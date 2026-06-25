@@ -1,0 +1,698 @@
+\chapter{实时点云融合定位}
+\label{ch:lidar-loc}
+
+% ════════════════════════════════════════════════════════════════
+%  本章：吸收 高翔《自动驾驶与机器人中的 SLAM 技术》Ch10（实时点云融合定位）
+%  —— 在 ch:lidar-map 产出的先验点云地图上做实时定位（区别于里程计）。
+%  三大独特点：① RTK 引导的冷启动网格搜索（360°/10° 扫朝向 + 多分辨率 NDT）；
+%             ② 九宫格地图块的动态加卸载（加载九格、卸载阈值略大防边界抖动）；
+%             ③ ESKF 预测 + 去畸变 + LoadMap(pred) + NDT 地图匹配 + ObserveSE3 回灌。
+%  ESKF 数学 \cref{ch:eskf}（P1）、NDT \cref{sec:pc-ndt}、去畸变/同步 \cref{ch:lidar_slam}、
+%  RTK/UTM/GINS \cref{ch:gins}、先验地图 \cref{ch:lidar-map} —— 一律回引，不复述。
+%  教学层遵循 v5.0 算法工程教学规范；自包含独立记录。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的框图与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item “在先验地图上定位”和“激光里程计”有什么本质区别？为什么前者\emph{不会}随路程无界漂移，而后者会？
+  \item RTK 直接给出物理世界的坐标，NDT 配准却需要一个\emph{初值}才能收敛。同样是“定位”，为什么一个能冷启动、一个不能？这对系统初始化提出了什么要求？
+  \item 一台只装\emph{单天线} RTK 的车，开机静止时能从 RTK 读到平移，却读不到航向。要把它放进一张已知点云地图里做 NDT 匹配，缺的这个航向怎么补出来？
+  \item 一座城市的高精点云地图有几十 GB，车载内存装不下。车在地图上行驶时，应当把哪一部分地图常驻内存、何时换入换出？如果在地图块的边界上来回行驶，会发生什么？怎么避免？
+  \item 点云定位每一帧都要把当前扫描配到“车辆周边的地图”。这块“周边地图”随车移动而改变，PCL 的 NDT 内部建了一棵 K-d 树作为配准目标——地图一换，这棵树要不要重建？重建带来什么工程后果？
+  \item 用 $4$ 月采的数据建图、用 $5/6$ 月采的数据定位，为什么这样\emph{跨时段}的验证比“同一份数据自己定位自己”更有说服力？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{设计}点云融合定位系统的总体方案：说清它与组合导航（\cref{ch:gins}）、与激光里程计（\cref{ch:lidar_slam}）的异同，论证“激光-地图匹配”这一额外输入为什么能消除无界漂移，并在 ESKF 平滑与位姿图鲁棒两条融合路线之间做选型；
+  \item \textbf{推导并实现}\textbf{RTK 引导的冷启动初始化}：用首个有效 RTK 读数把搜索范围收缩到一个网格，在无航向时按 $360^\circ/10^\circ$ 步长\emph{并发}扫朝向，对每个候选位姿跑\emph{多分辨率} NDT，取最高分作为滤波器初值并置 \textsf{WORKING}；
+  \item \textbf{掌握}\textbf{先验地图的动态加卸载}：按当前位姿计算所在网格、加载九宫格（$3\times3$）的 $100$\,m 地图块、用\emph{略大于}加载范围的卸载阈值防止边界抖动，并在地图变更时重建 NDT 的配准目标；
+  \item \textbf{独立写出}实时融合主循环：ESKF 预测 $\to$ 点云去畸变 $\to$ \texttt{LoadMap}(预测位姿) $\to$ NDT 与地图配准 $\to$ \texttt{ObserveSE3} 把位姿观测回灌滤波器，并用 NDT 分值作失效重定位判据；
+  \item \textbf{论证}点云定位相对 RTK 的工程优势（与天气/遮挡无关、室内外通用、对小动态物体鲁棒）与代价（需先验地图、需初值），并能把大场景压成 $2$D/$2.5$D 地图以省存储（\cref{ch:slam2d}）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是激光定位建图链条的\textbf{应用顶层}与终点：\cref{ch:lidar_slam} 教会了“一帧点云对齐到参考”，\cref{ch:gins} 把 IMU 与 RTK 组装成组合导航，\cref{ch:lidar-map} 用它们离线生产出一张\emph{分块、带索引、回环修正过的高精点云地图}。本章把这张地图\emph{用起来}：让车辆在其上做\emph{实时、有界、不依赖 RTK 信号好坏}的高精定位。一句话主线——\textbf{“先验地图把里程计的无界漂移钉死成有界误差”}。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4.5mm and 8mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  mp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!9, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (imu) {IMU\\ 高频};
+\node[blk, below=of imu] (rtk) {RTK\\ 慢/绝对};
+\node[blk, below=of rtk] (lidar) {LiDAR\\ 扫描};
+\node[grp, right=14mm of rtk] (init) {初始化\\ 网格搜索};
+\node[grp, right=of init] (eskf) {ESKF\\ 预测/更新};
+\node[blk, right=of eskf] (out) {定位\\ 输出};
+\node[grp, below=8mm of init] (lidarloc) {激光定位\\ NDT 配准};
+\node[mp, below=8mm of eskf] (map) {点云地图\\ 九宫格加卸载};
+\draw[ln] (imu.east) -| (eskf.north);
+\draw[ln] (rtk)--(init);
+\draw[ln] (init)-- node[midway,above,font=\scriptsize]{初值} (eskf);
+\draw[ln] (eskf)--(out);
+\draw[ln] (lidar.east) -| (lidarloc.west);
+\draw[ln] (lidarloc.north) -- node[midway,left,font=\scriptsize]{观测} (init.south);
+\draw[ln] (eskf.south) -- node[midway,right,font=\scriptsize]{预测位姿} (map.north);
+\draw[ln] (map.west) -- node[midway,above,font=\scriptsize]{NDT 目标} (lidarloc.east);
+\draw[ln] (lidarloc.east) to[bend right=12] (eskf.south west);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：第 \ref{sec:lidar-loc-design} 节（设计方案，搞清“为什么需要初值、为什么有界”）$\to$ 第 \ref{sec:lidar-loc-init} 节（冷启动网格搜索，本章最独特的算法）$\to$ 第 \ref{sec:lidar-loc-mapload} 节（九宫格动态加卸载）$\to$ 第 \ref{sec:lidar-loc-loop} 节（实时融合主循环）。第 \ref{sec:lidar-loc-eng} 节（工程要点与泛化）面向落地，可选。
+
+\subsection*{前置知识桥接}
+本章是一章纯粹的\emph{系统集成}：几乎所有“零件”都在前面章节讲透了，本章只负责\emph{装配}与\emph{调度}。请先激活以下前置：
+\begin{itemize}
+  \item \textbf{误差状态卡尔曼滤波}（\cref{ch:eskf}）：名义/误差状态分离、IMU 预测、位姿观测更新、注入与重置——本章的融合器就是它，公式一律回引 P1，\textbf{不复述}。
+  \item \textbf{NDT 配准}（\cref{ch:pointcloud} 第 \ref{sec:pc-ndt} 节）：正态分布变换的体素表示、匹配分值（transformation probability）、牛顿迭代——本章用它做“当前扫描 $\to$ 周边地图”的对齐，以及初始化时的多分辨率打分。
+  \item \textbf{激光里程计的去畸变与时间同步}（\cref{ch:lidar_slam} 第 \ref{sec:lidar-deskew} 节）：用 ESKF 预测位姿对帧内各点做运动补偿、IMU-激光消息同步（\texttt{MessageSync}）——本章主循环\emph{原样保留}这两步，只把里程计的“帧间配准”换成“地图配准”。
+  \item \textbf{组合导航与世界坐标系}（\cref{ch:gins}）：RTK 读数、单/双天线、UTM 投影把经纬度落到局部度量系——本章用首个 RTK 读数（已在 UTM 系下）控制搜索范围。
+  \item \textbf{离线高精地图构建}（\cref{ch:lidar-map}）：把数据包变成\emph{按 $100$\,m 网格切分、带 \texttt{map\_index.txt} 索引}的点云地图——本章\emph{消费}这张地图，网格的算法与建图侧严格一致。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会以为“有了里程计和回环就够了”，却答不出一个落地问题：车每次开机都在地图上的\emph{未知}位置，里程计只能告诉你“相对开机点动了多少”，无法告诉你“你在城市的哪条街上”——这正是\emph{重定位}（relocalization），需要本章的冷启动网格搜索；
+  \item 你会把“在地图上定位”和“RTK 定位”混为一谈，忽视点云定位\emph{需要初值、不能直接给坐标}这一关键差异，从而在 RTK 抖动/消失的园区、隧道、室内场景束手无策；
+  \item 在工程里会撞上“地图太大装不下内存”的硬墙，却没有动态加卸载的设计与防边界抖动的卸载阈值，导致频繁换图卡顿。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\label{tab:lidar-loc-reading}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含网格搜索与加卸载的完整逻辑、练习） & 2.5--3 小时 & 首次做“地图定位/重定位”系统、要落地点云定位 \\
+速读（跳过工程细节与实验数值） & 1 小时 & 已懂 ESKF/NDT、想对齐本章的初始化与调度思路 \\
+速查（只看框图 + 主循环 + 速查卡） & 15 分钟 & 写代码、调参时回来查流程 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+位姿 $\mathbf T=\big[\begin{smallmatrix}\mathbf R&\mathbf t\\\mathbf 0^\top&1\end{smallmatrix}\big]\in\SE(3)$，旋转 $\mathbf R\in\SO(3)$，右扰动为主（与全书一致）。
+状态记号沿用 \cref{ch:eskf}：名义状态 $\mathbf x=(\mathbf R,\mathbf p,\mathbf v,\mathbf b_g,\mathbf b_a)$、误差状态 $\delta\mathbf x$、协方差 $\mathbf P$。
+点云 $P=\{\mathbf p_i\in\mathbb R^3\}$；当前帧（去畸变后、已变到 IMU/车体系）记 $\mathcal S$，先验地图记 $\mathcal M$，车辆周边参与配准的“局部地图”记 $\mathcal M_{\mathrm{loc}}$。
+网格坐标 $\mathbf g=(g_x,g_y)\in\mathbb Z^2$（$100$\,m 一格，与 \cref{ch:lidar-map} 同一切分）。
+RTK 首个有效读数在 UTM 系下记 $\mathbf t_{\mathrm{rtk}}$（\cref{ch:gins} 的 UTM 投影产物）。
+NDT 匹配分值记 $s$（PCL 的 transformation probability，越大越好，\cref{eq:pc-ndt-score}）。
+系统状态机三态：\textsf{WAITING\_FOR\_RTK}（等首个 RTK，未定位）、\textsf{WORKING}（已初始化，正常融合）、\textsf{LOST}（失效，待重定位）。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{点云融合定位的设计方案}
+\label{sec:lidar-loc-design}
+
+\paragraph{动机：把里程计的“无界漂移”钉成“有界误差”。}
+\cref{ch:lidar_slam} 的激光里程计（含 LIO）解决的是\emph{相对}运动：它告诉你“相对开机时刻，车辆动了多少”。即便最好的三维激光里程计也只能做到约 $0.1\%$ 的漂移率（每行进 $1000$\,m 漂 $1$\,m），且这点漂移\emph{随路程无界累积}（\cref{ch:lidar_slam}）。回环 + 位姿图能在\emph{回到旧地}时把整条轨迹拉回一致，但它要求你真的走了一个环。自动驾驶的现实是：车在一张\emph{已经建好}的城市地图上反复穿行，每天的路线未必成环。这时正确的做法不是“积分里程计”，而是\textbf{在先验地图上定位}——把当前扫描\emph{配准到地图}，每一帧都从地图里读出一个\emph{绝对}位姿。只要地图本身准、当前帧能配上，定位误差就被地图\emph{钉死}成有界，不随路程增长。这就是“点云融合定位”与“里程计”的根本分野（\cref{ins:lidar-loc-bounded}）。
+
+\paragraph{与组合导航的异同：多了一路“激光-地图匹配”输入。}
+\cref{ch:gins} 的组合导航（GINS）已经能用 IMU + RTK 给出绝对定位。点云融合定位与它\emph{同构}，只是多了一路输入：\textbf{激光-地图匹配}。把三路输入摆在一起对照（\cref{tab:lidar-loc-inputs}）：IMU 高频但漂移、RTK 慢而绝对但受信号质量影响、激光-地图匹配则\emph{与天气/遮挡无关、室内外通用}，只要地图主体结构（通常是建筑物）变化不大就能稳定工作。NCLT 等数据集表明 RTK 在许多城区存在\emph{抖动、消失}的情况——园区、隧道、高楼峡谷、地库尤甚；而\cref{ch:lidar-map} 产出的点云地图是对\emph{静态}场景三维结构的可靠描述。所以在自动驾驶高精定位里，激光-地图匹配往往是\emph{主}输入，RTK 退居\emph{初始化}与\emph{粗校验}角色，IMU 负责高频平滑。
+
+\begin{table}[H]\centering\small
+\caption{点云融合定位的三路输入对照}
+\label{tab:lidar-loc-inputs}
+\begin{tabular}{p{0.18\textwidth} p{0.16\textwidth} p{0.16\textwidth} p{0.40\textwidth}}
+\toprule
+输入 & 频率 & 性质 & 特点与角色 \\
+\midrule
+IMU & 高（$\sim$100\,Hz） & 相对、漂移 & ESKF 高频预测，给去畸变与配准提供初值 \\
+RTK & 慢（$\sim$1\,Hz） & 绝对、UTM 坐标 & 受信号质量影响（园区/隧道抖动消失）；本章只用首个有效读数做\emph{初始化}与控制搜索范围 \\
+激光-地图匹配 & 中（$\sim$10\,Hz） & 绝对、有界 & \emph{主}输入；与天气/遮挡无关、室内外通用；需\emph{初值}引导 NDT 收敛、需\emph{先验地图} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{关键差异：RTK 直接给坐标，点云定位却需要初值。}
+这是点云定位\emph{特有}的逻辑难点，也是本章后两节的全部由来。RTK 是\textbf{绝对}测量——一上电就直接吐出物理世界的坐标，无需任何先验。点云-地图配准不然：NDT（\cref{sec:pc-ndt}）本质是一个\emph{非凸}的局部优化，从一个差初值出发会陷入错误极小、配准发散。所以点云定位\emph{必须先给出一个大致的位置点，再引导配准算法收敛}。这一条差异分叉出两个工程必需品：
+\begin{itemize}
+  \item \textbf{冷启动初始化}（\cref{sec:lidar-loc-init}）：滤波器尚无自身位置时，从哪里取这个“大致位置”？——用首个有效 RTK 读数控制搜索范围，再网格搜索补出朝向。
+  \item \textbf{运行期初值}（\cref{sec:lidar-loc-loop}）：进入正常工作后，每一帧用 ESKF 的\emph{预测}位姿做 NDT 初值——这正是 IMU 高频预测在融合系统里的第二个作用（第一个是去畸变）。
+\end{itemize}
+
+\paragraph{融合手段选型：ESKF 平滑 vs 位姿图鲁棒。}
+把“激光-地图位姿观测”融进状态估计，有两条路，与\cref{ch:lidar_slam}、\cref{ch:gins} 反复出现的“滤波 vs 优化”二分一脉相承：
+\begin{enumerate}
+  \item \textbf{ESKF 融合}（本章主线）：和传统组合导航一样，用误差状态卡尔曼滤波（\cref{ch:eskf}）把激光-地图位姿当作\texttt{ObserveSE3} 观测更新进去。\emph{设计与实现都简单、结果平滑}；代价是\emph{可能收敛到错误的解}（一次错误配准会被当成可信观测拉偏），且不易做异常剔除。
+  \item \textbf{位姿图优化融合}：把各路因子（激光-地图位姿、IMU 预积分、可选 RTK）与定位状态写成因子图，用图优化求解（\cref{ch:isam2}）。它更适合\emph{在逻辑层面处理各种异常}（用鲁棒核 / 切换约束关掉坏匹配），但要保证\emph{平滑性}就难了——除非像紧耦合 LIO 那样手动做边缘化先验，或用 GTSAM 这类自带增量优化库。
+\end{enumerate}
+本章选 ESKF 路线作为主线演示（最小可用系统），并在 \cref{sec:lidar-loc-eng} 指出位姿图路线的接口。这与\cref{ch:lidar_slam} 紧耦合 LIO “滤波与优化两条路都给”的处理一致：\emph{先用滤波把系统跑起来，再按需升级到优化}。
+
+\begin{insight}[为什么“地图定位”有界、而“里程计”无界]\label{ins:lidar-loc-bounded}
+里程计是把\emph{相对}增量\emph{累加}：每一步的小误差被一路加进总位姿，误差随步数\emph{随机游走}地放大，方差正比于路程——这是\emph{无界}的数学根源（\cref{ch:lidar_slam}）。地图定位则是每一帧\emph{独立}地从一个\emph{固定}参照物（先验地图）读出绝对位姿：本帧误差只取决于本帧配准质量，\emph{不}继承上一帧的误差、\emph{不}累加。于是误差被地图“钉死”在一个与路程无关的常数水平上——这是\emph{有界}的根源。代价也正在“依赖固定参照”：地图必须\emph{已经存在}且\emph{足够准}，且当前帧得\emph{配得上}地图（结构变化太大、遮挡太重、初值太差都会让这一帧失效）。所以点云定位与里程计不是替代而是\emph{互补}：里程计在没有地图时也能走（建图阶段、未知区域），定位在有地图时把漂移钉死；工程上常并存，定位失效时退回里程计续推、定位恢复时再拉回。本章假定地图已由 \cref{ch:lidar-map} 备好，专注“怎么用”。
+\end{insight}
+
+\begin{pitfall}[把“点云定位”当成“另一种 RTK”]
+初学者容易以为点云定位和 RTK 一样“一上电就给坐标”，于是省掉初始化、直接每帧 NDT。结果是：开机时滤波器位置是零、NDT 从原点附近的地图块配一帧来历不明的扫描，几乎必然发散。\textbf{点云定位不能自举}——它要么靠 RTK 给首个大致位置（本章方案），要么靠人工指定初始位姿（如 ROS 的 \texttt{2D Pose Estimate}），要么靠全局描述子（ScanContext 等，\cref{ch:lidar_slam}）做重定位。把这一步漏掉，是点云定位最常见的“开机即挂”。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{冷启动初始化：RTK 引导的网格搜索}
+\label{sec:lidar-loc-init}
+
+\paragraph{问题：滤波器没有初值，从何处起步？}
+系统刚上电时处于 \textsf{WAITING\_FOR\_RTK} 态：还没收到任何有效 RTK 信号，\emph{无从知道车在地图里的位置}，自然也无法做点云定位（NDT 缺初值）。一旦收到\textbf{首个有效} RTK 读数 $\mathbf t_{\mathrm{rtk}}$（已由 \cref{ch:gins} 的 UTM 投影落到与地图同一的局部度量系），就在它\emph{周边}做一次\textbf{网格搜索}（grid search），找出一个足够好的初始位姿，成功即置 \textsf{WORKING}。这一节就是把“没有初值”冷启动成“有初值”的全部逻辑。
+
+\paragraph{为什么是“网格搜索朝向”而非直接用 RTK 位姿？}
+关键在 RTK \emph{读数本身的残缺}。\cref{ch:gins} 指出：\textbf{单天线} RTK 只给\emph{平移}（位置），不给\emph{航向}（朝向）。把车放进地图做 NDT，平移有了（$\mathbf t_{\mathrm{rtk}}$），\textbf{朝向 $\theta$ 仍是未知量}。而 NDT 对初始朝向相当敏感——朝向差得多，配准就陷错误极小。既然朝向未知，又只是一维（绕 $z$ 的偏航角），最直接的办法就是\textbf{把它离散地扫一遍}：在 $[0^\circ,360^\circ)$ 内以 $10^\circ$ 为步长生成 $36$ 个候选朝向，对每个候选位姿都跑一遍配准、取\emph{分值最高}者。这正是“用首个 RTK 控制\emph{位置}搜索范围、用网格搜索补出\emph{朝向}”的含义。
+
+\begin{algo}[RTK 引导的冷启动网格搜索]\label{alg:lidar-loc-search}
+输入：首个有效 RTK 平移 $\mathbf t_{\mathrm{rtk}}$（UTM 系）、当前去畸变扫描 $\mathcal S$、先验地图 $\mathcal M$、分值阈值 $s_{\min}$。
+\begin{enumerate}
+  \item \textbf{加载周边地图}：\texttt{LoadMap}$(\mathbf t_{\mathrm{rtk}})$——按 $\mathbf t_{\mathrm{rtk}}$ 所在网格载入九宫格地图块（\cref{sec:lidar-loc-mapload}）。
+  \item \textbf{生成候选位姿}：for $\theta = 0^\circ,10^\circ,\dots,350^\circ$：候选 $\mathbf T_\theta=\big[\mathbf R_z(\theta)\,\big|\,\mathbf t_{\mathrm{rtk}}\big]$，存入候选集（共 $36$ 个）。
+  \item \textbf{并发多分辨率配准}：对每个候选 $\mathbf T_\theta$ \emph{并行}调用 \cref{alg:lidar-loc-multi}（多分辨率 NDT），得对齐结果 $\mathbf T_\theta^\star$ 与分值 $s_\theta$。
+  \item \textbf{取最优}：$\theta^\star=\arg\max_\theta s_\theta$。
+  \item \textbf{判据}：若 $s_{\theta^\star} > s_{\min}$，则\emph{初始化成功}：用 $\mathbf T_{\theta^\star}^\star$ 重置滤波器（旋转 $\mathbf R\!\leftarrow$ 其旋转、平移 $\mathbf p\!\leftarrow$ 其平移、速度 $\mathbf v\!\leftarrow\mathbf 0$、协方差按初始不确定度设小），置 \textsf{WORKING}，返回真；否则\emph{本次失败}（标记 \texttt{init\_has\_failed}、记下 $\mathbf t_{\mathrm{rtk}}$ 待下一个 RTK 再试），返回假。
+\end{enumerate}
+\end{algo}
+
+\paragraph{为什么协方差要“按初始不确定度设小”？}
+重置滤波器时，除了把名义状态设成搜索到的位姿，还要把误差协方差 $\mathbf P$ 设成一个\emph{较小}的初值——表示“我对这个初始位姿相当有信心”。高翔的实现里取旋转/平移块 $\sim10^{-4}$、速度与偏置块 $\sim10^{-6}$ 量级的对角阵。设小的理由：网格搜索 + 多分辨率 NDT 已经把位姿\emph{配}到了地图上（不是 RTK 那种米级粗读），初始不确定度本就小；若把 $\mathbf P$ 设得过大，后续第一帧观测会被过度信任、可能把已经对好的位姿又拉跑。这与 \cref{ch:eskf} 的初始化哲学一致：\emph{初值越可信，初始协方差越小}。
+
+\subsection{多分辨率 NDT：由粗到精的配准与打分}
+\label{sec:lidar-loc-multi}
+
+\paragraph{动机：单一分辨率要么收不住、要么不够准。}
+对每个候选朝向只跑一次 NDT 是不够的：分辨率（体素边长）太大，目标函数平缓、收敛域宽但精度低；太小，精度高但稍偏初值就陷局部极小、对 $10^\circ$ 间隔的粗朝向尤其脆。\cref{ch:lidar-map} 的回环检测早已用过同一招应对：\textbf{多分辨率、由粗到精}。这里把它用在初始化打分上——用一串\emph{从大到小}的体素分辨率级联配准，前一级的输出作后一级的初值，逐级收紧，既保住宽收敛域、又拿到细精度。
+
+\begin{algo}[多分辨率 NDT 对齐（\texttt{AlignForGrid}）]\label{alg:lidar-loc-multi}
+输入：候选位姿 $\mathbf T_0$（初值）、当前扫描 $\mathcal S$、周边地图 $\mathcal M_{\mathrm{loc}}$。分辨率序列 $\{10,5,4,3\}$\,m（由粗到精）。
+\begin{enumerate}
+  \item $\mathbf T\!\leftarrow\!\mathbf T_0$。
+  \item for $r$ in $\{10,5,4,3\}$\,m：
+  \begin{enumerate}
+    \item 对地图 $\mathcal M_{\mathrm{loc}}$ 做体素降采样到分辨率 $r$，作 NDT 配准\emph{目标}；当前扫描 $\mathcal S$ 作\emph{源}；
+    \item 设 NDT 分辨率为 $r$，以 $\mathbf T$ 为初值对齐，更新 $\mathbf T\!\leftarrow$ 本级输出；
+  \end{enumerate}
+  \item 记最终 $\mathbf T$ 为对齐结果 $\mathbf T^\star$、取最末级 NDT 的 transformation probability 为分值 $s$（\cref{eq:pc-ndt-score}）。
+  \item 返回 $(\mathbf T^\star, s)$。
+\end{enumerate}
+\end{algo}
+
+\noindent{}这里的体素降采样与 NDT 配准、分值都来自 \cref{sec:pc-ndt}，本章只\emph{编排}它们由粗到精级联，不重述 NDT 的牛顿迭代与海森。注意分辨率序列 $\{10,5,4,3\}$ 是高翔的工程取值（与 \cref{ch:lidar-map} 回环用的同款思路），可按场景尺度增减级数。
+
+\paragraph{并发：$36$ 个朝向天然可并行。}
+$36$ 个候选朝向之间互不依赖——每个都独立地跑一遍多分辨率 NDT、产出自己的分值。这是\emph{尴尬并行}（embarrassingly parallel）：用并行 \texttt{for\_each}（如 C++17 的 \texttt{std::execution::par\_unseq}）把 $36$ 次配准撒到多核上，再对结果取 $\max$ 即可。冷启动只发生一次（或失败重试几次），这点并发开销完全可接受，却把 $36\times4$ 次 NDT 的串行等待压成近 $1/N_{\mathrm{core}}$。
+
+\begin{codebox}[C++]{冷启动网格搜索（仿 \texttt{Fusion::SearchRTK}，对齐高翔 Ch10）}
+bool Fusion::SearchRTK() {
+  // RTK 不带姿态，必须搜索一定的角度范围
+  std::vector<GridSearchResult> search_poses;
+  LoadMap(last_gnss_->utm_pose_);            // ① 按 RTK 平移加载周边九宫格地图
+
+  // ② 由于 RTK 不带角度，按固定步长扫一圈朝向
+  double grid_ang_range = 360.0, grid_ang_step = 10;     // 角度搜索范围与步长
+  for (double ang = 0; ang < grid_ang_range; ang += grid_ang_step) {
+    SE3 pose(SO3::rotZ(ang * math::kDEG2RAD),
+             last_gnss_->utm_pose_.translation());        // 朝向 ang、平移取 RTK
+    GridSearchResult gr; gr.pose_ = pose;
+    search_poses.emplace_back(gr);
+  }
+
+  // ③ 并发对每个候选位姿做多分辨率 NDT 打分
+  std::for_each(std::execution::par_unseq,
+                search_poses.begin(), search_poses.end(),
+                [this](GridSearchResult& gr) { AlignForGrid(gr); });
+
+  // ④ 选最优匹配
+  auto max_ele = std::max_element(
+      search_poses.begin(), search_poses.end(),
+      [](const auto& g1, const auto& g2) { return g1.score_ < g2.score_; });
+
+  if (max_ele->score_ > rtk_search_min_score_) {   // ⑤ 分值过阈 → 初始化成功
+    LOG(INFO) << "初始化成功, score: " << max_ele->score_;
+    status_ = Status::WORKING;
+    // 重置滤波器状态：位姿取搜索结果，速度清零，协方差设小
+    auto state = eskf_.GetNominalState();
+    state.R_ = max_ele->result_pose_.so3();
+    state.p_ = max_ele->result_pose_.translation();
+    state.v_.setZero();
+    eskf_.SetX(state, eskf_.GetGravity());
+    ESKFD::Mat18T cov = ESKFD::Mat18T::Identity() * 1e-4;
+    cov.block<12,12>(6,6) = Eigen::Matrix<double,12,12>::Identity() * 1e-6;
+    eskf_.SetCov(cov);
+    return true;
+  }
+  init_has_failed_ = true;                          // 本次失败，等下一个 RTK 再试
+  last_searched_pos_ = last_gnss_->utm_pose_;
+  return false;
+}
+\end{codebox}
+
+\begin{codebox}[C++]{多分辨率 NDT 对齐（仿 \texttt{Fusion::AlignForGrid}）}
+void Fusion::AlignForGrid(GridSearchResult& gr) {
+  pcl::NormalDistributionsTransform<PointType, PointType> ndt;
+  ndt.setTransformationEpsilon(0.05);
+  ndt.setStepSize(0.7);
+  ndt.setMaximumIterations(40);
+  ndt.setInputSource(current_scan_);                 // 源 = 当前扫描
+
+  CloudPtr output(new PointCloudType);
+  std::vector<double> res{10.0, 5.0, 4.0, 3.0};      // 由粗到精的分辨率序列
+  Mat4f T = gr.pose_.matrix().cast<float>();          // 候选位姿作初值
+  for (auto& r : res) {
+    auto rough_map = VoxelCloud(ref_cloud_, r * 0.1); // 地图按该分辨率降采样
+    ndt.setInputTarget(rough_map);                    // 目标 = 周边地图
+    ndt.setResolution(r);
+    ndt.align(*output, T);
+    T = ndt.getFinalTransformation();                 // 本级输出作下一级初值
+  }
+  gr.score_ = ndt.getTransformationProbability();     // 取末级分值
+  gr.result_pose_ = Mat4ToSE3(ndt.getFinalTransformation());
+}
+\end{codebox}
+
+\paragraph{失败与重试：标记并等下一个 RTK。}
+若 $36$ 个朝向的最高分仍 $\le s_{\min}$，说明这一处 RTK 给的位置不可信（信号差、或在地图边缘），本次初始化失败：置 \texttt{init\_has\_failed}、记下本次 RTK 位置 \texttt{last\_searched\_pos}，返回假，等\emph{下一个}有效 RTK 再来一遍。系统仍停在 \textsf{WAITING\_FOR\_RTK}，不会带着错误初值进入 \textsf{WORKING}。这种“宁可不定位、不可错定位”的保守初始化，是地图定位系统稳健性的第一道闸门。
+
+% ════════════════════════════════════════════════════════════════
+\section{先验地图的动态加卸载：九宫格策略}
+\label{sec:lidar-loc-mapload}
+
+\paragraph{问题：城市地图装不进内存，得“随车换图”。}
+\cref{ch:lidar-map} 把整张高精地图\emph{按 $100$\,m 网格切分}，每块单独存为一个 PCD 文件，并把各块位置写进 \texttt{map\_index.txt} 索引。原因正是为本章服务：一座城市的点云地图几十 GB，车载内存装不下，必须\emph{只把车辆周边那一小片}常驻内存，随车移动换入换出。问题归结为两个决策——\textbf{加载哪些块}、\textbf{何时卸载}。
+
+\paragraph{加载：当前网格 + 周边八格 = 九宫格。}
+按当前（或预测）位姿 $\mathbf t$ 算出所在网格 $\mathbf g=(g_x,g_y)$：
+\begin{equation}
+  g_x=\Big\lfloor\frac{t_x-50}{100}\Big\rfloor,\qquad
+  g_y=\Big\lfloor\frac{t_y-50}{100}\Big\rfloor,
+  \label{eq:lidar-loc-grid}
+\end{equation}
+（$-50$ 是把网格中心对齐到 $100$\,m 格的约定，须与 \cref{ch:lidar-map} 切分时\emph{严格一致}，否则地图块对不上号）。然后加载\textbf{以 $\mathbf g$ 为中心的 $3\times3$ 九个网格}：
+\begin{equation}
+  \mathcal N(\mathbf g)=\big\{\,\mathbf g+(\Delta x,\Delta y)\ \big|\ \Delta x,\Delta y\in\{-1,0,+1\}\,\big\},
+  \label{eq:lidar-loc-nine}
+\end{equation}
+共九块（\cref{fig:lidar-loc-grid}）。为什么是九宫格而非只载当前一格？因为车可能正处在某格的\emph{边缘}，激光扫到的结构、以及下一刻就要走进的区域都落在相邻格里；载满周边一圈，配准目标 $\mathcal M_{\mathrm{loc}}$ 才能完整覆盖传感器视野与近期轨迹。对每块：若它\emph{已在内存}则跳过；若\emph{索引里没有}（地图边界外）则跳过；否则从对应 PCD 文件读入、登记到内存地图字典，并置“地图已变更”标志。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, scale=0.78]
+  % 5x5 grid of 100m cells
+  \foreach \i in {0,...,5} { \draw[gray!50] (\i,0)--(\i,5); }
+  \foreach \j in {0,...,5} { \draw[gray!50] (0,\j)--(5,\j); }
+  % the loaded 3x3 (centered on cell (2,2)..(3,3) area -> center cell [2,2])
+  \foreach \i in {1,2,3} \foreach \j in {1,2,3} {
+    \fill[third!18] (\i,\j) rectangle (\i+0,\j+0); }
+  \foreach \i in {1,2,3} \foreach \j in {1,2,3} {
+    \fill[third!18] (\i,\j) rectangle ++(1,1); }
+  % center cell highlighted
+  \fill[main!25] (2,2) rectangle ++(1,1);
+  % car
+  \node at (2.5,2.5) {\small$\blacktriangle$};
+  \node[font=\scriptsize, below] at (2.5,2.35) {车};
+  % unload boundary (slightly larger than 3x3) dashed
+  \draw[red!70!black, dashed, thick] (0.55,0.55) rectangle (4.45,4.45);
+  \node[red!70!black, font=\scriptsize, anchor=west, align=left] at (4.55,4.2) {卸载阈值\\(略大于加载范围)};
+  % labels
+  \node[main!50!black, font=\scriptsize, anchor=west] at (5.3,2.5) {当前网格 $\mathbf g$};
+  \node[third!50!black, font=\scriptsize, anchor=west] at (5.3,3.5) {加载九宫格 $\mathcal N(\mathbf g)$};
+  \node[gray!60!black, font=\scriptsize, anchor=west] at (5.3,1.5) {每格 $100\,$m};
+\end{tikzpicture}
+\caption{九宫格动态加卸载：按车辆所在网格 $\mathbf g$（深色）加载 $3\times3$ 周边块（浅色，$\mathcal N(\mathbf g)$）作为配准目标 $\mathcal M_{\mathrm{loc}}$；卸载阈值（红虚线）\emph{略大于}加载范围（实现取“离当前格距离 $>3$ 格”才卸），在加载与卸载之间留一圈\emph{滞回带}，防止车在边界来回时反复换图。}
+\label{fig:lidar-loc-grid}
+\end{figure}
+
+\paragraph{卸载：阈值略大于加载范围 —— 一圈“滞回带”防抖动。}
+若“离开当前格就立刻卸掉非邻格”，会出现一个隐患：车在两格\emph{边界}上来回小幅移动时，网格 $\mathbf g$ 反复跳变，地图块被\emph{频繁加载又卸载}，引发持续卡顿。解决办法是给加载与卸载设\emph{不同}的范围——\textbf{卸载范围略大于加载范围}：只有当某块离当前格的距离\emph{超过卸载阈值}（高翔实现取欧氏（$L_2$）距离 $>3$ 格，与下方算法的 $\|\mathbf k-\mathbf g\|$ 一致）才真正卸掉。于是在“加载九宫格（距离 $\le 1$）”与“卸载（距离 $>3$）”之间留出一圈\emph{滞回带}（距离 $=2,3$ 的块加载后暂不卸），车在边界抖动时这些块\emph{留在内存里不动}，避免反复 I/O。这是控制里\emph{施密特触发器}（迟滞比较）的同款思想：用两个阈值制造滞回、消除临界抖振（\cref{ins:lidar-loc-hysteresis}）。
+
+\begin{algo}[地图动态加卸载（\texttt{LoadMap}）]\label{alg:lidar-loc-loadmap}
+输入：位姿 $\mathbf t$（一般用 ESKF 预测位姿）、内存地图字典 $D$、磁盘索引 $I$。
+\begin{enumerate}
+  \item 由 \cref{eq:lidar-loc-grid} 算当前网格 $\mathbf g$；列出九宫格 $\mathcal N(\mathbf g)$（\cref{eq:lidar-loc-nine}）。
+  \item \textbf{加载}：for $\mathbf k\in\mathcal N(\mathbf g)$：若 $\mathbf k\notin I$（地图无此块）跳过；若 $\mathbf k\in D$（已在内存）跳过；否则从 PCD 读入、$D[\mathbf k]\!\leftarrow$ 点云、置 \texttt{map\_changed}。
+  \item \textbf{卸载}：for $\mathbf k\in D$：若 $\|\mathbf k-\mathbf g\| > 3$（超卸载阈值）则从 $D$ 删除、置 \texttt{map\_changed}。
+  \item \textbf{重建 NDT 目标}：若 \texttt{map\_changed}：把 $D$ 里所有块拼成 $\mathcal M_{\mathrm{loc}}=\bigcup_{\mathbf k\in D}D[\mathbf k]$，设 NDT 分辨率（如 $1.0$\,m）、\texttt{setInputTarget}$(\mathcal M_{\mathrm{loc}})$（PCL 内部据此\emph{重建配准目标的 K-d 树}）。
+\end{enumerate}
+\end{algo}
+
+\begin{codebox}[C++]{地图动态加卸载（仿 \texttt{Fusion::LoadMap}）}
+void Fusion::LoadMap(const SE3& pose) {
+  int gx = int((pose.translation().x() - 50.0) / 100);
+  int gy = int((pose.translation().y() - 50.0) / 100);
+  Vec2i key(gx, gy);
+
+  // 一个区域的周边地图，载入 9 块
+  std::set<Vec2i, less_vec<2>> surrounding_index{
+    key + Vec2i(0,0),  key + Vec2i(-1,0), key + Vec2i(-1,-1), key + Vec2i(-1,1),
+    key + Vec2i(0,-1), key + Vec2i(0,1),  key + Vec2i(1,0),
+    key + Vec2i(1,-1), key + Vec2i(1,1),
+  };
+
+  bool map_data_changed = false;
+  int cnt_new_loaded = 0, cnt_unload = 0;
+  for (auto& k : surrounding_index) {                  // 加载必要区域
+    if (map_data_index_.find(k) == map_data_index_.end()) continue;  // 地图无此块
+    if (map_data_.find(k) != map_data_.end()) continue;              // 已在内存
+    CloudPtr cloud(new PointCloudType);
+    pcl::io::loadPCDFile(
+        data_path_ + std::to_string(k[0]) + "_" + std::to_string(k[1]) + ".pcd", *cloud);
+    map_data_.emplace(k, cloud);
+    map_data_changed = true; cnt_new_loaded++;
+  }
+
+  // 卸载不需要的区域：距离略大于加载范围（取 3 格），不频繁卸载
+  for (auto iter = map_data_.begin(); iter != map_data_.end();) {
+    if ((iter->first - key).norm() > 3) {              // 超卸载阈值
+      iter = map_data_.erase(iter);
+      cnt_unload++; map_data_changed = true;
+    } else { iter++; }
+  }
+
+  if (map_data_changed) {                              // 地图变了 → 重建 NDT 目标
+    ref_cloud_.reset(new PointCloudType);
+    for (auto& mp : map_data_) { *ref_cloud_ += *mp.second; }
+    ndt_.setResolution(1.0);
+    ndt_.setInputTarget(ref_cloud_);                   // PCL NDT 内部重建 K-d 树
+  }
+}
+\end{codebox}
+
+\paragraph{工程后果：换图时 NDT 要重建 K-d 树、会有卡顿。}
+地图块一旦变更（载入新块或卸掉旧块），拼出的 $\mathcal M_{\mathrm{loc}}$ 就变了，PCL 版 NDT 内部的 K-d 树\emph{必须重建}。这一步\emph{比较耗时}，会导致系统在切换地图的瞬间出现\emph{卡顿}。落地系统的常见缓解：单独开一个\textbf{加载线程}异步预读即将进入的网格、后台重建目标，主线程仍用旧目标配准，重建好再原子切换——把卡顿从主链路移走。本章演示版为求清晰用同步加载，但务必知道这是真实系统里要专门处理的点。
+
+\begin{insight}[加卸载的“滞回”：与控制里施密特触发器同构]\label{ins:lidar-loc-hysteresis}
+“加载范围 $\ne$ 卸载范围”不是随手设的工程参数，而是一个有名字的通用模式：\textbf{迟滞}（hysteresis）。任何“在阈值附近抖动会触发昂贵开关动作”的系统都该用它——温控器（开/关温度设两个值，避免压缩机频繁启停）、施密特触发器（高/低电平阈值不同，抗输入噪声抖动）、本章的地图加卸载（加载/卸载距离不同，抗边界换图抖动）。本质都是：用\emph{两个}阈值在“开”与“关”之间制造一段\emph{死区}，让系统状态在死区内\emph{记住}上一次的决定、不随小扰动翻来覆去。识别出这是迟滞，你就能把单阈值的“边界抖动”一眼看穿为缺了死区，并知道补一个略宽的反向阈值即可——而不必把卸载逻辑写得很复杂。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{实时融合主循环：ESKF 与 NDT 地图匹配}
+\label{sec:lidar-loc-loop}
+
+\paragraph{总览：把里程计主循环的“帧间配准”换成“地图配准”。}
+进入 \textsf{WORKING} 后，系统每收到一组同步好的测量（IMU + 激光，由 \cref{ch:lidar_slam} 的 \texttt{MessageSync} 攒齐）就跑一次主循环。它与 \cref{ch:lidar_slam} 的松耦合 LIO 主循环\emph{几乎逐行相同}——\emph{这正是设计的精妙处}：前三步（ESKF 预测、去畸变、点云预处理）原样复用 LIO 的代码，只把第四步的“当前帧配到\emph{上一帧/局部子图}”换成“当前帧配到\emph{先验地图}”。一图蔽之（\cref{fig:lidar-loc-loop}）：
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=5mm,
+  box/.style={draw, rounded corners, align=center, minimum height=8mm, inner sep=3pt},
+  e/.style={box, fill=main!8, draw=main!60!black},
+  m/.style={box, fill=third!9, draw=third!60!black},
+  ln/.style={->, thick, gray!55!black}]
+  \node[e] (sync) {消息同步\\ IMU+激光};
+  \node[e, right=of sync] (pred) {ESKF\\ 预测};
+  \node[e, right=of pred] (desk) {点云\\ 去畸变};
+  \node[m, right=of desk] (load) {LoadMap\\ (预测位姿)};
+  \node[m, right=of load] (ndt) {NDT 配\\ 先验地图};
+  \node[e, right=of ndt] (obs) {ObserveSE3\\ 回灌};
+  \draw[ln] (sync)--(pred); \draw[ln] (pred)--(desk); \draw[ln] (desk)--(load);
+  \draw[ln] (load)--(ndt); \draw[ln] (ndt)--(obs);
+  \draw[ln, dashed] (obs.south) to[out=-120,in=-60] node[midway,below,font=\scriptsize]{更新名义/误差状态} (pred.south);
+  \draw[ln, dashed] (pred.north) to[out=60,in=120] node[midway,above,font=\scriptsize]{预测位姿作初值} (ndt.north);
+  \node[font=\scriptsize, third!50!black, below=1mm of load] {\textbf{与 LIO 唯一不同：配地图而非配帧}};
+\end{tikzpicture}
+\caption{实时点云融合定位主循环（\textsf{WORKING} 态）。前三步（同步、ESKF 预测、去畸变）原样复用 \cref{ch:lidar_slam} 的松耦合 LIO；自 \texttt{LoadMap} 起改为“与先验地图配准”：ESKF 预测位姿既是去畸变与 NDT 的\emph{初值}，又决定 \texttt{LoadMap} 加载哪块地图；NDT 配出的绝对位姿经 \texttt{ObserveSE3} 回灌滤波器。}
+\label{fig:lidar-loc-loop}
+\end{figure}
+
+\paragraph{逐步拆解。}
+\begin{enumerate}
+  \item \textbf{ESKF 预测}（\texttt{Predict}）：用本次 IMU 高频递推名义状态与误差协方差（\cref{ch:eskf}），得预测位姿 $\hat{\mathbf T}=\,$\texttt{GetNominalSE3()}。它有\emph{三个}用途：去畸变的运动模型、NDT 的初值、\texttt{LoadMap} 的当前位姿。
+  \item \textbf{去畸变}（\texttt{Undistort}）：用预测位姿对帧内各点做运动补偿（\cref{sec:lidar-deskew}），把一个扫描周期内不同时刻测得的点\emph{拉回}同一参考时刻——这一步与里程计完全相同，是高翔“保留点云去畸变、IMU 激光消息同步部分代码”的明示。
+  \item \textbf{点云预处理}：去畸变后把点从激光系经外参 $\mathbf T_{IL}$ 变到 IMU/车体系（\texttt{transformPointCloud}），再体素降采样（如 $0.5$\,m）得当前帧 $\mathcal S$，与地图分辨率匹配、降低配准开销。
+  \item \textbf{地图配准}（\texttt{LidarLocalization}）：\texttt{LoadMap}$(\hat{\mathbf T})$ 备好周边地图；以 $\hat{\mathbf T}$ 为初值跑 NDT（\texttt{setInputCloud}$(\mathcal S)$、\texttt{align}）；得绝对位姿 $\mathbf T_{\mathrm{ndt}}=\,$\texttt{Mat4ToSE3}(getFinalTransformation())。
+  \item \textbf{回灌}（\texttt{ObserveSE3}）：把 $\mathbf T_{\mathrm{ndt}}$ 当作一次\emph{位姿观测}喂给 ESKF——这与 \cref{ch:gins} 用 RTK 位姿做 \texttt{ObserveSE3} 是\emph{同一个}观测接口，只是观测来源从 RTK 换成了 NDT-地图匹配。ESKF 据此算新息、更新误差状态、注入名义状态、重置（\cref{ch:eskf}），完成本帧融合。观测噪声按位姿（旋转/平移）量级设定（如 $10^{-1}/10^{-2}$）。
+\end{enumerate}
+
+\begin{codebox}[C++]{融合主循环：处理一组同步测量（仿 \texttt{Fusion::ProcessMeasurements}/\texttt{Align}）}
+void Fusion::ProcessMeasurements(const MeasureGroup& meas) {
+  measures_ = meas;
+  if (imu_need_init_) { TryInitIMU(); return; }      // 静止估零偏（沿用 GINS/LIO）
+
+  // 以下三步与 LIO 一致，只是由 Align 函数完成“地图匹配”工作
+  if (status_ == Status::WORKING) { Predict(); Undistort(); }
+  else { scan_undistort_ = measures_.lidar_; }       // 未定位时不预测、不去畸变
+  Align();
+}
+
+void Fusion::Align() {
+  // 去畸变 → 变到 IMU/车体系 → 体素降采样，得当前帧
+  FullCloudPtr scan_trans(new FullPointCloudType);
+  pcl::transformPointCloud(*scan_undistort_, *scan_trans, TIL_.matrix());
+  current_scan_ = VoxelCloud(ConvertToCloud<FullPointType>(scan_trans), 0.5);
+
+  if (status_ == Status::WAITING_FOR_RTK) {          // 尚未初始化
+    if (last_gnss_ != nullptr) {                     // 来了 RTK 就试冷启动
+      if (SearchRTK()) { status_ = Status::WORKING; ui_->UpdateScan(current_scan_, ...); }
+    }
+  } else {                                           // WORKING：地图匹配定位
+    LidarLocalization();
+    ui_->UpdateScan(current_scan_, eskf_.GetNominalSE3());
+    ui_->UpdateNavState(eskf_.GetNominalState());
+  }
+}
+
+bool Fusion::LidarLocalization() {
+  SE3 pred = eskf_.GetNominalSE3();                   // ① ESKF 预测位姿
+  LoadMap(pred);                                      // ② 按预测位姿加载周边地图
+  ndt_.setInputCloud(current_scan_);                 // ③ 源 = 当前帧
+
+  CloudPtr output(new PointCloudType);
+  ndt_.align(*output, pred.matrix().cast<float>());  // ④ 以预测位姿为初值配地图
+
+  SE3 pose = Mat4ToSE3(ndt_.getFinalTransformation());
+  eskf_.ObserveSE3(pose, 1e-1, 1e-2);                // ⑤ 位姿观测回灌（旋转/平移噪声）
+  LOG(INFO) << "lidar loc score: " << ndt_.getTransformationProbability();
+  return true;
+}
+\end{codebox}
+
+\paragraph{为什么 \textsf{WAITING\_FOR\_RTK} 时\emph{不}预测、\emph{不}去畸变？}
+注意主循环里有个分支：只有 \textsf{WORKING} 态才 \texttt{Predict}+\texttt{Undistort}，\textsf{WAITING\_FOR\_RTK} 态直接把原始扫描当 \texttt{scan\_undistort\_}。原因是去畸变需要一个\emph{可信的运动模型}（ESKF 预测位姿），而未初始化时滤波器状态根本不可信、预测毫无意义；此时唯一要做的是\emph{等 RTK、试冷启动}（\texttt{SearchRTK}），用的是原始单帧扫描去和地图网格搜索匹配。一旦 \texttt{SearchRTK} 成功置 \textsf{WORKING}，下一帧起才有可信状态可供预测与去畸变。这种“按状态机分支裁剪流水线”是融合系统的常见结构。
+
+\paragraph{失效重定位：NDT 分值作判据。}
+正常工作时也可能\emph{失效}——长时间穿过与地图差异极大的区域（大规模施工、地图过期）、严重遮挡、或被错误观测带偏。判据现成：\textbf{NDT 的 transformation probability}（\cref{eq:pc-ndt-score}）。每帧 \texttt{LidarLocalization} 都打印/监控这个分值；若它持续低于阈值，说明当前帧配不上地图、定位不可信，应置 \textsf{LOST} 并触发\emph{重定位}——回到 \cref{sec:lidar-loc-init} 的网格搜索流程（此时可用最近一次可信位姿或下一个 RTK 控制搜索范围）。这把“初始化”与“失效恢复”统一成同一套机制：\emph{重定位 = 任意时刻的冷启动}。
+
+\paragraph{外围测试代码：数据包驱动。}
+把一切串起来的最外层是一个数据回放器（\cref{ch:lidar-map} 同款 \texttt{RosbagIO}）：从 NCLT 等数据包里把 RTK / 点云 / IMU 三类消息分别回调给 \texttt{Fusion::ProcessRTK} / \texttt{ProcessPointCloud} / \texttt{ProcessIMU}，由内部攒成同步组后驱动主循环。运行界面里灰色点云是地图、彩色点云是当前累积扫描、白色坐标系是定位结果。
+
+\begin{codebox}[C++]{外围测试：数据包消息分发（仿 \texttt{run\_fusion\_offline}）}
+int main(int argc, char** argv) {
+  sad::Fusion fusion(FLAGS_config_yaml);
+  if (!fusion.Init()) return -1;
+
+  auto yaml = YAML::LoadFile(FLAGS_config_yaml);
+  auto bag_path = yaml["bag_path"].as<std::string>();
+  sad::RosbagIO rosbag_io(bag_path, sad::DatasetType::NCLT);
+
+  rosbag_io                                            // 各类消息分发给 fusion
+    .AddAutoRTKHandle([&](GNSSPtr gnss)  { fusion.ProcessRTK(gnss);  return true; })
+    .AddAutoPointCloudHandle([&](sensor_msgs::PointCloud2::Ptr cloud) {
+        fusion.ProcessPointCloud(cloud); return true; })
+    .AddImuHandle([&](IMUPtr imu)        { fusion.ProcessIMU(imu);   return true; })
+    .Go();
+  return 0;
+}
+\end{codebox}
+
+% ════════════════════════════════════════════════════════════════
+\section{工程要点与泛化}
+\label{sec:lidar-loc-eng}
+
+\paragraph{跨时段验证：用 $4$ 月建图、$5/6$ 月定位。}
+评测点云定位时，一个\emph{公平}的做法是\textbf{建图与定位用不同时段的数据}。NCLT 数据集在不同月份分别采集——可用 $4$ 月的数据建图，再用 $5$、$6$ 月的数据测定位。这样验证更有说服力：它\emph{逼出}了真实部署的核心矛盾——地图是\emph{过去}采的、定位是\emph{当下}发生的，两者间隔数周到数月，期间场景必有变化（落叶、施工、临时车辆、季节性外观）。若用“同一份数据自己定位自己”，结构完全一致、配准必然好，掩盖了时段差异这一最致命的退化源。跨时段还\emph{自带}动态物体差异（$5/6$ 月的人群车辆不同于 $4$ 月），顺带检验对动态的鲁棒性。
+
+\paragraph{点云定位的鲁棒性总结。}
+实践表明点云定位通常\emph{比 RTK 更鲁棒}（\cref{tab:lidar-loc-vs-rtk}）：
+\begin{itemize}
+  \item \textbf{环境适应性}：定位质量与\emph{场景结构}相关，而与\emph{天气、遮挡}无关，室内外通用、限制因素少。只要地图本身建得够准，大部分地图区域内它都能正常工作，\emph{不依赖室外 RTK 信号的好坏}。
+  \item \textbf{对动态物体的适应性}：只要\emph{主体结构}（通常是建筑物）变化不大，少量小型动态物体（人群、车辆）通常不会对配准产生大干扰——NDT 的分布化表示与体素聚合天然抑制了零散外点。
+  \item \textbf{融合的灵活性}：定位结果可像 RTK 一样融入 ESKF（本章方案），也可像 \cref{ch:lidar_slam} 那样组成因子图优化系统，按对平滑性 / 异常处理的需求选型。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{点云定位 vs RTK 定位}
+\label{tab:lidar-loc-vs-rtk}
+\begin{tabular}{p{0.22\textwidth} p{0.34\textwidth} p{0.34\textwidth}}
+\toprule
+维度 & 点云融合定位 & RTK 定位 \\
+\midrule
+是否需初值 & \emph{需要}（NDT 非凸，须先给大致位姿） & 不需要（绝对测量，直接出坐标） \\
+误差是否有界 & 有界（地图钉死，与路程无关） & 有界（绝对），但受信号质量强烈影响 \\
+对天气/遮挡 & 无关（主动测距 + 静态结构） & 敏感（园区/隧道/峡谷抖动消失） \\
+室内外 & 通用 & 室内基本不可用 \\
+对小动态物体 & 鲁棒（主体结构不变即可） & 不涉及 \\
+前置条件 & 需\emph{先验地图}（\cref{ch:lidar-map}） & 需基准站 + 卫星可见 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{大场景泛化：压成 $2$D/$2.5$D 地图。}
+若定位场景属于\emph{开阔地}，三维点云地图可进一步\textbf{压缩}成 $2$D / $2.5$D 地图（如把高度方向折叠为高程栅格或占据栅格，见 \cref{ch:slam2d} 的占据栅格 / \cref{ch:dense} 的高程图思想）。压缩后的地图\emph{大幅减少存储}（几十 GB $\to$ 数百 MB 量级），对自动驾驶量产应用更友好；配准也从三维 NDT 退化为二维/平面匹配，更快。代价是丢掉了竖直结构信息，仅适合结构主要在地面铺开、竖直方向冗余的开阔场景。这条路与本章三维方案互补：\emph{城市楼宇用三维、开阔园区/港口用 $2.5$D}。
+
+\paragraph{升级到位姿图：接口与代价。}
+若需要在逻辑层处理更复杂的异常（多假设并存、长时间 RTK/激光双失效、多段地图拼接），可把 ESKF 换成因子图：把 \texttt{ObserveSE3} 的“激光-地图位姿观测”改写为一元位姿因子、IMU 改写为预积分因子（\cref{ch:imu}），用 GTSAM/iSAM2（\cref{ch:isam2}）增量求解。它的好处是\emph{统一地}用鲁棒核 / 切换约束抑制坏匹配、用滑窗保持实时；代价是为保平滑性需\emph{手动边缘化}维护先验，复杂度高于一行 \texttt{ObserveSE3}。本章给的是\emph{最小可用}的 ESKF 版，位姿图版按本接口替换观测层即可，融合逻辑（初始化、加卸载、主循环骨架）完全不变。
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+点云定位和 RTK 一样能一上电就出坐标 & 点云定位\emph{不能自举}，NDT 非凸须先给初值（\cref{ins:lidar-loc-bounded} 的 pitfall）\\
+有了里程计 + 回环就不需要地图定位 & 路线未必成环；重定位（开机不知身在何处）必须靠地图匹配 \\
+直接每帧 NDT 即可、无需初始化 & 开机滤波器位置为零，缺初值的 NDT 几乎必然发散 \\
+单天线 RTK 给了位置就能直接做 NDT & 单天线\emph{无航向}，须网格搜索 $360^\circ/10^\circ$ 补出朝向（\cref{alg:lidar-loc-search}）\\
+初始化用单一分辨率 NDT 打分即可 & 单分辨率要么收敛域窄要么精度低，须由粗到精多分辨率（\cref{alg:lidar-loc-multi}）\\
+只加载当前一格地图就够 & 车可能在格边缘，须加载九宫格覆盖视野与近期轨迹（\cref{eq:lidar-loc-nine}）\\
+离开当前格就立刻卸掉非邻格 & 边界抖动会频繁换图卡顿；卸载阈值须\emph{略大于}加载范围留滞回带（\cref{ins:lidar-loc-hysteresis}）\\
+换地图块时 NDT 目标无需重建 & 地图一变，PCL NDT 内部 K-d 树必须重建（耗时，宜异步加载线程）\\
+地图定位误差会像里程计一样累积 & 每帧独立从固定地图读绝对位姿，误差有界、与路程无关 \\
+用同一份数据自定位即可评测 & 须\emph{跨时段}（如 4 月建图、5/6 月定位）才暴露真实退化 \\
+ESKF 融合一定优于位姿图 & ESKF 简单平滑但难剔异常；位姿图善处理异常但保平滑需手动边缘化 \\
+NDT 分值只在初始化用 & 运行期也是失效判据：分值持续过低 $\to$ 置 \textsf{LOST} 触发重定位 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号与状态表}
+\begin{tabular}{lll}
+\toprule
+符号 / 状态 & 含义 & 首次出现 \\
+\midrule
+$\mathcal S$ & 当前帧（去畸变、变到车体系、降采样后） & \cref{sec:lidar-loc-loop} \\
+$\mathcal M,\mathcal M_{\mathrm{loc}}$ & 先验全图 / 车辆周边参与配准的局部地图 & \cref{sec:lidar-loc-mapload} \\
+$\mathbf g=(g_x,g_y)$ & $100$\,m 网格坐标（与 \cref{ch:lidar-map} 同切分） & \cref{eq:lidar-loc-grid} \\
+$\mathcal N(\mathbf g)$ & 以 $\mathbf g$ 为中心的九宫格块集 & \cref{eq:lidar-loc-nine} \\
+$\mathbf t_{\mathrm{rtk}}$ & 首个有效 RTK 平移（UTM 系，控制搜索范围） & \cref{sec:lidar-loc-init} \\
+$\theta,\theta^\star$ & 候选 / 最优搜索朝向（$360^\circ$ 内 $10^\circ$ 步长） & \cref{alg:lidar-loc-search} \\
+$\hat{\mathbf T}=\mathbf T_{\mathrm{pred}}$ & ESKF 预测位姿（去畸变 / NDT 初值 / LoadMap 依据） & \cref{sec:lidar-loc-loop} \\
+$\mathbf T_{\mathrm{ndt}}$ & NDT 配地图得到的绝对位姿（ObserveSE3 观测） & \cref{sec:lidar-loc-loop} \\
+$s,s_{\min}$ & NDT 匹配分值 / 阈值（\cref{eq:pc-ndt-score}） & \cref{alg:lidar-loc-search} \\
+\textsf{WAITING/WORKING/LOST} & 状态机三态（待 RTK / 正常 / 失效待重定位） & \cref{sec:lidar-loc-design} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{核心流程速查表}
+\begin{tabular}{lll}
+\toprule
+流程 & 一句话说明 & 对应 \\
+\midrule
+设计取舍 & 地图匹配钉死漂移；需初值；ESKF/位姿图二选一 & \cref{sec:lidar-loc-design} \\
+冷启动搜索 \cref{alg:lidar-loc-search} & RTK 控位置 + $360^\circ/10^\circ$ 扫朝向 + 多分辨率 NDT 取最优 & \cref{sec:lidar-loc-init} \\
+多分辨率 NDT \cref{alg:lidar-loc-multi} & $\{10,5,4,3\}$\,m 由粗到精级联、并发 $36$ 朝向 & \cref{sec:lidar-loc-init} \\
+九宫格加卸载 \cref{alg:lidar-loc-loadmap} & 载 $3\times3$ 块、卸载阈值略大防抖、变更重建 NDT 目标 & \cref{sec:lidar-loc-mapload} \\
+网格坐标 \cref{eq:lidar-loc-grid} & $\lfloor(t-50)/100\rfloor$，须与建图切分一致 & \cref{sec:lidar-loc-mapload} \\
+融合主循环 & 预测 $\to$ 去畸变 $\to$ LoadMap $\to$ NDT 配地图 $\to$ ObserveSE3 & \cref{sec:lidar-loc-loop} \\
+失效重定位 & NDT 分值持续过低 $\to$ \textsf{LOST} $\to$ 回网格搜索 & \cref{sec:lidar-loc-loop} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 地图定位 vs 里程计 & 地图匹配把无界漂移钉成有界；需初值、需先验地图 & $\bigstar\bigstar$ \\
+2 & 三路输入与融合选型 & IMU/RTK/激光-地图；ESKF 平滑 vs 位姿图鲁棒 & $\bigstar\bigstar$ \\
+3 & RTK 引导冷启动 & 首个 RTK 控位置 + 网格搜朝向 + 多分辨率 NDT & $\bigstar\bigstar\bigstar$ \\
+4 & 多分辨率 NDT 打分 & 由粗到精级联、并发 $36$ 朝向、保守阈值 & $\bigstar\bigstar$ \\
+5 & 九宫格动态加卸载 & 载 $3\times3$、卸载滞回防抖、变更重建 K-d 树 & $\bigstar\bigstar\bigstar$ \\
+6 & 实时融合主循环 & 复用 LIO 前三步，唯改“配地图”；ObserveSE3 回灌 & $\bigstar\bigstar\bigstar$ \\
+7 & 失效重定位 & NDT 分值判据；重定位 = 任意时刻冷启动 & $\bigstar\bigstar$ \\
+8 & 工程泛化 & 跨时段验证、$2.5$D 压缩、位姿图升级 & $\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{本章主源}：高翔《自动驾驶与机器人中的 SLAM 技术：从理论到实践》\cite{gao2023slamad} 第 $10$ 章——点云融合定位的设计方案、RTK 初始搜索、九宫格加卸载（本章全部）；代码仓 \texttt{gaoxiang12/slam\_in\_autonomous\_driving}。
+  \item \textbf{先验地图来源}：本章定位所用地图由 \cref{ch:lidar-map}（同书第 $9$ 章）的两轮位姿图优化 + 多分辨率 NDT 回环 + $100$\,m 网格切分离线生产。
+  \item \textbf{地图先验定位经典}：Levinson--Thrun 概率地图定位\cite{levinson2010robust}（ICRA 2010，城区鲁棒定位）、Levinson--Montemerlo--Thrun 地图相对精定位\cite{levinson2007map}（RSS 2007，自动驾驶高精地图定位奠基）。
+  \item \textbf{融合引擎}：ESKF 见 \cref{ch:eskf}（P1，名义/误差态、ObserveSE3 观测更新）；NDT 配准与分值见 \cref{ch:pointcloud} 第 \ref{sec:pc-ndt} 节；去畸变与消息同步见 \cref{ch:lidar_slam} 第 \ref{sec:lidar-deskew} 节。
+  \item \textbf{数据集}：NCLT\cite{carlevaris2016nclt}（IJRR 2016，密歇根北校区长期多时段，建图/定位主用）；UTBM\cite{yan2020utbm}（IROS 2020）、UrbanLoco\cite{wen2020urbanloco}（ICRA 2020）作跨场景验证。
+  \item \textbf{大场景压缩}：开阔地可压成 $2$D/$2.5$D 地图——占据栅格见 \cref{ch:slam2d}、稠密/高程表示见 \cref{ch:dense}。
+\end{itemize}
+
+\section*{本章与前后章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+章节 & 关系 & 本章如何用 \\
+\midrule
+\cref{ch:eskf} ESKF（P1） & 融合引擎 & 预测 / ObserveSE3 观测更新 / 注入复位，\emph{不复述} \\
+\cref{ch:pointcloud} 点云处理 & NDT 配准与分值 & 地图匹配、多分辨率打分 \\
+\cref{ch:lidar_slam} 激光 SLAM & 去畸变 / 同步 / 主循环骨架 & 前三步原样复用，只改“配地图” \\
+\cref{ch:gins} 组合导航 & RTK / UTM / 单天线 & 首个 RTK 读数控制搜索范围 \\
+\cref{ch:lidar-map} 离线建图 & 先验地图 & \emph{消费}其分块带索引的高精地图，网格切分一致 \\
+\cref{ch:slam2d} 2D SLAM / \cref{ch:dense} 稠密 & 大场景压缩 & $2.5$D 地图泛化 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.24\textwidth} p{0.30\textwidth} p{0.36\textwidth}}
+\toprule
+症状 & 可能原因 & 排查步骤 \\
+\midrule
+开机即发散 / 定位乱跳 & 缺初始化、滤波器从零位配图 & 1.确认走 \texttt{SearchRTK} 冷启动；2.确认未初始化时\emph{不}做 NDT；3.等首个有效 RTK（\cref{sec:lidar-loc-init}）\\
+冷启动总失败 & 朝向步长太粗 / 阈值过严 / RTK 在地图边缘 & 1.减小角度步长；2.核对多分辨率序列；3.放宽 $s_{\min}$；4.换更靠地图中心的 RTK（\cref{alg:lidar-loc-search}）\\
+切换地图块时卡顿 & 同步重建 NDT 的 K-d 树 & 1.改异步加载线程后台预读重建；2.增大体素降采样减小目标点数（\cref{sec:lidar-loc-mapload}）\\
+在格边界反复换图 & 卸载阈值 = 加载范围、无滞回 & 1.把卸载阈值设为\emph{略大于}加载（如 $>3$ 格）；2.加滞回带（\cref{ins:lidar-loc-hysteresis}）\\
+地图块对不上 / 加载空 & 网格公式与建图切分不一致 & 1.核对 \cref{eq:lidar-loc-grid} 的 $-50$ 偏移与格长 $100$；2.核对 PCD 命名与 \texttt{map\_index.txt}（\cref{ch:lidar-map}）\\
+跑着跑着定位失效 & 场景与地图差异大 / 严重遮挡 & 1.监控 NDT 分值；2.分值持续过低则置 \textsf{LOST} 重定位；3.检查地图是否过期（\cref{sec:lidar-loc-loop}）\\
+跨时段定位明显变差 & 地图过期、季节/施工变化 & 1.确认建图与定位时段差异；2.更新地图；3.评测须本就跨时段（\cref{sec:lidar-loc-eng}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{API 速查表}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.30\textwidth} p{0.62\textwidth}}
+\toprule
+功能 & 接口 / 要点（一句话） \\
+\midrule
+NDT 配准 & PCL \texttt{NormalDistributionsTransform}：\texttt{setInputSource/Target}、\texttt{setResolution}、\texttt{align}、\texttt{getTransformationProbability}（分值） \\
+体素降采样 & \texttt{VoxelCloud(cloud, leaf)}（PCL \texttt{VoxelGrid} 封装）；当前帧与地图须分辨率匹配 \\
+ESKF 接口 & \texttt{Predict}（IMU 递推）、\texttt{ObserveSE3(pose, $\sigma_R$, $\sigma_t$)}（位姿观测更新）、\texttt{GetNominalSE3/State}、\texttt{SetX/SetCov}（重置） \\
+李群 & Sophus \texttt{SO3::rotZ(}$\theta$\texttt{)}（绕 $z$ 偏航）、\texttt{SE3}；\texttt{Mat4ToSE3}/\texttt{matrix()} 互转 \\
+并发 & C++17 \texttt{std::for\_each(std::execution::par\_unseq, ...)} 撒 $36$ 朝向到多核 \\
+地图 I/O & \texttt{pcl::io::loadPCDFile}；按 \texttt{"gx\_gy.pcd"} 命名 + \texttt{map\_index.txt} 索引（\cref{ch:lidar-map}） \\
+数据回放 & \texttt{RosbagIO} + \texttt{AddAuto\{RTK,PointCloud,Imu\}Handle} 分发三类消息 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{研究实践建议}
+\begin{itemize}
+  \item \textbf{初学者}：在 NCLT 上跑通本章融合定位，可视化灰色地图 + 彩色当前扫描 + 白色定位坐标系；建图与定位\emph{务必用不同月份}的数据包，观察大部分时段定位有效。
+  \item \textbf{进阶}：用自写 NDT 替换 PCL 版，并\emph{解决切图卡顿}——加异步加载线程后台预读 + 原子切换目标；用 NDT 分值判据实现 \textsf{LOST} 重定位闭环。
+  \item \textbf{有余力}：把本章融合换成因子图（\cref{ch:isam2}），用鲁棒核处理坏匹配并比较平滑性；或把开阔场景的三维地图压成 $2$D/$2.5$D（\cref{ch:slam2d}）做匹配定位，对比存储与精度。
+  \item \textbf{系统}：将本程序改写为 ROS 节点（订阅 RTK/点云/IMU 话题、发布定位 TF），把离线回放搬上实车闭环。
+\end{itemize}
+
+\begin{practice}[本章习题]
+\begin{enumerate}
+  \item （设计）论证“地图定位误差有界、里程计误差无界”的数学根源：分别写出两者的误差累积模型，指出方差对路程的依赖关系（提示：\cref{ins:lidar-loc-bounded}）。
+  \item （初始化）若 RTK 为\emph{双}天线、自带航向，本章的 $360^\circ/10^\circ$ 网格搜索还需要吗？改成什么？双天线航向有 $\pm\delta$ 误差时，搜索范围与步长该如何缩小化设？
+  \item （加卸载）设车辆以速度 $v$ 沿格边界往复运动，加载范围 $1$ 格、卸载阈值 $L$ 格。给出“不发生反复换图”对 $L$ 的下界与往复幅度的关系；再讨论 $L$ 过大对内存的代价（提示：\cref{ins:lidar-loc-hysteresis}）。
+  \item （主循环）说明 ESKF 预测位姿在主循环里的\emph{三个}用途，并解释为何 \textsf{WAITING\_FOR\_RTK} 态要跳过预测与去畸变（提示：\cref{sec:lidar-loc-loop}）。
+  \item （重定位）用 NDT 分值实现失效检测：给出一个带\emph{滞回}与\emph{连续帧计数}的判据（避免单帧抖动误触发 \textsf{LOST}），并说明触发后如何用最近可信位姿控制重定位的搜索范围。
+  \item （泛化）把本章三维 NDT 地图匹配改为 $2.5$D 高程/占据栅格匹配（\cref{ch:slam2d}）：写出二维位姿 $[x,y,\theta]$ 下的匹配目标与初值来源，并讨论它相对三维方案省了什么、丢了什么。
+  \item （工程，仿高翔 Ch10 习题）将本程序改写为 ROS 节点，通过订阅回调运行激光定位系统；列出需要的话题、TF 帧与时间同步注意点。
+\end{enumerate}
+\end{practice}

@@ -1,0 +1,728 @@
+\chapter{2D 激光 SLAM 与占据栅格建图}
+\label{ch:slam2d}
+
+% ════════════════════════════════════════════════════════════════
+%  本章：吸收高翔《自动驾驶与机器人中的 SLAM 技术：从理论到实践》第 6 章（2D SLAM）整章。
+%  主线：似然场扫描匹配 + 占据栅格 log-odds/Bresenham + SE2 子地图 + 多分辨率回环（对照 Cartographer BnB）。
+%  与本书已有内容的重叠（3D ICP/NDT、log-odds 的 3D OctoMap、回环-PGO 通论）一律 \cref 回引、不复述；
+%  只展开 2D 特有的降维结构与"似然场/占据栅格/子地图"这三块本书空白。
+%  右扰动为主；SE2/SO2 更新写成 \mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的对照表与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 一台扫地机器人只在水平地面上运动，它的位姿用 $[x,y,\theta]$ 三个量就够了。把第 \cref{ch:pointcloud} 章的三维 ICP「降维」到这种 $\SE(2)$ 场景，雅可比矩阵会从 $3\times 6$ 变成几乘几？哪些项会化简、哪些项会消失？
+  \item 用一张「图片」存储二维地图时，每个像素该存什么？是存「这里有没有障碍物」这个布尔值，还是存别的？多次观测互相矛盾（这一帧说有、下一帧说无）时怎么融合？
+  \item 「似然场」把扫描点想象成在空间里形成了一个「磁场」。这个磁场是怎么把当前帧「吸」到正确位姿上的？为什么它比逐次重建弹簧（标准 ICP 每轮重找最近邻）更快？
+  \item 激光从传感器中心射向一个障碍物，沿途穿过的那些栅格应该被标成「空闲」。怎样\emph{只用整数加减}就把这条连线经过的栅格逐个点亮？
+  \item 机器人绕一圈回到起点，地图却出现明显「重影」。这是哪个环节的累积误差？为什么单线激光只有 $270^\circ$ 视场会让回环检测的匹配阈值不能设太高？
+  \item 在一条笔直的长走廊里，二维扫描匹配会沿走廊方向「滑动」而算不准前进了多少。这种「额外自由度」在数学上叫什么？走廊场景有几个、空旷广场又有几个？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{推导} $\SE(2)$ 上的扫描匹配：写出点到点、点到线两种二维 ICP 的残差与对位姿 $[x,y,\theta]$ 的雅可比，并说清它与第 \cref{ch:pointcloud} 章三维 ICP 的降维对应关系；
+  \item \textbf{掌握似然场（likelihood field）扫描匹配}：理解距离变换图的「磁场吸引」直觉，推导似然场值对位姿的雅可比（链式法则 + 图像梯度），并能写出高斯-牛顿与图优化两种实现；
+  \item \textbf{解释占据栅格地图}的 log-odds 二值贝叶斯滤波与逆传感器模型，掌握 Bresenham 整数画线与模板法两种栅格化，并能讲清它与第 \cref{ch:dense} 章三维 OctoMap 的同与异；
+  \item \textbf{设计基于 $\SE(2)$ 子地图的 2D SLAM}：用 $\mathbf{T}_{WS}\cdot\mathbf{T}_{SC}$ 分离子地图位姿与帧内位姿，把子地图当作回环的基本单元；
+  \item \textbf{实现多分辨率（由粗至精）回环检测}：用似然场金字塔扩大收敛域，并\textbf{对照}解释它与 Cartographer 的分支定界（Branch-and-Bound, BnB）是同一思路的近似/精确两种实现；
+  \item \textbf{诊断} 2D SLAM 的工程退化：运动畸变、玻璃/镜面/反光、几何退化与规范自由度（gauge freedom），并知道何时必须升到 3D 或融合 IMU。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条「\emph{从一圈扫描到一张干净占据栅格图}」的主线，结构与第 \cref{ch:lidar_slam} 章的 3D 激光 SLAM 刻意保持平行，方便你在二维/三维之间迁移：先把当前帧\textbf{对齐}到参考（扫描匹配 = 前端），用\textbf{似然场}把「点到点」的弹簧换成「磁场」加速，再把对齐结果\textbf{刷}进占据栅格、按子地图组织，最后用\textbf{多分辨率回环}消除累积漂移。
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  bk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (scan) {单线扫描\\ $(\rho,\theta)_i$};
+\node[blk, right=of scan] (match) {扫描匹配\\ 点点/点线 ICP};
+\node[grp, right=of match] (lf) {似然场匹配\\ 距离变换 + GN};
+\node[bk, below=8mm of scan] (grid) {占据栅格\\ log-odds + Bresenham};
+\node[bk, right=of grid] (sub) {$\SE(2)$ 子地图\\ $\mathbf{T}_{WS}\!\cdot\!\mathbf{T}_{SC}$};
+\node[bk, right=of sub] (loop) {多分辨率回环\\ + SE2 位姿图};
+\draw[ln] (scan)--(match); \draw[ln] (match)--(lf);
+\draw[ln] (lf.south) -- ++(0,-3mm) -| (grid.north);
+\draw[ln] (grid)--(sub); \draw[ln] (sub)--(loop);
+\draw[ln] (loop.east) -- ++(6mm,0) |- node[pos=0.25,right,font=\scriptsize]{校正}  (sub.east);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径（骨干 only 速通）}：\cref{sec:slam2d-overview}（2D SLAM 总览与降维直觉）$\to$ \cref{sec:slam2d-match}（扫描匹配，重点看雅可比的降维）$\to$ \cref{sec:slam2d-lf}（似然场，本章核心增量之一）$\to$ \cref{sec:slam2d-grid}（占据栅格 log-odds + Bresenham）$\to$ \cref{sec:slam2d-submap}（子地图 + 多分辨率回环）。约需 $3$–$4$ 小时建立完整骨架。\cref{sec:slam2d-discuss}（退化与工程坑）面向落地，可选深潜。
+
+\subsection*{前置知识桥接}
+本章把前几章的工具「降到二维」拼成一个完整系统，请先激活以下前置：
+\begin{itemize}
+  \item \textbf{点云配准与近邻搜索}（\cref{ch:pointcloud}）：点到点/点到线 ICP 的残差与高斯-牛顿、KD-tree 的 $k$ 近邻、直线/平面的 SVD 拟合——本章的二维扫描匹配是它们在 $\SE(2)$ 上的降维特例，只展开「二维特有」的化简，三维通论不复述。
+  \item \textbf{占据建图与 log-odds}（\cref{ch:dense}）：三维 OctoMap 的占据概率、对数几率（log-odds）二值贝叶斯滤波、逆传感器模型——本章的二维占据栅格与它共用同一套概率内核，\cref{sec:slam2d-grid} 只在「平面栅格 vs 八叉树」「Bresenham 整数画线」处补二维特有的细节。
+  \item \textbf{回环检测与位姿图优化}（\cref{ch:loop}、\cref{ch:nlopt}、\cref{ch:isam2}）：回环把累积漂移「均摊」到整条轨迹、位姿图的因子构成、鲁棒核——本章在 $\SE(2)$ 上构图，并补一处 Cartographer 分支定界（BnB）作为多分辨率金字塔的精确对照。
+  \item \textbf{李群与右扰动}（\cref{ch:lie}）：$\SO(2)/\SE(2)$ 指数映射、右扰动 $\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$——二维位姿增量统一写成右乘小量。$\SE(2)$ 是 $\SE(3)$ 的低维同构，代码里二者接口一致（矩阵乘法、`Exp/Log` 同名）。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 上手 GMapping\cite{grisetti2007gmapping}、Hector SLAM\cite{kohlbrecher2011hector}、Cartographer\cite{hess2016cartographer} 这类 ROS 主流 2D SLAM 时，你会看到「似然场」「占据栅格」「分支定界」等模块却不知其所以然，只能照抄参数、无法在长走廊/玻璃幕墙等退化场景里调试；
+  \item 你会误以为二维和三维 SLAM 是两套不同的数学，而看不出它们其实是同一套右扰动配准 + log-odds 建图 + 位姿图回环在不同维度上的两个实例，因而无法把第 \cref{ch:lidar_slam} 章的经验迁移到扫地机/服务机器人这类二维平台。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\label{tab:slam2d-reading}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含似然场雅可比与多分辨率回环全流程） & 3--4 小时 & 首次系统学 2D SLAM、要做扫地机/服务机器人 \\
+速读（跳过代码与工程讨论） & 1 小时 & 已熟三维配准、想看「降到二维如何化简」 \\
+速查（只看小结的符号表 + 对照表 + 速查卡） & 15 分钟 & 写代码、调参时回来查公式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+二维位姿 $\mathbf{x}=[x,y,\theta]^\top$，对应 $\SE(2)$ 变换 $\mathbf{T}_{WB}\in\SE(2)$（机器人体坐标系 $B$ $\to$ 世界系 $W$）。代码中 $\SE(2)$ 与 $\SE(3)$ 接口一致，数学上也不刻意区分二维/三维位姿，矩阵乘法、$\mathrm{Exp}/\mathrm{Log}$ 同名（二维位姿有些文献也称\textbf{三自由度位姿}）。
+单次扫描记 $\{(\rho_i,\theta_i)\}_{i=1}^N$，$\rho_i$ 为第 $i$ 束激光的测距、$\theta_i$ 为其在传感器系下的方位角（部分公式沿用高翔记法写作 $(r_i,\rho_i)$，本章统一 $\rho_i$ 表测距、$\theta_i$ 表机器人朝向、$\alpha_i$ 表束方位角，见各式上下文）。
+末端点（end point）$\mathbf{p}_i^B$ 表示第 $i$ 束激光打到的障碍物点（传感器系），$\mathbf{p}_i^W=\mathbf{T}_{WB}\,\mathbf{p}_i^B$ 为其世界系坐标。
+坐标系下标：$W$ 世界系、$S$ 子地图（submap）系、$C$ 当前扫描（current）系；子地图位姿 $\mathbf{T}_{WS}$、帧在子地图内位姿 $\mathbf{T}_{SC}$。
+\textbf{扰动取右扰动} $\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$；二维旋转更新 $\mathbf{R}(\theta)\leftarrow\mathbf{R}(\theta)\,\mathrm{Exp}(\delta\theta)$ 即 $\theta\leftarrow\theta+\delta\theta$（$\SO(2)$ 交换，无右雅可比修正——这是二维相对三维的一个根本简化）。
+占据栅格用 $0\!\sim\!1$ 浮点占据概率，或工程上直接用 $8$ 位灰度计数；$127$（灰）= 未知、$\to 255$（白）= 可通行、$\to 0$（黑）= 占据。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{2D SLAM 总览：为什么二维值得单独一章}
+\label{sec:slam2d-overview}
+
+\paragraph{动机：很多机器人天生活在平面上。}
+所有现实传感器都工作在三维空间，本身与维度无关。但\emph{大量}轮式机器人只在某个固定平面上运动，并不会像飞行器那样随意改变姿态。扫地机器人、AGV、酒店送餐机器人在水平地面上跑，爬墙机器人在垂直面上跑——对它们而言，作为「运动主体」需要估计的位姿就是二维的：平面位置 $[x,y]$ 加一个朝向 $\theta$，共三自由度。一旦把问题压到二维，许多在三维里很重的环节会显著简化：俯视视角下激光扫描数据和地图都可以「图像化」，于是大量图像处理的工具（梯度、距离变换、金字塔）可以直接搬过来用——这正是似然场（\cref{sec:slam2d-lf}）与多分辨率回环（\cref{sec:slam2d-submap}）的方法论来源。
+
+\paragraph{二维假设的代价：它在哪里失效。}
+把三维世界压成二维，本质上是\emph{假设}障碍物与激光雷达处在同一高度、且世界沿竖直方向「不变」。这个假设在两类情形下崩塌：(1) 场景中存在\emph{随高度变化}的物体——例如桌子（桌面和桌腿在不同高度）、矮台阶、悬挂物，二维地图无法表达，机器人可能与之碰撞；(2) 机器人行驶在\emph{倾斜}坡面上，激光不再水平，测距读数与真实平面距离产生几何偏差。这些都是二维假设的\emph{系统固有}问题，很难在 2D 框架内解决，需要升到第 \cref{ch:lidar_slam} 章的 3D SLAM。理解这条边界，才能判断一个任务该用 2D 还是 3D。
+
+\paragraph{典型架构：与 3D 刻意平行的四块。}
+一个现代 2D SLAM 系统（\cref{fig:slam2d-arch}）由四个模块组成，恰好与第 \cref{ch:lidar_slam} 章的 3D 激光 SLAM 一一对应：
+\begin{enumerate}
+  \item \textbf{扫描匹配（scan matching）}：把一圈扫描（一次 scan）配准到参考上，估计机器人位姿。既可 Scan-to-Scan（配到上一帧），也可 Scan-to-Map（配到地图/子地图），二者原理相同、实际混用（\cref{sec:slam2d-match}、\cref{sec:slam2d-lf}）。
+  \item \textbf{占据栅格地图（occupancy grid）}：把配准好的扫描刷进栅格，区分「障碍物」与「可通行区域」，并借栅格的概率更新机制\emph{过滤}动态物体（\cref{sec:slam2d-grid}）。
+  \item \textbf{子地图（submap）}：把若干相邻帧归并成一个有独立位姿的局部地图，作为回环与全局调整的\emph{基本单元}（\cref{sec:slam2d-submap}）。
+  \item \textbf{回环检测与闭环（loop closure）}：当机器人回到旧地，用多分辨率匹配重新配准、并在 $\SE(2)$ 位姿图上闭环，消除累积漂移（\cref{sec:slam2d-submap}）。
+\end{enumerate}
+早期的 2D SLAM 常把地图当作单张二维图像处理，简单粗暴、不易处理回环；本章采用更现代、与 3D 同构的视角组织全章。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=6mm,
+  box/.style={draw, rounded corners, align=center, minimum height=8mm, inner sep=3pt},
+  o/.style={box, fill=main!8, draw=main!60!black},
+  b/.style={box, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!55!black}]
+\node[o] (sensor) {传感器};
+\node[o, right=10mm of sensor] (scan) {扫描数据};
+\node[o, right=10mm of scan] (pose) {位姿};
+\node[o, right=10mm of pose] (loc) {定位};
+\node[b, below=10mm of sensor] (hist) {历史子地图};
+\node[b, right=10mm of hist] (sub) {子地图};
+\node[b, right=10mm of sub] (grid) {栅格更新};
+\node[b, right=10mm of grid] (map) {地图};
+\draw[ln] (sensor)--(scan); \draw[ln] (scan)--(pose); \draw[ln] (pose)--(loc);
+\draw[ln] (scan) -- node[right,font=\scriptsize]{扫描匹配} (sub);
+\draw[ln] (hist) -- node[above,font=\scriptsize,pos=0.4]{回环检测} (scan);
+\draw[ln] (sub)--(grid); \draw[ln] (grid)--(map);
+\draw[ln] (hist)--(sub);
+\end{tikzpicture}
+\caption{一个典型的 2D SLAM 框架（对照高翔图 6-2 重绘）。左到右是「传感器 $\to$ 扫描 $\to$ 位姿 $\to$ 定位」的前端定位流，下方是「子地图 $\to$ 栅格更新 $\to$ 地图」的建图流，二者通过扫描匹配耦合，历史子地图经回环检测反馈校正。}
+\label{fig:slam2d-arch}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{二维扫描匹配：三维 ICP 的降维}
+\label{sec:slam2d-match}
+
+本节从状态估计的视角导出二维扫描匹配。二维激光雷达的扫描可视为一次观测 $\mathbf{z}$：它是机器人在位姿 $\mathbf{x}$ 上对地图 $\mathbf{m}$ 观测得到的数据，观测模型记 $\mathbf{z}=\mathbf{h}(\mathbf{x},\mathbf{m})+\mathbf{w}$，$\mathbf{w}$ 为噪声。我们要由 $\mathbf{z}$ 和 $\mathbf{m}$ 反估 $\mathbf{x}$，这是一个最大后验（MAP）或最大似然（MLE）问题。若只考虑 Scan-to-Scan，$\mathbf{m}$ 就退化为上一帧扫描，问题的关键便落到「如何定义残差」。
+
+\begin{note}
+\textbf{与第 \cref{ch:pointcloud} 章的关系（避免重复）.}\;
+点到点/点到线 ICP 的\emph{通用}原理——数据关联（找最近邻）与位姿估计两步交替、为何必须迭代、闭式 SVD 解与高斯-牛顿解、点到点/点到线/点到面在结构化环境中的鲁棒性差异——已在第 \cref{ch:pointcloud} 章讲透。本节\textbf{只}做一件三维章节没做的事：把这套配准\emph{降到} $\SE(2)$，展示哪些项化简、哪些项消失，并给出二维特有的雅可比。二维不存在「面」元素，故只有点到点与点到线两种。
+\end{note}
+
+\subsection{点到点二维 ICP 与雅可比降维}
+\label{sec:slam2d-p2p}
+
+设机器人坐标系 $B$ 到世界系 $W$ 的变换为 $\mathbf{x}=[x,y,\theta]^\top$。某束激光的测距与方位角为 $(\rho_i,\alpha_i)$，则该末端点的世界坐标为
+\begin{equation}
+\mathbf{p}_i^W=\big[\,x+\rho_i\cos(\alpha_i+\theta),\;\; y+\rho_i\sin(\alpha_i+\theta)\,\big]^\top.
+\label{eq:slam2d-pw}
+\end{equation}
+这正是 $\mathbf{p}_i^W=\mathbf{T}_{WB}\,\mathbf{p}_i^B$ 的展开。假设在目标点云中为 $\mathbf{p}_i^W$ 找到最近邻 $\mathbf{q}_i^W$，残差是它们的欧氏距离
+\begin{equation}
+\mathbf{e}_i=\mathbf{p}_i^W-\mathbf{q}_i^W\;\in\;\mathbb{R}^2,
+\label{eq:slam2d-p2p-e}
+\end{equation}
+于是位姿估计就是最小二乘 $(x,y,\theta)^*=\arg\min_{\mathbf{x}}\sum_{i=1}^n\|\mathbf{e}_i\|_2^2$，可交给高斯-牛顿求解。
+
+\paragraph{为什么二维可以直接对 $[x,y,\theta]$ 求导。}
+在三维 ICP 里我们对 $\SE(3)$ 取右扰动，雅可比是 $\mathbf{e}$ 对 $\delta\boldsymbol{\xi}\in\mathbb{R}^6$ 的导数，旋转部分要带反对称矩阵 $(\cdot)^\wedge$ 与右雅可比 $\mathbf{J}_r$（\cref{ch:lie}）。二维则可\emph{绕开}流形符号：因为 $\SO(2)$ 是\emph{交换}群、其右雅可比恒为 $1$，朝向更新就是简单的标量加法 $\theta\leftarrow\theta+\delta\theta$，所以可以直接对拆散的 $x,y,\theta$ 求偏导而不损失正确性。逐项对 \cref{eq:slam2d-pw} 求导：
+\begin{equation}
+\frac{\partial\mathbf{e}_i}{\partial x}=\begin{bmatrix}1\\0\end{bmatrix},\qquad
+\frac{\partial\mathbf{e}_i}{\partial y}=\begin{bmatrix}0\\1\end{bmatrix},\qquad
+\frac{\partial\mathbf{e}_i}{\partial\theta}=\begin{bmatrix}-\rho_i\sin(\alpha_i+\theta)\\ \rho_i\cos(\alpha_i+\theta)\end{bmatrix}.
+\label{eq:slam2d-p2p-jcol}
+\end{equation}
+整理成 $2\times 3$ 矩阵：
+\begin{equation}
+\frac{\partial\mathbf{e}_i}{\partial\mathbf{x}}=
+\begin{bmatrix}
+1 & 0 & -\rho_i\sin(\alpha_i+\theta)\\
+0 & 1 & \rho_i\cos(\alpha_i+\theta)
+\end{bmatrix}\;\in\;\mathbb{R}^{2\times 3}.
+\label{eq:slam2d-p2p-J}
+\end{equation}
+
+\paragraph{降维对账：$3\times 6$ 如何坍缩成 $2\times 3$。}
+把它和三维点到点 ICP 的 $3\times 6$ 雅可比 $\big[\,\mathbf{I}_3\;\;-(\mathbf{R}\mathbf{p}^B)^\wedge\,\big]$（\cref{ch:pointcloud}）对照，二维的化简一目了然：
+\begin{itemize}
+  \item \textbf{残差从 $3$ 维降到 $2$ 维}：$z$ 分量整行消失（平面运动无 $z$）。
+  \item \textbf{平移块从 $\mathbf{I}_3$ 降到 $\mathbf{I}_2$}：$\partial\mathbf{e}/\partial x,\partial\mathbf{e}/\partial y$ 就是单位阵的前两列。
+  \item \textbf{旋转块从 $3$ 列退化为 $1$ 列}：三维 $-(\mathbf{R}\mathbf{p}^B)^\wedge$ 是 $3\times 3$（绕 $x,y,z$ 三个轴），二维只剩绕 $z$ 轴一个转角，反对称矩阵 $(\cdot)^\wedge$ 退化为标量旋转 $90^\circ$，即 $\partial\mathbf{e}/\partial\theta$ 恰是把世界系相对位移 $\rho_i[\cos,\sin]^\top$ 旋转 $90^\circ$（$[\,-\sin,\cos\,]$）。
+\end{itemize}
+这条对账不是数字游戏：它说明二维 ICP \emph{就是}三维 ICP 把第三维和两个转轴「按掉」的特例，你在第 \cref{ch:pointcloud} 章对收敛性、初值敏感性、退化的全部直觉都原样适用。高斯-牛顿每轮：重找最近邻 $\to$ 用 \cref{eq:slam2d-p2p-J} 累加 $\mathbf{H}=\sum\mathbf{J}^\top\mathbf{J}$、$\mathbf{b}=-\sum\mathbf{J}^\top\mathbf{e}$ $\to$ 解 $\delta\mathbf{x}=\mathbf{H}^{-1}\mathbf{b}$ $\to$ 更新 $[x,y]\mathrel{+}=\delta\mathbf{x}_{1:2}$、$\theta$ 的 $\SO(2)$ 部分右乘 $\mathrm{Exp}(\delta\mathbf{x}_3)$。代码骨架如下。
+
+\begin{codebox}[C++]{二维点到点 ICP 的高斯-牛顿核心（对照高翔 icp\_2d.cc）}
+// source_scan_ 配准到 target_scan_（已对 target 建 K-d 树 kdtree_）
+bool Icp2d::AlignGaussNewton(SE2& init_pose) {
+  SE2 current_pose = init_pose;
+  const float max_dis2 = 0.01;     // 最近邻最大平方距离（剔野点）
+  const int   min_effect_pts = 20; // 最小有效点数
+  for (int iter = 0; iter < 10; ++iter) {
+    Mat3d H = Mat3d::Zero(); Vec3d b = Vec3d::Zero();
+    double cost = 0; int effective_num = 0;
+    float theta = current_pose.so2().log();          // 当前朝向
+    for (size_t i = 0; i < source_scan_->ranges.size(); ++i) {
+      float r = source_scan_->ranges[i];
+      if (r < range_min || r > range_max) continue;
+      float angle = angle_min + i * angle_increment;  // 束方位角 alpha_i
+      Vec2d pw = current_pose * Vec2d(r*std::cos(angle), r*std::sin(angle)); // p_i^W
+      // 最近邻
+      std::vector<int> nn_idx; std::vector<float> dis;
+      kdtree_.nearestKSearch(Point2d(pw.x(), pw.y()), 1, nn_idx, dis);
+      if (nn_idx.empty() || dis[0] >= max_dis2) continue;
+      ++effective_num;
+      Mat32d J;                                       // 2x3 雅可比，式 (slam2d-p2p-J)
+      J << 1, 0, -r*std::sin(angle+theta),
+           0, 1,  r*std::cos(angle+theta);
+      Vec2d e(pw.x()-target_cloud_->points[nn_idx[0]].x,
+              pw.y()-target_cloud_->points[nn_idx[0]].y);
+      H += J.transpose()*J;  b += -J.transpose()*e;   cost += e.dot(e);
+    }
+    if (effective_num < min_effect_pts) return false;
+    Vec3d dx = H.ldlt().solve(b);                     // 解 H dx = b
+    if (std::isnan(dx[0])) break;
+    current_pose.translation() += dx.head<2>();       // 平移直接加
+    current_pose.so2() = current_pose.so2() * SO2::exp(dx[2]); // 朝向右乘
+    if (iter > 0 && cost/effective_num >= last_cost) break;
+    last_cost = cost/effective_num;
+  }
+  init_pose = current_pose;  return true;
+}
+\end{codebox}
+
+\subsection{点到线二维 ICP（PL-ICP 的二维形式）}
+\label{sec:slam2d-p2l}
+
+二维不存在面，故 ICP 的另一种残差是\emph{点到线}（point-to-line，PL-ICP\cite{censi2008plicp}）。它整体流程与点到点一致，差别只在最近邻：不再取\emph{一个}最近邻，而是取 $k$ 个（如 $k=5$），用它们拟合一条直线，再算目标点到这条线的\emph{垂直}距离。直觉上点到线更贴合「激光打在墙面/平面边缘」的物理，在结构化环境里更稳——这一点的三维版（点到面）已在 \cref{ch:pointcloud} 论证，此处不重复。
+
+\paragraph{二维直线的简化表示与 SVD 拟合。}
+三维直线要用方向向量 $\mathbf{d}$ 加原点 $\mathbf{p}$ 描述（\cref{ch:pointcloud}），二维则可化为更简洁的\emph{隐式}形式 $a x + b y + c = 0$。给定 $k$ 个近邻点 $(x_j,y_j)$，直线拟合是参数最小二乘 $(a,b,c)^*=\arg\min\sum_j\|a x_j+b y_j+c\|_2^2$。把各点坐标排成
+\begin{equation}
+\mathbf{A}=\begin{bmatrix} x_1 & y_1 & 1\\ x_2 & y_2 & 1\\ \vdots & \vdots & \vdots\\ x_k & y_k & 1\end{bmatrix},
+\label{eq:slam2d-line-A}
+\end{equation}
+取 $\mathbf{A}$ 的\emph{最小奇异值}对应的右奇异向量即为 $(a,b,c)$（齐次最小二乘，约束 $\|(a,b)\|=1$ 由 SVD 自然给出）。
+
+\paragraph{残差与雅可比。}
+点 $(x,y)$ 到直线的垂直距离 $d=(a x+b y+c)/\sqrt{a^2+b^2}$，分母是\emph{固定常数}可以并入信息矩阵忽略，于是直接取残差 $e_i=a_i x_i^W+b_i y_i^W+c_i$（标量）。它对世界点坐标的导数恰是直线系数 $\partial e/\partial\mathbf{p}^W=[a_i,\,b_i]$。再用链式法则乘上 \cref{eq:slam2d-p2p-J} 的 $\partial\mathbf{p}^W/\partial\mathbf{x}$：
+\begin{equation}
+\frac{\partial e_i}{\partial\mathbf{x}}
+=\frac{\partial e_i}{\partial\mathbf{p}_i^W}\frac{\partial\mathbf{p}_i^W}{\partial\mathbf{x}}
+=\Big[\,a_i,\;\; b_i,\;\; -a_i\rho_i\sin(\alpha_i+\theta)+b_i\rho_i\cos(\alpha_i+\theta)\,\Big]\;\in\;\mathbb{R}^{1\times 3}.
+\label{eq:slam2d-p2l-J}
+\end{equation}
+注意残差从二维（点到点）降为\emph{标量}（点到线只惩罚法向偏离、不约束沿线方向）——这正是点到线在「沿墙滑动」方向上给出零梯度、从而对走廊等场景的\emph{切向}天然「放手」的代数根源，也为 \cref{sec:slam2d-discuss} 的退化分析埋下伏笔。其余（最近邻、$\mathbf{H}/\mathbf{b}$ 累加、更新）与点到点完全相同。
+
+% ════════════════════════════════════════════════════════════════
+\section{似然场扫描匹配}
+\label{sec:slam2d-lf}
+
+点到点 ICP 在每轮迭代都要\emph{重找}一遍最近邻——可以想象成给每个点和它的最近邻之间装一根「弹簧」，但每动一次位姿弹簧就得重装，比较费时。似然场（likelihood field，也叫高斯似然场）换一种思路：不装弹簧，而是认为目标点云在空间中形成了一个「\textbf{磁场}」——它对附近点有吸引力，吸引力随距离平方衰减；当前帧的点落在场里，沿场的负梯度方向被「吸」向最近的目标结构。这样就不必每轮重建近邻关系，直接查场值即可，这是本章相对标准 ICP 最重要的加速思想，也是 Hector SLAM\cite{kohlbrecher2011hector} 等系统的数学内核。
+
+\paragraph{从最近邻到距离变换图。}
+在地图的每个目标点附近定义一个随距离平方衰减的场，整张地图叠加起来，就是一个对每个像素都赋了「到最近障碍物的距离（的某种函数）」的图——这在图像处理里正是\textbf{距离变换图}（distance transform / distance map）。有了它，查询任意点的「误差」只需读该点所在像素的场值，$O(1)$ 完成，无需 K-d 树。\cref{fig:slam2d-lf} 给出一个二维扫描及其似然场：每个扫描点周围晕开一团亮斑，离扫描点越远场值越小（越暗）。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=1.0]
+  % 左：散乱扫描点
+  \begin{scope}
+    \foreach \p in {(0,0),(0.3,0.1),(0.55,0.05),(0.8,0.2),(0.5,0.6),(0.45,0.95),(0.4,1.3),
+                    (0.9,0.5),(1.2,0.45),(1.5,0.5),(1.1,1.0),(1.0,1.35)} {
+      \fill[main!70!black] \p circle (1.6pt);
+    }
+    \node[font=\small] at (0.7,-0.45) {（a）二维扫描点 $\{\mathbf{p}_i\}$};
+  \end{scope}
+  % 右：似然场（同布局，外晕表示衰减场）
+  \begin{scope}[xshift=4.2cm]
+    \foreach \p in {(0,0),(0.3,0.1),(0.55,0.05),(0.8,0.2),(0.5,0.6),(0.45,0.95),(0.4,1.3),
+                    (0.9,0.5),(1.2,0.45),(1.5,0.5),(1.1,1.0),(1.0,1.35)} {
+      \fill[third!20] \p circle (7pt);
+    }
+    \foreach \p in {(0,0),(0.3,0.1),(0.55,0.05),(0.8,0.2),(0.5,0.6),(0.45,0.95),(0.4,1.3),
+                    (0.9,0.5),(1.2,0.45),(1.5,0.5),(1.1,1.0),(1.0,1.35)} {
+      \fill[third!45] \p circle (4pt);
+    }
+    \foreach \p in {(0,0),(0.3,0.1),(0.55,0.05),(0.8,0.2),(0.5,0.6),(0.45,0.95),(0.4,1.3),
+                    (0.9,0.5),(1.2,0.45),(1.5,0.5),(1.1,1.0),(1.0,1.35)} {
+      \fill[third!85!black] \p circle (1.6pt);
+    }
+    \node[font=\small] at (0.7,-0.45) {（b）对应似然场（距离变换图）};
+  \end{scope}
+  \draw[->, thick, gray!60!black] (1.9,0.7) -- node[above,font=\scriptsize]{生成场} (3.9,0.7);
+\end{tikzpicture}
+\caption{二维扫描数据（a）与其对应的似然场（b，对照高翔图 6-5 示意）。每个扫描点周围晕开一个随距离衰减的「磁场」，整体叠加成距离变换图；当前帧落入场后沿负梯度被吸向最近结构。场有\emph{有效范围}与\emph{分辨率}（与物理场不同），实现中可用预生成模板「贴」出。}
+\label{fig:slam2d-lf}
+\end{figure}
+
+\paragraph{目标函数与雅可比（链式法则 + 图像梯度）。}
+考虑当前帧某点 $\mathbf{p}_i^B$ 经位姿 $\mathbf{x}$ 变到世界点 $\mathbf{p}_i^W$。设世界系下有一个似然场 $\pi(\cdot)$，该点落入场中读到 $\pi(\mathbf{p}_i^W)$。位姿估计就是最小化所有点的场值（场值定义为「偏离最近结构的程度」，越小越好）：
+\begin{equation}
+\mathbf{x}^*=\arg\min_{\mathbf{x}}\sum_{i=1}^n\big\|\pi(\mathbf{p}_i^W)\big\|_2^2.
+\label{eq:slam2d-lf-obj}
+\end{equation}
+$\pi$ 对位姿的雅可比由链式法则分解为「场对世界点」乘「世界点对位姿」：
+\begin{equation}
+\frac{\partial\pi}{\partial\mathbf{x}}=\frac{\partial\pi}{\partial\mathbf{p}_i^W}\cdot\frac{\partial\mathbf{p}_i^W}{\partial\mathbf{x}}.
+\label{eq:slam2d-lf-chain}
+\end{equation}
+后一项已是 \cref{eq:slam2d-p2p-J}。前一项需要把世界点按某分辨率 $\alpha$（像素/米）采到图像坐标 $\mathbf{p}_i^f=\alpha\,\mathbf{p}_i^W+\mathbf{c}$（$\mathbf{c}$ 为图像中心偏移，因为图像原点在左上角而物体坐标零点常在中心），于是场对世界点的导数 = 链上图像缩放 $\alpha$ 乘\emph{图像梯度}：
+\begin{equation}
+\frac{\partial\pi}{\partial\mathbf{p}_i^W}=\frac{\partial\pi}{\partial\mathbf{p}_i^f}\frac{\partial\mathbf{p}_i^f}{\partial\mathbf{p}_i^W}=\alpha\,[\Delta\pi_x,\;\Delta\pi_y],
+\label{eq:slam2d-lf-grad}
+\end{equation}
+其中 $[\Delta\pi_x,\Delta\pi_y]$ 是似然场图像上的梯度（用相邻像素差分估计，因为我们把场定义成\emph{光滑}函数，梯度可靠）。两式相乘得到每个残差对位姿的 $1\times 3$ 雅可比：
+\begin{equation}
+\frac{\partial\pi}{\partial\mathbf{x}}=\big[\,\alpha\Delta\pi_x,\;\;\alpha\Delta\pi_y,\;\; -\alpha\Delta\pi_x\,\rho_i\sin(\alpha_i+\theta)+\alpha\Delta\pi_y\,\rho_i\cos(\alpha_i+\theta)\,\big]^\top.
+\label{eq:slam2d-lf-J}
+\end{equation}
+有了它，便可用高斯-牛顿迭代配准。和点到点 ICP 比，似然场把「每轮重找最近邻」换成「每轮查表 + 读图像梯度」，且场可\emph{预生成}并与子地图绑定，非常适合 Scan-to-Map（\cref{sec:slam2d-submap}）。
+
+\paragraph{实现一：高斯-牛顿 + 预生成模板。}
+生成似然场最朴素的办法：对目标点云的每个点，「贴」一个预先算好的\emph{固定大小模板}（如 $20$ 像素边长，每个模板像素存其到中心的距离）。遍历所有目标点、把模板盖上去、取各像素的\emph{最小}距离值，就得到一张距离变换图（实现里常用 $1000\times 1000$、分辨率 $30$ 像素/米的 \texttt{cv::Mat}）。配准时把 ICP 的「残差 + 雅可比」换成似然场的「场值 + 图像梯度」即可。
+
+\begin{codebox}[C++]{似然场生成与高斯-牛顿配准要点（对照高翔 likelihood\_field.cc）}
+// 预生成模板：每个模板像素存其到中心的距离（场值）
+void LikelihoodField::BuildModel() {
+  const int range = 20;                  // 模板半径（像素）
+  for (int x = -range; x <= range; ++x)
+    for (int y = -range; y <= range; ++y)
+      model_.emplace_back(x, y, std::sqrt(x*x + y*y)); // (dx, dy, residual)
+}
+// 把模板"贴"到每个目标点 -> 距离变换图 field_
+void LikelihoodField::SetTargetScan(Scan2d::Ptr scan) {
+  field_ = cv::Mat(1000, 1000, CV_32F, 30.0);          // 初值=大距离
+  for (size_t i = 0; i < scan->ranges.size(); ++i) {
+    float r = scan->ranges[i]; if (r < range_min || r > range_max) continue;
+    double a = angle_min + i * angle_increment;
+    double x = r*std::cos(a)*resolution_ + 500;        // 世界点 -> 图像坐标
+    double y = r*std::sin(a)*resolution_ + 500;
+    for (auto& m : model_) {                            // 贴模板，取最小场值
+      int xx = int(x + m.dx_), yy = int(y + m.dy_);
+      if (xx>=0 && xx<field_.cols && yy>=0 && yy<field_.rows
+          && field_.at<float>(yy, xx) > m.residual_)
+        field_.at<float>(yy, xx) = m.residual_;
+    }
+  }
+}
+// 配准时（每点）：读场值作残差，读图像梯度构雅可比
+// e        = field_.at<float>(pf.y, pf.x);              // 式 (slam2d-lf-obj)
+// dx_img   = 0.5*(field_(y, x+1) - field_(y, x-1));     // 图像 x 梯度
+// dy_img   = 0.5*(field_(y+1, x) - field_(y-1, x));     // 图像 y 梯度
+// J << res*dx_img, res*dy_img,
+//      -res*dx_img*r*sin(a+th) + res*dy_img*r*cos(a+th); // 式 (slam2d-lf-J)
+\end{codebox}
+
+\paragraph{实现二：图优化（g2o 一元边）。}
+若用图优化器（g2o/Ceres），可以更方便地切换迭代策略、加鲁棒核。把 $\SE(2)$ 位姿设为顶点 \texttt{VertexSE2}，每个扫描点对应一条\emph{一元边} \texttt{EdgeSE2LikelihoodField}：其 \texttt{computeError} 读场值作残差、\texttt{linearizeOplus} 读图像梯度构 \cref{eq:slam2d-lf-J}。两套（高斯-牛顿/图优化）数学完全一致，区别只在「谁来管迭代」。
+
+\begin{codebox}[C++]{似然场的 g2o 一元边（顶点 + 边，对照高翔 g2o\_types.h）}
+class VertexSE2 : public g2o::BaseVertex<3, SE2> {
+public:
+  void setToOriginImpl() override { _estimate = SE2(); }
+  void oplusImpl(const double* update) override {       // 右乘更新
+    _estimate.translation()[0] += update[0];
+    _estimate.translation()[1] += update[1];
+    _estimate.so2() = _estimate.so2() * SO2::exp(update[2]);
+  }
+};
+class EdgeSE2LikelihoodField : public g2o::BaseUnaryEdge<1, double, VertexSE2> {
+public:
+  void computeError() override {                          // 残差 = 场值
+    auto* v = static_cast<VertexSE2*>(_vertices[0]);
+    Vec2d pw = v->estimate() * Vec2d(range_*std::cos(angle_), range_*std::sin(angle_));
+    Vec2i pf = (pw*resolution_ + center_).cast<int>();
+    if (IsInside(pf)) _error[0] = field_image_.at<float>(pf[1], pf[0]);
+    else { _error[0] = 0; setLevel(1); }                  // 出界点降权
+  }
+  void linearizeOplus() override { /* 读图像梯度构 1x3 雅可比，式 (slam2d-lf-J) */ }
+};
+\end{codebox}
+
+\begin{practice}[想一想：似然场为什么快、又为什么有「天花板」]
+似然场把 $O(\text{近邻搜索})$ 降为 $O(1)$ 查表，代价是\emph{有效范围}与\emph{分辨率}有限：离任何障碍物都很远的点读到的是「饱和」的大场值、梯度近零，给不出有效约束。这意味着似然场对\emph{初值}仍敏感（初值偏太远则落在场外）。\cref{sec:slam2d-submap} 的多分辨率金字塔正是为缓解这一点：在\emph{低}分辨率（场更「胖」、有效范围更大）下先粗配，再逐级精化。请预判：若把模板半径从 $20$ 像素调到 $5$ 像素，收敛域会变大还是变小？精度呢？
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{占据栅格地图：log-odds 与 Bresenham}
+\label{sec:slam2d-grid}
+
+扫描匹配解决了「定位」，接下来是「建图」：把配准好的扫描刷成一张可供导航的二维地图。最广泛使用的形式是\textbf{占据栅格地图}（occupancy grid）——把平面划成许多小格，每格存一个「被障碍物占据」的概率（$0\!\sim\!1$ 浮点）。栅格与图像天然一一对应，可用 OpenCV 存取与可视化。对多数轮式机器人，我们只关心每格的\emph{可通行性}（有没有物体占据），并不在意复杂语义。
+
+\begin{note}
+\textbf{与第 \cref{ch:dense} 章的关系（不复述 log-odds 推导）.}\;
+「占据概率 / 对数几率（log-odds）二值贝叶斯滤波 / 逆传感器模型 / 为何用对数域把乘法变加法」这套\emph{概率内核}已在第 \cref{ch:dense} 章随三维 OctoMap 完整推导。本节默认你已掌握它，只补两件二维特有的事：(1) 二维平面栅格 vs 三维八叉树的取舍；(2) 把一条激光线\emph{栅格化}成「沿途空闲 + 末端占据」的两种整数算法（Bresenham 画线、模板法）。
+\end{note}
+
+\subsection{占据概率与 log-odds 的工程化}
+\label{sec:slam2d-logodds}
+
+\paragraph{两类物理含义：末端点占据、连线空闲。}
+一束激光的末端点表示「这里有障碍物」；而从传感器中心到末端点的\emph{连线}表示「这一路是空的、可通行」。注意第二层含义需要\emph{计算}这条连线经过哪些栅格，这正是\textbf{光线投射}（ray casting）与\textbf{栅格化}（rasterization）。占据栅格更新的逻辑：某格反复被观测为障碍 $\Rightarrow$ 占据概率升向 $1$；反复被观测为空 $\Rightarrow$ 降向 $0$；从未观测 $\Rightarrow$ 停在 $0.5$（未知）。这套「升/降」恰是 log-odds 二值贝叶斯滤波的离散观测形式（\cref{ch:dense}），它\emph{动态}更新——一个物体先在再走开，对应栅格概率先升后降，从而\emph{过滤动态物体}。
+
+\paragraph{工程上常用灰度计数代替对数运算。}
+log-odds 严格做要引入指数和对数，计算偏重。工程里有一个常用近似：直接用 $8$ 位图像灰度（$0\!\sim\!255$）描述占据状态——$127$ 为未知；每次观测为障碍则该格灰度计数减一（变黑、趋占据），观测为空则加一（变白、趋通行），并\emph{钳位}上下限（如 $[117,137]$ 附近设阈），既保留「多次观测才确信」的滤波效果，又省去 $\exp/\log$。这与 log-odds 的对数域加减在效果上同型（计数即 log-odds 的整数化代理），但实现极简、并发友好。最终把灰度二值化（$\ne 127$ 即显黑/白）即得占据栅格图。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=0.52]
+  % 栅格
+  \draw[step=1, gray!45, thin] (0,0) grid (9,7);
+  % 传感器中心
+  \fill[black] (0.5,0.5) circle (4pt);
+  \node[font=\small, left] at (0.4,0.5) {传感器};
+  % 一条光线穿过的空闲格（蓝）
+  \foreach \c in {(1,0),(1,1),(2,1),(3,1),(3,2),(4,2),(4,3),(5,3),(5,4),(6,4)} {
+    \fill[main!35] \c rectangle ++(1,1);
+  }
+  % 末端占据格（红）
+  \fill[red!55] (6,4) rectangle ++(1,1);
+  \fill[red!55] (7,5) rectangle ++(1,1);
+  % 光线
+  \draw[very thick, gray!70!black] (0.5,0.5) -- (7.4,5.4);
+  \node[font=\small] at (3.0,-0.7) {\textcolor{main!60!black}{空闲（连线穿过）}};
+  \node[font=\small] at (7.4,-0.7) {\textcolor{red!70!black}{占据（末端）}};
+\end{tikzpicture}
+\caption{二维激光的占据栅格与投射过程（对照高翔图 6-7 重绘）。激光从传感器中心射向末端点，沿途穿过的栅格被标为「空闲」（蓝、计数加），末端点所在栅格被标为「占据」（红、计数减）。把连续激光线转成栅格涉及一个\emph{栅格化}过程，可用 Bresenham 整数画线实现。}
+\label{fig:slam2d-raycast}
+\end{figure}
+
+\subsection{Bresenham 整数画线}
+\label{sec:slam2d-bresenham}
+
+要把「从 $\mathbf{p}_1$（传感器）到 $\mathbf{p}_2$（末端）」这条连线经过的栅格逐个点亮，最经典的是 \textbf{Bresenham 算法}——一种\emph{只用整数加减}对直线栅格化的算法。它的妙处在于完全避开浮点与除法，因而极快、并发友好，这对动辄数十万格的栅格刷新至关重要。
+
+\paragraph{从浮点斜率到纯整数判据。}
+朴素想法：记 $[\mathrm{d}x,\mathrm{d}y]=\mathbf{p}_2-\mathbf{p}_1$，取增量较大的轴为主轴（设为 $x$）；从 $\mathbf{p}_1$ 出发，每当 $x$ 自增 $1$，与真实直线的纵向误差就累加斜率 $\mathrm{d}y/\mathrm{d}x$，误差超过 $0.5$ 就让 $y$ 自增 $1$、误差减 $1$。这里有浮点。Bresenham 的关键技巧是把第 $3$ 步的所有运算\emph{同乘 $2\mathrm{d}x$}：令初始误差 $e=-\mathrm{d}x$，每当 $x$ 自增 $1$，$e\mathrel{+}=2\mathrm{d}y$；若 $e>0$ 则 $y$ 自增 $1$、$e\mathrel{-}=2\mathrm{d}x$。这样\emph{只剩整数加法与乘法}，回避了浮点和除法。若 $y$ 为主轴则交换 $x,y$ 的角色即可。
+
+\begin{codebox}[C++]{Bresenham 画线刷占据栅格（对照高翔 occupancy\_map.cc）}
+void OccupancyMap::BresenhamFilling(const Vec2i& p1, const Vec2i& p2) {
+  int dx = p2.x()-p1.x(), dy = p2.y()-p1.y();
+  int ux = dx > 0 ? 1 : -1,  uy = dy > 0 ? 1 : -1;     // 步进方向
+  dx = std::abs(dx); dy = std::abs(dy);
+  int x = p1.x(), y = p1.y();
+  if (dx > dy) {                                        // x 为主轴
+    int e = -dx;
+    for (int i = 0; i < dx; ++i) {
+      x += ux;  e += 2*dy;
+      if (e >= 0) { y += uy; e -= 2*dx; }
+      if (Vec2i(x, y) != p2) SetPoint(Vec2i(x, y), false); // 沿途=空闲
+    }
+  } else {                                              // y 为主轴：x/y 互换
+    int e = -dy;
+    for (int i = 0; i < dy; ++i) {
+      y += uy;  e += 2*dx;
+      if (e >= 0) { x += ux; e -= 2*dy; }
+      if (Vec2i(x, y) != p2) SetPoint(Vec2i(x, y), false);
+    }
+  }
+}
+// SetPoint：occupy=true 则计数趋黑（占据），false 则趋白（空闲），钳位上下限
+\end{codebox}
+
+\subsection{模板法：用空间换计算稳定性}
+\label{sec:slam2d-template}
+
+Bresenham 对\emph{每条}激光线逐格栅格化，当激光角分辨率很高、或测距很远（如量程 $100\!\sim\!200$ 米）时会很费。\textbf{模板法}（template）反过来：预先算好一个\emph{固定大小}的模板区域，模板内每个格存它相对传感器的「距离 + 夹角」；刷地图时遍历模板格，把模板格在某角度上的距离与该角度激光\emph{实际}测到的距离比较——模板距离\emph{小于}激光测距 $\Rightarrow$ 该格在障碍物之前，空闲；\emph{约等于} $\Rightarrow$ 占据；\emph{大于} $\Rightarrow$ 在障碍物之后，不更新。这样总计算量与\emph{模板点数}线性相关（固定），不随激光线数/量程膨胀，且天然并行。
+
+实测对比：模板法刷一帧约需 $10\!\sim\!20$ ms，Bresenham 直线法不到 $1$ ms，差异显著——因为模板法的更新点数（几十万）远多于直线法（几百点）。但当激光角分辨率\emph{很高}或测距\emph{很远}时，模板法可\emph{限制}计算范围（只更新模板覆盖区），反而省时。两法各有适用边界：近距离高线数用直线法，远量程稀疏用模板法。这也呼应了一条工程通则——\emph{用空间（预生成结构）换时间}，与似然场「预生成模板贴场」是同一招。
+
+\begin{table}[H]\centering\small
+\caption{两种栅格化方法对照（高翔图 6-7、6-8 实测）}
+\label{tab:slam2d-raster}
+\begin{tabular}{p{0.16\textwidth} p{0.30\textwidth} p{0.30\textwidth} p{0.12\textwidth}}
+\toprule
+方法 & 原理 & 适用 & 单帧耗时 \\
+\midrule
+Bresenham 直线法 & 对每条激光线整数画线，沿途空闲、末端占据 & 近距、激光线数有限 & $<1$ ms \\
+模板法 & 预生成「距离+夹角」模板，比较模板距离与实测距离 & 远量程、高角分辨率（可限范围） & $10\!\sim\!20$ ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{子地图与多分辨率回环}
+\label{sec:slam2d-submap}
+
+把扫描匹配与占据栅格拼起来，再引入\textbf{子地图}（submap）这一中间层，就能优雅地处理回环与全局调整。子地图是介于「单帧」与「全局地图」之间的数据组织方式：把若干相邻帧归并成一个有\emph{独立位姿}的局部地图。早期 SLAM 用单张全局地图，处理回环时牵一发动全身；子地图把地图\emph{分块}，回环时只需调整块与块之间的相对关系，更灵活。
+
+\subsection{\texorpdfstring{$\SE(2)$}{SE(2)} 子地图：分离 \texorpdfstring{$\mathbf{T}_{WS}$}{T\_WS} 与 \texorpdfstring{$\mathbf{T}_{SC}$}{T\_SC}}
+\label{sec:slam2d-submap-se2}
+
+每个子地图含有一个可随时调整的位姿 $\mathbf{T}_{WS}\in\SE(2)$（$W$ 世界系、$S$ 子地图系）。Scan-to-Map 配准时，实际算的是当前扫描相对\emph{当前子地图}的位姿 $\mathbf{T}_{SC}$（$C$ 当前扫描系）。于是每帧的世界位姿是两段复合：
+\begin{equation}
+\mathbf{T}_{WC}=\mathbf{T}_{WS}\,\mathbf{T}_{SC}.
+\label{eq:slam2d-twc}
+\end{equation}
+这种分离的精髓在于：把\textbf{子地图位姿} $\mathbf{T}_{WS}$ 单独拎出来。日常每帧配准只解\emph{帧相对子地图}的 $\mathbf{T}_{SC}$（算完即固定）；而当回环要调整整张地图形状时，\emph{只需}改各子地图的 $\mathbf{T}_{WS}$，无须再动子地图\emph{内部}的每帧 $\mathbf{T}_{SC}$。这就是为什么回环可以把子地图当作\emph{基本单元}处理——子地图数远少于关键帧数，位姿图规模小得多，优化更快（代价是基于子地图的回环无法修复单个子地图\emph{内部}的畸变，故有些系统仍以关键帧为单元，见 \cref{sec:slam2d-discuss}）。
+
+\paragraph{基于子地图的 2D SLAM 主循环。}
+按下面逻辑实现（每个子地图\emph{同时}持有一个占据栅格和一个似然场——似然场供配准、栅格供建图与可视化）：
+\begin{enumerate}
+  \item 当前扫描与\emph{当前}子地图做似然场配准，得 $\mathbf{T}_{SC}$，进而得世界位姿 \cref{eq:slam2d-twc}；
+  \item 把该帧刷进当前子地图的占据栅格，并据新栅格更新似然场图像；
+  \item 若机器人移动/转动超阈值，取为\emph{关键帧}并加入当前子地图；
+  \item 若机器人移出当前子地图范围（出现「界外点」），或当前子地图关键帧数超上限（如 $>50$），就以当前帧为中心\emph{新建}子地图（并把旧子地图最近的几个关键帧复制进新子地图，方便后续配准的初始衔接），把旧子地图存入历史；
+  \item 合并所有子地图的栅格即得全局地图。
+\end{enumerate}
+
+\begin{codebox}[C++]{子地图配准 + 建图（对照高翔 submap.cc / mapping\_2d.cc）}
+bool Submap::MatchScan(std::shared_ptr<Frame> frame) {
+  field_.SetSourceScan(frame->scan_);
+  field_.AlignG2O(frame->pose_submap_);                 // 配到本子地图，得 T_SC
+  frame->pose_ = pose_ * frame->pose_submap_;            // T_WC = T_WS * T_SC，式(slam2d-twc)
+  return true;
+}
+void Submap::AddScanInOccupancyMap(std::shared_ptr<Frame> frame) {
+  occu_map_.AddLidarFrame(frame, OccupancyMap::GridMethod::MODEL_POINTS); // 刷栅格
+  field_.SetFieldImageFromOccuMap(occu_map_.GetOccupancyGrid());          // 据栅格更新似然场
+}
+// 外层主循环 Mapping2D::ProcessScan：用上一帧位姿作初值 -> MatchScan -> 刷栅格
+//   -> IsKeyFrame() 取关键帧 -> 若 HasOutsidePoints() 或关键帧>50 则 ExpandSubmap()
+\end{codebox}
+
+\subsection{多分辨率回环检测：金字塔与 BnB 同源}
+\label{sec:slam2d-mrlc}
+
+\paragraph{为什么回环配准不同于里程计配准。}
+里程计配准基于\emph{连续运动}，初值（上一帧）离最优解很近；而回环的位姿初值由\emph{累积漂移}决定，可能离最优解很远。直接拿 ICP/似然场去配回环，极易陷入错误局部极小。实际回环配准都在原配准基础上\emph{增强对大偏差初值的处理}：网格搜索、粒子滤波、\textbf{分支定界}（Branch-and-Bound, BnB）、\textbf{金字塔（多分辨率）} 等。其中分支定界与金字塔最实用，且二者原理\emph{相近}。
+
+\paragraph{多分辨率（由粗至精）：用「胖」场换大收敛域。}
+金字塔回环（也叫由粗至精 coarse-to-fine、多分辨率 multi-resolution）的思路：在原似然场之外，再造几张\emph{不同分辨率}的似然场。低分辨率下，每个障碍物形成的似然场物理尺寸\emph{更大}（场更「胖」、有效范围更广），能容忍更差的初值；但形状细节糊掉。于是先在低分辨率粗配，再把结果\emph{投影}到高分辨率精配，逐级收敛（\cref{fig:slam2d-pyramid}）。典型用四层场，每上一层图像缩小一半。这正是 \cref{sec:slam2d-lf} 末尾埋下的伏笔——多分辨率是治似然场「初值敏感」的标准药方。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small]
+  % L0 大图
+  \draw[draw=third!60!black, fill=third!6, rounded corners] (0,0) rectangle (3,3);
+  \node at (1.5,3.25) {Level 0（原始，细）};
+  \foreach \p in {(0.6,0.6),(1.0,0.7),(1.4,0.9),(1.9,1.5),(2.2,2.0),(0.9,2.3),(2.5,0.8)} { \fill[third!75!black] \p circle (3pt); }
+  % L1
+  \draw[draw=second!60!black, fill=second!6, rounded corners] (3.7,0.75) rectangle (5.2,2.25);
+  \node[font=\scriptsize] at (4.45,2.5) {Level 1};
+  % 点坐标已按 base(3.7,0.75)+0.5*offset 预算为绝对值（避免 calc 因子语法在 \foreach 内的解析脆弱）
+  \foreach \p in {(3.85,0.90),(3.95,0.925),(4.05,0.975),(4.175,1.125),(4.25,1.25),(3.925,1.325),(4.325,0.95)} { \fill[second!75!black] \p circle (4.5pt); }
+  % L2
+  \draw[draw=main!60!black, fill=main!6, rounded corners] (5.7,1.05) rectangle (6.45,1.8);
+  \node[font=\scriptsize] at (6.05,2.0) {Level 2};
+  % 同上：base(5.7,1.05)+0.25*offset 预算为绝对坐标
+  \foreach \p in {(5.775,1.125),(5.85,1.175),(5.925,1.2625),(5.8125,1.30)} { \fill[main!70!black] \p circle (5pt); }
+  \draw[->, thick, gray!60!black] (3.1,1.5) -- node[above,font=\scriptsize]{先粗配} (3.6,1.5);
+  \draw[->, thick, gray!60!black] (5.25,1.5) -- node[above,font=\scriptsize]{再粗} (5.65,1.5);
+  \draw[->, thick, gray!50!black, dashed] (6.05,1.0) to[bend right=30] node[below,font=\scriptsize]{结果投回精化} (1.5,-0.1);
+\end{tikzpicture}
+\caption{多分辨率似然场金字塔（对照高翔图 6-12 示意）。越上层图像越小、似然场越「胖」、有效范围越大、可容忍越差的初值；先在低分辨率粗配、结果逐级投影回高分辨率精化。这与分支定界（BnB）「先在粗分辨率定界、再细化搜索」是同一思路的两种实现。}
+\label{fig:slam2d-pyramid}
+\end{figure}
+
+\paragraph{匹配阈值与单线激光的视场限制。}
+回环匹配成功的判据是「内点（inlier）比例超过阈值」。这个阈值是回环检测的\emph{关键超参}，体现敏感度：阈值\emph{高}则更准更严，但可能漏检（机器人完全回到原点且同朝向才认）；阈值\emph{低}则更灵敏，但可能误检（错误回环）。一个常被忽视的工程约束：单线激光雷达视场往往不是 $360^\circ$（如某些只有 $270^\circ$），机器人回到旧地时\emph{朝向}可能不同，导致当前扫描与历史子地图虽在同一位置却\emph{部分重叠}。为容忍部分匹配，阈值不能设太高——高翔实测在 $270^\circ$ 视场下取约 $40\%$ 的内点比例阈值。
+
+\paragraph{对照 Cartographer 的分支定界（BnB）。}
+高翔用金字塔做\emph{近似}的由粗至精搜索；而 Cartographer\cite{hess2016cartographer} 用\textbf{分支定界}做\emph{精确}（保证全局最优）的窗口搜索——这是补第 \cref{ch:loop} 章未展开的一处空白。BnB 把「在一个位姿窗口内找最高匹配分」建模成树搜索：每个节点代表一个位姿\emph{子区间}，先在\emph{粗}分辨率上为该子区间计算一个匹配分的\emph{上界}（branch + bound），若上界都低于当前最优解就整枝\emph{剪掉}（不再细化该子区间），否则继续二分细化、下探更精分辨率。BnB 与金字塔的\emph{共性}：都用多分辨率栅格、都先粗后精；\emph{区别}：金字塔在每层各做\emph{一次}配准（局部、近似、快），BnB 在每层取\emph{若干}子区间算\emph{定界}（全局最优、有理论保证、稍慢）。理解这层对应，便能在「要快」与「要全局最优」之间按需选型。
+
+\subsection{基于子地图的回环修正：\texorpdfstring{$\SE(2)$}{SE(2)} 位姿图}
+\label{sec:slam2d-pgo}
+
+一旦多分辨率匹配成功，得到当前帧与某历史子地图的配准关系，就启动一次回环修正——一个 $\SE(2)$ 上的\textbf{位姿图}（pose graph）问题，以\emph{子地图位姿}为优化变量。
+
+\paragraph{把匹配结果换算成子地图间相对位姿。}
+设历史子地图 $S_1$ 位姿 $\mathbf{T}_{WS_1}$、当前帧位姿 $\mathbf{T}_{WC}$、当前所在子地图 $S_2$ 位姿 $\mathbf{T}_{WS_2}$。多分辨率匹配实际算的是当前帧在 $S_1$ 中的相对位姿 $\mathbf{T}_{S_1 C}$，于是 $S_1$ 与 $S_2$ 的相对位姿是
+\begin{equation}
+\mathbf{T}_{S_1 S_2}=\mathbf{T}_{S_1 C}\,\mathbf{T}_{WC}^{-1}\,\mathbf{T}_{WS_2}.
+\label{eq:slam2d-Ts1s2}
+\end{equation}
+
+\paragraph{位姿图残差与鲁棒验证。}
+位姿图的观测有两类：\emph{相邻}子地图之间的相对位姿、\emph{回环}检测算出的两子地图相对位姿。设回环测得 $S_1,S_2$ 的相对位姿为 $\mathbf{T}_{S_1 S_2}$，则残差是
+\begin{equation}
+\mathbf{e}=\mathrm{Log}\!\left(\mathbf{T}_{WS_1}^{-1}\,\mathbf{T}_{WS_2}\,\mathbf{T}_{S_1 S_2}^{-1}\right)\;\in\;\mathbb{R}^3.
+\label{eq:slam2d-pg-e}
+\end{equation}
+其雅可比交给优化器自动求导（g2o/Ceres）。为防\emph{假回环}污染全局，加一道几何验证：修正引入的累积误差不应过大，否则把该回环当异常值剔除——这与第 \cref{ch:loop} 章「鲁棒 PGO 抗假回环」、第 \cref{ch:nlopt} 章鲁棒核一脉相承，此处只点出 $\SE(2)$ 的具体残差形式 \cref{eq:slam2d-pg-e}，通用鲁棒后端不复述。可视化对比「开/关回环」的全局地图，能直观看到中间区段的重影被回环修正抹平。
+
+\begin{codebox}[C++]{$\SE(2)$ 回环约束与位姿图优化要点（对照高翔 loop\_closing.cc）}
+struct LoopConstraints {                 // 一个回环约束：两子地图 id + 相对位姿
+  size_t id_submap1_, id_submap2_;  SE2 T12_;  bool valid_ = true;
+};
+// 1) 候选检测：当前帧与历史子地图空间近、时间远（跳过最近 submap_gap_ 个）
+//    且距离 < candidate_distance_th_（如 15 m）
+// 2) 多分辨率匹配验证：mr_field->AlignG2O(init_guess) 成功 -> 算 T_S1S2 (式 slam2d-Ts1s2)
+// 3) Optimize()：以各子地图位姿为顶点，相邻边 + 回环边构 g2o 位姿图，
+//    回环边挂 RobustKernelHuber(delta) 抗假回环；优化结果直接更新各 T_WS
+//    （注意：本实现把回环串在主循环里；工程上常独立线程，加锁/解锁）
+\end{codebox}
+
+% ════════════════════════════════════════════════════════════════
+\section{讨论：退化、畸变与工程陷阱}
+\label{sec:slam2d-discuss}
+
+至此我们拼出了一个相对完整的、基于子地图模式的 2D SLAM。本节叙述几类\emph{实践中明显多于理论}的问题——它们决定了一个 2D SLAM 系统能否真正落地。
+
+\subsection{运动畸变}
+\label{sec:slam2d-distortion}
+
+激光雷达是\emph{周期旋转}的传感器，转一周约需 $100$ ms。它在设计时并不考虑机器人底盘本身也在动：底盘静止时，传感器转 $360^\circ$ 对应物理世界 $360^\circ$；底盘运动时，激光转满一圈对应的物理朝向就略大于或略小于 $360^\circ$，且底盘平移也会改变各激光点的实际测距——这就是\textbf{运动畸变}（motion distortion）。去畸变的基本思路：获取激光周期\emph{起始}与\emph{终止}时刻的位姿，对每个激光点按其采集时刻\emph{内插}补偿。难点在于「刚拿到激光数据时还没估出位姿，而去畸变又依赖位姿」这个鸡生蛋问题——有 IMU 时可用 IMU 在 $100$ ms 内的短时积分预测这段运动（去畸变四法及三维细节见 \cref{ch:lidar_slam} 的去畸变一节，此处不重复）。
+
+\subsection{玻璃、镜面与反光}
+\label{sec:slam2d-glass}
+
+激光测的是发射与反射之间的飞行时间，被测物表面性质会显著影响读数：
+\begin{itemize}
+  \item \textbf{玻璃}：表面可能引起激光\emph{部分}反射、也可能\emph{穿透}，导致玻璃墙被刷成断断续续的障碍物（图上「透视」）。
+  \item \textbf{镜面}：打到镜面的激光被\emph{镜像}反射到另一区域，表现为该方向测距异常变长，镜面物体在地图上\emph{测不出}。
+  \item \textbf{反光/低反射率}：黑色吸光面回波弱、远处稀疏面回波丢失，造成空洞。
+\end{itemize}
+这些都是单线纯激光的\emph{物理}短板，工程上常靠地图层手工标注、或融合其他模态缓解。
+
+\subsection{几何退化与规范自由度}
+\label{sec:slam2d-degeneracy}
+
+单线激光观测单一、视场窄，纯激光方案易受场景\emph{结构}影响而\textbf{退化}（degeneracy）：扫描匹配在某些方向上无法确定位姿，结果存在一个或多个\emph{额外自由度}。两类经典退化：
+\begin{itemize}
+  \item \textbf{长走廊}：似然场沿走廊两壁分布；机器人沿走廊前进时，新扫描仍能正常匹配到旧走廊上，算法\emph{误判机器人没动}。位姿估计沿走廊方向产生额外自由度、垂直方向不会——故走廊的额外自由度为 $1$。这正是 \cref{sec:slam2d-p2l} 点到线残差在切向给零梯度的几何后果。
+  \item \textbf{空旷广场}：既不能定平移、也不能定旋转，额外自由度为 $3$（整个 $\SE(2)$ 不可观）。
+\end{itemize}
+这种「优化问题对某方向不敏感、解不唯一」的现象，在数学上称为\textbf{规范自由度}（gauge freedom）——与第 \cref{ch:nlopt} 章、第 \cref{ch:lidar_slam} 章在 SLAM 后端可观测性里讨论的 gauge freedom 是同一概念在 2D 扫描匹配上的体现。正圆、单边墙、多面同向墙等规则/对称场景也会有额外自由度。退化的\emph{治法}：引入其他传感器（IMU/轮速/GPS）融合即可在退化方向补上约束——无论松耦合还是紧耦合，都能在退化场景下为激光建图/定位提供补偿（融合机制见 \cref{ch:lidar_slam}）。
+
+\begin{practice}[退化检测：从 Hessian 看可观测性]
+扫描匹配的高斯-牛顿每轮都构造 $\mathbf{H}=\sum\mathbf{J}^\top\mathbf{J}\in\mathbb{R}^{3\times 3}$。退化方向恰对应 $\mathbf{H}$ 的\emph{小特征值}方向（该方向上代价对位姿变化不敏感）。请据此设计一个\emph{退化检测器}：对 $\mathbf{H}$ 做特征分解，若最小特征值低于阈值，则判定沿对应特征向量方向退化、并在该方向\emph{降权}或交给其他传感器。提示：这与本章习题「用直线拟合做退化检测」殊途同归，也是工业级 LIO 处理长走廊的标准手段（\cref{ch:lidar_slam}）。
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+本章把第 \cref{ch:pointcloud} 章的配准、第 \cref{ch:dense} 章的 log-odds 建图、第 \cref{ch:loop} 章的回环-位姿图「降到二维」，拼成一个完整的 2D 激光 SLAM。主线是：\emph{扫描匹配（点点/点线 ICP 的 $\SE(2)$ 降维 $\to$ 似然场磁场加速）$\to$ 占据栅格（log-odds + Bresenham/模板）$\to$ $\SE(2)$ 子地图 $\to$ 多分辨率回环（对照 Cartographer BnB）}。它可作为各种单线激光雷达（扫地机、AGV、服务机器人）定位与建图的算法雏形。
+
+\paragraph{核心记号与公式速查.}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.30\textwidth} p{0.62\textwidth}}
+\toprule
+对象 & 含义 / 公式 \\
+\midrule
+二维位姿 & $\mathbf{x}=[x,y,\theta]^\top\leftrightarrow\mathbf{T}_{WB}\in\SE(2)$；更新 $\theta\!\leftarrow\!\theta+\delta\theta$（$\SO(2)$ 交换） \\
+点到点 ICP 雅可比 & \cref{eq:slam2d-p2p-J}：$2\times 3$，由三维 $3\times 6$ 坍缩（$z$ 消失、旋转块 $3\!\to\!1$ 列） \\
+点到线 ICP 雅可比 & \cref{eq:slam2d-p2l-J}：$1\times 3$，残差降为标量（只罚法向、放切向） \\
+似然场目标/雅可比 & \cref{eq:slam2d-lf-obj}、\cref{eq:slam2d-lf-J}：场值作残差，链式 = 图像梯度 $\times$ 缩放 $\times\,\partial\mathbf{p}^W/\partial\mathbf{x}$ \\
+占据栅格更新 & log-odds 二值贝叶斯（\cref{ch:dense}）；工程用灰度计数：占据趋黑、空闲趋白、钳位 \\
+Bresenham & 整数画线：$e\!=\!-\mathrm{d}x$，$e\!+\!=\!2\mathrm{d}y$；$e\!>\!0$ 则进位、$e\!-\!=\!2\mathrm{d}x$ \\
+子地图复合 & \cref{eq:slam2d-twc}：$\mathbf{T}_{WC}=\mathbf{T}_{WS}\mathbf{T}_{SC}$；回环只调 $\mathbf{T}_{WS}$ \\
+$\SE(2)$ 回环残差 & \cref{eq:slam2d-pg-e}：$\mathbf{e}=\mathrm{Log}(\mathbf{T}_{WS_1}^{-1}\mathbf{T}_{WS_2}\mathbf{T}_{S_1S_2}^{-1})\in\mathbb{R}^3$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{知识点总表.}
+\begin{table}[H]\centering\small
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 一句话 & 难度 \\
+\midrule
+1 & 2D SLAM 架构 & 扫描匹配 + 占据栅格 + 子地图 + 回环，与 3D 平行 & $\bigstar$ \\
+2 & 点到点二维 ICP & $\SE(2)$ 雅可比 $2\times 3$，三维 $3\times 6$ 的降维特例 & $\bigstar\bigstar$ \\
+3 & 点到线二维 ICP & $k$ 近邻 SVD 拟合直线，残差标量、只罚法向 & $\bigstar\bigstar$ \\
+4 & 似然场扫描匹配 & 距离变换「磁场」+ 图像梯度雅可比，查表 $O(1)$ & $\bigstar\bigstar\bigstar$ \\
+5 & 占据栅格 log-odds & 二值贝叶斯滤波，灰度计数代理，过滤动态物体 & $\bigstar\bigstar$ \\
+6 & Bresenham / 模板 & 整数画线 vs 预生成模板，时空权衡 & $\bigstar\bigstar$ \\
+7 & $\SE(2)$ 子地图 & $\mathbf{T}_{WS}\!\cdot\!\mathbf{T}_{SC}$ 分离，回环基本单元 & $\bigstar\bigstar$ \\
+8 & 多分辨率回环 & 似然场金字塔扩收敛域，由粗至精 & $\bigstar\bigstar\bigstar$ \\
+9 & BnB 对照 & 分支定界 = 精确版「由粗至精」，全局最优有保证 & $\bigstar\bigstar\bigstar$ \\
+10 & 退化与 gauge & 走廊额外自由度 $1$、广场 $3$；Hessian 小特征值检测 & $\bigstar\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{本章与后续/相关章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+章节 & 关系 & 本章如何用它 / 它如何用本章 \\
+\midrule
+\cref{ch:pointcloud} 点云处理 & 提供点点/点线 ICP、SVD 拟合、KD-tree & 本章二维扫描匹配是其 $\SE(2)$ 降维特例 \\
+\cref{ch:dense} 稠密建图 & 提供 log-odds 二值贝叶斯、OctoMap & 本章占据栅格共用其概率内核（平面 vs 八叉树） \\
+\cref{ch:loop} 回环检测 & 回环-PGO 通论、鲁棒抗假回环 & 本章补 $\SE(2)$ 残差 + Cartographer BnB \\
+\cref{ch:lidar_slam} 激光 SLAM & 3D 去畸变、退化/可观测性、IMU 融合 & 本章与之刻意平行，退化/畸变细节回引 3D \\
+\cref{ch:lie} 李群 & $\SO(2)/\SE(2)$、右扰动 & 二维位姿更新（$\SO(2)$ 交换，无右雅可比修正） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.24\textwidth} p{0.28\textwidth} p{0.38\textwidth}}
+\toprule
+症状 & 可能原因 & 排查步骤 \\
+\midrule
+似然场配准陷错误极小 & 初值偏太远、落在场外（梯度饱和） & 1.开多分辨率金字塔（低分辨率先粗配）；2.增大模板半径扩收敛域；3.用里程计/IMU 给更好初值（\cref{sec:slam2d-mrlc}）\\
+长走廊里位姿「不动」 & 几何退化、切向额外自由度 & 1.对 $\mathbf{H}$ 做特征分解查小特征值方向；2.该方向降权或融合 IMU/轮速；3.改点到点（点到线在切向给零梯度）（\cref{sec:slam2d-degeneracy}）\\
+栅格图玻璃墙断续/有空洞 & 玻璃透视、镜面镜像、黑面吸光 & 1.地图层手工标注玻璃/镜面；2.融合其他模态；3.确认非动态物体残留（\cref{sec:slam2d-glass}）\\
+地图绕圈后「重影」 & 回环未检出或假回环未滤 & 1.降低内点比例阈值（单线 $270^\circ$ 取约 $40\%$）；2.回环边加 Huber 鲁棒核 + 几何验证；3.检查子地图间隔 submap\_gap（\cref{sec:slam2d-pgo}）\\
+高速/转弯处地图拖尾 & 未做运动畸变补偿 & 1.确认开启去畸变；2.用 IMU 短时积分插值起止位姿；3.估 $v\cdot T_{\text{scan}}$ 是否超栅格分辨率（\cref{sec:slam2d-distortion}）\\
+栅格刷新太慢 & 模板法在高线数/近距下过载 & 1.近距高线数改 Bresenham 直线法；2.限制模板覆盖范围；3.按量程调子地图与模板尺寸（\cref{sec:slam2d-template}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{吸收主源}：高翔《自动驾驶与机器人中的 SLAM 技术：从理论到实践》\cite{gao2023slamad} 第 6 章（2D SLAM）——本章扫描匹配/似然场/占据栅格/子地图/多分辨率回环的全部出处，代码仓 \texttt{gaoxiang12/slam\_in\_autonomous\_driving}。
+  \item \textbf{占据栅格 2D SLAM 代表}：GMapping\cite{grisetti2007gmapping}（T-RO 2007，Rao-Blackwellized 粒子滤波 + 改进提议分布）——ROS 经典栅格 SLAM。
+  \item \textbf{似然场扫描匹配代表}：Hector SLAM\cite{kohlbrecher2011hector}（SSRR 2011，无里程计、多分辨率似然场配准）。
+  \item \textbf{子地图 + 分支定界回环}：Cartographer\cite{hess2016cartographer}（ICRA 2016，2D 子地图 + BnB 精确窗口搜索）——\cref{sec:slam2d-mrlc} BnB 对照的出处，亦补第 \cref{ch:loop} 章 BnB 空白。
+  \item \textbf{点到线度量}：PL-ICP\cite{censi2008plicp}（ICRA 2008，二维点到线 ICP）——\cref{sec:slam2d-p2l} 的出处。
+\end{itemize}
+
+\section*{习题}
+\begin{enumerate}
+  \item \textbf{（降维对账）} 从第 \cref{ch:pointcloud} 章三维点到点 ICP 的 $3\times 6$ 雅可比 $\big[\mathbf{I}_3\;\;-(\mathbf{R}\mathbf{p}^B)^\wedge\big]$ 出发，约束 $z\equiv 0$、绕 $x/y$ 轴转角恒为零，逐步推出本章 \cref{eq:slam2d-p2p-J} 的 $2\times 3$ 形式。说明旋转块为何恰好是把世界系位移旋转 $90^\circ$。
+  \item \textbf{（点到线实现）} 基于优化器（g2o 或 Ceres）实现二维点到线 ICP：$k=5$ 近邻、SVD 拟合直线 \cref{eq:slam2d-line-A}、残差 + 雅可比 \cref{eq:slam2d-p2l-J}。在一段走廊数据上对比它与点到点 ICP 沿走廊方向的协方差。
+  \item \textbf{（似然场插值）} 当前实现把似然场离散成像素查表。请用\emph{双线性插值}读取场值与梯度，得到更精确、更光滑的残差与雅可比 \cref{eq:slam2d-lf-J}，并验证收敛是否更稳。
+  \item \textbf{（log-odds 严格版）} 把 \cref{sec:slam2d-logodds} 的「灰度计数」替换为严格 log-odds 二值贝叶斯滤波（\cref{ch:dense}）：给定逆传感器模型的占据/空闲对数似然增量，写出每格更新式，并讨论它与灰度计数在「钳位」行为上的异同。
+  \item \textbf{（退化检测）} 利用直线拟合或对扫描匹配 Hessian $\mathbf{H}=\sum\mathbf{J}^\top\mathbf{J}$ 做特征分解，实现 2D SLAM 的退化检测：当最小特征值低于阈值时，标记退化方向并降权。在走廊与空旷场景上验证检出的额外自由度数（应分别为 $1$ 与 $3$，\cref{sec:slam2d-degeneracy}）。
+  \item \textbf{（BnB 实现，进阶）} 实现 Cartographer 式的分支定界（BnB）回环窗口搜索：在多分辨率栅格上为每个位姿子区间计算匹配分上界、剪枝、细化。与本章金字塔法在「召回率/最优性/耗时」上对比，验证 BnB 的全局最优性（\cref{sec:slam2d-mrlc}）。
+\end{enumerate}

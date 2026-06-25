@@ -1,0 +1,1346 @@
+\chapter{增量平滑与 Bayes 树（iSAM/iSAM2）}
+\label{ch:isam2}
+
+% ════════════════════════════════════════════════════════════════
+%  P1 增量平滑章：全保真吸收 Robotics_Tutorial/01_数学/60_概率与估计/60_iSAM2与Bayes树.md
+%  （AI 原稿，逐步推导/陷阱/对比全录；逐式 \cite Kaess2008/2010/2012、Davis06、Liu90、LRT79 等）。
+%  承接 \cref{ch:slam_est} 因子图与变量消元 = 稀疏分解；\cref{ch:eskf} 滤波；\cref{ch:nlopt} GN/LM。
+%  记号归一：R∈SO(3)、T∈SE(3)（preamble 宏 \SO \SE）；se(3) 排序 ξ=[ρ;φ]；右扰动为主、retraction 写 ⊕（= \cref{ch:lie} 的 ⊞）。
+%  教学层遵循 v5.0 理论教学规范（动机→反面→理论→陷阱→练习 + 符号表/速查/故障排查）。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item \textbf{MAP $=$ 加权最小二乘}：写出 SLAM 的 MAP 估计等价的加权非线性最小二乘问题，残差 $\mathbf{r}_k(\mathbf{x})=\mathbf{h}_k(\mathbf{x})-\mathbf{z}_k$ 的权重矩阵是什么？（忘了回 \cref{ch:slam_est}。）
+  \item \textbf{高斯牛顿正规方程}：写出 $\mathbf{H}\,\delta\mathbf{x}=-\mathbf{g}$，$\mathbf{H}=\mathbf{J}^\top\boldsymbol{\Omega}\mathbf{J}$，并解释为何 $\mathbf{H}$ 是\emph{近似} Hessian、它比真 Hessian 忽略了什么。
+  \item \textbf{Schur 补与边缘化}：对一个含路标的图，消去（边缘化）一个变量在信息矩阵上是什么运算？它会带来什么副作用（提示：稀疏性）？
+  \item \textbf{稀疏 Cholesky 与排序}：什么是 fill-in？为什么消元顺序影响 fill-in 的多少？COLAMD 想解决什么问题？
+  \item \textbf{因子图语义}：画一个 $3$ 位姿 $+\,2$ 路标的因子图，标出变量节点与因子节点。在图上“消元一个路标”是什么操作？（忘了回 \cref{ch:slam_est} 的因子图小节。）
+\end{enumerate}
+\noindent\emph{答案线索}：(1) 见 \cref{ch:slam_est} 的 \cref{thm:fg-map}，权重 $=$ 噪声协方差之逆 $\boldsymbol{\Omega}=\boldsymbol{\Sigma}^{-1}$；(2) GN 丢掉了残差二阶项 $\sum_k r_k\nabla^2 r_k$，仅在残差小或近线性时可忽略；(3) Schur 补，会产生 fill-in（被消变量的邻居两两连边）；(4)(5) 见 \cref{ch:slam_est} 的 \cref{thm:elimination}。答错 $\ge 2$ 题，建议先回 \cref{ch:slam_est}。
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}为何批量平滑到一定规模就无法实时，以及增量平滑“只更新受影响子集”的核心观察；
+  \item \textbf{独立执行}从因子图到 Bayes 网再到 Bayes 树的变量消元，理解每个团的 frontal / separator 划分及其概率含义 $P(F_k\mid S_k)$；
+  \item \textbf{证明} Bayes 树的团 $=$ 稀疏 Cholesky 的超节点 $=$ 弦图最大团这一核心等价，并由此把“哪些团受影响”读成稀疏回代的依赖链；
+  \item \textbf{解释} iSAM2 的三把钥匙——findAffectedTop（局部性）、Fluid Relinearization（选择性重线性化）、Wildfire 回代（部分状态更新）——的数学依据；
+  \item \textbf{推导}团内条件密度 $P(F\mid S)$ 到局部回代 $\delta_F=R_{FF}^{-1}(d_F-R_{FS}\delta_S)$，并由误差放大界理解 wildfire 阈值；
+  \item \textbf{分析} iSAM2 每步复杂度——2D 位姿图 $O(\sqrt N)$、3D BA $O(N^{2/3})$——的来源（Lipton--Rose--Tarjan 嵌套剖分），及其“不依赖回环数”的边界；
+  \item \textbf{区分} iSAM2 与 iSAM1、EKF-SLAM、滑窗 BA、批量 LM 的适用场景，并配置 GTSAM \texttt{ISAM2} 的关键参数；
+  \item \textbf{诊断} iSAM2 的典型故障（不收敛、非叶边缘化报错、SmartFactor 冲突等）并应用正确修复。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章主线：\emph{把全图批量 MAP 改写成“沿一棵概率树自底向上局部编辑 + 沿根向下野火回代”的增量算法}。一句话底线（BLUF）：\textbf{Bayes 树 $=$ 弦化因子图的团树 $+$ 按消元顺序有根化 $+$ 每团存条件密度 $P(F_k\mid S_k)$}，它本质等价于稀疏 Cholesky 因子 $\mathbf{R}$ 的超节点结构\cite{kaess2012isam2,liu1990elimination}；三把核心钥匙把批量变增量。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4.5mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  fwd/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (batch) {批量瓶颈\\（为何增量）};
+\node[blk, right=of batch] (elim) {消元\\因子图$\to$Bayes 网};
+\node[blk, right=of elim] (tree) {Bayes 树\\$\prod_k P(F_k\mid S_k)$};
+\node[blk, right=of tree] (chol) {$=$ 稀疏 Cholesky\\超节点};
+\node[grp, below=8mm of batch] (top) {findAffectedTop\\removeTop+graft};
+\node[grp, right=of top] (fluid) {Fluid\\Relinearization};
+\node[grp, right=of fluid] (wild) {Wildfire\\部分回代};
+\node[fwd, below=8mm of fluid, fill=third!8, draw=third!60!black] (cplx) {复杂度\\$O(\sqrt N)$/$O(N^{2/3})$};
+\node[fwd, right=of cplx, fill=third!8, draw=third!60!black] (eng) {GTSAM 工程\\参数与陷阱};
+\draw[ln] (batch)--(elim); \draw[ln] (elim)--(tree); \draw[ln] (tree)--(chol);
+\draw[ln] (chol.south) -- ++(0,-4mm) -| (top.north);
+\draw[ln] (top)--(fluid); \draw[ln] (fluid)--(wild);
+\draw[ln] (wild.south) |- (cplx.east);
+\draw[ln] (cplx)--(eng);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:isam-why,sec:isam-fg2tree} 是任何读者的主干（建立“增量动机—消元—Bayes 树”三角）；\cref{sec:isam-equiv} 的“Bayes 树 $=$ 超节点”是\emph{全章最重要的数学桥梁}，把概率结构与稀疏线代焊接；\cref{sec:isam-algorithm,sec:isam-fluid,sec:isam-wildfire} 是 iSAM2 算法的三把钥匙；\cref{sec:isam-clique-algebra} 给团内回代的线性代数细节（可在掌握主干后回看）；\cref{sec:isam-marg,sec:isam-gn} 处理边缘化与“iSAM2 不是 LM”这两处工程要害；\cref{sec:isam-complexity} 给复杂度界；\cref{sec:isam-gtsam,sec:isam-compare,sec:isam-pitfalls} 是工程实践与选型。带（进阶）标记的并行/连续时间扩展为选读。
+
+\subsection*{前置知识桥接}
+\cref{ch:slam_est} 已建立本章的全部前置：SLAM 的 MAP $=$ 加权非线性最小二乘（\cref{thm:fg-map}）、因子图的定义（\cref{def:factor-graph}）、以及最关键的——\textbf{变量消元 $=$ 稀疏矩阵分解}（\cref{thm:elimination}）。本章正是把\emph{消元产物的结构}提炼成一个可\emph{增量编辑}的数据结构（Bayes 树），并据此设计只更新受影响子集的算法。\cref{ch:eskf} 的卡尔曼/RTS 滤波在本章会被识别为 Bayes 树退化成链的特例；\cref{ch:nlopt} 的高斯牛顿/LM 是本章每个团内求解所用的迭代内核。残差含位姿 $\mathbf{T}\in\SE(3)$ 时，状态更新用\emph{右扰动} $\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$、即 \cref{ch:lie} 的 retraction $\boxplus$（本章统一记作 $\oplus$）；切空间增量 $\delta$ 始终在欧氏空间里加减。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 在 \cref{ch:lidar_slam}、\cref{ch:vio} 的后端里，你会看到 LIO-SAM、Kimera-VIO 反复调用 \texttt{ISAM2::update()}，却不懂它为何\emph{每帧只付局部代价}、为何回环后要\emph{连跑多次空 update}——只能照抄参数而不会调试；
+  \item 你会把 \texttt{relinearizeThreshold}、\texttt{wildfireThreshold} 当成玄学旋钮，而不知道前者控制\emph{模型准确度}、后者控制\emph{回代完整度}，二者朝相反方向权衡精度与速度；
+  \item 遇到 \texttt{marginalizeLeaves} 报“not leaves”、SmartFactor 触发 \texttt{InconsistentEliminationRequested} 时无从下手——这些都是 Bayes 树结构假设被破坏的征兆。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导与练习） & 5--7 小时 & 首次系统学习、要做 SLAM 后端 \\
+速读（跳过 \cref{sec:isam-clique-algebra} 线代细节与进阶节） & 2 小时 & 已懂因子图、想掌握 iSAM2 机制与调参 \\
+速查（只看小结的符号表 + 速查表） & 15 分钟 & 写代码时回来查参数/公式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+因子图记 $G=(\mathcal{F},\Theta,\mathcal{E})$：$\mathcal{F}$ 为因子集、$\Theta=\{\theta_1,\dots\}$ 为变量（状态）集、$\mathcal{E}$ 为边\cite{kaess2012isam2}。沿用 \cref{ch:slam_est}，单个因子的信息（权重）矩阵记 $\boldsymbol{\Omega}=\boldsymbol{\Sigma}^{-1}$，全图信息矩阵记 $\boldsymbol{\Lambda}=\mathbf{J}^\top\boldsymbol{\Omega}\mathbf{J}$，平方根（上三角）因子记 $\mathbf{R}$，使 $\boldsymbol{\Lambda}=\mathbf{R}^\top\mathbf{R}$（Handbook\cite{carlone2026handbook} 同取上三角；下三角 Cholesky $\mathbf{L}=\mathbf{R}^\top$）。
+Bayes 树的团记 $C_k=F_k:S_k$，$F_k$ 为 frontal（前沿）变量、$S_k$ 为 separator（分隔）变量。
+增量（线性化点处的切空间步长）记 $\delta$；对含位姿的变量，状态更新 $\Theta_j\leftarrow\Theta_j\oplus\delta_j$ 用右扰动 retraction（$\oplus=\boxplus$，见 \cref{ch:lie}）；$\se(3)$ 坐标排序 $\boldsymbol{\xi}=[\boldsymbol{\rho};\boldsymbol{\phi}]$（平移在前）。
+$\mathrm{Exp}/\mathrm{Log}$、$\mathrm{Ad}$ 沿用 \cref{ch:lie}。本章源笔记为 AI 撰写、经多轮审仍可能有错，存疑处就地以 \pz{} 标注，并汇入章末复核清单。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么必须增量：批量平滑的计算瓶颈}
+\label{sec:isam-why}
+
+\paragraph{动机：每帧重算整图，迟早卡死。}
+\cref{ch:slam_est} 把 SLAM 的 MAP 求解归结为一个因子图上的加权非线性最小二乘，标准解法是\emph{批量}（batch）：每收到新一帧，把新因子追加进 $\mathcal{F}$，再对\emph{整张图}重做一次高斯牛顿（GN）或列文伯格--马夸尔特（LM）。这条路线每步的代价取决于信息矩阵 $\boldsymbol{\Lambda}=\mathbf{J}^\top\boldsymbol{\Sigma}^{-1}\mathbf{J}$ 的稀疏 Cholesky 分解\cite{dellaert2006square}：
+\begin{itemize}
+  \item \textbf{稠密上界} $O(N^3)$，$N$ 为状态维度。对 KITTI 一段 $4500$ 帧的位姿图（$N\approx 2.7\times10^4$），单次稠密 Cholesky 在桌面 CPU 上已是秒级。
+  \item \textbf{稀疏上界}：2D 位姿图 $O(N^{3/2})$，3D BA $O(N^2)$——来自嵌套剖分排序（\cref{sec:isam-complexity}）。
+  \item \textbf{实时要求}：LiDAR SLAM 约 $10$\,Hz、VIO 约 $30$--$100$\,Hz，每帧预算 $10$--$100$\,ms。纯批量到 $N\sim10^4$ 后就难以为继。
+\end{itemize}
+
+\paragraph{反面：不用增量，纯批量会怎样。}
+考虑一个自动驾驶场景：$4500$ 帧序列、每帧一个 $6$-DoF 位姿，$N=2.7\times10^4$。在 COLAMD 排序下批量 Cholesky 约需 $O(N^{3/2})\approx 4.6\times10^6$ 次浮点运算，桌面 CPU（约 $10$\,GFLOPS）约 $0.5$\,ms/帧——看似可行。但一旦加入 $5000$ 个 $3$-DoF 路标，$N$ 跳到 $4.2\times10^4$，Hessian 从位姿图的带状结构变成 BA 的箭头（arrow-head）结构，即便先做 Schur 消元路标，仍需 $O(N_{\text{pose}}^2\,N_{\text{lm}})\approx 10^{11}$ 量级运算\pz{存疑：该 BA flops 量级是原稿的粗估，量纲与系数未严格推导，仅作数量级直觉}。此时若改用增量——每步只消元受影响的约 $50$ 个团——可省下 $3$--$4$ 个数量级。
+
+\paragraph{核心观察：变化是局部的。}
+增量式平滑（incremental smoothing）的目标是：新来一批因子 $\mathcal{F}_{\text{new}}$ 时，\emph{只更新受影响的变量子集}，而不是重算整图。关键观察是：在位姿图中，新的里程计因子 $f(\mathbf{x}_{k-1},\mathbf{x}_k)$ \emph{局部地}耦合两个相邻变量；即便出现回环因子 $f(\mathbf{x}_k,\mathbf{x}_m)$（$m\ll k$），受影响的也只是“从 $\mathbf{x}_k$ 与 $\mathbf{x}_m$ 各自到它们最低公共祖先（LCA）的那条路径上的团”。如果数据结构能\emph{天然编码}这种“变化局部性”，算法每帧就能做到期望 $O(\sqrt N)$。这正是 Bayes 树的设计目的。
+
+\begin{insight}[增量平滑的本质]
+增量平滑的核心不是“更快地做同一件事”，而是\textbf{利用概率图结构天然编码的条件独立性}。在 Bayes 树中，\emph{给定 separator 变量的值，子树与图的其余部分条件独立}（\cref{sec:isam-fg2tree}）。新因子只打破\emph{局部}的条件独立关系——这种“破坏的局部性”正是 $O(\sqrt N)$ 复杂度的来源。
+\end{insight}
+
+\paragraph{对比 EKF-SLAM。}
+EKF 把所有路标塞进一个\emph{稠密}协方差 $\boldsymbol{\Sigma}\in\mathbb{R}^{N\times N}$，每步 $O(N^2)$；而且一次线性化\emph{不可撤销}，长期漂移无解（详见 \cref{ch:eskf}）。iSAM2 则既保留全图（可再线性化、即“平滑”），又只付局部代价——两全其美。下表给出从 EKF 的“全耦合”到 iSAM2 的“局部编辑”这条对条件独立结构逐步开发的脉络\cite{smith1986estimating,dellaert2006square,kaess2008isam,kaess2010bayestree,kaess2012isam2}。
+
+\begin{table}[H]\centering\small
+\caption{从 EKF 到 iSAM2 的历史演进}
+\label{tab:isam-history}
+\begin{tabular}{cllp{0.30\textwidth}}
+\toprule
+年份 & 工作 & 核心贡献 & 局限 \\
+\midrule
+1986 & Smith--Self--Cheeseman\cite{smith1986estimating} & EKF-SLAM：首次把 SLAM 形式化为状态估计 & $O(N^2)$ 稠密协方差 \\
+2004/06 & Dellaert(--Kaess)\cite{dellaert2006square} & SqrtSAM：稀疏 $\mathbf{R}$ 因子直接解；$=$ 因子图上的变量消元 & 仍需批量，每帧 $O(N^{3/2})$ \\
+2008 & Kaess 等\cite{kaess2008isam} & \textbf{iSAM1}：Givens 旋转增量更新 $\mathbf{R}$ & 周期性批量尖峰 \\
+2010 & Kaess 等\cite{kaess2010bayestree} & \textbf{Bayes 树}：消元产物的概率数据结构 & 纯理论，尚未完整算法化 \\
+2012 & Kaess 等\cite{kaess2012isam2} & \textbf{iSAM2}：Bayes 树 $+$ fluid relin $+$ wildfire & 当前工业标准 \\
+2017 & Dellaert--Kaess\cite{dellaert2017factor} & 统一因子图范式综述 & 教材，非新算法 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{practice}
+\begin{enumerate}
+  \item 对一个 $N$ 维状态，写出稠密 Cholesky 与回代各自的浮点运算量级，解释为什么“批量每帧重算”随 $N$ 增长不可持续。
+  \item 直观论证：纯里程计（无回环）的位姿图，新因子 $f(\mathbf{x}_{k-1},\mathbf{x}_k)$ 只耦合相邻两帧。它在因子图上“波及”的范围有多大？
+  \item EKF-SLAM 的协方差为何随时间变稠密？（提示：回环把远处变量也耦合起来。）这给“可撤销的再线性化”带来什么困难？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{从因子图到 Bayes 网再到 Bayes 树}
+\label{sec:isam-fg2tree}
+
+本节把 \cref{ch:slam_est} 的“变量消元 $=$ 稀疏分解”（\cref{thm:elimination}）推进一步：消元的\emph{产物}是一个有向图（Bayes 网），它的弦性允许把变量打包成团，组织成一棵有根树——Bayes 树。
+
+\subsection{联合分布与变量消元}
+\label{sec:isam-elimination}
+
+因子图 $G=(\mathcal{F},\Theta,\mathcal{E})$ 上的（未归一化）联合分布为\cite{kaess2012isam2}
+\begin{equation}
+  f(\Theta)=\prod_i f_i(\Theta_i),\qquad \Theta^\ast=\arg\max_\Theta f(\Theta),
+  \label{eq:isam-joint}
+\end{equation}
+其中 $\Theta_i\subseteq\Theta$ 是第 $i$ 个因子涉及的变量子集（与 \cref{ch:slam_est} 的 \cref{eq:fg-product} 一致）。高斯因子 $f_i(\Theta_i)\propto\exp\!\big(-\tfrac12\|\mathbf{h}_i(\Theta_i)-\mathbf{z}_i\|^2_{\boldsymbol{\Sigma}_i}\big)$，在当前线性化点处线性化后化为 $\arg\min_\delta\|\mathbf{A}\delta-\mathbf{b}\|^2$，其中白化因子 $\boldsymbol{\Sigma}_i^{-1/2}$ 已吸入 $\mathbf{A}$ 的行块。
+
+\emph{变量消元}按给定的消元顺序 $\pi$ 逐个消去变量 $\theta_j$，每消一个就向 Bayes 网追加一条条件密度，同时在图上留下一个新因子（其作用域是 $\theta_j$ 的邻居除去 $\theta_j$，即\emph{分隔集} $S_j$）：
+
+\begin{algo}[变量消元（符号版，Kaess 2012 Alg.~2\cite{kaess2012isam2}）]
+\label{algo:eliminate}
+\begin{enumerate}
+  \item 收集邻居因子 $\mathrm{adj}=\{f_i\in G:\theta_j\in\mathrm{scope}(f_i)\}$，并令分隔集 $S_j=\big(\bigcup_{f_i\in\mathrm{adj}}\mathrm{scope}(f_i)\big)\setminus\{\theta_j\}$；
+  \item 构造联合（未归一化）密度 $f_{\text{joint}}(\theta_j,S_j)=\prod_{f_i\in\mathrm{adj}}f_i$；
+  \item 链式分解 $f_{\text{joint}}=P(\theta_j\mid S_j)\,f_{\text{new}}(S_j)$；
+  \item 更新图 $G.\mathcal{F}\leftarrow(G.\mathcal{F}\setminus\mathrm{adj})\cup\{f_{\text{new}}\}$，并把 $P(\theta_j\mid S_j)$ 追加到 Bayes 网。
+\end{enumerate}
+\end{algo}
+
+\paragraph{高斯情形的一步消元（招牌推导）。}
+设 $\mathbf{A}_j=[\,\mathbf{a}\mid\mathbf{A}_S\,]$ 是所有含 $\delta_j$ 的因子 Jacobian 拼成的列块（$\mathbf{a}$ 对应被消变量 $\delta_j$，$\mathbf{A}_S$ 对应分隔变量 $\mathbf{s}_j$），则\cite{kaess2012isam2}
+\begin{equation}
+  f_{\text{joint}}(\delta_j,\mathbf{s}_j)\propto\exp\!\Big(-\tfrac12\big\|\mathbf{a}\,\delta_j+\mathbf{A}_S\,\mathbf{s}_j-\mathbf{b}\big\|^2\Big).
+  \label{eq:isam-fjoint}
+\end{equation}
+对 $\mathbf{a}$ 做一步 Gram--Schmidt（等价于对该列做 QR），可把 $\delta_j$ 从余项中“投影掉”。记伪逆 $\mathbf{a}^\dagger=(\mathbf{a}^\top\mathbf{a})^{-1}\mathbf{a}^\top$，并令
+\begin{equation}
+  \mathbf{r}\triangleq\mathbf{a}^\dagger\mathbf{A}_S,\qquad d\triangleq\mathbf{a}^\dagger\mathbf{b},\qquad R_{jj}\triangleq\|\mathbf{a}\|,
+  \label{eq:isam-rd}
+\end{equation}
+则联合密度精确分解为条件密度乘以余因子：
+\begin{align}
+  P(\delta_j\mid\mathbf{s}_j)&\propto\exp\!\Big(-\tfrac12\,\|\mathbf{a}\|^2\big(\delta_j+\mathbf{r}\,\mathbf{s}_j-d\big)^2\Big),
+  \label{eq:isam-cond}\\
+  f_{\text{new}}(\mathbf{s}_j)&\propto\exp\!\Big(-\tfrac12\,\|\mathbf{A}'\mathbf{s}_j-\mathbf{b}'\|^2\Big),\quad
+  \mathbf{A}'\triangleq\mathbf{A}_S-\mathbf{a}\,\mathbf{r},\;\; \mathbf{b}'\triangleq\mathbf{b}-\mathbf{a}\,d.
+  \label{eq:isam-fnew}
+\end{align}
+
+\begin{derivation}[\cref{eq:isam-cond,eq:isam-fnew} 的配方]
+把 \cref{eq:isam-fjoint} 中的二次型按 $\delta_j$ 配方。记 $\mathbf{u}\triangleq\mathbf{A}_S\mathbf{s}_j-\mathbf{b}$，则被平方项是 $\mathbf{a}\,\delta_j+\mathbf{u}$。把 $\mathbf{u}$ 沿 $\mathbf{a}$ 方向与正交方向分解：$\mathbf{u}=\mathbf{u}_\parallel+\mathbf{u}_\perp$，其中 $\mathbf{u}_\parallel=\mathbf{a}\,(\mathbf{a}^\dagger\mathbf{u})$。由勾股关系（$\mathbf{a}\,\delta_j+\mathbf{u}_\parallel\perp\mathbf{u}_\perp$）：
+\[
+\|\mathbf{a}\,\delta_j+\mathbf{u}\|^2=\underbrace{\|\mathbf{a}\,\delta_j+\mathbf{u}_\parallel\|^2}_{\text{含 }\delta_j}+\underbrace{\|\mathbf{u}_\perp\|^2}_{\text{不含 }\delta_j}.
+\]
+第一项 $=\|\mathbf{a}\|^2\big(\delta_j+\mathbf{a}^\dagger\mathbf{u}\big)^2=\|\mathbf{a}\|^2(\delta_j+\mathbf{r}\,\mathbf{s}_j-d)^2$（代入 $\mathbf{a}^\dagger\mathbf{u}=\mathbf{r}\,\mathbf{s}_j-d$），即 \cref{eq:isam-cond}。第二项 $\mathbf{u}_\perp=\mathbf{u}-\mathbf{a}\,\mathbf{a}^\dagger\mathbf{u}=(\mathbf{I}-\mathbf{a}\mathbf{a}^\dagger)(\mathbf{A}_S\mathbf{s}_j-\mathbf{b})$，化简即 $\mathbf{A}'\mathbf{s}_j-\mathbf{b}'$（其投影分量 $\mathbf{a}\mathbf{a}^\dagger\mathbf{A}_S=\mathbf{a}\,\mathbf{r}$、$\mathbf{a}\mathbf{a}^\dagger\mathbf{b}=\mathbf{a}\,d$），即 \cref{eq:isam-fnew}。$\square$
+\end{derivation}
+
+\noindent\cref{eq:isam-rd} 中的 $(\mathbf{r},d)$ 恰是稀疏 QR 把 $\mathbf{A}$ 化为上三角 $\mathbf{R}$ 时\emph{新增的那一行}：$R_{jj}=\|\mathbf{a}\|$ 是对角元，$\mathbf{r}$ 是该行的非对角元，$d$ 是对应的右端项。这就是 \cref{thm:elimination}（变量消元 $=$ 稀疏分解）在概率层面的现身——\textbf{消元一个变量 $=$ 给 $\mathbf{R}$ 添一行}。
+
+\begin{pitfall}[概念误区：只保留条件密度的“均值关系”，丢掉信息尺度]
+\cref{eq:isam-cond} 括号内的 $\delta_j+\mathbf{r}\,\mathbf{s}_j-d$ 只描述\emph{均值}关系（条件期望 $\mathbb{E}[\delta_j\mid\mathbf{s}_j]=d-\mathbf{r}\,\mathbf{s}_j$），\textbf{它不能代表完整的条件密度}。前置因子 $R_{jj}=\|\mathbf{a}\|$ 决定了条件方差（$\mathrm{Var}=R_{jj}^{-2}$），是信息尺度，绝不能从公式里省掉。把 Bayes 网/Bayes 树的每条边只记成“均值关系”是常见错误——回代时数值会失尺度。
+\end{pitfall}
+
+\subsection{弦性、团分解与 Bayes 树的定义}
+\label{sec:isam-chordal}
+
+消元的全部产物组成一个\emph{有向无环图}（DAG）：每个节点 $\theta_j$ 存储 $P(\theta_j\mid S_j)$，边由 $\theta_j$ 指向其分隔变量。这个 DAG 是一个 \emph{Bayes 网}。Kaess 等\cite{kaess2012isam2} 证明它对应的无向图是\textbf{弦图}（chordal graph，每个长度 $\ge 4$ 的环都有弦）——这是消元（完美消元序列）的必然结果。弦图的所有\emph{最大团}可用最大基数搜索（MCS\cite{tarjan1984simple}）以\emph{反消元顺序}发现，并组织成团树（clique tree）。把团树按消元顺序\emph{有根化}，就得到 Bayes 树。
+
+\begin{definition}[Bayes 树\cite{kaess2010bayestree,kaess2012isam2}]
+\label{def:bayes-tree}
+Bayes 树是一棵\textbf{有向树}，其节点是底层弦图 Bayes 网的\emph{团} $C_k$。每个团存储一个条件密度 $P(F_k\mid S_k)$，其中
+\begin{itemize}
+  \item \textbf{分隔变量} $S_k=C_k\cap\Pi_k$（$\Pi_k$ 为父团的变量集）；
+  \item \textbf{前沿变量} $F_k=C_k\setminus S_k$。
+\end{itemize}
+记作 $C_k=F_k:S_k$。根团 $C_r$ 的 $S_r=\varnothing$（无父团）。
+\end{definition}
+
+由 \cref{def:bayes-tree}，联合分布精确分解为各团条件密度之积\cite{kaess2012isam2}：
+\begin{equation}
+  \boxed{\;P(\Theta)=\prod_k P(F_k\mid S_k)\;}
+  \label{eq:bayes-tree-factor}
+\end{equation}
+
+\begin{algo}[Bayes 树构造（Kaess 2012 Alg.~3\cite{kaess2012isam2}）]
+\label{algo:build-tree}
+输入：因子图 $G$ 与消元顺序 $\pi$（由 COLAMD/METIS 给定，见 \cref{sec:isam-complexity}）。
+\begin{enumerate}
+  \item \textbf{符号消元}：按 $\pi$ 对 $G$ 执行 \cref{algo:eliminate}，得到所有条件密度 $P(\theta_j\mid S_j)$；
+  \item \textbf{反序扫描}（按消元顺序的逆序）逐个 $P(\theta_j\mid S_j)$：
+  \begin{itemize}
+    \item 若 $S_j=\varnothing$：新开一个根团 $F_r\ni\theta_j$；
+    \item 否则：找父团 $C_p$（其前沿含 $S_j$ 中\emph{最先被消去}的变量）；若 $F_p\cup S_p=S_j$ 则把 $\theta_j$ 并入 $C_p$，否则新建子团 $C'=(\theta_j:S_j)$ 挂在 $C_p$ 下；
+  \end{itemize}
+  \item \textbf{输出}：一棵有根有向树，每团存 $[F_k,\,S_k,\,P(F_k\mid S_k)\text{（}\mathbf{R}\text{ 块）}]$ 与子节点指针。
+\end{enumerate}
+\end{algo}
+
+\begin{insight}[Bayes 树构造 $=$ 超节点检测]
+\cref{algo:build-tree} 第 2 步的“并入还是新建”本质上是\textbf{超节点（supernode）检测}：把\emph{连续消元且共享同一分隔集}的变量打包成一个稠密块。这不只是概率图技巧——它正是 CHOLMOD、PaStiX、MUMPS 等稀疏矩阵库为利用 Level-3 BLAS 而做的标准加速（\cref{sec:isam-equiv} 把这条等价讲透）。
+\end{insight}
+
+\subsection{一个完整的小例子：5 变量位姿图}
+\label{sec:isam-example5}
+
+下图是一个 $3$ 位姿 $+\,2$ 路标 $+\,1$ 先验的因子图（实心为变量、空心方块为因子）：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  >=Stealth,
+  var/.style={circle, draw, fill=main!12, draw=main!60!black, minimum size=6mm, inner sep=0pt, font=\small},
+  fac/.style={rectangle, draw, fill=black!70, minimum size=2mm, inner sep=1.2pt},
+  ed/.style={gray!55!black}]
+\node[var] (x1) at (0,0) {$x_1$};
+\node[var] (x2) at (2.6,0) {$x_2$};
+\node[var] (x3) at (5.2,0) {$x_3$};
+\node[var] (l1) at (1.3,-1.7) {$l_1$};
+\node[var] (l2) at (5.2,-1.7) {$l_2$};
+\node[fac] (fp) at (-1.2,0) {};
+\node[fac] (f12) at (1.3,0) {};
+\node[fac] (f23) at (3.9,0) {};
+\node[fac] (fl1a) at (0.55,-0.95) {};
+\node[fac] (fl1b) at (2.05,-0.95) {};
+\node[fac] (fl2) at (5.2,-0.95) {};
+\draw[ed] (fp)--(x1); \draw[ed] (f12)--(x1); \draw[ed] (f12)--(x2);
+\draw[ed] (f23)--(x2); \draw[ed] (f23)--(x3);
+\draw[ed] (fl1a)--(l1); \draw[ed] (fl1a)--(x1);
+\draw[ed] (fl1b)--(l1); \draw[ed] (fl1b)--(x2);
+\draw[ed] (fl2)--(l2); \draw[ed] (fl2)--(x3);
+\node[font=\scriptsize, gray!50!black] at (-1.2,0.42) {prior};
+\node[font=\scriptsize, gray!50!black] at (1.3,0.42) {odo};
+\node[font=\scriptsize, gray!50!black] at (3.9,0.42) {odo};
+\end{tikzpicture}
+\end{center}
+
+\noindent 共 $6$ 个因子：$f(x_1)$、$f(x_1,x_2)$、$f(x_2,x_3)$、$f(l_1,x_1)$、$f(l_1,x_2)$、$f(l_2,x_3)$。取消元顺序 $l_1,l_2,x_1,x_2,x_3$（先消路标再消位姿，典型 BA 顺序），逐步执行 \cref{algo:eliminate}：
+
+\begin{enumerate}
+  \item 消 $l_1$：吸收 $f(l_1,x_1),f(l_1,x_2)$，产出 $P(l_1\mid x_1,x_2)$ $+$ 新因子 $f'(x_1,x_2)$；
+  \item 消 $l_2$：产出 $P(l_2\mid x_3)$ $+$ $f'(x_3)$；
+  \item 消 $x_1$：吸收 $f(x_1),f(x_1,x_2),f'(x_1,x_2)$，产出 $P(x_1\mid x_2)$ $+$ $f''(x_2)$；
+  \item 消 $x_2$：产出 $P(x_2\mid x_3)$ $+$ $f''(x_3)$；
+  \item 消 $x_3$：产出 $P(x_3)$（根，无分隔）。
+\end{enumerate}
+
+\noindent 用 MCS 发现团并有根化，得到 Bayes 树：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  >=Stealth, level distance=13mm, sibling distance=34mm,
+  cl/.style={rectangle, rounded corners, draw, fill=second!8, draw=second!60!black, align=center, font=\small, inner sep=4pt},
+  ed/.style={->, thick, gray!55!black}]
+\node[cl] (root) {$x_2,x_3$\\\scriptsize $F_r=\{x_2,x_3\},\,S_r=\varnothing$}
+  child {node[cl] (c1) {$l_1,x_1 \mid x_2$\\\scriptsize $F_1=\{l_1,x_1\},\,S_1=\{x_2\}$}}
+  child {node[cl] (c2) {$l_2 \mid x_3$\\\scriptsize $F_2=\{l_2\},\,S_2=\{x_3\}$}};
+\end{tikzpicture}
+\end{center}
+
+\noindent 读法：$F:S$ 即“前沿 $:$ 分隔”。根团 $C_r=\{x_2,x_3\}$ 是\emph{最后消去}的变量、携带全图回传的所有信息；叶团 $C_1,C_2$ 的前沿是\emph{最先消去}的变量、只与局部邻居耦合。这就是“根最全局、叶最局部”的由来——也正是“回环会传到根（全局耦合）、里程计更新只到叶附近（局部耦合）”的结构根据。
+
+\paragraph{添加回环因子 $f(x_1,x_3)$。}
+$x_1$ 与 $x_3$ 各自到根的路径并集 $=$ 左团 $+$ 根（即整棵左支）。按 \cref{sec:isam-algorithm} 的流程：(i) 剥离左团与根，得到一个“top”子因子图，外加新回环因子；右团 $\{l_2\mid x_3\}$ 暂成 \emph{orphan}（孤儿，携带缓存的边缘因子）；(ii) 对 top 重新消元（含重排序），形成新子树；(iii) 把 orphan 挂回。新根变为 $\{x_1,x_2,x_3\}$，左孩子 $\{l_1\mid x_1,x_2\}$，右孩子（orphan）$\{l_2\mid x_3\}$（参见 Kaess 2012 Fig.~6\cite{kaess2012isam2}）。
+
+\begin{practice}
+\begin{enumerate}
+  \item 对上面的 $5$ 变量图，改用消元顺序 $x_3,x_2,x_1,l_2,l_1$ 重做一遍，画出新的 Bayes 树。根团变成什么？说明“消元顺序自由 $\Rightarrow$ 同一图可有多棵 Bayes 树”。
+  \item 验证 \cref{eq:isam-fnew} 的 $\mathbf{A}'=\mathbf{A}_S-\mathbf{a}\,\mathbf{r}$ 与 Schur 补 $\boldsymbol{\Lambda}_{SS}-\boldsymbol{\Lambda}_{Sj}\boldsymbol{\Lambda}_{jj}^{-1}\boldsymbol{\Lambda}_{jS}$ 在信息形式下一致（提示：$\boldsymbol{\Lambda}=\mathbf{A}^\top\mathbf{A}$）。
+  \item 在该图上消去 $l_1$ 后，$x_1$ 与 $x_2$ 之间会多出一条边吗？这条 fill-in 边的概率含义是什么？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Bayes 树与稀疏 Cholesky 的等价}
+\label{sec:isam-equiv}
+
+这是\textbf{全章最重要的数学桥梁}。\cref{ch:slam_est} 已说明“消元 $=$ Schur 补 $=$ 稀疏分解”；本节把消元产物的\emph{结构}与 Cholesky 因子 $\mathbf{R}$ 的\emph{稀疏模式}逐一对应，从而把概率语言（团、分隔、条件独立）翻译成线代语言（超节点、依赖链、回代）。
+
+\subsection{消元树与超节点}
+\label{sec:isam-etree}
+
+\begin{definition}[消元树（elimination tree\cite{liu1990elimination,davis2006direct}）]
+\label{def:elim-tree}
+对 Cholesky 因子 $\mathbf{L}$（$\boldsymbol{\Lambda}=\mathbf{L}\mathbf{L}^\top$，等价上三角 $\mathbf{R}=\mathbf{L}^\top$），节点 $i$ 的父定义为第一个在 $i$ 列以下出现非零元的行：
+\begin{equation}
+  \mathrm{parent}(i)=\min\{\,j>i:L_{ji}\neq 0\,\}.
+  \label{eq:elim-tree-parent}
+\end{equation}
+\end{definition}
+
+\begin{theorem}[消元树的祖先刻画（Liu 1990, Thm.~2.4\cite{liu1990elimination}）]
+\label{thm:liu}
+忽略数值偶然相消，$L_{ji}\neq 0$ 蕴含 $j$ 在 $i$ 于消元树 $\mathcal{T}(\boldsymbol{\Lambda})$ 中的祖先路径上。等价地，$\mathcal{T}(\boldsymbol{\Lambda})$ 是填充图 $G^+(\boldsymbol{\Lambda})$ 的生成树，亦即有向图 $G(\mathbf{L}^\top)$ 的\emph{传递约简}（transitive reduction）。
+\end{theorem}
+
+\begin{pitfall}[概念误区：把“祖先关系”等同于“每个 Cholesky 非零元”]
+\cref{thm:liu} 是\emph{单向}的：$L_{ji}\neq 0\Rightarrow j$ 是 $i$ 的祖先；\textbf{反过来不成立}——祖先关系描述的是\emph{传递依赖/可达性}，并不要求每个祖先位置都出现一个直接非零元。换言之，非零元给出\emph{直接依赖}，沿这些直接依赖向上求闭包才得到\emph{祖先关系}。把二者混为一谈，会高估 $\mathbf{R}$ 的非零数（fill-in）。
+\end{pitfall}
+
+\begin{definition}[超节点\cite{davis2006direct}]
+\label{def:supernode}
+$\mathbf{L}$ 的超节点是一段连续的列 $\{i_s,\dots,i_{s+t-1}\}$，它们具有\emph{相同}（在“higher adjacency”意义下）的非零结构，并在消元树中构成一条链。
+\end{definition}
+
+\begin{theorem}[Bayes 树团 $=$ 超节点 $=$ 弦图最大团\cite{pothen1990compact,kaess2012isam2}]
+\label{thm:supernode-equiv}
+对同一消元顺序，三者一一对应：
+\begin{equation}
+  \text{$\mathbf{L}$ 的超节点}\;\Longleftrightarrow\;\text{$G^+(\boldsymbol{\Lambda})$ 的最大团}\;\Longleftrightarrow\;\text{Bayes 树团 }C_k.
+  \label{eq:supernode-equiv}
+\end{equation}
+\end{theorem}
+
+\subsection{三条教学用等价陈述}
+\label{sec:isam-three-equiv}
+
+\cref{thm:supernode-equiv} 落到 iSAM2 的三处使用上，可读成三句话：
+\begin{enumerate}
+  \item \textbf{结构等价}：Bayes 树的团 $=$ Cholesky 超节点（$=$ 弦图最大团）；
+  \item \textbf{依赖等价}：Bayes 树的祖先关系 $=$ 稀疏回代的传递依赖——$R_{ij}\neq 0$ 给出\emph{直接}依赖，沿其向上闭包得\emph{祖先}依赖；
+  \item \textbf{算法等价}：Bayes 树的野火（wildfire）回代路径 $=$ 稀疏回代 $\mathbf{R}\,\delta=\mathbf{d}$ 的依赖链。
+\end{enumerate}
+
+\paragraph{行结构定理（Gilbert\cite{gilbert1994predicting}；另见 Gilbert--Ng--Peyton 1994 的行/列计数算法）。}
+$\mathbf{R}$ 第 $i$ 行的非零模式由消元树上从 $i$ 向上的祖先决定：
+\begin{equation}
+  \mathrm{struct}(R_{i,:})=\{i\}\cup\bigcup_{k:\,L_{ki}\neq 0,\,k<i}\mathrm{struct}(R_{k,:})\cap\{j:j\ge i\}.
+  \label{eq:row-struct}
+\end{equation}
+应用到 Bayes 树：\emph{从团 $C_k$ 到根的路径上的变量集合} $=$ $\mathbf{R}$ 中 $F_k$ 行块的非零列集合（row subtree）。这正是“受影响团 $=$ 根路径”这一局部性结论的线代来源。
+
+\begin{insight}[等价性的三重解读]
+理解“Bayes 树 $=$ 超节点 $=$ 弦图团”是掌握 iSAM2 的钥匙，可从三个方向看：
+\begin{itemize}
+  \item \textbf{概率角度}：每团存 $P(F_k\mid S_k)$，联合 $=$ 各团之积（\cref{eq:bayes-tree-factor}）。故\emph{给定 separator $S_k$，前沿 $F_k$ 与树中非后代节点条件独立}——这是局部更新的概率根基。
+  \item \textbf{线性代数角度}：$\mathbf{R}$ 的每个超节点是一组共享非零行结构的列。回代 $\mathbf{R}\,\delta=\mathbf{d}$ 时，超节点\emph{内部}用稠密 Level-3 BLAS（如 \texttt{dtrsv}/\texttt{dgemm}），超节点\emph{之间}只传 separator 分量——这正是 wildfire 在矩阵层面的实现。
+  \item \textbf{图论角度}：弦图的完美消元序列保证不产生“意外”新边（fill-in 只落在已有边的传递闭包内）；MCS 在 $O(N+M)$ 内发现全部最大团并按反消元顺序组织成团树。Bayes 树就是这棵团树的有根版本。
+\end{itemize}
+\end{insight}
+
+\begin{insight}[跨领域类比：Bayes 树之于推断，如 B$+$ 树之于数据库（边界声明）]
+B$+$ 树把有序数据组织成“叶存数据、内部节点存索引”的结构，使插入/删除/查找都 $O(\log N)$。Bayes 树把联合分布组织成“叶存局部信息、根存全局耦合”的结构，使增量更新只需沿受影响路径操作。共同哲学是\textbf{把全局结构分层编码，使局部操作不必触碰全体}。\emph{类比的边界}：B$+$ 树是平衡树，更新路径恒为 $O(\log N)$；Bayes 树的更新路径长度取决于\emph{图的拓扑}——位姿图约 $O(\sqrt N)$（平面分隔符），BA 约 $O(N^{2/3})$，最坏（全连通回环）退化为整棵树。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 对一条 $5$ 节点链 $x_0-x_1-x_2-x_3-x_4$（仅相邻里程计），写出消元树，验证它退化为一条链。
+  \item 在上链加一条回环 $f(x_0,x_4)$，重画消元树，用 \cref{eq:row-struct} 找出 $\mathbf{R}$ 各行非零模式，标出哪些是 fill-in。
+  \item 用 \cref{thm:liu} 的“单向性”说明：为什么不能仅凭“$j$ 是 $i$ 的祖先”就断言 $L_{ji}\neq 0$。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Bayes 树的关键性质}
+\label{sec:isam-properties}
+
+\cref{def:bayes-tree} 的结构带来五条性质，它们正是 iSAM2 三把钥匙的依据。
+
+\begin{table}[H]\centering\small
+\caption{Bayes 树的关键性质}
+\label{tab:bayes-tree-prop}
+\begin{tabular}{p{0.16\textwidth}p{0.46\textwidth}p{0.28\textwidth}}
+\toprule
+性质 & 陈述 & 用途 \\
+\midrule
+\textbf{局部性} & 新因子 $f(\mathbf{x}_a,\mathbf{x}_b)$ 只影响从 $C(\mathbf{x}_a),C(\mathbf{x}_b)$ 到其\emph{最低公共祖先}（LCA）路径上的所有团 & findAffectedTop 的根据（\cref{sec:isam-algorithm}） \\
+\textbf{可分离性} & 任何子树在给定其 separator 后与树的其余部分条件独立 & 并行消元、分布式 SLAM（\cref{sec:isam-parallel}） \\
+\textbf{增量可编辑} & 拆开受影响路径 $\to$ 产生 orphan 子树（带缓存边缘因子）$\to$ 重新消元 top $\to$ 挂回 orphan & removeTop $+$ graft 的依据 \\
+\textbf{叶剪枝 $=$ 精确边缘化} & 叶团前沿的信息已\emph{完全向上传递}给父团 separator，直接删叶 $=$ 零误差边缘化 & \texttt{marginalizeLeaves}、固定延迟平滑（\cref{sec:isam-marg}） \\
+\textbf{消元顺序自由} & 同一 Bayes 树可对应多个 $\mathbf{R}$（子团排序可任意） & 解释 Bayes 树比 $\mathbf{R}$ 结构更稳 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{theorem}[叶剪枝 $=$ 精确边缘化]
+\label{thm:leaf-marg}
+设 $F_k$ 恰是某\emph{叶团}的全部前沿变量，则对该叶团积分（边缘化 $F_k$）等于直接删去该叶团：
+\begin{equation}
+  \int P(\Theta)\,dF_k
+  =\underbrace{\Big(\int P(F_k\mid S_k)\,dF_k\Big)}_{=\,1}\cdot\prod_{j\neq k}P(F_j\mid S_j)
+  =\prod_{j\neq k}P(F_j\mid S_j).
+  \label{eq:leaf-marg}
+\end{equation}
+\end{theorem}
+\begin{proof}
+由 \cref{eq:bayes-tree-factor} 把 $P(\Theta)$ 写成各团之积。$F_k$ 是叶团前沿，故 $F_k$ 不出现在\emph{任何其他}团的条件式中（叶团无子团，其前沿不作为别人的 separator）。于是积分号只作用在含 $F_k$ 的唯一因子 $P(F_k\mid S_k)$ 上；条件密度对其前沿积分恒为 $1$。$\square$
+\end{proof}
+
+\begin{insight}[只向上流的信息：Bayes 树相对 junction tree 的优势]
+\cref{thm:leaf-marg} 的“零计算边缘化”依赖一个事实：叶团前沿的信息\emph{已经}通过消元被推到了父团的 $P(F_{\pi(k)}\mid S_{\pi(k)})$ 里（$S_k$ 就在父团出现）。这是 Bayes 树相较一般 junction tree 的突出优势——\emph{信息只向上流}，所以删叶不需要任何回传计算。这也解释了为什么固定延迟平滑“掐掉最旧的叶”如此廉价。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 \cref{eq:bayes-tree-factor} 证明 \cref{thm:leaf-marg}：写清“为何 $\int P(F_k\mid S_k)\,dF_k=1$”用到的归一化性质。
+  \item 若要边缘化的变量\emph{不是}叶团前沿，会怎样？（提示：它的信息散布在多个团，不能直接删——这正是 \cref{sec:isam-marg} 要先“旋转到叶”的原因。）
+  \item 用“可分离性”说明：为何兄弟子树可以并行回代而不必互相通信？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{iSAM2 总体流程：三把钥匙}
+\label{sec:isam-algorithm}
+
+iSAM2\cite{kaess2012isam2} 把批量 GN 改写成对 Bayes 树的局部编辑。它维护一组状态：Bayes 树 $T$、非线性因子集 $\mathcal{F}$、线性化点 $\Theta$、当前增量 $\delta$。每步输入新因子 $\mathcal{F}_{\text{new}}$ 与新变量初值 $\Theta_{\text{new}}$。
+
+\begin{algo}[iSAM2 单步（Kaess 2012 Alg.~8\cite{kaess2012isam2}）]
+\label{algo:isam2-step}
+\begin{enumerate}
+  \item \textbf{addVariables / addFactors}：$\mathcal{F}\leftarrow\mathcal{F}\cup\mathcal{F}_{\text{new}}$，$\Theta\leftarrow\Theta\cup\Theta_{\text{new}}$（初始化新变量）；
+  \item \textbf{Fluid Relinearization}（\cref{sec:isam-fluid}）：找需重线性化的变量集 $M=\{$含 $|\delta_j|\ge\beta$ 变量的团及其祖先$\}$，并把这些变量吸收进 $\Theta$；
+  \item \textbf{findAffectedTop}：令受影响集 $J=M\cup\{$被 $\mathcal{F}_{\text{new}}$ 影响的变量$\}$，沿 Bayes 树\emph{父指针}向根游走，路径上所有团进入“top”；
+  \item \textbf{removeTop}：拆下 top 中的团；它们的孩子成为 orphan，保留\emph{缓存边缘因子}（cached marginal factors，避免重消元整棵子树）；
+  \item \textbf{relinearize}：在最新 $\Theta$ 处重算 top 涉及的非线性因子 Jacobian（\emph{只对受影响子集}）；
+  \item \textbf{reorder}（可选）：对 top 内变量做局部 (C)COLAMD 重排序，把\emph{最近访问的变量约束到排序末尾}（推向根，使下次 top 更小）；
+  \item \textbf{eliminate}：对 top 因子集 $+$ orphan 缓存边缘因子执行变量消元（\cref{algo:eliminate}）$\to$ 新 Bayes 子树；
+  \item \textbf{graft}：把 orphan 按其 separator 挂回新子树；
+  \item \textbf{update $\delta$}：沿受影响团向下做 \emph{wildfire 回代}（\cref{sec:isam-wildfire}），非路径团保持旧 $\delta$。
+\end{enumerate}
+\end{algo}
+
+\noindent 这九步对应三把钥匙：\textbf{(i) findAffectedTop $+$ removeTop}（第 3--4 步，只拆受影响路径上的团）、\textbf{(ii) Fluid Relinearization}（第 2、5 步，只对 $|\delta_j|>\beta$ 的变量重线性化）、\textbf{(iii) Wildfire 回代}（第 9 步，只沿变化显著的子树传播新 $\delta$）。下两节分别展开后两把钥匙；本节先给整体伪代码与一个完整走查。
+
+\begin{codebox}[Python]{iSAM2 单步骨架（对照 Alg.~8）}
+def isam2_step(T, F, Theta, delta, F_new, Theta_new, beta, alpha):
+    F = F | F_new
+    Theta = Theta | Theta_new                 # init new variables
+    # (i) fluid relinearization: which variables to relinearize
+    Theta, M = fluid_relinearize(Theta, delta, beta)
+    # (ii) findAffectedTop: new factors + relin -> walk to root
+    J = M | affected_by(F_new)
+    T = update_top(T, F, J)                    # removeTop + relin + reorder
+                                              #   + eliminate + graft
+    # (iii) wildfire partial back-substitution
+    delta = partial_solve(T, alpha)
+    return T, Theta, delta
+\end{codebox}
+
+\subsection{一个完整的局部编辑走查}
+\label{sec:isam-worked}
+
+把 \cref{algo:isam2-step} 在一个具体图上跑一遍。考虑 $6$ 个位姿的链 $x_1-x_2-x_3-x_4-x_5-x_6$，当前 Bayes 树（简化形状）为：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  >=Stealth, level distance=12mm, sibling distance=30mm,
+  cl/.style={rectangle, rounded corners, draw, fill=second!8, draw=second!60!black, align=center, font=\small, inner sep=3.5pt},
+  ed/.style={->, thick, gray!55!black}]
+\node[cl] {$x_5,x_6$}
+  child {node[cl] {$x_3,x_4 \mid x_5$}
+    child {node[cl] {$x_1,x_2 \mid x_3$}}}
+  child {node[cl] {$l_6 \mid x_6$}};
+\end{tikzpicture}
+\end{center}
+
+\noindent 现在加入回环因子 $f_{\text{loop}}(x_2,x_6)$。逐步执行：
+\begin{enumerate}
+  \item \textbf{定位涉及变量所在团}：$x_2\in\{x_1,x_2\mid x_3\}$，$x_6\in$ 根团 $\{x_5,x_6\}$。
+  \item \textbf{findAffectedTop}：从这两个团各自向根走，取路径并集，得 top $=\{x_1,x_2\mid x_3\},\{x_3,x_4\mid x_5\},\{x_5,x_6\}$。右子树 $\{l_6\mid x_6\}$ 不在 top 内，但其父团被拆，故临时成 orphan。
+  \item \textbf{removeTop}：把 top 中所有团拆成一个因子集合，含：top 内原条件密度转回的高斯因子、新回环因子、以及 orphan 的缓存边缘因子（保持 $\{l_6\mid x_6\}$ 与新父团的连接）。
+  \item \textbf{relinearize}：在 top 相关变量的新线性化点处重算 Jacobian；\emph{orphan 内部不重线性化}，它只通过缓存因子与 top 交互。
+  \item \textbf{reorder}：对 top 内变量局部重排序，可能得到 $x_1,x_2,x_3,x_4,x_5,x_6$，也可能因回环强耦合把 $x_2,x_6$ 推向根（启发式尽量把最近受影响变量放到排序末端、靠近根，以减小未来 top）。
+  \item \textbf{eliminate}：重消元 top 因子集，生成新 Bayes 子树，例如根 $\{x_2,x_5,x_6\}$、左孩子 $\{x_1\mid x_2\}$、右孩子 $\{x_3,x_4\mid x_5\}$。
+  \item \textbf{graft}：把 orphan 按 separator $\{x_6\}$ 挂到含 $x_6$ 的最近团下。
+  \item \textbf{update $\delta$}：从新子树根开始 wildfire 回代；若 $\delta_{x_6}$ 变化大则 orphan 也被访问，否则保持旧解。
+\end{enumerate}
+
+\begin{table}[H]\centering\small
+\caption{走查给出的四点结论}
+\label{tab:worked-lessons}
+\begin{tabular}{ll}
+\toprule
+观察 & 含义 \\
+\midrule
+新因子不一定只影响附近变量 & 回环可沿 Bayes 树路径影响到根 \\
+orphan 不丢信息 & 通过缓存边缘因子保持与 top 的关系 \\
+局部重排序很关键 & 不重排会让未来 top 越来越大 \\
+wildfire 只改数值不改结构 & 结构更新在 removeTop/eliminate/graft 完成 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{与批量的差别（一句话）。}
+批量做法是“重线性化\emph{所有}因子 $\to$ 全图重排序 $\to$ 重 Cholesky $\to$ 全量回代”；iSAM2 做法是“只线性化 top 涉及因子 $\to$ 只对 top 重排序 $\to$ 只重消元 top $\to$ 只沿变化传播回代”。当 top 远小于全树时收益巨大；当 top 接近全树时（大回环），iSAM2 退化为批量，并多出管理开销——这就是 \emph{iSAM2 最坏情况 $=$ 批量} 的本质。
+
+\begin{practice}
+\begin{enumerate}
+  \item 在上述 Bayes 树上改加 $f(x_1,x_6)$，重新画出 top 与 orphan。
+  \item 若某 orphan 的 separator 为 $\{x_4,x_6\}$，它应挂到哪个新团下？给出判据。
+  \item 写伪代码统计每次 update 的 “top 占全树比例”，并用它判断是否需要触发一次周期性批量 reorder。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Fluid Relinearization：选择性重线性化}
+\label{sec:isam-fluid}
+
+\paragraph{动机：大多数变量没必要重线性化。}
+完整重线性化 $=$ 批量 GN，每步 $O(N^{3/2})$。但实测中 $80$--$90\%$ 的变量 $\|\delta_j\|$ 很小，旧 Jacobian 仍可信。Fluid Relinearization 只对越界变量刷新线性化点\cite{kaess2012isam2}：
+\begin{equation}
+  J=\{\,j:\|\delta_j\|\ge\beta\,\}\;\Rightarrow\;
+  \Theta[J]\leftarrow\Theta[J]\oplus\delta[J],\quad
+  M=\bigcup_{j\in J}\{\text{含 }j\text{ 的团及其全部祖先}\}.
+  \label{eq:fluid-relin}
+\end{equation}
+
+\subsection{什么时候旧线性化点仍可信}
+\label{sec:isam-fluid-math}
+
+设某非线性残差为 $\mathbf{r}_i(\Theta_i)$。在旧线性化点 $\bar\Theta$ 处的一阶展开为
+\begin{equation}
+  \mathbf{r}_i(\bar\Theta\oplus\delta)\approx\mathbf{r}_i(\bar\Theta)+\mathbf{J}_i(\bar\Theta)\,\delta,
+  \label{eq:relin-taylor}
+\end{equation}
+被忽略的余项是二阶小量 $\tfrac12\,\delta^\top\nabla^2\mathbf{r}_i(\bar\Theta)\,\delta=O(\|\delta\|^2)$。这就是阈值规则的数学依据：
+\begin{equation}
+  \|\delta_j\|<\beta_j\;\Longrightarrow\;\text{暂保留旧 Jacobian}.
+  \label{eq:relin-threshold}
+\end{equation}
+
+\paragraph{为什么必须先把 $\delta$ 吸收进线性化点。}
+若变量越界，iSAM2 做 $\Theta_j\leftarrow\Theta_j\oplus\delta_j,\ \delta_j\leftarrow 0$。这\emph{不是}普通的状态更新，而是\textbf{重新定义局部坐标原点}：随后涉及该变量的因子在新 $\Theta_j$ 处重线性化。若不吸收 $\delta$ 而继续在远离当前估计的切空间里线性化，会出两个问题：(1) 李群 retraction 的局部坐标不再准确（\cref{ch:lie}）；(2) Jacobian 描述的是旧切平面、不再刻画当前残差曲率。这与迭代 EKF（IEKF）的 iterated update 很像，区别在于 IEKF 对\emph{当前时刻}反复重线性化，而 iSAM2 对整棵 Bayes 树中\emph{越界的}变量做\emph{局部}重线性化。
+
+\paragraph{阈值要分量设，不能只用一个标量。}
+$\mathrm{Pose3}$ 的切向量同时含旋转与平移 $\delta\boldsymbol{\xi}=[\boldsymbol{\rho}^\top,\boldsymbol{\phi}^\top]^\top$\pz{存疑：原稿此处把切向量写成 $[\omega;\rho]$（旋转在前）；本书 $\se(3)$ 约定平移在前 $\boldsymbol{\xi}=[\boldsymbol{\rho};\boldsymbol{\phi}]$，已统一，物理结论不变}，“旋转 $0.1$\,rad”与“平移 $0.1$\,m”物理意义不同。工程上更合理的是按变量类型设阈值：
+
+\begin{table}[H]\centering\small
+\caption{Fluid Relinearization 的分量阈值建议}
+\label{tab:relin-threshold}
+\begin{tabular}{ll}
+\toprule
+变量 & 建议阈值含义 \\
+\midrule
+$\mathrm{Pose3}$ 旋转 & $0.01$--$0.1$ rad \\
+$\mathrm{Pose3}$ 平移 & $0.01$--$0.1$ m \\
+IMU 陀螺偏置 & 按随机游走 $\sigma$ \\
+IMU 加速度偏置 & 按随机游走 $\sigma$ \\
+路标逆深度 & 按深度不确定性 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent GTSAM 默认 \texttt{relinearizeThreshold}$=0.1$（标量，大致是“旋转 $0.1$\,rad 或平移 $0.1$\,m”），也支持 \texttt{FastMap<char,Vector>} 对 \texttt{X}/\texttt{V}/\texttt{B} 等符号分别给阈值向量；另有 \texttt{relinearizeSkip}$=10$（每 $10$ 次 \texttt{update()} 才触发一次 relin 检查，实时系统常改为 $1$）。实测 $\beta=0.1$ 对 $\chi^2$ 几乎无影响，而受影响矩阵元数可降到批量的 $5$--$15\%$（Kaess 2012 Fig.~9\cite{kaess2012isam2}）。
+
+\begin{pitfall}[概念误区：把 Fluid Relinearization 当成 FEJ]
+Fluid Relinearization 和 FEJ（First-Estimate Jacobian，见 \cref{ch:eskf}）都涉及“线性化点”，但\textbf{目标完全不同}。Fluid Relinearization 是增量 GN 的\emph{效率启发式}——变化大的变量刷新 Jacobian、变化小的沿用旧值，以减少受影响团。FEJ 的目标是\emph{固定}特定 Jacobian 求值点，以维护滤波器在不可观子空间的\emph{一致性}。iSAM2 的选择性重线性化\emph{不等于} FEJ 的一致性保证——不能把前者直接理解为一致性修正。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 对重投影残差写出 Taylor 余项的二阶量级，解释“远点”与“近点”哪个更怕沿用旧线性化点。
+  \item 取 $\beta\to 0$ 与 $\beta\to\infty$ 两个极端，分别说明 Fluid Relinearization 退化成什么（提示：前者$\to$批量 GN，后者$\to$从不重线性化）。
+  \item 在 GTSAM 中分别设 \texttt{relinearizeThreshold}$=0.001,0.1,1.0$，预测 \texttt{ISAM2Result.variablesRelinearized} 的相对大小。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Wildfire 回代：部分状态更新}
+\label{sec:isam-wildfire}
+
+\paragraph{动机：解完 $\mathbf{R}\,\delta=\mathbf{d}$ 不必更新所有变量。}
+批量 GN 解完正规方程后一次性回代更新所有变量；iSAM2 只沿“受影响路径”向下传播。野火（wildfire）从根开始，逐团做局部回代；若某团的前沿增量变化低于阈值 $\alpha$，则\emph{不再向其子树蔓延}（野火熄灭）。
+
+\begin{algo}[Wildfire 部分回代（Kaess 2012 Alg.~7\cite{kaess2012isam2}）]
+\label{algo:wildfire}
+\begin{codebox}[Python]{partial\_solve：从根向下的野火回代}
+def partial_solve(T, alpha):
+    def visit(C):                          # clique C = (F : S)
+        dF_new = solve_local(P_FgivenS[C], delta[S(C)])  # Eq. (clique-bs)
+        changed_F = {j in F(C):
+                     norm(dF_new[j] - delta[j]) > alpha}
+        delta[F(C)] = dF_new
+        for D in children(C):
+            if separator(D) & changed_F:   # spread only if S(D) changed
+                visit(D)
+            # else: subtree keeps old delta (fire dies out)
+    visit(root(T))
+\end{codebox}
+\end{algo}
+
+\paragraph{结构基础：running intersection property。}
+野火策略的结构依据是团树的\emph{运行交性质}（running intersection property）：若当前团的 separator 变量与条件密度都几乎没变，下游子树的增量通常也很小，可停止传播。\textbf{这是数值启发式而非严格等式}：阈值过大牺牲精度，过小则接近全量回代。其定量界见 \cref{sec:isam-clique-algebra} 的 \cref{eq:wildfire-bound}。
+
+\paragraph{GTSAM 参数与收敛性。}
+\texttt{ISAM2GaussNewtonParams::wildfireThreshold}$=0.001$（默认）；Dogleg 版默认 $10^{-5}$。单次 \texttt{update()} 内的 wildfire 并不等价于一步批量 GN；但 Kaess 2012 §4.3\cite{kaess2012isam2} 说明：在每次 update 内部\emph{迭代} fluid relinearization 直到 $J=\varnothing$，等价于批量 GN 的若干步。\textbf{退化条件}：当新回环导致大范围变量变动（$\delta$ 遍及全树），野火就“烧到根再烧到每片叶”——等价于批量 GN。
+
+\begin{pitfall}[思维陷阱：把 wildfire 阈值当成严格数学剪枝]
+\texttt{wildfireThreshold} 控制的是\emph{回代完整度}，不是一个无损的剪枝准则。它越大越快、但线性化误差越可能累积；越小越接近全量回代、越精确。它也\emph{不等于} \texttt{relinearizeThreshold}——后者控制\emph{模型准确度}（是否刷新 Jacobian），前者控制\emph{解的传播范围}（是否更新 $\delta$）。二者朝相反方向权衡精度与速度，调参时务必分清。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 给出一种回环拓扑，使得 wildfire 必须传播到全树（提示：回环连接 Bayes 树两个遥远子树，其 LCA $=$ 根）。
+  \item 解释为什么“野火在某子树熄灭”\emph{不}意味着该子树的变量“不重要”，而只意味着本次其 separator 变化低于阈值。
+  \item 把 \texttt{wildfireThreshold} 设为 $0$，描述算法行为（提示：退化为全量回代，逐团但不剪枝）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{团内条件密度的线性代数：从 \texorpdfstring{$P(F\mid S)$}{P(F|S)} 到局部回代}
+\label{sec:isam-clique-algebra}
+
+本节把“团存什么、怎么回代”讲到线代底。每个 Bayes 树团存储一个高斯条件密度，写成（白化后）平方根信息形式：
+\begin{equation}
+  P(\delta_F\mid\delta_S)\propto\exp\!\Big(-\tfrac12\big\|R_{FF}\,\delta_F+R_{FS}\,\delta_S-d_F\big\|^2\Big),
+  \label{eq:clique-cond}
+\end{equation}
+其中 $R_{FF}$ 是（块）上三角矩阵。给定父团已算出的 $\delta_S$，该团的最优前沿增量由\emph{三角回代}给出：
+\begin{equation}
+  \boxed{\;\delta_F=R_{FF}^{-1}\big(d_F-R_{FS}\,\delta_S\big).\;}
+  \label{eq:clique-bs}
+\end{equation}
+这就是 Bayes 树回代——与普通三角回代完全相同，只是\emph{按团块}执行。
+
+\subsection{从 QR 到条件密度}
+\label{sec:isam-qr}
+
+设某团装配后的局部线性系统为 $\mathbf{A}_F\,\delta_F+\mathbf{A}_S\,\delta_S\approx\mathbf{b}$。对 $\mathbf{A}_F$ 做 QR：$\mathbf{A}_F=\mathbf{Q}\big[\begin{smallmatrix}R_{FF}\\\mathbf{0}\end{smallmatrix}\big]$。左乘 $\mathbf{Q}^\top$：
+\begin{equation}
+  \begin{bmatrix}R_{FF}\\\mathbf{0}\end{bmatrix}\delta_F
+  +\begin{bmatrix}\bar{\mathbf{A}}_S\\\mathbf{A}'_S\end{bmatrix}\delta_S
+  \approx\begin{bmatrix}\bar{\mathbf{b}}\\\mathbf{b}'\end{bmatrix}.
+  \label{eq:clique-qr}
+\end{equation}
+\emph{上半}部分给出条件密度 $R_{FF}\,\delta_F+\bar{\mathbf{A}}_S\,\delta_S-\bar{\mathbf{b}}$（存在当前团）；\emph{下半}部分不再含 $\delta_F$，成为 separator 上的新因子 $\mathbf{A}'_S\,\delta_S-\mathbf{b}'$（传给父团）。这就是消元的代数全过程：Bayes 树把上半存在本团、把下半传给父团。
+
+\paragraph{与 Cholesky 视角的对偶。}
+若从正规方程出发，局部 Hessian 写成 $\big[\begin{smallmatrix}\mathbf{H}_{FF}&\mathbf{H}_{FS}\\\mathbf{H}_{SF}&\mathbf{H}_{SS}\end{smallmatrix}\big]$，消去 $F$ 后父团收到的更新是 Schur 补 $\mathbf{H}'_{SS}=\mathbf{H}_{SS}-\mathbf{H}_{SF}\mathbf{H}_{FF}^{-1}\mathbf{H}_{FS}$（与 \cref{ch:slam_est} 的 \cref{thm:schur-cond} 一致）。\textbf{QR 视角避免显式形成 $\mathbf{H}=\mathbf{A}^\top\mathbf{A}$，数值更稳（条件数不平方）；Cholesky 视角更易解释 fill-in。} 这就是 GTSAM 中 \texttt{factorization}$=$\texttt{QR}（稳但慢约 $3\times$）与 \texttt{CHOLESKY}（快但对病态更敏感）之分——不是理论偏好，而是数值条件的工程判断。
+
+\subsection{为何分 frontal 与 separator；局部回代的误差传播}
+\label{sec:isam-fs-split}
+
+设团 $C_k=\{x_1,x_2,x_5,x_9\}$，若父团含 $\{x_5,x_9\}$，则 $F_k=\{x_1,x_2\}$、$S_k=\{x_5,x_9\}$，团内条件密度是 $P(x_1,x_2\mid x_5,x_9)$。这意味着：只要父团给出 $x_5,x_9$ 的增量，本团就能\emph{独立}求 $x_1,x_2$；兄弟团之间不必通信（只共享父团 separator）——这正是 Bayes 树可并行的原因。
+
+\paragraph{Wildfire 阈值的定量来源。}
+回代公式 \cref{eq:clique-bs} 中只有 $\delta_S$ 影响子团。若父团 separator 变化小，$\|\delta_S^{\text{new}}-\delta_S^{\text{old}}\|<\alpha$，则子团前沿变化受限于
+\begin{equation}
+  \big\|\delta_F^{\text{new}}-\delta_F^{\text{old}}\big\|\le\big\|R_{FF}^{-1}R_{FS}\big\|\cdot\big\|\delta_S^{\text{new}}-\delta_S^{\text{old}}\big\|.
+  \label{eq:wildfire-bound}
+\end{equation}
+这就是 \cref{sec:isam-wildfire} wildfire 阈值的直觉：separator 变化小 $\Rightarrow$ 整棵子树变化通常也小，可暂不更新。但放大因子 $\|R_{FF}^{-1}R_{FS}\|$ 出现在界里：\textbf{若局部系统病态，这个因子可能很大}，小的 separator 变化仍可造成大的 frontal 变化。故在高精度离线优化或病态几何场景，应把 wildfire 阈值设得更小、甚至设为 $0$ 做全量回代。
+
+\begin{table}[H]\centering\small
+\caption{团内回代的数值边界}
+\label{tab:clique-numerical}
+\begin{tabular}{lll}
+\toprule
+现象 & 可能原因 & 建议 \\
+\midrule
+\texttt{IndeterminantLinearSystemException} & $R_{FF}$ 奇异或近奇异 & 检查 gauge、先验、退化观测 \\
+QR 能跑而 Cholesky 失败 & $\mathbf{J}^\top\mathbf{J}$ 病态放大条件数 & 切 QR 或增强白化尺度 \\
+回代后局部变量跳变 & separator 变化被 $\|R_{FF}^{-1}R_{FS}\|$ 放大 & 降低 \texttt{wildfireThreshold} \\
+团很大 & 排序不佳或大回环制造大 separator & 用 constrained COLAMD/METIS \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{practice}
+\begin{enumerate}
+  \item 给定 $R_{FF}=\big[\begin{smallmatrix}2&1\\0&3\end{smallmatrix}\big]$、$R_{FS}=\big[\begin{smallmatrix}1\\2\end{smallmatrix}\big]$、$d_F=[1,0]^\top$，用 \cref{eq:clique-bs} 手算 $\delta_F$ 关于标量 $\delta_S$ 的表达式。
+  \item 对一个局部因子矩阵 $[\mathbf{A}_F\mid\mathbf{A}_S]$ 做 QR，标出哪部分是条件密度、哪部分是传给父团的因子。
+  \item 解释为什么 \texttt{factorization}$=$\texttt{QR} 在病态情况下更稳（提示：QR 不形成 $\mathbf{A}^\top\mathbf{A}$，条件数不被平方）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{增量边缘化与固定延迟平滑}
+\label{sec:isam-marg}
+
+\subsection{叶团的零开销边缘化}
+\label{sec:isam-leaf-marg}
+
+由 \cref{thm:leaf-marg}，若要边缘化的 key 集合 $K$ \emph{恰是某叶团的全部前沿}，直接删除该叶即可——其 separator $S_k$ 的信息已完全位于父团 $P(F_{\pi(k)}\mid S_{\pi(k)})$ 中，无需任何重新计算（\cref{eq:leaf-marg}）。
+
+\subsection{非叶变量：必须先“旋转到叶”}
+\label{sec:isam-rotate-to-leaf}
+
+若目标变量不是叶团前沿，需通过 \texttt{constrainedKeys} 的 Group 机制，强制把它们\emph{最先消元}（落到叶端），再删除：
+
+\begin{codebox}[C++]{把待边缘化 key 推到叶端（仿 IncrementalFixedLagSmoother）}
+// GTSAM IncrementalFixedLagSmoother::createOrderingConstraints
+FastMap<Key,int> constrained;
+for (Key k : allKeys)            constrained[k] = 1;  // normal group
+for (Key k : marginalizableKeys) constrained[k] = 0;  // eliminate first
+isam.update(newFactors, newValues, FactorIndices(), constrained);
+isam.marginalizeLeaves(marginalizableKeys);
+\end{codebox}
+
+\noindent COLAMD 会在 Group 0 内部做最小度排序，\emph{但保证 Group 0 全部消元在 Group 1 之前}——即被边缘化的变量最早消元（落到叶端），然后真正删掉。
+
+\begin{pitfall}[编程陷阱：constrainedKeys 组号反了导致 fill-in 爆炸或边缘化失败]
+若把\emph{要边缘化}的 key 设为 Group 1（高优先级、最后消元）、现有 key 设 Group 0，则边缘化目标反而被\emph{推向根}，形成巨大 separator——不仅无法删叶，还会让 Bayes 树退化。正确做法：\textbf{边缘化 key $=$ Group 0（最先消元、落到叶），其余 $=$ Group 1}。照搬 \texttt{IncrementalFixedLagSmoother::createOrderingConstraints} 的逻辑即可。
+\end{pitfall}
+
+\subsection{IncrementalFixedLagSmoother = iSAM2 + 定期边缘化}
+\label{sec:isam-fixedlag}
+
+文件 \texttt{gtsam\_unstable/nonlinear/IncrementalFixedLagSmoother.\{h,cpp\}}（4.3 后迁入主 gtsam）。工作流：
+\begin{enumerate}
+  \item 维护 \texttt{KeyTimestampMap}：每次 \texttt{update} 写入新 key 的时间戳；
+  \item 找超时 key（\texttt{timestamp < now $-$ lag}）$\to$ \texttt{marginalizableKeys}；
+  \item 构造 \texttt{constrainedKeys}（Group 0 $=$ 超时 key，Group 1 $=$ 其余）；
+  \item \texttt{isam\_.update(factors, values, timestamps, constrainedKeys, ...)}；
+  \item \texttt{isam\_.marginalizeLeaves(marginalizableKeys)}；
+  \item \texttt{eraseKeysBefore(timestamp)} 清理时间戳表。
+\end{enumerate}
+
+\subsection{SmartFactor 与边缘化的冲突}
+\label{sec:isam-smartfactor}
+
+\emph{SmartFactor}（如 \texttt{SmartProjectionPoseFactor}）把 3D 路标\emph{按需} Schur 消去——因子只显式连接 pose key，内部维护动态观测列表。这与 \texttt{marginalizeLeaves} 的假设冲突（GTSAM Issues \#595/\#1101/\#1976）：
+\begin{enumerate}
+  \item \texttt{marginalizeLeaves} 假设受影响团的 key 顺序使“要边缘化的 key 都排在被保留 key 之前”。SmartFactor 每次 linearize 内部重排 key，该假设可能被破坏（Issue \#1101：拆团逻辑假设 key 有序，而这并不总成立）。
+  \item SmartFactor 内部的 Schur 补让路标隐式依赖多个 pose，故该路标\emph{不是叶}、也不在显式 key 列表中，但其信息散布各团，边缘化时重算冲突。
+  \item \texttt{cacheLinearizedFactors}$=$\texttt{true} 让旧 Jacobian 被复用，但 SmartFactor 的 Jacobian 模式会随观测变化，缓存失效不易察觉。
+\end{enumerate}
+\textbf{解决策略}：边缘化前把相关 SmartFactor 显式 linearize 为 \texttt{JacobianFactor}（“固化”、冻结 key 顺序）；或设 \texttt{cacheLinearizedFactors}$=$\texttt{false}；Kimera-VIO 采用前者（\texttt{deleteOldSmartFactors} 后再 \texttt{marginalize}）。
+
+\begin{practice}
+\begin{enumerate}
+  \item 为何 \texttt{SmartProjectionPoseFactor} 会让 \texttt{marginalizeLeaves} 失败？写出两种绕过方案并讨论各自影响。
+  \item 给固定延迟平滑构造一个“非叶边缘化失败”的最小案例，再用 \texttt{constrainedKeys} 修复。
+  \item 解释 \cref{eq:leaf-marg} 与 \texttt{marginalizeLeaves} 的对应：删叶为何在概率上是\emph{精确}边缘化而非近似。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{与批量 GN/LM 的关系：iSAM2 不是 LM}
+\label{sec:isam-gn}
+
+\begin{pitfall}[思维陷阱：以为 iSAM2 内置了 LM 阻尼]
+这是使用 GTSAM 最常见的误解之一。\textbf{iSAM2 默认是纯高斯牛顿，没有任何阻尼参数 $\lambda$}（\texttt{ISAM2GaussNewtonParams}）。这意味着在大回环或坏初值场景下，单次 \texttt{update()} 可能因 GN 步过大而跳出正确收敛域。若回环后发现轨迹“抖一下然后恢复/发散”，第一件事是检查是否需要多次空 \texttt{update()} 或切到 \texttt{ISAM2DoglegParams}。
+\end{pitfall}
+
+iSAM2 没有 LM 的阻尼矩阵。那么非线性失败时怎么办？
+
+\begin{table}[H]\centering\small
+\caption{iSAM2 的非线性失败应对}
+\label{tab:isam-failure}
+\begin{tabular}{ll}
+\toprule
+失败模式 & iSAM2 应对 \\
+\midrule
+小扰动、好初值 & 正常收敛（局部二次收敛率） \\
+大回环后多变量偏离线性点 & 单次 \texttt{update()} 不够；连跑多次（LIO-SAM 回环后在常规 $2$ 次之外再补 $5$ 次空 \texttt{update}） \\
+严重非线性 / 坏初值 & 切 \texttt{ISAM2DoglegParams}：信赖域 Powell dogleg\cite{rosen2014rise}，在 Bayes 树上实现 \\
+病态 Hessian & \texttt{factorization}$=$\texttt{QR} 代替 \texttt{CHOLESKY}（慢约 $3\times$ 但稳健） \\
+外点型噪声 & 配 \texttt{noiseModel::Robust}(Cauchy/Huber/DCS) 或批量 \texttt{GncOptimizer} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{为什么 SLAM 中通常收敛。}
+里程计 / scan-matching / IMU 预积分提供\emph{好的位姿初值}；路标由首次观测反投影得良好初值；回环前误差在局部近似范围内；Fluid Relinearization $+$ 多次 update 足以拉回最优。在良好线性化点附近（$\|\delta\|$ 小），GN 具有\emph{二次收敛率}（见 \cref{ch:nlopt}）：
+\begin{equation}
+  \|\delta^{(k+1)}\|\le C\,\|\delta^{(k)}\|^2,
+  \label{eq:gn-quadratic}
+\end{equation}
+常数 $C$ 取决于残差的 Hessian。在 iSAM2 中，每次 \texttt{update()} 等价于一步 GN（或 Dogleg），故：
+\begin{itemize}
+  \item \textbf{纯里程计区间}：$\|\delta\|$ 很小（初值来自预积分，误差约 $10^{-2}$\,m/rad），一次 update 足够；
+  \item \textbf{回环闭合后}：$\|\delta\|$ 可能很大（如米级闭合误差），需多次 update 才收敛；
+  \item \textbf{多次空 update 的含义}：每次空 update 在当前 $\Theta$ 处重新线性化并求解，等价于 GN 的多次迭代。
+\end{itemize}
+LIO-SAM 回环后约 $6$ 次空 update（常规 $2$ 次里 $1$ 次空，加回环块的 $5$ 次）的经验来自：闭合误差通常 $<5$\,m，按 \cref{eq:gn-quadratic}，多次二次收敛可把误差迅速降到远低于传感器精度（设 $C\approx 0.1$）\pz{存疑：原稿给出 $5\times(0.5)^{64}\approx 10^{-10}$\,m 的估计；二次收敛的“迭代次数指数化”仅在 $C\|\delta^{(0)}\|<1$ 时成立，且 $6$ 次叠加的常数处理偏粗，量级直觉可用、精确数值待核}。
+
+\paragraph{Dogleg 信赖域的数学形式。}
+当 GN 步 $\delta_{\text{gn}}$ 超出信赖域半径 $\Delta$ 时，Powell Dogleg 取
+\begin{equation}
+  \delta_{\text{dl}}=
+  \begin{cases}
+    \delta_{\text{gn}}, & \|\delta_{\text{gn}}\|\le\Delta,\\[2pt]
+    (1-\tau)\,\delta_{\text{sd}}+\tau\,\delta_{\text{gn}}, & \text{沿 dogleg 路径插值，使 }\|\delta_{\text{dl}}\|=\Delta,
+  \end{cases}
+  \label{eq:dogleg}
+\end{equation}
+其中 $\delta_{\text{sd}}=-\alpha_{\text{sd}}\,\mathbf{J}^\top\mathbf{r}$ 是梯度方向的 Cauchy 点（详见 \cref{ch:nlopt}）。在 Bayes 树上实现 Dogleg 需额外存储 Newton 步与梯度投影（GTSAM 的 \texttt{deltaNewton\_} 与 \texttt{RgProd\_} 成员即此用途）。Rosen--Kaess--Leonard 的 RISE\cite{rosen2014rise} 在 iSAM2 之上加信赖域控制：若单步 update 使非线性误差增加，则缩小信赖域并重试——比切完整 Dogleg 更轻量，代价是偶尔触发 batch-like 行为。
+
+\begin{insight}[算法--数据结构协同设计：为什么是 GN 而非 LM]
+若 iSAM2 用 LM，每改一次阻尼 $\lambda$ 等于给所有因子加 $\lambda\mathbf{I}$ 的“虚拟先验”——这\emph{改变了所有对角块}，破坏了 Bayes 树赖以增量的\emph{局部性假设}，迫使每步重线性化全图。因此 iSAM2 选 GN（无 $\lambda$）作默认，需要鲁棒性时用\emph{信赖域}（Dogleg/RISE，约束步长而非加阻尼矩阵）。这是“数据结构的局部性假设约束了可用优化策略”的典型例子。
+\end{insight}
+
+\paragraph{开发期监控线性化误差。}
+GTSAM 默认不算非线性误差（代价高）。开发阶段应设 \texttt{params.evaluateNonlinearError = true}，观察 $\Delta F=F_{\text{after}}-F_{\text{before}}$。若单次 update 后误差明显上升，常见原因与对策见下表。
+
+\begin{table}[H]\centering\small
+\caption{单次 update 后误差上升的诊断}
+\label{tab:error-up}
+\begin{tabular}{ll}
+\toprule
+可能原因 & 处理 \\
+\midrule
+GN 步过大 & 切 Dogleg 或多次 update \\
+阈值太松 & 降低 \texttt{relinearizeThreshold} \\
+外点回环 & 加 DCS/Huber 或先做 PCM \\
+排序把关键变量推到根 & 检查 \texttt{constrainedKeys} \\
+初值太差 & 用批量 LM/GNC/SE-Sync 初始化 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 \cref{eq:gn-quadratic} 估计：若初始闭合误差 $1$\,m、$C\approx 0.1$，几次 update 能把误差压到 $10^{-3}$\,m？（按二次收敛粗估即可。）
+  \item 解释为什么 LM 的 $\lambda\mathbf{I}$ 会破坏 Bayes 树的局部性，而 Dogleg 的步长截断不会。
+  \item 设计一个最小实验：回环后分别跑 $1,3,6$ 次空 update，比较 ATE 与耗时，验证“多次 update $=$ 多步 GN”。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{复杂度分析}
+\label{sec:isam-complexity}
+
+\subsection{理论界}
+\label{sec:isam-bounds}
+
+\begin{itemize}
+  \item \textbf{完全批量 Cholesky}：2D 位姿图 $O(N^{3/2})$、3D BA $O(N^2)$——来自对平面图/网格图的嵌套剖分；2D 的 $O(N^{3/2})$ 界在 SLAM 语境下由 Krauthausen 等\cite{krauthausen2006exploiting}（基于 Lipton--Rose--Tarjan 嵌套剖分\cite{lipton1979generalized}）给出，Kaess 2012 §4.3\cite{kaess2012isam2} 即引此结果。
+  \item \textbf{iSAM2 每步}：纯探索（无回环、每步常数个新约束）时只有树顶常数个团需重消元，故每步 $O(1)$\cite{kaess2012isam2}；典型含回环的 SLAM 图受影响团数 $\approx$ 路径长度 $\approx$ separator 长度，按嵌套剖分约 $O(\sqrt N)$（2D）/ $O(N^{2/3})$（3D），最坏（大回环遍及全树）退化为批量 $O(N^{3/2})$。\pz{存疑：每步 $O(\sqrt N)$/$O(N^{2/3})$ 是由分隔符大小推导的工程估计；Kaess 2012 原文只给纯探索 $O(1)$ 与一般批量 $O(N^{3/2})$（引 Krauthausen 2006），未逐 2D/3D 给出每步 $\sqrt N$/$N^{2/3}$ 闭式}
+  \item \textbf{关键结论}（Kaess 2012 §4.3\cite{kaess2012isam2}）：上述 $O(N^{3/2})$ 批量界\emph{不依赖回环的数目}（“this bound does not depend on the number of loop closings”）；经验上由于回环多为局部，实际开销通常远低于该上界。
+\end{itemize}
+
+\begin{theorem}[平面分隔符定理（Lipton--Tarjan 1979\cite{liptontarjan1979separator}）]
+\label{thm:planar-separator}
+任何 $N$ 节点平面图都存在一个大小 $O(\sqrt N)$ 的\emph{分隔符集合} $S$，使删除 $S$ 后图裂为两个大小各 $\le\tfrac23 N$ 的子图。该定理被嵌套剖分（Lipton--Rose--Tarjan\cite{lipton1979generalized}）用于推导平面图 Cholesky 的 $O(N\log N)$ fill 与 $O(N^{3/2})$ 运算量。
+\end{theorem}
+
+\paragraph{对 SLAM 的意义。}
+2D 位姿图本质上是平面图（少量回环跨越平面不影响渐近）。对信息矩阵做 Cholesky 时，消元变量 $\mathbf{x}_i$ 会在其所有邻居间引入 fill-in 边。嵌套剖分排序递归地找分隔符、先消两侧子图、最后消分隔符——这把 fill-in 控制在 $O(N\log N)$ 个非零元内，总 Cholesky 运算量 $O(N^{3/2})$。推广到 3D：3D 网格图的分隔符大小为 $O(N^{2/3})$（George 1973\cite{george1973nested}），对应 Cholesky $O(N^2)$。iSAM2 每步只消元受影响子集（路径长度 $\approx$ 分隔符大小），故每步 $O(\sqrt N)$（2D）/ $O(N^{2/3})$（3D）。
+
+\paragraph{为什么界“不取决于回环数”。}
+回环 $f(\mathbf{x}_i,\mathbf{x}_j)$ 影响的 Bayes 树路径是 $\mathbf{x}_i,\mathbf{x}_j$ 到其 LCA。对\emph{局部回环}（$\mathbf{x}_j$ 在 $\mathbf{x}_i$ 附近），LCA 很浅、路径很短；只有\emph{全局回环}（如起点--终点闭合）才让路径延伸到根。多数实际 SLAM 的回环是局部的，故平均每步远低于最坏情况。Kaess 2012 在 Manhattan/M3500 数据集（$3500$ 位姿、$5598$ 条约束，Olson 等 2006）上以多个 2D 位姿图对比了批量与增量的每步耗时（Kaess 2012 Fig.~11、Fig.~14\cite{kaess2012isam2}），增量法的每步代价远低于批量重分解，与“受影响子集 $\ll$ 全图”的局部性一致。\pz{存疑：原稿曾写“Fig.~11 拟合每步受影响团数 $\approx 3.2\sqrt N$、$5453$ 边”——经核对 Kaess 2012 Fig.~11 为 2D 数据集耗时对比、未给出 $3.2\sqrt N$ 这一经验拟合，Manhattan 约束数应为 $5598$；该常数已删除}
+
+\subsection{对比表}
+\label{sec:isam-complexity-table}
+
+\begin{table}[H]\centering\small
+\caption{增量/批量方法的复杂度对比（$N$ 状态数，$k$ 滑窗长）}
+\label{tab:complexity}
+\begin{tabular}{lll}
+\toprule
+方法 & 每步复杂度 & 空间 \\
+\midrule
+EKF-SLAM & $O(N^2)$ & $O(N^2)$（稠密 $\boldsymbol{\Sigma}$） \\
+iSAM1（Givens） & $O(\text{fill})$ $+$ 周期性批量尖峰 & $O(\mathrm{nnz}(\mathbf{R}))$ \\
+iSAM2（2D 位姿图） & $\approx O(\sqrt N)$ & $O(\mathrm{nnz}(\mathbf{R}))$ \\
+iSAM2（3D BA） & $\approx O(N^{2/3})$ & $O(\mathrm{nnz}(\mathbf{R}))$ \\
+iSAM2（最坏，全图回环） & $O(N^{3/2})$ & 同上 \\
+滑窗 BA（VINS-Mono） & $O(k^3)$ & $O(k^2)$ \\
+批量 LM（g2o） & $O(N^{3/2})$/次 & 同上 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[跨领域类比：B 树索引更新（边界声明）]
+iSAM2 的复杂度结构类似数据库 B 树的索引更新：插入一条记录最坏需分裂 $O(\log N)$ 个节点，但平均只影响 $O(1)$ 个。同理，iSAM2 添加一个里程计因子平均只影响 $O(1)$ 个叶团；添加一个回环因子影响 $O(\sqrt N)$ 个团（到 LCA 的路径）。\emph{边界}：B 树是平衡结构，路径恒 $O(\log N)$；Bayes 树的路径长度由图拓扑决定，最坏退化为整树。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 \cref{thm:planar-separator} 论证：2D 位姿图的批量 Cholesky 为 $O(N^{3/2})$（提示：嵌套剖分 $+$ 分隔符大小 $O(\sqrt N)$）。
+  \item 解释为什么 METIS 嵌套剖分在大图上常优于 COLAMD（提示：METIS 显式优化分隔符大小，产出更平衡、更矮的树）。
+  \item 给出一个回环拓扑使 iSAM2 退化为批量，并指出此时它相对纯批量的\emph{额外}开销来自何处。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{从滤波链到 Bayes 树：增量平滑的范式切换}
+\label{sec:isam-paradigm}
+
+\cref{ch:slam_est} 已把滤波与平滑放在同一后验上比较。这里进一步说明：Bayes 树不是凭空出现的数据结构，而是\emph{平滑后验在消元顺序下的概率骨架}。
+
+\paragraph{从链开始。}
+最简单的链式系统 $x_0\to x_1\to\cdots\to x_T$。卡尔曼滤波只保留当前边缘，递推为
+\begin{equation}
+  p(x_k\mid z_{1:k})\propto p(z_k\mid x_k)\int p(x_k\mid x_{k-1})\,p(x_{k-1}\mid z_{1:k-1})\,dx_{k-1},
+  \label{eq:kf-recursion}
+\end{equation}
+每次只向前传一条消息。若保留全轨迹并做 MAP，则
+\begin{equation}
+  \min_{x_{0:T}}\tfrac12\|x_0-\bar x_0\|^2_{P_0^{-1}}
+  +\tfrac12\sum_{k=1}^{T}\|x_k-f(x_{k-1},u_{k-1})\|^2_{Q^{-1}}
+  +\tfrac12\sum_{k=1}^{T}\|z_k-h(x_k)\|^2_{R^{-1}},
+  \label{eq:chain-map}
+\end{equation}
+线性化后 Hessian 是\emph{块三对角}（这正是 \cref{ch:slam_est} 的 \cref{sec:est-batch-recursive} 证明“批量 $=$ 前向递归”所用的稀疏结构）。对块三对角系统做 Cholesky，消元树是一条链，Bayes 树也退化为链：
+
+\begin{table}[H]\centering\small
+\caption{线性高斯链中的同一后验，四种表现}
+\label{tab:chain-views}
+\begin{tabular}{ll}
+\toprule
+结构 & 线性高斯链中的表现 \\
+\midrule
+卡尔曼滤波 & 从左到右的前向消息 \\
+RTS 平滑 & 前向滤波 $+$ 从右到左回代 \\
+批量 Cholesky & 分解块三对角信息矩阵 \\
+Bayes 树 & 一条由条件密度组成的链 \\
+iSAM2 wildfire & 链上只回代发生变化的一段 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[Bayes 树 $=$ RTS 平滑在一般稀疏图上的推广]
+链式图的“前向滤波、后向平滑”只有一条路径；一般 SLAM 图有许多路径，Bayes 树把这些路径组织成可\emph{局部更新}的条件独立子树。给定父团 separator 的值，子树与其余图条件独立——这正是增量更新能局部化的概率原因。
+\end{insight}
+
+\paragraph{回环如何破坏链式结构。}
+在链上加回环 $f(x_0,x_3)$。消元 $x_0$ 时它同时连 $x_1$（里程计）与 $x_3$（回环），产出因子覆盖 $\{x_1,x_3\}$——这就是 fill-in。消元后 $x_3$ 穿透多层 separator，Bayes 树不再是单链。极端地，“全图回环”（连接首末帧）迫使整条链每个团都把首帧变量含入 separator，Bayes 树退化为“每团都依赖根”的星形结构。
+
+\begin{insight}[回环代价取决于“距离”而非“测量质量”]
+回环在 Bayes 树上的代价\textbf{不取决于回环本身的测量精度}，而取决于\emph{回环连接的两个变量在消元顺序中的距离}。相邻帧回环几乎免费（LCA 就是父团）；远帧回环代价正比于路径长度。这解释了为何 SLAM 对回环的处理策略差异巨大——频繁短距回环（走廊来回）廉价，长距闭合（绕一圈回起点）需特殊处理（多次 update、Dogleg、甚至批量精修）。
+\end{insight}
+
+\paragraph{为什么不维护协方差。}
+EKF 维护协方差 $\boldsymbol{\Sigma}$，回环会让交叉项把所有变量耦合。即便信息矩阵 $\boldsymbol{\Lambda}$ 稀疏，其逆 $\boldsymbol{\Sigma}=\boldsymbol{\Lambda}^{-1}$ 通常\emph{稠密}。Bayes 树维护的是平方根信息（$\mathbf{R}$ 的结构），保稀疏。这就是增量平滑选择维护 $\boldsymbol{\Lambda}$ 的平方根而非 $\boldsymbol{\Sigma}$ 的原因。\cref{tab:dual-form} 把两种表示的操作代价对照清楚。
+
+\begin{table}[H]\centering\small
+\caption{信息形式与协方差形式的操作效率对偶}
+\label{tab:dual-form}
+\begin{tabular}{lll}
+\toprule
+操作 & 信息形式（$\boldsymbol{\Lambda}$） & 协方差形式（$\boldsymbol{\Sigma}$） \\
+\midrule
+添加新因子 & $\boldsymbol{\Lambda}\mathrel{+}=\mathbf{J}_i^\top\boldsymbol{\Omega}_i\mathbf{J}_i$，局部加法 $O(1)$ & 需重算整个 $\boldsymbol{\Sigma}$，$O(N^2)$ \\
+边缘化变量 $x_j$ & Schur 补，产生 fill-in & 直接删行/列 $O(1)$ \\
+条件化（给定 $x_j$） & 直接删行/列 $O(1)$ & Schur 补 $O(N)$ \\
+查询单变量边缘协方差 & 沿路径回代 $O(\text{path}^2)$ & 直接读 $\boldsymbol{\Sigma}_{jj}$ $O(1)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[跨领域类比：信息/协方差对偶 $\approx$ 频域/时域对偶（边界声明）]
+时域里卷积难、点乘易；频域里点乘易、卷积需逆变换。同理，信息形式里“添加约束（乘法）”易、“查询边缘（积分）”难；协方差形式反之。Bayes 树的精妙在于用\emph{树结构}把两种操作的代价都压到中间地带——约 $O(\sqrt N)$。\emph{边界}：该类比仅在“一种操作易/另一种难”的对偶层面成立，不涉及具体变换的线性性等性质。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{从滤波到 Bayes 树的工程范式切换}
+\label{tab:paradigm}
+\begin{tabular}{lll}
+\toprule
+问题 & 滤波思路 & Bayes 树思路 \\
+\midrule
+新里程计 & 更新当前边缘 & 添加局部因子，更新叶附近团 \\
+大回环 & 改当前状态并传播协方差 & 拆受影响 top，重消元并回代 \\
+旧状态需修正 & 不自然（除非存历史） & 原生支持 \\
+协方差查询 & 当前易、历史难 & 需局部 marginal covariance \\
+实时性 & 每步固定 & 平均局部，最坏批量 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 这解释了 LIO-SAM 一类系统的设计：IMU 前端用 ESKF（\cref{ch:eskf}）传播高频状态，关键帧后端用 iSAM2 保留全局轨迹——前者解决高频预测，后者解决全局一致性。
+
+\begin{practice}
+\begin{enumerate}
+  \item 对 $x_0-x_1-x_2-x_3$ 链写出 Bayes 网分解并画 Bayes 树；在链尾加 $x_4$，说明受影响团有哪些。
+  \item 加回环 $f(x_0,x_4)$，说明为何 LCA 变成根、更新范围扩到全树（这正是“增量退化为批量”的最小例子）。
+  \item 用 \cref{tab:dual-form} 解释 EKF 与 iSAM2 在“添加观测”与“查询任意变量协方差”上的代价为何恰好相反。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{GTSAM 工程实践：API、参数与内部结构}
+\label{sec:isam-gtsam}
+
+\paragraph{API 与关键参数。}
+头文件 \texttt{gtsam/nonlinear/ISAM2.h}、\texttt{ISAM2Params.h}、\texttt{ISAM2Result.h}、\texttt{ISAM2-impl.h}。\texttt{ISAM2Params} 关键字段见下表。
+
+\begin{table}[H]\centering\small
+\caption{ISAM2Params 关键字段}
+\label{tab:isam2params}
+\begin{tabular}{lll}
+\toprule
+字段 & 默认 & 含义 \\
+\midrule
+\texttt{optimizationParams} & GaussNewton & \texttt{variant<GaussNewton, Dogleg>Params} \\
+\texttt{relinearizeThreshold} & \texttt{0.1} & double 或 \texttt{FastMap<char,Vector>}（分符号设） \\
+\texttt{relinearizeSkip} & \texttt{10} & 每多少次 \texttt{update()} 检查一次 relin \\
+\texttt{enableRelinearization} & \texttt{true} & 全局开关 \\
+\texttt{evaluateNonlinearError} & \texttt{false} & 为 true 则 \texttt{errorBefore/After} 有值 \\
+\texttt{factorization} & \texttt{CHOLESKY} & \{\texttt{CHOLESKY}, \texttt{QR}\} \\
+\texttt{cacheLinearizedFactors} & \texttt{true} & 缓存 Jacobian；SmartFactor 场景建议 false \\
+\texttt{findUnusedFactorSlots} & \texttt{false} & 删因子后复用 slot \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent \texttt{update()} 完整签名（按位：新因子、新初值、待删因子下标、约束 key、不重线性化 key、额外重消元 key、强制重线性化）。返回 \texttt{ISAM2Result}，含 \texttt{variablesRelinearized}、\texttt{variablesReeliminated}、\texttt{factorsRecalculated}、\texttt{cliques}、\texttt{newFactorsIndices}（删因子时必需）、以及（开启时）\texttt{errorBefore/After}。
+
+\begin{codebox}[C++]{ISAM2 最小示例}
+#include <gtsam/nonlinear/ISAM2.h>
+using namespace gtsam;
+
+ISAM2Params p;
+p.relinearizeThreshold   = 0.1;
+p.relinearizeSkip        = 1;
+p.factorization          = ISAM2Params::CHOLESKY;
+p.cacheLinearizedFactors = true;
+p.findUnusedFactorSlots  = true;
+p.evaluateNonlinearError = true;
+// Dogleg is more robust on bad initial guesses:
+ISAM2DoglegParams dl; p.setOptimizationParams(dl);
+
+ISAM2 isam(p);
+NonlinearFactorGraph g; Values v0;
+// ... add factors and initial values ...
+ISAM2Result res = isam.update(g, v0);
+Values est = isam.calculateEstimate();
+Matrix C   = isam.marginalCovariance(X(k));   // per-variable cov
+\end{codebox}
+
+\begin{codebox}[Python]{Python 绑定（gtsam $\ge$ 4.2）}
+import gtsam
+from gtsam.symbol_shorthand import X
+
+params = gtsam.ISAM2Params()
+params.setRelinearizeThreshold(0.1)
+params.setRelinearizeSkip(1)
+isam = gtsam.ISAM2(params)
+
+graph  = gtsam.NonlinearFactorGraph()
+values = gtsam.Values()
+# ... build factors and initial values ...
+result   = isam.update(graph, values)
+estimate = isam.calculateEstimate()
+cov      = isam.marginalCovariance(X(0))
+\end{codebox}
+
+\paragraph{内部数据结构。}
+\texttt{ISAM2} 主体是一棵 \texttt{BayesTree<GaussianBayesTreeClique>}，每个团（\texttt{GaussianBayesTreeClique}）含：一个 \texttt{GaussianConditional}（条件密度 $P(F_k\mid S_k)$，即 $\mathbf{R}$ 的行块 $[R_{FF}\,R_{FS}]$ 加 RHS $d_F$）、子团指针、以及 \texttt{cachedFactor}/\texttt{cachedSeparatorMarginal}（缓存边缘因子，用于 orphan 挂回）。其余成员：\texttt{theta\_}（当前线性化点 $\Theta$）、\texttt{delta\_}（当前增量 $\delta$）、\texttt{deltaNewton\_}/\texttt{RgProd\_}（Dogleg 专用）、\texttt{variableIndex\_}（因子$\to$变量反向索引）、\texttt{nonlinearFactors\_}（原始因子存档，供重线性化）、\texttt{linearFactors\_}（缓存线性因子）、\texttt{fixedVariables\_}（已 marginalize、不许 relin 的变量）。
+
+\paragraph{案例：LIO-SAM 的每帧流程。}
+\texttt{LIO-SAM/src/mapOptmization.cpp} 配置 \texttt{relinearizeThreshold}$=0.1$、\texttt{relinearizeSkip}$=1$（比默认激进 $10\times$），不设 \texttt{factorization}/Dogleg（即默认 GN）。每帧 \texttt{saveKeyFramesAndFactor()}：
+
+\begin{codebox}[C++]{LIO-SAM 每帧 update（saveKeyFramesAndFactor 摘要）}
+addOdomFactor();        // PriorFactor on X(0) + BetweenFactor<Pose3>
+addGPSFactor();         // GPSFactor / translation-only PriorFactor<Pose3>
+// addLoopFactor() lives in the correctPoses() path
+isam->update(gtSAMgraph, initialEstimate);
+isam->update();         // 2nd call: no new factors, one more sweep
+
+if (aLoopIsClosed) {    // after a loop closure: 5 extra empty updates
+    isam->update(); isam->update(); isam->update();
+    isam->update(); isam->update();   // -> 7 update() calls total (6 of them empty)
+}
+gtSAMgraph.resize(0);
+initialEstimate.clear();
+isamCurrentEstimate = isam->calculateEstimate();
+\end{codebox}
+
+\noindent LIO-SAM \emph{从不}调用 \texttt{marginalizeLeaves}——它持全轨迹在 iSAM2，随地图增大 \texttt{calculateEstimate()} 线性增长（这就是其 README 建议降速回放的根因）。
+
+\begin{practice}
+\begin{enumerate}
+  \item 解释 LIO-SAM 为何在普通帧也调用两次 \texttt{update()}：第二次（无新因子）做了什么？
+  \item \texttt{findUnusedFactorSlots}$=$\texttt{false} 且频繁删因子会怎样？为什么长跑系统应设 true？
+  \item 用 \texttt{ISAM2Result} 的哪几个字段可在线判断“本次 update 的更新范围”？各自的异常信号是什么？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{与其他方法的对比与工程选型}
+\label{sec:isam-compare}
+
+\subsection{为什么 ORB-SLAM3 不用 iSAM2}
+\label{sec:isam-orbslam}
+
+iSAM2 强在\emph{全轨迹一致增量平滑}（LIO-SAM、Kimera-VIO），不强在\emph{超大规模视觉 BA}（ORB-SLAM3 路线）。后者改用 g2o 局部 BA $+$ Schur 补，原因有五：
+\begin{enumerate}
+  \item \textbf{拓扑剧烈变动}：相机--路标可见性随 tracking 随机变化，iSAM2 的 \texttt{cacheLinearizedFactors} 假设因子稳定；频繁 remove$+$reinsert 代价高。
+  \item \textbf{问题规模}：ORB-SLAM3 可持万级 MapPoint $+$ 千级关键帧，相机--点结构用 Schur 补比一般消元快得多。
+  \item \textbf{回环策略不同}：ORB-SLAM3 用 Essential Graph（稀疏子图）$+$ Sim(3) PGO $+$ Full BA 三段式，把重投影 BA 与位姿图解耦；iSAM2 在同一张图里处理大回环反而易触发数值病态。
+  \item \textbf{边缘化语义}：滑窗 VIO 想保留旧信息作先验；ORB-SLAM3 认为“忘掉比记错好”，iSAM2 的“全图保留”优势在它的设计里不必要。
+  \item \textbf{工程惯性}：ORB-SLAM 自 2014 绑 g2o，自定义边类型；切 iSAM2 重写收益不明。
+\end{enumerate}
+
+\subsection{增量方法横向对比}
+\label{sec:isam-horizontal}
+
+\begin{table}[H]\centering\small
+\caption{Bayes 树与其他增量/批量方法对比（$L\approx O(\sqrt N)$ 2D / $O(N^{2/3})$ 3D）}
+\label{tab:methods-compare}
+\begin{tabular}{lllp{0.20\textwidth}}
+\toprule
+方法 & 每步时间 & 保留全图 / 回环 & 典型应用 \\
+\midrule
+iSAM2（Bayes 树）\cite{kaess2012isam2} & $O(L)$ & 是 / 原生 & GTSAM, LIO-SAM, Kimera-VIO \\
+iSAM1（Givens QR）\cite{kaess2008isam} & $O(\text{fill})$ $+$ 批量尖峰 & 是 / 是 & 早期 SAM \\
+EKF-SLAM\cite{smith1986estimating} & $O(N^2)$ & 当前态 / 一致性差 & 历史 \\
+滑窗 BA（VINS-Mono）\cite{qin2018vins} & $O(k^3)$ & 否 / 外挂 4-DoF PGO & AR/VR, 无人机 \\
+批量 LM（SqrtSAM）\cite{dellaert2006square} & $O(N^{3/2})$ & 是 / 是 & 离线 BA \\
+SE-Sync\cite{rosen2019sesync} & 低秩 SDP & 是（批量）/ 是 & 离线 PGO，全局$+$证书 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{说明}：iSAM2 的 $O(\sqrt N)$ 特指稀疏 2D 位姿图\emph{平均}情况；最坏（密集回环）退化为 $O(N^{3/2})$。
+
+\subsection{工程选型决策}
+\label{sec:isam-decision}
+
+\paragraph{用 iSAM2 的典型场景}：LiDAR SLAM 后端（关键帧 $2$--$10$\,Hz、结构稀疏、偶尔回环）；固定延迟 VIO（滑窗$+$边缘化、每帧少量因子）；多传感器融合（IMU$+$GPS$+$LiDAR 异步因子、需全轨迹一致）；在线语义建图（需随时查询历史 pose 边缘协方差）。
+
+\paragraph{不适合 iSAM2 的场景}：纯视觉 BA（大量路标频繁出入，优先 Schur 补$+$局部 BA）；需全局最优保证（优先 SE-Sync$+$批量 LM）；高外点率需 GNC（优先批量 LM$+$\texttt{GncOptimizer}）；仅需当前帧位姿（优先 MSCKF 或 motion-only BA）；超大规模离线建图（优先分层$+$子图分割）。
+
+\begin{table}[H]\centering\small
+\caption{工程选型速查}
+\label{tab:selection}
+\begin{tabular}{lll}
+\toprule
+应用场景 & 推荐后端 & 原因 \\
+\midrule
+自动驾驶 LiDAR SLAM & iSAM2（LIO-SAM 模式） & 关键帧稀疏、增量自然、需全轨迹 \\
+AR/VR VIO & iSAM2 固定延迟（Kimera 模式） & 低延迟、滑窗边缘化控内存 \\
+无人机视觉 SLAM & 滑窗 BA（VINS-Mono 模式） & 特征频繁进出、不需全轨迹 \\
+手持三维重建 & ORB-SLAM3 $+$ 批量 BA & 需精确地图点、Schur 补高效 \\
+多机器人协作 & 本地 iSAM2 $+$ 全局分布式 PGO & 兼顾实时与全局一致 \\
+后处理精修（真值生成） & SE-Sync $+$ 批量 LM & 需证书保证全局最优 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[反事实：若所有 SLAM 都用 iSAM2 会怎样]
+ORB-SLAM3 的视觉 BA 每帧涉及约 $200$ 个 map point 的可见性变化——每帧大量 remove$+$reinsert 因子，iSAM2 的 \texttt{cacheLinearizedFactors} 反复失效，性能可能反而\emph{差于}直接批量 Schur 补。这正是 ORB-SLAM3 选 g2o 而非 iSAM2 的原因。正确的工程直觉是：\textbf{因子图拓扑稳定时 iSAM2 的增量缓存优势最大；拓扑频繁变动时，批量方法的简单性反而更高效。}
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{常见陷阱与工程边界}
+\label{sec:isam-pitfalls}
+
+下表汇总 iSAM2 工程中最常踩的坑（合并自源笔记 §C.23 与各分散陷阱）。
+
+\begin{table}[H]\centering\small
+\caption{iSAM2 常见陷阱与对策}
+\label{tab:isam-pitfalls}
+\begin{tabular}{p{0.30\textwidth}p{0.62\textwidth}}
+\toprule
+陷阱 & 对策 \\
+\midrule
+\texttt{relinearizeThreshold} 过松（0.1）：慢动作下 $\delta$ 几乎不越阈，地图越用越“懒” & LiDAR/视觉设 $0.01$--$0.1$；分符号设阈值向量 \\
+\texttt{relinearizeSkip} 过大（默认 10）：即使越阈也要等 10 次 update 才刷新 & 实时系统设 $1$（LIO-SAM/Kimera/Visual-ISAM2 均如此） \\
+\texttt{marginalizeLeaves} 报“not leaves”：消元顺序错致目标 key 还挂子树 & 用 \texttt{constrainedKeys} Group 0 推到叶；bug 复现时绕开批量边缘化（Issue \#1101） \\
+SmartFactor 与边缘化冲突（\#595/\#1101/\#1976） & \texttt{cacheLinearizedFactors}$=$false；或边缘化前固化为 JacobianFactor（Kimera 做法） \\
+\texttt{update(g,v)} 缺初值 $\to$ \texttt{ValuesKeyDoesNotExist} & 新因子引用的每个 key 要么已在 isam、要么须在 \texttt{newTheta}；先 insert 再加因子 \\
+\texttt{constrainedKeys} 组号反 $\to$ fill-in 爆炸 & 边缘化 key $=$ Group 0、其余 $=$ Group 1 \\
+非 LM、大回环 GN 一步过头 $\to$ 下次 update 发散 & 多次 \texttt{update()}；切 Dogleg；\texttt{force\_relinearize}；回环因子包 Robust(Cauchy/DCS) \\
+初值差 $+$ wildfire 阈值 $\to$ 估计冻结 & \texttt{wildfireThreshold}$\le 0$（全量回代）；或 \texttt{force\_relinearize} \\
+\texttt{cacheLinearizedFactors} 误用：Jacobian 结构动态变（SmartFactor/GNC 权重） & 此类因子关闭缓存；或每次 update 删旧 slot 插新 \\
+iSAM2 非线程安全：\texttt{calculateEstimate()} 与 \texttt{update()} 并行 & mutex 互斥（LIO-SAM 用 \texttt{std::mutex}） \\
+\texttt{PriorFactor} 太松 $\to$ \texttt{IndeterminantLinearSystemException} & 首帧 $\sigma$ 给小量；IMU gravity 约束 roll/pitch；缺 yaw 用磁/GPS 航向 \\
+\texttt{findUnusedFactorSlots}$=$false $+$ 频繁 remove $\to$ slot 单调增长 & 长跑系统一律设 true \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{工程边界小结（何时 iSAM2 不是最优）。}
+(1) 目标函数频繁\emph{全局}变化（GNC、可学习鲁棒权重、全局退火）——破坏局部性，应转批量 LM/GN 外层（典型管线：在线 iSAM2$+$Huber/DCS，回环后导出 pose graph，离线 PCM$\to$GNC-TLS$\to$LM，再注入重置 iSAM2）。(2) 视觉 BA 路标拓扑高速变化——优先 g2o 局部 BA$+$Schur。(3) 强非线性$+$坏初值——多次 update$+$\texttt{force\_relinearize}、或 Dogleg、或先 SE-Sync/GNC 初始化。(4) 边缘化变量非叶——用 \texttt{constrainedKeys} 推到前端；SmartFactor 破坏 key 顺序时固化或关缓存。(5) 协方差查询非免费——\texttt{marginalCovariance} 需沿路径回代，在线系统应只查关键变量。
+
+% ════════════════════════════════════════════════════════════════
+\section{进阶：并行推断与连续时间扩展}
+\label{sec:isam-parallel}
+
+\paragraph{Bayes 树上的并行推断。}
+由可分离性（\cref{tab:bayes-tree-prop}）：给定 separator $S_k$，前沿 $F_k$ 与非后代 separator 变量条件独立，故\emph{兄弟子树可并行消元/并行回代}。多机器人去中心化平滑由此展开：DDF-SAM\cite{cunningham2010ddfsam}（每机器人维护局部 SAM，用约束因子图经 Schur 边缘化生成“凝聚”邻域因子并交换）；DDF-SAM 2.0\cite{cunningham2013ddfsam2}（引入 anti-factor，即信息减法/降权，避免重复计数）。Certifiable 分布式 PGO（DC²-PGO\cite{tian2021distributed}）用稀疏 SDP 松弛$+$黎曼块坐标下降$+$分布式对偶证书，证明与 SE-Sync 同样的精确性保证；Kimera-Multi\cite{tian2022kimeramulti} 在 $8$ 机器人、$8$\,km 实时户外验证了局部 VIO$+$分布式 PGO$+$分布式 GNC 的完整栈。
+
+\paragraph{连续时间 SLAM 与 GP 先验。}
+把轨迹视作高斯过程 $x(t)$、先验由线性时变 SDE 生成\cite{barfoot2014batch}：若先验由 $\dot x(t)=\mathbf{A}(t)x(t)+\mathbf{v}(t)+\mathbf{L}(t)\mathbf{w}(t)$（$\mathbf{w}\sim\mathcal{GP}(0,\mathbf{Q}_c\delta(t-t'))$）生成，则在测量时刻 $\{t_k\}$ 上先验精度矩阵 $\mathbf{K}^{-1}$ 为\emph{块三对角}（马尔可夫），MAP 信息矩阵仍“带状$+$测量稀疏”，标准 Cholesky $O(N)$ 完成（这与 \cref{ch:slam_est} 的 STEAM 小节 \cref{sec:est-steam} 同源）。白噪声加速度（WNOA）模型给出常速度 GP 因子；Mukadam 等给出增量版本，比裸 iSAM2 快约 $3\times$。\cref{sec:est-steam} 已完整推导离散转移矩阵 $\boldsymbol{\Phi}$ 与过程噪声 $\mathbf{Q}_k$，此处不赘。
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+Bayes 树是另一种滤波器 & 它是全局平滑后验的条件分解 $\prod_k P(F_k\mid S_k)$（\cref{eq:bayes-tree-factor}）\\
+iSAM2 每次只优化新变量 & 它重消元受影响团，必要时改旧变量（\cref{sec:isam-worked}）\\
+野火不更新就意味着变量不重要 & 只意味着本次 separator 变化低于阈值（\cref{eq:wildfire-bound}）\\
+增量一定比批量快 & 大回环/差初值/全图重线性化时接近批量（\cref{sec:isam-complexity}）\\
+iSAM2 内置 LM 阻尼 & 默认纯 GN，无 $\lambda$；鲁棒性用 Dogleg/RISE（\cref{sec:isam-gn}）\\
+Fluid Relinearization $=$ FEJ & 前者是效率启发式，后者是一致性保证，目标不同（\cref{sec:isam-fluid}）\\
+wildfire 阈值是严格剪枝 & 数值启发式，与 relin 阈值朝相反方向权衡（\cref{sec:isam-wildfire}）\\
+消元树祖先 $=$ 每个 Cholesky 非零元 & 非零元给\emph{直接}依赖，祖先是其\emph{传递闭包}（\cref{thm:liu}）\\
+条件密度只需均值关系 & $R_{jj}$（信息尺度）不可省，否则回代失尺度（\cref{eq:isam-cond}）\\
+非叶变量可直接 \texttt{marginalizeLeaves} & 须先用 \texttt{constrainedKeys} 旋转到叶（\cref{sec:isam-marg}）\\
+GNC 可直接嵌进 iSAM2 & GNC 全局退火破坏局部性，应作批量后端（\cref{sec:isam-pitfalls}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$G=(\mathcal{F},\Theta,\mathcal{E})$ & 因子图（因子/变量/边） & \cref{eq:isam-joint} \\
+$C_k=F_k:S_k$ & Bayes 树团（前沿 $:$ 分隔） & \cref{def:bayes-tree} \\
+$P(F_k\mid S_k)$ & 团条件密度；联合 $=\prod_k$ 之积 & \cref{eq:bayes-tree-factor} \\
+$\mathbf{R},\boldsymbol{\Lambda}$ & 平方根信息因子 / 信息矩阵（$\boldsymbol{\Lambda}=\mathbf{R}^\top\mathbf{R}$） & \cref{sec:isam-elimination} \\
+$R_{FF},R_{FS},d_F$ & 团内 $\mathbf{R}$ 行块与 RHS & \cref{eq:clique-cond} \\
+$\delta,\ \delta_F,\delta_S$ & 增量（前沿/分隔分量） & \cref{eq:clique-bs} \\
+$\Theta_j\oplus\delta_j$ & 右扰动 retraction（$=\boxplus$，\cref{ch:lie}） & \cref{eq:fluid-relin} \\
+$\beta$（\texttt{relinThreshold}） & Fluid Relinearization 阈值 & \cref{eq:fluid-relin} \\
+$\alpha$（\texttt{wildfireThreshold}） & 野火回代阈值 & \cref{algo:wildfire} \\
+$L$ & 受影响子树大小 $\approx O(\sqrt N)/O(N^{2/3})$ & \cref{tab:complexity} \\
+LCA & 最低公共祖先（决定回环影响范围） & \cref{tab:bayes-tree-prop} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{定理/公式速查表}
+\begin{tabular}{lll}
+\toprule
+定理 / 公式 & 一句话说明 & 对应 \\
+\midrule
+一步消元 \cref{eq:isam-cond,eq:isam-fnew} & 配方 $=$ 给 $\mathbf{R}$ 添一行 $+$ Schur 余因子 & \cref{sec:isam-elimination} \\
+Bayes 树分解 \cref{eq:bayes-tree-factor} & $P(\Theta)=\prod_k P(F_k\mid S_k)$ & \cref{def:bayes-tree} \\
+超节点等价 \cref{eq:supernode-equiv} & Bayes 团 $=$ Cholesky 超节点 $=$ 弦图最大团 & \cref{thm:supernode-equiv} \\
+消元树祖先 \cref{eq:elim-tree-parent} & 非零$\Rightarrow$祖先（单向，传递闭包） & \cref{thm:liu} \\
+行结构 \cref{eq:row-struct} & 受影响团 $=$ 到根的路径 & \cref{sec:isam-three-equiv} \\
+叶剪枝 \cref{eq:leaf-marg} & 删叶 $=$ 精确边缘化（$\int P(F\mid S)=1$） & \cref{thm:leaf-marg} \\
+iSAM2 单步 \cref{algo:isam2-step} & top$+$relin$+$reorder$+$elim$+$graft$+$wildfire & \cref{sec:isam-algorithm} \\
+Fluid relin \cref{eq:fluid-relin} & 只对 $\|\delta_j\|\ge\beta$ 重线性化 & \cref{sec:isam-fluid} \\
+团内回代 \cref{eq:clique-bs} & $\delta_F=R_{FF}^{-1}(d_F-R_{FS}\delta_S)$ & \cref{sec:isam-clique-algebra} \\
+野火界 \cref{eq:wildfire-bound} & $\|\Delta\delta_F\|\le\|R_{FF}^{-1}R_{FS}\|\,\|\Delta\delta_S\|$ & \cref{sec:isam-fs-split} \\
+复杂度 \cref{thm:planar-separator} & 嵌套剖分 $\Rightarrow O(\sqrt N)$/$O(N^{2/3})$ & \cref{sec:isam-complexity} \\
+GN 二次收敛 \cref{eq:gn-quadratic} & 好初值下 $\|\delta^{(k+1)}\|\le C\|\delta^{(k)}\|^2$ & \cref{sec:isam-gn} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 增量动机 & 批量每帧重算不可持续；变化是局部的 & \(\bigstar\bigstar\) \\
+2 & 变量消元 $\to$ Bayes 网 & 配方一步消元 $=$ 给 $\mathbf{R}$ 添一行 & \(\bigstar\bigstar\bigstar\) \\
+3 & Bayes 树 & 团 $=F:S$；$\prod_k P(F_k\mid S_k)$ & \(\bigstar\bigstar\) \\
+4 & 超节点等价 & Bayes 团 $=$ 超节点 $=$ 弦图最大团 & \(\bigstar\bigstar\bigstar\) \\
+5 & 关键性质 & 局部性/可分离/增量编辑/叶剪枝 & \(\bigstar\bigstar\) \\
+6 & iSAM2 三把钥匙 & findAffectedTop / fluid relin / wildfire & \(\bigstar\bigstar\bigstar\) \\
+7 & Fluid Relinearization & $\|\delta_j\|\ge\beta$ 才刷新；非 FEJ & \(\bigstar\bigstar\bigstar\bigstar\) \\
+8 & Wildfire 回代 & separator 变化小则子树熄火 & \(\bigstar\bigstar\bigstar\) \\
+9 & 团内回代 & $\delta_F=R_{FF}^{-1}(d_F-R_{FS}\delta_S)$；QR vs Cholesky & \(\bigstar\bigstar\bigstar\bigstar\) \\
+10 & 增量边缘化 & 删叶精确；非叶须旋转到叶 & \(\bigstar\bigstar\bigstar\) \\
+11 & 非 LM & 默认 GN；大回环多次 update / Dogleg & \(\bigstar\bigstar\bigstar\) \\
+12 & 复杂度 & 嵌套剖分 $O(\sqrt N)$/$O(N^{2/3})$；不依回环数 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+13 & 范式切换 & Bayes 树 $=$ RTS 在一般图上的推广 & \(\bigstar\bigstar\bigstar\) \\
+14 & 工程选型 & 拓扑稳定用 iSAM2；频繁变动用批量 & \(\bigstar\bigstar\) \\
+15 & 并行/连续时间扩展 & 兄弟子树并行；GP 先验块三对角 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{iSAM2 权威原文}：Kaess 等《iSAM2: Incremental Smoothing and Mapping Using the Bayes Tree》\cite{kaess2012isam2}——§III--IV 与 Alg.~2--8 是本章算法主线的完整出处（精读）。
+  \item \textbf{Bayes 树首次提出}：Kaess 等 WAFR 2010\cite{kaess2010bayestree}；\textbf{iSAM1}：Kaess 等 TRO 2008\cite{kaess2008isam}（Givens 增量 QR 的最细节版）。
+  \item \textbf{统一教材}：Dellaert--Kaess《Factor Graphs for Robot Perception》\cite{dellaert2017factor} §5——把因子图/Bayes 树作为机器人感知的“一等语言”。
+  \item \textbf{稀疏线代地基}：Davis《Direct Methods for Sparse Linear Systems》\cite{davis2006direct} Ch.3--4（消元树、超节点、COLAMD）；Liu《The Role of Elimination Trees》\cite{liu1990elimination} Thm.~2.4。
+  \item \textbf{复杂度数学源头}：Lipton--Rose--Tarjan《Generalized Nested Dissection》\cite{lipton1979generalized}（2D $O(N^{3/2})$ 界）。
+  \item \textbf{批量与 GP-SLAM}：Barfoot《State Estimation for Robotics》\cite{barfoot2024state} Ch.9；连续时间 GP 先验 Barfoot--Tong--Särkkä\cite{barfoot2014batch}。
+  \item \textbf{全局最优与分布式}：SE-Sync\cite{rosen2019sesync}（PGO 证书）；DC²-PGO\cite{tian2021distributed}、Kimera-Multi\cite{tian2022kimeramulti}（分布式）；信赖域增强 RISE\cite{rosen2014rise}。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+章节 & 关系 & 衔接点 \\
+\midrule
+\cref{ch:slam_est} 状态估计 & 本章是其“消元 $=$ 稀疏分解”（\cref{thm:elimination}）的增量化 & 因子图、变量消元、Schur 补 \\
+\cref{ch:eskf} 卡尔曼/ESKF & 滤波 $=$ Bayes 树退化为链；RTS $=$ 链上双向回代 & \cref{eq:kf-recursion,eq:chain-map} \\
+\cref{ch:nlopt} 非线性优化 & 每个团内求解所用 GN/LM/Dogleg 内核 & \cref{eq:gn-quadratic,eq:dogleg} \\
+\cref{ch:lidar_slam} 激光 SLAM & LIO-SAM 后端纯用 iSAM2，回环后多次 update & \cref{sec:isam-gtsam} \\
+\cref{ch:vio} VIO & Kimera 用 IncrementalFixedLagSmoother$+$SmartFactor & \cref{sec:isam-marg} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：回环后轨迹\emph{仅局部变形}、远处不动。\textbf{原因}：wildfire 阈值过大或 update 次数不足（\cref{sec:isam-wildfire}）。\textbf{对策}：多跑 $3$--$6$ 次空 \texttt{update()}；降低 \texttt{wildfireThreshold}；开 \texttt{force\_relinearize}。
+  \item \textbf{症状}：每帧耗时\emph{单调递增}。\textbf{原因}：Bayes 树根团膨胀 / factor slot 不复用（\cref{sec:isam-complexity}）。\textbf{对策}：打印 \texttt{ISAM2Result.cliques}；开 \texttt{findUnusedFactorSlots}；检查是否需 constrained ordering。
+  \item \textbf{症状}：\texttt{marginalizeLeaves} 报“not leaves”。\textbf{原因}：constrained ordering 未把目标 key 推到叶（\cref{sec:isam-marg}）。\textbf{对策}：检查 Group 0/1；确认目标 key 无子树；照搬 \texttt{IncrementalFixedLagSmoother} 实现。
+  \item \textbf{症状}：SmartFactor 相关崩溃（\texttt{InconsistentEliminationRequested}）。\textbf{原因}：缓存线性因子与 key 生命周期/顺序冲突（\cref{sec:isam-smartfactor}）。\textbf{对策}：关 \texttt{cacheLinearizedFactors}；边缘化前固化为 JacobianFactor；删旧重建。
+  \item \textbf{症状}：\texttt{IndeterminantLinearSystemException} 或 Cholesky 崩溃。\textbf{原因}：gauge 自由度 / 先验过松 / 退化观测 / 坏回环（\cref{sec:isam-clique-algebra}）。\textbf{对策}：首帧先验 $\sigma$ 给小量；切 \texttt{factorization}$=$\texttt{QR}；检查 robust 权重与退化几何。
+  \item \textbf{症状}：加了鲁棒核但外点仍拉坏图。\textbf{原因}：阈值单位理解错（残差是否已白化）。\textbf{对策}：确认残差已白化；先用保守阈值再逐步收紧；高外点率改批量 GNC。
+\end{enumerate}

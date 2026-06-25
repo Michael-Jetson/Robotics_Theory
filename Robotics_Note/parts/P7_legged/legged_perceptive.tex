@@ -1,0 +1,538 @@
+\chapter{感知四足运动控制}
+\label{ch:legged-perc}
+
+% ════════════════════════════════════════════════════════════════
+%  感知四足章：把「盲」四足栈（OCS2 质心 NMPC + WBC）升级到「带地形感知」。
+%  铁律：本章是 P7 四足栈的「感知叠加层」，不重推 NMPC/WBC（一律 \cref 回
+%  quad_mpc / quad_wbc / quad_gait / quad_est），也不重讲点云/稠密建图理论
+%  （一律 \cref 回 P2 SLAM 的 ch:dense / ch:pointcloud）——本章是 P7-P2 的接驳章。
+%  主线 = 感知 NMPC =「启发式选带高度的落脚点 where」→「质心 NMPC 求力/轨迹 how」
+%  →「WBC 解成关节力矩」；地形只通过两条途径进入：落脚点投影 + base 参考抬升。
+%  源：legged_perceptive（Qiayuan Liao），论文血缘 grandia2022perceptive(T-RO 2023)。
+%  失败方法论（dz²/positionErrorGain=0/over-launch/关节阻尼/接触检测）只「点名预告」，
+%  完整证伪链放 ch:legged-debug，本章保持「范式+数据流+约束公式+真缺陷点名」纯度。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的数据流图与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 前几章的四足 MPC（\cref{ch:quad_mpc}）从头到尾\emph{假设了什么样的地形}？它凭什么敢假设？一旦机器人面前是一级 $16\,$cm 的台阶，这个假设在哪一步崩掉？
+  \item 你想让四足“看见”台阶并迈上去。地形信息应该\emph{以什么形式}、\emph{从哪一层}进入控制器？是写成“脚必须落在台阶上”这样的\emph{硬约束}，还是别的？为什么把它写成硬约束往往是个坏主意？
+  \item “高程图（elevation map）”和你在 \cref{ch:dense} 学过的 OctoMap / TSDF 是什么关系？为什么足式机器人偏偏用一张\emph{随机体移动}的、\emph{单层高度}的图，而不是一个全局三维占据栅格？
+  \item 落脚点要从若干候选凸区域里挑一个“最优”的。最朴素的做法是按“候选区到名义落点的三维距离”排序。这个看似无害的 $\mathrm{d}z^2$ 距离项，为什么会让机器人在台阶前\emph{死活上不去、还左右乱晃翻车}？
+  \item 加了地形感知约束、机器人却在台阶处\emph{竖直弹射到半空再翻滚}（over-launch）。如果你的第一反应是“加大横滚姿态权重把它压住”，为什么这个方向\emph{恰恰是反的}？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}感知 locomotion 的核心范式——\emph{“选落脚点（where）”与“求力轨迹（how）”分离}——以及地形仅通过\emph{落脚点投影}与\emph{base 参考抬升}两条途径进入 OCS2 NMPC，而\emph{没有}显式 ZMP / 支撑多边形 / 横滚约束（\cref{sec:lp-paradigm}）；
+  \item \textbf{画出}从深度相机/激光雷达点云到关节力矩的完整感知数据流，并说清其中哪几环\emph{复用} P2 SLAM 的技术（自滤波、平面分割、SDF），把它们\emph{锚定}回 \cref{ch:pointcloud,ch:dense}（\cref{sec:lp-dataflow,sec:lp-slam}）；
+  \item \textbf{解释}高程图为何是“随机体移动的 $2.5$D 稠密建图”，是 \cref{ch:dense} 中 OctoMap / TSDF 的\emph{机体跟随特例}，并说清“全局三维占据 vs 机体局部 $2.5$D 高程”的取舍（\cref{sec:lp-dataflow}）；
+  \item \textbf{诊断}落脚点选择中的 $\mathrm{d}z^2$ 架构缺陷——为何它让脚“留在地面、上不了台阶、逐周期闪烁”，并给出“惩罚低于脚下地形的候选区”的修法（\cref{sec:lp-foothold}）；
+  \item \textbf{写出}感知 NMPC 新增的两条 per-foot 软约束（落脚点入凸多边形、足-地形 SDF 间隙）与 base 参考三通道（pitch / z / roll）的构造，理解“强 base-z 参考是非规范简化”这一论断（\cref{sec:lp-constraint}）；
+  \item \textbf{指出}感知框架里三处与 dz$^2$ 同级的真缺陷——摆腿 $z$ 位置反馈被关断、WBC 权重进 $\mathbf{H}=\mathbf{A}^\top\mathbf{A}$ 被平方、调度用步态时钟接触而非实测接触——并知道它们的完整证伪链在哪里（\cref{sec:lp-foothold,sec:lp-wbc,sec:lp-contact,ch:legged-debug}）；
+  \item \textbf{获得}一张“把一台新四足移植进感知框架”的 checklist，以及 over-launch / 关节阻尼两条失败根因的指针（\cref{sec:lp-summary}）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把盲四足栈升级成会看地形的四足栈}”的主线。它\emph{不}重推 NMPC/WBC、也\emph{不}重讲点云/建图理论，而是把这两套既有能力\emph{接驳}起来：一端接 P7 的四足运动控制栈，另一端接 P2 的 SLAM 感知栈。串联骨架是一句核心论断：\textbf{感知 = 选带高度的落脚点 + 抬身体，求解器照旧、WBC 一行不改}。结构如下：
+
+\begin{center}
+\begin{forest} navtree
+[{感知四足运动控制\\（盲 NMPC $\to$ 地形感知）}
+  [{范式与继承\\where/how 分离}
+    [{WBC 零改动}] ]
+  [{感知数据流\\点云$\to$高程图$\to$凸区域}
+    [{接 P2 SLAM}] ]
+  [{落脚点与约束\\投影选区/软约束/base 参考}
+    [{dz² 等真缺陷}] ]
+  [{感知 WBC 与接触\\六任务/时钟 vs 实测}
+    [{失败根因指针}] ]
+]
+\end{forest}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:lp-paradigm} 立住“where/how 分离”与“地形只经两条途径进入”，是全章的总纲，任何读者必看；\cref{sec:lp-dataflow,sec:lp-slam} 是 P7$\leftrightarrow$P2 的接驳，把高程图/自滤波/平面分割/SDF 对号入座回 SLAM 章；\cref{sec:lp-foothold,sec:lp-constraint} 是感知的算法核心（投影选区、软约束、base 参考），也是真缺陷最密集处，写控制器前必看；\cref{sec:lp-wbc,sec:lp-contact} 讲感知如何（不）改 WBC 与接触估计；\cref{sec:lp-summary} 给移植 checklist 与失败根因指针。
+
+\subsection*{前置知识桥接}
+本章把前几章的四足栈\emph{整个}当作“要被叠加感知层的底座”，并把 P2 SLAM 当作“地形感知的供应商”：
+\begin{itemize}
+  \item \cref{ch:quad_mpc}（单刚体凸 MPC / 质心动力学 NMPC）给出“求力轨迹（how）”的全部理论——本章的感知 NMPC 就是在它的 OCP 上\emph{叠加}两条地形软约束，状态/输入/质心动力学原样保留（\cref{sec:lp-constraint}）；
+  \item \cref{ch:quad_wbc}（全身控制 WBC）给出把 NMPC 最优解翻译成关节力矩的优先级/加权 QP——本章的关键论断是\emph{感知不改 WBC 一行}（\cref{sec:lp-wbc}）；
+  \item \cref{ch:quad_gait}（步态与落足）已写出 Raibert 启发式与捕获点反馈项 \cref{eq:qg-raibert-vel}——本章的“名义落脚点”正是它在感知下的扩展（\cref{sec:lp-foothold}）；
+  \item \cref{ch:quad_est}（足式状态估计）的 GM 广义动量接触观测器与概率融合触地（\cref{sec:qe-contact}、\cref{ins:qe-prob-boundary}）——本章“调度用步态时钟接触 vs 实测接触”直接承接它（\cref{sec:lp-contact}）；
+  \item \cref{ch:pointcloud}（点云处理）的滤波（\cref{sec:pc-filter}）与分割范式（\cref{sec:pc-paradigm}）——机器人自滤波与凸平面分割就是它们的应用（\cref{sec:lp-slam}）；
+  \item \cref{ch:dense}（稠密建图）的 OctoMap（\cref{sec:dense-octomap}）、TSDF/ESDF（\cref{sec:dense-tsdf}）——高程图是其机体跟随 $2.5$D 特例，足-地形 SDF 间隙约束直接用其符号距离场（\cref{sec:lp-dataflow,sec:lp-slam}）。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部真缺陷与数据流） & 3 小时 & 首次要把感知四足跑上仿真/真机 \\
+速读（只读范式 + 数据流图 + base 参考） & 1 小时 & 已读完 P7 四足栈、想加“看地形”能力 \\
+速查（只看数据流速查卡与缺陷清单） & 15 分钟 & 调试时回来查“哪一环对应哪段理论” \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+本章沿用 P7 四足栈与 P2 SLAM 各自的符号，不另起一套；如需总览见 \nameref{ch:notation}。
+旋转矩阵 $\mathbf{R}\in\SO(3)$，机身$\to$世界记 $\mathbf{R}_{sb}$；质心动量记 $\mathbf{h}_{\mathrm{CoM}}$（其角动量分量 $\mathbf{L}=\mathbf{I}\boldsymbol{\omega}$），地反力 $\mathbf{f}_c$，关节力矩 $\boldsymbol{\tau}$，腿雅可比 $\mathbf{J}$（\cref{ch:quad_kin}）。
+地形高度场记 $z_{\mathrm{terrain}}(\cdot)$，平滑层记 $z_{\mathrm{sp}}(\cdot)$（\texttt{smooth\_planar}），符号距离场记 $\mathrm{SDF}(\cdot)$。
+机身俯仰/横滚 $(\theta,\phi)$，机身高度（heave）$z_{\mathrm{base}}$，名义站高 $h_{\mathrm{com}}$。
+代码标识符、文件名、类名用等宽体（如 \texttt{PerceptiveLeggedInterface}），不进 math mode。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{感知 locomotion 范式：选落脚点（where）与求力轨迹（how）的分离}
+\label{sec:lp-paradigm}
+
+\paragraph{动机：盲 locomotion 把地形“假设”成平地。}
+回看 \cref{ch:quad_mpc} 的四足栈：质心动力学 NMPC 把地反力当决策变量、在摩擦锥内优化合力跟踪机身轨迹；WBC（\cref{ch:quad_wbc}）把最优解翻成关节力矩。整条链里，地形\emph{从未作为输入出现}——它被隐式地“假设”成一张过原点、法向竖直的水平地面（落足点 $z\approx 0$、地面法向 $\hat{\mathbf{n}}=\hat{\mathbf{z}}$）。在平地、缓 rough 地形上这个假设够用；可一旦机器人面前是一级台阶、一道缓坡、一段碎石，“脚该落在哪个高度、地面法向朝哪”就成了控制器\emph{必须知道却看不见}的量。感知 locomotion 要做的，就是把地形重新请回控制回路。
+
+\begin{insight}[全章主线·感知 = 选带高度的落脚点 + 抬身体，求解器照旧]\label{ins:lp-where-how}
+感知 NMPC 的心智模型是一条三段流水线：\textbf{“启发式选带高度的落脚点（where）” $\to$ “质心动力学 NMPC 求力/轨迹（how）” $\to$ “WBC 把力/轨迹解成关节力矩”}。关键在于，地形\emph{只通过两条途径}进入这条链：
+\begin{enumerate}
+  \item \textbf{落脚点投影}：一个 \texttt{ConvexRegionSelector} 把名义落脚点投影到地形分割出来的“可行凸区域”里——决定脚\emph{落在哪、落多高}；
+  \item \textbf{base 参考抬升}：\texttt{ReferenceManager} 用地形高度/梯度\emph{抬高 base-$z$ 参考 + 给 base 一个俯仰角}——决定身体\emph{怎么抬、朝哪倾}。
+\end{enumerate}
+除此之外，\emph{没有}显式的 ZMP、\emph{没有}支撑多边形约束、\emph{没有}横滚约束。动态稳定性全靠“落脚点选对 + 摩擦锥 + 地形法向带来的隐式俯仰”来保证。这条主线解释了本章后面所有设计，也解释了为什么感知层代码能做到\emph{几乎与机器人无关}、且 WBC 一行不改。
+\end{insight}
+
+\begin{insight}[where/how 分离 = 离散规划与连续控制的分工]\label{ins:lp-discrete-continuous}
+“选落脚点”与“求力轨迹”之所以要分离，是因为它们\emph{数学性质迥异}。选落脚点是一个\emph{离散、组合}的决策（落在哪一块凸地块、是地面还是台阶顶），用启发式 + 投影到凸集来做，便宜且鲁棒；求力轨迹是一个\emph{连续、可微}的最优控制问题（在给定落脚点序列下优化地反力与质心轨迹），交给 OCS2 的 SQP/HPIPM。若把“落脚点也塞进 NMPC 当离散决策变量”，问题就退化成混合整数规划，实时求解极难——这正是本框架\emph{不}让 NMPC 自己挑落脚点、而是先用 \texttt{ConvexRegionSelector} 投影定下来的根本原因。它与 \cref{ch:quad_mpc} “MPC 在给定落脚点下优化力”、\cref{ch:quad_gait} “规划器决定落足点本身”的分工\emph{一脉相承}，感知只是把这条分界线\emph{加上了地形高度}。
+\end{insight}
+
+\begin{insight}[感知是“叠加层”：继承四足栈、零改 WBC]\label{ins:lp-overlay}
+感知框架的工程结构印证了 \cref{ins:lp-where-how}。它\emph{不替换}盲四足栈的任何运行环，而是\emph{继承并扩展}：感知接口类 \texttt{PerceptiveLeggedInterface} 继承自盲版的 \texttt{LeggedInterface}，感知控制器 \texttt{PerceptiveController} 继承自 \texttt{LeggedController}。其 \texttt{setupOptimalControlProblem()} 第一步就是\emph{原样调用基类}的同名函数——质心动力学、摩擦锥、支撑零速、摆动 $z$、自碰撞等盲版约束\emph{全部保留}；感知\emph{只}在其上\emph{追加}两条 per-foot 软约束，并把 ReferenceManager 换成感知版。于是 WBC（qpOASES）、Gazebo 仿真层、卡尔曼滤波估计、\texttt{ros\_control} 运行环\emph{全部复用、零改动}。这是 \cref{ins:lp-where-how} “地形只经两条途径进入”的代码级证据：地形从未触碰“how”（NMPC 动力学）与“执行”（WBC），只改了“where”（落脚点 + base 参考）。
+\end{insight}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=6mm and 12mm,
+  where/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=second!12, draw=second!60!black, minimum height=1.0cm, text width=2.5cm},
+  how/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=main!12, draw=main!60!black, minimum height=1.0cm, text width=2.5cm},
+  exe/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=third!12, draw=third!60!black, minimum height=1.0cm, text width=2.5cm},
+  terr/.style={draw, rounded corners, align=center, font=\scriptsize, inner sep=3pt, fill=gray!10, minimum height=0.8cm, text width=2.2cm},
+  ln/.style={->, thick, gray!55!black}]
+  \node[where] (sel) {\textbf{选落脚点 where}\\\texttt{ConvexRegionSelector}\\投影到凸区域};
+  \node[how, right=of sel] (nmpc) {\textbf{求力轨迹 how}\\质心 NMPC\\（SQP/HPIPM）};
+  \node[exe, right=of nmpc] (wbc) {\textbf{执行}\\WBC\\$\to$关节力矩};
+  \node[terr, above=of nmpc] (terr) {地形\\高程图 / 凸区域 / SDF};
+  \draw[ln] (sel)--node[above,font=\scriptsize]{落脚点序列}(nmpc);
+  \draw[ln] (nmpc)--node[above,font=\scriptsize]{$\mathbf{f}_c,\mathbf{x}^\ast$}(wbc);
+  \draw[ln] (terr)--node[right,font=\scriptsize, align=left]{途径①\\落脚点投影}(sel.north);
+  \draw[ln] (terr)--node[left,font=\scriptsize, align=left]{途径②\\base 参考}(nmpc);
+\end{tikzpicture}
+\caption{感知 locomotion 主线（\cref{ins:lp-where-how}）：地形\emph{只}经两条途径进入“选落脚点（where）$\to$求力轨迹（how）$\to$执行”这条流水线——途径①投影落脚点、途径②抬 base 参考。NMPC 动力学与 WBC 不被地形触碰（\cref{ins:lp-overlay}）。}
+\label{fig:lp-where-how}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{感知数据流与高程图：接 P2 SLAM 的稠密建图}
+\label{sec:lp-dataflow}
+
+把 \cref{ins:lp-where-how} 的“地形”落到工程，要先看它\emph{从哪来、长什么样}。本节给出从传感器到约束的完整数据流，并把其中的“高程图”一环锚定回 \cref{ch:dense} 的稠密建图。
+
+\paragraph{完整感知数据流。}
+运行时，地形信息沿如下链条流动：
+
+\begin{equation*}
+\boxed{\text{深度相机/激光雷达点云}} \xrightarrow{\text{自滤波}} \boxed{\text{高程图 }2.5\text{D}} \xrightarrow{\text{凸分割}} \boxed{\text{凸平面区域}} \xrightarrow{\text{注入}} \boxed{\text{NMPC 约束 + base 参考}} \xrightarrow{} \boxed{\text{WBC}}
+\end{equation*}
+
+逐环展开（括号内为对应代码节点）：
+\begin{enumerate}
+  \item \textbf{点云}：深度相机（如 D435）或激光雷达（如 Livox）输出原始点云；
+  \item \textbf{机器人自滤波}（\texttt{robot\_self\_filter}）：滤掉打在机器人自身肢体上的点，免得把自己的腿当成障碍——见 \cref{sec:lp-slam}，接 \cref{sec:pc-filter}；
+  \item \textbf{高程图}（\texttt{elevation\_mapping\_cupy}）：把点云融合成一张\emph{随机体移动}的 $2.5$D 高程图（\texttt{grid\_map}），每个栅格存一个高度值；
+  \item \textbf{凸平面分割}（\texttt{convex\_plane\_decomposition}）：把高程图分割成若干“凸平面区域”（可落足地块），并生成一层平滑高度场 \texttt{smooth\_planar}——见 \cref{sec:lp-slam}，接 \cref{sec:pc-paradigm}；
+  \item \textbf{注入求解器}（\texttt{PlanarTerrainReceiver}，一个 OCS2 \texttt{SynchronizedModule}）：每个 MPC 周期前，线程安全地把外部地形（凸区域 + 重建的 SDF）喂进接口；
+  \item \textbf{消费地形}：\texttt{ConvexRegionSelector} 选落脚点凸区域并投影高度（途径①），\texttt{PerceptiveReferenceManager} 抬 base-$z$ + 算 base-pitch（途径②），二者一起喂进\emph{带 \texttt{FootPlacement} 与 \texttt{FootCollision} 约束}的 NMPC，求出最优状态/输入，再交 WBC 解成关节力矩。
+\end{enumerate}
+
+\begin{insight}[高程图 = 随机体移动的 \texorpdfstring{$2.5$}{2.5}D 稠密建图]\label{ins:lp-elevation}
+高程图（elevation map）不是一种新地图，而是 \cref{ch:dense} 稠密建图家族里的一个\emph{机体跟随、单层高度}特例。与 OctoMap（\cref{sec:dense-octomap}）、TSDF（\cref{sec:dense-tsdf}）同族——都在融合传感器观测、维护对环境几何的稠密估计——但它有两个刻意的简化：
+\begin{itemize}
+  \item \textbf{$2.5$D 而非 $3$D}：它对每个 $(x,y)$ 栅格只存\emph{一个}高度 $z$，是一张“可起伏的桌布”，而非 OctoMap 那样的体素占据。代价是表达不了悬垂（overhang）、桥洞、多层结构；收益是数据量、查询、维护都从 $O(N^3)$ 塌到 $O(N^2)$；
+  \item \textbf{机体跟随而非全局}：地图原点随机身移动（robot-centric），只覆盖机器人脚下一小片，旧区域随着走出视野而丢弃，不累积全局地图。
+\end{itemize}
+\textbf{为何足式 locomotion 偏要这张“缩水”的图}：脚要落在哪、身体要抬多高，\emph{只需要知道脚下那一小片地面的高度}——它不需要全局三维占据，也极少遇到要落脚在悬垂结构上的情形。机体跟随 $2.5$D 高程图把“维护一张精确局部地形高度”的成本压到能跑进数百赫兹控制回路的程度，正是“全局三维占据 vs 机体局部 $2.5$D 高程”这个取舍里、为运动控制选定的那一端。与 \cref{ch:dense} 里那些为重建/规划服务的全局 $3$D 表示\emph{各取所需、并不矛盾}。
+\end{insight}
+
+\begin{insight}[\texttt{SynchronizedModule}：把外部地图喂进求解器的线程安全闸门]\label{ins:lp-sync}
+地形从感知管线（异步、$\sim$几十赫兹）流进 NMPC 求解器（每个 MPC 周期）这一步，不能直接改求解器正在用的问题数据——否则会和求解线程打架。OCS2 的 \texttt{SynchronizedModule} 机制就是这道闸门：它在\emph{每个 MPC 周期开始求解之前}的安全时刻，被求解器回调一次，此刻才把最新的凸地形/SDF 写进接口的 \texttt{planarTerrainPtr\_}/\texttt{sdfPtr\_}。这与本部双足章里 OCS2 的 \texttt{ReferenceManager} 三段式（ROS 回调加锁缓冲 $\to$ 求解前安全写入 $\to$ 求解器查询）是\emph{同一套因果链}的两个实例——凡“外部异步数据要进 OCS2 求解器”，都走这个“缓冲 + 求解前同步”的模式（\cref{ch:legged-biped} 对此模式有更展开的讨论）。
+\end{insight}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\scriptsize, inner sep=3pt, fill=main!8, draw=main!55!black, minimum height=0.9cm, text width=2.15cm},
+  slam/.style={draw, rounded corners, align=center, font=\scriptsize, inner sep=3pt, fill=second!10, draw=second!60!black, minimum height=0.9cm, text width=2.15cm},
+  ln/.style={->, thick, gray!60!black}]
+  \node[blk] (pc) {点云\\D435/Livox};
+  \node[slam, right=12mm of pc] (sf) {自滤波\\\texttt{self\_filter}\\(\cref{sec:pc-filter})};
+  \node[slam, right=12mm of sf] (em) {高程图 $2.5$D\\\texttt{elevation}\\(\cref{ch:dense})};
+  \node[slam, below=8mm of em] (cpd) {凸平面分割\\\texttt{convex\_plane}\\(\cref{sec:pc-paradigm})};
+  \node[blk, left=12mm of cpd] (recv) {\texttt{Synchronized}\\\texttt{Module} 注入\\凸区域+SDF};
+  \node[blk, left=12mm of recv] (nmpc) {NMPC\\\texttt{FootPlacement}\\\texttt{FootCollision}};
+  \node[blk, below=8mm of nmpc] (wbc) {WBC\\$\to\boldsymbol{\tau}$};
+  \draw[ln] (pc)--(sf);
+  \draw[ln] (sf)--(em);
+  \draw[ln] (em)--(cpd);
+  \draw[ln] (cpd)--(recv);
+  \draw[ln] (recv)--(nmpc);
+  \draw[ln] (nmpc)--(wbc);
+\end{tikzpicture}
+\caption{感知四足完整数据流（\cref{sec:lp-dataflow}）：蓝色三环（自滤波 / 高程图 / 凸平面分割）\emph{复用} P2 SLAM 技术，括号给出回引章节；地形经 \texttt{SynchronizedModule} 注入 NMPC（\cref{ins:lp-sync}），约束求解后交 WBC 解成关节力矩。}
+\label{fig:lp-dataflow}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{接 P2 SLAM：自滤波、平面分割与符号距离场}
+\label{sec:lp-slam}
+
+\cref{fig:lp-dataflow} 里的三个蓝色环，恰好是 P2 SLAM 三类技术在足式感知里的应用。本节把它们逐一接回 SLAM 章——\emph{不重讲理论}，只点明“感知四足这里用的就是你学过的那一套”。
+
+\paragraph{机器人自滤波 $\approx$ 几何剔除滤波。}
+\texttt{robot\_self\_filter} 把落在机器人自身肢体（用一组随关节运动的几何包络近似）内的点剔除，避免把自己的腿/躯干当成脚下的“障碍”混进高程图。这本质上是\emph{基于几何先验的点云剔除滤波}，与 \cref{sec:pc-filter} 里讲的统计离群剔除（SOR/ROR）、体素下采样\emph{并列}——区别只在“判据”：自滤波的判据是“点是否落在机器人当前位姿下的自身几何包络内”（需要正运动学把包络摆到当前关节角），而非统计邻域。把它理解成“一种以机器人自身为掩膜的几何剔除滤波”即可，原理见 \cref{sec:pc-filter}。
+
+\paragraph{凸平面分割 $\approx$ 点云分割范式。}
+\texttt{convex\_plane\_decomposition} 把高程图分割成若干\emph{凸平面区域}（每块是一片近似共面、且边界为凸多边形的可落足地块）。这是 \cref{sec:pc-paradigm} 点云分割范式在 $2.5$D 高程图上的具体落地：从“一片连续高度场”里切出“离散的、可被落脚点投影进去的几何地块”。落脚点约束需要把“脚必须落在某块凸区域内”写成线性不等式，因此分割结果要以\emph{半空间交}的形式给出。对凸多边形，由其逆时针顶点序列 $\{(x_\ell,y_\ell)\}$ 可\emph{精确}构造各边的内法向半空间 $\mathbf{a}_\ell^\top \mathbf{p}\le b_\ell$：
+
+\begin{equation}
+  \mathbf{a}_\ell=\begin{bmatrix} y_{\ell+1}-y_\ell \\ x_\ell-x_{\ell+1} \end{bmatrix},
+  \qquad
+  b_\ell = y_\ell\,x_{\ell+1} - x_\ell\,y_{\ell+1},
+  \label{eq:lp-halfspace}
+\end{equation}
+
+其中 $\mathbf{a}_\ell$ 取该边方向向量逆时针旋 $90^\circ$（指向多边形\emph{内部}），$b_\ell$ 由该边上任一顶点定常数项。若下一顶点不满足 $\mathbf{a}_\ell^\top \mathbf{p}\le b_\ell$ 则说明法向取反，需翻转符号——这是“凸多边形 = 有限个半空间之交”的逐边兑现，每条边贡献一行落脚点不等式（\cref{sec:lp-constraint} 的 \texttt{FootPlacementConstraint} 用之）。
+
+\begin{insight}[足-地形碰撞 = 在地形 SDF 上查间隙，接 P2 的 TSDF/ESDF]\label{ins:lp-sdf}
+要防脚插进台阶立面，需要一个能\emph{快速回答“某点到地形表面的有符号距离”}的场——这正是 \cref{sec:dense-tsdf} 讲的符号距离场（SDF）。感知框架在收到新地形时\emph{重建}一个 \texttt{SignedDistanceField}（基于高程图的 \texttt{elevation\_before\_postprocess} 层，体素分辨率约 $0.03\,$m，SDF 截断范围约 $\pm 0.1\,$m），其物理含义与 SLAM 侧的 TSDF/ESDF\emph{完全一致}：场内一点的值是它到最近地形表面的有符号距离（地形外为正、地形内为负）。足-地形间隙约束就是要求摆动足球心处的 $\mathrm{SDF}\ge \text{clearance}$（\cref{sec:lp-constraint}）。本书 SLAM 侧已多次出现 SDF——增量 ESDF 的 Voxblox\cite{oleynikova2017voxblox}、学到连续 SDF 的 DeepSDF\cite{park2019deepsdf}、实时神经 SDF 的 iSDF\cite{ortiz2022isdf}——感知 locomotion 用的就是这同一个数学对象，只是把“相机重建场景”换成“高程图重建脚下地形”，把“规划无碰撞路径”换成“约束脚不撞立面”。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{感知四足三环 $\leftrightarrow$ P2 SLAM 技术的对照（本节接驳表）}
+\begin{tabular}{p{0.24\textwidth} p{0.30\textwidth} p{0.36\textwidth}}
+\toprule
+感知四足环节 & SLAM 侧对应技术 & 关系 \\
+\midrule
+\texttt{robot\_self\_filter} 自滤波 & 点云滤波（\cref{sec:pc-filter}）& 以机器人自身几何为掩膜的剔除滤波，与 SOR/ROR/体素并列 \\
+\texttt{convex\_plane\_decomposition} 凸分割 & 点云分割范式（\cref{sec:pc-paradigm}）& 从高度场切出离散凸地块，半空间表示见 \cref{eq:lp-halfspace} \\
+高程图 & 稠密建图（\cref{ch:dense}，\cref{sec:dense-octomap,sec:dense-tsdf}）& 机体跟随 $2.5$D 高度特例（\cref{ins:lp-elevation}）\\
+足-地形 \texttt{SignedDistanceField} & TSDF/ESDF（\cref{sec:dense-tsdf}）；Voxblox\cite{oleynikova2017voxblox} & 同一 SDF 对象，用于足-地形间隙约束（\cref{ins:lp-sdf}）\\
+\bottomrule
+\end{tabular}
+\label{tab:lp-slam}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{落脚点选择：名义落脚、凸区域投影与 \texorpdfstring{$\mathrm{d}z^2$}{dz2} 缺陷}
+\label{sec:lp-foothold}
+
+落脚点是 \cref{ins:lp-where-how} 途径①的核心，也是整条感知链\emph{最易踩坑}的一环。本节先给名义落脚与投影选区的构造，再剖析两处与机器人能力无关、却足以让机器人翻车的\emph{结构缺陷}。
+
+\subsection{名义落脚点与凸区域投影}
+\label{subsec:lp-nominal}
+
+\paragraph{名义落脚点。}
+每个 MPC 周期，先按当前参考轨迹算出“这只脚\emph{该}落在哪”的名义落脚点 \texttt{getNominalFoothold}：
+
+\begin{equation}
+  \mathbf{p}_{\mathrm{nom}} = \mathrm{FK}\big(\mathbf{x}_{\mathrm{des}}\big)\big[\text{leg}\big] - \mathbf{R}^\top\,\mathbf{o},
+  \qquad
+  \mathbf{o} = \tan(-\theta)\cdot 0.4,
+  \label{eq:lp-nominal}
+\end{equation}
+
+即由期望状态的正运动学得到该腿的足位，再沿机身坐标减去一个偏移向量 $\mathbf{o}$。这里的关键是 $\mathbf{o}=\tan(-\theta)\cdot 0.4$：base 俯仰角 $\theta$ 通过它\emph{把落点往坡上推}（$\theta$ 越大、落点越往前移上台阶），是“爬升机制”的一环——身体先有了俯仰，落脚点就自动前移去够台阶。它与 \cref{ch:quad_gait} 的 Raibert 启发式同源：名义落脚就是 Raibert 中性点 + 补偿在感知下的版本。\cref{eq:qg-raibert-vel} 那个捕获点速度反馈项在本框架的落脚点选择里被\emph{注释禁用}了（落脚点的“前瞻”改由 NMPC 隐式优化承担），但其物理含义——“落点提前到未来支撑相中心”——在本部双足章里会作为横向平衡的理论底座被补全（\cref{ch:legged-biped}）。
+
+\paragraph{投影到“最优”凸区域。}
+名义落脚点 $\mathbf{p}_{\mathrm{nom}}$ 在平地假设下高度 $z\approx 0$，\emph{不知道台阶}。\texttt{ConvexRegionSelector} 把它投影到分割出的凸区域里、选一块“最优”的，再用该区域的高度作为落脚高度。选区的代价函数形如
+
+\begin{equation}
+  \text{cost}(\text{region}) = \underbrace{\big\| \mathbf{p}_{\mathrm{nom}} - \mathrm{proj}_{\text{region}}(\mathbf{p}_{\mathrm{nom}})\big\|^2}_{\text{含 } \mathrm{d}z^2 \text{ 的三维距离}} + \underbrace{\rho(\text{region})}_{\text{惩罚项}}.
+  \label{eq:lp-region-cost}
+\end{equation}
+
+投影点的高度 $z$ 进一步喂给摆动轨迹规划器（\texttt{SwingTrajectoryPlanner}）作为该步的起落高度，摆动顶点（apex）取 $\max(\text{liftoff},\text{touchdown})+\text{swingHeight}$。注意这里是 $\max$ 而非 $\min$：台阶处摆动顶 $=\max(0,0.16)+0.08=0.24$ 自动抬过台阶——这正是“摆高 $0.08\,$m 就够、不必加到 $0.15$”成立的原因，误以为“摆高必须 $\ge$ 台阶竖板高”是个\emph{错前提}（真正撞立面的原因在下面的 $\mathrm{d}z^2$ 与摆腿 $z$ 开环）。
+
+\subsection{\texorpdfstring{$\mathrm{d}z^2$}{dz2} 架构缺陷：脚为何上不了台阶}
+\label{subsec:lp-dz2}
+
+\begin{pitfall}[$\mathrm{d}z^2$ 距离项让脚“偏选地面、上不去、还闪烁翻车”]\label{pit:lp-dz2}
+\cref{eq:lp-region-cost} 里那个看似无害的三维距离项（含竖直方向的 $\mathrm{d}z^2$），叠加上“惩罚项 $\rho$ 实际是个 no-op（恒返回 $0$）”，会引出一连串失效。设名义落点在台阶沿、$z\approx 0$：
+\begin{itemize}
+  \item \textbf{偏选地面区}：地面区到名义落点的 $\mathrm{d}z^2=0^2=0$（赢），台阶顶区 $\mathrm{d}z^2=0.16^2=0.0256$（输）$\to$ 选区器\emph{偏选地面区} $\to$ 脚\emph{留在地面}、上不了台阶；
+  \item \textbf{逐周期闪烁}：base 一摇晃，赢家在“台阶顶区 $\leftrightarrow$ 地面区”之间\emph{逐周期翻转} $\to$ 落点不一致 $\to$ 对角 trot 撑不住 $\to$ 横滑翻；
+  \item \textbf{摆动顶点饥饿}：被选成地面区后 touchdown 高度 $z\approx 0$ $\to$ apex $=0+0.08=0.08<0.16$ $\to$ 脚\emph{撞台阶立面}；
+  \item \textbf{鸡生蛋耦合}：脚要上台阶得 base 先抬（俯仰把落点前推），base 要抬又得脚先踩上去——两者互为前提，谁也先动不了。
+\end{itemize}
+\textbf{为什么这是“架构缺陷”而非“调参问题”}：它根植于“按三维欧氏距离选区 + 惩罚项是 no-op”这个度量设计，无论怎么调摆高/速度/权重都绕不过去。\textbf{修法}是把 no-op 惩罚换成\emph{对“候选区平面低于脚下局部地形高”的惩罚}：
+\begin{equation}
+  \rho(\text{region}) = w\cdot \max\!\big(0,\; z_{\mathrm{terrain}}-\mathbf{p}.z()\big)^2,\qquad w\approx 1000,
+  \label{eq:lp-dz2-fix}
+\end{equation}
+使台阶顶区\emph{坚定地赢}、消掉闪烁、把 apex 修对（投影 $z=0.16\to$ apex $0.24$ 清台阶立面）。关键是这\emph{不能}直接把落脚点 $z$ 硬设成 $0.16$（那会让机器人暴冲翻车）：\cref{eq:lp-dz2-fix} 保留 $\mathbf{p}.z()\approx 0$、让 base 仍\emph{先}抬、落脚\emph{跟上}（保住“鸡生蛋”里正确的先后顺序）；\texttt{smooth\_planar} 是平滑层，使 $z_{\mathrm{terrain}}$ 跨台阶渐变无跳变。这是\emph{多方独立诊断收束到同一根因}的典型案例，完整复盘见 \cref{ch:legged-debug}。
+\end{pitfall}
+
+\begin{pitfall}[摆腿 $z$ 位置反馈被关断：\texttt{positionErrorGain=0}]\label{pit:lp-posgain}
+与 $\mathrm{d}z^2$ \emph{同级}的第二处真缺陷藏在配置里：\texttt{model\_settings} 的 \texttt{positionErrorGain} 被设成 $0$，而上游默认是 $20$。这一个 $0$ 让预计算环节\emph{跳过摆腿 $z$ 的位置反馈块}——摆动足只受 $z$ \emph{速度}约束、\emph{没有}把足端往规划样条上拉回的\emph{位置}反馈。后果：摆腿一旦被扰动偏离轨迹（撞立面、漂走），\emph{无人纠正}$\to$ 落点非对称 $\to$ 横滚。它和 \cref{pit:lp-dz2} 在配置注释里被并列为“台阶处削脚（riser-clip）”的两面（$\mathrm{d}z^2$ 选地面区 + 摆腿 $z$ 开环）。教训：移植/继承别人的 task 配置时，\emph{逐项核对被改动的默认值}——一个被悄悄改成 $0$ 的增益，足以让一整套感知约束形同虚设。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{感知 NMPC 约束与 base 参考构造}
+\label{sec:lp-constraint}
+
+本节给出 \cref{ins:lp-overlay} 里“感知\emph{追加}了什么”的精确清单：两条 per-foot 软约束（途径①的约束侧）与 base 参考三通道（途径②）。它们都进 \cref{ch:quad_mpc} 的同一个 OCP，理论地基（OCP/QP/状态空间）见 \cref{sec:qp,sec:state-space,ch:nlopt}。
+
+\subsection{两条 per-foot 软约束}
+\label{subsec:lp-soft}
+
+感知接口 \texttt{setupOptimalControlProblem()} 在原样调用基类（保留全部盲版约束）后，\emph{对每只脚}追加两条软约束，都用\emph{松弛障碍惩罚}（\texttt{RelaxedBarrierPenalty}）而\emph{非}硬约束：
+
+\begin{itemize}
+  \item \textbf{落脚点约束}（\texttt{FootPlacementConstraint}）：要求落脚点落在所选凸区域的多边形内，即满足 \cref{eq:lp-halfspace} 的全部半空间不等式（\texttt{numVertices} 条）。这是感知的\emph{核心}约束——强制脚落在可行地块上；
+  \item \textbf{足-地形碰撞约束}（\texttt{FootCollisionConstraint}）：要求摆动足球心处的 $\mathrm{SDF}\ge \text{clearance}$（clearance $\approx 0.03\,$m），防脚插进台阶立面（\cref{ins:lp-sdf}）。它\emph{只在脚摆动时}激活（前后各 $\pm 0.05\,$s 也判为触地以留余量）。
+\end{itemize}
+
+\begin{insight}[为何用软约束（松弛障碍）而非硬约束]\label{ins:lp-soft-why}
+落脚点与足-地形约束用\emph{软}的松弛障碍惩罚、而非\emph{硬}不等式，是一个深思熟虑的取舍。地形感知\emph{天然带噪}（深度噪声、地图滞后、分割边界抖动），若把“脚必须落在凸区域内”写成硬约束，地图稍有误差就可能让 OCP\emph{不可行}——求解器直接失败、机器人当场失控。松弛障碍惩罚则把约束做成“越界代价急剧上升、但永不真正不可行”的软墙：绝大多数时候脚被推回可行域，极端情形下宁可轻微越界也不让整个求解崩掉。这与本书安全控制里“硬约束 vs 控制障碍函数软化”的取舍同理（\cref{ch:legged-biped} 对“注册硬约束 $\ne$ 闭环满足”有量化的反面案例）。代价是：软约束\emph{压不死}持续的反方向驱动——若上层一直发前进指令，软的落脚点/碰撞约束可能被“推过去”，这也是后面“优雅停下必须靠零速指令而非软约束”的根源（\cref{ch:legged-debug}）。
+\end{insight}
+
+\subsection{base 参考三通道}
+\label{subsec:lp-baseref}
+
+途径②是 \texttt{PerceptiveReferenceManager::modifyReferences}：每个 MPC 周期重算各 horizon 节点的 base 参考，源码实证三大通道。
+
+\paragraph{base-pitch（爬升核心）。}
+在足迹四角（$\pm h_x,\pm h_y$）采样平滑层 \texttt{smooth\_planar} 做最小二乘\emph{平面拟合}，得前后坡度 $\mathrm{d}z/\mathrm{d}x$，取
+
+\begin{equation}
+  \theta = \operatorname{clamp}\!\Big(\arctan\frac{\mathrm{d}z}{\mathrm{d}x},\; -0.12,\; 0.12\Big)\ \text{rad}.
+  \label{eq:lp-pitch}
+\end{equation}
+
+\textbf{为何用四足拟合而非两点中心差分}：四点拟合让“前样本落在台阶上”时 base \emph{还没过沿}就有平滑非零俯仰 $\to$ 经 $\tan\theta\cdot 0.4$（\cref{eq:lp-nominal}）把落点前推 $\to$ 破“鸡生蛋”（\cref{pit:lp-dz2}）。两点中心差分是\emph{不连续}的，会在过沿瞬间跳变把机器人掀翻。\textbf{为何 clamp 到 $0.12\,$rad（约 $7^\circ$）}：俯仰“权限”不是越大越好——放宽到 $0.25$ 让机器人抬头 $17^\circ$ 后\emph{倒翻}（这条 clamp 边界是血泪试出来的，复盘见 \cref{ch:legged-debug}）。
+
+\paragraph{base-$z$（heave，最高权重）。}
+机身高度参考由 base \emph{单点}采样平滑层、再除以俯仰余弦升高：
+
+\begin{equation}
+  z_{\mathrm{base}} = z_{\mathrm{sp}}(\text{base}_{xy}) + \frac{h_{\mathrm{com}}}{\max\!\big(\cos\theta,\,0.5\big)}.
+  \label{eq:lp-basez}
+\end{equation}
+
+$/\cos\theta$ 抬高身体、使脚不被“拽进”台阶立面（$\max(\cdot,0.5)$ 防大俯仰时除数过小）。注意取\emph{单点}采样：曾把它改成“四角足迹均值”并丢掉 $/\cos\theta$ 升高项 $\to$ 抬头时 base-$z$ 命令偏低、前腿被拉进竖板 $\to$ 自注入扰动（已修回单点 + $/\cos\theta$）。
+
+\paragraph{base-roll（默认 $0$；坡上 banking）。}
+直台阶无真实横滚，命令任何横滚都是纯误差注入，故 base-roll 默认\emph{强制 $0$}。坡上需要时，对四个规划落脚点拟合\emph{真平面} $z=a\,\mathrm{d}x+b\,\mathrm{d}y+c$，由侧向梯度给 banking 横滚 $\phi=\arctan(-a\sin\psi+b\cos\psi)$（$\psi$ 为偏航）——身体倾向支撑侧抵消侧滑。其\emph{安全性}在于：参考源是\emph{规划落脚点}（非漂移 base 上重采样）$\to$ 不构成正反馈环；平地 $a=b=0\to\phi=0$（零回归）。
+
+\begin{insight}[强 base-$z$ 参考是一个“非规范简化”——埋下 over-launch 的种子]\label{ins:lp-strong-baseref}
+\cref{eq:lp-basez} 这套\emph{强 base-$z$ 位置参考}（高权重命令身体抬到精确高度）其实是本框架的一个\emph{非规范简化}，与主流文献的设计哲学\emph{相反}。文献一致倾向“\emph{隐藏/弱化} base 参考”、让机器人靠落脚点 + 摆动反射爬台阶：感知 NMPC 的奠基工作\cite{grandia2022perceptive}用的是温和的髋平面拟合附加项、无台阶专用参数；后续工作甚至\emph{移除} base/CoM 跟踪约束、或\emph{刻意对控制器隐藏} base-pose 参考（以降低对地图误差的敏感、靠纯落脚点 + 摆动反射爬更大台阶）。\textbf{为何这关乎稳定性}：强 base-$z$ 位置参考意味着 NMPC 会\emph{主动施加竖直地反力}去把身体顶到参考高度；对重躯干机器人，这股竖直力一旦过度，就成了把机器人\emph{弹射}上天的触发源——这正是 over-launch 的触发层所在。本章把它\emph{点名}为“非规范简化 + over-launch 触发层”，完整的证伪链（为何升横滚权重是反方向、为何 $\ge 13$ 个假设逐个被证伪、文献如何独立交叉验证）放在 \cref{ch:legged-debug}。这里只需记住：\emph{你写的 base 参考越“硬”，求解器为追它而施的瞬态力就越可能把重机器人推飞}。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{感知层在盲 NMPC 之上\emph{追加}的内容（本章核心增量表，\cref{ins:lp-overlay}）}
+\begin{tabular}{p{0.20\textwidth} p{0.30\textwidth} p{0.34\textwidth}}
+\toprule
+增量 & 形式 & 说明 / 落点 \\
+\midrule
+落脚点约束 & per-foot 软约束（松弛障碍）& 落点入凸多边形 \cref{eq:lp-halfspace}；感知核心 \\
+足-地形碰撞 & per-foot 软约束（仅摆动激活）& 球心 $\mathrm{SDF}\ge 0.03$，防撞立面（\cref{ins:lp-sdf}）\\
+base-pitch & 四足平面拟合 + clamp & \cref{eq:lp-pitch}；爬升核心、推落点前移 \\
+base-$z$ & 单点采样 $+\,h_{\mathrm{com}}/\cos\theta$ & \cref{eq:lp-basez}；最高权、抬身体（\cref{ins:lp-strong-baseref} 非规范）\\
+base-roll & 默认 $0$；坡上侧向梯度 banking & 直台阶零横滚，坡上抵消侧滑 \\
+ReferenceManager & 换成感知版 \texttt{SynchronizedModule} & 每周期注入地形（\cref{ins:lp-sync}）\\
+\bottomrule
+\end{tabular}
+\label{tab:lp-increment}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{感知 WBC（六任务）与纯力矩下发}
+\label{sec:lp-wbc}
+
+\cref{ins:lp-overlay} 已立论“感知不改 WBC 一行”。本节补全这套 WBC 的任务清单，并点出一个\emph{与机器人无关}却能让横滚恢复被碾压的权重陷阱——它与 \cref{ch:quad_wbc} 的 WBC 同源，本节只讲“感知如何（不）改它 + 平方权重坑”。
+
+\paragraph{六任务。}
+WBC 把 NMPC 的最优状态/输入翻译成关节力矩，求解变量同 \cref{eq:qp-wbc} 为 $[\ddot{\mathbf{q}}^\top,\mathbf{f}_c^\top,\boldsymbol{\tau}^\top]^\top$，任务表（每个任务是对该变量的等式/不等式）：
+
+\begin{table}[H]\centering\small
+\caption{感知 WBC 六任务（与 \cref{ch:quad_wbc} 同源，感知不改）}
+\begin{tabular}{p{0.24\textwidth} p{0.18\textwidth} p{0.42\textwidth}}
+\toprule
+任务 & 类型 & 作用 \\
+\midrule
+\texttt{FloatingBaseEom} & 等式 & 浮动基多刚体动力学 $\mathbf{M}\ddot{\mathbf{q}}+\mathbf{h}=\mathbf{S}^\top\boldsymbol{\tau}+\mathbf{J}^\top\mathbf{f}_c$ \\
+\texttt{TorqueLimits} & 不等式 & $|\boldsymbol{\tau}|\le \tau_{\max}$ \\
+\texttt{FrictionCone} & 不等式 & 接触力在摩擦锥（金字塔近似）内 \\
+\texttt{NoContactMotion} & 硬等式 & 支撑脚加速度 $=0$（完美 stiction）\\
+\texttt{BaseAccel} & 等式 & base 六自由度加速度跟 NMPC 质心动量率 \\
+\texttt{SwingLeg} & 等式 & 摆动脚跟踪轨迹 \\
+\bottomrule
+\end{tabular}
+\label{tab:lp-wbc}
+\end{table}
+
+\begin{pitfall}[加权 WBC 的权重进 $\mathbf{H}=\mathbf{A}^\top\mathbf{A}$ 是\emph{平方}的]\label{pit:lp-square-weight}
+加权 WBC 把各任务按 $\sqrt{\text{weight}}$ 堆进堆叠矩阵 $\mathbf{A}$、再解 $\min\|\mathbf{A}\mathbf{x}-\mathbf{b}\|^2$，于是\emph{有效权重比是平方}。这意味着配置里写的 $\text{swingLeg}{:}\text{baseAccel}=100{:}1$，在二次型里实际是 $100^2{:}1=10000{:}1$——摆腿任务以\emph{一万倍}的强度\emph{碾压} base 横滚恢复任务。新手按字面读成 $100{:}1$、以为“摆腿略重于姿态”，量级整整差了两个数量级。\textbf{含义}：当机器人在台阶处需要 base 任务去恢复横滚时，它被摆腿任务压得几乎使不上劲。理解这一点，才不会困惑“我明明给了 base 姿态恢复权重、它却像没有”。修权重时务必记得：\emph{你写的是 $\sqrt{}$、求解器用的是平方}。
+\end{pitfall}
+
+\paragraph{纯力矩下发。}
+底层关节命令统一为 $k_p=0,\;k_d=3,\;\tau_{\mathrm{ff}}=\boldsymbol{\tau}$，即\emph{纯力矩 + 小速度阻尼}（按 \cref{eq:qp-hybrid} 的混合控制律，退化成 $\tau=\boldsymbol{\tau}-k_d\boldsymbol{\omega}$）。所有机器人共享这套值，因此“调底层 PD”对不同机型\emph{无差异}——这条提示在排查时很有用：若怀疑底层 PD，先想到它是全机型共享的常量，问题多半不在这里（这正是关节阻尼根因被误判为底层 PD 的反面，详见 \cref{ch:legged-debug}）。
+
+% ════════════════════════════════════════════════════════════════
+\section{接 P2：感知接触检测（步态时钟 vs 实测接触）}
+\label{sec:lp-contact}
+
+最后一环把感知接回 \cref{ch:quad_est} 的接触估计。这一环看似工程细节，却是台阶处横滚失稳的一条\emph{隐蔽}根因。
+
+\begin{insight}[WBC/调度用“步态时钟接触”而非“实测接触”]\label{ins:lp-clock-contact}
+本框架里，WBC 的 \texttt{NoContactMotion} 硬约束与步态调度，依据的是\emph{步态时钟}（gait clock）告诉它“此刻这只脚\emph{应该}触地”，而\emph{非}真实测量的接触状态（源码里 \texttt{contactDetection} 一类钩子为空）。在平地，这没问题——脚按时钟落地、误差极小。但在台阶处，前脚\emph{晚}着地：调度已按时钟把它置成 \texttt{STANCE}（支撑），质心模型于是\emph{假设了一个并不存在的地反力} $\to$ base 受力计算错 $\to$ 横滚。这正是 \cref{ins:qe-prob-boundary}（概率融合触地“平地够用、复杂地形必须”）所警示的情形：平地可用步态时钟“标称”代替实测，复杂地形\emph{必须}靠实测接触（\cref{sec:qe-contact} 的 GM 广义动量观测器、\cref{subsec:qe-gm}）才不会“以为脚踩着、其实悬空”。文献也把这条作为事件驱动执行（event-based locomotion）的动机\cite{bledt2018contact}——用实测接触触发步态相位切换、而非纯时钟。本章\emph{点名}这条根因，它的完整诊断（为何 grep 出 \texttt{contactDetection} 为空就是“标称代替实测”的铁证）与对应的状态估计修法放在 \cref{ch:legged-debug}。
+\end{insight}
+
+\begin{pitfall}[“标称接触”是一族坑：步态时钟接触、KF 平地 base-$z$ 假设]\label{pit:lp-nominal-contact}
+\cref{ins:lp-clock-contact} 是更大一族“以标称代替实测”坑的一员。同族的还有 \cref{ch:quad_est} 卡尔曼滤波估计 base-$z$ 时\emph{假设支撑脚在 $z=0$}（平地假设）——机器人 spawn 在抬高平台上时，估计器“欠读” base-$z$ 恰好等于平台高度 $\to$ WBC 以为身体太低、把它顶高 $\to$ 站太高、起步失稳。这两条（WBC 用时钟接触、KF 用平地 base-$z$）是同一个反面模式的两个实例：\emph{系统标称的接触/高度未必是实测的}。排查任何“台阶/抬高地形上莫名失稳”前，先问一句：\emph{这里用的是实测量、还是某个平地假设下的标称量？}（terrain-aware 的 touchdown-latch 修法接 \cref{sec:qe-state,sec:qe-kf}，完整复盘在 \cref{ch:legged-debug}。）
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\label{sec:lp-summary}
+
+本章把盲四足栈升级成会看地形的四足栈：地形以机体跟随 $2.5$D 高程图 $\to$ 凸平面区域 $\to$ 落脚点投影 + base 参考的形式进入 OCS2 NMPC，WBC 一行不改。核心是\emph{where/how 分离}（\cref{ins:lp-where-how}）与四处与机器人无关、却足以致命的真缺陷。
+
+\begin{table}[H]\centering\small
+\caption{本章公式 / 结论速查（理论地基详见所属章）}
+\begin{tabular}{lll}
+\toprule
+公式 / 结论 & 一句话说明 & 对应 \\
+\midrule
+半空间表示 \cref{eq:lp-halfspace} & 凸多边形逐边内法向 $\mathbf{a}_\ell^\top\mathbf{p}\le b_\ell$ & \cref{sec:lp-slam} \\
+名义落脚 \cref{eq:lp-nominal} & $\mathrm{FK}-\mathbf{R}^\top\mathbf{o}$，$\mathbf{o}=\tan(-\theta)0.4$ 推落点上坡 & \cref{sec:lp-foothold} \\
+$\mathrm{d}z^2$ 修法 \cref{eq:lp-dz2-fix} & 惩罚“低于脚下地形”的候选区 & \cref{pit:lp-dz2} \\
+base-pitch \cref{eq:lp-pitch} & 四足平面拟合 + clamp $\pm 0.12$ & \cref{subsec:lp-baseref} \\
+base-$z$ \cref{eq:lp-basez} & 单点 $+\,h_{\mathrm{com}}/\cos\theta$（强参考、非规范）& \cref{ins:lp-strong-baseref} \\
+平方权重 & WBC 权重进 $\mathbf{H}=\mathbf{A}^\top\mathbf{A}$ 是平方 & \cref{pit:lp-square-weight} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{感知框架四处“与机器人无关却致命”的真缺陷（移植必查）}
+\begin{tabular}{p{0.26\textwidth} p{0.32\textwidth} p{0.30\textwidth}}
+\toprule
+缺陷 & 症状 & 修法 / 出处 \\
+\midrule
+$\mathrm{d}z^2$ 选区偏置 & 脚留地面、上不了台阶、闪烁横滑 & 惩罚低于脚下地形的区（\cref{pit:lp-dz2}）\\
+\texttt{positionErrorGain=0} & 摆腿 $z$ 开环、撞立面/漂走无纠正 & 改回上游默认 $20$（\cref{pit:lp-posgain}）\\
+WBC 平方权重 & 摆腿 $100^2{:}1$ 碾压横滚恢复 & 按平方折算权重（\cref{pit:lp-square-weight}）\\
+步态时钟接触 & 台阶前脚晚着地、假设虚假 GRF $\to$ 横滚 & 用实测接触（\cref{ins:lp-clock-contact}，\cref{sec:qe-contact}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{practice}[移植一台新四足进感知框架的 checklist]
+按下列清单把一台自定义四足接入感知框架，每条标注它对应本章哪条洞见/缺陷：
+\begin{enumerate}
+  \item \textbf{继承而非重写}：确认感知接口/控制器继承盲版、原样调用基类 OCP，WBC 零改动（\cref{ins:lp-overlay}）；唯一可能需改的硬编码是小腿 link 名（自碰撞球贴在 \texttt{*\_calf} 上）。
+  \item \textbf{数据流通畅}：点云 $\to$ 自滤波 $\to$ 高程图 $\to$ 凸分割 $\to$ \texttt{SynchronizedModule} 注入逐环验通（\cref{sec:lp-dataflow}）；高程图理解成机体跟随 $2.5$D（\cref{ins:lp-elevation}）。
+  \item \textbf{逐项核对被改默认值}：尤其 \texttt{positionErrorGain}（别留 $0$，\cref{pit:lp-posgain}）、选区惩罚（别留 no-op，\cref{pit:lp-dz2}）、WBC 权重（记得平方，\cref{pit:lp-square-weight}）。
+  \item \textbf{base 参考别太硬}：明白强 base-$z$ 参考是非规范简化、是 over-launch 触发层（\cref{ins:lp-strong-baseref}）；重躯干机器人尤其警惕。
+  \item \textbf{复杂地形用实测接触}：平地可用步态时钟，台阶/抬高地形改用实测接触与 terrain-aware 估计（\cref{ins:lp-clock-contact}、\cref{pit:lp-nominal-contact}）。
+\end{enumerate}
+\end{practice}
+
+\begin{note}[失败根因指针：over-launch 与关节阻尼]\label{note:lp-failure-pointer}
+本章\emph{点名}了感知框架的几处真缺陷与触发层，但两条最值得作为“案例研究”的失败根因——\textbf{over-launch（台阶处竖直弹射翻滚）的完整证伪链}（$\ge 13$ 个假设逐个被实验证伪、“升横滚权重是反方向”的精确根因、文献对“摩擦锥下界 independent of weight tuning / 注入角动量 FUTILE”的独立交叉验证）与\textbf{关节阻尼失配致平地 trot 边缘失稳}（仿真关节阻尼是参考机型的 $200\times$、而质心动力学不建模关节摩擦 $\to$ 控制裕度被静默侵蚀）——其完整论证统一放在 \cref{ch:legged-debug}，以免在本章打断“范式 + 数据流 + 约束”的主线。本章只需建立指针：遇到 over-launch 先查 base 参考是否过硬（\cref{ins:lp-strong-baseref}）、遇到平地基础失稳先查仿真参数是否与质心模型失配。
+\end{note}
+
+\section*{本章常见误解汇总}
+
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+感知要把地形写成硬约束“脚必须落在台阶上” & 用软的松弛障碍，硬约束遇地图误差会让 OCP 不可行（\cref{ins:lp-soft-why}）\\
+高程图是一种全新的地图 & 是 \cref{ch:dense} 稠密建图的机体跟随 $2.5$D 特例（\cref{ins:lp-elevation}）\\
+加感知就得改 NMPC 动力学和 WBC & 地形只经落脚点投影 + base 参考两条途径，WBC 零改（\cref{ins:lp-where-how,ins:lp-overlay}）\\
+摆高必须 $\ge$ 台阶竖板高才不撞立面 & apex 取 $\max+$swingHeight 已够；撞立面真因是 $\mathrm{d}z^2$ + 摆腿 $z$ 开环（\cref{subsec:lp-nominal,pit:lp-dz2,pit:lp-posgain}）\\
+按三维距离选最近凸区域就对了 & $\mathrm{d}z^2$ 偏选地面区、脚上不去（\cref{pit:lp-dz2}）\\
+WBC 里 swing:base$=100{:}1$ 是略重 & 进 $\mathbf{H}=\mathbf{A}^\top\mathbf{A}$ 是 $10000{:}1$ 碾压（\cref{pit:lp-square-weight}）\\
+base 参考越精确越稳 & 强 base-$z$ 参考是非规范简化、是 over-launch 触发层（\cref{ins:lp-strong-baseref}）\\
+over-launch 就加大横滚权重压住 & 代价已惯量归一化，加权是反方向（详见 \cref{ch:legged-debug}）\\
+WBC 知道脚到底有没有踩到 & 用的是步态时钟接触而非实测，台阶处会假设虚假 GRF（\cref{ins:lp-clock-contact}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{知识点总表}
+\begin{table}[H]\centering\small
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & where/how 分离 & 选落脚点 + 求力轨迹分工，地形经两途径进入 & \(\bigstar\bigstar\) \\
+2 & 感知是叠加层 & 继承四足栈、WBC 零改、几乎机器人无关 & \(\bigstar\bigstar\) \\
+3 & 感知数据流 & 点云$\to$自滤波$\to$高程图$\to$凸分割$\to$注入 & \(\bigstar\bigstar\) \\
+4 & 高程图 & 机体跟随 $2.5$D 稠密建图特例 & \(\bigstar\bigstar\) \\
+5 & 接 P2 SLAM & 自滤波/平面分割/SDF 对号入座回 SLAM 章 & \(\bigstar\bigstar\) \\
+6 & 半空间表示 & 凸多边形逐边内法向不等式 & \(\bigstar\bigstar\bigstar\) \\
+7 & 名义落脚 + 投影 & FK $-$ 俯仰偏移；投影选凸区域 & \(\bigstar\bigstar\) \\
+8 & $\mathrm{d}z^2$ 缺陷 & 偏选地面区、闪烁、apex 饥饿、鸡生蛋 & \(\bigstar\bigstar\bigstar\) \\
+9 & \texttt{positionErrorGain=0} & 摆腿 $z$ 位置反馈被关断 & \(\bigstar\bigstar\) \\
+10 & 两条软约束 & 落脚点入凸域 + 足-地形 SDF 间隙 & \(\bigstar\bigstar\bigstar\) \\
+11 & 软约束 vs 硬约束 & 松弛障碍防不可行，代价是压不死持续驱动 & \(\bigstar\bigstar\) \\
+12 & base 参考三通道 & pitch 拟合 / z 抬升 / roll banking & \(\bigstar\bigstar\bigstar\) \\
+13 & 强 base-$z$ 非规范 & over-launch 触发层，文献倾向隐藏 base 参考 & \(\bigstar\bigstar\bigstar\) \\
+14 & 平方权重坑 & WBC 权重进 $\mathbf{H}$ 是平方 & \(\bigstar\bigstar\) \\
+15 & 时钟 vs 实测接触 & 标称代替实测，复杂地形必须实测 & \(\bigstar\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{感知 NMPC 的奠基}：Grandia 等的感知 locomotion through NMPC\cite{grandia2022perceptive}——本章感知栈的直接血缘（凸落脚约束、髋平面拟合 base 参考、无台阶专用参数），盲版四足栈是其平地子集。
+  \item \textbf{学习派对照}：Miki 等的鲁棒感知 locomotion\cite{miki2022perceptive}——把本章“模型 + 感知”的路线换成“端到端学习 + 本体感知/外感知融合”，与本书 \cref{ch:legged-biped} 之后的强化学习运控部互为另一条腿。
+  \item \textbf{优化控制综述}：动态足式机器人的优化控制\cite{wensing2024legged}——把本章的质心 NMPC + WBC 放进更大的优化控制谱系。
+  \item \textbf{符号距离场（SLAM 侧）}：增量 ESDF 的 Voxblox\cite{oleynikova2017voxblox}、连续 SDF 的 DeepSDF\cite{park2019deepsdf}、实时神经 SDF 的 iSDF\cite{ortiz2022isdf}——本章足-地形碰撞约束用的就是这同一个 SDF 对象（\cref{ins:lp-sdf}），理论见 \cref{sec:dense-tsdf}。
+  \item \textbf{安全与软/硬约束}：多层安全（CBF + MPC）\cite{grandia2021cbf}——本章“软约束防不可行”的取舍在安全控制里的对应（\cref{ins:lp-soft-why}）。
+\end{itemize}
+
+\section*{本章与相关章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+相关章节 & 关系 & 本章接口 \\
+\midrule
+\cref{ch:quad_mpc} 质心 NMPC & 提供“求力轨迹（how）”，感知在其 OCP 上叠加 & \cref{sec:lp-constraint} \\
+\cref{ch:quad_wbc} 全身控制 & 提供 WBC，感知零改、补平方权重坑 & \cref{sec:lp-wbc} \\
+\cref{ch:quad_gait} 步态与落足 & 提供 Raibert/捕获点，名义落脚是其感知扩展 & \cref{sec:lp-foothold} \\
+\cref{ch:quad_est} 足式状态估计 & 提供接触估计，时钟 vs 实测接触承接于此 & \cref{sec:lp-contact} \\
+\cref{ch:pointcloud} 点云处理 & 提供滤波/分割范式，自滤波/凸分割用之 & \cref{sec:lp-slam} \\
+\cref{ch:dense} 稠密建图 & 提供 OctoMap/TSDF，高程图/SDF 是其应用 & \cref{sec:lp-dataflow,sec:lp-slam} \\
+\cref{ch:legged-biped} 双足点足 & 把四足栈移植到欠驱点足，与本章并列升级 & \cref{ins:lp-sync,ins:lp-soft-why} \\
+\cref{ch:legged-debug} 调试方法论 & over-launch/关节阻尼/标称接触的完整证伪链 & \cref{note:lp-failure-pointer} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：机器人走到台阶前\emph{卡住、脚上不去}、试爬时横滑翻。\textbf{原因}：$\mathrm{d}z^2$ 选区偏选地面区 + 选区惩罚是 no-op（\cref{pit:lp-dz2}）。\textbf{对策}：把惩罚换成“惩罚低于脚下地形的候选区”\cref{eq:lp-dz2-fix}，保留落脚 $z\approx 0$ 让 base 先抬。
+  \item \textbf{症状}：摆动腿\emph{撞台阶立面 / 漂走却无人纠正}，落点非对称致横滚。\textbf{原因}：\texttt{positionErrorGain=0} 关断了摆腿 $z$ 位置反馈（\cref{pit:lp-posgain}）。\textbf{对策}：改回上游默认 $20$。
+  \item \textbf{症状}：给了 base 横滚恢复权重、它\emph{却像没有}。\textbf{原因}：WBC 权重进 $\mathbf{H}=\mathbf{A}^\top\mathbf{A}$ 是平方，摆腿 $100^2{:}1$ 碾压（\cref{pit:lp-square-weight}）。\textbf{对策}：按平方折算所需权重。
+  \item \textbf{症状}：地图稍有误差，OCP\emph{求解直接失败}、机器人失控。\textbf{原因}：把落脚点/碰撞写成了硬约束（\cref{ins:lp-soft-why}）。\textbf{对策}：用松弛障碍软约束。
+  \item \textbf{症状}：台阶处\emph{竖直弹射到半空再翻滚}（over-launch）。\textbf{原因}：强 base-$z$ 参考过硬、NMPC 施过度竖直力把重躯干推飞（\cref{ins:lp-strong-baseref}）。\textbf{对策}：弱化/隐藏 base 参考；切勿升横滚权重（反方向，详见 \cref{ch:legged-debug}）。
+  \item \textbf{症状}：台阶/缓坡上\emph{莫名横滚}、平地正常。\textbf{原因}：调度用步态时钟接触、前脚晚着地却被当成支撑、假设了虚假 GRF（\cref{ins:lp-clock-contact}）。\textbf{对策}：复杂地形改用实测接触（\cref{sec:qe-contact}）。
+\end{enumerate}

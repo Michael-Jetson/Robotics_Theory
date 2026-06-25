@@ -1,0 +1,863 @@
+\chapter{时空走廊构建与凸分解}
+\label{ch:st-corridor}
+
+% ════════════════════════════════════════════════════════════════
+%  时空走廊与凸分解：吸收 Tutorial「时空走廊与搜索」选材+综合。
+%  范围：时空 A*/Hybrid A* 选同伦类；SSC/IRIS/FIRI/CIRI 凸走廊；
+%  动态障碍时空建模；走廊连续性与凸包性质。
+%  承接 planning_intro（C 空间/A*/RRT*/min-snap/CHOMP/SFC 基础，重叠处 \cref 指过去）。
+%  记号：构型空间 SE(2)/SE(3)，Frenet s-l-t，代价泛函；与既有规划章一致。
+%  源 md 由 AI 写、经多轮审仍可能含错；存疑处 \pz/\rebuilt，并入 claimsToVerify。
+%  教学层遵循 v5.0 理论教学规范（动机→反面→理论→陷阱→练习 + 符号表/速查/故障排查）。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item \cref{ch:planning} 的安全飞行走廊（\cref{sec:plan-minsnap}）把“先搜索找无碰路径、再沿路径膨胀出凸自由区、最后在凸区里解 QP”讲成了四旋翼的主流架构。那它\emph{没}回答什么？（提示：障碍若会动呢？“凸自由区”究竟怎么从一片点云里长出来？）
+  \item 凸多面体可写成 $A\mathbf{x}\le\mathbf{b}$（一组半空间的交）。若一条多项式轨迹的所有“控制点”都落在某个凸多面体内，整条曲线一定也在里面吗？这个性质叫什么？
+  \item 一辆车以 $2\,\mathrm{m/s}$ 匀速横穿某路口格子。若把规划时域 $10\,\mathrm{s}$ 按 $0.1\,\mathrm{s}$ 离散，这个格子在“构型 $\times$ 时间”的搜索图里会变成多少个节点？这个数字暴露了朴素时间离散的什么毛病？
+  \item “从障碍左边绕过去”和“从右边绕过去”是两条本质不同的路径。一个连续优化器（QP/NLP）能在迭代中自动从“左绕”跳到“右绕”吗？为什么？
+  \item \cref{ch:planning} 把避障约束写成“每个 $s_i$ 处横向 $l$ 落在固定左右边界之间”的 box。若障碍是动态的、边界随时间变，这套 box 约束还够用吗？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}时空规划与“路径--速度解耦”规划的分界：什么场景下“先定路径、再排速度”会失真，必须把时间 $t$ 升格为独立的搜索/优化维度；
+  \item \textbf{陈述}时空格搜索（spatiotemporal state lattice）与时空 Hybrid A$^*$ 的框架，证明“时间单调 $\Rightarrow$ 有向无环图（DAG）”，并解释它如何\emph{自动}选定同伦类；
+  \item \textbf{定义}同伦类（homotopy class），论证“跨同伦类是离散决策、类内精修是连续优化”这一全章主线；
+  \item \textbf{建立}动态障碍的时空占据模型（时空柱、$(s,l,t)$ 占据体），并说明静态障碍是其“竖直柱”退化；
+  \item \textbf{推导} Bézier/B 样条的\emph{凸包性质}，并据此把“轨迹避障”这一非凸约束线性化为“控制点落在凸 cube 内”的 $A\mathbf{c}_i\le\mathbf{b}$；
+  \item \textbf{组装}时空语义走廊（SSC）的 QP：代价（jerk/snap）二次、约束（安全 + 连续性 + 边界）全线性，并理解软约束兜底；
+  \item \textbf{推导} IRIS 的两步交替（分离超平面 + 最大内切椭球 SDP），说明“最大内切椭球”为何是半定规划、为何只保证局部最优；
+  \item \textbf{比较} IRIS / FIRI / CIRI 三代凸分解在质量、效率、可控性、构型空间处理上的取舍，理解 SFC 如何把单块凸域沿骨架串成走廊；
+  \item \textbf{界定}走廊的连续性（相邻 cube 必须有正体积重叠）与凸性（每块凸、整段轨迹凸包受控）两条性质，及其失效后果；
+  \item \textbf{设计}“搜索定同伦 + 走廊精修”的两段式时空规划管线，并把它接回 \cref{ch:planning} 的搜索/采样/优化三范式。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把动态环境里的连续避障，拆成‘离散选同伦类 + 连续凸优化’两段}”的主线。两条支线（搜索给离散最优、走廊给连续凸域）先分流、再合流：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=5mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  opt/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (motiv) {时间升维\\ $(s,l)\!\to\!(s,l,t)$};
+\node[grp, right=of motiv] (search) {时空搜索\\ lattice / Hybrid A$^*$};
+\node[grp, below=7mm of search] (homo) {同伦类\\（离散决策）};
+\node[opt, right=of search] (ssc) {SSC 走廊\\ Bézier 凸包 $\to$ QP};
+\node[opt, below=7mm of ssc] (iris) {凸分解\\ IRIS/FIRI/CIRI/SFC};
+\node[blk, below=7mm of homo, fill=third!8, draw=third!60!black] (combine) {两段式组合\\ 搜索定同伦 + 走廊精修};
+\node[blk, right=of iris, fill=main!6, draw=main!60!black] (dyn) {动态障碍\\ 时空柱建模};
+\draw[ln] (motiv)--(search); \draw[ln] (search)--(homo);
+\draw[ln] (search)--(ssc); \draw[ln] (ssc)--(iris);
+\draw[ln] (iris)--(dyn);
+\draw[ln] (homo)--(combine); \draw[ln] (iris.south) |- (combine.east);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:stc-spatiotemporal} 是动机与分界（时间为何要升维），任何读者都应先读；\cref{sec:stc-lattice}（时空格 / Hybrid A$^*$ / 同伦类）是\emph{搜索支线}，给出“选哪个同伦类”的离散决策；\cref{sec:stc-dynobs}（动态障碍时空建模）是两条支线共用的地基；\cref{sec:stc-ssc}（SSC + Bézier 凸包）是\emph{走廊支线}的核心，把避障线性化成 QP；\cref{sec:stc-iris}（IRIS/FIRI/CIRI/SFC）回答“凸 cube 从哪来”；\cref{sec:stc-continuity}（连续性与凸性）把走廊的两条结构性质讲透；\cref{sec:stc-combine}（互补与组合）合流。带“选读”标记的 FIRI/CIRI 推导、复杂度对照为进阶。
+
+\subsection*{前置知识桥接}
+本章直接踩在 \cref{ch:planning}（运动规划导论）的肩上，下列已在那里讲透，本章\emph{不再重复}，仅在用到处 \cref 指过去：
+\begin{itemize}
+  \item \textbf{构型空间} $\mathcal{C}$、自由空间 $\mathcal{C}_{free}$、$\SE(2)/\SE(3)$ 拓扑（\cref{sec:plan-cspace}）——本章的时空走廊就在 $\mathcal{C}_{free}\times[0,T]$（典型地 $(s,l,t)$）里生长；
+  \item \textbf{图搜索与 A$^*$}：通用前向框架、可采纳/一致启发、出队即最优（\cref{sec:plan-search,sec:plan-astar}）——时空搜索是它在“加一维时间”后的特例；
+  \item \textbf{Hybrid A$^*$ 与运动基元/状态格}（\cref{sec:plan-lattice}）——本章的时空格只是给它“长出时间轴”；
+  \item \textbf{同伦类与多连通性}（\cref{sec:plan-topology}）——本章把它从拓扑概念落到“抢/跟、左绕/右绕”的规划决策；
+  \item \textbf{minimum-snap 多项式轨迹 QP 与安全飞行走廊}（\cref{sec:plan-minsnap}）——本章是它的\emph{时空推广}：把静态走廊扩成时变 cube、把多项式换成 Bézier、补上“凸 cube 从哪来”；
+  \item \textbf{CHOMP / 轨迹优化的一般泛函}（\cref{sec:plan-traj,sec:plan-chomp}）——走廊 QP 与之同属优化式范式，分工见本章末。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 在做动态场景（自驾绕行、无人机穿越动态障碍）时，你会沿用 \cref{ch:planning} 的静态走廊 + min-snap，却\emph{无法表达}“同一位置此刻被占、待会儿空出”，只能把动障当“永久静态”（过度保守、常判无解）或干脆忽略（撞上）；
+  \item 你会调用 \verb#DecompROS#、\verb#EGO-Planner# 等库吐出的凸走廊，却\emph{不理解}它是 IRIS 一个椭球一个椭球“吹”出来的、为什么走廊形状决定优化的保守性、为什么相邻 cube 必须重叠——只能照抄而不会调试与选型。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\label{tab:stc-reading}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导与算例） & 4--6 小时 & 首次系统学习、要实现时空走廊/QP \\
+速读（跳过 FIRI/CIRI 与 SDP 细节） & 1.5 小时 & 有规划/凸优化基础、想建立时空规划全景 \\
+速查（只看小结的符号表 + 定理速查表） & 15 分钟 & 写代码时回来查走廊约束/凸包性质 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+沿用 \cref{ch:planning} 的规划记号：构型空间 $\mathcal{C}$、自由空间 $\mathcal{C}_{free}$（平面刚体 $\mathcal{C}=\SE(2)$，空间刚体 $\mathcal{C}=\SE(3)$，见 \cref{sec:plan-cspace}）。本章常用 Frenet 坐标 $(s,l)$（$s$ 纵向弧长、$l$ 横向偏移，取左正右负），并把\textbf{时间 $t$ 升为一等公民}——它不再藏在速度里，而是搜索/优化的独立维度。时空状态典型记 $(s,l,t)$ 或 $(x,y,\theta,v,t)$。凸多面体（cube）记 $C_k=\{\mathbf{x}:A_k\mathbf{x}\le\mathbf{b}_k\}$；Bézier 控制点 $\mathbf{c}_i$，其 $r$ 阶导控制点 $\mathbf{c}_i^{(r)}$。IRIS 椭球 $\mathcal{E}=\{C\mathbf{u}+\mathbf{d}:\|\mathbf{u}\|\le1\}$（形状矩阵 $C\succ0$、中心 $\mathbf{d}$）。
+\textbf{字母隔离}：本章 $C_k$ 指第 $k$ 个 cube、$C$（无下标）指椭球形状矩阵、$c(\cdot)$ 指代价，均与 SLAM 章 Barfoot 的旋转别名无关（本书旋转一律 $\mathbf{R}$，见 \cref{ch:lie}）；$\mathcal{E}$ 在本章指椭球，与 \cref{ch:lie} 的单位元 $\mathcal{E}$ 局部区分。所有“凸优化/QP/SDP”术语与 \cref{ch:nlopt} 一致。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么时间要升维：从解耦到时空联合}
+\label{sec:stc-spatiotemporal}
+
+\paragraph{动机：当“走哪”与“何时”纠缠在一起。}
+\cref{ch:planning} 的轨迹优化（min-snap、CHOMP）默认环境静态：先搜一条无碰几何路径，再把它平滑成轨迹。自驾里更常见的是\emph{路径--速度解耦}范式\cite{ding2019ssc}：先在 Frenet 的 $(s,l)$ 平面上定一条路径，再在 ST 图（横轴时间 $t$、纵轴纵向进度 $s$）上排速度。这套范式有一个写死的前提——\textbf{路径与速度弱耦合，且“走哪条路”基本由参考线与静态障碍定下}。一旦二者强耦合，解耦就失真。
+
+最朴素的反例：你要并入一条有车流的主路，前方一辆车正以某速度行驶。要不要\emph{加速抢}到它前面、还是\emph{减速跟}到它后面？这个\textbf{横向决策}（往哪个 gap 钻）和\textbf{纵向决策}（加速还是减速）是死死绑在一起的——抢前面就得加速、且路径要早早往左切；跟后面就得减速、路径可以晚点切。解耦管线会先在 $(s,l)$ 上定一条路径（此时还不知该抢该跟），再在 ST 图上排速度，等于把一个本应联合的决策硬掰成两步，很容易定出“路径假设抢、速度却跟不上”的拧巴解。
+
+\paragraph{反面：纯空间搜索在动态场景必然失灵。}
+退一步，若只用\emph{纯空间}的 Hybrid A$^*$（状态 $(x,y,\theta)$，\cref{sec:plan-lattice}），它在静态地图上工作得很好，却有一个致命盲区：\textbf{它不知道“何时”经过某处}。于是一个移动障碍，它要么当成“永远占据”（过度保守——明明等一秒就能过，却绕一大圈甚至判无解），要么当成“不存在”（直接撞上）。纯空间搜索在动态场景里无论怎么调都不对，因为它的状态空间里压根没有“时机”这一维。把时间 $t$ 放进状态后，“等一秒再过”和“现在抢过”才第一次成为图里两个\emph{不同}的状态转移，避动态障碍才变得可表达。
+
+\paragraph{核心思想：升维 + 两段分工。}
+时空规划的思路直接得多：别分两步，把状态扩成包含时间的 $(s,l,t)$ 或 $(x,y,\theta,v,t)$，在这个空间里一次性决定“走哪、何时到”。但连续的时空避障仍是非凸难题，于是全章贯穿一条主线——
+\begin{insight}
+\textbf{时空规划 = 离散选同伦类（搜索）+ 类内连续精修（凸优化）。}\;
+“选哪条路绕”（抢/跟、左绕/右绕）是\emph{离散、组合}的决策，只能靠搜索/枚举来定；“在选定的路里求最优平滑轨迹”才是连续凸优化的活。本章前半（\cref{sec:stc-lattice}）讲前者，后半（\cref{sec:stc-ssc,sec:stc-iris}）讲后者，末尾（\cref{sec:stc-combine}）把二者焊成两段式管线。这恰是 \cref{ch:planning} “全局搜索/采样定粗解 + 局部优化精修”级联流水线（\cref{sec:plan-traj}）在\emph{动态高维时空}里的升级版。
+\end{insight}
+
+\paragraph{历史脉络。}
+把时间塞进搜索状态的奠基之作是 Ziegler 与 Stiller 在 IROS 2009 的时空状态格\cite{ziegler2009spatiotemporal}；两年后 McNaughton 等人在 ICRA 2011 把它推上 GPU、用贴参考线的 conformal 状态格并行评估上万条候选\cite{mcnaughton2011lattice}。走廊一侧，安全飞行走廊（SFC）由 Liu 等 RA-L 2017 提出\cite{liu2017corridor}（已在 \cref{sec:plan-minsnap} 引入），其单块凸域的几何内核可追到 Deits 与 Tedrake 的 IRIS（WAFR 2014）\cite{deits2015iris}；时空语义走廊（SSC）由 Ding 等 RA-L 2019 提出\cite{ding2019ssc}，把语义规则编码进 $(s,l,t)$ 的 cube。近年 Wang 等的 FIRI（T-RO 2025）\cite{wang2025firi} 与 hku-mars 的 SUPER 系统中的 CIRI\cite{ren2025super} 把凸分解推到了更快、更可控、且能处理构型空间。
+
+% ════════════════════════════════════════════════════════════════
+\section{时空搜索：格、Hybrid \texorpdfstring{A$^*$}{A*} 与同伦类选择}
+\label{sec:stc-lattice}
+
+\paragraph{动机：搜索的职责是“定对大方向”。}
+本节解决“走哪条路绕”——它是后半段走廊优化的前提。要点不在于搜出多精细的轨迹（那是走廊 QP 的事），而在于\emph{选对同伦类}：是从障碍左绕还是右绕、是抢在动障前还是跟在其后。这是一个粗粒度的离散决策，搜索恰好擅长。
+
+\subsection{时空状态格与 DAG 结构}
+\label{sec:stc-dag}
+
+时空格的状态是离散化的构型加时间：道路场景常用 $(s,l,v,t)$（贴参考线、维度可控），开阔/越野用 $(x,y,\theta,v,t)$。状态之间不是随便连边，而是由一组预先设计的\textbf{运动基元} $\mathcal{P}$ 连接——每个基元是一段满足车辆运动学（非完整约束、曲率/加速度上限）、固定时长 $\Delta t$ 的轨迹片段（如“保持车道匀速 $\Delta t$”“向左偏移半车道并加速”）。从一个状态出发应用每个适用基元，得到若干后继。基元本身保证边对应的轨迹动力学可行，这是格搜索相对自由图搜索的最大好处：搜出来的路径天生可执行，不像普通 A$^*$ 还要事后平滑（关于基元库的设计——控制空间采样 vs 状态空间采样的边值问题，见 \cref{sec:plan-lattice}）。
+
+\begin{theorem}[时空格是有向无环图]\label{thm:stc-dag}
+设时空格每条边使时间严格前进至少 $\Delta t>0$。则状态转移图\emph{无环}（有向无环图，DAG）：不存在从任一状态回到时间更早状态的有向路径。从而最短路可按时间层拓扑排序、一次线性扫描 $O(|E|)$ 算完；即便用 A$^*$，一个状态被弹出闭集后也\emph{不会}再被更短路径重新打开。
+\end{theorem}
+\begin{proof}
+设存在有向环 $\mathbf{x}_0\to\mathbf{x}_1\to\cdots\to\mathbf{x}_m=\mathbf{x}_0$。记状态 $\mathbf{x}_i$ 的时间分量为 $t(\mathbf{x}_i)$。每条边使时间前进至少 $\Delta t>0$，故 $t(\mathbf{x}_{i+1})\ge t(\mathbf{x}_i)+\Delta t$，沿环累加得 $t(\mathbf{x}_0)=t(\mathbf{x}_m)\ge t(\mathbf{x}_0)+m\Delta t>t(\mathbf{x}_0)$，矛盾。故无环。无环图可拓扑排序，按时间层 $t=0,\Delta t,2\Delta t,\dots$ 递推 Bellman 最优 cost-to-come（\cref{thm:plan-bellman}），每条边恰松弛一次。对 A$^*$：闭集状态 $\mathbf{x}$ 的任何后继时间都严格大于 $t(\mathbf{x})$，不存在“绕回”给出更短路的路径，故出队即定。
+\end{proof}
+
+\begin{note}
+\textbf{与 ST 图 DP 的对照（\cref{sec:plan-search} 的动态规划）.}\;
+\cref{ch:planning} 的 Bellman 递推（\cref{eq:plan-bellman}）能逐阶递推，本质也是“阶段单调”带来的 DAG 结构。ST 图 DP 把它用在一维 $s$ 上（时间分层、纵向进度递推）；时空格只是把这个结构从一维 $s$ 扩到二维构型 $(s,l)$。所以二者不是两套互不相干的算法，而是\emph{同一时间单调结构}在不同维数上的实例。
+\end{note}
+
+\paragraph{代价设计。}
+一条边 $e$（对应一段运动基元轨迹）的代价通常是几段加权和：平滑度（jerk 平方积分）、偏离参考线/期望速度的惩罚、交通规则代价：
+\begin{equation}
+  c(e)=w_j\!\int_e\! j^2\,\mathrm{d}t \;+\; w_{\mathrm{ref}}\,\|l\|^2 \;+\; w_v\,(v-v_{\mathrm{des}})^2 \;+\; w_{\mathrm{rule}}\,c_{\mathrm{rule}},
+  \label{eq:stc-edge-cost}
+\end{equation}
+其中 $w_\bullet$ 为权重，$j$ 是 jerk、$v_{\mathrm{des}}$ 是期望速度、$c_{\mathrm{rule}}$ 打包压线/超速等规则惩罚\cite{ziegler2009spatiotemporal}。搜索最小化整条路径的边代价之和——这与 \cref{ch:planning} 轨迹优化的代价（\cref{eq:plan-trajopt}）同属一套设计哲学（平滑 + 贴参考 + 守规则），只是这里离散地摊在每条边上、由搜索而非 QP 求和最小化。\textbf{碰撞不用代价软惩罚，而用硬禁用}——扫到动态障碍占据的时空节点直接剔除（边代价记 $+\infty$）。
+
+\paragraph{时空格与 Hybrid A$^*$ 的关系。}
+这是初学最容易犯迷糊的地方。Hybrid A$^*$（\cref{sec:plan-lattice}）状态是 $(x,y,\theta)$、用车辆运动学扩展后继——和时空格的“运动基元扩展”很像，区别就一条：\textbf{Hybrid A$^*$ 的状态里没有时间}。它解决“静态环境里找一条运动学可行的几何路径”，至于何时到达路径上某点，它不关心、也无法表达。时空格把 $t$（常常还有 $v$）放进状态，于是能回答 Hybrid A$^*$ 回答不了的“何时经过这里”。
+\begin{insight}
+\textbf{Hybrid A$^*$ 是时空格“抽掉时间维”的特例；时空格是 Hybrid A$^*$“长出时间轴”的推广。}\;
+纯静态泊车场景二者几乎等价（没有动障，时间维无用）；一旦有动态障碍，Hybrid A$^*$ 就回到“纯空间搜索”的困境，必须升级成时空格。这也解释了为何很多自驾栈泊车用 Hybrid A$^*$、动态道路场景却换时空格或时空走廊——不是两套算法，而是同一搜索思想在“要不要管时间”上的两档配置。
+\end{insight}
+
+\subsection{同伦类：搜索为何能“自动选边”}
+\label{sec:stc-homotopy}
+
+\paragraph{什么是同伦类。}
+\cref{sec:plan-topology} 已给出同伦的拓扑定义（两路径端点固定、可在空间内连续形变而不过洞，则同伦）。落到规划：
+\begin{definition}[规划中的同伦类]\label{def:stc-homotopy}
+两条无碰撞轨迹属于\textbf{同一同伦类}，当且仅当其中一条能在\emph{不穿过任何（时空）障碍}的前提下连续形变成另一条。若把一条变成另一条\emph{必然要跨过某障碍}，则二者属于\textbf{不同同伦类}。
+\end{definition}
+\noindent 拿绕障说最清楚：从障碍\emph{左}边绕过去的所有轨迹彼此可连续微调、互相变形（同一类）；从\emph{右}边绕的也是一类；但“左绕”想变“右绕”，中途一定要穿过障碍本身——两类之间隔着障碍，连续形变跨不过去。时空里同理：动障在某时段卡住一段 $(s,l)$，“跟在后面”（绕过时空障碍下方）与“抢在前面”（绕过上方）就是两个同伦类，中间被禁用的节点正是隔开它们的“墙”。
+
+\paragraph{为什么这个概念对规划这么关键。}
+因为它精确刻画了“连续优化的能与不能”。连续优化（QP/NLP，走廊支线的后端）本质是连续微调——它能在\emph{一个同伦类内部}把轨迹优化到最好，却\emph{永远跨不到}另一个同伦类，因为跨越需要穿过障碍，而优化器被约束着不许碰障碍。这就解释了全章那个反复出现的分工：\textbf{选哪个同伦类靠搜索，类内求最优靠优化}。也正因如此，同伦类数量往往不多（绕一个障碍 $2$ 类、绕两个至多 $4$ 类\dots），离散搜索只需在这少数几类里挑，不必担心组合爆炸——这是两段式范式高效的根本原因之一。
+
+\begin{example}[最小时空格：搜索自动劈出“抢/跟”两支]\label{ex:stc-lattice}
+在 $(s,t)$ 平面建一个极简时空格（先忽略横向 $l$，只看纵向进度，便于与 ST 图对照）。设 $\Delta t=1\,\mathrm{s}$，规划三步到 $t=3$；每步三个基元——\emph{减速}（前进 $4\,\mathrm{m}$）、\emph{匀速}（前进 $6\,\mathrm{m}$）、\emph{加速}（前进 $8\,\mathrm{m}$）。自车从 $s_0=0$ 出发。一个动态障碍在 $t=2$ 占据 $s\in[10,14]$（一辆车切到前面的瞬间）。逐层展开这张 DAG：
+\begin{center}
+\begin{tikzpicture}[>=Stealth, font=\footnotesize, node distance=6mm,
+  st/.style={draw, circle, inner sep=1pt, minimum size=5mm, fill=main!8},
+  bad/.style={draw, circle, inner sep=1pt, minimum size=5mm, fill=red!18, draw=red!60!black},
+  ed/.style={->, gray!55!black}]
+\node[st] (t0) at (0,0) {$0$};
+\node[st] (a4) at (2.6,1.0) {$4$};
+\node[st] (a6) at (2.6,0.0) {$6$};
+\node[st] (a8) at (2.6,-1.0) {$8$};
+\node[st] (b8) at (5.2,1.6) {$8$};
+\node[bad] (b10) at (5.2,0.8) {$10$};
+\node[bad] (b12) at (5.2,0.0) {$12$};
+\node[bad] (b14) at (5.2,-0.8) {$14$};
+\node[st] (b16) at (5.2,-1.6) {$16$};
+\node[st] (c) at (7.8,1.6) {$12{\sim}16$};
+\node[st] (cc) at (7.8,-1.6) {$20{\sim}24$};
+\draw[ed] (t0)--(a4); \draw[ed] (t0)--(a6); \draw[ed] (t0)--(a8);
+\draw[ed] (a4)--(b8); \draw[ed,red!55!black] (a4)--(b10);
+\draw[ed,red!55!black] (a6)--(b12); \draw[ed,red!55!black] (a8)--(b14);
+\draw[ed] (a8)--(b16);
+\draw[ed] (b8)--(c); \draw[ed] (b16)--(cc);
+\node[font=\scriptsize] at (0,-1.8) {$t{=}0$};
+\node[font=\scriptsize] at (2.6,-1.8) {$t{=}1$};
+\node[font=\scriptsize] at (5.2,-2.4) {$t{=}2$（红=障碍禁用 $s\in[10,14]$）};
+\node[font=\scriptsize] at (7.8,-2.4) {$t{=}3$};
+\end{tikzpicture}
+\end{center}
+障碍在 $t=2$ 卡掉中间一截 $s$，这张 DAG 在 $t=2$ 被劈成两支——要么\emph{减速到 $s=8$ 以下}（跟在障碍后面），要么\emph{加速冲到 $s=16$ 以上}（抢在障碍前面）。这正是“抢”与“跟”两个同伦类，且它们是搜索\emph{自己}从禁用节点中长出来的，不是谁事先指定的。最后比较两支到 $t=3$ 的累积代价（\cref{eq:stc-edge-cost}）取小者即最优时空轨迹。把禁用区间改成几乎堵死的 $s\in[6,18]$，再搜会发现“抢”那支被全部剪掉、只剩“跟”——同伦类的存在与否，直接由动障的时空占据决定。
+\end{example}
+
+\begin{codebox}[C++]{一维时空格搜索（教学最小实现，对应 \texttt{ex:stc-lattice}）}
+// 状态 (t, s); 运动基元 = 三种"这一秒前进多少米"; A* 在时间分层 DAG 上搜最优
+#include <vector>
+#include <queue>
+#include <cstdio>
+
+const std::vector<double> PRIMS = {4.0, 6.0, 8.0};  // 减速/匀速/加速: 前进米数
+const double V_REF = 6.0;                            // 参考速度(算代价)
+const int    T_MAX = 3;                              // 规划到 t=3
+
+// 障碍: t=2 时禁用 s in [10,14]
+bool Blocked(int t, double s) {
+  return t == 2 && s >= 10.0 - 1e-9 && s <= 14.0 + 1e-9;
+}
+
+struct PQItem {
+  double f, g;                 // f = g + h (此处 h=0, 退化为 Dijkstra); g = 累计代价
+  int t; double s, last_v;     // 时空状态 + 上一步速度(算 jerk 代价)
+  std::vector<double> hist;    // 走过的基元序列(回溯轨迹)
+};
+struct Cmp { bool operator()(const PQItem& a, const PQItem& b) const { return a.f > b.f; } };
+
+int main() {
+  std::priority_queue<PQItem, std::vector<PQItem>, Cmp> open;
+  open.push({0.0, 0.0, 0, 0.0, V_REF, {}});
+  while (!open.empty()) {
+    PQItem cur = open.top(); open.pop();
+    if (cur.t == T_MAX) {                            // DAG 时间单调: 先弹出终层即最优
+      double s = 0; std::printf("best traj  s: 0");
+      for (double dv : cur.hist) { s += dv; std::printf("->%.0f", s); }
+      std::printf("   cost=%.1f\n", cur.g);
+      return 0;
+    }
+    for (double dv : PRIMS) {
+      double ns = cur.s + dv; int nt = cur.t + 1;
+      if (Blocked(nt, ns)) continue;                 // 扫到障碍占用 -> 禁用这条边
+      double cost = (dv - cur.last_v) * (dv - cur.last_v);  // 速度突变平方 ~ jerk 代价
+      auto nh = cur.hist; nh.push_back(dv);
+      open.push({cur.g + cost, cur.g + cost, nt, ns, dv, nh});
+    }
+  }
+  std::printf("no feasible spatiotemporal path\n");
+  return 0;
+}
+// 输出: best traj  s: 0->4->8->12   cost=4.0  -- 在"抢"与"跟"两支里挑了代价更小的"跟"
+\end{codebox}
+
+\begin{pitfall}[编程陷阱：碰撞检查只查基元末点，漏掉中途碰撞]
+为省事，碰撞检查只验运动基元的\emph{末状态}是否被占、不查 $\Delta t$ 这段中间过程。后果：规划出的轨迹在仿真里“穿模”——明明端点都没碰，车却在两个时间层之间一头扎过障碍；$\Delta t$ 越大、车速越快，漏检越严重。根因：一段 $\Delta t$ 的轨迹连续、障碍也在连续移动，碰撞可能发生在区间内部而非端点。对策：沿基元轨迹按足够细的步长（或用连续碰撞检测 CCD）采样检查，$\Delta t$ 偏大时尤其加密。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：以为搜索分辨率越细越好]
+默认把 $\Delta t$、$\Delta s$、基元数取得越细密，解就越优越安全。后果：状态数随各维分辨率\emph{连乘}暴涨，实时性崩溃；过粗又错过窄缝、漏碰撞。根因：格搜索的解质量与计算量被离散分辨率同时绑定，这是离散方法的固有张力——不是参数没调好，而是离散表示本身的代价。对策：把搜索分辨率当“够用即可”的取舍（道路场景用 conformal 贴参考线压低维度\cite{mcnaughton2011lattice}、必要时 GPU 并行扛候选数）。要真正摆脱分辨率枷锁，得转向连续优化——正是本章走廊支线（\cref{sec:stc-ssc} 起）。\textbf{这也正是搜索只负责“选同伦类”、把精细轨迹交给走廊 QP 的工程理由}：搜索定对粗粒度决策即可，对分辨率不敏感。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 把 \cref{ex:stc-lattice} 写成代码（或直接跑上面的最小实现），打印“抢”与“跟”两支各自的累积代价；再把障碍占用区间改成 $[6,18]$，确认“抢”这一支是否还存在。
+  \item 证明 \cref{thm:stc-dag}：若每条边使时间严格前进至少 $\Delta t>0$，则时空格无环；再说明无环性如何保证 A$^*$ 中一个状态弹出闭集后不被更短路重新打开。
+  \item （对比）纯空间 Hybrid A$^*$（$(x,y,\theta)$）与时空格（加 $v,t$）在“绕一个静止障碍”时表现几乎一样、在“避一辆横穿的车”时却天差地别。各画一张示意图说明差异来源。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{动态障碍的时空建模}
+\label{sec:stc-dynobs}
+
+\paragraph{动机：把会动的障碍变成不会动的几何体。}
+搜索支线靠“禁用时空节点”避动障，走廊支线靠“cube 绕开占据体”避动障——两者都需要一个统一的动态障碍表示。关键观察：\textbf{一旦把时间 $t$ 升为坐标轴，动态障碍就“凝固”成一个静态几何体}。
+
+\begin{definition}[时空占据体与时空柱]\label{def:stc-stcolumn}
+给定动态障碍的预测轨迹（一串 $(\mathbf{p}_o(t))$，$\mathbf{p}_o(t)\in\mathcal{C}$ 为 $t$ 时刻其占据的空间区域），它在时空 $\mathcal{C}\times[0,T]$ 中的\textbf{时空占据体}为
+\begin{equation}
+  \mathcal{O}_{\mathrm{st}}=\big\{(\mathbf{x},t)\in\mathcal{C}\times[0,T]\ \big|\ \mathbf{x}\in\mathbf{p}_o(t)\big\}.
+  \label{eq:stc-occ}
+\end{equation}
+在 $(s,l,t)$ 三维里，匀速直线运动的障碍其 $\mathcal{O}_{\mathrm{st}}$ 是一根随 $t$ \emph{倾斜}的“时空柱”（slope $=$ 障碍速度）；\textbf{静态障碍是其退化}——它在所有时刻占同一空间，对应一根\emph{竖直}的时空柱（不随 $t$ 倾斜）。
+\end{definition}
+
+\begin{insight}
+\textbf{静态与动态障碍\emph{不必}分两套机制处理——这是时空表示的优雅之处。}\;
+静态障碍只是“斜率为零的动态障碍”：竖直时空柱。无论搜索（禁用其占据的时空节点）还是走廊（cube 膨胀时绕开柱子），处理逻辑完全一致，只是柱子形状不同（竖直 vs 倾斜）。所以工程上常把静态、动态障碍统一投影成时空占据 $\mathcal{O}_{\mathrm{st}}$，再交给同一套搜索/走廊处理。
+\end{insight}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\footnotesize, scale=0.95,
+  ax/.style={->, thick}, fillst/.style={fill=red!14, draw=red!55!black},
+  filldy/.style={fill=second!18, draw=second!60!black}]
+% axes: s (right), t (up), l into page (drawn as skew)
+\draw[ax] (0,0)--(6.2,0) node[right]{$s$};
+\draw[ax] (0,0)--(0,3.6) node[above]{$t$};
+\draw[ax] (0,0)--(-1.3,-1.0) node[below left]{$l$};
+% static obstacle: vertical column in (s,t), occupies s in [1,2] all t
+\fill[fillst] (1.0,0) rectangle (2.0,3.3);
+\node[red!60!black] at (1.5,3.55) {\scriptsize 静态(竖直柱)};
+% dynamic obstacle: tilted column, occupies s in [3.0+0.5t, 4.0+0.5t]
+\fill[filldy] (3.0,0) -- (4.0,0) -- (5.6,3.3) -- (4.6,3.3) -- cycle;
+\node[second!60!black] at (5.4,3.55) {\scriptsize 动态(倾斜柱)};
+% a world-line going below the static, above-then-below the dynamic
+\draw[very thick, third] (0,0) .. controls (2.6,1.0) and (3.0,1.8) .. (6.0,3.3);
+\node[third] at (6.2,3.0) {\scriptsize 轨迹世界线};
+\end{tikzpicture}
+\caption{$(s,l,t)$ 时空里的障碍占据体（在 $(s,t)$ 截面上画）。静态障碍是竖直柱、动态障碍是倾斜柱（斜率 $=$ 其速度）；一条无碰撞轨迹的“世界线”须绕开所有柱子。绕过倾斜柱的下方 / 上方对应“跟 / 抢”两个同伦类（\cref{def:stc-homotopy}）。}
+\label{fig:stc-stcolumn}
+\end{figure}
+
+\paragraph{从占据体到约束的两种用法。}
+\begin{itemize}
+  \item \textbf{搜索支线}（\cref{sec:stc-lattice}）：把 $\mathcal{O}_{\mathrm{st}}$ 离散采样，凡落入其中的时空节点标记“禁用”——\emph{带时间戳}的禁用是关键：同一 $(s,l)$ 在 $t=2$ 被禁、在 $t=5$ 又开放（那时障碍已开过去）。这正是纯空间搜索做不到的“时机感”。
+  \item \textbf{走廊支线}（\cref{sec:stc-ssc,sec:stc-iris}）：cube 膨胀时绕开 $\mathcal{O}_{\mathrm{st}}$ 这根柱子——于是同一 $(s,l)$ 位置在障碍经过的时段被排除、其余时间可用。这从“占据体外”切出无碰撞凸 cube，是把动态避障升格成 $(s,l,t)$ 三维 cube 约束的来由。
+\end{itemize}
+
+\begin{pitfall}[概念陷阱：把动态障碍的预测当成确定真值]
+时空占据体 $\mathcal{O}_{\mathrm{st}}$ 是\emph{按预测}的障碍轨迹切的；预测不准，走廊/搜索就按错误的柱子避障。本章默认预测给定，但工程上必须补：(1) 给 $\mathcal{O}_{\mathrm{st}}$ 加不确定性裕度（柱子切粗一圈）；(2) 高频重规划（滚动时域，每周期用最新预测重切重解）吸收误差；(3) 把预测不确定性显式建模成机会约束/风险敏感优化——这就进入不确定性规划的范畴了，本章不展开。\pz{源 md 列举的对策合理，但“机会约束”归属的后续 Part 在本书章节编号未定，此处不写死 \cref，待全书目录稳定后补桥接。}
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 一辆车在 $t\in[2,4]$ 横穿格子 $p$，其余时刻该格安全。写出 $p$ 处的“不安全时间区间”与“安全时间区间”，并解释为什么在 $(s,t)$ 截面上这对应一块矩形“阻挡块”。
+  \item 论证 \cref{def:stc-stcolumn}：静态障碍是动态障碍“速度为零”的退化，画出其在 $(s,t)$ 截面的形状。
+  \item 给定两个动态障碍先后经过同一格子，画出该格的时空占据并说明它把该格的安全时间切成几段。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{时空语义走廊 SSC：凸包性质把避障线性化}
+\label{sec:stc-ssc}
+
+\paragraph{动机：从离散粗解到连续优化，凸性是关键。}
+设你已用搜索（\cref{sec:stc-lattice}）拿到一条粗解：“先在这等等、再往左切、最后加速”。它是离散、棱角分明的，不能直接给底盘执行。你想用 QP 精修成平滑轨迹——可这里有拦路虎：\textbf{避障约束是非凸的}。“待在障碍之外”这个集合（自由空间）通常非凸，塞进 QP，OSQP 这类凸求解器要么不收敛、要么停在糟糕的局部解（\cref{ch:nlopt} 强调过凸性是 QP 毫秒级求解的前提）。
+
+SSC 的破局思路：\textbf{自由空间整体非凸，但可以切成一块块凸的}。把 $(s,l,t)$ 里的无碰撞区域分解成一串凸立方体（cube），轨迹被约束“依次穿过这些 cube”。每个 cube 内部凸，“在 cube 里”是线性约束，于是非凸的避障被切成凸的子问题——这正是 \cref{sec:plan-minsnap} 安全飞行走廊那句“走廊重获凸性”在\emph{三维时空}里的兑现。走廊（corridor）这名字很形象：它是自由空间里一条由凸块串成、保证无碰撞的“管道”，轨迹在管道里随便优化，怎么都撞不到墙。
+
+\paragraph{反面：直接在全空间写非凸距离约束会卡死。}
+不切走廊、直接对每个障碍写“轨迹点离障碍距离 $\ge$ 安全裕度” $\|\mathbf{p}(t)-\mathbf{o}(t)\|\ge d$，这是\emph{非凸}约束（可行域是障碍外的“甜甜圈”，非凸集）。塞进优化要用非凸求解器（SQP、内点法解 NLP），慢且易陷局部最优；初值稍差就给出绕错方向甚至穿墙的解。障碍一多，非凸约束叠加，可行域支离破碎，求解器几乎必然卡住。走廊的全部意义，就是用“预先切好凸块”这步预处理，把后端从痛苦的非凸优化解放成温顺的凸 QP——把难点从在线优化挪到前端的走廊生成。
+
+\paragraph{历史：SSC 与 EPSILON。}
+SSC 由 Ding、Zhang、Chen、Shen（HKUST 沈劭劼组）RA-L 2019 提出\cite{ding2019ssc}。它的贡献不只“切凸块”——更关键是“\textbf{语义}（semantic）”二字：cube 的生成不仅看几何碰撞，还吃交通语义（交通灯、限速、让行、车道边界）。一条“红灯前必须停”的语义会反映成 $(s,l,t)$ 里一个限制 $s$ 上界的 cube；一个让行义务会让 cube 在某段时间收窄。这样，行为决策（该让该抢、能不能闯）被编码进走廊形状，运动规划只需在走廊里求最优。SSC 后被集成进 EPSILON 完整系统，与行为层 EUDM（多策略行为决策）配合——EUDM 选意图，SSC 据此生成时空走廊，运动层在走廊里解 QP。这条“行为层定走廊、运动层解 QP”的分工，是工业级自驾栈的经典范式。
+
+\subsection{Bézier 凸包性质：本节命门}
+\label{sec:stc-bezier}
+
+\paragraph{Bézier 参数化。}
+在每个 cube 内，轨迹用一段 Bézier 曲线表示。一条 $n$ 阶 Bézier 由 $n+1$ 个\textbf{控制点} $\mathbf{c}_0,\dots,\mathbf{c}_n$ 定义：
+\begin{equation}
+  \mathbf{p}(\tau)=\sum_{i=0}^{n}\underbrace{\binom{n}{i}(1-\tau)^{n-i}\tau^{i}}_{B_i^n(\tau)\ \text{(Bernstein 基)}}\,\mathbf{c}_i,\qquad \tau\in[0,1].
+  \label{eq:stc-bezier}
+\end{equation}
+
+\begin{theorem}[Bézier 凸包性质]\label{thm:stc-convexhull}
+$n$ 阶 Bézier 曲线 \cref{eq:stc-bezier} 整条落在其控制点 $\{\mathbf{c}_0,\dots,\mathbf{c}_n\}$ 的凸包内。推论：若所有控制点都落在一个凸集 $C$ 内，则整条曲线段落在 $C$ 内。
+\end{theorem}
+\begin{proof}
+Bernstein 基 $B_i^n(\tau)=\binom{n}{i}(1-\tau)^{n-i}\tau^i$ 在 $\tau\in[0,1]$ 上\emph{非负}（各因子非负），且由二项式定理对 $i$ 求和恒为 $1$：$\sum_{i=0}^n B_i^n(\tau)=\big((1-\tau)+\tau\big)^n=1$。故对每个 $\tau$，$\mathbf{p}(\tau)=\sum_i B_i^n(\tau)\,\mathbf{c}_i$ 是控制点的一个\emph{凸组合}，必落在控制点凸包内。若控制点全在凸集 $C$ 内，凸集对凸组合封闭，故 $\mathbf{p}(\tau)\in C$ 对所有 $\tau$ 成立。
+\end{proof}
+
+\begin{theorem}[凸包性质把安全约束线性化]\label{thm:stc-safety-linear}
+设 cube 为凸多面体 $C_k=\{\mathbf{x}:A_k\mathbf{x}\le\mathbf{b}_k\}$。则“第 $k$ 段 Bézier 整段落在 $C_k$ 内”的一个\emph{充分条件}是：其全部控制点满足线性不等式
+\begin{equation}
+  A_k\,\mathbf{c}_i\le\mathbf{b}_k,\qquad i=0,1,\dots,n.
+  \label{eq:stc-safety}
+\end{equation}
+（反向一般不成立——曲线整段在 $C_k$ 内时，个别控制点仍可能落在 $C_k$ 外；走廊方法取此充分方向作为约束，略保守但严格安全。）
+\end{theorem}
+\begin{proof}
+（充分性）若 $A_k\mathbf{c}_i\le\mathbf{b}_k$ 对所有 $i$ 成立，则所有控制点 $\in C_k$；$C_k$ 是凸多面体（凸集），由 \cref{thm:stc-convexhull}（曲线落在控制点凸包内）整段曲线 $\in C_k$。
+（为何反向不成立）端点 $\mathbf{c}_0=\mathbf{p}(0)$、$\mathbf{c}_n=\mathbf{p}(1)$ 确在曲线上，但中间控制点 $\mathbf{c}_i$（$0<i<n$）一般\emph{不}在曲线上——它们可以伸到曲线之外。于是存在“曲线整段在 $C_k$ 内、却有某 $\mathbf{c}_i\notin C_k$”的情形（控制多边形比曲线本身‘鼓’得更外），故充分条件并非必要。走廊方法仍取此充分方向作为约束：它略保守（排除了一些其实可行的轨迹），但换来线性约束与严格安全保证。\pz{严格的充要刻画需用 $C_k$ 的支撑函数对曲线逐方向取上确界；本书与多数走廊文献一致，只用“控制点在 $C_k$ 内 $\Rightarrow$ 整段在内”这一充分方向作为可用约束。}
+\end{proof}
+
+\noindent 至此，非凸的“曲线避开障碍”被彻底翻译成凸的、线性的“控制点满足 $A_k\mathbf{c}_i\le\mathbf{b}_k$”——这是 SSC（以及一切 Bézier/B 样条走廊方法）的命门。你不必对曲线上无穷多个点逐一检查碰撞，只需管住有限个控制点。
+
+\begin{insight}
+\textbf{凸包性质不止管位置，还管速度、加速度。}\;
+一条 $n$ 阶 Bézier 对参数求导，得到的导函数\emph{仍是 Bézier}——降一阶（$n-1$ 阶），其控制点是原控制点的\emph{线性差分}：
+\begin{equation}
+  \mathbf{c}_i^{(1)}=n\,(\mathbf{c}_{i+1}-\mathbf{c}_i),\qquad
+  \mathbf{c}_i^{(2)}=(n-1)\,(\mathbf{c}_{i+1}^{(1)}-\mathbf{c}_i^{(1)}),
+  \label{eq:stc-deriv-ctrl}
+\end{equation}
+每阶都是上一阶控制点的相邻差分。既然导函数也是 Bézier、也服从凸包性质，那么“速度落在速度盒内”“加速度落在加速度盒内”这类\emph{动力学约束}，照搬同一招——只要原控制点的\emph{线性差分}落在对应盒子里即可。于是不光“避障”是线性的，连“别开太快、别冲太猛”也是\emph{原控制点的线性不等式}；整个 QP 的约束保持全线性，凸性毫发无损。这就是走廊 QP 能同时塞进安全和动力学两类约束、还依然是标准 QP 的原因。
+\end{insight}
+
+\subsection{组装走廊 QP}
+\label{sec:stc-corridor-qp}
+
+\begin{definition}[时空走廊 QP]\label{def:stc-qp}
+给定重叠的 cube 序列 $C_1,\dots,C_m$，每段用一段 $n$ 阶 Bézier，决策变量是所有段所有控制点 $\{\mathbf{c}_i^{(k)}\}$。求解
+\begin{align}
+  \min_{\{\mathbf{c}\}}\quad & J=\sum_{k=1}^m \int_0^1 \big\|\mathbf{p}_k^{(r)}(\tau)\big\|^2\,\mathrm{d}\tau \;+\; w_{\mathrm{ref}}\sum_k\|\,\cdot\,\|^2_{\text{偏离参考}} \quad(\text{二次}) \notag\\
+  \text{s.t.}\quad & A_k\,\mathbf{c}_i^{(k)}\le\mathbf{b}_k && \text{(a) 安全：控制点在 cube 内（\cref{eq:stc-safety}）}\label{eq:stc-qp}\\
+  & \mathbf{c}_n^{(k)}=\mathbf{c}_0^{(k+1)},\ \ \mathbf{c}_i^{(k),(r)}\ \text{接缝处连续}(r=1,2) && \text{(b) 连续性：位置/速度/加速度（\cref{eq:stc-deriv-ctrl}）} \notag\\
+  & \text{起终点位置/导数固定} && \text{(c) 边界} \notag
+\end{align}
+代价二次（jerk/snap 是控制点的二次型，承接 \cref{eq:plan-minsnap-cost} 的 min-snap 思路）、约束全线性 $\Rightarrow$ \textbf{标准凸 QP}，OSQP 毫秒级求解。
+\end{definition}
+
+\noindent \cref{def:stc-qp} 与 \cref{sec:plan-minsnap} 的 min-snap QP 是同一家族，只是把“box 约束”换成“cube 半空间约束”、自变量从多项式系数 $\mathbf{p}$ 换成 Bézier 控制点 $\mathbf{c}$（Bézier 的几何意义让安全约束\emph{直接}线性化，而普通多项式系数无几何意义、无法简单转成“曲线在 cube 内”的线性约束——这是走廊方法偏爱 Bézier/B 样条的根本原因）。
+
+\begin{example}[最小走廊 QP：控制点在 cube 里]\label{ex:stc-qp}
+看 $(s,l)$ 平面（先忽略 $t$，便于画图）。自由空间切成三个矩形 cube：$C_1=[0,4]\times[-1,1]$、$C_2=[3,7]\times[0,2]$、$C_3=[6,10]\times[-1,1]$（相邻在 $s$ 方向有 $1\,\mathrm{m}$ 重叠：$C_1\cap C_2$ 在 $s\in[3,4]$，$C_2\cap C_3$ 在 $s\in[6,7]$）。这串 cube 描述“先直、中间向左凸绕过某物、再回正”的走廊。用三段三阶 Bézier（每段 $4$ 控制点）。第二段“向左凸”那段，“控制点在 $C_2=[3,7]\times[0,2]$ 内”对每个控制点 $\mathbf{c}_i^{(2)}=(s_i,l_i)$ 展开成 $4$ 条标量不等式：
+\begin{equation}
+  \underbrace{\begin{bmatrix} 1&0\\ -1&0\\ 0&1\\ 0&-1\end{bmatrix}}_{A_2}\begin{bmatrix} s_i\\ l_i\end{bmatrix}\le\underbrace{\begin{bmatrix} 7\\ -3\\ 2\\ 0\end{bmatrix}}_{\mathbf{b}_2}\quad\Longleftrightarrow\quad 3\le s_i\le 7,\ \ 0\le l_i\le 2.
+  \label{eq:stc-cube-c2}
+\end{equation}
+那条 $-l_i\le0$（即 $l_i\ge0$）把整段顶到参考线左侧——它来自 $C_2$ 的下边界 $l=0$，而 $C_2$ 下边界抬到 $0$ 是因为右半空间被障碍占了。三段合起来，决策变量 $3\times4=12$ 个控制点（$24$ 个标量），安全约束 $3\times(4\times4)=48$ 条线性不等式。连续性：第一段末控制点 $=$ 第二段首控制点 $\mathbf{c}_3^{(1)}=\mathbf{c}_0^{(2)}$（位置连续）；速度连续要求接缝处一阶导控制点相等，用 \cref{eq:stc-deriv-ctrl} 展开也是控制点的线性等式；加速度同理。QP 在这堆线性约束下最小化 jerk，解出的曲线\emph{平滑地从 $C_1$ 钻进 $C_2$ 的上凸、再落回 $C_3$}，全程不出任何 cube——因为凸包性质替我们担保了。把维度加回 $t$：每个 cube 变成 $(s,l,t)$ 立方体，第二段的“$l\ge0$”可能来自“某动障在 $t\in[2,4]$ 占了右侧”，于是 cube 在那段时间抬高 $l$ 下界——走廊形状自动编码了“何时该往左让”。
+\end{example}
+
+\begin{codebox}[C++]{凸包性质验证（教学，无外部依赖，对应 \texttt{ex:stc-qp} 的 $C_2$）}
+// 验证: 控制点都在 cube 内 ==> 曲线上每个采样点都在 cube 内 (走廊 QP 安全约束的命门)
+#include <vector>
+#include <array>
+#include <cmath>
+#include <cstdio>
+using Pt = std::array<double, 2>;                     // (s, l)
+
+Pt BezierEval(const std::vector<Pt>& ctrl, double tau) {   // n 阶 Bézier 在 tau 处求值
+  int n = (int)ctrl.size() - 1;
+  auto binom = [](int n, int i) {
+    double r = 1; for (int k = 0; k < i; ++k) r = r * (n - k) / (k + 1); return r; };
+  Pt p{0.0, 0.0};
+  for (int i = 0; i <= n; ++i) {
+    double b = binom(n, i) * std::pow(1 - tau, n - i) * std::pow(tau, i);
+    p[0] += b * ctrl[i][0]; p[1] += b * ctrl[i][1];
+  }
+  return p;
+}
+
+int main() {
+  const double s_lo = 3, s_hi = 7, l_lo = 0, l_hi = 2;     // cube C2
+  auto in_cube = [&](const Pt& p) {
+    return p[0] >= s_lo-1e-9 && p[0] <= s_hi+1e-9 && p[1] >= l_lo-1e-9 && p[1] <= l_hi+1e-9; };
+  std::vector<Pt> ctrl = {{3.2,0.1},{4.5,1.9},{6.0,1.8},{6.8,0.3}};  // 4 控制点, 全在 cube 内
+  int bad = 0;                                             // 曲线上密采样 1001 点
+  for (int j = 0; j <= 1000; ++j)
+    if (!in_cube(BezierEval(ctrl, j / 1000.0))) ++bad;
+  std::printf("ctrl all in cube; curve out-of-cube samples = %d\n", bad);
+  ctrl[1][1] = 3.5;                                        // 反证: 把一个控制点挪出 cube
+  int bad2 = 0;
+  for (int j = 0; j <= 1000; ++j)
+    if (BezierEval(ctrl, j / 1000.0)[1] > l_hi + 1e-9) ++bad2;
+  std::printf("after moving one ctrl to l=3.5: out-of-cube samples = %d\n", bad2);
+  return 0;
+}
+// 输出: ctrl all in cube; curve out-of-cube samples = 0     <- 管住控制点 = 管住整条曲线
+//       after moving one ctrl to l=3.5: out-of-cube samples = 193
+\end{codebox}
+
+\paragraph{走廊 QP 也会不可行——软约束兜底。}
+cube 序列若因走廊过窄、相邻重叠不足、或动障把某段 cube 挤太小，安全约束 + 连续性约束可能凑不出可行解，OSQP 报 infeasible、规划器哑火。对策与 \cref{ch:nlopt} 一脉相承：把最易冲突的硬约束\emph{软化}——给安全约束引入松弛 $\xi\ge0$，写成 $A_k\mathbf{c}_i\le\mathbf{b}_k+\xi$，再在代价里加大权重惩罚 $w_\xi\xi^2$。正常情况下 $\xi$ 被压到 $0$（等价原硬约束）；实在无解时 $\xi$ 取尽量小的正值，让 QP 仍吐出“轻微越界但可控”的轨迹，把“硬撞墙”换成“贴墙蹭一下”，工程上远比哑火安全。注意软化的是安全裕度这类可让步约束，\textbf{动力学硬限（如曲率上限）通常不软化}，否则解出来根本执行不了。
+
+\begin{pitfall}[编程陷阱：对曲线采样逐点加约束，而非用控制点]
+为“保险”对 Bézier 曲线采样一堆点、逐点加 cube 约束。后果：(1) 约束数暴涨（$\propto$ 采样数 $\times$ 段数），QP 变大变慢；(2) 采样点之间仍可能出界（只保证采样点在内，不保证整段）；(3) 丢掉了“管控制点即管全段”的凸包红利。根因：放着 \cref{thm:stc-convexhull} 这个免费午餐不用，退回“采样检查”。对策：安全约束\emph{只}加在有限个控制点上（\cref{eq:stc-safety}），凸包性质自动覆盖整段。判据：你信不信凸包性质？信了就只管控制点。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：把走廊当“另一种避障约束”，看不到它在重构凸性]
+把“切 cube + 控制点约束”仅理解为一种具体避障写法，没抓住它真正做的事——\textbf{把非凸优化重构成凸优化}。后果：遇到新场景（无人机、机械臂）想不到迁移这个思想，仍硬上非凸 NLP。根因：缺少“凸性可以通过空间分解人为制造”这层抽象。走廊的本质不是“一种约束”，而是“用前端的凸分解，换后端的凸可解性”。对策：把走廊记成通用范式——\emph{遇到非凸可行域，先想能不能切成凸块再优化}。这思想在 \cref{sec:stc-iris}（怎么切）、无人机 MINCO、机械臂 C-空间走廊里反复出现。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 证明 \cref{thm:stc-convexhull}：用 Bernstein 基非负且对 $i$ 求和为 $1$，说明 $\mathbf{p}(\tau)$ 是控制点凸组合；再据此论证“控制点全在凸集 $C$ 内 $\Rightarrow$ 曲线在 $C$ 内”。
+  \item 取 \cref{ex:stc-qp} 的三个矩形 cube，用三段三阶 Bézier 在 OSQP 里解最小 jerk 轨迹（约束 $=$ 控制点在对应 cube 内 + 段间位置/速度/加速度连续）。在曲线上密采样 $200$ 点，验证全部落在 $C_1\cup C_2\cup C_3$ 内；再把 $C_2$ 的 $l$ 下界从 $0$ 改到 $0.5$，观察“向左凸”幅度的变化。
+  \item 推导 \cref{eq:stc-deriv-ctrl} 的导函数控制点差分关系（对 \cref{eq:stc-bezier} 求 $\mathrm{d}/\mathrm{d}\tau$，归并 Bernstein 基），并据此把“速度 $\le v_{\max}$”写成原控制点的线性不等式。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{凸分解：IRIS、FIRI、CIRI 与 SFC 走廊串接}
+\label{sec:stc-iris}
+
+\paragraph{动机：cube 不会自己出现。}
+\cref{sec:stc-ssc} 默认你已有 cube 序列，却只字没说它们从哪来。手画？障碍一多就不现实——真实场景里障碍是激光雷达扫出的一片点云、或一张占据栅格，自由空间形状任意、还在动。必须有一个算法：\textbf{输入地图 + 一个种子点（或一条粗路径），输出一个（或一串）尽量大的、保证无碰撞的凸多面体}。这就是 IRIS/SFC 干的活，它把 \cref{sec:stc-ssc} “凸分解”那句口号变成真能跑的几何算法，也补上 \cref{sec:plan-minsnap} 安全飞行走廊里“沿路径膨胀出凸自由区”那步的内部机制。
+
+\paragraph{反面：固定网格切块的两个老毛病。}
+不自动生成，凸分解只能靠手工或固定网格切块。手工不必说，障碍一复杂就崩。固定网格（把空间均匀切成小立方体、剔除含障碍的）则有：(1) 切得粗会漏掉窄缝、或让 cube 含障碍；切得细则 cube 数量爆炸，下游 QP 段数随之膨胀。(2) 网格 cube 轴对齐、形状死板，贴不紧不规则障碍，自由空间利用率低，逼出过度保守的轨迹。IRIS 这类方法的价值，正是\textbf{让凸域自适应障碍形状、尽量大、且数量少}——把“切多少块、每块多大”从拍脑袋变成优化决定。
+
+\subsection{IRIS：椭球膨胀与超平面切割的两步交替}
+\label{sec:stc-iris-alg}
+
+\paragraph{历史。}
+IRIS（Iterative Regional Inflation by Semidefinite programming）由 Deits 与 Tedrake 在 WAFR 2014 提出\cite{deits2015iris}（论文集 \emph{Algorithmic Foundations of Robotics XI}，STAR vol.\ 107，页 109--124，2015 出版，DOI \texttt{10.1007/978-3-319-16595-0\_7}——\textbf{常被误记成 RSS 2015，实际是 2014 年 8 月伊斯坦布尔的 WAFR}，论文集次年出版）。
+
+\begin{algo}[IRIS 单凸域生成]\label{alg:stc-iris}
+给定种子点 $\mathbf{s}_0$（须无碰撞）与障碍集，初始化以 $\mathbf{s}_0$ 为心的小椭球 $\mathcal{E}$，循环两步直到收敛：
+\begin{enumerate}
+  \item \textbf{分离超平面}（QP/几何）：对每个障碍，找一个把椭球 $\mathcal{E}$ 与该障碍分开的超平面（取障碍上离椭球最近点处的切超平面）。所有这些超平面的半空间之交是一个无碰撞凸多面体 $\mathcal{P}=\{\mathbf{x}:A\mathbf{x}\le\mathbf{b}\}$（椭球在内、障碍在外）。
+  \item \textbf{最大内切椭球}（SDP）：在 $\mathcal{P}$ 内解半定规划，求体积最大的内切椭球，作为新的 $\mathcal{E}$。
+  \item \textbf{收敛判据}：新椭球体积相比上一轮增长 $<$ 阈值则停；否则回第 1 步。
+\end{enumerate}
+\end{algo}
+
+\paragraph{第 1 步的“最近点”怎么算。}
+把椭球用仿射变换“拉正”成单位球（变量代换 $\mathbf{y}=C^{-1}(\mathbf{x}-\mathbf{d})$，椭球 $\mathcal{E}$ 变成原点单位球）；在变换后的空间里，求障碍上离原点最近的点是简单最近点投影（障碍凸时更是标准凸投影）；找到最近点 $\mathbf{y}^*$ 后，过它作垂直于 $\mathbf{y}^*$ 方向的切平面，再用逆变换映回原空间，得分离超平面 $\mathbf{a}^\top\mathbf{x}\le b$。直觉：在“拉正”的空间里椭球是规整的球，“最近点 + 切平面”才有干净几何意义；变回去后球的切平面对应椭球的切平面，自然把椭球与障碍分开。对点云障碍逐点算距离取最小即可；对凸多面体障碍是一个小 QP。
+
+\begin{derivation}[为什么“最大内切椭球”是半定规划（IRIS 名字里 SDP 的由来）]\label{der:stc-mvie}
+把椭球写成仿射映射下的单位球 $\mathcal{E}=\{C\mathbf{u}+\mathbf{d}:\|\mathbf{u}\|\le1\}$，$C\succ0$（对称正定）刻画形状与朝向、$\mathbf{d}$ 是中心。椭球体积 $\propto\det C$，故“最大体积”就是最大化 $\det C$（等价地最大化 $\log\det C$，凹函数，更好优化）。“椭球被包在多面体 $\{\mathbf{x}:\mathbf{a}_j^\top\mathbf{x}\le b_j\}$ 里”，对每个半空间 $j$ 化成关于 $(C,\mathbf{d})$ 的约束：
+\begin{equation}
+  \|C\mathbf{a}_j\|_2+\mathbf{a}_j^\top\mathbf{d}\le b_j,\qquad\forall j.
+  \label{eq:stc-mvie}
+\end{equation}
+直觉：椭球沿 $\mathbf{a}_j$ 方向最远伸到“中心 $\mathbf{d}$ 加上该方向半径 $\|C\mathbf{a}_j\|$”，这个最远点不越过边界 $b_j$，椭球就被包住。于是整个问题成了“在 \cref{eq:stc-mvie} 约束下最大化 $\log\det C$、且 $C\succeq0$”——目标 $\log\det$（凹）、约束含半正定锥 $C\succeq0$，这正是\textbf{半定规划}的标准形态。关键收获不在会手解 SDP（有成熟求解器），而在看清：“找最大内切椭球”这个听起来很几何的问题，其实是有现成高效解法的凸优化——这也是 IRIS 能把“造大凸域”做到毫秒级的根本。
+\end{derivation}
+
+\begin{theorem}[IRIS 单调收敛但仅局部最优]\label{thm:stc-iris-conv}
+\cref{alg:stc-iris} 两步都是凸优化、都让椭球体积\emph{单调不减}；环境有界时迭代必收敛（椭球长不出边界、体积有上界）。但\textbf{不保证}找到全局最大凸域——结果依赖种子位置与迭代路径，只是一个局部意义上的大凸域。
+\end{theorem}
+\begin{proof}[证明要点]
+第 2 步在固定多面体 $\mathcal{P}$ 内求\emph{最大}内切椭球，故新椭球体积 $\ge$ 旧椭球（旧椭球本就在 $\mathcal{P}$ 内，是一个可行解）。体积序列单调不减且有上界（有界环境的体积上界），故收敛。两步均为局部构造（切超平面取当前椭球的最近点、椭球只在当前多面体内最大化），不同种子收敛到不同凸域——与 \cref{ch:nlopt} 的块坐标下降/EM 同病：只保证收敛到块坐标意义下的驻点，不保证全局最优。
+\end{proof}
+
+\begin{insight}
+\textbf{IRIS 是“交替优化”大家族的一员。}\;
+把一个难的联合问题，拆成若干各自好解的子块、固定其余轮流优化一块——这套路有个统一名字：交替优化（alternating optimization）/块坐标下降。家族从轻到重：最朴素的 Gauss--Seidel 式坐标下降、EM（\cref{ch:nlopt}）；IRIS 是它在“几何造凸域”上的实例（两块分别是\emph{超平面}和\emph{椭球}）；更讲究的是 ADMM（在分块之上引入对偶变量处理块间耦合）。它们共享同一组优点（每步只解一个简单子问题，快而稳）和同一个软肋（只收敛到块坐标驻点、不保证全局——IRIS 依赖种子、EM 依赖初值，都是这软肋的体现）。看清这点：以后再遇“两变量纠缠、联合优化难”，本能地想——能不能拆成两块轮流做？
+\end{insight}
+
+\subsection{FIRI 与 CIRI：更快、更可控、进构型空间}
+\label{sec:stc-firi-ciri}
+
+IRIS 用 SDP 求最大内切椭球，通用但相对慢，且不显式保证“走廊包住给定的种子集/粗路径”。两项后续工作针对性改进：
+
+\paragraph{FIRI（Fast Iterative Region Inflation，选读）。}
+Wang 等 T-RO 2025\cite{wang2025firi}（arXiv:2403.02977）把 IRIS 的两步换成两个更快、更可控的子模块，迭代执行：
+\begin{enumerate}
+  \item \textbf{Restrictive Inflation（RsI，限制性膨胀）}：在膨胀出半空间时\emph{显式纳入}“必须包含的种子点集”约束，从而\textbf{保证可控性（manageability）}——生成的凸域一定包住给定的粗路径片段（这正解决了 IRIS 不保证含种子集的痛点）；
+  \item \textbf{Maximum Volume Inscribed Ellipsoid（MVIE，最大体积内切椭球）}：求最大内切椭球。论文给出\emph{二维情形下最大面积内切椭圆的首个线性复杂度解析算法}，相比通用 SDP 求解器有数量级的速度提升。
+\end{enumerate}
+一句话：FIRI 在保持“大凸域”的同时，额外拿下\emph{可控性}（含种子集）与\emph{效率}（线性复杂度子模块），是 IRIS 的工程化升级。（FIRI 完整标题 \emph{Fast Iterative Region Inflation for Computing Large 2-D/3-D Convex Regions of Obstacle-Free Space}，T-RO 2025 卷 41 页 3223--3243、DOI \texttt{10.1109/TRO.2025.3562482}；“二维最大面积内切椭圆首个线性复杂度精确算法”系原文自述贡献，均经核实。）
+
+\paragraph{CIRI（Configuration-space Iterative Regional Inflation，选读）。}
+IRIS/FIRI 多在工作空间（点/质点）造凸域；当机器人有体积/形状（如带翼展的无人机、机械臂），需在\emph{构型空间}里避障——障碍要按机器人形状做 Minkowski 膨胀，几何更复杂。CIRI 用球建模（sphere modeling）在构型空间里生成无碰撞凸多面体，由 hku-mars 的 SUPER 系统\cite{ren2025super}（Ren 等，\emph{Science Robotics} 2025，vol.\ 10, no.\ 98, eado6187，>$20\,\mathrm{m/s}$ 夜间林间飞行、可避 $2.5\,\mathrm{mm}$ 细线）采用；据 SUPER 官方实现，CIRI 明确“在构型空间生成安全飞行走廊、构筑于 FIRI 之上”，相比 FIRI 在走廊体积与种子包含上进一步改善。\pz{CIRI 的独立论文出处仍未完全锁定——其框架（构型空间、球建模、构筑于 FIRI、Ren 等、用于 SUPER）已据 SUPER 官方资料核实，但 CIRI 这一命名最可靠地见于 SUPER 谱系；候选独立来源为 Ren 等 ICRA 2023 SE(3) 全身规划走廊工作（未能确证其正文即以“CIRI”命名）。务必区分 CIRI（SUPER 谱系、球建模构型空间）与 MIT 的 C-IRIS（rational C-space 认证, Dai/Amice/Tedrake）——二者不同工作。待 CIRI 独立论文确证后补引。}
+
+\begin{note}
+\textbf{三代凸分解一句话对照.}\;
+IRIS（SDP 求椭球，通用、慢、不保证含种子集）$\to$ FIRI（RsI 保可控、MVIE 线性复杂度，快且含种子集）$\to$ CIRI（进构型空间、按机器人形状避障）。共同骨架都是“膨胀凸域 + 求内切椭球”的交替（\cref{thm:stc-iris-conv} 的单调收敛、局部最优对三者都成立）；差别在子模块的效率、可控性与是否处理构型空间。选型：质点/工作空间够用就 IRIS/FIRI，机器人有形状/要构型空间安全才上 CIRI。
+\end{note}
+
+\subsection{SFC：把单块凸域沿骨架串成走廊}
+\label{sec:stc-sfc}
+
+\cref{alg:stc-iris} 造的是\emph{一块}凸域。安全飞行走廊（SFC，\cref{sec:plan-minsnap} 已引入\cite{liu2017corridor}）把它们沿一条骨架路径串成走廊：
+\begin{enumerate}
+  \item \textbf{骨架路径}：用快速图搜索（JPS、A$^*$，\cref{sec:plan-grid}）在栅格上找一条从起点到目标的分段线性无碰撞路径 $\langle p_0\to p_1\to\cdots\to p_n\rangle$（在时空里就是 \cref{sec:stc-lattice} 的时空搜索粗解）；
+  \item \textbf{逐段膨胀}：对每条线段找一个包住它的无碰撞椭球，膨胀成凸多面体（IRIS/FIRI/CIRI 风格）；
+  \item \textbf{重叠保证}：相邻多面体须有公共区域（骨架连接点天然落在两段交界，提供重叠种子）——这正是 \cref{sec:stc-ssc} 强调的“cube 必须重叠”在 SFC 里的来源（细究见 \cref{sec:stc-continuity}）；
+  \item \textbf{时空扩展}：把 $t$ 当第四维，多面体变 4D（$(x,y,z,t)$）或 3D（$(s,l,t)$），动态障碍按其时空占据 $\mathcal{O}_{\mathrm{st}}$（\cref{def:stc-stcolumn}）切掉对应区域。
+\end{enumerate}
+
+\begin{insight}
+\textbf{“空间走廊”与“时空走廊”差在哪——本章标题的点睛。}\;
+最朴素的 SFC/IRIS 造\emph{纯空间走廊}：在 $(x,y,z)$ 或 $(s,l)$ 里切凸多面体，只回答“哪些位置安全”，默认障碍静态。这对静态环境够用，碰动态障碍就露怯——会动的障碍在纯空间走廊里要么被当“永远占据”（过度保守），要么没法表达“现在在这、待会儿就走”。\textbf{时空走廊}把时间 $t$ 升成正式维度：cube 从 $(s,l)$ 二维矩形变成 $(s,l,t)$ 三维立方体（SSC），或从 $(x,y,z)$ 变成 $(x,y,z,t)$ 四维多面体（4D SFC）。多出的 $t$ 维让走廊能表达“同一位置在 $t\in[3,5]$ 被占、其余时间可用”——动障的时空柱被精确切进走廊形状。一句话：\emph{空间走廊是时空走廊在“障碍静止”假设下的截面；时空走廊是空间走廊“长出时间轴”的版本}，恰好呼应 \cref{sec:stc-lattice} 里时空格相对纯空间格的升维。本章叫“时空走廊”而非“安全走廊”，强调的正是这个时间维。
+\end{insight}
+
+\begin{codebox}[C++]{IRIS 单凸域生成骨架（教学示意，SDP/QP 细节省略）}
+// 把"分离超平面"和"最大内切椭球"两步写成循环, 直到椭球体积收敛
+struct Ellipsoid { Eigen::MatrixXd C; Eigen::VectorXd d;   // {C u + d : ||u|| <= 1}
+                   double Volume() const; };
+struct Polytope  { Eigen::MatrixXd A; Eigen::VectorXd b; }; // A x <= b
+
+Polytope IrisInflate(const Eigen::VectorXd& seed,           // seed 必须无碰撞!
+                     const std::vector<Obstacle>& obstacles,
+                     int max_iter = 20, double tol = 1e-3) {
+  Ellipsoid ellipsoid = InitSmallBall(seed);     // 以种子为心的小球
+  Polytope polytope; double prev_volume = 0.0;
+  for (int iter = 0; iter < max_iter; ++iter) {
+    // 步骤1: 为每个障碍找分离超平面(取障碍离椭球最近点处切平面), 交成无碰撞多面体
+    std::vector<Eigen::VectorXd> A_rows; std::vector<double> b_vals;
+    for (const auto& obs : obstacles) {
+      auto [a_i, b_i] = SeparatingHyperplane(ellipsoid, obs);
+      A_rows.push_back(a_i); b_vals.push_back(b_i);
+    }
+    polytope = AssemblePolytope(A_rows, b_vals);
+    // 步骤2: 在多面体内解 SDP, 求最大体积内切椭球(实际调 Mosek/SCS 等)
+    ellipsoid = MaxInscribedEllipsoidSDP(polytope);
+    // 步骤3: 体积增长低于阈值则收敛
+    double vol = ellipsoid.Volume();
+    if (vol - prev_volume < tol) break;
+    prev_volume = vol;
+  }
+  return polytope;                               // 一个无碰撞凸 cube
+}
+\end{codebox}
+
+\begin{pitfall}[编程陷阱：种子点落在障碍内或贴边]
+从粗路径取种子时没检查它是否无碰撞，或它恰好贴在障碍表面。后果：分离超平面步找不出能把“含碰撞的椭球”与障碍分开的平面，IRIS 直接失败或产出退化（零体积）多面体。根因：IRIS 的前提是种子无碰撞——它从一个“安全的核”往外膨胀，核本身不安全则整个膨胀无从谈起。对策：取种子前做无碰撞检查并留安全裕度；若种子来自骨架路径，先确保骨架无碰撞（SFC 第一步的图搜索就该保证）。
+\end{pitfall}
+
+\begin{pitfall}[概念陷阱：把 IRIS/SFC 的凸域当成全局最大无碰撞凸区]
+以为 IRIS 给出的是该位置能取到的最大凸无碰撞区域。后果：对走廊保守性产生错误预期，调试时百思不解“明明还有更大空间，为什么走廊没覆盖”。根因：IRIS 是\emph{局部}优化（\cref{thm:stc-iris-conv}），结果依赖种子位置与迭代路径，只保证收敛、不保证全局最大。对策：把输出理解为“一个够大的局部凸域”，需要更大覆盖时换种子重跑、或沿路径多放几个种子（SFC 的做法），而非指望一次得到全局最优。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 在 2D 占据栅格上实现简化 IRIS：给一个无碰撞种子点和若干圆形障碍，交替做“切分离超平面 $\to$ 求最大内切椭圆”，可视化每轮膨胀；对比迭代 $1$ 次 vs 收敛后的凸域面积。
+  \item 由 \cref{der:stc-mvie} 说明为什么 IRIS 两步都是凸优化：分离超平面步为何可化为凸问题，最大内切椭球为何是 SDP（用椭球体积的对数 $\leftrightarrow$ $\det C$、半定约束的关系）；再论证环境有界时迭代必收敛（\cref{thm:stc-iris-conv}）。
+  \item 对照 IRIS / FIRI / CIRI 三者：各自的两个子模块是什么、各解决了前者的什么短板（效率 / 可控性 / 构型空间）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{走廊的两条结构性质：连续性与凸性}
+\label{sec:stc-continuity}
+
+走廊方法的全部正确性，压在两条结构性质上。把它们单独拎出来讲透，因为违反任一条，下游 QP 要么无解、要么解出危险轨迹。
+
+\subsection{连续性：相邻 cube 必须有正体积重叠}
+\label{sec:stc-overlap}
+
+\begin{theorem}[走廊连续性条件]\label{thm:stc-overlap}
+设走廊为 cube 序列 $C_1,\dots,C_m$，轨迹第 $k$ 段与第 $k+1$ 段在接缝处位置连续（\cref{def:stc-qp} 的连续性约束要求第 $k$ 段末控制点 $=$ 第 $k+1$ 段首控制点，记此公共点为 $\mathbf{c}^\star$）。则 QP 可行的\emph{必要条件}是相邻 cube 的重叠
+\begin{equation}
+  C_k\cap C_{k+1}\neq\varnothing,
+  \label{eq:stc-overlap}
+\end{equation}
+且为数值稳定，须 $C_k\cap C_{k+1}$ 是\textbf{有正体积}的凸区域（非空、非退化为一条线或一个点）。
+\end{theorem}
+\begin{proof}
+公共控制点 $\mathbf{c}^\star$ 既属第 $k$ 段（须满足 $A_k\mathbf{c}^\star\le\mathbf{b}_k$，即 $\mathbf{c}^\star\in C_k$），又属第 $k+1$ 段（须 $\mathbf{c}^\star\in C_{k+1}$）。故 $\mathbf{c}^\star\in C_k\cap C_{k+1}$。若 $C_k\cap C_{k+1}=\varnothing$，则 $\mathbf{c}^\star$ 无处安放，安全约束与连续性约束冲突，可行域为空，QP 报 infeasible。若重叠仅为零体积（一条线/一个点），$\mathbf{c}^\star$ 被钉死在该退化集上，速度/加速度连续性的额外自由度受挤压，数值上极不稳定。
+\end{proof}
+
+\begin{insight}
+\textbf{重叠区是轨迹从一个 cube 过渡到下一个的“门”。}\;
+轨迹要在两个 cube 的公共区域里完成交接：第 $k$ 段 Bézier 的末控制点和第 $k+1$ 段的首控制点（因连续性相等）这个公共点，必须能\emph{同时}落在两个 cube 内，即落在 $C_k\cap C_{k+1}$ 里。重叠为空 $\Rightarrow$ 没门可走（QP 无解）；重叠零体积 $\Rightarrow$ 门缝太窄（数值病态）。所以 cube 生成时要\emph{显式}保证相邻重叠有一个最小正体积（SFC 用骨架连接点当共享种子正是为此，\cref{sec:stc-sfc}）。
+\end{insight}
+
+\subsection{凸性：每块凸 + 凸包担保整段}
+\label{sec:stc-convexity}
+
+走廊的第二条性质是凸性，它有两层：
+\begin{itemize}
+  \item \textbf{每块 cube 凸}：$C_k=\{\mathbf{x}:A_k\mathbf{x}\le\mathbf{b}_k\}$ 是半空间之交，恒为凸集（\cref{ch:nlopt} 的凸集基本性质）。IRIS/FIRI/CIRI 的输出天然是这种半空间表示。\emph{凸}是“在 cube 里”能写成线性不等式 $A_k\mathbf{x}\le\mathbf{b}_k$ 的前提——若 cube 非凸，“在内”就不是线性约束，QP 凸性破产。
+  \item \textbf{凸包担保整段安全}：单块凸还不够，还要曲线整段不出块。这正是 \cref{thm:stc-convexhull} 的凸包性质——控制点在凸 cube 内 $\Rightarrow$ 凸组合（整段曲线）在 cube 内。\textbf{两层凸性缺一不可}：cube 凸让约束线性，凸包性质让“管有限控制点 $=$ 管无穷曲线点”。
+\end{itemize}
+
+\begin{theorem}[走廊保证整条轨迹无碰撞]\label{thm:stc-corridor-safe}
+设走廊 cube 序列满足：(i) 每块 $C_k$ 凸且无碰撞（$C_k\cap\mathcal{O}_{\mathrm{st}}=\varnothing$，由 \cref{sec:stc-iris} 的膨胀保证）；(ii) 相邻重叠正体积（\cref{thm:stc-overlap}）。若轨迹各段 Bézier 控制点满足安全约束 \cref{eq:stc-safety}，则整条轨迹无碰撞。
+\end{theorem}
+\begin{proof}
+对第 $k$ 段：控制点 $\in C_k$（约束 \cref{eq:stc-safety}）$\Rightarrow$ 整段曲线 $\in C_k$（凸包性质 \cref{thm:stc-convexhull}）$\Rightarrow$ 该段不碰障碍（$C_k$ 无碰撞，条件 (i)）。各段无碰撞、且相邻段在重叠区位置连续（条件 (ii) 保证接缝合法），故整条轨迹（各段之并）无碰撞。
+\end{proof}
+
+\noindent \cref{thm:stc-corridor-safe} 是走廊方法的“安全证书”：它把“无穷多个轨迹点都安全”规约成“有限个控制点满足线性约束 + 走廊本身的两条结构性质”。这种\emph{可形式化的硬安全保证}，正是走廊 + QP 相对端到端学习式规划器的不可替代之处——约束写在那里，解必满足。
+
+\begin{pitfall}[概念陷阱：以为 cube 越大越好]
+默认把每个 cube 撑得越大、可行空间越大、解越优。后果：大 cube 可能跨越不该跨的语义边界（吃进对向车道），或贴近动障的时空柱（\cref{def:stc-stcolumn}）导致解出“擦着障碍走”的危险轨迹；cube 间重叠过大还让走廊失去对轨迹的有效引导。根因：cube 是“安全 + 语义”的双重容器，盲目放大会突破语义约束、贴近动障的时变边界。走廊的价值在于\emph{恰当地约束}，而非最大化自由。对策：cube 膨胀同时尊重几何无碰撞与语义规则（车道、限速、让行）、对动障留足时变裕度；大小以“够轨迹平滑通过且不越界”为准。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 构造两个\emph{不重叠}的相邻矩形 cube（边对边相接），写出公共控制点 $\mathbf{c}^\star$ 须同时满足的两组不等式，证明它们矛盾（\cref{thm:stc-overlap}），并说明 QP 报 infeasible。
+  \item 举一个\emph{非凸} cube 的例子（如 L 形区域），说明“在内”为什么不再是单组线性不等式，以及它如何破坏 QP 凸性。
+  \item 沿用 \cref{thm:stc-corridor-safe}：若把条件 (i) 的“$C_k$ 无碰撞”弱化为“$C_k$ 仅在采样点上无碰撞”，给出一个反例说明整段轨迹可能仍碰障。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{走廊与搜索：互补、组合与选型}
+\label{sec:stc-combine}
+
+\paragraph{两条线的本质差异。}
+回看全章，搜索支线（\cref{sec:stc-lattice}）与走廊支线（\cref{sec:stc-ssc,sec:stc-iris}）的分野在一个根本问题：\textbf{你要的是“离散决策”还是“连续轨迹”？}
+\begin{itemize}
+  \item \textbf{搜索支线}（时空格、Hybrid A$^*$）在离散化状态空间找最优路径。强项是\emph{全局性与组合性}——能给离散空间的全局最优、能干净表达“抢/跟、走哪个 gap”这类离散选择、能自然扩展到多智能体的组合冲突消解。代价是离散分辨率绑死解质量与计算量（\cref{sec:stc-lattice} 思维陷阱），输出棱角分明需后续平滑。
+  \item \textbf{走廊支线}（SSC、SFC）在连续空间解凸优化。强项是\emph{连续性与可优化性}——直接产出平滑、动力学可行的轨迹，毫秒级 QP 可解。代价是只在走廊内局部最优（\textbf{走廊一旦切定，就出不去那个同伦类了}），且对“走哪条路”这类离散决策无能为力——它假设决策已由前端（走廊形状）定好。
+\end{itemize}
+一句话对照：\textbf{搜索擅长“决定走哪”，走廊擅长“把选定的路走平滑”}。这恰是 \cref{ch:planning} “全局搜索/采样定粗解、局部优化精修”级联（\cref{sec:plan-traj}）在动态高维时空的放大版——只不过这里全局段升级成时空搜索，局部段升级成走廊优化。
+
+\begin{table}[H]\centering\small
+\caption{走廊 vs 搜索的选型对照}
+\label{tab:stc-corridor-vs-search}
+\begin{tabular}{lll}
+\toprule
+维度 & 时空走廊（SSC / SFC） & 时空搜索（lattice / Hybrid A$^*$） \\
+\midrule
+输出 & 连续凸可行域 $\to$ QP/NLP 后端 & 离散最优路径 \\
+最优性 & 走廊内局部最优 & 离散空间内全局最优 \\
+决策表达 & 由走廊形状隐式编码（前端定） & 搜索显式给出（抢/跟/走哪 gap） \\
+动态障碍 & 编码为 cube 的时变边界 & 编码为禁用时空节点 \\
+平滑性 & 直接产出平滑轨迹 & 需后续平滑（除非格含动力学基元） \\
+计算代价 & 走廊生成 + QP（毫秒级） & 图搜索（毫秒-秒级，随分辨率） \\
+典型场景 & 自驾/无人机连续轨迹优化 & 离散路径、多机协调粗搜 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{组合：搜索 warm-start 走廊。}
+两条线最常见的联手，是\textbf{搜索给粗解、走廊给精修}：
+\begin{enumerate}
+  \item 先用时空搜索（\cref{sec:stc-lattice}）快速得一条离散粗解——它定下关键离散决策（抢还是跟、走哪个 gap、何时该等）；
+  \item 沿粗解切走廊（SFC/IRIS 用粗解当骨架，\cref{sec:stc-sfc}），把粗解所在的那个同伦类包成凸走廊；
+  \item 在走廊里解 QP（\cref{def:stc-qp}），把棱角分明的粗解精修成平滑、动力学可行的轨迹。
+\end{enumerate}
+精妙在\emph{各取所长、各避其短}：搜索负责“跳出局部、定对决策”（走廊优化做不到的），走廊负责“在选定决策内求最优平滑”（搜索给不出的）。SUPER\cite{ren2025super}、MADER、EGO-Swarm 等先进系统骨子里都是这个“搜索定同伦、优化求精修”的两段式。
+
+\begin{example}[动态绕障管线走查]\label{ex:stc-pipeline}
+一条双车道直路，自车沿参考线行驶、初速 $8\,\mathrm{m/s}$。前方 $30\,\mathrm{m}$ 处一辆\textbf{抛锚车}静止占住右半车道（$l\in[-2,0]$，全程不动，\emph{竖直}时空柱）；同时一辆\textbf{对向慢车}在 $t\in[3,5]\,\mathrm{s}$ 经过自车左前方（占 $l\in[1,2]$、$s\in[40,50]$，\emph{倾斜}时空柱）。这正是“路径与速度强耦合”的场景。
+\begin{itemize}
+  \item \textbf{Step 1 时空搜索定决策}（\cref{sec:stc-lattice}）：在 $(s,l,t)$ 里搜粗解。右车道被抛锚车全程堵死 $\Rightarrow$ 只能往左绕；左前方 $s\in[40,50]$ 在 $t\in[3,5]$ 被对向车占 $\Rightarrow$ 给出两个同伦类：“提前加速、$t{=}3$ 前通过 $s{=}50$”（抢）或“减速、$t{=}5$ 后再过”（跟），按代价（\cref{eq:stc-edge-cost}）选更优的一个（设抢更优，选它）。\textbf{决策在这里定}。
+  \item \textbf{Step 2 切时空走廊}（\cref{sec:stc-iris}）：沿“提前加速左绕”的粗解逐段膨胀 cube。抛锚车段的 cube 把 $l$ 上界顶到 $0$ 以上（强制左移）；对向车时空柱（$t\in[3,5]$）对应的 cube 在那段时间收窄。\textbf{安全凸域在这里造}。
+  \item \textbf{Step 3 走廊内 QP 精修}（\cref{sec:stc-ssc}）：Bézier 控制点约束在 cube 内（凸包性质保整段安全，\cref{thm:stc-corridor-safe}），最小化 jerk + 偏离参考、段间连续到二阶。得到一条平滑左绕、提前加速、在对向车到来前完成超越的连续轨迹——乘客感受到平顺变道加速而非顿挫。\textbf{平滑轨迹在这里求}。
+\end{itemize}
+\textbf{为什么顺序不能颠倒}：搜索必须在走廊之前——走廊沿粗解切，没粗解就不知该往哪切哪个同伦类；走廊必须在 QP 之前——QP 需凸可行域，走廊正是把非凸切成凸的那步。三步是一条信息逐级精化的链：粗决策（哪个同伦类）$\to$ 凸安全管道（哪个范围内安全）$\to$ 精确平滑轨迹（具体怎么走最优）。这也是搜索的离散分辨率\emph{不拖累}最终轨迹的原因——粗的归粗、精的归精，各管一段。
+\end{example}
+
+\begin{pitfall}[概念陷阱：以为走廊优化能“跳出”走廊找到更好的解]
+期待在走廊里解 QP 能自动发现“其实从另一侧绕更好”。后果：走廊一旦把轨迹框进“向左绕”的同伦类，QP 无论怎么优化都跳不到“向右绕”——你以为优化器会全局比较，实际它只在走廊内局部最优。根因：走廊把可行域限定在一个凸管道内，凸优化只在这管道里找最优；跨同伦的全局比较是\emph{前端搜索}的职责，不是后端优化的。对策：把“走哪个同伦类”交给搜索（或多走廊并行优化后择优），走廊优化只负责选定同伦类内的精修。指望 QP 做全局决策，是混淆了两条线的分工。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：把两条线看成“二选一”的对立]
+学完两条线后，遇问题先纠结“该用搜索还是走廊”，把它们当互斥选项。后果：要么硬用搜索做本该连续优化的精修（解粗糙），要么硬用走廊做本该离散搜索的决策（陷局部），错过二者组合的最优解法。根因：缺少“前端搜索定决策、后端优化求精修”的流水线视角，把工具看成竞品而非工序。对策：默认想“能不能组合”——多数先进系统正是搜索 + 走廊的两段式（\cref{ex:stc-pipeline}）。只有极端场景（纯多机组合、或纯单体平滑）才退化成单用一条线。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 为“无人机穿越有 $3$ 个缝隙的墙”设计搜索 + 走廊的两段式管线：搜索层选哪个缝隙（同伦类），走廊层在选定缝隙里精修。画出数据流，标明两层接口（搜索给走廊什么、走廊回什么）。
+  \item 把 \cref{ex:stc-pipeline} 的对向车时间窗改成 $t\in[1,6]$（几乎堵死“抢在前面”）。Step 1 会选哪个同伦类？（提示：抢在 $t{=}1$ 前通过 $s{=}50$ 需初速远超 $8\,\mathrm{m/s}$，不现实 $\to$ 只剩“等过去”。）Step 2 的 cube 会如何变化？
+  \item （跨章综合）论证“ST 图 DP 定决策 + 速度 QP 精修”与本章“时空搜索定同伦 + 走廊 QP 精修”是同一范式在不同维度的体现；指出从前者到后者“升维”时，DP 与 QP 各被替换成了什么、为什么要替换。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+ST 图已处理时间，时空规划多余 & ST 图把时间藏在速度一维、且路径已定；强耦合场景“走哪”与“何时”纠缠，须把时间升为独立搜索维（\cref{sec:stc-spatiotemporal}）\\
+时空格只是“维度更高的纯空间格” & 时间维单调（带来 DAG，\cref{thm:stc-dag}）且改变占用语义（占用是时间的函数），纯空间格都没有 \\
+Hybrid A$^*$ 能避动态障碍 & Hybrid A$^*$ 状态无时间，只能静态避障；动态须升级成时空格（\cref{sec:stc-dag}）\\
+碰撞检查查基元末点就够 & 一段 $\Delta t$ 轨迹连续，碰撞可能在区间内部；只查端点会“穿模”（\cref{sec:stc-lattice} 编程陷阱）\\
+连续优化能自动换边绕行 & 跨同伦类须穿障碍，凸优化跨不过；选同伦类是搜索的职责（\cref{def:stc-homotopy}）\\
+静态、动态障碍要两套机制 & 静态是动态“速度为零”的退化（竖直时空柱），统一投影成 $\mathcal{O}_{\mathrm{st}}$ 即可（\cref{def:stc-stcolumn}）\\
+走廊就是“另一种避障约束” & 走廊把非凸可行域重构成凸——用前端凸分解换后端凸可解性（\cref{sec:stc-ssc} 思维陷阱）\\
+Bézier 要逐采样点加 cube 约束 & 凸包性质保证“控制点在 cube 内 $\Rightarrow$ 整段在内”，只需管有限控制点（\cref{thm:stc-convexhull}）\\
+cube 越大越好 & cube 是“安全+语义”双重容器，盲目放大会越语义边界、贴近动障时变边界（\cref{sec:stc-convexity} 概念陷阱）\\
+相邻 cube 挨着即可、不必重叠 & 公共控制点须落在 $C_k\cap C_{k+1}$；无重叠则 QP 无解（\cref{thm:stc-overlap}）\\
+IRIS 给的是全局最大无碰撞凸区 & IRIS 是局部优化（交替两步、单调膨胀），依赖种子、非全局最优（\cref{thm:stc-iris-conv}）\\
+CIRI 就是 MIT 的 C-IRIS & 二者\emph{不同}：CIRI（SUPER 谱系、球建模构型空间），C-IRIS（认证 C-空间、rational 参数化）（\cref{sec:stc-firi-ciri}）\\
+走廊优化能“跳出”走廊找更好的解 & 走廊把轨迹框进一个同伦类，凸优化只在管道内局部最优；跨同伦是搜索的活（\cref{sec:stc-combine} 概念陷阱）\\
+走廊和搜索是二选一的竞品 & 二者分工互补（搜索定决策、走廊精修），主流系统是两段式组合（\cref{ex:stc-pipeline}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+本章把“时间”从 ST 图里那条被动的速度维，提升为时空规划里主动的搜索/优化维度，沿两条支线展开又合流。\textbf{搜索支线}：时空格 / Hybrid A$^*$（\cref{sec:stc-lattice}）在“构型 $\times$ 时间”的 DAG 上找离散最优轨迹，时间单调带来无环结构（\cref{thm:stc-dag}）、动障靠带时间戳禁用节点；它\emph{自动}从禁用区劈出同伦类（\cref{def:stc-homotopy}），负责“选哪条路绕”。\textbf{动态障碍}统一建成时空柱（\cref{def:stc-stcolumn}），静态是其竖直退化。\textbf{走廊支线}：SSC（\cref{sec:stc-ssc}）用 Bézier 凸包性质（\cref{thm:stc-convexhull}）把非凸避障线性化成“控制点在 cube 内”的 QP；IRIS/FIRI/CIRI（\cref{sec:stc-iris}）从地图自动膨胀出无碰撞凸 cube（两步交替、单调收敛但仅局部最优，\cref{thm:stc-iris-conv}），SFC 把单块沿骨架串成走廊。\textbf{两条结构性质}（\cref{sec:stc-continuity}）：连续性（相邻 cube 正体积重叠，\cref{thm:stc-overlap}）与凸性（每块凸 + 凸包担保整段，\cref{thm:stc-corridor-safe}）共同给出可形式化的硬安全保证。\textbf{合流}（\cref{sec:stc-combine}）：“搜索定同伦 + 走廊精修”的两段式（\cref{ex:stc-pipeline}），是 \cref{ch:planning} “全局粗解 + 局部精修”级联在动态高维时空的升级版。
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\label{tab:stc-symbols}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$(s,l,t)$ & Frenet 纵向弧长 / 横向偏移 / 时间（时空状态） & \cref{sec:stc-spatiotemporal} \\
+$\mathcal{P}$ & 运动基元集合 & \cref{sec:stc-dag} \\
+$c(e)$ & 一条边（运动基元）的代价 & \cref{eq:stc-edge-cost} \\
+$\mathcal{O}_{\mathrm{st}}$ & 动态障碍的时空占据体（时空柱） & \cref{eq:stc-occ} \\
+$C_k$ & 第 $k$ 个凸 cube（多面体），$A_k\mathbf{x}\le\mathbf{b}_k$ & \cref{eq:stc-safety} \\
+$\mathbf{c}_i,\ \mathbf{c}_i^{(r)}$ & Bézier 第 $i$ 控制点 / 其 $r$ 阶导控制点 & \cref{eq:stc-bezier,eq:stc-deriv-ctrl} \\
+$B_i^n(\tau)$ & $n$ 阶 Bernstein 基函数 & \cref{eq:stc-bezier} \\
+$\xi$ & 走廊 QP 安全约束的松弛变量（$\xi\ge0$） & \cref{sec:stc-corridor-qp} \\
+$\mathcal{E},C,\mathbf{d}$ & IRIS 内切椭球 / 形状矩阵 / 中心 & \cref{der:stc-mvie} \\
+$C_k\cap C_{k+1}$ & 相邻 cube 重叠（轨迹过渡的“门”） & \cref{eq:stc-overlap} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{定理速查表}
+\label{tab:stc-theorems}
+\begin{tabular}{lll}
+\toprule
+定理 / 公式 & 一句话说明 & 对应 \\
+\midrule
+时空格是 DAG & 时间单调 $\Rightarrow$ 无环 $\Rightarrow$ 线性最短路、A$^*$ 不怕重开 & \cref{thm:stc-dag} \\
+规划中的同伦类 & 左绕/右绕、抢/跟：跨类须穿障碍，连续优化跨不过 & \cref{def:stc-homotopy} \\
+时空占据体 / 时空柱 & 动障凝固成 $\mathcal{O}_{\mathrm{st}}$；静态是竖直退化 & \cref{def:stc-stcolumn} \\
+Bézier 凸包性质 & 整段曲线落在控制点凸包内 & \cref{thm:stc-convexhull} \\
+安全约束线性化 & 控制点满足 $A_k\mathbf{c}_i\le\mathbf{b}_k$ $\Rightarrow$ 整段在 cube 内（充分，非必要） & \cref{thm:stc-safety-linear} \\
+走廊 QP & jerk 二次 + 安全/连续/边界全线性 = 凸 QP & \cref{def:stc-qp} \\
+最大内切椭球是 SDP & $\max\log\det C$ s.t.\ $\|C\mathbf{a}_j\|+\mathbf{a}_j^\top\mathbf{d}\le b_j$ & \cref{der:stc-mvie} \\
+IRIS 单调收敛但局部最优 & 两步凸、体积单调增、有界必收敛；依赖种子 & \cref{thm:stc-iris-conv} \\
+走廊连续性条件 & 相邻 cube 须正体积重叠，否则 QP 无解 & \cref{thm:stc-overlap} \\
+走廊保证整轨无碰 & 每块凸无碰 + 重叠 + 控制点约束 $\Rightarrow$ 整轨安全 & \cref{thm:stc-corridor-safe} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\label{tab:stc-knowledge}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 时间升维 & 强耦合场景须把 $t$ 升为独立搜索/优化维 & \(\bigstar\bigstar\) \\
+2 & 时空格 / Hybrid A$^*$ & 构型$\times$时间 DAG、运动基元、时间单调无环 & \(\bigstar\bigstar\bigstar\) \\
+3 & 同伦类 & 跨类靠搜索（离散）、类内靠优化（连续） & \(\bigstar\bigstar\bigstar\) \\
+4 & 动态障碍时空建模 & 时空柱 $\mathcal{O}_{\mathrm{st}}$；静态是竖直退化 & \(\bigstar\bigstar\) \\
+5 & Bézier 凸包线性化 & 控制点在 cube 内 $\Rightarrow$ 整段在内 $\Rightarrow$ 线性约束 & \(\bigstar\bigstar\bigstar\) \\
+6 & 走廊 QP 组装 & 代价二次 + 约束全线性 = 凸 QP + 软约束兜底 & \(\bigstar\bigstar\bigstar\) \\
+7 & IRIS 两步交替 & 分离超平面 + 最大内切椭球（SDP），单调膨胀 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+8 & FIRI / CIRI & 可控性（含种子集）/ 线性复杂度 / 构型空间 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+9 & 走廊连续性与凸性 & 正体积重叠 + 每块凸 + 凸包担保整段 & \(\bigstar\bigstar\bigstar\) \\
+10 & 搜索+走廊两段式 & 搜索定同伦 + 走廊 QP 精修 = 主流时空规划骨架 & \(\bigstar\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{时空状态格（奠基）}：Ziegler \& Stiller《Spatiotemporal state lattices for fast trajectory planning in dynamic on-road driving scenarios》\cite{ziegler2009spatiotemporal}（IROS 2009，pp.\ 1879--1884）——把构型与时间组合成流形、确定性采样建 DAG、五次样条最小 jerk，AnnieWAY 实车 $<20\,\mathrm{ms}$；McNaughton 等《Motion Planning\dots Conformal Spatiotemporal Lattice》\cite{mcnaughton2011lattice}（ICRA 2011，pp.\ 4889--4895）——贴参考线 $(s,l,v,t)$ + GPU 并行评估约 $10^4$ 条候选。\pz{两处性能数字（AnnieWAY $<20\,\mathrm{ms}$、McNaughton GPU 约 $10^4$ 候选）取自源材料，论文标题/卷期/方法描述均已核实，但这两个具体量值因原文 PDF 联网未取全、暂未逐字确证；如需引用请回查原论文实验节。}
+  \item \textbf{Hybrid A$^*$}：Dolgov, Thrun, Montemerlo, Diebel《Path Planning for Autonomous Vehicles in Unknown Semi-structured Environments》\cite{dolgov2010hybrid}（IJRR 2010, 29(5):485--501；早期会议版《Practical Search Techniques\dots》见 2008 STAIR 研讨会，由 AAAI 出版）——连续 $(x,y,\theta)$ 状态 + 车辆运动学扩展的自驾搜索原典；纯空间，本章为其补时间轴。
+  \item \textbf{时空语义走廊}：Ding, Zhang, Chen, Shen《Safe Trajectory Generation for Complex Urban Environments Using Spatio-temporal Semantic Corridor》\cite{ding2019ssc}（RA-L 2019）——$(s,l,t)$ 语义 cube + Bézier 凸包 QP，集成于 EPSILON（配行为层 EUDM）。
+  \item \textbf{凸分解}：Deits \& Tedrake《Computing Large Convex Regions of Obstacle-Free Space Through Semidefinite Programming》\cite{deits2015iris}（IRIS，WAFR 2014）——椭球膨胀 + 超平面切割 + 最大内切椭球 SDP；Wang 等《Fast Iterative Region Inflation\dots》\cite{wang2025firi}（FIRI，T-RO 2025）——RsI 保可控性 + MVIE 线性复杂度。
+  \item \textbf{安全飞行走廊与无人机}：Liu 等《Planning Dynamically Feasible Trajectories for Quadrotors Using Safe Flight Corridors\dots》\cite{liu2017corridor}（RA-L 2017，UPenn GRASP，开源 \texttt{DecompROS}）——沿骨架串重叠凸多面体（\cref{sec:plan-minsnap} 已引）；配 min-snap\cite{mellinger2011minimum} 与 Richter 等无约束重构\cite{richter2016polynomial}（\cref{sec:plan-minsnap}）。
+  \item \textbf{前沿系统}：Ren 等《Safety-assured high-speed navigation for MAVs》（SUPER）\cite{ren2025super}（Science Robotics 2025）——CIRI 构型空间走廊 + 双轨迹安全，$>20\,\mathrm{m/s}$ 林间飞行。
+  \item \textbf{规划三范式基础}：LaValle《Planning Algorithms》\cite{lavalle2006planning}、Karaman \& Frazzoli《Sampling-based Algorithms\dots》\cite{karaman2011sampling}（C 空间、A$^*$、RRT$^*$ 的权威来源，\cref{ch:planning} 已系统吸收）。
+  \item \textbf{开源项目}：\texttt{HKUST-Aerial-Robotics/spatiotemporal\_semantic\_corridor}（SSC 参考实现）、\texttt{HKUST-Aerial-Robotics/EPSILON}（SSC 集成）、\texttt{sikang/DecompROS}（IRIS 风格凸分解 C++）、\texttt{hku-mars/SUPER}（CIRI/FIRI 走廊 + 双轨迹）。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+相关章节 & 关系 & 衔接点 \\
+\midrule
+\cref{ch:planning} 运动规划导论（前置） & C 空间/A$^*$/RRT$^*$/min-snap/CHOMP/SFC 基础 & 本章是安全飞行走廊（\cref{sec:plan-minsnap}）的时空推广 \\
+\cref{ch:nlopt} 非线性优化（前置） & 走廊 QP = 凸 QP；IRIS 内切椭球 = SDP；交替优化 & 凸性、KKT、块坐标下降的语言 \\
+\cref{ch:lie} 李群（前置） & $\SE(3)$ 上规划的距离/插值 & 构型空间度量、时空轨迹的位姿表示 \\
+\cref{ch:control} 控制导论 & 时空轨迹的跟踪执行 & 走廊 QP 产出的动力学可行轨迹喂给跟踪控制器 \\
+\bottomrule
+\end{tabular}
+\end{table}
+\noindent{}此外，本章的走廊表示与“走廊内 QP”是后续\emph{时空轨迹优化}（把走廊内 QP 推进到走廊内 NLP、引入 MINCO 等更先进轨迹表示）、\emph{多智能体协调}（多机走廊互斥约束、低层时空搜索复用于 CBS）、\emph{不确定性规划}（动障时空占据的预测不确定性显式建模为机会约束）的直接前身。\pz{这三类后续主题的具体章节编号待全书目录稳定后补 \cref 桥接。}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：仿真里轨迹“穿模”（端点不碰、中途撞障）。\textbf{原因}：碰撞检查只查基元/曲线端点，漏中途。\textbf{对策}：沿基元/曲线密采样检查或用 CCD；$\Delta t$ 大时加密（\cref{sec:stc-lattice} 编程陷阱）。
+  \item \textbf{症状}：纯空间 Hybrid A$^*$ 在动态场景判无解或撞车。\textbf{原因}：状态无时间维，把动障当永久静态或忽略。\textbf{对策}：升级为时空格，状态加 $t$（必要时加 $v$），用带时间戳的占据查询（\cref{sec:stc-dag}）。
+  \item \textbf{症状}：走廊 QP 报 infeasible。\textbf{排查}：相邻 cube 是否不重叠或重叠零体积——公共控制点无合法落点（\cref{thm:stc-overlap}）。\textbf{对策}：cube 膨胀时强制相邻非空（正体积）重叠，或生成后检查修补；仍冲突则软化安全约束（松弛 $\xi$，\cref{sec:stc-corridor-qp}）。
+  \item \textbf{症状}：轨迹贴着障碍/越语义边界走。\textbf{原因}：cube 撑得过大，越界或贴近动障时变边界。\textbf{对策}：收紧 cube 膨胀，尊重语义与动障时变裕度（\cref{sec:stc-convexity} 概念陷阱）。
+  \item \textbf{症状}：IRIS 产出零体积/退化多面体。\textbf{原因}：种子点在障碍内或贴边。\textbf{对策}：取种子前做无碰撞检查 + 安全裕度（\cref{sec:stc-iris} 编程陷阱）。
+  \item \textbf{症状}：走廊窄得轨迹没有优化余地。\textbf{原因}：IRIS 没迭代膨胀（只切一刀），或种子选得差。\textbf{对策}：确认迭代到体积收敛（\cref{thm:stc-iris-conv}）；沿路径多放种子（SFC，\cref{sec:stc-sfc}）；考虑 FIRI/CIRI 更大更可控的凸域。
+  \item \textbf{症状}：轨迹在 cube 接缝处顿挫。\textbf{原因}：段间连续性只到位置，缺速度/加速度连续。\textbf{对策}：连续性约束补到二阶（位置 + 速度 + 加速度，\cref{def:stc-qp}）。
+  \item \textbf{症状}：期待 QP 自动换边绕行却没换。\textbf{原因}：误以为走廊优化能跨同伦类。\textbf{对策}：跨同伦是搜索的职责；要么搜索重定、要么多走廊并行择优（\cref{sec:stc-combine} 概念陷阱）。
+  \item \textbf{症状}：决策反复横跳（这帧抢、下帧让）。\textbf{原因}：搜索离散化抖动，或走廊每帧重切引入跳变。\textbf{对策}：加同伦类滞回/一致性代价；走廊增量更新而非每帧重切。
+  \item \textbf{症状}：动障预测不准导致轨迹危险。\textbf{原因}：走廊/搜索按错误的时空柱避障。\textbf{对策}：给 $\mathcal{O}_{\mathrm{st}}$ 加不确定性裕度（切粗一圈）；高频滚动重规划吸收误差（\cref{sec:stc-dynobs} 概念陷阱）。
+\end{enumerate}

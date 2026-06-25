@@ -1,0 +1,1110 @@
+\chapter{具身RL仿真生态：mjlab、Isaac Lab 与 UniLab}\label{ch:rlmc-ecosystem}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的生态/选型实战章。
+%  主线：以「仿真在 RL 管线中承担的工程职责」为概念骨架——仿真三角色、
+%  GPU 并行、Manager 架构——再在每个概念下横向铺 mjlab / Isaac Lab / UniLab
+%  三框架对比实战。假定读者已掌握 RL 理论（前面理论部 P6_rl 已讲 MDP/PPO/
+%  Actor-Critic），不重教基础，聚焦工程扩展与上手。
+%  源稿 RL运控/Ch01_生态系统.md（实践偏重）已按本主线重构；
+%  关键 API/版本/benchmark/论文归属均联网核对（见各 \rebuilt / \pz / \cite）。
+%  UniLab 列已据服务器实装框架的源码 + 实跑核对填实（异构 CPU-sim/GPU-policy，
+%  论文 arXiv:2605.30313；非 Manager-Based）。凡 UniLab 真实欠缺处如实标注、不编造。
+% ════════════════════════════════════════════════════════════════
+
+强化学习运动控制（RL motion control）这一部，要把前几部的强化学习\emph{理论}——马尔可夫决策过程、贝尔曼方程、策略梯度、演员-评论家——落到一台真实（或仿真）的腿足/机械臂机器人上。而落地的第一块基础设施，不是奖励函数，也不是网络结构，而是\textbf{仿真器}：策略需要海量试错数据，真机无法承受这个量级的代价，于是仿真承担了「数据工厂」的角色。但「用哪个仿真器」在 2026 年已不是一个简单问题——MuJoCo、Isaac Gym、Isaac Lab、MuJoCo Playground、Newton、mjlab 构成了一个快速演进、互相借鉴的生态。本章是这一部的\textbf{地图章}：它不教你写某一行 reward，而是帮你建立全局视角，知道生态里有哪些框架、每一代解决了什么工程痛点、你的研究课题该选哪个。
+
+本章遵循全书「概念/算法领路、工程实践兑现」的次序，但因为这是一章\emph{生态选型}内容，其「算法骨架」不是某个 RL 算法，而是\textbf{仿真在 RL 管线中承担的三类工程职责}：物理世界、MDP 机器、调试仪器。我们先把这三类职责讲清楚（它们决定了「一个仿真框架到底要提供什么」），再在每一类职责下横向铺开 mjlab、Isaac Lab、UniLab 三个框架的对比实战。读者会反复看到一条主线：\textbf{框架层是连接 RL 算法与物理引擎的桥梁}，掌握了框架层的设计方法论（无论是 mjlab/Isaac Lab 的 Manager-Based 体系，还是 UniLab 的 \texttt{NpEnv} 异构范式），就同时获得了对上层（算法接入）与下层（物理引擎切换）的控制力。
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\label{sec:rlmc-eco-setup}
+\addcontentsline{toc}{section}{环境配置指南}
+
+本章是概念/选型章，正文的代码以\emph{演示框架差异}为主，多为可读的最小片段而非完整工程。但要亲手验证后文每一处对比，你需要至少装好一个框架。下表给出两个主线框架的系统要求与版本兼容关系（数据以 2026 年中为快照，\textbf{版本号会随时间变化，请以官方仓库为准}）。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+要素 & mjlab & Isaac Lab & 备注 \\
+\midrule
+操作系统 & Linux / macOS（CPU 调试）/ Win(WSL2) & Linux（推荐）/ Win & Isaac Sim 对 Linux 支持最完整 \\
+Python & $\ge 3.10$（$<3.14$） & $\ge 3.10$ & 经核对 mjlab PyPI 元数据\,\cite{mjlab2026} \\
+GPU & NVIDIA + CUDA（训练）& NVIDIA RTX 系（渲染）& mjlab 可 CPU 跑通流程做调试 \\
+物理后端 & MuJoCo Warp & PhysX（默认）/ Newton(Beta) & 见 \cref{sec:rlmc-eco-evolution} \\
+RL 后端 & RSL-RL（默认且唯一）& RSL-RL / RL Games / SKRL / SB3 & 见 \cref{sec:rlmc-eco-tools} \\
+安装方式 & \verb|pip install mjlab| / \verb|uv sync| & conda + pip + Isaac Sim 或 kit-less & 复杂度差异显著 \\
+启动延迟 & 数秒 & 数十秒；\textbf{首跑 $\ge 5$ 分钟}（编译 shader/USD）& 影响迭代体验 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[版本锚定：为什么要写死版本，又为什么不能迷信它]
+机器人 RL 生态演进极快：2025 到 2026 年间，mjlab 从首个 Beta 发布到 1.x 系列，Isaac Lab 从 2.x 演进到 3.0 Beta，Newton 从公告走到 1.0 GA。若教材追最新版，读者在不同时间阅读会面对不同 API。本章的策略是\emph{锚定}一组主线版本（mjlab 1.x、Isaac Lab 2.3.2、RSL-RL 即 \texttt{rsl-rl-lib}，Isaac 钉 3.0.1 / mjlab 装 5.2.0），把 3.0 等破坏性变更放进注释框单独说明。\pz{源稿把 mjlab 锚定在 1.2.0；经核对 PyPI，截至 2026-05 最新已是 1.4.0\,\cite{mjlab2026}——故请把任何具体小版本号当作「最低兼容参考」，实际安装用当时的稳定版。}
+\end{note}
+
+\paragraph{分系统最小安装步骤（以 mjlab 为「先跑通」入口）。}mjlab 的安装是单条命令，适合作为第一个上手的框架；Isaac Lab 因依赖 Isaac Sim，步骤更长，建议在确认任务需要视觉渲染或多 RL 后端后再装（理由见 \cref{sec:rlmc-eco-select}）。
+
+\begin{codebox}[bash]{mjlab：Linux / macOS / WSL2 通用最小安装}
+# 推荐用 uv（Astral 的 Python 包管理器）管理环境，亦可纯 pip
+pip install uv                      # 若已有 uv 可跳过
+uv venv --python 3.11 && source .venv/bin/activate
+uv pip install mjlab               # 一条命令装好；v1.0 起无需 git pin MuJoCo-Warp
+python -c "import mjlab, importlib.metadata as m; print('mjlab', m.version('mjlab'))"  # mjlab 无 __version__ 属性，用 importlib.metadata 取版本
+\end{codebox}
+
+\begin{codebox}[bash]{Isaac Lab：Linux（pip 工作流，2.3.0 主线，简化示意）}
+conda create -n isaaclab python=3.10 && conda activate isaaclab
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install isaacsim[all]          # Isaac Sim 运行时（数 GB，耗时较长）
+git clone https://github.com/isaac-sim/IsaacLab.git
+cd IsaacLab && ./isaaclab.sh --install   # 安装 isaaclab 系列扩展
+# 验证：跑一个空场景，确认 Isaac Sim 能加载（首次启动会编译 shader，较慢）
+\end{codebox}
+
+第三个框架 UniLab 的安装介于两者之间：用 \verb|uv sync| 选物理后端，不依赖 Isaac Sim（故无 mjlab 那条「别装 Omniverse」的坑），但物理在 CPU、需要一块 GPU 跑策略学习。
+
+\begin{codebox}[bash]{UniLab：异构 CPU-sim + GPU-policy（uv 工作流，简化示意）}
+git clone https://github.com/unilabsim/UniLab && cd UniLab
+uv sync --extra mujoco              # MuJoCoUni 后端（mujoco-uni）；或 --extra motrix
+# 国内首跑从 HuggingFace 拉资产，需换镜像端点：
+export HF_ENDPOINT=https://hf-mirror.com
+# 物理跑 CPU（核越多越好），策略需 GPU（CUDA / MPS / ROCm / XPU 任一）
+\end{codebox}
+
+\begin{pitfall}[安装阶段三个最常见的「卡住」]
+\textbf{一·CUDA/PyTorch 版本不匹配}：Isaac Sim 对 CUDA 与 PyTorch 版本有强约束，装错会在第一次 \verb|import| 时报 \verb|undefined symbol| 或段错误。务必照官方矩阵选版本，别用 \verb|pip install torch| 的默认 wheel。\textbf{二·把 mjlab 当 Isaac Lab 那样装}：mjlab \emph{不需要} Isaac Sim/Omniverse，若你照 Isaac Lab 教程去装 Omniverse 再装 mjlab，纯属浪费时间。\textbf{三·无 GPU 也想跑训练}：mjlab 可在 CPU 上跑通\emph{流程}（调试用），但真正的并行训练需要 NVIDIA GPU；Isaac Lab 的渲染更依赖 RTX。先确认硬件再开始。
+\end{pitfall}
+
+\begin{pitfall}[两个 Isaac Lab 新手必踩的坑：启动慢、不能裸 Python 导入]
+\textbf{一·首次启动远比「数秒」慢，要有心理预期。}上面那张系统要求表把 Isaac Lab 启动延迟写成「数十秒」，那是\emph{二次以后}的乐观值。实测在 RTX 4090 上跑最小的 \verb|Isaac-Cartpole-v0|，从敲下命令到打印第 1 个训练迭代要 \textbf{$5$ 分钟以上}（纯花在 shader 编译 + USD 资产加载上）。这不是卡死：首跑会把编译结果\emph{缓存}下来，二次启动通常一两分钟。所以第一次跑 Isaac Lab 请用 \verb|--headless| 关掉渲染窗口、并预留 $5$--$8$ 分钟，别在三分钟时以为挂了就 \verb|Ctrl-C|（一旦中断缓存没写完，下次又得从头编译）。mjlab 无此问题（数秒起）。
+\textbf{二·想「快速查个 API」时不能用系统 \texttt{python}。}Isaac Lab 的相机/资产类挂在 Omniverse 的 \verb|pxr|/\verb|omni.usd| 运行时上，必须先由 \verb|AppLauncher| 拉起 Isaac Sim 才能导入。直接 \verb|python -c "import isaaclab.envs"| 会立刻 \verb|ModuleNotFoundError: No module named 'pxr'|（或 \verb|omni.usd|）。正确姿势是用仓库自带的解释器包装器 \verb|./isaaclab.sh -p your_script.py|，并在脚本里先 \verb|AppLauncher(...)| 再 \verb|import|。这是「环境隔离」坑：报错信息看着像没装好，其实是没经 Isaac Sim 入口。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：五分钟在 mjlab 上看见机器人}
+\label{sec:rlmc-eco-quickstart}
+\addcontentsline{toc}{section}{Quick Start：五分钟跑通}
+
+装好 mjlab 后，下面四条命令让你在几分钟内完整体验「选环境 $\to$ 看默认姿态 $\to$ 看随机动作 $\to$ 启动训练」这条最小闭环。命令格式经核对为 mjlab 的 tyro CLI + \verb|uv run|\,\cite{mjlab2026}；具体的任务注册名以你所装版本的 \verb|--help| 输出为准。
+
+\begin{codebox}[bash]{mjlab 最小闭环（可逐条复制）}
+# 1. 列出已注册任务，确认安装与注册都正常（无 ImportError）
+uv run list-envs        # mjlab 列任务用 list-envs；train --help 只看 CLI 旗标
+# 2. zero agent：动作恒为 0，机器人应保持默认站姿——验证模型正确加载
+uv run play Mjlab-Velocity-Flat-Unitree-G1 --agent zero --num-envs 4
+# 3. random agent：连续随机动作，应见明显运动但不「炸飞」、无 NaN
+uv run play Mjlab-Velocity-Flat-Unitree-G1 --agent random --num-envs 4
+# 4. 小规模训练 10 迭代：steps/s 稳定、reward 非 NaN 即说明管线打通
+#    注：mjlab 默认用 WandB 记录；未配 API key 会报 "No API key configured"。
+#    冒烟可加 WANDB_MODE=disabled 跳过登录（正式训练再 wandb login）。
+WANDB_MODE=disabled uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+    --env.scene.num-envs 512 --agent.max-iterations 10
+\end{codebox}
+
+\begin{insight}[zero agent 与 random agent 是「免费的体检」]\label{ins:rlmc-eco-zerorandom}
+还没训练就先跑 \verb|--agent zero| 与 \verb|--agent random|，是机器人 RL 里一条极廉价、极有效的习惯。\textbf{zero agent} 把动作钉死为零：若机器人此时不是稳稳站着，而是瘫软或劈叉，说明默认姿态（offset）配错了——这与动作空间的「默认偏置」设计直接相关（详见 \cref{ch:rlmc-obsact} 的动作变换链）。\textbf{random agent} 把动作设为均匀随机：若机器人立刻飞出场景或数值变 NaN，多半是 action scale 太大或缺裁剪。两步都不写一行训练代码，却能在 30 秒内把「环境装错/配错」与「算法没调好」两类问题区分开——这正是 \cref{sec:rlmc-eco-roles} 将讲的仿真「调试仪器」角色的最小体现。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{前置自测}
+\label{sec:rlmc-eco-selftest}
+\addcontentsline{toc}{section}{前置自测}
+
+\begin{practice}[前置自测：答不出 $\ge 3$ 题，建议先回「强化学习理论部」复习]
+\begin{enumerate}
+  \item 强化学习的基本闭环里，观测、动作、奖励、下一观测四个量的因果关系是什么？（答错回看 \cref{sec:rl-basic-mdp}）
+  \item \verb|sim.step()| 与 \verb|env.step()| 有何区别？后者在物理推进之外还做了哪些事？（答错回看 \cref{sec:rlmc-eco-roles}）
+  \item PPO 的 rollout $\to$ GAE $\to$ clip 更新大致流程是什么？（本章不重讲，答错回看 \cref{ch:rl-pg} 与 \cref{ch:rl-ac}）
+  \item 为什么「渲染漂亮」不等于「适合大规模 RL 训练」？请从吞吐量与显存两个角度回答。（答错回看 \cref{sec:rlmc-eco-gpu}）
+  \item GPU 并行仿真与 CPU 多进程仿真的本质区别仅仅是「GPU 更快」吗？（答错回看 \cref{sec:rlmc-eco-gpu}）
+\end{enumerate}
+\end{practice}
+
+\textbf{本章目标}：学完本章，你应当能够——
+\begin{enumerate}
+  \item \textbf{配置}并验证至少一个 GPU 并行 RL 框架（mjlab 或 Isaac Lab），跑通\nameref{sec:rlmc-eco-quickstart}的最小闭环；
+  \item \textbf{区分} \verb|sim.step()| 与 \verb|env.step()| 的职责，定位一个 bug 是出在物理层还是 MDP 层；
+  \item \textbf{对比} mjlab、Isaac Lab、UniLab 三框架在物理后端、安装复杂度、可视化、RL 后端、内置任务上的工程差异，并用决策树为一个新课题\textbf{选定}框架；
+  \item \textbf{实现}一个粗略但够用的显存估算，判断「我的 GPU 能否跑 4096 并行环境」；
+  \item \textbf{调通} Manager-Based 配置的最小骨架（observation/reward/event 三个 term），并解释它相对单体架构的工程收益；
+  \item \textbf{定位} Isaac Lab 2.x 与 3.0 的破坏性变更（四元数序、warp-native 数据、模块改名），在升级报错时找到正确的迁移方向。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section*{知识导航与阅读时间}
+\label{sec:rlmc-eco-nav}
+\addcontentsline{toc}{section}{知识导航}
+
+\textbf{前置桥接}：本章假定你已学过强化学习理论部——尤其是马尔可夫决策过程（\cref{sec:rl-basic-mdp}）给出的 $(\mathcal S,\mathcal A,P,R,\gamma)$ 五元组、策略梯度（\cref{ch:rl-pg}）与演员-评论家（\cref{ch:rl-ac}）的 PPO/GAE 机制。本章\emph{不重讲}这些，而是把它们当作既有词汇，专注「这些算法要在什么样的仿真基础设施上运行」。本章也是本部入口章 \cref{ch:rlmc-obsact}（观测与动作设计）的\emph{前置}：先建立框架全景，再深入单个 Manager。
+
+\begin{forest}
+navtree
+[具身RL仿真生态
+  [仿真的三类职责 (\S\ref*{sec:rlmc-eco-roles})
+    [物理世界 sim.step]
+    [MDP 机器 env.step]
+    [调试仪器 ground-truth]
+  ]
+  [GPU 并行 (\S\ref*{sec:rlmc-eco-gpu})
+    [数据零搬运]
+    [SIMT / SoA]
+    [显存与最大环境数]
+  ]
+  [生态演进六阶段 (\S\ref*{sec:rlmc-eco-evolution})
+    [MuJoCo {$\to$} Isaac Gym]
+    [Isaac Lab {$\to$} MJX]
+    [Newton {$\to$} mjlab]
+  ]
+  [Manager 架构三框架对比 (\S\ref*{sec:rlmc-eco-manager})
+    [mjlab]
+    [Isaac Lab]
+    [UniLab (非 Manager-Based)]
+  ]
+  [框架选型 (\S\ref*{sec:rlmc-eco-select})
+    [决策树]
+    [迁移成本]
+  ]
+  [其他框架与工具 (\S\ref*{sec:rlmc-eco-tools})]
+]
+\end{forest}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含练习与动手） & 3--4 小时 & 初次接触机器人 RL 仿真的读者 \\
+速读（跳过练习，看表与陷阱） & 1--1.5 小时 & 有 Isaac Gym/Gym 经验、不熟 mjlab/Newton 的读者 \\
+速查（只看对比表与版本表） & 30 分钟 & 已有双框架经验，只查最新变化 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{概念骨架：仿真在 RL 管线中的三类职责}
+\label{sec:rlmc-eco-roles}
+
+\subsection{模块功能与在管线中的位置}
+
+要回答「一个仿真框架到底该提供什么」，先要看清仿真在训练闭环里同时扮演的\emph{三个}角色。很多初学者只把仿真当成「一个跑得快的环境」，于是在调试时分不清问题出在哪一层。这三个角色，正是后文衡量 mjlab / Isaac Lab / UniLab 的三把尺子。
+
+\begin{insight}[仿真之于机器人 RL，如编译器与单元测试之于软件工程——但边界要记牢]\label{ins:rlmc-eco-analogy}
+你最终要把控制器跑在真机上（如同软件最终要上生产环境），但你不会把每一次语法错误都部署到生产系统才发现；同样，你不该把每一次奖励设计错误都拿真机摔一遍才知道。这个类比的\textbf{边界}是：编译器给出\emph{确定性}的错误信息，仿真器给出的却是对物理世界的\emph{近似}——「编译通过」约等于「语法正确」，但「仿真成功」\emph{不等于}「真机成功」。仿真能把试错成本压低几个数量级，却消除不了 sim-to-real gap。理解这条边界，是后续所有章节（尤其域随机化与 sim-to-real 部署）的前提。
+\end{insight}
+
+\paragraph{角色一·物理世界（物理引擎，\texttt{sim.step}）。}最底层职责：给定关节力矩，算出下一时刻的关节位置、速度与接触力。这由\emph{物理引擎}完成，而物理引擎的选择直接决定仿真的真实度——尤其是接触行为。下表是三类主流引擎的对照（接触模型差异将在 \cref{sec:rlmc-eco-evolution} 展开）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+物理引擎 & 坐标体系 & 接触模型 & 主要使用框架 \\
+\midrule
+MuJoCo / MuJoCo Warp & 广义坐标 & 凸优化（CG/Newton 求解器） & mjlab、MuJoCo Playground \\
+PhysX & 笛卡尔坐标 & TGS 迭代求解器 & Isaac Lab（默认） \\
+Newton & 多求解器统一 & MuJoCo Warp / Kamino / XPBD 等 & Isaac Lab 3.0 Beta \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{角色二·MDP 机器（框架层，\texttt{env.step}）。}物理引擎只管 \verb|sim.step()|；而 RL 算法要消费的是一个完整的 MDP，这由框架层的 \verb|env.step()| 封装。\verb|env.step()| 在物理推进之外还做一整套事：
+
+\begin{codebox}[text]{env.step(action) 在 sim.step() 之上封装的 MDP 逻辑}
+env.step(action):
+    1. 处理 action（缩放 scale / 裁剪 clip / 偏置 offset）
+    2. 调用 sim.step() 一次或多次（action repeat / decimation）
+    3. 计算 observation（从物理状态提取策略需要的信息）
+    4. 计算 reward（评估当前行为）
+    5. 判断 termination（是否结束当前 episode）
+    6. 对终止的环境执行 reset
+    7. 返回 (obs, reward, done, info)
+\end{codebox}
+
+\begin{insight}[\texttt{sim.step()} 与 \texttt{env.step()} 的区别，是理解整个框架架构的起点]\label{ins:rlmc-eco-simenv}
+物理引擎负责「世界如何运转」，框架负责「如何把物理世界包装成 RL 算法可消费的 MDP」。把两者混为一谈，是初学者最常见的认知错误，后果是调试时分不清问题出在物理层还是 MDP 层：足端穿地、机器人「沉」进地下，多半是\emph{物理层}的接触参数问题；而策略不跟随速度命令、奖励曲线像随机游走，多半是\emph{MDP 层}的观测/奖励配置问题。第 2 步那套 MDP 逻辑的\emph{组织方式}，就是后文 \cref{sec:rlmc-eco-manager} 要讲的 Manager-Based 架构——它把这七步从一个巨型 \verb|step| 函数里拆成可独立替换的模块。
+\end{insight}
+
+\paragraph{角色三·调试仪器（ground-truth 读取）。}仿真相比真机有一个常被忽视的优势：可以读取\emph{完整}的物理状态。真机上你只能靠有噪声的部分传感器；仿真里你能直接读每个关节的精确 \verb|qpos|/\verb|qvel|、每个接触点的力、每个物体的质心位姿。这对调试奖励函数、诊断策略行为至关重要——\cref{ins:rlmc-eco-zerorandom} 的 zero/random 体检就是这一角色的最小用法。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+调试能力 & 真机 & 仿真 \\
+\midrule
+关节角/速度 & 编码器（有噪声） & 精确 \verb|qpos|/\verb|qvel| \\
+接触力 & 力传感器（若有） & 精确接触法向力/摩擦力 \\
+质心位置 & 需状态估计器 & 直接读取 \\
+地形信息 & 难以获取 & heightfield 精确数据 \\
+状态保存/恢复 & 几乎不可能 & 可存完整状态并从任意点恢复 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{三框架在「三角色」上的分工对比}
+
+把三个角色当成尺子，三框架的定位差异立刻清晰（数值/版本以 2026 年中为快照，详见各小节核对）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+角色 & mjlab & Isaac Lab & UniLab \\
+\midrule
+物理世界 & MuJoCo Warp（凸优化接触） & PhysX / Newton(Beta) & MuJoCoUni / MotrixSim（\textbf{CPU} 多线程） \\
+MDP 机器 & Manager-Based（借鉴 Isaac Lab） & Manager-Based（首创） & \textbf{非} Manager-Based（\verb|NpEnv| 子类） \\
+调试仪器 & Viser（web 3D）+ 直接读 \verb|mjData| & Isaac Sim Viewer + RTX & Viser（web 3D）+ 直接读 \verb|NpEnvState| + NaN 守卫 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[关于第三个框架 UniLab：它\emph{不是}第三个 Manager-Based 框架]
+本部按「三大框架对比」组织实战。前两家（mjlab / Isaac Lab）是「GPU 仿真主导」范式的两个 Manager-Based 框架；第三家 \textbf{UniLab}（论文 arXiv:2605.30313，副标题 \emph{A Heterogeneous Architecture for Robot RL Beyond GPU-Dominant Paradigms}）则\textbf{刻意正交}：它把物理仿真留在 \textbf{CPU}（MuJoCoUni / MotrixSim 多线程批量步进），把策略学习放在 \textbf{GPU}（PPO/APPO/SAC/TD3），二者经\emph{共享内存 IPC} 解耦（见 \cref{sec:rlmc-eco-manager}）。这意味着 UniLab \emph{不采用} Manager 体系——它没有 \verb|ObservationManager|/\verb|RewardManager|/\verb|EventManager| 这些类，MDP 逻辑集中在 \verb|NpEnv| 子类的 \verb|update_state()| 里。本书把 UniLab 当作「第三条工程路线」并入对比：凡 UniLab 与前两家\emph{设计同源}处直接并表，凡 UniLab \emph{独有}（异构 IPC、CPU 物理）或\emph{真实欠缺}（无 RTX 视觉、无 Manager 类）处都如实标注，不强行套用 Manager 词汇。本章正文凡 UniLab 列均为对源码与实跑核对后的真实信息（事实来源见 \cref{sec:rlmc-eco-tools} 延伸阅读）。
+\end{note}
+
+\begin{pitfall}[把「渲染漂亮」当成「适合训练」]
+Isaac Sim 的 RTX 实时光追画面非常逼真，容易让人误以为它在所有任务上都更优。但对\emph{无视觉}的 locomotion 训练，渲染质量与训练吞吐、显存占用无关——你需要的是几千个并行环境快速 step，而非一帧逼真画面。逼真渲染只在\emph{视觉策略}（RGB/Depth 输入）任务里才是刚需。把这两件事混在一起，会让你为纯 locomotion 任务背上不必要的安装复杂度与显存开销（见 \cref{sec:rlmc-eco-select} 决策树）。
+\end{pitfall}
+
+\begin{practice}[练习·三角色]
+\begin{enumerate}
+  \item \textbf{[分析]} 你的机器人足端持续穿入地面、整机缓慢下沉。这个 bug 更可能出在「物理世界」还是「MDP 机器」角色？你会先检查哪一类参数？
+  \item \textbf{[实操]} 在 mjlab 上对一个 velocity 任务跑 \verb|--agent zero|，用调试仪器角色读出机器人此刻的若干关节角，判断默认姿态是否合理（提示：与官方 MJCF 的 keyframe 对照）。
+  \item \textbf{[设计]} 列出三个仿真\emph{无法}完美模拟的物理现象（如柔性绳索、液体、软体接触），并思考这些任务是否仍可用 sim-to-real RL 范式解决。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么必须是 GPU 并行仿真}
+\label{sec:rlmc-eco-gpu}
+
+\subsection{动机：数据需求与真实世界成本的数量级鸿沟}
+
+机器人 RL 的核心矛盾，可一句话概括：\textbf{策略学习需要海量试错数据，而真实世界的每一次试错都有物理代价}。这不是程度差异，而是数量级鸿沟。以四足 locomotion 为例，一个 PPO 策略从随机初始化到学会稳定行走，典型需要 $10^8$ 到 $10^9$ 个环境 step。下表把这个量级翻译成时间：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+参数 & 值 & 说明 \\
+\midrule
+控制频率 & $50\,$Hz & 每秒 50 个 policy step \\
+训练所需 step & $\sim 10^8$ & 典型 PPO 四足任务（单组超参） \\
+单环境实时运行 & $10^8/50=2\times10^6\,$s $\approx 23\,$天 & 不停机、不维修 \\
+4096 并行环境 & $2\times10^6/4096\approx 500\,$s $\approx 8\,$分钟 & GPU 并行的数量级优势 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+真实吞吐不会线性扩展（kernel 调度、reset、传感器模拟都有开销），但数量级差异已足够说明：\emph{GPU 并行仿真对机器人 RL 不是锦上添花，而是刚需}。这也呼应 \cref{ins:rlmc-eco-analogy} 的成本论——把 23 天压到 8 分钟，研究迭代才从「一天一组实验」变成「一小时十组」。
+
+\subsection{CPU 多进程 vs GPU 并行：本质不是「核心多」}
+
+GPU 并行不是凭空出现的。它对应一次计算范式的切换：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & CPU 多进程（2021 前主流） & GPU 并行（2021 后） \\
+\midrule
+并行度 & 16--64（受核心数限制） & 4096--65536（受显存限制） \\
+数据位置 & 各进程独立内存 & 连续 GPU 显存 \\
+通信开销 & 进程间通信（微秒级） & 无通信（同一显存空间） \\
+与 RL 算法交互 & 需 CPU$\to$GPU 数据搬运 & 数据已在 GPU 上，零搬运 \\
+编程模型 & 标准 Python 多进程 & CUDA kernel / Warp \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[GPU 并行的核心优势是「数据零搬运」，不只是「核心多」]\label{ins:rlmc-eco-zerocopy}
+端到端看一次训练迭代：\verb|env.step()| 产出 obs/reward $\to$ 策略网络前向算 action $\to$ rollout buffer 存储 $\to$ PPO 反向更新。在 GPU 并行范式下，这一整条流水线\emph{从头到尾都在 GPU 显存上}，没有任何 CPU--GPU 搬运。而在 CPU 多进程范式下，即使你有\emph{无限多}的 CPU 核心，每次 rollout 后仍要把数据从 CPU 搬到 GPU 做策略前向、再搬回 CPU 做下一次 \verb|env.step()|——这个搬运延迟（微秒级）在 4096 环境规模下累积成无法消除的瓶颈。所以「为什么 CPU 加核也追不上 GPU」的答案，是搬运，不是算力。
+\end{insight}
+
+\begin{insight}[多视角·有人偏要把物理放回 CPU：UniLab 的异构反范式]\label{ins:rlmc-eco-heterogeneous}
+上一条把 CPU 多进程说成「追不上 GPU」，但这只是\emph{硬把整条管线钉在一种设备上}时的结论。第三个框架 \textbf{UniLab} 给出了反例：它\emph{故意}把物理仿真留在 CPU（MuJoCoUni / MotrixSim 多线程批量步进），只把策略学习放在 GPU，两端用\textbf{共享内存 IPC} 解耦——transition 单向从 collector（CPU 子进程）流向 learner（GPU 父进程），actor 权重经 \verb|SharedWeightSync|（版本化扁平 buffer + \verb|int64| 版本号、单写多读、零序列化）单向流回。它\emph{没有}消除 CPU--GPU 边界，而是把这条边界做成\textbf{显式、可计量、可预取}的 H2D 管线（pinned-host + 双缓冲 + 可选原生扩展），让「CPU 采样打包」与「GPU 训练」流水线重叠。这样换来三件 GPU-sim 给不了的东西：(1) 不依赖任何 GPU 物理后端——任何能跑 MuJoCo 的机器都行；(2) collector 不必等 learner，异步 off-policy（APPO/SAC）成了一等公民；(3) 接触求解在 CPU 全精度。代价也实在：放弃了 CUDA-graph 那种把整条物理步固化的极致单卡并行，并多出一个新失败面——\verb|/dev/shm| 共享内存预算（UniLab 专门有 \verb|memory_budget.py| 在分配前估算、超 80\% 直接 \verb|MemoryError|）。所以「GPU 并行是不是唯一答案」的诚实回答是：\emph{当 GPU-sim 后端可用且追求单卡极致吞吐时是；当 CPU 核多、无强 GPU-sim 后端、或要异步解耦时，把物理留在 CPU 反而是更优的工程选择}。记住这条多视角，你才不会把「GPU 并行」误当成机器人 RL 的唯一信仰。
+\end{insight}
+
+GPU 的执行模型是 SIMT（Single Instruction, Multiple Threads）：同一条指令同时在数千线程上执行，每线程操作不同数据。这天然契合环境并行——每个环境的 \verb|step()| 跑\emph{完全相同}的计算流程（同一指令），但各自操作\emph{独立}的状态数据（不同数据）。这种「相同计算、不同数据」的模式在 GPU 上极高效：指令缓存命中率高、状态数据连续排布可合并访存（memory coalescing）、环境间无通信需求。
+
+\begin{insight}[SIMT 直接约束你怎么写环境]\label{ins:rlmc-eco-simt}
+理解 SIMT 不是为了写 CUDA，而是因为它\emph{约束}了环境设计。两类做法在 GPU 并行里低效或不允许：(1) \verb|if env_id == 0: do_special()| 这类按环境分支会导致 warp 发散（warp divergence），GPU 效率骤降——正确替代是用 mask 张量：\verb|result = mask*special + (1-mask)*normal|；(2) 不同环境用不同 reward 函数违反「同一指令」原则——正确做法是所有环境算相同 reward，用权重 mask 控制哪些项生效。好在 Manager-Based 架构已替你处理了大部分：你在 config 里写的 \verb|ObsTerm|/\verb|RewTerm|/\verb|EventTerm| 都被框架自动转成符合 SIMT 的张量操作，你无需手写 kernel。这也解释了\emph{为什么}框架要做成 Manager-Based 的——它是 SIMT 约束下「让研究者像搭积木」的工程答案。
+\end{insight}
+
+\subsection{数据布局与 action repeat：两个易被忽视的工程细节}
+
+\paragraph{SoA 而非 AoS。}对 $N$ 个环境、每个 $D$ 维状态，GPU 偏好 SoA（Structure of Arrays）布局：同一维度的数据在显存里连续，当所有线程同时读同一维度时可合并为一次访存。这就是为什么框架里的张量形状几乎总是 \verb|(num_envs, dim)| 而非 \verb|(dim, num_envs)|——这不是随意约定，而是访存模式的直接要求。mjlab 与 Isaac Lab 都用 SoA。
+
+\paragraph{action repeat（decimation）。}策略决策频率（如 $50\,$Hz）通常低于物理步频（如 $200\,$Hz），于是每次 \verb|env.step()| 内部调用多次 \verb|sim.step()|：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+参数 & 含义 & 典型值 \\
+\midrule
+\verb|dt| & 物理时间步长 & $0.005\,$s（$200\,$Hz） \\
+\verb|decimation| & 每个 policy step 的物理子步数 & 4 \\
+\verb|policy_dt| & 决策周期（\verb|dt| 乘 \verb|decimation|） & $0.02\,$s（$50\,$Hz） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[action repeat 是「决策频率」与「物理精度」之间的桥]\label{ins:rlmc-eco-decimation}
+策略不必每个物理步都决策——就像人走路时大脑不以 $200\,$Hz 控制每块肌肉，而是低频发高层指令，底层反射回路做高频调节。decimation 太小（如 1）使策略输出变化过于细碎、训练负担重；太大（如 20）使策略反应迟钝、来不及修正误差；locomotion 常用 4。这个参数会贯穿后文的延迟建模——观测延迟的 lag 单位正是 env step 而非 physics step（详见 \cref{ch:rlmc-obsact} 的 delay 阶段）。
+\end{insight}
+
+\subsection{吞吐量、CUDA Graph 与显存上限}
+
+不同框架在相同硬件上的吞吐差异，比想象中小。下表是\emph{量级参考}（\pz{待核实：具体 steps/s 强依赖任务与硬件，源稿给出的 A100 上 mjlab/Isaac Lab 约 $4$--$5\times10^5$ steps/s 为社区量级估计，未逐一复现}）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+框架 & 物理引擎 & 并行度 & 量级（steps/s） & 备注 \\
+\midrule
+CPU MuJoCo & MuJoCo & 1 & $\sim 10^3$ & 单核 baseline \\
+mjlab & MuJoCo Warp & 4096 & $\sim 10^5$ & \rebuilt{量级参考} \\
+Isaac Lab & PhysX & 4096 & $\sim 10^5$ & \rebuilt{量级参考} \\
+MuJoCo Playground & MJX(JAX) & 4096 & $\sim 10^5$ & \rebuilt{量级参考} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+要点：GPU 并行相比 CPU 单核有\emph{两到三个数量级}的提升（这与 Isaac Gym 原论文「2--3 orders of magnitude」一致\,\cite{makoviychuk2021isaacgym}），但 mjlab 与 Isaac Lab 之间在同一数量级、差异不大——\textbf{吞吐量不是选框架的主要依据}，物理精度、API 设计、生态支持更重要。
+
+\begin{insight}[别被「首跑小 env 数的低吞吐」吓到，且学会自己测]\label{ins:rlmc-eco-throughput}
+上表的 $\sim 10^5$ steps/s 是 \textbf{4096 并行环境} 量级的稳态峰值，\emph{不是}你第一次小规模冒烟时会看到的数字。在 RTX 4090 上实测 mjlab \verb|Velocity-Flat-Unitree-G1| 仅 \verb|--env.scene.num-envs 64| 时，稳态约 \textbf{$1.6$--$2.5\times10^3$ steps/s}——比峰值低了近两个数量级。原因有二：(1) 64 个环境远填不满 GPU 的数千个 SIMT 通道（kernel 未饱和），吞吐受启动/调度而非算力主导；(2) \textbf{首个}迭代还要付一次性的 JIT 编译与 CUDA-graph 录制开销，所以\emph{第一行 steps/s 总是最低}，跑几十迭代后才升到稳态。结论：冒烟用小 env 数看到几千 steps/s 是\emph{正常}的，别误判成「装坏了」；要看真实吞吐，把 \verb|--env.scene.num-envs| 加到 $2048$/$4096$ 再读稳态行。\textbf{怎么自己测}——不必写计时代码，三框架的训练循环都\emph{自带}每迭代打印 \verb|steps/s|（mjlab/Isaac Lab 经 RSL-RL 的 \verb|OnPolicyRunner|，UniLab 同理）：跑十几迭代、读\emph{稳定后}那几行的数字，就是你这台机器在该 env 数下的实测吞吐。把这个数记下来当 baseline，日后某次改动让它掉一半，往往就是无意中触发了 CUDA-graph 重建或把某段计算挪回了 CPU（呼应 \cref{ins:rlmc-eco-zerocopy}）。
+\end{insight}
+
+即便数据全在 GPU，每次 \verb|env.step()| 仍要启动多个 CUDA kernel（接触检测、力计算、积分、obs 拼接、reward……），每个 kernel 启动都有微秒级 CPU 端开销。\textbf{CUDA Graph} 把一串 kernel 启动序列「录制」下来，之后一次 CPU 调用即可重放整段——mjlab 与 Isaac Lab 都支持。但它有硬限制：\emph{计算图必须静态}，不允许动态分支。框架常用「延迟 reset」（记录待 reset 的环境 ID，待所有环境 step 完成后统一 reset）来规避「不同环境在不同时刻 reset」造成的分支。
+
+\begin{insight}[GPU 并行的上限是显存，不是核心数]\label{ins:rlmc-eco-vram}
+每个并行环境要存机器人状态（\verb|qpos|/\verb|qvel|）、接触缓冲、obs/action/reward 张量。一个粗略但够用的估算公式是
+\begin{equation}
+\texttt{max\_envs}\ \approx\ \frac{(\texttt{VRAM\_GB}-2)\times 1000}{\texttt{per\_env\_MB}},
+\label{eq:rlmc-eco-maxenvs}
+\end{equation}
+其中预留 $2\,$GB 给 PyTorch 框架与策略网络。它不精确，却足以在训练\emph{前}判断「4096 环境在我的卡上跑不跑得动」。一个关键提醒：当任务含视觉传感器（RGB/Depth）时，每环境显存会暴涨 $10$--$50$ 倍——这正是视觉策略任务往往需要 $80\,$GB 卡的原因，也是 \cref{sec:rlmc-eco-select} 决策树把「是否需要视觉」放在第一问的工程根据。
+\end{insight}
+
+\begin{pitfall}[三个关于 GPU 并行的常见误解]
+\textbf{一·以为 GPU 并行\emph{总}更快}：对极简任务（如 CartPole），kernel 启动开销可能超过计算本身，此时 CPU 多进程反而更快。GPU 的优势在高自由度机器人（四足/人形）上才真正体现。\textbf{二·忽视 CUDA Graph 的静态图限制}：若环境有复杂动态行为（地形切换、curriculum 升级），CUDA Graph 可能失效，表现为「某些 step 突然变慢」。\textbf{三·混淆「环境数」与「有效样本量」}：4096 个\emph{初始条件相同、无域随机化}的环境产生高度相关的数据，对策略更新的贡献远小于 4096 个独立样本——数量不等于多样性。
+\end{pitfall}
+
+\begin{practice}[练习·GPU 并行]
+\begin{enumerate}
+  \item \textbf{[推理]} 解释为什么 CPU 多进程范式即便有 4096 个核心，训练速度仍追不上 GPU 并行（提示：\cref{ins:rlmc-eco-zerocopy} 的搬运延迟）。
+  \item \textbf{[计算]} 查出你常用 GPU 的显存，用 \cref{eq:rlmc-eco-maxenvs} 估算每环境约 $2\,$MB 状态时最多能并行多少个人形环境；再估算每环境含相机约 $50\,$MB 时的数字。
+  \item \textbf{[计算]} 任务用 \verb|dt=0.005|（$200\,$Hz）、\verb|decimation=4|。决策频率是多少 Hz？若改 \verb|decimation=8|，频率变多少？这对训练效果可能有何影响？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{生态演进：每一代解决了什么痛点}
+\label{sec:rlmc-eco-evolution}
+
+\subsection{为什么要懂演进脉络}
+
+2026 年的 GitHub 上至少有六个活跃的机器人 RL 仿真框架。一个博士新生面对它们会困惑：「它们什么关系？我该用哪个？」要回答，必须理解演进脉络——\emph{每一代框架都是为解决上一代的痛点而生}。不懂这条线，你会看不懂为什么 2023 年的论文用 Isaac Gym 而 2026 年的用 mjlab，可能花几天配好一个已停止维护的框架，甚至在不适合你任务的框架上耗费数月。
+
+\subsection{六个阶段：核心创新与遗留痛点}
+
+\paragraph{阶段一·CPU MuJoCo（2012--2021）。}MuJoCo（Multi-Joint dynamics with Contact）由 Todorov、Erez、Tassa 在 IROS 2012 发表\,\cite{todorov2012mujoco}。经核对，它于 2021 年 10 月被 Google DeepMind 收购，2022 年 5 月以 Apache 2.0 完整开源\,\cite{todorov2012mujoco}。其核心创新是\textbf{广义坐标 + 凸优化接触}：接触约束不像传统 LCP 那样求解互补性问题（病态时可能发散），而是松弛为凸优化——\emph{求解总能成功}。这使它在足式机器人（接触频繁建立/断开）与灵巧手（手指与物体复杂接触）中表现出色。遗留痛点：\textbf{单线程 CPU，吞吐低}——训练四足要数小时到数天。
+
+\begin{paper}[MuJoCo：广义坐标 + 凸优化接触的物理引擎]\label{paper:rlmc-eco-mujoco}
+\textbf{问题}：如何在接触密集的多关节系统中兼顾仿真精度与速度，且求解稳定。\textbf{核心思想}：用广义（关节）坐标表达动力学，把硬接触的互补性约束松弛为\emph{凸优化}问题求解。\textbf{关键结果}：凸优化保证全局最优解、求解总能收敛，代价是允许极微小穿透与微滑（slip）；在足式与灵巧操作上取得当时最佳的精度-速度平衡\,\cite{todorov2012mujoco}。\textbf{与本书关系}：mjlab 的 MuJoCo Warp 本质是「保留这套接触精度，但搬到 GPU 上跑」——理解 \cref{paper:rlmc-eco-mujoco} 才懂 \cref{sec:rlmc-eco-manager} 里 mjlab「回到 MuJoCo 物理」的动机。\textbf{局限}：原版单线程 CPU，吞吐量不足以支撑大规模并行 RL。
+\end{paper}
+
+接触模型的差异值得先建立直觉，因为它是后续物理引擎选型的核心。传统游戏引擎（PhysX/Bullet/ODE）用\textbf{硬接触}：求解一组力使穿透量为零，这是 LCP（线性互补问题），数学上 NP-hard，求解器只能近似（如 PhysX 的 TGS 迭代），接触点多或几何复杂时可能不收敛。MuJoCo 用\textbf{软接触}：允许微小穿透，用凸优化算使穿透最小的接触力，求解\emph{总能成功}，代价是接触面有极微小穿透与微滑。
+
+\begin{pitfall}[接触参数选错的三种典型症状]
+MuJoCo 用 \verb|solref|（接触刚度/阻尼）与 \verb|solimp|（约束阻抗）控制接触行为。选错的三种症状：\textbf{穿透}（\verb|solref| 太软）——足端穿过地面，机器人「沉」入地下；\textbf{弹跳}（\verb|solref| 太硬 + 阻尼不足）——物体在接触面反复振荡；\textbf{微滑}（软接触固有特性）——静止物体在斜面缓慢下滑，可调 \verb|impratio| 缓解。对多数 locomotion 任务，MuJoCo 默认值已够好，只在接触行为明显异常时才手动调。\pz{源稿给出各材质 solref 参考值（如金属 [0.005,1.0]）引自 ROBOLAWEB cheat sheet，本书未独立复现，使用前请对照官方文档。}
+\end{pitfall}
+
+\paragraph{阶段二·Isaac Gym（2021--2024）。}NVIDIA 在 NeurIPS 2021 发布 Isaac Gym\,\cite{makoviychuk2021isaacgym}，\textbf{首次实现 GPU 并行仿真 + 端到端 GPU 训练}，是机器人 RL 工程化的分水岭。后端为 PhysX。它对社区影响巨大：ETH RSL 的 \verb|legged_gym|（Rudin 等，CoRL 2021\,\cite{rudin2021minutes}）在其上确立了四足 locomotion 的标准训练范式，后续几乎所有足式 RL 论文都以它为基。但 Isaac Gym 的\textbf{单体架构}痛点很快暴露：一个任务文件常超 2000 行，obs/reward/reset/域随机化全耦合在一个巨型类里，改任一组件都可能引入隐蔽 bug。
+
+\begin{paper}[Isaac Gym / legged\_gym：GPU 并行 locomotion 的奠基]\label{paper:rlmc-eco-isaacgym}
+\textbf{问题}：CPU 仿真吞吐不足，四足 locomotion 训练动辄数小时到数天。\textbf{核心思想}：把物理仿真与神经网络训练\emph{都}放在 GPU 上，数据从物理 buffer 直接传给 PyTorch 张量，不经 CPU（\cref{ins:rlmc-eco-zerocopy} 的「零搬运」即源于此）\,\cite{makoviychuk2021isaacgym}；\verb|legged_gym| 在此之上给出大规模并行 PPO 的 locomotion 范式\,\cite{rudin2021minutes}。\textbf{关键结果}：相较 CPU 仿真 + GPU 训练有 2--3 个数量级加速\,\cite{makoviychuk2021isaacgym}；平地四足策略可在数分钟内训成，崎岖地形约二十分钟\,\cite{rudin2021minutes}。\textbf{与本书关系}：理解它的\emph{单体架构痛点}，才理解 Manager-Based 架构（\cref{sec:rlmc-eco-manager}）为何不可避免。\textbf{局限}：单体类不可组合、接触精度不如 MuJoCo、仅支持 PhysX；Isaac Gym 本身已停止维护。
+\end{paper}
+
+\begin{codebox}[Python]{单体架构（legged\_gym 风格，简化示意）：一个类装下所有逻辑}
+class LeggedRobot(BaseTask):
+    def step(self, actions):
+        self.pre_physics_step(actions)   # action 处理
+        self.gym.simulate(self.sim)      # 物理 step
+        self.post_physics_step()         # obs/reward/reset 全混在这里
+
+    def compute_observations(self):      # 200+ 行 obs 计算
+        self.obs_buf = torch.cat([...], dim=-1)
+
+    def compute_reward(self):            # 300+ 行 reward 计算
+        self.rew_buf = ...
+
+    def reset_idx(self, env_ids):        # 150+ 行 reset 逻辑
+        ...
+    def _push_robots(self):              # 域随机化也在同一个类里
+        ...
+\end{codebox}
+
+\paragraph{阶段三·Isaac Lab（2024--）。}NVIDIA 2024 年发布 Isaac Lab\,\cite{mittal2025isaaclab} 作为 Isaac Gym 继任者，核心创新是 \textbf{Manager-Based 架构}——把 MDP 的每个组件（obs/action/reward/termination/event/command/curriculum）拆到独立 Manager，实现关注点分离。后端默认 PhysX，3.0 Beta 起可经 Newton 用 MuJoCo Warp。优势：架构清晰、多物理后端、RTX 渲染（视觉任务）、社区最大。痛点：\textbf{安装复杂}（需 Isaac Sim/Omniverse 或 kit-less 配置）、启动延迟较大、对 MuJoCo 物理的支持仍在 Beta。
+
+\paragraph{阶段四·MuJoCo Playground / MJX（2024--2025）。}Google DeepMind 推出 MuJoCo 的 JAX 加速版 MJX 及其上的 MuJoCo Playground\,\cite{zakka2025playground}，用 JAX \verb|vmap| 实现批量仿真，物理精度与 CPU MuJoCo 一致，且\emph{可微分}。其独特能力是基于 Madrona 的\emph{批量渲染}——可在 GPU 上同时为数千环境生成 RGB/Depth\,\cite{zakka2025playground}。痛点：JAX 生态与主流 PyTorch RL 算法库（RSL-RL/RL Games）不直接兼容。
+
+\paragraph{阶段五·Newton（2025--）。}Newton 由 NVIDIA、Google DeepMind、Disney Research 联合发起，2025 年起由 Linux Foundation 治理为开源项目（Apache 2.0）\,\cite{newton2025}。目标是\textbf{统一多个物理求解器}在一个 API 下，让用户在同一任务中切换后端而不改 MDP 代码。其中 Disney 的 \textbf{Kamino} 求解器专攻\emph{闭环机构}（平行连杆腿、灵巧手）——多数引擎难以稳定仿真的拓扑\,\cite{newton2025}。
+
+\begin{paper}[Newton：多求解器统一的开源物理引擎]\label{paper:rlmc-eco-newton}
+\textbf{问题}：不同任务（locomotion / 闭环机构 / 软体 / 颗粒材料）需要不同物理求解器，过去要维护多套环境代码才能跨引擎对比。\textbf{核心思想}：在 NVIDIA Warp + OpenUSD 之上，用统一 API 容纳多个求解器（含 MuJoCo Warp 主求解器与 Disney 的 Kamino 闭环求解器），切换后端只改配置\,\cite{newton2025}。\textbf{关键结果}：据 NVIDIA 技术博客，MuJoCo Warp 相对 MJX 在 RTX PRO 6000 Blackwell 上 locomotion 约 $252\times$、manipulation 约 $475\times$\,\cite{newton2025blog}。\textbf{与本书关系}：Newton 正让 Isaac Lab 与 mjlab 在\emph{物理后端}层面趋同（两者都可用 MuJoCo Warp），未来选框架更多取决于 API/生态而非引擎——这是本书选「双框架对比」教学的核心理由。\textbf{局限}：Isaac Lab 对 Newton 的集成仍 Beta。
+\end{paper}
+
+\begin{pitfall}[别盲信「up to」峰值 benchmark]
+\cref{paper:rlmc-eco-newton} 引的 $252\times$/$475\times$ 是 NVIDIA 官方在特定硬件（RTX PRO 6000 Blackwell）、特定任务（locomotion / manipulation）上对 MJX 的\emph{峰值}（up to），非平均值；换 RTX 4090 数字降到约 $152\times$/$313\times$\,\cite{newton2025blog}。教学选型里，性能差异\emph{不}是主要依据。经核对 NVIDIA 技术博客，「Newton Beta 作 Isaac Lab 后端时 in-hand 灵巧操作比 PhysX 快至多 $65\%$」一句\emph{属实}\,\cite{newton2025blog}。\pz{源稿曾写「Newton 含 7 个求解器」，经核对官方 \texttt{newton.solvers} API 实为 8 个具体求解器类——\texttt{SolverMuJoCo}、\texttt{SolverXPBD}、\texttt{SolverVBD}、\texttt{SolverImplicitMPM}、\texttt{SolverFeatherstone}、\texttt{SolverSemiImplicit}、\texttt{SolverStyle3D}、\texttt{SolverKamino}（另有抽象基类 \texttt{SolverBase}）；具体个数随版本增删，以你所装 Newton 的 \texttt{newton.solvers} 为准。}
+\end{pitfall}
+
+\paragraph{阶段六·mjlab（2026--）。}UC Berkeley 的 Zakka、Liao、Yi、Le Lay、Sreenath、Abbeel 团队 2026 年发布 mjlab\,\cite{mjlab2026}。设计哲学一句话：\textbf{Isaac Lab 的 Manager-Based API + MuJoCo Warp 的 GPU 物理 + 一条命令安装}。后端为 MuJoCo Warp（Google DeepMind 与 NVIDIA 共同维护的 MuJoCo GPU 加速版）。优势：轻量、MuJoCo 原生精度、Isaac Lab 风格 API、可直接访问 \verb|MjModel|/\verb|MjData|。痛点：社区规模与内置任务数不如 Isaac Lab、不支持 RTX 渲染、仅支持 RSL-RL（PPO）。
+
+\begin{paper}[mjlab：轻量级 GPU 机器人学习框架]\label{paper:rlmc-eco-mjlab}
+\textbf{问题}：Isaac Lab 的 Manager-Based API 很好，但 Isaac Sim 依赖让安装与启动笨重；MuJoCo 物理精度高，却缺一个 PyTorch 生态下的轻量框架封装。\textbf{核心思想}：把 Isaac Lab 的 Manager-Based API 直接搭在 MuJoCo Warp 上，单条 \verb|pip install| 即可，并\emph{直接暴露} MuJoCo 原生数据结构\,\cite{mjlab2026}。\textbf{关键结果}：随附 velocity tracking / motion imitation / manipulation 等参考任务；学会 Isaac Lab 后迁移到 mjlab 认知成本低（核心 Manager 概念一一对应）\,\cite{mjlab2026}。\textbf{与本书关系}：mjlab 是本部「轻量/接触密集」实战的主线框架之一。\textbf{局限}：仅 RSL-RL 后端、无 RTX 渲染。\pz{源稿引用的 mjlab arXiv 号 2601.22074 与版本/Stars 等细节中，arXiv 号与作者经核对属实；Stars 等时效数据本书不固定。}
+\end{paper}
+
+\begin{insight}[一条贯穿六阶段的模式：保留核心优势、消除核心痛点]\label{ins:rlmc-eco-pattern}
+六个阶段不是孤立的，而是一条「继承-改良」链：Isaac Gym 保留了 GPU 并行、消除了 CPU 吞吐痛点；Isaac Lab 保留 GPU 并行、用 Manager 架构消除单体不可组合痛点；mjlab 保留 Manager API、用 MuJoCo Warp + pip 消除「物理精度不足 + 安装笨重」痛点；Newton 则保留各家引擎优势、用统一 API 消除「跨引擎要维护多套代码」痛点。看懂这条模式，你读任何\emph{新}框架时都能一句话定位它：「它保留了谁的什么，又想消除谁的什么痛点。」
+\end{insight}
+
+\subsection{演进时间线（速查）}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+年份 & 框架/项目 & 后端 & 解决的痛点 / 留下的痛点 \\
+\midrule
+2012 & MuJoCo（Todorov） & CPU 广义坐标 & 接触精度高 / 单线程吞吐低 \\
+2021 & Isaac Gym（NVIDIA） & PhysX(GPU) & GPU 并行 / 单体架构 \\
+2021 & legged\_gym（ETH RSL） & PhysX(GPU) & locomotion 标准范式 / 不可组合 \\
+2024 & Isaac Lab（NVIDIA） & PhysX/Newton & Manager 架构 / 安装复杂 \\
+2024 & MuJoCo Playground/MJX & MJX(JAX) & 可微分 + 批量渲染 / JAX 生态 \\
+2025 & Newton（LF 治理） & 多求解器 & 统一引擎 / Isaac Lab 集成 Beta \\
+2026 & mjlab（UC Berkeley） & MuJoCo Warp & MuJoCo 精度 + pip 安装 / 仅 PPO \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[三个关于生态的常见误解]
+\textbf{一·以为 Isaac Gym 还是主流}：截至 2026 年它已被 Isaac Lab 与 mjlab 取代，新项目不应再基于它；但很多高星老项目仍用它，读其代码要理解架构限制。\textbf{二·把 MJX 与 MuJoCo Warp 当同一物}：MJX 基于 JAX（用于 MuJoCo Playground），MuJoCo Warp 基于 NVIDIA Warp（用于 mjlab，由 DeepMind + NVIDIA 共同维护）；物理精度相近，编程模型完全不同。\textbf{三·混淆「框架」与「物理引擎」}：Isaac Lab 是\emph{框架}、PhysX/MuJoCo Warp 是\emph{物理引擎}；同一引擎可被不同框架使用（MuJoCo Warp 被 mjlab 直接用、被 Isaac Lab 经 Newton 间接用）。
+\end{pitfall}
+
+\begin{practice}[练习·生态演进]
+\begin{enumerate}
+  \item \textbf{[梳理]} 画一张「框架-引擎」对应图，标明 mjlab、Isaac Lab、legged\_gym、MuJoCo Playground 各用什么物理引擎。
+  \item \textbf{[对比]} 找一篇 2024 年与一篇 2026 年的足式机器人论文，对比其仿真框架，分析迁移的技术原因。
+  \item \textbf{[应用]} 用 \cref{ins:rlmc-eco-pattern} 的「保留-消除」句式，给一个你听说过但本章没讲的框架（如 Genesis）做一句话定位。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Manager-Based 架构：三框架对比实战}
+\label{sec:rlmc-eco-manager}
+
+\subsection{模块功能与在管线中的位置}
+
+\cref{ins:rlmc-eco-simenv} 指出 \verb|env.step()| 的七步 MDP 逻辑需要某种\emph{组织方式}。Manager-Based 架构就是这个组织方式：把 MDP 的每个维度交给一个独立 Manager 管理，每个 Manager 由若干\emph{项}（term）组成，项之间通过 config 组合。这把复杂任务从一个巨型 \verb|step| 函数里解耦出来——\emph{改一个奖励不再牵动观测}。这套架构 Isaac Lab 首创、mjlab 借鉴；UniLab 则\emph{不走} Manager 路线，但要处理的那些 MDP 维度一个不少，只是组织在别处（下一小节逐项对齐）。
+
+经核对 Isaac Lab 官方文档\,\cite{mittal2025isaaclab}，其公开 Manager 覆盖 observation / action / reward / termination / command / curriculum / event / recorder 等维度。下表给出职责与「你何时会改它」，并标注三框架支持情况：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+Manager & 职责 / 何时修改 & mjlab & Isaac Lab \\
+\midrule
+ObservationManager & 算 obs 并拼张量 / 改策略输入 & \checkmark & \checkmark \\
+ActionManager & 处理 action 并下发执行器 / 改动作空间 & \checkmark & \checkmark \\
+RewardManager & 算各 reward 项并加权 / 改奖励 & \checkmark & \checkmark \\
+TerminationManager & 判 episode 结束 / 改终止条件 & \checkmark & \checkmark \\
+EventManager & 域随机化与事件 / 改 DR 策略 & \checkmark & \checkmark \\
+CommandManager & 生成指令并管生命周期 / 改指令范围 & \checkmark & \checkmark \\
+CurriculumManager & 按进度调难度 / 改课程 & \checkmark & \checkmark \\
+RecorderManager & 录视频/状态 / 加录制 & \checkmark & \checkmark \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[一个易传错的「Manager 数目」说法]
+源稿称「Isaac Lab 八大 Manager、mjlab 第九个 MetricsManager 独有」。经在服务器实装的 mjlab 1.4.0 上核对源码：\verb|mjlab.managers| 确实多出一个 \textbf{MetricsManager}（Isaac Lab 无对应——它无 weight、不 $\times$dt、不除 episode 长度，专报「真·逐步回合平均」），这一「mjlab 独有」说法\emph{成立}；mjlab 另有 Action/Command/Curriculum/Event/Observation/Recorder/Reward/Termination 共九个管理器。但「Isaac Lab 恰好八个公开 Manager」这类\emph{精确计数}随版本变化、不同文档口径不一。\pz{待核实：两框架公开 Manager 的确切个数随版本浮动，请以各自当时版本的 API 文档为准；本书只依赖「每个 Manager 对应 MDP 一个维度、改一个不影响其他」这一稳定事实。}
+\end{note}
+
+上表只列了两家，因为\textbf{UniLab 没有 Manager 类}——但 Manager 要管的那些 MDP 维度，UniLab 一样要处理，只是\emph{散布在别处}。把「每个 Manager 的职责落在 UniLab 的哪里」对齐一遍，恰好能反向印证「Manager 把什么聚合成了什么」：
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.6cm}p{10.0cm}@{}}
+\toprule
+Manager 职责（mjlab/Isaac Lab） & UniLab 把它放在哪（经源码核对） \\
+\midrule
+Observation / Reward / Termination & 合并进 \verb|NpEnv.update_state()| \emph{一处}算：obs 在 \verb|_compute_obs| 拼，reward 经 \verb|run_reward_dispatch| 派发，terminated 直接判 \\
+Reward 的「项+权重」 & 不是 \verb|RewTerm| 类，而是 Hydra \verb|reward.scales| 标量字典 + env 内 \verb|_reward_fns| 派发表（\verb|RewardContext| 传上下文） \\
+Event（域随机化） & 独立 \verb|DomainRandomizationManager|（init / reset / interval 三模式，对应 \verb|EventMode|） \\
+Curriculum & 独立 \verb|PenaltyCurriculum|（按 episode 长度缩放负权重）+ 地形课程 \\
+Command & \verb|Commands|（速度命令采样 + heading 反馈） \\
+Action & 无 \verb|ActionCfg| 类：\verb|apply_action| 里 \verb|ctrl = act*action_scale + default_angles|（位置式 PD 残差） \\
+Recorder / Metrics & 无对应 Manager 类；诊断靠 \verb|NanGuard|（自动 dump + \verb|unilab-viz-nan| 离线复现）+ chrome-trace profiling \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[Manager-Based 不是「唯一正确」，是一种\emph{聚合粒度}的选择]\label{ins:rlmc-eco-manager-granularity}
+对照上表能看出一个常被忽略的事实：Manager-Based 的本质是\textbf{把 MDP 沿「维度」切开、每维一个可独立替换的盒子}。UniLab 把 obs/reward/termination \emph{合在一处}（\verb|update_state|）、却把 DR 和课程\emph{拆成独立 manager}——它的切分线和 Isaac Lab 不同，但同样在「关注点分离」与「一处看全」之间做权衡。所以「要不要 Manager」不是对错题：Manager 把消融做廉价（改一行 config）、代价是逻辑被打散到多个文件、新手要先建立「哪个 term 在哪个 manager」的地图；\verb|update_state| 一处算齐则一眼看全数据流、代价是想做消融得改函数体。看清这一点，你读任何框架时都能问出更准的问题：「它把 MDP 切成了几块、沿什么线切、谁能独立换」——而不是只会问「它有没有 RewardManager」。
+\end{insight}
+
+\subsection{配置详解：Manager-Based 最小骨架（四维配置表）}
+
+把抽象落到代码。Manager-Based 任务的核心是一个 \verb|@configclass| 配置树，下面是「观测 + 奖励 + 事件」三个 Manager 的最小骨架（Isaac Lab 风格；mjlab 结构几乎同形，差异见 \cref{sec:rlmc-eco-manager-compare}）。先看代码，再用四维表解读关键配置项。
+
+\begin{codebox}[Python]{Manager-Based 最小骨架（Isaac Lab 风格，简化示意）}
+from isaaclab.utils import configclass
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import EventTermCfg as EventTerm
+import isaaclab.envs.mdp as mdp
+
+@configclass
+class ObservationsCfg:
+    @configclass
+    class PolicyCfg(ObsGroup):                       # 部署可得信号（actor 用）
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)  # 相对默认姿态的关节角
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+    policy: PolicyCfg = PolicyCfg()
+
+@configclass
+class RewardsCfg:
+    track_lin_vel = RewTerm(func=mdp.track_lin_vel_xy_exp, weight=1.5)
+    track_ang_vel = RewTerm(func=mdp.track_ang_vel_z_exp, weight=0.75)
+
+@configclass
+class EventCfg:
+    # mode 决定何时触发：startup（仅一次）/ reset（每次重置）/ interval（周期）
+    randomize_mass = EventTerm(func=mdp.randomize_rigid_body_mass, mode="startup")
+    push_robot = EventTerm(func=mdp.push_by_setting_velocity, mode="interval")
+\end{codebox}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{2.6cm}p{3.0cm}p{3.4cm}@{}}
+\toprule
+配置项 & 默认值来源 & 修改影响 & 合理范围 / 与其他配置耦合 \\
+\midrule
+\verb|RewTerm.weight| & 任务基类经验值\,\cite{rudin2021minutes} & 调高某项使策略更重视它，过高会压制其他项 & 与其他权重\emph{相对}大小才有意义；改一项常需重标其他项 \\
+\verb|EventTerm.mode| & 经核对 Isaac Lab\,\cite{mittal2025isaaclab} & 决定 DR 在 startup/reset/interval 何时触发 & 质量随机化常 \verb|startup|，推力常 \verb|interval|；与 episode 长度耦合 \\
+\verb|ObsTerm.func| & \verb|isaaclab.envs.mdp|\,\cite{mittal2025isaaclab} & 决定该项提取什么物理量 & 必须返回首维 \verb|num_envs| 的张量；与可部署性耦合（见 \cref{ch:rlmc-obsact}） \\
+组名 \verb|policy| & locomotion 基类默认 & 决定哪个网络消费这组 obs & Isaac Lab 默认仅 \verb|policy| 组，\verb|critic| 是追加项（详见 \cref{ch:rlmc-obsact}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[Manager-Based 的价值有两个互补视角]\label{ins:rlmc-eco-manager-value}
+\textbf{软件工程视角}：它实现了\emph{关注点分离}（separation of concerns）——每个 Manager 只负责一件事，改 obs 不碰 reward，改 DR 不碰 reset，降低认知复杂度。\textbf{科学研究视角}：它让\emph{消融实验}（ablation）变得廉价——你只改一行 config 就得到一个新实验条件，确保对比公平。对比单体架构：在 \verb|legged_gym| 里加一个 reward 项要改 \verb|compute_reward()| 内部、可能影响其他项的计算顺序；在 Manager 架构里只需加一行 \verb|RewTerm()|，其他 reward 完全不受影响。这正是 \cref{paper:rlmc-eco-isaacgym} 单体痛点的解药。
+\end{insight}
+
+\subsection{代码走读与三框架对比}
+\label{sec:rlmc-eco-manager-compare}
+
+mjlab 与 Isaac Lab 能互通的根本原因，是它们共享同一套 Manager-Based 架构。下面把同一个「四足速度跟踪」任务的配置在 mjlab 与 Isaac Lab 中并排（简化版）——\textbf{注意 mjlab 与 Isaac Lab 在命名上的真实差异}：mjlab 用\emph{原生 dataclass 工厂函数} + 普通 \verb|dict| 装 term（无 \verb|@configclass|），term 类用\emph{全名}（无 \verb|ObsTerm|/\verb|RewTerm| 短别名，那是 Isaac Lab 的 import 重命名习惯），奖励/观测函数名也与 Isaac Lab 不同。再放上 UniLab 的等价配置——\textbf{第三段读起来更不一样}：UniLab 不写 Manager 配置树，而是在 \verb|NpEnv| 子类里直接实现，奖励写成 Hydra 标量字典。这种「同一任务、多种架构哲学」的并置，恰是看清 Manager-Based 设计\emph{得失}的最好镜子。
+
+\begin{codebox}[Python]{mjlab：velocity 任务配置（G1，工厂函数 + dict，简化示意）}
+from mjlab.managers import ObservationTermCfg, RewardTermCfg   # mjlab 用全名，无 ObsTerm/RewTerm 别名
+from mjlab.managers import ObservationGroupCfg
+
+def make_g1_velocity_env_cfg():                # mjlab 用工厂函数返回 @dataclass 实例
+    actor_terms = {                            # term 容器是普通 dict（顺序靠插入序）
+        "base_ang_vel": ObservationTermCfg(func=mdp.base_ang_vel),
+        "joint_pos":    ObservationTermCfg(func=mdp.joint_pos_rel),
+        "joint_vel":    ObservationTermCfg(func=mdp.joint_vel_rel),
+    }
+    observations = {"actor": ObservationGroupCfg(terms=actor_terms,   # 组名叫 actor
+                                                 concatenate_terms=True)}
+    rewards = {                                # mjlab velocity 奖励真名（非 Isaac 的 *_exp）
+        "track_lin_vel": RewardTermCfg(func=mdp.track_linear_velocity,  weight=1.5),
+        "track_ang_vel": RewardTermCfg(func=mdp.track_angular_velocity, weight=0.75),
+    }
+    return ManagerBasedRlEnvCfg(scene=..., observations=observations, rewards=rewards)
+\end{codebox}
+
+\begin{codebox}[Python]{Isaac Lab：等价 velocity 任务配置（简化示意）}
+@configclass
+class AnymalVelocityEnvCfg(LocomotionVelocityRoughEnvCfg):
+    scene = InteractiveSceneCfg(
+        robot=ArticulationCfg(prim_path="{ENV_REGEX_NS}/Robot", ...),  # USD 资产
+        terrain=TerrainImporterCfg(prim_path="/World/ground", ...),
+    )
+    observations = ObservationsCfg(
+        policy=ObservationsCfg.PolicyCfg(                  # Isaac Lab 组名叫 policy
+            base_ang_vel=ObsTerm(func=mdp.base_ang_vel),
+            joint_pos=ObsTerm(func=mdp.joint_pos_rel),
+            joint_vel=ObsTerm(func=mdp.joint_vel_rel),
+        ),
+    )
+    rewards = RewardsCfg(
+        track_lin_vel_xy_exp=RewTerm(func=mdp.track_lin_vel_xy_exp, weight=1.5),
+        track_ang_vel_z_exp=RewTerm(func=mdp.track_ang_vel_z_exp, weight=0.75),
+    )
+\end{codebox}
+
+UniLab 的等价配置分两半：一个注册到 registry 的 \verb|dataclass| cfg（持 scene / 周期参数），一个继承 \verb|LocomotionBaseEnv| 的 env 类（在 \verb|update_state| 里\emph{一处}算 obs+reward+terminated）；奖励则\emph{不在 Python 里}，而在 Hydra YAML 的 \verb|reward.scales| 标量字典。下面是与上两段对应的简化骨架（结构经源码核对，\verb|registry|/\verb|NpEnv|/\verb|run_reward_dispatch| 见 UniLab \verb|src/unilab/base/| 与 \verb|envs/locomotion/common/|）。
+
+\begin{codebox}[Python]{UniLab：等价 velocity 任务（NpEnv 子类 + 标量字典奖励，简化示意）}
+from unilab.base import registry
+from unilab.base.scene import SceneCfg
+from unilab.envs.locomotion.common import rewards
+from unilab.envs.locomotion.common.base import LocomotionBaseCfg, LocomotionBaseEnv
+
+@registry.envcfg("Go2JoystickFlat")               # CamelCase = training.task_name
+@dataclass
+class Go2VelocityCfg(LocomotionBaseCfg):
+    scene: SceneCfg = field(default_factory=lambda: SceneCfg(
+        model_file="assets/robots/go2/scene_flat.xml"))   # MJCF（非 USD）
+    reward_config: RewardConfig | None = None     # 奖励权重经 Hydra 注入
+
+@registry.env("Go2JoystickFlat", sim_backend="mujoco")    # 同名可注册多后端
+@registry.env("Go2JoystickFlat", sim_backend="motrix")
+class Go2WalkTask(LocomotionBaseEnv):
+    @property
+    def obs_groups_spec(self):                    # 组名固定 obs/critic（非 policy）
+        return {"obs": 49, "critic": 52}          # critic 多 3 维 = 特权 base linvel
+
+    def update_state(self, state):                # 无 ObservationManager/RewardManager：
+        linvel, gyro = self.get_local_linvel(), self.get_gyro()   # 一处算齐
+        dof_pos, dof_vel = self.get_dof_pos(), self.get_dof_vel()
+        reward = self._compute_reward(state.info, linvel, gyro, dof_pos)
+        obs = self._compute_obs(state.info, gyro, dof_pos, dof_vel)
+        terminated = self._backend.get_sensor_data("upvector")[:, 2] <= 0.5
+        return state.replace(obs=obs, reward=reward, terminated=terminated)
+\end{codebox}
+
+\begin{codebox}[text]{UniLab：奖励是 Hydra 标量字典（conf/ppo/task/go2\_joystick\_flat/mujoco.yaml）}
+# @package _global_
+training: {task_name: Go2JoystickFlat, sim_backend: mujoco}
+reward:                                  # 对照 mjlab/Isaac 的 RewTerm(weight=...)
+  scales: {tracking_lin_vel: 1.0, tracking_ang_vel: 0.2,   # 正权重=目标
+           lin_vel_z: -2.0, action_rate: -0.01}            # 负权重=正则惩罚
+  tracking_sigma: 0.25
+\end{codebox}
+
+mjlab 与 Isaac Lab 结构几乎一一对应，差异集中在命名与资产格式；UniLab 则在\emph{架构维度}就不同（无 Manager 类、奖励是标量字典），故同一行里它常是「另一类东西」而非「换个名字」：
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.0cm}p{3.0cm}p{3.4cm}p{4.0cm}@{}}
+\toprule
+组件 & mjlab & Isaac Lab & UniLab \\
+\midrule
+环境基类 & \verb|ManagerBasedRlEnvCfg| & \verb|ManagerBasedRLEnvCfg|（及其子类） & \verb|NpEnv|/\verb|LocomotionBaseEnv|（\textbf{非} Manager 基类） \\
+场景 & \verb|SceneCfg|+\verb|EntityCfg| & \verb|InteractiveSceneCfg|+\verb|ArticulationCfg| & \verb|SceneCfg|（\verb|model_file|+\verb|fragment_files|） \\
+机器人资产 & MJCF（经 \verb|MjSpec| 合成） & USD（支持 URDF 转换） & MJCF / Motrix XML（\verb|unilab-import-robot| 转 URDF；无 USD） \\
+观测组名 & \verb|actor| / \verb|critic| & \verb|policy|（+可选 \verb|critic|） & \verb|obs| / \verb|critic|（env 侧固定两组） \\
+观测/奖励项 & 全名 \verb|ObservationTermCfg| / \verb|RewardTermCfg|（无短别名） & 习惯重命名为 \verb|ObsTerm| / \verb|RewTerm| & 无 term 类：obs 在 \verb|update_state| 拼，reward 是 \verb|scales| 标量字典 \\
+数据访问 & \verb|env.scene.robot|（属性） & \verb|env.scene["robot"]|（字典） & 后端 getter（\verb|get_dof_pos|/\verb|get_local_linvel| 等） \\
+配置系统 & 原生 \verb|@dataclass| + 工厂函数 & 自研 \verb|@configclass| 嵌套类 & Hydra \verb|@dataclass| + \verb|conf/*.yaml| 覆盖 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+经核对 UniLab 源码（\verb|base/registry.py| 的 \verb|register_env_config|/\verb|register_env|）：任务用\textbf{双装饰器}注册——\verb|@registry.envcfg("Name")| 标 cfg、\verb|@registry.env("Name", sim_backend=...)| 标 env 类，同名可挂多个后端；这与 Isaac Lab 的 \verb|gym.register|（字符串 entry\_point）、mjlab 的 \verb|register_mjlab_task|（已实例化 cfg 对象）是\emph{三种}不同的注册机制，但都回答同一个问题：「为什么 \verb|train| 给个任务名就能跑」。配置覆盖则走 Hydra 深合并（如 \verb|algo.num_envs=4096|），路由键 \verb|algo|/\verb|task|/\verb|training.sim_backend| 是保留字、必须用 flag。
+
+\begin{insight}[两类差异：mjlab$\leftrightarrow$Isaac Lab 是「换名字」，UniLab 是「换架构」]\label{ins:rlmc-eco-pickright}
+看上表要分清\emph{两种量级}的差异。mjlab 与 Isaac Lab 之间是\textbf{命名差异}（\verb|actor| vs \verb|policy|、\verb|EntityCfg| vs \verb|ArticulationCfg|），底层概念完全一致——掌握一个迁移到另一个只需 1--2 天，这正是「先用 mjlab 快速验证、需要视觉/多算法时切 Isaac Lab」之所以低成本的原因。而 UniLab 与前两家之间是\textbf{架构差异}：Manager 配置树 vs \verb|NpEnv| 子类、term 类 vs 标量字典、GPU 物理 vs CPU 物理——迁移要重写环境实现层，不是改命名。这条「两类差异」的区分，正是三框架对比的教学价值所在：前一对让你看清\emph{同一架构的不同命名}（概念稳定），后者让你看清\emph{同一问题的不同架构}（设计权衡）——当一个独立团队\emph{反着}主流范式做（把物理放回 CPU），你会自然追问「它在赌什么、放弃了什么」，这个追问比记住任何 API 都更接近工程本质。
+\end{insight}
+
+\begin{pitfall}[「两框架代码可直接复制粘贴」是错的]
+API 结构类似，但命名与细节不同：把 mjlab config 原样贴到 Isaac Lab 会报 \verb|AttributeError|/\verb|KeyError|（如组名 \verb|actor| vs \verb|policy|、数据访问属性 vs 字典）。迁移要按对应表逐项替换，而非复制。这也是为什么 \cref{ch:rlmc-obsact} 会专门厘清「环境侧组名」与「runner 侧 \texttt{obs\_groups} 键」两层命名的混乱。
+\end{pitfall}
+
+\subsection{运行验证：怎么确认 Manager 接对了}
+
+改完 Manager 配置后，\emph{先验证再训练}。最廉价的验证是 \cref{ins:rlmc-eco-zerorandom} 的 zero/random 体检，再加一步「打印实际维度」：
+
+\begin{codebox}[Python]{改完 obs/reward 配置后先跑几步，核对维度与 NaN（组名自适应三框架）}
+import torch
+
+def sanity_check(env, num_steps=5):
+    """改完 Manager 配置后跑 5 步 random agent，核对接线。"""
+    obs_dict, _ = env.reset()
+    # 关键：actor 组名跨框架不同——Isaac Lab 叫 "policy"，mjlab 叫 "actor"，
+    # UniLab 叫 "obs"。别硬编码 obs_dict["policy"]，否则照搬到 mjlab 会 KeyError。
+    actor_key = next(k for k in ("policy", "actor", "obs") if k in obs_dict)
+    print("实际可用的 obs 组名:", list(obs_dict.keys()), "-> 用", repr(actor_key))
+    for step in range(num_steps):
+        actions = torch.rand(env.num_envs,
+                             env.action_manager.total_action_dim,
+                             device=env.device) * 2.0 - 1.0
+        obs_dict, rew, *_ = env.step(actions)
+        actor_obs = obs_dict[actor_key]
+        assert actor_obs.shape[0] == env.num_envs        # 首维必须是 num_envs
+        print(f"[step {step}] obs={tuple(actor_obs.shape)} "
+              f"rew_mean={rew.mean():.3f} nan={torch.isnan(actor_obs).any().item()}")
+\end{codebox}
+
+预期：obs 形状的首维等于 \verb|num_envs|、第二维等于你手算的观测拼接维度；\verb|rew| 不为 NaN；运行不抛 \verb|KeyError|（组名匹配）。若 obs 维度与手算不符，多半是某个 \verb|ObsTerm| 没生效或拼接顺序有误。
+
+\begin{pitfall}[这段 \texttt{sanity\_check} 直接照搬到 mjlab 会 \texttt{KeyError}]
+上面的诊断脚本最初是 Isaac Lab 风格、取 \verb|obs_dict["policy"]|。但实测三框架的 actor 组名\emph{各不相同}：Isaac Lab 是 \verb|policy|、mjlab 是 \verb|actor|、UniLab 是 \verb|obs|（\cref{sec:rlmc-eco-manager-compare} 的对应表已列）。所以脚本里那行 \verb|next(k for k in ...)| 不是花架子——它先\textbf{打印当前框架真实存在的组名}再取值，正是「不背书里的名字、跑一次问框架要真值」这一方法论的最小落地。读者最该养成的习惯是：\emph{遇到组名相关的 \texttt{KeyError}，第一反应是} \verb|print(obs_dict.keys())| \emph{看实际有哪些键，而不是猜}。
+\end{pitfall}
+
+\begin{insight}[zero/random 体检：具体该在终端/Viser 里看哪几个量]\label{ins:rlmc-eco-smoke-read}
+\cref{ins:rlmc-eco-zerorandom} 说 zero/random 是「免费体检」，但只说「要跑、看什么」还停在概念——落到操作，你应当盯\textbf{三处可观测信号}：
+\begin{enumerate}
+  \item \textbf{Viser 网页里的姿态}（\verb|play --agent zero| 时）：浏览器开 \verb|http://localhost:8080| 看 3D 视图。健康的判据是机器人\emph{稳稳站着、足底贴地、不抖}；若它瘫成一摊或某条腿劈出去，就是默认偏置（offset）配错——回 \cref{ch:rlmc-obsact} 的动作偏置链查 keyframe，而\emph{不}是去调 reward。
+  \item \textbf{是否「炸飞」/出 NaN}（\verb|--agent random| 时）：随机动作下机器人应有明显但\emph{有界}的乱动；若瞬间飞出视野、或上面 \verb|sanity_check| 打印的 \verb|nan=True|，是 action scale 太大或缺裁剪。
+  \item \textbf{首行训练日志的三个数}（\verb|train ... --max-iterations 2| 时）：终端会打印每迭代的 \verb|steps/s| 与各 loss。\emph{第一次跑通只需确认三件事}：\verb|steps/s| 是有限正数（哪怕只有几千，见 \cref{ins:rlmc-eco-throughput}）、\verb|value loss| 是有限数（不是 \verb|inf|/\verb|nan|）、\verb|reward| 非 NaN。三者俱在即「管线打通」，可以放大 env 数正式训练；任一为 NaN/inf 就先回头查 obs/action，别急着调 PPO 超参。
+\end{enumerate}
+这三处刚好对应仿真的「调试仪器」角色（\cref{sec:rlmc-eco-roles}）：用零成本的两个 dummy agent，在写一行训练代码之前就把「环境装错/配错」和「算法没调好」分开。
+\end{insight}
+
+\subsection{从零起步：搭一个能跑通的最小新任务}
+\label{sec:rlmc-eco-fromscratch}
+
+前面都在\emph{读}已有任务的配置；但工程上你迟早要\emph{新建}一个任务。新手最容易犯的错是「对着代码框从一张白纸手写整棵 cfg 树」，结果撞上一串 import 路径与类名坑。真实且省力的路径恰恰相反——\textbf{复制框架自带的最近邻任务，再增量改}。下面给出三框架各自「从注册到跑通」的最小步骤；记住这套骨架，比记任何单个 API 都更接近怎么\emph{自己}起一个任务。
+
+\begin{codebox}[bash]{mjlab：从复制现成任务到跑通新任务的最小步骤}
+# 1) 先确认基准任务存在、能跑（别从空白起步，先有一个能跑的锚点）
+uv run list-envs | grep Velocity-Flat-Unitree-G1
+# 2) 在源码里定位它的 env_cfg（task 的 cfg + 注册都在这一带）
+#    mjlab 的 velocity 任务在 mjlab/tasks/velocity/ 下；找到 register_mjlab_task(...)
+# 3) 复制该任务目录为 my_velocity/，改两处：
+#    (a) register_mjlab_task("Mjlab-MyVelocity-G1", cfg=make_my_cfg()) 换个唯一任务名
+#    (b) 在 make_*_cfg() 里改你要动的 term（如给 rewards dict 加一项惩罚）
+# 4) 重新 list-envs 确认新名字出现，再 zero/random 体检，最后 2 迭代冒烟
+uv run list-envs | grep MyVelocity                 # 注册成功的判据：名字在表里
+WANDB_MODE=disabled uv run train Mjlab-MyVelocity-G1 \
+    --env.scene.num-envs 64 --agent.max-iterations 2   # steps/s 有限 + reward 非 NaN 即通
+\end{codebox}
+
+三框架的「最小新任务」骨架同形、只是注册机制不同（已在 \cref{sec:rlmc-eco-manager-compare} 末尾对齐过三种注册）：\textbf{Isaac Lab} 复制 \verb|source/.../velocity/config/<robot>/| 下现成任务，在其 \verb|__init__.py| 里 \verb|gym.register("Isaac-MyTask-v0", entry_point=..., kwargs={"env_cfg_entry_point": MyEnvCfg})|，再 \verb|./isaaclab.sh -p .../train.py --task Isaac-MyTask-v0 --headless --max_iterations 2| 冒烟；\textbf{UniLab} 则复制 \verb|conf/| 下最近的任务 YAML + 一个 \verb|@registry.envcfg("MyTask")| 的 dataclass 与 \verb|@registry.env("MyTask", sim_backend="mujoco")| 的 \verb|NpEnv| 子类，用 \verb|unilab train --algo ppo --task my_task --sim mujoco algo.num_envs=16| 冒烟。
+
+\begin{insight}[「从最近邻复制」为什么几乎总比「从零手写」对]\label{ins:rlmc-eco-copyfrom}
+框架自带任务是\textbf{开发者亲手调通、且与当前版本 API 同步}的——它替你踩平了 import 路径（如 mjlab 的 \verb|ObservationGroupCfg| 实际在 \verb|mjlab.managers.observation_manager| 而非你以为的某处）、类名、scene 资产挂载这些「不写错就跑、写错就一行 \verb|ImportError|」的隐性约束。从它出发，你每次只\emph{增量}改一两个 term，出错时变量被限制在你刚动的那几行，二分定位极快；而从空白手写，第一次 \verb|python| 往往先撞一串与你真正想改的逻辑无关的环境坑（典型如 \verb|ModuleNotFoundError|）。这条「复制最近邻再增量改」是贯穿全书的工程默认动作：\emph{先有一个能跑的，再让它变成你要的}，而不是反过来。
+\end{insight}
+
+\begin{practice}[练习·Manager 架构]
+\begin{enumerate}
+  \item \textbf{[实操]} 按 \cref{sec:rlmc-eco-fromscratch} 的四步，在你装的框架里\emph{复制}一个 velocity 任务、改唯一任务名注册成功（\verb|list-envs| 能看到），再 2 迭代冒烟跑通——体会「从最近邻起步」而非从白纸手写。
+  \item \textbf{[实操]} 在 mjlab 或 Isaac Lab 的 velocity 任务里\emph{加一行} \verb|RewTerm|（如关节力矩平方惩罚），跑 50 迭代，对比加项前后的步态/奖励曲线，体会「改一行做一次消融」。
+  \item \textbf{[对比]} 对照本节 mjlab 与 Isaac Lab 的两段 config，列出至少三个命名差异，并为每个差异猜一个设计动机。
+  \item \textbf{[设计]} 为「崎岖地形四足」任务草拟 Manager 骨架：列出你会用到哪些 Manager、各放哪些代表性 term（obs 至少含本体感知 + 命令，event 至少含一种 DR）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{框架选型与迁移}
+\label{sec:rlmc-eco-select}
+
+\subsection{全方位对比表}
+
+mjlab 与 Isaac Lab 共享 Manager-Based API、UniLab 走异构 CPU-sim 路线，三者为何并存？因为它们在\emph{物理位置、安装方式、视觉能力、RL 后端、生态}上有本质差异，适合不同场景。下表汇总（数值/版本为 2026 年中快照，时效项见注；UniLab 列经源码与实跑核对）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{1.9cm}p{3.0cm}p{3.2cm}p{4.3cm}@{}}
+\toprule
+维度 & mjlab & Isaac Lab & UniLab \\
+\midrule
+物理位置 & MuJoCo Warp（\textbf{GPU}） & PhysX / Newton(Beta)（\textbf{GPU}） & MuJoCoUni / MotrixSim（\textbf{CPU} 多线程） \\
+安装 & \verb|pip install mjlab|（数十秒） & conda+pip+Isaac Sim（数十分钟） & \verb|uv sync --extra mujoco|（或 \verb|motrix|）；不依赖 Isaac Sim \\
+启动延迟 & 数秒 & 数十秒（\textbf{首跑 $\ge 5$ 分钟}编译） & 数秒（CPU 后端，无 Isaac Sim 加载） \\
+模型格式 & MJCF & USD（支持 URDF 转换） & MJCF / Motrix XML（URDF 经 \verb|unilab-import-robot|；无 USD） \\
+视觉渲染 & Viser（web，轻量） & Isaac Sim（RTX 光追，工业级） & Viser（web，轻量）；Motrix 原生 renderer 仅回放 \\
+RL 后端 & RSL-RL（唯一） & RSL-RL / RL Games / SKRL / SB3 & PPO/APPO/SAC/TD3/FlashSAC（on+off-policy 并重） \\
+内置任务数 & 较少（velocity/tracking/lift/cartpole 等，实测约 12 个；\textbf{仅 G1/Go1，无 Go2}） & 较多（loco/manip/dexterous 等） & 26 个注册任务（四足/人形 loco、in-hand、motion-tracking；\textbf{无视觉}） \\
+直接访问物理数据 & \checkmark（\verb|mjData|/\verb|mjModel|） & 经 API 间接 & \checkmark（\verb|NpEnvState| + 后端 getter） \\
+架构范式 & Manager-Based + CUDA-graph & Manager-Based（双工作流） & 异构 CPU-sim/GPU-policy + 共享内存 IPC（\textbf{非} Manager） \\
+RTX 渲染 & 否 & 是 & 否 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[两类时效性数据本书不固定]
+源稿给了大量 Stars 数（如 Isaac Lab 6.5k/7.3k、mjlab 2.2k）与精确小版本号。\pz{Stars 与小版本号时效性极强、不同日期差异大，本书一律不固定具体数字；需要时请查各仓库当下数据。}本书只固定\emph{稳定}事实：mjlab 轻量单命令安装、Isaac Lab 功能全但安装重、两者 API 趋同。
+\end{note}
+
+\subsection{选型决策树}
+
+\begin{codebox}[text]{框架选型决策树（三框架，UniLab 分支按异构 CPU-sim 特性插入）}
+你的任务需要视觉输入（RGB/Depth）吗？
+  ├── 是 → Isaac Lab（RTX 渲染是核心优势；显存按含相机估算，见 ins:rlmc-eco-vram）
+  │        （UniLab 当前无视觉任务，不适用；mjlab 渲染轻量、视觉能力有限）
+  └── 否 → 继续
+      你的机器只有强 CPU、没有大显存 GPU-sim 后端吗？
+        ├── 是 → UniLab（物理在 CPU 多线程，GPU 只跑策略；不依赖 GPU-sim）
+        └── 否 → 继续
+            你想以异步 off-policy（APPO/SAC/TD3）为主，或要 collector-learner 解耦吗？
+              ├── 是 → UniLab（异构 IPC 让异步采集/学习是一等公民）
+              └── 否 → 继续
+                  你需要对比多种 RL 算法（PPO/SAC/Diffusion）吗？
+                    ├── 是 → Isaac Lab（RSL-RL/RL Games/SKRL/SB3 多后端）
+                    └── 否 → 继续
+                        你需要快速原型 + 轻量部署吗？
+                          ├── 是 → mjlab（pip 安装 + 数秒启动）
+                          └── 否 → 继续
+                              任务接触密集（足式/灵巧手）吗？
+                                ├── 是 → mjlab（MuJoCo 接触精度更好）
+                                └── 否 → 选社区 baseline 更多的（多为 Isaac Lab）
+\end{codebox}
+
+\begin{insight}[决策树第一问为何是「要不要视觉」]\label{ins:rlmc-eco-treeroot}
+把「视觉」放在决策树根节点，是因为它同时触发\emph{两个}最贵的约束：(1) 渲染质量——只有 Isaac Sim 的 RTX 光追能给逼真纹理/光照（视觉 sim-to-real 的关键）；(2) 显存——含相机的环境每环境显存暴涨 $10$--$50$ 倍（\cref{ins:rlmc-eco-vram}），直接决定你需要多大的卡、能跑多少并行。一旦确定无视觉，后面的选择（多算法/轻量/接触密集）都是「锦上添花」级别的偏好，没有视觉那样的硬约束。
+\end{insight}
+
+\subsection{迁移成本评估}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+迁移方向 & 成本 & 主要工作 \\
+\midrule
+mjlab $\leftrightarrow$ Isaac Lab & 低（1--2 天） & 改 config 格式、\verb|EntityCfg|$\leftrightarrow$\verb|ArticulationCfg|、模型路径 \\
+Manager-Based $\leftrightarrow$ UniLab & 中高（约 1 周） & 架构差异：Manager+term 树 $\leftrightarrow$ \verb|NpEnv| 子类 \verb|update_state| + \verb|scales| 标量字典；reward 函数要重写为 \verb|RewardContext| 形式 \\
+Isaac Gym $\to$ mjlab/Isaac Lab & 中（3--5 天） & 单体类拆成 Manager config，须读懂旧 obs/reward 逻辑 \\
+非 PyTorch（JAX/MJX）$\to$ 上述 & 高（1--2 周） & 整条训练管线重写 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[选型阶段三个高频踩坑]
+\textbf{一·为纯 locomotion 任务硬上 Isaac Lab}：一个真实案例是某同学在 Isaac Lab 上花三天配环境（Isaac Sim 版本冲突 + CUDA 不匹配），最后发现任务是纯四足 locomotion、不需视觉也不需多算法——若一开始用 mjlab，\verb|pip install| + \verb|uv run train| 十分钟即可开训。\textbf{二·在 mjlab 上做视觉策略}：mjlab 的 Viser 不支持 RTX 光追，视觉 sim-to-real 的纹理/光照随机化能力有限，视觉密集任务应选 Isaac Lab。\textbf{三·以「Stars 多」论优劣}：Stars 反映社区规模而非代码质量；框架自带的内置任务往往由开发者亲写、质量极高，是最好的入门阅读材料。
+\end{pitfall}
+
+\begin{practice}[练习·选型]
+\begin{enumerate}
+  \item \textbf{[决策]} 为下列课题各选一个框架并说明理由：(a) G1 人形在崎岖地形上的速度跟踪；(b) Franka 机械臂的 RGB 抓取；(c) 对比 PPO/SAC/Diffusion 在四足上的表现。
+  \item \textbf{[综合]} 若最终要把策略部署到 Unitree Go2 真机，sim-to-real 管线的哪些环节适合用 mjlab、哪些适合 Isaac Lab？有没有需要\emph{同时}用两者的环节（提示：sim2sim 验证）？
+  \item \textbf{[规划]} 为你自己的研究课题制定「主线框架 + 辅助框架」计划：什么场景用主线，什么场景切到辅助？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{其他框架与工具：知道定位即可}
+\label{sec:rlmc-eco-tools}
+
+除三大框架外，你读论文与开源代码时一定会遇到下列名词。无需深入，但要知道定位以免走弯路。
+
+\paragraph{Brax / MuJoCo Playground（JAX 生态）。}基于 JAX 的可微分仿真，物理用 MJX 批量化。优势是端到端可微分；局限是 JAX 与主流 PyTorch RL 库不兼容\,\cite{zakka2025playground}。若论文「trained in MJX」而你用 PyTorch，正确做法是在 mjlab（同为 MuJoCo 物理）或 Isaac Lab 上重实现，而非硬迁 JAX 管线。
+
+\paragraph{MuJoCo Menagerie（模型库，非框架）。}Google DeepMind 维护的高质量 MJCF 机器人模型库（Go1/Go2/G1/H1/ANYmal/Franka 等）。mjlab 直接使用它。需要新机器人 MJCF 时先查 Menagerie——用社区验证过的模型远比从零建模可靠。
+
+\paragraph{RSL-RL（RL 算法库，非框架）。}ETH RSL 与 NVIDIA 共同维护的轻量 RL 库（Schwarke 等，arXiv:2509.10771\,\cite{schwarke2025rslrl}）。经核对，它支持 \textbf{PPO + Student-Teacher Distillation}，外加 RND（好奇心探索）与 Symmetry Augmentation（对称数据增广）\,\cite{schwarke2025rslrl}。它是 mjlab 的\emph{唯一}后端，是 Isaac Lab 的可选后端之一；\textbf{连 UniLab 的 PPO 也复用它}——UniLab 在 RSL-RL 的 \verb|OnPolicyRunner| 上套了个 \verb|FinalObservationAwarePPO|（处理终止观测的 bootstrap）。三个架构迥异的框架都接同一个 RSL-RL，这件事本身就值得玩味。
+
+\begin{insight}[三框架都接 RSL-RL，暴露了一个事实标准]\label{ins:rlmc-eco-vecenv}
+读源码会发现 mjlab 与 Isaac Lab 的 RSL-RL 适配器（各自的 \verb|RslRlVecEnvWrapper|）\emph{几乎逐行相同}：都继承 RSL-RL 的 \verb|VecEnv|、都在 \verb|step| 后把 obs 包成 \verb|TensorDict|、都把超时标记 \verb|time_outs| 塞进 \verb|extras| 供 value bootstrap。两个独立团队在 RL 胶水层收敛到几乎一样的接口，说明「\verb|VecEnv| 抽象 + \verb|TensorDict| + \verb|time_outs| 入 extras」已是 GPU 并行 RL env 的\textbf{事实标准}。UniLab 虽然环境侧（CPU、\verb|NpEnv|）完全不同，PPO 路径却同样接 RSL-RL \verb|OnPolicyRunner|——这进一步印证：\emph{算法库与框架是可独立替换的两层}，framework 怎么变，只要实现这套 VecEnv 契约，就能复用同一个 PPO。这正是 \cref{ins:rlmc-eco-layers} 分层可替换观的最硬证据。
+\end{insight}
+
+\begin{insight}[「只有 PPO」对 locomotion 通常不是局限]\label{ins:rlmc-eco-ppo}
+RSL-RL 的在线 RL 算法以 PPO 为主，初看像局限，但 PPO 统治 locomotion 有工程理由：(1) locomotion 的 reward 分布在训练中剧变（倒地$\to$站立$\to$行走），off-policy 的 replay buffer 易充满过时数据；(2) PPO 只需前向收集数据，数据收集与梯度更新可完全分离，契合 GPU 并行的数据流；(3) 超参少且有物理直觉；(4) Symmetry Augmentation 只与 on-policy 兼容（在 rollout buffer 里左右镜像每个 transition，等效翻倍 batch）。操作任务里 SAC/Diffusion 可能更合适——要 off-policy 有两条路：Isaac Lab 换 RL 后端（RL Games/SKRL/SB3），或换框架到 \textbf{UniLab}（SAC/TD3/FlashSAC 与异步 APPO 是其一等公民，配共享内存 replay buffer）。这回扣 \cref{sec:rlmc-eco-select} 决策树「要不要多算法 / 要不要异步 off-policy」那两问。
+\end{insight}
+
+\begin{note}[在 UniLab 上真上手异步/off-policy：一条可复制命令]
+\cref{ins:rlmc-eco-ppo} 把 APPO/FlashSAC 说成 UniLab 的「一等公民」，但只有抽象描述读者不知道怎么真跑。UniLab 的 \verb|conf/| 下确有 \verb|appo|（异步 PPO）与 \verb|flashsac|（off-policy）两套算法配置树，换算法只需改 \verb|--algo| 这一个路由键（其余沿用同一任务）：
+\begin{codebox}[bash]{UniLab：把同一个 go2 任务从同步 PPO 切到异步/off-policy}
+# 同步 on-policy PPO（默认对照基线）
+unilab train --algo ppo     --task go2_joystick_flat --sim mujoco algo.num_envs=16
+# 异步 PPO（collector/learner 经共享内存解耦，采集与学习重叠）
+unilab train --algo appo    --task go2_joystick_flat --sim mujoco algo.num_envs=16
+# off-policy（FlashSAC，配共享内存 replay buffer）
+unilab train --algo flashsac --task go2_joystick_flat --sim mujoco algo.num_envs=16
+\end{codebox}
+三条命令\emph{只有} \verb|--algo| 不同，正是 \cref{ins:rlmc-eco-layers} 「算法层可独立替换」在 UniLab 上的具体落地：环境（CPU \verb|NpEnv|）不动，换的是 GPU 那侧的学习算法。\verb|algo.num_envs| 这种点路径走 Hydra 深合并覆盖（\cref{sec:rlmc-eco-manager} 提过的 \verb|algo|/\verb|task| 是保留路由键）。冒烟时把 \verb|num_envs| 设小（如 16）先确认三条都起得来、reward 非 NaN，再放大 env 数比较异步与同步的真实收益。
+\end{note}
+
+\paragraph{WandB / Rerun（实验管理与可视化，非仿真）。}WandB（Weights \& Biases）是实验管理平台，mjlab 原生集成（训练曲线/checkpoint/视频/超参自动上传）。机器人 RL 单个四足任务常有 $30$--$60$ 个可调参数，不用实验管理工具几天后就会忘记「那个成功实验用了什么参数」。Rerun 是时间序列数据流可视化，擅长回放「某个 episode 第 137 步到底发生了什么」。
+
+\begin{insight}[框架-引擎-工具是可独立替换的分层]\label{ins:rlmc-eco-layers}
+整个生态可分四层：RL 算法层（RSL-RL/RL Games/SKRL/SB3）、框架层（mjlab/Isaac Lab/UniLab）、物理引擎层（MuJoCo Warp/PhysX/Newton/MJX/MuJoCoUni/MotrixSim）、模型与工具层（Menagerie/USD 资产/WandB/Viser/Rerun）。关键洞察是\emph{每一层都可独立替换}：你能在 Isaac Lab 上把引擎从 PhysX 换成 MuJoCo Warp（经 Newton）而不改 MDP 代码；能在 mjlab 上把算法从 RSL-RL 换成自定义 PPO（实现相同 VecEnv 接口）而不改环境；UniLab 更把「物理引擎层」整个挪到 CPU（MuJoCoUni/MotrixSim）、却仍接同一个 RSL-RL（\cref{ins:rlmc-eco-vecenv}）。这解释了为什么本书选「框架」而非「引擎」或「算法」作教学轴线——框架层是连接算法与引擎的\emph{桥}，是研究者日常交互最多的层级；学会框架层（无论它是 Manager-Based 还是 UniLab 的 \verb|NpEnv| 范式），就同时获得了对上下两层的控制力。
+\end{insight}
+
+\begin{pitfall}[四个易混的「是什么」]
+\textbf{一·把 RSL-RL 当通用 RL 库}：它在线算法以 PPO 为主，无 SAC/TD3；要 off-policy 须用 Isaac Lab + 其他后端。\textbf{二·把 Menagerie 当框架}：它只是 MJCF 模型库，不提供 \verb|env.step()|。\textbf{三·混淆框架与算法库}：mjlab/Isaac Lab 提供 \verb|env.step()|，RSL-RL/RL Games 提供 \verb|ppo.update()|，两者经 VecEnv wrapper 连接。\textbf{四·忽视 WandB}：实验散落本地几周后必丢，从第一次训练就用 WandB 是零成本高回报的习惯。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\label{sec:rlmc-eco-misconceptions}
+\addcontentsline{toc}{section}{常见误解汇总}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.4cm}p{8.4cm}@{}}
+\toprule
+误解 & 正确理解 \\
+\midrule
+「仿真越真实越好」 & 足够真实 + 域随机化 $>$ 极致真实；过度精细牺牲吞吐、收益递减（\cref{ins:rlmc-eco-analogy}） \\
+「GPU 并行就是核心多所以快」 & 核心优势是数据零搬运，obs/action/梯度全程在显存（\cref{ins:rlmc-eco-zerocopy}） \\
+「Isaac Gym 还能用」 & 可读旧代码，新项目应用 Isaac Lab 或 mjlab \\
+「MJX = MuJoCo Warp」 & MJX 基 JAX，MuJoCo Warp 基 NVIDIA Warp；精度近、编程模型异 \\
+「框架 = 物理引擎」 & 框架 $\ne$ 物理引擎 $\ne$ RL 算法库（\cref{ins:rlmc-eco-layers}） \\
+「Stars 多 = 质量好」 & Stars 反映社区规模而非代码质量 \\
+「sim-to-real 不可能成功」 & 已有大量成功案例（walk-these-ways/humanoid-gym/ASAP 等） \\
+「选一个框架学就够」 & 三框架边际成本低、覆盖互补（\cref{ins:rlmc-eco-pickright}） \\
+「三框架都是 Manager-Based」 & mjlab/Isaac Lab 是；UniLab 是异构 CPU-sim、\textbf{非} Manager（\cref{ins:rlmc-eco-manager-granularity}） \\
+「GPU 并行是机器人 RL 唯一答案」 & UniLab 故意把物理放回 CPU、用共享内存解耦也成立（\cref{ins:rlmc-eco-heterogeneous}） \\
+「RSL-RL 只有 PPO」 & 还有 Distillation + RND + Symmetry（\cref{ins:rlmc-eco-ppo}） \\
+「\texttt{sim.step} 与 \texttt{env.step} 一回事」 & 前者只推物理，后者封装整套 MDP（\cref{ins:rlmc-eco-simenv}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\label{sec:rlmc-eco-summary}
+\addcontentsline{toc}{section}{小结}
+
+本章是「强化学习运动控制」部的地图章，主线是\textbf{以仿真在 RL 管线中的工程职责为骨架、在每个职责下横向铺三框架对比}。我们先立三角色——物理世界（\verb|sim.step|）、MDP 机器（\verb|env.step|）、调试仪器（ground-truth），它们是衡量任何框架的三把尺子（\cref{ins:rlmc-eco-simenv}）；再论证 GPU 并行的刚需性，其本质是\emph{数据零搬运}而非核心多（\cref{ins:rlmc-eco-zerocopy}），上限是显存（\cref{eq:rlmc-eco-maxenvs}）；接着梳理六阶段演进，提炼出「保留核心优势、消除核心痛点」的统一模式（\cref{ins:rlmc-eco-pattern}）；然后落到框架架构，用并排配置说明 mjlab 与 Isaac Lab 同源命名小异、而 UniLab 是\emph{非} Manager-Based 的异构 CPU-sim 第三路线（\cref{ins:rlmc-eco-manager-granularity}、\cref{ins:rlmc-eco-heterogeneous}），三者却都接同一个 RSL-RL（\cref{ins:rlmc-eco-vecenv}）；最后给出以「是否需要视觉」为根的选型决策树（\cref{ins:rlmc-eco-treeroot}）与分层可替换的生态观（\cref{ins:rlmc-eco-layers}）。本章不教某一行 reward，而是给你一张地图，让后续每一章都能定位在整体结构中。
+
+\paragraph{术语速查。}
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 含义 \\
+\midrule
+\verb|sim.step()| / \verb|env.step()| & 物理推进一步 / 框架级 MDP step（含 decimation+obs+reward+reset） \\
+decimation（action repeat） & 一个 policy step 内调用 \verb|sim.step()| 的次数 \\
+SoA / AoS & Structure / Array of Arrays，GPU 偏好 SoA 以合并访存 \\
+CUDA Graph & 预录制的 kernel 启动序列，要求计算图静态 \\
+SIMT & 同一指令多线程执行，环境并行的硬件基础 \\
+Manager-Based & 把 MDP 各维度拆到独立 Manager 的框架架构 \\
+\verb|ObsTerm|/\verb|RewTerm|/\verb|EventTerm| & Manager 里的基本配置单元 \\
+\verb|solref| / \verb|solimp| & MuJoCo 接触刚度/阻尼 与 约束阻抗参数 \\
+MuJoCo Warp / MJX & MuJoCo 的 NVIDIA-Warp / JAX 两种 GPU 加速实现 \\
+Newton / Kamino & 多求解器统一引擎 / 其中处理闭环机构的求解器 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+\begin{center}
+\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+编号 & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 仿真三角色：物理世界/MDP 机器/调试仪器 & \cref{sec:rlmc-eco-roles} & 低 \\
+2 & \verb|sim.step| vs \verb|env.step| 是架构理解的起点 & \cref{sec:rlmc-eco-roles} & 低 \\
+3 & GPU 并行核心是数据零搬运 & \cref{sec:rlmc-eco-gpu} & 中 \\
+4 & SIMT 约束环境设计（用 mask 代替分支） & \cref{sec:rlmc-eco-gpu} & 中 \\
+5 & decimation 桥接决策频率与物理精度 & \cref{sec:rlmc-eco-gpu} & 中 \\
+6 & 显存估算 $\texttt{max\_envs}\approx(\text{VRAM}-2)\cdot10^3/\text{per\_env\_MB}$ & \cref{sec:rlmc-eco-gpu} & 中 \\
+7 & MuJoCo 凸优化软接触 vs PhysX 硬接触 & \cref{sec:rlmc-eco-evolution} & 中 \\
+8 & 生态六阶段与「保留-消除」模式 & \cref{sec:rlmc-eco-evolution} & 高 \\
+9 & Manager-Based 架构与单体架构的对比收益 & \cref{sec:rlmc-eco-manager} & 高 \\
+10 & 三框架配置同源、命名小异 & \cref{sec:rlmc-eco-manager} & 高 \\
+11 & 以「是否需要视觉」为根的选型决策树 & \cref{sec:rlmc-eco-select} & 中 \\
+12 & 框架-引擎-工具分层可独立替换 & \cref{sec:rlmc-eco-tools} & 低 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\label{sec:rlmc-eco-further}
+\addcontentsline{toc}{section}{延伸阅读}
+
+\begin{itemize}
+  \item \textbf{Isaac Gym}（Makoviychuk 等，NeurIPS 2021，arXiv:2108.10470）\,\cite{makoviychuk2021isaacgym}——GPU 并行仿真的奠基，教「端到端 GPU 训练为何快」。
+  \item \textbf{Learning to Walk in Minutes / legged\_gym}（Rudin 等，CoRL 2021，arXiv:2109.11978）\,\cite{rudin2021minutes}——大规模并行 locomotion 标准范式，教「四足 RL 的 obs/reward/DR 该长什么样」。
+  \item \textbf{Isaac Lab}（Mittal 等，arXiv:2511.04831）\,\cite{mittal2025isaaclab}——Manager-Based 架构的设计文档，教「如何把 MDP 拆成可组合的 Manager」。
+  \item \textbf{mjlab}（Zakka 等，arXiv:2601.22074）\,\cite{mjlab2026}——轻量框架设计哲学，教「Isaac Lab API 如何搭在 MuJoCo Warp 上」。
+  \item \textbf{UniLab}（arXiv:2605.30313，文档 unilabsim.github.io/UniLab-doc）\,\cite{unilab2026}——异构 CPU-sim/GPU-policy 架构，教「为什么把物理留在 CPU、用共享内存 IPC 解耦 collector/learner，是 GPU-sim 主导范式之外的第三条路」。
+  \item \textbf{MuJoCo}（Todorov 等，IROS 2012）\,\cite{todorov2012mujoco}——凸优化接触的物理引擎原始论文，教「为什么 MuJoCo 接触稳」。
+  \item \textbf{MuJoCo Playground}（Zakka 等，arXiv:2502.08844）\,\cite{zakka2025playground}——MJX + Madrona 批量渲染，教「JAX 生态下的可微分仿真与视觉训练」。
+  \item \textbf{RSL-RL}（Schwarke 等，arXiv:2509.10771）\,\cite{schwarke2025rslrl}——RL 算法库设计，教「PPO + Distillation + RND + Symmetry 的工程封装」。
+  \item \textbf{ASAP}（He 等，RSS 2025，arXiv:2502.01143）\,\cite{he2025asap}——跨仿真器 delta action model，教「物理引擎选择对 sim-to-real 的实质影响」。
+  \item \textbf{Newton}（Linux Foundation 开源项目）\,\cite{newton2025}——多求解器统一引擎，官方文档教「如何一行切换物理后端」。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\label{sec:rlmc-eco-trouble}
+\addcontentsline{toc}{section}{故障排查手册}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{6.6cm}@{}}
+\toprule
+症状 & 可能原因 & 排查 / 相关节 \\
+\midrule
+\verb|import| 即报 \verb|undefined symbol| / 段错误 & CUDA/PyTorch 与 Isaac Sim 版本不匹配 & 照官方矩阵重装 torch；别用默认 wheel（见\nameref{sec:rlmc-eco-setup}） \\
+zero agent 下机器人瘫软/劈叉 & 默认偏置（offset）配错，非算法问题 & 查默认关节位置/MJCF keyframe（\cref{ins:rlmc-eco-zerorandom}，详见 \cref{ch:rlmc-obsact}） \\
+random agent 立即炸飞或出 NaN & action scale 太大或缺裁剪 & 打印 processed action 范围（\cref{ins:rlmc-eco-zerorandom}） \\
+足端穿地、整机下沉 & 物理层接触参数（\verb|solref| 太软） & 这是「物理世界」角色问题，非 MDP 层（\cref{ins:rlmc-eco-simenv}） \\
+策略不跟速度命令、奖励像随机游走 & MDP 层 obs/reward 配错 & 先查接口再查奖励最后才调 PPO（\cref{ch:rlmc-obsact}） \\
+启动报 \verb|KeyError|（组名） & 环境组名与 runner \verb|obs_groups| 不匹配 & 对齐组名（\cref{sec:rlmc-eco-manager}，详见 \cref{ch:rlmc-obsact}） \\
+某些 step 突然变慢 & CUDA Graph 因动态分支失效或 DR 首次触发重建图 & 正常现象，非 bug（\cref{sec:rlmc-eco-gpu}） \\
+4096 环境 OOM & 显存不足，尤其含相机时 & 用 \cref{eq:rlmc-eco-maxenvs} 重估；视觉任务换大卡 \\
+两框架同机器人行为不同 & 物理引擎接触模型差异 & 正常现象，ASAP 量化过\,\cite{he2025asap}（\cref{sec:rlmc-eco-select}） \\
+mjlab config 贴到 Isaac Lab 报错 & API 命名差异 & 按对应表逐项替换（\cref{sec:rlmc-eco-manager-compare}） \\
+Isaac Lab 3.0 代码与 2.3 不兼容 & 四元数序/warp-native/模块改名 & 见下「版本信息速查」的 3.0 变更表 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+上表是「症状$\to$原因」的速查；但工程上更要紧的是\emph{怎么自己把症状定位到原因}。下面把两个最高频的故障，演示成一次真实的\textbf{排查命令序列}——核心方法只有一句：\emph{别猜，去问机器要真值}。
+
+\begin{codebox}[bash]{排查示范一·训练中途 OOM：用 nvidia-smi 把「显存不足」坐实并二分}
+# 症状：train 跑到第 N 迭代崩在 torch.cuda.OutOfMemoryError
+# 1) 另开一个终端，训练时实时盯显存占用（每 0.5s 刷新）
+watch -n 0.5 nvidia-smi
+#    看 Memory-Usage 那列：是否在崩之前就逼近卡上限（如 4090 的 24GB）？
+#    含相机的任务每环境显存暴涨 10-50x（见 ins:rlmc-eco-vram），最易在这里爆
+# 2) 二分确认是不是 env 数的锅：把 num-envs 砍半再跑，能过就是显存上限问题
+WANDB_MODE=disabled uv run train <你的任务> --env.scene.num-envs 2048   # 砍半试
+# 3) 用估算公式反推该机能跑多少（eq:rlmc-eco-maxenvs），把 num-envs 定在其下
+#    结论：OOM 不是玄学——nvidia-smi 一看占用曲线、num-envs 一砍二分即可定位
+\end{codebox}
+
+\begin{codebox}[Python]{排查示范二·启动报 KeyError（组名）：打印实际组名而非猜}
+# 症状：env.step 后取 obs_dict["policy"] 抛 KeyError，或 runner 报 obs_groups 不匹配
+# 不要猜「是不是该叫 actor」——直接把框架\emph{真实}给出的键打出来：
+obs_dict, _ = env.reset()
+print("实际 obs 组名 =", list(obs_dict.keys()))
+#  Isaac Lab 多半打印 ['policy', ...]；mjlab 打印 ['actor', 'critic']；UniLab ['obs','critic']
+#  → 看清后把代码里的硬编码键改成实际存在的那个（参见 sec:rlmc-eco-manager-compare 对应表）
+#  若是 runner 侧 obs_groups 不匹配：核对训练配置里的 obs_groups 键名与上面这行一致
+\end{codebox}
+
+\begin{insight}[「排查」与「看症状表」的区别：把书里的名字/数字当\emph{待验证假设}]\label{ins:rlmc-eco-debugmethod}
+症状表给你\emph{方向}，但真正的排错动作永远是\textbf{让机器输出真值、再与你的假设对照}：OOM 就 \verb|nvidia-smi| 看占用、\verb|num-envs| 砍半二分；\verb|KeyError| 就 \verb|print(obs_dict.keys())| 看真名；某个 reward 项疑似失效就去训练日志里看对应的逐项回合奖励是不是恒为 0（三框架都按项打印，前缀各异：mjlab/Isaac Lab 形如 \verb|Episode_Reward/<term>|，UniLab 形如 \verb|reward/<term>|，哪项恒为 0 即定位到失效的 term）。这套「不背书、跑一次问框架」的习惯，比记住任何一张症状表都更通用——因为版本会变、API 名会漂，但「打印真值再对照」这个动作永远有效。本书所有具体 term 名、维度、版本号，都请当成\emph{待你本地实测复核的假设}，而非真理。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\label{sec:rlmc-eco-version}
+\addcontentsline{toc}{section}{版本信息速查}
+
+本部后续章节的安装命令与 API 调用以下表为「最低兼容参考」（\pz{快照为 2026 年中；具体小版本号与 Stars 等时效数据请以各仓库当下为准}）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+组件 & 锚定版本 & 说明 \\
+\midrule
+mjlab & 1.x（\pz{2026-05 PyPI 最新 1.4.0\,\cite{mjlab2026}}） & \verb|pip install mjlab| / \verb|uv sync| \\
+Isaac Lab & 2.3.2（主线） & conda+pip+Isaac Sim；3.0 Beta 变更见下 \\
+UniLab & arXiv:2605.30313\,\cite{unilab2026} & \verb|uv sync --extra mujoco/motrix|；后端 \verb|mujoco-uni|\,3.8.0 / \verb|motrixsim-core|\,0.8.2 \\
+rsl-rl-lib & Isaac 3.0.1 / mjlab 5.2.0 & 新 config（拆分 actor/critic 模型；PyPI 无对外 4.0 版本号）；三框架 PPO 共用 \\
+Newton & 1.0 GA & 引擎可用，Isaac Lab 集成仍 Beta \\
+MuJoCo Warp & 随 mjlab & Google DeepMind + NVIDIA 共同维护 \\
+Python & $\ge 3.10$ & mjlab 支持 3.10--3.13\,\cite{mjlab2026} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[Isaac Lab 3.0 的破坏性变更（升级前必读）]
+本书正文以 Isaac Lab 2.3.0 为主线，但你需知道 3.0 Beta（基于 Isaac Sim 6.0 + Newton）的几处破坏性变更，以便升级报错时定位方向：\textbf{(1) 四元数序}从 \verb|wxyz| 改为 \verb|xyzw|——所有硬编码四元数需更新（与全书 Hamilton 四元数约定无关，是 Isaac Lab 内部存储序）；\textbf{(2) 数据管线}从返回 torch tensor 改为返回 \verb|wp.array|（需 \verb|wp.to_torch()| 包装）；\textbf{(3) 模块前缀}从 \verb|omni.isaac.lab.*| 改为 \verb|isaaclab.*|；\textbf{(4) 安装}新增 kit-less 模式（可不依赖 Isaac Sim，改用 Newton 后端，运行时以 \texttt{presets=newton} 切换）。以上四项均已对照 Isaac Lab 3.0 官方文档与 \texttt{v3.0.0-beta} Release Notes 核实；其中四元数改序是为对齐 Warp/PhysX/Newton 约定，官方另附 quaternion finder 与 \texttt{scripts/tools/wrap\_warp\_to\_torch.py} 等迁移脚本（脚本名与细节随版本，升级时以官方迁移指南为准）。
+\end{note}

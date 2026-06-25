@@ -1,0 +1,2032 @@
+\chapter{DIY 实战：从自定义机器人到完整训练}\label{ch:rlmc-diy}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章——「方法论 + 端到端」收口章。
+%  主线：算法/概念领路 —— 先立「自定义环境搭建在概念上要确保哪些 MDP 组件正确 + 原理与反面」，
+%  再把每个概念落到 mjlab / Isaac Lab / UniLab 三框架的工程接线对比。
+%  假定读者已有 RL 基础与前面实践章基础（观测·动作·奖励·Manager·DR·特权·训练管线·物理引擎·
+%  资产建模·四足/人形/操作实战），本章只讲「自定义 + 系统化验证 + 排错」，不重教基础。
+%  源稿 RL运控/Ch22_DIY实战_从自定义机器人到完整训练.md（mjlab + Isaac Lab 双框架）按本主线重构；
+%  UniLab 列已据实跑源码（unilabsim/UniLab commit 99936e08）补齐为真三框架（子类即环境/双装饰器注册/
+%  reward 标量字典派发表/domain_rand 后端能力门控/跨后端 sim2sim 契约/HORA 蒸馏对照），欠缺项如实标注。
+%  关键 API/版本/命令/论文归属经联网核对：
+%    - mjlab：github.com/mujocolab/mjlab，arXiv:2601.22074；Isaac Lab 风格 API + MuJoCo-Warp；
+%      CLI=uv run train/play；样例 task id 已核 Mjlab-Velocity-Flat-Unitree-G1、
+%      Mjlab-Tracking-Flat-Unitree-G1（Go1 四足内置但其确切 task id 未在文档逐字给出，加注）。
+%      [复核②, gpufree mjlab 1.4.0 introspect] 已据真实源码改正本章 mjlab 代码块：
+%        EntityCfg 无 spawn/MjCfg/actuators 字段(用 spec_fn + articulation=EntityArticulationInfoCfg(actuators=));
+%        无 ImplicitActuatorCfg(用 BuiltinPositionActuatorCfg, 字段 target_names_expr/stiffness/damping/effort_limit);
+%        无 InteractiveSceneCfg/prim_path/.replace(用 SceneCfg(entities={...})); 无 mjlab.envs.make(用 load_env_cfg+ManagerBasedRlEnv);
+%        JointPositionActionCfg 用 entity_name/actuator_names(非 asset_name/joint_names);
+%        ObsTerm/RewTerm/DoneTerm/EventTerm 无短别名(用 ObservationTermCfg/RewardTermCfg/TerminationTermCfg/EventTermCfg);
+%        velocity reward 真名 track_linear_velocity/track_angular_velocity(非 track_lin_vel_xy_exp);
+%        lin_vel_z_l2/ang_vel_xy_l2/undesired_contacts mjlab 无(改 body_angular_velocity_penalty/self_collision_cost);
+%        DR 在 mdp.dr 子包(geom_friction/body_mass, 非 Isaac randomize_rigid_body_*); SimCfg 无(decimation 是 env cfg 顶层字段)。
+%    - Isaac Lab：Mittal 等 \cite{mittal2025isaaclab}；离线转换工具 scripts/tools/convert_urdf.py /
+%      convert_mjcf.py 用「位置参数 <input> <output>」、启动器 ./isaaclab.sh -p（已核官方文档）；
+%      RL 入口 scripts/reinforcement_learning/rsl_rl/train.py（已核）。
+%    - HOVER：He 等，ICRA 2025，arXiv:2410.21229，Unitree H1，NVlabs/HOVER，mask-conditioned
+%      teacher-student 蒸馏（已核）。
+%    - HUSKY：Han 等，RSS 2026，arXiv:2602.03205，Unitree G1（23 可控 DoF，排除腕部），
+%      TeleHuman/humanoid_skateboarding，mjlab + PPO + AMP，kingpin 几何 tan σ=tan λ·sin γ（已核）。
+%      [!] 源稿把 G1 写成 29-DOF——经核论文用「23 可控 DoF」，已改正。
+%    - 凡未在官方文档/论文逐字确认的具体字符串/默认值/签名，包 \rebuilt{} 或 \pz{待核实：}。
+% ════════════════════════════════════════════════════════════════
+
+前面整部把强化学习运控的\emph{零件}逐一磨好、又在四足（\cref{ch:rlmc-quadloco}）、人形（\cref{ch:rlmc-humanoidloco}）、操作（\cref{ch:rlmc-manip}）等\emph{内置任务}上组合演练过了。但这些实战有一个共同前提：\textbf{机器人模型与环境配置框架里已经有了}，你只需改参数。本章要跨过的，是从“用内置任务训练”到“为\emph{自己}的机器人、\emph{自己}的研究任务从零搭一个全新环境”的鸿沟——这是博士研究者迟早要独立完成的一步。
+
+为什么单独给 DIY 一章？因为自定义环境的“难”有一个独特而隐蔽的特征：\textbf{绝大多数错误不报错，只表现为“策略训练不收敛”}。你以为是 reward 设计不好、是超参不对、是算法选错，折腾一整天，真正的病根却可能只是某个观测的坐标系（frame）转换搞反了，或一个传感器名拼错导致观测静默返回零。本章的核心不是教你“怎么写代码”（前面章节已反复示范），而是教你一套\textbf{系统化确保每一步都正确}的工程方法论，并把它落到三大框架的对比接线上。
+
+本章仍遵循全书「概念领路、实践兑现」的次序。每一节先立\textbf{方法论/概念主线}（这个环节要确保哪些 MDP 组件正确、原理、反面教训），再在其下排布\textbf{三框架对比实战}：mjlab、Isaac Lab 与 UniLab 各给出可运行的工程接线。三者中 mjlab/Isaac Lab 同属 Manager-Based 的 GPU-sim 范式，UniLab 则是\emph{异构 CPU-sim $+$ GPU-policy} 的非 Manager-Based 路径——把同一 MDP 落成「子类即环境」，正好让你看清「框架组织形态」与「MDP 语义」的分野。本质洞察先行：\textbf{自定义环境搭建的核心困难不在代码量——一个完整环境通常只有 300--500 行配置；困难在于每一行配置都与物理模型和任务语义紧耦合，任何一行错都会以“训练不收敛”而非“编译/运行报错”的形式表现出来。}
+
+% ════════════════════════════════════════════════════════════════
+\section{环境配置与版本兼容}
+\label{sec:rlmc-diy-setup}
+
+\textbf{本节解决什么问题}：本章不重复 \cref{ch:rlmc-setup} 的通用安装流程，只补充\emph{做自定义环境时}额外要核对的版本点与工具链。做 DIY 比跑内置任务多依赖两类东西：\textbf{资产转换工具}（CAD$\to$URDF$\to$MJCF/USD）与\textbf{模型检视工具}（MuJoCo viewer / Isaac Sim viewer）。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.7cm}p{3.0cm}p{3.4cm}p{3.7cm}@{}}
+\toprule
+要求项 & mjlab & Isaac Lab & UniLab \\
+\midrule
+自定义模型格式 & MJCF（\texttt{.xml}） & USD（\texttt{.usd}），亦支持运行时 URDF/MJCF & MJCF（mujoco 后端）或 Motrix XML（motrix 后端）；\textbf{不用} USD \\
+离线资产转换 & 无需（原生吃 MJCF） & \texttt{scripts/tools/convert\_urdf.py} / \texttt{convert\_mjcf.py} & 无 MJCF$\leftrightarrow$USD 互转；URDF 经 \texttt{unilab-import-robot} 导入，资产经 \texttt{unilab-pull-assets} 从 HF 拉 \\
+模型检视 & \texttt{mujoco} viewer / Viser & Isaac Sim Viewer & Viser（\texttt{-{}-render-mode interactive}）；motrix 走原生 renderer \\
+RL 后端 & RSL-RL & RSL-RL / RL-Games / SKRL & 自带 PPO/APPO/SAC/TD3/FlashSAC（PPO 复用 RSL-RL 的 \texttt{OnPolicyRunner}） \\
+任务注册 & \texttt{register\_mjlab\_task}（私有 \texttt{\_REGISTRY}） & \texttt{gymnasium.register} & \texttt{@registry.envcfg} + \texttt{@registry.env}（双装饰器，按后端注册） \\
+训练 CLI & \verb|uv run train <Task>| & \verb|./isaaclab.sh -p scripts/.../train.py| & \verb|uv run train --algo ppo --task <slug> --sim mujoco| \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[UniLab 是「异构 CPU 仿真 $+$ GPU 策略」的第三条路]
+mjlab 与 Isaac Lab 都把\emph{物理与策略都钉在 GPU}（靠 CUDA-graph 消除 launch 开销）；UniLab（\verb|github.com/unilabsim/UniLab|，arXiv:2605.30313\,\cite{unilab2026}）把\textbf{物理留在 CPU}（MuJoCoUni / MotrixSim 多线程批量步进），\textbf{策略学习放 GPU}（CUDA/MPS/ROCm/XPU），二者经\emph{共享内存 IPC} 解耦（collector 子进程产 transition、learner 父进程做更新、actor 权重经 \verb|SharedWeightSync| 版本化回传）。对 DIY 的直接影响：（1）你的机器人模型写成 MJCF/Motrix XML 即可，无须像 Isaac Lab 那样转 USD；（2）不依赖 Isaac Sim / NVIDIA 驱动绑定，也不依赖 MuJoCo-Warp/GPU 仿真——\textbf{任何 CPU 核多的机器都能跑}；（3）多了一条共享内存预算约束（大 replay buffer 撑爆 \verb|/dev/shm| 会直接 \verb|MemoryError|），这是 GPU-sim 框架没有的新失败面。国内首跑要拉 HF 资产，须 \verb|export HF_ENDPOINT=https://hf-mirror.com|。本章三框架对比里，UniLab 列均以实跑 \verb|/root/gpufree-data/src/UniLab| 源码为据。
+\end{note}
+
+\begin{note}[离线转换不是必须，但强烈建议先做一次]
+Isaac Lab 既能在运行时通过 \verb|UrdfFileCfg| / \verb|MjcfFileCfg| 直接 spawn URDF/MJCF（无须先手动转 USD），也能用离线工具转成 USD 再复用。\textbf{为什么仍建议离线转一次}：转换是\emph{有损}的（fixed joint 可能被合并、mesh 碰撞体可能被简化为凸包、默认惯量可能被填入），离线转一次能让你在 Isaac Sim viewer 里逐项检视转换结果，把“几何/惯量/关节数”这类 Phase A 错误在训练前堵住。离线命令用\textbf{位置参数} \verb|<input> <output>|（不是 \verb|--input_path/--output_path|），启动器是 \verb|./isaaclab.sh -p|：
+\begin{codebox}[bash]{Isaac Lab 离线资产转换（位置参数）}
+# URDF -> USD
+./isaaclab.sh -p scripts/tools/convert_urdf.py  my_robot.urdf  my_robot.usd  --headless
+# MJCF -> USD（用 Isaac Lab / Isaac Sim 自带 MJCF importer，无须 MuJoCo 官方 exporter）
+./isaaclab.sh -p scripts/tools/convert_mjcf.py  my_robot.xml   my_robot.usd  --headless
+\end{codebox}
+\end{note}
+
+\begin{note}[mjlab core 与 unitree\_rl\_mjlab 的区分仍然适用]
+与 \cref{ch:rlmc-quadloco} 一致：\textbf{mjlab core}（\verb|github.com/mujocolab/mjlab|，arXiv:2601.22074\,\cite{mjlab2026}）是 Isaac Lab 风格 API 的 MuJoCo-Warp 复刻，自带 Go1+G1+YAM，CLI 为 \verb|uv run train/play|。本章 DIY 主线全部以 mjlab core 的 \texttt{EntityCfg}$\to$\texttt{register\_mjlab\_task} 体系为准（经 mjlab 1.4.0 \texttt{tasks/registry.py} 核实，私有 \texttt{\_REGISTRY}、非 gym）；凡涉及 mjlab \emph{确切}类名/字段名而官方 README 未逐字给出者，本章加 \rebuilt{} 或 \pz{待核实}。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{Quick Start：五分钟把一个内置任务“改名重注册”}
+\label{sec:rlmc-diy-quickstart}
+
+真正的 DIY 从零开始要几天（见 \cref{sec:rlmc-diy-timeline} 的时间线），不适合做 5 分钟 Quick Start。但有一个\textbf{最小可跑的 DIY 动作}能在 5 分钟内建立“我能注册自己的任务”的肌肉记忆：\emph{把一个内置任务的配置类继承一份、改个名、重新注册、跑一次 zero agent}。这一步不碰模型、不碰 reward，只验证“注册—创建—reset”这条最外层链路通。
+
+\begin{codebox}[Python]{mjlab：继承内置 G1 velocity，改名重注册（最小 DIY）}
+# config/g1/__init__.py（落在 mjlab.tasks 下）—— 不改任何 MDP，只验证「我能注册自己的 task id」
+from mjlab.tasks.registry import register_mjlab_task
+# 复用 mjlab core 内置 G1 velocity 的 env cfg / rl cfg 工厂（确切工厂名以你装的版本为准）
+from mjlab.tasks.velocity.config.g1.env_cfgs import unitree_g1_flat_env_cfg
+from mjlab.tasks.velocity.config.g1.rl_cfg import unitree_g1_ppo_runner_cfg
+
+register_mjlab_task(
+    task_id="MyFirstDIY-Velocity-Flat-G1",
+    env_cfg=unitree_g1_flat_env_cfg(),                  # 训练 env cfg（cfg 对象，不是 entry_point 字符串）
+    play_env_cfg=unitree_g1_flat_env_cfg(play=True),    # play cfg（关 noise/push）
+    rl_cfg=unitree_g1_ppo_runner_cfg(),                 # RSL-RL runner cfg
+)   # runner_cls 可选，默认 MjlabOnPolicyRunner
+\end{codebox}
+
+\begin{codebox}[bash]{mjlab：跑通自己注册的 task（zero agent）}
+# 先列出当前版本所有 task id，确认 MyFirstDIY-... 出现在列表里
+uv run list-envs
+# zero agent 看默认姿态：策略恒输出 0，配置正确则机器人站住
+uv run play MyFirstDIY-Velocity-Flat-G1 --agent zero --num-envs 4 --viewer viser
+\end{codebox}
+
+\begin{pitfall}[mjlab \texttt{register\_mjlab\_task} 后 CLI 报 task not found]
+\textbf{错误描述}：注册脚本写好了，跑 \verb|uv run play MyFirstDIY-...| 仍报找不到。\textbf{现象后果}：以为注册 API 用错，反复改签名。\textbf{根本原因}：注册代码所在模块\emph{从未被 import}——mjlab 靠 \verb|import_packages| 递归 import \verb|mjlab.tasks| 下每个子包、把 \verb|register_mjlab_task| 作为 import 副作用触发；你的模块若不落在 \verb|mjlab.tasks| 包树下（或没成为可发现子包），就不会被执行。\textbf{正确做法}：把注册放进 \verb|mjlab.tasks| 下某 \verb|config/<robot>/__init__.py|；仓库外的独立 pip 包则在包元数据声明 \verb|mjlab.tasks| entry point。再用 \verb|uv run list-envs| 确认 task id 进了列表。
+\end{pitfall}
+
+UniLab 的最小 DIY 动作略有不同：它\emph{不用} \verb|register_mjlab_task| 这类函数调用、也不用 \verb|gym.register|，而是给配置类与环境类各打一个\textbf{装饰器}（\verb|@registry.envcfg| / \verb|@registry.env|），把模块加进所属包的发现列表（导入即注册，同 mjlab/Isaac Lab 的「import 触发」思想）。改名只需起新的 CamelCase 注册名并写一个最小 owner YAML：
+
+\begin{codebox}[Python]{UniLab：继承内置 Go2 joystick，改名重注册（最小 DIY）}
+# src/unilab/envs/locomotion/go2/my_first_diy.py —— 不改 MDP，只验证「我能注册自己的 task」
+from dataclasses import dataclass
+from unilab.base import registry
+from unilab.envs.locomotion.go2.joystick import Go2JoystickCfg, Go2WalkTask
+
+@registry.envcfg("MyFirstDIY")                       # 注册名 = CamelCase = training.task_name
+@dataclass
+class MyFirstDIYCfg(Go2JoystickCfg):                 # 直接继承内置 Go2 joystick cfg
+    pass
+
+@registry.env("MyFirstDIY", sim_backend="mujoco")    # 同名可对多后端各注册一次
+@registry.env("MyFirstDIY", sim_backend="motrix")
+class MyFirstDIYTask(Go2WalkTask):                    # 复用内置 env 类
+    pass
+# 别忘了把本模块加进 go2 包的 __unilab_registry_modules__，spawn 子进程才能发现它
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab：跑通自己注册的 task（极短训练当冒烟）}
+# UniLab 无现成 zero agent 入口，最小验证用「极短训练」代替：env/迭代数走 Hydra 覆盖（不是 flag）
+uv run train --algo ppo --task my_first_diy --sim mujoco \
+    algo.num-envs=64 algo.max-iterations=3 training.no_play=true
+# 注：--task 用小写 slug（my_first_diy），对应 conf/ppo/task/my_first_diy/mujoco.yaml；
+#     注册名（CamelCase MyFirstDIY）经该 owner YAML 的 training.task_name 绑定
+\end{codebox}
+
+\begin{pitfall}[UniLab 注册后 \texttt{make()}/CLI 报 task not found]
+\textbf{错误描述}：装饰器都打了，跑 \verb|train --task my_first_diy| 仍报找不到。\textbf{现象后果}：以为装饰器用错，反复改签名。\textbf{根本原因}：UniLab 跨进程一律用 \verb|spawn| context（干净解释器），子进程\emph{不继承}父进程已 import 的模块——若新模块没进所属包的 \verb|__unilab_registry_modules__|，\verb|ensure_registries()| 在子进程里就发现不了它。\textbf{正确做法}：把模块名加进该包的 \verb|__unilab_registry_modules__|；仓库外的包用环境变量 \verb|UNILAB_EXTRA_REGISTRY_PACKAGES| 注入。对照 mjlab：mjlab 用 \verb|register_mjlab_task| 写进私有 \verb|_REGISTRY|（不是 \verb|gym.register|），靠 \verb|import_packages| 递归 import \verb|mjlab.tasks| 子包触发；两框架都是「导入即注册」，但 UniLab 多一层 spawn 子进程的发现契约。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{前置自测}
+\label{sec:rlmc-diy-pretest}
+
+本章是整部的收口实战，依赖前面几乎所有实践章。下面五题覆盖最关键的前置概念，\textbf{答不出 $\ge 3$ 题，先回对应章节复习再继续}。
+
+\begin{practice}[开课前自测]
+\begin{enumerate}
+\item （Manager 时序）\cref{ch:rlmc-manager}：Manager-Based 环境一个 \texttt{step} 内，\verb|ActionManager|、\verb|ObservationManager|、\verb|RewardManager|、\verb|TerminationManager| 的调用先后是什么？若漏配 \verb|TerminationManager| 会怎样？（答错回看 \cref{sec:rlmc-mgr-step}）
+\item （观测契约）\cref{ch:rlmc-obsact}：actor 组与 critic 组的 \verb|enable_corruption| 为何一般取不同值？critic 组放 privileged 观测时 \verb|enable_corruption=False| 的含义？（答错回看 \cref{sec:rlmc-asymmetric}）
+\item （资产建模）\cref{ch:rlmc-assets}：用 sw2urdf 导出的 URDF 中 \verb|<inertial>| 的 mass/origin/inertia 各描述什么？inertia 张量非对角元全零意味着什么？（答错回看 \cref{sec:rlmc-assets-inertia}）
+\item （执行器）\cref{ch:rlmc-actuator}：\verb|ImplicitActuatorCfg| 的 \verb|stiffness|/\verb|damping| 如何映射到 PD 控制？\verb|stiffness=0| 时退化为什么控制？（答错回看 \cref{sec:rlmc-act-delta}）
+\item （奖励）\cref{ch:rlmc-reward}：reward 设计里“乘法门控”与“加法组合”各自优缺点？为什么 random agent 的 episode reward 应为负？（答错回看 \cref{sec:rlmc-rew-fourlayers}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{本章目标}
+\label{sec:rlmc-diy-goals}
+
+学完本章，你应该\textbf{能够}（每条都可当场验收）：
+
+\begin{enumerate}
+\item \textbf{在 mjlab 中从零注册一个全新任务}——按 EntityCfg $\to$ SceneCfg $\to$ 七大 Manager $\to$ \texttt{register\_mjlab\_task} 六步法配齐并跑通；
+\item \textbf{在 Isaac Lab 中创建一个独立 extension}——遵循 HOVER 仓库的目录范式，\verb|pip install -e .| 后可注册可训练；
+\item \textbf{执行完整的验证三步走}——smoke test $\to$ zero agent $\to$ random agent，每步说得出明确的通过标准；
+\item \textbf{系统性地定位并修复}自定义环境最常见的十类 bug，并能从“症状”反推“根因”；
+\item \textbf{把任意 URDF/MJCF 机器人接入双框架}，跑通从模型导入到策略训练的端到端九步流水线；
+\item \textbf{根据任务特征选择 Manager-Based 还是 Direct workflow}，并说清选择理由。
+\end{enumerate}
+
+\paragraph{知识导航。}本章在全书中的位置如下。
+
+\begin{center}
+\begin{forest}
+navtree,
+[{本章：DIY 实战}
+  [{方法论}
+    [{DVI 分治-验证-集成}]
+    [{验证三步走}]]
+  [{三框架从零搭}
+    [{mjlab 六步法}]
+    [{Isaac Lab extension}]
+    [{UniLab 子类即环境}]]
+  [{端到端九步}
+    [{CAD$\to$URDF$\to$MJCF/USD}]
+    [{双框架一致性}]
+    [{sim2sim$\to$ONNX}]]
+  [{研究级案例}
+    [{HOVER（Isaac Lab）}]
+    [{HUSKY（mjlab）}]]
+  [{排错}
+    [{十大 bug 字典}]
+    [{不收敛决策树}]]
+]
+\end{forest}
+\end{center}
+
+\paragraph{前置桥接（2--3 行重述）。}\cref{ch:rlmc-manager} 立了 Manager-Based 架构与一个 step 的调用时序，\cref{ch:rlmc-assets} 立了 CAD$\to$URDF$\to$MJCF/USD 的资产管线，\cref{ch:rlmc-actuator} 立了执行器建模，\cref{ch:rlmc-quadloco} 把这些零件组合到一个内置四足任务。本章把它们\emph{合到一起}：你将为一个\emph{框架里没有的}机器人，独立走完从模型到策略的全程。
+
+\paragraph{阅读时间。}精读（含动手在某框架走完六步法 + 验证三步走）约 6--8 小时；速读（只读各节概念主线 + 验证三步走 + 十大 bug 表 + 小结）约 75 分钟；查阅（按 \cref{sec:rlmc-diy-bugs} 十大 bug 表 + \cref{sec:rlmc-diy-trouble} 故障手册定位）按需。
+
+% ════════════════════════════════════════════════════════════════
+\section{方法论：分治-验证-集成（DVI）}
+\label{sec:rlmc-diy-dvi}
+
+\textbf{本节解决什么问题}：在写任何配置之前，先确立一套\emph{贯穿全章}的工程原则，把“训练不收敛”这种模糊症状变成可逐项排除的有限清单。
+
+\subsection{动机：照搬内置任务为什么会出错}
+\label{sec:rlmc-diy-dvi-motivation}
+
+最自然的做法是复制一个相近的内置任务（如某个 \texttt{anymal\_c\_velocity}），把机器人模型换成自己的，其余尽量不动。这条捷径几乎一定会踩三类坑，而且\emph{都不报错}：
+
+\begin{itemize}
+\item \textbf{关节名不匹配}。内置任务的观测/动作配置通过关节名引用特定关节（如 \verb|["FL_hip_joint", ...]|）。你的机器人关节名不同，配置\emph{静默失败}——观测返回全零或维度错误，但程序照跑。
+\item \textbf{动力学特性不同}。内置任务的 action scale、reward 的 std、termination 阈值都是\emph{针对那台机器人}调好的。你的机器人更重、更矮、力矩范围不同——直接套旧值，轻则训练慢，重则策略崩。
+\item \textbf{任务语义不同}。速度跟踪的 reward 是追踪指令速度；你的任务若是抓取、平衡或导航，reward 结构完全不同，照搬毫无意义。
+\end{itemize}
+
+\begin{insight}[自定义环境的“难”是耦合，不是代码量]\label{ins:rlmc-diy-coupling}
+一个完整环境通常只有 300--500 行配置，比内置任务多写的也就一两百行——\emph{代码量从不是瓶颈}。真正的难点是：\textbf{每一行配置都与物理模型和任务语义紧耦合}。action 配置引用 robot entity 的关节名，观测配置引用 scene 中各 entity 的状态，reward 配置又引用观测算出的中间量。这条耦合链上任何一环错位，都不会触发编译/运行异常，而是\emph{在数千 iteration 后}以“reward 曲线平坦”或“行为诡异”浮现。于是 debug 的搜索空间不是“代码哪一行写错”，而是“MDP 的哪个组件、哪个维度、哪个坐标系不对”——后者大得多。本章所有方法论，本质都是\emph{把这条耦合链拆开、逐环单独验证}，把指数级搜索压成线性排查。
+\end{insight}
+
+\subsection{DVI 三原则}
+\label{sec:rlmc-diy-dvi-three}
+
+本章的核心方法论是\textbf{分治-验证-集成}（Divide-Verify-Integrate, DVI）：
+
+\begin{enumerate}
+\item \textbf{分治}：把环境搭建拆成独立模块——模型验证、action 验证、obs 验证、reward 验证、termination 验证；
+\item \textbf{验证}：每个模块有\emph{不需要训练策略}就能检查正确性的方法（这是关键——训练一次几小时，验证一个模块几秒）；
+\item \textbf{集成}：模块逐步组合，\emph{每加一个就跑一次 smoke test}——若崩，错误一定在最后加的那个。
+\end{enumerate}
+
+\begin{insight}[DVI 与硬件“板级测试”的同构]\label{ins:rlmc-diy-pcb}
+DVI 就像电子工程的板级测试：你不会把所有芯片焊上 PCB 才通电，而是先测电源能否输出正确电压、再测时钟是否稳定，然后逐个焊、每焊一个重测——新芯片让系统挂了，故障一定在最后焊的那个。类比到 RL 环境：每加一个 Manager 配置就重跑一次 smoke test，环境崩了，错误一定在最后加的那个 Manager。这个类比的\textbf{边界}在于：PCB 测试有明确的数值判据（电压在阈值内），而 RL 环境的“正确性”有时需要更多领域判断（如“random agent 的 reward 方差应该多大才算合理”）——所以 DVI 的“验证”一步在 RL 里既有硬判据（无 NaN、维度对、有方差），也有软判据（行为在 viewer 里看着合理）。
+\end{insight}
+
+\begin{pitfall}[把“环境搭建”当成一次性工作]
+\textbf{错误描述}：花两天搭好环境，认定后面只剩调超参。\textbf{现象后果}：观测归一化错误、reward 量纲不对、DR 范围不合理这类问题，往往训练数千 iteration 后才暴露，届时你早已在“调超参”的错误方向上耗了几天。\textbf{根本原因}：环境正确性不是布尔量，而是要在不同 DR、不同 command、不同地形下\emph{持续成立}的性质。\textbf{正确做法}：把环境验证脚本（smoke/zero/random 三步）做成 CI 的一部分，每次改环境自动跑一遍；并坚持“每次只改一项配置”，便于归因。
+\end{pitfall}
+
+\begin{practice}[DVI 热身]
+\begin{enumerate}
+\item \textbf{[回顾]} 列出 \cref{ch:rlmc-quadloco}、\cref{ch:rlmc-humanoidloco}、\cref{ch:rlmc-manip} 各自用的内置环境名，标注哪些是 mjlab 内置、哪些是 Isaac Lab 内置。\emph{验收}：一张三行表。
+\item \textbf{[设计]} 你实验室有一台六自由度机械臂（关节名与 \cref{ch:rlmc-manip} 的 YAM 完全不同）。若直接复制操作任务的 env cfg，列出 $\ge 5$ 个必须改的配置项及原因。\emph{验收}：5 条“配置项 + 为什么”。
+\item \textbf{[思考]} 从 MDP 四元组 $(S,A,R,T)$ 出发，分析“训练不收敛”可能的错误来源各落在哪个组件，并各举一个\emph{不报错}的失败例子。\emph{验收}：四组“组件—静默失败例”。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{mjlab 自定义任务：六步法 + 验证三步走}
+\label{sec:rlmc-diy-mjlab}
+
+\textbf{本节解决什么问题}：在 mjlab 中从零创建一个完整的自定义 RL 环境，掌握 EntityCfg $\to$ SceneCfg $\to$ 七大 Manager $\to$ \texttt{register\_mjlab\_task} 的全流程，并用验证三步走在训练前堵住绝大多数坑。
+
+\subsection{概念主线：mjlab 的“配置即环境”哲学}
+\label{sec:rlmc-diy-mjlab-philosophy}
+
+mjlab 的环境设计哲学是\textbf{配置即环境}：你\emph{不}继承任何环境基类、\emph{不}重写 \verb|step()|。整个环境由一串 dataclass 配置组成，框架据此自动编排物理仿真、观测计算、奖励计算、终止检查与 reset。\cref{ch:rlmc-manager} 介绍的 mjlab 九大 Manager 里，自定义任务必配前七个（\verb|ObservationManager|、\verb|ActionManager|、\verb|RewardManager|、\verb|TerminationManager|、\verb|EventManager|、\verb|CommandManager|、\verb|CurriculumManager|），后两个（Metrics/Recorder）有合理默认值。
+
+\begin{insight}[Manager-Based 的双重身份：依赖注入 $\equiv$ MDP 形式化]\label{ins:rlmc-diy-di}
+Manager-Based 架构可从两个看似无关的角度理解。\textbf{软件工程视角}：它是依赖注入（Dependency Injection）框架——每个 Manager 是可替换组件，框架（容器）负责按正确顺序调用它们，你只需提供正确配置，不必关心调度。\textbf{强化学习视角}：它是 MDP 形式化的直接映射——\verb|ObservationManager| 算 $s_t$、\verb|ActionManager| 施加 $a_t$、\verb|RewardManager| 算 $r_t$、\verb|TerminationManager| 判 $d_t$、\verb|EventManager| 处理初始状态分布 $\rho_0$ 与环境参数随机化。两个视角的\emph{交汇点}是：好的 MDP 设计恰好就是好的模块化设计——观测/奖励/动作的独立性，既是 MDP 的数学性质（reward 不该依赖 action 空间的具体实现），又是软件工程的低耦合高内聚。把握这个交汇点，面对复杂自定义环境时你才能做出正确的拆分决策。
+\end{insight}
+
+\paragraph{反事实推理：跳过某个 Manager 会怎样。}两个最易被忽视的 Manager：
+
+\begin{itemize}
+\item \textbf{不配 \texttt{TerminationManager}}：环境永不 reset，episode 长度趋于无穷。PPO 的 GAE（\cref{ch:rlmc-training}）依赖 episode 边界截断 trajectory，无穷长 episode 令 return 估计方差爆炸、训练不稳；更糟的是物理状态会逐渐漂到不合理区域（关节超限、穿模、NaN），最终仿真崩溃。
+\item \textbf{不配 \texttt{EventManager}（的 reset 随机化）}：每个 episode 初始状态完全相同，策略 overfit 到这一个初始状态——换个稍异的初始位姿就失效。固定基座操作里尤其严重：物体每次都在同一处，策略学到的是一条\emph{固定抓取轨迹}而非泛化抓取能力。
+\end{itemize}
+
+\subsection{配置详解：六步法逐步落地}
+\label{sec:rlmc-diy-mjlab-sixstep}
+
+以一个“自定义四足速度跟踪”为贯穿案例（非 Go2/ANYmal 的非标四足，MJCF 已由 \cref{ch:rlmc-assets} 的 sw2urdf 流程备好）。
+
+\paragraph{Step 1：定义 Robot EntityCfg。}EntityCfg 告诉框架“机器人 MJCF 在哪、初始状态是什么、关节怎么分组驱动”：
+
+\begin{codebox}[Python]{Step 1 —— Robot Entity（\texttt{my\_robot/robot\_cfg.py}）}
+import mujoco
+from mjlab.entity import EntityCfg, EntityArticulationInfoCfg
+from mjlab.actuator import BuiltinPositionActuatorCfg
+
+# mjlab 用 spec_fn（返回 MjSpec 的可调用对象）指向模型，框架 spec.compile() 出 MjModel；
+# 执行器落在 articulation.actuators，用 target_names_expr 绑关节名（不是 Isaac 的 joint_names_expr）
+MY_QUADRUPED_CFG = EntityCfg(
+    spec_fn=lambda: mujoco.MjSpec.from_file("my_robot/xmls/my_quad.xml"),
+    init_state=EntityCfg.InitialStateCfg(
+        pos=(0.0, 0.0, 0.45),                 # 初始高度：必须 > 站立时脚到 base 的距离
+        rot=(1.0, 0.0, 0.0, 0.0),             # wxyz 四元数（Hamilton 约定）
+        joint_pos={
+            ".*_hip_joint":   0.0,            # 正则匹配所有 hip 关节
+            ".*_thigh_joint": 0.7,
+            ".*_calf_joint":  -1.4,
+        },
+    ),
+    articulation=EntityArticulationInfoCfg(
+        actuators={
+            "legs": BuiltinPositionActuatorCfg(
+                target_names_expr=[".*"],     # 见 Step 3 陷阱：勿误含 freejoint
+                stiffness=25.0,               # PD 刚度 (Nm/rad)
+                damping=0.5,                  # PD 阻尼 (Nm*s/rad)
+                effort_limit=33.5,
+            ),
+        },
+    ),
+)
+\end{codebox}
+
+两个\textbf{关键决策点}：（1）\textbf{初始高度} \verb|pos[2]| 必须大于机器人站立时脚到 base 的距离——设太低，初始腿穿地，MuJoCo 接触求解器产生巨大弹出力把机器人弹飞；设太高，自由落体落地冲击可能触发 termination。正确做法是在 viewer 里手动 \verb|mj_step| 几步看是否稳定站立。（2）\textbf{初始关节角}用 \verb|".*_hip_joint": 0.0| 这类正则是 mjlab 标准模式，但若你的 MJCF 关节名不遵循 \verb|prefix_type_joint| 惯例（如用了 \verb|j1,j2,j3|），正则要相应改写。
+
+\paragraph{Step 2：定义 SceneCfg。}把机器人、地面（及可选地形）组合成场景：
+
+\begin{codebox}[Python]{Step 2 —— Scene（\texttt{my\_robot/scene\_cfg.py}）}
+from mjlab.scene import SceneCfg
+# mjlab 的场景是 SceneCfg（不是 Isaac 的 InteractiveSceneCfg），机器人经 entities 字典进场，
+# "robot" 这个 key 即各 MDP 项里 entity_name 引用的句柄；无 Isaac 的 prim_path/.replace 概念
+scene_cfg = SceneCfg(
+    num_envs=4096,
+    env_spacing=3.0,                           # 多环境并行时相邻 env 间距
+    entities={"robot": MY_QUADRUPED_CFG},      # 地面/地形走 terrain= 字段（平地可省）
+)
+\end{codebox}
+
+\verb|env_spacing| 太小则不同 env 的机器人可能互撞，太大则浪费显存；经验值为机器人最大尺寸的 3--5 倍。
+
+\paragraph{Step 3：定义 ActionsCfg。}
+
+\begin{codebox}[Python]{Step 3 —— Action（关节位置控制）}
+from mjlab.envs.mdp import JointPositionActionCfg
+
+# mjlab：JointPositionActionCfg 用 entity_name + actuator_names（绑执行器名，内部
+#   find_joints_by_actuator_names 解析）；Isaac Lab 才用 asset_name + joint_names
+actions = {"joint_pos": JointPositionActionCfg(
+    entity_name="robot",
+    actuator_names=[".*"],       # 见下方陷阱（绑执行器，非直接绑关节）
+    scale=0.25,                  # action in [-1,1] -> 增量 in [-0.25,0.25] rad
+    use_default_offset=True,     # action=0 对应初始关节角（zero agent 站住的前提）
+)}
+\end{codebox}
+
+\textbf{scale 的工程经验}（细节见 \cref{sec:rlmc-action-scale}）：太大（如 1.0 rad）random agent 会剧烈乱动、立刻触发 termination；太小（如 0.01 rad）策略表达力受限。四足速度跟踪经验值 0.2--0.3 rad，人形 0.1--0.2 rad（关节范围更小），操作任务可到 0.5--1.0 rad（臂关节范围大）。
+
+\paragraph{Step 4：定义 ObservationsCfg（actor/critic 双组）。}延续 \cref{ch:rlmc-privileged} 的非对称 actor-critic：actor 组只放部署时可得的本体感受，critic 组额外叠 privileged 观测。\textbf{此处有一个本部前几轮 introspect 实测纠正的关键事实}：mjlab 的 \verb|cfg.observations| 是\textbf{一个 \texttt{dict[str, ObservationGroupCfg]}（键\emph{就是}组名）}，内置 Go1/G1 velocity 用的两个组名是 \verb|"actor"| 与 \verb|"critic"|——\textbf{不是} \verb|"policy"|/\verb|"critic"|，也\textbf{不是}「\verb|class ObservationsCfg| 内嵌 \verb|class PolicyCfg|」那种 Isaac Lab 形态（Isaac Lab 才用类树 $+$ \verb|policy| 组名）。这个差异不报错却致命：照 Isaac 形态写 \verb|obs["policy"]|，在真 mjlab 上当场 \verb|KeyError: 'policy'|（实跑跑 \cref{sec:rlmc-diy-threestep} 的 smoke\_test 即复现）。下面给\textbf{mjlab 真实的 dict 形态}：
+
+\begin{codebox}[Python]{Step 4 —— Observation（mjlab 真实形态：dict 键即组名 actor/critic；真名 ObservationTermCfg，无 ObsTerm 别名）}
+from mjlab.managers import ObservationGroupCfg, ObservationTermCfg
+from mjlab.envs.mdp import (base_lin_vel, base_ang_vel, projected_gravity,
+                            generated_commands, joint_pos_rel, joint_vel_rel,
+                            last_action, height_scan)
+
+# mjlab：observations 是 dict[str, ObservationGroupCfg]，键即组名（实测内置 Go1/G1 用 "actor"/"critic"，非 "policy"）
+observations = {
+    "actor": ObservationGroupCfg(                # actor 组：部署时可得（注意键名是 "actor" 不是 "policy"）
+        base_lin_vel      = ObservationTermCfg(func=base_lin_vel),       # 3
+        base_ang_vel      = ObservationTermCfg(func=base_ang_vel),       # 3
+        projected_gravity = ObservationTermCfg(func=projected_gravity),  # 3
+        velocity_commands = ObservationTermCfg(func=generated_commands,
+                                    params={"command_name": "base_velocity"}),  # 3
+        joint_pos = ObservationTermCfg(func=joint_pos_rel),             # N_joints
+        joint_vel = ObservationTermCfg(func=joint_vel_rel),             # N_joints
+        actions   = ObservationTermCfg(func=last_action),               # N_joints
+    ),
+    "critic": ObservationGroupCfg(               # critic 组：privileged
+        enable_corruption = False,               # critic 不加观测噪声（见 \cref{sec:rlmc-asymmetric}）
+        base_lin_vel      = ObservationTermCfg(func=base_lin_vel),
+        base_ang_vel      = ObservationTermCfg(func=base_ang_vel),
+        projected_gravity = ObservationTermCfg(func=projected_gravity),
+        velocity_commands = ObservationTermCfg(func=generated_commands,
+                                    params={"command_name": "base_velocity"}),
+        joint_pos = ObservationTermCfg(func=joint_pos_rel),
+        joint_vel = ObservationTermCfg(func=joint_vel_rel),
+        actions   = ObservationTermCfg(func=last_action),
+        # privileged：仅 critic 可见的真实量（如高度扫描/地形、接触力等，部署时不可得）
+        height_scan = ObservationTermCfg(func=height_scan),
+    ),
+}
+\end{codebox}
+
+\textbf{为什么两组要\emph{显式各列一遍}而非继承}：Python dataclass 继承中子类改父类字段可能打乱 field 顺序，而观测拼接对顺序敏感（拼出来的向量第 $k$ 维必须稳定对应某个量）。mjlab 推荐显式列全每组的所有 term——即使重复——以保证 actor/critic 维度在任何修改下都可预测。
+
+\begin{pitfall}[mjlab 观测组名是 \texttt{actor}/\texttt{critic}，照 Isaac 写 \texttt{obs["policy"]} 当场 KeyError]
+\textbf{错误描述}：从 Isaac Lab 迁来的代码用 \verb|obs["policy"]| / \verb|observation_space["policy"]| / \verb|class PolicyCfg|。\textbf{现象后果}：在真 mjlab 上跑 smoke\_test 立刻 \verb|KeyError: 'policy'|（\verb|observation_manager| 的组名 \verb|dict_keys(['actor','critic'])|）。\textbf{根本原因}：mjlab 用 \verb|dict[str,ObservationGroupCfg]|、内置任务把 actor 组命名为 \verb|"actor"|；Isaac Lab 用类树且默认组名 \verb|"policy"|——两框架\emph{组名与组织形态都不同}。\textbf{正确做法}：写诊断脚本时\textbf{先 \texttt{print(list(obs.keys()))} 拿到真实组名再索引}，别硬编码 \verb|"policy"|；要让脚本跨框架可移植，用 \verb|next(iter(obs.keys()))| 取「第一个（actor）组」而非写死字符串。这正是本章反复强调的「命名静默失败」的活样例——把它当成 DIY 第一条肌肉记忆。
+\end{pitfall}
+
+\paragraph{Step 5：定义 RewardsCfg 与 TerminationsCfg。}奖励按 \cref{ch:rlmc-reward} 的四层框架（Tracking/Regularization/Contact/Style）组织：
+
+\begin{codebox}[Python]{Step 5 —— Reward / Termination（mjlab 真名 RewardTermCfg/TerminationTermCfg）}
+# mjlab velocity 真实函数名（非 Isaac 的 track_lin_vel_xy_exp 等）：tracking 用
+#   track_linear_velocity / track_angular_velocity（精度参数叫 std），通用正则在 envs.mdp
+class RewardsCfg:
+    # --- Tracking (正) ---
+    track_lin_vel = RewardTermCfg(func=track_linear_velocity, weight=1.5,
+                             params={"command_name": "base_velocity", "std": 0.25})
+    track_ang_vel = RewardTermCfg(func=track_angular_velocity, weight=0.75,
+                             params={"command_name": "base_velocity", "std": 0.25})
+    # --- Regularization (负)：mjlab 无 lin_vel_z_l2/ang_vel_xy_l2，用下面这些真名 ---
+    body_ang_vel   = RewardTermCfg(func=body_angular_velocity_penalty, weight=-0.05)
+    angular_mom    = RewardTermCfg(func=angular_momentum_penalty,      weight=-2.0e-3)
+    action_rate_l2 = RewardTermCfg(func=action_rate_l2,   weight=-0.01)
+    dof_torques_l2 = RewardTermCfg(func=joint_torques_l2, weight=-2.0e-4)
+    dof_acc_l2     = RewardTermCfg(func=joint_acc_l2,     weight=-2.5e-7)
+    # --- Contact ---
+    feet_air_time   = RewardTermCfg(func=feet_air_time, weight=0.125,
+                                    params={"sensor_cfg": ..., "threshold": 0.5})
+    self_collision  = RewardTermCfg(func=self_collision_cost, weight=-1.0,
+                                    params={"sensor_cfg": ...})
+
+class TerminationsCfg:
+    time_out     = TerminationTermCfg(func=time_out, time_out=True)
+    base_contact = TerminationTermCfg(func=illegal_contact,   # mjlab velocity.mdp 真实函数
+                            params={"sensor_cfg": ..., "threshold": 1.0})
+\end{codebox}
+
+\textbf{奖励权重的初始设定经验法则}（一张可照抄的起点表，细节见 \cref{sec:rlmc-rew-fourlayers}）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{6.0cm}@{}}
+\toprule
+类别 & 典型权重范围 & 调节原则 \\
+\midrule
+Tracking（正） & $0.5 \sim 3.0$ & 占总正奖励的 $60\%\sim 80\%$ \\
+Regularization（负） & $-0.1 \sim -0.001$ & 不应超过 tracking 奖励的 $20\%$ \\
+Contact（正/负） & $0.05 \sim 1.0$ & 别让触地惩罚压过 tracking \\
+Style（正） & $0.01 \sim 0.5$ & 最后添加，微调行为质量 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+一个实用技巧：先\emph{只}开 tracking（其余 weight=0）确认能移动，再逐项打开 regularization、每次只加一项观察曲线与行为变化——这样能精确定位每个 reward 项对行为的影响。
+
+\paragraph{Step 6：组装 EnvCfg 并注册。}
+
+\begin{codebox}[Python]{Step 6 —— 组装与注册}
+from dataclasses import dataclass, field
+from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.tasks.registry import register_mjlab_task
+
+# mjlab 用原生 @dataclass(kw_only)；decimation 是 env cfg 顶层字段（不在 sim 里），
+# 物理 dt 落在 sim.mujoco（无 Isaac 的 SimCfg(dt=,decimation=) 那种写法）
+@dataclass(kw_only=True)
+class MyQuadEnvCfg(ManagerBasedRlEnvCfg):
+    scene:        SceneCfg          = field(default_factory=lambda: scene_cfg)
+    observations: dict              = field(default_factory=lambda: observations)  # dict[str,ObservationGroupCfg]（键即组名 actor/critic）
+    actions:      dict              = field(default_factory=lambda: actions)
+    rewards:      RewardsCfg        = field(default_factory=RewardsCfg)
+    terminations: TerminationsCfg   = field(default_factory=TerminationsCfg)
+    events:       EventsCfg         = field(default_factory=EventsCfg)   # DR（见 \cref{sec:rlmc-diy-events}）
+    commands:     CommandsCfg       = field(default_factory=CommandsCfg) # 速度指令（见 \cref{sec:rlmc-diy-events}）
+    decimation:        int   = 4           # 物理步 * 4 -> 50 Hz 策略（dt 在 sim.mujoco 配 0.005）
+    episode_length_s:  float = 20.0
+
+# mjlab 用私有 _REGISTRY，传 cfg 对象（不是 gym、也不是 entry_point 字符串）
+register_mjlab_task(
+    task_id="MyQuad-Velocity-Flat",
+    env_cfg=MyQuadEnvCfg(),
+    play_env_cfg=MyQuadEnvCfg(),       # play 变体通常关 noise/push（这里简化复用）
+    rl_cfg=MyQuadPPOCfg(),
+)   # runner_cls 可选，默认 MjlabOnPolicyRunner
+\end{codebox}
+
+注册后即可用标准命令启动训练与可视化：
+
+\begin{codebox}[bash]{mjlab：训练与可视化}
+uv run train MyQuad-Velocity-Flat --env.scene.num-envs 4096 --headless
+uv run play  MyQuad-Velocity-Flat --num-envs 1
+\end{codebox}
+
+\begin{note}[mjlab 注册用 \texttt{register\_mjlab\_task}，不是 gym]
+经核 mjlab \texttt{tasks/registry.py}（mjlab 1.4.0）：内置任务一律用 \verb|register_mjlab_task| 写进模块级私有 \verb|_REGISTRY: dict[str, _TaskCfg]|（重复注册报错），\textbf{不用} \verb|gym.register|；签名是 \verb|register_mjlab_task(task_id, env_cfg, play_env_cfg, rl_cfg, runner_cls=...)|——\verb|env_cfg|/\verb|play_env_cfg|/\verb|rl_cfg| 接\emph{cfg 对象或工厂返回值}，不是 entry\_point 字符串。\verb|EntityCfg|/\verb|ImplicitActuatorCfg|/\verb|JointPositionActionCfg| 等类名以你所装 mjlab 版本源码为准（\verb|JointPositionActionCfg| 在 mjlab 用 \verb|entity_name|/\verb|actuator_names| 字段，Isaac Lab 用 \verb|asset_name|/\verb|joint_names|）。
+\end{note}
+
+\subsection{运行验证：三步走（训练前必做）}
+\label{sec:rlmc-diy-threestep}
+
+环境注册后，\textbf{不要立即训练}。先跑三步验证，确保 MDP 每个组件正常——这是 DVI 方法论在 mjlab 侧的落地，三步合计两分钟，能堵住后面几天的弯路。
+
+\paragraph{第一步：Smoke Test（约 10 秒）——能否创建、reset、不报错。}
+
+\begin{codebox}[Python]{smoke\_test.py}
+import torch
+# mjlab 无 gym 式 make()；从私有 _REGISTRY 取已注册 cfg，再实例化 ManagerBasedRlEnv
+from mjlab.envs import ManagerBasedRlEnv
+from mjlab.tasks.registry import load_env_cfg
+
+cfg = load_env_cfg("MyQuad-Velocity-Flat")        # 返回 deepcopy 的 env cfg
+cfg.scene.num_envs = 4
+env = ManagerBasedRlEnv(cfg, device="cuda")
+obs, info = env.reset()
+# 第一件事：打印真实组名，别假设叫 "policy"！mjlab 内置任务用 actor/critic，Isaac Lab 才用 policy
+print("Obs groups:", list(obs.keys()))            # mjlab Go1/G1 实测 -> ['actor', 'critic']
+ACTOR = next(iter(obs.keys()))                    # 取第一个（actor）组，跨框架可移植
+print("Obs  shape:", obs[ACTOR].shape)
+print("Action shape:", env.action_space.shape)
+for _ in range(10):
+    action = torch.zeros(4, env.action_space.shape[-1])
+    obs, reward, terminated, truncated, info = env.step(action)
+    assert not torch.isnan(obs[ACTOR]).any(), "NaN in obs!"
+    assert not torch.isnan(reward).any(),     "NaN in reward!"
+print("Smoke test passed.")
+env.close()
+\end{codebox}
+
+\textbf{通过标准}：不报错，观测与奖励无 NaN。失败最常见的原因是 MJCF 编译错误或 joint name 不匹配。\textbf{第一行 \texttt{print(list(obs.keys()))} 不是可选的}——它一次性告诉你「这个框架/这个任务的观测组到底叫什么」，比翻文档快、比假设组名稳。养成「先 print 真实结构、再索引」的习惯，能躲掉本章一半的「命名静默失败」。
+
+\paragraph{第二步：Zero Agent（约 30 秒）——action=0 下物理是否合理。}因 \verb|use_default_offset=True|，action=0 对应初始姿态，机器人应站住。
+
+\begin{codebox}[Python]{zero\_agent\_test.py}
+import numpy as np, torch
+from mjlab.envs import ManagerBasedRlEnv
+from mjlab.tasks.registry import load_env_cfg
+
+cfg = load_env_cfg("MyQuad-Velocity-Flat"); cfg.scene.num_envs = 16
+env = ManagerBasedRlEnv(cfg, device="cuda")
+obs, info = env.reset()
+rewards_history = []
+for step in range(200):                       # 约 4 秒（50 Hz 下 200 步）
+    action = torch.zeros(16, env.action_space.shape[-1])
+    obs, reward, terminated, truncated, info = env.step(action)
+    rewards_history.append(reward.mean().item())
+    if step == 0:
+        # 直接读仿真状态里的 base 高度；勿用 projected_gravity 当高度代理（二者无关）
+        h = env.unwrapped.scene["robot"].data.root_link_pos_w[:, 2].mean().item()
+        print(f"Step 0 base height: {h:.3f}")
+print(f"Mean reward: {np.mean(rewards_history):.4f}  std: {np.std(rewards_history):.4f}")
+print(f"Any terminated: {terminated.any().item()}")
+\end{codebox}
+
+\textbf{通过标准}：机器人 200 步内\emph{不倒}（terminated 全 False）——倒了说明初始关节角不在平衡点；base 高度\emph{基本不变}（允许几毫米~几厘米下沉，阻尼会让关节略松；实测内置 Go1 zero agent 200 步 base 高度 $0.307\to 0.250$）；reward 是\textbf{一个绝对值不大的常数}——\textbf{符号取决于你配了哪些项}：纯正则惩罚（无 alive/upright）时为\emph{小负值}（不移动则 tracking 近零、无动作则正则惩罚近零），但若配了 \verb|alive|/\verb|upright| 这类「站着就给正分」的项，则会是\emph{小正值}（实测内置 Go1 含 alive/upright 时 reward $\approx +0.076$）。\textbf{所以别把「reward 必须为负」当硬判据}——zero agent 真正要看的是\emph{不倒} $+$ \emph{无 NaN} $+$ reward 是个稳定的小常数（不该是 $\pm 100$ 这种大值，那说明某项量纲错）。reward 的正负只是「你配了哪些项」的推论，不是环境对错的判据。
+
+\begin{insight}[zero agent 是自定义环境最有价值的诊断工具]\label{ins:rlmc-diy-zeroagent}
+为什么 zero agent 比任何训练曲线都先值得看？因为 action=0 是策略\emph{探索的起点}（\verb|use_default_offset=True| 下它就是默认姿态）。如果起点都不稳定——机器人在零动作下都站不住——那么 PPO 的初始 rollout 全是“跌倒—reset”的灾难样本，advantage 估计里没有任何“做对了”的正信号可供策略爬升，再好的算法也学不出东西。换句话说，zero agent 检查的是\emph{优化问题的可行性}，而非策略的优劣。这条洞察可推广：任何 RL 任务，先确认“什么都不做”的 baseline 行为是否合理，再谈学习。
+\end{insight}
+
+\paragraph{第三步：Random Agent（约 2 分钟）——奖励有方差、终止会触发、reset 正常。}
+
+\begin{codebox}[Python]{random\_agent\_test.py}
+import numpy as np, torch
+from mjlab.envs import ManagerBasedRlEnv
+from mjlab.tasks.registry import load_env_cfg
+
+cfg = load_env_cfg("MyQuad-Velocity-Flat"); cfg.scene.num_envs = 64
+env = ManagerBasedRlEnv(cfg, device="cuda")
+obs, info = env.reset()
+ep_rewards, ep_lengths = [], []
+cur_r = torch.zeros(64); cur_l = torch.zeros(64)
+for step in range(2000):                       # 约 40 秒
+    action = torch.randn(64, env.action_space.shape[-1])
+    obs, reward, terminated, truncated, info = env.step(action)
+    cur_r += reward; cur_l += 1
+    done = terminated | truncated
+    if done.any():
+        ep_rewards.extend(cur_r[done].tolist()); ep_lengths.extend(cur_l[done].tolist())
+        cur_r[done] = 0; cur_l[done] = 0
+print(f"Completed episodes: {len(ep_rewards)}")
+print(f"Ep reward: {np.mean(ep_rewards):.2f} +/- {np.std(ep_rewards):.2f}")
+print(f"Ep length: {np.mean(ep_lengths):.1f} +/- {np.std(ep_lengths):.1f}")
+\end{codebox}
+
+\textbf{通过标准}：完成的 episode 数 $>0$（终止在工作）；episode 长度\emph{有方差}（不同随机动作存活时间不同）；reward\emph{有方差}（奖励对动作有区分度）；episode reward 为\emph{负}（随机策略乱动必然摔，纯负则信号清晰；实测内置 Go1 random agent epReward $\approx -1.56$、epLen $91\pm 55$ 步——方差大正说明终止/奖励都在工作）。若 random agent 的 reward 恒为常数，说明 reward 没和动作关联——见 \cref{sec:rlmc-diy-bugs} Bug 4。
+
+\subsection{从零探路：照着一个真内置任务把结构「抄」对}
+\label{sec:rlmc-diy-explore}
+
+上面三个脚本里反复出现一个动作：\verb|print(list(obs.keys()))|、\verb|load_env_cfg(...)| 再看里面有什么。这不是凑数——它是 DIY 最该先学会的一项\textbf{元技能}：\textbf{与其照书背 API，不如打开一个\emph{已经能跑}的内置任务、把它的真实结构 print 出来，照着仿}。框架版本一变、字段名一改，背下来的写法就过期；但「列任务$\to$取一个$\to$打印它的真实结构」这套\emph{查法}永不过期。本章 mjlab 侧观测组名是 \verb|actor| 而非 \verb|policy| 这件事，就是这么探明的——不是查文档，是 print 出来撞见的。
+
+\paragraph{一次完整的「打开真 env 逐项 introspect」session（可直接复制）。}下面这段在任何装了 mjlab 的机器上都能跑，它一次性回答「这个框架的观测组叫什么、每组多少维、动作多少维、reward 有哪些项、command 是什么」——这五个问题正好覆盖你 DIY 要保证正确的 MDP 五锚点：
+
+\begin{codebox}[Python]{introspect\_builtin.py —— 把一个内置任务的真实结构全 print 出来}
+import torch
+from mjlab.envs import ManagerBasedRlEnv
+from mjlab.tasks.registry import load_env_cfg
+
+# 第 1 步：拿一个「已知能跑」的内置任务当模板（task id 从 `uv run list-envs` 抄）
+cfg = load_env_cfg("Mjlab-Velocity-Flat-Unitree-Go1")
+cfg.scene.num_envs = 2
+env = ManagerBasedRlEnv(cfg, device="cuda")
+obs, _ = env.reset()
+
+# 第 2 步：观测——组名(S 锚点)。别假设叫 "policy"！实测打印出 ['actor', 'critic']
+print("obs groups :", list(obs.keys()))
+for g, v in obs.items():
+    print(f"  group {g!r:8} dim = {v.shape[-1]}")
+# mjlab 官方 introspect 入口：逐组维度 + 每组的 active term 名
+om = env.observation_manager
+print("group dims :", om.group_obs_dim)          # {'actor': .., 'critic': ..}
+print("actor terms:", om.active_terms["actor"])  # 逐项 term 名，核对顺序/拼写
+
+# 第 3 步：动作(A 锚点)
+print("action dim :", env.action_space.shape[-1])
+# 第 4 步：reward(R 锚点)——有哪些项、权重多少
+print("reward terms:", list(env.reward_manager.active_terms))
+# 第 5 步：command(任务指令)——有哪些
+print("commands   :", list(env.command_manager.active_terms))
+env.close()
+\end{codebox}
+
+把这段对你\emph{自己}的任务再跑一遍，逐行和「你以为配的」对照——\textbf{对不上的那一项，就是你下一个 bug}。这比训练几小时后看平坦曲线再回头猜，快几个数量级。
+
+\begin{insight}[「查得到」比「背得住」值钱：把核实变成可复用技能]\label{ins:rlmc-diy-introspect}
+本书给的所有配置代码块都是「某版本下的快照」，会随框架升级漂移（本部实跑就撞见过 mjlab 组名、reward 真名、rsl-rl 文件迁移等多处与旧稿不符）。所以真正要内化的不是\emph{某个字段叫什么}，而是\textbf{「拿到一个陌生框架，怎么三五行 print 出它的真实结构」}：（1）\verb|list-envs| 列出能跑的任务；（2）\verb|load_env_cfg| 把一个 cfg 取出来 print；（3）建一个 2-env 的 \verb|env|，对 \verb|observation_manager|/\verb|action_manager|/\verb|reward_manager|/\verb|command_manager| 逐个问 \verb|active_terms|。UniLab 侧对应动作是 \verb|registry.list_registered_envs()| $+$ 读 \verb|obs_groups_spec|；Isaac Lab 侧是 \verb|gym.registry| $+$ \verb|env.observation_manager|。\textbf{框架会换，print 真实结构的习惯不会过期}——这是 DIY 里最保值的一条肌肉记忆，也是本章每个「实测发现 X 与文档不符」背后用的同一招。
+\end{insight}
+
+\subsection{代码走读：自定义 Reward/Obs Term}
+\label{sec:rlmc-diy-customterm}
+
+当内置 term 不够用时，自定义 term 的标准模式（与 \cref{sec:rlmc-mgr-customterm} 一致，这里给可直接套的骨架）：
+
+\begin{codebox}[Python]{自定义 reward term 及其注册}
+def my_custom_tracking_reward(env, asset_cfg, command_name: str,
+                              std: float = 0.25) -> torch.Tensor:
+    """自定义速度跟踪奖励，返回 [B] 一维 tensor。"""
+    actual_vel = env.scene["robot"].data.root_link_lin_vel_b[:, :2]  # base frame！
+    cmd_vel    = env.command_manager.get_command(command_name)[:, :2]
+    error      = torch.norm(actual_vel - cmd_vel, dim=-1)
+    return torch.exp(-error**2 / std**2)                            # 高斯核
+
+class RewardsCfg:                          # mjlab 用 RewardTermCfg（无 RewTerm 别名）
+    my_tracking = RewardTermCfg(func=my_custom_tracking_reward, weight=2.0,
+        params={"asset_cfg": SceneEntityCfg("robot"),
+                "command_name": "base_velocity", "std": 0.25})
+\end{codebox}
+
+\textbf{命名约定}：函数名应描述“算什么”而非“在哪个任务用”。好名：\verb|track_lin_vel_xy_exp|、\verb|feet_air_time|、\verb|base_height_penalty|；坏名：\verb|my_reward|、\verb|task1_bonus|、\verb|reward_v2|——好名让 term 可跨任务复用。
+
+\subsection{常见陷阱}
+\label{sec:rlmc-diy-mjlab-pitfalls}
+
+\begin{pitfall}[\texttt{joint\_names} 正则误含 freejoint]
+\textbf{错误描述}：用 \verb|[".*"]| 匹配所有关节，但 MJCF 里还有 freejoint（6-DoF 浮基关节）。\textbf{现象后果}：action 维度多出 6 维，策略直接“控制底盘位姿”——训出的策略物理上无意义。\textbf{根本原因}：freejoint 也是“joint”，正则一锅端。\textbf{正确做法}：用精确正则 \verb|["FL_.*","FR_.*","HL_.*","HR_.*"]|，或排除式 \verb|["(?!root).*"]|；并打印 \verb|env.action_manager.total_action_dim| 确认维度。
+\end{pitfall}
+
+\begin{pitfall}[\texttt{dt} 与 \texttt{decimation} 配出过高策略频率]
+\textbf{错误描述}：\verb|dt=0.01, decimation=1| $\Rightarrow$ 策略 100 Hz。\textbf{现象后果}：每步状态变化极小、reward 信号极弱，PPO 难以学到有效更新。\textbf{根本原因}：策略频率太高，单步动作几乎不改变世界。\textbf{正确做法}：\verb|dt=0.002~0.005, decimation=4~10| $\Rightarrow$ 20--50 Hz，且策略频率应与真机部署频率匹配。
+\end{pitfall}
+
+\begin{pitfall}[RewardTermCfg 的 func 返回了错误形状]
+\textbf{错误描述}：reward 函数返回 \verb|[B,1]| 而非 \verb|[B]|。\textbf{现象后果}：RewardManager 内部 squeeze 失败或广播出错。\textbf{根本原因}：约定被破坏。\textbf{正确做法}：所有 reward/termination term 的返回值必须是 \verb|[B]| 一维 tensor（长度 = num\_envs）。
+\end{pitfall}
+
+\begin{pitfall}[观测里的速度用了 world frame]
+\textbf{错误描述}：用 \verb|root_link_lin_vel_w|（world frame）作观测。\textbf{现象后果}：底盘朝向一变，同样的前进速度在 world frame 里表示不同，观测变得不稳定，策略学不会。\textbf{根本原因}：观测应对“朝向”不变。\textbf{正确做法}：用 \verb|root_link_lin_vel_b|（body frame）——前进方向恒为 x 轴，与朝向无关。这是“不报错却不收敛”的典型，也是 \cref{sec:rlmc-diy-bugs} 多条 bug 的共同根因。
+\end{pitfall}
+
+\begin{practice}[mjlab 六步法]
+\begin{enumerate}
+\item \textbf{[实践]} 按六步法，为一个倒立摆（action=cart 力，obs=pole 角与角速度，reward=保持直立时长）在 mjlab 中创建自定义环境，跑通 smoke + zero agent。\emph{验收}：zero agent 下 pole 不\emph{瞬间}倒、smoke 无 NaN。
+\item \textbf{[调试]} 你的四足 smoke test 通过，但 zero agent 第一步就“弹飞”（base height $>5$ m）。列出三个可能原因与排查步骤。\emph{验收}：3 组“原因—排查”，至少含初始高度与初始穿模。
+\item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-dr}，为该四足加三项 DR（mass、friction、joint damping），设计一个验证实验：无 DR 训 baseline、加 DR 再训，用 sim2sim 对比两策略在不同物理参数下的鲁棒性。\emph{验收}：实验设计 + 至少一个对比指标。
+\end{enumerate}
+\end{practice}
+
+\subsection{三框架同一概念：UniLab 的「子类即环境」从零路径}
+\label{sec:rlmc-diy-mjlab-unilab}
+
+mjlab 的六步法本质是\emph{填一串 dataclass 配置}，框架据此自动编排 step。UniLab 走的是\textbf{另一条路}：它\emph{不是} Manager-Based——你\textbf{继承 \texttt{NpEnv}（或其 locomotion 子类）并重写 \texttt{update\_state}}，在一个方法里一处算 obs/reward/terminated（替代 mjlab/Isaac Lab 的 Obs/Reward/Term 三个 Manager），reward 不写成 \verb|RewTerm| 类树而是\textbf{标量字典 + 派发表}。这把「配置即环境」换成了「子类即环境」，但分层与注册的\emph{心智模型}与 mjlab 一致（机器人无关 cfg $+$ 注入资产 $+$ 训练超参 $+$ 导入即注册）。下面把 mjlab 六步法逐步对照到 UniLab。
+
+\paragraph{Step 1--2（Entity $+$ Scene）$\to$ UniLab 的 SceneCfg。}UniLab 没有独立的 EntityCfg/执行器配类（mjlab 用 \texttt{EntityCfg} $+$ \texttt{BuiltinPositionActuatorCfg}）；\textbf{机器人模型、传感器、PD 增益分别落在 MJCF/Motrix XML、\texttt{SceneCfg} 与 \texttt{PdControlConfig}}。MJCF 的 keyframe \verb|home| 提供 \verb|default_angles|（动作残差基准）：
+
+\begin{codebox}[Python]{UniLab Step 1--2 —— SceneCfg $+$ PD 增益（对照 mjlab EntityCfg $+$ BuiltinPositionActuatorCfg）}
+from dataclasses import dataclass, field
+from unilab.base.scene import SceneCfg
+from unilab.envs.locomotion.common.base import LocomotionBaseCfg
+
+@registry.envcfg("MyQuadJoystick")
+@dataclass
+class MyQuadJoystickCfg(LocomotionBaseCfg):
+    scene: SceneCfg = field(default_factory=lambda: SceneCfg(
+        model_file="src/unilab/assets/robots/my_quad/scene_flat.xml"))  # MJCF，含 keyframe home + 传感器
+    max_episode_seconds: float = 20.0
+    sim_dt: float = 0.005          # 物理步（validate() 强制 sim_dt <= ctrl_dt）
+    ctrl_dt: float = 0.02          # 控制步 -> sim_substeps = ctrl_dt/sim_dt = 4
+    reward_config: "RewardConfig | None" = None   # 必须经 Hydra 注入（见 Step 5）
+    # PD 增益经 control_config（PdControlConfig: Kp 默认 35.0, Kd 默认 0.5, action_scale 0.25）
+\end{codebox}
+
+\paragraph{Step 3--4（Action $+$ Observation）$\to$ UniLab \texttt{apply\_action} $+$ \texttt{obs\_groups\_spec}。}动作\emph{不配 JointPositionActionCfg 类}——基类 \verb|apply_action| 已把动作当作关节位置目标残差：\verb|ctrl = action * action_scale + default_angles|（与 mjlab \verb|use_default_offset=True| 等价）。观测的 actor/critic 双组经 \verb|obs_groups_spec| 声明维度，\verb|_compute_obs| 里 actor 组只放真机可得量（可加噪声）、critic 组追加特权量（无噪声）——与 mjlab 的非对称 actor-critic 思想相同，只是 UniLab \textbf{env 侧固定用 \texttt{obs}/\texttt{critic} 两个组名}（mjlab 内置任务用 \verb|actor|/\verb|critic|，Isaac Lab 用 \verb|policy|/\verb|critic|——三框架的 actor 侧组名各不相同，这正是写跨框架脚本要先 \verb|print(list(obs.keys()))| 的原因）：
+
+\begin{codebox}[Python]{UniLab Step 3--4 —— 动作（残差 PD）$+$ 观测双组}
+import numpy as np
+from unilab.base.np_env import NpEnvState
+from unilab.envs.locomotion.common.base import LocomotionBaseEnv
+
+@registry.env("MyQuadJoystick", sim_backend="mujoco")
+@registry.env("MyQuadJoystick", sim_backend="motrix")    # 同名可注册多后端
+class MyQuadWalkTask(LocomotionBaseEnv):
+    @property
+    def obs_groups_spec(self) -> dict:                    # actor / critic 维度（critic 多特权量）
+        return {"obs": 48, "critic": 51}                 # critic 多 3 = 特权 base linvel
+
+    def _compute_obs(self, info, linvel, gyro, gravity, dof_pos, dof_vel):
+        diff = dof_pos - self.default_angles
+        last = info.get("current_actions", np.zeros_like(diff))
+        obs = np.concatenate([gyro, -gravity, diff, dof_vel, last,
+                              info["commands"]], axis=1)              # actor：真机可得
+        critic = np.concatenate([obs, linvel], axis=1)               # critic：+特权 base linvel
+        return {"obs": obs, "critic": critic}
+    # 动作无需配类：基类 apply_action 算 ctrl = act*action_scale(0.25) + default_angles
+\end{codebox}
+
+\paragraph{Step 5（Reward $+$ Termination）$\to$ UniLab 标量字典派发表。}这是与 mjlab/Isaac Lab \textbf{差异最大}的一处：reward \emph{不是} \verb|RewTerm(func=..., weight=...)| 列表，而是 \verb|scales| 标量字典（Hydra 注入）$+$ env 内 \verb|_reward_fns| 派发表；终止也\emph{不配 DoneTerm 类}，直接在 \verb|update_state| 里算（如 \verb|gravity[:,2] <= 0.5| 即摔倒），超时 \verb|truncated| 由基类按 \verb|max_episode_steps| 自动算：
+
+\begin{codebox}[Python]{UniLab Step 5 —— reward 派发表 $+$ 终止（对照 mjlab RewardTermCfg/TerminationTermCfg）}
+from unilab.envs.locomotion.common import rewards
+from unilab.envs.locomotion.common.rewards import RewardContext
+
+def _init_reward_functions(self):                # scale 名 -> 函数（共享函数在 common/rewards.py）
+    self._reward_fns = {
+        "tracking_lin_vel": rewards.tracking_lin_vel,   # exp(-||cmd_xy - v_xy||^2 / sigma^2)
+        "tracking_ang_vel": rewards.tracking_ang_vel,
+        "lin_vel_z":        rewards.lin_vel_z,
+        "action_rate":      rewards.action_rate,
+        "similar_to_default": rewards.similar_to_default,
+        "alive":            rewards.alive,
+    }
+
+def update_state(self, state: NpEnvState) -> NpEnvState:
+    linvel = self.get_local_linvel(); gyro = self.get_gyro()     # 机体系速度可直接得
+    gravity = self._backend.get_sensor_data("upvector")
+    dof_pos = self.get_dof_pos(); dof_vel = self.get_dof_vel()
+    terminated = gravity[:, 2] <= 0.5                            # 摔倒终止（无 DoneTerm 类）
+    ctx = RewardContext(info=state.info, linvel=linvel, gyro=gyro, dof_pos=dof_pos,
+                        num_envs=self._num_envs, default_angles=self.default_angles,
+                        tracking_sigma=self._reward_cfg.tracking_sigma)
+    reward = rewards.run_reward_dispatch(scales=self._reward_cfg.scales,   # Σ scales[n]*fns[n](ctx)
+                fns=self._reward_fns, ctx=ctx, info=state.info,
+                enable_log=True, ctrl_dt=self._cfg.ctrl_dt)       # 返回 reward*ctrl_dt（按控制周期缩放）
+    obs = self._compute_obs(state.info, linvel, gyro, gravity, dof_pos, dof_vel)
+    return state.replace(obs=obs, reward=reward, terminated=terminated)
+\end{codebox}
+
+\paragraph{Step 6（组装 $+$ 注册）$\to$ UniLab 双装饰器 $+$ owner YAML。}注册即上面两个 \verb|@registry| 装饰器（cfg 与 env 各一，env 可多后端各标一次）；超参与 reward 权重写进 owner YAML（Hydra \verb|# @package _global_|），训练命令的 \verb|--task| 用\emph{小写 slug}：
+
+\begin{codebox}[bash]{UniLab Step 6 —— owner YAML 关键段 $+$ 训练命令}
+# conf/ppo/task/my_quad_joystick/mujoco.yaml （# @package _global_）
+#   training: {task_name: MyQuadJoystick, sim_backend: mujoco}
+#   algo: {num_envs: 4096, max_iterations: 300, obs_groups: {actor: [actor], critic: [critic]}}
+#   reward:
+#     scales: {tracking_lin_vel: 1.0, tracking_ang_vel: 0.2, lin_vel_z: -2.0,
+#              action_rate: -0.01, similar_to_default: -0.1, alive: 0.5}
+#     tracking_sigma: 0.25
+#     base_height_target: 0.3
+uv run train --algo ppo --task my_quad_joystick --sim mujoco \
+    algo.num-envs=4096 algo.max-iterations=300         # env/迭代数走 Hydra 覆盖，不是 flag
+\end{codebox}
+
+\begin{insight}[同一 MDP 的三种「落盘形态」]\label{ins:rlmc-diy-three-forms}
+把速度跟踪这\emph{一个} MDP 落到三框架，会得到三种结构迥异的代码，但它们编码的是同一组 $(S,A,R,T)$。\textbf{mjlab}：一串 dataclass 配置 $+$ 普通 dict \verb|{name: TermCfg}| 的 Manager，框架编排 step（配置即环境）。\textbf{Isaac Lab}：嵌套 \verb|@configclass| 的 Manager $+$ \verb|gym.register|，风格更「声明式」（同为 Manager-Based）。\textbf{UniLab}：继承 \verb|NpEnv| 重写 \verb|update_state| 一处算 obs/reward/done $+$ reward 标量字典派发表 $+$ 双 \verb|@registry| 装饰器（子类即环境，非 Manager-Based）。这给 DIY 一个普适判断：\textbf{当你看一个陌生框架时，先问「MDP 的五个组件各落在哪个文件、用什么形态表达」}——找到 $S$（观测组）、$A$（动作/控制映射）、$R$（reward 项/字典）、$T$（终止判据）、$\rho_0$（reset/DR）这五个锚点，任何框架的「从零搭」都会迅速变得可读。三框架的差异是\emph{组织形态}，不是\emph{MDP 语义}——后者是你真正要保证正确的东西。
+\end{insight}
+
+\begin{note}[UniLab 无 zero agent 入口；冒烟用极短训练代替]
+mjlab/Isaac Lab 都有显式的 zero/random agent 脚本，UniLab \textbf{当前没有现成 zero agent 入口}。最小验证用「极短训练」代替（\verb|algo.max-iterations=3 training.no_play=true|，见 \cref{sec:rlmc-diy-quickstart}）：跑满几个 iter、reward 各项有数值、无 NaN 即说明 obs/reward/step 链路通。\cref{sec:rlmc-diy-threestep} 的 zero agent 诊断洞察（\cref{ins:rlmc-diy-zeroagent}）在 UniLab 下要么手写一个恒输出 \verb|default_angles| 的临时策略回放、要么靠 \verb|NanGuard|（\verb|utils/nan_guard.py|）$+$ \verb|unilab-viz-nan| 离线复现来兜底。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{Isaac Lab Extension 开发模式}
+\label{sec:rlmc-diy-isaac}
+
+\textbf{本节解决什么问题}：在 Isaac Lab 中创建独立 extension 项目，遵循 HOVER 仓库的目录范式，理解 Manager-Based 与 Direct workflow 的选择依据，并掌握与 mjlab 配置的逐项对应。
+
+\subsection{概念主线：为什么用 extension 而非改主仓库}
+\label{sec:rlmc-diy-isaac-why}
+
+Isaac Lab 的环境开发有两种模式：\textbf{内部模式}（代码直接写进 \verb|isaac-sim/IsaacLab| 主仓库）与 \textbf{Extension 模式}（创建独立 Python 包，作为外部扩展加载）。Extension 是\emph{推荐的生产模式}，原因有三：\textbf{版本隔离}（你的代码不与主仓库耦合，升级 Isaac Lab 不必处理合并冲突）、\textbf{协作友好}（团队各自开发不同 extension，互不影响）、\textbf{可发布}（extension 能打包成 pip 包，HOVER 即如此）。HOVER（\cref{sec:rlmc-diy-hover}）是 Isaac Lab extension 的标杆范例，其仓库结构清晰展示了“如何为一个研究项目组织 Isaac Lab 代码”。
+
+\subsection{配置详解：HOVER 仓库结构精读}
+\label{sec:rlmc-diy-isaac-hover-layout}
+
+\verb|NVlabs/HOVER| 的顶层结构（按功能分层，是值得照抄的范式）：
+
+\begin{codebox}[text]{HOVER 仓库目录范式}
+NVlabs/HOVER/
+  neural_wbc/                 # 核心 Python 包
+    core/                     # 环境 + Oracle 策略逻辑
+      envs/   tasks/  oracles/
+    isaac_lab_wrapper/        # Isaac Lab 特定 wrapper
+    mujoco_wrapper/           # MuJoCo sim2sim wrapper
+    hw_wrappers/              # 真机部署 wrapper
+    inference_env/            # 推理环境（ONNX 加载）
+    data/   motions/  policy/ # 动作片段 + 预训练 checkpoint
+  scripts/rsl_rl/             # train_teacher / train_student / play / eval
+  third_party/                # pin 住的子模块（含定制 rsl_rl）
+  setup.py   pyproject.toml   # pip install -e .
+\end{codebox}
+
+\textbf{核心设计决策}（这张表本身就是一份 extension 设计 checklist）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{4.6cm}p{5.4cm}@{}}
+\toprule
+决策 & HOVER 的选择 & 理由 \\
+\midrule
+代码组织 & 按功能分（core/wrapper/inference） & 同一 task 的训练/评估/部署代码分离 \\
+环境基类 & Manager-Based & 多观测组（oracle/student）、多 action term \\
+RL 后端 & RSL-RL（定制 fork） & PPO 足够且与部署链兼容 \\
+配置方式 & Hydra 风格 YAML & 灵活覆盖超参而不改源码 \\
+部署 & ONNX + MuJoCo sim2sim + hw\_wrapper & 完整三阶段部署链 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{代码走读：从零创建 Isaac Lab Extension}
+\label{sec:rlmc-diy-isaac-create}
+
+Isaac Lab 自带 template generator 可生成 extension 骨架；为理解每个文件的作用，这里手动创建。
+
+\paragraph{Step 1：目录结构。}
+
+\begin{codebox}[bash]{创建 extension 包结构}
+mkdir -p my_robot_lab/my_robot_lab/{envs,tasks/locomotion} my_robot_lab/scripts/rsl_rl
+cd my_robot_lab
+touch my_robot_lab/__init__.py my_robot_lab/envs/__init__.py \
+      my_robot_lab/tasks/__init__.py my_robot_lab/tasks/locomotion/__init__.py
+\end{codebox}
+
+\paragraph{Step 2：定义 Scene（USD 资产 + PhysX 属性）。}
+
+\begin{codebox}[Python]{\texttt{tasks/locomotion/scene\_cfg.py}}
+import isaaclab.sim as sim_utils
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.scene import InteractiveSceneCfg
+
+MY_ROBOT_CFG = ArticulationCfg(
+    spawn=sim_utils.UsdFileCfg(
+        usd_path="my_robot_lab/assets/my_quad.usd",
+        activate_contact_sensors=True,                # Isaac Lab 必须显式开
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False, retain_accelerations=False),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=False,
+            solver_position_iteration_count=4,        # PhysX 求解器迭代
+            solver_velocity_iteration_count=4),
+    ),
+    init_state=ArticulationCfg.InitialStateCfg(
+        pos=(0.0, 0.0, 0.45),
+        joint_pos={".*_hip_joint": 0.0, ".*_thigh_joint": 0.7, ".*_calf_joint": -1.4}),
+    actuators={"legs": ImplicitActuatorCfg(
+        joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
+        stiffness=25.0, damping=0.5)},
+)
+
+class MyQuadSceneCfg(InteractiveSceneCfg):
+    ground = AssetBaseCfg(prim_path="/World/ground", spawn=sim_utils.GroundPlaneCfg())
+    robot  = MY_ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")  # 注意占位符！
+\end{codebox}
+
+\paragraph{Step 3：定义 MDP 组件。}Isaac Lab 与 mjlab 的 MDP 配置\emph{高度对称}（共享 Observation/Reward/Termination term 概念），但有两处易踩的命名/形态差异：（1）Isaac Lab 习惯把 \verb|ObservationTermCfg/RewardTermCfg/TerminationTermCfg| 重命名成短别名 \verb|ObsTerm/RewTerm/DoneTerm|，mjlab \textbf{无这些短别名、只用全名}；（2）\textbf{观测的组织形态与组名不同}——Isaac Lab 用「\verb|class ObservationsCfg| 内嵌 \verb|class PolicyCfg(ObservationGroupCfg)|」的类树、actor 侧组名是 \verb|"policy"|（下面这段就是 Isaac 真实写法）；而 mjlab 用 \verb|dict[str,ObservationGroupCfg]|、内置任务的 actor 组名是 \verb|"actor"|（见 \cref{sec:rlmc-diy-mjlab-sixstep} Step 4）。迁移时这第二点最坑：把 Isaac 的 \verb|obs["policy"]| 照搬到 mjlab 会当场 \verb|KeyError|。
+
+\begin{codebox}[Python]{\texttt{tasks/locomotion/env\_cfg.py}（要点）}
+from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.managers import (ObservationGroupCfg, ObservationTermCfg,
+                               RewardTermCfg, TerminationTermCfg)
+import isaaclab.envs.mdp as mdp
+
+class ObservationsCfg:
+    class PolicyCfg(ObservationGroupCfg):
+        base_lin_vel      = ObservationTermCfg(func=mdp.base_lin_vel)
+        base_ang_vel      = ObservationTermCfg(func=mdp.base_ang_vel)
+        projected_gravity = ObservationTermCfg(func=mdp.projected_gravity)
+        velocity_commands = ObservationTermCfg(func=mdp.generated_commands,
+                                params={"command_name": "base_velocity"})
+        joint_pos = ObservationTermCfg(func=mdp.joint_pos_rel)
+        joint_vel = ObservationTermCfg(func=mdp.joint_vel_rel)
+        actions   = ObservationTermCfg(func=mdp.last_action)
+    class CriticCfg(ObservationGroupCfg):
+        enable_corruption = False
+        # ... 同 Policy + privileged ...
+
+class RewardsCfg:
+    track_lin_vel_xy = RewardTermCfg(func=mdp.track_lin_vel_xy_exp, weight=1.5,
+                        params={"command_name": "base_velocity", "std": 0.25})
+    track_ang_vel_z  = RewardTermCfg(func=mdp.track_ang_vel_z_exp, weight=0.75,
+                        params={"command_name": "base_velocity", "std": 0.25})
+    lin_vel_z_l2     = RewardTermCfg(func=mdp.lin_vel_z_l2,   weight=-2.0)
+    action_rate_l2   = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01)
+
+class TerminationsCfg:
+    time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
+
+class MyQuadEnvCfg(ManagerBasedRLEnvCfg):
+    scene = MyQuadSceneCfg(num_envs=4096, env_spacing=3.0)
+    observations = ObservationsCfg(); actions = ActionsCfg()
+    rewards = RewardsCfg(); terminations = TerminationsCfg()
+\end{codebox}
+
+\paragraph{Step 4：注册（gymnasium 标准）。}
+
+\begin{codebox}[Python]{\texttt{tasks/locomotion/\_\_init\_\_.py}}
+import gymnasium as gym
+gym.register(
+    id="MyQuad-Velocity-Flat-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={"env_cfg_entry_point": "my_robot_lab.tasks.locomotion.env_cfg:MyQuadEnvCfg",
+            "rsl_rl_cfg_entry_point": "my_robot_lab.tasks.locomotion.agents:rsl_rl_ppo_cfg"},
+    disable_env_checker=True,
+)
+\end{codebox}
+
+\paragraph{Step 5：安装与训练。}官方 RL 入口是 \verb|scripts/reinforcement_learning/<rl_lib>/train.py|（不是 \verb|isaaclab.app|）：
+
+\begin{codebox}[bash]{Isaac Lab：安装与训练}
+pip install -e .                              # 开发模式安装 extension
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+    --task MyQuad-Velocity-Flat-v0 --headless --num_envs 4096
+# extension 自带 wrapper 时，也可用项目自己的 scripts/rsl_rl/train.py
+\end{codebox}
+
+\subsection{多视角对比：三框架的机器人配置}
+\label{sec:rlmc-diy-isaac-compare}
+
+同一台机器人，三个框架的配置项一一对照（这张表是三框架迁移的核心速查）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{3.0cm}p{4.0cm}p{3.6cm}@{}}
+\toprule
+配置项 & mjlab \texttt{EntityCfg} & Isaac Lab \texttt{ArticulationCfg} & UniLab \texttt{SceneCfg} \\
+\midrule
+模型格式 & MJCF（XML） & USD（亦支持运行时 URDF/MJCF） & MJCF 或 Motrix XML（不用 USD） \\
+路径字段 & \verb|spec_fn|（返回 \verb|MjSpec| 的可调用对象） & \verb|usd_path| & \verb|model_file| \\
+碰撞传感器 & 自动（MuJoCo 原生） & 显式 \verb|activate_contact_sensors=True| & MJCF 内 sensor（足端接触/位置 sensor） \\
+刚体属性 & MJCF 内定义 & \verb|RigidBodyPropertiesCfg| & MJCF/Motrix XML 内定义 \\
+求解器参数 & MJCF 全局 & \verb|ArticulationRootPropertiesCfg| 每 articulation 独立 & MJCF 全局；motrix 有 \verb|motrix_max_iterations| \\
+Actuator & \verb|BuiltinPositionActuatorCfg| 等（\verb|target_names_expr|） & \verb|ImplicitActuatorCfg|（\verb|joint_names_expr|） & 无类；后端位置执行器 $+$ \verb|PdControlConfig|（kp/kd） \\
+场景路径 & 不用 prim 路径（\verb|SceneCfg.entities| 字典 $+$ \verb|entity_name|） & \verb|{ENV_REGEX_NS}/...| & 不用 prim 路径（每 env 独立物理状态） \\
+默认姿态 & \verb|init_state.joint_pos| & \verb|init_state.joint_pos| & MJCF keyframe \verb|home| 的 qpos 尾段 \\
+注册 & \verb|register_mjlab_task| & \verb|gymnasium.register| & \verb|@registry.envcfg|+\verb|@registry.env| \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+UniLab 列的关键差异：它\textbf{不用 USD、不用 prim 路径}——每个并行 env 在 CPU 上各持一份独立物理状态（\verb|NpEnv| 批量步进），所以没有 Isaac Lab 那种 \verb|{ENV_REGEX_NS}| 占位符语义；执行器也\emph{不在 Python 配类树}，而是把 \verb|kp/kd| 经 \verb|create_backend(..., position_actuator_gains={"kp":..,"kd":..})| 传给后端的位置执行器（Ideal PD 层级），力矩/速度饱和由 MJCF/Motrix 模型本身的 actuator 定义（\verb|ctrlrange|/\verb|forcerange|/\verb|gear|）承担。
+
+\subsection{Manager-Based vs Direct Workflow 选择}
+\label{sec:rlmc-diy-isaac-workflow}
+
+Isaac Lab 提供两种开发 workflow，选择取决于任务特征：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{4.4cm}p{4.8cm}@{}}
+\toprule
+维度 & Manager-Based & Direct \\
+\midrule
+代码组织 & 分散在多个 Cfg dataclass & 集中在一个类 \\
+模块复用 & 高（term 跨任务共享） & 低（逻辑内嵌 env 类） \\
+灵活性 & 中（受 Manager API 约束） & 高（完全控制 step） \\
+学习成本 & 高（须懂九大 Manager） & 低（一个类搞定） \\
+协作 & 好（各自开发不同 term） & 差（改同一文件） \\
+JIT 优化 & 受限（Manager 调度有 Python 开销） & 可对整 step JIT trace \\
+适用任务 & 标准 RL（locomotion/manipulation） & 复杂 step 逻辑（multi-agent/分层） \\
+代表项目 & HOVER、几乎所有内置任务 & Legged Lab（Direct for legged） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[Manager-Based vs Direct $\equiv$ React 组件化 vs 原生 JS]\label{ins:rlmc-diy-react}
+这对取舍同构于前端：React 的组件系统让代码更模块化、更易维护，但有运行时开销（virtual DOM diff）；原生 JavaScript 更灵活但维护成本高。多数 Web 应用选 React，只有极端性能需求才回退原生 JS。同理，多数 RL 任务选 Manager-Based，只有需要\emph{极端 step 性能}或\emph{非标 MDP 结构}（multi-agent 轮替、分层策略切换、自定义物理回调）时才用 Direct。\textbf{决策一句话}：先问“是否需要非标 step 逻辑”——是则 Direct；否则问“团队是否 $>2$ 人协作”——是则 Manager-Based（强烈推荐），否则仍推荐 Manager-Based（除非要 JIT 全图优化）。本书绝大多数任务（速度跟踪、操作、移动操作）都该选 Manager-Based。
+\end{insight}
+
+\subsection{\texorpdfstring{配置详解：URDF/MJCF $\to$ USD 转换验证}{配置详解：URDF/MJCF 到 USD 转换验证}}
+\label{sec:rlmc-diy-isaac-convert}
+
+\cref{sec:rlmc-diy-setup} 给了离线转换命令（位置参数 \verb|<input> <output>|）。转换是\emph{有损}的，转完必须逐项验证：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{4.4cm}p{4.8cm}@{}}
+\toprule
+检查项 & 验证方法 & 常见问题 \\
+\midrule
+关节数量 & 比较 MJCF 与 USD 的 joint count & URDF 的 fixed joint 可能被省略或保留 \\
+质量/惯量 & 比较 total mass & 转换工具可能填默认惯量 \\
+碰撞体 & 在 viewer 可视化碰撞体 & mesh 碰撞体可能被简化为凸包 \\
+Actuator & 打印 actuator 列表 & MJCF 的 velocity actuator 需手动映射 \\
+Frame 约定 & 比较初始 base 位姿 & MuJoCo/PhysX 均 z-up，但某些 URDF 是 y-up \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{反事实推理：跳过转换验证会怎样。}最隐蔽的一例是 mesh 碰撞体被简化为凸包——原本机器人底盘内部的\emph{凹腔}变成凸面，导致本不该碰撞的 body 产生接触。训练中的表现是：某些关节角度被“看不见的墙”挡住（凸包碰撞），策略学到的运动范围比预期小。这类 bug 几乎\emph{无法}从 reward 曲线发现——你只看到“步幅不够大”，真因却是碰撞体形状错了。所以 viewer 里开碰撞体可视化、与原模型逐一对照，是转换后不可省的一步。
+
+\subsection{常见陷阱}
+\label{sec:rlmc-diy-isaac-pitfalls}
+
+\begin{pitfall}[\texttt{\{ENV\_REGEX\_NS\}} 占位符遗漏]
+\textbf{错误描述}：SceneCfg 里 robot 的 \verb|prim_path| 写成固定路径（如 \verb|/World/Robot|）而非含 \verb|{ENV_REGEX_NS}|。\textbf{现象后果}：所有 env 共享同一个机器人，物理彻底混乱。\textbf{根本原因}：\verb|{ENV_REGEX_NS}| 在运行时被替换为每个 env 的唯一路径，漏了它就没有“每 env 一份”。\textbf{正确做法}：robot 的 \verb|prim_path| 必须含 \verb|{ENV_REGEX_NS}|；地面等共享资产才用固定路径。
+\end{pitfall}
+
+\begin{pitfall}[Isaac Lab 版本不兼容导致 rsl\_rl 报错]
+\textbf{错误描述}：用比 extension 要求更新/更旧的 Isaac Lab 跑 HOVER 这类项目。\textbf{现象后果}：遇到 \verb|rsl_rl| 与 \verb|rsl_rl_lib| 的重命名问题、API 不兼容报错。\textbf{根本原因}：extension 锁定了特定 Isaac Lab / RSL-RL 版本。\textbf{正确做法}：按 extension README 锁版本，用 conda 环境隔离；HOVER 这类项目用其 \verb|third_party/| 里 pin 的定制 rsl\_rl，别用 \verb|pip install rsl-rl| 的 upstream。
+\end{pitfall}
+
+\begin{pitfall}[以为 Manager-Based 与 Direct 可以混用]
+\textbf{错误描述}：想在 Manager-Based 环境里插一段 Direct 风格的自定义 step。\textbf{现象后果}：结构冲突、难以维护。\textbf{根本原因}：一个环境只能选一种 workflow。\textbf{正确做法}：若只需自定义 step 的一小部分，优先用自定义 Manager term（如自定义 reward/observation term）实现，而非切 workflow。
+\end{pitfall}
+
+\begin{practice}[Isaac Lab extension]
+\begin{enumerate}
+\item \textbf{[实践]} Fork \verb|NVlabs/HOVER|，阅读 \verb|neural_wbc/core/envs/| 下的环境定义，画出 Oracle teacher 与 Student 的观测维度差异表。\emph{验收}：一张“维度来源—actor/critic”对照表。
+\item \textbf{[对比]} 分别用 Manager-Based 和 Direct 实现一个 CartPole 平衡任务，对比两者的代码行数、可读性与 steps/s。\emph{验收}：三列对比数据。
+\item \textbf{[设计]} 你要实现“双机器人协作搬运”（两台四足各抬箱子一端）。该用 Manager-Based 还是 Direct？为什么？\emph{验收}：结论 + 依 \cref{ins:rlmc-diy-react} 的两问回答。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{端到端九步流水线：从 CAD 到策略}
+\label{sec:rlmc-diy-pipeline}
+
+\textbf{本节解决什么问题}：把散落在 \cref{ch:rlmc-assets}（建模）、\cref{ch:rlmc-actuator}（执行器）、\cref{sec:rlmc-diy-mjlab}/\cref{sec:rlmc-diy-isaac}（环境创建）的步骤串成一条流水线，给出每步的输入/输出与验证标准。实际项目中这些步骤前一步的输出是后一步的输入，任何一步出错都会在下游放大。
+
+\begin{codebox}[text]{九步流水线总览}
+1 选构型 -> 2 SolidWorks 建模 -> 3 sw2urdf 导出 -> 4 MJCF/USD 调优
+        -> 5 双框架接入 -> 6 环境设计 -> 7 训练启动 -> 8 sim2sim 验证 -> 9 ONNX 导出
+\end{codebox}
+
+\subsection{Step 1：选构型}
+\label{sec:rlmc-diy-pipe-morph}
+
+构型（morphology）决定后续全部复杂度。决策表（难度用文字描述，不入正文符号）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+构型 & DOF & 接触模式 & 训练/建模难度 & 本书参考 \\
+\midrule
+倒立摆 & 1--2 & 简单 & 低/低 & 入门练习 \\
+固定基座臂 & 6--7 & 中等 & 低/中 & \cref{ch:rlmc-manip} \\
+四足 & 12 & 复杂（步态） & 中/中 & \cref{ch:rlmc-quadloco} \\
+轮式+臂 & 8--10 & 混合 & 中/较高 & \cref{ch:rlmc-manip} \\
+人形 & 19--29 & 很复杂 & 高/较高 & \cref{ch:rlmc-humanoidloco} \\
+人形+灵巧手 & 50+ & 极复杂 & 很高/高 & \cref{ch:rlmc-manip} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{经验法则}：第一个自定义环境应选 DOF $\le 12$ 的构型。DOF 越高，debug 搜索空间越大——12 DoF 四足已有 $2^{12}=4096$ 种“某关节配置错误”的组合。
+
+\subsection{\texorpdfstring{Step 2--3：SolidWorks $\to$ sw2urdf $\to$ URDF}{Step 2-3：SolidWorks 到 sw2urdf 到 URDF}}
+\label{sec:rlmc-diy-pipe-urdf}
+
+这两步在 \cref{ch:rlmc-assets} 已详讲，这里只给从建模到本章的\emph{衔接 checklist}：
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{6.0cm}p{5.0cm}l@{}}
+\toprule
+检查项 & 标准 & 来源 \\
+\midrule
+所有 revolute joint 旋转轴方向正确 & 在 RViz 拖动 slider 看旋转方向 & \cref{ch:rlmc-assets} \\
+质量与惯量合理 & 总质量与真机称重误差 $<10\%$ & \cref{ch:rlmc-assets} \\
+碰撞体覆盖所有接触表面 & viewer 开碰撞体可视化 & \cref{ch:rlmc-assets} \\
+初始姿态无自碰撞 & \verb|mj_forward| 后 \verb|ncon|=0（不含地面） & \cref{ch:rlmc-actuator} \\
+Actuator 力矩/速度上限匹配 datasheet & 比 MJCF \verb|ctrlrange| 与电机 spec & \cref{ch:rlmc-actuator} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Step 4：MJCF/USD 调优}
+\label{sec:rlmc-diy-pipe-tune}
+
+从 URDF 转来的模型通常要手调三类参数。\textbf{（1）接触参数}（MuJoCo 软接触细节见 \cref{ch:rlmc-physics}）：
+
+\begin{codebox}[text]{MJCF 接触参数（default 块）}
+<default>
+  <geom condim="4"
+        friction="0.8 0.005 0.0001"
+        solref="0.005 1.0"
+        solimp="0.9 0.95 0.001"/>
+</default>
+\end{codebox}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{4.8cm}p{4.6cm}@{}}
+\toprule
+参数 & 含义 & 调优方向 \\
+\midrule
+\verb|condim| & 接触约束维度（1 法向 / 3 +2D 切向 / 4 +扭转） & 足式用 4（防旋转滑动） \\
+\verb|friction| & 切向、扭转、滚动摩擦 & 第一项 $0.5\sim 1.2$（室内地面） \\
+\verb|solref| & 正数格式为 (时间常数, 阻尼比)——第一项是\emph{时间常数}非频率 & 时间常数 $\approx 2\,dt$，阻尼比 $\approx 1.0$ \\
+\verb|solimp| & 5 参阻抗函数，控约束力随 violation 的软硬 & $d_0{=}0.9,\,d_{\text{width}}{=}0.95$（偏硬，几乎不许穿透） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{（2）仿真步长}：让机器人从 0.5 m 自由落体，看落地弹跳次数与稳定时间——弹跳 $>3$ 次或不稳定 $>1$ 秒则减小 \verb|dt|。经验起点 \verb|dt=0.002|（500 Hz 物理）配 \verb|decimation=10|（50 Hz 策略）。\textbf{（3）Actuator 模型选择}（详见 \cref{ch:rlmc-actuator}）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{2.4cm}p{3.0cm}p{4.2cm}@{}}
+\toprule
+类型 & 控制模式 & mjlab API & Isaac Lab API \\
+\midrule
+Position PD & 位置目标 & \verb|BuiltinPositionActuatorCfg| & \verb|ImplicitActuatorCfg| \\
+Ideal/DC PD & 力矩输出 & \verb|IdealPdActuatorCfg| / \verb|DcMotorActuatorCfg| & \verb|IdealPDActuatorCfg|（\verb|DCMotorCfg| 继承自它，多 \verb|saturation_effort|） \\
+Velocity & 速度目标 & \verb|BuiltinVelocityActuatorCfg| & \verb|ImplicitActuatorCfg(stiffness=0)| \\
+Actuator Net & 学习模型 & \verb|LearnedMlpActuatorCfg| & \verb|ActuatorNetLSTMCfg| \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Step 5：双框架接入与一致性验证}
+\label{sec:rlmc-diy-pipe-dual}
+
+接入即 \cref{sec:rlmc-diy-mjlab}（mjlab）与 \cref{sec:rlmc-diy-isaac}（Isaac Lab）的流程，两框架可并行。关键是一段\textbf{一致性验证脚本}，确保两边配置等价：
+
+\begin{codebox}[Python]{双框架配置一致性验证}
+def verify_dual_framework(mjlab_env, isaaclab_env):
+    assert mjlab_env.robot.data.joint_pos.shape[-1] == \
+           isaaclab_env.robot.data.joint_pos.shape[-1], "joint count mismatch"
+    assert mjlab_env.action_space.shape[-1] == \
+           isaaclab_env.action_space.shape[-1], "action dim mismatch"
+    # 注意两框架 actor 组名不同：mjlab 内置任务叫 "actor"，Isaac Lab 叫 "policy"
+    assert mjlab_env.observation_space["actor"].shape[-1] == \
+           isaaclab_env.observation_space["policy"].shape[-1], "obs dim mismatch"
+    mjlab_env.reset(); isaaclab_env.reset()
+    a = mjlab_env.action_space.shape[-1]
+    for _ in range(100):
+        mjlab_env.step(torch.zeros(1, a)); isaaclab_env.step(torch.zeros(1, a))
+    h_mj = mjlab_env.robot.data.root_link_pos_w[0, 2].item()
+    h_il = isaaclab_env.robot.data.root_link_pos_w[0, 2].item()
+    print(f"base height after 100 zero-steps: mjlab={h_mj:.3f} IsaacLab={h_il:.3f}")
+    assert abs(h_mj - h_il) < 0.05, "height mismatch > 5cm!"
+\end{codebox}
+
+若两框架 base height 差 $>5$ cm，最常见的原因是：接触摩擦参数不同（MuJoCo 与 PhysX 摩擦模型不完全等价）、初始关节角 offset 计算方式不同、求解器精度不同（MuJoCo 凸优化求解 vs PhysX TGS）。这正是 \cref{ch:rlmc-physics} 反复强调的跨引擎差异在 DIY 中的体现。
+
+\subsection{Step 6：环境设计的两棵决策树}
+\label{sec:rlmc-diy-pipe-design}
+
+环境设计的核心是 MDP 四元组 $(S,A,R,T)$ 的工程化。代码模板已在 \cref{sec:rlmc-diy-mjlab} 给出，这里补两棵\emph{设计决策树}（落到文字流程）：
+
+\textbf{观测设计}：先问“这个信息真机可获取吗”——可获取则放 actor 组（mjlab 键名 \texttt{actor}、Isaac 类名 \texttt{PolicyCfg}），并按噪声水平决定是否滤波/走 teacher-student（低噪声如编码器/IMU 直接用，高噪声如视觉/触觉考虑滤波）；不可获取则只放 critic 组（privileged），如真实摩擦系数、真实物体质量、完美 base 速度。这与 \cref{ch:rlmc-privileged} 的特权学习一脉相承。
+
+\textbf{奖励设计}：先问“任务目标能否用距离度量”——能则用 $\exp(-d^2/\sigma^2)$ 形式，$\sigma$ 按目标距离量级取（精细操作 $<0.1$ m 取 $\sigma\approx 0.05\sim 0.1$；接近 $0.1\sim 1$ m 取 $\sigma\approx 0.1\sim 0.5$；导航 $>1$ m 取 $\sigma\approx 0.5\sim 2.0$）；不能则用 boolean/stage 奖励（抓取成功、站立、连续步数计数）。
+
+\subsection{Step 7--9：训练启动、sim2sim、ONNX 导出}
+\label{sec:rlmc-diy-pipe-train}
+
+\paragraph{Step 7：训练启动后的前 5 分钟检查表}（PPO 配置与数据流见 \cref{ch:rlmc-training}）。这张表是“训练刚起步就能发现方向性错误”的快速体检：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{3.0cm}p{3.4cm}p{3.6cm}@{}}
+\toprule
+时间点 & 检查 & 正常 & 异常处理 \\
+\midrule
+第 1 iter & reward 数值 & $-5\sim -20$（负，正则惩罚） & NaN $\to$ 查 obs/reward 除零 \\
+前 10 iter & entropy & 约 $3\sim 5$（依动作维度） & $<1$ $\to$ init\_noise\_std 太小 \\
+前 50 iter & reward 趋势 & 缓慢上升 & 完全平坦 $\to$ reward 没和动作关联 \\
+前 100 iter & episode length & 渐增 & 始终很短 $\to$ termination 太严 \\
+前 500 iter & KL 散度 & 在 target 附近 & 持续偏高 $\to$ LR 太大 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Step 8：Sim2Sim 交叉验证。}一框架训完，在另一框架加载策略评估——这是 sim2real 的前置。\textbf{成功标准}：两框架的 tracking error 差异 $<15\%$。差异更大则优先查接触摩擦与 actuator 参数的跨框架差异。
+
+\begin{codebox}[Python]{sim2sim 评估（要点）}
+def sim2sim_eval(policy_path, eval_env="MyQuad-Velocity-Flat", num_episodes=100):
+    env = make(eval_env, num_envs=64)
+    policy = torch.jit.load(policy_path)           # 跨框架加载 TorchScript 策略
+    success = 0
+    obs, _ = env.reset()
+    ACTOR = next(iter(obs.keys()))                 # actor 组名：mjlab="actor"，Isaac="policy"，别写死
+    for _ in range(num_episodes):
+        obs, _ = env.reset(); ep_r = 0.0
+        for _ in range(1000):
+            obs, reward, done, trunc, info = env.step(policy(obs[ACTOR]))
+            ep_r += reward.mean().item()
+            if done.all(): break
+        success += int(ep_r > THRESHOLD)
+    print(f"sim2sim success rate: {success/num_episodes:.1%}")
+\end{codebox}
+
+\begin{insight}[UniLab 把 sim2sim 从「事后人工对比」升级成「编译期契约关卡」]\label{ins:rlmc-diy-sim2sim-contract}
+上面的 mjlab/Isaac Lab sim2sim 是\emph{事后}手写脚本对比两框架行为。UniLab 因为天生支持 \textbf{两个物理后端}（MuJoCoUni $\leftrightarrow$ MotrixSim），把跨后端一致性做成了\textbf{一等公民的契约关卡}（\verb|training/sim2sim.py| 的 \verb|resolve_sim2sim_config|）：一份后端训出的策略要拿到另一后端回放/评估前，框架先读源 run 的 \verb|run_config.json| 里 \verb|contract_snapshot|，与目标配置\emph{逐字段比对}——落在 \verb|DENYLIST|/\verb|ENV_STRUCTURAL_DENYLIST| 里的字段不一致（或一侧有一侧无）就是「denial」，\verb|training.sim2sim_strict=true|（默认）直接抛 \verb|CrossBackendIncompatibleError|，把「DR 能力/接触模型不同导致策略漂移」\textbf{前置成编译期错误}而非训练几小时后才发现的行为退化。这对 DIY 的启示超出 UniLab 本身：\textbf{凡是「同一策略要在两个仿真器/仿真器与真机之间迁移」的场景，都值得把「决定策略行为的字段」显式快照下来、迁移前自动比对}——这正是 \cref{sec:rlmc-diy-pipe-dual} 那段一致性脚本的「制度化」版本。motrix 在 tracking 任务上也正是「仅用于 sim2sim 评估/回放」而注册。
+\end{insight}
+
+\paragraph{Step 9：ONNX 导出。}部署到真机的必要步骤（ONNX 边界细节见 \cref{sec:rlmc-train-onnx}）。两条\emph{致命}注意：
+
+\begin{itemize}
+\item \textbf{观测归一化必须 baked-in}：若训练用了 \verb|EmpiricalNormalization|（running mean/std），导出时须把 mean/std 固化进 ONNX 图，否则部署时观测不归一化，策略行为完全错误——这是部署阶段最高发的“静默错误”。
+\item \textbf{RNN 隐状态}：若用 LSTM 策略，hidden state 的初始化与传递必须在 ONNX 图中显式处理。
+\end{itemize}
+
+\begin{codebox}[Python]{ONNX 导出 + 数值核对}
+def export_onnx(policy, obs_dim, path="policy.onnx"):
+    dummy = torch.randn(1, obs_dim)
+    torch.onnx.export(policy.actor, dummy, path,
+        input_names=["obs"], output_names=["action"], opset_version=11,
+        dynamic_axes={"obs": {0: "batch"}, "action": {0: "batch"}})
+    import onnxruntime as ort, numpy as np
+    out_onnx = ort.InferenceSession(path).run(None, {"obs": dummy.numpy()})[0]
+    out_torch = policy.actor(dummy).detach().numpy()
+    assert np.abs(out_onnx - out_torch).max() < 1e-5, "ONNX export mismatch!"
+\end{codebox}
+
+\subsection{常见陷阱}
+\label{sec:rlmc-diy-pipe-pitfalls}
+
+\begin{pitfall}[跳过 Step 4 直接训练]
+\textbf{错误描述}：URDF 一转完就接入框架开训。\textbf{现象后果}：接触参数不对导致脚底打滑、actuator 力矩限制不对导致关节锁死，全表现为“训练不收敛”。\textbf{根本原因}：转换默认参数不适配你的机器人。\textbf{正确做法}：在 viewer 里花 30 分钟手动验证模型——拖关节、看碰撞、确认 actuator 范围——再接框架。
+\end{pitfall}
+
+\begin{pitfall}[Step 7 之前花大量时间纸上调 reward 权重]
+\textbf{错误描述}：先在纸上设计“完美”权重再开训。\textbf{现象后果}：权重假设基于对行为的\emph{猜测}，真实行为常与猜测大相径庭，白调。\textbf{根本原因}：reward 与行为的关系高度非线性、依赖具体动力学。\textbf{正确做法}：用粗略权重先跑 500 iter 看行为再调——“先跑后调”远比“先想后跑”高效。
+\end{pitfall}
+
+\begin{pitfall}[ONNX 导出忘记 bake 观测归一化]
+\textbf{错误描述}：导出时只导 actor，未把 normalizer 固化进图。\textbf{现象后果}：部署时观测未归一化，策略输出近乎随机动作。\textbf{根本原因}：归一化在训练 wrapper 里，不在 actor 里。\textbf{正确做法}：导出时显式检查 \verb|policy.normalizer| 是否进了 ONNX 图，并用上面的数值核对断言把关。
+\end{pitfall}
+
+\begin{practice}[端到端流水线]
+\begin{enumerate}
+\item \textbf{[流程]} 画出从 SolidWorks CAD 到真机部署的完整流水线图，标注每步输入/输出格式与所用工具。\emph{验收}：含九步 + sim2real 的有向图。
+\item \textbf{[验证]} 设计一个“双框架一致性测试套件”，$\ge 5$ 个用例（zero action base height、random action reward 分布、episode length 分布等），写成 pytest。\emph{验收}：5 个 test 函数骨架 + 各自断言。
+\item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-dr} 的 DR 与 \cref{ch:rlmc-visuomotor} 的 sim2real 视角，为 Step 8 设计更严格的 sim2sim 协议：除 tracking error，还应检查哪些指标？\emph{验收}：$\ge 3$ 个补充指标 + 为什么。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{EventsCfg 与 CommandsCfg 设计}
+\label{sec:rlmc-diy-events}
+
+\textbf{本节解决什么问题}：补齐两个在 DIY 里最易被忽视、却对 sim2real 影响最大的 Manager——EventManager（DR）与 CommandManager（指令采样）的设计要点。基础在 \cref{ch:rlmc-dr} 已讲，这里只给“自定义任务里怎么配”。
+
+\subsection{概念主线：EventManager 的触发模式}
+\label{sec:rlmc-diy-events-mode}
+
+回顾 \cref{ch:rlmc-dr}：EventManager 开箱即用的常见触发模式是 \verb|startup|、\verb|reset|、\verb|interval|（源码里还有 \verb|prestartup|）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{3.6cm}p{4.4cm}l@{}}
+\toprule
+模式 & 触发时机 & 典型用途 & 性能影响 \\
+\midrule
+\verb|startup| & 环境创建时，只一次 & 物理参数随机化（质量/摩擦/惯量） & 无 \\
+\verb|reset| & 每次 episode reset & 初始状态随机化（位姿/关节角/速度） & 低 \\
+\verb|interval| & 每隔 N 步 & 外部扰动（push force/风力） & 中 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[误以为有自动的 step 模式去做逐步扰动]
+\textbf{错误描述}：想配一个 \verb|mode="step"| 的 event 让它“每个仿真步”自动做 action delay / 逐步 obs noise。\textbf{现象后果}：配了却不生效，或自造一个不存在的 API。\textbf{根本原因}：EventManager \emph{不会}每步自动触发某 mode；自定义 mode 必须由环境显式调用 \verb|event_manager.apply(mode=...)| 才执行，配 \verb|mode="step"| 本身不会让它每步跑。\textbf{正确做法}：逐步扰动应放在 action/observation term、或 actuator 层延迟建模里——Isaac Lab 用 \verb|DelayedPDActuatorCfg(min_delay=..., max_delay=...)|，\textbf{mjlab 则\emph{原生}在执行器配类上支持 action delay}（实测 \verb|BuiltinPositionActuatorCfg| 自带 \verb|delay_min_lag|/\verb|delay_max_lag|/\verb|delay_hold_prob|/\verb|delay_per_env_phase| 四个字段——每 env 独立采样滞后步数、按概率保持，比自写缓冲区更稳更省，详见 \cref{ch:rlmc-actuator}），或退而求其次在自定义 ActionTerm 内维护延迟缓冲区。（经核 Isaac Lab \texttt{event\_manager.py}：\verb|EventTermCfg.mode| 只接受 \verb|startup|/\verb|reset|/\verb|interval|，并无 \verb|step| 模式；\texttt{randomize\_action\_delay + mode="step"} 不是框架内置 API。）
+\end{pitfall}
+
+\subsection{配置详解：DIY 任务的 EventsCfg 模板}
+\label{sec:rlmc-diy-events-template}
+
+\begin{codebox}[Python]{DIY 标准 DR 配置（节选，Isaac Lab 函数名；mjlab 见下注）}
+# 下面 func= 用 Isaac Lab 的 DR 函数名；mjlab DR 在 mdp.dr 子包、名更短：
+#   摩擦 mdp.dr.geom_friction、质量 mdp.dr.body_mass（参数用 operation∈{abs,add,scale}+ranges），
+#   reset_root_state_uniform/reset_joints_by_offset/push_by_setting_velocity 两框架同名
+class EventsCfg:
+    # --- startup：物理参数（episode 间不变） ---
+    randomize_friction = EventTermCfg(func=mdp.randomize_rigid_body_material,
+        mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+        "static_friction_range": (0.7, 1.3), "dynamic_friction_range": (0.7, 1.3)})
+    randomize_mass = EventTermCfg(func=mdp.randomize_rigid_body_mass,
+        mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names="base"),
+        "mass_distribution_params": (-1.0, 3.0), "operation": "add"})  # 加 -1~3 kg 载荷
+    # --- reset：初始状态（每 episode 不同） ---
+    reset_base_pose = EventTermCfg(func=mdp.reset_root_state_uniform, mode="reset",
+        params={"pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
+                "velocity_range": {"x": (-0.5, 0.5), "y": (-0.25, 0.25), "z": (-0.3, 0.3),
+                    "roll": (-0.25, 0.25), "pitch": (-0.25, 0.25), "yaw": (-0.25, 0.25)}})
+    reset_joints = EventTermCfg(func=mdp.reset_joints_by_offset, mode="reset",
+        params={"position_range": (-0.25, 0.25), "velocity_range": (-0.5, 0.5)})
+    # --- interval：外部扰动 ---
+    push_robot = EventTermCfg(func=mdp.push_by_setting_velocity, mode="interval",
+        interval_range_s=(10.0, 15.0),
+        params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}})
+\end{codebox}
+
+UniLab 把这同一组 DR 表达成\textbf{任务 \texttt{domain\_rand} 的 Hydra 字典}（不是 \verb|EventTermCfg| 类列表），由 \verb|DomainRandomizationManager| 在 reset/interval 时分发给后端；触发模式对应 init（$\approx$startup）/reset/interval 三档，思想与 mjlab/Isaac Lab 的 \verb|mode| 一致：
+
+\begin{codebox}[Python]{UniLab 等价 DR（owner YAML 的 domain\_rand 字典）}
+# conf/ppo/task/my_quad_joystick/mujoco.yaml 片段
+env:
+  domain_rand:
+    randomize_base_mass: true          # reset：基座质量 +U(added_mass_range)
+    added_mass_range: [-1.0, 3.0]
+    random_com: true                   # reset：质心 x 偏移
+    randomize_kp: true                 # reset：PD kp 乘 U(kp_multiplier_range)（scale 模式保物理一致）
+    kp_multiplier_range: [0.5, 2.0]
+    randomize_kd: true
+    kd_multiplier_range: [0.5, 2.0]
+    push_robots: true                  # interval：每 push_interval 步施加速度扰动
+    push_interval: 625
+    max_force: [1.0, 1.0, 0.5]
+# 机制：reset -> provider.build_reset_plan -> 后端 set_state(randomization=payload)；
+#       interval -> apply_interval_randomization_if_due(step) -> 后端 apply_interval_randomization。
+# 后端能力门控：每后端 get_dr_capabilities() 声明支持项；不支持的 reset 项被 filter_reset_payload
+#   自动跳过（打 warning，不报错）——这就是为什么 go2 flat 的 motrix.yaml 显式 randomize_kp/kd: false。
+\end{codebox}
+
+\begin{pitfall}[把 UniLab DR 项配上后端不支持的字段，静默降级却以为生效]
+\textbf{错误描述}：在 motrix 后端开 \verb|randomize_kp/kd| 或 \verb|body_inertia| 类 DR，以为和 mujoco 后端一样生效。\textbf{现象后果}：sim2real 鲁棒性达不到预期，却查不出原因——\emph{没有报错}。\textbf{根本原因}：两后端 DR 能力\emph{不同}（MuJoCo 后端 11 项 reset 全集；Motrix 基线仅 4 项，按能力门控追加 kp/kd/friction/gravity，且\textbf{不支持} \verb|body_iquat|/\verb|body_inertia|/\verb|dof_armature|），UniLab 的 \verb|filter_reset_payload| 会把不支持项\emph{打 warning 后跳过}，优雅降级但易被忽视。\textbf{正确做法}：跑训练时\emph{看 warning 日志}确认哪些 DR 项真生效；或 reset 后读后端 per-world 字段（如 geom\_friction）核对跨 env 是否真有方差（std$>$1e-6）。这是 UniLab「多后端」带来的、mjlab/Isaac Lab 单后端没有的新陷阱。
+\end{pitfall}
+
+\textbf{分阶段引入策略}（别一上来全开 DR，与 \cref{ch:rlmc-dr} 的分阶段一致）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{4.8cm}p{4.4cm}@{}}
+\toprule
+训练阶段 & 引入的 DR & 原因 \\
+\midrule
+$0\sim 2$k iter & 无 DR（仅 reset 随机化） & 让策略先学会基本行为 \\
+$2$k$\sim 5$k iter & + friction + mass & 增鲁棒，不动基本行为 \\
+$5$k$\sim 8$k iter & + push disturbance & 测抗扰 \\
+$8$k+ iter & + action delay + obs noise & sim2real 准备 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{配置详解：CommandsCfg 设计}
+\label{sec:rlmc-diy-events-cmd}
+
+CommandsCfg 定义策略要完成的“任务指令”：速度跟踪是目标速度，导航是目标位置，操作是目标物体位姿。
+
+\begin{codebox}[Python]{速度指令配置}
+class CommandsCfg:
+    base_velocity = UniformVelocityCommandCfg(
+        asset_name="robot",                   # mjlab 此字段名为 entity_name（Isaac 用 asset_name）
+        resampling_time_range=(10.0, 10.0),   # 每 10 秒重采样
+        heading_command=True, debug_vis=True,
+        ranges=UniformVelocityCommandCfg.Ranges(
+            lin_vel_x=(-1.0, 1.0), lin_vel_y=(-0.5, 0.5),
+            ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)))
+\end{codebox}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{4.0cm}p{5.0cm}@{}}
+\toprule
+参数 & 含义 & 调优方向 \\
+\midrule
+\verb|resampling_time_range| & 指令重采样间隔 & 太短（$<3$s）策略来不及执行；太长（$>30$s）训练效率低 \\
+\verb|heading_command| & 用 heading 还是 ang\_vel\_z & heading 适合导航，ang\_vel\_z 适合速度跟踪 \\
+\verb|lin_vel_x| 范围 & 前后速度采样范围 & 从小范围（$\pm 0.5$）起，curriculum 逐步扩 \\
+\verb|lin_vel_y| 范围 & 侧向速度范围 & 差速底盘设 0（不能横移），全向底盘可非零 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[CommandTerm 也可以是“episode 级实验条件生成器”]\label{ins:rlmc-diy-command}
+我们习惯把 command 理解成“给策略的目标指令”（要追踪的目标速度）。但 CommandTerm 还有一个常被忽视的身份：\textbf{episode 级实验条件生成器}。设想一个物理验证环境（如网球发射器），command 可以是“发球参数”——速度、仰角、落点范围——策略\emph{并不追踪}这些参数，它们只是定义了每个 episode 的物理条件。把随机化条件封装成 CommandTerm 而非硬编码进 reset 函数，有两个工程红利：（1）采样范围可经 CLI 覆盖（如 \verb|--env.commands.launch.speed-range "[20,45]"|）而不改代码；（2）每个 episode 的条件被显式记进 command buffer，\emph{可复现、可分析}。这个视角扩展了 CommandManager 的用途边界——它不只是“任务”，也是“实验设计”的载体。
+\end{insight}
+
+\begin{pitfall}[resampling 太短导致指令抖动、策略学会“忽略指令”]
+\textbf{错误描述}：\verb|resampling_time_range=(1.0, 1.0)|，策略每秒收新指令。\textbf{现象后果}：上一个还没执行完就被要求做新的，tracking error 在切换瞬间猛增——策略干脆学会“忽略指令”以躲避这种惩罚。\textbf{根本原因}：指令变化快于机器人物理响应。\textbf{正确做法}：resampling time $\ge$ 机器人到达目标速度所需时间的 2 倍。
+\end{pitfall}
+
+\begin{pitfall}[Command 返回 world frame 而非 base frame]
+\textbf{错误描述}：自定义 Command 的 \verb|_compute_command()| 返回 world frame 值。\textbf{现象后果}：观测里的指令随底盘旋转而变，相同的“向前走”在不同朝向下有不同表示，策略学不会。\textbf{根本原因}：与 \cref{sec:rlmc-diy-mjlab-pitfalls} 的速度 frame 同一类错误。\textbf{正确做法}：\verb|_compute_command()| 必须返回 base frame 值（用 \verb|quat_rotate_inverse| 把 world 相对量转到 base）。
+\end{pitfall}
+
+\begin{practice}[Events 与 Commands]
+\begin{enumerate}
+\item \textbf{[设计]} 为“物体导航”任务（机器人走到物体旁）设计 CommandsCfg：指令含什么信息？重采样时机？\emph{验收}：指令字段表 + 重采样策略。
+\item \textbf{[实验]} 速度跟踪任务里分别用 \verb|(3.0,3.0)| 与 \verb|(15.0,15.0)| 的 resampling 训练，对比 tracking reward 与行为平滑度。\emph{验收}：两组曲线对比 + 一句结论。
+\item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-dr} 的分阶段 DR，写一个脚本：按当前 iter 自动决定激活哪些 EventTerm（提示：用 CurriculumManager 驱动）。\emph{验收}：阶段$\to$EventTerm 的映射逻辑。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{研究级案例精读：HOVER 与 HUSKY}
+\label{sec:rlmc-diy-cases}
+
+\textbf{本节解决什么问题}：通过两个来自顶会的真实项目（HOVER 用 Isaac Lab，HUSKY 用 mjlab），展示 DIY 在研究级项目里的实际样貌——你将看到“真正的研究项目怎么做 DIY”。
+
+\subsection{案例一：HOVER —— Isaac Lab extension 范式}
+\label{sec:rlmc-diy-hover}
+
+\begin{paper}[HOVER：mask-conditioned 多模态统一全身控制器]\label{paper:rlmc-diy-hover}
+\textbf{问题}：人形全身控制要适配导航、loco-manipulation、桌面操作等\emph{不同模式}的控制（导航靠 root velocity tracking、桌面操作靠上半身关节角 tracking），如何用\emph{一个}策略统一？\textbf{核心思想}：以“全身运动学模仿”作为所有模式的共同抽象，先训一个看完整 SMPL 参考姿态 + 全 state（privileged）的 Oracle teacher，再通过 mask-conditioned 蒸馏把多模态整合进单一 student；mask 随机选择激活哪些控制子空间（mode mask）与屏蔽哪些命令维度（sparsity mask）。\textbf{关键结果}：单策略 $+$ $N$ 个 mask 即覆盖多模态、推理时切 mask 不重训，在多种真实控制模态上优于专用控制器。\textbf{与本书关系}：HOVER 是本章 Isaac Lab extension 模式的标杆，其 teacher-student（\cref{ch:rlmc-privileged}）与目录范式（\cref{sec:rlmc-diy-isaac-hover-layout}）都直接可借。\textbf{局限}：依赖特定 Isaac Lab / 定制 rsl\_rl 版本；mask 蒸馏对 teacher 质量敏感。He 等，\textbf{ICRA 2025}，arXiv:2410.21229，机器人 Unitree H1，仓库 \texttt{NVlabs/HOVER}\,\cite{he2025hover}。
+\end{paper}
+
+HOVER 的训练 pipeline 是两阶段（与 \cref{ch:rlmc-privileged} 的特权蒸馏同构，但叠了“命令 mask”）：
+
+\begin{codebox}[text]{HOVER 两阶段（概念）}
+Stage 1  Oracle Teacher (PPO, RSL-RL)
+  输入: 完整 SMPL 参考姿态 + 全 state(privileged)   输出: 全关节 action
+  网络: MLP [512,256,128] ELU   环境: 4096   训练: 约 10k iter
+        | 保存 Oracle checkpoint
+Stage 2  Student Distillation (DAgger 式监督, 非策略梯度)
+  输入: 多帧历史本体感受 + (M_mode * M_sparsity * command)   (* = 逐元素乘)
+  标签: Oracle 的 action       损失: || a_oracle - a_student ||^2  (action MSE)
+\end{codebox}
+
+\begin{insight}[HOVER 的 mask 同构于 BERT 的 masked language modeling]\label{ins:rlmc-diy-hovermask}
+HOVER 的双重 mask 为什么能让单策略覆盖多模态？类比 NLP：BERT 随机 mask 部分 token，逼网络学“即使部分上下文缺失也能理解整句”；HOVER 随机 mask 部分身体部位的跟踪目标，逼 student 学“即使部分命令缺失也能保持全身协调”。工程含义有二：（1）蒸馏完成后推理时\emph{只需指定 mask}即可切换控制模态，不重训——per-task 要 $N$ 个策略，HOVER 只要 $1$ 个策略 $+$ $N$ 个 mask；（2）mask \emph{不是}简单把观测置零——被 mask 的部位不贡献 tracking reward，student 学到在这些部位维持\emph{默认行为}而非随机动作。这解释了为什么“双重 mask + DAgger”这套看似复杂的机制，反而比“为每种模式各训一个策略”更省、更鲁棒。
+\end{insight}
+
+\begin{note}[向 HOVER 学的是\emph{架构模式}，不是直接复用代码]
+HOVER 代码针对 19-DOF Unitree H1（论文实机，质量约 51.5\,kg）与特定任务优化，\textbf{不能直接搬到你的机器人}。该学的是：mask 观测组的组织、teacher$\to$student 的 DAgger 蒸馏（用 action MSE 而非分布匹配，更稳）、按功能分层的 extension 目录。其中 student 的本体感受输入按论文是把 $[q,\dot q,\boldsymbol\omega_{\text{base}},\mathbf{g}]$ 与历史 action \emph{堆叠最近 25 步}（mode/sparsity 二值 mask 每位独立取自 $\mathcal{B}(0.5)$）。\pz{待核实：各 mask 通道的确切维度与训练 wall-clock，论文未逐字量化、且随硬件/版本差异较大，以 \texttt{NVlabs/HOVER} README 与你的硬件为准。}
+\end{note}
+
+\subsection{案例二：HUSKY —— mjlab 研究项目范式}
+\label{sec:rlmc-diy-husky}
+
+\begin{paper}[HUSKY：物理感知的人形滑板全身控制]\label{paper:rlmc-diy-husky}
+\textbf{问题}：让人形机器人在\emph{真实滑板}上推进与转向——一个同时涉及非完整约束、器具耦合与高动态动作的复合任务，如何建模与训练？\textbf{核心思想}：显式建模“人形—滑板”系统，把转向架（truck）的运动学耦合写进物理模型（板面倾斜诱导轮轴转向），再用\emph{分阶段}学习——推进用 AMP（\cref{ch:rlmc-imitation}）学人类推板风格、转向用物理引导的 lean-to-steer 参考、推进与转向间用轨迹规划（Bézier + slerp）平滑切换。\textbf{关键结果}：实现人形在真实滑板上的推进与转向闭环。\textbf{与本书关系}：HUSKY 是本章 mjlab 研究项目的标杆，展示了 DIY 建模的高级技巧（equality constraint 实现器具耦合）与“AMP 只用于人类做得好的子技能”的工程判断。\textbf{局限}：器具耦合的精确建模依赖近似，对接触/摩擦参数敏感。Han 等，\textbf{RSS 2026}，arXiv:2602.03205，机器人 Unitree G1（\textbf{23 可控 DoF}，排除每侧腕部 3 个 DoF），框架 mjlab（集成 MuJoCo 物理 $+$ Isaac Lab 风格 API，PPO 经 RSL-RL）$+$ AMP，4096 并行环境，仓库 \texttt{TeleHuman/humanoid\_skateboarding}\,\cite{husky2026}。
+\end{paper}
+
+\paragraph{HUSKY 的建模核心：转向架运动学耦合。}真实滑板的转向架把板面倾斜角 $\gamma$（tilt）经主销（kingpin）的恒定 rake 角 $\lambda$ 映射为轮轴转向角 $\sigma$（steering）：
+
+\begin{equation}
+\tan\sigma = \tan\lambda \cdot \sin\gamma.
+\label{eq:rlmc-diy-kingpin}
+\end{equation}
+
+HUSKY 在 MuJoCo 中用 equality constraint 实现这一耦合——这是 DIY 建模的高级技巧：
+
+\begin{codebox}[text]{HUSKY 滑板 MJCF + kingpin 耦合（简化）}
+<worldbody>
+  <body name="board" pos="0 0 0.1">
+    <joint name="board_yaw" type="hinge" axis="0 0 1"/>
+    <geom type="box" size="0.4 0.1 0.01" mass="3.5"/>
+    <body name="front_truck" pos="0.2 0 -0.03">
+      <joint name="front_tilt"  type="hinge" axis="0 1 0"/>
+      <joint name="front_steer" type="hinge" axis="0 0 1"/>
+    </body>
+  </body>
+</worldbody>
+<equality>
+  <!-- MuJoCo equality/joint 的 polycoef 是 joint1 相对 joint2 的四次多项式; -->
+  <!-- polycoef="0 0.45 0 0 0" 只实现线性项 steer ~ 0.45*tilt, 即式(eq:rlmc-diy-kingpin)小角度线性近似 -->
+  <joint joint1="front_steer" joint2="front_tilt" polycoef="0 0.45 0 0 0"/>
+</equality>
+\end{codebox}
+
+\begin{insight}[式~\eqref{eq:rlmc-diy-kingpin} 的非线性 vs MuJoCo 约束的线性近似]\label{ins:rlmc-diy-husky-approx}
+式~\eqref{eq:rlmc-diy-kingpin} 是\emph{非线性}的（含 $\tan$ 与 $\sin$），而 MuJoCo \verb|equality/joint| 的 \verb|polycoef| 只能表达 joint1 相对 joint2 的\emph{四次多项式}。\verb|polycoef="0 0.45 0 0 0"| 实现的是线性项 $\sigma\approx 0.45\,\gamma$——恰是式~\eqref{eq:rlmc-diy-kingpin} 在小角度下的线性化（小角度时 $\tan x\approx x$、$\sin x\approx x$，故 $\sigma\approx \lambda\gamma$，系数即 $\tan\lambda$ 的小角度等效）。这给 DIY 建模一个普适教训：\textbf{物理关系常是非线性的，但仿真约束接口往往只给低阶多项式}——你要么接受小角度线性近似（多数运控够用），要么用更高阶 \verb|polycoef| 拟合、或干脆把耦合写进自定义控制逻辑。选哪条取决于你的动作幅度是否进入非线性显著区。\rebuilt{HUSKY 论文给出耦合关系式~\eqref{eq:rlmc-diy-kingpin}（其 Eq.~1）但\emph{未公布} rake 角 $\lambda$ 的数值，故上面的系数 0.45 仅为示意；确切 rake 角与拟合系数以 \texttt{TeleHuman/humanoid\_skateboarding} 仓库的 MJCF 为准。}
+\end{insight}
+
+HUSKY 的训练分三相：\textbf{推进}（AMP，参考人类推板 MoCap）、\textbf{转向}（物理引导 heading/lean-to-steer 参考，\emph{不}用 AMP，因转向运动模式与人类不同）、\textbf{切换}（Bézier + slerp 轨迹规划）。
+
+\begin{insight}[AMP 只用在“人类做得好”的子技能上]\label{ins:rlmc-diy-amp-scope}
+为什么 HUSKY 推进用 AMP、转向却不用？这是一条值得内化的工程判断：\textbf{对抗式模仿（AMP）的前提是“有一批人类做得好的参考动作”}。人类推滑板的 MoCap 充足且自然，AMP 能学到地道的推进风格；但人类“在滑板上转向”的动作既难采集、又与机器人的质量分布/驱动方式差异大，强行用 AMP 反而会把不合适的人类风格灌进策略。于是转向改用\emph{物理引导}的参考（lean-to-steer），让奖励直接奖励正确的物理量（heading 对齐）而非“像人”。推广开来：\textbf{选模仿还是选 physics reward，取决于“高质量人类参考是否存在且与机器人匹配”}——这正是 \cref{ch:rlmc-imitation} 技术线选择的现实落点。
+\end{insight}
+
+\subsection{两案例对比与选择建议}
+\label{sec:rlmc-diy-cases-compare}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{4.6cm}p{4.6cm}@{}}
+\toprule
+维度 & HOVER（Isaac Lab） & HUSKY（mjlab） \\
+\midrule
+框架 & Isaac Lab extension & mjlab 任务格式 \\
+训练方法 & Oracle PPO + DAgger 蒸馏 & PPO + AMP + 物理引导 + 分阶段 \\
+关键建模技巧 & mask 观测组 & equality constraint（器具耦合） \\
+部署平台 & Unitree H1 & Unitree G1（23 可控 DoF） \\
+何时参考 & 多模态控制 / 视觉输入 / USD 资产 & 复杂物理建模 / 自定义约束 / 轻量 codebase \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{选择建议}：任务需多模态控制、视觉输入或 USD 资产，参考 HOVER 的 Isaac Lab extension 模式；任务涉及复杂物理建模（自定义约束、器具耦合）或偏好轻量 codebase，参考 HUSKY 的 mjlab 模式。两者不互斥——可在 mjlab 快速原型验证，再用 Isaac Lab extension 做生产级训练。
+
+\begin{note}[这两个研究模式在 UniLab 里有什么对应（如实核对）]
+本节两案例都用 mjlab/Isaac Lab，那么\textbf{若用 UniLab 做同类研究}，哪些能直接借、哪些要自实现？按实跑源码核对：（1）\textbf{HOVER 的 teacher-student 蒸馏} —— UniLab \emph{有原生蒸馏}，但形态不同：它的内置路径是 \textbf{HORA}（\verb|scripts/train_hora_distill.py| $+$ \verb|conf/hora_distill/|，算法在 \verb|algos/torch/hora/distill.py|），属\emph{RMA 式时序自适应蒸馏}——stage-1 用特权 \verb|priv_info| 训 PPO teacher，stage-2 只训练名字含 \verb|adapt_tconv| 的时序卷积适应编码器（teacher 主干 $+$ obs\_normalizer 冻结），从本体感知历史学一个适应模块。这与 HOVER 的「mask-conditioned DAgger」\emph{不是}一回事——\textbf{HOVER 那种通用 mask 蒸馏 / camera-conditioned student，UniLab 不内置，需自实现}。（2）\textbf{HUSKY 的 AMP 对抗模仿} —— UniLab 主线是\emph{显式动作跟踪} $+$ RL（\verb|G1MotionTracking| 等原生任务，跟踪 NPZ 参考运动，奖励直接奖励躯干/关节位姿对齐），\textbf{无内置 AMP/ASE 判别器一等公民}——HUSKY 的「推进用 AMP」那条线在 UniLab 里要自己接判别器。（3）\textbf{HUSKY 的 equality constraint 器具耦合} —— 这是 MJCF 层的建模技巧，UniLab 的 mujoco 后端吃同样的 MJCF，故 \verb|<equality>| 耦合\emph{可直接复用}。一句话：UniLab 适合「显式跟踪 $+$ 时序自适应蒸馏」的人形动作任务，对抗模仿与通用 mask 蒸馏需自行扩展。
+\end{note}
+
+\begin{pitfall}[以为 HOVER/HUSKY 的代码可以直接用]
+\textbf{错误描述}：clone 下来改个模型路径就想跑自己的任务。\textbf{现象后果}：API/版本/机器人假设全不匹配，处处报错或行为崩。\textbf{根本原因}：研究代码针对特定机器人（H1/G1）与特定任务深度优化。\textbf{正确做法}：学其\emph{架构模式}（mask 观测组、AMP 集成、equality constraint），在你的任务里重新实现；HUSKY/HOVER 的依赖都要用其仓库 pin 的版本。
+\end{pitfall}
+
+\begin{practice}[案例精读]
+\begin{enumerate}
+\item \textbf{[代码阅读]} 读 HOVER 的 \verb|neural_wbc/core/oracles/|：Oracle teacher 的观测维度是多少？它与 student 的观测维度差异来自哪里？\emph{验收}：两个维度数 + 差异来源说明。
+\item \textbf{[设计]} 用 HOVER 的 mask 机制实现“导航 + 抓取”双模态控制器：mask 怎么设计？哪些观测维度属导航、哪些属抓取？\emph{验收}：mask 向量定义 + 维度归属表。
+\item \textbf{[实践]} clone HUSKY，在 viewer 加载滑板 MJCF，手动让人形站上滑板、倾斜板面，观察 equality constraint 是否生效（轮子是否随倾斜自动转向）。\emph{验收}：一句“倾斜$\to$转向”是否成立的观察。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{自定义环境的十大常见 Bug 与排查}
+\label{sec:rlmc-diy-bugs}
+
+\textbf{本节解决什么问题}：把自定义环境中最高发的十类 bug 做成一本“字典”，每类按“症状$\to$根因$\to$排查$\to$修复”组织。它们覆盖了作者与社区经验里 $90\%$ 以上的自定义环境问题。
+
+\begin{insight}[自定义环境的 bug 几乎都不报错]\label{ins:rlmc-diy-silentbug}
+本章反复出现一个母题，在这里收束成一条洞察：\textbf{自定义环境的 bug 绝大多数不触发运行时错误，而是表现为“策略训练不收敛”}。这意味着你可能训了一整天、看着平坦的 reward 曲线，开始怀疑 reward 设计、超参、算法——但真因或许只是观测里某一维的 frame 转换搞反了。正因如此，本节的十大 bug 才有价值：它把“训练不收敛”这个\emph{单一模糊症状}，反解成十类\emph{各有独立排查手段}的具体病因。掌握它，你 debug 时就不再盲猜，而是按字典逐条排除。
+\end{insight}
+
+\paragraph{Bug 1：初始化“弹飞”。}症状：reset 后第一步 base height 暴增到 5--50 m 后 terminated。根因：初始关节角致身体部件互相穿模或与地面穿模，接触求解器产生巨大排斥力。排查：\verb|mujoco.mj_forward(model, data)| 只算运动学不推进物理，打印 \verb|data.ncon| 与每对接触的 geom 名/距离。修复：调 \verb|init_state.joint_pos| 使初始姿态无穿模（对应 \cref{sec:rlmc-diy-mjlab} 的初始高度决策）。
+
+\paragraph{Bug 2：Zero agent 缓慢倒塌。}症状：action=0 时机器人 100--200 步内渐倒。根因：PD stiffness 不足以支撑自重，或初始关节角不在平衡点。排查：在初始姿态下比较各关节的重力力矩（\verb|data.qfrc_bias|，跳过 freejoint 的前 6 维）与 PD 可提供的最大力矩（\verb|actuator_forcerange|），比值 $>0.8$ 的关节可能撑不住。修复：增大 stiffness（别过大以免高频振荡）或调初始关节角到更平衡的姿态。
+
+\paragraph{Bug 3：Obs 维度不匹配致崩溃。}症状：训练开始报 shape mismatch（或更隐蔽地报 \verb|KeyError: 'policy'|——见下方排查第 0 步）。根因：观测各 term 维度之和 $\ne$ 网络输入维度，常见于改了观测却忘了更新 PPO 的 \verb|num_observations|。排查：\textbf{第 0 步先 \texttt{print(list(obs.keys()))} 确认组名}（mjlab 内置任务是 \verb|actor|/\verb|critic|，Isaac Lab 是 \verb|policy|——拿错组名会直接 \verb|KeyError|）；再用真实组名打印 \verb|obs[group].shape[-1]|；mjlab 还可 \verb|env.observation_manager.compute()| 配合 \verb|group_obs_dim| 逐组拿维度、用 \verb|active_terms| 逐项核对每个 term 的 shape（这是 mjlab 暴露的官方 introspect 入口，比自己拼 print 准）。修复：让 PPO 配置\emph{自动从环境推断}观测维度，而非手填。
+
+\paragraph{Bug 4：Reward 恒为常数。}症状：reward 曲线从第一步就是固定值，不随训练变。根因：reward 函数没和当前状态/动作关联，常见于引用了错变量（如 \verb|env.robot| 写成 \verb|env.arm| 返回默认零）。排查：在 random action 下逐项打印每个 reward term 的 \verb|mean|/\verb|std|——\textbf{mjlab 不用你自己写 print}：训练日志默认就分项输出每个 \verb|Episode_Reward/<term>|（实跑 Go1 可见 \verb|Episode_Reward/track_linear_velocity|、\verb|.../action_rate_l2| 等逐项数值），直接看哪一项恒定/为零即可；UniLab 同理打 \verb|reward/<name>| 分项。修复：找到 \verb|std=0| 的 term，检查其函数实现与变量引用。
+
+\paragraph{Bug 5：学到“原地抖动”而非行走。}症状：reward 上升但 viewer 里机器人原地高频颤抖。根因：action rate penalty 太小或缺失、tracking reward 在零速度指令下就有正信号、或 feet\_air\_time 阈值不对。排查：viewer 观察 + 打印 velocity command 与 actual velocity 分布。修复：增大 \verb|action_rate_l2| 权重、调 command 采样（降低零速度概率）、加 feet\_air\_time 鼓励迈步。
+
+\paragraph{Bug 6：训练中途突然 NaN。}症状：前 1000 iter 正常后 obs/reward 突现 NaN。根因：物理状态漂到极端区（关节超限、位置越界、速度过大致接触求解器发散）。排查：开 NaN guard；逐步检查时，用布尔掩码 \verb|nan_mask = torch.isnan(obs).any(dim=-1)| 后 \verb|nan_mask.nonzero().flatten()[0]| 取\emph{第一个 NaN 环境 id}（注意 \verb|nan_mask[0]| 只是“第 0 个 env 是否 NaN”的布尔值，不是环境 id），再打印该 env 的 qpos/qvel。修复：加更严格的 termination（关节超限、高度异常）、clip 观测、降学习率或 gradient clip。
+
+\paragraph{Bug 7：两框架训练结果差异巨大。}症状：同一任务 mjlab 正常上升、Isaac Lab 远低于预期（或反之）。根因：物理引擎差异（MuJoCo 凸优化软接触 vs PhysX TGS，摩擦/积分不同，见 \cref{ch:rlmc-physics}）。排查：跑 \cref{sec:rlmc-diy-pipe-dual} 的一致性脚本，重点比 zero action 下 base height drift 与接触力。修复：调接触参数使两框架物理尽量接近（drop test / slide test 对齐）。
+
+\paragraph{Bug 8：Curriculum 不推进。}症状：Phase 0 训了数千 iter，success rate 不达标，永不进下一阶段。根因：Phase 0 难度本就太高，或 success 判据太严。排查：打印当前 phase、success rate、平均 episode length。修复：降低 Phase 0 的 success 阈值或缩小初始范围让任务更易。
+
+\paragraph{Bug 9：reset 后 obs 不变。}症状：连续 reset 返回的 obs 完全相同。根因：EventManager 没配 reset-mode 随机化，每次 reset 都回到同一初始状态。排查：检查 EventsCfg 里是否有 \verb|mode="reset"| 的 term。修复：加 \verb|reset_root_state_uniform| 与 \verb|reset_joints_by_offset|（见 \cref{sec:rlmc-diy-events-template}）。
+
+\paragraph{Bug 10：训练极慢（$<100$ steps/s）。}症状：预期 4096 envs 下约数万 steps/s，实际只有几百。根因：num\_envs 太小、obs/reward 里有 Python for 循环而非 batch 操作、CPU-GPU 搬运成瓶颈。排查：\verb|torch.profiler| 定位瓶颈，\verb|nvidia-smi -l 1| 看 GPU 利用率。修复：增大 num\_envs 到 4096+、把 for 循环改 batch、消除观测函数里不必要的 \verb|.cpu()|。\textbf{先确认你看的是不是「真慢」}：steps/s 与 num\_envs 近似线性，\textbf{小并行下几百 steps/s 是正常的、不是 bug}——实测 RTX 4080 SUPER 上 mjlab Go1 用 \verb|--env.scene.num-envs 64| 单 iter 约 1.45 s、UniLab go2 \verb|num_envs=16| 约 398 steps/s（CPU 物理，且首个 iter 含 JIT 冷启更慢）。只有当你把 num\_envs 拉到 4096+ 仍卡在几百 steps/s、且 GPU 利用率低时，才是上面那些根因。判据一句话：\textbf{steps/s} $\approx$ \textbf{num\_envs} $\times$ \textbf{控制频率} $\times$ \textbf{并行效率}——拿这个估算心算一遍，就知道自己该期望多少。
+
+\subsection{排查总表与“不收敛”决策树}
+\label{sec:rlmc-diy-bugs-table}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{3.0cm}p{3.2cm}p{3.0cm}l@{}}
+\toprule
+Bug & 症状 & 排查工具 & 修复方向 & 参考 \\
+\midrule
+1 弹飞 & base height $>5$m & \verb|mj_forward|+ncon & 调 init\_state & \cref{sec:rlmc-diy-mjlab} \\
+2 倒塌 & zero agent 倒 & qfrc\_bias 分析 & 调 stiffness/init & \cref{sec:rlmc-diy-mjlab} \\
+3 obs 维度 & shape mismatch & 逐项打印 shape & 自动推断 num\_obs & \cref{sec:rlmc-diy-mjlab} \\
+4 常数 reward & reward std=0 & 分项打印 & 查变量引用 & \cref{sec:rlmc-diy-mjlab} \\
+5 原地抖动 & 高频颤抖 & viewer+cmd 分布 & 加 action\_rate & \cref{ch:rlmc-reward} \\
+6 NaN & 中途崩溃 & NaN guard+qpos & 加 termination/clip & \cref{ch:rlmc-training} \\
+7 跨框架差异 & reward 差 $>30\%$ & 一致性脚本 & 调接触参数 & \cref{ch:rlmc-physics} \\
+8 curriculum 卡 & 不推进 & success rate & 降阈值 & \cref{ch:rlmc-reward} \\
+9 reset 不变 & obs 恒定 & 查 EventsCfg & 加 reset event & \cref{ch:rlmc-dr} \\
+10 训练慢 & $<100$ steps/s & torch.profiler & 增 env/去 for & \cref{ch:rlmc-training} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+遇到“训练不收敛”这种模糊症状时，按决策树系统排查，避免盲猜：
+
+\begin{codebox}[text]{“训练不收敛”系统化决策树}
+训练不收敛
+├─ reward 全 0 或常数? ── 是 ─> Bug 4（reward 函数断路）：分项打印 reward term
+├─ reward 上升但行为不对?
+│    ├─ 原地抖动 ─> Bug 5（缺 action rate / command 分布问题）
+│    ├─ 不移动   ─> termination 太严（一动就 done）
+│    └─ 动作剧烈 ─> action scale / init_noise_std 太大
+├─ reward N iter 后突崩(NaN)? ─> Bug 6（物理越界）：obs clip + 更严 termination
+├─ reward 缓升但太慢?
+│    ├─ KL 太高     ─> 降 learning_rate
+│    ├─ entropy<1.0 ─> 增 init_noise_std / entropy_coef
+│    └─ episode 太短 ─> 放宽 termination 阈值
+└─ 一切正常但 sim2sim 差? ─> Bug 7（跨框架物理差异）：比 zero agent base height
+\end{codebox}
+
+\begin{insight}[排查的两条第一原则]\label{ins:rlmc-diy-debugprinciple}
+\textbf{第一原则：先排除环境 bug，再怀疑算法/超参。}在自定义环境里，$80\%$ 的“训练不收敛”来自环境配置错误而非 PPO 超参。如果你对环境配置没有 $100\%$ 的信心（\cref{sec:rlmc-diy-checklist} 的 Phase A+B checklist 没全过），就去调超参，那是在错误方向上努力。\textbf{第二原则：用 random agent 作 baseline。}若训了 1000 iter 的策略还\emph{不如} random agent（episode reward 更低、存活更短），说明 PPO 更新方向\emph{完全反了}——大概率是观测 frame 转反或 reward 符号写反。这个 5 分钟的 baseline 对比，能在你浪费几小时之前揪出方向性错误。两条原则合起来就是：\emph{把信心建立在“可验证的环境正确性”上，而非“感觉超参不对”的直觉上。}
+\end{insight}
+
+\begin{practice}[Bug 字典]
+\begin{enumerate}
+\item \textbf{[诊断]} 四足走路任务 reward 在 2000 iter 后趋平、viewer 里能走但步幅很小。按优先级列出排查步骤及每步预期发现。\emph{验收}：有序排查清单（至少含碰撞体凸包、feet\_air\_time、action scale）。
+\item \textbf{[实践]} 故意制造 Bug 4：把 tracking reward 的 \verb|command_name| 改成不存在的名字，观察 reward 曲线与行为，确认你能从“症状”反推“根因”。\emph{验收}：一句“症状$\to$根因”的复盘。
+\item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-training} 的训练诊断，设计一份“自定义环境健康检查报告模板”：$\ge 10$ 个自动检查项、各自通过标准与不通过时的建议动作。\emph{验收}：10 行检查表。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{综合实战：自定义四足速度跟踪完整代码与检查清单}
+\label{sec:rlmc-diy-fullcode}
+
+\textbf{本节解决什么问题}：把前面的概念、片段、排查收束成一份\emph{可直接复制修改}的完整参考——一个假想非标四足 MyQuad 的双框架完整配置，外加可打印的全流程检查清单。
+
+\subsection{mjlab 完整环境（四文件结构）}
+\label{sec:rlmc-diy-fullcode-mjlab}
+
+下面是一个完整 mjlab 自定义四足速度跟踪环境的全部配置。换成你自己的 MJCF、改 joint names 即可运行。\textbf{文件 1：机器人 Entity}（逐关节给初始角与刚度）：
+
+\begin{codebox}[Python]{文件 1/4 —— \texttt{my\_quad\_robot\_cfg.py}}
+import mujoco
+from mjlab.entity import EntityCfg, EntityArticulationInfoCfg
+from mjlab.actuator import BuiltinPositionActuatorCfg
+
+# mjlab：spec_fn 指向 MJCF（框架 compile）；执行器在 articulation.actuators，
+# 绑关节用 target_names_expr（非 Isaac 的 joint_names_expr）；位置 PD 执行器无 velocity_limit 字段
+MY_QUAD_CFG = EntityCfg(
+    spec_fn=lambda: mujoco.MjSpec.from_file("my_quad/xmls/my_quad.xml"),
+    init_state=EntityCfg.InitialStateCfg(
+        pos=(0.0, 0.0, 0.42), rot=(1.0, 0.0, 0.0, 0.0),     # wxyz
+        joint_pos={
+            "FL_hip_joint": 0.0, "FL_thigh_joint": 0.8, "FL_calf_joint": -1.6,
+            "FR_hip_joint": 0.0, "FR_thigh_joint": 0.8, "FR_calf_joint": -1.6,
+            "HL_hip_joint": 0.0, "HL_thigh_joint": 1.0, "HL_calf_joint": -1.6,
+            "HR_hip_joint": 0.0, "HR_thigh_joint": 1.0, "HR_calf_joint": -1.6},
+        joint_vel={".*": 0.0}),
+    articulation=EntityArticulationInfoCfg(actuators={
+        "legs": BuiltinPositionActuatorCfg(
+            target_names_expr=["FL_.*", "FR_.*", "HL_.*", "HR_.*"],
+            stiffness={".*_hip_joint": 20.0, ".*_thigh_joint": 20.0, ".*_calf_joint": 25.0},
+            damping={".*_hip_joint": 0.5, ".*_thigh_joint": 0.5, ".*_calf_joint": 0.5},
+            effort_limit=33.5)}))
+\end{codebox}
+
+\textbf{文件 2：完整环境配置}（Scene/Actions/Obs/Commands/Rewards/Terminations/Events 一处汇总；观测维度逐项标注，便于核对总维度 48）：
+
+\begin{codebox}[Python]{文件 2/4 —— \texttt{my\_quad\_env\_cfg.py}（节选关键段）}
+import math
+from dataclasses import dataclass, field
+from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.managers import (ObservationGroupCfg, ObservationTermCfg, RewardTermCfg,
+                            TerminationTermCfg, EventTermCfg)
+from mjlab.scene import SceneCfg
+import mjlab.envs.mdp as mdp                 # 通用项函数库（含 dr 子包）
+from mjlab.tasks.velocity import mdp as vmdp # velocity 专用 reward/termination
+from my_quad_robot_cfg import MY_QUAD_CFG
+
+# mjlab 场景 = SceneCfg(entities={...})；无 Isaac 的 InteractiveSceneCfg/prim_path/.replace
+scene = SceneCfg(num_envs=4096, env_spacing=3.0, entities={"robot": MY_QUAD_CFG})
+
+# 动作字典：JointPositionActionCfg 用 entity_name + actuator_names
+actions = {"joint_pos": mdp.JointPositionActionCfg(entity_name="robot",
+    actuator_names=["FL_.*", "FR_.*", "HL_.*", "HR_.*"],
+    scale=0.25, use_default_offset=True)}
+
+# mjlab：observations 是 dict[str,ObservationGroupCfg]，键即组名（actor/critic，非 Isaac 的 class+PolicyCfg/policy）
+observations = {
+    "actor": ObservationGroupCfg(                                          # 键名 "actor"（不是 "policy"！）
+        base_lin_vel = ObservationTermCfg(func=mdp.base_lin_vel),          # 3
+        base_ang_vel = ObservationTermCfg(func=mdp.base_ang_vel),          # 3
+        projected_gravity = ObservationTermCfg(func=mdp.projected_gravity),# 3
+        velocity_commands = ObservationTermCfg(func=mdp.generated_commands,
+            params={"command_name": "base_velocity"}),       # 3
+        joint_pos = ObservationTermCfg(func=mdp.joint_pos_rel),            # 12
+        joint_vel = ObservationTermCfg(func=mdp.joint_vel_rel),            # 12
+        actions   = ObservationTermCfg(func=mdp.last_action),              # 12  -> total 48
+    ),
+    "critic": ObservationGroupCfg(
+        enable_corruption = False,
+        # 同 actor 组 + privileged（height_scan 等部署不可得量）
+    ),
+}
+
+class CommandsCfg:
+    base_velocity = vmdp.UniformVelocityCommandCfg(
+        resampling_time_range=(10.0, 10.0), heading_command=True,
+        ranges=vmdp.UniformVelocityCommandCfg.Ranges(
+            lin_vel_x=(-1.0, 1.0), lin_vel_y=(-0.5, 0.5),
+            ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)))
+
+class RewardsCfg:                          # mjlab velocity 真名（非 Isaac track_lin_vel_xy_exp 等）
+    track_lin_vel = RewardTermCfg(func=vmdp.track_linear_velocity, weight=1.5,
+        params={"command_name": "base_velocity", "std": 0.25})
+    track_ang_vel = RewardTermCfg(func=vmdp.track_angular_velocity, weight=0.75,
+        params={"command_name": "base_velocity", "std": 0.25})
+    body_ang_vel = RewardTermCfg(func=vmdp.body_angular_velocity_penalty, weight=-0.05)
+    flat_orientation_l2 = RewardTermCfg(func=mdp.flat_orientation_l2, weight=-1.0)
+    dof_torques_l2 = RewardTermCfg(func=mdp.joint_torques_l2, weight=-2e-4)
+    dof_acc_l2 = RewardTermCfg(func=mdp.joint_acc_l2, weight=-2.5e-7)
+    action_rate_l2 = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01)
+    feet_air_time = RewardTermCfg(func=vmdp.feet_air_time, weight=0.2,
+        params={"sensor_cfg": ..., "threshold": 0.5})  # sensor_cfg：mjlab ContactSensorCfg(primary/secondary)
+    self_collision = RewardTermCfg(func=vmdp.self_collision_cost, weight=-1.0,
+        params={"sensor_cfg": ...})
+
+class TerminationsCfg:
+    time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
+    base_contact = TerminationTermCfg(func=vmdp.illegal_contact,
+        params={"sensor_cfg": ..., "threshold": 1.0})
+
+class EventsCfg:                           # mjlab DR 在 mdp.dr 子包，用 operation∈{abs,add,scale}+ranges
+    reset_base = EventTermCfg(func=mdp.reset_root_state_uniform, mode="reset",
+        params={"pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
+                "velocity_range": {k: (-0.5, 0.5) for k in
+                    ["x","y","z","roll","pitch","yaw"]}})
+    reset_joints = EventTermCfg(func=mdp.reset_joints_by_offset, mode="reset",
+        params={"position_range": (-0.25, 0.25), "velocity_range": (-0.5, 0.5)})
+    friction = EventTermCfg(func=mdp.dr.geom_friction, mode="startup",
+        params={"operation": "scale", "ranges": {...}})        # 几何摩擦随机化
+    add_base_mass = EventTermCfg(func=mdp.dr.body_mass, mode="startup",
+        params={"operation": "add", "ranges": {...}})          # 基座质量随机化
+
+@dataclass(kw_only=True)
+class MyQuadVelocityFlatEnvCfg(ManagerBasedRlEnvCfg):
+    scene: SceneCfg = field(default_factory=lambda: scene)
+    observations: dict = field(default_factory=lambda: observations)  # dict[str,ObservationGroupCfg]（键 actor/critic）
+    actions: dict = field(default_factory=lambda: actions)
+    rewards: RewardsCfg = field(default_factory=RewardsCfg)
+    terminations: TerminationsCfg = field(default_factory=TerminationsCfg)
+    commands: CommandsCfg = field(default_factory=CommandsCfg)
+    events: EventsCfg = field(default_factory=EventsCfg)
+    decimation: int = 4                    # dt 在 sim.mujoco 配（无 Isaac 的 SimCfg(dt=,decimation=)）
+    episode_length_s: float = 20.0
+\end{codebox}
+
+\textbf{文件 3：PPO 训练配置}（与 \cref{ch:rlmc-training} 一致的 RSL-RL 风格）：
+
+\begin{codebox}[Python]{文件 3/4 —— \texttt{my\_quad\_train\_cfg.py}（节选）}
+class MyQuadPPOCfg:
+    seed = 42; runner_type = "OnPolicyRunner"
+    class policy:
+        class_name = "ActorCritic"; init_noise_std = 1.0
+        actor_hidden_dims = [256, 256, 128]; critic_hidden_dims = [256, 256, 128]
+        activation = "elu"
+    class algorithm:
+        class_name = "PPO"; value_loss_coef = 1.0; use_clipped_value_loss = True
+        clip_param = 0.2; entropy_coef = 0.01; num_learning_epochs = 5
+        num_mini_batches = 4; learning_rate = 1e-3; schedule = "adaptive"
+        desired_kl = 0.01; gamma = 0.99; lam = 0.95; max_grad_norm = 1.0
+    class runner:
+        num_steps_per_env = 24; max_iterations = 10000
+        save_interval = 500; experiment_name = "my_quad_velocity"
+\end{codebox}
+
+\textbf{文件 4：注册}：
+
+\begin{codebox}[Python]{文件 4/4 —— \texttt{config/my\_quad/\_\_init\_\_.py}（落在 mjlab.tasks 下）}
+from mjlab.tasks.registry import register_mjlab_task
+from my_quad.my_quad_env_cfg import MyQuadVelocityFlatEnvCfg
+from my_quad.my_quad_train_cfg import MyQuadPPOCfg
+register_mjlab_task(task_id="MyQuad-Velocity-Flat",
+    env_cfg=MyQuadVelocityFlatEnvCfg(),
+    play_env_cfg=MyQuadVelocityFlatEnvCfg(),   # play 变体通常关 noise/push
+    rl_cfg=MyQuadPPOCfg())                      # runner_cls 可选，默认 MjlabOnPolicyRunner
+\end{codebox}
+
+\subsection{Isaac Lab 等价代码的四处核心差异}
+\label{sec:rlmc-diy-fullcode-isaac}
+
+把上面的 mjlab 代码迁到 Isaac Lab，差异集中在四处（其余 init\_state/actuators/reward 几乎照搬）：
+
+\begin{codebox}[Python]{Isaac Lab 等价：仅差异部分}
+# 差异 1：USD 替代 MJCF（多 PhysX 特有属性）
+MY_QUAD_IL_CFG = ArticulationCfg(spawn=sim_utils.UsdFileCfg(
+    usd_path="my_quad_lab/assets/my_quad.usd", activate_contact_sensors=True,
+    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+        disable_gravity=False, max_depenetration_velocity=10.0),     # PhysX 特有
+    articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+        solver_position_iteration_count=4, solver_velocity_iteration_count=4)))
+# 差异 2：prim_path 用 {ENV_REGEX_NS}；contact sensor 须显式
+class MyQuadILSceneCfg(InteractiveSceneCfg):
+    ground = AssetBaseCfg(prim_path="/World/ground", spawn=sim_utils.GroundPlaneCfg())
+    robot  = MY_QUAD_IL_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*",
+        history_length=3, track_air_time=True)
+# 差异 3：gymnasium.register（Isaac Lab 用 gym；mjlab 用 register_mjlab_task 写私有 _REGISTRY）
+import gymnasium as gym
+gym.register(id="MyQuad-Velocity-Flat-IL-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={"env_cfg_entry_point": f"{__name__}:MyQuadILEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{__name__}:MyQuadILPPOCfg"},
+    disable_env_checker=True)
+# 差异 4：训练命令
+#   Isaac Lab: ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+#              --task MyQuad-Velocity-Flat-IL-v0 --headless --num_envs 4096
+#   mjlab:     uv run train MyQuad-Velocity-Flat --env.scene.num-envs 4096
+\end{codebox}
+
+\subsection{UniLab 等价代码的三处核心差异}
+\label{sec:rlmc-diy-fullcode-unilab}
+
+把同一 MyQuad 迁到 UniLab，差异不在「改几个字段」而在「换一种环境形态」（非 Manager-Based），集中在三处（完整骨架见 \cref{sec:rlmc-diy-mjlab-unilab}）：
+
+\begin{codebox}[Python]{UniLab 等价：三处核心差异（对照 mjlab 文件 2/3/4）}
+# 差异 1：reward 不是 RewTerm 列表，而是 owner YAML 的 scales 标量字典 + env 内派发表
+#   conf/ppo/task/my_quad_joystick/mujoco.yaml:
+#     reward.scales: {tracking_lin_vel: 1.5, tracking_ang_vel: 0.75, lin_vel_z: -2.0,
+#                     action_rate: -0.01, similar_to_default: -0.1, ...}
+#     reward.tracking_sigma: 0.25
+#   env 侧 _init_reward_functions 把 scale 名映射到 common/rewards.py 的函数（见上文 Step 5）
+# 差异 2：obs/reward/done 在 update_state 一处算（无 ObservationsCfg/RewardsCfg/TerminationsCfg 三类）
+#   terminated = gravity[:, 2] <= 0.5            # 直接算，无 DoneTerm；truncated 由基类按超时自动算
+# 差异 3：注册 = 双装饰器（无 register_mjlab_task / gym.register）
+#   @registry.envcfg("MyQuadJoystick") 标 cfg；@registry.env("MyQuadJoystick", sim_backend="mujoco") 标 env
+#   训练：uv run train --algo ppo --task my_quad_joystick --sim mujoco \
+#         algo.num-envs=4096 algo.max-iterations=10000     # env/迭代走 Hydra 覆盖
+# 其余（init 姿态来自 MJCF keyframe home、动作=残差 PD、actor/critic 双组）与 mjlab 思想一致。
+\end{codebox}
+
+\begin{note}[UniLab 缺的两块 DIY 配件：DR 惯量正定 与 $\sigma$ 课程]
+按实跑核对，UniLab 在两个 DIY 常用点上\textbf{确无对应}，迁移时需手动兜底：（1）\textbf{物理合法（正定）惯量随机化}——UniLab 的 reset DR 只到 \verb|body_inertia|/\verb|body_ipos|/\verb|body_iquat| 级，\textbf{不保证扰动后惯量张量正定}；mjlab 独有的 \verb|pseudo_inertia|（4$\times$4 伪惯量上扰动 $+$ Cholesky 重构）UniLab 无等价物，需自实现或改用「乘性质量 DR」近似。（2）\textbf{tracking\_sigma 课程}——UniLab \textbf{无现成「按步收紧 reward std」} 的课程函数；它有 \verb|PenaltyCurriculum|（按 episode 长度缩放\emph{负权重} reward）与 \verb|TerrainCurriculumCfg|（地形等级），但 $\sigma$ 收紧需在 owner YAML 分阶段手调 \verb|reward.tracking_sigma| 或写自定义回调改 \verb|cfg.reward_config.tracking_sigma|。此外 UniLab 用后端\emph{内置位置 PD 执行器}，\textbf{无 learned-actuator 网络}（mjlab 有）——执行器失真靠 kp/kd 域随机化覆盖而非精确建模。
+\end{note}
+
+\subsection{DIY 全流程检查清单（可打印）}
+\label{sec:rlmc-diy-checklist}
+
+这是收束全章的 checklist，分三阶段。\textbf{Phase A：模型验证（训练前必须 100\% 通过）}：
+
+\begin{center}
+\small
+\begin{tabular}{@{}cp{3.4cm}p{3.2cm}p{2.8cm}p{2.4cm}@{}}
+\toprule
+\# & 检查项 & 验证方法 & 通过标准 & 不通过 \\
+\midrule
+A1 & MJCF/USD 编译无错 & \verb|from_xml_path()| & 不报错 & 查 XML 语法 \\
+A2 & joint 数量正确 & \verb|model.njnt|/\verb|nu| & 与设计一致 & 查转换 \\
+A3 & 总质量合理 & \verb|sum(body_mass)| & 与真机 $<10\%$ & 修 inertial \\
+A4 & 初始姿态无穿模 & \verb|mj_forward|+ncon & 自碰撞=0 & 调 init joint\_pos \\
+A5 & zero action 站稳 & 200 步后高度 & 下沉 $<3$cm & 增 stiffness \\
+A6 & 关节名匹配 action & 打印 names vs regex & 全匹配 & 修正则 \\
+A7 & actuator 力矩足够 & 重力矩/max PD $<0.8$ & 全关节过 & 增 effort\_limit \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Phase B：环境验证（训练前必须 100\% 通过）}：
+
+\begin{center}
+\small
+\begin{tabular}{@{}cp{3.4cm}p{3.4cm}p{2.8cm}p{2.2cm}@{}}
+\toprule
+\# & 检查项 & 验证方法 & 通过标准 & 不通过 \\
+\midrule
+B1 & smoke test & 建+reset+10 步 & 无报错无 NaN & 查配置依赖 \\
+B2 & obs 维度正确 & 打印 obs shape & 与设计一致 & 逐项查 term \\
+B3 & action 维度正确 & 打印 action shape & =受控关节数 & 查 joint 正则 \\
+B4 & random reward 有方差 & std$>0.01$ & 是 & Bug 4 \\
+B5 & random 有 termination & 2000 步内 ep$>0$ & 是 & 查 Terminations \\
+B6 & reset 后 obs 变 & 连续 reset diff$>0$ & 是 & Bug 9 \\
+B7 & reward 可分项打印 & 每项独立 print & 全有数值 & 查 term 引用 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Phase C：训练早期验证（前 500 iter）}：reward 缓升（100 iter 内有上升趋势，否则查 reward shaping）；entropy 不陡降（$>50\%$ init，否则增 init\_noise\_std）；KL 在 $0.005\sim 0.02$（否则调 LR/clip）；episode length 渐增（否则查 termination 阈值）；viewer 里行为有移动倾向（否则全面 debug）。
+
+\subsection{关键参数调优优先级}
+\label{sec:rlmc-diy-tuning}
+
+完整代码里有些参数须按你的机器人调，按优先级排序（P0 必须训练前用 zero agent 确认，P1 可在 500 iter 快速训练中迭代，P2--P3 在大规模训练中优化）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{3.4cm}p{3.6cm}@{}}
+\toprule
+优先级 & 参数 & 调优方法 & 错了会怎样 \\
+\midrule
+P0 & 初始高度 \verb|pos[2]| & viewer 手动测 & 弹飞/穿地 \\
+P0 & 初始关节角 & zero agent 测 & 倒塌 \\
+P1 & stiffness/damping & 重力矩分析 & 弱$\to$倒、强$\to$振荡 \\
+P1 & action.scale & random agent 测 & 大$\to$冲击、小$\to$表达力不足 \\
+P2 & reward.weight & 500 iter 快训 & 行为偏移 \\
+P2 & dt/decimation & 自由落体测 & 物理不稳定 \\
+P3 & DR ranges & sim2sim 验证 & 窄$\to$sim2real gap、宽$\to$不收敛 \\
+P3 & learning\_rate & KL 监控 & 大$\to$KL spike、小$\to$慢 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[参数调优的优先级 $\equiv$ 修车的顺序]\label{ins:rlmc-diy-carfix}
+参数调优有严格的优先级，违背它是 DIY 新手最常见的低效来源。类比修车：先确保轮子装对（P0：初始高度/关节角），再调悬挂与刹车（P1：PD 参数/action scale），然后优化发动机（P2：reward 权重/步长），最后做空气动力学微调（P3：DR/LR）。\textbf{你不会在轮子还没装好时就去风洞做空气动力学测试}——但很多人在环境搭建里做的正是这件事：初始化都不对（zero agent 都站不住）就开始调 reward 权重。这条洞察把抽象的“先验证后训练”落成一个\emph{可执行的优先级}：任何时候卡住，先回到当前最低优先级里\emph{尚未确认正确}的那一项，而不是去碰更高层的旋钮。
+\end{insight}
+
+\subsection{常见陷阱}
+\label{sec:rlmc-diy-fullcode-pitfalls}
+
+\begin{pitfall}[复制整段代码后忘记改 joint names]
+\textbf{错误描述}：照抄完整代码却没改正则里的关节名。\textbf{现象后果}：action 引用不存在的关节，action 维度变 0，策略没有动作输出。\textbf{根本原因}：正则与你的 MJCF 关节名不匹配。\textbf{正确做法}：复制后第一件事就是在你的 MJCF 里搜出所有 joint name，逐一更新代码中的正则；并打印 action 维度确认。
+\end{pitfall}
+
+\begin{pitfall}[ContactSensorCfg 的 body\_names 与 MJCF 不匹配]
+\textbf{错误描述}：\verb|ContactSensorCfg(body_names=".*_foot")| 但 MJCF 里脚 body 不叫这个名。\textbf{现象后果}：feet\_air\_time reward 恒返回零（检测不到脚接触），策略学不出步态。\textbf{根本原因}：传感器引用了不存在的 body。\textbf{正确做法}：打印 \verb|model.geom_bodyid| 与 body names 映射，确认 ContactSensorCfg 引用的 body 确实存在。
+\end{pitfall}
+
+\begin{practice}[完整代码综合]
+\begin{enumerate}
+\item \textbf{[实践]} 用本节完整代码，把 robot MJCF 换成 MuJoCo Menagerie 的 Unitree Go2，更新 joint names 与 init\_state，跑通训练并达到 $80\%$ 的速度跟踪成功率。\emph{验收}：训练曲线 + play 视频。
+\item \textbf{[扩展]} 在完整代码上加 terrain curriculum（参考 \cref{ch:rlmc-quadloco}）：Phase 0 平地、Phase 1 随机台阶，实现 CurriculumCfg 并验证阶段推进。\emph{验收}：阶段推进日志。
+\item \textbf{[对比]} 分别用 PPO 默认配置与一组更宽 critic（actor [256,256,128]、critic [512,256,128]、entropy 0.005）训 5000 iter，比 reward 曲线与最终行为，说清哪个更好、为什么。\emph{验收}：两组曲线 + 归因。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{从零到第一次成功训练的典型时间线}
+\label{sec:rlmc-diy-timeline}
+
+下面是一位有 \cref{ch:rlmc-quadloco}--\cref{ch:rlmc-multimodal} 实战经验的读者，为一台\emph{新}四足搭自定义环境的典型时间投入。若你明显慢于此，说明某步卡住了——回 \cref{sec:rlmc-diy-bugs} 的排查总表定位。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{4.4cm}p{3.4cm}p{3.0cm}@{}}
+\toprule
+时间 & 任务 & 预期产出 & 常见卡点 \\
+\midrule
+D1 上午 & MJCF 导入 + viewer 验证 & 能在 viewer 站立 & 初始高度/关节角 \\
+D1 下午 & EntityCfg+SceneCfg+smoke & env 构造成功、obs 有值 & joint 正则不匹配 \\
+D2 上午 & Actions+Obs+zero agent & zero 下不倒塌 & PD stiffness 不够 \\
+D2 下午 & Rewards+Term+random agent & 有 termination、reward 有方差 & reward 常数化 \\
+D3 上午 & Events+Commands+首训 500 iter & reward 有上升趋势 & command 范围太大 \\
+D3 下午 & 观察 viewer+调权重+训 5k iter & 基本行走 & 原地抖动 \\
+D4 & DR 引入 + 10k iter & 鲁棒速度跟踪 & DR 范围过宽 \\
+D5 & sim2sim 验证 + ONNX 导出 & 双框架行为一致 & 跨框架接触差异 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{若你是第一次做自定义环境}，实际时间可能是上表的 2--3 倍——这完全正常，多出的时间大多花在理解框架 API 与排 \cref{sec:rlmc-diy-bugs} 的 bug 上。第二次会快 3--5 倍，因为大部分 bug 你已见过一次。这和学开车一样：第一次要有意识地想每个操作（看后视镜、松离合、打方向），做过 3--5 次后大部分配置你能直接写对，只在关键参数（init\_state、PD stiffness）上用 zero agent 验证。
+
+% ════════════════════════════════════════════════════════════════
+\section{常见误解汇总}
+\label{sec:rlmc-diy-myths}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.6cm}p{8.0cm}@{}}
+\toprule
+误解 & 纠正 \\
+\midrule
+“自定义环境难在代码量” & 难在\emph{耦合}：300--500 行配置，但每行与物理/任务语义紧耦合，错了不报错只“不收敛”（\cref{ins:rlmc-diy-coupling}）。 \\
+“MuJoCo 里能跑就够了，Isaac Lab 以后再说” & 双框架 API 差异（四元数顺序、frame 约定）会让同一“正确”配置行为不同；从一开始就维护双版本、用 sim2sim 交叉验证。 \\
+“注册完就能训练” & 必须先跑验证三步走（smoke/zero/random）；zero agent 站不住时任何算法都学不出（\cref{ins:rlmc-diy-zeroagent}）。 \\
+“reward 上升=行为正确” & 可能是 reward hacking 的捷径；每 500 iter 用 viewer 看一次行为。 \\
+“EventManager 有自动 step 模式” & 没有；逐步扰动放 action/observation term 或 actuator 延迟，不能靠自动 step event（\cref{sec:rlmc-diy-events-mode}）。 \\
+“HOVER/HUSKY 代码能直接用” & 它们针对特定机器人/任务优化；学架构模式、在你的任务里重写。 \\
+“先排算法/超参” & $80\%$ 的不收敛是环境 bug；先过 Phase A+B checklist 再碰超参（\cref{ins:rlmc-diy-debugprinciple}）。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{小结}
+\label{sec:rlmc-diy-summary}
+
+本章把整部的零件收束成“从零搭一个全新环境”的方法论与端到端流程。一句话浓缩：\textbf{自定义环境搭建的核心困难不在写代码，而在确保每一行配置都与物理模型和任务语义正确对齐}；DVI（分治-验证-集成）是应对它的系统方法——先让每个组件独立正确，再组合成完整系统。
+
+\paragraph{术语速查。}\emph{DVI}：分治-验证-集成，逐模块独立验证再集成。\emph{验证三步走}：smoke test（不报错无 NaN）$\to$ zero agent（默认姿态站稳）$\to$ random agent（奖励/存活有方差、有终止）。\emph{配置即环境}：mjlab/Isaac Lab 不重写 step，环境由 dataclass 配置自动编排。\emph{extension 模式}：Isaac Lab 推荐的独立包开发方式（版本隔离/协作/可发布）。\emph{Manager-Based vs Direct}：模块化复用 vs 完全控制 step 的两种 workflow。\emph{mask-conditioned distillation}：HOVER 用 mask 选跟踪部位、单策略覆盖多模态。\emph{equality constraint}：MuJoCo 表达器具运动学耦合的约束（HUSKY 的 kingpin）。\emph{baked-in normalization}：ONNX 导出时把观测 mean/std 固化进图。
+
+\begin{center}
+\small
+\begin{tabular}{@{}clp{5.4cm}c@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & DVI 方法论：分治-验证-集成 & \cref{sec:rlmc-diy-dvi} & 中 \\
+2 & mjlab 六步法：Entity$\to$Scene$\to$Manager$\to$register & \cref{sec:rlmc-diy-mjlab} & 中 \\
+3 & 验证三步走：smoke/zero/random & \cref{sec:rlmc-diy-threestep} & 中 \\
+4 & Isaac Lab extension + HOVER 目录范式 & \cref{sec:rlmc-diy-isaac} & 中 \\
+5 & Manager-Based vs Direct 选择 & \cref{sec:rlmc-diy-isaac-workflow} & 中 \\
+6 & 端到端九步流水线 + 双框架一致性 & \cref{sec:rlmc-diy-pipeline} & 较高 \\
+7 & EventsCfg/CommandsCfg 设计 & \cref{sec:rlmc-diy-events} & 中 \\
+8 & HOVER（mask 蒸馏）/ HUSKY（equality 耦合） & \cref{sec:rlmc-diy-cases} & 较高 \\
+9 & 十大 bug + 不收敛决策树 & \cref{sec:rlmc-diy-bugs} & 较高 \\
+10 & 完整代码 + 三阶段 checklist & \cref{sec:rlmc-diy-fullcode} & 中 \\
+11 & 参数调优优先级 P0$\to$P3 & \cref{sec:rlmc-diy-tuning} & 中 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+教学路径回顾：\cref{sec:rlmc-diy-dvi} 立方法论（DVI）$\to$ \cref{sec:rlmc-diy-mjlab}/\cref{sec:rlmc-diy-isaac} 在双框架实践 $\to$ \cref{sec:rlmc-diy-pipeline} 扩成端到端九步 $\to$ \cref{sec:rlmc-diy-events} 补两个易忽视的 Manager $\to$ \cref{sec:rlmc-diy-cases} 用 HOVER/HUSKY 两个顶会案例展示研究级实践 $\to$ \cref{sec:rlmc-diy-bugs} 系统化排错 $\to$ \cref{sec:rlmc-diy-fullcode} 给可复制的完整模板。不同水平的读者都能找到切入点。
+
+% ════════════════════════════════════════════════════════════════
+\section{延伸阅读}
+\label{sec:rlmc-diy-further}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{6.2cm}p{7.2cm}@{}}
+\toprule
+资料（简称 + 出处） & 一句话教什么 \\
+\midrule
+HOVER（He 等，ICRA 2025，arXiv:2410.21229）\,\cite{he2025hover} & mask-conditioned teacher$\to$student 蒸馏；Isaac Lab extension 标杆，本章范式来源。 \\
+HUSKY（Han 等，RSS 2026，arXiv:2602.03205）\,\cite{husky2026} & mjlab + AMP + equality constraint；器具耦合建模与分阶段训练的研究范例。 \\
+mjlab（Zakka 等，arXiv:2601.22074）\,\cite{mjlab2026} & 把 Isaac Lab manager-based API 接到 MuJoCo-Warp 的轻量框架（本章 mjlab 侧底座）。 \\
+Isaac Lab（Mittal 等）\,\cite{mittal2025isaaclab} & 多物理后端、Manager-Based 的机器人学习平台（本章 Isaac Lab 侧底座、转换工具出处）。 \\
+PPO（Schulman 等，2017，arXiv:1707.06347）\,\cite{schulman2017ppo} & 本章所有训练配置背后的策略优化算法。 \\
+Rudin 等（CoRL 2021，arXiv:2109.11978）\,\cite{rudin2021minutes} & legged\_gym + 地形 curriculum；GPU 并行分钟级训练，本章 curriculum 思路来源。 \\
+DAgger（Ross 等，AISTATS 2011）\,\cite{ross2011dagger} & 数据集聚合式模仿学习，HOVER student 蒸馏的理论基础。 \\
+AMP（Peng 等，SIGGRAPH 2021，arXiv:2104.02180）\,\cite{peng2021amp} & 判别器学动作分布而非逐帧对齐，HUSKY 推进技能的方法。 \\
+MuJoCo（Todorov 等，IROS 2012）\,\cite{todorov2012mujoco} & 凸优化软接触物理引擎，本章 MJCF 建模与 equality constraint 的底层。 \\
+MuJoCo Menagerie（DeepMind）\,\cite{menagerie2022} & 高质量 MJCF 模型库（Go2/G1/ANYmal 等），练习用机器人来源。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{阅读建议。}只读一个外部参考的话，读 HOVER 仓库——目前 Isaac Lab extension 模式最佳工程范例；用 mjlab 则读 HUSKY 仓库——它示范了如何用 mjlab 做复杂器具建模与多阶段训练。两个仓库 README 都含安装/训练/评估的完整命令。
+
+% ════════════════════════════════════════════════════════════════
+\section{故障排查手册}
+\label{sec:rlmc-diy-trouble}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{4.0cm}p{3.6cm}p{4.2cm}l@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+\verb|register_mjlab_task| 后报 KeyError & task\_id 拼错或注册模块未 import & \verb|list-envs| 看已注册列表；查 import 路径与 \verb|__init__.py| & \cref{sec:rlmc-diy-mjlab} \\
+MJCF 编译报 undefined joint & actuator 引用不存在的关节 & 打印 MJCF 全部 joint name 对照 actuator 正则 & \cref{sec:rlmc-diy-mjlab} \\
+Isaac Lab 报 prim not found & \verb|prim_path| 漏 \verb|{ENV_REGEX_NS}| & GUI 看 USD prim 树对照 & \cref{sec:rlmc-diy-isaac} \\
+smoke 过但 zero agent 倒 & PD stiffness 不足或 init 不平衡 & 比重力矩 vs max PD；调 stiffness/init & Bug 2 \\
+random reward 全零 & reward 引用错变量或返回错维度 & 逐项打印 reward；查返回 \verb|[B]| & Bug 4 \\
+训练第 1 步 NaN & obs 有除零 & 逐项打印 obs；加 \verb|clamp(min=1e-8)| & Bug 6 \\
+双框架 reward 差 $>30\%$ & 引擎接触模型差异 & 跑一致性脚本对比 zero base height & \cref{sec:rlmc-diy-pipe-dual} \\
+5k iter 后 reward 平坦 & reward 没和动作关联或探索不足 & 分项 reward；查 entropy；增 init\_noise\_std & Bug 4,5 \\
+ONNX 后行为随机 & 观测归一化未 baked-in & 比 PyTorch vs ONNX 输出；查 normalizer & \cref{sec:rlmc-diy-pipe-train} \\
+extension 安装后 import 失败 & \verb|setup.py| 没配好或 AppLauncher 未先初始化 & 确认 \verb|pip install -e .|；import 在 AppLauncher 之后 & \cref{sec:rlmc-diy-isaac} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{版本信息速查}
+\label{sec:rlmc-diy-versions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+组件 & 本章基于 & 备注 \\
+\midrule
+mjlab & arXiv:2601.22074 对应版本 & \verb|EntityCfg|$\to$\verb|register_mjlab_task|（私有 \verb|_REGISTRY|）；CLI \verb|uv run train/play| \\
+Isaac Lab & 2.x 主线 & extension 模式；转换工具用位置参数；RL 入口 \verb|scripts/.../rsl_rl/train.py| \\
+UniLab & \texttt{unilabsim/UniLab}（commit \texttt{99936e08}） & 异构 CPU-sim/GPU-policy；\verb|@registry.envcfg/env| 注册；后端 \verb|mujoco-uni|\,3.8.0 / \verb|motrixsim-core|\,0.8.2；CLI \verb|train --algo --task --sim| \\
+RSL-RL & 与所装 Isaac Lab/mjlab 匹配 & 本章 PPO 后端；旧字段名可能弃用 \\
+HOVER & \texttt{NVlabs/HOVER}（ICRA 2025） & 锁定其 README 指定的 Isaac Lab/定制 rsl\_rl 版本 \\
+HUSKY & \texttt{TeleHuman/humanoid\_skateboarding}（RSS 2026） & mjlab + RSL-RL；G1 23 可控 DoF \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\rebuilt{凡 task id 确切字符串、各框架字段名/默认值、\texttt{register\_mjlab\_task} 签名、HOVER/HUSKY 仓库脚本路径，均以你所装版本的 \texttt{--help} 与官方文档/仓库 README 为准；本章已对未逐字确认处加注。}
+
+\begin{finenote}
+本章为同作者 Tutorial「RL运控」Ch22 按本书「算法/方法论领路、实践兑现」主线的重构融入版。三框架对比中 UniLab 列已据实跑源码（\texttt{unilabsim/UniLab} commit \texttt{99936e08}）补齐：从零搭项目的「子类即环境」路径、双装饰器注册、reward 标量字典派发表、\texttt{domain\_rand} 字典与后端能力门控、跨后端 sim2sim 契约关卡、HORA 时序自适应蒸馏对照，以及 UniLab 真实欠缺项（无 zero agent 入口、无正定惯量 DR、无 tracking\_sigma 课程、无 learned-actuator、AMP/通用 mask 蒸馏需自实现）均如实标注，未编造。关键 API/版本/命令/论文归属经联网核对（mjlab arXiv:2601.22074、Isaac Lab 官方转换工具文档、HOVER arXiv:2410.21229、HUSKY arXiv:2602.03205、UniLab arXiv:2605.30313）：已改正源稿“HUSKY G1=29-DOF”为“23 可控 DoF”、补正 EventManager 无自动 step 模式、明确 Isaac Lab 转换工具用位置参数；并据 mjlab 1.4.0 \texttt{tasks/registry.py} 把全章 \texttt{register\_task} 勘误为源码确证的 \texttt{register\_mjlab\_task}（私有 \texttt{\_REGISTRY}、传 cfg 对象而非 entry\_point 字符串），与本部其余章一致。凡未逐字确认者均以 \rebuilt{} / \pz{待核实} 标注并列入复核清单。
+\end{finenote}

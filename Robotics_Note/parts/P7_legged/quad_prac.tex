@@ -1,0 +1,607 @@
+\chapter{实践：宇树控制框架与开源控制器}
+\label{ch:quad_prac}
+
+% \cnum（字体无关带圈数字）已上提到 common/preamble.tex，全书统一，勿在此重定义。
+
+% ════════════════════════════════════════════════════════════════
+%  实践章：四足机器人运动控制部 —— 从理论到“跑起来”的工程地图。
+%  铁律：本章遵「跳过纯工程」——框架/ROS/Gazebo/电机配置/代码细节凝练进
+%  practice 盒与实践节，不做全量推导；公式极少（混合控制 PD+前馈、单腿静力学
+%  J^T、摆动腿修正力、NMPC/WBC 标准形），理论一律 \cref 回前六章与 ch:engineering。
+%  主线 = 作者个人笔记思路「控制器不该知道自己面对仿真还是实物」（硬件抽象）；
+%  三源 = 宇树《四足机器人控制算法》(unitree_guide, ch2/ch3) + legged_control(OCS2
+%  NMPC+WBC，个人笔记 1541-2457) + A1-QP-MPC-Controller(MIT 凸 MPC 极简复刻，1525-1540)。
+%  组织策略：三框架是「教学→入门→工业」难度阶梯，非平行三段。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的工程地图表与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 你写了一个四足控制器，先在 Gazebo 里调通，再要搬到真机上跑。最坏的写法是：仿真版与真机版各写一套“读传感器/发电机”的函数，移植时把所有读写调用替换一遍。有没有办法让\emph{控制器代码一个字都不用改}，就能在仿真和真机之间切换？这背后是哪条软件设计原则？
+  \item 现代四足的电机底层只接受\emph{力矩}指令，可机器人却要同时给“期望位置、期望速度、位置刚度、速度阻尼、前馈力矩”这五个量。这五个量到底如何\emph{合成}为一个力矩送进电机？ROS 的标准关节接口（纯位置 / 纯速度 / 纯力矩）为什么传不了它们？
+  \item IMU 数据为什么\emph{不}应该走 ROS 话题（topic）送进数百赫兹的控制环？若不用话题，仿真里的 IMU、关节角、足端接触这些量要怎样才能保证“同一时间戳、完美对齐”？
+  \item 一个控制器类只定义了 \texttt{init/update/starting/stopping} 四个回调函数，它自己\emph{从不}主动循环。那么“每 1\,ms 跑一次 \texttt{update}”这件事是谁在驱动？“先读传感器、再算、再发指令”的顺序又是谁保证的？
+  \item 你用 SolidWorks 导出的精细 STL 网格直接作为机器人在仿真里的\emph{碰撞体}，结果 NMPC 求解器频繁超时、机器人在地上乱抖。问题出在哪？正确的做法是什么？
+  \item “运动学零点”“机械/传感器零点”“控制零点”是三个\emph{不同}的概念。若把它们配错，机器人一上电就抽搐乱动。你能说清这三层各指什么、它们之间靠什么映射连接吗？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}本章的核心工程哲学——\emph{控制器不应知道自己面对的是仿真还是实物}——以及它如何通过“硬件抽象层”把一份控制器代码在仿真与真机两处复用（\cref{sec:qp-philosophy}）；
+  \item \textbf{辨析}三套开源框架（\texttt{unitree\_guide} / \texttt{legged\_control} / \texttt{A1-QP-MPC}）在“控制范式、仿真切换、架构骨架”三个维度上的差异，并理解它们是“教学$\to$入门$\to$工业”的\emph{难度阶梯}而非平行三段（\cref{sec:qp-ecosystem}）；
+  \item \textbf{把}前六章的每个理论模块——单刚体动力学、足底力 QP、凸 MPC、WBC、状态估计、步态——\emph{锚定}到三套框架里的具体代码模块（关节层、单腿层、整机层、架构层），写出关节混合控制式 \cref{eq:qp-hybrid} 与单腿静力学映射 \cref{eq:qp-jacobian-force}（\cref{sec:qp-anchor}）；
+  \item \textbf{描述}硬件抽象层的两个核心概念——\emph{句柄}（指向缓冲区的指针 + 安全检查）与\emph{接口}（同类句柄的容器 + 资源声明），以及为何要自定义 \texttt{HybridJointInterface}（\cref{sec:qp-hwabs}）；
+  \item \textbf{描述}控制器“被动回调 + 主动管理器”的生命周期，以及 \texttt{read}$\to$\texttt{update}$\to$\texttt{write} 的高频调用时序与“命令非立即生效”的含义（\cref{sec:qp-lifecycle}）；
+  \item \textbf{对照}\texttt{unitree\_guide} 的 FSM（有限状态机）与 \texttt{legged\_control} 的生命周期回调两种架构骨架，并理解级联 MPC+WBC 的频率解耦（MPC 单独后台线程）（\cref{sec:qp-fsm}）；
+  \item \textbf{避开}部署一台\emph{自定义}四足时的典型工程陷阱：关节名硬编码必须一致、碰撞体用简单几何体、标准垂直构型、姿态/零点三层概念（\cref{sec:qp-pitfalls}）；
+  \item \textbf{获得}一张可操作的部署路线图（URDF$\to$xacro$\to$transmission$\to$Gazebo 插件$\to$姿态配置），并知道强化学习训练环境（Mujoco/Docker）在整张地图中的位置（\cref{sec:qp-deploy,sec:qp-rl}）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把前六章的纸面公式，落到能在仿真和真机上跑起来的代码模块}”的主线。它\emph{不}推新理论，而是把理论\emph{钉}到工程上，串联骨架是一句核心论断：\textbf{控制器不该知道自己面对仿真还是实物}。结构如下：
+
+\begin{center}
+\begin{forest} navtree
+[{宇树框架与开源控制器\\（实践：理论$\to$跑起来）}
+  [{工程哲学\\硬件抽象/动态绑定}
+    [{一份代码两处复用}] ]
+  [{三框架生态\\教学$\to$入门$\to$工业}
+    [{难度阶梯非平行}] ]
+  [{理论锚定\\六章$\to$四代码层}
+    [{关节/单腿/整机/架构}] ]
+  [{架构机理\\句柄/接口/生命周期}
+    [{FSM vs 回调}] ]
+  [{部署与陷阱\\URDF/碰撞体/零点}
+    [{RL 环境点到为止}] ]
+]
+\end{forest}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:qp-philosophy,sec:qp-ecosystem} 立住“为什么硬件抽象”与“三框架定位”，是任何读者的主干；\cref{sec:qp-anchor} 是把前六章理论\emph{对号入座}到代码的核心，写控制器前必看；\cref{sec:qp-hwabs,sec:qp-lifecycle,sec:qp-fsm} 讲清架构机理（句柄/接口/生命周期/FSM），是读懂工业级工程的钥匙；\cref{sec:qp-pitfalls,sec:qp-deploy} 是部署自定义机器人时的避坑清单与路线图，跑通现成例子后再回看；\cref{sec:qp-rl} 是“另一条腿”（强化学习），点到为止。
+
+\subsection*{前置知识桥接}
+本章把前六章的控制理论直接当作“要被部署的对象”：
+\begin{itemize}
+  \item \cref{ch:quad_mpc}（单刚体 MPC，本部范本章）给出凸 MPC 的全部推导。本章只关心它\emph{怎么落地}：\texttt{A1-QP-MPC} 是它的极简复刻，\texttt{legged\_control} 把它升级为带预测时域的 NMPC（\cref{sec:qp-anchor}）；
+  \item \cref{ch:quad_wbc}（全身控制 WBC）给出 WBC 的优先级求解。本章把它对应到 \texttt{legged\_control} 的 WBC 模块、并给出其优化变量 \cref{eq:qp-wbc}（\cref{sec:qp-anchor}）；
+  \item \cref{ch:quad_est}（足式状态估计）给出 MPC 的“当前状态” $\boldsymbol{x}(0)$ 的来源；本章只点明仿真里可用 \emph{cheater}（Gazebo 真值）或卡尔曼滤波二选一（\cref{sec:qp-deploy}）；
+  \item \cref{ch:engineering}（工程实践附录）承接本章\emph{有意略过}的所有纯工程细节：电机 FOC/减速比换算、报文协议、ROS/Gazebo 安装、编译部署、网络配置。本章遇到这些处一律 \cref{ch:engineering}，正文不展开；
+  \item \cref{ch:rl-basic}（强化学习导论）是 \cref{sec:qp-rl} 所指“另一条腿”的理论入口，本章只给可复现的环境入口（Mujoco/Docker）。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含部署路线图与全部陷阱） & 3--4 小时 & 首次要把四足控制器跑上仿真/真机 \\
+速读（只读工程哲学 + 理论锚定表） & 1 小时 & 已读完前六章、想对齐“公式$\to$代码” \\
+速查（只看工程地图表与避坑清单） & 15 分钟 & 部署时回来查“哪段理论对应哪个模块” \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+旋转矩阵记 $\mathbf{R}\in\SO(3)$，机身$\to$世界记 $\mathbf{R}_{sb}$（本书右扰动主线下 $\mathbf{R}_{bs}=\mathbf{R}_{sb}^\top$）。
+关节角向量 $\boldsymbol{q}$、关节力矩 $\boldsymbol{\tau}$；足端力 $\boldsymbol{F}$（足端对地）或 $\boldsymbol{f}$（地对足，世界系 $\boldsymbol{f}_{is}$）。
+腿雅可比 $\mathbf{J}$（足端速度 $=\mathbf{J}\dot{\boldsymbol{q}}$）。
+关节混合控制的五个量记为 $(\tau_{\mathrm{ff}},p_{\mathrm{des}},\omega_{\mathrm{des}},k_p,k_d)$。
+代码标识符、文件名、类名用等宽体（如 \texttt{LeggedController}），不进 math mode。
+本章\emph{有意不引入新数学符号}：所有理论符号沿用其所属章（\cref{ch:quad_mpc,ch:quad_wbc}）的约定；本章关心的是它们\emph{出现在哪个代码模块}。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{工程哲学：控制器不该知道自己面对仿真还是实物}
+\label{sec:qp-philosophy}
+
+\paragraph{动机：前六章给了闭环，但“怎么变成电机上的力矩”仍是悬空的。}
+读完前六章，你已经握有一条完整的理论闭环：单刚体动力学（\cref{ch:quad_mpc}）$\to$ 足底力 QP / 凸 MPC（\cref{ch:quad_mpc}）$\to$ 全身控制 WBC（\cref{ch:quad_wbc}）$\to$ 状态估计（\cref{ch:quad_est}）$\to$ 步态（\cref{ch:quad_gait}）。但当你真的坐到电脑前，面对的却是一个朴素而尖锐的问题：\textbf{这些公式，最终如何变成电机轴上的那个力矩值？} 本章不再推新公式，而是给出三套真实开源工程的“工程地图”，把每个理论模块对应到具体的代码文件与类，让你从“会推导”走到“跑得起来”。
+
+\paragraph{反面：最朴素的写法——为仿真和实物各写一套。}
+设想你要把控制器先在仿真里调通，再搬到真机。最直觉、也最糟的写法是：仿真版写一套 \texttt{readSim()/writeSim()}、真机版写一套 \texttt{readReal()/writeReal()}，控制算法里到处穿插 \texttt{if (是仿真) \dots else \dots}。等到要移植，你得把散落在各处的读写调用\emph{逐一}替换\cite{unitree2023quadruped}。这不仅工作量大、易错，更糟的是\emph{控制算法与硬件细节被焊死在了一起}——任何一方改动都牵连另一方。
+
+\begin{insight}[全章主线·控制器不该知道自己面对仿真还是实物]\label{ins:qp-abstraction}
+本章的串联骨架是一句话：\textbf{控制器不应该知道自己面对的是仿真还是实物}。控制器只和一个\emph{标准接口}（ROS 生态里叫 \texttt{hardware\_interface}）通信——它从接口“读到关节角、IMU、接触”，向接口“写下关节命令”，至于接口的另一端是 Gazebo 仿真器还是真实电机，控制器\emph{一无所知、也不需要知道}。仿真器（\texttt{legged\_gazebo}）的职责，就是\emph{假扮}成一套真实硬件：它实现同一套读写接口，把 Gazebo 的物理量喂进去、把命令取出来施加到仿真物体上。于是\textbf{一份控制器代码，仿真和真机两处复用}，移植时控制算法一个字都不用改\cite{unitree2023quadruped}。这正是软件工程“依赖倒置 / 面向接口编程”原则在机器人控制栈里的落地，是理解后面所有架构设计（句柄、接口、插件、生命周期）的总纲。
+\end{insight}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=5mm and 14mm,
+  ctrl/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=main!10, draw=main!60!black, minimum height=1.2cm, text width=2.6cm},
+  hw/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=second!10, draw=second!60!black, minimum height=1.0cm, text width=2.2cm},
+  end/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=gray!8, minimum height=1.0cm, text width=2.0cm},
+  ln/.style={<->, thick, gray!55!black}]
+  \node[ctrl] (ctrl) {\textbf{控制器}\\（MPC/WBC/FSM）\\\emph{不知道下游是谁}};
+  \node[hw, right=of ctrl] (iface) {\texttt{hardware}\\\texttt{\_interface}\\标准抽象层};
+  \node[end, above right=of iface] (sim) {\texttt{legged\_gazebo}\\仿真器\\（假扮硬件）};
+  \node[end, below right=of iface] (real) {真实电机\\+ IMU\\（真机）};
+  \draw[ln] (ctrl)--node[above,font=\scriptsize]{读/写}(iface);
+  \draw[ln] (iface.east)--(sim.west);
+  \draw[ln] (iface.east)--(real.west);
+  \node[font=\scriptsize, gray!60!black, align=center] at ($(sim)!0.5!(real)+(2.6,0)$) {同一套接口\\两种实现};
+\end{tikzpicture}
+\caption{本章主线（\cref{ins:qp-abstraction}）：控制器只面向标准接口 \texttt{hardware\_interface} 编程，对“另一端是仿真还是真机”一无所知。\texttt{legged\_gazebo} 实现同一套接口、假扮硬件，于是控制器代码一份、仿真与真机两处复用。}
+\label{fig:qp-abstraction}
+\end{figure}
+
+\begin{insight}[严格分离实时与非实时任务]\label{ins:qp-realtime-split}
+与主线配套的第二条原则：\textbf{控制环路内部不做 ROS 通信}。ROS 的话题/服务带来网络栈、序列化、异步调度的开销与抖动，对一个要跑数百赫兹、且\emph{周期必须恒定}的实时控制环来说是不可接受的。因此工程上把任务严格切成两层：实时层（高频控制环：读传感器$\to$算控制$\to$发指令）内部\emph{只用共享内存式的句柄直接读写}、不碰 ROS；只有\emph{对外}的、低频的、可容忍延迟的交互（如接收操作者的目标点、状态可视化）才走 ROS\cite{unitree2023quadruped}。这条原则解释了本章后面一连串设计：为什么 IMU 不走话题（\cref{sec:qp-hwabs}）、为什么 MPC 要单开后台线程（\cref{sec:qp-fsm}）。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{三套开源框架的生态定位：一条难度阶梯}
+\label{sec:qp-ecosystem}
+
+把前六章理论“跑起来”，社区里有三套常被引用的开源工程。本节给出它们的定位，并点明本章组织全章的核心策略：\textbf{它们不是平行的三段，而是“教学$\to$入门$\to$工业”的一条难度阶梯}。
+
+\begin{itemize}
+  \item \textbf{\texttt{unitree\_guide}}\cite{unitree2023quadruped}：\emph{教学优先}。基于 ROS melodic / Gazebo9，用面向对象（OOP）三核心 + 有限状态机（FSM）搭起最易懂的架构骨架；控制范式是\emph{瞬时 QP 足底力分配}（无 MPC、无预测，相当于 \cref{ch:quad_mpc} 的 $N_p{=}1$ 退化）加简化逆动力学。它的价值是把“架构思想”和“关节/单腿一手公式”讲得最透。
+  \item \textbf{\texttt{A1-QP-MPC-Controller}}\cite{dicarlo2018cheetah}：\emph{入门级 MPC 范例}。是 MIT Cheetah 3 凸 MPC（\cref{ch:quad_mpc} 的主角范式）的极简复刻，主程序 \texttt{MainGazebo.cpp} 用\emph{双线程}（力控线程 + 主更新流程）把“凸 MPC 怎么跑起来”剥到最小可读。适合在读懂理论后，第一次看“MPC 工程长什么样”。
+  \item \textbf{\texttt{legged\_control}}\cite{sleiman2021unified}：\emph{工业级}。基于 OCS2 框架，上层是带预测时域的\emph{非线性 MPC（NMPC）}（质心动力学 + 多重打靶 SQP + HPIPM 求解子 QP），下层是\emph{分层/加权 WBC}\cite{bellicoso2016whole}；并提供完整的硬件抽象层、控制器生命周期、URDF/xacro 部署、碰撞体简化、零点配置。它是本章“架构机理”与“部署陷阱”两节的主要素材源。
+\end{itemize}
+
+\begin{insight}[三框架是难度阶梯，不是平行三段（全章组织策略）]\label{ins:qp-ladder}
+本章把三套框架\emph{交织}讲、而非各讲一段，依据是它们形成一条天然的难度阶梯：\textbf{\texttt{unitree\_guide} 给最易懂的架构思想（OOP/FSM）+ 最完整的关节/单腿一手公式；\texttt{A1-QP-MPC} 给最小可读的 MPC 工程范例；\texttt{legged\_control} 给工业级 NMPC+WBC 的真实部署细节（硬件抽象 / 生命周期 / URDF / 碰撞 / 零点）}。三者在“控制范式”这一维上恰好是“预测能力”的递进：瞬时 QP（$N_p{=}1$）$\to$ 凸 MPC $\to$ NMPC。学习时按“教学$\to$入门$\to$工业”拾级而上，每一级只比上一级多扛一点复杂度，是把三源融成一张地图的关键。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{三套开源框架对照（本章融合写法的依据，\cref{ins:qp-ladder}）}
+\begin{tabular}{p{0.15\textwidth} p{0.25\textwidth} p{0.25\textwidth} p{0.21\textwidth}}
+\toprule
+维度 & \texttt{unitree\_guide}\cite{unitree2023quadruped} & \texttt{legged\_control}\cite{sleiman2021unified} & \texttt{A1-QP-MPC}\cite{dicarlo2018cheetah} \\
+\midrule
+控制范式 & 瞬时 QP 足底力分配（无预测）+ 简化逆动力学 & NMPC（OCS2/SQP/HPIPM）+ 分层 WBC & 凸 MPC（Cheetah 3 复刻）\\
+预测能力 & $N_p{=}1$（退化）& 完整预测时域 & 短预测时域 \\
+仿真/实物切换 & OOP 动态绑定：\texttt{IOInterface*} 指基类、指向 \texttt{IOROS}/\texttt{IOSDK} & 硬件抽象插件：\texttt{LeggedHWSim} 假扮硬件、控制器不知情 & 单一 Gazebo 主程序、双线程 \\
+架构骨架 & FSM（Passive/FixedStand/Trotting\dots），每态四函数 & 控制器生命周期 init/update/starting/stopping + 管理器 & 双线程（力控 + 主更新）\\
+关节命令 & \texttt{MotorCmd\{mode,q,dq,tau,Kp,Kd\}}，式 \cref{eq:qp-hybrid} & \texttt{HybridJointInterface.setCommand($\cdot$)}，底层 \texttt{EffortJointInterface} & \texttt{update\_foot\_forces\_grf}$\to$\texttt{send\_cmd} \\
+部署门槛 & ROS melodic/Gazebo9，教学最低 & Docker + OCS2 重依赖，工业级 & 极简，入门 \\
+定位 & 教学 & 工业 & 入门 \\
+\bottomrule
+\end{tabular}
+\label{tab:qp-frameworks}
+\end{table}
+
+\begin{insight}[同一哲学的两种实现：虚函数 vs 插件]\label{ins:qp-two-impl}
+\cref{ins:qp-abstraction} 的“仿真/实物切换”在两套框架里有两种实现，恰好对应 OOP 的两种多态机制。\texttt{unitree\_guide} 用\emph{运行时虚函数动态绑定}：定义一个抽象基类 \texttt{IOInterface}，派生出 \texttt{IOROS}（Gazebo）与 \texttt{IOSDK}（真机），控制器持有一个基类指针 \texttt{IOInterface* ioInter}，运行时指向谁、就调谁的 \texttt{sendRecv()}。\texttt{legged\_control} 则用 ROS 的\emph{插件机制}：把 \texttt{LeggedHWSim}（仿真硬件）做成一个可加载插件，启动时按配置加载哪一个，控制器经由统一的 \texttt{hardware\_interface} 访问，同样不知情。\textbf{两种机制、同一哲学}——这正是 \cref{tab:qp-frameworks} 第三行的含义。
+\end{insight}
+
+\begin{codebox}[C++]{unitree\_guide 的运行时动态绑定（核心 3 行示意）}
+// 抽象基类: 控制器只持有它, 不知道下游是仿真还是真机
+IOInterface* ioInter;          // 基类指针 (依赖倒置)
+ioInter = new IOROS();         // 仿真: 指向 Gazebo 实现 (或 new IOSDK() 真机)
+ioInter->sendRecv(&cmd,&state);// 运行时多态: 调到哪个实现, 控制器不关心
+\end{codebox}
+
+% ════════════════════════════════════════════════════════════════
+\section{理论锚定：把前六章钉到代码的四个层}
+\label{sec:qp-anchor}
+
+本节是全章的“对号入座”表：把前六章的理论模块，按\emph{关节层$\to$单腿层$\to$整机层$\to$架构层}四个抽象层，逐一锚定到代码。这里收录\emph{极少数}非看不可的一手公式（关节混合控制、单腿静力学、摆动腿修正力），其余理论一律交叉引用回所属章。
+
+\subsection{关节层：混合控制 PD + 前馈}
+\label{subsec:qp-joint}
+
+四足的每个关节电机底层\emph{只}接受力矩目标，但机器人控制要同时给“期望位置、期望速度、前馈力矩”等多个量。宇树的关节电机采用\textbf{混合控制}：用一个关节级 PD 把位置/速度偏差折算成力矩，再叠加一个前馈力矩\cite{unitree2023quadruped}：
+\begin{equation}
+  \tau \;=\; \tau_{\mathrm{ff}} \;+\; k_p\,(p_{\mathrm{des}}-p) \;+\; k_d\,(\omega_{\mathrm{des}}-\omega).
+  \label{eq:qp-hybrid}
+\end{equation}
+其中 $\tau_{\mathrm{ff}}$ 为前馈力矩，$p_{\mathrm{des}},\omega_{\mathrm{des}}$ 为期望角度 / 角速度，$p,\omega$ 为实测值，$k_p$ 为位置刚度、$k_d$ 为速度阻尼。这一条看似简单，却是整个控制栈“最后一公里”的标准接口：上层 MPC/WBC 算出的力或加速度，最终都要落成\cref{eq:qp-hybrid} 的五个量 $(\tau_{\mathrm{ff}},p_{\mathrm{des}},\omega_{\mathrm{des}},k_p,k_d)$ 送进电机\cite{unitree2023quadruped}。
+
+\begin{note}[转子参量与关节命令勿混]
+\cref{eq:qp-hybrid} 是标准的“PD + 前馈”力矩合成律，三项分别是前馈、位置反馈、速度反馈。需要区分两类参量：电机底层的参量针对\emph{转子}（含减速比），而控制器下发的关节命令针对\emph{关节}（无需换算减速比），二者不可混用；减速比与 FOC 换算见 \cref{ch:engineering}。
+\end{note}
+
+\begin{insight}[为何要自定义 HybridJointInterface]\label{ins:qp-hybrid-iface}
+\cref{eq:qp-hybrid} 直接解释了 \texttt{legged\_control} 里一个看似多余的设计。ROS 的标准关节命令接口只有三种单值形态：纯位置（\texttt{PositionJointInterface}）、纯速度、纯力矩（\texttt{EffortJointInterface}）——\emph{任何一种都传不了\cref{eq:qp-hybrid} 的五个量}。现代四足偏偏要一次性下发这五个量，于是 \texttt{legged\_control} 自定义了一个 \texttt{HybridJointInterface}，其 \texttt{setCommand($p_{\mathrm{des}},\omega_{\mathrm{des}},k_p,k_d,\tau_{\mathrm{ff}}$)} 一次性接收五个量。但要注意：\textbf{底层最终仍是力矩控制}——硬件层把这五个量按\cref{eq:qp-hybrid} 合成一个 $\tau$，经 \texttt{EffortJointInterface} 送进电机。自定义接口不是“另起炉灶”，而是“在标准力矩接口之上包了一层混合控制的语义”。
+\end{insight}
+
+\begin{note}[退化模式：纯阻尼安全姿态]\label{note:qp-damping}
+\cref{eq:qp-hybrid} 的一个常用退化是\emph{阻尼模式}：取 $k_p{=}0$、$\tau_{\mathrm{ff}}{=}0$、$p_{\mathrm{des}}{=}\omega_{\mathrm{des}}{=}0$、$k_d$ 取一中等正值（宇树示例取 $k_d{=}8$），则 $\tau=-k_d\,\omega$，即纯速度负反馈——关节像泡在黏液里，缓慢松垮地落下\cite{unitree2023quadruped}。这是 FSM 里 \texttt{Passive}（被动）态的实现，作为上电/急停后的安全姿态。
+\end{note}
+
+\subsection{单腿层：静力学 $\mathbf{J}^\top$ 映射与摆动腿修正力}
+\label{subsec:qp-leg}
+
+上层算出的是\emph{足端力}，电机能控的是\emph{关节力矩}，二者由腿雅可比 $\mathbf{J}$ 连接。由虚功原理 $\boldsymbol{\tau}^\top\dot{\boldsymbol{q}}=\boldsymbol{F}^\top\mathbf{J}\dot{\boldsymbol{q}}$ 对任意 $\dot{\boldsymbol{q}}$ 成立，立得单腿\textbf{静力学映射}\cite{unitree2023quadruped}：
+\begin{equation}
+  \boldsymbol{\tau}=\mathbf{J}^\top\boldsymbol{F},
+  \qquad
+  \boldsymbol{F}=\mathbf{J}^{-\top}\boldsymbol{\tau},
+  \label{eq:qp-jacobian-force}
+\end{equation}
+其中 $\boldsymbol{F}$ 是足端\emph{对地}作用力，$\mathbf{J}^{-\top}:=(\mathbf{J}^\top)^{-1}$。若改用\emph{地对足}的反作用力 $\boldsymbol{f}$，则差一个负号：$\boldsymbol{\tau}=-\mathbf{J}^\top\boldsymbol{f}$。在世界系下，把 QP/MPC 输出的世界系足底力 $\boldsymbol{f}_{is}$ 转到关节力矩，即\cite{unitree2023quadruped}
+\begin{equation}
+  \boldsymbol{\tau}_i=-\mathbf{J}_i^\top\,\mathbf{R}_{sb}^\top\,\boldsymbol{f}_{is},
+  \label{eq:qp-grf-to-torque}
+\end{equation}
+这正是“足底力 QP/MPC 输出 $\to$ 电机指令”的最后一公里（\cref{ch:quad_mpc} 平衡控制器的式同此）。雅可比 $\mathbf{J}$ 的来历见 \cref{ch:quad_kin}。
+
+\begin{note}[足底力转力矩的逐步换算]
+\cref{eq:qp-grf-to-torque} 的完整链条为 $\boldsymbol{\tau}_i=-\mathbf{J}_i^\top\boldsymbol{f}_{ib}=-\mathbf{J}_i^\top\mathbf{R}_{bs}\,\boldsymbol{f}_{is}=-\mathbf{J}_i^\top\mathbf{R}_{sb}^\top\boldsymbol{f}_{is}$：先把世界系足底力 $\boldsymbol{f}_{is}$ 经 $\mathbf{R}_{bs}=\mathbf{R}_{sb}^\top$ 转到机身系得 $\boldsymbol{f}_{ib}$，再由 \cref{eq:qp-jacobian-force} 折算成关节力矩。$\mathbf{R}_{sb}$（机身$\to$世界）与本书右扰动主线一致，无需换算。
+\end{note}
+
+摆动腿（不触地）无地面反力，仅靠关节角跟踪足端轨迹时误差难修；故在\emph{笛卡尔空间}对足端再加一层 PD，得到一个\emph{虚拟修正力}\cite{unitree2023quadruped}：
+\begin{equation}
+  \boldsymbol{f}_d=\mathbf{K}_p\,(\boldsymbol{p}_{0d}-\boldsymbol{p}_{0f})+\mathbf{K}_d\,(\dot{\boldsymbol{p}}_{0d}-\dot{\boldsymbol{p}}_{0f}),
+  \label{eq:qp-swing-force}
+\end{equation}
+其中 $\boldsymbol{p}_{0d},\boldsymbol{p}_{0f}$ 为足端期望 / 实测位置（基座系），$\mathbf{K}_p,\mathbf{K}_d$ 为正定对角阵。$\boldsymbol{f}_d$ 再经 \cref{eq:qp-jacobian-force} 折算成关节力矩 $\boldsymbol{\tau}=\mathbf{J}^\top\boldsymbol{f}_d$。期望轨迹 $\boldsymbol{p}_{0d}$（摆线）由步态规划给出（\cref{ch:quad_gait}）。
+
+\begin{practice}[摆动腿调参]
+摆动腿目标速度常设 $\dot{\boldsymbol{p}}_{0d}=\mathbf{0}$，此时操纵足端会有较明显延迟，属正常现象；调参只需保证足端不抖动、位置不振荡即可，无须追求零延迟\cite{unitree2023quadruped}。
+\end{practice}
+
+\subsection{整机层：QP / 凸 MPC / NMPC / WBC}
+\label{subsec:qp-whole}
+
+整机层是三框架“控制范式”差异最大的地方，恰好沿“预测能力”铺成一条线（\cref{ins:qp-ladder}）：
+
+\paragraph{瞬时 QP 足底力分配（\texttt{unitree\_guide}）。}
+在每个控制周期\emph{只}解一个当前时刻的 QP：以各支撑腿足底力为决策变量，使合力/合力矩跟踪期望、并满足摩擦锥与幅值约束。它没有时间维度，相当于 \cref{ch:quad_mpc} 凸 MPC 取预测步数 $N_p{=}1$ 的退化。摩擦锥线性化、QP 标准形见 \cref{ch:quad_mpc}。
+
+\paragraph{凸 MPC（\texttt{A1-QP-MPC}）。}
+\cref{ch:quad_mpc} 范本章的工程落地，把单刚体动力学沿预测时域堆叠成凸 QP。\texttt{A1-QP-MPC} 的 \texttt{MainGazebo.cpp} 把它剥到最小可读（见 \cref{sec:qp-fsm} 双线程结构）。
+
+\paragraph{NMPC（\texttt{legged\_control}）。}
+工业级的非线性 MPC，OCS2 把它写成一个标准的连续时间最优控制问题\cite{sleiman2021unified}：
+\begin{equation}
+\begin{aligned}
+  \min_{\boldsymbol{u}(\cdot)}\;& \phi\big(\boldsymbol{x}(t_f)\big)+\int_{t_0}^{t_f} l\big(\boldsymbol{x}(t),\boldsymbol{u}(t),t\big)\,\mathrm{d}t\\
+  \text{s.t.}\;& \boldsymbol{x}(t_0)=\boldsymbol{x}_0,\qquad \dot{\boldsymbol{x}}(t)=\boldsymbol{f}\big(\boldsymbol{x}(t),\boldsymbol{u}(t),t\big),\\
+  & \boldsymbol{g}_1(\boldsymbol{x},\boldsymbol{u},t)=\boldsymbol{0},\quad \boldsymbol{g}_2(\boldsymbol{x},t)=\boldsymbol{0},\quad \boldsymbol{h}(\boldsymbol{x},\boldsymbol{u},t)\ge\boldsymbol{0}.
+\end{aligned}
+\label{eq:qp-nmpc}
+\end{equation}
+其状态与输入为\cite{sleiman2021unified}
+\begin{equation}
+  \boldsymbol{x}=\big[\boldsymbol{h}_{\mathrm{CoM}}^\top,\ \boldsymbol{q}_b^\top,\ \boldsymbol{q}_j^\top\big]^\top,
+  \qquad
+  \boldsymbol{u}=\big[\boldsymbol{f}_c^\top,\ \boldsymbol{v}_j^\top\big]^\top,
+  \label{eq:qp-nmpc-state}
+\end{equation}
+即 $\boldsymbol{x}$ 含质心动量 $\boldsymbol{h}_{\mathrm{CoM}}$、机体广义坐标 $\boldsymbol{q}_b$、关节角 $\boldsymbol{q}_j$；$\boldsymbol{u}$ 含地反力 $\boldsymbol{f}_c$、关节速度 $\boldsymbol{v}_j$。三类约束分别为：地反力须落在摩擦锥内（不等式 $\boldsymbol{h}$）、触地腿足端不动（等式 $\boldsymbol{g}_1$）、摆动足竖向位置满足步态曲线（等式 $\boldsymbol{g}_2$）。求解链为：质心动力学 $\to$ 多重打靶（multiple shooting）$\to$ 非线性规划 $\to$ SQP，子 QP 用 HPIPM 求解\cite{sleiman2021unified}。与 \cref{ch:quad_mpc} 的凸 MPC 相比，这是带完整预测时域、保留非线性的版本。
+
+\paragraph{WBC（\texttt{legged\_control}）。}
+下层全身控制只考虑当前时刻，把多个任务按优先级求解，优化变量为\cite{bellicoso2016whole}
+\begin{equation}
+  \boldsymbol{x}_{\mathrm{wbc}}=\big[\ddot{\boldsymbol{q}}^\top,\ \boldsymbol{f}_c^\top,\ \boldsymbol{\tau}^\top\big]^\top,
+  \label{eq:qp-wbc}
+\end{equation}
+即广义加速度、接触力、关节力矩。每个任务是对 $\boldsymbol{x}_{\mathrm{wbc}}$ 的等式/不等式约束，按优先级在“高优先级等式约束的零空间内最小化低优先级松弛”，得到严格优先级，同时满足浮动基多刚体动力学，求出全部电机最优扭矩\cite{bellicoso2016whole}。WBC 的完整理论见 \cref{ch:quad_wbc}。
+
+\begin{insight}[NMPC 与 WBC 的频率解耦在代码里的体现]\label{ins:qp-freq-decouple}
+\cref{eq:qp-nmpc} 的 NMPC 计算量远大于 \cref{eq:qp-wbc} 的 WBC，故二者频率天差地别：NMPC 低频（如 $\sim$几十 Hz）、WBC 高频（等于控制环 \texttt{update} 的频率，如 $\sim$几百 Hz）。代码里这一频率解耦由“MPC 单开后台线程”实现：\texttt{setupMrt()} 启动一个独立的 MPC 求解线程，慢慢算出最优轨迹；WBC 在每个 \texttt{update} 周期里\emph{读取 MPC 最新一次的解}并高频跟踪。这就是级联 MPC+WBC 架构的工程落点（\cref{sec:qp-fsm} 详述）。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{理论模块 $\to$ 代码模块的锚定地图（本章核心对照表）}
+\begin{tabular}{p{0.18\textwidth} p{0.22\textwidth} p{0.28\textwidth} p{0.16\textwidth}}
+\toprule
+抽象层 & 理论（前六章）& 代码落点 & 公式 \\
+\midrule
+关节层 & 关节力矩控制 & \texttt{MotorCmd} / \texttt{HybridJointInterface}；底层 \texttt{EffortJointInterface} & \cref{eq:qp-hybrid} \\
+单腿层 & 雅可比（\cref{ch:quad_kin}）、步态摆线（\cref{ch:quad_gait}）& 静力学 $\mathbf{J}^\top$、摆动腿笛卡尔 PD & \cref{eq:qp-jacobian-force,eq:qp-swing-force} \\
+整机层 & 足底力 QP / 凸 MPC（\cref{ch:quad_mpc}）& 瞬时 QP（unitree）/ 凸 MPC（A1QP）/ NMPC（legged）& \cref{eq:qp-nmpc} \\
+整机层 & WBC（\cref{ch:quad_wbc}）& \texttt{legged\_control} WBC 模块 & \cref{eq:qp-wbc} \\
+架构层 & 状态估计（\cref{ch:quad_est}）& cheater / KF（\cref{sec:qp-deploy}）& --- \\
+架构层 & ---（工程）& 硬件抽象 / 生命周期 / FSM & \cref{sec:qp-hwabs,sec:qp-lifecycle,sec:qp-fsm} \\
+\bottomrule
+\end{tabular}
+\label{tab:qp-anchor}
+\end{table}
+
+\begin{practice}[公式到 API 的对应]
+把关节混合控制 \cref{eq:qp-hybrid} 的五个量 $(\tau_{\mathrm{ff}},p_{\mathrm{des}},\omega_{\mathrm{des}},k_p,k_d)$，与 \texttt{legged\_control} 的 \texttt{setCommand($p_{\mathrm{des}},\omega_{\mathrm{des}},k_p,k_d,\tau_{\mathrm{ff}}$)} 字段、以及 \texttt{unitree\_guide} 的 \texttt{MotorCmd\{q,dq,Kp,Kd,tau\}} 字段，一一对应列表，注意它们\emph{只是同一条 \cref{eq:qp-hybrid} 的不同 API 封装}。
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{硬件抽象层：句柄与接口}
+\label{sec:qp-hwabs}
+
+\cref{ins:qp-abstraction} 的主线落到代码，核心是两个概念：\emph{句柄}（handle）与\emph{接口}（interface）。理解它们，就理解了“控制器如何与硬件零拷贝、实时地交换数据，却又不知道硬件是谁”。
+
+\begin{insight}[句柄 = 指针 + 安全检查；接口 = 句柄容器 + 资源管理]\label{ins:qp-handle-iface}
+这对概念可从“资源管理”视角理解。\textbf{句柄}是指向某关节\emph{状态/命令缓冲区}的指针，再加上必要的安全检查——它让控制器\emph{零拷贝}地直接读到最新关节角、直接写下命令，是实时交互的最小单元（不经过 ROS 序列化）。\textbf{接口}是“同一类句柄的容器”，外加资源声明与冲突检查：它负责注册有哪些关节句柄、供控制器按名查找，并在多个控制器抢同一关节时报冲突。一句话：\textbf{句柄管“一个资源怎么安全读写”，接口管“一类资源怎么注册、查找、防冲突”}。这正是 \cref{ins:qp-abstraction} 主线的实现机制——控制器经接口拿到句柄、经句柄直接读写缓冲区，对缓冲区另一端是 Gazebo 还是真机一无所知。
+\end{insight}
+
+\begin{insight}[IMU 为什么不走 ROS 话题]\label{ins:qp-imu-no-topic}
+这条是 \cref{ins:qp-realtime-split}（实时/非实时分离）最具体的体现。若 IMU 走 ROS 话题送进控制环，会引入网络传输、延迟、抖动、异步——对数百赫兹、周期须恒定的高频控制\emph{不可接受}；更糟的是 IMU 与关节角、足端接触数据来自不同话题、时间戳\emph{对不齐}。\texttt{legged\_control} 的做法是让 IMU 也走句柄/接口（\texttt{ImuSensorInterface}）：在仿真里，数据流是 \texttt{Gazebo}$\to$\texttt{readSim()}$\to$\texttt{ImuSensorInterface}（C++ 共享内存）$\to$\texttt{update()}。这样 IMU、关节角、接触力\emph{在同一次 \texttt{read} 里取出，天然对齐同一时间戳}\cite{sleiman2021unified}。
+\end{insight}
+
+\begin{pitfall}[误区：高频控制环里图省事走 ROS 话题]
+新手常把所有数据都用 ROS 话题发布/订阅，因为“ROS 教程都这么教”。但 ROS 话题是为\emph{异步、可容忍延迟}的模块间通信设计的，不是为\emph{硬实时、恒周期}的控制环设计的。一旦把 IMU/关节反馈塞进话题，控制环就会受调度抖动与序列化开销拖累，表现为间歇性失稳。正确做法：实时层用句柄/共享内存（\cref{ins:qp-imu-no-topic}），只有对外的低频交互才用 ROS（\cref{ins:qp-realtime-split}）。
+\end{pitfall}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=4mm and 11mm,
+  box/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, minimum height=0.95cm, text width=2.3cm},
+  ln/.style={->, thick, gray!55!black}]
+  \node[box, fill=gray!8] (gz) {Gazebo\\物理仿真};
+  \node[box, right=of gz, fill=second!10, draw=second!60!black] (rd) {\texttt{readSim()}\\取关节/IMU/接触};
+  \node[box, right=of rd, fill=main!10, draw=main!60!black] (if) {接口 + 句柄\\（共享内存）};
+  \node[box, right=of if, fill=third!10, draw=third!60!black] (up) {\texttt{update()}\\控制器};
+  \draw[ln] (gz)--(rd);
+  \draw[ln] (rd)--node[above,font=\scriptsize]{同一时间戳}(if);
+  \draw[ln] (if)--(up);
+  \draw[ln] (up.south) to[out=-90,in=-90] node[below,font=\scriptsize]{\texttt{write()} 写回}(if.south);
+\end{tikzpicture}
+\caption{\texttt{legged\_control} 的数据流（\cref{ins:qp-imu-no-topic}）：IMU、关节角、接触力都\emph{不}走 ROS 话题，而是经 \texttt{readSim()} 一次性取出、放进共享内存式的接口/句柄，于同一次 \texttt{update} 中被控制器读到——天然对齐同一时间戳。}
+\label{fig:qp-dataflow}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{控制器生命周期：被动回调与主动管理器}
+\label{sec:qp-lifecycle}
+
+\begin{insight}[被动控制器 vs 主动管理器]\label{ins:qp-passive-active}
+理解 \texttt{ros\_control} 架构的钥匙是一个比喻：\textbf{控制器是“被动”的，管理器是“主动”的}。\texttt{LeggedController} 这类控制器类\emph{只定义四个回调}——\texttt{init}（加载时初始化一次）、\texttt{update}（每个控制周期被调一次）、\texttt{starting}（启用瞬间）、\texttt{stopping}（停用瞬间）——它\emph{从不}自己起循环。真正“每 1\,ms 跑一次”的，是 \texttt{ControllerManager}：它是主动执行者，按固定节拍、以 \texttt{read}$\to$\texttt{update}$\to$\texttt{write} 的\emph{严格顺序}高频调用\cite{sleiman2021unified}。控制器只管“被调到时该算什么”，调度与时序交给管理器——这正是把实时调度与控制逻辑解耦的设计。
+\end{insight}
+
+\begin{insight}[read/update/write 三段：命令为什么不是立即生效]\label{ins:qp-rww}
+管理器每周期的三段各司其职：\texttt{read} 从硬件接口读入最新状态（关节角、IMU、接触）；\texttt{update} 跑控制器算法，算出命令并经句柄 \texttt{setCommand($\cdot$)} 写入\emph{命令缓冲区}；\texttt{write} 才把缓冲区里的命令\emph{真正打包下发}给电机。关键在于：\texttt{update} 里调 \texttt{setCommand} \emph{只是写缓冲区}，命令\emph{并未立即作用}到电机；要到本周期 \texttt{write} 执行时才真正生效\cite{sleiman2021unified}。理解这一点，才不会困惑“为什么我在 \texttt{update} 里改了命令、电机却像慢半拍”——它本就是设计成“先攒齐、后统一下发”。
+\end{insight}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=3mm and 9mm,
+  ph/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, minimum height=0.9cm, text width=2.0cm},
+  ln/.style={->, thick, gray!55!black}]
+  \node[ph, fill=second!10, draw=second!60!black] (r) {\texttt{read}\\读传感器};
+  \node[ph, right=of r, fill=main!10, draw=main!60!black] (u) {\texttt{update}\\控制器算\\\texttt{setCommand}};
+  \node[ph, right=of u, fill=third!10, draw=third!60!black] (w) {\texttt{write}\\打包下发电机};
+  \draw[ln] (r)--(u);
+  \draw[ln] (u)--(w);
+  \draw[ln] (w.east) to[out=20,in=160] node[above,font=\scriptsize]{下一周期（恒定节拍）}(r.west);
+  \node[font=\scriptsize, gray!55!black, align=center, below=5mm of u] {\texttt{setCommand} 只写缓冲区$\;\to\;$\texttt{write} 才真正生效（\cref{ins:qp-rww}）};
+\end{tikzpicture}
+\caption{\texttt{ControllerManager} 每个控制周期以 \texttt{read}$\to$\texttt{update}$\to$\texttt{write} 严格顺序高频调用被动的控制器（\cref{ins:qp-passive-active,ins:qp-rww}）。}
+\label{fig:qp-rww}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{架构骨架：FSM 与双线程}
+\label{sec:qp-fsm}
+
+\paragraph{\texttt{unitree\_guide} 的有限状态机（FSM）。}
+教学框架用一个 FSM 组织机器人行为：每个状态（如 \texttt{Passive} 被动、\texttt{FixedStand} 固定站立、\texttt{FreeStand} 自由站立、\texttt{Trotting} 小跑、\texttt{move\_base} 导航）实现四个函数：\texttt{enter}（进入时）、\texttt{run}（每周期运行）、\texttt{exit}（离开时）、\texttt{checkChange}（判断是否切换到别的状态）\cite{unitree2023quadruped}。这是把“机器人此刻处于哪种行为模式”显式建模，便于教学理解与安全切换（如任何态都能切到 \texttt{Passive} 急停，对应 \cref{note:qp-damping} 的阻尼模式）。
+
+\begin{insight}[FSM 与生命周期回调：两种架构骨架的对照]\label{ins:qp-fsm-vs-lifecycle}
+\texttt{unitree\_guide} 的 FSM 与 \texttt{legged\_control} 的生命周期回调（\cref{ins:qp-passive-active}）是两种不同粒度的“骨架”。FSM 管的是\emph{行为级}状态切换（站立$\leftrightarrow$小跑$\leftrightarrow$急停），每态四函数 \texttt{enter/run/exit/checkChange}；生命周期回调管的是\emph{控制器级}的加载/启用/运行/停用，四回调 \texttt{init/update/starting/stopping}。二者并不矛盾：一个工业级系统完全可以在“一个被生命周期管理的控制器”内部，再用一个 FSM 组织行为。教学框架把 FSM 摆在最外层、最显眼，正是为了让初学者一眼看清“机器人现在在干嘛、怎么切换”。
+\end{insight}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=10mm and 14mm,
+  st/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!8, draw=main!60!black, minimum height=0.8cm, text width=1.8cm},
+  sf/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!10, draw=third!60!black, minimum height=0.8cm, text width=1.8cm},
+  ln/.style={->, thick, gray!55!black, font=\scriptsize}]
+  \node[sf] (pass) {\texttt{Passive}\\被动/急停};
+  \node[st, right=of pass] (stand) {\texttt{FixedStand}\\固定站立};
+  \node[st, right=of stand] (trot) {\texttt{Trotting}\\小跑};
+  \draw[ln] (pass) to[bend left=15] node[above]{站起} (stand);
+  \draw[ln] (stand) to[bend left=15] node[below]{趴下} (pass);
+  \draw[ln] (stand) to[bend left=15] node[above]{起步} (trot);
+  \draw[ln] (trot) to[bend left=15] node[below]{停步} (stand);
+  \draw[ln] (trot) to[out=60,in=20,looseness=1.6] node[right]{急停} (pass);
+  \node[font=\scriptsize, gray!55!black, align=center, below=3mm of stand] {每态四函数：\texttt{enter}/\texttt{run}/\texttt{exit}/\texttt{checkChange}};
+\end{tikzpicture}
+\caption{\texttt{unitree\_guide} 的 FSM 行为状态转移示意（\cref{ins:qp-fsm-vs-lifecycle}）：任何态都可切到 \texttt{Passive} 急停。状态名与转移条件为教学示意，非穷举。}
+\label{fig:qp-fsm}
+\end{figure}
+
+\paragraph{\texttt{A1-QP-MPC} 的双线程：最小可读的 MPC 工程范例。}
+A1QP 的主程序 \texttt{MainGazebo.cpp} 把“凸 MPC 怎么跑起来”剥到最小：分成两个线程\cite{dicarlo2018cheetah}。\emph{力控线程}跑 \texttt{update\_foot\_forces\_grf}——计算期望地面支撑力（即凸 MPC 的核心求解）；\emph{主更新流程}跑 \texttt{main\_update}$\to$\texttt{send\_cmd}——处理急停、期望状态、模式切换、步态、状态估计，并把力折算成关节命令下发。双线程的意义与 \cref{ins:qp-freq-decouple} 一致：MPC 求解慢、单独占一个线程，主流程高频跑、读 MPC 最新解。这是理解级联 MPC 架构的最小工程模型。
+
+\begin{codebox}[text]{A1-QP-MPC 双线程结构（伪代码，纯 ASCII 注释）}
+# 线程 1: 力控线程 (MPC 求解, 频率较低)
+loop:
+    f_des = update_foot_forces_grf(x_hat, gait, ref)   # 解凸 MPC, 得期望地面支撑力
+
+# 线程 2: 主更新流程 (高频)
+loop @ control_rate:
+    handle_estop()                  # 急停
+    ref   = update_desired_state()  # 期望状态/模式切换
+    gait  = update_gait()           # 步态相位
+    x_hat = state_estimate()        # 状态估计
+    tau   = main_update(f_des)      # 读力控线程最新 f_des, 折算关节力矩 (式 qp-grf-to-torque)
+    send_cmd(tau)                   # 下发电机
+\end{codebox}
+
+% ════════════════════════════════════════════════════════════════
+\section{部署自定义四足：陷阱清单}
+\label{sec:qp-pitfalls}
+
+把一台\emph{现成}机器人跑起来不难；难的是部署一台\emph{自定义}四足。本节把 \texttt{legged\_control} 自建机器人过程中的高频陷阱集中成清单——它们都不涉及深推导，但每一条踩中都会让机器人“乱动/抖动/无法控制”。
+
+\begin{pitfall}[关节名称硬编码必须完全一致]\label{pit:qp-jointname}
+\texttt{LeggedController::init} 里\emph{硬编码}了 12 个关节名（如 \texttt{LF\_HAA}、\texttt{LF\_HFE}、\texttt{LF\_KFE}\dots）。这些名字必须与机器人描述文件（xacro/URDF）里的关节名\emph{逐字一致}，否则控制器按名查找句柄时找不到、根本无法控制\cite{sleiman2021unified}。这条与 \texttt{unitree\_guide} 的关节\emph{编号}约定（RF/LF/RH/LH 各三关节，编号 $0\!\dots\!11$）是\emph{两套不同}的命名体系，\textbf{不可混用}——这是从一个框架迁到另一个框架时最易翻车之处。
+\end{pitfall}
+
+\begin{insight}[碰撞体用简单几何体，别用 STL 网格]\label{ins:qp-collision}
+这里有一个反直觉的工程取舍：仿真里的\emph{碰撞体}应该用\emph{简单几何基元}（机身用长方体、髋用圆柱、大小腿用长方体、足端用球），\emph{而不是}从 SolidWorks 导出的精细 STL 网格。原因是 Gazebo 底层靠判断几何\emph{基元}之间的交集来做碰撞检测；用基元，计算量极小；用 STL 三角网格，会让 NMPC（OCS2）求解\emph{超时}、机器人在地上乱抖\cite{sleiman2021unified}。注意：精细 STL 仍可用于\emph{视觉}渲染（看着像真机），只是\emph{碰撞}用简单几何体——视觉与碰撞是两套独立的几何描述。
+\end{insight}
+
+\begin{pitfall}[STL 网格碰撞体 $\to$ 求解超时 $\to$ 机器人乱动]
+承 \cref{ins:qp-collision}：若图“逼真”把 STL 网格直接设为碰撞体，最常见的症状是 OCS2 单次求解超时、控制周期被拖垮，表现为机器人在地面上无规律抽搐。排查时优先检查碰撞体是否误用了网格；改为长方体/圆柱/球即可。
+\end{pitfall}
+
+\begin{insight}[标准垂直构型：设计之初就用]\label{ins:qp-standard-config}
+另一条“早做早省事”的取舍：定义机器人坐标系时，应采用\emph{标准垂直构型}——膝关节在髋关节\emph{正下方}、髋在侧摆轴的正左右。它与真机几何\emph{可能有差异}，但\emph{计算容易}：碰撞检测不易穿模、惯量变换简单。若一上来就用自定义的非标准构型，会在碰撞检测（穿模）和惯量变换上带来麻烦\cite{sleiman2021unified}。因此应\textbf{设计之初就用标准垂直构型}，把麻烦扼杀在源头。
+\end{insight}
+
+\begin{insight}[姿态/零点三层概念：配错就乱动]\label{ins:qp-zero}
+最易让人混淆、也最容易配错的，是三个\emph{不同}的“零点/姿态”概念：
+\begin{enumerate}
+  \item \textbf{运动学零点}：URDF 里 $\boldsymbol{q}=\boldsymbol{0}$ 时的参考构型，应选对称、居中、数值稳定的姿态；
+  \item \textbf{机械 / 传感器零点}：装配时的限位、编码器读数为 $0$ 的物理位置；
+  \item \textbf{控制零点}：机械零点加一个偏置（offset），映射到运动学零点。
+\end{enumerate}
+此外还有两个\emph{姿态}量易混：初始姿态 \texttt{initialState}（机器人启动瞬间的构型）与参考站立姿态 \texttt{defaultJointState} + \texttt{comHeight}（控制目标的“标准站姿”）。任何一处配错——比如把传感器零点当成运动学零点——机器人一上电就会因“以为自己在 A 姿态、实际在 B 姿态”而剧烈乱动 / 抖动\cite{sleiman2021unified}。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{部署自定义四足的陷阱速查（\cref{sec:qp-pitfalls}）}
+\begin{tabular}{p{0.30\textwidth} p{0.30\textwidth} p{0.30\textwidth}}
+\toprule
+症状 & 根因 & 对策 \\
+\midrule
+控制器加载即报“找不到关节” & 关节名与 xacro 不一致 & 逐字核对 12 个硬编码关节名（\cref{pit:qp-jointname}）\\
+机器人在地上无规律抽搐 & STL 网格做了碰撞体、求解超时 & 碰撞体改用长方体/圆柱/球（\cref{ins:qp-collision}）\\
+碰撞穿模 / 惯量变换报错 & 用了非标准构型坐标系 & 设计之初用标准垂直构型（\cref{ins:qp-standard-config}）\\
+一上电就剧烈乱动/抖动 & 三层零点或两种姿态配错 & 厘清运动学/机械/控制零点（\cref{ins:qp-zero}）\\
+URDF 找不到网格/资源 & 路径未用 \texttt{package://} & 资源路径统一用 \texttt{package://}（\cref{sec:qp-deploy}）\\
+\bottomrule
+\end{tabular}
+\label{tab:qp-pitfalls}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{部署路线图：从 URDF 到跑起来}
+\label{sec:qp-deploy}
+
+把上面的陷阱反过来看，就是一条部署自定义四足的正向路线图。这里只给\emph{骨架步骤}，每步的纯工程细节（命令、参数文件格式）一律 \cref{ch:engineering}。
+
+\begin{enumerate}
+  \item \textbf{写 URDF/xacro}：用 xacro 宏描述机器人结构；资源路径用 \texttt{package://}；视觉用精细网格、\emph{碰撞用简单几何体}（\cref{ins:qp-collision}）；采用标准垂直构型（\cref{ins:qp-standard-config}）；关节名与控制器硬编码名一致（\cref{pit:qp-jointname}）。
+  \item \textbf{加 transmission}：为每个关节声明传动（transmission）与硬件接口类型，把关节与 \texttt{HybridJointInterface} 绑定（\cref{ins:qp-hybrid-iface}）。
+  \item \textbf{挂 Gazebo 插件}：加载 \texttt{legged\_gazebo} 的硬件仿真插件，让它实现 \texttt{read/write}、\emph{假扮}硬件（\cref{ins:qp-abstraction}）；IMU 经 \texttt{ImuSensorInterface} 而非话题（\cref{ins:qp-imu-no-topic}）。
+  \item \textbf{配姿态/零点}：设运动学零点、\texttt{initialState}、\texttt{defaultJointState}、\texttt{comHeight}，厘清三层零点（\cref{ins:qp-zero}）。
+  \item \textbf{选状态估计}：仿真里可用 \emph{cheater}（直接取 Gazebo 真值）或卡尔曼滤波二选一；真机只能用滤波（\cref{ch:quad_est}）\cite{sleiman2021unified}。
+  \item \textbf{起控制器}：经 \texttt{ControllerManager} 加载控制器，按 \texttt{read}$\to$\texttt{update}$\to$\texttt{write} 高频跑（\cref{ins:qp-passive-active}）；MPC 经 \texttt{setupMrt()} 单开后台线程（\cref{ins:qp-freq-decouple}）。
+\end{enumerate}
+
+\begin{note}[工程细节登记（不在正文展开）]\label{note:qp-eng}
+以下纯工程项凝练登记、细节见 \cref{ch:engineering}：前馈力矩报文幅度上限 $|\tau_{\mathrm{ff}}|<2^{15}/256=128$（$2$ 字节有符号、$\times256$ 倍描述、符号位占 $1$ 位）\cite{unitree2023quadruped}；\texttt{/tmp/legged\_control/<type>.urdf} 必须由 xacro 生成；ROS melodic / Gazebo9 版本依赖；电机 FOC / 减速比换算。这些不影响理论理解，故不在本章推导。
+\end{note}
+
+\begin{practice}[部署演练]
+\begin{enumerate}
+  \item 按上面六步路线图，为一台虚构的自定义四足写出部署 checklist，每一步标注它对应本章哪条陷阱/洞见。
+  \item 解释：为什么仿真里可用 cheater 真值、真机却只能用滤波？这与 \cref{ch:quad_est} 的状态估计动机如何呼应？
+  \item （概念）若你把视觉网格也设成碰撞体、却发现机器人乱动，按 \cref{tab:qp-pitfalls} 给出三步排查。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{另一条腿：强化学习训练环境（点到为止）}
+\label{sec:qp-rl}
+
+除了本章的“模型控制”路线（MPC/WBC），四足运动控制还有“另一条腿”：基于\emph{强化学习}的端到端策略（在仿真里大规模训练、再 sim-to-real 迁移到真机）。其理论入口见 \cref{ch:rl-basic}；本章遵“跳过纯工程”，只给可复现的环境入口，正文不展开。
+
+\begin{practice}[RL 训练环境入口（仅登记）]
+\begin{itemize}
+  \item \textbf{Mujoco}：可从源码编译；常见报错（如 ONNXRuntime 的 \texttt{cmake} 选项被转义打散）属环境配置问题，细节见 \cref{ch:engineering}。
+  \item \textbf{Docker 镜像}：把训练依赖封进镜像，规避“在不同机器上装环境”的痛苦——这与 \cref{ins:qp-abstraction} 的“屏蔽底层差异”精神一致，只是抽象层从“硬件”换成了“操作系统/依赖”。
+  \item \textbf{定位}：RL 路线与本章的模型控制路线\emph{并行存在}、各有所长（模型控制可解释、易整定；RL 适应复杂地形、免精细建模）。深入见 \cref{ch:rl-basic} 及其后续。
+\end{itemize}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+仿真与真机要各写一套收发函数 & 面向标准接口编程，仿真器假扮硬件，一份代码两处复用（\cref{ins:qp-abstraction}）\\
+所有数据都走 ROS 话题最省事 & 高频控制环用句柄/共享内存，只有对外低频交互才用 ROS（\cref{ins:qp-realtime-split,ins:qp-imu-no-topic}）\\
+ROS 标准接口就能传关节命令 & 混合控制要传 5 个量，须自定义 \texttt{HybridJointInterface}，底层仍是力矩控制（\cref{ins:qp-hybrid-iface}）\\
+控制器自己起循环跑 update & 控制器被动定义回调，\texttt{ControllerManager} 主动按节拍调用（\cref{ins:qp-passive-active}）\\
+\texttt{setCommand} 一调命令就生效 & 只写缓冲区，本周期 \texttt{write} 才真正下发电机（\cref{ins:qp-rww}）\\
+碰撞体越精细（STL）越好 & 用简单几何基元，STL 网格会让求解超时乱动（\cref{ins:qp-collision}）\\
+坐标系怎么定都行 & 标准垂直构型计算容易、不易穿模，设计之初就用（\cref{ins:qp-standard-config}）\\
+零点只有一个 & 运动学/机械传感器/控制三层零点，配错即乱动（\cref{ins:qp-zero}）\\
+关节名随便起 & 与 xacro 逐字一致，两套命名体系不可混用（\cref{pit:qp-jointname}）\\
+三框架是平行的三种选择 & 教学$\to$入门$\to$工业的难度阶梯（\cref{ins:qp-ladder}）\\
+瞬时 QP 和 MPC 是两回事 & 瞬时 QP 是凸 MPC 的 $N_p{=}1$ 退化（\cref{tab:qp-frameworks}）\\
+MPC 和 WBC 同频跑 & MPC 低频单开后台线程、WBC 高频跟踪，频率解耦（\cref{ins:qp-freq-decouple}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{本章公式速查表（公式少，详见所属理论章）}
+\begin{tabular}{lll}
+\toprule
+公式 / 结论 & 一句话说明 & 对应 \\
+\midrule
+关节混合控制 \cref{eq:qp-hybrid} & $\tau=\tau_{\mathrm{ff}}+k_p(p_{\mathrm{des}}-p)+k_d(\omega_{\mathrm{des}}-\omega)$ & \cref{ins:qp-hybrid-iface} \\
+单腿静力学 \cref{eq:qp-jacobian-force} & $\boldsymbol{\tau}=\mathbf{J}^\top\boldsymbol{F}$（虚功原理）& \cref{subsec:qp-leg} \\
+足底力转力矩 \cref{eq:qp-grf-to-torque} & $\boldsymbol{\tau}_i=-\mathbf{J}_i^\top\mathbf{R}_{sb}^\top\boldsymbol{f}_{is}$（最后一公里）& \cref{ch:quad_mpc} \\
+摆动腿修正力 \cref{eq:qp-swing-force} & 笛卡尔 PD $\to\boldsymbol{f}_d$ & \cref{ch:quad_gait} \\
+NMPC 标准形 \cref{eq:qp-nmpc} & OCS2 最优控制问题 & \cref{ch:quad_mpc} \\
+WBC 优化变量 \cref{eq:qp-wbc} & $[\ddot{\boldsymbol{q}},\boldsymbol{f}_c,\boldsymbol{\tau}]$、分层 & \cref{ch:quad_wbc} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 硬件抽象主线 & 控制器不知仿真/实物，一份代码两处复用 & \(\bigstar\bigstar\) \\
+2 & 实时/非实时分离 & 控制环不走 ROS，IMU 走共享内存对齐时间戳 & \(\bigstar\bigstar\) \\
+3 & 三框架难度阶梯 & 教学(unitree)$\to$入门(A1QP)$\to$工业(legged) & \(\bigstar\) \\
+4 & 关节混合控制 & PD+前馈合成力矩，5 量入 HybridJointInterface & \(\bigstar\bigstar\) \\
+5 & 单腿静力学 & $\mathbf{J}^\top$ 映射、足底力转关节力矩 & \(\bigstar\bigstar\) \\
+6 & 整机控制范式 & 瞬时 QP / 凸 MPC / NMPC / WBC 锚定 & \(\bigstar\bigstar\bigstar\) \\
+7 & 句柄与接口 & 指针+安全检查 / 句柄容器+资源管理 & \(\bigstar\bigstar\) \\
+8 & 生命周期 & 被动回调 + 主动管理器，read/update/write & \(\bigstar\bigstar\) \\
+9 & 命令非立即生效 & setCommand 写缓冲区，write 才下发 & \(\bigstar\bigstar\) \\
+10 & FSM vs 生命周期 & 行为级状态机 vs 控制器级回调 & \(\bigstar\bigstar\) \\
+11 & 频率解耦 & MPC 后台线程低频、WBC 高频跟踪 & \(\bigstar\bigstar\) \\
+12 & 部署陷阱 & 关节名/碰撞体/构型/零点四大坑 & \(\bigstar\bigstar\bigstar\) \\
+13 & 部署路线图 & URDF$\to$xacro$\to$transmission$\to$插件$\to$零点 & \(\bigstar\bigstar\) \\
+14 & RL 另一条腿 & Mujoco/Docker 训练环境，点到为止 & \(\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{工程落地与瞬时 QP}：宇树《四足机器人控制算法》\cite{unitree2023quadruped}——配套 \texttt{unitree\_guide} 开源代码，OOP 三核心 + FSM、关节混合控制、单腿静力学、瞬时 QP 足底力分配的一手讲解，本章关节/单腿/架构思想的主要出处。
+  \item \textbf{工业级 NMPC+WBC}：OCS2 统一 MPC 框架\cite{sleiman2021unified}——\texttt{legged\_control} 的理论与代码基座（质心动力学 + SQP + HPIPM）；感知版 NMPC 见 Grandia 等\cite{grandia2022perceptive}；分层 WBC 见 Bellicoso 等\cite{bellicoso2016whole}。
+  \item \textbf{入门级 MPC 工程范例}：MIT Cheetah 3 凸 MPC\cite{dicarlo2018cheetah}（\cref{ch:quad_mpc} 范式）及其极简复刻 \texttt{A1-QP-MPC-Controller}——双线程主程序是“MPC 怎么跑起来”的最小可读模型。
+  \item \textbf{另一条腿（强化学习）}：四足 RL 策略的训练环境（Mujoco/Isaac）与 sim-to-real，理论入口见 \cref{ch:rl-basic}；本章 \cref{sec:qp-rl} 仅给可复现入口。
+\end{itemize}
+
+\section*{本章与相关章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+相关章节 & 关系 & 本章接口 \\
+\midrule
+\cref{ch:quad_mpc} 单刚体 MPC & 提供凸 MPC 理论，本章是其落地 & \cref{eq:qp-nmpc}、A1QP 双线程 \\
+\cref{ch:quad_wbc} 全身控制 & 提供 WBC 理论，本章给优化变量 & \cref{eq:qp-wbc} \\
+\cref{ch:quad_kin} 浮动基运动学 & 提供腿雅可比 $\mathbf{J}$ & \cref{eq:qp-jacobian-force} \\
+\cref{ch:quad_gait} 步态生成 & 提供摆线轨迹 $\boldsymbol{p}_{0d}$ & \cref{eq:qp-swing-force} \\
+\cref{ch:quad_est} 足式状态估计 & 提供 $\boldsymbol{x}(0)$；cheater/KF 选择 & \cref{sec:qp-deploy} \\
+\cref{ch:engineering} 工程实践 & 承接本章略过的纯工程细节 & \cref{note:qp-eng} \\
+\cref{ch:rl-basic} 强化学习 & “另一条腿”的理论入口 & \cref{sec:qp-rl} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：控制器加载即\emph{报错找不到关节句柄}。\textbf{排查}：硬编码关节名与 xacro 是否逐字一致；是否误把 \texttt{unitree\_guide} 的编号体系与 \texttt{legged\_control} 的命名体系混用（\cref{pit:qp-jointname}）。
+  \item \textbf{症状}：机器人在地面\emph{无规律抽搐}、求解器报超时。\textbf{原因}：STL 网格被设为碰撞体（\cref{ins:qp-collision}）。\textbf{对策}：碰撞体改用长方体/圆柱/球，网格只用于视觉。
+  \item \textbf{症状}：机器人\emph{一上电就剧烈乱动/抖动}。\textbf{原因}：三层零点或两种姿态配错（\cref{ins:qp-zero}）。\textbf{对策}：厘清运动学/机械传感器/控制零点，核对 \texttt{initialState} 与 \texttt{defaultJointState}。
+  \item \textbf{症状}：控制环\emph{间歇性失稳/抖动}，仿真时尤甚。\textbf{原因}：把 IMU/反馈塞进了 ROS 话题（\cref{ins:qp-imu-no-topic}）。\textbf{对策}：改走句柄/共享内存，保证同一时间戳。
+  \item \textbf{症状}：\texttt{update} 里改了命令、电机\emph{像慢半拍}。\textbf{原因}：误以为 \texttt{setCommand} 立即生效（\cref{ins:qp-rww}）。\textbf{对策}：理解 \texttt{setCommand} 只写缓冲区、本周期 \texttt{write} 才下发，这是正常时序。
+  \item \textbf{症状}：碰撞\emph{穿模}、惯量变换报错。\textbf{原因}：用了非标准构型坐标系（\cref{ins:qp-standard-config}）。\textbf{对策}：改用标准垂直构型（膝在髋正下方）。
+\end{enumerate}

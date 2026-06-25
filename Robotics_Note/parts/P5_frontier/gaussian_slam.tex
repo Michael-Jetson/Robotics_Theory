@@ -1,0 +1,626 @@
+\chapter{高斯泼溅 SLAM}
+\label{ch:gsslam}
+
+% ════════════════════════════════════════════════════════════════
+%  P5 前沿。承 \cref{ch:learning}(DROID/光流即测量) + \cref{sec:dense-radiance}(可微渲染地图：表示级)
+%  → 把"可微渲染地图"从【地图表示】抬到【在线 SLAM 范式 + 前沿系统】。
+%  兑现 \cref{sec:dense-radiance-slam} 埋的悬念(辐射场 SLAM <5fps/跟踪落后/重在重建)：
+%    2024–25 的几何感知 + DROID 打底如何把这道差距补上。
+%  组织轴 = map-centric(渲染即跟踪, MonoGS) vs pose-centric/解耦(DROID+高斯地图, HI-SLAM2)。
+%  多机协作留下一章《多机协作高斯 SLAM》。
+%  去重铁律(R14/R18)：3DGS 表示(协方差/α合成) → \cref{sec:dense-radiance-gs} 不重讲；
+%    DROID/RAFT/光流即测量 → \cref{ch:learning}；SE(3)/Sim(3)/右扰动/⊙ → \cref{ch:lie}；
+%    BA/Schur → \cref{ch:nlopt}；TSDF/网格 → \cref{ch:dense}。
+%  右扰动主线；母方程 \cref{eq:intro-nls} 贯穿(GS 的残差 = 光度渲染误差)。
+%  待填：§1 兑现悬念+母方程视角；§2 渲染即跟踪(SE3 雅可比 derivation + MonoGS paper 盒)；
+%        §3 两范式(地图参不参与定位，拆轴+litmus)；§4 解耦几何感知(HI-SLAM2 paper 盒,JDSA/Sim3/无偏深度/法向)；
+%        §5 几何感知→mesh(引 dense TSDF)；§6 误解+LiDAR 对照；§7 小结/速查/故障排查。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题——它们勾勒了本章要回答的核心疑问。若已能流畅作答，可只速读框架图与速查表；若卡住，正是本章要为你打通的。
+\begin{enumerate}
+  \item \cref{sec:dense-radiance-slam} 给可微渲染 SLAM 下过一句断语：“实时性 $<5$\,fps、跟踪精度落后，\emph{重在重建而非在线}”。可仅一年后，一批高斯 SLAM 已能在线、跟踪精度还反超经典稠密法。它们\emph{在哪一步}补上了这道差距？
+  \item “渲染即跟踪”——把当前位姿下渲出的图与实拍比对、反传调位姿。这与 \cref{eq:intro-nls} 的最小二乘母方程是\emph{同一回事}吗？残差被换成了什么？自由变量还是位姿吗？
+  \item 同样拿 3DGS 当地图：MonoGS \emph{对着地图渲染}来跟踪，HI-SLAM2 的跟踪却\emph{根本不碰}那张高斯图。这两种范式分在哪一根轴上？各自的代价是什么？
+  \item 单目没有绝对尺度。一个纯靠渲染损失优化的高斯 SLAM，尺度从哪来、为什么会漂、要在\emph{哪个群}（\cref{ch:lie} 的哪一个）上做回环才治得了？
+  \item 回环闭合后要把一段漂掉的地图“整体挪正”。为什么\emph{显式}的 3DGS 地图能瞬间挪、而\emph{隐式}的神经辐射场（NeRF）地图做不到？这对多机地图拼接意味着什么？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}可微渲染地图从“表示”（\cref{sec:dense-radiance}）跨到“在线 SLAM 范式”的那一步——高斯 SLAM 并未推翻 \cref{eq:intro-nls} 的母方程，而是把\emph{地图表示}换成可渲染高斯、把\emph{残差}换成光度渲染误差；
+  \item \textbf{推导}“渲染即跟踪”的 $\SE(3)$ 位姿雅可比（\cref{sec:gs-track}）：以 \cref{ch:lie} 的右扰动与齐次点扰动算子 $(\cdot)^\odot$ 为骨架，并看清它与重投影 BA、点到面 ICP 的雅可比\emph{同一副骨架}；
+  \item \textbf{辨析} map-centric / pose-centric / hybrid \emph{三}范式——靠 litmus（回环解谁）分在哪根轴、各自代价与失效边界，并把每个系统\emph{定位}回母方程的哪个零件被换；
+  \item \textbf{复述}解耦式几何感知高斯 SLAM 的装配（DROID 打底 $+$ 单目深度/法向先验对齐 $+$ $\mathrm{Sim}(3)$ 治尺度 $+$ 几何感知地图），以 HI-SLAM2 为范例；
+  \item \textbf{解释}几何感知建图（无偏深度、法向监督）为何能让高斯既\emph{渲得真}又\emph{测得准}，以及最终网格如何经 TSDF 融合（\cref{sec:dense-tsdf,sec:dense-mesh}）导出；
+  \item \textbf{定位}高斯 SLAM 相对经典稠密（\cref{ch:dense}）与激光 SLAM（\cref{ch:lidar_slam}）的异同，把“可渲染地图”放回你的传感器直觉。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是“经典稠密 $\to$ 可微渲染”弧线（\cref{sec:dense-radiance}）的\textbf{在线化落点}。前面把 3DGS 当一种\emph{地图表示}讲清；本章问的是——\emph{当这张可渲染地图被放进在线 SLAM 的环里，跟踪、回环、尺度该怎么办？}全章沿两件事展开：\textbf{三条表示底座}（3DGS / 神经场 / 点图）与 \textbf{map / pose / hybrid 范式坐标}。结构如下。
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  bk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (eq) {母方程\\$\min\sum\|\mathbf e_i\|^2_{\boldsymbol\Sigma_i^{-1}}$};
+\node[blk, right=of eq] (rep) {三表示底座\\3DGS / 神经场 / 点图};
+\node[grp, right=of rep] (axis) {范式坐标\\map / pose / hybrid};
+\node[bk, below=9mm of eq] (mono) {MonoGS\\map-centric · 渲染即跟踪};
+\node[bk, right=of mono] (hi) {HI-SLAM2\\hybrid · DROID+JDSA+$\mathrm{Sim}(3)$};
+\node[bk, right=of hi] (mast) {MASt3R-SLAM\\点图 · ray 残差};
+\node[grp, below=9mm of hi] (multi) {多机：子图刚体 · 搬高斯\\（下一章）};
+\draw[ln] (eq)--(rep); \draw[ln] (rep)--(axis);
+\draw[ln] (axis.south) -- ++(0,-3mm) -| (mono.north);
+\draw[ln] (axis.south) -- ++(0,-3mm) -| (hi.north);
+\draw[ln] (axis.south) -- ++(0,-3mm) -| (mast.north);
+\draw[ln] (mono.south) -- ++(0,-3mm) -| (multi.north);
+\draw[ln] (hi)--(multi);
+\draw[ln] (mast.south) -- ++(0,-3mm) -| (multi.north);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:gs-online}（兑现悬念、把渲染地图框进母方程）是全章的“锚”，任何读者都应先读；\cref{sec:gs-track}（渲染即跟踪）是 map-centric 一支的理论核心，含 $\SE(3)$ 渲染雅可比的完整推导；\cref{sec:gs-paradigm}（范式坐标）是全章的\emph{分类骨架}，把后面所有系统挂上 map / pose / hybrid；\cref{sec:gs-decoupled}（HI-SLAM2 解耦式几何感知）是当前精度最强的一支、也是本章工程落点，\cref{sec:gs-pointmap}（前馈点图 MASt3R-SLAM）补上第三条表示底座；\cref{sec:gs-geom}（几何与网格）与 \cref{sec:gs-pitfalls}（误解与对照）收束。多机协作留待\emph{下一章}。
+
+\subsection*{前置知识桥接}
+本章把前几部的工具与“可渲染地图”缝在一起，请先激活以下前置：
+\begin{itemize}
+  \item \textbf{MAP 母方程}（\cref{eq:intro-nls}；\cref{ch:nlopt}）：$\arg\min_X\sum_i\|\mathbf{e}_i\|^2_{\boldsymbol\Sigma_i^{-1}}$ 是本章一切“渲染层”的接驳口——渲染即跟踪只是把残差 $\mathbf{e}_i$ 换成\emph{光度渲染误差}、把状态表示换成可渲染高斯，优化即推断的主干未变。
+  \item \textbf{3DGS 作为地图表示}（原理见专章 \cref{ch:3dgs}，速写见 \cref{sec:dense-radiance-gs}）：各向异性高斯 $\boldsymbol\Sigma_i=\mathbf{R}_i\mathbf{S}_i\mathbf{S}_i^\top\mathbf{R}_i^\top$、投影 $+$ 深度排序 $+$ $\alpha$ 合成（\cref{eq:dense-gs-blend}）。\textbf{本章不重讲表示}，直接拿来当“地图”，聚焦它\emph{进环}后的跟踪/回环/尺度。
+  \item \textbf{李群与扰动}（\cref{ch:lie}；\cref{sec:nlopt-manifold}）：相机位姿 $\mathbf{T}\in\SE(3)$、\emph{右扰动}局部参数化、齐次点扰动算子 $(\cdot)^\odot$——渲染雅可比 \cref{sec:gs-track} 即建在它上；单目尺度漂移的回环要在 $\mathrm{Sim}(3)$（含尺度的 7 自由度群）上解。
+  \item \textbf{可微稠密 SLAM：DROID}（\cref{ch:learning}）：解耦式高斯 SLAM 的\emph{跟踪骨架}是 DROID 的“光流即测量 $+$ 可微 BA”，本章\emph{引用其结论}（输出关键帧位姿与逐像素逆深度），只在其上挂高斯地图与尺度对齐。
+  \item \textbf{稀疏化与 Schur 消元}（\cref{sec:vo-schur}；\cref{ch:nlopt}）：尺度/深度联合对齐（JDSA）靠“边缘化逐像素深度、解小尺度系统”的 Schur 补，与 BA 的结构-运动消元同一套。
+  \item \textbf{经典稠密与网格}（\cref{sec:dense-tsdf,sec:dense-surfel,sec:dense-mesh}）：高斯地图的\emph{网格出口}仍是把渲染深度做 TSDF 融合；面元（surfel）则是“带朝向的点”，把它换成带不透明度的高斯椭球正是本章的地图基元（\cref{sec:dense-surfel} 已埋此过渡）。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会把 MonoGS、SplaTAM、HI-SLAM2、Splat-SLAM 这些近年屠榜的稠密重建系统，当成与经典 SLAM \emph{无关}的“另一套渲染玩法”，既看不出它们仍在解 \cref{eq:intro-nls} 的母方程，也分不清“对着地图渲染来跟踪”和“跟踪根本不碰地图”是两条\emph{代价迥异}的范式；
+  \item 你会以为 \cref{sec:dense-radiance-slam} 那句“辐射场 SLAM 重在重建、跟踪落后”是\emph{定论}——而本章恰恰要展示这道差距如何在一年内被几何感知与 DROID 打底\emph{补上}；
+  \item 下一章《多机协作高斯 SLAM》直接建在本章“显式高斯地图可被刚体搬运”之上，跳过本章，多机拼接为何\emph{偏偏选高斯}而非神经场就无从理解。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号.}\;
+本章在前几部记号上新增“可渲染高斯地图”一层，并\emph{严格避让}全书已占用者。
+\textbf{高斯基元}记 $g_i$：\emph{均值}（三维位置）记 $\boldsymbol\mu_i$、\emph{协方差}记 $\boldsymbol\Sigma_i=\mathbf{R}_i\mathbf{S}_i\mathbf{S}_i^\top\mathbf{R}_i^\top$（\textbf{注意}：与全书\emph{噪声}协方差 $\boldsymbol\Sigma$ 同字母，本章高斯协方差\emph{一律带下标} $\boldsymbol\Sigma_i$ 并称“高斯协方差”以避歧义；分解沿用 \cref{sec:dense-radiance-gs}：旋转 $\mathbf{R}_i$、尺度 $\mathbf{S}_i=\operatorname{diag}(\mathbf{s}_i)$）、\emph{不透明度} $o_i\in[0,1]$、\emph{颜色} $\mathbf{c}_i$。
+\textbf{渲染}沿用 \cref{sec:dense-radiance-gs} 的 $\alpha$ 合成（\cref{eq:dense-gs-blend}）：渲染图记 $\hat{\mathbf{I}}$、渲染深度记 $\hat{\mathbf{D}}$（帽子表“由地图渲出”，与估计帽子靠语境区分）。
+\textbf{相机位姿}沿用 $\mathbf{T}\in\SE(3)$ 与本书帧下标 $\mathbf{T}_{wc}$（\nameref{ch:notation}）；扰动\emph{以右扰动为主线} $\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol\xi)$（\cref{sec:nlopt-manifold}），位姿雅可比用齐次点扰动算子 $(\cdot)^\odot$（\cref{ch:lie}）。
+\textbf{尺度群}：单目尺度漂移的回环在 $\mathrm{Sim}(3)$（含尺度的 7 自由度群，\cref{ch:lie}）上解；逐帧尺度因子记标量 $s$。投影/反投影记 $\boldsymbol\pi,\boldsymbol\pi^{-1}$（\cref{ch:camera}）。
+\textbf{单目先验}（来自预测网络，\cref{ch:learning}）：深度先验记 $\check{\mathbf{d}}$、法向先验记 $\check{\mathbf{n}}$（先验帽 $\check{}$，与后验 $\hat{}$ 相对）。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{从可微渲染地图到在线 SLAM：兑现一道悬念}
+\label{sec:gs-online}
+
+\subsection{一道悬念：可微渲染 SLAM 当真“重在重建”吗}
+
+\cref{sec:dense-radiance-slam} 收尾时，给可微渲染 SLAM 下过一句谨慎的断语：辐射场地图虽能渲出逼真新视角，但“实时性 $<5$\,fps、跟踪精度尚落后于经典稠密法，更适合\emph{重建/渲染}而非\emph{在线}”。那是 2023 至 2024 年初的快照。本章要讲的，恰是这道断语\emph{怎样在一年内被改写}——到 2024–2025 年，一批以 3D 高斯泼溅（3DGS，\cref{sec:dense-radiance-gs}）\cite{kerbl2023gaussian} 为地图的系统已能在线运行、跟踪精度反超经典稠密法，并成为多机协作稠密建图的首选底座。
+
+它们补上的不是某个孤立技巧，而是\emph{把可渲染地图正确地接回了 SLAM 的优化主干}。要看清这一点，先把它放回母方程。
+
+\begin{insight}[高斯 SLAM 没有另起炉灶]
+无论“渲染即跟踪”听上去多新，高斯 SLAM 解的仍是全书那条 MAP 母方程 \cref{eq:intro-nls}：$\arg\min_{X}\sum_i\lVert\mathbf e_i\rVert^2_{\boldsymbol\Sigma_i^{-1}}$。它只换两个零件——状态 $X$ 里的“地图”从稀疏路标 / TSDF 体素换成一堆\emph{可渲染高斯}，残差 $\mathbf e_i$ 从重投影 / 点到面换成\emph{光度渲染误差}（按当前位姿渲一张图、与实拍相减）。优化即推断的主干、右扰动求解（\cref{sec:nlopt-manifold}）、信息矩阵加权——一概照旧。\textbf{把“新范式”翻译回母方程的哪个零件被换，是本章反复要做的动作。}
+\end{insight}
+
+\subsection{先问一句：它到底是不是“完整 SLAM”}
+
+可渲染 SLAM 的论文几乎都冠名 “SLAM”，但这名字得先打个问号。立尺为先（\cref{ch:slam_system} 判据，复述要点）：\textbf{里程计}只估增量运动、漂移随路程\emph{无界累积}；\textbf{完整 SLAM} $=$ 里程计 $+$ 后端，后端靠\emph{回环检测 $+$ 全局优化}把累积漂移摊匀纠正，使轨迹与地图\emph{全局一致}。一句话判据：\emph{重访去过的地方，系统能否纠正累积漂移？}能则 SLAM，不能则里程计。
+
+拿这把尺量这一代高斯 SLAM，会照出两个阵营（\cref{tab:gs-camps}）。
+
+\begin{table}[H]\centering
+\caption{可渲染 SLAM 的两个阵营：3DGS 当引擎，还是当渲染器}
+\label{tab:gs-camps}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & \textbf{A “GS 原生”} & \textbf{B “经典 SLAM $+$ GS 渲染器”} \\
+\midrule
+定位 $+$ 全局优化 & GS 自己做（渲染损失跟踪 $+$ 自建回环）& 交给成熟经典 SLAM（DROID / ORB $+$ 全局 BA）\\
+完整 SLAM？ & 多数否 / 少数弱后端 & 是，完整 \\
+3DGS 角色 & 既当地图、又想当引擎 & 纯渲染器，真·顺带重建 \\
+代表 & MonoGS（\cref{sec:gs-track}）、子图刚体派 & HI-SLAM2（\cref{sec:gs-decoupled}）、Splat-SLAM \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{一个反讽}：真正“GS 只顺带做重建”的，恰是 GS \emph{不}当引擎的 B 营；而“看着还不太像完整 SLAM”的，正是想让 GS 自己当引擎、后端还没长成的 A 营 \cite{matsuki2024monogs}。A 营卡在“里程计 $+$ 重建”有三个结构性原因：\emph{稠密全局 BA 太贵}（百万基元重渲染反传，只能退回廉价的子图刚体位姿图）、\emph{刚体搬图的诱惑}（3DGS 支持闭式刚体变换，整块搬最省力；非刚性形变难，于是被回避）、\emph{范式年轻}（3DGS 2023 才出现，回环 / 全局 BA 是 2024 之后才补的浪潮）。这是\emph{发展阶段的快照，不是架构死胡同}。
+
+\begin{pitfall}[冠名“GS-SLAM” $\ne$ 几何由 GS 算]
+\textbf{错误}：见系统冠名 “GS-SLAM”、又有高斯地图参与，便以为它的深度 / 位姿 / 尺度都是 3DGS 算的。\textbf{后果}：完全看错系统的能力边界与计算瓶颈——把下游渲染开销当成定位开销，或高估 GS 的几何能力。\textbf{根因}：3DGS 完全可以只当\emph{下游渲染器}。HI-SLAM2 的深度 / 位姿 / 尺度\emph{全在 DROID 那层算完}，3DGS 只是搭在成熟几何骨架上的乘客（吃算好的深度 / 位姿去建图渲染，不反过来参与定位）；反过来 MonoGS 那种才是“渲染本身就是跟踪器”。\textbf{正确}：读一篇 “GS-SLAM”，先问一句——\emph{几何引擎到底是不是 GS？}（这正是 \cref{sec:gs-paradigm} 范式坐标要钉的事。）
+\end{pitfall}
+
+\subsection{地图表示之争：为什么偏偏是高斯}
+
+地图\emph{表示}是高斯 SLAM 的地基——它直接决定\textbf{回环能不能搬地图、多机能不能拼、跑得快不快}。早期可渲染 SLAM 多用\emph{隐式神经场}（NeRF \cite{mildenhall2020nerf} $\to$ iMAP / NICE-SLAM），有三个硬伤，头一个最致命：
+
+\begin{enumerate}
+  \item \textbf{神经场天然不支持刚体变换。}地图是烘进网络权重的函数 $f_{\boldsymbol\theta}(\mathbf x)$，$\mathbf x$ 是世界坐标——\emph{没有一个可被直接重定位的显式基元}。回环闭合后想把一段漂掉的地图整体“挪正”，无法给它乘一个变换矩阵，只能重训 / 重编码，或去 warp 查询坐标（会扭曲已学到的特征）。多机对齐、回环纠正、全局合并因此极昂贵。
+  \item \textbf{定位精度受限}——神经式位姿优化在真实噪声面前挣扎。
+  \item \textbf{慢}——逐像素 ray marching，渲染与优化都重。
+\end{enumerate}
+
+3DGS 取而代之的根本原因，正落在第一条的反面：
+
+\begin{insight}[闭式刚体可搬 $=$ 高斯赢下多机的根]
+3DGS 地图是一堆\emph{显式}高斯，每个带均值 $\boldsymbol\mu_i$（3D 位置）与协方差 $\boldsymbol\Sigma_i=\mathbf R_i\mathbf S_i\mathbf S_i^\top\mathbf R_i^\top$（\cref{sec:dense-radiance-gs}）。要对一段地图做刚体变换 $\mathbf T=(\mathbf R,\mathbf t)$，直接\emph{闭式}：
+\begin{equation}
+\boldsymbol\mu_i \leftarrow \mathbf R\,\boldsymbol\mu_i+\mathbf t,\qquad
+\boldsymbol\Sigma_i \leftarrow \mathbf R\,\boldsymbol\Sigma_i\,\mathbf R^\top
+\label{eq:gs-rigid}
+\end{equation}
+瞬间、精确、无需重训。回环纠正就是这样“搬高斯”（下一章多机后端），多机把各自子图拼成全局图，也是给整块子图乘一个 $\mathbf T$。\textbf{“高斯天然适合多 Agent 位姿计算”的根，就是 \cref{eq:gs-rigid} 这两行闭式变换}——神经场没有它，点云有它但不可渲染。
+\end{insight}
+
+把所有备选表示横着记一笔账（不止 vs 神经场），高斯是“一身集齐”那个：
+
+\begin{table}[H]\centering
+\caption{地图表示横向账：高斯如何避开各家短板}
+\label{tab:gs-repr}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+表示 & 短板 & 高斯如何避开 \\
+\midrule
+体素（KinectFusion）& 内存大、分辨率有界、难大幅 warp & 自适应稀疏摆放 \\
+网格 & 拓扑难融合 & 无拓扑、点状基元 \\
+surfel / 点云 & 不连续、难梯度优化 & 平滑连续可微 \\
+神经场（NeRF）& 逐像素 raycast 慢、刚体搬运难 & splatting 光栅化 $+$ 闭式刚体搬（\cref{eq:gs-rigid}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent{}高斯 $=$ 似点 / surfel 的效率与可 warp 性 $+$ 平滑连续可微 $+$ 显卡 splatting 快——这正是 MonoGS \cite{matsuki2024monogs} 敢拿它当\emph{唯一}表示的底气（\cref{sec:gs-track}）。
+
+\textbf{第三条路：点图（point-map）。}还有一脉既不用神经场、也不用高斯，而让\emph{前馈基石模型}直接吐逐像素点图当几何底座——MASt3R-SLAM \cite{leroy2024mast3r} 一系（\cref{sec:gs-pointmap}）。三条表示底座的取舍轴是\emph{可渲染性} $\times$（\emph{刚体可搬性} / \emph{优化代价} / \emph{是否需位姿先验}）：3DGS 强在可渲染 $+$ 刚体可搬，神经场弱在刚体搬运，点图强在\emph{免位姿先验}的前端关联。本章随后按这三条底座各立一个单机锚：MonoGS（3DGS / map-centric，\cref{sec:gs-track}）、HI-SLAM2（3DGS / hybrid 解耦，\cref{sec:gs-decoupled}）、MASt3R-SLAM（点图，\cref{sec:gs-pointmap}）；它们的多机子代留待下一章。
+
+但在立锚之前，先把“渲染怎么就成了跟踪”这件最反直觉的事，从母方程一路推到 $\SE(3)$ 雅可比——这是 \cref{sec:gs-track} 的任务。
+
+\section{渲染即跟踪：把光度残差接进母方程}
+\label{sec:gs-track}
+
+\subsection{三步：取初值、冻结地图、对地图精化位姿}
+
+最反直觉的一步，是“渲染”怎么就成了“跟踪”。把它拆成三步，与 \cref{sec:gs-paradigm} 将定义的 map-centric 前端一一对应：
+
+\begin{enumerate}
+  \item \textbf{取初值}——先用廉价方法给当前帧一个粗位姿（恒速外推、帧到帧配准、或外部里程计）。纯光度优化有局部极小，初值好坏值不值得投入，留到本节末再谈。
+  \item \textbf{冻结地图}——锁死所有高斯（$\boldsymbol\mu_i,\boldsymbol\Sigma_i,o_i,\mathbf c_i$ 全不动），只留相机位姿 $\mathbf T\in\SE(3)$ 当唯一变量。
+  \item \textbf{对地图精化位姿}——按该位姿把冻结的高斯地图\emph{渲}成图 $\hat{\mathbf I}(\mathbf T)$，与实拍 $\bar{\mathbf I}$ 相减，最小化光度残差、反传调位姿（analysis-by-synthesis / frame-to-model）。
+\end{enumerate}
+
+写成母方程 \cref{eq:intro-nls} 的样子，这一步就是
+\begin{equation}
+\mathbf T^\star=\arg\min_{\mathbf T\in\SE(3)}\sum_{\mathbf p}\big\lVert\,\hat{\mathbf I}_{\mathbf p}(\mathbf T)-\bar{\mathbf I}_{\mathbf p}\,\big\rVert_1 ,
+\label{eq:gs-track}
+\end{equation}
+（RGB-D 再加深度残差 $\lVert\hat{\mathbf D}_{\mathbf p}(\mathbf T)-\bar{\mathbf D}_{\mathbf p}\rVert_1$。）\textbf{与母方程比对}：状态退化为单帧位姿 $\mathbf T$，残差 $\mathbf e_{\mathbf p}=\hat{\mathbf I}_{\mathbf p}(\mathbf T)-\bar{\mathbf I}_{\mathbf p}$ 是\emph{光度渲染误差}，地图当冻结的“尺子”。这与 \cref{ch:dense} 的“先重建后渲染”正好倒过来——\emph{用渲染损失直接驱动位姿}。要解出它，缺的只有一件：$\hat{\mathbf I}$ 对 $\mathbf T$ 的雅可比。
+
+\subsection{位姿雅可比：其实就是 BA 那条骨架}
+
+渲染 $\hat{\mathbf I}$ 经一长串映射依赖 $\mathbf T$，但这串的\emph{头}与\emph{尾}早是熟面孔：
+
+\begin{derivation}[渲染对位姿的雅可比链]
+单个高斯投影到像面，链为
+\[
+\mathbf e_{\mathbf p}\ \xrightarrow{\ \alpha\text{ 合成}\ }\ \{\boldsymbol\mu_I,\boldsymbol\Sigma_I\}\ \xrightarrow{\ \text{投影}\ }\ \boldsymbol\mu_c=\mathbf T_{cw}\,\boldsymbol\mu_w\ \xrightarrow{\ \text{右扰动}\ }\ \mathbf T .
+\]
+\textbf{头一段}（残差 $\to$ 2D 高斯参数 $\boldsymbol\mu_I,\boldsymbol\Sigma_I$）是 3DGS 原生的 $\alpha$ 合成导数（\cref{sec:dense-radiance-gs}），与位姿无关、CUDA 光栅器自带。\textbf{要补的只有末段}（2D 高斯参数 $\to$ 位姿），它又拆成两个已知块：
+\begin{enumerate}
+  \item \emph{投影雅可比}（针孔，\cref{ch:camera}）：唯一的非线性是透视除法 $\div z$，
+  \begin{equation}
+  \mathbf J_\pi=\frac{\partial\boldsymbol\pi}{\partial\boldsymbol\mu_c}=\begin{bmatrix}f_x/z & 0 & -f_x x/z^2\\[2pt] 0 & f_y/z & -f_y y/z^2\end{bmatrix}\ (2\times3),\quad \boldsymbol\mu_c=(x,y,z)^\top .
+  \label{eq:gs-projjac}
+  \end{equation}
+  \item \emph{位姿扰动雅可比}（\cref{ch:lie}）：以本书右扰动 $\mathbf T_{wc}\,\mathrm{Exp}(\delta\boldsymbol\xi)$ 对相机系点求导——恰是齐次点扰动算子 $(\cdot)^\odot$ 的非零部分，增量落\emph{相机系}：
+  \begin{equation}
+  \frac{\mathcal D\boldsymbol\mu_c}{\mathcal D\boldsymbol\xi}=\big[\,\mathbf I_3\ \ -\boldsymbol\mu_c^\wedge\,\big]\ (3\times6).
+  \label{eq:gs-posejac}
+  \end{equation}
+\end{enumerate}
+两块相乘即位姿雅可比 $\dfrac{\mathcal D\boldsymbol\mu_I}{\mathcal D\boldsymbol\xi}=\mathbf J_\pi\big[\,\mathbf I_3\ -\boldsymbol\mu_c^\wedge\,\big]\ (2\times6)$；协方差支路 $\boldsymbol\Sigma_I=\mathbf J_\pi\,\mathbf R_{cw}\,\boldsymbol\Sigma_w\,\mathbf R_{cw}^\top\mathbf J_\pi^\top$（EWA 仿射近似，\cref{sec:dense-radiance-gs}）再补一条同构链。整条梯度 $\sum_{\mathbf p}\frac{\partial\mathbf e}{\partial\hat{\mathbf I}}\frac{\partial\hat{\mathbf I}}{\partial\{\boldsymbol\mu_I,\boldsymbol\Sigma_I\}}\frac{\mathcal D\{\boldsymbol\mu_I,\boldsymbol\Sigma_I\}}{\mathcal D\boldsymbol\xi}$ 喂一阶优化器（Adam）即可。
+\end{derivation}
+
+\begin{insight}[渲染即跟踪的“新”，新在残差、不在雅可比]
+\cref{eq:gs-posejac} 的 $[\,\mathbf I\ -\boldsymbol\mu_c^\wedge\,]$ 不是 3DGS 发明的——它\emph{逐字}就是重投影 BA（\cref{sec:nlopt-ba}）里点对相机位姿的雅可比，也是点到面 ICP、乃至 \cref{ch:lidar_slam} 里 FAST-LIO 点面残差 $\mathbf n^\top(\mathbf T\boldsymbol\mu-\mathbf q)$ 对位姿那条 $[\,\mathbf I\ -\boldsymbol\mu^\wedge\,]$ 的同一副骨架。\textbf{render-as-tracking 真正换掉的只是母方程里的\emph{残差}}：把重投影 / 点面误差换成\emph{光度渲染误差}，前面的投影 $\mathbf J_\pi$ 与位姿块 $(\cdot)^\odot$ 原封不动。所以它一点不神秘——是 BA 的骨架接进了一条新的、可微渲染的观测链。
+\end{insight}
+
+\begin{codebox}[C++]{原版 3DGS 光栅器：投影雅可比就在 computeCov2D 里}
+// cuda_rasterizer/forward.cu :: computeCov2D  (EWA affine projection)
+float3 t = transformPoint4x3(mean, viewmatrix);    // Gaussian center -> camera frame  mu_c
+glm::mat3 J = glm::mat3(                            // pinhole projection Jacobian  J_pi
+    focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
+    0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
+    0, 0, 0);
+glm::mat3 W = ...;                                  // 3x3 rotation R_cw from viewmatrix
+glm::mat3 T = W * J;
+glm::mat3 cov = transpose(T) * transpose(Vrk) * T; // Sigma' = J_pi R Sigma R^T J_pi^T  (EWA)
+\end{codebox}
+
+\noindent{}这段把 \cref{eq:gs-projjac} 坐实在真代码里——那个 \texttt{J} 逐元素就是针孔投影雅可比 $\mathbf J_\pi$，协方差支路 $\boldsymbol\Sigma_I=\mathbf J_\pi\mathbf R\boldsymbol\Sigma\mathbf R^\top\mathbf J_\pi^\top$ 也是光栅器\emph{原生自带}（EWA 仿射近似，\cref{sec:dense-radiance-gs}）。但看第一行：\texttt{viewmatrix} 是\emph{常量}传进来的——原版 3DGS 是离线 SfM 定位，只把高斯的 $\{\boldsymbol\mu,\boldsymbol\Sigma,o,\mathbf c\}$ 当变量、\emph{从不回传位姿梯度}。render-as-tracking 要补的“末段”（\cref{eq:gs-posejac}），正是让 \texttt{viewmatrix} 升格成待求位姿 $\mathbf T$ 后多挂的那条链——\textbf{怎么挂}，就是下面 MonoGS（显式手推）与 SplaTAM（隐式自动微分）的分野。
+
+\subsection{左扰动还是右扰动：殊途同归}
+
+\cref{eq:gs-posejac} 用本书右扰动主线，MonoGS 代码里却是\emph{左}扰动 $\mathbf T\leftarrow\mathrm{Exp}(\boldsymbol\tau)\mathbf T$——不矛盾，关键看\emph{位姿存哪个方向}：
+
+\begin{note}
+扰动落哪个系，由“右扰动落源系 / 左扰动落目标系”与位姿指向共同决定（\cref{sec:nlopt-manifold}）。MonoGS 存 $\mathbf T_{cw}$（world$\to$camera），\emph{左}扰动把增量落\emph{相机系}，雅可比直接用相机系点 $\boldsymbol\mu_c$、光栅器手头就有；本书存 $\mathbf T_{wc}$（camera$\to$world），\emph{右}扰动同样把增量落相机系，得 \cref{eq:gs-posejac} 同一形状。\textbf{殊途同归}：两边都把增量钉在\emph{传感器系}，只因位姿指向相反、一左一右。这与 \cref{ch:lidar_slam} 里 FAST-LIO 存 $\mathbf R_{wb}$、用右扰动把误差落\emph{机体系}以配 IMU 噪声，是同一套用心。
+\end{note}
+
+\subsection{范式锚一：MonoGS}
+
+\begin{paper}[MonoGS：把渲染本身当跟踪器]
+\textbf{简称 \& 出处}：MonoGS（\emph{Gaussian Splatting SLAM}，Matsuki 等，CVPR 2024 Highlight，arXiv:2312.06741）\cite{matsuki2024monogs}。
+
+\textbf{问题}：3DGS \cite{kerbl2023gaussian} 惊艳，却要\emph{离线 SfM 先给好所有相机位姿}才能优化高斯。能否把位姿也变成在线待求量，让一套 3D 高斯同时服务\emph{跟踪 / 建图 / 渲染}？
+
+\textbf{核心思想}：以 3D 高斯为\emph{唯一}表示。跟踪 $=$ 冻结地图、对其渲染配准求位姿（\cref{eq:gs-track}），靠首次显式布出的 $\SE(3)$ 解析位姿雅可比（\cref{eq:gs-posejac} 接进 EWA/3DGS 链）走 $\ge\!50$ 次 Adam 迭代/帧；建图 $=$ 窗口内联合优化高斯参数与关键帧位姿。
+
+\textbf{关键结果}：纯单目即可在线 SLAM，新视角合成与轨迹估计达当时 SOTA，甚至重建微小、半透明物体。两个“显式红利”：各向同性正则 $E_{iso}=\sum_i\lVert\mathbf s_i-\tilde s_i\rVert_1$ 压住高斯沿视线方向拉长的伪影；几何验证剪枝删多视不一致的新高斯。无显式回环，靠窗口联合优化 $+$ 每迭代随机回采 2 帧历史关键帧防遗忘维持全局一致，活跑 $\sim\!3$\,fps。
+
+\textbf{与本书关系}：MonoGS 是 \cref{sec:gs-paradigm} \emph{map-centric} 范式的当代锚、本节渲染即跟踪的范本——把 \cref{sec:dense-radiance-slam} 提到的 ElasticFusion “map-centric”哲学从面元延续到高斯。它解的仍是母方程 \cref{eq:intro-nls}，只是地图与位姿在窗口里\emph{一起}当自由变量。
+
+\textbf{局限}：每帧对重高斯地图渲染配准既\emph{贵}（$\sim\!3$\,fps）又\emph{脆}（光度残差易陷局部极小、地图没建好时跟踪跟着飘），单目尺度也脆。这三条软肋，正是 \cref{sec:gs-decoupled} 那条“脱钩前端”路线要绕开的。
+\end{paper}
+
+\subsection{显式还是隐式：SplaTAM 把跟踪交给自动微分}
+
+MonoGS 把 \cref{eq:gs-posejac} 那条解析位姿雅可比\emph{亲手}推出、塞进 Gauss--Newton 骨架——这是\emph{显式}一极。同属 3DGS / map-centric / 渲染即跟踪、却走向另一极的，是把高斯与 SLAM 正式接上的开篇之作 SplaTAM：它\emph{一行位姿雅可比都不写}，把位姿当可微变量，让光度残差经自动微分自己反传回来。
+
+\begin{paper}[SplaTAM：把位姿交给自动微分的 RGB-D 高斯 SLAM]
+\textbf{简称 \& 出处}：SplaTAM（\emph{Splat, Track \& Map 3D Gaussians for Dense RGB-D SLAM}，Keetha 等，CVPR 2024，arXiv:2312.02126）\cite{keetha2024splatam}。
+
+\textbf{问题}：与 MonoGS 同一抱负——让一套 3D 高斯同时跟踪 / 建图 / 渲染；但问得更激进：\emph{能否完全不手推位姿雅可比}，把定位交给可微渲染的自动微分？
+
+\textbf{核心思想}：三件事让在线自动微分跑得稳。\textbf{(1) 各向同性简化}——丢球谐、令 $\boldsymbol\Sigma_i=r_i^2\mathbf I_3$，每个高斯只剩 $8$ 参（颜色 $\mathbf c_i$、中心 $\boldsymbol\mu_i$、半径 $r_i$、不透明度 $o_i$），投影退化成各向同性圆盘，前 / 反向都更轻（各向同性是\emph{论文默认}、非硬约束，官方后续提交已加回各向异性）。\textbf{(2) 轮廓掩码}——把 $\alpha$ 合成的“这束光线被挡住多少”累成一张可见性图 $S(\mathbf p)=\sum_i f_i(\mathbf p)\prod_{j<i}\big(1-f_j(\mathbf p)\big)$，编码\emph{地图的认知不确定性}：$S\!\approx\!1$ 已建图实体、$S\!\approx\!0$ 未探索虚空。\textbf{(3) 隐式跟踪}——把当前帧位姿 $(\mathbf q_t,\mathbf t_t)$ 注册成可微叶子张量、冻结全部高斯，最小化轮廓门控的 RGB-D 残差
+\[
+L_t=\sum_{\mathbf p}\mathbf 1\!\big(S(\mathbf p)>0.99\big)\Big(\lVert\hat{\mathbf D}_{\mathbf p}-\bar{\mathbf D}_{\mathbf p}\rVert_1+0.5\,\lVert\hat{\mathbf I}_{\mathbf p}-\bar{\mathbf I}_{\mathbf p}\rVert_1\Big),
+\]
+靠 \texttt{loss.backward()} $+$ Adam 一阶下降把梯度反传到位姿——\emph{全程没有正规方程、没有} $\mathbf J^\top\mathbf J$。
+
+\textbf{关键结果}：纯靠“自动微分 $+$ 恒速初值 $+$ 轮廓门控”，RGB-D 在线跟踪与建图达当时 SOTA。最硬的一条消融——\emph{去掉轮廓掩码，跟踪彻底失败}：新帧里“地图还没建到”的像素若也进残差，会把位姿往错处拽。
+
+\textbf{与本书关系}：SplaTAM 与 MonoGS 同解母方程 \cref{eq:intro-nls}、同走渲染即跟踪，唯一分水岭是\emph{位姿梯度怎么来}——一个显式解析、一个隐式自动微分。这条轴就是下面这则洞见。
+
+\textbf{局限}：(1) 一阶 Adam 无二阶曲率，比 MonoGS 的 Gauss--Newton \emph{更吃初值}；(2) 跟踪 / 建图\emph{交替冻结}、并非位姿 $+$ 高斯联合 BA（代码里联合分支恒关）；(3) 各向同性牺牲视角相关外观，深度梯度亦未回传。
+\end{paper}
+
+\begin{codebox}[Python]{隐式跟踪骨架（SplaTAM，精简）：一个开关让位姿拿梯度}
+# get_loss(): one differentiable renderer; a switch picks who receives gradients
+transformed = transform_to_frame(params, t_idx,
+                gaussians_grad=not tracking,   # tracking: freeze the whole map
+                camera_grad=tracking)          # tracking: only camera pose is a leaf var
+im, _, depth, sil = Renderer(...)(transformed) # differentiable raster: color / depth / silhouette
+mask = (sil > 0.99)                             # silhouette gate: trust well-mapped pixels only
+loss = l1(depth, gt_depth, mask) + 0.5 * l1(im, gt_im, mask)
+loss.backward(); optimizer.step(); optimizer.zero_grad()   # autodiff -> pose, no normal equations
+\end{codebox}
+
+\begin{insight}[显式解析雅可比 vs 隐式自动微分：同一条轴的两极]
+同一个渲染即跟踪、同一个光度残差，\emph{位姿梯度的来路}却分两极：
+\begin{itemize}
+  \item \emph{显式}（MonoGS）：亲手写出 $\partial\boldsymbol\mu_c/\partial\boldsymbol\xi=[\,\mathbf I_3\ -\boldsymbol\mu_c^\wedge\,]$、组装 $\mathbf H=\mathbf J^\top\mathbf J$、解正规方程——有\emph{二阶}曲率、吸引域大、步长自适应，代价是要自己推导、自己接进光栅器。
+  \item \emph{隐式}（SplaTAM）：位姿设成可微叶子，让自动微分替你反传——\emph{一阶}梯度下降、人不碰雅可比，代价是无二阶信息、更靠好初值与学习率。
+\end{itemize}
+这正是 \cref{ch:nlopt} 的老分野：显式 $=$ 自己写 Jacobian 喂 Gauss--Newton / LM，隐式 $=$ 交给自动微分跑 SGD；两者都精确，只差\emph{谁来求导、用几阶信息}。\textbf{还要分清“显式 / 隐式”的两层义}：在\emph{表示}层，3D 高斯是\emph{显式}几何基元（对照 NeRF 把场景藏进 MLP 的\emph{隐式}场，\cref{sec:dense-radiance-gs}）；在\emph{位姿求导}层，SplaTAM 用的是\emph{隐式}自动微分（对照 MonoGS 的显式解析雅可比）。两层正交，一句话收口——\textbf{SplaTAM $=$ 显式表示 $+$ 隐式（自动微分）位姿求导}。
+\end{insight}
+
+\begin{note}
+（兑现本节开头“初值值不值得投入”的扣子。）值得，而且\emph{越隐式越值}。\cref{eq:gs-track} 是非凸光度优化，两条路线都得靠好初值落进收敛盆地，但敏感度不同：MonoGS 的 Gauss--Newton 借 $\mathbf H\approx\mathbf J^\top\mathbf J$ 的曲率，吸引域更宽、步长更聪明；SplaTAM 的一阶 Adam 只有梯度方向，初值一远（急转、抖动、丢帧打破恒速假设）就易陷局部极小，甚至把错位高斯写进地图、酿成不可逆漂移。所以 SplaTAM 必配“双拐杖”——\emph{恒速外推}给初值、\emph{轮廓门控}限残差，把起点摆进盆地、把残差压在可信像素上。这与 \cref{ch:lidar_slam} 里 FAST-LIO 拿\emph{IMU 预积分}给每帧一个强初值，是同一套用心；SplaTAM 没有 IMU，只能退而用恒速模型，初值自然更脆。
+\end{note}
+
+\begin{pitfall}[“渲染即跟踪” $\ne$ 不需要初值]
+\textbf{错误}：以为靠渲染配准求位姿，就能从任意位姿收敛。\textbf{后果}：低纹理 / 弱光度梯度（白墙、过曝）或初值太差时跟踪发散，却归咎“高斯不行”。\textbf{根因}：\cref{eq:gs-track} 是\emph{非凸}光度优化，收敛盆地有限、依赖第一步的初值；MonoGS 的“宽收敛盆地”是相对而言、非无条件。\textbf{正确}：仍要喂像样初值（恒速外推 / 帧到帧），并配置信度 / 掩码（$\alpha$、silhouette）压低没建好、不可信区的权重，只让可信像素主导。
+\end{pitfall}
+
+\section{范式坐标：跟踪对齐谁、回环解谁}
+\label{sec:gs-paradigm}
+
+\subsection{一个最小二乘，三个岔路}
+
+\cref{sec:gs-online} 立了一根轴（完整 SLAM vs 里程计，后端纠不纠漂）。本节立\emph{另一根正交的轴}：跟踪对着谁、回环又解谁。这根轴在传统稀疏 SLAM 是个\emph{假问题}，到 NeRF / 3DGS 才第一次成真——是\textbf{相对传统 SLAM 唯一真正新的那一极}，也最容易把人绕晕。
+
+任何稠密 SLAM 都在反复解 $\min_{\mathbf x}\lVert\mathbf y-f(\mathbf x)\rVert^2$（母方程 \cref{eq:intro-nls}）。范式之争只看三个\emph{先后相扣}的岔路——前一个锁死后一个的可选范围，故有顺序、非彼此独立：
+
+\begin{description}
+  \item[岔路 0 · 观测归宿（前置，定生死）] 每帧观测\emph{留 body 系当相对量}（焊关键帧、全局地图 $\mathbf p^W=\mathbf T(\mathbf x)\,\mathbf p^B$ 临时拼出），还是\emph{融进一张全局地图}（surfel / TSDF、丢相对性）？这一选决定地图\emph{有没有独立几何自由度}，也就锁死岔路 2 能不能选“地图”。
+  \item[岔路 1 · 跟踪参照（求位姿）] 每帧残差参照\emph{地图}（render / 配准）还是\emph{帧间}（光流 / 特征）？这步 $\mathbf x$ 永远是位姿。
+  \item[岔路 2 · 回环自由变量（纠漂）] 纠漂时被解的 $\mathbf x$ 选\emph{位姿}还是\emph{地图几何}？
+\end{description}
+
+\textbf{为什么传统没有岔路 1。}传统地图稀疏、不可渲染，没人“渲染稀疏点云来跟踪”——选项根本不存在，脱钩是默认。NeRF / 3DGS 让地图\emph{又重、又可微可渲染}，“要不要对着这张重地图 analysis-by-synthesis 跟踪”第一次成了真选择。\emph{所以真正新的是“对重地图跟”那半；脱钩那半本就是 ORB-SLAM 套 3DGS。}（\cref{sec:gs-track} 的显式 / 隐式之分，整个活在“对地图跟”这一侧内部。）
+
+\subsection{三个名字，一格一列一行}
+
+\begin{insight}[litmus：被解的自由变量 $\mathbf x$ 是谁]
+判一篇稠密 SLAM 的耦合范式，只问\emph{回环纠漂时优化器解的 $\mathbf x$ 是什么}：解\emph{地图几何} $\Rightarrow$ \textbf{map-centric}（且前端也对地图，纯种，占 2$\times$2 一个\emph{格}）；解\emph{位姿} $\Rightarrow$ \textbf{pose-centric}（后端解位姿这\emph{一整列}）；前端\emph{根本不碰地图} $\Rightarrow$ \textbf{hybrid}（前端脱钩这\emph{一整行}）。一格、一列、一行，形状都不同，自然不是三兄弟。
+\end{insight}
+
+把前端（对不对地图）作行、后端（解谁）作列，2$\times$2 摆开（\cref{tab:gs-paradigm}）：
+
+\begin{table}[H]\centering
+\caption{耦合范式 2$\times$2：行 $=$ 前端跟不跟地图，列 $=$ 后端解谁}
+\label{tab:gs-paradigm}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+前端 $\downarrow$／后端 $\rightarrow$ & 解地图 & 解位姿 & 无回环（里程计）\\
+\midrule
+\textbf{对地图跟} & ElasticFusion〔纯 map-centric〕& FAST-LIO-SLAM、ORB-SLAM & 裸 FAST-LIO2、MonoGS$^\ast$ \\
+\textbf{不碰地图（hybrid）}& 罕见 / 空 & \textbf{HI-SLAM2}、MAGiC & 纯 DROID-VO \\
+\bottomrule
+\end{tabular}
+\end{table}
+\noindent{}$^\ast$\,MonoGS 对贵渲染地图跟、无显式回环，靠窗口联合优化凑全局一致。\textbf{读法}：map-centric $=$ 左上一格；pose-centric $=$“解位姿”整列；hybrid $=$“不碰地图”整行。HI-SLAM2 落在 hybrid 行 $\cap$ pose-centric 列 $=$ \emph{既是 hybrid 又是 pose-centric}（两标签答不同岔路、不打架）。
+
+\subsection{逐个范式：用自由变量的语言}
+
+\begin{description}
+  \item[map-centric（地图当王）] 观测融进全局可形变地图、丢 body 系相对性 $\Rightarrow$ 地图长出独立几何自由度。前端残差对地图（render / 对 surfel 的 ICP），地图此刻冻结当尺子、解位姿；后端 $\mathbf x=$\emph{地图几何}（移 surfel / 形变节点），位姿 $=h(\mathbf x)$ 是副产品——签名 \emph{Without a Pose Graph}。软肋：每帧对重地图配准贵、光度陷局部最小、地图烂 $\to$ 跟踪烂。
+  \item[pose-centric（位姿当王）] 观测留 body 系相对量焊关键帧；地图 $\mathbf p^W=\mathbf T(\mathbf x)\,\mathbf p^B$ 临时拼、无独立自由度 $\Rightarrow$ \emph{只能解位姿}。前端不限定（对地图如 FAST-LIO、对帧如 ORB），解的都是位姿；后端 $\mathbf x=$\emph{位姿}，地图当乘客按新位姿刚体重贴（\cref{eq:gs-rigid}）。软肋：地图只能\emph{刚体重贴}，关键帧 / 子图\emph{内部}漂移焊死——便宜换的。
+  \item[hybrid（脱钩前端 $+$ 借来的位姿后端）] 观测也留 body 系相对量。前端残差\emph{只在帧间}、式里\emph{没有地图项} $\mathbf y=\check{\mathbf p}_{ij}-\boldsymbol\pi\big(\mathbf T_{ij}(\mathbf x)\,\boldsymbol\pi^{-1}(\mathbf p_i,d_i)\big)$，地图（3DGS）纯下游、连跟踪都不看它；后端照搬 pose-centric。本质：\textbf{hybrid $=$“脱钩前端”$+$“pose-centric 后端”的合称}，不是与 pose-centric 并列的第三极。动因：躲开 map-centric“每帧对重高斯地图跟、又贵又脆”那个坑。
+\end{description}
+
+\subsection{一个回环，两种修法（与一个易错点）}
+
+绕屋一圈回起点、地图现裂缝。两种修法各钉一次自由变量：\textbf{pose-centric} 调每个相机位姿、误差摊位姿图，地图跟着位姿归位（\emph{动轨迹}）；\textbf{map-centric} 直接抓地图表面掰、误差摊地图（\emph{动地图}）。
+
+\begin{pitfall}[“改关键帧来改地图” $=$ pose-centric，不是 map-centric]
+\textbf{错误}：见回环后地图被纠正，就以为是 map-centric。\textbf{后果}：把 FAST-LIO-SLAM、HI-SLAM2、子图刚体派全误判成 map-centric，litmus 失灵。\textbf{根因}：纯 map-centric（ElasticFusion）改的是\emph{地图节点}（deformation graph 直接形变面元）；而“改关键帧位姿 $\to$ 拖动地图”解的仍是\emph{位姿}，是 pose-centric。\textbf{正确}：只问 litmus——优化器的自由变量 $\mathbf x$ 是地图几何还是位姿。子图刚体派（MAGiC / LoopSplat）整块高斯子图刚体挪位，解的是子图位姿，仍归 pose-centric。
+\end{pitfall}
+
+\begin{note}
+\textbf{LiDAR 锚点：FAST-LIO-SLAM $\leftrightarrow$ HI-SLAM2 同构.}\;
+读者的母语里早有这套坐标（\cref{ch:lidar_slam}）。\textbf{FAST-LIO2}（裸里程计）对 ikd-Tree 地图做点面配准求位姿、地图当尺子——“对地图跟”行、无回环格。挂上 \textbf{FAST-LIO-SLAM}（Scan Context $+$ GTSAM 外挂位姿图回环）后，回环解位姿、地图跟着刚体归位——\emph{pose-centric}。这与 HI-SLAM2“DROID 前端 $+$ $\mathrm{Sim}(3)$ 位姿图回环、3DGS 当乘客”\emph{结构同构}，只是前端测量从点面换光流、地图从点云换高斯。换言之：把 FAST-LIO-SLAM 的点云地图换成可渲染高斯、点面前端换成可微渲染或光流，就得到本章的系统。
+\end{note}
+
+\section{解耦式几何感知高斯 SLAM}
+\label{sec:gs-decoupled}
+
+\subsection{装配：DROID 打底，高斯当下游}
+
+HI-SLAM2 是 \cref{sec:gs-paradigm} 那张 2$\times$2 表里 hybrid 行 $\cap$ pose-centric 列的本体，也是 \cref{sec:gs-online} “完整 SLAM” B 营的代表。它把四件事分给四个成熟模块（\cref{tab:gs-hislam2}），\emph{没有一件让 3DGS 去算几何}：
+
+\begin{table}[H]\centering
+\caption{HI-SLAM2 四模块：几何全在 DROID/PGBA 那层，3DGS 是下游}
+\label{tab:gs-hislam2}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+模块 & 干什么 & 来路 \\
+\midrule
+在线跟踪 & 学习式稠密 BA 估位姿 $+$ 逐像素深度 & DROID 光流 BA（\cref{ch:learning}）\\
+在线回环 & 光流距离检测 $+$ $\mathrm{Sim}(3)$ PGBA & 治单目尺度漂移 \\
+连续建图 & 增量几何感知 3DGS（深度 / 法向监督）& 3DGS 下游乘客 \\
+离线精修 & 全 BA $+$ 位姿-地图联合 $+$ TSDF 网格 & 三段收尾（\cref{sec:gs-geom}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{跟踪 $=$ DROID 稠密光流 BA \cite{teed2021droid}。}RAFT 式循环光流给出逐像素对应 $\check{\mathbf p}_{ij}=\mathbf p_i+\mathbf f$，最小化重投影残差（HI-SLAM2 论文 Eq.1）
+\begin{equation}
+\arg\min_{\mathbf T,\,\mathbf d}\sum_{(i,j)\in\mathcal E}\big\lVert\,\check{\mathbf p}_{ij}-\boldsymbol\pi\big(\mathbf T_{ij}\,\boldsymbol\pi^{-1}(\mathbf p_i,\mathbf d_i)\big)\big\rVert^2_{\boldsymbol\Sigma_{ij}} ,
+\label{eq:gs-droidba}
+\end{equation}
+权 $\boldsymbol\Sigma_{ij}$ 是光流置信度（遮挡 / 弱纹理降权），\emph{位姿 $\mathbf T$ 与逆深度 $\mathbf d$ 一起解}（稠密 BA、非仅位姿；Schur 先位姿后回代深度，\cref{sec:vo-schur}）。这正是 \cref{sec:gs-paradigm} 说的 hybrid 前端——式里\emph{没有一个高斯项}。\cref{ch:learning} 已把 DROID 讲透，此处原样借用，只接一层\emph{深度代理}：DROID 吐的逐像素逆深度反投影成点云，当高斯地图的种子（\cref{sec:gs-paradigm} ORB 换件表里“3DGS 时代才需要”的那一格）。
+
+\subsection{JDSA：把单目深度先验的尺度对齐（头号原创）}
+
+DROID 的稠密深度在低纹理、低光流置信区是空的；补一张单目深度先验（Omnidata 预测网，\cref{ch:learning}）能填洞，但\emph{先验是相对深度、尺度逐区不一致}，直接用会把几何拉歪。HI-SLAM2 的招牌动作 JDSA（Joint Depth-Scale Alignment）用一张\emph{逐像素空间变化的 scale 网格}对齐：每张先验配一个 $2\times2$ 的 scale 网格 $\mathbf s_i$，像素处 scale 由双线性插值 $\mathrm{Bi}(\mathbf p_i,\mathbf s_i)$ 给出，先验因子
+\begin{equation}
+r_d=\big\lVert\,\check{\mathbf d}_i\cdot\mathrm{Bi}(\mathbf p_i,\mathbf s_i)-\mathbf d_i\,\big\rVert^2 ,
+\label{eq:gs-jdsa}
+\end{equation}
+$\check{\mathbf d}_i$ 是相对深度先验、$\mathbf d_i$ 是系统深度。\textbf{JDSA 单独解、不混进主 BA}——否则尺度自由度会让尺度漂移难收敛。它靠一次 Schur 消元（\cref{sec:vo-schur}）：scale 块小、深度块对角，先解 $\Delta\mathbf s$ 再回代 $\Delta\mathbf d$。
+
+\begin{insight}[为什么深度块对角——Schur 才便宜]
+JDSA 的深度块 $\mathbf C$ 是\emph{对角}的，关键在 \cref{eq:gs-jdsa} 里 scale 只乘在\emph{先验常量} $\check{\mathbf d}_i$ 上、不跨像素耦合深度变量——于是逐像素深度彼此独立，$\mathbf C$ 对角、Schur 补里的 $\mathbf C^{-1}$ 廉价。这与重投影 BA“结构块（路标）对角、先消结构”是\emph{同一个便宜}（\cref{sec:nlopt-ba}），只是这里被消的是逐像素深度、留下一个小小的 scale 系统。去掉 JDSA，低纹理区要么空洞、要么被未对齐的先验拉歪——它是 HI-SLAM2 几何质量的承重件。
+\end{insight}
+
+\begin{note}
+\textbf{代码口径（已核）.}\;JDSA 在\emph{视差}（逆深度）空间做，故 \cref{eq:gs-jdsa} 的深度雅可比 $\mathbf J_d=\mathbf 1$ 精确（\texttt{geom/ba.py} 里精确逆深度雅可比 $-1/\mathbf d^2$ 被注释掉、直接置一）；深度 / 法向先验网是 Omnidata（两个单任务 DPT，非 Metric3D）。这些是“论文没明说、读代码才见”的口径。
+\end{note}
+
+\subsection{$\mathrm{Sim}(3)$ 回环：治单目尺度漂移}
+
+单目重建的尺度随路程缓慢漂移，回环闭合时两端尺度对不上。\textbf{为何用 $\mathrm{Sim}(3)$（7 自由度、含尺度）而非 $\SE(3)$}：$\SE(3)$ 锁死 scale$=1$、纠不了尺度漂移；$\mathrm{Sim}(3)$ 多出的那一维相似变换正好吸收尺度差（\cref{ch:lie}）。
+
+\textbf{回环检测无外观描述子}——纯\emph{光流距离}（共视几何）：三闸把关（光流距离够近、相机朝向夹角够小、帧序在窗口外），每次取 top-$k$ 候选。这与下一章 MAGiC 一脉用 DINOv2 外观描述子检索回环\emph{走相反路线}（几何 vs 外观），是两类多机系统的一个分水岭。
+
+检出后做 $\mathrm{Sim}(3)$ 位姿图优化（PGBA）：位姿升到 $\mathrm{Sim}(3)$，相对位姿误差
+\begin{equation}
+\mathbf e_{ij}=\mathrm{Log}\big(\mathbf S_{ij}^{-1}\,\mathbf S_i^{-1}\,\mathbf S_j\big),\qquad \mathbf S\in\mathrm{Sim}(3),
+\label{eq:gs-sim3pgo}
+\end{equation}
+就是 \cref{sec:nlopt-posegraph} 的位姿图、把群换成含尺度的 $\mathrm{Sim}(3)$；几步高斯牛顿解完，每帧得一个尺度校正 $\Delta s$。位姿一动，地图\emph{跟着}动——高斯均值与朝向按相对 $\SE(3)$、scale 按 $\mathrm{Sim}(3)$ 闭式形变（HI-SLAM2 论文 Eq.12），正是 \cref{sec:gs-paradigm} 里“pose-centric 回环、地图当乘客刚体重贴”那一步（\cref{eq:gs-rigid} 的含尺度版）。
+
+\subsection{几何感知建图：既渲得真、又测得准}
+
+种子高斯由关键帧逆深度反投影点云得到（均值 $\boldsymbol\mu$、scale 取最近 3 邻均距、颜色直接取像素 RGB 而非球谐——省 view-dependent 一路，回环搬高斯也不必重算颜色）。建图损失在光度之外叠两条\emph{几何监督}：
+\begin{equation}
+\mathcal L=\lambda_c\mathcal L_c+\lambda_d\mathcal L_d+\lambda_n\mathcal L_n+\lambda_s\mathcal L_s ,
+\label{eq:gs-geoloss}
+\end{equation}
+$\mathcal L_n$ 法向项（渲染深度梯度叉积出的法向 vs Omnidata 法向先验、cosine 对齐）、$\mathcal L_s$ scale 正则。再加一招\emph{无偏深度}（RaDe-GS）：取光线与高斯的\emph{实际交点}深度、而非高斯\emph{均值}深度，去掉中心偏置——这一步让渲染深度可信，下游 TSDF 才融得准（\cref{sec:gs-geom}）。
+
+\begin{insight}[“几何引擎不是 GS”在这里落地]
+回看 \cref{sec:gs-online} 那条 pitfall：HI-SLAM2 的深度、位姿、尺度全在 DROID/PGBA 那层算完，3DGS 只是\emph{吃}算好的深度 / 位姿去建图、再用法向 / scale 正则把面贴平。所以它“渲得真”靠 3DGS、“测得准”靠几何监督 $+$ 无偏深度，而\emph{定位精度}靠的根本不是高斯——这正是 B 营“GS 当渲染器”的样板。
+\end{insight}
+
+\subsection{范式锚二：HI-SLAM2}
+
+\begin{paper}[HI-SLAM2：给可渲染地图配一套成熟几何后端]
+\textbf{简称 \& 出处}：HI-SLAM2（\emph{Geometry-Aware Gaussian SLAM for Fast Monocular Scene Reconstruction}，Wei Zhang 等，IEEE T-RO 2025，arXiv:2411.17982）\cite{zhang2024hislam2}。
+
+\textbf{问题}：MonoGS 那类 map-centric（\cref{sec:gs-track}）每帧对重高斯地图渲染配准——又贵又脆、单目尺度脆、且无真回环。能否给可渲染高斯地图配一套\emph{成熟、准、有真全局优化}的几何后端？
+
+\textbf{核心思想}：彻底脱钩（\cref{sec:gs-paradigm} 的 hybrid）。跟踪交给 DROID 稠密光流 BA（\cref{eq:gs-droidba}）、回环交给 $\mathrm{Sim}(3)$ PGBA（\cref{eq:gs-sim3pgo}），3DGS 退为\emph{几何感知}的下游地图。真正的单点原创是 JDSA 的 $2\times2$ scale 网格（\cref{eq:gs-jdsa}）与接 3DGS 的地图形变。
+
+\textbf{关键结果}：纯单目 RGB 的\emph{完整}稠密 SLAM，在线跟踪精度反超经典稠密法，几何感知高斯经 TSDF 出可测网格——正面兑现了 \cref{sec:dense-radiance-slam} 留下的“辐射场 SLAM 重在重建”那道悬念。
+
+\textbf{与本书关系}：它是 \cref{sec:gs-paradigm} hybrid $\cap$ pose-centric 的本体、与 \cref{ch:lidar_slam} FAST-LIO-SLAM 结构同构；其两支多机扩展（MCGS、MAGS）是下一章的主线之一。
+
+\textbf{局限}：跟踪 / 回环\emph{不在 GS 上重新发明}、而是继承 DROID 与前作 HI-SLAM 的 $\mathrm{Sim}(3)$ PGBA——“GS-SLAM”名字陷阱（\cref{sec:gs-online}）的典型；后端是\emph{离线}收尾（全 BA $+$ 联合精修跑完才补一次全局），运行时各帧仍以未校正位姿前进；子图 / 关键帧\emph{内部}漂移仍焊死（pose-centric 通病，\cref{sec:gs-paradigm}）。
+\end{paper}
+
+\section{前馈点图 SLAM：另一条表示底座}
+\label{sec:gs-pointmap}
+
+\subsection{第三条表示底座：点图}
+
+\cref{sec:gs-online} 列过三条表示底座，前两节走的是 3DGS 一支（MonoGS 的 map-centric、HI-SLAM2 的 hybrid）。第三条\emph{既不用高斯、也不用神经场}：让前馈基石模型直接吐\emph{逐像素 3D 点图}（point-map）当几何底座。
+
+基石模型（MASt3R \cite{leroy2024mast3r}，\cref{ch:learning}）吃两张图、直接回归出\emph{同一坐标系下}的逐像素 3D 点 $\mathbf X$（带置信度 $\mathbf C$）——一步给出几何\emph{与}跨图对应，\emph{不需要相机位姿、甚至不需要内参先验}。这正是点图相对 3DGS / 神经场的取舍轴落点（\cref{sec:gs-online}）：\emph{强在免位姿先验的前端关联}（前馈直接给几何对应），\emph{弱在不可渲染}（要新视角得再转一道）。
+
+\begin{note}
+\textbf{点图底座的家谱.}\;MASt3R 不是孤例，而是 DUSt3R 开创的\emph{前馈点图}一脉的一支。原型 \textbf{DUSt3R} 把“先求相机、再求几何”的传统链整个倒过来：一个 Transformer 吃两张\emph{无位姿、无内参}的图，直接回归\emph{统一在第一相机系}下的逐像素点图，内外参反倒是\emph{事后从点图反解}——几何不再过 SfM 前端。\textbf{MASt3R} 在其上加一个稠密描述子头，换来度量级的局部匹配（MASt3R-SLAM 的射线匹配正用它）。同脉兄弟各补一块在线 / 多视短板：\textbf{Spann3R} 加空间记忆做增量、\textbf{CUT3R} 用递归持久状态做在线、\textbf{Fast3R} 一次前向吃多图、\textbf{VGGT} 一张大网同出位姿 / 深度 / 点图（\textbf{MonST3R} 则把它推广到动态视频，呼应 \cref{ch:dynamic}）。MASt3R-SLAM 取这家谱里\emph{最适合做匹配}的 MASt3R 当地基、再套上 SLAM 回路——\emph{底座给免位姿的关联，SLAM 给时序与闭环}。
+\end{note}
+
+\subsection{点图怎么撑起一套 SLAM}
+
+把双视先验做成实时单机稠密 SLAM，要回答“匹配 / 跟踪 / 建图 / 回环 / 后端”各用什么。MASt3R-SLAM 的答案每一格都把点图用到底：
+\begin{itemize}
+  \item \textbf{匹配}：不暴力搜描述子，而把参考帧点图归一化成\emph{射线图}（每像素一条单位射线 $\psi(\mathbf X)=\mathbf X/\lVert\mathbf X\rVert$），对来帧每个 3D 点迭代调它在参考帧的像素位置、直到\emph{射线角误差}最小（CUDA 里 10 轮 LM、约 2\,ms）。
+  \item \textbf{跟踪}：通用相机模型 $\psi$ $+$ ray/range 残差 $E_r=\sum\lVert\psi(\tilde{\mathbf X}_k^k)-\psi(\mathbf T_{kf}\mathbf X_f^f)\rVert$，对相对 $\mathrm{Sim}(3)$（\cref{ch:lie}）做高斯牛顿——\emph{无内参也能跑}。
+  \item \textbf{建图}：置信度加权点图融合（多视滑动平均压噪）。
+  \item \textbf{回环}：同一网络特征做 ASMK 增量检索、解码加边。
+  \item \textbf{后端}：二阶 $\mathrm{Sim}(3)$ 全局高斯牛顿、稀疏 Cholesky、钉死首帧消 gauge 自由度（\cref{sec:nlopt-posegraph}）。
+\end{itemize}
+
+\begin{insight}[比方向、不比点——ray 残差为何抗错]
+全文最值得学的一个选择，是跟踪残差比\emph{射线方向}而非\emph{3D 点本身}。直接最小化 3D 点误差对\emph{深度预测错误}极敏感（基石模型的深度时常不一致）；把点归一化成单位射线、只比\emph{方向}，对深度错误天然不敏感、角误差还有界抗外点。代价是纯旋转下射线全平行、解不出平移（退化），于是再加一个\emph{小权重}的距离残差兜底。“ray 主 $+$ dist 辅 $+$ 通用相机”这一招是它免内参能力的全部秘密——也是继 \cref{sec:gs-track} 光度残差、\cref{eq:gs-droidba} 重投影残差之后，又一种把母方程残差\emph{换皮}的范例。
+\end{insight}
+
+\subsection{范式锚三：MASt3R-SLAM}
+
+\begin{paper}[MASt3R-SLAM：拿前馈三维先验当 SLAM 地基]
+\textbf{简称 \& 出处}：MASt3R-SLAM（\emph{Real-Time Dense SLAM with 3D Reconstruction Priors}，Murai、Dexheimer、Davison，CVPR 2025，arXiv:2412.12392）\cite{murai2025mast3rslam}。
+
+\textbf{问题}：经典稠密 SLAM 要标定相机、要从零估深度与对应。能否直接\emph{借用}一个吃两张图就吐逐像素 3D 点的基石模型当 SLAM 的几何地基——\emph{连内参都不要}？
+
+\textbf{核心思想}：以点图为唯一几何表示。点图迭代投影\emph{匹配}替光流、ray/range 残差 $+$ 通用相机 $\psi$ 做\emph{跟踪}、置信度加权\emph{融合}做地图、ASMK \emph{检索}回环、二阶 $\mathrm{Sim}(3)$ 全局 GN 做\emph{后端}。
+
+\textbf{关键结果}：实时（约 15\,FPS）单机稠密 SLAM，\emph{不假设任何参数相机模型}（只设单一光心），无内参也能跑。
+
+\textbf{与本书关系}：它是 \cref{sec:gs-online} 三条表示底座里\emph{点图}那条的当代锚——与 3DGS 两支（\cref{sec:gs-track,sec:gs-decoupled}）并列；其单机点图栈，是下一章 CoMo3R 多机扩展\emph{逐件复制}的源头。
+
+\textbf{局限}：点图\emph{不可渲染}（要逼真新视角得再接一层渲染）；几何精度受基石模型深度一致性所限（ray 残差正为绕开这点而设）；尺度仍是 $\mathrm{Sim}(3)$ 的自由度（相对、非度量）。
+\end{paper}
+
+\section{从高斯到网格：几何感知与表面导出}
+\label{sec:gs-geom}
+
+\subsection{高斯先贴成面，深度才可信}
+
+3DGS 的高斯本是\emph{体}椭球，直接取深度有偏，出网格会噪。要出可测网格，得先让高斯\emph{贴面}：\cref{sec:gs-decoupled} 的法向监督 $\mathcal L_n$ 与 scale 正则 $\mathcal L_s$ 把椭球压扁、把朝向对齐表面法向；再用无偏深度（取光线-高斯交点、而非均值深度，\cref{sec:gs-decoupled}）去掉中心偏置。两步之后，渲染深度才够准、可拿去融。
+
+\subsection{网格出口：渲染深度过 TSDF}
+
+有了可信的渲染深度，出网格就\emph{不必另起炉灶}——直接复用经典稠密那条成熟管线（\cref{ch:dense}）：把各关键帧的渲染深度做 TSDF 融合（\cref{sec:dense-tsdf}）、再 Marching Cubes 抽等值面（\cref{sec:dense-mesh}）。HI-SLAM2 的实现就是一个\emph{独立脚本}（SLAM 跑完单独执行 \texttt{tsdf\_integrate.py}、Open3D 体素块网格、voxel $0.03$），不在建图回路内。
+
+\begin{note}
+\textbf{与面元一脉相承.}\;\cref{sec:dense-surfel} 埋过一句：把带朝向的“小圆盘”面元换成带不透明度的三维高斯椭球，就通向可渲染地图。本章正是那句的兑现——而出网格时，高斯又被\emph{压扁回}近似面元的薄片、走和面元 / TSDF 同一条网格化老路。\textbf{表示换了皮，几何出口仍是经典那套}（\cref{ch:dense}）。
+\end{note}
+
+\section{常见误解与传统对照}
+\label{sec:gs-pitfalls}
+
+\subsection{三个最常见的误读}
+
+前面各节已沿途破了几个名字陷阱（\cref{sec:gs-online} 冠名陷阱、\cref{sec:gs-track} 初值、\cref{sec:gs-paradigm} 改关键帧）。这里收拢三个跨系统的高频误读：
+
+\begin{pitfall}[“稠密”不等于“map-centric”]
+\textbf{错误}：见系统用稠密地图，就归它 map-centric。\textbf{后果}：把 DROID、HI-SLAM2 这类\emph{稠密但脱钩}的系统误判。\textbf{根因}：map-centric 由 litmus（回环解地图几何）定，与地图稠不稠密无关——DROID 地图稠密，前端却根本不对地图跟、后端解位姿，是 hybrid（\cref{sec:gs-paradigm}）。\textbf{正确}：先问 litmus，别看地图密度。
+\end{pitfall}
+
+\begin{pitfall}[以为 GS-SLAM “抛弃了传统几何”]
+\textbf{错误}：把可渲染 SLAM 当成与经典 SLAM 决裂的新物种。\textbf{后果}：看不出它们仍解母方程、仍靠 BA / 位姿图 / Schur。\textbf{根因}：3DGS 换的只是\emph{地图表示}与\emph{一种残差}；HI-SLAM2 的定位全在 DROID 几何栈、MASt3R-SLAM 的后端是 $\mathrm{Sim}(3)$ GN——经典几何一点没少。\textbf{正确}：把每个系统翻回母方程的哪个零件被换（\cref{sec:gs-online}）。
+\end{pitfall}
+
+\begin{pitfall}[“渲染深度 $=$ 高斯中心深度”]
+\textbf{错误}：以为渲染出的深度就是高斯均值沿光线的深度。\textbf{后果}：TSDF 融合带中心偏置、网格糊。\textbf{根因}：高斯是\emph{体}、有展布，均值深度有偏；无偏深度取\emph{光线-高斯交点}（\cref{sec:gs-geom}）。\textbf{正确}：要出可测网格，用无偏深度、别用中心深度。
+\end{pitfall}
+
+\subsection{与激光 SLAM 对照}
+
+读者的母语是激光（\cref{ch:lidar_slam}）。把这一章逐件摆到 FAST-LIO 旁边（\cref{tab:gs-lidar}）：
+
+\begin{table}[H]\centering
+\caption{可渲染 GS-SLAM 与激光 SLAM 逐件对照}
+\label{tab:gs-lidar}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & 激光（FAST-LIO 一脉）& 可渲染 GS-SLAM \\
+\midrule
+地图 & ikd-Tree 点云 & 3D 高斯（可渲染、可刚体搬）\\
+跟踪残差 & 点到面 $\mathbf n^\top(\mathbf T\boldsymbol\mu-\mathbf q)$ & 光度渲染 / 重投影 / ray \\
+位姿雅可比 & $[\,\mathbf I\ -\boldsymbol\mu^\wedge\,]$ & $[\,\mathbf I\ -\boldsymbol\mu_c^\wedge\,]$（同骨架）\\
+回环 & Scan Context $+$ GTSAM PGO & 光流距离 / DINOv2 $+$ $\mathrm{Sim}(3)$ PGO \\
+尺度 & 激光天然度量 & 单目靠 $\mathrm{Sim}(3)$ 治漂 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{母语桥.}\;FAST-LIO2 “对 ikd-Tree 地图做点面配准求位姿”那股\emph{对地图跟}的味道，与 map-centric 跟踪同源——但 litmus 不同：FAST-LIO-SLAM 回环\emph{解位姿}（pose-centric），不是 ElasticFusion 那样解地图。换皮三处：点云 $\to$ 高斯、点到面 $\to$ 光度渲染、激光度量 $\to$ 单目 $\mathrm{Sim}(3)$，骨架（母方程 $+$ 右扰动 $+$ 位姿图）原样。\textbf{把这一章当成“激光 SLAM 换上可渲染地图与可微残差”，就抓住了。}
+\end{note}
+
+\section{本章小结与速查}
+\label{sec:gs-summary}
+
+\subsection{知识点总表}
+
+\begin{table}[H]\centering
+\caption{本章知识点与难度（$\star$ 必学 / $\star\star$ 核心 / $\star\star\star$ 进阶）}
+\label{tab:gs-points}
+\small
+\begin{tabular}{@{}lcl@{}}
+\toprule
+知识点 & 难度 & 落点 \\
+\midrule
+高斯 SLAM 仍解母方程（换表示 $+$ 残差）& $\star\star$ & \cref{sec:gs-online} \\
+闭式刚体可搬 \cref{eq:gs-rigid} & $\star\star$ & \cref{sec:gs-online} \\
+渲染即跟踪 $\SE(3)$ 位姿雅可比 & $\star\star\star$ & \cref{sec:gs-track} \\
+范式坐标 map / pose / hybrid 与 litmus & $\star\star\star$ & \cref{sec:gs-paradigm} \\
+JDSA $2\times2$ scale 网格 $+$ Schur & $\star\star\star$ & \cref{sec:gs-decoupled} \\
+$\mathrm{Sim}(3)$ 回环治单目尺度漂 & $\star\star$ & \cref{sec:gs-decoupled} \\
+点图 ray/range 残差与通用相机 & $\star\star\star$ & \cref{sec:gs-pointmap} \\
+无偏深度 $+$ TSDF 出网格 & $\star\star$ & \cref{sec:gs-geom} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{故障排查}
+
+\begin{table}[H]\centering
+\caption{高斯 SLAM 常见故障排查}
+\label{tab:gs-trouble}
+\small
+\begin{tabular}{@{}p{3.2cm}p{4.2cm}p{4.6cm}@{}}
+\toprule
+症状 & 可能原因 & 排查 / 对策（相关节）\\
+\midrule
+跟踪发散 / 漂 & 初值差、低纹理光度梯度弱 & 查初值源（恒速 / 帧到帧），加置信度 / silhouette 掩码（\cref{sec:gs-track}）\\
+网格糊 / 有偏 & 用了高斯中心深度、高斯没贴面 & 开法向 / scale 正则，用无偏深度（\cref{sec:gs-geom}）\\
+单目尺度持续漂 & 回环用 $\SE(3)$ 锁死尺度 & 换 $\mathrm{Sim}(3)$ PGBA（\cref{sec:gs-decoupled}）\\
+低纹理区几何空洞 & 无深度先验或先验未对齐 & 上 JDSA 逐像素 scale 网格（\cref{sec:gs-decoupled}）\\
+范式判错 & 看了地图密度而非 litmus & 只问“回环解谁”（\cref{sec:gs-paradigm}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{过渡：通向多机}
+
+本章把单机可渲染 SLAM 的\emph{三条表示底座}（3DGS / 神经场 / 点图）与\emph{范式坐标}（map / pose / hybrid）立清，并各立一个锚：MonoGS（map-centric 渲染即跟踪）、HI-SLAM2（hybrid 解耦 $+$ 几何感知）、MASt3R-SLAM（前馈点图）。
+
+下一章把它们\emph{复制到多机}。核心红利正是 \cref{eq:gs-rigid} 那两行\emph{闭式刚体可搬}：每个 agent 各建一块子图，回环 / 合并时给整块高斯子图乘一个 $\mathbf T$ 就拼进全局——神经场做不到、点云不可渲染，唯独高斯一身集齐。三个单机锚于是各长出一脉多机系统：HI-SLAM2 一脉（MCGS、MAGS）、MASt3R-SLAM 一脉（CoMo3R）、RGB-D 子图一脉（MAGiC、Coko）。它们怎么分子图、怎么搬高斯、怎么检测跨机回环、怎么省带宽，是下一章的事。

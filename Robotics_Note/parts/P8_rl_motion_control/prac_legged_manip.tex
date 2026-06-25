@@ -1,0 +1,1441 @@
+\chapter{四足机械臂移动操作}\label{ch:rlmc-leggedmanip}
+
+% ════════════════════════════════════════════════════════════════
+%  「强化学习运动控制」(P8_rl_motion_control) 的复合形态实战章。
+%  主线：算法/概念领路 —— 先把 loco-manipulation 的「耦合结构」讲清
+%  （底盘 locomotion 与机械臂 manipulation 的逆运动学/动力学/感知三重耦合、
+%   whole-body 端到端 vs 分层解耦），假定读者已有 RL 与单形态实战基础
+%  （观测/动作 \cref{ch:rlmc-obsact}、奖励课程 \cref{ch:rlmc-reward}、
+%   四足 \cref{ch:rlmc-quadloco}、操作 \cref{ch:rlmc-manip}），不重教；
+%   再在每个概念下排布 mjlab / Isaac Lab / UniLab 三框架对比实战。
+%  源稿 RL运控/Ch19_四足机械臂移动操作.md（mjlab + Isaac Lab 双框架）已按本主线重构，
+%  并对 VBC / ETH 羽毛球论文事实与两框架关键 API 做了联网核对（见各 \rebuilt / \pz 标注）。
+%  UniLab 三框架对照已据服务器实装框架（commit 99936e08）的源码 + 实跑补全：
+%  go2_arm_manip_loco 任务（Go2+Airbot 臂、全程无夹爪、臂用 Diff-IK 残差驱动、
+%  EE 目标在球面采样的 loco-manip reaching）、非 Manager 架构的手写 obs/reward、
+%  actor/critic 同 79 维仅 noise 非对称、后端位置执行器 PD 等。
+% ════════════════════════════════════════════════════════════════
+
+本章是「强化学习运动控制」部里第一个\textbf{复合形态}实战章。在此之前，\cref{ch:rlmc-quadloco} 教会了四足底盘怎么\emph{走}，\cref{ch:rlmc-manip} 教会了机械臂怎么\emph{抓}——它们各自的基座是固定的：四足任务里没有手，操作任务里底座不动。本章让底座「活」起来：四足底盘提供\emph{移动性}（mobility），机械臂提供\emph{操作性}（manipulability），二者\emph{同时}工作。读者很快会发现，移动操作（loco-manipulation）的核心工程挑战\textbf{不是}「locomotion 加 manipulation」的简单拼接，而是两者耦合产生的「积」——底盘的每一步都改变臂末端在世界系中的位置，臂的每一个动作都改变整机的重心与角动量，一套感知系统又要同时服务导航与操作。
+
+因此本章仍遵循全书「算法/概念领路、实践兑现」的次序：先把移动操作的\textbf{耦合结构}与两条主流方法论（whole-body 端到端 vs 分层解耦）讲清——这是后面一切「接线」的契约；再把每个概念落成 mjlab / Isaac Lab / UniLab 三框架的对比实战。\textbf{假定读者已掌握} RL 基础（理论部）、观测/动作设计（\cref{ch:rlmc-obsact}）、奖励与课程设计（\cref{ch:rlmc-reward}）、域随机化（\cref{ch:rlmc-dr}）、特权学习与师生蒸馏（\cref{ch:rlmc-privileged}）、四足速度跟踪（\cref{ch:rlmc-quadloco}）与操作（\cref{ch:rlmc-manip}）。本章不重教这些，只聚焦移动操作\emph{特有}的扩展与动手环节。两个完整案例——CoRL'24 的 VBC（分层）与 Science Robotics'25 的 ETH 羽毛球（端到端）——分别代表「工程简洁性」与「性能极限」的两端。
+
+% ════════════════════════════════════════════════════════════════
+\section{环境配置与版本兼容}
+\label{sec:rlmc-lm-setup}
+
+本章假定你已按 \cref{ch:rlmc-setup} 装好至少一个框架，并已能跑通 \cref{ch:rlmc-quadloco} 的四足速度跟踪与 \cref{ch:rlmc-manip} 的操作任务。这里只补充\textbf{移动操作额外需要核对的版本点与资产来源}，不重复通用安装流程。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.4cm}p{3.2cm}p{3.2cm}p{4.4cm}@{}}
+\toprule
+要求项 & mjlab & Isaac Lab & UniLab \\
+\midrule
+复合模型格式 & MJCF（\verb|attach|/\verb|include|） & USD（USD Composer 组装） & MJCF（mujoco 后端）/ Motrix XML（motrix 后端）；\verb|SceneCfg.model_file| 机器人 XML + \verb|fragment_files| 冷路径拼任务/臂片段；不用 USD\,\cite{unilab2026} \\
+预组装资产 & awesome-loco-manipulation $\to$ MJCF & awesome-loco-manipulation $\to$ USD & \verb|unilab-import-robot| 从 URDF 导、\verb|unilab-pull-assets| 从 HF 拉；无 MJCF$\leftrightarrow$USD 互转 \\
+复合模型示例平台 & Go2+ARX / B1+Z1（社区） & G1 人形（官方内置） & Go2+Airbot 臂内置任务 \verb|go2_arm_manip_loco|（注册名 \verb|Go2ArmManipLoco|；源码 \verb|src/unilab/envs/locomotion/go2_arm/manip_loco.py|）\,\cite{unilab2026} \\
+渲染（视觉版） & MuJoCo Warp 批渲染 & RTX \verb|TiledCameraCfg| & Viser web 3D / Motrix 原生渲染（回放可视化，非训练相机观测，见 \cref{sec:rlmc-lm-trouble}） \\
+RL 后端 & RSL-RL（唯一） & RSL-RL / RL-Games / SKRL & RSL-RL（PPO 复用 \verb|OnPolicyRunner| + \verb|FinalObservationAwarePPO|）+ 自研 APPO / SAC / TD3 / FlashSAC \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[版本基线：本章核对所用的框架版本]
+本章正文凡涉及类名/字段/默认值，均以联网核对时的官方文档为准，并尽量标注框架版本。核对基线为 \textbf{Isaac Lab 2.x}（截至 2025--2026 的稳定线）与 \textbf{mjlab}（\verb|github.com/mujocolab/mjlab|，与 \cref{ch:rlmc-quadloco} 同源）。两个框架都基于\emph{管理器}（manager）架构，observation/action/reward/event 的\textbf{设计模式}相近，但精确类名（相机、raycast、asset、event、action）会随版本漂移——\textbf{API 名以你所用版本的官方文档为准}，本章已把「概念映射」与「精确类名」分开标注。
+\end{note}
+
+\begin{note}[资产来源：预组装 loco-manipulation 模型库]
+四足底盘与机械臂的复合模型，最省力的起点是开源仓库 \verb|github.com/aCodeDog/awesome-loco-manipulation|，它提供多个预组装的 loco-manipulation URDF（Go2+ARX、B1+Z1、Aliengo+Z1 等，许可多为 BSD-3）。\pz{仓库真实存在，README 现确列 Go2+ARX-L5-Pro、B1+Z1、Aliengo+Z1 三套四足复合 URDF（均 BSD-3-Clause）及若干轮足/移动平台；确切平台清单与许可随提交变化，使用前请核对仓库当前 README。}这些 URDF 可经 MuJoCo 官方 Python API 转 MJCF，或经 Isaac Lab 的 URDF$\to$USD 转换器转 USD（见 \cref{sec:rlmc-lm-asset}）。MuJoCo Menagerie 只提供\emph{独立}的底盘或臂模型，\textbf{不}提供预组装的复合模型——这正是 awesome-loco-manipulation 填补的空白。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{Quick Start：五分钟看一个复合机器人站起来}
+\label{sec:rlmc-lm-quickstart}
+
+先建立「复合模型能加载、能站住」的肌肉记忆，再讲原理。下面三段命令分别在三个框架里加载一个四足+臂的复合模型并用 zero agent 观察——目的是看到机器人以默认姿态站住、臂保持收起姿态，而\emph{不是}训练出好策略。
+
+\begin{codebox}[Python]{mjlab/MuJoCo：加载复合 MJCF，确认自由度与站立（5 分钟）}
+# 把 awesome-loco-manipulation 的 Go2+ARX URDF 转成 MJCF 后加载
+import mujoco
+import numpy as np
+
+model = mujoco.MjModel.from_xml_path("go2_arx.xml")
+data = mujoco.MjData(model)
+
+# 关键自检：actuated joint 数看 model.nu，不是 model.nq
+# 浮动基座 free joint 会让 nq/nv 各含 7/6 个基座广义坐标/速度
+print(f"nu (驱动数) = {model.nu}")           # 期望 19（12 腿 + 6 臂 + 1 夹爪）
+print(f"nq (广义坐标) = {model.nq}")          # 约 19_hinge + 7_free = 26，不等于 19
+print(f"nv (广义速度) = {model.nv}")          # 约 18_hinge + 6_free = 24
+
+# zero agent：control 全零，仿真几步看是否站住（配合默认姿态偏置）
+mujoco.mj_resetDataKeyframe(model, data, 0)   # 若 MJCF 定义了 home keyframe
+for _ in range(100):
+    data.ctrl[:] = 0.0
+    mujoco.mj_step(model, data)
+print(f"base height after 100 steps = {data.qpos[2]:.3f} m")  # 不应塌陷到 0
+\end{codebox}
+
+\begin{codebox}[bash]{Isaac Lab：加载内置 G1 移动操作环境（zero/随机策略冒烟）}
+# Isaac Lab 2.x 内置 G1 人形的 in-place loco-manipulation 环境，
+# 用空 checkpoint 的 play 即 zero/随机策略，可看复合机器人站立。
+# 注意：这是人形 (G1) 环境，不是四足；四足+臂需自定义环境（见本章正文）。
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py \
+  --task Isaac-PickPlace-Locomanipulation-G1-Abs-v0 --num_envs 4
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab：五分钟最小可跑（一定能成功的一行短训练）}
+# UniLab 没有 mjlab/Isaac Lab 那样的 --agent zero/random 冒烟入口；
+# 它的「能加载、能跑」靠极短训练验证。注意内置带臂任务真名是
+# go2_arm_manip_loco（注册名 Go2ArmManipLoco），【不是】go2_arm——
+# 用 go2_arm 会报 'No owner config exists ... conf/ppo/task/go2_arm/mujoco.yaml'。
+# (1) Go2+Airbot 复合任务的极短训练冒烟：env 数/迭代数走 Hydra 覆盖（不是 flag）。
+#     看 reward 各项正常更新、无 NaN、能跑满迭代即「装好且能跑」。
+uv run train --algo ppo --task go2_arm_manip_loco --sim mujoco \
+    algo.num_envs=16 algo.max_iterations=1 training.no_play=true
+# 实跑应看到（RTX 4090, CPU-sim, ~575 steps/s）reward 分项正常更新，例如：
+#   reward/object_distance=1.88   reward/arm_collision=...   reward/tracking_lin_vel=...
+#   critic in_features=79         （actor/critic 同 79 维，仅 noise 非对称，见正文）
+# (2) 想看已训策略的复合机器人动作（Viser web 回放，首跑从 HF 拉权重）：
+export HF_ENDPOINT=https://hf-mirror.com         # 国内镜像；非国内可省
+uv run demo locomani                             # Go2 移动操作 demo
+\end{codebox}
+
+\begin{note}[UniLab 的复合机器人验证为何不用 zero agent]
+UniLab 的 \verb|play|/\verb|eval| 路径不直接提供「control 全零站立」的 zero agent（见 \cref{sec:rlmc-lm-trouble}）。它的环境核 \verb|NpEnv| 每步走 \verb|apply_action|$\to$后端 CPU 物理步$\to$\verb|update_state|；\textbf{腿}动作是关节位置目标残差（\verb|ctrl = act*action_scale + default_angles|），\textbf{臂}动作则是 Diff-IK 残差（\verb|ctrl = arm_dof_pos + act*arm_action_scale + ik.gain*dq_ik|，详见 \cref{sec:rlmc-lm-obs}）。要确认「复合模型能加载、自由度对、不塌陷」，最干净的是跑一次上面 \verb|max_iterations=1| 的极短训练看 reward 行（第一步就有正反馈），或 \verb|demo locomani| 回放已训好的策略。这与 mjlab/Isaac Lab 的 zero/random agent\emph{意图相同}，只是命令形态因「CPU-sim + 短训练」范式而异。\pz{命令与实跑输出取自服务器（gpufree, RTX 4090, commit 99936e08）实测；以你所装 UniLab 版本的 \texttt{train --help} 与 \texttt{go2\_arm\_manip\_loco} owner YAML 为准。}
+\end{note}
+
+\begin{pitfall}[Isaac Lab 的 G1 移动操作环境不是现成的 RL reward 环境]
+\textbf{错误描述}：看到 \verb|Isaac-PickPlace-Locomanipulation-G1-Abs-v0| 这个 task id，以为它是「带 navigation+reaching+grasping+stability 奖励与课程」的现成 RL 环境，直接拿来复用 reward/curriculum。\textbf{现象后果}：训练不出任何抓取行为，或干脆找不到 reward 配置。\textbf{根本原因}：该环境确为 Mimic / teleop / IK workflow（官方定位为 Apple Vision Pro 遥操 + IK 上半身控制器 + RL 行走策略的模仿学习管线，见 Isaac Lab PR \#3150），\textbf{不}提供现成的 navigation/reaching/grasping RL reward 与 curriculum（社区 issue \#4033 即用户问如何在此基础上自行加抓取）；更适合参考其上半身/下半身控制器与 IK workflow 的\emph{配置结构}，而非当作 RL 训练环境（\pz{具体字段随版本演进，以你所用版本源码为准}）。\textbf{正确做法}：四足+臂的移动操作\emph{必须}自定义 RL 环境（自己设计 reward 与 curriculum，见 \cref{sec:rlmc-lm-reward,sec:rlmc-lm-curriculum}）。\textbf{若要找更贴 RL（有 tracking reward）的现成 loco-manip 任务做参考}，Isaac Lab 源码里还注册有 \verb|Isaac-Tracking-LocoManip-Digit-v0|（\verb|manager_based/locomanipulation/tracking|）与 \verb|Isaac-G1-SteeringWheel-Locomanipulation|，比纯 teleop 的 PickPlace-G1 更适合做 RL reward 教学对照。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{前置自测}
+\label{sec:rlmc-lm-pretest}
+
+本章是复合形态实战的起点，依赖前面所有单形态实战章与理论部的基础。下面六题覆盖最关键的前置概念，\textbf{答不出 $\ge 3$ 题，先回对应章节复习再继续}。
+
+\begin{practice}[开课前自测]
+\begin{enumerate}
+\item （四足）\cref{ch:rlmc-quadloco}：四足速度跟踪的 velocity tracking reward 是什么形式？高斯核里的 $\sigma$ 如何影响跟踪精度？（答错回看 \cref{ch:rlmc-quadloco}）
+\item （操作）\cref{ch:rlmc-manip}：分阶段奖励（staged reward）的\emph{乘法门控}为什么优于加法组合？从梯度传播角度解释。（答错回看 \cref{ch:rlmc-manip}）
+\item （观测）\cref{ch:rlmc-obsact}：为什么物体位姿放进 actor 观测时常用\emph{相对}底盘/末端的坐标而非世界坐标？（答错回看 \cref{sec:rlmc-principles}）
+\item （特权）\cref{ch:rlmc-privileged}：师生蒸馏里 teacher 看到的特权信息有哪些？student 如何从受限输入中恢复等价信息？（答错回看 \cref{ch:rlmc-privileged}）
+\item （物理）当四足伸出机械臂抓取远处物体时，整机重心（CoM）如何变化？这对底盘稳定性意味着什么？（答错回看本章 \cref{sec:rlmc-lm-coupling}）
+\item （建模）MJCF 中如何把两个独立 XML 模型（底盘与臂）组合成一个机器人？\verb|attach| 与 \verb|include| 的区别是什么？（答错回看本章 \cref{sec:rlmc-lm-asset}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{本章目标}
+\label{sec:rlmc-lm-goals}
+
+学完本章，你应该\textbf{能够}（每条都可当场验收）：
+
+\begin{enumerate}
+\item \textbf{分析}移动操作的三重耦合（逆运动学耦合、动力学耦合、感知耦合），并定量估算给定平台伸臂时的 CoM 偏移；
+\item \textbf{组合建模}四足底盘+机械臂的 MJCF/USD 资产，正确处理 mount frame、惯性参数、碰撞几何与执行器分组，并跑通验证清单；
+\item \textbf{配置}混合动作空间（底盘速度/腿关节偏移 + 臂关节偏移 + 夹爪），用量纲归一化使各维度梯度平衡，并能监控梯度范数比值定位失衡；
+\item \textbf{设计}多源融合的 observation group（底盘本体 + 臂本体 + 物体相对位姿）与非对称 actor/critic 分组；
+\item \textbf{实现}导航 + 末端接近 + 抓取 + 稳定性的多目标奖励，用乘法门控编码因果顺序、用加权组合处理并行目标，并诊断 reward hacking；
+\item \textbf{执行}arm-constrained 四阶段课程（冻结臂$\to$冻结底盘$\to$全身$\to$加 DR），每阶段达到验收标准，并会用 hot-start 加速；
+\item \textbf{精读并迁移} VBC 的分层架构（低层 whole-body tracker + 高层 visual policy + DAgger 视觉蒸馏）；
+\item \textbf{解释} ETH 羽毛球的端到端方法论（感知噪声模型、constrained RL、涌现的主动感知行为）。
+\end{enumerate}
+
+\paragraph{知识导航。}本章在全书中的位置如下。
+
+\begin{center}
+\begin{forest}
+navtree,
+[{本章：四足机械臂移动操作}
+  [{概念主线：三重耦合}
+    [{逆运动学耦合}]
+    [{动力学耦合 / CoM}]
+    [{感知耦合}]
+    [{whole-body vs 分层}]]
+  [{接线主线}
+    [{复合建模：attach/USD}]
+    [{混合动作空间}]
+    [{多源观测融合}]
+    [{多目标奖励}]
+    [{四阶段课程}]]
+  [{两个精读案例}
+    [{VBC：分层}]
+    [{ETH 羽毛球：端到端}]]
+  [{三框架}
+    [{mjlab}]
+    [{Isaac Lab}]
+    [{UniLab：第三条路}]]
+]
+\end{forest}
+\end{center}
+
+\paragraph{前置桥接（2--3 行重述）。}\cref{ch:rlmc-quadloco} 立了四足速度跟踪（velocity command 必入 actor 观测、奖励四层框架），\cref{ch:rlmc-manip} 立了操作的分阶段奖励与动作空间选择，\cref{ch:rlmc-privileged} 立了非对称 actor-critic 与师生蒸馏。本章把这三件事\emph{同时}用到一个会走也会抓的复合机器人上：你会看到「速度跟踪」成为 Phase 0 的热启动源、「分阶段奖励」扩展成 navigation$\to$reaching$\to$grasping 的多阶段融合、「特权 critic」用来在噪声感知下稳住价值估计。
+
+\paragraph{阅读时间。}精读（含动手跑通四阶段）约 6--8 小时；速读（只读概念主线 + 每节首段 + 小结）约 2.5 小时；查阅（按 \cref{sec:rlmc-lm-trouble} 故障表 + \cref{sec:rlmc-lm-summary} 速查表定位）按需。\cref{sec:rlmc-lm-vbc,sec:rlmc-lm-eth} 的案例精读需要较扎实的 \cref{ch:rlmc-quadloco,ch:rlmc-manip} 基础。
+
+% ════════════════════════════════════════════════════════════════
+\section{移动操作的三重耦合：为什么不是 locomotion + manipulation 的简单拼接}
+\label{sec:rlmc-lm-coupling}
+
+\textbf{本节解决什么问题}：建立「移动操作 $\neq$ 走路 + 抓东西」的认知契约。\cref{ch:rlmc-quadloco} 教了四足怎么走、\cref{ch:rlmc-manip} 教了臂怎么抓——但把两者放在一起，新的工程挑战不是两者之和，而是两者之积。理解这三重耦合，是后面所有建模/动作/观测/奖励决策的判据。
+
+\subsection{动机：分别训练底盘和臂会怎样}
+\label{sec:rlmc-lm-motivation}
+
+最直觉的方案是「分离控制」（sequential）：底盘用 \cref{ch:rlmc-quadloco} 的速度跟踪策略走到物体附近、停下，再让臂用 \cref{ch:rlmc-manip} 的抓取策略取物。这套方案只在四个条件同时满足时才工作：底盘能精确停位（$\pm2\,$cm）、目标落在臂工作空间内、抓取时底盘完全不动、物体静止。
+
+实际场景中这四条很少同时满足。粗糙地面上底盘位置精度通常只有 $\pm5\!\sim\!10\,$cm；轻量臂工作空间半径仅 $30\!\sim\!60\,$cm（\pz{ARX5/ARX L5 系列厂商标称\emph{臂展}约 $620\,$mm（基座到末端全伸长），据此可用作业半径量级约 $45\,$cm；「工作空间半径」无统一官方定义，精确值以你所用型号的厂商规格与 URDF 为准}）；抓取时底盘会因臂的反作用力漂移；物体可能在移动（如传送带）。更根本的是，分离控制丧失了\emph{协调}能力——人取桌上的杯子不是「走到桌边$\to$停$\to$伸手」，而是「边走边伸手，在最后几步同时完成定位与抓取」。loco-manipulation 的工程目标，正是让机器人获得这种协调。
+
+\begin{insight}[端着盘子穿过餐厅：三重耦合的日常类比]\label{ins:rlmc-lm-restaurant}
+想象你端着一盘食物穿过拥挤餐厅。腿在导航避障（locomotion），手在保持盘子水平（manipulation），目光同时关注前方路线与盘中食物（perception）。这三者\emph{不}独立：你会为不撒食物而放慢脚步（动力学耦合），会按地面平整度调整手臂高度（逆运动学耦合），会因低头看食物差点撞柱子（感知耦合）。机器人的移动操作面临完全相同的三重耦合——这就是为什么「分别训练再拼接」在实际中很少奏效：底盘和臂\emph{是一个整体}。
+\end{insight}
+
+\subsection{耦合一：逆运动学耦合}
+\label{sec:rlmc-lm-ikcoupling}
+
+\textbf{底盘姿态改变了臂的可达工作空间。} 四足在不平地面行走时，底盘的 pitch/roll 持续变化；对安装在底盘上的臂，底盘每倾斜一度都会改变末端在世界系中的位置。
+
+定量估算：设臂安装在底盘中心上方 $0.3\,$m、臂长 $0.5\,$m。底盘 pitch $10^\circ$ 时，臂底座在 $x$ 方向偏移 $0.3\sin 10^\circ\approx 5.2\,$cm，$z$ 方向偏移 $0.3(1-\cos 10^\circ)\approx 0.5\,$cm。对臂长仅 $0.5\,$m 的轻量臂，$5\,$cm 偏移占工作空间半径的约 $10\%$——底盘姿态变化直接吃掉了臂 $10\%$ 的有效工作范围。若不处理这个耦合（臂 IK 不考虑底盘姿态），末端会系统性偏离目标，偏离量与倾角成正比；平地上不明显，但粗糙地面 pitch/roll 可达 $\pm15^\circ$，偏离可达 $\pm8\,$cm，远超抓取精度要求。
+
+\textbf{工程解法}：在观测中加入 base orientation（以 projected gravity 或四元数表示），让策略\emph{隐式}学会补偿底盘倾斜；或在动作空间用 Diff-IK（笛卡尔空间控制），让 IK 求解器\emph{显式}每步补偿。VBC 采用后者——低层策略跟踪 base 系中的末端目标位姿（相对坐标），IK 每步重算关节角以补偿底盘变化\,\cite{liu2024vbc}。
+
+\subsection{耦合二：动力学耦合}
+\label{sec:rlmc-lm-dyncoupling}
+
+\textbf{臂的运动改变了整机重心（CoM）与角动量。} 一个 $2\!\sim\!3\,$kg 的臂（如 ARX L5 Pro 含夹爪约 $2.5\,$kg）装在 Go2 底盘上（Unitree 官方整机含电池约 $15\,$kg；某些无电池 URDF 的 inertial 质量可能约 $12\,$kg，\textbf{请以你所用的具体模型为准}）。臂完全伸展时，CoM 从底盘中心向伸出方向偏移约 $5\!\sim\!8\,$cm。
+
+\begin{derivation}[Go2 + ARX 伸臂的 CoM 偏移量化]\label{der:rlmc-lm-com}
+\textbf{关键：mount offset 不能直接相加}到整机 CoM 偏移，它同样要按臂质量占总质量加权。设底盘质量 $m_{\text{base}}=12\,$kg、CoM 在几何中心；臂含夹爪 $m_{\text{arm}}=2.5\,$kg、臂长 $l_{\text{arm}}=0.45\,$m；臂安装在底盘前方 $x_{\text{mount}}=0.15\,$m，臂自身 CoM 约在 $l_{\text{arm}}/2=0.225\,$m 处，则臂整体 CoM 在 $x_{\text{mount}}+l_{\text{arm}}/2=0.375\,$m。整机 CoM 偏移
+\begin{equation}
+\Delta x_{\text{CoM}} = \frac{m_{\text{arm}}\,(x_{\text{mount}}+l_{\text{arm}}/2)}{m_{\text{base}}+m_{\text{arm}}}
+= \frac{2.5\times 0.375}{14.5}\approx 6.5\ \text{cm}.
+\label{eq:rlmc-lm-com}
+\end{equation}
+若按官方整机 $15\,$kg 计（分母 $17.5$），则约 $2.5\times0.375/17.5\approx 5.4\,$cm，与「约 $5\!\sim\!8\,$cm」量级一致。Go2 前脚支撑线到底盘中心约 $20\,$cm——$6\,$cm 偏移仍在支撑多边形内，但留给\emph{行走}（swing phase 仅 3 脚着地、支撑多边形缩小）与\emph{动态挥臂}的余量已明显减少。这是\textbf{静态估算}，真实 CoM 还取决于各 link 质量分布、底盘姿态与负载；若臂再抓起 $0.5\,$kg 物体（并入臂端再加权），偏移进一步增大。
+\end{derivation}
+
+更严重的是动态效应：臂快速挥动时（如 ETH 羽毛球末端\emph{执行}峰值 $12.06\,$m/s，对应命令 $19\,$m/s\,\cite{ma2025badminton}），角动量变化会在底盘上产生反作用力矩。若底盘 locomotion 策略没预期到这个力矩，机器人会在挥臂瞬间失衡。两种典型失败模式：(1) 臂伸出时整机前倾倒（CoM 超出支撑多边形）；(2) 臂快速运动时步态被打乱（角动量传到底盘致意外 yaw/pitch）。工程解法谱见下表。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+方案 & 实现 & 优点 & 缺点 \\
+\midrule
+稳定性惩罚 & 惩罚 base pitch/roll 超阈值 & 简单直接 & 限制臂工作范围 \\
+CoM 跟踪 & 观测含 CoM、奖励 CoM 居中 & 物理正确 & 需实时算 CoM \\
+全身联合训练 & 不分离底盘/臂，端到端 & 自动学会补偿 & 更难收敛 \\
+分层控制 & 低层跟踪 base+EE、高层规划 & 模块化 & 层间可能丢信息 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+VBC 用「分层控制」，ETH 羽毛球用「全身联合训练」\,\cite{liu2024vbc,ma2025badminton}。两者各有优劣：分层更易训练（每层问题更简单），端到端性能上限更高（自动学会复杂协调，如 ETH 机器人涌现出击球时的全身协调与挥拍跟随动作）。
+
+\subsection{耦合三：感知耦合}
+\label{sec:rlmc-lm-perccoupling}
+
+\textbf{导航误差传递到操作精度。} 若底盘位置估计有 $\pm5\,$cm 误差，则臂看到的「物体在末端系中的位置」也带 $\pm5\,$cm 误差——\emph{即使臂 IK 完美}。底盘导航精度由此直接决定操作精度下限。对视觉系统耦合更重：装在底盘上的相机行走时持续抖动，产生运动模糊与视角变化；若同一相机同时服务导航（看路）与操作（看物），两者对相机姿态的需求可能矛盾（导航要朝前、操作要朝下）。
+
+ETH 羽毛球论文报告了一个有趣的\emph{主动感知}（active perception）涌现行为：机器人学会在追球时主动调整底盘 pitch（后仰抬高相机视角），把羽毛球保持在相机视野内、提升状态估计精度——这一行为\textbf{未经显式 reward 设计}，纯由端到端训练自动涌现\,\cite{ma2025badminton}。
+
+\begin{insight}[移动操作的三重耦合 = 一个整体系统]\label{ins:rlmc-lm-onesystem}
+三重耦合意味着你不能把底盘和臂当作两个独立系统来设计：底盘的每一步影响臂的末端位置（IK 耦合），臂的每一个动作影响底盘稳定性（动力学耦合），感知系统须同时服务两者（感知耦合）。这就是「分别训练再拼接」在实际中很少奏效的根因——你必须在某种程度上\emph{联合}训练，让策略学会协调。本章后半的所有「接线」，都是把这条耦合契约逐项变成可执行的配置。
+\end{insight}
+
+\subsection{Loco-Manipulation 方法谱}
+\label{sec:rlmc-lm-spectrum}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+方法 & 底盘控制 & 臂控制 & 协调方式 & 代表工作 \\
+\midrule
+Sequential & 速度跟踪策略 & 抓取策略 & 时序切换（先走后抓） & --- \\
+Hierarchical & 低层 whole-body tracker & 高层 visual planner & 低层自动协调 & VBC (CoRL'24) \\
+End-to-end & 全身策略同控所有关节 & 同左 & 隐式协调 & ETH 羽毛球 (Sci.\,Rob.'25) \\
+Decoupled+反馈 & locomotion 策略 + 臂 IK & IK 补偿底盘偏移 & IK 在线补偿 & SLIM (2025) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+本章重点讲 Hierarchical（VBC，\cref{sec:rlmc-lm-vbc}）与 End-to-end（ETH 羽毛球，\cref{sec:rlmc-lm-eth}）——它们是当前学术界两个主流路径，分别代表「工程简洁性」与「性能极限」的两端。
+
+\begin{pitfall}[底盘策略和臂策略使用不同控制频率]
+\textbf{错误描述}：底盘 locomotion 以 $50\,$Hz 运行，臂以 $20\,$Hz 运行。\textbf{现象后果}：快速运动时末端位置出现系统性偏差——「底盘已移动一步、臂还在执行上一帧命令」。\textbf{根本原因}：频率不匹配让两套控制在时间轴上错位。\textbf{正确做法}：两者用相同控制频率，或\emph{明确}设计频率分层（如 VBC 的高层约 $10\,$Hz、低层约 $50\,$Hz；ETH 羽毛球状态估计 $400\,$Hz、控制 $100\,$Hz、感知 $60\,$Hz 异步\,\cite{ma2025badminton}）。
+\end{pitfall}
+
+\begin{pitfall}[把「加一个机械臂」当成「obs 里多几个关节」]
+\textbf{错误描述}：以为复合机器人只是在观测里多 $6$ 个臂关节维度。\textbf{现象后果}：沿用纯 locomotion 的奖励/课程，训练出「会走但从不抓」或频繁翻倒的策略。\textbf{根本原因}：臂改变了系统\emph{动力学}（CoM、角动量）、改变了任务\emph{结构}（单目标跟踪$\to$多目标优化）、改变了奖励\emph{设计哲学}（单目标$\to$导航+接近+抓取+稳定的多阶段融合）。\textbf{正确做法}：从一开始就按多目标、强耦合系统来设计（本章 \cref{sec:rlmc-lm-action,sec:rlmc-lm-obs,sec:rlmc-lm-reward,sec:rlmc-lm-curriculum}）。
+\end{pitfall}
+
+\begin{practice}[练习·耦合分析]
+\begin{enumerate}
+\item \textbf{[分析]} Go2 底盘 $12\,$kg、ARX 臂含夹爪 $2.5\,$kg、臂长 $45\,$cm。臂完全水平伸出时按 \cref{eq:rlmc-lm-com} 算 CoM 偏移。若支撑多边形从中心到边缘为 $20\,$cm，CoM 是否仍在多边形内？再抓起 $0.5\,$kg 物体后呢？
+\item \textbf{[设计]} 设计一个 sequential 基线（走到物体$\to$停$\to$抓），列出它可能失败的 $5$ 个场景，并对每个场景指出三重耦合中的哪一重在起作用。
+\item \textbf{[跨章综合]} 回顾 \cref{ch:rlmc-manip} 的分阶段奖励与 \cref{ch:rlmc-quadloco} 的速度跟踪奖励。若要设计一个从「走向物体」到「抓取物体」的连续奖励，乘法门控的门控信号应该是什么？（提示：\cref{sec:rlmc-lm-reward}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{复合机器人组合建模：MJCF/USD 资产拼接}
+\label{sec:rlmc-lm-asset}
+
+\textbf{本节解决什么问题}：如何在仿真里把「一个四足底盘」和「一个机械臂」组合成一个\emph{可训练}的机器人？两个框架的建模方式有何差异？常见建模错误如何规避？
+
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-lm-asset-role}
+
+\cref{ch:rlmc-quadloco} 用的是完整四足模型，\cref{ch:rlmc-manip} 用的是完整臂模型。移动操作要把两者拼成一个新的复合机器人。这\emph{不是}把两个 XML 粘在一起——需要处理五个工程问题：(1) \textbf{mount frame}：臂装在底盘何处、朝何方向、安装点坐标系如何；(2) \textbf{命名冲突}：底盘和臂可能都有 \verb|joint_0|，拼接后须重命名；(3) \textbf{惯性一致性}：臂质量与惯性须加入底盘模型，否则 CoM 计算不准；(4) \textbf{碰撞几何}：安装点附近的臂/底盘碰撞几何不能穿透；(5) \textbf{执行器配置}：底盘关节与臂关节的 PD 增益范围差异很大（底盘要大力矩、臂要精细）。
+
+\subsection{配置详解：MJCF 组合的三种方式}
+\label{sec:rlmc-lm-mjcf}
+
+\textbf{方式一：\texttt{include} 直接包含。} 最简单——在底盘 MJCF 里用 \verb|<include>| 引入臂片段。但 \verb|<include>| 是\textbf{解析期}把文件内容原样插入，被包含文件\emph{必须}是合法 MJCF 片段，而不能是一个完整的 \verb|<mujoco>| 顶层模型。此外 MJCF 的运动学树由 XML body 嵌套表达（body \emph{没有} URDF 风格的 \verb|parent| 属性）——要把臂挂到 trunk 上，必须把 mount body 写成 trunk body 的\emph{子元素}。
+
+\begin{codebox}[text]{go2\_arx.xml：用嵌套 body + include 把臂挂到 trunk 下}
+<mujoco model="go2_arx">
+  <!-- go2_body.xml 应为合法 MJCF 片段；其中把臂 mount frame 嵌套在 trunk body 内： -->
+  <!--   <body name="trunk"> ...                                              -->
+  <!--     <body name="arm_mount" pos="0.15 0 0.12">                          -->
+  <!--       <include file="arx_l5_pro_fragment.xml"/>   片段，非完整模型      -->
+  <!--     </body>                                                            -->
+  <!--   </body>                                                             -->
+  <include file="go2_body.xml"/>
+
+  <!-- 合并 actuator 列表：position actuator 的阻尼属性是 kv，不是 kd；刚度是 kp -->
+  <actuator>
+    <position name="FR_hip" joint="FR_hip_joint" kp="40" kv="1"/>
+    <!-- ... 其余 11 个底盘关节 ... -->
+    <position name="arm_joint_1" joint="arx_joint_1" kp="10" kv="0.5"/>  <!-- 臂 kp 远小于底盘 -->
+    <!-- ... 其余 5 个臂关节 ... -->
+    <position name="gripper" joint="arx_gripper" kp="5" kv="0.2"/>
+  </actuator>
+</mujoco>
+\end{codebox}
+
+\verb|<include>| 的两个陷阱：(1) 被包含文件若是完整 \verb|<mujoco>| 模型、直接塞进 \verb|<body>| 内，会把顶层 section 插到 body 里导致结构非法；(2) 被包含文件的所有命名（body/joint/geom）进入\emph{同一命名空间}，名称冲突只能靠\emph{手动/脚本加前缀}或改用方式二的 \verb|attach prefix| 解决——\verb|<default class="...">| 只给元素\emph{补默认属性}，\textbf{不会}重命名或加前缀。
+
+\textbf{方式二：\texttt{attach} 框架挂载（MuJoCo 3.x，mjlab 推荐）。} MuJoCo 3.x 的 \verb|body/attach| 是\emph{编译期} meta 元素：子模型须先在 \verb|<asset><model name="..." file="..."/></asset>| 中声明；\verb|attach| 的属性是 \verb|model|（必需）、\verb|body|（必需）、\verb|prefix|（可选）——\textbf{没有} \verb|site| 定位属性；定位通过把 \verb|attach| 放在目标 body/frame 下（用带 \verb|pos/quat| 的 \verb|<frame>| 或父 body）实现。这是编译期组合、保存后展开，而非「运行时组合」。（上述属性表与「无 \texttt{site} 属性」已对 MuJoCo 官方 XML reference 的 \texttt{body/attach} 条目核实。）
+
+\begin{codebox}[text]{attach 方式：子模型先入 asset，再用 frame 在 trunk 下定位}
+<mujoco>
+  <compiler meshdir="meshes/"/>
+  <asset>
+    <model name="arx_l5_pro" file="arx_l5_pro.xml"/>   <!-- 子模型先声明 -->
+  </asset>
+  <include file="go2.xml"/>
+  <worldbody>
+    <body name="trunk">
+      <frame pos="0.15 0.0 0.12">                       <!-- 用 frame 定位 -->
+        <attach model="arx_l5_pro" body="base_link" prefix="arm_"/>
+      </frame>
+    </body>
+  </worldbody>
+</mujoco>
+\end{codebox}
+
+\verb|prefix="arm_"| 自动解决命名冲突——臂的 \verb|joint_1|$\to$\verb|arm_joint_1|、\verb|base_link|$\to$\verb|arm_base_link|。这是 mjlab 推荐方式。\textbf{方式三：代码中动态组合}——在 Python 里用 MuJoCo API 动态改模型，最灵活（可运行时改安装位置）但代码复杂度最高，仅在需要对不同安装配置做消融时使用。
+
+\subsection{配置详解：从 URDF 到 MJCF 的转换流程}
+\label{sec:rlmc-lm-urdf2mjcf}
+
+预组装的 awesome-loco-manipulation URDF 可经 MuJoCo 官方 Python API 转 MJCF。注意：\textbf{没有} \verb|mujoco.mjcf.load()| 这个入口，也\textbf{没有} \verb|python -m mujoco.tool convert| 这个官方命令——加载/导出走下面两个函数。
+
+\begin{codebox}[Python]{URDF 加载并导出为 MJCF（MuJoCo 官方 Python API）}
+import mujoco
+
+# from_xml_path 会按顶层元素 robot/mujoco 自动识别 URDF/MJCF
+model = mujoco.MjModel.from_xml_path("go2_arx.urdf")
+# 注意：URDF 的 continuous joint 会被转为 unbounded joint，需手动加回 joint range
+
+# 把刚编译的模型保存为 XML（即导出 MJCF）
+mujoco.mj_saveLastXML("go2_arx.xml", model)
+# 后处理：1) 给原 continuous joint 补 <joint range="-3.14 3.14" .../>
+#         2) 按关节组设不同 PD（见下表），底盘大、臂小
+\end{codebox}
+
+\textbf{PD 增益的工程原理}：为什么底盘和臂的 \verb|kp| 差这么大？底盘关节要对抗重力（支撑 $12+\,$kg 体重）并产生行走地面反力，需要大力矩（\verb|kp| 高$\to$位置偏差小$\to$力矩大）；若底盘 \verb|kp| 太小（如 $10$），机器人会「软趴趴」站不住。臂关节\emph{当然也}要支撑自身重力与负载——尤其水平伸展时远端关节要承受整段臂加负载的重力力矩；只是臂承载通常小于腿（臂自重约 $2\!\sim\!3\,$kg）、且需更精确的位置控制，故需「恰好够」的力矩与合适刚度/阻尼，并\emph{通常配合重力补偿或积分/前馈项}消除 PD 的重力稳态误差。若臂 \verb|kp| 太大（如 $40$），微小位置偏差产生大力矩，臂运动会过「硬」、抖动。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+配置项 & 默认值来源 & 修改影响 & 合理范围 / 与其他配置耦合 \\
+\midrule
+底盘 \texttt{kp}（hip/thigh/calf） & \cref{ch:rlmc-quadloco} 四足基线 & 太小站不住、太大步态硬 & $30\!\sim\!80$；与 action scale 耦合 \\
+臂近端 \texttt{kp}（joint 1--3） & 厂商/经验 & 太小精度差、太大抖动 & $\approx 10\!\sim\!15$；配重力补偿 \\
+臂远端 \texttt{kp}（joint 4--6） & 厂商/经验 & 同上 & $\approx 5\!\sim\!8$（小于近端） \\
+夹爪 \texttt{kp} & 经验 & 太小夹不紧 & $\approx 5$；二值控制 \\
+\texttt{effort\_limit} & 仿真模型/URDF & 限制最大力矩输出 & 以你所用 URDF 为准（非电机峰值） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[\texttt{effort\_limit} 别照抄电机峰值]
+\verb|effort_limit|（Isaac Lab）/\verb|forcerange|（MJCF）应来自你所用的\emph{具体仿真模型/URDF}，而\emph{不是}厂商电机峰值。例如 Unitree 官方 Go2 膝关节峰值力矩约 $45\,$N$\cdot$m\,\cite{unitree2023go2}，但 URDF 里写入的 solver 力矩限制可能不同——\textbf{以你的 URDF 实际值为准}。这与 ETH 羽毛球的 constrained RL 思想一致（\cref{sec:rlmc-lm-eth}）：在仿真层面就防止超出执行器能力的动作。
+\end{note}
+
+\subsection{配置详解：Isaac Lab 的多 Entity 挂载与 actuator 分组}
+\label{sec:rlmc-lm-isaaclab-asset}
+
+Isaac Lab 用 USD 格式，复合机器人通常在 NVIDIA Isaac Sim 的 USD Composer 中\emph{预先}组装——底盘与臂图形化对齐、设 fixed joint 连接、验证碰撞，再导出为一个完整 USD。这比 MJCF 的 XML 编辑更直观，但需 GUI 环境。actuator 用正则表达式分组配置（比 MJCF 逐个配置更简洁，且支持 per-joint 字典匹配 stiffness/damping/effort）。
+
+\begin{codebox}[Python]{Isaac Lab：复合机器人的 ArticulationCfg + 分组 actuator}
+from isaaclab.assets import ArticulationCfg
+from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.sim import UsdFileCfg
+
+go2_arx_cfg = ArticulationCfg(
+    prim_path="{ENV_REGEX_NS}/Robot",
+    spawn=UsdFileCfg(usd_path="assets/go2_arx.usd", activate_contact_sensors=True),
+    actuators={
+        "legs": ImplicitActuatorCfg(        # 底盘组：高力矩 PD
+            joint_names_expr=[".*hip_joint", ".*thigh_joint", ".*calf_joint"],
+            stiffness=40.0, damping=1.0,
+            # 该值应来自具体 URDF，不是电机峰值；implicit actuator 推荐用
+            # effort_limit_sim 设 solver 限制（effort_limit 是兼容/弃用别名）
+            effort_limit_sim=33.5,          # 以你所用 URDF 的实际力矩为准
+        ),
+        "arm": ImplicitActuatorCfg(         # 臂组：低力矩精细 PD（支持 per-joint 字典）
+            joint_names_expr=["arm_joint_.*"],
+            stiffness={"arm_joint_[1-3]": 15.0, "arm_joint_[4-6]": 8.0},
+            damping={"arm_joint_[1-3]": 0.5,  "arm_joint_[4-6]": 0.2},
+            effort_limit_sim={"arm_joint_[1-3]": 10.0, "arm_joint_[4-6]": 5.0},
+        ),
+        "gripper": ImplicitActuatorCfg(
+            joint_names_expr=["gripper_.*"], stiffness=5.0, damping=0.1,
+            effort_limit_sim=2.0,
+        ),
+    },
+)
+\end{codebox}
+
+\textbf{UniLab} 没有 \verb|ImplicitActuatorCfg| 这类 Python actuator 类树\,\cite{unilab2026}：它的 PD 增益经 \verb|create_backend| 的 \verb|position_actuator_gains={"kp":..., "kd":...}| 传给后端的位置执行器（\verb|locomotion/common/base.py| 的 \verb|PdControlConfig|，字段 \verb|Kp|/\verb|Kd|/\verb|action_scale|）；力矩/速度饱和（即上面 Isaac Lab 的 \verb|effort_limit_sim| 对应物）由 MJCF/Motrix 模型本身的 \verb|<general>|/\verb|forcerange|/\verb|gear| 在\emph{模型层}承担，而非 Python 配置。注意 \verb|go2_arm_manip_loco| 的动作执行\textbf{腿与臂不同}（实跑确认）：\textbf{腿}是关节位置目标残差 \verb|ctrl = act*action_scale + default_angles|（与四足章相同），\textbf{臂}是 Diff-IK 残差 \verb|ctrl = arm_dof_pos + act*arm_action_scale + ik.gain*dq_ik|（默认 \verb|arm_action_scale=0.0| 即纯 IK，见 \cref{sec:rlmc-lm-obs}）。复合机器人「底盘大 kp、臂小 kp」的分组需求，在 UniLab 里靠\emph{按关节段的 action scale}（go2 rough 已有 \verb|hip|/\verb|non_hip| 分项 \verb|action_scale|）与模型层 per-actuator 增益表达，改增益用 Hydra 覆盖 \verb|env.control_config.Kp=40|。
+
+\textbf{从零组装 vs 预组装}：先用预组装模型（awesome-loco-manipulation）跑通整个训练管线（Phase 0--3，\cref{sec:rlmc-lm-curriculum}），确认管线正确后，再按需修改安装位置或更换臂型号。预组装模型提供了含 meshes/inertias/collisions 的\emph{起点}，但这\textbf{不等同于}训练级验证（无自碰撞、惯性正确性、sim-to-real 验证），仍需按下面的清单逐项验证。
+
+\subsection{运行验证：复合模型 10 分钟验证清单}
+\label{sec:rlmc-lm-asset-verify}
+
+\begin{codebox}[text]{复合模型验证 Checklist（约 10 分钟）}
+[ ] 可视化：viser/meshcat 中模型正确显示，臂安装在底盘上方
+[ ] 自由度：看 model.nu（驱动数）与 actuator/joint 名称列表；
+    注意浮动基座 free joint 让 nq/nv 各含 7/6 个基座坐标/速度，
+    故 nq 通常 != 19（19 个驱动关节时 nq ≈ 19_hinge + 7_free）
+[ ] 关节命名：打印所有关节名，确认无冲突且有清晰前缀（如 arm_）
+[ ] 零态：zero agent 下底盘站立、臂保持默认收起姿态
+[ ] CoM：打印 model.body_mass 的加权平均位置，确认在支撑多边形内
+[ ] 碰撞：跑 10 步 random agent，检查臂与底盘间无自碰撞
+[ ] 执行器：分别给底盘/臂发小命令，确认正确的关节在动
+[ ] 惯性：对比组合模型总质量与单独模型质量之和
+\end{codebox}
+
+如果你用的是 UniLab 内置的 \verb|go2_arm_manip_loco|（Go2+Airbot），上面的抽象清单有现成可跑的落地：其 \verb|docs/manip_loco.md| 给了官方自检命令，直接把「看自由度 / 验证模型」变成一行（实跑确认这些命令存在）。
+
+\begin{codebox}[bash]{UniLab：go2\_arm\_manip\_loco 的官方模型自检（约 1 分钟）}
+# (1) 直接加载场景 XML，打印自由度计数（对应清单的「自由度/命名」两条）：
+python -c "import mujoco; m=mujoco.MjModel.from_xml_path( \
+  'src/unilab/assets/.../go2_arm/scene_flat.xml'); \
+  print('nq',m.nq,'nv',m.nv,'nu',m.nu,'nsensor',m.nsensor)"   # 路径以你的安装为准
+# (2) 跑官方单元测试（含 site jacobian 自检，间接验证 IK 用的末端 site 正确）：
+pytest tests/envs/locomotion/go2_arm
+pytest -k test_mujoco_site_jacobian          # 验证 Diff-IK 依赖的 site 雅可比
+\end{codebox}
+
+\subsection{常见陷阱}
+\label{sec:rlmc-lm-asset-pitfalls}
+
+\begin{pitfall}[URDF$\to$MJCF 转换时「丢失」fixed joint]
+\textbf{错误描述}：转换后按 body 名引用臂的 base body，却找不到它。\textbf{现象后果}：代码报 KeyError 或拿到错误 body。\textbf{根本原因}：MuJoCo 导入 URDF 时会把 fixed joint \emph{合并}到父 body（MuJoCo 不支持 0-DOF joint）——臂经 fixed joint 连到底盘，转换后臂的 base body 被并入 trunk。这通常是\emph{正确}的，只是引用名变了。\textbf{正确做法}：转换后打印 \verb|model.body_names| 确认所有预期 body 都在，再按实际名引用。
+\end{pitfall}
+
+\begin{pitfall}[底盘和臂的 PD 增益用相同值]
+\textbf{错误描述}：图省事给全部关节配同一组 \verb|kp/kv|。\textbf{现象后果}：用底盘的大 \verb|kp| 配臂$\to$臂运动过「硬」、微小误差产生巨大力矩致震荡；用臂的小 \verb|kp| 配底盘$\to$底盘「软」得站不住。\textbf{根本原因}：底盘要大力矩支撑体重与行走，臂要小力矩做精细控制，两者物理需求相反。\textbf{正确做法}：按关节组分别配（底盘 \verb|kp| $30\!\sim\!80$、臂 \verb|kp| $5\!\sim\!20$），转换后打印每个 actuator 的 \verb|kp/kv| 核对。
+\end{pitfall}
+
+\begin{practice}[练习·复合建模]
+\begin{enumerate}
+\item \textbf{[工程]} 从 awesome-loco-manipulation 下载 Go2+ARX URDF，用 \verb|mujoco.MjModel.from_xml_path(...)| 加载、\verb|mujoco.mj_saveLastXML(...)| 导出 MJCF。打印关节名列表，确认底盘和臂关节都正确导入、前缀清晰。
+\item \textbf{[验证]} 在 mjlab 加载转换后的模型，跑 zero agent 与 random agent 各 $100$ 步，存一帧截图确认显示正确。random agent 是否触发自碰撞？若有，定位是哪两个 link。
+\item \textbf{[设计]} 若把臂装在底盘\emph{侧面}（而非背部），mount frame 的 \verb|pos| 与 \verb|quat| 应怎么设？画出坐标系示意图，并说明这会如何改变臂的可达工作空间（呼应 \cref{sec:rlmc-lm-ikcoupling}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{混合动作空间：量纲统一与梯度平衡}
+\label{sec:rlmc-lm-action}
+
+\textbf{本节解决什么问题}：移动操作的动作空间是\emph{异构}的——底盘速度（m/s）、臂关节角（rad）、末端增量（m）、夹爪开合（二值）。这些量的数值范围与物理意义完全不同。如何设计统一的动作空间，使 PPO 能有效优化所有维度？
+
+\subsection{模块功能：为什么动作设计比单形态更难}
+\label{sec:rlmc-lm-action-why}
+
+\cref{ch:rlmc-quadloco} 的四足动作空间很\emph{均匀}——$12$ 个关节角、全是 rad、范围相似（$\pm0.5\,$rad）；\cref{ch:rlmc-manip} 的操作动作空间也较均匀。但移动操作的动作空间是异构的：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+动作维度 & 物理量 & 典型范围 & 控制目标 \\
+\midrule
+底盘 $v_x$ & 线速度 (m/s) & $[-1.0, 1.0]$ & 前后移动 \\
+底盘 $v_y$ & 线速度 (m/s) & $[-0.5, 0.5]$ & 左右移动 \\
+底盘 $\omega_z$ & 角速度 (rad/s) & $[-1.5, 1.5]$ & 原地转向 \\
+腿关节 $\times 12$ & 角度偏移 (rad) & $[-0.3, 0.3]$ & 步态控制 \\
+臂关节 $\times 6$ & 角度偏移 (rad) & $[-0.15, 0.15]$ & 精细操作 \\
+夹爪 $\times 1$ & 开合度 & $[0, 1]$ & 二值抓取 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+注意臂关节的 action scale（$\pm0.15\,$rad）远小于腿关节（$\pm0.3\,$rad）——操作需要更精细的控制。若两者用相同 scale，臂每步变化量太大，无法精确定位。
+
+\subsection{配置详解：三种动作空间设计模式}
+\label{sec:rlmc-lm-action-modes}
+
+\textbf{模式一：统一关节空间（End-to-end）。} 策略输出所有关节的位置偏移——以本章 Go2+ARX 为例是底盘 $12$ + 臂 $6$ + 夹爪 $1=19$ 维，每维独立 scale。这是 ETH 羽毛球使用的模式\,\cite{ma2025badminton}（其 ANYmal-D + DynaArm 平台为 $18$ 维：$12$ 腿 $+\,6$ 臂、末端是球拍无夹爪，见 \cref{sec:rlmc-lm-eth}）：策略直接控制所有关节、无层级分离，灵活性最大，但动作维度高、训练更难收敛。
+
+\begin{codebox}[Python]{模式一：统一关节空间（Isaac Lab，per-joint regex scale）}
+from isaaclab.envs.mdp import JointPositionActionCfg
+
+action_cfg = JointPositionActionCfg(
+    asset_name="robot",
+    joint_names=[".*"],                  # 所有关节
+    scale={
+        ".*hip_joint": 0.25, ".*thigh_joint": 0.25, ".*calf_joint": 0.25,  # 底盘
+        "arm_joint_[1-3]": 0.15,         # 臂近端
+        "arm_joint_[4-6]": 0.10,         # 臂远端（更精细）
+        "gripper": 0.5,
+    },
+    use_default_offset=True,             # 从默认站姿偏移，raw=0 即默认姿态
+)
+\end{codebox}
+
+\textbf{模式二：分层动作空间（Hierarchical）。} 高层输出 base velocity command + EE target pose 增量，低层接收高层命令并输出实际关节角。这是 VBC 使用的模式\,\cite{liu2024vbc}：VBC 高层动作是 $9$D——\verb|p_cmd|（$6$D EE 位姿增量）+ \verb|v_cmd|（$2$D 底盘线速度与 yaw 角速度命令）+ gripper（$1$D 二值）；高层动作空间低维、训练易收敛。代价是层间信息瓶颈可能限制最终性能。\textbf{模式三：混合模式}——底盘用 velocity command（高层）、臂用关节角（直接），拼接成约 $10$D。
+
+\subsection{配置详解：Action Scale 归一化使梯度量级一致}
+\label{sec:rlmc-lm-action-scale}
+
+\textbf{为什么需要 action scale？} PPO 策略网络输出的是标准正态分布的样本（均值约 $0$、方差约 $1$）。不同动作维度需映射到不同物理范围。两个框架的动作变换链一致（与 \cref{ch:rlmc-obsact} 的 \cref{eq:rlmc-action-transform} 同）\,\cite{isaaclab2024,mjlab2026}：
+\begin{equation}
+a_{\text{physical}} = a_{\text{network}}\times\texttt{scale} + \texttt{offset}.
+\label{eq:rlmc-lm-action}
+\end{equation}
+设底盘 $v_x$ 物理范围 $[-1.0,1.0]\,$m/s（scale $=1.0$）、臂 \verb|joint_1| 物理范围 $[-0.15,0.15]\,$rad（scale $=0.15$），但两者都接收策略输出 $[-1,1]$。则在策略网络中，\verb|arm_joint_1| 对 reward 的梯度被 scale 缩小了约 $6.7$ 倍——PPO 更新时会「忽视」臂而过度关注底盘。
+
+\begin{derivation}[scale 如何影响梯度量级]\label{der:rlmc-lm-grad}
+设策略网络输出 $a_{\text{net}}\in\mathbb R^{19}$，物理动作 $a_{\text{phys}}=\mathbf s\odot a_{\text{net}}$（$\mathbf s$ 为 scale 向量），奖励 $R(a_{\text{phys}})$。则
+\begin{equation}
+\frac{\partial R}{\partial a_{\text{net},i}} = s_i\cdot\frac{\partial R}{\partial a_{\text{phys},i}}.
+\label{eq:rlmc-lm-gradchain}
+\end{equation}
+若 $s_{\text{leg}}=0.25$ 而 $s_{\text{arm}}=0.1$，即使 $\partial R/\partial a_{\text{phys}}$ 对底盘和臂同样大，策略网络收到的梯度中底盘维度是臂维度的 $2.5$ 倍。PPO 的自然梯度（natural gradient）经 Fisher 信息矩阵归一化\emph{部分}缓解这一问题，但实践中 scale 差异超过 $3\!\sim\!5$ 倍时仍会导致训练失衡。
+\end{derivation}
+
+\textbf{调参经验法则}：先独立确认底盘与臂各自的 action scale 合理（底盘用 \cref{ch:rlmc-quadloco} 默认、臂用 \cref{ch:rlmc-manip} 默认），再在组合训练中微调——通常需把臂 scale 减到独立训练时的 $50\%\!\sim\!70\%$（组合训练要同时优化多目标，每个目标的动作变化量应更保守）。两种典型失败：臂 scale 太大（如 $0.5\,$rad）$\to$臂运动粗暴、「挥臂但从不碰到物体」；底盘 scale 太小（如 $0.1\,$m/s）$\to$底盘移动太慢、「臂在努力伸但底盘不配合」。
+
+\begin{codebox}[Python]{mjlab：完整的移动操作混合动作空间（三组不同 scale）}
+# mjlab 1.4.0：Go2+ARX 的混合动作空间——底盘大步幅、臂精细、夹爪二值
+# 注意 mjlab 的 JointPositionActionCfg 字段是 entity_name + actuator_names
+#   （不是 Isaac Lab 的 asset_name + joint_names）——动作空间由【执行器名】定义，
+#   内部经 entity.find_joints_by_actuator_names() 解析到关节索引。
+class LocoManipActionsCfg:
+    legs = JointPositionActionCfg(           # 底盘腿关节：与四足章相同
+        entity_name="robot",
+        actuator_names=("FR_hip", "FR_thigh", "FR_calf",
+                        "FL_hip", "FL_thigh", "FL_calf",
+                        "RR_hip", "RR_thigh", "RR_calf",
+                        "RL_hip", "RL_thigh", "RL_calf"),
+        scale=0.25, use_default_offset=True,            # +-0.25 rad (~15 度)
+    )
+    arm = JointPositionActionCfg(            # 臂关节：比底盘更精细
+        entity_name="robot",
+        actuator_names=("arm_joint_1", "arm_joint_2", "arm_joint_3",
+                        "arm_joint_4", "arm_joint_5", "arm_joint_6"),
+        scale={"arm_joint_[1-3]": 0.15,      # 近端 ~9 度（scale 支持正则字典）
+               "arm_joint_[4-6]": 0.10},     # 远端 ~6 度
+        use_default_offset=True,
+    )
+    # 夹爪二值：mjlab 无内置 binary 动作类，按位置目标配 + 手动阈值化（见下文 pitfall）。
+    #   Isaac Lab 才有专门的 BinaryJointPositionActionCfg（字段 open_command_expr /
+    #   close_command_expr）与带阈值变体 AbsBinaryJointPositionActionCfg。
+    gripper = JointPositionActionCfg(
+        entity_name="robot",
+        actuator_names=("gripper_left", "gripper_right"),
+        scale=0.04, use_default_offset=False,
+    )
+\end{codebox}
+
+\subsection{运行验证：监控各动作组的梯度范数}
+\label{sec:rlmc-lm-action-verify}
+
+\begin{codebox}[Python]{训练中监控各动作维度的策略梯度范数}
+def monitor_action_gradients(policy, loss):
+    """若 arm 梯度远小于 leg 梯度，说明 arm scale 太小或 arm reward 太弱。"""
+    loss.backward(retain_graph=True)
+    output_grad = policy.actor[-1].weight.grad        # [19, hidden_dim]
+    leg = output_grad[:12].norm().item()
+    arm = output_grad[12:18].norm().item()
+    grip = output_grad[18:].norm().item()
+    print(f"grad norm -- leg:{leg:.4f}  arm:{arm:.4f}  gripper:{grip:.4f}")
+    # 目标：arm/leg 比值在 0.3-1.0；< 0.1 增大 arm scale 或 arm reward；
+    #       > 3.0 减小 arm scale 或 arm reward
+\end{codebox}
+
+\textbf{看什么}：理想情况下 arm/leg 梯度范数比值落在 $0.3\!\sim\!1.0$。一种更激进的方案是为底盘和臂用\emph{独立}的 MLP 分支（梯度完全独立、互不干扰），代价是参数翻倍且两分支缺乏信息共享——VBC 的分层架构本质上就是这种「分支」的极端版（两层完全独立的策略）。
+
+\subsection{常见陷阱}
+\label{sec:rlmc-lm-action-pitfalls}
+
+\begin{pitfall}[混合动作空间的关节顺序不一致]
+\textbf{错误描述}：\verb|action_scale| 向量假设的关节排列与 MJCF/USD 实际排列不同。\textbf{现象后果}：底盘的 scale 被应用到臂上（或反过来），训练行为诡异。\textbf{根本原因}：MJCF 可能把底盘关节排前、臂关节排后，而你的 scale 向量假设了别的顺序。\textbf{正确做法}：打印 \verb|env.action_manager| 的 active terms 与每个 term 的关节名列表，确认与 scale 配置一致；用 regex 字典匹配（按名）而非按下标硬编码。
+\end{pitfall}
+
+\begin{pitfall}[夹爪动作的连续/离散混淆]
+\textbf{错误描述}：用连续 PPO 输出直接驱动夹爪。\textbf{现象后果}：夹爪一直停在「半开」状态，永远抓不住物体。\textbf{根本原因}：真实夹爪通常是开/合二值，但连续 action（正态分布）会输出 $0\!\sim\!1$ 之间的值。\textbf{正确做法}：用二值动作项（Isaac Lab 的 \verb|BinaryJointPositionActionCfg|，或带阈值的 \verb|AbsBinaryJointPositionActionCfg|），或在 \verb|env.step| 里手动阈值化 \verb|gripper_cmd = close if raw > 0 else open|。
+\end{pitfall}
+
+\begin{practice}[练习·混合动作空间]
+\begin{enumerate}
+\item \textbf{[计算]} 一个 $19$-DOF 的移动操作策略网络（MLP $[256,256,128]$）有多少参数？与 $12$-DOF 的纯 locomotion 策略相比增加了百分之多少？（提示：第一层输入维度差异 + 输出层维度差异）
+\item \textbf{[设计]} 为 Go2+ARX 设计一个\emph{分层}动作空间：高层输出什么、低层输出什么？两层控制频率分别多少？（参考 \cref{sec:rlmc-lm-vbc} 的 VBC）
+\item \textbf{[实验]} 训练两个 reach 策略，一个 \verb|arm_scale=0.1|、一个 \verb|arm_scale=0.3|，在 $500$ iteration 后比较末端到达精度。哪个更好？用 \cref{der:rlmc-lm-grad} 解释为什么。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Observation 设计：多源状态融合}
+\label{sec:rlmc-lm-obs}
+
+\textbf{本节解决什么问题}：移动操作的 observation 需含底盘状态、臂状态、物体状态。如何设计 obs group？不同状态的表示（绝对 vs 相对）如何选择？这一节直接复用 \cref{ch:rlmc-obsact} 的四条观测原则与非对称 actor-critic 思想，只补移动操作\emph{特有}的三源融合。
+
+\subsection{配置详解：三类状态的组成}
+\label{sec:rlmc-lm-obs-three}
+
+移动操作的 actor 观测由三部分组成（加可选视觉）。\textbf{Part 1 底盘本体感知}与 \cref{ch:rlmc-quadloco} 完全相同——关节位置/速度、base 角速度、projected gravity、commands、上一拍腿动作（约 $45$ 维）。\textbf{Part 2 臂本体感知}——臂关节位置/速度、末端位置/姿态（base 系）、夹爪状态、上一拍臂+夹爪动作（约 $27$ 维）。\textbf{Part 3 物体状态}是任务相关的关键设计决策：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+表示 & 内容 & 维度 \\
+\midrule
+绝对坐标 & \texttt{object\_pos\_world} + \texttt{object\_quat\_world} & $3+4$ \\
+相对坐标（推荐） & \texttt{object\_pos\_ee} / \texttt{object\_pos\_base} + \texttt{object\_quat\_ee} & $3+3+4$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{绝对坐标 vs 相对坐标：关键设计决策}
+\label{sec:rlmc-lm-obs-rel}
+
+\begin{insight}[相对坐标带来平移不变性]\label{ins:rlmc-lm-relcoord}
+考虑「底盘从 $(0,0)$ 走到 $(2,0)$ 处物体、再用臂抓取」。若 obs 用世界系物体位置 $(2,0,0.3)$，策略要学「当 \texttt{object\_x}$=2$ 且 \texttt{base\_x}$<2$ 时向前走」；可一旦物体在 $(5,3,0.3)$，策略看到完全不同的数字、需重学。若用相对坐标 $\texttt{object\_pos\_base}=\texttt{object\_pos\_world}-\texttt{base\_pos}$，无论物体在哪、策略看到的都是「物体在我前方 $2\,$m」——同样的数值映射到同样的行为。这就是\textbf{平移不变性}：策略不必为每个绝对位置分别学习。这条与 \cref{ch:rlmc-obsact} 的观测原则一脉相承——观测应表达「与决策相关的相对量」，而非「碰巧的世界坐标」。
+\end{insight}
+
+VBC 的低层策略 observation 是 $90$ 维（含 base 状态、臂/腿状态、上一拍动作、environment extrinsic、foot timing/contact 等），目标跟踪部分用\emph{相对}坐标（base 系下的 EE 目标位姿）\,\cite{liu2024vbc}。注意 VBC 低层策略\textbf{不看物体位置}——它只看 EE 目标（由高层给出）。这是分层架构的核心：低层不需要知道「物体在哪」，只需知道「末端该去哪」，物体定位由高层视觉策略完成。
+
+\subsection{配置详解：末端位姿的表示选择}
+\label{sec:rlmc-lm-obs-quat}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+表示 & 维度 & 连续性 & 推荐场景 \\
+\midrule
+四元数 $(w,x,y,z)$ & 4 & 有符号歧义（$\mathbf q\equiv-\mathbf q$） & 大范围旋转 \\
+旋转矩阵 & 9 & 连续、无歧义（需正交化） & 数值稳定要求高 \\
+欧拉角 (rpy) & 3 & 有万向锁 & 小范围旋转 \\
+6D 旋转 & 6 & 连续、无歧义 & 学习旋转的最新推荐 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+对移动操作的 EE 目标姿态，推荐\textbf{四元数}（操作常涉及大范围旋转，如从上方接近到侧方抓取，欧拉角的万向锁是致命的）。全书采用 \textbf{Hamilton 四元数}约定（见全书记号），与 MuJoCo 的 \verb|wxyz| 存储一致；Isaac Lab 部分版本张量用 \verb|xyzw|，直接读写务必确认版本。四元数符号歧义可用「确保 $w>0$」的约定消除（若 $w<0$ 取 $-\mathbf q$）。
+
+\begin{codebox}[Python]{四元数处理：归一化 + 标准化 + 相对位姿（移动操作常用）}
+import torch
+
+def normalize_quat(q):                 # MLP 输出的"四元数"不保证单位范数
+    return q / (q.norm(dim=-1, keepdim=True) + 1e-8)
+
+def standardize_quat(q):               # 确保 w>0，消除 q/-q 符号歧义
+    return torch.where(q[..., 0:1] < 0, -q, q)
+
+def quat_distance(q1, q2):             # 两四元数夹角(rad)，用于 EE 姿态跟踪奖励
+    q1 = normalize_quat(standardize_quat(q1))
+    q2 = normalize_quat(standardize_quat(q2))
+    dot = (q1 * q2).sum(dim=-1).clamp(-1.0, 1.0)
+    return 2.0 * torch.acos(dot.abs())  # abs 处理 q/-q 歧义
+\end{codebox}
+
+\subsection{配置详解：Observation 归一化与 Critic 特权信息}
+\label{sec:rlmc-lm-obs-norm}
+
+不同 obs 项数值范围差异大（关节角 $\sim[-2,2]\,$rad、关节速 $\sim[-10,10]\,$rad/s、物体位置 $\sim[-3,3]\,$m）。\textbf{推荐 per-term scaling}（在 obs term 上设 scale，物理含义明确、可控）：如 \verb|joint_vel| 乘 $0.05$、\verb|base_ang_vel| 乘 $0.25$、\verb|object_pos_base| 乘 $0.5$。\rebuilt{RSL-RL/Isaac Lab 的经验归一化用的是 \texttt{EmpiricalNormalization} 模块（非 Gym/SB3 的 \texttt{VecNormalize} wrapper）；其配置入口随版本变化——RSL-RL 4.0+ 已将 cfg 字段 \texttt{empirical\_normalization} 标记为弃用，改用 \texttt{actor\_obs\_normalization}/\texttt{critic\_obs\_normalization}，以你所装 \texttt{isaaclab\_rl.rsl\_rl} cfg 为准。}对移动操作推荐 per-term scaling（更可控）。
+
+与 \cref{ch:rlmc-privileged} 的非对称 actor-critic 一致，critic 可用额外\emph{特权}信息（真机不可得，仅改善价值估计）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+特权项 & 维度 & 来源 & actor 不能用的原因 \\
+\midrule
+\texttt{object\_velocity} & 6 & 仿真器 & 真实场景难实时估计 \\
+\texttt{true\_friction} & 1 & DR 参数 & 未知地面摩擦 \\
+\texttt{true\_arm\_payload} & 1 & DR 参数 & 负载质量未知 \\
+\texttt{contact\_force\_gripper} & 6 & 仿真器 & 真实夹爪可能无力传感器 \\
+\texttt{terrain\_height\_scan} & $\sim$200 & raycast & 视部署硬件而定 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+ETH 羽毛球的非对称 critic 即此思路：teacher（critic）看精确羽毛球 3D 位置/速度，actor 只看带噪相机检测；critic 因而能准确估值、为 actor 提供更好的优势估计，即使 actor 面对噪声很大的感知\,\cite{ma2025badminton}。
+
+\begin{codebox}[Python]{mjlab：actor/critic 两组观测（critic 追加特权项）}
+# mjlab 1.4.0：observation 按 group 组织，velocity 任务的两个 group
+#   在源码里就叫 "actor" 和 "critic"（dict 键，不是类属性）。
+# 注意 mjlab 的 term 是 ObservationTermCfg(func=mdp.<函数>)——观测是【函数】
+#   （base_ang_vel/projected_gravity/joint_pos_rel/last_action 等），不是 *ObsCfg 类。
+observations = ObservationsCfg(
+    actor=ObservationGroupCfg(terms={
+        "base_ang_vel": ObservationTermCfg(func=mdp.base_ang_vel, scale=0.25),
+        "projected_gravity": ObservationTermCfg(func=mdp.projected_gravity),
+        "leg_joint_pos": ObservationTermCfg(func=mdp.joint_pos_rel),  # 全关节，臂腿同表
+        "object_pos_base": ObservationTermCfg(func=object_pos_base, scale=0.5),  # 相对坐标!自定义func
+        "object_quat_base": ObservationTermCfg(func=object_quat_base),           # 自定义func
+        "last_action": ObservationTermCfg(func=mdp.last_action),
+    }),
+    critic=ObservationGroupCfg(terms={
+        # ... actor 全部项 ...
+        "object_velocity": ObservationTermCfg(func=object_velocity),  # 特权:真机难得(自定义func)
+        "true_friction": ObservationTermCfg(func=true_friction),      # 特权:DR 参数(自定义func)
+    }),
+)
+\end{codebox}
+
+\textbf{UniLab} 的非对称 actor-critic 不走声明式 \verb|ObsGroup|/\verb|ObsTerm| 树，而是在环境子类里\emph{手写}两组观测：\verb|obs_groups_spec| 声明 \verb|{"obs": A, "critic": C}|，\verb|_compute_obs| 把两组各自的数组返回（机制见 \cref{ch:rlmc-obsact} 与 UniLab 的 \verb|base/observations.py| 的 \verb|split_obs_dict()|，它把 \verb|obs["obs"]| 路由给 actor、\verb|obs["critic"]| 路由给 critic）\,\cite{unilab2026}。\textbf{重要（实跑核对）}：\verb|go2_arm_manip_loco| 此版的非对称\emph{只体现在噪声}——actor 与 critic \textbf{共用同一套 79 维布局}，唯一差别是 actor 端 \verb|add_noise=True|、critic 端 \verb|add_noise=False|；它\emph{并未}像 mjlab 上例那样给 critic 追加 object\_lin\_vel / friction / payload / 接触力等\emph{对象级特权维}。这是「noise 非对称」与「对象级特权非对称」两种做法的区别：前者本任务真有，后者属别的任务/上节 mjlab 的做法（\cref{sec:rlmc-lm-obs-norm}）。
+
+更值得学的是这个任务的观测里\textbf{臂相关三元组与 IK 契约}：单步 $79$ 维中，臂/末端部分是 \verb|ee_local_pos|（末端在 base 系位置 $3$）+ \verb|ee_goal_cart|（采样得到的 EE 目标笛卡尔位置 $3$）+ \verb|ee_error|（目标减当前 $3$）+ \verb|last_actions|（上一拍 $18$ 维全身动作）。注意这里\textbf{没有夹爪、没有物体真值}——任务是「边走边用 Diff-IK 把末端送到采样 EE 目标」的 loco-manip \emph{reaching}，EE 目标在以 base 为心的球面上按 \verb|sphere_l/phi/theta| 采样（即 \cref{sec:rlmc-lm-vbc-stage1} 的「height-invariant sphere」的现成实现）。
+
+\begin{insight}[为什么带臂任务给策略「EE 误差 + IK 残差」而非让它直接出 6 个臂关节]\label{ins:rlmc-lm-ikresidual}
+\verb|go2_arm_manip_loco| 的臂\textbf{不}让策略直接输出 $6$ 个臂关节角，而是：先由 Diff-IK 根据「当前 EE 到目标 EE 的笛卡尔误差」解出一步关节增量 \verb|dq_ik|，策略只在其上叠一个\emph{学习残差}——\verb|arm_ctrl = arm_dof_pos + act*arm_action_scale + ik.gain*dq_ik|（默认 \verb|arm_action_scale=0.0| 即\emph{纯 IK}，臂完全由 IK 闭环驱动、策略不插手臂）。这正是本章三重耦合里\textbf{逆运动学耦合}（\cref{sec:rlmc-lm-ikcoupling}）的活教材：底盘一动，EE 在 base 系的位置就变，IK 每步用 \verb|ee_error| 重解关节角\emph{显式}补偿——策略因此只需操心「把底盘开到让 EE 够得着的地方」，臂的精确定位交给 IK。好处有二：(1) \textbf{降维}——$18$ 维动作里臂那 $6$ 维要么不学（纯 IK）、要么只学小残差，搜索空间大大缩小；(2) \textbf{相对坐标契约}——观测给的是 base 系下的 \verb|ee_error|（平移不变，\cref{ins:rlmc-lm-relcoord}），与 VBC 低层「跟踪 base 系 EE 目标」（\cref{sec:rlmc-lm-vbc}）同一思想。\textbf{怎么调}：\verb|arm_action_scale=0.0|$\to$纯 IK（最稳，先用它把管线跑通）；调到 $>0$ 即「IK 打底 + 学习残差」，让策略修正 IK 在动态/受扰下的偏差（\verb|docs/manip_loco.md| 把它列为首要调参旋钮）。\verb|ik.gain| 控每步 IK 增量幅度、\verb|ik.dq_clip| 限单步关节增量防发散、\verb|ik.orientation_mode| 在 \verb|target|（同时跟姿态）与 \verb|zero_error|（只跟位置）间切换。
+\end{insight}
+
+\begin{codebox}[Python]{UniLab：go2\_arm\_manip\_loco 的 actor/critic 观测（同 79 维，仅 noise 非对称）}
+# UniLab —— 非 Manager 架构：观测在 go2_arm env 子类 _compute_raw_obs 里手写（NumPy, CPU 物理）
+# 实跑确认：actor 与 critic 共用同一 79 维布局，差别只在 add_noise（不是对象级特权）。
+@property
+def obs_groups_spec(self) -> dict[str, int]:
+    return {"obs": 79, "critic": 79}          # 同维！非对称仅来自下面的 add_noise
+
+def _compute_raw_obs(self, info, gyro, gravity, dof_pos, dof_vel,
+                     arm_dof_pos, arm_dof_vel, ee_local_pos, ee_goal_cart,
+                     ee_error, last_actions, add_noise: bool):
+    # add_noise=True 走 actor 组、=False 走 critic 组；除此之外两组逐项相同
+    n = (lambda x, s: self._obs_noise(x, s)) if add_noise else (lambda x, s: x)
+    nc = self._cfg.noise_config
+    leg_diff = dof_pos - self.default_angles
+    return np.concatenate([
+        n(gyro, nc.scale_gyro),                        # 机体角速度(3)
+        -n(gravity, nc.scale_gravity),                 # 投影重力(3) —— 编码底盘 pitch/roll
+        info["commands"],                              # 速度命令(3)
+        n(leg_diff, nc.scale_joint_angle),             # 腿关节角差(12)
+        n(dof_vel, nc.scale_joint_vel),                # 腿关节速度(12)
+        n(arm_dof_pos, nc.scale_joint_angle),          # 臂关节角(6)
+        n(arm_dof_vel, nc.scale_joint_vel),            # 臂关节速度(6)
+        ee_local_pos,                                  # 末端在 base 系位置(3)
+        ee_goal_cart,                                  # 采样 EE 目标(笛卡尔,3)
+        ee_error,                                      # EE 误差=目标-当前(3) —— IK 用它解 dq_ik
+        last_actions,                                  # 上一拍全身动作(18)
+    ], axis=1)                                         # 合计 79（无夹爪、无物体真值）
+
+def _compute_obs(self, ...):                           # 框架按 obs_groups_spec 取两份
+    return {"obs":    self._compute_raw_obs(..., add_noise=True),    # actor：加噪
+            "critic": self._compute_raw_obs(..., add_noise=False)}  # critic：干净
+# 噪声仅 actor 加：_obs_noise(data, scale) 幅度 = level*scale*U(-1,1)，level<=0 一键全关。
+# 若要给 critic 补对象级特权（friction/payload 等），那是别的任务的做法，本任务此版未做。
+\end{codebox}
+
+\subsection{常见陷阱}
+\label{sec:rlmc-lm-obs-pitfalls}
+
+\begin{pitfall}[物体位置用世界坐标而非相对坐标]
+\textbf{错误描述}：actor obs 用 \verb|object_pos_world|。\textbf{现象后果}：策略学到「物体在 $(2,0,0.3)$ 时向前走」，却无法泛化到 $(5,3,0.3)$。\textbf{根本原因}：丧失平移不变性（\cref{ins:rlmc-lm-relcoord}）。\textbf{正确做法}：始终用相对 base 或 EE 的坐标 \verb|object_pos_base| / \verb|object_pos_ee|。
+\end{pitfall}
+
+\begin{pitfall}[以为「obs 维度越高策略越好」]
+\textbf{错误描述}：把所有可得状态都塞进 obs。\textbf{现象后果}：噪声与冗余增加 MLP 学习难度、训练变慢。\textbf{根本原因}：同时给 \verb|ee_pos_base| 和 \verb|ee_pos_world|+\verb|base_pos_world| 是冗余的（前者是后者之差），却多了 $6$ 维无用绝对位置。\textbf{正确做法}：只放「最小充分」观测——策略需要什么就给什么，不多给（呼应 \cref{ch:rlmc-obsact} 的低维性原则）。
+\end{pitfall}
+
+\begin{practice}[练习·观测融合]
+\begin{enumerate}
+\item \textbf{[设计]} 为 Go2+ARX 抓取任务设计完整的 actor 与 critic observation group。列出每个 term 的名称、维度、坐标系。actor 与 critic 有何区别？
+\item \textbf{[实验]} 训练两个策略：一个用绝对坐标 \verb|object_pos_world|、一个用相对坐标 \verb|object_pos_base|。在 $2000$ iteration 后比较两者在随机初始位置上的抓取成功率。
+\item \textbf{[分析]} VBC 低层策略为何不看物体位置？若低层也看到物体位置，会发生什么？（提示：分层架构的信息分工，\cref{sec:rlmc-lm-vbc}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{多目标 Reward 融合：从导航到抓取的连续奖励}
+\label{sec:rlmc-lm-reward}
+
+\textbf{本节解决什么问题}：移动操作有多个目标——走到物体附近、伸臂接近、闭合夹爪抓取、保持底盘稳定。如何设计统一的奖励，使策略依次完成这些目标？这一节把 \cref{ch:rlmc-manip} 的分阶段奖励\emph{扩展}到「带导航」的多阶段，并复用 \cref{ch:rlmc-reward} 的权重平衡方法。
+
+\subsection{模块功能：分阶段奖励在这里如何扩展}
+\label{sec:rlmc-lm-reward-stages}
+
+回顾 \cref{ch:rlmc-manip}：操作任务的分阶段奖励有两阶段（reaching $\to$ bringing），用乘法门控编码因果顺序。移动操作的阶段更多：
+\begin{equation*}
+\text{操作}:\ \text{reaching}\to\text{bringing};\qquad
+\text{移动操作}:\ \text{navigation}\to\text{reaching}\to\text{grasping}\to\text{bringing}\ (+\ \text{stability 全程}).
+\end{equation*}
+navigation 阶段是移动操作\emph{独有}的——底盘需先移动到物体附近，这是 \cref{ch:rlmc-quadloco} 速度跟踪的一个变体。关键区别：四足章的 velocity command 是外部随机采样的，而移动操作的「速度命令」由物体位置\emph{隐式}决定（「向物体方向移动」）。
+
+\subsection{配置详解：Reward 的四个组件}
+\label{sec:rlmc-lm-reward-comp}
+
+\begin{codebox}[Python]{四个奖励组件：导航 / 接近 / 抓取 / 稳定}
+import torch
+
+def navigation_reward(base_pos, object_pos, sigma_nav=0.5):
+    """鼓励底盘进入臂可达范围。sigma_nav 控制"多近算到达"——
+    对臂长 45cm 的臂，0.3-0.5 m 合理；不需精确到位，让物体进入工作空间即可。"""
+    dist = torch.norm(base_pos[:, :2] - object_pos[:, :2], dim=-1)  # 只看 xy
+    return torch.exp(-dist**2 / sigma_nav**2)
+
+def ee_reaching_reward(ee_pos, object_pos, sigma_reach=0.1):
+    """鼓励末端接近物体；sigma_reach 应比 sigma_nav 小（末端要更精确）。"""
+    dist = torch.norm(ee_pos - object_pos, dim=-1)
+    return torch.exp(-dist / sigma_reach)
+
+def grasp_reward(gripper_state, object_height, table_height, threshold=0.05):
+    """成功条件：夹爪闭合 AND 物体高度 > 桌面 + threshold。"""
+    closed = gripper_state < 0.1
+    lifted = object_height > table_height + threshold
+    return (closed & lifted).float()
+
+def stability_reward(base_pitch, base_roll, pitch_limit=0.3, roll_limit=0.3):
+    """惩罚底盘过度倾斜（防伸臂时翻倒）；阈值应比纯 locomotion 更严，
+    因 CoM 偏移让翻倒风险更高（见 der:rlmc-lm-com）。"""
+    p = torch.clamp(torch.abs(base_pitch) - pitch_limit, min=0)
+    r = torch.clamp(torch.abs(base_roll) - roll_limit, min=0)
+    return -(p + r) * 10.0
+\end{codebox}
+
+\subsection{多目标融合：加权组合 vs 乘法门控}
+\label{sec:rlmc-lm-reward-fuse}
+
+加权组合是各 reward 独立计算后加权相加：
+\begin{equation}
+r_{\text{total}} = w_{\text{nav}}r_{\text{nav}} + w_{\text{reach}}r_{\text{reach}} + w_{\text{grasp}}r_{\text{grasp}} + w_{\text{stab}}r_{\text{stab}}.
+\label{eq:rlmc-lm-rweighted}
+\end{equation}
+乘法门控（\cref{ch:rlmc-manip} 模式的扩展）则把因果顺序编码进结构：
+\begin{equation}
+r_{\text{total}} = r_{\text{nav}}\cdot r_{\text{reach}} + r_{\text{grasp}} + w_{\text{stab}}r_{\text{stab}}.
+\label{eq:rlmc-lm-rgated}
+\end{equation}
+
+\begin{insight}[乘法门控编码因果顺序：「锅热了才下菜」]\label{ins:rlmc-lm-gate}
+\cref{eq:rlmc-lm-rgated} 编码了「先导航后抓取」的因果——若 $r_{\text{nav}}\approx 0$（底盘还没到），$r_{\text{reach}}$ 的贡献被屏蔽，策略不会浪费时间在远处乱伸臂。做菜的类比：你不会在锅还没热时就下食材（导航没完成就开始操作）——$r_{\text{nav}}$ 是「锅温」，只有它够高 $r_{\text{reach}}$ 的「烹饪奖励」才有意义。若用加法组合（不门控），相当于「边加热边下菜」，表面省时但菜可能不熟——在移动操作里「不熟」就是「底盘还在远处但臂已乱伸」，既浪费臂运动（可能碰障碍）、又没导航到位。注意这与 \cref{sec:rlmc-lm-reward-stop} 的接触窗口约束\emph{不同}：粗导航与预伸臂\textbf{可以并行}，门控屏蔽的是「底盘远在天边时的精细接近奖励」，不是「禁止边走边伸」。
+\end{insight}
+
+\textbf{推荐方案}：多数移动操作任务\emph{混合}使用乘法门控（导航$\to$接近）+ 加权组合（稳定性全程生效）。
+
+\begin{codebox}[Python]{推荐的 reward 融合：乘法门控 + 加权组合}
+def compute_total_reward(env_state):
+    r_nav   = navigation_reward(env_state)
+    r_reach = ee_reaching_reward(env_state)
+    r_grasp = grasp_reward(env_state)
+    r_stab  = stability_reward(env_state)
+    r_rate  = action_rate_penalty(env_state)
+    r_approach = r_nav * r_reach            # 乘法门控: 导航到位才算接近
+    total = (1.0 * r_approach + 5.0 * r_grasp     # 抓取成功给大奖励
+             + 0.5 * r_stab + 0.02 * r_rate)      # 稳定性全程 + 动作平滑
+    return total
+\end{codebox}
+
+\textbf{UniLab} 把奖励组织成\emph{第三种范式}\,\cite{unilab2026}：既不是 mjlab 的类式 \verb|RewardTermCfg(func=...)|、也不是 Isaac Lab 的函数式 \verb|@configclass|，而是 \textbf{Hydra 标量字典 \texttt{reward.scales} + 环境内 \texttt{\_reward\_fns} 派发表}。每个奖励项是 \verb|common/rewards.py| 里一个吃 \verb|RewardContext| 的纯函数（或 robot 特有的 env 方法），权重则从 YAML 注入；每步 \verb|run_reward_dispatch| 算 $\sum_i \texttt{scales}[i]\cdot\texttt{fns}[i](\text{ctx})$（\textbf{跳过 \texttt{scale==0} 的项}）并\emph{乘} \verb|ctrl_dt|（等价 mjlab/Isaac 的 \verb|scale_by_dt|，但按控制周期而非 \verb|physics_dt*decimation|），每 $4$ 步把分项写进 \verb|info["log"]|。\textbf{重要（实跑核对）}：\verb|go2_arm_manip_loco| 此版\emph{没有}夹爪/抓取奖励——它的 \verb|reward.scales| 是 \textbf{loco 全套}（\verb|tracking_lin_vel|/\verb|tracking_ang_vel|/姿态/能量/动作平滑等，与四足章同源）\textbf{加上三个 loco-manip 项}：\verb|object_distance|（末端到采样 EE 目标的距离奖励，主导 reaching 梯度）、\verb|object_distance_l2|（L2 形式的同类项）、\verb|arm_collision|（臂自碰撞/碰底盘惩罚）。乘法门控等更复杂的多目标融合可写成一个自定义 reward 函数（在函数内部做乘法），但本任务的「reaching」用单调的 \verb|object_distance| 距离奖励已足；权重平衡纯靠改 YAML 标量——改单项权重无需碰代码，一条 Hydra 覆盖即可：
+
+\begin{codebox}[Python]{UniLab：go2\_arm\_manip\_loco 奖励 = scales 字典 + 派发表（真实键名）}
+# UniLab —— reward 不用 cfg 类树；标量字典 + RewardContext 派发表（common/rewards.py）
+# 实跑确认：本任务无 gripper/grasp 奖励，只有 loco 全套 + 三个 loco-manip 项。
+# (1) loco-manip 专属项是 env 方法（吃 RewardContext，返回 [num_envs]）：
+def _reward_object_distance(self, ctx) -> np.ndarray:   # 末端→采样 EE 目标，越近越大
+    return np.exp(-np.linalg.norm(ctx.info["ee_error"], axis=1) / self._cfg.tracking_sigma)
+# object_distance_l2 同理（L2 形式）；arm_collision 惩罚臂自碰撞/碰底盘（接触计数）。
+
+# (2) env 侧把名字挂进派发表（_init_reward_functions）—— loco 全套 + 三个 loco-manip 项：
+self._reward_fns = {
+    # loco 全套（与四足章同源，此处略列）：
+    "tracking_lin_vel": rewards.tracking_lin_vel, "tracking_ang_vel": rewards.tracking_ang_vel,
+    "orientation": rewards.orientation, "action_rate": rewards.action_rate,  # ...其余 loco 项
+    # loco-manip 专属三项：
+    "object_distance":    self._reward_object_distance,    # 末端到 EE 目标（主导 reaching）
+    "object_distance_l2": self._reward_object_distance_l2, # L2 形式
+    "arm_collision":      self._reward_arm_collision,      # 臂自碰撞/碰底盘惩罚
+}
+# (3) 派发 + ctrl_dt 缩放（run_reward_dispatch，rewards.py）—— 跳过 scale==0、每4步写 info["log"]：
+reward = rewards.run_reward_dispatch(scales=cfg.scales, fns=self._reward_fns, ctx=ctx,
+                                     info=info, enable_log=True, ctrl_dt=self._cfg.ctrl_dt)
+\end{codebox}
+
+\begin{codebox}[text]{UniLab：go2\_arm\_manip\_loco 奖励权重（真实 owner YAML，改权重不碰代码）}
+# conf/ppo/task/go2_arm_manip_loco/mujoco.yaml （# @package _global_）
+reward:
+  scales:
+    tracking_lin_vel:   1.0        # loco：线速度跟踪（与四足章同源）
+    tracking_ang_vel:   0.5        # loco：角速度跟踪
+    object_distance:    ...        # loco-manip：末端到采样 EE 目标（主导 reaching）
+    object_distance_l2: ...        # loco-manip：L2 形式
+    arm_collision:      ...        # loco-manip：臂自碰撞/碰底盘（负权重=惩罚）
+    orientation:       -0.5        # loco：姿态稳定
+    action_rate:       -0.01       # loco：动作平滑
+    # ...其余 loco 项（能量、关节加速度、足相位等）
+  tracking_sigma: 0.25
+# 改单项权重：train ... reward.scales.object_distance=3.0（Hydra 覆盖，无需改 Python）。
+#   —— 务必用真实键名；覆盖不存在的键（如 grasp_success）会报 'key not found'。
+# 注：UniLab 无现成「按步收紧 sigma」的 reward 课程；负权重项可经 PenaltyCurriculum
+#     按 episode 长度自适应缩放，sigma 课程需手动分阶段或自定义回调（见 ch:rlmc-reward）。
+\end{codebox}
+
+\subsection{配置详解：权重平衡的三步方法论}
+\label{sec:rlmc-lm-reward-weight}
+
+不要盲猜权重，用 \cref{ch:rlmc-reward} 的系统方法：\textbf{Step 1 确认值域}——训练前用 random agent 跑 $100$ 步，打印每项 reward 的均值/方差（若 $r_{\text{nav}}$ 均值 $0.3$ 而 $r_{\text{stab}}$ 均值 $-5.0$，两者梯度量级差 $15$ 倍，PPO 会被 $r_{\text{stab}}$ 主导）；\textbf{Step 2 归一化}——调权重使 $w_i\cdot|\bar r_i|\approx 1.0$ 对所有 $i$ 成立，确保各项加权贡献量级相当；\textbf{Step 3 按优先级微调}——grasp success 是最终目标，其加权贡献应最大（$2\!\sim\!5$ 倍于其他）；stability 是约束而非目标，应「刚好够用」（太大会限制探索）。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+组件 & 推荐权重 & 默认值来源 & 与其他配置耦合 / 调参方向 \\
+\midrule
+\texttt{navigation} & $1.0$（基准） & \cref{ch:rlmc-quadloco} & 不动$\to$增大；走太快$\to$减小 \\
+\texttt{ee\_reaching} & $1.0\!\sim\!2.0$ & \cref{ch:rlmc-manip} & 臂不伸$\to$增大；臂乱挥$\to$减小 \\
+\texttt{grasp\_success} & $5.0\!\sim\!10.0$ & 任务目标 & 不抓$\to$增大（终极目标） \\
+\texttt{stability} & $0.3\!\sim\!1.0$（惩罚） & 物理约束 & 翻倒$\to$增大；臂范围太小$\to$减小 \\
+\texttt{action\_rate}（腿/臂） & $0.01$ / $0.02$ & 平滑 & 震荡$\to$增大；臂平滑更重要 \\
+\texttt{stop\_during\_grasp} & $\sim\!5.0$（惩罚） & 接触窗口 & 见 \cref{sec:rlmc-lm-reward-stop} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{操作阶段的底盘冻结 Reward}
+\label{sec:rlmc-lm-reward-stop}
+
+移动操作的一个独有挑战：\emph{精细抓取窗口}内底盘应低速/稳定——若底盘在夹爪即将闭合时继续移动，末端位置偏移、抓取失败。
+
+\begin{codebox}[Python]{stop-during-grasp：末端接近物体时惩罚底盘运动}
+def stop_during_grasp_reward(base_vel, ee_to_object_dist, threshold=0.15):
+    """threshold：末端距物体多近时开始要求底盘低速。"""
+    near = (ee_to_object_dist < threshold).float()
+    base_speed = torch.norm(base_vel[:, :2], dim=-1)
+    return -near * base_speed * 5.0
+\end{codebox}
+
+这个奖励编码的工程直觉是\textbf{接触窗口的速度约束}，\emph{不是}「导航和操作不能同时发生」。与本章主线一致：粗导航与预伸臂\emph{可以}并行（边走边把臂伸向目标），只有在\emph{夹爪闭合/接触丰富}的精细窗口才要求底盘低速。是否需完全停下取决于任务、物体与控制精度；过强的 stop 约束反而会退化成「先导航-停-再抓」的 sequential 基线，丧失协调优势。
+
+\begin{insight}[移动操作奖励的核心是「编码行为顺序」，不是「把 reward 做大」]\label{ins:rlmc-lm-reward-order}
+移动操作奖励设计的核心，不是「怎么让 reward 更大」，而是「怎么编码正确的行为顺序与约束」。乘法门控编码「先导航后操作」的因果，stop reward 编码「精细抓取窗口底盘要稳」的约束——这些都不是直觉上显然的。若只靠「添加更多 shaping 项」，策略很容易学到 shortcut（见 \cref{sec:rlmc-lm-reward-hack}）。
+\end{insight}
+
+\subsection{运行验证：Reward Hacking 检测}
+\label{sec:rlmc-lm-reward-hack}
+
+\cref{ch:rlmc-reward} 的「reward 涨但 task metric 平」黄金诊断，在移动操作里有个特别常见的变种——\textbf{冲刺循环}：策略学会「高速冲向物体」获取大 navigation reward，但到达后不停也不抓。因为 navigation reward 每步都给正信号（越近越大），而 grasp reward 只在成功时给一次；若 grasp 权重不够大（或策略还没学会抓），PPO 会发现「反复冲向物体再 reset」的期望回报\emph{高于}「尝试抓取但可能失败」。
+
+\textbf{诊断方法}：\emph{独立}记录 \verb|base_to_object_distance| 的最小值——若它在 episode 中反复达到很小（如 $0.2\,$m）又变大（机器人冲过物体），说明在做「冲刺循环」而非「导航-停-抓」。\textbf{解法}：增大 \verb|grasp| 权重到 $10\!\sim\!20$，或加 \verb|stop_during_grasp|（\cref{sec:rlmc-lm-reward-stop}）。
+
+\subsection{常见陷阱}
+\label{sec:rlmc-lm-reward-pitfalls}
+
+\begin{pitfall}[navigation 与 reaching 的 sigma 混淆]
+\textbf{错误描述}：把 $\sigma_{\text{nav}}$ 设得和 $\sigma_{\text{reach}}$ 一样小（如 $0.1\,$m）。\textbf{现象后果}：底盘必须精确到 $10\,$cm 内才有 navigation reward——对四足底盘太苛刻，底盘「围着物体转」拿不到奖励。\textbf{根本原因}：底盘定位精度本就远低于末端。\textbf{正确做法}：$\sigma_{\text{nav}}\approx$ 臂工作空间半径的 $2/3$（如 $0.3\,$m），$\sigma_{\text{reach}}$ 才用 $0.1\,$m。
+\end{pitfall}
+
+\begin{pitfall}[以为「grasp reward 应该是稀疏的」]
+\textbf{错误描述}：只用稀疏 grasp reward（成功 $=1$、失败 $=0$）。\textbf{现象后果}：高维移动操作几乎不可能收敛。\textbf{根本原因}：策略要先导航、再伸臂、再闭夹爪、再抬起，这条序列每一步都需要梯度信号，纯稀疏奖励没有中间梯度。\textbf{正确做法}：用 dense reward（navigation+reaching+grasp 组合），比稀疏奖励收敛快几个数量级。
+\end{pitfall}
+
+\begin{practice}[练习·多目标奖励]
+\begin{enumerate}
+\item \textbf{[设计]} 为「Go2+ARX 捡起地上的球」设计完整奖励：列出所有 reward 项、权重、$\sigma$ 参数，并标明哪些用乘法门控、哪些用加权组合。
+\item \textbf{[实验]} 比较两种融合：(a) 纯加权组合 \cref{eq:rlmc-lm-rweighted}，(b) 乘法门控+加权 \cref{eq:rlmc-lm-rgated}。在 $3000$ iteration 后比较 grasp success rate。
+\item \textbf{[分析]} \verb|stop_during_grasp| 的 threshold 设多少合适？太大、太小分别导致什么行为？（结合 \cref{ins:rlmc-lm-reward-order}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Arm-Constrained 四阶段课程训练}
+\label{sec:rlmc-lm-curriculum}
+
+\textbf{本节解决什么问题}：直接训练全身移动操作策略很难收敛——$19$ 维动作空间 + 多目标 reward 让 PPO 探索效率极低。arm-constrained 四阶段课程如何分解训练难度？这一节把 \cref{ch:rlmc-reward} 的课程学习思想用到复合形态上。
+
+\subsection{模块功能：为什么需要课程}
+\label{sec:rlmc-lm-curr-why}
+
+移动操作的训练难度来自两方面「组合爆炸」：(1) \textbf{动作维度}——$19$D（$12$ 腿 + $6$ 臂 + $1$ 夹爪）比纯 locomotion（$12$D）高约 $58\%$，PPO 在高维空间的探索效率随维度迅速下降；(2) \textbf{多目标 reward}——策略需同时学会走路与抓取，若两个技能的 reward 信号相互干扰，易陷入「走得好但不抓」或「抓得好但不走」的局部最优。四阶段课程通过「先学简单再学复杂」分解难度，每阶段只引入一个新挑战。
+
+\subsection{配置详解：四个阶段}
+\label{sec:rlmc-lm-curr-phases}
+
+\textbf{Phase 0：冻结臂，只训练底盘 locomotion。} 目标是让策略学会「背上有固定额外质量」时稳定行走——臂虽不动，但其质量改变了系统惯性分布（CoM 偏移，\cref{der:rlmc-lm-com}）。验收：velocity tracking error $<$ \cref{ch:rlmc-quadloco} 基线 $+20\%$。
+
+\begin{insight}[Hot-start：从已有 locomotion 策略热启动是工程加速器]\label{ins:rlmc-lm-hotstart}
+不从零训练 Phase 0——直接加载 \cref{ch:rlmc-quadloco} 已训练好的纯 locomotion 策略作为初始化。策略已经会走路，Phase 0 只需微调以适应额外质量。\rebuilt{实测 hot-start 的 Phase 0 常在数百至约 1000 iteration 内收敛（vs 从零的数千 iteration），具体数字依平台/实现而异。}（须注意：这是\emph{本章推荐}的通用工程技术；下一节 VBC 的低层在论文里其实是「RL 从零训 + ROA 在线适应」，\textbf{并未}明述从 locomotion 策略热启动——hot-start 用在扩维到带臂 whole-body tracker 上是标准且合理的做法，但勿当成 VBC 的论文事实。）维度处理是关键：locomotion 策略只有 $12$ 维输出，移动操作有 $19$ 维——多出的 $7$ 维（$6$ 臂 + $1$ 夹爪）用零初始化输入权重、随机初始化输出权重的新维度部分，Phase 0 中臂被冻结故不影响。
+\end{insight}
+
+\begin{codebox}[Python]{Phase 0：冻结臂 + hot-start（维度扩展处理）}
+phase0_cfg = dict(
+    arm_frozen=True,                              # 臂关节输出被忽略
+    arm_default_pos=[0, -0.5, 0.5, 0, 0, 0],      # 收起姿态
+    locomotion_reward=True, manipulation_reward=False,
+    num_envs=4096, max_iterations=1000,
+)
+# Hot-start：从纯 locomotion 策略加载（12D -> 19D 维度扩展）
+loco_policy = torch.load("go2_velocity_tracking.pt")
+phase0_policy = LocoManipPolicy(action_dim=19)
+phase0_policy.actor.load_partial(loco_policy.actor, match_prefix="leg_")  # 只加载匹配维度
+# 臂的输出权重保持随机初始化（Phase 0 中被冻结，不影响）
+\end{codebox}
+
+\textbf{Phase 1：冻结底盘，训练臂 reach。} 目标是用臂关节到达任意 EE 目标位姿——这是 \cref{ch:rlmc-manip} 的 reach 任务在移动底盘上的翻版。底盘冻结确保策略只需学臂控制（$6$D 问题），不必同时学底盘（$12$D + 速度）。EE 目标在以 base 为中心的「height-invariant sphere」上均匀采样（球面高度范围受限，不会太高/太低，覆盖整个可达工作空间）。验收：EE position error $<3\,$cm、orientation error $<10^\circ$。
+
+\textbf{Phase 2：全身联合训练 mobile reach + grasp。} 全部解冻、联合训练——策略学会「走到物体$\to$伸臂接近$\to$闭夹爪$\to$抬起」的完整序列。这是最难的阶段（$19$D + 多目标同时生效）。关键决策见下表。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+决策 & 推荐 & 替代 & 原因 \\
+\midrule
+从 Phase 0+1 热启动 & 是 & 从零训练 & 热启动节省数千 iteration \\
+底盘和臂共享 MLP & 否（不共享） & 共享 & 不同物理量梯度方向不同 \\
+物体初始位置范围 & $0.5\!\sim\!2.0\,$m & $0\!\sim\!3.0\,$m & 太远走不到、太近不需导航 \\
+Episode 长度 & $10\!\sim\!20\,$s & $5\!\sim\!30\,$s & 太短来不及、太长浪费步 \\
+学习率 & $1\times10^{-4}$ & $3\times10^{-4}$ & 已有好初始化，大 lr 会破坏 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{codebox}[bash]{Phase 2 训练命令（从 Phase 1 热启动，用更小 lr）}
+# 为什么 lr=1e-4 而非 Phase 0/1 的 3e-4? 策略已有好初始化(hot-start 的
+# locomotion 权重 + Phase 1 的 arm reach 权重)，大 lr 会破坏已学到的能力——
+# 像在粗加工好的石头上做精细雕刻，要小刻刀(小 lr)不是大锤(大 lr)。
+uv run train LocoManip-Go2Arx-Phase2 \
+  --env.scene.num-envs 2048 --agent.max-iterations 10000 \
+  --agent.learning-rate 1e-4 --agent.gamma 0.99 --agent.clip-param 0.2 \
+  --agent.entropy-coeff 0.005 --resume-from phase1_best.pt
+\end{codebox}
+
+\textbf{Phase 3：加 Domain Randomization 与扰动。} 在不显著降低 Phase 2 性能的前提下提高对物理参数变化的鲁棒性。典型损失：grasp success rate 从 Phase 2 的 $\sim\!85\%$ 降到 $\sim\!70\!\sim\!75\%$；若降超 $20\%$ 说明 DR 范围太大。除常规 DR（底盘质量、摩擦、CoM 偏移）外，移动操作特有的是\textbf{臂安装扰动 DR}（来自 SLIM 2025\,\cite{wang2025slim}）：reset 时随机扰动臂安装位置（$\pm1\,$cm）与朝向（$\pm3^\circ$），模拟 3D 打印安装板的公差与螺丝拧紧偏移。若不做，策略会过拟合到完美安装位置，真机微小偏移就致抓取失败。
+
+\subsection{运行验证：Phase 2 中期健康检查}
+\label{sec:rlmc-lm-curr-verify}
+
+Phase 2 的收敛有明显阶段性：$0\!\sim\!2000$ iter 导航 reward 快速上升、$2000\!\sim\!5000$ iter 接近 reward 快速上升、$5000\!\sim\!10000$ iter 抓取 reward 稳步上升。在 $5000$ iter 做一次中期检查：
+
+\begin{codebox}[Python]{Phase 2 中期健康检查（5000 iter）}
+def phase2_midpoint_check(env, policy, num_episodes=100):
+    m = {"nav": 0.0, "reach": 0.0, "grasp": 0.0, "stab": 0.0}
+    for _ in range(num_episodes):
+        obs = env.reset()
+        for _ in range(500):                       # 10s episode @ 50Hz
+            obs, _, done, info = env.step(policy(obs))
+            if done: break
+        m["nav"]   += (info["base_to_object_dist"] < 0.5).float().mean()
+        m["reach"] += (info["ee_to_object_dist"]   < 0.1).float().mean()
+        m["grasp"] += info["grasp_success"].float().mean()
+        m["stab"]  += (info["base_pitch_abs"]      < 0.3).float().mean()
+    for k in m: m[k] /= num_episodes
+    print(f"nav {m['nav']:.1%}(>80%)  reach {m['reach']:.1%}(>50%)  "
+          f"grasp {m['grasp']:.1%}(>10%)  stab {m['stab']:.1%}(>90%)")
+    if m["nav"]   < 0.5: print("  nav 弱 -> 增大 nav weight 或查 base velocity command")
+    if m["reach"] < 0.2: print("  reach 弱 -> 增大 arm scale 或 ee_reaching weight")
+    if m["grasp"] < 0.01:print("  无抓取 -> 查 gripper 阈值化与物体可达性")
+    if m["stab"]  < 0.7: print("  频繁翻倒 -> 增大 stability weight 或减小臂质量")
+    return m
+\end{codebox}
+
+\textbf{看什么}：若 grasp reward 在 $5000$ iter 后仍为零，问题通常在 reaching 阶段（臂没精确到位）——检查 EE-to-object 距离是否在下降；若在下降但未达抓取阈值，减小 $\sigma_{\text{reach}}$ 或增大 arm action scale。四阶段总时间预算约 $10\!\sim\!20\,$小时（单卡 RTX 4090），\rebuilt{相比直接端到端训练（常需 $20000+$ iteration、$30\!\sim\!50\,$小时且收敛不稳）大幅节省；具体数字依平台而异。}
+
+\begin{insight}[四阶段课程 = 「先学子技能，再学组合」]\label{ins:rlmc-lm-curriculum}
+四阶段课程的核心是「先学子技能，再学组合」，与人类学运动技能一致：你不会一上来就学「边跑步边接球」，而是先学跑步、再学接球、最后学边跑边接。杂技演员同时骑独轮车和抛接球也是如此——Phase 0 先学骑车（locomotion）、Phase 1 站地上学抛接（manipulation）、Phase 2 骑车慢慢加入抛接（联合）、Phase 3 颠簸地面练习（加 DR）。Hot-start 是这个过程的加速器——让策略不必从零学习已有的子技能。
+\end{insight}
+
+\subsection{从零搭课程：UniLab go2\_arm\_manip\_loco 的真实开关}
+\label{sec:rlmc-lm-curr-unilab}
+
+上面 Phase 0--3 的 \verb|phase0_cfg=dict(...)| 与 \verb|LocoManip-Go2Arx-Phase2| 是\emph{讲方法的伪代码}（这些任务名并不存在）。要在真框架里\emph{照着把课程跑起来}，UniLab 的 \verb|go2_arm_manip_loco| 已经把「阶段」做成了几个可一条 Hydra 覆盖落地的真实开关（实跑核对）——这正是「从零搭一个课程」最该学的：不必自己写 phase 调度，先看框架\emph{已有}哪些冻结/扰动旋钮，再用它们拼出阶段。
+
+\begin{codebox}[bash]{UniLab：用真实开关跑出 Phase 0 / Phase 2 / Phase 3（可复制）}
+# 「阶段」在 go2_arm_manip_loco 里对应这三组真实配置（owner YAML 字段，可 Hydra 覆盖）：
+#   env.arm_stage.freeze_arm_joints   —— 冻结臂（apply_action 里 effective_actions[:,12:18]=0
+#                                          且 arm_ctrl 锁 default_angles）=> Phase 0「冻臂只练 loco」
+#   env.goal_ee.disable_ee_goal_trajectory —— 关掉 EE 目标轨迹（不再采样移动目标）
+#   domain_rand.*                     —— 各项域随机化开关 => Phase 3「加 DR」
+#
+# Phase 0（冻臂，只练底盘 loco；EE 目标也关掉）：
+uv run train --algo ppo --task go2_arm_manip_loco --sim mujoco \
+    env.arm_stage.freeze_arm_joints=true env.goal_ee.disable_ee_goal_trajectory=true \
+    algo.num_envs=4096 algo.max_iterations=1000
+# Phase 2（解冻臂 + 开 EE 目标，全身 loco-manip reaching；默认即此态）：
+uv run train --algo ppo --task go2_arm_manip_loco --sim mujoco \
+    env.arm_stage.freeze_arm_joints=false algo.num_envs=4096 algo.max_iterations=10000
+# Phase 3（在 Phase 2 基础上加 DR；具体子项以 owner YAML 的 domain_rand 段为准）：
+uv run train --algo ppo --task go2_arm_manip_loco --sim mujoco \
+    env.arm_stage.freeze_arm_joints=false domain_rand.randomize_friction=true \
+    algo.num_envs=4096 algo.max_iterations=12000
+\end{codebox}
+
+\begin{note}[「Phase 1 冻底盘只练臂」在本任务里没有现成开关]
+\verb|go2_arm_manip_loco| 提供的是 \verb|freeze_arm_joints|（冻\emph{臂}），\textbf{没有}对称的「冻\emph{底盘}」开关——因为本任务的臂是 IK 驱动的 reaching（\cref{ins:rlmc-lm-ikresidual}），EE 目标采样 + IK 本身就让「臂练到位」不必单独冻底盘成一个 $6$D 子问题。若你确实想要 \cref{sec:rlmc-lm-curr-phases} 的 Phase 1（冻底盘练臂），需自己加一个对称开关（在 \verb|apply_action| 里把腿动作 \verb|effective_actions[:,:12]=0| 并锁 \verb|default_angles|），或把底盘 \verb|action_scale| 临时设 $0$。这本身就是一次好的「读源码 + 加开关」练习。\pz{字段名与冻结语义以你所装版本的 \texttt{go2\_arm\_manip\_loco} owner YAML 与 \texttt{manip\_loco.py} 的 \texttt{apply\_action} 为准；上列覆盖在 commit 99936e08 实测可解析。}
+\end{note}
+
+\subsection{常见陷阱}
+\label{sec:rlmc-lm-curr-pitfalls}
+
+\begin{pitfall}[Phase 2 从 Phase 1 恢复时忘记调整 action mask]
+\textbf{错误描述}：Phase 1 把底盘动作 mask 为零（冻结），Phase 2 忘了取消。\textbf{现象后果}：底盘在 Phase 2 中仍不动，策略只学到 reach 没学 navigation。\textbf{根本原因}：mask 状态没随阶段切换更新。\textbf{正确做法}：Phase 2 开始后打印前 $10$ 步底盘动作输出，确认非零。
+\end{pitfall}
+
+\begin{pitfall}[Hot-start 时网络维度不匹配]
+\textbf{错误描述}：直接 \verb|load_state_dict| 把 $12$D locomotion 策略加载到 $19$D 移动操作策略。\textbf{现象后果}：维度不匹配报错。\textbf{根本原因}：输入/输出层维度因新增臂维度而改变。\textbf{正确做法}：用 \verb|load_partial| 只加载匹配维度，或手动复制前 $12$ 维权重、新维度用零/随机初始化（\cref{ins:rlmc-lm-hotstart}）。
+\end{pitfall}
+
+\begin{pitfall}[以为「Phase 3 的 DR 越多越好」]
+\textbf{错误描述}：把臂安装偏移 DR 设到 $\pm5\,$cm。\textbf{现象后果}：策略学到「保守到什么都不做」——极端 DR 下任何积极动作都可能失败。\textbf{根本原因}：DR 范围超出了真实物理不确定性。\textbf{正确做法}：DR 范围应反映真实物理不确定性（安装偏移 $\pm1\,$cm 量级），而非「越大越鲁棒」。
+\end{pitfall}
+
+\begin{practice}[练习·四阶段课程]
+\begin{enumerate}
+\item \textbf{[设计]} 写出 Phase 0--3 的完整配置：每阶段的 reward 开关、action mask、\verb|num_envs|、\verb|max_iterations|、学习率，并标注每阶段从哪里初始化。
+\item \textbf{[实验]} 对比两条路径：(a) 四阶段课程（$0\to1\to2\to3$），(b) 直接端到端（从零、全 reward 同时生效）。在 $10000$ iteration 后比较 grasp success rate 与收敛稳定性。
+\item \textbf{[分析]} 若 Phase 1 的 EE position error 始终 $>5\,$cm（不达标），列出 $3$ 个可能原因与对应修复（提示：PD gain、action scale、EE 目标采样）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{精读案例一：VBC 分层移动操作（CoRL'24）}
+\label{sec:rlmc-lm-vbc}
+
+\textbf{本节解决什么问题}：把前面所有「接线」零件组合成一个\emph{完整的、可复现的}分层移动操作系统。VBC（Visual Whole-Body Control，Liu 等 CoRL'24 Oral，arXiv:2403.16967）\,\cite{liu2024vbc} 是当前最完整的开源 loco-manipulation 框架之一，在 Unitree B1+Z1 平台（共 $19$ DoF）上实现了视觉引导的移动抓取：机器人看到 depth 图像里的目标物体，走过去，伸臂抓起。读它的价值不在「又一个 SOTA」，而在它把\textbf{分层架构}的工程取舍做到了教科书级清晰。
+
+\subsection{三阶段层级训练}
+\label{sec:rlmc-lm-vbc-arch}
+
+VBC 的核心是\emph{功能分层}的三阶段训练——注意这与 \cref{sec:rlmc-lm-curriculum} 的「能力课程」四阶段是两个正交的维度（功能分层 = 谁负责什么；能力课程 = 先学什么后学什么），二者可组合（先用四阶段课程把低层练出来，再用 VBC 的 Stage 2--3 练高层）。
+
+\begin{codebox}[text]{VBC 三阶段架构（论文事实，B1+Z1，19 DoF）}
+Stage 1  低层 whole-body policy（RL 从零训 + ROA 在线适应；非论文明述的 hot-start）
+  跟踪 : root velocity command + target EE pose（base 系，相对坐标）
+  输入 : ~90D 观测（base 状态 / 臂腿状态 / 上一拍动作 / environment extrinsic /
+         foot timing & contact 等）；低层【不看物体位置】
+  输出 : 12 个腿关节角目标；臂由 IK 把 EE pose 转成关节目标（非直接输出 18/19 维原始关节）
+Stage 2  高层 privileged teacher（RL，低层冻结）
+  输入 : proprio + object_state（特权：相对 arm base 的 local object pose）
+  输出 : 9D 动作 = EE 位姿增量 p_cmd(6) + 底盘速度命令 v_cmd(2: 线速度+yaw) + gripper(1)
+Stage 3  视觉 student（DAgger 蒸馏自 Stage 2 teacher）
+  输入 : proprio + object masks + segmented depth（两路视觉）；网络 CNN + GRU + MLP
+  输出 : 同 Stage 2
+部署频率 : 50 Hz（低层）/ 10 Hz（高层）/ 500 Hz（底层 PD）（论文）
+\end{codebox}
+
+低层\textbf{不看物体位置}是分层架构的灵魂（\cref{ins:rlmc-lm-relcoord} 的延伸）：低层只需知道「末端该去哪」（EE 目标，由高层给），不需要知道「物体在哪」——物体定位是高层视觉策略的职责。这一分工让低层成为一个纯粹、可复用的 whole-body \emph{tracker}：换任务只换高层，低层不动。
+
+\subsection{Stage 1 的工程内核：精确 EE 跟踪 + ROA 适应}
+\label{sec:rlmc-lm-vbc-stage1}
+
+Stage 1 训练一个\emph{通用}低层 whole-body 策略，跟踪「root velocity command + EE 目标位姿（base 系，相对坐标）」。EE 目标在「height-invariant sphere」上均匀采样（球心在 base 上方、半径等臂可达距离，高度限制在约 $[0.05,0.5]\,$m），保证训练数据覆盖整个可达工作空间。低层内嵌一个 ROA（Regularized Online Adaptation）适应模块——思路与 \cref{ch:rlmc-privileged} 的 RMA 同源，让低层部署时自动适应地面摩擦、负载质量等物理差异，这是 VBC sim-to-real 的关键。\pz{待核实：VBC 论文将低层描述为「RL 从零训 + ROA」，\emph{未}明述「从 locomotion 策略热启动」；本章 \cref{ins:rlmc-lm-hotstart} 把 hot-start 作为一条\emph{独立推荐}的通用工程加速技术讲（对扩维到带臂的 whole-body tracker 是标准且合理的做法），但不应把它当成 VBC 的论文事实。}臂由 IK 把 EE 位姿命令转成关节目标（\cref{sec:rlmc-lm-vbc-arch} 架构框）。
+
+\begin{codebox}[Python]{VBC Stage 1 低层奖励：base 速度跟踪 + 精确 EE 跟踪 + 正则}
+import torch
+
+def vbc_low_level_reward(env):
+    # 1. base 速度跟踪（与四足章相同，sigma=0.25）
+    r_vel = torch.exp(-(env.base_vel - env.base_vel_cmd).norm(dim=-1) / 0.25)
+    # 2. EE 位置跟踪 —— sigma=0.05m，比操作章 reach 的 0.15m 小得多，
+    #    因为低层必须【精确】跟踪高层给的 EE 目标（这是分层的契约）
+    r_ee_pos = torch.exp(-(env.ee_pos - env.ee_target_pos).norm(dim=-1) / 0.05)
+    # 3. EE 姿态跟踪（可选；quat_distance 见 sec:rlmc-lm-obs-quat）
+    r_ee_quat = torch.exp(-quat_distance(env.ee_quat, env.ee_target_quat) / 0.1)
+    # 4. 正则：动作变化率 + 关节限位
+    r_rate  = -torch.sum((env.action - env.last_action) ** 2, dim=-1) * 0.01
+    r_limit = -torch.sum(torch.clamp(
+        torch.abs(env.joint_pos) - env.joint_limit * 0.9, min=0), dim=-1) * 5.0
+    return 1.0 * r_vel + 2.0 * r_ee_pos + 0.5 * r_ee_quat + r_rate + r_limit
+\end{codebox}
+
+下面给出的低层奖励是\textbf{本章按 VBC 思路重构的示意实现}（\rebuilt{各 $\sigma$/权重/迭代数为典型量级，非 VBC 论文逐字数值}）：取 \verb|ee_pos| 的 $\sigma=0.05\,$m 体现「低层是执行器、必须精确」的设计意图——低层 $\sigma$ 小、高层「规划器」只需把末端\emph{带到}物体附近故可粗。按本章下面的 hot-start 配方复现时，base 速度跟踪常在约 $2000$ iter 内到 reward $>0.8$、EE 跟踪约 $5000$ iter 到 $>0.7$、EE-to-target 收敛到 $<3\,$cm；若 base 跟踪 $<0.5$，首先怀疑 hot-start 没加载成功（\cref{sec:rlmc-lm-trouble} 故障 1）。
+
+\begin{codebox}[bash]{低层 tracker 训练配方（本章重构；用 hot-start 加速，非 VBC 论文配置）}
+# 低层 whole-body tracker：本章推荐从四足 locomotion 策略热启动以加速
+#   （VBC 论文低层为 RL 从零训 + ROA；hot-start 是本章的通用加速技术，见 ins:rlmc-lm-hotstart）
+uv run train VBC-LowLevel-Go2Arx \
+  --env.scene.num-envs 4096 --agent.max-iterations 10000 \
+  --agent.learning-rate 3e-4 --agent.logger wandb \
+  --resume-from go2_locomotion.pt          # hot-start：四足速度跟踪策略
+\end{codebox}
+
+\subsection{Stage 2/3 与向三框架的迁移}
+\label{sec:rlmc-lm-vbc-migrate}
+
+Stage 2 高层 teacher 用\emph{特权}物体位姿生成低层目标（\verb|p_cmd| EE 位姿增量 6D + \verb|v_cmd| 底盘线/yaw 速度 2D + \verb|gripper_cmd| 1D，共 9D），reward 是任务级的 \verb|grasp_success + navigation_progress + stability|——它不关心「关节怎么动」，那是低层的事。\textbf{训练 Stage 2 时低层必须冻结}（\verb|requires_grad=False|），否则高层和低层同时变会陷入「移动目标」问题、不收敛（\cref{sec:rlmc-lm-trouble} 故障 9）。Stage 3 把高层 teacher 经 DAgger\,\cite{ross2011dagger} 蒸馏成视觉 student（depth$\to$CNN$\to$visual feature，拼 proprio$\to$MLP$\to$高层动作$\to$冻结低层$\to$关节角），与 \cref{ch:rlmc-privileged} 的 teacher-student 蒸馏同一范式。
+
+VBC 原始代码基于 IsaacGym；迁移到本书三框架的关键对照如下。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.4cm}p{3.6cm}@{}}
+\toprule
+VBC (IsaacGym) & mjlab & Isaac Lab & UniLab \\
+\midrule
+B1+Z1 URDF & awesome-loco-manip $\to$ MJCF & URDF $\to$ USD & URDF 经 \verb|unilab-import-robot| $\to$ MJCF \\
+IsaacGym 相机 & MuJoCo Warp 批渲染 & \verb|TiledCameraCfg| & 当前无相机任务（Stage 3 视觉需自实现，\cref{sec:rlmc-lm-trouble}） \\
+RSL-RL PPO & RSL-RL PPO（相同） & RSL-RL PPO（相同） & RSL-RL PPO（\verb|FinalObservationAwarePPO|）\\
+ROA adaptation & 自行移植 & 自行移植 & HORA 式适应蒸馏可参考，通用 ROA 需自实现 \\
+Hot-start 脚本 & \verb|load_partial| + 零初始化新维 & 同左 & 同左（手写 \verb|state_dict| 部分加载）\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[VBC 的本质贡献是「把复杂问题切成可独立验证的层」]\label{ins:rlmc-lm-vbc-layers}
+VBC 的工程价值不在某个单点技巧，而在它把「视觉引导移动抓取」这个难问题切成了三个\emph{可独立训练、可独立验证}的层：低层只对「跟踪 EE 目标准不准」负责（指标：EE-to-target 距离），高层只对「规划得好不好」负责（指标：grasp success），视觉只对「从像素恢复物体状态准不准」负责（指标：与特权 teacher 的动作差）。每一层失败都能\emph{单独}定位、单独修——这正是工程上「分层」最大的回报，也是它相对端到端的核心优势：不是性能更高，而是\emph{更可调试}。代价是层间信息瓶颈（低层拿不到「物体其实在动」这类高层才知道的信息），故性能上限低于下一节的端到端。
+\end{insight}
+
+\begin{practice}[练习·VBC 精读]
+\begin{enumerate}
+\item \textbf{[源码阅读]} 在 VBC 代码（\verb|github.com/Ericonaldo/visual_wholebody|）里找到 hot-start 实现，说明它如何把 $12$D locomotion 策略的权重搬进 $19$D loco-manip 策略（哪些维度复制、哪些零/随机初始化）。
+\item \textbf{[设计]} VBC 高层输出 $9$D（$6$D EE 位姿增量 + $2$D 底盘线/yaw 速度 + $1$D gripper）。若把 EE 位姿增量从「相对当前」改成「相对 base 的绝对目标位姿」，Stage 2 的 reward 与 obs 各需怎么改？这两种参数化各有什么训练上的利弊？
+\item \textbf{[对比]} VBC 的分层 vs 下节 ETH 的端到端：列出 $3$ 个「分层明显更合适」的任务条件、$3$ 个「端到端明显更合适」的条件，各给一句理由。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{精读案例二：ETH 羽毛球端到端移动操作（Science Robotics'25）}
+\label{sec:rlmc-lm-eth}
+
+\textbf{本节解决什么问题}：看清\emph{端到端}移动操作能把性能推到哪、代价是什么。ETH 羽毛球（Ma 等 Science Robotics'25）\,\cite{ma2025badminton} 在 ANYmal-D + DynaArm 平台（$4\times3$ 腿关节 $+\,6$ 臂关节 $=18$ DoF）上实现了自主羽毛球对打：立体相机追踪羽毛球、预测飞行轨迹、移动到拦截位、挥拍击球，末端\emph{执行}峰值约 $12.06\,$m/s、连续对打最多约 $10$ 拍。与 VBC 的关键区别：\textbf{一个策略端到端同控全部 $18$ 关节、不分层}——论文指出这正是「自然的臂腿补偿」涌现的根因（挥拍时用后腿蹬地增力、击球前主动后仰保持视觉追踪）。
+
+\subsection{贡献一：标定的感知噪声模型}
+\label{sec:rlmc-lm-eth-noise}
+
+ETH 最精细的工程是\emph{用真实相机数据标定}仿真感知噪声，而非凭感觉加高斯噪声（呼应 \cref{ch:rlmc-obsact} 观测原则四：噪声应从数据出发）。做法：真机用双目相机检测球位置、同时用动捕记真值，二者之差给出「相机检测噪声」的统计分布（均值、方差、\emph{与距离的关系}），再注入仿真观测：
+\begin{equation}
+o_{\text{noisy}} = o_{\text{true}} + \mathcal N\!\big(\boldsymbol\mu_{\text{cam}},\ \boldsymbol\Sigma_{\text{cam}}(d)\big),
+\label{eq:rlmc-lm-camnoise}
+\end{equation}
+其中 $\boldsymbol\Sigma_{\text{cam}}(d)$ 是距离相关协方差——远处的球检测噪声更大。
+
+\begin{insight}[主动感知行为是「标定噪声」的免费副产品]\label{ins:rlmc-lm-active}
+\cref{eq:rlmc-lm-camnoise} 的距离相关噪声带来一个\emph{未经显式 reward 设计}的涌现行为：策略学会在追球时主动调整底盘 pitch（后仰抬高相机视角），把球保持在视野中心（噪声更小的区域），从而提升状态估计精度、最终提升击球成功率\,\cite{ma2025badminton}。这是感知耦合（\cref{sec:rlmc-lm-perccoupling}）的正面体现——locomotion \emph{服务于} perception。它给本章一个深刻教训：你不必为每个想要的行为都写 reward；只要把\textbf{环境的物理约束}（这里是「视野中心看得更准」）如实建进训练，正确的行为会作为「最大化任务回报」的解\emph{自己}涌现。这只在端到端架构下可能——分层架构里底盘控制器拿不到「看得准不准」的信号，无从涌现这种跨模块协调。
+\end{insight}
+
+\subsection{贡献二：约束式 RL（硬约束电流）}
+\label{sec:rlmc-lm-eth-crl}
+
+挥拍时关节角速度与电流逼近电机/供电物理极限，超限会触发保险丝或电机过载。标准 RL 用 reward penalty 是\emph{软约束}（策略可能发现「挨罚但拿更大 reward」的捷径）；ETH 改用约束式 RL。\pzr{论文事实更正}：ETH 用的是 \textbf{N-P3O}（一种 constrained PPO 变体），\textbf{关键硬约束是机械臂电流消耗 $\le 8\,$A}（真机由保险丝限制）；而关节 torque 与 velocity 在论文里是\emph{软惩罚}（硬件上它们也非「立即失败」的硬约束）。下面的 Lagrangian 实现作为\emph{通用}约束式 RL 教学保留，\textbf{不是} ETH 采用的具体算法：
+
+\begin{codebox}[Python]{通用约束式 RL（Lagrangian 松弛；非 ETH 专用算法）}
+import torch
+
+class ConstrainedPPO:
+    """PPO + Lagrangian：把约束转成自适应乘子项加进 reward。
+    乘子初值为零（约束从松到紧渐进生效），违反超目标则增大乘子。"""
+    def __init__(self, constraint_names, target_violations):
+        self.lambdas = {n: 0.0 for n in constraint_names}
+        self.targets = target_violations
+        self.lambda_lr = 0.01
+        self.lambda_max = 10.0                      # 防乘子爆炸
+
+    def augmented_reward(self, base_reward, violations):
+        penalty = torch.zeros_like(base_reward)
+        for n, v in violations.items():
+            penalty += self.lambdas[n] * v
+        return base_reward - penalty
+
+    def update_lambdas(self, mean_violations):       # 每个 PPO epoch 后
+        for n, mv in mean_violations.items():
+            self.lambdas[n] += self.lambda_lr * (mv - self.targets[n])
+            self.lambdas[n] = max(0.0, min(self.lambdas[n], self.lambda_max))
+\end{codebox}
+
+约束式 RL 与 reward penalty 的关键区别：penalty 是\emph{固定}权重（人设，可能不够大而约束失守），Lagrangian 是\emph{自适应}乘子（会一直增大直到约束渐近满足）。经验法则：软约束（如「尽量不震荡」）用 reward penalty 足矣；硬约束（如「绝不超电机电流极限」）用约束式 RL 更安全。\pz{此前流传的「ANYmal $\pm15/\pm80$、DynaArm $\pm20/\pm30$、拍尖 $\le15\,$m/s」等具体限值未在论文中核到——论文核心是 $8\,$A 电流硬约束 + torque/velocity 软惩罚；需具体电机限值请查硬件手册。}
+
+\subsection{贡献三：基于物理的轨迹预测（EKF）}
+\label{sec:rlmc-lm-eth-pred}
+
+策略不直接用「球当前检测位置」，而用一个预测模块估计飞行轨迹与拦截时间/位置，再把 \verb|predicted_intercept_time| 与 \verb|predicted_intercept_pos| 拼进观测。\pzr{论文事实更正}：这个预测\textbf{不是}离线训练的学习型 MLP，而是 \textbf{EKF + 基于物理的羽毛球动力学模型}（论文用实测气动长度 $L=4.1\,$m），且\emph{训练与部署复用同一套} EKF/预测模块（轨迹生成与状态估计共用同一动力学模型）——这保证了「训练时见到的球轨迹分布」与「部署时预测器给出的」一致，是端到端方法 sim-to-real 的一处关键正确性。
+
+\begin{insight}[端到端 vs 分层不是「谁更先进」，是「把复杂度放在哪」]\label{ins:rlmc-lm-e2e-vs-hier}
+端到端（ETH）与分层（VBC）的对立，本质是\textbf{复杂度的安置位置}之争。端到端把复杂度压进\emph{训练}：一个策略同控所有关节，复杂的臂腿协调、主动感知自动涌现，性能上限更高——但代价是 reward 极难设计、计算量大、超参敏感、几乎不可\emph{分层调试}（出了问题很难定位是「腿的锅」还是「臂的锅」）。分层把复杂度摊进\emph{架构}：每层简单、可独立验证、低层可热启动复用，工程上「能用」来得快——但层间信息瓶颈压低了性能天花板。\textbf{对工程项目，「能用且可调」往往胜过「最优但难产」}；对追求性能极限或需要涌现式协调（高速、强耦合）的任务，端到端的上限不可替代。选型回到 \cref{sec:rlmc-lm-spectrum} 的方法谱：先问任务要的是「快速落地」还是「性能极限」。
+\end{insight}
+
+\begin{practice}[练习·ETH 精读]
+\begin{enumerate}
+\item \textbf{[分析]} \cref{ins:rlmc-lm-active} 说主动感知行为「免费涌现」。若把感知噪声建成\emph{距离无关}的常值噪声（去掉 \cref{eq:rlmc-lm-camnoise} 的 $\boldsymbol\Sigma(d)$），这个后仰行为还会涌现吗？为什么？
+\item \textbf{[设计]} 你要给一个「四足投掷」任务加「关节力矩不超 $X$」的约束。该用 reward penalty 还是约束式 RL？若用后者，约束量、目标违反率、乘子学习率各怎么定？
+\item \textbf{[对比综合]} 同一个「移动到桌边抓杯子」任务，分别用 VBC 分层与 ETH 端到端实现。各画一张数据流图，并标出「最可能出 bug 的环节」与「该环节怎么单独验证」。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{常见误解汇总}
+\label{sec:rlmc-lm-myths}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.2cm}p{8.5cm}@{}}
+\toprule
+误解 & 纠正 \\
+\midrule
+移动操作 = locomotion + manipulation & 是两者之\emph{积}：三重耦合（IK/动力学/感知）让「分别训练再拼接」很少奏效（\cref{sec:rlmc-lm-coupling}）。 \\
+加机械臂 = obs 里多几个关节维度 & 臂改变了系统动力学（CoM/角动量）、任务结构（单目标$\to$多目标）、奖励哲学（\cref{ins:rlmc-lm-onesystem}）。 \\
+mount offset 直接加进整机 CoM 偏移 & 要按臂质量占总质量\emph{加权}（\cref{eq:rlmc-lm-com}）；不加权会高估偏移数倍。 \\
+混合动作各维同 scale 即可 & scale 差异 $>3\!\sim\!5$ 倍会让 PPO 偏向某组、忽视另一组（\cref{der:rlmc-lm-grad}）；按物理范围分维归一。 \\
+物体位置用世界坐标 & 丧失平移不变性，策略难泛化到新位置；用相对 base/EE 坐标（\cref{ins:rlmc-lm-relcoord}）。 \\
+多目标奖励全用加权相加 & 因果顺序（先导航后抓）该用乘法门控编码，加法会让「底盘还远臂已乱伸」（\cref{ins:rlmc-lm-gate}）。 \\
+奖励设计核心是「把 reward 做大」 & 核心是「编码正确的行为顺序与约束」；堆 shaping 易诱发 reward hacking（\cref{ins:rlmc-lm-reward-order}）。 \\
+端到端一定比分层好 & 端到端上限高但难调；分层「能用且可独立验证」更适合多数工程（\cref{ins:rlmc-lm-e2e-vs-hier}）。 \\
+VBC 三阶段 = 四阶段课程 & 功能分层（谁负责什么）与能力课程（先学什么）正交，可组合（\cref{sec:rlmc-lm-vbc-arch}）。 \\
+DR 越多越鲁棒 & 超出真实物理不确定性的 DR 让策略学到「保守到不动」（臂安装偏移 $\pm1\,$cm 量级即可）。 \\
+Isaac Lab G1 移动操作环境是现成 RL 环境 & 它偏 Mimic/teleop/IK，reward/curriculum 多为占位，四足+臂须自定义 RL 环境（\cref{sec:rlmc-lm-quickstart}）。 \\
+三框架同名 reward 行为相同 & exp kernel 的 $\sigma$、坐标系、是否乘 dt（UniLab 乘 \texttt{ctrl\_dt}）都可能不同，须查源码（\cref{sec:rlmc-lm-reward-fuse}）。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{故障排查手册}
+\label{sec:rlmc-lm-trouble}
+
+\begin{center}
+\small
+\begin{tabular}{@{}cp{3.1cm}p{3.4cm}p{4.2cm}c@{}}
+\toprule
+\# & 症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+1 & hot-start 后 base 跟踪 reward $<0.5$ & locomotion 权重没加载成功 & 打印加载前后第一层权重范数；确认 \verb|load_partial| 匹配的维度数 & \cref{sec:rlmc-lm-vbc-stage1} \\
+2 & 训练出「会走但从不抓」 & 沿用纯 locomotion 奖励/课程 & 打印各 reward 分项；确认有 reaching/grasp 项且 grasp 权重够大 & \cref{sec:rlmc-lm-reward} \\
+3 & 伸臂时整机前倾翻倒 & CoM 超支撑多边形 / 稳定性权重太小 & 按 \eqref{eq:rlmc-lm-com} 估 CoM 偏移；增大 stability、减小臂 scale & \cref{sec:rlmc-lm-dyncoupling} \\
+4 & 快速运动末端系统性偏差 & 底盘/臂控制频率不一致 & 确认两者同频或显式频率分层（VBC 10/50 Hz）& \cref{sec:rlmc-lm-spectrum} \\
+5 & 臂梯度远小于腿梯度 & 臂 action scale 太小 / 臂 reward 太弱 & 监控 arm/leg 梯度范数比（目标 $0.3\!\sim\!1.0$）；调 scale 或 reward & \cref{sec:rlmc-lm-action-verify} \\
+6 & 夹爪停在「半开」永远抓不住 & 连续动作驱动二值夹爪 & 用 \verb|BinaryJointPositionActionCfg| 或手动阈值化 \verb|gripper_cmd| & \cref{sec:rlmc-lm-action-modes} \\
+7 & 策略学到「冲向物体再 reset」 & navigation 每步给奖、grasp 权重不足 & 看 grasp success 是否平、navigation reward 是否独涨；增 grasp 权重 & \cref{sec:rlmc-lm-reward-hack} \\
+8 & 夹爪闭合时末端偏移、抓取失败 & 接触窗口底盘仍高速 & 加 \verb|stop_during_grasp| 惩罚；打印闭爪瞬间 base 速度 & \cref{sec:rlmc-lm-reward-stop} \\
+9 & VBC Stage 2 不收敛 & 训高层时低层未冻结 & 确认低层 \verb|requires_grad=False|；打印低层权重是否在变 & \cref{sec:rlmc-lm-vbc-migrate} \\
+10 & 转换后按 body 名引用臂 base 报 KeyError & fixed joint 被 MuJoCo 合并进父 body & 打印 \verb|model.body_names|；按实际名引用 & \cref{sec:rlmc-lm-asset-pitfalls} \\
+11 & 复合模型自碰撞 / 站不住 & PD 增益全用同一组 & 按组分别配（底盘 kp $30\!\sim\!80$、臂 $5\!\sim\!20$）；打印每 actuator kp & \cref{sec:rlmc-lm-asset-pitfalls} \\
+12 & UniLab 跑不出 zero-agent 站立 & UniLab 无 \verb|--agent zero| 入口 & 用极短训练 + Viser 看初始帧，或 \verb|demo locomani| 回放 & \cref{sec:rlmc-lm-quickstart} \\
+13 & UniLab 想加视觉 student 找不到相机接口 & 当前任务集无相机/视觉任务 & 视觉运动控制在 UniLab 需自实现；本体感知任务先行 & \cref{sec:rlmc-lm-vbc-migrate} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{小结}
+\label{sec:rlmc-lm-summary}
+
+本章把「四足会走」与「机械臂会抓」组合成一台\emph{会走也会抓}的复合机器人，贯穿始终的本质洞察是：\textbf{移动操作的难点不是「locomotion 加 manipulation」，而是两者耦合产生的「积」}。三重耦合（逆运动学、动力学、感知，\cref{ins:rlmc-lm-onesystem}）是后面一切建模/动作/观测/奖励决策的判据；复合建模要按组配 PD 与处理 mount frame（\cref{sec:rlmc-lm-asset}）；混合动作空间要按物理范围归一以平衡梯度（\cref{der:rlmc-lm-grad}）；多源观测用相对坐标换平移不变性（\cref{ins:rlmc-lm-relcoord}）、特权信号归 critic；多目标奖励用乘法门控编码因果、用 stop reward 约束接触窗口（\cref{ins:rlmc-lm-gate,ins:rlmc-lm-reward-order}）；arm-constrained 四阶段课程 + hot-start 把难收敛的 $19$D 问题拆成可控的子技能习得（\cref{ins:rlmc-lm-curriculum,ins:rlmc-lm-hotstart}）。两个精读案例 VBC（分层、可调试，\cref{ins:rlmc-lm-vbc-layers}）与 ETH 羽毛球（端到端、性能极限、涌现主动感知，\cref{ins:rlmc-lm-active,ins:rlmc-lm-e2e-vs-hier}）划出了当前方法谱的两端。三框架对照里，UniLab 作为「非 GPU-sim、非 Manager-Based」的第三条路贯穿全章：观测/奖励/动作都在 \verb|NpEnv| 子类里手写、reward 用 scales 标量字典 + 派发表、PD 增益经后端位置执行器——与 mjlab/Isaac Lab 的声明式管线形成最有教学价值的对比。
+
+\paragraph{术语速查。}
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 一句话 \\
+\midrule
+三重耦合 & 移动操作的 IK/动力学/感知耦合，使「分别训练再拼接」失效（\cref{ins:rlmc-lm-onesystem}） \\
+CoM 偏移 & 伸臂使整机重心移动，按臂质量加权算，关乎翻倒风险（\cref{eq:rlmc-lm-com}） \\
+混合动作空间 & 底盘 + 臂 + 夹爪量纲不同，须 per-组 scale 平衡梯度（\cref{der:rlmc-lm-grad}） \\
+相对坐标 & 物体位姿用相对 base/EE 表示，带来平移不变性（\cref{ins:rlmc-lm-relcoord}） \\
+乘法门控 & 用 $r_{\text{nav}}\!\cdot\!r_{\text{reach}}$ 编码「先导航后接近」的因果（\cref{ins:rlmc-lm-gate}） \\
+stop-during-grasp & 接触窗口内惩罚底盘速度，防闭爪时末端漂移（\cref{sec:rlmc-lm-reward-stop}） \\
+hot-start & 从已训 locomotion 策略热启动低层，省数千 iteration（\cref{ins:rlmc-lm-hotstart}） \\
+四阶段课程 & 冻臂$\to$冻底盘$\to$全身$\to$加 DR 的能力课程（\cref{sec:rlmc-lm-curriculum}） \\
+功能分层 & VBC 低层 tracker / 高层 planner / 视觉 student，可独立验证（\cref{ins:rlmc-lm-vbc-layers}） \\
+主动感知 & locomotion 服务 perception，标定噪声下涌现的后仰行为（\cref{ins:rlmc-lm-active}） \\
+约束式 RL & 用自适应乘子保证硬约束（如电流 $\le 8\,$A）渐近满足（\cref{sec:rlmc-lm-eth-crl}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+\begin{center}
+\small
+\begin{tabular}{@{}clcl@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 移动操作 = 两者之积（三重耦合）& \cref{sec:rlmc-lm-coupling} & 中 \\
+2 & CoM 偏移按臂质量加权估算 & \cref{sec:rlmc-lm-dyncoupling} & 中 \\
+3 & 复合建模：attach/include 与 mount frame & \cref{sec:rlmc-lm-asset} & 中 \\
+4 & 按组配 PD（底盘大 kp、臂小 kp）& \cref{sec:rlmc-lm-isaaclab-asset} & 中 \\
+5 & 混合动作 per-组 scale 平衡梯度 & \cref{sec:rlmc-lm-action-scale} & 难 \\
+6 & 物体用相对坐标 $\to$ 平移不变 & \cref{sec:rlmc-lm-obs-rel} & 中 \\
+7 & 特权信号归 critic（非对称 AC）& \cref{sec:rlmc-lm-obs-norm} & 中 \\
+8 & 四组件奖励：导航/接近/抓取/稳定 & \cref{sec:rlmc-lm-reward-comp} & 中 \\
+9 & 乘法门控编码因果顺序 & \cref{sec:rlmc-lm-reward-fuse} & 难 \\
+10 & stop-during-grasp 接触窗口约束 & \cref{sec:rlmc-lm-reward-stop} & 中 \\
+11 & reward hacking「冲刺循环」诊断 & \cref{sec:rlmc-lm-reward-hack} & 难 \\
+12 & 四阶段课程 + hot-start & \cref{sec:rlmc-lm-curriculum} & 难 \\
+13 & VBC 三阶段功能分层 & \cref{sec:rlmc-lm-vbc} & 难 \\
+14 & ETH 端到端 + 标定噪声 + 约束 RL & \cref{sec:rlmc-lm-eth} & 难 \\
+15 & 三框架对照（含 UniLab 第三条路）& \cref{sec:rlmc-lm-setup} & 中 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{关键数字速查。}复合平台约 $19$ DoF（$12$ 腿 $+6$ 臂 $+1$ 夹爪）；浮动基座令 \verb|nq/nv| 各含 $7/6$ 个基座坐标/速度；Go2+ARX 伸臂 CoM 偏移约 $5\!\sim\!8\,$cm（\cref{eq:rlmc-lm-com}）；底盘 \verb|kp| $\approx30\!\sim\!80$、臂 \verb|kp| $\approx5\!\sim\!20$；底盘 action scale $0.25\,$rad、臂近端 $0.15$/远端 $0.10$；VBC 低层 EE 跟踪 $\sigma=0.05\,$m（远小于操作章 reach 的 $0.15$）；四阶段总预算约 $10\!\sim\!20\,$h（单卡 RTX 4090）；ETH 末端执行峰值 $\approx12.06\,$m/s、电流硬约束 $\le 8\,$A、气动长度 $L=4.1\,$m。\rebuilt{上述数值多取自源稿与论文，平台相关项（质量、臂长、kp 区间）为典型量级，精确值以你所用模型/URDF 与论文为准。}
+
+\paragraph{本章与其他章节的关系。}本章是「强化学习运动控制」部里第一个复合形态实战章，承接 \cref{ch:rlmc-quadloco}（四足速度跟踪成为 Phase 0 热启动源）、\cref{ch:rlmc-manip}（分阶段奖励扩成多阶段融合）、\cref{ch:rlmc-privileged}（非对称 AC 与师生蒸馏用于 VBC Stage 2--3 与 ETH critic）、\cref{ch:rlmc-reward}（权重平衡方法论）与 \cref{ch:rlmc-dr}（Phase 3 的 DR）。后续视觉运动控制章会把 VBC Stage 3 的 depth student 与 ETH 的相机感知展开，人形全身控制章会把这里的「臂腿协调」推广到双臂与上半身。掌握了「复合形态 = 单形态零件 + 耦合契约」这套模式，新平台（双臂、轮足、人形操作）的工作量就从「从零设计」降为「调参 + 验证」。
+
+% ════════════════════════════════════════════════════════════════
+\section{延伸阅读}
+\label{sec:rlmc-lm-further}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{6.4cm}p{7.2cm}@{}}
+\toprule
+资料（简称 + 出处） & 一句话教什么 \\
+\midrule
+VBC, Liu et al.\ CoRL 2024 Oral（arXiv:2403.16967）\,\cite{liu2024vbc} & 视觉引导分层移动抓取：低层 whole-body tracker（RL 从零训 + ROA）+ 高层 visual planner（9D 动作）+ DAgger 视觉蒸馏（本章分层案例）。 \\
+ETH Badminton, Ma et al.\ \textit{Sci.\ Robotics} 2025\,\cite{ma2025badminton} & 端到端腿臂协调对打：标定感知噪声、约束 RL（电流 $\le 8$A）、EKF 轨迹预测、涌现主动感知。 \\
+SLIM 2025\,\cite{wang2025slim} & 解耦 + IK 在线补偿的移动操作，臂安装扰动 DR（本章 Phase 3 来源）。 \\
+RMA, Kumar et al.\ RSS 2021\,\cite{kumar2021rma} & base policy + adaptation module 实时在线适应（VBC 的 ROA 同源思路）。 \\
+DAgger, Ross et al.\ AISTATS 2011\,\cite{ross2011dagger} & 数据集聚合的模仿学习，解决分布漂移（VBC Stage 3 视觉蒸馏的算法）。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{阅读路线建议。}\textbf{最小路线}（先跑通一个复合机器人）：本章 \cref{sec:rlmc-lm-coupling}--\cref{sec:rlmc-lm-asset} $\to$ \cref{sec:rlmc-lm-curriculum} 的 Phase 0--1；\textbf{标准路线}（做出移动抓取）：上述 $+$ \cref{sec:rlmc-lm-action}--\cref{sec:rlmc-lm-reward} $\to$ VBC 精读 \cref{sec:rlmc-lm-vbc} $\to$ Liu et al.\ 2024；\textbf{研究路线}（追性能极限）：上述 $+$ ETH 精读 \cref{sec:rlmc-lm-eth} $\to$ Ma et al.\ 2025 $+$ 约束式 RL，设计自己的端到端方案。
+
+% ════════════════════════════════════════════════════════════════
+\section{版本信息速查}
+\label{sec:rlmc-lm-versions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+组件 & 本章基于 & 备注 \\
+\midrule
+mjlab & 1.4.0（与四足章同源）& MJCF \verb|attach|/\verb|include| 组合复合模型；RSL-RL 唯一后端 \\
+Isaac Lab & 2.x 主线 & USD 复合模型（USD Composer 组装）；\verb|ImplicitActuatorCfg| 分组 actuator \\
+UniLab & main（2026 时点）& 非 Manager-Based；\verb|Go2ArmManipLoco| 带臂任务；MJCF/Motrix XML，不用 USD \\
+RSL-RL & arXiv:2509.10771 对应版本 & 三框架 PPO 共用；UniLab 经 \verb|FinalObservationAwarePPO| \\
+awesome-loco-manipulation & 仓库当前版 & 预组装复合 URDF（Go2+ARX/B1+Z1 等）；平台清单与许可随提交变化 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\rebuilt{凡 task id 确切字符串、各框架字段名与默认值、平台质量/臂长/kp 等硬件相关量，均以你所装版本的 \texttt{--help}、官方文档与具体模型/URDF 为准；本章已对未逐字确认处加 \texttt{\textbackslash pz}/\texttt{\textbackslash rebuilt} 标注。}

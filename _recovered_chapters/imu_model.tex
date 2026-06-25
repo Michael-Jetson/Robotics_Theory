@@ -1,0 +1,1202 @@
+\chapter{IMU 模型与预积分}
+\label{ch:imu}
+
+% ════════════════════════════════════════════════════════════════
+%  全吸收章：SLAM Handbook ch11 + Forster et al. TRO2017/RSS2015 流形预积分
+%  + VINS-Mono 四元数预积分 + Kalibr 噪声模型 + Woodman 惯导误差/捷联机理
+%  + OpenVINS 完整 IMU 内参模型 + Allan 方差五项辨识 + WGS84 重力/坐标系。
+%  自包含独立记录，右扰动 + 右雅可比 J_r 为主，读者无需翻原书。
+%  教学层遵循 v5.0 算法工程教学规范（动机→反面→历史→理论→陷阱→练习
+%  + 符号表/速查/故障排查/API 速查）。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 加速度计在静止时为什么读数不是 $\mathbf 0$，而是大小约 $9.81\,\mathrm{m/s^2}$、方向指天？它测的到底是什么量？
+  \item 一段 $200\,\mathrm{Hz}$ 的 IMU 数据有上千个采样。若把每个采样时刻都加进因子图，会发生什么？为什么不可行？
+  \item 你在 \cref{ch:lie} 学过右扰动 $\mathbf R\,\mathrm{Exp}(\delta\boldsymbol\phi)$ 与右雅可比 $\mathbf J_r$。在 SO(3) 上把一个小旋转噪声从矩阵乘积内部“移到末尾”，应当用哪一条恒等式？
+  \item 厂商手册给的陀螺噪声单位是 $\,^\circ/\sqrt{\mathrm h}$，而你代码里的协方差需要 $\mathrm{rad}^2/\mathrm s$。它们之间差了哪些换算？为什么白噪声离散化要除以 $\Delta t$、而 bias 随机游走要乘以 $\Delta t$？
+  \item 优化过程中 IMU 偏置（bias）的估计会被不断修正。每次修正后，是否必须把这段 IMU 数据重新积分一遍？有没有办法只做一次积分、之后用线性修正？
+\end{enumerate}
+\textbf{答错 $\ge2$ 题}：第 1--2 题指向 \cref{sec:imu-why,sec:imu-meas}；第 3 题回看 \cref{ch:lie}；第 4 题指向 \cref{subsec:cont-disc-noise}；第 5 题指向 \cref{subsec:bias-correction}。
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{写出并解释}六轴 IMU 的测量模型（加速度计测“比力”、陀螺测角速度），区分加性白噪声、缓变偏置、尺度/失准/g-敏感等确定性内参；
+  \item \textbf{推导}连续时间惯导运动学 $\dot{\mathbf R},\dot{\mathbf v},\dot{\mathbf p}$ 及其欧拉离散化，并说明“两测量间姿态恒定”近似的有效域；
+  \item \textbf{独立完成}SO(3) 流形上的 IMU 预积分——定义与初态、重力解耦的相对增量 $\Delta\mathbf R_{ij},\Delta\mathbf v_{ij},\Delta\mathbf p_{ij}$，分离噪声得到预积分测量模型；
+  \item \textbf{推导}预积分噪声的一阶传播与迭代式协方差递推 $\boldsymbol\Sigma_{i,k+1}=\mathbf A\boldsymbol\Sigma_{ik}\mathbf A^\top+\mathbf B\boldsymbol\Sigma_\eta\mathbf B^\top$；
+  \item \textbf{运用}偏置一阶修正避免重积分，写出预积分 IMU 因子的残差与全部解析雅可比；
+  \item \textbf{换算}连续↔离散噪声参数，并用 Allan 方差辨识 IMU 噪声系数；
+  \item \textbf{判别}视觉惯性系统（VIO）中全局位置与偏航不可观、纯平移/纯旋转/常加速度等退化运动；
+  \item \textbf{对接}预积分 IMU 因子到因子图 / 滑动窗口优化，理解它与视觉因子在 MAP 中的并列关系。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把高频含噪 IMU 数据，压缩成一条可放进优化的相对运动测量}”的主线。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  thr/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (meas) {测量模型\\ 比力 $+$ 偏置 $+$ 噪声};
+\node[blk, right=of meas] (kin) {连续/离散\\ 运动学};
+\node[grp, right=of kin] (pre) {SO(3) 预积分\\ $\Delta\mathbf R,\Delta\mathbf v,\Delta\mathbf p$};
+\node[grp, below=8mm of pre] (cov) {噪声传播\\ 协方差 $\boldsymbol\Sigma_{ij}$};
+\node[grp, left=of cov] (bias) {偏置一阶修正\\ 雅可比};
+\node[grp, left=of bias] (res) {IMU 因子\\ 残差/雅可比};
+\node[thr, below=8mm of res] (noise) {噪声标定\\ Kalibr/Allan};
+\node[thr, right=of noise] (obs) {可观测性\\ 与退化};
+\node[thr, right=of obs] (vio) {接口：因子图\\ VIO};
+\draw[ln] (meas)--(kin); \draw[ln] (kin)--(pre);
+\draw[ln] (pre)--(cov); \draw[ln] (cov)--(bias); \draw[ln] (bias)--(res);
+\draw[ln] (res.south)--(noise.north);
+\draw[ln] (noise)--(obs); \draw[ln] (obs)--(vio);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径（骨干 only）}：先读 \cref{sec:imu-meas}（测量模型）$\to$ \cref{sec:imu-kinematics}（运动学）$\to$ \cref{sec:imu-preint}（预积分核心三式）$\to$ \cref{sec:imu-cov}（协方差与偏置修正）$\to$ \cref{sec:imu-factor}（因子残差），约 4--5 小时即可建立可实现的完整链条。噪声标定（\cref{sec:imu-noise}）、可观测性（\cref{sec:imu-obs}）、连续/高阶预积分（\cref{sec:imu-advanced}）为次优/进阶，按需深读。
+
+\subsection*{前置知识桥接}
+\cref{ch:lie} 已给出本章反复要用的李群工具：$\mathbf R\in\SO(3)$、反对称算子 $(\cdot)^\wedge$、指数/对数映射 $\mathrm{Exp}/\mathrm{Log}$、\textbf{右扰动} $\mathbf R\,\mathrm{Exp}(\delta\boldsymbol\phi)$ 与\textbf{右雅可比} $\mathbf J_r$，以及伴随恒等式 $\mathrm{Exp}(\boldsymbol\phi)\mathbf R=\mathbf R\,\mathrm{Exp}(\mathbf R^\top\boldsymbol\phi)$。本章把这些工具用在“随时间积分的旋转”上：预积分的全部代数技巧，本质就是反复调用一阶近似 $\mathrm{Exp}(\boldsymbol\phi+\delta\boldsymbol\phi)\approx\mathrm{Exp}(\boldsymbol\phi)\mathrm{Exp}(\mathbf J_r(\boldsymbol\phi)\delta\boldsymbol\phi)$ 与伴随恒等式“把噪声移到末尾”。\cref{ch:eskf} 给出了误差状态滤波（ESKF）的协方差传播视角，本章的迭代式协方差递推与之同源（线性化误差动力学 $+$ 一阶传播），但落脚于\emph{优化/因子图}而非滤波。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 在视觉里程计 / VIO 里，你会发现纯视觉无法估计绝对尺度、对快速运动鲁棒性差；不懂预积分，你就无法把 IMU 的尺度与高频运动信息正确地融进优化；
+  \item 你会照抄 GTSAM 的 \texttt{PreintegratedImuMeasurements} 或 VINS-Mono 的 \texttt{IntegrationBase}，却不理解为什么偏置变化时只需做一次线性修正、为什么协方差能在线递推——调参与排错将寸步难行。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导与练习） & 6--8 小时 & 首次系统学习、要实现预积分/VIO \\
+速读（跳过冗长推导细节） & 2.5 小时 & 有李群基础、想对齐本书记号与右扰动约定 \\
+速查（只看小结的符号表 + 速查表） & 20 分钟 & 写代码时回来查公式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+体（IMU）系记 $b$，世界系记 $w$（近地小尺度近似为惯性系）。旋转 $\mathbf R_{wb}\in\SO(3)$ 把点从 $b$ 系映到 $w$ 系（即 body-to-world），$\mathbf R_{bw}=\mathbf R_{wb}^\top$。位置、速度 $\mathbf p^w,\mathbf v^w\in\mathbb R^3$。
+原始测量带波浪号：陀螺 $\tilde{\boldsymbol\omega}$、加速度计 $\tilde{\mathbf a}$；标称/线性化点带横杠：$\bar{\mathbf b}_i$；预积分测量带波浪号：$\Delta\tilde{\mathbf R}_{ij}$ 等。
+偏置上标指\textbf{传感器类型}（陀螺 $g$、加速度计 $a$），\emph{不是坐标系}：$\mathbf b^g,\mathbf b^a$。
+\textbf{扰动方向：全书右扰动 $\mathbf R\,\mathrm{Exp}(\delta\boldsymbol\phi)$ 为主，右雅可比 $\mathbf J_r$ 为主}（\cref{ch:lie}）。
+过程噪声协方差记 $\boldsymbol\Sigma$（避免与旋转 $\mathbf R$ 冲突）；预积分 $9\times9$ 协方差 $\boldsymbol\Sigma_{ij}$，原始 IMU $6\times6$ 噪声协方差 $\boldsymbol\Sigma_\eta$。重力向量 $\mathbf g$（世界系）。本章不少推导源自 Forster 等的奠基论文\cite{forster2017preintegration} 与 SLAM Handbook\cite{carlone2026handbook}，工程对照取 VINS-Mono\cite{qin2018vins} 与 Kalibr\cite{rehder2016kalibr}。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么需要 IMU 模型与预积分}
+\label{sec:imu-why}
+
+\paragraph{动机：IMU 是最普遍、最互补的里程计来源。}
+惯性测量单元（Inertial Measurement Unit, IMU）测量它所附着刚体的\emph{线加速度}与\emph{角速度}，是机器人 SLAM 中最普遍的里程计来源之一\cite{carlone2026handbook}。它的形态与成本跨度极大：从飞机上又大又准的光学陀螺，到手机里又小又噪的 MEMS（微机电系统）。MEMS IMU 低 SWAP（尺寸/重量/功耗）、廉价，是机器人传感器的优良候选，在 SLAM 中已被研究二十余年。IMU 与相机互补：IMU 高频（$200$--$1000\,\mathrm{Hz}$）能捕捉快速加速度与旋转，相机能提供环境的丰富观测；二者融合得到\emph{视觉惯性里程计}（Visual-Inertial Odometry, VIO），加闭环则成视觉惯性 SLAM。
+
+\paragraph{反面一：纯惯性积分快速发散。}
+若只把 IMU 测量按运动学积分（航位推算），噪声、偏置、数值积分误差会迅速累积。一个具体数字：基于消费级 Xsens Mtx 的简单捷联惯导，仅 $60\,\mathrm s$ 后位置误差就超过 $150\,\mathrm m$\cite{woodman2007inertial}。其中陀螺误差经姿态投影传到位置，是几乎所有惯导的关键误差路径——这就是为什么 IMU 必须与其他传感器融合。
+
+\paragraph{反面二：把每个 IMU 采样都加进因子图，图会爆炸。}
+原则上，可以用 IMU 测量模型把相邻时刻的状态关联起来，推一个 \cref{ch:slam_est} 式的 MAP 估计器。但 IMU 高频输出意味着每来一个采样就要向因子图加一个状态\cite{carlone2026handbook}。一段几秒的轨迹就有上千个状态，因子图迅速变得无法实时求解。更敏锐的读者会问：连续时间表述能否绕过高频加变量？答案是——连续时间惯导表述仍需为每个测量加一个因子，同样导致笨重因子图。
+
+\paragraph{核心思想：预积分。}
+\emph{IMU 预积分}（IMU preintegration）的核心想法是：避免以 IMU 频率向因子图加状态或测量。把两个\emph{关键帧}之间的所有 IMU 测量\textbf{随时间积分成一条相对运动测量}，这样（远少的）相对运动测量才进因子图。但朴素积分有个致命缺点——优化器每次迭代改变初始状态（如关键帧 $i$ 的姿态 $\mathbf R_i$）时，积分都得重做。预积分的精髓在于：\textbf{把依赖待估状态变量的项与只依赖测量的项分离开}，使积分结果与初态、与重力无关，从而在线性化点改变时\emph{无需重新积分}。
+
+\begin{insight}[预积分的本质]\label{ins:imu-essence}
+预积分不是“一种更快的积分算法”，而是一次\textbf{变量重组}：把“从 $t_i$ 到 $t_j$ 的运动”写成“一个只由测量决定的相对增量” $\oplus$ “关键帧状态与重力的函数”。前者一次算好、永不重做；后者随优化变量变化，但代价只是矩阵乘加。难的部分（双重积分、SO(3) 上的非交换旋转累乘）被一次性吸收进“伪测量”。
+\end{insight}
+
+\paragraph{历史脉络。}
+预积分的原始思想来自 Lupton 与 Sukkarieh（2012），他们用\emph{欧拉角}参数化旋转做相对增量\cite{forster2017preintegration}。Forster、Carlone、Dellaert、Scaramuzza（2015 RSS / 2017 TRO，arXiv:1512.02363）——\emph{On-Manifold Preintegration for Real-Time Visual-Inertial Odometry}，给出 SO(3) 流形上完整、解析、可在线增量的预积分理论，避免了欧拉角的万向锁\cite{forster2017preintegration}。VINS-Mono（Qin 等，2018，arXiv:1708.03852）给出等价的\emph{四元数}离散实现\cite{qin2018vins}。本章以 Forster 的流形版本为理论主线（右雅可比、严谨、与本书右扰动一致），以 VINS-Mono 为工程对照。
+
+% ════════════════════════════════════════════════════════════════
+\section{IMU 测量模型与误差模型}
+\label{sec:imu-meas}
+
+\paragraph{动机：先搞清楚 IMU 到底测了什么。}
+六轴 IMU $=$ 三轴加速度计 $+$ 三轴陀螺仪。陀螺仪基于\emph{角动量守恒}测量传感器相对惯性系的角速度；加速度计用一个检验质量块的惯性，测量“相对惯性系的运动学加速度”与“重力加速度”之差——这个差称\textbf{比力}（specific force）。这就解释了前置自测第 1 题：静止时运动学加速度为零，加速度计读到的是 $-\mathbf g$（在体系中），大小 $g\approx9.81\,\mathrm{m/s^2}$、方向指天。
+
+\begin{note}
+\textbf{关于罗盘.}\;IMU 通常还含磁罗盘（测磁北方向），但 SLAM 中较少用——许多机器人场景（含室内、城市）有大金属结构、电子设备造成的局部磁干扰，使罗盘有大偏置\cite{carlone2026handbook}。本章不涉及磁力计。
+\end{note}
+
+\subsection{标准测量模型}
+\label{subsec:imu-std-model}
+
+简化假设：传感器系与体系 $b$ 重合，世界系 $w$ 为惯性系。时刻 $t$ 的 IMU 测量被假设受\textbf{加性零均值高斯白噪声} $\boldsymbol\eta$ 和\textbf{缓变偏置} $\mathbf b$ 污染。陀螺测量模型\cite{forster2017preintegration,carlone2026handbook}：
+\begin{equation}
+  \tilde{\boldsymbol\omega}(t)=\boldsymbol\omega_b^b(t)+\mathbf b^g(t)+\boldsymbol\eta^g(t),
+  \label{eq:imu-gyro}
+\end{equation}
+加速度计测量模型：
+\begin{equation}
+  \tilde{\mathbf a}(t)=\mathbf R_{wb}^\top(t)\big(\mathbf a^w(t)-\mathbf g^w\big)+\mathbf b^a(t)+\boldsymbol\eta^a(t).
+  \label{eq:imu-accel}
+\end{equation}
+逐项说明：$\boldsymbol\omega_b^b(t)\in\mathbb R^3$ 是体系 $b$ 相对世界系 $w$ 的瞬时角速度，在 $b$ 系表达；$\mathbf a^w(t)\in\mathbb R^3$ 是传感器在世界系下的运动学加速度；$\mathbf g^w$ 是世界系重力向量。\cref{eq:imu-accel} 中 $\mathbf R_{wb}^\top(t)(\mathbf a^w(t)-\mathbf g^w)$ 正是 IMU 在体系中实际感受到的\emph{比力}。$\boldsymbol\eta^g,\boldsymbol\eta^a$ 零均值高斯；偏置 $\mathbf b^g,\mathbf b^a$ 服从随机游走（\cref{subsec:bias-model}）。
+
+\begin{insight}[比力与重力的关系决定了运动学里 $+\mathbf g$ 的出现]\label{ins:specific-force}
+从 \cref{eq:imu-accel} 解出运动学加速度 $\mathbf a^w=\mathbf R_{wb}(\tilde{\mathbf a}-\mathbf b^a-\boldsymbol\eta^a)+\mathbf g^w$。重力项 $+\mathbf g^w$ 之所以总出现在速度/位置更新中（\cref{sec:imu-kinematics}），根源就在这里：加速度计读的是“减掉重力之后”的量，要恢复真加速度就得把重力\emph{加回去}。
+\end{insight}
+
+\begin{pitfall}[概念误区：偏置上标 $a$/$g$ 指坐标系]
+新手看到 $\mathbf b^a,\mathbf b^g$ 容易以为上标是“在 $a$ 系/$g$ 系表达”。\textbf{错}。这里 $a=$ accelerometer（加速度计）、$g=$ gyroscope（陀螺），上标指\emph{哪个传感器}的偏置，与坐标系无关。现象：若误读成坐标系，会在写残差时给偏置乱加旋转。正确做法：偏置定义在体系、是传感器固有量，三个分量分别对应三个敏感轴。\cite{carlone2026handbook}
+\end{pitfall}
+
+\begin{pitfall}[编程陷阱：重力符号约定不一致导致状态发散]
+错误做法：直接照抄某库代码的 $\mathbf g=[0,0,+9.81]$ 而自己的世界系是 ENU（z 轴朝天）。现象：速度/位置在第一帧就朝错误方向积分，几秒内发散。根本原因：\cref{eq:imu-accel} 用的是 $\mathbf a^w-\mathbf g^w$，在 ENU 下 $\mathbf g^w=[0,0,-9.81]$（重力指向 $-z$），而 NED 下 $\mathbf g^w=[0,0,+9.81]$。正确做法：先明确世界系（ENU 还是 NED），再让 $\mathbf g^w$ 与之一致；自检：让设备静止，确认估计的 $\mathbf a^w\approx\mathbf 0$（而非 $\approx2\mathbf g$）。
+\end{pitfall}
+
+\subsection{扩展测量模型：尺度、失准与 g-敏感}
+\label{subsec:imu-ext-model}
+
+\paragraph{动机：标定时标准模型不够用。}
+\cref{eq:imu-gyro,eq:imu-accel} 在机器人中常已够用，但（重）标定传感器平台时需更精细的模型，把制造缺陷显式建模。
+
+\textbf{加速度计失准 $+$ 尺度误差}：引入形状矩阵 $\mathbf T_a$，
+\begin{equation}
+  \tilde{\mathbf a}(t)=\mathbf T_a\,\mathbf R_{wb}^\top(t)\big(\mathbf a^w(t)-\mathbf g^w\big)+\mathbf b^a(t)+\boldsymbol\eta^a(t),
+  \label{eq:imu-accel-ext}
+\end{equation}
+$\mathbf T_a$（$3\times3$）建模三轴的尺度误差（对角）与轴间失准（非对角），可由内参标定确定；尺度误差还可含温度相关分量\cite{carlone2026handbook}。\textbf{陀螺失准 $+$ 尺度误差}：
+\begin{equation}
+  \tilde{\boldsymbol\omega}(t)=\mathbf T_g\,\boldsymbol\omega_b^b(t)+\mathbf b^g(t)+\boldsymbol\eta^g(t).
+  \label{eq:imu-gyro-ext}
+\end{equation}
+\textbf{g-敏感}（陀螺受加速度影响）：若该影响在白噪声 $\boldsymbol\eta^g$ 量级内可忽略；某些 MEMS 中更显著，建模为
+\begin{equation}
+  \tilde{\boldsymbol\omega}(t)=\mathbf T_g\,\boldsymbol\omega_b^b(t)+\mathbf T_s\,\mathbf R_{wb}^\top(t)(\mathbf a^w(t)-\mathbf g^w)+\mathbf b^g(t)+\boldsymbol\eta^g(t),
+  \label{eq:imu-gsens}
+\end{equation}
+其中 $\mathbf T_s$ 是 g-敏感矩阵，可在标定中估计\cite{carlone2026handbook}。
+
+\paragraph{完整内参模型（OpenVINS 谱系）。}
+更系统的处理把陀螺系 $\{w\}$ 与加速度计系 $\{a\}$ 区分开，并允许它们相对一个基惯性系 $\{I\}$ 有各自的旋转\cite{yang2022online}。原始读数：
+\begin{align}
+  {}^w\boldsymbol\omega_m&=\mathbf T_w\,{}^w_I\mathbf R\,{}^I\boldsymbol\omega+\mathbf T_g\,{}^I\mathbf a+\mathbf b_g+\mathbf n_g, \label{eq:imu-intr-gyro}\\
+  {}^a\mathbf a_m&=\mathbf T_a\,{}^a_I\mathbf R\,{}^I\mathbf a+\mathbf b_a+\mathbf n_a, \label{eq:imu-intr-accel}
+\end{align}
+其中 $\mathbf T_w,\mathbf T_a$ 是可逆的尺度-失准阵，$\mathbf T_g$ 是 g-敏感阵。求真值（校正后量）时用其逆 $\mathbf D_w=\mathbf T_w^{-1},\mathbf D_a=\mathbf T_a^{-1}$：
+\begin{align}
+  {}^I\boldsymbol\omega&={}^I_w\mathbf R\,\mathbf D_w\big({}^w\boldsymbol\omega_m-\mathbf T_g\,{}^I\mathbf a-\mathbf b_g-\mathbf n_g\big), \label{eq:imu-intr-gyro-inv}\\
+  {}^I\mathbf a&={}^I_a\mathbf R\,\mathbf D_a\big({}^a\mathbf a_m-\mathbf b_a-\mathbf n_a\big). \label{eq:imu-intr-accel-inv}
+\end{align}
+实践中标定 $\mathbf D_a,\mathbf D_w$、$\mathbf T_g$ 以及 ${}^I_w\mathbf R$ 与 ${}^I_a\mathbf R$ 之\textbf{一}（基惯性系与其一重合）——同时标二者会因过参数化使 IMU--相机旋转不可观\cite{yang2022online}。尺度-失准阵的形态有上三角、下三角（Kalibr/Rehder 模型）与全阵（把旋转并入）等变体，参数个数从 6 到 9 不等。
+
+\begin{table}[H]\centering\small
+\caption{IMU 完整内参模型的几种代表变体（OpenVINS 谱系\cite{yang2022online}）}
+\label{tab:imu-intrinsics}
+\begin{tabular}{lllllll}
+\toprule
+模型 & 维数 & $\mathbf D_w$ & $\mathbf D_a$ & ${}^I_w\mathbf R$ & ${}^I_a\mathbf R$ & $\mathbf T_g$ \\
+\midrule
+imu0（理想，本章预积分默认）& 0 & $\mathbf I$ & $\mathbf I$ & $\mathbf I$ & $\mathbf I$ & $\mathbf 0$ \\
+imu1 & 15 & 上三角 6 & 上三角 6 & 标 & -- & -- \\
+imu2 & 15 & 上三角 6 & 上三角 6 & -- & 标 & -- \\
+imu6（$=$ Kalibr/Rehder）& 24 & 下三角 6 & 下三角 6 & 标 & -- & 全阵 9 \\
+imu11 & 21 & 上三角 6 & 上三角 6 & 标 & -- & 上三角 6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章预积分的内参前提.}\;后续 \cref{sec:imu-preint} 起的预积分推导采用理想模型（imu0）：$\mathbf T_a=\mathbf T_g=\mathbf I$、$\mathbf T_s=\mathbf 0$、$\{I\}=\{w\}=\{a\}$，只保留偏置与白噪声。\cref{eq:imu-accel-ext} 到 \cref{eq:imu-intr-accel-inv} 的完整内参作为\emph{更精细的测量模型}留给标定与高精度标定专题；其数值结论是：g-敏感 $\mathbf T_g$ 项通常比其他内参小 1--2 个数量级，系统性能对它不敏感\cite{yang2022online}。
+\end{note}
+
+\begin{pitfall}[思维陷阱：以为“尺度误差”和“偏置”是一回事]
+新手想法：“反正都是误差，拿一个标量乘上去/加上去差不多。”实际上：偏置 $\mathbf b$ 是\emph{加性}的、即使静止（真值为零）也存在，且\emph{缓变}（随机游走）；尺度/失准 $\mathbf T$ 是\emph{乘性}的、\emph{确定性}的，\textbf{只在有运动（真值非零）时显现}。正确思维：偏置进状态向量、在线估计（随机游走因子）；尺度/失准是内参、离线标定或当作慢变状态。自检：让设备静止——偏置可观（直接读平均），但尺度误差完全不可观（没有激励）。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 把一台理想（无噪、无偏）IMU 静置于水平桌面，世界系取 ENU。写出陀螺与加速度计的理论读数。
+  \item 由 \cref{eq:imu-accel} 解出 $\mathbf a^w$，并验证 \cref{ins:specific-force} 中“静止读 $-\mathbf R_{wb}^\top\mathbf g^w$”。
+  \item 设某 MEMS 的 g-敏感使 $1\,g$ 的横向加速度引入 $0.1\,^\circ/\mathrm s$ 的陀螺误差。若该 IMU 陀螺白噪声标准差为 $0.05\,^\circ/\mathrm s$，论证为何在剧烈运动下 g-敏感不可忽略。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{连续与离散运动学}
+\label{sec:imu-kinematics}
+
+\paragraph{动机：从测量推断运动。}
+有了测量模型，下一步是写出运动如何随测量演化。捷联惯导（strapdown，IMU 刚固连载体）的连续时间运动学模型\cite{forster2017preintegration,woodman2007inertial}：
+\begin{equation}
+  \dot{\mathbf R}_{wb}=\mathbf R_{wb}\,(\boldsymbol\omega_b^b)^\wedge,\qquad
+  \dot{\mathbf v}^w=\mathbf a^w,\qquad
+  \dot{\mathbf p}^w=\mathbf v^w.
+  \label{eq:imu-kin-cont}
+\end{equation}
+第一式刻画体系相对世界系的旋转演化（与 \cref{ch:lie} 的 $\dot{\mathbf R}=\mathbf R\boldsymbol\omega^\wedge$ 一致），后两式是平凡的“加速度积分得速度、速度积分得位置”。
+
+\begin{derivation}[姿态微分方程的捷联推导]
+为巩固 \cref{eq:imu-kin-cont} 第一式，给出 Woodman 式的直接推导\cite{woodman2007inertial}。用方向余弦阵 $\mathbf R(t)$（每列是体轴在世界系的单位向量），有 $\mathbf R(t+\delta t)=\mathbf R(t)\mathbf A(t)$，$\mathbf A(t)$ 是体系从 $t$ 到 $t+\delta t$ 的微转动。小角近似 $\mathbf A(t)=\mathbf I+\delta\boldsymbol\Psi$，其中
+\[
+  \delta\boldsymbol\Psi=\begin{bmatrix}0&-\delta\psi&\delta\theta\\\delta\psi&0&-\delta\phi\\-\delta\theta&\delta\phi&0\end{bmatrix}
+\]
+是绕体轴 $x,y,z$ 三个小转角的反对称阵。代入差商定义：
+\[
+  \dot{\mathbf R}(t)=\lim_{\delta t\to0}\frac{\mathbf R(t)(\mathbf I+\delta\boldsymbol\Psi)-\mathbf R(t)}{\delta t}
+  =\mathbf R(t)\lim_{\delta t\to0}\frac{\delta\boldsymbol\Psi}{\delta t}=\mathbf R(t)\,\boldsymbol\Omega(t),
+\]
+而 $\lim_{\delta t\to0}\delta\boldsymbol\Psi/\delta t=\boldsymbol\Omega(t)=(\boldsymbol\omega_b^b)^\wedge$ 正是角速度的反对称形式。这与 \cref{eq:imu-kin-cont} 第一式逐字相同（$\mathbf R\equiv\mathbf R_{wb}$，$\boldsymbol\Omega\equiv(\boldsymbol\omega_b^b)^\wedge$）。离散单步把 $\int_t^{t+\delta t}\boldsymbol\Omega\,dt=\mathbf B$ 代入指数 $\mathbf C(t{+}\delta t)=\mathbf C(t)\exp(\mathbf B)$，记 $\sigma=\|\boldsymbol\omega_b\delta t\|$ 并用反对称阵幂性质 $\mathbf B^3=-\sigma^2\mathbf B$ 整理 Taylor 级数，恰得罗德里格斯形式 $\mathbf C(t{+}\delta t)=\mathbf C(t)\big(\mathbf I+\tfrac{\sin\sigma}{\sigma}\mathbf B+\tfrac{1-\cos\sigma}{\sigma^2}\mathbf B^2\big)$——即 \cref{eq:imu-euler} 第一式的展开。
+\end{derivation}
+
+\subsection{积分与欧拉离散化}
+\label{subsec:imu-euler}
+
+把 \cref{eq:imu-kin-cont} 在 $[t,t+\Delta t]$ 上积分（$\Delta t$ 为 IMU 采样周期）：
+\begin{align}
+  \mathbf R_{wb}(t+\Delta t)&=\mathbf R_{wb}(t)\,\mathrm{Exp}\!\Big(\!\int_t^{t+\Delta t}\!\boldsymbol\omega_b^b(\tau)\,d\tau\Big),\nonumber\\
+  \mathbf v^w(t+\Delta t)&=\mathbf v^w(t)+\int_t^{t+\Delta t}\!\mathbf a^w(\tau)\,d\tau,\label{eq:imu-int-exact}\\
+  \mathbf p^w(t+\Delta t)&=\mathbf p^w(t)+\int_t^{t+\Delta t}\!\mathbf v^w(\tau)\,d\tau+\iint_t^{t+\Delta t}\!\mathbf a^w(\tau)\,d\tau^2.\nonumber
+\end{align}
+第一式假设角速度的\emph{方向}在区间内不变。进一步假设 $\mathbf a^w,\boldsymbol\omega_b^b$ 在 $[t,t+\Delta t]$ 内\textbf{保持常值}（零阶保持/欧拉积分）：
+\begin{equation}
+  \mathbf R_{wb}(t{+}\Delta t)=\mathbf R_{wb}(t)\mathrm{Exp}\!\big(\boldsymbol\omega_b^b(t)\Delta t\big),\quad
+  \mathbf v^w(t{+}\Delta t)=\mathbf v^w(t)+\mathbf a^w(t)\Delta t,\quad
+  \mathbf p^w(t{+}\Delta t)=\mathbf p^w(t)+\mathbf v^w(t)\Delta t+\tfrac12\mathbf a^w(t)\Delta t^2.
+  \label{eq:imu-euler}
+\end{equation}
+用测量模型 \cref{eq:imu-gyro,eq:imu-accel} 把 $\mathbf a^w,\boldsymbol\omega_b^b$ 写成测量的函数——从 \cref{eq:imu-gyro} 得 $\boldsymbol\omega_b^b=\tilde{\boldsymbol\omega}-\mathbf b^g-\boldsymbol\eta^{gd}$，从 \cref{eq:imu-accel} 得 $\mathbf a^w=\mathbf R(\tilde{\mathbf a}-\mathbf b^a-\boldsymbol\eta^{ad})+\mathbf g$——代入 \cref{eq:imu-euler}（下文起省略坐标系下标，记号无歧义）：
+\begin{align}
+  \mathbf R(t{+}\Delta t)&=\mathbf R(t)\,\mathrm{Exp}\!\big((\tilde{\boldsymbol\omega}(t)-\mathbf b^g(t)-\boldsymbol\eta^{gd}(t))\Delta t\big),\nonumber\\
+  \mathbf v(t{+}\Delta t)&=\mathbf v(t)+\mathbf g\Delta t+\mathbf R(t)\big(\tilde{\mathbf a}(t)-\mathbf b^a(t)-\boldsymbol\eta^{ad}(t)\big)\Delta t,\label{eq:imu-euler-meas}\\
+  \mathbf p(t{+}\Delta t)&=\mathbf p(t)+\mathbf v(t)\Delta t+\tfrac12\mathbf g\Delta t^2+\tfrac12\mathbf R(t)\big(\tilde{\mathbf a}(t)-\mathbf b^a(t)-\boldsymbol\eta^{ad}(t)\big)\Delta t^2.\nonumber
+\end{align}
+这里 $\boldsymbol\eta^{gd},\boldsymbol\eta^{ad}$ 是\emph{离散时间}噪声（见 \cref{subsec:cont-disc-noise}）。
+
+\begin{note}
+\textbf{近似的有效域.}\;\cref{eq:imu-euler-meas} 的速度、位置更新假设区间内姿态 $\mathbf R(t)$ 恒定，对非零旋转速率\emph{并非} \cref{eq:imu-kin-cont} 的精确解；高频 IMU（$\Delta t$ 小）缓解此误差\cite{forster2017preintegration}。采用此一阶欧拉是因其简单、便于建模与不确定度传播；慢率 IMU 可用更高阶数值积分或连续时间预积分（\cref{sec:imu-advanced}）。
+\end{note}
+
+\subsection{捷联机理：误差如何随积分放大}
+\label{subsec:strapdown-error}
+
+\paragraph{动机：理解漂移的来源。}
+为体会 \cref{sec:imu-why} 的“$60\,\mathrm s$ 漂 $150\,\mathrm m$”，看 Woodman 对误差经积分放大的定量分析\cite{woodman2007inertial}。
+
+\textbf{常值偏置.}\;陀螺常值偏置 $\epsilon$ 经一次积分使姿态误差\emph{线性}增长 $\theta(t)=\epsilon\cdot t$；加速度计常值偏置 $\epsilon$ 经\emph{二次}积分使位置误差\emph{二次}增长 $s(t)=\tfrac12\epsilon t^2$。
+
+\textbf{白噪声.}\;设白噪声序列 $\{N_i\}$，$E(N_i)=0$、$\mathrm{Var}(N_i)=\sigma^2$、互不相关。矩形法积分 $\int_0^t\epsilon\,d\tau=\delta t\sum_{i=1}^nN_i$（$t=n\delta t$），其期望为零，方差
+\[
+  \mathrm{Var}\Big[\int_0^t\epsilon\,d\tau\Big]=\delta t^2\cdot n\cdot\sigma^2=\delta t\cdot t\cdot\sigma^2
+  \;\Rightarrow\; \sigma_\theta(t)=\sigma\sqrt{\delta t\cdot t}\propto\sqrt t,
+\]
+即陀螺白噪声引入姿态的\textbf{角度随机游走}（$\propto\sqrt t$）。加速度计白噪声经二次积分则使位置误差 $\propto t^{3/2}$：
+\[
+  \mathrm{Var}\Big[\iint\epsilon\Big]=\delta t^4\sum_{i=1}^n(n-i+1)^2\sigma^2\approx\tfrac13\delta t\cdot t^3\cdot\sigma^2
+  \;\Rightarrow\;\sigma_s(t)\approx\sigma\,t^{3/2}\sqrt{\tfrac{\delta t}{3}}.
+\]
+
+\begin{insight}[重力-倾斜耦合：姿态误差为何主导位置漂移]\label{ins:gravity-tilt}
+捷联惯导从竖直加速度里减掉 $1g$ 才得运动加速度。若姿态有倾斜误差 $\epsilon$，会把幅度 $g\sin(\epsilon)$ 的重力分量错误投到水平轴，在水平加速度上留下 $g\sin(\epsilon)$ 的\emph{残余比力偏置}；竖直轴残余仅 $g(1-\cos\epsilon)$（小 $\epsilon$ 时小得多）。因此小倾斜误差造成的位置误差主要在水平面，且\textbf{陀螺误差经姿态投影才是位置漂移的关键路径}——这就是为什么 \cref{sec:imu-why} 强调“纯惯性必败”。\cite{woodman2007inertial}
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{IMU 误差源及其经积分的增长律（捷联惯导\cite{woodman2007inertial}）}
+\label{tab:imu-error-sources}
+\begin{tabular}{lll}
+\toprule
+误差类型 & 描述 & 积分结果 \\
+\midrule
+常值偏置（陀螺）& $\epsilon$ & 姿态线性增长 $\theta=\epsilon t$ \\
+常值偏置（加计）& $\epsilon$ & 位置二次增长 $s=\tfrac12\epsilon t^2$ \\
+白噪声（陀螺）& 标准差 $\sigma$ & 角度随机游走 $\propto\sqrt t$ \\
+白噪声（加计）& 标准差 $\sigma$ & 位置二阶随机游走 $\propto t^{3/2}$ \\
+偏置不稳定 & 随机游走建模 & 角度二阶、位置三阶随机游走 \\
+温度 & 温度相关残余偏置 & 同常值偏置（线性/二次） \\
+标定（尺度/失准）& 确定性 & 仅在运动时显现，漂移正比转速与时长 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{连续\texorpdfstring{$\leftrightarrow$}{<->}离散噪声协方差}
+\label{subsec:cont-disc-noise}
+
+\paragraph{动机：手册给的是连续谱密度，代码要的是离散方差。}
+IMU 数据手册给的噪声参数是\emph{连续时间}量（功率谱密度的平方根），而离散积分要用\emph{离散}时间方差。两者由采样周期 $\Delta t$ 联系。对白噪声\cite{forster2017preintegration,rehder2016kalibr}：
+\begin{equation}
+  \mathrm{Cov}(\boldsymbol\eta^{gd}(t))=\frac{1}{\Delta t}\,\mathrm{Cov}(\boldsymbol\eta^{g}(t)),\qquad
+  \mathrm{Cov}(\boldsymbol\eta^{ad}(t))=\frac{1}{\Delta t}\,\mathrm{Cov}(\boldsymbol\eta^{a}(t)).
+  \label{eq:noise-white-disc}
+\end{equation}
+对偏置随机游走（\cref{subsec:bias-model}）则\emph{相反}——乘以 $\Delta t_{ij}$：
+\begin{equation}
+  \boldsymbol\Sigma^{bgd}=\Delta t_{ij}\,\mathrm{Cov}(\boldsymbol\eta^{bg}),\qquad
+  \boldsymbol\Sigma^{bad}=\Delta t_{ij}\,\mathrm{Cov}(\boldsymbol\eta^{ba}).
+  \label{eq:noise-rw-disc}
+\end{equation}
+用 Kalibr 的写法（逐轴标准差）\cite{rehder2016kalibr}，等价地：
+\begin{equation}
+  \sigma_{g,d}=\frac{\sigma_g}{\sqrt{\Delta t}}\quad(\text{白噪声}),\qquad
+  \sigma_{bg,d}=\sigma_{bg}\sqrt{\Delta t}\quad(\text{随机游走}).
+  \label{eq:kalibr-conv}
+\end{equation}
+两套写法完全一致：$\sigma_{g,d}^2=\sigma_g^2/\Delta t$ 即 \cref{eq:noise-white-disc}，$\sigma_{bg,d}^2=\sigma_{bg}^2\Delta t$ 即 \cref{eq:noise-rw-disc}。
+
+\begin{insight}[方向相反的两个 $\Delta t$]\label{ins:dt-direction}
+白噪声方差随采样\emph{越快越小}（$\propto1/\Delta t$）：积分一段固定时长，采样越密、每步噪声方差越大，但步数也越多，二者综合后\emph{积分误差}随采样变密而减小。随机游走方差随时长\emph{越长越大}（$\propto\Delta t$）：偏置是缓慢漂移，时间越长漂得越远。把这两个方向记反，是预积分协方差出错的高频原因。
+\end{insight}
+
+\begin{pitfall}[编程陷阱：把手册的 ARW 单位直接当 $\sigma_g$]
+错误做法：手册给陀螺角度随机游走 $\mathrm{ARW}=0.2\,^\circ/\sqrt{\mathrm h}$，直接填进 $\sigma_g$。现象：协方差量级错几个数量级，预积分因子权重严重失衡，IMU 约束几乎不起作用或主导一切。根本原因：Kalibr 的 $\sigma_g$ 单位是 $\mathrm{rad}/\mathrm s/\sqrt{\mathrm{Hz}}=\mathrm{rad}/\sqrt{\mathrm s}$（连续谱密度的平方根），与手册 $\,^\circ/\sqrt{\mathrm h}$ 相差角度$\to$弧度（$\times\pi/180$）与 $\sqrt{\mathrm h}\to\sqrt{\mathrm s}$（$\times1/\sqrt{3600}=1/60$）两重换算。正确做法：$\sigma_g[\mathrm{rad}/\sqrt s]=\mathrm{ARW}[\,^\circ/\sqrt h]\cdot\frac{\pi}{180}\cdot\frac{1}{60}$。自检：用 Allan 方差（\cref{subsec:allan}）从实采数据反推一遍，与手册对齐。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 设陀螺连续白噪声 $\sigma_g=1.7\times10^{-4}\,\mathrm{rad}/\sqrt s$，IMU 率 $200\,\mathrm{Hz}$。算离散标准差 $\sigma_{g,d}$。
+  \item 推导 \cref{eq:imu-euler-meas} 中速度更新的 $+\mathbf g\Delta t$：从 \cref{eq:imu-accel} 解出 $\mathbf a^w$ 代入 \cref{eq:imu-euler}。
+  \item 解释为什么 \cref{eq:noise-white-disc} 与 \cref{eq:noise-rw-disc} 中 $\Delta t$ 的指数符号相反（用 \cref{ins:dt-direction}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{SO(3) 流形上的 IMU 预积分}
+\label{sec:imu-preint}
+
+本节是全章核心。我们把 \cref{eq:imu-euler-meas} 的单步递推，沿两关键帧间所有区间累乘/累加，再做变量重组得到与初态、重力无关的相对增量，最后分离噪声得到可放进优化的\emph{预积分测量模型}。
+
+\subsection{跨关键帧迭代积分}
+\label{subsec:cross-kf}
+
+设因子图已建模了其它传感器测量（如 \cref{ch:vo} 的视觉测量），状态实例化在\emph{关键帧}时刻 $t_i,t_j$（可以是每个相机帧、每个 LiDAR 扫描、或每 $n$ 个 IMU 测量\cite{forster2017preintegration}）。对 $t_i,t_j$ 间所有 $\Delta t$ 区间迭代 \cref{eq:imu-euler-meas}（引入简写 $\Delta t_{ij}\doteq\sum_{k=i}^{j-1}\Delta t$，$(\cdot)_i\doteq(\cdot)(t_i)$）：
+\begin{align}
+  \mathbf R_j&=\mathbf R_i\prod_{k=i}^{j-1}\mathrm{Exp}\!\big((\tilde{\boldsymbol\omega}_k-\mathbf b_k^g-\boldsymbol\eta_k^{gd})\Delta t\big),\nonumber\\
+  \mathbf v_j&=\mathbf v_i+\mathbf g\Delta t_{ij}+\sum_{k=i}^{j-1}\mathbf R_k(\tilde{\mathbf a}_k-\mathbf b_k^a-\boldsymbol\eta_k^{ad})\Delta t,\label{eq:imu-cross-kf}\\
+  \mathbf p_j&=\mathbf p_i+\sum_{k=i}^{j-1}\Big[\mathbf v_k\Delta t+\tfrac12\mathbf g\Delta t^2+\tfrac12\mathbf R_k(\tilde{\mathbf a}_k-\mathbf b_k^a-\boldsymbol\eta_k^{ad})\Delta t^2\Big].\nonumber
+\end{align}
+\cref{eq:imu-cross-kf} 已给出 $t_i,t_j$ 间运动估计，但缺点是：当 $t_i$ 处线性化点改变（如 Gauss--Newton 每次迭代调整 $\mathbf R_i$）时，整段积分必须重做——$\mathbf R_i$ 一变，所有未来旋转 $\mathbf R_k$ 都变，求和与连乘都要重算\cite{forster2017preintegration}。这正是 \cref{sec:imu-why} 提到的痛点。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small]
+  \draw[thick] (0,0) -- (10,0);
+  \foreach \x/\lab in {0/i, 10/j} {
+    \filldraw[main] (\x,0) circle (2.6pt);
+    \node[below=4pt, main!50!black] at (\x,0) {$t_{\lab}$};
+  }
+  \foreach \x in {1,2,...,9} {
+    \draw[gray!70] (\x,0.12) -- (\x,-0.12);
+  }
+  \node[above=2pt] at (5,0.12) {IMU 测量 $(\tilde{\boldsymbol\omega}_k,\tilde{\mathbf a}_k)$，间隔 $\Delta t$};
+  \node[above=12pt, main!60!black] at (1.4,0) {$\mathbf x_i=(\mathbf R_i,\mathbf v_i,\mathbf p_i,\mathbf b_i)$};
+  \node[above=12pt, main!60!black] at (9.4,0) {$\mathbf x_j$};
+  \draw[->, very thick, second!60!black] (0,-0.9) -- (10,-0.9)
+    node[midway, below] {一条预积分测量 $\Delta\tilde{\mathbf R}_{ij},\Delta\tilde{\mathbf v}_{ij},\Delta\tilde{\mathbf p}_{ij}$（协方差 $\boldsymbol\Sigma_{ij}$）};
+\end{tikzpicture}
+\caption{预积分把两关键帧 $t_i,t_j$ 之间的全部高频 IMU 测量压缩成一条相对运动测量，再进因子图。}
+\label{fig:imu-preint-timeline}
+\end{figure}
+
+\subsection{相对运动增量定义}
+\label{subsec:rel-increment}
+
+\paragraph{核心招式：把依赖初态、重力的项剥出去。}
+为避免重算，定义如下\textbf{与 $t_i$ 处位姿、速度无关}的相对增量\cite{forster2017preintegration,carlone2026handbook}：
+\begin{align}
+  \Delta\mathbf R_{ij}&\doteq\mathbf R_i^\top\mathbf R_j=\prod_{k=i}^{j-1}\mathrm{Exp}\!\big((\tilde{\boldsymbol\omega}_k-\mathbf b_k^g-\boldsymbol\eta_k^{gd})\Delta t\big),\nonumber\\
+  \Delta\mathbf v_{ij}&\doteq\mathbf R_i^\top(\mathbf v_j-\mathbf v_i-\mathbf g\Delta t_{ij})=\sum_{k=i}^{j-1}\Delta\mathbf R_{ik}(\tilde{\mathbf a}_k-\mathbf b_k^a-\boldsymbol\eta_k^{ad})\Delta t,\label{eq:imu-rel-increment}\\
+  \Delta\mathbf p_{ij}&\doteq\mathbf R_i^\top\Big(\mathbf p_j-\mathbf p_i-\mathbf v_i\Delta t_{ij}-\tfrac12\mathbf g\Delta t_{ij}^2\Big)=\sum_{k=i}^{j-1}\Big[\Delta\mathbf v_{ik}\Delta t+\tfrac12\Delta\mathbf R_{ik}(\tilde{\mathbf a}_k-\mathbf b_k^a-\boldsymbol\eta_k^{ad})\Delta t^2\Big],\nonumber
+\end{align}
+其中 $\Delta\mathbf R_{ik}\doteq\mathbf R_i^\top\mathbf R_k$，$\Delta\mathbf v_{ik}\doteq\mathbf R_i^\top(\mathbf v_k-\mathbf v_i-\mathbf g\Delta t_{ik})$。每个等式左端是“状态的函数”，右端是“纯测量累加”——右端可直接由两关键帧间的惯性测量算出，与 $\mathbf R_i,\mathbf v_i,\mathbf p_i,\mathbf g$ 无关。
+
+\begin{pitfall}[概念误区：把 $\Delta\mathbf v_{ij},\Delta\mathbf p_{ij}$ 当成真实的速度/位置变化]
+新手想法：“$\Delta\mathbf v_{ij}$ 当然就是 $\mathbf v_j-\mathbf v_i$ 嘛。”\textbf{不是}。与“delta 旋转” $\Delta\mathbf R_{ij}=\mathbf R_i^\top\mathbf R_j$（确是相对旋转）不同，$\Delta\mathbf v_{ij},\Delta\mathbf p_{ij}$ \emph{并非}物理上的速度/位置变化，而是被\emph{刻意}定义成使 \cref{eq:imu-rel-increment} 右端独立于 $i$ 时刻状态与重力的量\cite{forster2017preintegration}。它们扣掉了 $\mathbf g\Delta t_{ij}$、$\mathbf v_i\Delta t_{ij}$ 等项，又左乘 $\mathbf R_i^\top$ 转进体系。理解这一点，才不会在写残差时把重力项漏掉或加错。
+\end{pitfall}
+
+遗留问题：\cref{eq:imu-rel-increment} 右端仍是\emph{偏置}的函数（每项含 $\mathbf b_k^g,\mathbf b_k^a$）。分两步处理：先假设两关键帧间偏置\textbf{常值}
+\begin{equation}
+  \mathbf b_i^g=\mathbf b_{i+1}^g=\dots=\mathbf b_{j-1}^g,\qquad \mathbf b_i^a=\mathbf b_{i+1}^a=\dots=\mathbf b_{j-1}^a,
+  \label{eq:bias-const}
+\end{equation}
+并设 $\mathbf b_i$ 已知（本节）；\cref{subsec:bias-correction} 再处理偏置估计变化时如何免重积分。
+
+\subsection{分离噪声：预积分测量模型}
+\label{subsec:noise-separation}
+
+目标：把 \cref{eq:imu-rel-increment} 变形，使噪声从“嵌在测量内部”变为“附加在末尾的小扰动”，从而能定义清楚的测量似然。全程反复调用 \cref{ch:lie} 的两条恒等式：
+\begin{align}
+  \mathrm{Exp}(\boldsymbol\phi+\delta\boldsymbol\phi)&\approx\mathrm{Exp}(\boldsymbol\phi)\,\mathrm{Exp}\!\big(\mathbf J_r(\boldsymbol\phi)\,\delta\boldsymbol\phi\big),\label{eq:lie-firstorder}\\
+  \mathrm{Exp}(\boldsymbol\phi)\,\mathbf R&=\mathbf R\,\mathrm{Exp}(\mathbf R^\top\boldsymbol\phi),\label{eq:lie-adjoint}
+\end{align}
+以及一阶近似 $\exp(\boldsymbol\phi^\wedge)\approx\mathbf I+\boldsymbol\phi^\wedge$ 和反对称交换 $\mathbf a^\wedge\mathbf b=-\mathbf b^\wedge\mathbf a$。
+
+\begin{derivation}[旋转增量的噪声分离]
+对 \cref{eq:imu-rel-increment} 中 $\Delta\mathbf R_{ij}$ 的连乘，逐因子用 \cref{eq:lie-firstorder} 把小噪声 $-\boldsymbol\eta_k^{gd}\Delta t$ 当作 $\delta\boldsymbol\phi$ 分裂出来（并依 \cref{eq:bias-const} 把随 $k$ 变的 $\mathbf b_k^g$ 替为常值 $\mathbf b_i^g$）：
+\[
+  \Delta\mathbf R_{ij}\overset{\eqref{eq:lie-firstorder}}{\simeq}\prod_{k=i}^{j-1}\Big[\mathrm{Exp}\big((\tilde{\boldsymbol\omega}_k-\mathbf b_i^g)\Delta t\big)\,\mathrm{Exp}\big(-\mathbf J_r^k\boldsymbol\eta_k^{gd}\Delta t\big)\Big],
+  \quad \mathbf J_r^k\doteq\mathbf J_r\!\big((\tilde{\boldsymbol\omega}_k-\mathbf b_i^g)\Delta t\big).
+\]
+再用伴随恒等式 \cref{eq:lie-adjoint}，把每个噪声项 $\mathrm{Exp}(-\mathbf J_r^k\boldsymbol\eta_k^{gd}\Delta t)$ 依次“穿过”其右侧的无噪旋转，移到整个连乘末尾。每穿过一次，扰动被左乘一次相应的 $\Delta\tilde{\mathbf R}_{k+1\,j}^\top$：
+\[
+  \Delta\mathbf R_{ij}\overset{\eqref{eq:lie-adjoint}}{=}\Delta\tilde{\mathbf R}_{ij}\prod_{k=i}^{j-1}\mathrm{Exp}\!\big(-\Delta\tilde{\mathbf R}_{k+1\,j}^\top\mathbf J_r^k\boldsymbol\eta_k^{gd}\Delta t\big)\doteq\Delta\tilde{\mathbf R}_{ij}\,\mathrm{Exp}(-\delta\boldsymbol\phi_{ij}),
+\]
+其中定义\textbf{预积分旋转测量}与其噪声
+\[
+  \Delta\tilde{\mathbf R}_{ij}\doteq\prod_{k=i}^{j-1}\mathrm{Exp}\!\big((\tilde{\boldsymbol\omega}_k-\mathbf b_i^g)\Delta t\big),\qquad
+  \mathrm{Exp}(-\delta\boldsymbol\phi_{ij})\doteq\prod_{k=i}^{j-1}\mathrm{Exp}\!\big(-\Delta\tilde{\mathbf R}_{k+1\,j}^\top\mathbf J_r^k\boldsymbol\eta_k^{gd}\Delta t\big).
+\]
+\end{derivation}
+
+\begin{derivation}[速度与位置增量的噪声分离]
+把上式 $\Delta\mathbf R_{ik}=\Delta\tilde{\mathbf R}_{ik}\mathrm{Exp}(-\delta\boldsymbol\phi_{ik})$ 代回 \cref{eq:imu-rel-increment} 的 $\Delta\mathbf v_{ij}$，对 $\mathrm{Exp}(-\delta\boldsymbol\phi_{ik})$ 用一阶近似 $\mathbf I-\delta\boldsymbol\phi_{ik}^\wedge$，丢弃高阶噪声项：
+\[
+  \Delta\mathbf v_{ij}\simeq\sum_{k=i}^{j-1}\Delta\tilde{\mathbf R}_{ik}(\mathbf I-\delta\boldsymbol\phi_{ik}^\wedge)(\tilde{\mathbf a}_k-\mathbf b_i^a)\Delta t-\Delta\tilde{\mathbf R}_{ik}\boldsymbol\eta_k^{ad}\Delta t.
+\]
+用反对称交换 $-\delta\boldsymbol\phi_{ik}^\wedge(\tilde{\mathbf a}_k-\mathbf b_i^a)=+(\tilde{\mathbf a}_k-\mathbf b_i^a)^\wedge\delta\boldsymbol\phi_{ik}$ 把对 $\delta\boldsymbol\phi$ 线性的项提出：
+\[
+  \Delta\mathbf v_{ij}=\Delta\tilde{\mathbf v}_{ij}+\sum_{k=i}^{j-1}\Big[\Delta\tilde{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\mathbf b_i^a)^\wedge\delta\boldsymbol\phi_{ik}\Delta t-\Delta\tilde{\mathbf R}_{ik}\boldsymbol\eta_k^{ad}\Delta t\Big]\doteq\Delta\tilde{\mathbf v}_{ij}-\delta\mathbf v_{ij},
+\]
+其中 $\Delta\tilde{\mathbf v}_{ij}\doteq\sum_{k=i}^{j-1}\Delta\tilde{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\mathbf b_i^a)\Delta t$。同法对 $\Delta\mathbf p_{ij}$（代入 $\Delta\tilde{\mathbf R}$ 与 $\Delta\tilde{\mathbf v}$ 的噪声分解、用一阶近似）：
+\[
+  \Delta\mathbf p_{ij}=\Delta\tilde{\mathbf p}_{ij}+\sum_{k=i}^{j-1}\Big[-\delta\mathbf v_{ik}\Delta t+\tfrac12\Delta\tilde{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\mathbf b_i^a)^\wedge\delta\boldsymbol\phi_{ik}\Delta t^2-\tfrac12\Delta\tilde{\mathbf R}_{ik}\boldsymbol\eta_k^{ad}\Delta t^2\Big]\doteq\Delta\tilde{\mathbf p}_{ij}-\delta\mathbf p_{ij},
+\]
+其中 $\Delta\tilde{\mathbf p}_{ij}\doteq\sum_{k=i}^{j-1}\big[\Delta\tilde{\mathbf v}_{ik}\Delta t+\tfrac12\Delta\tilde{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\mathbf b_i^a)\Delta t^2\big]$。
+\end{derivation}
+
+把三式代回相对增量定义 \cref{eq:imu-rel-increment}（注意 $\mathrm{Exp}(-\delta\boldsymbol\phi_{ij})^\top=\mathrm{Exp}(\delta\boldsymbol\phi_{ij})$），得到\textbf{预积分测量模型}：
+\begin{equation}
+\boxed{\;
+\begin{aligned}
+  \Delta\tilde{\mathbf R}_{ij}&=\mathbf R_i^\top\mathbf R_j\,\mathrm{Exp}(\delta\boldsymbol\phi_{ij}),\\
+  \Delta\tilde{\mathbf v}_{ij}&=\mathbf R_i^\top(\mathbf v_j-\mathbf v_i-\mathbf g\Delta t_{ij})+\delta\mathbf v_{ij},\\
+  \Delta\tilde{\mathbf p}_{ij}&=\mathbf R_i^\top\Big(\mathbf p_j-\mathbf p_i-\mathbf v_i\Delta t_{ij}-\tfrac12\mathbf g\Delta t_{ij}^2\Big)+\delta\mathbf p_{ij}.
+\end{aligned}
+\;}
+  \label{eq:imu-preint-model}
+\end{equation}
+读法：复合测量 $=$（待估）状态的函数 $\oplus$ 随机噪声 $[\delta\boldsymbol\phi_{ij}^\top,\delta\mathbf v_{ij}^\top,\delta\mathbf p_{ij}^\top]^\top$。这正是我们要的——左端 $\Delta\tilde{\mathbf R}_{ij},\Delta\tilde{\mathbf v}_{ij},\Delta\tilde{\mathbf p}_{ij}$ 由测量一次算出且不含初态/重力，右端是关键帧状态。
+
+\begin{insight}[为什么能放进因子图]\label{ins:why-factor}
+\cref{eq:imu-preint-model} 的妙处：后两行是加性高斯噪声，负对数似然就是二次型；第一行 $\delta\boldsymbol\phi_{ij}$ 若零均值高斯，则 $\Delta\tilde{\mathbf R}_{ij}$ 服从 \cref{ch:lie} 的 SO(3) 高斯（切空间高斯经指数映射推前），其负对数似然是测地距离的马氏平方。于是整条预积分测量就是一个标准的、可微的因子，权重为协方差逆 $\boldsymbol\Sigma_{ij}^{-1}$（下节求）。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 \cref{eq:lie-adjoint} 自己推一遍“两个噪声项穿过两个旋转移到末尾”的两步过程，确认每穿过一次产生一个 $\Delta\tilde{\mathbf R}^\top$。
+  \item 验证 $\mathrm{Exp}(-\delta\boldsymbol\phi)^\top=\mathrm{Exp}(\delta\boldsymbol\phi)$（提示：$\mathrm{Exp}(\boldsymbol\phi)^\top=\mathrm{Exp}(-\boldsymbol\phi)$）。
+  \item 把 \cref{eq:imu-preint-model} 第二行的 $\mathbf R_i^\top$ 与重力项 $-\mathbf g\Delta t_{ij}$ 解释为“扣掉重力造成的速度变化、再转进 $i$ 时刻体系”。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{协方差传播与偏置一阶修正}
+\label{sec:imu-cov}
+
+\subsection{噪声的一阶传播}
+\label{subsec:noise-prop}
+
+预积分噪声向量
+\begin{equation}
+  \boldsymbol\eta_{ij}^\Delta\doteq[\delta\boldsymbol\phi_{ij}^\top,\ \delta\mathbf v_{ij}^\top,\ \delta\mathbf p_{ij}^\top]^\top\sim\mathcal N(\mathbf 0_{9\times1},\ \boldsymbol\Sigma_{ij}).
+  \label{eq:imu-noise-vec}
+\end{equation}
+协方差 $\boldsymbol\Sigma_{ij}$ 至关重要——其逆在 MAP 中作因子权重。先把噪声写成原始 IMU 噪声的线性组合。\textbf{旋转噪声}：由噪声分离结果 $\mathrm{Exp}(-\delta\boldsymbol\phi_{ij})=\prod_k\mathrm{Exp}(-\Delta\tilde{\mathbf R}_{k+1\,j}^\top\mathbf J_r^k\boldsymbol\eta_k^{gd}\Delta t)$，两边取 $\mathrm{Log}$、变号，反复用对数一阶近似 $\mathrm{Log}(\mathrm{Exp}(\boldsymbol\phi)\mathrm{Exp}(\delta\boldsymbol\phi))\approx\boldsymbol\phi+\mathbf J_r^{-1}(\boldsymbol\phi)\delta\boldsymbol\phi$（$\boldsymbol\eta_k^{gd}$ 小，$\mathbf J_r^{-1}\approx\mathbf I$）：
+\begin{equation}
+  \delta\boldsymbol\phi_{ij}\simeq\sum_{k=i}^{j-1}\Delta\tilde{\mathbf R}_{k+1\,j}^\top\,\mathbf J_r^k\,\boldsymbol\eta_k^{gd}\,\Delta t.
+  \label{eq:dphi-prop}
+\end{equation}
+至一阶，$\delta\boldsymbol\phi_{ij}$ 零均值高斯（零均值噪声的线性组合）。\textbf{速度/位置噪声}（$\boldsymbol\eta_k^{ad}$ 与 $\delta\boldsymbol\phi_{ik}$ 的线性组合，故亦零均值高斯）：
+\begin{align}
+  \delta\mathbf v_{ij}&\simeq\sum_{k=i}^{j-1}\Big[-\Delta\tilde{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\mathbf b_i^a)^\wedge\delta\boldsymbol\phi_{ik}\Delta t+\Delta\tilde{\mathbf R}_{ik}\boldsymbol\eta_k^{ad}\Delta t\Big],\label{eq:dv-prop}\\
+  \delta\mathbf p_{ij}&\simeq\sum_{k=i}^{j-1}\Big[\delta\mathbf v_{ik}\Delta t-\tfrac12\Delta\tilde{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\mathbf b_i^a)^\wedge\delta\boldsymbol\phi_{ik}\Delta t^2+\tfrac12\Delta\tilde{\mathbf R}_{ik}\boldsymbol\eta_k^{ad}\Delta t^2\Big].\label{eq:dp-prop}
+\end{align}
+\cref{eq:dphi-prop,eq:dv-prop,eq:dp-prop} 把 $\boldsymbol\eta_{ij}^\Delta$ 表为 IMU 测量噪声 $\boldsymbol\eta_k^d\doteq[\boldsymbol\eta_k^{gd},\boldsymbol\eta_k^{ad}]$ 的线性函数，于是由 $\boldsymbol\eta_k^d$ 的协方差（IMU 规格给出）经线性传播即得 $\boldsymbol\Sigma_{ij}$。
+
+\subsection{迭代式协方差递推}
+\label{subsec:iter-cov}
+
+\paragraph{动机：在线增量计算。}
+直接对整段求和再传播很繁，且每来一个新测量都要重算。改写为\emph{逐测量递推}——新测量到来只更新一次\cite{forster2017preintegration}。
+
+\begin{derivation}[从求和到递推]
+对 \cref{eq:dphi-prop} 取出末项（$k=j-1$）重排，利用 $\Delta\tilde{\mathbf R}_{jj}=\mathbf I$ 与 $\Delta\tilde{\mathbf R}_{k+1\,j}=\Delta\tilde{\mathbf R}_{k+1\,j-1}\Delta\tilde{\mathbf R}_{j-1\,j}$：
+\[
+  \delta\boldsymbol\phi_{ij}=\Delta\tilde{\mathbf R}_{j-1\,j}^\top\underbrace{\sum_{k=i}^{j-2}\Delta\tilde{\mathbf R}_{k+1\,j-1}^\top\mathbf J_r^k\boldsymbol\eta_k^{gd}\Delta t}_{=\,\delta\boldsymbol\phi_{i\,j-1}}+\mathbf J_r^{j-1}\boldsymbol\eta_{j-1}^{gd}\Delta t.
+\]
+同理对 \cref{eq:dv-prop,eq:dp-prop} 拆末项，得迭代形式（$k=i,\dots,j-1$，初值 $\delta\boldsymbol\phi_{ii}=\delta\mathbf v_{ii}=\delta\mathbf p_{ii}=\mathbf 0$）：
+\begin{align*}
+  \delta\boldsymbol\phi_{i\,k+1}&=\Delta\tilde{\mathbf R}_{k\,k+1}^\top\delta\boldsymbol\phi_{ik}+\mathbf J_r^k\boldsymbol\eta_k^{gd}\Delta t,\\
+  \delta\mathbf v_{i\,k+1}&=\delta\mathbf v_{ik}-\Delta\tilde{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\mathbf b_i^a)^\wedge\delta\boldsymbol\phi_{ik}\Delta t+\Delta\tilde{\mathbf R}_{ik}\boldsymbol\eta_k^{ad}\Delta t,\\
+  \delta\mathbf p_{i\,k+1}&=\delta\mathbf p_{ik}+\delta\mathbf v_{ik}\Delta t-\tfrac12\Delta\tilde{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\mathbf b_i^a)^\wedge\delta\boldsymbol\phi_{ik}\Delta t^2+\tfrac12\Delta\tilde{\mathbf R}_{ik}\boldsymbol\eta_k^{ad}\Delta t^2.
+\end{align*}
+\end{derivation}
+
+把上式写成矩阵形式 $\boldsymbol\eta_{i\,k+1}^\Delta=\mathbf A_k\,\boldsymbol\eta_{ik}^\Delta+\mathbf B_k\,\boldsymbol\eta_k^d$，其中
+\begin{equation}
+  \mathbf A_k=\begin{bmatrix}
+    \Delta\tilde{\mathbf R}_{k\,k+1}^\top & \mathbf 0 & \mathbf 0\\
+    -\Delta\tilde{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\mathbf b_i^a)^\wedge\Delta t & \mathbf I & \mathbf 0\\
+    -\tfrac12\Delta\tilde{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\mathbf b_i^a)^\wedge\Delta t^2 & \mathbf I\Delta t & \mathbf I
+  \end{bmatrix},\quad
+  \mathbf B_k=\begin{bmatrix}
+    \mathbf J_r^k\Delta t & \mathbf 0\\
+    \mathbf 0 & \Delta\tilde{\mathbf R}_{ik}\Delta t\\
+    \mathbf 0 & \tfrac12\Delta\tilde{\mathbf R}_{ik}\Delta t^2
+  \end{bmatrix},
+  \label{eq:AB-matrices}
+\end{equation}
+（行块顺序 $[\delta\boldsymbol\phi;\delta\mathbf v;\delta\mathbf p]$，输入顺序 $[\boldsymbol\eta^{gd};\boldsymbol\eta^{ad}]$）。由原始 IMU 噪声协方差 $\boldsymbol\Sigma_\eta\in\mathbb R^{6\times6}$，\textbf{协方差迭代传播}（初值 $\boldsymbol\Sigma_{ii}=\mathbf 0_{9\times9}$）：
+\begin{equation}
+  \boxed{\;\boldsymbol\Sigma_{i\,k+1}=\mathbf A_k\,\boldsymbol\Sigma_{ik}\,\mathbf A_k^\top+\mathbf B_k\,\boldsymbol\Sigma_\eta\,\mathbf B_k^\top\;}.
+  \label{eq:cov-recursion}
+\end{equation}
+
+\begin{note}
+\textbf{与 ESKF 协方差传播同源.}\;\cref{eq:cov-recursion} 与 \cref{ch:eskf} 的误差状态协方差传播 $\mathbf P\leftarrow\mathbf F\mathbf P\mathbf F^\top+\mathbf G\mathbf Q\mathbf G^\top$ 完全同型：$\mathbf A$ 是状态转移、$\mathbf B$ 是噪声雅可比。区别只在“状态”是 9 维预积分增量误差而非滤波误差状态，且这里是为\emph{优化因子}而非滤波递推。VINS-Mono 用一个 $15$ 维误差态（含偏置）的连续动力学 $\dot{\delta\mathbf z}=\mathbf F_t\delta\mathbf z+\mathbf G_t\mathbf n$，离散为 $\mathbf P_{t+\delta t}=(\mathbf I+\mathbf F_t\delta t)\mathbf P_t(\mathbf I+\mathbf F_t\delta t)^\top+(\mathbf G_t\delta t)\mathbf Q(\mathbf G_t\delta t)^\top$\cite{qin2018vins}，与 \cref{eq:cov-recursion} 数学等价（\cref{subsec:vins-quat}）。
+\end{note}
+
+预积分测量本身也同样在线累加（由 \cref{eq:imu-euler-meas} 的去偏置版直接得）：
+\begin{align}
+  \Delta\tilde{\mathbf R}_{i\,k+1}&=\Delta\tilde{\mathbf R}_{ik}\,\mathrm{Exp}\!\big((\tilde{\boldsymbol\omega}_k-\mathbf b_i^g)\Delta t\big),\nonumber\\
+  \Delta\tilde{\mathbf v}_{i\,k+1}&=\Delta\tilde{\mathbf v}_{ik}+\Delta\tilde{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\mathbf b_i^a)\Delta t,\label{eq:preint-recursion}\\
+  \Delta\tilde{\mathbf p}_{i\,k+1}&=\Delta\tilde{\mathbf p}_{ik}+\Delta\tilde{\mathbf v}_{ik}\Delta t+\tfrac12\Delta\tilde{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\mathbf b_i^a)\Delta t^2.\nonumber
+\end{align}
+
+\begin{pitfall}[编程陷阱：位置/速度更新顺序写反]
+错误做法：在 \cref{eq:preint-recursion} 中先更新 $\Delta\tilde{\mathbf v}$ 再用它更新 $\Delta\tilde{\mathbf p}$。现象：位置预积分系统性偏移、预积分与重积分对不上。根本原因：位置更新用的是\emph{更新前}的 $\Delta\tilde{\mathbf v}_{ik}$ 与 $\Delta\tilde{\mathbf R}_{ik}$；旋转更新会改变 $\Delta\tilde{\mathbf R}$，速度更新会改变 $\Delta\tilde{\mathbf v}$。正确做法：按 $\Delta\tilde{\mathbf p}\to\Delta\tilde{\mathbf v}\to\Delta\tilde{\mathbf R}$ 的顺序更新，或先把旧值存好。自检：与一段数据的逐步重积分对比，误差应在浮点精度内。
+\end{pitfall}
+
+\subsection{偏置一阶修正}
+\label{subsec:bias-correction}
+
+\paragraph{动机：偏置一变，难道全重积分？}
+上面假设预积分所用偏置 $\{\bar{\mathbf b}_i^a,\bar{\mathbf b}_i^g\}$ 正确且不变。但优化中偏置估计会变一个小量 $\delta\mathbf b$。重算 delta 测量代价高；改用\textbf{一阶展开}：给定 $\mathbf b\leftarrow\bar{\mathbf b}+\delta\mathbf b$，
+\begin{equation}
+\boxed{\;
+\begin{aligned}
+  \Delta\tilde{\mathbf R}_{ij}(\mathbf b_i^g)&\simeq\Delta\bar{\mathbf R}_{ij}\,\mathrm{Exp}\!\Big(\tfrac{\partial\Delta\bar{\mathbf R}_{ij}}{\partial\mathbf b^g}\delta\mathbf b_i^g\Big),\\
+  \Delta\tilde{\mathbf v}_{ij}(\mathbf b_i^g,\mathbf b_i^a)&\simeq\Delta\bar{\mathbf v}_{ij}+\tfrac{\partial\Delta\bar{\mathbf v}_{ij}}{\partial\mathbf b^g}\delta\mathbf b_i^g+\tfrac{\partial\Delta\bar{\mathbf v}_{ij}}{\partial\mathbf b^a}\delta\mathbf b_i^a,\\
+  \Delta\tilde{\mathbf p}_{ij}(\mathbf b_i^g,\mathbf b_i^a)&\simeq\Delta\bar{\mathbf p}_{ij}+\tfrac{\partial\Delta\bar{\mathbf p}_{ij}}{\partial\mathbf b^g}\delta\mathbf b_i^g+\tfrac{\partial\Delta\bar{\mathbf p}_{ij}}{\partial\mathbf b^a}\delta\mathbf b_i^a,
+\end{aligned}
+\;}
+  \label{eq:bias-correction}
+\end{equation}
+其中 $\Delta\bar{(\cdot)}$ 是在线性化点 $\bar{\mathbf b}_i$ 处算出的预积分量。旋转用右乘 $\mathrm{Exp}$ 修正（\textbf{直接在 SO(3) 上}，区别于 Lupton--Sukkarieh 的欧拉角），速度/位置用加法修正。
+
+\begin{derivation}[旋转偏置雅可比]
+新估计 $\hat{\mathbf b}_i\leftarrow\bar{\mathbf b}_i+\delta\mathbf b_i$。从 $\Delta\tilde{\mathbf R}_{ij}(\hat{\mathbf b}_i)=\prod_k\mathrm{Exp}((\tilde{\boldsymbol\omega}_k-\bar{\mathbf b}_i^g-\delta\mathbf b_i^g)\Delta t)$，对每因子用 \cref{eq:lie-firstorder}（$\mathbf J_r^k\doteq\mathbf J_r((\tilde{\boldsymbol\omega}_k-\bar{\mathbf b}_i^g)\Delta t)$）：
+\[
+  \Delta\tilde{\mathbf R}_{ij}(\hat{\mathbf b}_i)\simeq\prod_{k=i}^{j-1}\mathrm{Exp}\big((\tilde{\boldsymbol\omega}_k-\bar{\mathbf b}_i^g)\Delta t\big)\mathrm{Exp}\big(-\mathbf J_r^k\delta\mathbf b_i^g\Delta t\big).
+\]
+用伴随恒等式 \cref{eq:lie-adjoint} 把含 $\delta\mathbf b$ 项移到末尾（与旋转噪声分离同套路），再反复用 \cref{eq:lie-firstorder} 合并：
+\[
+  \Delta\tilde{\mathbf R}_{ij}(\hat{\mathbf b}_i)\simeq\Delta\bar{\mathbf R}_{ij}\,\mathrm{Exp}\Big(\underbrace{-\sum_{k=i}^{j-1}\Delta\tilde{\mathbf R}_{k+1\,j}(\bar{\mathbf b}_i)^\top\mathbf J_r^k\Delta t}_{=\,\partial\Delta\bar{\mathbf R}_{ij}/\partial\mathbf b^g}\,\delta\mathbf b_i^g\Big).
+\]
+\end{derivation}
+
+\begin{derivation}[速度偏置雅可比]
+把上式代回 $\Delta\tilde{\mathbf v}_{ij}(\hat{\mathbf b}_i)=\sum_k\Delta\tilde{\mathbf R}_{ik}(\hat{\mathbf b}_i)(\tilde{\mathbf a}_k-\bar{\mathbf b}_i^a-\delta\mathbf b_i^a)\Delta t$，用一阶近似 $\mathrm{Exp}(\cdot)\approx\mathbf I+(\cdot)^\wedge$，展开并弃二阶 $\delta\mathbf b$ 项，再用反对称交换：
+\[
+  \Delta\tilde{\mathbf v}_{ij}(\hat{\mathbf b}_i)=\Delta\bar{\mathbf v}_{ij}-\sum_{k}\Delta\bar{\mathbf R}_{ik}\Delta t\,\delta\mathbf b_i^a-\sum_{k}\Delta\bar{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\bar{\mathbf b}_i^a)^\wedge\frac{\partial\Delta\bar{\mathbf R}_{ik}}{\partial\mathbf b^g}\Delta t\,\delta\mathbf b_i^g,
+\]
+读出 $\partial\Delta\bar{\mathbf v}_{ij}/\partial\mathbf b^a$ 与 $\partial\Delta\bar{\mathbf v}_{ij}/\partial\mathbf b^g$。位置同法。
+\end{derivation}
+
+汇总五个偏置雅可比（在 $\bar{\mathbf b}_i$ 处求值、恒定、可随测量\textbf{增量预计算}）\cite{forster2017preintegration}：
+\begin{equation}
+  \boxed{\begin{aligned}
+    \frac{\partial\Delta\bar{\mathbf R}_{ij}}{\partial\mathbf b^g}&=-\sum_{k=i}^{j-1}\Delta\tilde{\mathbf R}_{k+1\,j}(\bar{\mathbf b}_i)^\top\,\mathbf J_r^k\,\Delta t,\\
+    \frac{\partial\Delta\bar{\mathbf v}_{ij}}{\partial\mathbf b^a}&=-\sum_{k=i}^{j-1}\Delta\bar{\mathbf R}_{ik}\,\Delta t,\qquad
+    \frac{\partial\Delta\bar{\mathbf v}_{ij}}{\partial\mathbf b^g}=-\sum_{k=i}^{j-1}\Delta\bar{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\bar{\mathbf b}_i^a)^\wedge\frac{\partial\Delta\bar{\mathbf R}_{ik}}{\partial\mathbf b^g}\Delta t,\\
+    \frac{\partial\Delta\bar{\mathbf p}_{ij}}{\partial\mathbf b^a}&=\sum_{k=i}^{j-1}\Big[\frac{\partial\Delta\bar{\mathbf v}_{ik}}{\partial\mathbf b^a}\Delta t-\tfrac12\Delta\bar{\mathbf R}_{ik}\Delta t^2\Big],\quad
+    \frac{\partial\Delta\bar{\mathbf p}_{ij}}{\partial\mathbf b^g}=\sum_{k=i}^{j-1}\Big[\frac{\partial\Delta\bar{\mathbf v}_{ik}}{\partial\mathbf b^g}\Delta t-\tfrac12\Delta\bar{\mathbf R}_{ik}(\tilde{\mathbf a}_k-\bar{\mathbf b}_i^a)^\wedge\frac{\partial\Delta\bar{\mathbf R}_{ik}}{\partial\mathbf b^g}\Delta t^2\Big].
+  \end{aligned}}
+  \label{eq:bias-jacobians}
+\end{equation}
+旋转不依赖 $\mathbf b^a$（\cref{eq:imu-rel-increment} 旋转项只含陀螺），故只有五个独立雅可比。Forster 等的实验证实：在合理偏置漂移幅度内，一阶修正 \cref{eq:bias-correction} 与精确重积分的误差可忽略\cite{forster2017preintegration}。
+
+\begin{insight}[一阶修正为什么够用]\label{ins:bias-firstorder}
+偏置在两关键帧（典型 $0.1$--$1\,\mathrm s$）间漂移极小（随机游走 $\propto\sqrt{\Delta t_{ij}}$），优化迭代对偏置的修正 $\delta\mathbf b$ 也是小量。预积分量对偏置在该小邻域内近似线性，一阶 Taylor 足够。这把“偏置一变就 $O(N)$ 重积分”降为“一次 $O(N)$ 预计算雅可比 $+$ 之后 $O(1)$ 线性修正”，是预积分能实时的另一关键。
+\end{insight}
+
+\subsection{偏置模型：随机游走}
+\label{subsec:bias-model}
+
+偏置缓变，用\textbf{布朗运动}（积分白噪声）建模\cite{forster2017preintegration}：
+\begin{equation}
+  \dot{\mathbf b}^g(t)=\boldsymbol\eta^{bg},\qquad \dot{\mathbf b}^a(t)=\boldsymbol\eta^{ba}.
+  \label{eq:bias-brownian}
+\end{equation}
+在相邻关键帧 $[t_i,t_j]$ 上积分：
+\begin{equation}
+  \mathbf b_j^g=\mathbf b_i^g+\boldsymbol\eta^{bgd},\qquad \mathbf b_j^a=\mathbf b_i^a+\boldsymbol\eta^{bad},
+  \label{eq:bias-rw}
+\end{equation}
+离散噪声 $\boldsymbol\eta^{bgd},\boldsymbol\eta^{bad}$ 零均值，协方差由 \cref{eq:noise-rw-disc} 给出（正比 $\Delta t_{ij}$）。\cref{eq:bias-rw} 作为额外加性因子进因子图：
+\begin{equation}
+  \|\mathbf r_{\mathbf b_{ij}}\|^2\doteq\|\mathbf b_j^g-\mathbf b_i^g\|^2_{\boldsymbol\Sigma^{bgd}}+\|\mathbf b_j^a-\mathbf b_i^a\|^2_{\boldsymbol\Sigma^{bad}}.
+  \label{eq:bias-factor}
+\end{equation}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:bias-jacobians} 论证位置雅可比依赖速度雅可比，因此实现时按 $k$ 递推须一并维护 $\partial\Delta\bar{\mathbf v}/\partial\mathbf b$。
+  \item 给定 $\bar{\mathbf b}_i^g$ 处算好的 $\Delta\bar{\mathbf R}_{ij}$ 与 $\partial\Delta\bar{\mathbf R}_{ij}/\partial\mathbf b^g$，写出偏置更新 $\delta\mathbf b^g$ 后修正旋转测量的表达式（用 \cref{eq:bias-correction}）。
+  \item （调试挑战）某实现把 \cref{eq:bias-jacobians} 第一式漏了转置 $(\cdot)^\top$，只对快速旋转段发散。解释为什么。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{预积分 IMU 因子：残差与解析雅可比}
+\label{sec:imu-factor}
+
+\subsection{MAP 框架与 IMU 残差}
+\label{subsec:imu-residual}
+
+\paragraph{宿主：因子图 MAP。}
+系统时刻 $i$ 状态 $\mathbf x_i\doteq[\mathbf R_i,\mathbf p_i,\mathbf v_i,\mathbf b_i]$，位姿 $(\mathbf R_i,\mathbf p_i)\in\SE(3)$、速度 $\mathbf v_i\in\mathbb R^3$、偏置 $\mathbf b_i=[\mathbf b_i^g,\mathbf b_i^a]\in\mathbb R^6$。记 $\mathcal I_{ij}$ 为两关键帧间 IMU 测量集、$\mathcal C_i$ 为图像测量。后验分解为先验、IMU、视觉三类因子之积\cite{forster2017preintegration}，零均值高斯下负对数后验即残差平方和：
+\begin{equation}
+  \mathcal X_k^\star=\arg\min_{\mathcal X_k}\ \|\mathbf r_0\|^2_{\boldsymbol\Sigma_0}+\sum_{(i,j)}\|\mathbf r_{\mathcal I_{ij}}\|^2_{\boldsymbol\Sigma_{ij}}+\sum_{i}\sum_{l\in\mathcal C_i}\|\mathbf r_{\mathcal C_{il}}\|^2_{\boldsymbol\Sigma_C}.
+  \label{eq:imu-map}
+\end{equation}
+由预积分测量模型 \cref{eq:imu-preint-model} 与协方差 $\boldsymbol\Sigma_{ij}$，并纳入偏置一阶修正 \cref{eq:bias-correction}，得 $9$ 维 IMU 残差 $\mathbf r_{\mathcal I_{ij}}=[\mathbf r_{\Delta\mathbf R_{ij}}^\top,\mathbf r_{\Delta\mathbf v_{ij}}^\top,\mathbf r_{\Delta\mathbf p_{ij}}^\top]^\top$：
+\begin{equation}
+\boxed{\;
+\begin{aligned}
+  \mathbf r_{\Delta\mathbf R_{ij}}&=\mathrm{Log}\!\Big(\big(\Delta\tilde{\mathbf R}_{ij}(\bar{\mathbf b}_i^g)\,\mathrm{Exp}(\tfrac{\partial\Delta\bar{\mathbf R}_{ij}}{\partial\mathbf b^g}\delta\mathbf b^g)\big)^\top\mathbf R_i^\top\mathbf R_j\Big),\\
+  \mathbf r_{\Delta\mathbf v_{ij}}&=\mathbf R_i^\top(\mathbf v_j-\mathbf v_i-\mathbf g\Delta t_{ij})-\Big[\Delta\bar{\mathbf v}_{ij}+\tfrac{\partial\Delta\bar{\mathbf v}_{ij}}{\partial\mathbf b^g}\delta\mathbf b^g+\tfrac{\partial\Delta\bar{\mathbf v}_{ij}}{\partial\mathbf b^a}\delta\mathbf b^a\Big],\\
+  \mathbf r_{\Delta\mathbf p_{ij}}&=\mathbf R_i^\top\Big(\mathbf p_j-\mathbf p_i-\mathbf v_i\Delta t_{ij}-\tfrac12\mathbf g\Delta t_{ij}^2\Big)-\Big[\Delta\bar{\mathbf p}_{ij}+\tfrac{\partial\Delta\bar{\mathbf p}_{ij}}{\partial\mathbf b^g}\delta\mathbf b^g+\tfrac{\partial\Delta\bar{\mathbf p}_{ij}}{\partial\mathbf b^a}\delta\mathbf b^a\Big].
+\end{aligned}
+\;}
+  \label{eq:imu-residual}
+\end{equation}
+旋转残差的几何意义：测量预测的相对旋转 $\Delta\tilde{\mathbf R}_{ij}$（含偏置修正）与状态给出的 $\mathbf R_i^\top\mathbf R_j$ 之差，经 $\mathrm{Log}$ 映到 $\mathbb R^3$ 夹角向量。加上偏置随机游走因子 \cref{eq:bias-factor}，即得完整 IMU 部分。
+
+\subsection{解析雅可比（lift--solve--retract）}
+\label{subsec:imu-jacobians}
+
+Gauss--Newton 每次迭代用 \cref{ch:lie} 的 retraction 重参数化（lifting）：$\mathbf R\leftarrow\mathbf R\,\mathrm{Exp}(\delta\boldsymbol\phi)$、$\mathbf p\leftarrow\mathbf p+\mathbf R\delta\mathbf p$、$\mathbf v\leftarrow\mathbf v+\delta\mathbf v$、$\delta\mathbf b\leftarrow\delta\mathbf b+\tilde\delta\mathbf b$，再对切空间变量求雅可比。下面给出全部非零块\cite{forster2017preintegration}。
+
+\textbf{位置残差雅可比}（$\mathbf R_j,\mathbf v_j$ 不出现 $\Rightarrow$ 对 $\delta\boldsymbol\phi_j,\delta\mathbf v_j$ 为零）：
+\begin{align}
+  \frac{\partial\mathbf r_{\Delta\mathbf p_{ij}}}{\partial\delta\boldsymbol\phi_i}&=\Big(\mathbf R_i^\top(\mathbf p_j-\mathbf p_i-\mathbf v_i\Delta t_{ij}-\tfrac12\mathbf g\Delta t_{ij}^2)\Big)^\wedge,\quad
+  \frac{\partial\mathbf r_{\Delta\mathbf p_{ij}}}{\partial\delta\mathbf p_i}=-\mathbf I,\quad
+  \frac{\partial\mathbf r_{\Delta\mathbf p_{ij}}}{\partial\delta\mathbf p_j}=\mathbf R_i^\top\mathbf R_j,\nonumber\\
+  \frac{\partial\mathbf r_{\Delta\mathbf p_{ij}}}{\partial\delta\mathbf v_i}&=-\mathbf R_i^\top\Delta t_{ij},\quad
+  \frac{\partial\mathbf r_{\Delta\mathbf p_{ij}}}{\partial\tilde\delta\mathbf b_i^a}=-\frac{\partial\Delta\bar{\mathbf p}_{ij}}{\partial\mathbf b^a},\quad
+  \frac{\partial\mathbf r_{\Delta\mathbf p_{ij}}}{\partial\tilde\delta\mathbf b_i^g}=-\frac{\partial\Delta\bar{\mathbf p}_{ij}}{\partial\mathbf b^g}.
+  \label{eq:jac-p}
+\end{align}
+\textbf{速度残差雅可比}（$\mathbf R_j,\mathbf p_i,\mathbf p_j$ 不出现 $\Rightarrow$ 对 $\delta\boldsymbol\phi_j,\delta\mathbf p_i,\delta\mathbf p_j$ 为零）：
+\begin{align}
+  \frac{\partial\mathbf r_{\Delta\mathbf v_{ij}}}{\partial\delta\boldsymbol\phi_i}&=\big(\mathbf R_i^\top(\mathbf v_j-\mathbf v_i-\mathbf g\Delta t_{ij})\big)^\wedge,\quad
+  \frac{\partial\mathbf r_{\Delta\mathbf v_{ij}}}{\partial\delta\mathbf v_i}=-\mathbf R_i^\top,\quad
+  \frac{\partial\mathbf r_{\Delta\mathbf v_{ij}}}{\partial\delta\mathbf v_j}=\mathbf R_i^\top,\nonumber\\
+  \frac{\partial\mathbf r_{\Delta\mathbf v_{ij}}}{\partial\tilde\delta\mathbf b_i^a}&=-\frac{\partial\Delta\bar{\mathbf v}_{ij}}{\partial\mathbf b^a},\quad
+  \frac{\partial\mathbf r_{\Delta\mathbf v_{ij}}}{\partial\tilde\delta\mathbf b_i^g}=-\frac{\partial\Delta\bar{\mathbf v}_{ij}}{\partial\mathbf b^g}.
+  \label{eq:jac-v}
+\end{align}
+\textbf{旋转残差雅可比}（$\mathbf p,\mathbf v,\delta\mathbf b^a$ 不出现 $\Rightarrow$ 对应为零；最繁，需 \cref{eq:lie-adjoint} 与对数一阶近似）：
+\begin{equation}
+  \frac{\partial\mathbf r_{\Delta\mathbf R_{ij}}}{\partial\delta\boldsymbol\phi_i}=-\mathbf J_r^{-1}(\mathbf r_{\Delta\mathbf R_{ij}})\,\mathbf R_j^\top\mathbf R_i,\quad
+  \frac{\partial\mathbf r_{\Delta\mathbf R_{ij}}}{\partial\delta\boldsymbol\phi_j}=\mathbf J_r^{-1}(\mathbf r_{\Delta\mathbf R_{ij}}),\quad
+  \frac{\partial\mathbf r_{\Delta\mathbf R_{ij}}}{\partial\tilde\delta\mathbf b_i^g}=\boldsymbol\alpha,
+  \label{eq:jac-R}
+\end{equation}
+其中（记 $\hat{\mathbf J}_r^b\doteq\mathbf J_r(\tfrac{\partial\Delta\bar{\mathbf R}_{ij}}{\partial\mathbf b^g}\delta\mathbf b_i^g)$）
+\[
+  \boldsymbol\alpha=-\mathbf J_r^{-1}\big(\mathbf r_{\Delta\mathbf R_{ij}}\big)\,\mathrm{Exp}\big(\mathbf r_{\Delta\mathbf R_{ij}}\big)^\top\,\hat{\mathbf J}_r^b\,\frac{\partial\Delta\bar{\mathbf R}_{ij}}{\partial\mathbf b^g}.
+\]
+
+\begin{derivation}[旋转残差对 $\delta\boldsymbol\phi_i$ 的雅可比]
+代入 lifting $\mathbf R_i\leftarrow\mathbf R_i\mathrm{Exp}(\delta\boldsymbol\phi_i)$，记 $\mathbf E=\mathrm{Exp}(\tfrac{\partial\Delta\bar{\mathbf R}_{ij}}{\partial\mathbf b^g}\delta\mathbf b^g)$：
+\[
+  \mathbf r_{\Delta\mathbf R_{ij}}=\mathrm{Log}\big((\Delta\tilde{\mathbf R}_{ij}\mathbf E)^\top\mathrm{Exp}(-\delta\boldsymbol\phi_i)\mathbf R_i^\top\mathbf R_j\big)
+  \overset{\eqref{eq:lie-adjoint}}{=}\mathrm{Log}\big((\Delta\tilde{\mathbf R}_{ij}\mathbf E)^\top\mathbf R_i^\top\mathbf R_j\,\mathrm{Exp}(-\mathbf R_j^\top\mathbf R_i\delta\boldsymbol\phi_i)\big),
+\]
+用对数一阶近似 $\mathrm{Log}(\mathrm{Exp}(\boldsymbol\phi)\mathrm{Exp}(\delta\boldsymbol\phi))\approx\boldsymbol\phi+\mathbf J_r^{-1}(\boldsymbol\phi)\delta\boldsymbol\phi$，读出 $-\mathbf J_r^{-1}(\mathbf r_{\Delta\mathbf R_{ij}})\mathbf R_j^\top\mathbf R_i$。对 $\delta\boldsymbol\phi_j$ 同法但无负号、无 $\mathbf R_j^\top\mathbf R_i$（$\mathbf R_j$ 在末端右乘），得 $+\mathbf J_r^{-1}(\mathbf r_{\Delta\mathbf R_{ij}})$。
+\end{derivation}
+
+\begin{note}
+\textbf{实现一致性.}\;噪声传播（\cref{subsec:noise-prop}）用 $\Delta\tilde{\mathbf R}_{ik}$、偏置雅可比（\cref{eq:bias-jacobians}）用 $\Delta\bar{\mathbf R}_{ik}$。实际实现（如 GTSAM）统一在当前线性化点 $\bar{\mathbf b}_i$ 处计算，二者一致。VINS-Mono 则把这些雅可比作为大 $15\times15$ 状态转移矩阵 $\mathbf J$ 的子块统一维护，与解析式数值等价\cite{qin2018vins}。
+\end{note}
+
+\subsection{在线预积分算法}
+\label{subsec:imu-algo}
+
+\begin{algo}[在线 IMU 预积分（关键帧 $i\to j$）]\label{alg:imu-preint}
+\textbf{输入}：当前偏置估计 $\bar{\mathbf b}_i=[\bar{\mathbf b}_i^g,\bar{\mathbf b}_i^a]$，IMU 噪声协方差 $\boldsymbol\Sigma_\eta$，测量流 $\{(\tilde{\boldsymbol\omega}_k,\tilde{\mathbf a}_k)\}$。\\
+\textbf{初始化}：$\Delta\tilde{\mathbf R}\leftarrow\mathbf I,\ \Delta\tilde{\mathbf v}\leftarrow\mathbf 0,\ \Delta\tilde{\mathbf p}\leftarrow\mathbf 0,\ \Delta t_{ij}\leftarrow0,\ \boldsymbol\Sigma\leftarrow\mathbf 0_{9\times9}$，五个偏置雅可比 $\leftarrow\mathbf 0$。\\
+\textbf{对每个测量}（间隔 $\Delta t$）：
+\begin{enumerate}
+  \item 去偏置：$\hat{\boldsymbol\omega}\leftarrow\tilde{\boldsymbol\omega}_k-\bar{\mathbf b}_i^g$，$\hat{\mathbf a}\leftarrow\tilde{\mathbf a}_k-\bar{\mathbf b}_i^a$；
+  \item 算 $\mathbf J_r^k=\mathbf J_r(\hat{\boldsymbol\omega}\Delta t)$；
+  \item 更新协方差 \cref{eq:cov-recursion}（用当前 $\Delta\tilde{\mathbf R}$ 与 $\mathrm{Exp}(\hat{\boldsymbol\omega}\Delta t)$ 构造 $\mathbf A_k,\mathbf B_k$）；
+  \item 更新偏置雅可比 \cref{eq:bias-jacobians}（须用\emph{旧} $\Delta\tilde{\mathbf R}$）；
+  \item 更新预积分量 \cref{eq:preint-recursion}：先 $\Delta\tilde{\mathbf p}$，再 $\Delta\tilde{\mathbf v}$，最后 $\Delta\tilde{\mathbf R}$；$\Delta t_{ij}\,{+}{=}\,\Delta t$。
+\end{enumerate}
+\textbf{到达 $j$}：以 $\{\Delta\tilde{\mathbf R}_{ij},\Delta\tilde{\mathbf v}_{ij},\Delta\tilde{\mathbf p}_{ij},\boldsymbol\Sigma_{ij},\Delta t_{ij}\}$ 与五个雅可比构造因子；残差按 \cref{eq:imu-residual}、雅可比按 \cref{eq:jac-p,eq:jac-v,eq:jac-R}。偏置变化时用 \cref{eq:bias-correction} 一阶修正免重积分。
+\end{algo}
+
+\begin{codebox}[C++]{GTSAM 风格：预积分单步累加（教学简化）}
+// 教学简化版：体现 alg:imu-preint 的步骤 3-5，纯 ASCII 注释
+// dR, dv, dp: 当前预积分量; Sigma: 9x9 协方差; Jr: 右雅可比
+void integrate(const Vec3& w_raw, const Vec3& a_raw, double dt) {
+  Vec3 w = w_raw - bg_bar;          // 去陀螺偏置 (tilde_w - bar_bg)
+  Vec3 a = a_raw - ba_bar;          // 去加速度计偏置
+  Mat3 Jr  = rightJacobianSO3(w*dt);// J_r(w*dt), 见 ch:lie
+  Mat3 dRk = Exp(w*dt);             // Exp((w_tilde - bg)*dt)
+
+  // ---- 协方差迭代: Sigma <- A Sigma A^T + B Sigma_eta B^T (eq:cov-recursion)
+  Mat9 A = Mat9::Identity();
+  A.block<3,3>(0,0) = dRk.transpose();
+  A.block<3,3>(3,0) = -dR * skew(a) * dt;          // skew = (.)^wedge
+  A.block<3,3>(6,0) = -0.5 * dR * skew(a) * dt*dt;
+  A.block<3,3>(6,3) = Mat3::Identity() * dt;
+  Mat96 B = Mat96::Zero();
+  B.block<3,3>(0,0) = Jr * dt;
+  B.block<3,3>(3,3) = dR * dt;
+  B.block<3,3>(6,3) = 0.5 * dR * dt*dt;
+  Sigma = A * Sigma * A.transpose() + B * Sigma_eta * B.transpose();
+
+  // ---- 更新预积分量 (eq:preint-recursion): 注意 p, v, R 顺序!
+  dp += dv * dt + 0.5 * dR * a * dt*dt;            // 用旧 dv, 旧 dR
+  dv += dR * a * dt;                               // 用旧 dR
+  dR  = dR * dRk;                                  // 最后更新 dR
+  dt_ij += dt;
+}
+\end{codebox}
+
+\begin{pitfall}[编程陷阱：协方差更新放在预积分量更新之后]
+错误做法：先更新 \texttt{dR/dv/dp}，再用更新后的 \texttt{dR} 构造 $\mathbf A,\mathbf B$。现象：协方差与测量量不一致，因子权重略偏、在长窗口下一致性变差。根本原因：\cref{eq:AB-matrices} 里 $\mathbf A_k,\mathbf B_k$ 用的是\emph{本步开始时}的 $\Delta\tilde{\mathbf R}_{ik}$（旧值），而 $\Delta\tilde{\mathbf R}_{k\,k+1}=\mathrm{Exp}(\hat{\boldsymbol\omega}\Delta t)$ 是本步增量。正确做法：协方差（步骤 3）与偏置雅可比（步骤 4）都\emph{先于}预积分量更新（步骤 5）执行。自检：单步打印 $\mathbf A,\mathbf B$ 与手算对齐。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （实现题）补全上面代码中偏置雅可比的递推（\cref{eq:bias-jacobians}），注意须在更新 \texttt{dR} 之前用旧值。
+  \item （设计扩展）把上述以旋转矩阵为载体的实现，改为以 Hamilton 四元数存储姿态、用 $\hat{\boldsymbol\gamma}\otimes[1,\tfrac12\hat{\boldsymbol\omega}\Delta t]^\top$ 更新（对照 \cref{subsec:vins-quat}）。
+  \item 给定残差 \cref{eq:imu-residual}，写出 IMU 因子对状态块 $(\mathbf x_i,\mathbf x_j)$ 的 $9\times(15{+}15)$ 雅可比的稀疏结构（哪些块为零）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{IMU 噪声标定：连续/离散参数与 Allan 方差}
+\label{sec:imu-noise}
+
+\subsection{Kalibr 噪声模型}
+\label{subsec:kalibr}
+
+\paragraph{动机：协方差里的数从哪来？}
+预积分要 $\boldsymbol\Sigma_\eta$，它由四个连续噪声参数构成（逐轴独立同构）\cite{rehder2016kalibr}：陀螺白噪声 $\sigma_g$（角度随机游走 ARW）、加速度计白噪声 $\sigma_a$（速度随机游走 VRW）、陀螺偏置随机游走 $\sigma_{bg}$、加速度计偏置随机游走 $\sigma_{ba}$。连续白噪声满足 $E[n(t)]=0$、$E[n(t_1)n(t_2)]=\sigma_g^2\,\delta(t_1-t_2)$（功率谱密度常数 $\sigma_g^2$）。它们的离散化由 \cref{eq:kalibr-conv} 给出。
+
+\begin{table}[H]\centering\small
+\caption{Kalibr IMU 噪声参数与单位\cite{rehder2016kalibr}}
+\label{tab:kalibr-params}
+\begin{tabular}{llll}
+\toprule
+参数 & 符号 & 连续单位 & 含义 \\
+\midrule
+陀螺白噪声（ARW） & $\sigma_g$ & $\mathrm{rad}\,\mathrm s^{-1}\,\mathrm{Hz}^{-1/2}$ & 加性噪声强度 \\
+加计白噪声（VRW） & $\sigma_a$ & $\mathrm{m}\,\mathrm s^{-2}\,\mathrm{Hz}^{-1/2}$ & 加性噪声强度 \\
+陀螺偏置游走 & $\sigma_{bg}$ & $\mathrm{rad}\,\mathrm s^{-2}\,\mathrm{Hz}^{-1/2}$ & 偏置变化强度 \\
+加计偏置游走 & $\sigma_{ba}$ & $\mathrm{m}\,\mathrm s^{-3}\,\mathrm{Hz}^{-1/2}$ & 偏置变化强度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Allan 方差五项辨识}
+\label{subsec:allan}
+
+\paragraph{动机：从静置数据反推噪声系数。}
+手册值往往保守，最可靠是用一段长时间静置数据，做 \textbf{Allan 方差}（两样本方差）辨识\cite{woodman2007inertial}。取平均时长 $T$，把序列分成长 $T$ 的 bin（$\ge9$ 个）、各 bin 内取平均率 $\bar\Omega_k(T)$，则
+\begin{equation}
+  \sigma^2(T)=\frac{1}{2(N-2n)}\sum_{k=1}^{N-2n}\big(\bar\Omega_{k+n}-\bar\Omega_k\big)^2,
+  \label{eq:allan-def}
+\end{equation}
+$\mathrm{AD}(T)=\sqrt{\sigma^2(T)}$ 称 Allan 偏差，在 $\log$-$\log$ 图上对 $T$ 作图。Allan 方差与功率谱密度 $S_\Omega(f)$ 的主公式（IEEE Std 952）：
+\begin{equation}
+  \sigma^2(T)=4\int_0^\infty S_\Omega(f)\,\frac{\sin^4(\pi fT)}{(\pi fT)^2}\,df.
+  \label{eq:allan-psd}
+\end{equation}
+不同噪声有不同 PSD，代入 \cref{eq:allan-psd} 得不同的 $T$ 依赖（幂律斜率），在 $\log$-$\log$ 图上分居不同区域，便于分离辨识。
+
+\begin{derivation}[角度随机游走项：从 PSD 到 $\sigma(T)=Q/\sqrt T$]
+高频白噪声率 PSD 为常数 $S_\Omega(f)=Q^2$（$Q=$ 随机游走系数）。代入 \cref{eq:allan-psd}，换元 $u=\pi fT$：
+\[
+  \sigma^2(T)=\frac{4Q^2}{\pi^2T}\int_0^\infty\frac{\sin^4 u}{u^2}\,du=\frac{4Q^2}{\pi^2T}\cdot\frac{\pi}{4}=\frac{Q^2}{T}
+  \;\Rightarrow\;\sigma(T)=\frac{Q}{\sqrt T},
+\]
+（用 $\int_0^\infty\sin^4u/u^2\,du=\pi/4$）。$\log$-$\log$ 斜率 $-1/2$；读数：斜率线在 $T=1$ 处的值即 $Q$（陀螺为 ARW、加计为 VRW）。
+\end{derivation}
+
+\begin{table}[H]\centering\small
+\caption{Allan 方差五项噪声（PSD、$\sigma(T)$ 斜率与读数法\cite{woodman2007inertial}）}
+\label{tab:allan-five}
+\begin{tabular}{lllll}
+\toprule
+噪声项 & 率 PSD $S_\Omega(f)$ & $\sigma(T)$ & $\log$-$\log$ 斜率 & 读数 \\
+\midrule
+量化 & $\propto(2\pi f)^2$ & $\sqrt3\,Q_z/T$ & $-1$ & 斜率线 @ $T=\sqrt3$ \\
+ARW/VRW（白噪声） & $Q^2$ & $Q/\sqrt T$ & $-1/2$ & 斜率线 @ $T=1$ \\
+偏置不稳定 & $B^2/(2\pi f),\ f\le f_0$ & $\to0.664\,B$ & $0$（平台） & 平台高度 $/\,0.664$ \\
+率随机游走 & $(K/2\pi)^2/f^2$ & $K\sqrt{T/3}$ & $+1/2$ & 斜率线 @ $T=3$ \\
+率斜坡 & $R^2/(2\pi f)^3$ & $RT/\sqrt2$ & $+1$ & 斜率线 @ $T=\sqrt2$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+多噪声并存时总 Allan 方差近似为各项之和：
+\begin{equation}
+  \sigma^2(T)\approx\frac{3Q_z^2}{T^2}+\frac{Q^2}{T}+\frac{2\ln2}{\pi}B^2+\frac{K^2T}{3}+\frac{R^2T^2}{2},
+  \label{eq:allan-combined}
+\end{equation}
+可对实采曲线做最小二乘拟合提系数（$\sqrt{2\ln2/\pi}\approx0.664$）\rebuilt{各项系数随源约定，使用前以本台 IMU 数据复核}。
+
+\begin{pitfall}[概念误区：把“偏置不稳定 $B$”当成随机游走系数 $K$ 填进卡尔曼/预积分]
+新手想法：“偏置不稳定就是偏置漂移，直接当随机游走方差用。”\textbf{错}。偏置不稳定 $B$ 来自闪烁噪声（$1/f$ 谱、Allan 图上的\emph{平台}），而预积分/KF 里建模偏置漂移用的随机游走对应 $1/f^2$ 谱的率随机游走系数 $K$（Allan 图上斜率 $+1/2$）。二者不是一回事。后果：偏置过程噪声设错，长期一致性变差。正确做法：随机游走 $\sigma_{bg}\leftrightarrow K$；偏置不稳定 $B$ 若要用，须近似为一阶 Gauss--Markov 过程（时间常数与驱动方差）而非直接当 $K$。
+\end{pitfall}
+
+\begin{note}
+\textbf{数值参照（设备级别）.}\;Honeywell GG5300 陀螺 $\mathrm{ARW}=0.2\,^\circ/\sqrt h$（$1\,\mathrm h$ 后姿态误差标准差 $0.2^\circ$，$2\,\mathrm h$ 后 $0.28^\circ$）\cite{woodman2007inertial}；导航级 CIMU 陀螺偏置不稳定 $\approx0.002\,^\circ/h$，消费级 Xsens Mtx 陀螺 $\mathrm{ARW}\approx4.8\,^\circ/\sqrt h$、偏置不稳定 $\approx30$--$40\,^\circ/h$。三档（导航级/战术级/消费 MEMS）噪声相差约两到三个数量级——这直接决定了纯惯性可漂多久。
+\end{note}
+
+\subsection{重力模型与坐标系}
+\label{subsec:gravity}
+
+预积分把重力当已知（如 ENU 下 $\mathbf g=[0,0,-9.81]^\top$）或待估状态。重力大小并非常数：WGS84 椭球面正常重力（Somigliana 公式，纬度 $\phi$）
+\begin{equation}
+  \gamma(\phi)=\gamma_e\,\frac{1+k\sin^2\phi}{\sqrt{1-e^2\sin^2\phi}},
+  \label{eq:gravity-somigliana}
+\end{equation}
+$\gamma_e=9.7803253359\,\mathrm{m/s^2}$（赤道）、极地 $9.8321849378\,\mathrm{m/s^2}$、$k\approx1.9319\times10^{-3}$、$e^2\approx6.6944\times10^{-3}$。赤道到极地差约 $0.5\%$，高度每升 $1\,\mathrm{km}$ 重力降约 $3.086\times10^{-3}\,\mathrm{m/s^2}$。坐标系上：ECI（地心惯性）是理想惯性系，ECEF 随地球转，局部导航用 NED（北-东-地）或 ENU（东-北-天，机器人/SLAM 常用），体系 $b$ 固连载体。预积分取世界系为惯性系（忽略地球自转 $\omega_E\approx7.29\times10^{-5}\,\mathrm{rad/s}$）；短时局部 VIO 可取重力常值，惯导/大范围须用 \cref{eq:gravity-somigliana} 并补离心/科氏/输运项。
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:allan-def} 与 \cref{eq:allan-psd} 论证“白噪声在 Allan 图上斜率 $-1/2$、率随机游走斜率 $+1/2$”。
+  \item 把 Honeywell GG5300 的 $\mathrm{ARW}=0.2\,^\circ/\sqrt h$ 换算成 $\sigma_g$（$\mathrm{rad}/\sqrt s$），再算 $200\,\mathrm{Hz}$ 下的离散 $\sigma_{g,d}$。
+  \item 一台设备从赤道运到北纬 $60^\circ$，用 \cref{eq:gravity-somigliana} 估重力变化的百分比；论证短时 VIO 取常值重力的合理性。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{初始对准与可观测性}
+\label{sec:imu-obs}
+
+\subsection{初始对准}
+\label{subsec:init-align}
+
+\paragraph{动机：世界系怎么对齐到重力？}
+SLAM 习惯把全局系设为轨迹起始位姿（单位位姿）。但 IMU 测量涉及重力（\cref{eq:imu-accel}），通常选\emph{重力对齐}的世界系，故需把初始位姿与重力方向对齐\cite{carlone2026handbook}。\textbf{静态初始化}：设部署之初机器人静止、无比力作用，低成本 MEMS 只测得重力 $\mathbf g^b$。仅给定 $\mathbf g^b$，\textbf{无法恢复绕重力的旋转（偏航 yaw）}，yaw 可任选；但 roll/pitch 可由 Gram--Schmidt 正交归一化确定：
+\begin{equation}
+  \mathbf z_w^b=\frac{\mathbf g^b}{\|\mathbf g^b\|},\quad
+  \mathbf x_w^b=\frac{\mathbf e_1-\mathbf z_w^b\,\mathbf e_1^\top\mathbf z_w^b}{\|\mathbf e_1-\mathbf z_w^b\,\mathbf e_1^\top\mathbf z_w^b\|},\quad
+  \mathbf y_w^b=\mathbf z_w^b\times\mathbf x_w^b
+  \;\Rightarrow\;\mathbf R_w^b=[\mathbf x_w^b\ \mathbf y_w^b\ \mathbf z_w^b].
+  \label{eq:static-align}
+\end{equation}
+直观：$\mathbf R_w^b$ 最后一列是世界 z 轴在体系的方向，世界 z 轴与重力对齐，故从 $\mathbf g^b$ 测量算出 $\mathbf z_w^b$、正交补全其余两列。\textbf{高端 IMU} 的陀螺能测地球自转 $\boldsymbol\omega_{ie}$，可用 $\mathbf g^b$ 与 $\boldsymbol\omega_{ie}^b$ 解析对准（堆叠 $\{\mathbf g,\boldsymbol\omega_{ie},\mathbf g\times\boldsymbol\omega_{ie}\}$ 在两系下由同一旋转关联，求逆得 $\mathbf R$，再投影回 SO(3)）。
+
+\subsection{辅助惯性导航的可观测性}
+\label{subsec:aided-obs}
+
+\paragraph{动机：测量够不够算出状态？}
+纯惯性会漂，故配外感受传感器（相机、LiDAR）得辅助惯性导航系统（AINS）。引入外部地标会扩大状态，自然要问：测量是否足以无歧义估计状态？这是\emph{可观测性分析}\cite{carlone2026handbook}。AINS 状态（每时间步）含机器人状态与外部特征：
+\begin{equation}
+  \boldsymbol x=\{\mathbf R_b^w,\ \mathbf b^g,\ \mathbf v^w,\ \mathbf b^a,\ \mathbf p^w,\ \boldsymbol x_f^w\}.
+  \label{eq:ains-state}
+\end{equation}
+线性化运动学与测量模型，构造\emph{可观测性矩阵} $\mathbf M(\hat{\boldsymbol x})=[\,(\mathbf H_{x_1}\boldsymbol\Phi_{(1,1)})^\top\ \cdots\ (\mathbf H_{x_k}\boldsymbol\Phi_{(k,1)})^\top]^\top$（$\mathbf H_{x_k}$ 堆叠时刻 $k$ 各测量雅可比、$\boldsymbol\Phi_{(k,1)}$ 状态转移），其零空间 $\mathcal U=\{\,\boldsymbol u:\mathbf M\boldsymbol u=\mathbf 0\,\}$ 描述不可观子空间。可观测性矩阵与状态估计的 Fisher 信息（协方差逆）密切相关；零空间为空 $\iff$ 完全可观。
+
+\begin{theorem}[AINS 的四维不可观子空间]\label{thm:imu-obs}
+对一般 AINS（IMU $+$ 对先验未知地标的局部点/线/面观测），可观测性矩阵有\textbf{四维零空间}：\emph{全局 3D 位置}（三维）与\emph{绕重力的全局偏航 yaw}（一维）不可观。其结构为
+\[
+  \mathrm{null}(\mathbf M)=\mathrm{span}[\boldsymbol u_1\ \ \boldsymbol u_{2:4}],
+\]
+其中 $\boldsymbol u_1$ 关联绕重力旋转（yaw），$\boldsymbol u_{2:4}$ 关联机器人平移运动\cite{carlone2026handbook}。
+\end{theorem}
+
+\begin{proof}[证明思路]
+对含单点、单线、单面的状态计算各测量雅可比 $\mathbf H_{x_i}$ 与转移 $\boldsymbol\Phi_{(i,1)}$，代入 $\mathbf M$ 并求 $\mathrm{null}(\mathbf M)$，得四个零向量。直观：任何测量（IMU 数据、未知地标的局部观测）都不携带全局系信息，唯一例外是 roll/pitch——它们可从加速度计对重力方向的测量观测到（\cref{eq:static-align}）。这种不可观在 SLAM 中常见、非病态：只意味着可任设世界系的 yaw 与 3D 原点（对这些变量只有相对测量）。若加提供绝对测量的传感器（如 GPS），此不可观消失。无 IMU 时基于地标的 SLAM 零空间至少 6 维（整个 3D 旋转 $+$ 3D 位置都不可观），IMU 的加入把 roll/pitch 变可观，零空间从 6 维降到 4 维。\cite{carlone2026handbook}
+\end{proof}
+
+\paragraph{退化运动。}
+某些运动会引入\emph{额外}不可观方向，致导航失败。汇总于 \cref{tab:imu-degenerate}：纯平移使整个全局朝向不可观（不旋转则混淆重力测量与加计偏置，roll/pitch 不再可观）；对单目相机（仅方位测量），常加速度使整个系统尺度不可观、纯旋转与朝特征运动使特征尺度不可观\cite{carlone2026handbook}。
+
+\begin{table}[H]\centering\small
+\caption{AINS 退化运动\cite{carlone2026handbook}}
+\label{tab:imu-degenerate}
+\begin{tabular}{lll}
+\toprule
+运动 & 传感器 & 不可观量 \\
+\midrule
+纯平移 & 通用 & 全局朝向 \\
+常加速度（含匀速） & 单目相机 & 系统尺度 \\
+纯旋转 & 单目相机 & 特征尺度 \\
+朝点特征运动 & 单目相机 & 特征尺度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[IMU 为何让单目尺度可观]\label{ins:imu-scale}
+单目相机靠视差三角化，本质只给\emph{方向}与\emph{相对深度}，缺绝对尺度。IMU 的加速度计给出\emph{有量纲}（$\mathrm{m/s^2}$）的比力，对它二次积分得有量纲的位移——只要运动非退化（有足够的加速度激励，见 \cref{tab:imu-degenerate}），尺度就被 IMU“钉死”。这正是 VIO 相比纯视觉 VO 的根本增益。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 \cref{eq:static-align} 写出当 $\mathbf g^b=[0,0,-9.81]^\top$（设备水平）时的 $\mathbf R_w^b$，并说明此时 yaw 任意。
+  \item 解释 \cref{thm:imu-obs} 中“加 GPS 后 4 维不可观消失”：GPS 提供哪类绝对测量？
+  \item （综合题，跨 \cref{ch:vo}）论证为何单目 VO 无法估计尺度（\cref{tab:imu-degenerate} 常加速度行），而加 IMU 后非退化运动下尺度可观。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{接口：预积分因子进因子图与 VIO}
+\label{sec:imu-interface}
+
+\subsection{因子图与滑动窗口}
+\label{subsec:factor-graph}
+
+预积分 IMU 因子（\cref{eq:imu-residual}）约束相邻关键帧的位姿、速度、偏置；偏置随机游走因子（\cref{eq:bias-factor}）约束偏置随时间演化；视觉因子（\cref{ch:vo} 的重投影 $\mathbf r_{\mathcal C_{il}}=\mathbf z_{il}-\pi(\mathbf R_i,\mathbf p_i,\boldsymbol\rho_l)$）关联相机位姿与地标。三类因子在 MAP \cref{eq:imu-map} 中并列，由非线性优化求解。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small,
+  state/.style={circle, draw=main!70!black, fill=main!8, minimum size=8mm, inner sep=1pt},
+  lm/.style={circle, draw=third!70!black, fill=third!10, minimum size=7mm, inner sep=1pt},
+  fimu/.style={rectangle, draw=second!70!black, fill=second!20, minimum size=3mm, inner sep=2pt},
+  fvis/.style={rectangle, draw=orange!80!black, fill=orange!20, minimum size=3mm, inner sep=2pt},
+  fbias/.style={rectangle, draw=blue!70!black, fill=blue!15, minimum size=3mm, inner sep=2pt}]
+  \node[state] (xi) {$\mathbf x_i$};
+  \node[state, right=24mm of xi] (xj) {$\mathbf x_j$};
+  \node[state, right=24mm of xj] (xk) {$\mathbf x_k$};
+  \node[lm, above=12mm of xj] (l1) {$\boldsymbol\rho_1$};
+  % imu factors
+  \node[fimu] (fij) at ($(xi)!0.5!(xj)$) {};
+  \node[below=1pt, second!50!black, font=\scriptsize] at (fij) {IMU};
+  \node[fimu] (fjk) at ($(xj)!0.5!(xk)$) {};
+  \node[below=1pt, second!50!black, font=\scriptsize] at (fjk) {IMU};
+  \draw (xi)--(fij)--(xj); \draw (xj)--(fjk)--(xk);
+  % bias factors (small offset)
+  \node[fbias] (bij) at ($(xi)!0.5!(xj)+(0,-0.7)$) {};
+  \node[fbias] (bjk) at ($(xj)!0.5!(xk)+(0,-0.7)$) {};
+  \draw[blue!60] (xi) to[bend right=22] (bij); \draw[blue!60] (bij) to[bend right=22] (xj);
+  \draw[blue!60] (xj) to[bend right=22] (bjk); \draw[blue!60] (bjk) to[bend right=22] (xk);
+  \node[below=1pt, blue!60!black, font=\scriptsize] at (bjk) {bias};
+  % visual factors
+  \node[fvis] (vi) at ($(xi)!0.5!(l1)$) {};
+  \node[fvis] (vj) at ($(xj)!0.55!(l1)$) {};
+  \node[fvis] (vk) at ($(xk)!0.5!(l1)$) {};
+  \draw[orange!70] (xi)--(vi)--(l1); \draw[orange!70] (xj)--(vj)--(l1); \draw[orange!70] (xk)--(vk)--(l1);
+  \node[right=1pt, orange!70!black, font=\scriptsize] at (vk) {视觉};
+\end{tikzpicture}
+\caption{VIO 因子图：状态 $\mathbf x=(\mathbf R,\mathbf p,\mathbf v,\mathbf b)$（绿圆）、地标 $\boldsymbol\rho$（蓝圆）；预积分 IMU 因子（橙方）约束相邻状态，偏置因子（蓝方）约束偏置演化，视觉因子（橙方，连地标）。仿 \cite{forster2017preintegration} 重绘。}
+\label{fig:imu-vio-graph}
+\end{figure}
+
+实际 VIO 系统通常实现\textbf{固定滞后平滑器}（fixed-lag smoother，又称滑动窗口优化），只估计后退视界（如最近 $5$--$10\,\mathrm s$）内的状态：视界越长精度越高但状态空间越大。落出视界的因子与变量逐步\emph{边缘化}（marginalize）；许多实现还用 Schur 补从优化中消去视觉地标，进一步减小状态空间\cite{forster2017preintegration}。替代方案是增量求解器（如 iSAM2），复用先前计算、实践很准，但不提供延迟保证、可能有运行时尖峰。
+
+\begin{note}
+\textbf{无结构视觉因子.}\;Forster 等用\emph{无结构}（structureless）视觉因子：在每次 Gauss--Newton 迭代用 Schur 补线性地消去 3D 地标 $\boldsymbol\rho_l$（仍得最优 MAP），把含位姿 $+$ 地标的因子降为只含位姿的因子，地标 $l$ 的因子只连接看到它的关键帧子集 $\mathcal X(l)$。消元用正交投影 $\mathbf I-\mathbf E_l(\mathbf E_l^\top\mathbf E_l)^{-1}\mathbf E_l^\top$（$\mathbf E_l$ 为地标雅可比），可等价用其零空间基 $\mathbf E_l^\perp$ 实现以省去求逆\cite{forster2017preintegration}。视觉因子细节属 \cref{ch:vo}，此处仅作接口。
+\end{note}
+
+\subsection{VINS-Mono 四元数预积分（工程对照）}
+\label{subsec:vins-quat}
+
+\paragraph{动机：另一条主流实现路线。}
+VINS-Mono 用 Hamilton 四元数与离散递推实现同一理论\cite{qin2018vins}。它定义预积分量 $\boldsymbol\alpha,\boldsymbol\beta,\boldsymbol\gamma$（对应本章 $\Delta\tilde{\mathbf p},\Delta\tilde{\mathbf v},\Delta\tilde{\mathbf R}$），以 $b_k$ 为参考系：
+\begin{align}
+  \hat{\boldsymbol\alpha}^{b_k}_{i+1}&=\hat{\boldsymbol\alpha}^{b_k}_i+\hat{\boldsymbol\beta}^{b_k}_i\delta t+\tfrac12\mathbf R(\hat{\boldsymbol\gamma}^{b_k}_i)(\hat{\mathbf a}_i-\mathbf b_{a_i})\delta t^2,\nonumber\\
+  \hat{\boldsymbol\beta}^{b_k}_{i+1}&=\hat{\boldsymbol\beta}^{b_k}_i+\mathbf R(\hat{\boldsymbol\gamma}^{b_k}_i)(\hat{\mathbf a}_i-\mathbf b_{a_i})\delta t,\label{eq:vins-prop}\\
+  \hat{\boldsymbol\gamma}^{b_k}_{i+1}&=\hat{\boldsymbol\gamma}^{b_k}_i\otimes\begin{bmatrix}1\\\tfrac12(\hat{\boldsymbol\omega}_i-\mathbf b_{w_i})\delta t\end{bmatrix}.\nonumber
+\end{align}
+四元数误差用\emph{右乘}小扰动 $\boldsymbol\gamma\approx\hat{\boldsymbol\gamma}\otimes[1,\tfrac12\delta\boldsymbol\theta]^\top$（与本书右扰动一致）。$15$ 维误差态 $\delta\mathbf z=[\delta\boldsymbol\alpha,\delta\boldsymbol\beta,\delta\boldsymbol\theta,\delta\mathbf b_a,\delta\mathbf b_w]^\top$ 满足连续动态 $\dot{\delta\mathbf z}=\mathbf F_t\delta\mathbf z+\mathbf G_t\mathbf n$，离散协方差与雅可比递推
+\begin{equation}
+  \mathbf P_{t+\delta t}=(\mathbf I+\mathbf F_t\delta t)\mathbf P_t(\mathbf I+\mathbf F_t\delta t)^\top+(\mathbf G_t\delta t)\mathbf Q(\mathbf G_t\delta t)^\top,\qquad
+  \mathbf J_{t+\delta t}=(\mathbf I+\mathbf F_t\delta t)\mathbf J_t,
+  \label{eq:vins-cov}
+\end{equation}
+偏置一阶修正用 $\mathbf J_{b_{k+1}}$ 的子块（如 $\boldsymbol\alpha\approx\hat{\boldsymbol\alpha}+\mathbf J^\alpha_{b_a}\delta\mathbf b_a+\mathbf J^\alpha_{b_w}\delta\mathbf b_w$）。
+
+\begin{insight}[两条路线殊途同归]\label{ins:two-routes}
+Forster（旋转矩阵 $+$ 解析 $\mathbf A,\mathbf B$ $+$ 闭式偏置雅可比，GTSAM）与 VINS-Mono（四元数 $+$ 统一 $\mathbf F_t,\mathbf G_t$ $+$ 大 $\mathbf J$ 子块，Ceres）数学等价。差别在工程风格：前者把每个量的雅可比解析写死、流形严谨；后者用一个统一的 $15$ 维误差态转移矩阵，代码更紧凑但需小心四元数右乘约定。理解了本章的流形推导，读任一实现都不再是“照抄”。
+\end{insight}
+
+\subsection{VIO 性能、外参标定与时间同步}
+\label{subsec:vio-practical}
+
+好的 VIO 系统漂移低于行进距离的 $1\%$（行 $100\,\mathrm m$ 误差 $<1\,\mathrm m$），某些情形低至 $0.1\%$\cite{carlone2026handbook}。数值例：FEJ-WBA-VINS 在 KAIST 城市数据集 sequence 38（$11.42\,\mathrm{km}$、$36\,\mathrm{min}$，相机 $10\,\mathrm{Hz}$、IMU $100\,\mathrm{Hz}$）上，纯在线 VIO（无闭环）最终绝对轨迹误差约 $2.05^\circ$ 与 $21.2\,\mathrm m$（轨迹的 $0.18\%$）。VR 应用（如 Meta Quest 3，刷新率 $72$--$120\,\mathrm{Hz}$）要求 VIO 延迟典型 $10$--$50\,\mathrm{ms}$，否则影响体验、加剧晕动症\cite{carlone2026handbook}。
+
+\paragraph{外参标定与时间同步.}
+准确融合需估传感器间相对位姿（如相机相对 IMU 的 $\mathbf T_{bc}$）：离线标定（用标定靶、已知运动）一般更准但繁琐；在线标定把外参作为状态估计、能适应系统变化但可能更复杂甚至病态。时间同步同样关键：未处理的错误同步会显著误差化轨迹——硬件层用公共时钟触发、软件层用 PTP（精确时间协议）或后处理时间戳对齐；若无法同步，某些算法把\emph{时间偏移}作为状态变量估计\cite{carlone2026handbook}。
+
+% ════════════════════════════════════════════════════════════════
+\section{进阶：连续时间与高阶预积分}
+\label{sec:imu-advanced}
+
+\paragraph{动机：欧拉积分有误差。}
+标准预积分用欧拉法（矩形法则）把信号近似为分段常值，双重积分迅速累积误差；采样频率低时尤甚\cite{carlone2026handbook}。改进方向有二。
+
+\textbf{连续加速度预积分.}\;用连续时间表示更好近似真实惯性信号并做解析积分，还允许\emph{异步查询}预积分测量（对事件相机等非硬件同步传感器尤有用）。先解耦旋转与平移：把“旋转修正后的加速度计测量” $\hat{\mathbf a}_k=\Delta\mathbf R_{ik}\tilde{\mathbf a}_k$ 以连续方式表示。分段线性近似对应\emph{常 jerk（加加速度）运动模型}（第一重积分即梯形法则），比欧拉法显著增益；无模型的高斯过程（GP）回归用 $\hat{\mathbf a}\sim\mathcal{GP}(0,k_a(t,t')\mathbf I)$（平方指数核），对 GP 施加线性算子解析推断积分，不依赖显式运动模型。假设局部加速度常值的连续模型在 EuRoC 数据集上 VIO 精度比标准预积分改善约 $5\%$\cite{carlone2026handbook}。
+
+\textbf{连续旋转预积分.}\;旋转空间积分难，因 SO(3) 非欧、群运算不交换——求解运动学的乘积积分 $\mathbf R(t{+}\Delta t)=\mathbf R(t)\prod_{\tau}\mathrm{Exp}(\boldsymbol\omega_b^b(\tau))^{d\tau}$ \emph{无通用闭式}\cite{carlone2026handbook}。一种思路用旋转向量 $\mathbf r(t)$（$\mathbf R=\mathrm{Exp}(\mathbf r)$）作为线性空间，动力学 $\dot{\mathbf r}=\mathbf J_r(\mathbf r)^{-1}\boldsymbol\omega_b^b$，用 GP 建模 $\dot{\mathbf r}$ 并以虚拟观测（控制点）插值，精度比标准离散预积分至少改善一个数量级。
+
+\paragraph{扩展位姿与本体感知里程计.}
+近期趋势用\emph{扩展位姿流形}（含位置/速度/姿态的“扩展位姿”，本质 $\mathrm{SE}_2(3)$ / 不变滤波视角）与高阶噪声传播改进不确定度建模，并考虑地球自转的科氏与离心力\rebuilt{$\mathrm{SE}_2(3)$ 预积分细节属不变滤波专题，本章未展开}。足式/轮式机器人可用本体感知（足地接触、轮编码器）做辅助惯性里程计；无视觉时纯惯性发散，近期用学习方法（神经网络建模偏置、直接预测位移、可微积分模块）减小漂移，但泛化能力仍有限\cite{carlone2026handbook}。
+
+\begin{insight}[什么时候需要超越欧拉预积分]\label{ins:beyond-euler}
+对 $100$--$200\,\mathrm{Hz}$ 的常规 MEMS IMU、$0.1$--$1\,\mathrm s$ 的关键帧间隔，标准欧拉预积分的积分误差通常被传感器噪声淹没，不必上连续/高阶法。只有当 IMU 率低、运动剧烈（高 jerk）、或与异步传感器（事件相机）融合时，连续/GP 预积分的精度增益才显著。先把骨干做对，再考虑这些进阶。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+
+\begin{table}[H]\centering\small
+\caption{本章常见误解与正确理解}
+\begin{tabular}{p{0.46\linewidth}p{0.46\linewidth}}
+\toprule
+误解 & 正确理解 \\
+\midrule
+加速度计测的是运动学加速度 & 测的是\emph{比力} $\mathbf R^\top(\mathbf a-\mathbf g)$；静止时读 $-\mathbf R^\top\mathbf g$（指天、大小 $g$） \\
+偏置上标 $a/g$ 指坐标系 & 指传感器类型（加计/陀螺），与坐标系无关 \\
+$\Delta\mathbf v_{ij},\Delta\mathbf p_{ij}$ 是真实速度/位置变化 & 是刻意定义、扣掉重力与初态的伪测量，使右端只依赖测量 \\
+偏置变了就得重新积分整段 IMU & 一阶修正 \cref{eq:bias-correction}：一次预计算雅可比，之后 $O(1)$ 线性修正 \\
+白噪声与随机游走的 $\Delta t$ 缩放方向相同 & 相反：白噪声方差 $\propto1/\Delta t$，随机游走 $\propto\Delta t$ \\
+Allan 图平台值（偏置不稳定 $B$）就是随机游走系数 & 不是：$B$ 来自 $1/f$、随机游走来自 $1/f^2$（斜率 $+1/2$）；二者不同 \\
+单目纯视觉也能估尺度 & 不能；IMU 的有量纲加速度在非退化运动下使尺度可观 \\
+VIO 全局位置和 yaw 可观 & 一般不可观（4 维零空间）；只有 roll/pitch 经重力可观 \\
+预积分用更高阶积分总更好 & 常规 MEMS 下欧拉误差被噪声淹没；高阶仅在低率/高 jerk/异步时显著 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\paragraph{符号表。}
+\begin{table}[H]\centering\small
+\caption{本章符号表}
+\begin{tabular}{ll}
+\toprule
+符号 & 含义 \\
+\midrule
+$\mathbf R_{wb}\in\SO(3)$ & 体系到世界系旋转（body-to-world） \\
+$\tilde{\boldsymbol\omega},\tilde{\mathbf a}$ & 陀螺/加速度计原始测量（比力） \\
+$\mathbf b^g,\mathbf b^a$ & 陀螺/加速度计偏置（随机游走） \\
+$\boldsymbol\eta^g,\boldsymbol\eta^a$ & 加性白噪声；离散 $\boldsymbol\eta^{gd},\boldsymbol\eta^{ad}$ \\
+$\mathbf g$ & 世界系重力向量 \\
+$\Delta\tilde{\mathbf R}_{ij},\Delta\tilde{\mathbf v}_{ij},\Delta\tilde{\mathbf p}_{ij}$ & 预积分（旋转/速度/位置）测量 \\
+$\delta\boldsymbol\phi_{ij},\delta\mathbf v_{ij},\delta\mathbf p_{ij}$ & 预积分噪声；$\boldsymbol\eta_{ij}^\Delta=[\delta\boldsymbol\phi;\delta\mathbf v;\delta\mathbf p]$ \\
+$\boldsymbol\Sigma_{ij}$ & 预积分 $9\times9$ 协方差；$\boldsymbol\Sigma_\eta$ 原始 IMU $6\times6$ \\
+$\mathbf J_r,\mathbf J_r^{-1}$ & SO(3) 右雅可比及其逆 \\
+$\partial\Delta\bar{(\cdot)}/\partial\mathbf b$ & 预积分量对偏置的雅可比（五个） \\
+$\Delta t,\Delta t_{ij}$ & IMU 采样周期、关键帧间总时长 \\
+$\mathbf r_{\mathcal I_{ij}}$ & $9$ 维预积分 IMU 残差 \\
+$\sigma_g,\sigma_a,\sigma_{bg},\sigma_{ba}$ & 连续噪声参数（Kalibr） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{公式速查表。}
+\begin{table}[H]\centering\small
+\caption{本章核心公式速查}
+\begin{tabular}{ll}
+\toprule
+名称 & 公式 \\
+\midrule
+陀螺/加计模型 & \cref{eq:imu-gyro}, \cref{eq:imu-accel} \\
+连续运动学 & \cref{eq:imu-kin-cont} \\
+相对增量定义 & \cref{eq:imu-rel-increment} \\
+预积分测量模型 & \cref{eq:imu-preint-model} \\
+协方差迭代 & \cref{eq:cov-recursion}（$\mathbf A,\mathbf B$ 见 \cref{eq:AB-matrices}） \\
+预积分量递推 & \cref{eq:preint-recursion} \\
+偏置一阶修正 & \cref{eq:bias-correction}（雅可比 \cref{eq:bias-jacobians}） \\
+IMU 残差 & \cref{eq:imu-residual} \\
+残差雅可比 & \cref{eq:jac-p}, \cref{eq:jac-v}, \cref{eq:jac-R} \\
+连续↔离散噪声 & \cref{eq:noise-white-disc}, \cref{eq:noise-rw-disc}, \cref{eq:kalibr-conv} \\
+4 维不可观 & \cref{thm:imu-obs} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{知识点总表。}
+\begin{table}[H]\centering\small
+\caption{本章知识点总表}
+\begin{tabular}{p{0.04\linewidth}p{0.40\linewidth}p{0.34\linewidth}cc}
+\toprule
+\# & 知识点 & 核心要点 & 难度 & 脉络层 \\
+\midrule
+1 & IMU 测量/误差模型 & 比力、偏置、白噪声；尺度/失准/g-敏感 & \(\star\star\) & 骨干 \\
+2 & 连续/离散运动学 & $\dot{\mathbf R},\dot{\mathbf v},\dot{\mathbf p}$；欧拉离散；$+\mathbf g$ 来由 & \(\star\star\) & 骨干 \\
+3 & 相对增量与预积分 & 与初态/重力解耦；分离噪声 & \(\star\star\star\) & 骨干 \\
+4 & 协方差迭代传播 & $\boldsymbol\Sigma\leftarrow\mathbf A\boldsymbol\Sigma\mathbf A^\top+\mathbf B\boldsymbol\Sigma_\eta\mathbf B^\top$ & \(\star\star\star\) & 骨干 \\
+5 & 偏置一阶修正 & 免重积分；五个雅可比 & \(\star\star\star\) & 骨干 \\
+6 & IMU 因子残差/雅可比 & $9$ 维残差；解析雅可比 & \(\star\star\star\) & 骨干 \\
+7 & 连续/离散噪声 + Allan & $1/\Delta t$ vs $\Delta t$；五项辨识 & \(\star\star\) & 次优 \\
+8 & 初始对准/可观测性 & 重力对齐；4 维不可观；退化 & \(\star\star\star\) & 次优 \\
+9 & 因子图/VIO 接口 & 滑窗、边缘化、四元数对照 & \(\star\star\star\) & 次优 \\
+10 & 连续/高阶预积分 & GP、扩展位姿、本体感知 & \(\star\star\star\star\) & 前沿 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{Forster 等，On-Manifold Preintegration}（arXiv:1512.02363，TRO 2017）\cite{forster2017preintegration}——SO(3) 流形预积分奠基论文，含完整噪声传播、偏置修正与残差雅可比；本章理论主线。
+  \item \textbf{VINS-Mono}（arXiv:1708.03852，TRO 2018）\cite{qin2018vins}——四元数离散预积分 $+$ 滑窗紧耦合优化的代表实现；工程对照。
+  \item \textbf{SLAM Handbook 第 11 章}（Inertial Odometry for SLAM）\cite{carlone2026handbook}——惯性里程计的现代综述：可观测性、退化、连续时间与学习方法。
+  \item \textbf{Kalibr / Rehder 等}\cite{rehder2016kalibr}——相机-IMU 时空标定与 IMU 噪声模型的事实标准工具；连续↔离散噪声换算。
+  \item \textbf{Woodman, An Introduction to Inertial Navigation}（UCAM-CL-TR-696）\cite{woodman2007inertial}——惯导误差源、捷联机理、Allan 方差入门，直觉清晰。
+  \item \textbf{Yang 等，Online Self-Calibration for VINS}（arXiv:2201.09170）\cite{yang2022online}——完整 IMU 内参模型（尺度/失准/g-敏感）与可观测性/退化分析。
+\end{itemize}
+
+\section*{与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+后续章节 & 与本章的关系 & 本章哪个知识点为其铺垫 \\
+\midrule
+\cref{ch:vo}（视觉里程计）& 视觉因子与 IMU 因子并列入因子图 & 预积分因子残差、因子图接口 \\
+\cref{ch:vio}（VIO）& 紧耦合视觉惯性优化的核心 & 全章（预积分 + 协方差 + 残差 + 可观测性） \\
+\cref{ch:eskf}（误差状态滤波）& 协方差传播的滤波对偶 & 迭代协方差递推、误差状态线性化 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.20\linewidth}p{0.24\linewidth}p{0.36\linewidth}l}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关 \\
+\midrule
+状态几秒内发散 & 重力符号/世界系约定不一致 & 1.确认 ENU/NED；2.静止时查估计 $\mathbf a^w\approx\mathbf 0$；3.核对 $\mathbf g$ 方向 & \cref{subsec:imu-std-model} \\
+预积分与重积分对不上 & 递推顺序写反（先 $\mathbf v$ 后 $\mathbf p$） & 1.按 $\mathbf p\to\mathbf v\to\mathbf R$ 顺序；2.单步对比逐步重积分 & \cref{subsec:iter-cov} \\
+IMU 约束权重失衡 & 噪声单位换算错（ARW 当 $\sigma_g$） & 1.用 \cref{eq:kalibr-conv} 换算；2.Allan 反推核对；3.检查 $1/\Delta t$ 缩放 & \cref{subsec:cont-disc-noise} \\
+偏置变化后协方差不一致 & 协方差更新放在预积分量更新之后 & 1.把协方差/雅可比更新提前到 \cref{eq:preint-recursion} 之前；2.用旧 $\Delta\tilde{\mathbf R}$ & \cref{subsec:imu-algo} \\
+尺度估计发散/漂移 & 退化运动（匀速/纯旋转） & 1.检查运动激励；2.查 \cref{tab:imu-degenerate}；3.加绝对测量或激发加速度 & \cref{subsec:aided-obs} \\
+快速旋转段旋转残差异常 & 偏置雅可比漏转置或 $\mathbf J_r$ 处理不当 & 1.核对 \cref{eq:bias-jacobians} 第一式的 $(\cdot)^\top$；2.大角度时查 $\mathbf J_r$ & \cref{subsec:bias-correction} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{API 速查表}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.40\linewidth}p{0.50\linewidth}}
+\toprule
+接口（GTSAM/manif 风格）& 一句话说明 \\
+\midrule
+\texttt{PreintegratedImuMeasurements::integrateMeasurement(a,w,dt)} & 单步累加 IMU 测量（\cref{alg:imu-preint} 步骤 1--5） \\
+\texttt{...::deltaRij()/deltaVij()/deltaPij()} & 取 $\Delta\tilde{\mathbf R},\Delta\tilde{\mathbf v},\Delta\tilde{\mathbf p}$ \\
+\texttt{...::preintMeasCov()} & 取 $9\times9$ 协方差 $\boldsymbol\Sigma_{ij}$ \\
+\texttt{ImuFactor(xi,vi,xj,vj,bias,pim)} & 构造预积分 IMU 因子（残差 \cref{eq:imu-residual}） \\
+\texttt{...::biasCorrectedDelta(bias)} & 偏置一阶修正（\cref{eq:bias-correction}） \\
+\texttt{rightJacobianSO3(phi)} & SO(3) 右雅可比 $\mathbf J_r$（\cref{ch:lie}） \\
+\texttt{Rot3::Expmap/Logmap} & $\mathrm{Exp}/\mathrm{Log}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{版本信息.}\;本章代码示例对照 GTSAM 4.x 的 \texttt{ImuFactor}/\texttt{PreintegratedImuMeasurements} 与 VINS-Mono 的 \texttt{IntegrationBase};\,符号约定见本章「记号与约定」note。

@@ -1,0 +1,1357 @@
+\chapter{实时博弈求解、逆博弈与意图推断}
+\label{ch:plan-rtgame}
+
+% ════════════════════════════════════════════════════════════════
+%  规控部·博弈规划（实时求解 + 逆博弈）章：吸收
+%  30_实时博弈求解器.md（iLQGames / ALGAMES / SE-IBR / GFNE / DG-SQP）
+%  + 40_逆博弈与预测规划.md（逆博弈 MLE / Level-k / GameFormer / 预测即均衡）。
+%  逐步推导保留、融成连贯一章；记号与 planning_intro / control_intro 对齐。
+%  跨部去重：CBF/HJI 可达性等深推导留待控制部/安全章（\pz 标注），此处侧重规划/决策用途。
+%  源 md 由 AI 生成、经多轮审仍可能含错/幻觉，存疑处就地 \pz / \rebuilt，并入 claimsToVerify。
+%  教学层遵循 v5.0 理论教学规范。
+% ════════════════════════════════════════════════════════════════
+
+\rebuilt{本章吸收的两份源笔记由 AI 生成、虽经多轮审阅仍可能含错误公式、张冠李戴的论文归属或编造的实验数值；所有数值实验结果（最小间距、反推误差、成功率提升等）均为源笔记自报的运行结果，未在本仓库复跑，正文凡引用处已就近标注，待联网与复跑核对。本章所依赖的“微分博弈理论底座”（HJI 方程、可达性、连续时间耦合 Riccati 的完整推导）在本书规划部尚无专章，正文以自包含方式简述其结论，深推导待该章补齐后 \texttt{\textbackslash cref} 衔接。}
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 单人迭代 LQR（iLQR，\cref{sec:ctrl-ilqr-ddp}）每步迭代做哪四件事（线性化、二次化、反向 Riccati、前向 rollout）？为什么前向 rollout 需要 line search 的步长 $\alpha$？
+  \item 什么是 Nash 均衡？“同时决策”与“一方先公示、另一方再响应”这两种交互结构，分别对应哪种博弈解概念？
+  \item 一条算好的控制序列 $u(t_0),\dots,u(t_{T-1})$ 与一族反馈律 $u(t_k,x)$，在执行中途被扰动偏离名义轨迹后，二者的表现有何本质区别？
+  \item 写出带不等式约束 $g(x)\le0$ 的优化问题的 KKT 条件（含互补松弛）。增广拉格朗日法如何处理不等式约束？
+  \item 自动驾驶中“先预测他车轨迹、再规划自车”的管线，为什么会让车在无保护左转处“僵死不动”（frozen robot）？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{区分}两个正交的解概念维度：Nash（对等同时）vs Stackelberg（层级先后）、开环 Nash（时间函数）vs 反馈 Nash（状态函数），并说清各自适用的交互结构与抗扰后果；
+  \item \textbf{推导}并\textbf{实现} iLQGames——把一般非线性博弈在名义轨迹附近局部化成 LQ 博弈、解一组\emph{耦合} Riccati、前向 rollout，理解它为何是“iLQR 换内核”、为何能毫秒级实时；
+  \item \textbf{掌握} ALGAMES——把广义 Nash 的 KKT 条件堆叠成方程组、用增广拉格朗日严格处理硬约束，并说清它与 iLQGames 在均衡类型、约束处理、信息结构上的根本差异（软约束逼近 vs 硬约束保证）；
+  \item \textbf{解释} SE-IBR 的灵敏度项 $\partial u_{-i}^*/\partial u_i$（KKT 隐函数）如何让迭代最佳响应主动“封堵”对手，以及 GFNE/DG-SQP 各补了前几代什么短板；
+  \item \textbf{形式化}逆博弈——给定观测轨迹反推对手代价的最大似然问题，用隐函数定理让正向求解器可微、支持梯度下降（SE-IBR 灵敏度的“对参数版”）；
+  \item \textbf{理解} Level-k / Cognitive Hierarchy 对有界理性的层级递归建模、用贝叶斯在线估计对手的层级 $k$；
+  \item \textbf{读懂} GameFormer 把 Level-k 递归“编译”进 Transformer 层级 decoder 的思想，并解释“预测即均衡”范式如何从根上消除 frozen robot；
+  \item \textbf{会选型}：面对一个具体交互场景，论证该用哪套求解器、配什么辅助层，并说清各自的工程代价。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章的主线，是把前序章节的\emph{单人}最优控制工具（\cref{sec:ctrl-ilqr-ddp} 的 iLQR、\cref{sec:ctrl-mpc} 的 MPC）升级为\emph{多人博弈}的实时求解，再在其外套一层“从行为推断对手”的逆问题。结构如下：
+
+\begin{center}
+\begin{forest} navtree
+[{解概念\\ Nash / Stackelberg\\ 开环 / 反馈}
+  [{iLQGames\\ 耦合 Riccati\\（反馈·毫秒级）}
+    [{ALGAMES\\ AL + KKT\\（开环·硬约束）}]
+    [{SE-IBR\\ 灵敏度·封堵}
+      [{GFNE / DG-SQP\\ 统一 / 工业 SQP}]]]
+  [{逆博弈\\ MLE + 隐函数}
+    [{Level-k\\ 有界理性}
+      [{GameFormer\\ 预测即均衡}]]]
+]
+\end{forest}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:rtg-concept,sec:rtg-olne-fbne} 先把“要求什么样的解”定清楚（两个正交维度），这是理解所有求解器的前提；\cref{sec:rtg-ilqgames} 是全章重心——iLQGames 算法与实现必须吃透，它直接接前序的 iLQR、也是逆博弈的内层引擎；\cref{sec:rtg-algames,sec:rtg-seibr} 是两条重要的替代/增强路线；\cref{sec:rtg-frontier} 偏研究级，时间紧可先速读。逆博弈三节（\cref{sec:rtg-inverse,sec:rtg-levelk,sec:rtg-gameformer}）是本章后半的核心：\cref{sec:rtg-inverse} 是地基（最大似然 + 隐函数定理），\cref{sec:rtg-levelk} 处理有界理性，\cref{sec:rtg-gameformer} 是端到端范式。\cref{sec:rtg-pred-eq} 把全章收束成“预测即均衡”，建议最后读以获整体视角；\cref{sec:rtg-selection} 给选型决策树。
+
+\subsection*{前置知识桥接}
+本章重度复用前序章节，重叠处一律 交叉引用 指过去、不重复：
+\begin{itemize}
+  \item \textbf{iLQR / DDP}（\cref{sec:ctrl-ilqr-ddp}，\cref{alg:ctrl-ilqr}）：单人 iLQR 反复“线性化—二次化—反向 Riccati—前向 rollout（带 line search）”。\cref{sec:rtg-ilqgames} 的 iLQGames 就是它的博弈推广——四步骨架完全一样，只把第三步的单人 Riccati 换成 $N$ 人耦合 Riccati。
+  \item \textbf{离散 LQR 与 Riccati}（\cref{sec:ctrl-lqr-dp}，\cref{eq:ctrl-dlqr-P}）：单人 LQR 的反向 Riccati 递推，是耦合 Riccati 退耦后的特例。
+  \item \textbf{MPC / 滚动时域}（\cref{sec:ctrl-mpc}，\cref{sec:ctrl-mpc-formulation}）：每拍用当前状态重解、只执行第一步。\cref{sec:rtg-olne-fbne} 会用它把开环博弈解“反馈化”。
+  \item \textbf{运动规划与级联范式}（\cref{ch:planning}）：博弈规划处理的是“他车也是决策者”这一情形，是 \cref{ch:planning} 把环境当静态/被动假设的对立面；\cref{ch:planning} 的“全局搜索 + 走廊 + 局部优化”级联与本章“求解器 + 安全层”的组合一脉相承。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+状态 $\mathbf{x}\in\mathbb{R}^{n_x}$ 为所有玩家拼接的联合状态，玩家 $i$ 的控制 $u_i\in\mathbb{R}^{n_{u_i}}$，其余玩家记 $u_{-i}$；玩家代价 $J_i$（沿用控制/规划领域自然记号，与 \cref{sec:ctrl-lqr} 的 LQR 代价同族，但此处可能含碰撞项）。离散时间下时间步记 $k=0,\dots,T-1$，时域 $T$（与 \cref{sec:ctrl-mpc} 的 MPC 时域 $N$ 同义，本章为避免与玩家数 $N$ 混淆改记 $T$；玩家数恒记 $N$）。
+反馈律记 $u_{i,k}=-K_{i,k}\,x_k-k_{i,k}$（仿射形式 $\bar u_{i,k}-K_{i,k}(x_k-\bar x_k)-\alpha k_{i,k}$），其中 $K$ 为反馈增益、$k$ 为前馈、$\alpha$ 为 line search 步长；玩家 $i$ 的 cost-to-go 二次型权重记 $Z_{i,k}$（对应 \cref{sec:ctrl-lqr-dp} 单人 LQR 的 $\mathbf{P}_t$，本章为避免与下文协方差/概率混淆改记 $Z$）。
+代价参数（逆博弈待估量）记 $\theta$；拉格朗日乘子 $\lambda$；约束 $g(x,u)\le0$。本章不涉及旋转/位姿群运算，故 \nameref{ch:notation} 的 $\SO(3)/\SE(3)$ 记号此处不出现。
+\end{note}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\label{tab:rtg-reading}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导与实现走读） & 8--10 小时 & 首次系统学博弈规划、要做交互规划器 \\
+速读（抓三套求解器 + 逆博弈 + 预测即均衡主线） & 3 小时 & 有 iLQR/MPC 基础、想对齐博弈脉络 \\
+速查（只看小结的符号表 + 速查表 + 选型决策树） & 20 分钟 & 写代码、选求解器时回来查 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 在做自动驾驶无保护左转时，你会发现把对向车当固定障碍的规划器原地僵死（frozen robot）——要破解它必须在规划时建模交互（博弈），而 \cref{ch:planning} 的搜索/采样/优化都默认环境被动，给不出这种交互策略；
+  \item 在复现 Waymo/nuPlan 排行榜的预测-规划 SOTA（如 GameFormer）时，你能跑通别人的代码，却说不清它和“先预测后规划”的传统管线差在哪、decoder 为何分层、为何说它“隐式逼近 Nash”——这正是本章 \cref{sec:rtg-gameformer,sec:rtg-pred-eq} 要讲清的。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section{Nash 均衡 vs Stackelberg 均衡}
+\label{sec:rtg-concept}
+
+\paragraph{动机：路口的两种“谁先谁后”。}
+考虑一辆要左转的车，对向有车直行。问一个看似抽象、却决定整个求解器结构的问题：\textbf{你和对向车，是“同时”决策，还是有“先后”？}两种合理答案对应两种博弈解\cite{sadigh2016planning}：
+\emph{同时决策}——你们在同一瞬间各自选动作，谁也不先承诺，每人只能基于“对方大概会怎么做”选自己的最优，这导向 \textbf{Nash 均衡}；
+\emph{有先后}——你先把车头探进路口、公示“我要左转”的意图，对向车看到后再决定让还是不让，你作为先动方可预判对方反应、并利用它选最有利的公示，这导向 \textbf{Stackelberg 均衡}。
+两种建模不是谁对谁错，而是对应不同的真实交互结构：竞速中两车抢同一条线，没有谁天然先后，是 Nash；自动驾驶车面对人类司机，可主动公示意图、人类被动响应，更像 Stackelberg。
+
+\paragraph{反面：把“有先后”硬套成“同时”。}
+设你做人车交互，真实结构是“车公示、人响应”（Stackelberg），却图省事用了 Nash 求解器。Nash 假设双方同时决策、互不让步，求出的均衡里车不会“主动试探”——因为 Nash 框架下没有“我先动、对方会反应”这回事，车默认对方策略固定、与自己无关。结果就是 frozen robot 的变种：车不敢探、行为保守晦涩，错失“我探一下、人类自然会让”的协调机会。反过来，竞速本是 Nash（对等），你却用 Stackelberg 把自己当 leader、假设对手会乖乖响应公示——对手根本不买账，你基于错误的“对手会让”预判做出激进抢线，直接撞上。根子都一样：\textbf{均衡概念必须匹配真实的决策时序结构}。
+
+\paragraph{历史：Sadigh 2016 的范式转变。}
+把 Stackelberg 引入自动驾驶并产生重大影响的，是 Sadigh、Sastry、Seshia、Dragan 在 RSS 2016 的工作\cite{sadigh2016planning}。传统自动驾驶把人类司机当移动障碍、预测其轨迹然后避让，导致防御性且晦涩的行为；Sadigh 等把人车交互建模成一个\emph{欠驱动动力学系统}——机器人的动作不仅改变自己的状态，还会\emph{改变人类的动作}——并用逆强化学习（IRL）从人类轨迹学出人类的奖励函数，再让车用 Stackelberg 式规划\emph{主动影响}人类。这是一次从“预测-避让”到“影响-引导”的范式转变，也定义了博弈规划的两条主线：Stackelberg 式的层级交互（人车）与 Nash 式的对等交互（竞速、多车 merge）。
+
+\paragraph{理论：两种均衡的数学定义。}
+先看 Nash。$N$ 个玩家同时决策，一组策略 $(u_1^*,\dots,u_N^*)$ 是 \textbf{Nash 均衡}，当且仅当每人在他人策略固定时都无法单方面改善自己的代价。
+
+\begin{definition}[Nash 均衡]\label{def:rtg-nash}
+策略组 $(u_1^*,\dots,u_N^*)$ 为 Nash 均衡，当
+\begin{equation}
+  J_i\big(u_i^*,\,u_{-i}^*\big)\ \le\ J_i\big(u_i,\,u_{-i}^*\big)\qquad\forall u_i,\ \forall i.
+  \label{eq:rtg-nash}
+\end{equation}
+\end{definition}
+
+\noindent 直觉：站在均衡点上，任何人单独偏离都只会让自己更差，所以没人有动机动——这是一个\emph{不动点}\cite{sadigh2016planning}。注意 \cref{eq:rtg-nash} 里每人面对的 $u_{-i}^*$ 是\emph{固定}的：Nash 的精神是“在别人不变的前提下我最优”，所有人同时如此、彼此自洽。
+
+现在引入先后。\textbf{leader}（记 L）先选策略 $u_L$ 并公示，\textbf{follower}（记 F）看到后做\emph{理性响应}——针对 leader 的选择求自己的最优：
+\begin{equation}
+  u_F^*(u_L)=\arg\min_{u_F}\ J_F(u_L,\,u_F).
+  \label{eq:rtg-stack-br}
+\end{equation}
+leader 知道 follower 会这样响应，于是求解一个\textbf{双层优化}：在“follower 会最优响应”的约束下，选对自己最有利的公示：
+\begin{equation}
+  \min_{u_L}\ J_L\big(u_L,\ u_F^*(u_L)\big).
+  \label{eq:rtg-stack-bilevel}
+\end{equation}
+直觉：leader 把 follower 的最优响应 \cref{eq:rtg-stack-br} 当成一个“函数”嵌进自己的优化 \cref{eq:rtg-stack-bilevel}——它不是在猜 follower 固定会怎么做（那是 Nash），而是主动\emph{塑造} follower 的反应。
+
+\begin{insight}
+\textbf{先手优势 = 把对手的最优响应内化为约束.}\;
+Nash 和 Stackelberg 的根本差别，在于“对手的策略”在你眼里是什么。Nash 里它是固定的\emph{外生量} $u_{-i}^*$（你假设它不变、只优化自己）；Stackelberg 里它是依赖你的\emph{内生函数} $u_F^*(u_L)$（你知道你一动它就跟着变，于是主动利用）。正是这个“把对手响应内化进自己优化”的动作给了 leader 先手优势——它能在所有“对手会怎么回应”的可能里挑一个对自己最好的局面去引导。但天下没有免费午餐：这个优势完全建立在“能准确预测 follower 响应”之上，预测错了（把激进司机当成会让的），先手优势瞬间变成自负的灾难。
+\end{insight}
+
+\paragraph{一个算到底的例子：先手优势值多少。}
+用一个最小标量博弈把 Nash 和 Stackelberg 都算到底\cite{sadigh2016planning}。设两人代价
+\begin{equation}
+  J_L=(u_L-1)^2+u_F^2,\qquad J_F=(u_F-u_L)^2,\qquad u_L,u_F\in\mathbb{R}.
+  \label{eq:rtg-toy-game}
+\end{equation}
+leader 想让 $u_L$ 接近 $1$ 且希望 $u_F$ 小；follower 想让 $u_F$ 跟住 $u_L$。
+\emph{先算 Nash（同时决策）}：各自对自己的控制求最优，
+\[
+  \frac{\partial J_L}{\partial u_L}=2(u_L-1)=0\Rightarrow u_L=1,\qquad
+  \frac{\partial J_F}{\partial u_F}=2(u_F-u_L)=0\Rightarrow u_F=u_L,
+\]
+联立得 Nash 均衡 $(u_L^*,u_F^*)=(1,1)$，此时 leader 代价 $J_L=(1-1)^2+1^2=1$。Nash 里 leader 只顾把 $u_L$ 推到 $1$（让第一项归零），却没考虑这会逼 follower 也跟到 $1$、害得自己第二项 $u_F^2=1$ 变大——因为 Nash 框架下 leader 把 $u_F$ 当外生固定。
+\emph{再算 Stackelberg（leader 先动）}：leader 先求 follower 响应 $u_F^*(u_L)=u_L$，代入自己的代价 \cref{eq:rtg-stack-bilevel}：
+\[
+  J_L\big(u_L,u_F^*(u_L)\big)=(u_L-1)^2+u_L^2=2u_L^2-2u_L+1,
+\]
+对 $u_L$ 求最优 $\tfrac{d}{du_L}(2u_L^2-2u_L+1)=4u_L-2=0\Rightarrow u_L=0.5$，于是 $u_F^*=0.5$，leader 代价 $J_L=(0.5-1)^2+0.5^2=0.5$。
+\emph{对比}：Stackelberg leader 的代价 $J_L=0.5$，比 Nash 的 $J_L=1$ 降低了一半。这就是先手优势的具体值——leader 知道“我把 $u_L$ 压低一点，follower 会跟着压低、我的第二项就小了”，主动选了折中的 $u_L=0.5$，牺牲第一项一点（$0.25$）换第二项大降（$1\to0.25$），总代价反而更优。但这个 $0.5$ 的优势有前提：它假设 follower 真按 $u_F^*(u_L)=u_L$ 理性响应；若真实 follower（人类司机）偏离（根本不让），leader 基于乐观预期的决策反而可能比保守的 Nash 更糟——这正是 Sadigh 2016 要用 IRL 去\emph{学}真实 follower 响应、而非假设它的原因。
+
+\begin{note}
+\textbf{两者的数学关系.}\;Stackelberg 解一般\emph{不在} Nash 均衡集合里——它是一个不同的解概念。leader 利用先手优势，通常能得到比任何 Nash 均衡对自己更好的结果（Nash 是“对手固定”下的最优，Stackelberg 是“主动塑造对手”下的最优，后者可行空间更大）；代价是需要准确预测 follower 的响应函数 $u_F^*(u_L)$，任何偏差都会侵蚀这个优势。
+\end{note}
+
+\paragraph{系统性分类：什么场景用哪种均衡。}
+\begin{table}[H]\centering\small
+\caption{按交互的时序结构选均衡概念}
+\label{tab:rtg-concept-pick}
+\begin{tabular}{p{0.24\textwidth} p{0.26\textwidth} p{0.14\textwidth} p{0.24\textwidth}}
+\toprule
+交互结构 & 典型场景 & 该用的均衡 & 本章对应求解器 \\
+\midrule
+对等、同时（无明确先后） & 无人机竞速、多车 merge、多机协调 & Nash & iLQGames、ALGAMES、SE-IBR \\
+层级、有先后（一方公示、一方响应） & 人车协作、车与人类司机、领航-跟随 & Stackelberg & Sadigh 2016 式双层规划 \\
+对等但想“软性引导” & 竞速中想封堵对手、但仍同时决策 & Nash + 均衡选择 & SE-IBR（\cref{sec:rtg-seibr}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 第三行很微妙：交互结构是对等的（Nash），但你仍想获得类似 leader 的“引导”效果。\cref{sec:rtg-seibr} 的 SE-IBR 正是干这个——它不改变 Nash 的同时决策结构，而在均衡选择上做文章，用灵敏度项让求解器偏向“让对手最受限”的那个 Nash，即\emph{在 Nash 框架内实现近似 Stackelberg 的封堵行为}。
+
+\begin{pitfall}[概念误区：以为 Stackelberg 解就是“更好的 Nash 解”]
+觉得既然 leader 能做得比 Nash 好，那 Stackelberg 解一定也是个 Nash 解、只是更优的那个——于是在 Nash 求解器里找“最优的那个 Nash”，以为能复现 Stackelberg 的引导行为，结果完全做不出主动塑造对手的效果。\textbf{根本原因}：Stackelberg 解一般不在 Nash 集合内，是不同的解概念（对手响应内生 vs 外生），最优性条件不同。\textbf{正解}：先判断时序结构——真有先后才用双层优化 \cref{eq:rtg-stack-bilevel}；对等同时用 Nash；想在 Nash 框架内要引导效果，用 SE-IBR 而非“挑个好 Nash”。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：无条件相信“先手优势”，忽略对 follower 响应的预测误差]
+认为当 leader 总是有利、公示意图就能引导对方，不去验证对 follower 响应模型的准确性。后果：把不让行的激进司机当成会让的，车基于错误预判危险抢行；或对手并不理性响应时，Stackelberg 策略反而比保守 Nash 更危险。\textbf{根本原因}：先手优势完全依赖准确预测 $u_F^*(u_L)$，这来自对 follower 代价的假设或 IRL 学习，任何偏差都会让内层 \cref{eq:rtg-stack-br} 失真，引导变误导。\textbf{正解}：把 follower 响应模型的不确定性显式纳入（响应鲁棒化、在线辨识 follower 代价）；不确定性大时宁可退回保守 Nash 或加安全滤波。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （概念辨析）对下面四个场景，判断该用 Nash 还是 Stackelberg，并说明“谁先谁后”的依据：(i) 两架无人机竞速抢同一弯道；(ii) 高速上车想并入人类司机车流；(iii) 路口两辆完全对等的自动驾驶车；(iv) 领航车带一队跟随车编队。
+  \item （数学）设标量双人博弈 $J_L=(u_L-u_F)^2+u_L^2$、$J_F=(u_F-u_L/2)^2$，$u_L,u_F\in\mathbb{R}$。(a) 求 Nash（两人同时最优）；(b) 求以 L 为 leader 的 Stackelberg（先求 follower 响应 $u_F^*(u_L)$，代入 \cref{eq:rtg-stack-bilevel} 再对 $u_L$ 最优）；(c) 比较两者下 leader 的 $J_L$，验证 Stackelberg leader 是否确实不差于 Nash。
+  \item （开放）Sadigh 2016 用 IRL 学人类奖励再用 Stackelberg 影响人类。若人类是“有界理性”的（不完全最优、带随机性），用确定性 Stackelberg 双层优化会有什么问题？你会怎么改进？（提示：\cref{sec:rtg-levelk} 的有界理性建模。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{开环 Nash 与反馈 Nash}
+\label{sec:rtg-olne-fbne}
+
+\paragraph{动机：算好的控制序列，中途被风吹偏了怎么办。}
+\cref{sec:rtg-concept} 定了“同时还是先后”（Nash vs Stackelberg）。这一节定另一个\emph{正交}维度——\textbf{策略是时间的函数还是状态的函数}。这个区分决定了 iLQGames（反馈）和 ALGAMES（开环）的根本差异，也直接关系到“求出来的解扔到有扰动的真实车上还管不管用”。
+设求解器替你的车算出一条与对向车博弈后的最优计划，它有两种本质不同的形态：
+\emph{一串控制量} $u_i^*(t_0),\dots,u_i^*(t_{T-1})$——开局一次性算好、之后逐拍照执行，叫\textbf{开环（open-loop）}策略；
+\emph{一族反馈律} $u_i^*(t_k,x)=\bar u_{i,k}+K_{i,k}(x-\bar x_k)$——每个时刻看\emph{当前实际状态} $x$ 再算控制，叫\textbf{反馈（feedback）}策略。
+两者在没有扰动、模型完美时给出完全相同的轨迹。但真实世界有风、有建模误差、有噪声。执行到一半一阵侧风把车吹偏 $0.5$ 米，偏离名义轨迹 $\bar x_k$：开环策略照旧输出 $u_i^*(t_k)$——它只看时间、不看状态，误差不被纠正甚至越积越大；反馈策略看到当前 $x$ 比名义 $\bar x_k$ 偏了 $\delta x$，输出 $\bar u_{i,k}+K_{i,k}\,\delta x$，那个 $K_{i,k}\delta x$ 项就是针对偏差的修正，把车往回拉。这就是反馈策略“天然抗扰”的来历。
+
+\paragraph{反面：用开环 Nash 跑真实车。}
+把纯开环 Nash 解直接部署到真实车上，典型故障是：仿真里（无扰动）完美——两车流畅完成 merge、零碰撞；一上实车，轮胎打滑、风扰、定位漂移让真实状态持续偏离名义轨迹，开环控制序列对此一无所知，仍按“理想世界”计划走，真实轨迹慢慢偏离、安全间隙被吃掉，算好的“零碰撞”变成实际的危险接近甚至剐蹭。更糟的是博弈耦合放大了这个问题：你偏了、对方的开环计划也没考虑你偏了，两个都不纠偏的计划叠加，误差相互放大。这正是为什么 \textbf{ALGAMES（输出开环 GNE）必须配高频 MPC} 才能上车。
+
+\paragraph{理论：两种信息结构的精确定义。}
+\textbf{信息结构（information structure）}指“做决策时能用到什么信息”，开环和反馈是它的两种典型\cite{basar1999dynamic}。
+
+\begin{definition}[开环 Nash 均衡 OLNE]\label{def:rtg-olne}
+每个玩家的策略是\emph{时间的函数}，且只依赖初始状态 $x_0$：
+\[
+  u_i^*=\big\{u_i^*(t_0),\dots,u_i^*(t_{T-1})\big\},\qquad u_i^*(t_k)\ \text{只是 }t_k\ \text{的函数（给定 }x_0\text{）},
+\]
+并满足 Nash 条件 \cref{eq:rtg-nash}：每人的控制序列在他人序列固定时最优。
+\end{definition}
+
+\begin{definition}[反馈 Nash 均衡 FBNE]\label{def:rtg-fbne}
+每个玩家的策略是\emph{当前时刻状态的函数} $u_i^*(t_k,x)$，依赖运行时实际状态 $x$。在 LQ 博弈里它有闭式 $u_i^*(t_k,x)=-K_{i,k}\,x$（或仿射 $\bar u_{i,k}+K_{i,k}(x-\bar x_k)+\alpha k_{i,k}$），并满足\emph{子博弈完美（subgame perfect）}——不仅初始时刻是 Nash，从任何中途状态出发的剩余博弈也都是 Nash。
+\end{definition}
+
+\begin{insight}
+\textbf{开环承诺一条路，反馈承诺一个规则.}\;开环玩家说“我会走这条线，不管发生什么”；反馈玩家说“我会按这个规则应对——你在哪，我就相应地在哪”。确定性世界里两者走出的线一样；有扰动的世界里，反馈的“应变规则”能持续把系统拉回，开环的“固定轨迹”却会放任偏差累积。这就是反馈 Nash 在有扰动时严格优于开环——不是它算得更准，而是它\emph{带了纠偏机制}。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{开环（OLNE）与反馈（FBNE）信息结构对比}
+\label{tab:rtg-olne-fbne}
+\begin{tabular}{p{0.22\textwidth} p{0.34\textwidth} p{0.34\textwidth}}
+\toprule
+维度 & 开环 (OLNE) & 反馈 (FBNE) \\
+\midrule
+策略形式 & $u_i(t_k)$，时间的函数 & $u_i(t_k,x_k)$，当前状态的函数 \\
+决策用到的信息 & 只用初始状态 $x_0$ + 当前时刻 & 用运行时实际状态 $x_k$ \\
+何时算好 & $t_0$ 一次性算好整条序列 & 每个时刻看状态实时算 \\
+对扰动的反应 & 无（照旧执行既定序列） & 有（$K\delta x$ 项纠偏） \\
+最优性强度 & 仅初始时刻 Nash & 子博弈完美（任意中途状态都 Nash） \\
+求解结构 & 耦合两点边值问题（PMP 协态） & 耦合 Riccati（值函数对状态求导） \\
+本章对应 & ALGAMES、DG-SQP & iLQGames、GFNE \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 这张表把后面所有求解器的“信息结构”那一栏的来源讲清了：iLQGames 解耦合 Riccati（值函数 $V_i(x)$ 对状态求导，天然得状态反馈）$\to$ 反馈；ALGAMES 解 KKT（控制序列满足一阶最优性）$\to$ 开环。\textbf{求解结构决定了信息结构，而非反过来}。
+
+\paragraph{为什么 FBNE 一般不等于 OLNE。}
+这是个容易被忽略的微妙点：同一个博弈，开环 Nash 和反馈 Nash 的解\emph{一般不同}（即便在 LQ 情形）。原因在于“对手会不会对我的偏离做出反应”这个预期被编进了均衡：反馈博弈里玩家 $i$ 知道“如果状态偏了，对手 $j$ 的反馈律也会相应调整”，这个对手的应变能力改变了 $i$ 的最优策略；开环博弈里 $i$ 假设对手会雷打不动执行既定序列，无论状态怎么变。两种对“对手如何应对未来状态”的预期不同，导致两种均衡不同。下文耦合 Riccati（\cref{eq:rtg-coupled-riccati}）解的是\emph{反馈} Nash（值函数是状态的函数，求导得状态反馈）；开环 Nash 则要解一组耦合的两点边值问题（PMP 协态方程联立），结构不同。
+
+\paragraph{MPC 把开环变“准反馈”。}
+ALGAMES 的补救是\emph{滚动时域（receding horizon / MPC，\cref{sec:ctrl-mpc}）}：每隔很短的时间（如 $16$\,ms，对应 $60+$\,Hz），用\emph{当前实际状态}重新解一次开环博弈，只执行解出来的第一个控制量，下一拍再用新状态重解。这样虽然每次解的是开环序列，但因为每拍都用最新真实状态重启，\textbf{高频重规划在效果上逼近了反馈}——状态偏了，下一拍立刻基于偏后状态重算。所以 ALGAMES 上车的标准姿势是“开环求解器 + $60$\,Hz MPC”，用计算频率换反馈效果；iLQGames 因本身输出反馈律，单次求解就自带纠偏，MPC 频率可更低。
+
+\begin{codebox}[Python]{MPC 循环把单次求解变闭环}
+# solve_game(x0, H) 返回从 x0 出发、时域 H 的整条控制序列（开环计划）
+# MPC: 每拍用当前真实状态重解、只取第一步、滚动前进
+x = x0_init.copy(); traj = [x.copy()]
+for k in range(sim_steps):
+    u_plan = solve_game(x, H_mpc)               # 1) 用当前真实状态 x 重新规划
+    u_now  = [u_plan[0][i] for i in range(N)]   # 2) 只取第一个控制量
+    x = step(x, u_now) + noise * randn(nx)      # 3) 执行 + 真实扰动
+    traj.append(x.copy())                       # 4) 下一拍用偏移后的新状态重解
+\end{codebox}
+
+\noindent 关键就在 \verb@solve_game(x, ...)@ 每拍都吃\emph{最新的} \verb@x@——状态被扰偏了，下一拍的规划立刻基于偏后状态重启，这就是“高频重规划逼出反馈效果”。源笔记报告：在同一汇入场景注入扰动，MPC 闭环把两车最小间距维持在 $0.900$（接近无扰动的 $0.871$）、终点准确；单次开环（不重规划）在同样扰动下最小间距骤降到 $0.305$（危险接近）、横向跑偏一米多\cite{lecleach2022algames}。\pz{存疑：$0.900$/$0.305$ 等为源笔记自报的仿真输出，未复跑核对。}
+
+\paragraph{对比：信息结构维度上的 iLQGames vs ALGAMES。}
+把这一节和 \cref{sec:rtg-concept} 合起来，能看清两个\emph{正交}的分类维度——“同时/先后”（Nash/Stackelberg）和“反馈/开环”（信息结构）。本章两大主力求解器在第二个维度上正好分居两端：
+
+\begin{table}[H]\centering\small
+\caption{反馈 Nash（iLQGames）vs 开环 GNE（ALGAMES）的工程后果}
+\label{tab:rtg-ilq-vs-alg-info}
+\begin{tabular}{p{0.2\textwidth} p{0.36\textwidth} p{0.34\textwidth}}
+\toprule
+维度 & iLQGames（反馈 Nash） & ALGAMES（开环 GNE） \\
+\midrule
+策略形式 & $u_i(t_k,x)$ 状态的函数 & $u_i(t_k)$ 时间的函数 \\
+抗扰能力 & 强：反馈增益 $K$ 自动纠偏 & 弱：固定序列不纠偏 \\
+子博弈完美 & 是（任意中途状态都 Nash） & 否（只在初始状态 Nash） \\
+每步子问题 & 耦合 Riccati（解析，\cref{sec:rtg-ilqgames}） & KKT 牛顿步（线性系统，\cref{sec:rtg-algames}） \\
+上车方式 & 天然反馈，可直接闭环 & 必须配高频 MPC 补偿 \\
+硬约束处理 & 弱（penalty） & 强（AL + 互补，\cref{sec:rtg-algames}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 最后两行揭示了一个深刻权衡：ALGAMES 输出开环解、抗扰弱，但能\emph{严格处理硬约束}（碰撞、道路边界）；iLQGames 输出反馈解、抗扰强，但\emph{硬约束只能软惩罚}。两边都有短板，工程上靠组合策略补（\cref{sec:rtg-selection}）。
+
+\begin{insight}
+\textbf{MPC $\leftrightarrow$ 把开环解“反馈化”.}\;MPC 在这里扮演的角色，和它在单人最优控制里（\cref{sec:ctrl-mpc}）完全一致——用“高频重规划”把一个开环最优解变成事实上的闭环策略：每拍解一个开环问题、只执行第一步、滚动前进。不同之处是博弈 MPC 每拍重解的是一个\emph{多人博弈}，计算量比单人 OCP 大得多，所以“能不能在一个控制周期内解完”成了 ALGAMES 能否上车的硬指标。一句话：\textbf{反馈是“解一次、自带纠偏”，MPC 是“频繁重解、逼出纠偏”，两条路殊途同归，但代价结构不同。}
+\end{insight}
+
+\begin{pitfall}[概念误区：以为开环 Nash 和反馈 Nash 在 LQ 情形下相同]
+觉得既然都是 LQ 博弈、都满足 Nash 条件，开环解和反馈解应该一样——于是用开环求解器算出的解去对照反馈求解器的轨迹，发现对不上，误以为某个求解器有 bug，浪费大量时间查错。\textbf{根本原因}：两者信息结构不同——反馈博弈里玩家预期“对手会对未来状态变化做反应”，开环博弈里玩家假设“对手雷打不动执行既定序列”，这个对对手应变能力的不同预期使两种均衡一般不同，即便在 LQ 情形。\textbf{正解}：明确你要哪种均衡再选求解器——要反馈 Nash（抗扰、子博弈完美）用 iLQGames，要开环 GNE（约束严格）用 ALGAMES，不要拿两者轨迹直接对照期望相等。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：把开环 GNE 解直接部署到真实系统，不配 MPC]
+在仿真里 ALGAMES 的开环解完美，就直接把这条控制序列烧进真实车，期望同样表现。后果：实车扰动、打滑、定位漂移让真实状态偏离名义轨迹，开环序列不纠偏，误差累积、安全间隙被吃掉，仿真里的“零碰撞”变成实车的危险接近；博弈耦合还会放大误差（双方计划都没考虑对方偏离）。\textbf{正解}：开环求解器必须配滚动时域 MPC——每拍用当前实际状态重解、只执行第一步，并确保单次求解时间短于控制周期；或改用 iLQGames 的反馈解，单次求解即自带纠偏。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （概念）用自己的话解释，为什么反馈 Nash 满足“子博弈完美”而开环 Nash 不满足。举一个两步博弈的例子：第一步后状态被扰动偏离，说明反馈策略和开环策略各自如何（不）响应。
+  \item （推导）耦合 Riccati（下文 \cref{eq:rtg-coupled-riccati}）解的是反馈 Nash。说明：为什么从值函数 $V_i(x,t)=\tfrac12 x^\top Z_i x$ 出发、对状态求导得到的策略 $u_i=-K_i x$ 天然是状态反馈而非时间函数？若改求开环 Nash，方程结构会变成什么（提示：PMP 协态）？
+  \item （工程设计）你要在真实车上部署 ALGAMES（开环 GNE、严格处理碰撞约束）。设计完整上车方案：(a) MPC 频率怎么定（与单次求解时间的关系）；(b) 若某拍求解超时没解完，控制器该怎么办（fallback）；(c) 如何兼顾 ALGAMES 的硬约束优势和反馈的抗扰需求。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{iLQGames：迭代线性二次博弈}
+\label{sec:rtg-ilqgames}
+
+\paragraph{动机：一般博弈不可解，但 LQ 博弈可解——那就反复 LQ。}
+微分博弈理论给出两个看似矛盾的事实：一般非线性微分博弈没有闭式解、基于值函数网格的 Hamilton--Jacobi--Isaacs（HJI）方法被维度诅咒卡死（网格规模随维数指数爆炸，约 $6$ 维即算不动）；但 LQ 博弈（线性动力学 + 二次代价）有\emph{闭式}的反馈 Nash 解——一组耦合 Riccati 方程。\pz{规划部博弈理论章（HJI 方程、可达性、连续时间耦合 Riccati 完整推导）待补：此处 HJI 算不动与连续耦合 Riccati 的结论先以自包含方式简述，深推导待该章 交叉引用。}矛盾怎么调和？答案和单人最优控制里 iLQR（\cref{sec:ctrl-ilqr-ddp}）调和“非线性 OCP 难解、LQR 易解”的方式一模一样：\textbf{反复地把难问题局部近似成易问题}。
+具体说，iLQGames 的思路是：在当前猜测的名义轨迹附近，把非线性动力学\emph{一阶 Taylor 展开}成线性、把代价\emph{二阶展开}成二次，得到一个局部 LQ 博弈；解这个 LQ 博弈（耦合 Riccati）得每人的反馈律；用新策略前向 rollout 出一条更好的轨迹，作为下一轮名义轨迹；重复直到收敛。这就是 iLQGames——\textbf{iLQR 的博弈推广}。
+
+\paragraph{反面：为什么不能“预测对手 + 自己 iLQR”。}
+一个看似省事的替代：既然 iLQR 能解单人非线性最优控制，那我先用个预测器预测对手轨迹、把它当移动障碍，再对自己跑标准 iLQR——不就把博弈“降维”成单人问题了？这正是 iLQGames 论文要反对的做法\cite{fridovich2020efficient}。它的问题和 frozen robot 同源：把对手当成不对你反应的固定障碍，切断了交互反馈环。iLQR 求出的“最优”是针对“对手轨迹固定”的最优，可对手轨迹其实依赖你的策略——你避让对手算出的轨迹，反过来又会改变对手的最优响应，而你的 iLQR 对此一无所知。结果是预测与实际脱节：要么过度保守（预测对手不让，frozen），要么过度乐观（预测对手会让，实际抢行撞上）。iLQGames 的关键改进，就是把“对手也在同时优化”编进求解器——它每步解的是\emph{耦合}的多人 LQ 博弈，所有玩家的反馈增益同时求出、相互依赖，而非各自为政的单人 iLQR。
+
+\paragraph{历史：iLQR $\to$ iLQGames。}
+iLQGames 由 Fridovich-Keil、Ratner、Peters、Dragan、Tomlin 在 ICRA 2020 提出\cite{fridovich2020efficient}。思想谱系很清晰：单人最优控制里，Mayne 等的 DDP 与其简化版 iLQR（\cref{sec:ctrl-ilqr-ddp}）用“反复 LQ 近似”高效求解非线性 OCP；既然 LQ 博弈也有闭式解（耦合 Riccati），那就反复求解局部 LQ 博弈近似。其标志性 demo 是一个三人一般和博弈：两车过十字路口、一行人走人行横道，求解器自动让两车轻微转向互相避让、并给行人留出额外间隙——全程毫秒级实时（论文报告滚动时域问题收敛在 $<50$\,ms）\cite{fridovich2020efficient}。这一工作把博弈规划从“理论可行”推到“实时可用”。
+
+\paragraph{理论：iLQGames 的完整算法。}
+把思路落成精确算法。设 $N$ 人一般和离散时间博弈
+\begin{equation}
+  x_{k+1}=f(x_k,\,u_{1,k},\dots,u_{N,k}),\qquad
+  J_i=\sum_{k=0}^{T-1}\ell_i(x_k,u_{i,k})+\ell_i^f(x_T),
+  \label{eq:rtg-ilqgames-problem}
+\end{equation}
+其中 $x_k\in\mathbb{R}^{n_x}$ 是所有玩家拼接的状态、$u_{i,k}\in\mathbb{R}^{n_{u_i}}$ 是玩家 $i$ 的控制。iLQGames 迭代如下（与单人 iLQR \cref{alg:ctrl-ilqr} 逐步对照，唯一差别在步骤 ③）。
+
+\begin{algo}[iLQGames 一次迭代]\label{alg:rtg-ilqgames}
+给定名义轨迹 $(\bar x,\bar u_1,\dots,\bar u_N)$，重复直到收敛：
+\begin{enumerate}
+  \item \textbf{线性化动力学}（沿名义轨迹）：$A_k=\partial f/\partial x|_{(\bar x_k,\bar u_k)}$，$B_{i,k}=\partial f/\partial u_i|_{(\bar x_k,\bar u_k)}$；
+  \item \textbf{二次化代价}（沿名义轨迹）：$Q_{i,k},q_{i,k}$ 为 $\ell_i$ 对 $x$ 的二阶/一阶导，$R_{ii,k},r_{i,k}$ 为对 $u_i$ 的；
+  \item \textbf{反向递推解耦合 Riccati}：从 $k=T-1$ 倒推到 $0$，每步解一个块线性系统，得每人的反馈增益 $K_{i,k}$ 与前馈 $k_{i,k}$（\textbf{博弈特有，唯一区别于 iLQR 处}）；
+  \item \textbf{前向 rollout}（带步长 $\alpha$ 做 line search）：从 $x_0$ 出发，$u_{i,k}=\bar u_{i,k}-K_{i,k}(x_k-\bar x_k)-\alpha\,k_{i,k}$，逐步用 $f$ 推出新轨迹；
+  \item \textbf{检查收敛}（总代价变化 $<\epsilon$），更新名义轨迹。
+\end{enumerate}
+\end{algo}
+
+\noindent 步骤 ①②④⑤ 与单人 iLQR（\cref{alg:ctrl-ilqr}）逐字对应；唯一本质区别在步骤 ③：单人 iLQR 这一步解的是单人 Riccati（\cref{eq:ctrl-dlqr-P}，一条标量化的反向递推），iLQGames 解的是 \textbf{$N$ 人耦合 Riccati}——所有玩家的反馈增益 $K_{i,k}$ 在每个时间步\emph{同时}求出、相互耦合。
+
+\paragraph{核心推导：连续耦合 Riccati 与它的离散反向递推。}
+先看连续时间的形态以建立直觉。$N$ 人 LQ 博弈——线性动力学 $\dot x=Ax+\sum_j B_ju_j$、每人二次代价 $J_i=\tfrac12\int(x^\top Q_ix+u_i^\top R_{ii}u_i)\,dt$——的反馈 Nash 均衡由一组\emph{耦合}的 Riccati 方程给出\cite{basar1999dynamic}：
+\begin{equation}
+  -\dot Z_i=A^\top Z_i+Z_iA+Q_i-Z_iS_iZ_i-\sum_{j\ne i}\big(Z_jS_jZ_i+Z_iS_jZ_j\big),\qquad S_j=B_jR_{jj}^{-1}B_j^\top,
+  \label{eq:rtg-coupled-riccati}
+\end{equation}
+反馈增益 $K_i=R_{ii}^{-1}B_i^\top Z_i$，策略 $u_i=-K_ix$。\pz{规划部博弈理论章待补：\cref{eq:rtg-coupled-riccati} 的连续耦合 Riccati 完整推导（从值函数 $V_i=\tfrac12 x^\top Z_i x$ 出发、对各玩家做 HJ 驻点）留待该章；此处直接引用其结论作为离散递推的对照。}\textbf{关键点}：那个求和交叉项 $-\sum_{j\ne i}(Z_jS_jZ_i+Z_iS_jZ_j)$ 把 $N$ 条方程缠在一起，必须联立求解——\emph{这就是“博弈”相对“最优控制”的全部数学增量}。若去掉它（$N=1$ 或忽略他人），\cref{eq:rtg-coupled-riccati} 退化为单人 LQR 的 Riccati（\cref{eq:ctrl-dlqr-P} 的连续版）。
+
+iLQGames 在离散时间下做反向递推。设玩家 $i$ 的值函数（cost-to-go）$V_{i,k}(x)=\tfrac12 x^\top Z_{i,k}x+\zeta_{i,k}^\top x$，从终端 $Z_{i,T}=Q_{i,T}$ 倒推。在每个时间步 $k$，所有玩家的反馈增益由一个\emph{耦合的块线性系统}同时解出（这正是 \cref{eq:rtg-coupled-riccati} 交叉项在离散时间的体现）。把玩家 $i$ 的一阶最优性条件
+\begin{equation}
+  \big(R_{ii}+B_i^\top Z_{i,k+1}B_i\big)u_i+B_i^\top Z_{i,k+1}\sum_{j\ne i}B_ju_j+B_i^\top Z_{i,k+1}A\,x+\big(B_i^\top\zeta_{i,k+1}+r_i\big)=0
+  \label{eq:rtg-foc}
+\end{equation}
+对 $i=1,\dots,N$ 堆叠，得一个 $\big(\sum_i n_{u_i}\big)\times\big(\sum_i n_{u_i}\big)$ 的线性系统 $M\,\mathbf{u}=-(N_x\,x+n)$，解出 $\mathbf{u}=-K_k x-k_k$ 中的 $K_k,k_k$。那个矩阵 $M$ 的\emph{非对角块} $B_i^\top Z_{i,k+1}B_j\,(i\ne j)$ 就是耦合的来源——去掉它，$N$ 个玩家退化成各自独立的 LQR 反向递推（即下文陷阱 1 的“独立 iLQR”错误）。解出 $K_{i,k},k_{i,k}$ 后，用闭环转移 $F_k=A_k-\sum_j B_{j,k}K_{j,k}$ 更新每人的 $Z_{i,k},\zeta_{i,k}$，继续往前倒推。
+
+\begin{insight}
+\textbf{iLQGames = iLQR 换内核.}\;理解 iLQGames 最快的方式，是把它看成 iLQR 做了一处“换心手术”——把反向 pass 里的单人 Riccati 摘掉，换上多人耦合 Riccati（\cref{eq:rtg-foc} 那个含非对角块的块线性系统），其余器官（前向 rollout、line search、收敛判据）原样保留。这个视角的力量在于：你对 iLQR 的所有工程经验（怎么做 line search、怎么正则化防发散、怎么暖启动）几乎都能直接迁移。它也解释了 iLQGames 为什么快——耦合 Riccati 虽比单人 Riccati 多了块耦合，但仍是\emph{解析}的反向递推（每步只解一个小线性系统），没有外层迭代，故单次 LQ 博弈求解和单次 iLQR 反向 pass 一个量级，毫秒级即可完成。
+\end{insight}
+
+\paragraph{复杂度与实时性。}
+每步迭代的主要开销在反向递推：$T$ 个时间步，每步解一个 $(\sum_i n_{u_i})\times(\sum_i n_{u_i})$ 线性系统并更新 $N$ 个 $n_x\times n_x$ 的 $Z$ 矩阵，量级约 $O\big(T\cdot n_x^2\cdot\sum_i n_{u_i}\big)$，数次迭代即收敛。源笔记引用的实测：三人 $14$ 状态交叉路口场景，初次求解 $<0.25$\,秒；硬件避撞测试中滚动时域（MPC）问题收敛在 $<50$\,ms（对应 $20$\,Hz 重规划，足以放进车载 MPC 循环）\cite{fridovich2020efficient}。\pz{存疑：$<0.25$\,秒 / $<50$\,ms 为源笔记转引的论文数字，待与原文核对（尤其“kHz 级”说法应理解为更小规模/更优实现下的量级）。}这个速度让 iLQGames 能直接放进实时 MPC，是它相对 HJI（秒级甚至更慢）的决定性优势。代价是它只给\emph{局部}反馈 Nash（非全局最优、非严格安全），但对实时上车这是值得的取舍。
+
+\paragraph{实现：一个能跑的 iLQGames（2 车交叉路口）。}
+理论讲完，落到能跑的代码。下面给一个自包含、纯 NumPy 的最小 iLQGames，求解 2 车交叉路口的反馈 Nash：car0 沿 $+x$ 穿过原点、car1 沿 $+y$ 穿过原点，两车都想到达各自目标、又都要避免相撞。有三个设计决定值得先说清，否则容易写错：
+其一，\textbf{多车状态拼接成单一向量}——两车各 $4$ 维 $[p_x,p_y,\theta,v]$ 拼成 $8$ 维 $x$；因为耦合 Riccati 是在“全局状态”上做反向递推的，博弈耦合（碰撞）体现在不同车的状态之间，必须放在同一状态向量里才能让 $Z_i$ 矩阵的非对角块捕捉到。
+其二，\textbf{线性化是块对角的、耦合只来自代价}——每辆车的动力学只依赖自己的状态和控制，故拼接后的 $A_k$ 块对角、$B_{i,k}$ 只在第 $i$ 块非零；真正把两车耦合起来的是\emph{碰撞 penalty}（两车位置之差的函数），于是 $Q_{i,k}$ 在两车位置的交叉块上非零。
+其三，\textbf{前向 rollout 必须带 line search}——线性化只在名义轨迹附近有效，整步（$\alpha=1$）更新可能跨出近似有效域导致代价不降甚至发散，故试几个 $\alpha\in\{1,0.5,0.25,\dots\}$ 取代价最小者（与 \cref{alg:ctrl-ilqr} 一致）。
+下面是反向递推解耦合 Riccati 的核心函数，每行注明对应算法哪一步、哪个量：
+
+\begin{codebox}[Python]{离散耦合 Riccati 反向递推（算法步骤 3）}
+import numpy as np
+dt, T, N, nx_i, nu_i = 0.1, 40, 2, 4, 2
+nx = N * nx_i                                  # 拼接状态维 = 8
+idx = [slice(0,4), slice(4,8)]                 # 两车状态在拼接向量中的位置
+
+def lq_game_solve(As, Bs_list, Qs_t, qs_t, Rs_t, rs_t):
+    """反向递推解耦合 Riccati。返回反馈增益 K[i][k] 与前馈 kff[i][k]，u_i = -K_i*x - kff_i。"""
+    Z    = [[None]*T for _ in range(N)]        # Z[i][k] = 玩家 i 的 cost-to-go 二次项
+    zeta = [[None]*T for _ in range(N)]        # 一次项（仿射博弈才非零）
+    K    = [[None]*T for _ in range(N)]
+    kff  = [[None]*T for _ in range(N)]
+    for i in range(N):                          # 终端条件 Z[i][T-1] = Q[i][T-1]
+        Z[i][T-1] = Qs_t[T-1][i].copy(); zeta[i][T-1] = qs_t[T-1][i].copy()
+    for t in range(T-2, -1, -1):                # 从倒数第二步往回递推
+        A, Bs = As[t], Bs_list[t]
+        # 把 N 个玩家的一阶最优性堆叠成块线性系统 M*u = -(Nmat*x + nvec)
+        M    = np.zeros((N*nu_i, N*nu_i)); Nmat = np.zeros((N*nu_i, nx)); nvec = np.zeros(N*nu_i)
+        for i in range(N):
+            ri = slice(i*nu_i, (i+1)*nu_i)
+            for j in range(N):
+                rj  = slice(j*nu_i, (j+1)*nu_i)
+                blk = Bs[i].T @ Z[i][t+1] @ Bs[j]      # 非对角块 = 耦合来源
+                if i == j: blk = blk + Rs_t[t][i]      # 对角块加自己的 R_ii
+                M[ri, rj] = blk
+            Nmat[ri, :] = Bs[i].T @ Z[i][t+1] @ A
+            nvec[ri]    = Bs[i].T @ zeta[i][t+1] + rs_t[t][i]
+        sol  = np.linalg.solve(M, np.hstack([Nmat, nvec.reshape(-1,1)]))
+        Kbig, kbig = sol[:, :nx], sol[:, nx]            # 一次解出所有玩家的 K、k
+        for i in range(N):
+            ri = slice(i*nu_i, (i+1)*nu_i); K[i][t], kff[i][t] = Kbig[ri, :], kbig[ri]
+        F, beta = A.copy(), np.zeros(nx)                # 闭环转移 F = A - sum_j B_j K_j
+        for j in range(N):
+            F = F - Bs[j] @ K[j][t]; beta = beta - Bs[j] @ kff[j][t]
+        for i in range(N):                              # 更新每人的 Z、zeta
+            Z[i][t]    = Qs_t[t][i] + K[i][t].T @ Rs_t[t][i] @ K[i][t] + F.T @ Z[i][t+1] @ F
+            zeta[i][t] = qs_t[t][i] + K[i][t].T @ (Rs_t[t][i] @ kff[i][t] - rs_t[t][i]) \
+                         + F.T @ (Z[i][t+1] @ beta + zeta[i][t+1])
+    return K, kff
+\end{codebox}
+
+\noindent 反向 pass 吃的 $A_k,B_{i,k},Q_{i,k},\dots$ 来自 iLQGames 的“前半”——线性化与二次化（步骤 ①②）。动力学线性化（每辆 unicycle 连续动力学 $\dot{[p_x,p_y,\theta,v]}=[v\cos\theta,v\sin\theta,\omega,a]$ 求雅可比再前向欧拉离散）、按块对角拼接、以及代价二次化（碰撞 penalty 对\emph{双方对称}计入，对应陷阱 3），构成 iLQGames 的完整数据流：
+
+\begin{codebox}[Python]{线性化、拼接、二次化（算法步骤 1 与 2）}
+def jac_i(xi, ui):                             # 单车离散线性化：A_i = I + dt*df/dx, B_i = dt*df/du
+    px, py, th, v = xi
+    Ac = np.array([[0,0,-v*np.sin(th),np.cos(th)],[0,0,v*np.cos(th),np.sin(th)],
+                   [0,0,0,0],[0,0,0,0]])
+    Bc = np.array([[0,0],[0,0],[1,0],[0,1]])   # omega 进 theta_dot, a 进 v_dot
+    return np.eye(4) + dt*Ac, dt*Bc
+
+w_u = np.diag([0.1,0.1]); w_goal = np.diag([1.,1,0.1,0.5]); w_coll, d_safe = 50.0, 1.0
+goal = [np.array([4,0,0,1.0]), np.array([0,4,np.pi/2,1.0])]
+
+def costs_and_derivs(x, us):                    # 返回每车 Q_i, q_i, R_ii, r_i
+    Qs = [np.zeros((nx,nx)) for _ in range(N)]; qs = [np.zeros(nx) for _ in range(N)]
+    Rs = [w_u.copy() for _ in range(N)];        rs = [w_u @ us[i] for i in range(N)]
+    for i in range(N):                          # 各车 "到目标" 代价（自身块）
+        e = x[idx[i]] - goal[i]; Qs[i][idx[i],idx[i]] += w_goal; qs[i][idx[i]] += w_goal @ e
+    p0, p1 = x[idx[0]][:2], x[idx[1]][:2]       # 碰撞 penalty（耦合来源）
+    dvec = p0 - p1; dist = np.linalg.norm(dvec) + 1e-6
+    if dist < d_safe:
+        g = dist - d_safe; dgdp0, dgdp1 = dvec/dist, -dvec/dist
+        for i in range(N):                      # 对双方对称累加（陷阱 3）
+            qs[i][idx[0].start:idx[0].start+2] += w_coll*2*g*dgdp0
+            qs[i][idx[1].start:idx[1].start+2] += w_coll*2*g*dgdp1
+            Qs[i][idx[0].start:idx[0].start+2, idx[0].start:idx[0].start+2] += w_coll*2*np.outer(dgdp0,dgdp0)
+            Qs[i][idx[1].start:idx[1].start+2, idx[1].start:idx[1].start+2] += w_coll*2*np.outer(dgdp1,dgdp1)
+    return Qs, qs, Rs, rs
+\end{codebox}
+
+\noindent 外层迭代把五步串起来（线性化二次化 $\to$ 反向 pass $\to$ 前向 rollout + line search $\to$ 收敛检查），前向 rollout 用反馈律 $u_{i,k}=\bar u_{i,k}-K_{i,k}(x_k-\bar x_k)-\alpha k_{i,k}$ 推进——注意那个 $K_{i,k}(x_k-\bar x_k)$ 项，正是 \cref{sec:rtg-olne-fbne} 反复强调的反馈纠偏项。源笔记报告：对 car0 在 $(-3,0)$、car1 在 $(0,-3)$，$w_{\text{coll}}=50$、$d_{\text{safe}}=1.0$，求解器 $29$ 次迭代收敛，两车自动学会避让、各自抵达目标，两车最小间距 $0.871$；“纳什自检”（固定 car1、对 car0 控制序列做 $20$ 次随机单边扰动）全部 $20/20$ 不优于均衡，符合 Nash 定义 \cref{eq:rtg-nash}\cite{fridovich2020efficient}。\pz{存疑：$29$ 次、$0.871$、$20/20$ 等为源笔记自报的 NumPy 运行结果，未复跑。}
+
+\begin{insight}
+\textbf{纳什自检是判断“是不是 Nash”的金标准.}\;固定其他玩家策略、对自己的控制做随机单边扰动，若有任何一次扰动能降低自己的代价，说明求出的\emph{不是} Nash 均衡——几乎一定是漏了耦合块（陷阱 1）。这个检验把抽象的 Nash 定义 \cref{eq:rtg-nash} 变成一个可执行的断言，应收进任何博弈求解器实现的测试工具箱。
+\end{insight}
+
+\paragraph{软约束的本质局限：penalty 逼近、保证不了。}
+源笔记还做了一个关键实验：把碰撞 penalty 权重 $w_{\text{coll}}$ 从 $50$ 提到 $300$，两车最小间距从 $0.871$ 升到 $0.978$——\emph{仍 $<1.0$，仍轻微侵入安全区}\cite{fridovich2020efficient}。\pz{存疑：$0.978$ 为源笔记自报输出，未复跑。}这不是 bug，而是 \textbf{penalty 软约束的本质局限}：penalty 只在违反约束时加大代价，让违反“变贵”，却\emph{永远不能保证违反不发生}。最优解总停在“违反一点点换取主代价下降”与“penalty 惩罚”的平衡点，于是总侵入一点；再加大权重只能把间距推得更接近 $1.0$（永远差一点），或权重大到 $Q$ 矩阵条件数爆炸、迭代发散。
+
+\begin{insight}
+\textbf{软约束逼近、硬约束保证——这是 ALGAMES 存在的理由.}\;iLQGames 用 penalty 处理碰撞，本质是把“硬约束”软化成“代价项”。好处是简单——直接进二次代价、不破坏耦合 Riccati 的解析结构，故能保持毫秒级实时；代价是\emph{没有保证}——再大的权重也只能逼近 $d_{\text{safe}}$、无法真正满足它。安全关键场景里，“逼近不碰”和“保证不碰”是天壤之别（你不能对监管机构说“我的车有 $97.8\%$ 不撞墙”）。这正是 \cref{sec:rtg-algames} 的 ALGAMES 存在的全部理由：它用增广拉格朗日 + 互补条件\emph{严格}处理硬约束，能把这个 $0.978$ 变成“恰好 $1.0$、一步不越界”——代价是放弃解析 Riccati、换成迭代 KKT 根搜索。
+\end{insight}
+
+\paragraph{均衡选择：初始化决定停在哪个 Nash。}
+博弈均衡可能不唯一——路口“你让我”和“我让你”都是合法 Nash，数学不告诉你选哪个。iLQGames 作为\emph{局部}方法（局部 LQ 近似 + 梯度式迭代），收敛到\emph{离初始名义轨迹最近的}那个局部 Nash。换句话说，\textbf{iLQGames 靠初始化隐式地选均衡}：用“car0 先行”的名义轨迹初始化，多半收敛到 car0 抢行、car1 让的均衡；用“car1 先行”初始化则收敛到对称的另一个。这既是负担（结果依赖初始化、需小心暖启动）也是抓手（可用初始化引导均衡选择——想让车谦让就用谦让轨迹初始化）。\cref{sec:rtg-seibr} 的 SE-IBR 提供更主动的均衡选择机制。
+
+\begin{pitfall}[编程陷阱：把耦合 Riccati 写成 N 个独立的单人 Riccati]
+图省事，在反向递推里对每个玩家单独解一个标准 LQR Riccati，跳过那个块线性系统，相当于把 \verb@M@ 的非对角块 $B_i^\top Z_iB_j\,(i\ne j)$ 置零。后果：求解器跑得通、也“收敛”，但算出的不是 Nash——两车互不避让或避让诡异，纳什自检会失败（单边扰动能改善代价）。\textbf{根本原因}：去掉非对角块 = 假设“每个玩家当其他玩家不存在”，丢掉了博弈耦合（耦合恰来自那些非对角块，它们编码了“玩家 $i$ 的最优依赖玩家 $j$ 的反馈”）。\textbf{正解}：必须组装完整块线性系统（含非对角块）并一次性求解所有玩家的 $K$；用纳什自检验证。
+\end{pitfall}
+
+\begin{pitfall}[编程陷阱：碰撞 penalty 的梯度/Hessian 没正确写进所有玩家的代价]
+碰撞 penalty 是两车位置之差的函数，求导后既影响 car0 的状态块、也影响 car1 的；新手常只把它写进“肇事车”一方的 $q_i/Q_i$，漏掉对方。后果：一方避让、另一方无动于衷（它的代价里没有碰撞项梯度），博弈退化成单边避让、不对称不合理。\textbf{正解}：一般和博弈里碰撞代价对双方都计入（都不想撞），故 penalty 对 $p_0$ 和 $p_1$ 的导数要分别加到\emph{每个}玩家 $q_i$ 的对应状态块（见 \verb@costs_and_derivs@ 里对 \verb@i in range(N)@ 的循环）；可视化轨迹，若只有一方避让就检查 penalty 是否对称进了双方代价。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：以为 iLQGames 收敛到的就是“那个”正确均衡]
+把 iLQGames 输出的 Nash 当成唯一/最优解，不意识到它依赖初始化。后果：换个初始名义轨迹，求解器收敛到不同均衡（car0 让 vs car1 让），结果“不稳定”却找不到原因；需要特定礼让行为的场景里行为不可控。\textbf{根本原因}：iLQGames 是局部方法，收敛到离初始化最近的局部 Nash，而博弈均衡本就可能多个。\textbf{正解}：把初始化当成均衡选择的抓手（想要某种礼让就用体现该行为的轨迹暖启动）；需要更主动选择时用 SE-IBR（\cref{sec:rtg-seibr}）；多均衡场景下跑多个初始化、比较收敛结果是标准稳健性检查。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （实现）把本节的 \verb@lq_game_solve@ 补全外层迭代（线性化、二次化、带 line search 的前向 rollout、收敛检查），构成完整的 2 车 iLQGames。验收：(a) 复现避让行为；(b) 纳什自检通过；(c) 改变碰撞权重，复现间距随权重变化的现象。
+  \item （调试挑战）给你一个 iLQGames 实现，跑出来两车直接对穿、完全不避让。已知动力学和 line search 都正确。列出至少三个可能的 bug 来源（提示：回顾陷阱 1、陷阱 2），并说明各自如何用纳什自检或可视化定位。
+  \item （设计扩展 + 连接 \cref{sec:rtg-olne-fbne}）本节求解器输出反馈律 $u_i=-K_i\delta x-\alpha k_i$。设计实验验证它的“反馈抗扰”：前向 rollout 每步注入小随机扰动（模拟风/打滑），对比“用 $K_i\delta x$ 纠偏”与“只用名义控制（伪开环）”两种执行下的终点误差与最小间距，说明结果如何印证反馈 Nash 优于开环。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{ALGAMES：硬约束的博弈求解器}
+\label{sec:rtg-algames}
+
+\paragraph{动机：安全约束必须“保证”而非“逼近”。}
+兑现 \cref{sec:rtg-ilqgames} 末尾的伏笔——iLQGames 的 penalty 软约束把两车最小间距停在 $0.978<1.0$，永远差一点，且再加权重要么差一点、要么数值病态。对很多场景这够用（“尽量别撞”），但对安全关键应用（自动驾驶的碰撞、机械臂的关节限位、无人机的禁飞区），“逼近不违反”和“保证不违反”是天壤之别。要的是\textbf{硬约束}：$\text{dist}\ge d_{\text{safe}}$ 必须严格成立，一步不让。这就是 ALGAMES 要解决的问题，也是它与 iLQGames 最根本的分工。ALGAMES 论文恰好实测了“靠加大 penalty 逼硬约束”这条路走不通：iLQGames 的解会振荡、无法收敛，即便对其 Riccati 反向 pass 加自适应正则化也依然如此\cite{lecleach2022algames}。\pz{存疑：“iLQGames 解振荡无法收敛”为源笔记转引的 ALGAMES 论文对比结论，待核对。}
+
+\paragraph{历史：从 ALTRO 到 ALGAMES。}
+ALGAMES（Augmented Lagrangian GAME-theoretic Solver）由 Le Cleac'h、Schwager、Manchester 在 RSS 2020 提出，扩展版发表于 \emph{Autonomous Robots} 2022\cite{lecleach2022algames}。其思想根植于单人轨迹优化里成熟的增广拉格朗日方法（如同组的 ALTRO 求解器）——把增广拉格朗日处理约束的能力，从单人最优控制推广到多人博弈。论文的标志性结果：用拟牛顿根搜索满足一阶最优性、用增广拉格朗日严格处理一般非线性状态/输入约束；在三车 ramp merging 场景上比当时最先进的 DDP 方法快约三倍；其 MPC 实现跑在 $60+$\,Hz，能缓解 frozen robot\cite{lecleach2022algames}。\pz{存疑：“快三倍”“$60+$\,Hz”为源笔记转引论文数字，待核对。}
+
+\paragraph{理论：把 GNEP 的 KKT 条件当作根搜索。}
+ALGAMES 与 iLQGames 的本质区别是\emph{求解对象}不同：iLQGames 做 Riccati 反向递推（得反馈 Nash，约束只能 penalty）；ALGAMES 直接求\textbf{广义 Nash 均衡问题（GNEP）的 KKT 条件的根}（得开环 GNE，约束严格）。玩家 $i$ 在共享约束 $g(x,u)\le0$（碰撞、道路边界）下最小化自己的代价 $\min_{u_i}J_i(x,u_i,u_{-i})$ s.t.\ $g(x,u)\le0$。这是\emph{广义} Nash 问题——“广义”指约束 $g$ 被所有玩家\emph{共享}（碰撞约束同时约束双方），玩家的可行域相互依赖，比标准 Nash 更难。玩家 $i$ 的一阶最优性 + 原始可行 + 对偶可行 + 互补松弛构成 KKT 条件：
+
+\begin{definition}[GNEP 的 KKT 条件]\label{def:rtg-gnep-kkt}
+玩家 $i$ 在共享约束 $g(x,u)\le0$ 下的最优解满足
+\begin{equation}
+  \nabla_{u_i}J_i+\nabla_{u_i}g^\top\lambda_i=0,\qquad g(x,u)\le0,\qquad \lambda_i\ge0,\qquad \lambda_i^\top g=0.
+  \label{eq:rtg-gnep-kkt}
+\end{equation}
+\end{definition}
+
+\noindent 最后那个 $\lambda_i^\top g=0$ 是\textbf{互补松弛}：约束不起作用（$g<0$）时乘子为零（$\lambda_i=0$），约束起作用（$g=0$，恰好贴着安全边界）时乘子可正。这正是“硬约束”的数学刻画——它精确区分“没碰边界”和“贴着边界”，而 penalty 做不到。
+
+\begin{insight}
+\textbf{互补松弛为什么能做到 penalty 做不到的事.}\;互补松弛 $\lambda_i^\top g=0$ 把约束分成泾渭分明的两类：\emph{不起作用的}（离边界还远，乘子为零、对最优解无影响）和\emph{起作用的}（恰好贴在边界上，乘子顶住它）。对比 penalty——它把约束软化成 $\tfrac{\rho}{2}\max(0,g)^2$，对“离边界多远”连续响应，最优解总停在“罚款边际 = 收益边际”那一点，而这点几乎总在 $g>0$ 一侧一点点（侵入），因为只要还能通过轻微违反换取主代价下降，penalty 就会允许——这就是 $0.978$ 的来历。互补松弛则通过乘子 $\lambda$ 提供一个\emph{精确顶在边界上的力}（约束的“影子价格”），让一阶条件 $\nabla_{u_i}J_i+\nabla_{u_i}g^\top\lambda_i=0$ 成立、使最优解\emph{恰好}落在 $g=0$ 上。增广拉格朗日的外层迭代干的就是把这个 $\lambda$ 迭代出来：从猜测出发，每轮按约束违反量更新 $\lambda\leftarrow\max(0,\lambda+\rho g)$、并增大 $\rho$，$\lambda$ 逐步收敛到“恰好顶住边界”的影子价格。关键区别：纯 penalty 的最优解随 $\rho\to\infty$ 才趋于边界（且病态），AL 在\emph{有限} $\rho$ 下靠 $\lambda$ 收敛就能让解恰好落在边界上——$\lambda$ 承担“精确定位”，$\rho$ 只需保证迭代稳定。这就是为什么 AL 能做到“恰好 $1.0$”而 penalty 永远 $0.978$。
+\end{insight}
+
+\paragraph{求解策略与实现。}
+ALGAMES 把\emph{所有}玩家的 KKT 条件 \cref{eq:rtg-gnep-kkt} 堆叠成一个大的非线性方程组 $G(z)=0$（$z$ 含所有玩家的控制、状态、乘子），然后用\textbf{拟牛顿法}求根（每步解一个线性系统/牛顿步）、用\textbf{增广拉格朗日}处理不等式约束（外层迭代更新乘子 $\lambda$ 和惩罚 $\rho$）。下面给一个简化的对称 GNE 实现，碰撞约束 $c_k=d_{\text{safe}}-\text{dist}_k\le0$ 由增广拉格朗日处理（而非 penalty）：
+
+\begin{codebox}[Python]{增广拉格朗日硬约束求解器（简化对称 GNE）}
+import numpy as np
+from scipy.optimize import minimize
+dt, T, N, d_safe = 0.2, 20, 2, 1.0
+goal = [np.array([4,0]), np.array([0,4])]
+x0_list = [np.array([-3.,0,0,1.0]), np.array([0,-3.,np.pi/2,1.0])]
+
+def rollout_i(x0i, ui_seq):
+    xs = [x0i.copy()]
+    for k in range(T):
+        px, py, th, v = xs[-1]; om, a = ui_seq[k]
+        xs.append(xs[-1] + dt*np.array([v*np.cos(th), v*np.sin(th), om, a]))
+    return np.array(xs)
+
+def unpack(z): return z[:2*T].reshape(T,2), z[2*T:].reshape(T,2)
+
+def constraints_vec(z):                              # c_k = d_safe - dist_k (<=0 即满足)
+    u0, u1 = unpack(z); X0, X1 = rollout_i(x0_list[0],u0), rollout_i(x0_list[1],u1)
+    return np.array([d_safe - np.linalg.norm(X0[k][:2]-X1[k][:2]) for k in range(T+1)])
+
+def player_costs(z):                                 # 到目标 + 控制能耗（碰撞由 AL 约束处理）
+    u0, u1 = unpack(z); X0, X1 = rollout_i(x0_list[0],u0), rollout_i(x0_list[1],u1)
+    J0 = np.sum((X0[-1][:2]-goal[0])**2) + 0.05*np.sum(u0**2) + 0.02*np.sum((X0[:,:2]-goal[0])**2)
+    J1 = np.sum((X1[-1][:2]-goal[1])**2) + 0.05*np.sum(u1**2) + 0.02*np.sum((X1[:,:2]-goal[1])**2)
+    return J0, J1
+
+def al_solve():
+    z = np.zeros(4*T); lam = np.zeros(T+1); rho = 1.0
+    for outer in range(12):                          # 外层乘子迭代
+        def auglag(z):
+            J0, J1 = player_costs(z); c = constraints_vec(z); al = 0.0
+            for k in range(T+1):                     # 不等式约束的 AL（Hestenes-Powell）
+                al += (lam[k]*c[k] + 0.5*rho*c[k]**2) if (lam[k] + rho*c[k] > 0) else (-0.5*lam[k]**2/rho)
+            return J0 + J1 + al
+        z = minimize(auglag, z, method='L-BFGS-B', options={'maxiter':200}).x
+        c = constraints_vec(z)
+        lam = np.maximum(0, lam + rho*c)             # 乘子更新 <- 关键：lam 收敛到影子价格
+        rho *= 2.0                                    # 惩罚递增
+    return z
+\end{codebox}
+
+\noindent 关键就在 \verb@lam = np.maximum(0, lam + rho*c)@ 这行——它让 $\lambda$ 逐步收敛到精确顶住边界的影子价格。与 \cref{sec:rtg-ilqgames} 的 penalty 代码对比：那里把碰撞写进二次代价（软惩罚），这里把碰撞从代价里拿出来、交给约束 + AL 外层严格处理——这一处代码差异，就是 $0.978$ 和 $1.0000$ 的全部来源。源笔记报告：对\emph{完全相同}的 2 车场景，ALGAMES 把最小间距从 $0.978$ 推到 $1.0000$，最大约束违反仅 $\sim4\times10^{-6}$（机器精度，等价于严格满足），两车仍都抵达目标\cite{lecleach2022algames}。\pz{存疑：$1.0000$ / $4\times10^{-6}$ 为源笔记自报输出，未复跑；且该实现为简化对称 GNE（联合目标 + Hestenes--Powell 不等式 AL），真实 Algames.jl 对每玩家 KKT 分别处理、用拟牛顿求根，仅“AL 把约束逼到严格满足”的核心机制一致。}
+
+\begin{table}[H]\centering\small
+\caption{iLQGames vs ALGAMES 的六维对比}
+\label{tab:rtg-ilq-vs-alg}
+\begin{tabular}{p{0.2\textwidth} p{0.36\textwidth} p{0.34\textwidth}}
+\toprule
+维度 & iLQGames & ALGAMES \\
+\midrule
+均衡类型 & 反馈 Nash & 开环 GNE（广义 Nash） \\
+信息结构 & 反馈（策略依赖当前状态 $x$） & 开环（策略仅依赖初始状态） \\
+抗扰能力 & 强（$K$ 自动纠偏） & 弱（需高频 MPC 补偿） \\
+约束处理 & 弱（penalty 软约束，$0.978<1.0$） & 强（AL + 互补，严格满足 $1.0$） \\
+每步子问题 & 耦合 Riccati（解析，一次反向 pass） & 拟牛顿根搜索（迭代解 KKT 线性系统） \\
+求解速度 & 毫秒级（滚动时域 $<50$\,ms） & $60+$\,Hz（比 DDP 快 $3\times$，但慢于 iLQGames） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 核心权衡：\textbf{iLQGames 强在“反馈 + 快”、弱在“约束”；ALGAMES 强在“约束严格”、弱在“开环（需 MPC 补偿）+ 相对慢”。}两者不是谁取代谁，而是互补（\cref{sec:rtg-selection} 给选型）。
+
+\begin{insight}
+\textbf{两条路 $\leftrightarrow$ 优化里的两大约束处理范式.}\;iLQGames 和 ALGAMES 的分野，是数值优化里两大约束处理范式在博弈语境的投影。单人最优控制里也有这对：DDP/iLQR（把约束 penalty 进代价、做 Riccati）vs 直接法 + SQP/内点（把约束显式交给 NLP 求解器）。iLQGames 继承前者、ALGAMES 继承后者。博弈把“一个优化”变成“耦合的多个优化求不动点”，于是 iLQGames 的 Riccati 变成耦合 Riccati、ALGAMES 的 KKT 变成 GNEP 的堆叠 KKT。一句话：\textbf{若你熟悉单人轨迹优化里 “DDP vs 直接法+SQP” 的取舍，就已经理解了 iLQGames vs ALGAMES 的取舍——博弈只是给两者各加了一层玩家耦合。}
+\end{insight}
+
+\begin{pitfall}[概念误区：以为 ALGAMES 的开环 GNE 不需要 MPC 就能上车]
+看到 ALGAMES 严格满足约束，就以为它的开环解可以直接部署、不用配 MPC。后果：开环解在仿真完美（严格满足约束），上实车后扰动让状态偏离名义轨迹，开环序列不纠偏，约束在实际执行中被违反——“严格满足”只在名义轨迹上成立。\textbf{根本原因}：ALGAMES 的约束严格性针对\emph{名义轨迹}；它输出开环策略，本身不含反馈纠偏，实际状态一偏，名义轨迹上的约束保证就不再适用。\textbf{正解}：ALGAMES 必须配高频 MPC（论文的 $60+$\,Hz 正是为此）——每拍用当前实际状态重解，让高频重规划逼近反馈、并在新状态上重新保证约束（即 \cref{sec:rtg-olne-fbne} 的“开环 + MPC = 准反馈”）。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：在不需要硬约束的场景盲目上 ALGAMES]
+觉得 ALGAMES “约束更严格、更高级”，所有场景都用它、弃用 iLQGames。后果：在“尽量避免碰撞”就够用的场景（开阔区域多车协调），付出了 ALGAMES 更慢、需配 MPC、实现更复杂的代价，却没用上硬约束的好处，还丢了 iLQGames 反馈解的抗扰优势。\textbf{根本原因}：硬约束不是免费的——AL 的外层乘子迭代比一次 Riccati 慢，开环解还需 MPC 补偿抗扰。\textbf{正解}：按需选型（\cref{sec:rtg-selection}）——安全关键、约束必须严格 $\to$ ALGAMES；要反馈抗扰、约束“尽量满足”即可、要极致速度 $\to$ iLQGames；很多系统甚至两者结合（iLQGames 出反馈 + 安全滤波兜底硬约束）。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （对比实验）用 \verb@Algames.jl@ 复现一个 3 车 ramp merging，并用 \cref{sec:rtg-ilqgames} 的 iLQGames 求解同一场景。定量对比：(a) 约束满足精度（最小车间距 vs 安全距离，验证 ALGAMES 严格、iLQGames 侵入）；(b) 单次求解时间；(c) 轨迹差异（开环 GNE vs 反馈 Nash）。
+  \item （概念推导）写出 2 车碰撞约束 $\text{dist}\ge d_{\text{safe}}$ 的 KKT 条件 \cref{eq:rtg-gnep-kkt} 的具体形式（含互补松弛）。解释：两车相距很远（约束不起作用）时乘子 $\lambda$ 是多少？恰好贴着安全距离时呢？这个互补关系如何让 ALGAMES 做到“恰好 $1.0$”而 penalty 做不到？
+  \item （设计 + 连接 \cref{sec:rtg-olne-fbne,sec:rtg-selection}）为真实车设计博弈规划模块，要求：(a) 与人类车交互不僵住；(b) 严格不违反碰撞约束；(c) 对扰动鲁棒。单用 iLQGames 或单用 ALGAMES 各自缺什么？设计一个结合两者优点的方案并论证。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{SE-IBR：灵敏度增强的迭代最佳响应}
+\label{sec:rtg-seibr}
+
+\paragraph{动机：竞速要的不只是“避撞”，而是“封堵”。}
+回到 \cref{tab:rtg-concept-pick} 第三行那条“中间道路”——交互对等（Nash），但你想要类似 leader 的引导效果。竞速最典型：要赢得多机竞速，光会沿赛道最优行驶、避免碰撞还不够，你得像人类赛车手那样\emph{策略性封堵}（blocking，卡住对手超车线）、\emph{佯动}、伺机超车。这些都不是单纯避撞能产生的——避撞是“别撞上”，封堵是“主动占住对手想去的位置”。标准博弈求解器（iLQGames、纯 IBR）会算出一个 Nash，但当存在多个 Nash 时不会刻意选“封堵对手”的那个。SE-IBR 要补的就是这个能力：\textbf{在 Nash 框架内，主动选择倾向封堵对手的均衡}。
+
+\paragraph{反面：标准 IBR 为什么封堵不了。}
+标准 IBR（Iterated Best Response，迭代最佳响应）是求 Nash 的朴素方法：固定其他玩家策略，求自己的最优响应；更新；轮到下一个玩家固定别人求自己最优；交替直到没人想改变——收敛到一个 Nash。它的问题在于\emph{没有均衡选择能力}：当博弈有多个 Nash（竞速中“我封堵你”和“你封堵我”可能都是 Nash），IBR 收敛到哪个完全取决于初始化和迭代顺序，不会刻意挑对自己最有利（封堵对手）的那个。更本质的是，标准 IBR 求自己最优响应时把对手策略当\emph{完全固定}——它没建模“我这么走，会逼得对手不得不让”（这正是 \cref{sec:rtg-concept} Nash 的局限：对手策略外生固定）。结果是它把竞争对手当成了一个会避让的移动障碍，而非一个可以被你走位逼退的对手。
+
+\paragraph{历史：Spica 的无人机竞速。}
+SE-IBR（Sensitivity-Enhanced Iterated Best Response）由 Spica、Falanga、Cristofalo、Montijano、Scaramuzza、Schwager 在 RSS 2018 提出\cite{spica2020realtime}。论文开宗明义点出竞速的本质：要成功，玩家必须不仅最优沿赛道行驶，还要通过策略性封堵、佯动、伺机超车与对手竞争，同时避免碰撞；且因不愿向对手暴露策略，每个玩家必须独立预测对手的未来动作。关键创新是在迭代最佳响应中引入\emph{灵敏度分析}——用一个灵敏度项近似“对手会为避免碰撞而对 ego 让步多少”，从而实时逼近 Nash 并产生封堵行为。后续 Wang、Taubner、Schwager 将其扩展到多智能体 3D 环境，Wang 等进一步在 Stanford 的 Audi TTS 实车上用自行车模型 + 微分平坦做多车竞速验证（T-RO 2021）\cite{wang2021gametheoretic}，把博弈竞速从仿真推到真实赛车。
+
+\paragraph{理论：灵敏度项如何制造封堵。}
+标准 IBR 里玩家 $i$ 在对手策略 $u_{-i}$ 固定时最小化 $J_i(u_i,u_{-i})$（$u_{-i}$ 视为常量——这就是它不封堵的根源）。SE-IBR 的核心：ego 不再把对手当固定的，而是建模“对手最优响应会随 ego 策略而变”，即把对手响应 $u_{-i}^*(u_i)$ 看成 ego 策略的函数（这正是 \cref{sec:rtg-concept} Stackelberg 的精神，但放在 IBR 迭代里近似实现），并在代价里加一个\textbf{灵敏度项}：
+\begin{equation}
+  J_i^{\mathrm{SE}}(u_i)=J_i\big(u_i,\,u_{-i}^*(u_i)\big)+\alpha\cdot\frac{\partial J_i}{\partial u_{-i}}\cdot\frac{\partial u_{-i}^*}{\partial u_i}.
+  \label{eq:rtg-seibr-cost}
+\end{equation}
+第一项是常规代价（但对手响应已是 $u_i$ 的函数）；第二项是灵敏度项——$\alpha$ 是权重，$\partial u_{-i}^*/\partial u_i$ 是对手最优响应对 ego 策略的灵敏度，刻画“ego 动一点，对手会让多少”。直觉：这一项鼓励 ego 选那些能\emph{最大程度逼对手让步}的走位——也就是封堵。
+
+\paragraph{灵敏度怎么算：KKT 隐函数定理。}
+关键技术难点是计算 $\partial u_{-i}^*/\partial u_i$。对手的最优响应 $u_{-i}^*$ 是它自己优化问题的解，满足它的 KKT 条件 $G(u_{-i}^*,\,u_i)=0$（$G$ 是对手一阶最优性条件，依赖 ego 的 $u_i$ 作为参数）。对这个隐式方程用\textbf{隐函数定理}求导：
+\begin{equation}
+  \frac{\partial G}{\partial u_{-i}}\cdot\frac{\partial u_{-i}^*}{\partial u_i}+\frac{\partial G}{\partial u_i}=0
+  \ \Longrightarrow\
+  \frac{\partial u_{-i}^*}{\partial u_i}=-\Big(\frac{\partial G}{\partial u_{-i}}\Big)^{-1}\frac{\partial G}{\partial u_i}.
+  \label{eq:rtg-seibr-sensitivity}
+\end{equation}
+也就是说，灵敏度由对手 KKT 系统的雅可比（$\partial G/\partial u_{-i}$，即对手最优性条件的 Hessian）和它对 ego 参数的偏导算出。\textbf{这个隐函数求导技巧，和 \cref{sec:rtg-inverse} 的逆博弈“对均衡求导”是同一套数学——记住它，后面会反复出现。}
+
+\begin{insight}
+\textbf{SE-IBR = 在 Nash 框架内借一点 Stackelberg.}\;SE-IBR 处在 Nash 和 Stackelberg 之间一个巧妙的位置。纯 Nash（标准 IBR）把对手当固定——不封堵；纯 Stackelberg 把对手当完全可塑造的 follower——但要求 ego 真的是 leader（有先手、对手乖乖响应）。竞速里没有明确 leader（双方对等、同时决策），用不了纯 Stackelberg；但你又想要封堵这种“塑造对手”的效果。SE-IBR 的解法：保持 IBR 的对等迭代结构（仍在求 Nash），但通过灵敏度项 $\partial u_{-i}^*/\partial u_i$ 局部地建模“对手会让步”——相当于在每步最优响应里偷偷用了一点 Stackelberg 的“我动你让”。权重 $\alpha$ 是旋钮：$\alpha=0$ 退回标准 IBR（纯 Nash、不封堵），$\alpha$ 越大越激进封堵（越像 leader）。一句话：\textbf{SE-IBR 用一个灵敏度项，在对等的 Nash 框架里挤出近似 Stackelberg 的封堵能力——这正是 \cref{tab:rtg-concept-pick} 第三行那条中间道路的数学实现。}
+\end{insight}
+
+\paragraph{算法对照：SE-IBR 只比标准 IBR 多一步。}
+把两套迭代并排看，能看清 SE-IBR 的“增量”到底在哪——它不是另起炉灶的新算法，而是在标准 IBR 的最优响应里插了一个灵敏度修正：标准 IBR 每轮对每个玩家“固定对手（常量）$\to$ $u_i\leftarrow\arg\min J_i(u_i,u_{-i})$”；SE-IBR 每轮对每个玩家“① 算对手响应 $u_{-i}^*(u_i)$ $\to$ ② 算灵敏度 $\partial u_{-i}^*/\partial u_i$（KKT 隐函数）$\to$ ③ $u_i\leftarrow\arg\min[J_i+\alpha\cdot$灵敏度项$]$”。除步骤 ①②③ 外迭代骨架完全一样，故把已有标准 IBR 升级成 SE-IBR 只需加灵敏度项的计算与代价修正、不必重写迭代框架。源笔记给出一个单步标量博弈的可见效果：$x=u_e+u_o$，ego 想让 $x\to1$、opp 想让 $x\to0$，灵敏度 $\partial u_o^*/\partial u_e=-1/1.1\approx-0.909$；$\alpha=0$（标准 IBR）时 ego 控制 $0.840$，$\alpha=1.0$ 时增到 $1.603$——灵敏度项让 ego 更激进地施加控制去克服对手的对抗（因为它“看到”自己每加一分力、对手会让步）\cite{spica2020realtime}。\pz{存疑：$0.840$/$1.603$/$-0.909$ 为源笔记自报的玩具模型输出，未复跑；且真实赛道封堵需完整赛道几何 + 自行车模型 + 微分平坦才能复现，对称玩具模型观察不到明显封堵。}
+
+\begin{pitfall}[编程陷阱：灵敏度项里 KKT 雅可比奇异/病态时直接求逆]
+算 $\partial u_{-i}^*/\partial u_i=-(\partial G/\partial u_{-i})^{-1}\partial G/\partial u_i$ 时，直接对 $\partial G/\partial u_{-i}$ 求逆、不检查它是否奇异或病态。后果：当对手最优性条件 Hessian 接近奇异（约束退化、对手问题非严格凸），求逆得到爆炸的灵敏度，ego 策略剧烈震荡甚至发散。\textbf{根本原因}：隐函数定理要求 $\partial G/\partial u_{-i}$ 可逆；对手优化问题病态时这个雅可比奇异，求逆数值上不可靠。\textbf{正解}：用 \verb@np.linalg.solve@ 而非显式求逆；对病态情形加正则化（$\partial G/\partial u_{-i}+\epsilon I$）或用伪逆；对灵敏度项做幅值裁剪防单步过大；监控雅可比条件数。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：把灵敏度权重 $\alpha$ 调得越大越好]
+认为 $\alpha$ 越大封堵越强、竞速越有利，于是调到很大。后果：$\alpha$ 过大时 ego 过度激进封堵、忽视自身进展和避撞，要么被对手绕过、要么逼出危险接近；灵敏度项主导代价后求解也容易不收敛。\textbf{根本原因}：灵敏度项是“塑造对手”的奖励，但它与“自身最优进展”“避撞”是竞争关系，$\alpha$ 过大破坏平衡；且灵敏度本身是局部线性近似，大 $\alpha$ 放大近似误差。\textbf{正解}：把 $\alpha$ 当需调校的超参数，从小值起步逐步增大，在“封堵强度”与“自身进展/安全/收敛性”间折中，取拐点附近的值。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （实现对比）对 2 机无人机竞速（可用 2D 单积分器 + 一段有弯道的赛道），实现标准 IBR 和 SE-IBR。对比：(a) SE-IBR 是否更倾向 blocking（ego 是否更多占据对手前方）；(b) 灵敏度权重 $\alpha$ 从 $0$ 增大时封堵强度和竞速胜率如何变；(c) $\alpha$ 过大时是否出现震荡。注意需用带弯道的赛道才易观察到封堵。
+  \item （推导 + 连接 \cref{sec:rtg-inverse}）推导灵敏度 $\partial u_{-i}^*/\partial u_i$ 的隐函数定理表达式 \cref{eq:rtg-seibr-sensitivity}：从对手 KKT 条件 $G(u_{-i}^*,u_i)=0$ 出发对 $u_i$ 求全导。说明这个“对均衡/最优解求导”的技巧与 \cref{sec:rtg-inverse} 逆博弈的联系。
+  \item （概念 + 连接 \cref{sec:rtg-concept}）SE-IBR 被描述为“在 Nash 框架内实现近似 Stackelberg 的封堵”。对照 Nash \cref{eq:rtg-nash} 和 Stackelberg \cref{eq:rtg-stack-bilevel} 定义，论证：(a) 为什么竞速用不了纯 Stackelberg（谁是 leader）；(b) SE-IBR 的灵敏度项 \cref{eq:rtg-seibr-cost} 如何“借用”了 Stackelberg 的 $u_F^*(u_L)$ 思想；(c) $\alpha=0$ 时为什么退回纯 Nash。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{GFNE 与 DG-SQP：理论统一与工业级求解}
+\label{sec:rtg-frontier}
+
+\paragraph{动机：前几代求解器的短板拼图。}
+把 \cref{sec:rtg-ilqgames,sec:rtg-algames,sec:rtg-seibr} 的方法摆在一起，会发现一块缺失的拼图：iLQGames 给反馈 Nash（抗扰强），但约束只能 penalty（$0.978<1.0$）；ALGAMES 给严格约束，但输出开环 GNE（需 MPC 补偿抗扰）。两个最想要的性质——\emph{反馈信息结构}（抗扰）和\emph{严格约束满足}（安全）——分别被两套方法各占一半，没有一套同时拥有。这不是偶然，而是因为“反馈 + 约束”的数学本身就难：反馈策略是状态的函数，约束又依赖状态和所有玩家的控制，把两者严格统一需要处理一层套一层的隐式依赖。本节讲两个最新进展：GFNE（理论统一反馈 + 约束）和 DG-SQP（工业级 SQP 稳健求解）。本节偏研究级，时间紧可先速读，掌握“它们各补了前几代什么短板”即可。
+
+\paragraph{GFNE：把反馈 Nash 推广到带约束的博弈。}
+广义反馈 Nash 均衡（Generalized Feedback Nash Equilibrium, GFNE）由 Laine、Fridovich-Keil、Chiu、Tomlin 在 \emph{SIAM J. Optim.} 2023 提出\cite{laine2023computation}。名字拆开看就懂定位：“Feedback Nash”——要反馈均衡（像 iLQGames，策略依赖状态、抗扰）；“Generalized”——要处理状态/输入\emph{约束}（像 ALGAMES 的“广义” Nash，约束共享）；合起来 \textbf{GFNE = 反馈 Nash + 严格约束}，正好是缺失的拼图。论文把反馈 Nash 概念推广到玩家受状态/输入约束的博弈，在轨迹层面形式化了（局部）GFNE 解的必要与充分条件。\textbf{核心难点是嵌套的隐式导数}：求解 GFNE 的必要条件一般需要计算一系列嵌套的、隐式定义的导数，很快变得难以处理。直觉上，反馈博弈里玩家 $i$ 在每个时刻的最优反馈，依赖“未来所有时刻其他玩家的反馈如何随状态变化”——这本身又依赖更未来的反馈，一层套一层；加上约束后每一层还要处理约束的隐式依赖，嵌套迅速爆炸。这正是 \cref{sec:rtg-seibr} 那个 $\partial u_{-i}^*/\partial u_i$ 隐函数求导的“多时刻、带约束”加强版。GFNE 的破解之道是\emph{近似}——引入对必要条件的近似使其便于高效求值，再用牛顿式方法（SLQG，Sequential Linear-Quadratic Games，每步解一个\emph{约束} LQ 博弈/一次 LCP）求解，思想上是 iLQGames“反复解 LQ 博弈”的带约束版本。
+
+\begin{insight}
+\textbf{GFNE = iLQGames 的骨架 + ALGAMES 的约束处理.}\;GFNE 保留 iLQGames 的“反复解 LQ 博弈”骨架（所以输出反馈、保留抗扰），又把 ALGAMES 的“严格约束 + 互补条件”塞进每步的 LQ 博弈（所以约束严格），代价是每步子问题从“解析的耦合 Riccati”升级成“带约束的 LQ 博弈（LCP）”——比 Riccati 贵，且必要条件要用近似才算得动。它是博弈求解理论统一方向的里程碑，但计算代价和实现复杂度也最高，尚无 iLQGames 那样成熟的高频实时部署。
+\end{insight}
+
+\paragraph{DG-SQP：把博弈求解做成工业级 SQP。}
+DG-SQP（Dynamic Game SQP）由 Zhu 与 Borrelli 提出（UC Berkeley MPC Lab，赛车版 2024）\cite{zhu2024dgsqp}。它求解开环一般和动态博弈的局部 GNE（和 ALGAMES 同属开环阵营），但走经典数值优化里最成熟的一条路——\textbf{序贯二次规划（SQP）}：每次迭代只需求解一个凸二次规划（QP）。贡献不在“用 SQP”本身，而在三个让它在博弈语境下稳健收敛的工程设计：\emph{非单调线搜索}（求解 KKT 方程时不强求每步 merit 函数单调下降，允许暂时上升以跳出局部停滞）、\emph{处理零和代价的 merit 函数}（博弈里玩家代价可能此消彼长，普通 merit 函数会失效）、\emph{衰减正则化}（SQP 步加正则化保证 QP 子问题良态，并随迭代衰减以不损害最终精度）。论文证明该方法在局部 GNE 邻域达到线性收敛。\textbf{它的卖点不是“更快”，而是“更可靠”}：在 head-to-head 赛车场景下，用一种近似 Frenet 表述时，DG-SQP 相比基于混合互补问题（MCP）的 PATH 求解器成功率显著提升（论文报告最多达 $32\%$）\cite{zhu2024dgsqp}。\pz{存疑：“成功率最多提升 $32\%$”为源笔记转引数字，且强调是“近似 Frenet 表述下”而非全面碾压 PATH，待核对原文。}对工程部署而言，“$95\%$ 的情况能解出来”和“$60\%$ 能解出来”是天壤之别——这正是 DG-SQP 把博弈求解推向工业级的意义。
+
+\begin{insight}
+\textbf{开环 GNE = 混合互补问题（MCP）.}\;把 ALGAMES、DG-SQP、PATH 这几套开环求解器真正统一起来的，是一个深刻观察：\emph{开环动态博弈求 GNE，可以表述成一个混合互补问题（MCP）}。回顾 KKT 条件 \cref{eq:rtg-gnep-kkt}：每个玩家的一阶最优性（等式）+ 互补不等式（$\lambda\ge0,g\le0,\lambda^\top g=0$）合在一起，正是 MCP 的标准形式。于是“求开环 GNE”就等价于“解这个 MCP”，而 MCP 是运筹学研究了几十年的成熟问题。这个统一视角立刻解释了为什么 PATH 求解器（运筹学求解 MCP 的通用工具）能直接拿来解博弈的 GNE（DG-SQP 拿它当对比基线正因二者解同一个 MCP），以及为什么这些方法都面临收敛性挑战（MCP 一般非凸、可能多解或无解）。注意这条 MCP 视角主要适用于\emph{开环} GNE；反馈 GFNE 因嵌套隐式导数，结构比 MCP 更复杂，不能简单归约。
+\end{insight}
+
+\paragraph{前沿（选读）。}
+博弈求解仍在快速演进，几个方向（部分工作较新，细节以原文为准）：\textbf{Contingency Games}（Peters 等，2024）把博弈与分支规划融合——在均衡中加入一段共享“干”轨迹 + 针对对手不同意图的“分支”，处理“对手意图不确定”\cite{peters2024contingency}；\textbf{MaxEnt Multi-Agent Dynamic Games}（Mehr、Schwager 等，T-RO 2023）用 softmax Bellman 处理有界理性，让正向求解与逆向求解（\cref{sec:rtg-inverse}）统一\cite{mehr2023maximum}；\textbf{Implicit GT-MPC} 把离线训练的 GNE 数据学成值函数当 MPC 终端代价，用离线学习换在线计算。\textbf{三个贯穿全章的根本挑战}：\emph{全局性}（所有方法都是基于梯度/牛顿的局部方法，依赖好的初始化，无全局最优保证）、\emph{均衡选择}（多 Nash 时选哪个仍是设计决策）、\emph{模型不确定}（对手代价/意图未知或有界理性）。本章的演进可看成对这三者的逐步进攻，但没有一个方法同时解决三者——这既是博弈规划尚未成熟的标志，也是它仍是活跃研究领域的原因。
+
+\begin{practice}
+\begin{enumerate}
+  \item （概念对比）精读 GFNE（Laine et al.\ SIOPT 2023）摘要与算法部分。回答：(a) GFNE 相比 iLQGames 多处理了什么、相比 ALGAMES 多保留了什么？(b) “嵌套的隐式导数”难在哪、为何需要近似？(c) SLQG 每步解的“约束 LQ 博弈”与 iLQGames 每步的“无约束耦合 Riccati”差在哪？把三套方法的每步子问题并排列出。
+  \item （综合思考）本章五套方法（iLQGames、ALGAMES、SE-IBR、GFNE、DG-SQP）都是\emph{局部}方法。论证：(a) 为什么局部性是这些基于梯度/牛顿的方法的固有限制；(b) 前沿工作（Contingency、MaxEnt Games）各从什么角度部分缓解了挑战；(c) 如果让你设计下一代求解器，你会优先攻克全局性还是均衡选择？为什么？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{逆博弈：从行为反推代价}
+\label{sec:rtg-inverse}
+
+\paragraph{动机：你不知道对手想要什么。}
+前面所有求解器都有一个\emph{致命的隐含前提}——它们都假设\textbf{对手的代价函数已知}。iLQGames 要你写出对手的 $\ell_j$，ALGAMES 要你知道对手的约束，SE-IBR 要对对手的优化问题求灵敏度。可现实里，路口那辆车想直行还是右转、对向司机激进还是谦让、行人会不会突然加速——这些\emph{对手的真实意图和偏好恰恰是未知的}。你能观测到的只有对手的\emph{行为}（他的车开过的轨迹）。于是问题反过来了：\textbf{能不能从观测到的轨迹，反推出产生这条轨迹的代价函数？}这就是\textbf{逆博弈（inverse game）}。正向博弈是“给定代价求均衡轨迹”（前面做的事），逆博弈是“给定均衡轨迹反推代价”——方向恰好相反。这也是把对手当决策者后尚未兑现的最后一跨：从“代价已知”到“代价需推断”。
+
+\paragraph{反面：为什么不能“直接拟合一个预测器”。}
+一个看似省事的替代：既然要预测对手轨迹，那我干脆收集一堆对手轨迹数据，训练一个神经网络预测器（输入历史、输出未来），不就绕过“推断代价”了吗？这正是传统“先预测后规划”管线的做法，它有两个根本问题（\cref{sec:rtg-pred-eq} 详谈）：其一，\emph{预测不考虑 ego 的影响}——独立训练的预测器把对手轨迹当成与 ego 无关的量来预测（学的是“对手过去怎么走、未来就怎么走”），但真实交互里对手会对 ego 反应（你逼近，他让；你退让，他抢），一个不考虑 ego 影响的预测器预测的是“对手在你不存在时会怎么走”，这直接导致 frozen robot；其二，\emph{预测器是黑箱、不可解释、不可外推}——神经网络学到的是轨迹统计模式而非对手意图，换个没见过的场景就失效，且你无法问它“对手到底想要什么”。逆博弈的不同在于：它推断的是对手的\textbf{代价函数（意图）}而非直接预测轨迹——代价函数是一个\emph{紧凑、可解释、可外推}的对手模型，一旦推断出“这个司机很激进、不在乎安全距离”，就能用正向求解器预测他在\emph{任何}新场景下的行为，且这个预测天然考虑了 ego 影响（因为它来自博弈均衡）。
+
+\paragraph{历史：从 Sadigh 的 IRL 到 Peters 的逆博弈。}
+推断对手代价的思想最早可追溯到 \cref{sec:rtg-concept} 的 Sadigh 2016——它用逆强化学习（IRL）从人类轨迹学奖励\cite{sadigh2016planning}。但 Sadigh 的 IRL 是\emph{单边}的：它学人类一方的奖励、把机器人当 Stackelberg leader。把它严格化、一般化到\emph{多智能体联合推断}的，是 Peters、Fridovich-Keil、Rubies-Royo、Tomlin、Stachniss 在 RSS 2021 的工作（扩展版 IJRR 2023）——逆博弈范式的奠基\cite{peters2021inferring}。其核心创新是把“推断代价”和“博弈均衡”\emph{耦合}起来：Sadigh 的 IRL 单独学人类奖励、把机器人当 leader；Peters 的逆博弈把\emph{所有玩家}（不分 leader/follower）的代价参数放在一起推断，并要求“推断出的代价所对应的 Nash 均衡，要能解释观测到的所有轨迹”。关键词是\textbf{耦合}——不是各学各的，而是通过“观测轨迹必须是某个 Nash 均衡”这个约束把所有玩家的代价绑在一起联合求解。这比单边 IRL 更贴近真实多车交互（路口每辆车都在对其他车反应，没有谁天然是 leader）。这条线后来枝繁叶茂：LUCIDGames（在线 UKF 逆博弈）、MaxEnt Games（有界理性）等都建在 Peters 2021 的“可微博弈 + 推断代价”地基上。
+
+\begin{insight}
+\textbf{逆博弈 $\leftrightarrow$ 心智理论（Theory of Mind）.}\;逆博弈在做的事，和认知科学里的\emph{心智理论}（人类推断他人信念、欲望、意图的能力）惊人地相似。人开车时本能地“读”其他司机的意图（那辆车想并道、这个行人要过街），据此调整自己的行为——这正是从他人\emph{行为}推断其\emph{意图}，与逆博弈从轨迹反推代价同构；代价函数就是机器版的“欲望/意图”。不同之处：人的心智理论是快速、直觉、隐式的（一瞥就知道对方想干嘛），逆博弈是显式、数学化的（写出 MLE、解优化）。一句话：\textbf{逆博弈是给机器人装上“心智理论”——让它能从他人行为读出他人意图，这是安全交互的认知前提。}这个类比也解释了为什么 \cref{sec:rtg-levelk} 的 Level-k（“我想你想我”）天然属于这里——递归的信念推理正是心智理论的核心。
+\end{insight}
+
+\paragraph{理论：逆博弈的最大似然形式。}
+把逆博弈写成精确数学。先回顾\emph{正向}博弈：给定所有玩家的代价参数 $\theta=(\theta_1,\dots,\theta_N)$，求 Nash/GNE 均衡解 $x^*(\theta)$（均衡轨迹）——iLQGames、ALGAMES 干的就是这件事（$\theta$ 进、$x^*$ 出）。\emph{逆}博弈：给定观测到的轨迹 $\hat x_{1:T}$（带噪、可能部分观测），求代价参数 $\hat\theta$，使“观测轨迹在均衡意义下最可能”，写成最大似然估计（MLE）：
+
+\begin{definition}[逆博弈的最大似然形式]\label{def:rtg-inverse-mle}
+给定观测轨迹 $\hat x_{1:T}$，逆博弈求
+\begin{equation}
+  \hat\theta=\arg\max_\theta\ \log p(\hat x_{1:T}\mid\theta).
+  \label{eq:rtg-mle}
+\end{equation}
+在高斯观测噪声假设下（观测 = 真实均衡轨迹 + 高斯噪声），最大化对数似然等价于最小化加权最小二乘：
+\begin{equation}
+  \hat\theta=\arg\min_\theta\ \sum_k\big\lVert x_k^*(\theta)-\hat x_k\big\rVert_\Sigma^2,
+  \label{eq:rtg-inverse-ls}
+\end{equation}
+其中 $x_k^*(\theta)$ 是“假设代价参数为 $\theta$ 时，正向博弈解出的均衡轨迹在时刻 $k$ 的状态”，$\Sigma$ 是观测噪声协方差。
+\end{definition}
+
+\begin{insight}
+\textbf{逆博弈 = 在正向求解外面套一层参数优化.}\;\cref{eq:rtg-inverse-ls} 的结构值得盯住看——它是一个\emph{双层结构}。外层：对代价参数 $\theta$ 做优化（最小化“均衡轨迹与观测的偏差”）；内层：对每个候选 $\theta$，调用正向博弈求解器算出均衡轨迹 $x^*(\theta)$。换句话说，\textbf{逆博弈 = 正向求解器（\cref{sec:rtg-ilqgames}）+ 外层一个参数拟合循环}。这解释了为什么把求解器做到毫秒级如此关键——逆博弈外层每走一步梯度，内层就要解一次完整正向博弈；正向越快，逆博弈才越可行。也解释了 \cref{sec:rtg-inverse} 和前面的关系：正向求解器是引擎，逆博弈是把引擎装进推断的车架。
+\end{insight}
+
+\begin{note}
+\textbf{与 IRL 的关系.}\;逆博弈和逆强化学习（IRL）数学上同源——都是“从行为反推代价/奖励”。区别在\emph{耦合结构}：IRL 通常推断单个智能体的奖励（把环境/他人当固定）；逆博弈推断\emph{多个}智能体的代价，并通过 Nash 均衡约束把它们耦合——它假设观测轨迹是一个\emph{多人博弈的均衡}，而非单人最优。实践提示：当场景里只有一个需要建模的对手、且它基本不对 ego 反应时（如 ego 跟一辆几乎匀速的前车），单边 IRL 就够了；只有当多 agent 真正相互反应、把谁当固定都会失真时，逆博弈的“通过 Nash 约束联合推断”才体现价值。选 IRL 还是逆博弈，取决于交互的耦合强度。
+\end{note}
+
+\paragraph{关键技术：用隐函数定理让正向求解器可微。}
+\cref{eq:rtg-inverse-ls} 要用梯度下降求解，就得算 $\nabla_\theta x^*(\theta)$——均衡轨迹对代价参数的梯度。难点在于：$x^*(\theta)$ 不是显式函数，而是正向博弈求解器的\emph{输出}（一个优化/求根问题的解）。怎么对“一个求解器的输出”求导？答案是 \cref{sec:rtg-seibr} 用过的\textbf{隐函数定理}，这里升级成“对参数版”。关键观察：Nash 均衡解 $x^*(\theta)$ 满足博弈的 KKT 条件（一阶最优性），写成隐式方程 $F(x^*(\theta),\theta)=0$，其中 $F$ 是所有玩家 KKT 条件堆叠成的残差（这正是把 GNEP 写成 MCP 的那个 $F$，\cref{def:rtg-gnep-kkt}）。$F=0$ 对所有 $\theta$ 恒成立（因为 $x^*(\theta)$ 总是对应 $\theta$ 的均衡），所以对 $\theta$ 求全导：
+
+\begin{theorem}[均衡解对参数的梯度]\label{thm:rtg-implicit-grad}
+设 $F(x^*(\theta),\theta)=0$ 为博弈均衡的 KKT 残差，且 $\partial F/\partial x^*$ 可逆，则
+\begin{equation}
+  \frac{\partial F}{\partial x^*}\cdot\frac{\partial x^*}{\partial\theta}+\frac{\partial F}{\partial\theta}=0
+  \ \Longrightarrow\
+  \frac{\partial x^*}{\partial\theta}=-\Big(\frac{\partial F}{\partial x^*}\Big)^{-1}\frac{\partial F}{\partial\theta}.
+  \label{eq:rtg-implicit-grad}
+\end{equation}
+\end{theorem}
+
+\noindent 这就是均衡解对参数的梯度——由 KKT 残差的两个雅可比算出：$\partial F/\partial x^*$（残差对解的雅可比，即博弈的“Hessian”）和 $\partial F/\partial\theta$（残差对参数的雅可比）。
+
+\begin{insight}
+\textbf{隐函数定理 = 不解开求解器也能对它求导.}\;\cref{eq:rtg-implicit-grad} 的威力在于——它让你\emph{不必把正向求解器展开成显式公式}，就能对它的输出求导：你只需知道均衡满足的 KKT 条件 $F=0$，对这个\emph{隐式}条件求导，就得到了梯度。这正是 \cref{sec:rtg-seibr} SE-IBR 那个 $\partial u_{-i}^*/\partial u_i=-(\partial G/\partial u_{-i})^{-1}(\partial G/\partial u_i)$（\cref{eq:rtg-seibr-sensitivity}）的同构升级——SE-IBR 是对“对手响应关于 ego 策略”求导，逆博弈是对“整个均衡关于代价参数”求导，公式形状一模一样（都是“$-(\text{对解的雅可比})^{-1}(\text{对另一变量的雅可比})$”）。记住这个形状，你就掌握了\emph{可微博弈（differentiable games）}的全部数学核心——它在逆博弈、SE-IBR、GameFormer 的训练里反复出现。这和深度学习里的\emph{可微优化层}（OptNet、可微 MPC）是同一种思想：把一个优化/求根问题当成网络里的一层，用隐函数定理实现反向传播，而非把优化迭代展开。
+\end{insight}
+
+\paragraph{代码走读：解析梯度 vs 有限差分。}
+\cref{eq:rtg-implicit-grad} 是逆博弈的数学核心，用一个能跑的最小例子验证它对不对、是否比有限差分好。取一个单时刻 2 玩家 LQ 博弈——玩家 $i$ 代价 $J_i=\tfrac12 q_i(x-\theta_i)^2+\tfrac12 r_i u_i^2$，$x=u_1+u_2$，参数 $\theta=(\theta_1,\theta_2)$ 是两人的目标。它的 KKT 条件（一阶最优）可显式写出：$F_i=q_i(x-\theta_i)+r_i u_i=0$。
+
+\begin{codebox}[Python]{隐函数定理解析梯度 vs 有限差分}
+import numpy as np
+q1, q2, r1, r2 = 1.0, 1.5, 0.8, 1.2
+
+def solve_nash(theta):                              # 正向：解 2 玩家 LQ 博弈的 Nash（联立两个 F_i=0）
+    t1, t2 = theta
+    A = np.array([[q1+r1, q1], [q2, q2+r2]])        # KKT 系数矩阵（= dF/du）
+    b = np.array([q1*t1, q2*t2]); return np.linalg.solve(A, b)
+
+theta = np.array([2.0, -1.0]); u_star = solve_nash(theta)
+# 隐函数定理 (3): du*/dtheta = -(dF/du*)^{-1}(dF/dtheta)
+dF_du     = np.array([[q1+r1, q1], [q2, q2+r2]])    # dF/du（KKT 雅可比，与正向求解的 A 同）
+dF_dtheta = np.array([[-q1, 0], [0, -q2]])          # dF/dtheta（F_i 对 theta_i 偏导 = -q_i）
+grad_analytic = -np.linalg.solve(dF_du, dF_dtheta) # 一次线性求解得全部梯度
+
+eps = 1e-6; grad_fd = np.zeros((2, 2))             # 有限差分验证
+for j in range(2):
+    tp = theta.copy(); tp[j] += eps
+    grad_fd[:, j] = (solve_nash(tp) - u_star) / eps
+# 最大差异约 1.6e-10（机器精度）—— 隐函数定理梯度完全正确
+\end{codebox}
+
+\noindent 源笔记报告：解析梯度与有限差分的最大差异仅约 $1.6\times10^{-10}$（机器精度）——\cref{eq:rtg-implicit-grad} 的梯度完全正确\cite{peters2021inferring}。\pz{存疑：$1.6\times10^{-10}$ 为源笔记自报输出，未复跑。}但两者代价天差地别：有限差分要对\emph{每个参数维度}各扰动一次、各解一次正向博弈（参数 $d$ 维就要解 $d+1$ 次博弈）；隐函数定理只需在当前解处算两个雅可比、解一个线性系统，\emph{一次}就拿到对所有参数的完整梯度。注意 \verb@dF_du@ 正好等于正向求解 \verb@solve_nash@ 里的系数矩阵 \verb@A@——\textbf{正向求解和反向求梯度复用同一个 KKT 雅可比}，这是可微优化层实现高效的关键。
+
+\begin{insight}
+\textbf{解析梯度省的是“正向求解次数”.}\;解析梯度和有限差分结果一样，但代价天差地别——有限差分参数 $d$ 维要解 $d+1$ 次博弈，隐函数定理\emph{一次}拿到全部梯度。逆博弈外层梯度下降要走很多步、参数可能高维（每个 agent 多个代价参数），这个差别是“能不能实用”的差别。源笔记的计算分析：设每车 $6$ 个待估代价参数、两车 $d=12$，外层梯度下降 $K=200$ 步——解析梯度每步只解 $1$ 次博弈、共约 $200$ 次；有限差分每步要解 $d+1=13$ 次、共约 $2600$ 次——同一推断，正向求解总次数差了一个数量级，往往就是“几秒收敛”与“几十秒才收敛”的差别。
+\end{insight}
+
+\paragraph{从离线 MLE 到在线推断：LUCIDGames。}
+前面的逆博弈是\emph{离线/批量}的——拿一整段观测轨迹一次性梯度下降反推代价。但真实机器人是\emph{在线}的：一边开、一边观测对手、需要实时更新对手代价估计。把逆博弈在线化的代表是 LUCIDGames（Le Cleac'h、Schwager、Manchester，RAL 2021）\cite{lecleach2021lucidgames}。它把离线一次性 MLE 换成在线递归滤波：用\textbf{无迹卡尔曼滤波（UKF）}把对手的代价参数当作要估计的“隐藏状态”，每观测到对手一步新轨迹就用卡尔曼滤波更新一次参数的均值和协方差（贝叶斯后验）。额外的巧思：它不只给参数\emph{点估计}，还给\emph{协方差}（不确定性），规划器据此对不确定的对手保持安全余量（不确定性椭圆约束）——参数越不确定，机器人越保守。UKF 包了 iLQGames 内层（每个滤波步用 sigma 点采样不同候选参数、各跑一次 iLQGames 算均衡轨迹、与观测比对来更新后验），其 MPC 实现达 $40$\,Hz 实时\cite{lecleach2021lucidgames}。\pz{存疑：$40$\,Hz 为源笔记转引数字，待核对。}
+
+\begin{insight}
+\textbf{离线 MLE / 在线滤波 / 学习式是同一逆问题的三种解法.}\;把推断方法摆在一起，它们是“从行为反推对手隐藏属性”这一逆问题的不同实现：\emph{离线 MLE}（\cref{def:rtg-inverse-mle}）——批量观测、梯度下降、给点估计，适合事后分析；\emph{在线滤波}（LUCIDGames 的 UKF / \cref{sec:rtg-levelk} 的离散贝叶斯）——逐步观测、递归更新、给后验分布，适合实时机器人；\emph{学习式}（\cref{sec:rtg-gameformer} GameFormer）——用神经网络从海量数据摊销这个推断，运行时一次前向。三者的内层都需要正向博弈求解器（MLE 和 UKF 显式调 iLQGames，GameFormer 把它隐式学进网络），都在回答“对手是什么样、它会怎么做”。选哪种取决于场景：要实时 + 不确定性量化用在线滤波，要可扩展用学习式，要离线精确分析用 MLE。
+\end{insight}
+
+\begin{pitfall}[概念误区：以为观测一小段轨迹就能唯一反推代价]
+拿到对手几帧轨迹，就期望逆博弈精确反推出它的完整代价参数。后果：反推参数与真实值差很远，或每次跑（不同初值）收敛到不同参数；用这个不可靠的代价做预测，结果很差。\textbf{根本原因}：可识别性取决于观测信息量。短轨迹/单时刻观测下，多组代价能解释同一观测，逆问题欠定——梯度下降只会收敛到“能拟合观测”的参数流形上某一点，而非真实参数。源笔记的实证：固定真实参数、只改观测长度，反推误差随观测长度从 $1$ 步到 $15$ 步单调下降近 $300$ 倍（$5.477\to0.019$）\cite{peters2021inferring}。\pz{存疑：该误差-长度表为源笔记自报输出，未复跑。}\textbf{正解}：用足够长、足够多样的观测（覆盖不同交互情形）；对欠定情形用贝叶斯方法给参数\emph{后验分布}而非点估计；或减少待估参数维度。
+\end{pitfall}
+
+\begin{pitfall}[编程陷阱：逆博弈外层梯度下降发散]
+直接用有限差分梯度 + 固定大学习率做外层优化。后果：loss 不降反增、参数爆炸成天文数字、NaN。\textbf{根本原因}：有限差分梯度的尺度可能很大（尤其 loss 大时），固定大学习率下单步更新跨度过大，越过最优、震荡发散；博弈的 KKT 雅可比病态时更甚。\textbf{正解}：梯度归一化（$g/\lVert g\rVert$）+ 自适应/小学习率 + 必要时梯度裁剪；用解析梯度 \cref{eq:rtg-implicit-grad} 替代有限差分（更稳更快）；对内层求解器的雅可比 $\partial F/\partial x^*$ 加正则化防病态；监控 loss 是否单调下降，发散就先减小学习率。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：假设观测轨迹真的是 Nash 均衡]
+MLE \cref{eq:rtg-inverse-ls} 假设观测轨迹是某个 Nash 均衡的噪声版本，于是无条件相信反推出的代价。后果：如果人类其实不在玩 Nash（比如是 Level-1 有界理性、或根本次优），逆博弈会推断出一个“扭曲”的代价——它强行用 Nash 框架解释非 Nash 行为，得到的代价虽能拟合观测但不反映真实意图，外推到新场景会错。\textbf{根本原因}：逆博弈的正确性依赖“观测来自 Nash 均衡”这个生成假设，人类有界理性（\cref{sec:rtg-levelk}）时这个假设不成立。\textbf{正解}：用更贴合人类的行为模型——MaxEnt Games（有界理性的 softmax 均衡，\cref{sec:rtg-frontier}）或 Level-k 逆博弈（假设观测来自某个 Level-k 策略而非 Nash，\cref{sec:rtg-levelk}）。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （逆博弈 MLE，对接 \cref{sec:rtg-ilqgames}）在 iLQGames 的 2 车交叉路口场景做完整逆博弈：(1) 设两车真实代价参数 $\theta_{\text{true}}$（目标速度、安全距离权重）；(2) 正向求解得 Nash 轨迹；(3) 加高斯噪声作为“观测”；(4) 用梯度下降（内层调 iLQGames、外层用隐函数定理 \cref{eq:rtg-implicit-grad} 的梯度）反推 $\hat\theta$。验证 $\hat\theta\approx\theta_{\text{true}}$，并改变观测长度观察可识别性如何随观测信息量变化。
+  \item （Peters 2021 精读）精读论文，标注三点：(1) 隐函数定理 \cref{eq:rtg-implicit-grad} 在 iLQGames 的 KKT 上的具体形式（$F$、$\partial F/\partial x^*$ 分别是什么）；(2) 带噪 + 部分观测如何处理（提示：未观测量当待估变量，与代价参数联合优化——论文标题正是 “from Noise-Corrupted Partial State Observations”）；(3) 逆博弈与 IRL 的数学关系（耦合结构的区别）。
+  \item （推导 + 连接 \cref{sec:rtg-seibr}）写出 \cref{eq:rtg-implicit-grad} 中 $\partial F/\partial x^*$ 与 \cref{eq:rtg-seibr-sensitivity} SE-IBR 的 $\partial G/\partial u_{-i}$ 的对应关系——它们都是“KKT 残差对解的雅可比”。解释为什么这个雅可比可逆是隐函数定理适用的前提，以及它病态时（博弈接近退化）逆博弈梯度会出什么问题。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Level-k 与认知层级：给有界理性建模}
+\label{sec:rtg-levelk}
+
+\paragraph{动机：人类真的在算 Nash 均衡吗。}
+\cref{sec:rtg-inverse} 的逆博弈假设观测来自 Nash 均衡，但其陷阱已指出——人类不是完美的 Nash 玩家。Nash 均衡有一个很强的隐含假设——\emph{相互一致性}：每个玩家都正确预测了所有其他玩家的策略，且彼此自洽，形成不动点。要达到这个不动点，玩家得做无限层递归推理（“我认为你会这么做，但你也知道我这么想，所以你会那样做，但我又知道你知道……”一直推到收敛）。可真实的人类司机会这样推理吗？心理学和行为经济学的大量实验给出的答案是：\textbf{不会}。人类的策略推理只能到\emph{有限的几层}就停了——大多数人想一两步（“我觉得他会让，那我就并进去”），很少有人真的递归推到 Nash 不动点。用 Nash 建模人类，等于假设了一个不切实际的“完美博弈者”，会推断出扭曲的代价。我们需要一个\emph{承认人类只想有限步}的模型——这就是 Level-k。
+
+\paragraph{反面：直接用 Nash 建模人类。}
+设你做一个汇入场景的交互规划器，假设对向人类司机是完美 Nash 玩家。Nash 假设对手已经“算到底”——它预测对手会精确地对你的最优策略做最优响应。但真实的人类司机可能只是 Level-1——他假设你会按常规（匀速）开，然后对这个简单假设做反应，根本没考虑“你其实在对他反应”。后果是\emph{预测失配}：你的规划器期待一个会精细协调的 Nash 对手，实际遇到的却是一个“以为你匀速、自己抢行”的 Level-1 司机；你以为他会让（Nash 均衡里该让），他却因为只想了一层、没料到你会进而直接抢——轻则急刹，重则冲突。反过来，如果你假设对手是 Level-1（会抢），他却是个谨慎的 Level-2（料到你会进、主动让），你又会过度保守。\textbf{关键是：你得估计对手到底想了几层（$k$ 是多少），而非假设他是完美 Nash。}
+
+\paragraph{历史：从行为经济学到自动驾驶。}
+Level-k 思想源自行为博弈论对人类实验数据的观察——人在一次性博弈里的行为，用“有限层推理”解释得比 Nash 好得多。集大成的是 Camerer、Ho、Chong 在 QJE 2004 提出的 \textbf{Cognitive Hierarchy（CH，认知层级）模型}\cite{camerer2004cognitive}：step 0 玩家随机化（不做策略思考）；step $k$ 思考者做最佳响应，但假设其他玩家分布在 step 0 到 step $k-1$ 上。CH 弱化了 Nash 的“相互一致性”（不要求大家预测彼此自洽），只保留“最佳响应”——所以它能描述没算到不动点的真实人类。关键词是“假设别人比自己浅”，这正是有界理性的核心：每个人都觉得自己是房间里最聪明的，对手没自己想得深。把 CH/Level-k 引入自动驾驶的代表工作，用 Level-k 建模其他车的有界理性，并在线估计对手的 $k$ 来自适应调整自己的策略\cite{li2018game}。
+
+\paragraph{理论：Level-k 与 Cognitive Hierarchy。}
+\textbf{Level-0：规则策略}——不做任何策略推理的基准行为（自动驾驶里常用 IDM 跟车、MOBIL 变道规则、或匀速直行），是整个递归的“地基”，只按预设规则走、不考虑他人。\textbf{Level-k：对 Level-$(k-1)$ 的最佳响应}，递归定义：
+
+\begin{definition}[Level-k 策略]\label{def:rtg-levelk}
+\begin{equation}
+  \pi_k=\mathrm{BestResponse}\big(\pi_{k-1}\big),\qquad k=1,2,\dots
+  \label{eq:rtg-levelk}
+\end{equation}
+即 Level-1 假设所有他人是 Level-0（按规则行动）$\to$ 对规则行为做最优反应；Level-2 假设所有他人是 Level-1 $\to$ 对 Level-1 行为做最优反应；以此类推，每升一层就多想一步“对手会怎么想”。
+\end{definition}
+
+\noindent 注意 \cref{eq:rtg-levelk} 的“最佳响应”$\mathrm{BestResponse}(\cdot)$ 就是一次\emph{正向博弈/最优控制求解}（给定假设的对手策略，求自己的最优）——这正是前面求解器的活。所以 \textbf{Level-k = 把正向求解器递归调用 $k$ 次}。CH 在此基础上更精细——它假设对手分布在 Level-0 到 Level-$(k-1)$ 的\emph{混合}上，且层级 $k$ 服从一个\emph{泊松分布} $\mathrm{Poisson}(\tau)$：
+
+\begin{equation}
+  P(\text{level}=k)=\frac{\tau^k e^{-\tau}}{k!}.
+  \label{eq:rtg-poisson}
+\end{equation}
+参数 $\tau$ 刻画群体的平均思考深度。
+
+\begin{insight}
+\textbf{Level-k = 把“想到底”截断成“想 k 步”.}\;Nash 和 Level-k 的根本差别是\emph{递归深度}。Nash 是递归的不动点——“想到底”，要求 $\pi=\mathrm{BestResponse}(\pi)$ 自洽收敛；Level-k 是递归的\emph{有限截断}——从 Level-0 出发，做 $k$ 次最佳响应就停，不要求收敛到不动点。这个截断正是“有界理性”的数学化：人类的认知资源有限，想不了无限层，到第 $k$ 层就停。一个漂亮的极限关系：\emph{当 $k\to\infty$（或 $\tau\to\infty$）且递归收敛时，Level-k 趋于 Nash}——Nash 是 Level-k 的“无限理性极限”。所以 Level-k 不是 Nash 的对立面，而是它的\emph{有限理性推广}：Nash 是想到底，Level-k 是想 $k$ 步，现实的人在中间某个有限的 $k$。
+\end{insight}
+
+\begin{insight}
+\textbf{收敛性取决于博弈结构——这正是高 $k$ 未必好的根源.}\;上一条洞察的限定语“\emph{且递归收敛时}”不是多余的。Level-k 收敛到 Nash 的前提是最佳响应映射\emph{收缩}（BR 斜率绝对值 $<1$）。如果 BR 斜率绝对值 $\ge1$（非收缩，如某些强对抗博弈），Level-k 递归会\emph{震荡甚至发散}——$k$ 越大离 Nash 越远，而非越近。这从数学上解释了下文陷阱 1“高 $k$ 未必好”：盲目增大 $k$，在非收缩博弈里适得其反。加上真实人类的 $k$ 本就小，双重理由都指向同一结论——\textbf{建模时用小 $k$，别迷信高 $k$}。这也呼应 \cref{sec:rtg-gameformer} 的陷阱（decoder 层数不是越多越好）：层数 = 认知深度 = $k$，过多层既不对应真实认知、又可能不收敛。
+\end{insight}
+
+\begin{note}
+\textbf{人类的 $k$ 是多少？}\;Camerer-Ho-Chong 用大量博弈实验数据做最大似然估计，跨 $60$ 个博弈估出的泊松参数 $\tau$ 中位数为 $1.55$、四分位距 $(0.98,\,2.21)$（论文摘要以“约 $1.5$ 步”概括这一水平）\cite{camerer2004cognitive}。也就是说，真实人类的平均策略思考深度约 $1.5$ 层——大多数人是 Level-1 到 Level-2，很少有人想到 $3$ 层以上。这对自动驾驶很有指导意义：建模人类司机时 Level-1/Level-2 通常就够了，假设对手是高层级或完美 Nash 往往不切实际。驾驶场景与经济学实验不同，实际 $k$ 需针对驾驶数据重估，但“$k$ 很小（$1\sim2$）”这个定性结论是稳健的；泊松分布的 MLE 恰好就是样本均值 $\hat\tau=\tfrac1n\sum_i k_i$，便于从驾驶数据估计。
+\end{note}
+
+\paragraph{在机器人中的应用：在线估计对手的 $k$。}
+实战中你不知道对手是 Level 几。做法是\textbf{贝叶斯在线估计}：维护一个对手 $k$ 值的后验分布，每观测到一步对手行为就用贝叶斯更新——“如果对手是 Level-1，他这步该这么走；是 Level-2，该那么走；实际他这么走了，那他更可能是几？”估出对手的 $k$ 后，ego 就能对症下药地选自己的策略层级（通常比对手高一层）。这把 \cref{sec:rtg-inverse} 的“推断对手代价”换成了“推断对手的\emph{理性层级}”——两者都是逆问题，都在从行为反推对手的隐藏属性。
+
+\begin{codebox}[Python]{贝叶斯在线估计对手的层级 k}
+import numpy as np
+level_action_mean = {0: 0.0, 1: 1.5, 2: 1.0}   # 各层级"典型动作"：L0匀速/L1抢行/L2协调
+sigma = 0.4                                     # 对手动作随机性（有界理性的噪声）
+
+def likelihood(obs_action, k):                  # 若对手是 Level-k，观测到 obs_action 的似然（高斯）
+    mu = level_action_mean[k]
+    return np.exp(-0.5*((obs_action-mu)/sigma)**2) / (sigma*np.sqrt(2*np.pi))
+
+true_k = 1                                       # 真实对手是 Level-1；ego 从均匀先验在线推断
+posterior = np.array([1/3, 1/3, 1/3])           # P(k=0,1,2) 均匀先验
+for t in range(1, 8):
+    obs = level_action_mean[true_k] + sigma*np.random.randn()    # 观测对手这一步动作
+    lik = np.array([likelihood(obs, k) for k in range(3)])       # 三个层级假设下的似然
+    posterior = lik * posterior                                  # 贝叶斯更新：后验 ~ 似然 x 先验
+    posterior = posterior / posterior.sum()                      # 归一化；MAP = argmax(posterior)
+\end{codebox}
+
+\noindent 源笔记报告：后验逐步收敛到真实层级——第一步观测就几乎排除了 Level-0（对手明显在加速、不是匀速），之后在 Level-1/Level-2 间逐步收敛到真实的 Level-1（中间因噪声会有短暂波动）\cite{camerer2004cognitive}。\pz{存疑：该后验收敛过程为源笔记自报的玩具仿真输出，未复跑。}估出对手是 Level-1 后，ego 应选 Level-2 策略（比对手高一层，对它的抢行做最优响应）。
+
+\begin{insight}
+\textbf{估计 $k$ 与估计代价是同一类逆问题.}\;这个贝叶斯估计 $k$，和 \cref{sec:rtg-inverse} 的逆博弈推断代价，是\emph{同一类逆问题的两个实例}——都在“从观测行为反推对手的隐藏属性”。\cref{sec:rtg-inverse} 推断的隐藏属性是\emph{代价参数}（连续，用梯度下降）；这里推断的是\emph{理性层级 $k$}（离散，用贝叶斯滤波）。真实系统里两者可以结合：同时推断“对手想要什么（代价）”和“对手想得多深（层级 $k$）”——前者用逆博弈、后者用贝叶斯，共同构成一个完整的在线对手模型。注意单步观测不可靠（噪声会致短暂误判），需累积多步（呼应 \cref{sec:rtg-inverse} 可识别性陷阱：观测信息量决定推断质量）。
+\end{insight}
+
+\paragraph{延伸：MaxEnt 博弈——有界理性的另一条路。}
+Level-k/CH 用“有限层递归”建模有界理性，但这不是唯一的路。另一条主流路线是\textbf{最大熵（MaxEnt）博弈}，代表作是 Mehr、Wang、Bhatt、Schwager 的 T-RO 2023\cite{mehr2023maximum}。它对有界理性的建模机制与 Level-k 不同——不是“想得浅”，而是“带随机性”：完美理性 agent 总选最优动作（确定性），有界理性 agent 则以一定随机性选动作（越优的动作选的概率越高，但次优动作也有非零概率，即 softmax 分布），用一个 softmax Bellman 方程刻画这种“带噪的最优性”，均衡里每个 agent 的策略是对其他人策略的 softmax 最优响应（而非确定性最优响应）。
+
+\begin{insight}
+\textbf{两种有界理性是互补的，不是对立的.}\;Level-k 和 MaxEnt 捕捉的是有界理性的\emph{两个不同侧面}：Level-k 说“人的推理深度有限”（你想到第 2 层，对手可能只想到第 1 层），MaxEnt 说“人的选择有随机性”（即便算出了最优，人也不总精确执行它，有波动）。真实人类两者都有：既想不了无限层（Level-k），选择又带噪声（MaxEnt）。两者都把 Nash 作为“完美理性极限”——Level-k 在 $k\to\infty$ 时趋于 Nash，MaxEnt 在随机性 $\to0$ 时趋于 Nash，故都是 Nash 的有界理性推广，只是从不同方向放松了完美理性假设。MaxEnt 的一个额外优势（对 \cref{sec:rtg-inverse} 逆博弈很重要）：它的\emph{正向求解和逆向求解在同一个最大熵框架里统一}——逆博弈推断代价时，MaxEnt 的概率化策略天然给出观测的似然（softmax 概率），不必像确定性 Nash 那样假设“观测 = 均衡 + 高斯噪声”。这让 MaxEnt 成为逆博弈处理有界理性人类的有力工具。
+\end{insight}
+
+\begin{pitfall}[概念误区：以为 Level-k 收敛到 Nash、或 $k$ 越高越好]
+觉得 Level-k 随 $k$ 增大总会收敛到 Nash，所以建模时把 $k$ 取得越高越接近“真实”。后果：用高 $k$（如 Level-4）建模人类司机，预测的对手行为过度“精明”，与真实有界理性的人类（$k\approx1.5$）严重失配，交互失败。\textbf{根本原因}：Level-k 是有界理性模型，价值恰恰在于 $k$ \emph{小}（截断了无限递归）；高 $k$ 偏离建模初衷，且不一定收敛（非收缩博弈里递归震荡）。\textbf{正解}：用小 $k$（$1\sim2$）建模人类，并在线估计对手实际的 $k$；只有当你确信对手是高度理性的（如另一个优化求解器）时才用高 $k$ 或 Nash；用真实交互数据做 MLE 估 $k$，看落在什么范围。
+\end{pitfall}
+
+\begin{pitfall}[编程陷阱：Level-k 递归中混淆“自己的层级”和“假设对手的层级”]
+实现 Level-k 时，把“我是 Level-k”错误地实现成“对手也是 Level-k”，或递归基线（Level-0）设错。后果：行为层级错乱——本应对 Level-$(k-1)$ 响应却对了 Level-k，或 Level-0 规则设得不合理导致整个递归崩塌。\textbf{根本原因}：Level-k 的定义是“我是 Level-k = 我对（假设的）Level-$(k-1)$ 对手做最优响应”，实现时必须分清“我的层级 $k$”和“我假设对手的层级 $k-1$”，且 Level-0 必须是一个合理的规则策略。\textbf{正解}：严格按 \cref{eq:rtg-levelk} 实现 \verb@level_k = best_response(level_(k-1)_opponent)@，Level-0 用经过验证的规则（IDM/MOBIL）；单独验证每一层再往上递归。
+\end{pitfall}
+
+\begin{pitfall}[论文误导：以为 Level-k 和 Cognitive Hierarchy 是同一个模型]
+读文献时把 Level-k 和 CH 当成可互换的同义词，混用它们的“对手假设”。后果：实现时对手模型用错——Level-k 假设对手\emph{恰好}是 Level-$(k-1)$，CH 假设对手是 Level-0 到 Level-$(k-1)$ 的\emph{泊松混合}；混淆导致最佳响应的对象错误。\textbf{根本原因}：两者是不同模型，CH 是 Level-k 的精细化，二者最佳响应对象不同。\textbf{正解}：明确你用的是哪个——要简单递归用 Level-k（对手恰好 Level-$(k-1)$），要更贴合实验数据的群体异质性用 CH（对手泊松混合 \cref{eq:rtg-poisson}）；读论文时看清它定义的对手假设。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （Level-k 实现）在 highway-env 中实现 Level-k 决策：(1) Level-0 = IDM + MOBIL（规则）；(2) Level-1 = 对 Level-0 他车做 MPC 最优响应；(3) Level-2 = 对 Level-1 他车做 MPC。对比三个 Level 的变道成功率和碰撞率，并讨论哪个层级最像真实人类司机（联系 $\tau\approx1.5$）。
+  \item （在线估计 $k$）实现对手 $k$ 值的贝叶斯在线估计：维护对手 $k\in\{0,1,2\}$ 的后验，每观测一步对手行为就更新（似然 = “若对手是 Level-$j$，这步行为的概率”）。在汇入场景验证：当对手实际按 Level-1 行动时，你的后验是否收敛到 $k=1$？据此 ego 该选哪个层级？
+  \item （思考题 + 连接 \cref{sec:rtg-inverse}）逆博弈假设观测来自 Nash 均衡，但如果人类其实是 Level-1（非 Nash），逆博弈会推断出什么样的代价？这个被“扭曲”的代价用于预测会有什么问题？如果改用“Level-k 逆博弈”（假设观测来自某个 Level-k 策略而非 Nash），推断会更准吗？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{GameFormer：把 Level-k 嵌进 Transformer}
+\label{sec:rtg-gameformer}
+
+\paragraph{动机：城市场景里几十个 agent，怎么实时博弈。}
+\cref{sec:rtg-inverse} 的逆博弈、\cref{sec:rtg-levelk} 的 Level-k 在少数 agent（$2\sim3$ 车）的场景里很漂亮，但真实城市驾驶是另一回事——一个繁忙路口可能有几十个车辆、行人、骑车人，外加复杂的 HD 地图（车道、人行道、信号灯）。显式求解这么大规模的博弈（耦合 Riccati、逆博弈的隐函数微分）计算上极其吃力，且为每个 agent 手工设计代价函数也不现实；在线对几十个 agent 同时做逆博弈推断更远超实时预算。能不能换个思路：\textbf{不显式求解博弈，而是用神经网络从海量驾驶数据中“学”出博弈式的交互预测}？神经网络天生擅长处理高维输入（地图、多 agent 历史）、且推理是一次前向传播（无需迭代收敛）。如果能把博弈论的\emph{结构}（尤其 \cref{sec:rtg-levelk} 的 Level-k 层级推理）作为\emph{归纳偏置}注入网络架构，就能兼得两者之长——博弈论的交互建模能力 + 神经网络的可扩展性和速度。这正是 GameFormer 的思路。
+
+\paragraph{反面：忽略“未来交互”的预测器会怎样。}
+GameFormer 论文开篇点出已有方法的关键缺陷\cite{huang2023gameformer}：大多数轨迹预测器看每个 agent 的历史轨迹、预测它各自的未来——它们建模了 agent \emph{过去}怎么相互影响（历史轨迹里的交互），却没建模 agent 在\emph{未来}会怎么相互反应。问题在于未来是交互的——A 的未来动作取决于 B 的未来动作，反之亦然。一个只看过去、独立预测各 agent 未来的模型，会预测出\emph{相互矛盾}的未来（比如预测两辆车会在同一点抢行，因为各自的预测没考虑对方的未来反应）。这本质又是 \cref{sec:rtg-pred-eq} 要讲的 prediction-planning 不一致、frozen robot 的同源问题。GameFormer 的解法是用\textbf{层级博弈}显式建模未来交互：让每个 agent 的预测\emph{迭代地}响应其他 agent 上一轮的预测——这正是 \cref{sec:rtg-levelk} 的 Level-k 递归。
+
+\paragraph{历史与架构。}
+GameFormer 由 Huang、Liu、Lv（南洋理工）在 ICCV 2023（Oral）提出\cite{huang2023gameformer}，站在两条线的交汇点：一条是 \cref{sec:rtg-inverse,sec:rtg-levelk} 的博弈论交互建模（Sadigh$\to$Peters$\to$Level-k），另一条是深度学习里的 Transformer 轨迹预测。模型含一个 Transformer encoder（建模场景元素之间的关系）和一个\emph{层级 Transformer decoder}：encoder 把场景（HD 地图 + 所有 agent 历史）编码成共享上下文 context tokens；decoder 分多层，第一层（Level-0）让每个 agent 独立预测初始轨迹（不看他人未来，递归地基），之后每一层（Level-k）都让每个 agent 通过\emph{交叉注意力}看到上一层所有 agent 的预测 + context、再精化自己的预测——这就是对上一层做“最佳响应”。对照 \cref{sec:rtg-levelk} 的 Level-k 递归 \cref{eq:rtg-levelk}，GameFormer 的每一层 decoder 就是这个递归的一次迭代——只不过“最佳响应”不是显式求解，而是用一层 Transformer 的交叉注意力 + 前馈来\emph{学习}逼近。其成绩：ICCV 2023 Oral、Waymo Open Motion Dataset 交互预测 SOTA，其扩展 GameFormer Planner 在 nuPlan 闭环基准上有竞争力\cite{huang2023gameformer}。\pz{存疑：“ICCV 2023 Oral”“Waymo 交互预测 SOTA”“nuPlan 闭环竞争力”为源笔记转引，待核对会议接收类型与榜单名次。}
+
+\begin{insight}
+\textbf{GameFormer = 把 Level-k 递归“编译”进 decoder 层.}\;GameFormer 最漂亮的地方，是它把一个\emph{算法}（Level-k 递归）变成了一个\emph{架构}（decoder 的层）。\cref{sec:rtg-levelk} 的 Level-k 是一个迭代算法——每层调用一次正向求解器（best response）；GameFormer 把“调用一次 best response”换成“过一层 decoder”——decoder 层学会了用注意力实现最佳响应。于是：迭代 $k$ 次 $\leftrightarrow$ 堆叠 $k$ 层 decoder；每次 best response $\leftrightarrow$ 一层交叉注意力（agent 关注上一层其他 agent 的预测）。这个“算法 $\to$ 架构”的转换有两个好处：(1) 推理是一次前向传播（堆叠的 $k$ 层），无需迭代收敛检查，避开了 iLQGames 可能不收敛的问题；(2) “最佳响应”的具体形式是\emph{学}出来的（从数据），不必手工设计代价函数。代价是：它给出的是\emph{学到的近似} Nash，不像 iLQGames 那样有精确均衡的保证，也不可解释（学到的注意力权重不等于显式代价）。
+\end{insight}
+
+\begin{insight}
+\textbf{架构给骨架，损失给语义.}\;堆叠多层 decoder，凭什么保证“第 $k$ 层真的在对第 $(k-1)$ 层做最佳响应”，而不是学成随意的精化？这正是 GameFormer 论文标题里“Learning”的分量——它的另一个核心创新是\emph{训练过程的设计}：除了让每层预测逼近真实轨迹（模仿学习的常规损失），还额外设计损失\emph{让第 $k$ 层的预测是对“第 $(k-1)$ 层其他 agent 预测”的合理最优响应}（用真实未来轨迹监督每层输出、并让 agent 预测以“上一层其他 agent 的预测”为条件）。前面说层级 decoder 的\emph{架构}提供了 Level-k 的“骨架”（分层 + 交叉注意力）；但骨架本身不保证每层有“最佳响应”的语义——那是\emph{训练损失}注入的。类比：架构像搭好了“逐层递归”的舞台，损失函数像导演，逼每一层演出“对上一层做最佳响应”的戏。没有这个训练设计，多层 decoder 可能退化成普通的多层网络（只是更深，没有博弈语义）。
+\end{insight}
+
+\paragraph{代码走读：层级 decoder 的核心机制。}
+GameFormer 官方实现用 PyTorch，但其核心机制——交叉注意力实现的逐层最佳响应——可以用纯 NumPy 剥离出来看清楚。这里走读一个最小层级 decoder：每一层的 query 是当前 agent 的轨迹特征，key/value 是\emph{上一层各 agent 的预测 + 环境 context}——这让 agent “关注其他 agent 上一层怎么走”，再据此精化自己的预测（= 对上一层做最佳响应）。
+
+\begin{codebox}[Python]{层级 decoder：堆叠 = Level-k 递归}
+import numpy as np
+def softmax(x, axis=-1):
+    e = np.exp(x - np.max(x, axis=axis, keepdims=True)); return e / np.sum(e, axis=axis, keepdims=True)
+
+def cross_attention(query, key, value):            # 标准缩放点积注意力
+    d = query.shape[-1]
+    attn = softmax(query @ key.T / np.sqrt(d), axis=-1)   # (Nq,Nk) 注意力权重 = "谁关注谁"
+    return attn @ value, attn
+
+class GameFormerDecoderLayer:                       # 一层 decoder = 一个 Level
+    def __init__(self, d):
+        self.Wq = np.eye(d) + 0.05*np.random.randn(d, d)   # 真实中是学出来的投影
+        self.Wk = np.eye(d) + 0.05*np.random.randn(d, d)
+        self.Wv = np.eye(d) + 0.05*np.random.randn(d, d)
+    def forward(self, prev_preds, context):
+        kv = np.vstack([prev_preds, context])      # key/value = 上一层各 agent 预测 + 环境 context
+        out, attn = cross_attention(prev_preds @ self.Wq, kv @ self.Wk, kv @ self.Wv)
+        return prev_preds + out, attn              # 残差：在上一层基础上精化（最佳响应）
+
+N, M, d = 3, 2, 8                                   # 3 个 agent, 2 个环境 token, 特征维 8
+context = np.random.randn(M, d)
+preds = np.random.randn(N, d)                       # Level-0：每个 agent 独立预测的初始轨迹特征
+layers = [GameFormerDecoderLayer(d) for _ in range(3)]
+for lv, layer in enumerate(layers, 1):             # Level-1,2,3：逐层对上一层做交叉注意力精化
+    preds, attn = layer.forward(preds, context)    # attn[i,j] = agent i 对 agent j 的关注程度
+\end{codebox}
+
+\noindent 这段代码把 \cref{sec:rtg-levelk} 的 Level-k 递归在 decoder 里的化身展示得很清楚：Level-0 让每个 agent 独立预测（不看他人，递归地基）；Level-$k$ 让每个 agent 对 Level-$(k-1)$ 的预测 + context 做交叉注意力 $\to$ 精化（对 Level-$(k-1)$ 做最佳响应 \cref{eq:rtg-levelk}）。对比 \cref{sec:rtg-levelk} 的 Level-k 代码：那里“对上一层做最佳响应”是调用一次 \verb@best_response@（显式优化求解），这里是过一层交叉注意力（学习逼近的映射）——同一个 Level-k 递归骨架，一个用显式求解器实现、一个用注意力层实现，这就是“算法 $\to$ 架构”转换最具体的体现。真实 GameFormer 比这复杂得多（多头注意力、多模态轨迹、专门的训练损失），但核心数据流就是这个“逐层交叉注意力精化”，且输出是\emph{多模态}的（每个 agent 给出多条候选轨迹 + 概率，而非单条确定轨迹——因为对手意图本质不确定，强行预测单条会得到一条谁都不会走的“平均”轨迹）。
+
+\paragraph{隐式博弈 vs 显式博弈。}
+GameFormer（隐式、学习）和 iLQGames（显式、求解）代表两条对立又互补的路线，这是技术选型的关键：
+
+\begin{table}[H]\centering\small
+\caption{隐式博弈（GameFormer）vs 显式博弈（iLQGames）}
+\label{tab:rtg-implicit-explicit}
+\begin{tabular}{p{0.18\textwidth} p{0.38\textwidth} p{0.34\textwidth}}
+\toprule
+维度 & GameFormer（隐式博弈） & iLQGames（显式博弈） \\
+\midrule
+均衡求解 & 神经网络学习逼近（前向传播） & 数值求解（迭代耦合 Riccati） \\
+Level-k 实现 & decoder 层（堆叠 $k$ 层） & 算法递归（调用 $k$ 次 best response） \\
+代价函数 & 隐式、从数据学 & 显式、手工设计 \\
+可扩展性 & 强（几十 agent + HD 地图，一次前向） & 弱（agent 数增加，求解变慢） \\
+可解释性 & 弱（注意力权重 $\ne$ 显式意图） & 强（代价/均衡可解释） \\
+均衡保证 & 无（学到的近似） & 有（精确局部 Nash） \\
+数据需求 & 大（需海量驾驶数据训练） & 小（不需训练数据） \\
+典型场景 & 密集城市、大规模、产业部署 & 少 agent、要可解释/保证、研究 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 核心权衡：\textbf{GameFormer 用“可扩展 + 快 + 免设计代价”换“可解释 + 均衡保证”；iLQGames 反之。}两者也能结合（如 GameFormer 做粗预测 + iLQGames 做精细安全关键交互，或用 iLQGames 的均衡数据训练/约束 GameFormer）。一个架构层面的深层原因：Transformer 的注意力机制\emph{天然支持可变长度输入}（注意力对一组 token 操作，token 数即 agent 数可变，同一套权重处理 $3$ 个或 $30$ 个 agent 都行），而 iLQGames 的耦合 Riccati 维度随 agent 数固定增长、结构写死在代码里——这就是为什么 GameFormer 能直接上密集城市场景。
+
+\begin{insight}
+\textbf{GameFormer 是“博弈结构 + 数据驱动”的杂交体.}\;看论文时要看出“论文怎么说”和“代码怎么做”之间的落差：论文说“decoder 第 $k$ 层实现 Level-k 最佳响应”，实现是一层 Transformer decoder（权重从数据学）——\emph{误以为有显式 best-response 求解，实际是学习逼近}；论文说“对上一层做最佳响应”，实现是训练时用专门损失鼓励第 $k$ 层输出对第 $(k-1)$ 层合理——\emph{不是硬约束，是损失引导的软倾向}；论文说“层级博弈逼近 Nash”，实现是固定层数前向传播、无收敛判据——\emph{不是迭代到 Nash 不动点，是固定深度的近似}。每一行落差本质都是同一个：\emph{博弈论提供了架构的“骨架”，数据提供了骨架里的“肉”}。凡是博弈论术语（“最佳响应”“Nash”“博弈”），在实现里都被\emph{软化}成了“学习引导的倾向”而非“严格满足的数学条件”。这正是下文陷阱 1（以为它求解 Nash）的根源——把架构的博弈论\emph{灵感}误当成了求解的博弈论\emph{保证}。
+\end{insight}
+
+\begin{pitfall}[概念误区：以为 GameFormer 求解了 Nash 均衡]
+看到 GameFormer 用 Level-k 博弈、输出“近似 Nash”，就以为它像 iLQGames 一样真的求解了 Nash 均衡。后果：期望它的输出满足 Nash 的最优性条件（KKT），用它做需要均衡保证的安全分析，结果不可靠。\textbf{根本原因}：GameFormer 是\emph{学习}逼近，不是\emph{求解}——它的 decoder 层学会了“像最佳响应”的映射，但没有任何机制保证输出满足 Nash 的 KKT 条件，是从数据拟合出的近似，可能违反均衡最优性。\textbf{正解}：把 GameFormer 当成一个\emph{博弈式归纳偏置的预测器}，而非 Nash 求解器；需要均衡保证时用 iLQGames/ALGAMES（显式求解），或在其输出上加安全滤波兜底；别假设其输出满足 KKT，要做后验安全检查。
+\end{pitfall}
+
+\begin{pitfall}[论文误导：以为 decoder 层数越多（Level 越高）预测越准]
+既然 decoder 层对应 Level-k、$k$ 越高越接近 Nash，就堆很多 decoder 层期望更准。后果：层数过多时收益递减甚至下降，训练变难、过拟合、推理变慢；且偏离真实人类 $k\approx1\sim2$（\cref{sec:rtg-levelk}）的有界理性。\textbf{根本原因}：呼应 \cref{sec:rtg-levelk} 的陷阱——Level-k 的价值在 $k$ 小，真实交互的认知层级低，过多层级不对应真实人类行为，且更多层带来优化困难。GameFormer 论文用的 decoder 层数是有限的少数几层。\textbf{正解}：按论文设置用少数几层 decoder（对应 Level $1\sim3$ 量级），用验证集选最优层数；理解“层数 = 认知深度”，而真实认知深度是低的。
+\end{pitfall}
+
+\begin{pitfall}[编程陷阱：层级 decoder 中错误地让 Level-k 看到同层而非上一层]
+实现层级 decoder 时，让第 $k$ 层的 agent 对\emph{同层（第 $k$ 层）}其他 agent 的预测做注意力，而非\emph{上一层（第 $k-1$ 层）}。后果：破坏了 Level-k 递归的因果结构（Level-k 应对 Level-$(k-1)$ 响应），形成同层循环依赖，训练不稳定或退化。\textbf{根本原因}：Level-k 的定义是对\emph{上一层}做最佳响应 \cref{eq:rtg-levelk}，让它看同层会引入循环依赖（$k$ 层依赖 $k$ 层），既不符合 Level-k 语义，也使前向传播的依赖关系混乱。\textbf{正解}：严格让第 $k$ 层的 query 对第 $k-1$ 层的输出（+ encoder context）做交叉注意力，保持“逐层响应上一层”的单向依赖；检查 decoder 每层的输入是否来自前一层的输出。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （GameFormer 论文精读）精读 ICCV 2023 论文，画出 Level-k decoder 的\emph{注意力流图}：标出每层 decoder 的 query/key/value 各来自哪里（当前 agent 特征 / 上一层预测 / encoder context）。对比 GameFormer 的“隐式博弈”与 iLQGames 的“显式博弈”，列出至少四个维度的差异（可参考 \cref{tab:rtg-implicit-explicit}）。
+  \item （设计扩展）GameFormer 的 decoder 层数（Level 数）是固定超参数。设计实验：在 Waymo 或 nuPlan 子集上扫 decoder 层数 $1\sim5$，绘制“层数 vs 交互预测准确率”曲线。结合 \cref{sec:rtg-levelk} 的 $\tau\approx1.5$，讨论最优层数落在哪、为什么。
+  \item （隐式 vs 显式选型）GameFormer 用 Transformer 隐式逼近 Nash、无需迭代求解；iLQGames 用显式迭代保证精确 Nash。论证：(a) 什么场景下你会选 GameFormer（提示：agent 数量、数据可得性、实时性、可解释性需求）；(b) 什么场景下选 iLQGames；(c) 如何设计一个结合两者的系统。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{预测-规划一体化：“预测即均衡”}
+\label{sec:rtg-pred-eq}
+
+\paragraph{动机：frozen robot 的幽灵。}
+前面几节给了推断对手的工具（逆博弈、Level-k、GameFormer）。这一节把它们收束成一个\emph{范式转变}：传统自动驾驶“先预测后规划”的管线有结构性缺陷（frozen robot），而博弈视角给出最终解法。回到无保护左转、frozen robot：ego 把对向车当固定障碍，预测它会一直开过来、占满所有间隙，于是判定无安全机会、原地僵死。答案不在“更好的预测器”或“更好的规划器”，而在\textbf{两者如何组织}。传统自动驾驶把它们做成一条流水线：先预测、后规划，这个流水线本身就是 frozen robot 的温床。
+
+\paragraph{反面：传统“先预测后规划”管线的结构性缺陷。}
+传统架构是一条单向流水线“感知 $\to$ 预测（predictor 预测他人未来轨迹）$\to$ 规划（planner 在预测的他人轨迹下规划 ego）”。这条管线有一个\emph{结构性}（而非实现质量）的缺陷——predictor 和 planner 之间是\emph{单向}的：predictor 先预测他人轨迹，planner 再把这些预测当\emph{固定的}障碍来规划 ego。问题出在“固定”二字：predictor 预测他人未来时，它\emph{看不到 ego 的未来计划}（planner 还没运行），于是只能假设他人\emph{不对 ego 反应}——预测的是“他人在 ego 不存在/不动时会怎么走”。这直接导致两个病：其一，\emph{frozen robot}——predictor 预测对向车会一直直行（不会因 ego 探入而减速让行），planner 看到“所有间隙都被预测占满”，判定无安全机会，ego 僵死；其二，\emph{prediction-planning 不一致}——planner 规划的 ego 轨迹会影响他人实际行为，但 predictor 的预测没考虑这个影响，于是“预测的他人轨迹”和“ego 规划执行后他人的实际轨迹”不一致。\textbf{根子是：真实交互是双向的（ego 影响他人、他人影响 ego），而先预测后规划把它砍成了单向（他人 $\to$ ego）。}很多工程补丁（多次迭代 predictor-planner、给 predictor 喂 ego 候选计划）都是在打这个结构性缺陷的补丁，但治标不治本。
+
+\paragraph{理论：博弈视角的“预测即均衡”。}
+博弈视角的解法，是把“预测”和“规划”\emph{统一进同一个博弈均衡}，不再分成两个模块。形式化地，传统先预测后规划是两个\emph{分离}的优化：
+\begin{equation}
+  \underbrace{\hat x_{-e}=\mathrm{Predict}(\text{history})}_{\text{预测：不含 }u_e}\quad\to\quad
+  \underbrace{u_e^*=\arg\min_{u_e}J_e(u_e,\hat x_{-e})}_{\text{规划：}\hat x_{-e}\text{ 固定}}.
+  \label{eq:rtg-pred-then-plan}
+\end{equation}
+注意预测 $\hat x_{-e}$ \emph{不依赖} $u_e$（predictor 看不到 ego 计划），规划又把 $\hat x_{-e}$ 当\emph{固定}——这个单向依赖就是不一致的根源。博弈一体化把它写成一个\emph{联合不动点}——所有 agent（含 ego）的策略相互最优：
+
+\begin{definition}[预测即均衡的联合不动点]\label{def:rtg-pred-eq}
+$(u_e^*,u_{-e}^*)$ 满足
+\begin{equation}
+  \begin{cases}
+    u_e^*=\arg\min_{u_e}J_e\big(u_e,\,u_{-e}^*\big) & \text{(ego 规划：对他人响应最优)}\\[4pt]
+    u_{-e}^*=\arg\min_{u_{-e}}J_{-e}\big(u_{-e},\,u_e^*\big) & \text{(他人预测：对 ego 响应最优)}
+  \end{cases}
+  \label{eq:rtg-joint-fixedpoint}
+\end{equation}
+\end{definition}
+
+\noindent 这正是 Nash 均衡的定义（\cref{eq:rtg-nash}）。关键差别：$u_e^*$ 和 $u_{-e}^*$ \emph{相互依赖、同时求解}——ego 的规划用了他人的响应 $u_{-e}^*$，他人的预测用了 ego 的策略 $u_e^*$，二者在不动点上自洽。“他人预测”那一行 $u_{-e}^*=\arg\min J_{-e}(u_{-e},u_e^*)$ 就是“预测 = 对手最优响应”的数学表达——它\emph{含} $u_e^*$，所以预测考虑了 ego 影响（与传统的 $\hat x_{-e}$ 不含 $u_e$ 形成鲜明对比）。
+
+\begin{insight}
+\textbf{一个 argmin 含不含 $u_e$，就是全部差别.}\;盯住两种写法里“他人预测”那一项：传统 $\hat x_{-e}=\mathrm{Predict}(\text{history})$ 不含 $u_e$（预测与 ego 无关）；一体化 $u_{-e}^*=\arg\min J_{-e}(u_{-e},u_e^*)$ 含 $u_e^*$（预测是对 ego 的最优响应）。这\emph{一个变量的有无}，就是“先预测后规划”和“预测即均衡”的全部数学差别，也是 frozen robot 有无的全部根源。传统写法里，无论 ego 怎么规划，预测都不变（他人雷打不动）$\to$ ego 看到固定的占满间隙 $\to$ frozen；一体化写法里，ego 一变，他人的最优响应跟着变（会让）$\to$ ego 敢探入。所以“预测即均衡”不是加了什么复杂机制，而是把预测那个 argmin 里\emph{补上了 $u_e$ 这个被传统管线丢掉的依赖}——博弈求解器（\cref{sec:rtg-ilqgames}）天生就在解这个含 $u_e$ 的联合不动点，这就是为什么说“博弈求解器本身就是预测-规划一体化引擎”。
+\end{insight}
+
+\begin{insight}
+\textbf{frozen robot 的最终解法.}\;frozen robot 的根源，是 ego 假设对手不对自己反应（把对手当固定障碍）。“预测即均衡”从根上拔掉这个假设——在博弈均衡里，对手\emph{必然}对 ego 反应（它是对 ego 策略的最优响应）。于是 ego 在规划时就“知道”：我探入，对手会让（因为让是它在我探入时的最优响应）；ego 不再僵死，而是敢于试探。这就是把对手当决策者这条主线的终点：从“理论上承认对手是决策者”（导向博弈），到“实时求解交互均衡”（iLQGames/ALGAMES），到“推断未知对手代价 + 把预测规划统一进均衡”（逆博弈 + 本节）——frozen robot 被彻底解决。而前几节正好补上了这个范式落地所缺的最后一块——\emph{对手代价未知}怎么办：\cref{sec:rtg-inverse} 逆博弈从观测推断对手代价，\cref{sec:rtg-levelk} Level-k 用有界理性模型替代完美 Nash，\cref{sec:rtg-gameformer} GameFormer 端到端学习这个“联合预测 = 均衡”、可扩展到密集城市。
+\end{insight}
+
+\paragraph{代码走读：先预测后规划 vs 博弈一体化。}
+“frozen robot 是架构问题”听起来抽象，用一个对比 demo 让它具体。同一个汇入场景（ego 并入主道、主道有对手、冲突点在前方），两种架构的差别只在“对手是否对 ego 反应”：
+
+\begin{codebox}[Python]{先预测后规划 vs 博弈一体化}
+import numpy as np
+dt, T, conflict, gap_min, v0 = 0.5, 12, 10.0, 3.0, 5.0
+
+def simulate_A_pred_then_plan():               # 方式 A：预测器假设对手匀速（不对 ego 反应）
+    xo_pred = np.array([1.0 + v0*dt*k for k in range(T+1)])   # 预测：对手匀速直行
+    xe, ve = 0.0, v0; ego = [xe]
+    for k in range(T):
+        if conflict-gap_min < xe < conflict+gap_min:          # ego 进了冲突区
+            opp_near = any(abs(xo_pred[j]-conflict)<gap_min for j in range(max(0,k-1), min(T+1,k+2)))
+            a = -3.0 if opp_near else 0.5                      # 预测对手占着 -> ego 被迫减速
+        elif xe >= conflict+gap_min: a = 1.0
+        else: a = 0.3
+        ve = max(0, ve+a*dt); xe += ve*dt; ego.append(xe)
+    return np.array(ego)
+
+def simulate_B_game():                          # 方式 B：对手对 ego 探入做反应（让行 = 均衡最优响应）
+    xe, ve, xo, vo = 0.0, v0, 1.0, v0; ego = [xe]
+    for k in range(T):
+        ae = 1.0                                              # ego 正常并入（知道对手会让）
+        ao = -1.5 if (xe > xo-2 and abs(xe-conflict)<5) else 0.0   # 对手让行
+        ve = max(0, ve+ae*dt); xe += ve*dt; vo = max(0, vo+ao*dt); xo += vo*dt
+        ego.append(xe)
+    return np.array(ego)
+\end{codebox}
+
+\noindent 源笔记报告：方式 A 的 ego 平均速度只有 $3.13$、最低降到 $0.95$（几乎停住）——它因为预测“对手不会让”而被迫反复减速避让，通行效率极低，这就是 frozen robot 的典型表现；方式 B 的 ego 全程顺畅（平均速度 $8.00$），因为均衡告诉它“我探入，对手会让”\cite{peters2021inferring}。\pz{存疑：$3.13$/$0.95$/$8.00$ 为源笔记自报的玩具仿真输出，未复跑。}两种方式\emph{唯一}的区别是“对手是否对 ego 反应”（代码里 \verb@ao@ 是否响应 \verb@xe@）——这一行之差，就是“先预测后规划”和“预测即均衡”的全部差别。注意 frozen robot 不一定是“完全不动”，更多时候是\emph{过度保守、通行效率极低}；其根子是“预测不考虑 ego 影响”，而非预测器本身算得不准。
+
+\paragraph{与 GameFormer 的呼应。}
+\cref{sec:rtg-gameformer} 的 GameFormer 其实就是“预测即均衡”范式的一个端到端实现——它的 decoder 同时输出所有 agent 的联合轨迹（包括 ego 的规划和他人的预测），它们通过层级博弈相互响应、达到一致。论文标题里“Interactive Prediction and Planning”正是这个意思——预测和规划在一个模型里联合完成，而非分两步。这已不只是学术理念，而是当前自动驾驶的现实趋势：传统量产多年沿用“先预测后规划”的模块化管线（工程上易分工、易测试），但随着交互密集场景（无保护左转、汇入、环岛）成为 L4 落地瓶颈，业界越来越多转向博弈式/一体化的预测-规划——nuPlan 这类\emph{闭环}基准的兴起，正是因为开环预测指标无法反映“预测-规划是否一致”，而闭环才能暴露 frozen robot。
+
+\paragraph{前沿：Contingency Games——为多种意图同时备好计划。}
+“预测即均衡”还有一个尚未解决的张力：对手意图本质\emph{多模态}（\cref{sec:rtg-gameformer} 的多模态预测），可博弈求解通常给一个均衡（对应一种意图假设）。如果 ego 押注单一意图（认定对手会让），猜错就危险；如果对所有意图都保守（认定对手都不让），又会过度退缩（回到 frozen robot）。解决这个张力的前沿工作是 Contingency Games（Peters 等，RA-L 2024）\cite{peters2024contingency}：让 ego 的计划有一个\emph{共享的开头}（在意图揭晓前，对所有可能意图都安全的动作）+ 多个\emph{分支的结尾}（意图揭晓后，针对每种意图各自最优），关键参数是 branching time（意图大约何时明朗）。这比两个极端都好：比“押注单一意图”（猜错危险）安全，比“对所有意图都保守”（frozen）高效。它把 \cref{sec:rtg-gameformer} 的多模态预测和本节的预测即均衡缝合起来——不再是“预测多模态、规划押单模态”，而是“规划本身就为多模态备好分支”，是“预测即均衡”在意图不确定下的自然延伸。
+
+\paragraph{综合：一个完整的博弈式交互规划系统。}
+把全章学到的串起来，一个真实的博弈式交互规划系统在线运行时每个控制周期做四件事——推断对手、求解均衡、安全兜底、执行：
+
+\begin{codebox}[Python]{博弈式交互规划系统的在线主循环}
+def interactive_planning_loop():
+    opp_belief = init_prior()              # 对手模型先验（代价参数 + 理性层级 k）
+    while driving:
+        obs = perceive()                   # 感知：获取对手最新观测轨迹
+        # 1) 推断对手：在线逆博弈（UKF 估代价）+ 贝叶斯（估层级 k）
+        opp_belief = update_opponent_model(opp_belief, obs)
+        # 2) 求解博弈均衡 = 预测即均衡：一次求解同时得 ego 规划 + 他人预测（自洽一致）
+        ego_plan, others_pred = solve_game(opp_belief, current_state)   # iLQGames
+        # 3) 安全兜底：对手模型可能错，用 CBF/可达性把 ego_plan 投影到安全集
+        safe_control = safety_filter(ego_plan, others_pred)
+        # 4) 执行第一步，滚动前进（MPC）
+        execute(safe_control[0])
+\end{codebox}
+
+\noindent 这个循环把多项技术编织在一起：步骤 ① 推断对手用逆博弈 UKF + 贝叶斯估 $k$（\cref{sec:rtg-inverse,sec:rtg-levelk}），解决对手代价/层级未知；步骤 ② 求解均衡用 iLQGames（\cref{sec:rtg-ilqgames}），实现预测规划一体化、消除 frozen robot；步骤 ④ 滚动执行用 MPC（\cref{sec:rtg-olne-fbne}），用真实状态闭环、抗扰。步骤 ③ 的安全兜底是关键一环——\pz{安全部 CBF / HJI 可达性安全滤波章待补：当推断的对手代价有误时（下文边界二），用 CBF 或可达性把 ego 控制投影到安全集兜底硬安全；该理论的完整推导（控制障碍函数、最小限制 QP）留待安全/控制部专章 交叉引用，此处只点明其在系统中的角色。}注意步骤 ② 用了步骤 ① 推断的对手模型——这正是“逆 = 在正向外面套推断”的系统级体现：推断（外）喂给求解（内），求解的质量取决于推断的质量，三者在每个周期里闭环迭代。
+
+\begin{insight}
+\textbf{一体化消除的是“架构病”，不是“建模难”.}\;“预测即均衡”精确地解决了一类问题、又精确地留下了另一类。它\emph{消除}的是\emph{架构层面}的病——先预测后规划的单向信息流、prediction-planning 不一致、frozen robot；这类病是架构造成的，换架构（一体化）就根治。它\emph{没有消除}的是\emph{建模层面}的难——\emph{边界一}：依赖对手是“博弈式”的（分心司机、突发故障、不理性行人不在优化任何代价，均衡求解会基于错误假设）；\emph{边界二}：依赖对手模型的在线可推断性（交互刚开始观测还少时，对手模型不确定性大，此时的均衡求解是“基于猜测”的）；\emph{边界三}：计算与多均衡（求解可能很贵，且博弈可能有多个均衡，选错均衡虽自洽却可能不是期望的那个）。这类难是问题本身固有的，换架构不会消失，只能用更好的对手模型（\cref{sec:rtg-inverse,sec:rtg-levelk}）、不确定性量化（LUCIDGames）、安全兜底去缓解。一句话：\textbf{“预测即均衡”把“架构病”治好了，但把“建模难”留给了推断和安全层——认清这个边界，你才不会把它当银弹。}
+\end{insight}
+
+\begin{pitfall}[概念误区：以为“预测即均衡”只是把 predictor 和 planner 拼在一起]
+觉得“预测即均衡”就是工程上让 predictor 和 planner 多迭代几次、互相喂数据。后果：仍然维护两个分离的模块，用迭代打补丁，prediction-planning 不一致只是缓解、未根除；frozen robot 在困难场景仍出现。\textbf{根本原因}：“预测即均衡”是\emph{架构层面}的统一——不存在独立的 predictor，他人的预测就是同一个博弈均衡的一部分解，这与“两个模块迭代”有本质区别（前者在一个均衡里自洽，后者是两个目标不同的模块勉强对齐）。\textbf{正解}：用真正的博弈求解器（\cref{sec:rtg-ilqgames}）或端到端博弈模型（GameFormer）一次求出所有 agent 的联合解，而非维护分离模块；问“我的系统里，他人的预测和 ego 的规划是同一个优化/均衡的解吗？”——是，才是真正的一体化。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：忽略“预测即均衡”对对手模型正确性的依赖]
+采用了博弈一体化框架，就以为 frozen robot 一定消失、交互一定正确。后果：如果对手模型错了（代价设错、或假设 Nash 但对手是 Level-1），均衡里“他人的最优响应”是错的——ego 以为探入对手会让，对手却不让，引发危险。\textbf{根本原因}：“预测即均衡”消除的是\emph{架构层面}的不一致，但均衡的正确性仍依赖\emph{对手模型正确}，错误的对手代价/理性假设会产生错误的均衡。\textbf{正解}：博弈一体化框架必须配合\emph{正确的对手模型}——用 \cref{sec:rtg-inverse} 逆博弈在线推断对手代价、\cref{sec:rtg-levelk} Level-k 建模有界理性，让均衡基于贴合实际的对手模型；一体化架构 + 准确对手模型，缺一不可。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （架构对比）详细对比“先预测后规划”流水线与“预测即均衡”一体化两种架构。回答：(a) 为什么前者会产生 prediction-planning 不一致和 frozen robot（从信息流的单向 vs 双向角度）；(b) 后者如何从根上消除（从“他人的预测是否考虑 ego 影响”角度，即 \cref{eq:rtg-joint-fixedpoint} 那个 argmin 含不含 $u_e$）；(c) 工程上给前者打的补丁（迭代、喂候选计划）为什么治标不治本。
+  \item （设计 + 连接全章）设计一个完整的博弈式交互规划系统，要求消除 frozen robot 且处理未知对手：(a) 用什么求解器做“预测即均衡”的内核（iLQGames？GameFormer？）；(b) 如何在线获得对手模型（逆博弈推断代价？在线估计 $k$？）；(c) 如何兜底安全（CBF？）。论证各模块如何协作。
+  \item （范式反思）“预测即均衡”假设所有 agent（含人类）都在玩某种博弈。但有些 agent 行为可能根本不是博弈式的（分心司机、突发故障、不理性行人）。这种情况下“预测即均衡”会怎样？你会如何让系统对“非博弈式”的意外行为保持鲁棒（提示：结合 \cref{sec:rtg-levelk} 有界理性、意图不确定、安全兜底）？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{综合对比与选型}
+\label{sec:rtg-selection}
+
+\paragraph{动机：纸上谈兵 vs 工程决策。}
+学完五套求解器（iLQGames、ALGAMES、SE-IBR、GFNE、DG-SQP）+ 两种均衡概念（Nash、Stackelberg）+ 逆博弈推断，真正的考验是落地：给你一个具体场景——城市自动驾驶的无保护左转、无人机竞速、仓库多机器人协调、人车混行路口——你该选哪套？这不是“哪个最先进”的问题（GFNE/DG-SQP 最新不代表最该用），而是“哪个最匹配你的需求约束”。选型要同时权衡四个维度：\emph{均衡概念}（对等还是层级）、\emph{信息结构}（要不要反馈抗扰）、\emph{约束严格性}（安全约束是“尽量”还是“必须”）、\emph{计算预算}（毫秒级单次还是 $60$\,Hz 重规划够用、单次速度还是收敛成功率优先）。
+
+\begin{table}[H]\centering\small
+\caption{博弈求解器全景对比}
+\label{tab:rtg-solver-overview}
+\begin{tabular}{p{0.13\textwidth} p{0.13\textwidth} p{0.12\textwidth} p{0.13\textwidth} p{0.16\textwidth} p{0.18\textwidth}}
+\toprule
+方法 & 均衡类型 & 信息结构 & 约束处理 & 速度/特点 & 最适场景 \\
+\midrule
+iLQGames & 反馈 Nash & 反馈（抗扰强） & 弱（penalty） & 毫秒级（解析 Riccati） & 极致实时、对等、约束尽量满足 \\
+ALGAMES & 开环 GNE & 开环（需 MPC） & 强（AL，严格） & $60+$\,Hz & 安全关键、约束必须严格 \\
+SE-IBR & Nash（偏封堵） & 反馈/滚动 & 中（penalty + 灵敏度） & 实时（IBR 迭代） & 竞速、需主动封堵对手 \\
+GFNE & 广义反馈 Nash & 反馈 + 约束 & 强（互补） & 慢（约束 LQ 博弈） & 理论需“反馈 + 严格约束”两全 \\
+DG-SQP & 开环 GNE & 开环（需 MPC） & 强（SQP + 约束） & 中（高成功率） & 收敛可靠性优先、初始化难 \\
+Stackelberg & Stackelberg & 层级 & 视实现 & 双层优化 & 人车交互、车主动引导人类 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{选型决策树。}
+按四个问题依次决策：
+
+\begin{codebox}[text]{博弈求解器选型决策树}
+Q1: 交互是对等的，还是有明确先后（一方公示、另一方响应）?
+ |- 有明确先后（人车、车引导人类）
+ |    -> Stackelberg 式规划（Sadigh 2016）；需准确预测 follower 响应（IRL 学）
+ |       若 follower 有界理性 -> 考虑 MaxEnt Games
+ |- 对等（竞速、多车 merge、多机协调）-> 进入 Q2
+
+Q2: 安全约束是"尽量满足"，还是"必须严格满足"?
+ |- 尽量满足即可（开阔区域协调、约束不紧）-> 进入 Q3
+ |- 必须严格满足（碰撞、关节限位、禁飞区）
+ |    -> ALGAMES（开环 GNE + AL，配高频 MPC 补抗扰）
+ |       或 GFNE（若必须同时要反馈，且能承担计算代价）
+ |       或 iLQGames + CBF/可达性兜底（见组合策略）
+
+Q3: 你需要的核心能力是什么?
+ |- 极致实时 + 反馈抗扰 -> iLQGames（毫秒级、解析 Riccati、天然反馈）
+ |- 主动封堵对手（竞速博弈行为）-> SE-IBR（灵敏度项偏向封堵）
+ |- 收敛可靠性优先（初始化难、易发散）-> DG-SQP（SQP 稳健化、成功率高）
+\end{codebox}
+
+\noindent 这棵树的四层正好对应四个权衡维度：Q1 选均衡概念、Q2 选约束严格性、Q3 选核心能力。Q2 的“必须严格满足”分支给了三个选项——这反映一个现实：严格约束 + 反馈 + 实时这三者目前没有单一方法全占，要么牺牲一个（ALGAMES 牺牲反馈、GFNE 牺牲速度），要么用组合策略。
+
+\paragraph{工程落地的组合策略。}
+实际系统很少只用一套方法。最常见两种：
+\textbf{组合一：iLQGames（反馈 + 实时）+ 安全层（硬约束兜底）}——用 iLQGames 求反馈 Nash（毫秒级实时 + 抗扰），但其 penalty 软约束保证不了硬安全（$0.978<1.0$）；于是在它输出的控制上串一个安全滤波器（CBF 或 HJI 可达性的最小限制控制器），作为最后一道防线，把任何会违反硬安全约束的控制投影到安全集内。这样既有 iLQGames 的实时反馈交互，又有可证明的硬安全保证——博弈求解器管“怎么交互得好”，安全层管“绝不越界”。\pz{安全部 CBF/可达性章待补：此组合中安全层的具体形式（CBF 最小限制 QP、HJI 安全值函数）的完整推导留待该章 交叉引用。}
+\textbf{组合二：ALGAMES/DG-SQP（开环 GNE + 严格约束）+ 高频 MPC（补反馈）}——用 ALGAMES 或 DG-SQP 求严格满足约束的开环 GNE，但开环不抗扰（\cref{sec:rtg-olne-fbne}）；于是套一个高频 MPC 循环（$60+$\,Hz），每拍用当前实际状态重解、只执行第一步，用“高频重规划”逼出反馈效果。适合约束必须严格、且能负担高频重规划计算预算的场景。
+
+\begin{insight}
+\textbf{没有银弹，组合是常态.}\;本章五套方法没有一个是“最优解”——每个都在“反馈 / 约束严格 / 实时 / 收敛可靠 / 均衡选择”五个维度上有取舍。工程落地的智慧不在于挑一个“最强”的，而在于\emph{根据场景的核心约束选主求解器、再用辅助层补短板}：想要反馈 + 硬安全 $\to$ iLQGames + 安全层；想要严格约束 + 抗扰 $\to$ ALGAMES + MPC；想要封堵 $\to$ SE-IBR；想要收敛可靠 $\to$ DG-SQP。一句话：\textbf{选型的本质是“识别你的场景里哪个维度不可妥协，把它作为主轴选求解器，其余维度用组合策略补齐”——这比追逐“最先进的单一方法”重要得多。}这也呼应博弈规划的主线：从理论最优但算不动，到局部近似但实时，再到组合策略补短板——博弈规划的工程化，始终是在理想性质和可实现性之间做精明的取舍。
+\end{insight}
+
+\begin{pitfall}[思维陷阱：选型时追逐“最先进”而非“最匹配”]
+看到 GFNE/DG-SQP 是最新的，就默认它们比 iLQGames 更该用。后果：在只需极致实时 + 反馈的场景上了 GFNE，达不到毫秒级；或在简单对等协调场景上了 DG-SQP，付出收敛稳健化的复杂度却用不上。\textbf{根本原因}：方法的“新”不等于“适合你的场景”——GFNE 为“反馈 + 约束”、DG-SQP 为“收敛可靠性”，不是全面替代。\textbf{正解}：从场景需求出发走决策树，识别核心约束（实时性？约束严格性？收敛可靠性？），选最匹配的主求解器；问自己“这个场景里，哪个维度是绝对不能妥协的？”——答案决定主求解器，而非论文发表年份。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （综合选型）对下面四个真实场景，走一遍选型决策树，给出主求解器 + 必要的辅助层，并说明每步决策依据：(a) L4 城市自动驾驶的无保护左转（人车混行、必须严格不撞）；(b) 一对一无人机竞速（对等、要封堵、要赢）；(c) 仓库 $20$ 台 AGV 的开阔区域协调（对等、约束不紧、要实时）；(d) 高速 ramp merging（对等、必须严格不撞、要抗扰）。
+  \item （组合策略设计）详细设计“iLQGames + 安全层”的组合：(a) iLQGames 输出什么、安全层接收什么；(b) 安全层如何把不安全控制投影到安全集（最小限制 QP）；(c) 两层的频率如何配合；(d) 这个组合相比“单用 ALGAMES + MPC”各有什么优劣？
+  \item （批判性思考）本章从“HJI 理论最优但算不动”出发，发展出五套“局部近似但实时”的求解器。论证这条主线背后的根本权衡：(a) 为什么“全局最优 + 严格保证 + 实时”三者不可兼得；(b) 五套方法各自在这个“不可能三角”里牺牲了什么、换来了什么；(c) 组合策略（求解器 + 安全层）是否真的绕过了这个权衡，还是只是把它转移到了别处？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+
+把全章的陷阱与易错点收口成一张表，按“误解 $\to$ 正解”对照，便于回头自查。
+
+\begin{table}[H]\centering\small
+\caption{本章常见误解与正解}
+\label{tab:rtg-misconceptions}
+\begin{tabular}{p{0.40\textwidth} p{0.45\textwidth} p{0.08\textwidth}}
+\toprule
+误解 & 正解 & 出处 \\
+\midrule
+Stackelberg 解就是“更好的 Nash 解” & 一般不在 Nash 集合内，是不同的解概念（对手响应内生 vs 外生） & \cref{sec:rtg-concept} \\
+开环 Nash 与反馈 Nash 在 LQ 情形相同 & 一般不同——对“对手是否对未来状态反应”的预期不同 & \cref{sec:rtg-olne-fbne} \\
+开环 GNE 解可直接上车 & 开环不抗扰，必须配高频 MPC 用频率换反馈效果 & \cref{sec:rtg-olne-fbne,sec:rtg-algames} \\
+iLQGames 与 iLQR 是不同算法 & iLQGames = iLQR 换内核（单人 Riccati $\to$ 多人耦合 Riccati） & \cref{sec:rtg-ilqgames} \\
+把耦合 Riccati 写成 $N$ 个独立 LQR & 必须组装含非对角块的耦合系统，否则不是 Nash & \cref{sec:rtg-ilqgames} \\
+加大碰撞 penalty 权重就能保证不碰撞 & penalty 软约束永远逼近不保证（$0.978<1.0$），过大还病态 & \cref{sec:rtg-ilqgames,sec:rtg-algames} \\
+ALGAMES 的开环 GNE 不需 MPC & 约束严格性只在名义轨迹成立，实际状态偏离需 MPC 重解 & \cref{sec:rtg-algames} \\
+标准 IBR 收敛的 Nash 会自动封堵 & 标准 IBR 把对手当固定、不封堵；需 SE-IBR 的灵敏度项 & \cref{sec:rtg-seibr} \\
+观测一小段轨迹就能唯一反推代价 & 可识别性取决于观测信息量；短观测下参数欠定 & \cref{sec:rtg-inverse} \\
+观测轨迹一定是 Nash 均衡 & 人类有界理性（Level-k），用 Nash 解释会推出扭曲代价 & \cref{sec:rtg-inverse,sec:rtg-levelk} \\
+Level-k 随 $k$ 增大收敛 Nash，故 $k$ 越高越好 & 价值在 $k$ 小；真实人类 $k\approx1.5$；高 $k$ 未必收敛 & \cref{sec:rtg-levelk} \\
+Level-k 和 Cognitive Hierarchy 是同一模型 & Level-k：对手恰好低一层；CH：对手是更浅各层的泊松混合 & \cref{sec:rtg-levelk} \\
+GameFormer 求解了 Nash 均衡 & 它是学习逼近、非求解；无 KKT 保证 & \cref{sec:rtg-gameformer} \\
+GameFormer 的 decoder 层数越多越准 & 层数 = 认知深度，真实认知深度低（$k\approx1\sim2$） & \cref{sec:rtg-gameformer} \\
+“预测即均衡”= 把 predictor 和 planner 拼起来迭代 & 是架构统一——他人预测就是同一博弈均衡的一部分解 & \cref{sec:rtg-pred-eq} \\
+用了博弈一体化框架，frozen robot 必消失 & 还依赖对手模型正确；错误对手模型 $\to$ 错误均衡 & \cref{sec:rtg-pred-eq} \\
+选最先进的方法就对了 & 选最匹配场景的，而非最新的；识别不可妥协的维度 & \cref{sec:rtg-selection} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+本章把两个紧密相连的主题打通：\emph{实时博弈求解}（如何把博弈求解压到毫秒级、让博弈规划跑在车上）与\emph{逆博弈/意图推断}（对手代价未知时如何从行为反推、并把预测规划统一进均衡）。两条主线各有一句话内核：实时求解的内核是“\textbf{把单人 iLQR/MPC 升级为多人博弈}”，逆博弈的内核是“\textbf{逆 = 在正向求解外面套一层推断}”。
+\cref{sec:rtg-concept,sec:rtg-olne-fbne} 先定清“要求什么样的解”——Nash（对等）vs Stackelberg（层级）、反馈（抗扰）vs 开环（需 MPC）两个正交维度；\cref{sec:rtg-ilqgames} 的 iLQGames 是全章心脏（= iLQR 换内核，每步把非线性博弈局部化成 LQ 博弈、解耦合 Riccati、前向 rollout，毫秒级实时，但 penalty 软约束只能逼近安全）；\cref{sec:rtg-algames} 的 ALGAMES 用增广拉格朗日严格处理硬约束（$0.978\to1.0$，但开环、需 MPC）；\cref{sec:rtg-seibr} 的 SE-IBR 用灵敏度项在 Nash 框架内挤出封堵能力；\cref{sec:rtg-frontier} 的 GFNE（反馈 + 约束）和 DG-SQP（工业级 SQP）代表理论统一与工程稳健的最新进展。后半部，\cref{sec:rtg-inverse} 逆博弈把“从行为反推代价”形式化为最大似然 \cref{eq:rtg-mle}，核心是用隐函数定理 \cref{eq:rtg-implicit-grad} 让正向求解器可微（SE-IBR 灵敏度的“对参数版”）；\cref{sec:rtg-levelk} Level-k 用有界理性模型替代完美 Nash（真实 $k\approx1.5$）；\cref{sec:rtg-gameformer} GameFormer 把 Level-k 递归“编译”进 Transformer 层级 decoder；\cref{sec:rtg-pred-eq} 把前三者收束成“预测即均衡”——预测 = 对手最优响应、规划 = ego 最优响应、两者同时求解，从根上消除 frozen robot。\cref{sec:rtg-selection} 把全部方法串成选型决策树。贯穿全章的权衡：\textbf{全局最优、严格保证、实时三者不可兼得}，工程落地靠“求解器 + 安全层”的组合策略补短板。
+
+\subsection*{符号表}
+\begin{table}[H]\centering\small
+\caption{本章主要符号}
+\label{tab:rtg-symbols}
+\begin{tabular}{ll}
+\toprule
+符号 & 含义 \\
+\midrule
+$x_k\in\mathbb{R}^{n_x}$ & 所有玩家拼接的联合状态（时刻 $k$） \\
+$u_{i,k}\in\mathbb{R}^{n_{u_i}}$ & 玩家 $i$ 的控制；$u_{-i}$ 为其余玩家 \\
+$N,\ T$ & 玩家数、时域长度（时间步 $k=0,\dots,T-1$） \\
+$J_i$ & 玩家 $i$ 的代价（含碰撞项时为软约束/penalty） \\
+$K_{i,k},\ k_{i,k}$ & 玩家 $i$ 的反馈增益、前馈（策略 $u_i=-K_ix-k_i$） \\
+$\alpha$ & 前向 rollout 的 line search 步长 \\
+$Z_{i,k},\ \zeta_{i,k}$ & 玩家 $i$ 的 cost-to-go 二次项、一次项 \\
+$A_k,\ B_{i,k}$ & 沿名义轨迹线性化的状态/控制雅可比 \\
+$Q_{i,k},R_{ii,k},q_{i,k},r_{i,k}$ & 二次化代价的二阶/一阶导 \\
+$g(x,u)\le0,\ \lambda_i$ & 共享约束、拉格朗日乘子（ALGAMES） \\
+$\rho$ & 增广拉格朗日的惩罚系数 \\
+$\theta=(\theta_1,\dots,\theta_N)$ & 各玩家代价参数（逆博弈待估量） \\
+$x^*(\theta)$ & 正向博弈在参数 $\theta$ 下的均衡轨迹 \\
+$F(x^*,\theta)$ & 博弈均衡的 KKT 残差（堆叠所有玩家） \\
+$\pi_k$ & Level-k 策略；$\tau$ 为认知层级泊松参数 \\
+$u_L,u_F,u_F^*(u_L)$ & Stackelberg leader/follower 策略、follower 响应 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{定理与公式速查表}
+\begin{table}[H]\centering\small
+\caption{本章关键定义、定理与公式}
+\label{tab:rtg-theorems}
+\begin{tabular}{p{0.30\textwidth} p{0.40\textwidth} p{0.20\textwidth}}
+\toprule
+名称 & 一句话 & 出处 \\
+\midrule
+Nash 均衡 & 他人固定时无人能单边改善（不动点） & \cref{def:rtg-nash}, \cref{eq:rtg-nash} \\
+Stackelberg 双层优化 & leader 把 follower 响应内化进自己的优化 & \cref{eq:rtg-stack-bilevel} \\
+OLNE / FBNE & 时间函数（不抗扰）/ 状态函数（子博弈完美、抗扰） & \cref{def:rtg-olne,def:rtg-fbne} \\
+耦合 Riccati & 交叉项使 $N$ 条方程联立——博弈相对最优控制的增量 & \cref{eq:rtg-coupled-riccati} \\
+iLQGames 迭代 & iLQR 换内核：单人 Riccati $\to$ 多人耦合 Riccati & \cref{alg:rtg-ilqgames} \\
+GNEP 的 KKT & 一阶最优 + 原始/对偶可行 + 互补松弛 $\lambda^\top g=0$ & \cref{def:rtg-gnep-kkt}, \cref{eq:rtg-gnep-kkt} \\
+SE-IBR 灵敏度 & $\partial u_{-i}^*/\partial u_i=-(\partial G/\partial u_{-i})^{-1}(\partial G/\partial u_i)$ & \cref{eq:rtg-seibr-sensitivity} \\
+逆博弈 MLE & $\arg\min_\theta\sum_k\lVert x_k^*(\theta)-\hat x_k\rVert_\Sigma^2$ & \cref{def:rtg-inverse-mle}, \cref{eq:rtg-inverse-ls} \\
+均衡对参数梯度 & $\partial x^*/\partial\theta=-(\partial F/\partial x^*)^{-1}\partial F/\partial\theta$ & \cref{thm:rtg-implicit-grad}, \cref{eq:rtg-implicit-grad} \\
+Level-k 递归 & $\pi_k=\mathrm{BestResponse}(\pi_{k-1})$；$k\to\infty$ 趋于 Nash & \cref{def:rtg-levelk}, \cref{eq:rtg-levelk} \\
+预测即均衡 & 预测 = 对手最优响应、规划 = ego 最优响应，同时求解 & \cref{def:rtg-pred-eq}, \cref{eq:rtg-joint-fixedpoint} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{知识点总表}
+\begin{table}[H]\centering\small
+\caption{本章知识点与难度}
+\label{tab:rtg-knowledge}
+\begin{tabular}{p{0.06\textwidth} p{0.32\textwidth} p{0.10\textwidth} p{0.38\textwidth}}
+\toprule
+节 & 知识点 & 难度 & 一句话 \\
+\midrule
+\cref{sec:rtg-concept} & Nash vs Stackelberg & $\bigstar\bigstar$ & 对等用 Nash、层级用 Stackelberg；先手优势靠预测对手响应 \\
+\cref{sec:rtg-olne-fbne} & 开环 vs 反馈 Nash & $\bigstar\bigstar\bigstar$ & 反馈抗扰、开环需 MPC；二者一般不等 \\
+\cref{sec:rtg-ilqgames} & iLQGames & $\bigstar\bigstar\bigstar$ & iLQR 换内核，反复解耦合 Riccati，毫秒级；软约束只能逼近 \\
+\cref{sec:rtg-algames} & ALGAMES & $\bigstar\bigstar\bigstar$ & AL + KKT 根搜索，严格约束（$0.978\to1.0$），开环需 MPC \\
+\cref{sec:rtg-seibr} & SE-IBR & $\bigstar\bigstar\bigstar$ & 灵敏度项偏向封堵；KKT 隐函数算对手响应导数 \\
+\cref{sec:rtg-frontier} & GFNE / DG-SQP & $\bigstar\bigstar\bigstar\bigstar$ & GFNE 统一反馈 + 约束；DG-SQP 工业级 SQP 高成功率 \\
+\cref{sec:rtg-inverse} & 逆博弈 + 隐函数定理 & $\bigstar\bigstar\bigstar$ & 逆 = 正向外套参数拟合；隐函数定理让求解器可微 \\
+\cref{sec:rtg-levelk} & Level-k / 认知层级 & $\bigstar\bigstar\bigstar$ & 有界理性 = 想 $k$ 步就停；真实 $k\approx1.5$；贝叶斯在线估 $k$ \\
+\cref{sec:rtg-gameformer} & GameFormer & $\bigstar\bigstar\bigstar$ & Level-k 递归编译进 Transformer decoder；隐式逼近 Nash \\
+\cref{sec:rtg-pred-eq} & 预测即均衡 & $\bigstar\bigstar$ & 预测/规划是同一博弈均衡的两面；消除 frozen robot \\
+\cref{sec:rtg-selection} & 综合选型 & $\bigstar\bigstar$ & 决策树选主求解器，组合策略（求解器 + 安全层）补短板 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\begin{itemize}
+  \item \textbf{均衡概念与人车交互}：Sadigh 等，RSS 2016\cite{sadigh2016planning}（Stackelberg + IRL 影响人类，范式转变）；Ba\c{s}ar \& Olsder，\emph{Dynamic Noncooperative Game Theory}\cite{basar1999dynamic}（均衡概念、信息结构的理论圣经）。
+  \item \textbf{iLQGames（本章重心）}：Fridovich-Keil 等，ICRA 2020\cite{fridovich2020efficient}（主论文）；参考实现 \texttt{HJReachability/ilqgames}（C++）、\texttt{iLQGames.jl}（Julia，自动微分版，教学入门首选）。
+  \item \textbf{ALGAMES 与硬约束}：Le Cleac'h、Schwager、Manchester，RSS 2020 / AuRo 2022\cite{lecleach2022algames}；实现 \texttt{RoboticExplorationLab/Algames.jl}。
+  \item \textbf{SE-IBR 与竞速}：Spica 等，RSS 2018\cite{spica2020realtime}（灵敏度增强 IBR）；Wang 等，T-RO 2021\cite{wang2021gametheoretic}（Audi TTS 实车）。
+  \item \textbf{理论统一与工业级求解}：Laine 等，SIAM J.\ Optim.\ 2023\cite{laine2023computation}（GFNE）；Zhu \& Borrelli，2024\cite{zhu2024dgsqp}（DG-SQP）。
+  \item \textbf{逆博弈与意图推断}：Peters 等，RSS 2021 / IJRR 2023\cite{peters2021inferring}（逆博弈奠基）；Le Cleac'h 等，RAL 2021\cite{lecleach2021lucidgames}（LUCIDGames，在线 UKF）。
+  \item \textbf{有界理性与 Level-k}：Camerer、Ho、Chong，QJE 2004\cite{camerer2004cognitive}（Cognitive Hierarchy）；Li 等，T-CST 2018\cite{li2018game}（自动驾驶 Level-k）；Mehr 等，T-RO 2023\cite{mehr2023maximum}（MaxEnt Games）。
+  \item \textbf{端到端博弈学习与前沿}：Huang、Liu、Lv，ICCV 2023\cite{huang2023gameformer}（GameFormer）；Peters 等，RA-L 2024\cite{peters2024contingency}（Contingency Games）。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章与后续章节的关系}
+\addcontentsline{toc}{section}{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\caption{本章与其它章节的衔接}
+\label{tab:rtg-relations}
+\begin{tabular}{p{0.18\textwidth} p{0.26\textwidth} p{0.48\textwidth}}
+\toprule
+关系 & 章节 & 衔接点 \\
+\midrule
+直接前置（被本章用） & \cref{sec:ctrl-ilqr-ddp}（iLQR/DDP） & iLQGames = iLQR 换内核（\cref{alg:ctrl-ilqr} $\to$ \cref{alg:rtg-ilqgames}） \\
+直接前置 & \cref{sec:ctrl-lqr-dp}（LQR/Riccati） & 单人 Riccati（\cref{eq:ctrl-dlqr-P}）是耦合 Riccati 退耦的特例 \\
+直接前置 & \cref{sec:ctrl-mpc}（MPC） & 开环博弈 + 高频 MPC = 准反馈（\cref{sec:rtg-olne-fbne}） \\
+对立面 & \cref{ch:planning}（规划导论） & 规划导论假设环境静态/被动；本章正视“他车是决策者” \\
+理论底座（待补） & 规划部博弈理论章（HJI/可达性/连续耦合 Riccati） & \cref{eq:rtg-coupled-riccati} 的连续推导、HJI 算不动的论断待该章 交叉引用 \\
+安全兜底（待补） & 安全/控制部 CBF 与可达性 & 组合策略“求解器 + 安全层”的安全滤波器（\cref{sec:rtg-selection}）待该章 交叉引用 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\begin{table}[H]\centering\small
+\caption{本章实践常见故障与排查}
+\label{tab:rtg-troubleshooting}
+\begin{tabular}{p{0.27\textwidth} p{0.30\textwidth} p{0.35\textwidth}}
+\toprule
+症状 & 可能原因 & 排查步骤 \\
+\midrule
+iLQGames 迭代代价不降反升 / NaN & 前向 rollout 没做 line search，整步更新跨出近似有效域 & 加 line search 试递减 $\alpha\in\{1,0.5,\dots\}$；检查碰撞 penalty 权重是否过大致病态 \\
+两车互不避让 / 避让不对称 & 耦合 Riccati 漏非对角块（退化成独立 LQR）；或碰撞 penalty 没对称进双方代价 & 检查块线性系统是否含 $B_i^\top Z_iB_j(i\ne j)$；检查 penalty 梯度是否加到所有玩家；跑纳什自检 \\
+加大碰撞权重仍侵入安全区 & penalty 软约束的本质局限，无法严格满足 & 接受软约束逼近的事实；改用 ALGAMES 硬约束或串安全层 \\
+ALGAMES 仿真完美、上车违反约束 & 开环解不抗扰，实际状态偏离名义轨迹 & 配高频 MPC 每拍用实际状态重解；确认单次求解 $<$ 控制周期 \\
+SE-IBR 策略剧烈震荡 & 灵敏度项的 KKT 雅可比奇异/病态直接求逆；或 $\alpha$ 过大 & 用 solve 不求逆 + 正则化；监控雅可比条件数；减小 $\alpha$ \\
+逆博弈外层梯度下降发散（参数爆炸/NaN） & 有限差分梯度尺度大 + 固定大学习率 & 梯度归一化 + 小学习率 + 裁剪；改用隐函数定理解析梯度 \\
+逆博弈反推参数与真值差很远 & 观测信息量不足，逆问题欠定（可识别性差） & 用更长/更多样观测；改用贝叶斯后验；减少待估参数维度 \\
+博弈求解从某些初始条件不收敛 & 局部方法对初始化敏感 & 多初始化暖启动；考虑 DG-SQP（收敛域更大） \\
+Level-k 建模的对手行为过度精明 & $k$ 取太高、偏离真实人类 $k\approx1.5$ & 用小 $k$（$1\sim2$）；在线估计对手实际 $k$ \\
+\bottomrule
+\end{tabular}
+\end{table}

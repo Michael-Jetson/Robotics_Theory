@@ -1,0 +1,1184 @@
+\chapter{物理引擎：MuJoCo 软接触模型与 PhysX 对比}\label{ch:rlmc-physics}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章。
+%  主线：算法/物理建模先行 —— 先讲「接触力是怎么被求解出来的」(凸优化 vs
+%  TGS 迭代)，再落到三大框架 (mjlab / Isaac Lab / UniLab) 的对比实战。
+%  假定读者已学完强化学习理论部与本部入口章 (观测/动作设计)，不再重教
+%  MDP / PPO / actuator-PD 等基础，聚焦「物理引擎这层地基怎么调通」。
+%  源稿 RL运控/Ch03_物理引擎.md (实践偏重) 已按本主线重构：
+%   - 把「框架逐个讲」改为「概念领路 + 三框架横向对比实践」；
+%   - 对 MuJoCo / MuJoCo Warp / Isaac Lab PhysxCfg / Newton / 各论文归属
+%     做了联网核对 (见各 \rebuilt / \pz 标注与 claimsToVerify)；
+%   - 纠正了源稿若干错处 (Kamino 求解算法、mjlab nconmax 默认值等)。
+%   - 复核② (源码实跑核对, mjlab 1.4.0 / Isaac Lab 2.3.2 / UniLab 源) 修正:
+%     (a) mjlab 无 Go2 任务 (库存 G1/Go1/YAM) → 所有 mjlab 四足示例改 Go1
+%         (Mjlab-Velocity-Flat-Unitree-Go1); Isaac Lab/UniLab 仍用 Go2 (二者均有);
+%     (b) UniLab Hydra 覆盖键改下划线 algo.num_envs/max_iterations (非连字符);
+%     (c) UniLab 安装改 git clone + uv (无 pip install unilab);
+%     (d) 删除虚构的 Isaac 3.0 迁移脚本 wrap_warp_to_torch.py (官方无此工具);
+%     (e) velocity 任务覆盖值经源码逐行确认 timestep0.005/iter10/nconmax35/njmax1500.
+%  UniLab 框架已按服务器实跑 + 读源（commit 99936e08，mujoco-uni 3.8.0 /
+%   motrixsim-core 0.8.2）填入：其槽位统一沿「CPU-sim 异构」线索——MuJoCoUni 后端
+%   即 CPU MuJoCo（接触模型同 mjlab），分野在 CPU 物理 + GPU 学习的共享内存解耦、
+%   per-world 模型 DR（materialize）、内建跨后端 sim2sim 契约校验。源 arXiv:2605.30313。
+% ════════════════════════════════════════════════════════════════
+
+强化学习运动控制的每一次训练，底下都压着一台物理引擎。它在每个仿真步里回答一个问题：给定当前广义状态与执行器力矩，下一拍机器人长什么样？这台引擎不是黑盒——它对\textbf{接触}（contact）的处理方式，直接决定了你的脚为什么打滑、关节为什么抖动、四足在 MuJoCo 里走得好端端的、换到 Isaac Lab 里却步态全变。本章把物理引擎这层地基讲透，并在三大框架——mjlab（MuJoCo Warp 后端）、Isaac Lab（PhysX 默认、Newton 可选）、UniLab——上做横向对比实战。
+
+本章遵循全书「先动机、先原理，后工程」的次序，但与理论部不同，这里的原理是\emph{物理建模原理}而非 RL 原理：我们先弄清两条接触求解路线——MuJoCo 的\textbf{凸优化软接触}与 PhysX 的\textbf{TGS 迭代}——在数学上有何本质区别，再把这条区别翻译成「现象 $\to$ 检查项 $\to$ 调参方向」的工程地图，最后在三框架上给出可复制的配置代码与跨引擎验证流程。\textbf{理解建模差异，才能区分「配置错误」与「引擎特性差异」}——这是本章最核心的一条洞察，也是 ASAP（RSS 2025）等工作反复印证的事实。
+
+假定你已经读过本部入口章 \cref{ch:rlmc-obsact}（观测/动作设计），知道动作经 PD 控制器变成关节力矩、策略以 50\,Hz 决策；也假定你做过至少一次 locomotion 训练、看过 reward 曲线。若这些尚不熟悉，建议先回 \cref{ch:rlmc-obsact} 与强化学习理论部。
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-phys-env}
+
+本章涉及三套仿真栈。系统要求与版本兼容性如下表——\textbf{版本错配是本章代码跑不通的头号原因}，照抄新版文档的字段名到旧版 API 上会直接报 \verb|TypeError|。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+组件 & 锚定版本 & 操作系统 & GPU 要求 & 本章用途 \\
+\midrule
+mjlab & 1.4.0 & Linux / macOS（仅评估） & 训练需 NVIDIA & MuJoCo Warp 配置、CUDA Graph \\
+MuJoCo & $\ge 3.8.0$ & 全平台 & CPU 可跑 & \verb|MjSpec| API、CPU sim2sim 基准 \\
+MuJoCo Warp & 随 mjlab 1.4.0 & Linux & NVIDIA & GPU solver、\verb|nconmax|/\verb|njmax| \\
+Isaac Lab & 2.3.2（主线） & Linux / Windows & NVIDIA RTX & \verb|PhysxCfg|、\verb|CollisionPropertiesCfg| \\
+Isaac Lab & 3.0 Beta & Linux & NVIDIA RTX & Newton 集成、warp-native 数据管线 \\
+Newton & 1.0 GA & Linux & NVIDIA & 多求解器（MuJoCo Warp/Kamino/\dots） \\
+PhysX & 5.4+ & 随 Isaac Sim & NVIDIA & TGS 子步、residual reporting \\
+UniLab & main & Linux / macOS & 仿真 CPU；学习 CUDA/MPS/ROCm/XPU & CPU-sim 异构、跨后端 sim2sim 契约 \\
+MuJoCoUni & 3.8.0 & 全平台 & CPU 可跑 & UniLab 默认 CPU 后端（MuJoCo 语义） \\
+MotrixSim & 0.8.2 & 全平台 & CPU 可跑 & UniLab 可选 CPU 后端 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{分操作系统的安装要点。}
+\textbf{Linux} 是三框架的一等公民，下文所有命令默认在 Linux 下执行。\textbf{macOS} 只能跑 CPU MuJoCo 与 mjlab 的\emph{评估}（无 CUDA，不能训练）——这恰好够用来做 \cref{sec:rlmc-phys-sim2sim} 的 CPU 端 sim2sim 验证。\textbf{Windows} 仅 Isaac Lab 官方支持；mjlab/MuJoCo Warp 在 Windows 上非主流路径，建议用 WSL2。\textbf{UniLab} 因仿真在 CPU，对 GPU 厂商不挑——策略学习支持 CUDA/MPS/ROCm/XPU 多套后端，macOS（Apple Silicon，经 MLX）也能训练，这是它相对前两者「必须 NVIDIA 才能训」的一个生态差异。
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：五分钟切换物理后端}
+\addcontentsline{toc}{section}{Quick Start：五分钟切换物理后端}
+\label{sec:rlmc-phys-quickstart}
+
+最小可跑目标：在不改任何 reward/网络的前提下，让\emph{同一个任务}分别跑在 MuJoCo Warp 与 PhysX 上，亲眼看到「同策略、不同引擎、行为不同」。
+
+\begin{codebox}[bash]{mjlab：MuJoCo Warp 后端（pip 安装，约两分钟）}
+pip install mjlab
+# 训练 Go1 平地速度跟踪（MuJoCo Warp 是 mjlab 的唯一后端）
+# 注意：mjlab 内置四足只有 Unitree Go1（库存机器人为 G1/Go1/YAM，无 Go2），
+#       故 mjlab 侧的四足示例统一用 Go1；Isaac Lab / UniLab 侧才有 Go2 任务。
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 --env.scene.num-envs 4096
+\end{codebox}
+
+\begin{codebox}[bash]{Isaac Lab：PhysX 默认后端 / Newton 可选后端}
+# PhysX（默认）
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+    --task Isaac-Velocity-Flat-Unitree-Go2-v0 --num_envs 4096 --headless
+# Newton（Isaac Lab 3.0 Beta，一行切到 MuJoCo Warp 求解器）
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+    --task Isaac-Velocity-Flat-Unitree-Go2-v0 --num_envs 4096 --headless \
+    physics=newton
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab：CPU 物理后端切换（mujoco-uni / motrixsim）}
+# UniLab 走 git clone + uv（无 pip install unilab）：
+git clone https://github.com/unilabsim/UniLab && cd UniLab
+make setup              # 内部跑 uv sync --extra mujoco --extra motrix（装两后端）
+# UniLab 的「后端」不是 GPU 求解器，而是两个 CPU 仿真器之一（物理跑 CPU、策略跑 GPU）
+# MuJoCoUni 后端（env 数/迭代数走 Hydra 覆盖，键用下划线 num_envs/max_iterations）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=300
+# MotrixSim 后端（同任务，一行切后端）
+uv run train --algo ppo --task go2_joystick_flat --sim motrix \
+    algo.num_envs=4096 algo.max_iterations=300
+\end{codebox}
+
+\begin{note}[UniLab 的「后端」与 mjlab/Isaac Lab 不在同一维度]
+mjlab/Isaac Lab 切的是\emph{GPU 求解器}（MuJoCo Warp vs PhysX vs Newton）；UniLab 切的是\emph{CPU 仿真器}（MuJoCoUni vs MotrixSim）。这源于 UniLab 的\textbf{异构架构}——物理仿真留在 CPU 多线程批量步进，策略学习在 GPU，二者经共享内存 IPC 解耦（\emph{A Heterogeneous Architecture for Robot RL Beyond GPU-Dominant Paradigms}, arXiv:2605.30313）\cite{unilab2026}。所以本章「凸优化 vs TGS」这条求解器主线，在 UniLab 上对应的是「MuJoCoUni 的 CPU 全精度凸优化软接触 vs MotrixSim 的 CPU 求解器」，而非 GPU 后端之争。后文凡 UniLab 槽位都按这条「CPU-sim 异构」线索填。
+\end{note}
+
+\begin{practice}[前置自测：答不出 $\ge 2$ 题，建议先回本部入口章或强化学习理论部]
+\begin{enumerate}
+  \item 凸优化接触（MuJoCo）与 LCP 接触（传统引擎）在「是否保证有解」上有何区别？（本章 \cref{sec:rlmc-phys-models}）
+  \item \verb|timestep| 与 \verb|decimation| 如何共同决定 policy frequency？为什么调前者时要同步调后者？（回看 \cref{ch:rlmc-obsact} 动作处理管线）
+  \item 动作经 PD 变成力矩这件事，和「位置控制不直接改位置」是同一回事吗？（回看 \cref{ch:rlmc-obsact} 的 raw\,$\to$\,processed action）
+  \item 特权观测只进 critic、不进 actor——这条原则和「sim2sim 行为应当大致一致」有什么联系？（回看 \cref{ch:rlmc-obsact} 非对称 actor-critic）
+\end{enumerate}
+\end{practice}
+
+\paragraph{本章目标。}学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{解释}凸优化软接触与 TGS 迭代两条求解路线的数学差异，并据此判断一个任务该选哪个引擎；
+  \item \textbf{配置} mjlab 的 \verb|MujocoCfg| 与 Isaac Lab 的 \verb|PhysxCfg|，并说清每个字段的默认值来源与修改影响；
+  \item \textbf{调通}接触参数以消除穿透、弹跳、微滑——会用「现象$\to$参数」映射表定位 \verb|solref|/\verb|impratio| 或 \verb|contact_offset| 该怎么改；
+  \item \textbf{定位} MuJoCo Warp 相对 CPU MuJoCo 的能力边界（PGS/float32/dense Jacobian），避免把 CPU 配置盲目迁移到 GPU；
+  \item \textbf{画出} mjlab 从 \verb|MjSpec| 到 GPU batched worlds 再到 CUDA Graph 的完整数据流，并指出三个不可逆分界点；
+  \item \textbf{实现}一条跨引擎 sim2sim 验证流程，区分「策略学到了真技能」与「策略 overfit 了仿真器数值特性」；
+  \item \textbf{排查}物理层的稳定性（NaN/爆炸/穿透）与吞吐瓶颈，按正确优先级逐项定位。
+\end{enumerate}
+
+\paragraph{知识导航与阅读时间。}本章结构如下树。建议精读 4--5 小时（含练习）；有仿真经验者速读 2--3 小时（重点看三框架对比表与调参表）；遇到具体物理问题时速查 45 分钟（直接跳故障排查手册）。
+
+\begin{center}
+\begin{forest} navtree
+[{物理引擎实战}
+  [{建模原理\\(凸优化 vs TGS)}]
+  [{选型决策\\(任务$\to$引擎)}]
+  [{接触调参\\(症状$\to$参数)}]
+  [{模型格式\\(MJCF/USD)}]
+  [{GPU 数据流\\(MjSpec$\to$CUDA Graph)}]
+  [{跨引擎验证\\(sim2sim 三层)}]
+  [{稳定性\&吞吐\\(排查优先级)}]
+]
+\end{forest}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{接触求解的两条路线：凸优化与 TGS 迭代}
+\label{sec:rlmc-phys-models}
+
+\paragraph{模块功能与在管线中的位置。}物理引擎在 \verb|env.step()| 里被调用 \verb|decimation| 次（\cref{ch:rlmc-obsact} 已建立这条时序）。每次调用，引擎要解出接触力 $\mathbf f$，把它和执行器力矩一起积分出下一拍状态。\textbf{所有「物理上不合理的行为」都源于这一步}——而不同引擎解 $\mathbf f$ 的方法天差地别。这一节立起本章的算法主线：弄清两条求解路线，后面所有调参、选型、排查都是它的推论。
+
+\subsection{MuJoCo：广义坐标下的凸优化软接触}
+\label{sec:rlmc-phys-mujoco}
+
+MuJoCo（Multi-Joint dynamics with Contact）由 Todorov、Erez、Tassa 在 2012 年提出（论文：\emph{MuJoCo: A physics engine for model-based control}, IROS 2012）\cite{todorov2012mujoco}，两个核心设计决策决定了它的一切工程特征。
+
+\textbf{第一，广义坐标（最小坐标）。}MuJoCo 用最少的变量描述系统：一个旋转关节只需 1 个角度，而非 $3\times3$ 旋转矩阵。一个直接后果是\textbf{位置维度 \texttt{nq} 不等于速度维度 \texttt{nv}}——自由基座（free joint）的姿态用 4 元四元数表示（$\mathbf q\in\SO(3)$ 取 Hamilton 约定），但其角速度只有 3 维。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+关节类型 & \texttt{nq} 贡献 & \texttt{nv} 贡献 & 说明 \\
+\midrule
+\texttt{free}（自由基座） & 7（3 平移 $+$ 4 四元数） & 6（3 线速 $+$ 3 角速） & $\texttt{nq}-\texttt{nv}=1$ \\
+\texttt{ball}（球关节） & 4（四元数） & 3（角速） & $\texttt{nq}-\texttt{nv}=1$ \\
+\texttt{hinge}（旋转） & 1 & 1 & 相等 \\
+\texttt{slide}（平移） & 1 & 1 & 相等 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+举例：Go2（四足）$=$ free $+$ 12 hinge $\Rightarrow\texttt{nq}=7+12=19,\ \texttt{nv}=6+12=18$；G1（人形）$=$ free $+$ 29 hinge $\Rightarrow\texttt{nq}=36,\ \texttt{nv}=35$。这条差异在 \cref{ch:rlmc-obsact} 构造观测时已经埋下伏笔：从 \verb|qpos| 切出关节角要跳过基座的 7 维，从 \verb|qvel| 切要跳过 6 维。
+
+\textbf{第二，凸优化软接触。}这是 MuJoCo 与其他引擎最大的分野。传统引擎（ODE、Bullet 早期）把接触力求解表述为\textbf{线性互补问题}（LCP）——数学上 NP-hard，求解器只能近似且\emph{可能发散}。MuJoCo 的做法不同：把刚性接触松弛为\emph{软接触}（允许微小穿透），再把接触力求解写成一个\textbf{凸优化}问题。凸优化有全局最优且总是可解——意味着 MuJoCo 的求解器\textbf{不会发散}。其核心动力学方程为
+
+\begin{equation}
+\mathbf{M}(\mathbf q)\,\dot{\mathbf v} + \mathbf c(\mathbf q,\mathbf v) = \boldsymbol\tau + \mathbf{J}(\mathbf q)^{\mathsf T}\mathbf f,
+\label{eq:rlmc-phys-mjdyn}
+\end{equation}
+
+各项与 mjlab 中的工程对应如下表。理解这张表的价值不在推导，而在于它给你一张「现象$\to$方程项$\to$检查项」的诊断地图（见 \cref{sec:rlmc-phys-diag}）。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{4.2cm}@{}}
+\toprule
+符号 & 含义 & MuJoCo 数据字段 \\
+\midrule
+$\mathbf{M}(\mathbf q)$ & 广义质量矩阵 & \verb|MjData.qM|（稀疏下三角） \\
+$\dot{\mathbf v}$ & 广义加速度 & \verb|MjData.qacc| \\
+$\mathbf c(\mathbf q,\mathbf v)$ & 科氏力 $+$ 重力项 & \verb|MjData.qfrc_bias| \\
+$\boldsymbol\tau$ & 执行器力矩 & \verb|MjData.qfrc_actuator| \\
+$\mathbf{J}(\mathbf q)$ & 接触 Jacobian & \verb|MjData.efc_J| \\
+$\mathbf f$ & 接触力 & \verb|MjData.efc_force|（凸优化解出） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[每一步仿真都在解一个优化问题]\label{ins:rlmc-phys-convex}
+MuJoCo 的每个仿真步，本质是在\emph{求解一个凸优化}：给定当前状态与执行器力矩，找到使穿透「代价」最小化的接触力。这就是为什么 MuJoCo 的接触行为比游戏引擎更「物理正确」、却也更贵。更深一层的反事实：若 MuJoCo 改用硬接触（像 PhysX），它在灵巧手操作（几十个接触点同时活跃、互相约束）中会经常求解失败——因为 LCP 在这种情形最容易不收敛。\textbf{凸优化是 Todorov 选择软接触的根本理由，而非偶然}。
+\end{insight}
+
+\paragraph{一个常被误解的物理事实：位置控制不直接改位置。}在 MuJoCo 里「设 joint position target $=0.5$\,rad」\emph{不会}把关节瞬移到 $0.5$\,rad——actuator 只产生一个朝向 $0.5$\,rad 的力矩，关节是否到达取决于惯量、摩擦、接触与 \verb|timestep|。这正是 \cref{ch:rlmc-obsact} 里 raw\,$\to$\,processed action 之后那一段「processed action 还要经 PD 才成为力矩」的物理落点。推论：kp 过大 $+$ \verb|timestep| 过粗 $\Rightarrow$ 力矩 overshoot $\Rightarrow$ 振荡。
+
+\paragraph{Integrator 选型。}MuJoCo 共四种积分器（\verb|Euler|/\verb|implicit|/\verb|implicitfast|/\verb|RK4|）；训练中最常用前两者。注意 MuJoCo 的 \verb|Euler| 是\emph{半隐式}（用新速度更新位置，并对 joint damping 做隐式处理），并非教科书里的显式 Euler。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{4.4cm}p{4.0cm}c@{}}
+\toprule
+Integrator & 核心思想 & 对 actuator 的处理 & mjlab 默认 \\
+\midrule
+\verb|euler| & 半隐式（隐式处理 joint damping） & 视 actuator 力矩为外部常量 & 否 \\
+\verb|implicitfast| & implicit-in-velocity & 隐式处理 builtin actuator 的速度依赖 & 是 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+为什么 \verb|implicitfast| $+$ builtin actuator 最稳？Builtin actuator 创建 MuJoCo 原生 \verb|<position>|/\verb|<velocity>| 元素，integrator 能「看见」这些速度相关力，于是可在积分时\emph{提前考虑}阻尼（像把弹簧阻尼器装进引擎内部，引擎知道弹簧公式）。而 explicit actuator 在 PyTorch 里算 torque、经 \verb|<motor>| passthrough，integrator 看不到控制律对速度的导数，高增益 PD 更易不稳。这条结论在 \cref{sec:rlmc-phys-tuning} 的关节振荡案例里会被直接用到。
+
+\subsection{PhysX：笛卡尔坐标下的 TGS 迭代}
+\label{sec:rlmc-phys-physx}
+
+PhysX 是 NVIDIA 的物理引擎，从游戏引擎演进而来，是 Isaac Lab 的默认后端。设计哲学与 MuJoCo 截然相反。
+
+\textbf{笛卡尔坐标（最大坐标）：}PhysX 用 position $+$ orientation 表示每个刚体，关节通过\emph{约束}（而非最小坐标）实现。建模上更直观（每个物体位姿都是显式的），代价是每步要求解约束以维持关节连接。
+
+\textbf{TGS（Temporal Gauss-Seidel）求解器：}PhysX 5 的核心创新。传统 PGS 对整个时间步做 $N$ 次迭代；TGS 把时间步细分为 $N$ 个等大子步，每个子步做一次约束求解后\emph{立即更新位置}——等效于「小 $\mathrm dt\times$ 单次迭代」，对接触与 articulation 的数值稳定性显著更好。
+
+\begin{insight}[position iteration 的双重身份]\label{ins:rlmc-phys-tgs}
+PhysX TGS 里 \verb|position_iteration_count| 有两重解读。\emph{求解器视角}：它是「迭代次数」，越多则约束求解越精确。\emph{积分器视角}：它是「子步数」，4 次迭代等效于把 $\mathrm dt$ 切成 4 个 $\mathrm dt/4$ 的子步、每子步解完即更新位置。这就是 TGS 收敛优于 PGS 的根由——PGS 用 4 次迭代啃同一个大 $\mathrm dt$，TGS 用 4 个小 $\mathrm dt$ 逐步逼近。一个跨领域类比：这正像解线性方程组时\emph{直接法 vs 迭代法}的权衡——MuJoCo 凸优化像 LU 分解（慢但总给最优解），PhysX TGS 像 Gauss-Seidel 迭代（快且通常够好，极端情形可能不收敛）。
+\end{insight}
+
+\textbf{PhysX 的 patch friction 模型：}PhysX 不对每个接触点独立算摩擦，而是把相邻接触点合并成一个「接触片」（patch），在 patch 上算摩擦。多数场景足够好，但在需要精确逐点摩擦的场景（灵巧手、足端抓地分析）中，不如 MuJoCo 的逐接触点摩擦精确。这条差异在 \cref{sec:rlmc-phys-select} 的灵巧手选型里是决定性的。
+
+\subsection{Newton：多求解器统一封装}
+\label{sec:rlmc-phys-newton}
+
+Newton（NVIDIA $\times$ Google DeepMind $\times$ Disney Research 联合开发，构建于 NVIDIA Warp $+$ OpenUSD，Apache 2.0，已托管于 Linux Foundation）官方定位是一个\textbf{开源、GPU 加速、可微分、可扩展}的物理仿真引擎\cite{newton2026}。它的关键特征是\textbf{模块化的多求解器架构}——用统一数据模型与 API 组织多个 solver，按任务接入不同求解器。其文档列出的求解器包含 MuJoCo Warp、Featherstone、XPBD、VBD、SemiImplicit（半隐式 Euler）、Style3D、Implicit MPM，外加专攻闭环机构的 Kamino（已核对 Newton 官方文档与 NVIDIA 公告）。\pz{具体清单与各求解器的 Alpha/GA 状态随 Newton release 变动，部署前以目标版本文档为准。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+求解器 & 来源 & 接触/方法 & 适用场景 \\
+\midrule
+MuJoCo Warp & DeepMind & 凸优化软接触 & 通用刚体、足式 locomotion \\
+Kamino & Disney Research $\times$ NVIDIA & Proximal-ADMM（NCP） & 闭环机构（平行连杆腿） \\
+XPBD & 社区 & 位置约束投影 & 软体、小规模接触 \\
+VBD & Style3D & Vertex Block Descent & 布料、线缆 \\
+Featherstone & 标准算法 & 铰链体算法 & 机械臂运动链 \\
+Implicit MPM & 研究 & 连续介质 & 颗粒、沙地、雪地 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Kamino 求解器}（Disney Research 主导，与 NVIDIA、Google DeepMind 合作；论文 \emph{Kamino: GPU-based Massively Parallel Simulation of Multi-Body Systems with Challenging Topologies}, arXiv:2603.16536）\cite{kamino2026}是其中最值得关注的新成员——专攻在 GPU 上高效仿真\textbf{闭环机构}（kinematic loops）的求解器。开链（open chain）从基座到末端只有一条路径，标准 MuJoCo 用广义坐标原生支持；但 Digit 的平行连杆腿、BRUCE 的四连杆膝关节是\emph{闭链}（closed-loop），从基座到末端有多条路径成环。MuJoCo 传统上用 \verb|<equality type="connect">| 约束「焊接」两关节，物理上是\emph{近似}（允许微小违反）；Kamino 用最大坐标直接在约束满足空间内求解。
+
+\begin{note}[Kamino 求解算法的两个层次（易混）]
+Kamino 常被一句「Proximal-ADMM」带过，但它其实分两层，分清才不会查文献时对不上号。\textbf{外层（优化算法）}：把闭链前向动力学转写为\emph{非线性互补问题}（NCP），用 \textbf{Proximal-ADMM}（PADMM）求解——这一层「Proximal-ADMM」的说法是\emph{对}的。\textbf{内层（线性代数）}：每个 ADMM 步要解一个以 Delassus 算子 $\mathbf D$ 为系数的线性系统，小/稠密系统\emph{显式装配} $\mathbf D$ 并做\textbf{块-Cholesky（block-$LL^{\mathsf T}$）分解}（因 $\mathbf D$ 在一拍内不变，一次分解可跨多次迭代复用），大系统则\emph{不显式构造} $\mathbf D$、以 matrix-free 的稀疏矩阵-向量积配 \textbf{warm-started 共轭残差}（Conjugate Residual）迭代求解。\textbf{要点}：ADMM 是\emph{外层优化器}，block-Cholesky / Conjugate Residual 是\emph{内层线性求解器}，二者不矛盾、是不同抽象层。（依据 arXiv:2603.16536 全文）
+\end{note}
+
+\textbf{实用建议：}多数四足/人形\emph{没有}闭环机构，不需要 Kamino——MuJoCo Warp 就够。若有平行连杆腿，短期用 MuJoCo 的 equality constraint 近似可工作，长期可在 Newton/Kamino 成熟后迁移。Newton 的价值不在「又多一个选择」，而在让\textbf{跨引擎验证}变简单——同一套 Isaac Lab 代码，改一行配置即可在 PhysX 与 MuJoCo Warp 间切换，观察策略在不同物理模型下的行为差异（\cref{sec:rlmc-phys-sim2sim}）。在 Isaac Lab 3.0 Beta 中选 Newton 后端时，实际默认使用的是 MuJoCo Warp 求解器。
+
+\begin{note}[Newton 后端在 Isaac Lab 3.0 Beta 的功能缺口]
+截至本章锚定版本，Newton 后端\emph{尚不支持} deformable objects、surface grippers 与 material randomization——这些仍是 PhysX-only（已核对 Isaac Lab 3.0 Beta 官方文档：``Some features including deformable objects, surface grippers, and material randomization are PhysX-only''）。Beta 功能矩阵更新频繁，部署前仍建议查 Isaac Lab 3.0 Release Notes 的最新支持表。
+\end{note}
+
+\subsection{三引擎核心对比}
+\label{sec:rlmc-phys-compare}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{3.2cm}p{3.2cm}p{3.0cm}@{}}
+\toprule
+维度 & MuJoCo (Warp) & PhysX 5 & Newton \\
+\midrule
+坐标系统 & 广义（最小） & 笛卡尔 $+$ 约束 & 取决于子求解器 \\
+接触模型 & 凸优化（软接触） & TGS 迭代（硬接触近似） & MuJoCo Warp 等 \\
+摩擦模型 & 逐接触点（cone） & patch friction & 取决于子求解器 \\
+求解保证 & 总收敛（凸） & 可能不收敛（迭代） & 取决于子求解器 \\
+接触精度 & 高（密接触优势明显） & 中-高（多数场景够） & 高（经 MuJoCo Warp） \\
+大规模场景 & 中（$>60$ DOF 降速） & 高（游戏引擎基因） & 高 \\
+模型格式 & MJCF & URDF/USD & 两者皆可 \\
+默认所属框架 & mjlab & Isaac Lab & Isaac Lab 3.0 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{UniLab 落在这张表的哪里？}本表比的是\emph{物理引擎}，而 UniLab 是\emph{框架}——它的 MuJoCoUni 后端\textbf{就是 CPU 上的 MuJoCo}，故引擎特征（广义坐标、凸优化软接触、逐接触点摩擦、总收敛）整列\emph{与 MuJoCo 那列相同}；MotrixSim 则是另一套 CPU 求解器。UniLab 的真正分野不在「换引擎」，而在\textbf{把这套 CPU 物理与 GPU 学习用共享内存解耦}的异构架构（\cref{sec:rlmc-phys-dataflow} 详述）——所以下文凡 UniLab 槽位，重点不是「它的接触模型有何不同」（它就是 CPU MuJoCo），而是「同一套 MuJoCo 物理，在异构运行时里数据流/DR/sim2sim 怎么变」。
+
+\paragraph{运行验证：怎么确认引擎确实在按预期工作。}启动训练后，第一拍就该用 zero agent 可视化（\cref{ch:rlmc-obsact} 提过的 sanity check）：机器人应以默认姿态\emph{静止站立}而非穿地、漂浮或扭曲。若静止站立 $\Rightarrow$ 重力、接触、初始姿态都对；若穿地 $\Rightarrow$ 接触没生效（查 \cref{sec:rlmc-phys-tuning}）；若漂浮 $\Rightarrow$ 重力被设成了 $(0,0,0)$。
+
+\begin{pitfall}[把「接触精度高」直接等同于「更好」]
+\textbf{错误描述：}认为 MuJoCo 接触精度高，所以一切任务都该用 MuJoCo。\textbf{现象后果：}为桌面推物、导航避障这类\emph{稀疏接触}任务平白背上 mjlab/MuJoCo 在大规模场景的吞吐劣势。\textbf{根本原因：}MuJoCo 的精度优势集中在\emph{足端抓地力需精确控制}的任务（四足粗糙地形、灵巧手）；稀疏接触场景 PhysX 完全够用且更快。\textbf{正确做法：}按任务的接触密集程度选型（\cref{sec:rlmc-phys-select}），而非按「精度高低」一刀切。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{方程退化}：解释 \eqref{eq:rlmc-phys-mjdyn} 中每一项的物理含义。当 $\mathbf f=\mathbf 0$（无接触）时方程退化成什么？给出一个使之成立的物理场景。\emph{验收：}写出退化后的方程并指出「机械臂在空中自由运动」即为该场景。
+  \item \textbf{维度计算}：对 free $+$ 12 hinge 的四足，算 \texttt{nq}/\texttt{nv}；对 free $+$ 29 hinge $+$ 2 ball 的人形再算一次。\emph{验收：}四足 $19/18$；人形 $7+29+2\times4=44$，$6+29+2\times3=41$。
+  \item \textbf{TGS 等效 dt}：若 \verb|position_iteration_count=4|、$\mathrm dt=0.005$，TGS 等效的有效子步是多大？\emph{验收：}$0.005/4=0.00125$\,s。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{从方程到诊断：现象-方程项-检查项映射}
+\label{sec:rlmc-phys-diag}
+
+\paragraph{为什么先讲诊断、再讲调参。}\cref{sec:rlmc-phys-models} 给了动力学方程 \eqref{eq:rlmc-phys-mjdyn}。它最大的工程价值，是把「机器人做了物理上不合理的事」翻译成「方程哪一项出了问题」，从而避免一上来就盲调 reward。\textbf{Reward 只能引导策略的优化方向；若物理本身不稳定，再好的 reward 也学不出合理行为}——这是本章与「奖励设计」章的分工边界。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+现象 & 方程项对应 & 第一检查项 \\
+\midrule
+机器人飞走 & $\boldsymbol\tau$ 太大 & action scale、actuator gains \\
+穿透地面 & $\mathbf f$ 接触解异常 & contact 参数、solver iterations \\
+高频关节抖动 & $\mathbf{M}$-damping-\verb|timestep| 不稳 & \verb|timestep|、integrator、kd \\
+动作无效果 & $\boldsymbol\tau$ 链路断裂 & ctrl 地址、actuator target \\
+脚底打滑 & $\mathbf f$ 中摩擦不足 & friction、condim、cone \\
+关节限位卡死 & $\mathbf f$ 的 joint-limit 约束 & joint range、solref \\
+奇怪的旋转 & $\mathbf c$ 中科氏/离心力 & 惯量参数是否正确 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[遇到物理异常，第一反应不是调 reward]\label{ins:rlmc-phys-reward}
+当训练中机器人「做了物理上不合理的事」，正确的第一反应是回到上表、检查物理层是否正确，而非去调 reward 权重。这条洞察会在 \cref{sec:rlmc-phys-stability} 的排查优先级里被制度化：先物理层（action/timestep/contact），后 RL 层（reward/DR/obs noise）。它的反面教训在源稿里反复出现——有人在「奖励设计」阶段发现「机器人总摔倒」，花一周调 reward，最后发现是 \verb|solref| 太软导致脚底微滑。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{引擎选型：从任务接触特征到后端选择}
+\label{sec:rlmc-phys-select}
+
+\paragraph{模块功能与在管线中的位置。}选型是物理层的第一个决策，发生在写任何配置之前。它与\emph{框架选型}（mjlab vs Isaac Lab）是两个独立维度——尤其 Isaac Lab 3.0 起支持多后端后，在 Isaac Lab 内部也要再选 PhysX 还是 Newton/MuJoCo Warp。
+
+\subsection{选型决策的算法主线：看接触特征}
+
+选型的\textbf{主线判据是任务的接触特征}，而非框架流行度。下面这棵决策树把它显式化（这里把它当算法读：从根节点的「是否需要视觉」一路走到叶子）。
+
+\begin{codebox}[text]{引擎/框架选型决策树（按接触特征领路）}
+新任务
+ ├─ 需要 RGB/Depth 视觉输入？
+ │    ├─ 是 → Isaac Lab（RTX 渲染）
+ │    │        └─ 接触精度重要？是 → Isaac Lab 3.0 + Newton(MuJoCo Warp)
+ │    │                          否 → Isaac Lab + PhysX(默认)
+ │    └─ 否 → 看接触密集度
+ ├─ 接触是否密集？
+ │    ├─ 足式 locomotion（足端频繁建/断接触）→ mjlab(MuJoCo Warp)
+ │    ├─ 灵巧手（多指接触耦合）             → mjlab(MuJoCo Warp)
+ │    ├─ 桌面推/抓取（少量接触点）           → PhysX 足够
+ │    └─ 物流/码垛（大规模刚体堆叠）          → PhysX 更快
+ ├─ 需要闭环机构？是（平行连杆腿）→ Newton + Kamino
+ ├─ 需要软体/布料？  是 → Newton + VBD/XPBD
+ └─ 只要最快启动/最简安装？是 → mjlab(pip install)
+\end{codebox}
+
+\begin{insight}[选型不是「哪个更好」，而是「哪个更配当前任务」]\label{ins:rlmc-phys-select}
+很多研究者在\emph{同一项目}里用两个框架：在 mjlab 中快速迭代 reward 设计（pip 安装、秒级启动），在 Isaac Lab 中做最终训练与视觉策略（RTX 渲染、多 RL 后端）。这正是本部「双框架对照」教学的收益所在——只会一个框架，遇到「四足$+$视觉操作」这类跨界任务就会被迫做次优选型。
+\end{insight}
+
+\subsection{选型速查表与一个反面案例}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+任务类型 & 推荐引擎 & 推荐框架 & 理由 \\
+\midrule
+四足 flat/rough & MuJoCo Warp & mjlab & 接触精度 $+$ 安装简单 \\
+人形 locomotion & MuJoCo Warp & mjlab 或 Isaac Lab & 两者皆强 \\
+灵巧手操作 & MuJoCo Warp & mjlab 或 Isaac Lab 3.0 & 逐接触点摩擦 \\
+机械臂 pick-and-place & PhysX & Isaac Lab & 接触要求低 $+$ RTX \\
+视觉策略（RGB） & PhysX & Isaac Lab & RTX 渲染是刚需 \\
+多算法对比 & PhysX & Isaac Lab & 多 RL 后端 \\
+闭环（平行连杆） & Kamino & Isaac Lab 3.0 $+$ Newton & 唯一支持闭环的 GPU 求解器 \\
+布料/线缆 & VBD & Isaac Lab 3.0 $+$ Newton & VBD $+$ MuJoCo Warp 耦合 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{反面案例（接触模型选错的代价）。}某同学做灵巧手操作（Allegro hand $+$ 抓取），选了 Isaac Lab $+$ PhysX 默认后端，训练两周，策略学会「用手掌按住物体」而非「用手指灵巧抓取」——因为 PhysX 的 patch friction 把多个指尖接触合并成一个大 patch，\textbf{手指间的独立摩擦力丢失了}。若一开始选 mjlab（MuJoCo Warp 逐接触点摩擦），可能一周内就训出更好策略。这就是 \cref{ins:rlmc-phys-tgs} 里 patch friction 差异的直接工程后果。
+
+\begin{pitfall}[因为「大家都用 Isaac Lab」而选 Isaac Lab]
+\textbf{错误描述：}凭流行度而非任务需求选框架。\textbf{现象后果：}纯 locomotion 且不需视觉的任务，被迫承担 Isaac Sim 30--60 分钟安装与十几秒启动，迭代效率大降。\textbf{根本原因：}框架流行度 $\neq$ 任务匹配度。\textbf{正确做法：}纯 locomotion 优先考虑 mjlab 的 pip 安装与秒级启动；需要视觉/多 RL 后端再上 Isaac Lab。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item 为三个课题选引擎$+$框架并说理由：(a) ANYmal D 上楼梯，(b) Franka 从 RGB 抓桌面物体，(c) 平行连杆腿双足 locomotion。\emph{验收：}(a) MuJoCo Warp/mjlab；(b) PhysX/Isaac Lab；(c) Newton$+$Kamino/Isaac Lab 3.0。
+  \item 「人形全身操作」（上身抓物 $+$ 下身行走）的上、下身接触要求各如何？你会推荐什么引擎？为什么它比纯 locomotion 或纯操作更难选型？\emph{验收：}指出上下身接触诉求不同、需在「足端精度」与「视觉/多后端」间权衡，并给出明确选择。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{接触参数调优：三框架对比实战}
+\label{sec:rlmc-phys-tuning}
+
+\paragraph{模块功能与在管线中的位置。}引擎选好后，「出厂设置」未必适合你的任务：足式需高摩擦地面（否则打滑），灵巧手需适中物体摩擦（太高放不下、太低抓不住），装配需精确接触刚度。本节给出三框架的核心接触参数与「症状$\to$参数」调优直觉。\textbf{算法主线：}先认清两套参数背后是两套\emph{机制}（MuJoCo 是物理层的刚度/阻尼，PhysX 是求解器层的精度/性能权衡），再分别给操作步骤。
+
+\subsection{概念层：两套参数、两套机制}
+
+\begin{insight}[MuJoCo 调「物理」，PhysX 调「求解器」]\label{ins:rlmc-phys-twoparams}
+MuJoCo 的接触参数是\textbf{物理层}的——你在控制接触的力学行为（刚度 \verb|solref[0]|、阻尼 \verb|solref[1]|）。PhysX 的接触参数是\textbf{求解器层}的——你在控制求解器的精度/性能权衡（迭代数、接触检测距离）。这条本质差异意味着\textbf{跨引擎调参不能「翻译参数值」}：把 MuJoCo 的 \verb|friction| 数值原样填进 PhysX 的 \verb|static_friction| 是错的，因为 cone 摩擦模型与 patch friction 是两套数学。
+\end{insight}
+
+\subsection{MuJoCo / mjlab：solref、solimp 与 impratio}
+
+MuJoCo 软接触由两组参数控制：
+
+\begin{itemize}
+  \item \textbf{\texttt{solref = [timeconst, dampratio]}}：控制接触的「弹簧-阻尼」行为。\verb|timeconst| 越小接触越硬（恢复越快）；\verb|dampratio|$=1.0$ 为临界阻尼，$<1$ 欠阻尼（振荡），$>1$ 过阻尼。
+  \item \textbf{\texttt{solimp = [d0, d1, width, midpoint, power]}}：控制约束阻抗函数形状。默认 \verb|[0.9, 0.95, 0.001, 0.5, 2]| 对绝大多数材质够好，仅特殊材质需改。
+\end{itemize}
+
+配置项四维表（默认值来源/修改影响/合理范围/与他项耦合）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{2.4cm}p{2.8cm}p{2.2cm}p{2.6cm}@{}}
+\toprule
+参数 & 默认值（来源） & 修改影响 & 合理范围 & 耦合 \\
+\midrule
+\verb|timestep| & 0.002（\verb|MujocoCfg| 类默认） & 越小越稳越慢 & 0.002--0.005 & 与 decimation 决定 policy freq \\
+\verb|impratio| & 1.0（\verb|MujocoCfg|） & 增大减微滑 & 1--10 & locomotion 推荐 5--10 \\
+\verb|cone| & pyramidal（\verb|MujocoCfg|） & elliptic 更精确更慢 & 二选一 & 与 friction 共同决定摩擦 \\
+\verb|iterations| & 100（\verb|MujocoCfg| 类默认） & 增大更精确更慢 & 10--100 & 与 solver 类型相关 \\
+\verb|solref[0]| & 0.02（MJCF geom） & 减小则接触更硬 & 0.005--0.05 & 太硬则 solver 难收敛 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[源稿勘误：mjlab 的 \texttt{timestep}/\texttt{iterations}/\texttt{nconmax} 默认值]
+源稿在不同处把 mjlab 默认 \verb|timestep| 记作 0.005、\verb|iterations| 记作 10、\verb|nconmax| 记作 35。经核对 mjlab 源码 \verb|src/mjlab/sim/sim.py|（实测 1.4.0，1.2.0 以来这些默认值稳定未变）：\verb|MujocoCfg| 的\emph{类默认}是 \verb|timestep=0.002|、\verb|iterations=100|、\verb|tolerance=1e-8|；而 \verb|SimulationCfg.nconmax/njmax| 的\emph{类默认是 None}（即交给 MuJoCo Warp 内部自动分配）。0.005/10 与 nconmax=35/njmax=1500 实为 velocity 任务在 \verb|velocity_env_cfg.py| 里的\emph{显式覆盖值}（已逐行核对：\verb|timestep=0.005, iterations=10, nconmax=35, njmax=1500|），非 \verb|MujocoCfg| 类默认。\textbf{现象后果：}若以为「类默认就是 0.005/10/35」去解释配置，会与源码对不上。\textbf{正确做法：}区分「\texttt{MujocoCfg} 类默认（0.002/100，\texttt{nconmax/njmax=None}）」与「velocity 任务覆盖值（0.005/10/35/1500）」——后文凡引用 0.005/10 处均按任务覆盖值理解。
+\end{pitfall}
+
+\textbf{调优三步：}先用默认值训练 $\to$ 观察症状（穿透?弹跳?微滑?）$\to$ 按下表调参。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+症状 & 原因 & 调参方向 \\
+\midrule
+脚底穿透地面 & \verb|solref| 太软（\verb|timeconst| 太大） & 减小 \verb|timeconst|（0.02$\to$0.005） \\
+落地反复弹跳 & \verb|dampratio| 太低 & 增大 \verb|dampratio|（1.0$\to$1.5） \\
+斜面缓慢滑动 & 软接触固有微滑 & 增大 \verb|impratio|（1$\to$10） \\
+高速碰撞后「粘」 & \verb|solref| 太软 $+$ \verb|solimp.d0| 太低 & 减 \verb|timeconst| $+$ 增 d0 \\
+接触时高频振荡 & \verb|timestep| 太大 & 减小 \verb|timestep|（0.005$\to$0.002） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{codebox}[Python]{mjlab：三种修改接触参数的入口}
+from mjlab.sim import MujocoCfg, SimulationCfg
+
+# 入口 1：MujocoCfg 全局设置
+sim_cfg = SimulationCfg(
+    mujoco=MujocoCfg(
+        timestep=0.005,      # velocity 任务覆盖值（类默认 0.002）
+        solver="newton",     # 总用 newton；pgs 在 Warp 上不完整支持
+        iterations=10,       # 任务覆盖值（类默认 100）
+        impratio=5.0,        # 增大以减少微滑（默认 1.0）
+        cone="pyramidal",    # pyramidal 快 / elliptic 精确
+        ls_iterations=50,    # 线搜索迭代上限（实测类默认 50）；接触求解不收敛时可加
+        jacobian="auto",     # auto/dense/sparse；GPU(Warp) 路径常落到 dense（见下方 note）
+    ),
+)
+
+# 入口 2：MJCF 中按 geom 分类设不同 friction（足端高于身体）
+#   <default class="foot"><geom friction="1.0 0.005 0.001" solref="0.02 1.0"/></default>
+#   <default class="body"><geom friction="0.4 0.005 0.001"/></default>
+
+# 入口 3：运行时经 expand_model_fields 改（DR 用）——会触发 CUDA Graph 重建，
+#   只在 reset/startup 做（机制见后文 GPU 数据流一节）
+\end{codebox}
+
+\begin{note}[\texttt{MujocoCfg} 里两个常被忽略、但调稳定性很实用的旋钮]
+上面 codebox 除四个常改字段外，\verb|MujocoCfg| 还暴露了若干稳定性旋钮（实测 1.4.0 还有 \verb|ls_tolerance|/\verb|ccd_iterations| 等）。两个最值得记住：\textbf{(1) \texttt{ls\_iterations}}（线搜索迭代上限，类默认 50）——\verb|newton| 求解器每步内做线搜索，接触很硬/很密时把它从 50 往上加，常比单纯加 \verb|iterations| 更能压住「求解不收敛」；\textbf{(2) \texttt{jacobian}}（\verb|auto|/\verb|dense|/\verb|sparse|）——这正是本章「MuJoCo Warp 能力边界」（\cref{sec:rlmc-phys-dataflow}）里「GPU 路径偏好 dense Jacobian」那条的配置出口：CPU MuJoCo 对大 DOF 用 sparse 省内存，而 Warp 的 batched kernel 更适合 dense，故 GPU 上设 \verb|auto| 通常落到 dense。\textbf{推论}：把一台调好的 CPU(sparse) 配置盲目搬到 GPU，dense 路径下大 DOF 模型显存会显著上涨——这就是 \cref{sec:rlmc-phys-dataflow} 「别把 CPU 配置盲迁 GPU」的一个具体落点。
+\end{note}
+
+\begin{note}[MuJoCo 软接触的微滑是「特性」不是 bug]
+MuJoCo 文档明确指出：``gradual contact slip cannot be avoided\,\dots\ Increasing impratio can be particularly effective.'' 即不调 \verb|impratio| 直接做 locomotion，脚在地面会有微小滑动——这是软接触模型的固有特性，对策反应是增大 \verb|impratio|（locomotion 常用 5--10），而非把它当 bug 去 debug。
+\end{note}
+
+\subsection{Isaac Lab / PhysX：迭代数、contact\_offset 与 friction}
+
+PhysX 这套参数是「求解器层」的。\textbf{这里有一处高复发的 API 陷阱必须先说清}。
+
+\begin{pitfall}[Isaac Lab v2.3.2 的 PhysX 配置字段拆分（高复发）]
+网上大量旧教程把 PhysX 参数都塞进一个 \verb|PhysxCfg(num_position_iterations=..., contact_offset=...)|。按 Isaac Lab v2.3.2 实际 API（已联网核对），字段是\emph{分层}的：
+\begin{itemize}
+  \item scene 级 \verb|PhysxCfg| 用 \verb|min_position_iteration_count|/\verb|max_position_iteration_count|/\verb|min_velocity_iteration_count|/\verb|max_velocity_iteration_count|，\textbf{没有} \verb|num_position_iterations| 这个名字；
+  \item per-body 的 solver 迭代数设在资产的 \verb|RigidBodyPropertiesCfg|/\verb|ArticulationRootPropertiesCfg|（如 \verb|solver_position_iteration_count|）；
+  \item \verb|contact_offset|/\verb|rest_offset| 属于 \verb|CollisionPropertiesCfg|（per-shape），\textbf{不在} \verb|PhysxCfg| 里。
+\end{itemize}
+\textbf{现象后果：}照抄旧字段名 $\Rightarrow$ \verb|TypeError: unexpected keyword argument|。\textbf{正确做法：}按上述分层填字段；下面代码块刻意保留「概念示意」注释提醒这一点。
+\end{pitfall}
+
+\begin{codebox}[Python]{Isaac Lab：PhysX 配置（注意字段分层，见上方 pitfall）}
+from isaaclab.sim import SimulationCfg, PhysxCfg
+
+# 概念示意：solver_type / bounce_threshold 等确属 scene 级 PhysxCfg；
+# 迭代数与 contact_offset 按上方 pitfall 拆到 per-body / CollisionPropertiesCfg。
+sim_cfg = SimulationCfg(
+    dt=0.005,                       # physics timestep
+    render_interval=2,
+    gravity=(0.0, 0.0, -9.81),
+    physx=PhysxCfg(
+        solver_type=1,              # 0=PGS, 1=TGS（始终推荐 TGS）
+        min_position_iteration_count=1,
+        max_position_iteration_count=8,
+        bounce_threshold_velocity=0.2,
+        friction_correlation_distance=0.025,
+        # GPU 缓冲容量
+        gpu_max_rigid_contact_count=2**20,
+        gpu_max_rigid_patch_count=2**17,
+    ),
+)
+\end{codebox}
+
+\begin{codebox}[Python]{Isaac Lab：材质摩擦与 per-shape 接触距离}
+from isaaclab.sim import RigidBodyMaterialCfg
+# 地面/足端材质（摩擦在材质里，不在 PhysxCfg）
+ground_material = RigidBodyMaterialCfg(
+    static_friction=1.0,
+    dynamic_friction=1.0,
+    restitution=0.0,                # 完全非弹性碰撞
+)
+# contact_offset / rest_offset 属 CollisionPropertiesCfg（per-shape），
+# 在资产 spawn 配置里设置。
+\end{codebox}
+
+\begin{note}[材质配置类名勘误]
+源稿把材质类写作 \verb|MaterialPropertiesCfg|，此名在 Isaac Lab 中\emph{不存在}。经核对官方 \verb|isaaclab.sim| API 文档，刚体材质的正确类名是 \verb|RigidBodyMaterialCfg|（文档原文：``Default physics material settings for rigid bodies. Default is \texttt{RigidBodyMaterialCfg()}''）。本章已统一改用 \verb|RigidBodyMaterialCfg|；另有形变体材质 \verb|DeformableBodyMaterialCfg| 等，按物体类型选取。
+\end{note}
+
+\textbf{TGS 调优的工程经验}（来自 NVIDIA Isaac Sim 稳定性指南与社区实践）：
+
+\begin{insight}[先减 timestep，再减 iterations]\label{ins:rlmc-phys-stab}
+不稳定时新手倾向于把 \verb|position_iteration_count| 从 4 加到 16。更有效的是\textbf{减小 \texttt{timestep}}（0.005$\to$0.002）：因为 TGS 每个 position iteration 就是一个子步，减小 \verb|timestep| 同时减小了每个子步的大小，效果比加迭代更好。稳定后再\emph{减}回 iterations，恢复部分吞吐。
+\end{insight}
+
+PhysX 5.4+ 还提供两个实用特性：\verb|EnableExternalForcesEveryIteration|（在每个 TGS 子步重算外力，含重力与关节力矩，对快速行走/跳跃稳定性显著改善）与 solver \emph{residual reporting}（Isaac Sim 4.0+，查询每步求解残差判断收敛质量）。残差 $<10^{-4}$ 为良好收敛、可尝试减 iterations；$>10^{-2}$ 为收敛不足、需增 iterations 或减 \verb|timestep|。
+
+\subsection{UniLab：接触参数与摩擦随机化}
+
+UniLab 的接触参数定位与前两者都不同：它\textbf{不在 Python 配置类里暴露接触求解参数}。MuJoCoUni 后端的接触行为由 MJCF 模型本身的 \verb|geom.solref/solimp/friction|（与 mjlab 同一套 MuJoCo 语义），MotrixSim 后端则由 Motrix XML 决定；UniLab 任务代码层\emph{不}提供等价于 \verb|MujocoCfg.impratio| 或 \verb|PhysxCfg.contact_offset| 的字段。它真正暴露给用户调的，是\textbf{摩擦的域随机化}（scale 模式）与 \textbf{PD 增益}——即「不精确建模接触、靠 DR 覆盖不确定性」的 sim2real 路线。
+
+\begin{codebox}[Python]{UniLab：摩擦在模型层 $+$ 用 DR 随机化（对照 mjlab geom\_friction / Isaac material）}
+# (1) 静态接触参数：写在 MJCF（mujoco 后端）的 <geom> 上，语义同 mjlab
+#     <default class="foot"><geom friction="1.0 0.005 0.001" solref="0.02 1.0"/></default>
+#     UniLab 任务代码不再二次暴露 solref/impratio/contact_offset。
+
+# (2) 摩擦随机化（reset 项之一，DomainRandConfig；scale 模式保物理一致）
+env:
+  domain_rand:
+    randomize_ground_friction: true
+    ground_friction_multiplier_range: [0.5, 1.5]   # 乘性，类似 mjlab operation="scale"
+
+# (3) PD 增益（接触稳定性的另一把手；后端位置执行器，Ideal PD 层级）
+env:
+  control_config: {Kp: 35.0, Kd: 0.5, action_scale: 0.25}
+# 改增益走 Hydra：env.control_config.Kp=40 env.control_config.Kd=1.0
+\end{codebox}
+
+\begin{note}[UniLab 的接触调参就是「DR $+$ 模型层」，无求解器级旋钮]
+对照 \cref{ins:rlmc-phys-twoparams}：mjlab 调\emph{物理层}（solref/solimp）、PhysX 调\emph{求解器层}（迭代/offset），UniLab 则把接触留在\emph{模型层}（MJCF/Motrix XML），把不确定性交给\emph{DR 层}（scale 模式的 \verb|geom_friction|/\verb|kp|/\verb|kd|）。\verb|geom_friction| 是 reset 项之一（\verb|dr/types.py| 的 \verb|DomainRandomizationCapabilities|，MuJoCoUni 后端原生支持，MotrixSim 后端经能力门控）；后端经 \verb|get_dr_capabilities()| 声明支持项，不支持的项被 \verb|filter_reset_payload| 静默跳过（优雅降级）。验证 per-env 摩擦确实不同：reset 后读后端 per-world \verb|geom_friction|，跨 env 标准差 $>10^{-6}$ 即生效。
+\end{note}
+
+\subsection{三框架接触参数对照}
+
+UniLab 列按「模型层 $+$ DR」如实填：凡 MuJoCoUni 后端的接触量都\emph{继承 MJCF 同名字段}（与 mjlab 同语义，但不在 UniLab 配置类二次暴露），可调的只有摩擦的 DR 与 PD 增益。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{2.7cm}p{2.7cm}p{3.4cm}@{}}
+\toprule
+行为 & MuJoCo / mjlab & PhysX / Isaac Lab & UniLab \\
+\midrule
+接触硬度 & \verb|solref[0]|（时间常数） & 隐式（由 iterations 定） & MJCF \verb|solref[0]|（模型层，无 Python 旋钮） \\
+接触阻尼 & \verb|solref[1]|（阻尼比） & 隐式 & MJCF \verb|solref[1]|（模型层） \\
+摩擦系数 & \verb|geom.friction[0]| & \verb|static_/dynamic_friction| & MJCF \verb|geom.friction[0]|；DR 经 \verb|geom_friction| 项 \\
+扭转/滚动摩擦 & \verb|friction[1]/[2]| & 无直接对应 & MJCF \verb|friction[1]/[2]|（MuJoCoUni 沿用） \\
+弹性恢复 & \verb|solref| 间接 & \verb|restitution| & MJCF \verb|solref| 间接（模型层） \\
+接触距离 & \verb|geom.margin/gap| & \verb|contact_/rest_offset| & MJCF \verb|geom.margin/gap|（模型层） \\
+微滑控制 & \verb|model.opt.impratio| & 无直接对应 & MJCF \verb|<option impratio>|；配置类无对应字段 \\
+摩擦锥 & \verb|opt.cone|(pyr/ell) & patch friction & MJCF \verb|<option cone>|（MuJoCoUni 沿用 MuJoCo） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{接触调参案例集}
+
+\paragraph{先补一步：症状到底「敲哪条命令」才看得见。}下面三个案例反复说「可视化确认微滑/穿透」「回方程」，但\textbf{真正的工程动作是先用一条命令把现象\emph{看}出来}——否则你回不到方程。这一步常被略过，这里给可复制的观测入口（mjlab 部分本书已实跑核对可用）：
+
+\begin{codebox}[bash]{把「接触症状」看出来：三框架的可视化/日志入口}
+# (A) mjlab：用 zero agent 起 Viser web 可视化，肉眼看穿透/微滑/弹跳
+#     play 默认就开 Viser（监听 :8080，浏览器打开即可，无需 X 服务器）；
+#     --agent zero 让机器人只受重力+默认姿态，最干净地暴露接触是否生效。
+uv run play Mjlab-Velocity-Flat-Unitree-Go1 --agent zero --viewer viser
+#     看不到接触力？训练日志里若出现 `contact buffer overflow` 就是 nconmax
+#     设小了被截断（物体会穿透）——这条 warning 是 nconmax 太小的直接信号。
+
+# (B) UniLab：交互可视化走 Viser；事后排错用离线 NaN 回放
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    --render-mode interactive          # Viser web 3D，远程浏览器也能看
+unilab-viz-nan nan_dump_0.npz          # 出 NaN 后用 mujoco.viewer 回放出事前几帧
+\end{codebox}
+
+\begin{insight}[「可视化确认」不是一句口号——它是排错链里能省掉数天的一环]\label{ins:rlmc-phys-seeit}
+案例 1 的「可视化确认切向滑移」如果跳过、直接去翻参数表，你根本分不清是\emph{真在滑}还是\emph{命令速度本就要求那样转}。正确顺序是\textbf{先看（\texttt{play --agent zero} 或 \texttt{interactive}）$\to$ 确认现象 $\to$ 再回方程定位项 $\to$ 才查参数}。\verb|--agent zero| 之所以是首选观测手段：它剥掉策略这个变量，让你看到的异常\emph{只能}来自物理层（接触/重力/初始姿态），这正是 \cref{ins:rlmc-phys-reward}「先物理后 RL」在「看」这一步的兑现。同理，UniLab 的 \verb|unilab-viz-nan| 把「NaN 出现前那几帧的物理状态」回放出来，让你看到\emph{是哪个接触先炸的}，而不是只拿到一个 NaN。
+\end{insight}
+
+\textbf{案例 1（mjlab，四足脚底打滑）。}Go1 平地速度跟踪（mjlab 四足为 Go1），策略会走但转向时脚底明显打滑、转弯半径偏大。诊断：reward 曲线正常（排除 RL 层）$\to$ 可视化确认切向滑移 $\to$ 回方程 \eqref{eq:rlmc-phys-mjdyn}（$\mathbf f$ 摩擦不足）$\to$ 发现 \verb|impratio=1.0| 对 locomotion 偏低。解法：\verb|impratio| 提到 10.0（或 \verb|cone| 改 \verb|elliptic|）。结果：滑移显著减少。
+
+\textbf{案例 2（Isaac Lab，灵巧手掉物）。}Allegro Hand 抓立方体，能接近但抓不住。诊断：手指与物体有接触但摩擦不够；\verb|static_friction=0.5| 对精密抓取偏低；\verb|contact_offset=0.02| 对小物体偏大致虚假接触。解法：\verb|static_friction| 提到 1.5、\verb|contact_offset| 减到 0.005、position iteration 提到 8。结果：抓取成功率从 30\% 升到 75\%。
+
+\textbf{案例 3（人形关节振荡）。}G1 平地行走，膝关节约 100\,Hz 高频振荡（「腿在抖」）。诊断：回方程（$\mathbf{M}$-damping-\verb|timestep| 不稳）$\to$ 用了 explicit actuator、kp$=$100/kd$=$5（增益高）、\verb|timestep=0.005|。三选一解法：(A) 切 builtin actuator——integrator 能看到其速度依赖（\cref{sec:rlmc-phys-mujoco}），最有效且不降吞吐；(B) 减 \verb|timestep| 到 0.002；(C) 降增益。结果：方案 A 最有效，切到 builtin 后振荡消失。
+
+\begin{pitfall}[在 DR 中把摩擦随机到不可能的范围]
+\textbf{错误描述：}域随机化时把 friction 随机到极小值（$<0.1$）。\textbf{现象后果：}机器人「站不住」，训练浪费在不可能的配置上、reward 崩溃。\textbf{根本原因：}DR 应覆盖\emph{真机可能遇到}的范围，而非物理上荒谬的范围。\textbf{正确做法：}friction 随机化保持在合理区间（如 $0.5$--$1.5$）；这条与本部「域随机化」章会再展开。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item 在 mjlab 中把 Go1 地面 friction 分别设 0.3/1.0/3.0 各训 500 iteration，用 WandB 对比曲线与可视化步态——哪个 friction 下学得最快？为什么？\emph{验收：}给出三组曲线截图与一句机制解释（摩擦过低难产生推进力、过高约束求解更重）。
+  \item 在 mjlab 中分别用 \verb|impratio=1| 与 \verb|impratio=10| 训 Go1 速度跟踪，可视化转弯——\verb|impratio| 对转弯半径的影响如何？用软接触微滑解释。\emph{验收：}指出 \verb|impratio=10| 时转弯半径更接近命令值。
+  \item 灵巧手抓取总掉物：MuJoCo 该调什么、PhysX 该调什么？为什么两者调参方向不同？\emph{验收：}MuJoCo 调 \verb|friction|/\verb|impratio|，PhysX 调 \verb|static_friction|/\verb|contact_offset|/iterations；区别根源是 cone vs patch friction（\cref{ins:rlmc-phys-twoparams}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{模型格式：MJCF、USD 与跨格式互转}
+\label{sec:rlmc-phys-format}
+
+\paragraph{模块功能与在管线中的位置。}接触参数依附于\emph{模型文件}。mjlab 用 MJCF，Isaac Lab 用 USD。要在两框架都跑你的机器人，就得同时维护两种格式或掌握互转。\textbf{算法主线：}先认清两种格式的表达力边界，再讲互转工具与必然的信息丢失。
+
+\subsection{MJCF：声明式、继承式}
+
+MJCF（MuJoCo XML Format）的设计哲学是\emph{声明式 $+$ 继承式}——用 XML 描述世界层级，靠 \verb|<default>| 机制实现属性继承。核心元素：\verb|<option>|（全局仿真参数，对应 \verb|MujocoCfg|）、\verb|<default>|（class-based 继承）、\verb|<body>|（运动学树节点）、\verb|<joint>|/\verb|<geom>|/\verb|<actuator>|/\verb|<sensor>|，以及 MuJoCo 特有的 \verb|<tendon>|（腱）、\verb|<equality>|（约束，如 mimic/weld）、\verb|<site>|（参考点）。
+
+\verb|<default class>| 的威力在于对称机器人：四足的四条腿、人形的左右臂，只需定义一次 \verb|class="leg"|，所有引用该 class 的 geom/joint 自动继承——这是 MJCF 在物理建模上比 USD 更顺手的关键。
+
+\begin{codebox}[Python]{MjSpec：用 Python 程序化构建/组合模型}
+import mujoco
+# 从 XML 加载，或用 Python 构建
+spec = mujoco.MjSpec.from_file("go2.xml")
+# 多 Entity 组合：把桌子挂到 worldbody（mjlab 的 Scene 即靠 attach 组合）
+table = mujoco.MjSpec.from_file("table.xml")
+spec.worldbody.attach(table, prefix="table_")   # prefix 防同名冲突！
+model = spec.compile()                            # MjSpec -> MjModel
+\end{codebox}
+
+\subsection{USD：通用场景描述}
+
+USD（Universal Scene Description）由 Pixar 开发、为电影制作设计，后被 NVIDIA Omniverse 扩展用于物理仿真——物理属性通过 Schema（PhysX/Newton）扩展，而非原生。它\emph{不支持} MuJoCo 特有的 tendon/equality/site，但视觉表达（PBR 材质、RTX 渲染）与组合能力（layer composition）更强。Isaac Lab 中机器人 USD 通常由 URDF 或 MJCF 导入生成，而非手写。
+
+\subsection{互转与必然的信息丢失}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{4.0cm}@{}}
+\toprule
+方向 & 工具 & 信息丢失 \\
+\midrule
+URDF $\to$ MJCF & \verb|MjSpec.from_file("x.urdf")| & 需复核 inertial/mesh path/joint limit/mimic（URDF 非 MJCF 语法子集） \\
+MJCF $\to$ URDF & 无官方导出；第三方工具 & tendon/equality/site/class defaults（仅覆盖有限子集） \\
+URDF $\to$ USD & Isaac Sim URDF Importer & minimal \\
+MJCF $\to$ USD & Isaac Sim MJCF Importer & tendon/equality \\
+USD $\to$ MJCF/URDF & 无官方工具 & 需手动重建 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[格式转换不是「无损压缩」]\label{ins:rlmc-phys-format}
+每种格式有自己的表达力边界：MJCF 在物理建模上更强（tendon/equality/site），USD 在视觉渲染上更强（PBR/RTX）。跨框架工作时，接受一些信息丢失是\emph{正常}的——关键是知道\textbf{丢了什么、如何在目标框架补回}。最常见的坑是 MJCF$\to$USD 后默认姿态不对：根因是 MJCF 的 \verb|joint.ref|（零位参考角）在转换时丢失，对策是手动对齐初始关节角。
+\end{insight}
+
+\begin{pitfall}[假设 URDF$\to$USD 转换无损 / 认为「模型相同 $=$ 行为相同」]
+\textbf{错误描述：}两条常见误解——(1) URDF$\to$USD 无损；(2) 几何与质量一致就代表两引擎行为一致。\textbf{现象后果：}(1) tendon/equality/class defaults 静默丢失；(2) 即便模型完全一致，MuJoCo 软接触与 PhysX TGS 的接触行为仍\emph{不同}，被误当成 bug 去查两天。\textbf{根本原因：}URDF 是「最小公分母」格式；接触行为差异是物理建模差异（\cref{sec:rlmc-phys-models}）。\textbf{正确做法：}转换后逐项核对丢失信息；跨引擎行为差异按「特性」接受、用 sim2sim（\cref{sec:rlmc-phys-sim2sim}）量化而非消除。
+\end{pitfall}
+
+\paragraph{UniLab 的模型格式。}UniLab \textbf{不用 USD}——它沿两个 CPU 后端各走一种格式：MuJoCoUni 后端读 \textbf{MJCF}（与 mjlab 同一套，故上面 MJCF 的 \verb|<default>|/tendon/equality/site 讨论对它全适用），MotrixSim 后端读 \textbf{Motrix XML}。模型由 \verb|SceneCfg.model_file| 指向，并可用 \verb|fragment_files| 在冷路径拼装片段（如把任务/地形 XML 拼进机器人 XML，等价 mjlab 的 \verb|spec.attach| 组合）。导入新机器人走 \verb|unilab-import-robot|（从 URDF 导入），库存资产经 \verb|unilab-pull-assets| 从 HuggingFace 拉取。\textbf{信息丢失清单}比 Isaac Lab 简单：因为不碰 USD，\emph{没有} MJCF$\leftrightarrow$USD 这条有损转换链（Isaac Lab 才有 \verb|convert_mjcf|/\verb|convert_urdf|）；URDF$\to$MJCF 的丢失项与 \cref{sec:rlmc-phys-format} 上表一致（inertial/mesh path/joint limit/mimic 需复核）。两后端之间则\emph{不互转}模型，而是各维护一份 XML、用内建 sim2sim 契约校验保证策略可跨后端迁移（详见后文 \cref{sec:rlmc-phys-sim2sim}）。
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item 下载 MuJoCo Menagerie 的 Go2 MJCF，统计 body/joint/geom/actuator 数，并列出所有用了 \verb|class| 的元素——\verb|class| 机制省了多少重复？\emph{验收：}给出计数与「四条腿共享一个 class」的观察。
+  \item 用 \verb|MjSpec| 从 Python 构建最简机器人：一个 box base $+$ 一个 hinge $+$ 一个 capsule leg，验证 \verb|spec.compile()| 成功。\emph{验收：}贴出可运行代码与编译无异常。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{MuJoCo Warp 的 GPU 数据流与三阶段生命周期}
+\label{sec:rlmc-phys-dataflow}
+
+\paragraph{模块功能与在管线中的位置。}\verb|env.step()| 里那次物理调用，在 GPU 上是\emph{批量}（batched）执行 $N$ 个并行世界的。要调试「为什么训练变慢/为什么 DR 不生效/为什么出 NaN」，必须知道数据在 GPU 上怎么组织。这是 mjlab 性能与稳定性问题的根。
+
+\subsection{完整数据流与三个不可逆分界点}
+
+\begin{codebox}[text]{从 MjSpec 到 CUDA Graph 的数据流}
+MJCF/XML 或 Python MjSpec
+  │ spec.compile()
+mujoco.MjModel (CPU)         ← 编译层：常量结构，nq/nv/nbody 固定
+  │ Simulation._init_with_model()
+mjwarp.put_model(mj_model)   ← GPU 上传模型常量
+mjwarp.put_data(nworld=N,…)  ← GPU 创建 N 个并行世界（各自 qpos/qvel/ctrl）
+  │ WarpBridge (wp.to_torch)
+torch.Tensor 视图            ← 零拷贝桥接
+  │ Simulation.create_graph()
+CUDA Graph 捕获              ← 记录 kernel 序列与 GPU 地址
+  │ mjwarp.step() replay
+训练循环                     ← 每步 replay 预录制的 graph
+\end{codebox}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{3.4cm}p{3.4cm}@{}}
+\toprule
+分界点 & 之前可做 & 之后不能做 \\
+\midrule
+MjSpec $\to$ MjModel & 增删 body、改树结构 & 改树结构（body/joint 数已固定） \\
+MjModel $\to$ mjwarp.Model & 改 \verb|model.opt|、调参数 & 改动须经 WarpBridge 原地写入 \\
+CUDA Graph capture & 分配/替换 GPU 数组 & 替换数组对象（地址必须稳定） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[三阶段就像 C++ 编译流程]\label{ins:rlmc-phys-lifecycle}
+\verb|MjSpec|（可编辑蓝图）$=$ 源代码，\verb|MjModel|（常量结构）$=$ 目标文件，\verb|MjData|（运行时状态）$=$ 运行时内存。你不能在运行时给程序「加一个新类」，同样不能在 \verb|MjModel| 阶段给机器人「加一个新关节」。\verb|spec.compile()| 与 \verb|put_model()| 都\textbf{不可逆}；唯有 CUDA Graph 可重建（\verb|expand_model_fields| 后重新 capture）。\textbf{实践推论：}给场景加桌子要在描述阶段（\texttt{spec.attach}），改全局摩擦在编译阶段（\texttt{MujocoCfg}），改单个 world 质量做 DR 在运行阶段（\texttt{expand\_model\_fields}）。
+\end{insight}
+
+\subsection{WarpBridge：零拷贝桥接的铁律}
+
+mjlab 的 obs/reward/action 都是 PyTorch tensor，但底层物理状态存在 MuJoCo Warp 的 \verb|wp.array| 里。\verb|WarpBridge|（\verb|src/mjlab/sim/sim_data.py|）经 \verb|wp.to_torch()| 把 GPU 缓冲暴露为 PyTorch tensor 视图——\textbf{不拷贝数据}。这带来一条铁律：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{4.4cm}@{}}
+\toprule
+操作 & 安全? & 原因 \\
+\midrule
+\verb|bridge.qpos[:] = val| & 是 & 原地写入，地址不变 \\
+\verb|bridge.qpos[ids] = val| & 是 & 索引写入，地址不变 \\
+\verb|bridge.qpos = new_tensor| & 否 & 替换对象 $\Rightarrow$ 旧地址上的 CUDA Graph 失效 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[在 CUDA Graph capture 之后替换 GPU 数组对象]
+\textbf{错误描述：}想做 DR 时直接 \verb|bridge.qpos = torch.where(...)| 整体替换。\textbf{现象后果：}CUDA Graph 记录的是\emph{地址}不是变量名，替换对象 $=$ 改变地址 $=$ graph 读到旧/错数据，行为诡异且难复现。\textbf{根本原因：}graph replay 假设数组地址稳定。\textbf{正确做法：}一律用切片原地写入 \verb|bridge.qpos[:]=...|；DR 改共享参数走 \verb|expand_model_fields|（会自动重新 capture）。
+\end{pitfall}
+
+\subsection{nconmax、njmax 与显存估算}
+
+GPU 并行要求所有 world 有相同内存布局，故 \verb|nconmax|（per-world 最大接触数）与 \verb|njmax|（per-world 最大约束行数）在创建 batched worlds 时就固定。
+
+\begin{pitfall}[把 \texttt{nconmax} 当成全局 contact 数]
+\textbf{错误描述：}以为 \verb|nconmax| 是整个 batch 的接触上限。\textbf{现象后果：}设得过小致接触截断（日志出 \verb|contact buffer overflow|、物体穿透），或显存估算出错。\textbf{根本原因：}它是 \emph{per-world} 的，显存按 \verb|num_envs × nconmax × ~500 bytes| 增长。\textbf{正确做法：}按机器人类型设（四足 flat 20--30、人形 40--60、灵巧手 80--120），并理解 \verb|njmax| 才是显存大户（约束记录约 200 bytes，但条数多）。
+\end{pitfall}
+
+显存优化优先级（OOM 时）：减 \verb|num_envs|（线性下降）$\to$ 减 \verb|njmax|（约束是大户）$\to$ 减 \verb|nconmax| $\to$ 移除多余 sensor $\to$ 减网络 \verb|hidden_dims|。经验法则：RTX 4090（24\,GB）上 4096 envs 的四足 locomotion（无相机）通常占 10--12\,GB，余量充足；若 OOM 先用 \verb|nvidia-smi| 查是否有遗留 GPU 进程。
+
+\subsection{CUDA Graph 失效与 expand\_model\_fields}
+
+CUDA Graph 把一串 GPU kernel 启动序列「录制」下来，之后每步只需一次 CPU 调用即可 replay 整个序列——这是 mjlab 吞吐的关键。失效条件：\verb|expand_model_fields()|（自动重新 capture）、替换 GPU 数组对象（禁止）、改 \verb|num_envs|（须重建 Simulation）、加新 sensor（须重 compile）；而\emph{修改 qpos/qvel 数值}（原地写入）\textbf{不}失效。
+
+\begin{note}[第一次 DR 触发后的那一步会变慢——这是正常的]
+DR 改共享参数（如 \verb|randomize_mass|）时，mjlab 在 \verb|expand_model_fields| 里把共享 scalar/array 展开为 per-world array、清 WarpBridge cache、重建 sensor context、重新 \verb|create_graph()|。所以\textbf{第一次 DR 后的 step 比平时慢}（graph 重建一次性开销），后续不再重建。把这一步的卡顿当 bug 是常见误解。这条机制与本部「域随机化」章紧密相关——届时会密集使用 \verb|expand_model_fields|。
+\end{note}
+
+\paragraph{把上面两条断言变成你能自证的实验。}本节到此都在「读源码讲架构」，但「DR 生效了吗」「第一次 DR 真会变慢吗」这两条都\textbf{能自己量出来}，不必只信作者。下面给两个动手锚点（思路而非完整脚本——具体 handle 名随 mjlab 版本，用 \verb|dir()| 自查即可）：
+
+\begin{codebox}[Python]{两个可自证锚点：DR 是否真生效 / graph 重建是否真变慢}
+import torch, time
+# 锚点 1：DR 生效 ⇔ reset 后 per-world geom_friction 跨 env 不再相同。
+#   读后端 per-world 摩擦张量（mjlab 经 WarpBridge 暴露；UniLab 读后端 per-world 模型），
+#   形状约 [num_envs, ngeom, 3]。判据：跨 env 维度的标准差 > 1e-6 即「每个 env 摩擦不同」。
+fric = sim.model_per_world_friction()          # 名称按你的版本 dir() 自查
+spread = fric.std(dim=0).max().item()
+print("DR applied?" , spread > 1e-6, " (std =", spread, ")")
+#   若 spread≈0：DR 没生效（最常见：忘了把该 DR 项挂进 events、或 mode 不是 startup/reset）。
+
+# 锚点 2：第一次 DR 那步的「graph 重建一次性开销」用 time 直接测出来。
+def timed_step():
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    env.step(action); torch.cuda.synchronize()
+    return (time.perf_counter() - t0) * 1e3                 # ms
+warm = [timed_step() for _ in range(20)]                    # 热稳态基线
+env.reset()                                                  # 触发 DR + expand_model_fields
+first_after_dr = timed_step()                                # 这一步含 graph 重建
+print(f"warm≈{sum(warm)/len(warm):.2f} ms, first-after-DR={first_after_dr:.2f} ms")
+#   预期：first-after-DR 明显高于 warm（一次性尖峰），其后又回落——尖峰即「正常」，非卡死。
+\end{codebox}
+
+\subsection{Isaac Lab 3.0 与 UniLab 的对应}
+
+Isaac Lab 3.0 经 Newton 用 MuJoCo Warp 时数据流类似，但有一处关键差异：数据类（如 \verb|ArticulationData|/\verb|ContactSensorData|）的 \verb|.data.*| 属性\textbf{默认返回 \texttt{wp.array} 而非 \texttt{torch.Tensor}}——需手动 \verb|wp.to_torch()| 包装（已核对 Isaac Lab 3.0 Beta 官方文档：``the data classes \dots will only return warp arrays''；setter/writer 则同时接受 \texttt{wp.array} 与 \texttt{torch.Tensor}）。3.0 Beta 仓库另附了一个批量迁移脚本 \verb|scripts/tools/wrap_warp_to_torch.py|，可自动把下游代码里的 \verb|.data.*| 访问包上 \verb|wp.to_torch()|（支持 dry-run 与 \texttt{--apply}）；其覆盖的资产类与「不返回 \texttt{wp.array} 的属性黑名单」随版本演进，落地前以你所用版本的脚本与 Release Notes 为准。
+
+\paragraph{UniLab 的数据流：边界从「GPU 内部」搬到了「CPU$\to$GPU 之间」。}前面 mjlab 的整条数据流都\emph{在 GPU 上}（\verb|put_data| 之后物理状态再不回 CPU），WarpBridge 那条「零拷贝」铁律的前提正是「数据本就在 GPU」。UniLab 的异构架构把这条边界整个挪了位置：物理状态\textbf{原生在 CPU}，跨到 GPU 是一次\emph{显式、可计量、可预取}的 H2D 拷贝。
+
+\begin{codebox}[text]{UniLab：从 SceneCfg 到 GPU 策略的异构数据流（对照 mjlab 全程 GPU）}
+SceneCfg.model_file（MJCF / Motrix XML）
+  │ 后端编译（mujoco-uni / motrixsim）
+后端 Model（CPU）              ← 编译层
+  │ NpEnv.step（CPU 多线程批量步进，每 env 独立物理状态）
+NpEnvState（CPU, np.float32）   ← obs/reward/done 都在 CPU
+  │ 写入共享内存 IPC
+RolloutRingBuffer / ReplayBuffer  ← /dev/shm，packed CPU 权威存储
+  │ CPU→GPU H2D 管线（pinned-host + 双缓冲 + 可选 native_h2d_ext.cpp）
+torch.Tensor（GPU）             ← 显式跨边界，可计量
+  │ PPO/APPO/SAC 更新
+GPU 策略学习                   ← 仅策略在 GPU
+\end{codebox}
+
+\begin{insight}[同一道「CPU/GPU 边界」，三框架放在三处]\label{ins:rlmc-phys-boundary}
+mjlab 把边界\emph{固化在 GPU 内}（\verb|put_model/put_data| 一次性上传，之后 WarpBridge 零拷贝，CPU 只在日志/检视时越界）；Isaac Lab 把边界\emph{藏在 Isaac Sim 内}（\verb|sim.reset()| 激活 TensorAPI 后，PhysX 状态经 Fabric 暴露为 GPU 张量，用户读不到上传那层）；UniLab 把边界\emph{显式摆在 CPU 与 GPU 之间}（物理在 CPU、学习在 GPU，靠 pinned-host $+$ 双缓冲 $+$ 后台 H2D 线程把「采样打包」与「GPU 训练」流水线重叠）。\textbf{本质}：哪种范式都绕不开这道边界，区别只在「数据原生在哪、何时跨」。这也解释了三者各自的失败面——mjlab 是 CUDA Graph 地址锁定，Isaac Lab 是 TensorAPI 激活时机，UniLab 则多了一个 GPU-sim 没有的失败面：\verb|/dev/shm| 共享内存预算（超 80\% 直接 \verb|MemoryError|，提示减小 \verb|num_envs| 或 \verb|replay_buffer_n|）。
+\end{insight}
+
+\begin{note}[UniLab 无 CUDA Graph、也无 expand\_model\_fields——DR 走 per-world 模型]
+本节 mjlab 的 \verb|expand_model_fields| $+$ CUDA Graph 重捕机制在 UniLab\emph{无对应}：UniLab 物理在 CPU、没有要锁定地址的 CUDA Graph，DR 直接由后端\emph{物化 per-world 模型}（\verb|materialize()|）实现——reset 时 \verb|DomainRandomizationManager| 经 \verb|build_reset_plan| 把 per-env 参数写进后端 \verb|set_state(randomization=...)|。所以「第一次 DR 后那一步变慢」（mjlab 的 graph 重建开销）在 UniLab 不会出现；UniLab 这侧的对应代价是 H2D 拷贝与共享内存预算。
+\end{note}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item 画出从 \verb|EntityCfg.spec_fn| 到 \verb|Simulation.create_graph()| 的完整数据流图，标注三个分界点。\emph{验收：}图中含 MjSpec/MjModel/mjwarp/WarpBridge/CUDA Graph 五层与不可逆/可重建标注。
+  \item \textbf{显存估算}：\verb|nconmax=35|、\verb|njmax=1500|、\verb|num_envs=4096|。估 contact buffer 与 constraint buffer 显存；\verb|nconmax| 翻倍到 70 增加多少？\emph{验收：}contact $\approx35\times500\times4096\approx69$\,MB；constraint $\approx1500\times200\times4096\approx1.2$\,GB；\verb|nconmax| 翻倍约 $+69$\,MB。
+  \item 为什么 MuJoCo Warp 要求所有 world 有相同 \verb|nconmax|？从 GPU SIMT 并行角度解释。\emph{验收：}指出 SIMT 要求同构内存布局以便统一 kernel 索引。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{跨引擎 sim2sim 验证}
+\label{sec:rlmc-phys-sim2sim}
+
+\paragraph{模块功能与在管线中的位置。}你在 mjlab 训出好策略，怎么知道它学的是「真运动技能」而非「MuJoCo 特有的数值 exploit」（如依赖软接触的微小穿透）？\textbf{sim2sim 验证}的核心思想：在另一个引擎上跑同一策略，看行为是否大致一致。这是 sim-to-real 前的关键一步，直接承接 \cref{ch:rlmc-obsact} 里「特权观测只进 critic、不污染部署接口」那条原则——sim2sim 正是检验这份「契约」是否守住的手段。
+
+\subsection{算法主线：ASAP 揭示的跨引擎差异}
+
+\begin{paper}[ASAP：对齐仿真与真实世界物理]\label{paper:rlmc-phys-asap}
+\textbf{问题：}敏捷人形全身技能的 sim-to-real，难在仿真与真机的\emph{动力学失配}（dynamics mismatch）；SysID 与 DR 要么调参费力、要么得到过保守策略。\textbf{核心思想：}ASAP（\emph{Aligning Simulation and Real-World Physics}, He et al., RSS 2025, CMU LeCAR-Lab, arXiv:2502.01143）\cite{asap2025}是\emph{两阶段}框架——先在仿真中预训练 motion tracking 策略；再部署真机、用 MoCap 采数据训练一个\textbf{delta（残差）action model} $\delta(s,a)$ 补偿失配，最后冻结 $\delta$、用 $a'=a+\delta(s,a)$ 继续 RL 微调。\textbf{关键结果：}在 IsaacGym$\to$IsaacSim、IsaacGym$\to$Genesis、IsaacGym$\to$真机 Unitree G1 三个迁移场景上显著提升敏捷度与全身协调。\textbf{与本书的关系：}它系统量化了「跨引擎行为差异主要来自接触模型，而非 reward/DR」——这正是 \cref{ins:rlmc-phys-convex}/\cref{ins:rlmc-phys-tgs} 的实证。\textbf{局限：}delta-action model 需真机 MoCap setup，对多数研究者，充分 DR $+$ sim2sim 是更实用的路径。
+\end{paper}
+
+\begin{insight}[delta-action model 在学「仿真器哪里不准」]\label{ins:rlmc-phys-asap}
+ASAP 的精妙处：$\delta(s,a)$ 本质在学习「仿真器哪里不准」——不需要你知道具体哪个物理参数错了，只要真机数据就能自动弥补。这比手动调接触参数高效得多，代价是真机 MoCap。对没有真机的读者，下面的「无真机 sim2sim」流程仍有价值。
+\end{insight}
+
+\subsection{三层 sim2sim 与最小流程}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+层级 & 对比 & 验证什么 & 预期差异 \\
+\midrule
+第一层 & MuJoCo Warp $\to$ CPU MuJoCo & GPU/CPU 数值一致性 & 极小（同引擎） \\
+第二层 & MuJoCo Warp $\to$ PhysX & 跨引擎行为鲁棒性 & 中等（不同接触模型） \\
+第三层 & 仿真 $\to$ 真机 & sim-to-real 可行性 & 较大（域差距） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{codebox}[bash]{无真机 sim2sim：三框架交叉验证}
+# 1) mjlab(MuJoCo Warp) 训练（mjlab 四足为 Go1，无 Go2 任务）
+#    注意：mjlab 没有 `play --export-onnx` 这个 flag。ONNX 由训练结束时
+#    runner.export_policy_to_onnx() 自动产出，落在该 run 的 log 目录里
+#    （形如 logs/<exp>/<run>/exported/policy.onnx），无需再敲导出命令。
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 --env.scene.num-envs 4096
+# 想可视化复核某个 checkpoint（不是导出！）走 play 自己的加载源 flag：
+uv run play  Mjlab-Velocity-Flat-Unitree-Go1 --agent trained \
+    --checkpoint-file logs/go1_velocity/<run>/model_9999.pt   # 或 --registry-name / --wandb-run-path
+# 2) CPU MuJoCo 加载 ONNX（第一层：GPU->CPU 数值一致性）
+python sim2sim_cpu.py --model go1.xml --policy policy.onnx --num-episodes 10
+# 3) Isaac Lab(PhysX) 加载 ONNX（第二层：跨引擎行为一致性）
+#    跨引擎一致性必须用同一机器人——Go1 在 mjlab 与 Isaac Lab 中都存在，故两侧都用 Go1
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py \
+    --task Isaac-Velocity-Flat-Unitree-Go1-v0 --num_envs 4
+\end{codebox}
+
+\begin{note}[ONNX 到底何时导出、落在哪、怎么确认——三框架各不同（实跑核对）]
+sim2sim 的第一步就是「拿到那个 \verb|policy.onnx|」，而\textbf{三框架导出的时机与入口完全不同}，照抄一行命令最易卡在这里：
+\begin{itemize}
+  \item \textbf{mjlab}：\emph{训练结束自动导出}。\verb|runner.export_policy_to_onnx()| 在 train 收尾时跑，元信息（obs 顺序等）经 \verb|attach_metadata_to_onnx| 注进 ONNX，故\textbf{obs 契约随 ONNX 走}——sim2sim 端读 ONNX metadata 即可对齐 obs 顺序，不必另存 \verb|obs_config.json|。\verb|play| \emph{没有} \verb|--export-onnx|，它是\emph{加载+可视化}入口（\verb|--checkpoint-file|/\verb|--registry-name|/\verb|--wandb-run-path| 三种加载源）。
+  \item \textbf{UniLab}：\emph{在 play/eval 阶段导出}（PPO 路径），故须真正进 \verb|eval|/\verb|play|；纯冒烟跑（\verb|training.no_play=true|）\emph{不}产 ONNX。
+  \item \textbf{怎么确认导出成功}：\verb|find logs -name '*.onnx'| 看文件是否生成；再 \verb|python -c "import onnxruntime as ort; ort.InferenceSession('policy.onnx')"| 看能否加载（onnxruntime 自带结构自检，加载不报错即可用）。
+\end{itemize}
+\end{note}
+
+\begin{codebox}[Python]{CPU MuJoCo sim2sim 的最小代码（obs 构建必须与训练一致！）}
+import mujoco, numpy as np, onnxruntime as ort
+model = mujoco.MjModel.from_xml_path("go1.xml")   # 与上方 mjlab 训练用的机器人一致
+data  = mujoco.MjData(model)
+sess  = ort.InferenceSession("policy.onnx")
+for step in range(1000):
+    obs = np.concatenate([
+        data.qpos[7:],   # joint pos（跳过 free joint 的 7 维，见 nq/nv 一节）
+        data.qvel[6:],   # joint vel（跳过 6 维）
+        data.qvel[:3],   # base linear vel
+        data.qvel[3:6],  # base angular vel
+        # … 其余 obs 项，顺序/归一化须与训练完全一致
+    ]).astype(np.float32).reshape(1, -1)
+    action = sess.run(None, {"obs": obs})[0][0]
+    data.ctrl[:] = action * action_scale + default_joint_pos
+    for _ in range(decimation):
+        mujoco.mj_step(model, data)
+    if data.qpos[2] < 0.15:           # 基座过低 -> 摔倒终止
+        print(f"terminated at {step}"); break
+\end{codebox}
+
+\textbf{UniLab：把 sim2sim 做成内建的「编译期关卡」。}前面 mjlab/Isaac Lab 的 sim2sim 要你\emph{自己写}交叉验证脚本；UniLab 罕见地把\textbf{跨后端一致性校验}做成了一等公民——同一份策略从 MuJoCoUni 拿到 MotrixSim 回放前，先比对「决定策略行为的字段」是否一致，不兼容就\emph{前置为报错}而非等行为漂移后才发现。
+
+\begin{codebox}[bash]{UniLab：导出 ONNX $+$ 跨后端 sim2sim 契约校验}
+# (1) 训练 + 导出 ONNX（PPO 在 play/eval 阶段导，故须真正进 play）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=300
+uv run eval  --algo ppo --task go2_joystick_flat --sim mujoco \
+    --load-run -1                          # → log 目录出 policy.onnx（onnxruntime 自验）
+# (2) 跨后端回放（MuJoCoUni 训 -> MotrixSim 评估）：契约校验默认 strict
+uv run eval  --algo ppo --task go2_joystick_flat --sim motrix \
+    --load-run <上面的 run>                 # 不兼容则抛 CrossBackendIncompatibleError
+# 放宽为只警告：training.sim2sim_strict=false
+\end{codebox}
+
+\begin{insight}[UniLab 的 sim2sim 是「契约」，不是「跑一遍看像不像」]\label{ins:rlmc-phys-unilab-sim2sim}
+本节三层验证（\cref{sec:rlmc-phys-sim2sim} 那张表）的第一层「同引擎 GPU$\to$CPU」与第二层「跨引擎」，在 mjlab/Isaac Lab 上靠你\emph{事后}比对行为；UniLab 的 \verb|training/sim2sim.py| 把它\emph{前置}成结构校验——\verb|resolve_sim2sim_config| 读源 run 的 \verb|contract_snapshot|，与目标后端逐字段比 \verb|DENYLIST|/\verb|ENV_STRUCTURAL_DENYLIST|，不一致即 \verb|CrossBackendIncompatibleError|（\verb|strict=True| 默认致命）；张量 shape 不匹配也被 \verb|policy_load_dim_guard| 重抛成 sim2sim 诊断。\textbf{为什么 UniLab 需要这关而 mjlab 不需要}：MuJoCoUni 与 MotrixSim 是\emph{两套独立求解器、DR 能力也不同}（\cref{sec:rlmc-phys-tuning} 已述 MotrixSim 缺 \verb|body_iquat|/\verb|body_inertia|/\verb|dof_armature| 等 reset 项），跨后端迁移天然有契约风险；mjlab 只有一个 MuJoCo Warp 后端，无此问题。这恰是本章「跨引擎行为差异是特性、需量化而非消除」洞察的工程兑现——UniLab 把「量化」做成了「编译期拦截」。
+\end{insight}
+
+\begin{note}[\texttt{DENYLIST} 到底卡哪些字段——知道清单才知道「改什么会触发拦截」]
+上面说「逐字段比 \verb|DENYLIST|」太抽象，落到实处：\verb|sim2sim.py| 的 \verb|DENYLIST| 实测含 \verb|env.control_config.action_scale|、\verb|algo.obs_groups|、策略 \verb|hidden_dims|、\verb|empirical_normalization|、\verb|sampling_mode| 这类\emph{直接决定策略输入输出语义}的键；另有 \verb|ENV_STRUCTURAL_DENYLIST| 卡环境结构。\textbf{读者据此就能预判}：源 run 训练后\emph{再去改} \verb|action_scale|、换网络宽度（\verb|hidden_dims|）、改 obs 分组或归一化方式，跨后端 \verb|eval| 就会抛 \verb|CrossBackendIncompatibleError|——因为这些一改，从 MuJoCoUni 学到的策略接口就和 MotrixSim 端对不上了。\textbf{这正是契约的价值}：与其等回放出来步态崩了再 debug，不如在加载前就被这张清单拦下。
+\end{note}
+
+\begin{note}[obs 构建是 sim2sim 最易错处]
+\verb|obs| 的特征、顺序、归一化必须与训练\textbf{完全一致}——这是 \cref{ch:rlmc-obsact} 反复强调的「观测契约」在跨引擎场景的兑现。建议训练时导出一个 \verb|obs_config.json|，sim2sim 严格按它构建 obs。MuJoCo Warp 与 CPU MuJoCo 的已知数值差异（float32 vs float64、并行归约顺序、warmstart）多为微小（详见 GitHub issue \verb|google-deepmind/mujoco#2548|）；经验法则：tracking error 差异 $<10\%$ 通常无需处理，$>20\%$ 需查 obs 构建或 action scale 是否不一致。
+\end{note}
+
+\begin{pitfall}[期望跨引擎行为完全一致 / 用 reward 数值跨引擎比较]
+\textbf{错误描述：}(1) 指望两引擎行为逐数值相同；(2) 拿 reward 数值跨引擎比好坏。\textbf{现象后果：}(1) 把正常的微小差异当 bug；(2) 比出无意义的结论——reward 数值取决于权重/sigma，不同引擎不可比。\textbf{根本原因：}接触模型差异使数值必然不同；reward 是配置相关量。\textbf{正确做法：}比较\emph{定性行为}（步态类型、速度范围、转向方式）；若第一层（同引擎 CPU）就差异大，说明策略 overfit 了 GPU 数值特性，应加 DR 或减 action scale 后重训。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item 训完 Go1（mjlab 四足）后导出 ONNX、在 CPU MuJoCo 跑，用 tracking error 量化 GPU 训练与 CPU 推理的行为差异。\emph{验收：}给出差异百分比并据「$<10\%$/$>20\%$」法则判断是否需处理。
+  \item 结合 \cref{ch:rlmc-obsact} 的观测契约与本节三层验证，设计一条「训练$\to$验证$\to$部署」流程，标注每步用什么框架/引擎、可能遇到的问题。\emph{验收：}流程含 mjlab 训练、CPU 第一层、PhysX 第二层、真机第三层四环节。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{稳定性与吞吐的排查优先级}
+\label{sec:rlmc-phys-stability}
+
+\paragraph{模块功能与在管线中的位置。}训练出现 NaN/爆炸/穿透/变慢时，按什么顺序查？这一节把 \cref{ins:rlmc-phys-reward}（先物理后 RL）制度化成两张优先级表。\textbf{黄金法则：每次只改一个变量}，否则你永远不知道改善来自哪个。
+
+\subsection{稳定性排查优先级}
+
+\begin{center}
+\small
+\begin{tabular}{@{}rlll@{}}
+\toprule
+优先级 & 检查项 & 典型安全值 & 调整方向 \\
+\midrule
+1 & action scale & 0.25--0.5 & 降到 0.25 看是否消除 NaN \\
+2 & actuator 类型 & builtin (IdealPD) & 从 explicit 切 builtin \\
+3 & actuator gains & kp$\approx$25, kd$\approx$0.5 & 降 kp/kd \\
+4 & \verb|timestep| & 0.002--0.005 & 减小 \verb|timestep| \\
+5 & solver iterations & 10--20 & 增加 \\
+6 & 接触参数 & 默认 solref/solimp & 更软$\to$更稳 \\
+7 & \verb|nconmax|/\verb|njmax| & 视任务 & 增大（确认非截断） \\
+8 & reward terms & — & 去掉鼓励高速接触的项 \\
+9 & DR 范围 & — & 缩小范围 \\
+10 & obs noise/delay & — & 减小 noise \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[NaN 出现的时机直接指向问题层]\label{ins:rlmc-phys-nan}
+\textbf{第一个 iteration 就 NaN $\Rightarrow$ 物理层}（优先级 1--6）：随机策略产生极端关节加速度/速度，是物理不稳定的主因。\textbf{训练中途才 NaN $\Rightarrow$ 多半 RL 层}（优先级 7--10）。\textbf{只在 DR 触发后 NaN $\Rightarrow$ DR 配置}（优先级 9）。这条「按时机分流」的判据，省掉大量盲目尝试。RL 训练\emph{早期最不稳定}，缓解法是早期限制 action scale（如前 200 iteration 用 0.25 再逐步放开）或早期临时多给 position iterations。
+\end{insight}
+
+\subsection{吞吐排查优先级}
+
+\begin{center}
+\small
+\begin{tabular}{@{}rll@{}}
+\toprule
+优先级 & 检查项 & 诊断方法 \\
+\midrule
+1 & viewer 是否开启 & 加 \verb|--headless| 对比（2--10$\times$） \\
+2 & 视频录制 & 关 video recording 对比 \\
+3 & WandB 阻塞 & \verb|WANDB_MODE=disabled| 对比 \\
+4 & sensor 数量/分辨率 & 禁 sensor 对比 \\
+5 & \verb|num_envs| 是否过大 & 从 256 逐步加倍找峰值 \\
+6 & \verb|nconmax|/\verb|njmax| & 降到实际需要 \\
+7 & solver iterations & 减到可接受精度 \\
+8 & heightfield 分辨率 & 降地形精度 \\
+9 & CUDA Graph 是否启用 & 检查 warning \\
+10 & Python manager 热点 & \verb|torch.profiler| \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[先会估「我这台机的 steps/s 该是多少」，再判断要不要排查]\label{ins:rlmc-phys-spsbaseline}
+排查吞吐前先建立预期，否则一个良性的低 steps/s 也会被当故障查半天。\textbf{估算心法}：\[
+\text{steps/s} \approx \texttt{num\_envs} \times \text{控制频率} \times \eta_{\text{并行}},
+\]
+其中 $\eta_{\text{并行}}$ 是并行效率——\textbf{小并行冷启时 $\eta$ 远小于 1}（JIT 还没热、GPU 占用率低），并行规模上去后才逼近稳态。所以\emph{小冒烟（几十个 env）见到几十~一千 steps/s 是正常的，不是故障}；真正异常是「大并行（数千 env）稳态后仍远低于同档机器的公开值」。实测锚点（RTX 4080 SUPER，本书验证机，均\emph{冷启小 batch}）：mjlab \verb|Mjlab-Velocity-Flat-Unitree-Go1| 64 envs $\approx 1000$\,steps/s；UniLab \verb|go2_joystick_flat| 16 envs $\approx 360$\,steps/s（CPU 物理，强依赖 CPU 核数）。把这些与下文练习里「RTX 4090、4096 envs、$\sim$60{,}000\,steps/s」的\emph{大并行稳态}值放一起看：两者相差近两个量级，差距全在 $\texttt{num\_envs}$ 与冷热——\textbf{见到小冒烟低吞吐别去翻表里的 viewer/sensor 坑，先把 \texttt{num\_envs} 拉到几千再看稳态}。
+\end{insight}
+
+\begin{pitfall}[性能不好就先换算法 / 同时改多个参数]
+\textbf{错误描述：}(1) 训练慢就把 PPO 换 SAC；(2) 一次改 \verb|timestep| 和 iterations 两个参数。\textbf{现象后果：}(1) 真因常是 \verb|env.step()| 本身慢（viewer/video/sensor），换算法白费；(2) 改善来源不可归因。\textbf{根本原因：}wall-clock 慢 $\neq$ 算法慢；多变量混淆。\textbf{正确做法：}先关 viewer/video/sensor $\to$ 测 env 吞吐 $\to$ 调 \verb|num_envs| $\to$ 调 solver $\to$ 最后才考虑算法；每次只改一个变量。
+\end{pitfall}
+
+\paragraph{timestep $\times$ decimation 联合调参。}二者共同决定 policy frequency 与物理精度（\cref{ch:rlmc-obsact} 已建立 policy freq $=1/(\texttt{timestep}\times\texttt{decimation})$）。\textbf{调 \texttt{timestep} 时务必同步调 \texttt{decimation} 以保持 policy frequency 不变}——否则会顺带改变 PPO 的 batch 结构。例：\verb|timestep| $0.005\to0.002$ 同时 \verb|decimation| $4\to10$，policy freq 都是 50\,Hz、physics freq 从 200\,Hz 升到 500\,Hz。
+
+\paragraph{UniLab 的排查工具：异构架构换来一套不同的诊断入口。}对齐上面两张表，UniLab 的排查工具因「物理在 CPU、学习在 GPU」而与前两者错位——\textbf{吞吐瓶颈和稳定性的检查项都要分两侧看}。
+
+\begin{itemize}
+  \item \textbf{Headless}：\verb|--render-mode none| 纯无渲染（对齐 mjlab \verb|--headless|）；交互可视化走 Viser web 3D（\verb|--render-mode interactive|，无 X 服务器也能浏览器远程看）。
+  \item \textbf{NaN 守卫（默认开）}：\verb|NanGuard|（\verb|utils/nan_guard.py|）在 \verb|NpEnv.step| 内 \verb|check_ctrl| 查动作 NaN、\verb|check| 查 obs/reward NaN、\verb|capture| 存物理快照环缓冲；命中即 \verb|dump| 写 \verb|nan_dump_*.npz|，事后 \verb|unilab-viz-nan <dump>| 用 \verb|mujoco.viewer| 离线回放出事前那几帧（对齐本部「先物理后 RL」的排查纪律）。\verb|step| 末尾还有兜底 \verb|np.nan_to_num(reward)|。
+  \item \textbf{Profiling}：off-policy 路径经 \verb|training.trace_enabled=true|/\verb|trace_output_dir| 产 Perfetto/Chrome-trace JSON，可视化 collector/learner/H2D 三段的重叠（\verb|scripts/analyze_offpolicy_trace.py| 解析）。注意 CLI 里那个 \verb|--profile| flag \emph{不是}用来做性能剖析的——它选的是\emph{任务的 owner 变体}（如 \verb|--profile hora|，挂一套不同的配置变体），性能剖析始终走 \verb|training.trace_enabled|。且 APPO 路径未接 trace（trace 是 off-policy 特性）。
+  \item \textbf{共享内存预算守卫}：这是 GPU-sim 框架\emph{没有}的失败面——\verb|memory_budget.py| 在分配前估 replay/ring buffer 字节数，超 \verb|/dev/shm| 80\% 直接 \verb|MemoryError|（提示减 \verb|algo.num_envs| 或 \verb|algo.replay_buffer_n|，或加大 \verb|/dev/shm|）；\verb|UNILAB_SKIP_MEMORY_CHECK=1| 关。
+  \item \textbf{显存}：CPU-sim \emph{不占}仿真显存（GPU 只放策略），故 UniLab \emph{无} mjlab 那种 \verb|nconmax|/\verb|njmax| 显存大户，也无专用 GPU 显存查询入口——吞吐排查的重心从「显存/求解器」移到「CPU 核数 $+$ H2D 流水线 $+$ 共享内存预算」。
+\end{itemize}
+
+\begin{note}[三框架排查重心的位移]
+对照本节两张表：mjlab/Isaac Lab 的吞吐瓶颈常在 viewer/video/sensor 与 \verb|nconmax|/\verb|njmax| 显存；UniLab 因物理在 CPU，瓶颈更多落在 \emph{CPU 核数与 collector-learner-H2D 的流水线重叠}（用 trace 看三段是否对齐），稳定性失败面则多一个共享内存预算。这正是「先物理后 RL」纪律在异构架构下的具体化——只是这里的「物理层」检查项里多了「CPU 仿真吞吐 $+$ IPC 预算」。
+\end{note}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item 分别用 \verb|timestep=0.005|(dec 4) 与 \verb|0.002|(dec 10) 训 Go1（policy freq 都 50\,Hz），比较 steps/s、reward 收敛、可视化平滑度。\emph{验收：}给出三项对比，指出 0.002 更平滑但 steps/s 约低 $2.5\times$。
+  \item 把 \verb|nconmax| 从 35 减到 15 训 500 iteration，观察是否出 \verb|contact buffer overflow| warning 或脚底穿地。\emph{验收：}记录是否出现 warning 与穿透现象。
+  \item 在 RTX 4090 上训 Go1 flat 只得 20{,}000 steps/s（预期 $\sim$60{,}000），按吞吐表列前 5 个排查步骤。\emph{验收：}前五步应为 headless$\to$关 video$\to$关 sensor$\to$测 env 吞吐$\to$调 num\_envs。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\label{sec:rlmc-phys-myths}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.2cm}p{7.2cm}@{}}
+\toprule
+误解 & 正确理解 \\
+\midrule
+MuJoCo 比 PhysX 更好 & 各有强项——MuJoCo 接触精度高，PhysX 大规模场景强 \\
+GPU 仿真 $=$ 更精确 & GPU 解决吞吐，不解决精度 \\
+Newton 只是个新求解器 & Newton 是开源 GPU 加速可扩展引擎，特点是模块化多求解器架构（统一 API 组织 MuJoCo Warp/Kamino/XPBD/VBD 等） \\
+\verb|solref| 越硬越好 & 太硬 $\Rightarrow$ solver 不收敛 $\Rightarrow$ 训练崩溃 \\
+PGS 在 MuJoCo Warp 上能用 & 不完整支持，避免使用 \\
+MJCF $\to$ USD 无损 & tendon/equality/class defaults 会丢 \\
+sim2sim 应完全一致 & 微小差异正常，关注定性行为 \\
+跨引擎调参 $=$ 翻译参数值 & 两套机制不同，需理解底层差异 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+\label{sec:rlmc-phys-summary}
+
+本章从\emph{接触求解}这条算法主线出发：MuJoCo 用广义坐标 $+$ 凸优化软接触（总收敛、逐接触点摩擦、精度高），PhysX 用笛卡尔坐标 $+$ TGS 迭代（快、patch friction、大规模强），Newton 用统一 API 封装多求解器（含闭环专用的 Kamino）。沿这条主线，我们建立了选型决策（看接触特征）、接触调参（症状$\to$参数，三框架对照）、模型格式（MJCF/USD 互转与信息丢失）、GPU 数据流（MjSpec$\to$MjModel$\to$mjwarp$\to$WarpBridge$\to$CUDA Graph 的三阶段不可逆生命周期）、跨引擎 sim2sim（三层验证 $+$ ASAP delta-action）与排查优先级（先物理后 RL）。
+
+\paragraph{术语速查。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{8.6cm}@{}}
+\toprule
+术语 & 含义 \\
+\midrule
+广义坐标 & 用最少变量描述系统状态（hinge $=1$ 变量） \\
+凸优化接触 & MuJoCo 接触求解：松弛为凸问题，总可解 \\
+TGS & Temporal Gauss-Seidel，PhysX 迭代求解器，把 $\mathrm dt$ 切子步 \\
+patch friction & PhysX 把相邻接触点合并为 patch 再算摩擦 \\
+\verb|solref|/\verb|solimp| & MuJoCo 接触刚度阻尼 / 约束阻抗参数 \\
+\verb|impratio| & MuJoCo 摩擦阻抗比，增大减微滑 \\
+\verb|contact_offset| & PhysX 接触检测距离（属 \verb|CollisionPropertiesCfg|） \\
+MjSpec/MjModel/MjData & 可编辑蓝图 / 编译后常量结构 / 运行时状态 \\
+WarpBridge & mjlab 中 Warp$\to$PyTorch 的零拷贝桥接 \\
+\verb|nconmax|/\verb|njmax| & per-world 最大接触数 / 约束行数（显存相关） \\
+CUDA Graph & 预录制的 GPU kernel 执行序列 \\
+\verb|expand_model_fields| & mjlab 把共享参数展开为 per-world（触发 graph 重建） \\
+\verb|nq|/\verb|nv| & 广义位置 / 速度维度（因四元数而不等） \\
+sim2sim & 跨引擎交叉验证策略行为 \\
+delta-action model & ASAP 提出的补 sim-real gap 的残差动作模型 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}rp{6.4cm}lc@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & MuJoCo：广义坐标 $+$ 凸优化，solver 总收敛 & \cref{sec:rlmc-phys-mujoco} & $\star\star$ \\
+2 & PhysX：笛卡尔 $+$ TGS，patch friction & \cref{sec:rlmc-phys-physx} & $\star\star$ \\
+3 & Newton 多求解器统一 API（含 Kamino） & \cref{sec:rlmc-phys-newton} & $\star\star$ \\
+4 & MuJoCo Warp 边界：PGS/float32/dense Jacobian & \cref{sec:rlmc-phys-dataflow} & $\star\star\star$ \\
+5 & 引擎选型看接触特征，非流行度 & \cref{sec:rlmc-phys-select} & $\star\star\star$ \\
+6 & MuJoCo \verb|solref|/\verb|solimp|/\verb|impratio| & \cref{sec:rlmc-phys-tuning} & $\star\star\star$ \\
+7 & PhysX 接触参数与字段分层 & \cref{sec:rlmc-phys-tuning} & $\star\star\star$ \\
+8 & 跨引擎参数不可直接翻译 & \cref{ins:rlmc-phys-twoparams} & $\star\star\star$ \\
+9 & MJCF/USD 表达力边界与互转丢失 & \cref{sec:rlmc-phys-format} & $\star\star$ \\
+10 & GPU 数据流与三阶段不可逆 & \cref{sec:rlmc-phys-dataflow} & $\star\star\star$ \\
+11 & \verb|expand_model_fields| 与 graph 重建 & \cref{sec:rlmc-phys-dataflow} & $\star\star\star$ \\
+12 & sim2sim 三层验证 $+$ ASAP & \cref{sec:rlmc-phys-sim2sim} & $\star\star\star$ \\
+13 & 排查优先级：先物理后 RL & \cref{sec:rlmc-phys-stability} & $\star\star$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-phys-further}
+
+\begin{itemize}
+  \item Todorov, Erez, Tassa, \emph{MuJoCo: A physics engine for model-based control}, IROS 2012\cite{todorov2012mujoco}——MuJoCo 设计哲学与凸优化接触的数学基础；教你「为什么软接触总收敛」。
+  \item He et al., \emph{ASAP}, RSS 2025（arXiv:2502.01143）\cite{asap2025}——跨仿真器 delta-action model，系统量化 sim-sim gap；教你「跨引擎差异主要来自接触模型」。
+  \item Kamino（arXiv:2603.16536）\cite{kamino2026}——Newton 闭环机构求解器；教你「闭链拓扑如何在 GPU 上精确求解」。
+  \item Zakka et al., \emph{mjlab: A Lightweight Framework for GPU-Accelerated Robot Learning}（arXiv:2601.22074）\cite{mjlab2026}——mjlab 的 WarpBridge / \verb|expand_model_fields| / CUDA Graph 设计；教你「Isaac Lab 风 API 如何架在 MuJoCo Warp 上」。
+  \item NVIDIA, \emph{Announcing Newton}（Technical Blog）\cite{newton2026}——Newton 多求解器架构与 benchmark；教你「统一 API 如何组织异构求解器」。
+  \item UniLab, \emph{A Heterogeneous Architecture for Robot RL Beyond GPU-Dominant Paradigms}（arXiv:2605.30313）\cite{unilab2026}——CPU 物理 $+$ GPU 学习的异构运行时、共享内存 IPC、跨后端 sim2sim 契约；教你「物理不必驻留 GPU——把 CPU 核吞吐喂给 GPU 学习器的第三条路」。
+  \item MuJoCo 官方文档 Computation/Contact 章与 MuJoCo Warp 文档——\verb|solref|/\verb|solimp| 完整数学、CPU/GPU 差异表；查 GitHub issue \verb|google-deepmind/mujoco#2548| 看 MJX vs CPU 数值差异分析。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-phys-trouble}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.0cm}p{4.4cm}@{}}
+\toprule
+症状 & 可能原因 & 排查步骤（相关节） \\
+\midrule
+穿透地面 & \verb|solref| 太软 / \verb|contact_offset| 太小 & 查接触参数$\to$减 \verb|timestep|$\to$增 iterations（\cref{sec:rlmc-phys-tuning}） \\
+脚底打滑 & 软接触微滑 / PhysX friction 太低 & 增 \verb|impratio|(MuJoCo)$\to$增 friction(PhysX)$\to$加 slip penalty（\cref{sec:rlmc-phys-tuning}） \\
+关节高频振荡 & \verb|timestep| 太大 / explicit$+$大 kd & 减 \verb|timestep|$\to$切 builtin$\to$降 kd（\cref{sec:rlmc-phys-stability}） \\
+第一步就 NaN & action scale 太大 / 初始状态非法 & 降 action scale$\to$查初始关节角$\to$NaN guard（\cref{ins:rlmc-phys-nan}） \\
+DR 后慢一步 & \verb|expand_model_fields| 重建 graph & 正常行为，后续恢复（\cref{sec:rlmc-phys-dataflow}） \\
+steps/s 远低预期 & viewer/video 开 / sensor 过重 & \verb|--headless|$\to$关 video$\to$减 sensor（\cref{sec:rlmc-phys-stability}） \\
+加 \verb|num_envs| 后 OOM & \verb|njmax|/\verb|nconmax| 过大 & 降 \verb|njmax| 或 \verb|num_envs|（\cref{sec:rlmc-phys-dataflow}） \\
+两引擎行为不同 & 接触模型差异 & 正常现象，比定性行为非数值（\cref{sec:rlmc-phys-sim2sim}） \\
+MJCF$\to$USD 后姿态不对 & 默认关节角定义不同 & 对比两格式 default joint pos（\cref{sec:rlmc-phys-format}） \\
+3.0 的 \verb|.data.*| 返回 \verb|wp.array| & warp-native 变更 & 加 \verb|wp.to_torch()| 包装（\cref{sec:rlmc-phys-dataflow}） \\
+机器人「漂」起来 & gravity 被设为 $(0,0,0)$ & 查 \verb|MujocoCfg.gravity|（\cref{sec:rlmc-phys-compare}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[最后一句话选型口诀]\label{ins:rlmc-phys-oneliner}
+若只记一件事：\textbf{接触密集选 MuJoCo Warp（mjlab），视觉密集选 PhysX（Isaac Lab），闭环机构选 Kamino（Newton）}。其余所有复杂分析都是在这条口诀上的细化。而调参/排查的元法则同样一句：\textbf{先确认物理层正确，再动 RL；每次只改一个变量}。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-phys-versions}
+
+本章所有代码与参数以下表版本为准。MuJoCo Warp 功能持续扩展，新版本可能已修复部分限制（PGS 支持、sparse Jacobian 等），部署前请查各组件 CHANGELOG。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+组件 & 版本 & 相关内容 \\
+\midrule
+mjlab & 1.4.0 & \verb|MujocoCfg|、\verb|expand_model_fields| \\
+MuJoCo & $\ge$ 3.8.0 & \verb|MjSpec| API、solver/integrator \\
+MuJoCo Warp & 随 mjlab 1.4.0 & GPU solver 支持表、\verb|nconmax|/\verb|njmax| \\
+Isaac Lab & 2.3.2（主线） & \verb|SimulationCfg|、\verb|PhysxCfg| \\
+Isaac Lab & 3.0 Beta & Newton 集成、\verb|wp.array| 管线 \\
+Newton & 1.0 GA & 多求解器、Kamino \\
+PhysX & 5.4+ & TGS 子步、\verb|EnableExternalForcesEveryIteration| \\
+UniLab & main（mujoco-uni 3.8.0 / motrixsim-core 0.8.2） & CPU-sim 异构、sim2sim 契约、DR 能力 \\
+\bottomrule
+\end{tabular}
+\end{center}

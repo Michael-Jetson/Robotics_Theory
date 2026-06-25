@@ -1,0 +1,319 @@
+\chapter{多机协作高斯 SLAM}
+\label{ch:magsslam}
+
+% ════════════════════════════════════════════════════════════════
+%  P5 前沿。直接建在 \cref{ch:gsslam} 单机三锚之上：把可渲染高斯 SLAM 复制到多机。
+%  组织：四问(子图分配/跨机关联/全局合并/通信带宽) → 公共机制(子图刚体/搬高斯/合并/通信)
+%        → 三条多机一脉(de-jargon，无王朝)：
+%          光流-BA 一脉 MCGS+MAGS(源 HI-SLAM2)、点图一脉 CoMo3R(源 MASt3R-SLAM)、RGB-D 子图一脉 MAGiC+Coko。
+%  核心红利 = \cref{eq:gs-rigid} 闭式刚体可搬(每块子图乘一个 T 拼全局)。
+%  去重：单机三锚/范式坐标/母方程 → \cref{ch:gsslam}；回环/位姿图 → \cref{ch:loop}；Sim3/刚体 → \cref{ch:lie}；
+%        分布式后端共识 → \cref{ch:mr-consensus}。
+%  源：论文笔记 第六章(子图刚体)/第十一章(MAGiC)/第十二章(Coko) + 多机GS-SLAM_论文解读教学.md §2-§5
+%      + 后台 agent brief(ch2_briefs.md) + .md 转写。bib 键待补(task #4)。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+\begin{enumerate}
+  \item 多机比单机\emph{多}解哪四件事？为什么这些在单机根本不存在？
+  \item 神经场、点云、3D 高斯——三种地图里，多机拼接为什么\emph{偏偏}选高斯（\cref{eq:gs-rigid} 给了根）？
+  \item 跨机回环检测：一类系统用\emph{光流距离}（几何），另一类用 DINOv2 \emph{外观}描述子。多机（无共同时钟、无重叠轨迹保证）下哪种更现实？单机那套光流距离为什么到多机会失灵？
+  \item “子图当刚体”省了什么、又焊死了什么？为什么多机几乎人人都选它（\cref{ch:gsslam} 的 pose-centric 通病在这放大）？
+  \item 中心化、离线收尾的多机系统，按 \cref{ch:gsslam} “完整 SLAM vs 里程计”的尺子量，是什么成色？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}多机协作 GS-SLAM 比单机（\cref{ch:gsslam}）多解的\emph{四件事}（子图分配 / 跨机关联 / 全局合并 / 通信带宽），以及为什么 3D 高斯靠闭式刚体可搬（\cref{eq:gs-rigid}）天然适配多机；
+  \item \textbf{复述}四个公共机制——子图刚体、回环搬高斯、全局合并、通信压缩——它们如何把单机栈拼成多机系统；
+  \item \textbf{辨析}三条多机一脉（光流-BA / 点图 / RGB-D 子图）在\emph{前端、跨机回环、尺度、中心化}四个选择上的分化；
+  \item \textbf{定位}每个系统在“集中式 vs 分布式、在线 vs 离线收尾、外观 vs 几何回环”的设计空间里的坐标；
+  \item \textbf{评估}“子图刚体”的代价，并用 \cref{ch:gsslam} 的尺子判多机 GS-SLAM 的完整 SLAM 成色；
+  \item \textbf{对照}多机激光 / 协同 LIO 的母语，把“可渲染子图拼接”放回你的传感器直觉。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是 \cref{ch:gsslam} 的多机续篇：单机立好的三条表示底座与范式坐标，到多机各长出一脉。主线只有一句——\emph{每个 agent 建一块子图，靠闭式刚体可搬把子图拼成全局一致的大图}。
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  bk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (single) {单机三锚\\（\cref{ch:gsslam}）};
+\node[grp, right=of single] (four) {多机四问\\子图 / 关联 / 合并 / 带宽};
+\node[grp, right=of four] (mech) {公共机制\\子图刚体 · 搬高斯};
+\node[bk, below=9mm of single] (flow) {光流-BA 一脉\\MCGS · MAGS};
+\node[bk, right=of flow] (pm) {点图一脉\\CoMo3R};
+\node[bk, right=of pm] (rgbd) {RGB-D 子图一脉\\MAGiC · Coko};
+\node[grp, below=8mm of pm] (design) {设计空间\\集中/分布 · 在线/离线};
+\draw[ln] (single)--(four); \draw[ln] (four)--(mech);
+\draw[ln] (mech.south) -- ++(0,-3mm) -| (flow.north);
+\draw[ln] (mech.south) -- ++(0,-3mm) -| (pm.north);
+\draw[ln] (mech.south) -- ++(0,-3mm) -| (rgbd.north);
+\draw[ln] (flow.south) -- ++(0,-3mm) -| (design.north);
+\draw[ln] (pm)--(design);
+\draw[ln] (rgbd.south) -- ++(0,-3mm) -| (design.north);
+\end{tikzpicture}
+\end{center}
+
+\subsection*{前置知识桥接}
+\begin{itemize}
+  \item \textbf{单机可渲染 SLAM}（\cref{ch:gsslam}）：三条表示底座、map / pose / hybrid 范式坐标、尤其\emph{闭式刚体可搬} \cref{eq:gs-rigid}——本章的全部红利由它而来。三条多机一脉就是三个单机锚（MonoGS / HI-SLAM2 / MASt3R-SLAM）各自的多机扩展。
+  \item \textbf{回环检测与位姿图}（\cref{ch:loop}）：跨机回环 $=$ 单机回环的多机版，只是候选来自\emph{别的} agent；闭环后做的仍是位姿图优化。
+  \item \textbf{李群}（\cref{ch:lie}）：子图刚体搬运是 $\SE(3)$ / $\mathrm{Sim}(3)$ 作用，跨机对齐先求一个相对位姿。
+  \item \textbf{分布式优化}（\cref{ch:mr-consensus}）：去中心化多机后端可借多机器人部的共识 / 分布式优化框架；多数现有 GS 系统仍是\emph{中心化}的，本章会点明这条尚未走完的路。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会以为“多机 SLAM 只是多跑几个单机实例”，看不出\emph{跨机关联 / 全局合并 / 带宽}才是真问题，也错过“为什么多机这一波\emph{偏偏}押注 3D 高斯”这个本质答案（\cref{eq:gs-rigid}）；
+  \item 你会把 MCGS / MAGS / CoMo3R / MAGiC / Coko 当五个无关系统，而非三条单机一脉的多机投影，记不住、也比不清。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号.}\;沿用 \cref{ch:gsslam} 的高斯记号。新增多机层：agent 以下标 $a$ 标记，其子图记 $\mathcal S_a$（一块局部高斯地图，焊在 agent 局部坐标系）；agent 局部系到全局系的相似变换记 $\mathbf T_{ga}\in\mathrm{Sim}(3)$（\cref{ch:lie}），把子图拼进全局即 $\mathcal S_a\mapsto\mathbf T_{ga}\cdot\mathcal S_a$（逐高斯按 \cref{eq:gs-rigid} 搬）。跨机回环边记 $(a,i)\!-\!(b,j)$（agent $a$ 第 $i$ 关键帧 与 agent $b$ 第 $j$ 关键帧）。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{从单机到多机：多了哪四件事}
+\label{sec:mags-intro}
+
+\subsection{单机有的、多机要多解的四件事}
+
+单机可渲染 SLAM（\cref{ch:gsslam}）在\emph{一个}坐标系里估一条轨迹、建一张图。换成 $N$ 个 agent 同时跑，凭空多出四件单机根本不存在的事：
+\begin{enumerate}
+  \item \textbf{子图分配}：每个 agent 各建一块地图、各在\emph{自己的}局部坐标系——先有 $N$ 张互不对齐的局部图。
+  \item \textbf{跨机数据关联}：得发现“agent $a$ 与 agent $b$ 看过同一处”（跨机回环）。比单机回环难——\emph{没有共同时钟、不保证轨迹重叠}，候选来自别人的图。
+  \item \textbf{全局合并}：求每个局部系到全局系的相对变换 $\mathbf T_{ga}$，把 $N$ 块子图拼成\emph{一张全局一致}的大图，重叠区还要去重。
+  \item \textbf{通信 / 带宽}：agent 之间传什么、传多少。中心化（各 agent 汇到一个 server）还是分布式（agent 间直传）？传原始高斯太贵。
+\end{enumerate}
+
+\begin{insight}[多机这一波\emph{偏偏}押注 3D 高斯，根在闭式刚体可搬]
+四件事里有三件（关联、合并、通信）都绕着\emph{把一块子图整体挪到正确位姿}转。\cref{eq:gs-rigid} 给了这步\emph{闭式}解：一块子图就是一堆显式高斯，拼接 / 纠正就是给整块乘一个 $\mathbf T_{ga}$、逐高斯 $\boldsymbol\mu\!\leftarrow\!\mathbf R\boldsymbol\mu+\mathbf t,\ \boldsymbol\Sigma\!\leftarrow\!\mathbf R\boldsymbol\Sigma\mathbf R^\top$，瞬间、精确、不重训。神经场没有它（地图烘进权重、搬不动），点云有它却\emph{不可渲染}。\textbf{“可渲染 $+$ 可刚体搬”这对组合，正是多机集体押注高斯的根}——\cref{ch:gsslam} 单机时它只是“显式红利”，到多机成了刚需。
+\end{insight}
+
+\section{公共机制：子图刚体、搬高斯、合并、通信}
+\label{sec:mags-mech}
+
+\subsection{机制一：子图刚体——省了全局 BA，焊死了内部漂移}
+
+几乎所有多机 GS-SLAM 都把每个 agent 的轨迹切成\emph{子图}（submap）：子图内部走单机的 pose-centric 跟踪，对外子图当位姿图里\emph{一个刚体节点}（用首帧位姿代表）。回环 / 合并时只解\emph{子图位姿}、整块按 \cref{eq:gs-rigid} 搬。
+
+\begin{insight}[“子图刚体”省什么、焊死什么——一笔承重账]
+\textbf{省}：稠密全局 BA 要对百万级高斯联立位姿、做不起；把地图切成子图、子图当刚体，全局优化退化成\emph{子图级}位姿图，便宜得多。\textbf{焊死}：一个子图 $=$ 位姿图一个节点（首帧位姿），校正\emph{刚体地}搬给整块——于是子图\emph{首帧到末帧那段的累积跟踪漂移被永久焊死}（位姿图看不见它、建图阶段又固定位姿只优化高斯，\emph{没有任何环节能纠}）。子图越大、运动越猛、或回环恰好闭在子图中段，越糟；子图大小因此是个 bias-variance 旋钮（大则省、漂移多；小则细、配准多）。\textbf{去掉子图刚体}，要么回到做不起的稠密全局 BA、要么放弃全局一致——这是整条路线的承重折中。真正的解在另一档（可变形 / 帧锚定，把高斯绑到帧而非子图），是 \cref{ch:gsslam} 提过、新工作正补的方向。
+\end{insight}
+
+\subsection{机制二：回环搬高斯}
+
+跨机或同机回环检出后，先求两端相对位姿（单目在 $\mathrm{Sim}(3)$ 含尺度、RGB-D / 激光在 $\SE(3)$，\cref{ch:lie}），做一次位姿图优化（\cref{ch:loop}）摊匀误差，再让每块子图的高斯按新位姿\emph{闭式}重贴（\cref{eq:gs-rigid}）。地图始终是\emph{乘客}——这正是 \cref{ch:gsslam} 范式坐标里的 pose-centric，只是位姿图节点从关键帧变成了子图、边里多了\emph{跨机边} $(a,i)\!-\!(b,j)$。
+
+\subsection{机制三：全局合并 $\approx$ 3DGS 离线精修，不是全局 BA}
+
+把各 agent 子图拼到一起后，接缝处要\emph{细合并}。这步常被直觉当成“全局 BA”，严格说不是：
+
+\begin{insight}[合并是 BA 拿掉位姿、只留结构的那半]
+全局 BA 的定义是\emph{位姿 $+$ 结构联合}优化（最小化重投影残差）。多机 GS 的细合并却\emph{冻死位姿}（取自位姿图结果、不带梯度）、只优化高斯、残差是\emph{光度重渲染}——缺了 BA 的“位姿调整”那半。换句话说，BA 被拆成两个解耦半步：\emph{位姿图优化}（只动位姿、子图当刚体）$\to$\emph{地图精修}（只动结构、位姿冻），各跑一次、不交替。而“地图精修”那半\emph{恰好等于}标准 3DGS 的离线优化（固定位姿 $+$ 光度损失 $+$ 优化高斯 $+$ 剪 $\sigma\!<\!0.005$），只是从已建好的融合图热启、只剪不增密、几千步而非几万步。所以“像全局 BA”和“像 3DGS 离线”说的是同一件事，差的永远是位姿那一刀。
+\end{insight}
+
+\subsection{机制四：通信与带宽}
+
+谁把数据汇给谁、传多少，是多机\emph{独有}的工程轴。绝大多数现有系统是\emph{中心化}的：各 agent 把关键帧 / 特征 / 子图传给一个 server，server 做跨机关联与全局合并。传什么、压到多小（特征描述子？降采样高斯？）直接决定系统能扩到几台、能否实时——这正是后面 Coko 一脉的主轴。真正的\emph{分布式}（agent 对等、无 server）多机 GS-SLAM 仍近空白，可借多机器人部的共识 / 分布式优化（\cref{ch:mr-consensus}）往下走。
+
+\section{光流-BA 一脉：MCGS 与 MAGS}
+\label{sec:mags-flowba}
+
+HI-SLAM2 的单机栈（DROID 稠密光流 BA $+$ JDSA $+$ 几何感知 3DGS $+$ $\mathrm{Sim}(3)$ PGBA，\cref{sec:gs-decoupled}）有两支以同一作者为主的扩展——MCGS 与 MAGS。但它们的“多”不是一回事，这恰是个值得先钉清的教学点。
+
+\begin{insight}[“multi” 藏着两个完全不同的问题]
+\textbf{多相机（multi-camera）}：$k$ 个相机刚性装在\emph{一台}车 / 机上、外参\emph{已标定}、时钟同步——本质仍是\emph{一个 agent、一个机体系}。已知外参\emph{一举绕开}了未知相对位姿\emph{和}尺度两大难点，只多了“把跨相机观测塞进同一个 BA”。\textbf{多机（multi-agent）}：$N$ 个独立 agent、各自局部系、\emph{外参未知}、无共同时钟——\cref{sec:mags-intro} 那四件事（关联 / 合并 / 通信）全要从零解。MCGS 是前者、MAGS 是后者。\textbf{把它们都叫“多机”会彻底看错难度}。
+\end{insight}
+
+\subsection{MCGS：标定 rig 把尺度与相对位姿一次锁死}
+
+\begin{paper}[MCGS-SLAM：多相机 rig 上的稠密高斯]
+\textbf{简称 \& 出处}：MCGS-SLAM（\emph{A Multi-Camera SLAM Framework Using Gaussian Splatting}，Cao 等，ICRA 2026，arXiv:2509.14191）\cite{cao2026mcgsslam}。
+
+\textbf{问题}：单目稠密 SLAM 视场窄、有尺度漂移、侧向盲区（自动驾驶不安全）。能否用一组\emph{已标定}多相机 rig，把环视稠密 RGB 融成\emph{一张}连续优化的高斯地图？
+
+\textbf{核心思想}：首个纯 RGB 多相机 3DGS SLAM。\textbf{MCBA}（多相机 BA）在一个高斯牛顿里同时拉\emph{时序}边（同相机跨时刻）与\emph{跨视}边（同时刻跨相机，相对位姿 $=$ 已标定外参 $\mathbf T_{c}^{b}$）、联合解位姿 $+$ 逐像素深度；JDSA（沿用 HI-SLAM2 \cref{eq:gs-jdsa}）保证跨相机\emph{尺度一致}；几何感知 3DGS 当下游地图。
+
+\textbf{关键结果}：Waymo 平均 ATE 反超 HI-SLAM2（$1.298$ vs $1.473$\,m）、PSNR 最佳，\emph{补回}了单目方法漏掉的侧向立面。
+
+\textbf{与本书关系}：“把单机稠密 GS-SLAM 搬上\emph{标定 rig}”的范例，仍在 DROID 稠密光流 BA $+$ 几何感知 3DGS 一脉（\cref{sec:gs-decoupled}）、范式是 hybrid $\cap$ pose-centric——\emph{multi-camera $\ne$ multi-agent} 的对照锚。
+
+\textbf{局限}：要求标定、同步的 rig；JDSA 场景相关、“偶尔反增漂移”，论文报的是两套配置里\emph{较好}那套；声称支持 RGB-D 却只评 RGB；无 IMU；公开仅项目页，机制以继承的 HI-SLAM2 fork 为据、未对独立 MCGS 代码核验。
+\end{paper}
+
+\subsection{MAGS：真多机单目}
+
+\begin{paper}[MAGS-SLAM：首个 RGB-only 多机协作高斯 SLAM]
+\textbf{简称 \& 出处}：MAGS-SLAM（\emph{Monocular Multi-Agent Gaussian Splatting SLAM}，Cao 等，2026 预印本，arXiv:2605.10760）\cite{cao2026magsslam}。
+
+\textbf{问题}：已有多机 3DGS SLAM 都要 RGB-D（度量深度 $+$ 刚性 $\SE(3)$ 跨机对齐）；纯单目 RGB 多机仍空白——每个 agent 的地图\emph{尺度未知}、重叠不确定。
+
+\textbf{核心思想}：每个 agent 跑独立单目 DROID 前端、建局部高斯子图；一个轻量 \emph{coordinator} 从\emph{紧凑子图摘要}发现重叠、建\emph{全局 $\mathrm{Sim}(3)$ 子图位姿图}（几何 $+$ 锚点光度边），再做占用感知高斯融合 $+$ 联合精修。
+
+\textbf{关键结果}：号称首个 RGB-only 多机 3DGS SLAM，ReplicaMultiagent 上 ATE / PSNR 追平甚至超过 RGB-D 基线。一个干净的教学数据点：消融把 $\mathrm{Sim}(3)$ 强降到 $\SE(3)$，PSNR 从 $40.33$ 崩到 $18.61$——\emph{单目多机非 $\mathrm{Sim}(3)$ 不可}（呼应 \cref{sec:gs-decoupled} 治尺度漂的群选择）。
+
+\textbf{与本书关系}：单目多机协作稠密 SLAM 的范例，与 CoMo3R（\cref{sec:mags-pointmap}）是\emph{兄弟}（都“检索 $\to$ 验证 $\to$ Umeyama $\to$ 全局 $\mathrm{Sim}(3)$”），但 fork 不同祖先（MAGS 源 HI-SLAM2、CoMo3R 源 MASt3R-SLAM）。跨机回环用 128 维池化 DROID 描述子 $+$ LoFTR $+$ RANSAC-Umeyama（外观 $+$ 几何并用，\emph{非} DINOv2）。
+
+\textbf{局限}：仅室内；尺度依赖 Metric3D 室内深度先验。\textbf{三口径要紧}：招牌 Contribution 3——\emph{占用感知高斯融合}（Eq.15-19）——\textbf{公开快照里未实装}（退化成默认关闭的朴素体素哈希去重），子图图的光度残差、reactive PGBA 也缺。论文当\emph{设计}讲，代码跑的是更糙的版本——这一脉的通病，\cref{sec:mags-designspace} 收口。
+\end{paper}
+
+\section{点图一脉：CoMo3R}
+\label{sec:mags-pointmap}
+
+CoMo3R 把 MASt3R-SLAM 的单机点图栈（\cref{sec:gs-pointmap}）复制到多机——\emph{每个 agent 跑一份}（\texttt{matching.py}、\texttt{geometry.py} 与 MASt3R-SLAM 字节相同），再加一个中央协调器。
+
+\begin{paper}[CoMo3R-SLAM：把前馈点图栈复制到多机]
+\textbf{简称 \& 出处}：CoMo3R-SLAM（\emph{Collaborative Monocular Dense SLAM with Learned 3D Reconstruction Priors for Outdoor Multi-Agent Systems}，Cao 等，2026 预印本，arXiv:2605.30488）\cite{cao2026como3rslam}。
+
+\textbf{问题}：户外\emph{协作单目}稠密 SLAM。深度传感器队伍重、耗电、要标定；单目省事但每个 agent 只重建到一个未知相似变换，且户外跨机关联（低重叠、大视角差、重复纹理）让稀疏特征匹配崩掉。
+
+\textbf{核心思想}：把学习式前馈 3D 先验（MASt3R）放\emph{中心}的两级系统——每 agent 一套点图前端（ray-range 残差、通用相机，\cref{sec:gs-pointmap}），加一个协调器：ASMK \emph{检索}跨机候选 $\to$ 稠密\emph{对称}点图匹配\emph{验证} $\to$ 闭式 $\mathrm{Sim}(3)$（Umeyama）\emph{对齐尺度规} $\to$ GPU 全局 $\mathrm{Sim}(3)$ BA $+$ 段级深度精修。
+
+\textbf{关键结果}：约 8\,FPS 在线，Tanks\&Temples / Waymo 双机上多数场景超 RGB-D 基线——\emph{无深度传感器、无内参}。
+
+\textbf{与本书关系}：点图一脉（\cref{sec:gs-pointmap}）的多机投影，与 MAGS \emph{兄弟}（同样“检索 $\to$ 验证 $\to$ Umeyama $\to$ 全局 $\mathrm{Sim}(3)$”），只是祖先不同。跨机对齐用\emph{闭式 Umeyama}（一次解出、非迭代）化解“两条链都从原点起 $\to$ Hessian 秩亏 $\to$ Cholesky 静默返回零增量”的退化初始化。\textbf{注意}：它的地图是\emph{融合点图、不是 3DGS}——本章里唯一不用高斯渲染的一脉。
+
+\textbf{局限}：单光心 $+$ 先验训练分布外（强畸变）退化；中心化协调器是通信 / 容错瓶颈。\textbf{三口径}：headline 数是\emph{未标定}档，但放出的配置默认 \texttt{use\_calib:True}（克隆即跑\emph{标定}路）；论文说 LM-IRLS，代码函数仍叫 \texttt{solve\_GN\_rays}、CUDA 把 $\lambda\!\equiv\!0$，实为 Tikhonov-GN。
+\end{paper}
+
+\section{RGB-D 子图一脉：MAGiC 与 Coko}
+\label{sec:mags-rgbdsubmap}
+
+前两脉各从一个单机锚（HI-SLAM2 / MASt3R-SLAM）长出。第三脉的根在别处：RGB-D 的\emph{Gaussian-SLAM / SplaTAM 子图家族}（map-centric 味的隐式跟踪 $+$ 子图）。MAGiC 是这一脉的多机旗舰、Coko 是它的带宽续作。RGB-D 自带度量尺度，所以这一脉一律走 $\SE(3)$（不必 $\mathrm{Sim}(3)$ 治尺度）。
+
+\begin{paper}[MAGiC-SLAM：多机 RGB-D 高斯子图的旗舰]
+\textbf{简称 \& 出处}：MAGiC-SLAM（\emph{Multi-Agent Gaussian Globally Consistent SLAM}，Yugay、Gevers、Oswald，CVPR 2025）\cite{yugay2025magicslam}。
+
+\textbf{问题}：能渲染的多机 SLAM 此前只有 CP-SLAM（\emph{分布式神经}表示）——慢、渲不了真实数据、最多 2 机、跟踪差。神经表示\emph{不支持刚体变换}，没法高效纠正 / 合并全局图。
+
+\textbf{核心思想}：用\emph{可刚体形变的 3D 高斯}，让每个 agent 的 RGB-D 子图能被闭式刚体变换纠正 / 合并；给高斯 SLAM 管线加回环 $+$ PGO，用 \textbf{DINOv2} 当回环检测子；中央 server 支持灵活机数。
+
+\textbf{关键结果}：ATE 全面碾压 CP-SLAM；建图 $\sim\!24\times$、合并 $\sim\!8.7\times$、显存约 $1/7$；Aria 新视角 PSNR $22.61$ vs $9.06$；机数“只受 server 限”。
+
+\textbf{与本书关系}：多机 RGB-D 3DGS 子图范式的旗舰范例——把本章公共机制（\cref{sec:mags-mech} 子图刚体 / 搬高斯 / 两段合并）集齐；回环搬高斯走闭式 $\SE(3)$（$\boldsymbol\mu\!\leftarrow\!\mathbf T\boldsymbol\mu$，\cref{eq:gs-rigid}），正是“神经场做不到”的那一手。
+
+\textbf{局限}：略快于 $1$\,FPS；不适合动态环境。\textbf{三口径要紧}：跨机一致性\emph{硬依赖所有 agent 共享一个 GT 世界系}（首帧钉到 GT、PGO 冻结 GT 首节点）——是“已知公共系下的联合优化”，\emph{不是}从零估跨机外参的分布式 SLAM；“协作定位”是\emph{跑完一次性}产物、非运行时协作。论文写 colored-ICP $+$ g2o，代码跑 Open3D 图像域 \texttt{point\_to\_plane} $+$ GraphSLAM。
+\end{paper}
+
+\begin{paper}[Coko-SLAM：把带宽当一等目标]
+\textbf{简称 \& 出处}：Coko-SLAM（\emph{Compact Keyframe-Optimized Multi-Agent Gaussian Splatting SLAM}，Li 等，2026 预印本，arXiv:2604.00804；代码开源）\cite{li2026kokoslam}。
+
+\textbf{问题}：多机稠密 3DGS 要在\emph{带宽受限}链路上交换大地图——传高斯子图是瓶颈。三个子问题：冗余关键帧、子图过大（透明低信息高斯占多数）、\emph{跨机回环假设已知初始位姿}（没有就崩）。
+
+\textbf{核心思想}：在 MAGiC 代码上做三处服务带宽的改动——\emph{特征距离关键帧}（DINOv2-S）、\emph{GaussianSPA 压缩}、\emph{无初值跨机回环}（FPFH$+$RANSAC$\to$ICP）；agent 只传\emph{关键帧特征向量 $+$ 位姿 $+$ 3D 高斯子图——不传点云、不传图像}。
+
+\textbf{关键结果}：传输量\emph{降 85–95\%}、渲染质量不降；没有初始位姿时 MAGiC 在所有公寓场景\emph{失败}、Coko 成功。
+
+\textbf{与本书关系}：把\emph{通信 / 带宽}抬成一等目标的范例（\cref{sec:mags-mech} 机制四）；尤其\emph{无初值全局配准}——FPFH$+$RANSAC$\to$ICP 这条经典几何配准管线正是激光 / FAST-LIO 读者的母语（\cref{ch:lidar_slam}），只是这里跑在\emph{从高斯渲出}的点云上。它还把激光的关键帧选择理论（边际信息）引进视觉 SLAM。
+
+\textbf{局限}：渲染深度在低分辨率（Aria $512^2$）退化、配准变差；仍中心化；只 RGB-D（无单目）。\textbf{三口径}：招牌的鲁棒 line-process（GTSAM）是\emph{空 stub}（打印一句“future”、从不调用），回环边信息矩阵 $\boldsymbol\Lambda$ \emph{被注释掉}（退成固定 $\sigma$），回环检测用固定 FAISS-L2 阈值、非论文的自适应分位数。真正扎实的两件 $=$ 无初值回环（FPFH$+$RANSAC）$+$ image-free 载荷。
+\end{paper}
+
+\section{设计空间与范式总结}
+\label{sec:mags-designspace}
+
+\subsection{三根轴把六个系统摆开}
+
+六个协作 / 多视系统（MCGS / MAGS / CoMo3R / MAGiC / Coko $+$ 单机祖先 MASt3R-SLAM）表面五花八门，但只沿\emph{三根轴}分化（\cref{tab:mags-design}）：
+\begin{enumerate}
+  \item \textbf{尺度规}：RGB-D 自带度量 $\to$ $\SE(3)$（MAGiC / Coko / MCGS-标定）；单目尺度未知 $\to$ $\mathrm{Sim}(3)$（MASt3R-SLAM / CoMo3R / MAGS）。
+  \item \textbf{跨机关联模态}：外观 DINOv2（MAGiC / Coko）vs 前馈点图匹配（CoMo3R）vs DROID 描述子 $+$ LoFTR 几何（MAGS）vs 光流 / 无（MCGS）。
+  \item \textbf{传输内容}：原始子图 $+$ 图像（MAGiC）vs 紧凑摘要（MAGS）vs image-free 高斯载荷（Coko）。
+\end{enumerate}
+
+\begin{table}[H]\centering
+\caption{多机 / 多视高斯 SLAM 设计空间（六系统）}
+\label{tab:mags-design}
+\scriptsize
+\begin{tabular}{@{}lllll@{}}
+\toprule
+系统 & 多重性 & 尺度规 & 跨机回环模态 & 一脉 \\
+\midrule
+MASt3R-SLAM & 单机 & $\mathrm{Sim}(3)$ & 编码特征 ASMK & 点图（祖先）\\
+CoMo3R & 多机·户外 & $\mathrm{Sim}(3)$ & 点图匹配 & 点图 \\
+MCGS & 多\emph{相机} rig & 度量 & 无（离线全 BA）& 光流-BA \\
+MAGS & 多机·单目 & $\mathrm{Sim}(3)$ & DROID 描述子 $+$ LoFTR & 光流-BA \\
+MAGiC & 多机·RGB-D & $\SE(3)$ & DINOv2 外观 & RGB-D 子图 \\
+Coko & 多机·RGB-D & $\SE(3)$ & DINOv2 $+$ 无初值 FPFH & RGB-D 子图 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{范式总结：全是 pose-centric}
+
+\begin{insight}[六个系统无一 map-centric]
+按 \cref{sec:gs-paradigm} 的 litmus 逐一审：每个系统回环 / 后端优化的自由变量 $\mathbf x$ \emph{都是位姿}（子图位姿、或全局 $\mathrm{Sim}(3)$ 位姿），高斯 / 点图地图\emph{始终是乘客}、被闭式刚体 / $\mathrm{Sim}(3)$ 变换搬动（\cref{eq:gs-rigid}）。\textbf{无一是 map-centric}。原因正是 \cref{ch:gsslam} 那笔账：稠密全局 BA 太贵，多机更不可能对跨 agent 百万高斯联立位姿——子图刚体是唯一负担得起的路。多机这一波的全部红利，压在“高斯可被一个 $\mathbf T$ 闭式搬动”这一条上。
+\end{insight}
+
+\subsection{两瓢冷水}
+
+\begin{insight}[“多机协作”里有多少是\emph{运行时}协作？]
+按 \cref{ch:gsslam} 的“完整 SLAM vs 里程计”尺子量，这一代多机系统多是\emph{名义协作}：绝大多数\emph{中心化}（agent 把数据汇给 server）、跨机耦合是\emph{跑完一次性}的（运行时各 agent 互不知、只在末尾联合 PGO 里连起来）；MAGiC 一脉甚至\emph{硬依赖所有 agent 共享一个 GT 世界系}，不是从零估跨机外参。真正\emph{分布式}（对等、无 server、无共享先验系）的多机高斯 SLAM 仍近空白——可借多机器人部的共识优化（\cref{ch:mr-consensus}）。
+\end{insight}
+
+\begin{pitfall}[论文机制 $\ne$ 代码实装（这一脉的家族通病）]
+\textbf{错误}：照论文招牌机制理解系统的真实行为。\textbf{后果}：复现对不上、误判贡献来源。\textbf{根因}：这一脉反复出现\emph{论文写优雅自适应 / 鲁棒机制、代码退成更糙的固定阈值或干脆不实装}——MAGS 占用感知融合（Contribution 3）公开快照缺、退朴素去重；Coko 鲁棒 line-process 是空 stub、信息矩阵注释掉；MAGiC 论文 colored-ICP $+$ g2o、代码 \texttt{point\_to\_plane} $+$ GraphSLAM。\textbf{正确}：引用机制时按\emph{设计}讲、但标注\emph{公开快照实跑什么}（本章 paper 盒已逐一标）——这正是三口径里“代码证据”那一径的价值。
+\end{pitfall}
+
+\section{常见误解、小结与故障排查}
+\label{sec:mags-summary}
+
+\subsection{与多机激光的对照}
+
+\begin{note}
+\textbf{母语桥.}\;多机激光 / 协同 LIO 读者会觉得眼熟（\cref{ch:lidar_slam}）：各 agent 跑里程计建局部图、跨机找重叠、求相对变换拼全局——\emph{骨架完全一样}，只是局部图从点云换成可渲染高斯、跨机配准从点云 ICP 换成（高斯渲出点云的）FPFH$+$RANSAC$\to$ICP（Coko）或点图匹配（CoMo3R）。Coko 的“无初值回环 $+$ image-free 载荷”尤其对激光读者亲切：前者是经典几何配准、后者把“传地图”从传稠密点云压成传\emph{紧凑高斯参数}。把这一章当成\textbf{“协同 LIO 换上可渲染子图”}，就抓住了。
+\end{note}
+
+\subsection{知识点总表}
+
+\begin{table}[H]\centering
+\caption{本章知识点与难度（$\star$ 必学 / $\star\star$ 核心 / $\star\star\star$ 进阶）}
+\label{tab:mags-points}
+\small
+\begin{tabular}{@{}lcl@{}}
+\toprule
+知识点 & 难度 & 落点 \\
+\midrule
+多机四问 $+$ 为什么押注高斯 & $\star\star$ & \cref{sec:mags-intro} \\
+子图刚体的承重账 & $\star\star\star$ & \cref{sec:mags-mech} \\
+合并 $\approx$ 3DGS 离线、$\ne$ 全局 BA & $\star\star\star$ & \cref{sec:mags-mech} \\
+multi-camera vs multi-agent & $\star\star$ & \cref{sec:mags-flowba} \\
+闭式 Umeyama 跨机对齐 & $\star\star\star$ & \cref{sec:mags-pointmap} \\
+$\SE(3)$ / $\mathrm{Sim}(3)$ 尺度规之分 & $\star\star$ & \cref{sec:mags-designspace} \\
+六系统全 pose-centric & $\star\star$ & \cref{sec:mags-designspace} \\
+论文机制 $\ne$ 代码实装 & $\star\star$ & \cref{sec:mags-designspace} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{故障排查}
+
+\begin{table}[H]\centering
+\caption{多机高斯 SLAM 常见故障排查}
+\label{tab:mags-trouble}
+\small
+\begin{tabular}{@{}p{3.2cm}p{4.2cm}p{4.6cm}@{}}
+\toprule
+症状 & 可能原因 & 排查 / 对策（相关节）\\
+\midrule
+单目多机 PSNR 崩 & 跨机对齐用 $\SE(3)$ 锁死尺度 & 换 $\mathrm{Sim}(3)$（\cref{sec:mags-flowba}）\\
+跨机回环全是误配 & 无初值、纯 ICP 落局部最优 & 先 FPFH$+$RANSAC 粗配（\cref{sec:mags-rgbdsubmap}）\\
+子图接缝重影 & 合并只粗拼、未去重 / 精修 & 两段合并（\cref{sec:mags-mech}）\\
+带宽爆 & 传了原始点云 / 图像 & image-free 高斯载荷 $+$ 压缩（\cref{sec:mags-mech}）\\
+复现对不上论文 & 招牌机制代码未实装 & 查 paper 盒三口径（\cref{sec:mags-designspace}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{两章收尾}
+
+\cref{ch:gsslam} 与本章一起，把\emph{可渲染地图进 SLAM 环}讲完：单机立三条表示底座（3DGS / 神经场 / 点图）与 map / pose / hybrid 范式坐标；多机靠\emph{闭式刚体可搬}把单机子图拼成全局图，沿光流-BA / 点图 / RGB-D 子图三脉展开。一路所有系统——从 MonoGS 到 Coko——解的仍是 \cref{eq:intro-nls} 那条母方程，只是把地图换成可渲染高斯、把残差换成可微渲染 / 点图 / 重投影。\textbf{表示与残差换了皮，优化即推断的骨架未变}——这正是本书一贯的缝合线，也是它向 \cref{ch:dynamic} 动态 / 可变形 SLAM 的下一步交接。

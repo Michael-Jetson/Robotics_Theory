@@ -1,0 +1,1230 @@
+\chapter{步态生成与轨迹规划}
+\label{ch:quad_gait}
+
+% \cnum（字体无关带圈数字）已上提到 common/preamble.tex，全书统一，勿在此重定义。
+
+% ════════════════════════════════════════════════════════════════
+%  四足机器人运动控制部 —— 步态生成与轨迹规划章。
+%  本章为 \cref{ch:quad_mpc}（单刚体凸 MPC）供给「接触序列/相位时序 + 期望质心轨迹」。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item “原地踏步”和“向前走”这两件事，在腿的\emph{协调时序}上有何异同？若一台四足机器人“踏步”与“前进”用的是同一套对角步态，那么决定它是\emph{原地}还是\emph{前进}的，到底是步态调度器还是别的模块？
+  \item 一台没有足底力/触碰传感器的四足，只能按系统时钟在“支撑”与“摆动”之间切换。当它在崎岖地面行走、某条腿\emph{该触地时却踩进了坑里}（或\emph{该摆动时却已踩到石头上}），会发生什么？这说明纯时间切换的根本短板是什么？
+  \item 上层 MPC（\cref{ch:quad_mpc}）的预测时域需要知道“未来每个时刻哪几条腿着地”。这个\emph{接触序列}是 MPC 自己优化出来的，还是别处给定的？若让 MPC 顺便优化“何时触地”，优化问题的性质会怎样改变？
+  \item 人跑步时，向前加速则脚落在重心\emph{前方}、刹车则落在\emph{后方}、转弯则落点偏\emph{内侧}。请把这三种“落点偏置”各自对应到一个物理量（速度命令？速度误差？角速度？），并说出落足点规划的\emph{根本目的}是什么。
+  \item 在斜坡上行走时，若把摆动腿落足点的竖直坐标 $z$ 一律规划为 $0$（与平地同高），会出现什么后果？要避免它，规划器必须先估计出什么几何量？
+  \item 摆动足从离地点到落足点的空中轨迹有无穷多种画法。若要求“起点、终点的位置与速度都给定，且整个过程所用的控制力（加加速度）尽量小”，最优轨迹是几次多项式？为什么竖直方向 $z$ 要\emph{分两段}而非一段？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}“步态”是腿部接触/摆动的\emph{时序协调模式}，它与\emph{质心运动}是\emph{两层解耦}的；并论证“接触序列是 MPC 已知的未来（外生输入）”这一全章主旨（\cref{sec:qg-motivation,sec:qg-history}）；
+  \item \textbf{辨析}支撑/摆动相位的两种切换方式（时间 vs 事件），说清纯时间切换在崎岖地面的冲击短板与事件切换的五大工程难题（\cref{sec:qg-reverse,sec:qg-scheduler}）；
+  \item \textbf{掌握}步态的“占空比—偏移量”描述法，从单一系统时钟推出每条腿的\emph{相位变量、支撑布尔、支撑/摆动相位进度}，并据此读写 trot/walk/pace/bound/pronk 的时序（\cref{sec:qg-scheduler}）；
+  \item \textbf{推导}基于速度命令的质心轨迹：偏航递推、本体系$\to$世界系速度旋转、含\emph{堵转保护}的期望位置凸组合（\cref{sec:qg-com}）；
+  \item \textbf{建立}地形坡度估计：支撑足坐标采集、最小二乘平面拟合、由法向量反解期望俯仰/横滚，并把它闭环回落足点 $z$ 坐标（\cref{sec:qg-slope}）；
+  \item \textbf{构造}落足点：从 Raibert 启发式的\emph{中性点 + 速度补偿 + 旋转补偿}三项分解，到工程版的\emph{对称点 + 四项叠加}（含捕获点速度修正与向心补偿），并理解 Raibert 纯旋转的切向外推缺陷（\cref{sec:qg-footstep}）；
+  \item \textbf{推导}摆动足底轨迹：由“最小控制力平方积分”经推广 Euler–Lagrange 方程得 $\mathrm{d}^4x/\mathrm{d}t^4=0$、三次多项式 $x=3t^2-2t^3$，并把它整形为 $x,y$ 三次、$z$ 分段“摆线式”抬腿轨迹（\cref{sec:qg-swing}）；
+  \item \textbf{落地}摆动腿轨迹跟踪（足端 PD 修正力 $+\ \boldsymbol{\tau}=\mathbf{J}^\top\mathbf{f}$）与参数整定要点（\cref{sec:qg-practice}）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把单一系统时钟，翻译成 MPC 可直接吃下的接触序列与期望轨迹}”的主线。结构如下：
+
+\begin{center}
+\begin{forest} navtreeLR
+[{步态生成与轨迹规划\\（为 MPC 供料）}
+  [{为何步态先行\\接触序列=已知未来}
+    [{时间 vs 事件切换}] ]
+  [{步态调度器\\占空比/偏移量/相位}
+    [{相位变量$\to$支撑布尔}] ]
+  [{质心轨迹\\速度命令$\to$位姿}
+    [{堵转保护凸组合}] ]
+  [{地形坡度\\最小二乘平面}
+    [{法向量$\to$俯仰/横滚}] ]
+  [{落足点\\Raibert+四项叠加}
+    [{捕获点/向心补偿}] ]
+  [{摆动轨迹\\变分$\to$三次多项式}
+    [{$z$ 分段摆线式}] ]
+]
+\end{forest}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:qg-motivation,sec:qg-history} 建立“步态是什么、为何与质心运动解耦、为何接触序列是 MPC 的外生输入”三大立论，是任何读者的主干；\cref{sec:qg-scheduler} 是把单一时钟翻译成四腿相位的“齿轮箱”，写代码前必须吃透；\cref{sec:qg-com,sec:qg-slope} 生成 MPC 的\emph{期望状态轨迹} $\mathbf{D}$（含重力增广的第 13 维），是本章与 \cref{ch:quad_mpc} 的接口；\cref{sec:qg-footstep,sec:qg-swing} 决定摆动腿“落在哪、怎么摆过去”，前者供 MPC 的 $\mathbf{B}_k$ 装配落足点、后者供下游逆运动学；\cref{sec:qg-practice} 是工程落地（轨迹跟踪 + 整定），可在跑通仿真后回看。
+
+\subsection*{前置知识桥接}
+本章把前几章的几何与控制工具直接用作地基：
+\begin{itemize}
+  \item \cref{ch:rigid_body}（刚体运动）给出 ZYX 欧拉角与基本旋转 $\mathbf{R}_z(\psi)$，本章偏航递推、本体系$\to$世界系速度旋转、法向量反解俯仰/横滚都建在它上面；
+  \item \cref{ch:lie}（李群与李代数）给出 $\dot{\mathbf{R}}=\boldsymbol{\omega}^\wedge\mathbf{R}$ 与反对称算子 $(\cdot)^\wedge$，本章向心补偿的速度约束求导用到；
+  \item \cref{ch:quad_kin}（浮动基座建模与运动学）给出腿部正/逆运动学与足端雅可比 $\mathbf{J}$，本章 \cref{sec:qg-swing,sec:qg-practice} 把足端期望轨迹经逆运动学转关节命令、把足端力经 $\mathbf{J}^\top$ 转关节力矩；
+  \item \cref{ch:quad_mpc}（单刚体 MPC）是本章的\emph{下游消费者}：本章产出的接触序列 $s_i$、期望轨迹 $\mathbf{D}$、名义落足点都直接进入 MPC 的 $\mathbf{A}_k,\mathbf{B}_k$ 与代价函数。本章不重复 MPC 推导，仅在接口处衔接 \cref{ch:quad_mpc}。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会以为 MPC（\cref{ch:quad_mpc}）那个漂亮的凸 QP 是“凭空”知道未来每步谁着地的——其实“接触序列是已知未来”这一\emph{凸性前提}正是本章步态调度器提供的；不懂这一层，就会困惑“为什么不让 MPC 自己优化触地时刻”（答案：那会变成非凸的混合整数问题）；
+  \item 你会在读宇树、MIT 等开源代码时，看到反复出现的 $\beta$（占空比）、相位变量、Raibert 落足公式、三次样条摆动轨迹，却不知每一块从哪条物理直觉/方程来、为何如此取系数——只能照抄而不会调参、不会排错。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导与练习） & 4--6 小时 & 首次系统学习、要做四足步态/规划 \\
+速读（跳过变分与坡度推导） & 1.5 小时 & 有规划基础、想对齐记号与接口 \\
+速查（只看小结的符号表 + 公式速查表） & 15 分钟 & 写规划器代码时回来查公式/维度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+姿态用 ZYX 欧拉角 $\boldsymbol{\Theta}=[\phi,\theta,\psi]^\top$（roll/pitch/yaw，\cref{ch:rigid_body}），$\mathbf{R}_z(\psi)$ 为绕 $z$ 的基本旋转。
+世界（惯性）系记 $\mathcal{O}$、本体系记 $\mathcal{B}$；量的左上标记表达坐标系，如 ${}^{\mathcal{O}}\boldsymbol{p}_{com}$、${}^{\mathcal{B}}\boldsymbol{v}_{com}$。
+\textbf{左下标 $d$ 表期望（desired）}，如 ${}_d\psi$、${}_d^{\mathcal{O}}\boldsymbol{v}_{com}$；\textbf{左下标 $i$ 表第 $i$ 号腿}，腿序统一为 \textbf{LF–RF–LH–RH}（左前/右前/左后/右后，对应 $i=1,2,3,4$）。
+\textbf{接触布尔记 $s_i\in\{0,1\}$}（$1=$ 支撑/stance，$0=$ 摆动/swing），与 \cref{ch:quad_mpc} 一致；调度器内部的“支撑布尔”${}_iS_\Phi$ 即 $s_i$ 的相位判定形式。
+\textbf{相位/进度量带波浪 $\tilde{(\cdot)}\in[0,1]$}（归一化）。
+\textbf{控制/规划周期记 $\Delta T$}；步态周期 $T_{gait}$、名义支撑/摆动时长 $t_{st}/t_{sw}$、占空比 $\beta$。
+本章涉及的角速度多为偏航分量、且工作在小横滚/俯仰假设下，故沿用与 \cref{ch:quad_mpc} 同款的“世界系空间角速度 + 小角近似”表述；需切到本书右扰动主线（\cref{ch:lie}）时按 \cref{ch:quad_mpc} 的换算注执行。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么步态先行：接触序列是 MPC 已知的未来}
+\label{sec:qg-motivation}
+
+\paragraph{在控制栈里给本章定位。}
+四足控制系统要回答“在哪儿、去哪儿、怎么去”，分别对应\emph{状态估计、轨迹规划、控制器}。\cref{ch:quad_mpc} 讲的单刚体凸 MPC 属于“控制器”，它在每个周期解一个\emph{凸 QP}，求未来一段时域的最优足端力。但那个 QP 之所以是\emph{凸}的，有一个常被忽略的前提：\textbf{未来每个时刻“哪几条腿着地”是\emph{已知}的}——它进入 MPC 的接触约束（摆动腿零力 ${}^{\mathcal{O}}\boldsymbol{f}_i=\mathbf{0}$）与输入矩阵 $\mathbf{B}_k$ 的落足点装配（\cref{ch:quad_mpc}）。本章正是回答“这个已知的未来从哪来”的模块：\textbf{步态调度器 + 轨迹规划器}。它产出三样东西，恰好填进 MPC 的三个入口：
+\begin{enumerate}
+  \item \textbf{接触序列} $\{s_i(k)\}$（谁在第 $k$ 步着地）$\to$ MPC 的接触约束与 $\mathbf{B}_k$（\cref{sec:qg-scheduler}）；
+  \item \textbf{期望状态轨迹} $\mathbf{D}=[{}_d\boldsymbol{x}^1,\dots,{}_d\boldsymbol{x}^h]$（含姿态、位置、速度、角速度与重力常量）$\to$ MPC 的跟踪目标（\cref{sec:qg-com,sec:qg-slope}）；
+  \item \textbf{名义落足点} ${}_i^{\mathcal{O}}\boldsymbol{p}_{sw\text{-}end}$ 与摆动足底轨迹 $\to$ MPC 的 $\boldsymbol{r}_i$ 装配（\cref{ch:quad_mpc}）与下游逆运动学（\cref{sec:qg-footstep,sec:qg-swing}）。
+\end{enumerate}
+
+\begin{insight}[全章主旨：步态相位是 MPC 已知的未来]\label{ins:qg-known-future}
+MPC（\cref{ch:quad_mpc}）的预测能力建立在“\emph{未来是已知的}”之上——而四足的“未来”里最关键、也最特殊的一块，就是\textbf{接触序列}。它不像质心轨迹那样靠积分速度命令\emph{算}出来，而是由步态调度器\emph{钟表式地}确定：第 $k$ 步谁支撑、谁摆动，在求解 MPC 之前就一清二楚。把它当成\emph{外生已知输入}，是凸 MPC 成立的概念基石：若反过来让 MPC 顺便优化“何时触地”，决策里就混入了\emph{离散}的接触模式选择，问题立刻退化为\emph{混合整数}规划（非凸、不可实时）。因此“步态先行、轨迹规划其次、MPC 最后”这个分工不是工程上的偶然，而是为\emph{保住凸性}所做的根本切分。\textbf{本章把这个“已知的未来”造出来。}
+\end{insight}
+
+\begin{insight}[两层解耦：时序模式 vs 质心运动]\label{ins:qg-decouple}
+有一条教科书少直述的概念前提：\textbf{步态只是一种协调运动的\emph{模式}，而不一定产生\emph{移动}}——就好比人可以原地踏步，也可以正常踏步、高抬腿踏步、行军式踏步\cite{unitree2023quadruped}。这意味着“腿何时支撑/摆动”（\emph{时序模式}）与“机身往哪走、走多快”（\emph{质心运动}）是\textbf{两个解耦的层次}：前者由步态调度器（\cref{sec:qg-scheduler}）管，后者由质心轨迹生成器（\cref{sec:qg-com}）独立地从速度命令生成。原地踏步与前进，用的可以是\emph{同一套}对角步态，差别只在质心速度命令是否为零。理解这一解耦，才知道为什么本章能把“接触序列”单独抽出来当 MPC 的外生输入——它根本不依赖质心去哪。
+\end{insight}
+
+\begin{pitfall}[误区：以为“换步态”就是“换运动方向/速度”]
+新手常把“步态”与“运动”混为一谈，以为要让机器人走快点就得“换个步态”。其实改变\emph{速度/方向}主要靠改\emph{质心速度命令}（\cref{sec:qg-com}）与\emph{落足点}（\cref{sec:qg-footstep}），步态类型（trot/walk/\dots）只决定腿的\emph{协调时序与稳定裕度}。同一对角步态，速度命令置零就是原地踏步、给定前向速度就是前进。\cref{ins:qg-decouple} 的两层解耦正是要破除这一误区。当然，速度\emph{上限}与步态有关（飞行相步态能更快），但“方向/速度”与“时序模式”是两个旋钮。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{反面教材：纯时间切换的冲击与事件切换的代价}
+\label{sec:qg-reverse}
+
+要理解步态调度器为何这样设计，先看两个“做错会怎样”的反面教材。
+
+\paragraph{反面一：纯时间切换在崎岖地面“踩坑/踩石”。}
+支撑相与摆动相的切换有两条路线。\textbf{基于时间的切换}不用任何内外传感器，仅靠系统时钟到点强行切换\cite{yu2021quadruped}。它简单、确定、可预测（正合 \cref{ins:qg-known-future} 所需），但有一个根本短板：\emph{程序内部的切换时刻与物理实际触地/离地时刻有时差}，在崎岖地面尤其致命：
+\begin{itemize}
+  \item \textbf{踩进坑里}：足底\emph{尚未}真实触地，程序却已切到支撑相、开始按支撑腿施力——足底因此带较大\emph{垂直向下加速度}，落地瞬间产生冲击；
+  \item \textbf{踩到石头上}：足底\emph{已经}真实触地，程序却仍判为摆动相、继续往下探——足端被迫紧急减速，机身被顶起。
+\end{itemize}
+
+\begin{pitfall}[反面教材：纯时间切换的时差冲击]\label{pit:qg-time-switch}
+纯时间切换把“何时触地”\emph{写死在时钟里}，于是它\emph{看不见}地形：地面比预期高（石头）就过早受力、比预期低（坑）就过晚受力。其后果是落地冲击或机身被顶，平地上无碍、崎岖地面上放大。这也正是本章后面要做\textbf{地形坡度估计}（\cref{sec:qg-slope}）的动机之一——在\emph{没有足底力传感}的前提下，用支撑足坐标\emph{几何地}估出地面倾斜，把落足点 $z$ 摆到合适高度，从而\emph{缓解}（而非根除）时间切换的时差冲击。
+\end{pitfall}
+
+\paragraph{反面二：事件切换更稳，但工程代价高。}
+\textbf{基于事件的切换}给足底加触碰/压力传感器，真实触地时回传信号再切换。理论上它的稳定性上限更高、是未来方向，但要在真机上可靠落地，有五大工程难题\cite{yu2021quadruped}：
+\begin{enumerate}
+  \item \textbf{增大腿部惯量}：转动惯量 $\propto$ 距离平方，在\emph{足端}（离髋最远、全机最快的部位）加质量会急剧抬高腿的转动惯量——这与 \cref{ch:quad_mpc} 单刚体假设所依赖的“腿轻”背道而驰；
+  \item \textbf{寿命}：足底传感器反复承受落地冲击，还要耐磨、防水、防酸碱；
+  \item \textbf{可靠性}：漏检触碰会让足底一直向下探，直到腿伸到最长——危险；
+  \item \textbf{布线}：信号/供电线要从足底经膝、髋回躯干，需耐反复弯折且不被夹伤；
+  \item \textbf{测量角度}：一维应变片在高速时不适用——触地瞬间小腿与地面夹角极小，地面反力在传感器测量方向上的分量很小、难以测准。
+\end{enumerate}
+正因如此，多数工业级控制系统采用\emph{较保守的、基于时间的}步态调度器\cite{yu2021quadruped}——本章后续公式即建立在时间切换上，并用坡度估计与在线滚动重算来补其短板。
+
+\begin{insight}[确定性 vs 适应性的工程取舍]\label{ins:qg-time-vs-event}
+两种切换方式的对立，本质是\emph{确定性}与\emph{适应性}的取舍。时间切换的相位序列\emph{完全确定}、提前可知，这恰是 MPC 把接触序列当外生已知输入（\cref{ins:qg-known-future}）所需要的“可预测性”；代价是对地形不自适应。事件切换自适应地形，却把“未来何时触地”变得\emph{不可预测}，反而给上层 MPC 的预测带来麻烦（接触序列不再是干净的已知量）。多数工业级实现选择“时间切换 + 估计/反馈补偿”这条路：用确定的相位喂 MPC，再用坡度估计、足底接触估计（\cref{ch:quad_est}）、在线滚动重算去吸收时差。这与 \cref{ch:quad_mpc} 中“为凸性而简化、再用反馈补偿模型误差”是同一种系统级哲学。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{历史与直觉：步态即周期协调模式}
+\label{sec:qg-history}
+
+\paragraph{从直觉到定义。}
+\textbf{步态（gait）} 是在一个周期内各条腿的接触/摆动\emph{时序与相位关系的模式}，即腿部的\emph{协调运动模式}；它是\emph{周期性}的，借此实现机器人整体的运动与平衡\cite{unitree2023quadruped}。\textbf{步态周期}是一个完整循环——从某条腿的支撑开始，到\emph{同一条腿下一次}支撑开始（即某接触事件开始到下一次相同事件发生所经历的时间）；可用时间或相位（$0$ 到 $2\pi$，或归一化到 $[0,1)$）表示。\textbf{步频}是步态周期的倒数。
+
+\begin{insight}[踏步类比：步态≠移动]\label{ins:qg-treadmill}
+一个极朴素的类比可把“步态”讲透：人可以\emph{原地踏步}，也可以正常踏步、高抬腿踏步、行军式踏步——这些都是不同的\emph{腿部协调模式}，但都\emph{不一定}让人移动。所以“步态”刻画的是\emph{腿怎么轮流动}，而不是\emph{身体往哪走}。这条直觉是 \cref{ins:qg-decouple} 两层解耦的源头，也解释了为什么后面能把“占空比—偏移量”这套\emph{纯时序}的描述（\cref{sec:qg-scheduler}）与“速度命令$\to$质心轨迹”（\cref{sec:qg-com}）分开来讲。
+\end{insight}
+
+\paragraph{历史谱系：从 Raibert 到现代。}
+腿式步态规划的现代脉络起于 Raibert 的跳跃机器人工作\cite{raibert1986legged}：他提出用\emph{落足点}（落在“中性点”附近、落点是机身速度的线性函数）即可调速并稳定单腿/双足跳跃——这是“用离散落足点驱动连续质心”的源头，本章 \cref{sec:qg-footstep} 的落足启发式就直接继承自它。随后捕获点理论\cite{pratt2006capture} 给出了“为使机身停下、脚应落在何处”的解析答案（捕获点），它与线性倒立摆 LIPM\cite{kajita2001lipm} 同源，本章落足公式中的速度反馈校正项与向心补偿都来自这一脉。这些简化模型在 \cref{ch:quad_mpc} 已系统对照（LIPM / 质心动力学 / 单刚体），本章只用其\emph{落足与轨迹}产物。
+
+\begin{table}[H]\centering\small
+\caption{腿式步态/落足规划的简化谱系（与 \cref{ch:quad_mpc} 的模型谱系互补）}
+\begin{tabular}{p{0.20\textwidth} p{0.30\textwidth} p{0.40\textwidth}}
+\toprule
+工作 & 贡献 & 在本章的落点 \\
+\midrule
+Raibert (1986)\cite{raibert1986legged} & 落足启发式：落点 = 机身速度线性函数 & \cref{sec:qg-footstep} 三项分解的源头 \\
+LIPM (Kajita, 2001)\cite{kajita2001lipm} & 质点 + 无质量腿、恒质心高、解析步态 & 速度反馈系数 $\sqrt{z_0/\|g\|}$、向心补偿 \\
+捕获点 (Pratt, 2006)\cite{pratt2006capture} & “为停下脚该落哪”的解析点 & 速度修正项 $\Delta\boldsymbol{p}_3$ 的理论来源 \\
+本章工程实现\cite{yu2021quadruped} & 对称点 + 四项叠加 + 坡度闭环 + 摆动样条 & \cref{sec:qg-footstep,sec:qg-swing} 主体 \\
+\bottomrule
+\end{tabular}
+\label{tab:qg-history}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{步态调度器：从时钟到四腿相位}
+\label{sec:qg-scheduler}
+
+步态调度器是本章的“齿轮箱”：输入单一系统时钟 $t$，输出每条腿“此刻支撑还是摆动、进行到几成”。本节先给描述法，再逐式推出相位变量与判定。
+
+\subsection{占空比、偏移量与“占空比—偏移量”描述法}
+\label{subsec:qg-duty}
+
+\begin{definition}[占空比与偏移量]\label{def:qg-duty-offset}
+对一个步态周期 $T_{gait}$，定义两个四维向量（每分量对应一条腿）：
+\begin{itemize}
+  \item \textbf{占空比} $\mathbf{G}_d$：每条腿支撑相时长占周期总时长的比例，$\beta_i=t_{st,i}/T_{gait}$；
+  \item \textbf{偏移量} $\mathbf{G}_o$：每条腿\emph{支撑相开始时刻}占周期的比例（即该腿相对周期起点的初相位）。
+\end{itemize}
+\end{definition}
+
+占空比 $\beta$ 的大小天然给出步态的稳定—速度分类\cite{unitree2023quadruped}：
+\begin{itemize}
+  \item $\beta>0.5$：\textbf{静态步态}（多腿同时支撑、稳定，适合粗糙地形，如 walk）；
+  \item $\beta\approx0.5$：\textbf{动态步态}（速度高，需平衡控制，如 trot）；
+  \item $\beta<0.5$：\textbf{跳跃/飞行步态}（存在所有腿离地的飞行相，如 pronk/bound 的某些参数）。
+\end{itemize}
+
+把占空比与偏移量堆成一个向量，就是\textbf{“占空比—偏移量”描述法}。以对角步态 trot 为例（腿序 LF–RF–LH–RH）\cite{yu2021quadruped}：
+\begin{equation}
+  \mathbf{G}(\mathrm{trot})=\begin{bmatrix}\mathbf{G}_d\\ \mathbf{G}_o\end{bmatrix}
+  =\begin{bmatrix}
+  [\,0.5,\ 0.5,\ 0.5,\ 0.5\,]^\top\\[2pt]
+  [\,0.5,\ 0,\ 0,\ 0.5\,]^\top
+  \end{bmatrix}.
+  \label{eq:qg-trot}
+\end{equation}
+解读：trot 四腿占空比均 $0.5$；偏移量表示右前(RF)、左后(LH) 在周期起点（$0$）先进入支撑相，而左前(LF)、右后(RH) 在半个周期（$0.5$）后才进入支撑相——即对角两腿同步、两组对角错开半周期，这正是“对角小跑”。
+
+\cref{eq:qg-trot} 中 $\mathbf{G}_d,\mathbf{G}_o$ 是\emph{两个独立的四维列向量}上下堆叠，而非一个 $2\times4$ 矩阵。
+
+\begin{insight}[相位 = 钟表指针]\label{ins:qg-clock}
+这套描述法的精髓可比作钟表：因为步态是\emph{周期循环}的，可以用“钟表指针”的\textbf{相位}来精确描述支撑/摆动时机，便于生成轨迹和多腿同步\cite{unitree2023quadruped}。对应关系是——\textbf{相位}（归一化时间 $\tilde t$）就是指针角度；\textbf{占空比} $\mathbf{G}_d(i)$ 是表盘上“支撑扇区”的弧长；\textbf{偏移量} $\mathbf{G}_o(i)$ 是各腿指针的\emph{初相位差}。四条腿就是四根错开了固定相位差、以同一角速度旋转的指针，指针扫过“支撑扇区”时该腿支撑、扫过其余弧段时摆动。这个图像把下面的相位公式（\cref{eq:qg-leg-phase,eq:qg-stance-bool}）变得一目了然。
+\end{insight}
+
+\paragraph{频率与类型解耦。}
+步态频率通过改变周期长度 $T_{gait}$ 实现；而步态\emph{类型}由“占空比—偏移量”定义。因此\textbf{即使步频变化，步态类型不变}\cite{yu2021quadruped}——这是 \cref{ins:qg-decouple} 两层解耦的又一体现：时序\emph{模式}（类型）与时序\emph{快慢}（频率）也彼此独立。
+
+\begin{table}[H]\centering\small
+\caption{常用四足步态的占空比与偏移量（腿序 LF–RF–LH–RH）}
+\begin{tabular}{lllll}
+\toprule
+中文 & 英文 & 占空比 $\mathbf{G}_d$ & 偏移量 $\mathbf{G}_o$ & 特征 \\
+\midrule
+站立 & stance & $[1,1,1,1]^\top$ & $[0,0,0,0]^\top$ & 四腿恒支撑 \\
+爬行步态 & walk & $[0.75,0.75,0.75,0.75]^\top$ & $[0.25,0.75,0.5,0]^\top$ & 静态、稳 \\
+对角步态 & trot & $[0.5,0.5,0.5,0.5]^\top$ & $[0.5,0,0,0.5]^\top$ & 动态、常用 \\
+踱步步态 & pace & $[0.5,0.5,0.5,0.5]^\top$ & $[0,0.5,0,0.5]^\top$ & 同侧两腿同步 \\
+奔跑步态 & bound & $[0.5,0.5,0.5,0.5]^\top$ & $[0,0,0.5,0.5]^\top$ & 前后两腿同步 \\
+跳跃步态 & pronk & $[0.5,0.5,0.5,0.5]^\top$ & $[0,0,0,0]^\top$ & 四腿同步、有飞行相 \\
+\bottomrule
+\end{tabular}
+\label{tab:qg-gaits}
+\end{table}
+表首的 stance（静止站立、四腿恒支撑）便于与“原地踏步”（trot $+$ 零速命令）对照。
+
+\begin{example}[trot 的两种变体：占空比一动，飞行相/四足支撑相随之出现]\label{exam:qg-trot-variants}
+占空比 $\beta$（宇树记触地系数 $r$）对 $0.5$ 的偏离会\emph{定量地}改变同时支撑/同时腾空的时长，宇树据此把对角步态细分为两种变体\cite{unitree2023quadruped}。设步态周期 $P$，对角两组腿恒错开半周期。
+\textbf{步行对角步态（walking trot，$r>0.5$）.} 触地超过半周期，于是一个周期内出现\emph{两段}四足同时触地，各时长 $c$。沿一条腿的时间轴清点：本腿触地 $rP$，其后接对角腿\emph{独立}触地 $(1-r)P$，再接下一段四足同支撑 $c$，而本腿触地段两端各贡献一个 $c$，故
+\begin{equation}
+  rP=c+(1-r)P+c\ \Longrightarrow\ c=rP-\tfrac{P}{2}.
+  \label{eq:qg-trot-overlap}
+\end{equation}
+$r>0.5$ 时 $c>0$，确有四足同支撑段（更稳、更慢）。对角腿偏移时间则为
+\begin{equation}
+  b=c+(1-r)P=\Big(rP-\tfrac{P}{2}\Big)+(1-r)P=\tfrac{P}{2},
+  \label{eq:qg-trot-offset}
+\end{equation}
+即\emph{无论 $r$ 取何值，对角两组腿的偏移恒为半周期} $P/2$（对应 \cref{tab:qg-gaits} 中 trot 偏移量的 $0.5$）。
+\textbf{奔跑对角步态（running trot，$r<0.5$）.} 同理 $c=rP-P/2<0$，物理上对应出现\emph{四足同时腾空}的飞行相（时长 $|c|=P/2-rP$），更快但需平衡控制；偏移 $b$ 仍为 $P/2$。
+\textbf{结论}：trot 的“类型”（对角错开 $P/2$）由偏移量锁定、\emph{与 $r$ 无关}；而 $r$ 单独调节稳定—速度档位（$r>0.5$ 多支撑、$r=0.5$ 临界、$r<0.5$ 带飞行相）——这正是 \cref{def:qg-duty-offset} 后“$\beta$ 三分类”的定量出处，也再证 \cref{ins:qg-decouple} 的类型/快慢解耦。
+\end{example}
+
+\subsection{相位变量、支撑布尔与相位进度}
+\label{subsec:qg-phase}
+
+现在把单一系统时钟 $t$ 翻译成四条腿各自的相位。设 $t$ 从开始踏步起计时，名义摆动相时长 $t_{sw}$、名义支撑相时长 $t_{st}$，则步态周期为
+\begin{equation}
+  T_{gait}=t_{sw}+t_{st}.
+  \label{eq:qg-period}
+\end{equation}
+设 $n$ 为满足 $t>(n-1)T_{gait}$ 的最大正整数（当前处在第 $n$ 个迈步周期）。当前周期内的时间进度与归一化的\textbf{全局相位进度}为\cite{yu2021quadruped}：
+\begin{equation}
+  t_{ng}=t-(n-1)T_{gait},\qquad
+  \tilde t_{ng}=\frac{t_{ng}}{T_{gait}}\in[0,1).
+  \label{eq:qg-global-phase}
+\end{equation}
+
+\paragraph{每条腿的相位变量（指针平移到自家起点）。}
+第 $i$ 腿的支撑相在全局相位 $\mathbf{G}_o(i)$ 处开始。把全局相位\emph{平移}到该腿自己的支撑起点，得其\textbf{本地相位变量}\cite{yu2021quadruped}：
+\begin{equation}
+  {}_i\tilde t_\Phi=
+  \begin{cases}
+  \tilde t_{ng}-\mathbf{G}_o(i), & \tilde t_{ng}\ge\mathbf{G}_o(i),\\[2pt]
+  \tilde t_{ng}-\mathbf{G}_o(i)+1, & \tilde t_{ng}<\mathbf{G}_o(i).
+  \end{cases}
+  \label{eq:qg-leg-phase}
+\end{equation}
+来由：减去偏移量 $\mathbf{G}_o(i)$ 即把“周期起点”挪到“本腿支撑起点”；当 $\tilde t_{ng}$ 还没走到 $\mathbf{G}_o(i)$ 时差值为负，加 $1$ 把它绕回 $[0,1)$——这正是钟表指针“模 1”运算（\cref{ins:qg-clock}）。
+
+\paragraph{支撑布尔（指针是否在支撑扇区内）。}
+本地相位落在占空比弧长内即支撑，否则摆动\cite{yu2021quadruped}：
+\begin{equation}
+  {}_iS_\Phi=
+  \begin{cases}
+  1\ (\text{支撑}), & {}_i\tilde t_\Phi\le\mathbf{G}_d(i),\\
+  0\ (\text{摆动}), & {}_i\tilde t_\Phi>\mathbf{G}_d(i).
+  \end{cases}
+  \label{eq:qg-stance-bool}
+\end{equation}
+这个 ${}_iS_\Phi$ 就是喂给 \cref{ch:quad_mpc} 的接触布尔 $s_i$：${}_iS_\Phi=1$ 对应支撑腿（参与施力、其足端进 $\mathbf{B}_k$），${}_iS_\Phi=0$ 对应摆动腿（MPC 中 ${}^{\mathcal{O}}\boldsymbol{f}_i=\mathbf{0}$）。布尔量统一写大写 $S$ 加左下标 $i$（${}_iS_\Phi$），以与正弦量 $s_\phi=\sin\phi$ 区分。
+
+\paragraph{支撑相与摆动相的内部进度。}
+还需各相\emph{段内}的归一化进度，供轨迹生成用。支撑相进度把 $[0,\mathbf{G}_d(i)]$ 拉伸到 $[0,1]$\cite{yu2021quadruped}：
+\begin{equation}
+  \tilde t_{st}=
+  \begin{cases}
+  {}_i\tilde t_\Phi/\mathbf{G}_d(i), & {}_iS_\Phi=1,\\
+  0, & {}_iS_\Phi=0;
+  \end{cases}
+  \label{eq:qg-stance-prog}
+\end{equation}
+摆动相进度把 $(\mathbf{G}_d(i),1]$ 拉伸到 $[0,1]$\cite{yu2021quadruped}：
+\begin{equation}
+  {}_i\tilde t_{sw}=
+  \begin{cases}
+  \dfrac{{}_i\tilde t_\Phi-\mathbf{G}_d(i)}{1-\mathbf{G}_d(i)}, & {}_iS_\Phi=0,\\[8pt]
+  0, & {}_iS_\Phi=1.
+  \end{cases}
+  \label{eq:qg-swing-prog}
+\end{equation}
+约定带波浪 $\tilde{(\cdot)}$ 表归一化进度、取值 $[0,1]$。\emph{摆动相进度} ${}_i\tilde t_{sw}$ 是 \cref{sec:qg-swing} 足底轨迹的归一化时间参数；\emph{支撑相进度} $\tilde t_{st}$ 用于支撑段内的力分配与坡度采样。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=1.0,>=Stealth]
+  % 时序条：周期 [0,1] 映到宽度 8（每 0.5 周期 = 宽 4）。trot 占空比 0.5。
+  % 四腿轨道（行高 0.7，条高 0.5），并显式画出各自的支撑（实心）扇区
+  % LF（行3，偏移0.5）：支撑 [0.5,1] -> x∈[4,8]
+  % RF（行2，偏移0）：  支撑 [0,0.5] -> x∈[0,4]
+  % LH（行1，偏移0）：  支撑 [0,0.5] -> x∈[0,4]
+  % RH（行0，偏移0.5）：支撑 [0.5,1] -> x∈[4,8]
+  \foreach \name/\row in {LF/3, RF/2, LH/1, RH/0}{
+    \node[left] at (-0.15,\row*0.7+0.25) {\scriptsize \name};
+    \draw[gray!40] (0,\row*0.7) rectangle (8,\row*0.7+0.5);
+  }
+  \fill[main!25] (4,3*0.7) rectangle (8,3*0.7+0.5); % LF
+  \fill[main!25] (0,2*0.7) rectangle (4,2*0.7+0.5); % RF
+  \fill[main!25] (0,1*0.7) rectangle (4,1*0.7+0.5); % LH
+  \fill[main!25] (4,0*0.7) rectangle (8,0*0.7+0.5); % RH
+  % time axis
+  \draw[->,thick] (0,-0.3)--(8.3,-0.3) node[right]{\scriptsize $\tilde t_{ng}$};
+  \foreach \x in {0,0.25,0.5,0.75,1.0}\draw (\x*8,-0.22)--(\x*8,-0.38) node[below]{\scriptsize \x};
+  % moving phase pointer at 0.5
+  \draw[red!70!black, very thick, ->] (4,-0.45)--(4,3*0.7+0.6);
+  \node[red!70!black] at (4.9,3*0.7+0.55){\scriptsize 相位指针};
+  \node at (4,3*0.7+0.95){\footnotesize 实心=支撑相，空白=摆动相（trot）};
+\end{tikzpicture}
+\caption{对角步态 trot 的时序条与相位指针（腿序 LF–RF–LH–RH，占空比 $0.5$）：RF、LH 在 $\tilde t_{ng}\in[0,0.5)$ 支撑，LF、RH 在 $[0.5,1)$ 支撑——对角两腿同步、两组错开半周期。红色“相位指针”随时间从左扫到右，扫到某腿的实心“支撑扇区”时该腿支撑。这就是 \cref{ins:qg-clock} 的钟表图像，也是喂给 \cref{ch:quad_mpc} 的接触序列 $\{s_i\}$ 的来源。}
+\label{fig:qg-gait-timing}
+\end{figure}
+
+\begin{example}[读时序：trot 在 $\tilde t_{ng}=0.3$ 时各腿状态]\label{exam:qg-read-timing}
+取 \cref{tab:qg-gaits} 的 trot：$\mathbf{G}_d=[0.5,0.5,0.5,0.5]^\top$、$\mathbf{G}_o=[0.5,0,0,0.5]^\top$（LF–RF–LH–RH）。设全局相位 $\tilde t_{ng}=0.3$。逐腿代入 \cref{eq:qg-leg-phase,eq:qg-stance-bool}：
+\begin{itemize}
+  \item \textbf{LF}（$\mathbf{G}_o=0.5$）：$\tilde t_{ng}=0.3<0.5\Rightarrow {}_1\tilde t_\Phi=0.3-0.5+1=0.8>\mathbf{G}_d=0.5\Rightarrow S=0$（摆动），摆动进度 ${}_1\tilde t_{sw}=(0.8-0.5)/(1-0.5)=0.6$；
+  \item \textbf{RF}（$\mathbf{G}_o=0$）：${}_2\tilde t_\Phi=0.3\le0.5\Rightarrow S=1$（支撑），支撑进度 $\tilde t_{st}=0.3/0.5=0.6$；
+  \item \textbf{LH}（$\mathbf{G}_o=0$）：同 RF，$S=1$（支撑），$\tilde t_{st}=0.6$；
+  \item \textbf{RH}（$\mathbf{G}_o=0.5$）：同 LF，$S=0$（摆动），${}_4\tilde t_{sw}=0.6$。
+\end{itemize}
+故 $\tilde t_{ng}=0.3$ 时接触布尔 $\{s_i\}=\{0,1,1,0\}$：RF+LH 支撑、LF+RH 摆动，恰是对角支撑——与 \cref{fig:qg-gait-timing} 一致。把这个 $\{s_i\}$ 沿预测时域逐步求出，就得到 \cref{ch:quad_mpc} 所需的接触序列。
+\end{example}
+
+\begin{practice}
+\begin{enumerate}
+  \item 画出 pace（踱步）的时序条（用 \cref{tab:qg-gaits} 的偏移量），指出哪两条腿同步摆动，并与 trot（\cref{fig:qg-gait-timing}）对比稳定性。
+  \item 对 walk（$\mathbf{G}_d=0.75$、$\mathbf{G}_o=[0.25,0.75,0.5,0]^\top$），求 $\tilde t_{ng}=0.6$ 时各腿的 ${}_i\tilde t_\Phi$ 与 $s_i$，确认同时支撑的腿数 $\ge3$（静态步态特征）。
+  \item （概念）解释为什么“即使把 $T_{gait}$ 减半（步频加倍），步态类型仍是 trot”——从 \cref{eq:qg-global-phase,eq:qg-leg-phase} 的归一化结构说明。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{基于速度命令的质心轨迹}
+\label{sec:qg-com}
+
+接触序列就绪后，本节生成 MPC 的另一项输入：\emph{期望质心轨迹}。它独立于步态时序（\cref{ins:qg-decouple}），由操作者的速度命令积分而来。
+
+\paragraph{状态维数与上下层分工。}
+完整控制系统 = 上层\emph{运动规划}（本章）+ 下层\emph{运动跟随}（\cref{ch:quad_mpc,ch:quad_wbc}）。单刚体有 $6$ 自由度，每自由度需位置 + 速度共 $12$ 个变量描述某时刻期望状态；再加上重力增广的第 $13$ 维（与 \cref{ch:quad_mpc} 对齐），即 $13$ 维期望状态\cite{yu2021quadruped}。本节逐步求出这些量。
+
+\subsection{速度命令到偏航角的递推}
+\label{subsec:qg-yaw}
+
+操作手柄给出\emph{本体系}下的期望速度（“有头模式”更合人类直觉）\cite{yu2021quadruped}：
+\begin{equation}
+  {}_d^{\mathcal{B}}\boldsymbol{\nu}_{handle}=
+  \begin{bmatrix} {}_d^{\mathcal{B}}\nu_x & {}_d^{\mathcal{B}}\nu_y & 0 & 0 & 0 & {}_d^{\mathcal{B}}\omega_z\end{bmatrix}^\top,
+  \label{eq:qg-handle}
+\end{equation}
+即只给水平两个平动速度与一个偏航角速度（俯仰/横滚速度命令为 $0$，竖直速度为 $0$）。设当前为第 $0$ 控制周期，偏航角与偏航角速度按周期递推\cite{yu2021quadruped}：
+\begin{equation}
+  \begin{cases}
+  {}_d\psi^{k}={}_d\psi^{k-1}+{}_d^{\mathcal{O}}\omega_z^{k-1}\cdot\Delta T,\\
+  {}_d^{\mathcal{O}}\omega_z^{k}={}_d^{\mathcal{B}}\omega_z,\\
+  {}_d\psi^{0}=\psi_0,\\
+  {}_d^{\mathcal{O}}\omega_z^{0}={}_d^{\mathcal{B}}\omega_z.
+  \end{cases}
+  \label{eq:qg-yaw-recur}
+\end{equation}
+因仅考虑水平移动、忽略俯仰/横滚，本体系偏航角速度 $\approx$ 世界系偏航角速度（${}_d^{\mathcal{O}}\omega_z\approx{}_d^{\mathcal{B}}\omega_z$）；$\Delta T$ 为控制周期，$\psi_0$ 为初始偏航\cite{yu2021quadruped}。
+
+\subsection{期望质心速度：本体系到世界系}
+\label{subsec:qg-vel}
+
+本体系期望平动速度（竖直分量为 $0$），经偏航旋转转到世界系\cite{yu2021quadruped}：
+\begin{equation}
+  {}_d^{\mathcal{B}}\boldsymbol{v}_{com}^{k}=
+  \begin{bmatrix} {}_d^{\mathcal{B}}v_x & {}_d^{\mathcal{B}}v_y & 0\end{bmatrix}^\top,
+  \qquad
+  {}_d^{\mathcal{O}}\boldsymbol{v}_{com}^{k}=\mathbf{R}_z\!\big({}_d\psi^{k}\big)\,{}_d^{\mathcal{B}}\boldsymbol{v}_{com}^{k}.
+  \label{eq:qg-vel}
+\end{equation}
+只需绕 $z$ 旋转，因为水平速度命令不含竖直分量、且忽略俯仰/横滚——这是 \cref{eq:qg-yaw-recur} “仅水平移动”假设的直接结果。
+
+\subsection{期望质心位置：堵转保护与递推}
+\label{subsec:qg-pos}
+
+第 $1$ 周期的期望位置不是简单地“当前期望位置 + 速度积分”，而是引入\emph{堵转保护}系数 $\varpi\in[0,1]$\cite{yu2021quadruped}：
+\begin{equation}
+  {}_d^{\mathcal{O}}\boldsymbol{p}_{com}^{1}=
+  \varpi\,{}_d^{\mathcal{O}}\boldsymbol{p}_{com}^{0}
+  +(1-\varpi)\,{}^{\mathcal{O}}\boldsymbol{p}_{com}^{0}
+  +{}_d^{\mathcal{O}}\boldsymbol{v}_{com}^{0}\,\Delta T,
+  \label{eq:qg-pos1}
+\end{equation}
+即把期望位置取为“纯积分理想位置 ${}_d^{\mathcal{O}}\boldsymbol{p}_{com}^{0}$”与“实际位置 ${}^{\mathcal{O}}\boldsymbol{p}_{com}^{0}$”的\emph{凸组合}，再叠加一步速度积分。后续周期纯递推（无堵转项）\cite{yu2021quadruped}：
+\begin{equation}
+  {}_d^{\mathcal{O}}\boldsymbol{p}_{com}^{k}={}_d^{\mathcal{O}}\boldsymbol{p}_{com}^{k-1}+{}_d^{\mathcal{O}}\boldsymbol{v}_{com}^{k-1}\,\Delta T,
+  \label{eq:qg-posk}
+\end{equation}
+竖直方向不积分速度，而是用期望机身高度直接填充\cite{yu2021quadruped}：
+\begin{equation}
+  {}_d^{\mathcal{O}}\boldsymbol{p}_{com}^{k}(3)={}_dh_{body}.
+  \label{eq:qg-posz}
+\end{equation}
+
+\begin{insight}[堵转保护 = 位置规划层的抗积分饱和]\label{ins:qg-antiwindup}
+\cref{eq:qg-pos1} 的设计动机可由一个极端情形看清：设想操作者驱使机器人\emph{撞向一堵墙}。若期望位置只管按速度命令\emph{纯积分}，它会不断向墙里推进、与卡住不动的实际位置越拉越远；MPC 为消除这个无界增长的位置误差，会不断加大推墙的力，直到力饱和、失控\cite{yu2021quadruped}。堵转保护让期望位置\emph{在一定程度上“跟随”实际位置}——靠的是 \cref{eq:qg-pos1} 里权为 $(1-\varpi)$ 的\emph{实际位置}项。把每个控制步都按 \cref{eq:qg-pos1} 对实际位置重锚，撞墙（实际位置 ${}^{\mathcal{O}}\boldsymbol{p}_{com}^{0}$ 卡住不动）时求稳态（令 ${}_d^{\mathcal{O}}\boldsymbol{p}^{k}={}_d^{\mathcal{O}}\boldsymbol{p}^{k-1}$）：期望位置\emph{有界}地停在 ${}^{\mathcal{O}}\boldsymbol{p}_{com}^{0}+\frac{1}{1-\varpi}\,{}_d^{\mathcal{O}}\boldsymbol{v}_{com}^{0}\Delta T$，期望—实际误差被钳在 $\dfrac{\|{}_d^{\mathcal{O}}\boldsymbol{v}_{com}^{0}\|\Delta T}{1-\varpi}$，而非纯积分时的无界增长——这正是 anti-windup。务必当心\emph{方向}：“$\varpi$ 越大、质心抵抗外力改变其位置的能力越强”说的是\emph{自由空间}的位置刚度（$\varpi\!\to\!1$ 时期望几乎纯按速度命令积分、硬抗扰动）；而抗饱和这一面恰好\emph{相反}——$\varpi$ 越\emph{小}，上面的稳态误差界越紧、期望跟随实际越紧、抗饱和越强；$\varpi\!\to\!1$ 则界 $\to\infty$、退化为纯积分、保护消失。二者是\textbf{位置刚度 vs 抗饱和}的权衡。本质是\textbf{抗积分饱和（anti-windup）}思想在\emph{位置规划层}的体现——把“期望—实际”的偏差软性钳住，正如积分器抗饱和钳住积分项。
+\end{insight}
+
+\begin{example}[速度命令递推三步（数值例）]\label{exam:qg-com-recur}
+取 $\Delta T=0.002\,\mathrm{s}$、堵转系数 $\varpi=0.99$（取接近 $1$ 仅作示意；自由空间无堵转时轨迹对 $\varpi$ 不敏感，见 \cref{ins:qg-antiwindup}）、初始 $\psi_0=0$、初始期望与实际位置重合于原点、期望机身高 ${}_dh_{body}=0.30\,\mathrm{m}$；手柄命令 ${}_d^{\mathcal{B}}v_x=0.5\,\mathrm{m/s}$、${}_d^{\mathcal{B}}v_y=0$、${}_d^{\mathcal{B}}\omega_z=0.20\,\mathrm{rad/s}$。
+\begin{itemize}
+  \item \textbf{偏航}（\cref{eq:qg-yaw-recur}）：${}_d\psi^0=0$；${}_d\psi^1=0+0.20\times0.002=4.0\times10^{-4}\,\mathrm{rad}$；${}_d\psi^2=8.0\times10^{-4}$；${}_d\psi^3=1.2\times10^{-3}\,\mathrm{rad}$。
+  \item \textbf{世界系速度}（\cref{eq:qg-vel}）：$\psi$ 极小，$\mathbf{R}_z(\psi)\approx\mathbf{I}$，故 ${}_d^{\mathcal{O}}\boldsymbol{v}_{com}\approx[0.5,\ 0.5\cdot{}_d\psi,\ 0]^\top$；如 $k=3$ 时 $v_y\approx0.5\times1.2\times10^{-3}=6.0\times10^{-4}\,\mathrm{m/s}$（偏航使速度缓缓偏向 $+y$）。
+  \item \textbf{位置}（\cref{eq:qg-pos1,eq:qg-posk}）：第 $1$ 步堵转项中期望与实际重合，凸组合不产生偏移，故 ${}_d^{\mathcal{O}}p_x^1=0.5\times0.002=1.0\times10^{-3}\,\mathrm{m}$；之后纯递推 ${}_d^{\mathcal{O}}p_x^k\approx k\times10^{-3}\,\mathrm{m}$；竖直恒为 $0.30\,\mathrm{m}$。
+\end{itemize}
+可见三个旋钮各司其职：$\omega_z$ 转偏航、偏航旋转速度方向、速度积分出位置，竖直由机身高填充。
+\end{example}
+
+% ════════════════════════════════════════════════════════════════
+\section{地形坡度估计}
+\label{sec:qg-slope}
+
+\paragraph{动机（承反面教材）。}
+\cref{pit:qg-time-switch} 已指出：斜坡上若把摆动腿落足 $z$ 一律规划为 $0$（与平地同高），坡下的腿会像“踩进坑里”、坡上的腿会像“踩到石头上”，严重干扰机身控制\cite{yu2021quadruped}。在没有足底力传感的前提下，规划器须\emph{几何地}估出地面坡度，再据此摆放落足高度。本节就做这件事，并在末尾把结果闭环回落足点 $z$（\cref{eq:qg-foot-z}）。
+
+\subsection{平面方程与支撑足坐标采集}
+\label{subsec:qg-plane}
+
+假设机器人不会在垂直墙面行走，地面可用一张平面拟合（局部）\cite{yu2021quadruped}：
+\begin{equation}
+  z=a+bx+cy=\begin{bmatrix}1 & x & y\end{bmatrix}\mathbf{A}_{pla},
+  \qquad
+  \mathbf{A}_{pla}=\begin{bmatrix}a & b & c\end{bmatrix}^\top.
+  \label{eq:qg-plane}
+\end{equation}
+
+取矩阵形（\cref{eq:qg-plane}）便于后面的最小二乘拟合（\cref{eq:qg-ls}）与落足 $z$ 解算（\cref{eq:qg-foot-z}）直接调用。
+
+四条腿交替支撑/摆动。记 ${}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}$ 为第 $i$ 腿\emph{最后一次成为支撑腿时的足底坐标}：该腿正支撑时取其当前足底坐标，正摆动时则冻结为它最近一次“支撑$\to$摆动”瞬间的足底坐标。按接触布尔递推\cite{yu2021quadruped}：
+\begin{equation}
+  \begin{cases}
+  {}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}^{0}={}_i^{\mathcal{O}}\boldsymbol{p}^{\,t=0},\\
+  {}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}^{k}={}_i^{\mathcal{O}}\boldsymbol{p}, & {}_iS_\Phi=1\ (\text{支撑，取当前足底}),\\
+  {}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}^{k}={}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}^{k-1}, & {}_iS_\Phi=0\ (\text{摆动，冻结}).
+  \end{cases}
+  \label{eq:qg-stend}
+\end{equation}
+这样任一时刻都有四个“最近支撑落点”，足以拟合一张平面。
+
+\subsection{最小二乘平面拟合}
+\label{subsec:qg-ls}
+
+把四腿最近支撑落点的 $z$ 坐标与水平坐标分别堆成观测向量与设计矩阵\cite{yu2021quadruped}：
+\begin{equation}
+  {}^{\mathcal{O}}\boldsymbol{z}_f=
+  \begin{bmatrix}
+  {}_1^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(3) \\ {}_2^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(3) \\ {}_3^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(3) \\ {}_4^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(3)
+  \end{bmatrix},
+  \qquad
+  \mathbf{W}_{pla}=
+  \begin{bmatrix}
+  1 & {}_1^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(1) & {}_1^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(2) \\
+  1 & {}_2^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(1) & {}_2^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(2) \\
+  1 & {}_3^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(1) & {}_3^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(2) \\
+  1 & {}_4^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(1) & {}_4^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(2)
+  \end{bmatrix},
+  \label{eq:qg-zW}
+\end{equation}
+其中 $(1),(2),(3)$ 表向量的 $x,y,z$ 分量。把四个落点代入 \cref{eq:qg-plane} 得超定方程组 $\mathbf{W}_{pla}\mathbf{A}_{pla}={}^{\mathcal{O}}\boldsymbol{z}_f$（$4$ 方程、$3$ 未知）。
+
+\begin{theorem}[平面参数的最小二乘解]\label{thm:qg-ls}
+超定线性系统 $\mathbf{W}_{pla}\mathbf{A}_{pla}={}^{\mathcal{O}}\boldsymbol{z}_f$（$\mathbf{W}_{pla}\in\mathbb{R}^{4\times3}$ 列满秩）的最小二乘解为
+\begin{equation}
+  \mathbf{A}_{pla}=\big(\mathbf{W}_{pla}^\top\mathbf{W}_{pla}\big)^{-1}\mathbf{W}_{pla}^\top\,{}^{\mathcal{O}}\boldsymbol{z}_f=\mathbf{W}_{pla}^{+}\,{}^{\mathcal{O}}\boldsymbol{z}_f,
+  \label{eq:qg-ls}
+\end{equation}
+其中 $\mathbf{W}_{pla}^{+}=(\mathbf{W}_{pla}^\top\mathbf{W}_{pla})^{-1}\mathbf{W}_{pla}^\top$ 为左伪逆\cite{yu2021quadruped}。
+\end{theorem}
+
+\begin{derivation}[正规方程来由（\cref{thm:qg-ls}）]\label{deriv:qg-ls}
+四个落点一般\emph{不严格共面}（地形起伏 + 触地噪声），故 $\mathbf{W}_{pla}\mathbf{A}_{pla}={}^{\mathcal{O}}\boldsymbol{z}_f$ 通常无精确解。退而求\emph{残差平方和}最小：
+\[
+  J(\mathbf{A}_{pla})=\big\|\mathbf{W}_{pla}\mathbf{A}_{pla}-{}^{\mathcal{O}}\boldsymbol{z}_f\big\|_2^2
+  =(\mathbf{W}_{pla}\mathbf{A}_{pla}-{}^{\mathcal{O}}\boldsymbol{z}_f)^\top(\mathbf{W}_{pla}\mathbf{A}_{pla}-{}^{\mathcal{O}}\boldsymbol{z}_f).
+\]
+对 $\mathbf{A}_{pla}$ 求梯度并令其为零（\cref{ch:matderiv} 的二次型求导）：
+\[
+  \frac{\partial J}{\partial\mathbf{A}_{pla}}=2\mathbf{W}_{pla}^\top(\mathbf{W}_{pla}\mathbf{A}_{pla}-{}^{\mathcal{O}}\boldsymbol{z}_f)=\mathbf{0}
+  \;\Longrightarrow\;
+  \mathbf{W}_{pla}^\top\mathbf{W}_{pla}\,\mathbf{A}_{pla}=\mathbf{W}_{pla}^\top\,{}^{\mathcal{O}}\boldsymbol{z}_f,
+\]
+此即\emph{正规方程}。因 $\mathbf{W}_{pla}$ 列满秩（四足落点水平坐标不退化为一条线），$\mathbf{W}_{pla}^\top\mathbf{W}_{pla}\in\mathbb{R}^{3\times3}$ 可逆，左乘其逆即得 \cref{eq:qg-ls}。
+\end{derivation}
+
+单步拟合对触地噪声敏感，故再加一阶低通滤波平滑\cite{yu2021quadruped}：
+\begin{equation}
+  \hat{\mathbf{A}}_{pla}^{k}=\begin{bmatrix}\hat a & \hat b & \hat c\end{bmatrix}^\top
+  =\eta\,\mathbf{A}_{pla}+(1-\eta)\,\hat{\mathbf{A}}_{pla}^{k-1},
+  \qquad \eta=0.2,
+  \label{eq:qg-lpf}
+\end{equation}
+$\eta$ 越小越平滑、越滞后。低通滤波抑制单帧触地坐标噪声对坡度估计的扰动，使坡度随机器人在地形上移动而平滑变化。
+
+\subsection{法向量反解期望俯仰/横滚}
+\label{subsec:qg-normal}
+
+拟合出的平面 $z=\hat a+\hat b x+\hat c y$ 即写成隐式曲面 $F(x,y,z)=\hat b\,x+\hat c\,y-z+\hat a=0$。隐式曲面的法向量就是其梯度 $\nabla F=\big[\partial_x F,\ \partial_y F,\ \partial_z F\big]^\top$：逐分量求偏导，$\partial_x F=\hat b$、$\partial_y F=\hat c$、$\partial_z F=-1$，得 $\nabla F=[\hat b,\ \hat c,\ -1]^\top$。该向量第三分量为负（指向地面下方），取其相反向量使 $z$ 分量为正、即得\emph{朝上}的法向量，再单位化\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{n}=-\nabla F=\begin{bmatrix}-\hat b & -\hat c & 1\end{bmatrix}^\top,
+  \qquad
+  \boldsymbol{n}_e=\frac{\boldsymbol{n}}{\|\boldsymbol{n}\|}.
+  \label{eq:qg-normal}
+\end{equation}
+几何上 $\boldsymbol n_e$ 是坡面的单位朝上法向：平地（$\hat b=\hat c=0$）时退化为 $[0,0,1]^\top$（竖直向上），沿 $x$ 上坡（$\hat b>0$）时法向向 $-x$ 方向倾斜，正与坡面垂直。
+我们希望机身\emph{贴合坡面}：让期望机身坐标系的 $z$ 轴对齐坡面法向，即 $\boldsymbol{n}_e$ 为期望旋转矩阵 ${}_d^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}$ 的\emph{第三列}。按 ZYX 欧拉角展开该列\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{n}_e=
+  \begin{bmatrix}
+  s_\phi s_\psi+c_\phi c_\psi s_\theta \\
+  c_\phi s_\theta s_\psi-c_\psi s_\phi \\
+  c_\phi c_\theta
+  \end{bmatrix}
+  =\underbrace{\begin{bmatrix} c_\psi & s_\psi & 0 \\ s_\psi & -c_\psi & 0 \\ 0 & 0 & 1\end{bmatrix}}_{\mathbf{Y}}
+  \underbrace{\begin{bmatrix} c_\phi s_\theta \\ s_\phi \\ c_\phi c_\theta\end{bmatrix}}_{\boldsymbol{\xi}}
+  =\mathbf{Y}\boldsymbol{\xi},
+  \label{eq:qg-ne-decomp}
+\end{equation}
+其中 $c_\phi=\cos\phi$、$s_\phi=\sin\phi$ 等。偏航 $\psi$ 已由 \cref{eq:qg-yaw-recur} 给出 $\Rightarrow$ $\mathbf{Y}$ 已知，于是解出辅助向量\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{\xi}=\mathbf{Y}^{+}\boldsymbol{n}_e.
+  \label{eq:qg-xi}
+\end{equation}
+再由 $\boldsymbol{\xi}=[c_\phi s_\theta,\ s_\phi,\ c_\phi c_\theta]^\top$ 反解期望横滚/俯仰\cite{yu2021quadruped}：
+\begin{equation}
+  \begin{cases}
+  {}_d\phi^{1}=\arcsin\big(\xi(2)\big),\\
+  {}_d\theta^{1}=\arctan\big(\xi(1)/\xi(3)\big).
+  \end{cases}
+  \label{eq:qg-pitch-roll}
+\end{equation}
+来由：$\xi(2)=s_\phi\Rightarrow\phi=\arcsin\xi(2)$；$\xi(1)/\xi(3)=(c_\phi s_\theta)/(c_\phi c_\theta)=\tan\theta\Rightarrow\theta=\arctan(\xi(1)/\xi(3))$。期望横滚/俯仰\emph{不随预测步变化}（坡度在一段时域内近似恒定），故记上标 $1$。
+
+\begin{note}[$\mathbf{Y}$ 不是旋转矩阵]\label{note:qg-ocr-Y}
+\cref{eq:qg-ne-decomp} 的 $\mathbf{Y}$ 第二行为 $[s_\psi,\ -c_\psi,\ 0]$，故 $\det\mathbf{Y}=-1$：它\emph{不是}旋转矩阵，而是把 $\boldsymbol{n}_e$ 的三个三角分量按偏航重排的\emph{系数矩阵}。$\mathbf{Y}$ 只依赖已知的偏航 $\psi$，作用是把含 $\phi,\theta$ 的未知量 $\boldsymbol{\xi}$ 线性分离出来，再由 \cref{eq:qg-xi} 的伪逆求解，结果与 \cref{eq:qg-pitch-roll} 自洽。
+\end{note}
+
+\subsection{期望状态向量堆叠：交给 MPC}
+\label{subsec:qg-stack}
+
+至此第 $k$ 周期的期望姿态 ${}_d\boldsymbol{\Theta}^{k}=[{}_d\phi^{1},\ {}_d\theta^{1},\ {}_d\psi^{k}]^\top$（横滚/俯仰来自坡度、偏航来自速度命令递推）、期望位置 ${}_d\boldsymbol{p}_{com}^{k}$、期望速度 ${}_d\boldsymbol{v}_{com}^{k}$、期望角速度 ${}_d\boldsymbol{\omega}^{k}=[0,0,{}_d^{\mathcal{O}}\omega_z^{k}]^\top$ 全部就绪。叠加重力增广分量，得第 $k$ 周期的 $13$ 维期望状态\cite{yu2021quadruped}：
+\begin{equation}
+  {}_d\boldsymbol{x}^{k}=
+  \begin{bmatrix}
+  {}_d\boldsymbol{\Theta}^{k} \\ {}_d\boldsymbol{p}_{com}^{k} \\ {}_d\boldsymbol{\omega}^{k} \\ {}_d\boldsymbol{v}_{com}^{k} \\ {}^{\mathcal{O}}g(3)
+  \end{bmatrix},
+  \qquad {}^{\mathcal{O}}g(3)=-9.8\,\mathrm{m/s^2}.
+  \label{eq:qg-xdes}
+\end{equation}
+把未来 $h$ 个周期堆成期望轨迹（大小 $13h\times1$）\cite{yu2021quadruped}：
+\begin{equation}
+  \mathbf{D}=\begin{bmatrix}({}_d\boldsymbol{x}^{1})^\top & ({}_d\boldsymbol{x}^{2})^\top & \cdots & ({}_d\boldsymbol{x}^{h})^\top\end{bmatrix}^\top.
+  \label{eq:qg-D}
+\end{equation}
+
+\begin{insight}[全章主线收口：$\mathbf{D}$ 即 MPC 的跟踪目标]\label{ins:qg-handoff}
+\cref{eq:qg-xdes,eq:qg-D} 正是 \cref{ch:quad_mpc} 凸 MPC 的\emph{期望轨迹输入} $\mathbf{D}$：MPC 把堆叠状态 $\mathbf{X}$ 往 $\mathbf{D}$ 上拉，求最优足端力。特别地，第 $13$ 维重力常量 ${}^{\mathcal{O}}g(3)=-9.8$ 与 MPC 的\emph{重力增广状态}严丝合缝——本章生成的期望轨迹连重力增广维都备好了，可直接喂入。这一段把本章 \cref{ins:qg-known-future} 的主旨落到实处：步态调度器给\emph{接触序列}、质心+坡度给\emph{期望轨迹 $\mathbf{D}$}、落足规划给\emph{$\mathbf{B}_k$ 的落足点}——三样齐备，MPC 才有“已知的未来”可预测。本章的“供料”使命到此收口。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:qg-ne-decomp} 出发，对一个纯俯仰坡（$\phi=0$、$\psi=0$）验证 \cref{eq:qg-pitch-roll} 给出 ${}_d\theta=\arctan(s_\theta/c_\theta)=\theta$、${}_d\phi=0$。
+  \item 设四腿最近支撑落点为 $(0,0,0)$、$(0.3,0,0.03)$、$(0,0.2,0)$、$(0.3,0.2,0.03)$（沿 $x$ 上坡），手算 \cref{eq:qg-ls} 估出 $\hat b$ 的符号与量级，并据 \cref{eq:qg-normal,eq:qg-pitch-roll} 判断期望俯仰是抬头还是低头。
+  \item （概念）解释 \cref{eq:qg-lpf} 的低通系数 $\eta=0.2$ 为何要取较小值——把它和“单帧触地坐标噪声”联系起来。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{落足点规划}
+\label{sec:qg-footstep}
+
+落足点是连续质心与离散接触之间的“方向盘”。本节先讲 Raibert 启发式的物理直觉（三项分解），再给工程版的对称点 $+$ 四项叠加，最后点出 Raibert 纯旋转的核心缺陷。
+
+\subsection{动机与根本目标}
+\label{subsec:qg-foot-motivation}
+
+\begin{insight}[落足点的人类跑步类比]\label{ins:qg-running}
+人跑步把落足点的作用讲得很活：想象人跑步时\emph{脚并不是随意落下的}——为向前加速，脚自然落在重心\emph{前方}；为刹车，落在重心\emph{后方}；为转弯，落点偏向\emph{内侧}\cite{unitree2023quadruped}。这个过程下意识，却遵循精确的物理规律。由此引出落足点规划的\textbf{根本目标}：\emph{通过主动选择落足点位置，产生期望的地面反作用力，从而控制机身运动并维持动态平衡}。换言之，落足点是\emph{间接}的力执行器——不能直接“推”机身，但能通过“把脚落在哪”决定下一支撑相能产生怎样的反力。这与 \cref{ch:quad_mpc} “足端力是决策变量”互为表里：MPC 在给定落足点下优化力，规划器则决定落足点本身。
+\end{insight}
+
+\subsection{Raibert 启发式：三项分解}
+\label{subsec:qg-raibert}
+
+最经典的落足方法是 Raibert 启发式\cite{raibert1986legged}：假设在平面行走、落足点总在地面，先在机身系算出落点再转世界系。其预知参数有：控制指令速度 $\mathbf{v}_d$、角速度 $\boldsymbol{\omega}_d$；当前测量速度 $\mathbf{v}_{mes}$；步态参数 $T_{period}$、$t_{st}$、$t_{sw}$。落点由\emph{中性点 + 速度补偿 + 旋转补偿}三项叠加。
+
+\paragraph{（一）中性落足点。}
+${}^{\mathcal{B}}\mathbf{p}_{f,neutral}$：静止站立时每条腿的默认落点，通常在对应髋关节\emph{正下方}的地面，机身系描述。它是其余两项补偿的基准。
+
+\begin{insight}[中性点为何在髋正下方：倒立摆重力线过支点]\label{ins:qg-neutral-why}
+“中性点在髋正下方”不是约定，而有\emph{力学必然}\cite{unitree2023quadruped}。把单腿支撑抽象为\textbf{倒立摆}：质量集中的机身（圆球）经一根可伸缩、无质量、与地面无滑移的杆接触于地面 $O$ 点（伸缩仅用于保持摆高恒定，对应行走名义高度 $z_0$）。当摆\emph{竖直站立}时，重力 $\boldsymbol{G}$ 的作用线\emph{恰好穿过支点 $O$}，对 $O$ 的力矩为零、摆保持平衡——这个使重力线过支点的落点就是\textbf{中性点}。一旦落点偏到中性点\emph{左侧}（记 $O_1$），重力对 $O_1$ 产生\emph{顺时针}力矩，把球往\emph{右}推（产生 $+x$ 加速度）；落到\emph{右侧}（$O_2$）则把球往\emph{左}推。可见\emph{落点相对中性点的偏移}决定机身加速度的\emph{方向与大小}——这正是 \cref{ins:qg-running} “落点是间接力执行器”的力学内核。对四足，机身重心约在躯干形心，故各腿中性点取在\emph{大腿关节（髋）正下方附近}：如此对角两腿中性点连线的中点恰为重心地面投影，静态平衡。后面三项补偿，本质都是\emph{相对这个零力矩中性点做有目的的偏移}。
+\end{insight}
+
+\paragraph{（二）速度补偿项。}
+机身在未来支撑相内会持续移动，落点应\emph{提前}到未来支撑段的中心\cite{unitree2023quadruped,pratt2006capture}：
+\begin{equation}
+  \Delta\mathbf{p}_{vel}=
+  \underbrace{\frac{t_{st}}{2}\,{}^{\mathcal{B}}\mathbf{v}_{curr}}_{\text{前馈项}}
+  +\underbrace{\sqrt{\frac{z_0}{\|\boldsymbol{g}\|}}\,\big({}^{\mathcal{B}}\mathbf{v}_{curr}-{}^{\mathcal{B}}\mathbf{v}_{des}\big)}_{\text{反馈校正项（捕获点）}}.
+  \label{eq:qg-raibert-vel}
+\end{equation}
+
+\begin{derivation}[速度补偿的几何来由：让落点对称于中性点（\texorpdfstring{$\Delta\mathbf{p}_{vel}$}{Δp\_vel} 前馈项）]\label{deriv:qg-raibert-firstprinciple}
+前馈项 $\tfrac{t_{st}}{2}{}^{\mathcal{B}}\mathbf{v}_{curr}$ 可由“匀速平移、落点关于中性点对称”这一几何条件\emph{第一性地}导出\cite{unitree2023quadruped}，无需诉诸经验。取一条腿，沿时间标记四个姿态：①腿刚离地、②腿触地、③髋运动到触地足端正上方（此刻足端正处于\emph{中性点}）、④腿又离地。匀速时④与①姿态全同。
+\textbf{第一步（对称条件定半步长）.} 要机身匀速（不被落点偏置加速/减速），须令触地瞬间②与离地瞬间④\emph{关于中性点③对称}（\cref{ins:qg-neutral-why}：对称即左右力矩相消、净加速度为零）。②到④恰是一个支撑相 $T_{stance}=rP=t_{st}$，故②、④各距③半个支撑相。机身以 $v_x$ 匀速，半个支撑相走过的距离即落点应超前中性点的量
+\begin{equation}
+  \Delta x=\tfrac12 v_x\,T_{stance}
+  \label{eq:qg-raibert-halfstep}
+\end{equation}
+（落点设在③的中性点沿速度方向偏 $\Delta x$ 处）——这正是\cref{ins:qg-half-stance} “半支撑相中点”的代数兑现，也是前馈项系数 $t_{st}/2$ 的出处。
+\textbf{第二步（用相位消匀速假设的累积误差）.} 实际 $v_x$ 非恒定，若用离地点一次性外推 $x_f=x_b+v_xT_{swing}+\Delta x$ 会累积误差。引入摆动相\emph{相位} $p=(t-t_0)/(t_1-t_0)\in[0,1]$（归一化时间，与本章 ${}_i\tilde t_{sw}$ 同义，\cref{eq:qg-swing-prog}）：在相位 $p$ 处实时读取当前髋坐标 $x_p(p)$ 与速度 $v_x$，距触地（②，$p=1$）尚余 $(1-p)T_{swing}$，于是
+\begin{equation}
+  x_f=x_p(p)+v_x\,(1-p)\,T_{swing}+\tfrac12 v_x\,T_{stance}.
+  \label{eq:qg-raibert-phase}
+\end{equation}
+$p\to1$ 时外推项 $\to0$、$x_f\to x_p(1)+\Delta x$，误差自动消失——与本章工程版 \cref{ins:qg-touch-vanish} “近似误差随相位逼近 $1$ 而消失”是同一机制（此处 $x_p(p)$ 在线重读、那里匀速外推机身位姿）。
+\textbf{第三步（叠速度反馈）.} 落点偏离中性点会产生反向加速度（\cref{ins:qg-neutral-why}），故可用它修速度误差：$v_x$ 高于目标 $v_{xd}$ 时落点右移（刹车）、低时左移。叠加比例项 $k_x(v_x-v_{xd})$（$k_x>0$），并推广到 $y$：
+\begin{equation}
+  \begin{cases}
+  x_f=x_p(p)+v_x(1-p)T_{swing}+\tfrac12 v_x T_{stance}+k_x(v_x-v_{xd}),\\
+  y_f=y_p(p)+v_y(1-p)T_{swing}+\tfrac12 v_y T_{stance}+k_y(v_y-v_{yd}).
+  \end{cases}
+  \label{eq:qg-raibert-full}
+\end{equation}
+\cref{eq:qg-raibert-full} 即宇树版 Raibert 落点（与 \cref{eq:qg-raibert-vel} 同物：前馈半步长 $+$ 速度反馈），只是这里反馈用经验系数 $k_x$、\cref{eq:qg-raibert-vel} 用捕获点解析系数 $\sqrt{z_0/\|\boldsymbol{g}\|}$（\cref{ins:qg-capture}）。两条来路互证 Raibert 公式的物理根：\emph{把落点对称地放在中性点两侧、再按速度误差微调偏置}。
+\end{derivation}
+
+\begin{insight}[为何是半个支撑相中点]\label{ins:qg-half-stance}
+前馈项 $\tfrac{t_{st}}{2}\,{}^{\mathcal{B}}\mathbf{v}_{curr}$ 预测的是\emph{半个}支撑相内机身移动的距离。为什么是半个而非整个？把脚落在未来支撑阶段的\textbf{中点}，可使整个支撑段内的足端力\emph{最均匀}、机身姿态\emph{最稳定}\cite{unitree2023quadruped}。直观地，若落在支撑段起点正上方，则整段都在“向后撑”；若落在终点，则整段都在“向前够”；落在中点，前半段“接”、后半段“送”，受力对称、力矩平衡最好。这是把“倒立摆支撑点应在质心运动弧的中点”这一对称性用到落足上。
+\end{insight}
+
+\begin{insight}[反馈校正项 = 捕获点刹车]\label{ins:qg-capture}
+反馈校正项 $\sqrt{z_0/\|\boldsymbol{g}\|}\,({}^{\mathcal{B}}\mathbf{v}_{curr}-{}^{\mathcal{B}}\mathbf{v}_{des})$ 修的是\emph{速度跟踪误差}：若当前速度比期望\emph{快}，差值为正、落点更\emph{靠前}，下一支撑相起“刹车”作用；反之落点靠后、产生更大前推力\cite{unitree2023quadruped}。这一项来自\textbf{捕获点理论}\cite{pratt2006capture}：系数 $\sqrt{z_0/\|\boldsymbol{g}\|}$ 恰是线性倒立摆 LIPM\cite{kajita2001lipm} 的\emph{时间常数} $1/\omega_n$（$\omega_n=\sqrt{\|\boldsymbol{g}\|/z_0}$ 为摆的固有频率），$z_0$ 为行走名义高度。也就是说，“为使机身停到期望速度，脚应多落出去的距离”正比于速度误差，比例系数就是这个摆的特征时间——这与 \cref{ch:quad_mpc} 里 LIPM 的角色一脉相承。
+\end{insight}
+
+\paragraph{（三）旋转补偿项。}
+转弯时外侧腿要迈得更远，用期望角速度在中性点处产生的切向位移补偿\cite{unitree2023quadruped}：
+\begin{equation}
+  \Delta\mathbf{p}_{rot}=\frac{t_{st}}{2}\big({}^{\mathcal{B}}\boldsymbol{\omega}_{des}\times{}^{\mathcal{B}}\mathbf{p}_{f,neutral}\big).
+  \label{eq:qg-raibert-rot}
+\end{equation}
+叉乘 ${}^{\mathcal{B}}\boldsymbol{\omega}_{des}\times{}^{\mathcal{B}}\mathbf{p}_{f,neutral}$ 给出中性点处由期望角速度导致的切向速度，乘以半支撑相得该腿应额外迈出的位移，以平稳地支撑机身旋转。三项叠加 ${}^{\mathcal{B}}\mathbf{p}_{f,neutral}+\Delta\mathbf{p}_{vel}+\Delta\mathbf{p}_{rot}$ 得机身系完整落点，再转世界系供摆动轨迹生成。
+
+\begin{insight}[Raibert 公式的定位：鲁棒但非最优]\label{ins:qg-raibert-nature}
+Raibert 公式的本质判断很关键：它实际是对\emph{复杂非线性动力学的简化与线性化}，结合了物理直觉与控制经验；它定义的落点\textbf{并非最优，但非常鲁棒且易于计算}\cite{unitree2023quadruped}。想找\emph{严格最优}的落点，须求解复杂的非线性动力学方程。这条定位有两层用意：其一，它解释了为什么工程上 Raibert 启发式经久不衰（快、稳、够用）；其二，它埋下伏笔——本章 \cref{sec:qg-swing} 之所以要动用\emph{变分最优}来设计摆动轨迹，正是因为在“摆过去”这件相对简单的子问题上，我们\emph{负担得起}最优；而在“落到哪”这件与全身动力学强耦合的事上，则退而用鲁棒的启发式。最优与鲁棒，按子问题难度分而治之。
+\end{insight}
+
+\subsection{结合感知的落足点修正}
+\label{subsec:qg-perception}
+
+当平面假设不成立（石块、水坑、台阶边缘），须在 Raibert 理想点基础上做\emph{感知修正}\cite{unitree2023quadruped}：
+\begin{enumerate}
+  \item \textbf{生成地形图}：用 LiDAR/深度相机实时构建 $3$D 高度图（height map）或代价图（cost map）；
+  \item \textbf{验证理想点}：检查 Raibert 理想落点在地形图上是否安全（平坦、无障碍、不在边缘）；
+  \item \textbf{搜索安全区}：若不安全，在其周围小范围（如半径 $5$–$10\,\mathrm{cm}$ 的圆）内搜代价最低（最平坦/最安全）的替代点；
+  \item \textbf{更新目标}：以修正后的安全点为最终落足点。
+\end{enumerate}
+这是把“被动假设平面”升级为“主动选择落点”——不规则地面上必须依赖主动感知实现 $3$D 环境理解与落点搜索。本书把感知建图的细节留给规划/感知章，此处只标注其在落足管线中的位置。
+
+\subsection{工程实现：对称点与四项叠加}
+\label{subsec:qg-engineering-foot}
+
+下面给出可直接计算的工程版落足点，它与 Raibert 三项分解\emph{互补}：前者讲“怎么算”，后者讲“为什么”。
+
+\paragraph{对称点（机身系）。}
+先定义关节角为零时落点的基准（含全肘式结构的偏置）\cite{yu2021quadruped}：
+\begin{equation}
+  {}_i^{\mathcal{B}}\boldsymbol{p}_{hip}=
+  \begin{bmatrix}\delta h_x \\ \zeta(h_y+l_1) \\ 0\end{bmatrix}
+  +\begin{bmatrix}p_{offset}^{x} \\ 0 \\ 0\end{bmatrix},
+  \qquad p_{offset}^{x}=-0.018\,\mathrm{m},
+  \label{eq:qg-symmetric}
+\end{equation}
+第一项是关节角为零时第二连杆原点在本体系的水平坐标，$\delta,\zeta\in\{+1,-1\}$ 为腿位选择符号：$\delta$ 选前/后腿（$x$ 方向 $\pm$）、$\zeta$ 选左/右腿（$y$ 方向 $\pm$），按全肘式四腿对称布局取号；第二项 $p_{offset}^{x}=-0.018\,\mathrm{m}$ 把落点稍稍后移，因全肘式结构质心偏后，否则原地踏步时机器人在重力下有后退趋势\cite{yu2021quadruped}。
+
+\paragraph{近似触地位姿。}
+为避免逐步矩阵递推（\cref{eq:qg-posk}）的大量运算，用当前位姿 + 一段匀速外推近似\emph{名义触地时刻}的机身位姿\cite{yu2021quadruped}。名义触地时刻为 ${}_it_{touch}=t+(1-{}_i\tilde t_{sw})\,t_{sw}$，则
+\begin{equation}
+  \begin{cases}
+  {}^{\mathcal{O}}\boldsymbol{p}_{com}^{touch}={}^{\mathcal{O}}\boldsymbol{p}_{com}^{t}+{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}^{t}\,{}_d^{\mathcal{B}}\boldsymbol{v}_{com}^{t}\,(1-{}_i\tilde t_{sw})\,t_{sw},\\
+  \psi^{touch}=\psi^{t}+{}_d\omega_z^{t}\,(1-{}_i\tilde t_{sw})\,t_{sw}.
+  \end{cases}
+  \label{eq:qg-touch-pose}
+\end{equation}
+
+\begin{insight}[近似误差随相位逼近 1 自动消失]\label{ins:qg-touch-vanish}
+\cref{eq:qg-touch-pose} 这个近似有一处妙处：尽管它用“当前速度匀速外推”这种粗近似，但随摆动相位 ${}_i\tilde t_{sw}$ 逐渐\emph{逼近 $1$}（即越接近名义触地时刻），外推时长 $(1-{}_i\tilde t_{sw})\,t_{sw}\to0$，于是 ${}^{\mathcal{O}}\boldsymbol{p}_{com}^{touch}\to{}^{\mathcal{O}}\boldsymbol{p}_{com}^{t}$——\textbf{误差逐渐减少并在临界（触地）时刻精确消失}\cite{yu2021quadruped}。配合\emph{在线滚动重算}（每个周期都重算一次落点），这个近似在“最需要准的地方”（临触地）自动收敛到准确值。这与 \cref{ch:quad_mpc} “用反馈/滚动补偿模型误差”是同一哲学：不追求每步都精确，而是让误差在关键时刻被结构性地压到零。
+\end{insight}
+
+名义触地时刻的对称点（世界系）\cite{yu2021quadruped}：
+\begin{equation}
+  {}_i^{\mathcal{O}}\boldsymbol{p}_{hip}^{touch}={}^{\mathcal{O}}\boldsymbol{p}_{com}^{touch}+\mathbf{R}_z(\psi^{touch})\,{}_i^{\mathcal{B}}\boldsymbol{p}_{hip}.
+  \label{eq:qg-hip-touch}
+\end{equation}
+
+\paragraph{四个修正项。}
+在对称点上叠加四项修正。\textbf{平动项} $\Delta\boldsymbol{p}_1$ 与\textbf{转动项} $\Delta\boldsymbol{p}_2$ 使支撑足起止坐标的\emph{均值}落在对称点（即落点设在实际速度方向、距对称点半步长，呼应 \cref{ins:qg-half-stance}）\cite{yu2021quadruped}：
+\begin{equation}
+  \begin{cases}
+  \Delta\boldsymbol{p}_1={}_d^{\mathcal{O}}\boldsymbol{v}_{com}^{t}\,t_{st}/2,\\
+  \Delta\boldsymbol{p}_2=\mathbf{R}_z(\psi^{touch})\Big[\mathbf{R}_z\big({}_d\omega_z^{t}\,t_{st}/2\big)\,{}_i^{\mathcal{B}}\boldsymbol{p}_{hip}-{}_i^{\mathcal{B}}\boldsymbol{p}_{hip}\Big].
+  \end{cases}
+  \label{eq:qg-dp12}
+\end{equation}
+\textbf{捕获点速度修正} $\Delta\boldsymbol{p}_3$ 修速度跟踪误差——在某方向加大落足距离会引发反方向加速度（足式系统内在特性）\cite{yu2021quadruped,pratt2006capture}：
+\begin{equation}
+  \Delta\boldsymbol{p}_3=k_p\big({}^{\mathcal{O}}\boldsymbol{v}_{com}^{t}-{}_d^{\mathcal{O}}\boldsymbol{v}_{com}^{t}\big),
+  \qquad k_p=0.15.
+  \label{eq:qg-dp3}
+\end{equation}
+
+\cref{eq:qg-dp3} 与 Raibert 版的反馈校正项 \cref{eq:qg-raibert-vel} 第二项同源，都是“速度误差 $\to$ 落足前后偏移”的捕获点思想；区别只在比例系数：此处用经验值 $k_p=0.15$（整定简单），捕获点/LIPM 版用解析系数 $\sqrt{z_0/\|\boldsymbol{g}\|}$（有物理量纲依据，\cref{ins:qg-capture}）。
+
+\textbf{向心补偿} $\Delta\boldsymbol{p}_4$：匀速圆周运动的倒立摆中，支撑点相对质心总在\emph{远离圆心}的方向\cite{yu2021quadruped}：
+\begin{equation}
+  \Delta\boldsymbol{p}_4=\frac{{}^{\mathcal{O}}\boldsymbol{p}_{com}^{t}(3)}{-{}^{\mathcal{O}}g(3)}\,{}^{\mathcal{O}}\boldsymbol{v}_{com}^{t}\times{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{t}.
+  \label{eq:qg-dp4}
+\end{equation}
+
+\begin{derivation}[向心补偿的来由（\cref{eq:qg-dp4}）]\label{deriv:qg-centripetal}
+把质心相对支撑点的位置向量 ${}^A\boldsymbol{r}_{AP}$ 当作刚性连杆（倒立摆），对其速度约束 ${}^A\dot{\boldsymbol{r}}_{AP}$ 再求一次时间导数，并\emph{忽略角加速度}（匀速圆周，${}^A\dot{\boldsymbol{\Omega}}_B\approx\mathbf{0}$）\cite{yu2021quadruped}：
+\begin{equation}
+  {}^A\ddot{\boldsymbol{r}}_{AP}
+  ={}^A\dot{\boldsymbol{\Omega}}_B\,{}^A\boldsymbol{r}_{AP}+{}^A\boldsymbol{\Omega}_B\,{}^A\dot{\boldsymbol{r}}_{AP}
+  =\mathbf{0}+{}^A\boldsymbol{\omega}_{AB}\times{}^A\dot{\boldsymbol{r}}_{AP}
+  =-{}^A\dot{\boldsymbol{r}}_{AP}\times{}^A\boldsymbol{\omega}_{AB},
+  \label{eq:qg-centripetal-deriv}
+\end{equation}
+即得向心加速度 $\boldsymbol{a}=-{}^{\mathcal{O}}\boldsymbol{v}_{com}^{t}\times{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{t}$。对倒立摆，把支撑点放到产生此向心力所需的位置，即把落点沿“远离圆心”方向偏移；偏移量正比于摆长（用机身高 ${}^{\mathcal{O}}p_{com}^{t}(3)$ 近似）除以重力幅值，得 \cref{eq:qg-dp4} 的高度因子 $\tfrac{{}^{\mathcal{O}}p_{com}^{t}(3)}{-{}^{\mathcal{O}}g(3)}$（注意 ${}^{\mathcal{O}}g(3)=-9.8<0$，故该因子为正）。这与捕获点/LIPM 同源（\cref{ins:qg-capture}）。
+\end{derivation}
+
+\paragraph{落足点合成与坡度闭环。}
+水平方向把对称点与四项相加\cite{yu2021quadruped}：
+\begin{equation}
+  {}_i^{\mathcal{O}}\boldsymbol{p}_{sw\text{-}end}={}_i^{\mathcal{O}}\boldsymbol{p}_{hip}^{touch}+\Delta\boldsymbol{p}_1+\Delta\boldsymbol{p}_2+\Delta\boldsymbol{p}_3+\Delta\boldsymbol{p}_4,
+  \label{eq:qg-foot-xy}
+\end{equation}
+竖直坐标则\emph{代回坡度平面}（\cref{eq:qg-plane} 的拟合参数 $\hat a,\hat b,\hat c$）\cite{yu2021quadruped}：
+\begin{equation}
+  {}_i^{\mathcal{O}}\boldsymbol{p}_{sw\text{-}end}(3)=\hat a+\hat b\,{}_i^{\mathcal{O}}\boldsymbol{p}_{sw\text{-}end}(1)+\hat c\,{}_i^{\mathcal{O}}\boldsymbol{p}_{sw\text{-}end}(2).
+  \label{eq:qg-foot-z}
+\end{equation}
+
+\begin{insight}[坡度估计与落足点在此闭环]\label{ins:qg-slope-loop}
+\cref{eq:qg-foot-z} 是本章两个模块的\emph{闭环点}：\cref{sec:qg-slope} 估出的坡度 $(\hat a,\hat b,\hat c)$ 在这里给落足点定竖直高度，正是 \cref{pit:qg-time-switch} 动机（“斜坡不能简单把 $z$ 置 $0$”）的兑现。把它和 \cref{ins:qg-touch-vanish} 合看：落足点的 $x,y$ 由匀速外推 + 四项修正（在临触地自动收敛），$z$ 由坡度平面给定，二者共同保证“脚落在坡面上的合适位置”。这个落足点 ${}_i^{\mathcal{O}}\boldsymbol{p}_{sw\text{-}end}$ 接着供给两处：作为 \cref{ch:quad_mpc} 中摆动腿 $\boldsymbol{r}_i$ 的装配值，以及 \cref{sec:qg-swing} 摆动轨迹的终点。
+\end{insight}
+
+\subsection{Raibert 纯旋转的切向外推缺陷}
+\label{subsec:qg-raibert-flaw}
+
+\begin{pitfall}[核心陷阱：纯旋转指令下落足点沿环形轨道切向外推]\label{pit:qg-raibert-rot}
+Raibert 方法有一个\emph{严重}缺陷：当\textbf{只有角速度指令}不为零（纯转动、无平动）时，落足补偿只剩旋转项 \cref{eq:qg-raibert-rot} 的\emph{切向}补偿。按叉乘 ${}^{\mathcal{B}}\boldsymbol{\omega}_{des}\times{}^{\mathcal{B}}\mathbf{p}_{f,neutral}$ 的物理意义，它把落足点沿“相对机身的环形轨道”\emph{切向向外推}，导致期望落点相对机身中心的\emph{距离不断增加}\cite{unitree2023quadruped}。而理想情况下，纯旋转时落足点应停在某个\emph{半径不变}的圆上（圆心是质心在地面的投影）。切向外推使半径漂移，增幅过大时期望落点会\textbf{超出足端可达域}，导致逆运动学无解或腿伸到极限。
+
+\textbf{原因}：Raibert 的旋转项只给了切向位移、\emph{缺少把落点拉回圆上的径向收敛分量}——它是一阶切向近似，把“沿圆弧走”错算成“沿切线走”。\textbf{对策}：(1) 对落足点相对髋的距离做\emph{限幅}（保证在可达域内）；(2) 加径向修正项把落点拉回名义圆；(3) 改用更完整的落足模型（如 \cref{eq:qg-dp12} 的转动项 $\Delta\boldsymbol{p}_2$ 用旋转矩阵而非纯切向叉乘，天然在圆上，详见 \cref{eq:qg-dp2-note}）。这也提醒：Raibert 是很早期的方法（\cref{ins:qg-raibert-nature}），后续有更优方法与结合感知的落足搜索（\cref{subsec:qg-perception}）。
+\end{pitfall}
+
+\begin{note}[工程版旋转项为何无此缺陷]\label{eq:qg-dp2-note}
+对照 \cref{eq:qg-dp12} 的转动项 $\Delta\boldsymbol{p}_2$：它用\emph{旋转矩阵} $\mathbf{R}_z({}_d\omega_z\,t_{st}/2)$ 直接把对称点 ${}_i^{\mathcal{B}}\boldsymbol{p}_{hip}$ \emph{绕圆心转}一个角度再作差，得到的是\emph{弦}位移而非\emph{切线}位移——落点始终在以髋投影为基准的圆上，半径不漂移。这正是对 Raibert 纯切向近似（\cref{pit:qg-raibert-rot}）的修正：用有限角旋转代替一阶切向，避免切向外推。两式并读，可看清启发式的物理直觉与数值稳健实现之间的差距。
+\end{note}
+
+\begin{derivation}[根治切向外推：宇树的极坐标旋转落点（在圆上算角度）]\label{deriv:qg-rot-polar}
+宇树给出第三种、最直白的“半径不漂移”构造\cite{unitree2023quadruped}：不在\emph{直角坐标}里加切向位移，而\emph{直接在极坐标里推进落点的角度}，半径 $R$ 写死。原地以角速度 $\omega$ 旋转时，各腿中性点绕机身中心以\emph{固定半径} $R$ 转动。记 $\theta$ 为机身偏航、$\theta_0$ 为“髋—机身中心”连线相对机身 $x_b$ 轴的固定夹角（常数）。完全套用平移版 \cref{deriv:qg-raibert-firstprinciple} 的“②④对称于③ $+$ 相位外推 $+$ 速度反馈”三步，只是把被推进的量从\emph{位置}换成\emph{角度}：相位 $p$ 处偏航 $\theta_p$，距触地余 $(1-p)T_{swing}$，半支撑相中点贡献 $\tfrac12\omega T_{stance}$，再叠角速度反馈 $k_\omega(\omega-\omega_d)$，得目标落点与机身中心连线相对世界系 $x_s$ 轴的方位角
+\begin{equation}
+  \theta_f=\theta_p+\theta_0+\omega(1-p)\,T_{swing}+\tfrac12\,\omega\,T_{stance}+k_\omega(\omega-\omega_d).
+  \label{eq:qg-rot-thetaf}
+\end{equation}
+\textbf{关键一步}：落点的世界系水平坐标用\emph{极坐标}还原，半径恒为 $R$：
+\begin{equation}
+  x_f=R\cos\theta_f,\qquad y_f=R\sin\theta_f.
+  \label{eq:qg-rot-xy}
+\end{equation}
+因 $x_f^2+y_f^2=R^2$ 与 $\theta_f$ 无关，\textbf{落点被强制锁在半径 $R$ 的圆上}——从根上杜绝了 \cref{pit:qg-raibert-rot} 的“沿切线外推、半径漂移”：那里在直角坐标加 $\tfrac{t_{st}}{2}(\boldsymbol{\omega}\times\mathbf{p})$ 是\emph{切向一阶近似}，会把点推离圆；这里改在\emph{角度}上推进、再投影回圆，是\emph{有限角精确}处理。最后把平移（\cref{eq:qg-raibert-full}）与转动（\cref{eq:qg-rot-xy}）合成第 $i$ 腿落点
+\begin{equation}
+  \begin{cases}
+  x_i=x_b+R\cos\theta_f+v_x(1-p)T_{swing}+\tfrac12 v_x T_{stance}+k_x(v_x-v_{xd}),\\
+  y_i=y_b+R\sin\theta_f+v_y(1-p)T_{swing}+\tfrac12 v_y T_{stance}+k_y(v_y-v_{yd}).
+  \end{cases}
+  \label{eq:qg-foot-polar}
+\end{equation}
+\cref{eq:qg-foot-polar} 与本章工程版 \cref{eq:qg-foot-xy}（对称点 $+$ 四项）\emph{异曲同工}：两者都用“绕圆心转角度”而非“切向叉乘”处理旋转，故都无半径漂移；区别仅在 \cref{eq:qg-dp12} 把旋转写成对对称点作用的旋转矩阵 $\mathbf{R}_z$，而 \cref{eq:qg-rot-xy} 把它写成对极角 $\theta_f$ 的直接累加。三式（Raibert 切向 \cref{eq:qg-raibert-rot} / 工程旋转矩阵 \cref{eq:qg-dp12} / 宇树极坐标 \cref{eq:qg-rot-xy}）并读，可彻底看清“纯旋转落点该怎么算才不漂移”。
+\end{derivation}
+
+\begin{practice}
+\begin{enumerate}
+  \item 把 Raibert 三项 \cref{eq:qg-raibert-vel,eq:qg-raibert-rot} 与工程版四项 \cref{eq:qg-dp12,eq:qg-dp3,eq:qg-dp4} 逐项对应：哪项对应中性点？哪项对应速度前馈？哪项对应捕获点刹车？哪项是工程版独有的向心补偿？
+  \item （计算）取纯旋转 ${}^{\mathcal{B}}\boldsymbol{\omega}_{des}=[0,0,\omega_z]^\top$、中性点 ${}^{\mathcal{B}}\mathbf{p}_{f,neutral}=[0,r,0]^\top$，算 \cref{eq:qg-raibert-rot} 的 $\Delta\mathbf{p}_{rot}$，说明它指向 $+x$（切向）、与径向 $y$ 正交，从而印证 \cref{pit:qg-raibert-rot} 的“切向外推”。
+  \item 验证 \cref{eq:qg-dp4} 在纯前进（$\boldsymbol{\omega}=\mathbf{0}$）时 $\Delta\boldsymbol{p}_4=\mathbf{0}$、在纯旋转 + 前进时非零，解释其物理意义。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{摆动足底轨迹：从变分最优到分段样条}
+\label{sec:qg-swing}
+
+落足点既定，摆动足要从离地点“摆过去”落到落足点。本节先用变分法求点到点最优轨迹（给出三次多项式的来由），再把它整形为 $x,y$ 三次、$z$ 分段“摆线式”的足底轨迹。
+
+\subsection{点到点最优轨迹：变分法}
+\label{subsec:qg-variational}
+
+摆动起点 ${}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}$（摆动进度 ${}_i\tilde t_{sw}=0$ 处）与终点 ${}_i^{\mathcal{O}}\boldsymbol{p}_{sw\text{-}end}$（${}_i\tilde t_{sw}=1$）都已知，故足底轨迹是一个\emph{点到点规划问题}\cite{yu2021quadruped}。
+
+\paragraph{最优性问题与归一化。}
+考虑一个单位质量滑块在光滑地面上，受水平力 $u$，初位置/速度为零，要求在单位时间内走过单位距离并停下。满足此边界的轨迹有无穷多条，求“最省力”的那条。动力学为\cite{yu2021quadruped}：
+\begin{equation}
+  \dot x=v,\qquad \ddot x=\dot v=u.
+  \label{eq:qg-dyn}
+\end{equation}
+评价指标取\emph{控制力平方积分}最小（“最省力”的数学化）\cite{yu2021quadruped}：
+\begin{equation}
+  J=\int_0^1 u^2\,\mathrm{d}t=\int_0^1\ddot x^2\,\mathrm{d}t.
+  \label{eq:qg-cost}
+\end{equation}
+
+\paragraph{推广 Euler–Lagrange 方程。}
+被积函数 $\mathcal{L}(t,x,\dot x,\ddot x)=\ddot x^2$ 含\emph{二阶导}，须用\emph{推广}的 Euler–Lagrange 方程（含到二阶导的变分）\cite{yu2021quadruped}：
+\begin{equation}
+  \frac{\partial\mathcal{L}}{\partial x}-\frac{\mathrm{d}}{\mathrm{d}t}\frac{\partial\mathcal{L}}{\partial\dot x}+\frac{\mathrm{d}^2}{\mathrm{d}t^2}\frac{\partial\mathcal{L}}{\partial\ddot x}=0.
+  \label{eq:qg-EL}
+\end{equation}
+
+\begin{note}[推广 E–L 方程的符号交替]\label{note:qg-ocr-EL}
+推广 Euler–Lagrange 方程各阶导的符号\emph{依次交替}为 $+,-,+,\dots$，故含到二阶导时第三项取\textbf{正号}（\cref{eq:qg-EL}）。对本例 $\mathcal{L}=\ddot x^2$，前两项 $\partial\mathcal{L}/\partial x=0$、$\partial\mathcal{L}/\partial\dot x=0$，仅第三项非零，故无论其正负，方程都化为 $\tfrac{\mathrm{d}^2}{\mathrm{d}t^2}(2\ddot x)=0$，结论不变。
+\end{note}
+
+代入 $\partial\mathcal{L}/\partial x=0$、$\partial\mathcal{L}/\partial\dot x=0$、$\partial\mathcal{L}/\partial\ddot x=2\ddot x$\cite{yu2021quadruped}：
+\begin{equation}
+  \frac{\mathrm{d}^2}{\mathrm{d}t^2}(2\ddot x)=0\;\Longrightarrow\;\frac{\mathrm{d}^4}{\mathrm{d}t^4}x=0,
+  \label{eq:qg-fourth}
+\end{equation}
+即 $x(t)$ 的四阶导恒为零，故 $x(t)$ 是 $t$ 的\emph{三次多项式}\cite{yu2021quadruped}：
+\begin{equation}
+  x(t)=a t^3+b t^2+c t+d,\qquad v(t)=3a t^2+2b t+c.
+  \label{eq:qg-cubic}
+\end{equation}
+
+\begin{theorem}[归一化最小控制力点到点轨迹]\label{thm:qg-mincontrol}
+满足边界 $x(0)=0,\ v(0)=0,\ x(1)=1,\ v(1)=0$ 的最小控制力平方积分（\cref{eq:qg-cost}）轨迹为
+\begin{equation}
+  \boxed{\,x(t)=3t^2-2t^3,\qquad v(t)=6t-6t^2\,}.
+  \label{eq:qg-st}
+\end{equation}
+它是最小 jerk（加加速度）轨迹的特例（$\mathrm{d}^4x/\mathrm{d}t^4=0$）：起止速度为零、加速度光滑，控制力平方积分最小\cite{yu2021quadruped}。
+\end{theorem}
+
+\begin{derivation}[四元一次方程组求系数（\cref{thm:qg-mincontrol}）]\label{deriv:qg-coeff}
+把四个边界条件代入 \cref{eq:qg-cubic}：
+\[
+  \begin{aligned}
+  x(0)=d&=0,\\
+  v(0)=c&=0,\\
+  x(1)=a+b+c+d&=1\ \Rightarrow\ a+b=1,\\
+  v(1)=3a+2b+c&=0\ \Rightarrow\ 3a+2b=0.
+  \end{aligned}
+\]
+前两式直接给出 $d=0$、$c=0$。代回后两式，得关于 $a,b$ 的二元一次方程组
+\[
+  \begin{cases}
+  a+b=1,\\
+  3a+2b=0.
+  \end{cases}
+\]
+由第一式得 $b=1-a$，代入第二式：$3a+2(1-a)=0\Rightarrow a+2=0\Rightarrow a=-2$，回代得 $b=1-(-2)=3$。故 $(a,b,c,d)=(-2,3,0,0)$，即
+\[
+  x(t)=-2t^3+3t^2=3t^2-2t^3,\qquad v(t)=\dot x(t)=6t-6t^2,
+\]
+与 \cref{eq:qg-st} 一致。
+\end{derivation}
+
+\begin{insight}[把“最优”用在负担得起的子问题上]\label{ins:qg-optimal-subproblem}
+\cref{thm:qg-mincontrol} 与 \cref{ins:qg-raibert-nature} 形成有意思的对照：落足点（与全身动力学强耦合）我们用\emph{鲁棒但非最优}的 Raibert 启发式，而摆动轨迹（一个干净的点到点、与动力学弱耦合的子问题）我们\emph{负担得起}严格变分最优。“摆过去”这件事的物理本质就是“起止状态给定、过程最省力”，恰好对应最小 jerk 三次样条——既最优又解析（无需在线求解），何乐不为。这体现了规划器的工程智慧：\emph{按子问题与动力学耦合的强弱，分配最优化的算力预算}。
+\end{insight}
+
+\subsection{足底轨迹合成：$x,y$ 三次、$z$ 分段摆线式}
+\label{subsec:qg-swing-synth}
+
+把 \cref{eq:qg-st} 的归一化整形函数 $\sigma\mapsto3\sigma^2-2\sigma^3$ 用到三个坐标上，归一化时间取摆动相进度 ${}_i\tilde t_{sw}\in[0,1]$（\cref{eq:qg-swing-prog}）。先记起止向量\cite{yu2021quadruped}：
+\begin{equation}
+  {}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}sw}={}_i^{\mathcal{O}}\boldsymbol{p}_{sw\text{-}end}-{}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}.
+  \label{eq:qg-stsw}
+\end{equation}
+
+\paragraph{$x,y$ 方向（单段三次）。}
+水平两方向直接用 \cref{eq:qg-st} 从起点平滑插值到终点\cite{yu2021quadruped}：
+\begin{equation}
+  \begin{cases}
+  {}_dx({}_i\tilde t_{sw})={}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(1)+{}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}sw}(1)\big(3\,{}_i\tilde t_{sw}^2-2\,{}_i\tilde t_{sw}^3\big),\\
+  {}_dy({}_i\tilde t_{sw})={}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(2)+{}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}sw}(2)\big(3\,{}_i\tilde t_{sw}^2-2\,{}_i\tilde t_{sw}^3\big),\\
+  {}_d\dot x({}_i\tilde t_{sw})={}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}sw}(1)\big(6\,{}_i\tilde t_{sw}-6\,{}_i\tilde t_{sw}^2\big),\\
+  {}_d\dot y({}_i\tilde t_{sw})={}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}sw}(2)\big(6\,{}_i\tilde t_{sw}-6\,{}_i\tilde t_{sw}^2\big).
+  \end{cases}
+  \label{eq:qg-xy}
+\end{equation}
+
+\paragraph{$z$ 方向（分两段：抬腿、落腿）。}
+竖直方向不能用单段三次（那样脚要么不抬、要么斜着插过去），须\emph{先升到抬腿高度 ${}_dh_{foot}$、再落到落足终点高度}。把摆动相对半分段，各段重新归一化时间 $\sigma$，每段仍用三次整形\cite{yu2021quadruped}：
+\begin{equation}
+  \begin{cases}
+  {}_dz={}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(3)+{}_dh_{foot}\,(3\sigma^2-2\sigma^3), & \sigma=2\,{}_i\tilde t_{sw}\le1\ (\text{抬腿段}),\\[4pt]
+  {}_dz={}_dz(0.5)+\big[{}_i^{\mathcal{O}}\boldsymbol{p}_{sw\text{-}end}(3)-{}_dz(0.5)\big](3\sigma^2-2\sigma^3), & \sigma=2({}_i\tilde t_{sw}-0.5)>0\ (\text{落腿段}),\\[4pt]
+  {}_d\dot z={}_dh_{foot}\,(6\sigma-6\sigma^2), & \sigma=2\,{}_i\tilde t_{sw}\le1,\\[4pt]
+  {}_d\dot z=\big[{}_i^{\mathcal{O}}\boldsymbol{p}_{sw\text{-}end}(3)-{}_dz(0.5)\big](6\sigma-6\sigma^2), & \sigma=2({}_i\tilde t_{sw}-0.5)>0,
+  \end{cases}
+  \label{eq:qg-z}
+\end{equation}
+其中 ${}_dh_{foot}$ 为期望抬腿高度，${}_dz(0.5)$ 为摆动中点（峰）处的高度。合成期望足底轨迹与速度\cite{yu2021quadruped}：
+\begin{equation}
+  {}_i^{\mathcal{O}}\boldsymbol{p}^{d}=\begin{bmatrix}{}_dx & {}_dy & {}_dz\end{bmatrix}^\top,
+  \qquad
+  {}_i^{\mathcal{O}}\dot{\boldsymbol{p}}^{d}=\begin{bmatrix}{}_d\dot x & {}_d\dot y & {}_d\dot z\end{bmatrix}^\top.
+  \label{eq:qg-pd}
+\end{equation}
+
+\begin{insight}[$z$ 分段“摆线式”：通过性 + 峰点速度连续]\label{ins:qg-cycloid}
+$z$ 用 $\sigma=2\,{}_i\tilde t_{sw}$ 把摆动相\emph{对半切}：前半段（${}_i\tilde t_{sw}\in[0,0.5]$）抬腿到峰，后半段（$[0.5,1]$）落到终点。两段都用三次整形 $3\sigma^2-2\sigma^3$，叠成一个先升后降、形如\textbf{摆线}的抬腿曲线。两个设计要点：(1) \emph{通过性}——足端在中点抬到 ${}_dh_{foot}$，越过地面起伏与障碍；(2) \emph{峰点速度连续}——峰点处 $\sigma=1$，竖直速度 $\propto 6-6=0$，即抬腿段末与落腿段初竖直速度都为零、平滑衔接，不会在峰点“顿一下”\cite{yu2021quadruped}。注意这\emph{不是}真正的摆线（真摆线由滚圆生成），而是\emph{分段三次}逼近的“摆线式”形态——但峰点速度连续、起止速度为零的性质与摆线相近，且解析、计算量小。
+\end{insight}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=1.0,>=Stealth]
+  % ground
+  \draw[gray!50] (0,0)--(6,0);
+  \foreach \x in {0,0.5,...,5.5}\draw[gray!50](\x,0)--(\x-0.15,-0.18);
+  % start and end feet
+  \fill (0,0) circle (2.5pt) node[below left]{\scriptsize 离地点 ${}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}$};
+  \fill (5,0.4) circle (2.5pt) node[below right]{\scriptsize 落足点 ${}_i^{\mathcal{O}}\boldsymbol{p}_{sw\text{-}end}$};
+  % swing trajectory: rise to peak at mid, then fall to end (cycloid-like)
+  \draw[main, very thick] plot[smooth, domain=0:5, samples=60]
+    ({\x},{ (\x<=2.5) ? (1.6*(3*(\x/2.5)^2-2*(\x/2.5)^3)) : (1.6 + (0.4-1.6)*(3*((\x-2.5)/2.5)^2-2*((\x-2.5)/2.5)^3)) });
+  % peak marker
+  \fill[red!70!black] (2.5,1.6) circle (2pt) node[above]{\scriptsize 峰点（$\sigma=1$, $\dot z=0$）};
+  % height annotation
+  \draw[<->, second] (0.15,0)--(0.15,1.6) node[midway,left]{\scriptsize ${}_dh_{foot}$};
+  % phase labels
+  \node[main!60!black] at (1.25,-0.4){\scriptsize 抬腿段 ${}_i\tilde t_{sw}\in[0,0.5]$};
+  \node[main!60!black] at (3.9,-0.4){\scriptsize 落腿段 $[0.5,1]$};
+\end{tikzpicture}
+\caption{摆动足底竖直轨迹（侧视，$z$ 对水平进度）：前半摆动相由 \cref{eq:qg-z} 第一式抬腿到峰高 ${}_dh_{foot}$，后半由第二式落到落足终点高度。两段均为三次整形，峰点处竖直速度为零（\cref{ins:qg-cycloid}），整体呈“摆线式”先升后降。$x,y$ 方向（\cref{eq:qg-xy}）则单段三次平滑插值——三者合成空间足底轨迹 \cref{eq:qg-pd}，供下游逆运动学（\cref{ch:quad_kin}）。}
+\label{fig:qg-swing-z}
+\end{figure}
+
+\subsection{另一条来路：宇树的\texorpdfstring{\emph{真}}{真}摆线足底轨迹}
+\label{subsec:qg-true-cycloid}
+
+\cref{ins:qg-cycloid} 已强调：\cref{eq:qg-z} 的 $z$ 是\emph{分段三次}逼近的“摆线式”形态，\emph{并非}真正的摆线。那么真正的摆线长什么样、怎么用作足底轨迹？宇树《四足机器人控制算法》给出了\emph{另一条独立来路}\cite{unitree2023quadruped}：直接取几何摆线、再缩放对齐起止点。两条来路并读，正可看清“摆线式”与“真摆线”的差别，也补全本章对摆动足底轨迹的完整谱系。
+
+\paragraph{从滚圆生成真摆线。}
+取半径 $R$ 的圆，圆上一点 $A$ 在初始时刻与地面相切于 $A_1$；让圆\emph{无滑动}地沿地面向右滚动，$A$ 点在空间中划出的轨迹即\textbf{摆线（cycloid）}。设圆已滚过角 $\theta$，因\emph{纯滚动}（接触点瞬时速度为零），圆走过的水平距离等于已滚过的弧长 $R\theta$，故此刻圆心位于 $(R\theta,\,R)$。圆上 $A$ 点相对圆心的位置为 $(-R\sin\theta,\,-R\cos\theta)$（初始 $\theta=0$ 时 $A$ 在圆心正下方 $(0,-R)$，随滚动顺时针转过 $\theta$）。两者相加得 $A$ 点坐标\cite{unitree2023quadruped}：
+\begin{equation}
+  \begin{cases}
+  x=R\theta-R\sin\theta=R(\theta-\sin\theta),\\
+  z=R-R\cos\theta=R(1-\cos\theta).
+  \end{cases}
+  \label{eq:qg-cycloid-geom}
+\end{equation}
+设滚一周（$\theta:0\to2\pi$）耗时 $T$，则 $\theta=2\pi t/T$，代入得\emph{时间参数化}的摆线位置\cite{unitree2023quadruped}：
+\begin{equation}
+  x=R\!\left(\frac{2\pi t}{T}-\sin\frac{2\pi t}{T}\right),
+  \qquad
+  z=R\!\left(1-\cos\frac{2\pi t}{T}\right).
+  \label{eq:qg-cycloid-time}
+\end{equation}
+对 $t$ 求导得摆线速度\cite{unitree2023quadruped}：
+\begin{equation}
+  \dot x=\frac{2\pi R}{T}\!\left(1-\cos\frac{2\pi t}{T}\right),
+  \qquad
+  \dot z=\frac{2\pi R}{T}\sin\frac{2\pi t}{T}.
+  \label{eq:qg-cycloid-vel}
+\end{equation}
+
+\begin{insight}[为何真摆线天然满足“足底轨迹三期望”]\label{ins:qg-cycloid-why}
+宇树对摆动足底轨迹列出三条期望\cite{unitree2023quadruped}：(1) 离地与触地瞬间足端速度小、$xy$ 无滑动趋势；(2) 轨迹中段运动迅速；(3) 足够光滑无波动。真摆线\cref{eq:qg-cycloid-vel} \emph{结构性地}满足前两条：在 $t=0$（及 $t=T$）处 $\tfrac{2\pi t}{T}=0$（或 $2\pi$），$\cos=1\Rightarrow\dot x=0$、$\sin=0\Rightarrow\dot z=0$——\textbf{起止点水平与竖直速度同时为零}，正是“轻起轻落、不打滑”；在中段 $t=T/2$ 处 $\cos=-1\Rightarrow\dot x=\tfrac{4\pi R}{T}$ 取最大，即“中段迅速”。而 $\sin/\cos$ 处处可导，光滑性（第三条）自然成立。这与 \cref{thm:qg-mincontrol} 的三次多项式 $3t^2-2t^3$ 殊途同归——后者由\emph{变分最优}逼出起止零速、中段最快；前者由\emph{滚圆几何}直接给出同款定性形状。\textbf{两条来路、同一组边界期望}，这正是 \cref{ins:qg-optimal-subproblem} “摆过去”这一干净子问题的两种解析答卷。
+\end{insight}
+
+\paragraph{解耦高度与步长：缩放对齐。}
+几何摆线\cref{eq:qg-cycloid-time} 有一处不便：其峰高恒为 $2R$、水平跨距恒为圆周长 $2\pi R$，二者都被同一个 $R$ \emph{绑死}，无法独立指定“抬多高、迈多远”\cite{unitree2023quadruped}。解法是\emph{各方向独立线性缩放}：竖直方向用期望抬腿高 $h$ 反求半径 $R=h/2$（使峰高 $2R=h$）；水平方向把单位摆线 $\tfrac{1}{2\pi}(2\pi p-\sin2\pi p)$（其值在 $p:0\to1$ 由 $0$ 单调增到 $1$）乘以期望位移 $(x_1-x_0)$。设足端从 $(x_0,y_0,z_0)$ 离地、峰高 $h$、落到 $(x_1,y_1,z_1)$，相位 $p=t/T\in[0,1]$，得\emph{工程摆线足底轨迹}\cite{unitree2023quadruped}：
+\begin{equation}
+  \begin{cases}
+  x_c=x_0+\dfrac{x_1-x_0}{2\pi}\big(2\pi p-\sin2\pi p\big),\\[4pt]
+  y_c=y_0+\dfrac{y_1-y_0}{2\pi}\big(2\pi p-\sin2\pi p\big),\\[4pt]
+  z_c=z_0+\dfrac{h}{2}\big(1-\cos2\pi p\big),
+  \end{cases}
+  \label{eq:qg-cycloid-foot}
+\end{equation}
+对相位（经 $p=t/T$，$\mathrm{d}p/\mathrm{d}t=1/T$）求导得速度\cite{unitree2023quadruped}：
+\begin{equation}
+  \dot x_c=\frac{x_1-x_0}{T}\big(1-\cos2\pi p\big),
+  \quad
+  \dot y_c=\frac{y_1-y_0}{T}\big(1-\cos2\pi p\big),
+  \quad
+  \dot z_c=\frac{\pi h}{T}\sin2\pi p.
+  \label{eq:qg-cycloid-foot-vel}
+\end{equation}
+$y$ 方向与 $x$ 同构，故同式缩放。这套 $(x_c,y_c,z_c)$ 与 \cref{eq:qg-pd} 的 $(x,y,z)$ 一样供下游逆运动学；只是它在世界系 $\{s\}$ 下给出，下放到腿基座系 $\{0\}$ 跟踪前须做坐标变换（\cref{ch:quad_kin}）\cite{unitree2023quadruped}。
+
+\begin{note}[两套摆动轨迹的取舍：分段三次 vs 真摆线]\label{note:qg-two-swings}
+本章现有两套摆动足底轨迹，都解析、都满足起止零速，可按需取用：
+\begin{itemize}
+  \item \textbf{分段三次“摆线式”}（\cref{eq:qg-z}，于宪元）：$z$ 抬腿/落腿\emph{两段}各一条三次曲线，水平 $x,y$ 单段三次。优点是抬腿段与落腿段\emph{各自独立}（可令峰点不在中点、可让落腿段更陡以适配台阶），且与同章变分最优\cref{eq:qg-st} 同源、记号统一；
+  \item \textbf{真摆线}（\cref{eq:qg-cycloid-foot}，宇树）：$z$ \emph{单条} $1-\cos2\pi p$ 曲线、水平 $\theta-\sin\theta$ 曲线，参数仅 $h,T$ 与起止点，几何意义直白、推导最短。代价是峰点恒在相位中点 $p=0.5$、高度与缩放耦合在固定形状上，灵活性略逊。
+\end{itemize}
+两者在“起止点速度为零、中段最快、全程光滑”这三条定性性质上\emph{等价}（\cref{ins:qg-cycloid-why}），差别只在分段自由度与记号体系。工程上宇树 \texttt{unitree\_guide} 用真摆线、于宪元实现用分段三次，本章二者并收，读源码时可对号入座。
+\end{note}
+
+\begin{practice}
+\begin{enumerate}
+  \item 验证真摆线\cref{eq:qg-cycloid-foot}：$p=0$ 时 $(x_c,z_c)=(x_0,z_0)$、$p=1$ 时 $x_c=x_1$ 且 $z_c=z_0$（落回起始高度），并由 \cref{eq:qg-cycloid-foot-vel} 确认 $p=0,1$ 处 $\dot x_c=\dot z_c=0$、$p=0.5$ 处 $z_c=z_0+h$（峰）。
+  \item 取 $h=0.08\,\mathrm{m}$、$T=0.25\,\mathrm{s}$、水平位移 $x_1-x_0=0.12\,\mathrm{m}$，算 $p=0.5$ 处的水平速度 $\dot x_c$ 与峰高，并与同参数下分段三次\cref{eq:qg-z} 的峰点（$\dot z=0$）做定性对比。
+  \item （概念）解释为何几何摆线\cref{eq:qg-cycloid-time} 必须缩放才能用作足底轨迹——把“峰高 $2R$ 与跨距 $2\pi R$ 被同一 $R$ 绑死”讲清，并说明\cref{eq:qg-cycloid-foot} 的两个独立缩放如何解绑。
+\end{enumerate}
+\end{practice}
+
+\begin{practice}
+\begin{enumerate}
+  \item 验证 \cref{eq:qg-st} 满足全部四个边界：$x(0)=0$、$v(0)=0$、$x(1)=1$、$v(1)=0$，并求其加速度 $a(t)=6-12t$、确认 $a(0.5)=0$（拐点）。
+  \item 对 $z$ 抬腿段 \cref{eq:qg-z} 第一式，验证 $\sigma=0$（${}_i\tilde t_{sw}=0$）时 $z={}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(3)$、$\sigma=1$（${}_i\tilde t_{sw}=0.5$）时 $z={}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}(3)+{}_dh_{foot}$（峰），且峰处 $\dot z=0$。
+  \item （概念）若把 $z$ 也用\emph{单段}三次（从离地点直接插到落足点），足端轨迹会怎样？为什么过不去地面起伏？据此说明分两段的必要性（\cref{ins:qg-cycloid}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{实践：摆动腿轨迹跟踪与整定}
+\label{sec:qg-practice}
+
+本节按全书“跳过纯工程、凝练入实践盒”的原则，只保留摆动腿跟踪控制的物理与整定要点，框架/代码细节从略。
+
+\begin{practice}[摆动腿轨迹跟踪：足端 PD + $\boldsymbol{\tau}=\mathbf{J}^\top\mathbf{f}$]
+摆动腿控制的任务是：让腾空的足端\emph{跟随} \cref{eq:qg-pd} 的目标位置/速度，落到期望落足点。基本流程与要点：
+\begin{itemize}
+  \item \textbf{前馈（逆运动学）}：由基座系下足端目标位置 $\boldsymbol{p}_{0d}$、目标速度 $\dot{\boldsymbol{p}}_{0d}$，经\emph{逆运动学}求关节目标角 $\boldsymbol{q}_d$、经\emph{一阶微分逆运动学}求目标角速度 $\dot{\boldsymbol{q}}_d$，直接发关节位置/速度命令（\cref{ch:quad_kin}）。
+  \item \textbf{足端修正力（PD）}：纯关节控制下足端跟踪误差难修正，故在足端加 PD 修正力\cite{unitree2023quadruped}
+  \[
+    \boldsymbol{f}_d=\boldsymbol{K}_p(\boldsymbol{p}_{0d}-\boldsymbol{p}_{0f})+\boldsymbol{K}_d(\dot{\boldsymbol{p}}_{0d}-\dot{\boldsymbol{p}}_{0f}),
+  \]
+  $\boldsymbol{K}_p,\boldsymbol{K}_d$ 为对角正定增益，$\boldsymbol{p}_{0f},\dot{\boldsymbol{p}}_{0f}$ 为足端实际位置/速度。
+  \item \textbf{力转力矩（雅可比转置）}：足端修正力经雅可比转置映射为关节力矩（静力学对偶，\cref{ch:quad_kin}）
+  \[
+    \boldsymbol{\tau}=\boldsymbol{J}^\top\boldsymbol{f}_d.
+  \]
+  腿速不快时单腿静力学近似成立；如足端 $x$ 位置小于目标，则产生 $+x$ 修正力驱足端加速、缩小偏差\cite{unitree2023quadruped}。
+  \item \textbf{整定}：调关节位置刚度 $k_p$、速度刚度 $k_d$ 与足端 $\boldsymbol{K}_p,\boldsymbol{K}_d$，使足端既能良好跟随又不过冲；抬腿高度 ${}_dh_{foot}$ 按地形起伏与可达域取（太低易踢绊、太高费能且影响节奏）。
+\end{itemize}
+\textbf{跳过的工程细节}：FSM 状态机、SwingTest 测试流程、C++ 实现（如 \texttt{State\_SwingTest}、\texttt{unitreeLeg} 等）按全书惯例不展开，读者按各自框架对接 \cref{eq:qg-pd} 的轨迹输出与上述跟踪律即可。
+\end{practice}
+
+\begin{insight}[力—力矩对偶把规划与执行解耦]\label{ins:qg-jacobian}
+$\boldsymbol{\tau}=\boldsymbol{J}^\top\boldsymbol{f}_d$ 这一步看似平凡，却把“规划在\emph{任务空间}（足端笛卡尔位置/力）”与“执行在\emph{关节空间}（电机力矩）”干净地解耦：规划器（本章）只需在直观的足端空间画轨迹、给修正力，由雅可比转置（\cref{ch:quad_kin}）自动翻译为关节指令。这与 \cref{ch:quad_mpc} 把 MPC 的足端虚拟力经逆动力学/雅可比转关节力矩是\emph{同一座桥}——无论上层是规划摆动轨迹还是优化支撑力，落到电机前都要过 $\boldsymbol{J}^\top$ 这一关。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+步态决定运动方向/速度 & 步态只定时序模式；方向/速度由速度命令与落足点定（\cref{ins:qg-decouple}）\\
+接触序列由 MPC 优化 & 接触序列是步态调度器给的外生已知输入，否则非凸（\cref{ins:qg-known-future}）\\
+事件切换一定比时间切换好 & 事件切换稳但工程代价大、且使未来不可预测（\cref{ins:qg-time-vs-event}）\\
+期望位置就该按速度纯积分 & 须加堵转保护凸组合实际位置，防力饱和（\cref{ins:qg-antiwindup}）\\
+斜坡落足 $z$ 可置 $0$ & 会“踩坑/踩石”，须先估坡度再代平面定 $z$（\cref{pit:qg-time-switch},\cref{eq:qg-foot-z}）\\
+速度前馈落点应预测整个支撑相 & 落在半支撑相中点才使支撑力最均匀（\cref{ins:qg-half-stance}）\\
+Raibert 落点是最优的 & 鲁棒易算但非最优，严格最优须解非线性动力学（\cref{ins:qg-raibert-nature}）\\
+纯旋转时 Raibert 落点也正确 & 切向外推使半径漂移、超可达域，须限幅/径向修正（\cref{pit:qg-raibert-rot}）\\
+近似触地位姿误差一直存在 & 误差随相位逼近 $1$ 自动消失（\cref{ins:qg-touch-vanish}）\\
+摆动 $z$ 用单段三次即可 & 须分抬腿/落腿两段，保通过性与峰点速度连续（\cref{ins:qg-cycloid}）\\
+摆动轨迹随便取个曲线 & 最小控制力 $\Rightarrow$ 三次多项式 $3t^2-2t^3$（\cref{thm:qg-mincontrol}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\mathbf{G}_d,\mathbf{G}_o$ & 占空比 / 偏移量向量（四维） & \cref{def:qg-duty-offset} \\
+$\beta_i$ & 第 $i$ 腿占空比 & \cref{def:qg-duty-offset} \\
+$T_{gait},t_{st},t_{sw}$ & 步态周期 / 名义支撑 / 摆动时长 & \cref{eq:qg-period} \\
+$\tilde t_{ng}$ & 全局相位进度 $\in[0,1)$ & \cref{eq:qg-global-phase} \\
+${}_i\tilde t_\Phi$ & 第 $i$ 腿本地相位变量 & \cref{eq:qg-leg-phase} \\
+${}_iS_\Phi\ (=s_i)$ & 第 $i$ 腿支撑布尔（1 支撑/0 摆动） & \cref{eq:qg-stance-bool} \\
+$\tilde t_{st},{}_i\tilde t_{sw}$ & 支撑 / 摆动相位进度 $\in[0,1]$ & \cref{eq:qg-stance-prog,eq:qg-swing-prog} \\
+${}_d^{\mathcal{B}}\boldsymbol{v}_{com},{}_d^{\mathcal{O}}\boldsymbol{v}_{com}$ & 期望质心速度（本体/世界系） & \cref{eq:qg-vel} \\
+${}_d\psi^k$ & 第 $k$ 周期期望偏航 & \cref{eq:qg-yaw-recur} \\
+$\varpi$ & 堵转保护凸组合系数 & \cref{eq:qg-pos1} \\
+${}_dh_{body},{}_dh_{foot}$ & 期望机身高 / 抬腿高 & \cref{eq:qg-posz,eq:qg-z} \\
+$\mathbf{A}_{pla}=[a,b,c]^\top$ & 地面平面参数 & \cref{eq:qg-plane} \\
+${}_i^{\mathcal{O}}\boldsymbol{p}_{st\text{-}end}$ & 第 $i$ 腿最近支撑落点 & \cref{eq:qg-stend} \\
+$\mathbf{W}_{pla},\mathbf{W}_{pla}^{+}$ & 拟合设计矩阵 / 伪逆 & \cref{eq:qg-zW,eq:qg-ls} \\
+$\eta$ & 坡度低通系数（$=0.2$） & \cref{eq:qg-lpf} \\
+$\boldsymbol{n}_e,\boldsymbol{\xi}$ & 坡面单位法向 / 辅助向量 & \cref{eq:qg-normal,eq:qg-ne-decomp} \\
+${}_d\boldsymbol{x}^k,\mathbf{D}$ & 第 $k$ 周期 / 堆叠期望状态轨迹 & \cref{eq:qg-xdes,eq:qg-D} \\
+${}_i^{\mathcal{B}}\boldsymbol{p}_{hip}$ & 落足对称点（机身系） & \cref{eq:qg-symmetric} \\
+$\Delta\boldsymbol{p}_1\!\sim\!\Delta\boldsymbol{p}_4$ & 平动/转动/捕获点/向心修正 & \cref{eq:qg-dp12,eq:qg-dp3,eq:qg-dp4} \\
+${}_i^{\mathcal{O}}\boldsymbol{p}_{sw\text{-}end}$ & 第 $i$ 腿落足点（世界系） & \cref{eq:qg-foot-xy} \\
+${}_i^{\mathcal{O}}\boldsymbol{p}^{d}$ & 摆动足底期望轨迹 & \cref{eq:qg-pd} \\
+$\boldsymbol{f}_d,\mathbf{J}$ & 足端修正力 / 足端雅可比 & \cref{sec:qg-practice} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{公式速查表}
+\begin{tabular}{lll}
+\toprule
+公式 / 结论 & 一句话说明 & 对应 \\
+\midrule
+相位变量 \cref{eq:qg-leg-phase} & 全局相位减偏移、模 1 & \cref{ins:qg-clock} \\
+支撑布尔 \cref{eq:qg-stance-bool} & 本地相位 $\le\mathbf{G}_d$ 即支撑 $\Rightarrow s_i$ & \cref{ch:quad_mpc} 接触 \\
+偏航递推 \cref{eq:qg-yaw-recur} & ${}_d\psi^k={}_d\psi^{k-1}+\omega_z\Delta T$ & 质心轨迹 \\
+速度旋转 \cref{eq:qg-vel} & ${}_d^{\mathcal{O}}\boldsymbol{v}=\mathbf{R}_z(\psi){}_d^{\mathcal{B}}\boldsymbol{v}$ & 本体$\to$世界 \\
+堵转保护 \cref{eq:qg-pos1} & 期望位置凸组合实际位置 & \cref{ins:qg-antiwindup} \\
+平面最小二乘 \cref{eq:qg-ls} & $\mathbf{A}_{pla}=\mathbf{W}^{+}\boldsymbol{z}_f$ & \cref{thm:qg-ls} \\
+法向反解俯仰/横滚 \cref{eq:qg-pitch-roll} & $\phi=\arcsin\xi_2,\ \theta=\arctan(\xi_1/\xi_3)$ & 坡度 \\
+期望轨迹堆叠 \cref{eq:qg-D} & $\mathbf{D}=[{}_d\boldsymbol{x}^1;\dots;{}_d\boldsymbol{x}^h]$ & \cref{ins:qg-handoff} \\
+Raibert 速度补偿 \cref{eq:qg-raibert-vel} & 半支撑前馈 + 捕获点反馈 & \cref{ins:qg-half-stance,ins:qg-capture} \\
+Raibert 第一性推导 \cref{eq:qg-raibert-full} & 对称②④ + 相位外推 + 速度反馈 & \cref{deriv:qg-raibert-firstprinciple} \\
+trot 变体时序 \cref{eq:qg-trot-overlap,eq:qg-trot-offset} & $c=rP-P/2$、偏移恒 $P/2$ & \cref{exam:qg-trot-variants} \\
+极坐标旋转落点 \cref{eq:qg-rot-xy} & $x_f=R\cos\theta_f$、半径不漂移 & \cref{deriv:qg-rot-polar} \\
+落足合成 \cref{eq:qg-foot-xy} & 对称点 + 四项修正 & \cref{sec:qg-footstep} \\
+落足 $z$ \cref{eq:qg-foot-z} & 代回坡度平面 & \cref{ins:qg-slope-loop} \\
+点到点最优 \cref{eq:qg-st} & $x=3t^2-2t^3$（最小 jerk） & \cref{thm:qg-mincontrol} \\
+$z$ 分段摆线 \cref{eq:qg-z} & 抬腿/落腿各三次、峰点 $\dot z=0$ & \cref{ins:qg-cycloid} \\
+真摆线足底 \cref{eq:qg-cycloid-foot} & $z=z_0+\tfrac{h}{2}(1-\cos2\pi p)$、滚圆生成 & \cref{ins:qg-cycloid-why} \\
+摆动跟踪 \cref{sec:qg-practice} & $\boldsymbol{\tau}=\mathbf{J}^\top\boldsymbol{f}_d$ & \cref{ins:qg-jacobian} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 步态两层解耦 & 时序模式 vs 质心运动；接触序列=MPC 已知未来 & \(\bigstar\bigstar\) \\
+2 & 时间 vs 事件切换 & 确定性 vs 适应性；坡度估计补时差 & \(\bigstar\bigstar\) \\
+3 & 占空比—偏移量 & 钟表指针；类型与频率解耦 & \(\bigstar\bigstar\) \\
+4 & 相位变量与支撑布尔 & 单时钟$\to$四腿相位、支撑/摆动判定 & \(\bigstar\bigstar\bigstar\) \\
+5 & 质心轨迹生成 & 偏航递推、速度旋转、堵转保护凸组合 & \(\bigstar\bigstar\bigstar\) \\
+6 & 地形坡度估计 & 最小二乘平面、法向反解俯仰/横滚 & \(\bigstar\bigstar\bigstar\) \\
+7 & Raibert 落足 & 中性点 + 速度（半支撑+捕获点）+ 旋转 & \(\bigstar\bigstar\bigstar\) \\
+8 & 工程落足四项叠加 & 对称点 + 平动/转动/捕获/向心 + 坡度 $z$ & \(\bigstar\bigstar\bigstar\bigstar\) \\
+9 & Raibert 纯旋转缺陷 & 切向外推、半径漂移、须限幅 & \(\bigstar\bigstar\bigstar\) \\
+10 & 点到点最优轨迹 & 变分$\to\mathrm{d}^4x/\mathrm{d}t^4=0\to3t^2-2t^3$ & \(\bigstar\bigstar\bigstar\bigstar\) \\
+11 & 足底轨迹合成 & $x,y$ 三次、$z$ 分段摆线式 & \(\bigstar\bigstar\bigstar\) \\
+11b & 真摆线足底轨迹 & 滚圆$\to R(\theta-\sin\theta)$、缩放解绑高度/步长 & \(\bigstar\bigstar\bigstar\) \\
+12 & 摆动跟踪 & 足端 PD + $\mathbf{J}^\top$ 力转矩 & \(\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{落足启发式源头}：Raibert\cite{raibert1986legged}（\emph{Legged Robots That Balance}, 1986）——单/双足跳跃的落足启发式，本章 \cref{sec:qg-footstep} 三项分解的直接出处。
+  \item \textbf{捕获点与 LIPM}：Pratt 等\cite{pratt2006capture}（捕获点理论）与 Kajita 等\cite{kajita2001lipm}（LIPM）——本章速度反馈系数 $\sqrt{z_0/\|g\|}$ 与向心补偿的理论来源。
+  \item \textbf{一手工程推导}：于宪元《基于稳定性的仿生四足机器人控制系统设计》\cite{yu2021quadruped}（北航硕论，2021）——步态调度器、质心轨迹、坡度估计、落足四项叠加、摆动变分最优的完整推导，本章理论主线据此展开。
+  \item \textbf{工程落地与跟踪}：宇树《四足机器人控制算法》\cite{unitree2023quadruped}——步态分类直觉、trot 变体时序（\cref{exam:qg-trot-variants}）、中性点倒立摆力学（\cref{ins:qg-neutral-why}）、Raibert 落点第一性推导（平移 \cref{deriv:qg-raibert-firstprinciple} 与极坐标旋转 \cref{deriv:qg-rot-polar}）、真摆线足底轨迹（\cref{subsec:qg-true-cycloid}）、摆动腿 PD 跟踪 + $\boldsymbol{\tau}=\mathbf{J}^\top\boldsymbol{f}$，配套 \texttt{unitree\_guide} 开源代码。
+  \item \textbf{下游 MPC}：\cref{ch:quad_mpc}——本章产出的接触序列、期望轨迹 $\mathbf{D}$、落足点直接喂入单刚体凸 MPC。
+\end{itemize}
+
+\section*{本章与相关章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+相关章节 & 关系 & 本章接口 \\
+\midrule
+\cref{ch:rigid_body} 刚体运动 & 提供 ZYX 欧拉角、$\mathbf{R}_z(\psi)$ & \cref{eq:qg-vel,eq:qg-ne-decomp} \\
+\cref{ch:lie} 李群与李代数 & 提供 $\dot{\mathbf{R}}=\boldsymbol{\omega}^\wedge\mathbf{R}$、$(\cdot)^\wedge$ & \cref{deriv:qg-centripetal} \\
+\cref{ch:matderiv} 矩阵求导 & 提供二次型梯度（最小二乘） & \cref{deriv:qg-ls} \\
+\cref{ch:quad_kin} 浮动基运动学 & 提供逆运动学、足端雅可比 $\mathbf{J}$ & \cref{eq:qg-pd},\cref{sec:qg-practice} \\
+\cref{ch:quad_est} 足式状态估计 & 提供触地相位/足底接触估计 & \cref{ins:qg-time-vs-event} \\
+\cref{ch:quad_mpc} 单刚体 MPC & 消费接触序列 / $\mathbf{D}$ / 落足点 & \cref{ins:qg-known-future,ins:qg-handoff} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：崎岖地面落地\emph{冲击大 / 机身被顶}。\textbf{原因}：纯时间切换的时差（\cref{pit:qg-time-switch}）或坡度估计失效。\textbf{对策}：检查 \cref{eq:qg-foot-z} 是否真用了拟合坡度；增大坡度低通 $\eta$ 的响应（在噪声允许下）；考虑加足底接触估计（\cref{ch:quad_est}）。
+  \item \textbf{症状}：撞墙/堵转后机器人\emph{越推越猛、失控}。\textbf{原因}：堵转保护系数 $\varpi$ \emph{太接近 $1$}（趋于纯积分）或未启用凸组合（\cref{ins:qg-antiwindup}）。\textbf{对策}：\emph{减小} $\varpi$（留出更大的 $1-\varpi$ 权重跟随实际），把稳态误差界 $\frac{\|{}_d^{\mathcal{O}}\boldsymbol{v}_{com}^{0}\|\Delta T}{1-\varpi}$ 收紧、期望不无界前冲。
+  \item \textbf{症状}：原地转向时\emph{腿伸到极限 / 逆运动学无解}。\textbf{原因}：Raibert 纯旋转切向外推使落点超可达域（\cref{pit:qg-raibert-rot}）。\textbf{对策}：对落点相对髋的距离限幅；或改用 \cref{eq:qg-dp12} 的旋转矩阵式转动项 $\Delta\boldsymbol{p}_2$。
+  \item \textbf{症状}：摆动足\emph{踢绊地面 / 抬腿过高耗能}。\textbf{原因}：抬腿高 ${}_dh_{foot}$ 取值不当或 $z$ 未分段（\cref{ins:qg-cycloid}）。\textbf{对策}：按地形起伏调 ${}_dh_{foot}$；确认 \cref{eq:qg-z} 的分段与峰点速度连续生效。
+  \item \textbf{症状}：摆动足端\emph{跟踪滞后 / 落点偏}。\textbf{原因}：足端 PD 增益 $\boldsymbol{K}_p,\boldsymbol{K}_d$ 偏小或 $\mathbf{J}^\top$ 静力学近似在高速失准（\cref{sec:qg-practice}）。\textbf{对策}：增大足端 PD 增益；降低摆动速度或缩短摆动相。
+  \item \textbf{症状}：MPC 报\emph{接触模式异常 / 力分配错}。\textbf{原因}：调度器输出的 $s_i$ 与 MPC 预测时域不对齐（\cref{ins:qg-known-future}）。\textbf{对策}：核对 \cref{eq:qg-stance-bool} 在预测时域每步的取值，确认接触序列与 $\mathbf{B}_k$ 落足点一致。
+\end{enumerate}

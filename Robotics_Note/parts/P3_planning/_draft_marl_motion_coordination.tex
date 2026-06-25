@@ -1,0 +1,1529 @@
+\chapter{多机MARL运动协调}
+\label{ch:mr-marl-coord}
+
+% ════════════════════════════════════════════════════════════════
+%  全吸收章：重渲染 Tutorial 笔记
+%   - 04_移动机器人规控/50_多机器人协作/120_MARL多机运动协调.md
+%     （Dec-POMDP 运动建模 / 排列不变(Deep Sets) / 动作层级 / 奖励塑形(PBRS)
+%      / CTDE critic 喂料 / 三大应用+安全层 / MAPPO 训练 / 多机 sim-to-real / 选型）
+%  与 ch:plan-safemarl 去重：MARL 基础（CTDE/非平稳/信用分配/值分解/策略梯度/CBF）
+%     一律 \cref{ch:plan-safemarl} 指过去，不重讲。本章只讲“落到运动协调”的部分。
+%  与 ch:mr-consensus 去重：共识/ADMM/编队三范式 \cref 指过去。
+%  记号归一：R∈SO(3)、T∈SE(3)（preamble 宏 \SO \SE \so \se）；MARL/多机自然记号保留。
+%  源由 AI 生成，论文归属/年份/会议/数值/前沿编号存疑处就地 \pz/\rebuilt，并入 claims 台账。
+%  教学层遵循 v5.0 理论教学规范（动机→反面→历史→理论→陷阱→练习 + 误解汇总/小结/速查/排查）。
+% ════════════════════════════════════════════════════════════════
+
+\rebuilt{本章重渲染自 Tutorial 笔记《MARL 多机运动协调》，其源稿由 AI 撰写，论文归属、年份、会议/卷期与前沿工作（MQE、An--Hutter 可扩展协调、decPLM、MASQ、SeqWM、Dual-Quadruped Safe RL 等）的编号与实验数值可能有误。本章忠实重述、不擅自“修正”，逐处 \texttt{\textbackslash cite} 标源；存疑断言已登记 claims 台账，待联网核对后二次校验。}
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住（答不出 $\ge 2$ 题），先回 \cref{ch:plan-safemarl}（MARL 基础）补齐——本章默认你已掌握那些机制，直接在其上谈“怎么用到多机器人运动协调”。
+\begin{enumerate}
+  \item （接 \cref{ch:plan-safemarl}）CTDE（集中训练、分布执行）的两个“半”分别是什么？为什么“训练时让 critic 看全局、执行时让 actor 只看本地观测”能同时绕开非平稳性与部署时的通信约束？
+  \item （接 \cref{ch:plan-safemarl}）MAPPO 与 IPPO 的唯一结构差异是什么？参数共享在什么前提下合理、又在什么情况下有害？
+  \item （接 \cref{ch:plan-safemarl}）什么是信用分配问题？COMA 的反事实基线与 QMIX 的值分解分别从哪个角度缓解它？
+  \item 部分可观测（POMDP）下智能体拿到的“观测” $o$ 与真实“状态” $s$ 是什么关系？为什么多机器人天然部分可观测？
+  \item 传统 MAPF（\cref{ch:planning} 一侧的搜索/组合优化）把无碰撞作为\emph{硬约束}；而本章要让一个学出来的策略去避障，碰撞退化为\emph{软惩罚}。这两条路线在“碰撞保证”上的本质区别是什么？
+\end{enumerate}
+\noindent\emph{答案线索}：1,2,3 全部回 \cref{ch:plan-safemarl}（CTDE/参数共享/信用分配在那里推导）；4$\to$\cref{sec:mc-decpomdp}；5$\to$\cref{sec:mc-decpomdp} 与 \cref{sec:mc-apps}（软惩罚 vs 硬约束）。
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{建模}：把一个多机器人运动协调任务（导航/避障/编队）规范地写成 Dec-POMDP，能填出每个机器人的观测函数 $O_i$、动作空间 $\mathcal{A}_i$、单步奖励 $r_i$，并\textbf{论证}它为何在样本效率/可扩展性/部署可行性上全面优于“把 $N$ 个机器人拼成一个巨型 MDP”；
+  \item \textbf{设计可扩展观测}：理解固定槽位拼接为何随 $N$ 爆炸且不可迁移，\textbf{掌握并从零实现}排列不变（Deep Sets/mean/max/注意力）邻居编码器，把策略的有效搜索空间从对 $N$ 指数依赖降到多项式依赖；
+  \item \textbf{选动作层级}：判断协调发生在“机器人之间”还是“肢体之间”，据此在速度层与关节层之间取舍，理解分层架构如何让 MARL 只学协调、把本体运动交给下层控制器；
+  \item \textbf{塑形奖励}：辨析全局团队 / 个体局部 / 混合三种奖励结构的信用分配与协作取舍，\textbf{推导}势函数塑形（PBRS）保最优策略不变的定理，能诊断并修复“冻结/懒惰智能体/奖励黑客”三种病态；
+  \item \textbf{落地 CTDE}：说清在多机运动里中心化 critic 到底喂什么（真值状态 / 特权信息 / 排列不变聚合），并把 \cref{ch:plan-safemarl} 的 CTDE 原理串成一条完整的 MAPPO 数据流；
+  \item \textbf{应用与安全}：把通用接口特化到导航、避障、编队三类任务，理解软惩罚的固有不安全，掌握把控制障碍函数（CBF）/安全盾接到 learned policy 输出端的工程模式；
+  \item \textbf{迁移与选型}：列出多机比单机额外多出的 sim-to-real 维度（逐个体随机化、负载/接触力、通信延迟、数量随机化），理解“接触隐式通信”为何在真机更鲁棒，并\textbf{会做技术选型}——判断何时用纯 MARL、何时用传统规控、何时混合（为混合架构铺路）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是 \cref{ch:plan-safemarl}（合作 MARL 的学习框架）的\emph{应用延伸}。\cref{ch:plan-safemarl} 给了“学习器”（随机博弈、非平稳性、CTDE、值分解/策略梯度、信用分配），本章给“把学习器接到机器人运动上”的全部接口。主线一句话：\textbf{“别的机器人”这个动态、变长、无序的集合，到底该以什么形式进入一个机器人的决策回路}——观测层是排列不变聚合、奖励层是信用分配、训练层是中心化 critic 的喂料、迁移层是接触隐式通信，都是同一问题的不同面貌。
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4.5mm and 6mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  fin/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (model) {运动协调的\\ Dec-POMDP 建模};
+\node[grp, below left=10mm and -2mm of model] (obs) {观测\\ 排列不变(Deep Sets)};
+\node[grp, below=10mm of model] (act) {动作\\ 速度层 vs 关节层};
+\node[grp, below right=10mm and -2mm of model] (rew) {奖励\\ 混合 + PBRS};
+\node[blk, below=26mm of model, fill=main!8, draw=main!60!black] (ctde) {CTDE 落地\\ critic 喂什么};
+\node[grp, below left=10mm and 2mm of ctde] (app) {三大应用\\ 导航/避障/编队 + 安全层};
+\node[fin, below right=10mm and 2mm of ctde] (s2r) {多机 sim-to-real\\ + 选型/混合};
+\draw[ln] (model)--(obs); \draw[ln] (model)--(act); \draw[ln] (model)--(rew);
+\draw[ln] (obs.south) |- (ctde.west);
+\draw[ln] (act)--(ctde);
+\draw[ln] (rew.south) |- (ctde.east);
+\draw[ln] (ctde)--(app); \draw[ln] (ctde)--(s2r);
+\draw[ln] (app.east)--(s2r.west);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:mc-decpomdp}（建模）与 \cref{sec:mc-perminv}（排列不变）是必读地基——前者定义“我们到底在优化什么”，后者是多机 MARL 区别于单机 RL 的第一个、也是最重要的工程分水岭。\textbf{应用工程线}（会用就行）：\cref{sec:mc-decpomdp}$\to$\cref{sec:mc-perminv}$\to$\cref{sec:mc-action}$\to$\cref{sec:mc-reward}$\to$\cref{sec:mc-train}$\to$\cref{sec:mc-sim2real}。\textbf{原理深入线}（理解为什么）：\cref{sec:mc-decpomdp}$\to$\cref{sec:mc-perminv}$\to$\cref{sec:mc-reward}$\to$\cref{sec:mc-ctde}$\to$\cref{sec:mc-apps}$\to$\cref{sec:mc-boundary}。带（选读）色彩的注意力聚合细节、残差混合可首读略过。
+
+\subsection*{前置知识桥接}
+本章重度依赖 \cref{ch:plan-safemarl}（MARL 基础）与 \cref{ch:mr-consensus}（共识/分布式优化），重叠处一律 交叉引用 指过去、不重复：
+\begin{itemize}
+  \item \textbf{CTDE 是本章一切训练的底座}（\cref{ch:plan-safemarl} 的 \nameref{ch:plan-safemarl} 已证：多智能体一起学习会让单智能体 RL 的收敛保证失效——非平稳性，而 CTDE 用“训练时集中 critic 看全局、执行时 actor 只看本地”绕开它）。本章不再重推这个结论，而直接问：\textbf{在多机器人运动协调里，那个“全局”具体是什么？} 答案不唯一（真值状态、特权信息、排列不变聚合），\cref{sec:mc-ctde} 讲清。一句话：CTDE 给了“训练时可作弊、执行时必自立”的许可证，本章去\emph{用}这张许可证。
+  \item \textbf{MAPPO 是本章默认的训练算法}：一个共享参数的 PPO actor $\pi_\theta(a_i\mid o_i)$（所有同质机器人共用）$+$ 一个吃全局信息的中心化 critic $V_\phi(s)$。\cref{ch:plan-safemarl} 已论证它是合作 MARL 最强基线之一\cite{yu2022mappo}；本章所有实战（\cref{sec:mc-train}）默认用 MAPPO，并在其上叠加多机运动特有的观测/动作/奖励设计。需要值分解（VDN/QMIX\cite{sunehag2018vdn,rashid2018qmix}）的场合本章会指出，但主线是策略梯度路线。
+  \item \textbf{信用分配贯穿奖励设计}：\cref{ch:plan-safemarl} 在\emph{算法侧}缓解信用分配（COMA 反事实基线\cite{foerster2018coma}、QMIX 值分解），本章 \cref{sec:mc-reward} 的奖励塑形在\emph{问题侧}缓解（用个体局部奖励直接给每个机器人可归因的信号）。两条路互补、常同时用。
+  \item \textbf{离散决策层与连续运动层的分工}：\cref{ch:planning} 一侧解决“谁去做哪件任务”与“怎样不撞上（MAPF）”这两个\emph{离散决策}问题，碰撞是\emph{硬约束}。本章处理其下的\emph{连续运动协调}：机器人已知大致去哪，但要在连续状态空间里实时协调速度、躲避彼此、维持队形，且用\emph{学出来的策略}，碰撞退化为\emph{软惩罚}。两者不是替代关系，常分层协作（\cref{sec:mc-boundary}）。
+  \item \textbf{共识与编队三范式}（\cref{ch:mr-consensus}）：本章的“学习式编队”与那里的“模型驱动编队（共识/分布式 MPC）”是数据驱动 vs 模型驱动的对照（\cref{sec:mc-boundary} 的残差混合可让 MPC 出基线、MARL 学修正）。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item \textbf{“训练时两个机器人好好的，加到四个就全乱了”}：你用 \cref{ch:plan-safemarl} 学的 MAPPO 训了双机导航，观测里把队友位置按固定槽位拼进去。两机时一切完美；扩到四机，网络输入维度变了必须重训，且策略对“哪个队友排第几槽位”敏感——交换两个队友编号、输出竟变了。根因是没用\emph{排列不变}观测（\cref{sec:mc-perminv}）。
+  \item \textbf{“碰撞惩罚一调大，机器人就全冻在原地不动了”}：你把碰撞惩罚调大，机器人学会“待在原地永远不撞、惩罚为零”，放弃了任务奖励。这是奖励塑形最经典的病态——安全惩罚压过任务激励，最优策略退化成“什么都不做”（\cref{sec:mc-reward}）。
+  \item \textbf{“仿真里编队走得漂亮，搬到真机就散架了”}：根因是多机 sim-to-real 比单机多出好几个维度的现实差距（每机电机延迟/摩擦各不相同、接触力建模不准、机间接触力差异巨大）。\cref{sec:mc-sim2real} 给一份多机域随机化清单，讲清为何“接触隐式通信”更鲁棒。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\label{tab:mc-reading}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导与练习） & 15--21 小时 & 第一次系统学 MARL 在多机运动上的落地 \\
+速读（读结论与设计表，跳代码细节） & 5--7 小时 & 已掌握 \cref{ch:plan-safemarl}、想建立“怎么用到运动”的全局图景 \\
+速查（看设计表 $+$ DR 清单 $+$ 安全层接法 $+$ 故障排查） & 50--60 分钟 & 已学过、回来查特定设计 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+旋转矩阵记 $\mathbf{R}\in\SO(3)$、位姿 $\mathbf{T}\in\SE(3)$（preamble 宏 $\SO,\SE,\so,\se$，与全书一致，\nameref{ch:notation}）；MARL/多机领域的自然记号保留，并与 \cref{ch:plan-safemarl} 一致。
+机器人（智能体）数 $N$，下标 $i$（“自己”）、$j$（“队友”）；全局真值状态空间 $\mathcal{S}$、状态 $s$；机器人 $i$ 的本地观测 $o_i$、观测函数 $o_i=O_i(s)$；动作 $a_i$、动作空间 $\mathcal{A}_i$、联合动作 $\mathbf{a}=(a_1,\dots,a_N)$；单步奖励 $r_i$、团队奖励 $r^{\text{team}}$；折扣 $\gamma$。
+共享参数 actor $\pi_\theta$、中心化 critic $V_\phi(s)$；自身观测分量 $o_i^{\text{self}}$、队友相对观测 $o_{ij}^{\text{nbr}}$；排列不变的逐元素编码器 $\phi_{\mathrm{enc}}$、后处理 $\rho$、对称聚合算子 $\oplus$；目标 $g_i$、势函数 $\Phi(s)$、CBF 标量函数 $h(x)$、机间距 $d_{ij}$、安全距离阈值 $d_{\text{safe}}$。
+\textbf{字母隔离声明}：本章 $\Phi$ 指势函数（非位姿）、$\rho$ 在 \cref{sec:mc-perminv} 指 Deep Sets 后处理网络（非密度/谱半径）、$\alpha$ 在 \cref{sec:mc-apps} 指 CBF 的 class-$\mathcal{K}$ 系数（非学习率），均仅本章局部生效。学习率记 $\eta$。
+\end{note}
+
+\subsection*{科研发展脉络}
+多机运动协调的 MARL 化大致沿一条清晰主线推进：\textbf{从“在抽象游戏里验证 MARL 算法”，到“在有物理的多机器人导航/避障上学策略”，再到“在真实多足/多机器人上学协同运动并迁移真机”}。
+
+\begin{table}[H]\centering\small
+\caption{多机运动协调 MARL 化的代表工作（年份/会议以源稿为准，待核）}
+\label{tab:mc-history}
+\begin{tabular}{p{0.07\linewidth}p{0.30\linewidth}p{0.10\linewidth}p{0.40\linewidth}}
+\toprule
+年份 & 工作 & 出处 & 核心贡献 \\
+\midrule
+2017 & Zaheer 等（Deep Sets） & NeurIPS & 排列不变函数表示定理——处理集合不需排序/RNN，只需“逐元素编码 $+$ 对称聚合” \\
+2018 & Long, Fan, Pan 等 & ICRA & 去中心化避障的 RL 化奠基：本地激光 $+$ 邻居相对状态，端到端学分布式避障，\emph{无需通信} \\
+2017 & Lowe, Mordatch 等（MADDPG） & NeurIPS & CTDE 范式奠基（\cref{ch:plan-safemarl} 已讲）：集中 critic $+$ 去中心 actor \\
+2018 & Everett, Chen, How（GA3C-CADRL） & IROS/IJRR & 多机社会化导航：LSTM/注意力处理变长邻居集合，社会礼貌编入奖励 \\
+2024 & Xiong 等（MQE） & IROS & 多四足 MARL 标准基准（cooperative\_transport/formation/chase），GPU 大规模并行 \\
+2024 & An, Hutter 等 & RSS & 排列不变网络：多机协作策略天然对队友排列不变，从 $2$ 到 $N$ 零样本可扩展 \\
+2025 & Pandit, Shrestha, Fern 等（decPLM） & arXiv & $N$ 台四足-臂\emph{零通信}协同搬运（pinch-lift-move），分层策略 $+$ constellation 奖励，仅靠接触力协调，真机迁移 \\
+2025 & An, Hutter 等 & RA-L & 可扩展多足协调：系统化从 $2$ 扩到 $N$，量化可扩展性 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{关键脉络}：早期（2017 前后）证明“去中心化避障/导航可端到端学出来、且不需要通信”；中期（2018--2020）在导航上加入对\emph{变长邻居集合}的处理（LSTM、注意力），开始触及可扩展性；近两年（2024--2025）随 GPU 大规模并行仿真成熟，重心转向多足/多机器人协同运动，并把\emph{排列不变性}确立为可扩展的关键技术、把\emph{多机 sim-to-real}（尤其接触力建模与零通信协调）确立为最硬的开放问题。
+
+\begin{insight}[整章的统一主题]
+多机运动协调的 MARL，难点几乎从不在“单个机器人怎么动”（那是单机 RL 的事），而在“怎么表示和利用‘其他机器人’这个动态、变长、无序的集合”。整章你会反复看到同一个主题以不同面貌出现：观测层是排列不变聚合（\cref{sec:mc-perminv}）、奖励层是信用分配（\cref{sec:mc-reward}）、训练层是中心化 critic 的喂料（\cref{sec:mc-ctde}）、迁移层是接触隐式通信（\cref{sec:mc-sim2real}）——它们都在回答同一个问题：\textbf{“别的机器人”这个信息，到底该以什么形式进入一个机器人的决策回路。}
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{运动协调的 Dec-POMDP 建模}
+\label{sec:mc-decpomdp}
+
+\paragraph{动机：一群机器人在共享空间里运动，到底在求解什么？}
+设想三个场景：仓库地面上 $4$ 台移动机器人各自去货架取货，共享同一片地面，会在过道相遇、路口可能撞上、窄通道得互相礼让（\textbf{导航/避障}）；$4$ 台四足机器人抬一块大板子一起走，既要往目标前进、又要维持矩形队形不让板子翻掉（\textbf{编队/协同搬运}）；一群无人机穿过有静态障碍的空域，彼此不相撞、尽快到各自终点。这三类任务看似不同，却共享同一个数学骨架——有 $N$ 个\emph{决策者}，每个只\emph{看得到局部}，动作\emph{通过共享物理世界相互影响}，有用奖励表达的\emph{目标}，且是\emph{序贯}问题。这五条恰好是一个\emph{部分可观测随机博弈}的定义要件。
+
+\begin{insight}[与离散多机问题的本质区别]
+\cref{ch:planning} 一侧的任务分配（指派问题）与 MAPF 也是多机问题，但它们\textbf{离散、可一次性算完}——分配是静态匹配，MAPF 是在已知地图上一次性搜出所有路径。本章的运动协调不同：它是\textbf{连续状态空间里、随时间持续展开、每个智能体只看局部}的序贯决策。这个差别决定了为什么前者用搜索/组合优化、后者用强化学习——不是“哪个更先进”，而是问题结构本就不同。
+\end{insight}
+
+\paragraph{反面：把 $N$ 个机器人拼成一个巨型 MDP 会怎样。}
+最朴素的办法是\emph{联合学习（joint learning）}：把 $N$ 个机器人看成一个“超级机器人”，状态是所有机器人状态的拼接、动作是所有动作的拼接，用单智能体 RL（\cref{ch:plan-safemarl} 之前学的 PPO/SAC）去训。理论上没错（它是标准 MDP），但有三个致命问题，每一个都足以让它在真实系统上不可用：
+
+\begin{enumerate}
+  \item \textbf{动作空间随 $N$ 指数爆炸}。离散情形下每机 $|\mathcal{A}|$ 个动作，$N$ 机的联合动作空间是 $|\mathcal{A}|^N$：$4$ 机 $\times 7$ 动作即 $7^4=2401$；$10$ 机即 $7^{10}\approx 2.8\times10^8$。连续动作下维度线性增长看似温和，但策略要在高维联合空间里探索，样本复杂度同样急剧恶化。
+  \item \textbf{要求全局通信，部署做不到}。超级机器人需在每步收集所有机器人状态、算联合动作、再分发回去，运行时必须有能与所有机器人实时通信的中央节点。但真实部署（仓库 AGV、无人机蜂群、野外多足）里通信有延迟、会丢包、甚至完全没有——通信一断就整体瘫痪。
+  \item \textbf{完全不可扩展、不可迁移}。网络输入输出维度被 $N$ 焊死，训练 $4$ 机、部署来第 $5$ 个就得整体重训。
+\end{enumerate}
+
+\begin{insight}[联合学习的三个问题是结构性代价，CTDE 是解药]
+动作爆炸、要求全局通信、不可扩展，不是实现层面的小毛病，而是“把多智能体问题硬塞回单智能体框架”的结构性代价。CTDE 的全部价值就在于\textbf{把这三个问题留在训练阶段、而让执行阶段干净地去中心化}——训练时可在仿真里开天眼（不在乎全局通信，因为是离线的），执行时每个机器人只用本地观测自己的 actor（动作空间是单机的 $|\mathcal{A}_i|$、不需通信、换几个机器人都行）。这是 \cref{ch:plan-safemarl} 那张 CTDE“许可证”在本章兑现的第一笔价值。
+\end{insight}
+
+\paragraph{历史：从 Markov Game 到 Dec-POMDP，再到机器人运动。}
+把“多个决策者在共享环境里序贯交互”形式化的源头是 1994 年 Littman 的\emph{马尔可夫博弈}\cite{littman1994markov}（\cref{ch:plan-safemarl} 已讲），但它默认每个智能体能观测全局状态，对机器人不成立。更贴合机器人现实的是 Bernstein 等 2002 年形式化的 \emph{Dec-POMDP}\cite{bernstein2002decpomdp}——在 Markov Game 上加“部分可观测”，每个智能体只能通过自己的观测函数看到状态的一部分。Dec-POMDP 一般性极强但极难（最优求解 NEXP-完全，比 NP 还难）；好在我们不追求精确最优，而用 MARL（CTDE/MAPPO）在仿真里\emph{近似}地学一个好策略。到了机器人领域，2017 年前后 Long/Fan/Pan 等的去中心化避障工作是关键一步\cite{long2018collision}：第一次令人信服地证明，\textbf{一个完全去中心化、只用本地观测、无需通信的避障策略，可端到端学出来并在真实多机器人上跑}，把 Dec-POMDP 从理论框架变成可落地的机器人方案。
+
+\subsection{理论：运动协调 Dec-POMDP 的精确定义}
+\label{sec:mc-decpomdp-def}
+
+一个多机器人运动协调任务被建模为一个 Dec-POMDP，由元组
+\begin{equation}
+  \mathcal{M}=\big\langle\, N,\ \mathcal{S},\ \{\mathcal{A}_i\}_{i=1}^N,\ P,\ \{O_i\}_{i=1}^N,\ \{r_i\}_{i=1}^N,\ \gamma \,\big\rangle
+  \label{eq:mc-decpomdp}
+\end{equation}
+描述\cite{bernstein2002decpomdp}。逐项解释每个元素在多机器人运动协调里的具体含义——这张“对应表”是后续所有设计的导航图：
+
+\begin{table}[H]\centering\small
+\caption{Dec-POMDP 元组在多机器人运动协调里的实例化}
+\label{tab:mc-decpomdp}
+\begin{tabular}{p{0.10\linewidth}p{0.26\linewidth}p{0.42\linewidth}p{0.13\linewidth}}
+\toprule
+元素 & 数学含义 & 在多机器人运动协调里是什么 & 本章哪节填充 \\
+\midrule
+$N$ & 智能体数量 & 机器人数量（希望策略对 $N$ 可扩展） & \cref{sec:mc-perminv} \\
+$\mathcal{S}$ & 全局状态空间 & 所有机器人位姿/速度 $+$ 障碍 $+$ 目标 $+$ 负载状态（真值，仅训练可用） & \cref{sec:mc-ctde} \\
+$\mathcal{A}_i$ & 智能体 $i$ 的动作空间 & 机器人 $i$ 能下的指令：速度指令 / 关节位置偏移 & \cref{sec:mc-action} \\
+$P(s'\mid s,\mathbf{a})$ & 转移核，依赖联合动作 $\mathbf{a}$ & 物理引擎/真实动力学：所有动作共同决定下一状态 & 仿真器/真机实现 \\
+$O_i(s)$ & 智能体 $i$ 的观测函数 & 机器人 $i$ 的传感器：本体感知 $+$ 邻居相对状态 $+$ 局部障碍 $+$ 目标 & \cref{sec:mc-perminv} \\
+$r_i(s,\mathbf{a})$ & 智能体 $i$ 的奖励 & 到达目标 $+$ 维持队形 $-$ 碰撞 $-$ 控制代价 等的加权 & \cref{sec:mc-reward} \\
+$\gamma$ & 折扣因子 & 通常 $0.99$ 左右，权衡即时与长期 & 训练超参 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 几个必须讲清的细节：
+
+\textbf{（1）观测 $o_i=O_i(s)$ 是状态的有损函数。} 机器人 $i$ 拿到的不是 $s$，而是 $s$ 经传感器这个“有损通道”后的结果。损失是双重的：一是\emph{空间局部性}（只看得见附近，看不见远处机器人和障碍），二是\emph{信息缺失}（看得见队友位置，但看不见队友的速度意图、看不见队友奖励里在乎什么）。后者是多机器人特有的难点——你的队友也在学习、也在变策略，但你看不到它的“脑子”，这正是非平稳性在观测层的体现。
+
+\textbf{（2）转移 $P$ 依赖联合动作，这是“博弈”二字的来源。} 单智能体 MDP 里 $P(s'\mid s,a)$ 只依赖自己的动作；这里 $P(s'\mid s,\mathbf{a})$ 依赖所有人的动作 $\mathbf{a}=(a_1,\dots,a_N)$。即使 $i$ 的动作 $a_i$ 完全不变，只要队友改了策略，$i$ 经历的状态转移分布就变了——从 $i$ 单方面视角看，环境是非平稳的。这正是 \cref{ch:plan-safemarl} 反复强调、并用 CTDE 对治的核心困难，本章默认你已理解，不再重推。
+
+\textbf{（3）奖励可个体亦可共享。} \cref{eq:mc-decpomdp} 写成每智能体一个 $r_i$（最一般、能表达竞争）。合作型运动协调常让所有人共享同一团队奖励 $r_1=\dots=r_N=r^{\text{team}}$，或混合（个体部分 $+$ 共享部分）。奖励结构直接决定涌现的是协作还是各自为政——\cref{sec:mc-reward} 的核心，这里先埋下。
+
+\textbf{（4）要优化的“解”是什么？} 是一组\emph{去中心化策略} $\{\pi_i(a_i\mid\tau_i)\}$，其中 $\tau_i$ 是 $i$ 的本地观测-动作历史（部分可观测下一般要用历史，工程上常用当前观测 $+$ 一点记忆近似）。目标是最大化折扣累积团队回报的期望。注意“去中心化”写进了解的结构——每个 $\pi_i$ 只能依赖 $i$ 自己的信息。这与联合学习“一个看全局的大策略”根本对立，也是 CTDE 之所以必要的原因：我们想要去中心化的\emph{解}，却又想在\emph{训练}时利用全局信息稳定学习。
+
+\begin{table}[H]\centering\small
+\caption{为什么 Dec-POMDP $+$ CTDE 优于联合 MDP（三点对照）}
+\label{tab:mc-vs-joint}
+\begin{tabular}{p{0.18\linewidth}p{0.36\linewidth}p{0.38\linewidth}}
+\toprule
+维度 & 联合 MDP（超级机器人） & Dec-POMDP $+$ CTDE（本章） \\
+\midrule
+动作空间 & $|\mathcal{A}|^N$ 指数爆炸 & 每个 actor 只管单机 $|\mathcal{A}_i|$ \\
+部署通信 & 必须全局实时通信 & 各自本地观测，零运行时通信 \\
+可扩展性 & $N$ 焊死，换数量要重训 & 配合排列不变可零样本扩展（\cref{sec:mc-perminv}） \\
+样本效率 & 在 $N$ 倍维度空间探索 & 参数共享 $+$ 单机动作空间，高效 \\
+训练稳定性 & 标准单智能体保证 & 靠 CTDE 中心化 critic 恢复（\cref{sec:mc-ctde}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 代价是 Dec-POMDP 本身极难（NEXP-完全），我们放弃精确最优、用 MARL 近似。但对工程而言，“一个可部署、可扩展、样本高效的好策略”远胜于“一个理论最优但不可部署的方案”。
+
+\subsection{代码验证：把建模写成环境接口}
+\label{sec:mc-decpomdp-code}
+
+把这个 Dec-POMDP 建模“实例化”成一个环境接口骨架（教学简化，剥离物理引擎细节，只保留 Dec-POMDP 结构，与 PettingZoo 风格兼容），让你看清“建模的每个元素”如何落成可调用的方法。
+
+\begin{codebox}[Python]{多机器人运动协调环境（体现 Dec-POMDP 结构）}
+import numpy as np
+
+class MultiRobotCoordEnv:
+    """把 <N, S, {A_i}, P, {O_i}, {r_i}, gamma> 落成接口（教学简化版）。"""
+    def __init__(self, n_robots=4, world_size=10.0, dt=0.1):
+        self.N = n_robots                  # 元组里的 N
+        self.world_size, self.dt = world_size, dt
+        self.pos = self.vel = self.goal = None
+        self.sense_radius = 3.0            # 传感半径：观测的"有损通道"由它决定
+
+    def reset(self):
+        rng = np.random.default_rng()
+        self.pos  = rng.uniform(0, self.world_size, size=(self.N, 2))
+        self.goal = rng.uniform(0, self.world_size, size=(self.N, 2))
+        self.vel  = np.zeros((self.N, 2))
+        return self._get_obs_all()         # 每个 agent 的本地观测 o_i
+
+    def global_state(self):
+        """全局真值状态 s——仅训练时供中心化 critic 用（CTDE）。
+        执行时禁止调用：actor 只能用 _get_obs_all() 的本地观测。"""
+        return np.concatenate([self.pos.reshape(-1),
+                               self.vel.reshape(-1), self.goal.reshape(-1)])
+
+    def _get_obs_i(self, i):
+        """观测函数 O_i(s)：本地、部分可观测视角。
+        = 自身(到目标相对向量 + 自身速度) + 可见邻居的相对状态。"""
+        self_part = np.concatenate([self.goal[i] - self.pos[i], self.vel[i]])
+        nbr_parts = []
+        for j in range(self.N):
+            if j == i:
+                continue
+            rel = self.pos[j] - self.pos[i]
+            if np.linalg.norm(rel) <= self.sense_radius:   # 只看得见半径内队友
+                nbr_parts.append(np.concatenate([rel, self.vel[j] - self.vel[i]]))
+        # nbr_parts 是"变长、无序"的集合——这正是下一节要处理的核心
+        return {"self": self_part, "neighbors": nbr_parts}
+
+    def _get_obs_all(self):
+        return [self._get_obs_i(i) for i in range(self.N)]
+
+    def step(self, actions):
+        """转移 P(s'|s, a)：联合动作共同决定下一状态。
+        actions[i] = 机器人 i 的 (ax, ay) 加速度指令。"""
+        actions = np.asarray(actions).reshape(self.N, 2)
+        self.vel = self.vel + actions * self.dt          # 简化点质量动力学
+        self.pos = self.pos + self.vel * self.dt
+        return self._get_obs_all(), self._compute_rewards(), self._check_done(), {}
+
+    def _compute_rewards(self):
+        """奖励 r_i：到达(-距离) - 碰撞 - 控制代价。下一节会大改这里。"""
+        rewards = np.zeros(self.N)
+        for i in range(self.N):
+            rewards[i] += -0.1 * np.linalg.norm(self.goal[i] - self.pos[i])
+            for j in range(self.N):
+                if j != i and np.linalg.norm(self.pos[j] - self.pos[i]) < 0.5:
+                    rewards[i] += -10.0          # 碰撞惩罚（软惩罚！见安全层一节）
+        return rewards
+
+    def _check_done(self):
+        return [np.linalg.norm(self.goal[i] - self.pos[i]) < 0.3
+                for i in range(self.N)]
+\end{codebox}
+
+这段代码把 Dec-POMDP 每个元素都对应到一个方法：\verb|_get_obs_i| 是观测函数 $O_i$，\verb|step| 里的动力学是转移 $P$，\verb|_compute_rewards| 是奖励 $r_i$，\verb|global_state| 是仅训练可用的全局状态 $s$。\textbf{请特别注意 \texttt{\_get\_obs\_i} 返回的 \texttt{neighbors} 是变长、无序的列表}——这一个细节，就是整个 \cref{sec:mc-perminv} 存在的理由：策略必须能吃下“长度不定、顺序无关”的邻居集合。
+
+\begin{pitfall}[编程陷阱：执行时偷偷在 actor 里调用了 \texttt{global\_state()}]
+\textbf{错误做法}：图省事给 actor 也喂全局状态（“反正环境里有这个方法”），训练曲线很漂亮、成功率很高。\textbf{现象}：仿真里完美，一上真机（或一旦没有中央通信）策略直接失效——真机上每个机器人拿不到 \verb|global_state()|，actor 输入分布和训练时完全不同，输出垃圾动作。\textbf{根本原因}：违反 CTDE 铁律——critic 可用全局状态，actor 绝不可以。CTDE 的全部价值就在“训练作弊、执行自立”，actor 用了全局就把“执行自立”丢了，退化成不可部署的联合方案。\textbf{正确做法}：用代码强制隔离——actor 的 \verb|forward| 只接收 $o_i$，critic 的 \verb|forward| 才接收 $s$，让“actor 用全局”成为类型层面的错误；可在部署模式下让 \verb|global_state()| 抛异常，任何 actor 路径触发立刻暴露。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：以为“部分可观测”只是“传感器有噪声”]
+\textbf{新手想法}：“观测就是状态加点高斯噪声 $o_i\approx s+\boldsymbol{\epsilon}$，本质上还是能看到全局。”\textbf{实际上}：部分可观测的核心不是噪声，而是\emph{信息缺失}和\emph{局部性}。机器人 $i$ 根本看不到三公里外的机器人 $k$——这不是“看得不准”，是“完全看不到”；更要命的是它看不到队友的\emph{意图}（下一步想往哪走、策略是什么）。把部分可观测误解成“加噪声”，会让你低估问题难度、设计出依赖“其实能恢复全局”的错误方案。\textbf{为什么重要}：正因信息是真的缺失，才需要 (a) 排列不变地处理“我能看到的那部分队友”（\cref{sec:mc-perminv}）；(b) 用历史/记忆推断看不到的部分（POMDP 要用 $\tau_i$ 而非 $o_i$）；(c) CTDE 在训练时用全局 critic 补上 actor 看不到的信息（\cref{sec:mc-ctde}）。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：认为“既然是多智能体，就一定要用最复杂的 MARL 算法”]
+\textbf{新手想法}：“这是多机器人协调，得上 QMIX/QPLEX/MAPPO$+$注意力$+$通信这些最 fancy 的东西才配得上问题难度。”\textbf{实际上}：建模（这一节）和算法（\cref{ch:plan-safemarl}）是两件事。很多多机运动协调任务，用最朴素的“MAPPO $+$ 参数共享 $+$ 排列不变观测”就能解得很好，甚至 IPPO（连中心化 critic 都不要）在弱耦合任务上就够用。算法复杂度应由\emph{任务的耦合强度}决定，而非由“这是多智能体”这个标签决定。\textbf{正确思维}：先判断耦合强度——强物理耦合（一起抬一个刚体，一个动全身动）还是弱耦合（各走各的偶尔避让）？弱耦合 $\to$ IPPO 常够；强耦合 $\to$ 才需中心化 critic、值分解、甚至显式通信。永远先跑一个朴素基线，不够了再加复杂度。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （建模题）把“$3$ 台无人机穿过有 $5$ 个静态圆柱障碍的空域、各自飞到指定终点、彼此不相撞”写成 \cref{eq:mc-decpomdp} 的 Dec-POMDP 元组：(a) 状态 $\mathcal{S}$ 含哪些量；(b) 观测 $O_i$ 应含哪些部分（本体 $+$ 邻居 $+$ 障碍 $+$ 目标）、为什么障碍也要进观测；(c) 动作 $\mathcal{A}_i$ 选速度层还是加速度层、为什么；(d) 奖励 $r_i$ 各项。
+  \item （改写题）把 \verb|MultiRobotCoordEnv._get_obs_i| 改写为同时支持“障碍观测”：环境新增 \verb|self.obstacles|（一组 $(x,y,r)$），观测里加入“半径内最近 $K$ 个障碍的相对位置”。思考：障碍数也是变长的，你打算怎么处理这个变长集合？（为 \cref{sec:mc-perminv} 埋伏笔。）
+  \item （思辨题）\cref{ch:planning} 一侧用 MAPF（搜索）解多机无碰撞路径，本章用 MARL（学习）解多机避障。从三维度对比：(a) 碰撞保证（硬约束 vs 软惩罚）；(b) 对环境变化的适应性；(c) 计算发生的时机（规划时一次性算 vs 执行时实时推理）。最后回答：什么任务优先选 MAPF、什么优先选 MARL、什么想结合（指向 \cref{sec:mc-boundary}）？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{观测表示与排列不变性}
+\label{sec:mc-perminv}
+
+\paragraph{动机：邻居是一个集合，不是一个列表。}
+\cref{sec:mc-decpomdp-code} 的 \verb|_get_obs_i| 留下一个刺眼的尾巴——每个机器人观测里的“邻居集合”是\textbf{变长、无序}的。回到 $4$ 机仓库场景：机器人 $i$ 在某时刻看到附近 $3$ 个队友，下一时刻可能走远一个剩 $2$ 个、又靠近一个变 $4$ 个，“邻居”这部分长度\emph{一直在变}。更微妙的是这 $3$ 个队友\emph{没有天然顺序}——对 $i$ 而言，重要的是“我周围有这么几个队友、各自在什么相对位置、以什么相对速度运动”，至于先数哪个后数哪个完全无所谓。把队友 $A$ 和 $B$ 在观测里的位置对调，$i$ 该做的决策应当\emph{一模一样}（物理世界没变，只是数它们的顺序变了）。这两个性质——\textbf{变长}与\textbf{无序}——合起来说明：邻居是一个\emph{集合（set）}，不是\emph{列表（list）}。而几乎所有标准神经网络（MLP、CNN）的输入都是有固定维度、有固定顺序的张量（“列表”）。直接把集合硬塞进列表式网络，就是一切麻烦的根源。
+
+\paragraph{反面：固定槽位拼接。}
+最朴素、新手几乎必然第一次会写的办法：给每个队友分配固定槽位，按编号拼进观测向量（\verb|obs_i = concat([self, nbr_1, nbr_2, nbr_3])| 喂给普通 MLP）。它在双机、且数量永不变时勉强能用，但有三个层层递进的致命缺陷：
+
+\begin{enumerate}
+  \item \textbf{输入维度被 $N$ 焊死，不可扩展}。槽位数等于队友数；训练 $4$ 机（$3$ 槽位）、部署 $6$ 机（$5$ 槽位）则输入层维度变了、整网作废、必须重训。
+  \item \textbf{对排列敏感，浪费样本}。把队友 $A$ 放槽位 $1$、$B$ 放槽位 $2$，和反过来，对 MLP 是\emph{两个完全不同的输入}、算出\emph{两个不同输出}；但物理上一模一样！网络必须额外耗费大量样本去学“槽位 $1$ 和 $2$ 应被对称对待”这件\emph{本不该学、本应由架构保证}的事。这是巨大的样本浪费，且学不彻底。
+  \item \textbf{槽位分配本身无解}。可见队友数少于槽位数怎么办（补零会被误解成“有个队友在原点”）？多于槽位数怎么办（截断哪几个）？哪个队友进哪个槽位（任何排序规则都在往无序集合里强加顺序）？这些问题没有干净答案，因为问题本身被错误建模——你在用列表的工具处理集合的对象。
+\end{enumerate}
+
+\begin{insight}[对比性思维（反事实）：不解决排列不变会怎样]
+若不解决排列不变性：你的策略会把 $50\%$ 以上的训练样本浪费在学习一个数学上本该恒等的对称性上；策略永远绑死在训练时的机器人数量上；你会陷入“补零还是截断”的无解工程泥潭。排列不变的观测表示不是一个“锦上添花的优化”，而是多机 MARL 可扩展、样本高效的\textbf{必要条件}。
+\end{insight}
+
+\paragraph{历史：从 LSTM/注意力硬扛，到 Deep Sets 从架构根除。}
+处理“变长邻居集合”，机器人 MARL 走过一条清晰的进化路线。\emph{早期（2018--2020，硬扛阶段）}：把邻居先按某种规则排序（如按距离从近到远），再用 LSTM/RNN 顺序“读”进去，或用注意力对邻居加权求和；Everett/Chen/How 的 CADRL/GA3C-CADRL 系列就是代表\cite{everett2018cadrl}。这能处理变长，但排序仍在往集合里强加顺序，且 RNN 的顺序处理引入了与物理无关的“先后”偏置。\emph{中期（Deep Sets，2017，理论根除）}：Zaheer 等给出漂亮的表示定理\cite{zaheer2017deepsets}——\textbf{任何对集合的排列不变函数，都可写成“对每个元素先做同一变换、再做排列不变聚合（如求和）、最后再做一个变换”的形式}，从根本上告诉我们处理集合不需排序、不需 RNN。\emph{近期（2024--2025，机器人多机协调主流）}：An、Hutter 等把排列不变网络确立为多机协作策略可扩展到任意 $N$ 的关键技术\cite{an2024perminv}——训练 $N{=}2$、部署 $N{=}10$ 零样本可扩展，正是靠排列不变。
+
+\begin{insight}[排列不变把搜索空间从指数压到多项式]
+排列不变性把策略/价值函数的有效搜索空间，从对智能体数量 $N$ 的指数依赖降到多项式依赖。直觉：不利用对称性，网络要分别学习每一种“哪个队友在哪个位置”的排列（$N!$ 种）；利用排列不变性后，网络只需学“一个队友在某相对位置时该怎么反应”这一个函数，再对所有队友聚合。这是把组合爆炸的复杂度压缩成单个元素函数 $+$ 一次聚合的复杂度——和卷积用平移不变性压缩图像识别复杂度，是同一种思想的不同应用。
+\end{insight}
+
+\subsection{理论：排列不变性的精确定义与 Deep Sets 定理}
+\label{sec:mc-deepsets}
+
+\begin{definition}[排列不变函数]\label{def:mc-perm-inv}
+设函数 $f$ 接受一个集合 $\{x_1,x_2,\dots,x_M\}$（$x_j$ 为队友 $j$ 的相对观测）。称 $f$ 为\textbf{排列不变（permutation-invariant）}的，若对任意排列 $\sigma$（对 $\{1,\dots,M\}$ 的任意重排）都有
+\begin{equation}
+  f(x_1,x_2,\dots,x_M)=f\big(x_{\sigma(1)},x_{\sigma(2)},\dots,x_{\sigma(M)}\big).
+  \label{eq:mc-perm-inv}
+\end{equation}
+即把输入元素顺序怎么打乱，输出都不变。
+\end{definition}
+
+\noindent 注意区分一个相关但不同的概念——\textbf{排列等变（permutation-equivariant）}：把输入元素重排，输出也跟着以同样方式重排。什么时候要不变、什么时候要等变？
+
+\begin{table}[H]\centering\small
+\caption{排列不变 vs 排列等变：何时用哪个}
+\label{tab:mc-inv-equiv}
+\begin{tabular}{p{0.50\linewidth}p{0.12\linewidth}p{0.30\linewidth}}
+\toprule
+场景 & 要的性质 & 原因 \\
+\midrule
+把“我看到的所有队友”聚合成“周围环境”的单一表征，喂给我自己的策略 & \textbf{不变} & 我的决策不该依赖我数队友的顺序 \\
+一个中心化网络同时输出所有 $N$ 个机器人的动作 & \textbf{等变} & 第 $k$ 个输出要对应第 $k$ 个机器人，重排输入应重排输出 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 本节聚焦\textbf{不变}（每个机器人用自己策略、聚合邻居），等变主要出现在某些中心化 critic/策略里（\cref{sec:mc-ctde} 会提）。
+
+\begin{theorem}[Deep Sets 分解定理]\label{thm:mc-deepsets}
+Zaheer 等 2017 证明\cite{zaheer2017deepsets}：一个作用在集合上的函数 $f$ 是排列不变的，当且仅当它可分解为
+\begin{equation}
+  f\big(\{x_1,\dots,x_M\}\big)=\rho\!\left(\ \bigoplus_{j=1}^{M}\phi_{\mathrm{enc}}(x_j)\ \right),
+  \label{eq:mc-deepsets}
+\end{equation}
+其中 $\phi_{\mathrm{enc}}$ 是对\emph{每个元素分别施加的相同}编码器（共享权重的 MLP），把每个队友的相对观测 $x_j$ 映射成特征向量；$\bigoplus$ 是\emph{排列不变的聚合算子}（逐元素求和 $\sum_j$、求平均 $\frac1M\sum_j$、或逐元素取最大 $\max_j$）；$\rho$ 是对聚合结果再施加的后处理网络（MLP）。
+\end{theorem}
+
+\begin{proof}[为什么这个形式天然排列不变]
+关键在中间的聚合 $\bigoplus$。求和、求平均、取最大\emph{本身就与求和项的顺序无关}——$a+b+c=c+a+b$，$\max(a,b,c)=\max(c,b,a)$。因为聚合抹掉了顺序，所以无论 $\phi_{\mathrm{enc}}$ 与 $\rho$ 怎么取，整体一定满足 \cref{eq:mc-perm-inv}。\emph{充分性}由此即得；\emph{必要性}（任意排列不变连续函数都能写成此形式）由 \cite{zaheer2017deepsets} 用对称多项式/求和池化的逼近论证给出，此处不展开。
+\end{proof}
+
+\noindent Deep Sets 的精髓：\textbf{把“对集合不变”这个看似复杂的约束，简化为“逐元素编码 $+$ 一次对称聚合”这个简单的架构。} 三种聚合算子的取舍是工程中真正要做的选择：
+
+\begin{table}[H]\centering\small
+\caption{三种排列不变聚合算子的取舍}
+\label{tab:mc-agg}
+\begin{tabular}{p{0.13\linewidth}p{0.18\linewidth}p{0.20\linewidth}p{0.18\linewidth}p{0.20\linewidth}}
+\toprule
+聚合算子 & 数学形式 & 直觉含义 & 适合 & 局限 \\
+\midrule
+mean pooling & $\frac1M\sum_j\phi(x_j)$ & 周围队友的平均态势 & 队友影响可平均、数量变化大 & 最危险的那个队友被平均稀释 \\
+max pooling & $\max_j\phi(x_j)$（逐维） & 最显著/最危险的那个队友 & 避障（最近的队友最重要） & 丢掉非极值队友的信息 \\
+attention & $\sum_j\alpha_j\phi(x_j)$，$\alpha_j$ 学得 & 按重要性加权的队友态势 & 不同队友重要性差异大、需自适应 & 计算量大、需更多样本学权重 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 注意力可看成“可学习权重的加权求和”，比 mean（权重都 $1/M$）和 max（权重是 one-hot 在极值上）更一般、更灵活，代价是更难训。\textbf{工程建议}：先用 mean 或 max 起步（简单、稳健、足够多任务用），只在明确观察到“需自适应区分队友重要性”时才上注意力。
+
+\begin{insight}[多视角理解（类比 $+$ 边界）：Deep Sets 与卷积]
+排列不变聚合和\textbf{卷积神经网络}很像——CNN 用同一个卷积核扫过图像每个位置（参数共享），靠平移不变性把“识别一个模式”推广到全图任意位置；Deep Sets 用同一个 $\phi_{\mathrm{enc}}$ 编码每个队友（参数共享），靠排列不变性把“理解一个队友”推广到任意数量、任意顺序的队友。\textbf{像的地方}：都用参数共享 $+$ 对称性压缩复杂度。\textbf{不像的地方}：CNN 的不变性是\emph{平移}（有空间结构、有局部性），Deep Sets 的不变性是\emph{排列}（集合无空间结构、无顺序）；CNN 聚合用带空间结构的池化窗口，Deep Sets 聚合是全局对称聚合。不要把“卷积处理网格”的直觉（局部感受野、层级特征）生搬到集合上——集合没有“相邻”的概念。
+\end{insight}
+
+\subsection{第二个支柱：本地坐标系}
+\label{sec:mc-egocentric}
+
+排列不变解决了“队友无序变长”，但还有一个同样重要、却容易被忽略的设计：\textbf{观测必须用本地坐标系（egocentric/相对坐标）表达，而非全局坐标。} 回看 \cref{sec:mc-decpomdp-code} 的 \verb|_get_obs_i|：队友用 \verb|self.pos[j] - self.pos[i]|（相对位置），到目标用 \verb|self.goal[i] - self.pos[i]|（相对向量）——全是“相对于我自己”的。这不是随手写的，而是和排列不变同等重要的可扩展性支柱：
+
+\begin{itemize}
+  \item \textbf{为什么不能用全局坐标}：若观测里放队友全局绝对坐标 $(x_j,y_j)$，那么“队友在我右前方 $1$ 米”这个对决策真正重要的信息，在不同的全局位置会表现成完全不同的数值。策略得在每个全局位置分别学一遍“右前方有队友该怎么躲”，样本效率极低，且无法泛化到训练时没去过的区域。
+  \item \textbf{本地坐标系的威力}：用相对坐标后，“右前方 $1$ 米有个队友”无论发生在地图哪个角落，喂给策略的数值都一样。策略只需学一次“相对态势 $\to$ 动作”的映射，就能用在任何全局位置。这与“参数共享让所有同质机器人用同一个网络”配套——本地坐标让“同一个网络”在空间上也成立。
+  \item \textbf{三件套合体}：\textbf{参数共享（所有机器人同一个 $\pi_\theta$）$+$ 排列不变（对队友集合不变）$+$ 本地坐标（相对表达）}，三者共同支撑“训练 $N{=}2$、部署 $N{=}10$ 零样本可扩展”这个多机 MARL 最诱人的性质。缺任何一个，可扩展性都会打折\cite{an2024perminv}。
+\end{itemize}
+
+\begin{insight}[可扩展性是对称性的红利，不是免费午餐]
+多机策略能“训少部署多”，不是因为网络有什么魔力，而是因为我们用三个设计（参数共享、排列不变、本地坐标）把问题里的\textbf{对称性}全榨干了——智能体是可互换的（参数共享）、队友是无序的（排列不变）、空间是平移齐次的（本地坐标）。每利用一种对称性，就少学一类本不必学的东西。
+\end{insight}
+
+\subsection{代码：从零实现排列不变的邻居编码器}
+\label{sec:mc-perminv-code}
+
+把 \cref{thm:mc-deepsets} 落成 PyTorch 代码。策略网络拆成 \verb|self_encoder|（处理固定维度的“列表”部分）$+$ \verb|neighbor_encoder|（Deep Sets 的 $\phi_{\mathrm{enc}}$）$+$ 对称聚合 $+$ \verb|action_head|（$\rho$）四块——因为观测有两种结构完全不同的部分：自身状态 $o_i^{\text{self}}$ 是单个向量、用普通 MLP；邻居集合 $\{o_{ij}^{\text{nbr}}\}$ 变长无序、必须用 Deep Sets。混在一起用一个 MLP 就会重蹈固定槽位拼接的覆辙。排列不变的关键就一行：对邻居编码后做 mean/max（对称聚合），把“无序集合”压成“固定维度向量”、且与邻居顺序无关。
+
+\begin{codebox}[Python]{排列不变的多机器人策略网络（Deep Sets 架构）}
+import torch
+import torch.nn as nn
+
+class PermInvariantPolicy(nn.Module):
+    """输入：自身观测 + 变长无序邻居观测集合；对邻居排列不变、可扩展到任意邻居数。
+    所有同质机器人共享这一个网络（参数共享）。"""
+    def __init__(self, self_dim, nbr_dim, hidden=128, act_dim=2, agg="mean"):
+        super().__init__()
+        self.agg = agg
+        self.self_encoder = nn.Sequential(             # 处理固定维度的"列表"部分
+            nn.Linear(self_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU())
+        self.neighbor_encoder = nn.Sequential(         # phi_enc：对每个队友施加【相同】变换
+            nn.Linear(nbr_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU())
+        self.action_head = nn.Sequential(              # rho + 动作头：吃 [自身特征 + 邻居聚合]
+            nn.Linear(hidden * 2, hidden), nn.ReLU(),
+            nn.Linear(hidden, act_dim))
+
+    def forward(self, self_obs, neighbor_obs, neighbor_mask):
+        # self_obs:(B,self_dim)  neighbor_obs:(B,M_max,nbr_dim)  neighbor_mask:(B,M_max) 1=真,0=pad
+        self_feat = self.self_encoder(self_obs)              # (B, hidden)
+        nbr_feat  = self.neighbor_encoder(neighbor_obs)      # (B, M_max, hidden)
+        mask = neighbor_mask.unsqueeze(-1)                   # (B, M_max, 1)
+        nbr_feat = nbr_feat * mask                           # 用 mask 把 pad 贡献清零（关键！）
+        if self.agg == "mean":
+            cnt = mask.sum(dim=1).clamp(min=1.0)             # 每个样本的【真实】邻居数
+            nbr_agg = nbr_feat.sum(dim=1) / cnt              # 仅对真实邻居平均
+        elif self.agg == "max":
+            nbr_feat = nbr_feat.masked_fill(mask == 0, -1e9) # pad 设 -inf 不参与 max
+            nbr_agg = nbr_feat.max(dim=1).values
+        else:
+            raise ValueError(self.agg)
+        return self.action_head(torch.cat([self_feat, nbr_agg], dim=-1))
+\end{codebox}
+
+\begin{codebox}[Python]{四种典型错误对照（聚合的常见坑）}
+# 错误 1：忘了 mask，pad 的邻居被当真邻居参与聚合
+nbr_agg = self.neighbor_encoder(neighbor_obs).mean(dim=1)   # 对 M_max 求平均
+#   pad 的零向量经编码器（有 bias/非线性）成了非零特征也参与平均，
+#   "2 个真邻居"和"3 个真邻居(1 pad)"的聚合被 pad 数量污染。必须用 mask！
+
+# 错误 2：mean 聚合除以 M_max 而非真实邻居数
+nbr_agg = (nbr_feat * mask).sum(dim=1) / M_max             # 错误分母
+#   真实 2 个、M_max=6 时聚合幅值被错误缩到 1/3，数值尺度随 pad 量漂移
+
+# 错误 3：对邻居用带位置的处理（每槽位不同权重）
+nbr_feat = neighbor_obs @ self.per_slot_weight             # 每槽位一套权重
+#   直接破坏排列不变性——退回固定槽位拼接。Deep Sets 要求对每个元素施加【相同】 phi_enc
+
+# 错误 4：max 聚合时 pad 没设 -inf 就直接 max
+nbr_agg = (nbr_feat * mask).max(dim=1).values              # pad 是 0
+#   若真实邻居某维全为负，pad 的 0 反成那维最大值，把"不存在的邻居"当最显著。须设 -1e9
+\end{codebox}
+
+\noindent 上面四块网络是\textbf{所有同质机器人共享的同一套参数}——正是 \cref{ch:plan-safemarl} 中 MAPPO 参数共享在多机运动里的具体落地。配合本地坐标系观测（\cref{sec:mc-egocentric}）与这里的排列不变聚合，三件套齐活，策略就具备“训少部署多”的可扩展性。
+
+\paragraph{为什么 padding $+$ mask 是工程标准做法。}
+既然邻居是变长的，为何代码里还要 padding 到固定的 \verb|M_max|？这不是又回到固定长度了吗？答案是：\textbf{padding $+$ mask 是为了让 GPU 批处理高效，而 mask 保证它在数学上仍排列不变、且不受 padding 污染。}（1）\emph{为什么 padding}：GPU 喜欢规整张量，一个 batch 里不同样本真实邻居数不同，但张量必须是规整的 $(B,M_{\max},\cdot)$，故补零到统一 $M_{\max}$，纯为塞进一个张量做并行计算。（2）\emph{为什么有 mask 就不破坏排列不变}：mask 标记真假邻居，聚合时（mean 用真实计数当分母、max 把 pad 设 $-\infty$）pad 贡献被精确剔除，最终聚合只取决于真实邻居集合，与 pad 数量无关、与顺序无关。（3）\emph{$M_{\max}$ 怎么定}：取略大于“实际最多能同时看到的邻居数”的值，看不见那么多就 padding，多到超过 $M_{\max}$（罕见）就保留最近的 $M_{\max}$ 个。这与固定槽位拼接的根本区别：固定槽位是\emph{语义性}地把第 $k$ 个队友绑死在第 $k$ 个输入位置（破坏排列不变）；padding$+$mask 是\emph{计算性}的补齐，配合 mask 后语义上仍是无序集合。
+
+\begin{pitfall}[编程陷阱：padding 的邻居没用 mask 屏蔽就参与聚合]
+\textbf{错误做法}：\verb|neighbor_encoder(neighbor_obs).mean(dim=1)|，直接对补齐后的 $M_{\max}$ 个邻居求平均，不区分真假。\textbf{现象}：训练成功率上不去、且诡异地与“平均可见邻居数”挂钩——邻居稀疏（pad 多）的场景策略明显更差；debug 极难发现，因为代码“能跑”、loss 也在降，只是降不到位。\textbf{根本原因}：补零的 pad 经编码器（有 bias 和非线性）后\emph{不是零}，作为虚假“邻居特征”混进平均/最大，污染真实邻居聚合，pad 越多污染越重。\textbf{正确做法}：聚合前用 mask 清零（mean）或设 $-\infty$（max），且 mean 分母用真实邻居数而非 $M_{\max}$。\textbf{自检}：同一组真实邻居，分别用 $M_{\max}{=}4$ 和 $M_{\max}{=}8$（不同 pad 数）跑前向，输出必须 \verb|torch.allclose| 完全一致；不一致就说明 mask 没生效。
+\end{pitfall}
+
+\begin{pitfall}[编程陷阱：用全局绝对坐标而非相对坐标做观测]
+\textbf{错误做法}：观测里放队友绝对位置 $(x_j,y_j)$ 和自己绝对位置，以为“信息更全”。\textbf{现象}：训练奇慢、需海量样本，且策略无法泛化到训练时没覆盖过的地图区域——把机器人放到新角落就失灵。\textbf{根本原因}：绝对坐标下，“右前方有队友该怎么躲”这个本该位置无关的技能，被网络在每个全局位置分别学了一遍。物理世界对平移齐次，绝对坐标却没利用这个对称性。\textbf{正确做法}：所有空间量用相对/本地坐标——队友相对位置、到目标相对向量、必要时连朝向也转到本体坐标系。\textbf{自检}：把整个场景（所有机器人 $+$ 目标 $+$ 障碍）整体平移一个随机向量，每个机器人的本地观测应当\emph{完全不变}；若变了，说明漏掉了某个没转成相对的绝对量。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：以为“排列不变”和“排列等变”是一回事]
+\textbf{新手想法}：“反正都是处理顺序无关的多智能体，不变等变差不多。”\textbf{实际上}：不变是\emph{输出不随输入重排而变}（聚合邻居 $\to$ 单一表征，用于自己的决策）；等变是\emph{输出随输入重排而同样重排}（中心网络一次性输出所有 $N$ 个动作，第 $k$ 个输出必须对应第 $k$ 个机器人）。用错会导致：本该不变处用了等变，输出维度随邻居数变化、无法接固定的 \verb|action_head|；本该等变处用了不变，所有机器人拿到一样的动作、无法区分。\textbf{延伸}：自注意力天然排列等变（重排输入则重排输出），在它之后接一个对称聚合（如对所有 token 求和）就变成排列不变——这正是很多多机注意力策略的标准结构。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （实现题）把 \verb|PermInvariantPolicy| 接到 \cref{sec:mc-decpomdp-code} 的 \verb|MultiRobotCoordEnv| 上：写一个函数把 \verb|_get_obs_i| 返回的字典转换成 \verb|(self_obs, neighbor_obs, neighbor_mask)| 三个张量（处理变长邻居的 padding 和 mask）。构造一批假数据，验证关键性质：\textbf{对调任意两个邻居的顺序，网络输出必须不变}（\verb|torch.allclose|）。
+  \item （调试挑战）下面聚合代码在邻居数恒定时正常、变化时性能下降，请定位并修复：\verb|feat=(self.neighbor_encoder(obs)*mask.unsqueeze(-1)); return feat.mean(dim=1)|。提示：问题出在 mean 的分母（应是真实邻居数）。
+  \item （设计扩展题，跨章综合）综合 MAPF 的邻居/冲突概念（\cref{ch:planning}）、CTDE（\cref{ch:plan-safemarl}）与本节，设计一个“局部避障策略”的完整观测方案：(a) 自身部分放什么；(b) 邻居部分如何排列不变编码（选 mean/max/attention 哪个、为什么）；(c) 障碍如何纳入（障碍也是变长无序集合，能否复用同一个 Deep Sets 思路？需为障碍单独一套 $\phi_{\mathrm{enc}}$ 还是和队友共用？给出判断和理由）；(d) 这个 actor 在 CTDE 下训练时，对应的中心化 critic 应看到什么（为 \cref{sec:mc-ctde} 预热）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{动作空间设计：速度层 vs 关节层}
+\label{sec:mc-action}
+
+\paragraph{动机：同一个“往左走”，可以是一个指令，也可以是十二个。}
+设想 \cref{sec:mc-decpomdp} 那个多足协同搬运里的一台四足机器人，要“往目标方向走、同时和队友保持队形”。这个意图可用两种截然不同的粒度表达成动作：\textbf{高层（速度层）}——策略输出一个二维速度指令 $(v_x,v_y)$ 或加偏航角速度 $\omega$，怎么迈腿实现这个速度交给一个\emph{已有的底层运动控制器}（足式控制章/单机 locomotion 策略）；\textbf{底层（关节层）}——策略直接输出 $12$ 个关节的目标位置偏移（四条腿 $\times$ 每腿 $3$ 关节），从原始关节动作里直接长出“既能行走、又能协调”的行为。同一个意图，前者是 $1$（或 $3$）个数，后者是 $12$ 个数；这两种动作空间的选择，会从根本上改变 MARL 要学的东西的难度和性质。
+
+\paragraph{反面：两个极端的代价。}
+\textbf{极端一：所有任务都用关节层，让 MARL 从零学行走 $+$ 协调。} 听起来很“端到端”很优雅，但代价巨大：MARL 不仅要学“怎么和队友协调”（多机问题），还要同时学“怎么用 $12$ 个关节走路而不摔倒”（单机 locomotion，本身就是难问题）。把两个难问题耦合在一个策略里，样本需求暴涨、训练极不稳定，且学出的“走路”质量往往远不如专门训练的 locomotion 控制器；更糟的是，多机协调的奖励信号（队形、避障）很稀疏，要它穿透“先学会走路”这一层传导到关节，信用分配极其困难。\textbf{极端二：所有任务都用速度层，把底层完全黑箱化。} 这在导航/避障这类“本体能力不是瓶颈”的任务上很合理，但在强物理耦合的协同操作（一起抬一个刚体、缆绳牵引）上会丢信息：速度层指令无法精细表达“用左前腿多使点劲压住板子这一角”这种需要落到接触力/具体肢体的协调。当协调的本质发生在接触力层面时，速度抽象就太粗了。
+
+\begin{insight}[对比性思维（不是 X 而是 Y）：动作层级的选择哲学]
+动作层级的选择，\textbf{不是“端到端越底层越先进”，而是“让 MARL 只学它真正该学的那部分协调，把本体运动能力交给更合适的工具”}。MARL 的稀缺资源是样本和稳定性，不该浪费在“重新发明走路”上。
+\end{insight}
+
+\paragraph{历史与主流范式：分层让二者各司其职。}
+机器人多机 MARL 在实践中收敛到一个主流答案——\textbf{分层架构}：\emph{上层}是 MARL 策略，输出高层指令（速度、落脚点、或低维协调隐变量），只负责“多机协调”这件它擅长且必须学的事；\emph{下层}是一个已训好或设计好的运动控制器（单机 locomotion 策略、MPC、步态控制器），把上层指令翻译成关节动作，负责“让单台机器人稳稳地执行指令”。2025 年的 decPLM（多四足协同搬运）就是典型——明确地把基座运动（base locomotion）和手臂控制分离\cite{pandit2025decplm}；Cable-towed load 的工作同样是分层去中心 MARL 规划器出速度指令、底层执行。把“协调”和“运动”解耦，是这些工作能成功迁移真机的关键工程决策之一。但分层不是唯一答案：MASQ 反其道而行——\textbf{把单台四足的四条腿当作四个智能体}，用合作 MARL 在\emph{关节层}协调单机的腿\cite{masq2024}。这说明动作层级强依赖于“协调发生在哪个尺度”：多机器人协调发生在机器人之间（上层速度足够），单机多肢协调发生在肢体之间（必须到关节层）。
+
+\begin{table}[H]\centering\small
+\caption{分层架构里的上下层分工}
+\label{tab:mc-hierarchy}
+\begin{tabular}{p{0.10\linewidth}p{0.26\linewidth}p{0.34\linewidth}p{0.22\linewidth}}
+\toprule
+层级 & 谁来做 & 负责什么 & 动作粒度 \\
+\midrule
+上层 & MARL 策略（本章主角） & 多机协调（去哪、保持什么队形、怎么避让） & 速度 / 落脚点 / 协调隐变量 \\
+下层 & 已有运动控制器 & 单机稳定执行（怎么迈腿/转向实现上层指令） & 关节位置 / 力矩 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{理论：连续 vs 离散，以及几个设计维度}
+\label{sec:mc-action-dims}
+
+确定层级后，还有几个正交的设计维度。\textbf{维度一：连续 vs 离散。}
+
+\begin{table}[H]\centering\small
+\caption{连续动作 vs 离散动作}
+\label{tab:mc-cont-disc}
+\begin{tabular}{p{0.14\linewidth}p{0.40\linewidth}p{0.40\linewidth}}
+\toprule
+ & 连续动作 & 离散动作 \\
+\midrule
+形式 & $a_i\in\mathbb{R}^d$（如速度 $(v_x,v_y)$） & $a_i\in\{$前/后/左/右/停$\}$ \\
+策略输出 & 分布参数（如高斯均值方差） & 类别概率（softmax） \\
+适合算法 & MAPPO/MADDPG/SAC & MAPPO/QMIX \\
+适合场景 & 真实机器人运动（速度/力矩本就连续） & 栅格世界、与 MAPF 对接、动作语义离散 \\
+优点 & 精细、贴合物理 & 探索简单、易与离散规划层对接 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 机器人真实运动几乎总是连续的，所以本章主线用\textbf{连续动作}；离散动作主要出现在“与 MAPF 那种栅格离散规划对接”或“动作本身就是离散选择”的场合。\textbf{维度二：动作的物理范围与缩放。} 策略网络原始输出通常在 $(-\infty,\infty)$ 或经 $\tanh$ 压到 $[-1,1]$，必须\emph{缩放}到物理可行范围（速度指令要 clip 到机器人实际最大速度）。这一步看似琐碎，却是大量 sim-to-real 失败的隐藏原因——仿真里允许的动作范围比真机大，策略学会用真机做不到的激进动作。\textbf{维度三：动作平滑性。} 相邻两步动作跳变太大，真机执行器跟不上、还会抖。常见做法是在奖励里加动作变化惩罚 $-\|a_t-a_{t-1}\|^2$（\cref{sec:mc-reward}），或在动作输出端加低通滤波/动作残差。多机场景尤其重要——一台机器人动作抖动会通过物理耦合（接触、队形）传染给队友。
+
+\subsection{代码：速度层动作的实现与缩放}
+\label{sec:mc-action-code}
+
+\begin{codebox}[Python]{速度层动作头：原始输出 -> 物理速度指令（缩放是易错环节）}
+import torch
+import torch.nn as nn
+
+class VelocityActionHead(nn.Module):
+    """把策略特征映射成物理速度指令；tanh 压缩后缩放到机器人物理速度范围。"""
+    def __init__(self, feat_dim, v_max=1.0, w_max=1.0):
+        super().__init__()
+        self.mean_layer = nn.Linear(feat_dim, 3)             # (vx, vy, w) 的均值
+        self.log_std = nn.Parameter(torch.zeros(3))          # 可学习对数标准差
+        self.register_buffer("scale", torch.tensor([v_max, v_max, w_max]))
+
+    def forward(self, feat):
+        raw_mean = self.mean_layer(feat)                     # 原始输出，范围无界
+        action_mean = torch.tanh(raw_mean) * self.scale      # tanh 压到[-1,1]再乘物理上限
+        return action_mean, torch.exp(self.log_std)          # std 恒正
+
+    def sample(self, feat):
+        mean, std = self.forward(feat)
+        dist = torch.distributions.Normal(mean, std)
+        raw_action = dist.rsample()                           # 重参数化采样（训练用）
+        action = torch.clamp(raw_action, -self.scale, self.scale)  # 高斯尾巴会越界，执行前必 clip
+        log_prob = dist.log_prob(raw_action).sum(dim=-1)     # 用于 PPO 的对数概率
+        return action, log_prob
+\end{codebox}
+
+\begin{codebox}[Python]{动作缩放的三种典型错误}
+# 错误 1：原始输出不经缩放直接当速度指令
+action = self.mean_layer(feat)        # 范围 (-inf, inf)
+#   初始化时可能输出 50 m/s 的疯狂速度，仿真里机器人瞬移、物理炸开(NaN)，训练崩
+
+# 错误 2：仿真允许的 v_max 比真机大，没对齐
+#   仿真训练 v_max=3.0、真机只能 1.0 -> 学会的高速协调真机做不出 -> sim-to-real 失败
+#   正确：训练时 v_max 必须 <= 真机实际能力，宁可保守
+
+# 错误 3：采样后忘了 clip，高斯尾巴产生越界动作
+action = dist.rsample()               # 高斯长尾偶尔采出 5*scale 的极端值
+#   偶发越界动作在真机上可能触发急停或不安全行为；执行前必 torch.clamp
+\end{codebox}
+
+\begin{pitfall}[概念误区：以为底层关节动作“更端到端所以更好”]
+\textbf{新手想法}：“直接输出关节力矩最 fancy、最 end-to-end，速度层是偷懒。”\textbf{实际上}：动作层级的选择是工程权衡不是先进性比赛。关节层让 MARL 同时背负“学走路”和“学协调”两个难题，样本需求和不稳定性暴涨，且走路质量常不如专门的 locomotion 控制器。多机协调任务里，把本体运动交给成熟下层控制器、让 MARL 专注协调，几乎总是更稳、更快、更易迁移。\textbf{为什么重要}：选错层级是很多“训不出来”的根因——不是算法不行，是把太多负担压给了一个策略。\textbf{例外}：协调本身发生在关节/接触尺度的任务（如 MASQ 把单机四腿当多智能体、或协同操作需精细分配接触力）才有理由下沉到关节层。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：在多机场景忽视动作平滑性，只看单步最优]
+\textbf{新手想法}：“每步选当前最优动作就行，平不平滑无所谓。”\textbf{实际上}：多机器人通过物理耦合（接触、队形约束）相互影响，一台机器人动作抖动会传染给队友——你猛地变向，拽着共同负载的队友被带得踉跄，连锁放大。单机时动作抖动只是自己抖，多机时是全队抖。\textbf{正确思维}：在多机强耦合任务里，动作平滑性是协调质量的一部分，要主动塑形（动作变化惩罚 $-\|a_t-a_{t-1}\|^2$、动作残差、低通滤波）。\textbf{自检}：录制多机执行轨迹，看动作时间序列是否高频抖动；看队形误差是否随某台机器人的动作突变而尖峰——若是，加平滑约束。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （设计判断题）对以下三个任务分别判断用速度层还是关节层、为什么：(a) $4$ 台轮式 AGV 在仓库过道导航避障；(b) $4$ 台四足合抬一块刚性大板维持水平；(c) 单台六足机器人在崎岖地形协调六条腿前进。对每个任务说明“协调发生在什么尺度”，据此给出层级选择。
+  \item （实现题）把 \verb|VelocityActionHead| 接到 \verb|PermInvariantPolicy| 后面（替换原直接输出 \verb|act_dim| 的 \verb|action_head|），构成完整的“排列不变观测 $\to$ 速度动作”策略。再加入动作平滑：修改采样逻辑使其接受上一步动作 \verb|prev_action|，并返回用于奖励的“动作变化量” $\|a_t-a_{t-1}\|^2$（供 \cref{sec:mc-reward} 的平滑惩罚使用）。
+  \item （思辨题，承上启下）分层架构把“协调（上层 MARL）”和“运动（下层控制器）”解耦。讨论两个潜在风险：(a) 上层假设下层能完美执行速度指令，但下层在某些状态做不到（如机器人正在恢复平衡），这种“执行偏差”会怎么影响协调？(b) 上下层分开训练 vs 联合训练各有什么利弊？联系 \cref{sec:mc-boundary} 的混合，你认为分层接口处最需要传递什么信息才能让两层配合好？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{奖励塑形：协作如何涌现、竞争如何处理}
+\label{sec:mc-reward}
+
+\paragraph{动机：同样的任务，奖励一改，行为天差地别。}
+回到多机导航避障：你想让 $4$ 个机器人各自到达目标、彼此不撞。最直接的写法——到达目标给大正奖励、撞上队友给大负惩罚、每步给一点距离引导，看起来天经地义。但魔鬼在配比里，同样这套结构，三种配比会涌现出三种完全不同的“性格”：\emph{碰撞惩罚 $\gg$ 任务奖励}——机器人发现“只要不动就永远不撞”，全部冻结在起点，你得到一群“胆小鬼”；\emph{任务奖励 $\gg$ 碰撞惩罚}——机器人横冲直撞奔向目标，把队友当空气，你得到一群“莽夫”；\emph{配比恰当 $+$ 塑形得法}——机器人学会减速、绕行、礼让，既到达又不撞。更深一层的问题是奖励的\textbf{归属}：给团队整体（大家共享一个数），还是给每个机器人（各算各的）？这直接关系到 \cref{ch:plan-safemarl} 那个老大难：信用分配。
+
+\begin{insight}[本质洞察：你在设计优化问题，不是在编程行为]
+在 MARL 里，你不是在“编程”机器人的行为，而是在“设计一个让目标行为成为最优解的优化问题”。机器人会精确地最大化你写下的奖励——一字不差，包括你没意识到的漏洞。奖励塑形的全部艺术，就是确保“你真正想要的行为”和“奖励函数的最优解”是同一个东西。绝大多数 MARL 失败不是算法不行，是奖励没设对。
+\end{insight}
+
+\paragraph{反面：三种经典病态。}
+\textbf{病态一：冻结（freezing）——安全惩罚压过任务激励。} 碰撞惩罚过大时，“不动”成了风险最低的策略：你把“避免坏事”的权重设得远超“完成好事”，于是“什么都不做”（期望为 $0$）反而优于“努力但偶尔出错”（期望为负）。\textbf{病态二：懒惰智能体（lazy agent）——共享奖励下的搭便车。} 所有机器人共享一个团队奖励时，一部分努力把团队奖励做上去，另一部分发现“反正奖励共享，我躺平也能分到那份”，于是摆烂——这是共享奖励 $+$ 信用分配失败的直接后果。\textbf{病态三：奖励黑客（reward hacking）——钻奖励空子。} 你用“离目标越近奖励越高”做引导，机器人可能学会在目标附近\emph{反复横跳}持续领取接近奖励，而不停在目标上完成任务；或编队任务里机器人挤成一团（队形误差为零的退化解）。这三个病态有共同根源：\textbf{奖励函数的最优解，和你心里想要的行为，不是同一个。}
+
+\subsection{历史与理论：三种奖励结构}
+\label{sec:mc-reward-struct}
+
+把奖励的“归属”问题理论化。多机运动协调的奖励按归属分三种结构。\textbf{结构一：全局团队奖励（global/shared）}——所有机器人共享同一标量 $r_1=\dots=r_N=r^{\text{team}}(s,\mathbf{a})$，适合强协作、共同目标（一起搬一个物体——成败是集体的），优点是直接对齐团队目标、不会出现“个体最优损害团队”，\emph{致命缺点是信用分配极难}（团队奖励涨了，每个机器人都不知道是不是自己的功劳，滋生懒惰智能体）。\textbf{结构二：个体局部奖励（individual/local）}——每个机器人有自己可归因的奖励 $r_i=r_i^{\text{task}}(o_i,a_i)+\dots$，优点是\emph{信用分配天然清晰}（努力就有回报、摸鱼就没有，从问题侧根除懒惰），缺点是\emph{不激励协作}（机器人只顾自己到达，不会为团队牺牲）。\textbf{结构三：混合奖励（mixed/hybrid）——工程主流}：
+\begin{equation}
+  r_i=\underbrace{r_i^{\text{individual}}}_{\text{可归因，治懒惰}}+\ \lambda\cdot\underbrace{r^{\text{shared}}}_{\text{对齐团队，促协作}}.
+  \label{eq:mc-mixed-reward}
+\end{equation}
+个体部分给每个机器人清晰的信用，共享部分注入团队目标，$\lambda$ 调节“个体 vs 集体”的权重。\textbf{这是绝大多数成功的多机运动协调工作采用的结构}——既避免纯共享的懒惰，又避免纯个体的自私。decPLM 的 constellation 奖励本质上就是这类设计\cite{pandit2025decplm}：既有让每个机器人做好自己那部分的项，又有约束整体“星座”队形/协同的共享项。
+
+\begin{table}[H]\centering\small
+\caption{三种奖励结构的取舍}
+\label{tab:mc-reward}
+\begin{tabular}{p{0.13\linewidth}p{0.12\linewidth}p{0.13\linewidth}p{0.24\linewidth}p{0.26\linewidth}}
+\toprule
+奖励结构 & 信用分配 & 是否促协作 & 主要风险 & 典型适用 \\
+\midrule
+全局团队 & 极难 & 强 & 懒惰智能体、搭便车 & 强耦合共同目标（搬一个刚体） \\
+个体局部 & 天然清晰 & 弱 & 自私、不互助 & 弱耦合各自导航 \\
+混合 & 个体部分清晰 & 可调 & 需调 $\lambda$ 平衡 & 绝大多数运动协调（推荐起点） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[对比性思维（反事实）：为什么混合奖励缺一不可]
+若只用全局团队奖励 $\to$ 信用分配失败 $\to$ 一部分机器人搭便车摆烂。若只用个体奖励 $\to$ 没有协作激励 $\to$ 机器人互相把对方当障碍而非队友，狭窄通道里互相挤兑谁也不让。混合奖励不是“两种的折中妥协”，而是\textbf{用个体部分解决信用分配、用共享部分注入协作目标}——各取所长，缺一不可。
+\end{insight}
+
+\subsection{理论：势函数塑形——加引导但不改变最优策略}
+\label{sec:mc-pbrs}
+
+稠密引导奖励（如“离目标越近奖励越高”）能加速学习，但会引入奖励黑客（反复横跳刷接近奖励）。有没有办法“既加稠密引导、又保证不改变最优策略”？有——\textbf{势函数塑形（Potential-Based Reward Shaping, PBRS）}，Ng、Harada、Russell 1999 的经典结果\cite{ng1999shaping}。
+
+\begin{theorem}[PBRS 保最优性不变]\label{thm:mc-pbrs}
+若塑形奖励取如下形式
+\begin{equation}
+  F(s,a,s')=\gamma\,\Phi(s')-\Phi(s),
+  \label{eq:mc-pbrs}
+\end{equation}
+其中 $\Phi$ 是任意一个\emph{只依赖状态}的势函数，那么把 $F$ 加到原奖励 $r$ 上，\textbf{不改变最优策略}——原问题与塑形后问题有完全相同的最优策略集\cite{ng1999shaping}。
+\end{theorem}
+
+\begin{proof}[望远镜相消的直觉]
+$\gamma\Phi(s')-\Phi(s)$ 沿任何轨迹累加会\emph{望远镜式相消}——一条从 $s_0$ 到 $s_T$ 的轨迹，塑形奖励的折扣累加为
+\[
+  \sum_{t=0}^{T-1}\gamma^t\big(\gamma\Phi(s_{t+1})-\Phi(s_t)\big)
+  =\sum_{t=0}^{T-1}\big(\gamma^{t+1}\Phi(s_{t+1})-\gamma^t\Phi(s_t)\big)
+  =\gamma^T\Phi(s_T)-\Phi(s_0),
+\]
+只依赖起点和终点的势，与中间怎么走无关。所以它只是给每个状态贴了个“高度标签”引导下山方向，对任意策略的回报都只加一个仅依赖首末状态的常数项，不改变“哪条路最优”。严格地，可证塑形后的最优 $Q$ 函数满足 $Q_F^*(s,a)=Q^*(s,a)-\Phi(s)$，故 $\arg\max_a Q_F^*=\arg\max_a Q^*$，最优策略不变\cite{ng1999shaping}。
+\end{proof}
+
+\noindent \textbf{怎么用}：取 $\Phi(s)=-(\text{到目标的距离})$（离目标越近势越高），则 $F=\gamma\Phi(s')-\Phi(s)$ 在“朝目标移动”时为正、“远离”时为负——这就是一个\emph{保最优}的接近引导。关键区别在于：它不是简单的“近就给分”（那会被反复横跳刷分），而是“\emph{朝目标前进一步}才给分、退一步就扣回去”，横跳一来一回净收益为零，黑客行为被堵死。
+
+\begin{insight}[本质洞察：PBRS 把“加速学习”和“定义任务”彻底分开]
+势函数塑形的威力在于把两件事彻底分开：原始稀疏奖励（到达目标 $+1$，其余 $0$）定义了“什么是成功”；势函数塑形提供“怎么更快学会”的引导，且数学上保证不污染“什么是成功”。这是奖励工程里少数有严格理论保证的工具——能放心地加引导而不担心改变任务。势函数可编入领域知识（到目标的最短路距离、与队形的偏差），只要写成 $\gamma\Phi(s')-\Phi(s)$ 的差分形式，就是免费的、保最优的加速。
+\end{insight}
+
+\subsection{理论-工程桥接：碰撞惩罚的“软”与“硬”}
+\label{sec:mc-soft-collision}
+
+奖励里的碰撞惩罚是\textbf{软约束}——它只让碰撞“不划算”，但不禁止碰撞。这与 MAPF 的硬约束（碰撞在搜索里根本不被允许）有本质区别，也是 \cref{sec:mc-apps} 要叠加安全层的原因。这里先把软惩罚本身设计好。\textbf{距离型软惩罚}（推荐）：不要只在“已经撞上”时才惩罚（太晚），而要在“接近到危险距离”时就开始、随距离平滑增大：
+\begin{equation}
+  r_i^{\text{collision}}=-k\cdot\max\!\big(0,\ d_{\text{safe}}-d_{ij}\big)^2\qquad\text{对每个邻居 }j,
+  \label{eq:mc-soft-collision}
+\end{equation}
+当机间距 $d_{ij}>d_{\text{safe}}$ 时无惩罚；一旦逼近就平滑加大惩罚，平方让“越近惩罚增长越快”。这比“撞上才 $-10$”的稀疏惩罚好学得多——它给了机器人“提前减速绕行”的梯度信号。\textbf{为什么不能只惩罚“已碰撞”}：稀疏的碰撞惩罚梯度信息极差，机器人只在撞的瞬间得到信号，学不到“该提前多远开始避让”；距离型软惩罚提供连续可微的“危险梯度”，机器人能学到平滑的避让行为。
+
+\subsection{代码：一个完整的多机协调奖励函数}
+\label{sec:mc-reward-code}
+
+\begin{codebox}[Python]{多机运动协调的混合奖励（个体 + 共享 + PBRS + 距离型软惩罚）}
+import numpy as np
+
+def compute_coordination_reward(pos, vel, goal, prev_pos, actions,
+                                d_safe=1.0, gamma=0.99,
+                                w_progress=1.0, w_collision=5.0, w_formation=0.0,
+                                w_action=0.01, w_arrive=10.0, formation_target=None):
+    """返回长度 N 的个体奖励数组；权重 w_* 是要调的关键超参。"""
+    N = pos.shape[0]; rewards = np.zeros(N)
+    for i in range(N):
+        # ---- 个体部分（可归因，治懒惰）----
+        d_now  = np.linalg.norm(goal[i] - pos[i])
+        d_prev = np.linalg.norm(goal[i] - prev_pos[i])
+        # (1) PBRS 进度奖励：F = gamma*Phi(s') - Phi(s)，Phi = -距离（保最优、防横跳）
+        rewards[i] += w_progress * (gamma * (-d_now) - (-d_prev))
+        # (2) 到达奖励：到自己目标的稀疏大奖（定义"成功"）
+        if d_now < 0.3:
+            rewards[i] += w_arrive
+        # (3) 距离型碰撞软惩罚：逼近危险距离就平滑惩罚（不是撞上才罚）
+        for j in range(N):
+            if j != i:
+                violation = max(0.0, d_safe - np.linalg.norm(pos[j] - pos[i]))
+                rewards[i] += -w_collision * violation ** 2   # 平方：越近增长越快
+        # (4) 动作平滑/控制代价：抑制抖动（多机耦合下尤其重要）
+        rewards[i] += -w_action * np.sum(actions[i] ** 2)
+    # ---- 共享部分（对齐团队，促协作）----
+    if w_formation > 0 and formation_target is not None:
+        rewards += -w_formation * _formation_error(pos, formation_target)  # 广播=共享
+    return rewards
+
+def _formation_error(pos, target_offsets):
+    """队形误差：用相对质心的构型而非绝对位置，使队形可平移/旋转（避免退化解）。"""
+    rel = pos - pos.mean(axis=0)
+    return np.mean(np.linalg.norm(rel - target_offsets, axis=1))
+\end{codebox}
+
+\begin{codebox}[Python]{奖励设计的四种典型错误}
+# 错误 1：碰撞惩罚远大于到达奖励 -> 冻结
+#   w_collision=100, w_arrive=10 -> "不动"期望 0 优于"努力但偶尔擦碰"的负期望
+# 错误 2：只惩罚已碰撞，不用距离型软惩罚
+#   if d_ij < 0.3: r -= 10  -> 梯度极稀疏，学不到提前避让。改用 max(0,d_safe-d_ij)^2
+# 错误 3：进度奖励直接用 -距离（非势函数形式）
+#   r += -w * d_now  -> 机器人在目标附近反复横跳刷"近"的奖励(reward hacking)。
+#                       必须用 gamma*Phi(s')-Phi(s) 差分形式，横跳净收益为零
+# 错误 4：队形误差用绝对位置 -> 退化解
+#   err = ||pos - fixed_absolute_target||  -> 队形钉死在地图某处，或挤成一点也"零误差"。
+#                                              用相对质心的构型才正确
+\end{codebox}
+
+\paragraph{奖励配比的调试方法论。}
+奖励的各项权重 $w_*$ 是 MARL 里最磨人的超参。一套可操作的调试流程：（1）\textbf{先只放任务奖励}（只开进度 $+$ 到达，关碰撞/队形）——机器人能学会到达吗？不能说明任务奖励本身有问题；（2）\textbf{逐步加约束}（再开碰撞软惩罚，从小权重起调）——看碰撞率下降、到达率是否被压垮；（3）\textbf{监控分项}（训练时分别记录每一项奖励的均值）——某项异常大说明配比失衡；（4）\textbf{观察行为}（定期录制策略行为视频/轨迹）——冻结？挤兑？横跳？对应回去查哪种病态；（5）\textbf{二分调权}（出现病态时对相关权重做二分调整）——冻结 $\to$ 降碰撞权重，莽撞 $\to$ 升碰撞权重。\textbf{最重要的一条}：永远\emph{分项记录奖励}。把进度、到达、碰撞、队形、动作各项均值分别画出来，绝大多数病态从“某一项曲线明显压过其他项”就能一眼看出，比盯着总奖励和行为视频猜要快得多。
+
+\begin{pitfall}[编程陷阱：用纯共享团队奖励训练，出现懒惰智能体却归因为“算法不行”]
+\textbf{错误做法}：$r_1{=}\dots{=}r_N{=}r^{\text{team}}$，所有机器人共享一个数，不给个体可归因信号。\textbf{现象}：一部分机器人积极干活，另一部分原地摸鱼/打转，团队成功率卡在某水平上不去；换个随机种子，摸鱼的换成另几台。\textbf{根本原因}：团队奖励无法区分谁贡献谁摸鱼（信用分配失败），摸鱼者不受罚、搭便车分享了努力者的成果——这是博弈论意义上的稳定摸鱼，不是 bug，是奖励结构的结构性缺陷。\textbf{正确做法}：(a) 问题侧——改混合奖励，加个体可归因项（自己到达只奖自己、自己撞只罚自己）；(b) 算法侧——用 COMA 反事实基线或 QMIX 值分解（\cref{ch:plan-safemarl}）。两者可叠加。\textbf{自检}：分项记录每个 agent 各自的“贡献”，若存在长期零贡献却拿正回报的 agent，就是懒惰智能体。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：把“加稠密引导奖励”等同于“会改变任务最优解”]
+\textbf{新手想法}：“稀疏奖励太难学，但加了稠密引导就会让机器人学歪、刷分，所以稠密奖励是双刃剑只能忍着不用。”\textbf{实际上}：用\emph{势函数形式} $F=\gamma\Phi(s')-\Phi(s)$ 的稠密塑形，有严格定理（\cref{thm:mc-pbrs}）保证\emph{不改变最优策略}。它沿轨迹望远镜式相消，只依赖首末状态的势，不污染“哪条路最优”。会学歪的是\emph{非势函数形式}的朴素稠密奖励（如直接 $-$距离），那才会被横跳刷分。\textbf{为什么重要}：理解 PBRS 让你能放心地加引导加速学习，而不必在“学得慢（纯稀疏）”和“学歪（朴素稠密）”之间二选一。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：以为“奖励塑形”和“信用分配”是两个不相干的话题]
+\textbf{新手想法}：“信用分配是 \cref{ch:plan-safemarl} 算法（COMA/QMIX）的事，奖励塑形是这章的事，井水不犯河水。”\textbf{实际上}：奖励结构本身就是缓解信用分配的\emph{第一道闸门}。用个体局部奖励，等于在\emph{问题侧}直接给了每个 agent 可归因的信号，信用分配被大幅简化甚至消解；用纯团队奖励，则把全部信用分配负担甩给算法（COMA/QMIX 在算法侧硬解）。两者是同一问题的两个切入点。\textbf{正确思维}：先在问题侧用混合奖励把能归因的信用直接给清楚（便宜、有效），剩下确实只能集体评价的部分（如整体队形）再交给算法侧的值分解/反事实基线。\textbf{自检}：问自己“团队奖励涨的时候，能不能从奖励结构本身看出是谁的功劳”——能则信用分配在问题侧已解决大半；完全不能则要么改奖励结构、要么必须上算法侧工具。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （诊断题）训练 $4$ 机器人导航避障，观察到：训练前期到达率上升，但训到一半后所有机器人开始\emph{在目标附近来回打转、不肯停下}，到达率反而下降。请：(a) 判断这是哪种奖励病态；(b) 检查奖励函数里最可能的肇因项；(c) 给出修复方案（提示：和势函数形式 vs 朴素稠密形式有关）。
+  \item （设计题）为“$4$ 台四足合抬一块刚性大板、维持水平、向目标前进”设计完整混合奖励：(a) 写出个体部分有哪些项、共享部分有哪些项；(b) “板子保持水平”应是个体还是共享奖励、为什么；(c) 用相对构型而非绝对位置表达队形的理由；(d) 给出各项权重的相对大小关系（不需精确值，但要说明谁应明显大于谁、为什么）。联系 decPLM 的 constellation 奖励思想。
+  \item （跨章综合题）综合 \cref{ch:plan-safemarl}（COMA 反事实基线、QMIX 值分解）和本节（混合奖励）：对“$3$ 台机器人共享团队奖励搬运一个物体、但出现一台懒惰智能体”，分别从\emph{问题侧}（改奖励结构）和\emph{算法侧}（用 \cref{ch:plan-safemarl} 的信用分配工具）各给一套方案，讨论两者能否、如何同时使用。最后回答：若两套都用上懒惰智能体仍存在，你还会怀疑哪里出问题（提示：观测里机器人能区分自己和队友的贡献吗？这又回到 \cref{sec:mc-perminv} 的观测设计）？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{CTDE 在多机运动里的实践：中心化 critic 喂什么}
+\label{sec:mc-ctde}
+
+\paragraph{动机：actor 端已经定了，critic 端喂什么还没定。}
+经过 \cref{sec:mc-perminv,sec:mc-action,sec:mc-reward}，我们的 actor 已经设计完整：排列不变地编码本地观测（看自己 $+$ 看可见队友）、输出速度动作、由混合奖励驱动。actor 只用本地观测 $o_i$，这是 CTDE 的“执行自立”那一半，没有商量余地。但 CTDE 还有“训练作弊”那一半——中心化 critic。MAPPO 的 critic $V_\phi(\cdot)$ 在训练时可看全局，给 actor 提供低方差的优势估计（\cref{ch:plan-safemarl} 已论证它为何能吸收非平稳性）。问题来了：这个“全局”具体喂什么进去？这不是一个有唯一标准答案的问题，而是一个有几种选项、各有取舍的工程决策。喂的方式会显著影响训练效率和最终性能。
+
+\paragraph{反面：critic 喂错了会怎样。}
+\textbf{喂太少（critic 只看本地，退化成 IPPO）}：critic 只吃 $o_i$、看不到队友真实状态，那么从 critic 视角，队友的策略变化和真实状态都是看不见的噪声——非平稳性没被吸收，回到 \cref{ch:plan-safemarl} 独立学习的困境，优势估计方差大、训练慢且不稳。\textbf{喂太杂（把执行时也用不到、且与价值无关的信息一股脑塞进去）}：critic 维度爆炸、难训练，且容易过拟合到训练环境的特定信息上——critic 喂料要“全”但也要“相关”。\textbf{喂得不对称（critic 用固定槽位拼接所有机器人状态，不排列不变）}：又踩 \cref{sec:mc-perminv} 的坑——critic 也对智能体排列敏感，浪费样本、不可扩展。
+
+\subsection{理论：中心化 critic 的三种喂料方案}
+\label{sec:mc-critic-feed}
+
+在多机运动协调里，中心化 critic 的输入主要有三种选择，从“最理想但需仿真特权”到“最现实”。\textbf{方案一：真值全局状态 $s$（ground-truth state）}——直接喂仿真器能提供的真值状态（所有机器人精确位姿/速度、所有障碍精确位置、负载精确状态）。优点是信息最全最准，critic 能学到最精确的价值估计；前提是只有\emph{仿真}能提供真值状态，但这恰恰没问题——CTDE 下 critic \emph{只在训练时用}，训练在仿真里做、真值唾手可得，执行时 critic 被丢弃、actor 只用本地观测。这是 MAPPO 在多数仿真训练里的默认、也是最常用的选择。\textbf{方案二：特权信息（privileged information）}——喂 actor 看不到、但对价值很关键的“特权”量（真实地面摩擦系数、负载真实质量、队友真实意图/目标）。这与单机 locomotion 的“teacher-student/privileged learning”思想一脉相承。在多机运动里特权信息常包括：队友真实目标 $g_j$（actor 看不到队友想去哪，但 critic 知道）、负载/接触真实物理参数、全局任务进度，能让 critic 把“为什么团队回报高/低”归因得更准。\textbf{方案三：所有智能体观测的排列不变聚合}——当真值状态不易定义或想让 critic 也具备可扩展性时，把所有机器人观测 $\{o_1,\dots,o_N\}$ 用 \cref{sec:mc-perminv} 的 Deep Sets/注意力聚合成固定维度的全局表征喂给 critic。优点是 critic 也对智能体排列不变、可扩展到任意 $N$，与 actor 设计哲学统一。这是 An/Hutter 等可扩展多机协调工作的做法\cite{an2024perminv}——actor 和 critic 都用排列不变结构，整个系统才能“训少部署多”。
+
+\begin{table}[H]\centering\small
+\caption{中心化 critic 三种喂料方案的取舍}
+\label{tab:mc-critic-feed}
+\begin{tabular}{p{0.20\linewidth}p{0.12\linewidth}p{0.18\linewidth}p{0.18\linewidth}p{0.22\linewidth}}
+\toprule
+critic 喂料 & 信息量 & 可扩展性 & 前提 & 典型用法 \\
+\midrule
+真值全局状态 $s$ & 最全 & 差（维度随 $N$ 变） & 仿真能给真值 & MAPPO 仿真训练默认 \\
+特权信息 & 高（针对性强） & 中 & 仿真能给特权量 & 强物理耦合、需归因物理参数 \\
+观测排列不变聚合 & 中 & 好（对 $N$ 不变） & 无特殊前提 & 要 critic 也可扩展时 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 实践中常\emph{组合使用}：真值状态 $+$ 关键特权信息，并对其中“按智能体组织”的部分做排列不变处理。
+
+\begin{insight}[本质洞察：CTDE 的不对称是精巧设计，不是权宜近似]
+CTDE 的不对称（actor 看本地、critic 看全局）不是一个“为了方便的近似”，而是把“我们想要什么”和“我们怎么稳定地学到它”两件事解耦的精巧设计。我们\emph{想要}的是去中心化的 actor（可部署、可扩展）；我们\emph{为了稳定学到它}，允许训练时用一个看全局的 critic 来降低优势估计方差、吸收非平稳性。critic 是“训练时的脚手架”——盖楼时用，楼盖好（actor 训好）就拆掉。理解这一点，你就不会纠结“critic 用了真值会不会作弊”——会，但作弊只发生在训练、且 critic 执行时被丢弃，所以无害且有益。
+\end{insight}
+
+\begin{insight}[多视角理解（类比 $+$ 边界）：CTDE 与 teacher-student]
+CTDE 的“特权 critic $+$ 本地 actor”和单机 locomotion 的 \textbf{teacher-student（特权学习）} 范式高度相似——足式控制中，教师网络用特权信息（真值地形、真实摩擦）训练得到强策略，学生网络只用本体感知（关节角/IMU）从教师那里蒸馏出可部署策略。\textbf{像的地方}：都“训练时用特权信息、部署时丢弃特权”，都让“上真机的那部分”只依赖真机可得的信息，本质都是“训练作弊、执行自立”。\textbf{不像的地方}：teacher-student 是\emph{两阶段、两个网络}（先训教师、再蒸馏学生，特权信息进的是教师的 actor）；CTDE 是\emph{单阶段、actor 与 critic 同时训}（特权信息进的是 critic 而非另一个 actor，actor 全程只用本地观测、不经蒸馏）。不要把二者等同——CTDE 没有“蒸馏”这一步，actor 是被中心化 critic 的优势信号直接拉着学的。
+\end{insight}
+
+\subsection{理论-工程桥接：MAPPO 在多机运动里的完整数据流}
+\label{sec:mc-mappo-flow}
+
+把 actor、critic、奖励、优势串成一条完整的 MAPPO 训练数据流，看清各部分如何咬合：
+
+\begin{codebox}[text]{MAPPO 在多机运动协调里的数据流}
+仿真并行 rollout（4096 环境 x N agent）
+   |
+   +- 每个 agent i：本地观测 o_i --> 共享 actor pi_theta(a_i|o_i) --> 动作 a_i
+   |                                  （排列不变编码邻居，sec:mc-perminv）
+   +- 环境 step：联合动作 (a_1..a_N) --> 转移 --> 混合奖励 r_i（sec:mc-reward）
+   +- 中心化 critic：全局状态 s（或聚合）--> V_phi(s) --> 价值估计（仅训练用）
+   +- 用 r_i 和 V_phi 算 GAE 优势 A_i（critic 越准，A_i 方差越小）
+   +- PPO 裁剪目标更新 theta（actor，所有 agent 共享）和 phi（critic）
+\end{codebox}
+
+\noindent 几个关键工程点：（1）\textbf{actor 参数共享}——所有同质 agent 用同一个 $\pi_\theta$，rollout 时把 $N$ 个 agent 的经验都当作这个共享策略的样本，这是 MAPPO 样本效率高的来源，也要求 agent 同质（\cref{sec:mc-action} 讨论过异质时的代价）；（2）\textbf{critic 可共享也可中心化单一}——常见做法是一个中心化 critic $V_\phi(s)$ 评估全局，或每个 agent 一个吃全局的 critic（参数也共享），要点是 critic 的\emph{输入}含全局信息而非 critic 的数量；（3）\textbf{优势归一化}——多 agent 的优势放在一起归一化，稳定训练；（4）\textbf{GPU 大规模并行}——MQE 基于 IsaacGym\cite{xiong2024mqe}，$4096$ 环境 $\times$ $N$ agent 同时跑（如 $4$ agent 即 $16384$ 个 agent 并行），这是多机 MARL 能在合理时间训出来的算力基础。
+
+\subsection{代码：中心化 critic 的实现（含排列不变选项）}
+\label{sec:mc-ctde-code}
+
+\begin{codebox}[Python]{中心化 critic：支持真值全局状态 / 排列不变聚合两种喂料}
+import torch
+import torch.nn as nn
+
+class CentralizedCritic(nn.Module):
+    """训练时吃全局信息估计 V(s)；执行时丢弃——actor 才是要部署的东西。"""
+    def __init__(self, mode="global_state", state_dim=None, per_agent_dim=None, hidden=256):
+        super().__init__()
+        self.mode = mode
+        if mode == "global_state":                 # 方案一：吃真值全局状态（仿真特权）
+            self.net = nn.Sequential(
+                nn.Linear(state_dim, hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden), nn.ReLU(),
+                nn.Linear(hidden, 1))
+        elif mode == "perm_inv_agg":               # 方案三：排列不变聚合所有 agent（critic 也可扩展）
+            self.agent_encoder = nn.Sequential(
+                nn.Linear(per_agent_dim, hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden), nn.ReLU())
+            self.value_head = nn.Sequential(
+                nn.Linear(hidden, hidden), nn.ReLU(),
+                nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        if self.mode == "global_state":
+            return self.net(x)                     # x: (B, state_dim)
+        elif self.mode == "perm_inv_agg":
+            feat = self.agent_encoder(x)           # x:(B,N,per_agent_dim) -> (B,N,hidden)
+            return self.value_head(feat.mean(dim=1))   # 对 agent 排列不变聚合
+\end{codebox}
+
+\begin{pitfall}[编程陷阱：声称用 MAPPO，实际 critic 只喂了本地观测（其实是 IPPO）]
+\textbf{错误做法}：critic 的输入写成 $o_i$（本地观测），却以为自己在用 MAPPO。\textbf{现象}：在弱耦合任务上还行，一到强耦合（协同搬运、紧密编队）就训不好、收敛慢、最终性能明显低于预期。\textbf{根本原因}：MAPPO 之所以比 IPPO 强，唯一来源就是 critic 看全局——它降低优势估计方差、吸收非平稳性。critic 只看本地就丢了这个唯一优势，名为 MAPPO 实为 IPPO。\textbf{正确做法}：明确给 critic 喂全局信息（真值状态/特权信息/排列不变聚合），并在代码里把 actor 输入和 critic 输入从接口上分开。\textbf{自检}：检查 critic 的 \verb|forward| 入参——若它的维度等于单 agent 观测维度，就是 IPPO；若含全局/多 agent 信息，才是 MAPPO。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：担心“critic 用了真值/特权信息是作弊，部署会出问题”]
+\textbf{新手想法}：“critic 偷看了真值摩擦、队友真实目标这些真机上拿不到的东西，部署肯定要露馅。”\textbf{实际上}：CTDE 的设计就是允许 critic 作弊——因为 critic 只在\emph{训练}时用，训练在仿真里做（真值唾手可得），执行时 critic 被\emph{丢弃}，只有 actor 上真机，而 actor 从头到尾只用本地观测。critic 的作弊不会传染给 actor，除非你犯了“把 critic 输入泄露给 actor”那个错（\cref{sec:mc-decpomdp-code} 的陷阱）。\textbf{为什么重要}：理解这点你才敢放心给 critic 喂最全的信息（真值 $+$ 特权），从而得到最准的价值估计、最稳的训练。畏手畏脚不敢喂，反而训不好。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （设计判断题）对以下场景分别选最合适的 critic 喂料方案并说明理由：(a) 仿真训练 $4$ 机器人导航，机器人数固定为 $4$，追求训练简单稳定；(b) 想训一个能从 $2$ 扩到 $8$ 的可扩展协调策略；(c) $4$ 足协同搬运，负载真实质量/摩擦对协调成败影响巨大但 actor 估不准。
+  \item （实现题）给 \verb|CentralizedCritic| 增加第四种 mode \verb|"state_plus_privileged"|：输入 $=$ 真值全局状态 $+$ 特权信息（每个 agent 真实目标 $g_j$、负载真实质量）。写出 \verb|forward|，说明哪些信息属于“actor 也有”、哪些属于“特权（仅 critic 有）”。回答：为什么把特权信息只给 critic 而不给 actor，能让训练既稳又保持 actor 可部署？
+  \item （综合分析题，跨章）把 \cref{ch:plan-safemarl} 的 MAPPO、\cref{sec:mc-perminv}（排列不变 actor）、本节（critic 喂料）串起来，画出一个能“训练 $N{=}2$、部署 $N{=}10$”的完整系统数据流图（文字描述），明确标出：(a) 哪些组件参数共享；(b) 哪些组件排列不变；(c) actor 和 critic 各看到什么；(d) 执行时哪些组件被丢弃。最后指出：“可扩展到任意 $N$”这个性质，分别依赖前面哪几个设计决策共同支撑（提示：至少涉及参数共享、本地坐标、排列不变三处）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{三大应用：导航、避障、编队，以及为何必须叠加安全层}
+\label{sec:mc-apps}
+
+\paragraph{这一节解决什么。}
+前面五节把“通用接口”（建模、观测、动作、奖励、训练）都搭好了。这一节把它们具体落到三类典型任务——\textbf{导航到目标、去中心化避障、学习式编队}，讲清每类在观测/奖励/评价上的特化设计；然后处理一个贯穿全章的安全软肋：learned policy 把碰撞写成软惩罚，没有任何一步的硬安全保证。
+
+\subsection{应用一：多机导航到目标}
+\label{sec:mc-app-nav}
+\textbf{任务}：$N$ 个机器人各自从起点到达各自目标 $g_i$，路上彼此不撞、躲开静态障碍——最基础、也最被研究透的任务（Long/Fan/Pan 的去中心化导航是奠基\cite{long2018collision}）。导航是个体性较强的任务（每个机器人有自己的目标），所以奖励\textbf{以个体为主}，协作主要体现在“避让时的相互礼让”——这种礼让不需要共享奖励直接激励，而是从“个体避障软惩罚 $+$ 大家都想尽快到达”中自然涌现（你不让路大家都慢、都吃接近惩罚）。
+
+\begin{table}[H]\centering\small
+\caption{导航任务在通用接口上的特化}
+\label{tab:mc-app-nav}
+\begin{tabular}{p{0.13\linewidth}p{0.82\linewidth}}
+\toprule
+组件 & 导航任务的具体设计 \\
+\midrule
+观测 $o_i$ & 自身：到目标相对向量 $+$ 自身速度；邻居（排列不变）：可见队友相对位置/速度；障碍（排列不变）：可见障碍相对位置 \\
+动作 $a_i$ & 速度层 $(v_x,v_y)$ 或加偏航（导航本体能力不是瓶颈，速度层足够，\cref{sec:mc-action}） \\
+奖励 $r_i$ & 个体为主：PBRS 进度奖励 $+$ 到达大奖 $+$ 距离型碰撞软惩罚 $+$ 动作平滑（\cref{sec:mc-reward}） \\
+评价指标 & 成功率（全部到达）、平均到达时间、碰撞次数、路径效率（实际/最短） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{应用二：去中心化避障}
+\label{sec:mc-app-avoid}
+\textbf{任务}：避障常作为导航的子能力，但也可单独研究——重点是\textbf{在没有通信、只有本地感知的前提下，一群机器人如何不相撞}。Long/Fan/Pan 的核心贡献正是证明了这件事能端到端学出来且无需通信\cite{long2018collision}。特化设计的关键点：（1）\textbf{观测聚合选 max 而非 mean}——避障里“最近、最危险的那个邻居”最重要，max pooling 天然突出极值（\cref{sec:mc-perminv}），mean 会把危险邻居平均稀释；（2）\textbf{互惠性（reciprocity）}——经典的非学习方法 ORCA/RVO\cite{vandenberg2011orca} 假设“对方也会避让”各让一半，学习式避障里这种互惠性是从“所有机器人共享同一个策略（参数共享）”中自然得到的——大家都用同一套避让逻辑，自然互相协调、各让一半，不会出现“我以为你会让、你以为我会让”的对撞；（3）\textbf{碰撞软惩罚的距离型设计}（\cref{eq:mc-soft-collision}）尤其关键，要在逼近时就有梯度。
+
+\begin{insight}[多视角理解（类比 $+$ 边界）：学习式避障 vs ORCA/RVO]
+学习式去中心化避障和经典的 ORCA/RVO（速度障碍法）解决同一个问题。\textbf{像的地方}：都不需要中央协调、都靠每个机器人本地决策、都隐含互惠假设。\textbf{不像的地方}：ORCA 是\emph{几何方法}，对每个邻居算出“会导致碰撞的速度集合”并显式避开，有几何意义上的安全保证（在假设成立时）；学习式避障是\emph{统计方法}，从数据里学一个倾向于不撞的策略，没有硬保证但能处理 ORCA 难建模的复杂情况（非圆形机器人、动力学约束、传感噪声）。不要把学习式避障的“看起来很会躲”误当成“有 ORCA 那样的安全保证”——它没有，这正是下面要叠安全层的原因。
+\end{insight}
+
+\subsection{应用三：学习式编队}
+\label{sec:mc-app-form}
+\textbf{任务}：$N$ 个机器人维持一个指定队形（矩形、楔形、或抬一个刚体所需的构型）向目标移动——三类里\textbf{协作性最强}的（队形是集体属性，单个机器人无法独自定义“队形好不好”）。特化设计的关键点：（1）\textbf{奖励必须含共享部分}——队形质量是共享奖励（\cref{eq:mc-mixed-reward} 里 $w_{\text{formation}}$ 那一项），但同时保留个体项治懒惰；（2）\textbf{相对构型而非绝对位置}（\cref{sec:mc-reward-code} 的 \verb|_formation_error|）——队形应能整体平移/旋转地跟随团队移动，否则要么队形钉死在地图某处、要么机器人挤成一点也算“零误差”（退化解）；（3）\textbf{与协同搬运的联系}——抬一个刚体本质上就是一个“由物体刚性约束强制的编队”，decPLM 的 constellation 奖励就是这类设计\cite{pandit2025decplm}，既约束整体构型、又让每个机器人做好自己那部分。注意这与 \cref{ch:mr-consensus} 的编队三范式（position/displacement/distance-based）是\emph{模型驱动}对照——那里队形由共识协议显式给出，这里由学习从奖励涌现。
+
+\begin{table}[H]\centering\small
+\caption{三大应用对比总表}
+\label{tab:mc-apps-compare}
+\begin{tabular}{p{0.14\linewidth}p{0.26\linewidth}p{0.24\linewidth}p{0.26\linewidth}}
+\toprule
+维度 & 导航 & 避障 & 编队 \\
+\midrule
+协作强度 & 中（各有目标，避让时协作） & 中（互惠避让） & 强（队形是集体属性） \\
+奖励侧重 & 个体为主 & 个体软惩罚为主 & 个体 $+$ 共享队形 \\
+邻居聚合 & mean/attention & \textbf{max}（突出最危险） & mean（关心整体分布） \\
+动作层级 & 速度层 & 速度层 & 速度层（搬运可能需更细） \\
+安全软肋 & 软惩罚不保证不撞 & 软惩罚不保证不撞 & 队形偏离 $+$ 内部碰撞 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{贯穿问题：软惩罚的固有不安全与安全层的叠加}
+\label{sec:mc-safety-layer}
+
+三大应用都共享一个根本软肋：\textbf{碰撞被写成奖励里的软惩罚，learned policy 只是“倾向于”不撞，没有任何一步的硬保证。} 训练得再好，也只能把碰撞率压到很低（如 $99.9\%$ 无碰撞），但 $0.1\%$ 的碰撞在安全关键场景（载人、贵重设备、密集人群）里就是不可接受的。\textbf{为什么 learned policy 无法靠训练根除碰撞}：（a）神经网络策略是连续函数逼近，对没见过的状态（分布外，out-of-distribution）行为无保证——而真实部署必然遇到训练时没覆盖的极端构型；（b）软惩罚是统计意义的“平均不撞”，优化期望回报不等于满足每条轨迹的硬约束；（c）这是软约束方法的结构性局限，不是“再多训练就能解决”的工程问题。
+
+\textbf{解决之道：把硬安全约束作为一层叠加在 learned policy 输出端。} 核心思想是——让 MARL 策略负责“协调与意图”（往哪走、怎么配合），让一个有保证的安全层负责“否决会导致碰撞的动作”。安全层在策略输出动作后、执行前介入，把不安全的动作修正成最接近的安全动作。
+
+\begin{table}[H]\centering\small
+\caption{安全层的几种工程模式}
+\label{tab:mc-safety-modes}
+\begin{tabular}{p{0.16\linewidth}p{0.36\linewidth}p{0.20\linewidth}p{0.22\linewidth}}
+\toprule
+模式 & 机制 & 保证 & 代价 \\
+\midrule
+控制障碍函数（CBF） & 定义安全集 $\{h(x)\ge0\}$，求解 QP 把策略动作投影到使 $\dot h\ge-\alpha h$ 的安全动作 & 前向不变性（一旦安全永远安全） & 需可微/可解的 $h$，多机时 QP 耦合 \\
+安全盾（safety shield） & 检测策略动作是否会进入不安全状态，是则替换成已知安全的备用动作 & 取决于盾的设计 & 可能过保守，频繁触发损害性能 \\
+可达性 / 速度障碍 & 用 ORCA/可达集算安全速度集合，把策略速度裁剪进去 & 几何安全（假设成立时） & 假设（如对方也避让）可能不成立 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent \textbf{控制障碍函数（CBF）是最有理论保证的一种。} 这里只讲怎么接到 MARL 上（完整推导见 \cref{ch:plan-safemarl} 的 \cref{sec:sm-cbf-game} 与控制部安全控制章）：定义安全函数 $h(x)$，使 $h(x)\ge0$ 当且仅当状态安全（如机器人间距 $\ge d_{\text{safe}}$：$h=\|p_i-p_j\|-d_{\text{safe}}$）；CBF 条件要求 $\dot h(x,a)\ge-\alpha\,h(x)$（$\alpha>0$），保证安全集 $\{h\ge0\}$ 是\emph{前向不变}的（只要现在安全，按此约束行动就永远安全）；把它做成一个 QP——在所有满足 CBF 条件的动作里，找\emph{最接近 MARL 策略输出 $a_i^{\mathrm{RL}}$} 的那个：
+\begin{equation}
+  a_i^{\text{safe}}=\arg\min_{a_i}\ \big\|a_i-a_i^{\mathrm{RL}}\big\|^2\quad\text{s.t.}\quad
+  \dot h_{ij}(x,a_i)\ \ge\ -\alpha\,h_{ij}(x)\quad\forall j.
+  \label{eq:mc-cbf-filter}
+\end{equation}
+直觉：CBF-QP 像一个“安全过滤器”——大部分时候 $a_i^{\mathrm{RL}}$ 本就安全，QP 原样放行；只在 $a_i^{\mathrm{RL}}$ 会导致碰撞时，QP 把它“最小幅度地”修正到安全边界上。MARL 的协调意图被最大限度保留，只在必要时被安全否决。
+
+\begin{insight}[本质洞察：learned policy $+$ 安全层是分工，不是妥协]
+learned policy $+$ 安全层，是“灵活性”和“安全性”的分工，而非妥协。MARL 擅长在高维、复杂、难建模的多机交互中学出协调行为（灵活），但给不了硬保证；CBF/盾擅长给出可证明的安全保证（安全），但不会“协调”和“完成任务”。把前者放上层出意图、后者放输出端守安全，得到的系统既会协调又不会撞——这正是 \cref{sec:mc-boundary} 要画的边界、混合架构要做的事。\textbf{纯 MARL 适合协调，传统控制适合安全，最好的系统是二者的组合。}
+\end{insight}
+
+\begin{codebox}[Python]{CBF 安全层接到 MARL 输出端（教学简化）}
+import numpy as np
+from scipy.optimize import minimize
+
+def cbf_safety_filter(a_rl, pos_i, pos_others, vel_i, vel_others,
+                      d_safe=1.0, alpha=2.0, a_max=2.0):
+    """把 MARL 策略动作 a_rl 修正成最近的安全动作（点质量模型，动作=加速度）。"""
+    constraints = []
+    for p_j, v_j in zip(pos_others, vel_others):
+        rel_p, rel_v = pos_i - p_j, vel_i - v_j
+        dist = np.linalg.norm(rel_p)
+        if dist < 1e-6:
+            continue
+        h = dist - d_safe                          # 安全函数 h_ij = ||p_i-p_j|| - d_safe
+        h_dot = rel_p @ rel_v / dist               # h 的一阶导
+        # 约束：rel_p·a/dist + h_dot + alpha*h >= 0（教学简化的 CBF 形式）
+        constraints.append({"type": "ineq",
+            "fun": (lambda a, rp=rel_p, d=dist, hd=h_dot, hh=h: (rp @ a)/d + hd + alpha*hh)})
+    bounds = [(-a_max, a_max), (-a_max, a_max)]     # 动作幅值约束（物理可行）
+    res = minimize(lambda a: np.sum((a - a_rl) ** 2),   # 最小幅度偏离 MARL 意图
+                   a_rl, bounds=bounds, constraints=constraints, method="SLSQP")
+    return res.x if res.success else np.clip(a_rl, -a_max, a_max)   # 无解兜底
+\end{codebox}
+
+\begin{codebox}[Python]{安全层接法的三种错误}
+a_rl  = policy(obs_i)                              # MARL 策略的协调意图
+a_safe = cbf_safety_filter(a_rl, pos[i], pos_others, vel[i], vel_others)  # 执行前过滤
+
+# 错误 1：把安全层放在训练奖励里而非执行端
+#   以为"奖励里加了碰撞惩罚就等于有安全层"-> 不！那还是软惩罚，无硬保证
+# 错误 2：CBF 的 alpha 取太大 -> 过保守，机器人离老远就躲，任务做不动；太小则逼太近才修正
+# 错误 3：QP 不可行时直接放行原始动作（无兜底）
+#   多机时多约束冲突致 QP 无解 -> 必须有安全兜底（急停/减速）
+\end{codebox}
+
+\begin{pitfall}[编程陷阱：以为奖励里的碰撞惩罚就是“安全保证”]
+\textbf{错误做法}：在奖励里加了大碰撞惩罚，就认为系统是安全的、可以上真机载人。\textbf{现象}：$99.9\%$ 的情况不撞，但那 $0.1\%$ 的分布外极端构型下照撞不误，在安全关键场景造成事故。\textbf{根本原因}：奖励里的碰撞惩罚是\emph{软约束}，只优化“平均不撞”，对单条轨迹、对分布外状态无任何硬保证。\textbf{正确做法}：安全关键场景必须叠加\emph{执行端}的硬安全层（CBF-QP/安全盾/速度障碍），它在动作执行前否决不安全动作。奖励里的软惩罚负责“平时表现好”，安全层负责“绝不越界”。\textbf{自检}：问“这个系统能保证任何一步都不撞吗？”只靠软惩罚 $\to$ 答案是否；有正确接入的 CBF $\to$ 在 CBF 假设下答案是是。安全关键场景只接受后者。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：认为“只要训练够久、数据够多，learned policy 就能根除碰撞”]
+\textbf{新手想法}：“碰撞率还有 $0.1\%$？那就再训 $10$ 倍步数、再加 $10$ 倍域随机化，总能降到 $0$。”\textbf{实际上}：碰撞率可无限逼近 $0$，但\emph{结构上}到不了硬 $0$——因为 (a) 真实部署必遇训练未覆盖的分布外构型；(b) 软惩罚优化的是期望，不是每条轨迹的硬约束；(c) 函数逼近对 OOD 输入无保证。这不是训练量问题，是软约束范式的固有上限。\textbf{正确思维}：用训练把“平时表现”做好（低碰撞率、高效率、会协调），用执行端安全层把“绝不越界”这条硬底线兜住。\textbf{自检}：若你的安全论证是“我们训了很久碰撞率很低”，那它不是安全\emph{保证}而是安全\emph{统计}；需要保证就必须有形式化的硬约束机制。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （特化设计题）从导航、避障、编队三个任务里任选一个，完整填充它的“通用接口实例化”：写出观测各部分、动作层级、奖励各项（区分个体/共享）、邻居聚合算子选择（mean/max/attention 并说明为什么）、以及三个评价指标。每个设计决策都给出理由，体现你对该任务“协作强度”的判断。
+  \item （实现题）把 \verb|cbf_safety_filter| 接到 \cref{sec:mc-perminv-code}$+$\cref{sec:mc-action-code} 构成的完整策略后面，形成“排列不变观测 $\to$ 速度动作 $\to$ CBF 安全过滤 $\to$ 执行”的完整管线。再做一个实验设计（不需真跑，描述即可）：如何量化“安全层介入的频率”和“安全层对任务性能的影响”？提示：记录 $\|a^{\text{safe}}-a^{\mathrm{RL}}\|$ 的分布、对比有/无安全层的碰撞率和到达时间。
+  \item （思辨题，承接混合架构）CBF 安全层在多机场景有一个棘手问题：每个机器人各自解 CBF-QP（去中心化），但多个机器人的安全约束是耦合的（我躲你的同时你也在躲我），各自独立修正可能产生“互相误判对方意图”的死锁或抖动。讨论：(a) 这个问题和经典 ORCA 的“互惠假设”有什么联系；(b) 有哪些可能解法（共享意图？分布式 QP？给每个机器人分配“谁让谁”的优先级——这又回到 MAPF 的优先级思想）；(c) 这是否说明“安全层”本身也需要某种协调，从而模糊了“MARL 管协调、安全层管安全”的清晰分工？（这个问题指向 MARL 与分布式 MPC/CBF 的深度混合，\cref{sec:mc-boundary}。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{从零搭建：MQE 风格环境 $+$ MAPPO 参数共享训练循环}
+\label{sec:mc-train}
+
+\paragraph{动机：零件齐了，怎么装成一台能跑的机器。}
+前六节给了所有零件：Dec-POMDP 建模（\cref{sec:mc-decpomdp}）、排列不变观测编码器（\cref{sec:mc-perminv}）、速度动作头（\cref{sec:mc-action}）、混合奖励（\cref{sec:mc-reward}）、中心化 critic（\cref{sec:mc-ctde}）。但零件不是系统。装成能跑的训练管线，还需解决几个集成问题：怎么组织 GPU 并行 rollout、怎么把多个 agent 经验喂给共享策略、训练循环每一步怎么咬合、训练好后怎么换个机器人数量直接部署。这一节做这件集成的事。
+
+\paragraph{MQE 环境：多四足 MARL 的标准平台。}
+MQE（Multi-agent Quadruped Environment）是多四足 MARL 的标准基准，基于 IsaacGym 的 GPU 大规模并行仿真\cite{xiong2024mqe}，设计直接对应本章的建模：机器人是多 agent（支持 $2/4/8$ 灵活切换 $\leftarrow$ 对应 $N$ 可变），任务有 cooperative\_transport/formation/chase（$\leftarrow$ 三大应用），观测是本体感知 $+$ 邻居相对位置/状态 $+$ 任务特征（$\leftarrow O_i$），动作是关节位置偏移或经底层控制器的速度层（$\leftarrow\mathcal{A}_i$），奖励是任务 reward $+$ 个体 alive reward $+$ 组惩罚（$\leftarrow$ 混合奖励）。关键工程特性：支持 $2/4/8$ agent 灵活切换（天然适合验证可扩展性）、IsaacGym GPU 并行（$4096$ 环境 $\times N$ agent 同时模拟）、自定义地形生成（为 sim-to-real 域随机化铺路）。
+
+\paragraph{MAPPO 参数共享训练循环的结构。}
+\begin{codebox}[text]{MAPPO 训练循环（呼应 sec:mc-mappo-flow 的数据流）}
+初始化：共享 actor pi_theta（排列不变）、中心化 critic V_phi
+循环 直到收敛：
+  1. Rollout（4096 并行环境收集经验）
+       for 每个时间步 t:  for 每个 agent i（GPU 并行）:  a_i ~ pi_theta(.|o_i)
+       s',{r_i} = env.step({a_i})            # 联合动作 -> 转移 + 混合奖励
+       记录 (o_i, a_i, r_i, logp_i) 和全局 s（给 critic）
+  2. 优势计算
+       V = V_phi(s);  A_i = GAE(r_i, V);  A = normalize(所有 agent 的 A_i)
+  3. 更新（PPO 裁剪目标）
+       把所有 agent 经验【合并】成一个大 batch（参数共享的关键）
+       for 若干 epoch:  L_actor=PPO_clip(pi_theta,A);  L_critic=MSE(V_phi(s),returns)
+                        theta,phi <- Adam 更新
+\end{codebox}
+\noindent 最关键的工程点是\textbf{第 3 步的“合并 batch”}：因为所有同质 agent 共享 $\pi_\theta$，$N$ 个 agent 在 $4096$ 环境里产生的经验可全部当作这一个策略的训练样本拼在一起，把有效样本量乘以了 $N$——这正是 MAPPO 参数共享样本效率高的根源。
+
+\subsection{代码：最小 MAPPO 训练循环骨架}
+\label{sec:mc-train-code}
+
+\begin{codebox}[Python]{最小 MAPPO 训练器（组合前面所有零件，教学简化）}
+import torch, numpy as np
+
+class MAPPOTrainer:
+    """组合排列不变 actor + 中心化 critic + 混合奖励；所有同质 agent 共享 actor。"""
+    def __init__(self, env, actor, critic, gamma=0.99, lam=0.95, clip=0.2, lr=3e-4):
+        self.env, self.actor, self.critic = env, actor, critic
+        self.gamma, self.lam, self.clip = gamma, lam, clip
+        self.opt = torch.optim.Adam(
+            list(actor.parameters()) + list(critic.parameters()), lr=lr)
+
+    def collect_rollout(self, n_steps):
+        """所有 agent 用【同一个】共享 actor 采样。"""
+        buf = {k: [] for k in ("obs","act","logp","rew","state","done")}
+        obs = self.env.reset()
+        for _ in range(n_steps):
+            actions, logps = [], []
+            for i in range(self.env.N):
+                self_obs, nbr_obs, nbr_mask = self._to_tensor(obs[i])  # padding+mask
+                with torch.no_grad():
+                    feat = self.actor.encode(self_obs, nbr_obs, nbr_mask)
+                    a, logp = self.actor.action_head.sample(feat)
+                actions.append(a.numpy().squeeze()); logps.append(logp.item())
+            state = self.env.global_state()              # 全局状态给 critic
+            next_obs, rewards, done, _ = self.env.step(actions)
+            for k, v in zip(("obs","act","logp","rew","state","done"),
+                            (obs, actions, logps, rewards, state, done)):
+                buf[k].append(v)
+            obs = self.env.reset() if all(done) else next_obs
+        return buf
+
+    def compute_gae(self, rewards, values, dones):
+        """GAE：critic 越准，优势方差越小。"""
+        adv = np.zeros_like(rewards); last = 0.0
+        for t in reversed(range(len(rewards))):
+            mask = 1.0 - dones[t]
+            delta = rewards[t] + self.gamma * values[t+1] * mask - values[t]
+            adv[t] = last = delta + self.gamma * self.lam * mask * last
+        return adv
+
+    def update(self, buf, epochs=4):
+        """关键：把所有 agent 经验【合并】成一个大 batch（参数共享让这合法）。
+        1) critic 对 buf["state"] 估值 -> GAE 优势 A_i
+        2) 跨所有 agent 把 (obs_i,act_i,logp_i,A_i) 拼成大 batch
+        3) for epoch: PPO_clip 损失 + critic MSE + 熵正则，一次反向、一次 step
+        """
+        for _ in range(epochs):
+            pass    # 完整实现见练习 1（ratio=exp(new_logp-old_logp), L_clip, L_v, entropy）
+
+    def train(self, n_iters=1000, n_steps=128):
+        for it in range(n_iters):
+            self.update(self.collect_rollout(n_steps))
+            if it % 50 == 0:
+                print(f"iter {it}: success_rate={self.evaluate():.2f}")
+
+    def evaluate(self, n_episodes=20):
+        successes = 0
+        for _ in range(n_episodes):
+            obs = self.env.reset()
+            for _ in range(200):
+                actions = [self._greedy_action(obs[i]) for i in range(self.env.N)]
+                obs, _, done, _ = self.env.step(actions)
+                if all(done): successes += 1; break
+        return successes / n_episodes
+\end{codebox}
+
+\subsection{实战：训练双机器人、部署到多机器人}
+\label{sec:mc-train-deploy}
+
+排列不变 $+$ 参数共享 $+$ 本地坐标三件套（\cref{sec:mc-perminv,sec:mc-ctde}）的回报，就在这里兑现——\textbf{训练时用最少的机器人，部署时直接用更多，无需重训}：
+
+\begin{codebox}[Python]{训练 N=2、零微调部署到 N=4/8}
+# 训练阶段：用 N=2 训练（快、省算力）
+env_train = MultiRobotCoordEnv(n_robots=2)
+actor  = PermInvariantPolicy(self_dim=4, nbr_dim=4, agg="mean")    # sec:mc-perminv
+critic = CentralizedCritic(mode="perm_inv_agg", per_agent_dim=6)   # sec:mc-ctde 可扩展
+trainer = MAPPOTrainer(env_train, actor, critic); trainer.train(n_iters=1000)
+
+# 部署阶段：直接换 N=4 或 8，不动网络、不微调
+for N_deploy in [2, 4, 8]:
+    trainer.env = MultiRobotCoordEnv(n_robots=N_deploy)            # 同一个 actor，只换环境
+    print(f"N={N_deploy}: 零微调部署成功率 = {trainer.evaluate(50):.2f}")
+    # 预期：N=2(训练值)最高，N 增大成功率平滑下降——下降幅度就是可扩展性的实证度量
+\end{codebox}
+
+\textbf{为什么换 $N$ 不用改网络}：actor 的输入是“自身观测 $+$ 排列不变聚合的邻居”——邻居数变化只改变聚合前求和的项数，聚合后维度不变，网络结构纹丝不动；critic 用 \verb|perm_inv_agg| 模式同样对 $N$ 不变。这就是三件套的红利。如果当初用了固定槽位拼接（\cref{sec:mc-perminv} 的反面教材），这里换 $N$ 就得重训整个网络。
+
+\begin{insight}[对比性思维（反事实）：没有排列不变会怎样]
+若没有排列不变 $+$ 参数共享：训练时 $N{=}2$ 的网络输入输出维度被焊死，部署 $N{=}4$ 必须改网络结构、从头训练；即便重训，每个 $N$ 都得单独训一个模型，无法“一次训练、多规模复用”。排列不变把“训一次、任意规模部署”从奢望变成默认。
+\end{insight}
+
+\begin{pitfall}[编程陷阱：rollout 时每个 agent 用了不同的策略实例（破坏参数共享）]
+\textbf{错误做法}：为每个 agent 创建一个独立的 actor 副本，各自训练。\textbf{现象}：样本效率低下（没享受到参数共享的 $N$ 倍样本红利）、且 $N$ 个策略各自漂移，同质 agent 却学出不一致行为、协调变差。\textbf{根本原因}：MAPPO 的样本效率来自所有同质 agent 共享\emph{同一个} $\pi_\theta$——$N$ 个 agent 的经验合并成一个大 batch 训这一个网络；用 $N$ 个独立副本就退化成 $N$ 个独立 PPO。\textbf{正确做法}：所有同质 agent 引用同一个 actor 对象，update 时把所有 agent 经验合并成一个 batch。\textbf{自检}：检查 actor 是不是只 new 了一次、被所有 agent 共用；update 的 batch 大小是否约等于（步数 $\times$ 环境数 $\times N$）。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：用最终成功率单一指标判断训练好坏]
+\textbf{新手想法}：“成功率 $95\%$ 就是好策略，达标收工。”\textbf{实际上}：单看成功率会掩盖大量问题——$95\%$ 成功可能伴随大量擦碰（碰撞率高但没撞到完全失败）、路径极不效率（绕大圈）、动作剧烈抖动（真机做不出）、或只在训练的 $N$ 上好、换 $N$ 就崩。这些在 sim-to-real 时全会爆发。\textbf{正确思维}：多指标联合评估——成功率 $+$ 碰撞率/次数 $+$ 路径效率 $+$ 动作平滑度 $+$ 跨 $N$ 的可扩展性。\textbf{自检}：评估时同时记录上述多指标；尤其在不同 $N$ 上各评一遍，看成功率衰减曲线——这是部署可扩展性的关键证据。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （实现题，核心）补全 \verb|MAPPOTrainer.update| 的完整实现：(a) 用 critic 对 \verb|buf["state"]| 估值，调 \verb|compute_gae| 得到每个 agent 的优势；(b) 把所有 agent 的 \verb|(obs, act, old_logp, advantage, return)| 沿 agent 维度合并成大 batch；(c) 写出 PPO 裁剪损失（actor）$+$ critic MSE $+$ 熵正则，做若干 epoch 的 minibatch 更新。在 \verb|MultiRobotCoordEnv(n_robots=2)| 上跑通，画出成功率曲线。
+  \item （可扩展性实验题）用 $N{=}2$ 训练好后，在 $N\in\{2,3,4,6,8\}$ 上各零微调评估 $50$ 个 episode，记录成功率和平均碰撞次数，画成两条随 $N$ 变化的曲线。回答：(a) 成功率随 $N$ 如何衰减、平缓还是陡峭；(b) 对比“固定槽位拼接版本”（额外实现一个、训练 $N{=}2$，它根本无法在 $N{=}4$ 上运行），实证排列不变带来的可扩展性；(c) 若 $N{=}8$ 时成功率掉得厉害，可能是什么原因（提示：训练时只见过 $1$ 个邻居，部署要处理 $7$ 个，是否需要训练时就随机化 $N\in[2,4]$？这指向 \cref{sec:mc-sim2real} 的数量随机化）。
+  \item （设计扩展题，跨章综合）综合 \cref{sec:mc-reward}（编队奖励）、\cref{sec:mc-apps}（编队应用）和本节，把这个导航训练管线改造成一个\textbf{编队}训练管线：(a) 修改奖励函数加入共享的队形项（用相对构型，\cref{sec:mc-reward-code} 的 \verb|_formation_error|）；(b) 修改 critic 喂料以包含队形相关的全局信息；(c) 设计一个评估指标量化“队形保持质量随时间的变化”。讨论：编队比导航更依赖中心化 critic 看全局吗？为什么（提示：队形是集体属性、强耦合，回顾 \cref{sec:mc-decpomdp} 的耦合强度判断和 \cref{sec:mc-ctde} 的 critic 喂料选择）？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{多机 sim-to-real 迁移：比单机多出的坑}
+\label{sec:mc-sim2real}
+
+\paragraph{动机：单机迁移已经难，多机为什么更难。}
+单机 sim-to-real 的核心矛盾你应已熟悉：仿真和真机之间存在“现实差距（reality gap）”——质量、摩擦、电机延迟、传感噪声等参数仿真建得不准，标准解法是域随机化（训练时随机化这些参数，逼策略学一个对参数变化鲁棒的行为）。多机 sim-to-real 继承了单机的全部困难，还\textbf{额外}多出几个维度，每一个都是单机不会遇到的：\emph{每个机器人的参数各不相同}（$N$ 套不同的质量/摩擦/延迟）；\emph{机器人之间通过物理接触传递力}（协同搬运时机器人通过共同物体相互施力，这种“机器人间接触力”在仿真里建得极不准，而它恰恰是协调的核心通道）；\emph{机器人数量本身是变量}（部署的机器人数可能和训练不同）；\emph{通信（如果用）有延迟丢包}。
+
+\begin{insight}[本质洞察：多机迁移多出的是“相互作用的现实差距”]
+单机 sim-to-real 是“一个机器人对抗自己的现实差距”，多机 sim-to-real 是“一群机器人对抗各自的现实差距 $+$ 它们之间相互作用的现实差距”。后者多出的“相互作用的现实差距”（接触力、通信、数量）是质变而非量变——它正好打在多机协调最依赖的那个通道（机器人怎么相互影响）上。这就是为什么多机迁移比单机难得多，也是“别的机器人这个信息怎么进决策回路”这个主题在迁移层的终极体现。
+\end{insight}
+
+\subsection{理论：多机 sim-to-real 的现实差距按维度穷举}
+\label{sec:mc-dr-list}
+
+把多机现实差距做穷举式分类（而非随意列举），分成“单机也有但多机要逐个体随机化”和“多机特有”两类：
+
+\begin{table}[H]\centering\small
+\caption{多机域随机化清单（“额外”那几行是多机特有，单机清单里根本没有）}
+\label{tab:mc-dr}
+\begin{tabular}{p{0.16\linewidth}p{0.16\linewidth}p{0.28\linewidth}p{0.32\linewidth}}
+\toprule
+维度 & 单机 DR & 多机 DR（额外要求） & 为什么多机更难 \\
+\midrule
+质量/惯性 & $\pm 20\%$ & \textbf{每个 agent 独立随机} & $N$ 套不同参数，策略要对“队友也各不相同”鲁棒 \\
+摩擦 & $[0.3,1.0]$ & 每个 agent 独立随机 & 同上 \\
+电机延迟 & $[5,30]$ ms & \textbf{每个 agent 不同延迟} & 队友响应快慢不一，协调时序更难 \\
+地形 & 斜坡/阶梯 & 同上（共享地形） & --- \\
+\textbf{负载} & --- & \textbf{质量 $[1,30]$ kg} & 协同搬运特有，负载是协调的耦合媒介 \\
+\textbf{负载形状} & --- & \textbf{圆柱/方形/不规则} & 形状决定接触点和力分配，极难建模 \\
+\textbf{机间接触力} & --- & \textbf{接触刚度/阻尼随机化} & 仿真接触模型本就不准，这是最硬的坑 \\
+\textbf{通信延迟}（若用） & --- & \textbf{$[0,100]$ ms} & 显式通信在真机有延迟，仿真即时 \\
+\textbf{agent 数量} & --- & \textbf{训练时随机 $N\in[2,4]$} & 策略要对队友数量鲁棒（见下文） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 多机 sim-to-real 的成败，很大程度上取决于“额外”那几行（负载、负载形状、接触力、通信延迟、数量）随机化得够不够。
+
+\subsection{关键设计一：接触隐式通信 vs 显式通信}
+\label{sec:mc-implicit-comm}
+
+多机协调里“机器人怎么相互传递信息”有两种范式，sim-to-real 鲁棒性天差地别。\textbf{显式通信（explicit communication）}：机器人之间通过通信信道交换消息（位置、意图、状态），MARL 里可学一个“通信策略”决定发什么。优点是信息带宽高、能传递丰富意图；sim-to-real 软肋是仿真里通信即时无损、真机有延迟/抖动/丢包，策略若依赖即时通信，真机上通信一延迟/中断就失效。\textbf{接触隐式通信（implicit communication through contact）}：机器人不通过任何通信信道，纯粹通过\emph{物理接触}（共同搬运的物体、相互推挤）感知彼此动作并协调。decPLM 的核心贡献正是——$N$ 台四足-臂\emph{零通信}协同搬运，仅靠接触力协调\cite{pandit2025decplm}。优点是\emph{没有通信信道就没有通信的 sim-to-real 问题}——机器人通过本体感知（力/扭矩传感器、本体状态变化）感知队友施加的力，这种感知在仿真和真机里相对一致（虽然接触力本身建得不准，但“我感受到一个力”这件事是真实存在的物理）；代价是信息带宽低，只能传递“力”这一个通道的信息，无法传递复杂意图。
+
+\begin{insight}[对比性思维（不是 X 而是 Y）：接触隐式通信的真正价值]
+接触隐式通信的价值，\textbf{不是“它比显式通信更高级”，而是“它把协调建立在仿真和真机都存在的物理通道（接触力）上，而非建立在仿真理想化、真机不可靠的通信通道上”}。它用“低带宽但物理真实”换“高带宽但 sim-to-real 脆弱”。在通信不可靠、或追求极致鲁棒/可扩展的场景，这个交换非常划算。decPLM 证明了：很多协同搬运任务，零通信 $+$ 接触协调就足够，且迁移真机更稳。
+\end{insight}
+
+\begin{insight}[本质洞察：协调带宽与迁移可靠性常成反比]
+从信息论角度看，接触隐式通信和显式通信是两条带宽截然不同的信道——接触力大约只能传递几个标量（力的大小方向），显式通信能传几十上百维的消息。但 sim-to-real 的鲁棒性恰恰反着来：带宽越低、越贴近物理本质的通道，仿真真机越一致。这是一个深刻的权衡——\textbf{协调需要的信息带宽，和这个带宽通道的 sim-to-real 可靠性，往往成反比}。选哪条信道，取决于任务真正需要多少协调带宽、以及对部署鲁棒性的要求。（这也与 \cref{ch:mr-consensus} 的 ADMM 显式协调形成对照：那里靠邻居间消息交换协调一致，带宽与延迟权衡同理。）
+\end{insight}
+
+\subsection{关键设计二：为什么训练时要随机化智能体数量 $N$}
+\label{sec:mc-n-random}
+
+\cref{sec:mc-train} 末尾留了个伏笔：$N{=}2$ 训练、$N{=}8$ 部署时成功率可能掉得厉害。根因是——训练时策略只见过“最多 $1$ 个邻居”的态势，部署时却要处理“$7$ 个邻居同时存在”的拥挤场景，这是分布外。解法是\textbf{训练时就随机化 $N$}（如每个 episode 随机 $N\in[2,4]$）：让策略在训练时就见识不同密度的邻居态势——有时孤身、有时拥挤——从而学一个对“队友数量”鲁棒的行为。排列不变架构（\cref{sec:mc-perminv}）让这件事在技术上可行：网络结构对 $N$ 不变，只需在训练时改变环境里的机器人数。这与“每个 agent 独立随机化物理参数”是同一个 DR 哲学的延伸——把部署时会变的东西（这里是 $N$）在训练时随机化掉。
+
+\begin{table}[H]\centering\small
+\caption{训练 $N$ 策略对部署可扩展性的影响}
+\label{tab:mc-n-random}
+\begin{tabular}{p{0.20\linewidth}p{0.30\linewidth}p{0.42\linewidth}}
+\toprule
+训练 $N$ 策略 & 部署可扩展性 & 原因 \\
+\midrule
+固定 $N{=}2$ & 差（$N$ 大时性能陡降） & 没见过拥挤态势，分布外 \\
+随机 $N\in[2,4]$ & 好（$N$ 大时平缓衰减） & 见过多样密度，对 $N$ 鲁棒 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{理论-工程桥接：可迁移观测表征——本体感知 $+$ 相对观测}
+\label{sec:mc-transfer-obs}
+
+多机 sim-to-real 还有一个贯穿性的设计原则：\textbf{观测表征要选“仿真和真机都能可靠获得、且分布一致”的量}。这把 \cref{sec:mc-perminv} 的本地坐标/相对观测从“可扩展性”理由又叠上一层“可迁移性”理由：（1）\textbf{本体感知优先}——关节角、关节速度、IMU 这些本体量，仿真和真机都能可靠测、分布相对一致，是 sim-to-real 最稳的观测基础；（2）\textbf{相对观测优先于绝对}——队友/目标/障碍用相对量（\cref{sec:mc-perminv} 已论证可扩展性），这里再加一条：相对量比绝对量（如需要外部定位系统的全局坐标）在真机上更易获得、更鲁棒（不依赖可能不存在或不准的全局定位）；（3）\textbf{避免依赖仿真特有的“完美信息”}——仿真里能拿到队友精确速度/意图，真机拿不到；actor 观测里只能放真机也能获得的量，那些只在仿真有的（队友真实意图、真值物理参数）只能进 critic（\cref{sec:mc-ctde} 的特权信息），执行时丢弃。这条原则把全章串了起来：actor 观测（\cref{sec:mc-perminv}）$=$ 可迁移的本体 $+$ 相对量；critic 喂料（\cref{sec:mc-ctde}）$=$ 可包含仿真特权信息（反正执行丢弃）。CTDE 的不对称，本质上也是 sim-to-real 友好的设计——让“上真机的那部分（actor）”只依赖真机可得信息。
+
+\begin{pitfall}[配置/迁移陷阱：多机域随机化照搬单机清单，漏掉多机特有维度]
+\textbf{错误做法}：把单机的 DR（质量/摩擦/延迟/地形）直接用于多机，不加负载、接触力、通信延迟、数量随机化。\textbf{现象}：仿真训练表现优异，真机上协同搬运负载被拽歪、机器人间相对距离飘忽、换机器人数量就崩——单机指标都正常，但“协同”那部分散架。\textbf{根本原因}：多机的现实差距主要在“机器人相互作用”上（接触力、负载、通信、数量），这些是单机 DR 清单里根本没有的维度。\textbf{正确做法}：用 \cref{tab:mc-dr} 的完整清单——除单机各项要\emph{逐个体独立随机化}外，补上负载质量/形状、接触刚度阻尼、通信延迟（若用）、agent 数量随机化。\textbf{自检}：对照 \cref{tab:mc-dr} 逐行检查；尤其确认“额外”那几行都已纳入。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：以为显式通信信息多就一定比接触隐式通信好]
+\textbf{新手想法}：“让机器人互相通信交换位置和意图，信息越充分协调肯定越好，零通信太原始了。”\textbf{实际上}：信息带宽和 sim-to-real 鲁棒性往往成反比。显式通信带宽高，但仿真即时无损、真机有延迟丢包，依赖即时通信的策略真机易失效；接触隐式通信带宽低（只有力），但建立在仿真真机都存在的物理通道上，鲁棒、可扩展、部署简单。decPLM 证明很多协同搬运零通信就够。\textbf{为什么重要}：盲目上显式通信会引入一个 sim-to-real 的脆弱点，且增加部署复杂度（需通信基础设施）。应按“任务真正需要多少协调带宽”决定——够用接触就用接触，确需复杂意图传递才上通信，且通信策略要在训练时随机化延迟/丢包。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：把多机 sim-to-real 当成“调参就能解决”的工程问题]
+\textbf{新手想法}：“迁移不成功？再加大域随机化范围、再多训点、调调奖励，总能搬上真机。”\textbf{实际上}：多机 sim-to-real（尤其接触力建模）是公认的\emph{开放研究难题}，不是单纯调参能解决的。接触力在仿真里的精度，至今不足以支撑很多协同任务的零样本转移——这是仿真物理引擎的能力边界，不是你 DR 范围不够大；盲目加大 DR 范围还会让策略过保守、性能下降。\textbf{正确思维}：(a) 认清哪些是能靠 DR 解决的（参数不确定性）、哪些是仿真物理本身的局限（接触力精度）；(b) 对后者，考虑结构性方案——接触隐式通信（降低对精确接触建模的依赖）、真机微调、或保守的安全层兜底（\cref{sec:mc-apps}）；(c) 把它当研究问题而非纯工程问题对待。\textbf{自检}：若迁移失败且定位到“接触力相关”，不要只顾加大接触 DR——评估是否该改用接触鲁棒的协调范式，或叠加真机自适应。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （清单设计题）为“$4$ 台四足机器人协同搬运一个不规则形状、质量未知的箱子，从仓库 A 区搬到 B 区”设计一份完整的多机域随机化清单：(a) 列出所有要随机化的维度及其范围；(b) 明确标出哪些是“单机也有但要逐个体独立随机化”、哪些是“多机特有”；(c) 对“机器人间接触力”这个最难的维度，说明你打算怎么随机化、以及为什么它即便随机化了仍可能 sim-to-real 失败（联系“仿真物理局限”的讨论）。
+  \item （设计判断题）对以下三个多机任务，判断用“接触隐式通信”还是“显式通信”，说明理由（从协调所需带宽 $+$ sim-to-real 鲁棒性两个角度）：(a) $4$ 台四足合抬一块刚性板；(b) 一群无人机编队穿越障碍区、需交换各自规划的轨迹避免碰撞；(c) 多台 AGV 在仓库密集避让。对选显式通信的，说明你会如何在训练时处理通信延迟/丢包以保证可迁移。
+  \item （综合分析题，跨章 $+$ 全章总纲）本节说“CTDE 的不对称本质上是 sim-to-real 友好的设计”。综合 \cref{sec:mc-perminv}（可迁移观测）、\cref{sec:mc-ctde}（critic 特权信息）、本节论证：(a) 为什么把特权信息（真值物理参数、队友意图）放 critic 而非 actor，恰好让“上真机的部分（actor）”天然 sim-to-real 友好；(b) 这与单机 locomotion 的 teacher-student 是不是同一个思想，像在哪、（若有）不像在哪；(c) 把全章串起来回答本章开头那个本质问题——“‘别的机器人’这个信息该以什么形式进入决策回路”——在观测层、奖励层、训练层、迁移层分别是什么答案，它们如何共同服务于“可扩展 $+$ 可迁移”这个终极目标。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{与传统规控的边界与混合：什么时候用 MARL}
+\label{sec:mc-boundary}
+
+\paragraph{动机：手里有锤子，但不是所有东西都是钉子。}
+学完本章，你掌握了一把强大的锤子——MARL 多机运动协调。但前面的章节也给了你一整套工具：\cref{ch:mr-consensus} 的共识/分布式优化、\cref{ch:planning} 的任务分配/MAPF、分布式 MPC 编队、协同搬运力控。一个成熟的工程师不会因为新学了 MARL 就把所有问题都用 MARL 解——而会判断“这个问题的结构，到底适合哪种工具，或哪几种工具的组合”。这一节就建立这个判断力，核心是理解 MARL 和传统规控各自的\textbf{根本优势和根本软肋}——它们恰好互补。
+
+\subsection{理论：MARL vs 传统规控的根本对照}
+\label{sec:mc-vs-classical}
+
+\begin{table}[H]\centering\small
+\caption{MARL vs 传统规控的根本对照（选型的依据）}
+\label{tab:mc-vs-classical}
+\begin{tabular}{p{0.18\linewidth}p{0.38\linewidth}p{0.38\linewidth}}
+\toprule
+维度 & MARL（本章） & 传统规控（\cref{ch:mr-consensus,ch:planning} 等） \\
+\midrule
+\textbf{安全保证} & 软惩罚，无硬保证（\cref{sec:mc-apps}） & 硬约束（CBF/MPC 约束/MAPF 无碰撞），可证明 \\
+\textbf{复杂交互建模} & 强（从数据学难建模的接触/非凸/高维） & 弱（需显式建模，复杂交互难写进方程） \\
+\textbf{适应性/泛化} & 强（学一个对多样情况鲁棒的策略） & 弱（模型/参数变化需重新设计或重调） \\
+\textbf{可解释性} & 弱（黑箱策略，难解释为什么这么动） & 强（基于明确模型和优化目标，可分析） \\
+\textbf{样本/数据需求} & 高（需大量仿真训练） & 低（基于模型，无需训练数据） \\
+\textbf{最优性} & 近似（学到的策略不保证最优） & 可证明最优/有界次优（凸优化、MAPF 有界） \\
+\textbf{计算（部署时）} & 低（一次前向推理） & 视方法（MPC 要在线解优化，较重） \\
+\textbf{协调涌现} & 强（协作行为可从奖励涌现） & 需显式设计协调机制（共识/分布式 QP） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 读这张表，一条清晰的互补关系浮现：\textbf{MARL 强在“难建模的复杂交互 $+$ 适应性 $+$ 协调涌现”，软在“安全 $+$ 可解释 $+$ 最优性保证”；传统规控正好反过来。}
+
+\begin{insight}[本质洞察：互补源于方法论的根本差异]
+MARL 和传统规控不是“新 vs 旧”或“谁取代谁”的关系，而是\textbf{能力维度上的互补}。它们的优势和软肋几乎完美互补——这不是巧合，而是源于方法论的根本差异：MARL 是数据驱动的（从经验里学，所以能处理难建模的东西、能适应，但给不了保证）；传统规控是模型驱动的（从方程里推，所以有保证、可解释，但建不了复杂交互、不会自适应）。理解这个互补，你就知道为什么“最好的系统往往是二者的混合”——用各自的优势补对方的软肋。
+\end{insight}
+
+\subsection{系统性分类：选型决策框架}
+\label{sec:mc-selection}
+
+\begin{codebox}[text]{问题分类决策树}
+1. 任务是否安全关键（载人/贵重/密集人群）？
+   是 -> 必须有硬安全保证 -> 纯 MARL 不可单独用 -> 传统规控，或 MARL + 安全层混合
+   否 -> 继续
+2. 交互是否复杂到难以显式建模（非凸接触、高维耦合、难建模动力学）？
+   是 -> 传统规控难写方程 -> MARL 的数据驱动优势凸显 -> MARL（或 MARL 主导 + 传统兜底）
+   否（交互可清晰建模）-> 继续
+3. 环境/参数是否高度多变、需强适应性？
+   是 -> MARL 的泛化优势 -> 倾向 MARL
+   否（环境稳定、模型已知）-> 传统规控更可控、可验证、无需训练
+4. 是否需要可证明最优/有界次优？
+   是 -> 传统规控（凸优化/MAPF 有界次优）
+   否 -> MARL 的近似解可接受
+\end{codebox}
+
+\begin{table}[H]\centering\small
+\caption{几个典型判断的归宿}
+\label{tab:mc-selection}
+\begin{tabular}{p{0.32\linewidth}p{0.28\linewidth}p{0.32\linewidth}}
+\toprule
+任务特征 & 推荐方案 & 理由 \\
+\midrule
+仓库 AGV 密集调度，要无碰撞保证 & MAPF 或 MAPF $+$ 局部 MARL 避障 & 安全关键，需硬保证；MAPF 出离散计划，MARL 做局部精细避让 \\
+多足协同搬运不规则物体（难建模接触） & MARL（接触隐式通信，\cref{sec:mc-sim2real}） & 接触交互难建模，数据驱动优势大 \\
+已知模型的多机编队，要可证明稳定 & 分布式 MPC / 共识（\cref{ch:mr-consensus}） & 模型清晰，需稳定性保证，传统方法可验证 \\
+复杂地形多机导航，环境多变 & MARL $+$ CBF 安全层（\cref{sec:mc-apps}） & 需适应性（MARL）$+$ 安全（CBF），混合 \\
+载人场景的多机协调 & 传统规控为主，MARL 仅做非安全关键的优化 & 安全压倒一切 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{理论-工程桥接：三种混合范式}
+\label{sec:mc-hybrid}
+
+当纯 MARL 和纯传统都不够时，混合。这里先给出三种主流混合范式的框架，让你知道“混合”具体长什么样。\textbf{范式一：分层混合（hierarchical）}——上层传统/下层 MARL 或反过来。例：上层用 MAPF（\cref{ch:planning}）出离散无碰撞路径，下层用 MARL 做连续的精细避让和运动协调（离散层给安全骨架，连续层给灵活执行）；也可反过来：上层 MARL 出高层协调意图，下层传统控制器（MPC/locomotion）精确执行（\cref{sec:mc-action} 的分层就是这个）。\textbf{范式二：安全过滤混合（safety filtering）}——MARL 出意图，传统守安全。例：\cref{sec:mc-apps} 的 CBF 安全层——MARL 策略输出动作，CBF-QP 在执行前否决不安全动作（MARL 管协调，CBF 管硬安全），这是最直接的“取 MARL 灵活 $+$ 传统保证”的混合。\textbf{范式三：残差混合（residual）}——传统出基线，MARL 学修正。例：传统控制器（如分布式 MPC，\cref{ch:mr-consensus}）出一个基线动作，MARL 学一个“残差”修正它，处理传统方法建模不准的部分（基线保证基本行为合理，残差注入数据驱动的灵活性）。
+
+\begin{table}[H]\centering\small
+\caption{三种混合范式}
+\label{tab:mc-hybrid}
+\begin{tabular}{p{0.16\linewidth}p{0.28\linewidth}p{0.22\linewidth}p{0.26\linewidth}}
+\toprule
+混合范式 & MARL 角色 & 传统角色 & 典型场景 \\
+\midrule
+分层 & 上层协调 或 下层精细执行 & 另一层 & 复杂任务的层级分解 \\
+安全过滤 & 出协调意图 & 执行端守硬安全 & 安全关键 $+$ 需灵活协调 \\
+残差 & 学建模不准的修正 & 出可靠基线 & 模型大致已知但有难建模残差 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[对比性思维（不是 X 而是 Y）：混合架构的设计哲学]
+混合架构的设计哲学，\textbf{不是“用 MARL 弥补传统方法的不足”或“用传统方法约束 MARL”这种单向的主从关系，而是“让每种方法只做它最擅长的那部分，用接口把它们的优势拼起来”}。分层让传统管骨架、MARL 管细节；安全过滤让 MARL 管意图、传统管底线；残差让传统管基线、MARL 管修正。每种混合都是在问“这个任务的哪部分适合学、哪部分适合算”，然后让对的方法做对的事。
+\end{insight}
+
+\begin{pitfall}[概念误区：以为 MARL 是更先进的方法、应该取代传统规控]
+\textbf{新手想法}：“MARL 是数据驱动的现代 AI 方法，传统规控是老古董，新项目当然全用 MARL。”\textbf{实际上}：MARL 和传统规控是能力互补、各有不可替代优势的两类方法，不是先进落后之分。传统规控的硬安全保证、可证明最优、可解释性、零训练数据需求，是 MARL 给不了的；MARL 的复杂交互建模、适应性、协调涌现，是传统给不了的。把 MARL 当万能解会在安全关键、需保证的场景翻车。\textbf{为什么重要}：选型错误代价高昂——安全关键场景误用纯 MARL 可能酿成事故；简单可建模任务上用 MARL 则白白付出训练成本、丢掉可解释性和保证。\textbf{延伸}：很多最强的系统是混合的（\cref{sec:mc-apps} 的 CBF$+$MARL、本节的各种混合）——这恰恰说明二者互补而非替代。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：在能清晰建模的简单任务上硬上 MARL]
+\textbf{新手想法}：“这是多机协调，肯定要用本章学的 MARL，越复杂的方法越显水平。”\textbf{实际上}：如果任务的交互能清晰建模（如已知动力学的编队、可用凸优化解的分配）、环境稳定、且需要保证，那传统规控（共识/分布式 MPC/MAPF）更可控、可验证、无需训练、可解释——MARL 在这里没有优势，只有训练成本和黑箱风险。\textbf{正确思维}：先问“这个任务能不能用传统方法清晰建模并解决”。能且满足需求 $\to$ 用传统。只有当传统方法因“交互难建模 / 需强适应性 / 协调难显式设计”而吃力时，MARL 才有用武之地。\textbf{自检}：跑一个传统基线（如分布式 MPC 编队、ORCA 避障）；若传统基线就满足需求，就没有理由上 MARL。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （选型决策题）用本节决策树，为以下三个任务选择方案（纯 MARL / 纯传统 / 具体哪种混合），并走一遍决策树说明每一步的判断：(a) 医院里多台配送机器人在有行人的走廊运送药品；(b) 实验室里 $4$ 台机械臂协同装配一个已知 CAD 模型的零件；(c) 灾后废墟上多台足式机器人协同搬运伤员担架，地形和负载都高度不确定。
+  \item （混合设计题）选一个你认为最适合“MARL $+$ 传统规控混合”的多机任务，从三种混合范式（分层/安全过滤/残差）里选一种，画出混合架构框图（文字描述）：明确哪部分是 MARL、哪部分是传统、接口处传递什么信息、MARL 和传统各自的输入输出。说明为什么选这种范式而非另两种。
+  \item （全章总结题，跨章综合）本章是 \cref{ch:plan-safemarl}（MARL 基础）的应用延伸。请用一段话（不超过 $200$ 字）总结：\cref{ch:plan-safemarl} 给了什么、本章在其上加了什么、混合架构将进一步做什么，三者构成怎样的递进。然后回答一个判断题：有人说“既然混合架构更强，本章纯 MARL 是不是就没必要学了？”你怎么反驳（提示：理解纯 MARL 的能力边界，正是判断“何时需要混合、混合里 MARL 该承担什么”的前提；不懂纯 MARL 的软肋就不知道为什么要混合、怎么混合）？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\addcontentsline{toc}{section}{本章常见误解汇总}
+
+把全章散落的概念误区集中成一张“误解 $\to$ 正确理解”对照表，便于回头速查。这些误解大多源于“用单机 RL 的直觉硬套多机”，或“把软方法当硬保证”。
+
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.40\linewidth}p{0.46\linewidth}p{0.08\linewidth}}
+\toprule
+误解 & 正确理解 & 详见 \\
+\midrule
+把 $N$ 个机器人拼成巨型 MDP 用单智能体 RL 解 & 动作指数爆炸、要求全局通信、不可扩展——用 Dec-POMDP $+$ CTDE 去中心化解 & \cref{sec:mc-decpomdp} \\
+部分可观测只是“传感器有噪声” & 核心是信息缺失和局部性（看不到远处、看不到队友意图），不只是噪声 & \cref{sec:mc-decpomdp} \\
+既然是多智能体就要用最复杂的 MARL 算法 & 算法复杂度由任务耦合强度决定，弱耦合 IPPO 就够，先跑朴素基线 & \cref{sec:mc-decpomdp} \\
+邻居观测用固定槽位拼接 & 邻居是变长无序集合，必须用排列不变聚合，否则不可扩展、浪费样本 & \cref{sec:mc-perminv} \\
+排列不变 $=$ 排列等变 & 不变是输出不随输入重排而变（聚合邻居）；等变是输出随之重排（中心网络出所有动作） & \cref{sec:mc-perminv} \\
+观测信息越全（看到所有队友）越好 & 应匹配交互尺度和真机传感器能力，过大引入无关噪声、损害可迁移 & \cref{sec:mc-perminv} \\
+用全局绝对坐标做观测 & 用相对/本地坐标，否则样本效率低、无法泛化到新区域 & \cref{sec:mc-perminv} \\
+底层关节动作“更端到端所以更好” & 动作层级是工程权衡，多机协调常用速度层 $+$ 下层控制器分层，更稳更易迁移 & \cref{sec:mc-action} \\
+加稠密引导奖励就会改变任务最优解 & 势函数形式 $\gamma\Phi(s')-\Phi(s)$ 的塑形有定理保证不改变最优策略 & \cref{sec:mc-reward} \\
+奖励塑形和信用分配是不相干的两件事 & 奖励结构是缓解信用分配的第一道闸门（问题侧），与算法侧（COMA/QMIX）互补 & \cref{sec:mc-reward} \\
+纯团队奖励就能促协作 & 纯团队奖励导致懒惰智能体（搭便车），要用混合奖励（个体$+$共享） & \cref{sec:mc-reward} \\
+critic 用真值/特权信息是作弊、部署会出问题 & CTDE 下 critic 只训练时用、执行丢弃，作弊不传染给 actor，反而该放心喂全 & \cref{sec:mc-ctde} \\
+声称用 MAPPO 但 critic 只喂本地观测 & 那其实是 IPPO；MAPPO 的唯一优势就是 critic 看全局 & \cref{sec:mc-ctde} \\
+奖励里的碰撞惩罚就是“安全保证” & 软惩罚无硬保证，安全关键场景必须叠执行端硬安全层（CBF/盾） & \cref{sec:mc-apps} \\
+学习式避障“看起来很会躲”$=$有 ORCA 那样的安全保证 & 灵活 $\neq$ 有保证，学习式是统计倾向、分布外失效，需叠安全层 & \cref{sec:mc-apps} \\
+训练够久就能让 learned policy 根除碰撞 & 软约束范式结构上到不了硬 $0$，是范式上限不是训练量问题 & \cref{sec:mc-apps} \\
+多机域随机化照搬单机清单 & 多机要逐个体随机化 $+$ 补负载/接触/通信/数量等特有维度 & \cref{sec:mc-sim2real} \\
+显式通信信息多就一定更好 & 带宽与 sim-to-real 鲁棒性常成反比，接触隐式通信更鲁棒可扩展 & \cref{sec:mc-sim2real} \\
+多机 sim-to-real 是调参就能解决的工程问题 & 接触力建模是公认开放难题，需区分参数不确定与模型不准 & \cref{sec:mc-sim2real} \\
+MARL 是更先进方法、应取代传统规控 & 二者能力互补（MARL 灵活、传统有保证），最强系统常是混合 & \cref{sec:mc-boundary} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+本章把 \cref{ch:plan-safemarl} 的 MARL 框架落到了多机器人运动协调上。一条主线贯穿始终——\textbf{“别的机器人”这个动态、变长、无序的集合，到底该以什么形式进入一个机器人的决策回路}：在观测层，答案是排列不变聚合（\cref{sec:mc-perminv}，Deep Sets 定理 \cref{thm:mc-deepsets}）；在奖励层，是混合奖励缓解信用分配（\cref{eq:mc-mixed-reward}）$+$ 势函数塑形保最优（\cref{thm:mc-pbrs}）；在训练层，是中心化 critic 的喂料三方案（\cref{sec:mc-ctde}）；在迁移层，是接触隐式通信与可迁移表征（\cref{sec:mc-sim2real}）。把这四个层面的答案拼起来，就得到了一个可扩展、可迁移的多机协调系统。回到章首的三个“如果跳过会怎样”：加机器人就乱是因为没用排列不变（\cref{sec:mc-perminv}）；碰撞惩罚一大就冻结是奖励配比病态（\cref{sec:mc-reward}）；仿真好真机散架是多机 sim-to-real 的特有差距没随机化（\cref{sec:mc-sim2real}）。最后 \cref{sec:mc-boundary} 把全章放回工具箱：MARL 不是万能锤，它和传统规控能力互补——这既是本章的收口，也是混合架构的起点。
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\label{tab:mc-symbols}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$N,\ i,\ j$ & 机器人数 / 自己下标 / 队友下标 & \cref{sec:mc-decpomdp} \\
+$\mathcal{S},\ s$ & 全局真值状态空间 / 状态 & \cref{eq:mc-decpomdp} \\
+$o_i,\ O_i$ & 本地观测 / 观测函数 $o_i=O_i(s)$ & \cref{eq:mc-decpomdp} \\
+$\mathcal{A}_i,\ a_i,\ \mathbf{a}$ & 动作空间 / 动作 / 联合动作 & \cref{eq:mc-decpomdp} \\
+$P(s'\mid s,\mathbf{a})$ & 依赖联合动作的转移核 & \cref{eq:mc-decpomdp} \\
+$r_i,\ r^{\text{team}}$ & 个体奖励 / 团队奖励 & \cref{eq:mc-decpomdp} \\
+$\pi_\theta,\ V_\phi(s)$ & 共享 actor / 中心化 critic & \cref{sec:mc-ctde} \\
+$o_i^{\text{self}},\ o_{ij}^{\text{nbr}}$ & 自身观测分量 / 队友相对观测 & \cref{sec:mc-perminv} \\
+$\phi_{\mathrm{enc}},\ \rho,\ \oplus$ & 逐元素编码器 / 后处理 / 对称聚合算子 & \cref{eq:mc-deepsets} \\
+$g_i$ & 智能体 $i$ 的目标 & \cref{sec:mc-apps} \\
+$\Phi(s),\ F$ & 势函数 / 势函数塑形项 $\gamma\Phi(s')-\Phi(s)$ & \cref{eq:mc-pbrs} \\
+$h(x),\ \alpha$ & CBF 标量函数 / class-$\mathcal{K}$ 系数 & \cref{eq:mc-cbf-filter} \\
+$d_{ij},\ d_{\text{safe}}$ & 机间距 / 安全距离阈值 & \cref{eq:mc-soft-collision} \\
+$\lambda,\ \gamma,\ \eta$ & 混合奖励权重 / 折扣因子 / 学习率 & 全章 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{术语速查表}
+\label{tab:mc-glossary}
+\begin{tabular}{p{0.20\linewidth}p{0.24\linewidth}p{0.40\linewidth}p{0.08\linewidth}}
+\toprule
+术语 & 英文 & 一句话定义 & 首见 \\
+\midrule
+去中心化部分可观测 MDP & Dec-POMDP & 多个只看局部的智能体在共享环境里序贯决策的博弈框架 & \cref{sec:mc-decpomdp} \\
+联合学习 & joint learning & 把 $N$ 个智能体拼成超级智能体用单智能体 RL 解（动作爆炸、要全局通信） & \cref{sec:mc-decpomdp} \\
+排列不变 & permutation-invariant & 输入元素重排、输出不变（聚合邻居用） & \cref{sec:mc-perminv} \\
+排列等变 & permutation-equivariant & 输入元素重排、输出随之同样重排（中心网络出所有动作用） & \cref{sec:mc-perminv} \\
+Deep Sets & Deep Sets & 排列不变函数 $=$ 逐元素编码 $+$ 对称聚合 $+$ 后处理 & \cref{thm:mc-deepsets} \\
+本地/相对坐标 & egocentric/relative & 一切空间量相对于自己表达，使策略平移不变、可迁移 & \cref{sec:mc-egocentric} \\
+分层架构 & hierarchical & 上层 MARL 出高层指令、下层控制器精确执行 & \cref{sec:mc-action} \\
+势函数塑形 & PBRS & $F=\gamma\Phi(s')-\Phi(s)$ 形式的塑形，保最优策略不变 & \cref{thm:mc-pbrs} \\
+混合奖励 & mixed reward & 个体可归因部分 $+$ 共享团队部分的加权 & \cref{eq:mc-mixed-reward} \\
+懒惰智能体 & lazy agent & 纯团队奖励下搭便车摸鱼的智能体 & \cref{sec:mc-reward} \\
+奖励黑客 & reward hacking & 钻奖励空子刷分而非完成本意任务 & \cref{sec:mc-reward} \\
+中心化 critic & centralized critic & 训练时吃全局信息估值、执行时丢弃的 critic & \cref{sec:mc-ctde} \\
+特权信息 & privileged information & actor 看不到、critic 训练时可用的量（真值参数/队友意图） & \cref{sec:mc-ctde} \\
+控制障碍函数 & CBF & 用安全集前向不变性保证硬安全的约束，可做 QP 安全过滤 & \cref{sec:mc-apps} \\
+速度障碍/互惠避障 & ORCA/RVO & 几何避障方法，假设对方也避让各让一半 & \cref{sec:mc-apps} \\
+域随机化 & domain randomization & 训练时随机化物理参数逼策略鲁棒 & \cref{sec:mc-sim2real} \\
+接触隐式通信 & implicit communication & 零通信、纯靠物理接触力协调（sim-to-real 鲁棒） & \cref{sec:mc-sim2real} \\
+数量随机化 & agent-number randomization & 训练时随机智能体数 $N$，使策略对队友数量鲁棒 & \cref{sec:mc-sim2real} \\
+残差混合 & residual hybrid & 传统出基线、MARL 学修正的混合范式 & \cref{sec:mc-boundary} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表（难度用 \texorpdfstring{$\bigstar$}{star}）}
+\label{tab:mc-knowledge}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 运动协调的 Dec-POMDP 建模 & 五要件 $+$ 为何优于联合 MDP（动作爆炸/通信/可扩展） & \(\bigstar\bigstar\) \\
+2 & 联合 MDP 的三个致命问题 & 动作指数爆炸、要求全局通信、不可扩展 & \(\bigstar\bigstar\) \\
+3 & 排列不变性与 Deep Sets & 逐元素编码 $+$ 对称聚合，搜索空间从指数降到多项式 & \(\bigstar\bigstar\bigstar\) \\
+4 & 三种聚合算子 & mean(平均态势)/max(最危险)/attention(自适应)的取舍 & \(\bigstar\bigstar\bigstar\) \\
+5 & 本地坐标 $+$ 参数共享 $+$ 排列不变三件套 & 共同支撑“训少部署多”的零样本可扩展 & \(\bigstar\bigstar\bigstar\) \\
+6 & padding $+$ mask 的正确用法 & 计算性补齐 $+$ mask 保语义无序，与槽位拼接的本质区别 & \(\bigstar\bigstar\bigstar\) \\
+7 & 速度层 vs 关节层动作 & 协调发生在什么尺度决定层级；分层让二者各司其职 & \(\bigstar\bigstar\) \\
+8 & 动作缩放与裁剪 & tanh$\times$物理上限 $+$ 采样后 clamp，对齐真机能力 & \(\bigstar\bigstar\) \\
+9 & 三种奖励结构 & 全局团队/个体局部/混合的信用分配与协作取舍 & \(\bigstar\bigstar\bigstar\) \\
+10 & 势函数塑形 PBRS & $\gamma\Phi(s')-\Phi(s)$ 保最优，防横跳刷分 & \(\bigstar\bigstar\bigstar\) \\
+11 & 三种奖励病态 & 冻结/懒惰智能体/奖励黑客的识别与修复 & \(\bigstar\bigstar\bigstar\) \\
+12 & 距离型碰撞软惩罚 & 逼近就罚（有梯度）优于撞上才罚（稀疏） & \(\bigstar\bigstar\) \\
+13 & CTDE 在运动里的 critic 喂料 & 真值状态/特权信息/排列不变聚合三方案取舍 & \(\bigstar\bigstar\bigstar\) \\
+14 & MAPPO 参数共享数据流 & 多 agent 经验合并成大 batch 是样本效率来源 & \(\bigstar\bigstar\bigstar\) \\
+15 & 三大应用特化 & 导航(个体)/避障(max$+$互惠)/编队(共享队形)的设计差异 & \(\bigstar\bigstar\bigstar\) \\
+16 & 软惩罚的固有不安全 & learned policy 结构上无硬保证，需叠安全层 & \(\bigstar\bigstar\bigstar\) \\
+17 & CBF 安全层接法 & 安全集前向不变 $+$ QP 最小修正策略动作 & \(\bigstar\bigstar\bigstar\) \\
+18 & 从零搭 MAPPO 训练循环 & rollout$\to$GAE$\to$合并 batch PPO 更新 & \(\bigstar\bigstar\) \\
+19 & 训少部署多的实证 & 同一网络换 $N$ 直接部署，量化成功率衰减 & \(\bigstar\bigstar\) \\
+20 & 多机 sim-to-real 现实差距 & 逐个体随机化 $+$ 负载/接触/通信/数量特有维度 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+21 & 接触隐式通信 & 零通信靠接触力协调，带宽低但 sim-to-real 鲁棒 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+22 & 数量随机化 & 训练时随机 $N$ 使策略对队友数量鲁棒 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+23 & MARL vs 传统规控对照 & 能力互补：MARL 灵活、传统有保证 & \(\bigstar\bigstar\bigstar\) \\
+24 & 三种混合范式 & 分层/安全过滤/残差，让对的方法做对的事 & \(\bigstar\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\begin{itemize}
+  \item \textbf{去中心化导航/避障的 RL 化（奠基）}：Long、Fan、Pan 等\cite{long2018collision}（去中心化避障 RL 化奠基，本地观测 $+$ 无通信，本章 \cref{sec:mc-decpomdp,sec:mc-apps} 的源）；Everett、Chen、How\cite{everett2018cadrl}（GA3C-CADRL，用 LSTM 处理变长邻居、把社会礼貌编进奖励）；van den Berg 等\cite{vandenberg2011orca}（ORCA，几何式互惠避障，学习式避障的对照）。
+  \item \textbf{排列不变与可扩展性}（本章 \cref{sec:mc-perminv} 核心）：Zaheer 等\cite{zaheer2017deepsets}（Deep Sets，排列不变函数表示定理的原始论文）；An、Hutter 等\cite{an2024perminv}（把排列不变确立为多机协作可扩展的关键技术，训少部署多）。
+  \item \textbf{多足/多机器人协同运动与 sim-to-real}（本章 \cref{sec:mc-apps,sec:mc-sim2real} 核心）：Xiong 等\cite{xiong2024mqe}（MQE，多四足 MARL 标准基准，本章实战平台）；Pandit、Shrestha、Fern\cite{pandit2025decplm}（decPLM，零通信接触协调 $+$ 分层策略 $+$ constellation 奖励 $+$ 真机迁移，\cref{sec:mc-sim2real} 的核心案例）；MASQ\cite{masq2024}（把单机四腿当多智能体，MARL 思想“向内”应用）。
+  \item \textbf{奖励塑形}（本章 \cref{sec:mc-reward} 核心）：Ng、Harada、Russell\cite{ng1999shaping}（势函数塑形保最优性的原始定理）。
+  \item \textbf{MARL 基础与算法}（本章默认前置，深讲见 \cref{ch:plan-safemarl}）：MAPPO\cite{yu2022mappo}、HAPPO\cite{kuba2022happo}、MADDPG\cite{lowe2017maddpg}、COMA\cite{foerster2018coma}、VDN\cite{sunehag2018vdn}、QMIX\cite{rashid2018qmix}、HARL\cite{zhong2024harl}；Dec-POMDP 形式化 Bernstein 等\cite{bernstein2002decpomdp}、Markov Game Littman\cite{littman1994markov}。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\addcontentsline{toc}{section}{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.22\linewidth}p{0.22\linewidth}p{0.50\linewidth}}
+\toprule
+章节 & 关系 & 本章铺垫 / 复用 \\
+\midrule
+\cref{ch:plan-safemarl} 安全证书与 MARL & \textbf{直接前置} & 本章默认其 CTDE/非平稳/信用分配/值分解/策略梯度/CBF 全部结论，重叠处指过去 \\
+MARL 与传统规控混合（后续） & \textbf{直接延伸} & \cref{sec:mc-apps} 的 CBF 安全层、\cref{sec:mc-boundary} 的三种混合范式与选型决策框架 \\
+\cref{ch:mr-consensus} 共识与分布式优化 & 对照/可混合 & \cref{sec:mc-boundary} 把学习式编队与分布式 MPC/共识编队对照；残差混合可让 MPC 出基线、MARL 学修正 \\
+\cref{ch:planning} 运动规划导论 & 分层互补 & \cref{sec:mc-apps,sec:mc-boundary} 的分层混合：MAPF 出离散无碰撞计划、本章 MARL 做连续局部协调 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：训练 $N{=}2$ 正常，部署 $N{=}4$ 直接报维度错误/无法运行。\textbf{原因}：用了固定槽位拼接而非排列不变观测。\textbf{对策}：检查 actor 输入是否含固定槽位的队友，改用 Deep Sets 聚合的排列不变编码器（\cref{sec:mc-perminv}）。
+  \item \textbf{症状}：训练 $N{=}2$ 正常，部署 $N{=}8$ 成功率陡降。\textbf{原因}：训练时只见过稀疏邻居，拥挤态势分布外。\textbf{对策}：改为训练时随机 $N\in[2,4]$，重训后再测（\cref{sec:mc-n-random}）。
+  \item \textbf{症状}：所有机器人冻结在起点不动。\textbf{原因}：碰撞惩罚权重 $\gg$ 任务奖励，“不动”成最优。\textbf{对策}：分项打印各奖励均值，看碰撞项是否压过任务项，降碰撞权重/升到达奖励（\cref{sec:mc-reward}）。
+  \item \textbf{症状}：部分机器人积极、部分长期摸鱼打转。\textbf{原因}：纯团队奖励 $\to$ 懒惰智能体搭便车。\textbf{对策}：记录各 agent 各自贡献，改混合奖励加个体项 / 上 COMA-QMIX（\cref{sec:mc-reward}，\cref{ch:plan-safemarl}）。
+  \item \textbf{症状}：机器人在目标附近反复横跳不肯停。\textbf{原因}：进度奖励非势函数形式，被刷分（reward hacking）。\textbf{对策}：检查进度奖励是否为 $\gamma\Phi(s')-\Phi(s)$ 形式，若是朴素 $-$距离则改势函数差分形式（\cref{thm:mc-pbrs}）。
+  \item \textbf{症状}：训练初期物理引擎炸开（位置/速度变 NaN）。\textbf{原因}：动作未缩放裁剪，输出疯狂指令。\textbf{对策}：检查动作头是否 tanh$\times$物理上限、采样后是否 clamp，打印动作分位数确认在物理范围（\cref{sec:mc-action}）。
+  \item \textbf{症状}：自称用 MAPPO 但强耦合任务训不好、收敛慢。\textbf{原因}：critic 实际只喂本地观测（其实是 IPPO）。\textbf{对策}：检查 critic 输入维度，若等于单 agent 观测维度则给 critic 喂全局（\cref{sec:mc-ctde}）。
+  \item \textbf{症状}：邻居稀疏的场景策略明显更差。\textbf{原因}：padding 的假邻居未用 mask 屏蔽，污染聚合。\textbf{对策}：检查聚合是否用 mask、mean 分母是否用真实邻居数；同组真邻居 $+$ 不同 padding 数前向输出应一致（\cref{sec:mc-perminv}）。
+  \item \textbf{症状}：仿真编队完美，真机队形飘忽散架。\textbf{原因}：多机 sim-to-real 差距未随机化（接触/负载/逐个体）。\textbf{对策}：对照 \cref{tab:mc-dr} 逐行检查，确认负载/接触/数量等特有维度已纳入，评估是否接触力建模本身不准（\cref{sec:mc-sim2real}）。
+  \item \textbf{症状}：加安全层后机器人离老远就躲、任务做不动。\textbf{原因}：CBF 的 $\alpha$ 取太大，过保守。\textbf{对策}：调小 $\alpha$，记录安全层介入频率，权衡安全裕度 vs 任务效率（\cref{sec:mc-apps}）。
+  \item \textbf{症状}：多机各自解 CBF-QP 出现死锁/抖动。\textbf{原因}：去中心 CBF 约束耦合、互相误判意图。\textbf{对策}：检查是否多约束冲突致 QP 无解，加优先级/共享意图，QP 无解时安全兜底（减速/急停）（\cref{sec:mc-apps}）。
+  \item \textbf{症状}：同质 agent 学出不一致行为、协调差。\textbf{原因}：误用了 $N$ 个独立 actor 副本（破坏参数共享）。\textbf{对策}：确认 actor 是否只 new 一次被共用、update 是否合并所有 agent 经验（\cref{sec:mc-train}）。
+\end{enumerate}

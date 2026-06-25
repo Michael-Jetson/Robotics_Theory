@@ -1,0 +1,1662 @@
+\chapter{视觉里程计}
+\label{ch:vo}
+
+% ════════════════════════════════════════════════════════════════
+%  全吸收章：视觉SLAM十四讲 ch7（特征点法/对极几何/三角化/PnP/ICP）
+%  + ch8（光流 LK / 直接法）+ SLAM Handbook ch7（综述/重投影误差/BA/Schur/
+%    相机模型/RGB-D/前端架构/混合方法）。自包含独立记录，右扰动为主。
+%  教学层遵循 v5.0 算法工程教学规范（动机→反面→历史→理论→陷阱→练习
+%  + 符号表/速查/故障排查/API 速查/累积项目）。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 给定两幅图像的若干匹配像素点（都是 2D），在\emph{完全不知道}空间点深度的情况下，能否恢复相机的相对运动？能恢复到什么程度（位置？姿态？尺度？）？
+  \item 你打算优化相机位姿 $\mathbf{T}\in\SE(3)$ 使“把 3D 点投影到图像”的预测与实际像素观测一致。这个误差叫什么？它对 $\mathbf{T}$ 求导时，为什么不能像普通向量那样直接对 $\mathbf{T}$ 的元素求偏导？
+  \item ORB 特征 = ?\ +\ ?\ （关键点与描述子各是什么）。两个 BRIEF 二进制描述子之间的“距离”该怎么算，为什么不用欧氏距离？
+  \item 单目 SLAM 为什么必须“初始化”？为什么初始化时相机\emph{原地旋转}会失败？
+  \item 光流（如 Lucas--Kanade）和直接法都用到“灰度不变假设”。这个假设是什么？它什么时候不成立？光流估计的是\emph{像素的运动}，直接法估计的是\emph{什么}？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{提取并匹配} ORB 特征（说清 Oriented FAST 关键点的尺度/旋转改进、BRIEF 二进制描述子的构造与汉明距离匹配），并判断匹配是否可靠；
+  \item \textbf{推导}对极约束 $\mathbf{x}_2^\top\mathbf{E}\mathbf{x}_1=0$、本质矩阵 $\mathbf{E}=\mathbf{t}^\wedge\mathbf{R}$、基础矩阵 $\mathbf{F}$，并用\emph{八点法}从匹配点线性求解 $\mathbf{E}$、再 SVD 分解出 $\mathbf{R},\mathbf{t}$（含四解筛选）；
+  \item \textbf{推导}单应矩阵 $\mathbf{H}$ 的 DLT 求解，并说明何时（共面/纯旋转）必须改用 $\mathbf{H}$；
+  \item \textbf{推导}三角化求深度的最小二乘方程，并定量分析“视差—深度不确定度”矛盾；
+  \item \textbf{求解} PnP（3D-2D）：DLT 线性解、P3P 余弦定理方程、以及以\emph{右扰动}重投影误差为核心的 BA，并独立写出 $2\times6$ 雅可比；
+  \item \textbf{求解} ICP（3D-3D）：去质心 + SVD 闭式解（含 $\det<0$ 修正），以及李代数右扰动的非线性形式，并解释 ICP 解的全局最优性；
+  \item \textbf{推导} Lucas--Kanade 光流方程与最小二乘解、反向光流、金字塔多层光流；推导直接法的光度误差与链式雅可比，区分稀疏/半稠密/稠密；
+  \item \textbf{组织}视觉里程计前端：特征点法 vs 直接法的取舍、并行跟踪与建图、关键帧、共视局部 BA、Schur 消元，以及混合方法。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{从两幅图像里把相机怎么动了、点在哪里恢复出来}”的主线。视觉里程计（Visual Odometry, VO）就是 SLAM 前端：根据相邻图像估计相机的\emph{相对}运动，给后端较好的初值\cite{carlone2026handbook,gaoxiang2019slam14}。按\emph{可用信息}（2D-2D / 3D-2D / 3D-3D）和\emph{用不用特征}（特征点法 / 直接法）两条轴展开：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  drc/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (feat) {特征点\\ ORB=Oriented FAST+BRIEF};
+\node[grp, right=of feat] (epi) {2D-2D 对极几何\\ $\mathbf{E},\mathbf{F},\mathbf{H}$ 八点法};
+\node[grp, right=of epi] (tri) {三角化\\ 恢复深度};
+\node[grp, below=8mm of feat] (pnp) {3D-2D PnP\\ DLT/P3P/BA};
+\node[grp, right=of pnp] (icp) {3D-3D ICP\\ SVD/BA};
+\node[blk, right=of icp] (front) {前端架构\\ 关键帧/局部 BA/Schur};
+\node[drc, below=8mm of pnp] (flow) {光流 LK\\ 灰度不变};
+\node[drc, right=of flow] (direct) {直接法\\ 光度误差};
+\node[drc, right=of direct] (hybrid) {混合/学习\\ DSO/SuperGlue};
+\draw[ln] (feat)--(epi); \draw[ln] (epi)--(tri);
+\draw[ln] (feat.south)-- (pnp.north);
+\draw[ln] (pnp)--(icp); \draw[ln] (icp)--(front);
+\draw[ln] (tri.south) -- ++(0,-4mm) -| (pnp.north);
+\draw[ln] (flow)--(direct); \draw[ln] (direct)--(hybrid);
+\draw[ln] (feat.west) ++(-2mm,0) |- (flow.west);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径（骨干优先）}：第 \ref{sec:vo-feature}--\ref{sec:vo-pnp} 节是任何读者的主干（特征 $\to$ 对极几何 $\to$ 三角化 $\to$ PnP）。第 \ref{sec:vo-icp} 节 ICP 与点云/激光章相通。第 \ref{sec:vo-flow}--\ref{sec:vo-direct} 节（光流、直接法）是视觉里程计的另一大分支，VIO 与稠密重建会用到。第 \ref{sec:vo-frontend} 节把前端工程化（关键帧、局部 BA、Schur 消元），对接后端章。带 $*$ 的学习型特征、Power BA 为进阶/选读。
+
+\subsection*{前置知识桥接}
+\cref{ch:camera}（相机模型）已给出针孔投影 $s\mathbf{p}=\mathbf{K}\mathbf{P}_c$（见该章 \cref{eq:pinhole}）、内参 $\mathbf{K}=\big[\begin{smallmatrix}f_x&0&c_x\\0&f_y&c_y\\0&0&1\end{smallmatrix}\big]$（\cref{eq:intrinsic-scalar}）、归一化平面坐标 $\mathbf{x}=\mathbf{K}^{-1}\mathbf{p}$ 与畸变模型。本章默认\emph{内参已标定}，主角是\emph{相机怎么动、点在哪里}。\cref{ch:lie}（李群）给出了本章最关键的工具：位姿 $\mathbf{T}\in\SE(3)$ 不是向量空间，对它求导要用\emph{右扰动} $\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$，齐次点对位姿的右扰动导数为 $\mathbf{T}\,\tilde{\mathbf{p}}^{\,\odot}$（\cref{eq:right-pert-se3}）。\cref{ch:nlopt}（非线性优化）给出了高斯牛顿正规方程 $\mathbf{H}\delta\mathbf{x}=\mathbf{b}$（\cref{eq:gn-normal}）、LM 阻尼（\cref{eq:lm}）与 Schur 消元（\cref{eq:schur}），本章把它们具体落到“相机位姿 + 路标点”这个特定问题上。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 在 \cref{ch:vio}（VIO）里，你会看到视觉因子就是本章的\emph{重投影误差}或\emph{光度误差}，IMU 只是给它补尺度和重力——不懂本章你将不知道视觉残差从哪来、雅可比怎么填；
+  \item 在 \cref{ch:pointcloud}（点云）/激光 SLAM 里，扫描配准的核心就是本章的 \emph{ICP}——本章把“已匹配”的 ICP 讲透，那里再处理“匹配未知”。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\label{tab:vo-reading}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导、代码与练习） & 7--9 小时 & 首次系统学习、要做前端/写 VO \\
+速读（跳过冗长代数细节） & 2.5 小时 & 有基础、想对齐本书记号与右扰动约定 \\
+速查（只看小结速查表 + API 速查） & 20 分钟 & 写代码时回来查公式/雅可比 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+旋转 $\mathbf{R}\in\SO(3)$、位姿 $\mathbf{T}\in\SE(3)$；齐次点上加波浪 $\tilde{\mathbf{p}}=[\mathbf{p}^\top,1]^\top$。
+内参 $\mathbf{K}$，归一化平面坐标 $\mathbf{x}=\mathbf{K}^{-1}\mathbf{p}$，深度/尺度因子 $s$，“尺度意义下相等”记 $\simeq$（$s\mathbf{p}\simeq\mathbf{p}$，Handbook\cite{carlone2026handbook} 记 $\sim$）。
+本质矩阵 $\mathbf{E}=\mathbf{t}^\wedge\mathbf{R}$、基础矩阵 $\mathbf{F}=\mathbf{K}^{-\top}\mathbf{E}\mathbf{K}^{-1}$、单应 $\mathbf{H}$。
+运动方向：除非特别说明，对极几何/PnP 的 $(\mathbf{R},\mathbf{t})$ 指 $\mathbf{R}_{21},\mathbf{t}_{21}$（把第 1 相机系点变到第 2 相机系，$s_2\mathbf{p}_2=\mathbf{K}(\mathbf{R}\mathbf{P}+\mathbf{t})$）。
+\textbf{扰动方向：全书右扰动为主} $\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$，$\delta\boldsymbol{\xi}=[\delta\boldsymbol{\rho};\delta\boldsymbol{\phi}]$（平移在前）。十四讲\cite{gaoxiang2019slam14} 第 7、8 讲的解析雅可比与代码（`pose=SE3::exp(dx)*pose`）用的是\emph{左}扰动；本章引用其结论处会并列给出右扰动版本，并在小结说明二者经伴随 $\mathrm{Ad}(\mathbf{T})$ 的转换。
+注意 $\mathbf{E}$ 的 SVD 里 $\boldsymbol{\Sigma}$ 是奇异值矩阵，\emph{不是}协方差；像素观测协方差用 $\boldsymbol{\Sigma}_{\mathbf v}$、信息矩阵 $\boldsymbol{\Lambda}=\boldsymbol{\Sigma}_{\mathbf v}^{-1}$。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{特征点法：从像素到可匹配的路标}
+\label{sec:vo-feature}
+
+\paragraph{动机：图像是亮度矩阵，运动藏在哪？}
+视觉里程计的核心问题是：\emph{如何根据图像估计相机运动}\cite{gaoxiang2019slam14}。一帧图像不过是一个几十万元素的亮度/色彩矩阵，直接从“矩阵到矩阵”的层面去估计运动极其困难。务实的做法是：先从图像里选出少量\emph{有代表性、视角小幅变化后仍能再认出}的点，在不同图像中找到\emph{同一个点}，再围绕这些点谈相机位姿与点的定位。经典 SLAM 把这些点称为\emph{路标}（landmark）；视觉 SLAM 中路标就是\textbf{图像特征}（feature）。
+
+\paragraph{反面：直接拿单个像素当特征会怎样？}
+单个像素的灰度值确实也是一种“特征”，但它受光照、形变、材质影响严重——同一个物点在两帧里灰度可能差很多，几乎\emph{不可重复}。于是需要更稳定的局部结构。图像中“特别”的地方有三类（辨识度递减）：\emph{角点}（corner）、\emph{边缘}（edge）、\emph{区块}（blob）。角点辨识度最强（两个方向都有强梯度），边缘次之（沿边缘方向局部都相似，存在“孔径问题”），区块最弱。
+
+\begin{insight}
+角点之所以好用，是因为它在\emph{两个正交方向上灰度都剧烈变化}——这正是 Harris/Shi--Tomasi 检测器分析图像块\emph{二阶矩矩阵（结构张量）两个特征值}的几何含义\cite{carlone2026handbook}：两个特征值都大 $\Rightarrow$ 角点；一大一小 $\Rightarrow$ 边缘；都小 $\Rightarrow$ 平坦区。本章后面 LK 光流里出现的 $\mathbf{A}^\top\mathbf{A}$（\cref{eq:vo-lk-ls}）就是同一个矩阵——“能不能跟踪”和“是不是角点”是\emph{同一件事的两面}。
+\end{insight}
+
+\paragraph{历史：从 Harris 到 SIFT 再到 ORB。}
+角点检测算法多诞生于 2000 年前：Harris--Stephens（1988）、Shi--Tomasi（GFTT，1994）、FAST（2006）\cite{carlone2026handbook}。但单纯角点不够：远处的角点近看可能不是角点（尺度问题），图像旋转后外观改变难以再认（旋转问题）。为此设计了更稳定的局部特征：\textbf{SIFT}（Scale-Invariant Feature Transform，1999）综合考虑光照、尺度、旋转，鲁棒性极强但计算量极大；\textbf{SURF}（2006）用积分图 + 盒滤波近似 SIFT 提速；\textbf{ORB}（Oriented FAST and Rotated BRIEF，2011）则在 FAST 上补足方向、配二进制描述子 BRIEF，是质量与速度的极佳折中。
+
+\paragraph{人工设计特征点应有的四条性质\cite{gaoxiang2019slam14}。}
+\begin{enumerate}
+  \item \textbf{可重复性}（Repeatability）：相同特征能在不同图像中被找到；
+  \item \textbf{可区别性}（Distinctiveness）：不同特征有不同的表达；
+  \item \textbf{高效率}（Efficiency）：特征点数量应\emph{远小于}像素数；
+  \item \textbf{本地性}（Locality）：特征只与一小片图像区域相关。
+\end{enumerate}
+
+\paragraph{特征点 = 关键点 + 描述子。}
+一个特征点由两部分构成\cite{gaoxiang2019slam14,carlone2026handbook}：
+\begin{itemize}
+  \item \textbf{关键点}（key-point）：特征在图像里的位置（有些还带朝向、大小）；
+  \item \textbf{描述子}（descriptor）：通常是一个向量，按人为设计的方式描述关键点周围像素信息。设计原则是“\emph{外观相似的特征应有相似的描述子}”。于是“两个描述子在向量空间里距离相近 $\Rightarrow$ 是同一个特征点”。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{三种经典特征提取约 1000 个特征点的耗时对比（十四讲作者论文测试\cite{gaoxiang2019slam14}）}
+\label{tab:vo-feature-time}
+\begin{tabular}{lll}
+\toprule
+特征 & 提取约 1000 点耗时 & 备注 \\
+\midrule
+ORB  & $\approx 15.3$ ms & FAST 关键点 + BRIEF 描述子，本书主选 \\
+SURF & $\approx 217.3$ ms & 积分图近似 SIFT \\
+SIFT & $\approx 5228.7$ ms & 最经典最鲁棒；截至 2016 普通 CPU 无法实时 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 结论：GPU 加速的 SIFT 可实时但抬高 SLAM 成本；ORB 在质量与性能之间折中最好，故本书以 ORB 为代表。
+
+\subsection{ORB 关键点：Oriented FAST}
+\label{sec:vo-orb-kp}
+
+ORB 的关键点叫 \emph{Oriented FAST}，在原始 FAST 角点上补了\emph{方向}与\emph{尺度}。先看 FAST。
+
+\paragraph{FAST 角点检测过程\cite{gaoxiang2019slam14}。}思想极简单：若一个像素和它邻域差别大（过亮或过暗），它更可能是角点——只需比较亮度大小，故而极快（图 \ref{fig:vo-fast}）。
+\begin{enumerate}
+  \item 选取像素 $p$，设其亮度为 $I_p$；
+  \item 设阈值 $T$（比如 $I_p$ 的 $20\%$）；
+  \item 以 $p$ 为中心、半径 $3$，取圆上 $16$ 个像素；
+  \item 若圆上有\emph{连续 $N$ 个}点亮度都大于 $I_p+T$ 或都小于 $I_p-T$，则 $p$ 是特征点。$N$ 常取 $12$（称 \textbf{FAST-12}；也有 FAST-9、FAST-11）；
+  \item 对每个像素循环上述步骤。
+\end{enumerate}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=0.42,>=Stealth]
+  % center pixel
+  \fill[main!25] (0,0) circle (0.45) ;
+  \node at (0,0) {\scriptsize $p$};
+  % 16 pixels on radius-3 circle
+  \foreach \k in {0,...,15}{
+    \pgfmathsetmacro\ang{90 - \k*22.5}
+    \coordinate (P\k) at (\ang:3);
+    \fill[gray!30] (P\k) circle (0.32);
+  }
+  % highlight a contiguous arc (e.g. 9 bright pixels) k=0..8
+  \foreach \k in {0,...,8}{
+    \pgfmathsetmacro\ang{90 - \k*22.5}
+    \fill[second!55] (\ang:3) circle (0.32);
+  }
+  \draw[gray!50] (0,0) circle (3);
+  \node[font=\scriptsize, anchor=west] at (4,2) {连续 $N\!\ge\!12$ 个};
+  \node[font=\scriptsize, anchor=west] at (4,1.2) {更亮(或更暗)};
+  \node[font=\scriptsize, anchor=west] at (4,0.4) {$\Rightarrow p$ 为角点};
+  % pre-test pixels 1,5,9,13
+  \foreach \k in {0,4,8,12}{
+    \pgfmathsetmacro\ang{90 - \k*22.5}
+    \draw[third, very thick] (\ang:3) circle (0.42);
+  }
+  \node[font=\scriptsize, third!60!black, anchor=east] at (-3.8,-2) {预测试 1/5/9/13};
+\end{tikzpicture}
+\caption{FAST-12 角点检测：以 $p$ 为中心半径 $3$ 取圆上 $16$ 像素；若存在连续 $\ge 12$ 个像素都比 $I_p+T$ 亮或比 $I_p-T$ 暗，则 $p$ 为角点。粗圈标出的 $1,5,9,13$ 号用于预测试加速。（仿\cite{gaoxiang2019slam14} 重绘）}
+\label{fig:vo-fast}
+\end{figure}
+
+\paragraph{FAST-12 预测试加速\cite{gaoxiang2019slam14}。}对每个像素，先只检测圆上第 $1,5,9,13$ 个像素：只有当这 $4$ 个里有 $3$ 个同时大于 $I_p+T$ 或同时小于 $I_p-T$，当前像素才\emph{可能}是角点，否则直接排除——大幅加速。其后用\textbf{非极大值抑制}（non-maximal suppression）在小邻域内只保留响应最大的角点，避免角点“扎堆”。
+
+\paragraph{FAST 的缺点与 ORB 的两项改进\cite{gaoxiang2019slam14}。}FAST 重复性不强、分布不均、\emph{不带方向}、固定半径 $3$ 故有\emph{尺度问题}。ORB 补上：
+\begin{itemize}
+  \item \textbf{尺度不变性——图像金字塔}：对图像做多次固定倍率缩放得到金字塔，\emph{每层都检测角点}；底层是原图，越往上越小（可看作“远处场景”）。在不同层之间匹配 $\Rightarrow$ 尺度不变。例：相机后退时，应能在前一帧金字塔的\emph{上层}与后一帧金字塔的\emph{下层}找到匹配。
+  \item \textbf{旋转——灰度质心法}（Intensity Centroid）：把图像块的灰度当权重算“质心”，连接块的几何中心 $O$ 与质心 $C$ 得方向向量 $\overrightarrow{OC}$，作为特征点方向。
+\end{itemize}
+
+\begin{derivation}[灰度质心法求特征点方向]
+\label{def:vo-centroid}
+在以关键点为中心的小图像块 $B$ 中：
+
+\textbf{步骤 1（矩）}：定义图像块的矩
+\begin{equation}
+  m_{pq}=\sum_{x,y\in B} x^{p}y^{q}\, I(x,y),\qquad p,q\in\{0,1\}.
+  \label{eq:vo-moment}
+\end{equation}
+
+\textbf{步骤 2（质心）}：
+\begin{equation}
+  C=\Big(\frac{m_{10}}{m_{00}},\ \frac{m_{01}}{m_{00}}\Big).
+  \label{eq:vo-centroid}
+\end{equation}
+
+\textbf{步骤 3（方向）}：连接几何中心 $O$ 与质心 $C$，方向定义为
+\begin{equation}
+  \theta=\arctan\!\big(m_{01}/m_{10}\big).
+  \label{eq:vo-orientation}
+\end{equation}
+经此改进，FAST 同时具备尺度与旋转描述，ORB 称之为 \emph{Oriented FAST}。
+\end{derivation}
+
+\subsection{ORB 描述子：Rotated BRIEF}
+\label{sec:vo-brief}
+
+\paragraph{BRIEF 是二进制描述子\cite{gaoxiang2019slam14,carlone2026handbook}。}描述向量由许多 $0/1$ 组成，每一位编码关键点附近\emph{两个随机像素} $p,q$ 的灰度大小关系：若 $I(p)>I(q)$ 取 $1$，否则取 $0$。取 $128$（或 $256$）个这样的 $(p,q)$ 对，得 $128$（或 $256$）维二进制向量。它\emph{极快}（只比大小）、\emph{存储省}（二进制位），非常适合实时匹配。
+
+\paragraph{旋转不变性——Steer BRIEF\cite{gaoxiang2019slam14}。}原始 BRIEF 不具旋转不变性（图像一转，采样点对的相对位置就变了）。ORB 用 Oriented FAST 阶段已算出的方向 $\theta$（\cref{eq:vo-orientation}），先把每对采样点 $(p,q)$ 按 $\theta$ \emph{旋转}再比较，得到“Steered/Rotated BRIEF”，于是具备较好旋转不变性。综合下来，ORB 在平移、旋转、缩放下都表现良好，是实时 SLAM 的热门选择。
+
+\subsection{特征匹配：数据关联与汉明距离}
+\label{sec:vo-match}
+
+\paragraph{匹配 = 数据关联\cite{gaoxiang2019slam14}。}特征匹配解决 SLAM 的\textbf{数据关联}（data association）问题：当前看到的路标与之前看到的路标谁对谁。误匹配（局部相似 + 重复纹理）广泛存在，是视觉 SLAM 的性能瓶颈之一。
+
+\paragraph{暴力匹配与距离度量。}设 $I_t$ 提取特征点 $\mathbf{x}_t^m\,(m=1,\dots,M)$、$I_{t+1}$ 提取 $\mathbf{x}_{t+1}^n\,(n=1,\dots,N)$。\textbf{暴力匹配}（Brute-Force）对每个 $\mathbf{x}_t^m$ 与所有 $\mathbf{x}_{t+1}^n$ 测描述子距离、排序取最近。距离的选择取决于描述子类型：
+\begin{itemize}
+  \item \textbf{浮点描述子}（如 SIFT/SURF）$\to$ 欧氏距离；
+  \item \textbf{二进制描述子}（如 BRIEF）$\to$ \textbf{汉明距离}（Hamming distance）：两个二进制串\emph{不同位的个数}。
+\end{itemize}
+为什么二进制描述子不用欧氏距离？因为每一位只有 $0/1$，“距离”的自然含义就是\emph{有多少位不同}；而汉明距离可由\emph{异或后数 $1$}（\texttt{popcount}）在硬件上一条指令算完，比浮点欧氏距离快得多。特征点很多时（尤其拿一帧与整张地图匹配），暴力匹配运算量太大，改用\textbf{快速近似最近邻}（FLANN）。
+
+\begin{practice}[OpenCV 提取 ORB 并匹配]
+下面用 OpenCV 提取并匹配 ORB（十四讲 \texttt{orb\_cv.cpp}\cite{gaoxiang2019slam14}）。注意匹配筛选准则与经验阈值。
+\begin{codebox}[C++]{OpenCV ORB 提取 + 暴力汉明匹配 + 筛选}
+#include <opencv2/features2d/features2d.hpp>
+using namespace cv;
+// -- 初始化：检测器/描述子/匹配器（二进制描述子用 Hamming）
+Ptr<FeatureDetector>   detector  = ORB::create();
+Ptr<DescriptorExtractor> descriptor = ORB::create();
+Ptr<DescriptorMatcher> matcher = DescriptorMatcher::create("BruteForce-Hamming");
+
+// -- 第一步：检测 Oriented FAST 角点
+std::vector<KeyPoint> kp1, kp2;
+detector->detect(img_1, kp1);
+detector->detect(img_2, kp2);
+// -- 第二步：按角点位置计算 BRIEF 描述子
+Mat des1, des2;
+descriptor->compute(img_1, kp1, des1);
+descriptor->compute(img_2, kp2, des2);
+// -- 第三步：用 Hamming 距离匹配
+std::vector<DMatch> matches;
+matcher->match(des1, des2, matches);
+// -- 第四步：筛选。距离 > 2*最小距离即认为误匹配；最小距离可能极小,
+//    故设经验下限 30.0（工程经验, 不一定有理论依据）
+auto mm = std::minmax_element(matches.begin(), matches.end(),
+    [](const DMatch &a, const DMatch &b){ return a.distance < b.distance; });
+double min_dist = mm.first->distance, max_dist = mm.second->distance;
+std::vector<DMatch> good;
+for (int i = 0; i < des1.rows; i++)
+    if (matches[i].distance <= std::max(2.0 * min_dist, 30.0))
+        good.push_back(matches[i]);   // 保留好匹配
+\end{codebox}
+典型终端输出（十四讲数值例）：\texttt{Max dist : 95}，\texttt{Min dist : 4}；ORB 提取两张图约 $22.9$ ms、匹配约 $0.75$ ms——\emph{大部分计算量在提取}。未筛选含大量误匹配，筛选后数目减少但多数正确；运动估计仍需进一步去外点（RANSAC）。
+\end{practice}
+
+\begin{practice}[手写 ORB：质心定向 + SSE 汉明匹配]
+十四讲 \texttt{orb\_self.cpp}\cite{gaoxiang2019slam14} 用 $256$ 位描述子（$8\times$ 32 位 \texttt{uint32}），用三角函数避开 \texttt{arctan} 与 \texttt{sin/cos}，用 SSE 指令 \texttt{\_mm\_popcnt\_u32} 数汉明距离。
+\begin{codebox}[C++]{手写 ORB 描述子（旋转 BRIEF）核心}
+// 质心法定向（与式 (centroid) 一致）：不算 arctan, 直接拿 sin/cos
+float m01 = 0, m10 = 0;
+for (int dx = -8; dx < 8; ++dx)
+  for (int dy = -8; dy < 8; ++dy) {
+    uchar pixel = img.at<uchar>(kp.pt.y + dy, kp.pt.x + dx);
+    m01 += dx * pixel;  m10 += dy * pixel;       // 块的一阶矩
+  }
+float m_sqrt = sqrt(m01*m01 + m10*m10);
+float sin_t = m01 / m_sqrt, cos_t = m10 / m_sqrt; // 方向的 sin/cos
+// 对每个采样对 (p,q) 先按 theta 旋转再比较灰度 -> Steered BRIEF
+for (int i = 0; i < 8; i++) {
+  uint32_t d = 0;
+  for (int k = 0; k < 32; k++) {
+    int idx = i * 8 + k;
+    cv::Point2f p(ORB_pattern[idx*4],   ORB_pattern[idx*4+1]);
+    cv::Point2f q(ORB_pattern[idx*4+2], ORB_pattern[idx*4+3]);
+    cv::Point2f pp = cv::Point2f(cos_t*p.x - sin_t*p.y,
+                                 sin_t*p.x + cos_t*p.y) + kp.pt;  // 旋转
+    cv::Point2f qq = cv::Point2f(cos_t*q.x - sin_t*q.y,
+                                 sin_t*q.x + cos_t*q.y) + kp.pt;
+    if (img.at<uchar>(pp.y, pp.x) < img.at<uchar>(qq.y, qq.x)) d |= 1 << k;
+  }
+  desc[i] = d;   // 第 i 个 32 位字
+}
+// 汉明距离 = 异或后数 1（SSE popcount, 一条指令）
+int distance = 0;
+for (int k = 0; k < 8; k++)
+  distance += _mm_popcnt_u32(desc1[i1][k] ^ desc2[i2][k]);  // 阈值 d_max=40
+\end{codebox}
+数值例：手写提取仅 $3.9$ ms、匹配 $0.86$ ms，比 OpenCV 提取快约 $5.8$ 倍（需 CPU 支持 SSE）。
+\end{practice}
+
+\begin{pitfall}[编程陷阱：二进制描述子误用欧氏距离 / 浮点描述子用汉明]
+\textbf{错误}：对 ORB/BRIEF 这类二进制描述子用 \texttt{NORM\_L2}（欧氏），或对 SIFT 浮点描述子用 \texttt{NORM\_HAMMING}。
+\textbf{现象}：匹配质量莫名很差、好匹配寥寥，但不报错。
+\textbf{根因}：欧氏距离假设各维是连续实数；二进制位上它退化为“位差平方和的根号”，丢掉了“位”的语义且更慢。汉明距离要求逐位异或，对浮点位模式毫无意义。
+\textbf{正确}：二进制描述子用 \texttt{BruteForce-Hamming}/\texttt{NORM\_HAMMING}；浮点描述子用 \texttt{NORM\_L2}。自检：打印 \texttt{Min/Max dist}，二进制描述子的距离应是\emph{整数}且 $\le$ 位数。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：把“两倍最小距离 + 30”当成普适真理]
+\textbf{错误}：把 \texttt{distance <= max(2*min\_dist, 30)} 当成放之四海皆准的匹配阈值。
+\textbf{现象}：换数据集后要么把好匹配筛没了、要么漏不掉误匹配。
+\textbf{根因}：这是\emph{工程经验}，$30$ 是针对 $256$ 位 ORB 的下限托底；不同描述子位数、不同场景纹理，最优阈值不同。
+\textbf{正确}：把它当\emph{初值}；更稳的是比率测试（Lowe ratio：最近/次近 $<0.7\sim0.8$）+ 后续 RANSAC 几何校验（用对极约束/单应一致性剔除外点）。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 解释为什么 FAST 预测试只查 $1,5,9,13$ 四个点就能排除大量非角点；若改 FAST-9，预测试该如何调整？
+  \item 写出从 $256$ 位 ORB 描述子计算汉明距离的纯标量代码（不用 SSE），并说明它和 \texttt{popcount} 的等价性。
+  \item （概念）ORB 的旋转不变性来自把 BRIEF 采样对按 $\theta$ 旋转。若 $\theta$ 估计有 $10^\circ$ 误差，描述子会受多大影响？这解释了为什么 ORB 旋转不变性“较好”而非“完美”。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{2D-2D：对极几何}
+\label{sec:vo-epipolar}
+
+\paragraph{动机：单目两帧，只有 2D 像素，能恢复运动吗？}
+得到匹配点对后，按相机种类分三种情形估计运动\cite{gaoxiang2019slam14}：\textbf{(1) 单目}——只有两组 2D 像素 $\Rightarrow$ \emph{对极几何}；\textbf{(2) 双目/RGB-D}——两组 3D 点 $\Rightarrow$ \emph{ICP}（\cref{sec:vo-icp}）；\textbf{(3) 一组 3D 一组 2D} $\Rightarrow$ \emph{PnP}（\cref{sec:vo-pnp}）。本节从信息最少的 2D-2D 出发。这类问题也叫\emph{两视图几何}（two-view geometry）。
+
+\subsection{对极约束的推导}
+\label{sec:vo-epi-constraint}
+
+\paragraph{几何术语（图 \ref{fig:vo-epipolar}）。}两帧 $I_1,I_2$，相机中心 $O_1,O_2$，第一帧到第二帧运动 $\mathbf{R},\mathbf{t}$。$I_1$ 特征点 $\mathbf{p}_1$ 与 $I_2$ 特征点 $\mathbf{p}_2$ 是同一空间点 $\mathbf{P}$ 的两次投影\cite{gaoxiang2019slam14}：
+\begin{itemize}
+  \item $O_1,O_2,\mathbf{P}$ 三点确定的平面叫\emph{极平面}（epipolar plane）；
+  \item 基线 $O_1O_2$ 与两像平面的交点 $e_1,e_2$ 叫\emph{极点}（epipoles）；
+  \item 极平面与两像平面的交线 $l_1,l_2$ 叫\emph{极线}（epipolar line）。
+\end{itemize}
+直觉：从第一帧看，射线 $\overrightarrow{O_1\mathbf{p}_1}$ 上所有点都投影到同一像素 $\mathbf{p}_1$；不知 $\mathbf{P}$ 深度时，$\mathbf{P}$ 在第二图中的可能投影位置就是第二图的极线 $l_2$。匹配确定了 $\mathbf{p}_2$ $\Rightarrow$ 反推 $\mathbf{P}$ 与相机运动。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=1.0,>=Stealth,font=\small]
+  \coordinate (O1) at (0,0);
+  \coordinate (O2) at (5,-0.4);
+  \coordinate (P)  at (3.2,3.0);
+  \fill (O1) circle (1.6pt) node[below left]{$O_1$};
+  \fill (O2) circle (1.6pt) node[below right]{$O_2$};
+  \fill[main] (P) circle (1.8pt) node[above]{$\mathbf{P}$};
+  % image planes (segments)
+  \draw[second,thick] (0.6,1.6)--(2.0,1.0) node[midway,above left=-2pt]{$I_1$};
+  \draw[second,thick] (3.7,1.1)--(5.1,0.6) node[midway,above right=-2pt]{$I_2$};
+  % rays
+  \draw[gray,dashed] (O1)--(P);
+  \draw[gray,dashed] (O2)--(P);
+  % projected points
+  \coordinate (p1) at (1.28,1.32);  \fill[red] (p1) circle (1.3pt) node[left=1pt]{$\mathbf{p}_1$};
+  \coordinate (p2) at (4.34,0.86);  \fill[red] (p2) circle (1.3pt) node[right=1pt]{$\mathbf{p}_2$};
+  % baseline
+  \draw[thick,black!60] (O1)--(O2) node[midway,below]{基线};
+  % epipoles (intersection of baseline with image planes), schematic
+  \fill[third] (1.55,1.18) circle (1.1pt) node[below left=-1pt]{$e_1$};
+  \fill[third] (3.95,1.02) circle (1.1pt) node[above right=-1pt]{$e_2$};
+  % epipolar line l2 on I2
+  \draw[third,thick] (3.7,1.1)--(5.1,0.6);
+  \node[third!60!black] at (5.4,1.3) {极平面 $O_1O_2\mathbf{P}$};
+\end{tikzpicture}
+\caption{对极几何：空间点 $\mathbf{P}$ 在两帧的投影 $\mathbf{p}_1,\mathbf{p}_2$。$O_1,O_2,\mathbf{P}$ 共面（极平面），对极约束 $\mathbf{x}_2^\top\mathbf{t}^\wedge\mathbf{R}\,\mathbf{x}_1=0$ 正是这一共面性的代数表达。（仿\cite{gaoxiang2019slam14} 重绘）}
+\label{fig:vo-epipolar}
+\end{figure}
+
+\begin{derivation}[对极约束、本质矩阵、基础矩阵（逐步不跳）]
+\label{thm:vo-epi}
+设 $\mathbf{P}$ 在第一相机系坐标为 $\mathbf{P}=[X,Y,Z]^\top$。针孔模型给出两像素\cite{gaoxiang2019slam14}：
+\begin{equation}
+  s_1\mathbf{p}_1=\mathbf{K}\mathbf{P},\qquad s_2\mathbf{p}_2=\mathbf{K}(\mathbf{R}\mathbf{P}+\mathbf{t}).
+  \label{eq:vo-pinhole2}
+\end{equation}
+齐次坐标下乘任意非零常数等价，记\emph{尺度意义下相等} $s\mathbf{p}\simeq\mathbf{p}$，于是 $\mathbf{p}_1\simeq\mathbf{K}\mathbf{P}$、$\mathbf{p}_2\simeq\mathbf{K}(\mathbf{R}\mathbf{P}+\mathbf{t})$。取归一化平面坐标
+\begin{equation}
+  \mathbf{x}_1=\mathbf{K}^{-1}\mathbf{p}_1,\qquad \mathbf{x}_2=\mathbf{K}^{-1}\mathbf{p}_2,
+  \label{eq:vo-norm}
+\end{equation}
+代入得 $\mathbf{x}_2\simeq\mathbf{R}\mathbf{x}_1+\mathbf{t}$。两边\emph{左乘} $\mathbf{t}^\wedge$（与 $\mathbf{t}$ 做外积，消去 $\mathbf{t}$ 项）：
+\begin{equation}
+  \mathbf{t}^\wedge\mathbf{x}_2\simeq\mathbf{t}^\wedge\mathbf{R}\mathbf{x}_1.
+  \label{eq:vo-cross}
+\end{equation}
+再两边\emph{左乘} $\mathbf{x}_2^\top$：
+\begin{equation}
+  \mathbf{x}_2^\top\mathbf{t}^\wedge\mathbf{x}_2\simeq\mathbf{x}_2^\top\mathbf{t}^\wedge\mathbf{R}\mathbf{x}_1.
+  \label{eq:vo-cross2}
+\end{equation}
+关键观察：$\mathbf{t}^\wedge\mathbf{x}_2$ 是同时垂直于 $\mathbf{t}$ 与 $\mathbf{x}_2$ 的向量，再与 $\mathbf{x}_2$ 做内积 $\Rightarrow$ 恒为 $0$。左侧严格为零，乘任意非零常数仍为零，故 $\simeq$ 可写成\emph{等号}：
+\begin{equation}
+  \boxed{\ \mathbf{x}_2^\top\,\mathbf{t}^\wedge\mathbf{R}\,\mathbf{x}_1=0.\ }
+  \label{eq:vo-epi-x}
+\end{equation}
+代回 $\mathbf{x}_i=\mathbf{K}^{-1}\mathbf{p}_i$：
+\begin{equation}
+  \mathbf{p}_2^\top\,\mathbf{K}^{-\top}\mathbf{t}^\wedge\mathbf{R}\mathbf{K}^{-1}\,\mathbf{p}_1=0.
+  \label{eq:vo-epi-p}
+\end{equation}
+两式都称\textbf{对极约束}，几何意义就是 $O_1,\mathbf{P},O_2$ 共面。定义
+\begin{equation}
+  \mathbf{E}=\mathbf{t}^\wedge\mathbf{R},\qquad \mathbf{F}=\mathbf{K}^{-\top}\mathbf{E}\mathbf{K}^{-1},\qquad
+  \mathbf{x}_2^\top\mathbf{E}\mathbf{x}_1=\mathbf{p}_2^\top\mathbf{F}\mathbf{p}_1=0,
+  \label{eq:vo-EF}
+\end{equation}
+分别叫\textbf{本质矩阵}（Essential matrix）与\textbf{基础矩阵}（Fundamental matrix）。
+\end{derivation}
+
+\noindent 于是相机位姿估计变成两步：\textbf{(1)} 由匹配点求 $\mathbf{E}$ 或 $\mathbf{F}$；\textbf{(2)} 由 $\mathbf{E}$ 或 $\mathbf{F}$ 求 $\mathbf{R},\mathbf{t}$。$\mathbf{E}$ 与 $\mathbf{F}$ 只差内参 $\mathbf{K}$；SLAM 中 $\mathbf{K}$ 通常已知，故实践常用更简单的 $\mathbf{E}$。
+
+\begin{insight}
+对极约束把“两幅图、未知深度、未知运动”这个看似欠定的问题，压缩成了一个\emph{不含深度 $s$ 的}双线性等式 $\mathbf{x}_2^\top\mathbf{E}\mathbf{x}_1=0$。深度被“消掉”正是因为 $\mathbf{t}^\wedge\mathbf{x}_2\perp\mathbf{x}_2$——这一步是整套两视图几何的“魔法”：它让我们\emph{先求运动、后求结构}，绕开了“鸡生蛋”。
+\end{insight}
+
+\subsection{本质矩阵的性质与八点法}
+\label{sec:vo-eight-point}
+
+\paragraph{$\mathbf{E}$ 的内在性质\cite{gaoxiang2019slam14}。}$\mathbf{E}=\mathbf{t}^\wedge\mathbf{R}$ 是 $3\times3$、$9$ 个数，但：
+\begin{itemize}
+  \item \textbf{尺度等价}：$\mathbf{E}$ 乘任意非零常数仍满足对极约束（等式右边为 $0$）；
+  \item \textbf{奇异值必为 $[\sigma,\sigma,0]^\top$}：可由 $\mathbf{E}=\mathbf{t}^\wedge\mathbf{R}$ 证明\cite{gaoxiang2019slam14}（$\mathbf{t}^\wedge$ 秩 $2$，故 $\mathbf{E}$ 秩 $2$、两非零奇异值相等）；
+  \item 平移、旋转各 $3$ 自由度 $\Rightarrow$ $\mathbf{t}^\wedge\mathbf{R}$ 共 $6$；扣掉尺度等价 $\Rightarrow$ $\mathbf{E}$ 实际 \textbf{$5$ 自由度}。
+\end{itemize}
+$5$ 自由度理论上最少 $5$ 对点（五点法\cite{gaoxiang2019slam14}），但内在性质非线性、求解麻烦。只用 $\mathbf{E}$ 的\emph{线性}性质（尺度等价），用 \textbf{$8$ 对点}即可在线性代数框架里求——经典\textbf{八点法}（eight-point algorithm）。
+
+\begin{derivation}[八点法：把对极约束线性化求 $\mathbf{E}$]
+\label{thm:vo-eight}
+一对匹配的归一化坐标 $\mathbf{x}_1=[u_1,v_1,1]^\top$、$\mathbf{x}_2=[u_2,v_2,1]^\top$。把 $\mathbf{E}$ 写成
+\[
+  \mathbf{E}=\begin{pmatrix}e_1&e_2&e_3\\e_4&e_5&e_6\\e_7&e_8&e_9\end{pmatrix},
+\]
+对极约束 $\mathbf{x}_2^\top\mathbf{E}\mathbf{x}_1=0$ 展开为关于向量 $\mathbf{e}=[e_1,\dots,e_9]^\top$ 的\emph{线性}方程：
+\begin{equation}
+  [u_2u_1,\ u_2v_1,\ u_2,\ v_2u_1,\ v_2v_1,\ v_2,\ u_1,\ v_1,\ 1]\cdot\mathbf{e}=0.
+  \label{eq:vo-eight-row}
+\end{equation}
+$8$ 对点堆成 $8\times9$ 系数矩阵（第 $i$ 行如 \cref{eq:vo-eight-row}）：
+\begin{equation}
+  \begin{pmatrix}
+  u_2^1u_1^1 & u_2^1v_1^1 & u_2^1 & v_2^1u_1^1 & v_2^1v_1^1 & v_2^1 & u_1^1 & v_1^1 & 1\\
+  \vdots & & & & & & & & \vdots\\
+  u_2^8u_1^8 & u_2^8v_1^8 & u_2^8 & v_2^8u_1^8 & v_2^8v_1^8 & v_2^8 & u_1^8 & v_1^8 & 1
+  \end{pmatrix}\mathbf{e}=\mathbf{0}.
+  \label{eq:vo-eight-sys}
+\end{equation}
+若系数矩阵秩为 $8$，则 $\mathbf{e}$ 张成一维零空间（与 $\mathbf{E}$ 的尺度等价吻合）$\Rightarrow$ $\mathbf{E}$ 各元素（差一个尺度）确定。
+\end{derivation}
+
+\begin{derivation}[从 $\mathbf{E}$ 用 SVD 恢复 $\mathbf{R},\mathbf{t}$（含四解与奇异值投影）]
+\label{thm:vo-recover-Rt}
+对 $\mathbf{E}$ 做 SVD\cite{gaoxiang2019slam14}：$\mathbf{E}=\mathbf{U}\boldsymbol{\Sigma}\mathbf{V}^\top$，$\mathbf{U},\mathbf{V}$ 正交，理想 $\boldsymbol{\Sigma}=\mathrm{diag}(\sigma,\sigma,0)$。对任意 $\mathbf{E}$，存在两组可能的 $\mathbf{t},\mathbf{R}$（$\mathbf{R}_Z(\pm\tfrac{\pi}{2})$ 为绕 $Z$ 轴 $\pm90^\circ$ 的旋转）：
+\begin{align}
+  \mathbf{t}_1^\wedge=\mathbf{U}\mathbf{R}_Z(\tfrac{\pi}{2})\boldsymbol{\Sigma}\mathbf{U}^\top,&\qquad
+  \mathbf{R}_1=\mathbf{U}\mathbf{R}_Z^\top(\tfrac{\pi}{2})\mathbf{V}^\top,\label{eq:vo-Rt1}\\
+  \mathbf{t}_2^\wedge=\mathbf{U}\mathbf{R}_Z(-\tfrac{\pi}{2})\boldsymbol{\Sigma}\mathbf{U}^\top,&\qquad
+  \mathbf{R}_2=\mathbf{U}\mathbf{R}_Z^\top(-\tfrac{\pi}{2})\mathbf{V}^\top.\label{eq:vo-Rt2}
+\end{align}
+又因 $-\mathbf{E}$ 与 $\mathbf{E}$ 等价，对任一 $\mathbf{t}$ 取负也成立 $\Rightarrow$ \textbf{共 $4$ 个可能解}。
+\emph{四解筛选}：把任一空间点代入 $4$ 个解，只有\emph{一个}解使 $\mathbf{P}$ 在\emph{两个}相机下都有\emph{正深度}（在相机前方），即正确解。
+\emph{奇异值投影}：八点法线性解出的 $\mathbf{E}$ 奇异值不一定恰为 $(\sigma,\sigma,0)$；对其 SVD 得 $\boldsymbol{\Sigma}=\mathrm{diag}(\sigma_1,\sigma_2,\sigma_3)$（$\sigma_1\ge\sigma_2\ge\sigma_3$），投影回 $\mathbf{E}$ 所在流形：
+\begin{equation}
+  \mathbf{E}\leftarrow\mathbf{U}\,\mathrm{diag}\!\Big(\tfrac{\sigma_1+\sigma_2}{2},\tfrac{\sigma_1+\sigma_2}{2},0\Big)\mathbf{V}^\top,
+  \label{eq:vo-E-project}
+\end{equation}
+或更简单地取 $\mathrm{diag}(1,1,0)$（$\mathbf{E}$ 尺度等价，合理）。
+\end{derivation}
+
+\paragraph{多于 $8$ 对点：最小二乘\cite{gaoxiang2019slam14}。}实际常有几十上百对匹配（如 $79$ 对）。把 \cref{eq:vo-eight-sys} 左侧系数矩阵记 $\mathbf{A}$，$\mathbf{A}\mathbf{e}=\mathbf{0}$ 超定，一般无精确解，转为最小化二次型
+\begin{equation}
+  \min_{\mathbf{e}}\|\mathbf{A}\mathbf{e}\|_2^2=\min_{\mathbf{e}}\mathbf{e}^\top\mathbf{A}^\top\mathbf{A}\mathbf{e}\quad(\text{约束 }\|\mathbf{e}\|=1),
+  \label{eq:vo-eight-ls}
+\end{equation}
+解即 $\mathbf{A}^\top\mathbf{A}$ 最小特征值对应的特征向量。存在误匹配时更倾向 \textbf{RANSAC}（随机采样一致性）而非纯最小二乘——RANSAC 反复随机取 $8$ 点算 $\mathbf{E}$、用对极约束统计内点，选内点最多的模型，能容忍外点。
+
+\subsection{单应矩阵}
+\label{sec:vo-homography}
+
+\paragraph{动机：点都在一个平面上时。}当匹配点都落在\emph{同一空间平面}（墙、地面、桌面，或相机几乎纯旋转）时，$\mathbf{E}/\mathbf{F}$ 会\emph{退化}——自由度下降、求解不稳。此时用\textbf{单应矩阵}（Homography）$\mathbf{H}$ 描述两平面间的映射更稳\cite{gaoxiang2019slam14}。
+
+\begin{derivation}[单应矩阵 $\mathbf{H}$ 的推导（中间代数不跳）]
+\label{thm:vo-H}
+设匹配点 $\mathbf{p}_1,\mathbf{p}_2$ 落在空间平面上，平面方程 $\mathbf{n}^\top\mathbf{P}+d=0$，即 $-\tfrac{\mathbf{n}^\top\mathbf{P}}{d}=1$。代入 \cref{eq:vo-pinhole2} 的第二式：
+\begin{align}
+  \mathbf{p}_2&\simeq\mathbf{K}(\mathbf{R}\mathbf{P}+\mathbf{t})
+   \simeq\mathbf{K}\Big(\mathbf{R}\mathbf{P}+\mathbf{t}\cdot\big(-\tfrac{\mathbf{n}^\top\mathbf{P}}{d}\big)\Big)\notag\\
+  &\simeq\mathbf{K}\Big(\mathbf{R}-\tfrac{\mathbf{t}\mathbf{n}^\top}{d}\Big)\mathbf{P}
+   \simeq\mathbf{K}\Big(\mathbf{R}-\tfrac{\mathbf{t}\mathbf{n}^\top}{d}\Big)\mathbf{K}^{-1}\mathbf{p}_1.
+  \label{eq:vo-H-derive}
+\end{align}
+把中间部分记为 $\mathbf{H}=\mathbf{K}\big(\mathbf{R}-\tfrac{\mathbf{t}\mathbf{n}^\top}{d}\big)\mathbf{K}^{-1}$（$3\times3$），即
+\begin{equation}
+  \mathbf{p}_2\simeq\mathbf{H}\mathbf{p}_1.
+  \label{eq:vo-H}
+\end{equation}
+展开（$\simeq$，$\mathbf{H}$ 可乘非零常数，常令 $h_9=1$），用第三行消尺度：
+\begin{equation}
+  u_2=\frac{h_1u_1+h_2v_1+h_3}{h_7u_1+h_8v_1+h_9},\qquad
+  v_2=\frac{h_4u_1+h_5v_1+h_6}{h_7u_1+h_8v_1+h_9}.
+  \label{eq:vo-H-uv}
+\end{equation}
+整理成关于 $\mathbf{h}$ 的线性式：
+\begin{align}
+  h_1u_1+h_2v_1+h_3-h_7u_1u_2-h_8v_1u_2&=u_2,\notag\\
+  h_4u_1+h_5v_1+h_6-h_7u_1v_2-h_8v_1v_2&=v_2.
+  \label{eq:vo-H-lin}
+\end{align}
+每对点给 $2$ 个约束，$\mathbf{H}$（$8$ 自由度）由 \textbf{$4$ 对匹配点}（非三点共线）解出，称\textbf{直接线性变换}（DLT）。
+\end{derivation}
+
+\paragraph{$\mathbf{H}$ 的分解与退化处理\cite{gaoxiang2019slam14}。}求出 $\mathbf{H}$ 后用数值法或解析法分解，与 $\mathbf{E}$ 类似返回\emph{ $4$ 组} $\mathbf{R},\mathbf{t}$，并附带平面法向量 $\mathbf{n}$。用“地图点深度全正（相机前方）”排除两组，剩两组需更多先验（如平面法向）判断；若平面与相机平面平行，理论上 $\mathbf{n}=[0,0,1]^\top$（沿光轴）。\textbf{工程做法}：当特征共面或相机纯旋转，$\mathbf{F}$ 退化、多余自由度被噪声主导，故\emph{同时估计 $\mathbf{F}$ 和 $\mathbf{H}$，选重投影误差较小者}作为最终运动。
+
+\begin{practice}[对极约束求运动 + 验证]
+十四讲 \texttt{pose\_estimation\_2d2d.cpp}\cite{gaoxiang2019slam14}：OpenCV 算 $\mathbf{F}/\mathbf{E}/\mathbf{H}$ 并从 $\mathbf{E}$ 恢复 $\mathbf{R},\mathbf{t}$。
+\begin{codebox}[C++]{从匹配点估计 E/F/H 并恢复运动}
+Mat K = (Mat_<double>(3,3) << 520.9,0,325.1, 0,521.0,249.7, 0,0,1); // TUM 内参
+// 匹配点转 Point2f
+std::vector<Point2f> p1, p2;
+for (auto &m : matches) { p1.push_back(kp1[m.queryIdx].pt);
+                          p2.push_back(kp2[m.trainIdx].pt); }
+// 基础矩阵（八点法）、本质矩阵、单应（RANSAC）
+Mat F = findFundamentalMat(p1, p2, CV_FM_8POINT);
+Point2d pp(325.1, 249.7);  double focal = 521;          // 光心、焦距
+Mat E = findEssentialMat(p1, p2, focal, pp);
+Mat H = findHomography(p1, p2, RANSAC, 3);              // 本例非平面, H 意义不大
+// 从 E 恢复 R,t（内部检测深度为正, 自动选 4 解中的正确解）
+Mat R, t;
+recoverPose(E, p1, p2, R, t, focal, pp);
+// 验证: t^R 应与 E 成比例; 对每对点 y2^T (t^ R) y1 应 ~ 0
+\end{codebox}
+数值例（$79$ 对匹配）：对极约束 $\mathbf{y}_2^\top\mathbf{t}^\wedge\mathbf{R}\mathbf{y}_1$ 残差约 $10^{-3}$ 量级；恢复的 $\mathbf{t}\approx[-0.822,-0.033,0.568]^\top$。OpenCV 用深度为正自动筛出正确解。
+\end{practice}
+
+\begin{insight}[单目尺度不确定性]
+$\mathbf{E}$ 尺度等价 $\Rightarrow$ 分解出的 $\mathbf{t}$ 也只到尺度。$\mathbf{R}\in\SO(3)$ 自带约束，故\emph{只剩 $\mathbf{t}$ 的一个尺度}自由。把 $\mathbf{t}$ 归一化（长度 $1$）就直接造成\textbf{单目尺度不确定性}\cite{gaoxiang2019slam14}：数值例中 $t_x\approx0.822$，这 $0.822$ 是米还是厘米无从判断——对轨迹与地图\emph{同时}缩放任意倍，图像完全不变。这正是单目 SLAM 必须\emph{初始化}（固定一个尺度）的根源；另一种固定法是令初始化时所有特征点\emph{平均深度为 $1$}，数值上更稳。
+\end{insight}
+
+\begin{pitfall}[思维陷阱：单目初始化用纯旋转]
+\textbf{错误}：拿相机原地转一圈做单目初始化。
+\textbf{现象}：恢复不出尺度、三角化深度全是垃圾、初始化反复失败。
+\textbf{根因}：纯旋转 $\Rightarrow$ $\mathbf{t}=\mathbf{0}$ $\Rightarrow$ $\mathbf{E}=\mathbf{t}^\wedge\mathbf{R}=\mathbf{0}$，无从求 $\mathbf{R}$；此时虽可靠 $\mathbf{H}$ 求旋转，但\emph{没有平移就没有三角形}，无法三角化出点的位置。
+\textbf{正确}：初始化必须有\emph{足够平移}；经验上“左右平移”比“原地旋转”更易初始化成功。自检：平移太小则 $\mathbf{E}$ 接近零矩阵、解极不稳。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：以为 $\mathbf{E}$ 和 $\mathbf{F}$ 可以混用]
+\textbf{错误}：拿\emph{像素坐标} $\mathbf{p}$ 去套 $\mathbf{E}$，或拿\emph{归一化坐标} $\mathbf{x}$ 去套 $\mathbf{F}$。
+\textbf{现象}：对极约束残差巨大、恢复的运动完全错。
+\textbf{根因}：$\mathbf{E}=\mathbf{t}^\wedge\mathbf{R}$ 作用在\emph{归一化坐标} $\mathbf{x}=\mathbf{K}^{-1}\mathbf{p}$ 上（$\mathbf{x}_2^\top\mathbf{E}\mathbf{x}_1=0$）；$\mathbf{F}=\mathbf{K}^{-\top}\mathbf{E}\mathbf{K}^{-1}$ 作用在\emph{像素坐标} $\mathbf{p}$ 上（$\mathbf{p}_2^\top\mathbf{F}\mathbf{p}_1=0$）。
+\textbf{正确}：内参已知时统一用 $\mathbf{E}$ + 归一化坐标；记牢“$\mathbf{E}$ 吃 $\mathbf{x}$、$\mathbf{F}$ 吃 $\mathbf{p}$”。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 从 \cref{eq:vo-epi-x} 出发，逐步重新推出 \cref{eq:vo-epi-p}，写清每一步用到了什么（提示：$\mathbf{x}=\mathbf{K}^{-1}\mathbf{p}$）。
+  \item 证明 $\mathbf{E}=\mathbf{t}^\wedge\mathbf{R}$ 的秩为 $2$（提示：$\mathbf{t}^\wedge$ 秩 $2$，$\mathbf{R}$ 满秩），从而其奇异值必有一个为 $0$。
+  \item （开放）给定 $79$ 对匹配里有约 $10\%$ 误匹配，写出用 RANSAC 估 $\mathbf{E}$ 的伪代码：每轮取几点、用什么判据数内点、迭代次数如何定。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{三角化：从两视图恢复深度}
+\label{sec:vo-triangulation}
+
+\paragraph{动机：有了运动，点在哪？}对极几何给出了相机运动 $\mathbf{R},\mathbf{t}$，但单目单帧无法获得深度。\textbf{三角化}（triangulation，又称三角测量）通过\emph{不同位置观察同一路标}来推断其距离\cite{gaoxiang2019slam14}（高斯提出，原用于测量学/天文）。
+
+\begin{derivation}[三角化的最小二乘方程]
+\label{thm:vo-tri}
+以左图为参考，右图位姿 $\mathbf{R},\mathbf{t}$，归一化坐标 $\mathbf{x}_1,\mathbf{x}_2$ 满足\cite{gaoxiang2019slam14}
+\begin{equation}
+  s_2\mathbf{x}_2=s_1\mathbf{R}\mathbf{x}_1+\mathbf{t},
+  \label{eq:vo-tri-eq}
+\end{equation}
+$\mathbf{R},\mathbf{t}$ 已知，求深度 $s_1,s_2$。两边\emph{左乘} $\mathbf{x}_2^\wedge$ 消去左侧（$\mathbf{x}_2^\wedge\mathbf{x}_2=\mathbf{0}$）：
+\begin{equation}
+  \mathbf{0}=s_1\mathbf{x}_2^\wedge\mathbf{R}\mathbf{x}_1+\mathbf{x}_2^\wedge\mathbf{t}.
+  \label{eq:vo-tri-cross}
+\end{equation}
+\cref{eq:vo-tri-cross} 是关于 $s_1$ 的（超定，三行）线性方程，解出 $s_1$ 后回代 \cref{eq:vo-tri-eq} 得 $s_2$。理论上 $\overrightarrow{O_1\mathbf{p}_1}$ 与 $\overrightarrow{O_2\mathbf{p}_2}$ 交于 $\mathbf{P}$；噪声使两射线常\emph{不相交}，故 \cref{eq:vo-tri-cross} 在最小二乘意义下求解（等价于求两射线公垂线中点，或用 SVD 解线性三角化 DLT）。
+\end{derivation}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=1.0,>=Stealth,font=\small]
+  \coordinate (O1) at (0,0); \coordinate (O2) at (4.5,0);
+  \fill (O1) circle (1.4pt) node[below]{$O_1$};
+  \fill (O2) circle (1.4pt) node[below]{$O_2$};
+  \coordinate (P) at (2.5,2.6);
+  \fill[main] (P) circle (1.6pt) node[above]{$\mathbf{P}$};
+  \draw[->,gray] (O1)--(2.7,2.81); \draw[->,gray] (O2)--(2.3,2.85);
+  \node[red] at (1.2,1.35) {$\mathbf{x}_1$}; \node[red] at (3.7,1.4) {$\mathbf{x}_2$};
+  \draw[thick,black!60] (O1)--(O2) node[midway,below]{$\mathbf{t}$ (基线)};
+  % small parallax illustration
+  \draw[third,thick,->] (O1)++(0.9,0.9) arc (45:75:1.2);
+  \node[third!60!black] at (1.0,1.9) {视差};
+\end{tikzpicture}
+\caption{三角化：两相机从不同视角观测同一点 $\mathbf{P}$，由视差（parallax）反推深度。基线 $\mathbf{t}$ 越长、视差越大，深度估计越准。（仿\cite{gaoxiang2019slam14} 重绘）}
+\label{fig:vo-tri}
+\end{figure}
+
+\begin{practice}[OpenCV 三角化]
+十四讲 \texttt{triangulation.cpp}\cite{gaoxiang2019slam14} 调 \texttt{cv::triangulatePoints}。
+\begin{codebox}[C++]{两视图线性三角化}
+Mat T1 = (Mat_<float>(3,4) << 1,0,0,0, 0,1,0,0, 0,0,1,0);   // 参考帧 [I|0]
+Mat T2 = (Mat_<float>(3,4) <<                                  // 右帧 [R|t]
+  R.at<double>(0,0),R.at<double>(0,1),R.at<double>(0,2),t.at<double>(0,0),
+  R.at<double>(1,0),R.at<double>(1,1),R.at<double>(1,2),t.at<double>(1,0),
+  R.at<double>(2,0),R.at<double>(2,1),R.at<double>(2,2),t.at<double>(2,0));
+std::vector<Point2f> pts1, pts2;
+for (auto &m : matches) {                 // 像素 -> 归一化平面坐标
+  pts1.push_back(pixel2cam(kp1[m.queryIdx].pt, K));
+  pts2.push_back(pixel2cam(kp2[m.trainIdx].pt, K));
+}
+Mat pts4d;
+cv::triangulatePoints(T1, T2, pts1, pts2, pts4d);   // 输出齐次 4D 点
+for (int i = 0; i < pts4d.cols; i++) {              // 齐次 -> 非齐次
+  Mat x = pts4d.col(i);  x /= x.at<float>(3,0);     // 除以第 4 维归一化
+  // (x0,x1,x2) 即该点在参考系下的 3D 坐标
+}
+\end{codebox}
+\end{practice}
+
+\subsection{三角化的不确定度矛盾}
+\label{sec:vo-tri-uncertainty}
+
+\begin{insight}[视差—深度不确定度矛盾]
+三角化精度受\emph{视差}（parallax）支配\cite{gaoxiang2019slam14}：特征点在像素上动一个 $\delta x$ $\Rightarrow$ 视线角变 $\delta\theta$ $\Rightarrow$ 深度变 $\delta d$（可用正弦定理定量分析，图 \ref{fig:vo-tri}）。平移 $\mathbf{t}$ 大时同样的像素抖动 $\delta x$ 引起的 $\delta d$ 明显更小——\emph{平移大、三角化准}。但矛盾在于：增大平移会让两帧外观差异变大、\emph{特征匹配更难}；平移太小又精度不够。这就是三角化的根本矛盾。
+\end{insight}
+
+\paragraph{两条改进路径与延迟三角化\cite{gaoxiang2019slam14}。}
+(1) 提高特征点提取精度（提高分辨率，但增计算）；(2) 增大平移量（但外观变化导致匹配困难）。单目里常\emph{等特征被追踪几帧、积累足够视角}再三角化新点，称\textbf{延迟三角化}。原地旋转视差小 $\Rightarrow$ 深度估不准、易追踪失败、尺度不正确（机器人原地转很常见，要警惕）。若把特征点深度建模为高斯并不断观测、信息正确时方差不断收敛 $\Rightarrow$ 得\textbf{深度滤波器}（depth filter）：对每个待估深度维护均值与方差，每来一帧用三角化得到的新深度测量做一次贝叶斯更新（高斯乘高斯仍是高斯，均值取信息加权平均、方差按信息 $1/\sigma^2$ 累加），观测一致时方差单调收缩、最终给出该点的深度及其不确定度；它是单目稠密/半稠密建图的基石。
+
+\begin{pitfall}[概念误区：以为三角化在纯旋转下也能用]
+\textbf{错误}：相机几乎纯旋转时仍指望三角化出深度。
+\textbf{现象}：深度值乱跳、方差不收敛、地图点飘飞。
+\textbf{根因}：三角化依赖\emph{平移产生的三角形}；$\mathbf{t}\to\mathbf{0}$ 时两射线几乎平行、交点对噪声极敏感（视差趋零）。
+\textbf{正确}：监控视差角，低于阈值（如 $1^\circ$）就\emph{暂不}三角化该点，等视差累积；或对纯旋转段切换到只跟踪不建点。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用正弦定理把“像素抖动 $\delta x \to$ 深度抖动 $\delta d$”写成关于基线长 $\|\mathbf{t}\|$、深度 $d$、焦距 $f$ 的近似式，验证 $\delta d \propto d^2/(f\|\mathbf{t}\|)$ 量级。
+  \item 从 \cref{eq:vo-tri-eq} 推出 \cref{eq:vo-tri-cross}，并说明为什么三行方程里只有两行独立（提示：$\mathbf{x}_2^\wedge$ 秩 $2$）。
+  \item （设计）给定一段“先平移后原地旋转”的轨迹，设计一个判据决定每个新特征何时三角化。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{3D-2D：PnP}
+\label{sec:vo-pnp}
+
+\paragraph{动机：知道 3D 点又看到它的像，运动好求多了。}\textbf{PnP}（Perspective-$n$-Point）求 3D-2D 点对的运动：已知 $n$ 个 3D 空间点及其在图像中的投影位置，估计相机位姿\cite{gaoxiang2019slam14}。3D 位置可由三角化或 RGB-D 深度图得到。相比 2D-2D 对极几何（需 $\ge8$ 点、有初始化/纯旋转/尺度问题），PnP \emph{不需要对极约束}、最少 \textbf{$3$ 点（+1 验证点）}即可，且在少匹配点下也能给较好估计——是最重要的姿态估计方法。双目/RGB-D VO 可直接用 PnP；单目须先初始化。
+
+\paragraph{方法分类\cite{gaoxiang2019slam14}。}P3P（$3$ 对点）、直接线性变换 DLT、EPnP（Efficient PnP）、UPnP；以及非线性优化（最小二乘迭代）即\textbf{光束法平差}（Bundle Adjustment, BA）。下面依次讲 DLT、P3P、BA。
+
+\subsection{直接线性变换 DLT}
+\label{sec:vo-pnp-dlt}
+
+\begin{derivation}[PnP 的 DLT 解]
+\label{thm:vo-dlt}
+空间点齐次坐标 $\mathbf{P}=(X,Y,Z,1)^\top$，投影到归一化平面齐次点 $\mathbf{x}_1=(u_1,v_1,1)^\top$，位姿增广矩阵 $[\mathbf{R}\mid\mathbf{t}]$（$3\times4$，元素 $t_1,\dots,t_{12}$）\cite{gaoxiang2019slam14}：
+\begin{equation}
+  s\begin{pmatrix}u_1\\v_1\\1\end{pmatrix}=
+  \begin{pmatrix}t_1&t_2&t_3&t_4\\t_5&t_6&t_7&t_8\\t_9&t_{10}&t_{11}&t_{12}\end{pmatrix}
+  \begin{pmatrix}X\\Y\\Z\\1\end{pmatrix}.
+  \label{eq:vo-dlt-eq}
+\end{equation}
+用最后一行消 $s$，记行向量 $\mathbf{t}_1=(t_1,t_2,t_3,t_4)^\top$、$\mathbf{t}_2=(t_5,\dots,t_8)^\top$、$\mathbf{t}_3=(t_9,\dots,t_{12})^\top$，每点给两个线性约束：
+\begin{equation}
+  \mathbf{t}_1^\top\mathbf{P}-\mathbf{t}_3^\top\mathbf{P}\,u_1=0,\qquad
+  \mathbf{t}_2^\top\mathbf{P}-\mathbf{t}_3^\top\mathbf{P}\,v_1=0.
+  \label{eq:vo-dlt-constraint}
+\end{equation}
+$N$ 个点堆成
+\begin{equation}
+  \begin{pmatrix}
+  \mathbf{P}_1^\top & \mathbf{0} & -u_1\mathbf{P}_1^\top\\
+  \mathbf{0} & \mathbf{P}_1^\top & -v_1\mathbf{P}_1^\top\\
+  \vdots & \vdots & \vdots\\
+  \mathbf{P}_N^\top & \mathbf{0} & -u_N\mathbf{P}_N^\top\\
+  \mathbf{0} & \mathbf{P}_N^\top & -v_N\mathbf{P}_N^\top
+  \end{pmatrix}
+  \begin{pmatrix}\mathbf{t}_1\\\mathbf{t}_2\\\mathbf{t}_3\end{pmatrix}=\mathbf{0}.
+  \label{eq:vo-dlt-sys}
+\end{equation}
+$\mathbf{t}$ 共 $12$ 维 $\Rightarrow$ 最少 \textbf{$6$ 对点}线性求 $[\mathbf{R}\mid\mathbf{t}]$；$>6$ 对用 SVD 求超定最小二乘解。
+\end{derivation}
+
+\paragraph{旋转约束的处理\cite{gaoxiang2019slam14}。}DLT 把 $[\mathbf{R}\mid\mathbf{t}]$ 当 $12$ 个自由数，忽略了 $\mathbf{R}\in\SO(3)$。平移在向量空间易办；旋转需对估出的左 $3\times3$ 块找最近的真旋转矩阵，用 QR 分解或
+\begin{equation}
+  \mathbf{R}\leftarrow(\mathbf{R}\mathbf{R}^\top)^{-\frac12}\mathbf{R},
+  \label{eq:vo-dlt-Rproj}
+\end{equation}
+相当于把结果从一般矩阵空间重投影回 $\SE(3)$ 流形。
+
+\subsection{P3P}
+\label{sec:vo-p3p}
+
+\begin{derivation}[P3P：用余弦定理把问题化为二元二次方程组]
+\label{thm:vo-p3p}
+P3P 仅用 $3$ 对匹配点 $A,B,C$（3D，世界系坐标已知）与其投影 $a,b,c$（2D），外加一对验证点 $D$-$d$ 选解\cite{gaoxiang2019slam14}。相机光心 $O$。对三角形 $\triangle Oab$-$\triangle OAB$ 等，用余弦定理：
+\begin{align}
+  OA^2+OB^2-2\,OA\cdot OB\cos\langle a,b\rangle&=AB^2,\notag\\
+  OB^2+OC^2-2\,OB\cdot OC\cos\langle b,c\rangle&=BC^2,\notag\\
+  OA^2+OC^2-2\,OA\cdot OC\cos\langle a,c\rangle&=AC^2.
+  \label{eq:vo-p3p-cos}
+\end{align}
+全体除以 $OC^2$，记 $x=OA/OC,\ y=OB/OC$：
+\begin{align}
+  x^2+y^2-2xy\cos\langle a,b\rangle&=AB^2/OC^2,\notag\\
+  y^2+1-2y\cos\langle b,c\rangle&=BC^2/OC^2,\notag\\
+  x^2+1-2x\cos\langle a,c\rangle&=AC^2/OC^2.
+  \label{eq:vo-p3p-xy}
+\end{align}
+记 $v=AB^2/OC^2,\ u\,v=BC^2/OC^2,\ w\,v=AC^2/OC^2$，把第一式的 $v$ 代入后两式消 $v$：
+\begin{align}
+  (1-u)y^2-u\,x^2-\cos\langle b,c\rangle\,y+2u\,xy\cos\langle a,b\rangle+1&=0,\notag\\
+  (1-w)x^2-w\,y^2-\cos\langle a,c\rangle\,x+2w\,xy\cos\langle a,b\rangle+1&=0.
+  \label{eq:vo-p3p-final}
+\end{align}
+\emph{已知/未知}：$3$ 个余弦角由 2D 图像位置算出；$u=BC^2/AB^2,\ w=AC^2/AB^2$ 由 $A,B,C$ 世界坐标算出（变换到相机系比值不变）；$x,y$ 未知。\cref{eq:vo-p3p-final} 是关于 $x,y$ 的\emph{二元二次方程组}，解析解需\emph{吴消元法}，最多 $4$ 个解，用验证点 $D$-$d$ 选正确解。得到 $A,B,C$ 的相机系 3D 坐标后，PnP 就转成了 \textbf{3D-3D 的 ICP}（\cref{sec:vo-icp}）。
+\end{derivation}
+
+\paragraph{P3P 的问题与工程做法\cite{gaoxiang2019slam14}。}P3P 只用 $3$ 点，匹配点更多时利用不上；$3$ 点受噪声或误匹配即失效。EPnP/UPnP 用更多点 + 迭代消噪改进（EPnP 用 $4$ 个控制点的重心坐标表示所有 3D 点、构线性系统 $\mathbf{M}\mathbf{x}=\mathbf{0}$ 求解）。SLAM 常做法：先 P3P/EPnP 估初值，再构 BA 精化；相机连续时可用匀速/不动假设作初值。
+
+\subsection{最小化重投影误差求解 PnP（BA，右扰动）}
+\label{sec:vo-pnp-ba}
+
+\paragraph{从似然到加权重投影误差。}线性法先求位姿再求点；非线性优化把它们一起优化，这类“相机 + 三维点同时最小化”的问题统称 \textbf{Bundle Adjustment}\cite{carlone2026handbook,gaoxiang2019slam14}。先看单帧（PnP）形式，再到一般 BA（\cref{sec:vo-frontend}）。Handbook\cite{carlone2026handbook} 从概率给出干净推导：设观测像素被高斯噪声扰动，似然
+\begin{equation}
+  p(\mathbf{z}_j\mid\mathbf{P}_j^c)\sim\mathcal{N}\!\big(\pi(\mathbf{P}_j^c),\,\boldsymbol{\Sigma}_{\mathbf v,j}\big),
+  \label{eq:vo-likelihood}
+\end{equation}
+$\pi$ 为投影函数（\cref{ch:camera}），$\boldsymbol{\Sigma}_{\mathbf v,j}$ 为像素噪声协方差（各向同性时 $=\sigma^2\mathbf{I}_2$）。最大化似然 $=$ 最小化负对数似然，去掉常数得加权平方重投影误差
+\begin{equation}
+  E_{\text{reproj}}=\frac12\sum_j\big\|\mathbf{z}_j-\pi(\mathbf{P}_j^c)\big\|_{\boldsymbol{\Sigma}_{\mathbf v,j}}^2,
+  \label{eq:vo-reproj-cost}
+\end{equation}
+其中 $\|\mathbf{e}\|_{\boldsymbol{\Sigma}}^2=\mathbf{e}^\top\boldsymbol{\Sigma}^{-1}\mathbf{e}$ 是马氏范数。处理外点用鲁棒核 $\rho(\cdot)$（Huber/Tukey）：$E_{\text{robust}}=\tfrac12\sum_j\rho\big(\|\mathbf{z}_j-\pi(\mathbf{P}_j^c)\|_{\boldsymbol{\Sigma}_{\mathbf v,j}}\big)$。PnP 即只优化\emph{当前位姿}（地图点固定）的特例\cite{carlone2026handbook}：
+\begin{equation}
+  \mathbf{T}^*=\arg\min_{\mathbf{T}}\frac12\sum_{i=1}^{n}\Big\|\mathbf{u}_i-\frac1{s_i}\mathbf{K}\mathbf{T}\mathbf{P}_i\Big\|_2^2,
+  \label{eq:vo-pnp-ba}
+\end{equation}
+误差项 = 观测像素 $\mathbf{u}_i$ $-$ 3D 点投影位置 = \textbf{重投影误差}（reprojection error，图 \ref{fig:vo-reproj}）。这正是 Handbook 的 pose-only BA / PTAM 跟踪线程所解的式子。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=1.0,>=Stealth,font=\small]
+  \coordinate (C) at (0,0);
+  \fill (C) circle (1.4pt) node[left]{$O$ (相机)};
+  \coordinate (P) at (3.6,2.4);
+  \fill[main] (P) circle (1.6pt) node[above]{$\mathbf{P}_i$ (已知 3D)};
+  % image plane
+  \draw[second,thick] (1.4,-0.4)--(1.4,2.0) node[above]{像平面};
+  \draw[gray,dashed] (C)--(P);
+  % projected point
+  \coordinate (proj) at (1.4,0.93);  \fill[third] (proj) circle (1.3pt) node[right=1pt]{$\hat{\mathbf{u}}=\pi(\mathbf{T}\mathbf{P}_i)$};
+  % observed point
+  \coordinate (obs) at (1.4,1.45);   \fill[red] (obs) circle (1.3pt) node[right=1pt]{$\mathbf{u}_i$ (观测)};
+  \draw[->,very thick,red] (proj)--(obs) node[midway,left=1pt]{$\mathbf{e}$};
+\end{tikzpicture}
+\caption{重投影误差：已知 3D 点 $\mathbf{P}_i$ 按当前位姿 $\mathbf{T}$ 投影得 $\hat{\mathbf{u}}=\pi(\mathbf{T}\mathbf{P}_i)$，与实际观测 $\mathbf{u}_i$ 之差 $\mathbf{e}$。优化 $\mathbf{T}$（及在完整 BA 中也优化 $\mathbf{P}_i$）使 $\sum\|\mathbf{e}\|^2$ 最小。（仿\cite{gaoxiang2019slam14,carlone2026handbook} 重绘）}
+\label{fig:vo-reproj}
+\end{figure}
+
+现在推导核心：重投影误差对位姿的 $2\times6$ 雅可比。十四讲用\emph{左}扰动；本书主线用\emph{右}扰动，二者只在“变换后点对位姿的导数”那一项不同，下面先给\emph{公共}的投影项，再分别给左右两版。
+
+\begin{derivation}[重投影误差的 $2\times6$ 雅可比（先公共项，再右扰动主线）]
+\label{thm:vo-reproj-jac}
+记相机系下的点 $\mathbf{P}'=(\mathbf{T}\mathbf{P})_{1:3}=[X',Y',Z']^\top=\mathbf{R}\mathbf{P}+\mathbf{t}$\cite{gaoxiang2019slam14}。投影 $s\mathbf{u}=\mathbf{K}\mathbf{P}'$ 用第三行消 $s$（$s=Z'$）：
+\begin{equation}
+  u=f_x\frac{X'}{Z'}+c_x,\qquad v=f_y\frac{Y'}{Z'}+c_y.
+  \label{eq:vo-proj-uv}
+\end{equation}
+误差 $\mathbf{e}=\mathbf{u}_{\text{obs}}-\mathbf{u}_{\text{pred}}$，对相机系点求导（公共，$2\times3$）：
+\begin{equation}
+  \frac{\partial\mathbf{e}}{\partial\mathbf{P}'}=-\begin{bmatrix}\frac{f_x}{Z'}&0&-\frac{f_xX'}{Z'^2}\\[2pt]0&\frac{f_y}{Z'}&-\frac{f_yY'}{Z'^2}\end{bmatrix}.
+  \label{eq:vo-de-dP}
+\end{equation}
+\textbf{右扰动主线}：给 $\mathbf{T}$ 右乘 $\mathrm{Exp}(\delta\boldsymbol{\xi})$，由 \cref{ch:lie} 的 \cref{eq:right-pert-se3}，齐次点对右扰动的导数取前三维为
+\begin{equation}
+  \frac{\partial\mathbf{P}'}{\partial\delta\boldsymbol{\xi}}=\big[\mathbf{R},\ -\mathbf{R}\,\mathbf{P}^\wedge\big],
+  \label{eq:vo-dP-dxi-right}
+\end{equation}
+（左块 $\mathbf{R}$ 来自 $\delta\boldsymbol{\rho}$，右块 $-\mathbf{R}\mathbf{P}^\wedge$ 来自 $\delta\boldsymbol{\phi}$；$\delta\boldsymbol{\xi}=[\delta\boldsymbol{\rho};\delta\boldsymbol{\phi}]$ 平移在前）。链式相乘得右扰动雅可比
+\begin{equation}
+  \frac{\partial\mathbf{e}}{\partial\delta\boldsymbol{\xi}}
+  =\frac{\partial\mathbf{e}}{\partial\mathbf{P}'}\big[\mathbf{R},\ -\mathbf{R}\mathbf{P}^\wedge\big]
+  =-\begin{bmatrix}\frac{f_x}{Z'}&0&-\frac{f_xX'}{Z'^2}\\0&\frac{f_y}{Z'}&-\frac{f_yY'}{Z'^2}\end{bmatrix}\big[\mathbf{R},\ -\mathbf{R}\mathbf{P}^\wedge\big].
+  \label{eq:vo-jac-right}
+\end{equation}
+\textbf{左扰动（十四讲版，并列）}：给 $\mathbf{T}$ 左乘 $\mathrm{Exp}(\delta\boldsymbol{\xi})$，则 $\partial\mathbf{P}'/\partial\delta\boldsymbol{\xi}=[\mathbf{I},\ -\mathbf{P}'^\wedge]$，链式得十四讲式 $(7.46)$ 的闭式\cite{gaoxiang2019slam14}：
+\begin{equation}
+  \frac{\partial\mathbf{e}}{\partial\delta\boldsymbol{\xi}}\Big|_{\text{左}}
+  =-\begin{bmatrix}
+  \frac{f_x}{Z'} & 0 & -\frac{f_xX'}{Z'^2} & -\frac{f_xX'Y'}{Z'^2} & f_x+\frac{f_xX'^2}{Z'^2} & -\frac{f_xY'}{Z'}\\[3pt]
+  0 & \frac{f_y}{Z'} & -\frac{f_yY'}{Z'^2} & -f_y-\frac{f_yY'^2}{Z'^2} & \frac{f_yX'Y'}{Z'^2} & \frac{f_yX'}{Z'}
+  \end{bmatrix}.
+  \label{eq:vo-jac-left}
+\end{equation}
+（前 $3$ 列对应平移 $\boldsymbol{\rho}$、后 $3$ 列对应旋转 $\boldsymbol{\phi}$；若 $\se(3)$ 定义旋转在前则前后 $3$ 列对调。）两版差在 $\partial\mathbf{P}'/\partial\delta\boldsymbol{\xi}$：右扰动多出一个 $\mathbf{R}$，恰是伴随 $\mathrm{Ad}(\mathbf{T})$ 的作用——左、右雅可比满足 $\mathbf{J}_{\text{左}}=\mathbf{J}_{\text{右}}\,\mathrm{Ad}(\mathbf{T})^{-1}$（见 \cref{ch:lie}）。
+\end{derivation}
+
+\begin{derivation}[误差对空间点 $\mathbf{P}$ 的雅可比（用于完整 BA）]
+\label{thm:vo-de-dP-world}
+完整 BA 还要 $\partial\mathbf{e}/\partial\mathbf{P}$。由 $\mathbf{P}'=\mathbf{R}\mathbf{P}+\mathbf{t}$，$\partial\mathbf{P}'/\partial\mathbf{P}=\mathbf{R}$，故\cite{gaoxiang2019slam14}
+\begin{equation}
+  \frac{\partial\mathbf{e}}{\partial\mathbf{P}}=\frac{\partial\mathbf{e}}{\partial\mathbf{P}'}\mathbf{R}
+  =-\begin{bmatrix}\frac{f_x}{Z'}&0&-\frac{f_xX'}{Z'^2}\\0&\frac{f_y}{Z'}&-\frac{f_yY'}{Z'^2}\end{bmatrix}\mathbf{R}.
+  \label{eq:vo-de-dPworld}
+\end{equation}
+\end{derivation}
+
+\begin{practice}[手写高斯牛顿 PnP]
+十四讲 \texttt{pose\_estimation\_3d2d.cpp}\cite{gaoxiang2019slam14}（原书\emph{左乘}更新；下面在更新行并列标注本书右乘版）。
+\begin{codebox}[C++]{高斯牛顿求解 PnP（重投影误差）}
+void bundleAdjustmentGaussNewton(const VecVector3d &p3d, const VecVector2d &p2d,
+                                 const Mat &K, Sophus::SE3d &pose) {
+  typedef Eigen::Matrix<double,6,1> Vector6d;
+  double fx=K.at<double>(0,0), fy=K.at<double>(1,1),
+         cx=K.at<double>(0,2), cy=K.at<double>(1,2);
+  double lastCost = 0;
+  for (int iter = 0; iter < 10; iter++) {
+    Eigen::Matrix<double,6,6> H = Eigen::Matrix<double,6,6>::Zero();
+    Vector6d b = Vector6d::Zero();  double cost = 0;
+    for (size_t i = 0; i < p3d.size(); i++) {
+      Eigen::Vector3d pc = pose * p3d[i];           // P' = T P
+      double inv_z = 1.0/pc[2], inv_z2 = inv_z*inv_z;
+      Eigen::Vector2d proj(fx*pc[0]*inv_z + cx, fy*pc[1]*inv_z + cy);
+      Eigen::Vector2d e = p2d[i] - proj;            // 重投影误差 (观测 - 预测)
+      cost += e.squaredNorm();
+      Eigen::Matrix<double,2,6> J;                  // 左扰动版 2x6 (式 jac-left)
+      J << -fx*inv_z, 0, fx*pc[0]*inv_z2,
+            fx*pc[0]*pc[1]*inv_z2, -fx-fx*pc[0]*pc[0]*inv_z2, fx*pc[1]*inv_z,
+            0, -fy*inv_z, fy*pc[1]*inv_z2,
+            fy+fy*pc[1]*pc[1]*inv_z2, -fy*pc[0]*pc[1]*inv_z2, -fy*pc[0]*inv_z;
+      H += J.transpose()*J;                         // H = sum J^T J
+      b += -J.transpose()*e;                        // b = -sum J^T e
+    }
+    Vector6d dx = H.ldlt().solve(b);                // 解正规方程 H dx = b
+    if (std::isnan(dx[0])) break;
+    if (iter > 0 && cost >= lastCost) break;        // 代价不降则停
+    pose = Sophus::SE3d::exp(dx) * pose;            // 十四讲: 左乘更新
+    // 本书右扰动版应写: pose = pose * Sophus::SE3d::exp(dx);  且 J 用式 jac-right
+    lastCost = cost;
+    if (dx.norm() < 1e-6) break;                    // 收敛
+  }
+}
+\end{codebox}
+数值例：从 cost $6.45\times10^5$ 经 $4$ 次迭代降到 $1.23\times10^4$ 收敛；手写 GN 约 $0.15$ ms，比 OpenCV \texttt{solvePnP}、g2o 都快，三者位姿一致——\emph{位姿估计本身不耗算力}。
+\end{practice}
+
+\begin{practice}[g2o 图优化 BA]
+十四讲用 g2o 建图\cite{gaoxiang2019slam14}：位姿为顶点、每个 3D 点的投影为一元边。
+\begin{codebox}[C++]{g2o 顶点/边定义（PnP）}
+class VertexPose : public g2o::BaseVertex<6, Sophus::SE3d> {
+public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
+  void setToOriginImpl() override { _estimate = Sophus::SE3d(); }
+  void oplusImpl(const double *u) override {       // 流形上的更新 (retract)
+    Eigen::Matrix<double,6,1> du;
+    du << u[0],u[1],u[2],u[3],u[4],u[5];
+    _estimate = Sophus::SE3d::exp(du) * _estimate; // left multiplication on SE3
+  }
+  bool read(istream&) override { return true; }
+  bool write(ostream&) const override { return true; }
+};
+class EdgeProjection : public g2o::BaseUnaryEdge<2, Eigen::Vector2d, VertexPose> {
+  Eigen::Vector3d _pos3d;  Eigen::Matrix3d _K;
+public:
+  EdgeProjection(const Eigen::Vector3d &p, const Eigen::Matrix3d &K):_pos3d(p),_K(K){}
+  void computeError() override {
+    auto v = static_cast<VertexPose*>(_vertices[0]);
+    Eigen::Vector3d px = _K * (v->estimate() * _pos3d);
+    px /= px[2];
+    _error = _measurement - px.head<2>();          // 重投影误差
+  }
+  void linearizeOplus() override {                 // 解析雅可比 (式 jac-left)
+    auto v = static_cast<VertexPose*>(_vertices[0]);
+    Eigen::Vector3d pc = v->estimate() * _pos3d;
+    double fx=_K(0,0), fy=_K(1,1), X=pc[0],Y=pc[1],Z=pc[2], Z2=Z*Z;
+    _jacobianOplusXi <<
+      -fx/Z, 0, fx*X/Z2, fx*X*Y/Z2, -fx-fx*X*X/Z2, fx*Y/Z,
+      0, -fy/Z, fy*Y/Z2, fy+fy*Y*Y/Z2, -fy*X*Y/Z2, -fy*X/Z;
+  }
+  bool read(istream&) override { return true; }
+  bool write(ostream&) const override { return true; }
+};
+\end{codebox}
+求解器选 \texttt{BlockSolver<BlockSolverTraits<6,3>>}（位姿 $6$、路标 $3$）+ GN/LM/DogLeg。数值例：g2o 与手写 GN、OpenCV 结果一致，均 $<1$ ms。BA 通用：可同时放多帧位姿和所有空间点（大规模 BA 见后端章），前端常做局部小 BA。
+\end{practice}
+
+\begin{pitfall}[编程陷阱：雅可比的扰动侧与更新侧不一致]
+\textbf{错误}：雅可比按右扰动（\cref{eq:vo-jac-right}）推，更新却写 \texttt{pose = exp(dx)*pose}（左乘），或反过来。
+\textbf{现象}：收敛极慢、来回震荡甚至发散，残差降不下去，且难定位。
+\textbf{根因}：左右扰动的雅可比相差一个伴随 $\mathrm{Ad}(\mathbf{T})$；雅可比与更新不同侧，等于每步把增量\emph{搬错了坐标系}。
+\textbf{正确}：\emph{雅可比扰动侧、更新乘法侧、协方差定义侧三者同侧}。本书统一右侧：用 \cref{eq:vo-jac-right} + \texttt{pose = pose*exp(dx)}；引用十四讲左扰动公式时先经伴随转成右侧。自检：单步线性化后残差应明显下降。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：以为 $\mathbf{H}\approx\mathbf{J}^\top\mathbf{J}$ 是精确 Hessian]
+\textbf{错误}：把 BA 里 $\mathbf{H}=\sum\mathbf{J}^\top\mathbf{J}$ 当成目标函数的真 Hessian。
+\textbf{现象}：在高残差/强非线性处收敛变慢，纳闷“牛顿法不是二阶收敛吗”。
+\textbf{根因}：这是\emph{高斯牛顿}近似（\cref{ch:nlopt} \cref{thm:gn}），丢掉了残差二阶项 $\sum e_i\nabla^2 e_i$；残差大时该项不可忽略。
+\textbf{正确}：理解它是“小残差近似”；残差大或初值差时用 LM 阻尼（\cref{eq:lm}）增强稳定性。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）把 \cref{eq:vo-de-dP} 与右扰动块 $[\mathbf{R},-\mathbf{R}\mathbf{P}^\wedge]$ 相乘，写出 \cref{eq:vo-jac-right} 的显式 $2\times6$ 形式，并与左扰动版 \cref{eq:vo-jac-left} 逐元素比较，指出差异来自哪一项。
+  \item （实现题）把上面手写 GN 的更新与雅可比都改成\emph{右扰动}版本，跑通并验证与左扰动版收敛到同一位姿。
+  \item （调试）若某点深度 $Z'\le0$（落到相机后方），雅可比 \cref{eq:vo-de-dP} 会怎样？该点该如何处理？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{3D-3D：ICP}
+\label{sec:vo-icp}
+
+\paragraph{动机：两组已匹配的 3D 点，求变换。}两幅 RGB-D 图匹配后得到两组 3D 点 $\mathbf{P}=\{\mathbf{p}_i\}$、$\mathbf{P}'=\{\mathbf{p}_i'\}$，求欧氏变换 $\mathbf{R},\mathbf{t}$ 使 $\forall i,\ \mathbf{p}_i=\mathbf{R}\mathbf{p}_i'+\mathbf{t}$\cite{gaoxiang2019slam14}。这用\textbf{迭代最近点}（Iterative Closest Point, ICP）求解。ICP \emph{不含相机模型}（纯两组 3D 点的变换），故激光 SLAM 也用它（激光特征不丰富、无现成匹配，认距离最近为同一点 $\Rightarrow$ 故名“迭代最近点”，见 \cref{ch:pointcloud}）。本章 ICP 特指\emph{已匹配}两组点的运动估计。Handbook\cite{carlone2026handbook} 指出早期 RGB-D SLAM 即用 ICP 对齐深度点云，后被直接法（颜色+深度残差）取代。ICP 有两种解法：SVD 闭式、非线性优化。
+
+\begin{note}
+\textbf{运动方向提醒.}\;十四讲 ICP-SVD 实现按 $\mathbf{p}_i=\mathbf{R}\mathbf{p}_i'+\mathbf{t}$，得到的 $\mathbf{R},\mathbf{t}$ 是\emph{第二帧到第一帧}的变换，\emph{与本章 PnP/对极几何相反}\cite{gaoxiang2019slam14}。写公式时务必标明方向，必要时取逆 $\mathbf{T}^{-1}$。
+\end{note}
+
+\subsection{SVD 闭式解}
+\label{sec:vo-icp-svd}
+
+\begin{derivation}[ICP 的去质心分解与 SVD 解（逐步不跳）]
+\label{thm:vo-icp-svd}
+第 $i$ 对误差 $\mathbf{e}_i=\mathbf{p}_i-(\mathbf{R}\mathbf{p}_i'+\mathbf{t})$，最小二乘 $\min_{\mathbf{R},\mathbf{t}}\tfrac12\sum_i\|\mathbf{p}_i-(\mathbf{R}\mathbf{p}_i'+\mathbf{t})\|^2$\cite{gaoxiang2019slam14}。定义质心 $\mathbf{p}=\tfrac1n\sum_i\mathbf{p}_i$、$\mathbf{p}'=\tfrac1n\sum_i\mathbf{p}_i'$。在误差里\emph{加减} $\mathbf{p}-\mathbf{R}\mathbf{p}'$：
+\begin{align}
+  \tfrac12\sum_i\|\mathbf{p}_i-(\mathbf{R}\mathbf{p}_i'+\mathbf{t})\|^2
+  &=\tfrac12\sum_i\big\|(\mathbf{p}_i-\mathbf{p}-\mathbf{R}(\mathbf{p}_i'-\mathbf{p}'))+(\mathbf{p}-\mathbf{R}\mathbf{p}'-\mathbf{t})\big\|^2\notag\\
+  &=\tfrac12\sum_i\Big(\|\mathbf{p}_i-\mathbf{p}-\mathbf{R}(\mathbf{p}_i'-\mathbf{p}')\|^2+\|\mathbf{p}-\mathbf{R}\mathbf{p}'-\mathbf{t}\|^2\notag\\
+  &\qquad+2(\mathbf{p}_i-\mathbf{p}-\mathbf{R}(\mathbf{p}_i'-\mathbf{p}'))^\top(\mathbf{p}-\mathbf{R}\mathbf{p}'-\mathbf{t})\Big).
+  \label{eq:vo-icp-expand}
+\end{align}
+交叉项中 $\sum_i(\mathbf{p}_i-\mathbf{p}-\mathbf{R}(\mathbf{p}_i'-\mathbf{p}'))=\mathbf{0}$（去质心后求和为零），故目标简化为
+\begin{equation}
+  \min_{\mathbf{R},\mathbf{t}}\tfrac12\sum_i\|\mathbf{p}_i-\mathbf{p}-\mathbf{R}(\mathbf{p}_i'-\mathbf{p}')\|^2+\tfrac{n}{2}\|\mathbf{p}-\mathbf{R}\mathbf{p}'-\mathbf{t}\|^2.
+  \label{eq:vo-icp-split}
+\end{equation}
+左项只含 $\mathbf{R}$，右项含 $\mathbf{R},\mathbf{t}$ 且只与质心有关。于是三步：
+
+\textbf{(1)} 去质心 $\mathbf{q}_i=\mathbf{p}_i-\mathbf{p}$、$\mathbf{q}_i'=\mathbf{p}_i'-\mathbf{p}'$；
+
+\textbf{(2)} 求旋转 $\mathbf{R}^*=\arg\min_{\mathbf{R}}\tfrac12\sum_i\|\mathbf{q}_i-\mathbf{R}\mathbf{q}_i'\|^2$；
+
+\textbf{(3)} 求平移 $\mathbf{t}^*=\mathbf{p}-\mathbf{R}^*\mathbf{p}'$（令右项为零）。
+
+\emph{求 $\mathbf{R}$}：展开 $\sum_i\|\mathbf{q}_i-\mathbf{R}\mathbf{q}_i'\|^2=\sum_i(\mathbf{q}_i^\top\mathbf{q}_i+\mathbf{q}_i'^\top\mathbf{R}^\top\mathbf{R}\mathbf{q}_i'-2\mathbf{q}_i^\top\mathbf{R}\mathbf{q}_i')$。第一项与 $\mathbf{R}$ 无关；第二项因 $\mathbf{R}^\top\mathbf{R}=\mathbf{I}$ 也无关。故只需\emph{最大化}：
+\begin{equation}
+  \sum_i\mathbf{q}_i^\top\mathbf{R}\mathbf{q}_i'=\sum_i\operatorname{tr}(\mathbf{R}\mathbf{q}_i'\mathbf{q}_i^\top)=\operatorname{tr}\!\Big(\mathbf{R}\sum_i\mathbf{q}_i'\mathbf{q}_i^\top\Big).
+  \label{eq:vo-icp-trace}
+\end{equation}
+定义 $\mathbf{W}=\sum_i\mathbf{q}_i\mathbf{q}_i'^\top$（$3\times3$），SVD $\mathbf{W}=\mathbf{U}\boldsymbol{\Sigma}\mathbf{V}^\top$。$\mathbf{W}$ 满秩时最优旋转
+\begin{equation}
+  \boxed{\ \mathbf{R}=\mathbf{U}\mathbf{V}^\top.\ }
+  \label{eq:vo-icp-R}
+\end{equation}
+若此时 $\det\mathbf{R}<0$（得到了反射而非旋转），取 $-\mathbf{R}$。再由 $\mathbf{t}=\mathbf{p}-\mathbf{R}\mathbf{p}'$ 求平移。
+\end{derivation}
+
+\subsection{非线性优化解（右扰动）}
+\label{sec:vo-icp-nl}
+
+\paragraph{李代数形式\cite{gaoxiang2019slam14}。}用位姿 $\boldsymbol{\xi}$ 表达，目标
+\begin{equation}
+  \min_{\boldsymbol{\xi}}\frac12\sum_i\big\|\mathbf{p}_i-\exp(\boldsymbol{\xi}^\wedge)\mathbf{p}_i'\big\|_2^2.
+  \label{eq:vo-icp-nl}
+\end{equation}
+单项误差 $\mathbf{e}_i=\mathbf{p}_i-\mathbf{T}\mathbf{p}_i'$（$3$ 维观测）。\textbf{左扰动}（十四讲）下导数为 $\partial\mathbf{e}/\partial\delta\boldsymbol{\xi}=-(\mathbf{T}\mathbf{p}_i')^\odot$，取前三行展开为 $[-\mathbf{I},\ (\mathbf{T}\mathbf{p}_i')^\wedge]$。\textbf{右扰动}（本书主线）下，由 $\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})\mathbf{p}_i'\approx\mathbf{T}(\mathbf{I}+\delta\boldsymbol{\xi}^\wedge)\tilde{\mathbf{p}}_i'$，取前三行得 $3\times6$ 雅可比
+\begin{equation}
+  \frac{\partial\mathbf{e}_i}{\partial\delta\boldsymbol{\xi}}=-\big[\mathbf{R},\ -\mathbf{R}\,\mathbf{p}_i'^\wedge\big],
+  \label{eq:vo-icp-jac-right}
+\end{equation}
+即平移块 $-\mathbf{R}$、旋转块 $\mathbf{R}\,\mathbf{p}_i'^\wedge$（与右扰动点导数 \cref{eq:right-pert-se3} 一致；左扰动版的旋转块是 $(\mathbf{T}\mathbf{p}_i')^\wedge$，二者相差伴随）。装配 $\mathbf{H}=\sum\mathbf{J}^\top\mathbf{J}$、$\mathbf{b}=-\sum\mathbf{J}^\top\mathbf{e}$，GN/LM 迭代。
+
+\begin{theorem}[ICP 解的全局最优性]
+\label{thm:vo-icp-opt}
+匹配已知时，ICP 问题（\cref{eq:vo-icp-nl}）存在\emph{唯一解或无穷多解}\cite{gaoxiang2019slam14}。在唯一解情形，\textbf{任一极小值就是全局最优值}（不会陷入非全局的局部极小）。
+\end{theorem}
+\begin{proof}[证明思路]
+误差关于 $\mathbf{R}$ 的目标 \cref{eq:vo-icp-trace} 经去质心后化为 $\operatorname{tr}(\mathbf{R}\mathbf{W}^\top)$ 的最大化，SVD 给出闭式全局最优 $\mathbf{R}=\mathbf{U}\mathbf{V}^\top$（最优性证明见\cite{gaoxiang2019slam14} 所引文献）；$\mathbf{t}$ 由 $\mathbf{R}$ 唯一决定。既有闭式全局最优，迭代法找到的任何极小值即全局最优。退化（如所有点共线/共面、点太少）时解不唯一（无穷多）。
+\end{proof}
+
+\begin{insight}
+ICP（已匹配）的全局最优性是\emph{巨大}的实践红利：它意味着\textbf{可任意选初值}（哪怕单位阵）都收敛到对的解——这与 PnP 的 BA、直接法那种依赖好初值、可能陷局部极小的非凸问题形成鲜明对比。代价是它要求\emph{匹配已知}；激光 ICP 的难处恰恰在“匹配未知”，那里要边猜匹配边优化（\cref{ch:pointcloud}）。
+\end{insight}
+
+\paragraph{混合 PnP 与 ICP\cite{gaoxiang2019slam14}。}RGB-D 中一个像素可能\emph{有/无}深度。务实做法：深度已知的特征点建 3D-3D（ICP）误差，深度未知的建 3D-2D（重投影）误差，所有误差放进\emph{同一个}最小二乘统一求解，灵活且充分利用信息。
+
+\begin{practice}[ICP-SVD 与非线性 ICP]
+十四讲 \texttt{pose\_estimation\_3d3d.cpp}\cite{gaoxiang2019slam14}。OpenCV 无带匹配 ICP，自实现。
+\begin{codebox}[C++]{ICP 的 SVD 闭式解}
+void pose_estimation_3d3d(const vector<Point3f>&pts1, const vector<Point3f>&pts2,
+                          Mat &R, Mat &t) {
+  Point3f p1, p2;  int N = pts1.size();
+  for (int i=0;i<N;i++){ p1+=pts1[i]; p2+=pts2[i]; }
+  p1 = Point3f(Vec3f(p1)/N);  p2 = Point3f(Vec3f(p2)/N);   // 质心
+  vector<Point3f> q1(N), q2(N);
+  for (int i=0;i<N;i++){ q1[i]=pts1[i]-p1; q2[i]=pts2[i]-p2; } // 去质心
+  Eigen::Matrix3d W = Eigen::Matrix3d::Zero();
+  for (int i=0;i<N;i++)
+    W += Eigen::Vector3d(q1[i].x,q1[i].y,q1[i].z) *
+         Eigen::Vector3d(q2[i].x,q2[i].y,q2[i].z).transpose();  // W = sum q1 q2^T
+  Eigen::JacobiSVD<Eigen::Matrix3d> svd(W, Eigen::ComputeFullU|Eigen::ComputeFullV);
+  Eigen::Matrix3d R_ = svd.matrixU() * svd.matrixV().transpose(); // R = U V^T
+  if (R_.determinant() < 0) R_ = -R_;                  // det<0 取负, 保证是旋转
+  Eigen::Vector3d t_ = Eigen::Vector3d(p1.x,p1.y,p1.z)
+                     - R_ * Eigen::Vector3d(p2.x,p2.y,p2.z);  // t = p1 - R p2
+  // ... 写回 cv::Mat
+}
+\end{codebox}
+非线性版（g2o 一元边，$3$ 维观测、无相机模型）的解析雅可比（十四讲左扰动）：平移块 $-\mathbf{I}$、旋转块 $(\mathbf{T}\mathbf{p}')^\wedge$（即 \texttt{SO3::hat(T*p)}）：
+\begin{codebox}[C++]{ICP 的 g2o 一元边（3D-3D, 左扰动）}
+class EdgeICP : public g2o::BaseUnaryEdge<3, Eigen::Vector3d, VertexPose> {
+  Eigen::Vector3d _point;
+public:
+  EdgeICP(const Eigen::Vector3d &p):_point(p){}
+  void computeError() override {
+    auto pose = static_cast<const VertexPose*>(_vertices[0]);
+    _error = _measurement - pose->estimate() * _point;          // 3D 残差
+  }
+  void linearizeOplus() override {
+    auto pose = static_cast<VertexPose*>(_vertices[0]);
+    Eigen::Vector3d xyz = pose->estimate() * _point;            // T p'
+    _jacobianOplusXi.block<3,3>(0,0) = -Eigen::Matrix3d::Identity();  // 平移块 -I
+    _jacobianOplusXi.block<3,3>(0,3) = Sophus::SO3d::hat(xyz);  // 旋转块 (T p')^
+  }
+  bool read(istream&) override { return true; }
+  bool write(ostream&) const override { return true; }
+};
+\end{codebox}
+数值例：SVD 一步给解；非线性版\emph{一次迭代}即收敛（chi2 $\approx1.81$ 稳定），结果与 SVD 几乎一模一样——印证 SVD 已是全局最优。
+\end{practice}
+
+\begin{pitfall}[编程陷阱：ICP-SVD 忘了 $\det\mathbf{R}<0$ 修正]
+\textbf{错误}：直接用 $\mathbf{R}=\mathbf{U}\mathbf{V}^\top$ 不检查行列式。
+\textbf{现象}：偶尔（噪声大、点近共面时）得到 $\det\mathbf{R}=-1$ 的\emph{反射矩阵}，把点云“镜像”了，位姿完全错。
+\textbf{根因}：$\mathbf{U}\mathbf{V}^\top$ 只保证正交，不保证 $\det=+1$；它可能落在 $\mathrm{O}(3)$ 的反射分支。
+\textbf{正确}：检查 $\det(\mathbf{U}\mathbf{V}^\top)$，若 $<0$ 取 $-\mathbf{R}$（或更稳：$\mathbf{R}=\mathbf{U}\,\mathrm{diag}(1,1,\det(\mathbf{U}\mathbf{V}^\top))\,\mathbf{V}^\top$）。自检：$\det\mathbf{R}$ 应 $\approx+1$。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：把“已匹配 ICP”的全局最优性套到“匹配未知 ICP”]
+\textbf{错误}：因为本节说 ICP 全局最优，就以为激光里那种“迭代找最近点”的 ICP 也任意初值都收敛。
+\textbf{现象}：激光配准用差初值时陷入局部极小、配歪。
+\textbf{根因}：\cref{thm:vo-icp-opt} 的前提是\emph{匹配已知}。匹配未知的 ICP 在“找最近点”和“求变换”之间交替，整体\emph{非凸}，强烈依赖初值。
+\textbf{正确}：激光 ICP 要给好初值（里程计/IMU 预测），或用点到面、NDT、全局配准等更鲁棒变体（\cref{ch:pointcloud}）。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）补全 \cref{eq:vo-icp-expand} 中交叉项求和为零的证明（展开 $\sum_i(\mathbf{p}_i-\mathbf{p})$ 与 $\sum_i\mathbf{R}(\mathbf{p}_i'-\mathbf{p}')$）。
+  \item （推导）从右扰动点导数 \cref{eq:right-pert-se3} 出发推出 ICP 的右扰动雅可比 \cref{eq:vo-icp-jac-right}，并与左扰动版对照。
+  \item （设计）把空间点也设为优化变量重做本例 ICP（BA 形式），讨论为什么自由度增加后可能得到“相机少转、点多移”的另一种解，以及多观测如何缓解。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{光流：Lucas--Kanade}
+\label{sec:vo-flow}
+
+\paragraph{动机：特征点法太慢，能不能省掉描述子？}特征点法的痛点\cite{gaoxiang2019slam14}：(1) 关键点提取 + 描述子计算耗时（ORB 也要近 $20$ ms，若 SLAM 跑 $30$ ms/帧，一大半花在特征上）；(2) 丢弃了特征点之外的几十万像素信息；(3) 相机到白墙/空走廊等\emph{特征缺失}处会找不到足够匹配。克服思路有二：\emph{思路一}保留关键点但不算描述子，用\textbf{光流}跟踪它们；\emph{思路二}连关键点都随机选，用\textbf{直接法}（\cref{sec:vo-direct}）。光流跟到对应点后，运动仍用 PnP/ICP/对极几何估计（\cref{sec:vo-feature}--\ref{sec:vo-icp}）。
+
+\paragraph{光流的分类与历史\cite{gaoxiang2019slam14}。}光流描述\emph{像素随时间在图像间的运动}。\textbf{稀疏光流}只算部分像素，代表 \textbf{Lucas--Kanade（LK）光流}（1981），SLAM 中用来跟踪特征点；\textbf{稠密光流}算所有像素，代表 Horn--Schunck。本节讲 LK。
+
+\begin{derivation}[Lucas--Kanade 光流方程（逐步不跳）]
+\label{thm:vo-lk}
+把图像看作位置与时间的函数 $\mathbf{I}(x,y,t)$\cite{gaoxiang2019slam14}。
+
+\textbf{基本假设——灰度不变}：同一空间点的像素灰度在各帧固定不变。$t$ 时刻 $(x,y)$ 的像素在 $t+\mathrm{d}t$ 运动到 $(x+\mathrm{d}x,y+\mathrm{d}y)$：
+\begin{equation}
+  \mathbf{I}(x+\mathrm{d}x,\,y+\mathrm{d}y,\,t+\mathrm{d}t)=\mathbf{I}(x,y,t).
+  \label{eq:vo-lk-const}
+\end{equation}
+\textbf{一阶泰勒展开}左边：
+\begin{equation}
+  \mathbf{I}(x+\mathrm{d}x,y+\mathrm{d}y,t+\mathrm{d}t)\approx\mathbf{I}(x,y,t)+\frac{\partial\mathbf{I}}{\partial x}\mathrm{d}x+\frac{\partial\mathbf{I}}{\partial y}\mathrm{d}y+\frac{\partial\mathbf{I}}{\partial t}\mathrm{d}t.
+  \label{eq:vo-lk-taylor}
+\end{equation}
+代入灰度不变（左边 $=\mathbf{I}(x,y,t)$）消去 $\mathbf{I}(x,y,t)$：
+\begin{equation}
+  \frac{\partial\mathbf{I}}{\partial x}\mathrm{d}x+\frac{\partial\mathbf{I}}{\partial y}\mathrm{d}y+\frac{\partial\mathbf{I}}{\partial t}\mathrm{d}t=0.
+  \label{eq:vo-lk-diff}
+\end{equation}
+两边除以 $\mathrm{d}t$，记像素运动速度 $u=\mathrm{d}x/\mathrm{d}t$、$v=\mathrm{d}y/\mathrm{d}t$，图像梯度 $I_x=\partial\mathbf{I}/\partial x$、$I_y=\partial\mathbf{I}/\partial y$，时间梯度 $I_t=\partial\mathbf{I}/\partial t$：
+\begin{equation}
+  \begin{bmatrix}I_x & I_y\end{bmatrix}\begin{bmatrix}u\\v\end{bmatrix}=-I_t.
+  \label{eq:vo-lk-flow}
+\end{equation}
+这是\textbf{光流约束方程}：一个方程两个未知 $(u,v)$，\emph{欠定}。
+\end{derivation}
+
+\begin{derivation}[LK 窗口假设与最小二乘解]
+\label{thm:vo-lk-ls}
+LK 假设\emph{一个 $w\times w$ 窗口内的像素有相同运动}\cite{gaoxiang2019slam14}，于是 $w^2$ 个方程：
+\begin{equation}
+  \begin{bmatrix}I_x & I_y\end{bmatrix}_k\begin{bmatrix}u\\v\end{bmatrix}=-I_{tk},\qquad k=1,\dots,w^2.
+  \label{eq:vo-lk-window}
+\end{equation}
+堆叠 $\mathbf{A}=\big[[I_x,I_y]_1;\dots;[I_x,I_y]_{w^2}\big]$、$\mathbf{b}=[I_{t1};\dots;I_{t,w^2}]$，得超定方程 $\mathbf{A}[u,v]^\top=-\mathbf{b}$，最小二乘解
+\begin{equation}
+  \begin{bmatrix}u\\v\end{bmatrix}^*=-(\mathbf{A}^\top\mathbf{A})^{-1}\mathbf{A}^\top\mathbf{b}.
+  \label{eq:vo-lk-ls}
+\end{equation}
+$\mathbf{A}^\top\mathbf{A}=\big[\begin{smallmatrix}\sum I_x^2&\sum I_xI_y\\\sum I_xI_y&\sum I_y^2\end{smallmatrix}\big]$ 是 $2\times2$ 二阶矩——\emph{就是 Harris 角点的结构张量}。窗口内梯度退化（如纯色块）时 $\mathbf{A}^\top\mathbf{A}$ 不可逆 $\Rightarrow$ 光流不可解（对应代码里“black/white patch, H irreversible, update is nan”）。这定量印证了 §\ref{sec:vo-feature} 的洞察：\emph{能跟踪的地方就是角点}。
+\end{derivation}
+
+\begin{insight}
+LK 光流和 Harris 角点在数学上共享同一个矩阵 $\mathbf{A}^\top\mathbf{A}$，但用途相反：Harris 用它的两个特征值\emph{判断}哪里是角点；LK 用它的\emph{逆}去解像素运动。可逆（两特征值都大）$\Leftrightarrow$ 是角点 $\Leftrightarrow$ 光流可靠。所以“在角点上跑光流”不是巧合，而是数学上的必然——边缘上会有“孔径问题”（沿边缘方向不可解），平坦区彻底无解。
+\end{insight}
+
+\paragraph{把光流写成高斯牛顿优化\cite{gaoxiang2019slam14}。}LK 也可看成对每个特征点求
+\begin{equation}
+  \min_{\Delta x,\Delta y}\big\|\mathbf{I}_1(x,y)-\mathbf{I}_2(x+\Delta x,y+\Delta y)\big\|_2^2,
+  \label{eq:vo-lk-gn}
+\end{equation}
+残差 $e=\mathbf{I}_1(x,y)-\mathbf{I}_2(x+\Delta x,y+\Delta y)$，雅可比 $\mathbf{J}=-\nabla\mathbf{I}_2$（第二图在当前位置的梯度，每次迭代重算）。装配 $\mathbf{H}=\sum\mathbf{J}\mathbf{J}^\top$、$\mathbf{b}=-\sum e\,\mathbf{J}$，增量 $[\Delta x,\Delta y]=\mathbf{H}^{-1}\mathbf{b}$。因像素梯度仅\emph{局部}有效，一次不够要多迭代几次。
+
+\paragraph{反向光流（节省计算）\cite{gaoxiang2019slam14}。}雅可比也可用\emph{第一图}的梯度 $\nabla\mathbf{I}_1(x,y)$ 替代——称\textbf{反向（Inverse）光流}。$\mathbf{I}_1$ 的梯度不随 $\Delta x,\Delta y$ 变 $\Rightarrow$ $\mathbf{J}$ 与 $\mathbf{H}$ 恒定，只需在第 $0$ 次迭代算一次，后续只重算残差，省一大块计算。
+
+\paragraph{多层光流（金字塔，Coarse-to-fine）\cite{gaoxiang2019slam14}。}光流是优化，需初值靠近最优。相机运动快、两图差异大时单层易陷局部极小。引入\textbf{图像金字塔}：从顶层（最粗、最小）开始算，把上一层结果作下一层初值——\emph{由粗至精}。妙处：原图特征运动 $20$ 像素，在缩放 $0.5$ 倍的金字塔往上两层只剩 $20\times0.5\times0.5=5$ 像素，落在小范围内，避开图像非凸性导致的局部极小。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[font=\small]
+  \foreach \i/\w/\y in {0/3.2/0, 1/2.2/2.0, 2/1.4/3.6, 3/0.8/4.8}{
+    \pgfmathsetmacro\hh{\w*0.7}
+    \draw[fill=main!\the\numexpr8+\i*8\relax] (-\w/2,\y) rectangle (\w/2,\y+\hh);
+  }
+  \node[anchor=west] at (2.0,0.9) {第 0 层（原图，最精）};
+  \node[anchor=west] at (2.0,4.9) {顶层（最粗，运动小）};
+  \draw[->,thick,third] (1.0,5.0) .. controls (2.6,4.0) and (2.6,2.0) .. (1.8,0.6);
+  \node[third!60!black,rotate=-72] at (2.7,2.8) {Coarse-to-fine};
+  \node[anchor=west, font=\scriptsize] at (-1.6,5.6) {$20\!\to\!5$ 像素};
+\end{tikzpicture}
+\caption{图像金字塔多层光流：在顶层（粗、运动幅度小）求得初值，逐层下传精化。大位移在顶层被“缩小”，避开单层光流的局部极小。（仿\cite{gaoxiang2019slam14} 重绘）}
+\label{fig:vo-pyramid}
+\end{figure}
+
+\begin{practice}[高斯牛顿单层光流（含正/反向）]
+十四讲 \texttt{optical\_flow.cpp}\cite{gaoxiang2019slam14}。
+\begin{codebox}[C++]{单层 LK 光流（patch 内逐像素装配 H,b）}
+void calc(const Mat&img1, const Mat&img2, const KeyPoint&kp,
+          double &dx, double &dy, bool inverse) {
+  int half = 4;  double lastCost = 0;
+  Eigen::Matrix2d H;  Eigen::Vector2d b, J;
+  for (int iter = 0; iter < 10; iter++) {
+    if (!inverse) H = Eigen::Matrix2d::Zero();
+    b = Eigen::Vector2d::Zero();  double cost = 0;
+    for (int x=-half; x<half; x++) for (int y=-half; y<half; y++) {
+      double error = GetPixelValue(img1, kp.pt.x+x,    kp.pt.y+y)
+                   - GetPixelValue(img2, kp.pt.x+x+dx, kp.pt.y+y+dy);  // 残差
+      if (!inverse)                  // 正向: 用 img2 当前位置的梯度 (每次重算)
+        J = -Eigen::Vector2d(
+          0.5*(GetPixelValue(img2,kp.pt.x+dx+x+1,kp.pt.y+dy+y)
+              -GetPixelValue(img2,kp.pt.x+dx+x-1,kp.pt.y+dy+y)),
+          0.5*(GetPixelValue(img2,kp.pt.x+dx+x,kp.pt.y+dy+y+1)
+              -GetPixelValue(img2,kp.pt.x+dx+x,kp.pt.y+dy+y-1)));
+      else if (iter == 0)            // 反向: 用 img1 原位梯度, 只第 0 次算
+        J = -Eigen::Vector2d(
+          0.5*(GetPixelValue(img1,kp.pt.x+x+1,kp.pt.y+y)
+              -GetPixelValue(img1,kp.pt.x+x-1,kp.pt.y+y)),
+          0.5*(GetPixelValue(img1,kp.pt.x+x,kp.pt.y+y+1)
+              -GetPixelValue(img1,kp.pt.x+x,kp.pt.y+y-1)));
+      b += -error * J;  cost += error*error;
+      if (!inverse || iter == 0) H += J * J.transpose();   // 反向: H 只算一次
+    }
+    Eigen::Vector2d update = H.ldlt().solve(b);   // 解 2x2
+    if (std::isnan(update[0])) break;             // 纯色块 H 不可逆
+    if (iter > 0 && cost > lastCost) break;
+    dx += update[0];  dy += update[1];  lastCost = cost;
+    if (update.norm() < 1e-2) break;              // 收敛
+  }
+}
+\end{codebox}
+OpenCV 对照只需一行 \texttt{cv::calcOpticalFlowPyrLK(img1,img2,pt1,pt2,status,error)}。数值例（约 $230$ 点）：多层光流与 OpenCV 耗时相当（约 $2$ ms），单层明显弱于多层。
+\end{practice}
+
+\begin{pitfall}[概念误区：以为单层光流就够，无视大位移]
+\textbf{错误}：相机运动快时仍只用单层 LK。
+\textbf{现象}：大量点跟丢或跟到错误位置，残差卡在高位。
+\textbf{根因}：单层光流的优化\emph{需要初值接近最优}；位移大时图像非凸，优化困在局部极小。
+\textbf{正确}：用金字塔多层（Coarse-to-fine），顶层把大位移“缩小”到可优化范围；或提高帧率使帧间位移变小。
+\end{pitfall}
+
+\begin{pitfall}[编程陷阱：在低纹理 patch 上硬解光流]
+\textbf{错误}：对所有点（含白墙/天空）一律解 \cref{eq:vo-lk-ls}。
+\textbf{现象}：\texttt{update} 变 NaN 或乱跳，点漂移。
+\textbf{根因}：纹理弱时 $\mathbf{A}^\top\mathbf{A}$ 病态/奇异，逆放大噪声。
+\textbf{正确}：先看 $\mathbf{A}^\top\mathbf{A}$ 的最小特征值（即 Harris/Shi--Tomasi 响应），太小就\emph{放弃}该点（标 \texttt{status=0}）；只在角点上跟踪。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 从 \cref{eq:vo-lk-window} 推出最小二乘解 \cref{eq:vo-lk-ls}，并写出 $\mathbf{A}^\top\mathbf{A}$、$\mathbf{A}^\top\mathbf{b}$ 的逐元素形式。
+  \item 解释反向光流为何能省计算：写清楚正向法每次迭代的计算量 vs 反向法第 $0$ 次之后的计算量。
+  \item （直接法预热）直接法能否也搞“反向法”？（提示：见 §\ref{sec:vo-direct} 与习题）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{直接法：光度误差}
+\label{sec:vo-direct}
+
+\paragraph{动机：能不能边跟踪边调相机位姿？}光流是“两步走”——先跟踪像素、再估运动，难保全局最优\cite{gaoxiang2019slam14}。能不能在估运动时\emph{反过来}调整像素跟踪？\textbf{直接法}（Direct Method）正是如此：直接用像素灰度，\emph{同时}估计相机运动与点的投影，且\emph{不要求是角点}（甚至可随机选点）。只要场景有\emph{明暗变化}（哪怕渐变、无局部梯度极值）直接法就能工作，还能恢复半稠密/稠密结构。代表项目：SVO、LSD-SLAM、DSO\cite{gaoxiang2019slam14,carlone2026handbook}。
+
+\paragraph{特征点法 vs 直接法的本质差别\cite{gaoxiang2019slam14,carlone2026handbook}。}特征点法把特征看作空间不动点，按投影位置最小化\emph{重投影误差}——需精确知道 $\mathbf{p}_1,\mathbf{p}_2$ 的对应（故要匹配/跟踪，代价大）。直接法\emph{不需要点的对应关系}，靠最小化\emph{光度误差}求解。Handbook\cite{carlone2026handbook} 把直接法称为“在一步里直接对运动和结构优化光度损失”，与光流、光度 BA 同源。
+
+\begin{derivation}[直接法的光度误差与链式雅可比（右扰动主线）]
+\label{thm:vo-direct}
+空间点 $\mathbf{P}$，世界坐标 $[X,Y,Z]$，两帧像素 $\mathbf{p}_1,\mathbf{p}_2$。以第一相机为参照，第二相机运动 $\mathbf{R},\mathbf{t}$（李群 $\mathbf{T}$），内参相同\cite{gaoxiang2019slam14}：
+\begin{equation}
+  \mathbf{p}_1=\frac1{Z_1}\mathbf{K}\mathbf{P},\qquad
+  \mathbf{p}_2=\frac1{Z_2}\mathbf{K}(\mathbf{R}\mathbf{P}+\mathbf{t})=\frac1{Z_2}\mathbf{K}(\mathbf{T}\mathbf{P})_{1:3}.
+  \label{eq:vo-direct-proj}
+\end{equation}
+直接法\emph{无匹配}，不知哪个 $\mathbf{p}_2$ 对应 $\mathbf{p}_1$，而是\emph{按当前位姿估计}去找 $\mathbf{p}_2$，并优化位姿使二者灰度更接近。定义\textbf{光度误差}（标量）：
+\begin{equation}
+  e=\mathbf{I}_1(\mathbf{p}_1)-\mathbf{I}_2(\mathbf{p}_2),
+  \label{eq:vo-photo-err}
+\end{equation}
+$N$ 个点的整体问题（注意\emph{优化变量是位姿 $\mathbf{T}$}，不像光流优化每个点的运动）：
+\begin{equation}
+  \min_{\mathbf{T}}J(\mathbf{T})=\sum_{i=1}^{N}e_i^\top e_i,\qquad e_i=\mathbf{I}_1(\mathbf{p}_{1,i})-\mathbf{I}_2(\mathbf{p}_{2,i}).
+  \label{eq:vo-photo-cost}
+\end{equation}
+定义中间量 $\mathbf{q}=\mathbf{T}\mathbf{P}$（$\mathbf{P}$ 在第二相机系坐标）、$\mathbf{u}=\tfrac1{Z_2}\mathbf{K}\mathbf{q}$（像素坐标）。链式法则求 $\partial e/\partial\mathbf{T}$：
+
+\textbf{(1)} $\partial\mathbf{I}_2/\partial\mathbf{u}$：$\mathbf{u}$ 处的\emph{像素梯度}（$1\times2$）；
+
+\textbf{(2)} $\partial\mathbf{u}/\partial\mathbf{q}$：投影对相机系点的导数（$2\times3$，记 $\mathbf{q}=[X,Y,Z]^\top$）：
+\begin{equation}
+  \frac{\partial\mathbf{u}}{\partial\mathbf{q}}=\begin{bmatrix}\frac{f_x}{Z}&0&-\frac{f_xX}{Z^2}\\0&\frac{f_y}{Z}&-\frac{f_yY}{Z^2}\end{bmatrix};
+  \label{eq:vo-direct-duq}
+\end{equation}
+
+\textbf{(3)} $\partial\mathbf{q}/\partial\delta\boldsymbol{\xi}$：变换后点对位姿扰动的导数（$3\times6$）。\emph{右扰动主线}（本书）由 \cref{eq:right-pert-se3}：
+\begin{equation}
+  \frac{\partial\mathbf{q}}{\partial\delta\boldsymbol{\xi}}=\big[\mathbf{R},\ -\mathbf{R}\,\mathbf{P}^\wedge\big]\quad(\text{右扰动}),\qquad
+  \frac{\partial\mathbf{q}}{\partial\delta\boldsymbol{\xi}}=\big[\mathbf{I},\ -\mathbf{q}^\wedge\big]\quad(\text{左扰动, 十四讲}).
+  \label{eq:vo-direct-dqxi}
+\end{equation}
+后两项与图像无关，常合并。\emph{左扰动}下合并得十四讲式 $(8.18)$（与 PnP 的 \cref{eq:vo-jac-left} 同形）：
+\begin{equation}
+  \frac{\partial\mathbf{u}}{\partial\delta\boldsymbol{\xi}}\Big|_{\text{左}}=\begin{bmatrix}
+  \frac{f_x}{Z}&0&-\frac{f_xX}{Z^2}&-\frac{f_xXY}{Z^2}&f_x+\frac{f_xX^2}{Z^2}&-\frac{f_xY}{Z}\\
+  0&\frac{f_y}{Z}&-\frac{f_yY}{Z^2}&-f_y-\frac{f_yY^2}{Z^2}&\frac{f_yXY}{Z^2}&\frac{f_yX}{Z}
+  \end{bmatrix}.
+  \label{eq:vo-direct-merge}
+\end{equation}
+总雅可比（$1\times6$）：
+\begin{equation}
+  \mathbf{J}=-\frac{\partial\mathbf{I}_2}{\partial\mathbf{u}}\frac{\partial\mathbf{u}}{\partial\delta\boldsymbol{\xi}},
+  \label{eq:vo-direct-J}
+\end{equation}
+负号来自 $e=\mathbf{I}_1-\mathbf{I}_2(\mathbf{u})$ 对 $\mathbf{u}$ 求导得 $-\partial\mathbf{I}_2/\partial\mathbf{u}$。装配 $\mathbf{H}=\sum\mathbf{J}^\top\mathbf{J}$、$\mathbf{b}=-\sum e\,\mathbf{J}$（$e$ 标量、$\mathbf{J}$ 行向量，代码以 $6\times1$ 列存），GN/LM 迭代。
+\end{derivation}
+
+\begin{insight}[像素梯度引导优化方向]
+直接法完全靠\emph{像素梯度}引导优化方向：\cref{eq:vo-direct-J} 里若某像素梯度为零，整项雅可比为零、对运动\emph{毫无贡献}。十四讲的图形化解释\cite{gaoxiang2019slam14}：参考图测到灰度 $229$ 的像素，当前位姿下投影处灰度 $126$，误差 $103$；沿 $u$ 走一步灰度变 $123$（$-3$）、沿 $v$ 走一步变 $108$（$-18$），梯度 $[-3,-18]$ 建议把像往左上挪以变亮。但“单个像素一面之词”不够，要综合许多像素的意见，算出更新量 $\mathrm{Exp}(\boldsymbol{\xi}^\wedge)$。\textbf{关键限制}：图像是\emph{强烈非凸}函数，沿梯度走很容易陷局部极小——\emph{只有相机运动小、图像梯度非凸性弱时直接法才成立}，金字塔可缓解。
+\end{insight}
+
+\paragraph{直接法的三种分类\cite{gaoxiang2019slam14}。}$\mathbf{P}$ 的深度可由 RGB-D 反投影、双目视差、或单目深度估计（更难，含不确定度）得到。按用多少像素分：
+
+\begin{table}[H]\centering\small
+\caption{直接法的稀疏/半稠密/稠密分类}
+\label{tab:vo-direct-class}
+\begin{tabular}{p{0.14\textwidth}p{0.22\textwidth}p{0.14\textwidth}p{0.36\textwidth}}
+\toprule
+类别 & $\mathbf{P}$ 来源 / 点数 & 速度 & 重构能力与备注 \\
+\midrule
+稀疏直接法 & 稀疏关键点，数百\textasciitilde 上千 & 最快 & 只能稀疏重构；像 LK 那样假设关键点周围像素也不变；低端平台可实时 \\
+半稠密 & 只用\emph{带梯度}的像素 & 中 & 半稠密结构；梯度为零的像素雅可比为零、舍弃也无损（\cref{eq:vo-direct-J}）\\
+稠密 & 所有像素，几十万\textasciitilde 几百万 & 慢，多数需 GPU & 完整地图；梯度弱的点贡献小、重构也难定位 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{practice}[稀疏直接法（RGB-D/双目）]
+十四讲 \texttt{direct\_method.cpp}\cite{gaoxiang2019slam14}：随机选 $2000$ 点（不用任何特征提取），用视差/深度反投影，多层直接法估位姿。
+\begin{codebox}[C++]{直接法雅可比累加（每点 patch 内）}
+void accumulate_jacobian(const Range &range) {
+  const int half = 1;  Matrix6d H_local = Matrix6d::Zero();
+  Vector6d b_local = Vector6d::Zero();  double cost_tmp = 0;  int cnt = 0;
+  for (size_t i=range.start; i<range.end; i++) {
+    Eigen::Vector3d P =                                  // 反投影: P = Z K^-1 [px;1]
+      depth_ref[i]*Eigen::Vector3d((px_ref[i][0]-cx)/fx,(px_ref[i][1]-cy)/fy,1);
+    Eigen::Vector3d q = T21 * P;                         // q = T P
+    if (q[2] < 0) continue;                              // 深度无效, 跳过
+    double u = fx*q[0]/q[2]+cx, v = fy*q[1]/q[2]+cy;     // 投影到第二图
+    if (u<half||u>img2.cols-half||v<half||v>img2.rows-half) continue; // 越界
+    double X=q[0],Y=q[1],Z=q[2], Zi=1.0/Z, Zi2=Zi*Zi;  cnt++;
+    for (int x=-half; x<=half; x++) for (int y=-half; y<=half; y++) {
+      double error = GetPixelValue(img1, px_ref[i][0]+x, px_ref[i][1]+y)
+                   - GetPixelValue(img2, u+x, v+y);      // 光度误差
+      Matrix26d J_uxi;                                   // 式 direct-merge (左扰动)
+      J_uxi(0,0)=fx*Zi; J_uxi(0,1)=0; J_uxi(0,2)=-fx*X*Zi2;
+      J_uxi(0,3)=-fx*X*Y*Zi2; J_uxi(0,4)=fx+fx*X*X*Zi2; J_uxi(0,5)=-fx*Y*Zi;
+      J_uxi(1,0)=0; J_uxi(1,1)=fy*Zi; J_uxi(1,2)=-fy*Y*Zi2;
+      J_uxi(1,3)=-fy-fy*Y*Y*Zi2; J_uxi(1,4)=fy*X*Y*Zi2; J_uxi(1,5)=fy*X*Zi;
+      Eigen::Vector2d J_img(                             // u 处像素梯度 dI2/du
+        0.5*(GetPixelValue(img2,u+1+x,v+y)-GetPixelValue(img2,u-1+x,v+y)),
+        0.5*(GetPixelValue(img2,u+x,v+1+y)-GetPixelValue(img2,u+x,v-1+y)));
+      Vector6d J = -1.0 * (J_img.transpose() * J_uxi).transpose(); // 式 direct-J
+      H_local += J*J.transpose();  b_local += -error*J;  cost_tmp += error*error;
+    }
+  }
+  // 加锁累加到全局 H,b,cost（cost 按好点数归一）
+}
+\end{codebox}
+单层迭代：\texttt{dx=H.ldlt().solve(b)}；更新 \texttt{T21 = SE3::exp(dx)*T21;}（十四讲左乘；本书右扰动应改 \texttt{T21 = T21*SE3::exp(dx);} 并把 \texttt{J\_uxi} 换成右扰动块 $[\mathbf{R},-\mathbf{R}\mathbf{P}^\wedge]$）。多层时\emph{内参也要随金字塔缩放}：\texttt{fx=fxG*scales[level]} 等，参考像素同乘 \texttt{scales[level]}，但\emph{深度不缩放}（物理量）。数值例：$2000$ 点每层 $1$\textasciitilde$2$ ms、四层约 $8$ ms，比光流（十几 ms）更快；随机选点也能正确追踪。
+\end{practice}
+
+\begin{insight}[亮度恒定 vs 辐照度恒定]
+直接法的灰度不变假设很强：自动曝光、光照变化都会破坏它。DSO\cite{carlone2026handbook} 的关键改进是把朴素的\emph{亮度恒定}（brightness-constancy）换成\emph{辐照度恒定}（irradiance-constancy）——假设 3D 点随时间发出相同辐照度，并在优化中\emph{联合估计相机的曝光参数 + 响应函数 + 渐晕}（完整光度标定）。这让直接法在曝光变化时也能工作，是它能与特征点法“平分秋色”的工程关键。
+\end{insight}
+
+\paragraph{直接法优缺点总结\cite{gaoxiang2019slam14}。}
+\emph{优点}：省去特征/描述子计算；只需像素梯度、不需角点，可在特征缺失处工作（甚至随机选点）；能建半稠密/稠密地图。
+\emph{缺点}：(1) \textbf{非凸性}——靠图像梯度搜索、图像强非凸，只在小运动下成立，金字塔可缓解；(2) \textbf{单像素无区分度}——像它的像素太多，故用图像块（patch）或更复杂度量（如 NCC 归一化相关性），且“以数量代替质量”，点太少表现差（建议 $\ge500$ 点）；(3) \textbf{灰度不变是强假设}——自动曝光/光照变化即失效，实用直接法须同时估曝光参数。
+
+\begin{pitfall}[编程陷阱：金字塔缩放图像却忘了缩放内参]
+\textbf{错误}：多层直接法里把图像降采样了，却仍用原图的 $f_x,f_y,c_x,c_y$。
+\textbf{现象}：每层投影位置错位，优化在粗层就跑偏，多层比单层还差。
+\textbf{根因}：直接法雅可比 \cref{eq:vo-direct-merge} 带内参；图像缩 $s$ 倍，焦距和主点都要乘 $s$。
+\textbf{正确}：每层 \texttt{fx=fxG*scales[level]} 等、参考像素乘 \texttt{scales[level]}；\emph{深度不缩放}（是物理量）。自检：粗层投影点应落在缩小图内合理位置。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：以为直接法“不需要对应”就比特征点法总是更好]
+\textbf{错误}：因为直接法省了匹配，就认定它在任何场景都优于特征点法。
+\textbf{现象}：大基线、强光照变化、卷帘快门场景下直接法精度/鲁棒性反而崩。
+\textbf{根因}：直接法的代价是\emph{强灰度不变假设 + 小运动 + 强非凸}；它把“显式数据关联”换成了“隐式靠梯度找对应”，收敛域更小（Handbook\cite{carlone2026handbook}）。
+\textbf{正确}：直接法擅长低纹理、低分辨率、小运动 + 好光度标定 + 全局快门；大运动/重定位/回环更适合特征点法。实践常用\emph{混合}（\cref{sec:vo-frontend}）。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）验证 $\frac{\partial\mathbf{u}}{\partial\delta\boldsymbol{\xi}}=\frac{\partial\mathbf{u}}{\partial\mathbf{q}}\cdot[\mathbf{I},-\mathbf{q}^\wedge]$ 给出 \cref{eq:vo-direct-merge}（取一两个元素验算，如 $(0,3)$ 元应为 $-f_xXY/Z^2$）。
+  \item （改右扰动）把直接法的 \texttt{J\_uxi} 与更新改成右扰动版本（旋转块用 $-\mathbf{R}\mathbf{P}^\wedge$、更新右乘），说明结果应与左扰动版收敛一致。
+  \item 直接法能否像光流那样做“反向法”（用第一图梯度替代第二图梯度）？说明可行性与代价。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{前端架构：把视觉里程计工程化}
+\label{sec:vo-frontend}
+
+前面把“两帧之间怎么求运动”讲透了。本节按 Handbook\cite{carlone2026handbook} 的视角，把这些零件组织成一个能\emph{实时、可扩展、鲁棒}运行的前端。
+
+\paragraph{视觉 SLAM 三大子功能与术语\cite{carlone2026handbook}。}完整系统含三块：\textbf{里程计前端}（估相邻帧相对运动，给初值）、\textbf{建图后端}（全局 BA/位姿图优化，精化轨迹与地图）、\textbf{回环与重定位}（检测重访、消漂移）。相关术语的边界：\emph{摄影测量}（从照片提精确测量/3D 重建）、\emph{光束法平差 BA}（调相机 + 3D 点最小化重投影误差）、\emph{运动恢复结构 SFM}（多为离线、从无序图集同时估结构与运动）、\emph{视觉里程计 VO}（聚焦\emph{局部}运动，滑动窗口，\emph{不建全局地图}）、\emph{视觉 SLAM}（实时同时定位建图，\emph{含回环}）。VO 与 SLAM 的关键差别就在“有没有回环/全局地图”。
+
+\begin{insight}[视觉 SLAM 比激光更难的根因]
+与激光 SLAM 不同，相机\emph{不直接测 3D 几何}——它测的是场景辐照度在像平面上的\emph{投影}\cite{carlone2026handbook}。深度被投影“压扁”了，所以才需要本章这一整套（对极几何、三角化、PnP）从 2D 观测里\emph{反推} 3D。这也是“视觉因子是重投影/光度误差”而非“直接的 3D 点对”的根本原因。
+\end{insight}
+
+\paragraph{两类前端再回顾\cite{carlone2026handbook}。}\textbf{(i) 特征点法}：检测特征 $\to$ 算成对对应 $\to$ 最小化重投影误差（最后一步即 BA）；因\emph{显式数据关联}而\emph{收敛域更大}。\textbf{(ii) 直接法}：一步里直接优化光度损失（与光流、光度 BA 同源）；收敛域较小，故常用\emph{由粗到精}缓解，甚至对齐降采样图或学习特征。
+
+\subsection{并行跟踪与建图（PTAM）与关键帧}
+\label{sec:vo-ptam}
+
+\paragraph{为什么不能每帧都做完整 BA。}完整 BA（同时优化所有位姿和所有点）是 SFM 黄金标准，但每帧跑太贵，无法在帧率（$10$\textasciitilde$50$ Hz）运行\cite{carlone2026handbook}。两个关键思想救场：
+
+\textbf{思想 1：并行跟踪与建图}（PTAM）。把 SLAM 拆成两个并行线程：
+\begin{itemize}
+  \item \textbf{跟踪线程}：为当前帧找匹配、算位姿，\emph{不更新地图点}，解 \textbf{pose-only BA}（即 PnP 的 BA 形式，\cref{eq:vo-pnp-ba} 的多点版）：
+  \begin{equation}
+    \mathbf{T}_w^{i*}=\arg\min_{\mathbf{T}_w^i}\sum_{j}\rho\!\Big(\big\|\mathbf{z}_{ij}-\pi(\mathbf{R}_w^i\mathbf{x}_j^w+\mathbf{t}_w^i)\big\|_{\boldsymbol{\Sigma}_{ij}}\Big),
+    \label{eq:vo-poseonly-ba}
+  \end{equation}
+  地图点 $\mathbf{x}_j^w$ 固定、只优化当前位姿，跑在帧率；
+  \item \textbf{建图线程}：只对\emph{关键帧}（keyframe）子集 $\mathsf{K}\subset\mathsf{C}$ 求 BA，只有关键帧位姿入地图，故 BA 只需在关键帧率（$0.5$\textasciitilde$5$ Hz）运行。关键帧应选\emph{含显著新信息}的帧。
+\end{itemize}
+
+\textbf{思想 2：局部性}。相机在大环境里，单帧观测对\emph{远处}地图影响可忽略（回环除外）\cite{carlone2026handbook}。于是把回环交给一个\emph{很少运行}的第三线程，建图线程只对一个关键帧窗口跑\textbf{局部 BA}。局部窗口可用\emph{时间准则}（最后 $k$ 帧/关键帧，VO/VIO 常用）或更优的\emph{共视准则}（与当前关键帧共视点数 $>\theta$ 的关键帧）。局部 BA 只更新一组共视关键帧 $\mathsf{K}_1$ 与其观测点 $\mathsf{P}_1$（而 $\mathsf{K}_2$ 是看到 $\mathsf{P}_1$ 但\emph{位姿固定}的关键帧，提供约束不被优化）：
+\begin{equation}
+  \{\mathbf{T}_w^{k*},\mathbf{x}_j^{w*}\}=\arg\min_{\mathbf{T}_w^k,\mathbf{x}_j^w}\frac12\!\!\sum_{\substack{i\in\mathsf{K}_1\cup\mathsf{K}_2\\ j\in\mathsf{P}_1}}\!\!\rho\!\Big(\big\|\mathbf{z}_{ij}-\pi(\mathbf{R}_w^i\mathbf{x}_j^w+\mathbf{t}_w^i)\big\|_{\boldsymbol{\Sigma}_{ij}}\Big).
+  \label{eq:vo-local-ba}
+\end{equation}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[font=\small,>=Stealth,node distance=5mm,
+  th/.style={draw,rounded corners,align=center,fill=main!8,minimum width=2.6cm,minimum height=0.9cm},
+  ln/.style={->,thick,gray!60!black}]
+  \node[th] (track) {跟踪线程\\ pose-only BA\\ {\scriptsize 帧率 10-50Hz}};
+  \node[th, right=12mm of track] (map) {局部建图\\ 局部 BA\\ {\scriptsize 关键帧率 0.5-5Hz}};
+  \node[th, below=7mm of map] (loop) {回环闭合\\ {\scriptsize 每关键帧检测}};
+  \node[th, below=7mm of track] (full) {完整 BA\\ {\scriptsize 回环后, 可选}};
+  \draw[ln] (track)--(map) node[midway,above,font=\scriptsize]{关键帧};
+  \draw[ln] (map)--(loop);
+  \draw[ln] (loop)--(full);
+  \draw[ln] (full)-- (track);
+  \draw[ln] (map.south west) -- (track.north east) node[midway,sloped,above,font=\scriptsize]{地图};
+\end{tikzpicture}
+\caption{典型四线程视觉 SLAM 前端（ORB-SLAM 风格\cite{carlone2026handbook}）：跟踪（帧率）→ 局部建图（关键帧率）→ 回环闭合（每关键帧检测）→ 完整 BA（回环后可选）。前端 VO 本身是“跟踪 + 局部建图”两线程；回环让它升格为 SLAM。（仿\cite{carlone2026handbook} 重绘）}
+\label{fig:vo-pipeline}
+\end{figure}
+
+\paragraph{四种优化方法的取舍\cite{carlone2026handbook}。}把式 \cref{eq:vo-local-ba} 这类问题求解的策略有四：\textbf{批量优化}（GN/LM，SFM 黄金标准，但每帧太贵）、\textbf{滤波}（EKF/信息滤波，只保留最后一个位姿 $\Rightarrow$ \emph{破坏稀疏性}、且不重新线性化过去观测，限于几百特征）、\textbf{关键帧}（只留少数图，相同算力下地图更长更准）、\textbf{因子图}（把上述统一为图，节点=变量、因子=误差+先验，见后端章）。Handbook 的关键图（图 7.4）对比：EKF 边缘化过去位姿导致\emph{稠密图}（能力受限），关键帧丢弃中间观测\emph{保持稀疏}——这是现代 SLAM 倒向关键帧 + BA 的根本原因。
+
+\subsection{求解 BA：Schur 补消元}
+\label{sec:vo-schur}
+
+\paragraph{为什么能高效求解。}BA 的观测雅可比\emph{极稀疏}：每个观测 $\mathbf{z}_{ij}$ 只依赖相机 $i$ 和点 $j$\cite{carlone2026handbook}。Hessian 里每个观测只引入一个相机对角块、一个点对角块、一个相机-点非对角块。点数通常比相机数大几个数量级 $\Rightarrow$ \emph{先消点、再解相机}。\cref{ch:nlopt} 已给出 Schur 消元（\cref{eq:schur}）；这里独立记录其完整代数与在 BA 中的具体化。
+
+\begin{derivation}[Schur 补：先解 $x_1$ 再解 $x_2$（逐步不跳）]
+\label{thm:vo-schur}
+线性系统（$\mathbf{D}$ 可逆）\cite{carlone2026handbook}
+\[
+  \begin{pmatrix}\mathbf{A}&\mathbf{B}\\\mathbf{C}&\mathbf{D}\end{pmatrix}\begin{pmatrix}\mathbf{x}_1\\\mathbf{x}_2\end{pmatrix}=\begin{pmatrix}\mathbf{b}_1\\\mathbf{b}_2\end{pmatrix},
+\]
+左乘 $\big[\begin{smallmatrix}\mathbf{I}&-\mathbf{B}\mathbf{D}^{-1}\\\mathbf{0}&\mathbf{I}\end{smallmatrix}\big]$，第一块行变为 $(\mathbf{A}-\mathbf{B}\mathbf{D}^{-1}\mathbf{C},\ \mathbf{B}-\mathbf{B}\mathbf{D}^{-1}\mathbf{D})=(\mathbf{A}-\mathbf{B}\mathbf{D}^{-1}\mathbf{C},\ \mathbf{0})$，右端第一块变 $\mathbf{b}_1-\mathbf{B}\mathbf{D}^{-1}\mathbf{b}_2$：
+\[
+  \begin{pmatrix}\mathbf{A}-\mathbf{B}\mathbf{D}^{-1}\mathbf{C}&\mathbf{0}\\\mathbf{C}&\mathbf{D}\end{pmatrix}\begin{pmatrix}\mathbf{x}_1\\\mathbf{x}_2\end{pmatrix}=\begin{pmatrix}\mathbf{b}_1-\mathbf{B}\mathbf{D}^{-1}\mathbf{b}_2\\\mathbf{b}_2\end{pmatrix}.
+\]
+于是可先解 $\mathbf{x}_1$ 再回代 $\mathbf{x}_2$：
+\begin{equation}
+  (\mathbf{A}-\mathbf{B}\mathbf{D}^{-1}\mathbf{C})\mathbf{x}_1=\mathbf{b}_1-\mathbf{B}\mathbf{D}^{-1}\mathbf{b}_2,\qquad \mathbf{D}\mathbf{x}_2=\mathbf{b}_2-\mathbf{C}\mathbf{x}_1.
+  \label{eq:vo-schur-general}
+\end{equation}
+\end{derivation}
+
+\begin{derivation}[Schur 补在 BA 中的应用（三步）]
+\label{thm:vo-schur-ba}
+BA 每次迭代解（下标 $c$=相机、$p$=点）\cite{carlone2026handbook}
+\[
+  \begin{pmatrix}\mathbf{H}_{cc}&\mathbf{H}_{cp}\\\mathbf{H}_{cp}^\top&\mathbf{H}_{pp}\end{pmatrix}\begin{pmatrix}\mathbf{d}_c\\\mathbf{d}_p\end{pmatrix}=\begin{pmatrix}\mathbf{b}_c\\\mathbf{b}_p\end{pmatrix}.
+\]
+消去点（取 $\mathbf{D}=\mathbf{H}_{pp}$）得约化相机系统，三步：
+\begin{align}
+  \mathbf{H}_{cc}^{\text{red}}&=\mathbf{H}_{cc}-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{H}_{cp}^\top,\label{eq:vo-schur-a}\\
+  \mathbf{H}_{cc}^{\text{red}}\,\mathbf{d}_c&=\mathbf{b}_c-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{b}_p,\label{eq:vo-schur-b}\\
+  \mathbf{H}_{pp}\,\mathbf{d}_p&=\mathbf{b}_p-\mathbf{H}_{cp}^\top\mathbf{d}_c.\label{eq:vo-schur-c}
+\end{align}
+因 $\mathbf{H}_{pp}$ \emph{块对角}，Schur 补与最终点求解都可\emph{逐点}高效完成。约化相机系统 $\mathbf{H}_{cc}^{\text{red}}$ \emph{更不稀疏}（含“看到共同点的相机对”的块）：局部 BA 里它几乎是满的，用\emph{稠密}求解器；完整 BA 关键帧多但共视稀疏，用\emph{稀疏}求解器更优。
+\end{derivation}
+
+\paragraph{$*$ 免初始化与 Power BA\cite{carlone2026handbook}。}经典 BA 两大缺点：需好初值、大规模时计算/内存爆。近年改进：\textbf{Power Bundle Adjustment}（arXiv:2204.12834）——用\emph{矩阵幂级数}近似 Schur 矩阵逆 $(\mathbf{H}_{cc}^{\text{red}})^{-1}\approx\sum_{i=0}^{m}(\mathbf{H}_{cc}^{-1}\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{H}_{cp}^\top)^i\mathbf{H}_{cc}^{-1}$，把求逆换成更快更省内存的矩阵乘，对截断 $m$ 可证收敛；\textbf{Variable Projection}（VarPro）——把透视投影换成通用射影矩阵，使路标可\emph{解析}地表为相机参数的函数，消除“鸡生蛋”依赖、扩大吸引域，可从\emph{随机初值}开始。二者结合给出大规模 BA 的免初始化可扩展解。
+
+\subsection{完整系统、混合方法与新趋势}
+\label{sec:vo-systems}
+
+\paragraph{代表系统\cite{carlone2026handbook}。}
+\begin{itemize}
+  \item \textbf{ORB-SLAM}（arXiv:1502.00956）/\textbf{ORB-SLAM2}/\textbf{ORB-SLAM3}（arXiv:2007.11898）：基于关键点（ORB），鲁棒、回环强、稀疏地图；支持单目/双目/RGB-D，ORB-SLAM3 扩到鱼眼、多地图、视觉-惯性；
+  \item \textbf{LSD-SLAM}（直接、半稠密、光度误差，交替优化深度图与跟踪 + 位姿图优化）；
+  \item \textbf{DSO}（Direct Sparse Odometry）：相机运动与点在\emph{单个} GN 里联合优化（滑动窗口光度 BA + 边缘化旧帧 + 完整光度标定），精度高；
+  \item \textbf{OKVIS/OKVIS2}：视觉-惯性（用 BRISK 关键点）。
+\end{itemize}
+
+\paragraph{直接法 vs 特征点法的实践权衡（含混合）\cite{carlone2026handbook}。}可实时方法里直接法（如 DSO）常更准更鲁棒（\emph{不做中间抽象}，能从极微妙亮度变化里定运动）；但需良好光度标定 + 全局快门（卷帘快门致几何畸变，建模后常不再实时，特征点法因最小化几何畸变更好处理）。直接法在\emph{低分辨率}视频上常更好（模糊/降采样下特征难提）；特征点对\emph{重定位/回环}更有价值。故实践常回归\textbf{混合方法}（如把基于特征的重定位紧整合进直接 SLAM）。
+
+\paragraph{$*$ 学习型特征与匹配的新趋势\cite{carlone2026handbook}。}经典手工特征（Harris/SIFT/SURF/FAST/BRIEF/ORB/BRISK）外，学习型方法日盛：\textbf{LIFT}（端到端检测+定向+描述）、\textbf{SuperPoint}（自监督、整图、单应自适应）、\textbf{HF-Net}（分层定位、全局+局部）、\textbf{D2-Net}（先描述后检测）。匹配端：\textbf{SuperGlue}（arXiv:1911.11763，用 GNN + 自/交叉注意力 + 最优匹配层，抗重复纹理/遮挡/极端视角）、\textbf{MASt3R}（3D 感知匹配，从两图重建 3D 表示）、\textbf{MASt3R-SLAM}。它们在无纹理、极端光照/视角下显著超越手工描述子，正推动视觉 SLAM 范式转变。
+
+\paragraph{相机模型选型（前端的隐形前提）\cite{carlone2026handbook}。}本章默认针孔 + 径向切向畸变（\cref{ch:camera}）。Handbook 提醒：广角（FOV $\le180^\circ$）用 Brown--Conrady；鱼眼（$>180^\circ$）用 Kannala--Brandt（KB，$4$ 畸变系数 $r(\theta)=\theta+\sum_{n=1}^4 k_n\theta^{2n+1}$）；\textbf{Double Sphere}（DS，$6$ 参）精度与 $8$ 参 KB 相当但投影快约 $5$ 倍且有\emph{闭式反投影}。径向切向/BC/KB \emph{无解析去畸变}，需 Newton--Raphson 迭代。卷帘快门要么用全局快门相机、要么按行变位姿建模（VIO 里 IMU 在曝光窗内测局部运动，使卷帘建模更可行）。选错相机模型会引入系统性偏差，显著降精度与鲁棒性。
+
+\begin{pitfall}[思维陷阱：用滤波做大地图视觉 SLAM]
+\textbf{错误}：为了“实时”用 EKF 把所有路标和最后一个位姿一起滤。
+\textbf{现象}：特征一多（几百个）就算不动、协方差矩阵稠密、精度差。
+\textbf{根因}：EKF 边缘化掉过去位姿会\emph{破坏稀疏性}（稠密图），且不重新线性化过去观测、损失精度\cite{carlone2026handbook}。
+\textbf{正确}：用关键帧 + 局部 BA + Schur 消元，保持稀疏；相同算力下地图更长更准。滤波更适合 VIO 里维数受控的紧耦合（\cref{ch:vio}）。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：把 VO 当成完整 SLAM]
+\textbf{错误}：以为前端 VO 跑通了就有了 SLAM。
+\textbf{现象}：长时间运行后轨迹\emph{漂移}越来越大，回到原地却不知道。
+\textbf{根因}：VO 只做\emph{局部}运动估计（滑动窗口），误差随时间累积、\emph{不建全局地图、不回环}\cite{carlone2026handbook}。
+\textbf{正确}：补上回环检测（视觉地点识别，如词袋/学习型全局描述子）+ 位姿图优化/全局 BA，才是完整视觉 SLAM。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）补全 Schur 消元左乘后第一块行化简的每一步（\cref{thm:vo-schur}），并解释为什么选 $\mathbf{D}=\mathbf{H}_{pp}$ 而非 $\mathbf{H}_{cc}$ 来消元（提示：点数 vs 相机数、块对角）。
+  \item （跨章综合）用 \cref{ch:lie} 的右扰动雅可比（\cref{eq:right-pert-se3}）、本章重投影误差（\cref{eq:vo-reproj-cost}）、\cref{ch:nlopt} 的 GN 正规方程（\cref{eq:gn-normal}）与本节 Schur 消元（\cref{eq:vo-schur-a,eq:vo-schur-b,eq:vo-schur-c}），写出“两关键帧 + 若干共视点”局部 BA 一次迭代的完整装配与求解流程。
+  \item （选型）给定“低纹理走廊 + 全局快门 + 低分辨率”和“强光照变化 + 大运动 + 需频繁重定位”两个场景，分别论证选直接法、特征点法还是混合，并说明理由。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+单目两帧能恢复带尺度的运动 & 只能到尺度；$\mathbf{t}$ 归一化 $\Rightarrow$ 尺度不确定，必须初始化（\cref{sec:vo-epipolar}）\\
+ORB 描述子可用欧氏距离匹配 & 二进制描述子用汉明距离（异或数 $1$）；浮点才用欧氏 \\
+$\mathbf{E}$ 和 $\mathbf{F}$ 可混用 & $\mathbf{E}$ 吃归一化坐标 $\mathbf{x}$，$\mathbf{F}$ 吃像素 $\mathbf{p}$；差一个 $\mathbf{K}$ \\
+纯旋转也能初始化/三角化 & $\mathbf{t}=\mathbf{0}\Rightarrow\mathbf{E}=\mathbf{0}$、无三角形；必须有平移（\cref{sec:vo-tri-uncertainty}）\\
+$\mathbf{H}=\mathbf{J}^\top\mathbf{J}$ 是精确 Hessian & 高斯牛顿近似，丢了残差二阶项；大残差时失准 \\
+雅可比和更新可不同扰动侧 & 必须同侧（差一个 $\mathrm{Ad}(\mathbf{T})$），否则发散 \\
+ICP 总是任意初值都全局最优 & 仅\emph{匹配已知}时（\cref{thm:vo-icp-opt}）；匹配未知非凸、依赖初值 \\
+ICP-SVD 的 $\mathbf{U}\mathbf{V}^\top$ 一定是旋转 & 可能 $\det<0$（反射），需取 $-\mathbf{R}$ 修正 \\
+直接法不需对应所以总更好 & 强灰度不变 + 小运动 + 强非凸，收敛域小；大运动/重定位输给特征点法 \\
+金字塔直接法只缩图像 & 内参 $f_x,f_y,c_x,c_y$ 也要随层缩放；深度不缩放 \\
+VO 跑通就是 SLAM & VO 只做局部、会漂移；SLAM 需回环 + 全局优化 \\
+EKF 做大地图视觉 SLAM 高效 & EKF 边缘化破坏稀疏性，限于几百特征；关键帧 + BA 更优 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\mathbf{R},\mathbf{t},\mathbf{T}$ & 旋转 / 平移 / 位姿（默认 $\mathbf{R}_{21},\mathbf{t}_{21}$，$1\!\to\!2$） & \cref{eq:vo-pinhole2} \\
+$\mathbf{K},\mathbf{x}=\mathbf{K}^{-1}\mathbf{p}$ & 内参 / 归一化平面坐标 & \cref{eq:vo-norm} \\
+$s,\ \simeq$ & 深度/尺度因子 / 尺度意义下相等 & \cref{eq:vo-pinhole2} \\
+$\mathbf{E},\mathbf{F},\mathbf{H}$ & 本质 / 基础 / 单应矩阵 & \cref{eq:vo-EF,eq:vo-H} \\
+$m_{pq},\theta$ & 图像块矩 / 特征点方向（ORB） & \cref{eq:vo-moment,eq:vo-orientation} \\
+$\mathbf{e},\ \boldsymbol{\Sigma}_{\mathbf v}$ & 重投影/光度误差 / 像素噪声协方差 & \cref{eq:vo-reproj-cost} \\
+$\mathbf{P}'=\mathbf{R}\mathbf{P}+\mathbf{t}$ & 相机系下的点 $[X',Y',Z']$ & \cref{thm:vo-reproj-jac} \\
+$\delta\boldsymbol{\xi}=[\delta\boldsymbol{\rho};\delta\boldsymbol{\phi}]$ & 右扰动李代数增量（平移在前） & \cref{eq:vo-jac-right} \\
+$\mathbf{W}=\sum\mathbf{q}_i\mathbf{q}_i'^\top$ & ICP 去质心协方差阵（SVD 对象） & \cref{eq:vo-icp-R} \\
+$I_x,I_y,I_t$ & 图像空间/时间梯度（光流） & \cref{eq:vo-lk-flow} \\
+$\mathbf{H}_{cc},\mathbf{H}_{pp},\mathbf{H}_{cp}$ & BA Hessian 相机/点/耦合块 & \cref{thm:vo-schur-ba} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{定理 / 公式速查表}
+\begin{tabular}{lll}
+\toprule
+定理 / 公式 & 一句话 & 对应 \\
+\midrule
+对极约束 \cref{eq:vo-epi-x} & $\mathbf{x}_2^\top\mathbf{E}\mathbf{x}_1=0$，$\mathbf{E}=\mathbf{t}^\wedge\mathbf{R}$，消掉深度 & \cref{thm:vo-epi} \\
+八点法 \cref{eq:vo-eight-sys} & 线性解 $\mathbf{E}$，SVD 分四解、深度为正筛选 & \cref{thm:vo-eight,thm:vo-recover-Rt} \\
+单应 \cref{eq:vo-H} & $\mathbf{p}_2\simeq\mathbf{H}\mathbf{p}_1$，DLT 求解，退化时用 & \cref{thm:vo-H} \\
+三角化 \cref{eq:vo-tri-cross} & $\mathbf{x}_2^\wedge$ 消项解深度；视差越大越准 & \cref{thm:vo-tri} \\
+PnP-BA 雅可比 \cref{eq:vo-jac-right} & $2\times6$ 重投影误差对位姿（右扰动） & \cref{thm:vo-reproj-jac} \\
+ICP-SVD \cref{eq:vo-icp-R} & 去质心 $\to\mathbf{W}\to\mathbf{R}=\mathbf{U}\mathbf{V}^\top$；$\det<0$ 取负 & \cref{thm:vo-icp-svd} \\
+ICP 最优性 & 匹配已知时极小值即全局最优 & \cref{thm:vo-icp-opt} \\
+LK 光流 \cref{eq:vo-lk-flow} & $I_xu+I_yv=-I_t$，窗口最小二乘 & \cref{thm:vo-lk,thm:vo-lk-ls} \\
+直接法雅可比 \cref{eq:vo-direct-J} & $\mathbf{J}=-\partial\mathbf{I}_2/\partial\mathbf{u}\cdot\partial\mathbf{u}/\partial\delta\boldsymbol{\xi}$ & \cref{thm:vo-direct} \\
+Schur 消元 \cref{eq:vo-schur-a} & 先消点再解相机，利用 $\mathbf{H}_{pp}$ 块对角 & \cref{thm:vo-schur-ba} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表（难度 / 学习 ROI）}
+\begin{tabular}{cllcc}
+\toprule
+\# & 知识点 & 核心要点 & 难度 & ROI \\
+\midrule
+1 & ORB 特征与匹配 & Oriented FAST + Rotated BRIEF；汉明距离 & $\star\star$ & 骨干 \\
+2 & 对极几何八点法 & $\mathbf{E}=\mathbf{t}^\wedge\mathbf{R}$；线性解 + SVD 四解 & $\star\star\star$ & 骨干 \\
+3 & 单应矩阵 & 共面/纯旋转退化时用 $\mathbf{H}$；DLT & $\star\star\star$ & 次优 \\
+4 & 三角化 & 视差—深度不确定度矛盾；延迟三角化 & $\star\star$ & 骨干 \\
+5 & PnP & DLT/P3P/BA；$2\times6$ 重投影雅可比 & $\star\star\star$ & 骨干 \\
+6 & ICP & 去质心 + SVD；全局最优；右扰动 BA & $\star\star\star$ & 骨干 \\
+7 & LK 光流 & 灰度不变 $\to$ 最小二乘；金字塔/反向 & $\star\star\star$ & 骨干 \\
+8 & 直接法 & 光度误差链式雅可比；稀疏/半稠密/稠密 & $\star\star\star\star$ & 次优 \\
+9 & 前端架构 & PTAM/关键帧/局部 BA/Schur 消元 & $\star\star\star\star$ & 骨干 \\
+10 & 混合/学习型 & DSO 光度标定；SuperGlue/MASt3R & $\star\star\star\star$ & 前沿 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{累积项目：本章新增模块}
+\textbf{本章为累积 SLAM 项目新增“两帧视觉里程计”模块}，串起前几章的工具：
+\begin{enumerate}
+  \item \textbf{特征前端}：用 OpenCV ORB 提取 + 暴力汉明匹配 + 比率/RANSAC 去外点，得到匹配点对；
+  \item \textbf{初始化（单目）}：同时估 $\mathbf{F}$ 和 $\mathbf{H}$（\cref{sec:vo-epipolar}），选重投影误差小者，从 $\mathbf{E}$ 恢复 $\mathbf{R},\mathbf{t}$，三角化建初始地图点，固定尺度；
+  \item \textbf{跟踪（RGB-D/双目）}：对有深度的点用 PnP（手写右扰动 GN，\cref{sec:vo-pnp-ba}）求当前位姿，深度未知点用三角化补；
+  \item \textbf{可选直接法分支}：随机选点 + 多层直接法（\cref{sec:vo-direct}）做无特征跟踪，与特征点法对照精度/速度；
+  \item \textbf{局部 BA}：用 \cref{ch:lie} 右扰动雅可比 + \cref{ch:nlopt} GN + 本章 Schur 消元（\cref{sec:vo-schur}）优化最近 $k$ 帧位姿 + 共视点。
+\end{enumerate}
+代码框架统一用 Sophus（位姿）+ Eigen（线代）+ OpenCV（图像/特征），位姿更新一律\emph{右乘} $\mathbf{T}\leftarrow\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$。后续章节在此模块上接 IMU（\cref{ch:vio}）与点云配准（\cref{ch:pointcloud}）。
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{几何直觉与可运行代码}：视觉 SLAM 十四讲\cite{gaoxiang2019slam14} 第 7 讲（特征点法/对极几何/三角化/PnP/ICP）与第 8 讲（光流/直接法）——本章主要素材，代码均可在 \texttt{slambook2} 跑通。
+  \item \textbf{广度与现代视角}：SLAM Handbook\cite{carlone2026handbook} 第 7 章（视觉 SLAM 综述）——前端架构、BA/Schur、相机模型、RGB-D、混合与学习型方法的权威导览。
+  \item \textbf{严谨主线}：Barfoot《State Estimation for Robotics》\cite{barfoot2024state}——位姿协方差、李群上估计的严格处理，对接本章右扰动雅可比与后端不确定度。
+  \item \textbf{现代李群记号}：Solà 等《A micro Lie theory for state estimation in robotics》\cite{sola2018micro}（arXiv:1812.01537）——右/左 $\oplus\ominus$、函数的右雅可比与链式法则，强烈推荐对照本章右扰动约定阅读。
+  \item \textbf{学习型匹配}：SuperPoint（arXiv:1712.07629）——自监督关键点检测+描述；SuperGlue（arXiv:1911.11763）——GNN + 注意力做鲁棒匹配；MASt3R（arXiv:2406.09756）——3D 感知匹配。
+  \item \textbf{大规模 BA}：Power Bundle Adjustment（arXiv:2204.12834）——幂级数近似 Schur 逆，免初始化可扩展 BA。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+后续章节 & 关系 & 本章铺垫 \\
+\midrule
+\cref{ch:vio} VIO & 视觉因子 = 重投影/光度误差，IMU 补尺度与重力 & \cref{eq:vo-reproj-cost}、右扰动雅可比 \\
+\cref{ch:pointcloud} 点云 & 扫描配准核心是 ICP（这里处理“匹配未知”） & \cref{thm:vo-icp-svd,thm:vo-icp-opt} \\
+\cref{ch:imu} IMU 模型 & 给前端提供运动预测作初值 & 三角化/直接法对初值的依赖 \\
+后端（因子图/回环） & 局部 BA $\to$ 全局 BA / 位姿图优化 & \cref{sec:vo-frontend}、Schur 消元 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.2\textwidth}p{0.24\textwidth}p{0.34\textwidth}p{0.1\textwidth}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+匹配几乎全错 & 二进制描述子用了欧氏距离 & 1.改用 \texttt{NORM\_HAMMING} 2.加 Lowe 比率 + RANSAC 3.看 Min/Max dist 是否整数 & \cref{sec:vo-match} \\
+对极约束残差巨大 & $\mathbf{E}$/$\mathbf{F}$ 与坐标类型用错 & 1.确认 $\mathbf{E}$ 配归一化坐标、$\mathbf{F}$ 配像素 2.检查内参 $\mathbf{K}$ 3.RANSAC 去外点 & \cref{sec:vo-epi-constraint} \\
+单目初始化反复失败 & 平移太小/纯旋转 & 1.改“左右平移”运动 2.监控视差角 3.同时试 $\mathbf{F}$+$\mathbf{H}$ 选优 & \cref{sec:vo-homography} \\
+三角化深度乱跳 & 视差太小（基线短） & 1.算视差角，$<1^\circ$ 暂不三角化 2.等几帧延迟三角化 3.提分辨率 & \cref{sec:vo-tri-uncertainty} \\
+PnP/BA 发散或极慢 & 雅可比与更新扰动侧不一致 & 1.核对雅可比侧 = 更新乘法侧 2.右扰动用 \cref{eq:vo-jac-right}+右乘 3.改 LM 阻尼 & \cref{sec:vo-pnp-ba} \\
+ICP 结果像镜像 & $\det(\mathbf{U}\mathbf{V}^\top)<0$ 未修正 & 1.检查 $\det\mathbf{R}$ 2.$<0$ 取 $-\mathbf{R}$ 或 $\mathrm{diag}(1,1,\det)$ 3.确认运动方向 & \cref{sec:vo-icp-svd} \\
+光流/直接法 update=NaN & 低纹理 patch，$\mathbf{H}$ 奇异 & 1.查 $\mathbf{A}^\top\mathbf{A}$/$\mathbf{H}$ 最小特征值 2.放弃该点 3.只在角点跟踪 & \cref{sec:vo-flow} \\
+多层直接法比单层还差 & 缩图却没缩内参 & 1.每层 $f_x,f_y,c_x,c_y$ 乘 \texttt{scales} 2.参考像素同乘 3.深度不缩放 & \cref{sec:vo-direct} \\
+长时间轨迹漂移 & 只有 VO、无回环 & 1.加回环检测（词袋/学习全局描述子）2.位姿图优化 3.全局 BA & \cref{sec:vo-systems} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{API 速查表}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.42\textwidth}p{0.5\textwidth}}
+\toprule
+API（OpenCV / Sophus / Eigen） & 用途 / 注意 \\
+\midrule
+\texttt{ORB::create()} & 创建 ORB 检测器+描述子 \\
+\texttt{DescriptorMatcher::create("BruteForce-Hamming")} & 二进制描述子暴力匹配（必用 Hamming） \\
+\texttt{findFundamentalMat(p1,p2,CV\_FM\_8POINT)} & 八点法求 $\mathbf{F}$（输入像素坐标） \\
+\texttt{findEssentialMat(p1,p2,focal,pp)} & 求 $\mathbf{E}$（需焦距、光心） \\
+\texttt{findHomography(p1,p2,RANSAC,3)} & 求 $\mathbf{H}$（RANSAC，重投影阈值 3px） \\
+\texttt{recoverPose(E,p1,p2,R,t,...)} & 从 $\mathbf{E}$ 分解 $\mathbf{R},\mathbf{t}$，深度为正自动选解 \\
+\texttt{triangulatePoints(T1,T2,pts1,pts2,pts4d)} & 线性三角化，输出齐次 4D（需除第 4 维） \\
+\texttt{solvePnP(p3d,p2d,K,dist,r,t,false,EPNP)} & PnP 求位姿（\texttt{r} 是旋转向量，\texttt{Rodrigues} 转 $\mathbf{R}$） \\
+\texttt{calcOpticalFlowPyrLK(i1,i2,pt1,pt2,status,err)} & 金字塔 LK 光流；\texttt{status} 标是否跟到 \\
+\texttt{Sophus::SE3d::exp(dx)} / \texttt{.log()} & 李代数 $\to$ 位姿 / 位姿 $\to$ 李代数（$[\rho;\phi]$） \\
+\texttt{Sophus::SO3d::hat(v)} & 向量 $\to$ 反对称矩阵 $(\cdot)^\wedge$ \\
+\texttt{H.ldlt().solve(b)} & 解对称正规方程 $\mathbf{H}\delta=\mathbf{b}$（Cholesky） \\
+\texttt{JacobiSVD(W, ComputeFullU|ComputeFullV)} & ICP 用 $\mathbf{W}$ 的 SVD 求 $\mathbf{R}$ \\
+\bottomrule
+\end{tabular}
+\end{table}

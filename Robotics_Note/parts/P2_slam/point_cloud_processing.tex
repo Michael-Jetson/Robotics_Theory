@@ -1,0 +1,1759 @@
+\chapter{点云处理}
+\label{ch:pointcloud}
+
+% ════════════════════════════════════════════════════════════════
+%  本章：全吸收 SLAM Handbook ch8（点云配准综述骨架）
+%  + 经典原始文献（Besl-McKay ICP / Horn 四元数 / Arun-Kabsch SVD
+%    / Chen-Medioni & Low point-to-plane / Segal GICP / Biber-Magnusson NDT
+%    / Bentley KD-tree / Rusinkiewicz 六阶段 / Zhang LOAM），
+%  自包含独立记录每一步推导、每一道闭式解、收敛性证明、算法伪码与数值参数。
+%  右扰动为主；v5.0 算法工程教学模板（动机→反面→历史→理论→陷阱→练习）。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 给定两帧已知逐点对应的三维点云，求把一帧对齐到另一帧的最优旋转 $\mathbf{R}$ 与平移 $\mathbf{t}$，你会怎么解？这个问题有没有闭式解？
+  \item 若两帧点云的对应关系\emph{未知}，上一题的方法还能直接用吗？该怎么补救？
+  \item 一帧 LiDAR 点云动辄数万到数十万点，在另一帧里为每个点找最近邻，朴素做法要多少次距离比较？如何降到对数级？
+  \item “点到点距离”与“点到平面距离”作为配准残差，哪一个在平直墙面环境收敛更快？为什么？
+  \item 你优化一个 $\SE(3)$ 位姿时，为什么不能像优化普通六维向量那样直接对位姿做梯度下降？（提示：回顾 \cref{ch:lie}。）
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章后，你应当能够：
+\begin{enumerate}
+  \item \textbf{描述}点云的数学抽象、常见表示（原始点列/距离图像/体素/八叉树/KD 树/面元/鸟瞰图/隐式表示）与其权衡，并\textbf{选择}合适的空间索引数据结构；
+  \item \textbf{实现}体素栅格降采样、统计离群点剔除（SOR）、半径离群点剔除（ROR）等配准前的标准滤波管线，并说明各自的判据与适用边界；
+  \item \textbf{构建} KD 树并\textbf{推导}其最近邻搜索的回溯剪枝判据，分析其平均与最坏复杂度；
+  \item \textbf{独立推导}点到点 ICP 的两条闭式解（Arun--Kabsch 的 SVD 解与含行列式修正、Horn 的四元数解）及其等价性，并\textbf{证明} ICP 的单调收敛定理；
+  \item \textbf{推导}点到平面 ICP 的小角度线性化与 $6\times6$ 正规方程，并用本书右扰动雅可比写出其高斯--牛顿形式；
+  \item \textbf{推导} Generalized-ICP（GICP）的概率生成模型、最大似然代价、point-to-point/point-to-plane 退化与 plane-to-plane 协方差构造；
+  \item \textbf{推导} NDT 的 cell 高斯表示、得分函数、稳健化高斯混合、牛顿法的梯度与海森；
+  \item \textbf{推导} LOAM 的曲率定义式、边/面点判定、点到线与点到面残差，并理解“特征 ICP”如何把降采样、KD 树近邻、点到平面配准串成一个实时系统；
+  \item \textbf{运用} Rusinkiewicz--Levoy 的 ICP 六阶段框架对配准管线做选型与调优。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把两帧无序点云对齐成一个一致变换}”的主线：从点怎么存（表示与索引），到对齐前怎么洗（滤波降采样），到核心的配准算法族（ICP / GICP / NDT / LOAM），最后落到 LiDAR 里程计的工程范式。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 6mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  reg/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (rep) {点云表示\\与数据结构};
+\node[blk, right=of rep] (filt) {滤波 / 降采样\\体素·SOR·ROR};
+\node[blk, right=of filt] (kd) {最近邻\\KD 树};
+\node[reg, below=8mm of rep] (icp) {点到点 ICP\\SVD/四元数+收敛性};
+\node[reg, right=of icp] (p2pl) {点到面 ICP\\线性化法方程};
+\node[reg, right=of p2pl] (gicp) {GICP\\概率/Mahalanobis};
+\node[reg, below=8mm of icp] (ndt) {NDT\\cell 高斯+牛顿};
+\node[reg, right=of ndt] (loam) {LOAM 特征\\曲率·边/面残差};
+\node[grp, right=of loam] (para) {配准范式\\scan-to-scan/map};
+\draw[ln] (rep)--(filt); \draw[ln] (filt)--(kd);
+\draw[ln] (kd.south) -- ++(0,-4mm) -| (icp.north);
+\draw[ln] (icp)--(p2pl); \draw[ln] (p2pl)--(gicp);
+\draw[ln] (icp.south) -- ++(0,-4mm) -| (ndt.north);
+\draw[ln] (ndt)--(loam); \draw[ln] (loam)--(para);
+\draw[ln] (gicp.south) -- ++(0,-4mm) -| (loam.north);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径（骨干 only 速通）}：第 \ref{sec:pc-rep} 节（表示）$\to$ 第 \ref{sec:pc-kdtree} 节（KD 树）$\to$ 第 \ref{sec:pc-icp} 节（点到点 ICP，含闭式解与收敛性）$\to$ 第 \ref{sec:pc-p2plane} 节（点到面）。这四节是任何读者理解点云配准的主干，约 4 小时。GICP（第 \ref{sec:pc-gicp} 节）、NDT（第 \ref{sec:pc-ndt} 节）是结构化/大规模场景的进阶利器，LOAM（第 \ref{sec:pc-loam} 节）把前面所有工具串成实时 LiDAR 里程计——它们是 \cref{ch:lidar_slam}（激光 SLAM）的直接前置。第 \ref{sec:pc-track-point} 节（$\SE(3)$ 上跟踪一个已知点）是“流形上怎么估计”的最小范式（点观测雅可比、$\SE(3)$ 上 GN 与 EKF 五式），与 \cref{ch:lidar_slam} 的 FAST-LIO 同根而简单一个量级，可在读 ICP 后即看。带（选读）标记的解的唯一性（de Ruiter--Forbes，第 \ref{sec:pc-icp-uniqueness} 节）、D2D-NDT、TEASER/CPD 为研究级选读。
+
+\subsection*{前置知识桥接}
+\cref{ch:lie} 已给出在 $\SO(3)/\SE(3)$ 上做优化的核心工具：旋转/位姿是\emph{群}而非向量空间，不能直接加减求导；正确做法是用\textbf{右扰动} $\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\phi})$、$\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$（$\boldsymbol{\xi}=[\boldsymbol{\rho};\boldsymbol{\phi}]$，平移在前），在切空间（李代数）里解出一个普通的欧氏增量再用 $\boxplus$ 收缩回流形。点对旋转作用的右扰动雅可比是 $\partial(\mathbf{R}\mathbf{p})/\partial\boldsymbol{\varphi}=-\mathbf{R}\,\mathbf{p}^\wedge$（\cref{ch:lie} 式右扰动求导）。\cref{ch:nlopt}（非线性优化）则给了高斯--牛顿与 Levenberg--Marquardt 的正规方程框架——本章所有迭代配准算法（点到面 ICP、GICP、NDT、LOAM）都是把“点云对齐误差”塞进这两章的框架里求解。本章新引入的，是误差怎么\emph{定义}（点/线/面/分布）、对应怎么\emph{找}（KD 树最近邻），以及点云怎么\emph{洗}（滤波降采样）。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 在 \cref{ch:lidar_slam}（激光 SLAM）里，你会看到 LOAM、LIO-SAM、FAST-LIO 反复调用“scan registration”“边/面特征”“iKD-tree”——不理解本章的 ICP/特征/KD 树，你只能把它们当黑箱；
+  \item 在做 RGB-D 或 LiDAR 重建、回环精配准、地图融合时，你会遇到 ICP 不收敛、配准被错误对应带偏、NDT 发散等问题，而本章的收敛性分析、$d_{\max}$ 取舍、协方差软化、六阶段调优框架正是这些问题的诊断工具。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\label{tab:pc-reading}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导、证明与练习） & 6--8 小时 & 首次系统学习、要做 LiDAR/RGB-D 配准 \\
+速读（跳过 GICP/NDT 逐项求导） & 2.5 小时 & 有 ICP 基础、想对齐本书右扰动约定 \\
+速查（只看小结的符号表 + 速查表） & 20 分钟 & 写代码时回来查公式/参数缺省值 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+旋转矩阵记 $\mathbf{R}\in\SO(3)$（SLAM Handbook\cite{carlone2026handbook} 一致；Barfoot\cite{barfoot2024state} 用 $\mathbf{C}$，引用处转换），位姿 $\mathbf{T}\in\SE(3)$，点变换 $\mathbf{T}\!\cdot\!\mathbf{p}=\mathbf{R}\mathbf{p}+\mathbf{t}$。
+\textbf{配准方向统一}：$\mathcal{S}=\{\mathbf{p}_i\}$ 为 \emph{source}（待配准的“动”点云，常为当前帧），$\mathcal{T}=\{\mathbf{q}_j\}$ 为 \emph{target}（固定的“静”参考，常为上一帧或局部地图）；求变换满足 $\mathbf{R}\mathbf{p}_i+\mathbf{t}\approx\mathbf{q}_{c(i)}$，即把 source 对齐到 target（与 PCL 的 \texttt{setInputSource}/\texttt{setInputTarget} 一致）。
+反对称（叉积）算子统一记 $(\cdot)^\wedge$，$\mathbf{a}^\wedge\mathbf{b}=\mathbf{a}\times\mathbf{b}$（部分文献写 $\lfloor\cdot\rfloor_\times$ 或 $[\cdot]_\times$，本章统一 $(\cdot)^\wedge$，与 \cref{ch:lie} 一致）。
+协方差用 $\boldsymbol{\Sigma}$，信息矩阵 $\boldsymbol{\Lambda}=\boldsymbol{\Sigma}^{-1}$。
+四元数 \textbf{Hamilton} 约定，标量在前 $\mathbf{q}=[q_w,q_x,q_y,q_z]^\top$。
+\textbf{扰动方向：全书以右扰动 $\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\phi})$、$\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$ 为主}；引用各原论文（多用欧拉小角或四元数）处先按其原貌推导，再给出转到本书右扰动的对应式。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{从何而来：点云的物理来源与本章问题}
+\label{sec:pc-why}
+
+\paragraph{动机：两帧点云怎么“拼”起来。}
+机器人装一台 LiDAR 或 RGB-D 相机，每个时刻得到一帧三维点的集合（一帧 \emph{scan}）。机器人在运动，相邻两帧从不同位姿采集，看到的是同一场景的不同视角。要从“一堆堆离散点”里恢复机器人的运动、并把多帧拼成一致的地图，核心问题只有一个：\textbf{给定两帧点云，求把一帧对齐到另一帧的刚体变换 $(\mathbf{R},\mathbf{t})$}。这个问题叫\emph{点云配准}（point cloud registration）或\emph{扫描匹配}（scan matching），是 LiDAR 里程计与建图系统的基础组件\cite{carlone2026handbook}。
+
+\paragraph{点从哪来：LiDAR 的测距原理。}
+LiDAR 主动发射激光、测回波\emph{时间延迟}并由光速换算距离（RGB-D 相机同理给出每像素深度），本章把每帧点云当作\emph{给定输入}。其背后的三种测距物理（飞行时间 TOF、调幅连续波 AMCW、调频连续波 FMCW，以及 FMCW“频移测速”与毫米波雷达里程计的渊源）已在 \cref{par:lidar-ranging}（\cref{ch:lidar_slam}）详述，此处不赘。按扫描机构，LiDAR 分机械式、扫描式固态、闪光式、Risley 棱镜宏扫描四类；本章关注最常见的 2D/3D 机械式 LiDAR（如开创性的 Velodyne HDL-64E：多个激光发射器装在旋转机构上，整机绕方位轴旋转 $360^\circ$ 时各捕获不同仰角的距离测量）。
+
+\paragraph{点云的“先验”：近密远疏 + 沿扫描线分层。}
+LiDAR 点云有两条极重要的结构先验，后续的体素化、降采样、最近邻搜索、特征提取都必须考虑\cite{carlone2026handbook}：
+\begin{itemize}
+  \item \textbf{近密远疏}：同一立体角内激光束数固定，远处覆盖的物理面积大，故点密度随距离平方衰减。一帧 64 线 LiDAR 在设备近处很稠密、远处稀疏得多。
+  \item \textbf{沿扫描线分层}：机械式多线 LiDAR 的点天然按 \emph{ring}（仰角通道）分层，同 ring 内沿方位角密集、跨 ring 间距大。
+\end{itemize}
+忽视这两条先验，最常见的恶果就是 ICP 被近处稠密点“主导”、远处稀疏但有效的结构被忽略——这正是配准前要做\emph{均匀化降采样}的根本原因（\cref{sec:pc-filter}）。
+
+\paragraph{点的“字段”：不止 $xyz$。}
+不同 LiDAR 下，一个点可能携带的字段为 $\{x,y,z\}$（基本）、$+\,\text{强度}$（intensity / remission，几乎所有都有，刻画反射率/材料属性）、$+\,\text{相对速度}$（FMCW）、$+\,\text{ambient/光度}$（闪光式），以及隐含的 $\{\text{ring 号},\text{时间戳}\}$（多波束、用于运动去畸变）\cite{carlone2026handbook}。带属性时一个点是 $\mathbb{R}^3\times\mathcal{A}$ 的元素，$\mathcal{A}$ 为属性空间。
+
+\begin{insight}
+配准的本质，是\textbf{把“感知”问题化为“优化”问题}：先猜一个变换，把 source 点搬过去，看它与 target 贴得有多紧（定义一个误差），再调整变换让误差最小。本章后面所有算法（ICP/GICP/NDT/LOAM）共享这个骨架，区别只在两件事——\emph{误差怎么定义}（点/线/面/分布）与\emph{对应怎么找}（最近邻/落格）。抓住这条主线，几十种配准算法就不再是孤立的名字。
+\end{insight}
+
+\paragraph{历史脉络。}
+点云配准有两条经典路线\cite{carlone2026handbook}：当对应\emph{已知}时，Horn（1987）\cite{horn1987absolute} 与 Arun（1987）\cite{arun1987leastsquares} 给出\textbf{闭式解}（分别用四元数与 SVD）；当对应\emph{未知}时，Besl \& McKay（1992）\cite{besl1992icp} 的 \textbf{ICP}（迭代最近点）用“迭代地猜对应再求变换”绕开了这个难题，成为最流行、最基础的技术。此后 Chen \& Medioni（1991）\cite{chen1992pointplane} 提出点到平面度量，Segal 等（2009）\cite{segal2009gicp} 用概率框架统一出 GICP，Biber（2003）\cite{biber2003ndt} 与 Magnusson（2009）\cite{magnusson2009ndt} 发展出免对应的 NDT，Zhang \& Singh（2014）\cite{zhang2014loam} 的 LOAM 用特征点实现了实时 LiDAR 里程计。本章把这些经典工作的完整推导逐一独立记录，读者无需再翻原论文。
+
+% ════════════════════════════════════════════════════════════════
+\section{点云表示与数据结构}
+\label{sec:pc-rep}
+
+\paragraph{动机：无序点集为什么需要专门的数据结构。}
+图像是规则栅格，像素 $(u,v)$ 的邻居就是 $(u\pm1,v\pm1)$，邻域查询 $O(1)$。点云\textbf{无序}——点的索引不含几何意义，第 $5$ 个点和第 $6$ 个点在空间里可能相隔很远。这是点云与图像最本质的区别：任何“遍历邻域”的操作（找最近邻、估法向、提特征）都必须先建立\emph{空间索引}，否则只能 $O(N)$ 线性扫描。
+
+\begin{definition}[点云]\label{def:pc-cloud}
+点云是 $\mathbb{R}^3$（或带属性的高维空间）中有限点的集合
+\begin{equation}
+  \mathcal{P}=\{\mathbf{p}_i\in\mathbb{R}^3\mid i=1,\dots,N\},\qquad \mathbf{p}_i=(x_i,y_i,z_i).
+  \label{eq:pc-def}
+\end{equation}
+若每点附带属性（法向 $\mathbf{n}_i$、颜色 $(r,g,b)_i$、强度 $I_i$、时间戳 $\tau_i$、曲率 $c_i$ 等），则点云是 $\mathbb{R}^3\times\mathcal{F}$ 上的有限集，$\mathcal{F}$ 为属性空间。点云无固定拓扑、无序——配准、滤波、最近邻都建立在“无序点集 + 空间邻近”之上。
+\end{definition}
+
+\paragraph{有组织 vs 无组织。}
+一个实用区分：若点云能写成 $H\times W$ 的二维栅格（如 RGB-D 相机的逐像素深度、LiDAR 的“行 = ring、列 = 方位角”\emph{距离图像}），称\textbf{有组织点云}（organized）；否则为\textbf{无组织点云}（unorganized，纯点列）\cite{carlone2026handbook}。有组织点云天然带 2D 邻接，法向估计与近邻可走整数像素邻域 $O(1)$，无须 KD 树——LOAM/LeGO-LOAM 正是利用这点做高效特征提取（\cref{sec:pc-loam}）。
+
+\begin{table}[H]\centering\small
+\caption{常见点云表示与空间索引数据结构（综合 SLAM Handbook\cite{carlone2026handbook} 与 PCL 实践）}
+\label{tab:pc-representations}
+\begin{tabular}{p{0.16\textwidth} p{0.27\textwidth} p{0.23\textwidth} p{0.23\textwidth}}
+\toprule
+表示 & 结构 & 优点 & 缺点 / 适用 \\
+\midrule
+原始点列 & $N\times3$（或 $N\times d$）数组 & 无损、最通用 & 无空间索引，邻域查询需额外结构 \\
+距离图像 (range image) & 按 $(\text{方位角},\text{仰角})$ 投到 $H\times W$ 像素存 range & 有序、可借 2D 卷积；$O(1)$ 邻域 & 投影有遮挡冲突、量化损失；仅单视角扫描 \\
+体素栅格 (voxel grid) & 空间均分边长 $l$ 的立方体素 & 规则、可 3D 卷积、便于降采样 & 内存 $O((\text{范围}/l)^3)$；稀疏场景用\emph{哈希体素}只存非空 \\
+八叉树 (octree) & 递归把立方均分八子立方 & 自适应分辨率、省内存、支持 kNN 与盒搜索 & 树深处随机访问慢 \\
+KD 树 (k-d tree) & 二叉树，每节点一个轴对齐分裂超平面 & 低维主存 kNN 最快之一 & 插删破坏平衡需重建（\cref{ch:lidar_slam} 的增量 KD 树） \\
+面元 (surfel) & 中心 + 法向 + 半径(+协方差) 的小圆盘 & 紧凑表面表示、便于融合 & 需估法向；薄结构易丢 \\
+鸟瞰图 (BEV) & 投到地面 $xy$ 栅格存高度/密度 & 适合地面车、可接 2D 检测网络 & 丢竖直细节 \\
+隐式表示 & 用函数 $f(\mathbf{x})$（如 SDF/NeRF）表面 & 连续、可微、便于重建 & 训练/求值代价高 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{表示 vs 数据结构}：上表里“体素/八叉树/KD 树”既是表示也是空间索引数据结构——它们的核心价值是把无序点云的邻域查询从 $O(N)$ 降到 $O(\log N)$。其中体素栅格还兼任\emph{降采样}（\cref{sec:pc-filter}）与 NDT 的\emph{分布载体}（\cref{sec:pc-ndt}）。下一节专门展开最常用、配准里出现最频繁的 KD 树。
+
+\begin{pitfall}[概念误区：把点云当“图像的三维版”]
+新手常把点云想成“多了一维的图像”，于是期待 $\mathbf{p}_i$ 的邻居就在 $\mathbf{p}_{i\pm1}$。错误描述：用索引相邻当几何相邻。现象：法向估计、特征提取全错，因为索引相邻的点在空间可能隔几米。根本原因：点云\emph{无序}，索引只是存储顺序，不含几何。正确做法：任何邻域操作前先建空间索引（KD 树/八叉树/体素哈希）；唯一例外是\emph{有组织点云}（距离图像/RGB-D），它的二维栅格才真带几何邻接。自检：把点云随机打乱索引顺序——若你的算法结果变了，说明它错误地依赖了索引顺序。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：体素栅格无脑全用，不管稀疏性]
+错误描述：对一大片空旷场景直接开一个稠密三维体素数组。现象：内存爆炸（$O((\text{范围}/l)^3)$，$100\,\mathrm{m}$ 范围、$5\,\mathrm{cm}$ 体素就是 $2000^3=8\times10^9$ 个体素）。根本原因：LiDAR 点云极度稀疏，绝大多数体素是空的。正确做法：用\emph{哈希体素}（hashed voxels）只存非空体素（键 = 体素整数索引），内存随实际占据点数线性增长；或用八叉树自适应分辨率。自检：打印非空体素占比，若远小于 $1\%$，稠密数组就是浪费。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 给定 $100\,\mathrm{m}\times100\,\mathrm{m}\times20\,\mathrm{m}$ 的范围、$0.1\,\mathrm{m}$ 体素，估算稠密体素数组与哈希体素（设实际 $5\times10^4$ 个非空体素）的内存差距。
+  \item 为下列任务各选一种表示并说明理由：(a) 室内 RGB-D 实时法向估计；(b) 城市级 LiDAR 地图存储；(c) 接 2D 目标检测网络做地面车感知。
+  \item （概念）解释为什么把无序点云随机打乱索引后，正确的最近邻查询结果不变，但一个错误地依赖索引相邻的“伪邻域”算法结果会变。
+\end{enumerate}
+\end{practice}
+
+\subsection{工程表达：Packet 解析与 BEV / 距离图构造}
+\label{sec:pc-eng-rep}
+
+\paragraph{动机：从“总览表格”到“能落地的字节与像素”。}
+\cref{tab:pc-representations} 列出了原始点列、距离图像、鸟瞰图等表示及其权衡，但每一行都还停在“是什么”。真正写 LiDAR 驱动与里程计时，绕不开三件具体的事：原始数据在网线上是怎么\emph{压缩成数据包}（Packet）传过来的、点云怎么\emph{投成俯视图}（BEV）接 2D 算法、又怎么\emph{投成距离图}（range image）借相机的栅格便利。本小节把这三件工程表达的构造细节补齐，对齐高翔《自动驾驶与机器人中的 SLAM 技术》第 5 章\cite{gao2023slamad} 的讲法——它们都在“不改变测量数据本身、只改变\emph{点与点的相邻关系}”这一点上服务于后续算法。
+
+\paragraph{Packet：原始数据的压缩表达。}
+原始点云要存所有点的笛卡儿坐标，占空间且不便于网络传输。注意到 LiDAR 的旋转速率、各探头相对中心的俯仰角等是\emph{出厂固定}的\textbf{内参}，写进固定参数文件即可；真正逐次测量、随时间变化的只有每束的\emph{探测距离}与\emph{反射率}。把变化部分按设备原生格式打包成\textbf{数据包}（Packet，常经 UDP 等协议发送），就能大幅压缩数据量，这正是各厂商私有 Packet 格式的共同思想\cite{gao2023slamad}。以 Velodyne HDL-64S3 为例（\cref{tab:pc-packet}）：距离与反射率各用紧凑字节存储，同一列（同一次发射）的多束读数\emph{共享}一个方位角与区块 ID。
+
+\begin{table}[H]\centering\small
+\caption{Velodyne HDL-64S3 以太网数据包（Packet）的层级结构（据\cite{gao2023slamad}）}
+\label{tab:pc-packet}
+\begin{tabular}{p{0.26\textwidth} p{0.16\textwidth} p{0.46\textwidth}}
+\toprule
+字段 & 字节数 & 含义 / 取值 \\
+\midrule
+Ethernet Header & 42 & 以太网包头 \\
+Lidar Packet（总） & 1248 & 整包长度 \\
+\;\;Lidar Data Payload & 1206 & 数据载荷（含 12 个数据区块） \\
+\;\;\;\;Data Block $\times12$ & 1200 & 每块 100 字节 \\
+\;\;\;\;\;\;Laser Block ID & 2 & 上半区 \texttt{0xEEFF} / 下半区 \texttt{0xDDFF} \\
+\;\;\;\;\;\;Rotational Position & 2 & 方位角，整数 $0\!\sim\!35999$（除以 $100$ 得角度） \\
+\;\;\;\;\;\;Firing Data（$32$ 束） & 96 & 每束 $3$ 字节 \\
+\;\;\;\;\;\;\;\;Distance & 2 & $2\,\mathrm{mm}$ 为单位；$0$ 表示 $150\,\mathrm{m}$ 内无回波 \\
+\;\;\;\;\;\;\;\;Intensity & 1 & 反射率，整数 $0\!\sim\!255$（越大越强） \\
+\;\;GPS Timestamp & 4 & GPS 时间戳（微秒，逆序字节） \\
+\;\;Status Type / Value & 2 & 状态字段 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{为什么省：一道账。} 若按 PCL 方式直存点云，$32$ 线一列的 $XYZ$ 加反射率需 $32\times(4+4+4+1)=416$ 字节；而 Packet 里这 $32$ 个读数只占 $100$ 字节（距离/反射率紧凑编码 + 方位角共享），存 Packet 比直存点云高效得多\cite{gao2023slamad}。代价是 Packet 是\emph{压缩后}的中间形态，算法多希望直接访问每点坐标，故 Packet 通常只在驱动程序、原始数据回放、地图压缩存储里出现；各厂商一般提供 SDK 完成 Packet $\leftrightarrow$ 点云的解压。本书后续算法一律以\emph{已解压的点云}为输入。
+
+\begin{insight}
+Packet 的本质是“只传变化量”：把出厂固定的角度/线序当内参写死，只把每次真正变化的\emph{距离 + 反射率}上网。这与 \cref{sec:pc-why} 说的“记录时间和距离比记录 $XYZ$ 更省”一脉相承——RAE 极坐标下 $E$ 几乎固定、$A$ 随时间线性推、只有 $r$ 来自实测，压缩的全部空间正源于此。
+\end{insight}
+
+\paragraph{鸟瞰图（BEV）：投到地面栅格。}
+车辆与车载传感器通常\emph{水平}安装，故把点云的 $(x,y)$ 直接当水平坐标、$z$ 当高度，投到地面栅格即得俯视图，便于接 A$^\ast$/D$^\ast$ 等栅格路径规划或 2D 检测网络\cite{gao2023slamad}（倾斜安装的传感器则需先用地面/世界系方向把点云摆正）。设分辨率 $r$（每像素对应 $r$ 米）、点云中心 $\mathbf{c}=[c_x,c_y]^\top$、图像中心像素 $(I_x,I_y)$，则点 $(x,y,z)$ 落到的像素坐标 $(u,v)$ 为
+\begin{equation}
+  \begin{cases}
+    u=(x-c_x)/r+I_x,\\[2pt]
+    v=(y-c_y)/r+I_y,
+  \end{cases}
+  \label{eq:pc-bev}
+\end{equation}
+即“相对中心的物理偏移除以分辨率、再平移到图像中心”。$z$ 坐标不进像素位置，而用来\emph{着色}区分高度；通常只保留车辆周边某高度区间（如 $z\in[0.2,2.5]\,\mathrm{m}$）的障碍物点入图，滤掉地面与过高物。由于一个三维竖直柱体投影后落到\emph{同一像素}，BEV 必然丢失竖直方向的细节——这是“化三维为二维”不可避免的代价。
+
+\begin{codebox}[C++]{点云 → 俯视图（BEV）核心映射（据 Gao 第 5 章）}
+// inv_r = 1 / resolution; (x_center_image, y_center_image) = 图像中心像素
+for (const auto& pt : cloud->points) {
+  int u = int((pt.x - x_center) * inv_r + x_center_image);   // 式 (eq:pc-bev)
+  int v = int((pt.y - y_center) * inv_r + y_center_image);
+  if (u < 0 || u >= image_cols || v < 0 || v >= image_rows
+      || pt.z < min_z || pt.z > max_z) continue;             // 越界 / 高度门限
+  image.at<cv::Vec3b>(v, u) = cv::Vec3b(227, 143, 79);       // 障碍物着色
+}
+\end{codebox}
+
+\paragraph{距离图（range image）：借相机的规则栅格。}
+距离图与 RGB-D 相机同思路：把激光点云投到一个\emph{虚拟相机}里，横坐标取\textbf{方位角} $A$、纵坐标取\textbf{俯仰角} $E$（多线雷达也可直接用\emph{线号}当纵坐标），像素值存\emph{距离} $r$\cite{gao2023slamad}。对扫描后的点云，三者由直角坐标算得（注意弧度$\to$度的换算）：
+\begin{equation}
+  A=\operatorname{atan2}(y,\,x),\qquad
+  r=\sqrt{x^2+y^2},\qquad
+  E=\operatorname{atan2}\!\big(z-h,\ r\big),
+  \label{eq:pc-rangeimg}
+\end{equation}
+其中 $h$ 为雷达安装高度。再按方位角分辨率与俯仰角行数把 $(A,E)$ 量化到像素 $(行,列)$：横向覆盖 $360^\circ$、按分辨率切分得列数，纵向行数等于线数。例如 VLP-16（$16$ 线、俯仰角上下各 $15^\circ$、方位角分辨率 $0.3^\circ$）得到约 $1200\times16$ 的长条图像。与相机图像十分类似，\emph{但没有透视投影}——它只是把无序点云重排成有序的二维栅格，从而能套用 2D 卷积/邻域算法，后续的特征法里程计常借距离图提取垂直方向的杆状物作定位特征（\cref{sec:pc-loam}）。
+
+\begin{insight}
+BEV 与距离图\emph{都不改变测量数据本身}（既不让点云变稠也不变丰富），改变的只是\textbf{点与点的相邻关系}：三维里沿 $Z$ 轴排布的一根竖直柱体，在距离图里变成沿“行”方向一条线、在 BEV 里坍缩成一个像素。正因相邻关系被重排成规则栅格，某些聚类/特征提取算法在距离图或 BEV 上反而更高效——这就是有组织点云（\cref{sec:pc-rep} 的 organized）值得专门构造的根本原因。
+\end{insight}
+
+\begin{pitfall}[工程陷阱：把 Packet 的“距离/方位角整数”当物理量直接用]
+错误描述：解析 Packet 时把 Rotational Position 的整数 $0\!\sim\!35999$ 当角度、把 Distance 的原始整数当米直接喂进算法。现象：方位角差 $100$ 倍、距离差 $500$ 倍，点云整体错位/炸开。根本原因：Packet 为省字节做了定点编码——方位角须\emph{除以 $100$} 得度、距离以 $2\,\mathrm{mm}$ 为单位须\emph{乘 $0.002$} 得米，且 Distance $=0$ 是“无回波”哨兵而非“距离为零”。正确做法：严格按厂商手册（\cref{tab:pc-packet}）的标度与哨兵解码，无回波点直接丢弃。自检：解出的点云范围应落在雷达量程（如 $\le150\,\mathrm{m}$）内、方位角在 $[0,360^\circ)$。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{滤波与降采样}
+\label{sec:pc-filter}
+
+\paragraph{动机：配准前先洗点云。}
+原始 LiDAR 单帧动辄数万到数十万点，直接配准既慢（KD 树近邻次数随点数线性增长）又不准（外点会把 ICP 拉偏；近密远疏使代价被高密度区主导）。所以配准前几乎都要先\emph{降采样 + 去噪}。这一节给出三件最常用的预处理工具及其精确判据。
+
+\subsection{体素栅格降采样}
+\label{sec:pc-voxel}
+
+\paragraph{反面：随机抽稀的问题。}
+最朴素的降采样是“随机保留 $10\%$ 的点”。但随机抽稀\emph{不改变密度分布}——近处仍稠密、远处仍稀疏，ICP 仍被近处主导。体素栅格降采样则同时做到“减点 + 均匀化”。
+
+\begin{algo}[体素栅格降采样]\label{alg:pc-voxel}
+给定叶尺寸（leaf size）$l$（可各轴不同 $l_x,l_y,l_z$）：
+\begin{enumerate}
+  \item 把空间划分为边长 $l$ 的规则体素。点 $\mathbf{p}_i=(x_i,y_i,z_i)$ 落入体素整数索引
+  \begin{equation}
+    \big(\lfloor x_i/l_x\rfloor,\ \lfloor y_i/l_y\rfloor,\ \lfloor z_i/l_z\rfloor\big).
+    \label{eq:pc-voxel-index}
+  \end{equation}
+  \item 同一体素 $V$ 内的所有点用\emph{一个代表点}取代。两种代表：
+  \begin{itemize}
+    \item \textbf{质心}（centroid，PCL 默认）：$\displaystyle\mathbf{p}_{\text{rep}}=\frac{1}{|V|}\sum_{\mathbf{p}\in V}\mathbf{p}$。落在真实数据上，更贴近底层曲面，代价略高。
+    \item \textbf{体素中心}（voxel center）：取体素几何中心，更快、量化更整齐，但代表点不在真实点上。
+  \end{itemize}
+  \item 输出 = 各非空体素的代表点。点数从 $N$ 降到非空体素数。
+\end{enumerate}
+质心公式：体素 $V$ 内含 $n$ 个点 $\{\mathbf{p}_1,\dots,\mathbf{p}_n\}$，代表点
+\begin{equation}
+  \bar{\mathbf{p}}_V=\frac{1}{n}\sum_{i=1}^{n}\mathbf{p}_i.
+  \label{eq:pc-centroid}
+\end{equation}
+\end{algo}
+
+\paragraph{性质与参数。}
+体素降采样近似均匀化点密度（消除近密远疏的采样偏置），用哈希体素时为 $O(N)$ 时间\cite{magnusson2009ndt}。典型参数：PCL 官方数值例中 \texttt{table\_scene\_lms400.pcd} 原 $460400$ 点，叶尺寸 $0.01\,\mathrm{m}$（$1\,\mathrm{cm}$）体素滤波后降到 $41049$ 点（约减 $91\%$），几何信息基本保留\cite{rusu2011pcl}。LOAM 地图降采样取 $l=5\,\mathrm{cm}$\cite{zhang2014loam}；NDT 前常下采到 $0.1\sim0.2\,\mathrm{m}$\cite{magnusson2009ndt}。
+
+\begin{codebox}[C++]{PCL 体素栅格降采样}
+#include <pcl/filters/voxel_grid.h>
+pcl::VoxelGrid<pcl::PCLPointCloud2> sor;
+sor.setInputCloud(cloud);
+sor.setLeafSize(0.01f, 0.01f, 0.01f);   // 1 cm cube voxel
+sor.filter(*cloud_filtered);            // each voxel -> its centroid
+\end{codebox}
+
+\begin{insight}
+体素降采样是配准（ICP/NDT）前的\textbf{头号预处理}：既降算力（点数下降则 KD 树近邻次数下降），又起空间均匀化（消除近密远疏的采样偏置，避免 ICP 被高密度区主导）。它和后面的最近邻、点到面残差是同一套工程的不同环节——LOAM/LIO-SAM 的地图也用体素降采样去重。
+\end{insight}
+
+\subsection{统计离群点剔除（SOR）}
+\label{sec:pc-sor}
+
+\paragraph{目的与判据。}
+去除测量噪声、镜面反射造成的孤立离群点。\textbf{思想}：离群点远离邻居，故它到近邻的平均距离会异常大，落在分布的右尾。
+
+\begin{algo}[统计离群点剔除 SOR]\label{alg:pc-sor}
+给定邻居数 $k$ 与标准差倍数 $\alpha$：
+\begin{enumerate}
+  \item 对每个点 $\mathbf{p}_i$，用 KD 树求其 $k$ 个最近邻，计算到这 $k$ 邻的\textbf{平均距离}
+  \begin{equation}
+    \bar{d}_i=\frac{1}{k}\sum_{j=1}^{k}\|\mathbf{p}_i-\mathbf{q}_{ij}\|.
+    \label{eq:pc-sor-dbar}
+  \end{equation}
+  \item 假设全体 $\{\bar{d}_i\}$ 服从高斯分布，估其全局均值 $\mu$ 与标准差 $\sigma$：
+  \begin{equation}
+    \mu=\frac{1}{N}\sum_i\bar{d}_i,\qquad
+    \sigma=\sqrt{\frac{1}{N}\sum_i(\bar{d}_i-\mu)^2}.
+    \label{eq:pc-sor-musigma}
+  \end{equation}
+  \item \textbf{剔除判据}：若 $\bar{d}_i>\mu+\alpha\,\sigma$（或对称地 $\bar{d}_i<\mu-\alpha\,\sigma$）则 $\mathbf{p}_i$ 判为离群点删除。
+\end{enumerate}
+\end{algo}
+
+\noindent PCL 默认 $k=50$、$\alpha=1.0$\cite{rusu2011pcl}。
+
+\begin{codebox}[C++]{PCL 统计离群点剔除}
+#include <pcl/filters/statistical_outlier_removal.h>
+pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor;
+sor.setInputCloud(cloud);
+sor.setMeanK(50);                 // k neighbors
+sor.setStddevMulThresh(1.0);      // alpha
+sor.filter(*cloud_filtered);
+\end{codebox}
+
+\subsection{半径离群点剔除（ROR）}
+\label{sec:pc-ror}
+
+\paragraph{判据。}
+更简单直接：给定半径 $r$ 与最少邻居数 $k_{\min}$，对每个点统计半径 $r$ 球内的邻居数 $n_i=\big|\{\mathbf{q}:\|\mathbf{p}_i-\mathbf{q}\|\le r,\ \mathbf{q}\ne\mathbf{p}_i\}\big|$；若 $n_i<k_{\min}$ 则删除：
+\begin{equation}
+  \mathbf{p}_i\ \text{是内点}\iff n_i\ge k_{\min}.
+  \label{eq:pc-ror}
+\end{equation}
+PCL 例值 $r=0.8$、$k_{\min}=2$\cite{rusu2011pcl}。
+
+\begin{table}[H]\centering\small
+\caption{SOR 与 ROR 对比}
+\label{tab:pc-sor-ror}
+\begin{tabular}{lll}
+\toprule
+ & SOR & ROR \\
+\midrule
+判据 & 近邻平均距离的全局高斯尾部 & 局部半径球内邻居数 \\
+是否假设分布 & 是（近邻距离高斯） & 否（直接看局部密度） \\
+速度 & 较慢（每点 kNN + 两遍统计） & 较快（每点一次半径搜索） \\
+弱点 & 密度强非均匀时误删稀疏有效点 & 需手调 $r$，对密度变化不自适应 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{标准预处理管线。}
+典型配准前管线为：直通滤波（PassThrough，沿某轴设区间 $[a,b]$ 裁掉 ROI 外、地面/天空的点）$\to$ 体素栅格降采样（均匀化）$\to$ SOR/ROR（去噪）$\to$（可选）法向估计。法向估计（点到面 ICP / GICP / NDT-D2D 需要）：对每点取 $k$ 近邻求邻域协方差，最小特征值对应的特征向量即法向——这与 GICP 的协方差构造（\cref{sec:pc-gicp}）、LOAM 的 PCA 判别（\cref{sec:pc-loam}）同源，都是“PCA 协方差特征值/向量刻画局部几何”这一统一思想。
+
+\begin{pitfall}[概念误区：SOR 直接套在原始 LiDAR 点云上]
+错误描述：拿到原始 64 线 LiDAR 帧就直接 SOR 去噪。现象：远处稀疏但有效的点被大量误删（墙角、远处车辆消失）。根本原因：SOR 假设近邻平均距离服从单一高斯，但 LiDAR 近密远疏——远处点的近邻距离本来就大，被全局阈值当成离群点。正确做法：先体素降采样均匀化密度再 SOR；或对 LiDAR 用按距离自适应的门限（如 KISS-ICP 的自适应阈值）。自检：分别统计近处与远处点的 $\bar{d}_i$ 分布，若两者均值差出数倍，单一高斯假设就不成立。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：降采样越狠越好]
+错误描述：为求快把叶尺寸开得很大（如 $1\,\mathrm{m}$）。现象：配准精度骤降、薄结构（栏杆、电线杆）整根消失、点到面法向估计失真。根本原因：体素过大会把不同表面的点合并成一个质心，破坏几何细节。正确做法：叶尺寸与场景尺度、传感器分辨率匹配（室内 $\sim5\,\mathrm{cm}$、城市 $\sim10\sim20\,\mathrm{cm}$）；对特征提取/法向估计保留足够密度。自检：降采样后目视检查薄结构是否还在，配准残差是否反而变大。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （实现）写一个体素降采样函数：用 \texttt{unordered\_map} 以体素整数索引 \cref{eq:pc-voxel-index} 为键累加坐标和与计数，输出每个非空体素的质心 \cref{eq:pc-centroid}。
+  \item （调试）给定一帧含明显反射噪点的 LiDAR 数据，分别用 SOR（$k=50,\alpha=1$）与 ROR（$r=0.5,k_{\min}=5$）去噪，比较剔除点数与远处有效点的保留情况，解释差异。
+  \item （概念）为什么质心法 \cref{eq:pc-centroid} 比体素中心更贴近底层曲面？给一个反例说明体素中心可能落到无点的空腔里。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{最近邻搜索与 KD 树}
+\label{sec:pc-kdtree}
+
+\paragraph{动机：对应步是 ICP 的算力瓶颈。}
+ICP/GICP 每次迭代都要为 source 的每个点在 target 中找最近邻（\cref{sec:pc-icp}）。朴素法逐点比较，单次查询 $O(M)$，对 $N$ 个查询点共 $O(NM)$——两帧各 $10^5$ 点就是 $10^{10}$ 次比较，不可接受。KD 树把 target 预处理成二叉空间划分树，单次最近邻平均降到 $O(\log M)$，是点云配准实时化的基石\cite{segal2009gicp}。
+
+\begin{definition}[最近邻与 kNN/半径搜索]\label{def:pc-nn}
+给定 target 点集 $\mathcal{T}=\{\mathbf{q}_j\}_{j=1}^{M}$ 与查询点 $\mathbf{p}$，\textbf{最近邻}为
+\begin{equation}
+  \mathrm{NN}(\mathbf{p})=\arg\min_{\mathbf{q}_j\in\mathcal{T}}\|\mathbf{p}-\mathbf{q}_j\|_2.
+  \label{eq:pc-nn}
+\end{equation}
+\textbf{k 近邻}（kNN）返回距离最小的 $k$ 个点（拟合局部平面常取 $k=5\sim20$）；\textbf{半径搜索}返回 $\{\mathbf{q}_j:\|\mathbf{p}-\mathbf{q}_j\|\le r\}$。
+\end{definition}
+
+\subsection{KD 树构建}
+\label{sec:pc-kdbuild}
+
+\begin{definition}[KD 树]\label{def:pc-kdtree}
+$k$ 维 KD 树是二叉树，每个非叶结点存一个 $k$ 维点，并\emph{隐式定义一个轴对齐分裂超平面}，把空间分成两个半空间；左/右子树分别落在超平面两侧。点云 $k=3$。
+\end{definition}
+
+\paragraph{中位数分割建树。}
+每层选一个坐标轴（逐层轮换 $\text{axis}=\text{depth}\bmod k$），用该轴上的\emph{中位点}作分裂超平面把点集二分，递归。取中位点保证左右子树点数近似相等，得到近似平衡的树（树高 $\approx\log_2 M$）\cite{bentley1975kdtree}。
+
+\begin{algo}[KD 树建树]\label{alg:pc-kdbuild}
+\begin{codebox}[Python]{KD-tree construction (median split, cycling axes)}
+def kdtree(point_list, depth):
+    if not point_list:
+        return None
+    axis = depth % k                      # cycle through axes
+    select_median_by_axis(point_list, axis)   # quickselect: O(M) per level
+    node.location   = median
+    node.left_child  = kdtree(points_before_median, depth + 1)
+    node.right_child = kdtree(points_after_median,  depth + 1)
+    return node
+\end{codebox}
+\end{algo}
+
+\paragraph{复杂度与变体。}
+每层做一次中位选择。用线性时间中位选择（quickselect / median-of-medians）单层 $O(M)$，共 $\log M$ 层，总 \textbf{$O(M\log M)$}；若每层排序则 $O(M\log^2 M)$。空间 $O(M)$。\textbf{变体}：可不轮换轴，而在每节点选\emph{方差最大维}或\emph{极差最大维}作分裂轴（划分更紧凑，这是 LOAM/FAST-LIO 的 iKD-tree 的做法，\cref{ch:lidar_slam} 给出其完整伪码与 $\alpha$-平衡判据）；实现上常在叶节点存“一桶点”（bucket，$>1$）以减小树深、提升缓存命中。
+
+\subsection{最近邻搜索与回溯剪枝}
+\label{sec:pc-kdnn}
+
+\paragraph{核心思想：先下降到最可能的一侧，再决定要不要回溯另一侧。}
+朴素树搜索只看“查询点落在分裂面哪侧”就一路下降到叶——但最近邻\emph{可能在另一侧}（查询点离分裂面很近时）。关键是一个\emph{剪枝判据}：只有当“以查询点为心、当前最优距离为半径的超球”穿过分裂面时，才需要搜另一侧。
+
+\begin{algo}[KD 树最近邻搜索（含回溯剪枝）]\label{alg:pc-kdnn}
+\begin{codebox}[Python]{KD-tree nearest-neighbor search with pruning}
+def nn_search(node, q, depth, best):
+    if node is None:
+        return best
+    # 1) update current best with this node's own point
+    if dist(q, node.location) < best.dist:
+        best = (node.location, dist(q, node.location))
+    axis = depth % k
+    # 2) descend the side that q falls into first
+    if q[axis] < node.location[axis]:
+        near, far = node.left_child, node.right_child
+    else:
+        near, far = node.right_child, node.left_child
+    best = nn_search(near, q, depth + 1, best)
+    # 3) cross-plane pruning: search far side only if the
+    #    ball (center q, radius best.dist) crosses the splitting plane
+    if abs(q[axis] - node.location[axis]) < best.dist:
+        best = nn_search(far, q, depth + 1, best)
+    return best
+\end{codebox}
+\end{algo}
+
+\begin{derivation}[剪枝判据的几何证明]
+设当前找到的最近距离为 $r^\ast=\|\mathbf{q}-\text{best}\|$。分裂超平面是 $\{\mathbf{x}:x_{\text{axis}}=\text{node}_{\text{axis}}\}$，它与查询点 $\mathbf{q}$ 的垂直距离恰是 $|q_{\text{axis}}-\text{node}_{\text{axis}}|$（轴对齐平面到点的距离就是该轴坐标之差的绝对值）。“以 $\mathbf{q}$ 为心、半径 $r^\ast$ 的球”与另一侧半空间\emph{相交}的充要条件，是该垂距小于半径：
+\begin{equation}
+  |q_{\text{axis}}-\text{node}_{\text{axis}}|<r^\ast.
+  \label{eq:pc-kd-prune}
+\end{equation}
+\emph{仅当}相交时，另一侧才\emph{可能}含比当前最优更近的点（任何点到 $\mathbf{q}$ 的距离都 $\ge$ 它到分裂面的距离 $\ge$ 垂距）；否则整支被安全剪掉，无须递归——这正是 KD 树相对线性扫描加速的本质。
+\end{derivation}
+
+\paragraph{kNN 与半径搜索。}
+kNN 把 \texttt{best} 换成“距离最大的第 $k$ 近”的优先队列（大小 $k$ 的最大堆），剪枝半径用堆顶距离；半径搜索把剪枝半径固定为 $r$ 并收集所有满足者。框范围搜索最坏复杂度 $O\!\big(k\,N^{1-1/k}+m\big)$（$m$ 为命中点数）。ICP 的“最大匹配距离 $d_{\max}$”即用半径搜索过滤。
+
+\begin{theorem}[KD 树搜索复杂度]\label{thm:pc-kd-complexity}
+低维、点近似均匀分布时，KD 树最近邻搜索平均复杂度为 $O(\log M)$；\emph{最坏} $O(M)$（高维或退化分布时回溯几乎遍历全树）。对 $\mathbb{R}^3$ 点云（$k=3$）非常高效；当维度 $k\gtrsim10$（如 FPFH 等高维描述子）时 KD 树退化为近似线性扫描——即“维度灾难”，经验规则需 $N\gg2^k$ 才有效，此时改用近似最近邻（ANN / FLANN）或哈希。
+\end{theorem}
+
+\begin{pitfall}[编程陷阱：只下降不回溯，得到“假最近邻”]
+错误描述：实现 KD 树搜索时只按分裂面一路下降到叶，返回叶里的点。现象：返回的“最近邻”常常不是真正的最近邻，配准残差莫名偏大、ICP 收敛到错误位姿。根本原因：漏了第 3 步的回溯剪枝——真最近邻可能在分裂面另一侧（当查询点离分裂面比当前最优还近时）。正确做法：严格按 \cref{alg:pc-kdnn} 的三步，尤其判据 \cref{eq:pc-kd-prune} 决定是否搜远侧。自检：对同一查询用暴力 $O(M)$ 扫描验证 KD 树结果，二者必须完全一致。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：高维描述子也指望 KD 树加速]
+错误描述：对 $33$ 维 FPFH 或 $128$ 维特征描述子建 KD 树找最近邻。现象：搜索几乎不比暴力扫描快，甚至更慢（树的额外开销）。根本原因：维度灾难——高维时几乎每次查询都要回溯遍历整棵树（\cref{thm:pc-kd-complexity}）。正确做法：高维改用近似最近邻（FLANN 的随机化 KD 树森林 + 优先队列、best-bin-first），用少量精度换大幅速度。自检：测量平均回溯节点数占总节点数的比例，若接近 $1$ 就退化了。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （实现）按 \cref{alg:pc-kdbuild,alg:pc-kdnn} 实现三维 KD 树的构建与最近邻搜索，并用暴力扫描对拍验证正确性。
+  \item （推导）证明剪枝判据 \cref{eq:pc-kd-prune}：任一在远侧半空间的点到 $\mathbf{q}$ 的距离都不小于 $|q_{\text{axis}}-\text{node}_{\text{axis}}|$。
+  \item （开放思考）为什么“先下降查询点所在的一侧”比随便先下降一侧更高效？提示：先下降所在侧能更早收紧 $r^\ast$，从而剪掉更多远侧分支。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{拟合：平面与直线的最小二乘提取}
+\label{sec:pc-fit}
+
+\paragraph{动机：配准之前，先把“形状”从点里抠出来。}
+点云配准（下一节起的 ICP 全家）反复需要一种基础能力：在局部把一簇点\emph{拟合}成一个几何基元——平面或直线。点到平面 ICP（\cref{sec:pc-p2plane}）要每点邻域的\emph{平面法向}；GICP（\cref{sec:pc-gicp}）要邻域的\emph{协方差/主方向}；LOAM（\cref{sec:pc-loam}）靠局部是“面”还是“线”判别边/面特征；2D 似然场与点到线扫描匹配（\cref{ch:slam2d}）要把激光点拟合成\emph{直线}。这些“先用最近邻（\cref{sec:pc-kdtree}）取 $k$ 个邻点、再把它们拟合成固定形状”的操作，背后是同一道线性代数题。本节按高翔《自动驾驶与机器人中的 SLAM 技术》第 5 章\cite{gao2023slamad} 的工具化讲法，把平面拟合与直线拟合\emph{统一}到带单位约束的线性最小二乘，核心解法是 SVD 或特征值分解——它与本书反复出现的“PCA 协方差特征值/向量刻画局部几何”（\cref{sec:pc-filter} 的法向估计、\cref{sec:pc-gicp}、\cref{sec:pc-loam}）是同一个内核。
+
+\subsection{平面拟合：齐次坐标下的零空间解}
+\label{sec:pc-fit-plane}
+
+\paragraph{超定方程的由来。}
+给定一簇点 $\mathcal{X}=\{\mathbf{x}_1,\dots,\mathbf{x}_n\}$，$\mathbf{x}_k\in\mathbb{R}^3$，找一个平面参数 $(\mathbf{n},d)$（$\mathbf{n}\in\mathbb{R}^3$ 法向、$d\in\mathbb{R}$ 截距）使
+\begin{equation}
+  \mathbf{n}^\top\mathbf{x}_k+d=0,\qquad \forall k\in[1,n].
+  \label{eq:pc-plane-eq}
+\end{equation}
+四个未知量、每点给一个方程：点数 $n>3$ 时受噪声影响\emph{一般无精确解}（超定），故求线性最小二乘
+\begin{equation}
+  \min_{\mathbf{n},d}\ \sum_{k=1}^{n}\big(\mathbf{n}^\top\mathbf{x}_k+d\big)^2 .
+  \label{eq:pc-plane-ls}
+\end{equation}
+用\textbf{齐次坐标}可消去那个碍事的 $d$。记 $\tilde{\mathbf{x}}=[\mathbf{x}^\top,1]^\top\in\mathbb{R}^4$、$\tilde{\mathbf{n}}=[\mathbf{n}^\top,d]^\top\in\mathbb{R}^4$，则 $\mathbf{n}^\top\mathbf{x}_k+d=\tilde{\mathbf{x}}_k^\top\tilde{\mathbf{n}}$，于是 \cref{eq:pc-plane-ls} 写成
+\begin{equation}
+  \min_{\tilde{\mathbf{n}}}\ \sum_{k=1}^{n}\big(\tilde{\mathbf{x}}_k^\top\tilde{\mathbf{n}}\big)^2
+  \;=\;\min_{\tilde{\mathbf{n}}}\ \big\|\tilde{\mathbf{X}}^\top\tilde{\mathbf{n}}\big\|_2^2,
+  \qquad \tilde{\mathbf{X}}=[\tilde{\mathbf{x}}_1,\dots,\tilde{\mathbf{x}}_n]\in\mathbb{R}^{4\times n}.
+  \label{eq:pc-plane-Axb}
+\end{equation}
+这正是线性代数里的\textbf{齐次解方程问题}：给定（非方）矩阵 $\mathbf{A}=\tilde{\mathbf{X}}^\top\in\mathbb{R}^{n\times4}$，求非零向量 $\mathbf{x}=\tilde{\mathbf{n}}$ 使 $\|\mathbf{A}\mathbf{x}\|$ 最小。若不加约束，$\mathbf{x}=\mathbf{0}$ 给出平凡解；又因 $\mathbf{x}\to k\mathbf{x}$ 把目标放大 $k^2$ 倍、与方向无关，故只关心 $\mathbf{x}$ 的\emph{方向}，钉死 $\|\mathbf{x}\|=1$。
+
+\begin{theorem}[齐次最小二乘 = 最小特征值/奇异向量]\label{thm:pc-fit-homo}
+对 $\mathbf{A}\in\mathbb{R}^{m\times n}$，约束最小二乘
+\begin{equation}
+  \mathbf{x}^\ast=\arg\min_{\|\mathbf{x}\|=1}\ \|\mathbf{A}\mathbf{x}\|_2^2
+  =\arg\min_{\|\mathbf{x}\|=1}\ \mathbf{x}^\top\mathbf{A}^\top\mathbf{A}\,\mathbf{x}
+  \label{eq:pc-fit-rayleigh}
+\end{equation}
+的解，是 $\mathbf{A}^\top\mathbf{A}$ \emph{最小特征值}对应的特征向量，等价地是 $\mathbf{A}$ \emph{最小奇异值}对应的右奇异向量。
+\end{theorem}
+
+\begin{derivation}[特征值视角与奇异值视角]
+\textbf{特征值视角。} $\mathbf{A}^\top\mathbf{A}$ 实对称半正定，可正交对角化 $\mathbf{A}^\top\mathbf{A}=\mathbf{V}\boldsymbol{\Lambda}\mathbf{V}^{-1}$，设特征值\emph{降序} $\lambda_1\ge\dots\ge\lambda_n\ge0$，特征向量 $\mathbf{v}_1,\dots,\mathbf{v}_n$ 构成单位正交基。把任意单位向量展开 $\mathbf{x}=\sum_k\alpha_k\mathbf{v}_k$，则 $\mathbf{V}^{-1}\mathbf{x}=\mathbf{V}^\top\mathbf{x}=[\alpha_1,\dots,\alpha_n]^\top$，目标变成
+\begin{equation}
+  \|\mathbf{A}\mathbf{x}\|_2^2=\mathbf{x}^\top\mathbf{A}^\top\mathbf{A}\mathbf{x}=\sum_{k=1}^{n}\lambda_k\alpha_k^2 .
+  \label{eq:pc-fit-spectral}
+\end{equation}
+约束 $\|\mathbf{x}\|=1$ 即 $\sum_k\alpha_k^2=1$。因 $\lambda_k$ 降序，把全部“权重”压到\emph{最小}的 $\lambda_n$ 上最省：取 $\alpha_n=1$、其余为 $0$，得 $\mathbf{x}^\ast=\mathbf{v}_n$，目标达最小值 $\lambda_n$。这就是“\textbf{零空间解}”——当点严格共面时 $\lambda_n=0$，$\mathbf{v}_n$ 恰落在 $\mathbf{A}$ 的零空间。
+\textbf{奇异值视角。} 对 $\mathbf{A}=\mathbf{U}\boldsymbol{\Sigma}\mathbf{V}^\top$ 做 SVD（$\mathbf{U},\mathbf{V}$ 正交、$\boldsymbol{\Sigma}$ 对角存奇异值，降序），则 $\mathbf{x}^\top\mathbf{A}^\top\mathbf{A}\mathbf{x}=\mathbf{x}^\top\mathbf{V}\boldsymbol{\Sigma}^2\mathbf{V}^\top\mathbf{x}$，正交的 $\mathbf{U}$ 在二范数下被消掉。同理取 $\mathbf{x}=\mathbf{V}$ 的\emph{最后一列}（最小奇异值对应的右奇异向量）即最优。注意特征分解针对 $\mathbf{A}^\top\mathbf{A}$（保证实对称可对角化），而非直接对非方阵 $\mathbf{A}$。
+\end{derivation}
+
+\noindent\textbf{回到平面。} 把 $\mathbf{A}=\tilde{\mathbf{X}}^\top\in\mathbb{R}^{n\times4}$ 代入 \cref{thm:pc-fit-homo}：平面参数 $\tilde{\mathbf{n}}=[\mathbf{n}^\top,d]^\top$ 取 $\mathbf{A}$ 最小奇异值对应的右奇异向量（即 $\mathbf{V}$ 第 $4$ 列）。直觉上，平面拟合是在找点云分布“最薄”的那个方向——法向恰是邻域协方差\emph{最小特征值}的方向，与 \cref{sec:pc-filter} 的法向估计、\cref{sec:pc-gicp} 的协方差构造完全同源。
+
+\begin{codebox}[C++]{平面拟合：齐次设计矩阵 + ThinV 取末列（据 Gao 第 5 章）}
+// data: n 个三维点；plane_coeffs = [n_x, n_y, n_z, d]
+Eigen::MatrixXd A(data.size(), 4);
+for (int i = 0; i < data.size(); ++i) {
+  A.row(i).head<3>() = data[i].transpose();
+  A.row(i)[3]        = 1.0;                 // 齐次坐标补 1
+}
+Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeThinV);
+plane_coeffs = svd.matrixV().col(3);       // 最小奇异值 -> 第 4 (index 3) 列
+// 可选：把每点代回 |n·x + d| 检验残差是否超阈值，超则判拟合失败
+\end{codebox}
+
+\noindent 高翔给出的数值实验里，取真平面 $(0.1,0.2,0.3,0.4)$（归一化后）在面上取点加高斯噪声，拟合出的系数与真值差在小数点后第三位左右，且\emph{不依赖初值}——这是线性方法相对迭代法（如 ICP）的根本优势：一次 SVD 直达全局最优，平面点坐标即便远离原点也稳定工作\cite{gao2023slamad}。
+
+\subsection{直线拟合：去质心后求最大方向}
+\label{sec:pc-fit-line}
+
+\paragraph{参数化与点到线距离。}
+直线用“线上一点 $\mathbf{p}$ + 单位方向 $\mathbf{d}$”描述最直观：线上点满足 $\mathbf{x}=\mathbf{d}\,t+\mathbf{p}$（$\|\mathbf{d}\|=1$，$t$ 为参数），共 $6$ 个未知数，点多时同样是超定问题。对任一点 $\mathbf{x}_k$，由勾股定理，其到直线的\emph{垂直距离平方}为“到 $\mathbf{p}$ 的距离平方”减去“沿 $\mathbf{d}$ 投影的平方”：
+\begin{equation}
+  f_k=\|\mathbf{x}_k-\mathbf{p}\|^2-\big((\mathbf{x}_k-\mathbf{p})^\top\mathbf{d}\big)^2 .
+  \label{eq:pc-line-fk}
+\end{equation}
+最小二乘求 $(\mathbf{d},\mathbf{p})^\ast=\arg\min_{\mathbf{d},\mathbf{p}}\sum_k f_k$，约束 $\|\mathbf{d}\|=1$。
+
+\begin{derivation}[先解出 $\mathbf{p}$ 是质心，再把 $\mathbf{d}$ 化成最大方向问题]
+\textbf{对 $\mathbf{p}$ 求导。} 利用 $(\mathbf{x}_k-\mathbf{p})^\top\mathbf{d}=\mathbf{d}^\top(\mathbf{x}_k-\mathbf{p})$（标量），
+\begin{equation}
+  \frac{\partial f_k}{\partial\mathbf{p}}
+  =-2(\mathbf{x}_k-\mathbf{p})+2\big(\mathbf{d}^\top(\mathbf{x}_k-\mathbf{p})\big)\mathbf{d}
+  =-2(\mathbf{I}-\mathbf{d}\mathbf{d}^\top)(\mathbf{x}_k-\mathbf{p}).
+  \label{eq:pc-line-dfdp}
+\end{equation}
+整体目标对 $\mathbf{p}$ 的导数 $=-2(\mathbf{I}-\mathbf{d}\mathbf{d}^\top)\sum_k(\mathbf{x}_k-\mathbf{p})$，令其为零。因 $(\mathbf{I}-\mathbf{d}\mathbf{d}^\top)$ 只在垂直 $\mathbf{d}$ 的子空间非退化，须 $\sum_k(\mathbf{x}_k-\mathbf{p})=\mathbf{0}$，即
+\begin{equation}
+  \mathbf{p}=\frac{1}{n}\sum_{k=1}^{n}\mathbf{x}_k\quad(\text{点云质心}).
+  \label{eq:pc-line-p}
+\end{equation}
+\textbf{再解 $\mathbf{d}$。} 记 $\mathbf{y}_k=\mathbf{x}_k-\mathbf{p}$（去质心），\cref{eq:pc-line-fk} 成 $f_k=\mathbf{y}_k^\top\mathbf{y}_k-\mathbf{d}^\top\mathbf{y}_k\mathbf{y}_k^\top\mathbf{d}$。第一项与 $\mathbf{d}$ 无关可丢；最小化第二项的\emph{负}即\textbf{最大化}
+\begin{equation}
+  \mathbf{d}^\ast=\arg\max_{\|\mathbf{d}\|=1}\ \sum_{k=1}^{n}\mathbf{d}^\top\mathbf{y}_k\mathbf{y}_k^\top\mathbf{d}
+  =\arg\max_{\|\mathbf{d}\|=1}\ \|\mathbf{A}\mathbf{d}\|_2^2,
+  \qquad \mathbf{A}=\big[\mathbf{y}_1^\top;\ \dots;\ \mathbf{y}_n^\top\big]\in\mathbb{R}^{n\times3}.
+  \label{eq:pc-line-d}
+\end{equation}
+\end{derivation}
+
+\noindent\textbf{与平面拟合的对偶。} \cref{eq:pc-line-d} 与平面的 \cref{eq:pc-plane-Axb} 形式一模一样，只是把\emph{最小化}换成\emph{最大化}：由 \cref{eq:pc-fit-spectral} 的谱展开，最大化 $\|\mathbf{A}\mathbf{d}\|^2$ 该取\emph{最大}特征值/奇异值方向。于是
+\begin{center}\small
+\emph{直线拟合} $\to$ 找点云分布的\textbf{最大}方向（去质心协方差最大特征向量）；\quad
+\emph{平面拟合} $\to$ 找\textbf{最小}方向（法向）。
+\end{center}
+二者是同一道题的两端，恰对应主成分分析（PCA）的最大主成分与最小主成分（\cref{fig:pc-fit-dual}）——这也是 \cref{sec:pc-loam} 用同一套邻域协方差的特征值谱判别“线特征（一大两小）vs 面特征（两大一小）”的数学根。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[>=Stealth, scale=1.0]
+  % axes
+  \draw[->,gray!60!black] (-0.3,0) -- (4.4,0) node[right]{\small $X$};
+  \draw[->,gray!60!black] (0,-0.3) -- (0,2.6) node[above]{\small $Z$};
+  % a slab (plane) of points along a line
+  \fill[third!12,draw=third!55!black] (0.6,0.7) -- (3.6,1.55) -- (3.5,1.95) -- (0.5,1.1) -- cycle;
+  \foreach \x/\y in {0.9/0.95, 1.5/1.05, 2.0/1.25, 2.5/1.35, 3.0/1.5, 3.3/1.6} {
+    \fill[main!70!black] (\x,\y) circle (1.6pt);
+  }
+  % line-fit direction (max): along the elongation
+  \draw[->,very thick,main!60!black] (1.0,0.95) -- (3.2,1.55)
+        node[midway,below right=-1pt]{\small 直线拟合方向（最大）};
+  % plane normal (min): perpendicular-ish, short
+  \draw[->,very thick,second!60!black] (2.05,1.2) -- (1.75,2.0)
+        node[above]{\small 平面法向（最小）};
+\end{tikzpicture}
+\caption{直线拟合取点云分布的最大方向、平面拟合取最小方向（法向）；二者是同一线性最小二乘的最大/最小解，对应 PCA 的最大/最小主成分。}
+\label{fig:pc-fit-dual}
+\end{figure}
+
+\begin{codebox}[C++]{直线拟合：去质心 + FullV 取首列（据 Gao 第 5 章）}
+// origin = 质心；dir = 单位方向
+Eigen::Matrix<S,3,1> origin =
+    std::accumulate(data.begin(), data.end(),
+                    Eigen::Matrix<S,3,1>::Zero().eval()) / data.size();
+Eigen::MatrixXd Y(data.size(), 3);
+for (int i = 0; i < data.size(); ++i)
+  Y.row(i) = (data[i] - origin).transpose();        // 去质心
+Eigen::JacobiSVD<Eigen::MatrixXd> svd(Y, Eigen::ComputeFullV);
+dir = svd.matrixV().col(0);                          // 最大奇异值 -> 第 1 列
+// 注意：直线拟合要最大奇异值，故需完整 V (ComputeFullV)
+\end{codebox}
+
+\begin{insight}
+平面拟合代码取 \texttt{matrixV().col(3)}（最小、可只算 \texttt{ThinV}），直线拟合取 \texttt{matrixV().col(0)}（最大、需 \texttt{FullV}）——“取首列还是末列”这一行之差，正是“最大方向 vs 最小方向”的全部分别。把它推广到 $N$ 维：拟合 $N\!-\!1$ 维超平面取最小奇异向量、拟合 $1$ 维直线取最大奇异向量；更一般地，丢掉小奇异值的方向即\emph{数据降维}（在不同语境又叫主成分分析、低秩近似、子空间的零空间/值域构造）。一把 SVD，串起本章法向估计、GICP 协方差、LOAM 特征判别与降维，全是“看奇异值谱”的同一件事。
+\end{insight}
+
+\begin{pitfall}[编程陷阱：直线拟合误取最小奇异向量（照抄平面代码）]
+错误描述：写直线拟合时照搬平面拟合，仍取 \texttt{matrixV()} 的\emph{末}列、或仍用 \texttt{ComputeThinV}。现象：拟合出的“方向”垂直于真实直线，残差巨大、点到线扫描匹配整体跑偏。根本原因：平面拟合是\emph{最小化} $\|\mathbf{A}\mathbf{x}\|$（取最小奇异向量=法向），直线拟合是\emph{最大化}（取最大奇异向量=延展方向），二者方向正好相反；且 \texttt{ThinV} 对 $n\times3$ 的 $\mathbf{Y}$ 不保证给出全部右奇异向量。正确做法：直线拟合用 \texttt{ComputeFullV} 并取\emph{首}列（\cref{eq:pc-line-d}）。自检：把拟合出的 $\mathbf{d}$ 点乘点云延展方向，应接近 $\pm1$ 而非 $0$。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）从 \cref{eq:pc-line-fk} 出发，补全 \cref{eq:pc-line-dfdp} 到 \cref{eq:pc-line-p} 的每一步求导，说明为何 $\mathbf{p}$ 必为质心与方向 $\mathbf{d}$ 无关。
+  \item （实现）按平面/直线两段代码各实现一个拟合函数，用“设真值参数 + 面上/线上取点加高斯噪声”自测，验证估计系数与真值差在小数点后两三位；再把噪声调大，观察哪个先失效。
+  \item （概念）证明 \cref{thm:pc-fit-homo}：为什么约束 $\|\mathbf{x}\|=1$ 下 $\mathbf{x}^\top\mathbf{A}^\top\mathbf{A}\mathbf{x}$ 的最小值在最小特征向量处取得、最大值在最大特征向量处取得？（提示：用 \cref{eq:pc-fit-spectral} 的 $\sum_k\lambda_k\alpha_k^2$ 与 $\sum_k\alpha_k^2=1$。）
+  \item （联系）说明本节的“邻域 PCA 谱”如何分别支撑：点到平面 ICP 的法向（\cref{sec:pc-p2plane}）、GICP 的协方差（\cref{sec:pc-gicp}）、LOAM 的边/面判别（\cref{sec:pc-loam}）。三者用的是同一组特征值/向量的哪一部分？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{点到点 ICP：迭代最近点}
+\label{sec:pc-icp}
+
+\paragraph{动机：对应未知时怎么配准。}
+若两帧点云的逐点对应\emph{已知}，配准就是一个有闭式解的最小二乘（下面 \cref{sec:pc-icp-svd} 立刻给出）。但实际两帧从不同视角采集，对应未知、甚至点本身都对不上（离散化不同，永远采不到同一点）。\textbf{ICP（Iterative Closest Point）}的精妙之处，是用一个交替（alternating）循环绕开这个难题\cite{besl1992icp,carlone2026handbook}：
+\begin{enumerate}
+  \item \textbf{对应步}：用当前变换把 source 搬过去，为每个点取 target 中的\emph{最近点}当“对应”（KD 树，\cref{sec:pc-kdtree}）；
+  \item \textbf{配准步}：固定这组对应，求最小化对应点距离的\emph{最优变换}（闭式解）。
+\end{enumerate}
+两步交替直到收敛。这就是“迭代最近点”的名字由来。
+
+\begin{definition}[最近点算子与最大匹配阈值]\label{def:pc-closest}
+点 $\mathbf{p}$ 到点集 $\mathcal{A}$ 的距离与最近点：
+\begin{equation}
+  d(\mathbf{p},\mathcal{A})=\min_{\mathbf{a}\in\mathcal{A}}\|\mathbf{a}-\mathbf{p}\|,\qquad
+  \mathbf{m}=C(\mathbf{p},\mathcal{A})=\arg\min_{\mathbf{a}\in\mathcal{A}}\|\mathbf{a}-\mathbf{p}\|.
+  \label{eq:pc-closest}
+\end{equation}
+因实际两云\emph{非完全重叠}，须加\textbf{最大匹配距离阈值} $d_{\max}$：对 $\|\mathbf{m}_i-(\mathbf{R}\mathbf{p}_i+\mathbf{t})\|>d_{\max}$ 的对应剔除（赋权 $w_i=0$）\cite{segal2009gicp}。$d_{\max}$ 在收敛半径与精度间权衡：取小则“短视”、收敛差；取大则错误对应把对齐拉偏。
+\end{definition}
+
+\begin{algo}[标准 ICP（Besl--McKay / GICP Algorithm 1）]\label{alg:pc-icp}
+\begin{codebox}[Python]{ICP main loop (source S aligned to target T)}
+# input : source S = {p_i}, target T = {q_j}, initial transform T0
+# output: transform (R, t) aligning S to T
+R, t = T0
+while not converged:
+    for i in range(N):
+        m_i = closest_point_in_T(R @ p_i + t)        # KD-tree NN
+        w_i = 1 if norm(m_i - (R @ p_i + t)) <= d_max else 0
+    # registration step: closed-form (SVD / quaternion) below
+    R, t = argmin sum_i w_i * norm(R @ p_i + t - m_i)**2
+\end{codebox}
+\end{algo}
+
+\subsection{配准子问题与去质心解耦平移}
+\label{sec:pc-icp-decouple}
+
+固定对应后（记 $\mathbf{q}_i:=\mathbf{m}_i$ 已是 $\mathbf{p}_i$ 的对应），\textbf{点到点目标函数}为
+\begin{equation}
+  E(\mathbf{R},\mathbf{t})=\sum_{i=1}^{N}w_i\big\|\mathbf{R}\mathbf{p}_i+\mathbf{t}-\mathbf{q}_i\big\|_2^2,
+  \qquad \mathbf{R}\in\SO(3),\ \mathbf{t}\in\mathbb{R}^3.
+  \label{eq:pc-icp-cost}
+\end{equation}
+（下设 $w_i=1$，加权情形把质心改成加权质心即可，见末尾备注。）这正是经典的“绝对定向 / Procrustes / Wahba”问题\cite{arun1987leastsquares,horn1987absolute}。
+
+\begin{derivation}[第一步：去质心消去平移]
+对 $\mathbf{t}$ 求偏导并置零：
+\begin{equation}
+  \frac{\partial E}{\partial\mathbf{t}}=\sum_i 2(\mathbf{R}\mathbf{p}_i+\mathbf{t}-\mathbf{q}_i)=\mathbf{0}
+  \ \Longrightarrow\
+  \mathbf{t}=\frac{1}{N}\sum_i(\mathbf{q}_i-\mathbf{R}\mathbf{p}_i)=\bar{\mathbf{q}}-\mathbf{R}\bar{\mathbf{p}},
+  \label{eq:pc-t-star}
+\end{equation}
+其中质心 $\bar{\mathbf{p}}=\frac{1}{N}\sum_i\mathbf{p}_i$、$\bar{\mathbf{q}}=\frac{1}{N}\sum_i\mathbf{q}_i$。定义去心坐标 $\mathbf{p}_i'=\mathbf{p}_i-\bar{\mathbf{p}}$、$\mathbf{q}_i'=\mathbf{q}_i-\bar{\mathbf{q}}$。把 \cref{eq:pc-t-star} 代回 \cref{eq:pc-icp-cost}：
+\begin{align}
+  E&=\sum_i\big\|\mathbf{R}\mathbf{p}_i+(\bar{\mathbf{q}}-\mathbf{R}\bar{\mathbf{p}})-\mathbf{q}_i\big\|^2
+   =\sum_i\big\|\mathbf{R}(\mathbf{p}_i-\bar{\mathbf{p}})-(\mathbf{q}_i-\bar{\mathbf{q}})\big\|^2
+   =\sum_i\big\|\mathbf{R}\mathbf{p}_i'-\mathbf{q}_i'\big\|^2.
+  \label{eq:pc-E-decentered}
+\end{align}
+平移已被消掉，只剩对 $\mathbf{R}$ 的旋转配准问题。
+\end{derivation}
+
+\begin{derivation}[第二步：旋转化为 trace 最大化]
+展开 \cref{eq:pc-E-decentered}：
+\begin{equation}
+  \sum_i\|\mathbf{R}\mathbf{p}_i'-\mathbf{q}_i'\|^2
+  =\sum_i\Big(\underbrace{\mathbf{p}_i'^\top\mathbf{R}^\top\mathbf{R}\mathbf{p}_i'}_{=\|\mathbf{p}_i'\|^2}-2\,\mathbf{q}_i'^\top\mathbf{R}\mathbf{p}_i'+\|\mathbf{q}_i'\|^2\Big),
+  \label{eq:pc-E-expand}
+\end{equation}
+其中 $\mathbf{R}^\top\mathbf{R}=\mathbf{I}$（正交保模）。首末两项与 $\mathbf{R}$ 无关，故
+\begin{equation}
+  \min_{\mathbf{R}\in\SO(3)}E\iff \max_{\mathbf{R}\in\SO(3)}\sum_i\mathbf{q}_i'^\top\mathbf{R}\mathbf{p}_i'.
+  \label{eq:pc-trace-equiv}
+\end{equation}
+用 $\mathbf{a}^\top\mathbf{b}=\mathrm{tr}(\mathbf{b}\mathbf{a}^\top)$ 把标量写成迹：
+\begin{equation}
+  \sum_i\mathbf{q}_i'^\top\mathbf{R}\mathbf{p}_i'
+  =\sum_i\mathrm{tr}\!\big(\mathbf{R}\mathbf{p}_i'\mathbf{q}_i'^\top\big)
+  =\mathrm{tr}\!\Big(\mathbf{R}\,\underbrace{\textstyle\sum_i\mathbf{p}_i'\mathbf{q}_i'^\top}_{=:\mathbf{H}}\Big)=\mathrm{tr}(\mathbf{R}\mathbf{H}),
+  \label{eq:pc-H}
+\end{equation}
+定义\textbf{互协方差矩阵} $\mathbf{H}=\sum_i\mathbf{p}_i'\mathbf{q}_i'^\top\in\mathbb{R}^{3\times3}$。于是配准化为
+\begin{equation}
+  \max_{\mathbf{R}\in\SO(3)}\ \mathrm{tr}(\mathbf{R}\mathbf{H}).
+  \label{eq:pc-max-trace}
+\end{equation}
+\end{derivation}
+
+\begin{note}
+不同文献 $\mathbf{H}$ 的转置约定不同：本书/Arun 用 $\mathbf{H}=\sum\mathbf{p}_i'\mathbf{q}_i'^\top$（source 在前），得 $\mathbf{R}=\mathbf{V}\mathbf{U}^\top$；Wikipedia 的 Kabsch 词条用行向量约定 $\mathbf{H}=\mathbf{P}^\top\mathbf{Q}$，得 $\mathbf{R}=\mathbf{U}\,\mathrm{diag}(1,1,d)\mathbf{V}^\top$（满足 $\mathbf{Q}\approx\mathbf{P}\mathbf{R}$，右乘）。二者经转置等价，$\mathbf{R}_{\text{Arun}}=\mathbf{R}_{\text{Kabsch}}^\top$。\textbf{移植代码时务必核对 $\mathbf{H}$ 的定义、行/列约定、行列式修正放在 $\mathbf{U}$ 侧还是 $\mathbf{V}$ 侧}——这是 ICP 实现最常见的 bug。
+\end{note}
+
+\subsection{SVD 闭式解与最优性证明}
+\label{sec:pc-icp-svd}
+
+\begin{theorem}[旋转的 SVD 闭式解（Arun--Umeyama--Kabsch）]\label{thm:pc-svd}
+设 $\mathbf{H}=\sum_i\mathbf{p}_i'\mathbf{q}_i'^\top$ 的奇异值分解为 $\mathbf{H}=\mathbf{U}\boldsymbol{\Sigma}\mathbf{V}^\top$（$\mathbf{U},\mathbf{V}$ 正交，$\boldsymbol{\Sigma}=\mathrm{diag}(\sigma_1,\sigma_2,\sigma_3)$，$\sigma_i\ge0$），则 \cref{eq:pc-max-trace} 的最优旋转为
+\begin{equation}
+  \mathbf{R}^\star=\mathbf{V}\mathbf{U}^\top\quad(\text{若}\ \det(\mathbf{V}\mathbf{U}^\top)>0),
+  \label{eq:pc-R-svd}
+\end{equation}
+若 $\det(\mathbf{V}\mathbf{U}^\top)<0$（出现反射，非真旋转），修正为
+\begin{equation}
+  \mathbf{R}^\star=\mathbf{V}\,\mathrm{diag}\!\big(1,1,\det(\mathbf{V}\mathbf{U}^\top)\big)\,\mathbf{U}^\top
+  =\mathbf{V}\,\mathrm{diag}(1,1,-1)\,\mathbf{U}^\top.
+  \label{eq:pc-R-svd-fix}
+\end{equation}
+平移由 \cref{eq:pc-t-star} 得 $\mathbf{t}^\star=\bar{\mathbf{q}}-\mathbf{R}^\star\bar{\mathbf{p}}$。
+\end{theorem}
+
+\begin{proof}
+代入 SVD 并用迹的循环性：
+\begin{equation}
+  \mathrm{tr}(\mathbf{R}\mathbf{H})=\mathrm{tr}(\mathbf{R}\mathbf{U}\boldsymbol{\Sigma}\mathbf{V}^\top)
+  =\mathrm{tr}(\boldsymbol{\Sigma}\,\mathbf{V}^\top\mathbf{R}\mathbf{U})=\mathrm{tr}(\boldsymbol{\Sigma}\mathbf{Z}),\quad \mathbf{Z}:=\mathbf{V}^\top\mathbf{R}\mathbf{U}.
+\end{equation}
+$\mathbf{Z}$ 是三个正交阵之积，仍正交，故各对角元 $|Z_{jj}|\le1$（正交阵各列单位长，对角元绝对值不超 $1$）。因此
+\begin{equation}
+  \mathrm{tr}(\boldsymbol{\Sigma}\mathbf{Z})=\sum_{j=1}^{3}\sigma_j Z_{jj}\le\sum_{j=1}^{3}\sigma_j,
+\end{equation}
+等号成立当且仅当 $Z_{jj}=1\ \forall j$，即 $\mathbf{Z}=\mathbf{I}$（对角元全为 $1$ 的正交阵必是单位阵）。于是 $\mathbf{V}^\top\mathbf{R}\mathbf{U}=\mathbf{I}\Rightarrow\mathbf{R}=\mathbf{V}\mathbf{U}^\top$，即 \cref{eq:pc-R-svd}。
+
+若 $\det(\mathbf{V}\mathbf{U}^\top)=-1$，则 $\mathbf{V}\mathbf{U}^\top$ 是反射，不属 $\SO(3)$。$\SO(3)$ 内的最优解是把对应\emph{最小}奇异值 $\sigma_3$ 的那个对角元翻号（牺牲最小的 $\sigma_3$），即取 $\mathbf{Z}=\mathrm{diag}(1,1,-1)$，得 \cref{eq:pc-R-svd-fix}。
+\end{proof}
+
+\begin{note}
+\textbf{加权情形}：若各对应有权 $w_i$（鲁棒权或 GICP 简化权），把质心换成加权质心 $\bar{\mathbf{p}}=\frac{\sum w_i\mathbf{p}_i}{\sum w_i}$，互协方差换成 $\mathbf{H}=\sum_i w_i\mathbf{p}_i'\mathbf{q}_i'^\top$，其余不变。\textbf{含尺度}（Umeyama，相似变换 $\mathbf{q}\approx s\mathbf{R}\mathbf{p}+\mathbf{t}$）：最优尺度 $s^\star=\frac{1}{\sigma_p^2}\mathrm{tr}\!\big(\boldsymbol{\Sigma}\,\mathrm{diag}(1,1,d)\big)$，$\sigma_p^2=\frac{1}{N}\sum_i\|\mathbf{p}_i'\|^2$，$d$ 为行列式修正号；旋转同 \cref{eq:pc-R-svd-fix}，$\mathbf{t}^\star=\bar{\mathbf{q}}-s^\star\mathbf{R}^\star\bar{\mathbf{p}}$。
+\end{note}
+
+\subsection{等价的四元数闭式解}
+\label{sec:pc-icp-quat}
+
+Besl--McKay 原论文用的是 Horn 的\textbf{单位四元数法}（与 SVD 等价，给同一最优解，但用 $4\times4$ 特征问题），其优点是\emph{天然落在 $\SO(3)$ 上}，无须 \cref{eq:pc-R-svd-fix} 的反射修正\cite{horn1987absolute,besl1992icp}。
+
+\begin{derivation}[Horn 四元数解：构造 $\mathbf{N}$ 矩阵]
+把旋转写成单位四元数 $\mathbf{q}=[q_w,q_x,q_y,q_z]^\top$（Hamilton，标量在前），最大化 \cref{eq:pc-trace-equiv} 等价于二次型 $\max_{\|\mathbf{q}\|=1}\mathbf{q}^\top\mathbf{N}\mathbf{q}$。由去心后的互协方差元素 $S_{jk}=\sum_i(p_i')_j(q_i')_k$（$j,k\in\{x,y,z\}$，即 $\mathbf{H}$ 的元素 $H_{jk}=S_{jk}$）构造 $4\times4$ 对称矩阵
+\begin{equation}
+  \mathbf{N}=\begin{pmatrix}
+  S_{xx}+S_{yy}+S_{zz} & S_{yz}-S_{zy} & S_{zx}-S_{xz} & S_{xy}-S_{yx}\\
+  S_{yz}-S_{zy} & S_{xx}-S_{yy}-S_{zz} & S_{xy}+S_{yx} & S_{zx}+S_{xz}\\
+  S_{zx}-S_{xz} & S_{xy}+S_{yx} & -S_{xx}+S_{yy}-S_{zz} & S_{yz}+S_{zy}\\
+  S_{xy}-S_{yx} & S_{zx}+S_{xz} & S_{yz}+S_{zy} & -S_{xx}-S_{yy}+S_{zz}
+  \end{pmatrix}.
+  \label{eq:pc-N-matrix}
+\end{equation}
+$\mathbf{N}$ 对称且迹为零（四个对角和相加为 $0$）。
+\end{derivation}
+
+\begin{theorem}[Horn 最大特征值法]\label{thm:pc-horn}
+使 \cref{eq:pc-trace-equiv} 最大的最优单位四元数 $\mathbf{q}^\star$，是 $4\times4$ 对称矩阵 $\mathbf{N}$（\cref{eq:pc-N-matrix}）的\emph{最大特征值} $\lambda_{\max}$ 对应的单位特征向量：
+\begin{equation}
+  \mathbf{q}^\star=\arg\max_{\|\mathbf{q}\|=1}\mathbf{q}^\top\mathbf{N}\mathbf{q}=\mathrm{eigvec}(\mathbf{N},\lambda_{\max}).
+  \label{eq:pc-q-star}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+用四元数旋转恒等式 $\mathbf{R}(\mathbf{q})\mathbf{v}\leftrightarrow\mathbf{q}\,\mathring{\mathbf{v}}\,\mathbf{q}^\ast$，把待最大化量 $\sum_i\mathbf{q}_i'^\top\mathbf{R}(\mathbf{q})\mathbf{p}_i'$ 整理为四元数双线性型 $\mathbf{q}^\top\mathbf{N}\mathbf{q}$（$\mathbf{N}$ 由 $S_{jk}$ 如 \cref{eq:pc-N-matrix} 构造）。在约束 $\|\mathbf{q}\|=1$ 下，由 Rayleigh 商 $\frac{\mathbf{q}^\top\mathbf{N}\mathbf{q}}{\mathbf{q}^\top\mathbf{q}}$ 的极值理论（Rayleigh--Ritz），最大值在最大特征值处取得，最大化向量即对应特征向量。这与 SVD 解给出\emph{同一旋转}（Horn 1987 与 Arun 1987 同年证明两路等价）。四元数法的优点：天然满足 $\SO(3)$ 约束（无需反射修正），且最大特征值法数值稳健。
+\end{proof}
+
+\begin{insight}
+SVD 法与四元数法\textbf{等价、都闭式}。SVD 法（Arun/Kabsch）更通用（直接给 $\mathbf{R}$、可扩展尺度），但需行列式修正防反射；四元数法（Horn/Besl）天然落在 $\SO(3)$（无反射问题），数值稳健。理解“有对应时配准是有闭式解的”这一事实，是理解 ICP 的关键：ICP 的全部困难都在“对应未知”，一旦把对应固定，配准步就退化成这个干净的闭式问题。
+\end{insight}
+
+\subsection{（选读）解的唯一性：de Ruiter--Forbes 完整 case 分析}
+\label{sec:pc-icp-uniqueness}
+
+\paragraph{动机：闭式解\emph{什么时候}唯一？}
+\cref{thm:pc-svd} 给出了 $\mathbf{R}^\star=\mathbf{V}\,\mathrm{diag}(1,1,\det(\mathbf{V}\mathbf{U}^\top))\,\mathbf{U}^\top$，但回避了一个根本问题：这个解\emph{唯一}吗？\cref{eq:pc-R-svd-fix} 的反射修正提示“出现 $\det<0$ 时要小心”，近共面 pitfall（\cref{thm:pc-svd} 后的陷阱）也指出退化会出问题，但都只给\emph{现象}。本节给出 de Ruiter--Forbes\cite{deruiter2013wahba} 对这一问题（即\textbf{Wahba 问题}：从一组向量观测求最优姿态）的\emph{完整}判别：以互协方差矩阵 $\mathbf{H}$（\cref{eq:pc-H}）的奇异值结构为依据，把“唯一 / 无穷多解”分尽。这是 RANSAC 三点最小集、近共面退化“为什么会反射、为什么不唯一”的严谨根基。
+
+\begin{note}
+\textbf{记号对齐.}\;本节沿用 \cref{eq:pc-H} 的互协方差 $\mathbf{H}=\sum_i\mathbf{p}_i'\mathbf{q}_i'^\top=\mathbf{U}\boldsymbol{\Sigma}\mathbf{V}^\top$，奇异值 $\sigma_1\ge\sigma_2\ge\sigma_3\ge0$。Barfoot\cite{barfoot2024state} 与 de Ruiter--Forbes 用加权测量矩阵 $\mathbf{W}=\frac1w\sum_j w_j(\mathbf{y}_j-\bar{\mathbf{y}})(\mathbf{p}_j-\bar{\mathbf{p}})^\top$、旋转 $\mathbf{C}$、代价 $J=-\mathrm{tr}(\mathbf{C}\mathbf{W}^\top)$；它与本书 $\mathbf{H}$ 经转置/加权对应（$\mathbf{W}\leftrightarrow\mathbf{H}^\top$ 的加权版），结论可直接搬运。下面统一用本书的 $\max_{\mathbf{R}\in\SO(3)}\mathrm{tr}(\mathbf{R}\mathbf{H})$（\cref{eq:pc-max-trace}）叙述。
+\end{note}
+
+\begin{derivation}[把目标对角化：所有临界点的结构]
+由 \cref{thm:pc-svd} 证明中的 $\mathbf{Z}=\mathbf{V}^\top\mathbf{R}\mathbf{U}$，$\mathrm{tr}(\mathbf{R}\mathbf{H})=\mathrm{tr}(\boldsymbol{\Sigma}\mathbf{Z})=\sum_j\sigma_j Z_{jj}$。$\mathbf{R}$ 遍历 $\SO(3)$ 等价于 $\mathbf{Z}$ 遍历\emph{行列式为 $\det(\mathbf{U}\mathbf{V}^\top)$ 的正交阵}。在驻点处可证 $\mathbf{Z}$ 必为对角符号阵 $\mathbf{S}=\mathrm{diag}(s_1,s_2,s_3)$，$s_j\in\{+1,-1\}$，且须满足 $\det\mathbf{S}=\det\mathbf{Z}=\det(\mathbf{U}\mathbf{V}^\top)=\pm1$（即 $-1$ 的个数为偶/奇由 $\det(\mathbf{U}\mathbf{V}^\top)$ 定）。于是\emph{每个驻点}对应一组合法的符号 $\{s_j\}$，目标值 $\sum_j\sigma_j s_j$。要\emph{最大化}它，应让大奇异值配 $+1$；约束 $\det\mathbf{S}=\det(\mathbf{U}\mathbf{V}^\top)$ 决定能否全取 $+1$。
+\end{derivation}
+
+\begin{theorem}[Wahba 解的唯一性判别（de Ruiter--Forbes）]\label{thm:pc-wahba-cases}
+设 $\det\mathbf{H}=\det(\mathbf{U}\mathbf{V}^\top)\,\sigma_1\sigma_2\sigma_3$（$\sigma_j\ge0$），最优 $\mathbf{R}^\star=\mathbf{V}\mathbf{S}\mathbf{U}^\top$，$\mathbf{S}=\mathrm{diag}(1,1,\det(\mathbf{V}\mathbf{U}^\top))$。按 $\det(\mathbf{U}\mathbf{V}^\top)$ 的符号与奇异值的重数、秩分档：
+\begin{enumerate}
+  \item[\textbf{(i-a)}] $\det(\mathbf{U}\mathbf{V}^\top)=+1$、$\sigma_1\ge\sigma_2\ge\sigma_3>0$：可全取 $\mathbf{S}=\mathbf{I}$，\textbf{唯一全局最优} $\mathbf{R}^\star=\mathbf{V}\mathbf{U}^\top$。
+  \item[\textbf{(i-b)}] $\det(\mathbf{U}\mathbf{V}^\top)=-1$、$\sigma_1\ge\sigma_2>\sigma_3>0$（最小奇异值\emph{相异}）：须恰有一个 $s_j=-1$；为最大化 $\sum\sigma_j s_j$，翻号代价最小的 $\sigma_3$，即 $\mathbf{S}=\mathrm{diag}(1,1,-1)$，\textbf{仍唯一}。
+  \item[\textbf{(i-c)}] $\det(\mathbf{U}\mathbf{V}^\top)=-1$、$\sigma_1>\sigma_2=\sigma_3>0$（最小奇异值\emph{重根}）：翻 $s_2$ 或 $s_3$ 代价相同，且重根子空间内任意旋转 $\theta$ 都不改目标，\textbf{无穷多解}（$1$ 参数族）。
+  \item[\textbf{(i-d)}] $\det(\mathbf{U}\mathbf{V}^\top)=-1$、$\sigma_1=\sigma_2=\sigma_3>0$（三重根）：\textbf{无穷多解}（$2$ 参数族）。
+  \item[\textbf{(ii)}] $\det\mathbf{H}=0$（$\mathbf{H}$ 奇异，对应点退化）：
+  \begin{itemize}
+    \item $\mathrm{rank}\,\mathbf{H}=2$（$\sigma_3=0$，$\sigma_2>0$）：对应零奇异值的 $s_3$ 不影响目标但取定符号即得\textbf{唯一}解（点\emph{共面}的临界情形）；
+    \item $\mathrm{rank}\,\mathbf{H}=1$（$\sigma_2=\sigma_3=0$）：绕该唯一主轴自由旋转，\textbf{无穷多解}（$2$ 参数族，点\emph{共线}）；
+    \item $\mathrm{rank}\,\mathbf{H}=0$：任意 $\mathbf{R}\in\SO(3)$ 都是解（点\emph{重合}/无信息）。
+  \end{itemize}
+\end{enumerate}
+\end{theorem}
+
+\begin{derivation}[二阶判据：哪个临界点是极小]
+要判定某符号组合 $\mathbf{S}$ 给出的临界点是极大、极小还是鞍点，对 $\mathbf{R}=\mathrm{Exp}(\boldsymbol{\varphi}^\wedge)\mathbf{R}^\star$ 做二阶展开。代入 $\mathrm{tr}(\mathbf{R}\mathbf{H})$、用 $\mathrm{Exp}(\boldsymbol{\varphi}^\wedge)\approx\mathbf{I}+\boldsymbol{\varphi}^\wedge+\tfrac12(\boldsymbol{\varphi}^\wedge)^2$，目标的二阶变化（记 $\boldsymbol{\varphi}=[\varphi_1,\varphi_2,\varphi_3]^\top$ 在 $\mathbf{V}$ 主轴坐标下；因 $\mathbf{R}^\star\mathbf{H}=\mathbf{V}\mathbf{S}\boldsymbol{\Sigma}\mathbf{V}^\top$ 在 $\mathbf{V}$ 的列基上对角化）为
+\begin{equation}
+  \delta^2 J=\tfrac12\Big(\varphi_1^2(\sigma_2 s_2+\sigma_3 s_3)+\varphi_2^2(\sigma_1 s_1+\sigma_3 s_3)+\varphi_3^2(\sigma_1 s_1+\sigma_2 s_2)\Big),
+  \label{eq:pc-wahba-secondorder}
+\end{equation}
+（这里 $J=-\mathrm{tr}(\mathbf{R}\mathbf{H})$ 是被最小化的代价：$\mathrm{tr}(\mathbf{R}\mathbf{H})$ 的二阶变化为 $-\tfrac12(\cdots)$，取负号即得上式，故 $\delta^2 J>0$ 才是极小）。于是：
+\begin{itemize}
+  \item 三个系数 $(\sigma_j s_j+\sigma_k s_k)$ \emph{全正} $\Rightarrow$ $\delta^2 J>0$，\textbf{极小}；
+  \item 全负 $\Rightarrow$ 极大；混号 $\Rightarrow$ 鞍点。
+\end{itemize}
+\textbf{验证 case (i-a)}（$s_j=+1$，$\sigma_j>0$）：三系数 $\sigma_2+\sigma_3,\ \sigma_1+\sigma_3,\ \sigma_1+\sigma_2$ 全正 $\Rightarrow$ 唯一极小即全局最优。\textbf{验证 case (i-b)}（$s_1=s_2=1,s_3=-1$）：三系数为 $\sigma_2-\sigma_3,\ \sigma_1-\sigma_3,\ \sigma_1+\sigma_2$；因 $\sigma_1\ge\sigma_2>\sigma_3$ 全正 $\Rightarrow$ 仍唯一极小。若改翻 $s_1$ 或 $s_2$（非最小奇异值），某系数变负 $\Rightarrow$ 鞍点，故\emph{只有}翻 $\sigma_3$ 才是极小——这正是 \cref{eq:pc-R-svd-fix} “翻最小奇异值”的二阶根据。
+\end{derivation}
+
+\begin{insight}
+把 \cref{thm:pc-wahba-cases} 浓缩成一句\textbf{可操作判据}：\emph{当 $\mathbf{H}$ 的最小奇异值\textbf{严格大于}次小奇异值时，配准解唯一}（无非全局的局部极小，任一迭代极小即全局最优——这正是 \cref{thm:vo-icp-opt} 在 \cref{ch:vo} 所述全局最优性的来源）；\emph{一旦最小奇异值出现重根，或 $\mathbf{H}$ 降秩，解就退化为连续族}。几何上：$\mathrm{rank}\,\mathbf{H}=2$ 对应点近\emph{共面}（薄、易反射），$\mathrm{rank}\,\mathbf{H}=1$ 对应点近\emph{共线}（绕轴自由转），$\mathrm{rank}\,\mathbf{H}=0$ 对应点\emph{重合}。
+\end{insight}
+
+\begin{theorem}[唯一性的充分条件：三点不共线]\label{thm:pc-wahba-suff}
+迭代法（右扰动高斯--牛顿，\cref{sec:pc-icp-rightpert}）每步对 $\delta\boldsymbol{\phi}$ 的法方程系数阵正定，\emph{当且仅当}如下“惯量型”矩阵正定：
+\begin{equation}
+  \mathbf{I}_p=-\sum_i (\mathbf{p}_i')^\wedge(\mathbf{p}_i')^\wedge=\sum_i\big(\|\mathbf{p}_i'\|^2\mathbf{I}-\mathbf{p}_i'\mathbf{p}_i'^\top\big)\succ0.
+  \label{eq:pc-wahba-inertia}
+\end{equation}
+而 $\mathbf{x}^\top\mathbf{I}_p\mathbf{x}=\sum_i\|(\mathbf{p}_i')^\wedge\mathbf{x}\|^2\ge0$ 取零 $\iff$ 所有去心点 $\mathbf{p}_i'$ 都平行于 $\mathbf{x}$（即\emph{全部共线}）。故\textbf{只要存在三个不共线的点}，$\mathbf{I}_p\succ0$、解唯一。这给出 RANSAC 最小集“为何取三个\emph{不共线}点”的严格依据。
+\end{theorem}
+
+\begin{proof}
+点到点残差对右扰动旋转的雅可比为 $-\mathbf{R}\mathbf{p}_i'^\wedge$（\cref{eq:pc-icp-jac}），其旋转块的 Gram 阵 $\sum_i(\mathbf{R}\mathbf{p}_i'^\wedge)^\top(\mathbf{R}\mathbf{p}_i'^\wedge)=\sum_i\mathbf{p}_i'^{\wedge\top}\mathbf{p}_i'^\wedge=-\sum_i\mathbf{p}_i'^\wedge\mathbf{p}_i'^\wedge=\mathbf{I}_p$（用 $\mathbf{a}^{\wedge\top}=-\mathbf{a}^\wedge$）。二次型 $\mathbf{x}^\top\mathbf{I}_p\mathbf{x}=\sum_i\|\mathbf{p}_i'^\wedge\mathbf{x}\|^2$，每项 $\ge0$，全零要求 $\mathbf{p}_i'\times\mathbf{x}=\mathbf{0}\ \forall i$，即所有 $\mathbf{p}_i'$ 与 $\mathbf{x}$ 共线。三点不共线则不存在这样的 $\mathbf{x}\ne\mathbf{0}$，故 $\mathbf{I}_p\succ0$。注意此条件保证\emph{每步迭代}方向唯一（局部），与 \cref{thm:pc-wahba-cases} 的\emph{全局}解数互补：前者管“能不能算”，后者管“算出来唯不唯一”。
+\end{proof}
+
+\begin{pitfall}[思维陷阱：以为“点够多”就一定唯一]
+\textbf{错误}：以为只要对应点数 $\ge3$，配准解就唯一。
+\textbf{现象}：明明几十对点，解却在两个姿态间跳（或绕某轴漂）。
+\textbf{根因}：唯一性看的不是\emph{点数}而是\emph{分布}——\cref{thm:pc-wahba-cases} 的判据是 $\mathbf{H}$ 的奇异值结构。几十个点若近\emph{共线}（$\mathrm{rank}\,\mathbf{H}=1$）仍绕轴自由转，近\emph{共面}（最小奇异值重根）仍可能反射二义。
+\textbf{正确}：用 \cref{eq:pc-wahba-inertia} 自检——算 $\mathbf{I}_p$ 的最小特征值，接近零即退化；或看 $\mathbf{H}$ 的最小两个奇异值之比，接近 $1$ 即近重根、解不稳。结构化场景（长走廊、平面墙）尤其要警惕。
+\end{pitfall}
+
+\subsection{右扰动视角：本书主线下的高斯--牛顿}
+\label{sec:pc-icp-rightpert}
+
+\paragraph{为对接因子图/GTSAM，给出右扰动雅可比。}
+本书优先用右扰动 + 流形优化（\cref{ch:lie}）。残差 $\mathbf{r}_i(\mathbf{R},\mathbf{t})=\mathbf{R}\mathbf{p}_i+\mathbf{t}-\mathbf{q}_i$。右扰动 $\mathbf{R}\leftarrow\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\phi})$，用一阶 $\mathrm{Exp}(\delta\boldsymbol{\phi})\approx\mathbf{I}+\delta\boldsymbol{\phi}^\wedge$：
+\begin{equation}
+  \mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\phi})\mathbf{p}_i\approx\mathbf{R}\mathbf{p}_i+\mathbf{R}\,\delta\boldsymbol{\phi}^\wedge\mathbf{p}_i
+  =\mathbf{R}\mathbf{p}_i-\mathbf{R}\,\mathbf{p}_i^\wedge\,\delta\boldsymbol{\phi},
+\end{equation}
+末步用叉积反交换 $\delta\boldsymbol{\phi}^\wedge\mathbf{p}_i=-\mathbf{p}_i^\wedge\delta\boldsymbol{\phi}$。故残差对 $(\delta\boldsymbol{\phi},\delta\mathbf{t})$ 的右扰动雅可比
+\begin{equation}
+  \frac{\partial\mathbf{r}_i}{\partial\delta\boldsymbol{\phi}}=-\mathbf{R}\,\mathbf{p}_i^\wedge,\qquad
+  \frac{\partial\mathbf{r}_i}{\partial\delta\mathbf{t}}=\mathbf{I}_3.
+  \label{eq:pc-icp-jac}
+\end{equation}
+按本书 $\boldsymbol{\xi}=[\boldsymbol{\rho};\boldsymbol{\phi}]$（平移在前），单点雅可比 $\mathbf{J}_i=[\,\mathbf{I}_3\ \ -\mathbf{R}\,\mathbf{p}_i^\wedge\,]$。高斯--牛顿正规方程 $\big(\sum_i\mathbf{J}_i^\top\mathbf{J}_i\big)\Delta\mathbf{x}=-\sum_i\mathbf{J}_i^\top\mathbf{r}_i$，解出 $\Delta\mathbf{x}=[\delta\boldsymbol{\rho};\delta\boldsymbol{\phi}]$ 后右乘更新 $\mathbf{T}\leftarrow\mathbf{T}\,\mathrm{Exp}(\Delta\mathbf{x})$。迭代收敛即点到点 ICP 配准步——与闭式解殊途同归，但能统一进因子图框架并加鲁棒核。
+
+\subsection{单调收敛定理}
+\label{sec:pc-icp-convergence}
+
+\begin{theorem}[ICP 单调收敛（Besl--McKay 1992）]\label{thm:pc-convergence}
+ICP 迭代产生的均方误差序列\textbf{单调非增、有下界 $0$}，因而收敛；ICP 总是单调收敛到均方距离度量的某个\emph{局部}极小，且前几次迭代收敛极快\cite{besl1992icp}。
+\end{theorem}
+
+\begin{proof}
+记第 $k$ 次迭代后的变换为 $\mathbf{T}_k$，均方误差
+\begin{equation}
+  d_k=\frac{1}{N}\sum_i\big\|\mathbf{T}_k\mathbf{p}_i-\mathbf{m}_i^{(k)}\big\|^2,
+  \label{eq:pc-dk}
+\end{equation}
+$\mathbf{m}_i^{(k)}=C(\mathbf{T}_k\mathbf{p}_i,\mathcal{T})$ 是用第 $k$ 步变换后的点找到的最近对应。一次 ICP 迭代分两子步，\emph{各自都不增大误差}：
+\begin{enumerate}
+  \item \textbf{对应更新步}（更新 $\mathbf{m}_i$，固定变换 $\mathbf{T}_k$）：对每点重新取最近点。由最近点定义 \cref{eq:pc-closest}，$\mathbf{m}_i^{(k+1)}=\arg\min_{\mathbf{a}}\|\mathbf{T}_k\mathbf{p}_i-\mathbf{a}\|$ 给出\emph{不大于}旧对应的距离：$\|\mathbf{T}_k\mathbf{p}_i-\mathbf{m}_i^{(k+1)}\|\le\|\mathbf{T}_k\mathbf{p}_i-\mathbf{m}_i^{(k)}\|$。求和得中间误差 $e_k=\frac{1}{N}\sum_i\|\mathbf{T}_k\mathbf{p}_i-\mathbf{m}_i^{(k+1)}\|^2\le d_k$。
+  \item \textbf{变换更新步}（更新 $\mathbf{T}$，固定对应 $\mathbf{m}_i^{(k+1)}$）：第 $(k{+}1)$ 步变换 $\mathbf{T}_{k+1}$ 是 \cref{eq:pc-icp-cost} 在当前对应下的\emph{全局最小}（由 \cref{thm:pc-svd} 闭式解精确求得）。故 $d_{k+1}=\frac{1}{N}\sum_i\|\mathbf{T}_{k+1}\mathbf{p}_i-\mathbf{m}_i^{(k+1)}\|^2\le\frac{1}{N}\sum_i\|\mathbf{T}_k\mathbf{p}_i-\mathbf{m}_i^{(k+1)}\|^2=e_k$。
+\end{enumerate}
+合并两步：
+\begin{equation}
+  0\le d_{k+1}\le e_k\le d_k.
+  \label{eq:pc-monotone}
+\end{equation}
+即 $\{d_k\}$ 单调非增且有下界 $0$。由单调有界数列收敛定理，$d_k\to d_\infty\ge0$。又因变换空间紧致（$\SO(3)$ 紧、平移落在有界域）、对应只有有限种组合，迭代必在有限步内对应不再变化、变换不再更新，到达一个不动点（局部极小）。
+\end{proof}
+
+\paragraph{关于“局部”。}
+ICP 只保证收敛到\emph{局部}极小，强烈依赖初值——初始位姿差时易陷错误极小。实践对策：好的初值（IMU/里程计预对齐）、coarse-to-fine、多初值、扩大 $d_{\max}$ 增大收敛半径（但牺牲精度）。收敛速率方面，前几次迭代下降很快，后期接近极小时对应基本稳定、退化为局部二次收敛。
+
+\subsection{鲁棒化与外点处理}
+\label{sec:pc-icp-robust}
+
+实际对应含外点，处理手段（与 \cref{ch:nlopt} 的鲁棒核一脉相承）：
+\begin{itemize}
+  \item \textbf{硬阈值}：$d_{\max}$ 直接砍掉 $w_i=0$（\cref{alg:pc-icp}）；
+  \item \textbf{鲁棒核（M-估计）}：把 $\sum r_i^2$ 换成 $\sum\rho(r_i)$（Huber、Tukey bisquare、Cauchy），等价于迭代重加权 $w_i=\frac{1}{r_i}\frac{\partial\rho}{\partial r_i}$（IRLS）；LOAM 用 bisquare 权（距对应越远权越小，超阈值赋零）；
+  \item \textbf{Trimmed ICP}：只保留残差最小的一定比例（如 $70\%$）对应；
+  \item \textbf{（选读）可证鲁棒}：TEASER\cite{yang2021teaser}（arXiv:2001.07715）用截断最小二乘 + 半定松弛，对极高外点率仍给可证最优；CPD\cite{myronenko2010cpd}（Coherent Point Drift）把 source 视为高斯混合中心、EM 优化，与 NDT 的“高斯软对应”思想同源。
+\end{itemize}
+
+\begin{pitfall}[编程陷阱：SVD 解漏掉行列式修正，配准变成镜像]
+错误描述：直接用 $\mathbf{R}=\mathbf{V}\mathbf{U}^\top$ 而不查 $\det$。现象：在某些点分布（尤其近共面）下解出 $\det\mathbf{R}=-1$ 的反射矩阵，配准结果是镜像、点云“穿模”。根本原因：$\mathbf{V}\mathbf{U}^\top$ 只保证正交，不保证 $\det=+1$（\cref{thm:pc-svd}）。正确做法：必做 \cref{eq:pc-R-svd-fix} 的修正 $\mathbf{R}=\mathbf{V}\,\mathrm{diag}(1,1,\det(\mathbf{V}\mathbf{U}^\top))\,\mathbf{U}^\top$；或改用天然免修正的四元数解。自检：每次解出 $\mathbf{R}$ 后 \texttt{assert(R.determinant() > 0)}。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：以为 ICP 会收敛到全局最优]
+错误描述：不给初值就跑 ICP，期待它找到正确配准。现象：两帧错位较大时收敛到完全错误的位姿（如墙对到了天花板）。根本原因：\cref{thm:pc-convergence} 只保证收敛到\emph{局部}极小，ICP 是贪心的。正确做法：先用粗配准给初值——里程计/IMU 预对齐、特征匹配（FPFH+RANSAC）、或 NDT 粗对齐——再 ICP 精配准。自检：从多个随机初值跑 ICP，若结果发散到不同位姿，说明初值依赖严重，需粗配准。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：$d_{\max}$ 越大越好（收敛半径越大）]
+错误描述：把 $d_{\max}$ 设得很大以免漏掉对应。现象：大量错误对应（实际不对应的远点也被纳入）把对齐拉偏，精度反而下降。根本原因：$d_{\max}$ 在收敛半径与精度间权衡（\cref{def:pc-closest}）——大则收敛半径大但混入错误对应，小则收敛半径小但对应干净。正确做法：coarse-to-fine——先大 $d_{\max}$ 粗配，逐步收小精配；或用 GICP（\cref{sec:pc-gicp}）的协方差软化降低对 $d_{\max}$ 的敏感。自检：扫描不同 $d_{\max}$ 画收敛成功率与最终精度曲线，找折中。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）独立推出 \cref{thm:pc-svd} 的 SVD 解：从 $\max\mathrm{tr}(\mathbf{R}\mathbf{H})$ 出发，用迹循环性与正交阵对角元有界证 $\mathbf{R}=\mathbf{V}\mathbf{U}^\top$，并说明何时需 \cref{eq:pc-R-svd-fix}。
+  \item （实现）实现点到点 ICP：KD 树找对应 + $d_{\max}$ 过滤 + SVD 闭式解配准步 + 收敛判据 $|d_k-d_{k+1}|<\tau$；在两帧带初始错位的点云上验证 \cref{eq:pc-monotone} 的单调下降。
+  \item （跨章综合）用 \cref{ch:lie} 的右扰动雅可比 \cref{eq:pc-icp-jac} 把点到点 ICP 配准步写成高斯--牛顿迭代（不用闭式解），与 SVD 解对比收敛轨迹，验证二者收敛到同一位姿。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{在 $\SE(3)$ 上跟踪一个已知点：流形估计最小范式}
+\label{sec:pc-track-point}
+
+\paragraph{动机：从“配准两帧”到“估计动体位姿”。}
+前面的配准把\emph{相邻两帧点云}对齐。换一个同样基础、却更能暴露“流形上怎么估计”的范式问题\cite{barfoot2024state}：一个运动的载体（机器人），在每个时刻 $k$ 用机载传感器观测一个\emph{位置已知}的路标点 $\mathbf{p}$（如地图里标定好的反光柱），测得它在\emph{载体系}下的三维坐标 $\mathbf{y}_k$；求载体位姿 $\mathbf{T}_k\in\SE(3)$ 的轨迹。这个 toy 刻意简化掉相机投影的非线性（\cref{ch:vo} 的重投影是它叠加针孔模型的版本）、刻意只观测位置——于是它成了\textbf{初学者理解“流形 EKF / 流形 GN 的雅可比从哪来”的最干净入口}，也是激光/位置传感器最小观测模型，比 \cref{ch:lidar_slam} 的 FAST-LIO 简单一个量级，却共享同一套右扰动机理。
+
+\subsection{点观测模型与 $\odot$ 雅可比}
+\label{sec:pc-track-model}
+
+\begin{definition}[载体系点观测模型]\label{def:pc-track-obs}
+路标 $\mathbf{p}$ 的世界系齐次坐标 $\tilde{\mathbf{p}}=[\mathbf{p}^\top,1]^\top$ 已知。位姿 $\mathbf{T}_k$（world$\to$body）把它变到载体系，传感器测其前三维（位置）：
+\begin{equation}
+  \mathbf{y}_k=\mathbf{D}^\top\mathbf{T}_k\tilde{\mathbf{p}}+\mathbf{n}_k,\qquad
+  \mathbf{D}^\top=\begin{bmatrix}\mathbf{I}_3 & \mathbf{0}\end{bmatrix}\in\mathbb{R}^{3\times4},\quad
+  \mathbf{n}_k\sim\mathcal{N}(\mathbf{0},\boldsymbol{\Sigma}_{\mathbf v}),
+  \label{eq:pc-track-obs}
+\end{equation}
+其中 $\mathbf{D}^\top$ 是\textbf{投影（dilation）矩阵}，作用是从 $4$ 维齐次结果里取出前 $3$ 维（丢掉恒为 $1$ 的齐次分量），$\boldsymbol{\Sigma}_{\mathbf v}$ 为测量噪声协方差、信息阵 $\boldsymbol{\Lambda}_{\mathbf v}=\boldsymbol{\Sigma}_{\mathbf v}^{-1}$。
+\end{definition}
+
+\begin{derivation}[点观测对位姿的右扰动雅可比]
+\label{thm:pc-track-jac}
+在当前估计 $\check{\mathbf{T}}_k$ 上做右扰动 $\mathbf{T}_k=\check{\mathbf{T}}_k\,\mathrm{Exp}(\delta\boldsymbol{\xi}_k)$。由 \cref{ch:lie} 的齐次点右扰动导数 $\partial(\mathbf{T}\tilde{\mathbf{p}})/\partial\delta\boldsymbol{\xi}=\mathbf{T}\tilde{\mathbf{p}}^{\,\odot}$（\cref{eq:right-pert-se3}，其中 $\tilde{\mathbf{p}}^{\,\odot}=\big[\begin{smallmatrix}\mathbf{I}&-\mathbf{p}^\wedge\\\mathbf{0}^\top&\mathbf{0}^\top\end{smallmatrix}\big]$，本书 $\boldsymbol{\xi}=[\boldsymbol{\rho};\boldsymbol{\phi}]$ 平移在前），预测观测 $\check{\mathbf{y}}_k=\mathbf{D}^\top\check{\mathbf{T}}_k\tilde{\mathbf{p}}$ 对扰动的一阶项为
+\begin{equation}
+  \mathbf{y}_k-\check{\mathbf{y}}_k\approx\underbrace{\mathbf{D}^\top\big(\check{\mathbf{T}}_k\tilde{\mathbf{p}}\big)^{\!\odot}}_{=:\ \mathbf{G}_k\ \in\mathbb{R}^{3\times6}}\delta\boldsymbol{\xi}_k+\mathbf{n}_k.
+  \label{eq:pc-track-jac}
+\end{equation}
+把 $\check{\mathbf{T}}_k\tilde{\mathbf{p}}=[\mathbf{m}^\top,1]^\top$（$\mathbf{m}=\check{\mathbf{R}}_k\mathbf{p}+\check{\mathbf{t}}_k$ 是路标在载体系的预测位置）代入 $\odot$ 定义，$\mathbf{D}^\top$ 取上 $3$ 行：
+\begin{equation}
+  \mathbf{G}_k=\mathbf{D}^\top\big(\check{\mathbf{T}}_k\tilde{\mathbf{p}}\big)^{\!\odot}
+  =\mathbf{D}^\top\begin{bmatrix}\mathbf{I}_3 & -\mathbf{m}^\wedge\\ \mathbf{0}^\top & \mathbf{0}^\top\end{bmatrix}
+  =\big[\,\mathbf{I}_3\ \ -\mathbf{m}^\wedge\,\big]
+  =\big[\,\mathbf{I}_3\ \ -(\check{\mathbf{R}}_k\mathbf{p}+\check{\mathbf{t}}_k)^\wedge\,\big].
+  \label{eq:pc-track-G}
+\end{equation}
+即\textbf{平移块 $\mathbf{I}_3$、旋转块 $-(\check{\mathbf{R}}_k\mathbf{p}+\check{\mathbf{t}}_k)^\wedge$}。这就是 Barfoot $\mathbf{G}=\mathbf{D}^\top(\check{\mathbf{T}}\mathbf{p})^{\odot}$ 形式在本书右扰动、平移在前记号下的最小范式。
+\end{derivation}
+
+\begin{insight}
+对比一眼就看清这套记号的统一性：点云配准残差对右扰动的雅可比是 $[\mathbf{I},-\mathbf{R}\mathbf{p}_i'^\wedge]$（\cref{eq:pc-icp-jac}，对\emph{去心源点}求）；这里点观测雅可比是 $[\mathbf{I},-(\check{\mathbf{R}}\mathbf{p}+\check{\mathbf{t}})^\wedge]=[\mathbf{I},-\mathbf{m}^\wedge]$（对\emph{载体系预测点} $\mathbf{m}$ 求）；\cref{ch:vo} 的重投影雅可比 $[-\mathbf{M}\mathbf{R},\mathbf{M}\mathbf{R}\mathbf{P}^\wedge]$（\cref{eq:vo-jac-right}）只是再左乘一个投影项 $\mathbf{M}$。\textbf{三者同根}：都来自 $\mathbf{T}\tilde{\mathbf{p}}^{\odot}$。掌握这一个 $\odot$ 算子，流形上所有“点经位姿变换”的雅可比都能秒推。
+\end{insight}
+
+\subsection{单帧位姿估计 = $\SE(3)$ 上的高斯--牛顿}
+\label{sec:pc-track-gn}
+
+\begin{derivation}[多点观测的单帧位姿 GN]
+设某时刻观测到 $M$ 个已知路标 $\{\mathbf{p}_j\}$，测量 $\{\mathbf{y}_j\}$。单帧位姿 $\mathbf{T}$ 的最大似然估计即最小化马氏加权残差
+\begin{equation}
+  \mathbf{T}^\star=\arg\min_{\mathbf{T}\in\SE(3)}\ \frac12\sum_{j=1}^{M}\big\|\mathbf{y}_j-\mathbf{D}^\top\mathbf{T}\tilde{\mathbf{p}}_j\big\|_{\boldsymbol{\Sigma}_{\mathbf v}}^2.
+  \label{eq:pc-track-cost}
+\end{equation}
+在 $\check{\mathbf{T}}$ 处线性化（残差 $\mathbf{e}_j=\mathbf{y}_j-\mathbf{D}^\top\check{\mathbf{T}}\tilde{\mathbf{p}}_j$、雅可比 $\mathbf{G}_j$ 如 \cref{eq:pc-track-G}），右扰动法方程
+\begin{equation}
+  \Big(\underbrace{\textstyle\sum_j\mathbf{G}_j^\top\boldsymbol{\Lambda}_{\mathbf v}\mathbf{G}_j}_{\boldsymbol{\Lambda}\ (\text{信息阵})}\Big)\delta\boldsymbol{\xi}^\star
+  =\sum_j\mathbf{G}_j^\top\boldsymbol{\Lambda}_{\mathbf v}\,\mathbf{e}_j,
+  \qquad \check{\mathbf{T}}\leftarrow\check{\mathbf{T}}\,\mathrm{Exp}(\delta\boldsymbol{\xi}^\star),
+  \label{eq:pc-track-normal}
+\end{equation}
+迭代至 $\delta\boldsymbol{\xi}^\star$ 足够小。这就是“位姿估计 $=$ $\SE(3)$ 上 GN”的最小骨架：信息阵 $\boldsymbol{\Lambda}=\sum_j\mathbf{G}_j^\top\boldsymbol{\Lambda}_{\mathbf v}\mathbf{G}_j$ 正定 $\iff$ 三点不共线（同 \cref{thm:pc-wahba-suff} 的惯量条件），其逆 $\boldsymbol{\Lambda}^{-1}$ 即位姿估计协方差。
+\end{derivation}
+
+\subsection{递推情形：$\SE(3)$ 上的 EKF 五式}
+\label{sec:pc-track-ekf}
+
+\paragraph{从批量到滤波。}若载体连续运动、要\emph{在线}估计，则在上式的单帧校正前加一个运动预测步，得到\textbf{流形上的扩展卡尔曼滤波}（manifold-EKF）。它的精髓是 \cref{ch:eskf}（误差态卡尔曼）的核心思想：\emph{均值存在李群 $\SE(3)$ 上、协方差存在李代数 $\se(3)$（$6\times6$）上}。设运动输入给出名义增量 $\boldsymbol{\Xi}_k=\mathrm{Exp}(\Delta t_k\,\boldsymbol{\varpi}_k)$（$\boldsymbol{\varpi}_k$ 为广义速度旋量），过程噪声协方差 $\boldsymbol{\Sigma}_{\mathbf w}$。
+
+\begin{algo}[$\SE(3)$-EKF 跟踪已知点（五式）]\label{alg:pc-track-ekf}
+状态：均值 $\hat{\mathbf{T}}_k\in\SE(3)$、协方差 $\hat{\mathbf{P}}_k\in\mathbb{R}^{6\times6}$（李代数）。点观测雅可比 $\mathbf{G}_k=\mathbf{D}^\top(\check{\mathbf{T}}_k\tilde{\mathbf{p}})^{\odot}$（\cref{eq:pc-track-G}）；多点时把各 $\mathbf{G}_k$、残差竖直堆叠。
+\begin{enumerate}
+  \item \textbf{预测均值}（李群上左乘名义增量）与\textbf{预测协方差}（李代数上经伴随传播）：
+  \begin{equation}
+    \check{\mathbf{T}}_k=\boldsymbol{\Xi}_k\,\hat{\mathbf{T}}_{k-1},\qquad
+    \check{\mathbf{P}}_k=\mathbf{F}_{k-1}\hat{\mathbf{P}}_{k-1}\mathbf{F}_{k-1}^\top+\boldsymbol{\Sigma}_{\mathbf w},\quad
+    \mathbf{F}_{k-1}=\mathrm{Ad}(\boldsymbol{\Xi}_k).
+    \label{eq:pc-track-ekf-predict}
+  \end{equation}
+  \item \textbf{卡尔曼增益}：
+  \begin{equation}
+    \mathbf{K}_k=\check{\mathbf{P}}_k\mathbf{G}_k^\top\big(\mathbf{G}_k\check{\mathbf{P}}_k\mathbf{G}_k^\top+\boldsymbol{\Sigma}_{\mathbf v}\big)^{-1}.
+    \label{eq:pc-track-ekf-gain}
+  \end{equation}
+  \item \textbf{校正均值}（$6$ 维修正经 $\mathrm{Exp}$ 右乘回流形）与\textbf{校正协方差}：
+  \begin{equation}
+    \hat{\mathbf{T}}_k=\check{\mathbf{T}}_k\,\mathrm{Exp}\!\big(\mathbf{K}_k(\mathbf{y}_k-\mathbf{D}^\top\check{\mathbf{T}}_k\tilde{\mathbf{p}})\big),\qquad
+    \hat{\mathbf{P}}_k=(\mathbf{I}_6-\mathbf{K}_k\mathbf{G}_k)\check{\mathbf{P}}_k.
+    \label{eq:pc-track-ekf-correct}
+  \end{equation}
+\end{enumerate}
+\end{algo}
+
+\begin{insight}
+注意第 (4) 步：增益乘的是\emph{非线性}新息 $\mathbf{y}_k-\mathbf{D}^\top\check{\mathbf{T}}_k\tilde{\mathbf{p}}$（在 $\mathbb{R}^3$ 里算），得到的 $6$ 维修正量经 $\mathrm{Exp}(\cdot)$ \emph{右乘}回流形——这正是“均值在群、协方差在代数”的体现，避免了把 $\SE(3)$ 元素当向量直接相加的错误。与 \cref{ch:eskf} 的 ESKF（名义态 $+$ 误差态、注入与重置）是同一台机器：这里的“名义态”就是 $\check{\mathbf{T}}_k$、“误差态”就是 $6$ 维 $\delta\boldsymbol{\xi}$。把它读懂，再看 \cref{ch:lidar_slam} 的 FAST-LIO 紧耦合迭代 ESKF（多了 scan-to-map 的逐点对应与迭代）就只是“同一范式 $+$ 更难的观测”。
+\end{insight}
+
+\begin{note}
+\textbf{批量版与运动先验.}\;若做\emph{批量}（一次解整条轨迹 $\{\mathbf{T}_0,\dots,\mathbf{T}_K\}$），把相邻位姿用运动先验残差 $\mathbf{e}_{v,k}=\ln(\boldsymbol{\Xi}_k\mathbf{T}_{k-1}\mathbf{T}_k^{-1})^\vee$ 连起来，与点观测残差 \cref{eq:pc-track-cost} 一并最小化。因运动先验只耦合相邻两位姿、点观测只作用于单个位姿，正规方程的 $\mathbf{A}=\mathbf{H}^\top\mathbf{W}^{-1}\mathbf{H}$ 是\textbf{块三对角}的（来自马尔可夫性），可稀疏 Cholesky 线性时间求解——这与 \cref{ch:nlopt} 的位姿图、\cref{sec:sys-pgo-init} 的链式稀疏同源。本书把“滤波 $\leftrightarrow$ 批量”的等价与稀疏求解机理统一在 \cref{ch:eskf,ch:nlopt}，此处只给出这个最干净的接入点。
+\end{note}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）从 $\mathbf{T}\tilde{\mathbf{p}}^{\odot}$（\cref{eq:right-pert-se3}）出发，独立推出点观测雅可比 \cref{eq:pc-track-G}，并验证其旋转块 $-(\check{\mathbf{R}}\mathbf{p}+\check{\mathbf{t}})^\wedge$ 在 $\check{\mathbf{t}}=\mathbf{0}$ 时退化为纯旋转情形的 $-(\check{\mathbf{R}}\mathbf{p})^\wedge$。
+  \item （实现）实现 \cref{alg:pc-track-ekf} 的 $\SE(3)$-EKF：给一段已知路标 $+$ 仿真带噪观测，逐帧跑预测--校正，画出位姿误差与 $3\sigma$ 协方差包络，检查是否一致（NEES 检验）。
+  \item （概念）解释为什么第 (4) 步必须用 $\mathrm{Exp}(\cdot)$ 右乘而不能写成 $\hat{\mathbf{T}}_k=\check{\mathbf{T}}_k+\mathbf{K}_k(\cdots)$；后者错在哪？（提示：$\SE(3)$ 不是向量空间。）
+  \item （跨章）把本节单帧 GN \cref{eq:pc-track-normal} 与 \cref{ch:vo} 的 pose-only BA \cref{eq:vo-pnp-ba} 对照：二者雅可比只差一个投影项 $\mathbf{M}$，说明“观测 3D 位置”与“观测 2D 像素”在流形优化上是同一套骨架。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{点到平面 ICP}
+\label{sec:pc-p2plane}
+
+\paragraph{动机：点永远对不上，但面对得上。}
+点到点 ICP 把整个残差向量 $\|\mathbf{R}\mathbf{p}_i+\mathbf{t}-\mathbf{q}_i\|$ 都罚——但两帧从不同视角采样，离散化不同，\emph{永远采不到同一点}，强行让点重合会引入系统误差。真实情况是两个\emph{曲面}对齐：只要 source 点落在 target 的切平面上即可，沿切平面方向的偏移（滑动）不应惩罚。这就是 Chen \& Medioni（1991）提出的\textbf{点到平面度量}\cite{chen1992pointplane}。
+
+\begin{definition}[点到平面误差度量]\label{def:pc-p2plane}
+只罚残差沿 target 法向 $\mathbf{n}_i$ 的投影：
+\begin{equation}
+  E_{\perp}(\mathbf{R},\mathbf{t})=\sum_i\Big(\mathbf{n}_i^\top\big(\mathbf{R}\mathbf{p}_i+\mathbf{t}-\mathbf{q}_i\big)\Big)^2,
+  \label{eq:pc-p2plane-cost}
+\end{equation}
+$\mathbf{p}_i$ 为 source 点、$\mathbf{q}_i$ 为对应 target 点、$\mathbf{n}_i$ 为 $\mathbf{q}_i$ 处单位法向。与点到点 \cref{eq:pc-icp-cost} 的差别：残差先投到法向，只剩“点到平面”的垂距。
+\end{definition}
+
+\begin{insight}
+点到平面允许 source 沿 target 切平面\emph{自由滑动而不增代价}。在平面/墙面丰富处，切向自由度不被噪声/采样错位干扰，只锁定法向约束，故收敛比点到点\textbf{快得多}（Rusinkiewicz--Levoy 实测显著快）。代价：需先估 target 法向（PCA，\cref{sec:pc-filter} 末）。这也解释了为什么室内/城市等结构化环境普遍用点到平面。
+\end{insight}
+
+\subsection{小角度线性化与法方程}
+\label{sec:pc-p2plane-lin}
+
+点到平面目标 \cref{eq:pc-p2plane-cost} \emph{无简单闭式解}（这是 ICP 度量里的例外），须迭代线性化\cite{low2004p2plane}。
+
+\begin{derivation}[Low 的小角度线性化]
+把旋转写成在当前估计 $\mathbf{R}_0$ 上的小扰动 $\mathbf{R}=\mathrm{Exp}(\boldsymbol{\omega}^\wedge)\mathbf{R}_0\approx(\mathbf{I}+\boldsymbol{\omega}^\wedge)\mathbf{R}_0$（$\boldsymbol{\omega}\in\mathbb{R}^3$ 小轴角，舍去二阶项）。代入残差 $r_i=\mathbf{n}_i^\top(\mathbf{R}\mathbf{p}_i+\mathbf{t}-\mathbf{q}_i)$，令 $\mathbf{x}_i:=\mathbf{R}_0\mathbf{p}_i$：
+\begin{equation}
+  r_i\approx\mathbf{n}_i^\top\big(\mathbf{x}_i+\boldsymbol{\omega}^\wedge\mathbf{x}_i+\mathbf{t}-\mathbf{q}_i\big).
+\end{equation}
+用叉积反交换 $\boldsymbol{\omega}^\wedge\mathbf{x}_i=-\mathbf{x}_i^\wedge\boldsymbol{\omega}$：
+\begin{equation}
+  r_i\approx\mathbf{n}_i^\top(\mathbf{x}_i-\mathbf{q}_i)+\mathbf{n}_i^\top\mathbf{t}-\mathbf{n}_i^\top\mathbf{x}_i^\wedge\boldsymbol{\omega}.
+  \label{eq:pc-p2plane-r}
+\end{equation}
+等价地，用标量三重积循环性 $\mathbf{n}_i^\top(\boldsymbol{\omega}\times\mathbf{x}_i)=(\mathbf{x}_i\times\mathbf{n}_i)^\top\boldsymbol{\omega}$，残差对未知量\emph{线性}的形式为
+\begin{equation}
+  r_i\approx(\mathbf{x}_i\times\mathbf{n}_i)^\top\boldsymbol{\omega}+\mathbf{n}_i^\top\mathbf{t}+\mathbf{n}_i^\top(\mathbf{x}_i-\mathbf{q}_i).
+  \label{eq:pc-p2plane-rlin}
+\end{equation}
+\end{derivation}
+
+\paragraph{组装 $6\times6$ 线性系统。}
+把待求量堆成 $6$ 维 $\mathbf{x}=[\boldsymbol{\omega};\mathbf{t}]$，每个对应贡献一行
+\begin{equation}
+  \mathbf{a}_i^\top=\big[\,(\mathbf{x}_i\times\mathbf{n}_i)^\top\ \ \mathbf{n}_i^\top\,\big]\in\mathbb{R}^{1\times6},
+  \qquad b_i=\mathbf{n}_i^\top(\mathbf{q}_i-\mathbf{x}_i),
+  \label{eq:pc-p2plane-row}
+\end{equation}
+点到平面代价线性化为 $E_\perp\approx\sum_i(\mathbf{a}_i^\top\mathbf{x}-b_i)^2=\|\mathbf{A}\mathbf{x}-\mathbf{b}\|^2$，最小二乘解（正规方程）
+\begin{equation}
+  \mathbf{x}^\star=(\mathbf{A}^\top\mathbf{A})^{-1}\mathbf{A}^\top\mathbf{b},\qquad
+  \mathbf{A}^\top\mathbf{A}=\sum_i\mathbf{a}_i\mathbf{a}_i^\top\in\mathbb{R}^{6\times6}.
+  \label{eq:pc-p2plane-normal}
+\end{equation}
+$\mathbf{A}^\top\mathbf{A}$ 是 $6\times6$ 对称（满秩时正定），用 Cholesky 解。Hessian 的显式块结构：
+\begin{equation}
+  \mathbf{H}=\mathbf{A}^\top\mathbf{A}=\begin{bmatrix}
+  \displaystyle\sum_i\mathbf{x}_i^{\wedge\top}\mathbf{n}_i\mathbf{n}_i^\top\mathbf{x}_i^\wedge & -\displaystyle\sum_i\mathbf{x}_i^{\wedge\top}\mathbf{n}_i\mathbf{n}_i^\top\\[10pt]
+  -\displaystyle\sum_i\mathbf{n}_i\mathbf{n}_i^\top\mathbf{x}_i^\wedge & \displaystyle\sum_i\mathbf{n}_i\mathbf{n}_i^\top
+  \end{bmatrix},\quad \mathbf{x}_i=\mathbf{R}_0\mathbf{p}_i.
+  \label{eq:pc-p2plane-hessian}
+\end{equation}
+解出 $\mathbf{x}=[\boldsymbol{\omega};\mathbf{t}]$ 后更新 $\mathbf{R}\leftarrow\mathrm{Exp}(\boldsymbol{\omega}^\wedge)\mathbf{R}_0$（或正交化），$\mathbf{t}$ 累加，迭代至 $\boldsymbol{\omega},\mathbf{t}$ 足够小。
+
+\begin{note}
+\textbf{与本书右扰动一致}：$\boldsymbol{\omega}$ 即右扰动轴角 $\delta\boldsymbol{\phi}$（小角度下 $\mathbf{R}\approx\mathbf{I}+\delta\boldsymbol{\phi}^\wedge$），雅可比行 \cref{eq:pc-p2plane-row} 中旋转块 $(\mathbf{x}_i\times\mathbf{n}_i)^\top=-\mathbf{n}_i^\top\mathbf{x}_i^\wedge$ 正是点到平面残差对右扰动 $\delta\boldsymbol{\phi}$ 的雅可比；本书 $\boldsymbol{\xi}=[\boldsymbol{\rho};\boldsymbol{\phi}]$（平移在前）则交换两块的列顺序。OpenCV KinFu 的等价写法用每点 $3\times6$ 矩阵 $\mathbf{G}(\mathbf{x}_i)=[\,\mathbf{x}_i^{\wedge\top}\ |\ \mathbf{I}_3\,]$，正规方程为 $\big(\sum_i\mathbf{G}^\top\mathbf{n}_i\mathbf{n}_i^\top\mathbf{G}\big)\mathbf{x}=\sum_i\mathbf{G}^\top\mathbf{n}_i\mathbf{n}_i^\top\big(-(\mathbf{x}_i-\mathbf{q}_i)\big)$，因 $\mathbf{n}_i^\top\mathbf{G}(\mathbf{x}_i)=\mathbf{a}_i^\top$ 而与 \cref{eq:pc-p2plane-normal} 完全一致。
+\end{note}
+
+\begin{algo}[点到平面 ICP 一次迭代]\label{alg:pc-p2plane}
+\begin{codebox}[Python]{point-to-plane ICP iteration}
+# input: source S, target D (with normals n), current (R, t)
+for s_i in S:
+    s_world = R @ s_i + t
+    q_i, n_i = kdtree_nearest_with_normal(D, s_world)   # NN + normal
+    if norm(s_world - q_i) > d_max or angle(n_i) too large:
+        continue                                        # reject
+    a_i = concat(cross(s_world, n_i), n_i)              # 1x6 row
+    b_i = dot(n_i, q_i - s_world)
+    H += outer(a_i, a_i);  g += a_i * b_i               # 6x6, 6x1
+x = cholesky_solve(H, g)                                # [omega; t]
+R = Exp(skew(x[0:3])) @ R;  t = t + x[3:6]             # update
+\end{codebox}
+\end{algo}
+
+\begin{insight}
+\textbf{为何点到平面收敛快}：点到点的 Hessian 在切平面方向也有大曲率（罚切向滑移），导致沿曲面“爬行”慢；点到平面的法向投影 $\mathbf{n}_i\mathbf{n}_i^\top$ 使切向自由度代价为零、只约束法向（见 \cref{eq:pc-p2plane-hessian} 的秩 1 结构），等价于在曲面流形上做了正确的“滑动 + 法向贴合”，故每步走得更远、迭代更少。
+\end{insight}
+
+\begin{pitfall}[编程陷阱：未估法向或法向方向不一致]
+错误描述：点到平面 ICP 直接用未估法向的点云，或法向朝向（内/外）随机。现象：代价时正时负、不收敛或收敛慢。根本原因：\cref{eq:pc-p2plane-cost} 依赖每个 target 点的单位法向 $\mathbf{n}_i$；PCA 估出的法向有正负二义性。正确做法：配准前对 target 估法向（$k$ 近邻协方差最小特征向量），并统一朝向（朝向视点或一致传播）；残差用平方 $(\mathbf{n}_i^\top\cdots)^2$ 对法向正负不敏感，但雅可比组装时仍须一致。自检：可视化法向场，检查是否朝向一致。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）从 \cref{eq:pc-p2plane-r} 出发，用标量三重积循环性导出对未知量线性的 \cref{eq:pc-p2plane-rlin}，并写出雅可比行 \cref{eq:pc-p2plane-row}。
+  \item （实现）实现点到平面 ICP（\cref{alg:pc-p2plane}），在同一对结构化点云上与点到点 ICP 比较迭代次数，验证点到平面更快。
+  \item （概念）解释 Hessian \cref{eq:pc-p2plane-hessian} 的右下块 $\sum\mathbf{n}_i\mathbf{n}_i^\top$ 为何是“法向方向的信息累加”；在所有法向共线（如纯平面场景）时该块为何秩亏、配准为何欠约束。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Generalized-ICP：用概率统一点/面/分布}
+\label{sec:pc-gicp}
+
+\paragraph{动机：能不能把 point-to-point 与 point-to-plane 装进一个框架，还更鲁棒？}
+点到点对噪声敏感，点到平面只用单侧（target）的表面信息。Segal 等（2009）的 \textbf{GICP}\cite{segal2009gicp} 给每个点配一个\emph{协方差}，残差按对应协方差的马氏距离加权，从而把 point-to-point / point-to-plane / 两侧都用表面的 \emph{plane-to-plane} 统一进一个最大似然框架。它只改 ICP 的配准步（\cref{alg:pc-icp} 的最后一行），其余（KD 树找对应）不变，故\emph{保持 ICP 的速度与简洁}，同时获得概率方法的鲁棒性。SLAM Handbook 第 8 章只提到“比较局部分布之差”，未给 GICP 推导，本节补全。
+
+\subsection{概率生成模型}
+\label{sec:pc-gicp-model}
+
+\begin{derivation}[GICP 残差的分布]
+设两云按对应索引对齐：$\mathcal{S}=\{\mathbf{a}_i\}$（source）、$\mathcal{T}=\{\mathbf{b}_i\}$（target，$\mathbf{a}_i$ 对应 $\mathbf{b}_i$），已剔除 $\|\cdot\|>d_{\max}$ 者。\textbf{生成假设}：存在真值底层点 $\hat{\mathbf{a}}_i,\hat{\mathbf{b}}_i$，测量是其加噪样本
+\begin{equation}
+  \mathbf{a}_i\sim\mathcal{N}(\hat{\mathbf{a}}_i,\ \boldsymbol{\Sigma}_i^{A}),\qquad
+  \mathbf{b}_i\sim\mathcal{N}(\hat{\mathbf{b}}_i,\ \boldsymbol{\Sigma}_i^{B}),
+  \label{eq:pc-gicp-gen}
+\end{equation}
+$\boldsymbol{\Sigma}_i^A,\boldsymbol{\Sigma}_i^B$ 为各点协方差。\textbf{完美对应假设}：在真变换 $\mathbf{T}^\star$ 下 $\hat{\mathbf{b}}_i=\mathbf{T}^\star\hat{\mathbf{a}}_i$。定义残差 $\mathbf{d}_i^{(\mathbf{T})}=\mathbf{b}_i-\mathbf{T}\mathbf{a}_i$。因 $\mathbf{a}_i,\mathbf{b}_i$ 独立高斯，线性变换 $\mathbf{T}^\star\mathbf{a}_i$ 的协方差为 $\mathbf{R}^\star\boldsymbol{\Sigma}_i^A\mathbf{R}^{\star\top}$（旋转作用于协方差，平移不改协方差），故残差在真变换处的分布（均值相减、独立协方差相加）：
+\begin{equation}
+  \mathbf{d}_i^{(\mathbf{T}^\star)}\sim\mathcal{N}\!\Big(\hat{\mathbf{b}}_i-\mathbf{T}^\star\hat{\mathbf{a}}_i,\ \boldsymbol{\Sigma}_i^B+\mathbf{R}^\star\boldsymbol{\Sigma}_i^A\mathbf{R}^{\star\top}\Big)
+  =\mathcal{N}\!\Big(\mathbf{0},\ \boldsymbol{\Sigma}_i^B+\mathbf{R}^\star\boldsymbol{\Sigma}_i^A\mathbf{R}^{\star\top}\Big),
+  \label{eq:pc-gicp-resdist}
+\end{equation}
+末行用完美对应假设把均值消为零。
+\end{derivation}
+
+\subsection{最大似然代价}
+\label{sec:pc-gicp-mle}
+
+\begin{derivation}[MLE 导出 GICP 核心代价]
+用最大似然估计 $\mathbf{T}$：
+\begin{equation}
+  \mathbf{T}^\star=\arg\max_{\mathbf{T}}\prod_i p\big(\mathbf{d}_i^{(\mathbf{T})}\big)
+  =\arg\max_{\mathbf{T}}\sum_i\log p\big(\mathbf{d}_i^{(\mathbf{T})}\big).
+\end{equation}
+记 $\boldsymbol{\Lambda}_i^{-1}=\boldsymbol{\Sigma}_i^B+\mathbf{T}\boldsymbol{\Sigma}_i^A\mathbf{T}^\top$（合成协方差），高斯对数似然
+\begin{equation}
+  \log p(\mathbf{d}_i^{(\mathbf{T})})=-\tfrac12\mathbf{d}_i^{(\mathbf{T})\top}\big(\boldsymbol{\Sigma}_i^B+\mathbf{T}\boldsymbol{\Sigma}_i^A\mathbf{T}^\top\big)^{-1}\mathbf{d}_i^{(\mathbf{T})}-\tfrac12\log\!\big((2\pi)^3\det(\cdots)\big).
+\end{equation}
+GICP 舍弃 $\det$ 项与常数（视协方差随 $\mathbf{T}$ 变化对 $\det$ 的影响为二阶小，可安全忽略），最大化等价于最小化加权平方和：
+\begin{equation}
+  \boxed{\ \mathbf{T}^\star=\arg\min_{\mathbf{T}}\sum_i\mathbf{d}_i^{(\mathbf{T})\top}\Big(\boldsymbol{\Sigma}_i^B+\mathbf{T}\boldsymbol{\Sigma}_i^A\mathbf{T}^\top\Big)^{-1}\mathbf{d}_i^{(\mathbf{T})}.\ }
+  \label{eq:pc-gicp-cost}
+\end{equation}
+这是 \textbf{GICP 算法的核心步}：残差 $\mathbf{d}_i=\mathbf{b}_i-\mathbf{T}\mathbf{a}_i$ 用“两侧协方差经变换合成”的逆（信息矩阵）做马氏加权。记 $\mathbf{M}_i=(\boldsymbol{\Sigma}_i^B+\mathbf{R}\boldsymbol{\Sigma}_i^A\mathbf{R}^\top)^{-1}$，则 $\mathbf{T}^\star=\arg\min_{\mathbf{T}}\sum_i\mathbf{d}_i^\top\mathbf{M}_i\mathbf{d}_i$。注意 $\mathbf{M}_i$ 含 $\mathbf{T}$，故是非线性最小二乘（共轭梯度/BFGS/GN 解）。
+\end{derivation}
+
+\subsection{point-to-point 与 point-to-plane 作为特例}
+\label{sec:pc-gicp-special}
+
+\begin{proposition}[GICP 的两个退化特例]\label{prop:pc-gicp-special}
+由 \cref{eq:pc-gicp-cost} 选特定协方差即恢复经典 ICP：
+\begin{enumerate}
+  \item \textbf{point-to-point}：令 $\boldsymbol{\Sigma}_i^A=\mathbf{0}$、$\boldsymbol{\Sigma}_i^B=\mathbf{I}$，则 $\mathbf{M}_i=\mathbf{I}$，\cref{eq:pc-gicp-cost} 退化为 $\sum_i\|\mathbf{b}_i-\mathbf{T}\mathbf{a}_i\|^2$，即标准点到点 ICP \cref{eq:pc-icp-cost}。
+  \item \textbf{point-to-plane}：令 $\boldsymbol{\Sigma}_i^A=\mathbf{0}$、$\boldsymbol{\Sigma}_i^B=\mathbf{P}_i^{-1}$，$\mathbf{P}_i=\mathbf{n}_i\mathbf{n}_i^\top$（法向投影矩阵），则 $\mathbf{M}_i=\mathbf{n}_i\mathbf{n}_i^\top$，
+  \begin{equation}
+    \mathbf{d}_i^\top\mathbf{M}_i\mathbf{d}_i=\mathbf{d}_i^\top\mathbf{n}_i\mathbf{n}_i^\top\mathbf{d}_i=(\mathbf{n}_i^\top\mathbf{d}_i)^2,
+  \end{equation}
+  即点到平面 \cref{eq:pc-p2plane-cost}。严格说 $\mathbf{P}_i$ 秩亏不可逆，是“沿法向方差 $0$、切向方差无穷”的极限。
+\end{enumerate}
+\end{proposition}
+
+\subsection{plane-to-plane：两侧都用表面结构}
+\label{sec:pc-gicp-p2p}
+
+\paragraph{核心洞察。}
+点云不是任意点集，而是被传感器采样的\emph{曲面}（$2$-流形），局部可微即\emph{局部平面}。每个测量点本质上只沿其\emph{表面法向}提供约束，平面内位置完全不确定。GICP 的核心创新：\textbf{两侧点云都建局部平面模型}——每点沿法向方差极小（$\epsilon$）、切平面内方差为 $1$。
+
+\begin{derivation}[plane-to-plane 协方差构造]
+对点 $\mathbf{a}_i$（或 $\mathbf{b}_i$）取 $k$ 个最近邻（PCL 缺省 $k=20$），求经验协方差
+\begin{equation}
+  \boldsymbol{\Sigma}_i^{\text{emp}}=\frac{1}{k}\sum_{j=1}^{k}(\mathbf{p}_j-\bar{\mathbf{p}})(\mathbf{p}_j-\bar{\mathbf{p}})^\top.
+  \label{eq:pc-gicp-emp}
+\end{equation}
+特征分解 $\boldsymbol{\Sigma}_i^{\text{emp}}=\mathbf{U}\,\mathrm{diag}(\lambda_1,\lambda_2,\lambda_3)\,\mathbf{U}^\top$（$\lambda_1\ge\lambda_2\ge\lambda_3$，$\mathbf{U}=[\mathbf{u}_1,\mathbf{u}_2,\mathbf{u}_3]$，$\mathbf{u}_3$ 即最小特征值方向 = \emph{曲面法向}）。\textbf{重塑协方差}：把切平面两方向方差设为 $1$、法向方差设为 $\epsilon$（小）：
+\begin{equation}
+  \boldsymbol{\Sigma}_i=\mathbf{U}\,\mathrm{diag}(\epsilon,\,1,\,1)\,\mathbf{U}^\top
+  =\epsilon\,\mathbf{u}_3\mathbf{u}_3^\top+\mathbf{u}_2\mathbf{u}_2^\top+\mathbf{u}_1\mathbf{u}_1^\top.
+  \label{eq:pc-gicp-cov}
+\end{equation}
+（PCL 缺省 $\epsilon=0.001$。这表示“该点几乎确定落在某局部平面上、但平面内位置不确定”。）$\mathbf{a}_i,\mathbf{b}_i$ 都按此建模，变换 $\mathbf{T}$ 再由 \cref{eq:pc-gicp-cost} 求出。
+\end{derivation}
+
+\paragraph{自动剔除错误对应。}
+若把一段表面上的所有点都错配到 target 中\emph{单个}点——因表面朝向不一致，plane-to-plane \emph{自动 discount} 这些匹配：该对应的合成协方差 $\boldsymbol{\Sigma}_i^B+\mathbf{R}\boldsymbol{\Sigma}_i^A\mathbf{R}^\top$ 近似各向同性，相对正确对应（薄而锐的协方差）对目标函数贡献极小。等价视角：每个对应是一个\emph{软约束}，不一致匹配形成很弱、无信息的约束。\textbf{这是 GICP 对 $d_{\max}$ 不敏感、易调参的根因}——可设大 $d_{\max}$ 增大收敛半径而不易被错误对应带偏。
+
+\subsection{优化与右扰动雅可比}
+\label{sec:pc-gicp-opt}
+
+残差 $\mathbf{d}_i=\mathbf{R}\mathbf{a}_i+\mathbf{t}-\mathbf{b}_i$，单项 $e_i=\mathbf{d}_i^\top\mathbf{M}_i\mathbf{d}_i$。对平移 $\partial e_i/\partial\delta\mathbf{t}=2\mathbf{M}_i\mathbf{d}_i$；对右扰动旋转，由 $\partial\mathbf{d}_i/\partial\delta\boldsymbol{\phi}=-\mathbf{R}\,\mathbf{a}_i^\wedge$（同 \cref{eq:pc-icp-jac}）：
+\begin{equation}
+  \frac{\partial e_i}{\partial\delta\boldsymbol{\phi}}=2\,\mathbf{d}_i^\top\mathbf{M}_i\big(-\mathbf{R}\,\mathbf{a}_i^\wedge\big),\qquad
+  \frac{\partial e_i}{\partial\delta\mathbf{t}}=2\,\mathbf{d}_i^\top\mathbf{M}_i.
+  \label{eq:pc-gicp-jac}
+\end{equation}
+严格梯度含 $\partial\mathbf{M}_i/\partial\mathbf{R}$ 项，但实务中常\emph{冻结} $\mathbf{M}_i$（用当前 $\mathbf{R}$ 算好后视为常数）做高斯--牛顿，是良好近似。
+
+\begin{algo}[GICP 完整流程]\label{alg:pc-gicp}
+\begin{codebox}[Python]{Generalized-ICP}
+# preprocess: for each point in A and B, KD-tree k=20 NN,
+#   compute reshaped covariance Sigma = U @ diag(eps,1,1) @ U^T   # (6.11)
+T = T0
+while not converged:
+    for a_i in A:                              # correspondence step
+        b_i = kdtree_nearest(B, T @ a_i)       # filter by d_max
+        M_i = inv(Sigma_B[i] + R @ Sigma_A[i] @ R.T)   # info matrix
+    # minimize  sum_i (b_i - T a_i)^T M_i (b_i - T a_i)  via GN/BFGS
+    T = argmin_T weighted_cost(A, B, M)
+return T
+\end{codebox}
+\end{algo}
+
+\begin{insight}
+\textbf{GICP 三连}：$\boldsymbol{\Sigma}^A=\mathbf{0},\boldsymbol{\Sigma}^B=\mathbf{I}\Rightarrow$ point-to-point；$\boldsymbol{\Sigma}^A=\mathbf{0},\boldsymbol{\Sigma}^B=(\mathbf{n}\mathbf{n}^\top)^{-1}$ 极限 $\Rightarrow$ point-to-plane；两侧都 $\mathrm{diag}(\epsilon,1,1)\Rightarrow$ plane-to-plane。后者对错误对应最鲁棒、对 $d_{\max}$ 最不敏感（论文实测优于前两者）。GICP 与 NDT 都用“高斯/协方差软化”提升鲁棒性，但 GICP 仍需逐点最近邻（KD 树），NDT 用体素 cell 高斯免最近邻（下节）。
+\end{insight}
+
+\begin{pitfall}[概念误区：把 plane-to-plane 当成“两次点到平面”]
+错误描述：以为 GICP 就是对两侧分别做点到平面再平均。现象：手推的代价与 PCL 结果对不上。根本原因：plane-to-plane 是把两侧协方差\emph{经变换合成}后求逆做马氏加权（\cref{eq:pc-gicp-cost}），不是两个点到平面残差的简单叠加；合成协方差 $\boldsymbol{\Sigma}^B+\mathbf{R}\boldsymbol{\Sigma}^A\mathbf{R}^\top$ 同时编码了两侧的法向一致性。正确做法：按 \cref{eq:pc-gicp-cost} 与 \cref{eq:pc-gicp-cov} 构造。自检：令 $\boldsymbol{\Sigma}^A=\mathbf{0}$ 应退化回单侧点到平面（\cref{prop:pc-gicp-special}）。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）从生成模型 \cref{eq:pc-gicp-gen} 推出残差分布 \cref{eq:pc-gicp-resdist}，再由 MLE 导出代价 \cref{eq:pc-gicp-cost}（写清舍弃 $\det$ 项的理由）。
+  \item （推导）验证 \cref{prop:pc-gicp-special}：分别代入 $\boldsymbol{\Sigma}^A=\mathbf{0},\boldsymbol{\Sigma}^B=\mathbf{I}$ 与 $\boldsymbol{\Sigma}^B=(\mathbf{n}\mathbf{n}^\top)^{-1}$ 极限，验证退化到点到点、点到平面。
+  \item （实现）实现 plane-to-plane 协方差构造 \cref{eq:pc-gicp-emp,eq:pc-gicp-cov}（$k=20$ 近邻 PCA + 重塑 $\mathrm{diag}(\epsilon,1,1)$），接入 GICP 高斯--牛顿（雅可比 \cref{eq:pc-gicp-jac}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{NDT：正态分布变换}
+\label{sec:pc-ndt}
+
+\paragraph{动机：能不能不用每步找最近点？}
+ICP 把 target 表示为\emph{离散点集}，每次迭代都要重新找最近点——对应是离散跳变，代价曲面不光滑、有大量局部极小。Biber（2003）的 \textbf{NDT}\cite{biber2003ndt} 反其道而行：把 target 点云转成\emph{分片连续可微的概率密度}——把空间划成体素，每个体素拟合一个正态分布；配准 = 让 source 点落在这些高斯上的似然最大。\textbf{无须显式最近点查找}（用体素哈希 $O(1)$ 定位 cell），代价曲面光滑可微，可用牛顿法。SLAM Handbook 第 8 章只给 NDT 概念，本节补全数学。
+
+\subsection{NDT 表示与 cell 高斯}
+\label{sec:pc-ndt-rep}
+
+\begin{derivation}[每个 cell 的正态分布]
+把 target 点云所在空间划分为规则 cell（PCL 缺省分辨率 $1\,\mathrm{m}$）。对每个含 $n\ge$ 阈值（建议 $\ge6$）点的 cell，由内点 $\{\mathbf{x}_1,\dots,\mathbf{x}_n\}$ 计算
+\begin{equation}
+  \boldsymbol{\mu}=\frac{1}{n}\sum_{k=1}^{n}\mathbf{x}_k,\qquad
+  \boldsymbol{\Sigma}=\frac{1}{n-1}\sum_{k=1}^{n}(\mathbf{x}_k-\boldsymbol{\mu})(\mathbf{x}_k-\boldsymbol{\mu})^\top.
+  \label{eq:pc-ndt-musigma}
+\end{equation}
+（Biber 原文用 $\frac{1}{n}$，Magnusson/PCL 用无偏 $\frac{1}{n-1}$。）则 cell 内点 $\mathbf{x}$ 的“被测概率密度”（未归一化高斯）
+\begin{equation}
+  p(\mathbf{x})\propto\exp\!\Big(-\tfrac12(\mathbf{x}-\boldsymbol{\mu})^\top\boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu})\Big).
+  \label{eq:pc-ndt-density}
+\end{equation}
+全空间的 NDT 即各 cell 这些分布的分片拼接。
+\end{derivation}
+
+\paragraph{协方差正则化。}
+若 cell 内点近共线/共面，$\boldsymbol{\Sigma}$ 病态（小特征值近 $0$），$\boldsymbol{\Sigma}^{-1}$ 数值爆炸。Magnusson 把过小特征值抬升：$\lambda_i\leftarrow\max(\lambda_i,\ 0.001\lambda_{\max})$，与 GICP 的 $\mathrm{diag}(\epsilon,1,1)$ 思想相通。
+
+\begin{insight}
+NDT 把“离散点云”变成“每 cell 一个高斯”的\textbf{平滑曲面密度场}——既压缩了表示（每 cell 只存 $\boldsymbol{\mu},\boldsymbol{\Sigma}$），又使配准目标处处可导（可用牛顿法），且\emph{无须对应}（source 点直接查所在 cell 的高斯）。这是与 ICP 的根本区别：ICP 的算力主项是 KD 树最近邻，NDT 用体素哈希 $O(1)$ 定位 cell，故通常更快。
+\end{insight}
+
+\subsection{得分函数与稳健化}
+\label{sec:pc-ndt-score}
+
+\begin{derivation}[score 函数与高斯混合稳健化]
+设位姿参数 $\mathbf{p}$（2D：$[t_x,t_y,\phi]^\top$；3D：$6$ 维），source 点变换 $\mathbf{x}_k'=T(\mathbf{p},\mathbf{x}_k)=\mathbf{R}(\mathbf{p})\mathbf{x}_k+\mathbf{t}(\mathbf{p})$。把每个 $\mathbf{x}_k'$ 查其所在 cell 的 $(\boldsymbol{\mu}_k,\boldsymbol{\Sigma}_k)$。纯高斯 \cref{eq:pc-ndt-density} 尾部衰减太快、对外点不鲁棒，Magnusson 用\emph{高斯 + 均匀分布混合}近似单点概率 $\bar p(\mathbf{x})=c_1\exp(-\tfrac12 q)+c_2$，再用一个高斯拟合 $-\log\bar p$ 得可微近似
+\begin{equation}
+  \tilde p(\mathbf{x})=-d_1\exp\!\Big(-\frac{d_2}{2}(\mathbf{x}-\boldsymbol{\mu})^\top\boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu})\Big),
+  \label{eq:pc-ndt-robust}
+\end{equation}
+常数（PCL 由 outlier ratio $p_o$ 与体素体积 $V_{\text{cell}}$ 计算）：
+\begin{align}
+  c_1&=10(1-p_o),\quad c_2=\frac{p_o}{V_{\text{cell}}},\quad d_3=-\ln(c_2),\notag\\
+  d_1&=-\ln(c_1+c_2)-d_3,\quad
+  d_2=-2\ln\!\Big(\frac{-\ln(c_1 e^{-1/2}+c_2)-d_3}{d_1}\Big).
+  \label{eq:pc-ndt-d12}
+\end{align}
+\textbf{总得分}（要最大化的似然，或取负后最小化）：
+\begin{equation}
+  s(\mathbf{p})=\sum_{k=1}^{N}\tilde p(\mathbf{x}_k')
+  =-\sum_{k=1}^{N}d_1\exp\!\Big(-\frac{d_2}{2}(\mathbf{x}_k'-\boldsymbol{\mu}_k)^\top\boldsymbol{\Sigma}_k^{-1}(\mathbf{x}_k'-\boldsymbol{\mu}_k)\Big).
+  \label{eq:pc-ndt-score}
+\end{equation}
+\end{derivation}
+
+\subsection{牛顿法：梯度与海森}
+\label{sec:pc-ndt-newton}
+
+对 $\max s(\mathbf{p})$ 用\textbf{牛顿法}。记 $\mathbf{e}_k=\mathbf{x}_k'-\boldsymbol{\mu}_k$（cell 残差）、$q_k=\mathbf{e}_k^\top\boldsymbol{\Sigma}_k^{-1}\mathbf{e}_k$（马氏平方）、变换雅可比 $\mathbf{J}=\partial\mathbf{x}'/\partial\mathbf{p}$（第 $i$ 列 $\mathbf{J}_i=\partial\mathbf{x}'/\partial p_i$）。
+
+\begin{derivation}[梯度（链式法则逐步）]
+对单点 score $s_{\text{pt}}=-d_1 e^{u}$，$u=-\tfrac{d_2}{2}\mathbf{e}^\top\boldsymbol{\Sigma}^{-1}\mathbf{e}$。链式法则：
+\begin{equation}
+  \frac{\partial s_{\text{pt}}}{\partial p_i}=-d_1 e^{u}\frac{\partial u}{\partial p_i},\qquad
+  \frac{\partial u}{\partial p_i}=-d_2\,\mathbf{e}^\top\boldsymbol{\Sigma}^{-1}\mathbf{J}_i,
+\end{equation}
+（用 $\partial\mathbf{e}/\partial p_i=\partial\mathbf{x}'/\partial p_i=\mathbf{J}_i$）。故梯度第 $i$ 元（累加所有点）：
+\begin{equation}
+  g_i=\sum_k d_1 d_2\,\big(\mathbf{e}_k^\top\boldsymbol{\Sigma}_k^{-1}\mathbf{J}_i\big)\exp\!\Big(-\frac{d_2}{2}q_k\Big).
+  \label{eq:pc-ndt-grad}
+\end{equation}
+\end{derivation}
+
+\begin{derivation}[海森（对 \cref{eq:pc-ndt-grad} 再求导，三项）]
+对 $g$ 的单点项再求 $\partial/\partial p_j$，乘积法则得三项：
+\begin{equation}
+  H_{ij}=\sum_k d_1 d_2\,e^{-\frac{d_2}{2}q_k}\Big[
+  \underbrace{-d_2\big(\mathbf{e}_k^\top\boldsymbol{\Sigma}_k^{-1}\mathbf{J}_i\big)\big(\mathbf{e}_k^\top\boldsymbol{\Sigma}_k^{-1}\mathbf{J}_j\big)}_{\text{指数因子求导}}
+  +\underbrace{\mathbf{J}_j^\top\boldsymbol{\Sigma}_k^{-1}\mathbf{J}_i}_{\text{一阶雅可比内积}}
+  +\underbrace{\mathbf{e}_k^\top\boldsymbol{\Sigma}_k^{-1}\frac{\partial^2\mathbf{x}_k'}{\partial p_i\partial p_j}}_{\text{变换二阶导}}
+  \Big].
+  \label{eq:pc-ndt-hess}
+\end{equation}
+三项来源：(i) $e^{u}$ 对 $p_j$ 导出 $-d_2\mathbf{e}^\top\boldsymbol{\Sigma}^{-1}\mathbf{J}_j$ 乘原式；(ii) $\mathbf{e}^\top\boldsymbol{\Sigma}^{-1}\mathbf{J}_i$ 中 $\mathbf{e}$ 对 $p_j$ 导给 $\mathbf{J}_j^\top\boldsymbol{\Sigma}^{-1}\mathbf{J}_i$；(iii) $\mathbf{J}_i=\partial\mathbf{x}'/\partial p_i$ 对 $p_j$ 导给二阶导 $\partial^2\mathbf{x}'/\partial p_i\partial p_j$（旋转部分非零，平移部分为零）。
+\end{derivation}
+
+\paragraph{本书右扰动版的简化。}
+Magnusson 原文用欧拉角参数化，旋转雅可比需展开为一长串 $\sin/\cos$ 角度导数（$8$ 个一阶项、$15$ 个二阶项）。\textbf{本书右扰动主线下大为简化}：用 $\so(3)$ 指数坐标，变换雅可比 $\partial\mathbf{x}'/\partial\delta\boldsymbol{\phi}=-\mathbf{R}\,\mathbf{x}^\wedge$（同 \cref{eq:pc-icp-jac}），平移块 $\partial\mathbf{x}'/\partial\delta\mathbf{t}=\mathbf{I}$；梯度 \cref{eq:pc-ndt-grad} 与海森 \cref{eq:pc-ndt-hess} 的形式不变，只是把欧拉角 $\mathbf{J}_i$ 换成右扰动 $\mathbf{J}=[\,\mathbf{I}\ \ -\mathbf{R}\,\mathbf{x}^\wedge\,]$，二阶导项也随之大幅简化（仅含 $(\cdot)^\wedge$ 与二阶 BCH 修正）。这是本书移植 NDT 的推荐做法。\rebuilt{右扰动版雅可比按本书李群章约定重写，与 Magnusson 欧拉角版一阶等价。}
+
+\begin{algo}[NDT 配准（牛顿法）]\label{alg:pc-ndt}
+\begin{codebox}[Python]{NDT registration (Newton)}
+# build NDT: for each target cell, compute mu, Sigma  (eq. ndt-musigma)
+p = p0
+while norm(dp) > eps:
+    s = 0; g = zeros(6); H = zeros(6,6)
+    for x_k in source:
+        x1 = T(p, x_k)                          # transform
+        mu, Sigma = cell_of(x1)                 # voxel hash O(1), no NN!
+        e = x1 - mu;  q = e.T @ inv(Sigma) @ e
+        J = transform_jacobian(p, x_k)          # right-perturbation version
+        s += -d1 * exp(-d2/2 * q)               # eq. ndt-score
+        g += grad_term(e, Sigma, J, q)          # eq. ndt-grad
+        H += hess_term(e, Sigma, J, q)          # eq. ndt-hess
+    dp = solve(H + lam*I, -g)                    # damp if H not PD
+    p = p + line_search(dp)                      # More-Thuente
+return p
+\end{codebox}
+\end{algo}
+
+\paragraph{PCL 默认参数与数值例。}
+PCL NDT\cite{magnusson2009ndt}：Transformation Epsilon（位姿增量收敛阈）$=0.01$；Step Size（More--Thuente 线搜最大步长）$=0.1$；Resolution（体素分辨率，最依赖尺度，须使每 cell $\ge6$ 点）$=1.0\,\mathrm{m}$；Maximum Iterations $=35$。数值例：\texttt{room\_scan1/2.pcd}，target $112586$ 点、source 经 ApproximateVoxelGrid（叶 $0.2\,\mathrm{m}$）降到 $12433$ 点，NDT 收敛，fitness score $0.638694$。
+
+\begin{codebox}[C++]{PCL NDT 配准}
+#include <pcl/registration/ndt.h>
+pcl::NormalDistributionsTransform<pcl::PointXYZ, pcl::PointXYZ> ndt;
+ndt.setTransformationEpsilon(0.01);
+ndt.setStepSize(0.1);
+ndt.setResolution(1.0);          // voxel cell size (most scale-dependent)
+ndt.setMaximumIterations(35);
+ndt.setInputSource(filtered_source);   // downsampled (e.g. 0.2 m voxel)
+ndt.setInputTarget(target_cloud);
+Eigen::Matrix4f init_guess = /* odometry / IMU prior */;
+ndt.align(*output, init_guess);  // init guess matters: NDT needs good init
+\end{codebox}
+
+\subsection{（选读）D2D-NDT 与 GICP 的殊途同归}
+\label{sec:pc-ndt-d2d}
+
+上述是 \textbf{P2D-NDT}（point-to-distribution）：source 离散点 vs target 分布。\textbf{D2D-NDT}（distribution-to-distribution，Stoyanov 等 2012）两侧都建 NDT，source cell $i$（$\boldsymbol{\mu}_i^A,\boldsymbol{\Sigma}_i^A$）与 target cell $j$（$\boldsymbol{\mu}_j^B,\boldsymbol{\Sigma}_j^B$）的相似度核心项
+\begin{equation}
+  s_{\text{D2D}}=-\sum_{i}d_1\exp\!\Big(-\frac{d_2}{2}\,\boldsymbol{\mu}_{ij}^\top\big(\mathbf{R}\boldsymbol{\Sigma}_i^A\mathbf{R}^\top+\boldsymbol{\Sigma}_j^B\big)^{-1}\boldsymbol{\mu}_{ij}\Big),
+  \label{eq:pc-ndt-d2d}
+\end{equation}
+$\boldsymbol{\mu}_{ij}=\mathbf{R}\boldsymbol{\mu}_i^A+\mathbf{t}-\boldsymbol{\mu}_j^B$。
+
+\begin{insight}
+\cref{eq:pc-ndt-d2d} 与 GICP 代价 \cref{eq:pc-gicp-cost} 形式高度一致——都是“两侧协方差经变换合成的逆（马氏）加权两侧均值之差”。区别：GICP 逐点最近邻 + 逐点协方差；D2D-NDT 用 cell 均值/协方差 + cell 对应（体素哈希），免最近邻、更快。NDT 与 GICP \textbf{殊途同归地用“协方差软化”提升鲁棒性}——这是点云配准从“硬对应几何”走向“软对应概率”的统一主线。
+\end{insight}
+
+\begin{pitfall}[思维陷阱：NDT 不需要好初值（因为它“免对应”)]
+错误描述：以为 NDT 免最近邻就对初值不敏感。现象：初值差时 NDT 收敛到错误极小、甚至发散。根本原因：NDT 代价虽光滑，仍是非凸的牛顿优化，source 点落到错误 cell 就贡献错误梯度（\cref{eq:pc-ndt-grad}）。正确做法：NDT 同样需较准初值，常用 coarse-to-fine（多分辨率体素）或里程计先验。自检：从不同初值跑 NDT 看收敛域。
+\end{pitfall}
+
+\begin{pitfall}[编程陷阱：体素分辨率与场景尺度不匹配]
+错误描述：不分场景一律用 $1\,\mathrm{m}$ 分辨率。现象：cell 内点太少（$<6$）使协方差不可靠，或 cell 太大丢细节，配准精度差。根本原因：分辨率是 NDT 最依赖尺度的参数（每 cell 须 $\ge6$ 点才能稳估高斯）。正确做法：按点密度调分辨率（室内 $0.5\sim1\,\mathrm{m}$、城市更大），或用多分辨率 NDT。自检：统计有效 cell（点数 $\ge6$）占比，过低就调大分辨率或降采样前别太狠。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）按链式法则从 score \cref{eq:pc-ndt-score} 推出梯度 \cref{eq:pc-ndt-grad} 与海森 \cref{eq:pc-ndt-hess} 的三项，标清每项来源。
+  \item （推导）把 \cref{eq:pc-ndt-grad,eq:pc-ndt-hess} 的欧拉角雅可比换成本书右扰动 $\mathbf{J}=[\mathbf{I}\ {-}\mathbf{R}\mathbf{x}^\wedge]$，写出简化后的梯度/海森，并说明为何比欧拉角版简洁。
+  \item （对比）对照 D2D-NDT \cref{eq:pc-ndt-d2d} 与 GICP \cref{eq:pc-gicp-cost}，逐项说明二者的对应关系与唯一区别（对应方式：cell vs 逐点最近邻）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{LOAM：点云特征提取与特征 ICP}
+\label{sec:pc-loam}
+
+\paragraph{动机：海量点逐点配准太慢，能否只用“显著点”？}
+现代 64/128 线 LiDAR 单帧数十万点，逐点 ICP 后端负担随点数线性增长。LOAM（Zhang \& Singh 2014）\cite{zhang2014loam} 的思路：先用一个\emph{低层检测器}从点云提取少量\emph{边特征}与\emph{面特征}，只对特征做配准——把降采样、KD 树近邻、点到平面残差全部串起来，实现了\emph{实时} LiDAR 里程计，成为后续 LeGO-LOAM/LIO-SAM/FAST-LIO 的基础。SLAM Handbook 只给定性描述（“高曲率→边、低曲率→面”），本节补全精确公式。
+
+\subsection{局部曲率定义}
+\label{sec:pc-loam-curv}
+
+\begin{derivation}[局部曲面光滑度（曲率）]
+LiDAR 单帧不均匀（同一 scan 内角分辨率高、跨 scan 低），故特征\emph{仅用单条 scan 内信息}提取。设点 $i$，$\mathcal{S}$ 是激光在\emph{同一 scan} 内 $i$ 两侧的连续点集（左右各半，LeGO-LOAM 取 $|\mathcal{S}|=10$）。定义点 $i$ 的局部曲面光滑度（曲率）
+\begin{equation}
+  c=\frac{1}{|\mathcal{S}|\cdot\|\mathbf{X}^L_{(k,i)}\|}\left\|\sum_{j\in\mathcal{S},\,j\neq i}\Big(\mathbf{X}^L_{(k,i)}-\mathbf{X}^L_{(k,j)}\Big)\right\|,
+  \label{eq:pc-loam-curv}
+\end{equation}
+其中 $\mathbf{X}^L_{(k,i)}$ 是点 $i$ 在 LiDAR 系 $\{L\}$ 中坐标，分母含 $\|\mathbf{X}^L_{(k,i)}\|$ 做距离归一化（远点位置噪声大，归一后曲率可比）。\textbf{几何含义}：$\sum_j(\mathbf{X}_i-\mathbf{X}_j)$ 是 $i$ 与左右邻居差向量之和——在平直区左右邻居对称、差向量相消，$c$ 小；在尖锐边/角处不对称、差不相消，$c$ 大。这正是离散二阶差分（曲率）的度量。
+\end{derivation}
+
+\paragraph{边/面点判定与均匀分布。}
+scan 内点按 $c$ 排序：$c$ 最大者为\textbf{边缘点} $\mathcal{E}$（角、尖锐边），$c$ 最小者为\textbf{平面点} $\mathcal{H}$（平坦面），用阈值 $c_{th}$ 区分。为避免特征扎堆，把一条 scan 分成\emph{四个相同子区域}，每子区域最多 $2$ 个边点、$4$ 个面点。\textbf{剔除两类不可靠特征}：(i) 近平行于激光束的局部平面上的点（返回不可靠）；(ii) 遮挡边界点（其相连曲面被另一物体挡住，换视角时遮挡区可能变可见，是“伪边”）。
+
+\subsection{点到线与点到面残差}
+\label{sec:pc-loam-res}
+
+把上一 sweep 重投影点云存入 KD 树（\cref{sec:pc-kdtree}），对当前特征点逐点找最近邻构造几何基元。
+
+\begin{derivation}[点到边缘线距离]
+设边缘特征点 $\tilde{\mathbf{X}}_{(k+1,i)}$。边缘线由两点表示：$j$ = 在地图中的最近邻，$l$ = $j$ 相邻两条 scan 中的最近邻（$j,l$ 来自\emph{不同 scan}，单 scan 不含同一边缘线多于一点）。点到线距离
+\begin{equation}
+  d_{\mathcal{E}}=\frac{\big\|(\tilde{\mathbf{X}}_{(k+1,i)}-\bar{\mathbf{X}}_{(k,j)})\times(\tilde{\mathbf{X}}_{(k+1,i)}-\bar{\mathbf{X}}_{(k,l)})\big\|}{\big\|\bar{\mathbf{X}}_{(k,j)}-\bar{\mathbf{X}}_{(k,l)}\big\|}.
+  \label{eq:pc-loam-dE}
+\end{equation}
+\textbf{几何含义}：分子 = 以 $i,j,l$ 为顶点的平行四边形面积（= 底 $\|j-l\|$ $\times$ 高），除以底 $\|j-l\|$ 得点 $i$ 到过 $j,l$ 直线的垂距。
+\end{derivation}
+
+\begin{derivation}[点到平面片距离]
+设平面特征点。平面由三点表示：$j$ = 最近邻，$l$ = $j$ 同 scan 另一点，$m$ = $j$ 相邻 scan 一点（保证三点不共线）。点到面距离
+\begin{equation}
+  d_{\mathcal{H}}=\frac{\Big|(\tilde{\mathbf{X}}_{(k+1,i)}-\bar{\mathbf{X}}_{(k,j)})\cdot\big[(\bar{\mathbf{X}}_{(k,j)}-\bar{\mathbf{X}}_{(k,l)})\times(\bar{\mathbf{X}}_{(k,j)}-\bar{\mathbf{X}}_{(k,m)})\big]\Big|}{\big\|(\bar{\mathbf{X}}_{(k,j)}-\bar{\mathbf{X}}_{(k,l)})\times(\bar{\mathbf{X}}_{(k,j)}-\bar{\mathbf{X}}_{(k,m)})\big\|}.
+  \label{eq:pc-loam-dH}
+\end{equation}
+\textbf{几何含义}：分母 = $\triangle jlm$ 法向量模（= 平行四边形面积），分子 = $(i-j)$ 在该法向上的投影 $\times$ 面积（混合积绝对值 = 体积），商 = 点 $i$ 到过 $j,l,m$ 平面的垂距。归一化后 $d_{\mathcal{H}}=\mathbf{n}^\top(\mathbf{p}-\mathbf{p}_{\text{plane}})$，正是点到平面残差 \cref{eq:pc-p2plane-cost}。
+\end{derivation}
+
+\paragraph{运动估计与 L-M 求解。}
+把所有边/面距离 \cref{eq:pc-loam-dE}/\cref{eq:pc-loam-dH} 经运动插值（sweep 内匀速假设）写成关于 $6$-DOF 位姿 $\mathbf{T}^L_{k+1}$ 的非线性函数，堆叠成 $\mathbf{f}(\mathbf{T}^L_{k+1})=\mathbf{d}$，用 Levenberg--Marquardt 更新（让 $\mathbf{d}\to\mathbf{0}$）：
+\begin{equation}
+  \mathbf{T}^L_{k+1}\leftarrow\mathbf{T}^L_{k+1}-\big(\mathbf{J}^\top\mathbf{J}+\lambda\,\mathrm{diag}(\mathbf{J}^\top\mathbf{J})\big)^{-1}\mathbf{J}^\top\mathbf{d},\qquad \mathbf{J}=\frac{\partial\mathbf{f}}{\partial\mathbf{T}^L_{k+1}},
+  \label{eq:pc-loam-lm}
+\end{equation}
+配 bisquare 鲁棒权（\cref{sec:pc-icp-robust}）。LOAM 在 KITTI 里程计上达平均位置误差约 $0.88\%$\cite{zhang2014loam}。完整的 scan-to-scan/scan-to-map 双算法、IMU 辅助、mapping 细节见 \cref{ch:lidar_slam}。
+
+\subsection{PCA 特征值判别边/面}
+\label{sec:pc-loam-pca}
+
+scan-to-map 时，在特征点邻域取地图点集 $\mathcal{S}'$，算其协方差矩阵 $\mathbf{M}$ 的特征值 $\{\lambda_i\}$ 与特征向量：
+\begin{itemize}
+  \item $\mathcal{S}'$ 在\emph{边缘线}上 $\Rightarrow$ 含\emph{一个}显著大特征值，对应特征向量 = 边缘线方向；
+  \item $\mathcal{S}'$ 在\emph{平面片}上 $\Rightarrow$ 含\emph{两个}大特征值、第三个显著小，最小特征值对应特征向量 = 平面法向。
+\end{itemize}
+
+\begin{insight}
+\textbf{PCA 协方差特征值/向量是点云局部几何（线/面/法向）的统一刻画工具}：一个大特征值 = 线性（边），两个大特征值 = 平面（面），三个相近 = 散点。这一思想贯穿全章——GICP 的 plane-to-plane 协方差（\cref{eq:pc-gicp-cov}）、surfel 的椭球盘、法向估计、LOAM 的边/面判别，本质都是“对局部邻域做 PCA，看特征值的分布形态”。
+\end{insight}
+
+\begin{insight}
+\textbf{特征 ICP = LOAM}：LOAM 本质是“特征点 + 点到线/点到平面的 ICP”——先用曲率 \cref{eq:pc-loam-curv} 把海量点云压成稀疏边/面特征（降算力、抗噪），再对特征做点到线 \cref{eq:pc-loam-dE} / 点到平面 \cref{eq:pc-loam-dH} 配准。它把 \cref{sec:pc-p2plane} 的点到平面、\cref{sec:pc-kdtree} 的 KD 树近邻、\cref{sec:pc-filter} 的体素降采样全部串起来，是点云处理在 LiDAR SLAM 的集大成应用。
+\end{insight}
+
+\begin{pitfall}[概念误区：曲率阈值在所有传感器/场景通用]
+错误描述：把某数据集调好的 $c_{th}$、子区域取点上限直接搬到别的 LiDAR。现象：边/面特征全选错（草地伪边、墙面漏面），里程计退化。根本原因：曲率 \cref{eq:pc-loam-curv} 依赖点密度、ring 数、场景结构，阈值是手工设计的、不通用——这正是“直接法”（FAST-LIO 等免特征）兴起的动机之一。正确做法：按传感器/场景重调阈值，或改用直接法（\cref{ch:lidar_slam}）。自检：可视化选出的边/面点，检查是否落在真实边/面上。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）说明曲率 \cref{eq:pc-loam-curv} 为何在平直区小、在尖锐边大（用左右邻居差向量的对称/不对称论证），并解释分母距离归一化的必要性。
+  \item （推导）由叉积/混合积的几何意义证明 \cref{eq:pc-loam-dE}（点到线）与 \cref{eq:pc-loam-dH}（点到面）确实是垂距。
+  \item （跨章综合）把 LOAM 的点到面残差 \cref{eq:pc-loam-dH} 与 \cref{sec:pc-p2plane} 的点到平面 ICP 联系起来：说明二者残差同源，并用本书右扰动雅可比 \cref{eq:pc-p2plane-row} 写出 LOAM 面残差对 $\delta\boldsymbol{\xi}$ 的线性化。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{配准范式与 ICP 六阶段框架}
+\label{sec:pc-paradigm}
+
+\paragraph{两种配准范式。}
+把前面的算法放进系统框架\cite{carlone2026handbook,zhang2014loam}：
+\begin{itemize}
+  \item \textbf{scan-to-scan}：把当前帧配准到\emph{上一帧}（或上一去畸变帧）。优点：实时、轻；缺点：误差逐帧累积、漂移快（LOAM 的 odometry 模块，$\sim10\,\mathrm{Hz}$）。
+  \item \textbf{scan-to-map}：把当前帧配准到围绕传感器维护的\emph{局部地图}（历史多帧融合，远比单帧稠密）。优点：内点关联多得多、漂移低；代价：需可增量更新的点云数据结构（KD 树 / iKD-tree / 体素地图）来存与查地图。LOAM 的 mapping（$\sim1\,\mathrm{Hz}$）、LIO-SAM、FAST-LIO 皆此。
+\end{itemize}
+现代系统多用\emph{单阶段 scan-to-map}（体素化局部地图 + 直接逐点对应），\cref{ch:lidar_slam} 展开其完整系统。此外，LiDAR 点云在扫描期间因传感器运动会产生\emph{运动畸变}（一帧 scan 不是单一时刻的静态快照），配准前须\emph{运动去畸变}（恒速模型 / 连续时间轨迹 / IMU 预积分 / 逐点配准），这是 LiDAR 点云特有的预处理，\cref{ch:lidar_slam} 逐一展开这四类方法。
+
+\paragraph{ICP 六阶段框架（Rusinkiewicz--Levoy）。}
+ICP 不是单一算法，而是\textbf{算法族}\cite{rusinkiewicz2001efficient}（arXiv 前身 3DIM 2001）。把 ICP 拆成六个可独立替换的阶段，是理解/调优 ICP 的标准框架（认知工具：系统性分类）：
+
+\begin{table}[H]\centering\small
+\caption{ICP 六阶段分类（Rusinkiewicz--Levoy 2001\cite{rusinkiewicz2001efficient}）}
+\label{tab:pc-six-stages}
+\begin{tabular}{p{0.18\textwidth} p{0.74\textwidth}}
+\toprule
+阶段 & 可选方法 \\
+\midrule
+1 Selection（点选取） & 全部点；均匀子采样；随机采样（每迭代重采）；\textbf{法向空间均匀采样}（按法向方向均匀选点，使各方向约束充分，对“近平面带小特征”收敛更好）；按颜色/强度梯度选 \\
+2 Matching（对应） & 最近点（KD 树）；沿法向投影找交点（normal shooting）；反向校准（投影到距离图像）；加颜色/法向相容性约束 \\
+3 Weighting（加权） & 等权；按距离 $w\propto1/(1+d)$；按法向相容性 $w\propto\mathbf{n}_a\cdot\mathbf{n}_b$；按采集不确定度 \\
+4 Rejection（剔除） & 距离 $>d_{\max}$；剔除最差 $x\%$（trimmed ICP）；法向夹角过大；剔除网格边界对应；剔除双向不互为最近的对 \\
+5 Error metric（度量） & 点到点（\cref{sec:pc-icp}）；点到平面（\cref{sec:pc-p2plane}）；plane-to-plane/GICP（\cref{sec:pc-gicp}）；点到点 + 颜色 \\
+6 Minimization（求解） & 闭式（SVD/四元数，点到点）；线性 LS（点到平面小角，\cref{sec:pc-p2plane}）；非线性（LM，任意度量）；随机梯度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Rusinkiewicz--Levoy 的高速组合：法向空间采样 + 点到平面 + 投影匹配 + 常数权 + 距离剔除 + 线性最小化。实测结论：(a) 点到平面比点到点收敛快得多；(b) 对应策略（matching/sampling）对收敛速度影响最大；(c) 随机重采样 + 点到平面鲁棒高效。
+
+\begin{insight}
+调优 ICP = 针对数据特性（噪声/重叠/平面度/初值质量）在六阶段做选择。本章讲的所有方法都能定位到这张表的某个格子：点到点/点到平面/GICP 是“第 5 阶段”的不同选择，KD 树是“第 2 阶段”，体素降采样是“第 1 阶段”，$d_{\max}$ 是“第 4 阶段”。NDT 是个例外——它用分布把“对应”隐式化，跳出了这个以“显式对应”为前提的六阶段框架。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{点云配准算法选型小结}
+\label{tab:pc-selection}
+\begin{tabular}{p{0.14\textwidth} p{0.16\textwidth} p{0.15\textwidth} p{0.13\textwidth} p{0.12\textwidth} p{0.18\textwidth}}
+\toprule
+算法 & target 表示 & 对应方式 & 度量 & 闭式解 & 强项 / 弱项 \\
+\midrule
+点到点 ICP & 离散点 + KD 树 & 最近点 & 点-点欧氏 & 有（SVD/四元数） & 通用；初值敏感、慢收敛 \\
+点到面 ICP & 点 + 法向 & 最近点 & 点到切平面 & 无（线性化迭代） & 结构化环境优；需法向 \\
+GICP & 点 + 局部协方差 & 最近点 & 马氏（协方差加权） & 无（GN/BFGS） & 最稳、对 $d_{\max}$ 不敏感；算协方差略贵 \\
+NDT & 体素正态分布 & 无须最近点（落格） & 分布似然 & 无（牛顿法） & 大规模快、曲面光滑；对初值敏感 \\
+LOAM 特征法 & 边/面特征 + KD 树 & 近邻构边线/面片 & 点-线 + 点-面 & 无（LM） & 实时、特征少；依赖特征质量 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{统一视角}：除 NDT 外都是“找对应 + 最小化几何残差”的迭代；NDT 用分布把对应隐式化。所有几何残差最小化都可纳入本书右扰动高斯--牛顿/LM 框架，区别只在\emph{残差定义}（点/线/面/分布）与\emph{权矩阵}（单位/投影/协方差逆）。
+
+\begin{practice}
+\begin{enumerate}
+  \item （选型）为下列任务在 \cref{tab:pc-selection} 选算法并说明：(a) RGB-D 室内重建精配准；(b) 城市级 LiDAR 实时里程计；(c) 大范围低重叠回环精配准。
+  \item （设计扩展）用 \cref{tab:pc-six-stages} 的六阶段框架，为“高外点率、初值较差”的场景设计一套 ICP 管线（每阶段给出选择与理由）。
+  \item （跨章综合）综合本章：写出一条从原始 LiDAR 帧到位姿估计的完整管线（去畸变 $\to$ 降采样 $\to$ 特征/法向 $\to$ KD 树对应 $\to$ 点到面/GICP 配准 $\to$ 收敛判据），标注每步用到本章哪个公式/算法。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+点云像“三维图像”，索引相邻即几何相邻 & 点云无序，邻域须靠空间索引（\cref{def:pc-cloud}）\\
+有对应的配准没有闭式解 & 有：SVD（\cref{thm:pc-svd}）与四元数（\cref{thm:pc-horn}）等价闭式 \\
+ICP 会收敛到全局最优 & 只保证单调收敛到\emph{局部}极小，强依赖初值（\cref{thm:pc-convergence}）\\
+点数 $\ge3$ 配准解就唯一 & 唯一性看 $\mathbf{H}$ 奇异值结构不看点数；近共面/共线仍退化（\cref{thm:pc-wahba-cases}）\\
+任意三点都能定位 & 须三点\emph{不共线}，惯量阵才正定（\cref{thm:pc-wahba-suff}）\\
+SVD 解直接 $\mathbf{R}=\mathbf{V}\mathbf{U}^\top$ 就行 & 须查 $\det$，负则行列式修正防反射（\cref{eq:pc-R-svd-fix}）\\
+$d_{\max}$ 越大收敛越好 & 大则混入错误对应降精度，需 coarse-to-fine \\
+点到点与点到平面无关 & 点到平面是 GICP 取 $\boldsymbol{\Sigma}^B=(\mathbf{n}\mathbf{n}^\top)^{-1}$ 的特例（\cref{prop:pc-gicp-special}）\\
+NDT 免对应所以不依赖初值 & 仍是非凸牛顿优化，初值差会发散 \\
+KD 树对任意维度都快 & 高维退化（维度灾难），需 $N\gg2^k$（\cref{thm:pc-kd-complexity}）\\
+LOAM 曲率阈值通用 & 手工设计、依赖传感器/场景，不通用 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\mathcal{S}=\{\mathbf{p}_i\},\mathcal{T}=\{\mathbf{q}_j\}$ & source（待配准）/ target（参考）点云 & \cref{def:pc-cloud} \\
+$(\mathbf{R},\mathbf{t})$ & 待求刚体变换，$\mathbf{R}\mathbf{p}+\mathbf{t}\approx\mathbf{q}$ & \cref{sec:pc-why} \\
+$C(\mathbf{p},\mathcal{A}),d_{\max}$ & 最近点算子 / 最大匹配距离阈值 & \cref{def:pc-closest} \\
+$\bar{\mathbf{p}},\bar{\mathbf{q}};\mathbf{p}_i',\mathbf{q}_i'$ & 质心 / 去心坐标 & \cref{eq:pc-t-star} \\
+$\mathbf{H}=\sum\mathbf{p}_i'\mathbf{q}_i'^\top$ & 互协方差矩阵（SVD 解用） & \cref{eq:pc-H} \\
+$\mathbf{N}$ & Horn 的 $4\times4$ 对称矩阵 & \cref{eq:pc-N-matrix} \\
+$\mathbf{n}_i$ & target 点处单位法向（点到面/GICP） & \cref{def:pc-p2plane} \\
+$\boldsymbol{\Sigma}_i^A,\boldsymbol{\Sigma}_i^B;\mathbf{M}_i$ & 点协方差 / 合成信息矩阵（GICP） & \cref{eq:pc-gicp-gen,eq:pc-gicp-cost} \\
+$\epsilon$ & plane-to-plane 沿法向小方差（缺省 $0.001$） & \cref{eq:pc-gicp-cov} \\
+$\boldsymbol{\mu},\boldsymbol{\Sigma}$（cell） & NDT 体素均值 / 协方差 & \cref{eq:pc-ndt-musigma} \\
+$d_1,d_2$ & NDT 稳健化高斯混合常数 & \cref{eq:pc-ndt-d12} \\
+$c;d_{\mathcal{E}},d_{\mathcal{H}}$ & LOAM 曲率 / 点到线、点到面距离 & \cref{eq:pc-loam-curv,eq:pc-loam-dE,eq:pc-loam-dH} \\
+$\mathbf{G},\mathbf{m}$ & 点观测 $3\times6$ 雅可比 / 载体系预测点 $\check{\mathbf{R}}\mathbf{p}+\check{\mathbf{t}}$ & \cref{eq:pc-track-G} \\
+$(\cdot)^{\odot}$ & 齐次点右扰动算子，$\tilde{\mathbf{p}}^{\,\odot}=\big[\begin{smallmatrix}\mathbf{I}&-\mathbf{p}^\wedge\\\mathbf{0}^\top&\mathbf{0}^\top\end{smallmatrix}\big]$ & \cref{eq:pc-track-jac} \\
+$(\cdot)^\wedge$ & 反对称（叉积）算子 & \cref{sec:pc-icp-rightpert} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{定理 / 公式速查表}
+\begin{tabular}{lll}
+\toprule
+定理 / 公式 & 一句话说明 & 对应 \\
+\midrule
+KD 树剪枝 \cref{eq:pc-kd-prune} & 垂距 $<$ 最优半径才搜远侧 & \cref{alg:pc-kdnn} \\
+平移闭式 \cref{eq:pc-t-star} & $\mathbf{t}=\bar{\mathbf{q}}-\mathbf{R}\bar{\mathbf{p}}$，去质心解耦 & \cref{sec:pc-icp-decouple} \\
+SVD 旋转解 \cref{eq:pc-R-svd-fix} & $\mathbf{R}=\mathbf{V}\,\mathrm{diag}(1,1,\det)\,\mathbf{U}^\top$ & \cref{thm:pc-svd} \\
+四元数解 \cref{eq:pc-q-star} & $\mathbf{N}$ 最大特征值的特征向量 & \cref{thm:pc-horn} \\
+ICP 收敛 \cref{eq:pc-monotone} & $0\le d_{k+1}\le e_k\le d_k$ 单调下降 & \cref{thm:pc-convergence} \\
+Wahba 唯一性 \cref{thm:pc-wahba-cases} & 解唯一 $\iff$ 最小奇异值不重根、$\mathbf{H}$ 满秩 & \cref{sec:pc-icp-uniqueness} \\
+唯一性充分条件 \cref{thm:pc-wahba-suff} & 三点不共线 $\Rightarrow$ 惯量阵 $\mathbf{I}_p\succ0$、解唯一 & \cref{sec:pc-icp-uniqueness} \\
+点观测 $\odot$ 雅可比 \cref{eq:pc-track-G} & $\mathbf{G}=[\mathbf{I}\ {-}\mathbf{m}^\wedge]$，$\mathbf{m}=\check{\mathbf{R}}\mathbf{p}+\check{\mathbf{t}}$ & \cref{sec:pc-track-model} \\
+$\SE(3)$-EKF 五式 \cref{alg:pc-track-ekf} & 均值在群、协方差在代数；预测+增益+校正 & \cref{sec:pc-track-ekf} \\
+点到面法方程 \cref{eq:pc-p2plane-normal} & $6\times6$ 线性 LS，行 $[(\mathbf{x}\times\mathbf{n})^\top\ \mathbf{n}^\top]$ & \cref{sec:pc-p2plane-lin} \\
+GICP 代价 \cref{eq:pc-gicp-cost} & 合成协方差逆加权马氏距离 & \cref{thm:pc-svd} \\
+plane-to-plane 协方差 \cref{eq:pc-gicp-cov} & $\mathbf{U}\,\mathrm{diag}(\epsilon,1,1)\,\mathbf{U}^\top$ & \cref{sec:pc-gicp-p2p} \\
+NDT 梯度/海森 \cref{eq:pc-ndt-grad,eq:pc-ndt-hess} & 牛顿法链式求导（三项） & \cref{sec:pc-ndt-newton} \\
+LOAM 曲率 \cref{eq:pc-loam-curv} & 邻居差向量和的归一化模 & \cref{sec:pc-loam-curv} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{cllc}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 点云表示与数据结构 & 无序点集；体素/八叉/KD 树/surfel/BEV & \(\bigstar\bigstar\) \\
+2 & 滤波 / 降采样 & 体素质心、SOR 高斯尾、ROR 局部密度 & \(\bigstar\bigstar\) \\
+3 & KD 树最近邻 & 中位分割 + 回溯剪枝，$O(\log M)$ & \(\bigstar\bigstar\bigstar\) \\
+4 & 点到点 ICP & 去质心 + trace 最大化 + SVD/四元数 + 收敛性 & \(\bigstar\bigstar\bigstar\) \\
+5 & 解的唯一性（选读） & de Ruiter--Forbes case 分析；奇异值重数/秩判退化 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+6 & 点到面 ICP & 小角度线性化 $6\times6$ 法方程，收敛快 & \(\bigstar\bigstar\bigstar\) \\
+7 & GICP & 概率 MLE 统一点/面/分布，plane-to-plane & \(\bigstar\bigstar\bigstar\bigstar\) \\
+8 & NDT & cell 高斯 + 牛顿法，免对应 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+9 & LOAM 特征 & 曲率定义、边/面残差、特征 ICP & \(\bigstar\bigstar\bigstar\) \\
+10 & 配准范式 / 六阶段 & scan-to-scan/map；ICP 算法族选型 & \(\bigstar\bigstar\) \\
+11 & $\SE(3)$ 上跟踪已知点 & 点观测 $\odot$ 雅可比；$\SE(3)$ 上 GN 与 EKF 五式 & \(\bigstar\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{广度与现代视角}：SLAM Handbook\cite{carlone2026handbook} 第 8 章——LiDAR 里程计/建图的系统综述（点云配准在系统中的位置、运动去畸变、scan-to-map、位置识别）。
+  \item \textbf{ICP 奠基}：Besl \& McKay\cite{besl1992icp}（PAMI 1992）——ICP 算法、最近点算子、单调收敛定理；Horn\cite{horn1987absolute}（JOSA-A 1987）——四元数闭式绝对定向；Arun 等\cite{arun1987leastsquares}（PAMI 1987）——SVD 闭式解。
+  \item \textbf{点到平面与变体}：Chen \& Medioni\cite{chen1992pointplane}——点到平面度量；Low\cite{low2004p2plane}（TR04-004）——小角度线性化完整推导；Rusinkiewicz \& Levoy\cite{rusinkiewicz2001efficient}（3DIM 2001）——ICP 六阶段分类与加速。
+  \item \textbf{概率配准}：Segal 等\cite{segal2009gicp}（RSS 2009）——Generalized-ICP；Biber \& Straßer\cite{biber2003ndt}（IROS 2003）与 Magnusson\cite{magnusson2009ndt}（PhD 2009）——NDT 的 2D/3D 完整推导。
+  \item \textbf{鲁棒配准前沿}：TEASER\cite{yang2021teaser}（arXiv:2001.07715）——截断最小二乘 + 半定松弛的可证鲁棒配准；CPD\cite{myronenko2010cpd}——相干点漂移的 GMM-EM 配准。
+  \item \textbf{LiDAR 特征与系统}：Zhang \& Singh\cite{zhang2014loam}（RSS 2014）——LOAM 曲率特征与实时里程计（完整系统见 \cref{ch:lidar_slam}）。
+  \item \textbf{工具实践}：PCL\cite{rusu2011pcl}——VoxelGrid/SOR/ICP/GICP/NDT 的开源实现与官方教程。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+后续章节 & 关系 & 本章铺垫 \\
+\midrule
+\cref{ch:lidar_slam} 激光 SLAM & LOAM/LIO-SAM/FAST-LIO 系统 & ICP/特征/KD 树/scan-to-map、去畸变指引 \\
+\cref{ch:radar} 雷达 SLAM & 低分辨率含噪点云配准（CFEAR/APDGICP） & GICP/NDT 的稳健化变体直接复用本章内核 \\
+\cref{ch:vo} 视觉里程计 & RGB-D 点云配准、ICP 位姿求解 & 点到点/点到面 ICP、右扰动雅可比 \\
+\cref{ch:vio} VIO & 点云配准的不确定度与融合 & GICP 协方差、马氏加权 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.22\textwidth} p{0.24\textwidth} p{0.30\textwidth} p{0.14\textwidth}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+ICP 收敛到错误位姿 & 初值差、陷局部极小 & 1.可视化初始对齐 2.加粗配准/里程计先验 3.coarse-to-fine 调 $d_{\max}$ & \cref{thm:pc-convergence} \\
+配准结果是镜像/穿模 & SVD 解漏行列式修正 & 检查 $\det\mathbf{R}$，负则用 \cref{eq:pc-R-svd-fix} 或改四元数解 & \cref{thm:pc-svd} \\
+点到面 ICP 不收敛 & 法向未估或朝向乱 & 1.对 target 估法向 2.统一朝向 3.可视化法向场 & \cref{sec:pc-p2plane} \\
+KD 树返回错误最近邻 & 只下降不回溯剪枝 & 用暴力扫描对拍；检查判据 \cref{eq:pc-kd-prune} & \cref{alg:pc-kdnn} \\
+NDT 发散 & 初值差或体素分辨率不当 & 1.给里程计先验 2.检查有效 cell（点 $\ge6$）占比 3.多分辨率 & \cref{sec:pc-ndt} \\
+远处有效点被 SOR 误删 & 近密远疏违反高斯假设 & 先体素降采样均匀化再 SOR；或按距离自适应门限 & \cref{sec:pc-sor} \\
+LOAM 选错边/面特征 & 曲率阈值不匹配传感器 & 重调 $c_{th}$/取点上限；可视化特征点；或改直接法 & \cref{sec:pc-loam} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{API 速查表}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.42\textwidth} p{0.50\textwidth}}
+\toprule
+PCL / Eigen API & 用途 / 注意 \\
+\midrule
+\texttt{pcl::VoxelGrid::setLeafSize(lx,ly,lz)} & 体素降采样，叶尺寸（米）；每体素取质心 \\
+\texttt{pcl::StatisticalOutlierRemoval} & SOR 去噪，\texttt{setMeanK(50)}/\texttt{setStddevMulThresh(1.0)} \\
+\texttt{pcl::RadiusOutlierRemoval} & ROR 去噪，\texttt{setRadiusSearch}/\texttt{setMinNeighborsInRadius} \\
+\texttt{pcl::KdTreeFLANN::nearestKSearch} & KD 树 kNN（封装 FLANN）；高维退化用 ANN \\
+\texttt{pcl::IterativeClosestPoint} & 点到点 ICP，\texttt{setMaxCorrespondenceDistance}=$d_{\max}$ \\
+\texttt{pcl::GeneralizedIterativeClosestPoint} & GICP，\texttt{setCorrespondenceRandomness(20)}=$k$ 近邻 \\
+\texttt{pcl::NormalDistributionsTransform} & NDT，\texttt{setResolution}/\texttt{setStepSize}/\texttt{setMaximumIterations} \\
+\texttt{Eigen::JacobiSVD} & 解 SVD 闭式旋转；记得 $\det$ 修正 \\
+\bottomrule
+\end{tabular}
+\end{table}

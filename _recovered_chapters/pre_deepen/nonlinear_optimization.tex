@@ -1,0 +1,1116 @@
+\chapter{非线性优化}
+\label{ch:nlopt}
+
+% ════════════════════════════════════════════════════════════════
+%  P1 收尾章·全吸收范本：吸收
+%  十四讲6(1027): MAP→最小二乘全推导/SD-牛顿-GN-LM 逐步/曲线拟合手写GN·Ceres·g2o 三完整例
+%  Barfoot4(03ext): Newton/GN 两推导/H≈JᵀJ 来由与缺陷/line search+LM/正规方程(误差形式)
+%                    /白化Cholesky/Laplace=逆Hessian协方差/批量块结构/ML+Box(1971)偏差/SWF边缘化=Schur
+%  Barfoot5(04ext): M-估计(L2/Cauchy/GM)/IRLS/鲁棒=逆Wishart先验MAP/RANSAC/NEES-NIS/协方差估计
+%  Handbook1(hb_01): 因子图→MAP→NLS/白化/Cholesky-vs-QR/√SAM/稀疏=fill-in/COLAMD/变量消元=分解/Bayes树·iSAM
+%  右扰动为主；教学层遵循 v5.0 理论教学规范（动机→反面→历史→理论→陷阱→练习 + 符号表/速查/故障排查）。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 上一章把 SLAM 化成最小二乘 $\min_{\mathbf{x}}\tfrac12\sum_i\|\mathbf{e}_i\|^2$，但 $\mathbf{e}_i$ 非线性时为何不能像线性情形那样一步解出？（答错 $\to$ \cref{sec:nlopt-why}）
+  \item 高斯牛顿法用什么近似牛顿法的海森矩阵？这个近似什么时候站得住、什么时候崩？（答错 $\to$ \cref{sec:nlopt-gn}）
+  \item 列文伯格–马夸尔特的阻尼项 $\lambda$ 调大调小，分别让算法更像哪种方法？什么是“增益比 $\rho$”？（答错 $\to$ \cref{sec:nlopt-lm}）
+  \item 解 $\boldsymbol{\Lambda}\Delta\mathbf{x}=\mathbf{b}$ 时，Cholesky 与 QR 各有什么优劣？为什么绝不直接求 $\boldsymbol{\Lambda}^{-1}$？（答错 $\to$ \cref{sec:nlopt-solve}）
+  \item BA 的信息矩阵高达上万维，为什么还能实时求解？“Schur 消元 / 边缘化 / fill-in” 各指什么？（答错 $\to$ \cref{sec:nlopt-sparse}）
+  \item 一个误匹配（外点）会怎样毁掉最小二乘？“鲁棒核函数”如何补救，它和概率（逆 Wishart 先验）有什么关系？（答错 $\to$ \cref{sec:nlopt-robust}）
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{推导}从最大后验（MAP）到加权最小二乘的完整链条，说清高斯假设在哪一步、独立性假设在哪一步被用到；
+  \item \textbf{推导}最速下降、牛顿、高斯牛顿三种增量方程，解释 GN 用 $\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ 近似海森的依据（丢掉哪一项）与失效情形；
+  \item \textbf{掌握}列文伯格–马夸尔特/信赖域，理解 $\lambda$ 如何在高斯牛顿与最速下降间插值、增益比 $\rho$ 如何接受/拒绝步并调 $\lambda$；
+  \item \textbf{选择}解正规方程的数值方法（白化、Cholesky 与 QR、平方根信息 $\sqrt{}$SAM），并说清它们的复杂度与数值稳定性差别；
+  \item \textbf{利用}稀疏性：把 BA 的信息矩阵按因子图结构做 Schur 消元/变量消元，把代价从 $O(n^3)$ 降到 $O(\text{相机}^3)$，并解释 fill-in 与 COLAMD；
+  \item \textbf{在流形上优化}：用右扰动把位姿增量定义为 $\mathbf{T}\,\mathrm{Exp}(\Delta\boldsymbol{\xi})$，对接 \cref{ch:lie} 与求解器；
+  \item \textbf{鲁棒化}：用 M-估计/鲁棒核 $+$ IRLS 抑制外点，并\emph{证明}“鲁棒核 $=$ 某协方差逆 Wishart 先验下的 MAP”；
+  \item \textbf{提取不确定度}：收敛后由拉普拉斯近似得逆海森即后验协方差（与克拉默–拉奥下界的关系），并判断估计是否一致（NEES/NIS）；
+  \item \textbf{运行}手写高斯牛顿、Ceres、g2o 三套完整曲线拟合例并对比。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章主线：\emph{怎么解}上一章立起来的最小二乘——从 MAP 立目标，到迭代下降、高斯牛顿/LM，到数值分解与利用稀疏结构、流形右扰动，再到鲁棒化、协方差与一致性，最后落到三套软件实践。
+
+\begin{center}
+\small
+\begin{tikzpicture}[node distance=6mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (map) {MAP\\{\scriptsize $\to$最小二乘}};
+\node[blk, right=of map] (iter) {迭代下降\\{\scriptsize 梯度/牛顿}};
+\node[blk, right=of iter] (gn) {高斯牛顿\\{\scriptsize $\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$}};
+\node[blk, right=of gn] (lm) {LM·信赖域\\{\scriptsize $\rho,\lambda$}};
+\node[grp, below=of lm] (solve) {白化·Cholesky/QR\\{\scriptsize $\sqrt{}$SAM}};
+\node[grp, left=of solve] (sparse) {稀疏·Schur·消元\\{\scriptsize COLAMD}};
+\node[grp, left=of sparse] (man) {流形优化\\{\scriptsize 右扰动}};
+\node[grp, left=of man] (robust) {鲁棒核·IRLS\\{\scriptsize 逆Wishart}};
+\node[blk, below=of robust, fill=third!8, draw=third!60!black] (cov) {协方差\\{\scriptsize Laplace·NEES}};
+\node[blk, right=of cov, fill=third!8, draw=third!60!black] (code) {实践\\{\scriptsize Ceres/g2o}};
+\draw[ln] (map)--(iter); \draw[ln] (iter)--(gn); \draw[ln] (gn)--(lm);
+\draw[ln] (lm)--(solve);
+\draw[ln] (solve)--(sparse); \draw[ln] (sparse)--(man); \draw[ln] (man)--(robust);
+\draw[ln] (robust)--(cov); \draw[ln] (cov)--(code);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径（骨干 / 次优 / 前沿）}：
+\emph{骨干}（任何读者必跟）= 第 1--4 节（MAP$\to$最小二乘$\to$迭代$\to$GN$\to$LM）与第 5--6 节（数值分解 $+$ 稀疏 Schur/消元），后端、BA、VIO 反复用；
+\emph{次优}（够用即可）= 第 7 节流形右扰动（细节已在 \cref{ch:lie}）、第 9 节协方差与一致性、第 10 节软件实践；
+\emph{前沿/选读}（点到为止）= 第 8 节“鲁棒 $=$ 逆 Wishart 先验 MAP”的完整证明、第 9 节 ML 偏差闭式、附录的连续时间与 SWF 边缘化。带 $\star$ 的小节为进阶。
+
+\subsection*{前置知识桥接}
+\cref{ch:slam_est} 把 SLAM 钉成 $\min_{\mathbf{x}}J(\mathbf{x})=\tfrac12\sum_i\|\mathbf{e}_i\|_{\boldsymbol{\Sigma}_i}^2$ 并给了\emph{线性}情形的正规方程；本章解其\emph{非线性}版。\cref{ch:eskf} 已埋两处伏笔：“EKF $\approx$ 优化的一次迭代”、“IEKF $=$ 单时刻的高斯牛顿”——本章把“优化”讲透并\emph{证明}这两条。位姿增量用 \cref{ch:lie} 的右扰动 $\mathbf{T}\,\mathrm{Exp}(\Delta\boldsymbol{\xi})$ 与右扰动雅可比。概率基元（高斯密度、贝叶斯法则、马氏距离、边缘化/条件化）见 \cref{ch:slam_est}，本章在用到处会就地重述，无需翻回。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你能写出 BA/位姿图的目标函数，却\emph{解不动}它——不知道 GN/LM、不知道如何用稀疏 Schur 把上万维问题压到可实时；
+  \item Ceres/g2o/GTSAM 里的 \texttt{LinearSolver}、\texttt{RobustKernel}、\texttt{LocalParameterization}、\texttt{SPARSE\_SCHUR} 会像黑话；
+  \item 真实数据里一条误匹配就能把整条轨迹拉飞，而你不知道鲁棒核为何有效、为何不是“黑魔法”；
+  \item 你将无法理解 \cref{ch:vo}、\cref{ch:vio} 后端“为什么这样建图、这样求解、这样估协方差”。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导、例与练习） & 6--8 小时 & 要写/调 BA、位姿图、VIO 后端 \\
+速读（跳过 QR/消元/ML 偏差细节） & 2--3 小时 & 已懂 GN/LM、想抓稀疏 Schur 与右扰动 \\
+速查（只看小结三张表 $+$ 算法卡） & 15 分钟 & 写代码时回来查公式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+目标 $J(\mathbf{x})=\tfrac12\sum_i\|\mathbf{e}_i\|_{\boldsymbol{\Sigma}_i}^2=\tfrac12\mathbf{e}(\mathbf{x})^\top\mathbf{W}^{-1}\mathbf{e}(\mathbf{x})$，权 $\mathbf{W}=\operatorname{diag}(\boldsymbol{\Sigma}_i)$（取协方差时即马氏距离/负对数似然）。\emph{残差} $\mathbf{e}(\mathbf{x})$、其\emph{雅可比} $\mathbf{J}=\partial\mathbf{e}/\partial\mathbf{x}$；目标的梯度记 $\nabla J$、海森记 $\mathbf{H}_J$（以区别于残差雅可比 $\mathbf{J}$）。增量 $\Delta\mathbf{x}$（或李代数语境记 $\delta\mathbf{x}$）；信息矩阵 $\boldsymbol{\Lambda}=\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$。鲁棒核 $\rho$。先验 $\check{\mathbf{x}},\check{\mathbf{P}}$；后验 $\hat{\mathbf{x}},\hat{\mathbf{P}}$；线性化工作点 $\mathbf{x}_{\mathrm{op}}$。
+\textbf{流形约定}：当 $\mathbf{x}$ 含位姿时，更新用\emph{右扰动} $\mathbf{x}\leftarrow\mathbf{x}\boxplus\Delta\mathbf{x}$，位姿部分即 $\mathbf{T}\leftarrow\mathbf{T}\,\mathrm{Exp}(\Delta\boldsymbol{\xi})$（\cref{ch:lie}）。
+
+\textbf{跨书记号差异（务必先看，三书在此打架）}：
+（1）十四讲\cite{gaoxiang2019slam14} §6.2 把残差雅可比 $\mathbf{J}$ 定义为\emph{列向量}（标量残差的梯度），故写海森近似 $\mathbf{H}\approx\mathbf{J}\mathbf{J}^\top$、正规方程 $\mathbf{J}\mathbf{J}^\top\Delta\mathbf{x}=-\mathbf{J}f$；本书与多数文献（Ceres/g2o）把 $\mathbf{J}=\partial\mathbf{e}/\partial\mathbf{x}$ 当\emph{矩阵}（行$=$残差维、列$=$状态维），写 $\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$。两者“矩阵相同、符号互为转置”，本书统一用矩阵约定。
+（2）十四讲把运动噪声协方差记 $R_k$、观测噪声协方差记 $Q_{k,j}$（与卡尔曼惯例\emph{相反}！）；Barfoot\cite{barfoot2024state} 用 $\mathbf{Q}$（过程）/$\mathbf{R}$（观测）。本书统一 $\boldsymbol{\Sigma}_w$（过程）/$\boldsymbol{\Sigma}_v$（观测），把字母 $\mathbf{R}$ 留给旋转。
+（3）Barfoot 记 $\mathbf{H}=-\partial\mathbf{e}/\partial\mathbf{x}$（含负号），与本书 $\mathbf{J}=\partial\mathbf{e}/\partial\mathbf{x}$ 差一负号（不影响正规方程，因左右各出现偶数次）；Handbook\cite{carlone2026handbook} 把白化雅可比记 $\mathbf{A}$、Cholesky 上三角因子也记 $\mathbf{R}$（与旋转撞名，本书该处改记 $\mathbf{U}$ 并显式说明）。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{从最大后验到最小二乘}
+\label{sec:nlopt-map}
+
+\paragraph{动机：噪声让方程不再精确成立。}
+经典 SLAM 模型由运动方程与观测方程组成\cite{gaoxiang2019slam14}：
+\begin{equation}
+  \begin{cases}
+    \mathbf{x}_k=f(\mathbf{x}_{k-1},\mathbf{u}_k)+\mathbf{w}_k, & \mathbf{w}_k\sim\mathcal{N}(\mathbf{0},\boldsymbol{\Sigma}_{w,k}),\\
+    \mathbf{z}_{k,j}=h(\mathbf{y}_j,\mathbf{x}_k)+\mathbf{v}_{k,j}, & \mathbf{v}_{k,j}\sim\mathcal{N}(\mathbf{0},\boldsymbol{\Sigma}_{v,k,j}),
+  \end{cases}
+  \label{eq:nlopt-slam-model}
+\end{equation}
+其中 $\mathbf{x}_k$ 是相机位姿（可用 $\mathbf{T}_k\in\SE(3)$ 表达），$\mathbf{y}_j$ 是路标，$\mathbf{z}_{k,j}$ 是像素观测，$\mathbf{u}_k$ 是输入。观测方程对针孔相机即 $s\,\mathbf{z}_{k,j}=\mathbf{K}(\mathbf{R}_k\mathbf{y}_j+\mathbf{t}_k)$（$\mathbf{K}$ 为内参，$s$ 为深度，即 $\mathbf{R}_k\mathbf{y}_j+\mathbf{t}_k$ 的第三分量，\cref{ch:camera}）。因噪声 $\mathbf{w},\mathbf{v}$ 存在，等式\emph{必不精确成立}——即便高精度相机也只是近似。于是与其“假设数据必须符合方程”，不如问：\emph{如何在带噪数据里做准确的状态估计}\cite{gaoxiang2019slam14}。
+
+\paragraph{反面：不带概率地“硬解”会怎样。}
+若直接把 \cref{eq:nlopt-slam-model} 当作等式联立求解，方程数（观测数）通常远多于未知数，系统超定且互相矛盾（每个噪声把对应方程顶歪一点），\emph{无解}。强行取某个“折中”又缺乏依据——凭什么相信这条观测多于那条？答案是\emph{按不确定度加权}：观测越准（协方差越小、信息越大），它说话越算数。这正是下面 MAP$\to$最小二乘要给出的、有概率依据的“加权折中”。
+
+\paragraph{历史：从 Gauss 的最小二乘到 SLAM 的 MAP。}
+最小二乘可追到 Gauss（1795，行星轨道拟合）与 Legendre（1805）。把它放进贝叶斯框架（先验$\times$似然$=$后验、最大化后验）是现代状态估计的主线；Barfoot\cite{barfoot2024state} 与 Handbook\cite{carlone2026handbook,dellaert2017factor} 都以 MAP 为起点。SLAM 后端今天普遍采用\emph{批量}最大后验/最大似然，而非历史上的滤波\cite{gaoxiang2019slam14}。
+
+\paragraph{两种处理方式（三书共识）。}\cite{gaoxiang2019slam14,barfoot2024state}
+\begin{itemize}
+  \item \textbf{增量/滤波（incremental）}：数据随时间到来，持当前估计、用新数据更新（EKF 及衍生）。只关心当前时刻 $\mathbf{x}_k$。
+  \item \textbf{批量（batch）}：把 $0\sim k$ 全部输入与观测“攒”起来一并处理，估计整条轨迹与地图。在更大范围内最优化，被认为优于传统滤波\cite{gaoxiang2019slam14}，是当前主流；极端是离线 SfM。
+  \item \textbf{折中}：固定历史、只对当前邻近的若干轨迹优化——\emph{滑动窗口估计}（\cref{sec:nlopt-appendix} 的 SWF）。
+\end{itemize}
+本章以批量非线性优化为主。
+
+\paragraph{核心推导：MAP$\to$加权最小二乘（逐步，无跳步）。}
+设全部时刻状态 $\mathbf{x}=\{\mathbf{x}_1,\dots,\mathbf{x}_N\}$、路标 $\mathbf{y}=\{\mathbf{y}_1,\dots,\mathbf{y}_M\}$。状态估计 $=$ 求后验 $P(\mathbf{x},\mathbf{y}\mid\mathbf{z},\mathbf{u})$\cite{gaoxiang2019slam14}。直接求整个分布难，但求其\emph{峰值}（最大后验，MAP）可行。用贝叶斯法则（\cref{thm:nlopt-map}）。
+
+\begin{theorem}[MAP $\Rightarrow$ 加权最小二乘]\label{thm:nlopt-map}
+高斯先验 $+$ 高斯（加性）观测噪声 $+$ 各因子条件独立时，最大后验估计等价于求解
+\begin{equation}
+  \min_{\mathbf{x},\mathbf{y}}\ J=\sum_k\mathbf{e}_{u,k}^\top\boldsymbol{\Sigma}_{w,k}^{-1}\mathbf{e}_{u,k}
+  +\sum_{k,j}\mathbf{e}_{z,k,j}^\top\boldsymbol{\Sigma}_{v,k,j}^{-1}\mathbf{e}_{z,k,j},
+  \label{eq:nlopt-batch-ls}
+\end{equation}
+即\emph{各误差项的马氏距离（信息矩阵加权二次型）之和}最小，其中 $\mathbf{e}_{u,k}=\mathbf{x}_k-f(\mathbf{x}_{k-1},\mathbf{u}_k)$，$\mathbf{e}_{z,k,j}=\mathbf{z}_{k,j}-h(\mathbf{x}_k,\mathbf{y}_j)$。
+\end{theorem}
+\begin{proof}
+\emph{Step 1（贝叶斯法则，丢分母）}。
+\begin{equation}
+  P(\mathbf{x},\mathbf{y}\mid\mathbf{z},\mathbf{u})=\frac{P(\mathbf{z},\mathbf{u}\mid\mathbf{x},\mathbf{y})\,P(\mathbf{x},\mathbf{y})}{P(\mathbf{z},\mathbf{u})}\propto\underbrace{P(\mathbf{z},\mathbf{u}\mid\mathbf{x},\mathbf{y})}_{\text{似然}}\underbrace{P(\mathbf{x},\mathbf{y})}_{\text{先验}}.
+  \label{eq:nlopt-bayes}
+\end{equation}
+分母 $P(\mathbf{z},\mathbf{u})$ 与待估状态无关，求 $\arg\max$ 时可丢。故 $\arg\max$ 后验 $=\arg\max(\text{似然}\times\text{先验})$。无先验信息（取均匀先验）时退化为最大似然 $\arg\max P(\mathbf{z},\mathbf{u}\mid\mathbf{x},\mathbf{y})$。Handbook\cite{carlone2026handbook} 与本式同形（其 $\mathbf{x}^{\text{MAP}}=\arg\max p(\mathbf{z}\mid\mathbf{x})p(\mathbf{x})$）。
+
+\emph{Step 2（取负对数，把“最大化乘积”变“最小化求和”）}。$N$ 维高斯密度
+\begin{equation}
+  P(\mathbf{a})=\frac{1}{\sqrt{(2\pi)^N\det\boldsymbol{\Sigma}}}\exp\!\Big(-\tfrac12(\mathbf{a}-\boldsymbol{\mu})^\top\boldsymbol{\Sigma}^{-1}(\mathbf{a}-\boldsymbol{\mu})\Big),
+  \label{eq:nlopt-gauss}
+\end{equation}
+取负对数
+\begin{equation}
+  -\ln P(\mathbf{a})=\tfrac12\ln\big((2\pi)^N\det\boldsymbol{\Sigma}\big)+\tfrac12(\mathbf{a}-\boldsymbol{\mu})^\top\boldsymbol{\Sigma}^{-1}(\mathbf{a}-\boldsymbol{\mu}).
+  \label{eq:nlopt-neglog}
+\end{equation}
+对数单调递增，故\emph{最大化 $P$} $=$ \emph{最小化 $-\ln P$}。第一项 $\tfrac12\ln((2\pi)^N\det\boldsymbol{\Sigma})$ 与待估量无关、可略，\textbf{只剩右侧二次型}。
+
+\emph{Step 3（单次观测的二次型）}。观测 $\mathbf{z}_{k,j}=h(\mathbf{y}_j,\mathbf{x}_k)+\mathbf{v}_{k,j}$、$\mathbf{v}\sim\mathcal{N}(\mathbf{0},\boldsymbol{\Sigma}_{v,k,j})$ 给出 $P(\mathbf{z}_{k,j}\mid\mathbf{x}_k,\mathbf{y}_j)=\mathcal{N}(h(\mathbf{y}_j,\mathbf{x}_k),\boldsymbol{\Sigma}_{v,k,j})$，于是单次最大似然
+\begin{equation}
+  (\mathbf{x}_k,\mathbf{y}_j)^*=\arg\min\ \big(\mathbf{z}_{k,j}-h(\mathbf{x}_k,\mathbf{y}_j)\big)^\top\boldsymbol{\Sigma}_{v,k,j}^{-1}\big(\mathbf{z}_{k,j}-h(\mathbf{x}_k,\mathbf{y}_j)\big),
+  \label{eq:nlopt-mahal}
+\end{equation}
+即\emph{马哈拉诺比斯距离}（马氏距离），也可看作由\emph{信息矩阵} $\boldsymbol{\Sigma}^{-1}$ 加权的欧氏距离\cite{gaoxiang2019slam14}。
+
+\emph{Step 4（独立性因式分解）}。设各时刻输入、观测相互独立（且输入与观测独立）：
+\begin{equation}
+  P(\mathbf{z},\mathbf{u}\mid\mathbf{x},\mathbf{y})=\prod_k P(\mathbf{u}_k\mid\mathbf{x}_{k-1},\mathbf{x}_k)\prod_{k,j}P(\mathbf{z}_{k,j}\mid\mathbf{x}_k,\mathbf{y}_j).
+  \label{eq:nlopt-factorize}
+\end{equation}
+
+\emph{Step 5（合并）}。对 \cref{eq:nlopt-factorize} 取负对数：乘积变求和，每项按 Step 2--3 化为二次型，与状态无关的常数项丢弃，定义误差 $\mathbf{e}_{u,k},\mathbf{e}_{z,k,j}$，即得 \cref{eq:nlopt-batch-ls}。其解等价于状态的最大似然/最大后验估计。\hfill$\square$
+\end{proof}
+
+\begin{insight}
+\cref{thm:nlopt-map} 的链条是全书估计的“总纲”：\textbf{高斯} $\Rightarrow$ 负对数是二次型（最小二乘）；\textbf{独立} $\Rightarrow$ 二次型可拆成一项项之和（稀疏，\cref{sec:nlopt-sparse}）；\textbf{信息矩阵加权} $\Rightarrow$ 越准的观测权重越大。换言之，最小二乘不是凑出来的损失，而是“在高斯独立假设下，找最可能产生这批观测的状态”。
+\end{insight}
+
+\paragraph{SLAM 最小二乘的三个结构特点（十四讲，逐条）。}\cite{gaoxiang2019slam14}
+（1）目标由许多误差项的加权二次型组成；总维数很高，但\emph{每项只与一两个变量有关}（运动误差只连 $\mathbf{x}_{k-1},\mathbf{x}_k$；观测误差只连 $\mathbf{x}_k,\mathbf{y}_j$）——这带来\emph{稀疏}结构（\cref{sec:nlopt-sparse}）。
+（2）用李代数表示增量则问题\emph{无约束}；用 $\mathbf{R},\mathbf{T}$ 直接当变量则带约束 $\mathbf{R}^\top\mathbf{R}=\mathbf{I},\det\mathbf{R}=1$，优化困难——这正是 \cref{ch:lie} 右扰动的价值（\cref{sec:nlopt-manifold}）。
+（3）二次型度量误差时，误差分布决定权重；但这种二次度量\emph{对外点极敏感}（\cref{sec:nlopt-robust}）——十四讲在此埋下鲁棒核的伏笔。
+
+\paragraph{例：线性系统的批量 MAP 有闭式（十四讲 §6.1.3，全录）。}\cite{gaoxiang2019slam14}
+沿 $x$ 轴运动的小车，运动 $\mathbf{x}_k=\mathbf{x}_{k-1}+\mathbf{u}_k+\mathbf{w}_k$（$\mathbf{w}_k\sim\mathcal{N}(0,\boldsymbol{\Sigma}_{w,k})$）、观测 $\mathbf{z}_k=\mathbf{x}_k+\mathbf{n}_k$（$\mathbf{n}_k\sim\mathcal{N}(0,\boldsymbol{\Sigma}_{v,k})$），$k=1,2,3$，初值 $\mathbf{x}_0$ 已知。批量变量 $\mathbf{x}=[\mathbf{x}_0,\mathbf{x}_1,\mathbf{x}_2,\mathbf{x}_3]^\top$。误差 $\mathbf{e}_{u,k}=\mathbf{x}_k-\mathbf{x}_{k-1}-\mathbf{u}_k$、$\mathbf{e}_{z,k}=\mathbf{z}_k-\mathbf{x}_k$，目标 $\min\sum_k\mathbf{e}_{u,k}^\top\boldsymbol{\Sigma}_{w,k}^{-1}\mathbf{e}_{u,k}+\sum_k\mathbf{e}_{z,k}^\top\boldsymbol{\Sigma}_{v,k}^{-1}\mathbf{e}_{z,k}$。因系统\emph{线性}，可写成 $\mathbf{y}-\mathbf{H}\mathbf{x}=\mathbf{e}\sim\mathcal{N}(\mathbf{0},\boldsymbol{\Sigma})$，其中（上块为运动、下块为观测）
+\begin{equation}
+  \mathbf{H}=\begin{bmatrix}
+  1&-1&0&0\\ 0&1&-1&0\\ 0&0&1&-1\\
+  0&1&0&0\\ 0&0&1&0\\ 0&0&0&1
+  \end{bmatrix},\qquad
+  \boldsymbol{\Sigma}=\operatorname{diag}(\boldsymbol{\Sigma}_{w,1},\boldsymbol{\Sigma}_{w,2},\boldsymbol{\Sigma}_{w,3},\boldsymbol{\Sigma}_{v,1},\boldsymbol{\Sigma}_{v,2},\boldsymbol{\Sigma}_{v,3}).
+  \label{eq:nlopt-linear-H}
+\end{equation}
+于是 $\mathbf{x}^*_{\text{map}}=\arg\min\mathbf{e}^\top\boldsymbol{\Sigma}^{-1}\mathbf{e}$，唯一解即\emph{加权（广义）最小二乘}正规方程的解：
+\begin{equation}
+  \mathbf{x}^*_{\text{map}}=(\mathbf{H}^\top\boldsymbol{\Sigma}^{-1}\mathbf{H})^{-1}\mathbf{H}^\top\boldsymbol{\Sigma}^{-1}\mathbf{y}.
+  \label{eq:nlopt-gls}
+\end{equation}
+（推导：$\min\|\boldsymbol{\Sigma}^{-1/2}(\mathbf{y}-\mathbf{H}\mathbf{x})\|^2$ 对 $\mathbf{x}$ 求导置零，$\mathbf{H}^\top\boldsymbol{\Sigma}^{-1}(\mathbf{H}\mathbf{x}-\mathbf{y})=\mathbf{0}$，即得。无权版即十四讲习题 1 的 $\mathbf{x}=(\mathbf{A}^\top\mathbf{A})^{-1}\mathbf{A}^\top\mathbf{b}$。）\textbf{线性高斯时一步出解，无需迭代}——这正是下一节要打破的“非线性”假设。
+
+\begin{pitfall}[概念误区：把 MAP 的“峰值”当成后验的“均值”]
+MAP 给的是后验\emph{众数（mode/峰值）}，不是\emph{均值（mean）}。线性高斯时后验恰为高斯、众数$=$均值，两者重合；\emph{一旦观测模型非线性，后验不再对称，众数 $\neq$ 均值}\cite{barfoot2024state}。Barfoot 的立体相机例（深度 $y=fb/x+n$）显示：即便先验与噪声都高斯，后验也被非线性\emph{掰歪}成不对称。本章一切 GN/LM 求的都是\emph{众数}（MAP）；要均值得用采样/sigma 点（\cref{ch:eskf}）。这也是“MAP/最大似然\emph{有偏}”的根（\cref{sec:nlopt-cov} 的 ML 偏差）。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：以为“信息矩阵加权”可有可无]
+有人把 \cref{eq:nlopt-mahal} 里的 $\boldsymbol{\Sigma}^{-1}$ 当装饰、直接用裸欧氏 $\|\mathbf{z}-h\|^2$。后果：量纲不同的观测（像素 vs 米 vs 弧度）被错误地等权相加，单位大的项主导一切；各向异性噪声（如纵向比横向准）的方向信息全丢。正确做法是\emph{白化}（\cref{sec:nlopt-solve}）：左乘 $\boldsymbol{\Sigma}^{-1/2}$ 把马氏范数化成标准欧氏范数，量纲与各向异性都被吸收。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导，草稿纸）完整重做 \cref{thm:nlopt-map} 的 Step 2--5，特别说明“对数单调”和“常数项可略”分别用在哪一步。答案要点：单调用于把 $\arg\max P$ 换成 $\arg\min(-\ln P)$；常数项 $\tfrac12\ln((2\pi)^N\det\boldsymbol{\Sigma})$ 不含 $\mathbf{x}$ 故不影响 $\arg\min$。
+  \item 证明超定线性方程 $\mathbf{A}\mathbf{x}=\mathbf{b}$ 的最小二乘解为 $\mathbf{x}=(\mathbf{A}^\top\mathbf{A})^{-1}\mathbf{A}^\top\mathbf{b}$（即 \cref{eq:nlopt-gls} 无权版）。要点：$\min\|\mathbf{A}\mathbf{x}-\mathbf{b}\|^2$ 求导得 $2\mathbf{A}^\top(\mathbf{A}\mathbf{x}-\mathbf{b})=\mathbf{0}$。
+  \item （概念）若把上例 \cref{eq:nlopt-linear-H} 的小车运动改成 $\mathbf{x}_k=\cos(\mathbf{x}_{k-1})+\mathbf{u}_k+\mathbf{w}_k$，\cref{eq:nlopt-gls} 还成立吗？为什么？（答错 $\to$ \cref{sec:nlopt-why}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么要迭代}
+\label{sec:nlopt-why}
+
+\paragraph{问题：非线性最小二乘。}
+把 \cref{thm:nlopt-map} 的目标简记为
+\begin{equation}
+  \min_{\mathbf{x}}\ J(\mathbf{x})=\tfrac12\big\|\mathbf{e}(\mathbf{x})\big\|^2=\tfrac12\sum_i\|\mathbf{e}_i(\mathbf{x})\|_{\boldsymbol{\Sigma}_i}^2,
+  \label{eq:nls}
+\end{equation}
+其中 $\mathbf{e}(\mathbf{x})$ 堆叠所有（经信息矩阵加权的）残差。系数 $\tfrac12$ 只为求导方便、不影响最优解。
+
+\paragraph{为什么不能一步解出。}
+解析路线是令 $\mathrm{d}J/\mathrm{d}\mathbf{x}=\mathbf{0}$ 求驻点\cite{gaoxiang2019slam14}。$\mathbf{e}$ \emph{线性}时这是线性方程（正规方程），可直接解（\cref{eq:nlopt-gls}）；$\mathbf{e}$ \emph{非线性}时（相机投影、李群位姿、$\cos/\mathrm{atan2}$ 等），该方程一般\emph{无闭式解}，且求它需要知道目标函数的\emph{全局}性质，而这通常不可能。解此方程“可能得到极大、极小或鞍点，需逐一比较函数值”——对高维问题不现实。
+
+\paragraph{迭代下降框架（三书一致）。}\cite{gaoxiang2019slam14,carlone2026handbook,barfoot2024state}
+于是改求\emph{局部}下降：从初值出发，反复找一个让目标变小的增量。
+\begin{enumerate}
+  \item 给定初值 $\mathbf{x}_0$；
+  \item 第 $k$ 次迭代，寻找增量 $\Delta\mathbf{x}_k$ 使 $\|\mathbf{e}(\mathbf{x}_k\boxplus\Delta\mathbf{x}_k)\|^2$（即 $J(\mathbf{x}_k\boxplus\Delta\mathbf{x}_k)$）下降；
+  \item 若 $\|\Delta\mathbf{x}_k\|<\varepsilon$（或 $\|\nabla J\|<\varepsilon$），停止；
+  \item 否则更新 $\mathbf{x}_{k+1}=\mathbf{x}_k\boxplus\Delta\mathbf{x}_k$，返回 2。
+\end{enumerate}
+关键在于：每步只需 $\mathbf{e}$ 在当前点的\emph{局部}性质（可线性化），增量的计算就简单很多——“求导函数为零”被换成“不断寻找下降增量”。各算法的差别只在\emph{如何局部近似目标}与\emph{如何据近似求增量}\cite{carlone2026handbook}。更新第 4 步当 $\mathbf{x}$ 含位姿时用右扰动 $\boxplus$（\cref{sec:nlopt-manifold}），普通向量则就是加法 $\mathbf{x}+\Delta\mathbf{x}$。
+
+\begin{pitfall}[初值决定成败]
+非线性优化\emph{几乎所有}迭代法都依赖一个好初值\cite{gaoxiang2019slam14,carlone2026handbook}：目标非凸，初值差极易陷局部极小，甚至发散。Handbook\cite{carlone2026handbook} 提醒：\cref{eq:nls} 一般非凸，局部方法不保证全局最优——这催生了\emph{可证最优（certifiably optimal）}求解器（如位姿图的 SE-Sync，留作前沿）。SLAM 中初值常来自 ICP、PnP、对极几何（\cref{ch:vo}）等几何方法。“写出目标函数”只是一半，“给好初值”是另一半。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 把 \cref{eq:nls} 的“解析法 vs 迭代法”用一句话各自概括，并说明为什么相机重投影残差属于后者。
+  \item （概念）举一个一维非凸 $J(x)$，使从两个不同初值出发的梯度下降收敛到不同极小。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{下降方向：梯度法与牛顿法}
+\label{sec:nlopt-gradient}
+
+把\emph{目标} $J$ 在 $\mathbf{x}_k$ 处二阶泰勒展开（注意是 $J$ 不是残差 $\mathbf{e}$）\cite{gaoxiang2019slam14,barfoot2024state}：
+\begin{equation}
+  J(\mathbf{x}_k+\Delta\mathbf{x})\approx J(\mathbf{x}_k)+\nabla J^\top\Delta\mathbf{x}+\tfrac12\Delta\mathbf{x}^\top\mathbf{H}_J\Delta\mathbf{x},
+  \label{eq:taylor-J}
+\end{equation}
+$\nabla J$ 为梯度、$\mathbf{H}_J$ 为海森（对称，二次近似有良定义极小要求其正定）。
+
+\paragraph{最速下降（一阶梯度法）。}
+只留一阶项 $\nabla J^\top\Delta\mathbf{x}$，要它最负，取反梯度方向
+\begin{equation}
+  \Delta\mathbf{x}^*=-\nabla J\quad(\text{配步长 }\alpha,\ \Delta\mathbf{x}=-\alpha\nabla J).
+  \label{eq:nlopt-sd}
+\end{equation}
+步长 $\alpha$ 可按线搜索或经验定\cite{gaoxiang2019slam14}。一阶近似下目标必降，但\emph{过于贪心、走锯齿路线}，近极小处收敛慢。对 \cref{eq:nls} 的最小二乘目标，把它局部近似为 $J\approx\|\mathbf{A}(\mathbf{x}-\mathbf{x}_k)-\mathbf{b}\|^2$（$\mathbf{A},\mathbf{b}$ 为白化雅可比与残差，\cref{sec:nlopt-solve}），则在 $\mathbf{x}_k$ 处\emph{精确梯度} $\nabla J=-2\mathbf{A}^\top\mathbf{b}$\cite{carlone2026handbook}。
+
+\paragraph{牛顿法（二阶梯度法）。}
+留二阶项、对 $\Delta\mathbf{x}$ 求导置零。对 \cref{eq:taylor-J} 求导：零次项导数为 $\mathbf{0}$，一次项 $\nabla J^\top\Delta\mathbf{x}$ 导数为 $\nabla J$，二次项 $\tfrac12\Delta\mathbf{x}^\top\mathbf{H}_J\Delta\mathbf{x}$ 导数为 $\mathbf{H}_J\Delta\mathbf{x}$（$\mathbf{H}_J$ 对称），令和为零得\emph{牛顿增量方程}
+\begin{equation}
+  \mathbf{H}_J\,\Delta\mathbf{x}^*=-\nabla J.
+  \label{eq:nlopt-newton}
+\end{equation}
+Barfoot\cite{barfoot2024state} 把这写成 $\big(\partial^2 J/\partial\mathbf{x}\partial\mathbf{x}^\top\big|_{\mathbf{x}_{\mathrm{op}}}\big)\delta\mathbf{x}^*=-\big(\partial J/\partial\mathbf{x}\big|_{\mathbf{x}_{\mathrm{op}}}\big)^\top$，并给三点评注：(i) \emph{局部}收敛（初值够近才保证，复杂非线性目标这已是最好期望）；(ii) 收敛率\emph{二次}（远快于梯度下降）；(iii) \emph{难实现}——须算海森 $\mathbf{H}_J$，“问题规模大时非常困难，通常避免”\cite{gaoxiang2019slam14,barfoot2024state}。
+
+\paragraph{两法的通病与出路。}\cite{gaoxiang2019slam14}
+最速下降\emph{贪心、锯齿、慢}；牛顿\emph{要海森、贵}。一般问题可用拟牛顿（用历史梯度近似海森）；而\emph{最小二乘问题}有更省的专用法——高斯牛顿与 LM，它们\emph{不需显式海森}（\cref{sec:nlopt-gn,sec:nlopt-lm}）。
+
+\begin{pitfall}[思维陷阱：把“梯度法/牛顿法/GN”当成线性递进的“越新越好”]
+三者不是“改进链”，而是\emph{不同的局部近似策略}：最速下降用\emph{一阶}近似（只信梯度方向）、牛顿用\emph{完整二阶}（信精确曲率，但要海森）、高斯牛顿用\emph{最小二乘专属的近似二阶}（用 $\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ 替海森）。选哪个要问：能不能算海森？残差是否小？问题是否病态？（强非线性$+$大残差时 GN 的近似海森反而差，见 \cref{sec:nlopt-gn}。）
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:taylor-J} 完整推出 \cref{eq:nlopt-newton}，写清每一项求导。
+  \item （概念）为什么牛顿法在二次函数上\emph{一步}到极小，而最速下降不能？
+  \item 验证最小二乘局部近似下 $\nabla J=-2\mathbf{A}^\top\mathbf{b}$，并说明它与 \cref{eq:gn-normal} 右端的关系。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{高斯牛顿法}
+\label{sec:nlopt-gn}
+
+\paragraph{核心思想：线性化\emph{残差}，而非目标。}
+高斯牛顿（GN）把\emph{残差} $\mathbf{e}(\mathbf{x})$ 一阶展开（这是与牛顿法的关键区别——牛顿展开的是目标 $J$）\cite{gaoxiang2019slam14,barfoot2024state}：
+\begin{equation}
+  \mathbf{e}(\mathbf{x}_k\boxplus\Delta\mathbf{x})\approx\mathbf{e}(\mathbf{x}_k)+\mathbf{J}\Delta\mathbf{x},\qquad \mathbf{J}=\frac{\partial\mathbf{e}}{\partial\mathbf{x}}\bigg|_{\mathbf{x}_k}.
+  \label{eq:gn-linearize}
+\end{equation}
+代回 \cref{eq:nls} 得关于 $\Delta\mathbf{x}$ 的\emph{线性}最小二乘 $\min_{\Delta\mathbf{x}}\tfrac12(\mathbf{e}+\mathbf{J}\Delta\mathbf{x})^\top\mathbf{W}^{-1}(\mathbf{e}+\mathbf{J}\Delta\mathbf{x})$。
+
+\begin{theorem}[高斯牛顿增量方程]\label{thm:gn}
+\cref{eq:gn-linearize} 的最优增量满足
+\begin{equation}
+  \boxed{\ \underbrace{(\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J})}_{\textstyle\boldsymbol{\Lambda}\ \approx\,\text{海森}}\,\Delta\mathbf{x}^*
+  =\underbrace{-\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{e}(\mathbf{x}_k)}_{\textstyle\text{梯度的相反数}}\ }
+  \label{eq:gn-normal}
+\end{equation}
+即“增量方程 / 高斯牛顿方程 / 正规方程”。GN 用 $\boldsymbol{\Lambda}=\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ \emph{近似}牛顿法的海森 $\mathbf{H}_J$，从而\textbf{无需任何二阶导数}。
+\end{theorem}
+\begin{proof}
+\emph{途径一（展开二次型）}\cite{gaoxiang2019slam14}。把 \cref{eq:gn-linearize} 代入 $\tfrac12\|\mathbf{e}+\mathbf{J}\Delta\mathbf{x}\|_{\mathbf{W}}^2$ 并展开：
+\[
+  \tfrac12\big(\mathbf{e}+\mathbf{J}\Delta\mathbf{x}\big)^\top\mathbf{W}^{-1}\big(\mathbf{e}+\mathbf{J}\Delta\mathbf{x}\big)
+  =\tfrac12\Big(\mathbf{e}^\top\mathbf{W}^{-1}\mathbf{e}+2\,\mathbf{e}^\top\mathbf{W}^{-1}\mathbf{J}\Delta\mathbf{x}+\Delta\mathbf{x}^\top\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}\Delta\mathbf{x}\Big).
+\]
+对 $\Delta\mathbf{x}$ 求导置零：$\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{e}+\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}\Delta\mathbf{x}=\mathbf{0}$，即 \cref{eq:gn-normal}。
+
+\emph{途径二（GN 是牛顿法的近似）}\cite{barfoot2024state}。目标 $J=\tfrac12\mathbf{e}^\top\mathbf{W}^{-1}\mathbf{e}$，先白化 $\mathbf{u}=\mathbf{L}\mathbf{e}$（$\mathbf{L}^\top\mathbf{L}=\mathbf{W}^{-1}$，\cref{sec:nlopt-solve}），$J=\tfrac12\mathbf{u}^\top\mathbf{u}$。其精确雅可比与海森（记 $\mathbf{U}=\partial\mathbf{u}/\partial\mathbf{x}$，$u_i$ 为 $\mathbf{u}$ 的分量）：
+\[
+  \frac{\partial J}{\partial\mathbf{x}}=\mathbf{u}^\top\mathbf{U},\qquad
+  \mathbf{H}_J=\frac{\partial^2 J}{\partial\mathbf{x}\partial\mathbf{x}^\top}=\mathbf{U}^\top\mathbf{U}+\sum_{i}u_i\frac{\partial^2 u_i}{\partial\mathbf{x}\partial\mathbf{x}^\top}.
+\]
+\textbf{近似的依据}：在极小附近残差 $u_i$ 小（理想为零），含\emph{残差$\times$二阶导}的第二项相对 $\mathbf{U}^\top\mathbf{U}$ 可忽略，故 $\mathbf{H}_J\approx\mathbf{U}^\top\mathbf{U}$，\emph{不含任何二阶导}。代入牛顿步 \cref{eq:nlopt-newton} 得 $\mathbf{U}^\top\mathbf{U}\,\delta\mathbf{x}^*=-\mathbf{U}^\top\mathbf{u}$；用 $\mathbf{u}=\mathbf{L}\mathbf{e}$、$\mathbf{U}=\mathbf{L}\mathbf{J}$、$\mathbf{L}^\top\mathbf{L}=\mathbf{W}^{-1}$ 回代即 \cref{eq:gn-normal}。
+\hfill$\square$
+\end{proof}
+
+\begin{insight}
+\cref{eq:gn-normal} 与 \cref{ch:slam_est} 的正规方程\emph{同形}——GN 就是“在当前线性化点解一次 \cref{ch:slam_est} 的正规方程，更新，再线性化”，反复迭代。这也兑现了 \cref{ch:eskf} 的两处伏笔：\textbf{EKF $\approx$ GN 的一次迭代}（线性化只做一次、不迭代到收敛）；\textbf{IEKF $=$ 单时刻 MAP 的 GN}（每步把工作点设为上次后验均值、迭代重线性化到收敛——Barfoot\cite{barfoot2024state} §4.2.6 证明 IEKF 收敛到全后验的众数即 MAP）。滤波是优化的特例。
+\end{insight}
+
+\paragraph{“先线性化残差”是流形求导的捷径（Barfoot 的 GN shortcut）。}
+\cref{eq:gn-linearize} 这条“先对残差线性化、再组装最小二乘”的路子，Barfoot\cite{barfoot2024state} 称之为 Gauss-Newton \emph{shortcut}：不必先写出目标 $J$ 的二阶导，只要把残差对增量线性化即可。它正是 \cref{sec:nlopt-manifold} 在李群上求导的母本：把 $\Delta\mathbf{x}$ 理解为右扰动 $\delta\boldsymbol{\xi}$，$\mathbf{J}$ 用右扰动雅可比（\cref{ch:lie}），其余照旧。Barfoot 也由“批量误差线性化 $\to$ 堆叠 $\to$ 解 $(\mathbf{H}^\top\mathbf{W}^{-1}\mathbf{H})\delta\mathbf{x}=\mathbf{H}^\top\mathbf{W}^{-1}\mathbf{e}$”得到与 \cref{eq:gn-normal} 同形的批量更新（他记 $\mathbf{H}=-\partial\mathbf{e}/\partial\mathbf{x}$，差一负号不影响）。
+
+\paragraph{GN 算法步骤。}\cite{gaoxiang2019slam14}
+（1）给初值 $\mathbf{x}_0$；（2）第 $k$ 次迭代算雅可比 $\mathbf{J}(\mathbf{x}_k)$ 与残差 $\mathbf{e}(\mathbf{x}_k)$；（3）解 \cref{eq:gn-normal} 得 $\Delta\mathbf{x}_k$；（4）$\|\Delta\mathbf{x}_k\|$ 足够小则停，否则 $\mathbf{x}_{k+1}=\mathbf{x}_k\boxplus\Delta\mathbf{x}_k$ 返回 2。
+
+\begin{pitfall}[GN 的半正定与病态——$\mathbf{H}\approx\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ 近似的缺陷]
+$\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ 只\emph{半}正定，实际数据里可能\emph{奇异或病态（ill-conditioned）}\cite{gaoxiang2019slam14}：此时增量不稳定、算法不收敛，几何上意味着“局部不像二次函数”（对应 \cref{ch:slam_est} 的不可观测/gauge 自由度）。更严重：即使 $\boldsymbol{\Lambda}$ 非奇异、非病态，若 $\Delta\mathbf{x}$ \emph{太大}，\cref{eq:gn-linearize} 的线性近似失效，可能让目标\emph{变大}\cite{gaoxiang2019slam14,barfoot2024state}。根因是 GN 丢掉了 $\sum_i u_i\,\partial^2u_i/\partial\mathbf{x}\partial\mathbf{x}^\top$ 项：当残差\emph{大}（拟合差/外点）或问题\emph{强非线性}（$\partial^2u_i$ 大）时，该项不可略，近似海森失真，GN 可能失败。两个补丁：\emph{线搜索}（取 $\mathbf{x}\leftarrow\mathbf{x}\boxplus\alpha\Delta\mathbf{x}$，$\alpha\in(0,1]$，因 $\Delta\mathbf{x}$ 仍是下降方向）；以及更彻底的——LM（\cref{sec:nlopt-lm}）。
+\end{pitfall}
+
+\paragraph{完整数值例 1：手写高斯牛顿拟合曲线（十四讲 §6.3.1，全录）。}\cite{gaoxiang2019slam14}
+拟合 $y=\exp(ax^2+bx+c)+w$（$w\sim\mathcal{N}(0,\sigma^2)$），待估 $a,b,c$。误差 $e_i=y_i-\exp(ax_i^2+bx_i+c)$，其对参数的导数
+\begin{equation}
+  \frac{\partial e_i}{\partial a}=-x_i^2\,\mathrm{e}^{(\cdot)},\quad
+  \frac{\partial e_i}{\partial b}=-x_i\,\mathrm{e}^{(\cdot)},\quad
+  \frac{\partial e_i}{\partial c}=-\mathrm{e}^{(\cdot)},\qquad \mathrm{e}^{(\cdot)}:=\exp(ax_i^2+bx_i+c),
+  \label{eq:nlopt-curve-jac}
+\end{equation}
+即 $\mathbf{J}_i=[\partial e_i/\partial a,\partial e_i/\partial b,\partial e_i/\partial c]^\top$（$3\times1$）。增量方程（标量观测、信息权 $\sigma^{-2}$）
+\begin{equation}
+  \Big(\sum_{i=1}^{N}\mathbf{J}_i\,\sigma^{-2}\,\mathbf{J}_i^\top\Big)\Delta\mathbf{x}_k=\sum_{i=1}^{N}-\mathbf{J}_i\,\sigma^{-2}\,e_i.
+  \label{eq:nlopt-curve-gn}
+\end{equation}
+（此处 $\mathbf{J}_i\mathbf{J}_i^\top$ 是 $3\times3$ 外积，与本书矩阵约定 $\sum_i\mathbf{J}_i^\top\sigma^{-2}\mathbf{J}_i$ 数值相同。）
+
+\begin{codebox}[C++]{手写高斯牛顿曲线拟合（slambook2/ch6/gaussNewton.cpp，关键体）}
+double ar=1.0, br=2.0, cr=1.0;       // 真实参数
+double ae=2.0, be=-1.0, ce=5.0;      // 估计初值
+int N=100; double w_sigma=1.0, inv_sigma=1.0/w_sigma;
+// ... 生成带噪数据 x_data, y_data（y=exp(ar*x*x+br*x+cr)+gaussian noise）...
+double cost=0, lastCost=0;
+for (int iter=0; iter<100; iter++) {
+  Matrix3d H = Matrix3d::Zero();     // Hessian = J^T * Sigma^-1 * J（GN 近似海森）
+  Vector3d b = Vector3d::Zero();     // 右端 g = -J^T Sigma^-1 e
+  cost = 0;
+  for (int i=0; i<N; i++) {
+    double xi=x_data[i], yi=y_data[i];
+    double error = yi - exp(ae*xi*xi + be*xi + ce);   // 残差 e_i
+    Vector3d J;                                        // 雅可比（列向量）
+    J[0] = -xi*xi*exp(ae*xi*xi + be*xi + ce);          // de/da
+    J[1] = -xi*exp(ae*xi*xi + be*xi + ce);             // de/db
+    J[2] = -exp(ae*xi*xi + be*xi + ce);                // de/dc
+    H += inv_sigma*inv_sigma * J * J.transpose();      // 累加 J Sigma^-1 J^T
+    b += -inv_sigma*inv_sigma * error * J;             // 累加 -J Sigma^-1 e
+    cost += error*error;
+  }
+  Vector3d dx = H.ldlt().solve(b);   // 用 LDLT(Cholesky 变体)解 H dx = b，绝不求逆
+  if (isnan(dx[0])) break;           // 数值崩溃保护
+  if (iter>0 && cost>=lastCost) break;  // 代价不再下降则停（朴素 GN 无信赖域回退）
+  ae += dx[0]; be += dx[1]; ce += dx[2];
+  lastCost = cost;
+}
+// 结果: estimated abc = 0.890912, 2.1719, 0.943629（真值 1,2,1，受噪声影响）
+\end{codebox}
+
+\noindent\textbf{运行输出与分析}\cite{gaoxiang2019slam14}：目标函数 9 次迭代后趋于收敛（更新量趋零），代价 $\sum e^2$ 从 $3.2\times10^6$ 降到 $101.94$；终值 $(a,b,c)\approx(0.8909,2.1719,0.9436)$ 与真值 $(1,2,1)$ 接近（差异来自噪声）。在 i7-8700 上约 \emph{0.2 ms}。注意手写 GN 没有信赖域回退，靠 \texttt{cost>=lastCost} 这一朴素准则止步——这正是 LM（\cref{sec:nlopt-lm}）要补的。
+
+\begin{practice}
+\begin{enumerate}
+  \item 完整推导 \cref{eq:gn-normal}（两种途径），并写出多残差堆叠时 $\mathbf{J},\mathbf{W}$ 的分块。
+  \item 说明 GN 丢掉的“残差 $\times$ 二阶导”项在何种问题上不可忽略（提示：强非线性 $+$ 大残差），并据此解释为何曲线拟合例 GN 收敛得很好。
+  \item （概念）解释“为什么 $\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ 不正定时解不稳定”，联系 \cref{ch:slam_est} 的可观测性。
+  \item （编程）把上面 \texttt{H.ldlt().solve(b)} 换成显式 \texttt{H.inverse()*b}，在病态数据上观察数值差异。答案要点：求逆放大条件数，分解更稳（\cref{sec:nlopt-solve}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{列文伯格–马夸尔特与信赖域}
+\label{sec:nlopt-lm}
+
+\paragraph{动机：GN 的近似只在小范围可信。}
+GN 的线性化（\cref{eq:gn-linearize}）只在展开点附近有效，故给增量加一个\emph{信赖区域}（trust region）：区域内信任近似，区域外不信\cite{gaoxiang2019slam14,carlone2026handbook}。LM 因此被称\emph{阻尼牛顿法}（damped Newton），一般比 GN 更健壮（但可能更慢）。
+
+\paragraph{增益比 $\rho$：度量近似好坏。}\cite{gaoxiang2019slam14,carlone2026handbook}
+\begin{equation}
+  \rho=\frac{J(\mathbf{x})-J(\mathbf{x}\boxplus\Delta\mathbf{x})}{L(\mathbf{0})-L(\Delta\mathbf{x})}
+  =\frac{\text{实际下降}}{\text{模型预测下降}},
+  \label{eq:lm-rho}
+\end{equation}
+$L(\Delta\mathbf{x})$ 为 $J$ 在当前点的二次（线性化）近似模型。$\rho\approx1$ 近似好（可放大信赖域）；$\rho$ 太小说明近似差（缩小信赖域、\emph{拒绝}该步）。
+（十四讲 §6.2.3 给的是对\emph{残差} $f$ 的简化版分母 $\mathbf{J}^\top\Delta\mathbf{x}$；Handbook 的标准版用对\emph{目标} $J$ 的模型下降 $L(\mathbf{0})-L(\Delta\mathbf{x})$，$L(\Delta\mathbf{x})=\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}\Delta\mathbf{x}-\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{e}$，本书取标准版。）
+
+\begin{proposition}[LM 阻尼增量方程]\label{prop:lm}
+带信赖域约束 $\|\mathbf{D}\Delta\mathbf{x}\|^2\le\mu$ 的子问题，经拉格朗日乘子 $\lambda$ 化为
+\begin{equation}
+  \big(\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}+\lambda\mathbf{D}^\top\mathbf{D}\big)\Delta\mathbf{x}^*=-\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{e}.
+  \label{eq:lm}
+\end{equation}
+$\mathbf{D}=\mathbf{I}$（约束在球内）为 \emph{Levenberg}；$\mathbf{D}^\top\mathbf{D}=\operatorname{diag}(\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J})$（按各维梯度大小缩放）为 \emph{Marquardt}\cite{gaoxiang2019slam14,carlone2026handbook}。
+\end{proposition}
+\begin{proof}
+信赖域子问题 $\min_{\Delta\mathbf{x}}\tfrac12\|\mathbf{e}+\mathbf{J}\Delta\mathbf{x}\|_{\mathbf{W}}^2$ s.t. $\|\mathbf{D}\Delta\mathbf{x}\|^2\le\mu$。构造拉格朗日函数
+\[
+  \mathcal{L}(\Delta\mathbf{x},\lambda)=\tfrac12\|\mathbf{e}+\mathbf{J}\Delta\mathbf{x}\|_{\mathbf{W}}^2+\tfrac{\lambda}{2}\big(\|\mathbf{D}\Delta\mathbf{x}\|^2-\mu\big),
+\]
+对 $\Delta\mathbf{x}$ 求导置零：$\mathbf{J}^\top\mathbf{W}^{-1}(\mathbf{e}+\mathbf{J}\Delta\mathbf{x})+\lambda\mathbf{D}^\top\mathbf{D}\Delta\mathbf{x}=\mathbf{0}$，即 \cref{eq:lm}。Barfoot\cite{barfoot2024state} 由“GN 不保证收敛”直接给同式 $(\mathbf{U}^\top\mathbf{U}+\lambda\mathbf{D})\delta\mathbf{x}^*=-\mathbf{U}^\top\mathbf{u}$；Handbook\cite{carlone2026handbook} 给 $(\mathbf{A}^\top\mathbf{A}+\lambda\mathbf{I})\Delta=\mathbf{A}^\top\mathbf{b}$（Levenberg）与 $\lambda\operatorname{diag}(\mathbf{A}^\top\mathbf{A})$（Marquardt），均与本式一致。\hfill$\square$
+\end{proof}
+
+\paragraph{$\lambda$ 在 GN 与最速下降间插值（三书一致的退化分析）。}\cite{gaoxiang2019slam14,barfoot2024state,carlone2026handbook}
+\cref{eq:lm} 的两极行为：
+\begin{itemize}
+  \item $\lambda\to0$：$\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ 主导，LM $\to$ \textbf{高斯牛顿}（二次近似好、收敛快）；
+  \item $\lambda\to\infty$（取 $\mathbf{D}=\mathbf{I}$）：$\lambda\mathbf{I}$ 主导，$\Delta\mathbf{x}^*\approx-\tfrac1\lambda\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{e}$，正是\textbf{最速下降}方向上的极小步（小步、稳）。
+\end{itemize}
+故 LM 在 GN 与 SD 间\emph{自然插值}。两种阻尼都可在贝叶斯意义上解释为\emph{给所有变量加一个零均值先验}\cite{carlone2026handbook}。Marquardt 的对角缩放使：在目标\emph{平坦}方向（梯度小、对角元小）走更大步、\emph{陡峭}方向走更小步。
+
+\paragraph{接受/拒绝与 $\lambda$ 调度（Handbook 启发式）。}\cite{carlone2026handbook,gaoxiang2019slam14}
+迭代里按 $\rho$ 调 $\lambda$：
+\begin{itemize}
+  \item 步被\emph{接受}（$\rho$ 大、残差下降）：\emph{减小} $\lambda$（如 $\div10$，趋近 GN、快），用新线性化点继续；
+  \item 步被\emph{拒绝}（$\rho$ 小或目标变大）：\emph{增大} $\lambda$（如 $\times10$，趋近 SD、稳），\emph{重解}修改后的 \cref{eq:lm}。
+\end{itemize}
+十四讲 §6.2.3 给具体阈值：$\rho>\tfrac34$ 则 $\mu=2\mu$（放大信赖域），$\rho<\tfrac14$ 则 $\mu=0.5\mu$（缩小），$\rho$ 大于某阈值才接受步——倍数与阈值均为经验值。\textbf{LM 拒绝会让残差变大的步}，故在病态/强非线性下比 GN 稳健。工程准则：问题性质好用 GN，接近病态用 LM。
+
+\paragraph{Powell 狗腿（Dog-Leg）：省一次分解。}\cite{carlone2026handbook}
+LM 每次改 $\lambda$ 都要\emph{重新分解}修改后的矩阵（最贵环节）。Powell 狗腿改为：\emph{分别}算 GN 步与最速下降步，在信赖域内把两者折成一条“狗腿”折线（先沿 SD、到信赖域边界处\emph{急转}朝 GN，停在边界）。若组合步被拒，GN/SD 方向仍有效、只换组合比例，\textbf{每次状态更新只需一次分解}，故常比 LM 高效。Dog-Leg 维护\emph{显式}信赖域，用增益比 \cref{eq:lm-rho}（$\rho<0.25$ 缩小、$\rho>0.75$ 放大并接受）调半径。
+
+\begin{algo}[列文伯格–马夸尔特（信赖域）]\label{alg:nlopt-lm}
+给初值 $\mathbf{x}_0$、初始半径 $\mu$（或初始 $\lambda$）。重复：
+(1) 在 $\mathbf{x}_k$ 算 $\mathbf{J},\mathbf{e}$；
+(2) 解 \cref{eq:lm} 得 $\Delta\mathbf{x}_k$；
+(3) 按 \cref{eq:lm-rho} 算 $\rho$；
+(4) $\rho$ 大（如 $>\tfrac34$）则接受 $\mathbf{x}_{k+1}=\mathbf{x}_k\boxplus\Delta\mathbf{x}_k$ 并减小 $\lambda$/放大 $\mu$；$\rho$ 小（如 $<\tfrac14$）则拒绝、增大 $\lambda$/缩小 $\mu$、重解；
+(5) 收敛（$\|\Delta\mathbf{x}\|$ 或 $\|\nabla J\|$ 小）则止。
+\end{algo}
+
+\begin{pitfall}[思维陷阱：“LM 的 $\lambda$ 越大越好”]
+$\lambda$ 大趋最速下降（每步小、稳，但收敛\emph{慢}、可能停在远处）；$\lambda$ 小趋 GN（快，但二次近似差时可能发散）。没有“越大越好”——应\emph{按 $\rho$ 自适应}：近似好就减 $\lambda$ 提速，近似差就加 $\lambda$ 求稳。固定大 $\lambda$ 会让本可二次收敛的问题退化成龟速一阶下降。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：把增益比 $\rho$ 与鲁棒核 $\rho$ 混为一谈]
+本章两处都用了字母 $\rho$：\cref{eq:lm-rho} 的 $\rho$ 是\emph{标量增益比}（实际下降/预测下降，调信赖域用）；\cref{sec:nlopt-robust} 的 $\rho(u)$ 是\emph{鲁棒核函数}（把残差范数映成代价）。二者毫无关系，只是历史上撞了符号。读代码/论文时按上下文区分：前者是一个数、后者是一个函数。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由信赖域子问题的拉格朗日函数完整推出 \cref{eq:lm}。
+  \item 取 $\mathbf{D}=\mathbf{I}$，验证 $\lambda\to\infty$ 时增量趋于 $-\tfrac1\lambda\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{e}$（最速下降）。
+  \item （概念）说明 Dog-Leg 相比 LM “省一次矩阵分解”省在哪、为何 GN/SD 方向被拒后仍可复用。
+  \item 写出 $\rho<0$ 的几何含义（实际\emph{不降反升}），并说明此时该如何调 $\lambda$。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{解正规方程：白化、Cholesky 与 QR}
+\label{sec:nlopt-solve}
+
+每次迭代都要解一个线性系统 $\boldsymbol{\Lambda}\Delta\mathbf{x}=\mathbf{b}$（$\boldsymbol{\Lambda}=\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$，$\mathbf{b}=-\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{e}$）。怎么解得又快又稳，是 BA 能否实时的关键\cite{carlone2026handbook}。
+
+\paragraph{白化：把加权范数化成标准范数。}\cite{carlone2026handbook,barfoot2024state}
+定义 $\boldsymbol{\Sigma}^{-1/2}$ 为 $\boldsymbol{\Sigma}$ 的矩阵平方根之逆，则马氏范数化为标准欧氏范数：
+\begin{equation}
+  \|\mathbf{e}\|_{\boldsymbol{\Sigma}}^2=\mathbf{e}^\top\boldsymbol{\Sigma}^{-1}\mathbf{e}=\big(\boldsymbol{\Sigma}^{-1/2}\mathbf{e}\big)^\top\big(\boldsymbol{\Sigma}^{-1/2}\mathbf{e}\big)=\big\|\boldsymbol{\Sigma}^{-1/2}\mathbf{e}\big\|_2^2.
+  \label{eq:nlopt-whiten}
+\end{equation}
+对每个因子的雅可比与残差左乘 $\boldsymbol{\Sigma}_i^{-1/2}$，定义\emph{白化}量
+\begin{equation}
+  \mathbf{A}_i=\boldsymbol{\Sigma}_i^{-1/2}\mathbf{J}_i,\qquad \mathbf{b}_i=\boldsymbol{\Sigma}_i^{-1/2}\big(-\mathbf{e}_i\big),
+  \label{eq:nlopt-Ai}
+\end{equation}
+堆叠成标准最小二乘 $\min_{\Delta\mathbf{x}}\|\mathbf{A}\Delta\mathbf{x}-\mathbf{b}\|_2^2$。Barfoot\cite{barfoot2024state} 用 Cholesky 实现：$\mathbf{u}=\mathbf{L}\mathbf{e}$，$\mathbf{L}^\top\mathbf{L}=\mathbf{W}^{-1}$，把 $\tfrac12\mathbf{e}^\top\mathbf{W}^{-1}\mathbf{e}$ 变成 $\tfrac12\mathbf{u}^\top\mathbf{u}$。白化\emph{消去量纲}（像素/米/弧度），不同观测可放进同一目标；标量时即“每项除以标准差 $\sigma_i$”\cite{carlone2026handbook}。
+
+\paragraph{法方程与 Cholesky（平方根信息）。}\cite{carlone2026handbook,dellaert2017factor}
+满秩时唯一解由\emph{法方程} $(\mathbf{A}^\top\mathbf{A})\Delta\mathbf{x}=\mathbf{A}^\top\mathbf{b}$ 给出；信息矩阵 $\boldsymbol{\Lambda}=\mathbf{A}^\top\mathbf{A}$ 对称正定，作 Cholesky 分解
+\begin{equation}
+  \boldsymbol{\Lambda}=\mathbf{A}^\top\mathbf{A}=\mathbf{R}^\top\mathbf{R}\quad(\mathbf{R}\ \text{上三角}),
+  \qquad \mathbf{R}^\top\mathbf{y}=\mathbf{A}^\top\mathbf{b},\ \ \mathbf{R}\Delta\mathbf{x}=\mathbf{y}.
+  \label{eq:cholesky}
+\end{equation}
+先\emph{前代}解 $\mathbf{y}$、再\emph{回代}解 $\Delta\mathbf{x}$。$\mathbf{R}$ 即\emph{平方根信息矩阵}——这族方法因此称 $\sqrt{}$SAM（square-root smoothing and mapping）\cite{dellaert2017factor}。
+（Handbook\cite{carlone2026handbook} 把 Cholesky 因子记作上三角 $\mathbf{R}$；Golub--Van Loan 习惯下三角 $\mathbf{L}=\mathbf{R}^\top$。本书此处 $\mathbf{R}$ 指 Cholesky 因子，\emph{非}旋转矩阵。）
+
+\paragraph{复杂度（Cholesky）。}\cite{carlone2026handbook}
+稠密时 Cholesky 分解需 $n^3/3$ flops；含算对称 $\mathbf{A}^\top\mathbf{A}$ 的一半，整算法约 $(m+n/3)n^2$ flops（$\mathbf{A}$ 为 $m\times n$）。也可用 LDU/LDL$^\top$ 变体\emph{避免开平方根}（即代码里的 \texttt{ldlt()}）。
+
+\paragraph{QR：更稳，不显式构造 $\boldsymbol{\Lambda}$。}\cite{carlone2026handbook}
+对 $\mathbf{A}$ 直接做 QR（Householder 反射逐列消零）
+\begin{equation}
+  \mathbf{A}=\mathbf{Q}\begin{bmatrix}\mathbf{R}\\\mathbf{0}\end{bmatrix},\qquad \begin{bmatrix}\mathbf{d}\\\mathbf{e}'\end{bmatrix}=\mathbf{Q}^\top\mathbf{b},
+  \label{eq:nlopt-qr}
+\end{equation}
+$\mathbf{Q}$ 为 $m\times m$ 正交阵（通常\emph{不显式构造}，把 $\mathbf{b}$ 作为附加列随 $\mathbf{A}$ 一起变换即得 $\mathbf{Q}^\top\mathbf{b}$）。由 $\mathbf{Q}$ 正交：
+\[
+  \|\mathbf{A}\Delta\mathbf{x}-\mathbf{b}\|_2^2=\|\mathbf{Q}^\top\mathbf{A}\Delta\mathbf{x}-\mathbf{Q}^\top\mathbf{b}\|_2^2=\|\mathbf{R}\Delta\mathbf{x}-\mathbf{d}\|_2^2+\|\mathbf{e}'\|_2^2,
+\]
+回代 $\mathbf{R}\Delta\mathbf{x}=\mathbf{d}$ 即解，$\|\mathbf{e}'\|_2^2$ 为残差平方和。QR 与 Cholesky 得到\emph{相同}的 $\mathbf{R}$（因 $\mathbf{A}^\top\mathbf{A}=[\mathbf{R}^\top\,\mathbf{0}]\mathbf{Q}^\top\mathbf{Q}[\mathbf{R};\mathbf{0}]=\mathbf{R}^\top\mathbf{R}$，至多对角符号差），但 QR \emph{不构造} $\mathbf{A}^\top\mathbf{A}$（避免条件数平方放大），\textbf{数值更稳}；代价 $2(m-n/3)n^2$，约为 Cholesky 的两倍\cite{carlone2026handbook}。
+
+\begin{insight}[Cholesky vs QR 的取舍]
+两者解\emph{同一}问题、给\emph{同一} $\mathbf{R}$。差别在数值：QR 直接作用于 $\mathbf{A}$，条件数 $\kappa(\mathbf{A})$；Cholesky 先形成 $\mathbf{A}^\top\mathbf{A}$，条件数变 $\kappa(\mathbf{A})^2$（病态问题精度损失加倍）。但 QR 慢约一倍。实践中：\emph{稀疏} Cholesky/LDL 因更快、且稀疏问题上优势\emph{不止常数倍}，是多数 SLAM 的默认；只在数值病态时才换 QR\cite{carlone2026handbook,dellaert2017factor}。
+\end{insight}
+
+\begin{note}
+\textbf{为什么绝不直接求逆}：解 $\boldsymbol{\Lambda}\Delta\mathbf{x}=\mathbf{b}$ \emph{绝不}先算 $\boldsymbol{\Lambda}^{-1}$（稠密、$O(n^3)$、数值差、破坏稀疏），而是\emph{分解 $+$ 前后代}。手写实现里 Eigen 的 \texttt{ldlt().solve()} 即此意。需要某变量\emph{边缘协方差}时（\cref{sec:nlopt-cov}），也只回代 $\boldsymbol{\Lambda}^{-1}$ 的\emph{对应块}，不整体求逆。
+\end{note}
+
+\paragraph{历史：平方根滤波。}\cite{dellaert2017factor,carlone2026handbook}
+分解信息矩阵的思想在序贯估计里叫\emph{平方根信息滤波}（SRIF），1969 年为 JPL 水手 10 号金星任务开发。Maybeck 名言：“许多实践者有充分理由主张平方根滤波应\emph{总是}优先于标准卡尔曼递推”——平方根带来更精确、更稳定的算法。$\sqrt{}$SAM\cite{dellaert2017factor} 把这一思想用到批量平滑。
+
+\begin{practice}
+\begin{enumerate}
+  \item 推导 \cref{eq:nlopt-whiten}，并说明白化后为什么不同量纲的观测可以相加。
+  \item 验证 QR 与 Cholesky 给出相同的 $\mathbf{R}$（用 $\mathbf{A}^\top\mathbf{A}=\mathbf{R}^\top\mathbf{R}$）。
+  \item （概念）一个条件数 $\kappa(\mathbf{A})=10^4$ 的问题，用 Cholesky 解会损失约几位有效数字？为什么 QR 更好？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{稀疏性：SLAM 为何可解}
+\label{sec:nlopt-sparse}
+
+BA/位姿图的信息矩阵动辄上万、上百万维，稠密分解 $O(n^3)$ 不可行。SLAM 可解，全靠\emph{稀疏}\cite{carlone2026handbook,gaoxiang2019slam14,dellaert2017factor}。
+
+\paragraph{稀疏来自因子图结构。}\cite{dellaert2017factor,carlone2026handbook}
+每个残差只关联一两个变量（\cref{thm:nlopt-map} 结构特点 1），故白化雅可比 $\mathbf{A}$ 中\textbf{每个因子对应一块行、每个变量对应一块列}——$\mathbf{A}$ 的块结构\emph{镜像因子图}。于是 $\boldsymbol{\Lambda}=\mathbf{A}^\top\mathbf{A}$ 的稀疏模式恰是因子图诱导的\emph{无向图（马尔可夫随机场 MRF）}的邻接矩阵：两变量曾\emph{共现}于某因子 $\Rightarrow$ $\boldsymbol{\Lambda}$ 对应块非零；一个 $n$ 元因子在其全部变量间诱导一个\emph{团（clique）}（成对因子是其特例）。Handbook\cite{carlone2026handbook} 强调：$\mathbf{A}^\top\mathbf{A}$ \emph{不是真海森}，而是 GN 近似（由截断残差泰勒级数得到，呼应 \cref{thm:gn}）。
+
+\paragraph{BA 的箭头结构与 Schur 消元。}\cite{gaoxiang2019slam14}
+BA 状态分相机 $\mathbf{x}_c$（$6m$ 维，$m$ 个相机）与路标 $\mathbf{x}_p$（$3n$ 维，$n\gg m$）。因每条观测只连“一个相机 $+$ 一个路标”，$\boldsymbol{\Lambda}$ 有\emph{箭头（arrowhead）}结构：
+\begin{equation}
+  \begin{bmatrix}\mathbf{B}&\mathbf{E}\\\mathbf{E}^\top&\mathbf{C}\end{bmatrix}
+  \begin{bmatrix}\Delta\mathbf{x}_c\\\Delta\mathbf{x}_p\end{bmatrix}
+  =\begin{bmatrix}\mathbf{v}\\\mathbf{w}\end{bmatrix},
+  \label{eq:ba-block}
+\end{equation}
+其中 $\mathbf{B}$（相机块）、$\mathbf{C}$（路标块）均为\emph{块对角}阵——$\mathbf{C}$ 由一个个 $3\times3$ 小块组成，求逆极廉价。左乘消元矩阵 $\big[\begin{smallmatrix}\mathbf{I}&-\mathbf{E}\mathbf{C}^{-1}\\\mathbf{0}&\mathbf{I}\end{smallmatrix}\big]$ 消去 $\mathbf{E}$，得只含相机增量的\emph{Schur 补}方程：
+\begin{equation}
+  \boxed{\ \underbrace{\big(\mathbf{B}-\mathbf{E}\mathbf{C}^{-1}\mathbf{E}^\top\big)}_{\textstyle\mathbf{S}}\,\Delta\mathbf{x}_c=\mathbf{v}-\mathbf{E}\mathbf{C}^{-1}\mathbf{w}\ },\qquad
+  \Delta\mathbf{x}_p=\mathbf{C}^{-1}\big(\mathbf{w}-\mathbf{E}^\top\Delta\mathbf{x}_c\big).
+  \label{eq:schur}
+\end{equation}
+此过程称\emph{边缘化}（marginalization）/ Schur 消元\cite{gaoxiang2019slam14}。
+
+\begin{insight}[$O(\text{相机}^3)$ 而非 $O(n^3)$]
+直接分解全 $\boldsymbol{\Lambda}$ 是 $O\big((6m+3n)^3\big)$，被海量路标 $3n$ 拖垮。Schur 后，主成本是分解 $\mathbf{S}$（仅 $6m\times6m$），约 $O\big((6m)^3\big)$；$\mathbf{C}^{-1}$ 因块对角是 $O(n)$ 的廉价回代。\textbf{复杂度由“相机$+$路标总维立方”降到“相机维立方”}——这正是 BA 能在成百上千路标下实时的根本。
+\end{insight}
+
+\paragraph{Fill-in 与共视。}\cite{gaoxiang2019slam14,dellaert2017factor,carlone2026handbook}
+$\mathbf{S}=\mathbf{B}-\mathbf{E}\mathbf{C}^{-1}\mathbf{E}^\top$ \emph{不再}保持 $\mathbf{B}$ 的对角稀疏：消元把“两相机经由公共路标的间接耦合”显式填进 $\mathbf{S}$ 的相机--相机块，称\emph{填入}（fill-in）——即\emph{超出原矩阵稀疏模式之外的额外非零元}\cite{carlone2026handbook}。其几何意义是\textbf{共视}（co-visibility）：$\mathbf{S}$ 的非对角非零块 $\iff$ 两相机看到\emph{共同路标}。
+\emph{变量排序}极大影响 fill-in：任何排序给出\emph{相同}解，但决定 $\mathbf{R}$ 的非零元个数；\textbf{最小化 fill-in 的排序是 NP 难}\cite{dellaert2017factor,carlone2026handbook}，实践用 \emph{COLAMD}（column approximate minimum degree）等启发式。Handbook\cite{carlone2026handbook} 给一个真实例（图 1.9，$333$ 未知、$1126$ 行）：自然排序（位姿在前、路标在后）的 Cholesky 因子有 $9399$ 个非零元，COLAMD 重排后只剩 $4168$ 个——\emph{解完全相同}，只是分解快得多。
+
+\paragraph{消元 $=$ 稀疏分解 $=$ 图模型（变量消元算法）。}\cite{dellaert2017factor,carlone2026handbook}
+线性高斯下，“按某顺序逐变量消元”\emph{精确等价}于稀疏 Cholesky/QR 分解，也等价于把因子图转成有向的\emph{贝叶斯网}。消一个变量 $\mathbf{x}_j$：把所有与它相邻的因子相乘成 $\psi(\mathbf{x}_j,\mathbf{s}_j)$（$\mathbf{s}_j$ 为其\emph{分隔集}=消元后 $\mathbf{x}_j$ 所条件的变量集），再分解为条件 $p(\mathbf{x}_j\mid\mathbf{s}_j)$ 与 $\mathbf{s}_j$ 上的新因子 $\tau(\mathbf{s}_j)$。矩阵层面这一步用\emph{部分 QR}：把积因子的增广矩阵 $[\bar{\mathbf{A}}_j\mid\bar{\mathbf{b}}_j]$ 分解为 $\big[\begin{smallmatrix}\mathbf{R}_j&\mathbf{T}_j&\mathbf{d}_j\\\mathbf{0}&\tilde{\mathbf{A}}_\tau&\tilde{\mathbf{b}}_\tau\end{smallmatrix}\big]$，上行给条件（贡献一行上三角 $\mathbf{R}$），下行给新因子 $\tau$。\textbf{Schur 补正是“消去一个变量、更新其分隔集”的矩阵特例}：\cref{eq:schur} 里消去路标块 $\mathbf{C}$、更新相机块 $\mathbf{B}\to\mathbf{S}$，恰是变量消元一步。消完所有变量得贝叶斯网（弦图/三角化），其条件高斯
+\begin{equation}
+  \|\mathbf{R}_j\mathbf{x}_j+\mathbf{T}_j\mathbf{s}_j-\mathbf{d}_j\|_2^2=\|\mathbf{x}_j-\boldsymbol{\mu}_j\|_{\boldsymbol{\Sigma}_j}^2,\quad
+  \boldsymbol{\mu}_j=\mathbf{R}_j^{-1}(\mathbf{d}_j-\mathbf{T}_j\mathbf{s}_j),\quad \boldsymbol{\Sigma}_j=(\mathbf{R}_j^\top\mathbf{R}_j)^{-1},
+  \label{eq:nlopt-elim-cond}
+\end{equation}
+按\emph{逆消元序}回代即得各变量 MAP $\mathbf{x}_j^*=\mathbf{R}_j^{-1}(\mathbf{d}_j-\mathbf{T}_j\mathbf{s}_j^*)$。这条 $\boldsymbol{\Sigma}_j=(\mathbf{R}_j^\top\mathbf{R}_j)^{-1}$ 正是 \cref{sec:nlopt-cov} 协方差恢复的雏形。把这套增量化（Bayes 树、iSAM2：新观测只触及受影响的局部子树、并\emph{选择性重线性化}偏离工作点的变量）留给后端 / 增量 SLAM 专章（\cref{ch:vio} 及后端章），其库实现是 GTSAM\cite{dellaert2017factor}；本章只需记住：\textbf{稀疏 Schur/Cholesky/变量消元是 BA 可扩展的引擎，其结构由因子图直接给出}。
+
+\begin{pitfall}[思维陷阱：以为变量排序会改变解]
+不同排序给出\emph{完全相同}的 MAP 解（COLAMD 的 $4168$ 非零元版与自然序的 $9399$ 版回代结果一致）——排序只改变 fill-in（中间因子的非零元数），从而改变\emph{速度}，不改变\emph{答案}。所以可以放心用任何启发式排序加速；选错排序只会变慢、不会变错。反过来，\emph{别}为了“解更对”去手调排序，那是无用功。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：把滤波的“边缘化致稠密”和平滑的“消元致 fill-in”当成一回事]
+两者都叫“边缘化”，但后果不同。\emph{滤波}（EKF）边缘化掉\emph{历史全部}状态，使信息矩阵随时间\emph{不可逆地变稠密}\cite{dellaert2017factor}——信息一旦糊进当前块就拿不回来。\emph{平滑}（$\sqrt{}$SAM）保留整条轨迹，消元只在\emph{求解时}产生 fill-in，且信息矩阵\emph{始终稀疏}（这正是平滑优于滤波的计算理由）。SWF（\cref{sec:nlopt-appendix}）则在窗口边界做边缘化，是二者的折中。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 对一个“2 相机 $+$ 6 路标、各看 4 个点”的小 BA，画出 $\boldsymbol{\Lambda}$ 的箭头稀疏图案，并标出哪些块来自共视。
+  \item 由 \cref{eq:ba-block} 推出 \cref{eq:schur}（左乘 $\big[\begin{smallmatrix}\mathbf{I}&-\mathbf{E}\mathbf{C}^{-1}\\\mathbf{0}&\mathbf{I}\end{smallmatrix}\big]$）。
+  \item （概念）解释“边缘化路标”为何在相机间引入 fill-in，并联系 \cref{ch:eskf} 的“滤波边缘化历史致信息阵稠密”。
+  \item 说明为什么“消去一个变量并更新其分隔集”就是 Schur 补的一步。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{流形上的优化（右扰动）}
+\label{sec:nlopt-manifold}
+
+SLAM 的变量含位姿 $\mathbf{T}\in\SE(3)$，不在向量空间，普通加法 $\mathbf{x}+\Delta\mathbf{x}$ 非法（破坏正交约束，\cref{thm:nlopt-map} 结构特点 2）。\cref{ch:lie} 已给出出路：在流形上用\emph{右扰动}定义增量。本节把 GN/LM 干净地搬到流形——其余推导\emph{完全照旧}，只换“增量定义”与“雅可比”。
+
+\paragraph{$\boxplus/\boxminus$ 与 retraction。}\cite{hertzberg2013integrating}
+用 \emph{$\boxplus$}（retraction）把局部向量增量“贴”回流形：对位姿
+\begin{equation}
+  \mathbf{T}\boxplus\delta\boldsymbol{\xi}:=\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi}),\qquad
+  \mathbf{T}_2\boxminus\mathbf{T}_1:=\mathrm{Log}(\mathbf{T}_1^{-1}\mathbf{T}_2),
+  \label{eq:retraction}
+\end{equation}
+即\emph{右乘}一个小扰动 $\mathrm{Exp}(\delta\boldsymbol{\xi})$（本书右扰动约定，$\delta\boldsymbol{\xi}=[\delta\boldsymbol{\rho};\delta\boldsymbol{\phi}]$）。普通向量分量的 $\boxplus$ 就是加法。Hertzberg 等\cite{hertzberg2013integrating} 用 $\boxplus/\boxminus$ 把“流形上的优化”封装成“切空间的欧氏优化 $+$ retraction”，使通用优化器无需懂流形细节。
+
+\paragraph{流形高斯牛顿（GN shortcut 在李群上的落地）。}\cite{barfoot2024state,gaoxiang2019slam14}
+优化变量改为“当前估计 $\hat{\mathbf{x}}$ 上的局部增量 $\delta\mathbf{x}$”。用 GN 的 shortcut（\cref{sec:nlopt-gn}）：先对残差关于 $\delta\mathbf{x}$ 线性化，
+\begin{equation}
+  \mathbf{e}(\hat{\mathbf{x}}\boxplus\delta\mathbf{x})\approx\mathbf{e}(\hat{\mathbf{x}})+\mathbf{J}\,\delta\mathbf{x},\qquad
+  \mathbf{J}=\frac{\partial\,\mathbf{e}(\hat{\mathbf{x}}\boxplus\delta\mathbf{x})}{\partial\delta\mathbf{x}}\bigg|_{\delta\mathbf{x}=\mathbf{0}},
+  \label{eq:manifold-jac}
+\end{equation}
+$\mathbf{J}$ 即\emph{右扰动雅可比}（如 $\partial(\mathbf{R}\mathbf{p})/\partial\delta\boldsymbol{\phi}=-\mathbf{R}\mathbf{p}^\wedge$，见 \cref{ch:lie}）。其余完全照旧：解 \cref{eq:gn-normal}（或 LM \cref{eq:lm}）得 $\delta\mathbf{x}^*$，再\emph{右乘}更新 $\hat{\mathbf{x}}\leftarrow\hat{\mathbf{x}}\boxplus\delta\mathbf{x}^*$。增量 $\delta\boldsymbol{\xi}$ 是无约束的 $\mathbb{R}^6$ 向量，正规方程因此是\emph{无约束}最小二乘——这正是 \cref{ch:lie} 强调的“李代数把带约束优化变无约束”。
+
+\begin{insight}
+求解器里的 “local parameterization / manifold / \texttt{oplusImpl}” 就是 \cref{eq:retraction} 的右乘更新。GTSAM 的 \texttt{Pose3}、Ceres 的 \texttt{Manifold}（旧称 \texttt{LocalParameterization}）、g2o 顶点的 \texttt{oplusImpl} 都要你提供 $\boxplus$；理解了右扰动，这些不再是黑话，而是“在流形切空间做 GN、再 retract 回去”。Barfoot\cite{barfoot2024state} 的“批量误差线性化 $\to$ 解正规方程”推导对欧氏与流形\emph{同一套}，区别只在雅可比是普通导数还是右扰动雅可比。
+\end{insight}
+
+\begin{pitfall}[思维陷阱：雅可比侧与更新侧不一致]
+若雅可比按\emph{右}扰动算（$\partial/\partial\delta\boldsymbol{\xi}$，$\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$），更新却写成\emph{左}乘 $\mathrm{Exp}(\delta\boldsymbol{\xi})\,\mathbf{T}$（或反之），增量方向与几何不符，迭代不收敛甚至发散。\textbf{铁律：雅可比侧 $=$ 更新侧 $=$ 全程同侧}（本书统一右扰动）。引用 Barfoot/十四讲的左扰动公式时，须经伴随 $\mathrm{Ad}$ 转换到右扰动（\cref{ch:lie}）再用。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 把 \cref{sec:nlopt-gn} 的曲线拟合 GN 改成位姿图 GN：写出残差 $\mathbf{e}=\mathrm{Log}(\mathbf{T}_{ij}^{-1}\mathbf{T}_i^{-1}\mathbf{T}_j)$ 对 $\mathbf{T}_i,\mathbf{T}_j$ 的右扰动雅可比骨架。
+  \item （概念）为什么 $\delta\boldsymbol{\xi}\in\mathbb{R}^6$ 上的正规方程是“无约束”的，而直接优化 $\mathbf{T}$ 的 16 个元素不是？
+  \item 解释 Ceres 的 \texttt{Manifold::Plus} 与本节 $\boxplus$ 的对应关系。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{鲁棒核函数与 M-估计}
+\label{sec:nlopt-robust}
+
+真实数据有\emph{外点}（误匹配、动态物体、GPS 多径反射）。普通最小二乘对外点\emph{极度敏感}。本节给出 M-估计/鲁棒核/IRLS，并\emph{证明}“鲁棒 $=$ 逆 Wishart 先验下的 MAP”。
+
+\paragraph{动机：外点为何毁掉最小二乘。}\cite{gaoxiang2019slam14,barfoot2024state}
+二范数对大误差\emph{增长太快}（$\rho=\tfrac12u^2$，影响函数 $\psi=\rho'=u$ 无界）：一条误匹配边误差大、梯度大，优化会优先迁就这条“无理的边”，抹平其他正确边。外点 $=$ 按噪声模型\emph{极不可能}的观测（常见判据：偏离均值超过\emph{三个标准差}）\cite{barfoot2024state}。
+
+\paragraph{反面对照：先剔除——RANSAC。}\cite{barfoot2024state}
+一条常与鲁棒核\emph{联用}的预处理是 RANSAC（random sample consensus，Fischler--Bolles 1981）：迭代地（1）随机选小子集当假设内点（拟合直线选 2 点）；（2）拟合模型；（3）用模型把其余数据分内/外点，内点太少则弃此迭代；（4）用全部内点\emph{重拟合}；（5）以残差评分。重复多次取最优。要以概率 $p$ 选出全内点子集，需迭代数
+\begin{equation}
+  k=\frac{\ln(1-p)}{\ln(1-w^n)},
+  \label{eq:nlopt-ransac}
+\end{equation}
+$w$ 为单点是内点的概率、$n$ 为子集大小（由 $1-p=(1-w^n)^k$ 解得）。RANSAC \emph{剔除}外点，鲁棒核\emph{降权}外点，二者互补。
+
+\paragraph{M-估计与鲁棒核族。}\cite{barfoot2024state,gaoxiang2019slam14}
+M-估计（“极大似然型”估计）把目标改为
+\begin{equation}
+  J'(\mathbf{x})=\sum_i\alpha_i\,\rho\big(u_i(\mathbf{x})\big),\qquad u_i(\mathbf{x})=\sqrt{\mathbf{e}_i(\mathbf{x})^\top\boldsymbol{\Sigma}_i^{-1}\mathbf{e}_i(\mathbf{x})},
+  \label{eq:nlopt-mestim}
+\end{equation}
+$\alpha_i>0$，$u_i$ 为标量马氏范数，$\rho$ 须有界增长慢、$u=0$ 唯一零点、$u>0$ 单调增。常见核（影响函数 $\psi=\rho'$ 决定大残差的“话语权”）：
+
+\begin{table}[H]\centering\small
+\caption{常见鲁棒核（$s=u^2$；影响函数 $\psi=\rho'$ 决定大残差的话语权）}
+\label{tab:robust}
+\begin{tabular}{lll}
+\toprule
+核 & $\rho(u)$ & 大残差行为 \\
+\midrule
+二范数（L2，非鲁棒） & $\tfrac12 u^2$ & $\psi=u$ 无界，外点主导 \\
+Huber & $\tfrac12u^2\ (|u|\le\delta)$；$\delta(|u|-\tfrac12\delta)\ (|u|>\delta)$ & 内点二次、外点线性（限梯度），凸 \\
+Cauchy（Lorentzian） & $\tfrac{c^2}{2}\ln(1+u^2/c^2)$ & $\psi=\dfrac{u}{1+u^2/c^2}\to0$，强抑制，非凸 \\
+Geman--McClure & $\tfrac12\dfrac{u^2}{1+u^2}$ & 有界（饱和），重外点近乎零权，非凸 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Huber 是“内点保二次、外点转线性”的折中（凸、收敛好）；Cauchy/Geman--McClure 对外点压制更强但\emph{非凸}、易陷局部极小\cite{barfoot2024state}。一条更完整的核列表见 Zhang (1997)；比较研究见 MacTavish--Barfoot (2015)。
+
+\paragraph{IRLS：把鲁棒核变回加权最小二乘（完整推导）。}\cite{barfoot2024state}
+鲁棒核如何进入正规方程？答案是\emph{迭代重加权最小二乘}（IRLS）。对 \cref{eq:nlopt-mestim} 用链式法则求梯度：
+\begin{equation}
+  \frac{\partial J'}{\partial\mathbf{x}}=\sum_i\alpha_i\frac{\partial\rho}{\partial u_i}\frac{\partial u_i}{\partial\mathbf{e}_i}\frac{\partial\mathbf{e}_i}{\partial\mathbf{x}},
+  \qquad \frac{\partial u_i}{\partial\mathbf{e}_i}=\frac{1}{u_i}\mathbf{e}_i^\top\boldsymbol{\Sigma}_i^{-1}.
+  \label{eq:nlopt-irls-grad}
+\end{equation}
+代入得 $\partial J'/\partial\mathbf{x}=\sum_i\mathbf{e}_i^\top\mathbf{Y}_i^{-1}\,\partial\mathbf{e}_i/\partial\mathbf{x}$，其中\emph{依赖 $\mathbf{x}$ 的新（逆）协方差}
+\begin{equation}
+  \mathbf{Y}_i(\mathbf{x})^{-1}=\frac{\alpha_i}{u_i(\mathbf{x})}\frac{\partial\rho}{\partial u_i}\Big|_{u_i(\mathbf{x})}\boldsymbol{\Sigma}_i^{-1}.
+  \label{eq:irls}
+\end{equation}
+此梯度与普通加权最小二乘 $\partial(\tfrac12\sum\mathbf{e}_i^\top\mathbf{Y}_i^{-1}\mathbf{e}_i)/\partial\mathbf{x}$ \emph{形式完全相同}，只是 $\boldsymbol{\Sigma}_i\to\mathbf{Y}_i$。因 $\mathbf{e}_i$ 本就非线性、要迭代，故在上一步工作点 $\mathbf{x}_{\mathrm{op}}$ 处\emph{冻结}权 $\mathbf{Y}_i(\mathbf{x}_{\mathrm{op}})$，每次迭代解一个普通加权最小二乘 $J''(\mathbf{x})=\tfrac12\sum_i\mathbf{e}_i^\top\mathbf{Y}_i(\mathbf{x}_{\mathrm{op}})^{-1}\mathbf{e}_i$，再更新 $\mathbf{x}_{\mathrm{op}}$、重算权。\textbf{合法性}：收敛时 $\hat{\mathbf{x}}=\mathbf{x}_{\mathrm{op}}$，故 $\partial J'/\partial\mathbf{x}|_{\hat{\mathbf{x}}}=\partial J''/\partial\mathbf{x}|_{\hat{\mathbf{x}}}=\mathbf{0}$——\emph{两者同极小、同解}，只是到达路径不同。在 Ceres/g2o 里，给残差块设一个 \texttt{LossFunction}/\texttt{RobustKernel} 即自动启用此机制。
+
+\paragraph{例：Cauchy 核的 IRLS 权。}\cite{barfoot2024state}
+对 Cauchy $\rho=\tfrac12\ln(1+u^2)$，$\partial\rho/\partial u=u/(1+u^2)$，代入 \cref{eq:irls}：
+\begin{equation}
+  \mathbf{Y}_i(\mathbf{x}_{\mathrm{op}})^{-1}=\frac{\alpha_i}{u_i}\cdot\frac{u_i}{1+u_i^2}\boldsymbol{\Sigma}_i^{-1}
+  \ \Rightarrow\ \mathbf{Y}_i(\mathbf{x}_{\mathrm{op}})=\frac{1}{\alpha_i}\big(1+\mathbf{e}_i^\top\boldsymbol{\Sigma}_i^{-1}\mathbf{e}_i\big)\boldsymbol{\Sigma}_i,
+  \label{eq:nlopt-cauchy-Y}
+\end{equation}
+即原协方差 $\boldsymbol{\Sigma}_i$ 的\emph{膨胀版}——随二次误差增大而变大，对外点自动\emph{少信任}。这与下文 MAP 推导的最优协方差（\cref{eq:nlopt-invwishart-M}）形式呼应。
+
+\paragraph{$\star$ 鲁棒 $=$ 逆 Wishart 先验下的 MAP（完整证明）。}\cite{barfoot2024state}
+鲁棒核不是 ad-hoc 补丁，而能从 MAP 严格导出。把每个因子的协方差 $\mathbf{M}_i$ 也当\emph{待估隐变量}，并给它一个\emph{逆 Wishart 先验} $\mathbf{M}_i\sim\mathcal{W}^{-1}(\boldsymbol{\Psi}_i,\nu_i)$（定义在正定矩阵上，$\boldsymbol{\Psi}_i$ 为 scale 矩阵、$\nu_i$ 为自由度，$M_i=\dim\mathbf{M}_i$）：
+\begin{equation}
+  p(\mathbf{M}_i)\propto\det(\mathbf{M}_i)^{-\frac{\nu_i+M_i+1}{2}}\exp\!\Big(-\tfrac12\operatorname{tr}(\boldsymbol{\Psi}_i\mathbf{M}_i^{-1})\Big).
+  \label{eq:nlopt-invwishart}
+\end{equation}
+联合 MAP $\{\hat{\mathbf{x}},\hat{\mathbf{M}}\}=\arg\min J'(\mathbf{x},\mathbf{M})$，$J'=-\ln p(\mathbf{x},\mathbf{M}\mid\mathbf{z})$。后验因式分解 $p(\mathbf{x},\mathbf{M}\mid\mathbf{z})=\prod_i p(\mathbf{x}\mid\mathbf{z}_i,\mathbf{M}_i)p(\mathbf{M}_i)$，代入高斯似然与 \cref{eq:nlopt-invwishart}（丢与 $\mathbf{x},\mathbf{M}$ 无关项）得
+\begin{equation}
+  J'(\mathbf{x},\mathbf{M})=\tfrac12\sum_i\Big(\mathbf{e}_i^\top\mathbf{M}_i^{-1}\mathbf{e}_i-\alpha_i\ln\det(\mathbf{M}_i^{-1})+\operatorname{tr}(\boldsymbol{\Psi}_i\mathbf{M}_i^{-1})\Big),\quad \alpha_i=\nu_i+M_i+2.
+  \label{eq:nlopt-invwishart-J}
+\end{equation}
+\emph{先消去 $\mathbf{M}_i$}：对 $\mathbf{M}_i^{-1}$ 求导（用 $\partial(\mathbf{e}^\top\mathbf{M}^{-1}\mathbf{e})/\partial\mathbf{M}^{-1}=\mathbf{e}\mathbf{e}^\top$、$\partial\ln\det(\mathbf{M}^{-1})/\partial\mathbf{M}^{-1}=\mathbf{M}$、$\partial\operatorname{tr}(\boldsymbol{\Psi}\mathbf{M}^{-1})/\partial\mathbf{M}^{-1}=\boldsymbol{\Psi}$）置零：
+\begin{equation}
+  \tfrac12\mathbf{e}_i\mathbf{e}_i^\top-\tfrac12\alpha_i\mathbf{M}_i+\tfrac12\boldsymbol{\Psi}_i=\mathbf{0}
+  \ \Rightarrow\ \mathbf{M}_i(\mathbf{x})=\underbrace{\tfrac1{\alpha_i}\boldsymbol{\Psi}_i}_{\text{常数}}+\underbrace{\tfrac1{\alpha_i}\mathbf{e}_i(\mathbf{x})\mathbf{e}_i(\mathbf{x})^\top}_{\text{膨胀}}.
+  \label{eq:nlopt-invwishart-M}
+\end{equation}
+最优协方差在残差大处从常数被\emph{膨胀}（与 IRLS 的 \cref{eq:nlopt-cauchy-Y} 神似）。把 $\mathbf{M}_i(\mathbf{x})$ 代回 \cref{eq:nlopt-invwishart-J}（丢与 $\mathbf{x}$ 无关因子）得
+\begin{equation}
+  J'(\mathbf{x})=\tfrac12\sum_i\alpha_i\ln\!\big(1+\mathbf{e}_i(\mathbf{x})^\top\boldsymbol{\Psi}_i^{-1}\mathbf{e}_i(\mathbf{x})\big),
+  \label{eq:nlopt-robust-cauchy}
+\end{equation}
+当 scale 取通常协方差 $\boldsymbol{\Psi}_i=\boldsymbol{\Sigma}_i$ 时，\textbf{这正是加权 Cauchy 鲁棒核}（\cref{tab:robust}）。
+
+\begin{insight}[鲁棒核 $=$ 某协方差先验下的 MAP]
+\cref{eq:nlopt-robust-cauchy} 把“鲁棒估计”从工程补丁提升为\emph{有概率依据的 MAP}：大残差对应“这条观测的真实噪声其实更大”，故自动降权——而\emph{降多少}由逆 Wishart 先验定量给出。Barfoot\cite{barfoot2024state} 推测\emph{所有}鲁棒核都源自对协方差先验 $p(\mathbf{M})$ 的某种选择（Black--Rangarajan 1996 是起点）。现代做法还有：自适应单参数核族（Barron 2019，估计中\emph{自选}最佳核）、渐进非凸 GNC（Yang 等 2020，逐步施加非凸核以避开劣质局部极小）。
+\end{insight}
+
+\begin{pitfall}[概念误区：鲁棒核是“工程黑魔法”]
+“加个 Huber 就行”常被当成玄学。其实鲁棒核 $=$ IRLS 重加权（\cref{eq:irls}）$=$ 逆 Wishart 先验下的 MAP（\cref{eq:nlopt-robust-cauchy}）——三者等价、有严格概率根。误区后果：乱设核参数 $c$/$\delta$ 而不理解其“残差多大才算外点”的物理含义。正确做法：核参数对应“开始降权的残差阈值”（约几个 $\sigma$），按噪声尺度设。另注意非凸核（Cauchy/GM）需好初值或 GNC，否则陷局部极小。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 画出 L2、Huber、Cauchy 的 $\rho(u)$ 与影响函数 $\psi(u)=\rho'(u)$，比较大 $u$ 处的话语权。
+  \item 对 Cauchy 核推出 IRLS 权 \cref{eq:nlopt-cauchy-Y} 的具体形式。
+  \item （推导，草稿纸）完整重做 \cref{eq:nlopt-invwishart-J}$\to$\cref{eq:nlopt-invwishart-M}$\to$\cref{eq:nlopt-robust-cauchy} 的“消去 $\mathbf{M}_i$ 得 Cauchy 核”。
+  \item （概念）为什么 Huber 比 Cauchy 收敛更稳（凸），但抑制外点更弱？用 \cref{eq:nlopt-ransac} 估算 $w=0.5,n=2,p=0.99$ 需多少 RANSAC 迭代。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{收敛之后：协方差、偏差与一致性}
+\label{sec:nlopt-cov}
+
+\paragraph{拉普拉斯近似：逆海森即协方差。}\cite{barfoot2024state}
+MAP/GN 只给点估计 $\hat{\mathbf{x}}$，但常需其不确定度。\emph{拉普拉斯近似}用“以 $\hat{\mathbf{x}}$ 为中心、逆海森为协方差”的高斯近似后验：MAP 收敛后令 $\hat{\mathbf{x}}=\mathbf{x}_{\mathrm{op}}$，而 $\hat{\boldsymbol{\Sigma}}$ 取为代价函数海森在 $\hat{\mathbf{x}}$ 处的逆。GN 情形下，正规方程左端\emph{恰是逆协方差}：
+\begin{equation}
+  \hat{\boldsymbol{\Sigma}}^{-1}=\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}=\boldsymbol{\Lambda}\quad(\text{在 }\hat{\mathbf{x}}\text{ 处求值}).
+  \label{eq:laplace}
+\end{equation}
+即\textbf{信息矩阵 $=$ 逆协方差}（Barfoot\cite{barfoot2024state} §4.3.1 把 GN 左端直接取作 Laplace 逆协方差 $\hat{\mathbf{P}}^{-1}=\mathbf{H}^\top\mathbf{W}^{-1}\mathbf{H}$）。这与 \cref{ch:slam_est}、\cref{ch:eskf} 一脉相承，也和变量消元的 $\boldsymbol{\Sigma}_j=(\mathbf{R}_j^\top\mathbf{R}_j)^{-1}$（\cref{eq:nlopt-elim-cond}）一致——回代 $\boldsymbol{\Lambda}^{-1}=\mathbf{R}^{-1}\mathbf{R}^{-\top}$ 即得后验协方差。需要某变量的\emph{边缘}协方差时，回代 $\boldsymbol{\Lambda}^{-1}$ 的对应块（勿显式整体求逆）。
+
+\paragraph{与 CRLB 的关系。}
+\cref{eq:laplace} 的信息矩阵 $\boldsymbol{\Lambda}=\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ 正是高斯观测下的\emph{费舍尔信息矩阵}（Fisher information），其逆即\emph{克拉默--拉奥下界}（CRLB）——任何无偏估计的协方差不可能小于 $\boldsymbol{\Lambda}^{-1}$\rebuilt{CRLB$=$费舍尔信息之逆为标准结果（ML 大样本下达到 CRLB），Barfoot 仅在粒子滤波处顺带提 CRLB 作“采样数不可突破的下界”，未与 Laplace 显式等号；此处按经典结果补全}。换言之，GN 收敛后的逆海森\emph{同时}是“后验协方差（Laplace）”“费舍尔信息之逆”“CRLB”——三位一体，这是“最小二乘解在弱非线性下\emph{统计高效}”的根。
+
+\paragraph{$\star$ 最大似然/MAP 有偏（Box 1971 闭式）。}\cite{barfoot2024state}
+非线性观测下，ML/MAP \emph{有偏}（除非模型线性）——因后验众数 $\neq$ 均值（前述 pitfall）。Box (1971) 给近似偏差闭式：设 ML $\hat{\mathbf{x}}=\arg\min\tfrac12\sum_k(\mathbf{y}_k-\mathbf{g}_k(\mathbf{x}))^\top\boldsymbol{\Sigma}_{v,k}^{-1}(\mathbf{y}_k-\mathbf{g}_k(\mathbf{x}))$，记 $\mathbf{G}_k=\partial\mathbf{g}_k/\partial\mathbf{x}$、$\boldsymbol{\mathcal{G}}_{jk}=\partial^2 g_{jk}/\partial\mathbf{x}\partial\mathbf{x}^\top$、$\mathbf{W}(\mathbf{x})=\sum_k\mathbf{G}_k^\top\boldsymbol{\Sigma}_{v,k}^{-1}\mathbf{G}_k$，$\mathbf{1}_j$ 为单位阵第 $j$ 列，则系统偏差
+\begin{equation}
+  \mathbb{E}[\delta\mathbf{x}]=-\tfrac12\mathbf{W}(\mathbf{x})^{-1}\sum_k\mathbf{G}_k^\top\boldsymbol{\Sigma}_{v,k}^{-1}\sum_j\mathbf{1}_j\operatorname{tr}\!\big(\boldsymbol{\mathcal{G}}_{jk}\,\mathbf{W}(\mathbf{x})^{-1}\big).
+  \label{eq:nlopt-mlbias}
+\end{equation}
+\emph{推导骨架}（Barfoot\cite{barfoot2024state} §4.3.3，完整步在 \cref{sec:nlopt-appendix}）：把最优条件 $\sum_k\mathbf{G}_k(\hat{\mathbf{x}})^\top\boldsymbol{\Sigma}_{v,k}^{-1}(\mathbf{y}_k-\mathbf{g}_k(\hat{\mathbf{x}}))=\mathbf{0}$ 在真值处二阶展开，设 $\delta\mathbf{x}=\mathbf{A}\mathbf{n}+\mathbf{b}(\mathbf{n})$（线性 $+$ 二次依赖噪声），用奇偶对消（$\mathbf{n}\to-\mathbf{n}$）定出线性系数 $\mathbf{A}=\mathbf{W}^{-1}\sum_k\mathbf{G}_k^\top\boldsymbol{\Sigma}_{v,k}^{-1}\mathbf{P}_k$ 使线性项为零，再对二次项取期望（用 $\operatorname{tr}$ 恒等式 $\mathbb{E}[\mathbf{n}^\top\mathbf{A}^\top\boldsymbol{\mathcal{G}}\mathbf{A}\mathbf{n}]=\operatorname{tr}(\boldsymbol{\mathcal{G}}\mathbf{A}\boldsymbol{\Sigma}\mathbf{A}^\top)$）即得 \cref{eq:nlopt-mlbias}。偏差正比于观测模型的\emph{曲率}（二阶导 $\boldsymbol{\mathcal{G}}$）乘协方差量级；弱非线性时可近似\emph{去偏} $\hat{\mathbf{x}}\leftarrow\hat{\mathbf{x}}-\mathbb{E}[\delta\mathbf{x}]$。强非线性时这是 GN/EKF 系统误差之源（\cref{ch:eskf} 的“EKF 有偏不一致”同源）。
+
+\paragraph{一致性检验：NEES 与 NIS。}\cite{barfoot2024state}
+估出协方差后，怎么知道它\emph{可信}（不过自信/欠自信）？两个统计量。
+\emph{NEES}（归一化估计误差平方，需真值 $\mathbf{x}_{\text{true}}$）：
+\begin{equation}
+  \epsilon_{\text{nees},k}=\hat{\mathbf{e}}_k^\top\hat{\boldsymbol{\Sigma}}_k^{-1}\hat{\mathbf{e}}_k,\quad \hat{\mathbf{e}}_k=\hat{\mathbf{x}}_k-\mathbf{x}_{\text{true},k},\qquad \mathbb{E}[\epsilon_{\text{nees},k}]=N,
+  \label{eq:nlopt-nees}
+\end{equation}
+$N$ 为状态维。$<N$ 为\emph{欠自信}、$>N$ 为\emph{过自信}。\emph{NIS}（归一化创新平方，无需真值）：
+\begin{equation}
+  \epsilon_{\text{nis},k}=\mathbf{e}_{y,k}^\top\mathbf{S}_{y,k}^{-1}\mathbf{e}_{y,k},\quad \mathbf{e}_{y,k}=\mathbf{y}_k-\mathbf{g}(\check{\mathbf{x}}_k),\quad \mathbf{S}_{y,k}=\mathbf{G}_k\check{\boldsymbol{\Sigma}}_k\mathbf{G}_k^\top+\boldsymbol{\Sigma}_{v,k},\qquad \mathbb{E}[\epsilon_{\text{nis},k}]=M,
+  \label{eq:nlopt-nis}
+\end{equation}
+$M$ 为观测维。两者在多次试验或（遍历假设下）多时刻上应分别近 $N,M$；统计检验用卡方分位数 $Q_{\chi^2(NK)}(\ell)\le\sum_k\epsilon_{\text{nees},k}\le Q_{\chi^2(NK)}(u)$（NIS 同理）。\textbf{警示}：观测/运动非线性时（线性化推导），NEES/NIS 永不\emph{精确}满足，只作近似诊断\cite{barfoot2024state}。\cref{sec:nlopt-appendix} 给“自适应协方差估计与 NIS 的联系”。
+
+\begin{pitfall}[概念误区：把 GN 的逆海森协方差当“真协方差”]
+$\hat{\boldsymbol{\Sigma}}=\boldsymbol{\Lambda}^{-1}$ 只是\emph{Laplace 近似}（把后验当以众数为心的高斯），且 $\boldsymbol{\Lambda}=\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ 又是 GN 近似海森。两重近似 $+$ ML 偏差（\cref{eq:nlopt-mlbias}）使强非线性下它\emph{过乐观}。后果：下游（数据关联门限、主动 SLAM、一致性）误判。对策：用 NEES/NIS 检验一致性；强非线性处考虑去偏或采样法（\cref{ch:eskf}）。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:gn-normal} 说明为什么收敛后左端 $\boldsymbol{\Lambda}$ 就是逆协方差，并写出取某变量边缘协方差的做法（不整体求逆）。
+  \item （概念）解释 NEES $>N$（过自信）在工程上意味着什么、可能由什么引起。
+  \item （推导，选做）对一维 $g(x)=fb/x$（立体深度）写出 \cref{eq:nlopt-mlbias} 的标量版，定性说明深度越大偏差越大。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{实践：手写 GN / Ceres / g2o}
+\label{sec:nlopt-practice}
+
+现代做法是\emph{声明残差、交给库}：库负责线性化、稀疏分解、信赖域调度。本节给同一曲线拟合的三套完整实现并对比（与 \cref{sec:nlopt-gn} 手写 GN 互为印证）。
+
+\paragraph{Ceres（自动求导 $+$ 信赖域）。}\cite{gaoxiang2019slam14}
+Ceres 把问题写成 $\min\tfrac12\sum_i\rho_i(\|f_i(\cdot)\|^2)$ s.t. $l_j\le x_j\le u_j$（核 $\rho$ 取恒等即无鲁棒）。用户：定义参数块、残差块（带模板 \texttt{()} 的仿函数 $\to$ 自动求导）、加入 \texttt{Problem}、\texttt{Solve}。
+
+\begin{codebox}[C++]{Ceres 曲线拟合（slambook2/ch6/ceresCurveFitting.cpp，关键体）}
+// 残差仿函数：模板 () 运算符使 Ceres 能自动求导
+struct CURVE_FITTING_COST {
+  CURVE_FITTING_COST(double x, double y) : _x(x), _y(y) {}
+  template<typename T>
+  bool operator()(const T* const abc, T* residual) const {  // abc 有 3 维
+    residual[0] = T(_y) - ceres::exp(abc[0]*T(_x)*T(_x) + abc[1]*T(_x) + abc[2]);
+    return true;                                             // y - exp(a x^2 + b x + c)
+  }
+  const double _x, _y;
+};
+// main 中：
+double abc[3] = {ae, be, ce};                               // 参数块
+ceres::Problem problem;
+for (int i=0; i<N; i++)
+  problem.AddResidualBlock(
+    new ceres::AutoDiffCostFunction<CURVE_FITTING_COST, 1, 3>(  // 误差维 1, 参数维 3
+      new CURVE_FITTING_COST(x_data[i], y_data[i])),
+    nullptr,    // 核函数: nullptr 即不用鲁棒核(rho=恒等); 换 HuberLoss 即启用 IRLS
+    abc);
+ceres::Solver::Options options;
+options.linear_solver_type = ceres::DENSE_NORMAL_CHOLESKY;  // 稠密正规方程 + Cholesky
+// BA 中改为 ceres::SPARSE_SCHUR 即自动对路标做 Schur 边缘化(见 sec sparse)
+ceres::Solver::Summary summary;
+ceres::Solve(options, &problem, &summary);
+// 结果: a,b,c = 0.890908 2.1719 0.943628; 8 次迭代; 约 1.3 ms
+\end{codebox}
+
+\noindent Ceres 默认用 LM/信赖域：其日志里 \texttt{tr\_ratio} 即增益比 $\rho$（始终近 1 说明二次近似良好）、\texttt{tr\_radius} 从 $10^4$ 单调升到 $9.4\times10^6$（对应 $\rho>\tfrac34$ 则放大信赖域，\cref{sec:nlopt-lm}）。注意 Ceres 报的 cost 是 $\tfrac12\sum e^2\approx50.97$，手写 GN 报 $\sum e^2\approx101.94$，差因子 2（系数 $\tfrac12$）。
+
+\paragraph{g2o（图优化）。}\cite{gaoxiang2019slam14}
+g2o（general graphic optimization）把变量建成\emph{顶点}、残差建成\emph{边}：顶点用\emph{超图}（边可连一/二/多个顶点）。曲线拟合只有一个顶点 $(a,b,c)$、100 条\emph{一元边}（自连）。顶点须实现\emph{更新} \texttt{oplusImpl}（位姿则用右扰动）、边须实现 \texttt{computeError} 与 \texttt{linearizeOplus}。
+
+\begin{codebox}[C++]{g2o 曲线拟合（slambook2/ch6/g2oCurveFitting.cpp，关键体）}
+// 顶点: 优化变量维 3, 类型 Vector3d
+class CurveFittingVertex : public g2o::BaseVertex<3, Eigen::Vector3d> {
+public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  virtual void setToOriginImpl() override { _estimate << 0,0,0; }
+  virtual void oplusImpl(const double* update) override {     // 向量空间: 直接加
+    _estimate += Eigen::Vector3d(update);                     // 位姿则改为右乘 Exp
+  }
+  virtual bool read(istream&) { return true; }
+  virtual bool write(ostream&) const { return true; }
+};
+// 边: 观测维 1, 类型 double, 连接 CurveFittingVertex
+class CurveFittingEdge : public g2o::BaseUnaryEdge<1, double, CurveFittingVertex> {
+public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  CurveFittingEdge(double x) : BaseUnaryEdge(), _x(x) {}
+  virtual void computeError() override {
+    const auto* v = static_cast<const CurveFittingVertex*>(_vertices[0]);
+    const Eigen::Vector3d abc = v->estimate();
+    _error(0,0) = _measurement - std::exp(abc[0]*_x*_x + abc[1]*_x + abc[2]);
+  }
+  virtual void linearizeOplus() override {                    // 解析雅可比
+    const auto* v = static_cast<const CurveFittingVertex*>(_vertices[0]);
+    const Eigen::Vector3d abc = v->estimate();
+    double y = exp(abc[0]*_x*_x + abc[1]*_x + abc[2]);
+    _jacobianOplusXi[0] = -_x*_x*y;   // de/da
+    _jacobianOplusXi[1] = -_x*y;      // de/db
+    _jacobianOplusXi[2] = -y;         // de/dc
+  }
+  virtual bool read(istream&) { return true; }
+  virtual bool write(ostream&) const { return true; }
+  double _x;
+};
+// main: 选 GN/LM/DogLeg 之一; 加顶点; 加边(setInformation = Sigma^-1); optimize(10)
+// 边可挂鲁棒核: edge->setRobustKernel(new g2o::RobustKernelHuber());  // IRLS + Huber
+// 结果: estimated model = 0.890912 2.1719 0.943629
+\end{codebox}
+
+\noindent g2o 顶点的 \texttt{oplusImpl} 处理 $\mathbf{x}_{k+1}=\mathbf{x}_k\boxplus\Delta\mathbf{x}$：曲线参数在向量空间故直接加；\emph{位姿不在向量空间}，须用右乘更新 $\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$（\cref{sec:nlopt-manifold}，BA 中的关键）。日志 \texttt{chi2} 即 $\sum e^\top\boldsymbol{\Sigma}^{-1}e\approx101.94$；\texttt{schur=0} 表示本例无需 Schur（只一个顶点）。
+
+\paragraph{三者对比（同一曲线拟合）。}\cite{gaoxiang2019slam14}
+
+\begin{table}[H]\centering\small
+\caption{手写 GN / Ceres / g2o 对比（曲线拟合，真值 $a,b,c=1,2,1$）}
+\label{tab:nlopt-three}
+\begin{tabular}{lllll}
+\toprule
+方法 & 求解器 / 求导 & 迭代 & 用时 & 终估 $(a,b,c)$ \\
+\midrule
+手写 GN & LDLT(Cholesky) / 解析雅可比 & 9 & $\approx0.2$ ms & $0.8909,2.1719,0.9436$ \\
+Ceres & DENSE\_NORMAL\_CHOLESKY / 自动求导 $+$ LM & 8 & $\approx1.3$ ms & $0.8909,2.1719,0.9436$ \\
+g2o & LinearSolverDense / 解析雅可比 $+$ GN & 10 & $\approx0.9$ ms & $0.8909,2.1719,0.9436$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 结果一致，速度\emph{手写 $>$ g2o $>$ Ceres}（“通用性与效率互相矛盾”；Ceres 此处用了自动求导且配置非纯 GN，故看起来慢）。
+
+\paragraph{解析雅可比 vs 自动求导。}\cite{gaoxiang2019slam14}
+能推\emph{解析}雅可比（用 \cref{ch:lie} 右扰动）就告诉库，避免数值/自动求导的精度与效率损失——这与本书“逐公式推导”的基调一致。Ceres 提供模板元自动求导（编译期、本质仍是数值导数）与运行时数值求导；g2o 提供运行时数值求导。多数问题若能推出解析形式，可避免数值求导的种种问题。BA 中位姿用流形参数化、线性求解器选 \texttt{SPARSE\_SCHUR} 即自动对路标 Schur 边缘化（\cref{sec:nlopt-sparse}）。
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 Sophus $+$ Eigen 手写一个 SE(3) 位姿图的 GN/LM 迭代，\texttt{oplusImpl} 用右乘，对比有无 Huber 核时对外点的鲁棒性。
+  \item 在 Ceres 里把线性求解器从 \texttt{DENSE} 换成 \texttt{SPARSE\_SCHUR}，在一个 BA 例上测时间，验证 Schur 的加速。
+  \item （概念）解释 g2o 的 \texttt{setInformation(Sigma.inverse())} 与本章白化/信息矩阵加权的对应。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\addcontentsline{toc}{section}{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+非线性最小二乘能像线性那样一步解 & 一般无闭式解，须迭代线性化（\cref{sec:nlopt-why}）\\
+MAP 给的是后验“均值” & 给的是“众数”，非线性时 $\ne$ 均值，故 ML 有偏（\cref{sec:nlopt-cov}）\\
+信息矩阵加权可有可无 & 不加则量纲混乱、丢各向异性；须白化（\cref{sec:nlopt-solve}）\\
+高斯牛顿就是牛顿法 & GN 线性化\emph{残差}、用 $\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ 近似海森，丢残差$\times$二阶导项（\cref{thm:gn}）\\
+LM 的 $\lambda$ 越大越好 & 大趋最速下降（稳但慢）、小趋 GN（快但可能不稳）；按 $\rho$ 自适应（\cref{sec:nlopt-lm}）\\
+增益比 $\rho$ 与鲁棒核 $\rho$ 是一回事 & 前者是标量（调信赖域），后者是函数（降权外点），仅撞名 \\
+直接对信息矩阵求逆解方程 & 用 Cholesky/QR 分解 $+$ 前后代，绝不显式求逆（\cref{sec:nlopt-solve}）\\
+Cholesky 和 QR 给不同的解 & 给相同 $\mathbf{R}$、相同解；QR 更稳、Cholesky 更快（\cref{sec:nlopt-solve}）\\
+变量排序会改变解 & 只改 fill-in（速度），解完全相同（COLAMD，\cref{sec:nlopt-sparse}）\\
+BA 上万维解不动 & 利用因子图稀疏 $+$ Schur 消元，降到 $O(\text{相机}^3)$（\cref{eq:schur}）\\
+位姿当普通向量做加法更新 & 用右扰动 $\boxplus$（$\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$），无约束（\cref{sec:nlopt-manifold}）\\
+鲁棒核是工程黑魔法 & 它 $=$ IRLS 重加权 $=$ 逆 Wishart 先验下的 MAP（\cref{eq:nlopt-robust-cauchy}）\\
+GN 逆海森就是真协方差 & 是 Laplace$+$GN 双重近似，强非线性下过乐观（\cref{eq:laplace}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$J(\mathbf{x})$ & 目标函数 $\tfrac12\sum_i\|\mathbf{e}_i\|_{\boldsymbol{\Sigma}_i}^2$ & \cref{eq:nls} \\
+$\mathbf{e}(\mathbf{x}),\mathbf{J}$ & 残差及其雅可比 $\mathbf{J}=\partial\mathbf{e}/\partial\mathbf{x}$ & \cref{eq:gn-linearize} \\
+$\nabla J,\mathbf{H}_J$ & 目标的梯度 / 海森（区别于残差雅可比 $\mathbf{J}$） & \cref{eq:taylor-J} \\
+$\boldsymbol{\Lambda},\mathbf{W}$ & 信息矩阵 $\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ / 堆叠权 $\operatorname{diag}(\boldsymbol{\Sigma}_i)$ & \cref{eq:gn-normal} \\
+$\lambda,\rho$ & LM 阻尼 / 增益比 & \cref{eq:lm},\cref{eq:lm-rho} \\
+$\mathbf{A}_i,\mathbf{b}_i$ & 白化雅可比 / 右端 $\boldsymbol{\Sigma}_i^{-1/2}\mathbf{J}_i,\ \boldsymbol{\Sigma}_i^{-1/2}(-\mathbf{e}_i)$ & \cref{eq:nlopt-Ai} \\
+$\mathbf{R}$（此章）& Cholesky 上三角因子 $\boldsymbol{\Lambda}=\mathbf{R}^\top\mathbf{R}$（非旋转） & \cref{eq:cholesky} \\
+$\mathbf{B},\mathbf{C},\mathbf{E},\mathbf{S}$ & BA 相机/路标/耦合/Schur 补 $\mathbf{S}=\mathbf{B}-\mathbf{E}\mathbf{C}^{-1}\mathbf{E}^\top$ & \cref{eq:ba-block} \\
+$\mathbf{s}_j,\tau$ & 变量消元的分隔集 / 新因子 & \cref{eq:nlopt-elim-cond} \\
+$\boxplus,\boxminus$ & 流形增量 / 差 $\mathbf{T}\boxplus\delta\boldsymbol{\xi}=\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$ & \cref{eq:retraction} \\
+$\rho(u),u_i$ & 鲁棒核 / 标量马氏范数 & \cref{eq:nlopt-mestim} \\
+$\mathbf{Y}_i$ & IRLS 重加权后的等效协方差 & \cref{eq:irls} \\
+$\mathbf{M}_i,\boldsymbol{\Psi}_i,\nu_i$ & 待估协方差 / 逆 Wishart scale / 自由度 & \cref{eq:nlopt-invwishart} \\
+$\check{\mathbf{x}},\hat{\mathbf{x}},\mathbf{x}_{\mathrm{op}}$ & 先验 / 后验 / 线性化工作点 & \cref{sec:nlopt-cov} \\
+$\epsilon_{\text{nees}},\epsilon_{\text{nis}}$ & 归一化估计误差/创新平方 & \cref{eq:nlopt-nees},\cref{eq:nlopt-nis} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{定理速查表}
+\begin{tabular}{lll}
+\toprule
+名称 & 一句话说明（你能做什么） & 出处 \\
+\midrule
+MAP$\to$最小二乘 & 把“找最可能状态”化成可解的加权二次型 & \cref{thm:nlopt-map} \\
+迭代下降 & 非线性问题靠“线性化$\to$解增量$\to$更新”反复逼近 & \cref{sec:nlopt-why} \\
+牛顿 / GN & GN 用 $\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ 替海森，免算二阶导 & \cref{thm:gn} \\
+LM & 用 $\lambda,\rho$ 在 GN 与最速下降间安全插值 & \cref{prop:lm} \\
+白化 & 左乘 $\boldsymbol{\Sigma}^{-1/2}$ 使各观测同量纲可加 & \cref{eq:nlopt-whiten} \\
+Cholesky/QR/$\sqrt{}$SAM & 分解 $+$ 前后代解线性系统，绝不求逆 & \cref{eq:cholesky} \\
+Schur 消元 & 边缘化路标，复杂度降到 $O(\text{相机}^3)$ & \cref{eq:schur} \\
+变量消元 $=$ 分解 & 消元一步$=$Schur 补，回代得 MAP 与协方差 & \cref{eq:nlopt-elim-cond} \\
+流形 GN & 右扰动雅可比 $+$ $\boxplus$ 更新，把约束优化变无约束 & \cref{eq:retraction} \\
+IRLS & 把鲁棒核变回“逐步重加权”的普通最小二乘 & \cref{eq:irls} \\
+鲁棒 $=$ MAP & 鲁棒核 $\Leftrightarrow$ 逆 Wishart 协方差先验下的 MAP & \cref{eq:nlopt-robust-cauchy} \\
+拉普拉斯协方差 & 收敛后逆海森即后验协方差（$=$ CRLB） & \cref{eq:laplace} \\
+ML 偏差 & 非线性使估计有偏，可按曲率闭式去偏 & \cref{eq:nlopt-mlbias} \\
+NEES/NIS & 用卡方检验判断协方差是否过/欠自信 & \cref{eq:nlopt-nees} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{cllll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 & 脉络层 \\
+\midrule
+1 & MAP$\to$最小二乘 & 高斯$+$独立$+$信息加权 & \(\star\star\star\) & 骨干 \\
+2 & 迭代下降 & 线性化$\to$解增量$\to$更新 & \(\star\star\) & 骨干 \\
+3 & 梯度/牛顿/GN & $\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ 近似海森 & \(\star\star\star\) & 骨干 \\
+4 & LM/信赖域 & $\lambda,\rho$ 插值与接受/拒绝 & \(\star\star\star\) & 骨干 \\
+5 & 白化·Cholesky/QR & $\sqrt{}$SAM；不求逆 & \(\star\star\star\) & 骨干 \\
+6 & 稀疏·Schur·消元 & fill-in$=$共视；COLAMD & \(\star\star\star\star\) & 骨干 \\
+7 & 流形右扰动 & $\boxplus$；对接 Ceres/GTSAM & \(\star\star\star\star\) & 次优 \\
+8 & 鲁棒核/IRLS/逆 Wishart & 鲁棒$=$协方差先验 MAP & \(\star\star\star\star\) & 前沿 \\
+9 & 协方差/偏差/一致性 & Laplace$=$CRLB；ML 偏差；NEES & \(\star\star\star\star\) & 次优 \\
+10 & 三库实践 & 手写$>$g2o$>$Ceres & \(\star\star\) & 次优 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{延伸阅读。}
+\begin{itemize}
+  \item 视觉 SLAM 十四讲\cite{gaoxiang2019slam14} 第 6、9 章：MAP$\to$最小二乘、GN/LM 直觉与代码、BA 稀疏 Schur、Ceres/g2o 实践。
+  \item Barfoot\cite{barfoot2024state} 第 4、5 章：批量 GN 的严谨推导（$\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$ 近似海森、IEKF$=$GN、Laplace 协方差、ML 偏差、IRLS、鲁棒$=$逆 Wishart MAP、SWF 边缘化、NEES/NIS）。
+  \item SLAM Handbook\cite{carlone2026handbook} \& Dellaert/Kaess\cite{dellaert2017factor} 第 1 章：因子图、白化、Cholesky/QR/$\sqrt{}$SAM、稀疏$=$因子图、COLAMD/fill-in、变量消元$=$分解、Bayes 树/iSAM2。
+  \item Hertzberg 等\cite{hertzberg2013integrating}：$\boxplus/\boxminus$ 流形封装——把通用优化干净地搬到流形。
+  \item 前沿：自适应鲁棒核族（Barron 2019, arXiv:1701.03077）、渐进非凸 GNC（Yang 等 2020, arXiv:2009.00892）、可证最优位姿图（SE-Sync）——留作开放阅读。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+后续章节 & 与本章的关系 & 本章哪个知识点为其铺垫 \\
+\midrule
+\cref{ch:vo} 视觉里程计 & 重投影 BA 后端解最小二乘 & 流形 GN、稀疏 Schur、鲁棒核 \\
+\cref{ch:lidar_slam} 激光 SLAM & 点云配准/位姿图优化 & GN/LM、白化、Cholesky \\
+\cref{ch:vio} VIO & IMU 预积分因子 $+$ 滑窗边缘化 & SWF 边缘化（附录）、流形右扰动 \\
+\cref{ch:calib} 相机标定 & 最大似然 LM 精化内外参 & GN/LM、解析雅可比、协方差 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.22\textwidth} p{0.30\textwidth} p{0.40\textwidth}}
+\toprule
+症状 & 可能原因 & 排查步骤 / 对策 \\
+\midrule
+不收敛 / 发散 & 初值差、强非线性、步太大 & 给好初值（ICP/PnP）；改 LM 增大 $\lambda$；线搜索取 $\alpha<1$（\cref{sec:nlopt-lm}）\\
+$\boldsymbol{\Lambda}$ 奇异 / 解爆掉 \texttt{NaN} & 不可观测、gauge 自由度、$\theta\to0$ 雅可比奇异 & 加先验/固定基准帧（\cref{ch:slam_est}）；小角度用泰勒分支 \\
+BA 慢得无法实时 & 未用稀疏 Schur / 排序差 & 选 \texttt{SPARSE\_SCHUR}；好排序（COLAMD，\cref{sec:nlopt-sparse}）\\
+回环处轨迹被拉飞 & 外点/误匹配主导二次代价 & RANSAC 预剔 $+$ 鲁棒核（Huber/Cauchy）；非凸核用 GNC（\cref{sec:nlopt-robust}）\\
+位姿更新后不再是 SE(3) & 用了普通加法更新 & 右扰动 $\boxplus$（$\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$，\cref{sec:nlopt-manifold}）\\
+雅可比侧与更新侧不符、震荡 & 左扰动雅可比配右乘更新 & 全程同侧；引用左扰动公式经 $\mathrm{Ad}$ 转右（\cref{ch:lie}）\\
+协方差过乐观（NEES$>N$）& GN/Laplace 近似 $+$ ML 偏差 & NEES/NIS 检验；强非线性处去偏或采样（\cref{sec:nlopt-cov}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{研究实践建议}
+\addcontentsline{toc}{section}{研究实践建议}
+给新手：先把手写 GN 曲线拟合（\cref{sec:nlopt-gn}）跑通，再换 Ceres/g2o 验证；调 BA 时先确认\emph{初值}与\emph{稀疏求解器}选对，再谈鲁棒核。给有经验者：能推解析雅可比就别用自动求导（\cref{ch:lie} 右扰动）；用 NEES/NIS 把协方差校准好（下游一致性依赖它）；非凸鲁棒核配 GNC 以避局部极小。
+
+% ════════════════════════════════════════════════════════════════
+\section*{附录：本章推导补遗}
+\label{sec:nlopt-appendix}
+\addcontentsline{toc}{section}{附录：本章推导补遗}
+
+\begin{derivation}[高斯牛顿如何近似海森（\cref{thm:gn}）]
+$J=\tfrac12\mathbf{e}^\top\mathbf{W}^{-1}\mathbf{e}$，梯度 $\nabla J=\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{e}$。再求一次导：
+\[
+  \mathbf{H}_J=\frac{\partial}{\partial\mathbf{x}}\big(\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{e}\big)
+  =\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}+\sum_i\big[\mathbf{W}^{-1}\mathbf{e}\big]_i\,\frac{\partial^2 e_i}{\partial\mathbf{x}\partial\mathbf{x}^\top}.
+\]
+第一项只含一阶导 $\mathbf{J}$；第二项含残差 $\mathbf{e}$ 与二阶导之积。接近最优时 $\mathbf{e}\to\mathbf{0}$，第二项被压制，故 $\mathbf{H}_J\approx\mathbf{J}^\top\mathbf{W}^{-1}\mathbf{J}$。代入牛顿步 $\mathbf{H}_J\Delta\mathbf{x}=-\nabla J$ 即 \cref{eq:gn-normal}。当残差大且模型强非线性时第二项不可略，GN 退化、需牛顿或 LM。\hfill$\square$
+\end{derivation}
+
+\begin{derivation}[Schur 消元（\cref{eq:schur}）]
+对 \cref{eq:ba-block} 左乘消元矩阵 $\big[\begin{smallmatrix}\mathbf{I}&-\mathbf{E}\mathbf{C}^{-1}\\\mathbf{0}&\mathbf{I}\end{smallmatrix}\big]$：
+\[
+  \begin{bmatrix}\mathbf{B}-\mathbf{E}\mathbf{C}^{-1}\mathbf{E}^\top&\mathbf{0}\\\mathbf{E}^\top&\mathbf{C}\end{bmatrix}
+  \begin{bmatrix}\Delta\mathbf{x}_c\\\Delta\mathbf{x}_p\end{bmatrix}
+  =\begin{bmatrix}\mathbf{v}-\mathbf{E}\mathbf{C}^{-1}\mathbf{w}\\\mathbf{w}\end{bmatrix}.
+\]
+第一行只含 $\Delta\mathbf{x}_c$，即 $\mathbf{S}\Delta\mathbf{x}_c=\mathbf{v}-\mathbf{E}\mathbf{C}^{-1}\mathbf{w}$（$\mathbf{S}$ 为 $\mathbf{C}$ 的 Schur 补）；解出后回代第二行 $\mathbf{C}\Delta\mathbf{x}_p=\mathbf{w}-\mathbf{E}^\top\Delta\mathbf{x}_c$ 得 $\Delta\mathbf{x}_p$。因 $\mathbf{C}$ 块对角，$\mathbf{C}^{-1}$ 廉价；主成本在分解 $\mathbf{S}$（仅相机维）。$\mathbf{S}$ 的非对角填充即共视诱导的 fill-in。\hfill$\square$
+\end{derivation}
+
+\begin{derivation}[IRLS 的合法性（\cref{eq:irls}）]
+M-估计目标 $J'=\sum_i\alpha_i\rho(u_i)$，$u_i=\|\mathbf{e}_i\|_{\boldsymbol{\Sigma}_i}$。链式求导
+$\partial J'/\partial\mathbf{x}=\sum_i\alpha_i\dfrac{\rho'(u_i)}{u_i}\mathbf{e}_i^\top\boldsymbol{\Sigma}_i^{-1}\dfrac{\partial\mathbf{e}_i}{\partial\mathbf{x}}$。
+令重加权目标 $J''=\tfrac12\sum_i\mathbf{e}_i^\top\mathbf{Y}_i^{-1}\mathbf{e}_i$，$\mathbf{Y}_i^{-1}=\dfrac{\alpha_i\rho'(u_i)}{u_i}\boldsymbol{\Sigma}_i^{-1}$，在冻结点 $\mathbf{x}_{\mathrm{op}}$ 处其梯度与 $J'$ 相同。故 $\partial J'/\partial\mathbf{x}=\partial J''/\partial\mathbf{x}=\mathbf{0}$ 同解：每步解普通加权最小二乘 $J''$、更新权 $\mathbf{Y}_i$、迭代，即 IRLS，收敛到 $J'$ 的极小（到达路径不同）。\hfill$\square$
+\end{derivation}
+
+\begin{derivation}[鲁棒 $=$ 逆 Wishart 先验 MAP（\cref{eq:nlopt-robust-cauchy}）]
+把最优协方差 \cref{eq:nlopt-invwishart-M} $\mathbf{M}_i(\mathbf{x})=\tfrac1{\alpha_i}(\boldsymbol{\Psi}_i+\mathbf{e}_i\mathbf{e}_i^\top)$ 代回 \cref{eq:nlopt-invwishart-J}。逐项：
+$\mathbf{e}_i^\top\mathbf{M}_i^{-1}\mathbf{e}_i$ 用 Sherman--Morrison 得 $\dfrac{\alpha_i\,\mathbf{e}_i^\top\boldsymbol{\Psi}_i^{-1}\mathbf{e}_i}{1+\mathbf{e}_i^\top\boldsymbol{\Psi}_i^{-1}\mathbf{e}_i}$；$-\alpha_i\ln\det(\mathbf{M}_i^{-1})=\alpha_i\ln\det(\mathbf{M}_i)$ 含 $\alpha_i\ln(1+\mathbf{e}_i^\top\boldsymbol{\Psi}_i^{-1}\mathbf{e}_i)$（用 $\det(\boldsymbol{\Psi}+\mathbf{e}\mathbf{e}^\top)=\det\boldsymbol{\Psi}(1+\mathbf{e}^\top\boldsymbol{\Psi}^{-1}\mathbf{e})$）。合并、丢与 $\mathbf{x}$ 无关常数，得 $J'(\mathbf{x})=\tfrac12\sum_i\alpha_i\ln(1+\mathbf{e}_i^\top\boldsymbol{\Psi}_i^{-1}\mathbf{e}_i)$，即加权 Cauchy 核（$\boldsymbol{\Psi}_i=\boldsymbol{\Sigma}_i$）。\hfill$\square$
+\end{derivation}
+
+\begin{derivation}[$\star$ ML 偏差闭式（\cref{eq:nlopt-mlbias}，Box 1971）]
+最优条件 $\sum_k\mathbf{G}_k(\hat{\mathbf{x}})^\top\boldsymbol{\Sigma}_{v,k}^{-1}(\mathbf{y}_k-\mathbf{g}_k(\hat{\mathbf{x}}))=\mathbf{0}$。在真值 $\mathbf{x}$ 处对 $\mathbf{g}_k,\mathbf{G}_k$ 二阶/一阶展开（$\delta\mathbf{x}=\hat{\mathbf{x}}-\mathbf{x}$，$\mathbf{n}_k=\mathbf{y}_k-\mathbf{g}_k(\mathbf{x})$，$\boldsymbol{\mathcal{G}}_{jk}=\partial^2 g_{jk}/\partial\mathbf{x}\partial\mathbf{x}^\top$）：
+\[
+  \mathbf{g}_k(\hat{\mathbf{x}})\approx\mathbf{g}_k+\mathbf{G}_k\delta\mathbf{x}+\tfrac12\sum_j\mathbf{1}_j\delta\mathbf{x}^\top\boldsymbol{\mathcal{G}}_{jk}\delta\mathbf{x},\quad
+  \mathbf{G}_k(\hat{\mathbf{x}})\approx\mathbf{G}_k+\sum_j\mathbf{1}_j\delta\mathbf{x}^\top\boldsymbol{\mathcal{G}}_{jk}.
+\]
+设 $\delta\mathbf{x}=\mathbf{A}\mathbf{n}+\mathbf{b}(\mathbf{n})$（$\mathbf{A}$ 线性系数、$\mathbf{b}$ 二次）。代入展开、按 $\mathbf{n}$ 阶分组，得线性项 $\mathbf{L}\mathbf{n}$、两个二次项 $\mathbf{q}_1,\mathbf{q}_2$。要对任意 $\mathbf{n}$ 恒为零：考虑 $-\mathbf{n}$ 情形相减（二次项偶对称、相消），得 $2\mathbf{L}\mathbf{n}=\mathbf{0}$ $\Rightarrow$ $\mathbf{L}=\mathbf{0}$，定出 $\mathbf{A}=\mathbf{W}^{-1}\sum_k\mathbf{G}_k^\top\boldsymbol{\Sigma}_{v,k}^{-1}\mathbf{P}_k$（$\mathbf{P}_k$ 取第 $k$ 块噪声的投影，$\mathbf{W}=\sum_k\mathbf{G}_k^\top\boldsymbol{\Sigma}_{v,k}^{-1}\mathbf{G}_k$）。对二次项取期望：用恒等式 $\mathbf{A}\boldsymbol{\Sigma}\mathbf{A}^\top\equiv\mathbf{W}^{-1}$、$\mathbf{A}\boldsymbol{\Sigma}\mathbf{P}_k^\top\equiv\mathbf{W}^{-1}\mathbf{G}_k^\top$ 证 $\mathbb{E}[\mathbf{q}_2]=\mathbf{0}$，再由 $\mathbb{E}[\mathbf{n}^\top\mathbf{A}^\top\boldsymbol{\mathcal{G}}_{jk}\mathbf{A}\mathbf{n}]=\operatorname{tr}(\boldsymbol{\mathcal{G}}_{jk}\mathbf{A}\boldsymbol{\Sigma}\mathbf{A}^\top)=\operatorname{tr}(\boldsymbol{\mathcal{G}}_{jk}\mathbf{W}^{-1})$ 得
+$\mathbb{E}[\mathbf{b}(\mathbf{n})]=-\tfrac12\mathbf{W}^{-1}\sum_k\mathbf{G}_k^\top\boldsymbol{\Sigma}_{v,k}^{-1}\sum_j\mathbf{1}_j\operatorname{tr}(\boldsymbol{\mathcal{G}}_{jk}\mathbf{W}^{-1})$。因 $\mathbb{E}[\mathbf{n}]=\mathbf{0}$，$\mathbb{E}[\delta\mathbf{x}]=\mathbb{E}[\mathbf{b}(\mathbf{n})]$ 即 \cref{eq:nlopt-mlbias}。\hfill$\square$
+\end{derivation}
+
+\begin{derivation}[$\star$ 滑动窗口滤波：边缘化 $=$ Schur 补]
+SWF（Sibley 2006）在固定大小窗内迭代 GN 并滑动以求在线常数时间——介于离线批量与在线 EKF 之间。设窗内批量方程 $(\mathbf{H}^\top\mathbf{W}^{-1}\mathbf{H})\delta\mathbf{x}^\star=\mathbf{H}^\top\mathbf{W}^{-1}\mathbf{e}$ 为块三对角（运动链）。缩窗欲移除最旧态 $\mathbf{x}_0$：朴素删除会丢信息（初态知识不再参与）；正确做法是\emph{边缘化}——把窗内联合高斯（信息形式：$\mathbf{H}^\top\mathbf{W}^{-1}\mathbf{H}$ 是信息阵、$\mathbf{H}^\top\mathbf{W}^{-1}\mathbf{e}$ 是信息向量）对 $\mathbf{x}_0$ 边缘化。结果是对 $\mathbf{x}_1$ 块做 Schur 补：
+\[
+  \mathbf{A}_{11}\to\mathbf{A}_{11}-\mathbf{A}_{10}\mathbf{A}_{00}^{-1}\mathbf{A}_{10}^\top,\qquad
+  \mathbf{b}_1\to\mathbf{b}_1-\mathbf{A}_{10}\mathbf{A}_{00}^{-1}\mathbf{b}_0,
+\]
+即把被移除态的信息\emph{压}进其邻接态（保留信息、不丢精度），$\mathbf{x}_0$ 出窗后在该窗迭代中保持常量。这与 \cref{eq:schur} 的 BA Schur 补、与变量消元（\cref{sec:nlopt-sparse}）是同一矩阵操作的不同应用。VIO 的滑窗边缘化（\cref{ch:vio}）即此。一般扩缩窗时，边缘化产生的“先验”块 $\bar{\mathbf{A}}_{kk}=\check{\boldsymbol{\Sigma}}_k^{-1}+\mathbf{F}_k^\top\boldsymbol{\Sigma}_{w,k+1}^{-1}\mathbf{F}_k+\mathbf{G}_k^\top\boldsymbol{\Sigma}_{v,k}^{-1}\mathbf{G}_k$ 与信息向量 $\bar{\mathbf{b}}_k$ 递归更新，其中等效先验信息 $\check{\boldsymbol{\Sigma}}_k^{-1}=\boldsymbol{\Sigma}_{w,k}^{-1}-\boldsymbol{\Sigma}_{w,k}^{-1}\mathbf{F}_{k-1}\bar{\mathbf{A}}_{k-1,k-1}^{-1}\mathbf{F}_{k-1}^\top\boldsymbol{\Sigma}_{w,k}^{-1}$（即上一步 Schur 补的对角块），它在窗内迭代时保持常量、无需重算——这正是 SWF 在线常数时间的关键\cite{barfoot2024state}。\hfill$\square$
+\end{derivation}
+
+\begin{derivation}[$\star$ 连续时间批量估计（高斯过程回归）]
+把先验从离散运动链换成连续时间随机微分方程 $\dot{\mathbf{x}}(t)=f(\mathbf{x},\mathbf{v},\mathbf{w},t)$（$\mathbf{w}\sim\mathcal{GP}(\mathbf{0},\mathbf{Q}\delta(t-t'))$），围绕工作轨迹 $\mathbf{x}_{\mathrm{op}}(t)$ 线性化得 LTV 形式 $\dot{\mathbf{x}}\approx\mathbf{F}(t)\mathbf{x}+\boldsymbol{\nu}(t)+\mathbf{L}(t)\mathbf{w}$，则 $\mathbf{x}(t)$ 是高斯过程，均值/协方差由转移函数 $\boldsymbol{\Phi}(t,s)$ 积分给出。在量测时刻堆叠成 lifted 先验 $\mathbf{x}\sim\mathcal{N}(\mathbf{F}\boldsymbol{\nu},\mathbf{F}\mathbf{Q}'\mathbf{F}^\top)$，与离散批量\emph{同形}地得 GN 更新 $(\mathbf{F}^{-\top}\mathbf{Q}'^{-1}\mathbf{F}^{-1}+\mathbf{G}^\top\mathbf{R}'^{-1}\mathbf{G})\delta\mathbf{x}^*=\cdots$，仍块三对角。优点：可在\emph{任意}时刻 $O(1)$ 高斯插值查询轨迹 $\mathbf{x}_{\mathrm{op}}(s)=\check{\mathbf{x}}(s)+\check{\mathbf{P}}(s)\check{\mathbf{P}}^{-1}(\mathbf{x}_{\mathrm{op}}-\check{\mathbf{x}})$，适合异步/高频传感器（对接 STEAM、\cref{ch:vio}）。转移函数 $\boldsymbol{\Phi}(t,s)=\boldsymbol{\Upsilon}(t)\boldsymbol{\Upsilon}(s)^{-1}$ 可由归一化基本阵 $\dot{\boldsymbol{\Upsilon}}=\mathbf{F}(t)\boldsymbol{\Upsilon},\ \boldsymbol{\Upsilon}(0)=\mathbf{I}$ 数值积分得到；每次迭代代价仍随轨迹长度线性\cite{barfoot2024state}。\hfill$\square$
+\end{derivation}

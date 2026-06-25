@@ -1,0 +1,1538 @@
+\chapter{模仿学习工程实践：从动作数据到对抗训练}\label{ch:rlmc-imitation}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章。
+%  主线 = 算法/概念领路：先立「模仿学习有哪三条技术线、各自用什么观测/奖励/
+%  监督粒度」，再把每个概念落到 mjlab / Isaac Lab / UniLab 三框架的工程接线。
+%  假定读者已有 RL 基础（理论部已讲 MDP/策略梯度/AC/PPO/GAE）；本章只讲扩展+实战。
+%  源稿 RL运控/Ch10_模仿学习工程实践.md（mjlab+ProtoMotions/Isaac Lab）按本主线重构。
+%  关键 API/版本/论文归属经联网核（截至 2026-06）：
+%    - BeyondMimic = Liao, Truong, Huang, Gao, Tevet, Sreenath, C. Karen Liu, arXiv:2508.08241(2025)，已核(2026-06)；
+%      mjlab tracking 任务实现 DeepMimic 框架 + BeyondMimic 扩展（adaptive sampling/anchor），已核；
+%    - AMP style reward = α·max(0, 1−0.25(d−1)^2)，LSGAN 回归（参考→+1/策略→−1），已核；
+%    - ProtoMotions(当前 ProtoMotions3) 训练入口 = train_agent.py --experiment-path examples/experiments/.../*.py
+%      --robot-name --simulator --motion-file *.pt（dataclass，非旧 Hydra +exp=），已核；
+%      类继承 BaseAgent→PPO→AMP→ASE，Mimic 扩展 AMP，MaskedMimic=BC，已核；
+%    - AMASS = Mahmood ICCV2019，40h+/300+ subj/11000+ motions，已核；
+%    - DeepMimic Peng SIGGRAPH2018 / ASE Peng SIGGRAPH2022 / MaskedMimic Tessler 等 SIGGRAPH Asia2024，已核；
+%    - mjlab csv_to_npz：whole_body_tracking(argparse) 版命令 --input_file/--input_fps/--output_name/--headless（README 逐字核）；
+%      但 mjlab 包自带 mjlab/scripts/csv_to_npz.py 是 tyro：main(input_file,output_name,input_fps=30,output_fps=50,device,render=False)
+%      → 旗标连字符 --input-file/--output-name/--input-fps/--output-fps/--render，无 --headless（默认无头）；自动上传 WandB Registry。(复核②源码核)
+%  复核②(gpufree mjlab 1.4.0 源码实读 2026-06-24) 改正的硬错误：
+%    - mjlab tracking 是 6 个跟踪 reward(非 5)：motion_global_root_pos/ori + motion_body_pos/ori/lin_vel/ang_vel(各独立函数)，
+%      真名 motion_relative_body_{position,orientation}_error_exp / motion_global_body_{linear,angular}_velocity_error_exp；
+%      sigma 参数名是 std(非 sigma)，默认 0.3/0.4/0.3/0.4/1.0/3.14，权重 0.5/0.5/1/1/1/1，self_collision 权重 -10(非 -0.1)。
+%    - mjlab tracking .npz schema = fps/joint_pos/joint_vel/body_{pos,quat,lin_vel,ang_vel}_w(带_w世界系)，无独立 root_*；
+%      root = anchor body 那一列。mjlab 与 UniLab schema 同构(原稿说 mjlab 单列 root 系错)。
+%    - mjlab anchor 观测真名 motion_anchor_pos_b/motion_anchor_ori_b(ori 是 6D 旋转=旋转矩阵前两列)，
+%      非原稿的 motion_anchor_root_pos_diff/root_quat_diff/joint_pos_diff(编造)。actor obs 还含 base_lin_vel(IMU 估计)。
+%    - Isaac Lab 确有预注册 AMP 任务 Isaac-Humanoid-AMP-{Dance,Run,Walk}-Direct-v0(skrl 库, Direct workflow)——
+%      原稿 pzr「Isaac 无 ...-AMP-v0」系错;但 manager-based G1 仍无现成 AMP(那条路对)。
+%  源稿中已修正的硬错误：源稿正文用旧 Hydra(+exp=)，实为 dataclass。
+% ════════════════════════════════════════════════════════════════
+
+前面 \cref{ch:rlmc-obsact} 与 \cref{ch:rlmc-manager} 把观测/动作的\emph{契约}和 Manager 架构讲清楚了：策略能看见什么、能改变什么、配置如何组织。但到目前为止，奖励都还是「速度跟踪」这类\emph{目的型}信号——它只规定机器人「走到哪」，不规定「怎么走」。本章解决一个互补且更难的问题：如何让机器人\textbf{模仿一条参考运动}——不是只「到达目的地」，而是「像人一样到达目的地」。
+
+本章仍遵循全书「概念领路、实践兑现」的次序。这里的「概念」是模仿学习的\textbf{三条并行技术线}（显式跟踪 / 对抗风格 / 行为克隆蒸馏），以及它们在\emph{监督粒度}与\emph{信息来源}两个维度上的本质差异。理解这条主线之后，每一节都把对应概念落到 mjlab、Isaac Lab、UniLab 三个框架的工程接线上做对比。三框架在各概念下的真实接线都已逐项给出（UniLab 以 \texttt{G1MotionTracking}/\texttt{motion\_tracking} 任务族原生覆盖显式跟踪一线，对抗风格则按其异构 CPU 仿真 + GPU 策略的实际能力如实标注现成与欠缺，详见各节）。
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-imit-setup}
+
+本章的实战横跨三套工具，它们的安装层级与 \cref{ch:rlmc-setup} 打下的双框架基础一致，但多了\emph{动作数据处理}这条额外的依赖链。\cref{tab:rlmc-imit-req} 给出系统要求与版本兼容点。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{模仿学习三框架的环境要求与版本兼容}
+\label{tab:rlmc-imit-req}
+\begin{tabular}{@{}llll@{}}
+\toprule
+要求项 & mjlab tracking & ProtoMotions / Isaac Lab & UniLab \\
+\midrule
+本体框架 & mjlab（\cref{ch:rlmc-setup}） & ProtoMotions3 + 后端仿真器 & UniLab（\texttt{motion\_tracking} 任务族） \\
+Python & $\ge 3.10$ & $\ge 3.10$ & $3.13$（实测，torch 2.7） \\
+物理后端 & MuJoCo Warp & IsaacGym / Isaac Lab / Newton / MuJoCo / Genesis & MuJoCoUni / MotrixSim（CPU 多线程） \\
+RL 后端 & RSL-RL（PPO） & 内置 PPO/AMP/ASE/MaskedMimic & PPO/APPO/SAC（GPU，异构）；无内置 AMP \\
+动作数据 & \texttt{.npz}（已 retarget） & MotionLib \texttt{.pt}（打包） & \texttt{.npz} 参考运动（\texttt{MotionLoader}） \\
+数据预处理 & \texttt{scripts/csv\_to\_npz.py} & 内置 retarget（PyRoki） & \texttt{unilab-import-robot} + 离线 retarget \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{额外的版本约束：动作数据工具链。}除了 \cref{ch:rlmc-setup} 那条「驱动 $\to$ CUDA $\to$ PyTorch $\to$ 仿真后端」的约束，模仿学习还引入一条数据侧依赖：从 SMPL 体模型读取 AMASS 需要 \verb|numpy|/\verb|scipy|，从动捕做 retarget 需要 IK 求解器（mjlab 路线常用 Mink，ProtoMotions 路线用 PyRoki）。这条链的脆弱点是\emph{四元数约定}与\emph{帧率}——它们不会在安装时报错，只会在训练时让机器人「面朝错误方向」或「动作变速」。本章把这两个隐患作为头号工程陷阱反复强调。
+
+\begin{pitfall}[四元数约定在「装好」之后才咬人]
+\textbf{错误描述}：装好 mjlab/ProtoMotions 后直接喂入第三方 retarget 工具的 \texttt{.npz}，未确认四元数顺序。\textbf{现象后果}：环境跑得起来、训练不报错，但机器人在可视化里面朝下方或侧面，奖励永远上不去。\textbf{根本原因}：MuJoCo 与 PyTorch3D 用 $(w,x,y,z)$，而 scipy \texttt{Rotation}、USD/Isaac 资产、Warp 内部用 $(x,y,z,w)$；混用导致 root 朝向被整体旋转。\textbf{正确做法}：见 \cref{sec:rlmc-imit-data} 的「数据契约检查」——加载后立即按可视化或 heading/up 向量核对约定，而非只看 \verb|is_available()| 式的浅层检查。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：五分钟在 mjlab 上看见模仿}
+\addcontentsline{toc}{section}{Quick Start：五分钟在 mjlab 上看见模仿}
+\label{sec:rlmc-imit-quickstart}
+
+下面给出装好之后\emph{立即可复制粘贴}的最小路径。目标不是训练出好策略，而是证明「从动作数据到 tracking 训练循环」整条链是通的。mjlab 自带一个 BeyondMimic 风格的 motion imitation 任务，是验证整条链最快的入口。
+
+\begin{codebox}[bash]{mjlab tracking 最小可跑（命令经实跑核对：裸跑会报错，须显式给动作）}
+# 0. 先拿到一份能跑的 .npz —— 实跑捷径：mjlab 与 UniLab 的 .npz schema 完全互通，
+#    可直接借 UniLab 自带样例（assets/motions/g1/dance1_subject2_part.npz），无须先 retarget
+MOTION=$HOME/UniLab/src/unilab/assets/motions/g1/dance1_subject2_part.npz  # 按你的装路径改
+# 1. 用零动作 agent 回放参考动作 —— 验证数据加载 + 可视化（ghost 对齐）
+uv run play Mjlab-Tracking-Flat-Unitree-G1 --agent zero --num-envs 1 \
+    --env.commands.motion.motion-file "$MOTION"
+# 2. 64 环境跑几步 tracking 训练 —— 验证 reward 接线与训练循环（实跑 ~0.9s/iter）
+uv run train Mjlab-Tracking-Flat-Unitree-G1 \
+    --env.commands.motion.motion-file "$MOTION" \
+    --env.scene.num-envs 64 --agent.max-iterations 2
+\end{codebox}
+
+UniLab 走的是\emph{异构}路线：物理仿真在 CPU（MuJoCoUni/MotrixSim 多线程），策略学习在 GPU（PPO/APPO/SAC），两侧经共享内存解耦。它的动作跟踪入口是 \texttt{motion\_tracking} 任务族（如 \verb|G1MotionTracking|）。\textbf{注意一处与 mjlab 的真实差异}：UniLab 的命令行不支持 \verb|--agent zero| 式的零动作回放（这是已核实的欠缺），最快的「看见模仿」是回放官方预训练 demo，或跑极短训练做冒烟：
+
+\begin{codebox}[bash]{UniLab motion tracking 最小可跑（任务/demo 名经实测注册核对）}
+# 首跑务必先设镜像：demo 与 train 都会从 HuggingFace 拉 motion 资产，
+#   弱网/国内不设会卡死并报 RuntimeError: client has been closed（实跑确认）
+export HF_ENDPOINT=https://hf-mirror.com
+# 1. 回放预训练动作跟踪 demo（首跑从 HF 拉权重）
+uv run demo dance        # G1 跳舞跟踪；另有 boxtracking / wallflip
+# 2. 极短训练做冒烟 —— env 数与迭代数走 Hydra 覆盖（不是 flag，键名用下划线）
+#    实跑：~363 steps/s，逐项打印 reward/motion_global_root_pos/ori/body_pos/ori/lin_vel/ang_vel
+uv run train --algo ppo --task g1_motion_tracking --sim mujoco \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+\end{codebox}
+
+\begin{note}[最常踩的 Quick Start 坑：mjlab tracking \emph{没有}默认动作]
+\verb|Mjlab-Tracking-Flat-Unitree-G1| 必须有一份动作数据才能起跑——\textbf{它\emph{不}带任何默认/示例动作}（经实跑核对：任务配置里 \verb|motion_file=''| 默认空）。\textbf{不给} \verb|--env.commands.motion.motion-file| \textbf{或} \verb|--registry-name| \textbf{而裸跑会直接 \texttt{ValueError}}，不是「用默认动作做冒烟」。这正是「五分钟看见模仿」最常见的第一道坎——所以上面 Step 0 先借一份现成 \verb|.npz|。两条喂动作的路子：(1) 本地文件，\verb|--env.commands.motion.motion-file path.npz|（最快，可直接借框架样例）；(2) 先 \verb|csv_to_npz| 上传 WandB Registry，再 \verb|--registry-name org/wandb-registry-motions/name|（见 \cref{sec:rlmc-imit-track-three}）。真正训练前务必先过 \cref{sec:rlmc-imit-data} 的数据契约检查。另：mjlab 的 \verb|play| 默认 \verb|--viewer auto|（有显示器用 native 窗口、无显示器/服务器自动切 viser 浏览器端）；在远程 GPU 上看可视化建议显式 \verb|--viewer viser|（与 Isaac Lab 默认开 GUI 的差异见 \cref{ch:rlmc-setup}）。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{前置自测}
+\addcontentsline{toc}{section}{前置自测}
+\label{sec:rlmc-imit-pretest}
+
+\begin{practice}[前置自测：答错 $\ge 3$ 题，建议先回相应章节]
+\begin{enumerate}
+  \item PPO 的优势估计用什么方法？GAE 的 $\lambda$ 控制什么？（回看 RL 理论部 \cref{ch:rl-ac} 与策略优化）
+  \item 两个四元数之间的「旋转距离」如何定义？为什么不能直接做减法？（几何基础——本章核心操作，见 \cref{sec:rlmc-imit-track}）
+  \item 指数型奖励 $r=\exp(-\|e\|^2/\sigma^2)$ 中 $\sigma$ 的作用是什么？$\sigma$ 太小或太大分别有什么问题？（回看 \cref{ch:rlmc-reward}）
+  \item 非对称 actor-critic 的 actor 与 critic 看到的观测有何不同？（回看 \cref{ch:rlmc-obsact} 的非对称结构）
+  \item GAN 中生成器与判别器的对抗机制是什么？这是 AMP 的理论基础（见 \cref{sec:rlmc-imit-amp}）。
+  \item 域随机化（\cref{ch:rlmc-dr}）与模仿学习分别解决策略的什么问题？理解两者的互补性。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章目标}
+\addcontentsline{toc}{section}{本章目标}
+\label{sec:rlmc-imit-goals}
+
+学完本章后，你应当能够：
+
+\begin{enumerate}
+  \item \textbf{区分}三条模仿学习技术线（显式跟踪 / 对抗风格 / 行为克隆蒸馏）的适用场景与工程权衡，面对新项目能在它们之间做出有依据的选型。
+  \item \textbf{配置}动作数据的完整管线：从 AMASS/SMPL 到 retarget 再到 \texttt{.npz}（mjlab）或 MotionLib \texttt{.pt}（ProtoMotions），并\textbf{调通}训练前的数据契约检查脚本。
+  \item \textbf{配置} mjlab 中 BeyondMimic 风格 tracking 任务的六个跟踪 reward 项、anchor 观测与 RSI（参考状态初始化）。
+  \item \textbf{实现}四元数距离的数值稳健计算（处理 double cover 与 \texttt{clamp}），并\textbf{定位} tracking 漂移、body 顺序错位等失败模式。
+  \item \textbf{实现} AMP 判别器训练的五个稳定性技巧（梯度惩罚 / 1:1 更新 / replay 混合 / 低学习率 / 共享归一化），并\textbf{诊断}判别器坍塌。
+  \item \textbf{调通} BC/DAgger 蒸馏管线，把 teacher tracker 的能力迁移到可部署的 student。
+  \item \textbf{定位}常见失败：retarget 不可达、判别器 accuracy 飙高、数据质量问题，并对照故障排查手册给出对策。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section*{知识导航与阅读时间}
+\addcontentsline{toc}{section}{知识导航与阅读时间}
+\label{sec:rlmc-imit-nav}
+
+本章承接 \cref{ch:rlmc-obsact}（观测/动作设计）、\cref{ch:rlmc-reward}（奖励工程）与 \cref{ch:rlmc-manager}（Manager 架构）：模仿学习的 reward 就是建立在这三章定下的观测-动作-奖励接口之上的一类\emph{特殊奖励}。本章结构如下树。建议精读 4--5 小时（含练习）；有 RL 训练经验者速读 2--3 小时（重点看三技术线对比表与三框架命令对比）；遇到具体问题时速查 45 分钟（直接跳故障排查手册）。
+
+\begin{figure}[ht]
+\centering
+\begin{forest}
+navtree
+[模仿学习工程实践
+  [三条技术线 (\S\ref*{sec:rlmc-imit-lines})
+    [显式跟踪]
+    [对抗风格]
+    [BC 蒸馏]
+  ]
+  [动作数据管线 (\S\ref*{sec:rlmc-imit-data})
+    [AMASS {/} SMPL]
+    [retarget IK]
+    [数据契约检查]
+  ]
+  [显式跟踪 BeyondMimic (\S\ref*{sec:rlmc-imit-track})
+    [六个 reward 项]
+    [anchor 机制]
+    [RSI {+} 四元数距离]
+  ]
+  [AMP 对抗风格 (\S\ref*{sec:rlmc-imit-amp})
+    [判别器数据流]
+    [五个稳定性技巧]
+    [三框架配置对比]
+  ]
+  [ASE {/} MaskedMimic (\S\ref*{sec:rlmc-imit-ase})
+    [latent skill]
+    [motion inpainting]
+  ]
+  [BC {/} DAgger 蒸馏 (\S\ref*{sec:rlmc-imit-bc})]
+  [选型决策 (\S\ref*{sec:rlmc-imit-choose})]
+]
+\end{forest}
+\caption{本章知识导航树。}
+\label{fig:rlmc-imit-navtree}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{算法主线：模仿学习的三条技术线}
+\label{sec:rlmc-imit-lines}
+
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-imit-lines-pos}
+
+回顾前面几章：velocity tracking 任务给策略一个期望的线速度与角速度 $(v_x,v_y,\omega_z)$，策略通过关节动作使基座速度接近命令。这对「让机器人从 A 走到 B」足够了，但它对「怎么走」几乎没有约束——膝盖弯多少、手臂摆多大、躯干前倾多少，都由策略自由决定。
+
+这种自由在四足机器人上问题不大：四条腿的对称结构与接触约束天然限制了「怪异步态」。但在人形机器人上，二十多个自由度的全身控制意味着速度命令满足时仍可能出现各种非自然行为——低头冲刺、手臂乱甩、膝盖内扣。这些行为在速度 reward 看来「对」（速度确实跟上了），在人类观察者看来却「错」。模仿学习正是补上这块拼图：它告诉策略「身体的每个关键点应该在哪里、朝什么方向、以什么速度移动」。
+
+\begin{insight}[模仿学习是「照谱演奏」，速度跟踪是「自由即兴」]\label{ins:rlmc-imit-score}
+速度跟踪与模仿学习的关系，类似音乐里的「自由即兴」与「照谱演奏」。速度跟踪像对音乐家说「弹一首快节奏的曲子」——结果取决于个人风格；模仿学习像给他一份乐谱——每个音符的音高、时长、力度都已规定。这条类比贯穿全章：技术线之间的差别，本质是\emph{乐谱有多精确}——是逐音符标注，还是只给一段风格示范。
+\end{insight}
+
+\subsection{三条技术线的概念骨架}
+\label{sec:rlmc-imit-lines-three}
+
+模仿学习在 2018--2025 年间发展出三条并行路线。理解它们之间的关系是本章的核心。
+
+\textbf{技术线 A：显式跟踪（explicit tracking）。}从 DeepMimic\,\cite{peng2018deepmimic} 到 PHC\,\cite{luo2023phc} 再到 BeyondMimic\,\cite{liao2025beyondmimic}。核心思路：为参考运动的每一帧构造一个「目标状态」，用 reward 惩罚当前状态与目标状态之间的误差，再交给 PPO 优化。工程特点是 reward 透明、可调（每个 body part 独立权重），适合精确复现单条或多条动作；代价是需要精确的 retarget 数据与帧级时间对齐。DeepMimic（Peng 等，SIGGRAPH 2018）是这条线的起点，提出了沿用至今的两大基石：指数型 tracking reward 与参考状态初始化（RSI）。
+
+\textbf{技术线 B：对抗式风格约束（adversarial style）。}从 AMP\,\cite{peng2021amp} 到 ASE\,\cite{peng2022ase} 再到 CALM\,\cite{tessler2023calm} 到 MaskedMimic\,\cite{tessler2024maskedmimic}。核心思路：不做帧级显式跟踪，而是训练一个\emph{判别器}来判断策略产生的运动「看起来」是否像参考数据集。AMP（Peng 等，SIGGRAPH 2021，arXiv:2104.02180）的判别器输出经一个最小二乘形式的 surrogate 转成 style reward，与任务 reward 相加。工程特点是不需要帧级对齐、能从大量动作数据中提取「风格」；但判别器训练增加了不稳定性，且「风格像」不保证「动作精确」。
+
+\textbf{技术线 C：行为克隆蒸馏（behavioral cloning distillation）。}BC $\to$ DAgger $\to$ 大规模蒸馏。核心思路：先用技术线 A 或 B 训出一个 expert teacher，再用监督学习把 teacher 的行为蒸馏到一个更轻量或输入受限的 student。这条线与 \cref{ch:rlmc-privileged} 专讲的 teacher-student 蒸馏高度重叠，区别在于跨越的「边界」不同：\cref{ch:rlmc-privileged} 的蒸馏跨越的是\emph{信息边界}（privileged $\to$ deployable），本章的蒸馏跨越的是\emph{能力边界}（expert tracker $\to$ general controller）。两种蒸馏可以叠加。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{三条技术线的快速工程对比}
+\label{tab:rlmc-imit-three}
+\begin{tabular}{@{}llll@{}}
+\toprule
+维度 & 显式跟踪 & 对抗风格 & BC 蒸馏 \\
+\midrule
+核心 reward & 帧级误差（指数型） & 判别器输出（LSGAN 回归值） & $\mathrm{MSE}(\text{student},\text{teacher})$ \\
+需要的数据 & 精确 retarget & 大致 retarget & expert rollout \\
+训练组件 & PPO & PPO + 判别器 & 纯监督 \\
+调试难度 & 低 & 高（判别器不透明） & 低 \\
+代表框架 & mjlab tracking & ProtoMotions AMP & \cref{ch:rlmc-privileged} 蒸馏 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{本质洞察：监督粒度与信息来源的双重解读}
+\label{sec:rlmc-imit-lines-dual}
+
+三条技术线可从两个完全不同的视角理解——这是把握模仿学习全貌的关键，也是本章的第一处「多视角」。
+
+\textbf{视角 A（监督粒度）。}显式跟踪是\emph{逐帧监督}——每个时间步都有精确目标。AMP 是\emph{分布级监督}——判别器只关心运动的统计特性像不像参考数据，不关心某一帧是否对齐。BC 是\emph{行为级监督}——直接模仿 expert 的输出。三者从细到粗：逐帧 $\to$ 分布 $\to$ 行为。
+
+\textbf{视角 B（信息来源）。}从信息论看，三条线使用不同的信息源约束策略。显式跟踪的信息来自「参考运动每一帧的状态」——信息量最大但需要精确数据；AMP 的信息来自「参考数据集的联合分布 $p(s,s')$」——信息量中等但更鲁棒；BC 的信息来自「expert 的输入-输出映射 $\pi_{\text{expert}}(a\mid s)$」——信息量最少但最易获取。
+
+\begin{insight}[DeepMimic 与 AMP 的本质区别是监督粒度，不是技术细节]\label{ins:rlmc-imit-granularity}
+新手容易把 DeepMimic 与 AMP 的差别理解成「新旧」或「实现复杂度」。真正的区别是\textbf{监督粒度}：DeepMimic 说「你的左手在这个时刻应该在这个位置」（逐帧），AMP 说「你的运动整体上应该像人类」（分布级）。前者精确但脆弱（数据错就学错），后者灵活但模糊（可能满足于「大致像」而不精确）。这个洞察直接给出工程含义：\emph{数据质量高就走逐帧（显式跟踪），数据有限但量大就走分布级（AMP），只有训练好的 expert 没有原始数据就走行为级（BC）}。
+\end{insight}
+
+\subsection{演进脉络与三框架定位}
+\label{sec:rlmc-imit-lines-frameworks}
+
+\cref{tab:rlmc-imit-evolution} 给出三条线的演进时间线。三条线并非互斥——工业级管线常组合使用。例如 BeyondMimic 用显式跟踪训练 per-skill expert，再用 guided diffusion（一种 BC 变体）蒸馏出可导航的通用控制器。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{三条技术线的演进时间线（代表工作）}
+\label{tab:rlmc-imit-evolution}
+\begin{tabular}{@{}llll@{}}
+\toprule
+年份 & 显式跟踪线 & 对抗式线 & BC 蒸馏线 \\
+\midrule
+2018 & DeepMimic（单条动作） & --- & --- \\
+2021 & --- & AMP（数据集$\to$风格 reward） & --- \\
+2022 & --- & ASE（latent skill embedding） & --- \\
+2023 & PHC（万条动作+渐进网络） & CALM（motion-latent 条件） & HOVER 蒸馏 \\
+2024 & --- & MaskedMimic（motion inpainting） & MaskedMimic BC \\
+2025 & BeyondMimic（真机 G1） & TienKung-Lab（AMP+周期步态） & BeyondMimic diffusion 蒸馏 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+从三框架视角看分工：\textbf{mjlab} 提供 BeyondMimic 风格的显式跟踪任务，是技术线 A 的轻量入口；\textbf{ProtoMotions}（NVlabs）以统一框架覆盖 AMP/ASE/MaskedMimic，是技术线 B 与 C 的主战场，并可在 IsaacGym/Isaac Lab/Newton/MuJoCo/Genesis 多个后端上运行；\textbf{Isaac Lab} 既可作为 ProtoMotions 的后端，也可借其 manager-based 架构把判别器作为自定义 reward term 原生集成 AMP。\textbf{UniLab}（异构 CPU-sim + GPU-policy）以 \texttt{G1MotionTracking} 等任务原生覆盖技术线 A（显式跟踪 + PPO/APPO/SAC），并经 HORA 蒸馏（特权 teacher $\to$ 时序自适应 student，RMA 范式）触及技术线 C 的一种特例；但它\emph{没有}内置 AMP/ASE/MaskedMimic 判别器（技术线 B 与 inpainting 需自实现，本章后续在对应位置如实标注）。
+
+\begin{pitfall}[模仿学习的两个高频误解]
+\textbf{一·「AMP 总比 DeepMimic 好」}：AMP 更新、更灵活，但判别器训练增加了工程复杂度与不稳定性，且「风格像」不等于「动作精确」。若目标是精确复现动捕（如机器人体操表演），DeepMimic 式显式跟踪更可靠。\textbf{二·「模仿学习就是回放关节角」}：模仿学习不是把关节角序列直接写入电机命令。它在每个时间步构造\emph{参考状态}，用 root position / body pose / velocity / 正则化 / termination 共同约束策略——策略必须在物理仿真中通过力的交互实现参考姿态，而不是绕过物理直接设置关节位置。
+\end{pitfall}
+
+\begin{practice}[练习·三技术线]
+\begin{enumerate}
+  \item \textbf{[分类]} 以下任务分别更适合哪条技术线，说明理由：(a) 精确复现一段太极拳动作；(b) 让人形机器人在任意地形上自然行走；(c) 把一个 teacher tracker 部署到只有深度相机的 student。验收标准：每条给出「监督粒度」与「数据可得性」两条依据。
+  \item \textbf{[思考]} AMP 判别器的输入是状态对 $(s_t,s_{t+1})$ 而非单帧 $s_t$，为什么？若只用单帧，判别器可能学到什么 shortcut？提示：考虑「静止的某一帧姿态」是否足以判断运动自然。
+  \item \textbf{[跨章综合]} \cref{ch:rlmc-privileged} 的 teacher-student 蒸馏与本章 BC 蒸馏在技术上有何共同点与区别？两者能否叠加？给出一个叠加的具体管线。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{动作数据格式与管线：三框架对比}
+\label{sec:rlmc-imit-data}
+
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-imit-data-pos}
+
+动作数据是模仿学习的「燃料」。无论选哪条技术线，第一步都相同：把人类动捕转成框架可消费的格式。这一步在管线中位于\emph{所有训练之前}，却是最容易出错、也最值得前置投入的环节——因为数据错误会在 RL 训练中被\emph{放大}：策略为最大化 reward 而「适应」数据错误，产生不自然的补偿动作。
+
+\begin{insight}[数据质量决定训练上限，不是「跑通就行」]\label{ins:rlmc-imit-dataquality}
+模仿学习是数据驱动的——策略只能学到数据中存在的运动模式。若 retarget 后某些关节角超出机器人限位，策略会被迫学「妥协动作」，training reward 永远达不到理论最大值；若数据帧率与控制频率不匹配，插值误差会在快速运动中被放大。所以「retarget 工具跑通了」远不等于「数据没问题」——本质洞察是：\emph{数据质量是训练性能的硬上限，必须用可视化回放 + 契约检查显式守住}。
+\end{insight}
+
+\subsection{AMASS 数据集与 SMPL 体模型}
+\label{sec:rlmc-imit-data-amass}
+
+AMASS（Archive of Motion Capture as Surface Shapes，Mahmood 等，ICCV 2019，arXiv:1904.03278）是当前最大的公开人类动作数据集\,\cite{mahmood2019amass}。它把十多个不同来源的动捕统一到 SMPL 体模型的参数空间。原论文给出的精确规模为 \textbf{346 个受试者、11{,}451 条动作、42 小时}（摘要里取整为「300+ 受试者 / 11{,}000+ 动作 / 40+ 小时」；后续版本随新采集持续扩充，落地以官网当前发布为准）。
+
+SMPL（Skinned Multi-Person Linear model，Loper 等，SIGGRAPH Asia 2015）是一个参数化人体模型\,\cite{loper2015smpl}：
+
+\begin{codebox}[Python]{SMPL 参数空间（概念）}
+class SMPLParams:
+    beta:  np.ndarray  # (10,)  体型参数（PCA 系数），整条动作内不变
+    theta: np.ndarray  # (72,)  关节角 = 24 joints x 3 axis-angle
+    trans: np.ndarray  # (3,)   全局平移
+# 变体：SMPL+H 增加 MANO 手部（159 维 pose）；SMPL-X 增加面部表情+手部
+\end{codebox}
+
+AMASS 中每一帧就是一组 SMPL 参数 $(\beta,\theta_t,\text{trans}_t)$；整条序列是 $\{(\theta_t,\text{trans}_t)\}_{t=0}^{T}$ 加上固定的 $\beta$。\textbf{关键理解}：SMPL 的关节角 $\theta$ 是 axis-angle 格式，每个关节 3 个参数（ball joint，三轴旋转），而机器人 URDF 通常是 revolute（单轴）。Retarget 的核心工作正是处理这种表示差异。
+
+\subsection{Retarget 管线：从 SMPL 到机器人关节}
+\label{sec:rlmc-imit-data-retarget}
+
+Retarget 是模仿学习中最易出错也最难调试的步骤，目标是把 SMPL 的 24 关节 axis-angle 表示转成机器人 URDF 的 $N$ 关节 revolute 角度。这类似把一首钢琴曲改编为吉他曲——两种乐器音域不同、表达方式不同，要在保持旋律核心的同时适应新乐器的限制。标准流程见 \cref{alg:rlmc-imit-retarget}。
+
+\begin{algo}[SMPL $\to$ 机器人的标准 retarget 流程]\label{alg:rlmc-imit-retarget}
+\textbf{输入}：SMPL 动作序列（\texttt{.npz}）、目标机器人 MJCF/URDF、关键点匹配表。\\
+\textbf{输出}：机器人关节角序列 + root 轨迹（\texttt{.npz} 或 \texttt{.pt}）。
+\begin{enumerate}
+  \item 前向运动学（FK）：SMPL 参数 $\to$ 关键点 3D 位置。
+  \item 关键点匹配：SMPL 关键点 $\to$ 机器人 body 对应表（如 SMPL \texttt{hip\_l} $\to$ G1 \texttt{left\_hip\_yaw\_link}）。
+  \item 逆运动学（IK）：从目标关键点位置求解机器人关节角；约束 = 关节限位 + 末端位置 + 足底接触。
+  \item 质量验证：在 MuJoCo 中回放，检查穿模/越界/浮空。
+  \item 格式化输出：\texttt{.npz}（mjlab，已 retarget 的关节角）或 MotionLib \texttt{.pt}（ProtoMotions）。
+\end{enumerate}
+\end{algo}
+
+retarget 最棘手的问题是\emph{自由度不匹配}：SMPL 有 24 个 ball joint（72 DoF），而 G1 只有 20 多个 revolute joint。很多 SMPL 关节（如脊柱三段细分）在 G1 上没有对应驱动关节。解决方案是\textbf{聚合}——把 SMPL 的多段旋转合并为最接近的单关节旋转，或直接忽略无对应的自由度。下面给出一个\emph{简化}的 IK 求解器，理解底层原理对调试至关重要（实际项目推荐 Mink 或 ProtoMotions/PyRoki 的现成实现）：
+
+\begin{codebox}[Python]{simple\_retarget.py：阻尼最小二乘 IK（教学用，仅位置约束）}
+import numpy as np
+import mujoco
+
+def retarget_frame(smpl_joints_3d, mj_model, mj_data,
+                   joint_mapping, max_ik_iters=100):
+    """对单帧执行 IK retarget。
+    smpl_joints_3d: (24,3) SMPL 关键点世界坐标
+    joint_mapping:  {smpl_joint_idx: mujoco_body_name}
+    返回: 机器人关节角（radians）"""
+    mj_data.qpos[:] = mj_model.key_qpos[0]          # 初始化为站立姿态
+    for _ in range(max_ik_iters):
+        mujoco.mj_forward(mj_model, mj_data)
+        for smpl_idx, body_name in joint_mapping.items():
+            body_id = mujoco.mj_name2id(
+                mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            error = smpl_joints_3d[smpl_idx] - mj_data.xpos[body_id]
+            jacp = np.zeros((3, mj_model.nv))
+            mujoco.mj_jacBody(mj_model, mj_data, jacp, None, body_id)
+            # 阻尼最小二乘：(J^T J + lambda I)^-1 J^T e
+            JtJ = jacp.T @ jacp + 0.01 * np.eye(mj_model.nv)
+            dq = np.linalg.solve(JtJ, jacp.T @ error)
+            # free root 在 qpos 占 7 维(3 pos+4 quat)、在 qvel 占 6 维 -> 跳过；
+            # 下式把 qvel 空间增量直接加到 qpos，仅当 root 之后全为 hinge(nq==nv==1)
+            # 时成立；含 ball joint(nq!=nv) 时须用 mj_integratePos。
+            mj_data.qpos[7:] += 0.3 * dq[6:]        # 学习率 0.3
+        # 裁剪到关节限位
+        for j in range(mj_model.njnt):
+            if mj_model.jnt_limited[j]:
+                lo, hi = mj_model.jnt_range[j]
+                addr = mj_model.jnt_qposadr[j]
+                mj_data.qpos[addr] = np.clip(mj_data.qpos[addr], lo, hi)
+    return mj_data.qpos[7:].copy()                  # 只返回关节角（不含 root 前 7 维）
+\end{codebox}
+
+这段代码的工程要点：阻尼参数 \texttt{0.01} 防止 Jacobian 在奇异点附近的数值不稳定；学习率 \texttt{0.3} 控制每步更新幅度（太大震荡、太小收敛慢）。它只处理了\emph{位置}约束；实际 retarget 还需处理朝向约束、足底接触约束（接触帧脚底高度为 0）与对称性约束——ProtoMotions 与 TienKung-Lab 的 retarget 脚本都处理了这些。
+
+\subsection{三框架的数据加载对比}
+\label{sec:rlmc-imit-data-three}
+
+三框架在 retarget 的\emph{时机}与\emph{数据格式}上有本质差异，见 \cref{tab:rlmc-imit-dataformat}。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{三框架的动作数据加载对比}
+\label{tab:rlmc-imit-dataformat}
+\begin{tabular}{@{}llll@{}}
+\toprule
+维度 & mjlab & ProtoMotions & UniLab \\
+\midrule
+retarget 时机 & 预处理时（先 retarget 再训练） & 训练时（在线，PyRoki） & 预处理时（同 mjlab，离线先 retarget） \\
+数据格式 & \texttt{.npz}（已 retarget 关节角） & MotionLib \texttt{.pt}（打包多条） & \texttt{.npz} 参考运动（\texttt{MotionLoader} 读单条） \\
+机器人切换 & 需重新 retarget & 只需换 \texttt{--robot-name} & 需换任务 + 重新 retarget \\
+质量控制 & 可逐帧人工检查 & 自动化但难逐帧检查 & 可逐帧检查（但无 \texttt{zero} 回放，须自写脚本） \\
+管理方式 & WandB Registry / 本地文件 & 打包 \texttt{.pt} + 配置 & 本地文件 / HF 资产（\texttt{unilab-pull-assets}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{mjlab 路线。}mjlab tracking 任务用 \texttt{.npz} 存储\emph{已 retarget} 的动作；从 CSV（retarget 工具输出）到 \texttt{.npz} 的转换由仓库脚本完成：
+
+\begin{codebox}[bash]{CSV 转 mjlab .npz（命令经 whole\_body\_tracking 官方 README 核对）}
+# 续行反斜杠须是行末最后一个字符，其后不能写内联注释
+python scripts/csv_to_npz.py \
+    --input_file g1_walk_retargeted.csv \
+    --input_fps 30 \
+    --output_name g1_walk \
+    --headless
+\end{codebox}
+
+\rebuilt{命令的归属需分清两个仓库。上面的 \texttt{--input\_file/--input\_fps/--output\_name/--headless} 形式已对照 BeyondMimic 原始 Isaac Lab 复现仓库 HybridRobotics/whole\_body\_tracking 的 README 逐字核实（该仓库用 argparse，确有 \texttt{--headless}），并会自动把产物上传 WandB Registry。\textbf{但本章讲的 mjlab 包}内自带的 \texttt{mjlab/scripts/csv\_to\_npz.py} 是 \textbf{tyro} 实现，经源码核对其签名为 \texttt{main(input\_file, output\_name, input\_fps=30.0, output\_fps=50.0, device="cuda:0", render=False, line\_range=None)}——故 mjlab 版的旗标是连字符的 \texttt{--input-file/--output-name/--input-fps/--output-fps} 与 \texttt{--render}（默认 \texttt{False} 即无头，\emph{无} \texttt{--headless}）。两者功能等价、旗标命名不同；具体参数随版本可能增删，落地时以你所装脚本的 \texttt{--help} 为准。}该 mjlab 脚本的实际工作（经源码核对）：在 MuJoCo 中按参考根状态与关节角\emph{逐帧回放} CSV，用前向运动学（FK）记录 maximal-coordinate 的 body 量，并把帧率从 \texttt{input\_fps} 重采样到 \texttt{output\_fps}（默认 $30\to50$），最后存为 \texttt{.npz} 并上传 WandB Registry。转换后的 \texttt{.npz} 关键字段\textbf{与 mjlab \texttt{MotionLoader} 读取的字段完全一致}（注意全部 body 量带 \texttt{\_w} 世界系后缀、且\emph{不}单列 root）：
+
+\begin{codebox}[Python]{mjlab tracking .npz 内部结构（字段名经 csv\_to\_npz/MotionLoader 源码核对）}
+import numpy as np
+data = np.load("g1_walk.npz")
+# fps            ()         参考帧率（= output_fps）
+# joint_pos      (T,N_j)    关节角 (radians)
+# joint_vel      (T,N_j)    关节角速度
+# body_pos_w     (T,N_b,3)  每个 body 全局位置（world；root = anchor body，是 body 列表一员）
+# body_quat_w    (T,N_b,4)  每个 body 全局朝向 (w,x,y,z) —— MuJoCo wxyz 约定
+# body_lin_vel_w (T,N_b,3)  每个 body 全局线速度（RSI 初始化直接取用）
+# body_ang_vel_w (T,N_b,3)  每个 body 全局角速度
+# 无独立 root_pos/root_quat/root_lin_vel/root_ang_vel —— root 即 anchor body 的那一列
+\end{codebox}
+
+\textbf{ProtoMotions 路线。}ProtoMotions 把多条动作打包成 MotionLib 的 \texttt{.pt}，retarget 在训练时在线进行；切换机器人只需改 \verb|--robot-name|，无须重处理数据。这把灵活性放在了首位，代价是更依赖自动化质量保障。
+
+\textbf{UniLab 路线。}UniLab 的动作跟踪与 mjlab 同属「先 retarget、后训练」一类：参考运动以 \texttt{.npz} 存储，由 \verb|g1/motion_loader.py| 中的 \verb|MotionLoader| 加载成一个 \verb|MotionData| dataclass（UniLab，\texttt{envs/motion\_tracking/g1}）。它存的是\emph{maximal-coordinate} 量（每个 body 的全局位姿与速度），而非只存关节角——这与 mjlab 经 FK 补全 body pose 的做法一致，但 UniLab 把它直接作为参考数据的一等字段：
+
+\begin{codebox}[Python]{UniLab motion tracking 的参考 .npz 字段（MotionLoader -> MotionData）}
+import numpy as np
+data = np.load("dance1_subject2_part.npz")   # UniLab 默认示例（assets/motions/g1/）
+# fps            ()         参考帧率（采样/重采样基准）
+# joint_pos      (T,N_j)    关节角 (radians)
+# joint_vel      (T,N_j)    关节角速度
+# body_pos_w     (T,N_b,3)  每个 body 的全局位置（world）
+# body_quat_w    (T,N_b,4)  每个 body 的全局朝向（world）
+# body_lin_vel_w (T,N_b,3)  每个 body 的全局线速度
+# body_ang_vel_w (T,N_b,3)  每个 body 的全局角速度
+# MotionSampler 采帧，reset 经 _build_motion_reference_state 建参考态（= UniLab 版 RSI）
+\end{codebox}
+
+对比本小节上文 mjlab 的 \texttt{.npz} 结构可见两者字段\textbf{几乎逐一同构}——经源码核对，mjlab 与 UniLab \emph{都}用带 \verb|_w| 世界系后缀的 \verb|body_{pos,quat,lin_vel,ang_vel}_w|、都\emph{不}单列 root（root 就是 body 列表里的 anchor body 那一员），都把每个 body 的位姿与速度显式存好供 reward 与 RSI 直接取用。这一致性也呼应了两框架后端「机体系/世界系 body 量可直接得」的设计（mjlab 经 FK、UniLab 经 \verb|get_body_lin_vel_b| 等）。唯一的细节差异是 UniLab 的 \verb|MotionLoader| 把这些字段封进一个 \verb|MotionData| dataclass、mjlab 直接以张量字段持有。
+
+\begin{insight}[「先 retarget 后训练」把质量控制前置]\label{ins:rlmc-imit-pretarget}
+mjlab 的「先 retarget 后训练」流程把数据质量控制\emph{前置}——你可以在 MuJoCo 中逐帧回放检查 retarget 结果，确认没有穿模、越界、浮空后再开始训练。ProtoMotions 的「在线 retarget」更灵活（换机器人不重处理），但需要更强的自动化质量保障。对初学者与研究项目，\textbf{推荐 mjlab 的前置 retarget 流程}——更可控、更易调试。这是一处典型的「灵活性 vs 可调试性」工程权衡：两条路线都对，选择取决于你的项目是「探索多机器人」还是「打磨单条动作」。
+\end{insight}
+
+\subsection{数据契约检查：训练前的必过门禁}
+\label{sec:rlmc-imit-data-contract}
+
+在任何训练之前，先检查数据是否满足「契约」——必需字段齐全、shape 自洽、数值物理合理。这一步零成本却能避免大量浪费。\cref{tab:rlmc-imit-contract} 是配置项四维表式的检查清单，下面给出可直接接入 CI 的脚本。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{动作数据契约检查的四维表（默认值/失效原因/合理范围/耦合）}
+\label{tab:rlmc-imit-contract}
+\begin{tabular}{@{}llll@{}}
+\toprule
+检查项 & 期望（默认/范围） & 常见失效原因 & 与其他项的耦合 \\
+\midrule
+必需 key & fps/joint\_*/body\_*\_w & retarget 输出格式变化 & 缺则后续检查全 crash \\
+时间维一致 & 所有字段 $T$ 相同 & 截断只处理部分字段 & 影响 vel/pos 交叉验证 \\
+四元数单位化 & $\lvert q\rvert\approx 1$（误差 $<10^{-3}$） & 累积误差、未归一化 & 与 wxyz 约定共同决定朝向 \\
+wxyz 约定 & 第 0 帧 $w\approx\pm1$（近似无旋转） & xyzw/wxyz 混淆 & 错则 reward 永远偏低 \\
+vel vs pos 差分 & $\dot q\approx\Delta q/\Delta t$ & fps 不匹配、vel 来自异源 & 依赖 fps 字段正确 \\
+物理合理性 & 无 NaN/Inf、root 不在地下 & retarget 溢出、坐标系错 & 影响 RSI 初始化稳定性 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{codebox}[Python]{check\_motion\_contract.py：训练前必过门禁（节选核心检查）}
+import numpy as np
+
+def check_motion_contract(npz_path, anchor_idx=0):
+    """检查 motion.npz 数据契约（mjlab/UniLab 同构 schema），返回问题列表（空 = 通过）。
+    anchor_idx: root（anchor body）在 body 列表中的下标，通常为 0。"""
+    issues = []
+    data = np.load(npz_path)
+
+    # mjlab/UniLab 真实字段：无独立 root_*，root 即 body_*_w 的 anchor 列
+    required = ["fps", "joint_pos", "joint_vel",
+                "body_pos_w", "body_quat_w", "body_lin_vel_w", "body_ang_vel_w"]
+    for key in required:
+        if key not in data:
+            issues.append(f"缺少必需字段 '{key}'")
+    if issues:
+        return issues                               # 缺 key 不继续，否则后续 crash
+
+    T = data["joint_pos"].shape[0]                   # 时间维一致性
+    for key in required[1:]:
+        if data[key].shape[0] != T:
+            issues.append(f"'{key}' 时间维 {data[key].shape[0]} != {T}")
+
+    root_quat = data["body_quat_w"][:, anchor_idx]   # root = anchor body 列；四元数单位化
+    norms = np.linalg.norm(root_quat, axis=-1)
+    if np.any(np.abs(norms - 1.0) > 1e-3):
+        issues.append("root（anchor）四元数存在非单位值")
+    w0 = root_quat[0, 0]                             # wxyz 约定自检（仅初始近似无旋转时有效）
+    if abs(w0) < 0.5:
+        issues.append(f"body_quat_w[0,{anchor_idx}] 的 w={w0:.3f}（预期接近 ±1），疑 xyzw/wxyz 混淆")
+
+    dt = 1.0 / float(data["fps"])                    # vel 与 pos 差分交叉验证
+    pos_diff = np.diff(data["joint_pos"], axis=0) / dt
+    if np.max(np.abs(pos_diff - data["joint_vel"][1:])) > 5.0:   # rad/s 阈值
+        issues.append("joint_vel 与 joint_pos 差分不一致（dt 不匹配或速度字段错）")
+
+    if data["body_pos_w"][:, anchor_idx, 2].min() < -0.1:   # 物理合理性
+        issues.append("root（anchor）z 最小值在地下")
+    if np.any(np.isnan(data["joint_pos"])) or np.any(np.isinf(data["joint_pos"])):
+        issues.append("joint_pos 含 NaN/Inf")
+    return issues
+\end{codebox}
+
+\begin{note}[把契约检查加入 CI]
+把 \verb|check_motion_contract.py| 加入项目的 CI 或 Makefile，每次更新动作数据时自动运行。一次 10 秒的检查可以避免 10 小时的无效训练——这正是 \cref{ins:rlmc-imit-dataquality} 「数据质量是硬上限」的工程落地。
+\end{note}
+
+\subsection{从零起步：拿到第一份能跑的 .npz 并自验契约}
+\label{sec:rlmc-imit-data-bootstrap}
+
+本节的脚本与命令都假定你「手上已经有一份 \texttt{.npz}」。但初学者最现实的障碍恰恰是\emph{第一份动作数据从哪来}——AMASS 要注册下载、retarget 工具要另装环境，真照着走，「五分钟看见模仿」会变成「半天装数据管线」。这里给一条\textbf{零下载、零 retarget} 的实战捷径，把上文所有脚本立刻接到真实数据上跑通。
+
+\textbf{捷径的依据}：本章反复论证 mjlab 与 UniLab 的 \texttt{.npz} schema 完全同构（\cref{sec:rlmc-imit-data-three}、\cref{ins:rlmc-imit-pretarget}），这意味着\emph{框架自带的样例 \texttt{.npz} 可以跨框架直接复用}。UniLab 仓库自带一条 G1 跳舞参考运动，正好拿来当 mjlab tracking 的冒烟数据——这是「schema 同构」最省事的可操作落地。
+
+\begin{codebox}[bash]{从零到第一次契约检查：复用框架自带样例，看到 PASS（命令经实跑）}
+# 1) 定位框架自带样例 .npz（无须下载 AMASS、无须 retarget）
+MOTION=$HOME/UniLab/src/unilab/assets/motions/g1/dance1_subject2_part.npz
+ls -lh "$MOTION"        # 找不到就用 find：find ~ -name 'dance1_subject2_part.npz'
+# 2) 跑契约检查：期望打印「数据契约通过」
+python -c "from check_motion_contract import check_motion_contract as c; \
+           i=c('$MOTION'); print('数据契约通过' if not i else '\n'.join(i))"
+\end{codebox}
+
+\begin{codebox}[text]{上一步的预期输出（实跑该样例时的真实形态）}
+-rw-r--r-- 1 user user 3.1M ... dance1_subject2_part.npz
+数据契约通过
+# 该样例实测 shape：fps=()  joint_pos=(870,29)  body_pos_w=(870,31,3)
+#   —— G1 真实为 29 个驱动关节 / 31 个 body（本章练习里的 23 关节是泛例口径）
+\end{codebox}
+
+跑通这两步，你就完成了「从空手到第一份合法数据」的闭环，且\emph{亲眼确认上文那个契约脚本与真实 schema 对得上}——而不是把它当悬空代码读。拿到这份 \texttt{.npz} 后，直接喂给 \cref{sec:rlmc-imit-quickstart} 的 mjlab Quick Start（\verb|--env.commands.motion.motion-file "$MOTION"|）即可起训。
+
+\begin{note}[正经项目里第一份数据怎么来]
+框架样例只够冒烟。真做项目时，第一份数据的标准来路有三：(1) 直接用别人已 retarget 到你机器人的开源 \texttt{.npz}（如 BeyondMimic/TienKung-Lab 仓库随附的 G1 动作）——最省事；(2) 从 AMASS 下一段（需注册），用 ProtoMotions/Mink 的 retarget 脚本转到你的机器人；(3) 自采动捕或从视频提取（4D-Humans）再 retarget。无论哪条，\textbf{第一件事都是跑契约检查 +} \verb|--agent zero| \textbf{可视化回放}，确认数据没问题再进训练——顺序不能反。
+\end{note}
+
+\subsection{运行验证与常见陷阱}
+\label{sec:rlmc-imit-data-verify}
+
+数据契约通过后，还要在 MuJoCo 中\emph{可视化}回放第 0 帧与整条序列：用零动作 agent（\verb|--agent zero|）让物理引擎按参考状态摆姿，肉眼确认所有肢体在正确位置、脚底不浮空不穿地、朝向正确。这一步看的是「ghost（参考）与 current（机器人）是否对齐」。
+
+\begin{pitfall}[四元数 $(w,x,y,z)$ vs $(x,y,z,w)$ 约定混淆]
+\textbf{错误描述}：不同库之间传四元数时未逐个确认顺序。\textbf{现象后果}：root 朝向整体错误，机器人面朝下方或侧面，reward 永远偏低。\textbf{根本原因}：MuJoCo 与 PyTorch3D 用 wxyz（real part first）；scipy \texttt{Rotation.as\_quat()} 默认 xyzw（scalar-last，可用 \texttt{as\_quat(scalar\_first=True)} 输出 wxyz）；Warp 的 \texttt{wp.quat} 内部 xyzw；USD/Isaac 资产多为 xyzw。\textbf{正确做法}：\verb|assert abs(np.linalg.norm(q)-1)<1e-5| 且检查 $w$ 是否在预期位置；若初始帧带 yaw，则改用可视化回放或比较 heading/up 向量来确认，而非只看第 0 帧的 $w$。
+\end{pitfall}
+
+\begin{pitfall}[帧率不匹配导致动作变速]
+\textbf{错误描述}：源动作 30 fps，但训练以 50 Hz 逐帧消费且未按时间戳重采样。\textbf{现象后果}：动作被快放到 $50/30\approx1.67$ 倍速，时长缩为原来的 0.6 倍，速度类参考量随之失真。\textbf{根本原因}：「逐帧消费」隐含「数据帧率 = 控制频率」，而二者不等。\textbf{正确做法}：按源 fps/时间戳插值到控制频率；mjlab 的 \verb|csv_to_npz| 自动处理，但手动准备数据时务必检查（见 \cref{tab:rlmc-imit-contract} 的 vel/pos 交叉验证）。
+\end{pitfall}
+
+\begin{practice}[练习·数据管线]
+\begin{enumerate}
+  \item \textbf{[动手]} 下载一条 AMASS-CMU 动作，用 ProtoMotions 的 retarget 转成 G1 关节角序列，在 MuJoCo 中回放并记录发现的问题。验收标准：能指出至少一处穿模/越界/浮空，或确认无问题。
+  \item \textbf{[计算]} 一条 30 fps、10 秒的动作，重采样到 50 fps 后有多少帧？若 G1 有 23 个关节，\texttt{.npz} 中 \verb|joint_pos| 的 shape 应是多少？预期输出：帧数 = 500（含端点近似），shape $=(500,23)$。
+  \item \textbf{[设计]} 让 G1 模仿一段篮球投篮，但 G1 无手指关节（不能抓球），retarget 时上肢应如何处理？手部关键点的匹配权重怎么设？验收标准：给出「忽略手指自由度 + 降低手部关键点权重」的明确方案。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{显式跟踪：BeyondMimic 在 mjlab 中的实现}
+\label{sec:rlmc-imit-track}
+
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-imit-track-pos}
+
+若你有一段 retarget 好的参考动作、想让机器人\emph{精确复现}，显式跟踪是最自然的选择——把每一帧的目标状态与当前状态比较，用 reward 引导策略缩小差距。BeyondMimic（Liao 等，2025，arXiv:2508.08241）是这个方向的最新工作\,\cite{liao2025beyondmimic}，在 Unitree G1 上实现了跳旋、冲刺、侧空翻等高难度动作。mjlab 的 motion imitation 任务实现了 DeepMimic 框架并引入 BeyondMimic 的扩展（adaptive sampling、anchor 误差观测），是这条线在管线中的「expert 训练」环节。
+
+\subsection{动机：朴素关节角 MSE 为何不够}
+\label{sec:rlmc-imit-track-naive}
+
+最简单的 tracking reward 是 $r=-\sum_j (q_j-q_j^{\text{ref}})^2$——关节角误差负平方和。它有三个严重问题，正是 BeyondMimic reward 设计要解决的：
+
+\begin{enumerate}
+  \item \textbf{末端放大效应}：髋关节 $1^\circ$ 误差导致脚尖位移约 5\,cm，踝关节 $1^\circ$ 只导致约 1\,cm。扁平的关节角 MSE 给两者相同惩罚，物理效果却差异巨大。
+  \item \textbf{旋转表示问题}：关节角差值在 revolute joint 上良定义，但在 root 朝向（四元数）上需特殊处理——直接做减法没有几何意义（见 \cref{sec:rlmc-imit-track-quat}）。
+  \item \textbf{全局位置漂移}：关节角全对但 root 位置偏了，机器人「姿态对、位置错」，纯关节角 reward 检测不到。
+\end{enumerate}
+
+\subsection{配置详解：BeyondMimic 的跟踪 reward（六个误差项）}
+\label{sec:rlmc-imit-track-reward}
+
+mjlab tracking 任务的核心是\textbf{六个}指数型跟踪误差项，每项形如 $r_i=\exp(-e_i/\sigma_i^2)$（Cartesian/关节空间误差经高斯型指数归一化），外加三个正则项（动作率、关节限位、自碰撞）。源稿一度把它概括为「五项」并合并了 body pose 与 body velocity——经在 mjlab 源码（\texttt{mjlab/tasks/tracking/}）逐项核对，body 的位置与朝向、速度的线与角分量都是\emph{各自独立}的 reward 函数与 $\sigma$。配置项的四维含义见 \cref{tab:rlmc-imit-rewardterms}（默认值取自 mjlab G1 tracking 配置）。
+
+\begin{codebox}[Python]{mjlab tracking 的 reward 配置（函数名/默认值经 mjlab 源码核对）}
+# 注意 sigma 的参数名是 "std"；body pos/ori、vel lin/ang 都是独立项
+rewards = {
+    "motion_global_root_pos":  RewardTermCfg(   # 1. anchor（根）全局位置误差
+        func=mdp.motion_global_anchor_position_error_exp,
+        params={"command_name": "motion", "std": 0.3}, weight=0.5),
+    "motion_global_root_ori":  RewardTermCfg(   # 2. anchor（根）全局朝向误差（四元数距离）
+        func=mdp.motion_global_anchor_orientation_error_exp,
+        params={"command_name": "motion", "std": 0.4}, weight=0.5),
+    "motion_body_pos":         RewardTermCfg(   # 3. 各 body 相对位置误差
+        func=mdp.motion_relative_body_position_error_exp,
+        params={"command_name": "motion", "std": 0.3}, weight=1.0),
+    "motion_body_ori":         RewardTermCfg(   # 4. 各 body 相对朝向误差
+        func=mdp.motion_relative_body_orientation_error_exp,
+        params={"command_name": "motion", "std": 0.4}, weight=1.0),
+    "motion_body_lin_vel":     RewardTermCfg(   # 5. 各 body 全局线速度误差
+        func=mdp.motion_global_body_linear_velocity_error_exp,
+        params={"command_name": "motion", "std": 1.0}, weight=1.0),
+    "motion_body_ang_vel":     RewardTermCfg(   # 6. 各 body 全局角速度误差
+        func=mdp.motion_global_body_angular_velocity_error_exp,
+        params={"command_name": "motion", "std": 3.14}, weight=1.0),
+    # —— 正则项 ——
+    "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.1),
+    "joint_limit":    RewardTermCfg(func=mdp.joint_pos_limits, weight=-10.0,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))}),
+    "self_collisions": RewardTermCfg(func=mdp.self_collision_cost, weight=-10.0,
+        params={"sensor_name": "self_collision", "force_threshold": 10.0}),
+}
+\end{codebox}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{BeyondMimic 跟踪 reward 的配置四维表（默认值经 mjlab G1 源码核对）}
+\label{tab:rlmc-imit-rewardterms}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+reward 项 & $\sigma$（\texttt{std} 默认） & 权重 & 调参信号 & 缺失后果 \\
+\midrule
+motion\_global\_root\_pos & 0.3 & 0.5 & root\_pos\_error 均值 & 机器人漂移 \\
+motion\_global\_root\_ori & 0.4 & 0.5 & root\_ori\_error 均值 & 面朝错方向 \\
+motion\_body\_pos & 0.3 & 1.0 & body\_pos\_error 分布 & 姿态不像参考 \\
+motion\_body\_ori & 0.4 & 1.0 & body\_ori\_error 分布 & 肢体朝向偏 \\
+motion\_body\_lin\_vel & 1.0 & 1.0 & body\_lin\_vel\_error & 动作卡顿不流畅 \\
+motion\_body\_ang\_vel & 3.14 & 1.0 & body\_ang\_vel\_error & 旋转不跟手 \\
+self\_collisions & ---（硬惩罚） & $-10.0$ & 接触力计数 & 穿模 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[$\sigma$ 是 reward 的「宽容度旋钮」]\label{ins:rlmc-imit-sigma}
+$\sigma$（mjlab 里参数名为 \texttt{std}）控制 reward 的宽容度——$\sigma$ 大意味着「大方向对就给分」，$\sigma$ 小意味着「毫米级精确才给分」。注意 mjlab 默认就对不同物理量用了不同 $\sigma$：位置类 0.3、朝向/角速度类用更大的 0.4 与 3.14（rad、rad/s 量纲下「同样像」对应更大的数值容差）。训练初期可用较大 $\sigma$（先学会大致跟踪）、后期收紧（提精度），这与 \cref{ch:rlmc-reward} 的 curriculum 思想一致——BeyondMimic 在 mjlab 中默认用\emph{固定} $\sigma$，但你可以通过 EventManager 实现训练中的 $\sigma$ 退火。本质洞察：\emph{$\sigma$ 不是「精度参数」而是「梯度形状参数」——它决定 reward 在多大误差范围内还能提供有用梯度}。
+\end{insight}
+
+\paragraph{UniLab 的同款 tracking reward（标量字典范式）。}UniLab 的 \verb|G1MotionTracking| 实现了与 BeyondMimic 几乎逐项对应的跟踪 reward，但落地范式不同：mjlab/Isaac Lab 用 \verb|RewardTermCfg(func=...)| 类式（或函数式）配置，UniLab 则用 \textbf{\texttt{reward.scales} 标量字典 + env 内 \texttt{\_reward\_fns} 派发表}（UniLab，\verb|run_reward_dispatch| 在 \verb|envs/locomotion/common/rewards.py|）。同一组「root 位置 / root 朝向 / body 位姿 / body 速度」误差项，在三框架里是\emph{同构的物理量、不同的配置语法}：
+
+\begin{codebox}[Python]{UniLab G1MotionTracking 的 reward.scales（对照 mjlab 六个跟踪项）}
+# Hydra YAML（owner：conf/ppo/task/g1_motion_tracking/mujoco.yaml）
+reward:
+  scales:
+    motion_global_root_pos: 0.5    # 对应 mjlab motion_global_root_pos（root 全局位置误差）
+    motion_global_root_ori: 0.5    # 对应 mjlab motion_global_root_ori（root 朝向，四元数距离）
+    motion_body_pos:        1.0    # 各 body 位置误差（mjlab motion_body_pos 同源）
+    motion_body_ori:        1.0    # 各 body 朝向误差（mjlab motion_body_ori 同源）
+    motion_body_lin_vel:    1.0    # body 线速度误差（mjlab motion_body_lin_vel）
+    motion_body_ang_vel:    1.0    # body 角速度误差（mjlab motion_body_ang_vel）
+    motion_joint_pos:       ...    # 关节角误差（细粒度补充）
+    motion_ee_body_pos_z:   ...    # 末端（脚）高度误差（防浮空/穿地）
+  tracking_sigma: 0.25             # 指数核宽容度（= mjlab 各项 std 的统一旋钮）
+# 派发：run_reward_dispatch 算 Σ scales[name]*fns[name](ctx)，返回 reward*ctrl_dt
+#   （= mjlab/Isaac 的 scale_by_dt，按控制周期缩放）；每 4 步把 reward/<name> 写 info["log"]。
+\end{codebox}
+
+UniLab 的跟踪奖励项与 mjlab \emph{逐项同名同源}（\verb|motion_global_root_pos/ori|、\verb|motion_body_pos/ori/lin_vel/ang_vel|）——两框架都把 body 速度\emph{拆成}线速度与角速度独立加权；UniLab 另额外给一个 \verb|motion_ee_body_pos_z|（末端 Z 高度）与 \verb|motion_joint_pos| 专治脚底浮空与细粒度关节跟踪。\textbf{$\sigma$ 课程的一处真实差异}：UniLab \emph{没有}现成的「按步收紧 \texttt{tracking\_sigma}」课程函数（已核实欠缺），只能在 owner YAML 里分阶段手调，或自写回调改 \verb|cfg.reward_config.tracking_sigma|——而 mjlab 可借 EventManager、Isaac Lab 可借 CurriculumManager 实现退火。UniLab 自带的课程是 \verb|PenaltyCurriculum|（按 episode 长度缩放\emph{负权重} reward），方向不同。
+
+\subsection{Anchor 机制：BeyondMimic 的关键设计}
+\label{sec:rlmc-imit-track-anchor}
+
+传统 DeepMimic 把整条参考轨迹（或一个时间窗口）塞进观测，让策略「沿轨迹走」。BeyondMimic 改为只给一个 \textbf{anchor}——选定一个 anchor body（如躯干/骨盆），把\emph{当前参考帧}该 body 的目标位姿\textbf{表达在机器人当前 body frame 下}作为观测（mjlab 的 \verb|motion_anchor_pos_b|/\verb|motion_anchor_ori_b|，经源码核对）。这样策略只需对齐一个相对目标、而非记住全局轨迹；其工程价值是给物理仿真留「呼吸空间」——策略不必精确复现每一帧（物理响应有延迟），全身其余 body 的跟踪交给 reward（\cref{sec:rlmc-imit-track-reward} 的 \verb|motion_body_*| 项），观测则保持紧凑且平移/朝向不变。
+
+观测设计的一个重要选择是\emph{传差值而非目标值}：
+
+\begin{codebox}[Python]{mjlab tracking 的 actor observation 配置（字段名经 tracking\_env\_cfg 核对）}
+actor_terms = {
+    "command":   ObservationTermCfg(func=mdp.generated_commands,  # 跟踪命令
+                                    params={"command_name": "motion"}),
+    # —— 相对 anchor 的目标差（body frame，当前帧）——
+    "motion_anchor_pos_b": ObservationTermCfg(func=mdp.motion_anchor_pos_b,   # (3)
+        params={"command_name": "motion"}, noise=Unoise(n_min=-0.25, n_max=0.25)),
+    "motion_anchor_ori_b": ObservationTermCfg(func=mdp.motion_anchor_ori_b,   # 朝向(6)
+        params={"command_name": "motion"}, noise=Unoise(n_min=-0.05, n_max=0.05)),
+    # —— 当前机器人状态（本体可得）——
+    "base_lin_vel": ObservationTermCfg(func=mdp.builtin_sensor,   # IMU 估计线速度
+        params={"sensor_name": "robot/imu_lin_vel"}, noise=Unoise(n_min=-0.5, n_max=0.5)),
+    "base_ang_vel": ObservationTermCfg(func=mdp.builtin_sensor,
+        params={"sensor_name": "robot/imu_ang_vel"}, noise=Unoise(n_min=-0.2, n_max=0.2)),
+    "joint_pos": ObservationTermCfg(func=mdp.joint_pos_rel, params={"biased": True}),
+    "joint_vel": ObservationTermCfg(func=mdp.joint_vel_rel),
+    "actions":   ObservationTermCfg(func=mdp.last_action),
+}
+# critic 组额外加无噪声的 robot_body_pos_b / robot_body_ori_b（特权全身 body 位姿）
+\end{codebox}
+
+传 anchor 差值直接告诉策略「需往哪个方向移动多少」，省去了「先理解我在哪、目标在哪、再算差」的负担。这与 \cref{ch:rlmc-obsact} 「观测应表达策略需要的相对量」的原则一脉相承。注意 anchor 的位置与朝向是\emph{两个独立观测项}（\verb|motion_anchor_pos_b| 与 \verb|motion_anchor_ori_b|），都表达在机器人\emph{当前 body frame} 下。
+
+\paragraph{UniLab 的 anchor 观测（同样传相对量）。}UniLab 的 \verb|G1MotionTracking| 在 actor 观测里采用了同一思想：除当前本体状态外，加入 \textbf{motion anchor}——「目标躯干位姿\emph{相对机器人当前}的差」，由 \verb|_write_motion_anchor_transform| 写入（UniLab，\verb|envs/motion_tracking/g1|）。它与 mjlab \emph{逐项对应}：都拆成位置项 + 朝向项（\verb|motion_anchor_pos_b| + \verb|motion_anchor_ori_b|），且\textbf{都用 6D 旋转表示朝向}（经源码核对，mjlab \verb|motion_anchor_ori_b| 取旋转矩阵前两列 $3\times2=6$ 维，与 UniLab 一致）：
+
+\begin{codebox}[Python]{UniLab G1MotionTracking 的跟踪观测（actor 组，相对量）}
+# _compute_obs 拼接（actor 组）：当前本体状态 + 命令 + motion anchor 相对差
+obs = np.concatenate([
+    # ... 当前本体状态：gyro / projected_gravity / joint_pos_rel / joint_vel / last_action ...
+    command,                 # (2n)  跟踪命令（如目标速度/相位编码）
+    motion_anchor_pos_b,     # (3)   目标躯干位置相对机器人（body frame）
+    motion_anchor_ori_b,     # (6)   目标躯干朝向相对机器人（6D 旋转表示）
+], axis=1)
+# motion anchor = 目标躯干位姿相对当前机体，由 _write_motion_anchor_transform 写入
+# 部署变体 G1WBTObs：去掉真机不可得通道（base_lin_vel / motion_anchor_pos_b），改加本体感知历史
+\end{codebox}
+
+两点工程细节值得注意：mjlab 与 UniLab 的朝向 anchor 都用 \textbf{6D 旋转表示}（\verb|motion_anchor_ori_b| 占 6 维，取旋转矩阵前两列）而非四元数 diff——6D 表示在神经网络回归旋转时无 double cover、无万向锁，是 anchor 这类「喂给策略的旋转目标」的常见稳健选择（与 \cref{sec:rlmc-imit-track-quat} 里 reward 内部用旋转误差并不矛盾：观测求「平滑可学」，reward 求「几何正确」）。此外 UniLab 专门提供了部署导向变体 \verb|G1WBTObs|：它\emph{砍掉}真机拿不到的 \verb|base_lin_vel| 与 \verb|motion_anchor_pos_b| 通道、改用本体感知历史——这正是 \cref{sec:rlmc-imit-bc} 蒸馏要跨越的「信息边界」在 UniLab 里的现成抓手。\textbf{mjlab 侧也有对称的现成抓手}（实跑 \verb|list-envs| 确认）：除 \verb|Mjlab-Tracking-Flat-Unitree-G1| 外，mjlab 还注册了 \verb|Mjlab-Tracking-Flat-Unitree-G1-No-State-Estimation| 变体（\verb|has_state_estimation=False|，砍掉状态估计/\verb|base_lin_vel|）——它与 UniLab 的 \verb|G1WBTObs| 一样，把「真机不可得通道」直接做成了一个任务变体，是三框架里「特权 teacher $\to$ 可部署 student」信息边界的现成对照。
+
+\begin{pitfall}[anchor / body 顺序不匹配导致「扭曲」]
+\textbf{错误描述}：reward 函数期望参考数据的 body 顺序与 MuJoCo 模型一致，但 retarget 输出顺序不同（如「左髋,左膝,左踝,右髋,…」vs「左髋,右髋,左膝,右膝,…」）。\textbf{现象后果}：每个 body 误差与\emph{错误}的参考值比较，机器人姿态剧烈扭曲，reward 始终很低。\textbf{根本原因}：body 索引在两处的隐式约定不同。\textbf{正确做法}：在 MuJoCo 中打印 model 的 body 名列表，与 \texttt{.npz} 中 body 顺序逐一对齐；可视化第 0 帧确认所有肢体在正确位置。
+\end{pitfall}
+
+\subsection{参考状态初始化（RSI）}
+\label{sec:rlmc-imit-track-rsi}
+
+RSI 是 DeepMimic 沿用至今的关键技巧：episode reset 时从参考运动的\emph{随机帧}初始化机器人状态，而非总从 frame 0 开始。
+
+\begin{codebox}[Python]{RSI 配置与实现逻辑（root 取 anchor body 列，对齐 mjlab schema）}
+class RSIConfig:
+    enabled: bool = True
+    start_ratio: float = 0.0    # 0 = 可从头开始
+    end_ratio: float = 0.9      # 0.9 = 不从最后 10% 开始（避免终止前初始化）
+
+def reference_state_init(env, motion, rsi, anchor_idx=0):
+    T = motion["joint_pos"].shape[0]
+    init_frame = np.random.randint(int(T*rsi.start_ratio), int(T*rsi.end_ratio))
+    # root = anchor body 那一列（mjlab/UniLab 均无独立 root_* 字段）
+    env.robot.set_root_state(
+        pos=motion["body_pos_w"][init_frame, anchor_idx],
+        quat=motion["body_quat_w"][init_frame, anchor_idx],
+        lin_vel=motion["body_lin_vel_w"][init_frame, anchor_idx],
+        ang_vel=motion["body_ang_vel_w"][init_frame, anchor_idx])
+    env.robot.set_joint_state(
+        pos=motion["joint_pos"][init_frame], vel=motion["joint_vel"][init_frame])
+    return init_frame
+\end{codebox}
+
+RSI 解决的核心问题：若总从开头开始，策略可能只学会前几帧的跟踪（后面还没探索到就摔倒了）。RSI 让策略有机会从任意位置开始练习，大幅提高训练效率。mjlab 的真实实现在 \verb|MotionCommand._resample_command| 里：\verb|sampling_mode="start"| 时固定起点，否则按难度 bin 做 \verb|torch.multinomial| 采样（即 \cref{tab:rlmc-imit-protocol} 阶段 5 的 adaptive sampling），随后从对应帧 \verb|reset_to_frame|。
+
+\begin{pitfall}[RSI 初始化到越界帧导致「弹飞」]
+\textbf{错误描述}：参考运动某些帧关节角超出限位（retarget 不可达），RSI 把机器人初始化到物理不可行状态。\textbf{现象后果}：机器人在 reset 后几步内被「弹飞」或数值不稳定。\textbf{根本原因}：MuJoCo 把关节限位当\emph{约束}处理（而非简单 clip 到 range），越界初始状态会在随后几步产生很强的修正力/力矩。\textbf{正确做法}：reset 时主动把关节角投影/裁剪到限位内并 \verb|mj_forward| 检查；或在 retarget 阶段就确保所有帧都在限位内（见 \cref{tab:rlmc-imit-contract}）。
+\end{pitfall}
+
+\subsection{代码走读：四元数距离——模仿学习的核心几何操作}
+\label{sec:rlmc-imit-track-quat}
+
+tracking reward 中最易出错的是\emph{旋转距离}的计算。两个四元数 $q_1,q_2$ 之间的旋转距离不能直接做减法：四元数空间不是欧氏空间，且 $q$ 与 $-q$ 表示同一旋转（double cover）。
+
+\begin{codebox}[Python]{quat\_distance：数值稳健的四元数旋转距离（wxyz）}
+import torch
+
+def quat_distance(q1, q2):
+    """两个四元数之间的旋转角（弧度）。q1,q2 shape (...,4)，wxyz。"""
+    dot = (q1 * q2).sum(dim=-1)
+    q2 = torch.where(dot.unsqueeze(-1) < 0, -q2, q2)   # double cover：取更近的表示
+    dot = (q1 * q2).sum(dim=-1).clamp(-1.0, 1.0)       # 浮点误差可能略超 [-1,1]
+    return 2.0 * torch.acos(dot.abs())                 # 旋转角 = 2 arccos|dot|
+\end{codebox}
+
+三个关键工程细节：(1) \textbf{double cover 处理}——若 $q_1\cdot q_2<0$ 则翻转 $q_2$ 为 $-q_2$（同一旋转，但在四元数球面上更近）；(2) \textbf{\texttt{clamp}}——浮点误差可能让点积略超 $[-1,1]$，\texttt{arccos} 对此未定义；(3) \textbf{\texttt{abs}}——确保角度恒正。
+
+\begin{insight}[double cover 处理是工程必需，不是数学优雅]\label{ins:rlmc-imit-doublecover}
+不处理 double cover 的后果不是「精度略差」，而是\textbf{两个非常接近的旋转可能被算成 $\pi$ 弧度（最大距离）}——因为它们在四元数球面上恰好落在对跖点附近。这个 bug 会让 tracking reward 突然跳变，策略训练不稳定。本质洞察：\emph{在 $\SO(3)$ 上度量距离时，必须先把两个表示「拉到同一半球」再比较}；这与全书 \cref{ch:rlmc-obsact} 用的右扰动观点一致——旋转误差应在流形上度量，而非在嵌入坐标里硬减。
+\end{insight}
+
+\subsection{运行验证：八阶段训练协议与四类评估指标}
+\label{sec:rlmc-imit-track-protocol}
+
+模仿学习训练不应「一口气跑到底」。\cref{tab:rlmc-imit-protocol} 给出一套实战验证过的八阶段协议——每阶段有明确配置、指标与退出条件。按顺序完成可以把问题定位在最早阶段，避免后期才发现「原来是数据就有问题」。这类似火箭发射的逐级检查：不能跳过「燃料加注检查」直接点火。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{motion imitation 的八阶段训练协议}
+\label{tab:rlmc-imit-protocol}
+\begin{tabular}{@{}llll@{}}
+\toprule
+阶段 & 配置 & 主要指标 & 退出条件 \\
+\midrule
+1. 单帧调试 & start 采样、zero agent & ghost/current 对齐 & body 与 anchor 位置可解释 \\
+2. 短片段 & 单条 motion、固定起点 & anchor/body error & 无数据契约错误 \\
+3. 完整片段 & uniform 采样（RSI） & MPJPE、episode length & episode 走完 80\%+ 帧 \\
+4. 终止条件 & 打开关键 termination & termination 直方图 & 只有合理终止 \\
+5. adaptive 采样 & 失败 bin 采样 & entropy、top1 bin & 集中在真实难点 \\
+6. 多 motion & 按动作族分层 & 分 motion 成功率 & 不只记住单条 \\
+7. 轻量 DR & friction/COM/encoder 噪声 & 回退幅度 $<15\%$ & 风格不因 DR 失真 \\
+8. 导出评估 & checkpoint + ONNX + 视频 & 四类评估指标 & 可复现评估包 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+阶段 1--2 排除\emph{数据}问题（zero agent 下回放，看 ghost 与 current 是否对齐，无须任何训练）；阶段 3--4 确认\emph{基础训练}可行（单 motion + RSI 是最简配置，若 episode length 不能接近动作总帧数，先查 reward 权重/termination，别叠加复杂度）；阶段 5--6 从「单条」扩展到「多动作库」（adaptive 采样把资源集中到最薄弱片段，但若阶段 3 还没收敛就开 adaptive，会把采样集中到「随机失败」而非「动作难点」）；阶段 7--8 是部署准备（轻量 DR 让策略鲁棒但不应太激进——tracking 的首要目标是「精确模仿」而非「鲁棒走路」）。
+
+\paragraph{这些指标在哪看、长什么样、多少算过线。}协议讲了「该看 entropy、top1 bin、anchor error」，但新手最卡的是\emph{这些数字到底在哪}——其实 mjlab tracking 训练时\textbf{直接打印在 stdout/日志里}（也同步进 WandB/TensorBoard），不必另写脚本。\cref{tab:rlmc-imit-logkeys} 给出实跑日志里真实出现的 key 与一组\emph{真实量纲基准}（autodl RTX4080S，G1 tracking 早期 2 iter），让你拿到自己的数字时有参照、不至于「看着一串数不知好坏」。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{mjlab tracking 训练日志里的关键 key 与实跑参照值（早期阶段）}
+\label{tab:rlmc-imit-logkeys}
+\begin{tabular}{@{}lll@{}}
+\toprule
+日志 key（stdout/WandB） & 含义 & 实跑参照（早期/趋势） \\
+\midrule
+\verb|Metrics/motion/sampling_entropy| & 难度 bin 采样熵（阶段 5） & 约 0.98（高=均匀，收敛后应降） \\
+\verb|Metrics/motion/sampling_top1_bin| & 当前最常采的难度 bin & 集中到真实难点才算对 \\
+\verb|Metrics/motion/error_anchor_pos| & anchor 位置误差(m) & 约 0.77 起，应随训练下降 \\
+\verb|Metrics/motion/error_anchor_rot| & anchor 朝向误差(rad) & 同上，趋势比绝对值重要 \\
+\verb|.../error_anchor_lin_vel/ang_vel| & anchor 线/角速度误差 & 速度项收敛通常慢于位置 \\
+\verb|Episode_Termination/anchor_pos| & 因 anchor 偏差过大早停计数 & 早期高属正常（见下） \\
+\verb|Episode_Termination/ee_body_pos| & 因末端(脚)偏差早停计数 & 早期高属正常 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[早期大量「早停」不是训练崩了]
+\textbf{现象}：阶段 3--4 刚开训，日志里 \verb|Episode_Termination/anchor_pos| 与 \verb|ee_body_pos| 几乎每个 env 每步都触发（实跑 64/64 env 在头 2 个 iter 内就大量早停）。\textbf{别误判}：这\emph{不是}崩溃——策略还没学会跟踪，anchor/末端偏差自然超阈值，RSI + 早停正是让它从各种起点反复短练。\textbf{怎么算正常 vs 异常}：看\emph{趋势}——随 iter 增加，episode length 应稳步变长、\verb|error_anchor_pos| 应稳步下降；若训练几百 iter 后早停率仍不降、error 不降，才是真出了问题（先查 reward 权重/termination 阈值/数据契约，对照 \cref{sec:rlmc-imit-troubleshoot}）。\textbf{读日志的纪律}：判断模仿训练健康与否，\emph{永远看曲线趋势，不看单帧绝对值}。
+\end{pitfall}
+
+\begin{insight}[只看 episode reward 判断不了模仿成败]\label{ins:rlmc-imit-metrics}
+评估模仿质量至少要四类指标，单看 reward 会被「MPJPE 低但脚底一直在滑、动作抖动严重」骗过：\textbf{几何误差}（MPJPE、root pos/ori error，G1 行走合格区 MPJPE $<5$\,cm、root ori $<15^\circ$）、\textbf{速度误差}（root/joint velocity error，root vel $<0.3$\,m/s）、\textbf{接触质量}（foot slip distance、异常接触计数，slip $<2$\,cm/step）、\textbf{策略平滑度}（action rate L2、关节加速度代理，action\_rate $<0.5$）。本质洞察：\emph{几何指标看「像不像」，接触与平滑度看「能不能真机执行」——二者缺一不可}。
+\end{insight}
+
+\subsection{三框架对比：tracking 的工程接线}
+\label{sec:rlmc-imit-track-three}
+
+显式跟踪在三框架上的接线对比见 \cref{tab:rlmc-imit-track-fw}。完整的 mjlab 端到端流程：
+
+\begin{codebox}[bash]{mjlab tracking 端到端（mjlab 自带脚本，tyro 旗标）}
+# Step 1 准备数据（先过 check_motion_contract）；mjlab 包内脚本用 tyro 连字符旗标、
+#   默认无头（无 --headless，用 --render 才出预览视频），且自动上传 WandB Registry
+python -m mjlab.scripts.csv_to_npz --input-file g1_walk.csv \
+    --input-fps 30 --output-name g1_walk        # 默认 output-fps=50，产物自动入 registry
+# Step 2 训练 tracking 策略（registry-name 指向 Step 1 上传的 motion）
+uv run train Mjlab-Tracking-Flat-Unitree-G1 \
+    --registry-name my-org/wandb-registry-motions/g1_walk \
+    --env.scene.num-envs 4096 --agent.max-iterations 20000
+# Step 3 评估回放
+uv run play Mjlab-Tracking-Flat-Unitree-G1 --num-envs 1 --viewer viser
+\end{codebox}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{显式跟踪在三框架上的工程接线对比}
+\label{tab:rlmc-imit-track-fw}
+\begin{tabular}{@{}llll@{}}
+\toprule
+环节 & mjlab & ProtoMotions（Mimic） & UniLab \\
+\midrule
+任务/入口 & \texttt{Mjlab-Tracking-Flat-Unitree-G1} & \texttt{--experiment-path .../mimic/mlp.py} & \texttt{--task g1\_motion\_tracking} \\
+reward 实现 & DeepMimic + BeyondMimic 扩展 & Mimic（扩展 AMP 的 pose diff） & \texttt{motion\_*} scales 标量字典派发 \\
+数据输入 & \texttt{.npz}（已 retarget） & MotionLib \texttt{.pt} & \texttt{.npz}（\texttt{MotionLoader}） \\
+RL 后端 & RSL-RL（PPO） & 内置 PPO & PPO/APPO（rsl-rl）或 SAC \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+ProtoMotions 的 Mimic 入口经官方仓库核对为 dataclass 风格 \texttt{train\_agent.py --experiment-path examples/experiments/mimic/mlp.py --robot-name g1 --motion-file *.pt}；\cref{sec:rlmc-imit-amp} 给出更完整的命令与版本说明。
+
+\begin{practice}[练习·显式跟踪]
+\begin{enumerate}
+  \item \textbf{[分析]} 跟踪 reward 中去掉两个速度项（\verb|motion_body_lin_vel| 与 \verb|motion_body_ang_vel|，只留位置与朝向），策略行为会如何变化？提示：考虑「停在正确位置」与「以正确速度经过正确位置」的区别。
+  \item \textbf{[编码]} 实现 \verb|compute_tracking_metrics|，输入策略 rollout 与参考动作，输出每个 body 的 position/orientation error 直方图；用它对比「有 RSI」与「无 RSI」两个策略的跟踪精度。验收标准：能画出两条 error 分布并指出 RSI 的影响。
+  \item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-dr}（DR）与本节：在 tracking 训练中加入激进 DR（摩擦 $\mathcal{U}(0.2,2.0)$），tracking 精度与鲁棒性分别如何变化？是否存在权衡？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{对抗风格：AMP 判别器训练工程}
+\label{sec:rlmc-imit-amp}
+
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-imit-amp-pos}
+
+AMP 的判别器训练是模仿学习工程中\emph{最易失败}的环节。在管线中，AMP 取代显式 tracking reward 的位置：判别器从参考数据集学习「什么是自然运动」，把这个判断作为 style reward 反馈给策略。它适合的场景是「速度命令 + 自然步态」与「多任务控制」——你想让机器人以某速度前进但不指定具体腿如何摆，只要「看起来自然」。
+
+\begin{note}[本节代码是「原理示意」，可运行实现走 ProtoMotions]
+\textbf{先说清楚一件事，免得你照着片段去跑}：本节（及 \cref{sec:rlmc-imit-ase}、\cref{sec:rlmc-imit-bc}）的判别器/encoder/BC 代码都是\emph{为讲透原理而自写的最小片段}——它们帮你看懂「五个稳定性技巧具体落在哪几行」，但\textbf{不是}可直接 \verb|python xxx.py| 起训的入口。AMP/ASE/CALM/MaskedMimic 的\emph{可运行}实现在 \textbf{ProtoMotions}（\cref{sec:rlmc-imit-amp-three} 给了 dataclass 风格的 \verb|train_agent.py --experiment-path .../amp/mlp.py| 命令）；mjlab/UniLab 这条线\emph{没有}内置 AMP 判别器（见 \cref{sec:rlmc-imit-amp-three} 的诚实标注）。所以读本节的正确姿势是：\emph{对照片段理解 \cref{tab:rlmc-imit-amptricks} 的五个技巧与 \cref{tab:rlmc-imit-discmonitor} 的监控指标，真要实跑则起 ProtoMotions、把这些指标对到它的日志上}。
+\end{note}
+
+\subsection{动机：从精确跟踪到风格约束}
+\label{sec:rlmc-imit-amp-motivation}
+
+一种朴素替代是手工设计 style penalty（惩罚膝盖内扣、奖励对称步态）。它的问题是：(1) 要为每种「不自然」行为设计惩罚项，需要大量人工 reward engineering；(2) penalty 只「告诉策略什么不对」，不告诉「什么是对的」，策略可能找到一种满足所有惩罚却仍不自然的运动；(3) 不同机器人的「自然」标准不同。AMP 用数据驱动方式解决这些——判别器从参考数据\emph{自动}学「自然」的标准。
+
+\subsection{配置详解：AMP 的数据流与两部分 reward}
+\label{sec:rlmc-imit-amp-dataflow}
+
+AMP 的 reward 有两部分相加：
+\begin{equation}
+r_t = w_{\text{task}}\, r_{\text{task}} + w_{\text{style}}\, r_{\text{style}}.
+\label{eq:rlmc-imit-amp-reward}
+\end{equation}
+其中 $r_{\text{task}}$ 是标准任务 reward（如速度跟踪），$r_{\text{style}}$ 来自判别器。AMP 用 LSGAN（最小二乘 GAN）形式：判别器 $D$ 是\emph{回归输出}（非概率，未过 sigmoid），训练目标是让它对参考数据回归到 $+1$、对策略数据回归到 $-1$；style reward 由一个平滑 surrogate 给出\,\cite{peng2021amp}：
+\begin{equation}
+r_{\text{style}}(s_t,s_{t+1}) = \max\!\Big[0,\; 1 - \tfrac14\big(D(s_t,s_{t+1}) - 1\big)^2\Big].
+\label{eq:rlmc-imit-amp-style}
+\end{equation}
+即 $D\to+1$（判别器认为像参考）时 $r_{\text{style}}\to1$，远离则衰减并截断到 0。判别器的训练目标（最小二乘）为
+\begin{equation}
+\min_{D}\; \mathbb{E}_{(s,s')\sim\mathcal{D}}\big[(D(s,s')-1)^2\big] + \mathbb{E}_{(s,s')\sim\pi}\big[(D(s,s')+1)^2\big].
+\label{eq:rlmc-imit-amp-disc}
+\end{equation}
+
+权重 $w_{\text{style}}$ 控制「自然度」在整体 reward 中的占比——设太高，策略为「好看」而放弃任务性能；设太低，判别器信号被任务 reward 淹没。
+
+\subsection{配置详解：判别器网络与输入设计}
+\label{sec:rlmc-imit-amp-net}
+
+AMP 判别器的输入是相邻两帧的状态对 $(s_t,s_{t+1})$。关键工程选择是\emph{排除 root 的 xy 位置与 xy 速度}：
+
+\begin{codebox}[Python]{AMP 判别器输入特征（ProtoMotions 默认结构）与网络}
+discriminator_obs = [
+    "joint_pos", "joint_vel",      # 关节角 / 角速度
+    "root_height", "root_rot",     # 根节点高度 / 朝向（局部系）
+    "root_ang_vel", "key_body_pos" # 根角速度 / 关键 body 位置（手脚头）
+]
+# 不含 root_xy_pos（平移不变性）与 root_lin_vel_xy（速度不变性）
+
+import torch, torch.nn as nn
+class AMPDiscriminator(nn.Module):
+    def __init__(self, obs_dim, hidden=(1024, 512)):
+        super().__init__()
+        layers, d = [], obs_dim * 2          # 两帧拼接
+        for h in hidden:
+            layers += [nn.Linear(d, h), nn.ReLU()]; d = h
+        layers += [nn.Linear(d, 1)]
+        self.net = nn.Sequential(*layers)
+    def forward(self, s_t, s_tp1):
+        # 输出 LSGAN 回归值（非概率）：训练让参考->+1、策略->-1
+        return self.net(torch.cat([s_t, s_tp1], dim=-1))
+\end{codebox}
+
+\begin{insight}[排除 root xy = 让判别器学「运动模式」而非「在哪运动」]\label{ins:rlmc-imit-rootxy}
+判别器应学的是「步态、摆臂、重心转移」这类\emph{运动模式}，而非「在哪里运动」或「运动多快」。若输入含 root xy 位置，判别器会学到「参考数据总是从原点开始」——这不是有用的风格信息，是 shortcut。排除 root xy 让判别器输出具有\textbf{平移不变性}与\textbf{速度不变性}。本质洞察：\emph{对抗式方法里，「判别器能区分」未必是好事——关键是它\textbf{凭什么}区分；要刻意剥夺它一切与「风格」无关的可区分信号}。
+\end{insight}
+
+\subsection{配置详解：判别器训练的五个稳定性技巧}
+\label{sec:rlmc-imit-amp-tricks}
+
+AMP 判别器容易模式坍塌：判别器完美区分真假 $\to$ reward 信号消失 $\to$ 策略不再改进 $\to$ 判别器更易区分 $\to$ 恶性循环。这类似考试的「分数膨胀」——评分太严，所有学生拿零分，便无从得知如何改进。五个技巧（\cref{tab:rlmc-imit-amptricks}）确保判别器保持「适度区分能力」。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{AMP 判别器训练的五个稳定性技巧}
+\label{tab:rlmc-imit-amptricks}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\# & 技巧 & 目的 & 关键参数 \\
+\midrule
+1 & 梯度惩罚（R1） & 限制判别器梯度幅度 & $\lambda_{\text{gp}}=10$ \\
+2 & 更新比例 1:1 & 防止判别器领先 actor 太多 & --- \\
+3 & replay 50/50 & 平衡真假数据 & buf 约 $10^5$ \\
+4 & 低学习率 & 减慢判别器学习 & disc\_lr $=3\times10^{-5}$ \\
+5 & 共享 normalizer & 防止凭归一化差异区分 & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{codebox}[Python]{AMP 判别器更新（含五个技巧的核心实现）}
+def update_discriminator(disc, optim, policy_buf, ref_data, cfg, normalizer):
+    half = cfg.disc_batch_size // 2
+    if len(policy_buf) < half:
+        return {"disc/skip": True}
+    # 技巧 3：50% policy（fake）+ 50% reference（real）
+    fake = torch.stack([policy_buf[i] for i in
+        np.random.choice(len(policy_buf), half, replace=False)]).to(cfg.device)
+    real = ref_data[np.random.randint(0, len(ref_data), half)].to(cfg.device)
+    fs, fsp = fake[:, :cfg.obs_dim], fake[:, cfg.obs_dim:]
+    rs, rsp = real[:, :cfg.obs_dim], real[:, cfg.obs_dim:]
+    # 技巧 5：共享 normalizer（actor 与 disc 必须同一个）
+    fs, fsp, rs, rsp = (normalizer(x) for x in (fs, fsp, rs, rsp))
+    # 损失 = LSGAN 最小二乘（非 BCE 交叉熵）
+    fake_loss = 0.5 * ((disc(fs, fsp) + 1.0) ** 2).mean()   # fake -> -1
+    real_loss = 0.5 * ((disc(rs, rsp) - 1.0) ** 2).mean()   # real -> +1
+    # 技巧 1：R1 梯度惩罚（对真实数据）
+    rs.requires_grad_(True); rsp.requires_grad_(True)
+    grad = torch.autograd.grad(disc(rs, rsp).sum(), [rs, rsp],
+                               create_graph=True)
+    gp = sum((g ** 2).sum(dim=-1).mean() for g in grad)
+    loss = fake_loss + real_loss + cfg.disc_grad_penalty * gp
+    optim.zero_grad(); loss.backward()
+    torch.nn.utils.clip_grad_norm_(disc.parameters(), 1.0); optim.step()
+    # LSGAN 回归输出以 0 为真假中点
+    return {"disc/accuracy":
+            0.5 * ((disc(fs, fsp) < 0).float().mean()
+                   + (disc(rs, rsp) > 0).float().mean()).item()}
+\end{codebox}
+
+各技巧的工程直觉：\textbf{技巧 1}梯度惩罚惩罚判别器在真实数据附近的梯度幅度——梯度大说明决策边界「尖锐」，小扰动就改变判断，策略难以从中获得有用梯度；\textbf{技巧 2}用 1:1 而非 WGAN-GP 的 5:1，因为 PPO 的 clipping 限制了策略变化幅度，actor 分布变化远慢于 GAN 的 generator，判别器不需要过度拟合；\textbf{技巧 4}低学习率（disc 比 actor 低约 3 倍）防止判别器学得太快而 actor 跟不上。
+
+\begin{insight}[理想判别器是「稍好于瞎猜但不完美」]\label{ins:rlmc-imit-discsweet}
+AMP 判别器的理想状态是 accuracy 在 0.6--0.8 之间——稍好于随机猜测但不完美。完美判别器（accuracy $=1.0$）意味着策略运动与参考「完全不像」，style reward 几乎为零，策略收不到有用梯度。这正是需要梯度惩罚的根本原因：\emph{它刻意削弱判别器，防止它「学得太好」}。本质洞察与监督学习相反——这里你\textbf{不希望}分类器变强；判别器只是一把「持续提供梯度的尺子」，尺子太精确反而量不出改进方向。
+\end{insight}
+
+\subsection{代码走读：AMP 与 PPO 的整合（技巧 2）}
+\label{sec:rlmc-imit-amp-ppo}
+
+\begin{codebox}[Python]{一个 AMP+PPO 训练 epoch（1:1 更新比例）}
+def train_amp_epoch(runner, disc_trainer, ref_data, w_task, w_style):
+    rollout = runner.rollout(num_steps=runner.cfg.num_steps_per_env)  # 1. rollout
+    transitions = torch.cat([rollout.obs[:-1], rollout.obs[1:]], dim=-1)
+    disc_trainer.add_policy_data(transitions)                          # 收集 (s,s')
+    with torch.no_grad():                                              # 2. AMP reward
+        amp_r = disc_trainer.compute_disc_reward(rollout.obs[:-1], rollout.obs[1:])
+        rollout.rewards = w_task * rollout.rewards + w_style * amp_r   # 融合 (eq AMP)
+    ppo_stats = runner.update_ppo(rollout)                            # 3. PPO 更新
+    disc_stats = disc_trainer.update(ref_data)                        # 4. 判别器更新(1:1)
+    return {**ppo_stats, **disc_stats}
+\end{codebox}
+
+整个循环每 iteration 执行一次：rollout $\to$ 收集 transitions $\to$ 计算 AMP reward $\to$ 融合 reward $\to$ PPO 更新 $\to$ 判别器更新。监控指标的健康范围见 \cref{tab:rlmc-imit-discmonitor}。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{AMP 判别器的关键监控指标与对策}
+\label{tab:rlmc-imit-discmonitor}
+\begin{tabular}{@{}llll@{}}
+\toprule
+指标 & 健康范围 & 不健康信号 & 对策 \\
+\midrule
+disc/accuracy & 0.55--0.80 & $>0.95$（太强） & 增大 $\lambda_{\text{gp}}$、降 disc\_lr \\
+disc/accuracy & 0.55--0.80 & $\approx0.50$（瞎猜） & 增大 hidden、查数据格式 \\
+disc/grad\_penalty & $<5$ & $>50$（梯度爆炸） & 降 $\lambda_{\text{gp}}$ \\
+disc/loss & 下降后稳定 & 震荡不收敛 & 降 disc\_lr \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{三框架对比：ProtoMotions / Isaac Lab 原生 / TienKung-Lab}
+\label{sec:rlmc-imit-amp-three}
+
+\textbf{ProtoMotions（当前 ProtoMotions3）。}训练入口与配置体系是\emph{Python dataclass experiment files}，不是早期的 Hydra/YAML。当前官方命令形如：
+
+\begin{codebox}[bash]{ProtoMotions3 AMP 训练（dataclass 风格，经核对）}
+python protomotions/train_agent.py \
+    --experiment-path examples/experiments/amp/mlp.py \
+    --robot-name g1 --simulator isaacgym \
+    --motion-file path/to/amass_motionlib.pt \
+    --experiment-name g1_amp --num-envs 4096
+\end{codebox}
+
+\begin{note}[ProtoMotions3 已弃用旧 Hydra 入口（经官方仓库核对）]
+源稿正文沿用了较早的 Hydra 风格（\texttt{python protomotions/train.py +exp=amp/... motion\_file=*.npz}）与 \texttt{eval\_agent.py}。经对照 NVlabs/ProtoMotions 官方仓库（\texttt{CLAUDE.md}，2026-06）核实：当前 ProtoMotions3 已改为上面的 dataclass \texttt{--experiment-path} 风格，motion 输入是打包的 MotionLib \texttt{.pt}（不是 \texttt{.npz}），训练入口 \texttt{protomotions/train\_agent.py}、部署推理脚本为 \texttt{protomotions/inference\_agent.py}（用 \texttt{--checkpoint}），参数覆盖用 \texttt{--overrides}（写入 \texttt{resolved\_configs.pt}）。具体 experiment 文件名（如 \texttt{amp/mlp.py}）以你所装版本的 \texttt{examples/experiments/} 目录为准。
+\end{note}
+
+ProtoMotions 的类继承决定了配置的扩展方式（经核对官方源码）：
+\begin{codebox}[text]{ProtoMotions 类继承树（截至 2026-06 核对）}
+BaseAgent  (训练循环/checkpoint/Lightning Fabric)
+└── PPO    (actor-critic, GAE, clipped surrogate)
+    ├── AMP        (+判别器 +replay +style reward)
+    │   └── ASE    (+MI encoder +latent skill +diversity loss)
+    └── Mimic/ADD  (+pose tracking diff，扩展 AMP)   # 显式跟踪走这里
+MaskedMimic        (expert 蒸馏 = BC，非 RL；类层次上独立)
+\end{codebox}
+注意：\textbf{Mimic 扩展自 AMP}（不是与 PPO 平级的独立分支），\textbf{MaskedMimic 是 BC} 且在类层次上独立——它\emph{加载}一个 frozen 的 full-body tracker 当 expert，但「加载谁做 teacher」不等于「继承谁」。从 PPO 升级到 AMP 只需增加：判别器网络、参考数据加载、replay buffer、style reward。
+
+\textbf{Isaac Lab 原生集成。}除了通过 ProtoMotions 间接使用 Isaac Lab，也可在 Isaac Lab 中直接实现 AMP——其 manager-based 架构（\cref{ch:rlmc-manager}）为 AMP 提供了天然集成点：判别器可作为自定义 reward term 接入 RewardManager。
+
+\begin{codebox}[Python]{Isaac Lab 中把 AMP 判别器接成 reward term}
+def amp_style_reward(env, discriminator, shared_normalizer):
+    obs_t = env.observation_manager.compute_group("disc_obs")  # 不含 root_xy
+    obs_prev = env._prev_disc_obs                              # 上一帧需手动缓存
+    with torch.no_grad():
+        d = discriminator(shared_normalizer(obs_prev), shared_normalizer(obs_t))
+        return torch.clamp(1.0 - 0.25 * (d - 1.0) ** 2, min=0.0).squeeze(-1)
+
+@configclass
+class RewardsCfg:                       # AMP 增强的速度跟踪
+    velocity_tracking = RewardTermCfg(func=mdp.track_lin_vel_xy_exp,
+        weight=1.0, params={"command_name": "base_velocity", "std": 0.5})
+    amp_style = RewardTermCfg(func=amp_style_reward, weight=0.5,
+        params={"discriminator": None, "shared_normalizer": None})  # 训练脚本注入
+    action_rate = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01)
+\end{codebox}
+
+Isaac Lab 原生集成还需自行实现：判别器训练循环（PPO 更新后执行）、replay buffer、参考数据加载——这些在 ProtoMotions 中已内置。\pzr{勘误：Isaac Lab \emph{确实}自带预注册的 AMP 任务——\texttt{Isaac-Humanoid-AMP-\{Dance,Run,Walk\}-Direct-v0}（经官方环境文档核对，2026-06）。但它们是 \textbf{Direct workflow} 的 SMPL 类人形角色任务、且\emph{只}用 \texttt{skrl} 库（\texttt{--algorithm AMP}），\emph{不是} manager-based 的 G1 任务。故上面「把判别器接成 manager reward term」这条路针对的是\emph{为 G1 这类 manager-based locomotion 任务加 AMP}：官方无现成 \texttt{Isaac-Velocity-*-G1-AMP-v0}，须以 \texttt{Isaac-Velocity-Rough-G1-v0} 为基础自行注册（自定义 obs group + 判别器观测）。}
+
+\textbf{TienKung-Lab。}TienKung-Lab（Open-X-Humanoid/TienKung-Lab，Isaac Lab + RSL-RL）展示了一个重要变体：\textbf{AMP style reward 与手工 periodic gait reward 融合}——AMP 提供整体风格约束，periodic reward 提供额外步态节奏约束，在全身人形上效果显著。其 retarget 脚本 \verb|smplx_to_robot.py| 是从 SMPL-X 到自定义人形的现成参考，处理了脊柱聚合、手指忽略、肩部偏移。
+
+\textbf{UniLab（无内置 AMP，须自实现判别器）。}这是本节一处必须\emph{诚实标注}的框架欠缺：UniLab 的运动技能主线是\textbf{显式动作跟踪 + RL}（\verb|G1MotionTracking| 系列，PPO/APPO/SAC），\emph{没有}把 AMP 判别器做成一等公民的 reward。若要在 UniLab 上做对抗式风格，需要自己接线——好在它的 reward 范式恰好留了口子：判别器 style reward 可以写成一个普通 reward 函数放进 \verb|_reward_fns| 派发表，在 \verb|reward.scales| 里给权重即可参与 \verb|run_reward_dispatch| 求和；但\textbf{判别器网络的训练循环、replay buffer、参考 $(s,s')$ 数据加载都得自己实现}（这点与「Isaac Lab 原生 AMP」处境相同，且 UniLab 还要额外考虑判别器更新跑在 GPU learner 进程、而 $(s,s')$ 采集在 CPU collector 进程——跨进程数据流要自己接到它的共享内存 IPC 上）。一句话：\emph{UniLab 给了显式跟踪的完整解，对抗式风格则是「能自己搭、但无现成开关」}。同理 ASE 的 latent skill、CALM 的 motion-latent 条件、MaskedMimic 的 inpainting 在 UniLab 中也均\textbf{无对应}，需自实现（见 \cref{sec:rlmc-imit-ase}）。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{AMP 在三框架上的选择指南}
+\label{tab:rlmc-imit-amp-fw}
+\begin{tabular}{@{}lll@{}}
+\toprule
+场景 & 推荐方案 & 理由 \\
+\midrule
+快速 AMP/ASE/CALM 对比实验 & ProtoMotions & 改一个 experiment file 即切换 \\
+自定义判别器架构或损失 & Isaac Lab 原生 & 完全控制训练循环 \\
+与 Isaac Lab 其他 extension 集成 & Isaac Lab 原生 & 避免框架冲突 \\
+AMP + 周期步态融合 & TienKung-Lab & 现成实现 + retarget 脚本 \\
+MaskedMimic & ProtoMotions & 唯一实现 \\
+UniLab 路线 & 无内置 AMP（须自实现判别器） & 主线是显式跟踪 + RL，非对抗 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{paper}[AMP：用判别器把「自然风格」变成 reward]\label{paper:rlmc-imit-amp}
+\textbf{问题}：DeepMimic 式显式跟踪需要帧级对齐的精确参考，且一个策略只能复现\emph{一条}动作；如何从\emph{一整个}动作数据集学「风格」并与任意任务结合？\textbf{核心思想}：训练一个判别器区分「参考数据的状态转移 $(s,s')$」与「策略产生的 $(s,s')$」，用其 LSGAN 回归输出经平滑 surrogate（\cref{eq:rlmc-imit-amp-style}）转成 style reward，与任务 reward 相加，再用 PPO 优化\,\cite{peng2021amp}。\textbf{关键结果}：无须帧级对齐即可让角色以「数据集风格」完成下游任务；判别器输入排除 root xy 实现平移/速度不变性。\textbf{与本书关系}：AMP 是本章对抗式技术线的奠基，三框架的判别器接线都源于它。\textbf{局限}：判别器训练不稳定（易模式坍塌），「风格像」不保证「动作精确」；多技能时退化为「平均风格」，需 ASE 扩展（\cref{sec:rlmc-imit-ase}）。
+\end{paper}
+
+\begin{pitfall}[AMP 训练的三个高频陷阱]
+\textbf{一·判别器 input 含 root xy 位置}：判别器会学到「参考数据在特定位置」——这不是风格信息。去掉 root xy 与 root xy 速度后重训。\textbf{二·梯度惩罚 $\lambda_{\text{gp}}$ 太大}：$\lambda_{\text{gp}}>50$ 会让判别器几乎无法学习，reward 退化为随机噪声；从 10 起，判别器太强才逐步加大。\textbf{三·以为 AMP reward 能完全替代 task reward}：style reward 只约束「风格」，不约束「完成任务」——没有 task reward，策略会学会非常优雅地站在原地（站立也是「自然」运动）。AMP reward 是 task reward 的\emph{补充}，不是替代。
+\end{pitfall}
+
+\begin{practice}[练习·AMP]
+\begin{enumerate}
+  \item \textbf{[分析]} AMP 判别器用 ReLU 而非 LeakyReLU/ELU。若改用 LeakyReLU，对判别器梯度流与 AMP reward 质量有何影响？提示：考虑负区间梯度对决策边界尖锐度的作用。
+  \item \textbf{[调参]} 在 ProtoMotions 中分别设 style reward 权重为 0.1、0.5、2.0，观察 task reward / style reward / disc accuracy 三条曲线。验收标准：指出让 disc accuracy 维持在 0.6--0.8 的权重区间。
+  \item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-obsact} 的观测归一化：若 AMP 的 actor 与 discriminator 用了不同 normalizer，discriminator 能凭哪些 shortcut 区分真假？会出现什么训练症状？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{ASE 潜在技能空间与 MaskedMimic}
+\label{sec:rlmc-imit-ase}
+
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-imit-ase-pos}
+
+AMP 的判别器从数据集学\emph{一种}统一风格。若数据集含走/跑/跳三种运动，AMP 学到的是三者的「平均风格」，可能产生「半走半跑」的怪异运动。本节从 AMP 的「单一风格」扩展到 ASE 的「多技能切换」、CALM 的「motion-latent 条件」与 MaskedMimic 的「动作补全」——在管线中它们位于「expert 能力扩展」环节，仍主要在 ProtoMotions 中实现。
+
+\subsection{ASE：用 latent skill code 装下多技能}
+\label{sec:rlmc-imit-ase-arch}
+
+ASE（Adversarial Skill Embeddings，Peng 等，SIGGRAPH 2022）在 AMP 基础上增加一个 latent skill code $z$\,\cite{peng2022ase}：
+\[
+\text{AMP}:\ (s,s')\to D\to r; \qquad \text{ASE}:\ (s,s',z)\to D_z\to r,\quad z\sim\text{encoder}(\text{motion clip}).
+\]
+encoder 从每条动作 clip 提取一个 latent code $z$（如 64 维），不同 clip 映射到 latent 空间不同位置；策略输入增加 $z$——给定不同 $z$ 产生不同风格。相对 AMP，ASE 新增三个训练组件：encoder 训练、diversity loss（鼓励不同 $z$ 产生不同运动，防止 mode collapse）、mutual information reward（策略执行的 $(s,s')$ 与 $z$ 的互信息越高越好）。
+
+\begin{codebox}[Python]{ASE 核心组件（encoder + 条件判别器，节选）}
+class SkillEncoder(nn.Module):          # (s,s') -> latent z（VAE 风格）
+    def __init__(self, obs_dim, latent_dim=64):
+        super().__init__()
+        self.enc = nn.Sequential(nn.Linear(obs_dim*2, 512), nn.ReLU(),
+                                 nn.Linear(512, 256), nn.ReLU())
+        self.mu, self.logvar = nn.Linear(256, latent_dim), nn.Linear(256, latent_dim)
+    def forward(self, s_t, s_tp1):
+        h = self.enc(torch.cat([s_t, s_tp1], dim=-1))
+        mu, logvar = self.mu(h), self.logvar(h)
+        z = mu + torch.exp(0.5*logvar) * torch.randn_like(mu)   # 重参数化
+        return z, mu, logvar
+
+class ASEDiscriminator(nn.Module):      # 条件化 on z
+    def __init__(self, obs_dim, latent_dim):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(obs_dim*2 + latent_dim, 1024), nn.ReLU(),
+                                 nn.Linear(1024, 512), nn.ReLU(), nn.Linear(512, 1))
+    def forward(self, s_t, s_tp1, z):
+        return self.net(torch.cat([s_t, s_tp1, z], dim=-1))
+\end{codebox}
+
+\subsection{CALM 与 MaskedMimic：从技能到补全}
+\label{sec:rlmc-imit-ase-calm}
+
+\textbf{CALM}（Tessler 等，SIGGRAPH 2023）的\emph{核心}不是文本编码，而是用一个 motion encoder 把动捕序列编码成低维 latent skill code，并在判别器中对该 latent 做条件化\,\cite{tessler2023calm}——判别器不仅判断「运动是否自然」，还判断「是否匹配指定技能」。
+
+\begin{note}[关于 CALM 的常见误传]
+CALM 官方方法\textbf{不以 CLIP/文本编码器为核心}。「输入文本 $\to$ 选技能」这类自然语言控制是在 motion-latent 之上的\emph{扩展层}（通过额外的 text-to-latent mapper 把文本映射到已有 skill latent space），更纯粹的文本条件控制在下游工作（PADL/SuperPADL 等）中发展。CALM 的工程前提是需要\emph{文本标注的动作数据}——AMASS 本身不含文本标注，需用 BABEL（Language-grounded AMASS，CVPR 2021）或手动标注。
+\end{note}
+
+\textbf{MaskedMimic}（Tessler 等，SIGGRAPH Asia 2024）是 ProtoMotions 中最新也最强的方法\,\cite{tessler2024maskedmimic}，把控制问题重新定义为 \textbf{masked motion inpainting}：给定部分约束（关键帧、文本、object interaction），生成满足约束的完整全身运动。它与前面方法的关键区别见 \cref{tab:rlmc-imit-ase-compare}。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{AMP / ASE / CALM / MaskedMimic 的对比}
+\label{tab:rlmc-imit-ase-compare}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+维度 & AMP & ASE & CALM & MaskedMimic \\
+\midrule
+输入条件 & 无（只约束风格） & latent $z$ & motion-latent（文本为扩展） & 任意 mask \\
+训练方式 & RL（PPO+判别器） & RL & RL & \textbf{BC（行为克隆）} \\
+技能来源 & 数据集风格 & encoder 学到的 $z$ & motion encoder & expert tracker \\
+控制粒度 & 分布级 & 技能级 & 技能级 & 关键点级 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+MaskedMimic 在 ProtoMotions 中是\emph{两阶段}：Stage 1 训练全身 tracker（expert，技术线 A）；Stage 2 训练 MaskedMimic（BC 蒸馏，从 Stage 1 expert 的 rollout 学习）。Stage 2 是 BC 而非 RL——不需要 reward 设计、advantage 估计、PPO 循环，只需标准监督学习；代价是性能上限受 Stage 1 expert 限制。
+
+\begin{insight}[latent 连续不等于插值物理可行]\label{ins:rlmc-imit-latent}
+ASE/CALM 的 latent space 是连续的，但两个技能之间的插值\textbf{不保证物理可行}——「走路」与「跳跃」的 latent 中点可能对应「半走半跳」的非自然运动。MaskedMimic 用 motion inpainting 更优雅地解决技能组合：\emph{通过指定关键帧约束而非插值 latent}。本质洞察：连续表示给了「平滑」的假象，但运动的物理可行性是高度非凸的——可行解集在 latent 里不是凸的，直线插值会穿出可行区。
+\end{insight}
+
+\begin{pitfall}[ASE/MaskedMimic 的两个工程陷阱]
+\textbf{一·ASE 所有 $z$ 产生相同运动（mode collapse）}：diversity loss 太小或缺失所致；增大 diversity bonus，检查 encoder 输出 $z$ 的方差，可视化不同 $z$。\textbf{二·MaskedMimic Stage 2 数据量不足}：BC 蒸馏需覆盖\emph{所有} mask 配置——若有 $K$ 种 mask 但只从少量 episode 收集，某些 mask 下数据极少，student 在这些配置下很差；ProtoMotions 在数据收集时对 mask 配置做均匀采样。
+\end{pitfall}
+
+\begin{practice}[练习·ASE/MaskedMimic]
+\begin{enumerate}
+  \item \textbf{[概念]} 从 GAN 训练角度解释：若没有 diversity loss，为何所有 $z$ 可能塌缩到同一种运动？提示：判别器只要求「像参考」，不要求「多样」。
+  \item \textbf{[配置]} 在 ProtoMotions 中用相同参考数据集分别跑 AMP 与 ASE，比较训练时间、最终 task reward、运动多样性（可视化不同 $z$）。验收标准：给出三项的定量/定性对比。
+  \item \textbf{[分析]} MaskedMimic 为何用 BC 而非 RL 做 Stage 2？若改用 RL（把 mask-conditioned tracking 作 reward），会遇到什么困难？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{BC / DAgger 蒸馏管线}
+\label{sec:rlmc-imit-bc}
+
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-imit-bc-pos}
+
+前面 tracking 与 AMP 训出的策略可能需要 privileged 信息或特定参考输入。BC/DAgger 蒸馏把这些 expert 的能力迁移到更轻量的 student，位于管线的\emph{部署准备}环节。BeyondMimic 训出的 tracker 需要参考动作的 anchor pose 作输入——部署时谁来提供？AMP 策略可能依赖 privileged 接触力。要部署到真机，需把 expert 能力蒸馏到只依赖部署可得信息的 student。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{两类蒸馏的边界对比（与 \cref{ch:rlmc-privileged} 蒸馏的关系）}
+\label{tab:rlmc-imit-bc-compare}
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & \cref{ch:rlmc-privileged} 蒸馏 & 本章蒸馏 \\
+\midrule
+蒸馏目标 & 跨越信息边界（privileged$\to$deployable） & 跨越能力边界（expert$\to$general） \\
+teacher & 非对称 AC 的 actor & BeyondMimic tracker 或 AMP 策略 \\
+student & 输入受限但任务相同 & 可能执行不同下游任务 \\
+方法 & BC / DAgger & BC / DAgger / diffusion policy \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{配置详解：BeyondMimic 的 diffusion policy 蒸馏}
+\label{sec:rlmc-imit-bc-diffusion}
+
+BeyondMimic 的蒸馏是其最大创新之一：不是简单 BC，而是用 \textbf{guided diffusion policy} 从多个 per-skill expert tracker 蒸馏出一个通用控制器。流程是：为每个技能训练独立 expert tracker $\to$ 收集多专家 rollout $\to$ 训练 diffusion policy $\to$ 部署时用 cost-function guidance 实现新任务。相比纯 BC，diffusion policy 可在\emph{推理时}通过 cost function guidance 实现训练时从未见过的任务（导航、避障）——不必为每个新任务重训。BeyondMimic 在 G1 上展示了 zero-shot waypoint navigation、joystick teleop 与 obstacle avoidance\,\cite{liao2025beyondmimic}。
+
+\subsection{代码走读：标准 BC 与 DAgger}
+\label{sec:rlmc-imit-bc-code}
+
+对不需要 diffusion policy 灵活性的场景，标准 BC 仍是最简单有效的方法。关键是\emph{记录的 obs 是 student 部署可得的，标签是 expert 的 action}：
+
+\begin{codebox}[Python]{标准 BC 蒸馏（含验证集 + early stopping，节选）}
+def train_student_bc(student, dataset, cfg):
+    n = dataset["obs"].shape[0]; n_val = int(n*0.1)
+    perm = torch.randperm(n)
+    tr = TensorDataset(dataset["obs"][perm[n_val:]], dataset["actions"][perm[n_val:]])
+    val_o, val_a = dataset["obs"][perm[:n_val]], dataset["actions"][perm[:n_val]]
+    loader = DataLoader(tr, batch_size=cfg.batch_size, shuffle=True)
+    opt = torch.optim.Adam(student.parameters(), lr=cfg.lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.num_epochs)
+    best, patience = float("inf"), 0
+    for epoch in range(cfg.num_epochs):
+        student.train()
+        for ob, ac in loader:
+            loss = torch.nn.functional.mse_loss(student(ob.to(cfg.device)),
+                                                ac.to(cfg.device))
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0); opt.step()
+        sched.step()
+        student.eval()
+        with torch.no_grad():
+            vloss = torch.nn.functional.mse_loss(
+                student(val_o.to(cfg.device)), val_a.to(cfg.device)).item()
+        if vloss < best:
+            best, patience = vloss, 0; torch.save(student.state_dict(), "student_best.pt")
+        else:
+            patience += 1
+        if patience >= cfg.patience:
+            break
+    student.load_state_dict(torch.load("student_best.pt")); return student
+\end{codebox}
+
+当纯 BC 的 rollout 评估不合格（student $\le 80\%$ expert）时，升级到 DAgger——核心是 beta 退火混合执行：
+
+\begin{codebox}[Python]{motion imitation 专用 DAgger（beta 退火，节选）}
+def dagger_collect_round(env, expert, student, motion_files, beta, cfg, buf):
+    env.load_motion(np.random.choice(motion_files)); obs = env.reset()
+    for _ in range(cfg.steps_per_round):
+        student_obs = obs["policy"]                 # student 只看部署可得 obs
+        with torch.no_grad():
+            expert_action = expert(obs["expert"])   # expert 看完整 obs（anchor+privileged）
+            student_action = student(student_obs)
+        exec_a = expert_action if np.random.random() < beta else student_action  # 混合执行
+        buf["obs"].append(student_obs.cpu())        # 记录：student obs + expert action
+        buf["act"].append(expert_action.cpu())
+        obs, _, dones, _ = env.step(exec_a)
+        if dones.any(): obs = env.reset()
+
+def dagger_beta(round_idx, num_rounds):             # beta 退火：前 3 轮纯 expert
+    return 1.0 if round_idx < 3 else max(0.0, 1.0 - (round_idx - 3) / num_rounds)
+\end{codebox}
+
+\paragraph{三框架的蒸馏支持对比。}上面的 BC/DAgger 在三框架里都得「自己写训练循环」（mjlab 与 ProtoMotions 也没有把通用 DAgger 做成一键开关）。但 UniLab 这里有一处\emph{真实且独特}的内置能力值得点出：\textbf{HORA 蒸馏}——它不是通用 DAgger，而是 RMA（Rapid Motor Adaptation）范式的「特权 teacher $\to$ 时序自适应 student」蒸馏，原生用于 in-hand 操作（UniLab，\verb|scripts/train_hora_distill.py| + \verb|algos/torch/hora/distill.py| 的 \verb|HoraDistillationTrainer|）：
+
+\begin{codebox}[bash]{UniLab HORA 蒸馏（特权 teacher -> 时序自适应 student，RMA 范式）}
+# stage-1：在 HORA 特权任务上训 PPO teacher（用 priv_info 特权观测）
+uv run train --algo ppo --task sharpa_inhand --sim mujoco --profile hora
+# stage-2：蒸馏 —— 只训练名字含 "adapt_tconv" 的时序卷积适应模块，
+#          teacher 主干 + obs_normalizer 全冻结（eval()）；student 从本体感知历史学适应编码器
+python scripts/train_hora_distill.py task=sharpa_inhand/mujoco
+\end{codebox}
+
+它与本节通用 BC/DAgger 的关键区别：HORA \emph{冻结}整个 teacher，只把 student 的一个时序自适应编码器（\verb|TemporalAdaptationEncoder|，参数名含 \verb|adapt_tconv|）置 \verb|requires_grad=True| 来学「从本体感知历史推断特权量」——这跨越的是 \cref{ch:rlmc-privileged} 那种\textbf{信息边界}（privileged $\to$ deployable），而非本章主讲的能力边界。\textbf{但要诚实标注}：UniLab \emph{没有}通用的「在 student 诱导分布上在线交替请 expert 标注」的 DAgger，也\emph{没有} camera-conditioned student（无视觉任务）——上面的 \verb|dagger_collect_round| 在 UniLab 上需自己实现。换言之，\emph{UniLab 给了 RMA 式适应蒸馏的现成实现，通用 DAgger 与视觉 student 仍需自搭}。这也与运动跟踪部署闭环呼应：UniLab 的 \verb|G1WBTObs| 任务（去掉真机不可得通道）+ \verb|scripts/deploy/| 工具链（\verb|export_motion_bin.py| 导参考运动、\verb|sim_prototype.py| 用 ONNX 在 MuJoCo 逐段校验 obs 装配 == 训练侧）是「把 tracker 部署到真机」的另一条更工程化的路径。
+
+端到端管线（把全章串起来）：数据准备（\cref{sec:rlmc-imit-data}）$\to$ expert 训练（\cref{sec:rlmc-imit-track} 或 \cref{sec:rlmc-imit-amp}）$\to$ 蒸馏（本节）$\to$ 部署（\cref{ch:rlmc-obsact} 的 ONNX 导出 + 真机通信）。各步预估时间（单 GPU，4096 envs）见 \cref{tab:rlmc-imit-bc-time}。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{端到端管线各步预估时间（单 GPU，4096 envs，量级参考）}
+\label{tab:rlmc-imit-bc-time}
+\begin{tabular}{@{}lll@{}}
+\toprule
+步骤 & 预估时间 & 瓶颈 \\
+\midrule
+retarget（单条动作） & 约 10 分钟 & IK 求解 \\
+BeyondMimic tracking（单条） & 约 2--6 小时 & PPO 收敛 \\
+AMP 训练（约 100 条动作） & 约 8--24 小时 & 判别器稳定性 \\
+BC 蒸馏 & 约 30 分钟 & 数据收集 \\
+DAgger 蒸馏（10 轮） & 约 2--4 小时 & 交替执行 \\
+ONNX 导出 + sim-to-sim 验证 & 约 10 分钟 & 手动检查 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[BC/DAgger 蒸馏的三个陷阱]
+\textbf{一·expert 数据只来自一种 motion}：若 expert 只在走路上收集数据，student 只会走路；要泛化到多种运动，数据必须覆盖所有目标 motion。\textbf{二·DAgger 的 beta 退火太快}：若 beta 第 3 轮就降到 0，student 还没学好就完全自主执行，产生的 state 分布离 expert 太远——expert 在这些 state 的 action 标签未必最优；推荐 10--20 轮内线性退火。\textbf{三·以为更多 DAgger 轮次一定更好}：若 expert 在 student 诱导的某些 state 上不稳定（expert 本身没被训练过那些 state），收集到的标签质量下降；一般 10--20 轮足够，再多收益递减。
+\end{pitfall}
+
+\begin{practice}[练习·蒸馏]
+\begin{enumerate}
+  \item \textbf{[设计]} 为「BeyondMimic $\to$ deployable student」设计 DAgger 管线：student 只有 IMU + 关节编码器（无深度相机），expert 有完整 anchor pose 输入。每轮数据收集如何安排？beta 退火策略是什么？验收标准：给出轮数、每轮 motion 选择、beta 曲线。
+  \item \textbf{[分析]} diffusion policy 蒸馏与纯 BC 在以下场景哪个更合适：(a) 部署到计算受限嵌入式设备；(b) 需运行时切换任务；(c) 训练数据有限（$<10^5$ 帧）。
+  \item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-obsact} 的非对称学习：若 expert tracker 用了非对称 AC（critic 看 privileged），蒸馏时 student 应从 expert 的哪个网络收集 action——actor 还是 critic？为什么？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{选型决策：Tracking vs AMP vs BC}
+\label{sec:rlmc-imit-choose}
+
+\subsection{决策流程}
+\label{sec:rlmc-imit-choose-flow}
+
+延续 \cref{ch:rlmc-manager} 的「不要过度工程化」原则：选最简单的能解决问题的方案。对模仿学习，选型取决于三个因素——数据可得性、精度要求、部署约束。决策流程如 \cref{alg:rlmc-imit-decision}。
+
+\begin{algo}[模仿学习方法选型决策流程]\label{alg:rlmc-imit-decision}
+\begin{enumerate}
+  \item \textbf{有精确 retarget 参考动作吗？}
+    \begin{itemize}
+      \item 否 $\to$ 有人类动作数据集（可不精确 retarget）吗？否则用 velocity tracking + style penalty；是则走 AMP/ASE（不需帧级对齐）。
+      \item 是 $\to$ 需要\emph{精确复现}吗？是则显式 tracking（BeyondMimic，适用表演/体操/精确操作序列）。
+    \end{itemize}
+  \item \textbf{需要从动作数据提取「风格」用于其他任务吗？}是则 AMP（风格约束 + task reward，适用自然步态 + 速度跟踪）；否则 tracking 或 AMP 皆可，按工程复杂度选（tracking 更简单）。
+  \item \textbf{部署时 student 需泛化到新任务吗？}是则 diffusion policy 蒸馏（BeyondMimic 方案）；否则标准 BC/DAgger 蒸馏。
+\end{enumerate}
+\end{algo}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{三种方法的综合对比与推荐入门顺序}
+\label{tab:rlmc-imit-choose}
+\begin{tabular}{@{}llll@{}}
+\toprule
+维度 & 显式 Tracking & AMP & BC 蒸馏 \\
+\midrule
+数据要求 & 精确 retarget & 大致 retarget 即可 & expert rollout \\
+训练复杂度 & 低（标准 PPO） & 中（PPO+判别器） & 低（监督） \\
+精度 & 高（帧级） & 中（风格级） & 取决于 expert \\
+泛化性 & 低（跟踪特定动作） & 高（学到风格模式） & 中（取决于数据） \\
+调试难度 & 低（reward 可解释） & 高（判别器不透明） & 低 \\
+推荐入门顺序 & \textbf{第一步} & 第二步 & 第三步 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[三种方法像学外语的三种方式]\label{ins:rlmc-imit-language}
+显式 tracking 像\emph{逐字翻译}——精确但僵硬，离开原文就不知道怎么说；AMP 像\emph{浸入式学习}——不知道具体语法规则，但听多了自然「感觉对」；BC 蒸馏像\emph{跟母语者模仿}——不理解为什么这样说，但照着说通常没问题。本质洞察：三者的差别再次回到 \cref{ins:rlmc-imit-granularity} 的监督粒度——精度与泛化是一对此消彼长的权衡，没有「最好」，只有「最匹配你数据与部署约束」的选择。
+\end{insight}
+
+\subsection{选错方案会怎样}
+\label{sec:rlmc-imit-choose-wrong}
+
+\textbf{选了 tracking 但需要 AMP（数据不够精确）}：动作来自手机视频提取（如 4D-Humans），retarget 精度有限。用显式 tracking，策略会疯狂尝试跟踪不精确的参考帧——产生抖动与不自然补偿。改用 AMP 后，判别器只关心「整体像不像」，对单帧不精确更容错。\textbf{选了 AMP 但需要 tracking（需要精确复现）}：客户要求精确复现一段舞蹈。AMP 策略「整体风格对」但不保证每帧对齐，观众可能注意到手臂偏差 20\,cm。改用 BeyondMimic tracking 后，每帧都有精确目标，偏差被 reward 直接惩罚。
+
+\begin{practice}[练习·选型]
+\begin{enumerate}
+  \item \textbf{[选型]} 你有 100 条已 retarget 到 G1 的 AMASS 动作，目标是让 G1 以自然步态执行速度命令。选哪种方法？列出完整训练配置（含 disc 超参）。
+  \item \textbf{[选型]} 你只有一段 10 秒太极拳动捕，目标是让 G1 精确复现并部署到真机。选哪种方法？完整管线是什么？
+  \item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-dr}（DR）与 \cref{ch:rlmc-obsact}（非对称学习）：要把上面第 1 题的 AMP 策略部署到真机，DR 怎么配？privileged obs 应含什么？给出各章对应关系。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\label{sec:rlmc-imit-misconceptions}
+
+\begin{pitfall}[本章常见误解一览]
+(1) 「AMP 总比 DeepMimic 好」——精确复现场景下显式跟踪更可靠（\cref{ins:rlmc-imit-granularity}）。\\
+(2) 「模仿学习就是回放关节角」——策略须在物理仿真中通过力实现参考姿态，不绕过物理（\cref{sec:rlmc-imit-lines}）。\\
+(3) 「retarget 工具跑通就没问题」——工具会在限位处静默 clip，必须可视化回放（\cref{ins:rlmc-imit-dataquality}）。\\
+(4) 「四元数可以直接相减求距离」——必须处理 double cover + clamp（\cref{ins:rlmc-imit-doublecover}）。\\
+(5) 「判别器越强越好」——理想 accuracy 是 0.6--0.8，太强则 style reward 消失（\cref{ins:rlmc-imit-discsweet}）。\\
+(6) 「AMP reward 能替代 task reward」——没有 task reward，策略会优雅地站着不动（\cref{sec:rlmc-imit-amp}）。\\
+(7) 「ProtoMotions 还是 Hydra +exp= 风格」——当前 ProtoMotions3 已改为 dataclass \texttt{--experiment-path}（\cref{sec:rlmc-imit-amp-three}）。\\
+(8) 「MaskedMimic 继承 Mimic」——类层次上独立，只是\emph{加载} Mimic 训出的 tracker 当 expert（\cref{sec:rlmc-imit-amp-three}）。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\addcontentsline{toc}{section}{小结}
+\label{sec:rlmc-imit-summary}
+
+本章把强化学习\emph{理论}里的「模仿/对抗」落到一台机器人上，主线始终是\textbf{算法领路、实践兑现}：先立模仿学习的三条技术线与「监督粒度 / 信息来源」双重解读（\cref{ins:rlmc-imit-granularity}），再依次把每条线落成三框架的工程接线——数据管线守住「数据质量是硬上限」（\cref{ins:rlmc-imit-dataquality}）、显式跟踪靠六个指数跟踪 reward 项 + anchor 机制 + 数值稳健的四元数距离（\cref{ins:rlmc-imit-doublecover}）、AMP 靠 LSGAN 判别器（\cref{eq:rlmc-imit-amp-style}）与五个稳定性技巧把 accuracy 控在「稍好于瞎猜」（\cref{ins:rlmc-imit-discsweet}）、ASE/MaskedMimic 把单一风格扩展到多技能与 inpainting、BC/DAgger 把 expert 蒸馏到可部署 student。三条线不是割裂的——工业级管线常组合：用 BeyondMimic tracking 训 expert，用 AMP 风格约束增强自然度，最后用 DAgger/diffusion 蒸馏到 deployable student。
+
+\paragraph{术语速查。}
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 含义 \\
+\midrule
+显式跟踪 & 逐帧监督，reward 惩罚当前与参考状态之差（DeepMimic/BeyondMimic） \\
+对抗风格（AMP） & 分布级监督，判别器输出转 style reward（\cref{eq:rlmc-imit-amp-style}） \\
+监督粒度 & 逐帧$\to$分布$\to$行为，对应跟踪/AMP/BC（\cref{ins:rlmc-imit-granularity}） \\
+retarget & SMPL ball joint $\to$ 机器人 revolute 角的 IK 重定向 \\
+anchor pose & 策略看「下一关键姿态差」而非整条轨迹（\cref{sec:rlmc-imit-track-anchor}） \\
+RSI & 参考状态初始化，从随机帧起步提升训练效率 \\
+double cover & $q$ 与 $-q$ 同旋转，求距离前须拉到同一半球 \\
+LSGAN 回归 & 判别器回归到参考$+1$/策略$-1$，非概率（\cref{eq:rlmc-imit-amp-disc}） \\
+梯度惩罚（R1） & 刻意削弱判别器，防 accuracy 飙到 1（\cref{ins:rlmc-imit-discsweet}） \\
+latent skill $z$ & ASE 用其装多技能，配 diversity loss 防 mode collapse \\
+motion inpainting & MaskedMimic 用 mask 约束 + BC 生成完整运动 \\
+DAgger & 在 student 诱导分布上反复请 expert 标注，beta 退火 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+\begin{center}
+\small
+\begin{tabular}{@{}cllc@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 三技术线 + 监督粒度/信息来源双重解读 & \cref{sec:rlmc-imit-lines} & 2 \\
+2 & AMASS/SMPL 数据管线与 retarget IK & \cref{sec:rlmc-imit-data} & 3 \\
+3 & 数据契约检查（四元数/帧率/物理合理性） & \cref{sec:rlmc-imit-data-contract} & 2 \\
+4 & 四元数距离（double cover + clamp） & \cref{sec:rlmc-imit-track-quat} & 3 \\
+5 & BeyondMimic 六个跟踪 reward 项与 $\sigma$ 调参 & \cref{sec:rlmc-imit-track-reward} & 3 \\
+6 & anchor 机制与差值观测 & \cref{sec:rlmc-imit-track-anchor} & 3 \\
+7 & RSI 与越界帧弹飞陷阱 & \cref{sec:rlmc-imit-track-rsi} & 2 \\
+8 & 八阶段训练协议与四类评估指标 & \cref{sec:rlmc-imit-track-protocol} & 2 \\
+9 & AMP 两部分 reward 与 LSGAN 判别器 & \cref{sec:rlmc-imit-amp-dataflow} & 3 \\
+10 & 判别器输入排除 root xy（不变性） & \cref{sec:rlmc-imit-amp-net} & 3 \\
+11 & 判别器五个稳定性技巧 & \cref{sec:rlmc-imit-amp-tricks} & 4 \\
+12 & ProtoMotions dataclass 入口与类继承 & \cref{sec:rlmc-imit-amp-three} & 2 \\
+13 & ASE latent skill 与 MaskedMimic inpainting & \cref{sec:rlmc-imit-ase} & 3 \\
+14 & BC/DAgger 蒸馏与 diffusion policy & \cref{sec:rlmc-imit-bc} & 2 \\
+15 & 选型决策（数据$\times$精度$\times$部署） & \cref{sec:rlmc-imit-choose} & 2 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{后续关系。}本章是「强化学习运动控制」部里最贴近\emph{人形全身控制}的一章。模仿学习产出的 retarget 数据与 tracking/AMP 策略，是后续全身运动、文本条件控制、遥操作、sim-to-real 等主题的共同前置——没有正确的数据管线与 expert 策略，这些高级主题都无从谈起。理解了「数据$\to$expert$\to$蒸馏$\to$部署」这条主干，再叠加 \cref{ch:rlmc-dr} 的域随机化与 \cref{ch:rlmc-privileged} 的 teacher-student 蒸馏，就构成了一条完整的「从动作数据到真机」工程路径。
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-imit-reading}
+
+\begin{itemize}
+  \item \textbf{DeepMimic}（Peng 等，SIGGRAPH 2018）\,\cite{peng2018deepmimic}——模仿学习里程碑，教你 RSI 与指数型 tracking reward 的由来。
+  \item \textbf{AMP}（Peng 等，SIGGRAPH 2021，arXiv:2104.02180）\,\cite{peng2021amp}——对抗式风格约束的完整方法论，判别器设计与训练技巧。
+  \item \textbf{ASE}（Peng 等，SIGGRAPH 2022）\,\cite{peng2022ase}——从单一风格到多技能 latent 空间，教 diversity loss 与 MI reward。
+  \item \textbf{CALM}（Tessler 等，SIGGRAPH 2023）\,\cite{tessler2023calm}——motion-latent 条件控制，教技能级条件化判别器。
+  \item \textbf{MaskedMimic}（Tessler 等，SIGGRAPH Asia 2024）\,\cite{tessler2024maskedmimic}——motion inpainting 统一控制，ProtoMotions 最新方法。
+  \item \textbf{PHC}（Luo 等，ICCV 2023）\,\cite{luo2023phc}——大规模 motion tracking（万条动作）与渐进网络 PMCP。
+  \item \textbf{BeyondMimic}（Liao 等，2025，arXiv:2508.08241）\,\cite{liao2025beyondmimic}——本章 mjlab tracking 的精读项目，tracking + guided diffusion 蒸馏。
+  \item \textbf{AMASS}（Mahmood 等，ICCV 2019，arXiv:1904.03278）\,\cite{mahmood2019amass} 与 \textbf{SMPL}（Loper 等，2015）\,\cite{loper2015smpl}——理解动作数据格式与体模型。
+  \item 框架文档：\textbf{ProtoMotions}（NVlabs）\,\cite{protomotions2024}——AMP/ASE/CALM/MaskedMimic 的统一实现；\textbf{mjlab}\,\cite{mjlab2026} 与 \textbf{RSL-RL}\,\cite{schwarke2025rslrl}——本章 tracking 的底座。
+\end{itemize}
+
+\textbf{阅读顺序}：先 DeepMimic（显式跟踪原理）$\to$ AMP（对抗式风格）$\to$ BeyondMimic（现代 tracking + 蒸馏）；PHC 作为大规模 tracking 参考。时间有限则精读 DeepMimic、AMP、BeyondMimic 三篇——它们是两条线的起点与当前终点。
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-imit-troubleshoot}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.3cm}p{3.0cm}p{4.5cm}l@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+mjlab tracking 裸跑就 \texttt{ValueError}（提示给 registry-name/motion-file） & 任务无默认动作，\texttt{motion\_file=''} 空 & 加 \texttt{--env.commands.motion.motion-file path.npz}（可借框架样例）或 \texttt{--registry-name ...} & \cref{sec:rlmc-imit-data-bootstrap} \\
+UniLab demo/train 首跑卡死后 \texttt{RuntimeError: client has been closed} & 拉 HF motion 资产时网络中断（弱网/国内） & 先 \texttt{export HF\_ENDPOINT=https://hf-mirror.com} 再重跑；train 行同 demo 行都要设 & \cref{sec:rlmc-imit-quickstart} \\
+tracking reward 一直很低（$<0.2$） & retarget 数据质量差 & MuJoCo 回放查穿模/越界；打印 joint\_pos\_error 直方图；查帧率 & \cref{sec:rlmc-imit-data} \\
+跟踪正确但方向错 & 四元数 wxyz/xyzw 混淆 & 打印第 0 帧 \texttt{body\_quat\_w[0,anchor]} 查 $w$；确认工具输出约定 & \cref{sec:rlmc-imit-data-verify} \\
+判别器 accuracy $>95\%$ 但 style reward 不涨 & normalizer 未共享 / $\lambda_{\text{gp}}$ 太小 & 确认 actor 与 disc 共享 normalizer；增大 $\lambda_{\text{gp}}$；降 disc\_lr & \cref{sec:rlmc-imit-amp-tricks} \\
+判别器 accuracy $\approx50\%$ & 网络太小 / 参考数据太少 & 增大 hidden；加参考数据；查数据格式 & \cref{sec:rlmc-imit-amp-tricks} \\
+策略「像人」但不完成任务 & style reward 权重太高 & 降 style 权重；增大 task 权重 & \cref{sec:rlmc-imit-amp} \\
+RSI 后机器人弹飞 & 初始帧关节角越界 & 查所有帧是否在限位内；RSI 后加 mj\_forward + clip & \cref{sec:rlmc-imit-track-rsi} \\
+BC loss 低但 rollout 差 & compounding error & 增数据多样性；改 DAgger；查 student obs 与部署一致 & \cref{sec:rlmc-imit-bc} \\
+body「扭曲」 & body 顺序与 MuJoCo 不一致 & 打印 model body 名；对比 .npz body 顺序；重排序 & \cref{sec:rlmc-imit-track-anchor} \\
+ASE 所有 $z$ 同一运动 & diversity loss 太小/缺失 & 增 diversity bonus；查 $z$ 方差；可视化不同 $z$ & \cref{sec:rlmc-imit-ase} \\
+速度 reward $\sigma$ 太小致抖动 & 策略过激匹配速度 & 增 body\_velocity 的 $\sigma$ 到 $\ge0.5$；减其权重 & \cref{sec:rlmc-imit-track-reward} \\
+Isaac Lab AMP 判别器 loss NaN & 输入未归一化或含 inf & 查 disc\_obs 有无 inf/nan；确认 normalizer 已初始化；加 grad clip & \cref{sec:rlmc-imit-amp-three} \\
+retarget 后脚底浮空约 5\,cm & SMPL 与机器人身高比差异 & 查 retarget height\_offset；手调 root\_pos 的 $z$；启用 fix\_heights & \cref{sec:rlmc-imit-data} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-imit-versions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+组件 & 本章基准（截至 2026-06） & 备注 \\
+\midrule
+mjlab & RSL-RL(PPO) 后端，motion imitation 任务 & 实现 DeepMimic + BeyondMimic 扩展 \\
+ProtoMotions & ProtoMotions3，dataclass \texttt{--experiment-path} & 旧版为 Hydra \texttt{+exp=}（已弃） \\
+ProtoMotions 后端 & IsaacGym/Isaac Lab/Newton/MuJoCo/Genesis & 多后端，换后端改 \texttt{--simulator} \\
+ProtoMotions 数据 & MotionLib \texttt{.pt}（打包） & 旧式概念示例用 \texttt{.npz} \\
+mjlab 数据 & \texttt{.npz}（已 retarget） & \texttt{scripts/csv\_to\_npz.py} 预处理（命令经官方核对） \\
+AMP style reward & $\max[0,1-\tfrac14(D-1)^2]$，LSGAN & 参考$\to+1$/策略$\to-1$，非概率 \\
+四元数约定 & 本书统一 Hamilton；MuJoCo/PyTorch3D wxyz & scipy/Warp/USD 多为 xyzw \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{finenote}
+本章的可复制命令（mjlab \texttt{Mjlab-Tracking-Flat-Unitree-G1}、ProtoMotions \texttt{train\_agent.py --experiment-path}）以截至 2026-06 核对到的官方接口为准。框架迭代较快，落地时请以你所装版本的官方文档与 \texttt{examples/} 目录为最终依据；标 \rebuilt{} 或 \pz{待核实} 处尤需当面核验。
+\end{finenote}

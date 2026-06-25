@@ -1,0 +1,1334 @@
+\chapter{视觉感知运动控制}\label{ch:rlmc-visuomotor}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章——视觉与运动控制的融合入口。
+%  主线：算法/概念领路 —— 每节先立「这个环节有哪些观测/传感器/技巧 + 原理」，
+%  再把每个概念落到 mjlab / Isaac Lab / UniLab 三框架的工程接线（UniLab 当前无视觉任务，各视觉环节如实标「无对应」，非占位）。
+%  假定读者已有 RL 基础（理论部 P6_rl）与前面实践章基础（观测/奖励/Manager/DR/特权学习）。
+%  特别地：teacher-student 蒸馏的「一般框架」与 extreme-parkour 的「三阶段精读」已在
+%  \cref{ch:rlmc-privileged} 详述，height scan 传感器基础已在 \cref{ch:rlmc-quadloco} 详述，
+%  本章不重复，只补「视觉特有」的部分：相机传感器、depth 预处理、CNN 编码器、视觉 DR、视觉 sim2real。
+%  源稿 RL运控/Ch18_视觉感知运动控制.md 按本主线重构融入。
+%  关键 API/版本/论文归属经联网核对（截至 2026-06）：
+%    - Isaac Lab：TiledCamera 的 distance_to_image_plane 输出 (B,H,W,1) float32（depth 是其别名）；
+%      RayCaster 的 attach_yaw_only 自 v2.1.1 弃用，改用 ray_alignment="yaw"；
+%      配相机而漏 --enable_cameras 会抛 RuntimeError（"A camera was spawned without the
+%      --enable_cameras flag"），不是静默黑屏。均已核。
+%    - mjlab：相机是传感器 CameraSensorCfg（from mjlab.sensor import CameraSensorCfg，gpufree 源码实测，
+%      字段 camera_name/parent_body/pos/quat(wxyz)/fovy/width/height/data_types=("rgb"|"depth"|"segmentation")）；
+%      输出 CameraSensorData：depth=[N,H,W,1] float32、rgb=[N,H,W,3] uint8；本身无 clip/normalize 字段
+%      （裁剪/归一化在预处理里做）。底层 MuJoCo Warp batch renderer 用 ray-tracing（不是 rasterizer，
+%      源稿此处有误，已改），高吞吐多世界并行渲染。原占位类名 CameraObsCfg 已据源码改为真实 CameraSensorCfg。
+%    - extreme-parkour：ICRA 2024，arXiv:2309.14341（沿用 \cref{ch:rlmc-privileged} 的归属），
+%      depth 处理为 58×87；网络细节已据源码 rsl_rl/modules/depth_backbone.py 核实：convnet 出 32 维
+%      -> nn.GRU(input_size=32, hidden_size=512) -> nn.Linear(512, 32+2)。部署 10Hz depth / 50Hz base、
+%      Jetson NX、UDP、D435 约 10±2Hz、恒定 0.08s depth 延迟（论文 §4.1，已核）。
+%    - VIRAL：arXiv:2511.15200，29-DoF Unitree G1 + RealSense D435i，真机连续多达 54 个 loco-manipulation 周期（论文“up to 54 cycles”，非 54/59 试验成功率，已核改正），≤64 GPU。已核。
+%    - 凡未在官方文档/源码逐字确认的具体字符串/默认值，一律包 \rebuilt{} 或 \pz{待核实：}。
+% ════════════════════════════════════════════════════════════════
+
+前面几章把强化学习运控的零件逐一打磨好了，并在 \cref{ch:rlmc-quadloco} 把它们组合成第一个完整任务——四足速度跟踪。但那条策略，以及在它之前的所有策略，都是“盲”的：actor 观测里只有本体感知（关节位置/速度、base 角速度、投影重力、命令），没有一个像素。本章要做的，是给机器人装上“眼睛”，跨越到\textbf{视觉闭环运动控制}。
+
+为什么视觉值得单独一章？因为它改变的不是某个观测项的维度，而是整条管线的形态。盲策略只能“反应”——脚碰到障碍才知道障碍在那里；视觉策略能“预测”——障碍还在两米外时就看见它的形状与距离，于是有时间调整步态。这一字之差，把可通行的地形复杂度上限从“平地+粗糙面”推到了“缺口+高障碍+跑酷”。代价是：渲染拖慢吞吐、深度图带噪声、相机有视野盲区、sim-to-real 多了一整套视觉 gap。本章的任务，就是把这套“视觉特有”的工程难点逐一拆开。
+
+本章严格沿全书「概念领路、实践兑现」的次序，且\textbf{刻意不重复}两件已经讲过的事：teacher-student 蒸馏的一般框架与 extreme-parkour 的三阶段精读在 \cref{ch:rlmc-privileged} 已系统展开（\cref{paper:rlmc-priv-parkour}），height scan 射线传感器的网格/对齐/维度在 \cref{ch:rlmc-quadloco} 已算清。本章把它们当作\emph{已知前置}，只在需要时一句话桥接，把笔墨集中在视觉链路上：相机传感器配置、深度图预处理、CNN 编码器选型、视觉域随机化、视觉 sim-to-real。每个概念下仍排布\textbf{三框架对比实战}：mjlab 与 Isaac Lab 给可运行接线，UniLab 则在每个视觉环节如实标「无对应（当前无视觉任务）」——这并非「尚未补全的占位」，而是其异构 CPU 仿真 + GPU 策略架构下、当前任务集全为本体感知的真实现状（\cref{ins:rlmc-vm-unilab-gap} 详述这一体系结构信号）。
+
+\begin{insight}[视觉运控的 80\% 工作量不在“训练”，而在“确保每一环正确”]\label{ins:rlmc-vm-plumbing}
+盲策略的 bug 通常会让 loss 不降，给你明确的报警。视觉策略最危险的 bug 却是\emph{静默}的：相机朝向配反（看到天花板而非地面）、depth 单位混淆（mm 当成 m）、HWC/CHW 转置、obs group 漏接、GRU 隐状态忘清零——网络都不会报错，depth 值也“看起来合理”，但 CNN 在\textbf{完全无意义的输入}上训练。本章的每一节都会反复回到这条洞察：训练前花五分钟把视觉链路逐环验证一遍，能在开训前排除九成视觉管线错误。这与 \cref{ch:rlmc-quadloco} 「难在接线而非算法」的洞察一脉相承，只是“接线”里多了一根需要肉眼看一帧图才能确认的视觉线。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{环境配置与版本兼容}
+\label{sec:rlmc-vm-setup}
+
+本章假定你已按 \cref{ch:rlmc-setup} 装好至少一个框架，并能跑通 \cref{ch:rlmc-quadloco} 的盲四足任务。这里只补充\textbf{开启视觉渲染额外需要核对的版本点}，不重复通用安装流程。
+
+视觉任务与盲任务最大的差别在“渲染管线”这条额外依赖链。它对系统的要求显著更硬：必须有可用的 GPU 渲染上下文，Isaac Lab 侧必须显式开启相机标志，mjlab 侧（无显示器的服务器上）必须设对 OpenGL 后端环境变量。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+要求项 & mjlab & Isaac Lab & UniLab \\
+\midrule
+渲染后端 & MuJoCo Warp batch renderer（ray-tracing） & Omniverse RTX ray-tracer & Motrix 原生 renderer（仅回放可视化） \\
+相机声明位置 & \verb|CameraSensorCfg|（Python；可新建或包裹 MJCF \verb|<camera>|） & \verb|TiledCameraCfg|（Python） & 无对应（无视觉任务） \\
+深度观测类型 & \verb|CameraSensorCfg(data_types=("depth",))| & \verb|distance_to_image_plane| & 无对应 \\
+开启渲染的开关 & \verb|MUJOCO_GL=egl|（无显示器服务器） & \verb|--enable_cameras|（必须） & 无对应 \\
+典型 GPU & RTX 3090/4090（depth-only 可更低） & RTX 4090（$\le 512$ 相机环境） & 物理在 CPU，GPU 仅放策略 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[UniLab 的视觉现状：当前任务集无相机/视觉策略，本章 UniLab 列以「无对应」如实标注]
+本章是三框架对比里 UniLab 唯一\emph{大面积缺位}的一章，原因如实说明：截至本书写作所用版本（直接读源码 + 实跑核对），UniLab 的全部注册任务（locomotion / manipulation / motion\_tracking，实测共 $26$ 个）\textbf{都是纯本体感知}——没有任何一个任务以 RGB 或 depth 图像作为观测，因此不存在相机传感器配置、depth 预处理接口、视觉 DR 配置这些「视觉特有」的 API\,\cite{unilab2026}。需要厘清的一个细节：UniLab 的 MotrixSim 后端\emph{确实}带一个原生 renderer（\verb|demo| 回放、Viser 交互可视化会用到），但它是\textbf{渲染给人看的}，不是训练时喂给策略的相机观测——二者是完全不同的链路。所以本章后续每一处 UniLab 列，凡涉及视觉传感器/预处理/视觉 DR 的，一律标「无对应（当前无视觉任务，需自实现）」而\textbf{不编造}一套不存在的接口。这条诚实的缺位本身有教学价值（见 \cref{ins:rlmc-vm-unilab-gap}）：它印证了\textbf{视觉运控对框架的视觉基础设施有硬依赖}——没有相机渲染 + 图像 obs 这层地基，本章后面所有的 CNN 编码、视觉蒸馏、视觉 sim2real 都无从谈起。这与 \cref{ch:rlmc-privileged} 在 extreme-parkour 三框架对应表里对 depth 那条线的处理完全一致。
+\end{note}
+
+\begin{insight}[「无对应」是一个体系结构信号：视觉运控对框架的视觉地基有硬依赖]\label{ins:rlmc-vm-unilab-gap}
+为什么偏偏是 UniLab 在本章大面积缺位，而在前面的观测/奖励/DR/特权学习章它都能给出三框架对照？答案直指 UniLab 的体系结构定位（\cref{ch:rlmc-ecosystem}）：它是\textbf{异构 CPU-sim + GPU-policy} 框架——物理仿真在 CPU 多线程（MuJoCoUni / MotrixSim），策略学习在 GPU，二者用共享内存 IPC 解耦\,\cite{unilab2026}。这套设计的强项是「CPU 核多、无强 GPU-sim 后端、要异步 off-policy」的场景；但它\emph{没有}把「大规模并行相机渲染」做成一等公民——而这恰恰是视觉运控的命门。mjlab（MuJoCo Warp batch renderer）与 Isaac Lab（RTX tiled rendering）能上这一章，正因为它们的 GPU-sim 管线天然顺带了 GPU 批量渲染：几千个环境的相机帧能在 GPU 上一次性渲出、不经 CPU 往返（\cref{sec:rlmc-vm-camera-role} 的「全程在 GPU」前提）。UniLab 把物理留在 CPU，渲染若要做就得跨回 GPU，这条边界本就是它要极力\emph{避免}的（它的工程根是把 CPU 数据高效搬到 GPU 学习器，而非反向再加一条渲染流）。所以 UniLab 当前无视觉任务\textbf{不是「还没来得及写」的偶然，而是体系结构取舍的自然结果}。读这条「无对应」的正确姿势：它不是 UniLab 的短板清单，而是一面镜子——\textbf{选框架做视觉运控时，先问它的渲染是不是大规模并行、图像 obs 能不能不落 CPU}；想清楚这两点，就理解了为什么本章的可运行接线只能由 mjlab 与 Isaac Lab 提供。
+\end{insight}
+
+\begin{note}[mjlab 的视觉能力：相机是传感器 \texttt{CameraSensorCfg}（源码实测）]
+截至本章写作（2026-06），mjlab 提供 ray-cast / depth / RGB 三类相机传感器，底层走 MuJoCo Warp 的\textbf{批量渲染器}（GPU ray-tracing，可在多并行世界同时渲染相机，吞吐极高）。深度相机的真实配置类是 \texttt{CameraSensorCfg}（\verb|from mjlab.sensor import CameraSensorCfg|，gpufree 源码实测），核心字段 \verb|camera_name/parent_body/pos/quat(w,x,y,z)/fovy/width/height/data_types|，其中 \verb|data_types| 取 \verb|("rgb","depth","segmentation")| 任意组合（实测在\textbf{构造期}就校验：填 \verb|("lidar",)| 这类非法值会当场抛 \verb|ValueError: Invalid camera data types ...|，而非运行时才报错）；输出 \texttt{CameraSensorData} 中 \verb|depth| 为 $[N,H,W,1]$ \verb|float32|、\verb|rgb| 为 $[N,H,W,3]$ \verb|uint8|、\verb|segmentation| 为 $[N,H,W,2]$ \verb|int32|。除核心字段外，实测它还有 \verb|use_textures/use_shadows/enabled_geom_groups/orthographic/clone_data| 五个渲染控制字段——其中 \verb|use_textures/use_shadows/enabled_geom_groups| 受一条硬约束：\textbf{同一场景内所有相机这三项必须一致}（源码 docstring，多相机时尤需注意，见 \cref{sec:rlmc-vm-multicam}）。值得一提：\texttt{CameraSensorCfg} 本身\emph{不含}近/远裁剪或归一化字段——这些在预处理里做（\cref{sec:rlmc-vm-preprocess}），与 Isaac Lab 把 \texttt{clipping\_range} 放进相机配置不同。注意不要把 mjlab 的 batch renderer 与 MuJoCo Playground 走的 Madrona 渲染路径混为一谈——它们是两套不同的实现。\rebuilt{源稿把 MuJoCo Warp 渲染器称作 “rasterizer”，经核为 ray-tracing 后端，本章已改。}
+\end{note}
+
+\begin{pitfall}[Isaac Lab 配了相机却漏 \texttt{--enable\_cameras}：直接 RuntimeError，不是黑屏]
+\textbf{错误描述}：任务里配了 \verb|TiledCamera|，启动命令却没加 \verb|--enable_cameras|。\textbf{现象后果}：很多人以为会“黑屏但能跑”（返回全零或上一帧残留），于是去查 CNN——查错了方向。\textbf{根本原因}：当前 Isaac Lab 在相机初始化时会直接抛 \verb|RuntimeError|（提示 “A camera was spawned without the --enable\_cameras flag.”），程序退出。\textbf{正确做法}：启动命令一定带 \verb|--enable_cameras|（即便 \verb|--headless| 也要带，它启用 offscreen 渲染器）；训练初期再保存一帧 depth 图到磁盘肉眼确认内容正确。这条核对过的现象与源稿一致。
+\end{pitfall}
+
+\begin{pitfall}[想“快速 \texttt{import} 查 Isaac 相机配置类的字段”——裸 Python 直接 \texttt{ModuleNotFoundError}]
+\textbf{错误描述}：为了查 \verb|TiledCameraCfg| / \verb|PinholeCameraCfg| 有哪些字段，习惯性地开个裸 Python 解释器 \verb|python -c "from isaaclab.sensors import TiledCameraCfg"|。\textbf{现象后果}：还没看到字段就崩在 \verb|ModuleNotFoundError: No module named 'omni.usd'|（实测）——读者第一反应是“装错了/版本不对”，去重装依赖，越查越偏。\textbf{根本原因}：Isaac Lab 的相机配置类依赖 Omniverse 的 \verb|omni.usd| 等运行时模块，而这些只有在 \textbf{Isaac Sim 仿真 app 启动后}才可用；裸解释器没拉起 app，自然 import 不到。\textbf{正确做法}：所有涉及 Isaac 相机的脚本都必须先用 \verb|AppLauncher| 启动 app（且 \verb|enable_cameras=True|）再 import 相机类——这也是为什么 Quick Start 用的是 \verb|./isaaclab.sh -p 你的脚本.py| 而非系统 \verb|python|。要“查字段”就在一个已 \verb|AppLauncher| 起来的脚本里 \verb|print([f for f in TiledCameraCfg.__dataclass_fields__])|，而不是裸 import。
+\end{pitfall}
+
+视觉任务相比盲任务\emph{贵得多}：渲染开销约为纯物理仿真的 5--20 倍（取决于分辨率与环境数），所以并行环境数通常要从盲任务的 4096 砍到 512--1024。这条资源现实贯穿本章——它决定了为什么 teacher（盲，用 height scan）能跑 4096 环境而 student（视觉，渲 depth）只能跑几百环境，进而决定了为什么蒸馏（而非端到端 RL）是视觉运控的主流范式（\cref{sec:rlmc-vm-distill}）。
+
+% ════════════════════════════════════════════════════════════════
+\section{Quick Start：五分钟跑通一次深度渲染}
+\label{sec:rlmc-vm-quickstart}
+
+在训练任何视觉策略之前，先建立“它能渲染、而且渲染的是地面”的肌肉记忆。下面几段命令的目标\textbf{不是}训练好策略，而是\textbf{用 zero/随机策略跑几步、或极短训练几迭代，确认渲染管线活着、depth 在动}。这正是 \cref{ins:rlmc-vm-plumbing} 强调的“五分钟视觉健康检查”的第一步。一个对新手很关键、容易被本章「loco 视觉需自配相机」叙事盖过的事实：\textbf{mjlab 本身就自带可直接跑的视觉任务}（虽是机械臂 manipulation 而非 locomotion），无需你先写任何相机配置——下面 mjlab 段给出的就是这条真命令，跑通它能让你立刻看到“渲染—depth obs—训练”这条链路是通的，再回头读本章的 loco 相机配置就有了实物参照。
+
+\begin{codebox}[bash]{Isaac Lab：开相机跑几步并存一帧 depth（5 分钟）}
+# 关键：--enable_cameras 必带，否则配了相机会直接 RuntimeError。
+# 这里借用任意一个带相机的 manager-based 任务；--video 或脚本内保存 depth 皆可。
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+  --task <你的视觉任务 id> --num_envs 64 --max_iterations 5 \
+  --headless --enable_cameras
+\end{codebox}
+
+\begin{codebox}[bash]{mjlab：无显示器服务器上开 EGL 跑 zero agent}
+# 无显示器服务器必须设 MUJOCO_GL=egl，否则渲染上下文创建失败。
+MUJOCO_GL=egl uv run play <你的视觉任务> --agent zero --num-envs 4 --viewer viser
+\end{codebox}
+
+\begin{codebox}[bash]{mjlab：一条可直接复制的真实视觉任务（gpufree 实测可跑）}
+# 上一段的 <你的视觉任务> 不是占位符——mjlab 自带可直接跑的视觉任务（list-envs 可见）：
+#   Mjlab-Lift-Cube-Yam-Depth / -Rgb（depth/RGB）、Mjlab-Multi-Cube-Seg-Yam（segmentation）。
+# 它们是 Yam 机械臂 manipulation（非 locomotion），但渲染—obs—训练这条链路与本章 loco 视觉完全同构，
+# 是你第一次「确认 mjlab 能渲染、depth 在动」最省事的入口。下面这条在 RTX 4090 上实测跑通：
+WANDB_MODE=disabled MUJOCO_GL=egl \
+  uv run train Mjlab-Lift-Cube-Yam-Depth --env.scene.num-envs 64 --agent.max-iterations 2
+# 预期：约 5200 steps/s、reward 非 NaN、无报错；其 obs 里 depth 经内置预处理后挂在一个相机 obs 组。
+# 对照 RGB 版（更慢，因 RGB 渲染更重）：把任务名换成 Mjlab-Lift-Cube-Yam-Rgb，--max-iterations 1，
+#   实测约 1300 steps/s、obs 含 camera_d405_rgb 形如 (3,32,32) 的 CHW 张量、且带 geom_rgba 这一颜色 DR 项。
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab：无视觉任务，无 depth 渲染 Quick Start（如实标注）}
+# UniLab 当前任务集全是本体感知，没有相机/depth 观测任务，
+# 因此「开相机 / 跑 zero agent / 存一帧 depth 肉眼确认」这条本章主线在 UniLab 上无对应。
+# 能跑的最接近版本是一个纯本体感知任务（无任何像素），仅供对照 mjlab/Isaac Lab 的 CLI 形态：
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true   # 本体感知冒烟，无 depth
+# 若要可视化（给人看，非策略观测）：--render-mode interactive 走 Viser/Motrix renderer。
+# 视觉 Quick Start 待 UniLab 官方补齐相机 obs 后才有意义。
+\end{codebox}
+
+存下来的那一帧 depth 图要满足三个条件，缺一不可：(1) 图里能看见\emph{地面地形}（而非天花板、墙壁、或纯色）；(2) depth 数值落在你设的裁剪范围内（如 $0.01$--$5.0$ m）；(3) 没有大片无效像素（NaN/0）。任何一条不满足，先别训练——回到 \cref{sec:rlmc-vm-camera} 查相机朝向与裁剪面。
+
+\begin{practice}[把“看到地形”落实成一张图]
+跑通上面任一框架的 5 步渲染后，写 5 行 \verb|matplotlib| 把第一个环境的 depth 图存成 PNG（\verb|imshow(depth.squeeze(), cmap="viridis")|）。\textbf{验收标准}：图中能辨认出地面（远处偏一个颜色、近处偏另一个颜色，台阶/坡面有可见的颜色跳变）；打印该 depth 张量的 \verb|min/max/mean|，确认在裁剪范围内。\textbf{预期输出}：一张能看出“前方是地面而非天花板”的伪彩图 + 一行形如 \verb|min=0.31 max=5.00 mean=2.7| 的数值。
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{前置自测}
+\label{sec:rlmc-vm-pretest}
+
+本章重度依赖前面实践章与理论部。下面六题覆盖最关键的前置概念，\textbf{答不出 $\ge 3$ 题，先回对应章节复习再继续}。
+
+\begin{practice}[开课前自测]
+\begin{enumerate}
+\item （特权学习）\cref{ch:rlmc-privileged}：teacher-student 蒸馏里，teacher 用的 privileged 信息和 student 的受限输入分别是什么？为什么这种“信息鸿沟上搭桥”有助于 sim-to-real？（答错回看 \cref{sec:rlmc-priv-gap}）
+\item （DAgger）\cref{ch:rlmc-privileged}：DAgger 与离线 behavior cloning 的核心区别是什么？为什么“MSE 低 $\ne$ rollout 好”？（答错回看 \cref{sec:rlmc-priv-dagger} 与 \cref{ins:rlmc-priv-msevsrollout}）
+\item （height scan）\cref{ch:rlmc-quadloco}：射线高程扫描（height scan）的网格分辨率、ray alignment 与观测维度三者如何换算？为什么对齐通常只跟随 yaw？（答错回看 \cref{ch:rlmc-quadloco} 的 height scan 一节）
+\item （DR）\cref{ch:rlmc-dr}：EventManager 的 startup / reset / interval 三模式差异何在？把一项“每步都应变”的随机化错配成 startup 会怎样？（答错回看 \cref{sec:rlmc-dr-mode}）
+\item （观测契约）\cref{ch:rlmc-obsact}：\verb|ObservationManager| 如何区分 actor 与 critic 两组？把视觉 obs 只挂进 critic 组、漏挂 actor 组，会出现什么现象？（答错回看 \cref{sec:rlmc-asymmetric}）
+\item （图像基础）深度图的“到相机平面 Z 投影距离”与“到相机原点的欧氏距离”有何区别？对 CNN 输入预处理有何影响？（不确定就读本章 \cref{sec:rlmc-vm-camera}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{本章目标}
+\label{sec:rlmc-vm-goals}
+
+学完本章，你应该\textbf{能够}（每条都可当场验收）：
+
+\begin{enumerate}
+\item \textbf{配置}前视深度相机：在 Isaac Lab 写出可用的 \verb|TiledCameraCfg|、在 mjlab 写出 \verb|CameraSensorCfg|（或包裹 MJCF \verb|<camera>|），并算清分辨率--吞吐--精度的三角权衡；
+\item \textbf{调通}从原始渲染到 CNN 输入的完整 depth 预处理管线（格式/裁剪/归一化/无效像素/降采样），并定位单位与 HWC/CHW 类错配；
+\item \textbf{实现}三种 CNN 视觉编码器（Flatten / Global Average Pooling / SpatialSoftmax），并按 locomotion 任务特性选型；
+\item \textbf{配置}视觉域随机化的阶段化策略（depth 高斯噪声/dropout/延迟/外参扰动），并说清它与物理 DR 的耦合时机；
+\item \textbf{定位}视觉运控策略的典型故障——用五层诊断流程从“渲染不对”到“CNN 没学到”到“sim-to-real gap”逐层排查；
+\item \textbf{导出}视觉策略到部署格式（ONNX），并设计异步 CNN + 同步 MLP 的真机推理架构以满足延迟预算。
+\end{enumerate}
+
+\paragraph{知识导航。}本章在全书中的位置如下。
+
+\begin{center}
+\begin{forest}
+navtree,
+[{本章：视觉感知运动控制}
+  [{为何需要视觉}
+    [{盲策略的感知边界}]
+    [{三模态：depth/RGB/seg}]]
+  [{算法概念主线}
+    [{相机传感器与渲染}]
+    [{depth 预处理管线}]
+    [{CNN 编码器选型}]
+    [{视觉域随机化}]]
+  [{三框架接线}
+    [{mjlab：batch renderer}]
+    [{Isaac Lab：TiledCamera}]
+    [{UniLab：无视觉任务（如实标注）}]]
+  [{部署}
+    [{视觉 sim2real}]
+    [{ONNX + 异步架构}]]
+  [{诊断}
+    [{五层诊断流程}]
+    [{特征可视化}]]
+]
+\end{forest}
+\end{center}
+
+\paragraph{前置桥接（2--3 行重述）。}\cref{ch:rlmc-privileged} 立了“特权 teacher $\to$ 受限 student”的蒸馏框架，并精读了 extreme-parkour 的三阶段管线；\cref{ch:rlmc-quadloco} 立了四足速度跟踪与 height scan 传感器；\cref{ch:rlmc-dr} 立了域随机化的鲁棒优化视角。本章把这三件事\emph{聚焦到视觉}：student 的“受限输入”具体化为一张带噪声、有盲区、需 CNN 解析的深度图，蒸馏链条里多了“从像素恢复地形信息”这一隐式学习目标。
+
+\paragraph{阅读时间。}精读（含动手跑通渲染验证与一次 depth 蒸馏）约 5--7 小时；速读（只读每节首段 + 概念主线 + 小结）约 70 分钟；查阅（按 \cref{sec:rlmc-vm-trouble} 故障表 + \cref{sec:rlmc-vm-summary} 速查表定位）按需。
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么“盲”策略不够：从反应到预测}
+\label{sec:rlmc-vm-why}
+
+\textbf{本节解决什么问题}：建立“本体感知有物理边界”的认知，说清视觉填补的是哪类信息缺口——这是后面所有视觉接线的动机。
+
+\subsection{盲策略的失败边界}
+\label{sec:rlmc-vm-blind}
+
+回顾 \cref{ch:rlmc-quadloco}：四足速度跟踪的 actor 观测只有本体感知。它在平地和简单粗糙面上表现良好，因为本体感知已经够用——关节角告诉策略“腿在哪”，角速度告诉策略“身体是否稳”，投影重力告诉策略“哪边是下”。即便在粗糙地形，策略也能通过 \cref{ch:rlmc-privileged} 的适应机制（本体感知历史隐式编码地形）获得有限的地形适应力。
+
+但盲策略有一个物理性的边界：\textbf{它只能“反应”，不能“预测”}。它只有在脚\emph{碰到}障碍后才能感知障碍——此时往往已经太晚。下表把这条边界量化：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+场景 & 盲策略 & 失败的根本原因 \\
+\midrule
+平坦地面 & 正常 & 无需预测 \\
+随机粗糙面 & 自适应步态 & 本体感知历史够用 \\
+均匀台阶 & 勉强可行 & 需足够长历史才能“猜”到台阶高 \\
+不规则障碍 & 频繁绊倒 & 无法预测前方障碍的高度/位置 \\
+大缺口（gap） & 直接掉入 & 必须\emph{提前}看到缺口才能起跳 \\
+高障碍（$2\times$ 体高） & 撞上 & 必须\emph{提前}看到障碍才能调整步态 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+一个人类类比：闭眼走平路没问题；闭眼走楼梯，若知道是楼梯还能靠脚的触觉逐步适应；但闭眼跑酷绝对不行——你必须看见前方障碍才能决定跳过还是绕开。机器人 locomotion 面临完全相同的信息瓶颈。从工程数据看，extreme-parkour\,\cite{cheng2024parkour} 的 depth student 能在 Unitree A1 上实现约 $2\times$ 体高的跳跃，而同等条件下的盲策略甚至无法可靠通过 $0.5\times$ 体高的台阶。
+
+\subsection{视觉填补的三类信息缺口}
+\label{sec:rlmc-vm-gap}
+
+视觉为 locomotion 提供三类关键信息，每类对应不同的控制决策：
+
+\textbf{第一类：前方地形几何。}“前面 1--2 米是平的还是有台阶？多高？多宽？”决定步态选择——平地用正常步态、台阶用抬腿步态、大缺口用跳跃步态。
+
+\textbf{第二类：脚下地形细节。}“当前脚底接触的坡度多少？”影响单步内的力控制。\emph{前视}深度相机看不到脚正下方（视野盲区），这一类信息必须靠本体感知历史或额外的下视相机补——这是自我中心视觉的根本限制，后面 \cref{sec:rlmc-vm-multicam} 会专门处理。
+
+\textbf{第三类：障碍物的语义类型。}“前面是可踩的台阶还是不能碰的玻璃门？”RGB 才提供语义，depth 只看几何。对纯几何的 parkour，depth 已足够；对需要语义的导航（区分可通行/不可通行），才需要 RGB 或分割。
+
+三种视觉模态的工程对比如下：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+模态 & 提供 & 不提供 & sim-to-real 难度 & 计算成本 \\
+\midrule
+Depth & 几何形状、距离 & 颜色、材质、语义 & 低（不受光照影响） & 中 \\
+RGB & 颜色、纹理、语义 & 精确距离 & 高（光照/材质敏感） & 中 \\
+Segmentation & 语义标签 & 形状细节 & 不可部署（仿真特有） & 低 \\
+Height Scan & 精确地形高度 & 视觉外观 & 不可部署（需特权） & 极低 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[对 locomotion，depth 是性价比最高的模态]\label{ins:rlmc-vm-depthking}
+depth 同时满足两个对 locomotion 最关键的诉求：它提供了步态决策最需要的\emph{几何}信息（地形高度、障碍距离），又把 sim-to-real gap 压到最小（深度是纯几何量，不受光照与材质影响）。这就是 extreme-parkour\,\cite{cheng2024parkour}、ANYmal 感知运动控制\,\cite{miki2022perceptive} 等工作都以前视 depth 相机为主要外感受传感器、而非 RGB 或 LiDAR 的原因。RGB 只在需要语义理解时才引入。一条常见误解需要澄清：把 RMA\,\cite{kumar2021rma} 归到“depth 视觉 locomotion 代表工作”是错的——RMA 的核心是基于本体感知历史的在线适应模块，部署侧主要依赖 proprioception，并不以 depth 相机为主（见 \cref{sec:rlmc-priv-rma2}）。
+\end{insight}
+
+\subsection{视觉 locomotion 的三代演进}
+\label{sec:rlmc-vm-evolution}
+
+把视觉 locomotion 放进历史脉络，能看清本章聚焦的“第三代”范式从何而来。这条脉络与 \cref{sec:rlmc-priv-evolution} 的特权学习演进互补——那里讲“信息蒸馏链如何缩短”，这里讲“感知模态如何升级”。
+
+\textbf{第一代（2016--2019）：高程地图 + 落脚点规划。}用 LiDAR 或双目构建 elevation map，再用规划算法算落脚点（如 ANYmal 的 elevation mapping）。几何精确、可解释，但建图计算量大、对传感器噪声敏感。
+
+\textbf{第二代（2020--2022）：RL + height scan teacher $\to$ 本体感知 student。}用 RL 训一个看 height scan 的特权 teacher，蒸馏到只用本体感知历史的盲 student\,\cite{lee2020quadruped,kumar2021rma}。不需视觉传感器即可部署、对传感器噪声免疫，但“盲”特性使它无法处理需要预测性感知的复杂地形。
+
+\textbf{第三代（2023--至今）：RL + height scan teacher $\to$ depth student。}仍用 height scan teacher，但 student 改用前视 depth 相机\,\cite{agarwal2023legged,cheng2024parkour}。depth student 既有预测性感知（看见前方地形）又有部署可行性（depth 相机便宜且对光照鲁棒），能处理 gap jump、高障碍等场景。本章聚焦于此——它也是当前学术界与工业界的主流。
+
+\begin{insight}[每一代都在“降低对特权信息的依赖”同时“提高可部署的感知能力”]\label{ins:rlmc-vm-twoaxis}
+把三代演进画在“特权依赖”与“感知能力”两个轴上，会看到一条清晰的对角线：LiDAR 高程图（高感知、高成本、需建图）$\to$ 特权 height scan + 盲 student（零部署传感器、但感知弱）$\to$ depth student（廉价可部署相机、感知强）。每一步都在沿对角线移动——既不退回“靠昂贵特权传感器”，也不停留在“盲”，而是用蒸馏把特权 teacher 的能力转移到一个便宜、可部署、感知够用的输入上。理解了这条对角线，就理解了为什么本章把“蒸馏”而非“端到端 RL”作为骨架（\cref{sec:rlmc-vm-distill}）。
+\end{insight}
+
+\paragraph{常见陷阱与练习。}
+
+\begin{pitfall}[把 height scan teacher 的成绩当成视觉策略的性能上限去“追平”]
+\textbf{错误描述}：看到 depth student 的成功率比 height scan teacher 低 20\%--40\%，判定蒸馏失败，拼命调参想追平。\textbf{现象后果}：要么白费功夫，要么更糟——逼出了 privileged 泄漏。\textbf{根本原因}：height scan 是\emph{完美}信息（无噪声、无遮挡、全视野），depth student 面对的是有噪声、有遮挡、有限视野的真实图像，性能\emph{必然}低于 teacher。\textbf{正确做法}：把 20\%--40\% 的差距当作正常基线；若差距几乎为零，反而要怀疑 student 泄漏了特权信息（而非视觉真学完美）；若差距 $>50\%$，问题在蒸馏管线（\cref{sec:rlmc-vm-distill}）。
+\end{pitfall}
+
+\begin{pitfall}[认为“视觉策略一定比盲策略好”，在不需要视觉的场景强加视觉]
+\textbf{错误描述}：为了“看起来更先进”，在平地/均匀粗糙面任务里也接上相机。\textbf{现象后果}：性能反而可能下降。\textbf{根本原因}：简单地形本体感知已足够，视觉引入了额外噪声源（相机抖动、depth artifact），却几乎不增加有用信息。\textbf{正确做法}：视觉的价值是\emph{扩展}可处理地形的复杂度上限，不是普遍替代本体感知；先确认任务真的需要预测性感知，再上视觉。
+\end{pitfall}
+
+\begin{practice}[盲与视觉的边界]
+\begin{enumerate}
+\item 列出 3 个盲策略可胜任、3 个必须用视觉的 locomotion 场景，对每个说明关键信息缺口是什么。
+\item 一个 depth 相机帧率 30\,Hz，机器人 1\,m/s。两帧之间机器人移动多远？这对 CNN 的时序感知（\cref{sec:rlmc-vm-temporal}）意味着什么？给出数值与一句话结论。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{两种地形感知范式：Height Scan 与 Egocentric Depth}
+\label{sec:rlmc-vm-twoparadigm}
+
+\textbf{本节解决什么问题}：teacher 用 height scan、student 用 depth 相机——这两种感知在工程上有什么本质区别？信息如何从前者传递到后者？
+
+\subsection{从 height scan 到 depth 的范式落差}
+\label{sec:rlmc-vm-paradigmgap}
+
+height scan 的传感器配置（网格分辨率、ray alignment、与观测维度的换算）已在 \cref{ch:rlmc-quadloco} 讲透，这里不重复。本章只关心一件事：它和 depth 相机在\emph{信息形态}上的落差，因为这条落差正是 CNN 编码器（\cref{sec:rlmc-vm-encoder}）要跨越的鸿沟。
+
+一个日常类比：height scan 像在房间里\emph{开灯}——瞬间看到所有角落；egocentric depth 像在黑暗里用\emph{手电筒}——只能看见照到的方向，身后和脚下都是黑的。用手电筒走路要不断转头或记住照过的地方，开灯走路则没有这份认知负担。height scan teacher 享受“开灯”，depth student 必须学会用“手电筒”高效导航。两者的工程对比：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & Height Scan（teacher） & Egocentric Depth（student） \\
+\midrule
+数据维度 & $\sim 200$ 个标量 & $H\times W$ 像素（如 $64\times64=4096$） \\
+信息类型 & 相对 base 的地形高度 & 像素到相机平面的距离 \\
+视野 & 全方向（可配置） & 前方锥形（FOV 依赖） \\
+脚下信息 & 直接可得 & 前视相机看不到（盲区） \\
+噪声/遮挡 & 无 & 有（传感器噪声、自身体遮挡） \\
+计算成本 & 极低（raycast） & 高（渲染 + CNN 推理） \\
+可部署 & 否 & 是 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{信息传递的本质：从像素恢复地形}
+\label{sec:rlmc-vm-infotransfer}
+
+teacher-student 蒸馏的核心是“信息传递”：teacher 看到了什么，student 如何从视觉中\emph{恢复}同样的信息？把两者的观测写成公式，落差一目了然：
+
+\begin{itemize}
+\item teacher 直接知道 $\text{height\_scan}[i] = \text{terrain\_height}(\mathbf{p}_{\text{robot}} + \Delta_i) - h_{\text{base}}$，即“前方某点地面相对 base 高出多少”；
+\item student 只知道 $\text{depth}[u,v] = \text{dist\_to\_plane}(\text{camera}, \text{pixel}(u,v))$，即“图像 $(u,v)$ 处的像素对应多远”。
+\end{itemize}
+
+要从后者得到前者，CNN 必须\emph{隐式}学会三步转换：(1) 从 depth 中提取地形轮廓；(2) 把图像坐标转换到 base 坐标系；(3) 估计遮挡区域的地形（靠记忆）。蒸馏 loss 并不\emph{显式}要求 CNN 完成这三步，但 teacher 的动作只有在 student 成功完成它们之后才可能被模仿。
+
+\begin{insight}[视觉蒸馏的本质不是“模仿动作”，而是“迁移感知能力”]\label{ins:rlmc-vm-perception}
+把 depth 当作一种“语言”（$64\times64$ 像素矩阵），height scan 当作另一种“语言”（$\sim 200$ 维高度向量），两者描述同一个“现实”——前方地形。CNN 扮演的是\emph{翻译员}：把 depth 语言译成策略网络能懂的、与 height scan 等价的特征。蒸馏提供了“平行语料”（同一场景的 depth 图 + teacher 的动作标注），让翻译员通过大量对照例子学会翻译。所以动作模仿只是\emph{代理任务}，真正的学习目标是感知能力的迁移：CNN 一旦学会从 depth 提取地形信息，动作自然就接近 teacher。这条洞察解释了 \cref{ins:rlmc-priv-msevsrollout}「MSE 低 $\ne$ rollout 好」在视觉场景的特殊形态——MSE 低可能只是 student 在训练分布上“背”出了动作，并未真正学会“看懂”地形。
+\end{insight}
+
+\paragraph{常见陷阱与练习。}
+
+\begin{pitfall}[depth 相机的近裁剪面设得太大，障碍物“凭空消失”]
+\textbf{错误描述}：把 \verb|clipping_range| 设成 \verb|(0.3, 10.0)|，距相机 30\,cm 以内的物体返回 depth$=0$ 或 NaN。\textbf{现象后果}：机器人接近障碍物时，障碍进入近裁剪区“消失”，CNN 误以为前方无物，一头撞上。\textbf{根本原因}：近裁剪面 $>$ 机器人可能贴近障碍的距离。\textbf{正确做法}：近裁剪面设到尽可能小（如 $0.01$\,m），或在预处理里把近裁剪区像素显式标成“近距离障碍”而非“无穷远”。
+\end{pitfall}
+
+\begin{practice}[范式落差的换算]
+\begin{enumerate}
+\item 一个 height scan 配 \verb|size=(2.0, 1.0), resolution=0.1|。算出总采样点数；若 obs 还含 48 维本体感知，总 obs 维度多少？（这是 teacher 的 obs；对照下一节 student 的 $64\times64$ depth 维度，体会“低维标量 vs 高维像素”的差别。）
+\item 用一句话说清：为什么 student 的 depth 输入需要 CNN，而 teacher 的 height scan 可以直接拼进 MLP 的 obs 向量？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{相机传感器与渲染管线：三框架配置}
+\label{sec:rlmc-vm-camera}
+
+\textbf{本节解决什么问题}：如何在 mjlab 与 Isaac Lab 中配置深度相机？两个框架的渲染管线有何工程差异？分辨率与环境数如何权衡？
+
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-vm-camera-role}
+
+相机传感器在视觉运控管线中的位置很明确：它是 obs 链路的\emph{源头}。物理步进更新刚体位姿后，渲染器把每个环境的相机视图渲成一张图，经预处理（\cref{sec:rlmc-vm-preprocess}）喂给 CNN 编码器（\cref{sec:rlmc-vm-encoder}），编码出的视觉特征再与本体感知拼接送入策略 MLP。整条链路理想情况下\emph{全程在 GPU 上}，不经 CPU 往返——这是大规模并行渲染的关键性能前提。
+
+\subsection{Isaac Lab 的 TiledCamera：RTX 加速渲染}
+\label{sec:rlmc-vm-tiledcam}
+
+Isaac Lab 的视觉能力建立在 Omniverse RTX 渲染器之上，核心组件是 \verb|TiledCamera|——它把多个环境的相机输出“拼接”（tile）到一张大的 GPU framebuffer，避免逐环境渲染的开销。
+
+\begin{codebox}[Python]{Isaac Lab：前视深度相机配置（TiledCameraCfg）}
+from isaaclab.sensors import TiledCameraCfg
+from isaaclab.sim import PinholeCameraCfg
+
+front_depth_camera = TiledCameraCfg(
+    prim_path="{ENV_REGEX_NS}/Robot/base/front_camera",  # ENV_REGEX_NS 占位符
+    offset=TiledCameraCfg.OffsetCfg(
+        pos=(0.3, 0.0, 0.05),         # 相机相对 base：前 30cm、高 5cm
+        rot=(0.5, -0.5, 0.5, -0.5),   # 朝前看；四元数 (w, x, y, z)！
+        convention="ros",              # 坐标系约定：ros/opengl/world
+    ),
+    spawn=PinholeCameraCfg(
+        focal_length=1.93,             # 焦距 (mm)
+        clipping_range=(0.01, 3.0),   # 近/远裁剪面 (m)：近面尽量小；远面须等于预处理 far_clip
+    ),
+    width=64, height=64,               # 训练分辨率
+    data_types=["distance_to_image_plane"],  # 深度图；"depth" 是其别名
+    update_period=0.02,                # 渲染周期 (s) -> 50 Hz
+)
+\end{codebox}
+
+逐项解释几个最易出错的参数（这些都是 \cref{ins:rlmc-vm-plumbing} 所说“静默 bug”的高发地）。\verb|prim_path| 里的 \verb|{ENV_REGEX_NS}| 占位符让 Isaac Lab 在创建多环境时自动替换为每个环境的前缀——这是 tiled rendering 的基础，所有环境共享同一 render product，靠 tile 索引区分。\verb|data_types| 支持多种模态，其中 \verb|"distance_to_image_plane"| 返回 $(B,H,W,1)$ 的 \verb|float32| 张量（已联网核：\verb|"depth"| 是它的别名，输出相同），是像素到\emph{相机平面}沿 Z 轴的投影距离；与之相对的 \verb|"distance_to_camera"| 返回到\emph{相机原点}的欧氏距离。对 CNN 二者差别不大（网络能学会处理任一表示），但前者更常用——它与真实 depth sensor（如 RealSense）的输出格式一致。
+
+\verb|update_period| 配相机渲染频率，可低于物理步频以省算力（地形几何在两次渲染间变化不大）。下表把这四个最关键的配置项按“四维”拆开，方便落地时逐项核对：
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.6cm}p{2.4cm}p{3.0cm}p{3.4cm}@{}}
+\toprule
+配置项 & 默认值来源 & 修改影响 / 合理范围 & 与其他配置的耦合 \\
+\midrule
+\verb|width/height| & 任务自定 & 越大越精细但渲染越慢；$32$--$128$ & 必须等于预处理与 CNN 输入分辨率 \\
+\verb|clipping_range| & 任务自定 & 近面太大则近障碍消失；近 $0.01$、远 $3$--$5$ m & 必须等于预处理的 \verb|near/far_clip| \\
+\verb|offset.rot| & 任务自定 & 配错则看天花板而非地面；$(w,x,y,z)$ & 受 \verb|convention| 影响（ros/opengl 不同） \\
+\verb|update_period| & 任务自定 & 越大越省算力但视觉越滞后；$0.02$--$0.05$ s & 应与训练时延迟 DR（\cref{sec:rlmc-vm-dr}）一致 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[\texttt{OffsetCfg.rot} 是四元数 $(w,x,y,z)$，不是 $(x,y,z,w)$]
+\textbf{错误描述}：用 \verb|scipy| 的 \verb|Rotation.as_quat()| 算旋转后直接填进 \verb|rot|。\textbf{现象后果}：相机朝向莫名其妙（可能朝上看天花板），depth 图里全是 $2$--$3$ m 的“合理”数值，但策略学不到任何地形信息——网络不报错，最隐蔽。\textbf{根本原因}：\verb|scipy| 默认输出 $(x,y,z,w)$，而 Isaac Lab \verb|OffsetCfg| 要的是 $(w,x,y,z)$，顺序反了。\textbf{正确做法}：手动换序 \verb|quat_wxyz = [q[3], q[0], q[1], q[2]]|；并务必保存一帧 depth 图肉眼确认能看到\emph{地面}。这与全书 Hamilton 四元数约定一致（见全书记号约定），但仍要逐版本确认存储顺序——\cref{sec:rlmc-setup-isaaclab} 提到 Isaac Lab 3.0 Beta 在张量层面改用 \verb|xyzw|，配置类与张量两处的约定不要混。
+\end{pitfall}
+
+相机坐标系约定（\verb|convention|）也是常见坑：\verb|"ros"|（X 右、Y 下、Z 前，RealSense 默认）、\verb|"opengl"|（X 右、Y 上、Z 后，Blender/MuJoCo 默认）、\verb|"world"|（世界系）。对 locomotion 推荐 \verb|"ros"|——与真实 depth sensor 一致，部署时省去坐标翻转。
+
+\subsection{mjlab 的 MuJoCo Warp 批量渲染}
+\label{sec:rlmc-vm-mjlabcam}
+
+mjlab 的相机是一个\emph{传感器}（\verb|CameraSensorCfg|，\verb|from mjlab.sensor import CameraSensorCfg|，源码实测），既可\textbf{包裹}一个已在 MJCF 里声明的 \verb|<camera>|（传 \verb|camera_name|），也可直接\textbf{新建}一个相机（传 \verb|pos/quat/fovy/parent_body|）。底层是 MuJoCo Warp 的批量渲染器（GPU ray-tracing，多并行世界同时渲染）。
+
+\begin{codebox}[Python]{mjlab：用 CameraSensorCfg 声明前视深度相机（源码实测 API）}
+from mjlab.sensor import CameraSensorCfg
+
+# 方式 A：新建一个挂在 base 上的前视相机（pos/quat 相对 parent_body）
+front_depth = CameraSensorCfg(
+    name="front_depth",
+    parent_body="robot/base",      # 全名前缀；None 则挂 worldbody
+    pos=(0.3, 0.0, 0.05),          # 相对 parent_body 帧
+    quat=(0.5, -0.5, 0.5, -0.5),   # 四元数 (w, x, y, z)，朝前看
+    fovy=60.0,                      # 垂直 FOV (度)；None 用 MuJoCo 默认 45
+    width=64, height=64,
+    data_types=("depth",),         # 任意组合: "rgb"/"depth"/"segmentation"；构造期即校验非法值
+    # 选填的渲染控制字段（depth-only 想省渲染时常用）：
+    # use_shadows=False,           # depth 不需阴影，关掉省渲染
+    # enabled_geom_groups=(0, 3),  # 只渲染指定 geom 组、排除装饰几何（真实 Yam 任务即用 (0,3)）
+    # 硬约束：同一场景内所有相机的 use_textures/use_shadows/enabled_geom_groups 必须一致！
+)
+# 方式 B：包裹一个已在 MJCF 里写好的 <camera name="front_depth" .../>：
+#   front_depth = CameraSensorCfg(name="front_depth", camera_name="front_depth",
+#                                 width=64, height=64, data_types=("depth",))
+#   （真实 manipulation 任务正是这样：camera_name="robot/camera_d405", 32x32, ("depth",)）
+# 输出（CameraSensorData）：depth=[N,H,W,1] float32；rgb=[N,H,W,3] uint8；segmentation=[N,H,W,2] int32。
+# 注意：CameraSensorCfg 本身不含近/远裁剪或归一化字段——裁剪/归一化在预处理里做
+#       （见 Depth 预处理一节），与 Isaac Lab 的 clipping_range 不同。
+\end{codebox}
+
+mjlab 相机的 \verb|fovy=60| 定义垂直视野角，水平 FOV 由宽高比自动算出：$\text{fovx}=2\arctan(\text{aspect}\cdot\tan(\text{fovy}/2))$；对 $64\times64$ 正方形图，fovx = fovy = $60^\circ$。若改用 MJCF \verb|<camera>| 声明（方式 B 包裹），其 \verb|xyaxes| 前 3 数为相机 X 轴(右)、后 3 数为 Y 轴(上)，Z(光轴)由右手定则定，\verb|mode="fixed"| 让相机随 body 运动。
+
+两个框架的视觉能力对比：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+维度 & mjlab (MuJoCo Warp) & Isaac Lab (RTX) & UniLab \\
+\midrule
+渲染后端 & Warp batch renderer（ray-tracing） & RTX ray-tracer & Motrix 原生 renderer（仅回放，非策略观测） \\
+RGB 质量 & 中（无全局光照/PBR） & 高（光追、PBR 材质） & 无对应（不作训练观测） \\
+Depth 质量 & 高（几何精确） & 高（几何精确） & 无对应（无 depth obs） \\
+视觉 DR & 基础（颜色/纹理手动替换） & 丰富（Replicator + MDL） & 无对应（无视觉任务） \\
+推荐场景 & Depth-only locomotion & RGB sim-to-real & 本体感知 locomotion（CPU-sim） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[depth-only 任务下两个框架的 depth 质量没有本质差别]\label{ins:rlmc-vm-depthsame}
+一个反直觉但重要的事实：对本章核心的 depth-only locomotion，mjlab 与 Isaac Lab 的 depth 质量\emph{几乎一样}——因为 depth 是纯几何计算，不受渲染管线的光照/材质质量影响。Isaac Lab 的 RTX 优势主要体现在 \emph{RGB} 渲染（全局光照、PBR、光追反射）上。所以工程建议是：先在迭代更快、依赖更轻的框架里用 depth 验证管线正确性，确认 sim-to-real 可行后，若确需 RGB 或丰富视觉 DR，再切到 Isaac Lab 的 RTX + Replicator。不要因为“RTX 听起来更高级”就默认它在 depth 上也更优。
+\end{insight}
+
+\begin{codebox}[text]{UniLab：相机传感器配置——无对应（当前无视觉任务）}
+% UniLab 没有「相机传感器配置」这一环：其 SceneCfg 只声明机器人/地形的 MJCF/Motrix XML
+% 与传感器（local_linvel / gyro / upvector / 足端接触），不含可作策略观测的相机。
+% 上面 Isaac Lab 的 TiledCameraCfg、mjlab 的 CameraSensorCfg 在 UniLab 无等价物。
+% 若要在 UniLab 上做视觉运控，需自行：(1) 给后端加渲染→obs 的桥接；
+%   (2) 在 NpEnv.update_state 里把渲染帧塞进某个 obs 组；(3) 自定义视觉 DR。
+% 这三步当前都不是 UniLab 内置能力，本章不编造其 API。
+\end{codebox}
+
+\subsection{分辨率--吞吐--精度的三角权衡}
+\label{sec:rlmc-vm-resolution}
+
+视觉 RL 训练中，分辨率是一个三方权衡：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+分辨率 & 地形细节 & 计算成本 & 典型 num\_envs & 收敛速度 \\
+\midrule
+$32\times32$ & 粗糙（$1$px$\approx$几 cm） & 低 & 2048--4096 & 快 \\
+$64\times64$ & 中等（多数任务够用） & 中 & 512--2048 & 中 \\
+$128\times128$ & 精细 & 高 & 128--512 & 慢 \\
+$256\times256$ & 极精细 & 极高 & 64--128 & 极慢 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+经验法则：对 locomotion parkour，$64\times64$ 的 depth 已足以捕获台阶边缘、缺口宽度、障碍轮廓等关键几何特征。extreme-parkour 实际用约 $58\times87$ 的分辨率（受 Unitree A1 相机原始比例约束，已核：其部署预处理为“裁掉左侧坏像素 + 降采样到 $58\times87$”）。一个反直觉事实：降低分辨率通常\emph{不会}显著降低 locomotion 视觉策略的性能，却能显著提高吞吐——因为渲染成本随像素数线性增长，而 locomotion 需要的地形信息在低分辨率下就已足够。但若降到 $16\times16$，台阶边缘可能只剩 $1$--$2$ 个像素，CNN 难以可靠检测。
+
+\subsection{运行验证：看什么日志/曲线}
+\label{sec:rlmc-vm-camera-verify}
+
+相机配好后，开训\emph{前}的验证只看三件事，全部是肉眼/打印级别的，几分钟就能做完：(1) 保存一帧 depth PNG，确认能看到地面地形而非天花板/墙壁；(2) 打印 depth 张量的 \verb|min/max/mean/shape|，确认数值在裁剪范围内、形状是预期的 $(B,H,W,1)$（Isaac Lab）或对应布局；(3) 确认渲染没有把吞吐拖到不可接受——对比开/关相机的 steps/s，落差在 5--20 倍属正常，远超则查分辨率与 num\_envs。
+
+\paragraph{“渲染慢 5--20 倍”这个数，自己怎么测。}本章反复用“渲染比纯物理慢 5--20 倍”来论证为何 num\_envs 要砍到几百、为何用蒸馏——但这是个\emph{区间}，你该学会在自己机器上测出\emph{具体倍数}，而不是把区间当真理。测法有一条铁律：\textbf{必须用\emph{同一个任务}做加相机/不加相机的对照}，只改“是否渲染”这一个变量。框架训练日志每隔几迭代会打印一行 \verb|steps/s|（rsl-rl 系）或类似吞吐量，跑法是：
+\begin{codebox}[bash]{自测渲染倍数：同任务，只切换“是否开相机渲染”}
+# 同一任务、同 num_envs、同 max-iterations，跑两次，各记稳态那几迭代的 steps/s：
+# 关相机基线（若任务支持禁用相机 obs，或用同机器人的纯本体感知姊妹任务）：
+WANDB_MODE=disabled uv run train <同一任务·关渲染> --env.scene.num-envs 512 --agent.max-iterations 50
+# 开相机：
+WANDB_MODE=disabled MUJOCO_GL=egl uv run train <同一任务·开渲染> --env.scene.num-envs 512 --agent.max-iterations 50
+# 倍数 = 关相机 steps/s ÷ 开相机 steps/s。注意只看【稳态】那几迭代——
+# 首迭代被 JIT/CUDA-graph/USD-shader 预热污染（见下方基准提醒），不能算进去。
+\end{codebox}
+\textbf{一条实测基准（防止被绝对数字误导）}：在 RTX 4090、\emph{小} env 数（如 64）下，mjlab 视觉任务 \verb|Mjlab-Lift-Cube-Yam-Depth| 实测约 $5200$ steps/s、RGB 版约 $1300$ steps/s——但这远低于大 env 数（数千）下的峰值吞吐，因为小 batch 下 GPU kernel 没喂饱、且首迭代还要付一次性预热成本。所以\textbf{首跑别被一个“偏低”的 steps/s 吓到}，要看 num\_envs 拉到几百/几千、且跳过首迭代后的稳态值。本服务器上之所以不能直接给你一个“loco 任务加/不加相机”的现成倍数，正是因为现成视觉任务都是机械臂 manip、找不到“同一 loco 任务的加/不加相机”对照——这也提醒你：跨任务比 steps/s 没有意义，倍数只在同任务内才可信。
+
+\paragraph{常见陷阱与练习。}
+
+\begin{pitfall}[预处理的裁剪范围与相机 \texttt{clipping\_range} 不一致]
+\textbf{错误描述}：\verb|TiledCameraCfg| 配 \verb|clipping_range=(0.01, 5.0)|，但 depth 预处理用 \verb|(0.1, 3.0)| 归一化。\textbf{现象后果}：$5$--$10$\,cm 与 $3$--$5$\,m 的深度被错误截断或映射到边界，CNN 看到的输入分布偏离训练假设。\textbf{根本原因}：两处裁剪范围本是同一物理量，却各填各的。\textbf{正确做法}：把 \verb|near_clip/far_clip| 抽成一个共享常量，相机配置与预处理都引用它，杜绝两处不一致。
+\end{pitfall}
+
+\begin{practice}[配一个能看到地形的相机]
+\begin{enumerate}
+\item 在 Isaac Lab 写出一个 \verb|TiledCameraCfg|：前视 depth、$64\times64$、装在四足前胸（\verb|pos=(0.35, 0, 0.02)|）、FOV $60^\circ$、\verb|convention="ros"|。\textbf{验收标准}：跑 5 步后存的 depth PNG 能看到前方地面；若看到天花板，按 \cref{sec:rlmc-vm-tiledcam} 的四元数陷阱排查。
+\item 同一任务分别用 $32\times32$ 与 $64\times64$ 各跑 200 iteration，记录 steps/s。\textbf{预期输出}：$32\times32$ 的吞吐约为 $64\times64$ 的 $2$--$3$ 倍；写一句话说明这与“渲染成本随像素数线性增长”的关系。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Depth 预处理：从原始像素到 CNN 输入}
+\label{sec:rlmc-vm-preprocess}
+
+\textbf{本节解决什么问题}：渲染出的原始 depth 看似“归一化一下就行”，但每一步预处理的工程细节都直接影响 CNN 能否学到东西，更是 sim-to-real 失败的头号根因。
+
+\subsection{五步预处理管线}
+\label{sec:rlmc-vm-fivestep}
+
+从原始渲染输出到 CNN 输入，标准管线有五步，缺一步都可能让 CNN 静默地学废：
+
+\textbf{Step 1 格式转换。}仿真器输出可能是 \verb|float32|（米）或 \verb|uint16|（毫米，需除以 1000）。Isaac Lab 的 \verb|distance_to_image_plane| 已是 \verb|float32| 米制；mjlab 的 depth obs 同理。真机上 RealSense 输出 \verb|uint16| 毫米——单位换算是 sim-to-real 最常见的错配。
+
+\textbf{Step 2 裁剪。}把 depth 限到有效范围 $[d_{\text{near}}, d_{\text{far}}]$。近裁剪面以内（手爪挡镜头）设为 $d_{\text{near}}$，远裁剪面以外（天空）设为 $d_{\text{far}}$。对 locomotion 典型范围 $[0.01, 3.0]$\,m——$3$\,m 外的地形对即时步态决策不重要。
+
+\textbf{Step 3 归一化。}线性映射到 $[0,1]$：
+\begin{equation}
+d_{\text{norm}} = \frac{d - d_{\text{near}}}{d_{\text{far}} - d_{\text{near}}}.
+\label{eq:rlmc-vm-norm}
+\end{equation}
+归一化后 $d_{\text{norm}}=0$ 表示“最近可见距离”、$d_{\text{norm}}=1$ 表示“最远/无障碍”，与 CNN 典型输入范围兼容。
+
+\textbf{Step 4 无效像素处理。}真实 depth sensor 在反射面、边缘空洞处没有有效值；仿真里这些像素可能是 $0$、NaN 或 $d_{\text{far}}$。统一策略：把所有无效像素替换为 $d_{\text{far}}$（视为“无障碍”）再归一化。
+
+\textbf{Step 5 降采样（可选）。}若原始分辨率（如 $640\times480$）高于训练分辨率（如 $64\times64$），用插值降采样。\verb|bilinear| 更平滑但可能在台阶边缘产生“中间深度”伪影，\verb|nearest| 保留跳变但引入锯齿；对 locomotion，\verb|bilinear| 通常够用——“台阶大概多远”比“边缘精确像素位置”更重要。
+
+\begin{codebox}[Python]{depth 预处理管线：从原始渲染输出到 CNN 输入}
+def preprocess_depth(depth_raw, near_clip=0.01, far_clip=3.0):
+    """depth 预处理。约定输入 [B, H, W, 1] float32(米)，输出 [B, 1, H, W] in [0,1]。"""
+    depth = depth_raw.permute(0, 3, 1, 2)          # HWC -> CHW（关键！见陷阱）
+    invalid = torch.isnan(depth) | torch.isinf(depth) | (depth < 0)
+    depth = depth.clone()
+    depth[invalid] = far_clip                       # 无效像素 -> 无穷远，不是 0
+    depth = depth.clamp(near_clip, far_clip)        # 裁剪
+    depth = (depth - near_clip) / (far_clip - near_clip)  # 归一化到 [0,1]
+    return depth
+\end{codebox}
+
+为什么不归一化会出事？原始 depth 值域（$0.01$--$3$\,m）与本体感知值域（关节角 $-2$\textasciitilde$+2$\,rad）量级相近，看似无害——但 CNN 的权重初始化假设输入均值约 $0$、方差约 $1$。若 depth 值域整体偏移，CNN 的初始 feature map 可能饱和或接近零，梯度消失，训练原地不动。
+
+\begin{note}[真实世界的 \texttt{preprocess\_depth} 长什么样：mjlab 生产函数 \texttt{camera\_depth} 比教学版更“抠”]
+上面的 \verb|preprocess_depth| 是教学完整版（五步齐全）。mjlab 把 depth 接入策略 obs 用的\emph{生产}函数是 \verb|mjlab.tasks.manipulation.mdp.observations.camera_depth|（gpufree 源码实测），它做的事是：\verb|permute(0,3,1,2)| $\to$ \verb|clamp(min_depth, cutoff)| $\to$ \verb|/cutoff| $\to$ \verb|clamp(0,1)|。和教学版对照，它\textbf{有意省了两步}：(1) 归一化用 $d/\text{cutoff}$（即 $d/d_{\text{far}}$）而\emph{不}减近偏移，与 \eqref{eq:rlmc-vm-norm} 的 $(d-d_{\text{near}})/(d_{\text{far}}-d_{\text{near}})$ 不同；(2) \emph{不}处理 NaN/inf。这两处“省”不是 bug，而是工程判断：
+\begin{itemize}
+\item \textbf{为什么敢省近偏移}：当 $d_{\text{near}}\ll d_{\text{far}}$（如 $0.01$ vs $3.0$，近偏移只占满量程的 $0.3\%$），两种归一化几乎重合，CNN 完全学得动；省掉减法少一个常量、少一次广播。但代价是：\textbf{部署侧的真机预处理必须跟着用同一条公式}——若你训练用 mjlab 内置 obs（$d/\text{far}$），真机却照本章 \eqref{eq:rlmc-vm-norm} 的 $(d-\text{near})/(\text{far}-\text{near})$ 做，两边对不上，sim-to-real 会无谓退化（这正是 \cref{ins:rlmc-vm-bottleneck}「逐位一致」的字面含义）。
+\item \textbf{为什么敢省 NaN 处理}：mjlab 的渲染 depth 是\emph{几何精确}的合成值，不像真实 sensor 会吐 NaN/反射空洞，所以仿真侧无效像素本就罕见。但这恰恰是\textbf{可讨论的简化点}：一旦你换到真机 RealSense（必有空洞）或在仿真里加了 dropout DR，就必须把 NaN/inf $\to$ \verb|far_clip| 这步补回来——生产代码省它只是因为它的输入分布里没有这个问题。
+\end{itemize}
+工程心法：\textbf{读懂一段生产预处理“省了什么、凭什么敢省”，比照抄一个学院派完整公式更能教会你何时可简化}。要把 mjlab 这条 depth obs 真正挂上策略，见下面的接线一节。
+\end{note}
+
+\subsection{把 depth 接成一个 obs term：从预处理函数到 actor group}
+\label{sec:rlmc-vm-wire}
+
+到这里你已经有了一个把原始 depth 变成 $[B,1,H,W]\in[0,1]$ 的预处理函数——但\emph{有函数不等于策略能看到它}。中间缺的一步是：把这个函数注册成一个 observation term，再把这个 term 放进 \textbf{actor} group（\cref{sec:rlmc-asymmetric} 讲了 actor/critic 分组，这里是它在视觉上的落地）。这一步是「从零搭一个视觉 obs 组」最容易被跳过、却最卡人的环节，下面给 mjlab 的真实接线（Isaac Lab 同构，把 \verb|ObservationTermCfg| 换成 \verb|ObsTerm|、func 换成 Isaac 的相机观测函数即可）：
+
+\begin{codebox}[Python]{mjlab：把 depth 预处理函数接成 actor group 里的一个 obs term}
+from mjlab.managers import ObservationTermCfg, ObservationGroupCfg
+# 真实 manipulation 任务正是这样接的：func 指向上面那类预处理函数，
+# params 把 cutoff(=far_clip) 传进去；mjlab 内置的就是 manipulation.mdp.camera_depth。
+depth_term = ObservationTermCfg(
+    func=camera_depth,                      # 你的/内置的 depth 预处理函数
+    params={"sensor_name": "front_depth", "cutoff_distance": 3.0},
+)
+# 关键：depth 是 student 的【主感知】，必须进 actor group（不是只进 critic！见下一节陷阱）。
+# 单独给视觉开一个 group、concatenate_terms=True，让 CNN 拿到成形的 [B,1,H,W]：
+class ActorObsCfg(ObservationGroupCfg):
+    front_depth = depth_term                # 视觉项
+    # ... 本体感知项（joint_pos/joint_vel/ang_vel/projected_gravity/commands）照常拼在同组
+    concatenate_terms = True                # 注意：视觉与本体不同形，实战常拆成两个子组分别送 CNN/MLP
+\end{codebox}
+
+\begin{insight}[“写好预处理函数” 与 “策略看得到 depth” 之间隔着一次 obs term 注册]\label{ins:rlmc-vm-wire}
+新手最常见的断点不是预处理算错，而是\emph{预处理函数压根没被调用}——它被定义在某个文件里，却从未通过 \verb|ObservationTermCfg(func=...)| 挂进任何 obs group，于是 actor 的 obs 里根本没有视觉这一路，CNN 第一层梯度恒为零（\cref{sec:rlmc-vm-diag} 第 3 层的典型症状）。记住这条链路的三段：\textbf{预处理函数 $\to$ \texttt{ObservationTermCfg(func=...)} 注册成 term $\to$ term 放进 actor group}，缺任何一段，depth 都到不了网络。验证只需一句：开训第一迭代打印 actor obs 的 shape，确认里面真有视觉那一路的维度。
+\end{insight}
+
+\begin{pitfall}[HWC/CHW 转置：CNN 把高度维当成通道维]
+\textbf{错误描述}：渲染器输出 \verb|[B, H, W, 1]|（HWC），直接喂进期望 \verb|[B, 1, H, W]|（CHW）的 \verb|Conv2d|，忘了 \verb|permute(0, 3, 1, 2)|。\textbf{现象后果}：对 $64\times64$ 的图，CNN 看到的是“$64$ 个 $1\times64$ 的 feature map”而非“$1$ 个 $64\times64$ 的 depth 图”——网络不报错，但特征毫无意义。\textbf{根本原因}：PyTorch 卷积的通道维在第 1 维，渲染器却把通道放在最后。\textbf{正确做法}：预处理第一步就 \verb|permute| 成 CHW；用 \verb|assert depth.shape[1] == 1| 兜底。
+\end{pitfall}
+
+\begin{pitfall}[dropout/无效像素被设成 $0$ 而非 \texttt{far\_clip}]
+\textbf{错误描述}：把无效像素或 dropout 像素值设为 $0$。\textbf{现象后果}：CNN 把这些像素解读为“距离为零”（物体紧贴相机），凭空产生“近处有大障碍”的错觉，步态突变。\textbf{根本原因}：$0$ 在 depth 语义里是“最近”，恰与“无检测/无穷远”相反。\textbf{正确做法}：无效/dropout 像素设为 \verb|far_clip|（无障碍），或设一个特殊标记值并在 CNN 前统一处理。这条与 \cref{sec:rlmc-vm-dr} 的 depth dropout DR 是同一个坑的两面。
+\end{pitfall}
+
+\begin{practice}[把预处理跑成可对照的数字]
+\begin{enumerate}
+\item 对一帧含 NaN 与超远值的合成 depth（自己造一个 $[1,1,8,8]$ 张量，塞几个 NaN 和 $99.0$）跑上面的 \verb|preprocess_depth|。\textbf{验收标准}：输出无 NaN、全部落在 $[0,1]$、原 NaN 位置变成 $1.0$（far）。
+\item 故意去掉 \verb|permute|，对比有/无转置时 CNN 第一层输出的形状。\textbf{预期输出}：无转置时通道数变成 $H$（如 $64$），一眼可见错配。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{CNN 视觉编码器：从 Flatten 到 SpatialSoftmax}
+\label{sec:rlmc-vm-encoder}
+
+\textbf{本节解决什么问题}：depth 图经 CNN 编码成策略可用的低维特征——不同编码方式在 locomotion 中各有什么优劣？这是本章工程难度最高、最值得动手的一节。
+
+\subsection{编码的核心问题：压缩什么、丢弃什么}
+\label{sec:rlmc-vm-encode-core}
+
+CNN encoder 做的是信息压缩：把 $H\times W\times 1$ 的 depth 图压成 $d$ 维特征（通常 $d=32$--$128$），保留与 locomotion 相关的地形信息、丢弃无关信息。与操作（manipulation）视觉的关键差异在于：操作关心“物体在哪”（需要精确 2D 位置），locomotion 关心“前方地形的整体形状”（需要全局几何）。这个差异直接决定编码器选型：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+任务类型 & 关键信息 & 推荐编码 & 原因 \\
+\midrule
+操作（抓方块） & 物体 2D 位置 & SpatialSoftmax & 保留精确位置 \\
+Locomotion（平地+台阶） & 地形全局高度分布 & GAP 或小 CNN & 不需精确位置 \\
+Locomotion（parkour） & 障碍轮廓 + 距离 & SpatialSoftmax 或 CNN+GRU & 需障碍空间信息 \\
+导航（避障） & 可通行区域 & GAP & 只需“哪里能走” \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{三种池化方式的取舍}
+\label{sec:rlmc-vm-pooling}
+
+\textbf{Flatten：保留一切，代价是维度爆炸且脆弱。}把最后一层 feature map 直接展平。若最后一层是 $32$ 个 $8\times8$，展平即 $2048$ 维。它保留了全部空间信息，但对空间位置的微小变化\emph{极其敏感}——相机抖一个像素就改变整个向量。locomotion 中相机随机器人持续抖动是常态，Flatten 因此很脆弱。
+
+\textbf{Global Average Pooling（GAP）：降维彻底，但丢位置。}对每个 channel 在空间维取平均，$32$ 个 $8\times8$ 变成 $32$ 维。它的平移不变性在 locomotion 中反而\emph{是优势}——“前方有台阶”无论台阶在图像左还是右，对步态影响相似。但 GAP 无法区分“台阶在 $0.5$\,m”和“台阶在 $1.5$\,m”，对需要精确起跳时机的 parkour 是致命的。
+
+\textbf{SpatialSoftmax：保留位置，丢弃纹理。}对每个 channel 算空间 softmax 权重，再求激活的期望坐标 $(x_c, y_c)$，输出 $C\times2$ 维。对 parkour，它能精确定位“台阶边缘在图像哪个位置”——这个位置经相机模型换算即“台阶离机器人多远”。其数学形式为
+\begin{equation}
+w_c(i,j) = \frac{\exp(f_c(i,j)/\tau)}{\sum_{i',j'}\exp(f_c(i',j')/\tau)},\qquad
+x_c = \sum_{i,j} w_c(i,j)\,\text{pos}_x(j),\quad
+y_c = \sum_{i,j} w_c(i,j)\,\text{pos}_y(i),
+\label{eq:rlmc-vm-ssm}
+\end{equation}
+其中 $\tau$ 是温度。在 locomotion 中，$x_c$ 对应水平方向（障碍在左/右），$y_c$ 对应垂直方向；对前视相机，$y_c$ 接近图像底部意味障碍在近处地面、接近顶部意味障碍在远处或高处——CNN 可借 $y_c$ 判断障碍距离。SpatialSoftmax 由 Levine 等人的视觉运动策略工作\,\cite{levine2016visuomotor} 推广开来。
+
+\begin{insight}[SpatialSoftmax 是 CNN 学到的“注意力焦点”]\label{ins:rlmc-vm-ssm-focus}
+一个驾驶类比：你开车时注视前方，注意力不是均匀铺在整块挡风玻璃上，而是集中在几个关键位置——前车尾灯、路面坑洞边缘、信号灯。SpatialSoftmax 的每个 channel 关键点正是 CNN 学到的这种焦点：channel 3 盯“最近的台阶边缘”、channel 7 盯“最深的缺口中心”。策略网络看到的不再是整张 depth 的像素值，而是“前方 $0.8$\,m 处有一个台阶边缘”这样\emph{结构化}的信息。这解释了为什么它在需要精确空间定位的 parkour 上优于 GAP，又为什么在只需“哪里能走”的避障上反而不如 GAP——焦点信息对前者是金子、对后者是冗余。
+\end{insight}
+
+\subsection{代码走读：可切换池化的 locomotion 编码器}
+\label{sec:rlmc-vm-encoder-code}
+
+下面给一个可直接用的视觉编码器，三种池化方式可切换。注意几个 RL 专属的设计决策（与标准视觉分类网络不同），它们都写在注释里。
+
+\begin{codebox}[Python]{LocomotionVisualEncoder：3 层 CNN + 可切换池化}
+import torch, torch.nn as nn
+
+class SpatialSoftmax(nn.Module):
+    """从 feature map 提取每个 channel 的期望坐标（地形关键点）。"""
+    def __init__(self, num_channels, height, width, temperature=1.0):
+        super().__init__()
+        self.temperature = temperature
+        self.register_buffer("pos_x",
+            torch.linspace(-1, 1, width).view(1, 1, 1, width))
+        self.register_buffer("pos_y",
+            torch.linspace(-1, 1, height).view(1, 1, height, 1))
+
+    def forward(self, fmap):                    # fmap: [B, C, H, W]
+        B, C, H, W = fmap.shape
+        w = torch.softmax(fmap.view(B, C, -1) / self.temperature,
+                          dim=-1).view(B, C, H, W)
+        x = (w * self.pos_x).sum(dim=[2, 3])
+        y = (w * self.pos_y).sum(dim=[2, 3])
+        return torch.cat([x, y], dim=-1)         # [B, C*2]
+
+class LocomotionVisualEncoder(nn.Module):
+    def __init__(self, in_channels=1, base_ch=32,
+                 pooling="spatial_softmax", ssm_temp=1.0, output_dim=None):
+        super().__init__()
+        # 3 层 stride=2 逐步降分辨率 64->32->16->8；足以提取台阶/缺口边缘
+        self.conv1 = nn.Conv2d(in_channels, base_ch, 5, stride=2, padding=2)
+        self.conv2 = nn.Conv2d(base_ch, base_ch, 3, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(base_ch, base_ch, 3, stride=2, padding=1)
+        self.act = nn.ELU()                       # ELU 比 ReLU 平滑，少 dead neuron
+        # 注意：不用 BatchNorm！RL 的 batch 内样本高度相关，BN 统计量不稳
+        self.pooling = pooling
+        if pooling == "spatial_softmax":
+            self.pool = SpatialSoftmax(base_ch, 8, 8, ssm_temp)
+            feat_dim = base_ch * 2
+        elif pooling == "gap":
+            self.pool = nn.AdaptiveAvgPool2d(1)
+            feat_dim = base_ch
+        else:                                     # flatten
+            feat_dim = base_ch * 8 * 8
+        self.proj = nn.Linear(feat_dim, output_dim) if output_dim else None
+        self.feature_dim = output_dim or feat_dim
+
+    def forward(self, depth):                     # depth: [B, 1, 64, 64]
+        x = self.act(self.conv1(depth))
+        x = self.act(self.conv2(x))
+        x = self.act(self.conv3(x))               # [B, 32, 8, 8]
+        if self.pooling == "spatial_softmax":
+            f = self.pool(x)                      # [B, 64]
+        elif self.pooling == "gap":
+            f = self.pool(x).flatten(1)           # [B, 32]
+        else:
+            f = x.flatten(1)                      # [B, 2048]
+        return self.act(self.proj(f)) if self.proj else f
+\end{codebox}
+
+\begin{insight}[RL 视觉编码器为什么不用 BatchNorm]\label{ins:rlmc-vm-nobn}
+标准视觉任务里 BatchNorm 是标配，但在 RL 视觉编码器里它通常\emph{有害}。两个原因：其一，RL 的 mini-batch 内样本高度相关——同一 rollout 的连续帧几乎一样（机器人走路时相邻帧只差一步），BN 的均值/方差估计不准；其二，BN 在 train/eval 模式切换时行为不一致（train 用 batch 统计、eval 用 running 统计），而 RL 里采样与更新频繁交错，这种不一致会渗进策略行为。推荐改用 LayerNorm（对每个样本独立归一化）或干脆不归一化。这条与 \cref{sec:rlmc-train-wrapper} 讨论的“RL 数据非独立同分布”是同一性质在视觉层的体现。
+\end{insight}
+
+\subsection{时序处理：单帧 depth 不够}
+\label{sec:rlmc-vm-temporal}
+
+单帧 depth 只有空间信息。前视相机有脚下盲区（\cref{sec:rlmc-vm-gap}），机器人走过台阶时，前脚看到边缘、后脚踩上时边缘已出视野——student 必须“记住”看过的地形。三种加时序信息的方法：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+方法 & 实现 & 参数效率 & 时序建模能力 \\
+\midrule
+帧堆叠 & 最近 $N$ 帧拼成 $N$-channel & 低（输入通道 $\times N$） & 有限（只有 $N$ 帧窗口） \\
+帧差分 & 当前帧 $-$ 前一帧 & 高（只 $+1$ channel） & 只有一阶速度 \\
+RNN（GRU/LSTM） & CNN 特征过 RNN & 高（参数与历史长度无关） & 强（理论上无限历史） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+extreme-parkour 用的是 ConvNet + GRU（\cref{paper:rlmc-priv-parkour} 已精读其三阶段管线，这里只补视觉编码视角）：CNN 编码当前帧空间特征，GRU 维护时序记忆。这比帧堆叠更参数高效——帧堆叠把 $N$ 帧堆成 $N$-channel 输入，CNN 要学跨帧对应关系；GRU 则用隐状态\emph{显式}编码“我之前看过什么”。GRU 参数量约为 LSTM 的 $2/3$（无 cell state 与 forget gate），推理更快；对 locomotion 视觉，极少有需要 LSTM 长期记忆的场景，GRU 通常够用。
+
+\begin{pitfall}[GRU 隐状态在 episode reset 时未清零]
+\textbf{错误描述}：episode 结束后 GRU 隐状态没重置。\textbf{现象后果}：新 episode 的第一帧带着上个 episode 末尾的残留记忆，reset 后前几步动作异常。\textbf{根本原因}：GRU 隐状态是跨步携带的，reset 必须同步清。\textbf{正确做法}：在 \verb|env.reset_ids| 时按 \verb|done| mask 清零隐状态；mjlab 与 Isaac Lab 的 RSL-RL runner\,\cite{schwarke2025rslrl} 在标准 rollout 里会自动处理，但你自定义 rollout 循环（如 DAgger，\cref{sec:rlmc-vm-distill}）时必须手动处理。
+\end{pitfall}
+
+\paragraph{常见陷阱与练习。}
+
+\begin{pitfall}[认为“更深的 CNN 总更好”，套用 ResNet-18]
+\textbf{错误描述}：把分类网络的深层骨干（如 ResNet-18）搬来当 depth 编码器。\textbf{现象后果}：算力暴涨，且在真机上反而更差。\textbf{根本原因}：locomotion 的 depth 信息密度远低于 ImageNet——单通道、大部分像素是平坦地面（信息量近零）。深层网络容易过拟合到仿真 depth 的特定噪声模式，迁移到真实 sensor 上退化。\textbf{正确做法}：$2$--$3$ 层 CNN 足以提取台阶边缘与障碍轮廓；先用浅网络跑通，确有必要再加层。
+\end{pitfall}
+
+\begin{practice}[选型与可视化]
+\begin{enumerate}
+\item 计算题：最后一层 $32$ 个 $8\times8$ feature map，分别算 Flatten / GAP / SpatialSoftmax 的输出维度；若后接一个 $128$ 维全连接层，三者参数量各多少？
+\item 选型题：任务是“走平地 + 上下台阶（不需跳跃）”，应选 SpatialSoftmax、GAP 还是 CNN+GRU？给工程理由（提示：是否需要精确起跳时机？）。
+\item 实验题：用 SpatialSoftmax 编码器蒸馏一个 depth 策略，把训练中的关键点坐标叠到 depth 图上可视化。\textbf{验收标准}：关键点应收敛到台阶边缘附近，而非散落在平坦区域；若散落，说明 CNN 没学到（回看 \cref{sec:rlmc-vm-diag} 第 3 层诊断）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{视觉蒸馏管线：在已有框架上补“视觉特有”的环节}
+\label{sec:rlmc-vm-distill}
+
+\textbf{本节解决什么问题}：teacher-student 蒸馏的一般框架、DAgger、MTS、extreme-parkour 三阶段都在 \cref{ch:rlmc-privileged} 讲透了。本节\emph{不重复}，只补当输入换成深度图后多出来的工程环节。
+
+\subsection{为什么仍是“蒸馏”而非端到端视觉 RL}
+\label{sec:rlmc-vm-whydistill}
+
+先用一句话接上 \cref{sec:rlmc-priv-whystages} 的结论：直接用 RL reward 端到端训练 CNN + policy 有三个困难——(1) reward 到 CNN 参数的梯度链太长（reward $\to$ action $\to$ MLP $\to$ CNN 输出 $\to$ CNN 参数），大部分是噪声；(2) CNN 表示的 non-stationarity（CNN 在变、policy 也在变，互相干扰）；(3) 视觉捷径（CNN 优先学任何简单的视觉-reward 相关，而非真正的地形结构）。蒸馏通过\emph{分离}“学控制”（teacher 用完美信息）与“学感知”（student 用视觉恢复信息）来绕开这三点。视觉场景还多一条现实理由：\cref{sec:rlmc-vm-setup} 已说渲染把并行环境数从 4096 砍到几百，端到端 RL 在这么少的样本下更难收敛，而蒸馏的监督信号（teacher 动作）密度远高于稀疏 reward。
+
+\subsection{三阶段管线里“视觉特有”的环节}
+\label{sec:rlmc-vm-stages-vision}
+
+标准三阶段管线（state teacher $\to$ depth student $\to$ 可选 RGB student）的总体结构见 \cref{sec:rlmc-priv-stage1,sec:rlmc-priv-stage2,sec:rlmc-priv-stage3}。下表只标出每个阶段相对盲蒸馏\emph{多出来}的视觉环节——这些才是本章要你动手的地方：
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{1.7cm}p{4.4cm}p{5.6cm}@{}}
+\toprule
+阶段 & 与盲蒸馏相同的部分（见 \cref{ch:rlmc-privileged}） & 视觉特有的新增环节（本章） \\
+\midrule
+Stage 1 & PPO 训 height scan teacher，与 \cref{ch:rlmc-quadloco} 几乎一致 & 无（teacher 不用视觉） \\
+Stage 2 & DAgger（student rollout、teacher 标注）、MTS 防漂移 & 开渲染管线、depth 预处理一致性、CNN+GRU 编码、CNN 学习率独立调小、num\_envs 砍到几百、视觉 DR \\
+Stage 3 & BC + 大量 DR & RGB 渲染、外观 DR（光照/材质/纹理），仅当部署需 RGB 才做 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[视觉蒸馏的瓶颈从“算法”移到了“渲染与预处理一致性”]\label{ins:rlmc-vm-bottleneck}
+盲蒸馏（\cref{ch:rlmc-privileged}）的难点在算法层：DAgger 的分布匹配、MTS 的退火/切换、MSE 与 rollout 的背离。视觉蒸馏把这些\emph{原样继承}，却又压上一层纯工程的瓶颈：渲染要开对（\verb|--enable_cameras|/\verb|MUJOCO_GL|）、depth 预处理要与 teacher 标注时\emph{逐位}一致、CNN 输入要 CHW、GRU 隐状态 reset 要清。这层瓶颈不需要更聪明的算法，只需要更严格的核对——它正是 \cref{ins:rlmc-vm-plumbing} 的具体兑现。一个实用判据：若 student 的 MSE loss 低却 rollout 差，先别怀疑算法（那是 \cref{ins:rlmc-priv-msevsrollout} 的盲蒸馏老问题），\emph{先}存一帧 student 实际看到的 depth 图，确认它和 teacher 标注时看到的是同一套预处理。
+\end{insight}
+
+\subsection{Stage 2 启动前的视觉 checklist}
+\label{sec:rlmc-vm-checklist}
+
+把 \cref{ins:rlmc-vm-plumbing} 落成一张开训前必过的清单（盲蒸馏部分见 \cref{sec:rlmc-priv-warmstart}，这里只列视觉项）：
+
+\begin{codebox}{Stage 2（depth student）开训前视觉核对清单}
+[ ] 渲染开关已开：Isaac Lab --enable_cameras / mjlab MUJOCO_GL=egl
+[ ] 存一帧 student 视角 depth 图 -> 肉眼确认看到地面而非天花板
+[ ] depth 预处理与 teacher 标注时逐位一致（单位/裁剪/归一化/无效像素）
+[ ] CNN 输入是 CHW（permute 已做），shape[1]==1
+[ ] depth obs 挂进了 actor group（不是只在 critic group）
+[ ] GRU 隐状态在 reset 时按 done mask 清零
+[ ] num_envs 已从 teacher 的几千砍到 512-1024（渲染显存/吞吐瓶颈）
+[ ] student 的 MLP 部分从 teacher 复制初始化，CNN+GRU 随机初始化
+\end{codebox}
+
+最后两项各对应一个高发陷阱，单独拎出来讲。
+
+\begin{pitfall}[depth obs 只挂进 critic group，漏挂 actor group]
+\textbf{错误描述}：做非对称 actor-critic（\cref{sec:rlmc-asymmetric}）时习惯把“额外信息”放 critic，顺手把 depth 也只放进了 critic group。\textbf{现象后果}：actor（部署时唯一会跑的网络）根本看不到 depth，等于又训了个盲 student；critic 倒是看得见，loss 曲线还挺好看。\textbf{根本原因}：depth 是 student 的\emph{主感知输入}，必须进 actor；这与 height scan 作为 teacher 的特权信息放 critic 的逻辑正相反。\textbf{正确做法}：确认 depth 在 actor group；打印 actor obs 的维度，核对包含视觉特征。
+\end{pitfall}
+
+\begin{pitfall}[Stage 2 student 的 CNN 随机初始化却直接上 DAgger]
+\textbf{错误描述}：MLP 从 teacher 复制（对），但 CNN 随机初始化后立刻用 student 执行 rollout。\textbf{现象后果}：初期 CNN 输出是噪声 $\to$ MLP 输出噪声动作 $\to$ 机器人立刻摔倒 $\to$ teacher 在“摔倒后无地形信息的场景”上标注，CNN 几乎学不到东西。\textbf{根本原因}：DAgger 要求 student 的 rollout 至少“不灾难”，而随机 CNN 做不到。\textbf{正确做法}：先用 teacher 执行 rollout 做几百 iteration 的离线 BC 热启动 CNN，待 CNN 输出稳定再切到 DAgger（见 \cref{sec:rlmc-priv-warmstart}）。
+\end{pitfall}
+
+\paragraph{UniLab 的对应物：蒸馏骨架在、视觉那条线缺。}这里要把 UniLab 的情况说得比「无对应」更细，因为它\emph{部分}对应。蒸馏\textbf{骨架}在 UniLab 是有的——它原生提供一条\emph{特权 $\to$ 时序适应模块}的蒸馏路径 HORA（in-hand 操作的 RMA 式蒸馏，入口 \verb|scripts/train_hora_distill.py| + \verb|conf/hora_distill/|，算法在 \verb|algos/torch/hora/distill.py| 的 \verb|HoraDistillationTrainer|，\cref{ch:rlmc-privileged} 已详述），非对称 actor-critic 也用 \verb|obs_groups_spec| 的 \verb|{"obs":A,"critic":C}| 两组实现\,\cite{unilab2026}。但本节关心的是 Stage 2 \emph{视觉特有}的那几个环节——开渲染管线、depth obs 挂进 actor group、CNN+GRU 编码、GRU 隐状态 reset——这些在 UniLab \textbf{全部无对应}，根因只有一个：UniLab 当前没有相机 obs（\cref{ins:rlmc-vm-unilab-gap}），没有 depth 这个输入，就谈不上「把 depth 挂进 actor group」或「为 depth student 清 GRU」。HORA 的 student 输入是\emph{本体感知历史}（一维向量），不是图像，所以它复现的是 \cref{ch:rlmc-privileged} 的「盲适应」那条线，而非本章的「视觉蒸馏」那条线。
+
+\begin{codebox}[text]{UniLab：视觉蒸馏 runner——骨架在（HORA），视觉环节无对应}
+% 有：特权→适应模块蒸馏（HORA，本体感知 student），见特权学习章：
+%   uv run train --algo ppo --task sharpa_inhand --sim mujoco --profile hora  # 训特权 teacher
+%   python scripts/train_hora_distill.py task=sharpa_inhand/mujoco            # 蒸馏适应模块 student
+%   机制：冻结 teacher 主干 + obs_normalizer，仅训名字含 "adapt_tconv" 的时序卷积参数。
+% 无：本章 Stage 2 的「视觉特有」环节（均依赖相机 obs，UniLab 当前无）：
+%   - 开 depth 渲染管线               -> 无对应（无相机 obs）
+%   - depth obs 挂进 actor group       -> 无对应（无 depth 这个输入）
+%   - CNN+GRU 视觉编码 + 隐状态 reset  -> 无对应（student 输入是本体感知向量，非图像）
+%   - 通用 DAgger 在线交替（视觉 student）-> 非内置，需自定义 rollout 循环
+\end{codebox}
+
+\begin{practice}[视觉蒸馏的诊断思维]
+\begin{enumerate}
+\item 设计题：你的 depth student MSE loss 很低，但 play 时机器人在台阶前犹豫不前。按 \cref{ins:rlmc-vm-bottleneck} 的判据，列出你\emph{依次}会检查的 3 件事（提示：先查预处理一致性，再查 GRU 记忆，最后才怀疑 teacher 动作方差）。
+\item 跨章综合题：\cref{ch:rlmc-privileged} 的盲 student 蒸馏\emph{不需要} DAgger 也常能工作，本章的 depth student 却几乎必须用 DAgger。为什么？（提示：盲 student 的输入分布与 teacher 高度重叠，视觉 student 的输入分布对自身动作更敏感。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{视觉域随机化：覆盖而非精确}
+\label{sec:rlmc-vm-dr}
+
+\textbf{本节解决什么问题}：DR 的鲁棒优化视角与物理 DR 的事件四模式/分阶段已在 \cref{ch:rlmc-dr} 讲透。本节只补“视觉 DR”——它该覆盖哪些维度、与物理 DR 如何耦合、如何避免过度 DR 破坏可解性。
+
+\subsection{为什么 locomotion 的视觉 DR 与操作不同}
+\label{sec:rlmc-vm-dr-why}
+
+三点关键差异，每一点都简化或改变了 DR 配置。\textbf{其一，depth 是主力模态}：depth 不受光照/材质影响，所以纹理随机化与光照随机化对 depth locomotion \emph{无效}——这大大简化了 DR（不必碰 RGB 那套）。\textbf{其二，相机抖动是常态}：相机装在移动的机器人上持续抖，外参 DR 的范围可以更大，因为真实世界里相机确实在持续变化。\textbf{其三，地形几何 DR 是核心}：台阶高/缺口宽/坡度都需大范围随机化——但这是\emph{物理} DR，在 Stage 1 teacher 训练时就要做（\cref{ch:rlmc-dr}），不算视觉 DR。
+
+\subsection{Depth locomotion 的 DR 维度}
+\label{sec:rlmc-vm-dr-dims}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.6cm}p{3.4cm}p{2.6cm}p{3.0cm}@{}}
+\toprule
+DR 维度 & 随机化内容 & 典型范围 & sim-to-real 帮助 \\
+\midrule
+depth 高斯噪声 & 每像素加 $\mathcal{N}(0,\sigma^2)$ & $\sigma=0.001$--$0.01$\,m & 模拟传感器热噪声 \\
+depth dropout & 随机 $p\%$ 像素置 far & $p=1$--$5\%$ & 模拟深度“空洞” \\
+相机外参扰动 & 位置 $\pm\Delta p$、旋转 $\pm\Delta r$ & $\Delta p=1$\,cm, $\Delta r=2^\circ$ & 覆盖安装误差与运动抖动 \\
+相机内参扰动 & FOV $\pm 5^\circ$ & $\pm 5^\circ$ & 覆盖镜头差异 \\
+深度延迟 & 延迟 $1$--$3$ 帧 & $1$--$3$ 步 & 模拟相机处理延迟 \\
+纹理/光照 & RGB 颜色与光照 & --- & 仅 RGB student（Stage 3） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+真实 depth sensor 的噪声并非简单高斯：它\emph{距离相关}（远处噪声远大于近处，对结构光近似 $\sigma\propto d^2$）、有\emph{边缘飞散}（物体边缘 depth 不可靠）、有\emph{反射面问题}（金属/玻璃返回 $0$ 或 inf）。仿真里完美复现很难，工程做法是用“高斯 + dropout”近似，再靠 DR 的\emph{范围}覆盖真实噪声的不确定性。
+
+\begin{codebox}[Python]{距离相关的 depth 噪声 + dropout}
+def add_depth_noise(depth, base_std=0.003, slope=0.002,
+                    dropout=0.03, near=0.01, far=3.0):
+    """depth: [B,1,H,W] in meters。噪声随距离增大；dropout 像素置 far(不是 0!)。"""
+    std = base_std + slope * depth                 # 远处噪声更大
+    noisy = depth + torch.randn_like(depth) * std
+    keep = torch.rand_like(depth) > dropout
+    noisy = torch.where(keep, noisy, torch.full_like(noisy, far))  # 空洞=无穷远
+    return noisy.clamp(near, far)
+\end{codebox}
+
+\subsection{阶段化 DR 与物理 DR 的耦合}
+\label{sec:rlmc-vm-dr-phased}
+
+阶段化思路与 \cref{sec:rlmc-dr-phased} 的物理 DR 完全同构，只是把维度换成视觉：阶段零\emph{无 DR}（先在完美 depth 上确认蒸馏管线能工作——若完美 depth 都不收敛，加噪声只会更糟）；阶段一\emph{几何 DR}（小范围外参扰动 + 轻微高斯）；阶段二\emph{传感器 DR}（增大高斯 + dropout + $1$--$3$ 帧延迟，这是 sim-to-real 的关键阶段）；阶段三仅在需要 RGB 时做\emph{外观 DR}。若某阶段 DR 导致不收敛，\emph{回退}上一阶段，不要继续堆。
+
+视觉 DR 与物理 DR 的耦合时机有一条明确规则：
+
+\begin{insight}[Stage 1 只用物理 DR，Stage 2--3 同时用物理 DR + 视觉 DR]\label{ins:rlmc-vm-drcouple}
+Stage 1 的 teacher 不用视觉输入，视觉 DR 对它无效，所以只开物理 DR（地形/质量/摩擦）。但 Stage 2 的 student 用视觉——若 Stage 2 只开视觉 DR 而\emph{关掉}物理 DR，student 会过拟合到 teacher 训练时的那一组固定物理参数。正确做法是 Stage 2 蒸馏时\emph{同时}开物理 DR + 视觉 DR：teacher 在随机化物理条件下标注动作，student 在随机化物理 + 随机化视觉下学习。一句话记忆：\textbf{视觉 DR 不是“让仿真更真实”，而是“让策略对视觉条件变化更鲁棒”}——真实世界只是 DR 覆盖分布里的一个点（这与 \cref{ch:rlmc-dr} 的物理 DR 原理同源）。
+\end{insight}
+
+具体到 depth：适度高斯噪声（$\sigma=0.005$\,m）迫使 CNN 忽略传感器噪声、关注地形“大结构”（台阶边缘、缺口轮廓）——这些大结构在真机上同样可见；过度噪声（$\sigma=0.05$\,m）会糊掉大结构，CNN 学不到东西。关键是找到“足够大以覆盖真实噪声、又不大到破坏信号”的甜点。
+
+\subsection{Isaac Lab 的 RGB 外观 DR（仅 Stage 3）}
+\label{sec:rlmc-vm-rgbdr}
+
+若最终需要 RGB student，外观 DR（光照/材质/背景）的工具链是 Isaac Lab 的 Replicator + MDL 材质——可随机化光源强度/色温/位置、地面与障碍的 albedo/roughness/metallic、以及 HDRI 背景。这比 mjlab 的基础颜色替换强得多，是选 Isaac Lab 做 RGB sim-to-real 的主要理由（\cref{ins:rlmc-vm-depthsame}）。VIRAL\,\cite{he2025viral} 正是用 Isaac Lab 的 tiled rendering + 大规模视觉 DR（光照/材质/相机参数/图像质量/sensor 延迟）把 RGB humanoid loco-manipulation 做到零样本 sim-to-real（29-DoF Unitree G1 + RealSense D435i，真机上连续完成多达 54 个 loco-manipulation 周期，已核）。RGB DR 比 depth DR 难得多——depth DR 只处理数值扰动，RGB DR 要处理外观的“质变”（同一场景不同光照下看起来完全不同），这也再次印证了 \cref{ins:rlmc-vm-depthking}「locomotion 优先 depth」。
+
+\begin{codebox}[text]{UniLab：视觉 DR——无对应（有物理 DR，无视觉 DR）}
+% 物理 DR：UniLab 有完整的一套（DomainRandomizationManager + 后端能力声明），见域随机化章：
+%   env.domain_rand: randomize_base_mass / random_com / randomize_kp/kd（reset 项）+
+%                    push_robots（interval 项）；geom_friction 也是 reset 项。
+%   机制：reset 经 build_reset_plan→后端 set_state(randomization=)，后端 get_dr_capabilities() 门控。
+% 视觉 DR：无对应。本节的 depth 高斯噪声 / dropout / 深度延迟 / 相机外参扰动 / RGB 外观 DR
+%   在 UniLab 全部不存在——因为没有相机 obs（本节开头的体系结构洞察），没有「depth 像素」
+%   或「相机外参」这种可随机化的视觉量。相机外参扰动在 UniLab 里既不是物理 DR 项、也无视觉通道承载。
+% 若自行加视觉 DR：需先补相机 obs，再在渲染→obs 桥接处插 depth 噪声/dropout（同 mjlab/Isaac 思路）。
+\end{codebox}
+
+\paragraph{常见陷阱与练习。}
+
+\begin{pitfall}[认为“depth 不需要任何 DR”]
+\textbf{错误描述}：因为 depth 不受光照/材质影响，就不给 depth 加任何 DR。\textbf{现象后果}：仿真里表现完美，一上真机就退化。\textbf{根本原因}：depth 虽不受光照影响，仍受\emph{传感器噪声、外参误差、处理延迟}影响，这些在训练分布之外。\textbf{正确做法}：至少做阶段二的传感器 DR（高斯 + dropout + 延迟）。
+\end{pitfall}
+
+\begin{practice}[设计与验证 depth DR]
+\begin{enumerate}
+\item 设计题：RealSense D435 在 $1$\,m 处 $\sigma\approx 2$\,mm、$3$\,m 处 $\sigma\approx 14$\,mm。据此定出上面 \verb|add_depth_noise| 的 \verb|base_std| 与 \verb|slope|（线性拟合两点），写出数值。
+\item 实验题：训两个 depth student（一个无 DR、一个有高斯+dropout），训练后在 play 时手动注入 $\sigma=0.02$\,m 的噪声，比较二者稳定性。\textbf{预期输出}：有 DR 的明显更稳；无 DR 的步态可能崩。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{多相机策略：解决自我中心视觉的盲区}
+\label{sec:rlmc-vm-multicam}
+
+\textbf{本节解决什么问题}：前视相机看不到脚下（\cref{sec:rlmc-vm-gap}）。怎么补这个盲区？什么时候值得为它多付一个相机的渲染成本？
+
+前视深度相机最大的局限是脚下盲区——机器人看不到正在踩的地面。四种解决方案，按工程代价递增：
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.4cm}p{4.6cm}p{4.4cm}@{}}
+\toprule
+方案 & 做法 & 取舍 \\
+\midrule
+纯前视 + 本体历史 & 只用前视相机，靠 GRU 时序记忆 + 本体感知历史补盲区（extreme-parkour 方案） & 硬件最简；但快速移动时 GRU 可能“忘”掉看过的地形 \\
+前视 + 下视 & 腹部加一个朝下相机，直接看脚下 & 消除盲区、不依赖记忆；但渲染成本翻倍，两路特征需融合 \\
+前视 + 后视 & 背部加朝后相机 & 对 parkour 不必要；对避障/后退有用 \\
+全景深度 & $360^\circ$ 深度传感器 & 完整感知；计算成本极高 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+多相机融合的工程实现一般走“各自 CNN 编码 + 特征拼接”：
+
+\begin{codebox}[Python]{双相机（前视 + 下视）特征级融合}
+class DualCameraEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.front = LocomotionVisualEncoder(1, 32, "gap", output_dim=64)
+        self.belly = LocomotionVisualEncoder(1, 16, "gap", output_dim=32)
+    def forward(self, front_depth, belly_depth):   # 下视可更低分辨率
+        return torch.cat([self.front(front_depth),
+                          self.belly(belly_depth)], dim=-1)  # [B, 96]
+\end{codebox}
+
+\begin{insight}[多相机不是“越多越好”，而是“盲区代价 vs 渲染代价”的权衡]\label{ins:rlmc-vm-multicam}
+加一个相机就把该相机的渲染成本叠加进每一步——而渲染本就是视觉训练的头号瓶颈（\cref{sec:rlmc-vm-setup}）。所以多相机的决策不是感知能力的单调最大化，而是一道权衡题：盲区造成的失败有多严重？是否能用更便宜的手段（GRU 记忆、本体历史）补上？对纯前向的 parkour，extreme-parkour 证明单前视 + GRU 已足够；只有当任务对脚下/侧向地形真正敏感（如侧向障碍、原地转身踩空）时，多付一个相机的渲染代价才划算。近期“超越自我中心局限”的多视角 depth 工作正是在侧向障碍与后方威胁场景下才显出多相机的价值。
+\end{insight}
+
+\begin{pitfall}[双相机融合后性能反降：两路特征尺度不匹配]
+\textbf{错误描述}：把两个 CNN 分支的输出直接拼接送 MLP，不做任何对齐。\textbf{现象后果}：联合训练后性能不升反降。\textbf{根本原因}：两路特征的数值尺度可能差很多（分辨率、通道数不同），MLP 被尺度大的那路主导。\textbf{正确做法}：对两路分别做 LayerNorm 后再拼；或先单独训练每路、再联合微调；第二路相机的 CNN 学习率可调小。
+\end{pitfall}
+
+\begin{practice}[设计一个双相机 obs]
+设计题：机器人有前视（看前方地形）与下视（看脚下）两个深度相机。写出一个把两路 depth 与本体感知融合的 observation group 配置草图，标出各自分辨率与融合点；并说明为什么下视相机可以用更低分辨率（提示：脚下区域小、距离近）。
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{视觉 Sim-to-Real 与部署}
+\label{sec:rlmc-vm-sim2real}
+
+\textbf{本节解决什么问题}：depth student 在仿真里训好了，怎么搬到真机？真实 depth sensor 与仿真 depth 差在哪？延迟预算怎么算？（部署的通用 ONNX 边界见 \cref{sec:rlmc-priv-onnx}，本节补视觉特有的预处理一致性、外参标定与异步架构。）
+
+\subsection{真实 depth sensor 的特性与预处理一致性}
+\label{sec:rlmc-vm-realdepth}
+
+真实 sensor（RealSense D435/D435i、Orbbec Astra 等）与仿真“完美 depth”的差异，大多已被前面的 DR（\cref{sec:rlmc-vm-dr}）覆盖；但有两类\emph{系统性}差异 DR 覆盖不了，必须靠标定与一致的预处理消除：单位/裁剪/归一化的预处理链，以及相机外参。
+
+预处理一致性是 sim-to-real 失败的头号根因，没有之一。部署侧的 depth 预处理\emph{每一步}都必须与训练时\emph{逐位}相同：
+
+\begin{codebox}{真机 depth -> 策略输入：每步必须与训练一致}
+RealSense D435i: uint16, 640x480, 单位 mm
+  -> float32, 单位 m (/1000.0)         # 训练时若是 m，这步绝不能漏
+  -> 裁剪到 [0.01, 3.0] m              # 必须与训练预处理的 near_clip/far_clip 逐位一致（本章默认 0.01/3.0）
+  -> 降采样到训练分辨率 (如 64x64)      # 插值方式与训练一致
+  -> 归一化 (depth-near)/(far-near)    # 公式与 \eqref{eq:rlmc-vm-norm} 一致
+  -> 输入 CNN
+\end{codebox}
+
+\begin{pitfall}[部署时 \texttt{uint16}$\to$\texttt{float32} 后忘记 clip，值域溢出]
+\textbf{错误描述}：RealSense 输出 \verb|uint16|（$0$--$65535$），除以 $1000$ 后值域是 $0$--$65.535$\,m，直接送 CNN。\textbf{现象后果}：训练时归一化假设的范围是预处理的 \verb|far_clip|（本章默认 $0.01$--$3.0$\,m），超出 \verb|far_clip| 的值（天空、远墙）让 CNN 看到完全偏离训练的输入分布，行为异常。\textbf{根本原因}：忘了在归一化前把超出 \verb|far_clip| 的值 clip 掉。\textbf{正确做法}：严格按上面的链路，先 clip 到 $[near, far]$ 再归一化。
+\end{pitfall}
+
+\subsection{外参标定与对齐}
+\label{sec:rlmc-vm-extrinsics}
+
+DR 覆盖的是“随机性”（小幅外参抖动、传感器噪声），\emph{不}覆盖“系统性偏差”（相机装错位置、用错内参）。后者必须标定消除。若仿真里相机在 \verb|(0.3, 0, 0.05)| 朝前，真机安装位置偏差 $>2$\,cm 或朝向偏差 $>5^\circ$，地形感知就会产生系统性偏移。验证方法很直接：把真机放在已知简单场景（如正前方 $1$\,m 一面白墙、或一个台阶前 $1$\,m），在仿真里复现同样的机器人状态与场景，对比两张 depth 图——白墙/台阶边缘在图像中的位置应一致；不一致就调仿真相机外参（或修正真机安装）直到匹配。VIRAL\,\cite{he2025viral} 把这一步称作 real-to-sim 相机对齐，是其零样本迁移成功的关键工程之一。
+
+\subsection{延迟预算与异步部署架构}
+\label{sec:rlmc-vm-latency}
+
+视觉策略的部署延迟比盲策略多了“渲染/采集 + CNN 推理”两段。把链路逐段累加：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+环节 & 典型耗时 & 累积延迟 \\
+\midrule
+depth 采集 & $10$--$33$\,ms（$30$--$90$\,Hz） & $10$--$33$\,ms \\
+USB/网络传输 & $1$--$5$\,ms & $11$--$38$\,ms \\
+预处理（降采样+归一化） & $0.5$--$1$\,ms & $11.5$--$39$\,ms \\
+CNN + GRU 推理 & $1$--$3$\,ms(GPU)/$5$--$15$\,ms(CPU) & $12.5$--$54$\,ms \\
+MLP 推理 & $0.1$\,ms & $12.6$--$54$\,ms \\
+动作下发到电机 & $0.5$--$1$\,ms & $13$--$55$\,ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+总延迟 $13$--$55$\,ms，对 $50$\,Hz 控制（$20$\,ms/步）可能超过一个步长。三个对策：(1) CNN 与电机控制\emph{异步}执行；(2) 训练时加 $1$--$3$ 帧延迟 DR（\cref{sec:rlmc-vm-dr}）让策略学会在延迟下工作；(3) 用 ONNX + TensorRT 加速推理（边界见 \cref{sec:rlmc-priv-onnx}）。异步架构是核心：
+
+\begin{insight}[异步 CNN（低频）+ 同步 MLP（高频）：用“地形变化慢”换控制频率]\label{ins:rlmc-vm-async}
+关键观察是两条链路的更新需求\emph{不同}：MLP 要 $50$\,Hz（步态控制对延迟敏感），但 CNN 不必——地形几何在 $33$--$66$\,ms 内变化不大。于是把它们拆到两个线程：高频线程（$50$\,Hz）只跑 MLP（$\sim 0.1$\,ms），读最新本体感知 + 最新可用的 CNN 特征，立即出动作；低频线程（$15$--$30$\,Hz）跑 CNN+GRU，把视觉特征写进共享缓冲。代价是视觉信息有 $1$--$2$ 帧延迟——而这\emph{恰好}与训练时的延迟 DR 一致，策略已经学会在这种延迟下工作。extreme-parkour 真机部署正是这种异步：按论文（arXiv:2309.14341，\S4.1），depth backbone 与 base policy 同跑在 Jetson NX 上、经 UDP 通信，depth backbone 约 $10$\,Hz、base policy 约 $50$\,Hz（Intel RealSense D435 输出约 $10\pm 2$\,Hz），并人为强制一个恒定 $0.08$\,s 的 depth 延迟以抑制抖动。
+\end{insight}
+
+\begin{codebox}[Python]{异步部署：高频 MLP + 低频 CNN（结构示意）}
+# Thread 1 (50 Hz): 只跑 MLP —— 读最新 proprio + 最新 CNN 特征 -> action -> 电机
+# Thread 2 (15-30 Hz): 跑 CNN+GRU —— 读最新 depth -> visual_feature -> 写共享缓冲
+# 两线程通过一个带锁的 shared buffer 交换 visual_feature；
+# episode 结束时 Thread 2 清零 GRU 隐状态（见 CNN+GRU 那节的 reset 陷阱）。
+\end{codebox}
+
+\subsection{真机首跑的紧急诊断顺序}
+\label{sec:rlmc-vm-firstrun}
+
+视觉策略真机首跑几乎不会立刻正常。按优先级排序（每步几分钟）：(1) 不加载策略，用正弦关节命令确认电机链路正常——不动则问题在通信层；(2) 存一帧真机 depth 可视化，确认内容合理、值域在预期范围、无大片无效像素；(3) 把真机放进已知简单场景，对比 sim vs real depth——值域/物体位置差异显著说明预处理不一致或外参偏差；(4) 若可能，在真机上跑 height scan teacher（需外部地形信息）——teacher 行 student 不行则问题在 CNN 的 sim-to-real gap，teacher 也不行则问题在物理层。
+
+\begin{practice}[延迟预算计算]
+工程题：控制频率 $50$\,Hz（$20$\,ms 预算），CNN 推理实测 $10$\,ms。若采用同步架构（CNN 与 MLP 串行），留给“采集 + 传输 + 预处理 + MLP + 下发”的时间还剩多少？据此论证为什么需要异步架构。
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{视觉策略诊断：五层流程}
+\label{sec:rlmc-vm-diag}
+
+\textbf{本节解决什么问题}：视觉策略不工作时，失败可能在管线任何一环。系统性的分层诊断是定位问题的唯一可靠方法。
+
+视觉策略的调试比盲策略难得多——盲策略的失败大多在算法/奖励层，视觉策略却可能在渲染、预处理、CNN、蒸馏、sim-to-real 任意一层失败。核心纪律：\textbf{从粗到细，逐层排除，不跳层}。每一层都有明确的“看什么”和“不过怎么办”：
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.2cm}p{4.2cm}p{5.0cm}@{}}
+\toprule
+诊断层 & 看什么（耗时） & 不过怎么办 \\
+\midrule
+1 任务可行性 & height scan teacher 的 episode length 达标？（$5$\,min） & 不过则问题在奖励/地形，不是视觉——回 \cref{ch:rlmc-quadloco} \\
+2 渲染正确性 & 存一帧 depth，地形清晰可见、值域合理？（$5$\,min） & 查 \verb|--enable_cameras|、\verb|clipping_range|、相机朝向（\cref{sec:rlmc-vm-camera}） \\
+3 CNN 学习 & conv 第一层梯度范数 $>0$？feature\_std 随训练增大？MSE 在降？（$500$ iter） & 查 CNN 学习率、depth 预处理、depth 是否进 actor group（\cref{sec:rlmc-vm-encoder}） \\
+4 蒸馏质量 & student episode length 达 teacher 的 $60\%$+？步态合理？关键点在边缘？（$2$k iter） & 查 DAgger vs 离线 BC、MTS 退火、GRU reset（\cref{sec:rlmc-vm-distill}） \\
+5 sim-to-real & 真机 depth 与仿真相似？简单地形行为正常？（部署时） & 查外参标定、预处理一致性、延迟预算（\cref{sec:rlmc-vm-sim2real}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[跳过前层直接查后层是视觉调试最大的时间浪费]\label{ins:rlmc-vm-fivelayer}
+一个反复出现的反模式：student 表现差，工程师立刻去调 CNN 架构、加层、换池化（第 3--4 层）。但若第 1 层都没过（height scan teacher 本身就不行），再好的 CNN 也救不了——因为 teacher 的性能是 student 的\emph{上限}（\cref{ins:rlmc-vm-perception}）；若第 2 层没过（相机看的是天花板），CNN 是在无意义输入上训练，调架构毫无意义。所以纪律是：永远\emph{先}确认 height scan teacher 行（第 1 层），\emph{再}确认渲染对（第 2 层），\emph{再}查 CNN 学习（第 3 层）……每一层都用几分钟的肉眼/打印级检查，比盲目调架构高效一个数量级。这正是 \cref{ins:rlmc-vm-plumbing} 在调试阶段的兑现。
+\end{insight}
+
+\subsection{关键诊断工具：可视化 CNN 在看什么}
+\label{sec:rlmc-vm-vizcnn}
+
+最强的视觉调试工具是“看 CNN 关注哪里”。用 SpatialSoftmax 时，把关键点叠到 depth 图上——它们应落在地形边缘附近，若散落在平坦区域，说明 CNN 没学到有用特征。不用 SpatialSoftmax（如 extreme-parkour 的 flatten + GRU）时，用 Grad-CAM 看 CNN 对某个动作维度梯度大的区域：
+
+\begin{codebox}[Python]{诊断信号：训练中应记录的视觉健康指标}
+metrics = {
+    "distill/mse_loss":      mse.item(),          # 应持续下降
+    "cnn/conv1_grad_norm":   g1.norm().item(),    # 应 >0 且稳定；=0 -> CNN 没连上
+    "cnn/feature_std":       feat.std().item(),   # 应随训练增大；恒≈0 -> CNN 没学
+    "policy/episode_length": ep_len.mean().item(),# 应逐步接近 teacher
+}
+\end{codebox}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+指标 & 正常 & 异常信号 & 可能原因 \\
+\midrule
+\verb|mse_loss| & 持续下降 & 降后反弹 & CNN 学习率太大 / 过拟合 \\
+\verb|conv1_grad_norm| & $>0$ 稳定 & 恒为零 & depth 没连进 obs / CNN 被冻结 \\
+\verb|feature_std| & 逐步增大 & 恒近零 & CNN 没学到 / depth 是常数 \\
+\verb|episode_length| & 逐步增大 & 持平或下降 & DAgger 分布漂移 / DR 太强 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{两个最易混淆的失败模式}
+\label{sec:rlmc-vm-failmodes}
+
+\textbf{失败模式一：MSE loss 低但 episode length 不增长。}最常见也最迷惑。student 在训练数据上完美模仿了 teacher（MSE 低），实际执行却差（episode 短）。根因依优先级排查：(1) 执行时状态分布与训练分布不同——用了离线 BC 而非 DAgger，切到 DAgger；(2) teacher 在关键状态动作方差大（台阶边缘有多种等效最优动作，student 学了“平均动作”）——改用 L1 loss；(3) GRU 记忆不足——增大 hidden size。这正是 \cref{ins:rlmc-priv-msevsrollout} 在视觉场景的具体形态，但要先按 \cref{ins:rlmc-vm-bottleneck} 排除预处理不一致。
+
+\textbf{失败模式二：student 平地正常、障碍前摔倒。}根因：(1) CNN 没看到障碍——\verb|far_clip| 太小（远处障碍被截）或相机视角太低（障碍在图像顶部被截），存障碍前 $1$\,m 的 depth 图确认障碍可见；(2) 看到了但没学到——训练地形障碍类型不够多样，用 Grad-CAM 确认 CNN 是否关注障碍区域；(3) 学到了但时机不对——GRU 对“还有多远到障碍”估计不准，play 中逐帧打印 CNN 关键特征看接近障碍时是否有显著变化。
+
+\paragraph{常见陷阱与练习。}
+
+\begin{pitfall}[play 诊断时忘了 GRU 需要“热身”]
+\textbf{错误描述}：play 时 GRU 隐状态从零开始，看前几步动作异常就判定策略坏了。\textbf{现象后果}：误删好策略，或瞎调参。\textbf{根本原因}：GRU 隐状态从零起步时还没积累地形记忆，前几步本就该“热身”——这\emph{不是} bug。\textbf{正确做法}：评估时让机器人先在平地走 $20$--$30$ 步热身，再进复杂地形；这与真机部署时的行为一致。
+\end{pitfall}
+
+\begin{practice}[把诊断跑成一条曲线]
+\begin{enumerate}
+\item 实验题：对训好的 depth student 做 latency injection——分别注入 $0/1/3/5$ 帧延迟，记录 episode length，画延迟--性能曲线。\textbf{验收标准}：能指出“性能悬崖”出现在哪个延迟值；据此反推训练时延迟 DR 是否够。
+\item 诊断题：student 的 \verb|conv1_grad_norm| 一直是零。按上表，列出 2 个可能原因和各自的一行验证命令。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{前沿替代：从自训练 CNN 到 Foundation Model}
+\label{sec:rlmc-vm-frontier}
+
+\textbf{本节解决什么问题}：自训练小 CNN（$2$--$3$ 层）是当前标准，但预训练 Foundation Model（DINOv2、ViT）能否提供更好的视觉特征？这对工程管线意味着什么？（与 \cref{sec:rlmc-priv-frontier} 的特权学习前沿互补。）
+
+当前标准管线用从零训练的小 CNN——权重完全由蒸馏 loss 塑造，在目标任务上高效，但有两个局限：迁移性差（换地形可能要重新蒸馏）、语义理解缺失（只学到与当前 reward 相关的几何特征，不懂“这是台阶 vs 这是裂缝”的语义）。Foundation Model（如 DINOv2\,\cite{oquab2024dinov2}）在大规模数据上预训练，学到了通用视觉特征（几何、语义、深度估计），可能无需蒸馏就直接用于 locomotion。工程代价对比：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & 自训练 $2$ 层 CNN & DINOv2 ViT-S（frozen） \\
+\midrule
+参数量 & $\sim 50$K & $\sim 22$M（frozen，不占梯度显存） \\
+推理时间 & $\sim 0.5$\,ms & $\sim 5$--$10$\,ms \\
+输入分辨率 & 任意（如 $64\times64$） & 固定 $224\times224$（需 resize） \\
+训练时间 & 需完整蒸馏（$12$--$24$\,h） & 只训 MLP 头（$2$--$4$\,h） \\
+特征质量 & task-specific，对当前任务最优 & 通用，可能不如 task-specific \\
+泛化性 & 差（换任务需重训） & 好（通用特征） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[locomotion 不是 ImageNet：小 CNN 仍是 depth-only 的最优解]\label{ins:rlmc-vm-fm}
+DINOv2 在 ImageNet 上的特征质量碾压 $2$ 层 CNN——但 locomotion 的 depth 图\emph{不是} ImageNet：它只有一个通道（不是 $3$ 通道 RGB）、分辨率常只有 $64\times64$（不是 $224\times224$）、关键信息是几何边缘（不是纹理/语义）。在这种条件下，task-specific 小 CNN 通过蒸馏学到的特征往往比 DINOv2 的通用特征更\emph{有效}，且更小更快更易部署。Foundation Model 的价值主要在三类场景：需要语义理解（区分可通行草地 vs 不可通行水面）、需要跨任务泛化（一个 encoder 服务 locomotion + manipulation + navigation）、RGB sim-to-real（DINOv2 在真实图像上预训练，特征对光照/材质本就鲁棒，可能减少对 RGB DR 的依赖）。结论：不要因为“Foundation Model 很热门”就盲目替换已经工作良好的 depth 小 CNN 管线。
+\end{insight}
+
+\begin{pitfall}[DINOv2 的输入约束：$3$ 通道 $224\times224$]
+\textbf{错误描述}：把单通道 depth \verb|[B,1,64,64]| 直接喂 DINOv2。\textbf{现象后果}：维度/通道不匹配报错，或勉强跑但渲染成本暴涨。\textbf{根本原因}：DINOv2 期望 RGB \verb|[B,3,224,224]|。\textbf{正确做法}：把 depth 复制为 $3$ 通道并 resize 到 $224\times224$——但这引入插值误差，且 $224\times224$ 渲染成本远高于 $64\times64$，务必确认在部署延迟预算（\cref{sec:rlmc-vm-latency}）内。另注：Meta 官方的 DINOv2 加载方式是 \verb|torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')|（ViT-S/14，patch 14、embed 384）；torchvision 并\emph{不}提供 \texttt{vit\_small\_patch14\_dinov2}+\texttt{pretrained} 这种写法，要走 timm/HF 则用模型名 \texttt{vit\_small\_patch14\_dinov2.lvd142m}（\verb|timm.create_model(name, pretrained=True)|，权重托管在 HuggingFace \texttt{timm/} 命名空间）——别把这三套加载路径的名字混用。
+\end{pitfall}
+
+\paragraph{向前预告。}Foundation Model 在 locomotion 中的应用是 2025--2026 的前沿：有用 Mamba 替代 CNN+GRU 的序列建模新范式，也有部署前用真实场景 3D 重建做 test-time training 的快速适应方法。这些都超出本章范围，但它们的工程基础（depth 预处理、teacher-student 管线、视觉 DR）与本章\emph{完全相同}——掌握了本章管线，就具备了理解与实现这些前沿方法的能力。
+
+\begin{practice}[何时该上 Foundation Model]
+判断题：下面三个任务，哪些值得考虑 DINOv2、哪些应坚持小 CNN？给理由。(a) 四足在仓库地面 depth-only 走台阶；(b) 区分草地（可走）与水面（不可走）的室外导航；(c) 一个视觉 encoder 同时服务 locomotion 与 manipulation。
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{常见误解汇总}
+\label{sec:rlmc-vm-myths}
+
+把全章散落的概念误区集中成一张表，便于查阅。每条都对应正文某节的详细论证。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.2cm}p{6.4cm}@{}}
+\toprule
+误解 & 正解（详见） \\
+\midrule
+视觉 $=$ RGB & locomotion 以 depth 为主力；RGB 仅在需语义时引入（\cref{ins:rlmc-vm-depthking}） \\
+视觉策略一定比盲策略好 & 简单地形上视觉引入噪声反而可能更差；视觉扩展的是地形复杂度上限（\cref{sec:rlmc-vm-blind}） \\
+depth student 应追平 height scan teacher & 信息损失使 student 低 $20\%$--$40\%$ 属正常；几乎追平要怀疑特权泄漏（\cref{sec:rlmc-vm-paradigmgap}） \\
+Isaac Lab 渲染一定比 mjlab 好 & depth-only 任务两者 depth 质量无本质差别；RTX 优势在 RGB（\cref{ins:rlmc-vm-depthsame}） \\
+更深的 CNN 总更好 & locomotion depth 信息密度低，$2$--$3$ 层够用，深网易过拟合噪声（\cref{sec:rlmc-vm-encoder}） \\
+MSE 低就说明蒸馏成功 & MSE 低只说明训练分布上模仿得好；要在多地形看 episode length（\cref{ins:rlmc-vm-bottleneck}） \\
+depth 不需要任何 DR & depth 不受光照影响，但仍受传感器噪声/外参/延迟影响（\cref{sec:rlmc-vm-dr}） \\
+Foundation Model 一定比小 CNN 好 & locomotion 不是 ImageNet；task-specific 小 CNN 在 depth-only 上常更优（\cref{ins:rlmc-vm-fm}） \\
+配相机漏 \texttt{--enable\_cameras} 会黑屏但能跑 & 当前 Isaac Lab 直接抛 RuntimeError 退出（\cref{sec:rlmc-vm-setup}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{本章小结}
+\label{sec:rlmc-vm-summary}
+
+本章给机器人装上“眼睛”，把运动控制从“盲反应”推进到“视觉预测”。核心是一条认知：视觉运控的难点不在算法（蒸馏框架沿用 \cref{ch:rlmc-privileged}），而在\emph{视觉链路每一环的正确性}——相机朝向、depth 预处理、CNN 输入布局、GRU reset、预处理一致性，任一环静默出错都会让 CNN 在无意义输入上训练。
+
+\paragraph{术语速查。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 一句话定义 \\
+\midrule
+Egocentric depth & 装在机器人上的前视深度相机，可部署但有脚下盲区 \\
+Height scan & 仿真特权地形扫描（射线测高），teacher 用、不可部署 \\
+TiledCamera & Isaac Lab 把多环境相机拼到一张 framebuffer 的并行渲染组件 \\
+\verb|distance_to_image_plane| & 像素到相机平面的 Z 投影距离，$(B,H,W,1)$ float32 \\
+SpatialSoftmax & 取 feature map 每 channel 的期望坐标，保留位置、丢纹理 \\
+GAP & Global Average Pooling，空间维取平均，平移不变、丢位置 \\
+视觉 DR & 对 depth 加噪声/dropout/延迟、对相机扰外参，覆盖真实 sensor 不确定性 \\
+异步推理架构 & 高频 MLP + 低频 CNN，用“地形变化慢”换控制频率 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 盲策略只能反应、视觉能预测，视觉扩展地形复杂度上限 & \cref{sec:rlmc-vm-why} & 中 \\
+2 & depth 是 locomotion 性价比最高的模态 & \cref{ins:rlmc-vm-depthking} & 中 \\
+3 & height scan（特权）vs egocentric depth（可部署）的信息落差 & \cref{sec:rlmc-vm-twoparadigm} & 中 \\
+4 & 视觉蒸馏本质是迁移感知能力，动作模仿是代理任务 & \cref{ins:rlmc-vm-perception} & 高 \\
+5 & TiledCamera 配置 + 四元数 $(w,x,y,z)$ + 坐标系约定 & \cref{sec:rlmc-vm-camera} & 中 \\
+6 & 分辨率--吞吐--精度三角权衡，$64\times64$ 多数够用 & \cref{sec:rlmc-vm-resolution} & 中 \\
+7 & depth 五步预处理 + HWC/CHW + 无效像素置 far & \cref{sec:rlmc-vm-preprocess} & 中 \\
+8 & CNN 编码器选型：Flatten/GAP/SpatialSoftmax & \cref{sec:rlmc-vm-encoder} & 高 \\
+9 & RL 视觉编码器不用 BatchNorm & \cref{ins:rlmc-vm-nobn} & 中 \\
+10 & 时序处理：帧堆叠/帧差分/GRU，GRU reset 必清零 & \cref{sec:rlmc-vm-temporal} & 高 \\
+11 & 视觉蒸馏瓶颈从算法移到渲染/预处理一致性 & \cref{ins:rlmc-vm-bottleneck} & 高 \\
+12 & depth obs 必须进 actor group（与 height scan 进 critic 相反） & \cref{sec:rlmc-vm-distill} & 中 \\
+13 & 视觉 DR 维度 + 距离相关噪声 + 阶段化 & \cref{sec:rlmc-vm-dr} & 高 \\
+14 & Stage 1 只物理 DR，Stage 2--3 物理 + 视觉 DR & \cref{ins:rlmc-vm-drcouple} & 中 \\
+15 & 多相机是盲区代价 vs 渲染代价的权衡 & \cref{sec:rlmc-vm-multicam} & 中 \\
+16 & 视觉 sim-to-real：预处理一致性 + 外参标定 + 延迟预算 & \cref{sec:rlmc-vm-sim2real} & 中 \\
+17 & 异步 CNN + 同步 MLP 部署架构 & \cref{ins:rlmc-vm-async} & 中 \\
+18 & 五层诊断：任务 $\to$ 渲染 $\to$ CNN $\to$ 蒸馏 $\to$ sim2real & \cref{sec:rlmc-vm-diag} & 高 \\
+19 & Foundation Model vs 小 CNN，各有适用场景 & \cref{ins:rlmc-vm-fm} & 中 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{四个核心心智模型。}\textbf{其一，特权 $\to$ 可部署的渐进降级}：三阶段管线从最好的输入逐步降到部署可用的输入，每次降级靠蒸馏传递能力。\textbf{其二，感知与控制的分离}：teacher 用完美信息学控制、student 用视觉学感知，分离后各自更简单。\textbf{其三，DR 覆盖而非 DR 精确}：视觉 DR 不需精确模拟真实 sensor，只需覆盖其可能出现的情况。\textbf{其四，五层诊断从粗到细}：先查任务可行性、再查渲染、再查 CNN、再查蒸馏、最后查 sim-to-real，跳层是浪费时间。
+
+本章的视觉运控能力将在后续持续发挥作用：loco-manipulation 需同时用视觉感知地形与操作物体（\cref{ch:rlmc-imitation} 的模仿管线 + 本章的视觉感知），humanoid 全身控制中的视觉 parkour 直接复用本章三阶段管线（\cref{ch:rlmc-humanoidloco}），区别只在动作维度更高、平衡约束更严。
+
+% ════════════════════════════════════════════════════════════════
+\section{延伸阅读}
+\label{sec:rlmc-vm-further}
+
+下面按“先经典范式、再工程标杆、后大规模前沿”的顺序给出阅读路径。extreme-parkour 的三阶段已在 \cref{paper:rlmc-priv-parkour} 精读，这里只补视觉视角的代表工作。
+
+\begin{paper}[Egocentric Vision Locomotion（Agarwal 等，CoRL 2022）]\label{paper:rlmc-vm-agarwal}
+\textbf{问题}：四足在复杂地形上 locomotion，能否只用一个廉价前视 depth 相机替代昂贵 LiDAR？\textbf{核心思想}：height scan teacher 蒸馏到单前视 depth student，CNN 编码 depth + 本体感知历史补盲区。\textbf{关键结果}：首次证明单个前视 depth 相机足以支撑复杂地形 locomotion，奠定第三代范式\,\cite{agarwal2023legged}。\textbf{与本书关系}：本章 \cref{sec:rlmc-vm-evolution} 第三代的开端；其 CNN + 本体历史的盲区补偿思路贯穿 \cref{sec:rlmc-vm-multicam}。\textbf{局限}：前视盲区、单相机对侧向障碍弱。
+\end{paper}
+
+\begin{paper}[VIRAL：大规模视觉 Sim-to-Real（He 等，arXiv:2511.15200，2025）]\label{paper:rlmc-vm-viral}
+\textbf{问题}：humanoid loco-manipulation 的视觉策略能否纯仿真训练、零样本迁移真机？\textbf{核心思想}：privileged 状态 teacher（delta action + 参考状态初始化）经 tiled rendering 大规模蒸馏到视觉 student，混合 online DAgger + BC，配大规模视觉 DR + real-to-sim 相机/手对齐。\textbf{关键结果}：$29$-DoF Unitree G1 + RealSense D435i，真机上连续完成多达 $54$ 个 loco-manipulation 周期（论文原文 “up to 54 cycles”，非 $54/59$ 试验成功率）；算力是关键（扩到 $\le 64$ GPU 才可靠，低算力常失败）\,\cite{he2025viral}（已核）。\textbf{与本书关系}：本章 \cref{sec:rlmc-vm-rgbdr,sec:rlmc-vm-extrinsics} 的工业级范例；其 delta action 思想与 \cref{ch:rlmc-imitation} 相通。\textbf{局限}：算力门槛极高、目标是 loco-manipulation 而非纯 locomotion。
+\end{paper}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.6cm}p{5.8cm}@{}}
+\toprule
+资料（简称 + 出处） & 一句话教什么 \\
+\midrule
+Lee 等 2020「四足挑战地形」(Science Robotics)\,\cite{lee2020quadruped} & height scan teacher $\to$ 盲 student 的经典两阶段范式（第二代标杆） \\
+Miki 等 2022「ANYmal 感知运动控制」(Science Robotics)\,\cite{miki2022perceptive} & 本体 + 外感受融合的感知 locomotion，depth 为主外感受 \\
+extreme-parkour（\cref{paper:rlmc-priv-parkour}，arXiv:2309.14341） & 三阶段 depth parkour 工程实现：ConvNet+GRU + waypoint reward + MTS \\
+Levine 等 2016「端到端视觉运动策略」(JMLR)\,\cite{levine2016visuomotor} & SpatialSoftmax 的原始出处 \\
+Ross 等 2011 DAgger (AISTATS)\,\cite{ross2011dagger} & 蒸馏管线的理论基础：把模仿学习归约为无悔在线学习 \\
+DINOv2（\cite{oquab2024dinov2}，TMLR 2024） & 无监督预训练的通用视觉特征，Foundation Model 替代方案的代表 \\
+Isaac Lab Tiled Rendering 官方文档 & \texttt{TiledCameraCfg} 配置与 \texttt{distance\_to\_image\_plane} 语义 \\
+mjlab \texttt{CameraSensorCfg}（\texttt{mjlab.sensor}）/ 官方文档 & MuJoCo Warp batch renderer 的相机传感器配置（rgb/depth/segmentation）参考 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{故障排查手册}
+\label{sec:rlmc-vm-trouble}
+
+按“症状 $\to$ 可能原因 $\to$ 排查步骤 $\to$ 相关节”组织。先按 \cref{sec:rlmc-vm-diag} 定位到层，再用本表定位到具体项。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.4cm}p{3.0cm}p{3.8cm}p{1.6cm}@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+启动即 RuntimeError（相机相关） & 漏 \verb|--enable_cameras| & 检查启动命令含该标志 & \cref{sec:rlmc-vm-setup} \\
+depth 图全黑/能跑无内容 & 相机朝向或裁剪错 & 可视化 frustum；查 \verb|clipping_range|、\verb|OffsetCfg.rot| & \cref{sec:rlmc-vm-camera} \\
+depth 看到天花板而非地面 & convention 或 rot 配错 & 确认 \verb|convention="ros"|；查四元数 $(w,x,y,z)$ & \cref{sec:rlmc-vm-tiledcam} \\
+CNN 第一层梯度为零 & depth 没连进 obs & 查 obs group；打印 \verb|conv1| 梯度；确认 depth 在 actor & \cref{sec:rlmc-vm-encoder} \\
+\verb|feature_std| 恒近零 & depth 预处理错（全常数） & 打印 depth \verb|min/max/mean|；查归一化与单位 & \cref{sec:rlmc-vm-preprocess} \\
+MSE loss 不收敛 & CNN 学习率太大/预处理错 & 降 CNN lr；可视化预处理后 depth；核对 teacher 标注 & \cref{sec:rlmc-vm-distill} \\
+MSE 低但 episode 短 & 分布不匹配/离线 BC & 切 DAgger；先排除预处理不一致；查 teacher 动作方差 & \cref{sec:rlmc-vm-failmodes} \\
+平地正常、障碍前摔 & GRU 记忆不足/看不到障碍 & 增大 GRU hidden；查 \verb|far_clip|；Grad-CAM 诊断 & \cref{sec:rlmc-vm-failmodes} \\
+步态突然抖动 & SpatialSoftmax 关键点跳变 & 增大温度 $\tau$；可视化关键点；加 action\_rate & \cref{sec:rlmc-vm-encoder} \\
+GRU reset 后动作异常 & 隐状态未清零 & 在 \verb|reset_ids| 按 done mask 清零 & \cref{sec:rlmc-vm-temporal} \\
+真机 depth 策略退化 & 预处理不一致/外参未标定 & 对比 sim vs real depth；核对归一化；标定外参 & \cref{sec:rlmc-vm-sim2real} \\
+真机首跑全摔 & student CNN 噪声/MLP 未初始化 & 先离线 BC 热启动；查 student MLP 是否复制自 teacher & \cref{sec:rlmc-vm-distill} \\
+训练吞吐极低 & 分辨率太高/envs 太多 & 降到 $32\times32$；减 num\_envs；用 performance 渲染模式 & \cref{sec:rlmc-vm-resolution} \\
+延迟测试崩溃 & 训练时延迟 DR 不足 & 增大 \verb|depth_delay_frames| & \cref{sec:rlmc-vm-dr} \\
+关键点全聚在图像中心 & $\tau$ 太大/CNN 没学 & 减小 $\tau$；确认 CNN 有梯度；增训练步 & \cref{sec:rlmc-vm-encoder} \\
+ONNX 导出后行为不同 & 动态 shape/GRU 兼容性 & 对比 PyTorch 与 ONNX 输出；固定 batch；展开 GRU & \cref{sec:rlmc-vm-sim2real} \\
+双相机融合后反降 & 两路特征尺度不匹配 & 各路 LayerNorm；减第二路 CNN lr；先单训再联合 & \cref{sec:rlmc-vm-multicam} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{版本信息速查}
+\label{sec:rlmc-vm-versions}
+
+下表汇总本章涉及的关键 API/版本要点（截至 2026-06 核对）。标 \pz{} 者为未逐字确认、需以当前版本为准。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{4.0cm}p{8.0cm}@{}}
+\toprule
+要点 & 说明 \\
+\midrule
+Isaac Lab depth 输出 & \verb|distance_to_image_plane| 返回 $(B,H,W,1)$ \verb|float32|；\verb|depth| 是其别名（已核） \\
+Isaac Lab height scanner & \verb|attach_yaw_only| 自 v2.1.1 弃用，改用 \verb|ray_alignment="yaw"|（已核，详见 \cref{ch:rlmc-quadloco}） \\
+Isaac Lab 相机开关 & 配相机必带 \verb|--enable_cameras|，否则相机初始化抛 RuntimeError（已核） \\
+Isaac Lab 四元数（配置类） & \verb|OffsetCfg.rot| 为 $(w,x,y,z)$；注意 v3.0 Beta 张量层改 \verb|xyzw|（见 \cref{sec:rlmc-setup-isaaclab}） \\
+mjlab 渲染后端 & MuJoCo Warp batch renderer，GPU ray-tracing（非 rasterizer，已核改正） \\
+mjlab depth 相机类 & \verb|CameraSensorCfg|（\texttt{from mjlab.sensor}）；\verb|data_types=("depth",)| 输出 $[N,H,W,1]$ \verb|float32|（源码实测，无 clip/normalize 字段） \\
+extreme-parkour & ICRA 2024，arXiv:2309.14341；depth 预处理 $58\times87$；convnet 出 $32$ 维 $\to$ \texttt{nn.GRU(input\_size=32, hidden\_size=512)} $\to$ \texttt{nn.Linear(512, 32+2)}（$32$ 维 scandots latent $+2$ 维 yaw），源码 \texttt{rsl\_rl/modules/depth\_backbone.py} 实核 \\
+VIRAL & arXiv:2511.15200；$29$-DoF G1 + RealSense D435i；真机连续 $54$ 个周期（“up to 54 cycles”，非 $54/59$）；$\le 64$ GPU（已核） \\
+DINOv2 加载 & \verb|torch.hub.load('facebookresearch/dinov2','dinov2_vits14')|（官方）；timm/HF 用模型名 \texttt{vit\_small\_patch14\_dinov2.lvd142m}（torchvision 无此名，均已核） \\
+\bottomrule
+\end{tabular}
+\end{center}

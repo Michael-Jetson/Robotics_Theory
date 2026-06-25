@@ -1,0 +1,1509 @@
+\chapter{域随机化}\label{ch:rlmc-dr}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章。
+%  主线：算法/原理领路 —— 先讲「域随机化（DR）是一个鲁棒优化问题」这条
+%  数学主线，再把它落到三大框架 (mjlab / Isaac Lab / UniLab) 的对比实战。
+%  假定读者已学完强化学习理论部 (P6) 与本部前置章 (观测/动作、奖励、物理、
+%  manager 架构)，不再重教 MDP / PPO / GAE / EventManager 基础，聚焦
+%  「DR 这层鲁棒化怎么配、怎么验、怎么排查」。
+%  源稿 RL运控/Ch08_域随机化.md (实践偏重) 已按本主线重构：
+%   - 把「按节铺工具」改为「概念领路 + 三框架横向对比实践」；
+%   - 对 Isaac Lab 事件模式 / randomize_rigid_body_material / num_buckets、
+%     mjlab EventManager、ASAP delta action model、Rucker–Wensing
+%     pseudo-inertia、OpenAI ADR、SPI-Active 等做了联网核对
+%     (见各 \rebuilt / \pz 标注与 claimsToVerify)；
+%   - 保留并强化了源稿对 ASAP 实现的勘误 (open-loop RL、非监督 MSE)。
+%  UniLab 槽位已据服务器实装框架（commit 99936e08，已实跑核对）填实：DR 经
+%  DomainRandConfig + DomainRandomizationManager + 后端能力门控，非 Manager-Based。
+% ════════════════════════════════════════════════════════════════
+
+在仿真里练好的策略，搬到真机上几乎注定要摔。原因不在 RL 算法——\cref{ch:rlmc-physics} 已经把物理引擎讲透了，问题恰恰出在那台引擎\emph{太准}：它用的摩擦系数、连杆质量、电机增益、传感器噪声，都是\textbf{某一组标称参数}，而真实机器人的这组参数你并不精确知道。域随机化（domain randomization，DR）是弥合这条 sim-to-real gap 最朴素也最有效的工程手段：训练时不固定参数，而是在一个\emph{参数分布}上采样，逼策略在「一族环境」而非「一个环境」上都工作。只要真机的真实参数落进训练分布覆盖的范围，策略就有望直接迁移。
+
+本章遵循全书「先动机、先原理，后工程」的次序。这里的原理不是 RL 原理，而是 DR 的\emph{优化结构}：我们先把 DR 写成一个在参数分布上最大化\textbf{期望}回报的问题，弄清它\emph{不是}最坏情况优化、\emph{不是}数据增强、也\emph{不是}让仿真更逼真；再把这条主线翻译成「随机化什么 / 何时触发 / 怎样保证物理一致 / 怎样验证生效 / 怎样排查失效」的工程地图，最后在三大框架——mjlab（MuJoCo Warp 后端）、Isaac Lab（PhysX 默认）、UniLab——上给出可复制的配置与诊断代码。\textbf{DR 的工程难点从来不是「写配置」，而是「DR 静默失效时怎么归因」}——这是本章最核心的一条洞察。
+
+假定你已经读过本部前置章：\cref{ch:rlmc-obsact} 建立了观测/动作接口与非对称 actor-critic，\cref{ch:rlmc-reward} 讲了奖励/终止/课程（curriculum），\cref{ch:rlmc-physics} 讲了接触求解与 \verb|expand_model_fields|，\cref{ch:rlmc-manager} 讲了 EventManager 等四大 manager 的生命周期。若这些尚不熟悉，建议先回相应章节，否则本章的「事件模式」「per-env 字段扩展」会缺少地基。
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-dr-env}
+
+本章的 DR 能力分散在三套仿真栈的 \verb|EventManager| 与 \verb|ObservationManager| 里。系统要求与版本兼容性如下表——\textbf{DR 的 API 名在不同版本间漂移得很快}（Isaac Lab 2.x 把材质随机化集中到 \verb|randomize_rigid_body_material|，mjlab 把质量/惯量随机化集中到 \verb|dr| 子模块），照抄旧博客的函数名到新版上会直接 \verb|AttributeError|。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+组件 & 锚定版本 & 操作系统 & GPU 要求 & 本章用途 \\
+\midrule
+mjlab & 1.2.0（与本部一致） & Linux / macOS（仅评估） & 训练需 NVIDIA & \verb|EventManager|、\verb|dr| 子模块、pseudo-inertia \\
+mjlab & 1.4.0（最新） & Linux & NVIDIA & 最新 DR 函数；接口与 1.2.0 大体兼容 \\
+MuJoCo Warp & 随 mjlab & Linux & NVIDIA & per-env 字段扩展 $+$ CUDA Graph 重 capture \\
+Isaac Lab & 2.3.0（主线） & Linux / Windows & NVIDIA RTX & \verb|EventTermCfg|、\verb|num_buckets|、DexSuite ADR \\
+Isaac Lab & 3.0 Beta & Linux & NVIDIA RTX & Newton 后端下的事件管线 \\
+PhysX & 5.4+ & 随 Isaac Sim & NVIDIA & 材质 bucket、外力施加 \\
+UniLab & commit \verb|99936e08|（main） & Linux / macOS & 仿真用 CPU，学习需 GPU & \verb|DomainRandomizationManager|、后端能力门控 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{分操作系统的安装要点。}与 \cref{ch:rlmc-physics} 一致：\textbf{Linux} 是三框架的一等公民，下文命令默认 Linux；\textbf{macOS} 仅能跑 CPU MuJoCo 与 mjlab 评估（无 CUDA，DR 的 per-env 字段扩展和 CUDA Graph 路径用不上，但可在 CPU 上验证 DR 函数的数值正确性）；\textbf{Windows} 仅 Isaac Lab 官方支持，mjlab 建议走 WSL2。本章不引入超出 \cref{ch:rlmc-setup} 之外的新依赖——DR 是上述框架的内建能力，无需额外安装。
+
+\begin{finenote}
+\rebuilt{一个可对照的真实吞吐基准（在 RTX 4080 SUPER 32GB 上实跑本章命令，开 DR）}：\verb|train Mjlab-Velocity-Flat-Unitree-Go1| 在 \verb|num_envs=64| 时迭代时间约 $1.46$\,s/iter、吞吐\textbf{约 $9$k env-steps/s}，$2$ 迭代内 mean reward 约 $-0.63$（冷启动负值正常）、全程无报错；UniLab \verb|go2_joystick_rough --sim mujoco| 在 \verb|num_envs=16| 时约 $1.34$\,s/iter、\verb|tracking_lin_vel|/\verb|tracking_ang_vel| 在首迭代即非零（约 $0.07$/$0.13$）。\textbf{用途}：这两个数给你一个「DR 开着也能正常起飞」的下限锚——你自己的环境若 steps/s 比同 \verb|num_envs| 量级低一个数量级，多半不是 DR 本身慢，而是 \cref{sec:rlmc-dr-inertia-expand} 说的 \verb|set_const| 级字段（质量/惯量）误入了高频模式触发每步重算；\verb|num_envs| 上到数千时吞吐才接近 GPU 满载（$64$ env 远未喂饱 4080S，此基准只用于「能否起飞 $+$ 相对回归」，不代表峰值）。
+\end{finenote}
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：五分钟给策略加上摩擦随机化}
+\addcontentsline{toc}{section}{Quick Start：五分钟加摩擦随机化}
+\label{sec:rlmc-dr-quickstart}
+
+最小可跑目标：在一个已经能跑的 velocity task 上，\textbf{只加一项足底摩擦随机化}，亲眼确认「不同并行环境拿到了不同的摩擦」。下面三段代码（mjlab / Isaac Lab / UniLab）可直接复制。
+
+\begin{codebox}[Python]{mjlab：在 task cfg 的 events 里加一项 friction DR}
+# 加进 velocity_env_cfg.py 的 events 字典即可
+from mjlab.managers import EventTermCfg, SceneEntityCfg
+from mjlab.envs.mdp import dr                # mjlab 的 DR 函数在 mdp.dr 子模块
+
+events = {
+    "foot_friction": EventTermCfg(
+        func=dr.geom_friction,                # 真名 dr.geom_friction（非 randomize_*）
+        mode="startup",                       # 出厂差异：每个 env 不同、episode 内不变
+        params={
+            "asset_cfg": SceneEntityCfg("robot", geom_names=".*foot.*"),
+            "ranges": (0.5, 1.25),            # 标称值的 0.5x ~ 1.25x（参数名是 ranges）
+            "operation": "scale",
+            "shared_random": True,            # 四脚共享同一摩擦（同一块地面，见后文）
+        },
+    ),
+}
+\end{codebox}
+
+\begin{codebox}[Python]{Isaac Lab：在 @configclass EventCfg 里加一项材质随机化}
+from isaaclab.managers import EventTermCfg as EventTerm, SceneEntityCfg
+from isaaclab.utils import configclass
+import isaaclab.envs.mdp as mdp
+
+@configclass
+class EventCfg:
+    robot_physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="reset",                          # PhysX 材质：reset 时重采样
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*foot.*"),
+            "static_friction_range": (0.5, 1.25),
+            "dynamic_friction_range": (0.5, 1.25),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 250,                # 默认仅 1（=单一材质，几乎无随机化），务必显式设；上限受 PhysX 材质数约束，见后文
+        },
+    )
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab：在任务 owner YAML 的 domain\_rand 里加摩擦 DR}
+# 加进 conf/ppo/task/go2_joystick_rough/mujoco.yaml 的 env.domain_rand
+# UniLab 的 DR 不是 EventTermCfg，而是任务 DomainRandConfig（dataclass）
+# 由 DomainRandomizationManager 在 reset 时分发到后端 set_state(randomization=...)
+env:
+  domain_rand:
+    randomize_ground_friction: true          # reset：地面/足底摩擦
+    ground_friction_multiplier_range: [0.5, 1.25]   # 标称值 0.5x~1.25x（scale 模式保物理一致）
+# 机制：geom_friction 是 MuJoCo 后端的 reset 项之一（dr/types.py 的 RESET_TERM_GEOM_FRICTION）；
+#   Motrix 后端仅在「支持摩擦覆写」时才追加 geom_friction 能力，否则被 filter_reset_payload 静默跳过。
+\end{codebox}
+
+\noindent{}加完后立刻\textbf{验证 DR 真的生效}——这一步 90\% 的人会跳过，然后训练几小时才发现策略其实跑在无 DR 的环境里：
+
+\begin{codebox}[Python]{三框架通用：确认 per-env 摩擦确实不同（mjlab 版）}
+env.reset()                                   # 触发 startup/reset 事件
+field = env.sim.model.geom_friction           # 期望 shape = [num_envs, num_geoms, 3]
+assert field.ndim >= 2, "字段未被 expand —— DR 没写进仿真！"
+print("cross-env std =", field.float().std(dim=0).mean().item())
+# std > 1e-6 → DR 生效；std ≈ 0 → 所有 env 摩擦相同，DR 静默失效
+\end{codebox}
+
+\noindent{}UniLab 侧同理但读法不同：UniLab 的 per-world 摩擦在\emph{后端}里，reset 后经后端 getter（如 \verb|backend.get_geom_friction()|）读出 per-world \verb|geom_friction|，同样验「跨 env std $>1\mathrm{e}{-6}$ 即生效」。差异在 UniLab 物理跑在 CPU 多线程、每个 env 持独立物理状态（\cref{ch:rlmc-manager} 的异构架构），不存在 mjlab 的「字段是否 expand」问题——但仍要确认\emph{后端能力声明}里包含 \verb|geom_friction|（Motrix 后端可能不支持，见后文 \cref{sec:rlmc-dr-func}）。
+
+\begin{finenote}
+\rebuilt{一个跨框架最易踩的语义坑——「\texttt{ranges} 里写的到底是绝对摩擦系数还是相对倍率」（已在服务器上核对 mjlab shipped 默认）}：本 Quick Start 三段都用 \verb|scale| 语义（$0.5\times\sim1.25\times$ 标称），但\textbf{三框架的「摩擦默认怎么解释」并不统一}，跨框架迁移时必须先认清：\textbf{mjlab} 的 \verb|geom_friction| 默认 \verb|operation="abs"|（此时 \verb|ranges| 是\emph{绝对}摩擦系数区间，如 shipped Go1 默认 \verb|ranges=(0.3,1.2)| 指摩擦系数本身落在 $[0.3,1.2]$，\emph{不是}倍率！）——本节为教学统一显式写成 \verb|"scale"| 才把 $(0.5,1.25)$ 当倍率；\textbf{Isaac Lab} 的 \verb|static_friction_range| / \verb|dynamic_friction_range| 本质是\emph{绝对}摩擦区间（直接采样最终摩擦值，无 operation 旋钮）；\textbf{UniLab} 的 \verb|ground_friction_multiplier_range| 顾名思义是\emph{倍率}（scale 语义，保物理一致）。\textbf{心智模型}：看到一个摩擦区间，先问「它乘到标称上、还是直接就是最终值」——mjlab 取决于 \verb|operation|，Isaac 恒为绝对值，UniLab 恒为倍率。抄错一边，$(0.5,1.25)$ 在 abs 语义下会被当成「摩擦系数 $0.5\sim1.25$」（恰好接近真值故不易察觉），但 $(0.3,1.2)$ 若被误当倍率就会把摩擦缩到 $0.3\times$ 标称（极易打滑）。
+\end{finenote}
+
+\begin{practice}[前置自测：答不出 $\ge 2$ 题，建议先回本部前置章或强化学习理论部]
+\begin{enumerate}
+  \item EventManager 的 \verb|startup| / \verb|reset| / \verb|interval| / \verb|step| 四种模式各在什么时机触发？（回看 \cref{ch:rlmc-manager} 的 manager 生命周期）
+  \item 只改质量 $m$、不改惯量张量 $\mathbf I$，这个刚体在物理上自洽吗？为什么？（刚体动力学基础，本章 \cref{sec:rlmc-dr-inertia} 会用到）
+  \item DR 改变了状态转移 $p(s'|s,a;\theta)$ 后，PPO 的 advantage 估计会受什么影响？（回看 \cref{ch:rlmc-reward} 与 GAE）
+  \item 若把足底摩擦 DR 范围设为 $[0.01,\,5.0]$，策略最可能学到什么行为？（本章 \cref{sec:rlmc-dr-robust} 会解释）
+  \item 「特权观测只进 critic、不进 actor」这条原则，和 DR 训练里 critic 该不该看到摩擦系数有什么关系？（回看 \cref{ch:rlmc-obsact} 非对称 actor-critic）
+\end{enumerate}
+\end{practice}
+
+\paragraph{本章目标。}学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{解释} DR 的鲁棒优化视角——能写出 $J_{\mathrm{DR}}$ 的期望形式，并说清它为何\emph{不是}最坏情况优化、\emph{不是}数据增强；
+  \item \textbf{配置} mjlab 与 Isaac Lab 中完整的 DR 方案——能正确选择 startup/reset/interval/step 模式并给出每个选择的物理理由；
+  \item \textbf{实现}物理一致的惯性随机化——能用 pseudo-inertia 参数化避免「只改质量」造成的物理不一致；
+  \item \textbf{定位} DR 静默失效的根因——会从「配置层$\to$管理层$\to$字段层$\to$仿真层」四层逐层排查，并用脚本确认 per-env 参数确实不同；
+  \item \textbf{设计}分阶段（单变量递进）DR 方案，使每一阶段的训练失败都能清晰归因；
+  \item \textbf{评估} DR 策略的鲁棒性——会在固定参数网格上做「分布内 $+$ 边界 $+$ 分布外」三档系统测试；
+  \item \textbf{判断}何时该用 ASAP delta action model 等超越 DR 的方案——能说清 DR 与残差动作模型的互补关系。
+\end{enumerate}
+
+\paragraph{知识导航与阅读时间。}本章结构如下树。建议精读 4--5 小时（含练习与跑通验证脚本）；有 sim-to-real 经验者速读 2--3 小时（重点看 \cref{sec:rlmc-dr-mode} 模式对照与 \cref{sec:rlmc-dr-func} 函数映射表）；遇到「DR 没生效」时速查 30 分钟（直接跳故障排查手册）。
+
+\begin{center}
+\begin{forest} navtree
+[域随机化实战
+  [鲁棒优化视角\\(为什么需要 DR),name=theory]
+  [事件四模式\\(何时触发)]
+  [函数映射\\(随机化什么)]
+  [物理一致性\\(pseudo-inertia)]
+  [外力扰动\\(push vs impulse)]
+  [传感器 DR\\(噪声/延迟/偏置)]
+  [分阶段策略\\(单变量递进)]
+  [鲁棒性评估\\(三档参数网格)]
+  [超越 DR\\(ASAP delta)]
+]
+\end{forest}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{DR 的理论基础：一个鲁棒优化问题}
+\label{sec:rlmc-dr-theory}
+
+\paragraph{模块功能与在管线中的位置。}DR 不是一个独立模块，而是一组挂在 EventManager 上的「事件项」（\cref{ch:rlmc-manager}）：它们在仿真循环的特定时机改写物理参数。但在动手配置之前，必须先弄清 DR 在\emph{优化层面}做了什么——否则你会把它当成「让仿真更逼真」或「数据增强」，从而在范围选择上犯系统性错误。这一节立起本章的算法主线：DR 是在参数分布上最大化期望回报。
+
+\subsection{从固定 MDP 到参数化 MDP}
+\label{sec:rlmc-dr-pmdp}
+
+标准 RL 在一个固定 MDP $\mathcal{M}=(\mathcal S,\mathcal A,P,R,\gamma)$ 上训练。但真实世界的 MDP 参数 $\boldsymbol\theta$（摩擦、质量、电机增益、传感器噪声等）是\emph{未知}的——仿真器用的标称参数 $\boldsymbol\theta_0$ 只是一个估计，且几乎一定有偏。DR 的核心思想是：不要把 $\boldsymbol\theta_0$ 当真，而是在一个参数分布 $p(\boldsymbol\theta)$ 上训练，最大化
+
+\begin{equation}
+J_{\mathrm{DR}}(\pi)=\mathbb{E}_{\boldsymbol\theta\sim p(\boldsymbol\theta)}\big[J(\pi,\boldsymbol\theta)\big]
+=\int J(\pi,\boldsymbol\theta)\,p(\boldsymbol\theta)\,\mathrm d\boldsymbol\theta,
+\label{eq:rlmc-dr-objective}
+\end{equation}
+
+其中 $J(\pi,\boldsymbol\theta)=\mathbb{E}_{\pi}\!\big[\sum_{t}\gamma^{t}r_{t}\mid\boldsymbol\theta\big]$ 是策略 $\pi$ 在参数 $\boldsymbol\theta$ 下的期望回报。式~\eqref{eq:rlmc-dr-objective} 优化的是\textbf{平均性能}，而非\textbf{某个特定参数点的性能}。这就是 DR 全部数学内容——朴素到一行，但后面所有工程决策都是它的推论。
+
+\begin{insight}[DR 优化期望，而非最坏情况]\label{ins:rlmc-dr-expectation}
+式~\eqref{eq:rlmc-dr-objective} 里的是\emph{期望}$\mathbb{E}_{\boldsymbol\theta}$，不是\emph{下确界}$\inf_{\boldsymbol\theta}$。这条区别决定了 DR 的脾气：如果分布 $p(\boldsymbol\theta)$ 的某些区域特别难（如极低摩擦 $\mu=0.1$），DR 策略在数学上有权\emph{放弃}这些区域以抬高平均分——部署时一旦真撞上这种参数就会失败。反事实：若把目标换成最坏情况 $\max_{\pi}\min_{\boldsymbol\theta}J(\pi,\boldsymbol\theta)$，问题就变成鲁棒优化（minimax），策略会为最坏摩擦优化——结果通常是「站着不动」这种极端保守行为（对最坏摩擦的「最优」响应往往就是别动）。工程上，DR 的「平均优化」几乎总比「最坏优化」实用。\textbf{这也解释了为什么 DR 范围不能盲目放大}——范围一宽，难区域权重一升，平均最优解就被拖向保守。
+\end{insight}
+
+这条「平均 vs 最坏」的张力还有个保险业的精算类比：保险公司不为某一位特定客户定价（要么赔穿要么客户付不起），而是在客户群体的风险\emph{分布}上优化平均利润。DR 策略不为某一个摩擦系数优化（换个地面就摔），而是在摩擦\emph{分布}上优化平均 tracking。两者都是「在分布上优化期望」这同一个数学骨架。
+
+\subsection{DR 的四个维度}
+\label{sec:rlmc-dr-dims}
+
+DR 不是一个单旋钮，而是沿四个维度展开，每个维度对应真实世界一类不确定性。这张表是本章后续配置的总目录——\cref{sec:rlmc-dr-func} 的函数映射、\cref{sec:rlmc-dr-force} 的外力、\cref{sec:rlmc-dr-sensor} 的传感器，都各占其中一行或两行。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{3.4cm}p{4.2cm}@{}}
+\toprule
+维度 & 随机化内容 & 影响什么 & 典型参数（字段名） \\
+\midrule
+动力学 & 质量 / 惯量 / 质心 / 摩擦 / 接触刚度 & 系统对力的响应 & \verb|body_mass|, \verb|geom_friction|, \verb|dof_damping| \\
+执行器 & 电机增益 / 力矩上限 / 响应延迟 / armature & 动作的有效幅度与带宽 & \verb|pd_gains|, \verb|effort_limits|, \verb|dof_armature| \\
+感知 & 编码器偏置 / IMU 噪声 / 通信延迟 & 策略接收到的信息质量 & encoder bias, actor obs noise/delay \\
+环境 & 外部扰动 / 风力 / 负载变化 & 任务本身的难度 & push velocity, external wrench \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个分类框架的工程价值在于一条可证伪的原则：\textbf{每个 DR 项都应能追溯到一个具体的物理不确定性来源}。如果某随机化项找不到真实的部署对应物（典型反例：「每秒随机改一次质量」——物理上不可能），它只能当作压力测试，不能算作 sim-to-real 的证据。
+
+\subsection{自动域随机化（ADR）}
+\label{sec:rlmc-dr-adr}
+
+手动设 DR 范围有个老问题：太窄不够鲁棒，太宽训不出来，而「刚刚好」往往要试很多次。OpenAI（2019）在「机械手解魔方」工作里提出的\textbf{自动域随机化}（automatic domain randomization, ADR）把这件事自动化：从无随机化开始，当策略性能超过上阈值就把某个参数的范围\emph{扩大}一档，低于下阈值就\emph{收缩}。ADR 在 Shadow Hand 上展示了 sim-to-real 迁移，且训出的带记忆（LSTM）策略的隐状态自发编码了环境参数，呈现出涌现的 meta-learning 迹象——这篇是 ADR 的开山之作（arXiv:1910.07113，「Solving Rubik's Cube with a Robot Hand」）\cite{openai2019rubik}。
+
+\begin{paper}[OpenAI 2019：自动域随机化（ADR）]\label{paper:rlmc-dr-adr}
+\textbf{问题}：手动调 DR 范围既耗时又难保证「既够宽又可训」。\textbf{核心思想}：维护每个参数的区间边界，按策略当前表现自动外扩/内缩，使训练分布的难度随能力同步增长（一种 curriculum-over-physics）。\textbf{关键结果}：仅用仿真训练即在真实 Shadow Hand 上解魔方；记忆型策略隐状态涌现出对环境参数的编码。\textbf{与本书关系}：把 \cref{ch:rlmc-reward} 的 curriculum 思想从「任务难度」推广到「物理参数分布」；Isaac Lab 2.3 的 DexSuite（Kuka $+$ Allegro 的 Lift/Reorient 环境，参考 DextrAH/DexPBT）内置了 ADR 与 PBT 的参考配置\cite{mittal2025isaaclab}。\textbf{局限}：各参数独立外扩可能撞出不可训的组合（如同时低摩擦 $+$ 低力矩）；范围一变就需重采 on-policy 数据，PPO 旧数据可能失效；阈值与步长本身又成了新超参。
+\end{paper}
+
+在当前实践里，ADR 主要用于\emph{灵巧操作}（参数不确定性范围难以先验给定，值得自动搜）。对 \emph{locomotion}，手动设范围 $+$ 分阶段引入仍是主流——因为足式机器人的参数不确定性大多能从工程规格书里读出来（制造公差、传感器精度、负载范围），不必自动搜。\textbf{这条「locomotion 手动、manipulation 自动」的经验分界，是选择 DR 策略的第一个决策点}。
+
+\subsection{delta action model 的动机}
+\label{sec:rlmc-dr-delta-motivation}
+
+当 DR 不够用时怎么办？这里先埋一个伏笔，\cref{sec:rlmc-dr-beyond} 再展开。ASAP（He et al., RSS 2025，arXiv:2502.01143）\cite{asap2025} 给出一条不同思路：不是把仿真器参数分布做得更宽，而是用\emph{真机数据}训练一个残差（delta）动作模型，去\textbf{修正}仿真与现实的系统性差异。
+
+\begin{insight}[DR 与 delta model：两种世界观]\label{ins:rlmc-dr-vs-delta}
+DR 和 delta action model 解决 sim-to-real gap 的方式截然不同。DR 说：「我不知道真实参数是什么，所以我在一大堆可能参数上训练」——它不需要真机数据，但可能过于保守。delta model 说：「我知道仿真和真实有差，让我用真机轨迹学一个修正项」——它更精确，但必须有真机数据。两者不互斥：ASAP 第一阶段在仿真中训 motion-tracking base policy，通常也会配合合理 DR。\textbf{注意}：ASAP 公开代码的训练命令默认 \verb|+domain_rand=NO_domain_rand|，是否叠加 DR 取决于具体配置，并非论文硬性步骤——别把「Stage A 一定用 DR」当成定论。
+\end{insight}
+
+\begin{pitfall}[三个最常见的 DR 认知错误]
+\textbf{错误描述}：(1) 「DR 范围越大越鲁棒」；(2) 「DR 就是数据增强」；(3) 「DR 是为了让仿真更逼真」。\textbf{现象后果}：(1) 把可学任务变成不可学的鲁棒优化（见 \cref{ins:rlmc-dr-expectation}）；(2) 误以为只是换了输入表示，从而把噪声幅度当超参随便调大；(3) 把 DR 当 system ID 的替代，期待它「自动找到真实参数」。\textbf{根本原因}：没区分「改变输入表示」与「改变状态转移」。图像增强改的是输入 $o$ 的表示，任务 $p(s'|s,a)$ 不变；DR 改的是动力学 $p(s'|s,a;\boldsymbol\theta)$——低摩擦下同一动作产生完全不同的接触力与滑移。\textbf{正确做法}：把 DR 理解为「同时解一族不同的控制问题」（\cref{eq:rlmc-dr-objective}）；范围反映\emph{真实物理不确定性}，而非「越大越好」；要找真实参数请用 system ID（\cref{sec:rlmc-dr-beyond} 的 SPI-Active），不是 DR。
+\end{pitfall}
+
+\paragraph{运行验证。}本节无代码可跑，但有一个\emph{思想实验}可作自测：令 DR 分布退化为点分布 $p(\boldsymbol\theta)=\delta(\boldsymbol\theta-\boldsymbol\theta_0)$，代入式~\eqref{eq:rlmc-dr-objective}，期望塌缩为 $J_{\mathrm{DR}}(\pi)=J(\pi,\boldsymbol\theta_0)$——回到标准 MDP。这验证了 DR 是标准 RL 的\emph{严格推广}：关掉所有 DR（点分布），就该精确复现无 DR 的训练。后面 \cref{sec:rlmc-dr-phased} 的 Phase 0 baseline 正是利用这一点。
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[推导题]} 严格证明：当 $p(\boldsymbol\theta)=\delta(\boldsymbol\theta-\boldsymbol\theta_0)$ 时 $J_{\mathrm{DR}}(\pi)=J(\pi,\boldsymbol\theta_0)$。\emph{验收}：写出 Dirac 测度下的积分化简步骤。
+  \item \textbf{[计算题]} Go1 标称质量 $12.5$\,kg，装配误差 $[-5\%,+8\%]$，负载最多 $2$\,kg。给出 \verb|body_mass| 的合理 DR 范围（用 \verb|add| 操作）。\emph{验收}：下界 $\approx-0.625$\,kg、上界 $\approx 1.0+2.0=3.0$\,kg，并说明为何用 \verb|add| 而非 \verb|scale|。
+  \item \textbf{[思考题]} 为什么 locomotion 的 DR 常用均匀分布而非正态分布？\emph{提示}：考虑尾部行为与边界覆盖——均匀分布在区间端点仍有非零密度，正态分布的尾部样本稀少，难保证策略见过边界参数。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{事件四模式：何时触发随机化}
+\label{sec:rlmc-dr-mode}
+
+\paragraph{模块功能与在管线中的位置。}\cref{sec:rlmc-dr-theory} 立起了「随机化是为了在分布上优化」，但没说\emph{何时}采样。EventManager（\cref{ch:rlmc-manager}）用「触发模式」回答这个问题——而模式选错会从「训练不稳」一路坏到「物理不一致」。这一节把四种模式的物理语义讲清，并给出三框架的配置对照。
+
+\subsection{模式总览与物理语义}
+\label{sec:rlmc-dr-mode-overview}
+
+mjlab 与 Isaac Lab 的 EventManager 都支持四种核心触发模式（Isaac Lab 多一种 \verb|prestartup|）。每种模式对应一种「这个参数多久变一次」的物理假设：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{3.6cm}p{3.6cm}@{}}
+\toprule
+模式 & 触发时机 & 典型用途 & 适合随机化什么 \\
+\midrule
+\verb|startup| & 环境初始化后一次 & 硬件之间的固定差异 & 质量、惯量基线、编码器偏置 \\
+\verb|reset| & 每次 episode 重置 & 每集可能变化的参数 & 摩擦、PD 增益、初始姿态 \\
+\verb|interval| & 随机间隔触发 & 稀疏外部扰动 & push velocity、重力微扰 \\
+\verb|step| & 每个 env step & 需精确时序的外力 & impulse 生命周期管理 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Isaac Lab 额外的 \verb|prestartup| 模式在仿真启动\emph{前}的 USD 层面执行，用于 \verb|randomize_rigid_body_scale|（官方源码确有此函数，「Randomize the scale of a rigid body asset in the USD stage」）这类必须在 PhysX 初始化前完成的操作（USD 层随机化模式由 Isaac Lab 的 PR \#2040「Adds USD-level randomization mode to event manager」引入，模式名 \texttt{prestartup}，已联网核实）。mjlab 不需要此模式——MuJoCo 没有 USD 中间层，几何缩放可直接在 \verb|MjSpec| 编译期完成（\cref{ch:rlmc-physics} 讲过这条数据流）。
+
+\begin{insight}[模式 $=$ 把「变化频率」编码进训练]\label{ins:rlmc-dr-mode-physics}
+四种模式不是 API 的偶然分类，而是把「真实世界里这个量多久变一次」直接编码进训练循环。\verb|startup| 编码「出厂即定、终身不变」（每台机器人质量不同，但一台机器人用一辈子也不会突然变重）；\verb|reset| 编码「每次任务/场景可能不同」（今天走水泥地、明天走草地）；\verb|interval| 编码「任务中偶发」（被人撞一下）；\verb|step| 编码「持续变化」（连续风场）。\textbf{选错模式 $=$ 给策略灌输错误的物理因果}——把质量放进 \verb|interval| 模式，等于让机器人每隔几秒「质量守恒被违反」一次，策略被迫学一种真机上永远不会遇到的「质量跳变」响应，这份应对能力完全是浪费，更糟的是质量变化会触发 \verb|set_const| 级派生常量重算（\cref{sec:rlmc-dr-inertia}）拖垮吞吐。
+\end{insight}
+
+\subsection{三框架配置对照}
+\label{sec:rlmc-dr-mode-config}
+
+以下是 Go1 velocity task 中典型 DR 事件的配置，按模式分组。\textbf{配置详解}见后面的四维表（\cref{sec:rlmc-dr-func}），这里先建立「同一组 DR 在两框架里长什么样」的直觉。
+
+\begin{codebox}[Python]{mjlab 事件配置：startup / reset / interval 三模式}
+# src/mjlab/tasks/velocity/velocity_env_cfg.py（节选）
+# 函数：DR 项用 mdp.dr.<name>（mdp.dr 子模块）；reset/push 用 mdp.<name>（mdp.events）
+from mjlab.envs import mdp                    # mdp.dr.* 为 DR、mdp.* 为 reset/push
+events = {
+    # —— startup：硬件差异，每个 env 不同、episode 内不变 ——
+    "foot_friction": EventTermCfg(
+        func=mdp.dr.geom_friction, mode="startup",
+        params={"asset_cfg": SceneEntityCfg("robot", geom_names=".*foot.*"),
+                "ranges": (0.5, 1.25), "operation": "scale", "shared_random": True}),
+    "base_mass": EventTermCfg(
+        func=mdp.dr.body_mass, mode="startup",
+        params={"asset_cfg": SceneEntityCfg("robot", body_names="base"),
+                "ranges": (-1.0, 3.0), "operation": "add"}),
+    # —— reset：每集环境变化 ——
+    "reset_robot_state": EventTermCfg(
+        func=mdp.reset_root_state_uniform, mode="reset",
+        params={"pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5),
+                               "yaw": (-3.14, 3.14)},
+                "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}}),
+    # —— interval：稀疏扰动 ——
+    "push_robot": EventTermCfg(
+        func=mdp.push_by_setting_velocity, mode="interval",
+        interval_range_s=(10.0, 15.0),
+        params={"velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}}),
+}
+\end{codebox}
+
+\begin{codebox}[Python]{Isaac Lab 事件配置：等价三模式（注意 num\_buckets 与 log\_uniform）}
+@configclass
+class EventCfg:
+    robot_physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material, mode="reset",
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+                "static_friction_range": (0.7, 1.3),
+                "dynamic_friction_range": (0.7, 1.3),
+                "restitution_range": (0.0, 0.0),
+                "num_buckets": 250})           # PhysX 材质 bucket 上限约束
+    robot_joint_gains = EventTerm(
+        func=mdp.randomize_actuator_gains, mode="reset",
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+                "stiffness_distribution_params": (0.75, 1.5),
+                "damping_distribution_params": (0.3, 3.0),
+                "operation": "scale", "distribution": "log_uniform"})
+    push_robot = EventTerm(
+        func=mdp.push_by_setting_velocity, mode="interval",
+        is_global_time=False,                  # 每个 env 独立计时，见下方陷阱
+        interval_range_s=(10.0, 15.0),
+        params={"velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}})
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab 事件配置：DomainRandConfig 的三阶段 DR（go2 rough owner YAML）}
+# UniLab 无 startup/reset/interval/step 四模式枚举，而是 DomainRandConfig 的字段分三阶段：
+#   init（≈startup，apply_init_randomization）/ reset（per-episode，build_reset_plan）/
+#   interval（apply_interval_randomization_if_due，等价 EventMode.interval）
+env:
+  domain_rand:
+    # —— reset 阶段：个体差异 + 每集环境（质量/质心/PD 增益）——
+    randomize_base_mass: true                  # 基座质量 + U(added_mass_range)（add 语义）
+    added_mass_range: [-1.0, 3.0]
+    random_com: true                           # 质心 x 偏移
+    randomize_kp: true                         # PD kp 乘 U(kp_multiplier_range)（scale 语义）
+    kp_multiplier_range: [0.5, 2.0]
+    randomize_kd: true
+    kd_multiplier_range: [0.5, 2.0]
+    # —— interval 阶段：稀疏外力扰动（每 push_interval 步注入速度）——
+    push_robots: true
+    push_interval: 625                         # 单位为 step（非秒），≈ 625*ctrl_dt 秒
+    max_force: [1.0, 1.0, 0.5]                 # 速度扰动幅度 [x, y, yaw]
+\end{codebox}
+
+\noindent{}注意两点机制差异：(1) UniLab 没有 mjlab/Isaac 那样的\textbf{模式枚举}，而是把「何时触发」编码进 \verb|DomainRandConfig| 的不同字段族（\verb|randomize_*| 走 reset、\verb|push_*| 走 interval）——\cref{ch:rlmc-manager} 讲的 UniLab 非 Manager-Based 架构在此再现：DR 由独立的 \verb|DomainRandomizationManager| 而非 \verb|EventManager| 承担；(2) UniLab 的 \verb|push_interval| 以 \textbf{step 数}计（而非 mjlab/Isaac 的 \verb|interval_range_s| 秒数），换算成时间需乘 \verb|ctrl_dt|。后端经 \verb|get_dr_capabilities()| 声明支持哪些项，\verb|filter_reset_payload| 把不支持的项打 warning 跳过（优雅降级）——这正是 go2 flat 的 motrix.yaml 要显式 \verb|randomize_kp: false| 的原因（Motrix 后端基线不含 \verb|kp/kd|）。
+
+两框架的关键机制差异如下表——\textbf{这张表是「为什么同一个 DR 在两边写法不同」的根因}，不理解它就会把一边的字段名硬抄到另一边：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & mjlab & Isaac Lab \\
+\midrule
+摩擦随机化 & 直接改 \verb|geom_friction| 字段 & 经 \verb|randomize_rigid_body_material| $+$ \verb|num_buckets| \\
+PD 增益 & \verb|randomize_actuator_gains| & \verb|randomize_actuator_gains| $+$ log\_uniform \\
+材质数限制 & 无（MuJoCo 无 bucket 概念） & PhysX 限材质数 $\Rightarrow$ 必须用 bucket \\
+\verb|prestartup| & 不需要（无 USD 层） & USD 层操作（如 scale）必须用它 \\
+字段扩展 & \verb|expand_model_fields| $+$ CUDA Graph 重 capture & PhysX 内部管理 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{模式选择决策树与内部调度}
+\label{sec:rlmc-dr-mode-tree}
+
+\textbf{代码走读：模式怎么选。}下面这棵决策树把 \cref{ins:rlmc-dr-mode-physics} 的原则落成可操作流程：
+
+\begin{codebox}{模式选择决策树（按「真实世界多久变一次」分流）}
+这个参数在真实世界中多久变化一次？
+├── 出厂后不变（硬件公差、装配误差）
+│   └── startup        例：base_mass, encoder_bias, link_inertia
+├── 每个任务/场景可能不同
+│   └── reset          例：ground_friction, PD_gains, initial_pose
+├── 任务中偶尔突发
+│   └── interval       例：push（被撞）, wind_gust, gravity_tilt
+└── 每一步都在变（连续扰动）
+    └── step（或 obs corruption）  例：sensor_noise（多由 obs 噪声实现更高效）
+\end{codebox}
+
+\textbf{代码走读：interval 模式为什么要 per-env 计时器。}这是 EventManager 内部一个易被忽视但关键的设计。若 $4096$ 个环境在同一步同步收到 push，batch 内 transition 会高度相关，GAE 的 advantage 估计方差暴增（\cref{ch:rlmc-reward} 讲过 GAE 对样本相关性的敏感）。per-env 计时器让每个 env 独立触发，保持 batch 多样性：
+
+\begin{codebox}[Python]{interval 计时器逻辑（简化自 EventManager；关键行标注）}
+def _check_interval_timer(self, term_name, env_ids):
+    lo, hi = self._term_cfgs[term_name].interval_range_s
+    self._interval_timers[term_name] -= self._env.step_dt   # 每个 env 各自倒计时
+    expired = self._interval_timers[term_name] <= 0
+    env_ids_to_apply = expired.nonzero().squeeze(-1)        # 到期的那批 env
+    if len(env_ids_to_apply) > 0:
+        # 重采下一次间隔；必须显式 device，否则 CPU→CUDA 赋值触发 device mismatch
+        new_iv = torch.rand(len(env_ids_to_apply),
+                            device=self._env.device) * (hi - lo) + lo
+        self._interval_timers[term_name][env_ids_to_apply] = new_iv
+    return env_ids_to_apply
+\end{codebox}
+
+\textbf{运行验证。}配好事件后，看两处：(1) 训练日志里 EventManager 打印的各模式事件数是否与你的配置一致；(2) 用「\nameref{sec:rlmc-dr-quickstart}」一节的 cross-env std 脚本确认 startup/reset 项确实写进了 per-env 字段。interval 项可在一段 rollout 里统计「base 速度突变次数」间接确认其触发频率落在 \verb|interval_range_s| 内。
+
+\begin{pitfall}[interval 事件的 \texttt{is\_global\_time=True} 导致同步触发]
+\textbf{错误描述}：Isaac Lab 的 \verb|is_global_time=True| 让所有 env 共享一个全局计时器，于是所有 env 在同一步一起被 push。\textbf{现象后果}：对 locomotion，batch 多样性骤降，GAE 方差升高，训练曲线出现周期性抖动。\textbf{根本原因}：全局计时把「稀疏独立扰动」错配成了「全局同步冲击」。\textbf{正确做法}：locomotion 用 \verb|is_global_time=False|（默认），让每个 env 独立计时；只有在你\emph{确实}想模拟「全场同时受同一阵风」时才用全局。
+\end{pitfall}
+
+\begin{pitfall}[把 \texttt{reset} 当成「\texttt{startup} 的重复执行」]
+\textbf{错误描述}：以为 \verb|reset| 不过是每集再跑一遍 \verb|startup|。\textbf{现象后果}：把「应终身不变」的质量错放进 \verb|reset|，于是同一台机器人每集质量都不同——训练出的策略隐含「质量每集会变」的错误先验。\textbf{根本原因}：混淆了「出厂差异（startup，env 间不同、env 内不变）」与「环境差异（reset，每集重采）」。\textbf{正确做法}：质量/惯量/编码器偏置等硬件量用 \verb|startup|；摩擦/PD 增益/初始姿态等场景量用 \verb|reset|。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[分类题]} 把以下 DR 项分配到正确模式并说明物理理由：(a) 足底摩擦 (b) base mass (c) 外部推力 (d) encoder bias (e) 初始关节位置 (f) 重力方向微扰。\emph{验收}：(a)(e) reset，(b)(d) startup，(c)(f) interval，每项一句物理理由。
+  \item \textbf{[源码题]} 在 mjlab velocity task 的 cfg 中找出所有事件配置，画出触发时间线（startup 一次、reset 每集、interval 集中）。\emph{验收}：一张含三条泳道的时间线草图。
+  \item \textbf{[调试题]} 「有 DR 和无 DR 训练效果完全一样」。列出至少 3 个可能根因与排查步骤。\emph{验收}：覆盖（i）字段未 expand、（ii）entity pattern 空匹配、（iii）CUDA Graph 持旧指针 三类，各给一条排查命令。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{随机化什么：DR 函数映射与配置四维表}
+\label{sec:rlmc-dr-func}
+
+\paragraph{模块功能与在管线中的位置。}\cref{sec:rlmc-dr-mode} 解决了「何时」，本节解决「随机化什么、调用哪个函数、范围怎么选」。这是 DR 配置的「字典」——把 \cref{sec:rlmc-dr-dims} 的四维度落成具体 API。
+
+\subsection{完整 DR 函数对照表}
+\label{sec:rlmc-dr-func-table}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{3.0cm}p{3.4cm}cl@{}}
+\toprule
+物理参数 & mjlab 函数（\texttt{dr.*} 即 \texttt{mdp.dr}；push/impulse 在 \texttt{mdp}） & Isaac Lab 函数 & 推荐模式 & 典型范围 \\
+\midrule
+刚体质量 & \verb|dr.body_mass| & \verb|randomize_rigid_body_mass| & startup/reset & add: $(-1,3)$\,kg \\
+地面/足底摩擦 & \verb|dr.geom_friction| & \verb|randomize_rigid_body_material| & startup/reset & scale: $(0.5,1.25)$ \\
+PD 刚度 $K_p$ & \verb|dr.pd_gains| (\verb|kp_range|) & \verb|randomize_actuator_gains| & reset & log: $(0.75,1.5)$ \\
+PD 阻尼 $K_d$ & \verb|dr.pd_gains| (\verb|kd_range|) & \verb|randomize_actuator_gains| & reset & log: $(0.3,3.0)$ \\
+关节 armature & \verb|dr.dof_armature| & via joint properties & startup & scale: $(0.9,1.1)$ \\
+质心偏移 & \verb|dr.body_com_offset| & \verb|randomize_rigid_body_mass| (recompute) & startup & add: $(-2,2)$\,cm \\
+弹性系数 & 无现成函数（改 \verb|solref/solimp|） & via material & startup & $(0.0,0.5)$ \\
+外部推力 & \verb|push_by_setting_velocity| & \verb|push_by_setting_velocity| & interval & $(-1,1)$\,m/s \\
+脉冲力 & \verb|apply_body_impulse| & \verb|apply_external_force_torque| & step & $(0,50)$\,N \\
+重力方向 & 无现成函数（手动改 \verb|opt.gravity|） & \verb|randomize_physics_scene_gravity| & interval & $\pm 5^\circ$ \\
+惯量张量 & \verb|dr.pseudo_inertia| & 手动实现 & startup & $\alpha$: $(0.8,1.2)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{finenote}
+表中 mjlab 函数名已对 \texttt{mjlab.envs.mdp.dr} 子模块逐一核实（\texttt{dr.body\_mass / dr.geom\_friction / dr.pd\_gains / dr.dof\_armature / dr.body\_com\_offset / dr.pseudo\_inertia} 均为公开导出名，其中 \texttt{dr.dof\_armature} 是 \texttt{dr.joint\_armature} 的别名；\textbf{mjlab 无现成 restitution/gravity 随机化函数}，需手改 \texttt{solref/solimp} 与 \texttt{opt.gravity}）；Isaac Lab 的 \texttt{randomize\_rigid\_body\_mass} 用 \texttt{mass\_distribution\_params}、并有 \texttt{recompute\_inertia} 选项一并重算惯量。这套类型化、按字段的 \texttt{dr} API 自 mjlab \texttt{1.2.0}「Domain Randomization, Redesigned」起取代旧的 \texttt{randomize\_field} 接口，本部主线（1.2.0）至 1.4.0 实测均沿用上述命名；个别字段名仍可能跨版本增删，配置前在目标版本里 \texttt{import mjlab.envs.mdp.dr; dir(...)} 扫一眼即可，以你安装版本为准。\rebuilt{进阶索引（已在服务器实测 \texttt{dir(mjlab.envs.mdp.dr)}）}：上表只覆盖了 locomotion 最常用的子集，\texttt{dr} 子模块实际导出\textbf{ 40\,$+$ 个 DR 函数}，还包括视觉/光照/肌腱等更广的随机化能力——如 \texttt{camera} / \texttt{light} / \texttt{material} / \texttt{geom\_rgba}（视觉与渲染 DR，对 vision-based 策略有用）、\texttt{tendon\_*} / \texttt{site} / \texttt{jnt\_range} / \texttt{joint\_friction} / \texttt{dof\_frictionloss}（肌腱、关节限位、摩擦损耗）。要随机化本章未列的物理量时，先 \texttt{import mjlab.envs.mdp.dr; print([n for n in dir(mjlab.envs.mdp.dr) if not n.startswith("\_")])} 看一眼有没有现成函数，再照「\nameref{sec:rlmc-dr-inertia-expand} 的从零最小模板」自定义——能复用就别自己写。
+\end{finenote}
+
+\subsection{配置四维表：以足底摩擦为例}
+\label{sec:rlmc-dr-func-4d}
+
+光有函数名不够——每个配置项都该问四个问题：默认值哪来的、改了影响什么、合理范围多少、与谁耦合。下表以最常用的足底摩擦 DR 为例做\textbf{配置项四维分析}：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{2.6cm}p{3.0cm}p{2.4cm}p{2.6cm}@{}}
+\toprule
+配置项 & 默认值来源 & 修改影响 & 合理范围 & 与其他配置耦合 \\
+\midrule
+摩擦范围（mjlab \verb|ranges| / Isaac \verb|static_friction_range| 等） & legged\_gym 经验值 $(0.5,1.25)$ & 过窄不鲁棒；过宽（含极低摩擦）训不出步态 & $(0.4,1.5)$ & 与地形 curriculum 强耦合：低摩擦$+$粗糙地形几乎不可学 \\
+\verb|operation| & mjlab \verb|geom_friction| 默认 \verb|abs|；DR 实践常显式设 scale & scale 让不确定性随标称成比例；add 是绝对量 & scale & 与标称摩擦值耦合：scale 下真实范围 $=$ 标称 $\times$ range \\
+\verb|mode| & 物理语义决定 & startup $=$ 地面材质终身不变；reset $=$ 每集换地面 & startup 或 reset & 与 episode 长度耦合：reset 太频繁会增加非平稳性 \\
+\verb|num_buckets|（Isaac Lab） & PhysX 材质上限约束 & 太大 $\Rightarrow$ 超 PhysX 材质数上限崩溃；太小 $\Rightarrow$ 摩擦取值离散化粗 & $250$ & 与 \verb|num_envs| $\times$ body 数耦合 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[Isaac Lab 的 \texttt{num\_buckets} 是 PhysX 物理约束的泄漏]\label{ins:rlmc-dr-buckets}
+mjlab 没有 \verb|num_buckets|，Isaac Lab 却必须有——这不是 API 设计偏好，而是底层引擎差异的泄漏（\cref{ch:rlmc-physics} 的「引擎特性差异 vs 配置错误」在此再现）。PhysX 给每个场景的 unique 物理材质数设了上限，若 $4096$ 个 env $\times$ 若干 body 各要一个独立摩擦，材质数会爆表。\verb|randomize_rigid_body_material| 的对策是\textbf{预生成 \texttt{num\_buckets} 个材质}、把每个 body 随机指派到某个桶——用「离散化摩擦取值」换「不超 PhysX 上限」。\verb|num_buckets=250| 是社区经验折中：既够细，又远低于上限。\textbf{把它当 PhysX 的物理约束、而非可随意调的超参，才能解释它为何只在 Isaac Lab 一边存在}。
+\end{insight}
+
+\paragraph{UniLab 的第三种「泄漏」：后端能力门控。}把摩擦 DR 做成三框架对照后，会看到一条新的引擎约束泄漏。UniLab 既无 mjlab 的 \verb|expand_model_fields|，也无 Isaac Lab 的 \verb|num_buckets|——它的约束是\textbf{后端能力门控}：每个后端经 \verb|get_dr_capabilities()| 返回一个 \verb|DomainRandomizationCapabilities|（\verb|dr/types.py|），声明它支持哪些 reset 项。\textbf{MuJoCo 后端} 是静态全集 $11$ 项（含 \verb|geom_friction| / \verb|body_inertia| / \verb|dof_armature| / \verb|kp| / \verb|kd| 等）；\textbf{Motrix 后端} 是动态门控，基线仅 $4$ 项（\verb|base_mass_delta| / \verb|base_com_offset| / \verb|body_mass| / \verb|body_ipos|），按引擎能力\emph{追加} \verb|geom_friction| / \verb|kp| / \verb|kd| / \verb|gravity|——\textbf{Motrix 不支持 \texttt{body\_iquat} / \texttt{body\_inertia} / \texttt{dof\_armature}}。配错时 \verb|DomainRandomizationManager| 的 \verb|filter_reset_payload| 自动剔除不支持项（打 warning、不报错）。这与 \verb|num_buckets| 是同构的「引擎约束泄漏到配置层」：Isaac 的泄漏是\emph{材质数离散化}，UniLab 的泄漏是\emph{后端按能力裁剪 DR 清单}。\textbf{在 UniLab 上跨后端迁移 DR 配置时，先 \texttt{print(backend.get\_dr\_capabilities())} 确认目标后端支持该项，是 UniLab 版的「训练前体检」}。
+
+\subsection{采样分布与 operation 的选择}
+\label{sec:rlmc-dr-func-dist}
+
+DR 函数通常支持三种采样分布，选哪种取决于参数的物理特性：
+
+\textbf{均匀（uniform）}——参数范围明确且需均匀覆盖时用。摩擦、初始姿态偏移多用它（呼应 \cref{sec:rlmc-dr-theory} 练习 3：均匀分布保证边界被采到）。
+
+\textbf{对数均匀（log\_uniform）}——参数跨多个数量级时用。PD 阻尼可能从 $0.3$ 到 $3.0$：线性空间里 $[0.3,1.0]$ 只占 $26\%$，对数空间里却占 $50\%$。log\_uniform 让低值与高值都有足够采样概率。
+
+\textbf{高斯（gaussian）}——参数集中在标称值附近但有长尾时用（如观测噪声）。务必 clip 防极端值。
+
+\begin{codebox}[Python]{对数均匀采样：为什么 PD 阻尼要用它}
+import torch
+def log_uniform(low, high, size):
+    log_lo = torch.log(torch.tensor(low))
+    log_hi = torch.log(torch.tensor(high))
+    return torch.exp(torch.rand(size) * (log_hi - log_lo) + log_lo)
+
+d = log_uniform(0.3, 3.0, (4096, 12))   # PD 阻尼 0.3~3.0
+# 线性空间：约 50% 样本落在 [0.3, 1.0]，50% 落在 [1.0, 3.0]
+# 而 uniform(0.3, 3.0) 只有约 26% 落在 [0.3, 1.0] —— 低阻尼区域被欠采样
+\end{codebox}
+
+\verb|operation| 控制采样值如何施加到标称值上：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+operation & 含义 & 公式 & 适用场景 \\
+\midrule
+\verb|"add"| & 标称值上加偏移 & $\theta_{\mathrm{new}}=\theta_0+\Delta$ & 质量负载、编码器偏置（绝对量） \\
+\verb|"scale"| & 按比例缩放 & $\theta_{\mathrm{new}}=\theta_0\cdot s$ & 摩擦、PD 增益（相对不确定性） \\
+\verb|"abs"| & 直接设绝对值 & $\theta_{\mathrm{new}}=v$ & 需精确控制范围的参数 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{选择原则}：不确定性与标称值\emph{成比例}（「摩擦可能偏离标称 $\pm 30\%$」）用 \verb|scale|；不确定性是\emph{绝对量}（「负载 $\pm 2$\,kg」）用 \verb|add|。
+
+\paragraph{方法论：怎么为\emph{一台新机器人}从规格书推导 DR 范围（而不是抄 legged\_gym 经验值）。}本章给的范围（摩擦 $(0.5,1.25)$、PD $(0.75,1.5)$、armature $(0.9,1.1)$）大多是 legged\_gym 的社区经验值——对 Go1/Go2/ANYmal 够用，但你换一台\emph{没人调过}的机器人时，照抄就成了「巧合性正确」。下面给一套可操作的反推流程，核心是：\textbf{每个 DR 项的范围都该从一个\emph{真实物理不确定性来源}算出来，再决定 add 还是 scale}（呼应 \cref{sec:rlmc-dr-dims} 的可证伪原则）。
+
+\begin{enumerate}
+  \item \textbf{先列不确定性来源，再选 add/scale}。对每个待随机化参数，问「我的不确定性是\emph{绝对量}还是\emph{相对量}」：制造公差/装配误差/传感器零点多是\emph{绝对量}（datasheet 直接给 $\pm X$）$\to$ \verb|add|；增益标定误差/摩擦/材质老化多是\emph{相对量}（「约偏离标称 $\pm Y\%$」）$\to$ \verb|scale|。\textbf{判据}：范围是否随标称值大小而成比例伸缩——是则 scale，否则 add。
+  \item \textbf{质量：从 BOM 与负载反推 \texttt{add} 区间}。下界 $=-$（电池/外壳的制造公差，datasheet 或称重得，典型 $\pm 3\%\sim5\%$ 标称）；上界 $=+$（公差 $+$ 最大额定负载）。例 Go1 标称 $12.5$\,kg、公差 $\pm 5\%$（$\approx\pm 0.6$\,kg）、负载 $2$\,kg $\Rightarrow$ \verb|add: (-0.6, 2.6)|（本章练习用的 $(-1,3)$ 是含余量的圆整）。
+  \item \textbf{PD 增益：从控制器标定精度反推 \texttt{scale}$+$\texttt{log\_uniform}}。真机 PD 增益靠标定得到，标定误差通常以\emph{倍率}表述（「实际增益在标称的 $0.75\times\sim1.5\times$」），且跨数量级 $\to$ \verb|log_uniform|（\cref{sec:rlmc-dr-func-dist}）。\textbf{反推口诀}：增益越难精确标定（高减速比、串联弹性），倍率区间放越宽。
+  \item \textbf{传感器噪声：直接查 datasheet 的 noise density / 分辨率}。编码器取「分辨率 $\to$ rad」（如 $14$-bit $\to$ 量化噪声 $\approx 2\pi/2^{14}$）；IMU 取 datasheet 的 angular random walk 换算到控制周期。\textbf{这是唯一能从纸面规格直接读出 std 的一类}（\cref{sec:rlmc-dr-sensor} 的噪声表正是这么来的）。
+  \item \textbf{都没有 datasheet 时的兜底}：从窄区间起步（如 scale $(0.9,1.1)$）跑 Phase 1，能训通再逐步放宽（\cref{sec:rlmc-dr-phased}），并优先用 system ID（\cref{sec:rlmc-dr-beyond}）实测一组真值锚定中心，而非盲目放大。
+\end{enumerate}
+
+\noindent{}\textbf{一句话方法论}：DR 范围不是「越大越鲁棒」也不是「抄来就对」，而是「\emph{每一项}都能在 BOM/datasheet/标定报告里指出它的物理来源」——指不出来源的范围，就是 \cref{sec:rlmc-dr-dims} 说的「只能当压力测试、不算 sim-to-real 证据」。
+
+\paragraph{mjlab 进阶：\texttt{shared\_random} 让一组几何共享同一采样值。}mjlab 的 \verb|dr| 子模块函数（如 mjlab 1.4.0 的 \verb|dr/geom.py| 中的 \verb|geom_friction|）多支持一个 \verb|shared_random=True| 参数：开启后，被 \verb|SceneEntityCfg| 匹配到的\emph{一组} geom 共享\textbf{同一个}采样值，而非各采各的。典型用途是「四只脚同一摩擦」——物理上四只脚踩的是同一块地面，理应同摩擦；若各脚独立采样，等于假设「同一时刻四只脚踩在四种不同材质上」，这在平地上是非物理的。\textbf{这是一个「DR 也要尊重物理因果」的细节}：随机化的\emph{粒度}（per-geom 还是 per-group）本身就是一个该按真实物理来定的选择，呼应 \cref{sec:rlmc-dr-dims} 的「每个 DR 项都应追溯到具体物理不确定性」。
+
+\subsection{DR 配置验证工具}
+\label{sec:rlmc-dr-func-verify}
+
+\textbf{代码走读：训练前一键体检。}下面的脚本在训练\emph{开始前}就揪出配置错误——字段是否扩展、entity pattern 是否空匹配、数值范围是否合法。这把 \cref{sec:rlmc-dr-mode} 调试练习里的排查动作自动化了：
+
+\begin{codebox}[Python]{dr\_verify.py：DR 配置完整性检查（mjlab 风，关键行标注）}
+def verify_dr_config(env):
+    em, issues = env.event_manager, []
+    # [1] 各模式事件数 —— 确认 startup/reset/interval 都非空
+    for mode in ("startup", "reset", "interval", "step"):
+        terms = em._mode_term_cfgs.get(mode, {})
+        print(f"[{mode:>8s}] {len(terms)} events: {list(terms)}")
+    # [2] 字段是否被 expand（mjlab 特有）—— 没扩展 = DR 写不进仿真
+    fields = getattr(env.sim, "expanded_fields", None)
+    if not fields:
+        issues.append("No expanded fields -- DR may not be writing to sim!")
+    # [3] entity pattern 空匹配是头号静默失效源（见下方陷阱）
+    for mode, terms in em._mode_term_cfgs.items():
+        for name, (func, cfg) in terms.items():
+            ec = getattr(cfg, "params", {}).get("asset_cfg")   # mjlab DR 用 asset_cfg
+            if ec and getattr(ec, "body_names", None):
+                if len(env.scene[ec.name].find_bodies(ec.body_names)) == 0:
+                    issues.append(f"{name}: body pattern matched 0 bodies!")
+    # [4] 范围合法性 —— 空区间 / 负质量
+    for mode, terms in em._mode_term_cfgs.items():
+        for name, (func, cfg) in terms.items():
+            for k, v in getattr(cfg, "params", {}).items():
+                if isinstance(v, (tuple, list)) and len(v) == 2 \
+                   and all(isinstance(x, (int, float)) for x in v) and v[0] >= v[1]:
+                    issues.append(f"{name}.{k}: empty range {v}")
+    print("issues:", issues if issues else "none")
+    return not issues
+\end{codebox}
+
+\textbf{运行验证。}训练前调用 \verb|verify_dr_config(env)|，期望输出：四模式事件数与配置一致、expanded\_fields 非空、issues 为空。任一不满足就先修配置再训——\textbf{这一步省下的是「训了三小时才发现 DR 没生效」的代价}。
+
+\begin{pitfall}[entity pattern 空匹配导致 DR 静默失效]
+\textbf{错误描述}：用正则 \verb|"foot.*"| 匹配足端 geom，但 MJCF 里名字是 \verb|left_foot_1| / \verb|right_foot_2|，pattern 没匹配上（或大小写、前缀不符），摩擦随机化从未被应用。\textbf{现象后果}：训练正常、reward 正常上升，但策略实际跑在无 DR 环境里——是 DR 最隐蔽的失效方式。\textbf{根本原因}：正则与 MJCF/USD 实际命名不符，且空匹配通常不报错。\textbf{正确做法}：训练前在小 env 里 \verb|print(robot.find_bodies(pattern))| 确认匹配集非空；把这一检查并进 \verb|verify_dr_config| 的 [3]。
+\end{pitfall}
+
+\begin{pitfall}[Isaac Lab 的 \texttt{num\_buckets} 缺省（=1）或过大]
+\textbf{错误描述}：\verb|randomize_rigid_body_material| 不设 \verb|num_buckets|，或设得过大。\textbf{现象后果}：两种相反的失效——\emph{缺省}时该参数默认仅为 $1$（所有几何共用同一份材质），摩擦随机化\textbf{静默失效}（训练正常、reward 上升，却所有 env 同摩擦）；\emph{过大}时 $4096$\,env $\times$ body 数预生成的材质可能超 PhysX 材质上限，运行期崩溃。\textbf{根本原因}：见 \cref{ins:rlmc-dr-buckets}——PhysX 材质数有硬上限，而默认 $1$ 又远不够用。\textbf{正确做法}：显式设 \verb|num_buckets=250|（或按 env 规模微调），并理解这是「离散化摩擦取值」换「既够多样、又不超上限」。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[编程题]} 在 mjlab 里为 Go1 velocity task 加一项自定义 DR：随机化 \verb|dof_damping|，log\_uniform 分布、范围 $(0.5,2.0)$、\verb|operation="scale"|、\verb|mode="reset"|。\emph{验收}：reset 后 \verb|dof_damping| 的 cross-env std $>0$。
+  \item \textbf{[计算题]} \verb|damping_distribution_params=(0.3,3.0)| $+$ log\_uniform $+$ scale，标称阻尼 $d_0=1.0$。求随机化后阻尼的范围与中位数。\emph{验收}：范围 $[0.3,3.0]$、中位数 $=\exp(\tfrac12(\ln 0.3+\ln 3.0))=\sqrt{0.9}\approx 0.95$。
+  \item \textbf{[跨框架题]} 对比 mjlab 的 \verb|dr.geom_friction| 与 Isaac Lab 的 \verb|randomize_rigid_body_material|，两者实际效果等价吗？\emph{验收}：指出 bucket 离散化、static/dynamic 摩擦分离两点差异。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{物理一致的惯性随机化：pseudo-inertia}
+\label{sec:rlmc-dr-inertia}
+
+\paragraph{模块功能与在管线中的位置。}\cref{sec:rlmc-dr-func} 的质量随机化埋了个雷：只改质量、不改惯量，得到的刚体物理上不自洽。本节用 Rucker–Wensing 的 pseudo-inertia 参数化把这个雷拆掉，并接上 \cref{ch:rlmc-physics} 的 \verb|expand_model_fields| 讲清 per-env 字段的写入约束。
+
+\subsection{问题：朴素质量随机化的物理不一致}
+\label{sec:rlmc-dr-inertia-problem}
+
+一个刚体的惯性特征由 $10$ 个参数完整描述：质量 $m$（$1$ 个）、质心位置 $\mathbf c$（$3$ 个）、惯量张量 $\mathbf I$（$6$ 个独立分量，$\mathbf I$ 对称正定）。这 $10$ 个参数之间有物理约束——\textbf{不是所有 $(m,\mathbf c,\mathbf I)$ 组合都对应一个真实存在的刚体}。
+
+如果只随机化 $m$ 而不动 $\mathbf I,\mathbf c$，得到的刚体物理上不一致：质量翻倍但惯量不变，意味着平动响应变了、转动响应没变——好比一辆车质量翻倍却转弯半径不变。MuJoCo 在这种参数下不报错但行为可能失真，PhysX 可能静默接受或产生微妙的接触异常。\textbf{这是「改了配置却得到非物理结果」的典型，而非引擎 bug}。
+
+\subsection{pseudo-inertia 参数化（Rucker \& Wensing 2022）}
+\label{sec:rlmc-dr-inertia-pseudo}
+
+解决方案是用一个 \textbf{pseudo-inertia 矩阵} $\boldsymbol\Sigma\in\mathbb{R}^{4\times 4}$ 把 $10$ 个参数统一表示：
+
+\begin{equation}
+\boldsymbol\Sigma=
+\begin{pmatrix}
+\tfrac{1}{2}\operatorname{tr}(\mathbf I)\,\mathbf I_3-\mathbf I+m\,\mathbf c\mathbf c^{\mathsf T} & m\,\mathbf c \\[2pt]
+m\,\mathbf c^{\mathsf T} & m
+\end{pmatrix}.
+\label{eq:rlmc-dr-pseudoinertia}
+\end{equation}
+
+关键性质：$\boldsymbol\Sigma$ 对称正定 $\Longleftrightarrow$ $(m,\mathbf c,\mathbf I)$ 物理一致。因此只要在\emph{对称正定矩阵空间}里采样，就自动保证了物理一致性——把一个带约束的采样问题转成无约束的。Rucker \& Wensing（IEEE RA-L, vol.~7, 2022，「Smooth Parameterization of Rigid-Body Inertia」）\cite{rucker2022pseudoinertia} 进一步给出 $\boldsymbol\Sigma$ 的 \textbf{log-Cholesky} 参数化，构造了一个从 $\mathbb{R}^{10}$ 到全物理一致惯量集合的光滑同构映射，使惯性辨识/随机化可在向量空间上无约束进行，且无特征值分解的奇异性。
+
+\begin{paper}[Rucker \& Wensing 2022：刚体惯量的光滑参数化]\label{paper:rlmc-dr-pseudo}
+\textbf{问题}：基于特征值分解或主惯量的惯量参数化存在非唯一与奇异性，约束优化困难。\textbf{核心思想}：对 pseudo-inertia 矩阵 $\boldsymbol\Sigma$ 做 log-Cholesky 分解，得到 $\mathbb{R}^{10}\to\{\text{物理一致惯量}\}$ 的光滑同构；每个参数都有清晰的几何意义。\textbf{关键结果}：物理一致性「免费」保证，无奇异、无非唯一，适配无约束优化。\textbf{与本书关系}：mjlab 的 pseudo-inertia DR 直接落地这套数学；它把「质量/惯量随机化」从「容易写出非物理参数」变成「天然物理一致」。\textbf{局限}：扰动幅度（如全局密度缩放 $\alpha$）过大时 Cholesky 分解仍可能数值失败（见下方陷阱）。
+\end{paper}
+
+\paragraph{三框架对照：谁有物理一致的惯量 DR。}这是三框架差异最大的一节。\textbf{mjlab} 把 pseudo-inertia 做成一等公民——\verb|dr| 子模块里直接有 \verb|pseudo_inertia| 函数（mjlab 1.4.0 的 \verb|dr/body.py| 中，\verb|pseudo_inertia| 经 \verb|_cholesky_4x4| / \verb|_decompose_pseudo_inertia_J| / \verb|_reconstruct_pseudo_inertia_J| 实现 $\boldsymbol\Sigma$ 上扰动 $+$ Cholesky 重构 $+$ 平行轴定理搬回 body 原点）。\textbf{Isaac Lab} 无现成 pseudo-inertia 函数，需在 \verb|randomize_rigid_body_mass| 的 \verb|recompute_inertia| 基础上手动实现 Cholesky 重构。\textbf{UniLab 无对应}：UniLab 的 reset DR 只到 \verb|body_inertia| / \verb|body_ipos| / \verb|body_iquat| 级（MuJoCo 后端的 11 个 reset 项之一），\textbf{不保证扰动后惯量张量正定}——它没有 Cholesky 重构的物理合法惯量 DR（已据源码核对，见 UniLab \verb|dr/types.py| 的 reset 项清单）。\textbf{这意味着在 UniLab 上做惯量随机化时，须自行约束扰动幅度以避免非物理参数，或退而只随机化质量}。
+
+\textbf{代码走读：从 $\boldsymbol\Sigma$ 采样并提取物理参数。}下面是 mjlab pseudo-inertia DR 的核心逻辑（简化）。思路是：构造 $\boldsymbol\Sigma\to$ Cholesky 得 $\mathbf L\to$ 在 $\mathbf L$ 上做全局密度缩放 $\to$ $\mathbf L\mathbf L^{\mathsf T}$ 恢复正定 $\to$ 反解 $(m,\mathbf c,\mathbf I)$：
+
+\begin{codebox}[Python]{pseudo-inertia 随机化核心（简化自 mjlab dr/body.py）}
+def randomize_pseudo_inertia(m, c, I, alpha_range, env_ids):
+    """m:[N], c:[N,3], I:[N,3,3] → 返回物理一致的 (m_new, c_new, I_new)。"""
+    N, dev = len(env_ids), m.device
+    eye = torch.eye(3, device=dev).unsqueeze(0)
+    # 1) 构造 pseudo-inertia Σ ∈ R^{N×4×4}（式 6.x）
+    sigma = torch.zeros(N, 4, 4, device=dev)
+    trI = torch.diagonal(I, dim1=1, dim2=2).sum(1).view(N, 1, 1)
+    sigma[:, :3, :3] = 0.5 * trI * eye - I \
+                       + m.view(N,1,1) * torch.bmm(c.unsqueeze(2), c.unsqueeze(1))
+    sigma[:, :3, 3] = m.unsqueeze(-1) * c
+    sigma[:, 3, :3] = m.unsqueeze(-1) * c
+    sigma[:, 3, 3]  = m
+    # 2) Cholesky：Σ = L Lᵀ（要求 Σ 正定 —— 物理一致的前提）
+    L = torch.linalg.cholesky(sigma)
+    # 3) 全局密度缩放 α（对 L 缩 √α，等价对 Σ 缩 α）
+    alpha = torch.rand(N,1,1, device=dev) * (alpha_range[1]-alpha_range[0]) + alpha_range[0]
+    sig2 = torch.bmm(L*torch.sqrt(alpha), (L*torch.sqrt(alpha)).transpose(1,2))
+    # 4) 反解物理参数：m, c, 再用平行轴定理从原点移回质心得 I
+    m_new = sig2[:, 3, 3]
+    c_new = sig2[:, :3, 3] / m_new.unsqueeze(-1)
+    S = sig2[:, :3, :3]                                  # 关于原点的二阶矩
+    I_origin = torch.diagonal(S, dim1=1, dim2=2).sum(1).view(N,1,1) * eye - S
+    I_new = I_origin - m_new.view(N,1,1) * (
+        c_new.square().sum(1).view(N,1,1) * eye
+        - torch.bmm(c_new.unsqueeze(2), c_new.unsqueeze(1)))
+    return m_new, c_new, I_new
+\end{codebox}
+
+\subsection{per-env 字段写入：接上 expand\_model\_fields}
+\label{sec:rlmc-dr-inertia-expand}
+
+\cref{ch:rlmc-physics} 已经讲过 mjlab 的 \verb|expand_model_fields| 把共享的 model 字段扩展成 per-env 数组、并在 CUDA Graph capture \emph{之前}完成。这里补上 DR 写入侧最关键的一条工程约束。
+
+\paragraph{mjlab 怎么知道要扩展哪些字段：\texttt{@requires\_model\_fields} 装饰器。}这里要修正一个常见的误解：扩展哪些字段\emph{不是}手写死的，而是\textbf{声明式}的。mjlab 每个 DR 函数用装饰器声明它要改的字段与重算等级——mjlab 1.4.0 的 \verb|event_manager.py| 中，\verb|requires_model_fields("body_mass", recompute=RecomputeLevel.set_const)| 把字段名挂到 \verb|func.model_fields|；env 构造时（\verb|manager_based_rl_env.py| 的 \verb|ManagerBasedRlEnv| 中）统一调 \verb|sim.expand_model_fields(event_manager.domain_randomization_fields)| 一次性把所有被声明的字段展开成 per-world，派生字段按 \verb|RecomputeLevel| 自动追加。\textbf{这套「装饰器声明 $\to$ 自动收集 $\to$ 统一扩展」的范式是 mjlab 的 DR 工程核心}：你加一个新 DR 项时只要在函数上声明它碰哪些字段，框架就自动保证那些字段被 expand、CUDA Graph 在扩展后重捕获——\verb|_graph_captured| 这种底层状态用户从不手动碰。下面的 \verb|_randomize_model_field| 走读是\emph{写入侧}的简化，省略了装饰器收集这一步。
+
+\begin{insight}[原地写入是 CUDA Graph 安全的命门]\label{ins:rlmc-dr-inplace}
+DR 把采样值写回 per-env 数组时，必须 \verb|field[env_ids] = new_values|（\verb|__setitem__|，\emph{原地}改内容、GPU 指针地址不变），\textbf{绝不能} \verb|field = new_values|（替换整个 tensor，指针变了）。原因：MuJoCo Warp 用 CUDA Graph 预录 kernel 序列（\cref{ch:rlmc-physics} 的 GPU 数据流），Graph replay 时读的是\emph{录制时那块内存地址}。原地写入只改内容、地址不变，replay 仍读到更新后的值；替换 tensor 改了地址，Graph 还读旧地址——DR 值被静默忽略。\textbf{这一行 \texttt{=} 的写法，是「DR 配置全对、字段也扩展了、却毫无效果」这类最难查 bug 的根因}。
+\end{insight}
+
+\begin{codebox}[Python]{DR 写入核心：原地写入 + 按需重算派生量（简化自 dr/\_core.py）}
+def _randomize_model_field(sim, field_name, env_ids, params, operation, distribution):
+    field = getattr(sim.model, field_name)
+    assert field.ndim >= 2, f"{field_name} 未 expand！先 expand_model_fields。"
+    default = sim._default_snapshot[field_name]            # scale/add 的基准
+    lo, hi = params
+    shape = (len(env_ids),) + field.shape[1:]
+    if distribution == "uniform":
+        s = torch.rand(shape, device=sim.device) * (hi - lo) + lo
+    elif distribution == "log_uniform":
+        s = torch.exp(torch.rand(shape, device=sim.device)
+                      * (torch.log(torch.tensor(hi)) - torch.log(torch.tensor(lo)))
+                      + torch.log(torch.tensor(lo)))
+    new = default[env_ids] * s if operation == "scale" else \
+          default[env_ids] + s if operation == "add" else s
+    field[env_ids] = new                                   # >> 原地写入，CUDA Graph 安全
+    if field_name in {"body_mass", "body_ipos", "body_inertia"}:
+        sim.recompute_constants(env_ids)                   # 质量/惯量改了要重算派生量
+\end{codebox}
+
+\paragraph{从零写一个新 DR 函数：端到端最小路径（教会你举一反三）。}前面把装饰器范式（line~\pageref{ins:rlmc-dr-inplace} 前一段）、写入侧（上方 codebox）、验证侧（\nameref{sec:rlmc-dr-quickstart} 的 cross-env std）分别讲透了，但它们散在各处——本段把它们\textbf{串成一条从零开始的最小路径}，让你下次想随机化一个章节没覆盖的字段（如 \verb|dof_frictionloss| 关节摩擦损耗）时，照这五步即可，不必逆向整个框架。核心心法只有一句：\textbf{「声明碰哪个字段 $\to$ 原地写 $\to$ 挂进 events $\to$ 跑 verify 确认 std$>$0」}，框架替你管 expand 与 CUDA Graph。
+
+\begin{codebox}[Python]{从零加一个 DR 函数：dof\_frictionloss 随机化（端到端 10 行可跑）}
+# ── 第 1 步：写函数，用 @requires_model_fields 声明它碰哪个字段 + 重算等级 ──
+#    dof_frictionloss 是派生无关量(类比 dof_damping)，故 recompute=none
+from mjlab.managers.event_manager import requires_model_fields, RecomputeLevel
+import torch
+
+@requires_model_fields("dof_frictionloss", recompute=RecomputeLevel.none)  # ← 声明！
+def dof_frictionloss(env, env_ids, asset_cfg, ranges, operation="scale"):
+    asset = env.scene[asset_cfg.name]
+    field = asset.model.dof_frictionloss            # 已被框架 expand 成 per-env
+    lo, hi = ranges
+    s = torch.rand((len(env_ids),) + field.shape[1:], device=env.device)*(hi-lo)+lo
+    base = env.sim._default_snapshot["dof_frictionloss"][env_ids]
+    field[env_ids] = base * s if operation == "scale" else base + s   # ← 原地写！
+    # 注意：没有 field = ...；没有手动 expand；没有碰 _graph_captured —— 框架全包了
+
+# ── 第 2 步：挂进 task cfg 的 events 字典（与 Quick Start 同构）──
+events["joint_frictionloss"] = EventTermCfg(
+    func=dof_frictionloss, mode="reset",
+    params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "ranges": (0.8, 1.2), "operation": "scale"})
+
+# ── 第 3 步：训练前 verify（复用 dr_health_check / cross-env std）──
+env.reset()
+fld = env.scene["robot"].model.dof_frictionloss
+assert fld.ndim >= 2, "字段没 expand —— 第 1 步装饰器没生效？检查 import 路径"
+print("cross-env std =", fld.float().std(dim=0).mean().item())   # >1e-6 即生效
+\end{codebox}
+
+\noindent{}这五步（声明 $\to$ 写函数 $\to$ 原地写 $\to$ 挂 events $\to$ verify）就是 mjlab 里加任意一项 DR 的\textbf{通用模板}。\textbf{排错指针}：若第 3 步 \verb|assert| 挂了（字段没 expand），\emph{首查第 1 步}——多半是装饰器没 import 对、或函数没被 events 引用到（框架只扫被 events 用到的函数的 \verb|model_fields|）；若 \verb|assert| 过但 std$\approx 0$，转 \cref{ins:rlmc-dr-inplace} 查是不是误写成了 \verb|field = ...|。Isaac Lab 侧的「从零」路径不同：无装饰器/expand 概念，自定义函数直接调 \verb|asset.write_*_to_sim| 写回 PhysX 即可，但同样要在 \verb|@configclass EventCfg| 里挂一项并 verify。
+
+\textbf{配置详解：RecomputeLevel 与性能。}MuJoCo 里许多量从基础参数派生，改基础参数后可能要 \verb|recompute_constants()|。重算代价分级：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{3.6cm}p{3.8cm}l@{}}
+\toprule
+等级（值） & 重算什么 & 改了哪些字段后用 & 性能影响 \\
+\midrule
+\verb|none|（0） & 无需重算 & \verb|geom_friction|, \verb|dof_damping| & 几乎为零 \\
+\verb|set_const_fixed|（1） & 重算 \verb|body_subtreemass| & \verb|body_gravcomp| & 小 \\
+\verb|set_const_0|（2） & 重算 \verb|*invweight0| / \verb|tendon_*0| & \verb|dof_armature|, \verb|body_inertia|, \verb|body_pos/quat|, \verb|qpos0| & 中等 \\
+\verb|set_const|（3） & 完整重算（前几级的超集） & \verb|body_mass|, \verb|body_ipos| & 较大 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{工程含义}：\verb|set_const| 级字段（质量、质心、惯量）只放 \verb|startup| 或 \verb|reset|（每集至多触发一次），\textbf{绝不放 step 或高频 interval}——否则每步重算派生常量，吞吐崩塌。这与 \cref{ins:rlmc-dr-mode-physics} 一脉相承：把质量放进高频模式，既物理不合理，又性能灾难。
+
+\textbf{运行验证。}(1) pseudo-inertia DR 后，抽查几个 env 的 $\boldsymbol\Sigma$ 是否仍正定（\verb|torch.linalg.eigvalsh(sigma).min() > 0|）；(2) 用「\nameref{sec:rlmc-dr-quickstart}」一节的 cross-env std 确认 \verb|body_mass|/\verb|body_inertia| per-env 不同；(3) 用 \verb|measure_dr_overhead| 量 steps/s，若开 DR 后下降 $>30\%$，多半是 \verb|set_const| 级字段误入高频模式。
+
+\begin{pitfall}[pseudo-inertia 的 $\alpha$ 范围过大导致 NaN]
+\textbf{错误描述}：把全局密度缩放 $\alpha$ 设得太极端（如 $(0.01,100)$）。\textbf{现象后果}：Cholesky 分解对近奇异矩阵数值失败，惯量出现 NaN，仿真整体爆。\textbf{根本原因}：Cholesky 要求严格正定，极端缩放把 $\boldsymbol\Sigma$ 推到数值病态——\textbf{与用哪种 Cholesky 实现无关}：mjlab 真实实现并\emph{不}调 \verb|torch.linalg.cholesky|，而是自写 \verb|_cholesky_4x4|（动机见下方 finenote），但「近奇异 $\Rightarrow$ 分解 NaN」这条数值病理对任何 Cholesky 都成立。\textbf{正确做法}：从 $(0.9,1.1)$ 起步，确认稳定后逐步放宽到 $(0.7,1.5)$；分解前可加微小对角正则或 try/except 回退到原参数。
+\end{pitfall}
+
+\begin{finenote}
+\rebuilt{为什么 mjlab 自写 \texttt{\_cholesky\_4x4} 而非调 \texttt{torch.linalg.cholesky}（已据 \texttt{dr/body.py} 源码核对）}：\texttt{torch.linalg.cholesky} 走 cuSOLVER，而 cuSOLVER 在调用时会做\textbf{运行期动态分配 / 句柄获取}，这恰好踩中 \cref{ch:rlmc-physics} 讲的 CUDA Graph 雷区——Graph capture 期间不允许动态分配，replay 又要求 kernel 序列固定。pseudo-inertia DR 跑在 reset 路径上（可能在 capture 范围内），一个固定 $4\times4$ 矩阵的 Cholesky 用闭式手写公式即可，既无外部库句柄、又是纯逐元素 kernel，天然 CUDA Graph 安全。\textbf{这是「为 CUDA Graph 让路而避开通用线性代数库」的又一处工程取舍}，与 \cref{ins:rlmc-dr-inplace} 的「原地写入」同源——\textbf{凡是会在 capture 域内触发动态分配的调用（cuSOLVER/cuBLAS 的某些路径、tensor 替换），都要为 Graph 让路}。上面的走读代码标了「简化自」，写 \verb|torch.linalg.cholesky| 只为示意数学，真要在 mjlab 的 DR 路径里加自定义分解，须照此避开 cuSOLVER。
+\end{finenote}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[计算题]} Go1 标称 base 质量 $12.5$\,kg，pseudo-inertia $\alpha=(0.8,1.2)$。求随机化后质量范围，并解释为何比直接 \verb|add(-2.5,2.5)| 更好。\emph{验收}：范围 $[10,15]$\,kg；关键点是 $\alpha$ 同时一致缩放 $m,\mathbf c,\mathbf I$，而 \verb|add| 只改 $m$ 留下物理不一致。
+  \item \textbf{[编程题]} 写一个 pseudo-inertia 一致性校验：给定 $(m,\mathbf c,\mathbf I)$，构造 $\boldsymbol\Sigma$ 并检查其是否正定。\emph{验收}：对物理一致参数返回 True，对「只翻倍 $m$ 不动 $\mathbf I$」的参数返回 False（或最小特征值 $\le 0$）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{外力扰动：push 与 impulse}
+\label{sec:rlmc-dr-force}
+
+\paragraph{模块功能与在管线中的位置。}前几节随机化的是「环境固有属性」（摩擦/质量/增益），本节随机化「外部事件」——主动推机器人一把，逼它学会从扰动中恢复。这是 \cref{sec:rlmc-dr-dims} 第四维「环境」的落地，也是 push-recovery 能力的训练来源。
+
+\subsection{push vs impulse：两种外力模型}
+\label{sec:rlmc-dr-force-two}
+
+\textbf{push（速度注入）}：直接设 base 的线/角速度，物理上等价于瞬间施加一个冲量。简单高效，是 locomotion 训练的标准选择。
+
+\begin{codebox}[Python]{push\_by\_setting\_velocity 核心逻辑}
+def push_by_setting_velocity(env, env_ids, velocity_range):
+    robot = env.scene["robot"]
+    v = torch.zeros(len(env_ids), 6, device=env.device)
+    for i, key in enumerate(["x","y","z","roll","pitch","yaw"]):
+        if key in velocity_range:
+            lo, hi = velocity_range[key]
+            v[:, i] = torch.rand(len(env_ids), device=env.device)*(hi-lo)+lo
+    robot.write_root_velocity_to_sim(v, env_ids)     # 直接覆写 base 速度
+\end{codebox}
+
+\textbf{impulse（力/力矩注入）}：在指定 body 上施加外力，持续若干步后清零。更物理真实，但要管理力的生命周期——通常需 \verb|step| 模式。
+
+\begin{insight}[push 比 impulse 更「假」却更常用]\label{ins:rlmc-dr-push}
+直觉上 impulse（施加真实力）比 push（直接改速度）更物理。但几乎所有主流 locomotion 工作——Rudin et al.（minutes-to-train，arXiv:2109.11978）\cite{rudin2021minutes}、Walk-These-Ways（Margolis \& Agrawal, CoRL 2022）\cite{margolis2022walk}、extreme-parkour（Cheng et al., 2024）\cite{cheng2024parkour}——都用 \verb|push_by_setting_velocity|。原因有三：(1) push 不需管理力的生命周期（施加即生效、下一拍自然回到 PD 控制）；(2) push 与 MuJoCo/PhysX 不同的力模型无关，跨引擎行为一致（呼应 \cref{ch:rlmc-physics} 的 sim2sim 关切）；(3) 「瞬间速度扰动」恰好是「被撞一下」的良好近似。\textbf{这是一个「工程实用性压过物理精确性」的典型决策}——除非你要精确建模某个已知外力时序，否则 push 是默认选择。
+\end{insight}
+
+\subsection{频率与强度的选择}
+\label{sec:rlmc-dr-force-tune}
+
+push 强度要与机器人质量和步态速度匹配。下表给出常见平台的经验值：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lcccp{3.0cm}@{}}
+\toprule
+机器人 & 质量 & 推荐 push 线速度 & 等效冲量 & 说明 \\
+\midrule
+Go1 & $\sim 12$\,kg & $\pm 1.0$\,m/s & $\sim 12$\,N$\cdot$s & 中等力度手推 \\
+Go2 & $\sim 15$\,kg & $\pm 1.0$\,m/s & $\sim 15$\,N$\cdot$s & 与 Go1 类似 \\
+ANYmal-C & $\sim 50$\,kg & $\pm 0.5$\,m/s & $\sim 25$\,N$\cdot$s & 大型四足需更大绝对冲量 \\
+G1（人形） & $\sim 35$\,kg & $\pm 0.3$\,m/s & $\sim 10.5$\,N$\cdot$s & 人形平衡更脆弱，推力要小 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{finenote}
+表中质量与等效冲量为量级估计（\rebuilt{各平台质量随版本/配置变动，请以目标 URDF/MJCF 的实际 \texttt{body\_mass} 求和为准}）。等效冲量 $\approx m\cdot\Delta v$ 仅为直觉换算，不计接触与重力在扰动窗口内的贡献。
+\end{finenote}
+
+\textbf{经验法则}：push 强度应使训练充分后策略有 $>80\%$ 概率在 $1$ 秒内恢复平衡。恢复率 $<50\%$ 说明 push 太强；$>98\%$ 说明太弱。push 间隔（\verb|interval_range_s|）取 $10$--$15$\,s，给策略足够恢复时间。
+
+\begin{finenote}
+\rebuilt{本节的 push 参数是\emph{推荐区间}，与 mjlab shipped 默认有差，照搬 shipped task 会看到不一样的行为（已在服务器读 \texttt{velocity\_env\_cfg.py} 核对）}：真实 Go1 velocity task 的 shipped 默认 \verb|push_robot| 用的是 \verb|interval_range_s=(1.0,3.0)|（远比本节推荐的 $(10,15)$ \emph{激进}——几乎每隔 $1$--$3$ 秒就推一次），且 \verb|velocity_range| 是\textbf{完整 6 维}（\verb|x/y/z/roll/pitch/yaw| 全有，平面线速度区间约 $\pm 0.5$\,m/s），而非本节示例为讲清楚只写的平面 \verb|x/y|。差异的工程含义：(1) shipped 的高频 push 把「恢复」直接编进了稳态步态（策略必须时刻准备被推），代价是更难训、tracking 略低；本节推荐的 $(10,15)$ 更适合\emph{分阶段}先稳后扰（\cref{sec:rlmc-dr-force-phased}）。(2) shipped 的 6 维扰动连 \verb|z|/翻滚都随机，比平面推更全面。\textbf{所以读者照抄 shipped task 训练时若发现「被推得很频繁、还带上下颠簸」，这是默认配置而非 bug}——要更温和就显式覆盖 \verb|interval_range_s| 与 \verb|velocity_range|。
+\end{finenote}
+
+\subsection{分阶段引入 push}
+\label{sec:rlmc-dr-force-phased}
+
+\begin{insight}[push 太早会教坏策略：学到「别动」]\label{ins:rlmc-dr-push-early}
+若策略还不会走路就施加 push，它每次被推都摔——reward 几乎全负，策略学不到「如何抵抗推力」，反而可能发现：站着不动被推倒的 penalty，比走路时被推倒的 penalty\emph{更小}（移动中失稳更易摔），于是「不动」成了对 push 的「最优」响应。这与 \cref{ins:rlmc-dr-expectation} 的「DR 可能为难区域选择放弃」是同一现象的微观版本。\textbf{正确做法}：先在无 push 环境训到基本稳定，再引入 push——这正是 \cref{ch:rlmc-reward} curriculum「先学基础再加难度」在 DR 上的体现，也引出下一节的分阶段方案。
+\end{insight}
+
+\textbf{运行验证。}push 配好后：(1) 在一段 rollout 里检测 base 速度的突变，确认 push 触发频率落在 \verb|interval_range_s|；(2) 训练后期看「被推后 $1$--$2$ 秒内是否恢复正常步态」（可用 \cref{sec:rlmc-dr-robust} 的 push-recovery 评估）。
+
+\begin{pitfall}[push 过早引入导致策略「躺平」]
+\textbf{错误描述}：训练第一步就激活 push。\textbf{现象后果}：摔倒率可冲到 $>90\%$，策略收敛到「最小移动」的躺平行为。\textbf{根本原因}：见 \cref{ins:rlmc-dr-push-early}。\textbf{正确做法}：Phase 0--3 不配 push，Phase 4 在已稳定的 baseline 上 resume 训练时再加入（与 \cref{sec:rlmc-dr-phased} 六阶段一致）。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[设计题]} 为 $12.5$\,kg 四足设计 push 配置，并计算 $1$\,m/s push 等效多大冲量力（设作用时间 $0.02$\,s $=$ 一个 policy step）。\emph{验收}：冲量 $\approx 12.5\times 1=12.5$\,N$\cdot$s；若挤进一个 step，等效力 $\approx 12.5/0.02=625$\,N（说明 push 是「瞬时」近似，故不用真实施力）。
+  \item \textbf{[实验题]} 对比三种 push 配置的训练效果：(a) 无 push (b) 第 $0$ 步起 push (c) 第 $500$ iteration 起 push。\emph{验收}：预测 (b) 摔倒率最高/可能躺平，(c) 兼顾稳定与 recovery，并给出验证指标（摔倒率、push-recovery 成功率）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{传感器 DR：观测噪声、延迟与偏置}
+\label{sec:rlmc-dr-sensor}
+
+\paragraph{模块功能与在管线中的位置。}前面随机化的都是\emph{物理参数}，本节随机化\emph{策略看到的信息}——这是 \cref{sec:rlmc-dr-dims} 第三维「感知」，且实现位置从 EventManager 转到了 ObservationManager（\cref{ch:rlmc-manager}）。真实传感器有噪声、延迟、零点偏置，只在 clean obs 上训练的策略部署时会失控。
+
+\subsection{观测噪声：per-term 注入}
+\label{sec:rlmc-dr-sensor-noise}
+
+mjlab 与 Isaac Lab 的 ObservationManager 都支持给每个观测项单独加噪声：
+
+\begin{codebox}[Python]{mjlab：per-term 高斯噪声（只加在 actor 观测上）}
+observations = {
+  "actor": {
+    "joint_pos_rel": ObservationTermCfg(func=mdp.joint_pos_rel,
+        noise=GaussianNoiseCfg(mean=0.0, std=0.01)),   # ±0.01 rad
+    "joint_vel_rel": ObservationTermCfg(func=mdp.joint_vel_rel,  # mjlab 真名 joint_vel_rel
+        noise=GaussianNoiseCfg(mean=0.0, std=0.05)),   # ±0.05 rad/s
+    "base_ang_vel":  ObservationTermCfg(func=mdp.base_ang_vel,
+        noise=GaussianNoiseCfg(mean=0.0, std=0.02)),
+    "projected_gravity": ObservationTermCfg(func=mdp.projected_gravity,
+        noise=GaussianNoiseCfg(mean=0.0, std=0.01)),
+  },
+  # 注意：critic 观测不加噪声（见下方洞察）
+}
+\end{codebox}
+
+\begin{codebox}[Python]{Isaac Lab：等价 per-term 噪声}
+@configclass
+class ObservationsCfg:
+    @configclass
+    class PolicyCfg:                                    # actor 分支
+        joint_pos    = ObsTerm(func=mdp.joint_pos_rel,
+            noise=Gnoise(mean=0.0, std=0.01))
+        joint_vel    = ObsTerm(func=mdp.joint_vel,
+            noise=Gnoise(mean=0.0, std=0.05))
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel,
+            noise=Gnoise(mean=0.0, std=0.02))
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab：观测噪声在 \_compute\_obs 里逐项手动注入（无 ObservationManager）}
+# UniLab 非 Manager-Based：无 ObservationTermCfg/noise= 声明式 API，
+# 噪声经 env 的 _obs_noise(data, scale) 在 _compute_obs 里逐项加，且只加在 actor 组
+def _compute_obs(self, info, gyro, gravity, dof_pos, dof_vel, feet_phase):
+    nc = self._cfg.noise_config           # NoiseConfig：level + 各 per-term scale
+    diff = dof_pos - self.default_angles
+    obs = np.concatenate([                # actor：真机可得量 + 噪声
+        self._obs_noise(gyro, nc.scale_gyro),          # 角速度 std≈level*scale_gyro
+        -self._obs_noise(gravity, nc.scale_gravity),   # 投影重力
+        self._obs_noise(diff, nc.scale_joint_angle),   # 关节角差 ≈ 0.01 rad
+        self._obs_noise(dof_vel, nc.scale_joint_vel),  # 关节速 ≈ 0.05 rad/s
+        info.get("current_actions", np.zeros_like(diff)),
+        info["commands"], feet_phase], axis=1)
+    critic = np.concatenate([             # critic：无噪声 + 追加特权 base linvel
+        gyro, -gravity, diff, dof_vel, info["current_actions"],
+        info["commands"], feet_phase, self.get_local_linvel()], axis=1)
+    return {"obs": obs, "critic": critic}
+# _obs_noise(data, scale)：幅度 = level * scale * U(-1,1)（均匀噪声，非高斯）；
+#   noise_config.level <= 0 时整体关闭；critic 组从不加噪声（呼应下方非对称洞察）。
+\end{codebox}
+
+噪声 std 参考值（与真实传感器规格对齐）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+传感器 & 典型噪声 & 推荐 std & 来源 \\
+\midrule
+关节编码器 & $\pm 0.5^\circ$ & $0.01$\,rad & Unitree Go1 规格 \\
+关节速度（数值微分） & $\pm 2$--$5\%$ & $0.05$\,rad/s & 经验值 \\
+IMU 角速度 & $\pm 0.5$--$2^\circ$/s & $0.02$\,rad/s & MPU-6050 规格 \\
+projected gravity & $\pm 1$--$3\%$ & $0.01$ & 从 IMU 派生 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{finenote}
+上表数值为常见量级（\rebuilt{具体规格随传感器型号变化，部署前请查目标硬件 datasheet}）。
+\end{finenote}
+
+\begin{insight}[obs 噪声只加在 actor，critic 看 clean obs]\label{ins:rlmc-dr-asym}
+这是 \cref{ch:rlmc-obsact} 非对称 actor-critic 设计在 DR 训练里的直接兑现。critic 需要\emph{干净}信号来准确估计 value——给 critic 加噪声等于给 PPO 的 value target 加噪声，advantage 质量下降、训练不稳。actor 则被迫学会在噪声下做正确决策（部署时只有 actor 上线，且部署时观测就是带噪的）。更进一步：若 critic 还能额外看到 DR 参数本身（摩擦、质量）作为\emph{特权信息}，它就能为「同一 state、不同摩擦」学到精确 value，而非被迫预测一个对谁都不准的「平均 value」。\textbf{DR $+$ 非对称 AC $+$ Teacher-Student 三者的接口，正是「actor 用部署可得信号、critic 用特权信号」这条原则}（详见 \cref{ch:rlmc-obsact} 与 \cref{ch:rlmc-privileged} 的 Teacher-Student 蒸馏）。
+\end{insight}
+
+\subsection{观测延迟与编码器偏置}
+\label{sec:rlmc-dr-sensor-delay}
+
+真实控制系统的传感器有不同延迟（关节编码器 $\sim 1$\,ms、IMU $\sim 3$\,ms、深度相机 $\sim 33$\,ms）。延迟意味着策略收到的是\emph{过去某一步}的状态。延迟通过 history buffer 实现——ObservationManager 维护每个 term 最近 $N$ 步的值，按 delay 取偏移；延迟步数在每个 episode reset 时重采（reset 语义）：
+
+\begin{codebox}[Python]{mjlab：观测延迟配置（延迟是 ObservationTermCfg 的扁平字段，非 delay=）}
+# mjlab 的延迟不是 delay=SomeCfg(...)，而是 ObservationTermCfg 上的扁平字段
+# delay_min_lag/delay_max_lag（步），可选 delay_per_env / delay_hold_prob
+observations = {
+  "actor": {
+    "joint_pos_rel": ObservationTermCfg(func=mdp.joint_pos_rel,
+        noise=GaussianNoiseCfg(mean=0.0, std=0.01),
+        delay_min_lag=0, delay_max_lag=2),   # 0~2 步延迟（每 env 重采）
+  },
+}
+\end{codebox}
+
+\textbf{编码器偏置}与噪声/延迟正交：它不是每步随机，而是\emph{出厂即定、终身不变}的零点偏移（装配误差所致），故用 \verb|startup| 模式（mjlab velocity task 即如此配 \verb|dr.encoder_bias|）——这与 \cref{sec:rlmc-dr-mode-overview} 把编码器偏置归到 startup、本节练习答案一致：
+
+\begin{codebox}[Python]{编码器偏置：startup 模式（出厂零位固定），mjlab 真名 dr.encoder\_bias}
+from mjlab.envs.mdp import dr
+events = {
+  "encoder_bias": EventTermCfg(
+      func=dr.encoder_bias, mode="startup",    # 装配零位偏移：每台机器人固定、终身不变
+      params={"asset_cfg": SceneEntityCfg("robot"),
+              "bias_range": (-0.015, 0.015)}),  # ±0.015 rad ≈ ±0.86°，整机不变
+}
+\end{codebox}
+
+\textbf{三者正交}：噪声（每步随机）、延迟（每集重采的时间偏移）、偏置（出厂固定）是三个独立的传感器 DR 维度，可叠加。\textbf{运行验证}：加噪声/延迟后对比 tracking reward 与 action std——若 action std 因噪声显著增大或 tracking 在噪声下崩溃，说明噪声幅度过大。
+
+\begin{pitfall}[obs 噪声误加在 critic 上导致 value loss 不降]
+\textbf{错误描述}：图省事把噪声配在公用的观测项上、critic 也吃到了噪声。\textbf{现象后果}：value loss 居高不下、advantage 噪声大、训练不稳。\textbf{根本原因}：见 \cref{ins:rlmc-dr-asym}——critic 需 clean 信号。\textbf{正确做法}：把噪声只挂在 actor 分支的观测项；critic 分支用无噪声版本（或额外加特权观测）。
+\end{pitfall}
+
+\begin{pitfall}[「噪声越大越鲁棒」把信号淹没]
+\textbf{错误描述}：以为加大 obs 噪声能换更强鲁棒性，于是把 std 调到远超真实传感器水平。\textbf{现象后果}：策略无法区分信号与噪声，可能学到「忽略该 obs」的退化行为。\textbf{根本原因}：噪声幅度脱离了真实物理不确定性（呼应「DR 范围越大越好」的认知错误）。\textbf{正确做法}：std 对齐真实传感器规格（上表），需要更强鲁棒性时优先靠分阶段引入与课程，而非无脑加噪。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[设计题]} 人形头部 RGB 相机 $30$\,FPS、控制频率 $50$\,Hz，延迟应为几个 control step？\emph{验收}：相机周期 $\approx 33$\,ms，约 $1.6$ 个 control step（$20$\,ms/step），取 $1$--$2$ 步延迟。
+  \item \textbf{[编程题]} 在 mjlab 里配 obs 噪声，训 $200$ iteration，对比有/无噪声的 tracking reward 与 action std。\emph{验收}：给出两条曲线与一句结论（噪声下 tracking 略降、action std 略升属正常）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{分阶段 DR：单变量递进与可归因}
+\label{sec:rlmc-dr-phased}
+
+\paragraph{模块功能与在管线中的位置。}前面六节把「能随机化什么」铺齐了，本节回答「按什么顺序打开」——这是把所有 DR 项组织成可调试训练流程的元方法，也是本章工程价值最高的一节。
+
+\subsection{为什么要分阶段}
+\label{sec:rlmc-dr-phased-why}
+
+一次性打开所有 DR 的致命问题：\textbf{训练失败时无法归因}。是摩擦太低？质量偏差太大？编码器偏置太强？还是它们的组合？若同时变化 $10$ 个参数，每个失败视频可能对应无数种根因组合。
+
+\begin{insight}[分阶段 DR 的本质是「受控实验」]\label{ins:rlmc-dr-phased}
+分阶段引入的核心是\textbf{单变量递进}——每阶段只增加\emph{一类} DR，验证通过再加下一类。这与科学实验的「一次只改一个自变量」完全同构：唯有如此，每个阶段的失败才能清晰归因到具体的 DR 项。它和健身训练的「不要同时加重量又加组数」是同一智慧。\textbf{这条元方法的回报最高}——它不增加任何新算法，却把「DR 调不通」从玄学变成可二分定位的工程问题。注意它与 \cref{ch:rlmc-reward} 的 curriculum 既像又不同：curriculum 改\emph{任务难度}（命令范围、地形），DR 改\emph{物理规律}（摩擦、质量、延迟）；两者可同时用，但\textbf{不应同时大幅变化}（见 \cref{sec:rlmc-dr-robust}）。
+\end{insight}
+
+\subsection{六阶段方案}
+\label{sec:rlmc-dr-phased-six}
+
+\begin{codebox}{六阶段单变量递进 DR 方案}
+Phase 0  Clean Baseline（无 DR）
+  目标：验证 reward/obs/action 设计正确
+  检查：tracking > 0.7，play 视频正常
+  失败 → 问题在前置章（obs/reward/物理），不是 DR
+
+Phase 1  动力学随机化（startup）
+  加：foot_friction, base_mass, com_offset
+  检查：tracking > 0.6（允许略降）；失败 → 收窄范围逐项排查
+
+Phase 2  执行器随机化（reset）
+  加：PD gains, joint damping, armature
+  检查：action std 不过大；失败 → PD 增益范围是否过大
+
+Phase 3  感知随机化（startup/step）
+  加：encoder_bias, obs noise/delay
+  检查：tracking 在噪声下不崩；失败 → 噪声幅度太大
+
+Phase 4  外力扰动（interval）
+  加：push_velocity, gravity_tilt
+  检查：被推后 1~2 秒内恢复；失败 → push 太强或 baseline 不够稳
+
+Phase 5  鲁棒性验证（见下一节）
+  在固定参数网格评估 + 极端组合压力测试 → 通过则准备 sim-to-real
+\end{codebox}
+
+\textbf{代码走读：阶段间用 resume 串起来。}各阶段不是从零重训，而是在上一阶段 checkpoint 上 resume——这既省时，又让「能力随 DR 难度同步增长」（呼应 ADR 的 curriculum 思想）：
+
+\begin{codebox}[bash]{mjlab：Phase 0 至 Phase 1 至 Phase 4 的 CLI（resume 串联）}
+# Phase 0：Clean Baseline（关掉所有 DR 事件）
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+  --env.scene.num-envs 4096 --agent.max-iterations 300 \
+  --agent.run-name phase0_clean --agent.seed 42 \
+  --env.events.foot-friction None --env.events.base-mass None \
+  --env.events.push-robot None
+# 验证：tracking > 0.7，play 视频正常
+
+# Phase 1：动力学 DR（friction/mass 用 cfg 默认；push 仍关）
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+  --env.scene.num-envs 4096 --agent.max-iterations 500 \
+  --agent.run-name phase1_dynamics --agent.seed 42 \
+  --agent.resume True --agent.load-run phase0_clean
+
+# Phase 4：完整 DR + push（在 phase1 基础上继续）
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+  --env.scene.num-envs 4096 --agent.max-iterations 1500 \
+  --agent.run-name phase4_push --agent.seed 42 \
+  --agent.resume True --agent.load-run phase1_dynamics
+\end{codebox}
+
+\begin{codebox}[bash]{Isaac Lab：等价骨架（阶段间 DR 改 @configclass，非 CLI 开关）}
+# Phase 0
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0 --num_envs 4096 \
+  --max_iterations 300 --seed 42
+# Phase 1~4：Isaac Lab 的事件在 @configclass 里，需改 Python 文件
+#            或用 hydra override 切换不同 EventCfg
+# Play 验证
+python scripts/reinforcement_learning/rsl_rl/play.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab：分阶段 DR 用 Hydra 覆盖逐项开关（go2 rough）}
+# UniLab 用 Hydra 覆盖在命令行直接开关 DomainRandConfig 字段，无需改 Python
+# Phase 0：Clean Baseline —— 关掉全部 DR（每项 randomize_* / push_robots 置 false）
+uv run train --algo ppo --task go2_joystick_rough --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=300 \
+    env.domain_rand.randomize_base_mass=false env.domain_rand.randomize_kp=false \
+    env.domain_rand.randomize_kd=false env.domain_rand.push_robots=false
+# 验证：reward/tracking_lin_vel 正常上升，eval 回放步态正常
+
+# Phase 1：动力学 DR —— 开质量/质心/摩擦（push 仍关）
+uv run train --algo ppo --task go2_joystick_rough --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=500 \
+    env.domain_rand.randomize_base_mass=true env.domain_rand.random_com=true \
+    env.domain_rand.randomize_ground_friction=true env.domain_rand.push_robots=false
+
+# Phase 4：完整 DR + push —— 全开
+uv run train --algo ppo --task go2_joystick_rough --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=1500 \
+    env.domain_rand.push_robots=true env.domain_rand.push_interval=625
+# 说明：UniLab 没有 mjlab 那样的 --agent.resume/--load-run 续训作为分阶段标准路径；
+#   分阶段经「逐阶段放开 DR 字段」实现，每阶段从该 owner YAML 的 algo.* 起新 run。
+#   rough owner 默认已含较全 DR，flat owner 做减法（见生态系统章 rough 起步 / flat 减法）。
+\end{codebox}
+
+\textbf{运行验证。}每阶段记录 tracking 与 fall\_rate，画成「阶段 $\to$ 指标」表（典型：Phase 0 tracking $0.78$、Phase 4 $0.62$，下降 $\le 25\%$ 属正常）。\textbf{看什么}：相邻阶段的 tracking 下降幅度（Phase 0$\to$1 宜 $<15\%$，1$\to$2 宜 $<10\%$）；某阶段突然大降即定位到该阶段刚加的 DR 项。
+
+\begin{pitfall}[跳过 Phase 0 直接从 Phase 4 开始]
+\textbf{错误描述}：图快，不先验证 clean baseline 就全开 DR 训练。\textbf{现象后果}：训练失败时无法判断是 reward/obs 设计错了，还是 DR 范围太大——陷入无从下手的玄学调参。\textbf{根本原因}：违反单变量递进（\cref{ins:rlmc-dr-phased}）。\textbf{正确做法}：Phase 0 投资回报最高，务必先把无 DR baseline 的 tracking 跑过 $0.7$，再逐阶段加 DR。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[设计题]} 为 G1 人形（$29$ 自由度，vs Go1 的 $12$）设计完整六阶段 DR。需额外考虑什么？\emph{验收}：指出更高维动作空间下 PD 增益 DR 更易致不稳、人形平衡更脆弱故 push 更小、需关注上半身惯量随机化等。
+  \item \textbf{[分析题]} Phase 1 中低摩擦下策略很差。给 3 种修复方向及优劣。\emph{验收}：（i）收窄 friction 下界（快但牺牲极端鲁棒）、（ii）加 slip penalty 引导（需调权重）、（iii）配地形/摩擦 curriculum 渐进（最稳但最慢）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{鲁棒性评估：固定参数网格的三档测试}
+\label{sec:rlmc-dr-robust}
+
+\paragraph{模块功能与在管线中的位置。}训练时 DR 在分布上\emph{随机}采样，但评估必须在\emph{固定}参数网格上系统测试——这样才能发现策略在哪些参数区域强、哪些弱。这是 Phase 5 的核心，也是进入 sim-to-real 前的最后一道闸。
+
+\subsection{三档评估：分布内 / 边界 / 分布外}
+\label{sec:rlmc-dr-robust-3level}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+层次 & 含义 & 测试方法 & 判据 \\
+\midrule
+分布内 & 训练 DR 范围内 & 范围内均匀网格 & tracking $>0.6$, fall $<10\%$ \\
+边界 & DR 范围的极值 & 专测最低/最高值 & tracking $>0.4$, fall $<20\%$ \\
+分布外 & 超范围 $\pm 20\%$ & 测范围外参数 & \textbf{平缓退化}而非突然崩溃 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[分布外测试看的不是分数，是「退化曲线的形状」]\label{ins:rlmc-dr-ood}
+真实世界的参数不保证落进你的 DR 范围内，所以分布外行为对部署决策极有价值——但要看的不是绝对分数，而是\textbf{退化是平缓还是突崖}。若策略在摩擦 $0.5$ 处良好、$0.45$ 处突然摔，说明它没学到真鲁棒性，只是\emph{记住}了 $[0.5,1.25]$ 内的最优行为（一种对训练分布的过拟合）。平缓退化才意味着策略学到了可外推的控制原理。\textbf{这呼应 \cref{ins:rlmc-dr-expectation}}：DR 优化期望，对分布外没有任何保证，所以分布外的「形状」是你唯一能依赖的安全裕度信号。
+\end{insight}
+
+\textbf{代码走读：固定参数网格评估器。}下面的评估器在单个参数的固定值网格上系统测 tracking 与 fall\_rate。\textbf{关键行}：fall 统计要用 \verb|terminated.sum()|（按 env 数），而非 \verb|terminated.any(dim=0).sum()|（每步最多 $+1$，严重低估）：
+
+\begin{codebox}[Python]{dr\_evaluation.py：固定参数网格评估（核心；关键行标注）}
+class DRRobustnessEvaluator:
+    def __init__(self, env, policy):
+        self.env, self.policy = env, policy
+    def evaluate_single_param(self, param_name, values, num_eps=50, max_steps=1000):
+        out = {}
+        for v in values:
+            self._set_fixed_param(param_name, v)        # 固定参数（关掉该项随机化）
+            out[v] = self._run(num_eps, max_steps)
+            print(f"  {param_name}={v:.3f}: tracking={out[v]['tracking']:.3f}, "
+                  f"fall_rate={out[v]['fall_rate']:.0%}")
+        return out
+    def _run(self, num_eps, max_steps):
+        obs = self.env.reset(); ao = obs.get("actor", obs.get("policy"))
+        speeds, fall, ep, step = [], 0, 0, 0
+        while ep < num_eps and step < max_steps*num_eps:
+            with torch.inference_mode(): a = self.policy(ao)
+            od, r, term, trunc, _ = self.env.step(a); ao = od.get("actor", od.get("policy"))
+            step += 1
+            speeds.append(self.env.scene["robot"].data.root_lin_vel_b[:, :2].norm(dim=1).mean().item())
+            done = term | trunc
+            if done.any():
+                ep += done.sum().item()
+                fall += term.sum().item()               # >> 按 env 数统计真正摔倒
+        return {"tracking": float(np.mean(speeds[-100:]) if speeds else 0),
+                "fall_rate": fall / max(ep, 1)}
+    def _set_fixed_param(self, name, value):
+        # mjlab：直接改 model field；Isaac Lab：经 EventManager 设固定值
+        pass   # 框架相关
+\end{codebox}
+
+\subsection{push-recovery 与 A/B 对比}
+\label{sec:rlmc-dr-robust-ab}
+
+除参数网格外，push-recovery 是 locomotion 的标志性鲁棒性指标：施加固定 push，量「多少步内恢复」。\textbf{A/B 对比}（有 DR vs 无 DR 策略在同一参数网格上）则能直观证明 DR 的价值——分布内可能相近，但在边界与分布外，DR 策略应显著更稳。
+
+\textbf{运行验证。}一份完整的 Phase 5 报告应含：(1) 摩擦网格（如 $[0.2,0.4,0.6,0.8,1.0,1.2,1.5,2.0]$）的 tracking/fall 曲线；(2) 质量网格（如 $[-3,-1.5,0,1.5,3,5]$\,kg）；(3) push-recovery（如 $[0.5,1.0,1.5,2.0,3.0]$\,m/s 的恢复成功率）；(4) 分布外 $\pm 20\%$ 的退化形状。
+
+\subsection{DR 与 curriculum 的交互}
+\label{sec:rlmc-dr-robust-curriculum}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{4.6cm}p{4.0cm}p{3.4cm}@{}}
+\toprule
+交互模式 & 效果 & 建议 \\
+\midrule
+DR 范围突扩 $+$ curriculum 同时升级 & 双重难度跳变，策略可能崩 & \textbf{不要}同时变 \\
+DR 范围固定 $+$ curriculum 逐步升级 & 正常：固定参数分布上学更难任务 & 推荐默认组合 \\
+DR 逐步扩 $+$ curriculum 固定 & 正常：固定任务上适应更宽参数 & 适合分阶段 DR \\
+低摩擦 DR $+$ 粗糙地形 curriculum & 极难：几乎不可学 & 先学地形再加摩擦 DR \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[DR 与 curriculum 是正交维度，不应同时大变]\label{ins:rlmc-dr-orthogonal}
+DR 与 curriculum 都改训练数据分布，但维度正交：DR 改\emph{物理参数}分布（让策略更鲁棒），curriculum 改\emph{任务难度}分布（让策略更有能力）。同时大幅变化两者，等于一次实验改了两个自变量——失败无法归因（再次回到 \cref{ins:rlmc-dr-phased} 的单变量原则）。\textbf{元法则}：固定一个、动另一个。
+\end{insight}
+
+\begin{pitfall}[把鲁棒性「评估」做成了又一轮随机采样]
+\textbf{错误描述}：评估时仍让 DR 随机采样，只看一个平均 tracking。\textbf{现象后果}：看不出策略在\emph{哪些}参数区域弱，错过分布外的突崖式失效。\textbf{根本原因}：混淆了「训练用随机分布」与「评估用固定网格」。\textbf{正确做法}：评估时\emph{关掉}随机化、在固定参数网格上逐点测，重点看边界与分布外的退化形状（\cref{ins:rlmc-dr-ood}）。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[编程题]} 用上面的评估器跑摩擦网格 $[0.2,\dots,2.0]$，画 tracking-vs-摩擦曲线，标出「分布内/边界/分布外」三段。\emph{验收}：曲线 $+$ 三段标注 $+$ 一句「退化是否平缓」的判断。
+  \item \textbf{[分析题]} 某策略在摩擦 $0.5$ 处 tracking $0.7$、$0.45$ 处骤降到 $0.1$。这说明什么？该怎么改？\emph{验收}：判定为过拟合训练分布边界；改法：把 friction 下界外扩并重训，或加 system ID（下一节）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{超越 DR：ASAP delta action model 与系统辨识}
+\label{sec:rlmc-dr-beyond}
+
+\paragraph{模块功能与在管线中的位置。}\cref{sec:rlmc-dr-robust} 的评估若暴露出「DR 怎么调都不够」，说明撞上了 DR 的根本天花板。本节兑现 \cref{sec:rlmc-dr-delta-motivation} 的伏笔：当 DR 不够时的两条替代/互补路线——用真机数据修正的 ASAP delta model，以及精确找参数的 SPI-Active 系统辨识。
+
+\subsection{DR 的根本局限}
+\label{sec:rlmc-dr-beyond-limit}
+
+DR 通过扩大训练分布覆盖真实参数，但有两条硬限制：(1) \textbf{你必须知道该随机化哪些参数}——若真实不确定性来源不在你的随机化清单里（传动间隙、电机非线性、接触模型差异），DR 无从覆盖；(2) \textbf{过大的 DR 范围使策略过于保守}——ASAP 论文明确把 DR 列为 agile motion 的瓶颈（\cref{ins:rlmc-dr-expectation} 的「为难区域放弃」在 agile 任务上尤其致命）。
+
+\subsection{ASAP：两阶段 delta action model}
+\label{sec:rlmc-dr-beyond-asap}
+
+ASAP（He et al., RSS 2025，arXiv:2502.01143）\cite{asap2025} 的思路不是「把仿真分布做得更宽」，而是「用真机数据学一个残差动作模型，把仿真器\emph{掰}向现实」。其官方框架是两阶段（论文将其细分为「预训练 $\to$ 真机采集 $\to$ 训 delta $\to$ finetune $\to$ 部署」的流程）：
+
+\begin{codebox}{ASAP 流程（两阶段，按官方仓库的配置切换组织）}
+Stage A  Pretrain：仿真中训 motion-tracking base policy
+         （IsaacGym 等；DR 可选，公开代码默认 NO_domain_rand）
+Stage B  Real Rollout：部署 A 到真机（Unitree G1），用 MoCap 记录
+         (s_t, a_t, s_{t+1})_real
+Stage C  Train δ：训练 delta action model，使「仿真中 replay a_t+δ」
+         的 next-state 逼近真机 next-state
+Stage D  Finetune：冻结 δ，在仿真里插入 a_eff = a_policy + δ(s,a)，
+         用 PPO 继续训练（此时仿真更接近现实）
+Stage E  Deploy：只部署 Stage D 的 policy，不部署 δ
+         （δ 已通过 finetune 内化进策略）
+\end{codebox}
+
+\begin{paper}[ASAP, RSS 2025：对齐仿真与现实物理]\label{paper:rlmc-dr-asap}
+\textbf{问题}：DR/SysID 难以让 agile 全身动作（跳跃、急转）跨过 sim-to-real gap。\textbf{核心思想}：用真机轨迹训练残差（delta）动作模型补偿动力学失配，再把它接进仿真器 finetune 策略。\textbf{关键结果}：在 IsaacGym$\to$IsaacSim、IsaacGym$\to$Genesis、IsaacGym$\to$真实 Unitree G1 三种迁移上，tracking error 显著低于 SysID、DR、delta-dynamics 基线，实现此前难以达到的敏捷动作。\textbf{与本书关系}：是 \cref{ch:rlmc-physics} 跨引擎 sim2sim 与本章 DR 的延伸——当 DR 不够时用真机数据精修。\textbf{局限}：需 MoCap 级真机数据；base policy 若完全不鲁棒，可能差到连有意义的 real rollout 都采不到。
+\end{paper}
+
+\begin{pitfall}[把 ASAP 的 delta 当成「对仿真 step 反传的监督 MSE」]
+\textbf{错误描述}：望文生义，以为 delta model 是用 \verb|mse_loss(sim_step(s, a+delta), s_real)| 直接对仿真 step 反向传播训练的监督回归。\textbf{现象后果}：照此实现既要求仿真器可微，又对不上官方代码，复现失败。\textbf{根本原因}：ASAP 官方 delta 是 \textbf{open-loop RL（PPO）}训练——reward 最小化 sim/real 状态误差并带 action-norm 惩罚（配置 \verb|train_delta_a_open_loop|），随后 \verb|train_delta_a_closed_loop| 再微调 policy；统一入口是 \verb|humanoidverse/train_agent.py|，靠 \verb|+exp=...| 切换，\textbf{没有}独立的 \verb|delta_model.py|/\verb|train_delta.py|，也\textbf{不用} mjlab（支持 IsaacGym/IsaacSim/Genesis）。\textbf{正确做法}：把 delta 训练理解为 RL 而非监督回归；仓库结构以 \verb|humanoidverse/|、\verb|isaac_utils/|、\verb|sim2real/|、\verb|scripts/| 为准（已联网核对官方仓库）。
+\end{pitfall}
+
+\begin{codebox}[Python]{delta action model 的网络（概念示意，非官方实现）}
+import torch, torch.nn as nn
+class DeltaActionModel(nn.Module):
+    """输入 state+action，输出 action 修正量 δa。结构简单，难点在数据采集与对齐。"""
+    def __init__(self, state_dim, action_dim, hidden=(256, 128)):
+        super().__init__()
+        dims, layers = [state_dim + action_dim, *hidden], []
+        for a, b in zip(dims[:-1], dims[1:]):
+            layers += [nn.Linear(a, b), nn.ELU()]
+        layers += [nn.Linear(dims[-1], action_dim)]
+        self.mlp = nn.Sequential(*layers)
+    def forward(self, state, action):
+        return self.mlp(torch.cat([state, action], dim=-1))
+# 提醒：官方用 open-loop RL(PPO) 训练此模型，上面只示意其输入输出形状。
+\end{codebox}
+
+\subsection{互补关系与 SPI-Active}
+\label{sec:rlmc-dr-beyond-spi}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lccp{3.2cm}@{}}
+\toprule
+方法 & 需真机数据？ & 策略保守性 & 适用场景 \\
+\midrule
+只用 DR & 否 & 中--高 & 大多数 locomotion \\
+DR $+$ System ID & 少量（参数辨识） & 低--中 & 需精确跟踪 \\
+DR $+$ ASAP delta & 中等（轨迹采集） & 低 & agile motion、高精度 \\
+只用 delta（无 DR） & 大量 & 低但泛化差 & 不推荐 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+对多数项目，只用 DR 就够；只有追求 agile 动作（跳跃、翻滚、急转）时 DR 的保守性才成瓶颈，此时考虑 ASAP。另一条互补路线是\textbf{系统辨识}：SPI-Active（Sobanbabu et al., 2025，arXiv:2505.14266）\cite{sobanbabu2025spi} 不修正仿真器，而是用大规模并行采样\emph{直接辨识}最接近真实的仿真参数，再在这些精确参数上训练；它还用主动探索最大化采集轨迹的 Fisher 信息以提升辨识精度，在 Unitree Go2/G1 上比 DR 基线显著更精准。\textbf{这恰好是 mjlab/Isaac Lab $+$ GPU 仿真的主场}——高速并行搜参数正是它们的优势。
+
+\begin{insight}[sim-to-real 的核心三角]\label{ins:rlmc-dr-triangle}
+DR 不是孤军：它与非对称 actor-critic、Teacher-Student 蒸馏构成 sim-to-real 的核心三角（\cref{ins:rlmc-dr-asym} 已点出接口）。DR 提供\emph{鲁棒性}，非对称 AC 让 critic 在 DR 下\emph{更准}（看特权信息），Teacher-Student 把鲁棒性\emph{迁移}到只用部署可得信号的 student 上。ASAP/SPI-Active 则是当这套三角仍不够精确时的\emph{第四条边}——用真机数据精修或辨识。\textbf{把 DR 放进这张更大的图里，才能判断「该加宽 DR、还是该上 system ID/delta model」}。
+\end{insight}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[分析题]} ASAP 的 Stage E 为何不部署 delta model？若部署了会怎样？\emph{验收}：$\delta$ 已通过 Stage D finetune 内化进 policy；再叠加 $\delta$ 等于二次修正，反而引入分布偏移。
+  \item \textbf{[设计题]} 没有 MoCap 时如何改造 ASAP 的 Stage B？给出替代方案。\emph{验收}：列出（i）板载状态估计/腿式里程计、（ii）外部多相机视觉跟踪、（iii）改走 SPI-Active 这类只需板载轨迹的系统辨识 至少两条。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{综合诊断与排查四层法}
+\label{sec:rlmc-dr-diag}
+
+\paragraph{模块功能与在管线中的位置。}本章反复强调「DR 最难的是归因」。本节把散落各处的诊断动作收成一套\textbf{四层排查法}与一份一键体检脚本，作为故障排查手册的算法化前置。
+
+\begin{insight}[DR 失效的四层排查：配置-管理-字段-仿真]\label{ins:rlmc-dr-4layer}
+DR 从配置到物理生效要穿过四层，任一层断裂都导致\emph{静默失效}（训练正常、reward 上升、策略却跑在无 DR 环境）：\textbf{(1) 配置层}——事件是否注册、entity pattern 是否空匹配（\cref{sec:rlmc-dr-func} 陷阱）；\textbf{(2) 管理层}——EventManager 是否按模式调度到（mode 写错则永不触发）；\textbf{(3) 字段层}——目标 model 字段是否被 \verb|expand_model_fields| 扩展为 per-env（\cref{sec:rlmc-dr-inertia}）；\textbf{(4) 仿真层}——写入是否原地、CUDA Graph 是否持新指针（\cref{ins:rlmc-dr-inplace}）。\textbf{排查顺序就按这四层从上到下二分}：先确认配置/匹配，再查字段扩展，最后查 Graph——这与 \cref{ch:rlmc-physics} 「先物理后 RL」的元法则同构。
+\end{insight}
+
+\textbf{代码走读：一键 DR 体检。}下面脚本一次性覆盖四层中可自动检测的部分——字段扩展、per-env 差异、模式分布、pattern 匹配、高频重算预警：
+
+\begin{codebox}[Python]{dr\_health\_check.py：四层体检（mjlab 风，关键行标注）}
+def dr_health_check(env):
+    # [字段层] 扩展了哪些字段、形状对不对
+    expanded = getattr(env.sim, "_expanded_fields", set())
+    print("expanded fields:", {f: list(getattr(env.sim.model, f).shape) for f in expanded})
+    if not expanded:
+        print("  !! 无字段扩展 —— DR 多半未生效")
+    # [仿真层] per-env 差异：std≈0 说明各 env 参数相同
+    for f in list(expanded)[:5]:
+        d = getattr(env.sim.model, f)
+        if d.ndim >= 2 and d.shape[0] >= 2:
+            s = d.float().std(dim=0).mean().item()
+            print(f"  {f}: cross-env std={s:.2e}", "  !! 零方差" if s < 1e-8 else "")
+    # [管理层] 各事件落在哪个模式
+    em = env.event_manager
+    for name, term in em.active_terms.items():
+        print(f"  [{getattr(term.cfg, 'mode', '?'):>8s}] {name}")
+    # [配置层] entity pattern 是否空匹配
+    import re
+    for name, term in em.active_terms.items():
+        ac = getattr(term.cfg, "params", {}).get("asset_cfg")
+        if ac and getattr(ac, "body_names", None):
+            robot = env.scene[ac.name]
+            n = len([b for b in robot.body_names if re.match(ac.body_names, b)])
+            print(f"  match {name}: '{ac.body_names}' -> {n}", "  !! 空匹配" if n == 0 else "")
+    # [性能预警] set_const 级字段误入高频模式
+    for name, term in em.active_terms.items():
+        mode = getattr(term.cfg, "mode", "?")
+        if mode in ("step", "interval") and any(
+                "mass" in str(k) or "inertia" in str(k)
+                for k in getattr(term.cfg, "params", {})):
+            print(f"  !! {name} 在高频模式 '{mode}' 改质量/惯量 —— 移到 startup/reset")
+\end{codebox}
+
+\textbf{运行验证。}训练前跑一次 \verb|dr_health_check(env)|，把所有 \verb|!!| 清零再开训。配合 \cref{sec:rlmc-dr-phased} 的分阶段，几乎能把「DR 没生效」类问题挡在训练之前。
+
+\paragraph{一次真实排错的完整命令序列：从「std$=0$」到「定位到那一行」。}前面所有体检脚本都是\emph{预防式}的——但当你真的撞上「训了两小时、play 视频里所有机器人步态一模一样、怀疑 DR 没生效」时，怎么\textbf{从现象逐层 print 到根因}？下面复盘一次典型的 \verb|cross-env std=0| 排错，每一步给出\textbf{敲什么命令、预期看到什么、据此排除哪一层}。这把 \cref{ins:rlmc-dr-4layer} 的四层从「概念」变成「可照敲的命令序列」：
+
+\begin{codebox}[Python]{真实排错 trace：cross-env std=0 的逐层定位（在 ipython/pdb 里逐行敲）}
+# 现象：play 视频里 4096 个机器人步态完全同步，怀疑 friction DR 没生效。
+# ── 体检先给出总览（已知 friction 那项 std=0）──
+>>> dr_health_check(env)
+expanded fields: {'geom_friction': [4096, 92, 3], 'body_mass': [4096, 17]}
+  geom_friction: cross-env std=0.00e+00   !! 零方差          # ← 异常在这
+  body_mass:     cross-env std=3.71e-01                      # mass 正常 → 排除"全局没 expand"
+  [ startup] foot_friction
+  [ startup] base_mass
+  match foot_friction: '.*foot.*' -> 4                       # 匹配到 4 个 → 排除"配置层空匹配"
+# 推理：字段已 expand（在列表里、形状对）、pattern 非空、mass 同机制却正常
+#       → 配置层/字段层都没断 → 嫌疑落到"管理层(没调用)"或"仿真层(写了但没生效)"。
+
+# ── 管理层：这一项的 func 到底有没有被调到？在 func 里下断点或临时 print ──
+>>> term = env.event_manager.active_terms["foot_friction"]
+>>> term.cfg.mode, term.cfg.func.__name__
+('startup', 'geom_friction')                                 # mode 对、func 对
+>>> env.event_manager.apply(mode="startup")                  # 手动触发一次 startup
+>>> # 在 geom_friction 源码 field[env_ids]=... 那行前临时加 print(field.data_ptr())
+#    观察到：写入"前"和写入"后" data_ptr() 不同 ！                 # ← 找到了
+0x7f2a1c000000   (写入前)
+0x7f2a1e400000   (写入后)                                     # 指针变了 = 不是原地写！
+
+# ── 定位到仿真层根因：某次重构把 field[ids]=new 误写成 field=new ──
+#    (CUDA Graph 仍读旧地址 0x7f2a1c…，新值在 0x7f2a1e… 被无视 → std 恒为 0)
+# 改回原地写 field[env_ids] = new 后复测：
+>>> dr_health_check(env)
+  geom_friction: cross-env std=2.14e-02                      # ← std>0，DR 复活
+\end{codebox}
+
+\noindent{}这条 trace 的可迁移价值在于\textbf{排除法的次序}：先用「\verb|mass| 同机制却正常」一刀排除「全局没 expand」（否则不会只有 friction 挂），再用「pattern 匹配数$>$0」排除配置层，最后用 \verb|data_ptr()| 前后比对\emph{实锤}仿真层的换指针 bug——\verb|data_ptr()| 是\textbf{把抽象的「CUDA Graph 持旧指针」变成可肉眼对比的数字}的关键手段，比盲读源码快得多。\textbf{记住这个套路}：std$=0$ 时，先问「是\emph{只有这一项}还是\emph{全部}为零」——全部为零查全局 expand/Graph capture，只有一项为零查这一项的 pattern 与写入方式。
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[调试题]} 体检显示某字段 cross-env std$=0$ 但已在 expanded 列表里。按四层法定位最可能的根因。\emph{验收}：定位到仿真层——写入用了 \verb|field = ...| 替换而非 \verb|field[ids] = ...| 原地（\cref{ins:rlmc-dr-inplace}）。
+  \item \textbf{[编程题]} 给 \verb|dr_health_check| 增加一项「interval 事件实际触发频率」检测（跑一段 rollout 统计触发次数 vs 期望间隔）。\emph{验收}：输出实测平均间隔，并与 \verb|interval_range_s| 比对。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\label{sec:rlmc-dr-myths}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.4cm}p{7.0cm}@{}}
+\toprule
+误解 & 正确理解 \\
+\midrule
+DR 范围越大越鲁棒 & 过宽把可学任务变成不可学的鲁棒优化；范围应反映真实物理不确定性 \\
+DR 就是数据增强 & 数据增强改输入表示，DR 改状态转移 $p(s'|s,a;\theta)$——是在解一族控制问题 \\
+DR 让仿真更逼真 & DR 让策略更鲁棒；要逼近真实参数请用 system ID，不是 DR \\
+DR 优化最坏情况 & DR 优化\emph{期望}，可能为难区域选择「放弃」 \\
+reset 模式 $=$ startup 重复执行 & startup 每 env 终身一次，reset 每集重采 \\
+只改质量就够了 & 不改惯量则物理不一致；用 pseudo-inertia 一致缩放 \\
+\verb|field = new| 和 \verb|field[ids] = new| 一样 & 前者换指针使 CUDA Graph 失效，后者原地写入才安全 \\
+obs 噪声越大越鲁棒 & 过大噪声淹没信号，策略可能学到「忽略 obs」 \\
+评估也用随机采样 & 评估须用固定参数网格，才能定位弱区与分布外退化 \\
+有了 delta model 就不需要 DR & 二者互补；base policy 不鲁棒则连真机数据都采不到 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+\label{sec:rlmc-dr-summary}
+
+本章从\emph{鲁棒优化}这条算法主线出发：DR 是在参数分布 $p(\boldsymbol\theta)$ 上最大化\textbf{期望}回报（式~\eqref{eq:rlmc-dr-objective}），既非最坏情况优化、亦非数据增强。沿这条主线，我们建立了：事件四模式（startup/reset/interval/step，把「变化频率」编码进训练）、函数映射与配置四维表（随机化什么、范围怎么选、\verb|num_buckets| 为何只在 Isaac Lab）、pseudo-inertia（用 $\boldsymbol\Sigma$ 正定性保证物理一致 $+$ 原地写入保证 CUDA Graph 安全）、外力扰动（push 比 impulse 更实用、须分阶段引入）、传感器 DR（噪声/延迟/偏置三正交，只加在 actor）、分阶段策略（单变量递进、可归因）、三档鲁棒性评估（分布内/边界/分布外，看退化形状）、超越 DR（ASAP delta model 的 open-loop RL 训练 $+$ SPI-Active 系统辨识）与四层排查法（配置$\to$管理$\to$字段$\to$仿真）。三框架对比贯穿全章（mjlab / Isaac Lab 给出可复制代码，UniLab 据服务器实装框架以 \verb|DomainRandConfig| $+$ \verb|DomainRandomizationManager| $+$ 后端能力门控落实）。
+
+\paragraph{术语速查。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{8.6cm}@{}}
+\toprule
+术语 & 含义 \\
+\midrule
+域随机化（DR） & 在物理参数分布上训练以提升 sim-to-real 鲁棒性 \\
+鲁棒优化视角 & DR 优化的是参数分布上的\emph{期望}回报，非最坏情况 \\
+startup/reset/interval/step & 四种事件触发模式，对应参数的变化频率 \\
+prestartup & Isaac Lab 的 USD 层随机化模式（PhysX 初始化前） \\
+\verb|num_buckets| & Isaac Lab 材质随机化的桶数，应对 PhysX 材质数上限 \\
+\verb|operation| & DR 施加方式：add（绝对）/ scale（相对）/ abs \\
+log\_uniform & 对数空间均匀采样，适配跨数量级参数（如 PD 阻尼） \\
+pseudo-inertia $\boldsymbol\Sigma$ & $4\times4$ 矩阵，正定 $\Leftrightarrow$ $(m,\mathbf c,\mathbf I)$ 物理一致 \\
+log-Cholesky & Rucker--Wensing 对 $\boldsymbol\Sigma$ 的光滑无约束参数化 \\
+\verb|expand_model_fields| & mjlab 把共享字段扩展为 per-env（触发 Graph 重建） \\
+原地写入 & \verb|field[ids]=v|，改内容不换指针，CUDA Graph 安全 \\
+push vs impulse & 速度注入 vs 力注入；locomotion 多用前者 \\
+非对称 actor-critic & actor 用部署可得信号、critic 用 clean/特权信号 \\
+分阶段 DR & 单变量递进引入 DR，使失败可归因 \\
+delta action model & ASAP 用真机数据训练的残差动作修正（open-loop RL） \\
+SPI-Active & 大规模并行采样 $+$ 主动探索的系统辨识 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}rp{6.6cm}lc@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & DR 是在参数分布上优化\emph{期望}回报 & \cref{sec:rlmc-dr-pmdp} & $\star\star$ \\
+2 & DR $\neq$ 最坏优化 $\neq$ 数据增强 $\neq$ 逼真化 & \cref{ins:rlmc-dr-expectation} & $\star\star$ \\
+3 & 四模式把「变化频率」编码进训练 & \cref{ins:rlmc-dr-mode-physics} & $\star\star\star$ \\
+4 & interval 用 per-env 计时器保 batch 多样性 & \cref{sec:rlmc-dr-mode-tree} & $\star\star\star$ \\
+5 & \verb|num_buckets| 是 PhysX 材质约束的泄漏 & \cref{ins:rlmc-dr-buckets} & $\star\star$ \\
+6 & add/scale/log\_uniform 的选择依据 & \cref{sec:rlmc-dr-func-dist} & $\star\star$ \\
+7 & pseudo-inertia 用 $\boldsymbol\Sigma$ 正定保物理一致 & \cref{sec:rlmc-dr-inertia-pseudo} & $\star\star\star$ \\
+8 & 原地写入是 CUDA Graph 安全的命门 & \cref{ins:rlmc-dr-inplace} & $\star\star\star$ \\
+9 & set\_const 级字段勿入高频模式 & \cref{sec:rlmc-dr-inertia-expand} & $\star\star$ \\
+10 & push 比 impulse 更实用；须分阶段引入 & \cref{ins:rlmc-dr-push} & $\star\star$ \\
+11 & obs 噪声只加 actor，critic 看 clean & \cref{ins:rlmc-dr-asym} & $\star\star\star$ \\
+12 & 分阶段 DR $=$ 单变量受控实验 & \cref{ins:rlmc-dr-phased} & $\star\star\star$ \\
+13 & 评估用固定网格，看分布外退化形状 & \cref{ins:rlmc-dr-ood} & $\star\star$ \\
+14 & ASAP delta 是 open-loop RL，非监督 MSE & \cref{sec:rlmc-dr-beyond-asap} & $\star\star\star$ \\
+15 & 四层排查法定位 DR 静默失效 & \cref{ins:rlmc-dr-4layer} & $\star\star\star$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+本章建立了两个关键认知。\textbf{从「固定参数训练」到「参数分布训练」}：DR 不是让仿真更逼真，而是让策略更鲁棒——真实世界只是 DR 分布里的一个点。\textbf{从「一次性全开」到「分阶段可归因」}：DR 的工程难点不在写配置，而在 DR 静默失效时怎么归因——分阶段 $+$ 四层排查让每个失败都能定位。
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-dr-further}
+
+\begin{itemize}
+  \item Tobin et al., \emph{Domain Randomization for Transferring Deep Neural Networks from Simulation to the Real World}, IROS 2017\cite{tobin2017dr}——视觉 DR 的开山之作；教你「随机化渲染就能迁移」。
+  \item Peng et al., \emph{Sim-to-Real Transfer of Robotic Control with Dynamics Randomization}, ICRA 2018\cite{peng2018simtoreal}——动力学 DR 的奠基；教你「随机化物理参数让策略直接上真机」。
+  \item OpenAI, \emph{Solving Rubik's Cube with a Robot Hand}（arXiv:1910.07113）\cite{openai2019rubik}——ADR $+$ Shadow Hand；教你「让 DR 范围随能力自动增长」。
+  \item Rucker \& Wensing, \emph{Smooth Parameterization of Rigid-Body Inertia}, IEEE RA-L 2022\cite{rucker2022pseudoinertia}——pseudo-inertia 的数学基础；教你「为什么物理一致性可以免费保证」。
+  \item He et al., \emph{ASAP}, RSS 2025（arXiv:2502.01143）\cite{asap2025}——delta action model；教你「当 DR 不够时用真机数据精修仿真器」。
+  \item Sobanbabu et al., \emph{Sampling-Based System Identification with Active Exploration}（arXiv:2505.14266）\cite{sobanbabu2025spi}——大规模并行系统辨识；教你「直接找到最接近真实的仿真参数」。
+  \item mjlab / Isaac Lab 官方文档的 EventManager / events 章——mjlab 的 \verb|mdp.dr.*|（如 \verb|geom_friction|）与 Isaac Lab 的 \verb|randomize_*| 函数完整签名、\verb|num_buckets| / \verb|prestartup| 语义；配置前务必对照目标版本核一遍。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-dr-trouble}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.4cm}p{3.8cm}p{4.6cm}@{}}
+\toprule
+症状 & 可能原因 & 排查步骤（相关节） \\
+\midrule
+DR 配置全对却毫无效果 & 写入用 \verb|field=...| 换指针，CUDA Graph 持旧地址 & 改原地写入 \verb|field[ids]=...|（\cref{ins:rlmc-dr-inplace}） \\
+有/无 DR 训练效果一样 & 字段未 expand / pattern 空匹配 / mode 写错 & 跑 \verb|dr_health_check| 四层体检（\cref{ins:rlmc-dr-4layer}） \\
+entity pattern 空匹配 & 正则不匹配 MJCF/USD 实际名字 & 打印 \verb|find_bodies(pattern)| 确认非空（\cref{sec:rlmc-dr-func-verify}） \\
+Isaac Lab 材质超限崩溃 & \verb|num_buckets| 缺省或过大 & 设 \verb|num_buckets=250|（\cref{ins:rlmc-dr-buckets}） \\
+pseudo-inertia 出 NaN & $\alpha$ 范围过大致 Cholesky 失败 & 收窄到 $(0.9,1.1)$ 再逐步放宽（\cref{sec:rlmc-dr-inertia-pseudo}） \\
+steps/s 下降 $>30\%$ & set\_const 级字段误入高频模式 & 把质量/惯量移到 startup/reset（\cref{sec:rlmc-dr-inertia-expand}） \\
+push 训练摔倒率 $>90\%$ & push 太早或太强 & 先验证 Phase 0、延后引入、减小幅度（\cref{ins:rlmc-dr-push-early}） \\
+value loss 不降 & obs 噪声误加在 critic 上 & 噪声只挂 actor 分支（\cref{ins:rlmc-dr-asym}） \\
+interval 训练曲线周期抖动 & \verb|is_global_time=True| 同步触发 & 改 \verb|False| 让各 env 独立计时（\cref{sec:rlmc-dr-mode-tree}） \\
+低摩擦下打滑/摔倒 & friction 范围未覆盖或过宽 & 做三档摩擦网格评估（\cref{sec:rlmc-dr-robust-3level}） \\
+仿真鲁棒但真机失败 & DR 未覆盖真实不确定性源 & 系统辨识或 ASAP delta（\cref{sec:rlmc-dr-beyond}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[最后一句话：DR 的元法则]\label{ins:rlmc-dr-oneliner}
+若只记一件事：\textbf{DR 在参数分布上优化期望——范围要反映真实物理不确定性，每次只引入一类、且训练前必做四层体检}。其余所有配置、调参、排查，都是这一句的细化。当 DR 怎么调都不够时，别再加宽——转向系统辨识（SPI-Active）或残差修正（ASAP delta）。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-dr-versions}
+
+本章所有代码与参数以下表版本为准。DR 相关 API（尤其 Isaac Lab 的 events 与 mjlab 的 \verb|dr| 子模块）在小版本间仍有调整，部署前请查各组件 CHANGELOG 与目标版本的 \verb|mdp| 导出。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+组件 & 版本 & 相关内容 \\
+\midrule
+mjlab & 1.2.0（本部主线） & \verb|EventManager|、\verb|mdp.dr.*|（\verb|geom_friction| 等）、pseudo-inertia \\
+mjlab & 1.4.0（实测核对版） & \verb|mdp.dr| 子模块全集；接口大体兼容 1.2.0 \\
+MuJoCo Warp & 随 mjlab & \verb|expand_model_fields|、CUDA Graph 重 capture \\
+Isaac Lab & 2.3.0（主线） & \verb|EventTermCfg|、\verb|num_buckets|、DexSuite ADR/PBT \\
+Isaac Lab & 3.0 Beta & Newton 后端下的事件管线 \\
+PhysX & 5.4+ & 材质 bucket、外力施加 \\
+ASAP & 仓库 \verb|LeCAR-Lab/ASAP|（RSS 2025） & delta action model（open-loop RL） \\
+UniLab & commit \verb|99936e08|；mujoco-uni 3.8.0 / motrixsim-core 0.8.2 & \verb|DomainRandConfig|、\verb|DomainRandomizationManager|、后端 DR 能力门控 \\
+\bottomrule
+\end{tabular}
+\end{center}

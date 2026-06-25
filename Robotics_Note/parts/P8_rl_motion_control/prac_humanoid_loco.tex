@@ -1,0 +1,1360 @@
+\chapter{人形 Locomotion：从四足到双足}\label{ch:rlmc-humanoidloco}
+
+% ════════════════════════════════════════════════════════════════
+%  实践章（新部「强化学习运动控制」P8）。算法/概念为主线，三框架对比实战：
+%  mjlab / Isaac Lab / UniLab（UniLab 异构 CPU 仿真+GPU 策略，已据实装核验填实）。源：同作者 Tutorial RL运控 Ch14。
+%  关键 API/版本/论文归属已联网核（HOVER arXiv:2410.21229 ICRA'25；
+%  HoST arXiv:2502.08378 RSS'25 Best Systems Paper Finalist；
+%  Radosavovic Science Robotics 2024；humanoid-gym arXiv:2404.05695；
+%  SONIC arXiv:2511.07820；unitree_rl_mjlab 任务名/CLI 已按官方 README 改正）。
+% ════════════════════════════════════════════════════════════════
+
+本章把前几章在四足上建立的工程方法论——观测/动作设计（\cref{ch:rlmc-obsact}）、四层奖励框架（\cref{ch:rlmc-reward}）、Manager-Based 管线（\cref{ch:rlmc-manager}）、特权学习（\cref{ch:rlmc-privileged}）、域随机化（\cref{ch:rlmc-dr}）——迁移到人形机器人（Unitree G1 / H1）。但你会反复看到一件事：四足的很多工程直觉在双足上不再成立，甚至会误导。本章不重教 RL 基础，而是聚焦人形\emph{特有}的扩展点，并在每个概念下排布 mjlab、Isaac Lab、UniLab 三个框架的对比实战。
+
+\begin{note}
+\textbf{本章记号与前提.}\;
+速度命令记 $\mathbf{c}=(v_x,v_y,\omega_z)$；关节位置 $\mathbf{q}\in\mathbb{R}^{n}$，默认姿态 $\mathbf{q}^{\mathrm{def}}$，策略输出动作 $\mathbf{a}\in[-1,1]^n$，逐关节动作缩放 $\boldsymbol{s}\in\mathbb{R}^n$，关节位置目标 $\mathbf{q}^{\mathrm{tgt}}=\mathbf{q}^{\mathrm{def}}+\boldsymbol{s}\odot\mathbf{a}$。子树角动量记 $\mathbf{L}\in\mathbb{R}^3$。本章假定你已读完 \cref{ch:rlmc-reward}（四层奖励框架）与 \cref{ch:rlmc-privileged}（非对称 Actor-Critic），不再复述这两处的原理。本章正文出现的数值（力矩、刚度、std）多取自仿真资产配置而非官方硬件手册，凡涉及硬件规格处均单独标注来源。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+
+人形 velocity task 的依赖与四足完全一致——三个框架的安装方式分别见 \cref{ch:rlmc-setup}。本章只需在已装好的环境上确认人形资产可用。
+
+\paragraph{系统要求.}
+GPU 训练 4096 并行环境时，单卡显存 $\geq 8$\,GB 即可跑 G1 flat velocity（29-DoF 比 12-DoF 四足多约 $30\%$ 显存与计算）。CPU、驱动、CUDA 要求与 \cref{ch:rlmc-setup} 相同。
+
+\paragraph{版本兼容表.}
+
+\begin{center}
+\small
+\begin{tabular}{llll}
+\hline
+框架 & 包/仓库 & 本章验证版本 & 人形资产入口 \\
+\hline
+mjlab & \texttt{mujocolab/mjlab} & 1.4.0（pip） & 经 \texttt{unitree\_rl\_mjlab} \\
+mjlab 任务库 & \texttt{unitreerobotics/unitree\_rl\_mjlab} & main（源码安装，无 pip tag）& \texttt{Unitree-G1-Flat} \\
+Isaac Lab & \texttt{isaac-sim/IsaacLab} & 2.3.2（命名空间 \texttt{isaaclab.*}）& \texttt{Isaac-Velocity-Flat-H1-v0} \\
+Isaac Sim & NVIDIA Omniverse & 5.1.0（配 Isaac Lab 2.3.2）& --- \\
+UniLab & \texttt{unilabsim/UniLab} & main（commit \texttt{99936e08}）& \texttt{G1WalkFlat}/\texttt{G1WalkRough} \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[把 23-DoF 与 29-DoF 资产混用]
+\textbf{错误描述}：从 G1 23-DoF 配置复制 default pose / action scale 到 29-DoF 任务（或反之）。\textbf{现象后果}：env 创建时 \verb|tensor shape mismatch| 崩溃，错误信息常显示为 action 维度对不上而非直观的 “DoF 不一致”。\textbf{根本原因}：23-DoF 无手腕、action dim 为 23；29-DoF 含 $3\times2=6$ 个手腕、action dim 为 29。\textbf{正确做法}：在 \texttt{unitree\_rl\_mjlab} 里 \texttt{Unitree-G1-Flat} 与 \texttt{Unitree-G1-23Dof-Flat} 是两个独立任务，选定一个后所有逐关节张量（default pose、action scale、std 表）都按该任务的关节数对齐。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start（五分钟最小可跑）}
+
+下面给出三框架的最小可跑命令。\textbf{务必照抄任务 ID}——人形任务名是新手最容易写错的地方（见本节陷阱）。
+
+\begin{codebox}[bash]{mjlab：G1 flat velocity 烟雾测试}
+# 第 0 步——先查你这套装的 G1 任务真名叫什么（别照抄，自查！见下方陷阱）
+uv run list-envs        # 列出当前环境注册的全部 env id
+
+# —— 路线 A：只装了 mjlab core（任务由 core 自带，命名 Mjlab-Velocity-*）——
+# 训练（小规模冒烟，验证接线无报错）
+uv run train Mjlab-Velocity-Flat-Unitree-G1 --env.scene.num-envs 256 --agent.max-iterations 10
+# 大规模训练
+uv run train Mjlab-Velocity-Flat-Unitree-G1 --env.scene.num-envs 4096
+# 回放已训练 checkpoint（注意 flag 是连字符 --checkpoint-file，不是下划线）
+uv run play Mjlab-Velocity-Flat-Unitree-G1 \
+  --checkpoint-file logs/rsl_rl/g1_velocity/<run>/model_<iter>.pt
+
+# —— 路线 B：另装了 unitree_rl_mjlab 任务库（命名 Unitree-G1-Flat，入口是 scripts/）——
+python scripts/train.py Unitree-G1-Flat --env.scene.num-envs=4096
+python scripts/play.py Unitree-G1-Flat \
+  --checkpoint-file=logs/rsl_rl/g1_velocity/<run>/model_<iter>.pt
+\end{codebox}
+
+\begin{codebox}[bash]{Isaac Lab：H1 flat velocity 烟雾测试}
+# Isaac Lab 内置 Unitree H1 velocity 任务（19-DoF）
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Flat-H1-v0 --num_envs 256 --max_iterations 50 --headless
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab：G1 walk flat 烟雾测试}
+# UniLab 原生 G1 walk 任务（CPU 仿真 + GPU 策略，异构架构）
+# env 数/迭代数走 Hydra 覆盖（不是 flag），冒烟用小规模 + no_play
+train --algo ppo --task g1_walk_flat --sim mujoco \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+
+# 大规模训练（mujoco 后端；--sim motrix 切到另一物理后端）
+train --algo ppo --task g1_walk_flat --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=300
+
+# 回放并导出 ONNX（UniLab PPO 在 eval/play 阶段才导 ONNX）
+eval --algo ppo --task g1_walk_flat --sim mujoco --load-run -1 --render-mode record
+\end{codebox}
+
+\pz{\texttt{--load-run -1} 取“最近一次 run”——它从哪找？autodl 实测 UniLab 训练落点是 \texttt{logs/rsl\_rl\_ppo/G1WalkFlat/<时间戳>\_mujoco/}（注册名 CamelCase \texttt{G1WalkFlat}、不是 slug；目录里还存了 git diff 快照便于复现）。要回放某次具体 run，把 \texttt{-1} 换成该时间戳目录名即可。\texttt{--render-mode} 取 \texttt{\{auto,interactive,record,none\}}：冒烟用 \texttt{none}、要存视频用 \texttt{record}。}
+
+\begin{pitfall}[mjlab 的 G1 任务有\emph{两套命名}，照抄前必须 \texttt{list-envs} 自查]
+\textbf{错误描述}：把别处看到的某一种任务 ID（如 \texttt{Unitree-G1-Flat}）直接照抄，结果你这套装的根本没注册它。\textbf{现象后果}：\verb|gym.error| 找不到该 env id，或 \texttt{scripts/train.py} 文件不存在 / CLI 子命令不存在。\textbf{根本原因}：\emph{装了什么决定了任务名}——这是新手最大的坑。\textbf{两套并存的事实}（已在 autodl 实跑核实）：\;(1) 只装 \texttt{mjlab} core 时，G1 velocity 任务\emph{由 core 自带}，\texttt{uv run list-envs} 实测列出 \texttt{Mjlab-Velocity-Flat-Unitree-G1}/\texttt{-Rough-G1}/\texttt{Mjlab-Tracking-Flat-Unitree-G1}，入口是 \texttt{uv run train <id>}；\emph{没有} \texttt{Unitree-G1-Flat}。\;(2) 另装 \texttt{unitree\_rl\_mjlab} 任务库时，它再注册一套 \texttt{Unitree-G1-Flat}/\texttt{Unitree-G1-23Dof-Flat}，入口是 \texttt{python scripts/train.py <id>}。两套 ID 与两个入口\emph{同时存在}，互不替代。\textbf{正确做法（举一反三）}：永远先跑下面这条自查命令确认你环境里真有哪些 ID，再照抄——而不是背任务名：
+\begin{codebox}[bash]{先自查再照抄：确认装了哪套、有哪些 G1 任务}
+# 1) 看 core 注册了哪些 env（任务名以这里为准）
+uv run list-envs | grep -i g1
+# 2) 看是否另装了 unitree_rl_mjlab 任务库（决定有没有 scripts/train.py 那套名）
+python -c "import importlib.util as u; print('unitree_rl_mjlab:', u.find_spec('unitree_rl_mjlab') is not None)"
+\end{codebox}
+若第 2 步打印 \texttt{False}，就走 core 的 \texttt{Mjlab-Velocity-Flat-Unitree-G1} + \texttt{uv run train}；为 \texttt{True} 才有 \texttt{Unitree-G1-Flat} + \texttt{scripts/train.py}。\;UniLab 同理且更易踩——它有\emph{两套名}：注册名（\texttt{training.task\_name}）是 CamelCase（\texttt{G1WalkFlat}），而 CLI \texttt{--task} 用小写 slug（\texttt{g1\_walk\_flat}，对应 \texttt{conf/ppo/task/g1\_walk\_flat/<backend>.yaml} 目录）；二者经 owner YAML 的 \texttt{training.task\_name} 字段绑定，写错任一个都会找不到任务。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{前置自测}
+
+\begin{practice}[前置自测：答错 $\geq 3$ 题先回看]
+\begin{enumerate}
+  \item 四层 reward 框架（Tracking / Regularization / Style / Safety）各层的调参策略有何不同？若把所有 reward 权重设为 $1.0$ 会发生什么？（答错回看 \cref{ch:rlmc-reward}）
+  \item 非对称 Actor-Critic 的设计动机是什么？critic 看到的 privileged 信息应满足什么条件？（答错回看 \cref{ch:rlmc-privileged}）
+  \item 域随机化为什么要“分阶段引入”而不是一次全开？（答错回看 \cref{ch:rlmc-dr}）
+  \item 什么是“支撑多边形”（support polygon）？为什么双足的支撑多边形比四足小一个数量级？（物理基础题）
+  \item 什么是角动量？上肢挥动如何影响躯干姿态？走路时双臂绑住会更难吗，为什么？（动力学基础题）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章目标}
+
+学完本章后，你应当能够：
+\begin{enumerate}
+  \item \textbf{配置} G1 的逐关节 action scale（用 $0.25\times\text{effort}/\text{stiffness}$ 公式），并解释统一 scale 为何导致关节抽动；
+  \item \textbf{实现} variable posture reward——按运动状态自适应的逐关节约束强度，并写出其与统一 pose reward 的差异；
+  \item \textbf{配置} angular momentum penalty 与 self collision penalty，定位“手臂乱甩但 reward 上涨”的失败模式；
+  \item \textbf{调通} G1 flat velocity 训练，从 zero agent 到 large train 分阶段验证，并能读懂人形特有的五阶段训练曲线；
+  \item \textbf{对照} mjlab G1（29-DoF）与 Isaac Lab H1（19-DoF）的 velocity 配置，定位框架命名差异与“开箱即用”程度差异；
+  \item \textbf{执行} sim-to-sim 跨引擎验证，定位 obs 顺序不一致导致的评估失败；
+  \item \textbf{解释} HOVER 的 mask-conditioned distillation 与 HoST 的 multi-critic 跌倒恢复，并能写出把 HoST 作为安全兜底集成进 locomotion 管线的状态机。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章知识导航}
+
+\begin{center}
+\small
+\begin{forest} navtree
+[{人形 Locomotion}
+  [{本质差异\\(\cref{sec:rlmc-hl-diff})}
+    [{支撑面/质心/角动量}]
+    [{迁移检查清单}]
+  ]
+  [{动作空间\\(\cref{sec:rlmc-hl-action})}
+    [{逐关节 action scale}]
+    [{variable posture}]
+  ]
+  [{人形奖励\\(\cref{sec:rlmc-hl-reward})}
+    [{angular momentum}]
+    [{self collision}]
+  ]
+  [{三框架对照\\(\cref{sec:rlmc-hl-isaac})}
+    [{G1 vs H1}]
+    [{sim-to-sim\\(\cref{sec:rlmc-hl-sim2sim})}]
+  ]
+  [{进阶系统}
+    [{HOVER\\(\cref{sec:rlmc-hl-hover})}]
+    [{HoST\\(\cref{sec:rlmc-hl-host})}]
+  ]
+]
+\end{forest}
+\end{center}
+
+\paragraph{前置桥接（两三行）.}
+\cref{ch:rlmc-reward} 给出四层 reward 框架与势函数塑形；\cref{ch:rlmc-obsact} 给出 actor/critic 双观测组结构与 action 管线；\cref{ch:rlmc-privileged} 给出非对称 AC 与 teacher-student 蒸馏。本章站在它们之上，回答一个四足\emph{回避}的问题：当支撑面缩到只有一只脚、质心高到接近一人之高、上肢还会反向搅动躯干角动量时，前面那套配置要改哪些、为什么改。
+
+\paragraph{阅读时间（精/速/查三档）.}
+精读全章（含动手）约 $5$--$7$ 小时；速读主线（\cref{sec:rlmc-hl-diff}--\cref{sec:rlmc-hl-reward} + 各节洞察/陷阱）约 $90$ 分钟；查阅式（直接定位某个 reward term 或某条排查）用文末故障排查手册与附录表，$5$ 分钟内可定位。
+
+% ════════════════════════════════════════════════════════════════
+\section{人形与四足的本质差异}\label{sec:rlmc-hl-diff}
+
+\subsection{模块功能与在管线中的位置}
+本节不是一个“代码模块”，而是后续所有工程决策的\emph{前置认知}。它的位置在管线最上游：在你动手改 action scale、reward、termination、DR 之前，先建立“哪些四足直觉会失效”的清单，否则你会带着四足思维去调人形参数——这是人形 RL 新手最常犯的错误。
+
+最常见的反面案例是把四足 velocity task 的配置直接搬到 G1。表面上 G1 与四足共享同一套 base cfg——observation terms、reward terms、termination conditions 看起来都类似。但不做任何修改地运行，G1 会在几步之内摔倒。\textbf{这不是 bug，这是物理。}
+
+\subsection{配置详解：支撑多边形与本征不稳定性}
+支撑多边形（support polygon）是所有接触点的凸包。\emph{静态}稳定的充要条件是质心的垂直投影落在支撑多边形内。四足与双足的差距正在这里。
+
+\begin{center}
+\small
+\begin{tabular}{lccc}
+\hline
+步态模式 & 接触点数 & 支撑面积（典型值） & 容错 \\
+\hline
+四足 stance（四脚站立） & 4 & $\sim 0.12\,\mathrm{m}^2$ & 大（静态裕度大） \\
+四足 trot（对角） & 2 & 退化为线段（$\approx 0$） & 靠\emph{动态}稳定 \\
+双足双支撑（G1） & 2 & $\sim 0.05\,\mathrm{m}^2$ & 中等 \\
+双足单支撑（G1） & 1 & $\sim 0.025\,\mathrm{m}^2$ & 极小（依赖主动平衡） \\
+\hline
+\end{tabular}
+\end{center}
+
+从控制论角度，双足行走可近似为一个\textbf{倒立摆}：质心在支撑脚上方，但高质心（G1 pelvis 站立高度 $\sim 0.76$\,m）配窄支撑面（脚掌宽 $\sim 0.1$\,m）使系统\emph{本征不稳定}——即便站着不动也需要主动控制维持平衡。四足 trot 常用弹簧质量倒立摆（SLIP）模板近似，支撑相相对更易获得动态稳定裕度，但实际稳定性仍依赖闭环控制与触地时序，不能简单说“天然被动稳定”。
+
+\begin{insight}[人形之难不在 DoF 多]\label{ins:rlmc-hl-essence}
+人形控制的难点\emph{不是}自由度多这一件事。真正的难点是\textbf{支撑面小 $+$ 质心高 $+$ 上肢和腰会反向影响躯干角动量}三者叠加。同一个动作幅度，在四足上可能只是步态变化，在双足上可能就是摔倒触发器。理解这一点，是后续 action scale、variable posture、angular momentum penalty 全部设计的共同起点。
+\end{insight}
+
+\textbf{工程含义（zero agent 的不同命运）}：四足上你可以先跑 zero agent 验证 wiring 而不担心摔倒；人形上 zero agent 可能在 $1$--$2$ 秒内就倒了。这不代表配置有错——这是物理上的正常现象。你需要用 \verb|--no-terminations| 让 zero agent 在不被提前重置的情况下跑完 sensor 检查。
+
+\subsection{代码走读：系统性对比表}
+下表每一行都对应一个具体工程陷阱，是本章后续小节的“目录”。
+
+\begin{center}
+\small
+\begin{tabular}{p{2.0cm}p{2.4cm}p{3.0cm}p{4.0cm}}
+\hline
+维度 & 四足（Go1） & 人形（G1） & 工程后果 \\
+\hline
+支撑面 & 多边形大 & 极窄（单脚 $\sim 0.025\,\mathrm{m}^2$） & 对 roll / 侧滑极敏感 \\
+质心高度 & trunk 低（$\sim 0.3$\,m） & pelvis 高（$\sim 0.76$\,m） & 倒立摆不稳更强、恢复时间更短 \\
+自由度 & 12 & 23（硬件）/ 29（本章仿真） & action 维度翻倍 \\
+上肢 & 无 & 肩/肘/腕 & 上肢角动量直接影响躯干 \\
+腰部 & 无（或固定） & 1（硬件）/ 3（仿真）DoF & 上下半身角动量耦合 \\
+步态对称性 & trot 天然对称 & 左右交替 & 可用 mirror 增广 \\
+空气时间 reward & 鼓励四脚交替 & 双足节奏不同 & 四足 air time reward \textbf{不能}照搬 \\
+DR 敏感性 & friction/push 已关键 & CoM/编码器偏置/自碰撞更敏感 & 随机化需更保守地逐步放大 \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{运行验证：迁移检查清单}
+把四足 velocity task 迁移到人形时，逐项重新思考（每项都对应后文一节）：
+
+\begin{codebox}[text]{四足$\to$双足迁移检查清单}
+reward：
+  - tracking reward 可保留，但 sigma 可能需调大（人形更难精确跟踪）
+  - 必须新增 angular_momentum penalty
+  - 必须新增 variable posture reward（上肢约束）
+  - foot_clearance 阈值重设（步高不同）
+  - foot_slip 权重可能增大（打滑后果更严重）
+observation：
+  - actor obs 维度增大（29 vs 12）
+  - critic 需包含 angular_momentum（privileged）
+termination：
+  - fell_over 角度阈值更严（人形倾斜容忍更低）
+  - 需新增 self_collision termination（手臂可能碰腿）
+action：
+  - action scale 必须 per-joint（不能统一）
+  - default pose 极其关键（决定 zero agent 能否站住）
+DR：
+  - push force 更保守（同样力对人形影响更大）
+  - friction 范围更保守（单脚支撑打滑更致命）
+\end{codebox}
+
+\subsection{常见陷阱}
+\begin{pitfall}[把四足的 air time reward 照搬给人形]
+\textbf{错误描述}：直接复用四足 \texttt{feet\_air\_time} reward。\textbf{现象后果}：G1 站立时也不断抬脚，或步频异常。\textbf{根本原因}：四足 trot 与双足行走的支撑/摆动模式完全不同。\textbf{正确做法}：重新设计适配双足步态的接触 reward（阈值、左右交替逻辑都要改）。
+\end{pitfall}
+
+\begin{pitfall}[用四足的 push force 范围给人形]
+\textbf{错误描述}：把四足 $\pm 1.0$\,m/s 的随机 push 直接用于 G1。\textbf{现象后果}：训练初期大量摔倒、episode 极短，策略退化为“蹲下降重心”的保守解。\textbf{根本原因}：高质心 $+$ 窄支撑面放大了同等扰动的后果。\textbf{正确做法}：G1 的 push 初始值设为四足的 $30$--$50\%$，且只在步态稳定后引入（见 \cref{sec:rlmc-hl-reward} 的 DR 时机表）。
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[估算]} 设四足对角脚间距 $0.4\,\mathrm{m}\times0.3\,\mathrm{m}$、G1 脚掌 $0.25\,\mathrm{m}\times0.10\,\mathrm{m}$，计算四足 trot 与 G1 单脚支撑的支撑多边形面积，给出比值。\emph{验收}：写出两个面积与倍数，并说明 trot 面积为何应按线段（趋零）而非矩形估计。
+  \item \textbf{[实验]} 跑 \verb|uv run play Mjlab-Velocity-Flat-Unitree-G1 --agent zero --num-envs 4 --no-terminations|（autodl 实跑核实：\texttt{play --help} 确有 \texttt{--agent \{zero,random,trained\}}、\texttt{--no-terminations \{True,False\}}、\texttt{--num-envs} 三个 flag；\pz{注意 play 用单数 \texttt{--num-envs}，而 train 用 \texttt{--env.scene.num-envs}——二者不通用，照搬另一个会报 Unrecognized}）。\emph{验收}：记录 (a) G1 能站多久；(b) 哪些关节最先达限位；(c) 去掉 \verb|--no-terminations| 后 episode 长度变化。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{G1 自由度分析与 Action Space 设计}\label{sec:rlmc-hl-action}
+
+\subsection{模块功能与在管线中的位置}
+action space 在管线中的位置是“策略输出 $\to$ 仿真驱动”的接口层。策略输出 $n$ 维动作 $\mathbf{a}$，经逐关节缩放与默认姿态偏置得到关节位置目标 $\mathbf{q}^{\mathrm{tgt}}$，再由仿真内 PD 控制器转成力矩。人形的关节数与力矩异质性远大于四足，这一层因此从“一个统一标量”升级为“一张逐关节表”。
+
+\begin{insight}[base 速度只能被间接实现]\label{ins:rlmc-hl-indirect}
+固定机械臂的末端位置误差可由关节空间直接解释；\textbf{人形 base 速度误差必须通过接触间接实现}——策略不能直接“命令” base 移动，只能改变腿的姿态来改变接触力，再由地面反力驱动浮动基座：
+\[
+\mathbf{a}\ \to\ \mathbf{q}^{\mathrm{tgt}}\ \xrightarrow{\text{PD}}\ \boldsymbol\tau\ \xrightarrow{\text{接触}}\ \mathbf{f}_{\mathrm{GRF}}\ \xrightarrow{\text{牛顿}}\ \dot{\mathbf{v}}_{\mathrm{base}}\ \to\ \mathbf{v}_{\mathrm{base}}.
+\]
+这个间接性是所有足式 RL 的核心挑战，在人形上因窄支撑面而被放大。G1 的 XML 中那个 \texttt{floating\_base\_joint} 不是策略直接控制的 hinge，而是代表整机位姿的 6-DoF 浮动基座。
+\end{insight}
+
+\subsection{配置详解：规格、关节地图与 action scale（四维表）}
+先区分两件事，避免“硬件规格”与“仿真资产规格”混淆：
+
+\begin{itemize}
+  \item \textbf{Unitree 官方硬件}：G1 基础版 \textbf{23 DoF}；G1 EDU 可扩展到 \textbf{23--43 DoF}（增加手部、额外腰/腕自由度）。身高 $1.32$\,m、体重 $\sim 35$\,kg（Unitree 官方）。
+  \item \textbf{本章仿真模型（29-DoF）}：在 23-DoF 基础上加入额外腰部与 $3\times2=6$ 个腕部自由度，凑成 29 个 actuated joints 作为训练示例。29-DoF 更像某个仿真资产/训练配置的关节集合，而非官网固定硬件版本。
+\end{itemize}
+
+四足的 action scale 是一个统一值（如 $0.25$\,rad），因为 12 个关节力矩能力差异不大。但 G1 的 29 个关节力矩能力差异巨大——髋 pitch 仿真配置约 $88$\,Nm，而腕 yaw 只有约 $5$\,Nm。统一 scale 会让力矩大的关节步幅不够、力矩小的关节频繁饱和。\texttt{unitree\_rl\_mjlab} 的 G1 配置采用\textbf{逐关节 action scale}：
+\begin{equation}
+s_j = 0.25\times\frac{\text{effort\_limit}_j}{\text{stiffness}_j}.
+\label{eq:rlmc-hl-actionscale}
+\end{equation}
+该式把力矩能力（effort\_limit）与 PD 刚度（stiffness）连起来。当策略输出 $a_j\in[-1,1]$，实际位置增量为 $a_j\,s_j$，确保每个关节在 $[-1,1]$ 内既能充分利用力矩又不会饱和。
+
+\begin{center}
+\small
+\begin{tabular}{p{2.6cm}p{2.6cm}p{3.2cm}p{4.0cm}}
+\hline
+配置项 & 默认值来源 & 修改影响 / 合理范围 & 与其他配置的耦合 \\
+\hline
+\texttt{action\_scale} (逐关节) & 由 \eqref{eq:rlmc-hl-actionscale} 从 MJCF 的 effort/stiffness 算出 & 偏大$\to$抽动/自碰撞；偏小$\to$步幅不足。合理范围随关节，约 $0.03$--$0.31$\,rad & 与 stiffness、default pose、variable posture std 强耦合 \\
+\texttt{default\_joint\_pos} & MJCF \texttt{<keyframe>} & 不合理$\to$zero agent 站不住。微弯站立给被动弹性 & 决定 \verb|joint_pos_rel| 观测的零点 \\
+\texttt{stiffness/damping} & MJCF actuator & 过低$\to$跟不住目标抖动；过高$\to$僵硬/震荡 & 进 \eqref{eq:rlmc-hl-actionscale} 分母，直接改 action scale \\
+\hline
+\end{tabular}
+\end{center}
+
+具体计算示例（仿真配置，非硬件手册值）：
+
+\begin{center}
+\small
+\begin{tabular}{lccc}
+\hline
+关节 & effort (Nm) & stiffness & $s_j$ (rad) \\
+\hline
+\texttt{left\_hip\_pitch} & 88 & 150 & $0.25\times88/150=0.147$ \\
+\texttt{left\_knee} & 139 & 200 & $0.25\times139/200=0.174$ \\
+\texttt{left\_ankle\_pitch} & 50 & 40 & $0.25\times50/40=0.313$ \\
+\texttt{left\_shoulder\_pitch} & 25 & 40 & $0.25\times25/40=0.156$ \\
+\texttt{left\_wrist\_yaw} & 5 & 40 & $0.25\times5/40=0.031$ \\
+\hline
+\end{tabular}
+\end{center}
+
+本表用来\emph{讲清量纲与相对关系}：力矩越大、刚度越小，单步可用的位置增量越大。\textbf{核心结论是相对的}——腕关节 scale 最小、髋/膝/踝大几倍，统一一个标量必然要么让腕饱和振荡、要么让腿步幅不足。
+
+\pzr{别把上表 $s_j$ 的\emph{绝对数}当成真值照抄。实跑核对发现：mjlab 的 G1 里 \texttt{stiffness} 不是手填的 $150/200/40$，而是由 \texttt{armature}$\times$\texttt{natural\_freq}$^2$ 现场推导（见 \texttt{g1\_constants.py}）；故真实 \texttt{G1\_ACTION\_SCALE} 实测约为 hip\_pitch $0.55$、knee $0.35$、ankle $0.44$、wrist\_yaw $0.075$，与上表的 $0.147/0.174/0.313/0.031$ 差 $3$--$4$ 倍。腕最小、约 $7\times$ 跨度这个\emph{相对结论}成立，但要拿到\emph{你这套资产}的精确 scale，必须用下文“代码走读”里的提取脚本现算，而非记表里的数。}
+
+\begin{note}
+\textbf{反面对照（统一 scale $=0.5$\,rad 会怎样）.}\;
+力矩小的关节（腕）被要求做大幅运动但力矩不够，PD 目标与实际持续大偏差$\to$限位间抽动；同时力矩大的关节（髋 pitch）被人为截断在 $\pm0.5$\,rad，本可更大步幅却受限。整体表现：上肢抽动 $+$ 下肢步幅受限 $+$ 能耗异常高。
+\end{note}
+
+\paragraph{Default pose 与 keyframe.}
+G1 default pose 定义在 MJCF \texttt{<keyframe>} 中，关键是\emph{微弯站立}：
+
+\begin{codebox}[text]{G1 MJCF keyframe（示意，DoF 顺序以实际资产为准）}
+qpos = [0 0 0.76  1 0 0 0          # 浮动基座: xyz + 四元数(w,x,y,z)
+        0 0 -0.39 0.80 -0.42 0     # 左腿: hip(roll,yaw,pitch) knee ankle(pitch,roll)
+        0 0 -0.39 0.80 -0.42 0     # 右腿
+        0 0 0                      # 腰: yaw roll pitch
+        0.3 0 0 -0.5               # 左臂: shoulder(pitch,roll,yaw) elbow
+        0 0 0                      # 左腕: roll pitch yaw (29-DoF)
+        0.3 0 0 -0.5  0 0 0]       # 右臂 + 右腕
+\end{codebox}
+
+基座高度 $0.76$\,m 与 G1 站高一致；髋 pitch $-0.39$ $+$ 膝 $0.80$ $+$ 踝 $-0.42$\,rad $\approx$ 微弯站立。完全伸直的膝（$=0$）没有“弹性余量”吸收扰动，zero agent 在 PD 下可能站不住；微弯（knee $\approx 0.8$\,rad）提供被动弹簧效应。
+
+\begin{insight}[完全锁死与完全放松都不是好配置]\label{ins:rlmc-hl-vp}
+四足的 \texttt{pose} reward 对所有关节用统一 std——这对 12 个功能相似的腿关节合理。但 G1 锁死手臂不利于行走，完全放开手臂又会乱甩。工程目标是\textbf{让上肢帮助平衡，而不是成为投机通道}。variable posture reward 用运动状态自适应的逐关节约束强度实现这个平衡：standing 严格约束所有关节、running 放宽肩肘允许摆臂，但始终严格约束 \texttt{ankle\_roll} 与 \texttt{waist\_roll}（防失稳）。
+\end{insight}
+
+\subsection{代码走读：三框架对比实战}
+
+\paragraph{mjlab —— 逐关节 scale 与 variable posture（核心代码 $+$ 逐行注释）.}
+
+\begin{codebox}[Python]{mjlab：从 MJCF 提取关节信息并算 action scale}
+import mujoco, numpy as np
+m = mujoco.MjModel.from_xml_path("g1_29dof.xml")
+for i in range(m.nu):                                  # nu = actuator 数
+    name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+    jid  = m.actuator_trnid[i, 0]                      # 该 actuator 驱动的关节 id
+    kp     = m.actuator_gainprm[i, 0]                  # 位置增益(stiffness)
+    effort = m.actuator_ctrlrange[i, 1]               # 力矩上限
+    scale  = 0.25 * effort / kp if kp > 0 else 0.0     # 式(本章 action scale)
+    print(f"{name:28s} kp={kp:6.1f} effort={effort:5.1f} scale={scale:.4f}")
+\end{codebox}
+
+把上面 29 行输出保存为 \texttt{g1\_joint\_summary.txt}，后续配置 reward/DR/termination 时反复查阅。\pz{这段脚本读的是\emph{已编译模型} \texttt{actuator\_gainprm} 里的最终 stiffness，所以无论资产作者是直接写死 kp 还是像 mjlab 那样用 \texttt{armature}$\times$\texttt{natural\_freq}$^2$ 现场推导，它都给你\emph{真值}——这正是为什么本节前面那张示例表的 $s_j$ 与你实跑打印的数对不上时，应以这段脚本的输出为准。养成“配 scale 前先跑一遍这段、打印 kp/effort/scale 三列”的习惯，比记任何表都可靠。}\;variable posture reward 在 mjlab 中是\emph{内置} term（\texttt{mdp.variable\_posture} 类，velocity 任务里键名为 \texttt{pose}），按当前 command 速度选 std 表。下面给一段\emph{简化}实现以讲清原理（mjlab 内置版用指数核 $\exp(-\mathrm{mean}(\cdot))$、逐关节 std 用 \{关节名正则: std\} 字典传入，等价但更工程化）：
+
+\begin{codebox}[Python]{mjlab：variable posture reward（运动状态自适应 std）}
+def variable_posture_reward(env, joint_names, default_joint_pos,
+                            std_standing, std_walking, std_running,
+                            speed_thresholds=(0.2, 1.0)):
+    joint_pos = env.data.joint_pos[:, env.joint_ids]          # (N, 29) 当前关节位置
+    cmd = env.command_manager.get_command("twist")            # (N, 3) 速度命令
+    cmd_speed = torch.norm(cmd[:, :2], dim=-1)                # (N,) 线速度范数
+    is_standing = cmd_speed < speed_thresholds[0]             # 站立态
+    is_running  = cmd_speed > speed_thresholds[1]             # 跑步态
+    is_walking  = ~is_standing & ~is_running                  # 行走态
+    std = torch.zeros_like(joint_pos)                         # 逐 env 逐关节 std
+    for j, name in enumerate(joint_names):                    # 按状态填 std
+        std[is_standing, j] = std_standing[name]
+        std[is_walking,  j] = std_walking[name]
+        std[is_running,  j] = std_running[name]
+    default = torch.tensor([default_joint_pos[n] for n in joint_names],
+                           device=joint_pos.device)
+    deviation = joint_pos - default                           # 偏离 default
+    return -torch.sum((deviation / std) ** 2, dim=-1)         # 加权 L2 惩罚
+\end{codebox}
+
+对应的数学形式是把统一 std 换成逐关节、逐状态的 $\sigma_j^{\mathrm{state}}$：
+\begin{equation}
+r_{\mathrm{vp}} = -\sum_{j=1}^{29}\left(\frac{q_j-q_j^{\mathrm{def}}}{\sigma_j^{\mathrm{state}}}\right)^2,
+\qquad \mathrm{state}\in\{\text{standing},\text{walking},\text{running}\}.
+\label{eq:rlmc-hl-vp}
+\end{equation}
+
+不同状态的 std 配置示例（数值越小越严，完整表见附录）：
+
+\begin{center}
+\small
+\begin{tabular}{lccc l}
+\hline
+关节 & standing & walking & running & 设计理由 \\
+\hline
+shoulder\_pitch & 0.10 & 0.15 & \textbf{0.50} & 跑步需大摆臂补偿角动量 \\
+elbow & 0.10 & 0.15 & \textbf{0.35} & 跑步弯肘摆臂更自然 \\
+waist\_roll & 0.02 & 0.02 & 0.05 & 腰侧倾始终严格约束 \\
+ankle\_roll & 0.02 & 0.02 & 0.05 & 过大$\to$脚掌边缘接触 \\
+\hline
+\end{tabular}
+\end{center}
+
+\paragraph{Isaac Lab —— 用 \texttt{ImplicitActuatorCfg} 分组设刚度/力矩.}
+Isaac Lab 的 H1 通过 actuator 组隐式设置 stiffness/damping/effort，再由自定义动作项做缩放：
+
+\begin{codebox}[Python]{Isaac Lab：H1 actuator 分组（决定隐式 action scale 的分母）}
+# isaaclab 2.x 命名空间为 isaaclab.*（旧版 omni.isaac.lab.*）
+# 取自 isaaclab_assets H1_CFG —— 注意三组：腿(含 torso)/脚(踝单独)/臂
+actuators={
+    "legs": ImplicitActuatorCfg(                            # hip×3 + knee + torso（腰在腿组！）
+        joint_names_expr=[".*_hip_yaw", ".*_hip_roll", ".*_hip_pitch", ".*_knee", "torso"],
+        effort_limit_sim=300,
+        stiffness={".*_hip_yaw":150., ".*_hip_roll":150., ".*_hip_pitch":200.,
+                   ".*_knee":200., "torso":200.},           # 逐关节 dict，非单标量
+        damping={".*_hip_yaw":5., ".*_hip_roll":5., ".*_hip_pitch":5.,
+                 ".*_knee":5., "torso":5.},
+    ),
+    "feet": ImplicitActuatorCfg(                            # 踝单独成组、低刚度
+        joint_names_expr=[".*_ankle"],
+        effort_limit_sim=100, stiffness={".*_ankle":20.}, damping={".*_ankle":4.},
+    ),
+    "arms": ImplicitActuatorCfg(                            # 肩×3 + 肘
+        joint_names_expr=[".*_shoulder_pitch", ".*_shoulder_roll", ".*_shoulder_yaw", ".*_elbow"],
+        effort_limit_sim=300, stiffness={".*":40.}, damping={".*":10.},
+    ),
+}
+\end{codebox}
+
+\begin{note}
+\textbf{上述 H1 actuator 数值已对齐 Isaac Lab \texttt{H1\_CFG}（\texttt{isaaclab\_assets/robots/unitree.py}）.}\;
+三组而非两组：踝（\texttt{feet}）单独成组（stiffness $20$、低于腿的 $150$--$200$），\texttt{torso}（腰）属\emph{腿组}不属臂组；刚度是\emph{逐关节字典}（hip\_pitch/knee/torso $=200$，hip\_yaw/roll $=150$），不是单一标量；力矩限用 \texttt{effort\_limit\_sim}（隐式执行器里它即物理引擎力矩限）。这与“臂 effort 比腿小”的直觉不同——H1 三组 \texttt{effort\_limit\_sim} 实际都给到 $300$（踝 $100$），力矩异质性主要体现在\emph{刚度}而非 effort 上限。
+\end{note}
+
+\paragraph{UniLab —— 统一标量 scale，无 effort/stiffness 逐关节公式.}
+这里是三框架\emph{真实分化}的一处：UniLab 的动作管线在 \texttt{LocomotionBaseEnv}（UniLab，\texttt{envs/locomotion/common/base.py} 的 \texttt{apply\_action}）里走\emph{位置式 PD 残差}，而 scale 默认是\textbf{一个标量}（不是 \eqref{eq:rlmc-hl-actionscale} 那张逐关节表）：
+
+\begin{codebox}[Python]{UniLab：位置残差动作 + PD 增益（统一 action\_scale）}
+# control_config: PdControlConfig —— 字段 Kp(默认 35.0) Kd(默认 0.5)
+#   action_scale(默认 0.25) simulate_action_latency
+# apply_action（基类已给）：动作=关节位置目标对 default 的残差
+ctrl = exec_actions * self._cfg.control_config.action_scale + self.default_angles
+#   = act * 0.25 + default_angles（与四足同一套，统一标量）
+# PD 增益经 create_backend 传给后端的位置执行器：
+backend = create_backend(backend_type, cfg.scene, num_envs, cfg.sim_dt,
+                         position_actuator_gains={"kp": cfg.control_config.Kp,
+                                                  "kd": cfg.control_config.Kd})
+# 力矩/速度饱和由 MJCF/Motrix 模型自身的 actuator(ctrlrange/forcerange/gear) 承担
+\end{codebox}
+
+UniLab 的 G1 任务\textbf{不内置} $0.25\times\text{effort}/\text{stiffness}$ 那张逐关节 scale 表。它能做到的最细粒度是\emph{按组}分项——\texttt{go2 rough} 已有 \texttt{hip}/\texttt{non\_hip} 两段不同的 \texttt{action\_scale}，G1 同理可在 \texttt{control\_config} 里拆出 leg/arm/waist 几组，但仍是\emph{手填的几个标量}而非从 MJCF 力矩能力自动推导。\pzr{结论：mjlab 的逐关节 effort/stiffness 自动表是 UniLab 当前\emph{无对应}的；要在 UniLab 复刻 \cref{ins:rlmc-hl-vp} 的逐关节细度，需自己读后端 \texttt{get\_actuator\_ctrl\_range()} 算出逐关节 scale 数组、改写 \texttt{apply\_action} 让 \texttt{exec\_actions} 逐列乘不同 scale（基类只乘一个标量）。} 对应到本节的核心教训：UniLab 用户更要靠 \cref{sec:rlmc-hl-reward} 的 variable posture（约束）与 kp/kd 域随机化来弥补“统一 scale 对 $10\times$ 力矩差异不友好”的问题，而不能指望框架自动分配 scale。
+
+variable posture reward 在 UniLab 同样\textbf{非内置}（其 \texttt{common/rewards.py} 的约 40 个共享函数里有 \texttt{similar\_to\_default}/\texttt{weighted\_pose}/\texttt{joint\_deviation\_l1} 等\emph{统一} pose 约束，但没有“按速度状态切 std 表”的逐关节自适应项）。好在 UniLab 的 reward 是\emph{标量字典 $+$ 派发表}范式，自定义一项即可（实现见 \cref{sec:rlmc-hl-reward} 的 UniLab 段）。
+
+\subsection{运行验证}
+small train 后应打印并核对：actor obs 维度（flat G1 29-DoF 约 $99$ 维：$3+3+3+3+29+29+29$，依 obs 配置而定）、action 维度（$29$）、无 shape error、无 NaN、tensorboard 正常写入。逐关节 scale 是否生效可在 play 时打印各关节 action 的均值/方差——若某关节 scale 为 $0$ 则该关节不动。UniLab 侧可用 \texttt{env.obs\_groups\_spec} 自检观测维度——G1 walk 返回 \texttt{\{"obs": 98, "critic": 101\}}（critic 比 actor 多 $3$ 维 $=$ 特权 base linvel，见 \cref{sec:rlmc-hl-reward}/\cref{ch:rlmc-privileged}）。
+
+\subsection{常见陷阱}
+\begin{pitfall}[逐关节 action scale 设置不当导致抽动]
+\textbf{错误描述}：统一给所有关节 $0.5$\,rad。\textbf{现象后果}：踝、腕快速抽动，膝动作幅度太小。\textbf{根本原因}：忽略了关节间 $10\times$ 的力矩能力差异。\textbf{正确做法}：用 \eqref{eq:rlmc-hl-actionscale} 逐关节计算。
+\end{pitfall}
+
+\begin{pitfall}[把手臂当成不重要的关节]
+\textbf{错误描述}：“行走主要靠腿，手臂 reward 权重可以很低/不约束”。\textbf{现象后果}：策略发现手臂大幅摆动能产生角动量补偿走路时的旋转不平衡，学到“手臂乱甩但 tracking 很高”的非自然步态。\textbf{根本原因}：不约束手臂等于给策略一个“免费”的角动量来源。\textbf{正确做法}：用 variable posture（\eqref{eq:rlmc-hl-vp}）约束上肢，并配 angular momentum penalty（\cref{sec:rlmc-hl-reward}）。
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[计算]} 用 \eqref{eq:rlmc-hl-actionscale} 计算 \texttt{left\_hip\_pitch}（effort $88$, stiffness $150$）与 \texttt{left\_wrist\_yaw}（effort $5$, stiffness $40$）的 action scale，给出倍数并解释物理含义。\emph{验收}：两个 scale 值 $+$ 倍数 $+$ 一句“为什么不能统一”。
+  \item \textbf{[设计]} 若 G1 需双手持重物，上肢 variable posture std 应如何调整？此时 angular momentum penalty 权重要变吗？\emph{验收}：给出 std 调整方向（收紧/放宽哪些关节）与一句理由。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{人形特有 Reward 设计}\label{sec:rlmc-hl-reward}
+
+\subsection{模块功能与在管线中的位置}
+reward 在管线中的位置是“塑造策略行为”的核心信号。\cref{ch:rlmc-reward} 的四层框架（Tracking $\to$ Regularization $\to$ Style $\to$ Safety）在人形上\emph{结构不变}，但每层都要改：Regularization 层新增 angular momentum、Style 层把统一 pose 换成 variable posture 并新增 base height、Safety 层新增 self collision。
+
+\subsection{配置详解：四层框架的人形适配（与四足逐项对照）}
+
+\begin{center}
+\small
+\begin{tabular}{p{1.8cm}p{3.2cm}p{3.6cm}p{3.0cm}}
+\hline
+层级 & 四足 & 人形 & 新增/修改 \\
+\hline
+Tracking & lin\_vel\_xy, ang\_vel\_yaw & 同左 & $\sigma$ 可能调大 \\
+Regularization & action\_rate, dof\_acc, torque & 同左 $+$ \textbf{angular\_momentum} & 新增角动量惩罚 \\
+Style & upright, pose, feet\_airtime & upright, \textbf{variable\_posture}, base\_height, feet\_airtime & pose$\to$variable\_posture，加 base\_height \\
+Safety & foot\_slip, undesired\_contacts & 同左 $+$ \textbf{self\_collision} & 新增自碰撞 \\
+\hline
+\end{tabular}
+\end{center}
+
+人形特有四项的配置项四维表：
+
+\begin{center}
+\small
+\begin{tabular}{p{2.4cm}p{2.4cm}p{3.4cm}p{3.4cm}}
+\hline
+配置项 & 默认值来源 & 修改影响 / 合理范围 & 与其他配置耦合 \\
+\hline
+\texttt{angular\_momentum} weight & 经验 $-0.02$ & 太大$\to$步幅缩小蹭走；太小$\to$上肢乱甩。范围约 $-0.05\sim-0.01$ & 与 variable posture 共同约束上肢 \\
+\texttt{variable\_posture} std 表 & 见附录 std 表 & 太松$\to$投机摆臂；太紧$\to$僵硬。逐关节 $0.02\sim0.5$ & 与 action scale、walking/running\_threshold 耦合 \\
+\texttt{base\_height} weight / target & $+0.5$ / $0.76$\,m & 缺失$\to$蹲走换稳定 & 与 upright 共同管姿态 \\
+\texttt{self\_collision} weight / 监测对 & $-1.0$ / 仅异常对 & 监测相邻 link$\to$误罚弯膝 & 与上肢 std 耦合 \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{代码走读：三框架对比实战}
+
+\paragraph{mjlab —— 完整 RewardsCfg（标 $\star$ 为人形新增）.}
+
+\begin{codebox}[Python]{mjlab：G1 velocity 四层 reward 注册（简化）}
+cfg.rewards = {
+    # --- Tracking ---（mjlab 函数真名 track_linear_velocity / track_angular_velocity）
+    "track_linear_velocity":  RewardTermCfg(func=mdp.track_linear_velocity, weight=2.0,
+                                            params={"command_name":"twist","std":0.25}),
+    "track_angular_velocity": RewardTermCfg(func=mdp.track_angular_velocity, weight=2.0,
+                                            params={"command_name":"twist","std":0.25}),
+    # --- Style ---
+    "upright":          RewardTermCfg(func=mdp.upright, weight=1.0),            # 类式 term
+    "base_height":      RewardTermCfg(func=base_height_l2, weight=0.5,          # star 人形新增（自定义）
+                                      params={"target_height":0.76}),
+    "pose":             RewardTermCfg(func=mdp.variable_posture, weight=1.0,    # star 替代统一 pose（mjlab 键名 pose）
+                                      params={"asset_cfg":SceneEntityCfg("robot", joint_names=".*"),
+                                              "command_name":"twist",
+                                              "std_standing":G1_STD_STANDING,   # dict: {关节名正则: std}
+                                              "std_walking":G1_STD_WALKING,
+                                              "std_running":G1_STD_RUNNING,
+                                              "walking_threshold":0.5, "running_threshold":1.5}),
+    # --- Regularization ---
+    "angular_momentum": RewardTermCfg(func=mdp.angular_momentum_penalty, weight=-0.02,  # star 人形新增（G1 实配权重）
+                                      params={"sensor_name":"robot/root_angmom"}),
+    "action_rate_l2":   RewardTermCfg(func=mdp.action_rate_l2, weight=-0.1),
+    "joint_acc_l2":     RewardTermCfg(func=mdp.joint_acc_l2,   weight=-0.0025),
+    "joint_torques":    RewardTermCfg(func=mdp.joint_torques_l2, weight=-0.0001),
+    "dof_pos_limits":   RewardTermCfg(func=mdp.joint_pos_limits, weight=-1.0),
+    # --- Contact/Safety ---
+    "foot_slip":        RewardTermCfg(func=mdp.feet_slip, weight=-0.2),         # star 比四足 -0.1 加大
+    "self_collision":   RewardTermCfg(func=mdp.self_collision_cost, weight=-1.0,  # star 人形新增
+                                      params={"sensor_name":"self_collision",
+                                              "force_threshold":10.0}),
+}
+\end{codebox}
+
+\begin{note}
+\textbf{函数名已对齐 mjlab 源码（\texttt{tasks/velocity/mdp/rewards.py}）.}\;
+\texttt{track\_linear\_velocity}/\texttt{track\_angular\_velocity}/\texttt{angular\_momentum\_penalty}/\texttt{feet\_slip}/\texttt{self\_collision\_cost} 为函数式 term；\texttt{upright}/\texttt{variable\_posture} 为\emph{类式} term（\texttt{ManagerTermBase} 子类，故 \texttt{func=mdp.upright}）。注意：mjlab 基类 velocity 的 variable posture term 的\emph{字典键就叫 \texttt{pose}}（不是 \texttt{variable\_posture}），且其内核是 \texttt{exp(-mean(error$^2$/std$^2$))}（指数核，本章下文 \eqref{eq:rlmc-hl-vp} 给的是其等价的 $L_2$ 简化形以便讲清原理）；逐关节 std 经 \texttt{std\_standing}/\texttt{std\_walking}/\texttt{std\_running} 三个\emph{\{关节名正则: std\} 字典}传入。\texttt{self\_collision\_cost} 读一个名为 \texttt{self\_collision} 的 \texttt{ContactSensor}（不是 body 对列表）。两处确为本章\emph{自定义}、mjlab 核心未内置：\texttt{base\_height\_l2}（mjlab \texttt{envs/mdp/rewards.py} 无此函数，故上面不写 \texttt{mdp.} 前缀）与本节正文给的简化 \texttt{variable\_posture\_reward}。
+\end{note}
+
+\noindent{}权重方面：\texttt{angular\_momentum} 的 $-0.02$ 已由 mjlab G1 实配确证（基类 velocity 把它与 \texttt{body\_ang\_vel}/\texttt{air\_time} 等权重置 $0.0$，交各机器人 \texttt{env\_cfgs.py} 覆盖，G1 覆盖为 $-0.02$）；其余权重（track $2.0$、foot\_slip $-0.2$ 等）为本章示意值，\pz{这些覆盖权重随版本而异，以你所装 \texttt{unitree\_rl\_mjlab} 的 G1 \texttt{env\_cfgs.py} 实际值为准}。
+
+这段代码的教学价值：人形与四足的 reward 配置在\emph{结构上完全相同}（都是 \texttt{RewardTermCfg} 字典），差异只在四处 $\star$ 标记。理解了四足配置，读人形配置只需盯这四项。angular momentum penalty 本身极简：
+\begin{codebox}[Python]{mjlab：angular momentum penalty}
+def angular_momentum_penalty(env, sensor_name="root_angmom"):
+    angmom = env.data.sensor_data[sensor_name]   # (N, 3) 以 pelvis 为根的子树角动量
+    return torch.sum(angmom ** 2, dim=-1)        # (N,) L2，权重为负即惩罚
+\end{codebox}
+
+mjlab 的 G1 MJCF 内含 \texttt{subtreeangmom} sensor（名 \texttt{root\_angmom}，body 为 \texttt{pelvis}），测以 pelvis 为根的子树角动量。其物理意义是抑制全身角动量增长：正常行走每步都涉及摆腿与摆臂补偿的角动量（必要），penalty 太大策略过度保守（步幅缩小），太小则上肢/腰高频摆动换速度。
+
+\begin{insight}[angular momentum penalty 像汽车 ESP]\label{ins:rlmc-hl-esp}
+angular momentum penalty 不是禁止所有角动量变化（那样就走不了路），而是在角动量超出正常行走范围时给惩罚——正如车辆电子稳定程序（ESP）不禁止转弯，只在偏航角速率超安全范围时介入。这解释了为什么它是\emph{惩罚}（$L_2$）而非\emph{奖励角动量为零}：把目标设成“角动量恒为零”会逼出极小步幅的蹭走。
+\end{insight}
+
+\paragraph{Isaac Lab —— H1 内置缺这两项，需自定义.}
+Isaac Lab 内置 H1 velocity 配置\textbf{不含} variable\_posture 与 angular\_momentum，需用户自定义。命名也与 mjlab 不同：
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\hline
+mjlab 命名 & Isaac Lab 命名 & 语义 \\
+\hline
+\texttt{track\_linear\_velocity} & \texttt{track\_lin\_vel\_xy\_exp} & 线速度跟踪 \\
+\texttt{upright} & \texttt{flat\_orientation\_l2} & 基座水平 \\
+\texttt{dof\_acceleration} & \texttt{dof\_acc\_l2} & 关节加速度 \\
+\texttt{variable\_posture} & ---（需自定义） & 自适应姿态约束 \\
+\texttt{angular\_momentum} & ---（需自定义） & 角动量惩罚 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[在 Isaac Lab 里找 \texttt{subtreeangmom} sensor]
+\textbf{错误描述}：以为 Isaac Lab/PhysX 也有同名 \texttt{subtreeangmom} sensor，或用 \texttt{ContactSensorCfg} 取角动量。\textbf{现象后果}：找不到该 sensor / 属性，或拿到的是接触力而非角动量。\textbf{根本原因}：\texttt{subtreeangmom} 是 MuJoCo/MJCF 概念，USD/PhysX 无同名 sensor；\texttt{ContactSensorCfg} 只报接触力/接触时间。\textbf{正确做法}：在 Isaac Lab 中用自定义 observation/reward term，从 articulation 各 body 的质量/惯性/速度求和算总角动量 $\mathbf{L}=\sum_i\big(\mathbf{I}_i^{w}\boldsymbol\omega_i+(\mathbf{r}_i-\mathbf{r}_{\mathrm{ref}})\times m_i\mathbf{v}_i\big)$；属性名须按当前版本的 \texttt{ArticulationData} 核对：\texttt{body\_ang\_vel\_w}（世界系各 body 角速度）与 \texttt{body\_mass} 确有；\pz{但惯量按惯例存在 body 质心系（\texttt{default\_inertia} 等），未必有现成的世界系 \texttt{body\_inertia\_w}——需要时自行用各 body 姿态把惯量旋到世界系（$\mathbf{R}\mathbf{I}\mathbf{R}^\top$）。}
+\end{pitfall}
+
+\paragraph{UniLab —— 标量字典 $+$ 派发表，人形三项自定义补.}
+UniLab 的 reward \emph{不是} \texttt{RewardTermCfg(func=...)} 类树，而是 \textbf{\texttt{reward.scales} 标量字典 $+$ env 内 \texttt{\_reward\_fns} 派发表}（这是三框架的第三种 reward 范式，对照 mjlab 类式、Isaac 函数式）。每步建一个 \texttt{RewardContext}（bundle 了 \texttt{linvel/gyro/dof\_pos/default\_angles/tracking\_sigma/...}），由 \texttt{run\_reward\_dispatch}（UniLab，\texttt{envs/locomotion/common/rewards.py} 的 \texttt{run\_reward\_dispatch}）按字典逐项加权求和：
+
+\begin{codebox}[Python]{UniLab：G1 walk reward（scales 标量字典 $+$ 派发表）}
+# YAML 侧（conf/ppo/task/g1_walk_flat/mujoco.yaml）—— 全是标量，无 func 类
+# 下列数值取自 autodl 实跑核对的本机 mujoco.yaml（你装的版本可能微调，以本地 yaml 为准）
+reward:
+  scales: {tracking_lin_vel: 2.0, tracking_ang_vel: 0.2,   # Tracking 层（实配 2.0）
+           lin_vel_z: -2.0, ang_vel_xy: -0.1,              # Regularization 层
+           action_rate: -0.01, similar_to_default: -0.1,   # Style(统一 pose)
+           base_height: -500.0, alive: 0.5}                # base_height 标量惩罚（实配 -500）
+  tracking_sigma: 0.25
+  base_height_target: 0.754                                # G1 站高（实配 0.754，非 0.76）
+# env 侧 _init_reward_functions 把名字映射到函数（共享函数在 common/rewards.py）
+self._reward_fns = {"tracking_lin_vel": rewards.tracking_lin_vel,
+                    "similar_to_default": rewards.similar_to_default, ...}
+# 每步派发：reward = Σ scales[name]*fns[name](ctx)，跳过 scale==0；返回 reward*ctrl_dt
+reward = rewards.run_reward_dispatch(scales=cfg.scales, fns=self._reward_fns,
+                                     ctx=ctx, info=info, ctrl_dt=self._cfg.ctrl_dt)
+\end{codebox}
+
+\pzr{诚实分化：UniLab 的约 40 个共享 reward 函数里\emph{没有} \texttt{angular\_momentum}、\texttt{variable\_posture}、\texttt{self\_collision} 这三项人形特有项（有 \texttt{similar\_to\_default}/\texttt{weighted\_pose}/\texttt{joint\_deviation\_l1} 等\emph{统一} pose 约束）。}但好消息是它们\emph{可自定义}——派发表范式让你写个函数、放进 \texttt{\_reward\_fns}、在 \texttt{scales} 里给权重即生效。angular momentum penalty 的 UniLab 版本（需先在 MJCF 加 \texttt{subtreeangmom} sensor，再读 \texttt{get\_sensor\_data}）：
+
+\begin{codebox}[Python]{UniLab：自定义 angular\_momentum penalty（放进 \_reward\_fns）}
+def angular_momentum(ctx) -> np.ndarray:        # 返回 (N,)，scales 给负权重即惩罚
+    angmom = ctx.info["root_angmom"]            # (N,3)，env 在 update_state 里从
+                                                # backend.get_sensor_data("root_angmom") 取并塞进 info
+    return np.sum(np.square(angmom), axis=1)    # L2，对照 mjlab 同名实现
+# scales 里加：reward.scales.angular_momentum: -0.02（与 mjlab 同权重起点）
+# variable_posture 同理：自定义按 ctx.info["commands"] 速度选 std 表的逐关节 L2，
+#   照搬本章式 (variable posture) 的数学形式，只是写成 numpy + RewardContext。
+\end{codebox}
+
+与 mjlab 的对照点：mjlab 的 \texttt{root\_angmom} 是 MJCF \texttt{subtreeangmom} sensor，UniLab 的 mujoco 后端同样基于 MuJoCo，\emph{可}在 G1 的 \texttt{scene\_*.xml} 里加同款 sensor，再经 \texttt{backend.get\_sensor\_data("root\_angmom")} 取——这点比 Isaac Lab（USD/PhysX 无该 sensor，须求和算总角动量，见上面 pitfall）更接近 mjlab。但 \emph{motrix 后端} 是否暴露该 sensor 取决于其传感器集，跨后端用前应核对（呼应 \cref{sec:rlmc-hl-sim2sim} 的 sim2sim 契约）。
+
+\subsection{运行验证：人形特有的训练曲线与 tensorboard 重点}
+一个健康的 G1 velocity 训练通常经历\emph{五}阶段（比四足多一个“站稳期”与“上肢收敛期”）：
+
+\begin{center}
+\small
+\begin{tabular}{p{2.4cm}p{1.8cm}p{3.6cm}p{3.6cm}}
+\hline
+阶段 & 迭代范围 & 现象 & 解释 \\
+\hline
+I 探索 & 0--800 & reward 缓升、episode 很短 & 从随机动作学“站立” \\
+II 站稳 & 800--1500 & episode length 开始增长 & \textbf{人形特有}：在 default pose 附近维持平衡 \\
+III 步态涌现 & 1500--2500 & tracking 快速上升 & 学会基本行走步态 \\
+IV 上肢收敛 & 2500--3500 & angular\_momentum 下降、posture 改善 & \textbf{人形特有}：手臂从乱甩到自然摆臂 \\
+V 精修 & 3500+ & reward 缓升到平台 & 着地柔度、能耗细化 \\
+\hline
+\end{tabular}
+\end{center}
+
+\paragraph{在跑满五阶段之前：先用 2 迭代冒烟“读一眼 term 量级”.}
+五阶段曲线要几千迭代才看得全，但\emph{接线是否正确}、\emph{每个 reward term 是否真生效}，跑 \textbf{2 个迭代}就能确认——这是本章最廉价、最该养成的工程习惯（也是 \cref{ins:rlmc-hl-rewardhack} 那套“同时看多项”的最低成本落地）。下面这条命令在 autodl（RTX 4080S，64 env）实跑约 $1.4$\,s/iter、\emph{$\sim 1285$ steps/s}（小并行下偏低属正常，PPO 靠大并行；4096 env 才接近稳态吞吐）：
+
+\begin{codebox}[bash]{2 迭代冒烟：确认接线 + 读各 reward term 量级}
+# WANDB_MODE=disabled 避免冒烟也触发 WandB 登录/上传（默认 logger 是 wandb）
+WANDB_MODE=disabled uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+  --env.scene.num-envs 64 --agent.max-iterations 2
+\end{codebox}
+
+\noindent{}预期 stdout（autodl 实测要点，照此对照即可判断“起没起来”）：
+\begin{codebox}[text]{2 迭代冒烟的预期输出（节选，名字以你装版本为准）}
+Steps per second: ~1285        # 量级对即可；远低于此查 num-envs/CPU/JIT 冷启
+Mean reward / Mean value loss / Mean surrogate loss / ... 各项有限、非 NaN
+Episode_Reward/track_linear_velocity   Episode_Reward/pose            # 人形项
+Episode_Reward/angular_momentum        Episode_Reward/self_collisions # 已生效=非零
+Episode_Reward/upright  /body_ang_vel  /air_time  /foot_slip  /soft_landing
+Metrics/angular_momentum_mean  /slip_velocity_mean  /landing_force_mean
+Episode_Termination/fell_over          # 人形 zero/早期策略秒倒，触发它是正常物理
+\end{codebox}
+
+\begin{insight}[“2 迭代读 term” 是定位异常 reward 的通用起手式]\label{ins:rlmc-hl-smoke}
+新增一个 reward term（如 \texttt{angular\_momentum}、\texttt{variable\_posture}、\texttt{self\_collisions}）后，\emph{不要}直接开大训练赌它生效——先 2 迭代冒烟，在 \texttt{Episode\_Reward/<term>} 里确认它\textbf{出现且非零}（出现=接线对、键名没拼错；非零=该状态下真的被触发）。这一步同时给你各 term 的\emph{初始量级}，正是本节反复强调的“先看量级再调权重”的依据：例如看到 \texttt{angular\_momentum} 的 $L_2$ 原始值远大于 $[0,1]$ 的 tracking，就明白为什么它的权重只配 $-0.02$（见本节后面那个“以为 \texttt{angular\_momentum} 权重应与 tracking 同量级”陷阱）。换任务、换框架时此法照样管用——它教的是“怎么自查”，不是某个固定输出。
+\end{insight}
+
+\begin{insight}[reward 高 $\neq$ 步态正确]\label{ins:rlmc-hl-rewardhack}
+G1 可以靠低头冲刺、手臂乱甩或膝盖内扣来满足速度命令。\textbf{永远不要只看总 return}——必须\emph{同时}看 torso pitch/roll、angular momentum、foot contact、self collision。一个高复发的交叉检查：若 \texttt{track\_linear\_velocity} 上升而 \texttt{upright} 下降，策略在\emph{用前倾换速度}（四足少见、人形常见）——此时不要调 tracking，应增大 upright 或收紧 waist\_pitch std。Stage IV 中若 tracking 继续涨但 angular\_momentum 也在涨，说明在用“不自然但有效”的方式走路，是 variable posture 该发力的窗口。
+\end{insight}
+
+\textbf{人形 DR 引入时机}（核心原则：random push 对人形影响远大于四足，只有步态与角动量管理稳定后才能引入）：
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\hline
+训练阶段 & 可引入的 DR & 不应引入 \\
+\hline
+站稳期(II) & friction、motor\_strength（小范围） & push（会站不住） \\
+步态涌现(III) & 扩大 friction & push（步态还不稳） \\
+上肢收敛(IV) & obs noise、CoM offset & push（上肢还在收敛） \\
+精修(V) & \textbf{push}（此时才安全）、全部 DR & --- \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{常见陷阱}
+\begin{pitfall}[self\_collision 监测了相邻 link]
+\textbf{错误描述}：把（thigh, shank）这类相邻 link 对也纳入自碰撞监测（在 mjlab 即让喂给 \texttt{self\_collision} sensor 的碰撞几何对涵盖相邻 link，经 contype/conaffinity 位掩码控制，而非字面 \texttt{body\_pairs} 字段）。\textbf{现象后果}：正常弯膝就触发自碰撞惩罚，策略学到不弯膝的僵硬步态。\textbf{根本原因}：相邻 link 正常接触被当成异常。\textbf{正确做法}：只监测\emph{异常}对（手碰大腿、肘碰躯干）。
+\end{pitfall}
+
+\begin{pitfall}[以为 angular\_momentum 权重应与 tracking 同量级]
+\textbf{错误描述}：看到 $-0.02$ 觉得太小，调到和 tracking（$+2.0$）一个量级。\textbf{现象后果}：策略被角动量惩罚主导，蹲着不动。\textbf{根本原因}：angular momentum 是 $L_2$ 范数，数值量级可能远大于值域 $[0,1]$ 的 exponential tracking；乘以实际值后 $-0.02$ 的贡献已经很大。\textbf{正确做法}：先打印各 term 初始值确认量级，再调权重。
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[实验]} ablation：分别关闭 \texttt{angular\_momentum} 与 \texttt{variable\_posture}（每次只关一个），各训 $2000$ 迭代。\emph{验收}：对比表给出 (a) 最终 tracking reward；(b) 视频里步态差异；(c) angular\_momentum 实际值。
+  \item \textbf{[综合，跨 \cref{ch:rlmc-reward}]} 解释为何 tracking 用 exponential kernel 而 angular\_momentum 用 $L_2$ penalty；若把 angular\_momentum 也改成“奖励接近零”的 exponential 会怎样？\emph{验收}：一段推理 $+$ 预测的失败模式（提示：见 \cref{ins:rlmc-hl-esp}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{三框架对照：mjlab G1 与 Isaac Lab H1（兼及 UniLab）}\label{sec:rlmc-hl-isaac}
+
+\subsection{模块功能与在管线中的位置}
+本节把人形 velocity task 放到跨框架视角下对照。位置仍在“任务配置”层，但目标是建立\emph{跨框架心智模型}：同一个人形 locomotion 问题，mjlab（G1, MJCF, MuJoCo-Warp）与 Isaac Lab（H1, USD, PhysX）在任务入口、obs 组命名、开箱即用程度上各有差异；本节末再把 UniLab（G1, CPU 仿真 $+$ GPU 策略）接进同一张对照表，作为第三套范式。
+
+\subsection{配置详解：G1 vs H1 全维度对照}
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\hline
+维度 & mjlab G1 & Isaac Lab H1 \\
+\hline
+机器人 & Unitree G1（29-DoF 仿真） & Unitree H1（19-DoF） \\
+身高/体重 & $1.32$\,m / $35$\,kg & $1.8$\,m / $47$\,kg \\
+模型格式 & MJCF & USD（自 URDF 转换） \\
+obs group 名 & actor / critic & policy / critic \\
+RL 后端 & RSL-RL & RSL-RL（或 skrl 等） \\
+terrain & MuJoCo-Warp heightfield & PhysX terrain \\
+\hline
+\end{tabular}
+\end{center}
+
+最关键的关节差异是 \textbf{H1 没有 ankle\_roll}（也没有手腕）。这意味着 H1 无法靠踝内外翻调侧向平衡，必须完全依赖髋与步幅——侧向稳定更难，但更像人类（人踝 roll 范围也很小）。工程含义：H1 的 \texttt{hip\_roll} std 应比 G1 更放松，以补偿缺失的 ankle\_roll。
+
+H1 是更大的平台：约 $1.8$\,m、19 个 actuated joints（Isaac Lab \texttt{H1-v0} 即此 19-DoF 构型；整机质量随配置在约 $47$--$70$\,kg 间，含电池/全配偏高端）。Unitree 官方仅给出关节力矩\emph{包络}（腿关节峰值约 $360$\,N$\cdot$m、臂关节约 $120$\,N$\cdot$m），\pz{逐关节（膝/髋/踝/臂各轴）的额定力矩需对你所用 H1 型号的硬件手册核对，本章不写死单关节 Nm。}
+
+\subsection{代码走读：三框架对比实战}
+
+\paragraph{Isaac Lab —— H1 velocity 配置（核心 $+$ 注释）.}
+
+\begin{codebox}[Python]{Isaac Lab：H1 rough velocity 配置（简化）}
+@configclass
+class UnitreeH1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
+    scene = InteractiveSceneCfg(robot=ArticulationCfg(
+        prim_path="{ENV_REGEX_NS}/Robot",
+        spawn=UsdFileCfg(usd_path="unitree_h1/h1.usd",
+                         activate_contact_sensors=True),   # 启用接触传感器
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=(0.0, 0.0, 1.05),                          # H1 站高更高
+            joint_pos={".*_hip_pitch": -0.28, ".*_knee": 0.79,
+                       ".*_ankle": -0.52, ".*_shoulder_pitch": 0.28,
+                       ".*_elbow": 0.52}),                 # 微弯站立(同 G1 思路)
+        actuators={...}))                                  # 见上节 actuator 分组
+    rewards = RewardsCfg(                              # 数值对齐 H1 rough_env_cfg.py
+        track_lin_vel_xy_exp=RewTerm(func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=1.0),
+        track_ang_vel_z_exp =RewTerm(func=mdp.track_ang_vel_z_world_exp,      weight=1.0),
+        flat_orientation_l2 =RewTerm(func=mdp.flat_orientation_l2, weight=-1.0),  # 对应 mjlab 的 upright
+        feet_air_time       =RewTerm(func=mdp.feet_air_time_positive_biped, weight=0.25),
+        termination_penalty =RewTerm(func=mdp.is_terminated, weight=-200.0))
+        # H1 rough 还把 undesired_contacts 设 None（删除）、dof_torques_l2 权重设 0
+        # 注意：无 variable_posture / angular_momentum，需自定义
+\end{codebox}
+
+\begin{note}
+\textbf{H1 数值已对齐 Isaac Lab \texttt{UnitreeH1RoughEnvCfg}（\texttt{config/h1/rough\_env\_cfg.py}）.}\;
+init \texttt{joint\_pos}（hip\_pitch $-0.28$、knee $0.79$、ankle $-0.52$、shoulder\_pitch $0.28$、elbow $0.52$）与 \texttt{pos=(0,0,1.05)} 逐项核对无误。reward：跟踪权重实为 \emph{$1.0/1.0$}（非旧稿 $1.5/0.75$），且用的是 \texttt{track\_lin\_vel\_xy\_yaw\_frame\_exp}/\texttt{track\_ang\_vel\_z\_world\_exp}（heading/world 系变体，非 \texttt{\_exp} 基名）；\texttt{feet\_air\_time} 权重 $0.25$、函数是 \emph{biped} 专版 \texttt{feet\_air\_time\_positive\_biped}；H1 rough 还显式把 \texttt{undesired\_contacts} 设 \texttt{None}、\texttt{dof\_torques\_l2} 权重设 $0$、并加 \texttt{termination\_penalty}($-200$) 与 \texttt{joint\_deviation\_l1}（torso 等）。
+\end{note}
+
+\paragraph{命令行对照（同一套验证流程，两套 CLI）.}
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\hline
+操作 & mjlab（\texttt{unitree\_rl\_mjlab}） & Isaac Lab \\
+\hline
+训练 & \texttt{python scripts/train.py <id> ...} & \texttt{python .../rsl\_rl/train.py --task <id>} \\
+回放 & \texttt{python scripts/play.py <id> ...} & \texttt{python .../rsl\_rl/play.py --task <id>} \\
+环境数 & \texttt{--env.scene.num-envs} & \texttt{--num\_envs} \\
+Headless & \texttt{--viewer none}（\pz{mjlab README 未列 headless 开关名，经核未证实，以 \texttt{--help} 为准}）& \texttt{--headless} \\
+\hline
+\end{tabular}
+\end{center}
+
+\paragraph{humanoid-gym —— 第三套生态的方法论参考.}
+humanoid-gym（Gu, Wang, Chen，\textbf{arXiv:2404.05695}，2024 年的人形 zero-shot sim2real 框架，仓库 \texttt{roboterax/humanoid-gym}\cite{gu2024humanoidgym}）基于旧版 Isaac Gym（非 Manager-Based），但其方法论直接适用本章：(1) \textbf{sim-to-sim 验证层}（Isaac Gym 训练 $\to$ MuJoCo 验证，比直接上真机安全便宜）；(2) \textbf{symmetric mirror 增广}（人形行走左右对称，加镜像约等于 $2\times$ 样本效率）；(3) \textbf{参考相位变量}（为步态周期加显式相位信号）。其真机验证平台为 RobotEra XBot-S（$1.2$\,m）与 XBot-L（$1.65$\,m）。
+
+\begin{codebox}[Python]{mirror 增广概念（左右肢体 obs 互换 + 侧向量取反）}
+def mirror_obs(obs, left_idx, right_idx, vy_idx, yaw_idx):
+    m = obs.clone()
+    m[:, left_idx]  = obs[:, right_idx]      # 左右肢体观测互换
+    m[:, right_idx] = obs[:, left_idx]
+    m[:, vy_idx]  = -obs[:, vy_idx]          # 侧向速度取反
+    m[:, yaw_idx] = -obs[:, yaw_idx]         # 偏航取反
+    return m
+\end{codebox}
+
+在 Isaac Lab 中，mirror 增广由 \texttt{RslRlSymmetryCfg} 提供：\texttt{use\_data\_augmentation=True} 时用 \texttt{data\_augmentation\_func}（其签名接收 \texttt{env}（VecEnv）、\texttt{obs}（TensorDict）、\texttt{action}，返回拼接了镜像样本的 obs/action）把镜像轨迹加进 batch；另有 \texttt{use\_mirror\_loss}/\texttt{mirror\_loss\_coeff}（后者默认 $0.0$）加对称性损失项，不必手写。两者都为 \texttt{False} 时该函数仍会被调用以记录对称性指标（便于消融）。理解原理对\emph{非对称}人形（如单臂）禁用/修改它时很重要。
+
+\paragraph{UniLab —— 第三套生态：CPU 仿真 $+$ GPU 策略、非 Manager-Based.}
+把 UniLab 接进这张跨框架对照表，它是\emph{第三条范式}：物理仿真在 \textbf{CPU} 多线程（MuJoCoUni / MotrixSim），策略学习在 \textbf{GPU}，二者经共享内存 IPC 解耦——与 mjlab（MuJoCo-Warp/GPU）和 Isaac Lab（PhysX/GPU）的“GPU 仿真主导”正交。它的 G1 任务（\texttt{G1WalkFlat}/\texttt{G1WalkRough}）和这两家一样开箱即跑，但 reward/action/DR 的组织方式不同：
+
+\begin{center}
+\small
+\begin{tabular}{llll}
+\hline
+维度 & mjlab G1 & Isaac Lab H1 & UniLab G1 \\
+\hline
+物理位置 & GPU(MuJoCo-Warp) & GPU(PhysX) & \textbf{CPU}(MuJoCoUni/Motrix) \\
+模型格式 & MJCF & USD & MJCF / Motrix XML \\
+obs group 名 & actor/critic & policy/critic & \texttt{obs}/\texttt{critic}（env 侧固定） \\
+reward 范式 & \texttt{RewardTermCfg} 类 & \texttt{@configclass} 函数 & scales 标量字典$+$派发表 \\
+架构 & Manager-Based & Manager-Based & \textbf{非} Manager（\texttt{NpEnv}） \\
+镜像增广 & RSL-RL \texttt{data\_aug} & RSL-RL \texttt{data\_aug} & \texttt{SymmetryAugmentation} \\
+\hline
+\end{tabular}
+\end{center}
+
+UniLab \textbf{不是} Manager-Based：obs/reward/terminated 在一个 \texttt{update\_state} 里一处算（替代 Isaac Lab 的 Observation/Reward/Termination 三个 manager），DR/课程/对称性各用独立组件（\texttt{DomainRandomizationManager} / \texttt{PenaltyCurriculum} / \texttt{SymmetryAugmentation}）。对人形 velocity 任务，最直接的对照价值有三点：
+
+\begin{itemize}
+  \item \textbf{obs group 名是第三套}——前一节那个“mjlab \texttt{actor} vs Isaac \texttt{policy}”陷阱，到 UniLab 又多一层：env 侧 \texttt{obs\_groups\_spec} 固定用 \texttt{obs}/\texttt{critic}（\texttt{split\_obs\_dict} 把 \texttt{obs} 喂 actor、\texttt{critic} 喂 critic），而 Hydra 的 \texttt{algo.obs\_groups} 用 \texttt{\{actor: [actor], critic: [critic]\}} 路由给 rsl-rl。两层经 wrapper 对齐，跨框架移植 G1 配置时三套组名都要核对。
+  \item \textbf{镜像增广是原生协议}——humanoid-gym 手写、RSL-RL 集成的 mirror 增广，UniLab 做成了 \texttt{SymmetryAugmentation}（Protocol，\texttt{mirror\_obs} / \texttt{augment\_obs\_and\_actions}），env 经 \texttt{build\_symmetry\_augmentation(device=)} 提供；对人形左右对称步态同样约 $2\times$ 样本效率，且对\emph{非对称}人形（单臂）可在 env 侧改写该协议禁用。
+  \item \textbf{命令行同一套验证流、第三套 CLI}——训练 \texttt{train --algo ppo --task g1\_walk\_flat --sim mujoco}，回放 \texttt{eval ... --load-run -1 --render-mode record}，env 数/迭代数走 Hydra 覆盖（\texttt{algo.num\_envs} / \texttt{algo.max\_iterations}），不是 flag。
+\end{itemize}
+
+\begin{pitfall}[把 UniLab 的 env 数当 CLI flag 传]
+\textbf{错误描述}：照 Isaac Lab 习惯写 \texttt{--num\_envs 4096} 或照 mjlab 写 \texttt{--env.scene.num-envs}。\textbf{现象后果}：argparse 报未知参数，或被当 Hydra 透传里的保留键而 \texttt{SystemExit}。\textbf{根本原因}：UniLab 把 \texttt{algo / task / training.sim\_backend / training.play\_only} 列为 RESERVED 必须用 flag，其余（含 env 数/迭代数）一律走 Hydra 覆盖。\textbf{正确做法}：\texttt{train --algo ppo --task g1\_walk\_flat --sim mujoco algo.num\_envs=4096 algo.max\_iterations=300}。
+\end{pitfall}
+
+\subsection{运行验证：人形诊断矩阵}
+训练出问题时，用下表“现象 $\to$ 读数 $\to$ 落点 $\to$ 单变量动作”快速定位（每次只改一个参数）：
+
+\begin{center}
+\small
+\begin{tabular}{p{2.0cm}p{2.8cm}p{2.6cm}p{3.0cm}}
+\hline
+现象 & 优先读数 & 源码落点 & 单变量动作 \\
+\hline
+站立抖动 & zero cmd action\_rate & pose std / action scale & 只调 standing std \\
+低头冲刺 & torso pitch / upright & upright weight & 收紧 waist\_pitch std \\
+侧向倒 & torso roll / hip roll & lin\_vel\_y range & 缩窄 $v_y$ curriculum \\
+手臂乱甩 & root\_angmom / self\_collision & variable posture std & 只调上肢 std \\
+脚掌抖 & ankle roll / contact force & foot collision geom & 收紧 ankle\_roll std \\
+蹲着走 & base\_height / knee angle & base\_height reward & 增大 base\_height 权重 \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{常见陷阱}
+\begin{pitfall}[Isaac Lab H1 的 obs group 名是 \texttt{policy} 不是 \texttt{actor}]
+\textbf{错误描述}：在 mjlab 调好 G1（obs 组名 \texttt{actor}/\texttt{critic}）后，把组名直接复制到 Isaac Lab H1。\textbf{现象后果}：找不到 obs group / KeyError。\textbf{根本原因}：Isaac Lab 用 \texttt{policy}/\texttt{critic}，mjlab 用 \texttt{actor}/\texttt{critic}。\textbf{正确做法}：跨框架移植时核对组名映射。
+\end{pitfall}
+
+\begin{pitfall}[以为内置 H1 配置已是最优]
+\textbf{错误描述}：把 Isaac Lab 内置 H1 配置当成最优 baseline 直接用。\textbf{现象后果}：步态不自然（手臂行为不受控）。\textbf{根本原因}：内置配置是“能跑”的基础版，缺 variable\_posture 与 angular\_momentum。\textbf{正确做法}：当作起点，用 \cref{sec:rlmc-hl-reward} 的 reward 增强改进。
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[对照]} 列 mjlab G1 与 Isaac Lab H1 的 reward terms 对照表，标注共有/框架特有/需自定义三类。\emph{验收}：表格至少覆盖 tracking、upright/flat\_orientation、angular\_momentum、variable\_posture 四行。
+  \item \textbf{[配置]} 为 Isaac Lab H1 添加 \texttt{angular\_momentum} reward：写出完整 \texttt{RewTerm}（func/weight/params），并说明 H1 USD 无 \texttt{subtreeangmom} 时如何用自定义 term 求总角动量。\emph{验收}：给出 \texttt{RewTerm} 片段 $+$ 一句“为什么不能用 ContactSensorCfg”。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{sim-to-sim：跨引擎交叉验证}\label{sec:rlmc-hl-sim2sim}
+
+\subsection{模块功能与在管线中的位置}
+sim-to-sim 在管线中的位置是“sim-to-real 之前的鲁棒性预筛”。在人形上它\emph{比四足更重要}，原因有三：(1) 人形真机摔倒代价高（G1 从 $0.76$\,m 摔下可能损坏精密关节）；(2) 窄支撑面放大接触模型差异（MuJoCo 凸优化软接触 vs PhysX TGS，见 \cref{ch:rlmc-physics}）；(3) 人形的 reward hacking 更隐蔽（“看起来在走但其实在利用特定引擎接触特性”，只有跨引擎才暴露）。
+
+\subsection{配置详解：跨引擎评估的定量门限}
+
+\begin{center}
+\small
+\begin{tabular}{lccc}
+\hline
+指标 & 同引擎基线 & 跨引擎目标 & 不可接受 \\
+\hline
+Tracking error (m/s) & $0.10$--$0.15$ & $<0.25$ & $>0.5$ \\
+Fall rate (\%) & $<5$ & $<20$ & $>50$ \\
+Episode length & $>800$ 步 & $>400$ 步 & $<100$ 步 \\
+\hline
+\end{tabular}
+\end{center}
+
+跨引擎 fall rate $>50\%$ 通常不是“验证失败”，而是暴露了策略对特定引擎的\emph{过拟合}；解法是加大 friction 与接触相关 DR（见 \cref{ch:rlmc-dr}），逼策略学更鲁棒的行为。
+
+\subsection{代码走读：obs 对齐是跨引擎成败关键}
+最易出错的环节是 obs 顺序：mjlab 与 Isaac Lab 的 term 注册顺序可能不同，ONNX 模型期望固定输入布局。导出前务必两端打印 obs term 名与 shape 逐一对照：
+
+\begin{codebox}[Python]{两端通用的 obs 布局打印（用于逐位对齐）}
+def print_obs_layout(env, name):
+    obs = env.observation_manager.compute()       # 取各 group 的 obs 字典
+    offset = 0
+    for group, data in obs.items():
+        print(f"Group: {group}")
+        items = data.items() if isinstance(data, dict) else [("concat", data)]
+        for term, tensor in items:
+            dim = tensor.shape[-1]
+            print(f"  [{offset:3d}:{offset+dim:3d}] {term:24s} dim={dim}")
+            offset += dim
+    print(f"{name} total obs dim: {offset}")
+    return offset
+# 用法： assert print_obs_layout(mjlab_env,"mjlab") == print_obs_layout(isaac_env,"isaac")
+\end{codebox}
+
+\paragraph{HOVER 提供的现成 sim-to-sim 设施.}
+HOVER（\cref{sec:rlmc-hl-hover}）的仓库在 \texttt{neural\_wbc} 下同时提供 Isaac Lab 训练入口与一个\emph{独立的} MuJoCo 推理环境（\texttt{neural\_wbc/inference\_env}）。\pzr{注意：MuJoCo sim-to-sim 不是给 \texttt{play.py} 加一个 \texttt{--sim mujoco} flag 切换（HOVER 无此 flag），而是\emph{换一个脚本}——用 \texttt{neural\_wbc/inference\_env/scripts/eval.py} 跑训练好的 student，它内部直接走 MuJoCo 且仅支持单环境（\texttt{--num\_envs 1}）。} 两个环境共享同一套 obs/action 契约，从而保证策略可跨引擎回放：
+
+\begin{codebox}[bash]{HOVER：Isaac Lab 训练 teacher、独立 MuJoCo 脚本做 sim-to-sim}
+# 在 Isaac Lab 训练 teacher（经 isaaclab.sh 启动）
+${ISAACLAB_PATH}/isaaclab.sh -p scripts/rsl_rl/train_teacher_policy.py \
+  --num_envs 1024 \
+  --reference_motion_path neural_wbc/data/data/motions/stable_punch.pkl
+# 用独立 MuJoCo 推理脚本验证 student（注意是另一个脚本，单环境）
+${ISAACLAB_PATH}/isaaclab.sh -p neural_wbc/inference_env/scripts/eval.py \
+  --num_envs 1 --headless \
+  --student_path neural_wbc/data/data/policy/h1:student/ \
+  --student_checkpoint model_<iteration_number>.pt
+\end{codebox}
+
+\pz{脚本路径与参数名以 \texttt{NVlabs/HOVER} README 的当前版本为准（上述命令对应其 README 标定的 Isaac Lab 2.0.0）。}
+
+\paragraph{mjlab —— 单框架时用 DR 扫描模拟跨引擎.}
+若暂时只有 mjlab，可用 friction/push 扫描近似跨引擎差异：
+
+\begin{codebox}[bash]{mjlab：friction / push 鲁棒性扫描（近似 sim-to-sim）}
+# 改 friction（模拟不同引擎接触特性）；改 push（外部扰动）
+# 这里用 mjlab core 任务名 + 连字符 --checkpoint-file（autodl 实跑形式）
+uv run play Mjlab-Velocity-Flat-Unitree-G1 --checkpoint-file model.pt --num-envs 100 \
+  --env.events.physics_material.params.static_friction_range "(0.4, 0.4)"
+uv run play Mjlab-Velocity-Flat-Unitree-G1 --checkpoint-file model.pt --num-envs 100 \
+  --env.events.push_robot.params.velocity_range "(-1.5, 1.5)"
+\end{codebox}
+
+若低 friction 下 fall rate 从 $5\%$ 跳到 $60\%$，说明策略严重依赖当前摩擦设定，跨引擎大概率也会失败——加大训练时 friction DR 可缓解。
+
+\paragraph{UniLab —— sim-to-sim 是内置一等公民（跨后端契约校验）.}
+这是 UniLab 在本章\emph{最出彩}的一处：它把 sim-to-sim 做成了\textbf{框架内建的跨后端一致性关卡}（MuJoCo $\leftrightarrow$ Motrix），而不像 mjlab/Isaac 那样要靠用户手动对齐 obs。机制在 \texttt{resolve\_sim2sim\_config}（UniLab，\texttt{training/sim2sim.py}）：把一份后端训出的策略拿到\emph{另一}后端回放前，先读源 run 的 \texttt{contract\_snapshot}，与目标配置逐字段比对，DENYLIST 里的关键字段不一致就报错：
+
+\begin{codebox}[bash]{UniLab：训练于一后端、验证于另一后端（内建契约校验）}
+# 在 mujoco 后端训练 G1 walk
+train --algo ppo --task g1_walk_flat --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=300
+# 切到 motrix 后端回放/评估——training.sim2sim_strict=true(默认)会强制契约一致
+eval --algo ppo --task g1_walk_flat --sim motrix --load-run -1 --render-mode record
+#   若 DENYLIST 字段(决定策略行为者)不一致 -> 抛 CrossBackendIncompatibleError(致命)；
+#   非 DENYLIST 差异只打 [sim2sim] WARNING；张量 shape 不匹配经 policy_load_dim_guard
+#   重抛成 sim2sim 诊断（指向 scripts/audit_sim2sim_contracts.py）。
+\end{codebox}
+
+\begin{insight}[UniLab 把“obs 顺序不一致”前置成了编译期错误]\label{ins:rlmc-hl-sim2sim}
+本节那个高复发陷阱——“两端 obs 顺序不一致，策略全军覆没却不报错”——在 mjlab/Isaac 里要靠用户自己打印 term 名逐位对齐（见上面的 \texttt{print\_obs\_layout}）。UniLab 的不同在于：它\emph{内建}把“决定策略行为的字段”（obs 布局、归一化、action 后处理等）固化进 \texttt{contract\_snapshot}，跨后端迁移时由 \texttt{resolve\_sim2sim\_config} 逐字段比对，不兼容直接 \texttt{CrossBackendIncompatibleError}（\texttt{strict=True} 默认致命）。这把“运行时静默漂移”变成了“迁移时显式报错”——对人形尤其值钱，因为人形的 reward hacking 隐蔽、窄支撑面放大接触差异，越早暴露越省真机代价。代价是 UniLab 的 sim2sim 限于它自己的两个 CPU 后端（MuJoCo/Motrix），跨到 mjlab/Isaac 的 GPU 引擎仍需手动对齐。
+\end{insight}
+
+注意 UniLab 的 sim2sim 语义与本章别处不同：mjlab/Isaac 的 sim-to-sim 是“训练引擎 $\to$ 验证引擎”（如 Isaac Gym $\to$ MuJoCo），UniLab 的是“同框架两个 CPU 物理后端互验”（MuJoCoUni $\leftrightarrow$ MotrixSim）——它的接触求解都在 CPU，两后端接触模型/DR 能力不同（见 \cref{sec:rlmc-hl-reward} 提到的 sensor 可用性、\cref{ch:rlmc-dr} 的后端 DR 能力差异），契约校验正是为此而设。事实上 UniLab 的 motrix 在 tracking 类任务上\emph{就是}“仅用于 sim2sim 评估/回放”而注册的。
+
+\subsection{运行验证}
+对齐成功的标志：两端 \texttt{total obs dim} 相等且逐 term 名一一对应。典型 mjlab G1 actor 布局为 \texttt{[0:3] base\_lin\_vel}、\texttt{[3:6] base\_ang\_vel}、\texttt{[6:9] projected\_gravity}、\texttt{[9:12] command}、\texttt{[12:41] joint\_pos}、\texttt{[41:70] joint\_vel}、\texttt{[70:99] last\_action}，共 $99$ 维。
+
+\subsection{常见陷阱}
+\begin{pitfall}[obs 顺序不一致导致跨引擎评估全军覆没]
+\textbf{错误描述}：直接把一端训练的 ONNX 喂另一端，未核对 term 顺序。\textbf{现象后果}：策略行为完全错乱、fall rate 接近 $100\%$，却看不出代码报错。\textbf{根本原因}：例如一端 \texttt{command} 在 \texttt{projected\_gravity} 之前，ONNX 第 $6$--$8$ 维收到的语义被对调。\textbf{正确做法}：两端打印 obs term 名与 shape 逐位对齐；并确认归一化参数（running mean/var）一致、action 后处理（逐关节 scale、default offset）一致。
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[实验]} mjlab 训练 G1 flat（$3000$ 迭代），导出 ONNX 后在 friction $\in\{0.5,1.0,1.5\}$ 下评估。\emph{验收}：记录三档 tracking error 与 fall rate，判断是否存在“依赖特定摩擦”的过拟合。
+  \item \textbf{[实践]} 写 obs 对齐检查脚本，分别在 mjlab 与 Isaac Lab reset 一次并打印 term 名/shape 逐一对照。\emph{验收}：脚本输出两端布局 $+$ 一处不一致时的修复说明（重排层或改注册顺序）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{精读：HOVER 的统一 Whole-Body Controller}\label{sec:rlmc-hl-hover}
+
+\begin{paper}[HOVER：mask-conditioned 多模态统一控制器]\label{paper:rlmc-hl-hover}
+\textbf{问题}：人形 whole-body control 需适配导航、loco-manipulation、桌面操作等多种任务，每种任务对身体部位的约束不同（导航靠 root 速度跟踪、桌面操作重上肢关节角跟踪）。为每种模态各训一个专用策略既费算力又难维护。\\
+\textbf{核心思想}：以\emph{全身运动模仿}（full-body kinematic motion imitation）作为所有控制任务的\textbf{公共抽象}——不同模态只是对不同身体部位的约束；用 mask 选择哪些部位需要跟踪，一个统一策略即可覆盖所有模态。\\
+\textbf{关键结果}：经运动模仿 $+$ 策略蒸馏，HOVER 把多模态运动技能整合进单一策略，在多种真实控制模态上优于专用控制器。\\
+\textbf{与本书关系}：是 \cref{ch:rlmc-privileged} teacher-student 蒸馏在人形 WBC 上的范例，也是 \cref{sec:rlmc-hl-sim2sim} sim-to-sim 工具链的来源。\\
+\textbf{局限}：teacher 阶段需大量算力（推荐 $\geq 4096$ 环境）；依赖高质量 kinematic 参考运动（retarget 质量决定上限）。\\
+HOVER（Humanoid Versatile Controller，NVIDIA，He 等，\textbf{ICRA 2025}，arXiv:2410.21229，仓库 \texttt{NVlabs/HOVER}）\cite{he2025hover}。
+\end{paper}
+
+\subsection{配置详解：teacher-student 两阶段与 mask 机制}
+HOVER 采用 teacher-student 两阶段：
+
+\begin{codebox}[text]{HOVER 两阶段训练（概念）}
+Stage 1  Oracle Teacher（全信息）
+  输入: proprio + 完整参考姿态(全身 kinematic target)
+  训练: PPO，~50k-80k 迭代，4096 环境
+Stage 2  Multi-Mode Student（mask-conditioned）
+  输入: proprio + 部分参考姿态(masked command)
+  训练: 蒸馏 from teacher（DAgger 式），~10k 迭代
+  Masks: 全身=[1,1,1,1,1,1] 导航=[1,0,0,0,0,0]
+         上肢操作=[0,1,1,0,0,0] 头+手(遥操作)=[0,0,0,1,1,0]
+\end{codebox}
+
+\begin{insight}[mask-conditioned distillation 像 BERT 的 masked LM]\label{ins:rlmc-hl-mask}
+HOVER 的 mask 类比 NLP 中的 masked language modeling：BERT 随机 mask 部分 token 学上下文理解；HOVER 随机 mask 部分身体部位的跟踪目标，学到“即使部分信息缺失也能保持全身协调”。工程含义：蒸馏完成后 inference 时只需指定 mask 即可切换控制模态，\emph{不需要重训}——per-task 需 $N$ 个策略，HOVER 只需 $1$ 个策略 $+$ $N$ 个 mask。注意 mask 不是简单把 obs 置零：被 mask 的部位不贡献 tracking reward，student 学到在这些部位维持默认行为而非随机动作。
+\end{insight}
+
+\subsection{代码走读：训练资源与工作流}
+
+\begin{center}
+\small
+\begin{tabular}{lccc}
+\hline
+阶段 & envs & 迭代 & 量级（参考） \\
+\hline
+Teacher & 4096（推荐） & 50k--80k & 数小时到约一天 \\
+Student & 4096（推荐） & $\sim$10k & 约几十分钟 \\
+\hline
+\end{tabular}
+\end{center}
+
+\pz{上表 wall-clock 时间（某次 RTX 4090 实测约 $12$--$23$\,h teacher、约 $16$\,min student）强依赖 GPU 型号、env 数与版本，本章只给量级，不作承诺；以你的硬件实测为准。}HOVER README 明确建议：“至少用 $4096$ 个环境训练以获得好结果”（已核实）。
+
+\paragraph{UniLab —— 有 motion tracking 与 RMA 式蒸馏，无 mask-conditioned 多模态.}
+HOVER 的核心是 mask-conditioned multi-mode distillation（一个策略 $+$ 多个 mask 覆盖导航/操作/遥操作）。这在 UniLab \textbf{不是内置一等公民}，但 UniLab 提供两块可作骨架的现成件：
+
+\begin{itemize}
+  \item \textbf{原生动作跟踪}：UniLab 有整套 G1 motion-tracking 任务（\texttt{G1MotionTracking} 及 \texttt{G1FlipTracking}/\texttt{G1BoxTracking}/\texttt{G1ClimbTracking}/\texttt{G1WallFlipTracking}，含 SAC 变体），数据是 NPZ 参考运动（\texttt{MotionLoader}，键 \texttt{joint\_pos/body\_pos\_w/body\_quat\_w/...}），跟踪 reward 真的是逐项贴参考轨迹（\texttt{motion\_body\_pos}/\texttt{motion\_body\_ori}/\texttt{motion\_body\_lin\_vel}/...）。这正对应 HOVER 的“全身运动模仿作为公共抽象”那一层——\emph{teacher 阶段}的等价物 UniLab 有。
+  \item \textbf{RMA 式蒸馏（非 HOVER 的 mask 蒸馏）}：UniLab 的原生蒸馏是 \textbf{HORA}（\texttt{algos/torch/hora/distill.py} 的 \texttt{HoraDistillationTrainer}）——特权 teacher $\to$ 时序自适应 student，只训练名字含 \texttt{adapt\_tconv} 的参数（\texttt{TemporalAdaptationEncoder}），teacher 主干冻结。这是 Rapid Motor Adaptation 范式，与 HOVER 的 \emph{mask-conditioned} 蒸馏不同（HORA 学“从本体感知历史补出特权信息”，HOVER 学“部分跟踪目标被 mask 掉也保持全身协调”）。
+\end{itemize}
+
+\pzr{诚实标注：HOVER 的“一个策略 $+$ N 个身体部位 mask、推理时切模态不重训”这一核心在 UniLab \emph{无现成对应}。要在 UniLab 复刻，需在 G1MotionTracking 任务里自定义：把跟踪命令按身体部位分块、加 mask 向量进观测、让被 mask 部位不贡献跟踪 reward——机制上 UniLab 的 scales 派发表（\cref{sec:rlmc-hl-reward}）与 actor/critic 双组（\cref{ch:rlmc-privileged}）够用，但要自己搭，框架不送。}相比之下 HOVER 直接绑定特定 Isaac Lab 版本、开箱即用多模态，是它的优势；UniLab 的优势在另一头——异步 off-policy（APPO/SAC）训练 G1 跟踪天然契合其 collector-learner 解耦。
+
+\subsection{运行验证}
+关键判断点：teacher 到 $50$k 时 body tracking $>0.6$、fall rate $<10\%$ 方可开始 student；student 到 $10$k 时所有 mask mode 工作正常（如 navigation 模式能走直线）即可进入 sim-to-sim。
+
+\subsection{常见陷阱}
+\begin{pitfall}[HOVER 依赖特定 Isaac Lab 版本]
+\textbf{错误描述}：用任意 Isaac Lab 版本跑 HOVER。\textbf{现象后果}：API 不兼容、import/配置报错。\textbf{根本原因}：HOVER README 明确标注其在 Isaac Lab $2.0.0$ 上测试（“tested with Isaac Lab versions 2.0.0”）。\textbf{正确做法}：按 README 锁定 Isaac Lab $2.0.0$；自定义任务参考 HOVER 的 extension 模式（不 fork Isaac Lab 核心），升级时少踩合并坑。
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[架构分析，跨 \cref{ch:rlmc-privileged}]} HOVER 的 teacher-student 与特权学习的 teacher-student 有何异同？\emph{验收}：列 $\geq 3$ 相同点、$\geq 2$ 不同点（提示：privileged 是“信息不对称”，HOVER 还叠加“命令 mask”）。
+  \item \textbf{[设计]} 为 HOVER 加一个 \texttt{legs\_only}（只跟踪腿、上半身自由）mask，写出 mask 向量并预测该模式行为。\emph{验收}：mask 向量 $+$ 一句行为预测。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{精读：HoST 跌倒恢复与 Multi-Critic 架构}\label{sec:rlmc-hl-host}
+
+\begin{paper}[HoST：多 critic 学习跨姿态站起]\label{paper:rlmc-hl-host}
+\textbf{问题}：让人形从任意摔倒姿态（仰卧/俯卧/侧卧及中间姿态）站起来。传统方法为每种姿态预设固定站起轨迹，无法覆盖连续姿态、不适应地形、且某些动作动力学不可行。\\
+\textbf{核心思想}：用 RL 从零学习站起控制；把 reward 分为四组、用 \textbf{multi-critic} 分别优化每组；用\emph{课程化辅助力}解决冷启动；用 smoothness 正则与隐式速度约束保障真机安全。\\
+\textbf{关键结果}：在多种仿真地形上学到\emph{姿态自适应}的站起，并稳健 sim-to-real。\\
+\textbf{与本书关系}：multi-critic 是 PPO（\cref{ch:rlmc-manager}）在多阶段任务上的扩展；可作为 locomotion 的\emph{安全兜底}集成。\\
+\textbf{局限}：仓库基于 IsaacGym $+$ legged\_gym（单体类），与本书 Manager-Based 架构不同，直接复制不可行。\\
+HoST（Humanoid Standing-up Control，上海 AI Lab 等，Huang, Ren 等，\textbf{RSS 2025 Best Systems Paper Finalist}，arXiv:2502.08378，仓库 \texttt{InternRobotics/HoST}）\cite{huang2025host}。
+\end{paper}
+
+\subsection{配置详解：为什么要 multi-critic}
+标准 PPO 用一个 critic 估计所有 reward 的总 value。但站起有多个阶段（翻身 $\to$ 撑地 $\to$ 起身 $\to$ 站稳），各阶段 reward 重要性不同，单 critic 易出现 reward 间的负干扰。HoST 把 reward 分四组，\textbf{每组一个独立 critic}：
+
+\begin{center}
+\small
+\begin{tabular}{p{2.0cm}p{3.2cm}p{4.6cm}p{1.6cm}}
+\hline
+组（论文原名） & 目标 & 典型 terms（示意） & 阶段重要性 \\
+\hline
+Task & 完成站起高层目标（升高、达到站姿） & base\_height、head/base 升高 & 前中期 \\
+Style & 塑造站起动作风格 & 目标姿态/朝向、对称性、姿态贴合 & 全程 \\
+Regularization & 正则化动作（平滑、限幅） & action\_rate、joint\_vel/acc、torque、smoothness & 全程 \\
+Post-task & 站稳后的期望行为 & 站立平衡、二次摔倒抑制 & 后期 \\
+\hline
+\end{tabular}
+\end{center}
+
+HoST 论文（arXiv:2502.08378，RSS 2025 Best Systems Paper Finalist）将 reward 明确分为 Task / Style / Regularization / Post-task 四组，每组配一个独立 critic（组合奖励 $r_t=w^{\text{task}}r^{\text{task}}_t+w^{\text{style}}r^{\text{style}}_t+w^{\text{regu}}r^{\text{regu}}_t+w^{\text{post}}r^{\text{post}}_t$）。\pz{上表各组内的 terms 为按论文语义归并的示意，精确逐项清单以仓库 \texttt{InternRobotics/HoST} 为准（Tutorial 旧稿曾误写作 Posture/Balance/Progress/Safety，与论文不符，已更正）。}
+
+\begin{insight}[multi-critic 让“暂时变差”的探索不被一票否决]\label{ins:rlmc-hl-multicritic}
+考虑从仰卧翻身到俯卧：翻身过程中 Task 组（base height 暂降）暂时恶化，而 Regularization 组（为求平滑而抑制大动作）也在“拖后腿”。单 critic 把所有 reward 相加，合成 advantage 变负，策略被惩罚“尝试翻身”这个正确方向。multi-critic 中 Task critic 可独立认识到“现在 height 降了，但翻身后能站更高”，其 advantage 为正，即使其他组 advantage 为负也不会被一票否决。这正是多阶段任务相对单阶段 locomotion 的本质难点。
+\end{insight}
+
+\subsection{代码走读：advantage 独立归一化与辅助力课程}
+
+\begin{codebox}[Python]{HoST：multi-critic advantage 归并（各组独立归一化后等权求和）}
+def compute_total_advantage(reward_groups, critics, obs, gamma, lam):
+    all_adv = []
+    for group, rewards in reward_groups.items():
+        values = critics[group](obs)                 # 该组 critic 估值
+        adv = gae(rewards, values, gamma, lam)        # 该组独立 GAE
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8) # 关键：独立归一化
+        all_adv.append(adv)
+    return sum(all_adv)                                # 各组已归一化，等权合并
+\end{codebox}
+
+\begin{note}
+\textbf{反面对照（不做独立归一化）.}\;
+Task 组 reward 量级可能 $\pm100$（base height 变化大），Regularization 组只有 $\pm1$。不归一化时 Task 完全主导 actor 更新——策略学到“不惜代价站起来”，包括关节猛力一弹（Regularization 的 smoothness 惩罚被淹没）。HoST 的 multi-critic 正是用\emph{各组 advantage 独立归一化后等权合并}来消除这种量级失衡。\pz{术语澄清：Tutorial 旧稿把上面这套多 critic 归一化机制冠以 “L2C2 / Learning to Coordinate Critics” 之名，系误植——L2C2（arXiv:2202.07152，Kobayashi，IROS 2022）的真名是 “Locally Lipschitz Continuous Constraint”，是一种作用于 actor 与各 critic 的\emph{平滑正则}（HoST 论文确实采用了它，但用途是平滑而非协调 critic），与“多 critic advantage 归一化”是两回事；故本节只描述机制本身，不沿用该误名。}
+\end{note}
+
+冷启动时随机策略完全不会站起，reward 极稀疏。HoST 用\textbf{垂直辅助力课程}破解：
+
+\begin{codebox}[Python]{HoST：垂直辅助力课程（按成功率衰减）}
+class VerticalPullForceCurriculum:
+    def __init__(self, robot_mass, g=9.81):
+        self.mg = robot_mass * g           # G1: 35*9.81 ~ 343 N
+        self.force_ratio = 0.6             # 初始约 60% 体重(README 扩展 tips)
+        # 注意: HoST 提示 G1 URDF 有两个 torso link，该力会乘 2
+    def get_force(self, base_height, target=0.76):
+        if base_height < target:           # 仅在低于目标高度时施加
+            return torch.tensor([0., 0., self.force_ratio * self.mg])
+        return torch.zeros(3)
+    def step(self, success_rate):          # 成功率高则快速衰减辅助
+        self.force_ratio *= 0.995 if success_rate > 0.7 else 0.9999
+        self.force_ratio = max(self.force_ratio, 0.0)
+\end{codebox}
+
+\begin{insight}[辅助力课程像自行车辅助轮]\label{ins:rlmc-hl-aux}
+辅助力从约 $60\%$ 体重逐步衰减到 $0$，正如教小孩骑车的辅助轮逐步抬高直到拆掉：一开始让策略只需学翻身/撑地，逐步逼它用更多自身力矩，最终完全独立。直接零辅助从头学，等价于一上来就拆辅助轮——大多数情况下立刻摔、几乎学不到。\pz{HoST 论文确证“训练初期施加较大向上力、随机器人能在 episode 末维持目标高度而逐步衰减”这一机制；但代码与正文给出的具体 force 比例（如约 $60\%$ 体重）与衰减/迭代区间为示意，论文精确超参在其附录与仓库，落地以 \texttt{InternRobotics/HoST} 为准。}
+\end{insight}
+
+\paragraph{真机安全约束.}
+为 sim-to-real 安全，HoST 加 smoothness 正则（罚关节速度/加速度高频分量）与隐式速度上界。论文原文：“we constrain the motion with smoothness regularization and implicit motion speed bound to alleviate oscillatory and violent motions on physical hardware.” 仿真中高频抖动可能借接触弹性产生有效力矩，真机上却会损坏电机。
+
+\subsection{运行验证：作为安全兜底集成进 locomotion}
+HoST 的实际部署是 locomotion 管线的\emph{安全层}：正常跑 locomotion 策略；检测到摔倒切到 HoST 站起；站稳后切回。关键是一个状态机：
+
+\begin{codebox}[Python]{跌倒检测与恢复状态机（FSM）}
+class FallDetectorFSM:
+    NORMAL, FALLING, STANDING_UP, STABILIZING = range(4)
+    def __init__(self):
+        self.state = self.NORMAL
+        self.stable_counter = 0
+        self.stable_threshold = 100        # 2s @ 50Hz
+    def update(self, h, pitch, roll):
+        if self.state == self.NORMAL:
+            if h < 0.3 or abs(pitch) > 1.05 or abs(roll) > 1.05:   # 摔倒判据
+                self.state = self.FALLING; self.stable_counter = 0
+                return "switch_to_host"
+        elif self.state == self.FALLING:
+            self.state = self.STANDING_UP                          # 待停稳后起身
+            return "start_standing_up"
+        elif self.state == self.STANDING_UP:
+            if h > 0.65 and abs(pitch) < 0.17 and abs(roll) < 0.17:# 已站起
+                self.state = self.STABILIZING; self.stable_counter = 0
+            return "continue_host"
+        elif self.state == self.STABILIZING:
+            # roll 也必须在阈值内, 否则侧倾过大时错误累积 stable_counter
+            if h > 0.65 and abs(pitch) < 0.17 and abs(roll) < 0.17:
+                self.stable_counter += 1
+                if self.stable_counter >= self.stable_threshold:
+                    self.state = self.NORMAL                       # 持续稳定才切回
+                    return "switch_to_locomotion"
+            else:
+                self.state = self.STANDING_UP; self.stable_counter = 0
+            return "continue_host"
+        return "continue_current"
+\end{codebox}
+
+工程要点：fall\_detector 必须够快（$<50$\,ms）；\texttt{STABILIZING} 是关键——过早切回 locomotion，G1 可能在未完全稳定时收到速度命令导致二次摔倒；切回时 command 应先设零速、再逐步恢复。
+
+\paragraph{mjlab / Isaac Lab / UniLab 移植说明.}
+HoST 仓库基于 IsaacGym $+$ legged\_gym，与 mjlab/Isaac Lab 的 Manager-Based 架构不同：multi-critic 与辅助力课程需在目标框架\emph{重新实现}（mjlab 侧可在自定义 PPO runner 中加多组 critic；Isaac Lab 侧同理）。UniLab 侧同样\textbf{无内置 multi-critic}——其算法集是 PPO/APPO/SAC/TD3/FlashSAC（\texttt{structured\_configs.py}），都是\emph{单} critic，HoST 的“四组 reward 各一个独立 critic、advantage 独立归一化后合并”需在 \texttt{algos/torch/} 自写一个变体 runner。但 UniLab 有两点对落地这套\emph{反而方便}：(1) reward 已是 scales 标量字典 $+$ 派发表（\cref{sec:rlmc-hl-reward}），把 scales 按 Task/Style/Regularization/Post-task 分四组、各算一路 GAE 是自然的；(2) \texttt{NpEnv} 的 \texttt{update\_state} 一处算 obs/reward/terminated 且后端 getter 直给机体系量（\texttt{get\_base\_pos}/\texttt{get\_dof\_pos}），写跌倒检测 FSM 与“按 \texttt{base\_height} 施加垂直辅助力”都不必绕 manager；辅助力的成功率衰减还可借 \texttt{PenaltyCurriculum}（按 episode 长度自适应缩放）的同款思路。\pzr{结论：HoST 的 multi-critic 与辅助力课程 UniLab \emph{无现成实现}，须自写；但其 scales 字典与 NpEnv 直算范式让“分组 critic + 辅助力 + FSM 兜底”比在 Manager 框架里更易拼装。}
+
+\subsection{常见陷阱}
+\begin{pitfall}[以为站起来是摔倒的逆过程]
+\textbf{错误描述}：试图“倒放摔倒轨迹”来站起。\textbf{现象后果}：动力学不可行、力矩超限。\textbf{根本原因}：摔倒是被动的（重力做功），站起是主动的（关节力矩对抗重力），两者动力学完全不同。\textbf{正确做法}：用 RL 从零学，让策略自己发现每种姿态的最优站起路径。
+\end{pitfall}
+
+\begin{pitfall}[以为 locomotion 够鲁棒就不需要兜底]
+\textbf{错误描述}：仿真里不摔就不做 HoST。\textbf{现象后果}：真机一次意外摔倒即需人工介入、系统不可用。\textbf{根本原因}：真机的被推/绊倒/滑倒不可完全避免。\textbf{正确做法}：把 HoST 作为安全层常驻，配 fall\_detector 状态机。
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[架构分析]} multi-critic 与 multi-head critic（一个网络多输出头）有何区别？各自优缺点？HoST 为何选完全独立的 critic？\emph{验收}：一张对比 $+$ 一句结论。
+  \item \textbf{[综合，跨 \cref{ch:rlmc-dr}]} HoST 辅助力课程与课程学习/DR 分阶段有何共同点与不同点？若要在 velocity task 里加“辅助力”帮 G1 站稳期起步，怎么设计？\emph{验收}：给出辅助力施加条件、衰减触发、退出判据。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总表}
+
+\begin{center}
+\small
+\begin{tabular}{p{5.0cm}p{8.0cm}}
+\hline
+误解 & 纠正 \\
+\hline
+人形控制就是更多自由度的四足控制 & 质变不只量增：欠驱动、窄支撑面本征不稳、上肢反向影响躯干角动量都是四足没有的（\cref{ins:rlmc-hl-essence}）。 \\
+reward 高就说明步态正确 & G1 可低头冲刺/手臂乱甩换 reward，必须同时看 upright、angular momentum、self collision（\cref{ins:rlmc-hl-rewardhack}）。 \\
+angular momentum penalty 越大越稳 & 太大逼出极小步幅蹭走，反而更易在扰动下失稳；它是 ESP 不是刹车（\cref{ins:rlmc-hl-esp}）。 \\
+手臂关节不重要 & 不约束手臂等于给策略“免费”角动量来源，会被用来换短期速度。 \\
+Isaac Lab 内置 H1 配置已最优 & 是能跑的基础版，缺 variable\_posture/angular\_momentum，需增强。 \\
+跨引擎性能下降就是失败 & 一定下降正常（接触模型不同）；关键看是否在门限内，$0.12\to0.20$ 正常、$0.12\to0.50$ 是过拟合信号。 \\
+站起来是摔倒的逆过程 & 摔倒被动、站起主动，动力学不同，不能倒放轨迹。 \\
+\hline
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+
+\paragraph{术语速查.}
+\emph{支撑多边形}：接触点凸包，质心投影落入其内方静态稳定。\emph{逐关节 action scale}：$s_j=0.25\,\text{effort}_j/\text{stiffness}_j$。\emph{variable posture}：按运动状态自适应的逐关节姿态约束 std。\emph{angular momentum penalty}：以 pelvis 为根的子树角动量 $L_2$ 惩罚。\emph{mask-conditioned distillation}：用 mask 选跟踪部位、单策略覆盖多模态（HOVER）。\emph{multi-critic}：每组 reward 独立 critic、独立归一化 advantage 后合并（HoST）。
+
+\begin{center}
+\small
+\begin{tabular}{clcl}
+\hline
+编号 & 要点 & 对应节 & 难度 \\
+\hline
+1 & 四足$\to$双足：支撑面缩一个数量级、质心更高、角动量是新挑战 & \cref{sec:rlmc-hl-diff} & 中 \\
+2 & 逐关节 action scale $=0.25\times$effort/stiffness & \cref{sec:rlmc-hl-action} & 中 \\
+3 & variable posture：状态自适应逐关节 std，锁死与放松都不行 & \cref{sec:rlmc-hl-action} & 较难 \\
+4 & angular momentum penalty 权重 $-0.02$ 是平衡点 & \cref{sec:rlmc-hl-reward} & 中 \\
+5 & 人形 reward 四层适配：Style 加 vp/base\_height，Safety 加 self\_collision & \cref{sec:rlmc-hl-reward} & 较难 \\
+6 & G1(29) vs H1(19)：内置配置缺人形特有 reward，命名也不同 & \cref{sec:rlmc-hl-isaac} & 中 \\
+7 & sim-to-sim：obs 顺序对齐是成败关键 & \cref{sec:rlmc-hl-sim2sim} & 中 \\
+8 & HOVER：mask-conditioned distillation，单策略多模态 & \cref{sec:rlmc-hl-hover} & 较难 \\
+9 & HoST：multi-critic $+$ 辅助力课程 $+$ smoothness，安全兜底 & \cref{sec:rlmc-hl-host} & 较难 \\
+\hline
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+
+\begin{itemize}
+  \item \textbf{HOVER}（arXiv:2410.21229，ICRA 2025）\cite{he2025hover}——教你 mask-conditioned distillation 如何用一个策略覆盖导航/操作/遥操作多模态。
+  \item \textbf{HoST}（arXiv:2502.08378，RSS 2025 Best Systems Paper Finalist）\cite{huang2025host}——教你 multi-critic 与辅助力课程如何从零学跨姿态站起。
+  \item \textbf{humanoid-gym}（arXiv:2404.05695）\cite{gu2024humanoidgym}——教你 sim-to-sim 验证与 symmetric mirror 增广的人形工程方法论。
+  \item \textbf{Real-World Humanoid Locomotion with RL}（\emph{Science Robotics} 2024，scirobotics.adi9579）\cite{radosavovic2024humanoid}——教你因果 Transformer 控制器如何零样本部署到真机人形。
+  \item \textbf{SONIC}（arXiv:2511.07820）\cite{luo2025sonic}——教你把运动跟踪“规模化”（$100$M$+$ 帧、$42$M 参数）成自然鲁棒的人形全身控制基础模型。
+  \item \textbf{mjlab}（\texttt{mujocolab/mjlab}）\cite{mjlab2026}——教你 Isaac Lab 风格 API 如何由 MuJoCo-Warp 驱动做 GPU 机器人学习。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+
+\paragraph{通用起手式（任何症状先做这两步）.}
+\textbf{第 0 步——\texttt{list-envs}/\texttt{find\_spec} 自查环境}：照抄任何命令报“找不到任务/脚本不存在”前，先确认你装的是 mjlab core（任务名 \texttt{Mjlab-Velocity-*}、入口 \texttt{uv run train}）还是 $+$\texttt{unitree\_rl\_mjlab}（\texttt{Unitree-G1-Flat}、入口 \texttt{scripts/train.py}）——两套并存，装什么决定能用哪套（\cref{sec:rlmc-hl-action} 前的 Quick Start 陷阱给了自查命令）。\textbf{第 1 步——2 迭代冒烟读 term 量级}：\texttt{WANDB\_MODE=disabled uv run train <id> --env.scene.num-envs 64 --agent.max-iterations 2}，在 \texttt{Episode\_Reward/<term>} 里逐项确认“出现且非零”，并记下各 term 初始量级（\cref{ins:rlmc-hl-smoke}）。绝大多数“某 term 没生效/键名拼错/权重量级配反”的问题，这一步即定位，无需进下表。下表用于冒烟通过、训练却跑偏的\emph{行为级}症状：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.4cm}p{3.0cm}p{3.2cm}p{4.2cm}p{1.4cm}}
+\hline
+\# & 症状 & 可能原因 & 排查步骤 & 相关节 \\
+\hline
+1 & G1 zero agent 立即摔倒 & default pose 不合理或 PD gains 太低 & 检查 keyframe qpos；\texttt{--no-terminations} 观察；增大 kp & \cref{sec:rlmc-hl-action} \\
+2 & 速度涨但前倾摔倒 & upright 约束不足 & 画 velocity+upright 时间图；增大 upright；收紧 waist\_pitch std & \cref{sec:rlmc-hl-reward} \\
+3 & 手臂乱甩但 reward 涨 & variable\_posture std 太松或未配 & 检查 walking/running std；只调上肢；看 angular\_momentum & \cref{sec:rlmc-hl-reward} \\
+4 & 侧向命令致 roll 发散 & 侧向命令范围过大 & 缩窄 lin\_vel\_y range；勿同时改 yaw & \cref{sec:rlmc-hl-diff} \\
+5 & 踝/腕关节频繁抽动 & action scale 统一或太大 & 用 \eqref{eq:rlmc-hl-actionscale} 逐关节重算 & \cref{sec:rlmc-hl-action} \\
+6 & 自碰撞频繁 & self\_collision 监测对缺失或含相邻 link & 修正喂 sensor 的碰撞几何对；play 看碰撞位置 & \cref{sec:rlmc-hl-reward} \\
+7 & 跨引擎验证全摔 & obs 顺序不一致 & 两端打印 term 名/shape 逐位对齐；核对归一化 & \cref{sec:rlmc-hl-sim2sim} \\
+8 & Isaac Lab H1 效果差 & 缺 angular\_momentum/variable\_posture & 加自定义 reward；参考 mjlab 权重 & \cref{sec:rlmc-hl-isaac} \\
+9 & DR 后 G1 全摔 & push/friction/mass 同时开太强 & 分阶段引入；push $=$ 四足 $30$--$50\%$ & \cref{sec:rlmc-hl-reward} \\
+10 & 23/29-DoF 混用报错 & action dim 不匹配 & 确认资产 actuator 数；统一任务版本 & \cref{sec:rlmc-hl-action} \\
+\hline
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+
+\begin{center}
+\small
+\begin{tabular}{p{3.4cm}p{4.0cm}p{5.2cm}}
+\hline
+组件 & 本章基准 & 备注 \\
+\hline
+mjlab & \texttt{mujocolab/mjlab}（1.4.0） & Isaac Lab 风格 API + MuJoCo-Warp\cite{mjlab2026} \\
+mjlab 任务库 & \texttt{unitree\_rl\_mjlab}（main） & 任务 \texttt{Unitree-G1-Flat}/\texttt{Unitree-G1-23Dof-Flat}；CLI \texttt{python scripts/train.py} \\
+Isaac Lab & 2.3.2（\texttt{isaaclab.*}，Isaac Sim 5.1.0） & 任务 \texttt{Isaac-Velocity-Flat/Rough-H1-v0} \\
+RL 后端 & RSL-RL & 两框架共用；mirror 增广用 \texttt{RslRlSymmetryCfg.data\_augmentation\_func} \\
+HOVER & \texttt{NVlabs/HOVER} & README 标定 Isaac Lab 2.0.0 \\
+HoST & \texttt{InternRobotics/HoST} & IsaacGym + legged\_gym \\
+UniLab & \texttt{unilabsim/UniLab}（main） & 任务 \texttt{G1WalkFlat}/\texttt{G1WalkRough}；CLI \texttt{train --algo ppo --task g1\_walk\_flat --sim mujoco}\cite{unilab2026} \\
+\hline
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{附录 A：G1 关节参考表（29-DoF 仿真示例）}
+
+下表汇总 G1 29-DoF 仿真示例的关节参数，是配置 action scale、default pose、variable posture 的查阅工具。\textbf{数值为典型仿真配置，非官方硬件手册值}；以实际 MJCF/USD 为准，可用 \cref{sec:rlmc-hl-action} 的提取脚本获取精确值。
+
+\begin{center}
+\scriptsize
+\begin{tabular}{rlccccc}
+\hline
+\# & 关节名 & 组 & effort(Nm) & stiffness & range(rad) & $s_j$(rad) \\
+\hline
+0--2 & left\_hip\_(yaw,roll,pitch) & 腿-髋 & 88 & 150 & 见 MJCF & 0.147 \\
+3 & left\_knee & 腿-膝 & 139 & 200 & $[-0.26,2.05]$ & 0.174 \\
+4--5 & left\_ankle\_(pitch,roll) & 腿-踝 & 50 & 40 & 见 MJCF & 0.313 \\
+6--8 & right\_hip\_(yaw,roll,pitch) & 腿-髋 & 88 & 150 & 见 MJCF & 0.147 \\
+9 & right\_knee & 腿-膝 & 139 & 200 & $[-0.26,2.05]$ & 0.174 \\
+10--11 & right\_ankle\_(pitch,roll) & 腿-踝 & 50 & 40 & 见 MJCF & 0.313 \\
+12--14 & waist\_(yaw,roll,pitch) & 腰 & 88 & 200 & 见 MJCF & 0.110 \\
+15--18 & left\_shoulder$\times3$+elbow & 手臂 & 25 & 40 & 见 MJCF & 0.156 \\
+19--22 & right\_shoulder$\times3$+elbow & 手臂 & 25 & 40 & 见 MJCF & 0.156 \\
+23--25 & left\_wrist\_(roll,pitch,yaw) & 手腕 & 5 & 40 & 见 MJCF & 0.031 \\
+26--28 & right\_wrist\_(roll,pitch,yaw) & 手腕 & 5 & 40 & 见 MJCF & 0.031 \\
+\hline
+\end{tabular}
+\end{center}
+
+G1 官方硬件最大膝力矩约 $120$\,N$\cdot$m（Unitree EDU 版规格；基础版约 $90$\,N$\cdot$m，故此值随你的具体型号而异），与仿真 effort（如本表膝 $139$）不必相等——配 DR motor strength 时以实际资产为准。\pz{上表逐关节 effort/stiffness 为典型仿真值、随资产版本而异，应以你所装 \texttt{unitree\_rl\_mjlab} 的 G1 MJCF \texttt{<actuator>} 实际值为准（用 \cref{sec:rlmc-hl-action} 的提取脚本读出）。}
+
+% ════════════════════════════════════════════════════════════════
+\section*{附录 B：variable posture std 完整配置表（mjlab G1 典型）}
+
+数值越小约束越严（关节越不允许偏离 default）。
+
+\begin{center}
+\small
+\begin{tabular}{llccc l}
+\hline
+关节 & 组 & standing & walking & running & 设计理由 \\
+\hline
+hip\_yaw & 腿 & 0.05 & 0.10 & 0.10 & yaw 偏离改脚朝向 \\
+hip\_roll & 腿 & 0.05 & 0.10 & 0.10 & roll 直接影响侧向稳定 \\
+hip\_pitch & 腿 & 0.10 & 0.25 & 0.40 & 步幅主要来源 \\
+knee & 腿 & 0.10 & 0.15 & 0.20 & 跑步需更大膝弯 \\
+ankle\_pitch & 腿 & 0.05 & 0.10 & 0.15 & 推离地面主关节 \\
+ankle\_roll & 腿 & \textbf{0.02} & \textbf{0.02} & 0.05 & 始终严格——过大即失衡 \\
+waist\_yaw & 腰 & 0.05 & 0.10 & 0.10 & 允许一定转体 \\
+waist\_roll & 腰 & \textbf{0.02} & \textbf{0.02} & 0.05 & 始终严格——侧倾极危险 \\
+waist\_pitch & 腰 & 0.05 & 0.10 & 0.10 & 允许一定前后倾 \\
+shoulder\_pitch & 手臂 & 0.10 & 0.15 & \textbf{0.50} & 跑步大幅放宽以摆臂 \\
+shoulder\_roll & 手臂 & 0.10 & 0.15 & 0.15 & 侧向摆臂始终不需太大 \\
+shoulder\_yaw & 手臂 & 0.05 & 0.10 & 0.10 & yaw 几乎不用于行走 \\
+elbow & 手臂 & 0.10 & 0.15 & \textbf{0.35} & 跑步弯肘摆臂更自然 \\
+wrist\_* & 手腕 & \textbf{0.02} & 0.05 & 0.05 & 贡献极小，严格防抽动 \\
+\hline
+\end{tabular}
+\end{center}
+
+经验法则：$0.02$ 几乎锁死；$0.05$ 约 $3^\circ$；$0.10$ 约 $6^\circ$；$0.15$--$0.20$ 约 $10$--$12^\circ$；$0.35$--$0.50$ 约 $20$--$30^\circ$。
+
+% ════════════════════════════════════════════════════════════════
+\section*{附录 C：人形 DR 三阶段引入（相对四足更保守）}
+
+\begin{center}
+\small
+\begin{tabular}{p{2.6cm}p{2.0cm}p{3.2cm}p{4.0cm}}
+\hline
+DR 参数 & 四足典型 & 人形建议 & 原因 \\
+\hline
+push velocity & $\pm1.0$\,m/s & $\pm0.5$\,m/s（$2\times$ 收紧） & 高质心 $+$ 窄支撑面 \\
+friction range & $[0.5,2.0]$ & $[0.7,1.5]$ & 单脚支撑摩擦更关键 \\
+mass range & $[-1,3]$\,kg & $[-1,2]$\,kg & 质心高度变化影响更大 \\
+motor strength & $[0.8,1.2]$ & $[0.85,1.15]$ & 力矩余量更小 \\
+\hline
+\end{tabular}
+\end{center}
+
+引入顺序与训练阶段对齐（见 \cref{sec:rlmc-hl-reward} 的 DR 时机表）：基础 DR（friction/motor）在站稳期；中级 DR（mass/CoM/push 小范围）在能走 $>500$ 步后；高级 DR（地面高度噪声/IMU 偏置/action delay/扩大 friction 与 push）在中级 DR 下能走 $>300$ 步后。\textbf{不要跳级}——阶段 3 的 DR 在没有阶段 1--2 基础的策略上几乎必然失败（策略收敛到“蹲着不动”的局部最优）。

@@ -1,0 +1,1798 @@
+\chapter{网球击球控制与全身协调}\label{ch:rlmc-tenniscontrol}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章 —— 综合项目收口章。
+%  主线：算法/概念领路 —— 先立「击球控制 = 带速度和姿态约束的定时接触」这条
+%  问题主线，再把 MDP 设计 / staged reward / curriculum / DR / 约束 RL / 频率分离 /
+%  sim2real 逐一落到三大框架 (mjlab / Isaac Lab / UniLab) 的对比实战。
+%  假定读者已学完强化学习理论部 (P6, 含策略梯度/AC/PPO/重要性采样) 与本部前置章
+%  (观测动作 obsact / 奖励 reward / Manager 架构 / 域随机化 dr / 特权学习 privileged /
+%   各形态任务 / 诊断 diagnostics / sim2real)。这些方法在前置章已讲透，本章一律
+%   \cref 过去、不再重教，聚焦「高速接触任务」这一新增维度。
+%  源稿 RL运控/Ch28_网球击球控制与全身协调.md (设计/实践偏重) 已按本主线重构：
+%   - 把「平铺 10 节」改为「概念领路 + 三框架横向对比实践」；
+%   - 联网核对 KungfuBot(arXiv:2506.12851,NeurIPS'25)/WoCoCo(arXiv:2406.06005,CoRL'24)/
+%     LATENT(arXiv:2603.12686)/HITTER(arXiv:2508.21043)/PACE(arXiv:2509.21690)/
+%     Phybot(arXiv:2511.11218)/mjlab 1.4.0/Isaac Lab 2.x API 名与数值；
+%   - 对无法从公开摘要确认者包 \rebuilt / \pz 并列入 claimsToVerify。
+%  UniLab 实现槽位已据实装框架补齐（commit 99936e08，MuJoCoUni 3.8.0 / MotrixSim 0.8.2，源码 src/unilab）：
+%  其非 Manager-Based（动作=关节位置目标残差、奖励=标量字典+run_reward_dispatch、终止=TransitionBootstrapContract），
+%  task-space IK action / 成功率门控 curriculum / 气动 DR 在 UniLab 无现成类，已逐处诚实标注须自实现而非编造 API。
+% ════════════════════════════════════════════════════════════════
+
+在 \cref{ch:rlmc-tennisenv} 我们为网球场搭好了物理底座——坐标系、球体自由刚体、八维随机发球、三层空气动力学、接触验证，以及机器人加球拍的建模路线。本章进入综合项目的最后一层：\textbf{击球控制}。击球控制不是「让机械臂碰到球」，而是一个高时效的接触控制问题——机器人必须在零点几秒内判断球是否可打、移动底盘到合适位置、调整球拍姿态，并在正确时刻以正确速度和法向击中高速来球，同时保持自身稳定。它比 \cref{ch:rlmc-manip} 的物块抓取更难（目标在高速运动），比 \cref{ch:rlmc-quadloco} 的速度跟踪更难（奖励极稀疏），比普通到点任务更难（要求「带速度与姿态约束的定时接触」而非简单到点）。
+
+本章遵循全书「算法/概念领路，后工程兑现」的次序。这里的「算法主线」不是某个新的 RL 算法——\textbf{PPO 已经足够}（\cref{ch:rlmc-training} 已讲透）——而是一条工程方法论：\emph{把「打赢一分」这个稀疏目标，通过 MDP 设计、staged reward、curriculum、域随机化、约束 RL 与频率分离，逐层重写成 PPO 能够探索、能够学习、能够安全部署的形态}。沿这条主线，每个概念点下我们都给出 mjlab、Isaac Lab、UniLab 三大框架的对比实践。
+
+\begin{note}
+本章是「方法学集大成」之处，但绝大多数\emph{方法本身}已在前置章讲透，本章不再重教，只在用到时 交叉引用 过去并聚焦「高速接触任务」这一新增维度：
+\begin{itemize}
+  \item 观测/动作接口、非对称 actor-critic、噪声注入 \verb|enable_corruption|——见 \cref{ch:rlmc-obsact}；
+  \item 奖励角色 / 势函数塑形 / 终止语义 / 课程（curriculum）骨架——见 \cref{ch:rlmc-reward}；
+  \item Manager 架构（Observation/Action/Reward/Termination/Event Manager）——见 \cref{ch:rlmc-manager}；
+  \item 域随机化（DR）的鲁棒优化视角、事件四模式、分阶段引入——见 \cref{ch:rlmc-dr}；
+  \item 特权学习 / teacher-student 蒸馏（privileged critic）——见 \cref{ch:rlmc-privileged}；
+  \item 训练诊断五信号、平滑性/Butterworth 部署预诊断、约束 PPO 的 Lagrangian 视角——见 \cref{ch:rlmc-diag}；
+  \item ONNX 导出边界、sim2sim、安全链路与延迟补偿——见 \cref{ch:rlmc-sim2real}；
+  \item 网球场环境、\texttt{LaunchCommand}、接触物理、感知与轨迹预测接口——见 \cref{ch:rlmc-tennisenv}。
+\end{itemize}
+\end{note}
+
+\begin{note}[关于本章代码的「可跑度」约定（重要）]\label{note:rlmc-strike-pseudocode}
+本章的\emph{框架配置类}（\verb|TennisStrikeObsCfg| / \verb|TennisStrikeActionsCfg| / \verb|TennisDREventCfg| / \verb|TennisStrikeTerminationsCfg| 等，字段名/默认值均经 gpufree mjlab 1.4.0 实跑 introspection 核对）是\textbf{照真实 API 写的}，把抓取物换成球、补齐 MJCF 即可挂上框架。但本章的\emph{算法/管理器骨架类}（\verb|StrikeEventBuffer| / \verb|PerceptionNoiseManager| / \verb|LagrangianPPOForTennis| / \verb|TennisFrequencySeparation| / \verb|TennisCurriculumManager|）是\textbf{伪代码骨架}：它们引用 \verb|env.perception| / \verb|env.event_buffer| / \verb|env.contact_sensor| / \verb|env.physics_predictor| 这些\emph{本章约定的虚构属性}（真实工程里须由你在 \cref{ch:rlmc-tennisenv} 的感知管线与自建 env 上接出来），直接 \verb|copy-paste| 实例化会 \verb|AttributeError|。读这些块时请抓\emph{结构与意图}（数据流、为什么这么算），落地时把虚构属性替换成你 env 的真实接口——\cref{sec:rlmc-strike-env} 的「动手第一步：先从 stock task 改造」正是把这些骨架接到真实 env 的可操作路径。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-strike-env}
+
+本章在 \cref{ch:rlmc-tennisenv} 的环境之上新增一个\textbf{击球 task}（strike task），不引入新的训练框架依赖。唯一需要升级的是\textbf{仿真步长}——纯弹道飞行（\cref{ch:rlmc-tennisenv} 的 Phase 1）用 500\,Hz 足够，但球拍-球接触只持续 3--5\,ms，需要更高的物理频率才能稳定解算（\cref{sec:rlmc-strike-freq} 详述）。下表给出锚定版本与兼容性。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+组件 & 锚定版本 & 操作系统 & 角色 & 本章用途 \\
+\midrule
+mjlab & 1.4.0（最新） & Linux（训练）/ macOS（评估） & 训练 $+$ 接触解算 & strike task、DifferentialIK action、EventManager DR \\
+Isaac Lab & 2.x（主线） & Linux / Windows & 训练 $+$ 对照 & \verb|DifferentialInverseKinematicsActionCfg|、PhysX 接触 \\
+MuJoCo Warp & 随 mjlab 1.4.0 & Linux & GPU 物理后端 & 2000\,Hz 高频接触仿真 \\
+RSL-RL & 随框架 & 跨平台 & PPO 实现 & 训练循环、\verb|time_outs| value bootstrap \\
+UniLab & commit 99936e08（MuJoCoUni 3.8.0 / MotrixSim 0.8.2） & Linux CUDA/ROCm/XPU、macOS & 训练 $+$ 对照 & CPU 物理 $+$ GPU 策略；关节位置目标动作、\verb|DomainRandConfig| DR \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{分操作系统的要点。}与 \cref{ch:rlmc-physics} 一致：\textbf{Linux} 是一等训练平台（MuJoCo Warp / PhysX 的 CUDA 后端只在 Linux 上完整可用）；\textbf{macOS} 可跑 CPU 评估与可视化回放；\textbf{Windows} 可训练 Isaac Lab。高频接触仿真（2000\,Hz）对 GPU 显存与吞吐敏感，4096 并行环境建议至少 24\,GB 显存；显存吃紧时把 \verb|num_envs| 降到 2048、物理频率降到 1000\,Hz（\cref{sec:rlmc-strike-freq} 给出降配方案）。
+
+\paragraph{动手第一步：先用 stock task 确认环境能起。}本章的网球 strike task 是\emph{示意}（无现成 env，须自建），但\textbf{在写一行 strike 代码之前，应先用框架自带的现成任务确认装好的三框架真能跑}——这是「从零起步」最该先做、却最容易跳过的一步。下面这些命令在 gpufree（RTX 4090 / mjlab 1.4.0）上实测可跑，照敲即可，看到对应输出再往下走。
+
+\begin{codebox}[bash]{第一步：三框架各起一个 stock task（实测可跑，看输出确认环境健康）}
+# ① 先看 mjlab 注册了哪些任务（确认安装无误；本章击球任务不在其中是正常的）
+mjlab list-envs
+#   预期：列出 12 个任务，含 Mjlab-Velocity-Flat-Unitree-G1 / Mjlab-Lift-Cube-Yam 等
+
+# ② 极短训练 2 迭代，确认 PPO 真能起、无 NaN（WANDB_MODE=disabled 免登录 wandb）
+WANDB_MODE=disabled mjlab train Mjlab-Velocity-Flat-Unitree-G1 \
+    --env.scene.num-envs 64 --agent.max-iterations 2
+#   预期：~2500 steps/s（RTX 4090，64 env），value/surrogate/entropy loss 有限非 NaN
+
+# ③ Lift-Cube-Yam 是「机械臂 manip + IK」最接近网球击球的现成起点（见下）
+WANDB_MODE=disabled mjlab train Mjlab-Lift-Cube-Yam \
+    --env.scene.num-envs 32 --agent.max-iterations 1
+#   预期：~700 steps/s，日志含 ActionManager(7 维) 与 action_rate_l2 奖励项
+
+# ④ 不开 GPU 也能查 API 名是否存在（不存在会 ImportError，能立刻发现版本漂移）
+python -c "from mjlab.envs.mdp.actions import DifferentialIKActionCfg; \
+print([f for f in DifferentialIKActionCfg.__dataclass_fields__])"
+#   预期：打印出 entity_name/actuator_names/frame_type/frame_name/delta_pos_scale/...
+#         —— 看到 delta_pos_scale 在列，就知道本章 9D IK action 的字段名没写错
+\end{codebox}
+
+\noindent{}\textbf{为什么先跑 stock task？}（教方法而非背命令）三件事一次性确认：装的版本对不对（\verb|list-envs| 起得来）、GPU/PPO 链路通不通（2 迭代 loss 正常）、本章引用的 API 名在\emph{你这台}机器上还在不在（\verb|python -c import| 自检）。这三步是后面所有自定义 task 的地基——地基塌了，再漂亮的 strike 代码也跑不起来。命令 ④ 同时是本章「不背 API、自己查」方法论的落地：任何一个本章用到的类，都可以用 \verb|__dataclass_fields__| 当场列出真实字段，对照书里的写法。
+
+\begin{insight}[从 stock task 改造，而非从空白文件凭空写 strike task]\label{ins:rlmc-strike-retrofit}
+工程上搭新任务的真实路径不是「照着书里的代码框从空文件写 \texttt{TennisStrikeEnvCfg}」，而是\textbf{复制一个最接近的现成任务再改}。mjlab 1.4.0 里 \verb|Mjlab-Lift-Cube-Yam| 就是离网球击球最近的起点——它已经是「机械臂 $+$ 末端操作 $+$ 接触」的完整可跑 EnvCfg，自带 ActionManager / RewardManager（含 \verb|action_rate_l2|）/ 终止配置。改造路线：① 找到它的 \verb|EnvCfg| 源文件，复制成 \verb|TennisStrikeEnvCfg|；② 把抓取物换成球、把 lift reward 换成本章的 staged reward（\cref{sec:rlmc-strike-reward}）；③ 把动作从默认关节动作换成本章的 \verb|DifferentialIKActionCfg|（\cref{sec:rlmc-strike-mdp}）；④ 升频率到 2000\,Hz（\cref{sec:rlmc-strike-freq}）。从能跑的东西出发逐项改，每改一步都能 \verb|train --max-iterations 2| 验证没改坏——这比从空白写完再 debug 一堆 \verb|ImportError|/\verb|AttributeError| 高效得多。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：五分钟看懂「定时接触」为什么难}
+\addcontentsline{toc}{section}{Quick Start：定时接触为什么难}
+\label{sec:rlmc-strike-quickstart}
+
+在动手设计 MDP 之前，先用一段最小脚本建立\textbf{量化直觉}：在 50\,Hz 控制频率下，一个高速来球的「可击打窗口」到底有多窄。这段代码不依赖任何框架，纯算术——它解释了本章后面所有工程手段（高频仿真、staged reward、提前挥拍）的根本动机。
+
+\begin{codebox}[Python]{三框架通用：估算击球窗口（纯算术，可直接复制）}
+ball_speed = 30.0       # m/s，一发中速来球
+control_hz = 50.0       # Hz，策略决策频率（与 LATENT/HITTER 一致）
+racket_diameter = 0.30  # m，球拍面可击球宽度
+
+dt = 1.0 / control_hz                 # 控制步长 = 0.020 s
+ball_travel_per_step = ball_speed * dt # 每个控制步球飞多远
+window_in_steps = racket_diameter / ball_travel_per_step
+
+print(f"控制步长       = {dt*1000:.1f} ms")
+print(f"球单步移动     = {ball_travel_per_step:.2f} m")
+print(f"击球窗口       = {window_in_steps:.2f} 个控制步")
+# 控制步长 = 20.0 ms / 球单步移动 = 0.60 m / 击球窗口 = 0.50 个控制步
+# 结论：球从「可打」到「飞过」不到一个控制步 —— 策略必须提前规划挥拍。
+\end{codebox}
+
+\begin{practice}[前置自测：答不出 $\ge 3$ 题，建议先回 \cref{ch:rlmc-tennisenv} 与强化学习理论部]
+\begin{enumerate}
+  \item \cref{ch:rlmc-tennisenv} 的发球验证 task 里 \verb|actions| 字典是空的，为什么不能直接在它上面训练击球？（回看 \cref{sec:rlmc-tennis-manager}）
+  \item \cref{ch:rlmc-tennisenv} 把机器人和球拍\emph{分阶段}引入，为什么不能一步到位直接上完整移动底盘加机械臂？
+  \item 感知管线给控制器的「击球点估计、距击球时间、不确定性、预测有效位」四个量，分别给控制器什么信息？（回看 \cref{ch:rlmc-tennisenv} 的感知接口）
+  \item 「距击球时间」（time to impact）为什么比「预测球位置」更贴近控制需求？
+  \item 什么是 reward shaping？为什么纯稀疏 reward 很难让 PPO 学到东西？（回看 \cref{ch:rlmc-reward}）
+\end{enumerate}
+\end{practice}
+
+\paragraph{本章目标。}学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{设计}击球 MDP 的完整五元组（state / action / transition / reward / termination），并在三框架里\textbf{配置}分层观测与 task-space 动作；
+  \item \textbf{实现}五类 staged reward（approach / timing / contact / outcome / regularization）的完整代码，并\textbf{解释}乘法组合结构为什么强制层级优先；
+  \item \textbf{配置}从静态球到高速发球的八阶段 curriculum，含成功率门控与安全回退，并\textbf{定位}「刷 shaping 不击球」这类局部最优；
+  \item \textbf{配置}五类 sim2real gap 的 DR 覆盖策略，并通过消融实验\textbf{验证}每类 DR 的贡献；
+  \item \textbf{实现} Lagrangian 约束 PPO 的训练循环，并在 WandB 里\textbf{诊断} Lagrange 乘子轨迹；
+  \item \textbf{调通}从 Phase 1（500\,Hz / 100\,Hz）到 strike task（2000\,Hz / 50\,Hz）的频率升级，并\textbf{估算}延迟预算对击球的影响。
+\end{enumerate}
+
+\paragraph{阅读时间。}精读（含动手跑通三框架最小例）约 5--6 小时；速读（抓 MDP/奖励/curriculum 三条主线 + 本质洞察）约 90 分钟；查阅（按本章小结的知识点总表与故障排查手册定位）约 15 分钟。
+
+\paragraph{知识导航。}本章在「强化学习运动控制」部的位置如下。
+
+\begin{center}
+\begin{forest}
+navtree,
+[强化学习运动控制（P8）
+  [前置零件
+    [{观测/动作、奖励、Manager},name=parts]
+    [{域随机化、特权学习、诊断、sim2real}]
+  ]
+  [网球综合项目
+    [{环境构建与球物理（\cref{ch:rlmc-tennisenv}）},name=env]
+    [{击球控制与全身协调（本章）},name=here]
+  ]
+]
+\end{forest}
+\end{center}
+
+\noindent{}本章是综合项目的收口：它把前置零件（观测/奖励/Manager/DR/特权/诊断/sim2real）与 \cref{ch:rlmc-tennisenv} 的环境底座组合成一个完整的高速接触控制系统。下面先用一节把「击球控制到底难在哪」讲清楚。
+
+% ════════════════════════════════════════════════════════════════
+\section{击球控制的本质：带速度和姿态约束的定时接触}
+\label{sec:rlmc-strike-essence}
+
+\paragraph{模块功能与在管线中的位置。}本节不写代码，目标是建立对问题复杂度的正确认知——这决定了后面 MDP、奖励、curriculum 的所有设计取舍。在 \cref{ch:rlmc-tennisenv}$\to$感知$\to$本章的数据流里，本节处在「把感知输出翻译成控制目标之前」的概念层：先想清楚控制器到底要解什么问题，再谈怎么解。
+
+\subsection{为什么天真方案会失败}
+
+一个天真的控制方案是：从感知管线拿到未来球位置，让机械臂用 IK 把球拍中心移到那个点，碰到就给奖励。这个方案会失败，原因有五个，每个都对应后面的一项工程对策。
+
+\textbf{原因一：IK 到点不等于击球。} 球拍必须在正确\emph{时间}到达（太早等在那里球还没来，太晚球已飞过），还要有正确的\emph{速度}（静止球拍碰到高速球只会被弹开），面\emph{法向}也必须正确（偏了出球方向不可控）。这就像棒球击球——站在好球带里不挥棒也算「到位」，但球不会自己飞向外场。
+
+\textbf{原因二：只控制手臂可能不可达。} 高速横向来球可能落在 arm workspace 之外。若球预计到达机器人右侧 1.5\,m 处，固定底座机械臂根本够不到。移动底盘需要提前启动——但底盘移动会改变 arm base frame，又会改变 IK 目标。base-arm 协调是\emph{耦合}问题，不能拆成两个独立模块。
+
+\textbf{原因三：接触瞬间极短。} 真实网球拍-球接触约 3--5\,ms（\cref{sec:rlmc-tennis-contact} 已讨论）。LATENT（人形网球，arXiv:2603.12686）用 2000\,Hz 仿真才能准确解算。若奖励只看 episode 结束时的落点，策略很难知道是哪一步做对了——credit assignment（信用分配）问题被极端放大。
+
+\textbf{原因四：击中但失稳也不是成功。} 极端挥拍在仿真中可能打到球，但真实机器人会因惯性和反作用力损坏或摔倒。WoCoCo（CoRL'24，arXiv:2406.06005）在部署时对 PD 目标施加 Butterworth 低通滤波，正是为了抑制硬件不安全的高频抖动——其论文附录原文为「对 PD 目标施加 4\,Hz 带宽的 Butterworth 低通滤波以避免抖动输出」（具体配置见 \cref{sec:rlmc-strike-integration}）。
+
+\textbf{原因五：仿真接触太理想。} 仿真中球拍稍碰到球就产生可控出球，真实的线床变形、球体压缩、摩擦变化更复杂。LATENT 的消融实验直接证明了这一点——去掉动力学随机化后真机正手成功率从 90.90\% 骤降到 16.67\%（\cref{sec:rlmc-strike-dr} 详引）。
+
+\begin{insight}[击球控制的核心是定时接触，不是末端到点]\label{ins:rlmc-strike-timed-contact}
+击球控制的核心不是末端到点，而是「\textbf{带速度和姿态约束的定时接触}」。只把球拍中心追到球心，会把最关键的时间和动量问题删掉。控制器需要同时解决四个子问题：到哪（position）、什么时候（timing）、多快（velocity）、什么角度（orientation）。本章后面所有奖励项，本质上都是在分别给这四个子问题提供学习信号。
+\end{insight}
+
+\subsection{如果不做 staged reward 会怎样}
+
+\textbf{反面推演}：只给 outcome reward（球落在目标区才给分）。大多数时间奖励为 0——球拍追不上球、追上没打到、打到没过网。PPO 在这种极稀疏奖励下几乎学不到任何东西。这就像让从未摸过球拍的人参加温网，只告诉他「赢了才有奖金」却不教怎么挥拍——他连球都碰不到，更谈不上改进。staged reward 相当于沿途放一串越来越亮的灯，至少能沿着光走（\cref{sec:rlmc-strike-reward} 给出完整设计）。
+
+\subsection{前沿系统的击球控制架构对比}
+
+把当前主流的球类运动 RL 系统并排看，能看出一条共性：\emph{算法都不新（PPO 为主），胜负手在动作空间、奖励分解与 sim2real 工程}。下表的论文归属与编号均已联网核对。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+系统 & 控制架构 & 动作空间 & 奖励类型 & 关键创新 \\
+\midrule
+LATENT & 分层：高层策略 $+$ 低层 tracker & latent action $+$ wrist correction & 击球 $+$ 落点 $+$ 自然度 & latent 动作空间对腕部修正鲁棒 \\
+HITTER & 分层：model-based planner $+$ RL 控制器 & 全关节 PD targets & tracking $+$ balance $+$ contact & 解析弹道规划 $+$ 全身控制 \\
+WoCoCo & 端到端：sequential contact stages & 全关节 PD targets & 接触阶段分解奖励 & 任务无关奖励 $+$ 部署滤波 \\
+KungfuBot & 端到端：动作跟踪 $+$ 自适应课程 & 全关节 PD targets & tracking error & bi-level 自适应跟踪容忍度 \\
+Phybot & 多阶段课程（footwork$\to$swing$\to$task） & 全关节 PD targets & 分阶段（步法/挥拍/任务） & 无 motion prior 纯 RL \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{paper}[LATENT：从不完美人类动捕学习人形网球技能]\label{paper:rlmc-strike-latent}
+\textbf{问题}：如何让人形机器人（Unitree G1）用\emph{碎片化、不完美}的人类动捕数据学会打网球，并 zero-shot 迁移到真机？
+
+\textbf{核心思想}：三阶段框架——先采集正手/反手/横向移动等技能片段；再构造一个对腕部修正鲁棒的 \emph{latent action space}（潜动作空间），使高层策略可任意调整腕部姿态而不破坏下肢稳定；最后训练高层策略来组合、修正这些技能基元。
+
+\textbf{关键结果}：仿真正手成功率 96.52\%（判据：落到目标 2.5\,m 内）；真机正手 90.90\%、反手 77.78\%（判据放宽为落入对方球场边界）。消融显示动力学 DR 与观测噪声缺一不可。
+
+\textbf{与本书关系}：本章的 staged reward、curriculum、DR、安全部署四条主线都能在 LATENT 里找到对应；其动作空间设计是「latent action」一档（\cref{tab:rlmc-strike-actionspace}）的代表。
+
+\textbf{局限}：依赖人类动捕数据作 motion prior；latent 空间的构造需要额外的表示学习阶段，工程复杂度高于纯 task-space IK。
+\end{paper}
+
+\begin{pitfall}[直接在空 action 的发球 task 上训练击球]
+\textbf{错误描述}：沿用 \cref{sec:rlmc-tennis-manager} 的发球验证 task（\verb|actions: dict = {}|）直接挂 PPO 训练击球。\\
+\textbf{现象后果}：策略没有任何输出维度，训练 loss 不动、不报错，浪费数小时算力。\\
+\textbf{根本原因}：发球 task 是\emph{纯弹道验证}环境，没有机器人/球拍/动作项。\\
+\textbf{正确做法}：新建包含 robot、racket、action 的 strike task（\cref{sec:rlmc-strike-mdp}），并按 \cref{sec:rlmc-tennis-robot} 的阶段化引入路线先在固定底座上跑通。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[分析]} 解释为什么物块抓取的 staged reward 可以迁移到网球击球，但参数不能直接复用。从目标物体速度（0 vs 30\,m/s）、接触持续时间（持续 vs 3\,ms）、奖励稀疏性三个角度说明。验收标准：三个角度各给出一句定量对比。
+  \item \textbf{[设计]} 对比 LATENT（latent action）与 HITTER（全关节 PD targets）的动作空间。哪种更适合教学项目？为什么？验收标准：从样本效率、是否需要 motion data、可解释性三点权衡。
+\end{enumerate}
+\end{practice}
+
+\noindent{}建立了复杂度认知后，下一步把「打网球」翻译成 RL 可优化的数学语言——MDP 五元组。
+
+% ════════════════════════════════════════════════════════════════
+\section{击球 MDP 设计：状态、动作与转移}
+\label{sec:rlmc-strike-mdp}
+
+\paragraph{模块功能与在管线中的位置。}本节定义击球 task 的状态空间与动作空间，它们是 ObservationManager 与 ActionManager（\cref{ch:rlmc-manager}）的具体填充，也是后面奖励、curriculum、约束的作用对象。转移由物理仿真给出，奖励与终止留到 \cref{sec:rlmc-strike-reward,sec:rlmc-strike-safety}。
+
+\subsection{状态空间的分层设计}
+
+击球任务的状态天然分成三层，对应不同的信息访问权限。这正是 \cref{ch:rlmc-privileged} 非对称 actor-critic 思想在本任务的落地。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+层 & 包含的状态 & 谁能看到 & 维度（近似） \\
+\midrule
+环境真值 & 球 pos/vel/ang\_vel、接触状态、发球命令、球场几何 & 仿真内部 & $\sim 30$ \\
+Teacher Actor & 真值球 $+$ 未来轨迹 $+$ 精确机器人状态 & teacher 策略 & $\sim 60$ \\
+Student Actor & 估计击球点/速度、距击球时间、不确定性、本体感知、上一动作 & 可部署策略 & $\sim 50$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{为什么要分层（多视角）？} 从\emph{能力上限}视角，Teacher 看得到未来轨迹和精确接触，先确定「信息完全时能打多好」；从\emph{可部署性}视角，Student 只能看到感知管线输出和自身传感器，再逐步降级到「可部署信息下能打多好」。若一开始就限制 teacher 的信息，上限更低、蒸馏目标更弱。这与 \cref{ch:rlmc-privileged} 「critic 看真值、actor 看传感器」的原则完全一致。
+
+\subsection{Student Actor 的观测配置}
+
+\textbf{配置详解。}下面给出 mjlab 风格的观测配置。关键设计：球相关量来自感知管线（不是真值），并对位置量开 \verb|enable_corruption| 以便训练时注入噪声（\cref{sec:rlmc-strike-noise}）；critic 额外看真值与未来轨迹。
+
+\begin{codebox}[Python]{mjlab 1.4.0：击球 task 的分层观测（节选）}
+class TennisStrikeObsCfg:
+    """击球 task 的分层观测：Actor 看可部署量，Critic 加看 privileged 量。"""
+
+    class ActorCfg(ObservationGroupCfg):
+        # === 球相关（来自感知管线，非真值）===
+        ball_pos_estimate = ObservationTermCfg(
+            func=lambda env: env.perception.predicted_state_now[:, :3],
+            noise=GaussianNoiseCfg(mean=0.0, std=0.02),  # 训练注入噪声（受组级 corruption 总闸）
+        )                                     # [3] EKF 估计的当前球位置
+        ball_vel_estimate = ObservationTermCfg(
+            func=lambda env: env.perception.predicted_state_now[:, 3:6],
+        )                                     # [3]
+        impact_pos = ObservationTermCfg(
+            func=lambda env: env.perception.impact_pos_c,
+        )                                     # [3] 预测击球点（court-local）
+        time_to_impact = ObservationTermCfg(
+            func=lambda env: env.perception.time_to_impact.unsqueeze(-1),
+        )                                     # [1] 距击球时间
+        prediction_uncertainty = ObservationTermCfg(
+            func=lambda env: env.perception.uncertainty.unsqueeze(-1),
+        )                                     # [1]
+        prediction_validity = ObservationTermCfg(
+            func=lambda env: env.perception.validity.float().unsqueeze(-1),
+        )                                     # [1] 预测是否有效
+
+        # === 机器人本体感知 ===
+        joint_pos = ObservationTermCfg(func=mdp.joint_pos_rel)
+        joint_vel = ObservationTermCfg(func=mdp.joint_vel_rel)
+        base_lin_vel = ObservationTermCfg(func=mdp.base_lin_vel)
+        base_ang_vel = ObservationTermCfg(func=mdp.base_ang_vel)
+        projected_gravity = ObservationTermCfg(func=mdp.projected_gravity)
+
+        # === 球拍状态（face site，非 wrist）===
+        racket_pos = ObservationTermCfg(func=racket_face_position)
+        racket_normal = ObservationTermCfg(func=racket_face_normal)
+        racket_vel = ObservationTermCfg(func=racket_face_velocity)
+
+        # === 动作历史（平滑性所需，配合 action_rate 惩罚）===
+        last_action = ObservationTermCfg(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.enable_corruption = True     # 组级总闸：训练注入噪声，评估置 False 看干净
+            self.concatenate_terms = True
+
+    class CriticCfg(ActorCfg):
+        """Critic 继承 Actor 的全部，再加 privileged 量。"""
+        ball_pos_perfect = ObservationTermCfg(
+            func=ball_state_privileged,
+        )                                     # [9] 真值球状态
+        ball_future_trajectory = ObservationTermCfg(
+            func=ball_future_positions_20step,
+        )                                     # [60] 未来 20 步真实位置
+
+        def __post_init__(self):
+            self.enable_corruption = False    # critic 永远看干净（特权 obs 不加噪）
+            self.concatenate_terms = True
+\end{codebox}
+
+\textbf{代码走读。}在 mjlab 1.4.0 中，观测项由 \verb|ObservationManager| 按注册顺序拼接成张量（\cref{ch:rlmc-manager}）。\verb|enable_corruption| 是\textbf{组级总闸}（在 \verb|ObservationGroupCfg| 的 \verb|__post_init__| 里设）：开启时组内配了 \verb|noise=| 的项才注入噪声，评估时把它整组置 \verb|False| 即看干净——这让「训练有噪声、评估看干净」成为一行配置即可切换的事。\verb|CriticCfg(ActorCfg)| 用类继承表达「critic 是 actor 的超集」，是非对称 AC 最省事的写法；critic 组把 corruption 关掉以保证看真值。
+
+\textbf{两个被忽略的内置字段（实测可用，省掉手写代码）。}\verb|ObservationGroupCfg| 实测还带 \verb|history_length| / \verb|flatten_history_dim| 与 \verb|nan_policy| / \verb|nan_check_per_term| 两组字段，本任务正好用得上：（1）上面的 \verb|last_action| 是手搭的单步动作历史；若要让策略「看到」\verb|time_to_impact| 等时序量的最近 $N$ 帧（高速接触任务很需要），直接在组上设 \verb|history_length=4| 即可得到 N 步堆叠观测，比逐个加 \verb|last_*| term 通用得多。（2）本章后面多处担心 IK 在奇异处发散吐 NaN（\cref{eq:rlmc-strike-dls} 附近的陷阱、\cref{sec:rlmc-strike-freq} 的高频接触），\verb|nan_policy|（组级）与 \verb|nan_check_per_term| 是内置的 NaN 守卫——可在 obs 侧把偶发 NaN 兜住（按策略置零/复用上一帧），不至于「一个 env 炸了整批 rollout 作废」，比单纯调大 \verb|lambda| 更稳。这两项都不必自己实现。
+
+\subsection{动作空间设计}
+
+\textbf{配置详解（配置项四维表）。}动作空间有四档候选，权衡各异（\cref{tab:rlmc-strike-actionspace}）。
+
+\begin{table}[H]
+\centering
+\small
+\caption{击球任务动作空间的四档候选与适用阶段。}
+\label{tab:rlmc-strike-actionspace}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+候选方案 & 维度 & 优点 & 缺点 & 推荐阶段 \\
+\midrule
+base\_vel $+$ racket\_delta\_pos & 6D & 简单起步 & 无姿态控制 & Stage 1--2 \\
+base\_vel $+$ racket\_delta\_pose & 9D & 有姿态控制 & IK 可能不可达 & Stage 2--4 \\
+全关节 joint\_position\_targets & $n_j$D & 最大灵活性 & 策略需自学运动学 & Stage 4$+$ \\
+latent action（LATENT 方案） & $\sim 16$D & 自然运动 & 需 motion data & 高级 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+本课程推荐 \textbf{base velocity $+$ differential IK（9D）} 起步：3D 底盘速度 $+$ 6D 球拍 task-space 增量（3D 位置 $+$ 3D 旋转）。
+
+\begin{codebox}[Python]{mjlab 1.4.0：底盘速度 $+$ task-space IK 动作（9D）}
+# 注意：mjlab 的 DifferentialIKActionCfg 把 DLS 参数做成「扁平字段」
+# （damping/delta_pos_scale/delta_ori_scale/max_dq），不嵌套 Isaac 的 controller=...；
+# 且动作按「执行器名」选择（actuator_names），目标用 frame_name + frame_type（site/body）。
+# mjlab 无现成 BaseVelocityActionCfg —— 底盘速度须自定义 ActionTerm 或经底盘执行器走关节动作。
+# ⚠ 实测默认值（mjlab 1.4.0 introspection）：damping=0.05、max_dq=0.5、use_relative_mode=True，
+#   但 delta_pos_scale 与 delta_ori_scale 默认都是 1.0（即「不缩放」）。50 Hz 下若沿用默认 1.0，
+#   单步位置增量就是策略输出的整个动作量（±1 m 量级），会让关节瞬间跳变——必须像下面这样显式给
+#   小 scale（见下方「默认 scale=1.0」陷阱）。
+class TennisStrikeActionsCfg:
+    """击球 task 推荐起步动作：底盘速度 + 球拍 differential IK。"""
+
+    racket_ik = DifferentialIKActionCfg(
+        entity_name="robot",
+        actuator_names=(".*_shoulder_.*", ".*_elbow_.*", ".*_wrist_.*"),
+        frame_type="site",                     # IK 目标取 site（球拍面中心）
+        frame_name="racket_face_center",
+        use_relative_mode=True,                # delta pose（以零为中心；默认即 True）
+        delta_pos_scale=0.05,                  # 位置增量缩放（m/step）⚠ 默认 1.0，必须显式改小
+        delta_ori_scale=0.1,                   # 旋转增量缩放（rad/step）⚠ 默认 1.0，必须显式改小
+        damping=0.05,                          # DLS 阻尼 λ（扁平字段，非 lambda_val；默认 0.05）
+        max_dq=0.5,                            # 单步最大关节角变化（rad；默认 0.5）
+    )                                          # 6D：球拍 task-space 增量
+    # 进阶：mjlab 1.4.0 的 DifferentialIKActionCfg 还有 position_weight/orientation_weight/
+    #   joint_limit_weight/posture_weight/posture_target —— 加权 + 零空间姿态正则 IK，
+    #   冗余臂可把「举拍 ready pose」编码进 posture_target，比单加 give-up reward 更直接。
+    # 底盘 3D 速度需另接一个动作 term（mjlab 无内置 base-velocity term，见下文）
+    # 总 action_dim = 3 + 6 = 9
+\end{codebox}
+
+\begin{insight}[移动底盘是把击球点拉回可达域的控制变量]\label{ins:rlmc-strike-base}
+移动底盘不是「让机器人更灵活」的附加功能，而是把击球点从 arm workspace 外\textbf{拉回可达域}的控制变量。忽略 base，会把许多可打来球错误地变成不可达来球。类比：足球守门员只能站在原地伸手则大部分射门都接不到，移动脚步（底盘）才是扩大防守范围的关键。这也是为什么 \cref{ins:rlmc-strike-armfirst} 反对「先练手臂再加底盘」。
+\end{insight}
+
+\subsection{DifferentialIK：把运动学知识编码进 action transform}
+
+\verb|DifferentialIKActionCfg| 把 task-space 的 delta pose 转成 joint-space 的关节角增量，核心是 damped least squares（DLS，阻尼最小二乘）伪逆：
+\begin{equation}
+\Delta\mathbf{q} = \mathbf{J}^{\mathrm{T}}\bigl(\mathbf{J}\mathbf{J}^{\mathrm{T}} + \lambda^{2}\mathbf{I}\bigr)^{-1}\Delta\mathbf{x},
+\label{eq:rlmc-strike-dls}
+\end{equation}
+其中 $\mathbf{J}$ 是雅可比（$6\times n_j$），$\Delta\mathbf{x}$ 是 task-space pose 增量（3D 位置 $+$ 3D 旋转），$\lambda$ 是阻尼系数。
+
+\textbf{为什么不直接用伪逆 $\mathbf{J}^{+}$？}（先动机，再反面，再操作）当机器人接近 workspace 边界或奇异构型（雅可比秩下降）时，$\mathbf{J}$ 的小奇异值使伪逆放大——等价地，式~\eqref{eq:rlmc-strike-dls} 中 $\mathbf{J}\mathbf{J}^{\mathrm{T}}$ 的小特征值接近零，使逆矩阵剧增——策略一个微小的 task-space 动作，关节却跳变几十度。DLS 通过给 $\mathbf{J}\mathbf{J}^{\mathrm{T}}$ 加 $\lambda^{2}\mathbf{I}$ 正则化，代价是精度略降，换来数值稳定。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+参数 & 含义 & 击球任务建议值 & 理由（含耦合） \\
+\midrule
+\verb|use_relative_mode| & action 为 delta 还是绝对 & \verb|True| & delta 以零为中心，适合 RL 探索 \\
+\verb|delta_pos_scale| & 位置 delta 缩放 & 0.05--0.1 m/step & 50\,Hz $\to$ 0.05\,m/step $\to$ 最大 2.5\,m/s \\
+\verb|delta_ori_scale| & 旋转 delta 缩放 & 0.1--0.2 rad/step & 过大则球拍翻转；与 \verb|damping| 耦合 \\
+\verb|damping| & DLS 阻尼 $\lambda$（默认 0.05） & 0.05--0.1 & 太小奇异附近发散，太大响应迟钝 \\
+\verb|max_dq| & 单步最大关节角变化（默认 0.5） & 按关节速度限制 & 防关节瞬间跳变，与硬件保护耦合 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent{}上表是 mjlab \verb|DifferentialIKActionCfg| 的扁平字段（DLS 阻尼字段名为 \verb|damping|）；Isaac Lab 的等价量改放进 \verb|DifferentialIKControllerCfg(ik_method="dls", ik_params={"lambda_val":...})|（\cref{sec:rlmc-strike-mdp} 的三框架对比），数学上同为式~\eqref{eq:rlmc-strike-dls} 的 $\lambda$。
+
+\textbf{action transform 的完整链路（代码走读）}：策略输出 9D 动作后，前 3 维直接送底盘速度控制器，后 6 维经如下链路落到物理仿真：
+\begin{codebox}[text]{9D 动作的 transform 链路（伪流程）}
+策略输出 action[9]
+  ├─ action[:3] = base_velocity [vx, vy, wz]  → 底盘速度控制器
+  └─ action[3:9] = racket_delta_pose
+       delta_pos_scale * action[3:6] → dx_pos [m]
+       delta_ori_scale * action[6:9] → dx_ori [rad]
+       DLS IK: dq = J^T (J J^T + lambda^2 I)^{-1} [dx_pos; dx_ori]
+       clamp(dq, -max_dq, +max_dq)
+       q_target = current_joint_pos + dq
+       PD: tau = Kp (q_target - q) - Kd * qdot   -> 施加到物理仿真
+\end{codebox}
+
+\begin{insight}[task-space IK 让策略只学「球拍去哪」而非「关节怎么动」]\label{ins:rlmc-strike-taskspace}
+DifferentialIK 把运动学知识（「怎么移动关节才能让末端到达目标」）编码进 action transform。策略只需学习「球拍应该去哪」——这是一个 3D/6D 的决策问题，比 $n_j$-D 的关节控制问题简单得多。反面：直接用全关节 PD targets，等于让神经网络用几亿个样本去学一个人类工程师几十行代码就能精确解的逆运动学映射，样本效率极低。HITTER/Phybot 用全关节是因为它们要协调腿和躯干（IK 只覆盖手臂），对固定/简单底座的教学项目，task-space IK 是更优起点。
+\end{insight}
+
+\subsection{三框架对比：IK action}
+
+\textbf{Isaac Lab 对照。}Isaac Lab 2.x 提供数学上等价的 DLS IK，但 API 路径与类名不同。
+
+\begin{codebox}[Python]{Isaac Lab 2.x：DifferentialInverseKinematicsActionCfg}
+from isaaclab.envs.mdp.actions import DifferentialInverseKinematicsActionCfg
+from isaaclab.controllers import DifferentialIKControllerCfg
+
+class IsaacLabTennisActionsCfg:
+    racket_ik = DifferentialInverseKinematicsActionCfg(
+        asset_name="robot",
+        joint_names=["panda_joint.*"],         # 以 Franka 为例
+        body_name="panda_hand",
+        controller=DifferentialIKControllerCfg(
+            command_type="pose",
+            use_relative_mode=True,
+            ik_method="dls",                    # 同为阻尼最小二乘
+            ik_params={"lambda_val": 0.05},
+        ),
+    )
+\end{codebox}
+
+\textbf{UniLab 对照（诚实记录：无 task-space IK action 类）。}UniLab 不提供与 \verb|DifferentialIKActionCfg| 等价的 task-space differential IK action term——它的动作\emph{固定}是关节位置目标残差：在 \verb|np_env.py| 的 \verb|LocomotionBaseEnv.apply_action()| 中（UniLab，commit 99936e08），\verb|ctrl = exec_actions * action_scale + default_angles|（位置式 PD 目标，\verb|action_scale| 默认 0.25，\verb|default_angles| 取自 keyframe \verb|home| 的 qpos），由后端位置执行器按 \verb|{kp, kd}| 算力矩。因此本节的 9D「base velocity $+$ 球拍 task-space 增量」在 UniLab 里没有现成 action 类对应。
+
+\begin{codebox}[Python]{UniLab：无 task-space IK action，须自实现 DLS 映射后再写关节位置目标}
+# UniLab 动作 = 关节位置目标残差（apply_action: ctrl = act*action_scale + default_angles）。
+# 无 DifferentialIKActionCfg 等价类 —— task-space 增量须自己在 apply_action 里做 DLS：
+class TennisStrikeEnv(LocomotionBaseEnv):       # 继承 NpEnv 系
+    def apply_action(self, actions, state):
+        # actions[:3] 底盘速度（另走底盘控制），actions[3:9] = 球拍 delta pose
+        dx = actions[:, 3:9] * self._delta_scale            # task-space 增量
+        J = self._backend.get_body_jacobian("racket_face")  # 须后端提供雅可比
+        JT = J.transpose(0, 2, 1)
+        lam = 0.05
+        dq = JT @ np.linalg.inv(J @ JT + lam**2 * np.eye(6)) @ dx[..., None]
+        q_target = self.get_dof_pos() + dq[..., 0]          # 落回关节位置目标
+        ctrl = q_target                                     # 后端位置执行器按 kp/kd 出力矩
+        self._backend.step(ctrl, self._cfg.sim_substeps)
+\end{codebox}
+
+\noindent{}三框架的 IK 解算在数学上一致（都是式~\eqref{eq:rlmc-strike-dls} 的 DLS 伪逆；Isaac Lab 文档将 \verb|"dls"| 描述为「阻尼版 Moore-Penrose 伪逆，又称 Levenberg-Marquardt」，公式 $\mathbf{A}^{-}=\mathbf{A}^{\mathrm{T}}(\mathbf{A}\mathbf{A}^{\mathrm{T}}+\lambda\mathbf{I})^{-1}$，与本书记号一致），但\emph{封装层级}不同：mjlab/Isaac Lab 把 DLS 做成可配置的 action term（雅可比分别经 MuJoCo \verb|mj_jac| 类接口、PhysX articulation API 获取），UniLab 只提供关节位置目标动作，task-space IK 须在 \verb|apply_action| 里手写——这正印证了 \cref{ins:rlmc-strike-taskspace}：把运动学编码进 action transform 是\emph{框架的便利}，缺了它就得自己补这段逆运动学。
+
+\subsection{为什么本章用 mjlab 做主线（选型的一手体感）}
+\label{sec:rlmc-strike-mjlab-mainline}
+
+三框架 API 都核对过、数学也等价，那\emph{教学项目该把谁当主线}？这不是「哪个更强」的口水仗，而是几个能在第一天就感受到的工程体感——下表的体感数据来自 gpufree（RTX 4090）实跑。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+维度 & mjlab 1.4.0 & Isaac Lab 2.x & UniLab \\
+\midrule
+冷启动到第 1 迭代 & \textbf{秒级} & 数分钟（USD/shader 加载，首次更久） & 秒级（CPU 物理） \\
+物理后端 & MuJoCo Warp（GPU） & PhysX（GPU） & MuJoCo/Motrix（\textbf{CPU} 物理 $+$ GPU 策略） \\
+实测吞吐（小 env） & G1 \,$\sim$2500、Lift-Cube \,$\sim$700 steps/s & 同量级（需先起 Sim） & go2 \,$\sim$590 steps/s（CPU 受限） \\
+task-space IK action & \textbf{内置}（\verb|DifferentialIKActionCfg|） & 内置（\verb|DifferentialInverse...|） & 无，须手写 \\
+观测延迟 & \textbf{内置 per-term 字段} & 须自写 buffer & 须自写 buffer \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent{}对一个要反复「改一个数 → 短训 → 看曲线」的教学/调试循环（\cref{sec:rlmc-strike-reward} 的调参 walkthrough 就是这个循环），\textbf{冷启动时间是体感差异最大的一项}：mjlab 秒级起，每次 \verb|train --max-iterations 2| 验证「没改坏」几乎零等待；Isaac Sim 每次要先加载 USD/编译 shader、冷启数分钟（首跑可达 5--8 分钟，二次因缓存更快），频繁改 cfg 的迭代体验受拖累。加上 mjlab 把本章最需要的两件设施都做成了配置项（task-space IK action、per-term 观测延迟），故本章把 mjlab 当主线、Isaac Lab/UniLab 作对照。\textbf{这不是说另两框架不行}——Isaac Lab 的 PhysX 接触与大规模并行在生产里很强、UniLab 的双后端契约校验（\cref{ins:rlmc-strike-unilab-dr-gating}）是独到设施；只是\emph{教学迭代}阶段，启动快 $+$ 设施齐的 mjlab 摩擦最小。选型的判据应是「你这一步最频繁的操作是什么」：频繁改 cfg 短训选 mjlab，要大规模上量或对接已有 PhysX 资产选 Isaac Lab，要跨引擎一致性保证选 UniLab。
+
+\textbf{运行验证。}配好 IK action 后，先做一个零策略 sanity check：把 action 全置零，球拍面 site 应在数帧内稳定不动（无关节漂移）；再给一个小的 $+x$ delta，球拍面应沿 $+x$ 平移而非乱跳。若出现关节跳变，多半是 \verb|lambda_val| 太小或目标 body 选成了 wrist 而非 face site（见下方陷阱）。
+
+\begin{pitfall}[把 wrist pose 当成 racket face pose]
+\textbf{错误描述}：IK 的 \verb|body_name| 指向手腕 link，而非球拍面中心。\\
+\textbf{现象后果}：手腕到位了，但球拍面因长度和法向偏移（\cref{sec:rlmc-tennis-robot} 的 \verb|euler="0 -15 0"|）并没对准球，contact rate 长期偏低。\\
+\textbf{根本原因}：球拍有长度和面法向偏移，wrist 到位不代表 face 到位。\\
+\textbf{正确做法}：在 MJCF 里定义 \verb|racket_face_center| site，IK target 与 approach reward 都指向该 site。
+\end{pitfall}
+
+\begin{pitfall}[DifferentialIK 的 damping 设太低]
+\textbf{错误描述}：为追求精度把 \verb|lambda_val| 设到 0.001 量级。\\
+\textbf{现象后果}：接近 workspace 边界或奇异构型时 IK 解发散，关节角单步跳变几十度，触发关节限位终止甚至 NaN。\\
+\textbf{根本原因}：小奇异值被伪逆放大（式~\eqref{eq:rlmc-strike-dls} 去掉 $\lambda^2\mathbf{I}$ 即退化为不稳定伪逆）。\\
+\textbf{正确做法}：从 \verb|lambda_val=0.1| 起步，观察 IK 残差与关节速度峰值后再逐步下调。
+\end{pitfall}
+
+\begin{pitfall}[沿用 \texttt{delta\_pos\_scale}/\texttt{delta\_ori\_scale} 的默认值 1.0]
+\textbf{错误描述}：实例化 \verb|DifferentialIKActionCfg| 时只填了 \verb|frame_name|/\verb|damping| 等，没显式给 \verb|delta_pos_scale|/\verb|delta_ori_scale|，以为框架会自动缩放。\\
+\textbf{现象后果}：mjlab 1.4.0 这两项默认值是 \textbf{1.0（不缩放）}（实测 introspection 确认），策略输出范围约 $\pm 1$ 时单步位置增量就到 $\pm 1$\,m、姿态增量到 $\pm 1$\,rad，50\,Hz 下等于要求关节瞬间跳变，第一帧就触发关节限位终止甚至 NaN——比 damping 设太低更常见的「上来就炸」。\\
+\textbf{根本原因}：\verb|delta_*_scale| 默认不缩放，是给「已自带归一化动作」的用户留的；RL 策略输出未归一化到合理物理量纲，必须自己缩放。\\
+\textbf{正确做法}：始终显式设 \verb|delta_pos_scale=0.05|（50\,Hz $\to$ 最大 2.5\,m/s）、\verb|delta_ori_scale=0.1|，再按关节速度峰值微调；\verb|damping|/\verb|max_dq| 默认 0.05/0.5 通常可直接用。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[设计]} 设计 9D 动作 \verb|[base_vx, base_vy, base_wz, dx, dy, dz, drx, dry, drz]|，说明每维物理含义与建议 scale。若控制频率 50\,Hz，每维 scale 设多少才能达到合理的最大速度/角速度？验收标准：给出位置维（目标 $\le 2.5$\,m/s）与旋转维（目标不翻拍）的具体数值。
+  \item \textbf{[手算]} 固定底座机械臂 workspace 半径约 0.6--0.8\,m。若球可能到达机器人左右 2\,m 范围，底盘至少移动多远？假设底盘最大速度 2\,m/s，需多少时间？验收标准：算出移动距离与时间，并据此说明 \cref{ins:rlmc-strike-base}。
+\end{enumerate}
+\end{practice}
+
+\noindent{}状态和动作定义好后，进入 RL 训练中最关键的环节——奖励设计。
+
+% ════════════════════════════════════════════════════════════════
+\section{Reward 分解：从稀疏到可学}
+\label{sec:rlmc-strike-reward}
+
+\paragraph{模块功能与在管线中的位置。}奖励是 RewardManager（\cref{ch:rlmc-reward}）的填充，它把 \cref{ins:rlmc-strike-timed-contact} 的四个子问题（到哪/何时/多快/什么角度）拆成可独立提供梯度的信号。关键是把「打赢一分」这个稀疏目标，重写成 PPO 能沿途获得反馈的形态。
+
+\subsection{五类 reward 概览}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llllll@{}}
+\toprule
+类别 & 名称 & 时机 & 数学形式（示意） & 作用 & 权重建议 \\
+\midrule
+接近 & \verb|approach| & contact 前 & $\exp(-\lVert\mathbf{p}_r-\mathbf{p}_i\rVert^2/\sigma^2)$ & 引导进入击球窗口 & 1.0 \\
+对时 & \verb|timing| & contact 前 & $\exp(-\lvert t_{\text{tti}}-t_{\text{ready}}\rvert/\tau)$ & 在正确时间接近 & 0.5 \\
+击中 & \verb|contact| & contact 时 & 合法接触二值信号 & 确认物理接触 & 5.0 \\
+出球 & \verb|outcome| & contact 后 & 过网 $\cdot$ 落入目标区 & 最终任务目标 & 10.0 \\
+正则 & \verb|reg| & 全程 & action rate $+$ joint limit $+$ stability & 安全与平滑 & $-0.1\sim-0.5$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{approach reward：为什么用指数衰减}
+
+\begin{codebox}[Python]{approach reward：球拍面到预测击球点的指数衰减}
+def compute_approach_reward(env, sigma=0.3):
+    """球拍面中心到预测击球点的距离 reward：远处有信号，近处梯度最大。"""
+    racket_pos = env.get_site_position("racket_face_center")  # [N, 3]
+    impact_pos = env.perception.impact_pos_c                  # [N, 3]
+    validity = env.perception.validity                        # [N] bool
+
+    distance = (racket_pos - impact_pos).norm(dim=-1)         # [N]
+    reward = torch.exp(-distance**2 / sigma**2)               # [N]
+    reward = reward * validity.float()    # 无效预测不给 reward
+    return reward
+\end{codebox}
+
+\textbf{为什么指数衰减而非线性（先动机，再反面）？} $\exp(-d^2/\sigma^2)$ 近处最高，且距离大时梯度不为零（远处仍有学习信号）；其对距离的导数大小为 $(2d/\sigma^2)\exp(-d^2/\sigma^2)$，在 $d=0$ 处为 0、在 $d=\sigma/\sqrt{2}$ 附近最大——引导信号在中等距离最强、近处趋平。线性衰减 $\max(0,1-d/d_{\max})$ 在 $d>d_{\max}$ 时梯度为零，策略远处没有方向。$\sigma$ 应匹配 arm workspace 尺度（0.3--0.5\,m）。这与 \cref{ch:rlmc-reward} 势函数塑形的「处处有梯度」原则一致。
+
+\subsection{timing reward：在正确时间接近}
+
+\begin{codebox}[Python]{timing reward：球拍应在 tti 约等于 t\_ready 时到达击球点附近}
+def compute_timing_reward(env, tau=0.05, t_ready=0.1):
+    """过早到位则球还没来，过晚到位则球已飞过。"""
+    tti = env.perception.time_to_impact           # [N] 剩余时间
+    distance = (env.get_site_position("racket_face_center")
+                - env.perception.impact_pos_c).norm(dim=-1)  # [N]
+    # 用 |tti - t_ready| 而非 -tti，避免 tti<0（球已飞过）时 exp 爆炸；clamp 掉负 tti
+    tti_clamped = tti.clamp_min(0.0)
+    readiness = (torch.exp(-distance / 0.2)
+                 * torch.exp(-torch.abs(tti_clamped - t_ready) / tau))
+    return readiness * env.perception.validity.float()
+\end{codebox}
+
+\textbf{代码走读。}\verb|t_ready| 是理想提前量——策略应提前 \verb|t_ready| 到位开始挥拍。注意 \verb|clamp_min(0.0)|：若球已飞过（\verb|tti<0|），不 clamp 会让 $\exp$ 在 $-\text{tti}/\tau$ 上爆炸成巨大正奖励，反而鼓励「打空」。这是高速接触任务里极易忽略的数值陷阱。
+
+\subsection{contact 与 outcome：瞬时事件与事件缓冲}
+
+\begin{codebox}[Python]{contact reward：合法球拍-球接触的二值信号}
+def compute_contact_reward(env):
+    """合法 = 球拍面 geom 碰球 geom + 球在空中 + 球在可打范围。"""
+    contact_detected = env.contact_sensor.detect_contact(
+        geom_a="racket_face", geom_b="ball_geom",
+    )                                                  # [N] bool
+    ball_airborne = env.perception.predicted_state_now[:, 2] > 0.1
+    ball_in_range = env.perception.validity
+    legal_contact = contact_detected & ball_airborne & ball_in_range
+    env.event_buffer.record_contact(legal_contact, env.sim_time)  # 记录供 outcome 用
+    return legal_contact.float()
+\end{codebox}
+
+与物块抓取不同，网球接触是\textbf{瞬时事件}（3--5\,ms）。若不记录接触事件，几个 env step 后就无法知道「是否曾接触过」——outcome reward 也就无从计算。因此需要一个事件缓冲：
+
+\begin{codebox}[Python]{StrikeEventBuffer：记录瞬时接触并追踪接触后球状态}
+class StrikeEventBuffer:
+    """记录击球事件，跨 step 保存「是否接触过/过网否/落点」。"""
+
+    def __init__(self, num_envs, device):
+        self.has_contact = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        self.contact_time = torch.zeros(num_envs, device=device)
+        self.ball_crossed_net_after_contact = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        self.first_landing_after_contact = torch.zeros(num_envs, 3, device=device)
+        self.landing_recorded = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+    def record_contact(self, contact_mask, sim_time):
+        new_contacts = contact_mask & ~self.has_contact   # 只记第一次
+        self.has_contact = self.has_contact | contact_mask
+        self.contact_time[new_contacts] = sim_time
+
+    def update_post_contact(self, ball_pos_local, ball_vel):
+        active = self.has_contact & ~self.landing_recorded
+        # 机器人在近端（x<0）击球，成功回球应把球打回对方半场（x>0）
+        crossed = active & (ball_pos_local[:, 0] > 0)
+        self.ball_crossed_net_after_contact = self.ball_crossed_net_after_contact | crossed
+        landed = active & (ball_pos_local[:, 2] < 0.05) & (ball_vel[:, 2] < 0)
+        self.first_landing_after_contact[landed] = ball_pos_local[landed]
+        self.landing_recorded = self.landing_recorded | landed
+
+    def reset(self, env_ids):
+        self.has_contact[env_ids] = False
+        self.contact_time[env_ids] = 0.0
+        self.ball_crossed_net_after_contact[env_ids] = False
+        self.first_landing_after_contact[env_ids] = 0.0
+        self.landing_recorded[env_ids] = False
+\end{codebox}
+
+\begin{codebox}[Python]{outcome reward：过网 + 落入目标区（对方半场）}
+def compute_outcome_reward(env):
+    """最终任务目标，触发条件苛刻（须先合法击中）。"""
+    if not env.event_buffer.has_contact.any():
+        return torch.zeros(env.num_envs, device=env.device)
+    ball_crossed_net = env.event_buffer.ball_crossed_net_after_contact   # [N]
+    # 回球目标是对方（far）半场 x>0，而非机器人所在近端 x<0
+    landing_pos = env.event_buffer.first_landing_after_contact           # [N, 3]
+    in_target = (
+        (landing_pos[:, 0] > 0.0) & (landing_pos[:, 0] < 6.40) &
+        (landing_pos[:, 1] > -4.115) & (landing_pos[:, 1] < 4.115) &
+        (landing_pos[:, 2] < 0.1)
+    )
+    # 过网半分，落入目标区再半分
+    return ball_crossed_net.float() * 0.5 + in_target.float() * 0.5
+\end{codebox}
+
+\subsection{regularization 与乘法组合结构}
+
+\begin{codebox}[Python]{regularization：安全与平滑惩罚（节选）}
+def compute_regularization(env, w_action_rate=0.01, w_joint_limit=0.1,
+                           w_base_stability=0.05, w_energy=0.001):
+    """动作平滑 + 关节限位 + 底盘稳定 + 能耗。"""
+    action_rate = (env.actions - env.previous_actions).norm(dim=-1)
+    action_rate_penalty = w_action_rate * action_rate
+
+    joint_pos = env.scene["robot"].data.joint_pos
+    jl = env.scene["robot"].data.joint_pos_limits
+    margin = 0.05
+    lower = torch.clamp(jl[:, :, 0] + margin - joint_pos, min=0).sum(dim=-1)
+    upper = torch.clamp(joint_pos - jl[:, :, 1] + margin, min=0).sum(dim=-1)
+    joint_limit_penalty = w_joint_limit * (lower + upper)
+
+    g = env.scene["robot"].data.projected_gravity_b
+    base_stability_penalty = w_base_stability * g[:, :2].norm(dim=-1)
+
+    tau = env.scene["robot"].data.applied_torque
+    energy = (tau.abs() * env.scene["robot"].data.joint_vel.abs()).sum(dim=-1)
+    energy_penalty = w_energy * energy
+
+    return action_rate_penalty + joint_limit_penalty + base_stability_penalty + energy_penalty
+\end{codebox}
+
+\begin{codebox}[Python]{五类 reward 的乘法组合：强制层级优先}
+def compute_total_reward(env):
+    approach = compute_approach_reward(env)
+    timing = compute_timing_reward(env)
+    contact = compute_contact_reward(env)
+    outcome = compute_outcome_reward(env)
+    reg = compute_regularization(env)
+    # 乘法结构：approach=0 时后面再好也不贡献
+    total = (
+        1.0 * approach
+        * (1.0 + 0.5 * timing)
+        * (1.0 + 5.0 * contact)
+        * (1.0 + 10.0 * outcome)
+        - reg
+    )
+    return total
+\end{codebox}
+
+\begin{insight}[乘法组合把稀疏目标拆成有序可学的台阶]\label{ins:rlmc-strike-multiplicative}
+乘法结构确保层级优先：若 \verb|approach=0|（球拍离击球点很远），无论 timing 多好、是否碰到球，总 reward 都是零——强制策略先解决\emph{接近}。接近了（\verb|approach>0|），timing 才开始有意义；接近且时间对了，contact 才可能发生；contact 发生后，outcome 才能评估。这与物块抓取 \verb|reaching * (1 + bringing)| 的模式（\cref{ch:rlmc-manip}）完全一致——必须先够到 cube，才有机会搬起来。
+\end{insight}
+
+\subsection{用精确 predictor 算 reward，用 learned predictor 喂 obs}
+
+\textbf{关键工程决策。}奖励应始终用真值或\emph{物理} predictor 计算（确保稳定），而策略观测用\emph{learned} predictor（确保可部署）。这正是 PACE（人形乒乓球，arXiv:2509.21690）的核心设计之一。
+
+\begin{codebox}[Python]{用 physics predictor 构造 approach reward（PACE 思路）}
+def compute_approach_reward_with_physics_predictor(env, sigma=0.3):
+    """训练用 physics predictor（从第一天起就准）→ reward 稳定；
+       策略 obs 仍用 learned predictor（可部署）→ 学会用不精确预测。"""
+    racket_pos = env.get_site_position("racket_face_center")
+    physics_impact_pos = env.physics_predictor.compute_impact_point(
+        env.scene["ball"].data.root_pos_w[:, :3] - env.scene.env_origins,
+        env.scene["ball"].data.root_lin_vel_w[:, :3],
+    )
+    distance = (racket_pos - physics_impact_pos).norm(dim=-1)
+    return torch.exp(-distance**2 / sigma**2)
+\end{codebox}
+
+\textbf{为什么不用 learned predictor 算 reward？} 训练初期 learned predictor 还不准，用不准的预测算 reward 会让奖励噪声大、PPO 梯度方差大、训练不稳定。物理 predictor 从第一天起就相当准（物理定律不需「学习」），提供稳定信号。这与 \cref{sec:rlmc-strike-noise} 「噪声加在 obs 不加在 reward」是同一条原则的两面。
+
+\subsection{分项监控与系统化调优}
+
+\textbf{运行验证（看什么日志/曲线）。}只看 total reward 无法判断「奖励上升是真学会击球，还是学会刷 approach shaping」。必须分项记录，并单列\emph{真正的成功度量}（不是 reward）。
+
+\begin{codebox}[Python]{env.step 中分项记录到 WandB}
+self.extras["log"]["Reward/approach"] = approach.mean().item()
+self.extras["log"]["Reward/timing"] = timing.mean().item()
+self.extras["log"]["Reward/contact"] = contact.mean().item()
+self.extras["log"]["Reward/outcome"] = outcome.mean().item()
+self.extras["log"]["Reward/total"] = total.mean().item()
+# 关键指标（北极星）：直接衡量「碰到球了吗 / 过网了吗 / 落点准吗」
+self.extras["log"]["Metric/contact_rate"] = contact.float().mean().item()
+self.extras["log"]["Metric/over_net_rate"] = \
+    self.event_buffer.ball_crossed_net_after_contact.float().mean().item()
+\end{codebox}
+
+\textbf{Contact rate 是击球任务的北极星指标。}total reward 可能因 approach shaping 持续上升但 contact rate 不动（策略学到了「靠近但不击球」的局部最优）。此时按下图诊断流程调参：
+
+\begin{codebox}[text]{奖励不收敛的系统化诊断流程}
+Total reward 升但 contact rate = 0？
+  ├─ 是 → 策略在刷 approach shaping
+  │        修复：减小 approach σ 或增大 contact 权重
+  └─ 否 → contact rate 升但 over_net rate = 0？
+           ├─ 是 → 碰到球但力量/角度不对
+           │        修复：加 orientation reward 或 racket velocity reward
+           └─ 否 → over_net rate 升但 landing rate = 0？
+                    ├─ 是 → 球过网但落点不准 → 加 landing accuracy reward
+                    └─ 否 → 训练正常，逐步推进 curriculum
+\end{codebox}
+
+\paragraph{一次真实调参 walkthrough：把 \texorpdfstring{$\sigma$}{sigma} 从 0.5 调到 0.3。}诊断流程图给的是\emph{方向}（「减小 σ」），但「减到多少、看哪条曲线判断够了没」要靠一个可操作的闭环。以「\verb|Reward/approach| 一路涨、\verb|Metric/contact_rate| 卡在 0」这个最常见症状为例，演示怎么从曲线反推参数——\emph{每一步都是「改一个数 → 短训 → 读一条曲线 → 决定下一步」}：
+\begin{enumerate}
+  \item \textbf{先确认是刷 shaping，不是别的}：在 WandB 同时看 \verb|Reward/approach| 与 \verb|Metric/contact_rate|（\cref{sec:rlmc-strike-reward} 的分项日志）。若 approach 已逼近其上限 1.0、contact\_rate 仍 $\approx 0$ 持续 $>500$ 迭代，基本确诊「球拍稳定停在击球点附近但从不挥过去」。
+  \item \textbf{量出 approach 的「饱和半径」}：approach $=\exp(-d^2/\sigma^2)$，$\sigma=0.5$ 时 $d=0.5$\,m 处 reward 还有 $e^{-1}\approx0.37$、$d=0.25$\,m 处高达 $0.78$——意味着球拍离击球点 25\,cm 就拿到近八成奖励，\emph{再靠近边际收益太小}，策略没动力挥进最后那几厘米。这就是 σ 偏大的定量症结。
+  \item \textbf{改一个数、短训、读曲线}：把 \verb|sigma| 从 0.5 改到 0.3（$d=0.25$\,m 处 reward 降到 $e^{-(0.25/0.3)^2}\approx0.50$，逼近击球点的梯度明显变陡），\verb|train --agent.max-iterations 300| 跑一小段，只盯 contact\_rate 这一条：若它从 0 起步出现\emph{任何}非零上升（哪怕到 5\%），方向就对了，继续训满；若仍 0，再降到 0.2 或同时把 \verb|contact| 权重从 5 提到 8。
+  \item \textbf{设刹车，防过冲}：σ 不能无限小——\verb|sigma| 小于约 0.1\,m 时 approach 退化成「几乎只有贴脸才给分」的准稀疏奖励，远处又没梯度了（回到 \cref{sec:rlmc-strike-reward} 一开头反对的稀疏困境）。经验区间 $\sigma\in[0.2,0.4]$\,m，与 arm workspace 尺度同量级。判停信号：contact\_rate 稳定爬过当前 curriculum 阶段的通过阈值（如 Stage 1 的 $50\%$）即停手，不要为「曲线更好看」继续压 σ。
+\end{enumerate}
+\noindent{}这套「曲线 $\to$ 参数 $\to$ 曲线」的闭环对其它 shaping 参数同理：\verb|timing| 的 $\tau$ 太大则任何时刻到位都给分（学不会提前量）、\verb|t_ready| 反推自 \cref{ins:rlmc-strike-plan-ahead} 的反应窗口。关键是\textbf{一次只动一个数、用最短训练读一条北极星曲线判断}，而非一次调四个参数后无法归因。
+
+\textbf{三框架对比：奖励接线。}mjlab 用 \verb|RewardTermCfg(func=..., weight=...)| 注册（\cref{ch:rlmc-reward}）；Isaac Lab 的 \verb|RewardManager| 与 \verb|RewTerm| 在 API 命名上略有差异但语义一致（每项 \verb|func| 返回 \verb|[N]| 张量，按 weight 加权求和）。乘法组合结构在两框架里都需要写成\emph{一个}组合 reward term（而非多个独立 term 相加），因为 Manager 默认是\emph{加法}聚合。
+
+\textbf{UniLab 对照（标量字典 $+$ 派发表，乘法组合天然落在一个函数里）。}UniLab 不用 \verb|RewardTermCfg| 类树，而是 \verb|reward.scales| 标量字典 $+$ env 内 \verb|_reward_fns| 派发表：在 \verb|envs/locomotion/common/rewards.py| 的 \verb|run_reward_dispatch()|（UniLab）里，奖励按 $\sum_k \texttt{scales}[k]\cdot\texttt{fns}[k](\texttt{ctx})$ \emph{加法}聚合，并最终乘 \verb|ctrl_dt|（等价 mjlab/Isaac 的 scale-by-dt）。因为聚合是加法，本章的乘法组合（\cref{ins:rlmc-strike-multiplicative}）必须封进\emph{一个} reward 函数、在 \verb|_reward_fns| 里注册成单项，再给它 scale 1.0——这与「mjlab 写成一个组合 term」殊途同归。
+
+\begin{codebox}[Python]{UniLab：把乘法 staged reward 注册成派发表里的单个函数}
+# rewards.py 风格：函数签名 fn(ctx) -> np.ndarray[num_envs]；ctx bundle 了球/球拍/接触量
+def staged_strike(ctx):                     # 乘法组合落进一个函数（加法聚合无法表达层级）
+    approach = np.exp(-ctx.info["racket_to_impact"]**2 / 0.3**2)
+    timing   = np.exp(-np.abs(ctx.info["tti"].clip(min=0) - 0.1) / 0.05)
+    contact  = ctx.info["legal_contact"].astype(np.float32)
+    outcome  = ctx.info["over_net"].astype(np.float32) * 0.5 + ctx.info["in_target"] * 0.5
+    return approach * (1 + 0.5*timing) * (1 + 5*contact) * (1 + 10*outcome)
+
+class TennisStrikeEnv(LocomotionBaseEnv):
+    def _init_reward_functions(self):
+        self._reward_fns = {"staged_strike": staged_strike,           # 组合项 scale=1.0
+                            "action_rate": rewards.action_rate}        # 正则项另列负权重
+    def _compute_reward(self, info, *ctx_args):
+        ctx = RewardContext(info=info, num_envs=self._num_envs, ...)
+        return rewards.run_reward_dispatch(scales=self._reward_cfg.scales,
+            fns=self._reward_fns, ctx=ctx, info=info, ctrl_dt=self._cfg.ctrl_dt)
+# YAML: reward.scales: {staged_strike: 1.0, action_rate: -0.01}
+\end{codebox}
+
+\begin{pitfall}[reward 越高越好]
+\textbf{错误描述}：把 approach 权重调得很大以求曲线好看。\\
+\textbf{现象后果}：策略学到「一直把球拍举在预测点」刷分但从不挥拍，contact rate 长期为 0。\\
+\textbf{根本原因}：shaping 奖励被当成了任务目标。\\
+\textbf{正确做法}：分项记录每个 reward term，以 contact rate / target landing rate 为真正指标；必要时减小 approach $\sigma$ 或增大 contact 权重。
+\end{pitfall}
+
+\begin{pitfall}[contact reward 在 episode 结束后才结算]
+\textbf{错误描述}：把接触判定挪到 episode 末尾一次性结算。\\
+\textbf{现象后果}：接触发生的那一步没有即时奖励，credit assignment 更难，contact 学得极慢。\\
+\textbf{根本原因}：瞬时事件的奖励延迟到了终局。\\
+\textbf{正确做法}：每步检查合法接触并\emph{立即}给奖励；outcome 则需 contact 后继续运行到落地（见下条）。
+\end{pitfall}
+
+\begin{pitfall}[contact 时刻立即 terminate，吞掉 outcome 评估窗口]
+\textbf{错误描述}：一检测到接触就结束 episode。\\
+\textbf{现象后果}：无法评估出球是否过网、落点在哪，outcome reward 恒为 0。\\
+\textbf{根本原因}：终止早于结果显现。\\
+\textbf{正确做法}：contact 后继续运行到球落地或出界，再终止（\cref{sec:rlmc-strike-safety} 的终止配置据此设计）。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[设计]} 写完整的 staged reward 函数，含 5 类 reward 的权重与物理解释。验收标准：能在 mjlab 里注册为一个组合 term 并跑起来。
+  \item \textbf{[分析]} approach reward 稳定上升但 contact rate 不变，说明什么问题？怎么调？验收标准：指出「刷 shaping」并给出两种修复方向。
+  \item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-tennisenv} 的标准 deuce service box 坐标与感知接口，设计 outcome reward：如何判断出球过网并落入 deuce service box？验收标准：写出坐标不等式。
+\end{enumerate}
+\end{practice}
+
+\noindent{}有了奖励，接下来设计 curriculum——如何从简单到困难逐步加难。
+
+% ════════════════════════════════════════════════════════════════
+\section{分阶段 Curriculum：从静态球到高速发球}
+\label{sec:rlmc-strike-curriculum}
+
+\paragraph{模块功能与在管线中的位置。}curriculum 在 \cref{ch:rlmc-reward} 课程骨架之上，按\emph{成功率门控}动态调整 \cref{sec:rlmc-tennis-launch} 的发球参数范围与噪声强度，确保策略在每个阶段都有足够学习信号。
+
+\begin{note}
+本节的「Curriculum 阶段 0--7」与 \cref{sec:rlmc-tennis-robot} 的「环境引入 Stage」是\textbf{不同维度}：后者描述「何时引入机器人和球拍」（环境组装顺序），本节描述「如何逐步加训练难度」（发球参数与噪声递进）。两者可正交组合——例如在环境引入 Stage 3（固定底座机械臂引入后）才开始本节的 Curriculum 阶段 0。
+\end{note}
+
+\subsection{八阶段课程表}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llllp{3.0cm}@{}}
+\toprule
+阶段 & 条件 & 新增难度 & 通过标准 & 对应 \texttt{LaunchCommand} \\
+\midrule
+0 & 静态球、固定位置 & 无 & approach $>0.5$ & speed=0、固定 pos \\
+1 & 低速直线 12\,m/s、无 spin & 运动目标 & contact rate $>50\%$ & speed=12、elev=0、spin=0 \\
+2 & 低速抛物线、固定 elev/y & 垂直维度 & contact rate $>40\%$ & speed=12、elev=$-5$ \\
+3 & 增加横向偏移 & base-arm 协调 & contact rate $>30\%$ & $y\in[-2,2]$ \\
+4 & 增加速度 12--25\,m/s & 时间窗口缩短 & contact rate $>25\%$ & speed$\in[12,25]$ \\
+5 & 增加 elev/azimuth 随机 & 轨迹多样性 & legal contact $>20\%$ & 全范围 elev/azim \\
+6 & 增加 topspin/sidespin & 出球复杂化 & over-net rate $>15\%$ & topspin$\in[-100,300]$ \\
+7 & 加入感知延迟 & 信息退化 & 性能下降 $<30\%$ & $+$ 0--3 帧延迟 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{课程管理器：门控与回退}
+
+\begin{codebox}[Python]{TennisCurriculumManager：成功率门控 + 安全回退（节选）}
+class TennisCurriculumManager:
+    """按成功率门控推进，质量不稳则回退。"""
+
+    def __init__(self, env_cfg, num_envs, device):
+        self.current_stage = 0
+        self.stages = self._define_stages()   # 见课程表
+        self.success_history = []
+        self.history_window = 200             # 最近 200 episode 的成功率
+
+    def update(self, metrics):
+        stage = self.stages[self.current_stage]
+        metric_value = metrics.get(stage["metric"], 0.0)
+        self.success_history.append(metric_value)
+        if len(self.success_history) > self.history_window:
+            self.success_history = self.success_history[-self.history_window:]
+        avg = sum(self.success_history) / len(self.success_history)
+
+        # 推进：达标且非末阶段
+        if avg >= stage["pass_threshold"] and self.current_stage < len(self.stages) - 1:
+            self.current_stage += 1
+            self.success_history = []
+        # 回退：推进后持续很差（< 阈值的 30%）
+        if (len(self.success_history) > 50 and
+                avg < stage["pass_threshold"] * 0.3 and self.current_stage > 0):
+            self.current_stage -= 1
+            self.success_history = []
+
+    def get_current_params(self):
+        return self.stages[self.current_stage]
+\end{codebox}
+
+\textbf{代码走读。}门控的关键是\emph{按成功率而非步数}推进：用最近 200 episode 的滑动平均判断是否达标。回退分支防止「侥幸达标后进入更难阶段持续失败」——这是固定阶梯 curriculum 最常见的失败模式。每次切换都清空历史，避免旧阶段成绩污染新阶段判断。
+
+\subsection{两种替代课程思路：自适应容忍度与能力解耦}
+
+\textbf{KungfuBot 的自适应课程（多视角）。}KungfuBot（NeurIPS'25，arXiv:2506.12851）不按阶段切换参数，而是用 \emph{bi-level 自适应跟踪容忍度}动态调整 tracking 精度——这是一个 bi-level 优化：内层学策略，外层根据当前 tracking error 收紧容忍度。
+
+\begin{codebox}[Python]{自适应容忍度（按 KungfuBot 思路重构）}
+class AdaptiveTolerance:
+    """tracking error 低于容忍度则收紧（加难），否则保持（给策略时间）。"""
+    def __init__(self, initial_tolerance=0.5, min_tolerance=0.05, decay=0.999):
+        self.tolerance = initial_tolerance
+        self.min_tolerance = min_tolerance
+        self.decay = decay
+
+    def update(self, tracking_error):
+        if tracking_error < self.tolerance * 0.8:
+            self.tolerance = max(self.min_tolerance, self.tolerance * self.decay)
+
+    def compute_reward(self, tracking_error):
+        normalized = tracking_error / self.tolerance
+        return torch.clamp(1.0 - normalized, min=0.0)
+\end{codebox}
+
+其优势是不需手设阶段数与切换条件，容忍度自动随策略能力调整。但它只适用于\emph{tracking 类}任务；网球击球的「成功」是二值的（碰到/没碰到），不能直接用 tracking error，故本章主线仍用八阶段门控。\pz{经核 KungfuBot（arXiv:2506.12851）的 bi-level 自适应容忍度确实是针对运动跟踪误差设计的；「能否把它改造到二值击球任务」是本书的工程推断，KungfuBot 原文未涉及此类任务，建议落地时自行验证。}
+
+\textbf{Phybot 的能力解耦（多视角）。}Phybot（人形羽毛球，arXiv:2511.11218）用概念上更清晰的多阶段解耦——每阶段训练\emph{不同能力}，无 motion prior：
+
+\begin{codebox}[text]{Phybot 三阶段（footwork - swing - task）}
+Stage 1 Footwork：只训下肢，纯 locomotion（移动到位 + 平衡 + 能耗），无球
+Stage 2 Swing   ：只训上肢（机器人位置固定），球从固定位置投出（面法向对准 + 速度匹配 + 击中）
+Stage 3 Task    ：上下肢协调，加载 Stage 1/2 预训练权重作初始化，完整随机 launcher
+\end{codebox}
+
+\textbf{与八阶段的区别（本质洞察）}：八阶段在\emph{同一个 task 内}逐步加难（环境参数变化），Phybot 在\emph{不同 task 间}切换（能力解耦）。两者可组合——例如 Phybot 的 Stage 1 内部也可有从慢到快的子 curriculum。
+
+\textbf{三框架对比：curriculum 接线。}mjlab/Isaac Lab 都有 CurriculumManager（\cref{ch:rlmc-reward}）。本节的成功率门控既可挂进框架的 Curriculum term，也可作为外部管理器在训练循环里改 command range（\cref{sec:rlmc-strike-integration} 给出后者）。
+
+\textbf{UniLab 对照（无成功率门控 CurriculumManager，须用外部 loop）。}UniLab \emph{不是} Manager-Based，没有 \verb|CurriculumManager| 类（\cref{sec:rlmc-strike-essence} 已述其架构差异）。它内置的课程只有两类：\verb|base/curriculum.py| 的 \verb|PenaltyCurriculum|（UniLab，按 episode 长度自适应缩放\emph{负权重}reward，原地改 \verb|cfg.reward_config.scales| 里 $<0$ 的项）与 \verb|terrains/| 的 \verb|TerrainCurriculumCfg|（地形等级）——\textbf{都不是按成功率门控的难度递进}。因此本节的八阶段成功率门控在 UniLab 里只能走\emph{外部管理器}路线（恰是本章 \cref{sec:rlmc-strike-integration} 训练循环采用的那种）：在训练循环里读 metrics、达标则改发球参数。
+
+\begin{codebox}[Python]{UniLab：外部 loop 改命令范围（无 CurriculumManager，对照本章 mjlab 八阶段表）}
+# UniLab 课程仅 PenaltyCurriculum(按 episode 长度缩放负权重) + TerrainCurriculumCfg；
+# 成功率门控的难度递进须自己在训练循环里做（改命令/发球参数，不经框架 manager）：
+curriculum = TennisCurriculumManager(...)        # 本章自定义的成功率门控（八阶段表）
+for it in range(max_iterations):
+    stage = curriculum.get_current_params()
+    # UniLab 经 Hydra 风格深合并改 env 配置（apply_cfg_overrides），或直接改 commands 采样范围：
+    env._cfg.commands.speed_range = stage["speed_range"]      # 发球速度阶梯
+    rollout = collect_rollout(env, agent)
+    agent.update(rollout)
+    curriculum.update(compute_metrics(rollout))   # 成功率门控推进/回退（同 mjlab/Isaac 外部路线）
+# 注：PenaltyCurriculum 可同时挂着自动缩放 action_rate 等负权重，与上面的难度门控正交。
+\end{codebox}
+
+\begin{pitfall}[只按训练步数推进 curriculum]
+\textbf{错误描述}：固定每 1000 iteration 推进一个阶段。\\
+\textbf{现象后果}：若到点时 contact rate 仍是 0\%，推进毫无意义，后续阶段全盘崩。\\
+\textbf{根本原因}：步数与能力脱钩。\\
+\textbf{正确做法}：按成功率门控推进（上方代码），并允许回退。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[设计]} 为阶段 0（静态球）设计具体环境参数：球的位置、高度、机器人初始位置。验收标准：球放在 arm workspace 内（距机器人 0.3--0.5\,m），高度约 1.0--1.5\,m。
+  \item \textbf{[设计]} 设计阶段 3$\to$4 的过渡与安全回退条件。验收标准：给出推进指标/阈值与回退指标/阈值。
+\end{enumerate}
+\end{practice}
+
+\noindent{}curriculum 定义了难度递进。下一步在训练中注入感知噪声，让策略学会在不完美观测下工作。
+
+% ════════════════════════════════════════════════════════════════
+\section{感知噪声模型：与感知管线的衔接}
+\label{sec:rlmc-strike-noise}
+
+\paragraph{模块功能与在管线中的位置。}本节把 \cref{ch:rlmc-tennisenv} 的感知管线（EKF $+$ 残差预测 $+$ 延迟补偿）与本章控制训练连接起来，定义训练时的噪声注入策略——这是 \cref{ch:rlmc-obsact} 噪声机制在高速接触任务上的具体落地。
+
+\subsection{动机：训练时必须见过噪声}
+
+\textbf{反面推演。}若策略只在真值球状态下训练到 95\% contact rate，部署时面对 EKF 估计的有噪声状态——预测偏 2\,cm，策略可能完全无法调整（从未见过这种偏差）。LATENT 消融给出定量证据：去掉观测噪声后反手成功率从 77.78\% 掉到 0.00\%（\cref{sec:rlmc-strike-dr}）。但若训练时注入 0--5\,cm 随机噪声，策略会学到「对噪声鲁棒的挥拍」，即使预测不完美也能碰到球。
+
+\subsection{三种噪声注入策略}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+策略 & 实现 & 适用场景 & 复杂度 \\
+\midrule
+固定高斯噪声 & \texttt{ball\_pos += N(0,$\,\sigma^2$)} & 快速起步 & 低 \\
+DR 噪声范围 & $\sigma\sim U(\sigma_{\min},\sigma_{\max})$ & LATENT 风格 & 中 \\
+perception-aware 噪声 & $\sigma=f(\text{distance},\text{robot\_speed})$ & 标定相机误差后 & 高 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+教学项目从固定高斯起步，验证后升级到 DR 噪声范围；perception-aware 需标定真实相机误差，适合高级项目。
+
+\subsection{在框架里配置噪声注入}
+
+\textbf{方法一：mjlab 的 \texttt{ObservationTermCfg} noise 参数（最简单）。}
+
+\begin{codebox}[Python]{mjlab 1.4.0：在 ObservationTermCfg 中配置高斯噪声}
+class NoisyBallObsCfg(ObservationGroupCfg):
+    # 噪声配在 term 的 noise= 字段（mjlab.utils.noise.GaussianNoiseCfg）；
+    # 是否生效由组级 enable_corruption 总闸控制（不是 term 级字段）。
+    ball_pos = ObservationTermCfg(
+        func=ball_position_court_local,
+        noise=GaussianNoiseCfg(mean=0.0, std=0.02),  # 2 cm
+    )
+    ball_vel = ObservationTermCfg(
+        func=ball_velocity_world,
+        noise=GaussianNoiseCfg(mean=0.0, std=0.5),   # 0.5 m/s
+    )
+
+    def __post_init__(self):
+        self.enable_corruption = True    # 训练启用，评估置 False 即看干净
+        self.concatenate_terms = True
+\end{codebox}
+
+\textbf{方法二：自定义 obs function（支持 DR 与 perception-aware）。}
+
+\begin{codebox}[Python]{DR 噪声：每 episode 采样一次 sigma，episode 内每步噪声值不同}
+def ball_position_with_dr_noise(env) -> torch.Tensor:
+    gt_pos = env.scene["ball"].data.root_pos_w[:, :3] - env.scene.env_origins
+    noise_std = env.dr_params["ball_obs_noise_std"]   # [N] 由 EventManager 采样
+    noise = torch.randn_like(gt_pos) * noise_std.unsqueeze(-1)
+    return gt_pos + noise
+\end{codebox}
+
+\subsection{延迟注入与课程联动}
+
+\begin{note}[mjlab 1.4.0 已内置 per-term 观测延迟，球类 obs 不必手写 buffer]\label{note:rlmc-strike-mjlab-delay}
+下面的 \verb|PerceptionNoiseManager| 用一个手写的 \verb|DelayedObservationBuffer| 做延迟，是\emph{为讲清延迟机制}与覆盖三框架最小公分母而写的通用骨架。但对 mjlab 1.4.0，实测 \verb|ObservationTermCfg| 原生带 \verb|delay_min_lag| / \verb|delay_max_lag| / \verb|delay_per_env| / \verb|delay_hold_prob| 等字段（\verb|observation_manager| 已实装、引用 30 余处），\textbf{凡走 \texttt{ObservationTermCfg} 的 obs（如球位置估计项）只需一行配置即可得到 per-env 随机延迟，不必自维护 buffer}——还顺手消解了「延迟 buffer 在 reset 时未清空致鬼球」那个陷阱（框架内部按 env 管理延迟缓存并随 reset 清理）。手写 buffer 只在「延迟的不是某个 obs term、而是整条感知管线输出」时才需要。配置示意：
+\begin{codebox}[Python]{mjlab 1.4.0：直接在 ObservationTermCfg 上配 per-env 随机延迟（推荐）}
+ball_pos = ObservationTermCfg(
+    func=ball_position_court_local,
+    noise=GaussianNoiseCfg(mean=0.0, std=0.02),
+    delay_min_lag=0,          # 最小延迟（单位：env step，非 physics step）
+    delay_max_lag=3,          # 最大延迟 → 每 env 在 [0,3] 步内随机
+    delay_per_env=True,       # 每个并行 env 各自独立采样延迟量
+    delay_hold_prob=0.0,      # 可选：以一定概率「卡住」上一帧（模拟丢包）
+)   # 由组级 enable_corruption 总闸统一开关，评估时整组置 False 即关延迟+噪声
+\end{codebox}
+\end{note}
+
+\begin{codebox}[Python]{PerceptionNoiseManager：噪声 + 延迟（通用骨架，mjlab 可用上方内置字段替代）}
+class PerceptionNoiseManager:
+    def __init__(self, num_envs, device):
+        self.delay_buffer = DelayedObservationBuffer(
+            num_envs=num_envs, obs_dim=3, max_delay_steps=5, device=device)
+        self.noise_std = torch.zeros(num_envs, device=device)
+        self.max_delay = 0
+
+    def configure_for_stage(self, curriculum_stage):
+        cfgs = {
+            0: (0.0, 0), 1: (0.0, 0), 2: (0.0, 0),      # 无噪声
+            3: (0.005, 0), 4: (0.01, 0), 5: (0.02, 0),  # 噪声逐增
+            6: (0.03, 1), 7: (0.03, 3),                 # 噪声 + 延迟
+        }
+        std, self.max_delay = cfgs.get(curriculum_stage, cfgs[7])
+        self.noise_std[:] = std
+
+    def apply(self, gt_ball_pos, sim_time):
+        noise = torch.randn_like(gt_ball_pos) * self.noise_std.unsqueeze(-1)
+        noisy = gt_ball_pos + noise
+        self.delay_buffer.push(noisy, sim_time)
+        if self.max_delay > 0:
+            delay = torch.randint(0, self.max_delay + 1,
+                                  (gt_ball_pos.shape[0],), device=gt_ball_pos.device)
+            return self.delay_buffer.get_delayed(delay)
+        return noisy
+
+    def reset(self, env_ids):
+        self.delay_buffer.reset(env_ids)
+\end{codebox}
+
+\begin{insight}[噪声加在 obs，奖励用真值——两者必须分家]\label{ins:rlmc-strike-noise-reward}
+噪声应加在 observation（策略输入）上，奖励则始终用真值或物理 predictor 计算。策略从 noisy obs 做决策，但奖励告诉它「真实世界里你做得多好」。若噪声同时加在 obs 和 reward 上，奖励会不稳定、PPO 梯度方差大、训练发散。这正是 PACE 的核心设计（\cref{sec:rlmc-strike-reward} 已用物理 predictor 算 approach reward），也与 \cref{ch:rlmc-obsact} 噪声只进 obs 的约定一致。
+\end{insight}
+
+\textbf{三框架对比（延迟支持差异，已实测）。}三框架的\emph{噪声}都是声明式或近似声明式，但\emph{延迟}支持不同：\textbf{mjlab 1.4.0 原生支持 per-term 观测延迟}（\verb|ObservationTermCfg| 的 \verb|delay_min_lag|/\verb|delay_max_lag|/\verb|delay_per_env|/\verb|delay_hold_prob|，见 \cref{note:rlmc-strike-mjlab-delay}），无需手写 buffer；Isaac Lab 的 \verb|ObservationTermCfg| 有 \verb|noise| 字段（命名一致、\verb|enable_corruption| 同为\emph{组级}开关）但\emph{无}内置延迟字段，延迟需自定义 buffer；UniLab 也需自定义 buffer。即\textbf{只有 mjlab 把观测延迟做成了配置项}——这是把 mjlab 选作主线的一个具体便利（\cref{sec:rlmc-strike-mjlab-mainline}）。
+
+\textbf{UniLab 对照（噪声手写进 \texttt{\_compute\_obs}，只加 actor 组；延迟须自定义 buffer）。}UniLab 没有声明式的 \verb|ObservationTermCfg(noise=...)|——观测在 env 的 \verb|_compute_obs()| 里手工拼接，噪声经 \verb|_obs_noise(data, scale)| 函数加（UniLab），且\emph{只对 actor 组（\texttt{obs}）加噪、critic 组不加}（与本章「噪声进 obs、奖励/critic 用真值」的原则\cref{ins:rlmc-strike-noise-reward}天然一致）；噪声幅度 $=\texttt{level}\cdot\texttt{scale}\cdot U(-1,1)$，\verb|level<=0| 时关闭（等价 \verb|enable_corruption=False|）。延迟须自定义 buffer（与 Isaac Lab 同；mjlab 则有内置字段，见上）。
+
+\begin{codebox}[Python]{UniLab：在 \_compute\_obs 里给球估计量加噪（仅 actor 组）}
+def _compute_obs(self, info, ...):
+    nc = self._cfg.noise_config
+    # actor 组：球相关量来自感知管线 + 噪声（_obs_noise 仅 actor 加；level<=0 关）
+    obs = np.concatenate([
+        self._obs_noise(info["ball_pos_est"], nc.scale_ball_pos),   # 估计球位 + 噪声
+        self._obs_noise(info["impact_pos"],  nc.scale_impact),      # 击球点 + 噪声
+        info["tti"][:, None], info["validity"][:, None],            # 时间/有效位
+        self._obs_noise(self.get_gyro(), nc.scale_gyro), ...
+    ], axis=1)
+    # critic 组：无噪声 + 追加特权真值（球真位/未来轨迹）
+    critic = np.concatenate([info["ball_pos_gt"], info["ball_future"], obs], axis=1)
+    return {"obs": obs, "critic": critic}      # 维度自检经 obs_groups_spec
+# 延迟：UniLab 无内置延迟 obs，须自维护 DelayedObservationBuffer（Isaac 同样须自写；mjlab 有内置字段）。
+\end{codebox}
+
+\begin{pitfall}[噪声从训练第一步就加满]
+\textbf{错误描述}：Stage 0 就上 3\,cm 噪声 $+$ 3 帧延迟。\\
+\textbf{现象后果}：任务在策略还不会击球时就过难，contact rate 永远起不来。\\
+\textbf{根本原因}：噪声让任务更难，须在能力建立\emph{之后}引入。\\
+\textbf{正确做法}：Stage 0--4 用真值或极低噪声，Stage 5--7 逐步加噪（上方 \verb|configure_for_stage|）。
+\end{pitfall}
+
+\begin{pitfall}[延迟 buffer 在 episode reset 时未清空]
+\textbf{错误描述}：reset 只重置机器人，不重置 delay buffer。\\
+\textbf{现象后果}：新 episode 开头几步读到上一个 episode 残留的球观测，出现「鬼球」。\\
+\textbf{根本原因}：跨 episode 的状态泄漏。\\
+\textbf{正确做法}：在 \verb|env.reset()| 里调用 \verb|noise_manager.reset(env_ids)|。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[设计]} 为每个 Curriculum Stage（0--7）设计噪声配置（位置 $\sigma$、速度 $\sigma$、最大延迟帧），并解释理由。验收标准：给出表格并说明为何 Stage 0--4 不加噪。
+  \item \textbf{[编程]} 实现 \verb|PerceptionNoiseManager| 并集成进训练循环。验收标准：Stage 0 时 obs 与真值一致，Stage 7 时 obs 有明显偏差。
+\end{enumerate}
+\end{practice}
+
+\noindent{}噪声覆盖了感知不确定性。下一步用 DR 覆盖物理参数不确定性。
+
+% ════════════════════════════════════════════════════════════════
+\section{Domain Randomization 与 Sim2Real 风险}
+\label{sec:rlmc-strike-dr}
+
+\paragraph{模块功能与在管线中的位置。}DR 是 EventManager（\cref{ch:rlmc-dr}）的填充，目标是在仿真阶段提前暴露 sim2real gap。本节聚焦网球任务\emph{特有}的 gap 与逐项引入方法，DR 的鲁棒优化视角与事件四模式见 \cref{ch:rlmc-dr}，不再重述。
+
+\subsection{五类 sim2real gap}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+类别 & 仿真 vs 真实差异 & DR 策略 & 范围建议 \\
+\midrule
+感知 gap & RGB 太干净 & 随机光照/纹理/噪声 & 见 \cref{sec:rlmc-strike-noise} \\
+动力学 gap & drag/Magnus 未标定 & 随机 $C_d$、$C_L$、mass & $\pm 20\%\sim30\%$ \\
+接触 gap & 线床/球体变形难建模 & 随机 friction/restitution/solref & $\pm 30\%$ \\
+执行 gap & 关节延迟/饱和/backlash & 随机 actuator delay/strength & delay 5--15\,ms \\
+系统 gap & 网络延迟/标定误差 & 随机 observation delay & 0--3 帧 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{在 EventManager 中配置 DR}
+
+\begin{codebox}[Python]{mjlab 1.4.0：网球击球 DR 事件配置（节选）}
+# mjlab 的 DR 函数在模块化包 mjlab/envs/mdp/dr/，函数名精简（body_mass/geom_friction/
+# pd_gains），参数用 ranges + operation∈{abs,add,scale} + shared_random（不是 Isaac 的
+# *_distribution_params/*_range）。每个 DR 函数带 @requires_model_fields 装饰器声明改的字段。
+from mjlab.envs.mdp import dr
+class TennisDREventCfg:
+    ball_mass_dr = EventTermCfg(
+        mode="reset",                                # 每 episode 重采样
+        func=dr.body_mass,
+        params={"asset_cfg": SceneEntityCfg("ball"),
+                "operation": "abs",                  # 绝对替换为区间内采样值
+                "ranges": (0.045, 0.070)},           # ITF 56-59.4g ±裕量（kg）
+    )
+    court_friction_dr = EventTermCfg(
+        mode="reset",
+        func=dr.geom_friction,                       # 滑/滚/扭摩擦三分量
+        params={"asset_cfg": SceneEntityCfg("court", geom_names=()),
+                "operation": "abs",
+                "ranges": (0.3, 0.8),                # 接触摩擦区间
+                "shared_random": True},
+    )
+    actuator_gain_dr = EventTermCfg(
+        mode="reset",
+        func=dr.pd_gains,                            # 同时随机 kp/kd
+        params={"asset_cfg": SceneEntityCfg("robot"),
+                "operation": "scale",                # 乘性 ±20%
+                "kp_range": (0.8, 1.2),
+                "kd_range": (0.8, 1.2)},
+    )
+    aero_dr = EventTermCfg(
+        mode="reset",
+        func=randomize_ball_aerodynamics,            # 本任务自定义（mjlab 无内置气动 DR）
+        params={"drag_coefficient_range": (0.4, 0.7),
+                "lift_coefficient_range": (0.5, 1.5)},
+    )
+\end{codebox}
+
+\textbf{代码走读。}在 mjlab 1.4.0 中，\verb|EventManager| 在 \verb|mode="reset"| 时于每个 episode 起点对指定 entity 字段重采样（\cref{ch:rlmc-dr}）。\verb|dr.body_mass| / \verb|dr.geom_friction| / \verb|dr.pd_gains| 是模块化 DR 包 \verb|mjlab/envs/mdp/dr/| 的内置函数（函数名精简、参数用 \verb|ranges|$+$\verb|operation|，区别于 Isaac Lab 的 \verb|randomize_rigid_body_*|）；\verb|randomize_ball_aerodynamics| 是本任务自定义事件（包住 \cref{sec:rlmc-tennis-aero} 的 $C_d$、$C_L$，mjlab 无内置气动 DR）。
+
+\subsection{逐项引入与消融}
+
+\textbf{不要一次加满。}每加一项 DR，记录成功率变化：
+
+\begin{codebox}[Python]{DR 消融脚本：逐项累加，记录 contact/over\_net}
+dr_configs = [
+    {"name": "baseline", "dr_items": []},
+    {"name": "+ball_mass", "dr_items": ["ball_mass_dr"]},
+    {"name": "+court_friction", "dr_items": ["ball_mass_dr", "court_friction_dr"]},
+    {"name": "+actuator", "dr_items": ["ball_mass_dr", "court_friction_dr", "actuator_gain_dr"]},
+    {"name": "+aero", "dr_items": ["ball_mass_dr", "court_friction_dr", "actuator_gain_dr", "aero_dr"]},
+]
+for cfg in dr_configs:
+    result = train_with_dr(cfg["dr_items"], max_iterations=5000)
+    print(f"{cfg['name']}: contact={result['contact_rate']:.1%}, "
+          f"over_net={result['over_net_rate']:.1%}")
+\end{codebox}
+
+\textbf{预期结果（运行验证）。}每加一项 DR，仿真成功率会降 5\%--15\%，但真机 zero-shot 更好。若某项导致断崖式下降（$>50\%$），说明范围太宽或奖励对该参数过敏。
+
+\begin{insight}[DR 是让策略鲁棒，不是让仿真更真]\label{ins:rlmc-strike-dr-essence}
+DR 的本质不是把仿真调得更逼真，而是让策略对参数不确定性\textbf{鲁棒}。LATENT 给出最有力的定量证据：去掉动力学 DR，真机正手从 90.90\% 掉到 16.67\%、反手从 77.78\% 掉到 25.00\%；去掉观测噪声，反手从 77.78\% 掉到 0.00\%。两类 DR 覆盖不同的 gap——动力学 DR 覆盖物理参数不确定性，观测噪声覆盖感知管线不确定性，缺一不可。但 DR 不能替代正确建模：若接触模型结构本身错了（没建线床变形），DR 只是在错误模型的参数空间里加噪声。
+\end{insight}
+
+\subsection{三框架对比与课程联动}
+
+\textbf{Isaac Lab 对照。}Isaac Lab 2.x 的 DR 配置类似，但部分函数有框架特有参数（如 \verb|"operation": "abs"| 表示绝对替换而非缩放）：
+
+\begin{codebox}[Python]{Isaac Lab 2.x：DR 配置（注意 operation 字段）}
+from isaaclab.envs.mdp import events as mdp_events
+class IsaacLabDRCfg:
+    randomize_ball_mass = EventTermCfg(
+        func=mdp_events.randomize_rigid_body_mass,
+        mode="reset",
+        params={"asset_cfg": SceneEntityCfg("ball"),
+                "mass_distribution_params": (0.045, 0.070),
+                "operation": "abs"},          # 绝对替换（mjlab 用 ranges+operation 表达同义）
+    )
+\end{codebox}
+
+\textbf{UniLab 对照（\texttt{DomainRandConfig} $+$ 后端能力门控，气动 DR 须自定义）。}UniLab 的 DR 不用 \verb|EventTermCfg|，而是任务的 \verb|DomainRandConfig|（dataclass，乘性区间）$+$ \verb|dr/manager.py| 的 \verb|DomainRandomizationManager|（UniLab）：\verb|reset| 时 \verb|build_reset_plan| $\to$ 后端 \verb|set_state(randomization=payload)|。质量/摩擦/PD 增益都是内置 reset 项（\verb|randomize_base_mass| / \verb|randomize_ground_friction| / \verb|randomize_kp| / \verb|randomize_kd|，乘性 \verb|*_multiplier_range| 保物理一致，对应 mjlab 的 \verb|operation="scale"|）。但本任务的\emph{气动 DR}（随机 $C_d$、$C_L$，对应本节 \verb|aero_dr|）UniLab 无内置事件，须像 mjlab 的 \verb|randomize_ball_aerodynamics| 一样自定义。
+
+\begin{codebox}[Python]{UniLab：DomainRandConfig 配 DR（注意乘性区间与后端能力门控）}
+# 经 Hydra 写进任务 DomainRandConfig（对照 mjlab EventTermCfg / Isaac randomize_*）：
+env:
+  domain_rand:
+    randomize_base_mass: true
+    added_mass_range: [-0.01, 0.02]        # 球质量扰动（绝对加量，单位 kg）
+    randomize_ground_friction: true
+    ground_friction_multiplier_range: [0.7, 1.3]   # 乘性，保物理一致（≈±30%）
+    randomize_kp: true
+    kp_multiplier_range: [0.8, 1.2]        # 执行器增益 ±20%
+    randomize_kd: true
+    kd_multiplier_range: [0.8, 1.2]
+# 气动 DR（C_d/C_L）UniLab 无内置 → 自己在 update_state 里对球施力时乘随机系数。
+\end{codebox}
+
+\begin{insight}[UniLab 的 DR 受后端能力门控，缺项优雅降级而非报错]\label{ins:rlmc-strike-unilab-dr-gating}
+UniLab 双后端（MuJoCo / Motrix）的 DR 能力\emph{不同}：每后端经 \verb|get_dr_capabilities()| 声明支持的 reset 项（\verb|dr/types.py| 的 \verb|DomainRandomizationCapabilities|，UniLab），MuJoCo 后端支持 11 项（含 \verb|body_inertia| / \verb|dof_armature|），Motrix 基线仅 4 项、按能力追加 \verb|kp/kd/geom_friction/gravity|。\verb|DomainRandomizationManager| 的 \verb|filter_reset_payload| 会\emph{自动剔除}后端不支持的项（打 warning 跳过、不报错）——这是 GPU-sim 框架没有的失败面。对网球任务的含义：若用 Motrix 后端，球的惯量类 DR 可能被静默跳过，须查 warning 日志确认实际生效项。另注：UniLab \emph{无} mjlab 的 \verb|pseudo_inertia|（Cholesky 重构的正定惯量 DR），惯量 DR 不保证扰动后物理合法。
+\end{insight}
+
+\textbf{跨框架一致性验证。}由于 MuJoCo 与 PhysX 接触模型不同（\cref{ch:rlmc-physics}），同样的 friction 值在两引擎中行为可能不同。建议在两框架各做一次 COR 标定（\cref{sec:rlmc-tennis-contact} 方法），确保 DR 范围在两引擎里都产生合理弹跳。\textbf{UniLab 在这点上有一个独到的一等公民设施}：\verb|training/sim2sim.py| 的跨后端契约校验（UniLab）——把一份后端训出的策略拿到另一后端（MuJoCo$\leftrightarrow$Motrix）回放前，\verb|resolve_sim2sim_config()| 会逐字段比对「决定策略行为的字段」，\verb|training.sim2sim_strict=true|（默认）时不兼容直接抛 \verb|CrossBackendIncompatibleError|，把「接触模型/DR 能力不同导致策略行为漂移」前置为编译期错误。这正是本段「两引擎行为可能不同」的工程化关卡，是 mjlab/Isaac Lab（单一引擎）没有的。
+
+\textbf{DR 与 curriculum 联动。}DR 不应在所有 curriculum 阶段都满开，应随推进逐步引入：Stage 0--3（学基本击球）不加 DR，Stage 4--5 引入窄范围，Stage 6--7 用完整范围。实现上可让每个 DR 项带一个 \verb|start_stage| 与线性放大的 \verb|scale|（中心值不变、宽度按 scale 缩放），与 \cref{sec:rlmc-strike-noise} 的噪声联动同理。这与 LATENT「先简单条件建立能力，再用 DR 增强鲁棒」的训练策略一致。
+
+\begin{pitfall}[DR 范围越宽越好]
+\textbf{错误描述}：为「更鲁棒」把每项 DR 拉到 $\pm 60\%$。\\
+\textbf{现象后果}：训练任务过难，策略学到过度保守行为（「什么都不做最安全」）。\\
+\textbf{根本原因}：DR 覆盖范围远超真实不确定性。\\
+\textbf{正确做法}：覆盖真实世界不确定性 $+$ 适量裕量（通常 $\pm 20\%\sim30\%$），并按消融逐项收敛。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[设计]} 为 ball mass 设计 DR 范围。ITF 规定 56.0--59.4\,g，你的范围应比 ITF 更宽还是更窄？为什么？验收标准：给出数值并说明须覆盖标定误差。
+  \item \textbf{[实验]} 运行 DR 消融，绘制「每加一项 DR $\to$ 成功率变化」柱状图。验收标准：指出影响最大的一项。
+\end{enumerate}
+\end{practice}
+
+\noindent{}DR 提升了鲁棒性，但仿真里偶发的极端动作仍可能损坏真机。下一步引入安全约束。
+
+% ════════════════════════════════════════════════════════════════
+\section{约束 RL 与安全设计}
+\label{sec:rlmc-strike-safety}
+
+\paragraph{模块功能与在管线中的位置。}本节给训练循环加上\emph{安全约束}，并配置 TerminationManager（\cref{ch:rlmc-manager}）。约束 PPO 的 Lagrangian 视角在 \cref{ch:rlmc-diag} 已介绍，本节聚焦其在击球任务上的具体 cost 设计、终止语义与推理层安全过滤。
+
+\subsection{动机：为什么 reward penalty 不够}
+
+用 reward penalty（\verb|r -= w * violation|）惩罚不安全动作有一个根本问题：若不安全动作偶尔带来高奖励（极端挥拍恰好碰到球），策略可能学到「冒险挥拍」，因为期望奖励仍为正。仿真里没问题，真机上一次极端动作就可能烧电机。安全约束需要的是\textbf{硬限制}——不是「做了扣分」而是「尽量不允许做」。
+
+\subsection{Lagrangian 约束 PPO}
+
+回顾 \cref{ch:rlmc-diag}：把安全约束优化转成 Lagrangian 对偶问题
+\begin{equation}
+\max_{\pi}\ \min_{\lambda\ge 0}\ J(\pi) - \sum_{k}\lambda_k\bigl(C_k(\pi) - d_k\bigr),
+\label{eq:rlmc-strike-lagrangian}
+\end{equation}
+其中 $C_k$ 是第 $k$ 个约束的 cost，$d_k$ 是其上限，$\lambda_k$ 是对应乘子。
+
+\begin{codebox}[Python]{LagrangianPPOForTennis：增广奖励 + 乘子更新}
+class LagrangianPPOForTennis:
+    def __init__(self, cost_configs):
+        self.costs = cost_configs                       # name, cost_function, limit
+        self.lambdas = {c["name"]: 0.0 for c in cost_configs}
+        self.lambda_lr = 0.005                          # 远小于策略 lr
+
+    def compute_augmented_reward(self, reward, env):
+        augmented = reward.clone()
+        for c in self.costs:
+            augmented -= self.lambdas[c["name"]] * c["cost_function"](env)
+        return augmented
+
+    def update_lambdas(self, avg_costs):
+        for c in self.costs:
+            violation = avg_costs[c["name"]] - c["limit"]
+            self.lambdas[c["name"]] = max(
+                0.0, min(10.0, self.lambdas[c["name"]] + self.lambda_lr * violation))
+
+tennis_safety_constraints = [
+    {"name": "joint_velocity_limit",
+     "cost_function": lambda env: (
+         env.scene["robot"].data.joint_vel.abs()
+         > env.scene["robot"].data.joint_vel_limits * 0.9).float().mean(dim=-1),
+     "limit": 0.05},   # 违规时间步占比 < 5%
+    {"name": "base_tilt_limit",
+     "cost_function": lambda env: (
+         env.scene["robot"].data.projected_gravity_b[:, :2].norm(dim=-1) > 0.5).float(),
+     "limit": 0.02},
+    {"name": "racket_ground_contact",
+     "cost_function": lambda env: env.contact_sensor.detect_contact(
+         geom_a="racket_face", geom_b="court_surface").float(),
+     "limit": 0.0},    # 球拍绝不碰地
+]
+\end{codebox}
+
+\subsection{终止设计：分清 terminated 与 truncated}
+
+\textbf{配置详解。}终止分安全/任务/仿真三类，关键是区分 Isaac Lab/RSL-RL 的两类终止语义。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+类别 & 条件 & \verb|time_out| & 含义 \\
+\midrule
+安全 & robot fall（body height $<0.3$\,m） & False & 倒地，立即终止 \\
+安全 & joint limit severe（$>95\%$ 限位） & False & 接近极限，可能损坏 \\
+安全 & self collision & False & 自碰撞，硬件风险 \\
+安全 & racket hit ground & False & 球拍碰地，球拍损坏 \\
+任务 & ball missed（球停且未接触） & False & 失败 \\
+任务 & ball oob after contact & False & 出界，评估完成 \\
+任务 & ball landed after contact & False & 击球任务完成（真实 MDP 终止） \\
+仿真 & timeout（5\,s） & True & 人为时间截断，value bootstrap \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[击球成功落地是 terminated，不是 truncated]\label{ins:rlmc-strike-termination}
+要分清两类终止语义：\verb|time_out=True| 表示\textbf{人为时间截断}（truncation），进入 \verb|truncated/timeouts| 通道，RSL-RL 据此对最终状态做 value bootstrapping（$V(s_T)\neq 0$，因为真实 MDP 本会继续）；\verb|time_out=False| 表示\textbf{真正的 MDP 终止}（terminated），$V(s_T)=0$。\verb|ball landed after contact| 是单次击球任务的真实终止（球已落地、本回合结束、无后续回报），应设 \verb|time_out=False|；只有 5\,s 上限这种人为截断才用 \verb|time_out=True|。把成功落地错标成 timeout 会混淆终止统计、\verb|is_terminated| 类奖励与价值目标——这正是 \cref{ch:rlmc-diag} 反复强调的「terminated/truncated 不能混」。
+\end{insight}
+
+那「策略会不会为避免 episode 结束而学到不击球」（\cref{ch:rlmc-diag} 的自杀/赖活策略）？正确解法是\emph{奖励设计}——成功击球落入目标区给显著正的 outcome reward，策略自然被引导去击球，而不是靠把成功终止错标成 timeout 来回避。
+
+\begin{codebox}[Python]{mjlab 1.4.0：击球任务终止配置（节选）}
+class TennisStrikeTerminationsCfg:
+    # === 安全终止（terminated，不 bootstrap）===
+    robot_fall = TerminationTermCfg(
+        func=mdp.root_height_below_threshold,
+        params={"minimum_height": 0.3}, time_out=False)
+    self_collision = TerminationTermCfg(
+        func=mdp.illegal_contact,
+        params={"threshold": 1.0,
+                "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=".*")},
+        time_out=False)
+    # === 任务成功结束（terminated）===
+    ball_landed_after_contact = TerminationTermCfg(
+        func=ball_landed_post_contact, time_out=False)
+    # === 时间截断（truncation，value bootstrap）===
+    timeout = TerminationTermCfg(
+        func=mdp.time_out,
+        params={"max_episode_length_s": 5.0}, time_out=True)
+\end{codebox}
+
+\subsection{推理层安全：CBF 过滤器与「放弃」能力}
+
+Lagrangian PPO 提供\emph{训练层}的统计安全保证，但单个 episode 仍可能违约。部署时需\emph{推理层}的逐步保证——控制屏障函数（Control Barrier Function, CBF）。定义安全集 $\mathcal{C}=\{x:h(x)\ge 0\}$，对仿射控制系统 $\dot{x}=f(x)+g(x)u$，CBF 安全条件为
+\begin{equation}
+\underbrace{\tfrac{\partial h}{\partial x}f(x)}_{L_f h} + \underbrace{\tfrac{\partial h}{\partial x}g(x)}_{L_g h}\,u \ \ge\ -\gamma\, h(x),
+\label{eq:rlmc-strike-cbf}
+\end{equation}
+其中 $L_f h$、$L_g h$ 是 Lie 导数，$\gamma>0$ 控制保守程度。直觉：$h$ 大时右侧是大负数、约束很弱（策略自由）；$h$ 接近零时约束变紧（策略被迫调整），如同自适应巡航——车距远时自由加减速、近时自动减速。CBF 的奠基性工作见 Ames 等人对屏障函数与安全关键控制的系统阐述（\cite{ames2017cbf}）。
+
+\begin{codebox}[Python]{CBF 关节限位过滤器（教学简化版）}
+def cbf_joint_limit_filter(action, joint_pos, joint_vel, joint_limits,
+                           dt=0.02, gamma=2.0):
+    """h_lower=q-q_min, h_upper=q_max-q；CBF 简化为速度约束。"""
+    q_min, q_max = joint_limits[:, 0], joint_limits[:, 1]
+    estimated_vel = joint_vel + action[:, 3:] * dt           # 简化：未经 IK 映射
+    vel_lower = -gamma * (joint_pos - q_min)
+    vel_upper = gamma * (q_max - joint_pos)
+    safe_vel = torch.clamp(estimated_vel, min=vel_lower, max=vel_upper)
+    safe_action = action.clone()
+    safe_action[:, 3:] = (safe_vel - joint_vel) / dt
+    return safe_action
+\end{codebox}
+
+\begin{pitfall}[把教学版 CBF 直接搬上真机]
+\textbf{错误描述}：用上方简化 CBF（直接约束关节速度、未经 IK 雅可比映射）做真机安全层。\\
+\textbf{现象后果}：task-space 动作与 joint-space 约束不一致，安全保证失效，仍可能越限。\\
+\textbf{根本原因}：完整 CBF-QP 需要动作到关节速度的映射（$\mathbf{J}^{-1}$），简化版省略了它。\\
+\textbf{正确做法}：真机用基于雅可比的完整 CBF-QP，或至少叠加硬件层 PD 限幅；教学版仅用于演示「在安全边界处最小修正策略」的思想。
+\end{pitfall}
+
+\begin{insight}[三层安全：训练层 + 推理层 + 硬件层]\label{ins:rlmc-strike-three-layer-safety}
+三层安全架构——训练层 Lagrangian（统计约束）$+$ 推理层 CBF（逐步约束）$+$ 硬件层 PD 限幅——就像汽车的三重保护：安全意识培训 $\to$ 自动紧急制动 $\to$ 安全带。每层都可能失效，但三层同时失效的概率极低。CBF 保证安全但不优化性能，奖励负责「学会做什么」、CBF 负责「不允许做什么」，二者互补。
+\end{insight}
+
+\textbf{策略的「放弃」能力。}策略应能决定「这个球不打了」——当感知输出 \verb|validity=False|（球不可达）时回到 ready pose 而非强行挥拍。真实系统中「不可达球」比「危险挥拍」更可接受。可加一个 give-up reward：\verb|validity=False| 时，关节越接近 ready pose 给越高奖励。但其权重不能大于 approach reward，否则触发下方陷阱。
+
+\begin{pitfall}[策略学到「总是放弃」]
+\textbf{错误描述}：give-up reward 权重过大或 miss penalty 过弱。\\
+\textbf{现象后果}：策略发现「不动」比「挥拍但失败」更划算，学会赖在 ready pose。\\
+\textbf{根本原因}：放弃的收益超过了尝试击球的收益。\\
+\textbf{正确做法}：give-up 权重 $<$ approach 权重；确保接近球的行为有持续正奖励。
+\end{pitfall}
+
+\textbf{三框架对比。}Lagrangian 增广在 mjlab/Isaac Lab 都可作为外部 wrapper 挂在 RSL-RL 之外（改 reward），无需改算法核心；终止语义两框架一致（\verb|time_out| 字段）。乘子轨迹诊断见 \cref{ch:rlmc-diag}：$\lambda$ 持续上升 $\Rightarrow$ 约束太紧或任务太难，$\lambda=0$ $\Rightarrow$ 约束太松。
+
+\textbf{UniLab 对照（Lagrangian 同样外挂；终止经 \texttt{TransitionBootstrapContract} 显式区分）。}UniLab 的 PPO 也复用 rsl-rl（\verb|structured_configs.py| 的 \verb|PPOConfig| $+$ \verb|algos/torch/rsl_rl_ppo.py| 的 \verb|FinalObservationAwarePPO|，UniLab），所以本节的 \verb|LagrangianPPOForTennis| 增广奖励同样可作外部 wrapper 挂上去、不动算法核心——这一条在三框架完全通用。差异在终止语义的\emph{表达方式}：UniLab 没有 \verb|TerminationTermCfg| 类，\verb|terminated| 直接在 env 的 \verb|update_state()| 里算（如摔倒 \verb|gravity[:,2]<=0.5|），超时 \verb|truncated| 由基类 \verb|_compute_truncated| 按 \verb|max_episode_steps| 自动算；\verb@done = terminated | truncated@，而「自举该用哪个 next-obs、超时 vs 失败」被固化成 \verb|base/final_observation.py| 的 \verb|TransitionBootstrapContract|（UniLab）——它的 \verb|timeout_terminal_mask| 与失败终止 mask 正是 mjlab/Isaac Lab \verb|time_out| 字段的显式契约版。所以本章「成功落地是 terminated、5\,s 上限是 truncated」（\cref{ins:rlmc-strike-termination}）在 UniLab 里落地为：成功落地进失败/真终止 mask（$V=0$），5\,s 上限进 \verb|timeout_terminal_mask|（value bootstrap）。
+
+\begin{codebox}[Python]{UniLab：update\_state 里直接算终止 + 契约区分超时/真终止}
+def update_state(self, state):
+    ...                                          # 算 obs / reward
+    fell    = self._backend.get_sensor_data("upvector")[:, 2] <= 0.5
+    landed  = self._post_contact_landed()        # 成功击球后落地 = 真 MDP 终止（V=0）
+    terminated = fell | landed
+    # 超时 truncated 由基类 _compute_truncated 自动算；
+    # TransitionBootstrapContract 用 timeout_terminal_mask 让超时帧 bootstrap、真终止帧不 bootstrap
+    return state.replace(terminated=terminated)  # done = terminated | truncated（基类合并）
+\end{codebox}
+
+\begin{pitfall}[Lagrange 乘子 lambda\_lr 设太大]
+\textbf{错误描述}：把 \verb|lambda_lr| 设成与策略 lr 同量级。\\
+\textbf{现象后果}：乘子剧烈振荡，策略在「满足约束」与「完成任务」间反复横跳，曲线锯齿。\\
+\textbf{根本原因}：对偶变量更新太快，与策略更新失配。\\
+\textbf{正确做法}：\verb|lambda_lr| 取策略 lr 的 $1/10\sim1/100$（参见 PID-Lagrangian 思路）。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[设计]} 为击球任务设计完整终止列表（$\ge 8$ 项），区分安全/任务/仿真三类，标注 \verb|time_out| 与优先级。验收标准：成功落地项设为 \verb|time_out=False| 并说明理由。
+  \item \textbf{[编程]} 实现 \verb|LagrangianPPOForTennis| 并接入 PPO 循环，在 WandB 监控 $\lambda$ 轨迹。验收标准：能解释 $\lambda$ 持续上升意味着什么、如何调整。
+  \item \textbf{[推导]} 对一维系统 $\dot{q}=u$，推导关节限位 $h(q)=(q_{\max}-q)(q-q_{\min})$ 的 CBF 条件 $\dot{h}\ge -\gamma h$，并化为对 $u$ 的约束。验收标准：写出 $\dot h$ 表达式与最终对 $u$ 的不等式。
+\end{enumerate}
+\end{practice}
+
+\noindent{}安全约束保证了「不做危险动作」。但还有一个前提性问题：控制频率本身决定了策略能否「看到」击球窗口。
+
+% ════════════════════════════════════════════════════════════════
+\section{实时性与频率分离}
+\label{sec:rlmc-strike-freq}
+
+\paragraph{模块功能与在管线中的位置。}本节分析击球控制的时间约束并设计频率。这不是「性能优化」，而是「任务能否完成」的前提——它决定了 \cref{sec:rlmc-strike-mdp} 的 MDP 在物理上是否可解。
+
+\subsection{频率决定策略能否「看到」击球窗口}
+
+本章开头 Quick Start 的算术已给出结论：球速 30\,m/s、控制 50\,Hz 时，球单步移动 0.60\,m，而球拍有效直径仅 $\sim 0.30$\,m——\textbf{击球窗口不到一个控制步}。策略必须\emph{提前}开始挥拍，而非「看到球到了再反应」。这就像棒球击球手——不是看到球进好球带才挥棒，而是在投手出手后 0.2\,s 内就决定怎么挥。
+
+\begin{insight}[策略在球飞来的零点几秒内规划整套动作]\label{ins:rlmc-strike-plan-ahead}
+策略不是在「击球那一刻」做决策，而是在球飞来的 0.3--0.5\,s 内规划整个击球动作。可用决策步数 $\approx$ 反应窗口 $\times$ 控制频率：0.3--0.5\,s $\times$ 50\,Hz $\approx$ 15--25 步。这就是为什么 actor 观测里必须含 \verb|time_to_impact|（\cref{sec:rlmc-strike-mdp}）——没有它，策略无法判断「现在该挥到哪个阶段」，只能记住固定时刻挥拍而无法泛化。
+\end{insight}
+
+\subsection{前沿系统的频率配置对比}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+系统 & 物理频率 & 控制频率 & decimation & 理由 \\
+\midrule
+LATENT & 2000\,Hz & 50\,Hz & 40 & 球拍-球接触需高频仿真 \\
+HITTER & \pz{未公开} & 50\,Hz & — & 论文（arXiv:2508.21043）明示 Isaac Lab、策略 50\,Hz、动捕 360\,Hz，未公开物理频率/decimation \\
+Phybot & \pz{未公开} & 50\,Hz & — & 论文（arXiv:2511.11218）明示策略 50\,Hz、低层 PD 500\,Hz（故 PD 侧 decimation 10）、动捕 210\,Hz，物理步长未公开 \\
+当前 Phase 1（\cref{ch:rlmc-tennisenv}） & 500\,Hz & 100\,Hz & 5 & 纯弹道、无接触 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Phase 1 $\to$ strike task 的频率升级（配置详解）。}\cref{ch:rlmc-tennisenv} 的 \verb|timestep=0.002|（500\,Hz）对纯弹道足够，但对球拍-球接触不足。strike task 应升到 \verb|timestep=0.0005|（2000\,Hz，对齐 LATENT）或 \verb|0.001|（1000\,Hz），对应 \verb|decimation=40| 或 \verb|20|（保持 50\,Hz 控制）。
+
+\begin{codebox}[Python]{strike task 仿真配置：从 Phase 1 升级}
+class TennisStrikeSimCfg:
+    # Phase 1（弹道验证）：timestep=0.002 (500Hz), decimation=5 (100Hz)
+    timestep = 0.0005    # 2000 Hz（LATENT 配置，接触解算稳定）
+    decimation = 40      # 控制频率 = 2000/40 = 50 Hz
+    # 仿真步数翻 4 倍，但 env step 不变（每个 policy step 跑 40 个仿真步）
+    # 4096 环境 × 40 仿真步 ≈ 每 rollout step 16 万仿真步，单 GPU 约 50-100 ms（可接受）
+\end{codebox}
+
+\subsection{频率分离架构}
+
+高速接触需要频率分离：高层策略低频更新击球计划，低层 controller 高频追踪。这与腿足控制 MPC（10--100\,Hz）$+$ WBC（500--1000\,Hz）的分层一致（\cref{ch:rlmc-humanoidwbc}）。
+
+\begin{codebox}[Python]{频率分离：每仿真步追踪，每 decimation 步更新策略}
+class TennisFrequencySeparation:
+    def __init__(self, policy, ik_solver, predictor):
+        self.policy, self.ik_solver, self.predictor = policy, ik_solver, predictor
+        self.pd_controller = PDController()       # 高频 PD 追踪
+        self.current_action = None
+        self.decimation = 40                      # 2000/50
+
+    def step_physics(self, robot_state, sim_step):
+        # 每 40 个仿真步更新一次高层策略
+        if sim_step % self.decimation == 0:
+            obs = self._build_observation(robot_state)
+            self.predictor.step(obs)
+            self.current_action = self.policy.act(obs)
+        # 每个仿真步都用 PD 追踪 IK 解出的关节目标
+        if self.current_action is not None:
+            joint_targets = self.ik_solver.solve(self.current_action, robot_state)
+            return self.pd_controller.compute(
+                target=joint_targets,
+                current_pos=robot_state.joint_pos,
+                current_vel=robot_state.joint_vel)
+        return torch.zeros_like(robot_state.joint_pos)
+\end{codebox}
+
+\subsection{延迟预算}
+
+从球发出到机器人执行，每个环节都有延迟。仿真里全为 0，真机则累积可观：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+环节 & 真机（动捕） & 真机（视觉） \\
+\midrule
+感知采集 & 3\,ms & 16--33\,ms \\
+状态估计（EKF） & $<1$\,ms & $<1$\,ms \\
+轨迹预测 & 1--2\,ms & 1--2\,ms \\
+策略推理 & 2--5\,ms & 2--5\,ms \\
+通信 + 执行器响应 & 6--23\,ms & 6--23\,ms \\
+\textbf{总延迟} & \textbf{$\sim 15$--35\,ms} & \textbf{$\sim 30$--80\,ms} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+球速 30\,m/s $+$ 总延迟 50\,ms $\to$ 延迟位置误差 \textbf{1.5\,m}——远超球拍有效范围。这就是为什么 \cref{ch:rlmc-tennisenv} 的延迟补偿和本章 \cref{sec:rlmc-strike-noise} 的延迟注入如此重要：延迟不补偿，策略永远挥晚。
+
+\begin{pitfall}[提高仿真频率时忘记调整 decimation]
+\textbf{错误描述}：把 \verb|timestep| 从 0.002 降到 0.0005 却仍用 \verb|decimation=5|。\\
+\textbf{现象后果}：控制频率变成 400\,Hz，policy 被调用太频繁，单次 rollout 覆盖的物理时间太短，训练效率骤降。\\
+\textbf{根本原因}：控制频率 $=$ 物理频率 $/$ decimation，两者须同步调整。\\
+\textbf{正确做法}：\verb|timestep=0.0005| 配 \verb|decimation=40|，保持 50\,Hz 控制。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[估算]} policy 50\,Hz $+$ 球速 35\,m/s，一个 step 球移动多少？与球拍半径 0.15\,m 比较。若球从 $x=11$\,m 飞到 $x=-8$\,m（约 19\,m），50\,Hz 下策略有多少决策步？验收标准：给出三个数值。
+  \item \textbf{[设计]} 设计从 Phase 1（500\,Hz/100\,Hz）到 strike task（2000\,Hz/50\,Hz）的升级计划。验收标准：列出所有需改参数与预期性能影响。
+\end{enumerate}
+\end{practice}
+
+\noindent{}频率设计保证了任务物理可解。最后把所有零件组装成可运行的训练管线与部署链路。
+
+% ════════════════════════════════════════════════════════════════
+\section{完整管线集成与部署收尾}
+\label{sec:rlmc-strike-integration}
+
+\paragraph{模块功能与在管线中的位置。}本节把前面所有组件（观测/动作/奖励/curriculum/噪声/DR/约束/频率）组装成一个可运行的 strike task 与训练循环，并接上 \cref{ch:rlmc-sim2real} 的部署链路。这是本章最重要的工程产出。
+
+\subsection{完整环境配置}
+
+\begin{codebox}[Python]{TennisStrikeEnvCfg：组装所有模块（节选）}
+class TennisStrikeEnvCfg(ManagerBasedRlEnvCfg):
+    scene = TennisStrikeSceneCfg(
+        court=EntityCfg(spawn=MjcfFileCfg(mjcf_path="tennis_court.xml")),
+        ball=EntityCfg(spawn=BallSpecCfg()),
+        robot=ArticulationCfg(
+            spawn=MjcfFileCfg(mjcf_path="unitree_g1_with_racket.xml"),
+            init_state=ArticulationCfg.InitialStateCfg(pos=(-8.0, 0.0, 0.0)),
+        ),
+        num_envs=4096, env_spacing=30.0)
+
+    observations = TennisStrikeObsCfg()        # §击球 MDP
+    actions = TennisStrikeActionsCfg()         # base_vel + DifferentialIK
+    rewards = {                                # §Reward（一个组合 term）
+        "staged": RewardTermCfg(func=compute_total_reward, weight=1.0),
+        "give_up": RewardTermCfg(func=compute_give_up_reward, weight=0.2),
+    }
+    terminations = TennisStrikeTerminationsCfg()  # §安全设计
+    events = TennisDREventCfg()                    # §DR
+    commands = {"launch": LaunchCommandCfg(speed_range=(20.0, 45.0))}  # 由 curriculum 动态调
+
+    # §频率分离：2000 Hz 物理 / 50 Hz 控制
+    sim = SimCfg(timestep=0.0005, render_interval=4, gravity=(0.0, 0.0, -9.81))
+    decimation = 40
+    episode_length_s = 5.0
+\end{codebox}
+
+\subsection{训练循环}
+
+\begin{codebox}[Python]{train\_tennis\_strike：curriculum + 感知 + Lagrangian + PPO}
+def train_tennis_strike(cfg, max_iterations=10000):
+    env = ManagerBasedRlEnv(cfg)
+    perception = TennisPerceptionPipeline(cfg.scene.num_envs, env.device)  # Ch 环境
+    curriculum = TennisCurriculumManager(cfg, cfg.scene.num_envs, env.device)
+    lagrangian = LagrangianPPOForTennis(tennis_safety_constraints)
+    agent = PPOAgent(                                  # RSL-RL
+        actor_critic_cfg=ActorCriticCfg(actor_hidden_dims=[256, 256, 128],
+                                        critic_hidden_dims=[256, 256, 128]),
+        algorithm_cfg=PPOCfg(learning_rate=3e-4, num_learning_epochs=5,
+                             num_mini_batches=4, clip_param=0.2,
+                             entropy_coef=0.005, desired_kl=0.01,
+                             gamma=0.99, lam=0.95))
+    for it in range(max_iterations):
+        env.update_command_ranges(curriculum.get_current_params())  # curriculum 调发球
+        rollout = collect_rollout(env, agent, perception, lagrangian)
+        train_info = agent.update(rollout)
+        lagrangian.update_lambdas(compute_average_costs(rollout))    # 更新乘子
+        curriculum.update(compute_metrics(rollout))                 # 成功率门控
+        if it % 10 == 0:
+            log_to_wandb(it, train_info, curriculum, lagrangian)
+    return agent
+\end{codebox}
+
+\textbf{代码走读。}训练循环把四件事编织在一起：curriculum 改发球范围（决定\emph{看什么样的球}）、感知管线产出可部署观测、Lagrangian 增广奖励（注入安全约束）、PPO 更新策略。注意顺序——先用当前 curriculum 参数收 rollout，再用同一批 rollout 同时更新策略、乘子、curriculum，保证三者基于一致的数据快照。
+
+\subsection{部署：复用 sim2real 链路}
+
+训练产出的只是函数 $\mathbf{a}=\pi(\mathbf{o})$，真机需要的是闭环系统。本章不重复 \cref{ch:rlmc-sim2real} 的 ONNX 导出、sim2sim、安全链路、分级验收，只补\emph{网球特有}的部署收尾。
+
+\textbf{WoCoCo 风格部署安全包装。}部署端在策略输出后、执行前串一条安全链：缩放（action rescaler $\beta$，初期 0.3 逐步到 1.0）$\to$ 速率限制 $\to$ Butterworth 低通滤波 $\to$ 速度限制。\pz{截止频率 4\,Hz 取自 WoCoCo 论文原文（其对 PD 目标施加 4\,Hz 带宽 Butterworth、PD 200\,Hz / 策略 50\,Hz），4\,Hz 约为本书 50\,Hz 策略频率的 8\%；阶数 WoCoCo 未明示，下方代码按常见的 2 阶取，具体阶数与截止建议按真机电机带宽现场标定。}
+
+\begin{codebox}[Python]{部署安全包装：rescale - 限速率 - 滤波 - 限速}
+class DeploySafetyWrapper:
+    def __init__(self, num_joints):
+        self.filter = ButterworthFilter(order=2, cutoff=4.0, fs=50.0,
+                                        num_joints=num_joints)
+        self.beta = 0.3                 # action rescaler，逐步提到 1.0
+        self.max_joint_vel = 5.0        # rad/s（保守）
+        self.max_action_rate = 2.0      # rad/step
+        self.prev_action = None
+
+    def apply(self, raw_action):
+        action = raw_action * self.beta
+        if self.prev_action is not None:
+            delta = torch.clamp(action - self.prev_action,
+                                -self.max_action_rate, self.max_action_rate)
+            action = self.prev_action + delta
+        action = self.filter.filter(action)
+        action = torch.clamp(action, -self.max_joint_vel, self.max_joint_vel)
+        self.prev_action = action.clone()
+        return action
+\end{codebox}
+
+\textbf{部署前检查清单（运行验证）。}综合 \cref{ch:rlmc-diag,ch:rlmc-sim2real} 与本章：仿真 contact rate $>80\%$、over-net rate $>60\%$；动作频谱 90\% 能量在电机带宽内；ONNX 与 PyTorch 输出 max diff $<10^{-5}$；\verb|joint_names| 与真机 SDK 逐一比对一致；mjlab 与 Isaac Lab sim2sim 行为一致；$\beta=0.3$ 低速无异常振动后再逐步提速。
+
+\begin{insight}[球类 RL 的胜负手在工程，不在算法]\label{ins:rlmc-strike-engineering}
+球类运动 RL 的核心难点不在算法（PPO 足够），而在工程设计。本章的 staged reward、curriculum、DR、约束、频率分离、部署包装都不改变 PPO 的数学，但决定了 PPO 能否学到有用策略并安全落地。算法是引擎，工程设计是方向盘和油门——没有方向盘的引擎只会原地打转。LATENT 用的就是 PPO，靠 latent action $+$ 自适应 DR 达到 90.90\% 真机正手成功率；这印证了一条经验：在机器人 RL 中，奖励/课程/DR/安全的边际收益通常大于算法创新。
+\end{insight}
+
+\textbf{从网球迁移到其他高速交互任务（本质洞察）。}网球项目不是「一个特殊场景」，而是机器人感知控制的压力测试。下表的模式可迁移到乒乓球、羽毛球、足球乃至工业高速对位。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+模式 & 网球中的体现 & 可迁移到 \\
+\midrule
+环境即数据协议 & 坐标系/接触参数/终止语义 & 任何多模块系统 \\
+分层感知 & 真值 $\to$ EKF $\to$ predictor & 任何有噪声传感器的系统 \\
+staged reward & approach $\times$ timing $\times$ contact $\times$ outcome & 任何稀疏奖励任务 \\
+课程门控 & 静态 $\to$ 低速 $\to$ 全速 $\to$ 有噪声 & 任何从简到难的训练 \\
+DR 逐项引入 & 先固定 $\to$ 逐项加噪 $\to$ 全噪声 & 任何需 sim2real 的系统 \\
+privileged critic & critic 看真值、actor 看传感器 & 任何 teacher-student 任务 \\
+部署安全包装 & Butterworth $+$ action rescaler & 任何真机部署 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[综合]} 画出从 \verb|LaunchCommand| 到最终 \verb|joint_targets| 的数据流图，标注每个模块的输入/输出/频率/关键参数。验收标准：覆盖 \cref{ch:rlmc-tennisenv} 环境、感知、本章控制三段。
+  \item \textbf{[设计]} 把本项目从网球迁移到乒乓球，哪些模块要改、哪些可复用？验收标准：分别就球场尺寸、球速范围、机器人形态给出结论。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\label{sec:rlmc-strike-myths}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{6.2cm}p{8.0cm}@{}}
+\toprule
+误解 & 正确理解 \\
+\midrule
+IK 到点就是击球 & 需同时满足位置、速度、姿态、时机四个约束（\cref{ins:rlmc-strike-timed-contact}） \\
+纯稀疏 reward 也能学 & 3--5\,ms 接触窗口 $+$ 30\,m/s 球速 $\to$ PPO 几乎探索不到成功，需 staged reward \\
+先练手臂再加底盘 & 底盘是把不可达球拉回可达域的关键控制变量（\cref{ins:rlmc-strike-base}） \\
+curriculum 越多阶段越好 & 八阶段已覆盖完整过渡，更多阶段 $=$ 更多超参数 \\
+DR 应训练一开始就加 & 先在固定环境学会击球，再加 DR 增强鲁棒（\cref{ins:rlmc-strike-dr-essence}） \\
+reward penalty 可替代安全约束 & Lagrangian PPO 提供更可靠的约束满足（\cref{eq:rlmc-strike-lagrangian}） \\
+仿真 95\% $=$ 真机 95\% & sim2real gap 通常导致 20\%--50\% 性能下降；且 sim/real 的成功判据常不同 \\
+算法创新比工程设计重要 & PPO 足够，奖励/课程/DR/安全才是真正的杠杆（\cref{ins:rlmc-strike-engineering}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[「先练手臂再加底盘」为什么是错的]\label{ins:rlmc-strike-armfirst}
+arm-only 策略只能打正面来球；一旦加入底盘，策略需\emph{重新}学习 base-arm 协调，因为底盘移动会改变 arm base frame 与 IK 目标（\cref{sec:rlmc-strike-essence} 原因二）。正确做法是从第一版就把 base command 放入 action space，只需在早期 curriculum 阶段收窄其活动范围即可。这与「分阶段加难度」并不矛盾——加难度指的是发球参数，而非动作维度的有无。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\addcontentsline{toc}{section}{小结}
+\label{sec:rlmc-strike-summary}
+
+本章把「打网球」逐层重写成 PPO 可学、可约束、可部署的形态：从 \cref{ins:rlmc-strike-timed-contact} 的「定时接触」本质出发，经 MDP 分层（\cref{sec:rlmc-strike-mdp}）、staged reward 乘法组合（\cref{ins:rlmc-strike-multiplicative}）、八阶段门控 curriculum（\cref{sec:rlmc-strike-curriculum}）、噪声与 DR（\cref{ins:rlmc-strike-noise-reward,ins:rlmc-strike-dr-essence}）、三层安全（\cref{ins:rlmc-strike-three-layer-safety}）、频率分离（\cref{ins:rlmc-strike-plan-ahead}），最终在 \cref{sec:rlmc-strike-integration} 组装为完整管线。贯穿全章的洞察是 \cref{ins:rlmc-strike-engineering}：胜负手在工程，不在算法。
+
+\paragraph{术语速查。}
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 含义 \\
+\midrule
+定时接触 & 带速度和姿态约束、须在窄时间窗内完成的接触控制 \\
+staged reward & 把稀疏目标拆成 approach/timing/contact/outcome/reg 的分层塑形奖励 \\
+乘法组合 & 用 $a\cdot(1+b)\cdots$ 结构强制「前一层为零则总奖励为零」的层级优先 \\
+DifferentialIK & 用 DLS 伪逆把 task-space 增量映射为关节增量的 action transform \\
+DLS & damped least squares，$\mathbf{J}^{\mathrm{T}}(\mathbf{J}\mathbf{J}^{\mathrm{T}}+\lambda^2\mathbf{I})^{-1}$，奇异处稳定 \\
+课程门控 & 按成功率（非步数）滑动平均推进/回退训练难度 \\
+terminated/truncated & 真实 MDP 终止（$V=0$）vs 人为时间截断（value bootstrap） \\
+CBF & 控制屏障函数，推理层逐步安全过滤 \\
+decimation & 物理频率 $/$ 控制频率，决定每个 policy step 跑多少仿真步 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+\begin{center}
+\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+编号 & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 击球本质 $=$ 带速度+姿态约束的定时接触 & \cref{sec:rlmc-strike-essence} & 中 \\
+2 & MDP 三层状态（真值/teacher/student） & \cref{sec:rlmc-strike-mdp} & 高 \\
+3 & task-space IK 动作（base\_vel 3D $+$ racket 6D） & \cref{sec:rlmc-strike-mdp} & 高 \\
+4 & 五类 staged reward & \cref{sec:rlmc-strike-reward} & 高 \\
+5 & 乘法奖励结构强制层级优先 & \cref{sec:rlmc-strike-reward} & 高 \\
+6 & 事件缓冲记录瞬时接触 & \cref{sec:rlmc-strike-reward} & 中 \\
+7 & 八阶段成功率门控 curriculum & \cref{sec:rlmc-strike-curriculum} & 高 \\
+8 & 自适应容忍度 / 能力解耦两种替代课程 & \cref{sec:rlmc-strike-curriculum} & 高 \\
+9 & 噪声进 obs、奖励用真值 & \cref{sec:rlmc-strike-noise} & 中 \\
+10 & 五类 sim2real gap & \cref{sec:rlmc-strike-dr} & 高 \\
+11 & DR 逐项引入与消融 & \cref{sec:rlmc-strike-dr} & 高 \\
+12 & Lagrangian 约束 PPO & \cref{sec:rlmc-strike-safety} & 高 \\
+13 & terminated/truncated 终止语义 & \cref{sec:rlmc-strike-safety} & 中 \\
+14 & 三层安全（训练/推理/硬件） & \cref{sec:rlmc-strike-safety} & 高 \\
+15 & 频率分离与延迟预算 & \cref{sec:rlmc-strike-freq} & 中 \\
+16 & 完整管线集成与部署包装 & \cref{sec:rlmc-strike-integration} & 高 \\
+17 & 工程 $>$ 算法 & \cref{sec:rlmc-strike-integration} & 高 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-strike-further}
+
+\begin{itemize}
+  \item \textbf{LATENT}（arXiv:2603.12686，\cite{zhang2026latent}）——从不完美人类动捕学人形网球；教 latent action space $+$ wrist correction 与最完整的网球 sim2real 消融。代码 \verb|github.com/GalaxyGeneralRobotics/LATENT|。
+  \item \textbf{HITTER}（arXiv:2508.21043，\cite{he2025hitter}）——人形乒乓球，model-based planner $+$ RL 全身控制器，真机对人 106 连续回合；教解析弹道规划与全身协调的分层架构。
+  \item \textbf{PACE}（arXiv:2509.21690，\cite{tennis_pace2025}）——人形乒乓球，prediction augmentation；教「物理 predictor 算 reward、learned predictor 喂 obs」的双通道设计。
+  \item \textbf{Phybot 羽毛球}（arXiv:2511.11218，\cite{phybot2025badminton}）——无 motion prior 的多阶段 RL；教 footwork$\to$swing$\to$task 的能力解耦课程。
+  \item \textbf{KungfuBot}（arXiv:2506.12851，NeurIPS'25，\cite{xie2025kungfubot}）——高动态全身技能；教 bi-level 自适应跟踪容忍度课程。
+  \item \textbf{WoCoCo}（arXiv:2406.06005，CoRL'24，\cite{zhang2024wococo}）——序列接触全身控制；教接触阶段分解奖励与部署滤波。
+  \item \textbf{Tobin et al. 2017}（arXiv:1703.06907，\cite{tobin2017domainrand}）——Domain Randomization 开山之作；理解 \cref{ins:rlmc-strike-dr-essence} 的源头。
+  \item \textbf{Achiam et al. 2017 CPO}（ICML，\cite{achiam2017constrained}）——Constrained Policy Optimization；约束 RL 的代表性方法，与 \cref{eq:rlmc-strike-lagrangian} 的 Lagrangian 路线互补。
+  \item \textbf{Ames et al. 2017}（\cite{ames2017cbf}）——控制屏障函数与安全关键控制；\cref{eq:rlmc-strike-cbf} 的理论基础。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-strike-troubleshoot}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.0cm}p{3.2cm}p{4.8cm}l@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+球拍追不上球 & curriculum 太难 / base 没动 & 降速度；查 base action；查 approach $\sigma$ & \cref{sec:rlmc-strike-reward,sec:rlmc-strike-curriculum} \\
+碰到球但不过网 & racket 速度不足 / 面法向偏 & 记录接触时 racket vel；加 orientation reward；查 IK damping & \cref{sec:rlmc-strike-reward} \\
+contact rate 升但摔倒 & safety penalty 弱 & 增大 joint limit penalty；加严 safety termination；用 Lagrangian PPO & \cref{sec:rlmc-strike-safety} \\
+reward 升但 contact 不变 & 刷 approach shaping & 分项记录 reward；增 contact 权重；减 approach $\sigma$ & \cref{sec:rlmc-strike-reward} \\
+固定速度成功随机失败 & 策略记住固定时刻挥拍 & 查 actor obs 含 time\_to\_impact；held-out eval；加宽 curriculum & \cref{sec:rlmc-strike-curriculum,sec:rlmc-strike-freq} \\
+Lagrange $\lambda$ 持续上升 & 约束太紧或任务太难 & 放宽 cost limit；查 curriculum 难度；降 lambda\_lr & \cref{sec:rlmc-strike-safety} \\
+DR 后成绩断崖下降 & DR 范围太宽 & 缩小范围；逐项排查；查 reward 对该参数敏感性 & \cref{sec:rlmc-strike-dr} \\
+真机比仿真差 50\%+ & DR 不够 / 接触模型 gap & 分析失败 case；增大 DR；查 Butterworth 滤波 & \cref{sec:rlmc-strike-integration} \\
+关节角单步跳变 & IK damping 太低 & 调大 lambda\_val；确认 IK 目标是 face site & \cref{sec:rlmc-strike-mdp} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-strike-versions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+组件 & 锚定版本 & 本章用到的关键 API/类 \\
+\midrule
+mjlab & 1.4.0 & \verb|DifferentialIKActionCfg|、\verb|EventTermCfg|、\verb|ObservationTermCfg(noise=...)| \\
+Isaac Lab & 2.x & \verb|DifferentialInverseKinematicsActionCfg|、\verb|DifferentialIKControllerCfg| \\
+MuJoCo Warp & 随 mjlab 1.4.0 & GPU 接触解算（2000\,Hz） \\
+RSL-RL & 随框架 & \verb|PPOAgent|、\verb|time_outs| value bootstrap \\
+UniLab & commit 99936e08 & \verb|LocomotionBaseEnv.apply_action|（关节位置目标）、\verb|run_reward_dispatch|、\verb|DomainRandomizationManager|、\verb|TransitionBootstrapContract| \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{finenote}
+本章 API 名、版本号与论文数值均经实跑introspection（gpufree mjlab 1.4.0）+ 官方文档 + arXiv 正文核对：mjlab \texttt{DifferentialIKActionCfg} 的 DLS 参数是\emph{扁平字段}（\texttt{damping}/\texttt{delta\_pos\_scale}/\texttt{delta\_ori\_scale}/\texttt{max\_dq}，按 \texttt{actuator\_names}$+$\texttt{frame\_name} 选目标，不嵌套 \texttt{controller=}）；mjlab DR 在 \texttt{mjlab/envs/mdp/dr/} 包（\texttt{dr.body\_mass}/\texttt{geom\_friction}/\texttt{pd\_gains}，参数 \texttt{ranges}$+$\texttt{operation}），\emph{非} Isaac 的 \texttt{randomize\_rigid\_body\_*}；mjlab 观测 term 真名 \texttt{ObservationTermCfg}（\texttt{ObsTermCfg} 不存在），\texttt{enable\_corruption} 是\emph{组级}开关。Isaac Lab 2.x 侧 \texttt{DifferentialInverseKinematicsActionCfg}/\texttt{DifferentialIKControllerCfg}(\texttt{ik\_method="dls"},\texttt{ik\_params=\{"lambda\_val":...\}})、\texttt{randomize\_rigid\_body\_mass}(\texttt{operation="abs"}) 均为真实 API。论文侧 LATENT/HITTER/PACE/Phybot/KungfuBot/WoCoCo 的编号与归属、LATENT 真机消融 90.90\%/77.78\% 与去 DR/去噪声的降幅、HITTER 106 连续回合、PACE「物理 predictor 算 reward $+$ learned predictor 喂 obs」、KungfuBot bi-level 自适应容忍度（NeurIPS'25）、Phybot footwork$\to$swing$\to$task 三阶段均已逐条核实。无法从公开来源直接确认的细节（WoCoCo 部署 Butterworth 参数、把 KungfuBot 自适应机制套用到二值击球任务的可行性、HITTER 与 Phybot 的\emph{物理仿真频率}——两文均只明示 50\,Hz 控制频率）已就地以 \texttt{\textbackslash rebuilt} / \texttt{\textbackslash pz} 标注，并汇入交付的 claimsToVerify 清单。UniLab 实现槽位已据实装框架（commit 99936e08，MuJoCoUni 3.8.0 / MotrixSim 0.8.2，源码 \texttt{src/unilab}）补齐：其与 mjlab/Isaac Lab 的关键差异是\emph{非 Manager-Based}（动作固定为关节位置目标残差、奖励用标量字典 $+$ \texttt{run\_reward\_dispatch} 派发表、终止经 \texttt{TransitionBootstrapContract}），故 task-space IK action、成功率门控 curriculum、气动 DR 在 UniLab 里均无现成对应类、须自实现，本章已逐处诚实标注而非编造等价 API。
+\end{finenote}

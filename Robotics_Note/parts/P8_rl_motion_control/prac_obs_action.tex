@@ -1,0 +1,1056 @@
+\chapter{观测与动作空间设计：从 MDP 到 ObservationManager}\label{ch:rlmc-obsact}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的入口章。
+%  主线：算法/理论先行 —— 先讲「观测在 POMDP 意义下是什么、为何这样设计」，
+%  再落到「在 Isaac Lab 的 ObservationManager / mjlab 等价物里如何接线」。
+%  理论引导，实践是其兑现 (payoff)。
+%  源稿 RL运控/Ch05_观测与动作设计.md (实践偏重) 已按本主线重构，
+%  并对 Isaac Lab / mjlab 关键 API 做了联网核对（见各 \rebuilt / \pz 标注）。
+% ════════════════════════════════════════════════════════════════
+
+强化学习运动控制（RL motion control）这一部把前几部的强化学习\emph{理论}——马尔可夫决策过程、贝尔曼方程、策略梯度、演员-评论家——落到一台真实（或仿真）的腿足/机械臂机器人上。这条落地之路的第一道门，不是奖励函数，而是\textbf{观测}（observation）与\textbf{动作}（action）：观测决定了策略\emph{能看见什么}，动作决定了策略\emph{能改变什么}。二者共同写下了智能体与环境之间的接口契约。若这道接口设计有误，后续的奖励塑形、课程学习、PPO 调参全部沦为补救。
+
+本章遵循全书「先动机、先理论，后工程」的次序：先从 MDP/POMDP 的算法视角把观测与动作\emph{是什么}讲清楚，给出腿足与操作机器人常见的观测族（observation families）与四条设计原则；再转入工程实践——如何在 Isaac Lab 的 \verb|ObservationManager|（以 \verb|ObsTerm|/\verb|ObsGroup| 描述）与 mjlab 的等价配置中，把这些观测真正接到你的机器人上：归一化、裁剪、噪声注入、历史堆叠、特权（privileged）与策略（policy）分组——每一步实践都回指到激发它的那条理论。动作空间同理：关节位置目标 vs.\ 力矩 vs.\ 增量、缩放、裁剪、其上的 PD 控制。\textbf{理论领路，实践兑现}。
+
+\begin{practice}[前置自测：答不出 $\ge 3$ 题，建议先回「强化学习理论部」复习]
+\begin{enumerate}
+  \item 完全可观测的 MDP 与部分可观测的 POMDP，策略输入有何本质区别？
+  \item 评论家（critic）可以看到演员（actor）看不到的信号吗？为什么这样不破坏部署？
+  \item 神经网络输出的「原始动作」（raw action）有物理单位吗？它如何变成关节力矩？
+  \item 把仿真里的接触力\emph{真值}喂给 actor，训练曲线很好，为什么部署仍会失败？
+  \item 速度跟踪任务里若 actor 看不到速度命令（command），策略会学成什么样？
+  \item 观测历史（history）堆叠 $k$ 帧，展平后维度如何变化？代价是什么？
+  \item 真实四足机器人能直接测得机体\emph{线速度} $\mathbf v_{\text{base}}$ 吗？若不能，有哪些替代？
+\end{enumerate}
+\end{practice}
+
+\textbf{本章目标}：学完本章，你应当能够：(1) 从 POMDP 视角解释观测设计，区分「部署可得信号」与「训练特权信号」；(2) 用四条原则为一个 locomotion 或 manipulation 任务设计 actor/critic 观测分组；(3) 在 Isaac Lab 与 mjlab 中完成对等的观测/动作配置，并理解其处理管线（compute $\to$ noise $\to$ clip $\to$ scale $\to$ history）；(4) 写清楚 raw action $\to$ processed action 的完整变换链并为新机器人选定缩放；(5) 借 HOVER 案例理解多模态、mask 条件观测在统一控制中的作用。
+
+% ════════════════════════════════════════════════════════════════
+\section{算法视角：观测与动作是 MDP 的结构性定义}
+\label{sec:rlmc-obs-mdp}
+
+\subsection{为什么从结构而非奖励开始}
+
+许多初学者拿到新任务的第一反应是设计奖励函数。这一直觉源自监督学习的习惯——那里损失函数几乎决定一切，而输入输出格式通常是给定的（图像进、标签出）。但在面向机器人的强化学习中情况截然不同：策略不是静态分类器，而是\emph{闭环控制器}——它的输出（动作）会改变世界状态，进而改变它的下一个输入（观测）。若观测缺少关键信息，策略就像蒙眼开车，无论奖励如何设计都无法安全行驶；若动作空间定义失当，策略就像手脚不协调的运动员，纵使知道目标也无法精确执行。这正是观测与动作必须\emph{先于}奖励确定的原因：它们是 MDP 的\textbf{结构性定义}，奖励只是在这个结构上的优化目标。
+
+这与经典控制工程的系统建模思想一脉相承：你不会先设计控制器、再去想传感器测什么、执行器控什么；你一定是先定下系统的输入输出接口（状态空间模型里的输出 $\mathbf y=\mathbf C\mathbf x$ 与控制 $\mathbf u$），再在这个接口上设计控制律。强化学习的观测/动作正是 MDP 框架下的 $\mathbf y$ 与 $\mathbf u$。
+
+\begin{insight}[观测/动作是「契约」，不是「张量格式」]\label{ins:rlmc-contract}
+观测与动作的本质，不是「输入输出张量取什么形状」的工程细节，而是\textbf{训练系统与部署系统之间的契约}（contract）。actor 观测写下了部署端必须提供的传感器协议；动作的缩放/偏置写下了部署端必须执行的后处理协议。只要契约没写清楚，训练成功就\emph{不等于}控制器可用。本章后半的所有「实践接线」，都是在把这份契约逐项变成可执行的配置代码。
+\end{insight}
+
+\subsection{从 POMDP 看观测设计}
+\label{sec:rlmc-pomdp}
+
+回顾强化学习理论部对马尔可夫决策过程的定义（见 \cref{sec:rl-basic-mdp}）：在完全可观测的 MDP 中，策略 $\pi(a\mid s)$ 以\emph{完整状态} $s$ 为输入。但严格来说，几乎所有机器人强化学习任务都是\textbf{部分可观测马尔可夫决策过程}（Partially Observable MDP, POMDP）：智能体只能观测到状态的一部分
+\begin{equation}
+o_t = h(s_t) + \boldsymbol\epsilon_t,
+\label{eq:rlmc-obs-fn}
+\end{equation}
+其中 $h(\cdot)$ 是\emph{观测函数}，$\boldsymbol\epsilon_t$ 是传感器噪声。这意味着不同的真实状态可能产生相同（或近似）的观测——策略必须在「信息不完整」的条件下决策。
+
+以四足机器人行走为例。完整物理状态 $s$ 含浮动基座的广义位置与速度、所有接触点的力与位置、地形精确几何、关节摩擦系数、空气阻力等，维度极高且大半不可直接测量。而 actor 观测 $o$ 通常只有数十维：机体角速度 $\boldsymbol\omega_{\text{base}}\in\mathbb R^3$、重力在机体系的投影 $\mathbf g_{\text{proj}}\in\mathbb R^3$、关节位置与速度、上一拍动作、速度命令，再加可选的地形高度扫描。大量状态信息被「遮挡」了。
+
+\begin{insight}[最优 POMDP 策略依赖整段历史，而工程上用两种方式近似]\label{ins:rlmc-history}
+POMDP 的经典理论指出，最优策略需基于整段观测历史 $\pi(a_t\mid o_1,o_2,\dots,o_t)$，而非单帧 $o_t$。实践中用两种方式近似这一理想：
+\begin{itemize}
+  \item \textbf{历史缓冲（history buffer）}：把最近 $k$ 帧观测拼接成输入，让 MLP 在固定时间窗上提取时序特征；
+  \item \textbf{循环/注意力网络（RNN / Transformer）}：维护隐状态以压缩任意长度的历史。
+\end{itemize}
+三个框架的 locomotion 模板都默认用 MLP（可选历史缓冲）——这是工程上最稳健的起点。RNN 更灵活，但会引入隐状态重置、ONNX 输入输出变化、回合数据存储复杂化等额外代价。\textbf{这条理论直接对应后文 \cref{sec:rlmc-pipeline} 的 history 阶段：先知道「观测要尽量满足马尔可夫性」，才理解「为什么以及如何堆叠历史帧」。}
+\end{insight}
+
+观测设计像给驾驶员设计仪表盘：完整车辆状态不可能全显示，驾驶员靠有限仪表做决策。仪表盘的原则不是「显示越多越好」，而是「显示决策所需、且能可靠获取的关键信息」。这条类比有其边界——仪表盘面向人类视觉系统，而观测面向 MLP/RNN，后者对输入的数值范围和分布更敏感，因此需要额外的缩放与归一化（见 \cref{sec:rlmc-scale}）。
+
+\subsection{常见观测族：腿足与操作机器人}
+\label{sec:rlmc-obs-families}
+
+把上述抽象落到具体，腿足/操作机器人的观测大体分为四族。记住这张分类，是后文一切「该放什么、放给谁」的判断基础。书中运动学记号沿用全书约定：旋转 $\mathbf R\in\mathrm{SO}(3)$、位姿 $\mathbf T\in\mathrm{SE}(3)$、四元数取 Hamilton 约定。
+
+\begin{enumerate}
+  \item \textbf{本体感知（proprioception）}——机器人「对自己身体的感知」，部署时由机载传感器直接可得，是任何 locomotion 策略的最小核心集合：
+  \begin{itemize}
+    \item 关节位置 $\mathbf q$（相对默认姿态，编码器）、关节速度 $\dot{\mathbf q}$（编码器差分）；
+    \item 机体角速度 $\boldsymbol\omega_{\text{base}}$（IMU 陀螺仪，机体系）；
+    \item 重力投影 $\mathbf g_{\text{proj}}=\mathbf R_{wb}^{\mathsf T}\,\mathbf g/\lVert\mathbf g\rVert$（由 IMU 姿态估计得到的、重力单位向量在机体系下的表示，编码了 roll/pitch 倾角，但不含 yaw——这正是 yaw 在重力对称下不可观的体现）；
+    \item 上一拍动作 $a_{t-1}$（策略自己记得的输出，利于平滑、并与动作变化率惩罚同坐标系，见 \cref{sec:rlmc-lastaction}）。
+  \end{itemize}
+  \item \textbf{外部感知（exteroception）}——机器人「对外部世界的感知」，部署时需视觉/雷达链路，可得性视硬件而定：
+  \begin{itemize}
+    \item 地形高度扫描（height-scan）：机体下方网格点的离地高度，仿真里由射线投射（raycast）得到；
+    \item 深度图 / 点云：相机或 LiDAR 的原始或降采样输出。
+  \end{itemize}
+  \item \textbf{命令（commands）}——任务条件变量，告诉条件策略「目标是什么」，如速度命令 $\mathbf c=(v_x,v_y,\omega_z)$。它\emph{必须}进入 actor 观测，否则同一观测会对应互斥目标（详见 \cref{sec:rlmc-principles} 原则一）。
+  \item \textbf{特权 / 仅评论家观测（privileged / critic-only）}——仿真里精确可得、但真机不可得（或语义不等价）的信号，如接触力真值、地形精确高度、随机化的质量/摩擦、物体真实位姿。它们\emph{只}进入 critic，用于改善价值估计而不污染部署接口（其数学依据见 \cref{sec:rlmc-asymmetric}）。
+\end{enumerate}
+
+\begin{insight}[四族观测对应四个不同的问题]\label{ins:rlmc-families}
+这四族不是随意的分类，而是回答四个不同的问题：本体感知回答「我自己怎么样」，外部感知回答「周围环境怎么样」，命令回答「我要达成什么」，特权观测回答「训练时还能借到哪些上帝视角来更准地评估」。后文 \cref{sec:rlmc-asymmetric} 会看到，前三族进 actor、第四族进 critic，正是 sim-to-real 成功的第一道关卡。
+\end{insight}
+
+\subsection{动作空间的四种抽象层次}
+\label{sec:rlmc-action-types}
+
+在确定策略输出的物理含义前，先理解四种基本动作空间。它们对应不同的控制抽象层次，构成一条从「高抽象」到「低抽象」的连续谱：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+类型 & 物理含义 & 适用场景 & 学习难度 \\
+\midrule
+关节位置 Joint Position & 关节角目标 (rad) & locomotion、基础操作 & 低 \\
+关节速度 Joint Velocity & 关节角速度目标 (rad/s) & 高动态、连续运动 & 中 \\
+关节力矩 Joint Effort & 力矩目标 (Nm) & 力控、灵巧手 & 高 \\
+微分逆运动学 Diff-IK & 末端位姿增量 (m, rad) & 操作、任务空间控制 & 中（任务空间） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[抽象层次的选择是工程权衡，不是技术优劣]\label{ins:rlmc-abstraction}
+抽象度越高，策略要学的越少（运动学/动力学知识被编码进动作变换），但灵活性越低（策略无法做出变换不支持的动作）。这与软件工程的抽象层选择完全类比：高级语言开发效率高但性能上限低，汇编效率低但无所不能。
+
+\textbf{关节位置}是 locomotion 的标准默认：它在策略与物理世界之间放了一个 PD 控制器作为缓冲——策略只需学「去哪里」，由 PD 负责「怎么去」。若直接用力矩控制，策略必须\emph{同时}学会动力学模型，相当于让学生在学开车的同时学发动机工程，工程上不合理。本质原因将在 \cref{sec:rlmc-action-deep} 用反事实推理说清：力矩控制把「站姿下抵消重力需多大力矩」与「怎样的力矩模式产生步态」两个子问题耦合在了一起，而位置控制把前者交给了 PD。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{观测设计的四条原则}
+\label{sec:rlmc-principles}
+
+\cref{sec:rlmc-obs-mdp} 给出了「结构先于目标」的哲学与观测族分类。但面对新任务，仍需可操作的判据：该放哪些信号、不该放哪些？下面四条原则各自源自一条理论性质，并配「违反症状 $\to$ 修复方向」。
+
+\subsection{原则一·马尔可夫性：观测须含决策所需的充分信息}
+\label{sec:rlmc-markov}
+
+理论根据是 MDP 的马尔可夫性：最优动作应是当前（广义）状态的函数。若观测缺了决策关键信息，相同观测便会对应不同最优动作——MDP 退化为 POMDP，策略被迫学「平均行为」。速度跟踪任务里不含命令，就是典型的马尔可夫性违反：同一个本体观测 $o_t$ 既可能要求前进又可能要求后退，等价于在监督学习里用同一输入标了互斥标签，网络只能收敛到均值——通常就是「站着不动、微微抖动」。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+违反症状 & 典型原因 & 修复方向 \\
+\midrule
+策略不跟命令变化 & command 未进 actor & 加入 command 项 \\
+不同地形上表现相同 & 缺地形感知 & 加 height-scan 或深度 \\
+动作保守、不分化 & 缺区分状态的信号 & 增本体信号或历史 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{原则二·可部署性：actor 只能看真机可得的信号}
+\label{sec:rlmc-deployable}
+
+这是最容易违反、代价最高的一条。把仿真才有的真值（接触力精确值、地形精确高度、物体精确位姿）放进 actor，等于训练时给学生开卷、部署时却闭卷，成绩必然暴跌。理论上这是因为 \cref{eq:rlmc-obs-fn} 的观测函数 $h$ 在真机上\emph{丢失}了这些维度——策略一旦依赖它们，就依赖了一条部署时不存在的捷径。
+
+\begin{insight}[机体线速度 $\mathbf v_{\text{base}}$ 的部署困境——最重要的具体案例]\label{ins:rlmc-baselin}
+机体线速度 $\mathbf v_{\text{base}}$ 在速度跟踪任务的 actor 观测中几乎无处不在，但真实机器人\emph{没有}直接传感器能提供它（IMU 测的是加速度与角速度；积分得线速度会漂移）。Isaac Lab 官方「Sim-to-Real」文档明确警告：真实 IMU 无法直接测量线速度，若策略训练时依赖机体线速度，部署前必须移除它\,\cite{isaaclab2024sim2real}。三种处理方案：
+\begin{enumerate}
+  \item \textbf{移除}：actor 只留机体角速度（IMU 可直接测），策略在无线速度反馈下学跟踪——更难但更真实（DreamWaQ 即采此路\,\cite{nahrendra2023dreamwaq}）；
+  \item \textbf{状态估计}：用状态估计器（IMU + 足端运动学约束）在真机推算 $\mathbf v_{\text{base}}$，训练时给它加匹配估计器误差的噪声；
+  \item \textbf{师生蒸馏}：teacher 用仿真真值 $\mathbf v_{\text{base}}$，student 用本体历史隐式估计线速度——这正是 RMA\,\cite{kumar2021rma} 与 Lee 等\,\cite{lee2020quadruped} 的核心思路，将在后续「师生蒸馏」章详述。
+\end{enumerate}
+这一选择直接决定整个观测/动作架构，是项目启动时就要做的关键决策，而非「以后再说」的细节。
+\end{insight}
+
+下表把常见信号按「actor 可否 / critic 可否」归类，是原则二的速查表：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lccl@{}}
+\toprule
+信号 & actor & critic & 说明 \\
+\midrule
+IMU 角速度 $\boldsymbol\omega_{\text{base}}$ & \checkmark & \checkmark & 部署可得，需建模噪声/偏置 \\
+重力投影 $\mathbf g_{\text{proj}}$ & \checkmark & \checkmark & 部署可得但有估计误差 \\
+关节位置 $\mathbf q$ & \checkmark & \checkmark & 编码器，精度高 \\
+关节速度 $\dot{\mathbf q}$ & \checkmark & \checkmark & 差分噪声大 \\
+上一拍动作 $a_{t-1}$ & \checkmark & \checkmark & 控制器内部缓存 \\
+命令 $\mathbf c$ & 必须 & 必须 & 条件策略必须知道目标 \\
+接触力真值 & $\times$ & \checkmark & 真实力传感器语义不等价 \\
+地形高度扫描 & 视部署 & \checkmark & 需真实深度/LiDAR 链路 \\
+物体位姿真值 & $\times$ & \checkmark & 真机须视觉估计 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{原则三·低维性：信息瓶颈与样本效率的权衡}
+\label{sec:rlmc-lowdim}
+
+观测维度直接影响网络参数量与样本效率。对 MLP 策略，第一层参数量 $=\text{input\_dim}\times\text{hidden\_dim}$。从 48 维加到 480 维（堆 10 帧历史），仅第一层就增 10 倍参数；回合数据存储也随之膨胀，可能撑破显存。这与图像压缩的率失真权衡（rate--distortion）完全类比：信息越多重建质量越好，但成本越高。最优维度是「刚好包含决策所需信息」的那个点——信息论里的充分统计量（sufficient statistic）概念在此有直接对应。
+
+但维度并非越低越好：观测若缺关键信息，POMDP 问题更严重，反而需要更重的网络或更长训练去补偿。降维优先级：删冗余项（无信息损失）$\to$ 高维信号降采样 $\to$ 缩短历史长度 $\to$ 用编码器压到低维潜空间（最复杂，可能损信息）。
+
+\subsection{原则四·信噪比：训练时就建模部署噪声}
+\label{sec:rlmc-snr}
+
+若训练时观测是干净的仿真真值、部署时传感器有噪声，策略会经历分布偏移：它会学到「依赖高精度信号做精细调整」，而真机噪声让这些微调失效甚至有害（对噪声的「过拟合」导致抖动或失稳）。正确做法是训练时就加入与真实传感器匹配的噪声。理论上这是在用噪声项「模拟」\cref{eq:rlmc-obs-fn} 里的 $\boldsymbol\epsilon_t$，让训练分布逼近部署分布。
+
+噪声应「从传感器数据手册出发，而非凭感觉猜」。但也并非越大越好：过大的噪声淹没有效信号，降低学习效率。经验法则是把噪声范围设为真实传感器噪声的 $1\!\sim\!3$ 倍。具体的 per-term 噪声量级见 \cref{sec:rlmc-noise-clip} 的工程表。
+
+\begin{pitfall}[三个常见认知误区]
+\textbf{误区一「观测越多越好」}：若信息里含部署时不存在的真值，策略会学到依赖捷径，导致 sim-to-real 失败。观测设计的准绳是「部署可得性优先」，不是「信息量最大化」（原则二）。
+
+\textbf{误区二「训练失败先调 PPO」}：PPO 是相当鲁棒的优化器——若 MDP 接口正确、奖励合理，默认参数通常就能工作。正确的排查顺序是：先验证接口（观测分组、动作缩放、命令）$\to$ 再查奖励 $\to$ 最后才调 PPO。
+
+\textbf{误区三「盲目加历史」}：训练不稳时把历史长度从 1 直接拉到 10。历史能缓解部分可观测，但按倍数放大维度。若不稳的根因是动作缩放错误或奖励缺陷，历史只会\emph{掩盖}问题而非解决。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{实践（一）：ObservationManager 处理管线}
+\label{sec:rlmc-pipeline}
+
+理论与原则已就绪，现在把它们\emph{接到机器人上}。Isaac Lab 与 mjlab 都用「管理器」（manager）架构：观测、动作、奖励、终止由各自独立的 manager 管理，每个 manager 由若干\textbf{项}（term）组成。这种解耦把复杂任务从一个巨型 \verb|step| 函数里拆出来——修改一个奖励不再牵动观测。本节聚焦 \verb|ObservationManager|：它如何把物理状态变成策略输入。\textbf{UniLab 走的是第三条、非 Manager-Based 的路}\,\cite{unilab2026}：它没有 \verb|ObservationManager| 这类对象，观测/奖励/终止都在环境子类的 \verb|update_state()|（\verb|base/np_env.py| 的 \verb|NpEnv| 模板）里\emph{一处}手写算出。所以下文每讲一个管线阶段，UniLab 的对照不是「另一种配置写法」，而是「这一步在 UniLab 里写在哪段代码里、或根本没有独立阶段」——这本身就是三框架对比里最有教学价值的一组差异。
+
+\begin{note}[关于 API 命名：库导出名 vs.\ 任务里的惯用别名]
+后文 Isaac Lab 代码用 \verb|ObsTerm|/\verb|ObsGroup|/\verb|Unoise| 这些短名。它们\emph{不是}库定义的别名，而是任务配置文件里约定俗成的导入改名\,\cite{isaaclab2024}：
+\begin{codebox}[Python]{Isaac Lab 任务文件顶部的惯用导入}
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+# 库真正导出的全名是 ObservationTermCfg / ObservationGroupCfg / UniformNoiseCfg
+# （AdditiveUniformNoiseCfg 是 UniformNoiseCfg 的库内别名）
+\end{codebox}
+mjlab 则直接使用全名 \verb|ObservationTermCfg| / \verb|ObservationGroupCfg|，其观测项以 \verb|terms={"name": cfg}| 字典组织\,\cite{mjlab2026}。
+\end{note}
+
+\subsection{处理链总览与「为什么是这个顺序」}
+\label{sec:rlmc-pipeline-order}
+
+Isaac Lab 的 \verb|ObservationManager| 在 \verb|compute_group| 中对\emph{每一项}按固定顺序施加处理。核对其源码\,\cite{isaaclab2024}，顺序为：
+\begin{equation*}
+\boxed{\ \texttt{compute}\ \to\ \texttt{modifiers}\ \to\ \texttt{noise}\ \to\ \texttt{clip}\ \to\ \texttt{scale}\ \to\ \texttt{history}\ }
+\end{equation*}
+mjlab 在此基础上多一个内置的 \verb|delay| 阶段（位于 \verb|scale| 与 \verb|history| 之间）\,\cite{mjlab2026}：
+\begin{equation*}
+\texttt{compute}\to\texttt{noise}\to\texttt{clip}\to\texttt{scale}\to\texttt{delay}\to\texttt{history}.
+\end{equation*}
+两点差异值得记牢：(1) Isaac Lab 在 \verb|noise| 前先过 \verb|modifiers|（一组可配置的自定义变换，按列表顺序执行）；(2) Isaac Lab 默认的 \verb|ObsTerm| \textbf{没有} per-term \verb|delay| 阶段——若需观测延迟，需借助 \verb|DelayBuffer| 工具、自定义 modifier/observation 函数或社区扩展\,\cite{isaaclab2024}；而 mjlab 把 \verb|delay| 内置进了项配置（含 \verb|delay_min_lag|/\verb|delay_max_lag| 等字段）\,\cite{mjlab2026}。history 两个框架都内置。
+
+UniLab \textbf{没有这条声明式管线}\,\cite{unilab2026}：它的观测在 \verb|_compute_obs| 里手写计算，\texttt{compute} 与 \texttt{noise} 合并成「算原始量、顺手过 \verb|_obs_noise|」（见 \cref{sec:rlmc-groups} 的 UniLab codebox），\texttt{clip}/\texttt{scale} 没有 per-term 配置阶段（需要时直接 \verb|np.clip|、或在算式里乘系数），\texttt{history} 也不是内置阶段（需观测历史的任务——如部署导向的 \verb|G1WBTObs|——在 \verb|_compute_obs| 里自己堆叠最近若干帧本体感知）。唯一与「延迟」沾边的内置项是\emph{动作}侧的 \verb|simulate_action_latency|（用上一拍动作，模拟一帧执行延迟），不是观测侧的 per-term delay。所以下面那张「为什么是这个顺序」的物理含义表，对 UniLab 读者是一份\emph{手写实现清单}：框架不替你排序，你得自己保证「噪声加在物理单位空间、命令进 actor、不同项各自缩放」。
+
+\begin{insight}[管线顺序不是任意的——每一步对应「信号从世界流向网络」的一个物理环节]\label{ins:rlmc-pipeline}
+把一条信号想象成从物理世界流向策略网络的管道，顺序的物理含义就清楚了：
+\begin{itemize}
+  \item \texttt{compute}：从仿真状态提取原始信号——「世界是什么样」；
+  \item \texttt{noise}：模拟传感器测量误差——「传感器看到了什么」（对应 \cref{sec:rlmc-snr} 原则四，在此把 \cref{eq:rlmc-obs-fn} 的 $\boldsymbol\epsilon_t$ 注入）；
+  \item \texttt{clip}：防极端值击穿后续处理——「合法测量范围」；
+  \item \texttt{scale}：把有量纲的值映射到网络友好的数值范围——「数值怎样表达更利于学习」；
+  \item \texttt{delay}（mjlab）：模拟传感器与通信延迟——「策略拿到的信息有多旧」；
+  \item \texttt{history}：拼接当前帧与历史帧——「策略能看到多长的时间窗」（对应 \cref{ins:rlmc-history} 的马尔可夫性近似）。
+\end{itemize}
+顺序搞错就会出错：若先 \texttt{scale} 再 \texttt{noise}，噪声就加在了 scaled 空间里，物理量级全错（角速度噪声本应在 rad/s 空间加入）；若先 \texttt{history} 再 \texttt{delay}，延迟作用在整段历史而非单帧，语义完全变了；若先拼接（concatenate）再做 per-term \texttt{scale}，就无法给不同项设不同缩放。
+\end{insight}
+
+\subsection{compute 阶段：观测项就是一个纯函数}
+\label{sec:rlmc-compute}
+
+\verb|compute| 阶段由观测项的 \verb|func| 完成：它接收环境与参数，返回首维为 \verb|num_envs| 的张量。Isaac Lab 的通用观测函数在 \verb|isaaclab.envs.mdp.observations| 中（经核对，下列名称均真实存在\,\cite{isaaclab2024}）：\verb|base_lin_vel|、\verb|base_ang_vel|、\verb|projected_gravity|、\verb|joint_pos_rel|、\verb|joint_vel_rel|、\verb|last_action|、\verb|generated_commands|、\verb|height_scan|。mjlab 提供功能对等的实现，区别在于 mjlab 经 \verb|env.scene.robot| 直接属性访问，Isaac Lab 经 \verb|env.scene["robot"]| 字典访问\,\cite{mjlab2026}。
+
+UniLab 没有「观测函数库」这一概念——原始量直接经后端 getter 取，在 \verb|_compute_obs| 里现取现拼\,\cite{unilab2026}：\verb|get_gyro()|（机体角速度）、\verb|get_dof_pos()|/\verb|get_dof_vel()|（关节位置/速度）、\verb|get_local_linvel()| 与后端的 \verb|get_body_lin_vel_b()|（机体系线速度）、\verb|get_sensor_data("upvector")|（重力投影的来源）。值得注意的一点呼应 \cref{ins:rlmc-baselin}：UniLab 后端\emph{直接}提供机体系线速度 \verb|get_body_lin_vel_b|（与 mjlab 的便利一致），这让「把真值线速度放进 critic、不放进 actor」在 UniLab 里非常自然——你只需在 critic 那路 \verb|concatenate| 里多拼一个 \verb|linvel|（见 \cref{sec:rlmc-groups} 的 UniLab codebox），无需任何额外配置。
+
+任务特定的观测可做非线性预处理——这是观测设计的重要工具，直接呼应 \cref{ins:rlmc-pipeline}「数值怎样表达更利于学习」。例如对足端接触力做
+\begin{equation}
+\tilde f = \operatorname{sign}(f)\cdot\log(1+\lvert f\rvert),
+\label{eq:rlmc-log1p}
+\end{equation}
+把 $0$ 到几百牛的大范围力值压到个位数，同时保留方向。
+
+\begin{insight}[为什么是 \texttt{log1p} 而非 \texttt{log}，为什么保留 \texttt{sign}]\label{ins:rlmc-log1p}
+$\log(0)=-\infty$，脚完全腾空（接触力为零）时会产生 $-\infty$ 进而导致 NaN 传播；而 $\log(1+x)$ 保证 $\log(1+0)=0$，零力映射为零观测，物理含义正确。保留 $\operatorname{sign}$ 是因为接触力有方向（如 $[0,0,-100]\,$N 表示竖直向下的支撑反力），方向信息对判断受力很重要。同类预处理还有：角度用 $(\sin\theta,\cos\theta)$ 表示（避开 $\theta=\pm\pi$ 的不连续）、四元数用 6D 旋转表示替代（避开 $\mathbf q$ 与 $-\mathbf q$ 的对极等价性，与全书 Hamilton 四元数约定一致）。
+\end{insight}
+
+\begin{codebox}[Python]{自定义观测项：足端离地高度（特权信号，仅给 critic）}
+# Isaac Lab —— 函数式观测项
+import torch
+from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.managers import SceneEntityCfg
+
+def foot_height(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """足端离地高度 [num_envs, num_feet]，单位 m。
+    不适合 actor：真机没有直接测足端离地高度的传感器（见原则二）。"""
+    asset = env.scene[asset_cfg.name]
+    foot_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids]  # 世界系位置
+    return foot_pos_w[:, :, 2]  # 取 z 分量；假设地面 z=0
+\end{codebox}
+
+\begin{pitfall}[编写观测项的三条铁律]
+\textbf{一·无副作用}：观测项必须是\emph{只读}纯函数。在 mjlab 的 \verb|TorchArray| 零拷贝桥下，改了传入的 PyTorch 张量会\emph{直接}改动底层 Warp 数组，后续项读到被污染的数据——此类 bug 不报错，只让数值悄悄偏移。
+
+\textbf{二·首维必须是 \texttt{num\_envs}}：所有向量化环境都把 batch 放在第 0 维。若返回 \verb|[dim]|（漏了 batch 维），拼接时报形状不匹配或产生维度歧义。自检：\verb|assert result.shape[0] == env.num_envs|。
+
+\textbf{三·避免不可并行的操作}：禁止用 Python \verb|for| 循环遍历环境。在 4096 环境下，一个 Python 循环可能把吞吐从上万 steps/s 拖到几百 steps/s。
+\end{pitfall}
+
+\subsection{noise 与 clip 阶段}
+\label{sec:rlmc-noise-clip}
+
+\verb|noise| 阶段模拟传感器腐蚀，对应 \cref{sec:rlmc-snr} 原则四。Isaac Lab 的均匀噪声配置字段为 \verb|n_min|/\verb|n_max|，高斯噪声为 \verb|mean|/\verb|std|（经核对\,\cite{isaaclab2024}）。velocity actor 项的典型噪声范围：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+信号 & 噪声范围 & 单位 & 物理理由 \\
+\midrule
+机体线速度 & $[-0.1,\,0.1]$ & m/s & 状态估计器误差\,\cite{isaaclab2024} \\
+机体角速度 & $[-0.2,\,0.2]$ & rad/s & IMU 偏置与漂移 \\
+重力投影 & $[-0.05,\,0.05]$ & 无量纲 & 姿态估计误差 \\
+关节位置 & $[-0.01,\,0.01]$ & rad & 编码器噪声 \\
+关节速度 & $[-1.5,\,1.5]$ & rad/s & 差分噪声放大 \\
+地形高度扫描 & $[-0.1,\,0.1]$ & m & 深度传感器噪声 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[别脱离单位读这些数]
+关节速度噪声看上去比关节位置大 150 倍，但二者单位不同，且速度估计（基于编码器差分）本就远比位置估计噪声大。复制噪声范围到新任务前，必须先核对信号的物理单位与真实传感器噪声水平。\textbf{注}：源稿曾给机体线速度 $[-0.5,0.5]$，但 Isaac Lab velocity 基线官方值为 $[-0.1,0.1]$；此处以官方为准\,\cite{isaaclab2024}。
+\end{pitfall}
+
+\verb|clip| 阶段限制观测数值范围，防极端值击穿网络输入。clip 应基于传感器物理范围与训练日志统计量来选，\emph{不要}无条件裁到 $[-1,1]$——太紧丢信息，太松失去保护作用。
+
+UniLab 把噪声写成一个辅助方法 \verb|_obs_noise(data, scale)|\,\cite{unilab2026}：噪声幅度 $=\text{level}\times\text{scale}\times\mathcal U(-1,1)$，其中 \verb|scale| 是 per-信号的系数（如 \verb|noise_config.scale_gyro|/\verb|scale_gravity|/\verb|scale_joint_angle|/\verb|scale_joint_vel|），全局 \verb|level| 一关全关。这等价于 Isaac Lab 的 \verb|Unoise(n_min, n_max)|，只是把「范围」拆成了「全局档位 $\times$ 单项系数」两个旋钮，更便于一键调整整体噪声强度。一处对照差异：UniLab 没有独立的 per-term \verb|clip| 配置阶段，观测的越界保护要么靠传感器量级本身有界（如重力投影、相位天然在小范围），要么在 \verb|_compute_obs| 里手动 \verb|np.clip|——这是「非声明式管线」的又一体现。上表的噪声量级与物理理由对 UniLab 同样适用（只需把 $[-a,a]$ 范围折算成 \verb|level*scale|）。
+
+\subsection{scale 阶段：项级缩放 vs.\ 模型级归一化}
+\label{sec:rlmc-scale}
+
+项级 \verb|scale|（设计时写死的固定比例，通常有物理含义，如除以最大距离）与模型级归一化（依赖训练统计的 running mean/std）有本质区别。本章建议的默认策略：优先用物理含义明确的项级 scale，让多数项自然落在个位数范围；只有当尺度差异仍显著影响训练时，才考虑模型级归一化；一旦打开归一化，务必把部署边界写清楚（running statistics 是训练状态的一部分，ONNX 必须包含等价归一化层，否则部署时输入分布整体偏移）。这一条在 \cref{sec:rlmc-deploy} 的部署边界里还会回到。
+
+\subsection{delay 与 history 阶段}
+\label{sec:rlmc-delay-history}
+
+\verb|delay|（mjlab 内置 \verb|DelayBuffer|）的 lag 单位是 env step（\emph{不是} physics step）\,\cite{mjlab2026}。velocity 环境中 physics 时间步 $0.005\,$s、decimation $4$，故 env step 间隔 $0.005\times4=0.02\,$s$=20\,$ms；lag $=3$ 对应延迟约 $60\,$ms。
+
+\begin{insight}[delay 与 noise 不可互相替代]\label{ins:rlmc-delay}
+这是常见混淆。delay 改变\emph{时间索引}（「策略看到的是 $60\,$ms 前的状态」），noise 改变\emph{数值}（「当前状态的测量值有随机误差」）。对步态控制，相位滞后远比数值误差危险：delay 让策略「在错误的时间做正确的动作」，noise 只让动作略有偏差。好比音乐演奏——音准偏一点（noise）通常可容忍，但节拍错了（delay）整首曲子就乱了。
+\end{insight}
+
+\verb|history|（mjlab 用 \verb|CircularBuffer|；Isaac Lab 用项级 \verb|history_length| 配合 \verb|flatten_history_dim|，且可在组级覆盖\,\cite{isaaclab2024,mjlab2026}）实现 \cref{ins:rlmc-history} 的马尔可夫性近似。若 \verb|flatten_history_dim=True|，历史展平为 \verb|[num_envs, obs_dim * history_length]|。维度预算：actor 观测 48 维、\verb|history_length=4| 展平后输入变 192，第一层参数从 $48\times512$ 变 $192\times512$，仅第一层就增四倍——故历史长度应从 $2\!\sim\!4$ 起步，别一上来设 10（呼应 \cref{sec:rlmc-lowdim} 原则三）。
+
+UniLab 这两个阶段都\emph{无内置配置}\,\cite{unilab2026}。\textbf{delay}：观测侧没有 per-term delay；唯一相关的是动作侧的 \verb|simulate_action_latency=True|（用上一拍动作模拟一帧执行延迟，约 1 个 \verb|ctrl_dt|），\cref{ins:rlmc-delay} 「delay 改时间索引、noise 改数值」的本质区分仍成立。\textbf{history}：不是内置阶段，需历史的任务在 \verb|_compute_obs| 里\emph{手动}堆叠——典型如部署导向的 \verb|G1WBTObs| 任务，它去掉真机不可得的通道、转而拼接最近若干帧本体感知与历史动作（与 \cref{sec:rlmc-hover} 里 HOVER student 的「本体历史替代特权」同一思路）。维度预算的告诫对手写堆叠同样成立：自己 \verb|concatenate| 的帧数越多、actor 第一层越大，别图省事一上来堆 10 帧。
+
+\begin{practice}[练习·处理管线]
+\begin{enumerate}
+  \item \textbf{[分析]} 若把管线顺序改成 compute $\to$ scale $\to$ noise $\to$ clip $\to$ history $\to$ delay，列出至少三个会出的具体问题（提示：噪声单位、延迟作用对象、per-term 缩放）。
+  \item \textbf{[计算]} physics\_dt $=0.005\,$s、decimation $=4$。若真实 IMU 延迟 $30\,$ms，应设多少 delay lag？若 decimation 改为 $8$，lag 如何调整以保持同样的物理延迟？
+  \item \textbf{[设计]} 为 \cref{eq:rlmc-log1p} 的接触力变换写出 actor 与 critic 的不同处理：actor 是否该用它？critic 呢？说明理由。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{从算法到接线：非对称 Actor-Critic 与特权学习}
+\label{sec:rlmc-asymmetric}
+
+\cref{sec:rlmc-obs-families} 把第四族观测（特权信号）留给了 critic。本节先用演员-评论家的算法机制说清\emph{为什么 critic 可以「看更多」而不破坏部署}，再落到三个框架里 observation group 的接线。
+
+\subsection{算法机制：为什么 critic 可以看更多}
+\label{sec:rlmc-why-asymmetric}
+
+回到演员-评论家方法（见 \cref{ch:rl-ac}）。PPO 更新 actor 时需要优势估计 $\hat A_t$，实践中常用广义优势估计（Generalized Advantage Estimation, GAE）\,\cite{schulman2016gae} 近似：
+\begin{equation}
+\hat A_t = \sum_{l=0}^{T-t-1}(\gamma\lambda)^l\,\delta_{t+l},
+\qquad
+\delta_t = r_t + \gamma\,V\!\big(o^{\text{critic}}_{t+1}\big) - V\!\big(o^{\text{critic}}_t\big).
+\label{eq:rlmc-gae}
+\end{equation}
+关键观察：优势的质量直接取决于价值函数 $V$ 的估计精度。$V$ 越准，$\delta_t$ 越接近真实 TD 误差，优势方差越小，actor 更新方向越稳；$V$ 越差，优势充满噪声，actor 更新如随机游走。
+
+而 \cref{eq:rlmc-gae} 里 actor 与 critic 的输入\emph{可以不同}：actor 学 $\pi(a_t\mid o^{\text{actor}}_t)$，其中 $o^{\text{actor}}_t$ 只含部署可得信号；critic 学 $V(o^{\text{critic}}_t)$，其中 $o^{\text{critic}}_t$ 可含训练时额外可得的特权信号。critic \emph{不需要部署}——它只在训练中输出价值。因此让 critic 输入更丰富是「免费」的：它改善训练信号质量，却不改变部署时 actor 的输入要求。这正是 Pinto 等提出的非对称演员-评论家（asymmetric actor-critic）\,\cite{pinto2018asymmetric} 的核心。
+
+\begin{insight}[特权的是「误差信号」，不是「策略」]\label{ins:rlmc-privileged}
+特权学习（privileged learning）的本质，不是让策略拥有特权，而是让训练中的\emph{误差信号}（价值函数、优势）拥有特权。actor 仍须在部署可得的信息下行动；critic 用额外信息把「这个动作到底好不好」估得更准。这像一个教练在训练时可看慢动作回放与数据分析，运动员比赛时却只能靠自己的感官——教练的分析不是直接告诉运动员「现在迈左脚」，而是在训练后给出更准的反馈，让运动员自己调整策略。\textbf{这就是 \cref{ins:rlmc-families} 里第四族观测「只进 critic」的算法依据。}
+\end{insight}
+
+\begin{pitfall}[「给 critic 越多越好」的三个反例]
+\textbf{反例一·维度过高}：若给 critic 原始高分辨率深度图，critic 网络本身可能难以拟合，反而拖慢训练。特权信号应低维、高信息密度。
+
+\textbf{反例二·泄漏未来}：若特权信号泄漏了未来信息（如下一步的奖励真值），critic 学到的价值函数会破坏因果结构。合理的特权信号只描述「当前状态或当前环境参数」，不描述「未来会发生什么」。
+
+\textbf{反例三·交叉污染}：actor 与 critic 同名项若共享同一 cfg 对象，critic 改了某项的 noise 可能波及 actor。Isaac Lab 与 mjlab 都通过深拷贝/实例化机制隔离\,\cite{isaaclab2024,mjlab2026}，但自检仍值得：打印二者同名项的 cfg，确认是不同对象。UniLab 没有「同名项共享 cfg」这种结构——actor 与 critic 在 \verb|_compute_obs| 里是两路独立的 \verb|np.concatenate|（见 \cref{sec:rlmc-groups}），天然不会交叉污染；它要防的是另一类手写错误：忘了给 actor 某项加噪、或误把特权量也拼进了 actor 那一路。
+\end{pitfall}
+
+\subsection{实践：三个框架里的 observation group 组织}
+\label{sec:rlmc-groups}
+
+\textbf{mjlab} 的观测按 group 组织，velocity 任务有两个 group，源码里就叫 \verb|actor| 和 \verb|critic|\,\cite{mjlab2026}。\textbf{Isaac Lab} 用 \verb|ObservationsCfg| 的嵌套 \verb|@configclass|，每个 group 是一个继承 \verb|ObsGroup| 的内部类。
+
+\begin{note}[一个易错的命名事实：locomotion 基类默认只有 \texttt{policy} 组]
+经核对 Isaac Lab 源码\,\cite{isaaclab2024}：其 locomotion \emph{velocity 基类} \verb|ObservationsCfg| 默认\textbf{只}定义了一个 \verb|policy| 组——\textbf{基类里并没有 \texttt{critic} 组}。\verb|critic|（非对称特权组）只在\emph{选择启用}非对称演员-评论家的具体机器人配置里才追加。因此「默认有 policy 和 critic 两组」对 locomotion 并不准确：\verb|policy| 才是唯一保证的默认，\verb|critic| 是追加它时的惯用名。源稿在此点上含糊，已据官方修正。
+\end{note}
+
+\begin{codebox}[Python]{Isaac Lab：actor/critic 非对称观测组（critic 追加特权项）}
+from isaaclab.utils import configclass
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+import isaaclab.envs.mdp as mdp
+
+@configclass
+class ObservationsCfg:
+    @configclass
+    class PolicyCfg(ObsGroup):           # 部署可得信号（actor）
+        enable_corruption = True          # 打开噪声腐蚀（原则四）
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel,
+                               noise=Unoise(n_min=-0.2, n_max=0.2))
+        projected_gravity = ObsTerm(func=mdp.projected_gravity,
+                                    noise=Unoise(n_min=-0.05, n_max=0.05))
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel,
+                            noise=Unoise(n_min=-0.01, n_max=0.01))
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel,
+                            noise=Unoise(n_min=-1.5, n_max=1.5))
+        actions = ObsTerm(func=mdp.last_action)
+        velocity_commands = ObsTerm(func=mdp.generated_commands,
+                                    params={"command_name": "base_velocity"})
+
+    @configclass
+    class CriticCfg(PolicyCfg):           # 继承 actor 全部项……
+        enable_corruption = False         # ……但关掉噪声，保持价值估计稳定
+        # 追加特权项：真机不可得，仅用于改善 value 估计（见 ins:rlmc-privileged）
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)   # 真值线速度（特权）
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+\end{codebox}
+
+\textbf{UniLab} 走的是第三条路\,\cite{unilab2026}：它\emph{不是} Manager-Based 架构，没有 \verb|ObservationManager| 或 \verb|ObsTerm|/\verb|ObsGroup| 这类配置树——观测在环境子类里\emph{手写}计算。每个环境必须实现一个 \verb|obs_groups_spec| 属性，返回「组名 $\to$ 维度」字典；非对称性就体现在它\textbf{固定用两个组}：\verb|"obs"| 喂 actor、\verb|"critic"| 喂 critic（critic 组多出来的维度即特权信号）。在 UniLab 1.x 的 \verb|base/observations.py| 的 \verb|split_obs_dict()| 中，环境返回的观测字典被拆成 \verb|(actor=obs["obs"], critic=obs.get("critic", obs["obs"]))|——即若没有 \verb|critic| 组就让 critic 复用 actor 观测（退化为对称）。具体的拼接发生在环境的 \verb|_compute_obs()| 里（如 \verb|envs/locomotion/go2| 的 joystick 任务）：actor 组只放真机可得量并叠噪声，critic 组用无噪声的干净值再追加特权的机体线速度。
+
+\begin{codebox}[Python]{UniLab：actor/critic 两组观测（手写拼接，critic 追加特权 linvel）}
+# UniLab —— 非 Manager 架构：观测在 env 子类里手写计算
+# env 固定两组：obs 喂 actor、critic 喂 critic（critic 多出的维度=特权信号）
+@property
+def obs_groups_spec(self) -> dict[str, int]:
+    return {"obs": 49, "critic": 52}        # critic 比 obs 多 3 维 = 特权 base linvel
+
+def _compute_obs(self, info, linvel, gyro, gravity, dof_pos, dof_vel, feet_phase):
+    nc = self._cfg.noise_config
+    diff = dof_pos - self.default_angles
+    obs = np.concatenate([                   # actor：只含真机可得量 + 噪声
+        self._obs_noise(gyro, nc.scale_gyro),          # 机体角速度(3)
+        -self._obs_noise(gravity, nc.scale_gravity),   # 投影重力(3)
+        self._obs_noise(diff, nc.scale_joint_angle),   # 关节角差(12)
+        self._obs_noise(dof_vel, nc.scale_joint_vel),  # 关节速度(12)
+        info.get("current_actions", np.zeros_like(diff)),  # 上一拍动作(12)
+        info["commands"],                              # 速度命令(3)
+        feet_phase,                                    # 步态相位(4)
+    ], axis=1)
+    critic = np.concatenate([                # critic：无噪声 + 追加特权 base linvel
+        gyro, -gravity, diff, dof_vel, info["current_actions"],
+        info["commands"], feet_phase, linvel], axis=1)   # +linvel(3) = 特权
+    return {"obs": obs, "critic": critic}
+\end{codebox}
+
+三框架在同一概念上的对照值得记牢：Isaac Lab/mjlab 用\emph{声明式}的项配置（\verb|ObsTerm|/\verb|ObservationTermCfg|，框架自动按管线处理），UniLab 用\emph{命令式}的手写函数（在 \verb|np_env.py| 的 \verb|NpEnv| 模板里，观测是 \verb|update_state()| 的一部分，返回 NumPy 数组而非 PyTorch 张量，因为物理在 CPU 上算）。这一差异贯穿全章：UniLab 没有「per-term noise/clip/scale/history」这套可配置管线阶段（见 \cref{sec:rlmc-pipeline-order} 的对照说明），所有处理都写在 \verb|_compute_obs| 里——更直白，但也意味着\emph{你}要自己保证处理顺序正确（噪声在物理单位空间加、命令进 actor）。
+
+\begin{insight}[手写 \texttt{\_compute\_obs} 的自检清单：把散落的告诫收成一张表]\label{ins:rlmc-uniselfcheck}
+全章对 UniLab「非声明式 $=$ 你得自己保证正确」的告诫散落在各节，这里收拢成一张可逐条核对的清单——每写完或改完一个 \verb|_compute_obs|，对照走一遍：
+\begin{enumerate}
+  \item \textbf{actor 每一项都加噪了吗？} 框架不替你加，actor 那路的每个本体量都应过 \verb|_obs_noise(data, scale)|；漏掉某项 $=$ 该信号训练时干净、部署时带噪，分布偏移（\cref{sec:rlmc-snr} 原则四）。
+  \item \textbf{命令 $\mathbf c$ 拼进 actor 了吗？} 条件任务里 \verb|info["commands"]| 必须在 actor 那路的 \verb|concatenate| 里（\cref{sec:rlmc-markov} 原则一），否则学成「站着抖」。
+  \item \textbf{critic 那路是\emph{干净值}吗？} critic 的 \verb|concatenate| 应直接用原始量（不过 \verb|_obs_noise|），噪声只该出现在 actor 路（\cref{sec:rlmc-corruption}）；误把噪声加到 critic 会增大价值方差。
+  \item \textbf{特权量\emph{只}在 critic 路吗？} 机体线速度 \verb|linvel| 这类真值只能拼进 critic（\cref{ins:rlmc-privileged}），一旦混进 actor 那路就是「开卷训练、闭卷部署」（原则二）。
+  \item \textbf{两路的\emph{切片顺序}与部署侧约定一致吗？} 由于是手写 \verb|concatenate|，各项拼接顺序就是部署端解读 obs 的顺序——必须与 \verb|deploy_config.yaml| 的 \verb|obs_layout|（\cref{sec:rlmc-onnx}）逐段对齐，错位一项则整段 obs 全错。
+  \item \textbf{无副作用吗？} \verb|_compute_obs| 是只读纯函数，别就地改传入数组（\cref{sec:rlmc-compute} 铁律一）。
+\end{enumerate}
+声明式框架把这六条交给了配置与管线，UniLab 把它们交还给了你——所以这张清单对 UniLab 不是「可选优化」而是「每次必走」。
+\end{insight}
+
+\subsection{\texorpdfstring{\texttt{obs\_groups}}{obs\_groups} 路由：一类极隐蔽 bug 的根源}
+\label{sec:rlmc-obsgroups}
+
+环境返回的是一个字典（key 是 group 名，value 是张量）。RSL-RL 的 runner 通过 \verb|obs_groups| 配置决定「哪个网络吃哪个 group」。经核对 RSL-RL/Isaac Lab 源码与文档\,\cite{schwarke2025rslrl,isaaclab2024}，\verb|obs_groups| 是一个 \verb|dict[str, list[str]]|：
+
+\begin{codebox}[Python]{obs\_groups：runner 键是 actor/critic，值是环境 group 名的列表}
+# RSL-RL runner 配置（注意：runner 端的键是 "actor"/"critic"，
+# 值是【环境观测 group 名】组成的【列表】，列表内的 group 会被拼接）
+obs_groups = {
+    "actor":  ["policy"],               # actor 网络 ← 环境的 "policy" group
+    "critic": ["policy", "privileged"], # critic 网络 ← "policy"+"privileged" 拼接
+}
+# 蒸馏场景下键改为 "student"/"teacher"
+\end{codebox}
+
+UniLab 复用了 RSL-RL 的 runner（在 UniLab 的 PPO 路径里经 \verb|OnPolicyRunner| 配以自定义的 \verb|FinalObservationAwarePPO|），因此\emph{同样}有这层 \verb|obs_groups| 路由——只是它经 Hydra 配置注入，且两层命名的具体取名与 Isaac Lab 不同：环境侧固定是 \verb|obs|/\verb|critic|（见上节 \verb|obs_groups_spec|），Hydra 侧的 \verb|algo.obs_groups| 键则用 \verb|actor|/\verb|critic|。
+
+\begin{codebox}[Python]{UniLab：Hydra 里的 obs\_groups（YAML 注入，对照 RSL-RL runner）}
+# UniLab —— conf/<algo>/task/<task>/<backend>.yaml（Hydra，# @package _global_）
+# 环境侧 obs_groups_spec 给的是 obs/critic；这里 algo.obs_groups 给 runner 路由：
+# go2 rough（非对称，两组都用）：
+#   algo.obs_groups = {actor: [actor], critic: [critic]}
+# go2 flat（对称，可只给一组）：
+#   algo.obs_groups = {actor: [actor]}
+# 经 wrapper 把环境组名(obs/critic)对齐到 runner 键(actor/critic)。
+\end{codebox}
+
+\begin{insight}[厘清 actor/policy/critic 的命名混乱：三框架同病]\label{ins:rlmc-naming}
+初学常被绕晕，关键是分清\emph{两层命名}：(1) \textbf{环境侧 group 名}——Isaac Lab 习惯叫 \verb|policy|（+可选 \verb|critic|/\verb|privileged|），mjlab 直接叫 \verb|actor|/\verb|critic|，UniLab 固定叫 \verb|obs|/\verb|critic|；(2) \textbf{runner 侧的路由键}——固定是 \verb|actor|/\verb|critic|（蒸馏时 \verb|student|/\verb|teacher|），其\emph{值}是一个环境 group 名的列表。所以 Isaac Lab 里典型映射是 \verb|{"actor": ["policy"], "critic": ["policy","critic"]}|——左边的 \verb|critic| 是 runner 键，右边列表里的 \verb|critic| 是环境 group 名，二者\emph{不是}一回事；UniLab 里则是 \verb|{"actor": ["actor"], "critic": ["critic"]}|——左边的 \verb|actor|/\verb|critic| 是路由键，右边的 \verb|actor|/\verb|critic| 经 wrapper 对到环境的 \verb|obs|/\verb|critic| 组。三个框架的「坑」是同一个：路由键与环境组名重名却语义不同。
+\end{insight}
+
+\begin{pitfall}[三种 \texttt{obs\_groups} 隐蔽 bug]
+\textbf{Bug 1·group 名不匹配}：若环境返回 \verb|{"policy":...}| 但 \verb|obs_groups| 的某个值写成 \verb|["actor"]|，runner 查不到该 group，启动第一步即报 KeyError——易发现易修。
+
+\textbf{Bug 2·critic 错指向 actor 的 group}：若 \verb|{"actor":["policy"], "critic":["policy"]}|——critic 用了和 actor 完全相同的观测，丢失特权信息的好处。\emph{不报错、不崩溃}，只是优势方差增大、收敛变慢，可能训练 500+ 迭代后才察觉「怎么比预期慢这么多」。诊断：启动时打印 actor 与 critic 的\emph{实际观测维度}，若相同，很可能特权项没进 critic。
+
+\textbf{Bug 3·新增 group 未注册}：为蒸馏新增了 \verb|teacher| 环境 group，却忘了在 \verb|obs_groups| 里加对应键——环境算了这些观测但没人读，浪费算力且功能缺失。诊断：对比环境的 group 维度字典 keys 与 \verb|obs_groups| 的值集合。
+\end{pitfall}
+
+\subsection{group 级 corruption 与 play 模式}
+\label{sec:rlmc-corruption}
+
+Isaac Lab 与 mjlab 都支持 group 级噪声开关（\verb|enable_corruption|）\,\cite{isaaclab2024,mjlab2026}：velocity 任务里 actor 组打开（模拟传感器噪声，对应原则四），critic 组关闭（保持价值估计稳定，呼应 \cref{ins:rlmc-privileged}）。这体现了一个原则：actor 需对传感器噪声鲁棒，critic 更需稳定地估计训练价值（noisy value 会增大优势方差）。
+
+UniLab 没有 \verb|enable_corruption| 这个 group 级开关——因为它根本没有声明式的 group 配置。等效效果靠手写：在 \verb|_compute_obs| 里 actor 组的每一项都过 \verb|_obs_noise(data, scale)|（噪声幅度 $=\text{level}\times\text{scale}\times\mathcal U(-1,1)$；把 \verb|noise_config| 的全局 \verb|level| 设为 $\le 0$ 即整体关噪），而 critic 组直接用干净值不过噪声（见上文 \verb|_compute_obs| 的两路 \verb|concatenate|）。换言之 UniLab 把「actor 加噪、critic 干净」从一个\emph{配置标志}降成了一处\emph{代码约定}——更灵活但也更容易写错（忘了给某项加噪，或误把噪声加到 critic 组）。一处诚实的差异：UniLab 任务集里\emph{未见}与 Isaac Lab/mjlab 等价的「play 模式自动关 corruption」开关，评估时若要关噪须把全局 \verb|noise_config.level| 手动调到 $\le 0$（UniLab 无对应自动开关）。
+
+\begin{pitfall}[play 模式默认关 corruption，别把它当部署鲁棒性]
+评估/可视化（play）模式通常默认关闭 actor corruption，以看到「理想输入下的最佳表现」；但这意味着 play 看到的好表现\emph{不等于}真机鲁棒性。要评估鲁棒性，应在打开 corruption 的 play 下进行。play 还常移除随机外力扰动（push）、延长回合长度——故 play 结果不能直接与训练 rollout 奖励对比。一个常见误判：play 表现好、真机却下降，被归咎为 sim-to-real gap，实则只是 play 评估条件比真实部署更宽松。
+\end{pitfall}
+
+\begin{practice}[练习·非对称观测]
+\begin{enumerate}
+  \item \textbf{[推导]} 写出 \cref{eq:rlmc-gae} 在 $T-t=3$ 时的完整展开。说明 $\lambda=1$ 与 $\lambda=0$ 分别对应什么估计方式，它们对价值函数精度的依赖有何不同。
+  \item \textbf{[设计]} 为一个崎岖地形 locomotion 任务设计 actor 与 critic 观测组：actor $\le 50$ 维，critic 额外加 $\le 30$ 维特权信号。分别写出 mjlab 与 Isaac Lab 的 cfg 结构，并给出对应的 \verb|obs_groups| 映射。
+  \item \textbf{[分析]} 若有人误把 \verb|obs_groups| 配成 \verb|{"actor":["policy"], "critic":["policy"]}|：(a) 训练会崩溃吗？(b) 奖励曲线会怎样？(c) 策略质量受影响吗？(d) 你如何在\emph{不看}配置文件的情况下发现它？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{动作空间：从无量纲采样到关节力矩}
+\label{sec:rlmc-action}
+
+观测讲完了「策略看什么」，本节讲「策略能做什么」。同样先理论后实践：先说清 raw action 为何无量纲、它经过怎样的变换链才成为物理控制目标，再落到缩放/偏置/裁剪的工程选型。
+
+\subsection{算法视角：raw action 必须无量纲}
+\label{sec:rlmc-rawaction}
+
+策略（如 \cref{ch:rl-pg} 的随机策略）输出的\textbf{原始动作}（raw action）是神经网络从概率分布（locomotion 中通常是高斯分布）中采样得到的数值——它\emph{没有}物理单位，既不是 rad、也不是 rad/s 或 Nm，只是策略分布的输出坐标。物理单位由\emph{动作项}赋予，而非策略输出。三个框架的动作变换链一致\,\cite{isaaclab2024,mjlab2026,unilab2026}：
+\begin{equation}
+\texttt{processed\_action} = \texttt{raw\_action}\times\texttt{scale} + \texttt{offset}.
+\label{eq:rlmc-action-transform}
+\end{equation}
+若配置了裁剪，再对 processed action 做 clamp。UniLab 的这一步写在 \verb|envs/locomotion/common/base.py| 的 \verb|LocomotionBaseEnv.apply_action()| 里，字面就是 \verb|ctrl = exec_actions * action_scale + default_angles|——与 \cref{eq:rlmc-action-transform} 同构，只是它把这条公式\emph{硬编码}进了基类（默认即关节位置残差控制），而非像 Isaac Lab/mjlab 那样由可替换的动作项 cfg 决定。
+
+\begin{insight}[scale 与 offset 定义了策略探索的「坐标系」]\label{ins:rlmc-scale-offset}
+\cref{eq:rlmc-action-transform} 不是简单的单位换算——scale 与 offset 共同\emph{定义了策略探索的坐标系}。当采用「默认偏置」（见下）时，raw action 的零点对应安全、可解释、接近任务中性的控制目标；raw action 的单位步长对应机器人能承受的物理变化。这与控制工程的「工作点线性化」一脉相承：从稳定工作点出发的探索更易成功。这条类比也有边界——信号处理里的 DAC（数模转换）同样是「无量纲码字 $\times$ 参考电压 + 偏置」，但 DAC 的输出受硬件钳在 $[-1,1]$，而高斯采样\emph{没有}硬边界，需外部裁剪约束（见 \cref{sec:rlmc-clip}）。
+\end{insight}
+
+\subsection{实践：默认偏置（default offset）的设计哲学}
+\label{sec:rlmc-offset}
+
+经核对\,\cite{isaaclab2024}，Isaac Lab 的 \verb|JointPositionActionCfg| 与 \verb|JointVelocityActionCfg| 有 \verb|use_default_offset=True| 选项（\textbf{注意：} \verb|JointEffortActionCfg| \textbf{没有此选项}——力矩控制没有「默认偏置」概念）。当它为真时，\cref{eq:rlmc-action-transform} 的 offset 被覆盖为默认关节位置：
+\begin{equation}
+\texttt{target\_joint\_pos} = \texttt{raw\_action}\times\texttt{scale} + \mathbf q_{\text{default}}.
+\label{eq:rlmc-default-offset}
+\end{equation}
+于是 raw action 为零时机器人保持默认姿态（通常是安全站姿）。若没有默认偏置，raw action 为零意味着所有关节目标为 $0\,$rad——这通常\emph{不是}站姿。而训练初期策略的均值动作接近零，若零动作对应「瘫软」或「劈叉」，训练初期就充满摔倒与冲击。
+
+UniLab 把这条「默认偏置」哲学做成了\emph{默认且不可关}的行为：\cref{eq:rlmc-action-transform} 里的 \verb|offset| 在 \verb|apply_action| 中固定取 \verb|default_angles|，而 \verb|default_angles| 来自场景 MJCF/Motrix XML 里名为 \verb|home| 的 keyframe 的 \verb|qpos| 尾段（即设计者指定的默认站姿）。所以 UniLab 没有 \verb|use_default_offset| 这个布尔开关——它\emph{总是}用默认姿态作偏置（等价于 Isaac Lab 把该选项恒置为真）。这与全章主线一致：raw action 的零点天然对应安全站姿，训练初期不会因「零动作 = 劈叉」而崩。代价是若你想要\emph{非}残差式的绝对位置控制，UniLab 基类不直接支持，需自行覆写 \verb|apply_action|。
+
+\subsection{实践：action scale 的选择与诊断}
+\label{sec:rlmc-action-scale}
+
+action scale 不是任务通用常数，而是依赖机器人关节范围、默认姿态、电机能力与控制频率的特定参数。下表把「现象」映射到「scale 问题」与「第一检查项」，是日常调参的速查：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+观测现象 & 可能的 scale 问题 & 第一检查项 \\
+\midrule
+zero agent 姿态不合理 & offset 错（非 scale） & 默认关节位置 \\
+random agent 立即炸飞 & scale 太大或缺裁剪 & processed action 范围 \\
+策略动作长期贴边 & scale 太小 & raw action 分布 \\
+关节频繁撞限位 & scale 太大或 offset 偏 & 关节限位惩罚 \\
+高频抖动 & scale 大或动作惩罚弱 & 动作变化率惩罚 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[别把一台机器人的 scale 直接抄给另一台]
+不同机器人的 action scale 不能互抄。Isaac Lab 的 ANYmal-C locomotion 用 \verb|scale=0.5|\,\cite{isaaclab2024}；mjlab 的关节位置动作示例同样以 \verb|scale=0.5| 出现\,\cite{mjlab2026}；而 UniLab 的 \verb|PdControlConfig.action_scale|（在 \verb|envs/locomotion/common/base.py|）默认是 \verb|0.25|\,\cite{unilab2026}，其 Go2 joystick 任务即用此值（go2 rough 还把 hip/non-hip 关节拆成不同 \verb|action_scale| 分项）。这两个不同的默认值（$0.5$ vs $0.25$）\emph{不是}框架差异，而是\emph{机器人差异}（关节范围、PD 增益、默认姿态不同）：UniLab 的 Go2 与 Isaac Lab 的 ANYmal 本就是两台不同的机器人。每台新机器人都应用 zero agent 查默认姿态、用 random agent 查 processed target 范围，重新定标。改了 PD 增益（如 $K_p$ 翻 4 倍 $\Rightarrow$ 同样位置误差产生 4 倍力矩 $\approx$ 探索幅度增 4 倍）后，也必须重新评估 scale。
+\end{pitfall}
+
+\subsection{四种动作类型的深层比较}
+\label{sec:rlmc-action-deep}
+
+\cref{ins:rlmc-abstraction} 已点明「位置控制把动力学交给了 PD」。这里补足四种类型的物理特性与一个反事实推理：
+
+\textbf{Joint Position（位置目标）}是 locomotion 标准选择。策略输出关节位置目标 $\mathbf q_{\text{target}}$，PD 控制器算力矩
+\begin{equation}
+\boldsymbol\tau = \mathbf K_p(\mathbf q_{\text{target}}-\mathbf q) + \mathbf K_d(\dot{\mathbf q}_{\text{target}}-\dot{\mathbf q}),
+\label{eq:rlmc-pd}
+\end{equation}
+PD 承担「期望位置 $\to$ 实际力矩」的映射，策略不必理解动力学。代价是控制带宽受 PD 响应速度与刚度所限。
+
+\textbf{Joint Velocity（速度目标）}天然表达「运动连续性」（相邻帧速度变化比位置变化平滑），适合持续匀速任务；但在需精确静态位姿保持时较差（零速度目标不能保证静止，任何外力都会致位移累积）。
+
+\textbf{Joint Effort（力矩目标）}是最底层类型，策略直接输出力矩 $\boldsymbol\tau$，灵活性最大但须隐式学逆动力学，学习难度显著更高，多用于灵巧手与力控。其 scale 直接对应力矩范围，须精确匹配执行器规格。
+
+\textbf{Diff-IK（微分逆运动学）}把末端位姿增量经阻尼最小二乘解为关节目标（见 \cref{sec:rlmc-diffik}）。
+
+\begin{insight}[反事实：若给 locomotion 用力矩控制会怎样]\label{ins:rlmc-counterfactual}
+策略需\emph{同时}学会「站姿下抵消重力需多大力矩」与「怎样的力矩模式产生步态」——这两个子问题在位置控制中是\emph{分开}的（PD 处理重力补偿，策略专注步态）。耦合后训练时间可能增加 5--10 倍，且更易产生不稳定的高频力矩抖动。这正是 Rudin 等的 legged\_gym\,\cite{rudin2021minutes} 以及几乎所有 locomotion 基线都用关节位置控制的原因。
+\end{insight}
+
+\subsection{实践：裁剪的两个位置}
+\label{sec:rlmc-clip}
+
+动作裁剪（clip）在 Isaac Lab 与 mjlab 里存在于\emph{两个}位置\,\cite{isaaclab2024}：
+\begin{itemize}
+  \item \textbf{位置一·raw 裁剪}：RSL-RL 包装器的 \verb|clip_actions|（在 raw action 进入 \verb|env.step| 前 clamp，限制策略输出坐标）。经核对，它是 \verb|RslRlVecEnvWrapper| 与 runner cfg 的字段，类型 \verb|float | None|，\textbf{默认 \texttt{None}（即不裁剪）}，启用时做对称 $[-c,c]$ 钳位\,\cite{isaaclab2024}。
+  \item \textbf{位置二·processed 裁剪}：动作项 cfg 的 \verb|clip|（在 scale/offset 后 clamp processed action，限制物理控制目标）。
+\end{itemize}
+UniLab 因复用 RSL-RL runner，\emph{位置一}（raw 裁剪）的语义可经同名 runner 配置保留；但\emph{位置二}没有「动作项 cfg 的 \verb|clip| 字段」这一对应物——processed action 的物理约束改由场景模型本身承担（MJCF/Motrix XML 里执行器的 \verb|ctrlrange|/\verb|forcerange|/\verb|gear| 与关节 \verb|range|），即把「越界保护」下沉到了仿真器层而非配置层。这与全章主线一致：UniLab 把声明式配置项换成了「手写代码 + 模型文件约束」。
+
+\begin{pitfall}[别用 clip 掩盖 scale 错误]
+若只配 raw 裁剪，scale/offset 后仍可能越界；若只配 processed 裁剪，策略可能长期输出极端 raw action 然后被截断，造成梯度与执行之间的「饱和」效应。正确次序是：先把 scale 与 offset 调合理，再用 processed 裁剪做安全防线。
+\end{pitfall}
+
+\begin{codebox}[Python]{三框架动作配置对比（注意字段名与范式差异）}
+# ============ Isaac Lab ============ （字段：asset_name / joint_names）
+from isaaclab.utils import configclass
+from isaaclab.envs.mdp.actions import JointPositionActionCfg
+
+@configclass
+class ActionsCfg:
+    joint_pos = JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=[".*"],            # 正则匹配所有关节
+        scale=0.5,                     # 机器人相关，非通用常数
+        use_default_offset=True,       # offset = 默认关节位置（eq:rlmc-default-offset）
+    )
+
+# ============ mjlab ============ （字段：entity_name / actuator_names）
+from mjlab.envs.mdp.actions import JointPositionActionCfg as MjJointPosCfg
+actions = {
+    "joint_position": MjJointPosCfg(
+        entity_name="robot",           # mjlab 用 entity_name（非 asset_name）
+        actuator_names=(".*",),        # mjlab 用 actuator_names（非 joint_names）
+        scale=0.5,
+        use_default_offset=True,
+    ),
+}
+
+# ============ UniLab ============ （无 JointPositionActionCfg 类；动作=关节位置残差）
+# 动作语义固定在 LocomotionBaseEnv.apply_action：ctrl = act*action_scale + default_angles
+# 配置经 PdControlConfig（envs/locomotion/common/base.py），PD 增益喂给后端执行器：
+@dataclass
+class PdControlConfig:
+    Kp: float = 35.0                   # 后端位置执行器比例增益
+    Kd: float = 0.5
+    action_scale: float = 0.25         # eq:rlmc-action-transform 的 scale（Go2 默认）
+    simulate_action_latency: bool = True   # 用上一拍动作模拟一帧延迟
+# create_backend 把增益传给后端的位置执行器（默认 offset 即 keyframe "home" 的 qpos）：
+#   create_backend(..., position_actuator_gains={"kp": cfg.Kp, "kd": cfg.Kd})
+# Hydra 改增益/缩放：env.control_config.Kp=40 env.control_config.action_scale=0.25
+\end{codebox}
+
+\subsection{实践：任务空间动作与 Differential IK}
+\label{sec:rlmc-diffik}
+
+移动操作常需任务空间动作。Isaac Lab 的 \verb|DifferentialInverseKinematicsActionCfg| 把末端位姿命令经阻尼最小二乘（damped least-squares, DLS）IK 解为关节位置目标：
+\begin{equation}
+(\mathbf J^{\mathsf T}\mathbf J + \lambda^2\mathbf I)\,\Delta\mathbf q = \mathbf J^{\mathsf T}\,\Delta\mathbf x,
+\label{eq:rlmc-dls}
+\end{equation}
+其中 $\mathbf J$ 是末端雅可比，$\lambda$ 是阻尼。
+
+\begin{pitfall}[源稿的 DiffIK 字段名是\emph{编造}的——已据官方核实纠正]
+源稿声称 \verb|DifferentialIKActionCfg| 直接有 \verb|delta_pos_scale|、\verb|delta_ori_scale|、\verb|max_dq|、\verb|damping| 等字段。经核对 Isaac Lab 源码\,\cite{isaaclab2024}，\textbf{这些字段并不存在}（在 Cfg 与控制器 cfg 上都不存在）。真实接口是：
+\begin{itemize}
+  \item 类名是 \verb|DifferentialInverseKinematicsActionCfg|（不是 \verb|DifferentialIKActionCfg|），其字段为 \verb|asset_name|、\verb|joint_names|、\verb|body_name|、\verb|body_offset|（一个含 \verb|pos| 与 wxyz \verb|rot| 的 \verb|OffsetCfg|）、\verb|scale|、\verb|controller|；
+  \item 缩放经 Cfg 上的 \verb|scale| 字段；
+  \item 阻尼 $\lambda$ 是控制器 cfg \verb|DifferentialIKControllerCfg| 里 \verb|ik_params={"lambda_val": 0.01}| 的键（仅 \verb|ik_method="dls"| 时用），\textbf{不是}叫 \verb|damping| 的字段；
+  \item \textbf{没有} \verb|max_dq| 这个东西。
+\end{itemize}
+\end{pitfall}
+
+\begin{codebox}[Python]{Isaac Lab Differential IK 动作（已用真实字段）}
+from isaaclab.envs.mdp.actions import DifferentialInverseKinematicsActionCfg
+from isaaclab.controllers import DifferentialIKControllerCfg
+
+ee_action = DifferentialInverseKinematicsActionCfg(
+    asset_name="robot",
+    joint_names=["panda_joint.*"],
+    body_name="panda_hand",
+    scale=0.5,                          # 末端增量缩放（无 delta_pos_scale 这种字段）
+    controller=DifferentialIKControllerCfg(
+        command_type="pose",
+        use_relative_mode=True,         # raw action 解释为末端位姿【增量】
+        ik_method="dls",                # 阻尼最小二乘（eq:rlmc-dls）
+        ik_params={"lambda_val": 0.05}, # 阻尼 λ；奇异附近防关节速度爆炸
+    ),
+)
+\end{codebox}
+
+Diff-IK 的 raw action 语义是「末端位姿增量」$(\Delta\mathbf x,\Delta\boldsymbol\theta)$，不是关节空间增量——故 \verb|scale| 的物理含义与关节动作完全不同。$\lambda$（\verb|lambda_val|）太小时，雅可比接近奇异（手臂完全伸直）会产生极大关节速度；太大时 IK 解偏离目标。诊断「手臂锁死/末端抖动」：打印每步 IK 残差 $\lVert\mathbf J\Delta\mathbf q-\Delta\mathbf x\rVert$，若持续很大说明当前构型接近奇异或超出可达范围。
+
+\textbf{UniLab 在此处无对应}：经核对 UniLab 当前任务集，其动作族只到\emph{关节位置目标}（含带臂 loco-manipulation 的 \verb|Go2ArmManipLoco|，臂仍是关节位置控制）\,\cite{unilab2026}，\emph{未见}与 \verb|DifferentialInverseKinematicsActionCfg| 等价的任务空间 Diff-IK 动作族。若要在 UniLab 里做任务空间控制，需在环境子类的 \verb|apply_action| 里自行解 IK（如复用本节 \cref{eq:rlmc-dls} 的 DLS 公式把末端增量转成关节目标），框架不提供现成动作项。这是三框架对比里 UniLab 的一处真实欠缺，不应套用 Isaac Lab 的字段名硬凑。
+
+\subsection{实践：多段 action 的组合}
+\label{sec:rlmc-multiaction}
+
+移动操作的动作通常分段：base（机体系速度）、arm（绕默认姿态的关节增量）、末端 IK（任务空间相对增量）、gripper（归一化开合）。每段有独立 scale/offset/clip——\emph{不要}用一个全局 scale 控制所有自由度。多动作项的切片顺序由 cfg 顺序决定（Isaac Lab 与 mjlab 皆然\,\cite{isaaclab2024,mjlab2026}），\textbf{部署端必须按同样顺序解释 ONNX 输出}。UniLab 没有 \verb|ActionManager| 来自动按 cfg 切片，分段由你在 \verb|apply_action| 里\emph{手写} \verb|np.split|/索引完成（如 \verb|Go2ArmManipLoco| 把动作向量手动切成 base/arm 段），但「切片顺序必须与部署侧约定一致」这条铁律完全相同——且因为是手写，更要把每段的 \verb|(start, end)| 索引写进部署配置（UniLab 经 \verb|deploy_config.yaml| 的 \verb|obs_layout| 显式记录，见 \cref{sec:rlmc-onnx}）。
+
+\begin{codebox}[text]{移动操作 11 维 action 的切片划分（示意）}
+total_action_dim = 11
+  base_velocity:  [0:2]  -> 2D (vx, wz),  unit=m/s, rad/s
+  arm_joints:     [2:9]  -> 7D, scale=0.25, offset=default_arm_pos
+  gripper:        [9:11] -> 2D 左右指, scale=0.04, offset=0.04
+\end{codebox}
+
+\begin{pitfall}[搞错 term 顺序 = 全盘错配]
+\verb|ActionManager| 按 cfg 顺序切片分配 raw action。若 cfg 里 arm 在 base 前面，但部署端 ONNX 假设 base 在前，机器人会在该动手臂时移动底盘。自检：打印每个动作项的名称与 \verb|(start_idx, end_idx)| 切片范围；用 zero agent 确认每段零点行为；用 random agent 单独给一段非零值，验证物理效果。
+\end{pitfall}
+
+\subsection{为什么 last\_action 是 observation}
+\label{sec:rlmc-lastaction}
+
+velocity 的 actor 项里含 \verb|last_action|，它读的是 raw policy output（\emph{不是} processed joint target）。策略知道自己上一拍在 raw action 空间做了什么，利于平滑动作；奖励里的动作变化率惩罚（action rate penalty）也基于 raw action 差分，策略便在\emph{同一坐标系}里学「保持动作连续」。若 \verb|last_action| 改用 processed action，当 scale 是 per-joint 不同时，动作历史会混入物理尺度，让动作变化率惩罚的物理含义变得不透明。这正回扣 \cref{sec:rlmc-obs-families} 把 $a_{t-1}$ 列为本体感知一员的理由。三框架在这点上一致：UniLab 的 \verb|_compute_obs| 把上一拍动作以 \verb|info["current_actions"]| 拼进 actor 观测（见 \cref{sec:rlmc-groups} 的 UniLab codebox），读的同样是 raw action，其 \verb|action_rate| 奖励函数（\verb|envs/locomotion/common/rewards.py|）也对 raw action 差分。
+
+\subsection{动作管线的完整数值追踪}
+\label{sec:rlmc-action-trace}
+
+用 Go1 右前腿髋关节的实际参数追踪一个 raw action 从网络输出到物理执行的全过程（设 $\mathbf q_{\text{default}}=0.1\,$rad，$\texttt{scale}=0.25$，关节限位 $[-0.8,0.8]\,$rad）：
+
+\begin{enumerate}
+  \item \textbf{策略采样}：训练初期高斯分布均值 $\approx 0$、标准差 $\approx 1$，采样值多在 $[-2,2]$。设 raw\_action $=0.6$。
+  \item \textbf{raw 裁剪}：若 \verb|clip_actions=None|（默认不裁剪），$0.6$ 通过。
+  \item \textbf{动作项处理}：\cref{eq:rlmc-action-transform} 给 processed\_action $=0.6\times0.25+0.1=0.25\,$rad，即发给 PD 的目标关节位置。
+  \item \textbf{processed 裁剪}：$0.25\in[-0.8,0.8]$，通过。（若 raw\_action$=3.0$，则 $3.0\times0.25+0.1=0.85$ 越界，被 processed 裁剪到 $0.8$。）
+  \item \textbf{PD 执行}：\cref{eq:rlmc-pd} 用 $K_p=20$、$K_d=0.5$（Go1 典型值），若 $q_{\text{current}}=0.15$，则 $\tau=20(0.25-0.15)+0.5(0-\dot q)=2.0-0.5\dot q\;$Nm。
+\end{enumerate}
+
+\begin{insight}[action scale 的双重解读]\label{ins:rlmc-scale-dual}
+同一 scale 可从两个互补角度理解。\textbf{控制论视角}：scale 是策略输出空间到物理控制空间的\emph{增益}，增大 scale 等于增大控制增益——响应更快但更易不稳，恰如 PD 的 $K_p$。\textbf{优化视角}：scale 是策略梯度在物理空间的\emph{步长}，增大 scale 使策略参数的微小变化在物理空间产生更大效果——梯度信号更强但更不稳，恰如深度学习的 learning rate。这解释了一条常见调参经验：训练初期快速收敛但后期振荡 $\to$ 减小 scale；长期不收敛、奖励几乎不变 $\to$ 增大 scale。
+\end{insight}
+
+\begin{practice}[练习·动作空间]
+\begin{enumerate}
+  \item \textbf{[计算]} Go1 某关节默认位置 $0.8\,$rad、scale $0.5$。raw action $=0.6$ 时 processed action 是多少？若限位 $[-0.3,1.5]\,$rad，是否安全？
+  \item \textbf{[设计]} 为移动操作机器人设计 action 分段：base（2D 速度）、arm（6 自由度关节位置）、gripper（1D 开合）。给出每段 scale/offset/clip 的理由，以及 ONNX 部署时的后处理要求。
+  \item \textbf{[跨章综合]} 初始探索的物理幅度由策略分布的初始标准差 $\sigma_0$ 与 action scale 共同决定。若 Go1 \verb|scale=0.25|、$\sigma_0=1.0$，估算训练初期 95\% 的 processed action 变化范围；若想把它压到 $\pm0.1\,$rad（精细操作），给出至少两种调整方案并析其利弊。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{前沿案例：HOVER 的多模态 mask 条件观测}
+\label{sec:rlmc-hover}
+
+前几节的 actor/critic 框架假设任务是\emph{单一}的——一个策略对应一套观测和一种控制目标。但真实人形机器人场景多样：有时需关节级精确控制（跳跃），有时需末端跟踪（操作），有时需全身姿态控制（舞蹈模仿）。为每种场景单独训练一个策略既低效、部署切换也麻烦。HOVER\,\cite{he2025hover} 给出了一个把「观测设计」推到前沿的答案，正好检验 \cref{sec:rlmc-markov} 原则一的边界。
+
+\begin{note}[关于 HOVER 的实现框架——一处需澄清的事实]
+源稿称 HOVER「构建在 Isaac Lab 之上，使用 RSL-RL」。经核对其论文\,\cite{he2025hover}，论文正文写的是在 \textbf{IsaacGym} 上评测，且\emph{未}提及 RSL-RL（HOVER 沿袭 OmniH2O/H2O 一脉，后者基于 IsaacGym）。公开代码库与论文可能有出入，但就论文而言应为 IsaacGym。此处据论文修正，其 obs 设计思想仍可迁移到 Isaac Lab / mjlab。\pz{若以 NVlabs/HOVER 代码库为准需另行核对其后端}
+\end{note}
+
+\subsection{核心思想：用 mask 把「任务条件」从硬编码变软编码}
+
+HOVER 的核心思想是：用\emph{一个}统一策略支持多种控制模态，通过观测中的 \textbf{mask} 告诉策略「当前该关注哪种控制目标」。这是 \cref{sec:rlmc-markov} 马尔可夫性原则的高级应用——mask 本身就是「当前任务是什么」的条件信息，与速度命令功能类似，只是粒度更细。其观测结构可拆为三部分：
+\begin{equation*}
+o = [\,\underbrace{\text{proprioception}}_{\text{所有模态共享}}\;\mid\;\underbrace{\text{task\_target}\;\mid\;\text{task\_mask}}_{\text{模态相关}}\,].
+\end{equation*}
+proprioception 部分（关节位置/速度、机体角速度、重力投影、上一拍动作）在所有模态下完全相同，正是 \cref{sec:rlmc-obs-families} 的本体感知「最小集合」；task\_target 随模态变化（关节模态给目标关节角，末端模态给五个末端的 6D 位姿目标，全身模态给三者组合）。
+
+\subsection{两种 mask 的精细设计}
+
+经核对论文\,\cite{he2025hover}，HOVER 实际用\textbf{两种独立 mask}，且分别独立作用于上半身与下半身：
+\begin{itemize}
+  \item \textbf{Mode mask} $M_{\text{mode}}$：选择激活哪种控制子空间（kinematic position tracking / local joint angle tracking / root tracking）；
+  \item \textbf{Sparsity mask} $M_{\text{sparsity}}$：在已激活的子空间内进一步随机屏蔽部分目标维度（如即使位置跟踪被激活，也可能只激活左手目标而屏蔽右手）。
+\end{itemize}
+二者组合为
+\begin{equation}
+s^{g\text{-student}}_t \triangleq M_{\text{sparsity}}\odot\big[\,M_{\text{mode}}\odot s^{g\text{-upper}}_t,\ M_{\text{mode}}\odot s^{g\text{-lower}}_t\,\big],
+\label{eq:rlmc-hover-mask}
+\end{equation}
+每个 mask 的每一位从伯努利分布 $\mathcal B(0.5)$ 采样，回合开始时随机生成并在回合内固定\,\cite{he2025hover}——确保 student 训练中等概率遍历「只控左手」到「全身跟踪」的所有控制模式组合。
+
+\subsection{mask 条件蒸馏与 student 的历史观测}
+
+HOVER 训练分两阶段\,\cite{he2025hover}：阶段一为每种模态单独训练专家 teacher（可用特权 critic 加速）；阶段二蒸馏出统一 student，通过随机采样 mask 在模态间切换。蒸馏用 \textbf{MSE 动作匹配}（DAgger 框架）而非 KL：
+\begin{equation}
+\mathcal L = \lVert\hat a_t - a_t\rVert_2^2,
+\label{eq:rlmc-hover-dagger}
+\end{equation}
+其中 $\hat a_t$ 是 teacher 在 student 当前状态下给出的参考动作。选 MSE 而非 KL 的工程原因是：MSE 直接在动作空间匹配，不需对 teacher 的动作分布做参数化假设，teacher 的确定性动作足以作监督信号。
+
+关键是 student 与 teacher 的观测差异：student 用\textbf{本体历史}——堆叠最近 25 个时间步的 proprioception 与 24 步 past actions\,\cite{he2025hover}：
+\begin{equation*}
+o^{\text{student}}_t = [\mathbf q,\dot{\mathbf q},\boldsymbol\omega_{\text{base}},\mathbf g]_{t-25:t}\ \cup\ [a_{t-25:t-1}].
+\end{equation*}
+$25$ 帧（HOVER 论文逐字给出此堆叠长度\,\cite{he2025hover}，其前身 OmniH2O\,\cite{he2024omnih2o} 亦用 $25$ 步本体历史）在 $50\,$Hz 控制频率下约对应 $0.5\,$s 窗口（\pz{HOVER 论文未明写策略推理频率，$50\,$Hz 系本书据同源 H1/G1 人形 WBC 工作的标准取值推得——该谱系普遍跑 $50\,$Hz 策略；落地以你的部署频率为准}）——足以让 student 隐式估计地面特性与动力学参数，替代 teacher 用的特权 terrain/physics 信息。这正是 \cref{ins:rlmc-history} 「不可消除的部分可观测 $\to$ 从历史推断」原则的又一实例，也与 \cref{ins:rlmc-baselin} 方案三（师生蒸馏估线速度）同源。
+
+\begin{note}[在三框架里复现 HOVER 式观测：UniLab 的部分支持与真实欠缺]
+HOVER 的 obs 设计思想（多模态目标 $+$ mask $+$ 本体历史 student）与具体后端无关，可在 Isaac Lab/mjlab 复现。UniLab 这里是「\emph{部分}对得上」\,\cite{unilab2026}：它原生有 G1 动作跟踪系列任务（\verb|G1MotionTracking| 等），且专门有一个部署导向变体 \verb|G1WBTObs|——它正是「去掉真机不可得通道（base\_lin\_vel、motion\_anchor 等）、改用本体感知历史」的 student 式观测，与上式 $o^{\text{student}}$ 的构造同出一辙，可直接拿来当 HOVER student 观测的骨架。但 HOVER 的\emph{核心机制}——两种 mask（mode mask $+$ sparsity mask，\cref{eq:rlmc-hover-mask}）随机屏蔽上/下半身的多模态目标——UniLab 任务集里\textbf{无现成对应}，需在 G1 任务的 \verb|_compute_obs| 里自行实现 mask 采样与目标拼接。这是一处诚实的边界：UniLab 给了「本体历史 student」的现成件，没给「mask 条件多模态」的现成件。
+\end{note}
+
+\begin{insight}[mask 是更高级的「command」]\label{ins:rlmc-hover}
+HOVER 的 mask 本质上把「任务条件」从\emph{硬编码}（一个任务对应一个 env cfg）变成\emph{软编码}（一个 env cfg 经 obs 里的 mask 支持多种任务模式）。若说 velocity 任务的 command 是「告诉策略\emph{目标值}」（what to achieve），HOVER 的 mask 则是「告诉策略\emph{目标结构}」（what to pay attention to）。它给 \cref{sec:rlmc-principles} 四原则带来两个扩展：(1) 马尔可夫性要求观测含「当前任务是什么」的信号——单任务时 command 足矣，多模态时 mask+多模态目标必不可少；(2) 低维性的本质不是「维度越低越好」，而是「维度不应超过任务的信息需求」——HOVER 观测维度远高于 velocity 任务，但这不是违反低维性，而是任务信息需求本就更高。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{实践（二）：部署边界与 Smoke Test}
+\label{sec:rlmc-deploy}
+
+设计、接线之后，最后一道工序是\emph{验证接线正确}并\emph{写清部署边界}。这一节把 \cref{ins:rlmc-contract} 的「契约」落成可执行的检查流程。
+
+\subsection{ONNX 不是完整控制器}
+\label{sec:rlmc-onnx}
+
+部署常把 actor 网络导出为 ONNX。经核对\,\cite{isaaclab2024}，Isaac Lab 的导出函数是 \verb|export_policy_as_onnx|（位于 \verb|isaaclab_rl.rsl_rl.exporter|，默认输出 \verb|policy.onnx|，可带 normalizer）。\textbf{关键认识：ONNX 通常只含 actor 网络推理（MLP 权重 + 激活，可能含 normalizer），不含环境、manager、传感器驱动与安全逻辑。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lcl@{}}
+\toprule
+项目 & 在 ONNX 内 & 部署要求 \\
+\midrule
+actor MLP 权重 & \checkmark & 加载 ONNX \\
+actor obs 顺序与名称 & 部分 & 读 metadata 或任务文档 \\
+项级 scale & $\times$ & 部署端复现 \\
+history buffer & $\times$ & 部署端维护 \\
+command 生成 & $\times$ & 上层控制器提供 \\
+action scale/offset & $\times$ & 部署端复现（\cref{eq:rlmc-action-transform}） \\
+关节目标安全裁剪 & $\times$ & 控制端复现 \\
+critic 网络 & $\times$ & 不需要 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表就是 \cref{ins:rlmc-contract} 契约的清单：每一个标 $\times$ 的行，都是部署端必须自己复现的「契约条款」。缺任何一项，部署端就无法正确复现策略的输入输出。它应随 ONNX 与 checkpoint 一起版本管理。
+
+UniLab 在「把契约写成可执行文件」这件事上反而\emph{比另两者更进一步}\,\cite{unilab2026}：它同样导出 \verb|policy.onnx| 并用 onnxruntime 自验（导出后立刻起一个 \verb|InferenceSession|，比对 ONNX 与 PyTorch 输出的最大/平均差，打印 \verb|"ONNX export verified OK"|），但它还在 \verb|scripts/deploy/| 下提供 \verb|export_deploy_config.py|——把上表里那些标 $\times$ 的「部署端必须复现」项（\verb|obs_layout|/\verb|obs_dim|/\verb|default_angles|/动作 \verb|scale|）显式落进一份 \verb|deploy_config.yaml|，再用 \verb|sim_prototype.py| 拿 ONNX 在 MuJoCo 里逐段校验「部署侧 obs 装配 == 训练侧」。一个时机差异要记住：UniLab 的 PPO 在 \verb|play|/\verb|eval| 阶段才导 ONNX（故 \verb|training.no_play=true| 的纯训练跑\emph{不}产 ONNX），off-policy 则由 \verb|training.export_onnx| 标志在训练流程内导——这与 mjlab「训练后自动导」不同。归一化层（\verb|empirical_normalization=true| 时）经 rsl-rl 写进 ONNX，与 mjlab 一致。
+
+\begin{pitfall}[归一化部署遗漏——最隐蔽的部署 bug 之一]
+若训练时打开了 actor 观测归一化（\cref{sec:rlmc-scale}），其 running statistics 是训练状态的一部分。导出 ONNX 后若没包含等价归一化层，策略输入分布整体偏移，行为完全异常。这就是为什么 \cref{sec:rlmc-scale} 反复强调「优先用项级 scale、谨慎用模型级归一化、一旦打开就写清边界」。
+\end{pitfall}
+
+\subsection{从零搭起：拿到一台新机器人，怎么搭出第一个能跑的任务}
+\label{sec:rlmc-fromzero}
+
+前面各节教的是「改了 obs/action 怎么验」，但很多读者真正卡住的是更前一步：\emph{面对一台全新机器人、一张空白 cfg，第一项观测、第一个} \verb|scale| \emph{该填什么}？本小节给一份最小骨架的搭建次序——它不追求最终性能，只追求「以最少的项、最快地跑通到 random agent 不炸飞」，把性能调优留给后续奖励/PPO 章。\textbf{工程上真实的起点几乎从不是空文件，而是「复制一个最接近的现成任务再改」}（mjlab 复制 \verb|tasks/velocity/config/<robot>|、Isaac Lab 复制 \verb|.../velocity/config/anymal_c|、UniLab 复制 \verb|envs/locomotion/go2|），下面的「从零」是为了讲清\emph{每一步在填什么、为什么}，照着它你也能看懂那份现成 cfg 在做什么。
+
+\begin{enumerate}
+  \item \textbf{先放\emph{最小} actor 观测集（别贪多）}。locomotion 的不可省核心就五类，全部部署可得（\cref{sec:rlmc-obs-families} 本体感知）：机体角速度 $\boldsymbol\omega_{\text{base}}$、重力投影 $\mathbf g_{\text{proj}}$、关节位置 $\mathbf q$（相对默认姿态）、关节速度 $\dot{\mathbf q}$、上一拍动作 $a_{t-1}$；条件任务再加命令 $\mathbf c$（原则一，否则学不会跟命令）。\textbf{第一版先不加 height-scan、不加历史、不加任何特权项}——把 POMDP 难度压到最低，先确认接线通。
+  \item \textbf{critic 观测 $=$ actor $+$ 几个低维特权项}。最划算的一项就是机体线速度真值 $\mathbf v_{\text{base}}$（\cref{ins:rlmc-baselin}：真机难测、仿真免费、对价值估计极有用），它\emph{只}进 critic。先只加这一项，别一上来把深度图塞进 critic（\cref{sec:rlmc-why-asymmetric} 反例一）。
+  \item \textbf{动作选关节位置 $+$ 默认偏置}。这是 locomotion 的稳妥默认（\cref{ins:rlmc-counterfactual}）：\verb|use_default_offset=True|（UniLab 恒为真），让 raw action 零点对应安全站姿。
+  \item \textbf{\texttt{scale} 初值不要猜，用 zero/random 反推}。先填一个保守值（腿足关节位置 \verb|scale| 多在 \texttt{0.25}--\texttt{0.5} 量级，见 \cref{sec:rlmc-action-scale} 的 ANYmal~\texttt{0.5}/Go2~\texttt{0.25}），\emph{然后用 random agent 实测校准}：跑几步看 processed 关节目标是否落在限位中部 $50\%$--$80\%$（\cref{ins:rlmc-healthy-range}）——贴边就调小、挤在中心就调大。\textbf{第一次定 \texttt{scale} 靠的是「跑一次量一下」，不是查表抄数字}。
+  \item \textbf{用 manager 的 repr 核对维度，再开始训练}。环境一建好先 \verb|print(env.observation_manager)|（\cref{ins:rlmc-managerstr}）确认 actor/critic 维度与你手算一致、且 critic 比 actor 多出的正好是那几个特权项；再按下面七步 smoke test 跑通 zero$\to$random$\to$短训练。
+\end{enumerate}
+
+\begin{insight}[第一次接线 checklist：把上面五步压成可勾选的一张表]\label{ins:rlmc-firstwire}
+搭新任务时按序自检，每条都能在「跑一次 $+$ 读框架输出」内确认，不必读完全部源码：
+\begin{enumerate}
+  \item actor 只含部署可得信号了吗？（无 $\mathbf v_{\text{base}}$ 真值、无接触力真值、无地形精确高度——原则二）
+  \item 条件任务的命令 $\mathbf c$ 进 actor 了吗？（不进就只会站着抖——原则一）
+  \item critic $=$ actor $+$ 低维特权，且 \verb|enable_corruption=False| 了吗？（\cref{sec:rlmc-corruption}）
+  \item 动作 \verb|use_default_offset=True|、zero agent 下机器人是站姿而非劈叉吗？
+  \item random agent 下 processed 目标落在限位中部、没被狂裁吗？（\cref{ins:rlmc-healthy-range}）
+  \item \verb|print(env.observation_manager)| 显示的 actor/critic 维度差 $=$ 你加的特权项维度之和吗？（\cref{ins:rlmc-managerstr}）
+\end{enumerate}
+六条全过，再上规模训练；任一条不过，就停在这步修——这正是 \cref{sec:rlmc-principles} 四原则在「搭建期」的落地形态。
+\end{insight}
+
+\subsection{七步 Smoke Test}
+\label{sec:rlmc-smoke}
+
+下列流程同时适用于三个框架（命令格式各自替换）。每步都有明确通过标准——任一步失败，先修复再继续，\emph{不要}跳过。
+
+\begin{codebox}[bash]{mjlab 七步 smoke test（命令经核对：tyro CLI + uv run）}
+# 1. CLI help（确认安装与注册，无 ImportError）
+uv run train --help && uv run play --help
+# 3. zero agent：环境创建、manager 打印、机器人保持默认站姿
+uv run play Mjlab-Velocity-Flat-Unitree-G1 --agent zero --num-envs 4
+# 4. random agent：连续 step 无 NaN，运动明显但不炸飞
+uv run play Mjlab-Velocity-Flat-Unitree-G1 --agent random --num-envs 4
+# 5. 小规模训练 2 迭代：无 group key error / action dim mismatch
+uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+  --env.scene.num-envs 16 --agent.max-iterations 2
+# 6. 中等 GPU 训练 10 迭代：steps/s 稳定、显存不持续涨、reward 非 NaN
+uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+  --env.scene.num-envs 512 --agent.max-iterations 10
+# 7. 完整任务 zero agent（rough 变体）：critic 含特权项、含 terrain 扫描
+uv run play Mjlab-Velocity-Rough-Unitree-G1 --agent zero --num-envs 4
+\end{codebox}
+
+\begin{note}[第三个 agent：\texttt{--agent trained} 回放 checkpoint]
+\verb|play| 的 \verb|--agent| 实测有三个取值 \verb|{zero,random,trained}|（\verb|play --help| 直接可见），上面只用了前两个做冒烟。第三个 \verb|trained| 是\textbf{加载已训 checkpoint 回放}的入口——训练出第一版策略后，用 \verb|uv run play Mjlab-Velocity-Flat-Unitree-G1 --agent trained --num-envs 4| 在 Viser 里看它实际怎么走，是部署前最常用的可视化手段（也是肉眼发现「步态发抖/打滑」等 random/zero 看不出的问题的地方）。Isaac Lab 侧对应的是单独的 \verb|play.py|（加 \verb|--checkpoint| 指向权重），UniLab 侧则是上文的 \verb|eval --load-run -1|。
+\end{note}
+
+UniLab 的 smoke test 形态略有不同：它的 \verb|play|/\verb|eval| 路径不像 mjlab 那样直接提供 \verb|--agent zero|/\verb|random|，\textbf{冒烟以「极短训练 + 回放」代替}\,\cite{unilab2026}（本书已在两后端实跑验证此范式：Go2 joystick 各跑满数迭代、约 $4600$--$8900$ env-steps/s、reward 各项正常、无 NaN）。三框架的检查\emph{意图}完全相同（能创建环境、能连续 step 不炸、obs/action 维度对、能跑起训练循环），只是命令形态各异。
+
+\begin{codebox}[bash]{UniLab 冒烟（短训练代替 zero/random agent；env 数/迭代走 Hydra）}
+# 1. 极短训练冒烟：env 数与迭代数走 Hydra 覆盖（不是 flag），no_play 跳过回放
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+# 2. 换后端再验一遍（同一任务，MuJoCo<->Motrix；sim2sim 契约会强制一致）
+uv run train --algo ppo --task go2_joystick_flat --sim motrix \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+# 3. 中等规模 + 回放并导出 ONNX（eval 阶段才导 policy.onnx + onnxruntime 自验）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=2048 algo.max_iterations=300
+uv run eval  --algo ppo --task go2_joystick_flat --sim mujoco \
+    --load-run -1 --render-mode record
+# 4. 异步 collector-learner（APPO，最能体现 CPU-sim/GPU-policy 解耦）
+uv run train --algo appo --task go2_joystick_flat --sim mujoco algo.num_envs=2048
+\end{codebox}
+
+\begin{pitfall}[train/play 的 CLI 参数别混用（三框架各有各的坑）]
+mjlab 中训练环境数量是嵌套字段 \verb|--env.scene.num-envs 4096|，play 是顶层 \verb|--num-envs 4|\,\cite{mjlab2026}；Isaac Lab 中对应参数也有不同路径。混用\emph{不报错}但参数无效——环境以默认数量创建，实验记录失真（源稿失败案例六）。UniLab 则相反地把 \verb|--algo|/\verb|--task|/\verb|--sim| 这几个路由键设为\emph{必须用 flag}（RESERVED，Hydra 透传会直接 \verb|SystemExit|），而 env 数/迭代数\emph{必须走 Hydra 覆盖}（\verb|algo.num_envs=...|，不是 flag）——写反了同样得不到预期配置\,\cite{unilab2026}。
+\end{pitfall}
+
+\subsection{诊断脚本：每次改 obs/action 都先跑它}
+\label{sec:rlmc-diagnostic}
+
+\begin{codebox}[Python]{随机 agent 跑几步，打印 obs/action 统计与 NaN 检查}
+import torch
+
+def print_obs_action_stats(env, num_steps=5):
+    """改完 obs/action 配置后先跑 5-10 步 random agent，核对接线。"""
+    obs_dict, _ = env.reset()
+    am = env.action_manager
+    for step in range(num_steps):
+        actions = torch.rand(env.num_envs, am.total_action_dim,
+                             device=env.device) * 2.0 - 1.0
+        obs_dict, *_ = env.step(actions)
+        actor_obs = obs_dict["policy"]      # Isaac Lab 环境 group 名；mjlab 用 "actor"
+        print(f"[step {step}] actor obs {tuple(actor_obs.shape)} "
+              f"range=[{actor_obs.min():.3f}, {actor_obs.max():.3f}]")
+        # am.action 是发给环境的 raw action；processed 目标在各 term 上
+        first = am.active_terms[0]           # active_terms 是 list[str]
+        processed = am.get_term(first).processed_actions
+        print(f"          processed[{first}] "
+              f"range=[{processed.min():.3f}, {processed.max():.3f}]")
+        if torch.isnan(actor_obs).any():
+            print("  !! NaN in actor observation")
+\end{codebox}
+
+若 obs 范围超出约 $[-50,50]$ 或 processed action 超出关节限位，说明 scale 或 cfg 有问题。中期（训练 50--100 迭代后）还应做更深的检查：reward 分项分析（若命令跟踪奖励不升而动作变化率惩罚在降，说明策略在学「不动」——多半是 action scale 太小或 command 没正确进 obs）、action 分布检查（raw action 的 mean 长期偏离 0 提示 offset 不对）、obs 值域检查（某项比其他项大两个数量级以上，考虑加项级 scale）。
+
+\begin{insight}[给「异常」装上量纲：几个可照搬的健康区间锚点]\label{ins:rlmc-healthy-range}
+「scale 太大/太小」「steps/s 太低」这类判断若没有数量级锚点，初学者根本不知道多少算异常。下面几个区间来自本书在 RTX~4090 上的实跑，可作首次自检的参照尺（你的机器/任务会有偏移，但量级可借）：
+\begin{itemize}
+  \item \textbf{processed action 相对关节限位}：random agent（raw $\sim\mathcal U(-1,1)$）下，健康的 \verb|scale|/\verb|offset| 应让 processed 关节目标落在限位的约 \textbf{中部 $50\%$--$80\%$}、\emph{偶尔}触界。若几乎每步都贴在限位（占满 $100\%$ 甚至被裁剪），\verb|scale| 偏大；若始终挤在限位中心一小段（$<20\%$），\verb|scale| 偏小（对应 \cref{sec:rlmc-action-scale} 表的「贴边」与「炸飞」两行）。
+  \item \textbf{steps/s 的合理量级}：纯本体 locomotion 在 4090 上，\emph{大} batch（数千 env）稳态可达 $10^4$ 量级；但\emph{小} env 数受 CPU 与启动开销主导——实跑 mjlab \verb|Velocity-Flat-G1| \texttt{64}~env 仅 $1.6$k$\to$稳态 $\sim\!2.5$k steps/s，UniLab go2 \texttt{16}~env（CPU 物理）约 $0.6$k。\textbf{所以小 env 数下数字低是正常的，别被首迭代的低值吓到}（JIT/CUDA-graph 预热也占掉头一两迭代）。真正的告警信号是\emph{同规模下吞吐突然掉一个数量级}（如本应数千却只有几百）——这强烈提示观测/奖励函数里混进了不可并行的 Python \verb|for| 循环（\cref{sec:rlmc-compute} 铁律三），按 \cref{sec:rlmc-compute} 排查即可。
+\end{itemize}
+怎么读出这两个数：steps/s 直接看训练每行的 \texttt{... steps/s}；processed action 占限位比例用上面的诊断脚本打 \verb|processed.min()/.max()| 除以关节 \verb|range| 即得。\textbf{把这两个比值当成每次改 scale 后的「体温计」，比凭感觉「看着像炸了」可靠得多。}
+\end{insight}
+
+在 UniLab 里跑等价诊断要改三处\,\cite{unilab2026}：(1) 没有 \verb|action_manager|，动作维度从 \verb|env.action_space| 或后端 \verb|num_actuators| 取，动作是 \verb|np.ndarray| 不是 \verb|torch.Tensor|；(2) actor 观测的 group 名是 \verb|"obs"|（不是 \verb|"policy"|/\verb|"actor"|），从环境返回的 \verb|NpEnvState.obs["obs"]| 取，critic 取 \verb|obs["critic"]|；(3) 手写的 \verb|torch.isnan| 检查在 UniLab 里部分\emph{多余}——它内建 \verb|NanGuard|（\verb|utils/nan_guard.py|）在 \verb|step()| 里自动查动作/obs/reward 的非有限值并 dump 物理快照，事后还能用 \verb|unilab-viz-nan <dump>| 离线回放出事前那几帧来复现。所以「改完 obs/action 先跑几步看统计」的纪律三框架一致，只是 UniLab 把 NaN 那一环升级成了带离线复现的工具链。
+
+\begin{insight}[别手写打印维度——manager 的 \texttt{repr} 自带这张表]\label{ins:rlmc-managerstr}
+上面的诊断脚本是为「自定义检查」准备的，但若你\emph{只}想知道「每个 group / 每一项的实际 shape 是多少」（即 \cref{sec:rlmc-obsgroups} Bug~2 要查的东西），不必手写——Isaac Lab 与 mjlab 的 \verb|ObservationManager| / \verb|ActionManager| 都重载了 \verb|__str__|，环境一创建好直接打印即可：
+\begin{codebox}[Python]{用 manager 的 repr 一行打出逐项维度（实跑已验证此表自动生成）}
+# 环境创建后（zero/random agent 启动时框架其实已自动打印一次）：
+print(env.observation_manager)   # 表格化列出每个 group 的逐项 shape 与该 group 总维
+print(env.action_manager)        # 列出每个 action term 的名称、维度与切片范围
+\end{codebox}
+在 gpufree 上实跑 \verb|Mjlab-Velocity-Rough-Unitree-G1| 时，框架\emph{自动}打出的表里清楚写着 \verb|actor| 组共 \texttt{286} 维、\verb|critic| 组 \texttt{298} 维（多出的 \texttt{12} 维正是特权项：\verb|foot_height|~\texttt{2} 维 $+$ \verb|height_scan|~\texttt{187} 维等），二者维度差一眼可见、无需心算。这就是 \cref{sec:rlmc-obsgroups} 那条「不报错却悄悄变慢」的 Bug~2 的现成探针：\textbf{若 actor 与 critic 维度相同，几乎可断定特权项没进 critic}。UniLab 没有 manager 对象，但等效信息在\emph{训练启动日志}里——它会打印 actor/critic 两个 MLP 的结构（如 critic 首层 \verb|in_features=52|），首层输入维即各组观测维（实跑 go2 joystick 正是 \verb|obs|~49 / \verb|critic|~52）。一句话：三框架都能「不写代码就读出维度」，只是 Isaac Lab/mjlab 看 manager repr、UniLab 看网络结构日志。
+\end{insight}
+
+\begin{practice}[一次真实排错：从 KeyError 到定位失效 term]
+教学不该只给「症状$\to$原因」表，更要演示\emph{怎么自己查}。下面是一段在服务器上真实可复现的排错命令序列（mjlab 形态，Isaac Lab/UniLab 同理替换入口），目标是把抽象的「诊断流程」落成可敲的键盘动作。
+
+\textbf{场景一·改完 obs 组名后训练秒崩（KeyError）。}首跑别上大 env 数，先用最小 env 数 $+$ 极短迭代把接线跑通：
+\begin{codebox}[bash]{先用极短训练暴露 group/维度错配，再看报错定位}
+# 故意/无意把 obs_groups 的某个值写错 group 名时，这一步会立刻 KeyError
+WANDB_MODE=disabled mjlab train Mjlab-Velocity-Flat-Unitree-G1 \
+    --env.scene.num-envs 16 --agent.max-iterations 2
+# 预期(接线正确)：EXIT 0，刷出 "... steps/s" 与 value/surrogate loss，无 NaN
+# 预期(group 名错)：栈顶是 KeyError: '<写错的名字>'，且紧邻一行会打印
+#                   环境真实拥有的 group 名集合 —— 直接照它改 obs_groups 即可
+\end{codebox}
+关键纪律：\textbf{KeyError 的栈里通常就带着「环境实际有哪些 group」}，不要去翻配置文件猜，照报错里那份 key 列表改 \verb|obs_groups| 的值即可（对应 \cref{sec:rlmc-obsgroups} Bug~1）。
+
+\textbf{场景二·能跑但不学习（某 reward term 恒为零）。}训练起得来、loss 在动，但命令跟踪奖励不升。先让框架把\emph{逐项} reward 打出来，再看哪一项是死的：
+\begin{codebox}[bash]{让逐项 reward 日志暴露失效 term}
+# 跑十几迭代，盯每行 Episode_Reward/<term>（mjlab 是 Metrics/* 与奖励分项；
+# Isaac Lab 是 Episode_Reward/<term>；UniLab 日志前缀是 reward/<term>）
+WANDB_MODE=disabled mjlab train Mjlab-Velocity-Flat-Unitree-G1 \
+    --env.scene.num-envs 512 --agent.max-iterations 20
+# 读法：哪个 Episode_Reward/<term> 恒为 0 或不随训练变化，问题就在那个 term。
+#   命令跟踪项恒 0 → 多半 command 没进 actor 观测(原则一) 或 action scale 太小；
+#   某惩罚项异常大 → 它在主导梯度，先把它的 weight 调小做消融。
+\end{codebox}
+
+\textbf{场景三·OOM（显存炸了）。}多发于把 \verb|num_envs| 或 history 一次拉太大。用 \verb|nvidia-smi| 边跑边看，而非盲目减半：
+\begin{codebox}[bash]{用 nvidia-smi 实时定位显存占用，再决定砍 env 还是砍 history}
+# 终端 A：每 0.5 s 刷新一次显存
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv -l 1
+# 终端 B：从能跑的规模逐级加 env 数，看显存在哪一档逼近上限(RTX 4090=24 GB)
+WANDB_MODE=disabled mjlab train Mjlab-Velocity-Flat-Unitree-G1 \
+    --env.scene.num-envs 4096 --agent.max-iterations 5
+# 读法：显存随 num_envs 近似线性涨；history_length 翻倍主要吃回合 buffer。
+#   先减 num_envs（对吞吐影响最直接），history 是次要旋钮(呼应 sec:rlmc-lowdim)。
+\end{codebox}
+这三段的共同方法论：\textbf{先用「最小可复现规模 $+$ 框架自带输出」把问题逼出来，再读它已经打印给你的信息（group 名 / 逐项 reward / 显存曲线）去定位，而不是改一行猜一次}。这正是把 \cref{sec:rlmc-obsgroups} 与本节诊断脚本从「读」变成「会自己查」的那一步。
+\end{practice}
+
+\begin{practice}[练习·部署与验证]
+\begin{enumerate}
+  \item \textbf{[实操]} 用 zero agent 启动 velocity flat，记录 \verb|ObservationManager| 打印的 actor 维度与 \verb|ActionManager| 的 action 维度。若 actor 维度不符合你按观测项手算的值，列出可能原因。
+  \item \textbf{[设计]} 为 Go1 velocity flat 写一份部署边界文档（YAML），逐项列出每个 actor 观测的单位、坐标系、部署来源、训练噪声，以及动作类型/scale/offset/裁剪/控制频率/关节顺序。对照 \cref{sec:rlmc-onnx} 的表，确认没有遗漏标 $\times$ 的条款。
+  \item \textbf{[调试]} 故意把 action scale 设为 5.0 跑 random agent，观察是否炸飞或 NaN。结合 \cref{ins:rlmc-counterfactual} 与 \cref{ins:rlmc-scale-dual} 解释现象。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{小结}
+\label{sec:rlmc-summary}
+
+本章把强化学习\emph{理论}里的「观测」与「动作」落到一台机器人上，主线始终是\textbf{算法领路、实践兑现}：先从 POMDP 看观测\emph{是什么}（\cref{eq:rlmc-obs-fn}）、为何「结构先于目标」（\cref{ins:rlmc-contract}），给出四族观测与四条原则；再把每条理论落成 \verb|ObservationManager| 的一段接线——处理管线的每一步都对应「信号从世界流向网络」的一个物理环节（\cref{ins:rlmc-pipeline}），非对称 actor-critic 的「critic 看更多」源自 GAE 里价值精度对优势方差的影响（\cref{eq:rlmc-gae}、\cref{ins:rlmc-privileged}），动作变换链 \cref{eq:rlmc-action-transform} 定义了策略探索的坐标系（\cref{ins:rlmc-scale-offset}），HOVER 的 mask 则把任务条件从硬编码推向软编码（\cref{ins:rlmc-hover}）。
+
+\paragraph{符号表。}
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+符号 & 含义 \\
+\midrule
+$s_t,\ o_t$ & 完整状态、（部分可观测的）观测；$o_t=h(s_t)+\boldsymbol\epsilon_t$ \\
+$h(\cdot),\ \boldsymbol\epsilon_t$ & 观测函数、传感器噪声 \\
+$\mathbf q,\ \dot{\mathbf q}$ & 关节位置、关节速度（观测中常用相对默认姿态值） \\
+$\boldsymbol\omega_{\text{base}},\ \mathbf g_{\text{proj}}$ & 机体角速度、重力在机体系的投影 \\
+$\mathbf v_{\text{base}},\ \mathbf c$ & 机体线速度（部署困难项）、命令 \\
+$a_t,\ a_{t-1}$ & 当前动作、上一拍动作（raw，无量纲） \\
+$o^{\text{actor}},\ o^{\text{critic}}$ & actor / critic 各自的观测（后者可含特权信号） \\
+$\hat A_t,\ \delta_t,\ V$ & GAE 优势、TD 误差、价值函数 \\
+$\texttt{scale},\ \texttt{offset}$ & 动作缩放与偏置；$\texttt{processed}=\texttt{raw}\times\texttt{scale}+\texttt{offset}$ \\
+$\mathbf q_{\text{default}}$ & 默认关节位置（\texttt{use\_default\_offset} 时即 offset） \\
+$\mathbf K_p,\ \mathbf K_d$ & PD 控制器比例、微分增益 \\
+$\mathbf J,\ \lambda$ & 末端雅可比、DLS-IK 阻尼（\texttt{lambda\_val}） \\
+$M_{\text{mode}},\ M_{\text{sparsity}}$ & HOVER 的模式 mask 与稀疏 mask \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{核心要点速查。}
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+要点 & 一句话 \\
+\midrule
+结构先于目标 & 观测/动作是 MDP 的结构定义，奖励是其上的目标（\cref{ins:rlmc-contract}） \\
+可部署性优先 & actor 只看真机可得信号，绝不开卷考试（\cref{sec:rlmc-deployable}） \\
+特权归 critic & 特权的是误差信号，不是策略（\cref{ins:rlmc-privileged}） \\
+管线顺序有理 & noise$\to$clip$\to$scale$\to$(delay)$\to$history，错序则物理含义全错（\cref{ins:rlmc-pipeline}） \\
+raw 无量纲 & 物理单位由动作项赋予，scale/offset 定义探索坐标系（\cref{ins:rlmc-scale-offset}） \\
+位置控制默认 & PD 当缓冲，策略只学「去哪里」（\cref{ins:rlmc-counterfactual}） \\
+mask 即条件 & 多模态任务里 mask 是更高级的 command（\cref{ins:rlmc-hover}） \\
+ONNX 非完整控制器 & scale/offset/history/clip 都要部署端复现（\cref{sec:rlmc-onnx}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[常见误解汇总]
+(1) 「观测越多越好」——含部署不可得真值会学到捷径致 sim-to-real 失败（原则二）。
+(2) 「训练失败先调 PPO」——先验证接口、再查奖励、最后才调 PPO。
+(3) 「盲目加历史」——历史按倍数放大维度，掩盖而非解决根因（原则三）。
+(4) 「给 critic 越多越好」——维度过高难拟合、泄漏未来破坏因果（\cref{sec:rlmc-why-asymmetric}）。
+(5) 「play 表现好 = 真机鲁棒」——play 默认关 corruption，评估条件更宽松（\cref{sec:rlmc-corruption}）。
+(6) 「IK action 比 joint action 更高级因而更好」——locomotion 用关节动作更合适（\cref{ins:rlmc-counterfactual}）。
+\end{pitfall}
+
+\paragraph{延伸阅读。}非对称演员-评论家的原始工作见 Pinto 等\,\cite{pinto2018asymmetric}；大规模并行 locomotion 训练与标准 velocity 观测集合见 Rudin 等\,\cite{rudin2021minutes}（legged\_gym\,\cite{leggedrobotics2021}，现已转为有限支持，迁移至 Isaac Lab）；崎岖地形师生蒸馏见 Lee 等\,\cite{lee2020quadruped}；以本体历史隐式估计动力学参数的 RMA 见 Kumar 等\,\cite{kumar2021rma}；无线速度反馈的鲁棒四足见 DreamWaQ\,\cite{nahrendra2023dreamwaq}；多模态全身控制见 HOVER\,\cite{he2025hover}；视觉+本体的极限跑酷蒸馏见 Extreme Parkour\,\cite{cheng2024parkour}。GAE 与 PPO 的原始论文见 \cite{schulman2016gae,schulman2017ppo}。框架文档见 Isaac Lab\,\cite{isaaclab2024}、mjlab\,\cite{mjlab2026}、UniLab\,\cite{unilab2026} 与 RSL-RL\,\cite{schwarke2025rslrl}。UniLab 作为「异构 CPU 仿真 $+$ GPU 策略」的第三种范式，其非 Manager-Based 的手写观测/动作模型贯穿本章对照。
+
+\paragraph{后续关系。}本章是「强化学习运动控制」部的接口地基。接下来：奖励设计章将在本章定下的观测/动作接口上「定义好与坏」；策略优化章把 PPO 在这套接口上跑起来；师生蒸馏章兑现 \cref{ins:rlmc-baselin} 方案三与 \cref{sec:rlmc-hover} 的 teacher-student 管线，把特权信息蒸成本体历史可推断的策略；sim-to-real 章则把本章的部署边界（\cref{sec:rlmc-onnx}）推到真实硬件。理解了「观测-动作-奖励-优化」这个核心循环，后续所有高级主题（域随机化、课程学习、跨形态迁移）都是在它之上的扩展。

@@ -1,0 +1,1157 @@
+\chapter{人形全身控制}\label{ch:rlmc-humanoidwbc}
+
+% ════════════════════════════════════════════════════════════════
+%  实践章（新部「强化学习运动控制」P8）。算法/概念为主线，三框架对比实战：
+%  mjlab / Isaac Lab / UniLab（UniLab 已实装：G1MotionTracking/G1BoxTracking/G1ClimbTracking）。源：同作者 Tutorial RL运控 Ch20。
+%  本章定位：人形 loco-manipulation / whole-body 方法论。与 \cref{ch:rlmc-humanoidloco}
+%  （人形 locomotion）互补——后者已精读 HOVER/HoST、讲透 action scale / angular momentum /
+%  sim-to-sim，本章不重复，凡涉及处一律 \cref 过去；KungfuBot 的 BLO/physics filter
+%  已在 \cref{ch:rlmc-motimit} 精读，本章只作高动态路线的数据点并 \cref 过去。
+%  联网核：ExBody arXiv:2402.16796（Cheng 等）；ExBody2 arXiv:2412.13196（Ji 等 UCSD/Berkeley/MIT）；
+%  WoCoCo arXiv:2406.06005（Zhang/Xiao/He/Shi, CoRL'24；oral 未在官方页核实）；KungfuBot arXiv:2506.12851（NeurIPS'25 已核实）；
+%  HumanoidBench arXiv:2403.10506（Sferrazza 等, RSS'24, 27 task）；HumanPlus arXiv:2406.10454（Fu 等, 33-DoF）；
+%  HOVER arXiv:2410.21229（He 等, NVIDIA, 19-DoF, ICRA'25）；HoST arXiv:2502.08378（Huang 等, RSS'25 Best Systems Finalist）；
+%  Isaac Lab G1 任务 Isaac-Velocity-Flat/Rough-G1-v0 + Isaac-PickPlace-Locomanipulation-G1-Abs-v0（官方 v2.3.0 PR#3150；RL locomotion 走位+IK 上肢 pick-navigate-place，非原地）。
+%  复核②(2026-06-24)联网核：HumanoidBench 动作61(19身+每手21)/状态151(49身+每手51)/50Hz/27任务(12loco+15manip)——非"101 DoF"(原稿编造，已改)；
+%  ExBody2 仍 arXiv-only(无正式 venue)；WoCoCo CoRL'24(未标 oral)；HoST RSS'25 Best Systems Finalist；AGILE arXiv:2603.20147 真。
+% ════════════════════════════════════════════════════════════════
+
+\cref{ch:rlmc-humanoidloco} 让人形\emph{学会走}：在窄支撑面、高质心、欠驱动的双足上把速度命令跟住。本章把它推进一步——让人形\emph{边走边干活}：$23$ 到 $43$ 个自由度同时服务于行走平衡与上肢操作。这是人形从实验室 demo 走向实际任务的关键一跃，也是本部从「单形态 locomotion」迈入「全身 loco-manipulation」的方法论入口。
+
+与 \cref{ch:rlmc-quadloco} 的四足 $+$ 臂相比，人形全身控制不是「多几个关节」的量变，而是「下肢本身就是一个需要主动控制的不稳定系统、上肢的每个动作都在干扰它」的质变。本章不重教 RL 基础（理论见 \cref{ch:rl-ac} 所在的理论部），也不重复 \cref{ch:rlmc-humanoidloco} 已讲透的 action scale、angular momentum penalty、HOVER、HoST——而是聚焦 loco-manipulation 特有的扩展点：\textbf{三条技术路线}（上下肢解耦 / 接触阶段分解 / mask-conditioned 多模态）、\textbf{评估体系}（HumanoidBench 与分层 RL）、以及把跌倒恢复\emph{集成}进操作管线的策略切换。每个概念下照例排布 mjlab、Isaac Lab、UniLab 三框架对比实战。
+
+\begin{note}
+\textbf{本章记号与前提.}\;
+沿用 \cref{ch:rlmc-humanoidloco}：速度命令 $\mathbf{c}=(v_x,v_y,\omega_z)$；关节位置 $\mathbf{q}\in\mathbb{R}^{n}$，默认姿态 $\mathbf{q}^{\mathrm{def}}$，动作 $\mathbf{a}\in[-1,1]^n$ 经逐关节缩放 $\boldsymbol{s}$ 得目标 $\mathbf{q}^{\mathrm{tgt}}=\mathbf{q}^{\mathrm{def}}+\boldsymbol{s}\odot\mathbf{a}$。本章新增：参考运动关键点（landmark）在局部坐标系下的位置 $\mathbf{p}_i^{\mathrm{local}}$，质心 $\mathbf{p}_{\mathrm{CoM}}$，压力中心（CoP）$\mathbf{p}_{\mathrm{CoP}}$，子树角动量 $\mathbf{L}\in\mathbb{R}^3$。指数核奖励统一记 $r=\exp(-\lVert e\rVert^2/\sigma^2)$，$\sigma$ 为跟踪容差。本章假定你已读完 \cref{ch:rlmc-reward}（四层奖励框架）、\cref{ch:rlmc-privileged}（teacher-student 蒸馏）、\cref{ch:rlmc-humanoidloco}（人形 locomotion）。正文数值多取自仿真资产配置与论文报告，凡涉及硬件规格处单独标注来源。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+
+人形全身控制的依赖与 \cref{ch:rlmc-humanoidloco} 完全一致——三框架安装见 \cref{ch:rlmc-setup}，人形资产确认见 \cref{ch:rlmc-humanoidloco} 的环境配置指南。本章只需在已装好的人形 velocity 环境上，额外确认\emph{参考运动管线}（MoCap/AMASS retarget）与\emph{物体/接触资产}可用。
+
+\paragraph{系统要求.}
+全身控制比纯 locomotion 更吃显存与算力：$23$-DoF 全身 $+$ 物体仿真，$4096$ 并行环境建议单卡显存 $\geq 12$\,GB；teacher-student 蒸馏（如借鉴 HOVER 模板）的 oracle teacher 阶段建议 $\geq 16$\,GB。CPU、驱动、CUDA 要求与 \cref{ch:rlmc-setup} 相同。
+
+\paragraph{版本兼容表.}
+
+\begin{center}
+\small
+\begin{tabular}{llll}
+\hline
+框架 & 包/仓库 & 本章验证版本 & 全身/操作资产入口 \\
+\hline
+mjlab & \texttt{mujocolab/mjlab} & 1.4.0（pip） & 经 \texttt{unitree\_rl\_mjlab} 的 tracking 任务 \\
+Isaac Lab & \texttt{isaac-sim/IsaacLab} & 2.x（命名空间 \texttt{isaaclab.*}） & \texttt{Isaac-Velocity-Flat-G1-v0} 等 \\
+Isaac Lab loco-manip & 同上 & 2.x & \texttt{Isaac-PickPlace-Locomanipulation-G1-Abs-v0} \\
+HOVER 模板 & \texttt{NVlabs/HOVER} & Isaac Lab 2.0.0（README 已核） & \texttt{neural\_wbc/}（mask 多模态） \\
+HumanoidBench & \texttt{carlosferrazza/humanoid-bench} & \pz{仓库 \texttt{requirements\_*.txt} 未钉死 MuJoCo 版本（经 dm\_control/gymnasium-robotics 间接引入），以你装的 \texttt{mujoco} 为准} & $27$-task 评估套件 \\
+UniLab & \texttt{unilabsim/UniLab} & \texttt{mujoco-uni}\,3.8.0 / \texttt{motrixsim-core}\,0.8.2 & G1 动作跟踪族 \texttt{G1MotionTracking}/\texttt{G1BoxTracking}/\texttt{G1ClimbTracking}\cite{unilab2026} \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[误以为 Isaac Lab 自带「G1 全身动作模仿」任务]
+\textbf{错误描述}：照抄形如 \texttt{Isaac-Velocity-Flat-G1} 的名字去找一个「G1 上肢跟踪 MoCap」的内置任务。\textbf{现象后果}：\verb|gym.error| 找不到该 env id；或误把纯 locomotion 任务当全身控制用，上肢永远不动。\textbf{根本原因}：截至本章验证版本，Isaac Lab 内置的 G1 任务只有 locomotion velocity（\texttt{Isaac-Velocity-Flat-G1-v0}、\texttt{Isaac-Velocity-Rough-G1-v0}）与一个 loco-manipulation 拾放任务（\texttt{Isaac-PickPlace-Locomanipulation-G1-Abs-v0}，下肢用 RL locomotion 策略走到位并跟踪速度命令 $(v_x,v_y,\omega_z,h)$、上肢用 IK 控制拾放，走 pick-navigate-place 流程，为 Isaac Lab Mimic 模仿学习数据生成而设）——\textbf{没有}开箱即用的「全身 MoCap 跟踪」任务。\textbf{正确做法}：全身 tracking 走第三方扩展（如 HOVER 的 \texttt{neural\_wbc} 模板，见 \cref{sec:rlmc-wbc-routes}）或自建任务；先 \texttt{grep} 官方 environments 文档确认真实 ID 再照抄。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start（五分钟最小可跑）}
+
+全身控制没有「一行命令就跑通」的捷径——它建立在已调好的 locomotion 之上。这里给的「最小可跑」是\emph{在已会走的 G1 上叠加一个上半身参考动作}，验证全身管线接线无误。\textbf{务必照抄任务 ID}。
+
+\begin{codebox}[bash]{mjlab：G1 全身 motion tracking（官方内置 BeyondMimic 任务，烟雾测试）}
+# 前提：先按 \cref{ch:rlmc-humanoidloco} 跑通 Unitree-G1-Flat velocity
+# mjlab 本体自带 BeyondMimic 全身跟踪任务 Mjlab-Tracking-Flat-Unitree-G1（list-envs 实测注册）
+# 此任务必须显式给一个参考动作来源：要么 WandB registry，要么本地 NPZ 文件。
+#
+# 路径 A（需 WandB 登录 + 真实 motion）：your-org/motions/wave-hand 是占位名，
+#   照抄裸跑会 ValueError（registry 不存在）。务必换成你 WandB 里真实的 motion 路径。
+# uv run train Mjlab-Tracking-Flat-Unitree-G1 \
+#   --registry-name your-org/motions/wave-hand --env.scene.num-envs=256
+#
+# 路径 B（无需 WandB/网络，推荐冒烟用）：直接指本地 NPZ 文件——实测可越过 registry 进入仿真
+uv run train Mjlab-Tracking-Flat-Unitree-G1 \
+  --env.commands.motion.motion-file /path/to/your_motion.npz \
+  --env.scene.num-envs=256        # 小规模冒烟，验证 reward/obs 不报错
+# 参考动作管线（NPZ 从哪来、键格式）见 \cref{ch:rlmc-motimit}，此处仅冒烟验证接线
+\end{codebox}
+
+\begin{codebox}[bash]{Isaac Lab：loco-manipulation 拾放（官方内置）}
+# 官方内置 G1 loco-manip：下肢 RL locomotion 走到位 + 上肢 IK 拾放（pick-navigate-place）
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-PickPlace-Locomanipulation-G1-Abs-v0 \
+  --num_envs 256 --max_iterations 50 --headless
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab：G1 全身动作跟踪（原生任务，烟雾测试）}
+# UniLab 原生提供 G1 全身动作跟踪任务族（envs/motion_tracking/g1 的 MotionLoader 消费 NPZ 参考运动）
+# 与 Isaac Lab 不同：这里「全身 tracking」是开箱即用的注册任务，不必走第三方扩展
+# 注意：train 首跑也会从 HuggingFace 拉参考动作 dance1_subject2_part.npz——
+# 无镜像实测网络报错（RuntimeError），故国内 HF_ENDPOINT 必须前置到 train（不止 demo）
+HF_ENDPOINT=https://hf-mirror.com \
+uv run train --algo ppo --task g1_motion_tracking --sim mujoco \
+    algo.num_envs=256 algo.max_iterations=3 training.no_play=true   # 冒烟：env/迭代走 Hydra 覆盖
+HF_ENDPOINT=https://hf-mirror.com uv run demo dance   # 或直接回放预训练跟踪策略（首跑从 HF 拉权重）
+\end{codebox}
+
+\begin{note}
+\textbf{这三条命令都\emph{依赖外部数据}，照抄裸跑大概率报错——先看清依赖再跑.}\;
+全身 tracking 的「最小可跑」卡点不在代码而在\emph{参考动作从哪来}。三条命令的外部依赖与「不满足时长什么样」如下（均为服务器实测）：
+
+\begin{center}
+\small
+\begin{tabular}{p{2.6cm}p{3.2cm}p{3.0cm}p{2.9cm}}
+\hline
+命令 & 外部依赖 & 不满足时的报错 & 最小离线替代 \\
+\hline
+mjlab tracking & WandB registry \emph{或} 本地 NPZ（二选一，必须显式给） & 都不给即 \verb|ValueError:| 要求 \verb|--registry-name| 或 \verb|--motion-file| & \verb|--env.commands.motion.motion-file <本地.npz>|（无需 WandB/网络） \\
+UniLab train/demo & 首跑从 HF 拉 \verb|dance1_subject2_part.npz| & 无镜像即 \verb|RuntimeError|（client closed，网络断） & \verb|HF_ENDPOINT=https://hf-mirror.com|；或换本地 \verb|assets/motions/g1/*.npz| \\
+Isaac loco-manip & 仅依赖 Isaac 内置资产，无外部下载 & （本命令无外部依赖，可裸跑） & —— \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{没有 WandB org 时，怎么从零拿到一个能跑的 motion？}\;最实用的路线是\emph{准备一个本地 NPZ}，直接喂给 mjlab 的 \verb|--env.commands.motion.motion-file| 或换掉 UniLab \verb|MotionLoader| 默认指向的 \verb|assets/motions/g1/*.npz|（UniLab 自带 \verb|dance|/\verb|gangnam_style| 等可复用）。NPZ 的键格式见 \cref{ch:rlmc-motimit}（\verb|fps/joint_pos/joint_vel/body_{pos,quat,lin_vel,ang_vel}_w|）；从 CSV/AMASS 生成 NPZ 的 retarget 管线（如 \verb|csv_to_npz| 类脚本）同样在 \cref{ch:rlmc-motimit} 给出。\textbf{结论}：把「跑通第一帧」拆成两步——先用框架自带或本地 NPZ 验证接线（这一步不碰 WandB/不碰网络），再换成你真正想跟踪的动作。
+\end{note}
+
+\begin{pitfall}[混淆 mjlab 本体的内置 tracking 任务与 \texttt{unitree\_rl\_mjlab} 的命名]
+\textbf{错误描述}：分不清两套 G1 任务来源——以为 G1 tracking 只能走第三方 \texttt{unitree\_rl\_mjlab}，或反过来照抄 \texttt{Mjlab-Spinkick-Unitree-G1} 之类\emph{未注册}的名字。\textbf{现象后果}：\verb|gym.error| 找不到 env id。\textbf{根本原因}：mjlab 存在\emph{两条}路径——（a）mjlab \textbf{本体自带} BeyondMimic 全身跟踪任务 \texttt{Mjlab-Tracking-Flat-Unitree-G1}（\texttt{list-envs} 实测确有注册，console\_scripts 已装故 \texttt{uv run train}/\texttt{train} 均可调）；（b）第三方 \texttt{unitree\_rl\_mjlab} 仓库另注册 \texttt{Unitree-G1-Flat} 系列，入口是 \texttt{python scripts/train.py Unitree-G1-Flat}。两套任务名/CLI 不通用。\texttt{Mjlab-Spinkick-Unitree-G1} 等动作专名经 \texttt{list-envs} 实测\emph{不在}注册表（已验证内置只有 \texttt{Mjlab-Tracking-Flat-Unitree-G1}）；照抄前以 \texttt{list-envs} 或仓库 README 确认真实 ID。\textbf{正确做法}：先 \texttt{uv run list-envs}（或 \texttt{grep} README）确认真实 ID 再照抄；本章 mjlab 全身跟踪统一用已验证的内置 \texttt{Mjlab-Tracking-Flat-Unitree-G1}。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{前置自测}
+
+\begin{practice}[前置自测：答错 $\geq 3$ 题先回看]
+\begin{enumerate}
+  \item 人形为什么比四足更难「边走边操作」？支撑多边形、质心高度、角动量三者各起什么作用？（答错回看 \cref{ch:rlmc-humanoidloco} 的 \cref{ins:rlmc-hl-essence}）
+  \item 动作模仿的指数核奖励 $r=\exp(-\lVert e\rVert^2/\sigma^2)$ 中 $\sigma$ 太大、太小分别会怎样？（答错回看 \cref{ch:rlmc-reward}）
+  \item teacher-student 蒸馏里 DAgger 与离线 BC 的核心区别是什么？为什么人形全身控制常用 DAgger？（答错回看 \cref{ch:rlmc-privileged}）
+  \item MoCap 动作 retarget 到 G1 时，至少要检查哪三个物理可行性指标？（答错回看 \cref{ch:rlmc-motimit} 的 KungfuBot physics filter）
+  \item 多目标 reward 的乘法门控编码了什么因果关系？什么时候用乘法门控、什么时候用加权和？（答错回看 \cref{ch:rlmc-reward} 与 \cref{ch:rlmc-quadloco}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章目标}
+
+学完本章后，你应当能够：
+\begin{enumerate}
+  \item \textbf{对比} 三条全身控制路线（上下肢解耦 / 接触阶段分解 / mask-conditioned 多模态）的工程优劣，并对给定任务\emph{选}出合适路线；
+  \item \textbf{实现} ExBody2 风格的 velocity-landmark 解耦 reward——在局部坐标系跟踪上半身关键点、独立跟踪根速度，并解释 periodic local frame 为何能消除 drift；
+  \item \textbf{配置} WoCoCo 风格的 contact stage 与 stage-aware reward，定位「策略卡在某一阶段不推进」的失败模式；
+  \item \textbf{配置} teacher-data 自动过滤管线，区分它与 KungfuBot physics filter 的过滤依据；
+  \item \textbf{搭建} 分层 RL 的两层架构（低层 locomotion 冻结、高层 task policy 训练），并解释 HumanoidBench 为何显示分层优于端到端；
+  \item \textbf{集成} 跌倒恢复（HoST）为安全兜底，写出 locomotion $\to$ fall detect $\to$ stand-up $\to$ resume 的状态机并处理 action 平滑过渡；
+  \item \textbf{对照} mjlab、Isaac Lab、UniLab 在全身控制上的资产/任务/接口差异，定位「把内置 locomotion 当全身控制用」的常见误区。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章知识导航}
+
+\begin{center}
+\small
+\begin{forest} navtree
+[{人形全身控制}
+  [{核心挑战\\(\cref{sec:rlmc-wbc-challenge})}
+    [{DoF 爆炸/上下肢耦合}]
+    [{接触序列长时程}]
+  ]
+  [{三条路线\\(\cref{sec:rlmc-wbc-routes})}
+    [{解耦/接触分解/mask}]
+    [{决策树}]
+  ]
+  [{ExBody2 精读\\(\cref{sec:rlmc-wbc-exbody})}
+    [{velocity-landmark 解耦}]
+    [{teacher 过滤/specialist}]
+  ]
+  [{WoCoCo 精读\\(\cref{sec:rlmc-wbc-wococo})}
+    [{contact stage}]
+    [{stage-aware reward}]
+  ]
+  [{评估与分层\\(\cref{sec:rlmc-wbc-bench})}
+    [{HumanoidBench}]
+    [{分层 RL}]
+  ]
+  [{跌倒恢复集成\\(\cref{sec:rlmc-wbc-recovery})}
+    [{策略切换状态机}]
+  ]
+  [{参数与诊断\\(\cref{sec:rlmc-wbc-params})}]
+]
+\end{forest}
+\end{center}
+
+\paragraph{前置桥接（两三行）.}
+\cref{ch:rlmc-humanoidloco} 给出人形\emph{走}的全套工程方法（支撑多边形、逐关节 action scale、angular momentum penalty、HOVER mask 蒸馏、HoST multi-critic）。\cref{ch:rlmc-imitation} 与 \cref{ch:rlmc-motimit} 给出动作模仿三技术线与 KungfuBot 的视频到真机管线。本章站在它们之上，回答 loco-manipulation 的核心问题：当上肢必须\emph{同时}服务操作目标、而双足平衡又是硬约束时，reward、架构、训练课程该怎么组织。
+
+\paragraph{阅读时间（精/速/查三档）.}
+精读全章（含动手）约 $7$--$9$ 小时；速读主线（\cref{sec:rlmc-wbc-challenge}--\cref{sec:rlmc-wbc-routes} $+$ 各节洞察/陷阱）约 $2$ 小时；查阅式（定位某条 reward 或某个失败模式）用文末故障排查手册与参数表，$5$ 分钟内可定位。
+
+% ════════════════════════════════════════════════════════════════
+\section{从四足 loco-manipulation 到人形全身控制}\label{sec:rlmc-wbc-challenge}
+
+\subsection{模块功能与在管线中的位置}
+本节是后续所有路线选择的\emph{前置认知}，位置在管线最上游：在你决定用「解耦 / 接触分解 / mask」哪条路线之前，先建立「人形全身控制到底难在哪、难多少」的量化判断。\cref{ch:rlmc-humanoidloco} 已论证「双足比四足难」，本节进一步论证「双足\emph{边走边操作}比四足\emph{边走边操作}又难一个数量级」——这决定了为什么端到端 PPO 在人形全身操作上常常直接失败。
+
+\subsection{配置详解：三重挑战的量化}
+
+\paragraph{挑战一：DoF 爆炸与探索空间.}
+\cref{ch:rlmc-quadloco} 的四足 $+$ 臂（如 Go2-ARX）约 $19$ 个自由度，人形本体（G1）就有 $23$ 个，加灵巧手可达 $35$--$43$。PPO 在高维动作空间中的探索效率随维度近似指数下降——这不是「慢一点」，而是「随机探索几乎采不到\emph{既平衡又完成操作}的那个极小可行区」。
+
+\begin{center}
+\small
+\begin{tabular}{lccl}
+\hline
+平台 & 总 DoF & 动作维度 & 端到端可行性（经验） \\
+\hline
+Go1 locomotion（\cref{ch:rlmc-quadloco}） & 12 & 12 & 端到端稳定可解 \\
+Go2-ARX loco-manip（\cref{ch:rlmc-quadloco}） & 19 & 19 & 端到端可解，需调参 \\
+G1 全身（无手） & 23 & 23 & 端到端\emph{难}，常需解耦/分层 \\
+G1 全身 $+$ 灵巧手 & 35--43 & 35--43 & 端到端\emph{极难} \\
+H1 $+$ 双灵巧手（HumanoidBench） & $\sim 61$（驱动） & 61（位置控制） & 端到端大多 unsolved \\
+\hline
+\end{tabular}
+\end{center}
+
+上表 DoF 数为各平台典型仿真配置：G1 基础 $23$-DoF（$12$ 腿 $+$ $10$ 臂 $+$ $1$ 腰），官方 EDU 线扩展加腰 roll/pitch 与腕 pitch/yaw 至 $29$（EDU Plus），含灵巧手的 Ultimate 版达 $43$ DoF。HumanoidBench（arXiv:2403.10506）的 H1 $+$ 双 Shadow Hand 配置经核论文：动作空间 $61$ 维（含两手）、状态空间 $151$ 维（$49$ 身体 $+$ 每手 $51$）、$50$\,Hz 控制——论文未给单一「DoF 总数」，以动作 $61$／状态 $151$ 为准（不要写成「$101$ DoF」）。「端到端可行性」是经验判断而非定理——它解释了为什么从 \cref{ch:rlmc-quadloco} 的端到端四足，到本章的人形，主流方法都引入了\emph{结构}（解耦/分层/接触分解）来缩小搜索空间。
+
+\paragraph{挑战二：上下肢动力学耦合.}
+人形的上下肢耦合比四足 $+$ 臂\emph{严重得多}，根因是双足支撑面小（\cref{ch:rlmc-humanoidloco} 的 \cref{ins:rlmc-hl-essence}）。定量地看：单手举起 $2$\,kg 物体（臂长约 $0.5$\,m），CoM 侧向偏移约 $2\times0.5/(35+2)\approx 2.7$\,cm；G1 站立时 CoM 到侧边缘的余量约 $10$\,cm——这一动作就吃掉约 $27\%$ 余量，若恰在单脚支撑相，支撑面减半、余量可被吃掉一半以上。
+
+\begin{center}
+\small
+\begin{tabular}{lccl}
+\hline
+维度 & Go2（四足） & G1（人形） & 含义 \\
+\hline
+双支撑面积（典型） & $\sim 0.12\,\mathrm{m}^2$ & $\sim 0.05\,\mathrm{m}^2$ & 人形约 $2$--$4\times$ 更小 \\
+CoM 到支撑边缘余量 & $\sim 20$\,cm & $\sim 5$--$10$\,cm & 人形余量紧张 \\
+单臂举 $2$\,kg 的 CoM 偏移占比 & 约 $20\%$ & 约 $27\%$（单支撑可 $50\%+$） & 人形更逼近翻倒 \\
+角动量抑制能力 & 高（$4$ 点） & 低（$2$ 点） & 质变 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{insight}[四足有「稳定平台」，人形没有]\label{ins:rlmc-wbc-platform}
+四足 loco-manipulation 中，底盘提供了一个\emph{稳定的移动平台}——臂的动作虽影响 CoM，但四条腿的大支撑面提供了缓冲，「控制平衡」与「操作」可近似解耦地处理。人形全身控制中\emph{没有}这个平台：下肢本身是需要主动镇定的倒立摆，上肢每个动作都在扰动它。这就是为什么人形的全身协调\emph{不是}可选优化，而是「不协调就摔倒」的硬约束——它直接导致后面三条路线都要在「让下肢专注稳定」与「让上肢完成操作」之间做结构性取舍。这一点是 \cref{ins:rlmc-hl-essence}（人形之难不在 DoF 多）在 loco-manipulation 语境下的延伸：现在难点又叠加了「上肢被任务\emph{强制}大幅运动」，角动量扰动不再是副作用而是任务本身。
+\end{insight}
+
+\paragraph{挑战三：接触丰富的长时程任务.}
+全身操作任务常涉及复杂\emph{接触序列}——哪些身体部位在何时与什么接触。每次接触模式变化（如双脚站立变单脚、或手新增接触箱子）都改变系统约束，可行动作空间在切换瞬间突变。
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\hline
+任务 & 接触序列（简化） & 接触体 \\
+\hline
+搬箱子 & 站立$\to$弯腰$\to$双手触箱$\to$抬起$\to$行走 & 脚、手、箱 \\
+开门 & 站立$\to$单手握把$\to$转动$\to$推开$\to$走过 & 脚、手、把手、门 \\
+跑酷跳跃 & 双脚$\to$单脚蹬$\to$腾空$\to$双手抓壁$\to$翻上 & 脚、手、墙 \\
+攀岩 & 手脚交替接触，$4$ 点$\to$$3$ 点$\to$移动$\to$$4$ 点 & 手、脚、岩壁 \\
+\hline
+\end{tabular}
+\end{center}
+
+传统端到端 RL 在「接触模式切换」上极难——策略需要自己探索出正确的接触序列，而错误切换几乎必然摔倒。这正是 \cref{sec:rlmc-wbc-wococo} 的 WoCoCo 要解决的问题：把长时程任务\emph{分解}为接触模式固定的阶段，策略只在阶段内探索。
+
+\subsection{代码走读：人形 loco-manipulation 的迁移检查清单}
+下表每行对应一个具体陷阱，是「把 \cref{ch:rlmc-quadloco} 四足 $+$ 臂配置搬到人形」时必查的项，也是本章后续小节的索引。
+
+\begin{center}
+\small
+\begin{tabular}{p{3.3cm}p{4.6cm}p{4.6cm}}
+\hline
+四足 $+$ 臂的做法 & 直接搬到人形的后果 & 本章对策（节） \\
+\hline
+统一 action scale 覆盖下肢 & 髋/膝需大幅度、踝需精细，统一 scale 致抽动或步幅不足 & 逐关节 scale（\cref{ch:rlmc-humanoidloco}） \\
+臂动作不约束角动量 & 双足无法吸收角动量，上肢一甩即旋转摔倒 & angular momentum penalty（\cref{ch:rlmc-humanoidloco}）$+$ 解耦/接触分解 \\
+上下肢同一 reward 端到端 & $23$D 探索几乎采不到可行区 & 解耦（\cref{sec:rlmc-wbc-exbody}）/分层（\cref{sec:rlmc-wbc-bench}） \\
+长时程任务单段 dense reward & 接触切换探索不到，策略卡死 & contact stage（\cref{sec:rlmc-wbc-wococo}） \\
+摔倒只靠 early termination & 真机摔倒不可逆，无法继续任务 & 跌倒恢复集成（\cref{sec:rlmc-wbc-recovery}） \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{运行验证}
+在动手任何全身控制训练\emph{之前}，先做 \cref{ch:rlmc-humanoidloco} 的「稳定性健康检查」（默认姿态膝曲 $0.3$\,rad、纯 locomotion velocity error 达标、踝 kp $30$--$50$）。本节额外加两条 loco-manipulation 专属检查：（1）让上肢\emph{固定在默认姿态}行走，确认行走仍稳定——若不稳，说明上肢默认姿态的 CoM 影响过大，调 \verb|default_arm_pos|；（2）打印上肢默认姿态下的 CoM 偏移，确认 $<$ 支撑余量的 $30\%$。这两条通过后再叠加上肢运动。
+
+\subsection{常见陷阱}
+\begin{pitfall}[把「DoF 多」直接等同于「必须分层」]
+\textbf{错误描述}：看到 $23+$ DoF 就无脑上分层架构。\textbf{现象后果}：分层引入层间信息瓶颈，限制上下肢精细协调（如搬重物时下肢需配合加宽步幅，分层下高层难把这种耦合传给低层）。\textbf{根本原因}：分层的收益来自「探索效率 $+$ 信用分配」，代价是「信息瓶颈」；DoF 数量本身不决定该不该分层。\textbf{正确做法}：按\emph{任务特性}选——接触序列明确且需端到端协调时 WoCoCo 端到端反而更好（\cref{sec:rlmc-wbc-wococo}）；探索极难、可复用已有 locomotion 时才分层（\cref{sec:rlmc-wbc-bench}）。
+\end{pitfall}
+\begin{pitfall}[把「人形」当「两条腿的四足」]
+\textbf{错误描述}：套用四足「CoM 始终在支撑多边形内」的静态稳定直觉设计人形 reward。\textbf{现象后果}：策略学到「蹲着不敢迈步」的过保守步态，或在 swing phase 被强行拉回致步态僵硬。\textbf{根本原因}：人形行走是\emph{动态}稳定——swing phase 单脚着地时 CoM 可暂时超出支撑面，靠下一步落脚恢复；追求「每帧 CoM 在支撑内」反而错。\textbf{正确做法}：用 \cref{ch:rlmc-humanoidloco} 的 upright $+$ base height $+$ 步态时序 reward 追求「一个步周期内平均稳定」，而非逐帧静态稳定。
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[计算]} G1 总质量约 $35$\,kg、双臂各约 $3$\,kg、臂长约 $0.5$\,m。双臂同时前平举时 CoM 前向偏移多少？若站立时 CoM 到前脚趾约 $8$\,cm，平举后是否仍在支撑面内？\emph{验收}：给出偏移数值与是否越界的结论。
+  \item \textbf{[分析]} 从「探索效率」与「信用分配」两个角度，解释为什么 HumanoidBench 上分层 RL 比端到端好。\emph{验收}：每个角度 $\geq 2$ 句，并对照本节挑战一、二。
+  \item \textbf{[设计]} 各列 $3$ 个「接触序列简单、适合端到端」与「接触序列复杂、需接触分解或分层」的人形全身操作任务。\emph{验收}：$6$ 个任务 $+$ 一句分类理由。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{三条技术路线对比}\label{sec:rlmc-wbc-routes}
+
+\subsection{模块功能与在管线中的位置}
+本节是全章的\emph{主线}：面对 \cref{sec:rlmc-wbc-challenge} 的三重挑战，学术界给出了三种结构性思路。它们的位置在「确定任务后、动手配置前」——选错路线会让后面所有调参事倍功半。三条路线的共同点是都用\emph{结构}缩小搜索空间，区别在于「在哪里加结构」：解耦在 reward 上切上下肢、接触分解在时间上切阶段、mask 在命令上切模态。
+
+\subsection{配置详解：三条路线的原理与取舍}
+
+\paragraph{路线一：上下肢解耦（ExBody / ExBody2）.}
+把人形「劈成两半」——上半身跟踪参考动作（操作/表达），下半身跟踪速度命令（locomotion），两部分用不同 reward 目标、由一个统一策略同时优化：
+\begin{equation}
+r_{\mathrm{total}} = w_{\mathrm{upper}}\, r_{\mathrm{upper}}^{\mathrm{landmark}} + w_{\mathrm{lower}}\, r_{\mathrm{lower}}^{\mathrm{velocity}} + r_{\mathrm{reg}}.
+\label{eq:rlmc-wbc-decouple}
+\end{equation}
+优雅之处：下半身的 velocity tracking 已在 \cref{ch:rlmc-humanoidloco} 充分验证，上半身只是在「已稳定行走」之上叠加跟踪目标。代价：上下肢协调性受限——解耦的 reward 难让策略学会「搬重物时下肢主动加宽步幅补偿 CoM」这类\emph{耦合}行为。详见 \cref{sec:rlmc-wbc-exbody}。
+
+\paragraph{路线二：接触阶段分解（WoCoCo）.}
+把长时程任务分解为一系列\emph{接触阶段}——每阶段接触模式固定（哪些身体部位与什么有接触力），策略在阶段内优化 stage-aware reward，阶段间切换由人工接触计划驱动。优势：通用——同一 reward 模板可用于跑酷、搬箱、舞蹈、攀岩；端到端训练，上下肢可学精细协调。代价：需人工指定接触计划（「何时何处该有接触」），对接触序列不明确的任务无法应用。详见 \cref{sec:rlmc-wbc-wococo}。
+
+\paragraph{路线三：mask-conditioned 多模态（HOVER）.}
+训练一个看全部特权信息的 oracle teacher，再用 DAgger 蒸馏到不同 command mask 下的 student——不同 mask 激活不同控制模态（头 $+$ 手追踪 $=$ 遥操作、全身关节追踪 $=$ 模仿、根速度追踪 $=$ 导航）。优势：一个策略服务多模态，部署时改 mask 即切换、无需重训。代价：依赖高质量 oracle teacher（其性能是 student 上限），且 generalist 各模态通常不如 specialist。
+
+\textbf{本路线已在 \cref{ch:rlmc-humanoidloco} 的 \cref{sec:rlmc-hl-hover} 精读}（teacher-student 两阶段、mask 机制、训练资源、Isaac Lab 版本陷阱），本章不重复，只把它放进路线对比并在决策树中给出选择条件。\cref{ins:rlmc-hl-mask}（mask 像 BERT 的 masked LM）是理解其本质的捷径。
+
+\begin{insight}[三条路线是工具箱，不是互斥哲学]\label{ins:rlmc-wbc-toolbox}
+实际项目常\emph{混用}：用 ExBody2 的 velocity-landmark 解耦 reward 作基础，用 WoCoCo 的 contact stage 处理接触丰富的阶段，用 HOVER 的 mask 蒸馏实现多模态部署。把它们当成「在哪里加结构」的不同工具——解耦切 reward、分解切时间、mask 切命令——而非「选一条就排斥其余」。这个洞察的工程价值：当单一路线卡住时（如纯解耦学不会搬重物的上下肢耦合），第一反应应是「在哪个维度再加一层结构」，而不是「换一条路线从头再来」。
+\end{insight}
+
+\subsection{代码走读：三框架对比实战}
+三条路线在三个框架上的「落地方式」差异很大。下表是选型时的第一张参考图。
+
+\begin{center}
+\small
+\begin{tabular}{p{2.2cm}p{3.4cm}p{3.4cm}p{2.6cm}}
+\hline
+路线 & mjlab & Isaac Lab & UniLab \\
+\hline
+解耦（ExBody2） & 自定义 reward term：上肢 landmark $+$ 下肢 velocity，复用 tracking 任务骨架 & 自定义 \texttt{RewardTermCfg}，复用 velocity env，加上肢参考观测 & 以 \texttt{G1MotionTracking} 的 \texttt{motion\_body\_pos/ori} 跟踪为骨架；上肢 landmark $+$ 下肢 velocity 解耦需自定义 reward 函数\cite{unilab2026} \\
+接触分解（WoCoCo） & 自定义 contact stage 状态机 $+$ 接触力 reward（MuJoCo 接触读取直接） & 同理，接触力经 \texttt{ContactSensor} 读取 & \texttt{G1BoxTracking}/\texttt{G1ClimbTracking} 为接触丰富骨架；contact stage 状态机 $+$ 接触力 reward 需在 env 自实现\cite{unilab2026} \\
+mask 多模态（HOVER） & 需自行移植 mask 逻辑（HOVER 原生基于 Isaac，mjlab 无对应模板） & 官方有 \texttt{NVlabs/HOVER} 扩展模板（见 \cref{sec:rlmc-hl-hover}） & UniLab 无对应（无 mask 多模态/通用 DAgger；自带 HORA 是 RMA 适应蒸馏，非 mask），需自实现\cite{unilab2026} \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{工程建议（与 \cref{ch:rlmc-humanoidloco} 一致）}：先在 mjlab 验证 reward 设计与 action scale（迭代快、接触读取直接），确认策略在仿真中工作后，若需视觉输入或 multi-mode 蒸馏（HOVER 模式）再迁到 Isaac Lab。下面给出解耦路线在两框架的最小 reward 接线对照（接触分解、HOVER 的完整代码分别见 \cref{sec:rlmc-wbc-wococo}、\cref{sec:rlmc-hl-hover}）。
+
+\begin{codebox}[Python]{mjlab / Isaac Lab 通用：解耦 reward 的两个独立项（概念骨架）}
+# 注：两框架的 RewardTermCfg 字段名略有差异，这里给与框架无关的计算骨架；
+# 落地时把 upper_landmark / lower_velocity 各注册为一个 reward term。
+import torch
+
+def upper_landmark_reward(env, ref_motion, sigma_map):
+    """上半身关键点跟踪（局部坐标系）——见 \cref{sec:rlmc-wbc-exbody} 的完整版。"""
+    r = torch.zeros(env.num_envs, device=env.device)
+    for kp, sigma in sigma_map.items():
+        ref_local   = ref_motion.get_keypoint_local(kp)   # [B,3] 参考局部位置
+        robot_local = env.get_keypoint_local(kp)          # [B,3] 机器人局部位置
+        err = (ref_local - robot_local).norm(dim=-1)
+        r += torch.exp(-err**2 / sigma**2)
+    return r / len(sigma_map)                              # 归一化
+
+def lower_velocity_reward(env, vel_cmd):
+    """下半身跟踪用户速度命令（与 \cref{ch:rlmc-humanoidloco} 同源，不看参考动作速度）。"""
+    err = (env.get_root_velocity()[:, :2] - vel_cmd[:, :2]).norm(dim=-1)
+    return torch.exp(-err**2 / 0.25**2)
+# 合并由各 term 的 weight 完成：w_upper~1.5, w_lower~1.0（见式 \eqref{eq:rlmc-wbc-decouple}）
+\end{codebox}
+
+\subsection{运行验证：路线决策树}
+选型不是凭论文新旧，而是凭任务结构。下面的决策树是本章最该记住的一张图——它把 \cref{sec:rlmc-wbc-challenge} 的挑战映射到路线。
+
+\begin{codebox}[text]{人形全身控制路线决策树}
+你的任务是什么结构？
+├── 上半身跟踪参考动作 + 下半身行走（表达/舞蹈/挥手）
+│     → ExBody2（最简单、sim-to-real 最可靠）           见 \cref{sec:rlmc-wbc-exbody}
+├── 涉及明确的接触序列变化（搬箱/开门/跑酷/攀岩）
+│     ├── 接触计划可人工指定 → WoCoCo（端到端，自动上下肢协调） 见 \cref{sec:rlmc-wbc-wococo}
+│     └── 接触计划不明确     → 分层 RL（复用低层 locomotion）      见 \cref{sec:rlmc-wbc-bench}
+├── 需要多种控制模态（导航 + 遥操作 + 模仿一体）
+│     → HOVER（一个策略服务多需求，改 mask 切换）         见 \cref{sec:rlmc-hl-hover}
+└── 高动态动作（功夫/体操，存在物理上难完美复制的帧）
+      → KungfuBot 的 adaptive tracking + physics filter   见 \cref{sec:rlmc-mi-kungfu}
+\end{codebox}
+
+\textbf{怎么用}：先问「接触序列是否变化」——这是分水岭。不变（上肢跟踪、下肢走）走解耦；变且可规划走 WoCoCo；变且不可规划走分层。多模态部署是正交需求，叠加 HOVER。高动态是 tracking 精度需求，叠加 KungfuBot 的自适应 $\sigma$（其完整 BLO 机制见 \cref{ch:rlmc-motimit}，本章不重复）。
+
+\subsection{常见陷阱}
+\begin{pitfall}[把 ExBody2 的 velocity tracking 与 locomotion velocity command 混淆]
+\textbf{错误描述}：以为 ExBody2 下半身跟踪的是用户命令速度。\textbf{现象后果}：在 ExBody2 基础上加用户速度控制时，速度命令「无效」或与参考动作打架。\textbf{根本原因}：ExBody（原版）的 velocity tracking 既可来自用户命令、也可来自 MoCap 参考的根速度——两者来源不同。若你要用户可控速度，必须把 velocity 的 source 显式设为用户 command，而非参考动作根速度。\textbf{正确做法}：在 reward 配置里明确 \verb|vel_cmd| 的来源；ExBody2 的关键改进正是把 velocity 与 landmark\emph{彻底解耦}（\cref{sec:rlmc-wbc-exbody}），避免二者隐式耦合。
+\end{pitfall}
+\begin{pitfall}[以为「选了一条路线就不能用另一条」]
+\textbf{错误描述}：把三条路线当互斥的哲学，单一路线卡住就推倒重来。\textbf{现象后果}：纯解耦学不会搬重物的上下肢耦合，却去换 mask 蒸馏（与该问题无关），白费数周。\textbf{根本原因}：三条路线在\emph{不同维度}加结构，可叠加（\cref{ins:rlmc-wbc-toolbox}）。\textbf{正确做法}：卡住时先定位「缺哪个维度的结构」——缺接触阶段就在解耦之上加 WoCoCo 的 stage，缺多模态就加 HOVER 的 mask。
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[分析]} 对比 ExBody2 与 WoCoCo 在这三个任务上的适用性：(a) 跟 MoCap 跳舞，(b) 搬箱子走到指定位置，(c) 攀岩。\emph{验收}：每个任务给出选哪条 $+$ 一句理由（提示：看接触序列是否变化）。
+  \item \textbf{[设计]} 设计「人形在办公室巡逻 $+$ 发现异常物体时拾取」系统，需要结合哪些路线的哪些元素？\emph{验收}：列出 $\geq 2$ 条路线及其各自承担的子任务。
+  \item \textbf{[跨章综合]} \cref{ch:rlmc-quadloco} 的 VBC 分层与 HOVER 的 mask 蒸馏都用 teacher-student。两者 teacher 看到的信息、student 学到的能力各有何区别？\emph{验收}：列 $\geq 2$ 个区别。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{精读：ExBody2 的上下肢解耦控制}\label{sec:rlmc-wbc-exbody}
+
+\begin{paper}[ExBody2：velocity-landmark 解耦 + teacher 过滤的表达性全身控制]\label{paper:rlmc-wbc-exbody2}
+\textbf{问题}：让真机人形做出\emph{表达性}的全身动作（走、蹲、跳舞、挥手）同时保持稳定鲁棒。难点是人类 MoCap 与机器人能力之间的鸿沟——很多动作机器人物理上做不了。\\
+\textbf{核心思想}：(1) 把\emph{全身速度跟踪}与\emph{身体关键点（landmark）跟踪}解耦——速度独立控制根节点移动、landmark 在局部坐标系跟踪姿态；(2) 用\emph{privileged teacher} 产生更贴合机器人运动学的中间数据，并\emph{自动过滤}不可行动作；(3) generalist 先在全体数据上训练，再对特定动作组做 specialist fine-tuning。\\
+\textbf{关键结果}：student 策略可走、可蹲、可舞，sim-to-real 稳定。\\
+\textbf{与本书关系}：是 \cref{ch:rlmc-imitation} 显式跟踪线 $+$ \cref{ch:rlmc-privileged} teacher-student 在人形\emph{表达性}全身控制上的范例；其 velocity-landmark 解耦是 \cref{sec:rlmc-wbc-routes} 路线一的标杆实现。\\
+\textbf{局限}：解耦 reward 限制上下肢精细耦合（搬重物等需配合的动作较弱）；fine-tuning 有 versatility-fidelity trade-off。\\
+ExBody2（Ji, Peng, Liu, Li, Yang, Cheng, Wang，UCSD/Berkeley/MIT/NVIDIA，arXiv:2412.13196，项目页 \texttt{exbody2.github.io}）\cite{ji2024exbody2}；其前身 ExBody（Cheng 等，arXiv:2402.16796）\cite{cheng2024exbody}。\pz{ExBody2 的正式发表 venue 经核查未能证实（Tutorial 记为 RSS'25 Workshop Spotlight，但 arXiv 与项目页均只列为 preprint、未标注会议；以官方后续公告为准）。}
+\end{paper}
+
+\subsection{模块功能与在管线中的位置}
+本节是路线一的工程兑现。位置：在你已有 \cref{ch:rlmc-humanoidloco} 的稳定 locomotion、且任务是「上肢跟踪参考动作」时，ExBody2 告诉你怎么把上肢跟踪\emph{叠加}上去而不破坏行走。三个改进对应三个工程痛点：drift 耦合（改进一）、数据含不可行动作（改进二）、容量有限下的专精（改进三）。
+
+\subsection{配置详解：三个改进的四维拆解}
+
+\paragraph{改进一：velocity-landmark 解耦.}
+ExBody 的痛点是 velocity tracking 与 landmark tracking 耦合——参考动作含大幅根节点移动（如跑步）时，「跟着跑」与「保持姿态」打架。ExBody2 把两者彻底分开：velocity 独立跟踪（用户命令或参考根速度，二选一显式指定），landmark 在\emph{局部坐标系}跟踪。配置项四维表：
+
+\begin{center}
+\small
+\begin{tabular}{p{2.6cm}p{2.8cm}p{3.0cm}p{3.0cm}}
+\hline
+配置项 & 默认值来源 & 修改影响 & 与其他配置耦合 \\
+\hline
+landmark 坐标系 & ExBody2：局部（periodic reset） & 改世界系即退化为 ExBody 的 drift 问题 & 与 velocity source 必须配套（一个管移动、一个管姿态） \\
+periodic reset 间隔 $T_{\mathrm{reset}}$ & 经验 $\sim 30$ 帧（$0.6$\,s @ 50\,Hz） & 太短抹掉相对位移信号；太长 drift 累积 & 与控制频率、动作时长耦合 \\
+landmark $\sigma_i$（逐关键点） & 末端紧（腕 $0.04$）、根松（头 $0.10$） & 太小学不动、太大不精确 & 与 retarget 质量耦合（缺 DoF 处需放松） \\
+$w_{\mathrm{upper}}/w_{\mathrm{lower}}$ & 经验 $1.5/1.0$ & upper 太低上肢不动、太高下肢崩 & 与 regularization 权重总体平衡 \\
+\hline
+\end{tabular}
+\end{center}
+
+\rebuilt{上表 $\sigma_i$、$T_{\mathrm{reset}}$、权重为 Tutorial 给出的工程经验值，非 ExBody2 论文原始超参；ExBody2 论文（arXiv:2412.13196）Section III 给出其精确实现，落地以论文/代码为准。}
+
+\paragraph{为什么「局部坐标系」是关键.}
+若用\emph{当前} base 位置做原点（每帧更新），根节点移动速度差异被完全抹掉——机器人走得比参考快/慢 $2$ 倍，landmark error 都是零，策略不会被鼓励跟踪移动速度，velocity tracking 成了唯一速度信号。若用\emph{固定}原点（世界系），drift 随时间累积——$5$ 秒后参考「走远了」而机器人在原地，landmark error 暴涨却无能为力。\emph{periodic reset} 是折中：在 $T_{\mathrm{reset}}$ 窗口内鼓励跟踪相对位移（含速度变化），又不被长期 drift 干扰。
+
+\begin{insight}[解耦的本质是「让两个信号各管一件事」]\label{ins:rlmc-wbc-decouple}
+velocity-landmark 解耦不是「拆成两个 reward」这么简单——它是在\emph{消除信号冲突}。耦合时一个 landmark 误差同时承载了「姿态不对」和「位置没跟上」两种信息，策略无法分辨该调姿态还是调步速。解耦后：velocity 信号只管「根节点移动多快」，landmark 信号（局部系）只管「姿态像不像」。这与 \cref{ch:rlmc-reward} 强调的「每个 reward term 应有单一清晰语义」一脉相承——耦合 reward 的梯度方向是两个目标的混合，解耦后每个梯度方向纯粹，PPO 学得更快更稳。
+\end{insight}
+
+\paragraph{改进二：teacher-data 自动过滤.}
+人类 MoCap 含大量机器人做不了的动作（后空翻、劈叉）。ExBody 用语言标签手动过滤（不精确）；ExBody2 训练一个 privileged teacher，凡 teacher 都执行不了的（reward 低于阈值或 early termination）自动删除。这比标签可靠——「dance」标签可能含前空翻，teacher 评估能精确判断。
+
+\paragraph{改进三：specialist fine-tuning.}
+先在全体过滤后数据上训 generalist，再对特定动作组（如「舞蹈」）用小 $10$ 倍学习率 fine-tune。trade-off 的方向是确定的：目标组 tracking 精度上升、其他组下降（versatility-fidelity 权衡）。\rebuilt{具体降幅（如目标组 error 降 $30$--$50\%$、其他组降 $20$--$40\%$）为 Tutorial 给出的量级示意，非 ExBody2 论文报告的精确数值。}
+
+\begin{insight}[generalist 到 specialist 是「网络容量有限」的直接推论]\label{ins:rlmc-wbc-capacity}
+一个 $[256,256,128]$ MLP 约 $100$K 参数。若要同时编码走、舞、挥手、蹲四种行为，每种约分到 $25$K 参数的「容量」；fine-tune 只保留舞蹈，则全部 $100$K 服务舞蹈，精度自然更高。这与基础模型领域的「pretrain $+$ fine-tune」完全同构——先学通用能力（稳定行走、基本协调），再在特定任务上专精，比从零做专项更高效。工程含义：当某个动作组怎么调都达不到精度时，先问「是不是 generalist 容量被其他动作组挤占了」，再决定是 fine-tune 还是直接加大网络。
+\end{insight}
+
+\subsection{代码走读：三框架对比实战}
+ExBody2 的核心是 velocity-landmark 解耦 reward $+$ periodic local frame。下面给\emph{与框架无关}的核心计算，再说明三框架的接线差异。
+
+\begin{codebox}[Python]{periodic local frame + landmark tracking（核心，mjlab/Isaac Lab 通用）}
+import torch
+
+class PeriodicLocalFrame:
+    """每 reset_interval 帧把局部原点重置到当前 base，消除长期 drift。"""
+    def __init__(self, reset_interval=30):
+        self.reset_interval = reset_interval
+        self.origin_pos = None       # [B,3]
+        self.origin_quat = None      # [B,4] Hamilton (w,x,y,z)
+        self.counter = 0
+
+    def update(self, base_pos, base_quat):
+        if self.counter % self.reset_interval == 0:
+            self.origin_pos = base_pos.clone()
+            self.origin_quat = base_quat.clone()
+        self.counter += 1
+
+    def to_local(self, world_pos):
+        delta = world_pos - self.origin_pos                      # 相对上次重置原点
+        return quat_rotate(quat_conjugate(self.origin_quat), delta)
+
+def exbody2_reward(env, ref_motion, vel_cmd, frame, kp_sigma):
+    # Part 1: velocity tracking —— 跟用户命令(或参考根速度，二选一)，不掺姿态
+    v_err = (env.get_root_velocity()[:, :2] - vel_cmd[:, :2]).norm(dim=-1)
+    yaw_err = (env.get_root_yaw_rate() - vel_cmd[:, 2]).abs()
+    r_vel = 0.7 * torch.exp(-v_err**2 / 0.25**2) + 0.3 * torch.exp(-yaw_err**2 / 0.25**2)
+
+    # Part 2: landmark tracking —— 局部系，只管姿态像不像
+    frame.update(env.base_pos, env.base_quat)
+    r_lm = torch.zeros(env.num_envs, device=env.device)
+    for kp, sigma in kp_sigma.items():
+        ref_local   = ref_motion.get_keypoint_local(kp)          # 参考已在其局部系
+        robot_local = frame.to_local(env.get_keypoint_world(kp)) # 机器人转到当前局部系
+        err = (ref_local - robot_local).norm(dim=-1)
+        r_lm += torch.exp(-err**2 / sigma**2)
+    r_lm /= len(kp_sigma)
+
+    return 1.0 * r_vel + 1.5 * r_lm                              # 见式 \eqref{eq:rlmc-wbc-decouple}
+\end{codebox}
+
+\begin{center}
+\small
+\begin{tabular}{p{2.0cm}p{4.3cm}p{4.3cm}}
+\hline
+环节 & mjlab & Isaac Lab \\
+\hline
+关键点世界位姿 & 直接读 MuJoCo body xpos/xquat & 读 \texttt{Articulation} 的 body\_pos\_w/quat\_w \\
+reward 注册 & 自定义 reward 函数挂进 tracking 任务 & 包成 \texttt{RewardTermCfg}（\texttt{func} $+$ \texttt{params}） \\
+参考动作加载 & WandB registry（见 \cref{ch:rlmc-motimit}） & 本地 .pkl / AMASS（见 \cref{ch:rlmc-motimit}） \\
+periodic frame & 在 reward 函数内维护 counter 即可 & 同理；注意 reset 时清零 counter \\
+\hline
+\end{tabular}
+\end{center}
+
+\paragraph{UniLab.}
+UniLab 原生提供 G1 全身\emph{动作跟踪}任务族（\texttt{G1MotionTracking}，在 \texttt{envs/motion\_tracking/g1} 的 \texttt{G1MotionTrackingEnv} 类，UniLab）——这是离 ExBody2 最近的现成骨架，但二者的\emph{解耦哲学不同}，必须讲清。逐项对照上表四环节：（1）\textbf{关键点位姿}：UniLab 的后端 getter \verb|get_body_pos_w / get_body_quat_w| 直接给 body 世界位姿（\texttt{base/backend/base.py} 的 \texttt{SimBackend} 抽象方法，UniLab），与 mjlab 读 \verb|xpos/xquat| 同源；（2）\textbf{reward 注册}：UniLab \emph{不是} \texttt{RewardTermCfg} 类，而是「\texttt{reward.scales} 标量字典 $+$ env 内 \verb|_reward_fns| 派发表」第三范式（见 \cref{ch:rlmc-reward}），跟踪项已内置为 \texttt{G1MotionTracking} 的若干 scale；（3）\textbf{参考动作加载}：经 \texttt{g1/motion\_loader.py} 的 \verb|MotionLoader| 读 NPZ（键 \verb|fps/joint_pos/joint_vel/body_pos_w/body_quat_w/body_lin_vel_w/body_ang_vel_w|，UniLab），与 mjlab 的 WandB registry、Isaac 的 .pkl/AMASS 并列；（4）\textbf{periodic frame}：UniLab 用 \emph{motion anchor}（目标躯干位姿\,\emph{相对机器人}，由 \verb|_write_motion_anchor_transform| 写入 obs 的 \verb|motion_anchor_pos_b(3)+motion_anchor_ori_b(6)|，UniLab）实现「相对躯干坐标系」的姿态跟踪——这与 ExBody2 的 periodic local frame 解决的是同一类 drift 问题，但 UniLab 把锚点做成了\emph{每帧相对躯干}而非 ExBody2 的\emph{周期性重置}。
+
+\begin{codebox}[Python]{UniLab：G1MotionTracking 的跟踪 reward 标量字典（对照 mjlab/Isaac 的 term 范式）}
+# G1MotionTrackingCfg.reward.scales（envs/motion_tracking/g1，UniLab）—— 确实跟参考轨迹，非用户命令
+# 这是「全身关键点跟踪」的内置实现：body_pos/ori 等价 ExBody2 的 landmark，root_pos/ori 管根节点
+reward:
+  scales:
+    motion_global_root_pos: 0.5      # 根节点位置（世界系）—— 等价 ExBody2 的 velocity 那一路的位置端
+    motion_global_root_ori: 0.5      # 根节点朝向
+    motion_body_pos: 1.0             # 各 body 关键点位置 —— 等价 ExBody2 的 landmark（主导梯度）
+    motion_body_ori: 1.0             # 各 body 关键点朝向
+    motion_body_lin_vel: 1.0         # 关键点线速度
+    motion_body_ang_vel: 1.0         # 关键点角速度
+    motion_joint_pos: ...            # 关节角跟踪
+    motion_joint_vel: ...            # 关节速跟踪
+    action_rate_l2: -0.1             # 实测含：动作平滑正则（负权惩罚）
+    joint_limit: -10.0               # 实测含：关节限位硬罚（负权很大）
+  # 配套 std_* 容差字典（即各跟踪项指数核的 σ）—— 这正是 ExBody2 σ 表的现成落地：
+  std_body_pos: 0.3                  # body 关键点位置容差（对应 landmark σ）
+  std_body_ori: ...                  # 朝向/速度/关节各有独立 std_*，逐项可调
+# 跟踪 obs（actor，_compute_obs）：command(2n) + motion_anchor_pos_b(3) + motion_anchor_ori_b(6)
+\end{codebox}
+
+\begin{note}
+\textbf{UniLab 的「全身跟踪」与 ExBody2 的「velocity-landmark 解耦」不是一回事.}\;
+\texttt{G1MotionTracking} 把\emph{整个身体}（含根节点 \verb|motion_global_root_pos|）都跟向参考轨迹——这正是 \cref{paper:rlmc-wbc-exbody2} 里 ExBody\emph{原版}的耦合形态：根节点移动与姿态跟踪同源。要复现 ExBody2 的关键改进（把\emph{下半身 velocity} 改为跟\textbf{用户命令}、把\emph{上半身 landmark} 放到\textbf{periodic local frame}），在 UniLab 里需\emph{自定义} reward 函数：把 \verb|motion_global_root_*| 替换成一个吃 \verb|RewardContext| 的 \verb|lower_velocity| 纯函数（读 \verb|info["commands"]| 而非参考根位姿），并把 \verb|motion_body_*| 的上肢子集改到「每 $T_{\mathrm{reset}}$ 帧重置原点」的局部系下计算，挂进 env 的 \verb|_reward_fns| 派发表、权重经 \verb|reward.scales| 注入即可。UniLab 给了执行层（MotionLoader $+$ body 位姿 getter $+$ 派发表），\emph{解耦的 reward 结构本身需自实现}\cite{unilab2026}。
+\end{note}
+
+\subsection{运行验证}
+关键判断点：（1）训练曲线上 \verb|r_landmark| 与 \verb|r_velocity| 应\emph{各自}上升而非此消彼长——若一个涨另一个崩，说明权重失衡或解耦没生效（landmark 仍在世界系）；（2）可视化时上半身姿态贴合参考、下半身按命令速度行走、且根节点不「漂走」；（3）把参考动作换成含大幅移动的（如跑步），确认 landmark 不暴涨——这是 periodic local frame 起效的直接证据。
+
+\subsection{常见陷阱}
+\begin{pitfall}[landmark 在世界系而非局部系计算]
+\textbf{错误描述}：直接用世界坐标算 landmark error。\textbf{现象后果}：参考动作含大幅位移时，机器人走得稍快/慢即 landmark error 暴涨，下半身步态被「拉回」而崩溃。\textbf{根本原因}：世界系下策略被迫同时跟踪绝对位置 $+$ 姿态，而绝对位置在速度不完全匹配时不可能跟上。\textbf{正确做法}：用 periodic local frame（上面代码），策略只需「姿态像参考」，不需「在同一位置」。这是 ExBody$\to$ExBody2 的核心改进。
+\end{pitfall}
+\begin{pitfall}[以为 teacher 过滤会丢掉大半数据]
+\textbf{错误描述}：担心自动过滤太激进，索性不过滤。\textbf{现象后果}：训练数据混入物理不可行动作，策略学到「数据里有但做不到」的行为，整体 tracking 精度被拖低。\textbf{根本原因}：AMASS 等大规模数据里绝大多数是日常动作（走、坐、站、挥手），对 G1 可行；真正被滤的是少数极端动作。\textbf{正确做法}：放心过滤——典型保留率 $70$--$85\%$；\rebuilt{保留率为经验范围，随数据集与机器人而变。}
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[实现]} 写出 ExBody2 的 landmark tracking reward（局部系）。需要跟踪哪些关键点？各 $\sigma$ 设多少？\emph{验收}：可运行的函数 $+$ 关键点列表 $+$ $\sigma$ 表（参考上面代码与四维表）。
+  \item \textbf{[实验]} 把 \verb|reset_interval| 分别设 $5$、$30$、$120$ 帧训同一跑步参考动作，观察 landmark error 与步速跟踪。\emph{验收}：三组曲线对比 $+$ 一句结论（哪个间隔最好、为什么）。
+  \item \textbf{[跨章综合]} 对比 ExBody2 的 teacher-data 过滤与 \cref{ch:rlmc-motimit} 的 KungfuBot physics filter：过滤依据各是什么？哪个更自动化？\emph{验收}：列出两者依据 $+$ 一句判断。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{精读：WoCoCo 的接触阶段分解}\label{sec:rlmc-wbc-wococo}
+
+\begin{paper}[WoCoCo：用顺序接触把长时程全身控制分解为可学的阶段]\label{paper:rlmc-wbc-wococo}
+\textbf{问题}：接触丰富的长时程全身任务（跑酷、搬箱、舞蹈、攀岩）中，接触模式频繁切换，端到端 RL 探索不到正确接触序列。\\
+\textbf{核心思想}：把任务\emph{自然分解}为一系列接触阶段（contact stage），每阶段接触模式固定；用\emph{任务无关}的 reward 与 sim-to-real 设计，每个具体任务只需指定 $1$--$2$ 个任务相关项。\\
+\textbf{关键结果}：端到端 RL 控制器在真机上完成四个挑战性任务——多样跑酷跳跃、箱子 loco-manipulation、动态拍手跺脚舞蹈、崖壁攀爬，\emph{无需任何 motion prior}；框架还可推广到 $22$-DoF 恐龙机器人。\\
+\textbf{与本书关系}：是 \cref{sec:rlmc-wbc-routes} 路线二的标杆；其 stage-aware reward 是 \cref{ch:rlmc-reward} 多目标 reward 在长时程任务上的结构化扩展。\\
+\textbf{局限}：需人工指定接触计划，对接触序列不明确的任务不适用。\\
+WoCoCo（Zhang, Xiao, He, Shi 四人 equal-contribution，CoRL 2024，arXiv:2406.06005，项目页 \texttt{lecar-lab.github.io/wococo}，仓库 \texttt{LeCAR-Lab/wococo}）\cite{zhang2024wococo}。经核官方项目页只标「CoRL 2024」，未标 oral/spotlight。
+\end{paper}
+
+\subsection{模块功能与在管线中的位置}
+本节是路线二的工程兑现。位置：当任务涉及\emph{明确的接触序列变化}（搬箱、开门、攀岩）时，WoCoCo 取代「单段 dense reward 端到端」，把探索从「$10^{1000\times 23}$ 的整段」降到「每阶段 $10^{250\times 23}$ 的短段」。它与 \cref{sec:rlmc-wbc-exbody} 的解耦正交：解耦切上下肢、WoCoCo 切时间阶段，二者可叠加（\cref{ins:rlmc-wbc-toolbox}）。
+
+\subsection{配置详解：contact stage 与 stage-aware reward}
+
+\paragraph{contact stage 定义.}
+每个 stage 由「期望接触集合」定义——哪些身体部位应有接触力。这个定义\emph{任务无关}：对任何涉及接触序列的任务，只需指定「何时哪里该有接触」。阶段间切换由 entry/exit 条件驱动（几何接近 $+$ 物理接触双判据）。
+
+\paragraph{stage-aware reward 三组件.}
+\begin{itemize}
+  \item \textbf{contact reward}：鼓励当前阶段的正确接触模式（dense 接触力大小，非 $0/1$ 二值）；正确接触给正、意外接触（如膝盖撞地）给更大的负。
+  \item \textbf{stage-count reward}：每进入新阶段给一次性 bonus，防止策略卡在某阶段。
+  \item \textbf{task-specific term}（每任务仅 $1$--$2$ 个）：如搬箱的 approach 导航、carry 的箱到目标距离。
+\end{itemize}
+前两组任务无关、可复用；这正是 WoCoCo「通用模板 $+$ 少量定制」的来源。配置项四维表：
+
+\begin{center}
+\small
+\begin{tabular}{p{2.6cm}p{2.8cm}p{3.0cm}p{3.0cm}}
+\hline
+配置项 & 默认值来源 & 修改影响 & 与其他配置耦合 \\
+\hline
+exit\_condition 阈值 & 经验（手到物 $<0.15$\,m $+$ 有接触力） & 太严策略卡死、太松「假接触」过阶段 & 与 contact reward 的接触判据耦合 \\
+contact force\_clip & 经验 $100$\,N & 太小区分不出接触强弱、太大被极值主导 & 与归一化、weight 耦合 \\
+incorrect contact 罚倍率 & 经验为正确的 $2\times$ & 太小学不会避免意外接触 & 与 self collision penalty（\cref{ch:rlmc-humanoidloco}）协同 \\
+stage bonus & 经验 $5.0$ & 太小不推进、太大「冲阶段」忽略质量 & 与 episode 长度耦合 \\
+\hline
+\end{tabular}
+\end{center}
+
+\rebuilt{上表 exit\_condition（$0.15$\,m $+$ 接触力）、force\_clip $100$\,N、意外接触罚 $2\times$、stage bonus $5.0$ 均为 Tutorial 给出的工程起点，未与 WoCoCo 论文（arXiv:2406.06005）逐项核对；落地以你的任务/平台调参为准。}
+
+\paragraph{three-stage DR 课程.}
+WoCoCo 的 sim-to-real 用三阶段 DR：（i）无 DR，先学会接触序列；（ii）开 DR $+$ 增大 smoothness weight；（iii）更严格正则化，为真机做准备。
+
+\begin{insight}[Phase 1 不加 DR：先学序列再学鲁棒]\label{ins:rlmc-wbc-dr3}
+为什么 Phase 1 不加 DR？接触序列本身就难学——若同时加 DR，物理参数变化（如摩擦低时手抓不住箱子）会让接触判断不可靠，策略因「接触不可靠」而学不会序列。先在确定物理下学会序列，再逐步引入不确定性。这与 \cref{ch:rlmc-humanoidloco} 附录 C 的「人形 DR 三阶段、不要跳级」同理，也与 \cref{ch:rlmc-quadloco} 的课程思想一致：渐进式训练通过「每步缩小搜索空间」使难题可解——先固定接触序列（缩小一个维度），再放开物理不确定性。
+\end{insight}
+
+\subsection{代码走读：三框架对比实战}
+WoCoCo 的核心是 contact stage 状态机 $+$ stage-aware reward。下面给概念实现，再说明三框架的接触读取差异。
+
+\begin{codebox}[Python]{contact stage 状态机与 stage-aware reward（概念，搬箱为例）}
+import torch
+
+class ContactStage:
+    def __init__(self, name, expected, exit_cond):
+        self.name = name
+        self.expected = expected          # set[str]，期望有接触力的 body
+        self.exit_cond = exit_cond        # callable(env) -> bool
+
+BOX_CARRY_STAGES = [
+    ContactStage("approach",  {"left_foot","right_foot"},
+                 lambda e: e.hand_to_box_dist < 0.15),
+    ContactStage("grasp",     {"left_foot","right_foot","left_hand","right_hand"},
+                 lambda e: e.box_lifted > 0.05),
+    ContactStage("carry",     {"left_foot","right_foot","left_hand","right_hand"},
+                 lambda e: e.box_at_target),
+    ContactStage("place",     {"left_foot","right_foot"},
+                 lambda e: e.hands_released),
+]
+
+def contact_reward(env, stage, clip=100.0):
+    actual = env.get_active_contacts()            # set[str]
+    r = torch.zeros(env.num_envs, device=env.device)
+    for b in stage.expected:                       # 鼓励期望接触
+        r += torch.clamp(env.get_contact_force(b), 0, clip) / clip
+    for b in (actual - stage.expected):            # 惩罚意外接触（更重）
+        r -= torch.clamp(env.get_contact_force(b), 0, clip) / (clip / 2)
+    return r
+
+def stage_count_reward(stage_idx, total):          # 推进到更高阶段的线性奖励
+    return stage_idx / total
+
+# active_stages：某 reward 项只在指定阶段生效（比乘法门控更灵活）
+def task_term(env, stage, active_stages, fn):
+    mask = torch.tensor([stage.name in active_stages], device=env.device)
+    return torch.where(mask, fn(env), torch.zeros_like(fn(env)))
+\end{codebox}
+
+\begin{note}
+\textbf{active\_stages 是概念性字段.}\;
+mjlab / Isaac Lab 的标准 \texttt{RewardTermCfg} \emph{不原生支持} \verb|active_stages|——上面的 \verb|task_term| 是在 reward 函数内部手动检查当前 stage 再启停的工程实现。它比 \cref{ch:rlmc-quadloco} 的乘法门控更灵活：乘法门控只能编码线性顺序，\verb|active_stages| 可在任意阶段组合上激活（如「箱到目标」在 carry 与 place 两阶段都激活）。\rebuilt{此为 Tutorial 给出的工程封装，非 WoCoCo 官方 API；落地按你框架的 reward 机制实现。}
+\end{note}
+
+\begin{center}
+\small
+\begin{tabular}{p{2.0cm}p{4.3cm}p{4.3cm}}
+\hline
+环节 & mjlab & Isaac Lab \\
+\hline
+接触力读取 & MuJoCo 接触数组直接读（\cref{ch:rlmc-physics}） & \texttt{ContactSensor} 的 net force（需在场景里声明 sensor） \\
+stage 状态机 & 挂在 env 的 step 里维护 stage\_idx & 同理；可放进自定义 \texttt{EventTerm} 或 env 扩展 \\
+意外接触检测 & 遍历所有 body 的接触集合 & 用 \texttt{ContactSensor} 的 body 列表与 force 阈值 \\
+\hline
+\end{tabular}
+\end{center}
+
+\paragraph{UniLab.}
+UniLab 在接触丰富任务上有两个现成骨架：\texttt{G1BoxTracking}（箱子 loco-manipulation）与 \texttt{G1ClimbTracking}（崖壁攀爬），均在 \texttt{envs/motion\_tracking/g1}（UniLab）——\texttt{demo boxtracking} / \texttt{demo wallflip} 可直接回放预训练策略。逐项对照上表三环节：（1）\textbf{接触力读取}：UniLab 经后端 \verb|get_sensor_data(name)| 与 body 接触量在 \verb|update_state| 里直接取（CPU 全精度接触求解，UniLab），无须像 Isaac 那样先在场景声明 \verb|ContactSensor|；（2）\textbf{stage 状态机}：UniLab 的 MDP 逻辑\emph{集中}在 \verb|NpEnv| 子类的 \verb|update_state| 里（\texttt{base/np\_env.py} 的 \texttt{NpEnv}，UniLab；obs/reward/terminated 一处算），把 \verb|stage_idx| 作为 env 自维护字段最自然——它不像 mjlab/Isaac 那样有独立的 \verb|EventTerm|/manager；（3）\textbf{意外接触检测}：遍历 body 接触集合即可。但 WoCoCo 的核心——\textbf{contact stage 状态机 $+$ stage-aware reward 三组件}——UniLab \emph{未内置}，需写成自定义 reward 函数挂进派发表。
+
+\begin{codebox}[Python]{UniLab：把 WoCoCo 的 contact reward 写成派发表里的纯函数}
+import numpy as np
+# UniLab 范式：reward 是吃 RewardContext 的纯函数（common/rewards.py 风格），权重经 reward.scales 注入
+# contact stage 自身做成 env 字段（在 update_state 里推进 self._stage_idx），reward 函数读它即可
+def wococo_contact_reward(ctx, clip=100.0):     # 放进 env._reward_fns["wococo_contact"]
+    stage = ctx.info["stage"]                    # env 在 update_state 里写入当前 ContactStage
+    actual = ctx.info["active_contacts"]         # set[str]，由后端接触量阈值化得到
+    r = np.zeros(ctx.num_envs)
+    for b in stage.expected:                      # 鼓励期望接触
+        r += np.clip(ctx.info["contact_force"][b], 0, clip) / clip
+    for b in (actual - stage.expected):           # 惩罚意外接触（更重）
+        r -= np.clip(ctx.info["contact_force"][b], 0, clip) / (clip / 2)
+    return r                                       # run_reward_dispatch 会乘 reward.scales["wococo_contact"]*ctrl_dt
+# 在 owner YAML 里给权重即生效：reward.scales.wococo_contact: 2.0, reward.scales.stage_progress: 5.0
+\end{codebox}
+
+\begin{note}
+\textbf{UniLab 无 WoCoCo 内置模板，但范式契合.}\;
+UniLab 没有现成的 contact-stage 框架，但它的「\texttt{scales} 标量字典 $+$ \verb|_reward_fns| 派发表 $+$ \verb|update_state| 单点算 reward」范式恰好让 stage-aware reward 落地很直接：stage 状态机做成 env 字段在 \verb|update_state| 里推进，\verb|contact_reward|/\verb|stage_count_reward|/task-specific 三组件各写成一个吃 \verb|RewardContext| 的函数，权重纯靠改 YAML 标量（与 \cref{ins:rlmc-wbc-toolbox} 一致——解耦切 reward、WoCoCo 切时间，在 UniLab 里都是往派发表里加函数）。\verb|active_stages| 这种「某项只在指定阶段生效」也是在函数内部读 \verb|ctx.info["stage"]| 手动启停，与 mjlab/Isaac 同为工程封装、非框架原生 API\cite{unilab2026}。
+\end{note}
+
+\subsection{运行验证}
+搬箱任务的收敛特征（Phase 1，无 DR）：$0$--$1$k iter \verb|contact_reward| 快速上升（学会脚地接触）；$1$k--$3$k \verb|stage_progress| 与 approach 上升（学会推进与导航）；$3$k--$5$k 出现完整 stage $0\to1\to2\to3$ 序列。\textbf{若} \verb|stage_progress| \textbf{始终为 $0$（卡在 stage 0）}：最常见原因是 exit\_condition 太严（如手到箱 $<0.05$\,m 对人形太难，放松到 $0.15$\,m）；其次是 contact reward 的「正确接触」太严（只有双手完美同时接触才给正，改为「至少一只手接触给部分 reward」）。
+
+\subsection{常见陷阱}
+\begin{pitfall}[contact stage 切换条件只看几何不看接触力]
+\textbf{错误描述}：exit\_condition 只判「手是否接近箱子」。\textbf{现象后果}：策略学到「把手伸到箱子附近但不真正触碰」就过阶段，搬运时箱子掉落。\textbf{根本原因}：几何接近不等于物理接触；缺接触力判据时策略钻空子。\textbf{正确做法}：切换条件同时检查几何接近\emph{与}接触力存在（上面代码的双判据）。
+\end{pitfall}
+\begin{pitfall}[以为 WoCoCo 只适用于接触计划「非常精细」的任务]
+\textbf{错误描述}：因「要写接触计划」而放弃 WoCoCo。\textbf{现象后果}：错过最适合的路线，硬上端到端学不会。\textbf{根本原因}：接触计划不需精细——只需「大概接触顺序」（先走到箱附近$\to$手碰箱$\to$抬$\to$走），不必精确到「左手先还是右手先」。\textbf{正确做法}：写粗粒度接触计划，阶段内的细节（用什么手势抓）交给 RL 自动学。
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[设计]} 为「人形开门」设计 WoCoCo 的 contact stage 计划。列出每阶段名称、expected\_contacts、exit\_condition。\emph{验收}：$\geq 4$ 个阶段的完整三元组。
+  \item \textbf{[实验]} 用三阶段 DR 课程训一个简单接触任务，比较 Phase 1 结束与 Phase 3 结束的成功率与动作平滑度。\emph{验收}：两阶段成功率 $+$ action\_rate 对比。
+  \item \textbf{[分析]} contact reward 用 dense 接触力大小（而非 binary）对 PPO 梯度信号有什么好处？\emph{验收}：$\geq 2$ 句，联系 \cref{ch:rlmc-reward} 的稠密 vs 稀疏 reward。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{评估体系与分层 RL：HumanoidBench}\label{sec:rlmc-wbc-bench}
+
+\begin{paper}[HumanoidBench：$27$ 任务的全身控制基准与分层 RL 实证]\label{paper:rlmc-wbc-bench}
+\textbf{问题}：人形全身任务千差万别（搬箱、开门、跳跃、舞蹈），缺统一基准就无法横向比较算法。\\
+\textbf{核心思想}：在 Unitree H1 $+$ 双灵巧手平台上定义 $27$ 个高维全身控制任务（涵盖 locomotion 与 whole-body manipulation），用统一 MuJoCo 环境与标准指标评估。\\
+\textbf{关键结果}：SOTA RL（PPO/SAC/TD-MPC2/DreamerV3 等）在大多数任务上挣扎；而\emph{有鲁棒低层策略支撑的分层学习}基线显著更好。\\
+\textbf{与本书关系}：为 \cref{sec:rlmc-wbc-exbody} 解耦、\cref{sec:rlmc-hl-hover} HOVER 的分层/teacher-student 架构提供实证支持；其任务定义可直接指导你的 obs/reward 设计。\\
+\textbf{局限}：H1 $+$ Shadow Hand 配置与无手 G1 不同；含手任务无法直接迁到无手平台。\\
+HumanoidBench（Sferrazza, Huang, Lin, Lee, Abbeel，UC Berkeley/Yonsei，RSS 2024，arXiv:2403.10506，仓库 \texttt{carlosferrazza/humanoid-bench}）\cite{sferrazza2024humanoidbench}。
+\end{paper}
+
+\subsection{模块功能与在管线中的位置}
+本节有两个作用：一是给你一个\emph{标准化对照基线}（发表研究时用），二是讲透 HumanoidBench 最重要的经验结论——「分层 RL 在长时程操作上显著优于端到端」，并把它落成可复用的两层架构。位置：在你已选定路线、要评估或要走分层时。
+
+\subsection{配置详解：平台、任务分类与核心发现}
+
+\begin{center}
+\small
+\begin{tabular}{ll}
+\hline
+参数 & 值 \\
+\hline
+机器人 & Unitree H1 $+$ 双 Shadow Hand（仓库另含 G1 三指手 / Digit 变体） \\
+状态维度 & $151$（$49$ 身体 $+$ 每手 $51$） \\
+Action 维度 & $61$（$19$ 身体 $+$ 每手 $21$，位置控制） \\
+控制频率 & $50$\,Hz \\
+任务数 & $27$（$12$ locomotion $+$ $15$ whole-body manipulation） \\
+\hline
+\end{tabular}
+\end{center}
+
+上表为 HumanoidBench（arXiv:2403.10506）配置：动作 $61$ 维（$19$ 身体 $+$ 每手 $21$）、状态 $151$ 维（$49$ 身体 $+$ 每手 $51$）、$50$\,Hz、$27$ 任务（$12$ loco $+$ $15$ manipulation）均经论文正文核对。触觉/相机等扩展观测的精确维度以仓库为准。
+
+HumanoidBench 最重要的一句结论是：\emph{有鲁棒低层策略（如行走、伸手）支撑时，分层学习基线显著优于端到端 RL}。两个原因：
+
+\begin{enumerate}
+  \item \textbf{探索效率}：$61$D 动作空间中随机探索几乎 $100\%$ 摔倒；分层中低层已会稳定行走，高层在「已会走的机器人」上探索操作，不担心摔倒。
+  \item \textbf{信用分配}：端到端摔倒后无法区分「走路不稳」还是「抓取动作」导致；分层中摔倒责任明确归低层。
+\end{enumerate}
+
+\begin{insight}[分层把「一个难问题」拆成「两个易问题」]\label{ins:rlmc-wbc-hier}
+分层 RL 的收益本质是\emph{问题分解}——把「$61$D 同时学平衡 $+$ 操作」拆成「低层学平衡（已解决）$+$ 高层学操作（在稳定基础上）」。这与 \cref{sec:rlmc-wbc-wococo} 的接触阶段分解（在\emph{时间}上拆）、\cref{sec:rlmc-wbc-exbody} 的上下肢解耦（在\emph{身体}上拆）异曲同工——都是「在某个维度加结构以缩小搜索空间」。但分层的代价（\cref{ins:rlmc-wbc-platform} 已暗示）是层间信息瓶颈：高层只能通过低层的命令接口（速度 $+$ 上肢目标）影响动作，无法直接调每个关节，故精细的上下肢耦合（搬重物加宽步幅）会被瓶颈限制。这就是为什么 WoCoCo 在接触明确时\emph{端到端}反而胜出——它不引入瓶颈。
+\end{insight}
+
+\subsection{代码走读：分层 RL 的标准两层架构（三框架通用）}
+下面是与框架无关的两层架构——低层 $50$\,Hz、高层 $10$\,Hz（每 $5$ 个低层 step 更新一次高层命令）。
+
+\begin{codebox}[Python]{分层全身控制：低层冻结 + 高层训练}
+import torch
+
+class HierarchicalHumanoidPolicy:
+    def __init__(self, low_level_ckpt, high_level_policy, freq_ratio=5):
+        # 低层：预训练 locomotion（\cref{ch:rlmc-humanoidloco} 的成果），冻结
+        self.low_level = torch.load(low_level_ckpt)
+        self.low_level.eval()
+        for p in self.low_level.parameters():
+            p.requires_grad = False
+        self.high_level = high_level_policy        # 可训练 task policy
+        self.freq_ratio = freq_ratio               # 低层:高层 = 5:1
+        self.step_counter = 0
+        self.cmd = None
+
+    def step(self, obs):
+        if self.step_counter % self.freq_ratio == 0:        # 高层每 5 步更新
+            task_obs = self._task_obs(obs)
+            self.cmd = self.high_level(task_obs)            # -> base_vel_cmd(3)+upper_target(8)
+        low_obs = self._low_obs(obs, self.cmd)
+        action = self.low_level(low_obs)                    # 低层逐步执行
+        self.step_counter += 1
+        return action
+
+    def _task_obs(self, obs):
+        return torch.cat([obs["joint_pos"], obs["joint_vel"], obs["base_ang_vel"],
+                          obs["projected_gravity"], obs["task_specific_obs"]], dim=-1)
+
+    def _low_obs(self, obs, cmd):
+        return torch.cat([obs["joint_pos"], obs["joint_vel"], obs["base_ang_vel"],
+                          obs["projected_gravity"], cmd["base_vel_cmd"],
+                          cmd["upper_body_target"], obs["last_action"]], dim=-1)
+\end{codebox}
+
+训练流程三步：（1）训低层 velocity tracking（\cref{ch:rlmc-humanoidloco}），冻结；（2）训高层 task policy——低层作为「环境的一部分」，高层动作经低层转为关节角，PPO 用任务 reward 训高层；（3）可选端到端 fine-tune——解冻低层、用极小 lr（$1\text{e-}5$）同时更新，让低层适应高层的「非常规」命令。高层 curriculum：初期只给简单任务（物体在附近、不需长距离行走），逐步增难——与 \cref{ch:rlmc-quadloco} 课程同理。
+
+\paragraph{三框架接线差异.}
+
+\begin{center}
+\small
+\begin{tabular}{p{2.0cm}p{4.3cm}p{4.3cm}}
+\hline
+环节 & mjlab / Isaac Lab & UniLab \\
+\hline
+低层冻结 & 加载 checkpoint $+$ \texttt{requires\_grad=False}，两框架一致 & 策略在 GPU learner 侧是普通 torch 模块，冻结同写法；UniLab 的 HORA 蒸馏正是只解冻 \verb|adapt_tconv|、冻结 teacher 主干\cite{unilab2026} \\
+频率解耦 & 高层每 $N$ 个 env step 调用一次（计数器） & 同理：在 \texttt{NpEnv} 子类的 \verb|update_state| 里维护计数器，与框架无关 \\
+HumanoidBench 评估 & 经 \texttt{humanoid-bench}（MuJoCo），与 mjlab 同引擎更易对接 & UniLab \texttt{mujoco} 后端亦 MuJoCo，同引擎易对接；但 \texttt{humanoid-bench} 是独立包，需写适配（UniLab 任务集为自有注册表） \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{运行验证：可迁移的代表性任务 MDP}
+HumanoidBench 的核心价值不是 H1 $+$ 灵巧手这套硬件，而是\emph{任务定义方法论}——不需灵巧手的任务（推、搬、开门）的 obs/reward 设计可直接迁到 G1。下表提炼三个代表性任务的通用设计原则（完整 MDP 见仓库）。
+
+\begin{center}
+\small
+\begin{tabular}{p{2.6cm}p{2.4cm}p{2.4cm}p{3.4cm}}
+\hline
+原则 & Push（推箱） & Carry（搬运） & 通用建议 \\
+\hline
+obs 用相对坐标 & box\_pos\_rel & box/target\_rel & 始终用 base frame 相对坐标 \\
+reward 阶段性 & 弱（直接推） & 强（接近$\to$抓$\to$搬） & 阶段多用乘法门控或 WoCoCo \\
+episode 长度 & $\sim 500$（$10$\,s） & $\sim 750$（$15$\,s） & 阶段越多越长 \\
+接触力入 obs & 否 & 是（hand\_contact） & 力控任务时加入 \\
+success metric & 距离 & 距离 $+$ 高度 & 用任务语义评估，非 reward 值 \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{insight}[reward 涨 $\neq$ 任务完成：必须用任务语义评估]\label{ins:rlmc-wbc-metric}
+这是 \cref{ins:rlmc-hl-rewardhack}（reward 高 $\neq$ 步态正确）在 manipulation 上的延伸。搬箱任务里 reward 可能因「机器人贴着箱子站着、approach reward 拉满」而涨，但箱子从未被搬到目标——success metric（box\_to\_target\_dist $<0.15$\,m）才是真相。工程含义：训练监控\emph{同时}画 reward 曲线与 success rate；二者背离（reward 涨、success 平）即 reward hacking，要么改 success-aligned 的 reward（如乘法门控强制先抓再搬），要么收紧 reward 定义。
+\end{insight}
+
+\subsection{常见陷阱}
+\begin{pitfall}[以为 HumanoidBench 用 H1 $+$ Shadow Hand 就与无手 G1 无关]
+\textbf{错误描述}：因平台不同而完全忽略 HumanoidBench。\textbf{现象后果}：重复造轮子设计 obs/reward，且没有标准基线对照。\textbf{根本原因}：其核心贡献是任务定义与评估方法论，不是特定硬件。\textbf{正确做法}：迁移不需灵巧手的任务（搬箱、推车、开门）的 obs/action/reward 设计到 G1；含手任务（拧瓶盖）才需灵巧手。
+\end{pitfall}
+\begin{pitfall}[分层 RL 高层「不学」]
+\textbf{错误描述}：高层 reward 不涨，怀疑高层网络有问题。\textbf{现象后果}：浪费时间调高层，根因却在低层。\textbf{根本原因}：低层没正确接收高层命令（obs 拼接顺序错、或低层训练时根本没见过 upper\_body\_target 这一段）。\textbf{正确做法}：先确认低层 obs 里\emph{确实}含高层命令段且顺序一致（打印 shape 与前几维）；低层训练时就应把高层命令作为输入的一部分。
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[调研]} 从 HumanoidBench 的 $27$ 任务中选 $5$ 个不需灵巧手的，对每个列出核心 obs term 与 reward term。\emph{验收}：$5\times$（任务名 $+$ $\geq 3$ obs $+$ $\geq 2$ reward）。
+  \item \textbf{[分析]} 为什么 locomotion 任务 PPO 可解、manipulation 任务 PPO 大多不可解？从动作维度与 episode 长度两角度解释。\emph{验收}：两角度各 $\geq 2$ 句。
+  \item \textbf{[实现]} 用上面的两层架构，把 \cref{ch:rlmc-humanoidloco} 训好的 locomotion 当低层，加一个简单高层（输出固定前进速度），验证机器人能被高层「驱动」前进。\emph{验收}：可视化 $+$ 一句「高层命令确实改变了行为」的证据。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{跌倒恢复的集成：策略切换管线}\label{sec:rlmc-wbc-recovery}
+
+\subsection{模块功能与在管线中的位置}
+真实世界的人形在全身操作中\emph{不可避免}会摔倒——能自动站起继续工作是基本安全要求。本节解决的不是「怎么训站起策略」（那是 HoST，已在 \cref{ch:rlmc-humanoidloco} 的 \cref{sec:rlmc-hl-host} 精读其 multi-critic、辅助力课程、smoothness 正则），而是「怎么把站起策略\emph{集成}进 locomotion $+$ 操作管线」——位置在部署层：把实验室里各自训好的 main policy 与 stand-up policy 串成一个可上线的状态机。
+
+\begin{insight}[跌倒恢复是「系统」问题，不是「策略」问题]\label{ins:rlmc-wbc-system}
+单独训出一个能从侧躺站起的策略（HoST）只是\emph{零件}；让机器人在执行任务中摔倒后自动恢复并继续，是\emph{系统集成}——需要 fall detector、策略切换、obs 适配、action 平滑过渡四个环节协同。这与 \cref{ch:rlmc-motimit} 的策略切换（\cref{ins:rlmc-mi-switch}）同属一类工程问题：多个专用策略 $+$ 一个调度器。工程上最常被低估的不是「站起策略好不好」，而是「切换瞬间会不会因 action 突变把电机打坏」——下面的平滑过渡正是为此。
+\end{insight}
+
+\subsection{配置详解：四个环节的设计}
+
+\paragraph{环节一：fall detector.}
+检测 \verb|base_height < fall_threshold|（如 $0.3$\,m）或 \verb|pitch/roll > limit|（如 $1.0$\,rad）。要避免误检——正常蹲下不应被判为摔倒，故阈值要比正常工作姿态的极值更极端，且可加「持续 $N$ 帧」条件去抖。
+
+\paragraph{环节二：obs 适配.}
+main policy 的 obs 含操作相关信息（物体位置等），stand-up policy 不需要这些。切换时从 main obs 提取 stand-up 需要的子集——两者 obs 维度\emph{不同}是最常见的集成 bug 源。
+
+\paragraph{环节三：策略切换状态机.}
+\verb|main -> (fall detected) -> standup -> (stable N steps) -> main|。
+
+\paragraph{环节四：action 平滑过渡.}
+stand-up 最后一帧 action 与 main 第一帧 action 可能差异大（一个关节从 $0.5$\,rad 突变到 $-0.2$\,rad），真机上产生力矩冲击。切换时对 action 做 $5$--$10$ 步线性插值过渡。
+
+配置项四维表：
+
+\begin{center}
+\small
+\begin{tabular}{p{2.6cm}p{2.8cm}p{3.0cm}p{3.0cm}}
+\hline
+配置项 & 默认值来源 & 修改影响 & 与其他配置耦合 \\
+\hline
+fall\_height & 经验 $0.3$\,m & 太高正常蹲下误触发、太低摔透了才救 & 与正常工作姿态最低高度耦合 \\
+去抖帧数 $N$ & 经验 $\sim 5$ 帧 & 太小抖动误触发、太大反应迟钝 & 与控制频率耦合 \\
+stable\_steps（判站稳） & 经验 $\sim 50$ 帧（$1$\,s） & 太小没站稳就切回、太大磨蹭 & 与 stand-up 收敛速度耦合 \\
+过渡步数 & 经验 $5$--$10$ 步 & 太小冲击大、太大过渡期姿态尴尬 & 与两策略 action range 差异耦合 \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{代码走读：三框架通用的策略切换器}
+
+\begin{codebox}[Python]{PolicySwitcher：main 与 stand-up 的状态机 + action 平滑}
+import torch
+
+class PolicySwitcher:
+    def __init__(self, main_policy, standup_policy, fall_height=0.3,
+                 stable_height=0.5, stable_steps=50, blend_steps=8):
+        self.main, self.standup = main_policy, standup_policy
+        self.fall_height, self.stable_height = fall_height, stable_height
+        self.stable_steps, self.blend_steps = stable_steps, blend_steps
+        self.mode = "main"            # main / standup / blend
+        self.stable_counter = 0
+        self.blend_counter = 0
+        self.last_action = None       # 用于切换瞬间的平滑起点
+
+    def step(self, obs):
+        h, pitch = obs["base_height"], obs["base_pitch_abs"]
+
+        if self.mode == "main":
+            if h < self.fall_height or pitch > 1.0:           # 检测摔倒
+                self.mode = "standup"; self.stable_counter = 0
+            a = self.main(obs)
+
+        elif self.mode == "standup":
+            self.stable_counter = self.stable_counter + 1 \
+                if (h > self.stable_height and pitch < 0.3) else 0
+            if self.stable_counter > self.stable_steps:        # 站稳了，进入过渡
+                self.mode = "blend"; self.blend_counter = 0
+            a = self.standup(self._adapt_obs(obs))             # obs 适配子集
+
+        else:  # blend：standup 末态 → main 的线性过渡，防 action 突变
+            self.blend_counter += 1
+            t = self.blend_counter / self.blend_steps
+            a = (1 - t) * self.last_action + t * self.main(obs)
+            if self.blend_counter >= self.blend_steps:
+                self.mode = "main"
+
+        self.last_action = a
+        return a
+
+    def _adapt_obs(self, obs):
+        # stand-up policy 不需要操作相关 obs，提取其所需子集（维度通常 < main）
+        return torch.cat([obs["joint_pos"], obs["joint_vel"],
+                          obs["base_ang_vel"], obs["projected_gravity"]], dim=-1)
+\end{codebox}
+
+\paragraph{三框架接线差异.}
+状态机本身与框架无关；差异在「站起初始状态从哪来」与「HoST 仓库的架构」。HoST 仓库基于 IsaacGym $+$ legged\_gym（单体类，见 \cref{sec:rlmc-hl-host} 的局限），与 mjlab/Isaac Lab 的 Manager-Based 架构不同——\textbf{直接复制其训练代码不可行}，但训好的 stand-up 策略权重可被任意框架加载用于推理切换。
+
+\begin{center}
+\small
+\begin{tabular}{p{2.2cm}p{4.2cm}p{4.2cm}}
+\hline
+环节 & mjlab / Isaac Lab & UniLab \\
+\hline
+摔倒状态采集 & 随机姿态 reset $+$ 自由下落收集缓存（见下） & 同理：后端 \verb|set_state(env_idx, qpos, qvel)|（\texttt{SimBackend} 抽象方法，UniLab）可置任意初始姿态，CPU 批量自由下落收集缓存 \\
+stand-up 推理 & 加载 HoST 权重做纯推理，与训练框架无关 & 同理：权重是普通 MLP，UniLab 侧纯推理即可（或导 \verb|policy.onnx| 用 onnxruntime） \\
+切换器 & 与框架无关，包在 env 外层的部署脚本 & 与框架无关；UniLab 另有 \texttt{scripts/deploy/}（\verb|export_deploy_config.py|/\verb|sim_prototype.py|）做部署期 obs 装配校验\cite{unilab2026} \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{note}
+\textbf{摔倒状态缓存（state caching）的工程优化.}\;
+HoST 训站起需大量「摔倒初始状态」。让机器人从站立随机摔倒来生成太慢（大部分时间在「站着」）。做法：一次性 rollout 收集大量摔倒姿态（各角度/位置/速度），按姿态分类（面朝下/上/侧躺/蜷缩）缓存，训练时直接加载。这与 \cref{ch:rlmc-humanoidloco} 的 \cref{sec:rlmc-hl-host} 提到的「辅助力课程」配合——缓存解决「初始状态多样性」，辅助力解决「冷启动稀疏 reward」。采样时\emph{均匀}覆盖各姿态类别，否则策略只会从常见姿态站起。
+\end{note}
+
+\subsection{运行验证}
+集成测试：在仿真中给机器人一个外力推倒（或直接 reset 到摔倒姿态），观察状态机是否 \verb|main -> standup -> blend -> main| 完整走通、且切回后能继续行走/操作。重点看 blend 阶段的关节力矩曲线——应无尖峰（平滑过渡起效的证据）。\textbf{若只从某些姿态能恢复}：检查 state cache 各姿态比例是否均衡（\cref{sec:rlmc-hl-host} 同款问题）。
+
+\subsection{常见陷阱}
+\begin{pitfall}[main 与 stand-up 的 obs 维度不同却直接喂同一个 obs]
+\textbf{错误描述}：切到 stand-up 时把 main 的完整 obs（含物体位置）原样喂进去。\textbf{现象后果}：维度不匹配崩溃，或 stand-up 把无关维度当噪声、行为异常。\textbf{根本原因}：两策略训练时的 obs 空间不同。\textbf{正确做法}：用 \verb|_adapt_obs| 提取 stand-up 所需子集（上面代码）；部署前打印两策略的 obs 维度确认。
+\end{pitfall}
+\begin{pitfall}[切回 main 时不做 action 平滑导致力矩冲击]
+\textbf{错误描述}：站稳后立刻切回 main，无过渡。\textbf{现象后果}：真机上某些关节 action 突变，产生大力矩冲击，可能损坏电机或触发保护。\textbf{根本原因}：两策略在切换点的 action 不连续。\textbf{正确做法}：加 $5$--$10$ 步线性 blend（上面代码的 blend 模式）；这与 \cref{ch:rlmc-humanoidloco} 强调的 action smoothness 对真机安全的重要性一致。
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[设计]} 为 G1 设计 fall detector：检测哪些 obs？阈值多少？如何避免正常蹲下被误判？\emph{验收}：检测量 $+$ 阈值 $+$ 一条去抖/区分策略。
+  \item \textbf{[工程]} 实现 PolicySwitcher 集成 main 与 HoST stand-up（stand-up 可先用占位策略）。仿真中推倒机器人，验证切换正确。\emph{验收}：状态机走通的日志 $+$ blend 阶段力矩无尖峰。
+  \item \textbf{[分析]} 站起来\emph{不是}摔倒的逆过程（\cref{sec:rlmc-hl-host} 的误解）。为什么不能把摔倒轨迹倒放当站起策略？\emph{验收}：从动力学（主动 vs 被动）角度 $\geq 2$ 句。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{全身控制的工程参数与诊断}\label{sec:rlmc-wbc-params}
+
+\subsection{模块功能与在管线中的位置}
+本节是查阅工具：把全身控制\emph{特有}的 reward 权重、诊断层次、失败模式集中成表。PD gain、action scale 的逐关节配置已在 \cref{ch:rlmc-humanoidloco} 的附录 A/B 给出（踝 kp $30$--$50$、膝/髋 kp $150$--$200$、逐关节 scale），本节\emph{不重复}，只补 loco-manipulation 新增的 reward 与诊断。
+
+\subsection{配置详解：全身控制 reward 参考}
+下表汇总各路线常用 reward，权重为工程起点（非论文原值）。
+
+\begin{center}
+\small
+\begin{tabular}{p{2.8cm}p{4.2cm}p{1.4cm}p{2.4cm}}
+\hline
+Reward 项 & 表达式（示意） & 权重 & 适用路线 \\
+\hline
+velocity\_tracking & $\exp(-\lVert v - v_{\mathrm{cmd}}\rVert^2/0.25^2)$ & $1.0$ & 解耦, HOVER \\
+landmark\_tracking & $\exp(-\lVert p_i^{\mathrm{local}} - p_i^{\mathrm{ref}}\rVert^2/\sigma_i^2)$ & $1.5$ & 解耦（ExBody2） \\
+joint\_tracking & $\exp(-\lVert q - q_{\mathrm{ref}}\rVert^2/\sigma^2)$ & $1.0$ & KungfuBot \\
+contact\_reward & $\sum_i \mathrm{clip}(f_i^{\mathrm{correct}},0,100)/100$ & $2.0$ & WoCoCo \\
+stage\_progress & $\mathrm{stage\_idx}/\mathrm{total}$ & $5.0$ & WoCoCo \\
+base\_height & $\exp(-|h - h_{\mathrm{tgt}}|^2/0.05^2)$ & $0.5$ & 通用 \\
+orientation & $\exp(-\lVert \mathrm{proj\_gravity}\rVert^2/0.1^2)$ & $1.0$ & 通用 \\
+action\_rate & $-\lVert a_t - a_{t-1}\rVert^2$ & $0.01$--$0.05$ & 通用 \\
+angular\_momentum & $-\lVert \mathbf{L}_{\mathrm{subtree}}\rVert^2$ & $0.05$ & 高动态（见 \cref{ch:rlmc-humanoidloco}） \\
+alive & $1.0$（每步存活） & $0.5$ & 通用 \\
+\hline
+\end{tabular}
+\end{center}
+
+\rebuilt{权重为 Tutorial 给出的工程起点，依任务/平台/框架而调；angular\_momentum 的权重量级与机理见 \cref{ch:rlmc-humanoidloco} 的 \cref{ins:rlmc-hl-esp}（它是 ESP 不是刹车，过大逼出极小步幅）。}
+
+\subsection{运行验证：全身控制的诊断层次}
+人形全身控制的失败比纯 locomotion 更难定位——因为「上肢 / 下肢 / 任务」三处都可能出问题。按层次逐层排查：
+
+\begin{codebox}[text]{全身控制诊断层次（自下而上）}
+Layer 1 基础 locomotion（5 min）
+  □ 不加上肢任务，纯行走是否稳定（\cref{ch:rlmc-humanoidloco} 基线）
+  □ 健康基准（gpufree RTX4090 实测，作判读锚点）：
+      WANDB_MODE=disabled uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+        --env.scene.num-envs 64 --agent.max-iterations 2
+      → 64 env 约 2.5k steps/s（小 env 数下远低于满载，别被吓到）、
+        value loss 量级 ~1（如 1.1）、reward 随迭代上升、无 NaN，即基线健康
+  → 不稳/出 NaN/reward 不涨：回 \cref{ch:rlmc-humanoidloco} 查 locomotion 策略
+Layer 2 上肢固定的行走（10 min）
+  □ 上肢保持默认姿态不动，行走是否稳定
+  → 不稳：上肢默认姿态 CoM 影响太大，调 default_arm_pos
+Layer 3 上肢活动的行走（训练中期）
+  □ 上肢执行参考动作，是否频繁摔倒
+  → 角动量致摔：增大 angular_momentum 惩罚（\cref{ch:rlmc-humanoidloco}）
+  → CoM 偏移致摔：增大 base_height / orientation reward
+Layer 4 task metric（训练后期）
+  □ 独立评估任务指标（tracking error / grasp success）
+  → reward 涨但 task metric 不涨：reward hacking（\cref{ins:rlmc-wbc-metric}）
+Layer 5 sim-to-real（部署）
+  □ 关节命令在安全范围、action rate 平滑、foot contact force 不超硬件极限
+\end{codebox}
+
+\textbf{这个层次的关键是「自下而上、逐层隔离」}：先确认下层（locomotion）没问题，再排查上层（操作）——否则你会在「上肢任务」上调参，根因却在「下肢走不稳」。
+
+\subsection{常见陷阱}
+\begin{pitfall}[在「上肢任务」上调参，根因却在「下肢走不稳」]
+\textbf{错误描述}：全身策略频繁摔倒，直接去调 landmark / contact reward。\textbf{现象后果}：怎么调上肢都不收敛。\textbf{根本原因}：跳过了诊断 Layer 1--2——下肢 locomotion 本身就不稳，上肢再怎么对也救不回。\textbf{正确做法}：严格自下而上——先 Layer 1（纯走稳）、Layer 2（上肢固定走稳），再碰上肢任务。
+\end{pitfall}
+\begin{pitfall}[把四足 loco-manip 的 push/DR 范围照搬给人形全身]
+\textbf{错误描述}：用 \cref{ch:rlmc-quadloco} 的 push velocity / friction 范围训人形全身。\textbf{现象后果}：开 DR 后全摔。\textbf{根本原因}：人形高质心 $+$ 窄支撑面 $+$ 上肢扰动，对扰动远更敏感。\textbf{正确做法}：用 \cref{ch:rlmc-humanoidloco} 附录 C 的人形 DR 范围（push $\pm0.5$\,m/s 而非 $\pm1.0$，分阶段引入），且在\emph{上肢活动}时 DR 还要更保守。
+\end{pitfall}
+
+\begin{practice}[本节动手]
+\begin{enumerate}
+  \item \textbf{[诊断]} 你的全身策略训 $5$k iter 后仍频繁摔倒。按诊断层次，你\emph{首先}应检查什么？为什么不能先调 reward 权重？\emph{验收}：给出第一步 $+$ 理由。
+  \item \textbf{[配置]} 为一个 ExBody2 风格的舞蹈 tracking 任务，从上表选出并配齐 reward 项与权重起点。\emph{验收}：$\geq 6$ 项 reward 的权重表 $+$ 一句「为什么这样配」。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总表}
+
+\begin{center}
+\small
+\begin{tabular}{p{5.0cm}p{8.0cm}}
+\hline
+误解 & 纠正 \\
+\hline
+人形全身控制就是「多几个关节」的四足 loco-manip & 质变非量变：双足无「稳定平台」，上肢每个动作都扰动倒立摆，全身协调是硬约束（\cref{ins:rlmc-wbc-platform}）。 \\
+DoF 多就一定要分层 & 分层收益是探索/信用分配，代价是信息瓶颈；接触明确时端到端（WoCoCo）反而胜（\cref{ins:rlmc-wbc-hier}）。 \\
+三条路线互斥，选一条排斥其余 & 在不同维度加结构，可叠加：解耦切上下肢、WoCoCo 切时间、HOVER 切命令（\cref{ins:rlmc-wbc-toolbox}）。 \\
+ExBody2 的 landmark 在世界系算也行 & 世界系下 drift 暴涨步态崩；必须局部系 $+$ periodic reset（\cref{ins:rlmc-wbc-decouple}）。 \\
+teacher 过滤会丢掉大半数据 & 大规模 MoCap 多为可行日常动作，典型保留 $70$--$85\%$。 \\
+reward 涨就说明任务完成 & 可能贴着箱子刷 approach reward；必须看 success metric（\cref{ins:rlmc-wbc-metric}）。 \\
+站起来是摔倒的逆过程 & 摔倒被动、站起主动，动力学不同，不能倒放轨迹（\cref{sec:rlmc-hl-host}）。 \\
+跌倒恢复是「训个站起策略」就行 & 是系统集成：detector $+$ 切换 $+$ obs 适配 $+$ action 平滑四环节（\cref{ins:rlmc-wbc-system}）。 \\
+\hline
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+
+\paragraph{术语速查.}
+\emph{velocity-landmark 解耦}：速度独立跟踪移动、landmark 在局部系跟踪姿态，二者各管一事（ExBody2）。\emph{periodic local frame}：每 $\sim 30$ 帧重置局部原点，消 drift 又保短期位移信号。\emph{teacher-data 过滤}：用 privileged teacher 自动删除做不了的参考动作。\emph{contact stage}：接触模式固定的任务阶段，端到端长时程任务的时间分解（WoCoCo）。\emph{stage-aware reward}：contact $+$ stage-count $+$ task-specific 三组件，前两组任务无关。\emph{分层 RL}：低层 locomotion 冻结、高层 task policy 训练，HumanoidBench 实证优于端到端。\emph{策略切换管线}：main $\to$ fall detect $\to$ stand-up $\to$ resume 的部署状态机。
+
+\begin{center}
+\small
+\begin{tabular}{clcl}
+\hline
+编号 & 要点 & 对应节 & 难度 \\
+\hline
+1 & 人形全身控制 vs 四足 loco-manip：无稳定平台，全身协调是硬约束 & \cref{sec:rlmc-wbc-challenge} & 中 \\
+2 & 三条路线在不同维度加结构，可叠加（决策树看接触序列是否变化） & \cref{sec:rlmc-wbc-routes} & 中 \\
+3 & ExBody2 velocity-landmark 解耦 $+$ periodic local frame 消 drift & \cref{sec:rlmc-wbc-exbody} & 较难 \\
+4 & ExBody2 teacher 过滤 $+$ generalist 到 specialist 容量权衡 & \cref{sec:rlmc-wbc-exbody} & 较难 \\
+5 & WoCoCo contact stage $+$ stage-aware reward（三组件，两组任务无关） & \cref{sec:rlmc-wbc-wococo} & 较难 \\
+6 & WoCoCo three-stage DR：Phase 1 不加 DR 先学序列 & \cref{sec:rlmc-wbc-wococo} & 中 \\
+7 & HumanoidBench $27$ task；分层优于端到端（探索 $+$ 信用分配） & \cref{sec:rlmc-wbc-bench} & 中 \\
+8 & 分层两层架构：低层冻结 $50$\,Hz $+$ 高层 $10$\,Hz，信息瓶颈是代价 & \cref{sec:rlmc-wbc-bench} & 较难 \\
+9 & 跌倒恢复集成：detector $+$ 切换 $+$ obs 适配 $+$ action 平滑 & \cref{sec:rlmc-wbc-recovery} & 较难 \\
+10 & 全身诊断自下而上：locomotion$\to$上肢固定$\to$上肢活动$\to$task metric & \cref{sec:rlmc-wbc-params} & 中 \\
+\hline
+\end{tabular}
+\end{center}
+
+\paragraph{三个核心心智模型.}
+\textbf{（一）双足的脆弱性.} 全身控制的所有结构性决策都源于「双足支撑面极小、上肢动作必然扰动平衡」这一物理事实——它不是调 reward 权重能解决的，而是要从架构层（解耦/分层/接触分解）处理的根本约束。\textbf{（二）任务驱动的路线选择.} 三条路线不是好坏排序而是适用场景——选择应基于任务结构（接触序列是否变化、是否需多模态），而非论文新旧。\textbf{（三）渐进式训练的普遍性.} 从 WoCoCo 的 three-stage DR 到分层的「先低层后高层」到 HoST 的辅助力课程——「先简单后复杂、先确定后随机、先辅助后独立」贯穿所有成功方法，因为全身控制的探索空间太大（$10^{23+}$），直接在完整问题上训练几乎不收敛。
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+
+\begin{itemize}
+  \item \textbf{ExBody2}（arXiv:2412.13196）\cite{ji2024exbody2}——教你 velocity-landmark 解耦 $+$ teacher 过滤 $+$ specialist fine-tuning 的上下肢解耦最新实现；其前身 \textbf{ExBody}（arXiv:2402.16796）\cite{cheng2024exbody} 给出最简解耦架构与开源代码。
+  \item \textbf{WoCoCo}（arXiv:2406.06005，CoRL'24）\cite{zhang2024wococo}——教你 contact stage 分解 $+$ task-agnostic reward，四个真机任务无 motion prior 验证。
+  \item \textbf{HumanoidBench}（arXiv:2403.10506，RSS'24）\cite{sferrazza2024humanoidbench}——教你 $27$-task 标准评估与分层 vs 端到端的实证对比。
+  \item \textbf{KungfuBot}（arXiv:2506.12851，NeurIPS'25）\cite{xie2025kungfubot}——教你高动态动作的 adaptive tracking $+$ physics filter（完整精读见 \cref{ch:rlmc-motimit}）。
+  \item \textbf{HOVER}（arXiv:2410.21229，ICRA'25）\cite{he2025hover}——教你 mask-conditioned distillation 一个策略覆盖多模态（完整精读见 \cref{sec:rlmc-hl-hover}）。
+  \item \textbf{HoST}（arXiv:2502.08378，RSS'25 Best Systems Paper Finalist）\cite{huang2025host}——教你 multi-critic $+$ 辅助力课程从零学跨姿态站起（完整精读见 \cref{sec:rlmc-hl-host}）。
+  \item \textbf{HumanPlus}（arXiv:2406.10454，CoRL'24）\cite{fu2024humanplus}——教你单 RGB 实时遥操作 $+$ 模仿学习的 $33$-DoF 全身全栈系统。
+  \item \textbf{AGILE}（Zhao 等，arXiv:2603.20147）\cite{zhao2026agile}——教你 config-driven 对称性增强 $+$ virtual harness 等人形 loco-manipulation 工程工具箱。
+\end{itemize}
+
+\textbf{阅读顺序建议}：先 ExBody/ExBody2（解耦的基本架构与改进），再 WoCoCo（接触阶段分解的通用性），HumanoidBench 作评估基准；多模态部署看 HOVER，高动态看 KungfuBot，跌倒恢复看 HoST。若时间有限只读一篇：上肢 tracking 读 ExBody/ExBody2（最简单可复现）、全身接触任务读 WoCoCo（模板可快速适配新任务）。
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+
+\begin{center}
+\small
+\begin{tabular}{p{0.4cm}p{3.0cm}p{3.2cm}p{4.2cm}p{1.6cm}}
+\hline
+\# & 症状 & 可能原因 & 排查步骤 & 相关节 \\
+\hline
+1 & 全身策略频繁摔倒 & 跳过了下肢诊断 & 自下而上：先 Layer 1--2（纯走稳/上肢固定走稳）再碰上肢任务 & \cref{sec:rlmc-wbc-params} \\
+2 & 上肢动作时摔倒 & 角动量惩罚不足 & 增大 angular\_momentum；减小臂 action scale & \cref{sec:rlmc-wbc-challenge} \\
+3 & ExBody2 上半身不动 & landmark weight 太低 & 增大到 $1.5$--$2.0$；确认参考动作正确加载 & \cref{sec:rlmc-wbc-exbody} \\
+4 & ExBody2 下半身步态崩 & landmark 在世界系（drift 耦合） & 改局部系 $+$ periodic reset；检查 reset 间隔 & \cref{sec:rlmc-wbc-exbody} \\
+5 & WoCoCo stage 不推进 & exit\_condition 太严 & 放松阈值（手到物 $0.15$\,m）；查 contact reward 是否给正信号 & \cref{sec:rlmc-wbc-wococo} \\
+6 & WoCoCo「假接触」过阶段 & 切换只看几何不看接触力 & exit 加接触力判据（双判据） & \cref{sec:rlmc-wbc-wococo} \\
+7 & 分层高层「不学」 & 低层没收到高层命令 & 打印低层 obs 含命令段且顺序一致 & \cref{sec:rlmc-wbc-bench} \\
+8 & reward 涨但任务不完成 & reward hacking & 同时画 success rate；改 success-aligned reward & \cref{sec:rlmc-wbc-bench} \\
+9 & 切到 stand-up 崩溃 & obs 维度不匹配 & 用 \_adapt\_obs 提取子集；打印两策略 obs 维度 & \cref{sec:rlmc-wbc-recovery} \\
+10 & 切回 main 力矩冲击 & 无 action 平滑 & 加 $5$--$10$ 步线性 blend & \cref{sec:rlmc-wbc-recovery} \\
+11 & 只从某些姿态能站起 & state cache 姿态不均 & 检查各姿态比例；均匀采样 & \cref{sec:rlmc-wbc-recovery} \\
+12 & 开 DR 后全身全摔 & 用了四足 DR 范围 & 用人形 DR 范围（\cref{ch:rlmc-humanoidloco} 附录 C），上肢活动时更保守 & \cref{sec:rlmc-wbc-params} \\
+13 & 找不到 G1 全身内置任务 & 误以为 Isaac Lab 自带 & 用 HOVER 扩展或自建；内置只有 velocity $+$ loco-manip 拾放 & 环境配置指南 \\
+14 & tracking error 停在高位 & 固定 $\sigma$ 对高动态帧不公平 & 用 KungfuBot 自适应 $\sigma$（\cref{ch:rlmc-motimit}） & \cref{sec:rlmc-wbc-routes} \\
+\hline
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+
+\begin{center}
+\small
+\begin{tabular}{p{3.4cm}p{4.2cm}p{5.0cm}}
+\hline
+组件 & 本章基准 & 备注 \\
+\hline
+mjlab & \texttt{mujocolab/mjlab} & Isaac Lab 风格 API $+$ MuJoCo-Warp\cite{mjlab2026} \\
+mjlab 全身跟踪 & \texttt{mujocolab/mjlab} 内置 & BeyondMimic 任务 \texttt{Mjlab-Tracking-Flat-Unitree-G1}（\texttt{list-envs} 实测）及其 \texttt{-No-State-Estimation} 变体（去状态估计冒烟对照，与 sim-to-sim 鲁棒性相关）；CLI \texttt{uv run train}；另有第三方 \texttt{unitree\_rl\_mjlab}（\texttt{Unitree-G1-Flat} 系列，\texttt{python scripts/train.py}） \\
+Isaac Lab & 2.x（\texttt{isaaclab.*}） & G1 内置：\texttt{Isaac-Velocity-Flat/Rough-G1-v0} $+$ \texttt{Isaac-PickPlace-Locomanipulation-G1-Abs-v0}（v2.3.0 起）；2.3.2 实测另注册 \texttt{Isaac-Locomanipulation-G1-Abs-Mimic-v0}、\texttt{Isaac-G1-SteeringWheel-Locomanipulation}、\texttt{Isaac-PickPlace-FixedBaseUpperBodyIK-G1-Abs-v0/-InspireFTP-Abs-v0}（更全 loco-manip 任务谱） \\
+HOVER & \texttt{NVlabs/HOVER} & mask 多模态 \texttt{neural\_wbc} 模板；README 标定 Isaac Lab 2.0.0（已核）\cite{he2025hover} \\
+HoST & \texttt{InternRobotics/HoST} & IsaacGym $+$ legged\_gym；权重可跨框架推理\cite{huang2025host} \\
+HumanoidBench & \texttt{carlosferrazza/humanoid-bench} & MuJoCo，$27$ task\cite{sferrazza2024humanoidbench} \\
+UniLab & \texttt{unilabsim/UniLab}（main） & 异构 CPU-sim $+$ GPU-policy；G1 跟踪族 \texttt{G1MotionTracking}/\texttt{G1BoxTracking}/\texttt{G1ClimbTracking}；CLI \texttt{train --algo ppo --task g1\_motion\_tracking --sim mujoco}\cite{unilab2026} \\
+\hline
+\end{tabular}
+\end{center}

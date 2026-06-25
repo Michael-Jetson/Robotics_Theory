@@ -1,0 +1,468 @@
+\chapter{OCS2 NMPC 实战与 sim2real 调试方法论}
+\label{ch:quad_advanced}
+
+% ════════════════════════════════════════════════════════════════
+%  本章 = P7 的「实战合流 + 方法论收束」。把前七章的理论拼图钉到一个真实
+%  工业级开源栈(qiayuanl/legged_control = OCS2 NMPC + WBC + 线性 KF + sim2real)
+%  上跑起来，并把「移植一台自定义四足」过程中真实踩过的失败经验、根因侦探
+%  故事、可迁移调试方法论凝练成案例。料源：docs/Robot吸收_legged_control四足OCS2.md。
+%  铁律：理论一律 \cref 回前七章不复述（NMPC=ch:quad_mpc、WBC=ch:quad_wbc、
+%  KF=ch:quad_est、架构=ch:quad_arch、陷阱本体=ch:quad_prac、纯工程=ch:engineering）；
+%  本章只写「侦探链 + 机理 + 方法论」这层叙事，是 practice 体裁而非公式推导体裁。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。它们都不是「公式题」，而是「移植一台真四足时会卡死你」的工程判断题。若已能流畅作答，可只速读本章的侦探故事索引表与方法论速查；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 你把一台 SolidWorks 导出的自定义四足装进仿真，它在 RViz 里看得清清楚楚、模型也加载成功，可一站起来就往地里\emph{穿下去}。视觉没问题、物理却穿模——一个量能在 30 秒内确诊根因，是哪个量？
+  \item 同一台机器人，trot 命令「直走」，它却一路向左偏出 10\,m、甚至原地自旋。你先后加了「航向锁」「路径跟随」「单点几何修正」三个补偿器，每个都\emph{看似}有效、又都不干净。为什么这些补偿「是搬家不是修」？真正该改的是什么？
+  \item 机器人在完美状态（仿真真值）下只是轻微摆动 0.13\,m，一换上卡尔曼滤波就开始 veer、摔。直觉是「滤波器不准」。可你实测滤波航向误差最大才 $3.7^\circ$——那到底是什么在作怪？提示：和\emph{算力}有关，但「加 CPU 核」救不了。
+  \item 上面三个根因你都「治本」了，M1/M2 验收也「通过」了。但团队转去做台阶/感知时，发现机器人\emph{在平地上}就仍会翻。「验收通过」为什么不等于「鲁棒」？头号问题该不该是台阶？
+  \item 你为了让求解器别报错，临时把某个力矩上限从真值抬到 80、把 MPC 迭代数从 1 调到 10。问题排掉后，这些「临时值」该怎么办？如果忘了它们，后续的所有分析会被怎样系统性带偏？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{在脑中画出}一个工业级四足控制栈的完整实时数据流——从用户指令、参考管理器、NMPC、MRT 接口、WBC、混合关节、到线性 KF 的闭环，以及它的三层频率结构，并把这张图与 \cref{ch:quad_arch} 的分层架构对应（\cref{sec:qadv-stack}）；
+  \item \textbf{说清}移植一台自定义四足时「要提供什么、什么绝不能复用」：机器人专属只有 $3$ 个配置文件 + URDF，而与零位/轴向耦合的运动学宏\emph{不可}从参考件复用（\cref{sec:qadv-port}）；
+  \item \textbf{复盘}三个真实的 sim2real 根因侦探故事——穿地、自旋、边缘稳定——每个都\emph{不是}「看上去那个」，并掌握确诊它们的金标准（碰撞数守恒核对、决定性对照、\texttt{mpcTimer} 预算判据）（\cref{sec:qadv-rc1,sec:qadv-rc2,sec:qadv-rc3}）；
+  \item \textbf{理解}为何「加核救不了串行求解器」：RTI 实时机理、LQ 可并行而 Riccati 串行地板，以及「实时靠少算、不靠多并行」（\cref{sec:qadv-rc3}）；
+  \item \textbf{警惕}「验收通过 $\neq$ 鲁棒」：PHASE3 揭示的关节摩擦/阻尼失配致裕度侵蚀，与「平地不稳才是头号根因」的重定性（\cref{sec:qadv-phase3}）；
+  \item \textbf{执行}诊断 crutch 的登记—清零纪律与「独立审计防自我说服」（\cref{sec:qadv-crutch}）；
+  \item \textbf{迁移}一套可用于任何机器人移植的调试方法论：对照实验 + 不变量守恒核对 $\gg$ 盲调（\cref{sec:qadv-method}）；并把失败域用资源护栏圈进容器（\cref{sec:qadv-guardrail}）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条「\emph{把前七章的纸面理论，钉到一个真实工业级开源栈上、并在移植中踩坑—复盘—提炼方法论}」的主线。它\emph{不}推新理论，而是讲\textbf{侦探故事}与\textbf{可迁移方法论}。结构如下：
+
+\begin{center}
+\begin{forest} navtree
+[{OCS2 NMPC 实战\\与 sim2real 方法论}
+  [{全栈与移植\\(承上：七章合流)}
+    [{数据流 + 移植清单}] ]
+  [{三大根因侦探\\(本章脊梁)}
+    [{穿地 / 自旋 / 边缘稳定}] ]
+  [{反转与审计\\(验收$\neq$鲁棒)}
+    [{PHASE3 + crutch 清零}] ]
+  [{方法论收束\\(全章价值顶点)}
+    [{对照+守恒核对 + 护栏}] ]
+]
+\end{forest}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:qadv-stack,sec:qadv-port} 把前七章「合流」成一个能跑的栈、并讲清移植边界，是承上启下的主干；\cref{sec:qadv-rc1,sec:qadv-rc2,sec:qadv-rc3} 是本章脊梁——三个「根因都不是看上去那个」的侦探故事，最值得逐字读；\cref{sec:qadv-phase3,sec:qadv-crutch} 是对「M1 已圆满」乐观叙事的反转与自我审计；\cref{sec:qadv-method} 是全章价值顶点——一套可迁移到任何机器人移植的方法论；\cref{sec:qadv-guardrail} 是把失败域圈进容器的工程护栏，纯工程细节一律回引 \cref{ch:engineering}。
+
+\subsection*{前置知识桥接}
+本章把前七章的理论\emph{当作要被部署、要被调试的对象}：
+\begin{itemize}
+  \item \cref{ch:quad_arch}（导论与控制架构）给出「状态估计$\to$规划$\to$MPC+WBC」的分层架构。本章 \cref{sec:qadv-stack} 给出这张架构图在 OCS2 上的\emph{工业级实例}；
+  \item \cref{ch:quad_mpc}（单刚体 MPC）给出凸 MPC 的全部推导，其 \cref{sec:frontier} 已把「质心 NMPC + RTI 实时机理 + ReferenceManager」讲透。本章不复述机理，只把它们\emph{钉到失败现场}（\cref{sec:qadv-rc3}）；
+  \item \cref{ch:quad_wbc}（全身控制 WBC）给出 $42$ 维 QP 与「四足纯前馈 vs 双足必须反馈」之辨。本章只用到它的一个\emph{残留悬坑}（力矩上限读 \texttt{task.info} 不读 URDF，\cref{sec:qadv-crutch}）；
+  \item \cref{ch:quad_est}（足式状态估计）给出线性 KF 与「cheater$\to$KF 门槛」。本章把「左右不对称会先在估计里现形」钉到自旋故事（\cref{sec:qadv-rc2}）；
+  \item \cref{ch:quad_prac}（实践框架）已把本章涉及的\emph{陷阱本体}（无名 material 丢碰撞、关节阻尼污染、两份 config 只改一份等）收成速查清单。本章给\emph{完整侦探链}，二者互引、不重复；
+  \item \cref{ch:engineering}（工程实践）承接本章\emph{有意略过}的所有纯工程细节（容器/网络/编译/命令）。本章遇到这些处一律 \cref{ch:engineering}，正文不展开。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与体裁约定.}\;
+本章\emph{有意不引入新数学符号}：所有理论符号沿用其所属章（\cref{ch:quad_mpc,ch:quad_wbc,ch:quad_est}）。代码标识符、文件名、类名、配置项用等宽体（如 \texttt{SqpMpc}、\texttt{task.info}、\texttt{sqpIteration}），不进 math mode。
+本章主体是\textbf{侦探故事体裁}：每个根因按「症状 $\to$ 看似合理的错误理论（红鲱鱼）$\to$ 真根因 $\to$ 怎么确认 $\to$ 治本 $\to$ 教训」六段展开——这与前七章的「公式推导」体裁不同，是\emph{方法论教学}。
+所有数值、API、文件行号忠于料源（qiayuanl/legged\_control 的自定义四足 \texttt{dmgo} 移植全程文档 + 源码亲验），不臆造；料源已停止维护，故视作一份「定格的工程田野笔记」。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{全栈数据流：把前七章拼成一个实时闭环}
+\label{sec:qadv-stack}
+
+前七章把四足控制的理论拼图讲全了：运动学（\cref{ch:quad_kin}）、步态（\cref{ch:quad_gait}）、估计（\cref{ch:quad_est}）、MPC（\cref{ch:quad_mpc}）、WBC（\cref{ch:quad_wbc}）、落地（\cref{ch:quad_prac}）。本节把这些拼图\emph{钉到一个真实的工业级开源栈}上——\texttt{qiayuanl/legged\_control}，它是 OCS2 \texttt{legged\_robot} 例子的\emph{平地、非感知}子集（感知版的高程图 / SDF 碰撞 / 落脚多边形约束在 \texttt{legged\_perceptive}，本栈约束只有\textbf{摩擦锥 + 支撑足零速 + 摆动足 z 曲线 + 自碰撞软约束}）\cite{grandia2022perceptive,liao2023walking}。
+
+\begin{insight}[全栈数据流：分层架构的工业级实例]\label{ins:qadv-dataflow}
+\cref{ch:quad_arch} 的分层架构「状态估计$\to$规划$\to$MPC$\to$WBC」在 OCS2 上长成一条具体的实时数据流（\cref{fig:qadv-dataflow}）：用户指令（\texttt{/cmd\_vel} 或导航目标）经 \texttt{TargetTrajectoriesPublisher} 变成 OCS2 的 \texttt{TargetTrajectories}$\to$ \texttt{SwitchedModelReferenceManager}（= \texttt{GaitSchedule} + \texttt{SwingTrajectoryPlanner}）注入接触序列与摆动足 z 曲线 $\to$ \texttt{SqpMpc}（异步线程）解出最优状态/输入轨迹 $\to$ \texttt{MPC\_MRT\_Interface}（非阻塞 \texttt{updatePolicy} / 时间插值 \texttt{evaluatePolicy}）$\to$ \texttt{WeightedWbc}（每个 \texttt{ros\_control} tick）把 MPC 期望折算成关节力矩 $\to$ \texttt{HybridJoint} 命令下发 $\to$ \texttt{LeggedHWSim}（Gazebo 插件）物理仿真 $\to$ 关节/IMU/接触反馈经\textbf{线性 Kalman 估计}回到 base 位姿/速度，闭环。这正是 \cref{ch:quad_prac} 「硬件抽象」「频率解耦」在一个完整栈里的合体。
+\end{insight}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=4mm and 7mm,
+  blk/.style={draw, rounded corners, align=center, font=\scriptsize, inner sep=3pt, minimum height=0.85cm, text width=2.5cm},
+  ln/.style={->, thick, gray!55!black, font=\scriptsize}]
+  \node[blk, fill=gray!8] (cmd) {用户指令\\\texttt{/cmd\_vel} / goal};
+  \node[blk, below=of cmd, fill=second!10, draw=second!60!black] (ref) {\texttt{ReferenceManager}\\接触序列 + 摆动 z};
+  \node[blk, below=of ref, fill=main!12, draw=main!60!black] (mpc) {\texttt{SqpMpc}（异步线程）\\质心 NMPC};
+  \node[blk, below=of mpc, fill=main!8, draw=main!60!black] (mrt) {\texttt{MPC\_MRT\_Interface}\\非阻塞读 + 时间插值};
+  \node[blk, below=of mrt, fill=third!12, draw=third!60!black] (wbc) {\texttt{WeightedWbc}（每 tick）\\$\to\boldsymbol{\tau}$};
+  \node[blk, below=of wbc, fill=gray!8] (hw) {\texttt{HybridJoint} $\to$\\\texttt{LeggedHWSim}/Gazebo};
+  \node[blk, right=24mm of mrt, fill=second!12, draw=second!60!black] (kf) {线性 Kalman 估计\\IMU 预测 + 足端 FK 更新};
+  \draw[ln] (cmd)--(ref); \draw[ln] (ref)--(mpc); \draw[ln] (mpc)--(mrt);
+  \draw[ln] (mrt)--(wbc); \draw[ln] (wbc)--(hw);
+  \draw[ln] (hw.east) to[out=0,in=-90] node[below right,font=\tiny]{关节/IMU/接触}(kf.south);
+  \draw[ln] (kf.north) to[out=90,in=0] node[above right,font=\tiny]{$\hat{\boldsymbol{x}}$}(mpc.east);
+  \draw[ln] (kf.west) -- node[above,font=\tiny]{实测态}(mrt.east);
+  \node[font=\tiny, gray!60!black, align=left, right=2mm of mpc] {\textbf{三层频率}\\MPC：异步$\sim$100\,Hz\\WBC：每 tick\\KF：每 tick};
+\end{tikzpicture}
+\caption{\texttt{legged\_control} 全栈实时数据流（\cref{ins:qadv-dataflow}）：\cref{ch:quad_arch} 分层架构的工业实例。MPC 单开异步线程慢算、WBC/KF 在每个 \texttt{ros\_control} tick 高频跑——频率解耦（\cref{ch:quad_prac} 的 \texttt{setupMrt} 实例）。}
+\label{fig:qadv-dataflow}
+\end{figure}
+
+\paragraph{三层频率：为何 MPC 必须异步。}
+论文里真机是 MPC $100$\,Hz / WBC $400$\,Hz 分频；本仓\emph{仿真同环跑}：MPC 在独立 \texttt{std::thread} 上异步求解，WBC 与 KF 在 \texttt{ros\_control} 的 \texttt{update} 里每 tick 执行。控制器 \texttt{update()} 每 tick 走七步\cite{sleiman2021unified}：① \texttt{updateStateEstimation}（读关节/接触/IMU $\to$ 估计 $\to$ \texttt{measuredRbdState\_}，yaw 解卷绕）；② \texttt{setCurrentObservation}（非阻塞写）；③ \texttt{updatePolicy}（非阻塞读最新策略）；④ \texttt{evaluatePolicy(t,x)}（时间插值）；⑤ \texttt{wbc\_->update} 得 $\boldsymbol{x}=[\ddot{\boldsymbol{q}},\boldsymbol{F},\boldsymbol{\tau}]$，取 \texttt{torque=x.tail(12)}；⑥ \texttt{SafetyChecker}；⑦ 逐关节 \texttt{setCommand($p_{\mathrm{des}},\omega_{\mathrm{des}},k_p{=}0,k_d{=}3,\tau_{\mathrm{ff}}$)}。这条「频率解耦」的工业实例与 \cref{ch:quad_prac} 的 \cref{ins:qp-freq-decouple} 完全一致——而第④步「非阻塞读最新策略」正是 \cref{sec:qadv-rc3} 「边缘稳定」根因的发生地：若 MPC 算不过来，喂给 WBC 的就是\emph{陈旧}策略。
+
+\begin{note}[控制器接管的两个安全细节]
+两个易被忽略、却决定「上电瞬间会不会跳」的细节：\texttt{starting()} 把 MPC 目标设成\emph{当前测量姿态}（不是 \texttt{defaultJointState}）——接管瞬间不跳，并阻塞等首个 MPC 策略到来；\texttt{SafetyChecker} 实际\emph{只检查} ZYX 欧拉的 roll 分量越过 $\pm\pi/2$ 即 \texttt{stop}（非「roll/pitch 双查」）。\texttt{HybridJoint} 命令约定 $k_p{=}0,k_d{=}3$：位置无反馈、低速度阻尼、跟踪全靠 WBC 前馈力矩（\cref{ch:quad_prac} 的关节混合控制 \cref{eq:qp-hybrid} 的一个具体配置）。
+\end{note}
+
+\paragraph{核心维度速查（已亲验源码）。}
+全栈各处的维度必须同序、不可错配。四足 $12$-DOF 下：\texttt{stateDim}$=24$（$=$ 归一化质心动量 $6$ + base 位姿 $6$ + 关节角 $12$，即 \cref{eq:qp-nmpc} 的状态）；\texttt{inputDim}$=24$（$=$ $4$ 足 $\times3$ 接触力 $12$ + 关节速度 $12$）；广义坐标 $18$（base $6$ + 关节 $12$）；\textbf{WBC 决策变量 $=42$}（$=\ddot{\boldsymbol{q}}(18)+\boldsymbol{F}(12)+\boldsymbol{\tau}(12)$，详见 \cref{ch:quad_wbc} 的 $42$ 维 QP）；接触/模式顺序硬编码 $\{$LF,RF,LH,RH$\}$，全栈须同序。
+
+\begin{pitfall}[核心维度必回源码验，别信摘要]
+本项目记录过一条诫语：WBC 决策维 $=42$ 的\emph{亲验}来自 \texttt{WbcBase.cpp:24}（\texttt{generalizedCoordinatesNum(18) + 3·numThreeDofContacts(12) + actuatedDofNum(12)}），而\emph{两份}子代理摘要都曾误写成 $30$ 或「只 base $6$ 维加速度」。原因是直觉以为 WBC 只调 base，忘了 $\ddot{\boldsymbol{q}}$ 是\emph{全 $18$ 维}广义加速度（base $6$ + 关节 $12$）。教训：核心数字必回源码验，不信中间摘要——这条小事正是 \cref{sec:qadv-method} 「不变量守恒核对」方法论的微缩版。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{移植一台自定义四足：要提供什么、什么绝不能复用}
+\label{sec:qadv-port}
+
+把一台\emph{现成}机器人（go1）跑起来不难；本章的全部故事都源于把一台 SolidWorks 导出的\emph{自定义}四足 \texttt{dmgo} 移植进这套栈、对标 go1。移植的第一性问题是：\textbf{要提供什么、什么绝不能复用}。
+
+\begin{insight}[移植边界：机器人专属只有 3 个 config + URDF]\label{ins:qadv-port-boundary}
+\texttt{legged\_control} 的通用算法代码（\texttt{LeggedInterface} / 各 constraint·cost / WBC / 估计 / 控制器）\textbf{全不动}；机器人专属的只有两类：① \textbf{URDF/xacro}——提供连杆树、惯量、关节限位、碰撞几何、\emph{关节零位与轴向}；连杆/关节名\emph{必须}同 \texttt{legged\_unitree}（\texttt{LF/LH/RF/RH}$\times$\texttt{HAA/HFE/KFE} + \texttt{*\_FOOT} + \texttt{base} + \texttt{base\_imu}）。② \textbf{$3$ 个配置文件} \texttt{config/<robot>/\{task,reference,gait\}.info}——从 go1 复制，改 \texttt{modelFolderCppAd}，按需调 \texttt{initialState} / \texttt{defaultJointState} / \texttt{comHeight} / Q / R。外加 Gazebo 接入（\texttt{gazebo.xacro} + \texttt{imu.xacro} + \texttt{transmission.xacro} + p3d 地面真值）与 launch。\textbf{移植 $=$ 写对 URDF + 调对 $3$ 个 \texttt{.info}}，其余代码一行不碰。
+\end{insight}
+
+这条边界看似清爽，却藏着本章最贵的一个陷阱——它直接回应 \cref{ch:quad_kin} 反复强调的「电机零点 $\neq$ 模型零点」：
+
+\begin{insight}[薄包可复用、运动学宏绝不能复用]\label{ins:qadv-leg-noreuse}
+\texttt{unitree} 的 \texttt{gazebo/imu/transmission/materials} 这些薄包宏是\emph{机器人无关}的，可以直接复用；但 \texttt{leg.xacro}（运动学）\textbf{绝不能复用}。原因藏在关节 origin 里：\texttt{unitree} 的 \texttt{leg.xacro} 把「大腿\emph{垂直}零位」硬编码进了关节 origin（\texttt{KFE origin xyz="0 0 -thigh\_length"}）。若你的机器人零位约定不同（\texttt{dmgo} 是「水平\emph{向后}零位」），强行复用会让所有 STL 网格方向\emph{全错}。判定准则：\textbf{同作者参考件里，与零位/轴向约定耦合的几何宏不可复用，必须用自带运动学}。这条陷阱不写在「连杆/关节名须一致」的移植清单里、却藏在 origin 数值里，移植时极易漏——它正是 \cref{ch:quad_kin} 「电机零点 $\neq$ 模型零点」在工程上的放大。
+\end{insight}
+
+\paragraph{关节零位：解析推不靠谱，FK 实算取代。}
+\texttt{dmgo} 零位 $=$ 腿水平向后（$-x$），go1 零位 $=$ 腿垂直向下（$-z$），差一个绕 $+y$ 轴 $+\pi/2$。但你\emph{不能}靠解析换算直接填零位偏置：\texttt{dmgo} 前后腿\emph{不镜像}、且 \texttt{KFE}$=0$ 时小腿已预弯约 $40^\circ$，解析推的 \texttt{HFE} 偏置 $-\pi/2$ 与实际差很多。正确做法是\textbf{用正运动学（FK）实算取代解析值}：实算得前腿 \texttt{HFE}$=-0.14$、后腿 \texttt{HFE}$=-0.68$、\texttt{KFE}$=-1.42$、\texttt{HAA}$=\mp0.20$，并用 FK 验证「$4$ 足质心对称、共面」才算配对。这与 \cref{ch:quad_kin} 用 FK 校验整机构型的思路一致——遇到零位约定耦合，\emph{实算 $>$ 手推}。
+
+\begin{note}[关节序映射：易误判、但不是漂移源]\label{note:qadv-jointorder}
+一个容易自己吓自己的细节：OCS2 默认 \texttt{jointNames} 序是 \texttt{LF,RF,LH,RH}（\texttt{ModelSettings.h}），\emph{不同于} URDF 声明序 \texttt{LF,LH,RF,RH}。但 \texttt{createPinocchioInterface} 是\textbf{按关节名建模/映射、不按位置}，只要 URDF 含全部 $12$ 个名即可，故\emph{不是}漂移源。风险提示：若站立时左右髋\emph{劈叉方向反}或不对称，第一个怀疑点才是这个序映射（回看 \texttt{defaultJointState} 左右 \texttt{HAA} 符号 $\mp0.20$ 是否与实际腿对应）。把它记成「症状导向的怀疑清单」，别一上来就疑序。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{根因侦探一：穿地——URDF 到 SDF 静默丢碰撞}
+\label{sec:qadv-rc1}
+
+\noindent\emph{本节定位.}\;这是 M1（站稳 + trot 跟 \texttt{cmd\_vel} 直走）的第一个堵点。三大根因\emph{都不是}「看上去那个」，本节给完整侦探链；陷阱本体（\texttt{pit:qp-urdf-sdf} 等）已收进 \cref{ch:quad_prac} 的 \cref{sec:qp-pitfalls}。
+
+\paragraph{症状。}
+\texttt{dmgo} 在 cheater（仿真真值）下 \texttt{STANCE} 站不住：WBC 的 qpOASES 刷屏 \texttt{Maximum number of working set recalculations} $\to$ 输出垃圾力矩 $\to$ 倾倒 $\to$ \texttt{SafetyChecker} 自停 $\to$ base 塌到 $z\approx-0.17$（每次稳定塌到\emph{同一值}，纯 roll，$q_x\to-0.87$）。而 go1 走\emph{完全相同}的流程却腹部正立、静息不动。「同流程、一稳一塌」本身就是最强的提示：堵点是 \texttt{dmgo} 专属。
+
+\paragraph{红鲱鱼 A：「MPC 欠支撑，$\Sigma F_z/mg\approx0.90$」。}
+插桩测得竖直方向地反力之和 $\Sigma F_z/mg\approx0.90<1$，直觉立刻跳出来：「支撑力不够 $\to$ 撑不住 $\to$ 塌」。\textbf{证伪}：亲读代价函数源码 \texttt{LeggedRobotQuadraticTrackingCost.h:61}——R 代价的参考是 \texttt{weightCompensatingInput}（$=mg$），\emph{平衡点零拉力、模型根本没有 below-$mg$ 偏置}。所以 $0.90$ 是\emph{塌陷过程中的瞬态值}，是\textbf{果不是因}。这条红鲱鱼是 \cref{sec:qadv-method} 「用瞬态插桩值反推稳态结论」陷阱的活标本。
+
+\paragraph{红鲱鱼 B：「\texttt{initialState} 失配 / limp 倾倒」。}
+把 \texttt{initialState} 改成趴卧后，core-dump 消失了（看似坐实了「初值错」）。\textbf{证伪}：机器人\emph{仍在穿地}；core-dump 消失只是因为趴卧初值恰好给了 SQP 一个可行的初始猜测。期间走过的治标弯路全是错方向：$50$\,Hz 用 \texttt{set\_model\_configuration} 把关节 pin 住 $\to$ 关节速度尖峰 $\to$ \emph{连 go1 都被搞坏}（qpErr $19250$）；把关节阻尼从 $2$ 抬到 $25$ $\to$ 脚陷地几何退化 core-dump；base-pin 没生效——后来 deepwiki 证实\textbf{仓库根本没有 pin 机制}，方向从一开始就错了。
+
+\paragraph{真根因。}
+\texttt{dmgo} 的 URDF（SolidWorks 导出 + 手改，左右腿格式不一致）里有 \textbf{$14$ 个无 \texttt{name} 属性的 \texttt{<material>}}（这是\emph{非法} URDF）$\to$ urdfdom/sdformat 在 URDF$\to$SDF 解析时\textbf{静默丢弃 $17/20$ 个 \texttt{<collision>}}（\texttt{<visual>} 仍保留 $\to$ RViz 看得到、但 Gazebo 物理\emph{穿模}）$\to$ 几乎没有地面碰撞 $\to$ 穿地下沉。一个看不见的非法属性，吃掉了八成碰撞体。
+
+\paragraph{怎么确认（金标准，可复现）。}
+三步铁证：
+\begin{enumerate}
+  \item \textbf{go1 同容器对照}（\texttt{go1\_rest.sh}）：go1 自然落体稳息 $z{=}0.057$、$w{=}1.0$ $\to$ 仿真环境/world/cheater 都健康 $\to$ 堵点 $100\%$ 是 \texttt{dmgo} 专属。
+  \item \textbf{碰撞数守恒核对}：\texttt{gz sdf -p dmgo.urdf | grep -c collision} 得 \textbf{URDF $20$ $\to$ SDF $3$，丢 $17$，零 warning}。
+  \item \textbf{隔离铁证}：给无名 material 加上 \texttt{name} $\to$ SDF 碰撞数 \textbf{$3\to17$}。修后 limp 腹部静息 $z{=}0.120$、$w{=}1.0$。
+\end{enumerate}
+
+\begin{insight}[金标准：\texttt{gz sdf -p} 核对 URDF$\leftrightarrow$SDF 碰撞数守恒]\label{ins:qadv-collision-conserve}
+排查穿地的金标准是一行命令：\texttt{gz sdf -p robot.urdf | grep -c collision}，核对\textbf{URDF 里的 \texttt{<collision>} 数 $==$ SDF 里的数}。数对不上、且\emph{零 warning}，多半是无名 \texttt{<material>} 或其他非法 URDF 让解析器\emph{静默}丢了碰撞——「视觉在、物理穿模」是它的招牌症状（RViz 正常、Gazebo 穿地）。这与 \cref{ch:quad_prac} 的 \cref{ins:qp-collision}（STL 网格做碰撞体致求解超时）\emph{同类}：都是 URDF$\to$Gazebo 解析期\emph{静默丢东西}。陷阱本体见 \cref{sec:qp-pitfalls}（\texttt{pit:qp-urdf-sdf}），本节给的是它从「站不住」一路误判到根因的\emph{完整侦探链}。
+\end{insight}
+
+\paragraph{治本与教训。}
+治本 $=$ 所有 link 的 material 都命名（后来并入新腿宏架构，全 link 命名 material，永久根治，见 \cref{sec:qadv-rc2}）。三条教训：① \texttt{gz sdf} 碰撞数守恒核对是排查穿地的金标准；② 用瞬态插桩值（$0.90$）反推稳态结论会被带进沟里，先读代价/约束的\emph{数学定义}；③ 一个 hack 让症状\emph{部分}缓解（趴卧初值消 core-dump）$\neq$ 找到根因。
+
+\begin{note}[非根因、但仍正确的实践]
+有一条在排查中被「证伪为根因」、却仍然\emph{正确}的实践值得保留：\texttt{initialState} 应 $\approx$ 实际 spawn 姿态。它是 OCS2 移植自定义机器人的真实坑——失配症状（乱动 / 求解崩 / core-dump）极易被误判成模型/惯量错。区分「红鲱鱼 B 不是\emph{本次}的根因」与「这条实践本身错了」是两回事：前者对，后者不对。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{根因侦探二：veer/自旋——逐 link 左右永不 bit-exact}
+\label{sec:qadv-rc2}
+
+\noindent\emph{本节定位.}\;这是 M1 「trot 走直」的堵点。「左右不对称会先在状态估计/标定里现形」这一面已钉进 \cref{ch:quad_est} 的 \cref{sec:qe-practice}；本节给完整侦探链与腿宏 bit-exact 镜像的治本，腿级对称接 \cref{ch:quad_kin} 整机运动学对称。
+
+\paragraph{症状。}
+trot 跟 \texttt{cmd\_vel}「直走」却严重\emph{左偏}（$x{:}{-}0.04\to10.4$\,m，$y{:}0\to8.6$\,m，$w$ $1.0\to0.73$），轨迹是复合弧线 / 侧向 crab；开环时甚至原地\emph{自旋}出局，仅前进 $0.67$\,m。
+
+\paragraph{被证伪的补偿器（三连试，均「搬家不是修」）。}
+三个补偿器各\emph{看似}有效、又都不干净：① 航向锁 $\omega_z{=}-K\cdot\mathrm{yaw}$ $\to$ 把「方向漂移」转成「侧向 crab」（$y\to-8.7$\,m）；② path-follower（锁 world $y$ + yaw）$\to$ 半奏效但纯补偿、非治本；③ \texttt{KFE} z 单点修正 $\to$ \emph{翻转}了漂移方向（左偏变右偏 + 螺旋）。三个都失败暴露了一个事实：这是\textbf{多因素残差，不是单点可补}。
+
+\paragraph{侦探链关键一环（最先锁定的主导病灶）。}
+诊断脚本 \texttt{check\_lr\_symmetry.py} + \texttt{verify\_pose} 的 FK 最先揪出头号几何不对称 $=$ \texttt{RF/RH} 的 \texttt{KFE origin z}$=-0.00305$（右膝低 $3$\,mm $\to$ 右脚低 $3$\,mm $\to$ 非对称站姿 $\to$ 左偏），\texttt{verify\_pose} 实测站姿 z-spread $3$\,mm 吻合。但\emph{单修}它（z-spread $3$\,mm$\to0.4$\,mm，几何更对称了）却让 veer \textbf{方向翻转}（左$\to$右 + 螺旋，$w$ $1.0\to-0.76$，转约 $140^\circ$）。「修掉最大病灶反而翻车」正是顿悟「需\emph{结构性}对称、单点磨收敛慢」的转折点，直接催生了腿宏重构的决策。
+
+\paragraph{真根因。}
+\texttt{dmgo} 的 $4$ 条腿是\emph{逐 link 独立硬编码}的 $\to$ 左右\textbf{永远不是 bit-exact 镜像}，残留 L/R 不对称（\texttt{KFE origin z} $3$\,mm 为最大项；修后仍余 \texttt{HFE origin y} $+0.256$\,mm、\texttt{thigh inertia ixz} $\sim27\%$、\texttt{base com y} $+2.7$\,mm 等）$\to$ 每个步态周期注入微小的左右力/力矩差 $\to$ 在 \texttt{cmd\_vel} \emph{无绝对航向锁}下自由积分成弧线/自旋。
+
+\paragraph{怎么确认（决定性对照）。}
+go1 同 harness 走直 $\Delta y/\Delta x{=}0.03$、$w{=}1.0$，而 \texttt{dmgo} $0.82$、$w\to0.73$ $\to$ \texttt{dmgo} 专属。\textbf{为何 go1 走直}：go1 的 $4$ 条腿由\emph{同一个} \texttt{common/leg.xacro} 实例化 $4$ 次（\texttt{mirror}$=\pm1$ / \texttt{front\_hind}$=\pm1$）$=$ \textbf{构造性 bit-exact 镜像}——\texttt{HFE/KFE/foot origin} 的 $x$ 恒 $0$（前后腿运动学完全相同）、所有 $y$ 偏置与非对角惯量（\texttt{ixy/iyz}）恰好 $\times\pm1$，结构上\emph{零腿级 L/R 不对称}。
+
+\begin{insight}[结构性对称 $>$ 一次性脚本镜像：参数化腿宏]\label{ins:qadv-leg-macro}
+治本不是补偿，而是\emph{改几何对称}：仿 go1 把 \texttt{dmgo} 的 $4$ 条腿重构成\emph{一个}参数化宏 \texttt{dmgo\_leg(prefix, mirror, front\_hind)} 实例化 $4$ 次（go1 式三层：\texttt{const.xacro} 参数 $\to$ \texttt{leg.xacro} 腿类 + per-leg gazebo + 嵌套 \texttt{transmission.xacro} $\to$ \texttt{robot.xacro} 总汇总）。镜像规则 \textbf{verbatim 抄 go1}：\texttt{origin y / com\_y / ixy / iyz} $\to\times$\texttt{mirror}；对角惯量 / \texttt{ixz} 不变；hip 段 \texttt{x / com\_x / hip ixz} $\to\times$\texttt{front\_hind}；\textbf{关节轴绝不镜像}（\texttt{HAA}$(1,0,0)$、\texttt{HFE}/\texttt{KFE}$(0,1,0)$，$4$ 腿全同，左右靠站姿角 $\mp$\texttt{HAA} 实现——翻轴会\emph{双重取反}反而破坏对称）。\textbf{最易写错的特例}：hip 的 \texttt{ixy} 同时受 \texttt{mirror} 与 \texttt{front\_hind} 影响 $=$ \texttt{ixy}$\times$\texttt{mirror}$\times$\texttt{front\_hind}（$xy$ 惯量积对 $x$ 翻和 $y$ 翻都变号）——漏掉这层双重取反，hip 惯量积符号错就会重新引入左右残差。改\emph{一处} \texttt{const.xacro}、$4$ 腿自动保持 bit-exact、永不退化，这就是「结构性对称 $>$ 一次性脚本镜像」。
+\end{insight}
+
+\begin{codebox}[text]{go1 式镜像乘子规则（腿宏 verbatim 抄写要点，纯 ASCII）}
+# 一个参数化腿宏 dmgo_leg(prefix, mirror, front_hind) 实例化 4 次
+# mirror     in {+1(左), -1(右)}   front_hind in {+1(前), -1(后)}
+
+origin y, com_y, ixy, iyz   :  x mirror            # 左右翻 -> 变号
+diag inertia (ixx/iyy/izz)  :  unchanged           # 对角惯量不随翻转
+ixz                         :  unchanged           # (非 hip 段)
+hip: x, com_x, hip ixz      :  x front_hind         # 前后翻 -> 变号
+hip: ixy                    :  x mirror x front_hind # !! 双重取反, 最易漏 !!
+joint axis (HAA/HFE/KFE)    :  NEVER mirror          # 4 腿全同; 左右靠站姿角 -+HAA
+\end{codebox}
+
+\paragraph{验证与教训。}
+展开 URDF 后 \textbf{L/R 最大残差 $=0.000\mathrm{e}{+}00$}（bit-exact）；SDF $17$ collision、$0$ drop、$0$ 空名 material（顺带永久根治了 \cref{sec:qadv-rc1} 的穿地）。结果开环 \texttt{cmd\_vel} trot 从「自旋出局 $0.67$\,m」$\to$「前进 $7.5$\,m 跟踪、不摔不旋」。三条教训：① \textbf{左右不对称是真 bug}（残差），\textbf{前后站姿不对称是非 bug}（构造）——go1 的 \texttt{mirror} 乘子一眼区分两者；② 治本是改几何对称，\emph{补偿器只是把弧线 veer 换成 crab veer（搬家不是修）}；③ 结构性对称 $>$ 一次性脚本镜像。
+
+\begin{note}[同一根因的「估计/标定」那一面]
+这条根因还有一面专门钉在估计章：左右不对称会\emph{先}在状态估计/标定里现形——站立时若左右髋劈叉方向反/不对称，\texttt{verify\_pose} 的 FK 会在站姿 z-spread（$3$\,mm）里\emph{最先}揪出它（\cref{ch:quad_est} 的 \cref{sec:qe-practice}）。把它当「估计/标定阶段的可观测症状」，与本节「腿宏 bit-exact 镜像」的治本互为表里：一个负责\emph{发现}，一个负责\emph{根治}。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{根因侦探三：边缘稳定——\texttt{sqpIteration=10} 诊断 crutch}
+\label{sec:qadv-rc3}
+
+\noindent\emph{本节定位.}\;这是三大根因里\textbf{最隐蔽、最核心}的一个，也是把 \cref{ch:quad_mpc} 的 RTI 实时机理「钉到失败现场」的地方。RTI 机理本体已在 \cref{ch:quad_mpc} 的 \cref{sec:frontier} 讲透，本节只讲它\emph{如何被误判成一堆下游红鲱鱼}。
+
+\paragraph{症状（全是下游）。}
+一组看似互不相关的故障：cheater（完美态）下 $0.13$\,m 的横/偏航摆（曾被误判成「残余不对称」）、真 KF 下 veer/自旋/摔、\texttt{comHeight} $0.28$ 摔——\textbf{它们全是同一个根因的下游}。这正是隐蔽之处：一个根因伪装成四五个不同的「稳定性问题」。
+
+\paragraph{真根因。}
+\texttt{task.info} 里 \texttt{sqpIteration=10}（诊断期为「强制 MPC 收敛」留下的 crutch）。每个 MPC 周期跑 $10$ 次 SQP $\approx13.5$\,ms，\textbf{串行} $>100$\,Hz 的 $10$\,ms 预算 $\to$ MPC 落后实时 $\to$ \texttt{MPC\_MRT\_Interface} 喂出\textbf{陈旧/滞后策略}（stale/laggy policy）$\to$ 控制「不够脆」$=$ 边缘稳定。在 cheater（完美态）下只表现为 $0.13$\,m 摆；在真 KF（带估计噪声）下，滞后 $+$ 噪声叠加 $\to$ 翻。
+
+\paragraph{怎么确认（四步定位）。}
+\begin{enumerate}
+  \item 切真 KF 后 \texttt{dmgo} veer/摔，但 \texttt{kf\_estimate\_vs\_truth.py} 实测航向误差 \emph{max} $3.7^\circ$ / mean $0.21^\circ$ $\to$ \textbf{KF 本身没问题}（排除「滤波不准」）；
+  \item 跑 \textbf{go1 真 KF 基线}（\texttt{m1\_trot\_go1\_kf.sh}）$\Delta y/\Delta x{=}0.01$，稳如磐石 $\to$ \texttt{dmgo} 专属 gap；
+  \item \textbf{diff go1 vs dmgo 的 \texttt{task.info}}，标志性差异 $=$ \texttt{sqpIteration}：go1$=$\textbf{1} / dmgo$=$\textbf{10}；
+  \item 适配 $10\to1$ $\to$ \textbf{一发命中}：真 KF 下 $\Delta y/\Delta x{=}0.013$，qpErr $14\to0$，$w{=}0.998$，$14.4$\,m 直走不摔（复现 $2$ 次）。
+\end{enumerate}
+
+\paragraph{机制更正（关键：核数不是因）。}
+Phase 5 曾初写「$\le4$-CPU 撑不住」——\textbf{核数不是因}。\texttt{mpcTimer} 实证（\texttt{m1\_bench.sh}）：\texttt{sqp10} 在 $4$ 核（$13.73$\,ms）与 $8$ 核（$13.43$\,ms）耗时\emph{相同}；加核 + 加 \texttt{nThreads}（$3\to6$：LQ 近似 $2.02\to1.25$\,ms）都救不了（仍 $11.69$\,ms$>10$\,ms）。读 \texttt{SqpSolver.cpp} + 实测可知 SQP 各部分的可并行性截然不同：
+
+\begin{insight}[加核救不了串行求解器：LQ 可并行、Riccati 串行地板]\label{ins:qadv-parallel-floor}
+SQP 一次迭代里：\textbf{LQ 近似/线性化} $=$ embarrassingly parallel（\texttt{nThreads} $3\to6$：$2.02\to1.25$\,ms，亚线性）；\textbf{线搜 rollout} $=$ 可并行；但 \textbf{HPIPM 解 QP}（沿时域做 Riccati 递归）$=$ \emph{本质串行} $\to$ 始终 $0.29$\,ms 不变 $=$ \textbf{并行地板}（这就是压不到 $10$\,ms 以下的原因）。\texttt{OMP\_NUM\_THREADS=1} 只限 BLAS、不限 OCS2 的 \texttt{std::thread} 池。结论：\textbf{对一个昂贵求解器，「加核能否让它实时」的正解常是「不」}——要先分清可并行部分（LQ）与串行地板（Riccati QP），\textbf{实时的「加速」是\emph{少算}（RTI $1$ 迭代 + warm-start）、不是多并行}\cite{frison2020hpipm}。
+\end{insight}
+
+\begin{insight}[\texttt{sqpIteration=1} = RTI = 正确实时设计，不是妥协]\label{ins:qadv-rti}
+\texttt{sqpIteration=1} 不是「省着算」的将就，而是 \textbf{Real-Time Iteration（RTI）方案}\cite{diehl2002rti}：每个采样时刻\emph{只}做 $1$ 次 SQP 迭代，靠\emph{周期间的 warm-start 连续性} + 拆 preparation/feedback 两相来消除反馈延迟——本质是「在上一周期解的邻域里走一步 Newton」。go1/a1/aliengo \emph{全用} $1$（deepwiki + WebSearch + 读源码三方独立印证）。RTI 的机理推导见 \cref{ch:quad_mpc} 的 \cref{sec:frontier}，本节只补一句工程结论：把 \texttt{sqpIteration} 设回 $1$ 不是退让，而是\emph{回到设计本意}。「RTI 还不够准」时的真·提速菜单（全有论文出处）：GNRK（高效离散化 + 最小二乘代价减 LQ 成本）、Multi-level RTI（跨周期混合廉价/昂贵更新）、partial condensing（调 horizon 块大小权衡 QP 成本）、move-blocking / 缩短时域 / 粗 \texttt{dt}（减节点）——即「实时的加速永远是\emph{少算}，但少算有多种比『RTI $1$ 迭代』更聪明的菜单」。
+\end{insight}
+
+\paragraph{教训。}
+三条：① 「边缘稳定/漂移」\textbf{先怀疑控制实时性}（MPC 频率/迭代数/算力预算），别急着归因模型不对称/调参——一个 \texttt{sqpIteration=10} 让 $0.13$ 摆、\texttt{comHeight} 全被误判成下游红鲱鱼；② 「加核能否让昂贵 solver 实时」正解常是「不」——先分清可并行（LQ）与串行地板（Riccati QP）；③ \textbf{\texttt{mpcTimer} 的 Max/Avg $<$ 预算是判据，移植任何机器人后必查}（比盲调稳定性参数更早定位「边缘稳定」是否其实是 MPC 算不过来）。控制器每若干周期会打印 \texttt{mpcTimer\_}/\texttt{wbcTimer\_} 的 Max/Avg [ms]（只在析构 flush），判据是 MPC Max/Avg $<10$\,ms（$100$\,Hz 预算）$=$ 实时。
+
+% ════════════════════════════════════════════════════════════════
+\section{PHASE3 反转：M1「通过」不等于「鲁棒」}
+\label{sec:qadv-phase3}
+
+M1（站稳 + trot 直走）/ M2（多步态 + 转向 + goal 导航）定量验收都「通过」之后，团队转向 PHASE3（台阶/感知）准备，却在 \texttt{dmgo} 上又揪出\emph{两条独立于上述三大根因}的新根因，并把「头号问题」从台阶/感知\emph{重定到平地本身}。这两条直接修正了「三大根因全治本、M1/M2 圆满」的乐观叙事——是本项目最新、也最易被「M1 已完成」叙事掩盖的失败经验。
+
+\begin{insight}[新根因 A：关节摩擦/阻尼模型-仿真失配致裕度侵蚀]\label{ins:qadv-friction-margin}
+\texttt{dmgo} 的 URDF 原本 \texttt{joint\_damping=2.0}（$=$ go1 \texttt{0.01} 的 \textbf{$200\times$}）、\texttt{joint\_friction=1.0}（$=$ go1 \texttt{0.2} 的 \textbf{$5\times$}）——又是 SolidWorks 导出/手填的离谱值。\textbf{机理}（源码注释亲验）：\emph{MPC 的质心模型完全忽略关节摩擦/阻尼}，而 Gazebo 物理\emph{真实施加}它 $\to$ 相对 MPC 心目中「无摩擦的指令力矩」，实物响应变\textbf{迟钝（sluggish）} $\to$ 同样的前馈力矩产生不了预期加速度 $\to$ \textbf{稳定裕度被持续侵蚀（margin erosion）$\to$ 翻}。治本 $=$ 回退 go1 值（damping \texttt{0.01} / friction \texttt{0.2}）。\textbf{为何高价值}：这是「模型与仿真在关节摩擦上失配」这一\emph{极典型却隐蔽}的移植坑——它\textbf{不报错、不丢碰撞、维度也对}，只让裕度悄悄变薄。它与已吸的「无名 material 丢碰撞 / 左右不对称 / sqpIteration」并列，是\textbf{第四类 sim2real 根因}。陷阱本体（\texttt{pit:qp-cad-damping}）已进 \cref{ch:quad_prac} 的 \cref{sec:qp-pitfalls}。
+\end{insight}
+
+\paragraph{配套手段：重机 trot 周期放慢。}
+新根因 A 的配套修复是把 trot 周期从 go1 的 $0.6$\,s（\texttt{[0,0.3,0.6]}）放慢到 \texttt{dmgo} 的 $0.70$\,s（\texttt{[0.0,0.35,0.70]}），抄 aliengo 重机时序：每步更长支撑相，在俯仰步顶用以遏制 roll。这把「步态周期是一个可调的 sim2real 旋钮」钉了出来——\textbf{移植不能照抄 go1 周期，重机器人需更慢 trot}（\texttt{dmgo} $14.7$\,kg vs go1 $12.0$\,kg）。这条已钉进 \cref{ch:quad_gait} 的步态调度。
+
+\begin{insight}[新根因 B：平地不稳才是 REAL root，台阶/感知是下游]\label{ins:qadv-flat-root}
+源码注释直陈：「\texttt{dmgo} 平地 trot 在 $5$\,m 处就 \texttt{FLIPS}，而 a1 平地 rock-stable $\to$ \texttt{dmgo} 平地不稳才是 REAL root，step 是 downstream」。即团队在 PHASE3 准备期发现 \texttt{dmgo} \emph{即便在平地}仍有残留翻车不稳，遂把它判定为比台阶更根本的头号问题（\textbf{先治平地、再上台阶}）。附 \texttt{comHeight} 实验（亲验注释）：\texttt{0.40}$\to$稳（$0/4$ 翻）、\texttt{0.30}$\to$翻，最终恢复到 M1 可用的 \texttt{0.36}（配 stance：FRONT \texttt{HFE}$-0.50$ / HIND \texttt{HFE}$-0.86$ / 全 \texttt{KFE}$-0.96$，足在髋下）。\textbf{为何高价值}：这条「M1 看似完成、平地却仍存残余不稳、且被重定为头号根因」的反转，直接修正了「M1/M2 完成、三大根因全治本」的乐观叙事——\textbf{移植验收「通过」不等于「鲁棒」}，平地的残余不稳必须在上感知前清掉，否则台阶上的翻车只是它的下游放大。
+\end{insight}
+
+\begin{note}[\texttt{comHeight} 曾被误判为稳定因素]
+顺带纠正一个本项目早期的误判：「\texttt{comHeight} $0.28/0.36$ 摔」曾被归因为「CoM 太高不稳」。实为 \texttt{sqpIteration=10} 的 stale policy 下游（\cref{sec:qadv-rc3}）——\texttt{sqp1} 下 \texttt{comHeight} $0.36$（$68\%$ 腿伸展）能站住 $z{=}0.344$、trot 走 $38$\,m 全稳。这\emph{再次}印证根因 \#3 的下游性：在没找到真根因前，几乎\emph{任何}参数都会「看起来像」稳定因素。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{诊断 crutch 登记清零 + 独立审计防自我说服}
+\label{sec:qadv-crutch}
+
+排查三大根因的过程中，本项目留下了 \textbf{$3$ 个同类「诊断 crutch」}（为定位问题临时调的参数）——它们\emph{全是诊断遗留、全会误导后续分析、全须事后清零}。这一节讲的不是某个 bug，而是\textbf{调试卫生}。
+
+\begin{insight}[诊断 crutch 必须登记 + 事后清零]\label{ins:qadv-crutch-log}
+本项目踩过的 $3$ 个 crutch：① \texttt{R} 接触力权重 $1.0\to0.01$（源于已证伪的 $\Sigma F_z/mg$ 红鲱鱼；弱 $100\times$ 的力正则让 MPC 激进、放大左右力不均）；② \texttt{torqueLimitsTask} 真实值 $\to80/80/80$（为消 qpOASES 的 \texttt{RET\_MAX\_NWSR} 临时抬，但根因是模型不对称\emph{非}力矩不可行）；③ \texttt{sqpIteration} $1\to10$（根因 \#3 本体）。三者都已回退。\textbf{纪律}：诊断期临时调参\emph{必须登记}（建专门清单），问题排掉后\emph{逐项清零核对}；否则它们会\emph{系统性}地把后续每一步分析带偏——你会拿着一个被悄悄改过的系统、去解释另一个现象，越解释越远。
+\end{insight}
+
+\begin{insight}[独立审计防自我说服]\label{ins:qadv-audit}
+长时间盯一个问题，人会\emph{自我说服}：把「单次最佳」当「普遍成立」、把「症状缓解」当「根因治愈」。本项目的解药是\textbf{独立审计}——用\emph{最小提示词}的独立子代理复核 headline，它\emph{不知道}你的心理预期，于是揪出了：① \textbf{真 bug}：WBC torque 限 \texttt{task.info} 的 $20/55/55$ 与 URDF effort（注释自陈已改 $90$）矛盾——flat $20$ / perceptive $55$ / URDF $90$ \emph{三处冲突}；② \textbf{过度声明}：go1-parity 的 $\Delta y/\Delta x{=}0.013$ 是\emph{单次最佳}，实测 csv 均值是 $0.067$（$5\times$）、均速 $0.488$（非 $0.64$）、yaw 漂 $15.2^\circ$——诚实表述应为「横漂 $0.013$–$0.067$ 随 run，同 go1 量级」；③ \textbf{过度声明}：KF「带噪 IMU」实为\emph{干净}（\texttt{LeggedHWSim.cpp:96} TODO 未加噪、只播协方差；估计滞后真值约 $13\%$）；④ \textbf{crutch 未清}：\texttt{recompileLibrariesCppAd=true} 未还原（启动慢）。\textbf{独立审计的价值}就在于它\emph{不参与}你的自我说服。
+\end{insight}
+
+\begin{pitfall}[残留悬坑：两份 config 只改一份（力矩限）]\label{pit:qadv-torque-task-vs-urdf}
+上面审计点 ① 的 bug 后来定案、却留下一个\emph{至今残留的悬坑}（只读源亲验）。定案：三关节\emph{同一电机}，额定 $30$\,Nm / 峰值 $90+$\,Nm，URDF effort 统一取峰值 \textbf{$90$}（早先 $20/55/55$ 拆分是错的——同一电机必同 effort，\texttt{HAA} 绝不该是 $20$）。\textbf{精确失败机理}：\texttt{HAA} 力矩上界被卡在 $20$ $\to$ 在 $0.16$ 台阶顶（step crest）无法产生足够的髋外展力矩去遏制侧向 roll $\to$ \textbf{侧翻}。但 URDF effort 改了 $90$、\texttt{task.info:296--301} 的 \texttt{torqueLimitsTask} \emph{仍是} $20/55/55$——而 \textbf{WBC 力矩上界恰恰读 \texttt{task.info}、不读 URDF}，所以「修了 URDF 没修 \texttt{task.info}」，WBC 的 \texttt{HAA} 力矩仍被 $20$ 饿死。这条「两份配置只改一份」是移植期典型陷阱（URDF 与 OCS2 config \emph{各管一摊}）；它在 \cref{ch:quad_wbc} 作为「力矩限读 \texttt{task.info}」的陷阱落点，本节给的是它从「侧翻」一路追到「残留悬坑」的完整链。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{sim2real 调试方法论（可迁移到任何机器人移植）}
+\label{sec:qadv-method}
+
+本节是全章\textbf{最值钱、最可迁移}的部分。前面五个故事的具体根因会随机器人不同而不同，但提炼出的方法论\emph{跨项目通用}。
+
+\begin{insight}[母题：对照实验 + 不变量守恒核对 $\gg$ 盲调]\label{ins:qadv-method-core}
+本项目最大的收获，是一句可迁移的母题：\textbf{用一台「已知好」的机器人（go1）走\emph{同一条流程}做对照、再核对「守恒量」（碰撞数 / 维度 / 质量），比在自己机器人上盲调姿态/参数高效\emph{一个数量级}}。它派生出两条操作律：① \textbf{「研究同栈可用参考的『为何能 work』$\to$ diff config $\to$ 适配」}——go1 的 config 就是 \texttt{dmgo} 的\emph{答案表}，逐项 diff \emph{两次一击命中}（腿宏对称、\texttt{sqpIteration}）；② \textbf{three-strikes}：连续 $>3$ 次治标失败必转调研，不闭门造车（源码 + deepwiki + WebSearch + 用户笔记\emph{交叉验}）。三大根因的确诊全是这套方法的产物：穿地靠 \texttt{gz sdf} 守恒核对（\cref{ins:qadv-collision-conserve}）、自旋靠 go1 决定性对照（\cref{sec:qadv-rc2}）、边缘稳定靠 diff \texttt{task.info} + \texttt{mpcTimer} 判据（\cref{sec:qadv-rc3}）。
+\end{insight}
+
+\paragraph{瞬态插桩反推稳态的陷阱。}
+\cref{sec:qadv-rc1} 的红鲱鱼 A（$\Sigma F_z/mg\approx0.90$）是一个独立成条的方法论教训：\textbf{用塌陷过程中的瞬态插桩值，去反推稳态结论，会被系统性带偏}。$0.90$ 是「正在塌」的果、不是「为何塌」的因。解药：插桩之前先读\emph{代价/约束的数学定义}（这里是「R 参考 $=mg$、平衡点零拉力」），用定义\emph{证伪}瞬态直觉。
+
+\begin{insight}[幻影 qpErr 的四种成因：归因模型前先确认容器干净]\label{ins:qadv-phantom-qperr}
+qpErr（QP 求解报错）极易被\emph{误判}成「模型不可行」，但本栈记录的 $4$ 种成因里\emph{三种与模型无关}：① pin teleport（$50$\,Hz \texttt{set\_model\_configuration} 致关节速度尖峰，qpErr $19250$）；② 步态 UDP 没接上 $\to$ stance 下追 \texttt{cmd\_vel} 前倾；③ \texttt{sqpIteration=10} 的 stale policy（qpErr $14\to0$）；④ \textbf{stale-gazebo CPU 争用}（残留 ROS+gazebo 进程堆积争 CPU 致 MPC/qpOASES 算不过来，\texttt{docker restart} 后 qpErr $8\to0$，同脚本同模型）。教训：\textbf{把 qpErr 归因到模型/约束之前，先确认容器干净、无残留 gazebo 进程争 CPU}——幻影 qpErr 会 \texttt{docker restart} 后消失。这与 \cref{sec:qadv-rc3} 「sqpIteration」同源（都是「算力不够 $\to$ 假象」），只是触发物是\emph{进程堆积}而非迭代数。
+\end{insight}
+
+\begin{insight}[镜像对：加核救不了串行 solver vs 加核救得了相机渲染]\label{ins:qadv-mirror-pair}
+「算力不足导致的失败，要\emph{区分到底是不是真不可行}」——本项目有一对完美的镜像案例：\textbf{左}：\texttt{sqpIteration} 那条是「加核\emph{救不了}串行 solver」（Riccati 地板，\cref{ins:qadv-parallel-floor}），所以「$\le4$ 核撑不住」的初判被推翻、真因是\emph{迭代数过高}；\textbf{右}：相机录制那条相反——session-6 曾记「gazebo 相机软渲太重 $\to4$ 核饿死控制器 $\to$ trot 摔」、据此判「相机录制不可行」，但 session-7 在 $8$ 核下不复现（$720$p@$20$fps offscreen 相机 + 真 KF trot 走 $38$\,m 不摔）$\to$ 相机录制是\emph{算力（核数）问题、非根本不可行}。\textbf{元教训}：同样是「算力不够」，一边怎么加核都没用（本质串行）、一边加够核就解决（本质可并行）——失败时务必\emph{先判它属于哪一类}，别把「可并行的暂时不够」当成「不可行」、也别把「本质串行」寄望于堆核。
+\end{insight}
+
+\paragraph{字节级抽取 $>$ 手抄。}
+\texttt{dmgo} URDF $1526$ 行，运动学部分（纯静态、无 \texttt{\$\{\}}）用 \texttt{sed -n '24,848p'} 做\emph{字节级抽取} + \texttt{sed} 改 mesh 路径，\textbf{避免手抄 $800$ 行的转写错误恰好落在 \#1 杀手区}（关节零位/轴向）。这是一条朴素却高价值的纪律：凡是「错一个字符就致命」的区域（零位、轴向、关节名），\emph{机械复制 $>$ 人工转写}。
+
+\paragraph{测试判摔：用 z + roll/pitch，不用四元数 $w$。}
+\textbf{绝不能用四元数 $w$ 判摔}：$w=\cos(\mathrm{yaw}/2)$ 是偏航分量，纯旋转会让 $w\to0$ 被\emph{误判成「摔」}（M2 v1 踩中，把上层 yaw 漂当成 fall 而提前中止）。\textbf{正解：用 base 高度 $z$ + roll/pitch 判摔}。这条提醒「测试度量本身也会有 bug」——一个错误的判摔准则，会让你为不存在的「摔」去 debug。
+
+\begin{table}[H]\centering\small
+\caption{sim2real 调试方法论速查（可迁移到任何机器人移植，\cref{sec:qadv-method}）}
+\begin{tabular}{p{0.30\textwidth} p{0.32\textwidth} p{0.28\textwidth}}
+\toprule
+方法 & 一句话 & 出处 \\
+\midrule
+对照 + 守恒核对 $\gg$ 盲调 & 已知好机器人走同流程 + 核对碰撞数/维度/质量 & \cref{ins:qadv-method-core} \\
+研究参考的「为何 work」$\to$diff & 同栈 go1 config $=$ 答案表，逐项 diff & \cref{ins:qadv-method-core} \\
+three-strikes & 连续 $>3$ 次治标失败必转调研 & \cref{ins:qadv-method-core} \\
+先读定义再信插桩 & 瞬态值反推稳态会被带偏（$0.90$ 红鲱鱼）& \cref{sec:qadv-rc1} \\
+幻影 qpErr 先查容器 & $4$ 种成因里 $3$ 种与模型无关 & \cref{ins:qadv-phantom-qperr} \\
+分清串行地板 vs 可并行 & 加核救不了 solver、救得了相机渲染 & \cref{ins:qadv-mirror-pair} \\
+字节级抽取 $>$ 手抄 & 零位/轴向杀手区机械复制 & \cref{sec:qadv-method} \\
+判摔用 z+roll/pitch & 四元数 $w$ 会把纯旋转误判成摔 & \cref{sec:qadv-method} \\
+诊断 crutch 登记 + 清零 & 临时调参不清零会系统性带偏分析 & \cref{ins:qadv-crutch-log} \\
+独立审计防自我说服 & 最小提示词独立子代理复核 headline & \cref{ins:qadv-audit} \\
+\bottomrule
+\end{tabular}
+\label{tab:qadv-method}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{资源护栏与运行环境：把失败域圈进容器}
+\label{sec:qadv-guardrail}
+
+最后登记一批\emph{sim2real 实操约束}：它们是纯工程细节、不影响理论理解，但\textbf{不懂会卡死你}。完整的容器/网络/编译细节一律 \cref{ch:engineering}，本节只登记「不懂会让你卡半天」的项。
+
+\begin{insight}[把失败域圈进容器：资源护栏铁律]\label{ins:qadv-container}
+调试一个会爆内存、会自旋、会泄漏进程的栈，第一性原则是\textbf{把失败域圈进容器、别让它冻住主机}。主机内存是唯一硬约束（$31$\,G 仅约 $13$\,G available）$\to$ 容器用 \texttt{-{}-cpus} / \texttt{-{}-memory} / \texttt{-{}-memory-swap} 圈住：\textbf{编译爆内存只会 OOM 杀容器、主机绝不冻}（cgroup 圈住失败域）。配套：catkin \texttt{-j2}（OOM 则 \texttt{-j1}）；\texttt{OMP/OPENBLAS\_NUM\_THREADS=1}；\textbf{一次一容器}；\texttt{pkill-by-name}（\emph{从文件跑脚本}以避免 \texttt{pkill} 把自己杀掉）；\texttt{timeout} / \texttt{docker rm -f} 兜底防容器泄漏占内存。镜像只做 apt + git clone \emph{不编译}（CppAD 模板单翻译单元吃 $3$–$8$\,G，\texttt{docker build} 无法限内存），重编译挪到带 \texttt{-{}-memory} cap 的运行时容器。
+\end{insight}
+
+\begin{note}[四条「指令发了却没收到/跑不动」的静默坑]\label{note:qadv-silent}
+四条会让你「明明发了指令却没反应」的静默坑，逐一登记（细节回 \cref{ch:engineering}）：
+\begin{itemize}
+  \item \textbf{步态切换是 UDP-only}：\texttt{GaitReceiver} 用 \texttt{TransportHints().udp()}（亲验 \texttt{GaitReceiver.cpp:43}）$\to$ \texttt{rospy}/\texttt{rostopic}（仅 TCP）\emph{连不上}；必须用 roscpp 键盘节点 \texttt{legged\_robot\_gait\_command}，且该节点链接 \texttt{libhpp-fcl.so} 在 \texttt{/usr/local/lib}、跑前须补 \texttt{LD\_LIBRARY\_PATH=/usr/local/lib}。
+  \item \textbf{goal 导航必须发 \texttt{odom} 帧}：\texttt{goalCallback} 内 \texttt{buffer.transform(...,"odom")}，发别的 TF 帧会\emph{静默丢弃}；且验证须用 \texttt{/odom}（估计帧 $=$ goal 所在帧）而非 Gazebo 真值（KF 有位置偏移）。
+  \item \textbf{\texttt{/cmd\_vel} 须平滑限加速 $|a|\le0.3$}：突变速度指令会让 MPC/WBC 难跟 $\to$ 失稳，限加速度是跑直走/演示的隐性前提。
+  \item \textbf{DEBUG 构建致 Gazebo RTF$\sim0.05$}（issue\#4）$\to$ 必 \texttt{RelWithDebInfo}/\texttt{Release}；OCS2 是 monorepo、\textbf{禁编全量}（缺 \texttt{convex\_plane\_decomposition}/\texttt{grid\_map}，issue\#87）$\to$ 只编 \texttt{ocs2\_legged\_robot\_ros} + \texttt{ocs2\_self\_collision\_visualization}（会把依赖子图拉全）；改 URDF 后清 CppAD 缓存（\cref{ch:quad_prac} 的 \texttt{pit:qp-cppad-cache}）。
+\end{itemize}
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+RViz 看得到、模型加载成功，碰撞就没问题 & 视觉与碰撞两套描述；无名 material 会静默丢碰撞，用 \texttt{gz sdf} 守恒核对（\cref{ins:qadv-collision-conserve}）\\
+走不直加个航向锁补偿就行 & 补偿是「搬家不是修」，弧线 veer 换成 crab veer；治本是腿宏 bit-exact 镜像（\cref{ins:qadv-leg-macro}）\\
+左右站姿不对称 = 前后站姿不对称，都是 bug & 左右不对称是 bug（残差），前后站姿不对称是非 bug（构造）（\cref{sec:qadv-rc2}）\\
+机器人 veer，一定是滤波器不准 & KF 误差 max $3.7^\circ$ 没问题；真因是 \texttt{sqpIteration=10} 喂陈旧策略（\cref{sec:qadv-rc3}）\\
+求解器慢就多给几个 CPU 核 & Riccati QP 是串行地板，加核救不了；实时靠少算（RTI $1$ 迭代）（\cref{ins:qadv-parallel-floor,ins:qadv-rti}）\\
+\texttt{sqpIteration=1} 是为了省算力将就 & $1$ 就是 RTI 正确实时设计，回到设计本意（\cref{ins:qadv-rti}）\\
+M1/M2 验收通过 = 机器人鲁棒了 & 平地仍可能残留不稳；通过 $\neq$ 鲁棒，平地不稳才是头号根因（\cref{ins:qadv-flat-root}）\\
+关节阻尼大点无所谓，物理上更稳 & MPC 忽略关节摩擦/阻尼，CAD 污染的大值会侵蚀裕度致翻（\cref{ins:qadv-friction-margin}）\\
+诊断时临时调的参数，事后不用管 & 必须登记 + 清零，否则系统性带偏后续分析（\cref{ins:qadv-crutch-log}）\\
+改了 URDF 力矩上限就够了 & WBC 读 \texttt{task.info} 不读 URDF，两份 config 须都改（\cref{pit:qadv-torque-task-vs-urdf}）\\
+qpErr = QP 不可行 = 模型/约束错 & $4$ 种成因里 $3$ 种与模型无关，先确认容器干净（\cref{ins:qadv-phantom-qperr}）\\
+判摔看四元数 $w$ 接近 $0$ 就是摔了 & $w$ 含偏航分量，纯旋转会误判；用 z+roll/pitch（\cref{sec:qadv-method}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+本章把前七章的理论拼图\emph{钉到一个真实工业级开源栈（\texttt{legged\_control} $=$ OCS2 NMPC + WBC + 线性 KF）上跑起来}，并把移植一台自定义四足时真实踩过的失败经验凝练成侦探故事与可迁移方法论。三大根因\textbf{都不是「看上去那个」}：穿地的真因是无名 material 静默丢碰撞（不是支撑不足）、自旋的真因是逐 link 左右不 bit-exact（不是单点几何误差）、边缘稳定的真因是 \texttt{sqpIteration=10} 喂陈旧策略（不是滤波不准、不是核数不够）。PHASE3 进一步揭示「验收通过 $\neq$ 鲁棒」：关节摩擦污染侵蚀裕度、平地不稳才是头号根因。贯穿全章的方法论——对照实验 + 不变量守恒核对 $\gg$ 盲调、诊断 crutch 登记清零、独立审计防自我说服、分清串行地板与可并行——可迁移到任何机器人移植。
+
+\begin{table}[H]\centering\small
+\caption{三大根因侦探故事索引（本章脊梁）}
+\begin{tabular}{p{0.13\textwidth} p{0.20\textwidth} p{0.24\textwidth} p{0.27\textwidth}}
+\toprule
+故事 & 症状 & 红鲱鱼 & 真根因 / 金标准确认 \\
+\midrule
+穿地 & STANCE 站不住、塌到 $z{\approx}{-}0.17$ & $\Sigma F_z/mg{\approx}0.90$；趴卧消 core-dump & 无名 material 丢 $17/20$ 碰撞；\texttt{gz sdf grep -c collision} 守恒（\cref{sec:qadv-rc1}）\\
+自旋/veer & trot 左偏 $10$\,m / 自旋出局 & 航向锁/path-follower/单点修正 & 逐 link 非 bit-exact；go1 决定性对照 + 腿宏（\cref{sec:qadv-rc2}）\\
+边缘稳定 & $0.13$ 摆 / veer / comHeight 摔 & 残余不对称 / CoM 太高 / 核数不够 & \texttt{sqpIteration=10} 陈旧策略；diff \texttt{task.info} + \texttt{mpcTimer}（\cref{sec:qadv-rc3}）\\
+\bottomrule
+\end{tabular}
+\label{tab:qadv-stories}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 全栈数据流 & TargetTraj$\to$RefMgr$\to$SqpMpc$\to$MRT$\to$WBC$\to$KF 闭环、三层频率 & \(\bigstar\bigstar\) \\
+2 & 移植边界 & 专属仅 $3$ config + URDF；运动学宏绝不复用 & \(\bigstar\bigstar\) \\
+3 & 穿地侦探 & 无名 material 丢碰撞；\texttt{gz sdf} 碰撞数守恒核对 & \(\bigstar\bigstar\bigstar\) \\
+4 & 自旋侦探 & 逐 link 非 bit-exact；参数化腿宏镜像乘子 & \(\bigstar\bigstar\bigstar\) \\
+5 & 边缘稳定侦探 & \texttt{sqpIteration=10} 陈旧策略；\texttt{mpcTimer} 判据 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+6 & RTI 实时机理 & $1$ 迭代 $=$ 正确设计；LQ 可并行、Riccati 串行地板 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+7 & 验收$\neq$鲁棒 & 关节摩擦侵蚀裕度；平地不稳才是头号根因 & \(\bigstar\bigstar\bigstar\) \\
+8 & 诊断卫生 & crutch 登记清零 + 独立审计防自我说服 & \(\bigstar\bigstar\) \\
+9 & 两份 config 悬坑 & WBC 力矩限读 \texttt{task.info} 不读 URDF & \(\bigstar\bigstar\bigstar\) \\
+10 & 可迁移方法论 & 对照 + 守恒核对 $\gg$ 盲调；串行/可并行之辨 & \(\bigstar\bigstar\bigstar\) \\
+11 & 资源护栏 & 容器圈失败域、UDP/odom 帧/限加速静默坑 & \(\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{本栈的理论基座}：OCS2 统一全身 MPC（质心模型 + 多重打靶）\cite{sleiman2021unified}；感知版 NMPC（本栈取其平地子集）\cite{grandia2022perceptive}；作者的安全约束应用层（duality-CBF，窄道行走）\cite{liao2023walking}；分层 WBC 的理论 \cite{bellicoso2016whole}。
+  \item \textbf{RTI 与实时数值最优控制}：Real-Time Iteration 方案的原始思想 \cite{diehl2002rti}（\texttt{sqpIteration=1} 的出处，机理推导见 \cref{ch:quad_mpc} 的 \cref{sec:frontier}）；HPIPM 高性能内点 QP 求解器 \cite{frison2020hpipm}（「串行地板」的求解器侧出处）。
+  \item \textbf{线性 KF 腿式估计}：本栈状态估计的实现出处 \cite{flayols2017experimental}（IMU 预测 + 足端 FK 更新，按接触相调噪声，详见 \cref{ch:quad_est}）。
+  \item \textbf{入门级 MPC 工程范例}：MIT Cheetah 3 凸 MPC \cite{dicarlo2018cheetah}（\cref{ch:quad_mpc} 范式）及其极简复刻——读懂本章的 NMPC 之前，先看凸 MPC 怎么跑起来（\cref{ch:quad_prac}）。
+  \item \textbf{工程落地与瞬时 QP}：宇树《四足机器人控制算法》\cite{unitree2023quadruped}（\texttt{unitree\_guide} 的一手讲解，难度阶梯的入门入口，见 \cref{ch:quad_prac}）。
+\end{itemize}
+
+\section*{本章与相关章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+相关章节 & 关系 & 本章接口 \\
+\midrule
+\cref{ch:quad_arch} 导论与架构 & 提供分层架构，本章是其 OCS2 工业实例 & \cref{sec:qadv-stack}、\cref{fig:qadv-dataflow} \\
+\cref{ch:quad_kin} 浮动基运动学 & 提供「电机零点$\neq$模型零点」、整机对称 & \cref{sec:qadv-port}、\cref{ins:qadv-leg-macro} \\
+\cref{ch:quad_gait} 步态生成 & 提供步态调度；本章给重机 trot 周期放慢 & \cref{ins:qadv-friction-margin} \\
+\cref{ch:quad_est} 足式状态估计 & 提供线性 KF；左右不对称估计先现形 & \cref{sec:qadv-rc2} \\
+\cref{ch:quad_mpc} 单刚体 MPC & 提供 NMPC + RTI 机理 & \cref{sec:qadv-rc3}、\cref{ins:qadv-rti} \\
+\cref{ch:quad_wbc} 全身控制 & 提供 $42$ 维 QP；力矩限残留悬坑 & \cref{pit:qadv-torque-task-vs-urdf} \\
+\cref{ch:quad_prac} 实践框架 & 陷阱本体在 prac，本章给完整侦探链 & \cref{ins:qadv-collision-conserve} \\
+\cref{ch:engineering} 工程实践 & 承接纯工程细节（容器/网络/编译）& \cref{sec:qadv-guardrail} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：模型加载成功、RViz 正常，机器人却\emph{往地里穿}。\textbf{排查}：\texttt{gz sdf -p robot.urdf | grep -c collision} 核对 URDF$\leftrightarrow$SDF 碰撞数是否守恒；多半是无名 \texttt{<material>} 让解析器静默丢碰撞（\cref{ins:qadv-collision-conserve}）。
+  \item \textbf{症状}：trot 命令直走、机器人却\emph{弧线左偏/自旋}。\textbf{排查}：先用 go1 走同 harness 做决定性对照；若 go1 直、\texttt{dmgo} 偏，查\emph{腿级 L/R 不对称}（\texttt{check\_lr\_symmetry.py}），治本是参数化腿宏 bit-exact 镜像，别加补偿器（\cref{ins:qadv-leg-macro}）。
+  \item \textbf{症状}：完美态下轻微摆、真 KF 下\emph{veer/摔}。\textbf{排查}：先实测 KF 航向误差（若 max 几度则 KF 没问题）+ 跑 go1 真 KF 基线；再 diff \texttt{task.info} 的 \texttt{sqpIteration}，并查 \texttt{mpcTimer} Max/Avg 是否 $>10$\,ms 预算（\cref{sec:qadv-rc3}）。
+  \item \textbf{症状}：机器人\emph{莫名翻车}、不报错、碰撞数也对、维度也对。\textbf{排查}：查 \texttt{joint\_damping}/\texttt{joint\_friction} 是否被 CAD 导出污染成大值（MPC 忽略它、Gazebo 施加它 $\to$ 裕度侵蚀）；重机器人配套放慢 trot 周期（\cref{ins:qadv-friction-margin}）。
+  \item \textbf{症状}：台阶顶\emph{侧翻}、某关节力矩像被卡住。\textbf{排查}：核对 \texttt{task.info} 的 \texttt{torqueLimitsTask} 与 URDF effort 是否一致（WBC 读 \texttt{task.info}），「改了 URDF 没改 \texttt{task.info}」会让 \texttt{HAA} 力矩被旧值饿死（\cref{pit:qadv-torque-task-vs-urdf}）。
+  \item \textbf{症状}：qpErr 报错，怀疑模型不可行。\textbf{排查}：先 \texttt{docker restart} 清残留 gazebo 进程、确认容器干净——$4$ 种 qpErr 成因里 $3$ 种与模型无关，幻影 qpErr 会重启后消失（\cref{ins:qadv-phantom-qperr}）。
+  \item \textbf{症状}：测试脚本报「摔了」、但回放看机器人没摔。\textbf{排查}：判摔准则是否误用了四元数 $w$（纯旋转会让 $w\to0$）；改用 base 高度 $z$ + roll/pitch（\cref{sec:qadv-method}）。
+\end{enumerate}

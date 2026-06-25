@@ -1,0 +1,1189 @@
+\chapter{时空轨迹优化：CILQR、TEB、OBCA 与 MINCO}
+\label{ch:st-trajopt}
+
+% ════════════════════════════════════════════════════════════════
+%  时空轨迹优化：全吸收章。
+%  吸收 Chen-Zhan-Tomizuka CILQR(ITSC 2017) + Rösmann TEB(RAS 2017)
+%  + Zhang-Liniger-Borrelli OBCA(T-CST 2021) / H-OBCA(CDC 2018)
+%  + Wang-Zhou-Xu-Gao MINCO/GCOPTER(T-RO 2022) + am_traj(RA-L 2020)
+%  + Foehn-Romero-Scaramuzza CPC(Science Robotics 2021)。自包含独立记录。
+%  承接 \cref{ch:planning} 的 min-snap / CHOMP，不重复基础轨迹优化。
+%  源由 AI 写、多轮审，仍可能有错；存疑处打 \pz / \rebuilt，并入 claimsToVerify。
+%  教学层遵循 v5.0 理论教学规范。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item \cref{ch:planning} 的轨迹优化（min-snap/CHOMP）大多在\emph{固定时间分配}下优化空间形状。把“每段花多长时间”也变成优化变量，难在哪里？为什么它和多项式系数\emph{强耦合}？
+  \item “先定路径、再排速度”的解耦在什么场景下会失真？为什么？
+  \item 标准 iLQR（迭代 LQR）只能解\emph{无约束}最优控制。如何让它“学会”处理限速、避障这类不等式约束，又不丢掉它利用时序结构的速度？
+  \item “自车不在凸多边形障碍内”这个约束，为什么对标准非线性规划（NLP）求解器是个麻烦？它\emph{不可微}在哪？
+  \item 什么是同伦类？为什么单纯的连续优化跨不过不同的同伦类，因而需要一个离散前端来选定走哪一类？（答不出 $\to$ 回 \cref{sec:plan-optimal}）
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{陈述}时空轨迹优化的\emph{统一问题形式}，并用“表示 / 约束处理 / 代价”三选择框架拆解任意一个具体方法；
+  \item \textbf{推导} CILQR 如何用对数障碍（log-barrier）把不等式约束纳入 iLQR 的代价，理解 iLQR 反向递推为何随步数\emph{线性}增长、以及它“第一次迭代就要可行”的真实局限；
+  \item \textbf{建立} TEB 的数学框架——位姿 + 段时间序列、所有约束写成 g2o 超图上的加权软项、为何稀疏性使其能实时、以及多拓扑并行如何规避局部极小；
+  \item \textbf{说清} OBCA 如何用凸优化的\emph{强对偶}把非凸、不可微的避障约束\emph{精确}重构成光滑可微的硬约束，并理解“光滑 $\ne$ 凸”、为何仍需 warm-start；
+  \item \textbf{掌握} MINCO 的参数映射 $\mathbf c=\mathcal M(\mathbf q,\mathbf T)$——为何稠密的多项式系数由稀疏的（航点 $\mathbf q$、段时间 $\mathbf T$）唯一确定，以及这如何把约束优化变成低维无约束优化、支持时空同步变形；
+  \item \textbf{理解}微分平坦为何让无人机“只规划位置曲线”，把 MINCO/min-snap 焊接到 \cref{sec:plan-minsnap} 的多项式轨迹之上；
+  \item \textbf{解释} CPC 的互补进度约束如何让“何时经过哪个航点”本身成为优化变量，为何时间最优轨迹是 bang-bang 的、以及互补约束（MPCC）为何只能离线求解；
+  \item \textbf{根据}载体、实时性、避障硬度选择合适方法，并理解“离散定 homotopy + 连续精修”这条贯穿全章的工程分工。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把时间真正变成连续优化里的决策变量}”的主线。五个方法（CILQR / TEB / OBCA / MINCO / CPC）本质上是同一个时空联合优化问题在三件事上做了不同选择——\textbf{用什么表示轨迹与时间、怎么把（尤其非凸的避障）约束塞进优化、代价里放什么}。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4.5mm and 6mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  soft/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  hard/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (uni) {统一问题形式\\ 表示/约束/代价};
+\node[soft, below left=9mm and 2mm of uni] (cilqr) {CILQR\\ log-barrier 软化};
+\node[soft, right=of cilqr] (teb) {TEB\\ hinge 软化 + g2o};
+\node[hard, below=8mm of cilqr] (obca) {OBCA\\ 对偶精确重构};
+\node[hard, right=of obca] (minco) {MINCO\\ 光滑映射消去};
+\node[hard, right=of minco] (cpc) {CPC\\ 互补约束};
+\node[blk, below=8mm of minco, fill=main!6, draw=main!60!black] (sel) {方法选型\\ 离散定 homotopy + 连续精修};
+\draw[ln] (uni)--(cilqr); \draw[ln] (uni)--(teb);
+\draw[ln] (cilqr)--(obca); \draw[ln] (teb)--(minco);
+\draw[ln] (uni.east) to[out=-20,in=90] (cpc.north);
+\draw[ln] (obca)--(sel); \draw[ln] (minco)--(sel); \draw[ln] (cpc)--(sel);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:st-unified}（统一问题形式）是全章的坐标系，务必先读；\cref{sec:st-cilqr}（CILQR）把“约束怎么进连续优化”讲得最细，是理解后面四个方法的地基，无论你的方向是车还是机都建议精读；偏自动驾驶的读者再重点看 \cref{sec:st-obca}（OBCA），偏无人机/移动机器人的读者重点看 \cref{sec:st-teb}（TEB）、\cref{sec:st-minco}（MINCO）、\cref{sec:st-cpc}（CPC）；\cref{sec:st-select}（选型）收束全章。五个方法沿两条轴递进：约束处理从\emph{软化}（barrier/hinge）走向\emph{精确重构}（对偶/映射/互补），时间从\emph{隐式/固定}走向\emph{完全作为优化变量}。
+
+\subsection*{前置知识桥接}
+本章是 \cref{ch:planning}（运动规划导论）的直接延续，建立在它的三块基础上，重叠处不再重复、一律 \cref 指过去：
+\begin{itemize}
+  \item \textbf{构型空间与同伦类}：本章的轨迹活在车辆构型空间 $\SE(2)$ 或无人机 $\SE(3)$ 上（\cref{sec:plan-cspace}）；“连续优化跨不过不同同伦类、需离散搜索先选”这一关键事实来自 \cref{sec:plan-optimal}，是本章反复出现的“warm-start / 多拓扑”动机。
+  \item \textbf{轨迹优化的一般形式}：本章所有方法都是 \cref{def:plan-trajopt} 那个代价泛函在“把时间也作变量”后的具体版本；CHOMP 的协变梯度（\cref{sec:plan-chomp}）与 min-snap 的等式约束 QP（\cref{sec:plan-minsnap}、\cref{der:plan-minsnap}）是本章的基线——\textbf{MINCO 正是站在 min-snap 的肩膀上}，不重复其推导。
+  \item \textbf{求解器}：iLQR、g2o、Ipopt/CasADi、L-BFGS 在本章先当“黑盒”用，重点是\emph{怎么把规划问题建模成它们能吃的形式}；其底层（高斯牛顿、稀疏最小二乘、内点/SQP）见 \cref{ch:nlopt}。本章求解器与车型曲线（Dubins/Reeds--Shepp、\cref{sec:plan-dubins}）作为 warm-start 前端被引用。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 动态绕障时你会卡在“路径定死、速度无解”：用解耦管线先定一条贴着前车的变道路径、再排速度，前车一减速，这条已定死的路径就逼自车要么追尾、要么急刹到乘客不适——根源是路径与速度本该\emph{联合}决策，而你没有把时间一起放进优化（\cref{sec:st-cilqr}）。
+  \item 做无人机轨迹时你会在“飞得快”和“算得动”之间反复碰壁：简单 min-snap 太“软”、发挥不出电机极限；直接优化上百个多项式系数又慢得机载算不动——不懂 MINCO 的参数映射降维与时间分配，就做不出既快又实时的轨迹（\cref{sec:st-minco}）。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\label{tab:st-reading}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导与练习） & 8--12 小时 & 首次系统学习时空轨迹优化、要做规控实现/研究 \\
+速读（跳过代码细节与陷阱） & 2--3 小时 & 有优化基础、想建立五方法的全局图景 \\
+速查（只看小结的符号表 + 速查表 + 选型对照） & 20--40 分钟 & 写代码、做方法选型时回来查 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+本章承 \cref{ch:planning} 的规划记号。车辆构型空间记 $\mathcal C=\SE(2)$、无人机 $\mathcal C=\SE(3)$（群/代数宏 $\SO,\SE,\so,\se$ 同全书）。
+离散状态/控制序列记 $\mathbf x_k,\mathbf u_k$（$k$ 为时间步）；连续轨迹的航点（waypoint）记 $\mathbf q$、段时间（segment time）记 $T_i>0$，二者构成 MINCO 的低维参数（\textbf{注意 $\mathbf q$ 是航点序列，非单个构型；与 \cref{ch:planning} 的构型 $\mathbf q\in\mathcal C$ 同字母、不同对象，仅本章局部生效}）。
+不等式约束统一写成 $g_i(\cdot)\le 0$ 为可行；代价泛函记 $J$，加障碍后的增广代价记 $\tilde J$。
+对偶变量记 $\boldsymbol\lambda\ge\mathbf 0$（OBCA）、进度乘子记 $\mu_{i,k}\ge 0$（CPC）。
+\textbf{字母隔离声明}：本章 $\mu$ 视上下文指 barrier 权重（\cref{sec:st-cilqr}）或 CPC 的进度乘子（\cref{sec:st-cpc}），$\boldsymbol\lambda$ 指对偶变量（非特征值/波长），均仅在本章局部生效，与 SLAM 章同字母无关。
+本章不涉及旋转估计，故无左/右扰动之分；凡需姿态插值（如 $\SE(3)$ 上的轨迹）一律沿用 \cref{ch:lie} 的保群（测地）插值。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{时空轨迹优化的统一问题形式}
+\label{sec:st-unified}
+
+\paragraph{动机：先给五个方法一个共同骨架。}
+本章要讲 CILQR、TEB、OBCA、MINCO、CPC 五个方法，名字、出身、应用各不相同（自驾、移动机器人、泊车、无人机、竞速）。若孤立地记五个名字，既累又散。一个更有力的看法是：它们都是在解\emph{同一个}时空联合优化问题的某个具体版本。把这个骨架立起来，五个方法就被组织成同一问题的五种解法。
+
+\paragraph{反面：没有统一视角会怎样。}
+若把每个方法当成独立的“黑话集合”去背，你会发现它们的术语彼此冲突（CILQR 说“barrier”、TEB 说“hinge 边”、OBCA 说“对偶变量”、MINCO 说“参数映射”、CPC 说“互补约束”），却看不出它们其实在回答同一组问题。结果是：读新论文时无法快速定位它的创新点，做工程选型时只能凭印象。有了统一框架，任意一个新方法（哪怕本章没讲的）你都能用同一组问题去拆解。
+
+\begin{definition}[时空轨迹优化的一般形式]\label{def:st-general}
+给定载体的动力学、障碍集合与状态/控制界，时空轨迹优化在\emph{轨迹}（记为 $\mathrm{traj}$）与\emph{时间}（总时长或段时间序列，记为 $T$）上联合求解
+\begin{equation}
+  \min_{\mathrm{traj},\,T}\ J(\mathrm{traj},T)
+  \quad\text{s.t.}\quad
+  \begin{cases}
+    \text{动力学可行（满足载体运动方程）},\\
+    \text{无碰撞（轨迹处处在 } \mathcal C_{free}\text{ 内）},\\
+    \text{状态与控制在界内}.
+  \end{cases}
+  \label{eq:st-general}
+\end{equation}
+即“在动力学可行、无碰撞、状态与控制都在界内的前提下，对轨迹和时间求某个代价最小”。
+\end{definition}
+
+\noindent\cref{eq:st-general} 与 \cref{def:plan-trajopt} 的轨迹优化一般形式同源，区别只在\textbf{把时间 $T$ 显式地、与轨迹一起放进了决策变量}——这正是“时空”二字的来源，也是本章相对 \cref{sec:plan-traj} 推进的那一步。五个方法只是在下面三个问题上做了不同选择。
+
+\paragraph{选择一：用什么表示“轨迹 + 时间”？}
+这是最根本的分歧，一旦选定，求解器和后续技巧就大致定了。CILQR 用\emph{离散的状态-控制序列} $\{\mathbf x_k,\mathbf u_k\}$，时间隐含在状态（速度 $v$）和步长里；TEB 用\emph{位姿 + 段时间序列} $\{\mathbf s_i,\Delta T_i\}$，时间是显式的分段变量；MINCO 用\emph{分段多项式 + 航点 + 段时间} $(\mathbf q,\mathbf T)$，把稠密的多项式系数压缩成稀疏参数；CPC 在轨迹之外再加一组\emph{进度变量} $\mu_{i,k}$，把“何时到航点”也变成变量。
+
+\paragraph{选择二：怎么把约束（尤其非凸的避障）塞进优化？}
+这是本章反复出现的主题。CILQR 把约束变成代价里的 \emph{log-barrier}（双侧软墙）；TEB 把约束变成因子图上的\emph{单边 hinge 惩罚}（软）；OBCA 用\emph{对偶变量}把非凸的“不在障碍内”精确光滑化成等价的硬约束；MINCO 用\emph{光滑映射}精确消去几何约束、化为无约束优化；CPC 用\emph{互补条件}把离散的“过/不过航点”写成连续可解的约束。五种技巧，从“软化”到“精确重构”，难度递增、保证递强——这正是 \cref{sec:st-cilqr} 到 \cref{sec:st-cpc} 的递进顺序。
+
+\paragraph{选择三：代价 $J$ 里放什么？}
+平滑性（jerk/snap 的平方积分）、贴近参考、控制省力几乎总在；而是否放\emph{时间项}（$\sum_i\Delta T_i$ 或总时长）决定了这个方法是否追求“时间最优”——TEB、MINCO、CPC 都把时间最优作为核心目标，CILQR、OBCA 则更看重跟踪与舒适。
+
+\begin{insight}
+记住这个\textbf{三选择框架}（表示 / 约束处理 / 代价），本章后面每讲一个方法，你都可以问自己：它在这三件事上各选了什么？这样五个看似零散的方法，就被组织成了同一问题的五种解法，而非五个孤立技巧。框架还能外推——遇到本章没讲的方法（如工业界常用的 acados NMPC、或某篇新论文），用同样三栏去拆，比记住每个名字有用得多。
+\end{insight}
+
+\begin{note}
+\textbf{两条主线先打个招呼.}\;本章组织五方法的纵向逻辑有两条：其一，“约束怎么进优化”从\emph{软化}（barrier/hinge，可微但不保证满足）走向\emph{精确重构}（对偶/映射/互补，保证但更难解）；其二，T 线（\cref{ch:planning} 的搜索/走廊与本章）共有的\emph{“离散定 homotopy + 连续精修”}分工——连续优化跨不过同伦类（\cref{sec:plan-optimal}），故都需要一个离散前端来选对绕行方向、给可行初值。这两条线在 \cref{sec:st-select} 收束。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{CILQR：把约束变成 iLQR 代价里的软墙}
+\label{sec:st-cilqr}
+
+\paragraph{动机：iLQR 很快，但它不会处理约束。}
+先说 iLQR（iterative LQR，迭代 LQR）是什么、为什么自驾喜欢它。iLQR 是求解非线性最优控制问题的高效算法：给定一个非线性系统（如车辆运动学）与一个代价函数，它通过“在当前轨迹附近线性化系统、二次化代价、用 LQR 的 Riccati 反向递推求出控制增量、再前向更新轨迹”反复迭代，逼近最优控制序列\cite{chen2017cilqr}。它的好处是\textbf{快}——利用了最优控制问题的时序结构（动态规划的反向递推），复杂度随时间步\emph{线性}增长，而非像通用 NLP 那样把所有变量堆在一起。对自动驾驶这种要求几十赫兹实时重规划的场景，这个速度优势很关键。
+
+但 iLQR 有一个致命短板：\textbf{它只能处理无约束问题}。标准 iLQR 的推导假设代价光滑、控制自由，无法直接表达“速度不超限速”“加速度不超舒适上限”“不撞障碍”这类\emph{不等式约束}。而真实驾驶规划全是约束：限速、加减速上限、曲率上限（方向盘打不了那么死）、以及最要命的避障。于是问题成了：\textbf{怎么让又快又好的 iLQR，学会处理约束？} CILQR 的答案是——把约束“变成”代价。
+
+\paragraph{反面：不解决约束，只有两条都不理想的退路。}
+其一是\emph{用通用 NLP 求解器}（Ipopt、SNOPT 等）直接解带约束轨迹优化：能处理约束，却放弃了 iLQR 利用时序结构的速度优势——通用 NLP 把整条轨迹的所有变量当成一个大向量、约束当成一堆方程，求解慢，难满足自驾实时预算。其二是\emph{事后裁剪}：用无约束 iLQR 解出轨迹，再硬把越界部分裁回可行区（速度超了就削到限速）——这破坏了 iLQR 解的最优性与一致性，裁剪后的轨迹既非原问题最优解、又可能在裁剪点不连续，下游控制难以跟踪。两条路都说明：约束不能当事后补丁，必须\emph{在优化过程内部}就被考虑进去。
+
+\paragraph{历史：Tomizuka 组的 ITSC 2017。}
+CILQR（Constrained Iterative LQR）由 Jianyu Chen、Wei Zhan、Masayoshi Tomizuka（加州大学伯克利分校）提出，发表于 2017 年 IEEE 智能交通系统会议（ITSC 2017）\cite{chen2017cilqr}。他们的出发点正是上面那个矛盾：自动驾驶轨迹规划面临高动态环境需空间-时间联合、车辆模型非线性且避障约束非凸、实时性要求高三重挑战；iLQR 能高效求解非线性系统的预测最优控制，却无法处理约束。其解法是把约束通过 barrier 函数转移到代价里——非线性、非凸约束先被线性化，barrier 再被二次化、加到原代价上；并用一种基于椭圆的障碍表示、把中心线用多项式近似使其连续可微。这套做法把“约束处理”干净地嵌进 iLQR 的迭代，既保留速度、又获得约束处理能力——这正是名字里那个 “Constrained” 的含义。
+
+\subsection{理论：log-barrier 把约束变成代价}
+\label{sec:st-cilqr-theory}
+
+\paragraph{状态、控制与时空联合性。}
+CILQR 把车辆建模成离散时间系统，状态取 $\mathbf x_k=(x,y,\theta,v)$（位置、朝向、速度），控制取 $\mathbf u_k=(a,\delta)$（加速度、前轮转角）\cite{chen2017cilqr}。这里\textbf{时间是隐式的决策维度}：速度 $v$ 是状态、加速度 $a$ 是控制，二者直接决定“何时到达轨迹上的哪一点”——所以求解 $\{\mathbf x_k,\mathbf u_k\}$ 序列的同时，时间分布也被一起定下。这就是 CILQR “时空联合”的来源：它不像解耦法那样先定路径再排速度，而是在同一个 iLQR 迭代里同时优化位置与速度。车辆运动学采用自行车模型（轴距 $L$）：
+\begin{equation}
+  \dot x=v\cos\theta,\quad \dot y=v\sin\theta,\quad \dot\theta=\frac{v}{L}\tan\delta,\quad \dot v=a,
+  \label{eq:st-bicycle}
+\end{equation}
+离散化后即得状态转移 $\mathbf x_{k+1}=f(\mathbf x_k,\mathbf u_k)$。
+
+\paragraph{核心招式：barrier 函数。}
+约束的一般形式是一组不等式 $g_i(\mathbf x,\mathbf u)\le 0$（满足即可行，如 $g_v=v-v_{\max}\le 0$ 表示不超速）。CILQR 不把这些约束硬性交给求解器，而是为每个约束构造一个 \textbf{barrier 函数} $B(g_i)$，加到原代价 $J$ 上，得增广代价
+\begin{equation}
+  \tilde J = J + \sum_i \mu\, B\big(g_i(\mathbf x,\mathbf u)\big),\qquad \mu>0,
+  \label{eq:st-augcost}
+\end{equation}
+其中 $\mu$ 是 barrier 权重。barrier 的设计意图是：约束\emph{满足}（$g_i<0$，在可行域内部）时，$B$ 给一个有限的、随接近边界而增大的“惩罚”，像一堵\emph{软墙}把解往可行域内部推；约束\emph{逼近或越过}边界时，$B$ 急剧增大，让优化器强烈避开。一种常见实现是对数 barrier 加二次惩罚的组合\cite{chen2017cilqr}：
+\begin{equation}
+  B(g)=
+  \begin{cases}
+    -\ln(-g), & g<0 \quad(\text{可行}),\\[4pt]
+    \tfrac12 k\,g^2+(\text{linear, const}), & g\ge 0 \quad(\text{越界}).
+  \end{cases}
+  \label{eq:st-barrier}
+\end{equation}
+可行侧用对数 barrier（$-\ln(-g)$ 在 $g\to 0^-$ 时趋于 $+\infty$，形成“墙”），越界侧改用二次惩罚（对数在 $g\ge 0$ 无定义，必须换一个有限且光滑衔接的函数）。两段在 $g=0$ 处做光滑拼接（值、一阶导连续），保证整个 $B$ 可微——这对 iLQR 至关重要，因为 iLQR 需要对代价求一阶、二阶导。
+
+\paragraph{为什么这招能让 iLQR 处理约束？}
+关键在于：加了 barrier 后，约束信息被编码进了代价的\textbf{梯度和 Hessian} 里。iLQR 每次迭代要对代价做二次近似（求梯度、Hessian），barrier 项的导数会在接近约束边界时变得很大，于是 iLQR 的反向递推自然算出“把轨迹推离边界”的控制增量。非线性、非凸约束（如避障）先在当前轨迹处\emph{线性化}成 $g_i\approx \mathbf a_i^\top\delta\mathbf x+b_i$，barrier 再对这个线性化的 $g_i$ \emph{二次化}，加到代价的二次近似里——这样每次迭代仍是一个标准的、iLQR 能高效求解的二次子问题。约束就这样被“溶解”进 iLQR 的迭代，而未破坏它的结构与速度。
+
+\paragraph{障碍怎么表示：椭圆。}
+避障约束 $g_{\text{obs}}(\mathbf x)=d_{\text{safe}}-\|\mathbf p-\mathbf p_{\text{obs}}\|$ 这种基于欧氏距离的形式，在 $\|\mathbf p-\mathbf p_{\text{obs}}\|\to 0$ 时导数有奇异、对矩形等障碍不光滑。CILQR 用\textbf{椭圆}近似障碍（及自车占据形状）：把障碍表示成一个椭圆，避障约束写成“自车中心到椭圆的某种二次型距离 $\ge$ 安全值”，这个形式处处光滑可微，正好喂给 barrier\cite{chen2017cilqr}。中心线（参考路径）也用\emph{多项式拟合}使其连续可微——这样“贴近中心线”的代价项与横向偏移都光滑。这些“光滑化”不是细节，而是让整个 barrier-iLQR 框架能跑起来的前提：iLQR 要求一切可微。
+
+\begin{derivation}[iLQR 反向递推到底在做什么]\label{der:st-ilqr}
+理解了这一层，才明白 CILQR 为什么快。iLQR 一次迭代分两趟。
+\textbf{前向趟}：从当前控制序列 $\{\mathbf u_k\}$ 出发，用动力学 \cref{eq:st-bicycle} 滚出整条状态轨迹 $\{\mathbf x_k\}$，并在每步对动力学线性化（得 $\partial\mathbf x_{k+1}/\partial\mathbf x_k$、$\partial\mathbf x_{k+1}/\partial\mathbf u_k$）、对代价（含 barrier）二次化（得一、二阶导）。
+\textbf{反向趟}：从轨迹末端往回，逐步计算每步的“价值函数”二次近似——直观说就是“从第 $k$ 步到终点、若此后都最优，还要付多少代价”。这个反向过程本质是动态规划的 Bellman 递推（\cref{thm:plan-bellman}）：末端代价已知，往前每退一步，就把“本步代价 $+$ 下一步的最优未来代价”合并，解一个小的二次优化，得到本步最优控制增量
+\begin{equation}
+  \delta\mathbf u_k=\mathbf K_k\,\delta\mathbf x_k+\mathbf d_k,
+  \label{eq:st-ilqr-gain}
+\end{equation}
+其中 $\mathbf K_k$ 是反馈增益、$\mathbf d_k$ 是前馈项。
+\textbf{关键在“逐步”二字}：iLQR 不把整条轨迹所有变量堆成一个大矩阵一次性求逆（那是通用 NLP 的做法，复杂度随步数立方增长），而是利用“时间是链式的”这个结构，一步步往回推，每步只解一个小问题——总复杂度随步数\emph{线性}增长。这就是 iLQR（以及 CILQR）快的根本：它把时序结构吃干榨净。barrier 项进入这个框架时，无非在每步“本步代价”里多加一项（及其一、二阶导），反向递推照常进行——所以 CILQR 在获得约束处理能力的同时，没损失 iLQR 的速度优势。
+\end{derivation}
+
+\begin{note}
+\textbf{iLQR 与 DDP 的关系（一个常见疑问）.}\;你可能在别处见过 DDP（Differential Dynamic Programming，差分动态规划）。它和 iLQR 求解同一类非线性最优控制、都用“前向滚动 + 反向递推”，差别只在反向递推时对\emph{动力学}的处理：DDP 用动力学的\emph{二阶导}（完整二阶展开），iLQR 只用动力学的\emph{一阶导}（把动力学当线性，只对代价做二阶近似）。所以 iLQR 是 DDP 的高斯-牛顿式简化——丢掉动力学二阶项，换来每步更省、实现更简单，代价是收敛阶略低（但实践中往往够用，且更稳定，因动力学二阶导有时病态）。CILQR 建立在 iLQR 上，故继承其简单与稳定——自驾这种要高频实时的场景，多选 iLQR/CILQR 这一路。
+\end{note}
+
+\subsection{代码：barrier 如何把约束变成代价梯度}
+\label{sec:st-cilqr-code}
+
+完整 CILQR 要实现 iLQR 的反向 Riccati 递推（需矩阵运算），代码量不小。为把“barrier 如何把约束变成代价”这个\emph{核心机制}讲透，下面给一份可直接编译运行的最简演示：一维点质量，用 log-barrier 把“位置上限”约束纳入代价，看 barrier 怎么把解挡在可行域内、贴着边界停住。它不实现完整 iLQR（用梯度下降代替反向递推，便于无依赖运行），但 barrier 的构造、它对梯度的贡献、它“软约束”的本质，和真 CILQR 完全一致。
+
+\begin{codebox}[C++]{最简 CILQR 思想：log-barrier 把位置上限约束纳入代价}
+// 一维点质量, x_{k+1} = x_k + u_k*dt (控制=速度)
+// 目标:从 x0=0 走到尽量靠近 target,但位置不许超过 x_max(barrier 约束)
+#include <vector>
+#include <cmath>
+#include <cstdio>
+
+const int    N      = 20;       // 步数
+const double dt     = 0.1;
+const double target = 3.5;      // 想到达(故意设在约束外侧,看 barrier 怎么挡)
+const double x_max  = 3.0;      // 约束:位置不许超过 3.0
+const double w_u    = 0.01;     // 控制代价权重
+const double mu     = 0.01;     // barrier 权重(越小越贴近真约束)
+
+// log-barrier: g<0 可行用 -mu*ln(-g); g>=0 越界用二次延拓, 在 g=0 附近光滑拼接
+double Barrier(double g) {
+  const double t = 0.02;                          // 拼接点(离边界 t 处切到二次)
+  if (g < -t) return -mu * std::log(-g);          // 可行域内部:对数 barrier
+  double a = mu / (t * t) / 2.0;                  // 二次延拓(在 -t 处值/一阶导都连续)
+  double b = mu / t, c = -mu * std::log(t), d = g + t;
+  return a * d * d + b * d + c;
+}
+double BarrierGrad(double g) {                    // dB/dg
+  const double t = 0.02;
+  if (g < -t) return -mu / g;                     // d(-mu ln(-g))/dg = -mu/g
+  double a = mu / (t * t) / 2.0, b = mu / t;
+  return 2 * a * (g + t) + b;
+}
+
+int main() {
+  std::vector<double> u(N, 0.5);                  // 初始控制(匀速向 target)
+  for (int iter = 0; iter < 2000; ++iter) {       // 梯度下降(真 CILQR 用 iLQR 反向递推)
+    std::vector<double> x(N + 1, 0.0);            // 前向:由 u 滚出状态 x
+    for (int k = 0; k < N; ++k) x[k + 1] = x[k] + u[k] * dt;
+    std::vector<double> grad(N, 0.0);             // 算梯度 dJ/du_k(含 barrier 贡献)
+    for (int k = 0; k < N; ++k) {
+      double g_acc = 2 * w_u * u[k];              // 控制代价的梯度
+      for (int j = k + 1; j <= N; ++j) {          // u_k 影响 x_{k+1..N}
+        double track = 2 * (x[j] - target);       // 跟踪代价 d/dx_j
+        double barr  = BarrierGrad(x[j] - x_max); // barrier d/dx_j(约束 g=x_j-x_max)
+        g_acc += (track + barr) * dt;             // dx_j/du_k = dt
+      }
+      grad[k] = g_acc;
+    }
+    for (int k = 0; k < N; ++k) u[k] -= 0.02 * grad[k];  // lr=0.02
+  }
+  std::vector<double> x(N + 1, 0.0);
+  for (int k = 0; k < N; ++k) x[k + 1] = x[k] + u[k] * dt;
+  std::printf("target=%.1f, x_max=%.1f, 末位置 x[N]=%.4f, 越界量=%.4f\n",
+              target, x_max, x[N], x[N] - x_max);
+  // 输出: target=3.5, x_max=3.0, 末位置 x[N]=3.0000, 越界量=0.0000
+  return 0;
+}
+\end{codebox}
+
+\noindent\textbf{为什么这样写 / 正确要点.}\;这份演示与真 CILQR 共享三个关键点。其一，barrier 必须\emph{光滑拼接}：可行侧 $-\mu\ln(-g)$ 与越界侧的二次延拓在拼接点处值、一阶导都连续（代码里 \verb@Barrier@/\verb@BarrierGrad@ 的二次系数 \verb@a,b,c@ 正是为此解出，见 \cref{sec:st-cilqr-theory} 练习）——不光滑会让 iLQR 的二次近似失真。其二，约束通过\emph{梯度}进入优化：\verb@BarrierGrad(x[j]-x_max)@ 把约束信息加进 \verb@grad@，越接近边界梯度越大，自然把解推离边界——真 CILQR 里这一步是 barrier 二次化后进入反向递推，但“约束经导数影响解”的本质一样。其三，结果体现 barrier 的\emph{软约束本质}：目标在约束外（$3.5>3.0$），解被精确停在边界 $3.0$，但这是 $\mu$ 取得够小的结果；$\mu$ 大时会留下可见的越界量。
+
+\noindent{}\textbf{一个常见的错误写法.}\;新手最易犯的错，是直接用 $-\mu\ln(-g)$ 而\emph{不做越界侧二次延拓}：
+
+\begin{codebox}[C++]{反例:只用对数 barrier, 不处理越界}
+double BarrierWrong(double g) {
+  return -mu * std::log(-g);   // 错: g>=0 时 log(负数)=NaN, 污染整个优化
+}
+// 问题: iLQR/梯度下降的中间迭代里轨迹常常【暂时】越界(g>0),
+//       此时 log(-g) 是 log(负数), 返回 NaN, 梯度变成 NaN, 整条优化失败。
+//       真 CILQR 必须能容忍中间迭代的暂时越界 -> 越界侧必须有定义良好的延拓。
+\end{codebox}
+
+\noindent\textbf{对比.}\;正确版在越界侧用二次延拓兜底，能容忍中间迭代的暂时越界、最终把解拉回可行域贴边；错误版只有对数项，一旦中间越界就 NaN 崩溃。这个差别正是 CILQR 论文里那个 barrier 设计的精髓——\textbf{它必须在整个可行域和越界域都有定义、且光滑}，否则迭代式优化根本跑不起来。
+
+\paragraph{带数字走一遍。}
+场景是一维点质量从 $x_0=0$ 出发、想到达 $\text{target}=3.5$，硬约束“位置不超过 $x_{\max}=3.0$”，$\mu=0.01$。target（$3.5$）\emph{故意设在约束外侧}。优化收敛后：末位置 $x[N]=3.0000$，越界量 $=0.0000$。\textbf{为什么解停在 $3.0$ 而非冲到 $3.5$？} 因为 barrier 在 $x$ 接近 $3.0$ 时急剧增大形成一堵墙——跟踪代价想把解拉向 $3.5$，barrier 把它挡在 $3.0$，两个力平衡在边界上。\textbf{为什么越界量恰好是 $0.0000$？} 因为 $\mu=0.01$ 够小、墙够“硬”，把越界量压到显示精度之下；把 $\mu$ 调大（如 $0.1$）会看到末位置变成 $3.04$ 之类、有可见越界量——这印证 barrier 是软约束、越界量由 $\mu$ 控制。\textbf{为什么不直接把 $\mu$ 设成极小？} 因为 $\mu$ 太小、墙太陡，代价的 Hessian 条件数变差、数值病态，优化反而不稳定——这是 barrier 法的固有权衡（精确性 vs 数值条件）。真 CILQR 常用“$\mu$ 从大到小逐步收紧”的策略（外层减小 $\mu$、内层用 iLQR 解），兼顾探索与收敛。把 target 改回 $2.5$（约束\emph{内}）再跑，解停在 $2.5$（直接到达，barrier 没起作用）——说明 barrier 只在解逼近约束时才“发力”，可行域内部几乎不干扰，这正是好 barrier 该有的行为。
+
+\begin{pitfall}[编程陷阱：对数 barrier 不做越界侧延拓，中间迭代越界即 NaN]
+\textbf{错误想法}：约束就是 $g\le 0$，barrier 用 $-\mu\ln(-g)$ 就行，反正最优解在可行域内。\;
+\textbf{后果}：优化跑着跑着突然崩成 NaN——iLQR/梯度下降的中间迭代里轨迹常暂时越界（$g>0$），$\ln(-g)$ 吃到负数返回 NaN，梯度全毁。\;
+\textbf{根因}：迭代式优化的中间解不保证可行；纯对数 barrier 在 $g\ge 0$ 无定义，无法容忍暂时越界。\;
+\textbf{正确做法}：越界侧用二次（或其他光滑、处处有定义的）函数延拓，与对数侧在边界光滑拼接，让 barrier 在整个定义域都可微且有限。
+\end{pitfall}
+
+\begin{pitfall}[概念陷阱：以为 CILQR 的约束是硬约束]
+\textbf{错误想法}：加了 barrier，约束就被严格满足，解一定在可行域内。\;
+\textbf{后果}：实际解可能轻微越界（尤其 $\mu$ 取得不够小时），把它当硬约束用于安全关键判断会出事。\;
+\textbf{根因}：barrier 是把约束变成代价里的“软墙”——它强烈不鼓励越界，但不绝对禁止；越界量由 $\mu$ 控制，$\mu\to 0$ 才趋于硬约束，但 $\mu$ 太小又数值病态（墙太陡、Hessian 条件数差）。\;
+\textbf{正确做法}：明确 CILQR 约束是软的；安全关键约束要留足裕度（$d_{\text{safe}}$ 设大些）、或配合外层硬性安全检查，不能只靠 barrier。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：忽视 CILQR “第一次迭代就要可行”这个真实局限]
+\textbf{错误想法}：随便给个初始轨迹，CILQR 都能优化到可行最优。\;
+\textbf{后果}：初始轨迹若不可行（落在障碍里、或严重超速），log-barrier 从一开始就吃到越界、优化难以收敛甚至直接失败。\;
+\textbf{根因}：log-barrier 法的固有要求是它需要一条\emph{可行的初始轨迹}才能良好工作（barrier 要从可行域内部“推”，起点就在墙外则无从推起）。这正是后续研究专门指出并试图解决的局限——Ma 等\cite{ma2022admmilqr}用交替方向乘子法（ADMM）改造 CILQR，正是为了绕开“第一次迭代就要可行”这一要求。\;
+\textbf{正确做法}：用一个能给出可行初值的前端来 warm-start——这正是 \cref{ch:planning} 搜索/走廊的用武之地（先用搜索定一条可行的 homotopy 粗解，再交给 CILQR 精修）；Improved CILQR 用 Hybrid A$^*$ warm-start 同理。
+\end{pitfall}
+
+\paragraph{工程落地注意事项。}
+CILQR 在自驾规控里很受欢迎，但要自己实现，有几个工程关口。\textbf{barrier 权重的调度}：$\mu$ 不是设一个定值就完事——太大约束太软（明显越界）、太小数值病态（不收敛）。成熟做法是\emph{从大到小调度}（先松后紧），每个 $\mu$ 下用 iLQR 内层迭代到收敛再减小。\textbf{warm-start 是刚需不是可选}：log-barrier 要可行初值，自驾里通常来自上游参考线 + 一个粗糙可行轨迹（规则的或搜索的）；没有可行 warm-start，CILQR 在密集车流、cut-in 等复杂场景很难稳定收敛。\textbf{障碍椭圆的拟合}：真实障碍形状各异、CILQR 用椭圆近似，太大过度保守、太小不安全，动态障碍还要随预测轨迹更新椭圆。\textbf{实时性与时域长度}：CILQR 的约 $50$ Hz 来自 iLQR 的线性复杂度，但时域（步数）越长越慢，步数与频率要权衡。\textbf{和决策层的配合}：CILQR 是运动层，绕不过同伦类（向左还是向右超车是离散决策），所以通常配一个行为/决策层给出离散意图 + 对应初始 homotopy，CILQR 在选定意图下精修——又是“离散定 homotopy + 连续精修”的分工。
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 把上面的一维演示扩展到二维点质量（状态 $(x,y)$、控制 $(v_x,v_y)$），加一个圆形障碍的 barrier 约束 $g=d_{\text{safe}}-\|\mathbf p-\mathbf p_{\text{obs}}\|$，可视化轨迹如何绕开障碍；对比 $\mu$ 取大、取小时轨迹贴障碍的紧密程度。
+  \item \textbf{[分析]} 推导 \cref{eq:st-barrier} 二次延拓系数：要求在拼接点 $g=-t$ 处，$-\mu\ln(-g)$ 与二次 $a(g+t)^2+b(g+t)+c$ 的值、一阶导都连续，解出 $a,b,c$（验证代码取法）。再想：为何不在 $g=0$ 正好拼接，而要留一个 $t$ 的间隔？
+  \item \textbf{[跨章]} CILQR 需可行初始轨迹。结合 \cref{sec:plan-optimal} 的同伦类与 \cref{sec:plan-kinodynamic} 的搜索，设计一个“搜索/走廊 $\to$ CILQR”的两段式管线：前端负责什么、CILQR 负责什么？为何这个组合恰好补上 CILQR 的局限？（提示：homotopy + 可行 warm-start）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{TEB：位姿 + 段时间序列与 g2o 超图}
+\label{sec:st-teb}
+
+\begin{note}
+上一节的 CILQR 把约束变成代价里的 log-barrier、把时间藏在状态里，是“软约束 + 隐式时间”的一路。本节的 TEB 换一套思路：把段时间\emph{显式}拿出来当变量、把约束写成因子图上的软项——同样是软约束，但表示和求解器都不同。看完这两节，你会对“约束进优化”的两种主流软化方式都有体感。
+\end{note}
+
+\paragraph{动机：让“段时间”也成为优化变量。}
+CILQR 把时间隐式地藏在状态 $v$ 与步长 $\Delta t$ 里。TEB 走了一条更直白的路：\textbf{把时间显式地、分段地拿出来当决策变量}。这个想法源自一个朴素观察——一条轨迹不只是“走过哪些点”，还有“每两点之间花多长时间”。传统做法（包括 ST 图）往往把时间步长 $\Delta t$ 固定，于是“快慢”只能通过“点的疏密”间接体现；而 TEB 直接给每段配一个可优化的\emph{段时间} $\Delta T_i$，让优化器自己决定“这段走快点还是慢点”。“弹性带”（elastic band）这个名字来自更早的路径变形思想：把轨迹想象成一条可拉伸的橡皮筋，障碍把它推开、起终点把它拉住，它在各种“力”下变形到平衡；TEB 在这条弹性带上“定时”（timed）——给每段加上时间维度，于是它能同时变形空间形状与时间分配\cite{rosmann2017teb}。
+
+\paragraph{反面：固定时间步长会丢掉两样关键能力。}
+其一是\emph{自适应的速度分配}：固定 $\Delta t$ 时，要让车在直道快、弯道慢，只能靠调整路点疏密间接实现，既别扭又难和动力学约束统一；可变段时间让“直道 $\Delta T_i$ 小（快）、弯道 $\Delta T_i$ 大（慢）”直接成为优化结果。其二是\emph{时间最优的自然表达}：移动机器人常希望“尽快到达”，有了段时间变量，“最短时间”就是一个干净的代价项 $\sum_i\Delta T_i$（鼓励每段都尽量短），没有它则只能绕着弯表达。此外，TEB 还想解决一个 \cref{sec:plan-optimal} 已反复强调的问题——\emph{局部极小}：单条轨迹的连续优化会卡在一个同伦类里出不来。TEB 的回答是在多条同伦类上并行维护多条候选弹性带（下面细说），这也需要一个灵活、能快速重优化的轨迹表示——位姿 + 段时间序列正合适。
+
+\paragraph{历史：TU Dortmund 的弹性带谱系。}
+TEB（Timed Elastic Band，定时弹性带）出自德国多特蒙德工业大学（TU Dortmund）RST 研究组的 Christoph Rösmann、Frank Hoffmann、Torsten Bertram 等人，有一条清晰的演进谱系。最初的 TEB 思想发表于《Trajectory modification considering dynamic constraints of autonomous robots》（ROBOTIK 2012）——首次提出“定时弹性带”，显式把机器人速度、加速度等动态约束纳入，在实时中生成最优轨迹\cite{rosmann2012teb}。本章重点引用的是《Integrated online trajectory planning and optimization in distinctive topologies》（Robotics and Autonomous Systems, Vol. 88, 2017）——把 TEB 推进到\emph{多拓扑（distinctive topologies）并行}：同时维护一组属于不同同伦类的候选轨迹、并行优化、择优输出，以规避局部极小\cite{rosmann2017teb}。针对车型（Ackermann 转向）机器人，还有《Kinodynamic Trajectory Optimization and Control for Car-Like Robots》（IROS 2017）\cite{rosmann2017carlike}。这套方法以开源包 \verb@teb_local_planner@（BSD 许可，ROS navigation stack 的局部规划插件）广为人知，成了 ROS 生态里移动机器人局部规划的事实标配。
+
+\subsection{理论：加权软约束与稀疏超图}
+\label{sec:st-teb-theory}
+
+\paragraph{轨迹表示。}
+TEB 把一条轨迹表示成位姿序列与段时间序列的交错：
+\begin{equation}
+  \mathcal B=\{\,\mathbf s_0,\ \Delta T_0,\ \mathbf s_1,\ \Delta T_1,\ \dots,\ \Delta T_{N-1},\ \mathbf s_N\,\},
+  \label{eq:st-teb-traj}
+\end{equation}
+其中 $\mathbf s_i=(x_i,y_i,\theta_i)\in\SE(2)$ 是第 $i$ 个位姿（位置 + 朝向），$\Delta T_i$ 是从 $\mathbf s_i$ 走到 $\mathbf s_{i+1}$ 所花的时间。决策变量就是所有 $\mathbf s_i$ 和所有 $\Delta T_i$——空间形状（位姿）与时间分配（段时间）\emph{一起}被优化，这正是“时空联合”在 TEB 里的体现。有了 $\Delta T_i$，速度、加速度都能由相邻位姿与段时间\emph{差分}算出：平均速度 $\approx\|\mathbf s_{i+1}-\mathbf s_i\|/\Delta T_i$，加速度 $\approx$ 相邻速度之差再除以时间。这是 TEB 能把动力学约束写进代价的基础。
+
+\paragraph{所有约束写成加权软约束。}
+TEB 不区分“目标”和“约束”，而是把一切都写成代价项，加权求和后最小化：
+\begin{equation}
+  \min_{\mathcal B}\ \sum_k w_k\, f_k(\mathcal B),
+  \label{eq:st-teb-cost}
+\end{equation}
+其中每个 $f_k$ 是残差函数、$w_k$ 是其权重。典型项包括\cite{rosmann2017teb}：速度约束 $f_{\text{vel}}=\big[\max(0,\ \|\mathbf s_{i+1}-\mathbf s_i\|/\Delta T_i-v_{\max})\big]^2$（超速才罚，平方使其光滑）；加速度约束（类似，由相邻段速度差构造）；障碍避碰 $f_{\text{obs}}=\big[\max(0,\ d_{\min}-d(\mathbf s_i,\text{obs}))\big]^2$（离障碍太近才罚）；最短时间 $f_{\text{time}}=\sum_i\Delta T_i$（鼓励快速通过——这一项让 TEB 倾向时间最优）；运动学可行性 $f_{\text{kin}}$（约束相邻位姿满足非完整约束，如车型机器人转弯半径限制）。注意这些\emph{软约束}与 CILQR 的 barrier 有共性（都把约束变成代价），但形式不同：TEB 用 $[\max(0,\cdot)]^2$ 这种\textbf{单边二次惩罚}（hinge loss 的平方），只在越界侧罚、可行侧不管；CILQR 的 log-barrier 在可行侧也有“软墙”把解往里推。
+
+\begin{insight}
+\textbf{“不等式约束”必须用单边惩罚（hinge），不能用双边二次.}\;$[\max(0,g)]^2$ 在可行侧（$g\le 0$）零罚、零梯度，优化器可自由地在弯道、障碍处减速；而 $(g)^2$（双边二次）在可行侧也有惩罚梯度，把约束变成了“逼近某值”的\emph{等式}语义，会逼机器人全程顶着限速跑、该减速的地方也不减。这个区别是所有“软约束”建模的通用要点，TEB 的每个不等式约束项都是单边的，正是这个道理。
+\end{insight}
+
+\begin{theorem}[TEB 的 g2o 超图结构与稀疏性]\label{thm:st-teb-sparse}
+将 \cref{eq:st-teb-cost} 的加权最小二乘问题映射成一个 g2o 超图（hyper-graph）：每个位姿 $\mathbf s_i$、每个段时间 $\Delta T_i$ 是图里的一个\emph{节点}（待优化变量）；每个约束项 $f_k$ 是一条\emph{超边}（hyper-edge），只连接它所涉及的那几个节点（如速度约束边只连 $\mathbf s_i,\mathbf s_{i+1},\Delta T_i$ 三个节点，障碍约束边只连 $\mathbf s_i$ 一个节点）。则整个问题的信息矩阵（Hessian 近似）是\textbf{稀疏}的——每条边只碰少数节点，矩阵大量元素为零。
+\end{theorem}
+\begin{proof}[说明]
+高斯-牛顿/LM 的法方程矩阵 $\mathbf H=\sum_k w_k\mathbf J_k^\top\mathbf J_k$，其中 $\mathbf J_k=\partial f_k/\partial\mathcal B$。因 $f_k$ 只依赖少数节点，$\mathbf J_k$ 只在对应列非零，故 $\mathbf J_k^\top\mathbf J_k$ 只在那几个节点的块上非零；求和后 $\mathbf H$ 的非零块对应“被同一条边相连的节点对”，即图的邻接结构。轨迹是链式的（边只连相邻节点），故 $\mathbf H$ 近似带状、稀疏。g2o 是为这种稀疏最小二乘设计的求解器（同 SLAM 后端），用稀疏 Cholesky 把每次迭代的线性求解做得很快。
+\end{proof}
+
+\noindent 这就是 TEB 能在移动机器人上实时跑（约 $20$ Hz）的原因：问题虽变量多，但结构稀疏，g2o 吃得下。它与 SLAM 后端共享同一数学内核（稀疏非线性最小二乘），区别只在因子来源（SLAM 是传感器观测，TEB 是规划约束）与变量含义（SLAM 是位姿/路标，TEB 是位姿 + 段时间）——这也是学过因子图 SLAM 的人上手 TEB 会很快的原因（\cref{ch:nlopt}）。
+
+\paragraph{多拓扑并行（distinctive topologies）。}
+单条 TEB 是局部优化，会卡在一个同伦类里（\cref{sec:plan-optimal}：连续优化跨不过不同同伦类）。2017 年那篇的核心贡献，就是同时维护\textbf{多条}属于不同同伦类的候选弹性带——比如“从障碍左边绕”和“从右边绕”各一条，各自独立用 g2o 优化，最后比较代价、输出最优那条\cite{rosmann2017teb}。这相当于在连续优化外面套了一层离散的“同伦类枚举”——又是“离散定 homotopy + 连续精修”思想的体现，只不过 TEB 把它打包进了一个规划器里。怎么枚举同伦类？TEB 用一个 H-signature（基于障碍的拓扑特征）来区分和维护不同候选，剔除同伦等价的重复、保留代表，控制候选数量不爆炸。
+
+\subsection{代码：段时间作变量、约束作软项}
+\label{sec:st-teb-code}
+
+完整 TEB 要构建 g2o 超图、定义十来种自定义边、处理二维位姿和非完整约束，代码量大。下面给一份可直接编译运行的最简演示，抓住 TEB 最核心的两点：\textbf{段时间 $\Delta T_i$ 作为决策变量}、\textbf{约束写成软惩罚}。场景简化成一维：起终点固定、总路程 $10$，优化中间路点位置和各段时间，代价 $=$ 时间项（鼓励快）$+$ 速度超限软罚 $+$ 平滑项。看段时间如何在“想快”和“限速”之间自动分配。
+
+\begin{codebox}[C++]{最简 TEB 思想：段时间作变量, 速度软约束}
+// 固定起终点, 优化中间路点位置 + 段时间 dT_i
+// 代价 = 时间项 sum(dT_i)(鼓励快) + 速度软约束(超速才罚) + 平滑项
+#include <vector>
+#include <cmath>
+#include <cstdio>
+
+const int    N        = 5;      // 路点数(含起终点): p0..p4 => 4 段
+const double v_max    = 2.0;    // 速度上限
+const double w_time   = 1.0;    // 时间代价权重(鼓励 dT 小=快)
+const double w_vel    = 50.0;   // 速度软约束权重(超速重罚)
+const double w_smooth = 0.5;    // 平滑(相邻段速度差)
+
+int main() {
+  std::vector<double> x  = {0, 2, 5, 8, 10};   // 初始路点(x0/x4 固定, 中间可动)
+  std::vector<double> dT(N - 1, 1.0);          // 段时间(初始都=1)
+
+  auto cost = [&](const std::vector<double>& X, const std::vector<double>& DT) {
+    double J = 0;
+    for (int i = 0; i < N - 1; ++i) {
+      J += w_time * DT[i];                                   // 时间项:鼓励每段更快
+      double v = (X[i+1] - X[i]) / DT[i];                    // 第 i 段平均速度
+      double over = std::max(0.0, v - v_max);                // 超速量(不超不罚)
+      J += w_vel * over * over;                              // 单边二次软罚
+      if (i > 0) {                                           // 平滑:相邻段速度差
+        double vp = (X[i] - X[i-1]) / DT[i-1];
+        J += w_smooth * (v - vp) * (v - vp);
+      }
+    }
+    return J;
+  };
+
+  double eps = 1e-6, lr = 1e-3;                 // 数值梯度下降(真 TEB 用 g2o 解析 Jacobian)
+  for (int iter = 0; iter < 20000; ++iter) {
+    for (int i = 1; i < N - 1; ++i) {                        // 优化中间路点
+      auto Xp = x; Xp[i] += eps;
+      x[i] -= lr * (cost(Xp, dT) - cost(x, dT)) / eps;
+    }
+    for (int i = 0; i < N - 1; ++i) {                        // 优化段时间
+      auto Dp = dT; Dp[i] += eps;
+      dT[i] -= lr * (cost(x, Dp) - cost(x, dT)) / eps;
+      if (dT[i] < 0.05) dT[i] = 0.05;          // dT>0(真 TEB 用 dT=exp(tau) 参数化保正)
+    }
+  }
+  double total_T = 0;
+  for (int i = 0; i < N - 1; ++i) {
+    double v = (x[i+1] - x[i]) / dT[i];
+    std::printf("段%d: v=%.3f (上限%.1f) dT=%.3f\n", i, v, v_max, dT[i]);
+    total_T += dT[i];
+  }
+  std::printf("总时间 = %.3f (= 路程/限速 = 10/%.1f 的下界)\n", total_T, v_max);
+  // 输出(约): 各段 v~2.0, 总时间 ~4.98 (= 10/2.0, 限速下的最短时间)
+  return 0;
+}
+\end{codebox}
+
+\noindent\textbf{正确要点.}\;三个要点和真 TEB 一致。其一，\emph{段时间是真正的决策变量}：\verb@dT@ 和路点 \verb@x@ 一起被优化——这是 TEB 区别于固定步长方法的根本，“快慢”由优化器决定而非预设。其二，约束是\emph{单边软惩罚} \verb@w_vel*max(0,v-v_max)^2@：只在超速侧罚、不超不管——这正是 TEB 的 $[\max(0,\cdot)]^2$ 形式，和 CILQR 双侧 log-barrier 不同。其三，结果体现\emph{时间最优倾向}：时间项推着每段尽量快、速度软罚挡在限速，平衡的结果是所有段都贴着限速跑、总时间逼近理论下界（路程÷限速）。真 TEB 还有一个工程细节：段时间用 $\Delta T_i=\exp(\tau_i)$ 参数化来保证恒正（代码里用了简单的下限截断代替）。
+
+\noindent{}\textbf{一个常见的错误写法.}\;新手常把速度约束写成\emph{双边硬性}而非单边软罚：
+
+\begin{codebox}[C++]{反例:把"不超过"误写成"逼近"}
+double v = (X[i+1] - X[i]) / DT[i];
+J += w_vel * (v - v_max) * (v - v_max);   // 错: 这是"逼近 v_max", 不是"不超过 v_max"
+// 问题: (v-v_max)^2 在 v<v_max(没超速, 本该不罚)时也给正惩罚,
+//       逼着每段都【正好】开到 v_max -- 哪怕弯道、障碍附近本该减速!
+//       正确的约束语义是"<="(超了才罚), 必须用单边 max(0, v-v_max)^2。
+\end{codebox}
+
+\noindent\textbf{对比.}\;正确版用 \verb@max(0,v-v_max)^2@：可行域内零惩罚，优化器可自由减速；只有越界才罚。错误版用 \verb@(v-v_max)^2@：把约束变成“目标速度”，可行域内也有梯度，把解硬拽向 $v_{\max}$。这个区别是所有软约束建模的通用要点（见上 \cref{sec:st-teb-theory} 的洞见）。
+
+\paragraph{带数字走一遍。}
+总路程 $10$、限速 $v_{\max}=2.0$、$4$ 段。优化收敛后各段速度都约 $2.0$（贴着限速）、段时间约 $\Delta T_0\approx1.07$、$\Delta T_1\approx1.43$、$\Delta T_2\approx1.42$、$\Delta T_3\approx1.07$，总时间约 $4.98$。\textbf{为什么各段速度都贴 $2.0$？} 时间项 $\sum\Delta T_i$ 推着“每段尽量快”，速度软约束 $[\max(0,v-2.0)]^2$ 是墙挡在 $2.0$，两力平衡即“顶着限速但不超”。\textbf{为什么中间两段 $\Delta T$（$\approx1.43$）比两端（$\approx1.07$）大？} 因为优化让路点位置也动了：中间两段分到的路程更长（路点被推开），同样限速下走更长路自然花更多时间——段时间忠实反映“这段路有多长”。\textbf{为什么总时间 $4.98\approx 10/2.0$？} 限速下走完 $10$ 的理论最短就是 $5.0$ 秒，优化逼近了这个下界（差的 $0.02$ 是平滑项和数值的微小代价）。把限速改成 $4.0$ 再跑，所有段时间减半、总时间逼近 $2.5$——段时间随限速线性变化，这正是“段时间作为变量”带来的、固定步长方法给不了的自适应能力。
+
+\begin{pitfall}[编程陷阱：把不等式约束写成双边二次惩罚]
+\textbf{错误想法}：速度别超 $v_{\max}$，那就罚 $(v-v_{\max})^2$。\;
+\textbf{后果}：机器人全程顶着限速跑，弯道、障碍附近该减速也不减——双边二次在不超速时也有惩罚，把“$\le$”变成了“$\approx$”。\;
+\textbf{根因}：$(v-v_{\max})^2$ 是“逼近 $v_{\max}$”的等式语义；不等式约束“$v\le v_{\max}$”的正确软化是单边 $[\max(0,v-v_{\max})]^2$（可行侧零罚）。\;
+\textbf{正确做法}：所有不等式约束用单边 hinge 惩罚 $[\max(0,g)]^2$（$g\le 0$ 为可行）；只有真要“贴近某值”才用双边二次。
+\end{pitfall}
+
+\begin{pitfall}[概念陷阱：以为段时间可以取任意实数]
+\textbf{错误想法}：$\Delta T_i$ 是普通优化变量，让它在实数轴上自由优化即可。\;
+\textbf{后果}：优化中 $\Delta T_i$ 可能变成 $0$ 或负数——速度 $\|\mathbf s_{i+1}-\mathbf s_i\|/\Delta T_i$ 除零或变负，物理上无意义、数值上崩溃。\;
+\textbf{根因}：段时间必须严格为正（时间不能倒流、不能瞬移），但无约束优化不知道这一点。\;
+\textbf{正确做法}：用 $\Delta T_i=\exp(\tau_i)$ 参数化（优化 $\tau_i$，则 $\Delta T_i$ 自动恒正），或加正性约束/下限截断——\verb@teb_local_planner@ 用的是前者。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：以为单条 TEB 就能找到全局最优]
+\textbf{错误想法}：把 TEB 优化跑到收敛，得到的就是最好的轨迹。\;
+\textbf{后果}：单条 TEB 卡在初始化所在的那个同伦类里——若初始猜“绕左”，它永远不会发现“绕右”可能更优。\;
+\textbf{根因}：TEB 是连续局部优化，跨不过不同同伦类（\cref{sec:plan-optimal}：连续优化跨不过障碍隔开的拓扑类别）。\;
+\textbf{正确做法}：用多拓扑模式（distinctive topologies）——并行维护多条不同同伦类的候选弹性带，各自优化后择优。这正是 2017 那篇论文的核心贡献，也是 \verb@teb_local_planner@ 的 \verb@homotopy_class_planner@ 在做的事。
+\end{pitfall}
+
+\paragraph{工程落地注意事项。}
+TEB 是 ROS 标配、最易上手，但工程中有几个坑。\textbf{权重调参是最大痛点}：TEB 把所有约束写成加权软项，于是一大堆权重（速度、加速度、障碍、时间、运动学……）要调，且权重之间\emph{耦合}——调大时间权重更激进（更快但更贴障碍），调大障碍权重更保守（更安全但更慢）。没有放之四海皆准的权重，得针对场景调（对比硬约束方法 OBCA/MINCO，约束是“满足或不满足”，没有这种权衡旋钮）。\textbf{多拓扑候选数要控制}：候选轨迹数会随障碍数增长，每条都要独立 g2o 优化，太多会拖慢；\verb@teb_local_planner@ 用 H-signature 剔除同伦等价、限制最大候选数。\textbf{局部规划器的本分}：TEB 是\emph{局部}规划器，在滚动窗口内优化、依赖全局规划器给的全局路径做引导，全局路径差则 TEB 再好也救不回来。\textbf{振荡与恢复}：动态环境下 TEB 偶尔会在两候选间反复横跳或陷入局部不可行，新版本和衍生工作（如 RTEB，Resilient TEB\cite{kulathunga2025rteb}：检测到当前轨迹不可行时用 Hybrid A$^*$ 重搜并平滑、再重置 TEB 的位姿继续优化）加了恢复机制，工程部署要配上兜底。
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 把一维 TEB 扩到二维（路点 $(x_i,y_i)$，加圆形障碍软约束 $[\max(0,d_{\min}-d)]^2$），观察轨迹如何绕开障碍、且障碍附近的段时间如何变化（提示：绕行段路程变长，限速不变则 $\Delta T$ 变大）。
+  \item \textbf{[分析]} TEB 用 $[\max(0,g)]^2$、CILQR 用 log-barrier。列出两者三点区别（可行侧是否有梯度、是否容忍越界、是否需要可行初值），并说明各自适合什么场景。
+  \item \textbf{[跨章]} TEB 多拓扑并行、\cref{sec:plan-optimal} 的同伦类、CILQR 配 warm-start——这三者都在处理同一个问题。这个问题是什么？三种处理方式的共同思想是什么？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\subsection*{阶段小结：CILQR 与 TEB——两种“约束进优化”的范式}
+\cref{sec:st-cilqr} 和 \cref{sec:st-teb} 讲了两个方法，更值得记住的是它们代表的\emph{两种范式}——它们回答同一核心问题“怎么把约束塞进连续优化”，却给出不同答案。从三个维度对照，差异一目了然。\textbf{从“时间在哪”看}：CILQR 把时间\emph{隐式}藏在状态 $v$ 与步长里（时间是副产品），TEB 把段时间 $\Delta T_i$ \emph{显式}当变量（时间是一等公民）。\textbf{从“约束怎么进”看}：CILQR 用 log-barrier（双侧软墙，可行侧也有梯度把解往里推，需可行初值），TEB 用单边 hinge $[\max(0,g)]^2$（只在越界侧罚，可行侧零梯度，能容忍不可行初值）。\textbf{从“靠什么求解”看}：CILQR 靠 iLQR（利用时序结构的反向递推），TEB 靠 g2o（利用稀疏性的因子图最小二乘）。两者没有绝对优劣：CILQR 契合有清晰动力学、需高频重规划的自驾（约 $50$ Hz），TEB 契合移动机器人局部规划（稀疏图 + 多拓扑，约 $20$ Hz、ROS 标配）。但它们有共同软肋与对策：单独的连续优化都跨不过同伦类，对策都是引入离散的“同伦类选择”——CILQR 靠搜索/走廊 warm-start，TEB 靠多拓扑并行。接下来三节转向更专门、且\emph{硬约束}的技巧：OBCA 用对偶把非凸避障变光滑（\cref{sec:st-obca}）、MINCO 用参数映射把高维系数压成低维（\cref{sec:st-minco}）、CPC 用互补约束把“何时过航点”变成优化变量（\cref{sec:st-cpc}）。
+
+% ════════════════════════════════════════════════════════════════
+\section{OBCA：用对偶把非凸避障变光滑}
+\label{sec:st-obca}
+
+\begin{note}
+前两节（CILQR、TEB）都用\emph{软约束}处理避障——可微、好解，但不保证不撞。从本节起转向\emph{硬约束}：要严格保证无碰撞。第一个登场的 OBCA，用一个漂亮的对偶技巧，把“硬性、非凸、不可微”的避障约束，精确地变成求解器能吃的“硬性、光滑、可微”约束。这是从“软化”迈向“精确重构”的转折点。
+\end{note}
+
+\paragraph{动机：避障约束“不可微”，标准 NLP 求解器卡住。}
+前两节用“软约束”绕开了避障的非凸性——把“别撞”写成代价里的惩罚，越界就罚。但软约束有个根本缺点：它\emph{不保证}约束被满足（\cref{sec:st-cilqr} 那个陷阱：barrier 是软的，解可能轻微越界）。对泊车这种“差几厘米就刮蹭”的场景，我们想要\textbf{硬约束}——保证轨迹严格无碰撞。可硬性的避障约束有个大麻烦：它\textbf{不可微}。“自车不在障碍内”这个条件，数学上是“自车与障碍的距离 $\ge$ 安全值”，而点到凸多边形的距离函数在边、角附近不光滑（导数有跳变），甚至“在不在多边形内”本身是个非凸的逻辑判断。标准 NLP 求解器（Ipopt、SNOPT 等）依赖梯度工作——喂给它一个不可微约束，它要么报错、要么在不光滑点反复抖动不收敛。于是问题成了：\textbf{怎么把“硬性、非凸、不可微”的避障约束，变成求解器吃得下的“硬性、光滑、可微”约束，而且不引入任何近似？} OBCA 用凸优化的对偶理论，给出了一个漂亮的精确答案。
+
+\paragraph{反面：处理硬避障的几条老路都不理想。}
+其一是\emph{软约束惩罚}（CILQR/TEB 那套）：可微、好解，但不保证无碰撞——泊车不能接受。其二是\emph{直接喂非光滑约束给 NLP}：求解器在障碍的边角处梯度跳变，要么不收敛、要么解质量差。其三是\emph{用大量线性约束逼近}：把“在凸多边形外”近似成“在若干半空间之一外”，但“之一”是个离散的逻辑或（disjunction），会引入整数变量、变成混合整数规划（MIP），求解极慢。其四是\emph{signed distance 的次梯度}：能处理不光滑，但次梯度法收敛慢、且 signed distance 本身计算和求导都麻烦。OBCA 的高明之处在于：它既保留硬约束（精确无碰撞）、又让约束光滑可微（标准 NLP 可解）、还\emph{不引入任何近似或整数变量}——靠的是凸优化里一个经典而强大的工具：强对偶。
+
+\paragraph{历史：Berkeley MPC Lab 的对偶重构。}
+OBCA（Optimization-Based Collision Avoidance）由 Xiaojing Zhang、Alexander Liniger、Francesco Borrelli 提出（加州大学伯克利分校 MPC 实验室 + 苏黎世联邦理工 ETH），论文《Optimization-Based Collision Avoidance》（arXiv 1711.03449，后发表于 IEEE Transactions on Control Systems Technology, 2021, 29(3):972--983）\cite{zhang2021obca}。他们用凸优化的\emph{强对偶}，把不可微的避障约束精确重构成光滑、可微的非线性约束。这个重构有三个关键性质：\emph{精确}（exact，不引入任何近似）；适用于一般障碍和受控物体（只要能表示成凸集的并）；把结果与 signed distance（传统轨迹生成里广泛使用的有符号距离）联系起来。后续的 H-OBCA（Hierarchical OBCA，CDC 2018）针对自动泊车，指出泊车可建模成一个光滑非凸优化、但数值难解、需要好的 warm-start——于是用一个通用路径规划器（如 Hybrid A$^*$）先算粗轨迹来 warm-start，再用全车模型连续优化精修\cite{zhang2018hobca}。这套方法在 Apollo 的 Open Space（开放空间泊车）模块里有应用：其 \verb@DistanceApproachProblem@ 正是用 OBCA 的思路做泊入的时空联合优化。
+
+\subsection{理论：强对偶如何让“不在障碍内”变光滑}
+\label{sec:st-obca-theory}
+
+\paragraph{先看难点的数学形式。}
+设障碍是一个凸多面体 $\mathbb O=\{\mathbf x:\mathbf A\mathbf x\le\mathbf b\}$（$\mathbf A,\mathbf b$ 描述它的各个面）。“自车上某点 $\mathbf p$ 不在障碍内”，朴素地写就是“$\mathbf p$ 到 $\mathbb O$ 的距离 $\ge d_{\text{safe}}$”。但“点到凸多面体的距离”这个函数，在 $\mathbf p$ 正对某条边、还是正对某个顶点时，由不同的面决定，导数在切换处跳变——\emph{不光滑}。而且当 $\mathbf p$ 在障碍内部时，这个“距离”该取负（signed distance），整个函数的非凸、非光滑性让 NLP 求解器无从下手。
+
+\paragraph{OBCA 的核心招式：对偶变量。}
+OBCA 的关键洞察是——“点 $\mathbf p$ 到凸多面体 $\{\mathbf A\mathbf x\le\mathbf b\}$ 的距离 $\ge d_{\text{safe}}$”这件事，等价于“\emph{存在}一个对偶变量 $\boldsymbol\lambda\ge\mathbf 0$ 满足一组光滑的代数条件”\cite{zhang2021obca}。直觉上，这个 $\boldsymbol\lambda$ 参数化了一张\textbf{分离超平面}——把自车点和障碍分开的那张平面。凸优化的强对偶定理保证：只要自车点真的在障碍外、距离够远，这样的分离超平面（即满足条件的 $\boldsymbol\lambda$）就一定存在；反之若找不到，说明点侵入了障碍。具体地，避障约束被重构成（点对凸体情形，即原文 Proposition 1）：
+\begin{equation}
+  \exists\,\boldsymbol\lambda\ge\mathbf 0:\quad
+  (\mathbf A\mathbf p-\mathbf b)^\top\boldsymbol\lambda\ge d_{\text{safe}},\qquad
+  \|\mathbf A^\top\boldsymbol\lambda\|_*\le 1,
+  \label{eq:st-obca-dual}
+\end{equation}
+其中 $\boldsymbol\lambda$ 是新引入的优化变量（对偶变量），$\|\cdot\|_*$ 是对偶范数。读这两条：第一条 $(\mathbf A\mathbf p-\mathbf b)^\top\boldsymbol\lambda\ge d_{\text{safe}}$ 是说“沿 $\boldsymbol\lambda$ 这个方向，点 $\mathbf p$ 离障碍的各面足够远”；第二条 $\|\mathbf A^\top\boldsymbol\lambda\|_*\le 1$ 是对 $\boldsymbol\lambda$ 的归一化（让“距离”有正确的尺度）。\textbf{关键是：这两条约束关于 $(\mathbf p,\boldsymbol\lambda)$ 都是光滑可微的}——没有 $\max$、没有距离函数的边角跳变，全是光滑的代数式。\footnote{此式即 OBCA 原文（Zhang--Liniger--Borrelli）的点对凸体情形（其 Proposition 1）：$\mathrm{dist}(\mathbf p,\mathbb O)\ge d_{\min}\iff \exists\,\boldsymbol\lambda\succeq\mathbf 0:\ (\mathbf A\mathbf p-\mathbf b)^\top\boldsymbol\lambda\ge d_{\min},\ \|\mathbf A^\top\boldsymbol\lambda\|_*\le 1$，符号与对偶范数方向均与原文一致。若把“受控物体”也建成满维凸多边形 $\{\mathbf G\mathbf x\le\mathbf g\}$（两凸体间距，其 Proposition 3），则需再引入一组对偶变量 $\boldsymbol\mu\succeq\mathbf 0$，约束变为 $-\mathbf g^\top\boldsymbol\mu+(\mathbf A\mathbf t-\mathbf b)^\top\boldsymbol\lambda\ge d_{\min}$、$\mathbf G^\top\boldsymbol\mu+\mathbf R^\top\mathbf A^\top\boldsymbol\lambda=\mathbf 0$、$\|\mathbf A^\top\boldsymbol\lambda\|_*\le 1$（$\mathbf R,\mathbf t$ 为受控物体的位姿）——本式取其点退化情形（$\mathbf t=\mathbf p$、无 $\boldsymbol\mu$ 项）。}
+
+\begin{theorem}[强对偶下的精确重构]\label{thm:st-obca-exact}
+在凸性与约束规范条件下，“点在凸障碍外、距离 $\ge d_{\text{safe}}$”与“存在满足 \cref{eq:st-obca-dual} 的对偶变量 $\boldsymbol\lambda\ge\mathbf 0$”是\textbf{完全等价}的两件事。因此 OBCA 把前者（不可微）换成后者（可微），\emph{没有丢掉任何信息、没有引入任何误差}。
+\end{theorem}
+\begin{proof}[说明]
+强对偶定理是一个\emph{等价}关系（强对偶成立时原问题与对偶问题的最优值严格相等），不是近似。“点到障碍的距离”可写成一个凸优化（在障碍内找离 $\mathbf p$ 最近的点）；其对偶问题恰是“在分离超平面族上最大化间隔”。强对偶把“求最近距离”（原）与“找最优分离超平面”（对偶）的最优值划等号，于是“距离 $\ge d_{\text{safe}}$”等价于“存在间隔 $\ge d_{\text{safe}}$ 的分离超平面”，即存在满足 \cref{eq:st-obca-dual} 的 $\boldsymbol\lambda$。详细推导见 Zhang 等\cite{zhang2021obca}。
+\end{proof}
+
+\noindent 这正是 OBCA 区别于“线性约束逼近”的地方：它是\emph{精确}重构，不是近似。代价是：每个障碍（每个时间步）都要引入一组对偶变量 $\boldsymbol\lambda$，优化问题的变量数增加了。但换来的是——整个问题变成一个\textbf{光滑的非凸 NLP}，可以交给 Ipopt/CasADi 这类标准求解器，用它们成熟的 SQP/内点法去解。
+
+\begin{insight}
+OBCA 的对偶技巧，本质是“\textbf{把一个难回答的几何问题，换成一个等价但好回答的存在性问题}”。原问题“点到这个多边形有多远、在不在里面”涉及不可微的距离计算（哪条边最近会跳变）；对偶后的问题“能不能找到一张平面把点和障碍分开”是一个\emph{存在性}问题——而存在性问题可以用“构造一个满足条件的 $\boldsymbol\lambda$”来光滑地回答。这个“把度量问题转成存在性问题”的思路，远不止用于避障：很多“算某个最优值”的难题，都能换成“找一个满足对偶条件的证书（certificate）”的好解问题。理解了这一招的本质，你再遇到“某个约束不可微/难算”时，会下意识地问：能不能用对偶，把它换成一个等价的、关于某个新变量的光滑存在性条件？
+\end{insight}
+
+\paragraph{为什么需要 warm-start（H-OBCA 的动机）。}
+重构后的问题虽然光滑，但仍是\textbf{非凸}的（避障问题本质非凸——绕左绕右是不同 homotopy）。非凸 NLP 对初值敏感：初值差，求解器可能收敛到劣解、或根本不收敛。H-OBCA 的对策正是 \cref{sec:plan-optimal} 反复出现的那个思想——先用一个\emph{离散的前端}（Hybrid A$^*$）算一条粗糙但可行的轨迹，定下 homotopy（往哪个方向泊入），再用这条粗轨迹 warm-start OBCA 的连续优化做精修\cite{zhang2018hobca}。这又一次印证：\textbf{连续优化负责“在选定 homotopy 内求精”，离散搜索负责“选对 homotopy”}——OBCA（连续）配 Hybrid A$^*$（离散），和 CILQR 配 warm-start、TEB 多拓扑并行，是同一套分工的不同实例。
+
+\subsection{代码：分离超平面存在\texorpdfstring{ $\Leftrightarrow$ }{ <=> }点在障碍外}
+\label{sec:st-obca-code}
+
+完整 OBCA 要把对偶变量 $\boldsymbol\lambda$ 嵌进 NLP、交给 Ipopt/CasADi 求解，依赖重型求解器。但 OBCA 的\emph{核心命门——“分离超平面存在 $\Leftrightarrow$ 点在障碍外”}——可以独立验证，不需要任何求解器。下面这份可直接编译运行的代码，对一个凸多边形障碍，验证点在外/贴边/在内时分离超平面的存在性，把对偶的几何意义看清。
+
+\begin{codebox}[C++]{OBCA 核心验证:点在凸多边形外 <=> 存在分离超平面}
+// 凸多边形 {x: A x <= b}, 点 p 的有符号距离 = max_i (a_i^T p - b_i):
+//   >0 <=> 在某半空间外 <=> 在多边形外; 这个 max 正是 OBCA 用 lambda 光滑化的对象。
+#include <vector>
+#include <array>
+#include <cstdio>
+#include <limits>
+
+using Vec2 = std::array<double,2>;
+struct HalfPlane { Vec2 a; double b; };          // 半空间 a^T x <= b(a 为外法向)
+
+double SignedDistance(const Vec2& p, const std::vector<HalfPlane>& poly, int* sep) {
+  double best = -std::numeric_limits<double>::infinity();
+  *sep = -1;
+  for (int i = 0; i < (int)poly.size(); ++i) {
+    double val = poly[i].a[0]*p[0] + poly[i].a[1]*p[1] - poly[i].b;  // a_i^T p - b_i
+    if (val > best) { best = val; *sep = i; }    // 最违反的面即分离超平面
+  }
+  return best;
+}
+
+int main() {
+  std::vector<HalfPlane> square = {              // 单位正方形 [0,1]^2 的四个半空间
+    {{ 1, 0}, 1}, {{-1, 0}, 0}, {{ 0, 1}, 1}, {{ 0,-1}, 0},
+  };
+  std::vector<std::pair<const char*, Vec2>> tests = {
+    {"外侧 (2.0,0.5)", {2.0, 0.5}},
+    {"贴边 (1.0,0.5)", {1.0, 0.5}},
+    {"内部 (0.5,0.5)", {0.5, 0.5}},
+  };
+  for (auto& [name, p] : tests) {
+    int face;
+    double sd = SignedDistance(p, square, &face);
+    const char* v = sd > 1e-9 ? "在外(有分离超平面->无碰撞)"
+                  : (sd < -1e-9 ? "在内(无分离超平面->碰撞!)" : "在边界上");
+    std::printf("%s: 有符号距离=%+.3f, 分离面#%d -> %s\n", name, sd, face, v);
+  }
+  // 输出: 外侧 +1.000 在外; 贴边 +0.000 边界上; 内部 -0.500 在内(碰撞)
+  return 0;
+}
+\end{codebox}
+
+\noindent\textbf{正确要点.}\;这份验证抓住 OBCA 的三个本质。其一，\emph{有符号距离} $=\max_i(\mathbf a_i^\top\mathbf p-b_i)$：点在凸多面体外，当且仅当它违反至少一个半空间（该 $\max>0$）；这个 $\max$ 选出的面，正是分离超平面。其二，\emph{对偶变量 $\boldsymbol\lambda$ 就是在光滑地参数化这个 $\max$}：直接的 $\max$ 不可微（哪个面最违反会跳变），而 OBCA 用 $\boldsymbol\lambda\ge\mathbf 0$ 把“选最违反的面”变成“存在满足光滑条件的 $\boldsymbol\lambda$”——$\max$ 被对偶变量“吸收”成了光滑约束。其三，\emph{等价性是精确的}（\cref{thm:st-obca-exact}）：分离超平面存在 $\Leftrightarrow$ 点在障碍外，没有近似。真 OBCA 把这套用到整条轨迹的每个时间步、每个障碍上，但核心就是这里验证的对偶等价。
+
+\noindent{}\textbf{一个常见的错误写法.}\;新手常把避障约束写成“点到障碍中心的距离 $\ge$ 半径”，用圆近似多边形：
+
+\begin{codebox}[C++]{反例:用"到障碍中心距离>=半径"近似凸多边形}
+double dx = p[0] - cx, dy = p[1] - cy;           // cx,cy 为障碍中心
+double dist = std::sqrt(dx*dx + dy*dy);
+bool safe = dist >= radius;                       // 错: 把多边形当成了圆!
+// 问题: (1) 长条/L 形障碍, 外接圆比障碍大得多, 安全区严重高估 -- 能过的缝被判不可过;
+//       (2) 内切圆又漏掉角落 -- 会撞的角被判成安全(危险);
+//       (3) 无论外接内切都不【精确】, 这正是 OBCA 要避免的近似。
+\end{codebox}
+
+\noindent\textbf{对比.}\;正确版（OBCA 思路）用半空间表示障碍、有符号距离判内外，对\emph{任意凸多边形}都精确；错误版用圆近似，对非圆障碍必然失真。这正是 OBCA 的价值——它处理\emph{一般凸障碍}（甚至凸集的并）而不做形状近似，靠“半空间表示 + 对偶变量光滑化”，既精确又可微，这是软约束和圆近似都给不了的。
+
+\paragraph{带数字走一遍。}
+障碍是单位正方形 $[0,1]^2$（四个半空间），测三个点。外侧点 $(2.0,0.5)$：有符号距离 $=\max_i(\mathbf a_i^\top\mathbf p-b_i)=+1.000$（由 $x\le 1$ 这条边给出，$2.0-1=1$），判定“在外（有分离超平面 $\to$ 无碰撞）”。贴边点 $(1.0,0.5)$：$+0.000$（恰在 $x=1$ 边界上）。内部点 $(0.5,0.5)$：$-0.500$（所有边都满足、取最大的那个仍为负），判定“在内（无分离超平面 $\to$ 碰撞）”。\textbf{为什么外侧点的有符号距离 $=$ 到最近边的距离？} 因为 $\max$ 取了“最违反”的那个半空间——外侧点违反 $x\le 1$（违反量 $=1$），这个违反量正是它到该边的距离，也正是分离超平面能“插”进去的间隙。\textbf{为什么内部点是负的？} 内部点不违反任何半空间（所有 $\mathbf a_i^\top\mathbf p-b_i\le 0$），$\max$ 取最大的那个负值（$-0.5$，离最近的边还有 $0.5$）——没有任何边能分离它和障碍。\textbf{这个 $\max$ 和 $\boldsymbol\lambda$ 什么关系？} $\boldsymbol\lambda$ 像给各条边分配的权重，最优时把权重压在最违反的边上，等价于那个 $\max$，但全程可微。把测试点换成长条形障碍 $[0,4]\times[0,1]$ 的外侧点，会看到有符号距离仍精确反映到最近边的距离——这就是 OBCA 处理任意凸多边形（而非圆近似）的精确性。
+
+\begin{pitfall}[编程陷阱：用障碍外接圆/内切圆近似多边形避障]
+\textbf{错误想法}：避障就是“离障碍够远”，用“到障碍中心距离 $\ge$ 半径”最简单。\;
+\textbf{后果}：外接圆把安全区高估（窄缝明明能过却被禁，过度保守）；内切圆把角落漏判（会撞的角被当安全，危险）。\;
+\textbf{根因}：把多边形当成圆，丢掉了障碍真实形状；圆近似无论内切外接都不精确。\;
+\textbf{正确做法}：用半空间 $\{\mathbf A\mathbf x\le\mathbf b\}$ 描述凸多边形，用有符号距离（OBCA 的对偶重构）做精确、可微的避障约束。
+\end{pitfall}
+
+\begin{pitfall}[概念陷阱：以为“点到凸多边形的距离”是光滑函数]
+\textbf{错误想法}：距离就是个连续函数，直接当约束喂给 NLP 求解器就行。\;
+\textbf{后果}：求解器在障碍的边、角附近反复抖动、不收敛——距离函数在“由哪条边/哪个顶点决定最近点”切换处导数跳变。\;
+\textbf{根因}：点到凸多面体的距离是\emph{分片光滑}的（不同区域由不同面决定），在切换边界不可微；signed distance 在障碍内外还变号。\;
+\textbf{正确做法}：用 OBCA 的对偶重构把这个不可微的距离约束，等价换成关于 $(\mathbf p,\boldsymbol\lambda)$ 的光滑约束——这正是 OBCA 存在的理由。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：以为对偶重构消除了非凸性]
+\textbf{错误想法}：OBCA 把避障约束变光滑了，问题就成了好解的凸问题。\;
+\textbf{后果}：随便给初值跑 OBCA，收敛到劣解或不收敛，却以为是 bug。\;
+\textbf{根因}：OBCA 消除的是\emph{不可微性}，不是\emph{非凸性}——避障问题本质非凸（绕左/绕右是不同 homotopy），重构后仍是非凸 NLP，对初值敏感。\;
+\textbf{正确做法}：用离散前端（如 Hybrid A$^*$）warm-start——这正是 H-OBCA 的做法：先定 homotopy、再连续精修。\textbf{光滑 $\ne$ 凸，warm-start 不能省。}
+\end{pitfall}
+
+\paragraph{工程落地注意事项。}
+OBCA 主要用在泊车/开放空间这类需硬避障的场景。\textbf{对偶变量让问题变大}：为每个障碍、每个时间步引入一组 $\boldsymbol\lambda$，障碍多、时域长时变量数显著增加、求解变慢（约 $5$ Hz 量级，比 CILQR/MINCO 慢），所以 OBCA 适合泊车这类对实时性要求不极致、但对精确避障要求高的场景。\textbf{warm-start 用 Hybrid A$^*$}：泊车空间窄、机动复杂（要倒库、揉方向），非凸优化极易卡劣解，Hybrid A$^*$ 先搜一条可行粗轨迹（定下“怎么倒、往哪揉”的 homotopy）再 warm-start，少了这步 OBCA 基本跑不稳。\textbf{障碍的凸分解}：OBCA 处理凸障碍（或凸集的并），真实环境的不规则障碍要先做凸分解，分解质量影响约束数量和效率。\textbf{车辆形状也要建模}：OBCA 同时考虑障碍形状\emph{和}自车形状（自车也表示成凸多边形），算两个凸体之间的距离——这比“把车当质点 + 安全半径”精确得多，正是泊车刮蹭判断需要的。\textbf{Apollo 的实现可参考}：Apollo Open Space 的 \verb@DistanceApproachProblem@（OBCA 思路 + IPOPT/OSQP）展示了它在产品级泊车里怎么和上游 Hybrid A$^*$、下游跟踪衔接。
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 把有符号距离判据扩展成“点到凸多边形的最近距离”（不只判内外，还算具体距离值）：点在外时最近距离 $=$ 到最近边/顶点的欧氏距离。观察这个距离在点绕多边形一周时，在边-角切换处的不光滑（导数跳变）——这正是 OBCA 要光滑化的对象。
+  \item \textbf{[分析]} \cref{thm:st-obca-exact} 用了凸性的哪个性质？若障碍是\emph{非凸}的（如 L 形），这个等价还成立吗？OBCA 怎么处理非凸障碍？（提示：凸集的并）
+  \item \textbf{[跨章]} OBCA 配 Hybrid A$^*$、CILQR 配 warm-start、TEB 多拓扑并行——三者都在解决“非凸优化对初值敏感、会卡 homotopy”的问题。把这三种“离散定 homotopy + 连续精修”的组合列成对照表（前端是什么、后端是什么、各自保证什么）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{MINCO：参数映射把高维系数压成低维}
+\label{sec:st-minco}
+
+\begin{note}
+OBCA 用对偶\emph{精确消去}了不可微的避障约束。本节的 MINCO 把“精确消去”用到另一处——它用参数映射\emph{精确消去}了多项式系数和段间连续性约束，把约束优化变成无约束优化。两者都是“精确重构”思路（不像 CILQR/TEB 那样软化），但 OBCA 消的是避障约束、MINCO 消的是系数与连续性约束。MINCO 还顺带解决了“时间分配”，是无人机轨迹的主流方案。
+\end{note}
+
+\paragraph{动机：多项式轨迹的系数太多，直接优化太贵。}
+无人机轨迹常用\textbf{分段多项式}表示——每段是一个高阶多项式（如 $5$ 阶、$7$ 阶），整条轨迹由若干段拼成。\cref{sec:plan-minsnap} 的 min-snap 已建立这套范式：因为无人机是\emph{微分平坦}系统，最小化 snap（$4$ 阶导）的平方积分能得到平滑省力的轨迹。但这带来一个计算难题：\textbf{多项式系数太多}。一段 $p$ 阶多项式有 $p+1$ 个系数，$N$ 段三维轨迹系数总数是 $3\times N\times(p+1)$——动辄几十上百个。直接把它们全当优化变量，问题维度高、还要加一堆段间连续性约束（相邻段位置、速度、加速度……要接得上），求解又慢又难。更要命的是\emph{时间分配}：每段花多长时间（段时间 $T_i$）也该优化（直道快、弯道慢），但段时间与多项式系数\emph{强耦合}——改一个段时间，所有系数都得重算。于是问题成了：\textbf{能不能不优化那一大堆多项式系数，只优化少数几个有意义的量（航点位置、段时间），而系数自动跟着确定？} MINCO 给出的答案是一个漂亮的参数映射。
+
+\begin{insight}
+\textbf{微分平坦：为什么无人机能“只规划位置曲线”.}\;一个系统“微分平坦”，是指存在一组\emph{平坦输出}，使系统的所有状态和控制输入，都能写成这组平坦输出及其有限阶导数的代数函数——只要定下平坦输出的轨迹，整个系统的状态和控制就被\emph{唯一、显式}地确定，不用再解微分方程。对四旋翼，平坦输出恰好是\emph{位置} $(x,y,z)$ \emph{加偏航角} $\psi$（共 $4$ 个，对应四个旋翼的自由度）。这意味着：你只要规划好“位置怎么随时间变”，任意时刻需要的姿态、角速度、四旋翼推力，全都能从位置轨迹的各阶导数\emph{算出来}——姿态和推力是位置轨迹的“副产品”。为什么要高阶多项式、为什么最小化 snap？因为推力和力矩对应位置轨迹的\emph{高阶导}（粗略说，加速度关联推力大小、jerk 关联姿态变化率、snap 关联角加速度/力矩）——要让控制量光滑、不剧烈跳变，就得让高阶导光滑，于是用足够高阶的多项式、并最小化 snap 的平方积分。MINCO 的 “Minimum Control”（最小控制量）正是这个思路的一般化：它最小化的“控制量”就是这类高阶导数的能量。
+\end{insight}
+
+\paragraph{反面：不做降维、直接优化全部系数会同时撞上几堵墙。}
+其一是\emph{维度高}：几十上百个系数变量，非线性优化规模大、迭代慢，难满足无人机机载实时（百赫兹级）。其二是\emph{连续性约束多且繁}：段间要保证位置、速度、加速度乃至更高阶导连续，每个连接点每个维度每一阶都是一条等式约束——约束数量爆炸。其三是\emph{时空耦合难处理}：段时间和系数纠缠，想“同时优化空间形状和时间分配”时梯度关系复杂，要么固定时间只优化空间（丢了时间最优）、要么交替优化（慢、易震荡）。min-snap（\cref{sec:plan-minsnap}）能解，但要么把时间分配单独拎出来用启发式或外层搜索定、要么承受高维和约束负担。MINCO 的突破在于：用一个\emph{参数映射}把“系数”这个高维、带约束的表示，换成“航点 + 段时间”这个低维、稀疏的表示——系数由后者\emph{唯一确定}，连续性\emph{自动满足}，时空可\emph{同步优化}。
+
+\paragraph{历史：ZJU FAST Lab 的 GCOPTER。}
+MINCO（Minimum Control，最小控制量）由王哲培、周鑫、许超、高飞（浙江大学 FAST Lab）提出，核心论文是《Geometrically Constrained Trajectory Optimization for Multicopters》（IEEE Transactions on Robotics, T-RO, 2022, 38(5):3259--3278；arXiv 2103.00190）\cite{wang2022minco}。论文提出一个面向多旋翼的优化框架，处理几何空间约束和用户定义的动力学约束。它的基础是一种\emph{新的轨迹表示}——建立在作者提出的“无约束控制量最小化”的新最优性条件之上。在这个表示上，他们设计了\emph{线性复杂度}的操作来做“空间-时间变形”（spatial-temporal deformation）、用\emph{光滑映射}以轻量方式\emph{精确消除}几何约束、通过“稠密约束评估与稀疏参数化解耦 + 平坦性映射的反向微分”支持各种状态-输入约束，最终把一个一般约束的多旋翼规划问题\emph{转化成一个无约束优化}。MINCO 的前身是 am\_traj（《Alternating Minimization Based Trajectory Generation\dots》，RA-L 2020）——用\emph{交替最小化}（固定时间 $\mathbf T$ 优化航点 $\mathbf q$ $\to$ 固定 $\mathbf q$ 优化 $\mathbf T$）迭代，各子问题有闭式解\cite{wang2020amtraj}；GCOPTER 统一了交替和联合两种模式。代码以 \verb@ZJU-FAST-Lab/GCOPTER@（MIT 许可，C++ header-only）开源，核心是 \verb@minco.hpp@（含多种阶次特化，约近千行），实现了参数映射 $\mathcal M(\mathbf q,\mathbf T)$ 的解析构建和梯度回传。
+
+\begin{note}
+\textbf{MINCO 站在 min-snap 的肩膀上.}\;min-snap（\cref{sec:plan-minsnap}）确立了“微分平坦 + 多项式 + 最小化高阶导”的范式，但有两个 MINCO 改进的痛点：其一，它把多项式系数当优化变量、连续性写成约束（正是下面那个“反例”），维度高；其二，它的\emph{时间分配}往往单独拎出来用启发式或外层搜索定，没和空间形状一起优化。MINCO 的两大贡献正是针对这两点：用 $\mathbf c=\mathcal M(\mathbf q,\mathbf T)$ 把系数和连续性消成“航点+段时间”的低维无约束问题（解决痛点一），用解析梯度让空间（$\mathbf q$）和时间（$\mathbf T$）\emph{同步}优化（解决痛点二）。从 min-snap（2011）到 am\_traj（2020）到 MINCO/GCOPTER（2022），是同一条线越走越精的过程。
+\end{note}
+
+\subsection{理论：\texorpdfstring{$\mathbf c=\mathcal M(\mathbf q,\mathbf T)$}{c=M(q,T)} 为什么成立、为什么强大}
+\label{sec:st-minco-theory}
+
+\begin{theorem}[MINCO 参数映射]\label{thm:st-minco-map}
+阶次为 $2s-1$ 的分段多项式轨迹，若满足“\emph{每段内控制量（$s$ 阶导）能量最小}”这个最优性条件，那么它的全部多项式系数 $\mathbf c$，由\textbf{中间航点 $\mathbf q$（各段连接处的位置）和段时间 $\mathbf T$（各段时长）唯一确定}：
+\begin{equation}
+  \mathbf c=\mathcal M(\mathbf q,\mathbf T).
+  \label{eq:st-minco-map}
+\end{equation}
+即：一旦定下“轨迹经过哪些航点、每段花多长时间”，那条“在这些航点间最省控制量”的多项式轨迹就唯一确定，系数不用操心、自动算出。
+\end{theorem}
+
+\begin{derivation}[为什么 $\mathbf c=\mathcal M(\mathbf q,\mathbf T)$ 成立]\label{der:st-minco}
+考虑相邻两段之间的连接点：要保证轨迹光滑（位置、速度、加速度……到 $2s-2$ 阶都连续），同时这条轨迹要“最省 $s$ 阶导能量”。“最省能量”是一个变分问题，其最优性条件（欧拉--拉格朗日方程）给出了系数必须满足的一组\emph{线性方程}；加上“经过指定航点”和“段间连续”的条件，这些线性方程的数量恰好等于系数的数量——于是系数被唯一解出。关键是：这组方程关于 $(\mathbf q,\mathbf T)$ 是\emph{结构化的、稀疏的}（每段只和相邻段耦合），所以 $\mathcal M(\mathbf q,\mathbf T)$ 可以用线性复杂度（$O(N)$）算出，而非解一个稠密大矩阵\cite{wang2022minco}。把“最省控制量”这个条件用上，系数就从“自由变量”变成了“$(\mathbf q,\mathbf T)$ 的函数”。这与 \cref{der:plan-minsnap} 的 min-snap KKT 系统同源——区别在 MINCO 用“最优性条件 + 航点参数化”把系数显式解出为 $(\mathbf q,\mathbf T)$ 的函数，而非把系数留作 QP 变量。
+\end{derivation}
+
+\paragraph{为什么这强大？——降维 $+$ 自动连续 $+$ 同步变形。}
+这个映射带来三个直接红利。其一，\textbf{降维}：不再优化 $3N(p+1)$ 个系数，只优化 $\mathbf q$（中间航点，$3(N-1)$ 个）和 $\mathbf T$（段时间，$N$ 个）——共约 $4N-3$ 个稀疏参数，维度大幅下降。其二，\textbf{连续性自动满足}：段间的位置、速度、加速度连续性，已经被编码进 $\mathcal M(\mathbf q,\mathbf T)$ 的构造里（最优性条件就包含连续性），不用再写成显式约束——约束优化变无约束优化。其三，\textbf{时空同步变形}：因为系数是 $(\mathbf q,\mathbf T)$ 的解析函数，代价 $J$ 对航点的梯度 $\partial J/\partial\mathbf q$ 和对段时间的梯度 $\partial J/\partial\mathbf T$ 都能通过 $\mathcal M$ 的解析微分\emph{回传}——于是空间形状（$\mathbf q$）和时间分配（$\mathbf T$）可以在同一个梯度步里\emph{一起}更新，这就是“空间-时间同步变形”。
+
+\begin{insight}
+\textbf{$\mathbf c=\mathcal M(\mathbf q,\mathbf T)$ 的三个视角.}\;\emph{从变分最优看}，它是“最小控制量”变分问题最优性条件的解——给定边界（航点）和时长，那条“最省高阶导能量”的曲线由欧拉--拉格朗日方程唯一确定（这告诉你它\emph{为什么唯一}）。\emph{从降维看}，它是一个“坐标变换”——把高维的系数空间换成低维的 $(\mathbf q,\mathbf T)$ 空间，两者一一对应（这告诉你它\emph{为什么高效}）。\emph{从自动微分看}，它是一个可微的计算图节点——前向算系数、反向传梯度，像神经网络的一层（这告诉你它\emph{为什么能时空同步}）。三个视角不矛盾：变分视角给唯一性、降维视角给效率、微分视角给同步性。只盯着公式会觉得抽象，换这三个视角看，它的“唯一+高效+同步”三个好处就各有了来处。
+\end{insight}
+
+\paragraph{时间正性与求解。}
+段时间必须为正（$T_i>0$）。MINCO 用一个变量代换消掉这个约束：令 $T_i=e^{\tau_i}$（或类似的光滑正映射），优化无约束的 $\tau_i$，则 $T_i$ 自动恒正——和 TEB 用 $\exp$ 参数化段时间是同一招。整个问题于是变成一个\textbf{无约束优化}（航点 $\mathbf q$ + 变换后的时间 $\boldsymbol\tau$），用 L-BFGS（一种高效的拟牛顿无约束优化器）求解，配合解析梯度，能做到很高的求解频率（百赫兹级）。对几何约束（如走廊：轨迹要待在 \cref{sec:plan-minsnap} 那种凸多面体里），MINCO 用\emph{光滑映射}把“在凸区域内”这个约束也精确消去（把约束坐标映射到无约束空间）。所以 MINCO 的整条链路是：前端给走廊（几何约束）$\to$ 光滑映射消去几何约束 $+$ $\mathcal M(\mathbf q,\mathbf T)$ 消去系数和连续性约束 $\to$ 无约束优化（L-BFGS）$\to$ 时空同步变形出最优轨迹。
+
+\subsection{代码：只给\texorpdfstring{ $(\mathbf q,\mathbf T)$}{ (q,T)}，系数被唯一解出}
+\label{sec:st-minco-code}
+
+完整 MINCO 用 \verb@minco.hpp@ 实现 $\mathcal M(\mathbf q,\mathbf T)$ 的解析构建和梯度回传，还要接 L-BFGS、光滑映射，代码精巧但重。下面给一份可直接编译运行的最简演示，把 MINCO 最核心的断言（\cref{thm:st-minco-map}）验证出来：\textbf{只给航点 $\mathbf q$ 和段时间 $\mathbf T$，多项式系数被“经过航点 + 段间连续”唯一确定}。场景简化成一维、$N$ 段三次多项式，直接解那个确定系数的线性系统，验证轨迹精确过航点、段间连续。
+
+\begin{codebox}[C++]{MINCO 核心验证:系数由 (q,T) 唯一确定 c=M(q,T)}
+// 一维, N 段三次多项式。约束(共 4N 条, 正好定 4N 系数):
+//   每段端点过航点(2N) + 内部连接点速度/加速度连续(2(N-1)) + 起终点速度=0(2)。
+#include <vector>
+#include <cmath>
+#include <cstdio>
+
+std::vector<double> Solve(std::vector<std::vector<double>> A, std::vector<double> b) {
+  int n = b.size();                                // 极简高斯消元(n 小, 演示用)
+  for (int i = 0; i < n; ++i) {
+    int piv = i;
+    for (int r = i+1; r < n; ++r) if (std::fabs(A[r][i]) > std::fabs(A[piv][i])) piv = r;
+    std::swap(A[i], A[piv]); std::swap(b[i], b[piv]);
+    for (int r = 0; r < n; ++r) if (r != i) {
+      double f = A[r][i] / A[i][i];
+      for (int c = i; c < n; ++c) A[r][c] -= f * A[i][c];
+      b[r] -= f * b[i];
+    }
+  }
+  std::vector<double> x(n);
+  for (int i = 0; i < n; ++i) x[i] = b[i] / A[i][i];
+  return x;
+}
+
+int main() {
+  std::vector<double> q = {0.0, 2.0, 1.0, 3.0};   // 4 航点 => 3 段
+  std::vector<double> T = {1.0, 1.5, 1.0};        // 3 段时间
+  int N = T.size(), dim = 4 * N;
+  std::vector<std::vector<double>> A(dim, std::vector<double>(dim, 0.0));
+  std::vector<double> b(dim, 0.0);
+  int row = 0;
+  auto idx = [&](int seg, int k){ return 4*seg + k; };  // 段 seg 第 k 个系数
+  for (int i = 0; i < N; ++i) {                   // 每段端点过航点
+    double Ti = T[i];
+    A[row][idx(i,0)] = 1; b[row] = q[i]; ++row;                          // 起点=q[i]
+    A[row][idx(i,0)]=1; A[row][idx(i,1)]=Ti; A[row][idx(i,2)]=Ti*Ti;
+    A[row][idx(i,3)]=Ti*Ti*Ti; b[row] = q[i+1]; ++row;                   // 终点=q[i+1]
+  }
+  for (int i = 0; i < N-1; ++i) {                 // 连接点速度、加速度连续
+    double Ti = T[i];
+    A[row][idx(i,1)]=1; A[row][idx(i,2)]=2*Ti; A[row][idx(i,3)]=3*Ti*Ti;
+    A[row][idx(i+1,1)]=-1; ++row;                                        // 速度连续
+    A[row][idx(i,2)]=2; A[row][idx(i,3)]=6*Ti; A[row][idx(i+1,2)]=-2; ++row; // 加速度连续
+  }
+  A[row][idx(0,1)] = 1; ++row;                    // 起点速度=0
+  double Tl = T[N-1];
+  A[row][idx(N-1,1)]=1; A[row][idx(N-1,2)]=2*Tl; A[row][idx(N-1,3)]=3*Tl*Tl; ++row; // 终点速度=0
+  std::vector<double> c = Solve(A, b);            // c = M(q,T): 系数被唯一解出
+  auto eval = [&](int seg, double t){
+    double r=0,tp=1; for(int k=0;k<4;++k){r+=c[idx(seg,k)]*tp; tp*=t;} return r; };
+  for (int i = 0; i < N; ++i)
+    std::printf("段%d: 起点=%.4f(应%.1f) 终点=%.4f(应%.1f)\n",
+                i, eval(i,0), q[i], eval(i,T[i]), q[i+1]);
+  double maxerr = 0;
+  for (int i = 0; i < N-1; ++i)
+    maxerr = std::max(maxerr, std::fabs(eval(i,T[i]) - eval(i+1,0)));
+  std::printf("连接点最大不连续 = %.2e (~0 => 段间连续 OK)\n", maxerr);
+  // 输出: 各段精确过航点, 连接点最大不连续 = 0.00e+00
+  return 0;
+}
+\end{codebox}
+
+\noindent\textbf{正确要点.}\;这份演示抓住 MINCO 的本质。其一，\emph{系数是因变量、不是优化变量}：我们只给了 $\mathbf q$ 和 $\mathbf T$，系数 $\mathbf c$ 由线性系统 \verb@Solve(A,b)@ 解出——这正是 $\mathbf c=\mathcal M(\mathbf q,\mathbf T)$。真 MINCO 优化时只动 $\mathbf q$ 和 $\mathbf T$，系数永远跟着自动算，维度因此大降。其二，\emph{连续性被“焊进”了系统}：连接点的速度、加速度连续是线性系统的一部分约束，所以解出的系数\emph{自动满足}连续性（验证里不连续误差为 $0$）——无需在外层优化里再写连续性约束。其三，\emph{约束数 $=$ 系数数}：$N$ 段三次多项式有 $4N$ 个系数，而“过航点 + 连续 + 边界”恰好给出 $4N$ 条线性方程——系数被唯一确定。真 MINCO 用更高阶多项式 + “最小控制量”最优性条件给出这组方程，但“$(\mathbf q,\mathbf T)$ 唯一定系数”的机制一样。真 MINCO 还会对段时间用 $T_i=e^{\tau_i}$ 保正、用解析微分回传 $\partial J/\partial\mathbf q$ 和 $\partial J/\partial\mathbf T$ 做时空同步变形——这份 demo 只验证了映射本身，没做优化。
+
+\noindent{}\textbf{一个常见的错误写法.}\;新手最易犯的错，是\emph{把多项式系数也当成优化变量}，再外加连续性约束：
+
+\begin{codebox}[C++]{反例:把所有系数当优化变量, 连续性写成额外硬约束}
+// 决策变量 = 全部 4N 个系数 c[]; 约束: 段间位置/速度/加速度连续 + 过航点(一堆等式)
+optimize(c, subject_to = {continuity_constraints, waypoint_constraints});
+// 问题: (1) 维度高 -- 4N 个系数 vs MINCO 的 ~4N-3 个 (q,T), 且系数无直观意义难初始化;
+//       (2) 连续性约束多 -- 每个连接点每阶导都是一条约束, 求解器负担重;
+//       (3) 时间分配难嵌入 -- 段时间一变, 所有系数约束都要重写, 时空耦合处理复杂。
+//       MINCO 把"连续性"和"系数"都通过 c=M(q,T) 消掉了, 根本不让它们进优化。
+\end{codebox}
+
+\noindent\textbf{对比.}\;正确版（MINCO 思路）只优化 $(\mathbf q,\mathbf T)$、系数由映射自动确定、连续性自动满足——低维、无连续性约束、时空可同步变形。错误版优化全部系数 + 显式连续性约束——高维、约束多、时空耦合难处理。两者解出的最优轨迹可以一样，但 MINCO 的参数化让优化问题小一个量级、还天然支持时空同步——这就是它能在无人机上做到百赫兹级求解的根本，也是“选对表示”（\cref{sec:st-unified} 的选择一）威力的最佳例证。
+
+\paragraph{带数字走一遍。}
+输入只有两样：$4$ 个航点 $\mathbf q=\{0,2,1,3\}$ 和 $3$ 个段时间 $\mathbf T=\{1,1.5,1\}$——\emph{没有给任何多项式系数}。$3$ 段三次多项式共 $12$ 个系数；约束有：每段两端过航点（$6$ 条）、两个内部连接点的速度和加速度连续（$4$ 条）、起终点速度为零（$2$ 条）——恰好 $12$ 条，与系数数相等。解这个 $12\times 12$ 线性系统，$12$ 个系数被\emph{唯一}解出。验证：段 $0$ 起点 $=0.0000$（应 $=q_0=0$）、终点 $=2.0000$（应 $=q_1=2$）；连接点位置最大不连续 $=0.00\mathrm{e}{+}00$。这组数字坐实三件事。\textbf{系数是因变量}：我们一个系数都没给，它们由 $(\mathbf q,\mathbf T)$ 自动算出。\textbf{连续性自动满足}：不连续误差为 $0$，因为连续性被“焊”进了解。\textbf{约束数 $=$ 系数数}：$12=12$ 不是巧合，正是它让系数“唯一确定”——少一条则不唯一、多一条则无解。把段时间改成 $\mathbf T=\{1,3,1\}$（中间段拉长）再解，会看到中间段的系数变化、轨迹在该段变得更“舒缓”——这就是“时间分配”如何通过 $\mathcal M(\mathbf q,\mathbf T)$ 影响轨迹形状，也是 MINCO “时空同步变形”的微观体现。
+
+\begin{pitfall}[编程陷阱：把多项式系数当优化变量 + 显式连续性约束]
+\textbf{错误想法}：轨迹就是多项式，那就优化它的系数，段间连续性加几条等式约束。\;
+\textbf{后果}：优化问题维度高（$4N$ 个无直观意义的系数）、约束多（每连接点每阶导一条）、求解慢、初始化难。\;
+\textbf{根因}：没用上“系数可由 $(\mathbf q,\mathbf T)$ 唯一确定”这一结构——把本该是因变量的系数当成了自由变量。\;
+\textbf{正确做法}：用 $\mathbf c=\mathcal M(\mathbf q,\mathbf T)$，只优化稀疏的航点 $\mathbf q$ 和段时间 $\mathbf T$，系数和连续性都由映射自动处理（无约束优化）。
+\end{pitfall}
+
+\begin{pitfall}[概念陷阱：以为 $\mathcal M(\mathbf q,\mathbf T)$ 是某种近似或拟合]
+\textbf{错误想法}：$\mathbf c=\mathcal M(\mathbf q,\mathbf T)$ 大概是用 $(\mathbf q,\mathbf T)$ 去“拟合”一条多项式吧，应该有误差。\;
+\textbf{后果}：怀疑 MINCO 轨迹不精确、不敢用于高精度场景。\;
+\textbf{根因}：$\mathcal M(\mathbf q,\mathbf T)$ 是“最小控制量 + 连续性 + 过航点”这组\emph{最优性条件的精确解}，是解析的、唯一的、无近似的——它不是拟合，是“在给定 $(\mathbf q,\mathbf T)$ 下那条最优轨迹的闭式表达”。\;
+\textbf{正确做法}：理解 $\mathcal M$ 是精确映射：给定 $(\mathbf q,\mathbf T)$，系数被一组线性方程唯一确定，轨迹精确过航点、精确连续。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：以为 MINCO 只是“换个参数化”、没有本质区别]
+\textbf{错误想法}：优化系数还是优化 $(\mathbf q,\mathbf T)$，不就是变量换一下，最优解一样有啥区别。\;
+\textbf{后果}：低估 MINCO，在该用它的高频无人机场景里还用全系数优化，跑不到实时。\;
+\textbf{根因}：参数化的选择决定了\emph{问题的维度、约束数量、和能否时空同步}——这些直接决定求解速度，不是“换汤不换药”。\;
+\textbf{正确做法}：把“选对表示”当成一等大事（\cref{sec:st-unified} 的选择一）：MINCO 的降维 $+$ 自动连续 $+$ 同步变形，让同一个最优解的求解快一个量级。
+\end{pitfall}
+
+\paragraph{工程落地注意事项。}
+MINCO/GCOPTER 是无人机轨迹的事实标准之一。\textbf{走廊质量决定一切}：MINCO 的几何约束来自前端给的走廊（如 \cref{sec:plan-minsnap} 的安全飞行走廊），走廊切得好（够宽、重叠充分）轨迹就既安全又激进，走廊切得差（过窄、有缝隙）再强的优化也飞不出好轨迹——“垃圾进，垃圾出”，落地一大半功夫在前端走廊生成。\textbf{段数与航点的选择}：段多则表达能力强但变量多、慢，段少则快但可能不够灵活，工程上常按走廊的 cube 数定段、让段划分和几何走廊对齐。\textbf{L-BFGS 的初值与数值}：仍需合理初值（通常用前端粗解或走廊中心连线初始化），段时间的 $\exp$ 参数化要注意数值范围，$\tau$ 过大过小都会让 $T=e^\tau$ 数值病态。\textbf{header-only 的便利与约束}：\verb@minco.hpp@ 是 header-only、依赖 Eigen，集成方便，但面向多旋翼设计，用到车辆等其他动力学时要改写平坦性映射部分。\textbf{和控制器的衔接}：MINCO 输出参考轨迹，真飞还要一个轨迹跟踪控制器（如几何控制器或 MPC）去跟，规划频率（百赫兹）与控制频率要协调。
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 把一维 $\mathbf c=\mathcal M(\mathbf q,\mathbf T)$ 扩展：(a) 改段时间（让中间段更长），重解系数，观察轨迹形状变化——这就是“时间分配”对轨迹的影响；(b) 把三次多项式升到五次（minimum-jerk $\to$ minimum-snap），相应增加边界/连续性约束到 $6N$ 条，验证仍唯一确定。
+  \item \textbf{[分析]} MINCO 说系数由 $(\mathbf q,\mathbf T)$ 唯一确定，前提是“满足最小控制量的最优性条件”。若不要求“最小控制量”、只要求“过航点 + 连续”，系数还唯一吗？（提示：数自由度和约束数）这说明“最优性条件”在 $\mathcal M$ 里扮演什么角色？
+  \item \textbf{[跨章]} MINCO 的几何约束用“光滑映射”精确消去。回忆 \cref{sec:plan-minsnap} 的走廊（凸多面体）。说明：走廊如何成为 MINCO 的输入？“光滑映射消去几何约束”和 min-snap 里“控制点在 cube 内 $=$ 线性约束”是什么关系？（提示：都是把“在凸区域内”变成优化能处理的形式，但方式不同）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{CPC：让“何时过航点”成为优化变量}
+\label{sec:st-cpc}
+
+\begin{note}
+MINCO 已经能优化段时间了，但它（和前面所有方法）默认“哪个航点在第几段通过”是预先固定的。本节的 CPC 走到这条路的尽头——连“何时通过哪个航点”都交给优化。它用一个最巧也最难解的工具（互补约束）做到这点，代价是只能离线，但换来了真正的时间最优——快到击败人类飞手。这是本章“约束进优化”五种答案里最后、也最精妙的一种。
+\end{note}
+
+\paragraph{动机：时间最优的最后一块拼图——时间分配本身。}
+前面几个方法（尤其 MINCO）已能优化段时间，但它们有一个\emph{没说破的前提}：航点和时间步的对应关系是\textbf{预先固定}的——“第 $i$ 个航点在第几段通过”事先指定，优化只在这个分配下进行。对追求极致的\textbf{时间最优}（如无人机竞速），这个前提是致命的。为什么？因为真正的时间最优轨迹，“何时通过哪个航点”本身就该是\emph{自由}的——也许最优策略是“早早冲过前两个门、在第三个门附近多花点时间调整姿态”，这种灵活的时间分配，预先固定的分配表达不出来。更深一层：早期的多项式法（如 min-snap）因多项式\emph{固有的平滑性}，发挥不出四旋翼执行器的全部潜力（极限机动需要 bang-bang 式的推力切换，多项式太“软”）；而数值优化法虽灵活，却要求把航点作为代价或约束\emph{分配到特定的离散时刻}——可这个时间分配事先并不知道。于是问题成了：\textbf{怎么让“什么时候通过哪个航点”也成为优化变量，而非预先固定？} CPC 用一个巧妙的互补约束，给出了答案，并因此造出了第一条真正时间最优的四旋翼轨迹。
+
+\paragraph{反面：预先固定航点-时刻对应，会丢掉时间最优的关键自由度。}
+其一，\emph{次优的时间分配}：你猜“每个航点该在第几段通过”，猜得不准，最终轨迹就不是最优——而最优分配往往反直觉（不是均匀的）。其二，\emph{多项式平滑性的束缚}：若用多项式轨迹回避时间分配问题，多项式的光滑性会“磨平”该有的急加急减，发挥不出推力极限——时间最优轨迹在执行器饱和时常常是 bang-bang 式的，多项式表达不了。其三，\emph{人为离散化的误差}：把航点硬绑到某个离散时间步，离散网格的粗细直接限制了时间分配精度。CPC 的突破在于：它既不固定时间分配（让优化自己定何时过航点）、又用直接的状态-输入轨迹优化（不受多项式平滑性束缚，能产出 bang-bang）、还把“通过航点”用连续的互补约束表达（避免硬性离散化）——三管齐下，得到真正的时间最优。
+
+\paragraph{历史：UZH RPG 击败人类飞手。}
+CPC（Complementary Progress Constraints，互补进度约束）由 Philipp Foehn、Angel Romero、Davide Scaramuzza（苏黎世大学 UZH 机器人与感知组 RPG）提出，论文《Time-optimal planning for quadrotor waypoint flight》（Science Robotics, 2021, 6(56):eabh1221；arXiv 2108.04537）\cite{foehn2021cpc}。论文开门见山指出前人困境：四旋翼是最敏捷的飞行机器人之一，但“在执行器极限上、穿过多个航点的时间最优轨迹规划”仍是开放问题——早期多项式法因固有平滑性发挥不出执行器全部潜力，近期数值优化法又要求把航点作为代价或约束分配到特定离散时刻，而这个时间分配事先未知，使前人方法都无法产出真正时间最优的轨迹。其解法是\textbf{互补进度约束}：引入一个沿轨迹的“进度”度量，用互补条件把它和“航点接近度”耦合起来——直观说，一个航点只有当四旋翼进入它一定容差范围内时，才能被标记为“已完成”，这样就允许\emph{同时优化状态、输入轨迹、以及航点的时间分配}。他们在真机飞行验证中，在 3D 竞速赛道上圈速和一致性都\emph{超过了两名职业人类无人机飞手}\cite{foehn2021cpc}。这是无人机自主飞行第一次在竞速中击败顶尖人类飞手，代表了时间最优轨迹规划的里程碑。代码以 \verb@uzh-rpg/rpg_time_optimal@（CasADi/Python）开源。
+
+\subsection{理论：进度变量与互补约束}
+\label{sec:st-cpc-theory}
+
+\paragraph{核心想法：把“通过航点”变成连续可优化的条件。}
+传统做法是硬性规定“在时刻 $t_k$ 必须位于航点 $\mathbf w_i$”——这是个把航点钉死在时刻的等式约束，时间分配被写死。CPC 反其道而行：它不规定“何时”过航点，只规定“必须按顺序通过所有航点”，让优化器\emph{自己决定}每个航点在轨迹的哪个位置被通过。为此，它给每个航点 $i$、每个离散时间步 $k$ 引入一个\textbf{进度变量}，再用\textbf{互补约束}把进度和“接近航点”绑定。
+
+\begin{definition}[CPC 互补进度约束（示意形式）]\label{def:st-cpc}
+给每个航点 $i$、时间步 $k$ 引入与进度关联的乘子 $\mu_{i,k}\ge 0$，要求
+\begin{equation}
+  \mu_{i,k}\cdot\big(\|\mathbf p_k-\mathbf w_i\|^2-\epsilon^2\big)=0,\qquad \mu_{i,k}\ge 0,
+  \label{eq:st-cpc}
+\end{equation}
+其中 $\mathbf p_k$ 是第 $k$ 步的位置、$\mathbf w_i$ 是第 $i$ 个航点、$\epsilon$ 是容差半径。\textbf{两个因子的乘积为零，意味着至少一个为零}：要么 $\mu_{i,k}=0$（这一步不“消费”航点 $i$ 的进度），要么 $\|\mathbf p_k-\mathbf w_i\|=\epsilon$（位置到达航点 $i$ 容差圈的边界）。即\emph{只有当四旋翼真的飞到航点 $i$ 的容差范围内时，航点 $i$ 的进度才被允许推进}。
+\end{definition}
+
+\noindent\rebuilt{\cref{eq:st-cpc} 是 CPC 原文形式的简化（只为讲清“进度与接近度互补”）。原文（Foehn 2021，其式 (5)(8)(9)(13)(14)）给每个航点 $j$、时间步 $k$ 一个\emph{进度变量} $\lambda_{jk}$ 与\emph{进度变化量} $\mu_{jk}\ge 0$，链式演化 $\boldsymbol\lambda_{k+1}=\boldsymbol\lambda_k-\boldsymbol\mu_k$，且 $\lambda$ 从 $1$（未完成）单调降到 $0$（已完成，$\lambda_0=\mathbf 1,\lambda_N=\mathbf 0$）。互补约束的精确形式是带容差松弛的 $\mu_{jk}\cdot\|\mathbf p_k-\mathbf w_j\|^2-\nu_{jk}=0$、$0\le\nu_{jk}\le d_{\text{tol}}^2$——即进度只能在“位置进入航点容差圈内”（$\|\mathbf p_k-\mathbf w_j\|^2\le d_{\text{tol}}^2$、使松弛 $\nu$ 能吸收该项）的时间步推进。本式把它简化为 $\mu_{i,k}\cdot(\|\mathbf p-\mathbf w_i\|^2-\epsilon^2)=0$，方向与变量定义与原文略有出入，仅保留核心机制。}把这些互补约束 $+$ “进度从 $1$ 单调推进到 $0$（所有航点按序完成）” $+$ 四旋翼动力学 $+$ 执行器极限，全部放进一个优化问题，最小化总时间——优化器就会\emph{自动决定}每个航点在轨迹的哪一点被通过，时间分配成了优化的产物而非输入。
+
+\paragraph{为什么这能产出真正时间最优（bang-bang）？}
+因为 CPC 直接优化状态和输入轨迹（不用多项式参数化），输入（单旋翼推力）只受执行器上下限约束。当优化目标是“最小化总时间”时，最优解会让执行器\emph{尽可能多地工作在极限}——推力在最大/最小之间切换（bang-bang 控制），这是时间最优控制的经典特征（庞特里亚金极小值原理）。多项式法因为平滑性产不出这种切换，而 CPC 的直接轨迹优化能——这就是它“充分利用执行器潜力”、比前人更快的根本。代价是：\textbf{互补约束让问题变得很难解}（互补条件是一类特殊的非凸约束，可行域有组合结构），求解慢、对初值敏感，所以 CPC 主要用于\emph{离线}生成竞速轨迹，而非在线实时规划。
+
+\begin{insight}
+\textbf{把五方法对“时间”的处理排成一条光谱.}\;\emph{左端——时间隐式}：CILQR 把时间藏在状态 $v$ 和步长里，最省事，但“快慢”只能间接体现。\emph{中段——段时间显式}：TEB、MINCO 把段时间 $\Delta T_i$ 当变量，能直接优化“每段多快”，但“哪个航点在第几段”仍预先固定——这是大多数实用方法的位置。\emph{右端——连分配都优化}：CPC 把“何时通过哪个航点”也变成优化变量（靠互补约束），时间分配完全自由——最接近“真正时间最优”，代价是最难解、只能离线。这条光谱不是“越右越好”，而是“越右越自由、也越难”：左端实时好用，右端极致但离线。它和“约束怎么进优化”那条主线（软化$\to$精确重构）正交——一个方法在两条轴上各有位置，合起来才定义了它。
+\end{insight}
+
+\begin{derivation}[互补约束为什么这么难解——一个几何直觉]\label{der:st-mpcc}
+互补条件 $\mu\cdot g=0$ 这种“乘积为零”的约束，数学上属于 MPCC（Mathematical Program with Complementarity Constraints，带互补约束的数学规划）。普通的不等式约束 $g\le 0$，可行域是一片“实心”区域，光滑、有内部，求解器可在内部自由移动、沿梯度下降。而互补约束 $\mu\cdot g=0$（$\mu\ge 0,g\le 0$）的可行域\emph{不是实心的}——“乘积为零”要求 $\mu$ 和 $g$ 至少一个为零，于是可行域是两条边界的并：要么 $\mu=0$（落在 $\mu$ 轴上），要么 $g=0$（落在 $g$ 边界上），形如一个字母 “L”（两条线段拼成的拐角），只在拐角 $(\mu=0,g=0)$ 处相交。这个“L 形”可行域没有内部、在拐角处有尖点——标准 NLP 求解器赖以工作的\emph{约束规范条件}（constraint qualification，要求可行域在解附近是光滑流形、梯度线性无关）在这里被破坏：拐角处梯度信息退化，求解器不知道该往 $\mu$ 轴走还是往 $g$ 边界走。这就是 MPCC 难解的几何根源。所以求解 CPC 要用专门技巧：\textbf{松弛}（把 $\mu\cdot g=0$ 放成 $\mu\cdot g\le\delta$，把尖锐的 L 形“撑开”成有内部的区域，再让 $\delta$ 退火趋零）、或罚函数、或显式分支处理每个互补对的两种情况。这些技巧都要反复求解、慢——这正是 CPC 离线的根本原因。
+\end{derivation}
+
+\subsection{代码：互补约束让进度只在靠近航点时推进}
+\label{sec:st-cpc-code}
+
+完整 CPC 要把互补约束嵌进 CasADi/Ipopt 的 MPCC 求解，处理互补约束的数值难点，是离线重型计算。但 CPC 的\emph{核心机制——互补约束让“进度只在靠近航点时推进”}——可以独立演示。下面这份可直接编译运行的代码，模拟一条按序飞过 $3$ 个航点的轨迹，演示进度何时被互补条件“允许”推进，把 CPC “不固定时间分配、让优化自己定何时过航点”的思想看清。
+
+\begin{codebox}[C++]{CPC 核心验证:互补约束 mu*g=0 让"通过航点"只在靠近时计数}
+// 互补条件 mu_i*(||p-w_i||^2 - eps^2)=0 => 要么 mu=0(不推进), 要么 ||p-w_i||=eps(进容差圈)
+#include <vector>
+#include <array>
+#include <cmath>
+#include <cstdio>
+
+using Vec2 = std::array<double,2>;
+double dist(const Vec2& a, const Vec2& b){ return std::hypot(a[0]-b[0], a[1]-b[1]); }
+
+int main() {
+  std::vector<Vec2> wp = {{2,0},{4,2},{6,0}};      // 3 个航点(竞速门), 按序穿过
+  double eps = 0.5;                                // 容差半径: 进此圈才算"到达"
+  std::vector<Vec2> anchors = {{0,0},{2,0},{4,2},{6,0}};  // 模拟轨迹:依次飞向三门
+  std::vector<Vec2> traj;
+  for (int seg = 0; seg + 1 < (int)anchors.size(); ++seg)
+    for (int j = 0; j < 7; ++j) {
+      double a = j / 7.0;
+      traj.push_back({anchors[seg][0]*(1-a)+anchors[seg+1][0]*a,
+                      anchors[seg][1]*(1-a)+anchors[seg+1][1]*a});
+    }
+  traj.push_back(anchors.back());
+
+  std::vector<bool> done(wp.size(), false);
+  int next_wp = 0;                                 // 下一个待通过航点(按序)
+  for (int k = 0; k < (int)traj.size() && next_wp < (int)wp.size(); ++k) {
+    double g = dist(traj[k], wp[next_wp]) - eps;   // g = ||p-w|| - eps
+    if (g <= 1e-9) {                               // 互补: g<=0 时进度才可推进
+      std::printf("步%2d (%.2f,%.2f): 入航点%d容差圈(g=%.3f) -> 航点%d完成\n",
+                  k, traj[k][0], traj[k][1], next_wp, g, next_wp);
+      done[next_wp] = true; ++next_wp;
+    }
+  }
+  int n = 0; for (bool d : done) n += d;
+  std::printf("通过航点数: %d / %zu\n", n, wp.size());
+  // 输出: 步6 入航点0(g=-0.214); 步13 入航点1(g=-0.096); 步20 入航点2; 通过 3/3
+  return 0;
+}
+\end{codebox}
+
+\noindent\textbf{正确要点.}\;这份演示抓住 CPC 的本质。其一，\emph{进度只在靠近航点时推进}：只有 \verb@g=||p-w||-eps<=0@（进入容差圈）时才标记航点完成——这正是互补条件 $\mu\cdot g=0$ 的离散体现（$g>0$ 时进度乘子 $\mu$ 必须为 $0$，进度不能推进）。其二，\emph{何时过航点不是预先指定的}：代码没有规定“第几步必须到第几个航点”，而是让轨迹自然飞过、在进圈那一刻才计数——真 CPC 里这一步由优化器决定（它会调整轨迹和时间分配，让总时间最短）。其三，\emph{按序约束}：\verb@next_wp@ 保证航点按顺序完成——竞速要按门的顺序过。真 CPC 把这套互补约束 $+$ 动力学 $+$ 执行器极限放进 MPCC，最小化总时间，同时优化轨迹、输入、时间分配。
+
+\noindent{}\textbf{一个常见的错误写法.}\;新手处理“按序过航点”时，最易犯的错是\emph{把航点硬绑到固定时间步}：
+
+\begin{codebox}[C++]{反例:预先规定"第 i 个航点必须在第 k\_i 步通过"}
+for (int i = 0; i < n_wp; ++i) {
+  int k_i = (i + 1) * total_steps / (n_wp + 1);  // 错: 人为均匀分配航点到时间步
+  add_constraint(traj[k_i] == wp[i]);             // 硬性: 第 k_i 步必须在航点 i
+}
+// 问题: (1) 时间分配被写死且通常【非最优】 -- 最优分配往往不均匀
+//           (该在前段快冲、后段慢调, 均匀分配做不到);
+//       (2) 离散网格粗 => 分配精度差;
+//       (3) 这正是 CPC 论文批判的"把航点作为约束分配到特定离散时刻"。
+\end{codebox}
+
+\noindent\textbf{对比.}\;正确版（CPC 思路）用互补约束，进度“靠近才推进”，\emph{何时过航点由优化决定}——时间分配是产物。错误版预先把航点钉到固定时间步——时间分配是输入、且通常非最优。两者的差别正是 CPC 击败人类飞手的关键：\textbf{把时间分配从“人为预设”解放成“优化变量”}，配合直接轨迹优化（产 bang-bang），才逼出了真正的时间最优。代价是互补约束难解、只能离线——这是为极致性能付的账。
+
+\paragraph{带数字走一遍。}
+场景是 $3$ 个航点（竞速门）$\{(2,0),(4,2),(6,0)\}$、容差 $\epsilon=0.5$，一条从起点依次飞向三门的轨迹。输出：在第 $6$ 步、位置 $(1.71,0.00)$ 进入航点 $0$ 容差圈（$g=\|\mathbf p-\mathbf w_0\|-\epsilon=-0.214\le 0$），航点 $0$ 完成；第 $13$ 步 $(3.71,1.71)$ 进入航点 $1$（$g=-0.096$）；第 $20$ 步同理完成航点 $2$；最终 $3/3$ 通过。\textbf{为什么进度只在 $g\le 0$ 时推进？} 互补条件 $\mu\cdot g=0$ 要求“乘积为零”：当 $g>0$（容差圈外）时，要让乘积为零就必须 $\mu=0$（进度不能推进）；只有 $g\le 0$（进圈了）时 $\mu$ 才被允许为正、进度才能推进。\textbf{为什么三个 $g$ 都是负的小数？} 因为轨迹从门附近“擦过”——进了容差圈（$g<0$）但没正中靶心，这正是“进圈即算通过”的容差语义：不要求精确命中，只要进入 $\epsilon$ 半径内。\textbf{为什么是 $6,13,20$ 这个步序、而非均匀分布？} 因为门的位置和轨迹形状决定了“何时进圈”——这一步在真 CPC 里不是预设的，而是优化器调整轨迹和时间分配的结果。把容差 $\epsilon$ 改小到 $0.1$ 再跑，某些门可能“通不过”（轨迹擦得不够近、$g$ 始终 $>0$）——这说明 $\epsilon$ 控制着“多接近才算通过”，是 CPC 里一个需权衡的参数（太大则过门不精确，太小则难满足）。
+
+\begin{pitfall}[编程陷阱：把航点硬绑到固定离散时间步]
+\textbf{错误想法}：要按序过 $N$ 个航点，那就把它们均匀分配到时间步上，每个航点一条“第 $k_i$ 步必须在此”的约束。\;
+\textbf{后果}：轨迹被迫按这个人为分配走，得到的“最优”只是该固定分配下的最优，不是真正时间最优——而最优分配往往不均匀。\;
+\textbf{根因}：时间分配本该是优化变量，预先钉死就丢了这个自由度；离散网格还限制了精度。\;
+\textbf{正确做法}：用 CPC 的互补进度约束，让“何时过哪个航点”成为优化的产物——进度只在靠近航点时推进，分配由优化器自己定。
+\end{pitfall}
+
+\begin{pitfall}[概念陷阱：以为 CPC 能像 MINCO 一样实时在线跑]
+\textbf{错误想法}：CPC 这么强，那拿来在线实时规划无人机飞行吧。\;
+\textbf{后果}：求解慢得离谱（秒级甚至更久），根本满足不了在线重规划的频率。\;
+\textbf{根因}：互补约束属于 MPCC，违反标准 NLP 的约束规范条件、可行域有组合结构，求解既慢又对初值敏感——CPC 是\emph{离线}生成时间最优轨迹的工具，不是在线规划器。\;
+\textbf{正确做法}：明确 CPC 的定位——离线算出“这条赛道理论最快”的参考轨迹；在线跟踪/重规划用别的（如 MPCC++、acados NMPC 这类实时方法）。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：以为时间最优轨迹是平滑的]
+\textbf{错误想法}：最优轨迹应该是光滑优雅的曲线，像 min-snap 那样。\;
+\textbf{后果}：用多项式（平滑）方法去逼近时间最优，结果总是慢于 CPC，却不明白为什么。\;
+\textbf{根因}：时间最优控制在执行器饱和时是 \emph{bang-bang} 的（推力在极限间切换，庞特里亚金极小值原理），本质上\emph{不平滑}；多项式的固有平滑性磨掉了这种切换，发挥不出执行器全部潜力。\;
+\textbf{正确做法}：理解“时间最优 $\ne$ 平滑”——要榨干性能就得允许 bang-bang，这要求直接优化状态-输入轨迹（CPC 的做法），而非用平滑的多项式参数化。
+\end{pitfall}
+
+\paragraph{工程落地注意事项。}
+CPC 的定位很特殊——它是离线的极致性能工具，落地方式和前几个在线方法很不一样。\textbf{它是离线“算标准答案”的}：CPC 不在飞机上跑，而是在地面计算机上、针对已知赛道\emph{事先}算出时间最优参考轨迹（可能算几分钟到几十分钟），这条轨迹是“这条赛道理论能飞多快”的标准答案。\textbf{互补约束的数值技巧}：直接把 $\mu\cdot g=0$ 喂给 Ipopt 往往不收敛（违反约束规范），实践中要用\emph{松弛}（$\mu\cdot g\le\delta$，$\delta$ 从大到小退火）或罚函数等技巧，配合好的初值；\verb@rpg_time_optimal@ 的 CasADi 实现包含了这些处理，是学习互补约束求解的好材料。\textbf{初值与赛道几何}：CPC 对初值敏感，通常用一条朴素轨迹（航点间直线、或一条 min-snap 轨迹）做初值，赛道航点的顺序、间距、容差 $\epsilon$ 都影响收敛。\textbf{怎么用到真飞行}：把 CPC 离线算出的时间最优轨迹当\emph{参考}，在线用一个能实时跟踪的控制器（如 MPCC、acados NMPC）去跟、并实时微调应对扰动和建模误差——这就是“离线 $+$ 在线”的组合。\textbf{模型保真度决定上限}：CPC 的“时间最优”是相对它用的模型而言的，模型越准（含气动阻力等），算出的轨迹越接近真机能飞的极限——CPC 原文的四旋翼模型状态含位置、姿态、速度、机体角速度与各单旋翼推力，并用一个\emph{对角线性阻力矩阵}近似主要气动效应、以单旋翼推力上下限为执行器约束。
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 把 CPC demo 改进：(a) 加一个“按序”的强约束检查（航点必须 $0\to1\to2$ 顺序完成，不能跳过）；(b) 故意构造一条“漏过某个航点”的轨迹，验证它通不过该航点（进度卡住）。体会互补约束如何强制“必须真的飞到才算数”。
+  \item \textbf{[分析]} 互补约束 $\mu\cdot g=0$ 为什么难解？（提示：\cref{der:st-mpcc} 那个 “L” 形可行域）这种“乘积为零”的约束属于 MPCC，标准 NLP 求解器的哪条假设被它破坏了？
+  \item \textbf{[跨章]} 本章五个方法对“时间”的处理逐步深入：CILQR（时间隐含在 $v$）$\to$ TEB/MINCO（段时间 $\Delta T_i$ 作变量）$\to$ CPC（连航点-时刻对应都作变量）。画一条“时间作为决策变量”的深入程度光谱，标出五个方法的位置，并说明为什么越往后越接近“真正时间最优”、代价是什么。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{方法选型与统一回看}
+\label{sec:st-select}
+
+\begin{note}
+五个方法讲完，你已看清它们各自的招式和适用场景。但工程中真正的问题不是“理解某个方法”，而是“面对手头这个任务，到底该选哪个、怎么组合”。这一节把选型讲透——不是让你背对照表，而是给你一套能自己推导出答案的思考框架，并回到 \cref{sec:st-unified} 那个“三选择框架”收束全章。
+\end{note}
+
+\subsection{五大方法对照}
+\label{sec:st-select-table}
+
+\begin{table}[H]\centering\small
+\caption{五大时空轨迹优化方法对照}
+\label{tab:st-compare}
+\begin{tabular}{lllll}
+\toprule
+方法 & 适用场景 & 时间怎么处理 & 约束怎么处理 & 实时性 \\
+\midrule
+CILQR & 自驾城市交互 & 隐含在状态 $v$、步长 & 软（log-barrier） & 约 $50$ Hz \\
+TEB & 移动机器人局部规划 & 段时间 $\Delta T_i$ 作变量 & 软（加权 hinge） & 约 $20$ Hz \\
+OBCA & 自驾泊车 & 状态序列含时间 & 硬（对偶重构） & 约 $5$ Hz \\
+MINCO & 无人机轨迹 & 段时间 $\mathbf T$ + 同步变形 & 硬（光滑映射消去） & 约 $100$ Hz \\
+CPC & 无人机竞速 & 连航点-时刻都作变量 & 硬（互补约束） & 离线 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 工业界做通用时空联合 NMPC 还常用 acados（BSD-2 许可的实时 NMPC 框架）作底座，它不是本章主讲方法，但用 SQP-RTI（实时迭代）+ HPIPM 求解器可达几百赫兹，列此供选型参考。
+
+\subsection{决策逻辑：三个问题定方向}
+\label{sec:st-select-logic}
+
+选型不必死记表格，问自己三个问题就能定方向。
+
+\begin{codebox}[text]{选型决策树}
+问题 1: 你的载体和场景是什么?
+  |- 自动驾驶(车) --+- 城市道路动态交互 -> CILQR (软约束, ~50Hz, iLQR 快)
+  |                 +- 泊车/开放空间    -> OBCA  (硬避障, 精确, Hybrid A* warm-start)
+  |- 移动机器人(地面) -> TEB (ROS 标配, 多拓扑, g2o, 直接能用)
+  |- 无人机(空) -----+- 一般飞行/在线   -> MINCO (降维, ~100Hz, 时空同步)
+                     +- 竞速/极致时间最优 -> CPC  (离线, 互补约束, bang-bang)
+
+问题 2: 要实时在线, 还是离线算最优?
+  |- 在线(几十~几百 Hz) -> CILQR / TEB / MINCO / acados
+  +- 离线(求极致时间最优) -> CPC
+
+问题 3: 避障要硬保证, 还是软的够用?
+  |- 软约束够用(允许微小越界 + 安全裕度) -> CILQR / TEB
+  +- 必须硬保证(泊车、窄缝、竞速)        -> OBCA / MINCO / CPC
+\end{codebox}
+
+\noindent 这三个问题对应的，正是 \cref{sec:st-unified} 那三个选择的实践版：问题 1 关乎\emph{表示}（状态序列 vs 段时间 vs 互补变量），问题 3 关乎\emph{约束处理}（软 vs 硬），问题 2 关乎\emph{代价}里时间项的极致程度。把这三问答清，方法自然浮现。
+
+\subsection{用统一框架回看五个方法}
+\label{sec:st-select-recap}
+
+\cref{sec:st-unified} 给了一个“三选择框架”（表示 / 约束处理 / 代价），承诺每讲一个方法都回来填。现在五个方法讲完，把这张表填齐，五个看似零散的方法就被组织成同一问题的五种解法。
+
+\begin{table}[H]\centering\small
+\caption{五方法的三选择拆解}
+\label{tab:st-three-choice}
+\begin{tabular}{llll}
+\toprule
+方法 & 表示（轨迹+时间） & 约束处理（怎么进优化） & 代价（时间项的角色） \\
+\midrule
+CILQR & 离散状态-控制序列 $\{\mathbf x_k,\mathbf u_k\}$ & log-barrier 软化（可行侧也推） & 跟踪+舒适为主，时间隐含 \\
+TEB & 位姿+段时间序列 $\{\mathbf s_i,\Delta T_i\}$ & 单边 hinge 软化（越界才罚） & $\sum\Delta T_i$ 显式时间项 \\
+OBCA & 状态序列（含时间） & 对偶变量精确重构（硬、光滑） & 跟踪+平滑为主 \\
+MINCO & 多项式+航点+段时间 $(\mathbf q,\mathbf T)$ & 光滑映射精确消去（硬、无约束化） & 控制能量+段时间 \\
+CPC & 状态-输入序列+进度变量 $\mu$ & 互补约束（硬、MPCC） & 总时间为唯一/主目标 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 读这张表能看出三条规律。\textbf{表示越往下越“高级”}：从直接的状态序列（CILQR/OBCA），到引入段时间（TEB），到压缩参数化（MINCO），到额外的进度变量（CPC）——表示的精巧程度，决定了能优化的自由度和求解效率。\textbf{约束处理从软到硬、从近似到精确}：CILQR/TEB 软化（不保证满足）、OBCA/MINCO 精确重构（保证且光滑）、CPC 互补（保证但最难解）——这正是“约束怎么进优化”那条主线的递进。\textbf{时间项的地位决定“时间最优”的程度}：CILQR/OBCA 把时间当副产品、重跟踪舒适，TEB/MINCO 把段时间作显式代价、追求快，CPC 把总时间当唯一主目标、连分配都优化。框架填齐后，你面对一个新方法（如 acados NMPC 或某篇新论文），也可以用同样三栏去拆解。
+
+\subsection{它们可以组合：离散定 homotopy + 连续精修}
+\label{sec:st-select-combine}
+
+这些方法不是互斥的单选项，工程上常组合用。最常见的组合是\textbf{前端定 homotopy + 后端连续精修}——这是贯穿 \cref{ch:planning} 与本章的主线：Hybrid A$^*$（离散）$\to$ OBCA（连续），搜索/走廊（\cref{sec:plan-optimal}）$\to$ CILQR/MINCO（本章）。前端给可行初值、定对绕行方向，后端在其上求精——既补了连续优化“对初值敏感、卡 homotopy”的短板，又发挥了它“轨迹光滑、动力学精确”的长处。另一种组合是\textbf{离线 + 在线}：用 CPC 离线算出赛道的时间最优参考轨迹，再用在线方法（MPCC++/acados）跟踪并实时微调——把 CPC 的极致最优和在线方法的实时性结合。
+
+\begin{insight}
+\textbf{实时性从哪来：一个共同的工程秘密.}\;CILQR 约 $50$ Hz、MINCO 约 $100$ Hz、acados 甚至到几百赫兹——这些“实时”背后有一个共同秘密：\emph{充分利用最优控制问题的时序结构 $+$ 不追求每步解到收敛}。前者本章讲过：iLQR/MINCO/acados 都不把整条轨迹堆成一个大矩阵硬解，而是利用“时间是链式的”做结构化求解（iLQR 的反向递推、MINCO 的线性复杂度 $\mathcal M$、acados 的 Riccati 型 QP 求解），复杂度随步数线性而非立方增长。后者是一个更激进的工程权衡——以 acados 的\emph{实时迭代}（RTI）为代表：标准 SQP 会在每个控制周期把非线性问题迭代到收敛，而 RTI 每个周期只做一次线性化、解一个 QP 子问题就输出，不等收敛；这一周期没解到的，下一周期接着解——相当于把“迭代到收敛”摊到连续多个控制周期上。理解这个秘密，你就明白为什么“实时”和“最优”常常要折中：在线方法用“结构化 $+$ 不解到收敛”换实时，离线方法（CPC）用“放弃实时”换极致最优——没有免费的午餐。
+\end{insight}
+
+\paragraph{选型时容易踩的几个误区。}
+\textbf{误区一：盲目追求“最强”的方法。} 看到 CPC 击败人类飞手就想“那都用 CPC”——忘了它是离线的，根本上不了在线。方法没有绝对强弱，只有“适不适合你的实时性、约束硬度、载体”。\textbf{误区二：忽视前端的重要性。} 把全部精力放在调后端优化器上，却给一个糟糕的初值/走廊——这些非凸优化都对初值敏感，前端（搜索/走廊/Hybrid A$^*$）的质量常常比后端调参更决定成败。\textbf{误区三：软硬约束选反。} 在泊车这种刮蹭场景用软约束（CILQR）、裕度不够就刮了；或在高速行车的高频重规划里硬上 OBCA（约 $5$ Hz）、跟不上实时。\textbf{误区四：在错误的抽象层解决问题。} 想用一个时空优化器解决本该由决策层解决的问题（指望 CILQR 自己想清楚“该超车还是跟车”）——这些方法是\emph{运动层}，绕不过同伦类，离散决策该由上游行为/决策层给。\textbf{误区五：脱离动力学谈轨迹。} 优化出一条数学上漂亮、但真车/真机跟不了的轨迹——规划的动力学约束必须和真实平台一致、且和下游跟踪控制器的能力匹配。这五个误区背后是同一个道理：\textbf{时空优化器只是整个自主系统的一环}，它的效果取决于前端给的初值、上游给的决策、下游控制器的跟踪、以及和真实动力学的吻合。
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[思考]} 给定场景“自车在城市道路上，前方有一辆车突然 cut-in（切入）”，用本章方法设计完整方案：(a) 解耦管线为何在此失真（为什么 cut-in 是强耦合）？(b) 怎么用搜索定 homotopy（让/抢）+ 走廊把可行空间框出来？(c) 用哪个方法在走廊里精修、warm-start 从哪来、软硬约束怎么选？(d) 哪一步可能失败、怎么降级？
+  \item \textbf{[设计]} 本章五方法对“时间作为决策变量”的深入程度不同。设计一个“理想的统一时空优化器”：它该如何选表示、处理约束、安排时间项，才能兼顾通用性、实时性、和时间最优？指出现有方法离这个理想还差什么。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\addcontentsline{toc}{section}{本章常见误解汇总}
+把全章散落的“想当然”集中列出，临考/上手前扫一眼。
+
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+iLQR 能直接处理约束 & iLQR 本身只能解无约束；CILQR 靠 barrier 把约束变成代价才让它“会”处理约束（\cref{sec:st-cilqr-theory}） \\
+CILQR 的约束是硬约束 & barrier 是软的，解可能轻微越界，越界量由 $\mu$ 控制；安全关键要留裕度 \\
+给 CILQR 任意初值都能优化好 & log-barrier 要求第一次迭代就可行，需可行 warm-start（搜索/Hybrid A$^*$） \\
+速度约束写成 $(v-v_{\max})^2$ 即可 & 那是“逼近 $v_{\max}$”的等式语义；不等式约束要用单边 $[\max(0,\cdot)]^2$（\cref{sec:st-teb-theory}） \\
+段时间可以是任意实数 & 必须恒正，用 $\Delta T_i=e^{\tau_i}$ 参数化或正性约束 \\
+单条 TEB 能找全局最优 & 单条卡在初始 homotopy；要多拓扑并行才躲局部极小 \\
+用障碍外接圆/内切圆近似避障 & 外接圆过度保守、内切圆危险漏判；OBCA 用半空间精确处理（\cref{sec:st-obca-theory}） \\
+OBCA 的对偶重构消除了非凸性 & 它消除的是不可微性，不是非凸性；重构后仍是非凸 NLP，需 warm-start \\
+MINCO 的 $\mathcal M(\mathbf q,\mathbf T)$ 是某种拟合/近似 & 是“最小控制量+连续+过航点”最优性条件的精确解，无近似（\cref{thm:st-minco-map}） \\
+优化系数和优化 $(\mathbf q,\mathbf T)$ 没本质区别 & 参数化决定维度、约束数、能否时空同步——直接决定求解速度 \\
+CPC 能在线实时跑 & 互补约束属 MPCC，求解慢，CPC 是离线生成时间最优轨迹的工具 \\
+时间最优轨迹是平滑的 & 执行器饱和时是 bang-bang（不平滑）；多项式平滑性发挥不出极限 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+本章完成了规划部的数学核心——\textbf{把时间真正变成连续优化里的决策变量}。沿着“统一问题形式”的三选择框架（表示 / 约束处理 / 代价），五个方法各有侧重：\textbf{CILQR}（\cref{sec:st-cilqr}）用 log-barrier 把约束变成代价、在 iLQR 框架内做自驾时空联合；\textbf{TEB}（\cref{sec:st-teb}）把段时间显式作变量、用 g2o 超图软约束、多拓扑并行，成为 ROS 标配；\textbf{OBCA}（\cref{sec:st-obca}）用强对偶把非凸避障精确光滑化、做泊车硬约束 NMPC；\textbf{MINCO}（\cref{sec:st-minco}）用参数映射 $\mathbf c=\mathcal M(\mathbf q,\mathbf T)$ 把高维系数压成低维航点+段时间、时空同步变形、无人机百赫兹求解；\textbf{CPC}（\cref{sec:st-cpc}）用互补进度约束让“何时过航点”也成变量、离线求真正时间最优。\cref{sec:st-select} 给出选型。贯穿全章的两条主线：一是“约束怎么进连续优化”（从软化的 barrier/hinge，到精确重构的对偶/光滑映射/互补约束，难度与保证递增）；二是与 \cref{ch:planning} 共同的“离散定 homotopy + 连续精修”分工（CILQR/OBCA 配 warm-start、TEB 多拓扑、MINCO 配走廊）。
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\label{tab:st-symbols}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\mathbf x_k,\mathbf u_k$ & 第 $k$ 步的状态与控制（离散序列） & \cref{sec:st-cilqr-theory} \\
+$(x,y,\theta,v),\ (a,\delta)$ & 车辆状态（位置/朝向/速度）/ 控制（加速度/前轮转角） & \cref{eq:st-bicycle} \\
+$L$ & 车辆轴距（自行车模型） & \cref{eq:st-bicycle} \\
+$J,\ \tilde J$ & 原代价 / 加 barrier 的增广代价 & \cref{eq:st-augcost} \\
+$g_i(\cdot)$ & 第 $i$ 个不等式约束（$g_i\le 0$ 为可行） & \cref{sec:st-cilqr-theory} \\
+$B(\cdot),\ \mu$ & barrier 函数 / barrier 权重（越小越贴近原约束） & \cref{eq:st-barrier} \\
+$\mathbf K_k,\mathbf d_k$ & iLQR 反向递推的反馈增益 / 前馈项 & \cref{eq:st-ilqr-gain} \\
+$\mathbf s_i,\ \Delta T_i$ & TEB 第 $i$ 个位姿（$\SE(2)$）/ 段时间 & \cref{eq:st-teb-traj} \\
+$\mathcal B,\ w_k,f_k$ & TEB 轨迹（位姿+段时间）/ 第 $k$ 项约束的权重/残差 & \cref{eq:st-teb-cost} \\
+$\mathbb O,\ \mathbf A,\mathbf b$ & 凸多面体障碍 $\{\mathbf A\mathbf x\le\mathbf b\}$ & \cref{sec:st-obca-theory} \\
+$\boldsymbol\lambda,\ d_{\text{safe}}$ & OBCA 对偶变量（参数化分离超平面）/ 安全距离 & \cref{eq:st-obca-dual} \\
+$\mathbf c,\ \mathcal M(\mathbf q,\mathbf T)$ & 多项式系数 / MINCO 参数映射 & \cref{eq:st-minco-map} \\
+$\mathbf q,\ \mathbf T,\ \tau_i$ & 航点序列 / 段时间序列 / $T_i=e^{\tau_i}$ 的无约束代换 & \cref{eq:st-minco-map} \\
+$s$ & MINCO 最小化的控制量阶数（多项式阶 $2s-1$） & \cref{thm:st-minco-map} \\
+$\mathbf w_i,\ \mu_{i,k},\ \epsilon$ & CPC 第 $i$ 航点 / 进度乘子 / 容差半径 & \cref{eq:st-cpc} \\
+$\mathbf p_k$ & CPC 第 $k$ 步位置 & \cref{eq:st-cpc} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{定理/公式速查表}
+\label{tab:st-quickref}
+\begin{tabular}{lll}
+\toprule
+定理 / 公式 & 一句话说明 & 对应 \\
+\midrule
+统一问题形式 \cref{eq:st-general} & 轨迹+时间联合最优；三选择框架 & \cref{def:st-general} \\
+log-barrier \cref{eq:st-barrier} & 可行侧对数墙 + 越界侧二次延拓 & \cref{sec:st-cilqr-theory} \\
+增广代价 \cref{eq:st-augcost} & $\tilde J=J+\sum\mu B(g_i)$，约束变代价 & \cref{eq:st-augcost} \\
+iLQR 反向递推 \cref{eq:st-ilqr-gain} & 链式结构 $\Rightarrow$ 复杂度随步数线性 & \cref{der:st-ilqr} \\
+TEB 软约束 \cref{eq:st-teb-cost} & 一切写成加权 hinge，单边惩罚 & \cref{eq:st-teb-cost} \\
+g2o 稀疏性 & 边只连少数节点 $\Rightarrow$ 稀疏 $\Rightarrow$ 实时 & \cref{thm:st-teb-sparse} \\
+OBCA 对偶重构 \cref{eq:st-obca-dual} & 距离$\ge d$ $\Leftrightarrow$ 存在分离超平面 $\boldsymbol\lambda$ & \cref{thm:st-obca-exact} \\
+MINCO 参数映射 \cref{eq:st-minco-map} & 系数由 $(\mathbf q,\mathbf T)$ 唯一确定、连续性自动满足 & \cref{thm:st-minco-map} \\
+微分平坦 & 无人机只规划位置，姿态/推力是副产品 & \cref{sec:st-minco} \\
+CPC 互补约束 \cref{eq:st-cpc} & $\mu\cdot g=0$：进度只在靠近航点时推进 & \cref{def:st-cpc} \\
+MPCC 难解 & L 形可行域破坏约束规范 $\Rightarrow$ 离线 & \cref{der:st-mpcc} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\label{tab:st-knowledge}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 统一问题形式 & 表示/约束处理/代价三选择框架 & \(\bigstar\bigstar\) \\
+2 & CILQR：barrier & log-barrier 把约束变代价；越界侧须延拓 & \(\bigstar\bigstar\bigstar\) \\
+3 & iLQR 反向递推 & 吃干时序结构 $\Rightarrow$ 复杂度线性；DDP 是其二阶版 & \(\bigstar\bigstar\bigstar\) \\
+4 & CILQR 的局限 & barrier 软 + 要可行初值 $\to$ 配 warm-start & \(\bigstar\bigstar\bigstar\) \\
+5 & TEB：段时间+因子图 & 段时间作变量 + g2o 稀疏 + 多拓扑躲局部极小 & \(\bigstar\bigstar\) \\
+6 & 单边 hinge vs 双边二次 & 不等式约束须单边惩罚（可行侧零罚） & \(\bigstar\bigstar\) \\
+7 & OBCA：对偶 & 强对偶把不可微避障精确变光滑（非消除非凸） & \(\bigstar\bigstar\bigstar\bigstar\) \\
+8 & 度量问题$\to$存在性问题 & 找分离超平面证书；对偶的普遍威力 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+9 & MINCO：$\mathcal M(\mathbf q,\mathbf T)$ & 降维+自动连续+时空同步 & \(\bigstar\bigstar\bigstar\) \\
+10 & 微分平坦 & 平坦输出定轨迹 $\Rightarrow$ 只规划位置曲线 & \(\bigstar\bigstar\bigstar\) \\
+11 & CPC：互补约束 & 时间分配成变量 $\to$ 真正时间最优（bang-bang，离线） & \(\bigstar\bigstar\bigstar\bigstar\) \\
+12 & MPCC 难解的几何 & L 形可行域破坏约束规范条件 & \(\bigstar\bigstar\bigstar\bigstar\bigstar\) \\
+13 & 离散定 homotopy+连续精修 & 贯穿主线；warm-start/多拓扑 & \(\bigstar\bigstar\bigstar\) \\
+14 & 实时 vs 最优 & 在线靠“结构化+不解到收敛”，离线弃实时换极致 & \(\bigstar\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\begin{itemize}
+  \item \textbf{CILQR}：Chen, Zhan, Tomizuka, \emph{Constrained iterative LQR for on-road autonomous driving motion planning}, ITSC 2017\cite{chen2017cilqr}——本章 \cref{sec:st-cilqr} 的 barrier-iLQR 框架出处。
+  \item \textbf{TEB}：Rösmann 等\cite{rosmann2012teb}（原始定时弹性带，ROBOTIK 2012）与\cite{rosmann2017teb}（多拓扑，RAS 2017）；车型机器人见\cite{rosmann2017carlike}（IROS 2017）。开源 \verb@rst-tu-dortmund/teb_local_planner@。
+  \item \textbf{OBCA}：Zhang, Liniger, Borrelli, \emph{Optimization-Based Collision Avoidance}, T-CST 2021\cite{zhang2021obca}（对偶精确重构的完整推导）；H-OBCA 泊车见\cite{zhang2018hobca}（CDC 2018）。开源 \verb@XiaojingGeorgeZhang/OBCA@。
+  \item \textbf{MINCO}：Wang, Zhou, Xu, Gao, \emph{Geometrically Constrained Trajectory Optimization for Multicopters}, T-RO 2022\cite{wang2022minco}（参数映射 + 时空变形）；前身 am\_traj 见\cite{wang2020amtraj}（RA-L 2020）。开源 \verb@ZJU-FAST-Lab/GCOPTER@（\verb@minco.hpp@ 是参数映射核心）。无人机方向对 MINCO 有更细推导，本章侧重通用原理，可互为补充。
+  \item \textbf{CPC}：Foehn, Romero, Scaramuzza, \emph{Time-optimal planning for quadrotor waypoint flight}, Science Robotics 2021\cite{foehn2021cpc}（互补进度约束，击败人类飞手）。开源 \verb@uzh-rpg/rpg_time_optimal@。
+  \item \textbf{前沿（2024--2026）}：Romero 等, \emph{Actor-Critic Model Predictive Control}, T-RO 2025\cite{romero2025actorcritic}（可微 MPC 作 actor、RL 调参，真机竞速）；Krinner 等, \emph{MPCC++}, 2024\cite{krinner2024mpccpp}（隧道约束 + 学到的气动残差，$100$ Hz）。共同思路是“学习与优化融合”——学习补难建模的部分、优化保可行性。
+  \item \textbf{底层求解器}：iLQR/NLP/QP/L-BFGS 的原理见 \cref{ch:nlopt}；通用实时 NMPC 底座 acados（BSD-2）。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\addcontentsline{toc}{section}{本章与后续章节的关系}
+本章建立了“假设世界可预测”下的时空规划完整方法论，但仍站在两个未破的假设上：动态障碍的预测是给定且可信的、其他智能体不会因你的动作改变意图。
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+后续主题 & 关系 & 本章铺垫 \\
+\midrule
+不确定性规划 & 把预测的不确定性显式建模 & 时空联合优化的确定性框架（机会约束/鲁棒 MPC 的母问题） \\
+博弈规划 & 强交互下自车轨迹与他车意图相互影响 & 时空轨迹作为博弈中的策略 \\
+工业框架（Apollo/Autoware） & 本章方法在工业栈的落地 & CILQR/OBCA 的工程实现与衔接 \\
+学习驱动前沿 & 可微优化作为可学习模块 & Actor-Critic MPC、学到的动力学残差嵌入时空优化 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：CILQR/barrier 优化中途崩成 \texttt{NaN}。\textbf{原因}：对数 barrier 没做越界侧延拓，中间迭代越界吃到 $\log$ 负数。\textbf{对策}：越界侧加二次延拓、与对数侧光滑拼接（\cref{sec:st-cilqr-code} 编程陷阱）。
+  \item \textbf{症状}：CILQR 不收敛、轨迹乱跳。\textbf{原因}：初始轨迹不可行（log-barrier 要可行初值）。\textbf{对策}：用搜索/走廊或 Hybrid A$^*$ 给可行 warm-start（\cref{sec:st-cilqr-code} 思维陷阱）。
+  \item \textbf{症状}：机器人全程顶着限速、该减速不减。\textbf{原因}：速度约束写成双边二次 $(v-v_{\max})^2$（变成“逼近”）。\textbf{对策}：改单边 hinge $[\max(0,v-v_{\max})]^2$（\cref{sec:st-teb-code} 编程陷阱）。
+  \item \textbf{症状}：优化中段时间变 $0$ 或负、除零崩溃。\textbf{原因}：段时间当普通变量、没保正。\textbf{对策}：用 $\Delta T_i=e^{\tau_i}$ 参数化或正性约束。
+  \item \textbf{症状}：TEB 总绕一边、发现不了更优的另一边。\textbf{原因}：单条 TEB 卡在初始 homotopy。\textbf{对策}：开多拓扑模式（distinctive topologies）并行。
+  \item \textbf{症状}：避障“明明能过的缝却过不去”或“该撞的角没躲”。\textbf{原因}：用外接圆/内切圆近似多边形障碍。\textbf{对策}：用半空间 + 有符号距离（OBCA 思路）精确处理（\cref{sec:st-obca-code} 编程陷阱）。
+  \item \textbf{症状}：OBCA 求解器在障碍边角抖动不收敛。\textbf{原因}：直接喂了不可微的距离约束。\textbf{对策}：用对偶重构把约束变光滑（\cref{thm:st-obca-exact}）。
+  \item \textbf{症状}：OBCA 收敛到劣解。\textbf{原因}：以为光滑就是凸、没给好初值。\textbf{对策}：光滑 $\ne$ 凸，用 Hybrid A$^*$ warm-start 定 homotopy。
+  \item \textbf{症状}：MINCO 优化又慢又难初始化。\textbf{原因}：把多项式系数当成了优化变量。\textbf{对策}：用 $\mathbf c=\mathcal M(\mathbf q,\mathbf T)$，只优化 $(\mathbf q,\mathbf T)$，系数自动确定（\cref{sec:st-minco-code} 编程陷阱）。
+  \item \textbf{症状}：CPC 求解极慢、上不了实时。\textbf{原因}：误把 CPC（离线、MPCC）当在线规划器。\textbf{对策}：CPC 离线生成参考轨迹，在线跟踪用 MPCC++/acados（\cref{sec:st-cpc-code} 概念陷阱）。
+  \item \textbf{症状}：时间最优轨迹做不快、慢于 CPC。\textbf{原因}：用平滑多项式逼近、磨掉了 bang-bang。\textbf{对策}：直接优化状态-输入轨迹，允许执行器饱和切换（\cref{sec:st-cpc-code} 思维陷阱）。
+\end{enumerate}

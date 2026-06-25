@@ -1,0 +1,1510 @@
+\chapter{轮式底盘与双臂移动操作}\label{ch:rlmc-wheeled}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章——移动操作分支。
+%  主线：算法/概念领路 —— 每节先立「这个环节有哪些观测/哪些奖励/哪些技巧 + 原理」，
+%  再把每个概念落到 mjlab / Isaac Lab / UniLab 三框架的工程接线。
+%  假定读者已有 RL 基础（理论部 P6_rl 已讲 MDP/策略梯度/AC/PPO；前面实践章已讲
+%  观测·动作·奖励·Manager·DR·特权学习，四足/人形 locomotion）。本章只讲扩展+实战。
+%  源稿 RL运控/Ch21_轮式底盘与双臂移动操作.md（实践偏重）按本主线重构。
+%  联网核对要点（已核）：
+%    - Wheeled Lab：arXiv:2502.07380，CoRL 2025，Tyler Han et al.；
+%      演示三个 zero-shot 策略（drift / elevation / visual nav）。其「首个免在线微调
+%      sim2real 漂移」属源稿措辞，已软化并加注。\cite{han2025wheeledlab}
+%    - MuJoCo condim：1 法向 / 3 +滑动 / 4 +扭转 / 6 +滚动；condim 不能取 2 或 5。
+%      源稿对「condim=4 不含滚动、滚动需 condim=6」的更正经官方文档核实为正确。
+%    - Isaac Lab DelayedPDActuatorCfg：min_delay/max_delay（旧名 min/max_num_time_lags），
+%      继承 IdealPDActuatorCfg，环形缓冲实现，reset 时随机采样延迟（已核）。
+%    - rsl_rl EmpiricalNormalization：running mean/std；但 empirical_normalization 配置
+%      标志在 rsl-rl>=4.0.0 已改为 obs_normalization（已核，文中加注）。
+%    - isaaclab.utils.math.quat_rotate_inverse(q,v)，q 为 (w,x,y,z)（已核）。
+%    - Gu et al. ICRA 2017（arXiv:1610.00633）、Dubins 1957 AJM 79:497-516（已核）。
+%    - 凡未逐字确认的 task id / 字段名 / 默认值，包 \rebuilt{} 或 \pz{待核实：}。
+% ════════════════════════════════════════════════════════════════
+
+前面几章把强化学习运控的\emph{形态}从浮动基座的足式系统铺到了视觉感知与模仿学习。本章切换到工业与服务机器人中最常见的另一类形态——\textbf{轮式底盘搭载机械臂}——来讲移动操作（mobile manipulation）的另一面。四足加臂（\cref{ch:rlmc-quadloco} 的延伸方向）的核心难点是\emph{底盘本身不稳定}：四条腿在行走中持续产生质心扰动，手臂运动进一步改变角动量，策略必须同时兼顾步态稳定与末端精度。轮式底盘把其中的“姿态平衡”彻底移除了——但简化不等于简单。轮式系统引入了自己独特的挑战：\textbf{非完整约束}限制了底盘的运动学自由度，\textbf{轮地接触摩擦}决定了抓取时底盘是否漂移，\textbf{base-arm 动力学耦合}影响搬运的轨迹精度。
+
+本章仍遵循全书「概念领路、实践兑现」的次序。每一节先立\textbf{算法/概念主线}（有哪些观测、哪些奖励、哪些工程技巧，以及背后的原理与反面教训），再在其下排布\textbf{三框架对比实战}：mjlab 与 Isaac Lab 给出可运行的工程接线，UniLab 没有现成轮式底盘移动操作任务，则以其最接近的轮足 Go2W 与带臂 Go2ArmManipLoco 为参照，给出对应的编程模型接线（\verb|apply_action| 内臂走残差位置 PD、轮走速度级两路并存、\verb|_compute_obs| 拼接、scales 字典奖励）。本质洞察先行一步：\textbf{轮式移动操作不是四足移动操作的“简化版”，而是一个独立的问题类}——它的入口应当是\cref{ch:rlmc-manip} 的固定基座操作\emph{向上扩展}（加底盘），而不是四足加臂\emph{向下简化}（去掉腿）。这个视角差决定了本章几乎所有的设计选择。
+
+% ════════════════════════════════════════════════════════════════
+\section{环境配置与版本兼容}
+\label{sec:rlmc-wh-setup}
+
+本章假定你已按 \cref{ch:rlmc-setup} 装好至少一个框架，并完成过 \cref{ch:rlmc-manip} 的固定基座操作（YAM lift cube）。这里只补充\textbf{运行“轮式底盘 + 臂”移动操作额外需要核对的版本点}，不重复通用安装流程。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+要求项 & mjlab & Isaac Lab & UniLab \\
+\midrule
+底盘资产来源 & 自建 MJCF（无内置轮式） & 自建 USD / URDF 转换 & 自建 MJCF/Motrix XML（有轮足 Go2W，无轮式底盘） \\
+轮子速度控制 & \verb|<velocity>| actuator & \verb|ImplicitActuatorCfg(stiffness=0)| & 速度级（Go2W 轮子 \verb|wheel_Kd*(v_tgt-v)|，专属 \verb|wheel_action_scale|；无 velocity-action 类） \\
+复合机器人组装 & \verb|base_spec.attach(arm_spec,...)| & USD scene composition & \verb|fragment_files| 拼装（无运行时 attach） \\
+圆柱碰撞体 & MuJoCo 解析接触 & PhysX GPU 近似为 n-gon & CPU MuJoCo/Motrix 解析接触（无 n-gon） \\
+RL 后端 & RSL-RL（唯一） & RSL-RL / RL-Games / SKRL & RSL-RL（PPO）/ APPO / SAC / TD3 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[三个框架都\emph{没有}内置“轮式底盘 + 臂”移动操作任务（UniLab 也无，但有最近的两个亲戚）]
+与四足/人形不同，三大框架都不自带“轮式底盘 + 臂”的现成任务，本章的所有环境都需要\textbf{自建资产 + 复用操作组件}。UniLab 同样没有轮式底盘移动操作任务，但它的注册任务集里有两个\emph{最接近}的亲戚可作骨架：\textbf{Go2W}（\verb|envs/locomotion/go2w|，\verb|Go2WJoystickFlat/Rough|，轮足机器人——\emph{实测}轮子是\emph{速度级}控制：\verb|go2w/joystick.py| 构造 \verb|wheel_velocity_targets = action[wheels]*wheel_action_scale|，\verb|compute_go2w_motor_ctrl| 用 \verb|wheel_Kd*(v_target-v_cur)| 出力矩，与残差到 \verb|default_angles| 的腿\emph{不同}）与 \textbf{Go2ArmManipLoco}（\verb|envs/locomotion/go2_arm|，四足 + 臂的 loco-manipulation——真正的 base-arm 耦合范例）。本章把它们当作“UniLab 怎么接 base-arm 协调与轮子”的参照，而非现成轮式任务。这反而让本章成为最好的“从零搭环境”练习——它把前面所有零件（观测、动作、奖励、课程、DR）组合到一个全新形态上，且没有现成代码可抄。社区参考是 \verb|awesome-loco-manipulation|（\verb|github.com/aCodeDog/awesome-loco-manipulation|），提供 Clearpath Ridgeback + UR5 等真实平台的 URDF。\rebuilt{awesome-loco-manipulation 仓库确含 Clearpath Ridgeback + UR5 等真实平台的 URDF（已核）。UniLab 的 Go2W 轮速接口已实跑核对（轮子为速度级 \texttt{wheel\_Kd*(v\_tgt-v)}、专属 \texttt{wheel\_action\_scale=10.0}）；其完整资产清单与 Go2ArmManipLoco 的臂动作切分细节仍以 UniLab 当前源码为准。}
+\end{note}
+
+\paragraph{操作系统与依赖。}mjlab 侧依赖 MuJoCo（含 MuJoCo Warp）与 \verb|uv| 环境，Linux/macOS 均可，GPU 训练需 CUDA。Isaac Lab 侧依赖 Isaac Sim，仅支持 Linux + NVIDIA GPU（参见 \cref{ch:rlmc-setup} 的兼容表）。本章不引入新的系统级依赖——轮式底盘的物理都建立在已有引擎之上。
+
+% ════════════════════════════════════════════════════════════════
+\section{Quick Start：五分钟看一个轮式底盘动起来}
+\label{sec:rlmc-wh-quickstart}
+
+由于没有内置任务，这里的 Quick Start 不是“跑一个现成 task”，而是\textbf{用最小 MJCF 验证一个差速底盘能直行、能原地转、不能横移}——这是本章一切设计的物理地基。下面的 MJCF 可直接复制到文件后用 MuJoCo viewer 加载。
+
+\begin{codebox}[bash]{mjlab：用 MuJoCo viewer 看差速底盘（5 分钟）}
+# 把下一段 XML 存成 diffdrive.xml，再用 MuJoCo 自带 viewer 打开。
+python -m mujoco.viewer --mjcf diffdrive.xml
+# 在 viewer 的 control 面板手动给两个 wheel actuator 赋值：
+#   左右同号同值 -> 直行；左右异号 -> 原地旋转；试图“横推”底盘 -> 立刻被摩擦拉回。
+\end{codebox}
+
+\begin{codebox}[Python]{Isaac Lab：用虚拟臂抽象快速验证底盘运动（概要）}
+# Isaac Lab 侧无 MuJoCo viewer。最快的验证是用「虚拟臂抽象」（见后文“USD 配置与 n-gon 伪影”一节）
+# 直接对 root body 施加 (v_x, v_y, omega) 命令，省去轮子物理：
+# ./isaaclab.sh -p scripts/.../play.py --task <TASK_ID> --num_envs 4
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab：五分钟看最近的轮式平台（轮足 Go2W，无差速底盘任务）}
+# UniLab 无 MuJoCo viewer、也无“差速底盘 + 臂”现成任务。最近的可跑亲戚是轮足 Go2W
+# （实测：轮子是【速度级】控制——wheel_velocity_targets=action*wheel_action_scale，
+#  力矩=wheel_Kd*(v_target-v_cur)；与残差到 default_angles 的腿不同）。先冒烟训几步：
+uv run train --algo ppo --task go2w_joystick_flat --sim mujoco \
+    algo.num_envs=16 algo.max_iterations=1 training.no_play=true   # 冒烟（env/迭代走 Hydra 覆盖）
+# 预期首屏：~340 steps/s（RTX4080S/16env 冷启，小并行偏低属正常）、reward/* 各项更新、无 NaN。
+# 看带臂 loco-manipulation（base-arm 耦合的真实范例）的回放：
+uv run demo locomani        # 实测需先有本地 stage-2 checkpoint 才跑得起，否则会因缺权重退出
+# UniLab 侧验证“差速直行/原地转/不可横移”需自建 MJCF + 注册任务（本章无现成 UniLab 命令）。
+\end{codebox}
+
+下面是可直接加载的差速底盘最小 MJCF（两驱动轮 + 一被动万向轮 + 地面）。注意三处工程关键：驱动轮 \verb|condim="4"|（法向 + 滑动 + 扭转摩擦，足以产生牵引与原地旋转）、actuator 用 \verb|velocity| 类型（控制轮\emph{角速度}而非位置）、被动万向轮阻尼远小于驱动轮。
+
+\begin{codebox}[text]{diffdrive.xml：差速底盘最小可跑骨架}
+<mujoco model="diffdrive">
+  <option timestep="0.002"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1" condim="3"/>
+    <body name="base" pos="0 0 0.15">
+      <freejoint name="base_joint"/>
+      <geom name="chassis" type="box" size="0.3 0.25 0.08" mass="15.0"
+            condim="1" contype="0" conaffinity="0"/>
+      <body name="left_wheel" pos="0 0.28 -0.07">
+        <joint name="left_wheel_joint" type="hinge" axis="0 1 0" damping="0.5"/>
+        <geom type="cylinder" size="0.08 0.025" mass="0.5"
+              condim="4" friction="1.0 0.005 0.0001"/>
+      </body>
+      <body name="right_wheel" pos="0 -0.28 -0.07">
+        <joint name="right_wheel_joint" type="hinge" axis="0 1 0" damping="0.5"/>
+        <geom type="cylinder" size="0.08 0.025" mass="0.5"
+              condim="4" friction="1.0 0.005 0.0001"/>
+      </body>
+      <body name="castor" pos="0.25 0 -0.10">
+        <joint name="castor_yaw" type="hinge" axis="0 0 1" damping="0.01"/>
+        <joint name="castor_roll" type="hinge" axis="1 0 0" damping="0.01"/>
+        <geom type="sphere" size="0.04" mass="0.1"
+              condim="3" friction="0.3 0.001 0.0001"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <velocity name="left_wheel_vel"  joint="left_wheel_joint"  kv="10.0" ctrlrange="-10 10"/>
+    <velocity name="right_wheel_vel" joint="right_wheel_joint" kv="10.0" ctrlrange="-10 10"/>
+  </actuator>
+</mujoco>
+\end{codebox}
+
+\begin{pitfall}[用位置控制（\texttt{position} actuator）驱动轮子]
+\textbf{错误描述}：照搬臂关节的做法，给轮子配 \verb|position| actuator 或 \verb|JointPositionActionCfg|。\textbf{现象后果}：轮子\emph{来回摆动}到某个目标角度而非连续转动——目标 $\pi$ rad 时转半圈停，下一步目标 $2\pi$ 再转半圈。底盘根本走不动。\textbf{根本原因}：轮子的控制语义是\emph{速度级}的，真实差速底盘的电机控制器接受速度指令（内部 PID 闭环），位置级控制与之物理语义不符。\textbf{正确做法}：轮子用 \verb|velocity| actuator（mjlab）或 \verb|ImplicitActuatorCfg(stiffness=0, damping>0)|（Isaac Lab）；臂关节才用位置控制。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{前置自测}
+\label{sec:rlmc-wh-pretest}
+
+本章是移动操作的综合实战，依赖固定基座操作与若干前置实践章。下面五题覆盖最关键的前置概念，\textbf{答不出 $\ge 3$ 题，先回对应章节复习再继续}。
+
+\begin{practice}[开课前自测]
+\begin{enumerate}
+\item （操作）\cref{ch:rlmc-manip}：固定基座 YAM lift cube 用什么 action 类型？默认 action 维度是多少（臂 + 夹爪）？（答错回看 \cref{ch:rlmc-manip}）
+\item （动作）\cref{ch:rlmc-obsact}：若把不同量纲的动作（轮速 rad/s 与臂关节增量 rad）拼进\emph{同一个}无量纲向量、共享一个全局 action std，会出现什么？（答错回看 \cref{ch:rlmc-obsact}）
+\item （奖励）\cref{ch:rlmc-reward}：staged reward 的乘法门控 $r_{\text{reach}}\times(1+r_{\text{bring}})$ 相比简单加权 $w_1 r_{\text{reach}}+w_2 r_{\text{bring}}$ 有何优势？（答错回看 \cref{ch:rlmc-reward}）
+\item （物理）差速驱动两轮机器人能否横向平移？这种约束在控制理论中叫什么？（答错回看本章 \cref{sec:rlmc-wh-modeling}）
+\item （DR）\cref{ch:rlmc-dr}：EventManager 的 startup / reset / interval / step 四模式分别适合随机化什么？（答错回看 \cref{ch:rlmc-dr}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{本章目标}
+\label{sec:rlmc-wh-goals}
+
+学完本章，你应该\textbf{能够}（每条都可当场验收）：
+
+\begin{enumerate}
+\item \textbf{说清}轮式移动操作与足式移动操作在动作空间、稳定性约束、非完整约束、base-arm 耦合四个维度上的本质差异；
+\item \textbf{建模并验证}差速驱动底盘的 MJCF/USD（直行 / 原地转 / 不可横移），并配对正确的 \verb|condim| 与 actuator 类型；
+\item \textbf{配置}轮速 + 臂关节 + 夹爪的混合动作空间，用系统化方法选定各组 \verb|scale| 使量纲对齐；
+\item \textbf{设计}底盘里程计 + 臂状态 + 目标关系的完整 observation，并把相对向量正确地转换到 base frame；
+\item \textbf{实现}从固定底盘抓取到移动搬运的五阶段 curriculum，并配置性能门控的推进/回退；
+\item \textbf{诊断}并用三种方案（stop reward / brake action / 增大摩擦）解决抓取时底盘漂移；
+\item \textbf{在 mjlab 与 Isaac Lab 双框架}完成轮式 + YAM 环境的组装、注册与分阶段验证。
+\end{enumerate}
+
+\paragraph{知识导航。}本章在全书中的位置如下。
+
+\begin{center}
+\begin{forest}
+navtree,
+[{本章：轮式 + 双臂移动操作}
+  [{形态定位}
+    [{轮式 vs 足式}]
+    [{非完整约束}]]
+  [{算法概念主线}
+    [{底盘建模：差速 / 全向}]
+    [{混合动作空间}]
+    [{观测：里程计 + 目标关系}]
+    [{五阶段 curriculum}]
+    [{底盘漂移对策}]
+    [{多阶段奖励}]]
+  [{三框架接线}
+    [{mjlab：spec attach}]
+    [{Isaac Lab：虚拟臂 / USD}]
+    [{UniLab：Go2W / Go2ArmManipLoco 参照}]]
+  [{集成实战}
+    [{从零搭环境}]
+    [{分阶段验证}]]]
+\end{forest}
+\end{center}
+
+\paragraph{前置桥接。}本章在\cref{ch:rlmc-manip}（固定基座 YAM lift cube：staged reward / \verb|JointPositionAction| / DiffIK）之上\emph{加一个会动的底盘}。它复用 \cref{ch:rlmc-obsact} 的观测/动作五原则、\cref{ch:rlmc-reward} 的奖励四层与课程、\cref{ch:rlmc-dr} 的事件四模式，并与\cref{ch:rlmc-quadloco} 的四足加臂形成\emph{对照}。读完后，\cref{ch:rlmc-privileged} 的非对称 actor-critic 会在本章的 critic privileged 观测里再次出现。
+
+\paragraph{阅读时间。}精读（含动手搭环境）约 4--5 小时；速读（抓主线 + 看陷阱）约 70 分钟；查阅（按节定位某个配置/陷阱）约 10 分钟。
+
+% ════════════════════════════════════════════════════════════════
+\section{形态定位：轮式移动操作为什么是独立问题类}
+\label{sec:rlmc-wh-positioning}
+
+\paragraph{模块功能与在管线中的位置。}本节不写代码，它确立\textbf{问题边界}：在整个移动操作谱系中，轮式底盘 + 臂处在哪个位置，与足式相比哪些挑战消失了、哪些新挑战出现了。把这个边界想清楚，后面的动作/观测/奖励设计才有依据；想不清楚，最常见的错误就是“把轮式当简化版四足来做”，把四足那一套稳定性奖励和关节级动作原封不动搬过来。
+
+\paragraph{动机：简化不等于简单。}四足加臂的核心难点是底盘本身不稳定——四条腿在行走中持续产生周期性质心扰动，手臂运动进一步改变角动量，感知与控制必须同时应对步态稳定与末端精度两个目标。轮式底盘把其中“姿态平衡”部分彻底移除：四轮接触地面，平地上几乎不翻倒，策略可把全部注意力集中在导航与操作上。但它引入了自己的难题——非完整约束、底盘漂移、base-arm 耦合。在工业场景中，轮式移动操作的应用范围远大于足式：仓储取放、医疗运送、办公室服务，共同特征是地面平坦可预测，但\emph{导航精度与操作可靠性要求极高}（厘米级停车 + 拥挤货架取物）。
+
+\begin{insight}[底盘稳定把难度从“平衡”转移到“精度与协调”，而非消除难度]\label{ins:rlmc-wh-stable}
+一个普遍误判是“轮式底盘不会摔倒，所以训练一定比四足容易”。实际上轮式的难点从\emph{姿态平衡}转移到了\emph{导航精度与 base-arm 协调}：底盘必须精确停在货架前（厘米级），臂必须从拥挤空间取出正确物品——这种定位精度在四足任务里通常不是主要考量。评估任务难度时，要同时计入底盘控制精度与操作控制精度，而不是只看“会不会摔”。
+\end{insight}
+
+\paragraph{三种移动操作形态的系统对比。}下表把轮式放进谱系里横向比较。读它的正确方式是关注\emph{差异列}：动作空间类型、非完整约束、base-arm 耦合强度——这三项决定了你要不要、以及如何复用前面章节的代码。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+维度 & 轮式底盘 + 臂 & 足式底盘 + 臂 & 人形全身 \\
+\midrule
+底盘稳定性 & 天然稳定（四/三轮接触） & 需主动平衡 & 需全身协调 \\
+地形适应性 & 仅平地或小坡 & 粗糙地形 / 台阶 & 最灵活 \\
+运动学约束 & 非完整（差速不可横移） & 冗余自由度 & 高度冗余 \\
+base-arm 耦合 & 弱（底盘质量大） & 中（臂改变质心、影响步态） & 强（上肢直接改角动量） \\
+训练难度 & 中（课程主要在操作侧） & 高（稳定 + 操作双目标） & 最高 \\
+工业部署量 & 最大（物流 / 医疗） & 少量研究机 & 极少量 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{如果把轮式当成“简化版四足”来做会怎样。}最常见的错误是直接复制四足加臂架构，只把“腿”换成“轮子”。这会产生三个问题：（1）\textbf{动作空间不匹配}——四足底盘动作是 12 个腿关节角（位置级），轮式底盘动作是 2 个轮速（差速，速度级），物理语义完全不同；用位置控制驱动轮子，轮子会摆动而不是连续转。（2）\textbf{稳定性奖励变噪声}——base orientation、foot contact timing、body height 这些项对轮式要么不适用、要么恒为零，保留它们只增加无意义的计算与 reward 噪声。（3）\textbf{非完整约束被忽略}——差速底盘不能横移，必须“先转向再前进”；若 observation 不含底盘朝向与目标方向的关系，策略学不会高效导航。
+
+\begin{insight}[轮式的正确入口是“固定基座操作向上扩展”，不是“四足向下简化”]\label{ins:rlmc-wh-entry}
+从代码复用看，轮式 + 臂应当从\cref{ch:rlmc-manip} 的固定基座 YAM lift cube 出发——保留臂的 staged reward、夹爪接触、DiffIK，然后\emph{加}一个会动的底盘（新增底盘动作、底盘里程计观测、导航奖励）。这是增量式扩展，新增的 manager term 不破坏已有 term。若反过来从四足加臂\emph{删}腿、改稳定性奖励，你会发现要删的比要加的多，且容易残留对底盘已经不成立的假设。这正是 manager-based 架构的设计目标：每个 term 是独立模块，增删互不影响。
+\end{insight}
+
+\paragraph{非完整约束如何改变 RL 的学习难度（本质洞察）。}非完整约束不只影响运动学，还深刻改变学习难度。全向底盘的动作空间到工作空间是\emph{满射}——任意时刻可向任意方向移动；差速底盘需要学会“时序性运动规划”——先旋转对齐目标方向，再前进。这要求策略有一定的“记忆”或“预判”能力：单步 MLP 在差速底盘上明显弱于全向底盘，因为它每一步只能看当前状态做决策，难以规划“先转后走”的两步序列。更抽象地说，非完整约束导致了状态空间的\textbf{拓扑结构变化}：全向底盘的可达空间是欧几里得平面 $\mathbb{R}^2$（两点间最短路径是直线），差速底盘的配置空间是 $\SE(2)$（位置 + 朝向），两配置间的最短路径通常不是直线而是曲线（Dubins 路径或 Reeds--Shepp 路径）。RL 在 $\SE(2)$ 上学习路径规划比在 $\mathbb{R}^2$ 上更难，因为价值函数要编码更复杂的距离度量。Dubins 路径的数学源头是 Dubins 1957 的经典工作（\textit{Amer.\ J.\ Math.}\ 79:497--516）\,\cite{dubins1957curves}：曲率受限、给定起止位置与切向的最短路径。
+
+\begin{insight}[把 $(\cos\alpha,\sin\alpha)$ 喂给策略，是在帮它跨越非完整约束的时序鸿沟]\label{ins:rlmc-wh-heading}
+如果 observation 包含底盘朝向与目标方向的角度差 $\alpha$，且用 $(\cos\alpha,\sin\alpha)$ 编码，策略可以学到“当 $|\alpha|$ 大时先旋转、当 $|\alpha|$ 小时前进”的条件策略。若不含朝向信息，策略只能通过 base-to-object 向量的变化\emph{间接}推断朝向错了——这种间接推断需要多得多的训练样本。这就是后文 \cref{sec:rlmc-wh-obs} 把 heading 编码列为关键 obs term 的根本原因：它不是冗余信息，而是把一个时序规划问题\emph{部分地}转化成了反应式问题。
+\end{insight}
+
+\begin{pitfall}[把全向底盘训出的策略直接搬到差速底盘]
+\textbf{错误描述}：用全向底盘训练，部署到差速底盘。\textbf{现象后果}：策略每次需要横移时输出侧向速度，差速底盘无法执行；若侧向指令被硬件忽略，有效动作空间缩小、效率下降；若被工程近似映射为旋转，策略“期望横移却在旋转”，spatial reasoning 完全失效。\textbf{根本原因}：这不是参数不确定性，而是\emph{运动学结构差异}——Domain Randomization 无法弥补。\textbf{正确做法}：训练与部署的底盘构型必须一致；若必须跨构型，要在动作抽象层做显式适配，而非寄望策略自适应。
+\end{pitfall}
+
+\begin{practice}[形态定位]
+\begin{enumerate}
+\item （对比题）列表对比轮式与四足在五个维度的差异：动作空间类型、稳定性约束、非完整约束、base-arm 耦合强度、典型训练 curriculum。给出验收：每个维度一句话，指出“为什么这个差异决定了代码能否复用”。
+\item （设计题）医院走廊场景：机器人从 A 房间取药送到 B 房间，走廊平坦有弯道，门需推开。选轮式还是足式？列至少三个决策因素。
+\item （思考题）为什么 RNN/LSTM 策略在差速底盘上比 MLP 更有优势？从非完整约束导致的时序规划需求角度分析。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{底盘建模：差速驱动与全向轮}
+\label{sec:rlmc-wh-modeling}
+
+\paragraph{模块功能与在管线中的位置。}底盘建模是整条管线的物理地基——它决定了“底盘能动、且只能按其运动学约束动”。建错了，上层的动作/观测/奖励全都建立在错误的物理上：摩擦设错底盘走不动或抓取时漂移，自由度设错差速底盘能横移（仿真里能、真机上不能）。本节给出两种主流构型的 MJCF/USD 建模，并把非完整约束的工程表现讲清。
+
+\paragraph{动机：两种构型的运动学差异。}轮式底盘的运动学取决于轮子数量与布置。\textbf{差速驱动}最简单：两个独立控制的驱动轮 + 一到两个被动万向轮（castor）。两轮同速直行、异速转弯、反速原地旋转。关键约束是\emph{不能横向平移}——目标在正右方时，必须先原地转 90 度再前进。这在控制理论中称\textbf{非完整约束}（nonholonomic constraint），数学表达为 $\dot{y}\cos\theta-\dot{x}\sin\theta=0$（$\theta$ 为底盘朝向角）。\textbf{全向轮}（Mecanum/Swedish）通过特殊滚轮排列消除横向约束，有三个独立控制量：前进 $v_x$、横移 $v_y$、旋转 $\omega_z$。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+构型 & 驱动轮数 & 控制维度 & 非完整约束 & 典型平台 \\
+\midrule
+差速驱动 & 2 & 2（$v,\omega$） & 有（不可横移） & TurtleBot / Fetch / Pioneer 3-DX \\
+全向 3 轮 & 3 & 3（$v_x,v_y,\omega$） & 无 & Festo Robotino（3 全向轮） \\
+Mecanum 4 轮 & 4 & 3（$v_x,v_y,\omega$） & 无 & Clearpath Ridgeback / Kuka youBot base \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{差速驱动运动学}
+\label{sec:rlmc-wh-kinematics}
+
+在设计观测与奖励之前，必须理解轮速与底盘速度之间的映射——它是后面所有“轮速 $\leftrightarrow$ $(v,\omega)$”换算的基础。设左/右轮角速度 $\omega_L,\omega_R$，轮半径 $r$，轮距（两轮中心距）$d$。左右轮线速度 $v_L=r\omega_L$、$v_R=r\omega_R$。底盘中心的线速度与角速度为
+
+\begin{equation}
+v=\frac{v_L+v_R}{2}=\frac{r(\omega_L+\omega_R)}{2},\qquad
+\omega=\frac{v_R-v_L}{d}=\frac{r(\omega_R-\omega_L)}{d}.
+\label{eq:rlmc-wh-fwdkin}
+\end{equation}
+
+反过来，给定目标 $(v,\omega)$，轮速为
+
+\begin{equation}
+\omega_L=\frac{v-\omega d/2}{r},\qquad \omega_R=\frac{v+\omega d/2}{r}.
+\label{eq:rlmc-wh-invkin}
+\end{equation}
+
+\paragraph{两种动作参数化的权衡。}策略既可直接输出两个轮速 $(\omega_L,\omega_R)$（低级控制，灵活但学习更难），也可输出 $(v,\omega)$ 再经式~\eqref{eq:rlmc-wh-invkin} 换算（高级控制，符合直觉但限制动作表达）。推荐做法：训练初期用 $(v,\omega)$ 降低学习难度，高级阶段切换为 $(\omega_L,\omega_R)$ 获得更大灵活性；或始终用 $(\omega_L,\omega_R)$，但在观测里提供 $(v,\omega)$ 的估计帮助策略理解底盘运动。这一点与 \cref{ch:rlmc-quadloco} 的“动作抽象层次”讨论同构——抽象层次越高，学习越快但天花板越低。
+
+\subsection{MJCF 中的差速底盘：condim 与 actuator 是两个生死参数}
+\label{sec:rlmc-wh-mjcf}
+
+\cref{sec:rlmc-wh-quickstart} 已给出可跑的 MJCF 骨架。这里做\textbf{配置详解}，把两个最容易出错的参数摊开讲。
+
+\paragraph{配置详解（四维表）。}下表对底盘建模的关键配置项给出“默认/常用值、修改影响、合理范围、与其他配置的耦合”四维视图。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.4cm}p{2.0cm}p{3.4cm}p{2.2cm}p{2.6cm}@{}}
+\toprule
+配置项 & 常用值 & 修改影响 & 合理范围 & 耦合 \\
+\midrule
+驱动轮 \verb|condim| & 4 & 1=无切向力底盘走不动；3=无扭转、原地转吃力；6=加滚动阻力 & 3 或 4（必要时 6） & 与 \verb|friction| 通道生效与否绑定 \\
+\verb|friction| (滑/扭/滚) & \verb|1.0 0.005 0.001| & 滑动决定抓地与漂移阈值；扭转影响原地旋转能耗 & 滑动 0.6--1.2 & \verb|condim<6| 时第三个（滚动）值不生效 \\
+actuator 类型 & \verb|velocity| & 决定控制是速度级还是位置级 & 轮子必须 velocity & 与 \verb|kv| / Isaac \verb|damping| 等价 \\
+被动轮阻尼 & 0.01 & 太大则转向阻力大、策略学“少转弯” & 比驱动轮小 $\ge 1$ 量级 & 与底盘旋转难度耦合 \\
+底盘自由度 & \verb|freejoint| & 决定底盘能否自由移动 & 6 DOF 浮基 & 与“是否显式建轮子”绑定 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[\texttt{condim=4} 是“扭转”不是“滚动”——一个常被抄错的细节]
+经 MuJoCo 官方文档核实：\verb|condim=1| 仅法向；\verb|condim=3| 法向 + 滑动（切向）摩擦；\verb|condim=4| 在此基础上加\emph{扭转}摩擦（对应 soft-finger 接触，抵抗绕接触法线的旋转）；\verb|condim=6| 才加\emph{滚动}摩擦（例如阻止小球在平面上无限滚动）。\verb|friction| 的三个值是滑动/扭转/滚动系数，但\textbf{哪些通道真正参与约束由 condim 决定}：\verb|condim=4| 下第三个（滚动）系数\emph{不生效}。此外 \verb|condim| 不能取 2 或 5（两个切向、两个滚动方向各成对处理）。源稿对这一点的更正是正确的，本章沿用。
+\end{note}
+
+\verb|condim="4"| 对差速驱动已足够：滑动摩擦提供抓地力、扭转摩擦影响原地旋转能耗；若确需建模滚动阻力再用 \verb|condim="6"|。\verb|velocity| actuator 直接控制轮子角速度（rad/s），这与真实差速底盘“电机控制器接受速度指令、内部 PID 闭环”的惯例一致；在 RL 中，action 输出轮速、经 \verb|scale| 后直接作为 velocity actuator 目标。
+
+\paragraph{抽象底盘模型（方案 B，慎用）。}若不关心轮子接触物理，可跳过显式轮子，直接对底盘施外力/外力矩驱动。这训练更快（无轮子接触计算），但\emph{失去了底盘漂移的物理反馈}——策略不会学到“抓取时锁轮”，因为底盘是被力直接驱动而非通过轮地摩擦间接驱动。
+
+\begin{insight}[底盘建模精细程度是“仿真精度”与“训练效率”的双重解读]\label{ins:rlmc-wh-fidelity}
+同一件事可从两个角度看：\emph{角度一（仿真精度）}——显式轮子接触产生更真实的底盘动力学，利于 sim2real；\emph{角度二（训练效率）}——抽象底盘减少接触计算量，加速训练。正确选择取决于任务：若底盘漂移是核心挑战（精密定位、漂移控制、打滑恢复），用显式轮子；若底盘只是“搬运工具”、精度要求低，抽象模型即可。本章教学实战在 mjlab 侧用显式轮子（充分暴露漂移问题），在 Isaac Lab 侧用虚拟臂抽象（规避下文的 n-gon 伪影）。
+\end{insight}
+
+\subsection{Isaac Lab 中的轮式底盘：USD 配置与 n-gon 伪影}
+\label{sec:rlmc-wh-isaac-base}
+
+Isaac Lab 用 USD 定义资产，建模思路与 MJCF 类似但 API 与参数名不同。纯速度控制的轮子用 \verb|ImplicitActuatorCfg(stiffness=0, damping>0)|——当 stiffness 为零时 actuator 不追踪位置、只通过阻尼项产生力矩 $\tau=D\,(v_{\text{target}}-v_{\text{current}})$，等价于 MuJoCo 的 \verb|velocity| actuator。
+
+\begin{codebox}[Python]{Isaac Lab 差速底盘 ArticulationCfg（字段名以版本为准）}
+from isaaclab.assets import ArticulationCfg
+from isaaclab.actuators import ImplicitActuatorCfg
+
+WHEELED_BASE_CFG = ArticulationCfg(
+    spawn=UsdFileCfg(usd_path="path/to/wheeled_base.usd"),
+    init_state=ArticulationCfg.InitialStateCfg(
+        pos=(0.0, 0.0, 0.15),
+        joint_vel={"left_wheel_joint": 0.0, "right_wheel_joint": 0.0},
+    ),
+    actuators={
+        "wheels": ImplicitActuatorCfg(
+            joint_names_expr=["left_wheel_joint", "right_wheel_joint"],
+            velocity_limit=10.0,
+            effort_limit=50.0,
+            stiffness=0.0,   # 纯速度控制，无位置刚度
+            damping=10.0,    # 阻尼 = kv
+        ),
+    },
+)
+\end{codebox}
+
+\paragraph{一个影响严重但常被忽视的工程限制：PhysX 对圆柱碰撞体的近似。}PhysX 的 GPU 碰撞检测\emph{不原生支持}精确的 cylinder-plane 接触——它把 cylinder 近似为一个 n-gon（多面体）。轮子每转过一个面的角度，接触法线方向就离散跳变一次，产生周期性接触力扰动。对缓慢滚动的轮子这够好；但对高速旋转（如 10 rad/s），n-gon 的离散接触频率可能与策略控制频率\emph{干涉}——策略可能学到利用这些离散模式（在特定旋转角施加更大推力），而这些模式真机上不存在，sim2real 时底盘行为异常。
+
+\begin{insight}[两种规避 n-gon 伪影的工程方案]\label{ins:rlmc-wh-ngon}
+\emph{方案 A（替代碰撞几何）}：用球体或胶囊体替代 cylinder 作轮子碰撞体——球-平面接触在 PhysX 中是精确解析的，无 n-gon 问题；代价是视觉上不像轮子、球体侧向无方向性，但若摩擦已由参数建模则可接受（视觉 mesh 仍用 cylinder，仅碰撞 mesh 换球）。\emph{方案 B（虚拟臂抽象）}：完全跳过轮子物理，把底盘建成平面上的虚拟 2/3-DOF “臂”，动作是 $(v,\omega)$ 或 $(v_x,v_y,\omega)$，用 PD 把速度命令转成外力/外力矩施加到 root body。这是 Isaac Lab 社区处理轮式底盘的常见做法，适用于\emph{任务重点在操作而非底盘动力学}的场景。\rebuilt{方案 B 这种“把底盘建成虚拟臂、用外力驱动”的抽象是社区工程经验，非官方提供的现成任务；其底层外力接口在 Isaac Lab 中为关节体的 \texttt{set\_external\_force\_and\_torque()}（较新版本正逐步迁移到可组合的 wrench composer 系统），调用后需在仿真步前 \texttt{write\_data\_to\_sim()}，具体签名以你所装版本为准。}
+\end{insight}
+
+\begin{codebox}[Python]{虚拟臂抽象：直接施外力驱动底盘（Isaac Lab 概要）}
+class VirtualBaseAction:
+    """直接用力/力矩驱动底盘，跳过轮子物理。action: [B, 3] = (v_x, v_y, omega)。"""
+    def apply(self, env, action):
+        base_vel    = env.robot.data.root_link_lin_vel_b[:, :2]   # [B, 2]
+        base_angvel = env.robot.data.root_link_ang_vel_b[:, 2:3]  # [B, 1]
+        vel_target    = action[:, :2]  * self.scale_lin
+        angvel_target = action[:, 2:3] * self.scale_ang
+        force_xy = self.kp_lin * (vel_target    - base_vel)
+        torque_z = self.kp_ang * (angvel_target - base_angvel)
+        # Isaac Lab 签名：set_external_force_and_torque(forces, torques, body_ids=...)
+        # forces/torques 形状 (num_envs, num_bodies, 3)，此处对 base body 施加（需带 body 维与 body_ids）
+        env.robot.set_external_force_and_torque(
+            forces =torch.cat([force_xy, torch.zeros_like(torque_z)], dim=-1).unsqueeze(1),
+            torques=torch.cat([torch.zeros_like(force_xy), torque_z], dim=-1).unsqueeze(1),
+            body_ids=self.base_body_ids,
+        )
+\end{codebox}
+
+\paragraph{方案选择决策。}若任务需研究底盘动力学本身（漂移控制、打滑恢复、精确停车），必须显式建轮子（MuJoCo 更优，无 n-gon 问题）；若核心挑战在操作侧（抓取精度、搬运路径），虚拟臂抽象更高效且避免仿真伪影。
+
+\subsection{双框架轮式底盘 API 对照}
+\label{sec:rlmc-wh-base-api}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+概念 & mjlab (MJCF) & Isaac Lab (USD + PhysX) & UniLab \\
+\midrule
+轮子关节类型 & \verb|hinge| joint & revolute joint (USD) & MJCF \verb|hinge| / Motrix joint \\
+速度控制 & \verb|<velocity>| actuator & \verb|ImplicitActuatorCfg(stiffness=0)| & 速度级（Go2W 轮：\verb|wheel_Kd*(v_tgt-v)|；无 velocity-action \emph{类}） \\
+摩擦模型 & \verb|condim| + \verb|friction| & PhysX material friction & MJCF \verb|condim|+\verb|friction|（mujoco 后端） \\
+底盘自由度 & \verb|freejoint|（6 DOF） & floating root link & MJCF \verb|freejoint|（mujoco 后端） \\
+圆柱碰撞 & 解析接触（无 n-gon） & 近似为 n-gon（需规避） & CPU 解析接触（无 n-gon） \\
+全向轮建模 & 自定义 plugin / 多轮组合 & PhysX wheel constraint & 自建多轮 MJCF（无现成约束） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{运行验证。}建完底盘，最小验证三件事：（1）\verb|mj_step|/play 下两轮同速 $\to$ 直行轨迹近似直线；（2）两轮反速 $\to$ 原地旋转、底盘中心位移近零；（3）试图施加纯侧向力 $\to$ 底盘被摩擦拉回、无净横移。这三条对应非完整约束的三个工程表现，任何一条不满足都说明 condim/friction/actuator 配错了。
+
+\begin{pitfall}[全向底盘“更好”所以总应该用全向]
+\textbf{错误描述}：全向轮消除了非完整约束，于是认定它在任何场景都优于差速。\textbf{现象后果}：花大量时间在 Mecanum 轮接触建模上，sim2real 时又遭遇真机 Mecanum 在高负载下打滑。\textbf{根本原因}：全向轮的接触力模型在多数物理引擎中\emph{不精确}，真机也更贵、更易打滑；非完整约束在很多任务里根本不是瓶颈。\textbf{正确做法}：除非任务\emph{明确}需要横移（狭窄走廊侧向停靠），优先选差速底盘——物理更简单、仿真更准、真机更便宜。
+\end{pitfall}
+
+\begin{practice}[底盘建模]
+\begin{enumerate}
+\item （建模题）写一个完整差速底盘 MJCF（两驱动轮 + 一被动万向轮），加载到 viewer 验证：(a) 同速直行、(b) 反速原地转、(c) 不可横移。验收：三条均肉眼可辨。
+\item （估算题）轮距 $0.56$ m、轮半径 $0.08$ m，左轮 $5$ rad/s、右轮 $3$ rad/s，求底盘线速度与角速度（用式~\eqref{eq:rlmc-wh-fwdkin}）。验收：给出数值与单位。
+\item （跨框架题）分别在 MJCF 与 USD 中配一个纯速度控制的轮子 actuator，对比两框架“stiffness=0, damping=D”的物理效果。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{混合动作空间：让轮速与臂关节“同等重要”}
+\label{sec:rlmc-wh-action}
+
+\paragraph{模块功能与在管线中的位置。}本节解决“一个策略如何同时输出轮速和臂关节动作”。它是把底盘（速度级、rad/s）和臂（位置级、rad）两套异构控制接口\emph{统一}到一个连续动作向量的关键，处在“策略网络输出 $\to$ action manager 切分缩放 $\to$ 各 actuator 目标”这条链路的正中央。配错了，最典型的现象是“底盘疯狂冲刺、臂几乎不动”。
+
+\paragraph{动机：为什么不能把所有动作拼成一个向量。}回顾 \cref{ch:rlmc-obsact} 的动作设计原则：动作空间每一维应有相近的“任务影响力”，否则某一维 scale 远大于其他维时，PPO 梯度会被该维主导。轮式 + YAM 的动作有三种量纲：轮速（rad/s，$\pm 10$）、臂关节增量（rad，$\pm 0.1$）、夹爪开合（m，$0$--$0.04$），scale 差两个数量级。若直接拼成 9 维向量（2 轮 + 6 臂 + 1 夹爪），共享一个全局 action std，则对轮速合理的 std 对臂太大（臂剧烈抖动）、对轮速又太小（底盘几乎不动）。
+
+\begin{insight}[不做量纲归一化，臂会被“饿死”——一个反事实推演]\label{ins:rlmc-wh-starve}
+设策略输出 $[-1,1]$，轮速 scale 是 10（映射 $\pm 10$ rad/s），臂关节 scale 是 0.05（映射 $\pm 0.05$ rad 增量）。训练初期策略输出近标准正态：轮速维在 $\pm 10$ rad/s 间乱跳、底盘疯狂冲刺；臂关节只在 $\pm 0.05$ rad 微调、基本不动。策略很快发现“不动臂、大幅移动底盘”能偶尔（靠运气）让 base-to-object 距离减小，于是梯度集中在轮速维——\emph{臂的学习被饿死}。这就是为什么归一化不是锦上添花，而是让臂\emph{有机会}被学到的前提。
+\end{insight}
+
+\paragraph{归一化方案：每维 $[-1,1]$ 产生相近任务后果。}正确做法是网络输出统一的 $[-1,1]$，再在 action manager 中分别缩放。\verb|scale| 的选择原则：每一维 action 从 0 到 1 时对任务进度的贡献大致相等。
+
+\begin{codebox}[Python]{mjlab 混合 action 配置（mjlab 用 entity\_name + actuator\_names）}
+# mjlab 的 JointVelocity/PositionActionCfg 字段是 entity_name + actuator_names
+# （不是 Isaac Lab 的 asset_name + joint_names）；内部 find_joints_by_actuator_names 解析。
+actions = {
+    "base_velocity": JointVelocityActionCfg(
+        entity_name="robot",
+        actuator_names=["left_wheel_act", "right_wheel_act"],
+        scale=2.0,                 # [-1,1] -> [-2, 2] rad/s
+    ),
+    "arm_position": JointPositionActionCfg(
+        entity_name="robot",
+        actuator_names=["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
+        scale=0.05,                # [-1,1] -> [-0.05, 0.05] rad 增量
+        use_default_offset=True,   # 以 home keyframe 为中心
+    ),
+    "gripper": JointPositionActionCfg(
+        entity_name="robot",
+        actuator_names=["left_finger_act"],
+        scale=0.02,                # [-1,1] -> [-0.02, 0.02] m 增量
+    ),
+}
+\end{codebox}
+
+举例：轮速 scale $2.0$ 意味着满 action 时底盘速度约 $0.16$ m/s（轮半径 $0.08$ m $\times$ $2$ rad/s），一步（$0.01$ s）移动约 $1.6$ mm；臂关节 scale $0.05$ 时满 action 末端移动约 $1$--$3$ mm（取决于 Jacobian）。两者同数量级，策略不会偏好某一组。
+
+\subsection{Action scale 的系统化选择（三步法）}
+\label{sec:rlmc-wh-scale}
+
+选 scale 不靠猜。\textbf{Step 1 估算每维物理效果}：对轮子，位移 $=$ scale $\times r\times dt=2.0\times0.08\times0.01=1.6$ mm/step；对臂末端，经 Jacobian 估算典型 $1$--$5$ mm/step；对夹爪，scale $\times dt=0.02$ m/step（夹爪是位置增量不乘 $dt$）。\textbf{Step 2 对齐数量级}：若轮子一步 $1.6$ mm 而臂末端一步 $50$ mm，策略会优先学臂；调 scale 使各维落在 $0.5$--$5$ mm/step。\textbf{Step 3 跑 random agent 验证}：用随机策略播 100 步，看各关节运动幅度——某关节几乎不动（scale 太小）或剧烈抽搐到限位（scale 太大）就对应调整。
+
+\begin{codebox}[Python]{random agent 验证脚本（通用骨架，按所装框架的真实 API 微调）}
+import torch
+env = make_env("<TASK_ID>", num_envs=1)   # task id 以你的注册调用为准
+obs = env.reset()
+for step in range(100):
+    action = torch.randn(1, env.action_space.shape[0])
+    obs, reward, done, info = env.step(action)
+    if step % 20 == 0:
+        print(f"step {step}: base_xy={env.robot.data.root_link_pos_w[0, :2]}")
+\end{codebox}
+
+\paragraph{别只看上面的伪码——mjlab 有一条\emph{现成可跑}的 random/zero agent 命令。}上面的 \verb|make_env(...)| 是\textbf{框架无关骨架}，照抄跑不了；mjlab 不必自己写循环，\verb|play| 子命令实测就内置了 zero/random agent（\cref{sec:rlmc-wh-quickstart} 用过），直接对你注册的 task 跑即可看到 scale 选得对不对：
+
+\begin{codebox}[bash]{mjlab：用现成 play 子命令做 zero / random agent 验证（实测可跑）}
+# zero agent：所有 action=0。预期——底盘不动、臂停在 home（验证 use_default_offset 生效）。
+uv run play <TASK_ID> --agent zero   --num-envs 4 --viewer viser   # Viser web 默认监听 :8080
+# random agent：action~N(0,1)。预期——底盘移动但不爆飞、臂运动但不撞限位。
+uv run play <TASK_ID> --agent random --num-envs 4 --viewer viser
+# scale 体感：random 下若臂几乎不动=scale 太小、若狂抖到限位=scale 太大；据此回去调。
+# 注：<TASK_ID> 用你 list-envs 列出的真实名；play 的并行数用它自己的 --num-envs（非 train 的 --env.scene.num-envs）。
+\end{codebox}
+
+\subsection{网络架构对混合动作空间的影响}
+\label{sec:rlmc-wh-arch}
+
+底盘导航是粗粒度空间推理、臂操作是细粒度精确控制，这种异构性暗示网络架构也可考虑分化。最简单是单 MLP 同时输出所有维（教学推荐）；进阶有双头 MLP（共享 trunk + 底盘 head + 臂 head）、双策略（完全解耦、协调只靠观测）、RNN + MLP（处理非完整约束的时序需求）。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+架构 & 描述 & 优势 & 劣势 \\
+\midrule
+单 MLP & 一个网络输出所有 action & 简单、标准 & 底盘与臂共享梯度 \\
+双头 MLP & 共享 trunk + 两 head & 解耦输出层、各自 \verb|log_std| & 需手动划分维度 \\
+双策略 & 底盘与臂各自独立网络 & 完全解耦 & 协调只能经观测 \\
+RNN + MLP & LSTM 编码时序 + MLP 输出 & 应对非完整约束时序 & 训练更慢 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+RSL-RL 默认 MLP；切到 LSTM 需用 Isaac Lab 的循环模型配置（其中 \verb|rnn_type| 为必填，取 \verb|"lstm"| 或 \verb|"gru"|），并确认 runner/model cfg 与当前版本匹配。\rebuilt{循环模型配置类的类名随版本变化：Isaac Lab 历史上用 \texttt{RslRlPpoActorCriticRecurrentCfg}（其 \texttt{class\_name} 默认 \texttt{"ActorCriticRecurrent"}），该类在 rsl-rl $\ge$ 4.0.0 被弃用、官方改推 \texttt{RslRlRNNModelCfg}；以你所装版本文档为准。}双头架构的好处之一是底盘与臂的 action noise 量级通常不同（底盘探索范围大、臂小），让它们各自维护独立 \verb|log_std| 变得自然。
+
+\begin{codebox}[Python]{双头 actor 的最小修改（在 RSL-RL ActorCritic 基础上）}
+import torch
+import torch.nn as nn
+
+class DualHeadActor(nn.Module):
+    """共享 trunk + 独立底盘/臂输出头。"""
+    def __init__(self, obs_dim, base_dim=2, arm_dim=7):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(obs_dim, 256), nn.ELU(),
+            nn.Linear(256, 128), nn.ELU(),
+        )
+        self.base_head = nn.Sequential(nn.Linear(128, 32), nn.ELU(), nn.Linear(32, base_dim))
+        self.arm_head  = nn.Sequential(nn.Linear(128, 64), nn.ELU(), nn.Linear(64, arm_dim))
+
+    def forward(self, obs):
+        f = self.trunk(obs)
+        return torch.cat([self.base_head(f), self.arm_head(f)], dim=-1)
+\end{codebox}
+
+\subsection{双框架混合动作 API 对照}
+\label{sec:rlmc-wh-action-api}
+
+两个框架的 action manager 都在 \verb|step()| 中按 group 分别处理：先把网络输出的连续向量按维度切分，再分别施加 scale / offset / clip，最后写入对应 actuator 目标。这保证轮速与臂关节使用不同物理接口（velocity vs position），而策略只需输出一个统一连续向量。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+概念 & mjlab & Isaac Lab & UniLab \\
+\midrule
+多动作组 & \verb|actions| dict 多 key & \verb|ActionsCfg| 多 field & 单 \verb|apply_action|（无多 ActionCfg 组） \\
+速度控制 & \verb|JointVelocityActionCfg| & \verb|JointVelocityActionCfg| & 无 velocity-action \emph{类}，但 Go2W 轮子在 \verb|apply_action| 内是\emph{速度级}（\verb|wheel_Kd*(v_tgt-v)|） \\
+位置控制 & \verb|JointPositionActionCfg| & \verb|JointPositionActionCfg| & \verb|apply_action| 内置（腿残差到 \verb|default_angles|） \\
+归一化 & \verb|scale| 参数 & \verb|scale| 参数 & \verb|action_scale|（默认 0.25，全局或分项） \\
+默认偏移 & \verb|use_default_offset=True| & \verb|use_default_offset=True| & 内置（恒以 \verb|default_angles| 为中心） \\
+切分顺序 & dict key 插入顺序 & dataclass field 声明顺序 & 后端 actuator 顺序（\verb|get_actuator_ctrl_range|） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{UniLab 的混合动作长什么样（与上面两框架并列）。}UniLab 不提供 \verb|JointVelocityActionCfg| / \verb|JointPositionActionCfg| 这类\emph{逐组动作配置类}，整条动作链路压在 \verb|LocomotionBaseEnv| 的 \verb|apply_action| 一个方法里。但\textbf{“无 cfg 类”不等于“只能位置控制”}——\emph{实测} Go2W 的 \verb|apply_action| 里轮子与腿就是\emph{两路不同语义}并存的现成范例：腿走\textbf{残差位置 PD}（\verb|ctrl = action[legs]*action_scale + default_angles|，再交位置式 PD 执行器，\verb|kp/kd| 由 \verb|create_backend| 的 \verb|position_actuator_gains| 传入），轮子走\textbf{速度级}（\verb|go2w/joystick.py|：\verb|wheel_velocity_targets = action[wheels]*wheel_action_scale|，\verb|base.py| 的 \verb|compute_go2w_motor_ctrl| 用 \verb|wheel_Kd*(v_target-v_cur)| 出力矩，\emph{不}残差到 \verb|default_angles|）。这恰是本节“异构接口统一”的活样本：同一个连续动作向量在 \verb|apply_action| 里被切成两段、各走各的物理语义。三个与 mjlab/Isaac 的实质差异：（1）\textbf{差异落在“没有 cfg 类、改在 \texttt{apply\_action} 里”，而非“轮子只能位置控制”}——把轮足 Go2W 扩成“轮 + 臂”时，臂沿用残差位置 PD、轮子沿用 Go2W 已有的速度级那一路即可，无需自己 hand-roll 速度控制；（2）\verb|use_default_offset| 的“以 home 为中心”对\emph{位置段}是\emph{内置的}（残差式动作天然如此），无需逐项设标志（轮子段无此偏移）；（3）轮速与臂的“切分顺序”不由 dict/dataclass 声明序决定，而由\textbf{后端 actuator 在模型中的顺序}（\verb|get_actuator_ctrl_range| / \verb|num_actuators|）决定——排错时打印后端执行器顺序，而不是查配置声明序。量纲对齐：腿/臂段靠 \verb|action_scale|（默认 0.25，go2 rough 还能给 hip / non-hip 分项），轮子段则有\emph{专属}的 \verb|wheel_action_scale|（实测 10.0，与腿的 0.25 分离）——这是 Go2W 自带的“轮/臂分项缩放”，可直接借来对齐两段量纲，不必在 \verb|apply_action| 里手算分段缩放。
+
+\begin{codebox}[Python]{UniLab 混合动作：单 apply\_action 内【轮=速度级 / 臂=残差位置】两路并存（仿 Go2W）}
+# UniLab 没有逐组 ActionCfg；动作统一在 env.apply_action 里转 ctrl。
+# 关键：轮子和臂走【两种不同物理语义】，不是同一接口——这正是 Go2W 的真实做法。
+class WheeledArmEnv(LocomotionBaseEnv):
+    def apply_action(self, actions, state):
+        # 切分须与后端 actuator 顺序一致；别凭记忆假设“前两维一定是轮子”，先打印自检。
+        wheel_act = actions[:, self.wheel_idx]         # 轮子段
+        arm_act   = actions[:, self.arm_idx]           # 臂段
+        # --- 轮子：速度级（仿 go2w/joystick.py，专属 wheel_action_scale，不残差到 default）---
+        v_target  = wheel_act * self.wheel_action_scale            # 实测 wheel_action_scale=10.0
+        wheel_tau = self.wheel_Kd * (v_target - state.joint_vel[:, self.wheel_idx])  # 速度 PD
+        # --- 臂：残差位置 PD（action_scale=0.25，残差到 home 的 default_angles）---
+        arm_ctrl  = arm_act * self.action_scale + self.default_angles[self.arm_idx]
+        # 两路按各自语义下发：速度段给力矩/速度目标，位置段给位置目标（接后端位置式 PD）
+        return self._compose_ctrl(wheel_tau=wheel_tau, arm_pos=arm_ctrl)
+# 切分顺序自检：打印后端 get_actuator_ctrl_range() / num_actuators，别假设“前两维一定是轮子”。
+# 量纲对齐不靠手算：腿/臂用 action_scale、轮子用专属 wheel_action_scale，二者本就分离。
+# 量纲对齐：UniLab 无 per-term scale 类，靠 action_scale（必要时按段缩放）让轮/臂任务后果相近。
+\end{codebox}
+
+\begin{pitfall}[忘记给臂设 \texttt{use\_default\_offset=True}]
+\textbf{错误描述}：臂的 \verb|JointPositionActionCfg| 漏掉 \verb|use_default_offset=True|。\textbf{现象后果}：zero agent 播放时臂\emph{疯狂抽搐}到关节极限。\textbf{根本原因}：action$=0$ 时臂关节目标为 $0$ rad（可能超出关节限位），而非 home position。\textbf{正确做法}：臂关节始终用 \verb|use_default_offset=True|，让 action$=0$ 对应初始姿态。
+\end{pitfall}
+
+\begin{pitfall}[Isaac Lab 中 action group 顺序假设错误]
+\textbf{错误描述}：假设 action 向量前两维一定是轮速。\textbf{现象后果}：底盘收到臂的 action、臂收到底盘的 action——底盘不动、臂剧烈旋转。\textbf{根本原因}：Isaac Lab 的 \verb|ActionManager| 按配置项\emph{声明顺序}（dataclass field 声明序）切分，而非字段名字母序；mjlab 则按 dict key 插入序。\textbf{正确做法}：打印 \verb|env.action_manager|（或 \verb|active_terms| / \verb|action_term_dim|）确认每个 term 占据的维度范围，别凭记忆假设。
+\end{pitfall}
+
+\subsection{Action Delay Buffer：sim2real 的关键组件}
+\label{sec:rlmc-wh-delay}
+
+真实底盘的电机控制器从接收速度指令到轮子达目标转速，通常有 $20$--$80$ ms 的通信与执行延迟。仿真不模拟它，策略会学到“指令即时生效”的假设——部署后底盘总比策略预期慢一拍，导致过冲与振荡。\textbf{延迟应在 actuator 层建模，而不是写成“每步自动触发的 step event”}——这是一个高复发的误解。
+
+\begin{note}[三框架动作延迟对照：Isaac=内置 actuator，UniLab=配置标志，mjlab=手动缓冲]
+经核实，\emph{动作延迟在三框架里是“两个有内置开关、一个需手搓”}：
+\begin{itemize}
+\item \textbf{Isaac Lab（内置 actuator）}：\verb|DelayedPDActuatorCfg|（继承 \verb|IdealPDActuatorCfg|），用 \verb|min_delay| / \verb|max_delay|（单位：物理步，旧名 \verb|min_num_time_lags| / \verb|max_num_time_lags|）配置，内部以环形缓冲实现，\emph{每次 reset 在 $[\min,\max]$ 间随机采样}延迟步数——无需手动管理 buffer。
+\item \textbf{UniLab（配置标志）}：\emph{实测}也是开关而非手搓——\verb|control_config.simulate_action_latency| 打开后配 \verb|last_actions| 实现\emph{一拍}动作延迟（落到 \verb|apply_action| 里用上一拍动作）。\textbf{这正与本节“延迟应放 actuator/action 层、不是 step event”的论断互证}：UniLab 把它做成内置标志，读者照搬即可。
+\item \textbf{mjlab（手动）}：无对应内置字段，需在自定义 ActionTerm / wrapper 里手动维护环形缓冲（下面的教学实现）。
+\end{itemize}
+\end{note}
+
+\begin{codebox}[Python]{mjlab 侧手动动作延迟环形缓冲（教学实现）}
+import torch
+
+class ActionDelayBuffer:
+    """环形缓冲实现动作延迟。"""
+    def __init__(self, num_envs, action_dim, max_delay_steps=3, device="cuda"):
+        self.buffer = torch.zeros(max_delay_steps + 1, num_envs, action_dim, device=device)
+        self.ptr = 0
+        self.max_delay = max_delay_steps
+
+    def push(self, action):
+        self.buffer[self.ptr] = action
+        self.ptr = (self.ptr + 1) % (self.max_delay + 1)
+
+    def get_delayed(self, delay_steps):       # delay_steps: [B] 每个 env 的延迟步数
+        idx = (self.ptr - 1 - delay_steps) % (self.max_delay + 1)
+        return self.buffer[idx, torch.arange(len(delay_steps))]
+\end{codebox}
+
+\begin{pitfall}[只在 reset 时随机化延迟步数，却没有每步真正替换动作]
+\textbf{错误描述}：写了一个 \verb|mode="reset"| 的 event 随机化 \verb|delay_steps|，就以为引入了延迟。\textbf{现象后果}：照抄者训练里\emph{根本没有任何延迟}，sim2real 仍然过冲。\textbf{根本原因}：随机化“延迟几步”只是采样了一个整数；真正的延迟需要在每步下发动作\emph{之前}调用 \verb|buffer.push(action)| 存入当前动作、再用 \verb|buffer.get_delayed(...)| 取出对应延迟的旧动作来\emph{替换}。\textbf{正确做法}：把替换逻辑放进自定义 ActionTerm / action wrapper（或用 Isaac Lab 的 \verb|DelayedPDActuatorCfg| 一步到位）；\verb|mode="step"| 的 event 也并不会“自动每步触发替换”。
+\end{pitfall}
+
+\begin{practice}[混合动作]
+\begin{enumerate}
+\item （计算题）轮式 + YAM（6 臂 + 1 夹爪）+ 差速底盘（2 轮）总 action 维度是多少？换成全向底盘（3 控制量）变为多少？
+\item （实验题）在所装框架里用两种 scale 跑 random agent 20 步：(a) 全部 scale=1.0，(b) 推荐 scale。对比底盘与臂运动幅度，解释 (a) 中臂为何几乎不动。
+\item （设计题）若用 DiffIK 作臂的动作抽象（取代关节位置），action 维度与 scale 如何改？DiffIK 的 3D 末端增量（m）与轮速（rad/s）量纲差异如何处理？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Observation 设计：底盘里程计 + 臂状态 + 目标关系}
+\label{sec:rlmc-wh-obs}
+
+\paragraph{模块功能与在管线中的位置。}observation 决定“策略能看到什么世界”。移动操作相比固定操作多出底盘状态（位姿、朝向、轮速）与“坐标系转换”这两件事。它处在“仿真状态 $\to$ ObservationManager 计算 $\to$ 策略网络输入”的链路上，是训练“学不到东西”类问题最常见、也最难发现的根因（obs 错通常不报错、只是不收敛）。
+
+\paragraph{动机：移动操作的 observation 比固定操作多了什么。}固定基座 YAM lift cube 的观测约 26 维（臂关节位置/速度 + 末端到物体 + 物体到目标 + 上一步动作），底盘固定无需观测底盘状态。移动操作中，底盘状态成为必要输入：策略要知道底盘在哪、朝向哪、移动多快才能规划导航。同时，物体与目标位置必须从 world frame 转到 base frame——否则策略看到的坐标随底盘移动剧烈变化，违反观测的“低方差/对无关变换不变”原则。
+
+\paragraph{完整 observation 规格。}下表是 actor 观测的完整清单。读它的关键是\emph{Frame 列}与\emph{部署可用列}：base frame 的相对量对底盘全局位移不变（低方差），world frame 的绝对量会随 env 漂移、只能给 critic。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+字段 & 维度 & Frame & 来源 & 部署可用 \\
+\midrule
+底盘线速度 & 3 & base & IMU + 轮速里程计 & 是 \\
+底盘角速度 & 3 & base & IMU & 是 \\
+投影重力 & 3 & base & IMU & 是 \\
+臂关节位置 & 6 & joint & 编码器 & 是 \\
+夹爪位置 & 1 & joint & 编码器 & 是 \\
+臂关节速度 & 6 & joint & 编码器差分 & 是 \\
+夹爪速度 & 1 & joint & 编码器差分 & 是 \\
+底盘到物体 & 3 & base & 感知 & 条件性 \\
+末端到物体 & 3 & world & 正运动学 + 感知 & 条件性 \\
+底盘朝向 vs 物体方向 $(\cos\alpha,\sin\alpha)$ & 2 & base & 计算 & 是 \\
+轮速反馈 & 2 & joint & 编码器 & 是 \\
+上一步动作 & 9 & --- & 缓存 & 是 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+上表合计 $3+3+3+6+1+6+1+3+3+2+2+9=42$ 维（基线 actor）。若再加“物体到目标”“底盘到目标”两个条件性目标项（各 3 维），共 48 维。
+
+\paragraph{四个关键设计决策。}\textbf{决策 1（坐标 frame）}：底盘到物体/目标的相对向量必须在 base frame 表达。在 world frame 表达时，同一个“目标在底盘前方 1 米”的情况，在世界坐标 $(0,0)$ 和 $(10,10)$ 处的 observation 完全不同；用 base frame 消除底盘全局位移影响。回顾 \cref{ch:rlmc-obsact} 的原则：observation 应对无关变换不变——底盘全局坐标对任务无意义，不该进 actor，但可作 critic 的 privileged 信息。\textbf{决策 2（朝向编码）}：用 $(\cos\alpha,\sin\alpha)$ 而非角度 $\alpha$ 本身——$\alpha$ 在 $\pm\pi$ 处有 $2\pi$ 跳变（$3.14$ 到 $-3.14$ 只差 $0.001$ 弧度真实旋转，数值却差 $6.28$），跳变附近 loss landscape 有尖锐悬崖；$(\cos\alpha,\sin\alpha)$ 天然连续且一一对应（详见 \cref{ins:rlmc-wh-heading}）。\textbf{决策 3（轮速反馈）}：轮速反馈不冗余——它与底盘速度的差值反映轮子是否打滑（光滑地面实际速度小于轮速推算；抓取时臂反作用力可能让轮子空转），策略感知到打滑后可学“加大轮速补偿”或“锁轮防漂移”。\textbf{决策 4（上一步动作）}：在存在 action delay 或 actuator 动力学的系统中，当前物理状态不仅取决于当前观测，还取决于刚施加了什么控制；$a_{t-1}$ 打破 action delay 造成的部分可观测性，对惯性较大（15+ kg）的底盘尤其有用。
+
+\paragraph{Frame 转换的工程实现。}world frame 向量 $\mathbf{v}_w$ 转 base frame 需用底盘朝向四元数对应旋转矩阵的转置：$\mathbf{v}_b=\mathbf{R}(\mathbf{q}_{\text{base}})^{\!\top}\mathbf{v}_w$。两个框架都由 \verb|quat_rotate_inverse| 完成（经核：Isaac Lab 在 \verb|isaaclab.utils.math| 下，签名 \verb|quat_rotate_inverse(q, v)|，\verb|q| 为 $(w,x,y,z)$）。
+
+\begin{codebox}[Python]{mjlab observation terms（核心几项，函数名按版本核对）}
+import torch
+
+def base_lin_vel_b(env):       # 底盘线速度（base frame）[B, 3]
+    return env.robot.data.root_link_lin_vel_b
+
+def base_ang_vel_b(env):       # 底盘角速度（base frame）[B, 3]
+    return env.robot.data.root_link_ang_vel_b
+
+def projected_gravity(env):    # 投影重力（base frame）[B, 3]
+    return env.robot.data.projected_gravity_b
+
+def wheel_vel(env):            # 轮子角速度 [B, 2]
+    return env.robot.data.joint_vel[:, env.wheel_joint_ids]
+
+def base_to_object_b(env):     # 底盘到物体（base frame）[B, 3]
+    rel_w = env.cube.data.root_link_pos_w - env.robot.data.root_link_pos_w
+    return quat_rotate_inverse(env.robot.data.root_link_quat_w, rel_w)
+
+def heading_to_object(env):    # 底盘朝向 vs 物体方向的 cos/sin [B, 2]
+    rel_b = base_to_object_b(env)[:, :2]
+    angle = torch.atan2(rel_b[:, 1], rel_b[:, 0])
+    return torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
+\end{codebox}
+
+\subsection{Observation 调试三板斧}
+\label{sec:rlmc-wh-obs-debug}
+
+obs 错通常不报错、只是策略学不到东西。下面三步覆盖约九成 obs 问题。\textbf{第一斧（打印维度与数值范围）}：\verb|reset()| 后立即打印一帧 obs，确认维度对、数值在合理范围、无 NaN/Inf；某维异常大（如 $>100$）通常是 frame 转换错或漏减 \verb|env_origins|。\textbf{第二斧（可视化 base-to-object 向量）}：在 viewer 里画一条从底盘指向物体的线，若指向错误说明 \verb|quat_rotate_inverse| 参数顺序搞反。\textbf{第三斧（跨 env\_id 对比）}：多环境并行、物理配置相同时（如 Phase 0 固定物体），不同 env 的 obs 应几乎相同；若差异大，说明 \verb|env_origins| 没被正确处理。
+
+\begin{codebox}[Python]{obs 维度与数值健康检查（mjlab/RSL-RL：actor 组名为 policy）}
+obs, _ = env.reset()
+print("shape:", obs["policy"].shape)               # 应为 [B, 42]（此 42 是本章自建任务的设计值）
+print("min:", obs["policy"].min(dim=0).values)
+print("max:", obs["policy"].max(dim=0).values)
+assert not torch.isnan(obs["policy"]).any(), "NaN in obs!"
+assert not torch.isinf(obs["policy"]).any(), "Inf in obs!"
+\end{codebox}
+
+\begin{note}[别背“42 维”——让框架\emph{告诉}你维度（组名 mjlab=\texttt{policy} vs UniLab=\texttt{obs}）]
+上面的 \verb|42| 是本章自建任务的\emph{设计值}，没有现成可跑任务能证实；真正可操作的技能是\textbf{让 env 自报维度}，而不是记数字。注意 actor 组的\emph{键名}各框架不同：mjlab/RSL-RL 是 \verb|"policy"|，\textbf{UniLab 是} \verb|"obs"|（critic 组都叫 \verb|"critic"|）——拿错键名会 \verb|KeyError|。UniLab 侧实测可直接打印 \verb|obs_groups_spec| 自查，例如 \verb|go2_joystick_flat| 实跑得 \verb|{"obs":49,"critic":52}|（critic 多出的 3 维即特权 base linvel），\verb|go2w| 得 \verb|{"obs":53,"critic":72}|。
+
+\begin{codebox}[bash]{自查 obs 维度（UniLab：obs\_groups\_spec 是可实测的真值）}
+# 不依赖你“数”出来的 42——直接问注册环境它声明了哪些 obs 组、各几维
+python -c "import unilab; from unilab.registry import registry; \
+registry.ensure_registries(); \
+cfg = registry.make_envcfg('Go2JoystickFlat'); \
+print(cfg().obs_groups_spec)"        # 实测 {'obs': 49, 'critic': 52}
+# 心法：换任务/改了 obs term 后，先打印这个 spec 确认维度，再去对网络输入层——别照搬旧数字。
+\end{codebox}
+\end{note}
+
+\subsection{Privileged observation（仅 critic）与观测归一化}
+\label{sec:rlmc-wh-privileged}
+
+critic 可使用 actor 看不到的 privileged 信息以更准地估计 value：物体全局位姿（7）、底盘全局位姿（7）、轮地摩擦系数（2）、物体质量（1）、接触力（6）。这与 \cref{ch:rlmc-privileged} 的非对称 actor-critic 完全一致——actor 只用部署可得的观测，critic 用仿真特权信息。
+
+\begin{insight}[actor/critic 信息不对称像驾校学车，但边界要看清]\label{ins:rlmc-wh-asym}
+学员（actor）只能看后视镜和仪表盘，教练（critic）坐副驾能看盲区、知道路面湿滑、清楚目的地精确坐标——额外信息帮教练更准地\emph{评估}驾驶质量，但学员最终只能靠自己看到的信息开车。这个类比的边界在于：教练能直接说“左转”，而 critic 只能通过 value 估计\emph{间接}影响 policy gradient——它不会给 actor 喂答案，只会让优势估计更准。
+\end{insight}
+
+\paragraph{观测归一化的工程细节。}RSL-RL 用 \verb|EmpiricalNormalization| 维护每个 obs 维度的 running mean/std（经核确为该类名）。训练初期统计量不稳，需 warm-up 期；一个常见错误是 warm-up 期就评估策略——此时归一化未收敛，表现不代表真实水平。另外，保存 checkpoint 必须同时保存 running mean/std，否则加载后归一化从零开始、性能骤降。\rebuilt{开启归一化的\emph{配置标志名}随版本变化：Isaac Lab 的 \texttt{empirical\_normalization} 已弃用——按官方迁移说明，rsl-rl $<$ 4.0.0 用策略级 \texttt{actor\_obs\_normalization}/\texttt{critic\_obs\_normalization}，rsl-rl $\ge$ 4.0.0 用模型级 \texttt{obs\_normalization}；以你所装版本为准。}
+
+\subsection{双框架 Observation API 对照}
+\label{sec:rlmc-wh-obs-api}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+概念 & mjlab & Isaac Lab & UniLab \\
+\midrule
+Obs 定义 & \verb|ObservationGroupCfg| 内多 \verb|ObservationTermCfg|（无 \verb|ObsTerm| 别名） & \verb|ObservationGroupCfg| 内多 \verb|ObsTerm|（=\verb|ObservationTermCfg| 别名） & \verb|_compute_obs| 内拼接（无逐项 Obs 类） \\
+Frame 转换 & \verb|quat_rotate_inverse| & \verb|math_utils.quat_rotate_inverse| & 后端机体系 getter（\verb|get_body_lin_vel_b|） \\
+Obs 归一化 & RSL-RL running mean/std & 同左（共用 RSL-RL） & 同左（PPO 用 rsl-rl；SAC 有 \verb|obs_normalization|） \\
+Privileged obs & 单独 \verb|ObservationGroupCfg| & 单独 \verb|ObsGroup|（如 critic） & \verb|obs_groups_spec| 的 \verb|critic| 组多带特权维 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{UniLab 的观测怎么写（与上面 mjlab \texttt{base\_to\_object\_b} 并列）。}UniLab 没有 \verb|ObservationTermCfg| / \verb|ObservationGroupCfg| 这种逐项注册的观测项，整组观测由 env 的 \verb|_compute_obs| 一处用 \verb|np.concatenate| 拼好，并经 \verb|obs_groups_spec -> {"obs": A, "critic": C}| 声明两组维度——\verb|obs| 组喂 actor、\verb|critic| 组喂 critic（\verb|base/observations.py| 的 \verb|split_obs_dict| 负责路由）。两个工程要点正好对上本节的“frame”和“privileged”两件事：（1）\textbf{frame 转换不必手调} \verb|quat_rotate_inverse|——UniLab 后端直接给\emph{机体系} getter（\verb|get_body_lin_vel_b| / \verb|get_local_linvel| / \verb|get_gyro| / \verb|upvector| 投影重力），底盘线/角速度、投影重力开箱即在 base frame；只有“底盘到物体”这类\emph{相对向量}需自己在 \verb|_compute_obs| 里减完再（用底盘姿态）转到 base frame。（2）\textbf{特权观测 =} \verb|critic| \textbf{组比} \verb|obs| \textbf{组多几维}——例如 go2 是 \verb|{"obs":49,"critic":52}|，多出的 3 维就是特权 base linvel；UniLab 没有单独命名的 “privileged” 组，非对称性就体现为 \verb|critic| 组追加无噪声特权量。这与本章把“物体/底盘全局位姿、轮地摩擦、接触力”塞进 critic 的做法语义一致，只是落地成“同一个 \verb|_compute_obs| 里多拼一截 critic 专用量”。
+
+\begin{codebox}[Python]{UniLab 观测：\_compute\_obs 拼接 + actor/critic 两组（轮式 + 臂示意）}
+import numpy as np
+# UniLab：无逐项 Obs 类（无 ObservationTermCfg）；一处拼好，obs_groups_spec 声明两组维度
+@property
+def obs_groups_spec(self):
+    return {"obs": 42, "critic": 57}               # critic 多 15 维 = 特权（物体位姿7/摩擦2/接触力6）
+
+def _compute_obs(self, info, lin_b, ang_b, grav_b, dof_pos, dof_vel, wheel_vel):
+    # 机体系量直接来自后端 getter（无需手调 quat_rotate_inverse）
+    rel_b = self._base_to_object_b()               # 底盘到物体（相对向量，自行转 base frame）[B,3]
+    heading = self._cos_sin_to_object(rel_b)       # (cosα, sinα) 朝向编码 [B,2]
+    actor = np.concatenate([                       # 喂 actor：只放部署可得量
+        lin_b, ang_b, grav_b, dof_pos, dof_vel, wheel_vel, rel_b, heading,
+        info.get("current_actions", np.zeros_like(dof_pos)),
+    ], axis=1)
+    critic = np.concatenate([                      # 喂 critic：追加特权量（无噪声）
+        actor, self._object_pose_w(), self._wheel_friction(), self._contact_force(),
+    ], axis=1)
+    return {"obs": actor, "critic": critic}        # split_obs_dict: obs->actor, critic->critic
+\end{codebox}
+
+\begin{pitfall}[把绝对 world 位置混入 actor 观测]
+\textbf{错误描述}：直接把 \verb|object_pos_w| 或 \verb|base_pos_w| 这种\emph{绝对} world position 放进 actor obs。\textbf{现象后果}：不同 env 的同一情形 obs 不同，策略学不到位置无关的技能。\textbf{澄清}：对\emph{同一个 env} 的两个 world 位置，\verb|object_pos_w - base_pos_w| 中的 env origin 会\emph{代数抵消}（$(obj+origin)-(base+origin)=obj-base$），所以本节 \verb|base_to_object_b| 直接相减是\emph{对的}，无需先减 \verb|env_origins|。\textbf{真正的错误}：把绝对 world position 放进 actor obs，或把 world pose 与一个\emph{未加 origin 的局部 command/随机目标}混在一起比较（两者不在同一 frame/origin）。\textbf{正确做法}：相对向量用两个 world position 直接相减；与 command/local target 比较时务必保证双方同 frame/origin。
+\end{pitfall}
+
+\begin{pitfall}[用欧拉角表示底盘朝向]
+\textbf{错误描述}：把朝向角 $\theta$ 直接放进 obs。\textbf{现象后果}：$\theta$ 在 $\pm\pi$ 处 $2\pi$ 跳变，网络难学跳变附近行为。\textbf{根本原因}：角度表示不连续。\textbf{正确做法}：用 $(\cos\theta,\sin\theta)$ 或投影重力向量。
+\end{pitfall}
+
+\begin{practice}[观测设计]
+\begin{enumerate}
+\item （计算题）按上表计算完整 actor 维度与 critic 维度（actor + privileged）。验收：给出两数及加法过程。
+\item （设计题）若加入深度相机（$64\times64$）作视觉输入，actor 观测维度如何变？哪些状态项应从视觉版 actor obs 中移除、为什么？（提示：参考 \cref{ch:rlmc-visuomotor} 的 teacher-student 信息退化阶梯）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Curriculum 设计：从固定底盘到移动搬运}
+\label{sec:rlmc-wh-curriculum}
+
+\paragraph{模块功能与在管线中的位置。}curriculum 决定“训练以什么顺序变难”。移动搬运任务的奖励在初期近乎稀疏——策略要同时学导航、对齐、闭爪、提起、搬运五个子技能，且后者以前者为前提。课程的作用是把这条因果链拆成可学的台阶。它处在“CurriculumManager 读取 metrics $\to$ 修改 env 配置”的反馈环上。
+
+\paragraph{动机：为什么不从一开始就训练完整任务。}完整任务要求策略同时掌握五个子技能，后面的以前面的为前提（没学会抓取，搬运奖励就为零）。训练初期 PPO 面对近乎稀疏的奖励：底盘乱跑、臂乱挥，几乎不可能偶然完成完整序列。
+
+\begin{insight}[不分课程的后果是“奖励寄生”——一个反事实推演]\label{ins:rlmc-wh-parasite}
+若从一开始就训完整任务：reward 长期为零（没碰到物体 $\to$ 没抓住 $\to$ 没搬运），PPO 的 value 估计退化为零函数、策略梯度近随机噪声。数百万步后，底盘可能偶尔移动到物体附近（因为 base-to-object 导航奖励还有信号），但\emph{从不抓取}。这种行为叫\textbf{奖励寄生}：策略只优化容易获得的奖励子项，忽略需要精确操作才能获得的子项。课程的本质不是“把任务变简单”，而是“在策略当前能力的边缘制造足够多的成功经验”。
+\end{insight}
+
+\paragraph{五阶段 curriculum。}下表给出从静态到完整任务的五个台阶。注意\emph{通过标准列}的阈值故意不高（60\%/40\%/20\%）——进入下一阶段后策略会在新压力下继续改进旧技能，课程真正的价值是避免“冷启动”。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{2.6cm}p{2.4cm}p{2.6cm}@{}}
+\toprule
+阶段 & 名称 & 底盘状态 & 新增难度 & 通过标准 \\
+\midrule
+0 & Fixed-base reach & 锁定不动 & 无 & 末端到物体 $<5$ cm \\
+1 & Fixed-base grasp & 锁定不动 & 闭爪 + 提升 & grasp success $>60\%$ \\
+2 & Base reposition & 可动、物体固定 & 导航 & base-to-object $<30$ cm 且朝向对齐 \\
+3 & Mobile reach + grasp & 可动、物体随机 & 移动中抓取 & grasp success $>40\%$ \\
+4 & Pick-and-carry & 可动、物体与目标均随机 & 搬运 & carry success $>20\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{阶段 0}（锁底盘、只训臂 reach）几乎等同于固定基座 YAM reach，验证臂运动学与 reward 配置。\textbf{阶段 1} 加 staged reward（接近 + 闭爪 + 提起），验证抓取接触参数（夹爪摩擦、物体质量）——这一步学不会抓取，加底盘只会更糟。\textbf{阶段 2} 放开底盘、物体固定在远处，单独训练导航。\textbf{阶段 3} 物体随机化，训练 base-arm 协调（移动到合适位置后停下、伸手抓）。\textbf{阶段 4} 物体与目标都随机，完成完整序列。
+
+\begin{codebox}[Python]{阶段 0 vs 阶段 2 的 action 配置差异（mjlab 字段名；关键是底盘动作的有无）}
+# 阶段 0：只有臂 + 夹爪 -> 底盘保持静止
+actions_phase0 = {
+    "arm_position": JointPositionActionCfg(entity_name="robot",
+        actuator_names=["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
+        scale=0.05, use_default_offset=True),
+    "gripper": JointPositionActionCfg(entity_name="robot",
+        actuator_names=["left_finger_act"], scale=0.02),
+}
+# 阶段 2：加入底盘速度动作
+actions_phase2 = {
+    "base_velocity": JointVelocityActionCfg(entity_name="robot",
+        actuator_names=["left_wheel_act", "right_wheel_act"], scale=2.0),
+    **actions_phase0,
+}
+\end{codebox}
+
+\paragraph{推进机制：按性能门控，不按步数。}
+
+\begin{codebox}[Python]{CurriculumManager 推进逻辑（性能门控）}
+def advance_phase(env, thresholds, max_phase):
+    """满足 (metric >= 阈值 且 episodes >= 最少回合) 才推进。"""
+    cur = env.curriculum_phase
+    if cur >= max_phase:
+        return
+    cond = thresholds.get(cur)
+    if cond is None:
+        return
+    metric_val = env.metrics.get(cond["metric"], 0.0)
+    episodes   = env.metrics.get("total_episodes", 0)
+    if metric_val >= cond["value"] and episodes >= cond["min_episodes"]:
+        env.curriculum_phase = cur + 1
+        env.metrics["total_episodes"] = 0
+        apply_phase_config(env, cur + 1)   # 应用新阶段配置（动作/随机化/奖励）
+\end{codebox}
+
+\subsection{阶段推进时的 Warm-Start（保护已学技能）}
+\label{sec:rlmc-wh-warmstart}
+
+阶段推进最危险的时刻是\emph{加入新 action 维度}（如阶段 1$\to$2 加底盘）。若新维权重随机初始化，PPO 的策略更新会同时改所有权重，新维的随机梯度可能干扰旧维已学权重。三种对策：\textbf{方法 A（冻结旧权重，只训新权重）}保护已有能力但限制联合优化，适合 1$\to$2 过渡；\textbf{方法 B（降学习率）}进入新阶段把 lr 降到 $1/3$--$1/5$，让旧能力缓慢适应而非瞬间破坏——最常用；\textbf{方法 C（双策略网络）}底盘与臂独立网络、协调靠观测（与四足加臂的 locomotion/arm 双策略同构）。
+
+\begin{codebox}[Python]{方法 B：阶段推进时降学习率再线性恢复}
+if curriculum.phase_just_advanced:
+    for g in optimizer.param_groups:
+        g["lr"] *= 0.3                       # 降到 30%
+    lr_scheduler = make_linear_warmup(optimizer, warmup_epochs=50, target_lr=original_lr)
+\end{codebox}
+
+\paragraph{每阶段的 episode 设计。}episode 长度随阶段增长（移动搬运需要更多步完成完整序列），但过长会降低训练效率（PPO 的 GAE 在长 episode 中方差更大），故早期用短 episode：阶段 0 约 $3$ s，阶段 2 约 $8$ s，阶段 4 约 $15$ s。物体初始范围从“臂可达（$0.2$--$0.5$ m）”扩到“$360^\circ$ 随机 $1$--$3$ m”，目标范围在阶段 4 才随机化。
+
+\subsection{双框架 Curriculum 对照}
+\label{sec:rlmc-wh-curr-api}
+
+两框架核心思路一致（基于 episode 统计量触发），区别在配置语法：mjlab 用 \verb|CurriculumTermCfg| + 自定义推进/回退函数，Isaac Lab 用 \verb|CurriculumTermCfg| 配合触发条件（metric + 阈值 + 最少回合）。\rebuilt{两框架 curriculum 触发条件的确切字段名以所装版本为准；本章给出的是通用结构。}
+
+\paragraph{在 WandB 追踪课程进度。}创建一个 “Curriculum Progress” panel，x 轴为 iteration，y 轴同时显示 phase（阶梯线）与各阶段 success rate（曲线）。健康模式是：每个 phase 的 success rate 先升 $\to$ 触发推进 $\to$ 新 phase 从低值重新升。若某 phase 的 success rate 长时间（$>500$ iterations）不升，应检查该阶段 reward 是否有梯度信号。
+
+\begin{pitfall}[阶段推进不可逆]
+\textbf{错误描述}：达标即进下一阶段，新阶段崩溃也不回退。\textbf{现象后果}：若阶段 3 达标是\emph{暂时}的（刚好某 batch 超阈值），进入阶段 4 后持续失败。\textbf{根本原因}：单点达标不代表稳定能力。\textbf{正确做法}：设回退条件——连续 $N$ 个 epoch 性能低于回退阈值就退回上一阶段。
+\end{pitfall}
+
+\begin{pitfall}[Curriculum 阶段越多越好]
+\textbf{错误描述}：把 5 阶段拆成 10 阶段以求平滑。\textbf{现象后果}：每阶段都要单独阈值、配置、debug，超参爆炸。\textbf{根本原因}：阶段数与超参数量正相关。\textbf{正确做法}：5 阶段足够覆盖静态到完整任务；只有某阶段跳跃太大时才插中间阶段。
+\end{pitfall}
+
+\begin{practice}[课程设计]
+\begin{enumerate}
+\item （设计题）为阶段 2（base reposition）设计完整 reward 配置：哪些项激活？各项权重与 $\sigma$ 如何选？验收：给出激活项清单与一句话理由。
+\item （思考题）若跳过阶段 0--1 直接从阶段 2 开始（底盘可动但不单独验证抓取），有什么风险？如何用实验确认跳过是否可行？
+\item （跨章综合题）结合 \cref{ch:rlmc-reward} 的课程与 \cref{ch:rlmc-dr} 的 DR，设计扩展阶段 5：在阶段 4 上加物体质量随机化、地面摩擦随机化、观测噪声。给出每项 DR 范围与引入顺序。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{抓取时底盘漂移：移动操作独有的工程问题}
+\label{sec:rlmc-wh-drift}
+
+\paragraph{模块功能与在管线中的位置。}本节诊断并解决一个固定基座操作里\emph{不存在}的问题：抓取时臂的反作用力把底盘推走。它处在“物理层（轮地摩擦）$\leftrightarrow$ 动作层（刹车）$\leftrightarrow$ 奖励层（停车惩罚）”三层之间，是判断“底盘建模是否足够真实”的试金石。
+
+\paragraph{动机：为什么底盘会漂移。}臂向下按压或向侧施力时，按牛顿第三定律底盘受等大反向力。若轮地摩擦不足以抵消，底盘被推走。固定基座不存在此问题（底盘螺栓固定）。考虑具体场景：YAM 臂伸到前方 $0.4$ m 抓 $0.5$ kg 方块，支撑重量的向下接触力 $F_z\approx0.5\times9.81\approx5$ N，在 base joint 处产生力矩 $\tau=F_z\times L_{\text{arm}}\approx5\times0.4=2$ N$\cdot$m，反作用到底盘表现为向前推力。底盘 $15$ kg、静摩擦系数 $\mu=0.6$ 时最大静摩擦 $f_s=\mu m g=0.6\times15\times9.81\approx88$ N——$2$ N$\cdot$m 产生的推力远小于此，理想情况不该漂移。但实际有加剧因素：（1）臂快速运动的瞬时惯性力可能很大；（2）动摩擦小于静摩擦，一旦滑动不易停；（3）策略学习中可能输出剧烈底盘动作“追”物体，与臂反作用力叠加。
+
+\begin{insight}[漂移的主因是臂急停的动态惯性力，不是载荷静重]\label{ins:rlmc-wh-drift-cause}
+用一个量级估算把直觉钉死：静态反作用力约几 N，而臂以 $\sim 2$ rad/s 急停（$\sim 20$ ms）产生的动态惯性力可达数十 N——比载荷静重大一个数量级。这就是为什么即使载荷很轻（$0.5$ kg），臂的\emph{快速运动}仍能推动 $15$ kg 底盘。策略训练中经常输出高频臂动作抖动（exploration noise + 未收敛策略），其惯性力远超稳态抓取力。推论：抑制漂移既要管摩擦，也要管\emph{动作平滑}（见 \cref{sec:rlmc-wh-reward} 的 $r_{\text{smooth}}$）。
+\end{insight}
+
+\begin{codebox}[Python]{抓取漂移风险快速估算（设计阶段先算后建）}
+def estimate_drift_risk(arm_reach=0.4, payload_mass=0.5, base_mass=15.0,
+                        wheel_friction=0.6, arm_max_vel=2.0, arm_inertia=0.5):
+    g = 9.81
+    F_static  = payload_mass * g * arm_reach / 0.3   # 简化杠杆：支撑载荷的静态反作用
+    F_dynamic = arm_inertia * arm_max_vel / 0.02     # 臂 20ms 急停的冲击
+    F_fric    = wheel_friction * base_mass * g        # 最大静摩擦
+    drift_ratio = (F_static + F_dynamic) / F_fric
+    print(f"static={F_static:.1f}N dynamic={F_dynamic:.1f}N fric={F_fric:.1f}N "
+          f"ratio={drift_ratio:.2f} ({'HIGH' if drift_ratio > 0.3 else 'low'})")
+    return drift_ratio
+# estimate_drift_risk()  ->  static=6.5N dynamic=50.0N fric=88.3N ratio=0.64 (HIGH)
+\end{codebox}
+
+\paragraph{三种解决方案。}下表先给全貌，再逐一展开。核心是\emph{把约束放在哪里}：物理层（摩擦）、动作层（刹车）、还是奖励层（停车惩罚）。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+方案 & 优点 & 缺点 & 适用场景 \\
+\midrule
+Stop reward & 实现简单、不改动作空间 & 需调权重、接触检测可能延迟 & 一般场景 \\
+Brake action & 策略主动决策、物理直觉清晰 & 增加一个 action 维度 & 需精确定位 \\
+增大摩擦 & 零代码 & 底盘旋转变难、不够灵活 & 简单验证阶段 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{方案 A（Stop reward）}：抓取阶段（物体被持握后）惩罚底盘速度
+\begin{equation}
+r_{\text{stop}}=-w_{\text{stop}}\,\lVert \mathbf{v}_{\text{base}}\rVert^2\,\mathbb{1}[\text{grasping}],
+\label{eq:rlmc-wh-stop}
+\end{equation}
+其中 $\mathbb{1}[\text{grasping}]$ 只在夹爪接触力超阈值时为 1。若不加指示函数，导航阶段也被惩罚速度，策略会学“完全不移动”的保守行为。
+
+\textbf{方案 B（Brake action）}：在 action 加一个“刹车”维度，输出 $>0$ 时强制轮速目标为零、并增大轮子阻尼以抵抗外力。
+
+\begin{codebox}[Python]{带刹车的轮速 action term（运行时改关节阻尼，Isaac Lab API）}
+# 注：运行时写关节阻尼用 Isaac Lab Articulation.write_joint_damping_to_sim
+# （set_joint_velocity_target 两框架都有）；mjlab Entity 无 write_joint_damping_to_sim，
+# 要在 mjlab 动态改阻尼须改 model 的 dof_damping 字段（或改用增大 stop reward / 摩擦）。
+class BrakeAwareWheelAction:
+    """action: [B, 3] = (left_wheel, right_wheel, brake)。brake 经 sigmoid 到 [0,1]。"""
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.normal_damping = 10.0
+        self.brake_damping  = 200.0    # 高阻尼 = 难以转动
+        self.wheel_ids = None
+
+    def apply(self, env, action):
+        wheel_cmd  = action[:, :2] * self.cfg.scale
+        is_braking = (torch.sigmoid(action[:, 2:3]) > 0.5).float()   # [B, 1]
+        effective_vel     = wheel_cmd * (1.0 - is_braking)
+        effective_damping = self.normal_damping * (1.0 - is_braking) + self.brake_damping * is_braking
+        env.robot.set_joint_velocity_target(effective_vel, joint_ids=self.wheel_ids)
+        env.robot.write_joint_damping_to_sim(effective_damping, joint_ids=self.wheel_ids)
+\end{codebox}
+
+\begin{insight}[漂移对策揭示了一个更深的设计选择：约束放 action space 还是 reward space]\label{ins:rlmc-wh-where}
+brake action 把约束放进\emph{动作空间}——给策略一个“锁轮”的工具，控制力更强，但增大了探索空间；stop reward 把约束放进\emph{奖励空间}——不改探索空间，但依赖权重调节才生效。对于“物理直觉清晰”的问题（锁轮 = 不漂移），动作空间方案通常更高效（实验中常在 $\sim 500$ iterations 内学会在抓取阶段激活 brake）。这条经验可推广：凡是“有一个明确的物理动作能直接解决问题”的场景，优先给策略这个动作，而不是绕着用奖励去诱导它。
+\end{insight}
+
+\textbf{方案 C（增大摩擦）}：在 MJCF 增大轮子 \verb|friction|，使正常操作力下不滑动——最简单，但可能过度约束（摩擦太大底盘旋转也变难）。
+
+\subsection{漂移诊断方法论}
+\label{sec:rlmc-wh-drift-diag}
+
+缓慢漂移在 viewer 里几乎不可见，需系统化诊断。\textbf{Step 1（记录位移曲线）}：记录 episode 中底盘 $x,y$ 时间序列，若抓取阶段（检测到夹爪接触力后）底盘位置持续单调移动即存在漂移。\textbf{Step 2（区分被动/主动漂移）}：检查抓取阶段的 wheel action——接近零但底盘仍动是\emph{被动漂移}（臂反作用力推动，需增大摩擦或加 brake）；wheel action 非零是\emph{主动漂移}（策略仍输出底盘速度去“追”物体，需 stop reward）。\textbf{Step 3（测临界摩擦）}：用不同摩擦跑同一已训策略，画 drift-vs-friction 曲线找漂移趋零的临界值；若临界值在 $0.5$--$0.8$（合理橡胶-混凝土摩擦）说明物理合理，若需 $2.0+$ 才能防漂移说明臂反作用力过大（可能 action scale 太大、臂运动太激烈）。
+
+\begin{pitfall}[认为“策略会自己学到不漂移”]
+\textbf{错误描述}：不加任何约束，指望策略训练中自然学到稳定。\textbf{现象后果}：训练 reward 正常上升，但底盘一直漂移。\textbf{根本原因}：漂移在训练中\emph{可能不影响 reward}——物体被抓住后即使底盘移动、物体也跟着移动，搬运 reward 不受影响，策略\emph{没有动机}抑制漂移。\textbf{正确做法}：必须\emph{显式}加 stop reward 或 brake action，不能寄望涌现。
+\end{pitfall}
+
+\begin{pitfall}[stop reward 的指示函数阈值设错]
+\textbf{错误描述}：grasping 指示函数的接触力阈值取得太低或太高。\textbf{现象后果}：太低时导航阶段臂与地面微小接触被误判为 grasping、底盘提前停下；太高时抓取初期接触力没到阈值、底盘已漂走。\textbf{根本原因}：阈值没有落在“正常抓取”与“非抓取”接触力分布之间。\textbf{正确做法}：先在 zero agent 中记录两种状态的接触力分布，选两者之间的阈值。
+\end{pitfall}
+
+\begin{practice}[底盘漂移]
+\begin{enumerate}
+\item （估算题）YAM 臂最大负载 $2$ kg、臂长 $0.5$ m，水平伸出并持握负载时底盘受到的水平推力是多少？底盘 $15$ kg、摩擦 $0.5$，是否会滑动？验收：给出推力、最大静摩擦与结论。
+\item （实验题）在所装框架里分别用三种方案训练 $500$ iterations，记录底盘漂移距离（episode 中底盘位移标准差）。哪种最有效？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{奖励设计：从导航到搬运的多阶段信号}
+\label{sec:rlmc-wh-reward}
+
+\paragraph{模块功能与在管线中的位置。}奖励决定“策略优化什么”。移动搬运的奖励要覆盖导航、朝向、接近、抓取、搬运的完整序列，并处理多阶段奖励之间的权重平衡。它处在“RewardManager 逐项计算并加权求和 $\to$ PPO 优化”的链路上，是最终策略质量的天花板。
+
+\paragraph{动机：移动操作的奖励比固定操作多了什么。}固定基座 staged reward 是 $r_{\text{staged}}=r_{\text{reach}}\times(1+r_{\text{bring}})$，假设底盘固定、只有末端到物体与物体到目标两个距离。移动操作还需覆盖底盘导航、朝向对齐与搬运稳定。
+
+\paragraph{完整奖励函数。}
+
+\begin{equation}
+r_t=\underbrace{w_1 r_{\text{nav}}+w_2 r_{\text{heading}}}_{\text{导航}}
++\underbrace{w_3\, r_{\text{reach}}\,(1+w_4 r_{\text{grasp}}+w_5 r_{\text{carry}})}_{\text{操作（staged）}}
++\underbrace{w_6 r_{\text{stop}}+w_7 r_{\text{smooth}}+w_8 r_{\text{energy}}}_{\text{正则化}}.
+\label{eq:rlmc-wh-reward}
+\end{equation}
+
+各项定义（典型权重供起步，需按训练曲线调）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll l@{}}
+\toprule
+奖励项 & 公式 & 物理含义 & 权重 \\
+\midrule
+$r_{\text{nav}}$ & $\exp(-\lVert\mathbf{p}_{\text{base}}-\mathbf{p}_{\text{obj}}\rVert^2/\sigma_{\text{nav}}^2)$ & 底盘接近物体 & 1.0 \\
+$r_{\text{heading}}$ & $\cos(\alpha_{\text{base}\to\text{obj}})$ & 底盘朝向物体 & 0.5 \\
+$r_{\text{reach}}$ & $\exp(-\lVert\mathbf{p}_{\text{ee}}-\mathbf{p}_{\text{obj}}\rVert^2/\sigma_{\text{reach}}^2)$ & 末端接近物体 & 2.0 \\
+$r_{\text{grasp}}$ & $\mathbb{1}[\text{grasping}]\cdot\exp(-\Delta h/\sigma_h)$ & 抓住并提起 & 3.0 \\
+$r_{\text{carry}}$ & $\exp(-\lVert\mathbf{p}_{\text{obj}}-\mathbf{p}_{\text{goal}}\rVert^2/\sigma_{\text{carry}}^2)$ & 物体接近目标 & 5.0 \\
+$r_{\text{stop}}$ & $-\lVert\mathbf{v}_{\text{base}}\rVert^2\cdot\mathbb{1}[\text{grasping}]$ & 抓取时不漂移 & 0.5 \\
+$r_{\text{smooth}}$ & $-\lVert\mathbf{a}_t-\mathbf{a}_{t-1}\rVert^2$ & 动作平滑 & 0.01 \\
+$r_{\text{energy}}$ & $-\lVert\boldsymbol{\tau}\rVert^2$ & 能耗惩罚 & 0.001 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{乘法门控的逻辑。}$r_{\text{reach}}\times(1+r_{\text{grasp}}+r_{\text{carry}})$ 确保学习的因果顺序：当 $r_{\text{reach}}\approx0$（末端远离物体）时，无论 grasp/carry 多大，乘积都近零——策略不会被“虚假的 carry 信号”误导；只有 $r_{\text{reach}}$ 变大后 grasp/carry 才开始产生梯度。这正是 \cref{ch:rlmc-reward} staged reward 在移动操作上的延伸。
+
+\paragraph{$r_{\text{nav}}$ 与 $r_{\text{reach}}$ 的关系。}两者都在减小到物体的距离，但服务不同阶段：$r_{\text{nav}}$ 的 $\sigma_{\text{nav}}$ 较大（$\sim 1.0$ m）提供远距导航信号，$r_{\text{reach}}$ 的 $\sigma_{\text{reach}}$ 较小（$\sim 0.1$ m）提供近距精确对齐。初期 $r_{\text{nav}}$ 驱动底盘移动，到达附近后 $r_{\text{reach}}$ 驱动末端对齐。
+
+\begin{insight}[奖励设计本质是构建一个隐式任务状态机，相邻 $\sigma$ 必须空间重叠]\label{ins:rlmc-wh-vacuum}
+每个奖励项的 $\sigma$ 与门控条件定义了一个状态转移区域——策略从 $r_{\text{nav}}$ 主导过渡到 $r_{\text{reach}}$ 主导时，实际在穿越由 $\sigma$ 定义的“注意力切换边界”。若两个 $\sigma$ 区间不重叠（如 $\sigma_{\text{nav}}=0.3,\sigma_{\text{reach}}=0.05$），底盘到 $0.3$ m 后 nav 信号饱和、但 reach 信号还没显著梯度，策略会陷入\textbf{奖励真空带}。所以 $\sigma$ 不能独立选——必须确保相邻阶段信号在空间上有足够重叠。经验法则：$\sigma_{\text{nav}}/\sigma_{\text{reach}}\approx 5$--$15$；小于 3 则两信号几乎完全重叠（nav 没必要），大于 20 则中间出现明显梯度真空带。
+\end{insight}
+
+\begin{codebox}[Python]{staged 移动奖励 + heading 对齐（避开 atan2 象限问题）}
+import torch
+
+def staged_mobile_reward(env, reach_sigma=0.1, carry_sigma=0.3):
+    ee_pos  = env.robot.data.body_link_pos_w[:, env.ee_idx]
+    obj_pos = env.cube.data.root_link_pos_w
+    r_reach = torch.exp(-torch.norm(ee_pos - obj_pos, dim=-1)**2 / reach_sigma**2)
+    finger_gap = env.robot.data.joint_pos[:, env.finger_idx]
+    obj_height = obj_pos[:, 2] - env.table_height
+    is_grasping = (finger_gap < 0.02) & (obj_height > 0.04)
+    r_grasp = is_grasping.float() * torch.clamp(obj_height / 0.1, 0, 1)
+    carry_dist = torch.norm(obj_pos - env.goal_pos_w, dim=-1)
+    r_carry = is_grasping.float() * torch.exp(-carry_dist**2 / carry_sigma**2)
+    return r_reach * (1.0 + 3.0 * r_grasp + 5.0 * r_carry)   # 乘法门控：reach 是前置条件
+
+def heading_alignment_reward(env):
+    """用 base frame 中 base-to-object 向量的方向分量，避免显式算角度。"""
+    rel_b = base_to_object_b(env)                          # [B, 3]
+    xy = rel_b[:, :2]
+    cos_heading = xy[:, 0:1] / xy.norm(dim=-1, keepdim=True).clamp(min=0.01)
+    close_mask  = torch.exp(-rel_b.norm(dim=-1, keepdim=True) / 1.5)  # 靠近才强调朝向
+    return (cos_heading * close_mask).squeeze(-1)
+\end{codebox}
+
+\verb|heading_alignment_reward| 有两处巧妙：（1）用 $\cos=x/\lVert xy\rVert$ 直接得连续对齐度量，避开 \verb|atan2| 的 $\pm\pi$ 跳变；（2）乘距离衰减 \verb|close_mask|，底盘远离物体时不强调朝向（先移动过去），靠近时才要求精确对齐。
+
+\paragraph{权重设计原则。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+原则 & 说明 & 例子 \\
+\midrule
+后续阶段权重 $\ge$ 前序 & 防“卡在接近不抓取” & $w_{\text{carry}}>w_{\text{reach}}>w_{\text{nav}}$ \\
+正则项远小于任务项 & 正则是约束不是目标 & $w_{\text{smooth}}\ll w_{\text{nav}}$ \\
+stop reward 适中 & 太大底盘不敢动、太小不起作用 & 先设 0.5 看漂移再调 \\
+$\sigma$ 与空间尺度匹配 & $\sigma$ 太小信号太尖锐 & $\sigma_{\text{nav}}\approx$ 移动范围的 1/3 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Domain Randomization 考量}
+\label{sec:rlmc-wh-dr}
+
+回顾 \cref{ch:rlmc-dr} 的分阶段 DR 策略：先无 DR 训 baseline，再逐步引入。轮式移动操作有几类特别重要的 DR 参数（引入阶段越靠后、范围越宽需越谨慎）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+DR 参数 & 随机化范围 & 影响 & 引入阶段 \\
+\midrule
+轮地摩擦 & $0.4$--$1.2$ & 底盘打滑与漂移 & Phase 4+ \\
+物体质量 & $0.05$--$1.0$ kg & 抓取力需求与搬运惯性 & Phase 3+ \\
+底盘质量 & $\times U(0.85,1.15)$ & 加速性能与惯性 & Phase 4+ \\
+电机增益 & $\times U(0.7,1.3)$ & 轮速跟踪精度 & Phase 4+ \\
+观测噪声 & $\pm 2$ cm 位置 & 感知精度 & Phase 4+ \\
+执行延迟 & $0$--$20$ ms & 底盘响应滞后 & Phase 5 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{paper}[Wheeled Lab：轮式 sim2real 的系统化 DR 参考（arXiv:2502.07380）]\label{paper:rlmc-wh-wheeledlab}
+\textbf{问题}：低成本开源轮式机器人如何在 Isaac Lab 中训练、零样本迁移到真机。\textbf{核心思想}：把标准 1/10 比例 RC 车与 MuSHR 类机器人接入 Isaac Lab，配合系统化 DR（物理属性扰动 + 真实传感器模型 + 大规模并行）。\textbf{关键结果}：演示三个零样本策略——controlled drifting（漂移）、elevation traversal（爬坡）、visual navigation（视觉导航）。\textbf{与本书关系}：它的 DR 范围（轮地摩擦 $U(0.2,0.8)$、执行器增益随机化、IMU 噪声注入）是本章轮式 sim2real 设计的直接工程参考——RC 车的范围可按比例放大到全尺寸底盘（更重，摩擦上限更高）。其核心经验是 DR 范围需经 sim2sim 循环迭代确定：宽范围训练 $\to$ sim2sim 测试 $\to$ 收窄 $\to$ 反复。论文正文明确自述其漂移任务是“文献中迄今首个免在线微调的 sim2real 漂移策略”（原文 “the first work to demonstrate direct Sim2Real transfer for drifting without online fine-tuning”），此处按论文原始口径陈述。作者 Tyler Han 等 12 人，CoRL 2025\,\cite{han2025wheeledlab}。
+\end{paper}
+
+下表给出 Wheeled Lab 范围与本章建议范围的对照（IMU 噪声直接沿用其量级）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+参数 & Wheeled Lab 范围 & 本章建议 & 说明 \\
+\midrule
+轮地摩擦 $\mu$ & $U(0.2,0.8)$ & $U(0.4,1.2)$ & 全尺寸底盘更重，上限更高 \\
+底盘质量 & --- & $\times U(0.85,1.15)$ & 按比例随机化 \\
+电机增益 & 自定义 & $\times U(0.7,1.3)$ & 模拟老化与电压波动 \\
+IMU 加速度噪声 & $\sigma\approx0.02$ m/s$^2$ & $\sigma\approx0.02$ m/s$^2$ & 与 Wheeled Lab 一致 \\
+IMU 陀螺噪声 & $\sigma\approx0.001$ rad/s & $\sigma\approx0.001$ rad/s & 与 Wheeled Lab 一致 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\rebuilt{上表轮地摩擦 $U(0.2,0.8)$ 已与论文正文核对一致（论文后据弹簧秤实测将系数收窄至约 $0.4$）；但 IMU 噪声的具体数值论文正文并未给出，表中数字为源稿经验补充，按数量级参考即可。}
+
+\subsection{双框架 reward 配置对照}
+\label{sec:rlmc-wh-reward-api}
+
+\begin{codebox}[Python]{mjlab（上）/ Isaac Lab（下）reward 接线对照}
+# mjlab
+rewards = {
+    "nav":     RewardTermCfg(func=base_to_object_reward, weight=1.0, params={"sigma": 1.0}),
+    "heading": RewardTermCfg(func=heading_alignment_reward, weight=0.5),
+    "staged":  RewardTermCfg(func=staged_mobile_reward, weight=2.0),
+    "stop":    RewardTermCfg(func=base_stop_during_grasp, weight=0.5),
+    "action_rate": RewardTermCfg(func=action_rate_penalty, weight=0.01),
+}
+# Isaac Lab（注意 action_rate 用负权重表示惩罚）
+class RewardsCfg:
+    nav         = RewTerm(func=mdp.base_to_object_distance, weight=1.0, params={"sigma": 1.0})
+    heading     = RewTerm(func=mdp.heading_alignment, weight=0.5)
+    staged      = RewTerm(func=mdp.staged_mobile_reward, weight=2.0, params={"reach_sigma": 0.1})
+    stop        = RewTerm(func=mdp.base_stop_during_grasp, weight=0.5)
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+\end{codebox}
+
+\paragraph{奖励 Debug 工作流。}训练不符合预期时，按序排查 reward：（1）分项 reward 曲线（WandB/TensorBoard）——常见“nav 涨但 reach 不涨”；（2）reward 数值范围（打印 min/max/mean）——某项太大压制其他项；（3）reward 与行为对应（viewer + reward 标注）——reward 涨但行为不对（reward hacking）；（4）门控是否生效（打印 grasping 指示函数）——阈值错误；（5）$\sigma$ 是否合理（画 $\exp(-d^2/\sigma^2)$ 曲线）——太小则只在极近距离有信号。
+
+\begin{pitfall}[carry reward 没有被 grasp 门控]
+\textbf{错误描述}：carry reward 始终激活、不乘 \verb|is_grasping|。\textbf{现象后果}：策略学到\emph{用底盘把物体推到目标附近}比“抓起来搬”更容易拿 carry reward——学会推而不是抓。\textbf{根本原因}：未抓取也能获得搬运奖励。\textbf{正确做法}：$r_{\text{carry}}$ 必须被 $\mathbb{1}[\text{grasping}]$ 或 $r_{\text{grasp}}$ 门控。
+\end{pitfall}
+
+\begin{pitfall}[只看总 reward 调权重]
+\textbf{错误描述}：总 reward 曲线上升就认为一切正常。\textbf{现象后果}：$r_{\text{nav}}$ 快速上升掩盖了 $r_{\text{grasp}}$、$r_{\text{carry}}$ 的停滞，最终策略只会导航不会抓。\textbf{根本原因}：总和掩盖分项。\textbf{正确做法}：在 WandB 分别记录每个 reward 子项，按时间顺序检查是否依次上升。
+\end{pitfall}
+
+\begin{practice}[奖励设计]
+\begin{enumerate}
+\item （推导题）证明当 $r_{\text{reach}}=0$ 时整个 staged 项对 policy parameter 的梯度为零。这如何保证学习的因果顺序？
+\item （实验题）固定其他参数，分别用 $\sigma_{\text{nav}}=0.3$ 与 $\sigma_{\text{nav}}=3.0$ 训练 $300$ iterations，观察底盘行为差异，解释 $\sigma$ 过小与过大各自的问题。
+\item （跨章综合题）结合 \cref{ch:rlmc-dr} 的 EventManager 与本节奖励，若在阶段 4 加物体质量 DR（$\pm 30\%$），应同时调整哪些 reward 参数？为什么？（提示：物体更重时 lift reward 门槛需降低）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{集成实战：从零搭建轮式 + YAM 环境}
+\label{sec:rlmc-wh-integration}
+
+\paragraph{模块功能与在管线中的位置。}本节把前面所有零件组装成一个可运行环境，并完成从 smoke test 到短训练的全流程验证。它处在“资产 $\to$ scene $\to$ env cfg $\to$ register $\to$ verify”这条搭建主线的终点，也是把抽象设计变成“能跑的代码”的唯一一步。
+
+\paragraph{从固定基座 YAM lift cube 出发：复用与新建清单。}轮式移动操作不是从零开始——它复用 \cref{ch:rlmc-manip} 中 YAM 的大量组件。下表的核心模式是\textbf{增量式扩展}：不重写整个环境，只在固定基座基础上添加底盘相关的 manager term。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{3.6cm}@{}}
+\toprule
+组件 & 固定基座 YAM lift cube & 轮式 + YAM 的差异 \\
+\midrule
+臂 MJCF / 方块 Entity & 已有 & 复用，无改动 \\
+底盘 MJCF & 无 & 新建（差速两轮） \\
+组合 Scene & 无底盘 & 新建：臂挂载到底盘上 \\
+Action & \verb|JointPositionActionCfg|（7D） & 加 \verb|JointVelocityActionCfg|（2D），7$\to$9 \\
+Observation & 无底盘状态（约 26D） & 扩展：加底盘速度/朝向/轮速（42D） \\
+Reward & 单项 staged & 扩展：加 nav/heading/stop（8 项） \\
+Termination & illegal\_contact + timeout & 扩展：加底盘出界/倾斜/物体掉落 \\
+Curriculum & 无 & 新建五阶段 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{步骤 1：spec attach 组合复合机器人}
+\label{sec:rlmc-wh-attach}
+
+在 mjlab 中，复合机器人的 MJCF 通过 Python spec 组合：底盘 spec 作 root，把臂 spec attach 到底盘的 mount site。\textbf{真实方法是} \verb|parent.attach(child, ...)|\textbf{（mujoco 3.8.1 实测无} \verb|attach_to|\textbf{）}——即\emph{底盘} spec 调 \verb|attach| 把\emph{臂} spec 挂进来（主体在前、被挂者作参数）。attach 后臂的所有 body 成为底盘 body 的后代、共享同一 kinematic tree——底盘移动时臂自动跟随（无需额外同步），但臂运动也会通过 kinematic tree 把反作用力传到底盘（这正是 \cref{sec:rlmc-wh-drift} 漂移的物理来源）。
+
+\begin{codebox}[Python]{spec attach 组合底盘与 YAM（带名字冲突保护）}
+import mujoco
+import numpy as np
+
+def get_wheeled_yam_spec_safe():
+    base_spec = mujoco.MjSpec.from_file("wheeled_base.xml")
+    arm_spec  = mujoco.MjSpec.from_file("yam.xml")
+    base_body = base_spec.find_body("base")
+    mount_site = base_body.add_site(name="arm_mount", pos=[0.0, 0.0, 0.08])  # 底盘顶面
+    # 实测（mujoco 3.8.1）：真实方法是 parent_spec.attach(child_spec, prefix=, site=)，
+    # 调用方向是“底盘 spec 把臂 spec attach 进来”（主体在前、被挂者作参数），不是反过来。
+    # 用 prefix 避免名字冲突：attach 后 arm 的 "joint1" -> "yam/joint1"。
+    # site= 与 frame= 二选一（这里给 mount_site）；attach 返回新挂上的 MjsFrame。
+    base_spec.attach(arm_spec, prefix="yam/", site=mount_site)
+    model = base_spec.compile()
+    data  = mujoco.MjData(model)
+    mujoco.mj_step(model, data)
+    assert not np.isnan(data.qpos).any(), "NaN in qpos after mj_step!"
+    return model, data
+\end{codebox}
+
+\paragraph{别背 API 名，现场探明它（一次真实排错）。}本章早期草稿照网上印象写了 \verb|arm_spec.attach_to(base_spec, ...)|，在 mujoco 3.8.1 上直接 \verb|AttributeError: 'MjSpec' object has no attribute 'attach_to'|。\textbf{这正是“先探针再写”方法论该兜住的坑}——不要凭记忆写框架 API，装好后用三行把真实签名问出来：
+
+\begin{codebox}[bash]{探明 MjSpec 的真实拼装 API（遇到 AttributeError 先这么做）}
+# 1) 这个对象到底有哪些方法？（grep 出名字像 attach 的）
+python -c "import mujoco; print([m for m in dir(mujoco.MjSpec) if 'attach' in m.lower()])"
+#   实测输出: ['attach']      # ← 没有 attach_to，只有 attach
+# 2) attach 的真实签名/参数名是什么？（谁调谁、有哪些关键字参数）
+python -c "import mujoco; help(mujoco.MjSpec.attach)"
+#   实测要点: attach(self, child, *, prefix='', site=None, frame=None, ...) -> MjsFrame
+#            即 parent_spec.attach(child_spec, ...)：主体在前、被挂者作 child 参数；site/frame 二选一
+\end{codebox}
+
+\begin{insight}[“查不到就探针”是比记 API 更可靠的工程技能]\label{ins:rlmc-wh-probe}
+框架 API 名随版本漂移（\verb|attach_to| 这种“合理猜测”很容易和真实 \verb|attach| 错位），死记必踩坑。可复用的心法是：\emph{遇到 \texttt{AttributeError} 先 \texttt{dir(obj)} 过滤关键字、再 \texttt{help(obj.method)} 看签名}，三行就把“我以为的 API”换成“它真实的 API”。本章对 mjlab / UniLab 的所有字段（\verb|root_link_lin_vel_b|、\verb|wheel_action_scale| 等）都是这样探出来的，而不是抄文档——把“核 API”变成你自己的肌肉记忆。
+\end{insight}
+
+\begin{pitfall}[\texttt{spec.attach()} 的三个高频陷阱：keyframe / actuator 引用 / 初始碰撞]
+\textbf{错误描述与现象}：（1）\emph{keyframe 丢失}——底盘与臂的 home keyframe 不会自动合并，组合后若不重建 keyframe，初始姿态错乱；（2）\emph{actuator 引用断裂}——若臂 actuator 通过 \verb|joint="joint1"| 引用，attach 后关节名变 \verb|yam/joint1| 而 actuator 仍指旧名，\emph{编译失败}；（3）\emph{初始碰撞}——mount site 位置不准时臂初始位姿可能与底盘几何重叠。\textbf{根本原因}：attach 只重命名并嫁接 kinematic tree，不会智能合并语义资源。\textbf{正确做法}：组合后手动重建包含底盘+臂全部关节角的新 keyframe；确保 actuator 在 attach 后绑定到新关节名；用 \verb|mj_step| + 检查 \verb|data.ncon|（接触数）验证初始无自碰撞。
+\end{pitfall}
+
+\subsection{步骤 2--3：Scene 与 EnvCfg}
+\label{sec:rlmc-wh-scene}
+
+\begin{codebox}[Python]{Scene + EnvCfg 骨架（mjlab 风格，字段名以版本为准）}
+class WheeledYamSceneCfg:
+    terrain = TerrainCfg(type="plane")                 # 供底盘行驶
+    robot = EntityCfg(spec_fn=get_wheeled_yam_spec_safe,
+        init_state=EntityCfg.InitialStateCfg(pos=(0.0, 0.0, 0.15),
+            joint_pos={"left_wheel_joint": 0.0, "right_wheel_joint": 0.0,
+                       "joint1": 0.0, "joint2": -0.5, "joint3": 0.5,
+                       "joint4": 0.0, "joint5": 0.5, "joint6": 0.0,
+                       "left_finger_joint": 0.04}))
+    cube  = EntityCfg(spec_fn=get_cube_spec,
+        init_state=EntityCfg.InitialStateCfg(pos=(1.0, 0.0, 0.82)))   # 桌面高度
+    table = EntityCfg(spec_fn=get_table_spec,
+        init_state=EntityCfg.InitialStateCfg(pos=(1.0, 0.0, 0.0)))
+    num_envs = 128
+    env_spacing = 5.0   # 底盘移动范围大，需更大间距
+
+class WheeledYamLiftCubeEnvCfg(ManagerBasedRlEnvCfg):
+    scene = WheeledYamSceneCfg()
+    # actions / observations / rewards / terminations 见前面各节
+    sim = SimCfg(timestep=0.002, decimation=5)
+    episode = EpisodeCfg(length_s=10.0)
+\end{codebox}
+
+\begin{note}[保留桌子：cube 初始 \texttt{z=0.82} 依赖桌面高度]
+从固定基座扩展时，容易顺手删掉 table（“底盘在地面跑，要桌子干嘛”）。但 cube 的初始 \verb|z=0.82| 正是依赖桌面高度——删了桌子方块会直接掉到地面、reach 目标位置全错。正确做法是\emph{保留} table 作为放置方块的平台，同时\emph{新增} ground plane 供底盘行驶，并把 \verb|env_spacing| 加大到 $5.0$。
+\end{note}
+
+\subsection{步骤 4：Termination 设计}
+\label{sec:rlmc-wh-termination}
+
+轮式移动操作比固定基座多了几类与底盘相关的终止条件。\verb|time_out| 的语义回顾 \cref{ch:rlmc-reward}/\cref{ch:rlmc-training}：当 \verb|time_out=True| 时 PPO 对最后一步做 value bootstrapping（认为是时间截断而非真正失败），不把终止当 absorbing state。\textbf{只有超时终止设为 True}，碰撞/出界/掉落设为 False（这些是真正的任务失败）。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+Termination & 触发条件 & 类型 & \verb|time_out| \\
+\midrule
+timeout & episode 达上限 & 仿真安全 & True \\
+base\_oob & 底盘 $|x|>3$ 或 $|y|>3$ & 仿真安全 & False \\
+base\_tilt & 底盘倾角 $>30^\circ$ & 安全 & False \\
+illegal\_contact & 臂末端 link 碰地面 & 任务语义 & False \\
+object\_drop & 物体被持握后 $z$ 骤降 & 任务语义 & False \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\verb|base_tilt| 是保守安全终止：轮式底盘平地上几乎不倾斜，但臂伸到极远处且负载较重时质心偏移可能让底盘一侧抬起；$30^\circ$ 阈值足够宽松（正常操作倾角 $<5^\circ$），只在严重倾斜（真机意味翻车风险）时触发。
+
+\subsection{步骤 5：注册并分阶段验证}
+\label{sec:rlmc-wh-verify}
+
+\begin{codebox}[bash]{mjlab 五步 smoke test（task id 以 --help 实际输出为准）}
+# 1. 注册验证：列表里应包含你注册的 task id
+uv run list-envs
+# 2. zero agent：底盘不动、臂保持 home（验证 use_default_offset）
+uv run play <TASK_ID> --agent zero --num-envs 4 --viewer viser
+# 3. random agent：底盘移动但不爆飞、臂运动但不超限
+uv run play <TASK_ID> --agent random --num-envs 4 --viewer viser
+# 4. shape 验证：打印 obs/action shape，与设计一致（42 / 9）
+uv run train <TASK_ID> --env.scene.num-envs 4 --agent.max-iterations 1
+# 5. smoke 训练：无 shape error、无 NaN，完成 10 iterations
+uv run train <TASK_ID> --env.scene.num-envs 64 --agent.max-iterations 10 \
+  --agent.logger tensorboard
+\end{codebox}
+
+\begin{pitfall}[\texttt{<TASK\_ID>} 这串字符串本身可能因版本而异]
+\textbf{错误描述}：照抄某个 task id 却报 \verb|task not found|。\textbf{现象后果}：以为没装好、反复重装。\textbf{根本原因}：由于轮式任务是你\emph{自己注册}的，task id 完全取决于你的 \verb|register| 调用；即便复用社区命名，不同版本/分支也可能不同。\textbf{正确做法}：先 \verb|uv run list-envs|（或 \verb|uv run train --help|）列出当前实际可用的 task id，再照列表拼写跑。\rebuilt{本章正文用占位 \texttt{<TASK\_ID>} 指代你注册的任务名，不假定任何固定字符串。}
+\end{pitfall}
+
+\paragraph{逐阶段验证 checklist。}完整训练前，按 curriculum 阶段逐个验证配置正确性。任何阶段不通过，先在该阶段排查再进下一阶段——\textbf{跳过的阶段会把 bug 带入后续，定位难度指数级增长}。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+阶段 & 验证 & 通过标准 \\
+\midrule
+0 & 用固定基座 YAM 策略在无底盘环境 play & 抓取成功 \\
+1 & 固定底盘 + staged reward 训 500 iter & grasp\_success $>50\%$ \\
+2 & nav-only 环境训 300 iter & base-to-object $<30$ cm \\
+3 & 放开全环境训 1000 iter & grasp\_success $>20\%$ \\
+4 & 加 carry reward 训 2000 iter & carry\_success $>5\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Isaac Lab 对应路径与双框架搭建对照}
+\label{sec:rlmc-wh-isaac-integration}
+
+Isaac Lab 中遵循类似结构，但用 USD 与 Isaac Lab 的 manager API。两框架核心差异在资产格式（MJCF vs USD）与物理引擎（MuJoCo Warp vs PhysX），但 manager 层设计模式几乎一一对应——这是双框架并重教学的工程基础：掌握一个框架的 manager 架构后，迁移的主要工作是\emph{参数映射}而非逻辑重构。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+步骤 & mjlab & Isaac Lab & UniLab \\
+\midrule
+资产定义 & MJCF + \verb|spec_fn| & USD + \verb|UsdFileCfg| & MJCF/Motrix XML（\verb|SceneCfg.model_file|，无 USD） \\
+复合组装 & \verb|base_spec.attach(arm_spec,...)| & USD scene composition & \verb|SceneCfg.fragment_files| 拼片段 \\
+Scene 配置 & \verb|SceneCfg(entities=...)| & \verb|InteractiveSceneCfg| & \verb|SceneCfg(model_file=, terrain=)| \\
+Action / Obs / Reward & dict & dataclass cfg & \verb|apply_action| / \verb|_compute_obs| / scales 字典 \\
+环境注册 & \verb|register_mjlab_task(...)| & \verb|gymnasium.register(...)| & \verb|@registry.envcfg| + \verb|@registry.env| \\
+验证 & \verb|uv run play / train| & \verb|scripts/.../train.py| & \verb|uv run train/eval --algo ppo --task ...| \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+迁移最易错的步骤是 action 配置——两框架 action group 排序规则不同（mjlab 按 dict key 插入序、Isaac Lab 按 dataclass field 声明序），排序不一致会把网络输出的前几维发给错误 actuator（见 \cref{sec:rlmc-wh-action} 的陷阱）。
+
+\subsection{性能考量与 sim2real 准备度}
+\label{sec:rlmc-wh-perf}
+
+轮式移动操作比固定基座计算成本更高，主要来自轮地接触求解、更大的场景（\verb|env_spacing| 增大占更多 GPU 内存）、更长的 episode。在 4090 上 128 并行环境的轮式 + YAM 训练，预期 steps/s 约为固定 YAM 的 $60$--$80\%$；加 camera sensor 进一步降到 $30$--$50\%$。\rebuilt{此吞吐比例为源稿经验值，随硬件/版本波动，仅作量级参考。}\textbf{实测锚点（量级参照）}：RTX~4080~SUPER 上固定基座基准 \verb|Mjlab-Lift-Cube-Yam| 64~env 实跑约 \textbf{1355~steps/s}（本章轮式扩展按上面 $60$--$80\%$ 比例，量级落在千级）；UniLab \verb|go2w_joystick_flat| 16~env 冷启约 \textbf{340~steps/s}（小并行偏低属正常，PPO 吞吐随 \verb|num_envs| 近线性增长，热身后回升，别拿小冒烟的数字当性能回归）。优化按收益排序：减少被动轮（用 1 球代 2 万向轮，$15$--$20\%$）、episode 前期用短时长（$20$--$30\%$）、增大 decimation（$5\to10$，$30$--$50\%$，但需重调参）。
+
+\begin{insight}[性能优化要先 profile 再动手，别想当然定位瓶颈]\label{ins:rlmc-wh-profile}
+和代码优化一样：先 profile 确认瓶颈，再针对性优化。不要一上来就在“轮子接触太慢”上花时间——也许瓶颈其实在 reward 计算的 Python 侧。用 \verb|torch.profiler| 或 \verb|mj_step| 计时确认后再下手。这条对所有 RL 工程都成立：感知到的瓶颈与真实瓶颈经常不是同一个。
+\end{insight}
+
+\paragraph{sim2real 准备度（环境搭建阶段就要考虑）。}虽然部署是后续主题，但几项 sim2real 问题若不在搭建阶段考虑，后续修复成本很高。最关键是\textbf{底盘执行延迟}（$20$--$80$ ms）——已在 \cref{sec:rlmc-wh-delay} 讲过，应在 actuator 层建模（Isaac Lab 用 \verb|DelayedPDActuatorCfg|，mjlab 手动缓冲）。其余检查项：底盘惯性参数（对比 MJCF 质量/惯量与真机 spec sheet）、轮径轮距（\verb|mj_step| 验证直行 1 m 是否精确，否则里程计漂移）、关节摩擦（臂在 zero torque 下是否自然下垂）、夹爪力（抓取接触力是否在真机夹爪力矩范围内）。
+
+\begin{pitfall}[\texttt{env\_spacing} 太小]
+\textbf{错误描述}：沿用固定基座的 \verb|env_spacing=2.0|。\textbf{现象后果}：底盘移动范围超出 env 边界、撞到相邻 env 的物体，obs 出现莫名其妙的“别人家的物体”。\textbf{根本原因}：底盘会移动，占地远大于固定基座。\textbf{正确做法}：\verb|env_spacing| $\ge$ 底盘最大移动范围直径 $\times 1.5$（推荐 $5.0+$）。
+\end{pitfall}
+
+\begin{practice}[集成实战]
+\begin{enumerate}
+\item （实践题）按上述步骤在所装框架搭建轮式 + YAM 环境，完成五步 smoke test。验收：记录每一步的通过情况与实际打印的 obs/action shape。
+\item （源码桥接题）画三列表：固定基座 YAM 源码 $\to$ 可复用组件 $\to$ 轮式新增组件，覆盖 action/command/reward/observation/termination 五个 manager。
+\item （跨章综合题）结合 \cref{ch:rlmc-dr} 的 DR 与 \cref{ch:rlmc-privileged} 的 teacher-student，为轮式移动操作设计 Phase 5：(a) 列至少 6 项 DR 与范围，(b) 设计 critic privileged 观测（teacher 信号），(c) 说明如何验证 student（去 privileged 后）性能下降在可接受范围内。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{从单臂到双臂的扩展路径}
+\label{sec:rlmc-wh-bimanual}
+
+本章标题的“双臂”指轮式底盘搭载双臂的系统\emph{形态}，但教学实战用的是单臂（一个 YAM）——先把 base-arm 耦合这一核心问题讲透，再谈双臂。从单臂到双臂涉及的工程变化如下。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & 单臂（本章实现） & 双臂（扩展） \\
+\midrule
+Action 维度 & $2+6+1=9$ & $2+6\times2+1\times2=16$ \\
+Observation 新增 & --- & 双臂末端间距、左右臂对称性 \\
+Reward 新增 & --- & 双臂协调（两末端距离匹配） \\
+核心挑战 & 底盘-臂耦合 & 底盘-左臂-右臂三方耦合 + 双臂碰撞避免 \\
+典型任务 & 单物体抓取搬运 & 大物体双手抬起、开盒盖、倒水 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[双臂的关键决策：两只臂是否共享一个策略]\label{ins:rlmc-wh-shared}
+\emph{方案一（完全对称）}：一个策略网络输出 16 维动作，两臂通过 obs 中的对称编码（左右互换）实现协调——更简单，但对称性假设限制了\emph{非对称}任务（如一手扶一手拧）。\emph{方案二（主从架构）}：一只臂的策略生成目标轨迹，另一只臂的策略跟踪——更灵活，但需设计 inter-arm communication 的 obs 通道。这与 \cref{sec:rlmc-wh-arch} 的“单 MLP vs 双策略”一脉相承：共享策略简单但耦合，独立策略灵活但协调全压在观测上。建议读者在自定义项目中以本章单臂环境为起点，先通过 spec attach 把第二只臂挂到底盘另一侧 site，再扩 action/obs，最后设计双臂协调 reward。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{常见误解汇总}
+\label{sec:rlmc-wh-misconceptions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.2cm}p{8.0cm}@{}}
+\toprule
+误解 & 纠正 \\
+\midrule
+底盘稳定 = 任务更简单 & 难度从“平衡”转移到“导航精度 + base-arm 协调”，没有消失（\cref{ins:rlmc-wh-stable}）。 \\
+轮式是“简化版四足” & 是独立问题类，入口应是固定基座向上扩展、非四足向下简化（\cref{ins:rlmc-wh-entry}）。 \\
+轮子不需要物理建模 & 轮地接触摩擦直接决定抓取时是否漂移；\verb|condim|/\verb|friction|/\verb|solref| 是关键调试项。 \\
+\verb|condim=4| 含滚动摩擦 & \verb|condim=4| 是\emph{扭转}；滚动需 \verb|condim=6|（官方文档已核）。 \\
+全向底盘总是更好 & 全向接触模型多数引擎不精确、真机易打滑；差速更准更便宜（\cref{sec:rlmc-wh-modeling} 陷阱）。 \\
+归一化 action 就够了 & observation 的量纲差异同样会主导梯度，obs 也要归一化。 \\
+只配 reset 随机化延迟步数就有延迟了 & 还须每步从缓冲取出旧动作替换；只随机化步数不产生任何延迟（\cref{sec:rlmc-wh-delay}）。 \\
+策略会自己学到不漂移 & 漂移常不影响 reward，策略无动机抑制，必须显式加 stop reward / brake（\cref{sec:rlmc-wh-drift}）。 \\
+carry reward 始终激活没问题 & 会学成“推物体”而非“抓物体”，必须被 grasp 门控。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{小结}
+\label{sec:rlmc-wh-summary}
+
+本章把强化学习运控从浮动基座的足式系统切换到轮式底盘 + 臂的移动操作，核心是\textbf{把固定基座操作向上扩展一个会动的底盘}，而非把四足加臂向下简化。一句话提炼全章工程经验：\textbf{移动操作的每个子系统（底盘、臂、夹爪）都可独立验证，但集成后涌现的问题（漂移、量纲不匹配、奖励真空带）才是真正的工程挑战}——这正是本章强调“分治-集成-逐阶段验证”而非一次性集成的原因。
+
+\paragraph{术语速查。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 一句话 \\
+\midrule
+非完整约束 & 差速底盘不能横移，必须“先转后走”，配置空间是 $\SE(2)$。 \\
+差速 vs 全向 & 差速 2 控制量有约束；全向 3 控制量无约束、但建模更难。 \\
+混合动作空间 & 轮速（velocity）+ 臂（position），分组 scale 让每维 $[-1,1]$ 任务后果相近。 \\
+base frame 相对向量 & 把目标关系转到底盘坐标系，对底盘全局位移不变（低方差）。 \\
+heading 编码 & 用 $(\cos\alpha,\sin\alpha)$ 避免角度 $\pm\pi$ 跳变，帮策略跨越时序鸿沟。 \\
+五阶段 curriculum & fixed reach $\to$ grasp $\to$ nav $\to$ mobile grasp $\to$ carry。 \\
+底盘漂移 & 臂反作用力（尤其急停惯性力）+ 轮地摩擦不足；用 stop reward / brake / 摩擦解决。 \\
+staged 乘法门控 & $r_{\text{reach}}\times(1+\dots)$ 保证学习因果顺序，避免虚假后段信号。 \\
+奖励真空带 & 相邻 $\sigma$ 不重叠导致中间无梯度；$\sigma_{\text{nav}}/\sigma_{\text{reach}}\approx5$--$15$。 \\
+n-gon 伪影 & PhysX 把圆柱近似为多面体，高速旋转产生离散接触；用球碰撞或虚拟臂规避。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 轮式是独立问题类，入口是固定基座扩展 & \cref{sec:rlmc-wh-positioning} & 中 \\
+2 & 差速运动学与两种动作参数化 & \cref{sec:rlmc-wh-kinematics} & 易 \\
+3 & \verb|condim|/\verb|friction|/\verb|velocity| 三个生死参数 & \cref{sec:rlmc-wh-mjcf} & 中 \\
+4 & PhysX n-gon 伪影与两种规避方案 & \cref{sec:rlmc-wh-isaac-base} & 难 \\
+5 & 混合动作的量纲归一化与三步选 scale & \cref{sec:rlmc-wh-action} & 中 \\
+6 & action delay 须在 actuator 层、不能只随机化步数 & \cref{sec:rlmc-wh-delay} & 难 \\
+7 & base frame 相对向量 + heading 编码 & \cref{sec:rlmc-wh-obs} & 中 \\
+8 & 五阶段 curriculum 与性能门控 / 回退 & \cref{sec:rlmc-wh-curriculum} & 中 \\
+9 & 阶段推进的 warm-start（降 lr 最常用） & \cref{sec:rlmc-wh-warmstart} & 中 \\
+10 & 底盘漂移三方案与“约束放哪”的设计选择 & \cref{sec:rlmc-wh-drift} & 难 \\
+11 & 多阶段奖励与奖励真空带 & \cref{sec:rlmc-wh-reward} & 难 \\
+12 & spec attach 三陷阱（keyframe/actuator/碰撞） & \cref{sec:rlmc-wh-attach} & 中 \\
+13 & 五步 smoke test 与逐阶段验证 & \cref{sec:rlmc-wh-verify} & 易 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{延伸阅读}
+\label{sec:rlmc-wh-reading}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{6.6cm}p{6.4cm}@{}}
+\toprule
+资源 & 一句话教什么 \\
+\midrule
+Han et al.\ Wheeled Lab, CoRL 2025（arXiv:2502.07380）\,\cite{han2025wheeledlab} & 低成本开源轮式机器人的 Isaac Lab sim2real；漂移/爬坡/视觉导航三个零样本策略与系统化 DR。 \\
+Gu et al.\ ICRA 2017（arXiv:1610.00633）\,\cite{gu2017deeprl} & 操作中深度 RL 的早期系统性工作（异步 off-policy 更新）。 \\
+Lynch \& Park, \textit{Modern Robotics}（Ch.\ 13）\,\cite{lynch2017modern} & 非完整约束与轮式运动学的经典教材推导。 \\
+Khatib 1987, 操作空间控制\,\cite{khatib1987operational} & 操作空间（operational space）控制的理论基础，DiffIK 的学术根源。 \\
+Dubins 1957（\textit{Amer.\ J.\ Math.}\ 79:497--516）\,\cite{dubins1957curves} & 曲率受限最短路径，理解差速底盘规划本质难度的数学源头。 \\
+mjlab（arXiv:2601.22074）\,\cite{mjlab2026} & 把 Isaac Lab 的 manager-based API 接到 MuJoCo Warp 的轻量框架（本章 mjlab 侧）。 \\
+Isaac Lab\,\cite{mittal2025isaaclab} & 多物理后端、Manager-Based 的机器人学习平台（本章 Isaac Lab 侧）。 \\
+RSL-RL（arXiv:2509.10771）\,\cite{schwarke2025rslrl} & PPO + 蒸馏 + 归一化的统一库（本章 RL 后端，\verb|EmpiricalNormalization| 出处）。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{故障排查手册}
+\label{sec:rlmc-wh-troubleshoot}
+
+遇到问题先定位症状所在行，再按排查步骤逐一检查。\textbf{使用提示}：同时出现多个症状（如“底盘不动”+“reward 不涨”）时，先解决物理层（底盘不动）再排查奖励层——物理建模错误会导致所有上层机制失效。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.2cm}p{3.4cm}p{4.4cm}p{1.8cm}@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+底盘不动 & 轮子 condim 设错 / actuator 非 velocity & 查 \verb|condim|$\ge3$；查 actuator 类型；\verb|mj_step| 加非零 ctrl 手测 & \cref{sec:rlmc-wh-mjcf} \\
+zero agent 下臂抽搐 & 未设 \verb|use_default_offset| / 关节限位不含 0 & 查 action cfg；查 MJCF 关节 range；打印 home keyframe & \cref{sec:rlmc-wh-action} \\
+抓取时底盘滑走 & 轮地摩擦不足 / 无 stop reward & 打印轮接触力；增大 friction；加 stop reward；查臂力矩峰值 & \cref{sec:rlmc-wh-drift} \\
+reward 只有 nav 在涨 & 末端到不了物体 / reach $\sigma$ 太小 & 查臂可达范围覆盖物体；增大 reach $\sigma$；查 cube 高度 vs workspace & \cref{sec:rlmc-wh-reward} \\
+Isaac Lab action 维度不匹配 & action group 排序错误 & 打印 \verb|action_term_dim|；确认 field 声明序；比对网络输出维度 & \cref{sec:rlmc-wh-action} \\
+多环境 obs 异常 & 绝对 world 位置混入 / 跨 frame 混用 & 打印相对向量；比不同 env\_id 的值；查 base\_to\_object 与 command 是否同 frame & \cref{sec:rlmc-wh-obs} \\
+attach 后 joint 名冲突 & 底盘与臂有同名 joint & 列出全部 joint name；用 prefix 重命名；重新 compile & \cref{sec:rlmc-wh-attach} \\
+Curriculum 卡在 Phase 0 & reach 阈值太高 / 物体超出可达 & 打印 success rate；降阈值到 30\%；查物体 spawn vs workspace & \cref{sec:rlmc-wh-curriculum} \\
+底盘原地转不前进 & 两轮反向等速 / 朝向 obs 错 & 打印左右轮速；查 heading reward；viewer 确认朝向 & \cref{sec:rlmc-wh-modeling} \\
+策略推物体而非抓取 & carry reward 未被 grasp 门控 & 查 carry 是否乘 \verb|is_grasping|；viewer 看末端是否闭合；增大 grasp 权重 & \cref{sec:rlmc-wh-reward} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{版本信息速查}
+\label{sec:rlmc-wh-versions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+组件 & 版本基准 & 本章相关点 \\
+\midrule
+mjlab & arXiv:2601.22074 对应版本 & 无内置轮式；\verb|base_spec.attach(arm_spec,prefix=,site=)| 组合复合机器人；CLI \verb|uv run train/play| \\
+Isaac Lab & 官方文档对应版本 & \verb|DelayedPDActuatorCfg(min_delay,max_delay)|；\verb|ImplicitActuatorCfg(stiffness=0)| 做速度控制 \\
+MuJoCo & 含 Warp（实测 3.8.1） & \verb|condim| 1/3/4/6 语义（4=扭转，6=滚动）；\verb|velocity| actuator；\verb|MjSpec.attach| 无 \verb|attach_to| \\
+RSL-RL & arXiv:2509.10771 对应版本 & \verb|EmpiricalNormalization|；归一化配置标志名按版本（\verb|empirical_normalization| 或 \verb|obs_normalization|） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\rebuilt{凡 task id 确切字符串、各框架字段名与默认值，均以你所装版本的 \texttt{--help} 与官方文档为准；本章在文中已对未逐字确认处加注。轮式任务为自建，task id 完全取决于你的注册调用。}
