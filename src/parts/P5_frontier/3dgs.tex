@@ -1,0 +1,742 @@
+\chapter{三维高斯泼溅：从高斯基元到实时可微渲染}
+\label{ch:3dgs}
+
+% ════════════════════════════════════════════════════════════════
+%  P5 前沿「高斯弧线」开篇章。承 \cref{sec:dense-radiance-gs}(把 3DGS 当一种地图
+%  表示讲过的 teaser) → 把它抬成「原理级」深讲的新家，开启
+%    ch:3dgs(原理) → ch:gsslam(单机 GS-SLAM) → ch:magsslam(多机) 的三连。
+%  最高准则：教材而非论文——循序渐进、动机先行、逐步推导(不跳步)、代码落地、
+%    桥回 LiDAR/FAST-LIO-native 读者(协方差↔不确定椭球、splatting↔前向投影、
+%    densification↔地图增长)。论文那些压缩方程一律展开成完整逐步推导。
+%  去重铁律(R14/R18)：3DGS「作为地图表示」的速写(Σ=RSSᵀRᵀ / EWA / alpha合成) 已在
+%    \cref{sec:dense-radiance-gs} 给过——本章是其【更深的新家】，用全新标签 eq:3dgs-*；
+%    渲染即跟踪 / SE(3) 位姿雅可比 / map-pose-hybrid 范式 → \cref{ch:gsslam} 不重讲；
+%    SE(3)/右扰动/(·)^∧ → \cref{ch:lie}；针孔投影/Jpi → \cref{ch:camera}；
+%    NeRF 体渲染 / 面元 surfel → \cref{sec:dense-radiance-nerf,sec:dense-surfel}；
+%    Adam/SGD/可微优化机理 → \cref{ch:nlopt}。
+%  记号：高斯协方差恒带下标 \boldsymbol\Sigma_i(避让噪声 Σ)；skew 用 (·)^∧；
+%    frame \mathbf T_{wc}；\nameref{ch:notation} 不 \cref。
+%  难度星只入「知识点总表」，不入标题。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题——它们勾勒了本章要回答的核心疑问。若已能流畅作答，可只速读框架图与速查表；若卡住，正是本章要为你打通的。
+\begin{enumerate}
+  \item 一个三维各向异性高斯，凭什么能当“地图的一块砖”？它和你熟悉的\emph{激光点云里一个带不确定椭球的点}（\cref{ch:lie} 的协方差 $\boldsymbol\Sigma$）是不是一回事？多出来的是什么？
+  \item 3DGS 不直接存协方差矩阵 $\boldsymbol\Sigma_i$，偏要存一个尺度向量 $\mathbf s_i$ 加一个四元数 $\mathbf q_i$，渲染时再现场合成。这是图省事，还是不得不如此？如果你硬把 $\boldsymbol\Sigma_i$ 的 $6$ 个独立元素丢给 Adam 去优化，会出什么事？
+  \item NeRF（\cref{sec:dense-radiance-nerf}）渲一张图，要对\emph{每个像素}沿射线打几十个采样点、各查一次 MLP；3DGS 号称同等画质却快上一两个数量级。它把“逐像素查询”换成了\emph{什么}？为什么这一换就能跳过大片空白？
+  \item 优化一个场景时，初始那几千个 SfM 稀疏点显然不够铺满整个表面。3DGS 怎么在训练途中\emph{自己长出}新高斯、又\emph{自己删掉}没用的？这与激光 SLAM 里地图随轨迹“增量生长”是同一种冲动吗？
+  \item 这一章的 3DGS 是\emph{离线}的——相机位姿全由 SfM 事先标定好、当成\emph{常量}喂进来。那么一个自然的问题：如果连相机位姿都还不知道、要一边走一边估，这套渲染管线还能用吗？（这正是下一章 \cref{ch:gsslam} 的入口。）
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}3DGS 为何选\emph{各向异性三维高斯}当场景基元——从一维高斯 PDF 出发，经变量代换推出 $\boldsymbol\Sigma_i=\mathbf A\mathbf A^\top$，并解释“仿射闭合、降维仍高斯”这两条性质如何使它\emph{既可微又可快速光栅化}；
+  \item \textbf{推导}协方差的物理分解 $\boldsymbol\Sigma_i=\mathbf R_i\mathbf S_i\mathbf S_i^\top\mathbf R_i^\top$（\cref{eq:3dgs-cov}），并论证\emph{为何必须存 $\mathbf s_i+\mathbf q_i$ 而非 $\boldsymbol\Sigma_i$}（半正定约束 vs.\ 梯度下降）；
+  \item \textbf{掌握}EWA 投影 $\boldsymbol\Sigma_i'=\mathbf J\mathbf W\boldsymbol\Sigma_i\mathbf W^\top\mathbf J^\top$（\cref{eq:3dgs-proj}）：只投影均值、用雅可比线性化协方差，并把它与 NeRF 的射线投射（splatting 物序前向 vs.\ ray-casting 像序后向）对照；
+  \item \textbf{解释}球谐（SH）如何表达视相关外观、tile 光栅化（$16\times16$ 分块 $+$ 深度键 $+$ 基数排序 $+$ 前向 $\alpha$ 合成 $+$ 饱和早停）如何换来实时，以及反向传播为何要靠\emph{累积 $\alpha$ 反推}（\cref{eq:3dgs-blend}）；
+  \item \textbf{复述}自适应密度控制——位置梯度阈值触发、欠重建\emph{克隆} / 过重建\emph{分裂}、剪枝与不透明度重置（\cref{alg:3dgs-opt}）——并把它桥回激光 SLAM 的“地图增量生长”；
+  \item \textbf{装配}完整训练环（渲染-比对-反传、激活函数、$\mathcal L=(1-\lambda)\mathcal L_1+\lambda\mathcal L_{\mathrm{DSSIM}}$、显式梯度），并在真实代码（\cref{sec:3dgs-code}）里认出每一行对应哪条方程；
+  \item \textbf{定位}3DGS 的局限（需 SfM 先验、popping 伪影、存储重）与它\emph{留给在线 SLAM 的接口}——位姿为何在这里是常量、放开它会怎样，从而平滑过渡到 \cref{ch:gsslam}。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是 P5 “可微渲染”这条弧线的\textbf{原理基座}。在 \cref{sec:dense-radiance-gs}，我们已经\emph{把 3DGS 当作一种稠密地图表示}速写过一遍（面元的“可微升级”、$\boldsymbol\Sigma=\mathbf R\mathbf S\mathbf S^\top\mathbf R^\top$、EWA 投影、$\alpha$ 合成）；那是\emph{鸟瞰}。本章是那张速写的\textbf{逐步展开的新家}——把每个压缩的方程都\emph{从动机推到代码}，让一个从未碰过图形学的 LiDAR-native 读者也能从零看懂。全章沿“一个基元怎么定义 $\to$ 怎么投影 $\to$ 怎么上色 $\to$ 怎么实时渲 $\to$ 怎么自增长 $\to$ 怎么训”六步推进，最后落到源码与局限。结构如下。
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  bk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (rep) {\textbf{表示}\\各向异性高斯\\$\boldsymbol\Sigma_i{=}\mathbf R_i\mathbf S_i\mathbf S_i^\top\mathbf R_i^\top$};
+\node[blk, right=of rep] (proj) {\textbf{投影}\\EWA splatting\\$\boldsymbol\Sigma_i'{=}\mathbf J\mathbf W\boldsymbol\Sigma_i\mathbf W^\top\mathbf J^\top$};
+\node[blk, right=of proj] (col) {\textbf{颜色}\\球谐 SH\\视相关外观};
+\node[grp, below=9mm of rep] (rast) {\textbf{光栅化}\\tile $+$ 排序 $+$ $\alpha$ 合成};
+\node[grp, right=of rast] (dens) {\textbf{密度控制}\\克隆 / 分裂 / 剪枝};
+\node[grp, right=of dens] (opt) {\textbf{训练环}\\渲染-比对-反传};
+\node[bk, below=9mm of dens] (code) {\textbf{源码落点}\\computeCov / render / densify};
+\node[bk, right=of code] (slam) {\textbf{接口}\\位姿$=$常量\\$\to$ \cref{ch:gsslam} 放开};
+\draw[ln] (rep)--(proj); \draw[ln] (proj)--(col);
+\draw[ln] (col.south) -- ++(0,-3mm) -| (rast.north);
+\draw[ln] (rast)--(dens); \draw[ln] (dens)--(opt);
+\draw[ln] (opt.south) -- ++(0,-3mm) -| (code.north);
+\draw[ln] (code)--(slam);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:3dgs-repr}（表示）与 \cref{sec:3dgs-proj}（投影）是全章的\emph{骨干}，任何读者都应精读——它们建立“高斯基元 $+$ 协方差投影”这副地基，后面一切都站在它上。\cref{sec:3dgs-color}（球谐）够用即可，是次优分支；\cref{sec:3dgs-raster}（tile 光栅化）是\emph{实时之钥}，决定 3DGS 为何能跑而不只是好看，骨干。\cref{sec:3dgs-density}（自适应密度控制）是本书此前\emph{最缺}的一块，也是 3DGS 把稀疏点养成稠密场的关键，骨干、本章重点展开。\cref{sec:3dgs-opt}（训练环）把前面拼成闭环；\cref{sec:3dgs-code}（源码）把理论钉进真代码，工程读者必看；\cref{sec:3dgs-limits}（局限与过渡）收束并交棒给 \cref{ch:gsslam}。
+
+\subsection*{前置知识桥接}
+本章把前几部的工具与“可微渲染”缝在一起，请先激活以下前置：
+\begin{itemize}
+  \item \textbf{相机投影}（\cref{ch:camera}）：针孔模型 $\mathbf p=\boldsymbol\pi(\mathbf P_c)$、内参 $f_x,f_y,c_x,c_y$、透视除法 $\div z$ 是唯一的非线性。本章 EWA 投影（\cref{sec:3dgs-proj}）正是对这一非线性做\emph{一阶线性化}，雅可比 $\mathbf J_\pi$ 就是 \cref{ch:camera} 那条投影雅可比。
+  \item \textbf{高斯与协方差}（\cref{ch:lie} 不确定度小节）：多元高斯 $\mathcal N(\boldsymbol\mu,\boldsymbol\Sigma)$、马氏距离、协方差是\emph{半正定}对称矩阵、几何上是一个\emph{不确定椭球}。本章的高斯基元就是“把这个椭球当作有体积、可着色、可渲染的物体”——\textbf{注意}：为避让全书\emph{噪声}协方差 $\boldsymbol\Sigma$，本章高斯协方差\emph{一律带下标} $\boldsymbol\Sigma_i$。
+  \item \textbf{NeRF 与体渲染}（\cref{sec:dense-radiance-nerf}）：辐射场、沿射线的 $\alpha$ 合成 $C=\sum_i c_i\alpha_i\prod_{j<i}(1-\alpha_j)$、位置编码 $+$ MLP 的隐式表示。3DGS 与 NeRF \emph{目标相同}（拟合辐射场）但\emph{路线相反}（遍历图元 vs.\ 遍历射线），本章反复与它对照。
+  \item \textbf{面元 surfel}（\cref{sec:dense-surfel}）：带朝向的“盘状”地图基元、只在表面分配元素的稀疏性。一句话记住：\textbf{3DGS 高斯 $=$ surfel 的“可微升级”}——把带法向的小圆盘换成带不透明度的高斯椭球（\cref{sec:dense-radiance-gs} 已埋此过渡）。
+  \item \textbf{非线性优化与自动微分}（\cref{ch:nlopt}）：梯度下降 / Adam、自动微分 vs.\ 手写解析梯度的取舍。3DGS 为省去自动微分开销，\emph{亲手}推出全部参数的解析梯度（附录），这与 \cref{ch:nlopt} “自己写 Jacobian 喂优化器”是同一套用心。
+  \item \textbf{3DGS 作为地图表示的速写}（\cref{sec:dense-radiance-gs}）：你已在那里见过 $\boldsymbol\Sigma=\mathbf R\mathbf S\mathbf S^\top\mathbf R^\top$、EWA、$\alpha$ 合成、tile 光栅化的\emph{结论}。本章用\emph{全新标签} \texttt{eq:3dgs-*} 把它们\emph{从头推导}，是那段速写的深化，不是重复。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会把 3DGS 当成一个“调好就能出图的黑箱”，看不出它每一步都\emph{有据可推}——协方差为何那样分解、为何只投影均值、tile 排序为何换来实时、密度控制为何能无中生有；于是读 \cref{ch:gsslam} 的“渲染即跟踪”时，会把可微渲染管线当魔法，而非一条\emph{可反传的观测链}。
+  \item \cref{sec:dense-radiance-gs} 只给了 3DGS 的\emph{鸟瞰速写}；跳过本章，你就缺了把那张速写落到\emph{代码与梯度}的一层，无法判断一个 GS-SLAM 系统的真实计算瓶颈在哪、可调旋钮有哪些。
+  \item 下一章 \cref{ch:gsslam}（单机 GS-SLAM）与再下一章 \cref{ch:magsslam}（多机）直接把 3DGS 当地图\emph{的根}——“显式高斯可被闭式刚体搬运”“densification 即地图生长”这些论断，全靠本章打的地基。跳过它，后两章的“为何偏偏选高斯”就无从理解。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号.}\;
+本章引入“可渲染高斯基元”一层记号，并\emph{严格避让}全书已占用者，登记如下。
+\textbf{高斯基元}记 $g_i$，四大属性：\emph{均值}（三维位置）$\boldsymbol\mu_i\in\mathbb R^3$、\emph{协方差} $\boldsymbol\Sigma_i\in\mathbb R^{3\times3}$、\emph{不透明度} $o_i\in[0,1)$、\emph{颜色} $\mathbf c_i$（由球谐系数算出）。
+\textbf{协方差恒带下标} $\boldsymbol\Sigma_i$（\textbf{注意}：与全书\emph{噪声}协方差 $\boldsymbol\Sigma$ 同字母，本章一律带下标并称“高斯协方差”以避歧义），分解 $\boldsymbol\Sigma_i=\mathbf R_i\mathbf S_i\mathbf S_i^\top\mathbf R_i^\top$：旋转 $\mathbf R_i\in\SO(3)$（由四元数 $\mathbf q_i$ 算出，Hamilton 约定 \nameref{ch:notation}）、尺度对角阵 $\mathbf S_i=\operatorname{diag}(\mathbf s_i)$、尺度向量 $\mathbf s_i\in\mathbb R^3_{>0}$。
+\textbf{相机}沿用 $\mathbf T_{wc}\in\SE(3)$ 与本书帧下标（\nameref{ch:notation}）；视变换（world$\to$camera 的 $3\times3$ 旋转部分）记 $\mathbf W$、投影雅可比记 $\mathbf J$（\cref{ch:camera} 的 $\mathbf J_\pi$）；投影/反投影记 $\boldsymbol\pi,\boldsymbol\pi^{-1}$。
+\textbf{渲染}：投影后的 $2\times2$ 屏空间协方差记 $\boldsymbol\Sigma_i'$，渲染图记 $\hat{\mathbf I}$（帽子表“由地图渲出”）、真值图记 $\bar{\mathbf I}$；$\alpha$ 合成的透射率记 $T_i$，单高斯对像素的贡献不透明度记 $\alpha_i$（区别于学习到的固有不透明度 $o_i$）。
+\textbf{超参}：位置梯度阈值 $\tau_{\mathrm{pos}}$、分裂尺度因子 $\phi$、剪枝不透明度阈值 $\epsilon_\alpha$、损失权重 $\lambda$。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{表示：为什么偏偏是高斯}
+\label{sec:3dgs-repr}
+
+\subsection{动机：从一把稀疏点，到一张可渲染的地图}
+
+\paragraph{起点是 SfM 给的一把稀疏点。}
+3DGS\cite{kerbl2023gaussian} 的输入，是一组对\emph{静态}场景拍的照片，外加一次\emph{运动恢复结构}（Structure-from-Motion, SfM，\cref{ch:camera} 的多视几何）跑出来的两样东西：每张照片\emph{标定好的相机位姿}，以及一团\emph{稀疏}的三维点云（SfM 的副产物，往往只有几千到几万个点）。注意这两样在本章自始至终都是\emph{已知常量}——位姿不优化、SfM 点只当种子。目标则是：从这把稀疏点出发，长出一个能\emph{高质量合成任意新视角}的场景表示。
+
+这就立刻撞上一个矛盾。稀疏点云本身\emph{没法渲染}成连续图像——点是零维的、没有体积，投到屏幕上只是一些孤立的亮斑，点与点之间是空的。要补成连续表面，传统图形学有几条老路，但每条都有硬伤（\cref{tab:3dgs-why-gauss}）。3DGS 的答案是：给每个点套一个\emph{有体积、可着色、可微、还能快速投影}的“核”——而在所有候选核里，\textbf{三维高斯}几乎是唯一一身集齐这些性质的。
+
+\begin{table}[H]\centering
+\caption{为什么是高斯：候选场景基元的横向账}
+\label{tab:3dgs-why-gauss}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+基元 & 短板 & 高斯如何避开 \\
+\midrule
+裸点云 & 零维无体积、渲不出连续像 & 套高斯核，给点“撑”出体积 \\
+体素 / TSDF（\cref{sec:dense-tsdf}）& 分辨率有界、内存随体积涨 & 自适应稀疏摆放、按需增删 \\
+网格 mesh & 拓扑难融合、难端到端可微 & 无拓扑、点状独立基元 \\
+面元 surfel（\cref{sec:dense-surfel}）& 硬圆盘、不连续、梯度不光滑 & 平滑连续、处处可微 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[一个 LiDAR-native 的入口：高斯 $=$ 带不确定椭球的点，再加“可渲染”]
+你其实早就认识高斯基元的一半。在 \cref{ch:lie} 里，激光 SLAM 的一个地图点常带一个协方差 $\boldsymbol\Sigma$，几何上是一个\emph{不确定椭球}——长轴方向测得准、短轴方向测得糙。3DGS 的高斯 $g_i$ 用的\emph{正是同一个对象} $(\boldsymbol\mu_i,\boldsymbol\Sigma_i)$：均值是点的位置、协方差是那个椭球。\textbf{差别只在“身份”}：在激光 SLAM 里，这个椭球表示\emph{对位置的认知不确定度}（“点大概在这一带”）；在 3DGS 里，同一个椭球被重新解释成\emph{一块有体积、半透明、会发光的实体}——它不再描述“我有多不确定”，而是描述“这块物质占了多大、什么形状”。再给它挂上\emph{不透明度} $o_i$ 与\emph{颜色} $\mathbf c_i$，一个“激光点”就升级成了一块“可渲染的砖”。本章接下来做的，就是把这块砖\emph{投影、上色、堆叠、训练}的全过程讲透。
+\end{insight}
+
+\subsection{从一维高斯到三维：变量代换推出 \texorpdfstring{$\boldsymbol\Sigma_i=\mathbf A\mathbf A^\top$}{_i= A A^T}}
+
+\paragraph{先回到最熟的一维。}
+一维高斯的概率密度（PDF）人人会写：变量 $x\sim\mathcal N(\mu,\sigma^2)$ 时，
+\begin{equation}
+  p(x)=\frac{1}{\sigma\sqrt{2\pi}}\exp\!\Big(-\frac{(x-\mu)^2}{2\sigma^2}\Big).
+  \label{eq:3dgs-1d}
+\end{equation}
+现在要把它升到三维、而且是\emph{各向异性}（三个方向胖瘦不同、还能整体旋转）的一般情形。最干净的推法不是硬背多元 PDF，而是\emph{从标准正态出发做变量代换}——这条进路也最能讲清“协方差是怎么冒出来的”。
+
+\paragraph{第一步：三个独立标准正态。}
+设 $\mathbf v=[a,b,c]^\top$，三个分量\emph{独立}且各自 $\sim\mathcal N(0,1)$。联合密度就是三个一维密度相乘：
+\begin{equation}
+  p(\mathbf v)=p(a)p(b)p(c)=\frac{1}{(2\pi)^{3/2}}\exp\!\Big(-\tfrac12\,\mathbf v^\top\mathbf v\Big).
+  \label{eq:3dgs-std3d}
+\end{equation}
+这是一个\emph{各向同性}的“标准球”——等概率面是正球，没有偏好方向。
+
+\paragraph{第二步：用一次仿射变换把标准球“捏”成任意椭球。}
+任意一般高斯都可由标准球经一次\emph{仿射变换}得到。引入“先用矩阵 $\mathbf A$ 拉伸旋转、再平移到 $\boldsymbol\mu$”的代换：
+\begin{equation}
+  \mathbf x=\boldsymbol\mu+\mathbf A\,\mathbf v
+  \quad\Longleftrightarrow\quad
+  \mathbf v=\mathbf A^{-1}(\mathbf x-\boldsymbol\mu).
+  \label{eq:3dgs-affine}
+\end{equation}
+直觉上：$\mathbf v$ 那个正球，被 $\mathbf A$ 沿各方向拉成不同长度、还拧了个角度，就成了 $\mathbf x$ 的椭球。把 $\mathbf v=\mathbf A^{-1}(\mathbf x-\boldsymbol\mu)$ 代进 \cref{eq:3dgs-std3d} 的指数里，指数部分变成
+\begin{equation*}
+  -\tfrac12\,\mathbf v^\top\mathbf v
+  =-\tfrac12\,(\mathbf x-\boldsymbol\mu)^\top(\mathbf A^{-1})^\top\mathbf A^{-1}(\mathbf x-\boldsymbol\mu)
+  =-\tfrac12\,(\mathbf x-\boldsymbol\mu)^\top(\mathbf A\mathbf A^\top)^{-1}(\mathbf x-\boldsymbol\mu).
+\end{equation*}
+
+\paragraph{第三步：换元别忘了体积因子，协方差自然现身。}
+这里有个\emph{不能跳}的细节：$p(\mathbf v)$ 还不是 $p(\mathbf x)$。要从前者得后者，得用概率密度的换元法则——积分要凑回 $1$，微元 $\mathrm d\mathbf v$ 换成 $\mathrm d\mathbf x$ 时带一个雅可比行列式因子 $\mathrm d\mathbf v=|\det\mathbf A|^{-1}\mathrm d\mathbf x$。补上这个因子，便得到一般高斯的 PDF：
+
+\begin{derivation}[从标准正态到一般高斯：换元的体积因子]
+要求 $\iiint p(\mathbf x)\,\mathrm d\mathbf x=1$。从 \cref{eq:3dgs-std3d} 出发、代入 \cref{eq:3dgs-affine} 并换元：
+\[
+1=\iiint\frac{1}{(2\pi)^{3/2}}\exp\!\Big(-\tfrac12(\mathbf x-\boldsymbol\mu)^\top(\mathbf A\mathbf A^\top)^{-1}(\mathbf x-\boldsymbol\mu)\Big)\underbrace{|\det\mathbf A|^{-1}\mathrm d\mathbf x}_{\mathrm d\mathbf v}.
+\]
+被积函数即 $p(\mathbf x)$。定义\emph{协方差矩阵} $\boldsymbol\Sigma:=\mathbf A\mathbf A^\top$（于是 $|\det\mathbf A|=|\boldsymbol\Sigma|^{1/2}$），得
+\[
+p(\mathbf x)=\frac{1}{(2\pi)^{3/2}|\boldsymbol\Sigma|^{1/2}}\exp\!\Big(-\tfrac12(\mathbf x-\boldsymbol\mu)^\top\boldsymbol\Sigma^{-1}(\mathbf x-\boldsymbol\mu)\Big).
+\]
+\textbf{关键收获}：协方差 $\boldsymbol\Sigma=\mathbf A\mathbf A^\top$ 不是凭空定义的，它\emph{恰好}是“把标准球捏成此椭球”的那个变换 $\mathbf A$ 的 $\mathbf A\mathbf A^\top$——这保证了 $\boldsymbol\Sigma$ 天然\emph{对称半正定}（任何 $\mathbf A\mathbf A^\top$ 都是）。这一点下文 \cref{sec:3dgs-store} 至关重要。
+\end{derivation}
+
+\paragraph{扔掉常数，得到 3DGS 用的“核”。}
+渲染时我们不需要 $p(\mathbf x)$ 是个合法概率（不必积分为 $1$），只需要它的\emph{形状}——一个中心最亮、向外按高斯衰减的“能量包”。于是把归一化常数 $\tfrac{1}{(2\pi)^{3/2}|\boldsymbol\Sigma|^{1/2}}$ 一并丢掉（它只做整体缩放，对形状无影响），并把高斯平移到以 $\boldsymbol\mu_i$ 为心，就得到 3DGS 论文里那个干净的\textbf{高斯核}：
+\begin{equation}
+  \boxed{\;G_i(\mathbf x)=\exp\!\Big(-\tfrac12\,(\mathbf x-\boldsymbol\mu_i)^\top\boldsymbol\Sigma_i^{-1}(\mathbf x-\boldsymbol\mu_i)\Big)\;}
+  \label{eq:3dgs-gaussian}
+\end{equation}
+其中指数里那个二次型的平方根 $\sqrt{(\mathbf x-\boldsymbol\mu_i)^\top\boldsymbol\Sigma_i^{-1}(\mathbf x-\boldsymbol\mu_i)}$ 正是\emph{马氏距离}（\cref{ch:lie}）——它度量“$\mathbf x$ 离中心有几个椭球半径远”。$G_i$ 在中心取 $1$、随马氏距离增大而平滑衰减，处处可微、无限延伸却又快速趋零。\cref{eq:3dgs-gaussian} 是本章后续一切的\emph{原子}。
+
+\subsection{各向异性椭球：等值面 \texorpdfstring{$\mathbf x^\top\boldsymbol\Sigma_i^{-1}\mathbf x=1$}{x^T _i^-1 x=1} 为何是椭球}
+
+\paragraph{“高斯椭球”这个叫法不是比喻，是可证的。}
+我们反复说高斯基元是“椭球”，这值得一个小证明，顺便把 $\boldsymbol\Sigma_i^{-1}$ 的几何意义钉死。几何上，一个一般（旋转过的）椭球面可写成二次型 $\mathbf x^\top\mathbf M\mathbf x=1$，其中 $\mathbf M$ 对称正定。把它和高斯的\emph{等值面}对照即可。
+
+\begin{derivation}[$\boldsymbol\Sigma_i^{-1}$ 就是椭球的形状矩阵]
+取一个轴对齐的标准椭球 $\tfrac{x^2}{a^2}+\tfrac{y^2}{b^2}+\tfrac{z^2}{c^2}=1$，写成矩阵形式 $\mathbf x^\top\mathbf D\mathbf x=1$，$\mathbf D=\operatorname{diag}(a^{-2},b^{-2},c^{-2})$。现在把它整体旋转 $\mathbf R$：世界点 $\mathbf x$ 在椭球局部系下是 $\mathbf x_{\mathrm{loc}}=\mathbf R^\top\mathbf x$，代入局部方程
+\[
+\mathbf x_{\mathrm{loc}}^\top\mathbf D\,\mathbf x_{\mathrm{loc}}=(\mathbf R^\top\mathbf x)^\top\mathbf D(\mathbf R^\top\mathbf x)=\mathbf x^\top(\mathbf R\mathbf D\mathbf R^\top)\mathbf x=1,
+\]
+故一般椭球的形状矩阵 $\mathbf M=\mathbf R\mathbf D\mathbf R^\top$。另一边，高斯 \cref{eq:3dgs-gaussian} 的等值面（取马氏距离 $=1$、令 $\boldsymbol\mu_i=\mathbf 0$）是 $\mathbf x^\top\boldsymbol\Sigma_i^{-1}\mathbf x=1$。两式逐项对照立得：
+\[
+\boldsymbol\Sigma_i^{-1}=\mathbf M=\mathbf R\mathbf D\mathbf R^\top
+\quad\Longrightarrow\quad
+\boldsymbol\Sigma_i=\mathbf R\mathbf D^{-1}\mathbf R^\top=\mathbf R\,\operatorname{diag}(a^2,b^2,c^2)\,\mathbf R^\top.
+\]
+\textbf{读出几何}：$\mathbf R$ 是椭球的\emph{朝向}，$\operatorname{diag}(a^2,b^2,c^2)$ 是三个\emph{半轴长平方}。所以协方差 $\boldsymbol\Sigma_i$ 完整编码了高斯椭球的“胖瘦 $+$ 朝向”——这恰好就是下一节那个分解 $\boldsymbol\Sigma_i=\mathbf R_i\mathbf S_i\mathbf S_i^\top\mathbf R_i^\top$（令 $\mathbf S_i=\operatorname{diag}(a,b,c)$ 即 $\mathbf S_i\mathbf S_i^\top=\operatorname{diag}(a^2,b^2,c^2)$）。
+\end{derivation}
+
+\subsection{为什么是高斯（而不是别的核）：两条闭合性质}
+
+高斯能当渲染基元，靠的是两条“别的核大多没有”的数学性质。它们看似抽象，却\emph{直接}决定了 3DGS 能否快速渲染、能否端到端可微——值得记牢。
+
+\begin{enumerate}
+  \item \textbf{仿射变换下闭合}：高斯经任意仿射变换（旋转 $+$ 平移 $+$ 线性拉伸）后\emph{仍是高斯}。这意味着把一个\emph{三维}高斯从世界系搬到相机系、再投影，结果还是高斯，只要更新它的 $(\boldsymbol\mu,\boldsymbol\Sigma)$ 即可——无需重新积分、无需逐点采样。\cref{sec:3dgs-proj} 的投影公式就建在这条上。
+  \item \textbf{边缘化（降维）后仍是高斯}：把一个三维高斯沿某个轴“拍扁”（积分掉一维、即求边缘分布），得到的二维分布\emph{还是高斯}。投影到像平面、丢掉深度那一维，正是这种降维——所以三维高斯投影成\emph{二维高斯}，而非什么奇形怪状的斑点。
+\end{enumerate}
+
+\begin{insight}[这两条闭合性，正是“可快速光栅化 $+$ 可微”的根]
+把这两条性质翻成工程语言：(1) 仿射闭合 $\Rightarrow$ 投影一个高斯\emph{只需变换它的两个参数} $(\boldsymbol\mu,\boldsymbol\Sigma)$，是几次矩阵乘法，而\emph{不是}像 NeRF 那样沿射线积分——这是 3DGS 比 NeRF 快一两个数量级的\emph{数学根源}；(2) 降维仍高斯 $\Rightarrow$ 屏幕上每个高斯的“足迹（footprint）”是一个规整的二维高斯斑，其覆盖范围、衰减都解析可算，于是\emph{可微}且\emph{易并行}。换句话说，3DGS 选高斯不是审美偏好——\textbf{是这两条闭合性让“遍历图元做可微光栅化”这条路第一次走得通、且走得飞快}。傅里叶变换后仍是高斯、高斯卷高斯仍是高斯等性质同源，都源自高斯在仿射群下的良好行为。
+\end{insight}
+
+\subsection{为何存 \texorpdfstring{$\mathbf s_i+\mathbf q_i$}{s_i+ q_i} 而不存 \texorpdfstring{$\boldsymbol\Sigma_i$}{_i}：半正定约束撞上梯度下降}
+\label{sec:3dgs-store}
+
+\paragraph{物理分解。}
+我们要\emph{优化}每个高斯的形状（让它去贴合真实几何）。最直接的想法是把协方差矩阵 $\boldsymbol\Sigma_i$ 的 $6$ 个独立元素当自由变量，丢给 Adam 去调。\textbf{这恰恰是个陷阱}。回忆上面证过的：$\boldsymbol\Sigma_i$ 必须\emph{对称半正定}才有物理意义（它是某个 $\mathbf A\mathbf A^\top$、对应一个合法椭球）。可梯度下降\emph{不知道}这个约束——它沿梯度自由地改那 $6$ 个数，走一步就可能让 $\boldsymbol\Sigma_i$ 出现负特征值，变成一个\emph{非法}的“椭球”（半轴长平方为负，几何上根本不存在）。
+
+3DGS 的解法，是用上一节的几何分解\emph{重新参数化}：既然 $\boldsymbol\Sigma_i=\mathbf R_i\,\operatorname{diag}(a^2,b^2,c^2)\,\mathbf R_i^\top$，把半轴长写成尺度向量 $\mathbf s_i=(a,b,c)$、对角阵 $\mathbf S_i=\operatorname{diag}(\mathbf s_i)$，旋转 $\mathbf R_i$ 由四元数 $\mathbf q_i$ 表示，就有
+\begin{equation}
+  \boxed{\;\boldsymbol\Sigma_i=\mathbf R_i\,\mathbf S_i\mathbf S_i^\top\,\mathbf R_i^\top\;}\qquad
+  \mathbf S_i=\operatorname{diag}(\mathbf s_i),\quad \mathbf R_i=\mathbf R(\mathbf q_i)\in\SO(3).
+  \label{eq:3dgs-cov}
+\end{equation}
+\textbf{系统不存 $\boldsymbol\Sigma_i$，只存 $\mathbf s_i$（$3$ 个数）与 $\mathbf q_i$（$4$ 个数）；每次渲染时现场用 \cref{eq:3dgs-cov} 合成出 $\boldsymbol\Sigma_i$。} 这样无论梯度怎么更新 $\mathbf s_i,\mathbf q_i$，合成出的 $\boldsymbol\Sigma_i=\mathbf R_i\mathbf S_i\mathbf S_i^\top\mathbf R_i^\top$ 都\emph{自动}是合法的半正定矩阵——因为它天生是“某矩阵乘自己转置”的形式。约束被“焊死”在参数化里，优化器再也无法破坏它。
+
+\begin{insight}[“存因子、不存矩阵”是带约束量优化的通用招式]
+这一手并非 3DGS 独有，而是全书反复出现的范式：\emph{当一个量带约束、不能自由加减时，不要直接优化它，而是优化它的某个无约束参数化}。\cref{ch:lie} 里优化旋转 $\mathbf R\in\SO(3)$ 不直接动 $\mathbf R$ 的 $9$ 个元素（那会破坏正交性），而是在李代数上优化 $\delta\boldsymbol\phi\in\mathbb R^3$、再经指数映射 $\mathrm{Exp}(\delta\boldsymbol\phi)$ 映回群——\emph{一模一样}的用心。3DGS 这里把“半正定矩阵”这个带约束量，换成“尺度 $+$ 四元数”这对无约束因子（四元数还需归一化，是个轻约束）。\textbf{看到“带约束量要优化”，先想“能不能优化它的因子”——这是从 \cref{ch:lie} 一路贯穿到 3DGS 的同一条思路。}
+\end{insight}
+
+\begin{pitfall}[直接把 $\boldsymbol\Sigma_i$ 的元素丢给优化器]
+\textbf{错误}：图省事，把 $3\times3$ 协方差的 $6$ 个独立元素当自由变量做梯度下降。\textbf{现象 / 后果}：训练几步后高斯“爆掉”——出现负特征值，椭球非法，渲染出 NaN 或诡异条纹，loss 发散。\textbf{根因}：协方差的\emph{半正定约束}在元素级优化里没有任何保护，梯度步长一大就越界。\textbf{正确}：按 \cref{eq:3dgs-cov} 存 $\mathbf s_i$（经 $\exp$ 激活保正，见 \cref{sec:3dgs-opt}）与归一化四元数 $\mathbf q_i$，渲染时现合成 $\boldsymbol\Sigma_i$。这样合法性由参数化结构保证，与步长无关。
+\end{pitfall}
+
+\paragraph{小结这一节。}
+我们从一维高斯出发，经变量代换推出三维各向异性高斯核 \cref{eq:3dgs-gaussian}，证明了它的等值面是椭球、$\boldsymbol\Sigma_i^{-1}$ 是形状矩阵，论证了“仿射闭合 $+$ 降维仍高斯”如何使它\emph{既可快速光栅化又可微}，并解释了为何\emph{必须存 $\mathbf s_i+\mathbf q_i$、不存 $\boldsymbol\Sigma_i$}。至此，一块“可渲染的砖”已经定义完整——它带着位置 $\boldsymbol\mu_i$、形状 $(\mathbf s_i,\mathbf q_i)$、不透明度 $o_i$、颜色 $\mathbf c_i$。下一步：把这块三维的砖\emph{投影}到二维屏幕上。
+
+\subsection*{练习}
+\begin{enumerate}
+  \item 验证 \cref{eq:3dgs-affine} 的换元因子：对一维情形 $x=\mu+av$，直接由 $\mathrm dv=a^{-1}\mathrm dx$ 与 \cref{eq:3dgs-1d} 还原出标准正态，确认体积因子 $|\det\mathbf A|^{-1}$ 在一维退化成 $1/|a|$。
+  \item 设某高斯 $\mathbf s_i=(2,1,0.5)$、$\mathbf q_i=\mathbf 1_{\text{(单位)}}$（无旋转）。写出 $\boldsymbol\Sigma_i$，并指出它的三个主轴方向与半轴长。若把 $\mathbf s_i$ 的最小分量 $0.5$ 改成 $0.01$，这个高斯在几何上变成什么形状？（提示：这正是 \cref{sec:3dgs-color,ch:gsslam} 里“片状/针状”高斯的来由。）
+  \item （桥回激光）一个激光地图点带协方差 $\boldsymbol\Sigma$ 表示\emph{定位不确定度}。请用一两句话说清：把同一个 $\boldsymbol\Sigma$ 重新解释成 3DGS 的\emph{物质形状}时，“不确定度大”对应渲染里的什么视觉效果？两种解释在数学上有何不同、又有何相同？
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section{投影：EWA splatting}
+\label{sec:3dgs-proj}
+
+\subsection{动机：三维高斯怎么变成屏幕上的一个斑}
+
+\paragraph{只投影中心是不够的。}
+要渲染，得把世界系下的三维高斯搬到相机、再投到像平面。中心点 $\boldsymbol\mu_i$ 怎么投，\cref{ch:camera} 已经讲透：先用外参 $\mathbf T_{cw}$ 变到相机系得 $\boldsymbol\mu_c=\mathbf T_{cw}\boldsymbol\mu_i$，再经针孔投影 $\boldsymbol\pi$ 落到像素。问题在于：高斯\emph{不是一个点}，是一个有体积的椭球。我们要的不只是它中心投在哪，还要它在屏幕上摊开成多大、什么朝向的\emph{二维高斯斑}——也就是要把三维协方差 $\boldsymbol\Sigma_i$ 也“投”下来，得到二维协方差 $\boldsymbol\Sigma_i'$。
+
+笨办法是把椭球表面密密麻麻采一堆点、各自投影、再拟合个二维高斯——计算量爆炸。聪明办法源自上一节那条\emph{仿射闭合}性质：高斯经仿射变换仍是高斯，所以只要把“世界到屏幕”的映射在 $\boldsymbol\mu_i$ 处\emph{线性化}成一个仿射变换，三维高斯就直接变成二维高斯，协方差按一个干净公式传播。这套方法叫 \textbf{EWA splatting}（Elliptical Weighted Average，椭圆加权平均，Zwicker 等 2001 年为体渲染提出），是 3DGS 投影的数学内核。
+
+\subsection{核心：只投影均值，雅可比线性化协方差}
+
+\paragraph{为什么要线性化。}
+“世界点 $\to$ 像素”这条映射里，外参那一段（旋转平移）\emph{本就是}仿射的、不破坏高斯；唯一的非线性来自针孔投影的\emph{透视除法} $\div z$（\cref{ch:camera}）——远处缩小、近处放大。非线性会把高斯椭球投成略微扭曲的形状，不再是严格的二维高斯。EWA 的处理是：在高斯中心 $\boldsymbol\mu_c$ 处对投影做\emph{一阶泰勒展开}，用雅可比 $\mathbf J$ 把这段非线性\emph{近似成仿射}。近似一旦做出，仿射闭合性接管，协方差传播就有了闭式。
+
+\paragraph{协方差传播公式。}
+设 $\mathbf W$ 为视变换的 $3\times3$ 旋转部分（world$\to$camera），$\mathbf J$ 为针孔投影在 $\boldsymbol\mu_c$ 处的雅可比（\cref{ch:camera} 的 $\mathbf J_\pi$）。一个随机向量经线性变换 $\mathbf y=\mathbf L\mathbf x$ 时协方差按 $\operatorname{Cov}[\mathbf y]=\mathbf L\operatorname{Cov}[\mathbf x]\mathbf L^\top$ 传播（\cref{ch:lie} 的协方差传播律），把两段线性变换 $\mathbf W$（搬到相机系）与 $\mathbf J$（投影）串起来，令 $\mathbf L=\mathbf J\mathbf W$，即得 EWA 投影：
+\begin{equation}
+  \boxed{\;\boldsymbol\Sigma_i'=\mathbf J\,\mathbf W\,\boldsymbol\Sigma_i\,\mathbf W^\top\mathbf J^\top\;}
+  \label{eq:3dgs-proj}
+\end{equation}
+其中投影雅可比 $\mathbf J$ 显式写出来（$\boldsymbol\mu_c=(x,y,z)^\top$ 是相机系下的高斯中心）：
+\begin{equation}
+  \mathbf J=\frac{\partial\boldsymbol\pi}{\partial\boldsymbol\mu_c}=
+  \begin{bmatrix} f_x/z & 0 & -f_x x/z^2\\[2pt] 0 & f_y/z & -f_y y/z^2\end{bmatrix}\quad(2\times3).
+  \label{eq:3dgs-projjac}
+\end{equation}
+$\mathbf J$ 的第三列（带 $1/z^2$）正是透视除法的“非线性印记”——它告诉你高斯离相机越近、投影放大越剧烈。$\mathbf J\mathbf W$ 是个 $2\times3$ 矩阵，所以 $\boldsymbol\Sigma_i'=(\mathbf J\mathbf W)\boldsymbol\Sigma_i(\mathbf J\mathbf W)^\top$ 自动是 $2\times2$——这正是我们要的屏空间二维高斯协方差。
+
+\begin{insight}[“取 $2\times2$”就是降维：丢掉深度那一维]
+有的写法（如 \cref{sec:dense-radiance-gs} 的速写）先在相机系算出 $3\times3$ 的 $\mathbf J_{3}\mathbf W\boldsymbol\Sigma_i\mathbf W^\top\mathbf J_{3}^\top$、再\emph{扔掉第三行第三列}取左上 $2\times2$。这“扔掉一行一列”不是随手裁剪——它\emph{正是}上一节那条“边缘化仍高斯”的体现：丢掉深度那一维（沿视线积分），三维高斯的足迹就降成二维高斯。本节 \cref{eq:3dgs-projjac} 的 $\mathbf J$ 直接写成 $2\times3$、一步得 $2\times2$，与“先 $3\times3$ 再裁”是同一件事的两种记法。\textbf{所以“投影一个高斯”从头到尾只是仿射闭合 $+$ 边缘化两条性质的合用，没有任何积分。}
+\end{insight}
+
+\subsection{splatting vs.\ ray-casting：物序前向，还是像序后向}
+
+\paragraph{两种渲染哲学，方向相反。}
+3DGS 的渲染叫 \textbf{splatting（泼溅）}，与 NeRF 的 \textbf{ray-casting（射线投射，\cref{sec:dense-radiance-nerf}）}是\emph{两个方向相反}的过程。把它们并排看，最能体会 3DGS 快在哪（\cref{tab:3dgs-splat-vs-ray}）。
+
+\begin{table}[H]\centering
+\caption{splatting（物序前向）vs.\ ray-casting（像序后向）}
+\label{tab:3dgs-splat-vs-ray}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & \textbf{splatting（3DGS）}& \textbf{ray-casting（NeRF）}\\
+\midrule
+主角 & \emph{图元}（高斯）& \emph{像素}（射线）\\
+方向 & 前向：每个高斯\emph{主动}泼到它覆盖的像素 & 后向：每个像素\emph{被动}沿射线找发光粒子 \\
+表示 & 显式（椭球直接带色/形）& 隐式（位置编码 $+$ MLP 现算）\\
+空白区 & \emph{天然跳过}（没高斯就不泼）& 照样采点查询（空区也不放过）\\
+并行 & 极易（每个高斯独立泼）& 较重（每条射线几十次 MLP）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[一个雪球的比喻，标好边界]
+3DGS 团队自己爱用的直觉：想象空间里一堆五颜六色的高斯“雪球”，屏幕是一堵墙；渲染就像\emph{朝墙上扔雪球}——每扔一个（一个高斯），墙上留下一团从中心向外扩散变淡的痕迹，即“足迹（footprint）”，“啪唧”一声，故名 splat（泼溅，拟声）。\textbf{比喻像在哪}：雪球有体积（对应高斯有协方差）、痕迹中心浓边缘淡（对应高斯衰减）、扔的顺序影响叠加（对应深度排序 $+$ $\alpha$ 合成）。\textbf{比喻不像在哪}：真雪球扔上去是不透明的硬覆盖，而高斯是\emph{半透明}的、要按 $\alpha$ 与前面所有雪球做透射率累积（\cref{sec:3dgs-raster}），不是简单盖住。这个“主动扔”的姿态，正是 splatting 与 NeRF“被动接”的根本区别，也是它\emph{能用图形学光栅化硬件、能跳过空白}的来由。
+\end{insight}
+
+\begin{pitfall}[把 EWA 的仿射近似当成精确投影]
+\textbf{错误}：以为 $\boldsymbol\Sigma_i'=\mathbf J\mathbf W\boldsymbol\Sigma_i\mathbf W^\top\mathbf J^\top$ 是三维高斯投影的\emph{精确}结果。\textbf{现象 / 后果}：在\emph{视野边缘}、或高斯\emph{贴近相机}、或高斯特别大时，投出的二维斑会有可见误差（边缘畸变、轻微错位）。\textbf{根因}：$\mathbf J$ 是在中心 $\boldsymbol\mu_c$ 处的\emph{一阶}线性化，离中心越远、透视越强，近似越糙；真正的透视投影不是仿射的。\textbf{正确}：接受它是\emph{近似}——3DGS 实现里对极端位置的高斯做视锥剔除与守卫带（guard band）裁掉，并对屏空间协方差加一个小的低通项（保证每个高斯至少一像素宽）来稳住数值；这些工程补丁正是承认“近似”后的必要防护。
+\end{pitfall}
+
+\paragraph{小结这一节。}
+EWA splatting 把“投影一个三维高斯”化简成两步：投中心 $\boldsymbol\mu_c=\mathbf T_{cw}\boldsymbol\mu_i$、传协方差 $\boldsymbol\Sigma_i'=\mathbf J\mathbf W\boldsymbol\Sigma_i\mathbf W^\top\mathbf J^\top$。背后是仿射闭合（线性化后高斯仍高斯）$+$ 边缘化（取 $2\times2$ 即降维）。与 NeRF 的逐射线查询相反，splatting 是\emph{每个图元主动泼到屏幕}——这是 3DGS 实时的几何根源。屏幕上现在有了一堆带颜色、带二维形状的高斯斑；下一步先看\emph{颜色}怎么来（球谐），再看一个像素被多个斑覆盖时\emph{怎么合成}（光栅化）。
+
+\subsection*{练习}
+\begin{enumerate}
+  \item 由 \cref{ch:camera} 的针孔投影 $u=f_x x/z+c_x,\ v=f_y y/z+c_y$ 直接对 $(x,y,z)$ 求偏导，逐元素复现 \cref{eq:3dgs-projjac} 的 $\mathbf J$。指出哪一列编码了透视非线性，并解释为何 $z\to\infty$ 时该列趋零（远处高斯投影几乎不随深度变）。
+  \item 设某高斯在相机系正前方（$x=y=0,\ z=2$），$\boldsymbol\Sigma_i=\operatorname{diag}(1,1,1)$，$f_x=f_y=f$。代入 \cref{eq:3dgs-proj} 算出 $\boldsymbol\Sigma_i'$，确认它是各向同性的二维高斯，半径随 $z$ 增大而缩小。
+  \item （对照 NeRF）同一个空场景（大片空白 $+$ 一个小物体），定性比较 splatting 与 ray-casting 的计算量随“空白占比”如何变化。为什么 3DGS 在空旷场景里优势更大？
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section{颜色：球谐 SH}
+\label{sec:3dgs-color}
+
+\subsection{动机：同一块表面，换个角度看颜色会变}
+
+\paragraph{为什么颜色不能是个固定值。}
+最朴素的做法是给每个高斯存一个固定 RGB。但真实世界里，\emph{同一块表面从不同视角看颜色会变}——最典型的是\emph{高光}：金属、瓷砖、湿地面上那块亮斑，会随你走动而移动、明灭。这是一种\emph{视相关（view-dependent）外观}。要渲得真，高斯的颜色得是\emph{观察方向的函数} $\mathbf c_i(\mathbf d)$，其中 $\mathbf d$ 是从高斯指向相机的方向。
+
+\paragraph{思路：用一组“球面上的基函数”展开。}
+怎么紧凑地表示一个“定义在方向（球面）上的函数”？类比\emph{傅里叶级数}：一维周期函数可展成正弦余弦基的线性组合 $f(x)=a_0+\sum_n(a_n\cos\tfrac{n\pi}{l}x+b_n\sin\tfrac{n\pi}{l}x)$，低频项管整体、高频项管细节。\textbf{球谐函数（Spherical Harmonics, SH）就是“球面上的傅里叶基”}——任何球面函数都能展成 SH 基的线性组合，低阶项管整体色调、高阶项管随角度的细变（高光）。
+
+\subsection{球谐展开：低阶管底色、高阶管视相关}
+
+球谐展开写作
+\begin{equation}
+  \mathbf c_i(\mathbf d)=\sum_{\ell=0}^{L}\sum_{m=-\ell}^{\ell}\mathbf c_i^{\ell m}\,y_\ell^m(\mathbf d),
+  \label{eq:3dgs-sh}
+\end{equation}
+其中 $y_\ell^m$ 是球谐基函数（固定的、解析已知，只依赖方向 $\mathbf d$），$\mathbf c_i^{\ell m}$ 是\emph{待学习的系数}（每个高斯、每个颜色通道各一组）。这里只需把握三件事，无需背 $y_\ell^m$ 的复杂展开式：
+
+\begin{enumerate}
+  \item \textbf{阶数 $\ell$ 控制角向频率}：$\ell$ 越大，基函数在球面上波纹越密，能表达越剧烈的随角度变化。3DGS 默认取到 $L=3$（degree-3，共 $(3+1)^2=16$ 个基/通道）。
+  \item \textbf{DC 项（$\ell=0$）是底色}：零阶基 $y_0^0$ 是常数，与方向无关——这一项就是高斯\emph{不随视角变}的“基础颜色”。代码里 SfM 点自带的 RGB 会先经 \texttt{RGB2SH} 转成这个 DC 系数当初值。
+  \item \textbf{高阶项（$\ell\ge1$）才管视相关}：它们随 $\mathbf d$ 变，叠加在底色上，专门拟合高光、各向异性反射这类“换个角度就不同”的细节。
+\end{enumerate}
+
+\begin{insight}[球谐是“渐进披露”的颜色：先底色，再按需加视相关细节]
+SH 这套展开天然契合一种训练策略：\emph{从低阶练起、逐步升阶}。3DGS 实现里，训练初期只用 DC 项（每个高斯先学对一个平均颜色），随迭代推进再逐步\emph{激活}更高阶系数（\texttt{active\_sh\_degree} 从 $0$ 慢慢升到 $3$）。这与 \cref{ch:nlopt} 里“先粗后精”的优化哲学一致：先把容易的（底色）定下来，再去抠难的（视相关高光）。\textbf{把 SH 想成“颜色的频谱”——低频先行、高频补细}，就抓住了它的全部精神，而不必陷进基函数的解析式。
+\end{insight}
+
+\begin{pitfall}[以为高 SH 阶数总是更好]
+\textbf{错误}：默认把 SH 阶数开到最高以求最真。\textbf{现象 / 后果}：系数量随 $(\ell+1)^2$ 增长（degree-3 已是 $16$ 个/通道、$48$ 个/高斯），\emph{存储与显存翻倍}；视相关分量过强还会在稀疏视角下\emph{过拟合}，新视角下高光乱窜。\textbf{根因}：阶数是表达力与开销/泛化的折中，不是越高越好；多数漫反射表面 DC $+$ 低阶已够。\textbf{正确}：用默认 degree-3、从低阶渐进激活；存储吃紧时（尤其 SLAM 场景）可砍到 degree-1 甚至只留 DC（下一章 \cref{ch:gsslam} 的一些系统正是这么省的）。
+\end{pitfall}
+
+\paragraph{小结这一节。}
+球谐给了高斯一身\emph{随视角变}的外观：DC 项是底色，高阶项叠加高光等视相关细节，默认 degree-3、训练中渐进升阶。每个高斯现在四属性齐备——位置 $\boldsymbol\mu_i$、形状 $(\mathbf s_i,\mathbf q_i)\!\to\!\boldsymbol\Sigma_i$、不透明度 $o_i$、颜色 $\mathbf c_i(\mathbf d)$。万事俱备，只差把成千上万个这样的斑\emph{高效地堆成一张图}——这正是下一节 tile 光栅化要解决的实时之钥。
+
+\subsection*{练习}
+\begin{enumerate}
+  \item 数一数：degree-$L$ 的 SH 每通道有 $(L+1)^2$ 个系数。算出 $L=0,1,2,3$ 各自每个高斯（RGB 三通道）需存多少 SH 系数。这解释了为何 SH 是 3DGS 存储的大头之一。
+  \item 为什么 DC 项（$\ell=0$）与观察方向无关？（提示：$y_0^0$ 是常数。）由此说明：一个纯漫反射（无高光）的表面，理论上只需 DC 项就能表示。
+  \item （桥回传统）特征点法里一个地图点常存一个固定描述子/颜色。对比 SH 颜色，指出“固定颜色”在什么场景下会失真，而 SH 如何补上——并说一句这对\emph{回环时的外观匹配}意味着什么（伏笔到 \cref{ch:gsslam}）。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section{光栅化：tile 管线}
+\label{sec:3dgs-raster}
+
+\subsection{动机：一个像素被几十个高斯盖住，怎么又快又对地合成}
+
+\paragraph{两个难题：合成与速度。}
+屏幕上现在堆着成千上万个半透明高斯斑，一个像素往往被几十个斑覆盖。要出最终颜色，得解决两件事：(1) \emph{合成}——这些斑按深度从前到后、按不透明度半透明叠加，得算出像素最终颜色；(2) \emph{速度}——要实时（几十上百 fps），不能逐像素老老实实把所有高斯排个序。3DGS 的\emph{实时之钥}，正是一套精心设计的 GPU \textbf{tile（瓦片）光栅化}管线，把这两件事一起办了。
+
+\subsection{合成：深度排序后的 \texorpdfstring{$\alpha$}{alpha} 合成}
+
+\paragraph{先讲“怎么合成”——它直接搬自 NeRF 体渲染。}
+一个像素的颜色 $C$，由落在它射线上的高斯\emph{按深度从近到远}（$i=1,\dots,N$）做 $\alpha$ 合成：
+\begin{equation}
+  \boxed{\;C=\sum_{i=1}^{N}\mathbf c_i\,\alpha_i\,T_i,\qquad T_i=\prod_{j=1}^{i-1}(1-\alpha_j)\;}
+  \label{eq:3dgs-blend}
+\end{equation}
+逐项拆开（与 \cref{sec:dense-radiance-nerf} NeRF 的体渲染\emph{同一套合成律}，只是离散到高斯）：
+\begin{itemize}
+  \item $\mathbf c_i$ 是第 $i$ 个高斯的颜色（由 \cref{eq:3dgs-sh} 的 SH 按当前视角算出）。
+  \item $\alpha_i=o_i\cdot G_i(\mathbf x)$ 是该高斯\emph{对这个像素}的有效不透明度：等于它学到的\emph{固有不透明度} $o_i$，乘以\emph{该像素落点处的高斯衰减} $G_i$（\cref{eq:3dgs-gaussian} 的二维版本——像素离斑心越远，$G_i$ 越小、越透明）。
+  \item $T_i=\prod_{j<i}(1-\alpha_j)$ 是\emph{透射率}：光线穿到第 $i$ 个高斯前\emph{还剩多少能量}。前面的斑越不透明，$T_i$ 越接近 $0$。
+\end{itemize}
+
+\begin{insight}[透射率 $T_i$ 一旦趋零，后面全可跳过——这就是“饱和早停”]
+\cref{eq:3dgs-blend} 里 $T_i$ 是\emph{关键的加速钩子}。它从 $1$ 开始，每经过一个高斯就乘 $(1-\alpha_i)$ 而单调减小。\textbf{一旦 $T_i$ 降到接近 $0$，意味着光线能量几乎被前面的高斯吸光了，再后面（更远）的高斯无论什么颜色都贡献微乎其微——直接停止累加。}这叫\emph{饱和早停}（saturation early-stop），代码里就是 \texttt{if (test\_T < 0.0001f) done = true;}。它让“深度复杂”的场景（一条射线穿过很多层）也不必把所有层都算完——前景一旦不透明，背景自动被遮、被跳。这与 \cref{ch:dense} 传统 Z-buffer “只画最前面”是一脉相承的遮挡思想，只是这里是\emph{半透明}版的、按透射率渐进遮挡。
+\end{insight}
+
+\subsection{速度：\texorpdfstring{$16\times16$}{16x16} tile \texorpdfstring{$+$}{+} 一次全局深度排序}
+
+\paragraph{逐像素排序太慢，改成逐 tile。}
+合成 \cref{eq:3dgs-blend} 要求\emph{每个像素}的覆盖高斯\emph{按深度有序}。若对每个像素单独排序，开销爆炸。3DGS 的破局思路是\emph{把排序的粒度从像素抬到 tile}，整张图只排\emph{一次}。管线分四步（\cref{tab:3dgs-tile}）：
+
+\begin{table}[H]\centering
+\caption{tile 光栅化四步：把“逐像素排序”换成“一次全局排序”}
+\label{tab:3dgs-tile}
+\small
+\begin{tabular}{@{}p{0.16\textwidth}p{0.78\textwidth}@{}}
+\toprule
+步骤 & 做什么 \\
+\midrule
+(1) 分块 $+$ 剔除 & 屏幕切成 $16\times16$ 像素的 tile；对每个高斯做\emph{视锥剔除}（只留 $99\%$ 置信椭球与视锥相交者）与守卫带剔除（极端位置丢弃，免得协方差投影数值爆）。\\
+(2) 实例化 $+$ 编键 & 一个高斯可能盖到多个 tile，就为它\emph{在每个覆盖的 tile 里各生一个实例}；给每个实例一把 $64$ 位键 $=$（高 $32$ 位 tile ID $\,|\,$ 低 $32$ 位视空间深度）。\\
+(3) 一次基数排序 & 对所有实例按这把 $64$ 位键做\emph{一次}全局 GPU 基数排序（radix sort）。妙处：按键排序后，\emph{同一 tile 的高斯自动聚成一段、段内又恰好按深度升序}——一举两得，无需任何逐像素再排。\\
+(4) 逐 tile 并行合成 & 每个 tile 派一个 GPU 线程块（block）；块内线程\emph{协同}把该 tile 的高斯成批载入\emph{共享内存}，然后每个像素（一个线程）沿这段有序高斯\emph{从前到后} $\alpha$ 合成 \cref{eq:3dgs-blend}，饱和即停。\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[“编键 $+$ 一次排序”为何是整个管线的灵魂]
+全部魔法浓缩在第 (3) 步那把 $64$ 位键。把\emph{tile ID 放高位、深度放低位}，意味着排序\emph{先按 tile 分组、组内再按深度排}——一次基数排序同时办完“分到哪个 tile”和“tile 内谁在前”两件事。于是合成阶段每个 tile 只需\emph{顺着它那段已排好的高斯走一遍}，零额外排序。\textbf{这就是 3DGS 把“逐像素排序的 $O(\text{像素}\times\text{高斯}\log)$”压成“一次全局排序 $+$ 线性扫描”的关键}，配上共享内存协同加载与 tile 级并行，才换来实时。代价是合成是\emph{近似}的——同一 tile 内所有像素共用一份深度序，而非各像素精确各排；但当高斯小到接近像素尺寸时，这点近似几乎不可见（伏笔：这也是 \cref{sec:3dgs-limits} “popping 伪影”的来由）。
+\end{insight}
+
+\subsection{反向传播：用累积 \texorpdfstring{$\alpha$}{alpha} 反推，无需存长列表}
+
+\paragraph{反传的难处：前向那条合成链怎么倒着走。}
+3DGS 是\emph{可微}光栅器——loss 的梯度要从像素颜色反传回每个高斯的 $(\boldsymbol\mu_i,\boldsymbol\Sigma_i,o_i,\mathbf c_i)$。前向合成 \cref{eq:3dgs-blend} 是\emph{从前到后}累乘透射率；反传则要\emph{从后到前}走一遍。难点在：算第 $i$ 个高斯的梯度，需要它当时的透射率 $T_i=\prod_{j<i}(1-\alpha_j)$，而前向是\emph{从前往后}算的，到反传时这些中间透射率早已被覆盖。最笨的办法是前向时把每像素的整条高斯列表都存进显存——内存爆炸。
+
+3DGS 的巧解：\emph{只存一个数}——前向结束时每像素的\emph{最终累积透射率} $T_{\text{final}}$。反传时\emph{从后往前}遍历同一段（已排好的）高斯，遇到第 $i$ 个就\emph{把当前累积透射率除以 $(1-\alpha_i)$}，即可\emph{反推}出 $T_i$，无需任何长列表。
+
+\begin{insight}[“除以 $\alpha$ 反推透射率”——一道乘积的逆运算]
+前向是连乘 $T_{i+1}=T_i(1-\alpha_i)$；反传从 $T_{\text{final}}$ 出发，每退一个高斯就\emph{除掉}它当初乘进去的那个 $(1-\alpha_i)$，于是 $T_i=T_{i+1}/(1-\alpha_i)$——一道连乘的逆运算。\textbf{这把“存整条历史（$O(N)$ 显存/像素）”换成了“存一个数 $+$ 反向重算（$O(1)$ 显存/像素）”}，是 3DGS 反传又快又省内存的核心技巧。数值上要防 $\alpha_i\to1$ 时除零，故前向把 $\alpha$ 从上钳到 $0.99$、跳过 $\alpha<\tfrac{1}{255}$ 的高斯（\cref{sec:3dgs-code} 会在代码里见到这两道防护）。与 \cref{ch:nlopt} 自动微分“存全部中间量”相比，这是一种\emph{用重算换内存}的手工反传——正因 3DGS 自己掌控了这条链，才能这样优化。
+\end{insight}
+
+\paragraph{小结这一节。}
+tile 光栅化是 3DGS 的实时引擎：$\alpha$ 合成 \cref{eq:3dgs-blend} 借透射率 $T_i$ 做半透明叠加 $+$ 饱和早停；$16\times16$ 分块 $+$（tile ID $|$ 深度）$64$ 位键 $+$ 一次基数排序，把逐像素排序压成一次全局排序 $+$ 线性扫描；反传用“除以 $\alpha$ 反推透射率”省下显存。至此，给定一组高斯就能\emph{又快又可微}地渲出图、并把梯度送回每个高斯。可还差一大块：初始那几千个 SfM 点根本不够铺满场景——优化得能\emph{自己长出、自己删掉}高斯。这正是下一节。
+
+\subsection*{练习}
+\begin{enumerate}
+  \item 设一条射线上前 $3$ 个高斯 $\alpha=(0.5,0.6,0.9)$。算出各自的透射率 $T_1,T_2,T_3$ 与第 $4$ 个高斯的 $T_4$。若早停阈值是 $T<0.05$，第 $4$ 个之后的高斯会被算吗？
+  \item 解释为什么把 tile ID 放在 $64$ 位键的\emph{高} $32$ 位、深度放\emph{低} $32$ 位（而非反过来）。如果反过来会发生什么？
+  \item （反传）给定前向最终透射率 $T_{\text{final}}=0.02$ 与某像素最后一个高斯 $\alpha_N=0.9$，反推它之前那一步的透射率。说明这一“除法反推”为何能省去存储整条列表。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section{自适应密度控制：让高斯自增长}
+\label{sec:3dgs-density}
+
+\subsection{动机：优化光会“挪”不够，还得能“生”和“灭”}
+
+\paragraph{固定一把高斯，优化不出好场景。}
+若高斯的\emph{数量与位置}从头到尾固定（就那几千个 SfM 种子点），无论怎么优化它们的形状、颜色，也铺不满整个表面——三维到二维投影的歧义会让几何\emph{摆错位置}，而光靠梯度\emph{挪动}已有高斯无法填补大片空白、也无法把一个本该是细节的区域细分开。所以优化必须能\emph{创造（create）、销毁（destroy）、移动（move）}几何。移动靠常规梯度下降；\textbf{创造与销毁，就是本节的“自适应密度控制”（Adaptive Density Control, ADC）}——这是本书此前最缺、也是 3DGS 把稀疏种子养成稠密场的关键一招。
+
+\begin{insight}[densification $=$ 地图随“重建需求”增量生长，激光读者并不陌生]
+LiDAR-native 的你对“地图增量生长”再熟不过：FAST-LIO 的 ikd-Tree 地图随机器人走过新区域\emph{不断插入新点}、远处旧点被剔除——地图按\emph{探索}生长。3DGS 的 densification 是同一种冲动的\emph{另一种触发}：不按“走到哪”，而按\emph{“哪里重建得还不够好”}生长。判据是一个优雅的代理量——\emph{视空间位置梯度大}的地方，就是“优化器很想挪动这里的高斯、说明这块还没拟合好”的地方，于是在那里\emph{增殖}高斯。\textbf{激光地图按几何覆盖生长，3DGS 地图按渲染残差生长}——触发信号不同，但“地图不是一次建好、而是边优化边长”的精神完全一致。（这条“按需生长”的直觉，到 \cref{ch:gsslam} 在线 SLAM 里会变成“边走边往地图里加高斯”。）
+\end{insight}
+
+\subsection{触发判据：视空间位置梯度过阈}
+
+\paragraph{一个信号，同时指向两种“没建好”。}
+3DGS 观察到：\emph{欠重建}（该有几何的地方高斯太少、有空洞）与\emph{过重建}（一个大高斯糊住了一片本该有细节的区域）这两种毛病，都会表现为\emph{大的视空间位置梯度}——直觉上，优化器正使劲想挪动这些高斯去纠正误差。于是用一个统一判据：\emph{某高斯的视空间位置梯度平均幅值超过阈值 $\tau_{\mathrm{pos}}$（论文取 $0.0002$）就触发增密}。触发后，再用\emph{尺度}区分是哪种毛病、施以不同手术：小高斯欠重建 $\to$ \textbf{克隆}，大高斯过重建 $\to$ \textbf{分裂}（\cref{fig:3dgs-density}）。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=6mm,
+  g/.style={draw, ellipse, fill=main!12, draw=main!60!black, minimum width=10mm, minimum height=7mm, inner sep=1pt},
+  gs/.style={draw, ellipse, fill=second!14, draw=second!60!black, minimum width=6mm, minimum height=5mm, inner sep=0pt},
+  lab/.style={font=\footnotesize, align=center},
+  ln/.style={->, thick, gray!55!black}]
+% under-reconstruction: clone
+\node[lab] (ut) at (0,1.1) {\textbf{欠重建（小高斯）}};
+\node[g] (u1) at (-0.4,0) {};
+\node[lab] at (0,-1.1) {梯度大 $\Rightarrow$ \emph{克隆}\\复制一份、沿梯度移开};
+\node[g] (u2a) at (2.4,0.25) {};
+\node[g] (u2b) at (3.0,-0.25) {};
+\draw[ln] (0.4,0) -- (1.7,0);
+% over-reconstruction: split
+\node[lab] (ot) at (6.6,1.1) {\textbf{过重建（大高斯）}};
+\node[g, minimum width=15mm, minimum height=11mm] (o1) at (6.2,0) {};
+\node[lab] at (6.6,-1.1) {梯度大 $\Rightarrow$ \emph{分裂}\\一拆二、尺度 $\div\phi$};
+\node[gs] (o2a) at (9.2,0.3) {};
+\node[gs] (o2b) at (9.7,-0.3) {};
+\draw[ln] (7.0,0) -- (8.5,0);
+\end{tikzpicture}
+\caption{自适应密度控制（仿 \cite{kerbl2023gaussian} 重绘）。视空间位置梯度过阈触发增密：\emph{欠重建}的小高斯被\textbf{克隆}（复制同尺寸、沿位置梯度方向移开，去覆盖新几何）；\emph{过重建}的大高斯被\textbf{分裂}成两个、尺度各除以 $\phi=1.6$，并以原高斯为概率密度采样新位置。另有剪枝（删 $o_i<\epsilon_\alpha$ 的近透明高斯）与每 $3000$ 迭代的不透明度重置。}
+\label{fig:3dgs-density}
+\end{figure}
+
+\subsection{两种手术：克隆与分裂}
+
+\paragraph{克隆（clone）——欠重建，给小高斯补一个同伴。}
+若触发增密的高斯\emph{尺度小}（小于一个尺度阈值），判为\emph{欠重建}：这块该有几何，但高斯太小、覆盖不全。处理是\emph{克隆}——复制一个\emph{同样大小}的高斯，并把副本\emph{沿位置梯度方向移开}一点，去覆盖尚空的相邻几何。直觉：原高斯想往某个方向挪（梯度指示），但它一个人覆盖不过来，那就\emph{留一个、再派一个}过去。克隆\emph{增加}了系统的总体积与高斯数。
+
+\paragraph{分裂（split）——过重建，把大高斯拆细。}
+若触发增密的高斯\emph{尺度大}，判为\emph{过重建}：一个大高斯糊住了一片本该有细节的区域。处理是\emph{分裂}——把它换成\emph{两个}更小的高斯，尺度各\emph{除以 $\phi=1.6$}（实验定的经验值），并\emph{以原高斯本身当概率密度函数（PDF）采样}两个新高斯的位置（即在原椭球的高斯分布里随机抽两个落点）。直觉：原来一个大球粗粗盖住的地方，换两个小球去抠细节。分裂\emph{基本保持}总体积、但增加高斯数。
+
+\subsection{剪枝与不透明度重置：防止无节制膨胀}
+
+\paragraph{剪枝（prune）——删掉没用的。}
+增密只进不出会让高斯数失控。两道剪枝把没用的删掉：(1) 删\emph{近乎透明}的高斯（固有不透明度 $o_i<\epsilon_\alpha$，论文取很小阈值如 $0.005$）——它们对渲染几乎无贡献；(2) 删在世界空间\emph{过大}、或在视空间\emph{足迹过大}的高斯——它们往往是糊住一切的“漂浮物”。
+
+\paragraph{不透明度重置（opacity reset）——周期性“清账”。}
+还有一道治本的招：\emph{每 $N=3000$ 迭代，把所有高斯的不透明度 $o_i$ 强制重置到接近 $0$}。这逼着优化器\emph{重新挣}每个高斯的不透明度——真正有用的高斯会被优化重新抬回高 $o_i$，而那些可有可无、靠惯性赖着的高斯则抬不回来、随即被上面的剪枝删除。这有效地周期性\emph{清洗}掉冗余高斯与贴近相机的漂浮物，控住总数。
+
+\begin{algo}[3DGS 优化与自适应密度控制]
+\label{alg:3dgs-opt}
+输入：SfM 点云（位置）$\to$ 初始化各高斯的协方差 / 颜色 / 不透明度。\par
+\textbf{while} 未收敛：
+\begin{enumerate}
+  \item 采一个训练视角 $(\mathbf T_{wc},\bar{\mathbf I})$；用 tile 光栅器（\cref{sec:3dgs-raster}）渲出 $\hat{\mathbf I}$；
+  \item 算损失 $\mathcal L=(1-\lambda)\mathcal L_1+\lambda\mathcal L_{\mathrm{DSSIM}}$（\cref{sec:3dgs-opt}）；
+  \item 反传 $\nabla\mathcal L$，Adam 更新所有高斯参数 $(\boldsymbol\mu_i,\mathbf s_i,\mathbf q_i,o_i,\text{SH})$；
+  \item \textbf{if} 是精化迭代（warm-up 后每 $100$ 迭代）：
+  \begin{itemize}
+    \item 剪枝：删 $o_i<\epsilon_\alpha$ 或过大的高斯；
+    \item 增密：对位置梯度 $>\tau_{\mathrm{pos}}$ 的高斯，\emph{小尺度} $\to$ 克隆、\emph{大尺度} $\to$ 分裂（$\div\phi$）；
+  \end{itemize}
+  \item \textbf{if} 每 $3000$ 迭代：不透明度重置（$o_i\!\leftarrow\!\approx 0$）。
+\end{enumerate}
+\end{algo}
+
+\begin{pitfall}[把克隆 / 分裂的判据搞反，或忘了剪枝与重置]
+\textbf{错误}：以为“梯度大就一律分裂”，或只增密不剪枝、不重置。\textbf{现象 / 后果}：高斯数指数膨胀、显存炸；或欠重建区被错误分裂导致碎片化、过重建区被错误克隆而仍糊。\textbf{根因}：增密\emph{触发}靠位置梯度，但\emph{克隆还是分裂}靠\emph{尺度}区分（小 $\to$ 克隆、大 $\to$ 分裂）；且增密必须与\emph{剪枝} $+$ \emph{周期性不透明度重置}配套，才控得住总数。\textbf{正确}：严格按 \cref{alg:3dgs-opt}——梯度过阈触发、尺度定手术、剪枝删废、每 $3000$ 迭代重置不透明度清账。
+\end{pitfall}
+
+\paragraph{小结这一节。}
+自适应密度控制让 3DGS 从几千 SfM 种子\emph{自增长}成百万级稠密场：视空间位置梯度过 $\tau_{\mathrm{pos}}$ 触发增密，小尺度\emph{克隆}（补欠重建）、大尺度\emph{分裂}（抠过重建、$\div\phi$），辅以剪枝（删近透明 / 过大者）与每 $3000$ 迭代的不透明度重置控住总数。这是“地图按重建需求生长”的渲染版。剩下最后一块拼图：把渲染、损失、密度控制\emph{拧成一个训练环}，并交代那些让一切跑稳的工程细节（激活函数、初始尺度、显式梯度）。
+
+\subsection*{练习}
+\begin{enumerate}
+  \item 解释为什么\emph{欠重建}与\emph{过重建}\emph{都}表现为大的视空间位置梯度，却要用\emph{尺度}来区分施以克隆还是分裂。若只看梯度不看尺度，会出什么问题？
+  \item 不透明度重置为什么能\emph{净删}冗余高斯？（提示：重置后，有用的高斯会被优化重新抬高 $o_i$，无用的抬不回来、被剪枝。）这与单纯设个数量上限相比好在哪？
+  \item （桥回激光）把 3DGS 的“位置梯度过阈即增密”与 FAST-LIO“走到新区域即插点”并列：两者的\emph{触发信号}各是什么？各自如何\emph{删点}？用一句话点出“按渲染残差生长”与“按几何覆盖生长”的根本差异。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section{优化：训练环}
+\label{sec:3dgs-opt}
+
+\subsection{闭环：渲染-比对-反传}
+
+\paragraph{把前六节拧成一个循环。}
+3DGS 的训练就是 \cref{alg:3dgs-opt} 那个循环\emph{反复跑}：从数据集采一个已标定视角，用 tile 光栅器渲出 $\hat{\mathbf I}$，与真实照片 $\bar{\mathbf I}$ 比对算损失，反传梯度、Adam 更新所有高斯参数，间或做密度控制。这是一种典型的\emph{analysis-by-synthesis}（合成-比对）——“渲一张、比一张、调一调”，与 \cref{ch:dense} 直接法用光度误差驱动估计是同一种思想，只是这里被估的是\emph{地图}（高斯参数），位姿是常量。
+
+\subsection{损失函数：\texorpdfstring{$L_1$}{L_1} 配 D-SSIM}
+
+\paragraph{既要逐像素准，也要结构像。}
+损失是\emph{逐像素} $L_1$ 与\emph{结构相似度} D-SSIM 两项的加权：
+\begin{equation}
+  \mathcal L=(1-\lambda)\,\mathcal L_1+\lambda\,\mathcal L_{\mathrm{D\text{-}SSIM}},\qquad \lambda=0.2.
+  \label{eq:3dgs-loss}
+\end{equation}
+$\mathcal L_1=\lVert\hat{\mathbf I}-\bar{\mathbf I}\rVert_1$ 管\emph{逐像素颜色对不对}；$\mathcal L_{\mathrm{D\text{-}SSIM}}=1-\mathrm{SSIM}(\hat{\mathbf I},\bar{\mathbf I})$ 管\emph{局部结构（亮度 / 对比度 / 纹理）像不像}。只用 $L_1$ 会得到“平均对、但糊”的图（像素值对了、纹理糊了）；加 D-SSIM 把结构拉回来。$\lambda=0.2$ 是论文全程默认。
+
+\subsection{让一切跑稳的工程细节}
+
+\paragraph{激活函数：把无约束参数压进合法区间。}
+优化器在\emph{无约束}空间里走，但有些参数有物理约束，靠\emph{激活函数}在“现合成”时压回合法区间——又一次“存无约束量、用时映射回约束域”的范式：
+\begin{itemize}
+  \item \emph{不透明度} $o_i\in[0,1)$：存一个无约束实数 $\tilde o_i$，渲染时取 $o_i=\operatorname{sigmoid}(\tilde o_i)$，自动落进 $[0,1)$ 且梯度平滑。
+  \item \emph{尺度} $\mathbf s_i>0$：存无约束 $\tilde{\mathbf s}_i$，渲染时取 $\mathbf s_i=\exp(\tilde{\mathbf s}_i)$，保证恒正（半轴长不能为负）。
+  \item \emph{四元数} $\mathbf q_i$：每次用前\emph{归一化}成单位四元数，保证 $\mathbf R(\mathbf q_i)$ 是合法旋转。
+\end{itemize}
+
+\paragraph{初始尺度：distCUDA 的“三邻平均距”。}
+新高斯（含初始 SfM 点）的尺度怎么定初值？太大糊、太小漏。3DGS 用一个朴素而有效的启发：\emph{把初始协方差设成各向同性、半径等于到最近三个点的平均距离}。实现上由一个 CUDA 函数 \texttt{distCUDA2} 算每个点的\emph{平均 3 近邻距离}（KNN）。直觉：点稀的地方初始高斯大些（一个球管一片）、点密的地方小些（精细处用小球）——让初始尺度\emph{自适应局部点密度}。
+
+\paragraph{显式梯度：为何不用自动微分。}
+3DGS \emph{不}靠 PyTorch 自动微分去求高斯参数的梯度，而是\emph{亲手推导}全部解析梯度（$\partial\boldsymbol\Sigma'/\partial\boldsymbol\Sigma$、$\partial\boldsymbol\Sigma/\partial\mathbf s$、$\partial\boldsymbol\Sigma/\partial\mathbf q$、四元数 $\to\mathbf R$ 等，见原论文附录），写成 CUDA 核。原因是\emph{性能}：光栅化是优化的主瓶颈，自动微分会引入可观开销与显存占用；手写解析梯度让前/反向都极致精简。这与 \cref{ch:nlopt} “自己写 Jacobian 喂 Gauss--Newton/LM、而非全交给自动微分”是同一权衡——\emph{用一次性的人工推导，换长期的运行效率}。
+
+\begin{insight}[3DGS 的训练环，逐零件都是本书老相识]
+拆开 \cref{alg:3dgs-opt}，没有一个零件是凭空的：合成-比对是 \cref{ch:dense} 直接法的光度驱动；$L_1+$D-SSIM 是带结构正则的残差；sigmoid/exp 激活是“无约束参数 $+$ 用时映射”的老范式（同 \cref{sec:3dgs-store} 存 $\mathbf s_i+\mathbf q_i$、同 \cref{ch:lie} 李代数优化）；显式梯度 $+$ Adam 是 \cref{ch:nlopt} 的优化主干；密度控制是“地图按需生长”的渲染版。\textbf{所以 3DGS 训练不是一套陌生的深度学习黑箱，而是本书反复打磨的几件工具——光度残差、带约束量的无约束参数化、解析梯度、地图增量生长——在“可微渲染”这个新场景里的一次合奏。}唯一真正新的，是把“地图”做成了可渲染、可微的高斯集合。
+\end{insight}
+
+\paragraph{小结这一节。}
+训练环 \cref{alg:3dgs-opt} 把渲染、损失 \cref{eq:3dgs-loss}、密度控制拧成闭环：合成-比对驱动、$L_1+$D-SSIM 损失、sigmoid/exp 激活守约束、distCUDA 给自适应初始尺度、显式解析梯度 $+$ Adam 求解。约 $30$k 迭代后，几千 SfM 种子长成百万级高斯、渲出逼真新视角。下一节把这套理论\emph{钉进真实代码}，再收束于局限与“放开位姿”的过渡。
+
+\subsection*{练习}
+\begin{enumerate}
+  \item 解释 \cref{eq:3dgs-loss} 里若令 $\lambda=0$（纯 $L_1$）渲染结果会怎样、$\lambda=1$（纯 D-SSIM）又会怎样。为什么 $0.2$ 这样\emph{偏向 $L_1$}的折中是合理的默认？
+  \item 为什么尺度用 $\exp$ 激活、不透明度用 $\operatorname{sigmoid}$ 激活（而不是反过来或都用同一个）？分别从“值域”角度说明。
+  \item （综合，跨章）把 3DGS 训练写成 \cref{ch:nlopt} 的 $\arg\min_X\mathcal L(X)$ 形式：状态 $X$ 是什么、残差是什么、为何这里\emph{位姿不在} $X$ 里？再用一句话预告：若把位姿放进 $X$，就跨进了 \cref{ch:gsslam}。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section{源码落点}
+\label{sec:3dgs-code}
+
+\paragraph{把方程钉进真代码。}
+理论讲完，最后用三段官方实现的真实片段，把核心方程\emph{逐行}对回代码——这是工程读者把 3DGS 从“看懂”变“能改”的关键一跃。每段都标出它实现的是本章哪条方程。（按本书代码框约定，注释为英文 ASCII、不放 unicode 数学符号；$\mu/\Sigma/\pi$ 在代码里写作 \texttt{mu}/\allowbreak\texttt{Sigma}/\allowbreak\texttt{pi}、转置写 \texttt{\textasciicircum T}。）
+
+\begin{codebox}[C++]{computeCov3D:协方差分解 Sigma = R S S\textasciicircum T R\textasciicircum T（对应 eq:3dgs-cov）}
+// diff-gaussian-rasterization :: computeCov3D
+// Build scaling matrix S = diag(s) ; rotation R from quaternion q ; then Sigma.
+__device__ void computeCov3D(const glm::vec3 scale, float mod,
+                             const glm::vec4 rot, float* cov3D) {
+    glm::mat3 S = glm::mat3(1.0f);                 // S = diag(s), exp-activated outside
+    S[0][0] = mod * scale.x;  S[1][1] = mod * scale.y;  S[2][2] = mod * scale.z;
+    glm::vec4 q = rot;  float r=q.x, x=q.y, y=q.z, z=q.w;   // unit quaternion (w,x,y,z)
+    glm::mat3 R = glm::mat3(                        // R(q): quaternion -> rotation matrix
+        1.f-2.f*(y*y+z*z), 2.f*(x*y-r*z),     2.f*(x*z+r*y),
+        2.f*(x*y+r*z),     1.f-2.f*(x*x+z*z), 2.f*(y*z-r*x),
+        2.f*(x*z-r*y),     2.f*(y*z+r*x),     1.f-2.f*(x*x+y*y));
+    glm::mat3 M = S * R;                            // GLM is column-major:
+    glm::mat3 Sigma = glm::transpose(M) * M;        //  transpose(M)*M  ==  R S S^T R^T (math)
+    // store upper triangle (symmetric): [00,01,02,11,12,22]
+    cov3D[0]=Sigma[0][0]; cov3D[1]=Sigma[0][1]; cov3D[2]=Sigma[0][2];
+    cov3D[3]=Sigma[1][1]; cov3D[4]=Sigma[1][2]; cov3D[5]=Sigma[2][2];
+}
+\end{codebox}
+
+\noindent{}这段坐实 \cref{eq:3dgs-cov}：\texttt{S} 是尺度对角阵（\texttt{scale} 已在外层经 $\exp$ 激活保正）、\texttt{R} 由四元数现算。\textbf{一个易被绕晕的细节}：GLM 是\emph{列主序}的，所以代码里 \texttt{M = S*R} 加 \texttt{transpose(M)*M} 在\emph{数学（行主序）}意义上恰好实现 $\boldsymbol\Sigma_i=\mathbf R_i\mathbf S_i\mathbf S_i^\top\mathbf R_i^\top$——列主序的 \texttt{S*R} 等价于数学的 $\mathbf R\mathbf S$，再 $(\cdot)^\top(\cdot)$ 即得。只存上三角 $6$ 个数（协方差对称），正是“不存满矩阵”的体现。
+
+\begin{codebox}[C++]{computeCov2D:EWA 投影 Sigma' = J W Sigma W\textasciicircum T J\textasciicircum T（对应 eq:3dgs-proj）}
+// diff-gaussian-rasterization :: computeCov2D  (EWA, Zwicker et al. 2002)
+__device__ float3 computeCov2D(const float3& mean, float fx, float fy,
+        float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix) {
+    float3 t = transformPoint4x3(mean, viewmatrix);    // Gaussian center -> camera frame  mu_c
+    // clamp to a guard band so projection of off-screen Gaussians stays stable
+    float lim_x=1.3f*tan_fovx, lim_y=1.3f*tan_fovy;
+    t.x = min(lim_x, max(-lim_x, t.x/t.z))*t.z;  t.y = min(lim_y, max(-lim_y, t.y/t.z))*t.z;
+    glm::mat3 J = glm::mat3(                            // pinhole projection Jacobian J (eq:3dgs-projjac)
+        fx/t.z, 0.0f,  -(fx*t.x)/(t.z*t.z),
+        0.0f,   fy/t.z,-(fy*t.y)/(t.z*t.z),
+        0,      0,      0);
+    glm::mat3 W = glm::mat3(                            // 3x3 rotation part of view matrix (world->cam)
+        viewmatrix[0],viewmatrix[4],viewmatrix[8],
+        viewmatrix[1],viewmatrix[5],viewmatrix[9],
+        viewmatrix[2],viewmatrix[6],viewmatrix[10]);
+    glm::mat3 T = W * J;
+    glm::mat3 Vrk = glm::mat3(cov3D[0],cov3D[1],cov3D[2],   // rebuild symmetric Sigma from 6 stored
+                              cov3D[1],cov3D[3],cov3D[4],
+                              cov3D[2],cov3D[4],cov3D[5]);
+    glm::mat3 cov = glm::transpose(T) * glm::transpose(Vrk) * T;  // Sigma' = J W Sigma W^T J^T
+    cov[0][0] += 0.3f;  cov[1][1] += 0.3f;             // low-pass: every Gaussian >= 1px wide
+    return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };  // 2x2 (drop 3rd row/col)
+}
+\end{codebox}
+
+\noindent{}这段坐实 \cref{eq:3dgs-proj,eq:3dgs-projjac}：\texttt{J} 逐元素就是投影雅可比、\texttt{W} 是视变换旋转部分、\texttt{Vrk} 是从 $6$ 个存值重建的三维协方差，最后 \texttt{transpose(T)*transpose(Vrk)*T} 即 $\boldsymbol\Sigma_i'=\mathbf J\mathbf W\boldsymbol\Sigma_i\mathbf W^\top\mathbf J^\top$（列主序下的转置安排）。返回时只取 $3$ 个数——$2\times2$ 协方差的上三角，正是“取左上 $2\times2$、丢第三行列”的\emph{降维}。两处细节呼应正文的 pitfall：\texttt{guard band} 钳制（防边缘高斯投影数值爆）与 \texttt{+= 0.3f} 低通（保证每个高斯至少一像素宽）。\textbf{注意 \texttt{viewmatrix} 是\emph{常量}传入}——原版 3DGS 位姿由 SfM 定死，从不回传位姿梯度，这正是下一节“接口”的伏笔。
+
+\begin{codebox}[Python]{densify\_and\_clone:克隆判据（对应 sec:3dgs-density 欠重建分支）}
+# scene/gaussian_model.py :: densify_and_clone
+def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    # trigger: view-space position-gradient magnitude over threshold tau_pos
+    selected = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+    # AND keep only SMALL gaussians (scale below a fraction of scene size) -> under-reconstruction
+    selected = torch.logical_and(selected,
+        torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent)
+    # clone: copy all attributes of the selected gaussians (same size), append to the set
+    new_xyz      = self._xyz[selected]        # position  mu
+    new_scaling  = self._scaling[selected]    # scale  s   (same size -> a "same-size copy")
+    new_rotation = self._rotation[selected]   # quaternion q
+    new_opacity  = self._opacity[selected]    # opacity  o
+    new_dc       = self._features_dc[selected]; new_rest = self._features_rest[selected]  # SH
+    self.densification_postfix(new_xyz, new_dc, new_rest, new_opacity, new_scaling, new_rotation)
+\end{codebox}
+
+\noindent{}这段坐实 \cref{sec:3dgs-density} 的\emph{克隆}分支与 \cref{alg:3dgs-opt} 第 4 步：第一行按位置梯度过阈\emph{触发}（$\tau_{\mathrm{pos}}$ 即 \texttt{grad\_threshold}），第二行用\emph{尺度小}筛出\emph{欠重建}者，随后\emph{复制同尺寸}属性追加进高斯集合。配套的 \texttt{densify\_and\_split}（此处从略）则筛\emph{尺度大}者、以原高斯为 PDF 采样新位置、尺度除以 $\approx\phi$——正是\emph{分裂}分支。两个函数合起来就是 \cref{fig:3dgs-density} 的克隆 / 分裂双手术。
+
+\paragraph{小结这一节。}
+三段真代码把本章核心方程钉死：\texttt{computeCov3D} $\leftrightarrow$ \cref{eq:3dgs-cov}、\texttt{computeCov2D} $\leftrightarrow$ \cref{eq:3dgs-proj,eq:3dgs-projjac}、\texttt{densify\_and\_clone} $\leftrightarrow$ \cref{sec:3dgs-density}。你也亲眼看到 \texttt{viewmatrix} 是常量——位姿在原版 3DGS 里不是变量。这正引向最后一节：3DGS 的局限，以及它\emph{留给在线 SLAM 的那个接口}。
+
+% ════════════════════════════════════════════════════════════════
+\section{小结、局限与过渡：当位姿不再是常量}
+\label{sec:3dgs-limits}
+
+\subsection{本章在讲什么：一句话串起六步}
+
+3DGS 把“场景”表示成一堆\emph{各向异性三维高斯}，每个带位置 $\boldsymbol\mu_i$、形状 $\boldsymbol\Sigma_i=\mathbf R_i\mathbf S_i\mathbf S_i^\top\mathbf R_i^\top$、不透明度 $o_i$、球谐颜色 $\mathbf c_i$。渲染时把每个高斯经 EWA 投影成二维斑（$\boldsymbol\Sigma_i'=\mathbf J\mathbf W\boldsymbol\Sigma_i\mathbf W^\top\mathbf J^\top$）、按 tile 排序后 $\alpha$ 合成（$C=\sum_i\mathbf c_i\alpha_i T_i$）；训练时以光度损失反传、Adam 更新，并\emph{自适应地克隆 / 分裂 / 剪枝}高斯，把几千 SfM 种子养成百万级稠密场。一句话：\textbf{3DGS $=$ 用可微、可快速光栅化的高斯椭球集合，把“拟合辐射场”从 NeRF 的逐射线查询，换成逐图元泼溅。}
+
+\begin{table}[H]\centering
+\caption{本章知识点总表（难度：$\star$ 必学 / $\star\star$ 核心 / $\star\star\star$ 进阶）}
+\label{tab:3dgs-summary}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+知识点 & 关键式 / 标签 & 难度 & ROI \\
+\midrule
+高斯核与协方差 $\boldsymbol\Sigma_i=\mathbf A\mathbf A^\top$ & \cref{eq:3dgs-gaussian} & $\star\star$ & 骨干 \\
+协方差分解、为何存 $\mathbf s_i+\mathbf q_i$ & \cref{eq:3dgs-cov} & $\star\star$ & 骨干 \\
+EWA 投影与 $2\times2$ 降维 & \cref{eq:3dgs-proj,eq:3dgs-projjac} & $\star\star\star$ & 骨干 \\
+splatting vs.\ ray-casting & \cref{tab:3dgs-splat-vs-ray} & $\star\star$ & 骨干 \\
+球谐视相关颜色 & \cref{eq:3dgs-sh} & $\star\star$ & 次优 \\
+tile 光栅化与 $\alpha$ 合成 & \cref{eq:3dgs-blend} & $\star\star\star$ & 骨干 \\
+累积 $\alpha$ 反推（反传） & \cref{sec:3dgs-raster} & $\star\star\star$ & 次优 \\
+自适应密度控制（克隆 / 分裂） & \cref{alg:3dgs-opt} & $\star\star$ & 骨干 \\
+训练环、损失、激活、显式梯度 & \cref{eq:3dgs-loss} & $\star\star$ & 骨干 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{局限：三条软肋}
+
+3DGS 惊艳，但有三条结构性局限，每条都为下一章埋下问题：
+
+\begin{enumerate}
+  \item \textbf{需 SfM 先验}：整套管线\emph{假定相机位姿与稀疏点云已由 COLMAP 等 SfM 离线标定好}。位姿是\emph{常量}（你已在 \cref{sec:3dgs-code} 的 \texttt{viewmatrix} 见到），3DGS 只优化地图、\emph{从不估计位姿}。一旦没有 SfM 先验、或要在线一边走一边估位姿，原版 3DGS 直接失灵。
+  \item \textbf{popping 伪影}：tile 光栅化为求快，对\emph{每个 tile} 用一份按高斯\emph{中心深度}排的序、tile 内所有像素共用（\cref{sec:3dgs-raster}）。当视角连续变化、两个高斯的中心深度序\emph{突然互换}时，画面会“啪”地跳变一下（popping）——这是“按中心排序”这一近似的代价，在大幅运动下尤其可见。
+  \item \textbf{存储重}：百万级高斯，每个带位置 $+$ 协方差因子 $+$ 不透明度 $+$ 一大组 SH 系数（degree-3 是 $48$ 个/高斯），一个场景动辄数百 MB。这对内存有限的机器人、对要传输地图的多机系统（\cref{ch:magsslam}）都是负担。
+\end{enumerate}
+
+\begin{pitfall}[把“3DGS 重建得好”当成“3DGS 能定位”]
+\textbf{错误}：见 3DGS 渲得逼真、几何看着对，便以为它也能算位姿、能当 SLAM 用。\textbf{现象 / 后果}：误判系统能力边界——以为拿来就能在线跟踪，结果发现它\emph{根本不估位姿}、且没有 SfM 先验就跑不起来。\textbf{根因}：原版 3DGS 是\emph{离线、已知位姿}的新视角合成，位姿是输入常量、不是输出。\textbf{正确}：把 3DGS 看作一台优秀的\emph{可微地图引擎 / 渲染器}；要让它\emph{也}估位姿，需把 \texttt{viewmatrix} 从常量升格为待求变量、多挂一条位姿梯度链——那已是 \cref{ch:gsslam} 的事。
+\end{pitfall}
+
+\subsection{过渡：放开位姿，就跨进了在线 SLAM}
+
+\paragraph{留给下一章的那个接口。}
+回到本章反复出现的那个常量——\texttt{viewmatrix}，即相机位姿 $\mathbf T_{wc}$。在离线 3DGS 里它由 SfM 给定、焊死不动，优化器只对高斯参数 $\{\boldsymbol\mu_i,\boldsymbol\Sigma_i,o_i,\mathbf c_i\}$ 回传梯度、\emph{从不碰位姿}。一个再自然不过的追问是：\emph{如果位姿也不知道、要在线估呢？}
+
+这一问，就把我们推过了\emph{离线渲染}与\emph{在线 SLAM} 的分界线。答案的雏形其实已在本章：既然整条渲染管线\emph{可微}，那么只要把 $\mathbf T_{wc}$ 也注册成\emph{可微变量}、让光度损失的梯度\emph{也}反传到它，就能\emph{用渲染损失直接优化位姿}——这正是下一章 \cref{ch:gsslam} 的核心“渲染即跟踪”。届时要补的，不过是本章 \texttt{computeCov2D} 里那个常量 \texttt{viewmatrix} 升格为变量后\emph{多挂的一条 $\SE(3)$ 位姿雅可比}（建在 \cref{ch:lie} 的右扰动上）；而合成、投影、密度控制这套\emph{地图侧}的机器，原封不动地从本章继承下去。
+
+\begin{insight}[本章是“地图侧”，下一章接上“位姿侧”]
+把 3DGS 三连看成一条河：\textbf{本章（\cref{ch:3dgs}）}讲透\emph{地图侧}——高斯怎么定义、投影、上色、渲染、自增长、训练，位姿当常量。\textbf{下一章（\cref{ch:gsslam}）}放开位姿、接上\emph{位姿侧}——把渲染损失也反传到 $\mathbf T_{wc}$，于是“渲染即跟踪”，3DGS 从离线渲染器变成在线 SLAM 的地图。\textbf{再下一章（\cref{ch:magsslam}）}把单机高斯地图\emph{刚体搬运、跨机拼接}——靠的正是本章 \cref{eq:3dgs-cov} 那个\emph{显式}高斯（$\boldsymbol\mu_i,\boldsymbol\Sigma_i$ 可被一个变换矩阵闭式搬动，神经场做不到）。\textbf{所以“为何多机偏偏选高斯”的根，就埋在本章——显式、可微、可闭式刚体搬。}一句话收束：本章教你造好那块“可渲染的砖”，后两章教你\emph{一边走一边砌、还能多人合砌}。
+\end{insight}
+
+\section*{本章与后续章节的关系}
+\begin{itemize}
+  \item \textbf{承上}：本章是 \cref{sec:dense-radiance-gs}（把 3DGS 当地图表示的速写）的\emph{原理级深化}——同一组方程（协方差分解 / EWA / $\alpha$ 合成），这里从动机推到代码、用全新标签 \texttt{eq:3dgs-*}。也承 \cref{sec:dense-radiance-nerf}（NeRF 体渲染）的对照、\cref{sec:dense-surfel}（面元）的“可微升级”过渡。
+  \item \textbf{启下（\cref{ch:gsslam} 单机 GS-SLAM）}：放开位姿常量 $\to$ 渲染即跟踪，复用本章的地图侧机器，只多挂 $\SE(3)$ 位姿雅可比（\cref{ch:lie}）。本章 \cref{sec:3dgs-code} 的 \texttt{viewmatrix} 常量正是其入口。
+  \item \textbf{启下（\cref{ch:magsslam} 多机）}：多机拼图靠 \cref{eq:3dgs-cov} 的\emph{显式}高斯可闭式刚体搬运（$\boldsymbol\mu_i\!\leftarrow\!\mathbf R\boldsymbol\mu_i+\mathbf t,\ \boldsymbol\Sigma_i\!\leftarrow\!\mathbf R\boldsymbol\Sigma_i\mathbf R^\top$）；本章“为何选高斯”的论证（显式 / 可微 / 可搬）是其根基。
+\end{itemize}
+
+\section*{故障排查手册}
+\begin{table}[H]\centering
+\small
+\begin{tabular}{@{}p{0.26\textwidth}p{0.32\textwidth}p{0.34\textwidth}@{}}
+\toprule
+症状 & 可能原因 & 排查 / 相关节 \\
+\midrule
+训练几步后 loss 发散、出 NaN & 直接优化 $\boldsymbol\Sigma_i$ 元素破坏半正定；或尺度未经 $\exp$ 激活变负 & 改存 $\mathbf s_i+\mathbf q_i$、用 $\exp$/$\operatorname{sigmoid}$ 激活（\cref{sec:3dgs-store,sec:3dgs-opt}）\\
+高斯数指数膨胀、显存炸 & 只增密不剪枝 / 不重置；或克隆分裂判据搞反 & 按 \cref{alg:3dgs-opt}：梯度触发 $+$ 尺度定手术 $+$ 剪枝 $+$ 每 $3000$ 迭代重置不透明度（\cref{sec:3dgs-density}）\\
+渲染图“平均对但糊” & 纯 $L_1$ 损失、缺结构项 & 加 D-SSIM、$\lambda=0.2$（\cref{eq:3dgs-loss}）\\
+视野边缘 / 近相机高斯错位畸变 & EWA 是中心处一阶线性化、透视强处近似糙 & 接受为近似，配视锥剔除 $+$ 守卫带 $+$ 低通（\cref{sec:3dgs-proj}）\\
+视角连续变化时画面“啪”跳变 & popping：tile 按高斯中心深度排序、序突然互换 & 近似代价，可减小高斯 / 改进排序（\cref{sec:3dgs-limits}）\\
+新视角高光乱窜、稀疏视角过拟合 & SH 阶数过高、视相关分量过强 & 降到默认 degree-3 或更低、从低阶渐进激活（\cref{sec:3dgs-color}）\\
+想拿 3DGS 在线跟踪却跑不起来 & 原版需 SfM 先验、位姿是常量、不估位姿 & 放开 \texttt{viewmatrix} 为变量、挂位姿雅可比——见 \cref{ch:gsslam}（\cref{sec:3dgs-limits}）\\
+\bottomrule
+\end{tabular}
+\end{table}

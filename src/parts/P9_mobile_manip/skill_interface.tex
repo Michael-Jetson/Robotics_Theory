@@ -1,0 +1,525 @@
+\chapter{操作技能接口：从高层末端意图到全身可执行动作}\label{ch:mm-skill-interface}
+
+% ════════════════════════════════════════════════════════════════
+%  吸收 Tutorial 05_运动控制/30_复合/50_操作技能接口（理论与方法论部分）。
+%  主线：把「高层操作策略 → 末端 SE(3) 意图 → 全身控制器 → 关节动作」之间的
+%  接口当成一个可推导、可调试、可迁移的工程对象，而非一段消息格式。
+%  记号承 \cref{ch:lie}（Exp/Log/SO3/SE3 右扰动）、\cref{ch:unified-multimodal-mpc}
+%  （统一动力学与 SE(3) 末端代价）、\cref{ch:operational-space}（笛卡尔阻抗）。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的两张接口表与限速公式；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 一个视觉操作策略直接输出整机 $19$ 维关节目标，换到臂长、默认姿态、夹爪零位略有差异的另一台机器人后，同一组关节角还对应同一个抓取动作吗？为什么？
+  \item 末端世界位姿满足 ${}^{W}\mathbf{T}_{ee}={}^{W}\mathbf{T}_{B}\,{}^{B}\mathbf{T}_{ee}$。若高层下发的是\emph{机体系}末端目标 ${}^{B}\mathbf{T}_{ee}^{\mathrm{cmd}}$，当四足行走使基座姿态 ${}^{W}\mathbf{R}_{B}$ 抖动时，杯子附近的末端目标会发生什么？
+  \item 把两个姿态做“欧拉角逐分量相减”当成姿态误差，会在什么时候出问题？正确的 $\SO(3)$ 误差该怎么写？
+  \item 末端目标在一个控制周期内跳变了 $30$ 厘米，为什么不能让低层全身控制器“忠实跟踪”？谁该负责把它裁掉？
+  \item 机械臂逆运动学（IK）求出了到目标的一组关节解，是否就意味着四足或人形可以安全执行这个末端目标？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{论证}为何高层操作策略应输出\emph{与本体无关}的末端意图（末端 $\SE(3)$ 位姿/twist、夹爪命令、接触模式），而非整机关节向量；并据此区分“任务相关变量”与“本体相关变量”；
+  \item \textbf{推导} task-frame 与 body-frame 末端跟踪的坐标变换关系，证明 task-frame 目标对基座抖动\emph{一阶免疫}，并解释它对固定臂技能零样本迁移的意义；
+  \item \textbf{掌握}在 $\SE(3)$/$\SO(3)$ 上对末端轨迹做限速平滑（位置 clip、姿态 $\boldsymbol\delta=\mathrm{Log}(\mathbf R_0^\top\mathbf R_1)$ 限幅、$\mathbf R'=\mathbf R_0\,\mathrm{Exp}(\boldsymbol\delta')$），并说清为何不能对四元数逐分量裁剪；
+  \item \textbf{对比} RL-WBC、MPC-WBC、IK-QP 三类低层如何\emph{消费}同一末端命令，理解“几何可行 $\neq$ 动力学可行”，并写出阻抗/力控模式下的末端 wrench 与关节力矩映射 $\boldsymbol\tau_{ee}=\mathbf J_{ee}^\top\mathbf F$；
+  \item \textbf{设计}抓取流水线的有限状态机（接近/对齐/预抓取/闭合/提升/搬运/放置），为每个阶段配上控制模式与安全门，并用滞回避免阶段抖动；
+  \item \textbf{列出}固定臂操作技能迁移到移动基座所需的充分条件，并说明每个条件失效时的失败模式。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把高层关心的‘手要去哪’，安全地翻译成移动机器人能执行的全身动作}”的主线。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=5mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  saf/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (hi) {高层操作策略\\（任务意图）};
+\node[grp, right=of hi] (frame) {task-frame\\目标表达};
+\node[grp, right=of frame] (limit) {$\SE(3)$ 轨迹\\限速平滑};
+\node[saf, below=7mm of frame] (filt) {可行性 / 安全\\过滤（限幅·门槛）};
+\node[blk, right=of filt, fill=main!10, draw=main!60!black] (lo) {低层全身控制\\RL-WBC / MPC / IK-QP};
+\node[saf, below=7mm of filt] (fsm) {抓取 FSM\\（阶段 + 模式）};
+\draw[ln] (hi)--(frame); \draw[ln] (frame)--(limit);
+\draw[ln] (limit.south) -- ++(0,-3mm) -| (filt.north);
+\draw[ln] (filt)--(lo);
+\draw[ln] (fsm.east) -| (lo.south);
+\draw[ln] (fsm.north)--(filt.south);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:si-why} 先讲清“为什么需要这层接口”（动机与反面），是全章的认识论地基；\cref{sec:si-taskframe} 是\emph{理论核心}——task-frame 变换与对抖动的免疫，移动操作的零样本迁移全靠它；\cref{sec:si-smooth} 给出 $\SE(3)$ 上的限速平滑，是把高层离散输出接到高频低层的安全垫；\cref{sec:si-lowlevel} 讲低层如何消费命令、为何要做可行性过滤、以及阻抗/力控如何并入；\cref{sec:si-grasp} 把连续跟踪组织成完整抓取任务，并落到迁移条件。\cref{ch:lie} 的 $\mathrm{Exp}/\mathrm{Log}$ 与 \cref{sec:si-smooth} 焊接，\cref{ch:operational-space} 的笛卡尔阻抗与 \cref{sec:si-lowlevel} 焊接。
+
+\subsection*{前置知识桥接}
+本章把若干前置章的结论“拉到接口层”使用，而不重证：
+\begin{itemize}
+  \item \cref{ch:lie} 已建立 $\SO(3)/\SE(3)$ 的指数/对数映射 $\mathrm{Exp},\mathrm{Log}$、右扰动 $\mathbf R\,\mathrm{Exp}(\delta\boldsymbol\phi)$ 与位姿复合/求逆的闭式——本章用它在群上做误差、插值与限速；
+  \item \cref{ch:unified-multimodal-mpc} 给出复合机器人的统一动力学 \cref{eq:umm-core}，并把 $\SE(3)$ 末端误差 \cref{eq:umm-xierr} 写进了 MPC 代价——本章把“同一个末端误差”从 MPC \emph{内部}的代价，上提为高层与低层之间的\emph{接口约定}；
+  \item \cref{ch:operational-space} 给出笛卡尔阻抗与“末端 wrench $\to$ 关节力矩”的对偶 $\boldsymbol\tau=\mathbf J^\top\mathbf f$——本章用它实现接口里的阻抗/力控模式；
+  \item \cref{ch:mm-kinematics} 给出移动操作的联合运动学（底盘 $+$ 臂的联合雅可比 $\mathbf V_{ee}=[\mathbf J_b\ \mathbf J_a]\boldsymbol\nu$）——本章的低层把末端误差正是分配到“底盘/步态 $+$ 臂”这两组自由度上。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会把“高层策略输出什么”当成 ROS 消息字段的命名问题，于是把一个整机关节向量直接喂给低层——系统短期像端到端，长期却\emph{难迁移、难调试、难保证安全}（\cref{sec:si-why} 的反面案例）；
+  \item 你会在移动平台上直接复用固定臂学到的策略，却发现末端在物体附近反复抖——把锅甩给低层控制器，而真正的病根是\emph{目标表达在了晃动的身体上}（\cref{sec:si-taskframe}）；
+  \item 你会让神经策略“自己学会”不输出跳变轨迹、自己学会不撞，于是在遮挡或分布外输入下，末端突然冲向远处——因为缺了一层\emph{确定性}的限速与可行性过滤（\cref{sec:si-smooth,sec:si-lowlevel}）。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+基座（body）系记 $B$、世界系记 $W$、任务系（task-frame）记 $T$；位姿 ${}^{A}\mathbf{T}_{C}\in\SE(3)$ 读作“$C$ 系相对 $A$ 系的位姿”，满足复合律 ${}^{A}\mathbf{T}_{C}={}^{A}\mathbf{T}_{B}\,{}^{B}\mathbf{T}_{C}$。
+末端（end-effector）记 $ee$，其世界位姿 ${}^{W}\mathbf{T}_{ee}$、机体位姿 ${}^{B}\mathbf{T}_{ee}$。
+末端 $6$D 误差 $\boldsymbol\xi_{\mathrm{err}}\in\mathbb R^6$ 经 $\mathfrak{se}(3)$ 对数映射定义（沿用 \cref{eq:umm-xierr} 的左不变误差约定，$\boldsymbol\xi=[\boldsymbol\rho;\boldsymbol\phi]$，平移在前）。
+末端 wrench $\mathbf F\in\mathbb R^6$，笛卡尔刚度/阻尼 $\mathbf K,\mathbf D$，末端雅可比 $\mathbf J_{ee}$。
+高层下发的命令记 $(\cdot)^{\mathrm{cmd}}$；上标区分坐标系，例如 ${}^{T}\mathbf{T}_{ee}^{\mathrm{cmd}}$ 表示“在任务系中给定的末端目标”。
+所有连续物理量取 SI 单位，姿态量取弧度。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么需要一层操作技能接口}
+\label{sec:si-why}
+
+\paragraph{动机：操作策略与全身控制解决的是两个不同问题。}
+高层操作策略关心\emph{任务}：它从图像、语言、物体状态或人类演示中决定“末端该怎么动”——抓杯子、推门、擦桌、插孔。全身控制关心\emph{物理可行性}：它要在接触、摩擦、关节限位、力矩上界与平衡约束下，把这个末端意图真正执行出来。固定基座机械臂时，这两件事的耦合很弱，可以混在一起；一旦上了移动底盘、四足或人形，脚下接触不再固定、身体姿态会被末端动作反扰，二者必须\emph{显式分层}，中间用一层契约连接。
+
+\paragraph{反面：高层直接输出整机关节目标会把麻烦留给未来。}
+设想一个视觉策略直接输出 $19$ 自由度（四足 $12$ $+$ 臂 $6$ $+$ 夹爪 $1$）的关节目标，并在某个仿真里训得很好。它至少有三处脆弱：
+\begin{enumerate}
+  \item \textbf{跨平台不迁移}：换一台臂长、默认姿态、夹爪零位略不同的机器人，同一组关节角不再对应同一个末端行为。甚至同一台机器人，只要基座姿态有差，同一组臂关节角在世界系里的末端位置也变了——高层被迫去学\emph{本应由低层吸收}的本体差异。
+  \item \textbf{失败难定位}：关节动作没有任务语义。任务失败时，你很难判断是视觉认错、目标不可达、腿没站稳，还是某个关节超限。若高层输出的是末端 $\SE(3)$ 目标，则“目标是否合理 / 是否可达 / 是否被低层跟住”可以分别检查。
+  \item \textbf{安全无处插手}：把限速、自碰撞、支撑裕度这些安全逻辑塞进一个端到端关节策略里，既难训也难验证。
+\end{enumerate}
+
+\paragraph{历史：从“先到位、再抓取”到“边走边操作”。}
+传统工业臂在固定基座上工作，操作规划只需考虑臂的工作空间。移动操作早期把问题切成两层：底盘导航到物体附近\emph{停稳}，再由机械臂规划抓取。四足臂与人形把问题再推进一步——机器人不是停稳后操作，而是在移动、平衡与接触中操作。一类有代表性的思路（如把固定臂上学到的技能搬到腿式平台的工作，UMI-on-Legs\cite{ha2024umi}）的关键洞见是：\emph{操作技能可以只输出任务系中的末端轨迹，由移动平台的低层全身控制器负责把它执行出来}。这就把“操作技能”与“移动平衡”解耦——Diffusion Policy、ACT、VLA 或遥操作只要遵守末端轨迹接口，就能接入同一套低层。
+
+\begin{insight}[接口的本质是任务变量的选择]
+设全身状态 $\mathbf x=(\mathbf q,\mathbf v)$。高层若输出关节动作，等于选了关节空间任务变量 $\mathbf y=\mathbf q_{\mathrm{act}}$；若输出末端轨迹，等于选了操作空间任务变量 $\mathbf y={}^{T}\mathbf{T}_{ee}\in\SE(3)$。二者由正运动学 ${}^{W}\mathbf{T}_{ee}=f_{\mathrm{kin}}(\mathbf q)$ 相连。\textbf{好的接口不是把信息传得越多越好，而是把任务相关与本体相关的变量分开}：高层表达任务意图，低层承担本体差异与物理可行性。抓杯子关心的是夹爪相对杯子的位姿，而不是第 $3$ 个肩关节转了多少度。
+\end{insight}
+
+\paragraph{接口的三层含义。}
+只发一个 \verb|target_pose| 是不够的。一份完整的操作接口契约至少跨越三层——几何（目标在哪）、时间（何时到）、物理（能否执行）：
+
+\begin{table}[H]\centering\small
+\caption{操作技能接口的三层契约。只有几何层是不够的。}
+\label{tab:si-contract}
+\begin{tabular}{lll}
+\toprule
+层次 & 回答的问题 & 典型字段 \\
+\midrule
+几何接口 & 目标在哪个坐标系、什么位姿 & frame、$\SE(3)$ pose、twist \\
+时间接口 & 何时到达、是轨迹第几帧 & 时间戳 stamp、时域 $H$、步长 $\Delta t$ \\
+物理接口 & 是否允许接触、是否可执行 & 速度上界、控制模式、刚度、有效标志 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[思维陷阱：把接口当成软件格式问题]
+新手常以为接口只是 ROS message 或 Python dict 的字段命名，于是先定消息格式、再补语义。实际上\textbf{接口选择先于格式}：它决定了任务变量、控制分工与迁移能力。应当\emph{先}从控制理论与任务语义确定“传末端 $\SE(3)$ 还是传关节”“目标定义在哪个系”“是否需要力控模式”，\emph{再}去写消息字段。另一个相关误区是“端到端就是没有接口”——即便用端到端视觉策略，真实系统仍需要时间戳、限幅、可行性检查与回退；端到端可以延伸到“感知 $\to$ 目标生成”，但控制执行始终需要明确边界。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{Task-frame 与 body-frame 末端跟踪}
+\label{sec:si-taskframe}
+
+\paragraph{动机：目标应绑定任务，而不是绑定晃动的身体。}
+固定臂的基座不动，“末端相对基座的目标”与“末端相对世界的目标”几乎等价。移动机器人不同：四足或人形行走时，基座有平移、转动与高频晃动。但杯子、门把手、抽屉、桌面\emph{不会}跟着机器人身体晃。于是操作目标更自然地定义在\emph{任务系}（task-frame）——它可以是物体系、桌面系、门系，或一个世界局部系。低层负责把任务系目标换算成“当前基座下的可执行目标”。
+
+\begin{derivation}[body-frame 目标对基座抖动不免疫]
+设高层要求末端在基座前方固定位置 ${}^{B}\mathbf p_{ee}^{\mathrm{cmd}}=[0.5,\,0,\,0.2]^\top$（米）。其世界系目标为
+\begin{equation}
+  {}^{W}\mathbf p_{ee}^{\mathrm{cmd}}={}^{W}\mathbf p_{B}+{}^{W}\mathbf R_{B}\,{}^{B}\mathbf p_{ee}^{\mathrm{cmd}}.
+  \label{eq:si-bodyworld}
+\end{equation}
+考察基座绕 $\mathbf z$ 轴（yaw）的小抖动 ${}^{W}\mathbf R_{B}\leftarrow{}^{W}\mathbf R_{B}\,\mathrm{Exp}(\delta\psi\,\mathbf e_z)$。对 \cref{eq:si-bodyworld} 在 $\delta\psi=0$ 处取一阶（用 $\mathrm{Exp}(\delta\psi\,\mathbf e_z)\approx\mathbf I+\delta\psi\,\mathbf e_z^\wedge$）：
+\begin{equation}
+  \delta\big({}^{W}\mathbf p_{ee}^{\mathrm{cmd}}\big)\approx{}^{W}\mathbf R_{B}\,(\delta\psi\,\mathbf e_z^\wedge)\,{}^{B}\mathbf p_{ee}^{\mathrm{cmd}}
+  =\delta\psi\;{}^{W}\mathbf R_{B}\big(\mathbf e_z\times{}^{B}\mathbf p_{ee}^{\mathrm{cmd}}\big).
+  \label{eq:si-jitter}
+\end{equation}
+其量级正比于基座抖动 $\delta\psi$ 乘以末端到基座的水平力臂 $\|\mathbf e_z\times{}^{B}\mathbf p_{ee}^{\mathrm{cmd}}\|$。这里力臂约 $0.5$ m，故\emph{毫弧度级}的基座抖动就会在末端目标上产生\emph{毫米级}的世界系晃动。低层会忠实跟踪这个晃动目标，结果是末端在杯子附近来回摆——这不是低层不够好，而是\emph{目标表达错了}。
+\end{derivation}
+
+\paragraph{task-frame 跟踪的核心变换。}
+记基座世界位姿 ${}^{W}\mathbf{T}_{B}$（来自状态估计）、任务系世界位姿 ${}^{W}\mathbf{T}_{T}$（来自视觉/SLAM/物体检测）。Body-frame 控制给定 ${}^{B}\mathbf{T}_{ee}^{\mathrm{cmd}}$，其世界目标 ${}^{W}\mathbf{T}_{ee}^{\mathrm{cmd}}={}^{W}\mathbf{T}_{B}\,{}^{B}\mathbf{T}_{ee}^{\mathrm{cmd}}$ 随基座变化。Task-frame 控制改为给定 ${}^{T}\mathbf{T}_{ee}^{\mathrm{cmd}}$，其世界目标
+\begin{equation}
+  {}^{W}\mathbf{T}_{ee}^{\mathrm{cmd}}={}^{W}\mathbf{T}_{T}\,{}^{T}\mathbf{T}_{ee}^{\mathrm{cmd}}
+  \label{eq:si-taskworld}
+\end{equation}
+只要任务系绑在桌面或物体上、不随机器人晃动，就\emph{与基座姿态无关}。低层每个周期把它换算回当前基座系下的等效目标：
+\begin{equation}
+  \boxed{\;{}^{B}\mathbf{T}_{ee}^{\mathrm{cmd}}=\big({}^{W}\mathbf{T}_{B}\big)^{-1}\,{}^{W}\mathbf{T}_{T}\,{}^{T}\mathbf{T}_{ee}^{\mathrm{cmd}}.\;}
+  \label{eq:si-task2base}
+\end{equation}
+\cref{eq:si-task2base} 是 task-frame 跟踪的核心：基座一抖，${}^{B}\mathbf{T}_{ee}^{\mathrm{cmd}}$ 会\emph{反向}随之变化，恰好抵消，从而保持世界系目标稳定——抖动被“吸收”进了低层对臂关节的补偿里。
+
+\begin{proposition}[task-frame 对基座运动的不变性]\label{prop:si-invariance}
+若任务系世界位姿 ${}^{W}\mathbf{T}_{T}$ 与任务系下的命令 ${}^{T}\mathbf{T}_{ee}^{\mathrm{cmd}}$ 均不依赖基座位姿 ${}^{W}\mathbf{T}_{B}$，则由 \cref{eq:si-taskworld} 给出的世界系末端目标 ${}^{W}\mathbf{T}_{ee}^{\mathrm{cmd}}$ 对 ${}^{W}\mathbf{T}_{B}$ 的任意变化保持不变；从而由 \cref{eq:si-task2base} 算得的基座系目标随基座做\emph{精确}补偿，使世界系跟踪目标不受基座抖动影响（理想状态估计下成立）。
+\end{proposition}
+\begin{proof}
+直接由 \cref{eq:si-taskworld}：右端不含 ${}^{W}\mathbf{T}_{B}$，故 $\partial\,{}^{W}\mathbf{T}_{ee}^{\mathrm{cmd}}/\partial\,{}^{W}\mathbf{T}_{B}=\mathbf 0$。而 \cref{eq:si-task2base} 是同一个世界系目标在当前基座系下的表达 $({}^{W}\mathbf{T}_{B})^{-1}\,{}^{W}\mathbf{T}_{ee}^{\mathrm{cmd}}$，故世界系目标恒定。注意结论依赖“${}^{W}\mathbf{T}_{B}$ 准确”这一前提：状态估计延迟或漂移会把这份不变性打折扣（见下方陷阱）。
+\end{proof}
+
+\paragraph{末端误差：必须用 $\SE(3)$ 对数，不能逐分量减。}
+无论在世界系还是基座系算误差，姿态部分都要走群上的对数映射。沿用 \cref{eq:umm-xierr} 的左不变误差，
+\begin{equation}
+  \boldsymbol\xi_{\mathrm{err}}=\mathrm{Log}\!\big(({}^{W}\mathbf{T}_{ee})^{-1}\,{}^{W}\mathbf{T}_{ee}^{\mathrm{cmd}}\big)^{\vee}\in\mathbb R^6,
+  \label{eq:si-xierr}
+\end{equation}
+它表达在当前末端（body）系中、其微分轨迹与参考无关，正是 MPC 与状态估计偏好的性质。\cref{ch:unified-multimodal-mpc} 把它放进了 MPC 代价 $J_{ee}=\tfrac12\boldsymbol\xi_{\mathrm{err}}^\top\mathbf Q_{ee}\boldsymbol\xi_{\mathrm{err}}$；本章把“同一个 $\boldsymbol\xi_{\mathrm{err}}$”从 MPC 内部上提为高层接口约定——高层下发的不是“某个关节角”，而是“某个任务系中的 $\SE(3)$ 轨迹”，误差始终在群上定义。
+
+\begin{table}[H]\centering\small
+\caption{常见操作任务的 task-frame 选择。task-frame 不是唯一的，可分阶段切换。}
+\label{tab:si-taskframe-choice}
+\begin{tabular}{lll}
+\toprule
+任务 & 推荐 task-frame & 原因 \\
+\midrule
+抓杯子 & 杯子系或桌面局部系 & 抓取几何与物体绑定 \\
+推门 & 门铰链或门把手系 & 法向/切向清晰，便于分解力位 \\
+擦桌子 & 桌面系 & 法向力与切向轨迹自然分离 \\
+搬运物体 & 世界局部系或物体初始系 & 目标不随机器人晃动 \\
+遥操作 & 操作者手柄初始系 & 手势相对运动稳定 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent task-frame 可分阶段切换：抓取前用物体系，抓住后切到夹爪或搬运目标系，放置时再切到桌面放置区域系——切换时必须保持轨迹连续，否则末端会在切换瞬间跳变。
+
+\paragraph{task-frame 不替代 WBC，只是给它一个更稳的目标。}
+task-frame 只定义“目标在哪”。低层全身控制仍要处理末端跟踪、支撑脚不滑、基座姿态稳定、关节限位、自碰撞、力矩限制与接触模式切换。task-frame 给低层一个\emph{更稳定、更任务相关}的目标，低层仍可拒绝或修正不可行目标：目标过远时 saturate；目标导致自碰撞时降级为保持当前末端；目标需要基座前移时，把末端误差转化为底盘或步态命令——后者正是 \cref{ch:mm-kinematics} 联合雅可比 $\mathbf V_{ee}=[\mathbf J_b\ \mathbf J_a]\boldsymbol\nu$ 在做的事：末端误差在“底盘 $+$ 臂”的零空间里分配。
+
+\begin{insight}[task-frame 与零样本迁移的反事实]
+若用 body-frame 承接固定臂学到的策略：固定臂训练时基座永远不动，策略看到的是“目标相对基座静止”的分布；移动部署时基座不断动，目标相对基座持续变化——策略被迫在\emph{训练分布之外}工作，零样本迁移随之破裂。task-frame 的作用，正是把基座抖动吸收进低层，让高层始终停留在“物体附近怎么动手”这个\emph{相对稳定}的问题上。这也是固定臂技能能迁到腿式平台的数学前提。
+\end{insight}
+
+\begin{pitfall}[左右乘顺序写反 / 误以为 task-frame $=$ world-frame / 误以为 task-frame 能消除一切抖动]
+其一，$\SE(3)$ 变换\emph{不交换}：把 ${}^{W}\mathbf{T}_{B}\,{}^{B}\mathbf{T}_{ee}$ 写成 ${}^{B}\mathbf{T}_{ee}\,{}^{W}\mathbf{T}_{B}$ 会让目标方向完全错乱。务必在变量名里写清上下标（如 \verb|T_W_B|、\verb|T_B_ee|），让“相邻下标对消”成为可读的检查。其二，task-frame 不等于 world-frame——world-frame 只是 task-frame 的一种特例，物体系、桌面系、门系、工具系、手柄初始系都是合法 task-frame。其三，\cref{prop:si-invariance} 的不变性依赖“${}^{W}\mathbf{T}_{B}$ 准确且与 ${}^{W}\mathbf{T}_{T}$ 同步”：若 ${}^{W}\mathbf{T}_{B}$ 是当前时刻、${}^{W}\mathbf{T}_{T}$ 是 $100$ ms 前的视觉估计，二者\emph{不能直接相乘}——状态估计延迟、任务系漂移、低层带宽不足都仍会带来抖动。task-frame 只是第一步，仍需时间同步、滤波与阻抗调节。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{\texorpdfstring{$\SE(3)$}{SE(3)} 轨迹的限速与平滑}
+\label{sec:si-smooth}
+
+\paragraph{动机：高层是离散、低频、可能跳变的，低层是连续、高频、要求平滑的。}
+Diffusion Policy、VLA 的推理频率（如 $10$ Hz）通常远低于低层控制频率（如 $100$ Hz）；遮挡、分布外输入、采样噪声还会让高层偶尔吐出突变目标。若让低层忠实跟踪一次 $30$ 厘米的跳变，末端会冲向远处。因此在高层与低层之间需要一层\emph{确定性}的限速平滑，把传给低层的目标约束在物理合理的单步变化内。它\emph{不替代}低层控制器，只保证喂进去的目标不跳变。
+
+\paragraph{位置：欧氏空间内直接 clip。}
+设上一周期末端位置 $\mathbf p_{\mathrm{prev}}$、本周期目标 $\mathbf p_{\mathrm{cmd}}$、速度上界 $v_{\max}$、步长 $\Delta t$。限幅后的位置增量
+\begin{equation}
+  \Delta\mathbf p=\operatorname{clip}\big(\mathbf p_{\mathrm{cmd}}-\mathbf p_{\mathrm{prev}},\,v_{\max}\Delta t\big)
+  =\big(\mathbf p_{\mathrm{cmd}}-\mathbf p_{\mathrm{prev}}\big)\cdot\min\!\Big(1,\;\tfrac{v_{\max}\Delta t}{\|\mathbf p_{\mathrm{cmd}}-\mathbf p_{\mathrm{prev}}\|}\Big),
+  \label{eq:si-poslimit}
+\end{equation}
+新位置 $\mathbf p'=\mathbf p_{\mathrm{prev}}+\Delta\mathbf p$。注意按\emph{向量模长}缩放而非逐分量裁剪，否则会改变运动方向。
+
+\begin{derivation}[姿态：在 $\SO(3)$ 上限速，而非对四元数逐分量裁]
+姿态\emph{不能}像位置那样逐分量减。给定当前姿态 $\mathbf R_0$ 与目标姿态 $\mathbf R_1$，二者之差是一个\emph{相对旋转}，其轴角即李代数元素
+\begin{equation}
+  \boldsymbol\delta=\mathrm{Log}\big(\mathbf R_0^\top\mathbf R_1\big)\in\mathbb R^3,
+  \label{eq:si-rotdelta}
+\end{equation}
+$\|\boldsymbol\delta\|$ 是两姿态间的测地（最短）转角。限制单步转角不超过 $\omega_{\max}\Delta t$：
+\begin{equation}
+  \boldsymbol\delta'=
+  \begin{cases}
+    \boldsymbol\delta, & \|\boldsymbol\delta\|\le\omega_{\max}\Delta t,\\[2pt]
+    \boldsymbol\delta\,\dfrac{\omega_{\max}\Delta t}{\|\boldsymbol\delta\|}, & \text{otherwise},
+  \end{cases}
+  \label{eq:si-rotlimit}
+\end{equation}
+再映回群得到新姿态
+\begin{equation}
+  \mathbf R'=\mathbf R_0\,\mathrm{Exp}(\boldsymbol\delta').
+  \label{eq:si-rotnew}
+\end{equation}
+\cref{eq:si-rotnew} 的更新形如 $\mathbf R_0\,\mathrm{Exp}(\cdot)$，正是 \cref{ch:lie} 的\emph{右扰动}——增量定义在 $\mathbf R_0$ 的局部系中，沿测地线匀速插值，结果始终是合法旋转。
+\end{derivation}
+
+\begin{pitfall}[为什么不能对四元数逐分量 clip]
+单位四元数位于 $S^3$ 球面上。对其四个分量分别做线性裁剪，几乎一定会让结果\emph{离开球面}，得到非单位四元数、对应非正交“旋转矩阵”，姿态随之缓慢漂移；同理，欧拉角逐分量限幅会在接近万向锁时给出毫无意义的“增量”，并可能产生 $\pm\pi$ 跳变。正确做法只有一条：把姿态差化为 $\SO(3)$ 上的测地增量 $\boldsymbol\delta$（\cref{eq:si-rotdelta}），在切空间里限幅（\cref{eq:si-rotlimit}），再用 $\mathrm{Exp}$ 映回（\cref{eq:si-rotnew}）。这也解释了 \cref{sec:si-taskframe} 为何坚持用 $\SE(3)$ 对数定义误差——群上的运算天然避开了这些坑。
+\end{pitfall}
+
+\paragraph{轨迹窗口与缓冲：用预瞄补低层与基座运动。}
+只发当前单点目标，低层不知道目标接下来怎么变，只能被动追赶。更好的做法是发一段未来轨迹窗口
+\begin{equation}
+  \mathcal Y_{t:t+H}=\Big\{\big({}^{T}\mathbf{T}_{ee}^{\mathrm{cmd}}(t+k\Delta t),\;g(t+k\Delta t),\;m(t+k\Delta t)\big)\Big\}_{k=0}^{H-1},
+  \label{eq:si-window}
+\end{equation}
+其中 $g$ 是夹爪命令、$m$ 是控制模式。低层可取第一帧作为当前跟踪点，也可把整窗输入策略做预瞄——移动平台据此\emph{提前}补偿基座运动（这正是 UMI-on-Legs 给低层未来 EE 窗口的用意）。由于高层 $10$ Hz、低层 $100$ Hz，工程上维护一个命令缓冲：高层每次写入一段未来轨迹，低层按当前时间从中插值取目标（位置线性插值、姿态用 \cref{eq:si-rotnew} 式的 $\SO(3)$ 插值）；高层短暂超时则继续执行缓冲中的安全轨迹，缓冲耗尽则进入保持或回退（\cref{sec:si-grasp}）。
+
+\begin{codebox}[text]{接口层:末端命令的限速平滑（确定性，置于高层与低层之间）}
+function limit_command(p_prev, R_prev, p_cmd, R_cmd, v_max, w_max, dt):
+    # 位置:按模长缩放，不改方向（式 \ref{eq:si-poslimit}）
+    dp        = p_cmd - p_prev
+    p_new     = p_prev + dp * min(1, v_max*dt / (norm(dp)+eps))
+
+    # 姿态:在 SO(3) 上限速（式 \ref{eq:si-rotdelta}-\ref{eq:si-rotnew}）
+    delta     = Log(R_prev^T @ R_cmd)          # 测地增量(轴角) in R^3
+    angle     = norm(delta)
+    if angle > w_max*dt:
+        delta = delta * (w_max*dt / angle)     # 切空间内限幅
+    R_new     = R_prev @ Exp(delta)            # 右扰动映回群
+
+    return p_new, R_new                        # 始终为合法 SE(3)
+\end{codebox}
+
+% ════════════════════════════════════════════════════════════════
+\section{低层全身控制如何消费末端命令}
+\label{sec:si-lowlevel}
+
+\paragraph{动机：低层不是轨迹播放器。}
+若低层只是回放关节轨迹，移动平台上的操作很容易失败：脚下接触在变、基座姿态在变、末端目标可能被高层延迟污染、物体接触会产生外力。低层必须在\emph{每个}控制周期重新解释末端命令——决定如何把末端误差分配到腿、腰、臂与基座，并决定不可行时如何降级。一个共同框架是：先用统一动力学 \cref{eq:umm-core}
+\[
+  \mathbf M(\mathbf q)\dot{\mathbf v}+\mathbf h=\mathbf S^\top\boldsymbol\tau+\textstyle\sum_{i\in\mathcal C}\mathbf J_{c,i}^\top\boldsymbol\lambda_i+\mathbf J_{ee}^\top\mathbf f_{ee}
+\]
+描述“腿 $+$ 臂 $+$ 浮基”的全部刚体物理（$\mathbf S=[\,\mathbf 0\ \mathbf I\,]$ 前 $6$ 列为零，对应不可直接驱动的浮基），低层在此约束下消费末端命令。
+
+\begin{table}[H]\centering\small
+\caption{三类低层对同一末端命令的消费方式。它们可共享同一接口、甚至混合使用。}
+\label{tab:si-lowlevel}
+\begin{tabular}{p{2.0cm}p{3.3cm}p{2.6cm}p{2.9cm}}
+\toprule
+低层类型 & 末端命令进入的方式 & 输出 & 取舍 \\
+\midrule
+RL-WBC & 把 $\boldsymbol\xi_{\mathrm{err}}$ 或未来窗口加入观测 & 关节位置目标 & 频率高、能学耦合；约束靠奖励/终止隐式表达 \\
+MPC-WBC & 写成代价 $\ell_{ee}=\tfrac12\|\boldsymbol\xi_{\mathrm{err}}\|_{\mathbf Q_{ee}}^2$ & 接触力/基座轨迹/臂速度参考 & 约束显式、可解释；实时求解成本高 \\
+IK-QP & 速度层最小二乘跟踪 $\dot{\mathbf x}_{ee}^{\mathrm{cmd}}$ & 关节速度/位置 & 简单可解释；不含动力学/接触，仅查几何可达 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{RL-WBC 的消费。}
+RL 低层把末端命令并入观测：可加入当前误差 $\boldsymbol\xi_0=\mathrm{Log}(({}^{W}\mathbf{T}_{ee})^{-1}\,{}^{W}\mathbf{T}_{ee}^{\mathrm{cmd}}(t))^\vee$，也可加入未来窗口 $[\boldsymbol\xi_0,\boldsymbol\xi_1,\dots,\boldsymbol\xi_{H-1}]$（让策略知道末端将去哪）。策略输出全身关节位置目标，奖励里含末端跟踪、基座稳定、动作平滑与安全项。优点是高频；代价是约束靠训练学习与终止惩罚\emph{隐式}表达，不如 QP 显式。
+
+\paragraph{MPC-WBC 的消费。}
+MPC 把末端命令写成代价 $\ell_{ee}=\tfrac12\|\mathrm{Log}(({}^{W}\mathbf{T}_{ee})^{-1}\,{}^{W}\mathbf{T}_{ee}^{\mathrm{cmd}})\|_{\mathbf Q_{ee}}^2$，同时保留质心动量、摩擦锥、接触模式与自碰撞约束（皆见 \cref{ch:unified-multimodal-mpc}）。它输出较低频参考（接触力、基座轨迹、臂速度），由高频 WBC 转成关节力矩。更可解释，但四足臂/人形的实时求解很重，工程上常把 MPC 当慢速规划、WBC 或 RL 当快速执行。
+
+\paragraph{IK-QP 的消费。}
+IK-QP 在速度层求解
+\begin{equation}
+  \min_{\dot{\mathbf q}}\ \big\|\mathbf J_{ee}\dot{\mathbf q}-\dot{\mathbf x}_{ee}^{\mathrm{cmd}}\big\|^2+\lambda\|\dot{\mathbf q}\|^2
+  \quad\text{s.t.}\quad \dot{\mathbf q}_{\min}\le\dot{\mathbf q}\le\dot{\mathbf q}_{\max},
+  \label{eq:si-ikqp}
+\end{equation}
+其中阻尼项 $\lambda\|\dot{\mathbf q}\|^2$ 即 \cref{thm:ak-dls} 的阻尼最小二乘（DLS），在奇异/冗余处给出有界解（冗余与零空间见 \cref{sec:ak-redundancy}、奇异见 \cref{sec:ak-singularity}）；可再加关节居中、自碰撞近似与基座保持项。IK-QP 对固定臂常用，但对四足臂单靠 IK\emph{不足以}保证足端接触与基座稳定，更适合做高层命令的\emph{可达性预检}或站立慢速操作的基线。
+
+\begin{pitfall}[“IK 成功”不等于“全身可行”]
+最常见的误判：只要臂能 IK 到目标，就认为整机任务可执行。IK 只回答\emph{几何}可行性（关节空间存在解），它\emph{不考虑}足端摩擦锥、支撑多边形、接触力分配与基座动力学稳定。一个 IK 完全可达的末端目标，可能要求质心移出支撑域而让机器人摔倒。正确的层级是：IK 查几何可达 $\Rightarrow$ 全身控制（WBC/MPC）查动力学可行。因此低层必须有权\emph{拒绝}危险目标，并通过接口把 status（被限幅/拒绝/降级）回传给高层——不可行目标\emph{不必}强行追踪。
+\end{pitfall}
+
+\paragraph{执行前的可行性过滤。}
+低层在调用策略\emph{之前}应先过滤命令——策略不该直接面对未过滤的高层输出：
+
+\begin{table}[H]\centering\small
+\caption{低层消费末端命令前的可行性过滤。失败时温和降级，而非非黑即白。}
+\label{tab:si-feasibility}
+\begin{tabular}{lll}
+\toprule
+检查项 & 方法 & 失败处理 \\
+\midrule
+工作空间 & 末端距离 / IK 残差 & 限幅或拒绝 \\
+关节限位 & 预测 IK 解 & 投影到安全范围 \\
+自碰撞 & 几何最近距离 & 停止臂运动或绕行 \\
+支撑裕度 & 质心到支撑边界距离 & 降低末端跟踪权重 \\
+速度限制 & $\|\Delta\mathbf x\|/\Delta t$ & 轨迹限速（\cref{eq:si-poslimit}） \\
+目标年龄 & 当前时间 $-$ stamp & 丢弃过旧命令 \\
+置信度 & 高层 confidence & 保持或减速 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{阻抗与力控模式：很多操作不是纯位置跟踪。}
+推门要沿法向施力，擦桌要保持法向压力，插孔要低刚度以免卡死。故接口须含模式 $m$ 与刚度 $\mathbf K$。笛卡尔阻抗目标（承 \cref{ch:operational-space}）
+\begin{equation}
+  \mathbf F_{\mathrm{cmd}}=\mathbf K(\mathbf x_{\mathrm{cmd}}-\mathbf x)+\mathbf D(\dot{\mathbf x}_{\mathrm{cmd}}-\dot{\mathbf x})+\mathbf F_{\mathrm{ff}},
+  \label{eq:si-impedance}
+\end{equation}
+低层再经静力学对偶把末端 wrench 转成关节广义力或 WBC 任务：
+\begin{equation}
+  \boldsymbol\tau_{ee}=\mathbf J_{ee}^\top\mathbf F_{\mathrm{cmd}}.
+  \label{eq:si-tau}
+\end{equation}
+\cref{eq:si-tau} 是 $\boldsymbol\tau=\mathbf J^\top\mathbf f$ 在末端的实例——它正是 \cref{eq:umm-core} 里 $\mathbf J_{ee}^\top\mathbf f_{ee}$ 项的“主动施力”一侧。对 RL 低层，刚度 $\mathbf K$ 可作为观测，让策略在低刚度模式更柔顺、高刚度模式更精确。
+
+\begin{insight}[力--位混合：选择矩阵活在 task-frame 里]
+有的任务需要“某些方向力控、其余方向位控”（擦桌：法向力控、切向位控；开抽屉：拉出方向力控、其余对齐）。经典做法是选择矩阵 $\mathbf S\in\{0,1\}^{6\times6}$（对角，$S_{ii}=1$ 为力控）：
+\[
+  \mathbf F_{\mathrm{cmd}}=\mathbf S\,\mathbf f_{\mathrm{des}}+(\mathbf I-\mathbf S)\big(\mathbf K(\mathbf x_{\mathrm{cmd}}-\mathbf x)+\mathbf D(\dot{\mathbf x}_{\mathrm{cmd}}-\dot{\mathbf x})\big).
+\]
+关键在于：$\mathbf S$ 的方向应定义在 \emph{task-frame}（如桌面系 $z$ 轴为法向）而非世界系或机体系——这把 \cref{sec:si-taskframe} 的 task-frame 选择从“影响位置跟踪”推广到“同时决定力--位分解的方向”。选错 task-frame 会让力控与位控方向混淆。力--位混合的完整谱系（含 Mason/Raibert--Craig/Hogan 与无源性）见 \cref{ch:force-wbc}；而\emph{无接触时启用力控极其危险}——力控器会持续增大位移去够到目标力，前方没有物体时末端会一直前冲直到撞上或到达关节极限，故力控必须在确认接触（如末端力 $>2$ N）后才激活。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{抓取流水线与跨平台迁移}
+\label{sec:si-grasp}
+
+\paragraph{动机：抓取不是一个目标点。}
+“把夹爪移到物体位置然后闭合”是过度简化。真实抓取要：接近物体、对齐抓取轴、控速逼近（别撞飞物体）、闭合并判断是否抓住、提升并保持平衡、搬运到目标、放置并松开。每个阶段的控制模式、容错与安全检查都不同。因此抓取应由\emph{有限状态机}（FSM）组织——FSM 不是退回传统规划，而是把各阶段的离散事件与安全约束\emph{显式化}，让连续控制器只负责当前阶段的物理执行；每阶段的目标仍可由高层策略给出。
+
+\begin{table}[H]\centering\small
+\caption{抓取流水线的典型阶段、控制模式与主要风险。}
+\label{tab:si-grasp-stages}
+\begin{tabular}{llll}
+\toprule
+阶段 & 目标 & 控制模式 & 主要风险 \\
+\midrule
+Search & 找到物体与任务系 & 感知更新 & 目标漂移 \\
+Approach & 末端到预抓取位 & 位置控制 & 速度过快 \\
+Align & 夹爪姿态对齐抓取轴 & 姿态控制 & 关节限位 \\
+Pregrasp & 逼近接触前位 & 低速位置 & 撞到物体 \\
+Close & 夹爪闭合 & 夹爪力/位置 & 夹空或夹碎 \\
+Lift & 提升物体 & 位置 $+$ 稳定 & 负载扰动 \\
+Transport & 搬运 & task-frame 跟踪 & 基座晃动 \\
+Place & 放置 & 低速位置/阻抗 & 撞桌面 \\
+Release & 松开 & 夹爪控制 & 物体滑落 \\
+Retreat & 后撤 & 位置控制 & 二次碰撞 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{预抓取位：别把目标直接设成物体中心。}
+直接瞄物体中心通常会撞。应先到一个\emph{预抓取位}，再沿接近方向低速贴近：
+\begin{equation}
+  \mathbf{T}_{\mathrm{pre}}=\mathbf{T}_{\mathrm{obj}}\,\mathbf{T}_{\mathrm{grasp}}\,\mathbf{T}_{\mathrm{offset}},
+  \label{eq:si-pregrasp}
+\end{equation}
+其中 $\mathbf{T}_{\mathrm{grasp}}$ 是物体相对夹爪的理想抓取变换，$\mathbf{T}_{\mathrm{offset}}$ 是沿接近方向（如夹爪 $x$ 轴）后退一小段（如 $10$ cm）。低层先到 $\mathbf{T}_{\mathrm{pre}}$，再沿接近方向低速靠近——这能显著减小撞击。
+
+\paragraph{抓取确认：别只看时间或夹爪是否闭合。}
+夹爪闭合\emph{不等于}抓住：可能夹空、夹偏或夹住后滑落。应综合多信号判断——夹爪位置（是否到闭合目标）、夹爪速度（是否被物体挡住）、电机电流/力（是否产生夹持力）、物体运动（是否被带动）、末端力（接触是否异常）。无力传感器时，可用“夹爪位置误差 $+$ 电机电流”估计：完全闭合却无阻力多半夹空；闭合很少却电流很高多半夹到硬边或卡住。更稳妥的判据还要看\emph{提升后}物体是否随动。
+
+\begin{codebox}[text]{抓取状态机骨架（阶段逻辑;每阶段目标可由高层策略给出）}
+state := SEARCH
+loop every control step:
+    perc, rs, now := sense()                      # 感知 / 机器人状态 / 时间
+    switch state:
+        SEARCH:    if perc.object_found:               state := APPROACH
+        APPROACH:  if rs.ee_pos_err < 0.08:            state := ALIGN
+        ALIGN:     if rs.ee_rot_err < 0.15:            state := PREGRASP
+        PREGRASP:  if rs.ee_pos_err < 0.02:            state := CLOSE
+        CLOSE:     if rs.grasp_confirmed:              state := LIFT
+                   elif rs.close_timeout:             state := FAILSAFE
+        LIFT:      if rs.lift_height > 0.10:           state := TRANSPORT
+        # ... TRANSPORT / PLACE / RELEASE / RETREAT 同理，各带安全门
+    cmd := make_command(state, perc, rs, now)     # 生成本阶段模式的 EE 命令
+    cmd := safety_filter(cmd, rs, now)            # 限速 + 可行性 + 滞回
+    send_to_lowlevel(cmd)
+\end{codebox}
+
+\begin{pitfall}[阶段切换无滞回会抖 / 状态机不会削弱学习的泛化]
+其一，若“误差 $<$ 阈值就进下一阶段、$>$ 阈值就退回”，传感器噪声会让状态在阈值附近来回穿越、反复抖动。修法是滞回（进/出用两个不同阈值）、最短停留时间与置信度累计。其二，有人担心 FSM 是手工规则、会限制策略——实际上 FSM 只表达\emph{安全与阶段结构}，高层仍可学习每阶段的连续目标；学习负责连续决策，FSM 负责离散安全边界，二者互补而非互斥。
+\end{pitfall}
+
+\paragraph{失败恢复：回退不等于急停。}
+急停在接触/搬运任务里可能更危险（搬运中突然松开会掉落，推门时突然撤力可能反弹）。应按失败类型与任务阶段选择回退：高层短暂超时则保持上一安全轨迹并减速；目标置信度低则冻结末端、等重检；预抓取不可达则请求高层移动基座或重采样；基座不稳则收臂到安全位、优先站稳；接触力过大则降刚度、沿反向退让；夹持失败则回到 pregrasp 重试；自碰撞风险则停臂、保持腿稳。一个实用的组织方式是把安全状态嵌套在操作 FSM 之上：NORMAL（正常执行）$\to$ CAUTION（降速、提高稳定权重）$\to$ SAFE\_HOLD（停操作、收臂）$\to$ EMERGENCY（硬件安全流程），并用置信度、支撑裕度与接触力作为升降级触发量。
+
+\begin{insight}[安全过滤要进训练闭环；回退要分级]
+安全过滤器会\emph{改变}高层命令的分布。若高层训练时没见过这种过滤、部署时才加，策略会不适应而行为变差——故应把同一套过滤逻辑放进仿真训练闭环，让高层逐渐学会输出\emph{可执行}的命令；对 RL 低层，还应把过滤返回的 status/scale 作为观测，否则低层不知道目标为何突然变慢或被保持。与此呼应，安全阈值不应是单一硬阈值（过严会让机器人频繁拒绝任务、根本干不成活），而应分\emph{警告}（降速）、\emph{降级}（降权/限幅）、\emph{硬停止}三级——用一个 $\mathrm{scale}\in[0,1]$ 把“执行 / 拒绝”的二选一，扩成连续的温和降级。
+\end{insight}
+
+\paragraph{从单臂到双臂：耦合约束。}
+人形的双臂操作（搬箱、叠衣、开瓶）中，两臂末端不再独立——它们通过共同操作的物体\emph{刚性耦合}。协作搬运模式下，接口不再下发两个独立末端目标，而是下发\emph{物体}目标位姿 $\mathbf{T}_{\mathrm{obj}}^{\mathrm{cmd}}$ 加左右抓取偏移，由低层解出每臂目标：
+\begin{equation}
+  \mathbf{T}_{\mathrm{left}}^{\mathrm{cmd}}=\mathbf{T}_{\mathrm{obj}}^{\mathrm{cmd}}\,\mathbf{T}_{\mathrm{obj}\to\mathrm{left}}^{\mathrm{grasp}},\qquad
+  \mathbf{T}_{\mathrm{right}}^{\mathrm{cmd}}=\mathbf{T}_{\mathrm{obj}}^{\mathrm{cmd}}\,\mathbf{T}_{\mathrm{obj}\to\mathrm{right}}^{\mathrm{grasp}}.
+  \label{eq:si-bimanual}
+\end{equation}
+这与多机协作的协同运动学在数学上同构（\cref{sec:ma-coopkin}），区别仅在于双臂同处一机、通信延迟近零；其内力管理（不做无用功的内力）与抓取矩阵理论分别见 \cref{sec:ma-internalforce} 与 \cref{sec:cm-grasp}，移动双臂的整机协同规划见 \cref{ch:arm-dualarm-planning}。
+
+\paragraph{跨平台迁移的充分条件。}
+固定臂技能迁到移动基座\emph{不是}无条件成立，至少要满足下列五条；任一失效都对应一类典型失败：
+
+\begin{table}[H]\centering\small
+\caption{固定臂操作技能迁移到移动基座的五个条件与失效后果。}
+\label{tab:si-transfer}
+\begin{tabular}{p{3.4cm}p{5.0cm}p{4.0cm}}
+\toprule
+条件 & 含义 & 失效后果 \\
+\midrule
+任务系一致 & 高层轨迹相对任务对象表达（task-frame） & 用 body/关节表达则不迁移 \\
+夹爪几何相近 & 抓取宽度与接触点相似 & 抓取姿态不适用、夹不住 \\
+工作空间覆盖 & 移动平台能把末端送到目标范围 & 够不到、需重定位基座 \\
+低层跟踪精度足 & 末端误差落在策略容忍内 & 高层要 $1$ cm、低层只给 $10$ cm 则失败 \\
+感知分布相近 & 相机视角/光照/遮挡不过度偏移 & 分布外、识别错或目标漂移 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 这也解释了接口选择对 sim-to-real 的影响：关节角接口的 gap 最大（关节动力学差异直接传到末端），末端位姿接口居中（低层 IK/WBC 吸收部分差异），task-frame 末端接口最小——因为它定义在物体/环境上、不依赖本体，即便仿真动力学与真机有差，“手到杯子的相对位姿”在物理上仍一致。换言之，接口层不是仿真与真机之间的“透明通道”，而是一个能\emph{吸收一部分 sim-to-real gap} 的适配层。
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+本章把“高层操作意图 $\to$ 全身可执行动作”之间的接口当成一个可推导、可调试、可迁移的工程对象。核心结论：
+
+\begin{table}[H]\centering\small
+\caption{本章要点速查}
+\label{tab:si-summary}
+\begin{tabular}{p{2.6cm}p{5.4cm}p{4.4cm}}
+\toprule
+知识点 & 核心结论 & 关键式 / 落点 \\
+\midrule
+接口分层 & 高层表达任务意图、低层承担物理可行性；接口是任务变量的选择 & \cref{tab:si-contract} 三层契约 \\
+task-frame & 目标应绑任务对象而非晃动的身体；对基座抖动一阶免疫 & \cref{eq:si-task2base}、\cref{prop:si-invariance} \\
+$\SE(3)$ 误差 & 姿态误差走对数映射，不可逐分量减 & \cref{eq:si-xierr} \\
+轨迹限速 & 位置按模长 clip、姿态在 $\SO(3)$ 上限幅再 $\mathrm{Exp}$ 映回 & \cref{eq:si-poslimit,eq:si-rotnew} \\
+低层消费 & RL/MPC/IK-QP 共享同一接口；几何可行 $\neq$ 动力学可行 & \cref{tab:si-lowlevel}、\cref{eq:si-tau} \\
+抓取流水线 & 多阶段 FSM $+$ 阶段安全门 $+$ 滞回；回退分级非急停 & \cref{tab:si-grasp-stages} \\
+跨平台迁移 & 迁移性来自 task-frame 表达与低层跟踪精度 & \cref{tab:si-transfer} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{本章符号表}
+\label{tab:si-symbols}
+\begin{tabular}{ll}
+\toprule
+符号 & 含义 \\
+\midrule
+${}^{A}\mathbf{T}_{C}\in\SE(3)$ & $C$ 系相对 $A$ 系的位姿；$W$/$B$/$T$ 为世界/基座/任务系 \\
+${}^{B}\mathbf{T}_{ee}^{\mathrm{cmd}}$ & 由 task-frame 命令换算到基座系的末端目标（\cref{eq:si-task2base}） \\
+$\boldsymbol\xi_{\mathrm{err}}\in\mathbb R^6$ & $\SE(3)$ 末端误差，$=\mathrm{Log}(\mathbf T_{ee}^{-1}\mathbf T_{ee}^{\mathrm{cmd}})^\vee$（\cref{eq:si-xierr}） \\
+$\boldsymbol\delta=\mathrm{Log}(\mathbf R_0^\top\mathbf R_1)$ & 两姿态间的测地增量（轴角），姿态限速用（\cref{eq:si-rotdelta}） \\
+$v_{\max},\omega_{\max}$ & 末端线速度/角速度上界（限速用） \\
+$\mathbf F,\mathbf K,\mathbf D,\mathbf F_{\mathrm{ff}}$ & 末端 wrench、笛卡尔刚度/阻尼、前馈力（\cref{eq:si-impedance}） \\
+$\mathbf J_{ee}$ & 末端雅可比；$\boldsymbol\tau_{ee}=\mathbf J_{ee}^\top\mathbf F$（\cref{eq:si-tau}） \\
+$\mathbf S\in\{0,1\}^{6\times6}$ & 力--位混合选择矩阵（定义在 task-frame） \\
+$g,m$ & 夹爪命令、控制模式（位置/阻抗/力控） \\
+$H,\Delta t$ & 轨迹窗口长度、采样步长（\cref{eq:si-window}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{故障诊断速查。}
+\begin{itemize}
+  \item \textbf{末端目标方向反了} $\Rightarrow$ 多为 $\SE(3)$ 左右乘顺序或 frame 写反：打印 ${}^{W}\mathbf{T}_{B}$、做单位变换自检、可视化坐标轴（\cref{sec:si-taskframe}）。
+  \item \textbf{世界系末端抖} $\Rightarrow$ 用了 body-frame 目标或任务系漂移：固定 task-frame、对比 world/body 目标、查状态估计延迟（\cref{prop:si-invariance} 陷阱）。
+  \item \textbf{低层突然冲向远处} $\Rightarrow$ 高层目标跳变未限速：打印目标速度、启用 \cref{eq:si-poslimit,eq:si-rotnew} 的限速器、查视觉置信度。
+  \item \textbf{高层卡顿后仍执行旧动作} $\Rightarrow$ 缺时间戳/过期检查：打印 $\mathrm{now}-\mathrm{stamp}$、设 max\_age、缓冲耗尽进保持（\cref{sec:si-smooth}）。
+  \item \textbf{IK 可达却摔倒} $\Rightarrow$ 几何可行但动力学不可行：查支撑裕度、降末端权重、加支撑裕度门（\cref{sec:si-lowlevel} 陷阱）。
+  \item \textbf{抓取阶段来回跳} $\Rightarrow$ FSM 无滞回：加最短停留时间、双阈值、平滑检测信号（\cref{sec:si-grasp} 陷阱）。
+  \item \textbf{固定臂策略迁移失败} $\Rightarrow$ 数据不在 task-frame 或低层精度不足：查演示坐标系、训练注入低层误差、核对 \cref{tab:si-transfer} 五条件。
+\end{itemize}
+
+\begin{practice}[本章综合练习]
+\begin{enumerate}
+  \item \textbf{（task-frame 推导）} 仿 \cref{eq:si-jitter}，推导 body-frame 目标在基座 yaw 抖动 $\delta\psi$ 下的世界系\emph{姿态}变化一阶近似，并说明为何姿态抖动与力臂无关、只与 $\delta\psi$ 同阶。
+  \item \textbf{（变换自检）} 随机生成 ${}^{W}\mathbf{T}_{B}$ 与 ${}^{T}\mathbf{T}_{ee}^{\mathrm{cmd}}$，验证由 \cref{eq:si-task2base} 算得的 ${}^{B}\mathbf{T}_{ee}^{\mathrm{cmd}}$ 满足 ${}^{W}\mathbf{T}_{B}\,{}^{B}\mathbf{T}_{ee}^{\mathrm{cmd}}={}^{W}\mathbf{T}_{T}\,{}^{T}\mathbf{T}_{ee}^{\mathrm{cmd}}$（数值误差应 $<10^{-6}$）。
+  \item \textbf{（姿态限速）} 证明 \cref{eq:si-rotlimit,eq:si-rotnew} 给出的 $\mathbf R'$ 与 $\mathbf R_0$ 之间的测地距离恰为 $\min(\|\boldsymbol\delta\|,\omega_{\max}\Delta t)$；并据此说明为何对四元数逐分量 clip 不具备这一性质。
+  \item \textbf{（低层可行性）} 写出 \cref{eq:si-ikqp} 的扩展形式，加入“关节居中”与“基座姿态保持”两项软约束，并讨论 $\lambda$ 与这两项权重对奇异附近行为的影响（联系 \cref{thm:ak-dls}）。
+  \item \textbf{（抓取 FSM）} 为“拿起杯子并放到桌面右侧”写出完整 FSM：每阶段的 task-frame、控制模式、进入/退出阈值（带滞回）与回退策略；指出哪一步必须从物体系切到桌面放置区域系。
+\end{enumerate}
+\end{practice}
+
+\paragraph{承上启下。}
+本章把 \cref{ch:unified-multimodal-mpc} 的统一动力学与 SE(3) 末端代价、\cref{ch:operational-space} 的笛卡尔阻抗、\cref{ch:mm-kinematics} 的联合运动学，统一收束到“高层意图 $\to$ 末端 SE(3) 轨迹 $\to$ 全身控制”这一条接口上。其中双臂协作的耦合约束 \cref{eq:si-bimanual} 指向 \cref{ch:arm-dualarm-planning} 的移动双臂协同规划；而当高层命令与低层控制\emph{都}来自人类演示或动捕数据时，如何从参考运动、对抗先验、技能潜空间与重定向训练出可部署的全身行为，则归入运动模仿与全身技能学习部。

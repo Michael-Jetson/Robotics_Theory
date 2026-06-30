@@ -1,0 +1,1355 @@
+\chapter{网球感知与轨迹预测}\label{ch:rlmc-tennisperc}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章，承接 Ch26
+%  (\cref{ch:rlmc-tennisenv}) 的网球场环境与球物理。
+%  主线：算法/概念领路 —— 先立「球类感知-预测在概念上有哪些观测/状态估计/
+%  预测技巧 + 原理」，再把每个概念落到 mjlab / Isaac Lab / UniLab 三框架的
+%  工程接线。感知-预测管线本身与物理引擎解耦（只吃 position/velocity/
+%  timestamp 三元组），故三框架的差异主要在「球状态从哪取」与「相机 sensor
+%  如何配」，核心算法代码三框架共用。假定读者已学完 RL 理论部与本部前置实
+%  践章（观测·动作·特权学习·DR·Sim2Real），不再重教 EKF/贝叶斯/PPO 基础，
+%  聚焦「高速飞行目标的状态估计与预测」这一新设定下的 hands-on。
+%  源稿 RL运控/Ch27_网球感知与轨迹预测.md（mjlab+Isaac Lab）按本主线重构；
+%  UniLab 列已据源码（commit 99936e08，见 docs/RL运控融合_UniLab参考.md）实填：
+%  球状态读取改后端 getter（get_body_pos_w / get_body_lin_vel_w）、接触事件改命名
+%  sensor（get_sensor_data）、actor/critic 分组用 obs_groups_spec 两组、teacher-student
+%  用 HORA 式时序自适应蒸馏；唯「相机/视觉」一项 UniLab 当前 26 任务集确无，如实标
+%  「无对应」而非编造。
+%  关键 API/版本/论文归属/数值经联网核对（见 \rebuilt / \pz 标注与
+%  claimsToVerify），已纠正源稿若干错处：
+%    * 源稿把 ETH 羽毛球称作与人形并列的「球类运动系统」并给「~30 Hz 感知」。
+%      经核 ETH 是\emph{四足} ANYmal-D（非人形），机载感知 60 Hz、状态估计
+%      400 Hz、控制 100 Hz（Jetson AGX Orin），正文已改述并标注。
+%    * 源稿把 PACE 与 HITTER/LATENT 并列为「双通道 predictor 系统」无歧义，
+%      但 PACE 即 arXiv:2509.21690「Prediction Augmentation」论文本身，zero-shot
+%      部署在 Booster T1（23 转动关节）；仿真 hit rate >=96% / success >=92%，真机
+%      回报 hit 93% / return 61%（联网核），已据官方校正。
+%    * Isaac Lab 相机 API 类名/数据类型经官方文档核（TiledCameraCfg /
+%      CameraCfg，data_types 含 distance_to_image_plane / semantic_segmentation）。
+% ════════════════════════════════════════════════════════════════
+
+\cref{ch:rlmc-tennisenv} 建立了网球场的物理底座——court-local 坐标系、球体 \verb|freejoint|、八维发球命令、三层空气动力学弹道。但那些都是\textbf{仿真侧的物理真相}：控制器不能直接消费球刚体的世界系真值（mjlab 1.4.0 记作 \Verb[breaklines]|ball.data.root_link_pos_w|，Isaac Lab 记作 \Verb[breaklines]|ball.data.root_pos_w|）。真实部署时机器人看到的不是 ground-truth 状态向量，而是有噪声、有延迟、可能漏检的传感器观测。本章在物理底座之上构建\textbf{感知与轨迹预测管线}——从「仿真真值」到「可被下游击球控制器直接调用的预测接口」。
+
+本章的产物\emph{不是}一个 detector、也不是一个 filter，而是一个可被后续击球控制章直接 import 的数据结构 \Verb[breaklines]|PredictorOutput|：击球点在哪（\verb|impact_pos_c|）、还剩多少时间（\Verb[breaklines]|time_to_impact|）、预测有多可信（\verb|uncertainty|）、是否值得出手（\verb|validity|）。这条「输入规格书」的质量直接决定下游控制策略能否训得动——若 \Verb[breaklines]|time_to_impact| 偏 $30$\,ms，挥拍就打空；若 \verb|validity| 不可靠，策略会在不该出手时出手。
+
+本章遵循全书「概念领路、实践兑现」的次序：每节先立\textbf{算法/状态估计主线}（这个环节有哪些观测/技巧、背后的原理与反面教训），再在其下排布\textbf{三框架对比实战}：mjlab（MuJoCo Warp 后端）、Isaac Lab（PhysX 后端）、UniLab（MuJoCoUni/MotrixSim，CPU 仿真后端）。一个贯穿全章的本质：\textbf{感知-预测管线与物理引擎是解耦的}——EKF、GRU 残差、延迟补偿都只接收 $(\text{position},\text{velocity},\text{timestamp})$ 三元组，不关心数据来自 MuJoCo 还是 PhysX。所以三框架的工程差异主要落在「球状态从哪个 API 取」与「相机 sensor 如何配」两处，核心算法代码三框架共用。
+
+本章假定你已熟悉 \cref{ch:rlmc-tennisenv}（球场/球物理/发球命令）、\cref{ch:rlmc-privileged}（特权学习/非对称 AC/蒸馏）、\cref{ch:rlmc-dr}（域随机化）、\cref{ch:rlmc-obsact}（观测/动作）、\cref{ch:rlmc-sim2real}（Sim2Real）；EKF 的贝叶斯推导、高斯乘积、Jacobian 线性化等数学基础假定已在概率论与状态估计课程具备，本章只在「网球轨迹」这一具体语境下复用并落地。
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-perc-env}
+
+感知-预测管线核心是纯 PyTorch（不依赖物理引擎），但要在仿真里收集 ground-truth 标签、注入噪声/延迟、（可选）渲染相机，仍需与 \cref{ch:rlmc-tennisenv} 同一套仿真栈对齐。\textbf{版本错配是本章相机渲染与 batched EKF 跑不通的头号原因}。
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}llLLL@{}}
+\toprule
+组件 & 锚定版本 & 操作系统 & GPU 要求 & 本章用途 \\
+\midrule
+PyTorch & $\ge 2.1$ & 全平台 & 训练需 NVIDIA & batched EKF / GRU / \Verb[breaklines]|torch.linalg.inv| \\
+mjlab & 1.4.0 & Linux / macOS（评估） & 训练需 NVIDIA & 取球状态、收集标签 \\
+MuJoCo Warp & 随 mjlab 1.4.0 & Linux & NVIDIA & GPU batched worlds \\
+Isaac Lab & 2.3.x（主线） & Linux / Windows & NVIDIA RTX & \Verb[breaklines]|TiledCameraCfg|、球状态接口 \\
+UniLab & commit \texttt{99936e08} & Linux(CUDA/ROCm/XPU)/macOS & 策略需 GPU、物理跑 CPU & 取球状态、收集标签（\emph{无相机}） \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paragraph{UniLab 的版本与平台为何不同。}UniLab 是\textbf{异构 RL 运行时}（论文 arXiv:2605.30313）：物理仿真在 \emph{CPU}（MuJoCoUni \texttt{mujoco-uni==3.8.0} 或 MotrixSim \texttt{motrixsim-core==0.8.2}，多线程批量步进），策略学习在 GPU（CUDA/MPS/ROCm/XPU 之一），二者经共享内存 IPC 解耦。故它\emph{不}依赖 GPU-sim 后端（不绑 NVIDIA 驱动）——任何能跑 MuJoCo/Motrix 的机器都可做本章\textbf{纯算法部分}（EKF/GRU/延迟补偿），而本章主体恰是 CPU-only 可跑的。安装走 \Verb[breaklines]|uv sync --extra mujoco|（或 \Verb[breaklines]|--extra motrix|）。\textbf{关键事实边界}：UniLab 当前 $26$ 个注册任务\emph{全是本体感知（无 RGB/depth 相机观测任务）}，亦无网球任务；故本章「UniLab 相机配置」一律如实标注「无对应」，「球状态读取」给出与 mjlab/Isaac Lab 等价的\emph{后端 getter API}（若后续实装网球刚体）。
+
+\paragraph{一个必须先说清的事实边界。}\rebuilt{\cref{ch:rlmc-tennisenv} 已核：mjlab core 1.4.0 与 Isaac Lab 均\emph{不}附带官方网球任务；当前课程示例的 tennis task 没有相机 sensor，\texttt{actions} 字典为空（Phase 1）。}因此本章的相机配置、噪声模型、蒸馏管线绝大多数是\textbf{「预规划」}——为后续人形击球任务设计、当前仓库尚不存在。下文「已有」指课程示例已实现的对象（球状态读取、发球命令），「预规划」指需要后续补全的对象（相机、感知网络、student 蒸馏）。
+
+\paragraph{分操作系统要点。}\textbf{Linux} 是两框架一等公民。\textbf{macOS} 只能跑 CPU MuJoCo 与 mjlab 评估，但本章\emph{纯算法部分}（EKF、GRU、延迟补偿的单元测试与小批量轨迹回放）在 CPU 上完全可跑——这恰是本章主体。\textbf{相机渲染}（Isaac Lab \verb|TiledCamera| / mjlab Warp 渲染）需 NVIDIA GPU。
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：五分钟看 EKF 把噪声磨平}
+\addcontentsline{toc}{section}{Quick Start：五分钟看 EKF 把噪声磨平}
+\label{sec:rlmc-perc-quickstart}
+
+最小可跑目标：不训练、不写策略，给一条 ground-truth 抛体轨迹加 $2$\,cm 高斯噪声当观测，跑一个 $6$ 维 EKF，亲眼看到「估计 RMSE 显著低于原始观测 RMSE」。这是本章一切验证的起点，纯 PyTorch、可直接复制运行（不需要 GPU、不需要仿真器）。
+
+\begin{codebox}[Python]{五分钟 EKF 最小可跑（CPU 即可）}
+import torch, math
+g = -9.81
+T, dt = 80, 0.01
+# ground-truth 抛体:初速 (15, 0, 8) m/s，从 (0,0,1) 出发
+p = torch.tensor([0., 0., 1.]); v = torch.tensor([15., 0., 8.])
+gt, obs = [], []
+for _ in range(T):
+    p = p + v * dt + 0.5 * torch.tensor([0,0,g]) * dt**2
+    v = v + torch.tensor([0,0,g]) * dt
+    gt.append(p.clone()); obs.append(p + torch.randn(3) * 0.02)   # 2cm 噪声
+gt, obs = torch.stack(gt), torch.stack(obs)
+
+# 极简 6D KF（纯重力，单环境）
+x = torch.cat([obs[0], torch.zeros(3)]); P = torch.eye(6) * 10.0
+F = torch.eye(6); F[:3, 3:] = torch.eye(3) * dt
+H = torch.zeros(3, 6); H[:, :3] = torch.eye(3)
+Q = torch.eye(6) * 1e-3; R = torch.eye(3) * 0.02**2
+est = []
+for k in range(T):
+    x = F @ x; x[5] += g * dt; x[2] += 0.5 * g * dt**2     # 预测（含重力）
+    P = F @ P @ F.T + Q
+    y = obs[k] - H @ x                                       # 新息
+    S = H @ P @ H.T + R; K = P @ H.T @ torch.linalg.inv(S)  # Kalman 增益
+    x = x + K @ y; P = (torch.eye(6) - K @ H) @ P            # 更新
+    est.append(x[:3].clone())
+est = torch.stack(est)
+print(f"raw  RMSE = {(obs-gt).norm(dim=-1).mean()*100:.2f} cm")
+print(f"EKF  RMSE = {(est-gt).norm(dim=-1).mean()*100:.2f} cm")
+# 实测:raw~3.1cm -> EKF~2.6cm（仅~18%）.位置直接被观测、噪声小，平滑空间有限，
+# 这不是 bug！KF 在此设定真正大赢的是「速度」（差分速度 sigma_v~2.8 m/s，KF 低一个量级）.
+# 想看位置降 50%+:把噪声调到 5cm、dt 调到 1/60s（观测更脏更稀，模型权重才显著）.
+\end{codebox}
+
+\begin{codebox}[bash]{在仿真里取真值喂 EKF（mjlab，示意）}
+# 注意:Mjlab-Tennis-Launcher 当前未注册——`mjlab list-envs` 列出的 12 个任务里没有它
+# （网球任务属本章「预规划」，见环境配置指南）.下面这条是「任务实装后」的目标用法，
+# 现在跑会报「task not found」.先用上面那段纯 PyTorch EKF 验证算法即可.
+# 课程示例 tennis task（无 action）下用 zero agent 让球飞，
+# 在 step 回调里读 ball.data.root_link_pos_w（mjlab;Isaac 为 root_pos_w）当真值、
+# 加噪当观测、跑上面的 EKF.
+uv run play Mjlab-Tennis-Launcher --agent zero --num-envs 16 --viewer viser
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:五分钟最小可跑（上面那段 EKF 纯 PyTorch，UniLab 直接复用）}
+# 本章 EKF/GRU/延迟补偿是框架无关的纯 PyTorch——上面那段 6D KF 在 UniLab 环境下
+# 逐字相同，无需改动.差异只在「球真值从哪取」:UniLab 不是 manager-based，
+# 没有 ball.data.root_pos_w（那是 Articulation/RigidObject API），而是经后端 getter
+# 从 NpEnv 取刚体世界系状态（若实装网球刚体，对应 get_body_pos_w / get_body_lin_vel_w）:
+#   pos_w = env._backend.get_body_pos_w(ball_body_ids)      # 世界系位置 [N,3]
+#   vel_w = env._backend.get_body_lin_vel_w(ball_body_ids)  # 世界系线速度 [N,3]
+# 然后 obs = pos_w + 噪声，喂给同一个 EKF.注意:UniLab 当前任务集无网球任务，
+# 上述为「按 UniLab 后端 API 应如何接线」的范式，待官方实装网球刚体后即可直接套用.
+\end{codebox}
+
+\begin{practice}[前置自测：答不出 $\ge 3$ 题，先回对应章节复习]
+\begin{enumerate}
+  \item （\cref{ch:rlmc-tennisenv}）当前 tennis observation 里球的位置/速度各在哪个 frame（world vs body）？\texttt{actions} 字典内容是什么？（答错回看 \cref{sec:rlmc-perc-frame}）
+  \item （概率）两个高斯分布的乘积（归一化后）还是高斯吗？均值/方差怎么算？这与 EKF 更新步什么关系？
+  \item （线代）Jacobian 在非线性函数局部线性化中起什么作用？为什么纯重力模型的 $F$ 就是转移矩阵本身？
+  \item （\cref{ch:rlmc-privileged}）teacher 看 ground-truth、student 看 sensor——privileged 数据能不能进 student 的训练 target？为什么？
+  \item （信号）观测延迟 $30$\,ms、球速 $30$\,m/s，延迟导致的位置误差多少？相对球拍有效击球面（直径约 $30$\,cm）意味着什么？（答错回看 \cref{sec:rlmc-perc-delay}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章目标}
+\addcontentsline{toc}{section}{本章目标}
+\label{sec:rlmc-perc-goals}
+
+学完本章，你应当\textbf{能够}（每条都可当场验收）：
+
+\begin{enumerate}
+  \item \textbf{实现}一个批量（多环境）$6$ 维网球轨迹 EKF，能处理漏检帧、用 Joseph form 保证协方差正定，并在仿真轨迹上调通「估计 RMSE $<$ 原始观测 RMSE」；
+  \item \textbf{推导并实现}含二次空气阻力的非线性 EKF——写出 $\partial\dot{\mathbf v}/\partial\mathbf v$ 的解析 Jacobian，用有限差分验证，并量化它相对纯重力 EKF 的预测改进；
+  \item \textbf{定位并修复}弹跳模式切换问题——配置带 cooldown 的弹跳检测，弹跳后重置速度协方差，避免 EKF 在弹跳后「按旧速度外推」；
+  \item \textbf{配置}「物理 baseline $+$ GRU 残差」预测器，用按物理条件分割的 held-out 集验证泛化性，并跑通 physics-only / physics$+$GRU / pure-GRU 三方消融；
+  \item \textbf{实现}延迟补偿三步法（timestamp $\to$ 更新到观测时刻 $\to$ 前推到控制时刻），并在仿真中注入随机延迟训练对延迟鲁棒的策略；
+  \item \textbf{定义}给下游控制器的 \Verb[breaklines]|PredictorOutput| 接口，说清每个字段对应哪类 reward，并在三框架中用同一套接口接线；
+  \item \textbf{设计}从 privileged teacher 到 deployable student 的感知蒸馏路线（信息退化阶梯 $+$ 非对称 AC），并断言 student 评估时 privileged 信号不泄漏。
+\end{enumerate}
+
+\paragraph{知识导航与阅读时间。}本章结构如下树。建议精读 $4$--$5$ 小时（含动手实验）；有状态估计经验者速读 $2$--$3$ 小时（重点看含 drag Jacobian、弹跳处理、三框架对比表）；遇到具体数值问题速查 $40$ 分钟（直接跳故障排查手册）。
+
+\begin{center}
+\begin{forest} navtreeLR
+[网球感知预测
+  [{感知问题本质\\（六个失败原因）}]
+  [{标签与 frame\\（真值$\to$可训练）}]
+  [{观测方案对比\\（真值/动捕/视觉）}]
+  [{EKF 状态估计\\（预测$+$更新$+$增益）}]
+  [{含 drag 非线性\\（Jacobian 推导）}]
+  [{弹跳模式切换\\（检测$+$协方差重置）}]
+  [{GRU 残差预测\\（物理先验$+$数据）}]
+  [{延迟补偿\\（三步法$+$注入）}]
+  [{PredictorOutput\\（接下游控制）}]
+  [{感知蒸馏\\（teacher$\to$student）}]
+]
+\end{forest}
+\end{center}
+
+\paragraph{前置桥接。}本章把前面打磨的零件用在「感知一个快变目标」上：球状态读取沿用 \cref{ch:rlmc-tennisenv} 的 frame 约定；teacher-student / 非对称 AC 直接复用 \cref{ch:rlmc-privileged}；观测噪声/延迟的随机化是 \cref{ch:rlmc-dr} 事件机制的应用；最终蒸馏出的 student 与延迟补偿是 \cref{ch:rlmc-sim2real} 的 Sim2Real 链路一环。读本章时不妨随时回看这些章——本章只补「高速目标感知特有的环节」。
+
+% ════════════════════════════════════════════════════════════════
+\section{感知问题的本质：为什么「看见球」远远不够}
+\label{sec:rlmc-perc-essence}
+
+\paragraph{模块功能与在管线中的位置。}本节不写代码，立全章认知地基——\textbf{建立对网球感知复杂度的正确认知}，破除「只要 detector 检测到球就能打」的天真假设。它是后面所有技术决策（为什么要 EKF、为什么要预测、为什么先用真值）的动机来源。
+
+\paragraph{动机：六个让天真方案失败的原因。}天真方案是「每帧检测球心，相邻两帧差分得速度，线性外推到球拍平面」。它在慢速桌面物体上勉强能用，在网球上几乎一定失败，六个原因每一个都与 \cref{ch:rlmc-tennisenv} 的物理设计直接挂钩：
+
+\begin{enumerate}
+  \item \textbf{球极小}。网球半径 $0.033$\,m，距相机 $10$\,m 时在图像里只占几个像素；检测抖一个像素，反投影到三维就是几厘米到十几厘米误差。这与工业视觉检测大工件（占大量像素、亚像素精度即毫米级）完全不同。
+  \item \textbf{球极快}。\cref{ch:rlmc-tennisenv} 的发射速度 $20$--$45$\,m/s，$10$\,ms 误差对应 $0.20$--$0.45$\,m 位移——已超过球拍有效击球面尺度。帧率低（如 $30$\,fps）时差分速度估计极嘈杂。
+  \item \textbf{球有抛物线}。重力让 $z$ 速度持续变化（每秒 $-9.81$\,m/s）。线性外推假设速度恒定，系统性错过击球高度：飞行 $0.5$\,s 后纯线性外推的 $z$ 误差 $=\tfrac12\times 9.81\times 0.5^2\approx 1.23$\,m——整个身高都差出来。
+  \item \textbf{球会弹跳}。\cref{ch:rlmc-tennisenv} 标定了 COR 约 $0.73$--$0.76$，落地后速度方向突变。纯平滑模型（移动平均、一阶 EKF）会把弹跳当异常点，在弹跳前后给出完全错误的预测。
+  \item \textbf{空气动力学残差}。\cref{ch:rlmc-tennisenv} 的三层模型（drag$+$Magnus）不是精确标定的真实空气动力学——$C_d$、$C_L$ 只是近似，旋转衰减被忽略。predictor 必须有处理建模误差的机制。LATENT 的消融直证此点：去掉 dynamics randomization 后真机成功率从 $90.9\%$ 骤降到 $14$--$29\%$\cite{tennis_latent2026}。
+  \item \textbf{观测有延迟}。你「看到」的球是\emph{过去}的球——曝光、传输、推理、滤波都耗时。HITTER 用 $9$ 台 OptiTrack @ $360$\,Hz\cite{tennis_hitter2025}，即便如此单帧周期也有约 $3$\,ms（$1/360$\,s），加上下游处理仍不为零；RGB 相机系统延迟更可达 $30$--$100$\,ms。$30$\,m/s $+$ $30$\,ms $=$ \textbf{$0.9$\,m 位置误差}——整个球拍都够不到。要命的是这种「慢半拍」不在 detector loss 上显现：detector 可以非常准，但它准的是\emph{过去}。
+\end{enumerate}
+
+类比理解：感知问题像在漆黑中打网球，你只有一个每秒闪几十次的频闪灯。每次灯闪你看到球在某处（观测），但等你处理完灯已闪过（延迟），且闪光太短看不清（噪声），更糟的是球在没看到时可能弹了一下（模式切换）。你需要的不是「更亮的灯」（更好的 detector），而是「根据灯闪瞬间推算球\emph{现在}在哪」（状态估计$+$预测）。类比的边界：频闪灯观测是瞬时的，真实相机的曝光时间还会造成运动模糊，是额外噪声源。
+
+\begin{insight}[感知的产物是带时间戳、带不确定性、可外推到击球窗口的状态估计]\label{ins:rlmc-perc-essence}
+网球感知的产物\emph{不是}图像框、也\emph{不是}当前球心，而是\textbf{带 timestamp、带协方差、可外推到击球窗口的状态估计}。控制器需要的是 $(\verb|impact_pos_c|,\verb|time_to_impact|,\verb|uncertainty|)$，而不是 $(\verb|pixel_x|,\verb|pixel_y|,\verb|confidence|)$。如果输出不能被控制器消费，检测精度再高也只是中间指标。这正是本章把「感知」重新定义为「状态估计$+$预测」而非「目标检测」的根本原因。
+\end{insight}
+
+\paragraph{多视角：感知链条的五层分离。}把感知拆成五层，每层有明确输入输出、层间用定义良好的接口连接。核心价值是\textbf{当系统出问题时可以逐层定位误差来源}，而非在端到端黑箱里猜。
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}cLLL@{}}
+\toprule
+层 & 输入 $\to$ 输出 & 典型误差来源 & 对应技术 \\
+\midrule
+1 真实状态 & sim state $\to$ 位置/速度/角速度 & 无（ground truth） & \Verb[breaklines]|root_link_pos_w|（mjlab）/\verb|root_pos_w|（Isaac） \\
+2 传感器成像 & 3D 世界 $\to$ RGB/depth/seg & 分辨率、遮挡、噪声 & 相机 sensor cfg \\
+3 感知模型 & 图像 $\to$ 2D/3D 球心 & 漏检、误检、定位误差 & detector \\
+4 状态估计 & 多帧观测 $\to$ 位置/速度/协方差 & 模型误差、延迟 & EKF（\cref{sec:rlmc-perc-ekf}） \\
+5 轨迹预测 & 状态估计 $\to$ 击球窗口 & 空气残差、弹跳 & 物理$+$GRU（\cref{sec:rlmc-perc-gru}） \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+工程价值在于\textbf{可以在任意两层间插入 ground truth 来隔离误差}：用真值替代层 1--3 直接喂 EKF——若 EKF 仍不准，问题在 EKF 模型；用真值替代层 1--4 直接做预测——若预测不准，问题在预测模型。这就是 \cref{ch:rlmc-privileged} 特权学习的核心思想——先用 privileged information 建上限，再逐步移除。\textbf{反事实}：若第一天就训端到端视觉控制（RGB $\to$ 关节动作），打不到球时你无法诊断是 detector、EKF、预测还是控制出错；五层分离让你逐层替换真值、精确定位。
+
+\paragraph{前沿系统的感知方案对比。}进入技术细节前，先看前沿系统怎么选——这些选择背后的权衡值得细究：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+系统 & 感知方案 & 频率 & 延迟 & 关键权衡 \\
+\midrule
+LATENT\cite{tennis_latent2026} & 外部光学动捕 & $100+$\,Hz & $\sim5$\,ms & 精度最高 / 不可移动 \\
+HITTER\cite{tennis_hitter2025} & $9\times$ OptiTrack & $360$\,Hz & $\sim3$\,ms & 毫米级 / 成本极高 \\
+ETH ANYmal-D\cite{tennis_eth2025badminton} & 机载立体相机 & $60$\,Hz & 较高 & 自主部署 / 对象慢（羽毛球） \\
+PACE\cite{tennis_pace2025} & 近期球位置 $\to$ learned predictor & — & — & 预测器轻量、zero-shot \\
+Phybot\cite{tennis_phybot2025} & 外部动捕 $+$ EKF & $100+$\,Hz & $\sim5$\,ms & 有滤波平滑 / 依赖外设 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\pz{待核实：LATENT 论文只述「光学动捕」未具名品牌、亦未给动捕频率/延迟；表中 LATENT 与 Phybot 的 $100+$\,Hz/$\sim5$\,ms 为同类系统的量级估计。HITTER 的 $9\times$OptiTrack/$360$\,Hz、ETH 的 $60$\,Hz 已逐字核实；表中 HITTER 的 $\sim3$\,ms 延迟系按 $360$\,Hz 单帧周期（$\approx 2.8$\,ms）反推的量级，非论文明列数字（论文给的是亚 $200$\,ms 整体反应时间）。}
+
+\textbf{关键观察}：除 ETH 外都依赖\textbf{外部动捕}——实验室可行但不可移动。ETH 的系统是\emph{四足} ANYmal-D（非人形）配 $6$ 自由度 DynaArm（整机 $18$ 个驱动 $=$ 四足 $12+$ 臂 $6$）与 ZED X 立体相机，用 perception-aware 训练实现了\textbf{仅靠机载感知}的部署——这在球类全身控制中很罕见（多数同类工作仍依赖外部动捕）；\rebuilt{「目前唯一」系本书断言，论文本身未作此排他性声明。}其对象羽毛球（被击后因强空气阻力迅速减速，飞行速度量级远低于网球发球），机载感知运行在 $60$\,Hz、状态估计 $400$\,Hz、控制 $100$\,Hz（Jetson AGX Orin），论文报告峰值\emph{执行}速度约 $12.06$\,m/s。网球的高速（$20$--$45$\,m/s）对机载感知要求更高——更高帧率、更低延迟、更精确检测。对教学项目，推荐路线：\textbf{先用 ground truth 验证控制上限 $\to$ 再逐步引入噪声/延迟 $\to$ 最后考虑机载视觉}。本章主体聚焦前两阶段。
+
+\paragraph{三框架在「感知层」的角色。}本节不涉及框架专有 API，但提前点明三框架在感知管线中的分工：mjlab/Isaac Lab/UniLab \emph{都}只负责提供层 1（真值）与层 2（相机渲染，若配）；层 3--5（detector/EKF/预测）是框架无关的纯算法，三框架共用同一份 PyTorch 代码。这就是为什么本章后续每节的「三框架对比」往往只在层 1/2 处出现差异——记住这一点能避免「为每个框架重写一遍 EKF」的徒劳。
+
+\begin{pitfall}[思维陷阱：以为「detector mAP 足够高就能打好球」]
+\textbf{错误描述}：把感知目标等同于「把 detector 的 mAP 刷高」。\textbf{现象后果}：detector mAP $0.95$，但有 $30$\,ms 未补偿延迟，$30$\,m/s 球速下等效 $0.9$\,m 误差，整个球拍够不到，而 detector 指标看上去完美。\textbf{根本原因}：mAP 衡量图像级检测质量，不关心时间连续性、延迟补偿、未来预测。\textbf{正确做法}：从控制需求反推感知指标——下游需要的是 impact position error $<5$\,cm、time-to-impact error $<10$\,ms（量级参考 HITTER：击球前 $0.5$\,s 位置误差 $<7.5$\,cm、$0.3$\,s timing $<20$\,ms\cite{tennis_hitter2025}）。
+\end{pitfall}
+
+\begin{pitfall}[编程陷阱：混用 world frame 与 body frame 的速度]
+\textbf{错误描述}：直接拿 body-frame 球速（mjlab \Verb[breaklines]|root_link_lin_vel_b| / Isaac \Verb[breaklines]|root_lin_vel_b|）当球速喂 predictor。\textbf{现象后果}：球有显著旋转时，predictor 产生「看似随机、实则有规律」的系统性偏差。\textbf{根本原因}：\cref{ch:rlmc-tennisenv} 已指出 \verb|ball_velocity| 返回 body frame、\verb|ball_position| 返回 world frame；body frame 速度随四元数旋转。\textbf{正确做法}：统一用 world-aligned 速度（mjlab \Verb[breaklines]|root_link_lin_vel_w| / Isaac \Verb[breaklines]|root_lin_vel_w|），见 \cref{sec:rlmc-perc-frame}。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[估算]} 球速 $35$\,m/s、相机 $60$\,fps。相邻两帧球移动多少米？若 3D 检测精度 $\pm 2$\,cm，差分速度 $v=\Delta p/\Delta t$ 的绝对误差多少？相对 $35$\,m/s 是百分之几？（验收：给出三个数与结论）
+  \item \textbf{[思考]} 为什么先用 ground-truth predictor 再逐步降级，而非直接训端到端视觉控制？从 debug 与 Sim2Real 两角度分析（验收：每角度 $\ge 2$ 条论据）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Ground-Truth 标签与 Frame 统一}
+\label{sec:rlmc-perc-frame}
+
+\paragraph{模块功能与在管线中的位置。}本节把仿真的 ground truth 转成结构化、可训练的 label，并统一 frame 约定。它是 \cref{sec:rlmc-perc-gru} 训练预测器、\cref{sec:rlmc-perc-distill} 蒸馏 student 的「数据源头」——源头脏了，后面全脏。
+
+\paragraph{动机：仿真最宝贵的资源是 ground truth。}仿真最大优势不是渲染或物理精度，而是\textbf{完美的 ground truth}。真实世界你永远不知道球的精确位置（动捕有噪声/遮挡/延迟），但仿真里读球刚体的世界系位置就是真值，精度到浮点（mjlab 1.4.0 该属性名为 \Verb[breaklines]|root_link_pos_w|，Isaac Lab 为 \verb|root_pos_w|——见下文 frame 统一处的跨框架命名差异）。这是训练感知模型的金矿——但 ground truth $\neq$ 可训练 label，它需要 frame 统一、timestamp 关联、episode 条件标注。
+
+\paragraph{配置详解：label 数据规格。}下表四维地给出每个字段（语义 / 是否 privileged / 来源 / 合理处理）。是否 privileged 这一列直接决定它能否进 student 输入——这是 \cref{ch:rlmc-privileged} 的硬约束。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllp{3.2cm}@{}}
+\toprule
+字段 & 含义 & privileged？ & 来源 / 处理 \\
+\midrule
+\verb|t| & 仿真时间（秒） & 否 & \Verb[breaklines]|episode_length_buf * step_dt|（见下注） \\
+\verb|ball_pos_c| & court-local 球心 & 是 & \Verb[breaklines]|root_link_pos_w - env_origins|（mjlab；Isaac 为 \verb|root_pos_w|） \\
+\verb|ball_vel_w| & world-aligned 线速度 & 是 & \Verb[breaklines]|root_link_lin_vel_w|（\emph{非} \verb|_b|；Isaac \Verb[breaklines]|root_lin_vel_w|） \\
+\verb|ball_ang_w| & world-aligned 角速度 & 是 & \Verb[breaklines]|root_link_ang_vel_w|（Isaac \Verb[breaklines]|root_ang_vel_w|） \\
+\verb|launch_cmd| & 八维发球命令 & 是（仿真条件） & \cref{ch:rlmc-tennisenv} CommandTerm \\
+\verb|is_airborne| & 是否在空中 & 是 & \Verb[breaklines]|ball_pos_c[2] > 0.05| \\
+\verb|has_bounced| & 是否已弹跳 & 是 & 弹跳检测器 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\rebuilt{关于仿真时间的取法（已核 mjlab 源）：manager-based 框架\emph{无} \texttt{env.\allowbreak sim\_time} 现成属性，须由「每环境步计数 $\times$ 控制步长」算——mjlab/Isaac Lab 用 \texttt{episode\_length\_buf * step\_dt}（\texttt{step\_dt = sim.\allowbreak dt * decimation}），跨 episode 的全局时间用 \texttt{common\_step\_counter * step\_dt}；UniLab 用步计数 $\times$ \texttt{ctrl\_dt}。下表「来源」列与下面代码据此。}
+
+\textbf{为什么 timestamp 如此重要（反面）}：没有 timestamp 的观测\emph{不能}补偿延迟。这像银行流水缺时间戳无法对账。若相机每 $20$\,ms 出一帧、控制每 $10$\,ms 更新一次，predictor 必须知道每个观测对应哪个仿真时间，否则 \cref{sec:rlmc-perc-delay} 的延迟补偿无从谈起。
+
+\paragraph{代码走读：Frame 统一（三框架共用）。}\cref{ch:rlmc-tennisenv} 指出当前源码 \verb|ball_velocity| 返回 body frame、\verb|ball_position| 返回 world frame，这种不一致必须在 label 生成时修正。下面这份 \Verb[breaklines]|collect_ground_truth_label()| 在 mjlab 与 Isaac Lab 中\textbf{逻辑逐行相同，但球状态属性名有一处必须按框架改}：\verb|env_origins|/\allowbreak\Verb[breaklines]|episode_length_buf|/\allowbreak\verb|step_dt| 在两个 manager-based 框架里同名（\cref{ch:rlmc-manager} 的跨框架复用设计），\textbf{但球的世界系位姿/速度属性名不同}——\textbf{mjlab 1.4.0 用 \texttt{root\_link\_pos\_w} / \texttt{root\_link\_lin\_vel\_w} / \texttt{root\_link\_ang\_vel\_w}}（mjlab 把每个位姿/速度都拆成连杆系 \texttt{\_link\_} 与质心系 \texttt{\_com\_} 两套，\emph{没有}笼统的 \texttt{root\_pos\_w}，随手写它会 \texttt{AttributeError}，见 \cref{ch:rlmc-manager}），\textbf{Isaac Lab 才用裸的 \texttt{root\_pos\_w} / \texttt{root\_lin\_vel\_w} / \texttt{root\_ang\_vel\_w}}。下面代码以 mjlab 名为准，并在注释标出 Isaac 改名处。UniLab 非 manager-based，球状态改后端 getter（\Verb[breaklines]|get_body_pos_w|/\allowbreak\Verb[breaklines]|get_body_lin_vel_w|）、时间改 \Verb[breaklines]|步计数 * ctrl_dt|，拿到 pos/vel/时间后下游逻辑一致（见本节末三框架对比表）。
+
+\begin{codebox}[Python]{collect\_ground\_truth\_label:统一到 court-local / world-aligned}
+def collect_ground_truth_label(env, env_ids=None):
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    ball = env.scene["ball"]
+    # 位置:world -> court-local（减 env_origins）
+    # 属性名:mjlab 1.4.0 用 root_link_*（连杆系）;Isaac Lab 用裸 root_*（无 _link_）
+    ball_pos_c = ball.data.root_link_pos_w[env_ids, :3] - env.scene.env_origins[env_ids]
+    ball_vel_w = ball.data.root_link_lin_vel_w[env_ids, :3]  # world frame（不是 _b！）
+    ball_ang_w = ball.data.root_link_ang_vel_w[env_ids, :3]
+    # Isaac Lab 改名:root_link_pos_w -> root_pos_w / root_link_lin_vel_w -> root_lin_vel_w
+    #                root_link_ang_vel_w -> root_ang_vel_w（其余逐行相同）
+    is_airborne = ball_pos_c[:, 2] > 0.05                # 5cm 以上视为空中
+    has_bounced = (~is_airborne) & (ball_vel_w.norm(dim=-1) > 0.5)
+    # 仿真时间:manager-based 框架无 env.sim_time 属性，按「每环境步计数 × 控制步长」算
+    # （step_dt = sim.dt * decimation;episode_length_buf 是 per-env 步计数器）
+    timestamp = env.episode_length_buf[env_ids].float() * env.step_dt
+    return {"ball_pos_c": ball_pos_c, "ball_vel_w": ball_vel_w,
+            "ball_ang_w": ball_ang_w, "is_airborne": is_airborne,
+            "has_bounced": has_bounced, "timestamp": timestamp}
+\end{codebox}
+
+若只有 body frame 速度，需用 root link 四元数旋转回 world（Hamilton 约定 $[w,x,y,z]$，与 \cref{ch:rlmc-tennisenv} 的 MuJoCo 约定一致）：$\mathbf v_w=\mathbf R(\mathbf q)\,\mathbf v_b$。对球这种各向同性体，视觉上 body/world 差异不明显，但数值上——topspin $200+$\,rad/s 时 body frame 速度每步都在旋转坐标系中变化，即使 world frame 速度平滑。predictor 不知道这种旋转就会产生有规律的估计误差。三框架都可\emph{直接}取到 world-aligned 速度（mjlab \texttt{root\_link\_lin\_vel\_w}、Isaac \texttt{root\_lin\_vel\_w}、UniLab 后端 \texttt{get\_body\_lin\_vel\_w}），同时也都提供 body-frame 便利接口（mjlab \texttt{root\_link\_lin\_vel\_b}、UniLab \texttt{get\_body\_lin\_vel\_b}）——本节统一只用 world 版本喂 predictor，body 版本仅供机器人本体感知用。
+
+\paragraph{配置详解：观测历史 buffer。}前沿系统（PACE\cite{tennis_pace2025}、ETH\cite{tennis_eth2025badminton}）把最近 $N$ 帧球位置作为观测输入，这需要环境层维护一个滑动窗口 buffer：
+
+\begin{codebox}[Python]{BallObsHistoryBuffer:N 帧滑动窗口（reset 时必清空）}
+class BallObsHistoryBuffer:
+    def __init__(self, num_envs, history_length, obs_dim, device):
+        self.buffer = torch.zeros(num_envs, history_length, obs_dim, device=device)
+        self.timestamps = torch.zeros(num_envs, history_length, device=device)
+        self.valid = torch.zeros(num_envs, history_length, dtype=torch.bool, device=device)
+    def push(self, obs, timestamp):
+        self.buffer[:, :-1] = self.buffer[:, 1:].clone()        # 左移丢最旧
+        self.timestamps[:, :-1] = self.timestamps[:, 1:].clone()
+        self.valid[:, :-1] = self.valid[:, 1:].clone()
+        self.buffer[:, -1] = obs; self.timestamps[:, -1] = timestamp
+        self.valid[:, -1] = True
+    def reset(self, env_ids):                                   # episode reset 必调
+        self.buffer[env_ids] = 0.0; self.timestamps[env_ids] = 0.0
+        self.valid[env_ids] = False
+\end{codebox}
+
+\begin{finenote}
+本书教学项目采用「最近 $10$ 帧球位置（每帧 3D $=30$ 维）$\to$ 预测未来若干步」的设定。这是\emph{教学选择}；PACE 官方的 learned predictor 更轻量，输入近期若干帧球位置、输出目标击球点而非一整条多步状态轨迹\cite{tennis_pace2025}。buffer 须在环境 \verb|step()| 每步 \verb|push|、在 \verb|reset()| 时 \verb|reset|——否则新 episode 残留上一球的历史，predictor 基于错误历史预测。
+\end{finenote}
+
+\paragraph{运行验证。}单元测试（不需仿真）：对单位四元数 $q=(1,0,0,0)$，body 与 world 速度应相同；对 $q=(0.707,0,0.707,0)$（绕 $y$ 轴 $90^\circ$），body 的 $(1,0,0)$ 应变成 world 的 $(0,0,-1)$。集成测试：在仿真里跑一条 episode，断言 \verb|reset| 后 \verb|buffer.valid| 全 False、\Verb[breaklines]|history.buffer.norm()==0|。
+
+\paragraph{工程基本功：别记属性名，去机器上「问」它。}本节这一处 \texttt{root\_link\_pos\_w}（mjlab）vs \texttt{root\_pos\_w}（Isaac）的差异，正是\textbf{照书背 API 名}最容易栽的地方——版本一升、框架一换，名字就漂。\textbf{可迁移的工程习惯不是记名字，而是当场打印属性表去查}。第一次接一个新框架/新版本，先跑这 $3$ 行（比对照任何文档都准，因为它问的就是\emph{你这台机器上装的}那一版）：
+
+\begin{codebox}[Python]{在你的框架上自查球状态属性名（catch root\_link\_ vs root\_）}
+# mjlab:取到 ball 实体后，列出 data 上所有公开属性
+ball = env.scene["ball"]
+print([a for a in dir(ball.data) if "pos_w" in a or "vel_w" in a])
+# mjlab 1.4.0 会打印 ['root_link_pos_w','root_com_pos_w','root_link_lin_vel_w',...]
+#   —— 看不到裸 'root_pos_w'，正说明它在 mjlab 不存在，写它会 AttributeError.
+# Isaac Lab 同样一行，会打印 ['root_pos_w','root_lin_vel_w',...]（无 _link_）.
+# UniLab 不是 .data.* 风格:列后端 getter —— print([m for m in dir(env._backend)
+#   if m.startswith("get_body")]) 会给 ['get_body_pos_w','get_body_lin_vel_w',...].
+\end{codebox}
+
+\noindent 这条习惯比本节任何一个具体名字都值钱：\textbf{把「这名字对不对」从「赌书写得对」变成「跑一行当场确认」}。下游若发现某属性 \texttt{AttributeError}，第一反应就该是这三行，而不是猜。
+
+\paragraph{三框架对比：取真值与 env\_origins。}核心代码三框架共用，唯一差异在「从哪个对象取」，已在上表「来源」列给出。mjlab 与 Isaac Lab 同为 manager-based、\Verb[breaklines]|env.scene.env_origins| 同名同义（刻意设计）；\textbf{UniLab 不是 manager-based}——它的物理是 CPU 上\emph{每个环境一份独立世界}（\verb|NpEnv|，无共享场景偏移），刚体状态经\textbf{后端 getter} 取，而非 \verb|ball.data.*| 这种 Articulation/RigidObject 属性。因此「世界系球位置」直接就是 court-local（每个 env 自成一界、原点本就在场地），无需减 \verb|env_origins|；其余 label 收集逻辑（frame 统一、timestamp 关联）仍框架无关：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+环节 & mjlab 1.4.0 & Isaac Lab 2.3.x & UniLab \\
+\midrule
+球位置 & \Verb[breaklines]|ball.data.root_link_pos_w| & \Verb[breaklines]|ball.data.root_pos_w| & \Verb[breaklines]|backend.get_body_pos_w(ids)| \\
+球速（world） & \Verb[breaklines]|root_link_lin_vel_w| & \Verb[breaklines]|root_lin_vel_w| & \Verb[breaklines]|backend.get_body_lin_vel_w(ids)| \\
+env 原点 & \Verb[breaklines]|scene.env_origins| & \Verb[breaklines]|scene.env_origins| & 无（每 env 独立世界） \\
+label 收集代码 & \multicolumn{2}{c}{逻辑逐行相同，\emph{唯} root 状态属性名差 \texttt{\_link\_}} & 同左（拿到 pos/vel 后一致） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{finenote}
+\textbf{\texttt{\_link\_} 还是 \texttt{\_com\_}？对球无所谓，对人形要命。}mjlab 1.4.0 把每个位姿/速度都拆成连杆系（\texttt{root\_link\_pos\_w}）与质心系（\texttt{root\_com\_pos\_w}）两套（详见 \cref{ch:rlmc-manager}）。\textbf{网球是单刚体、连杆原点~=质心}，故本章取 \texttt{root\_link\_*} 还是 \texttt{root\_com\_*} 数值几乎无差。但当本章管线接到下游\emph{人形}击球控制时（\cref{ch:rlmc-visuomotor} 之后），喂 predictor / 算击球点用的若是某个 body，\texttt{\_link\_}（运动学/几何落点）与 \texttt{\_com\_}（动力学积分点）会差出几厘米——\textbf{球的状态一律用 \texttt{\_link\_}（球心即落点），不要顺手抄成 \texttt{\_com\_}}。Isaac Lab 只有单一 \texttt{root\_pos\_w}（语义上即 link 原点），无此二选一。
+\end{finenote}
+
+\begin{pitfall}[编程陷阱：把 reward 区域当 detector label]
+\textbf{错误描述}：拿 \cref{ch:rlmc-tennisenv} 的「球落在发球区」reward 标志当精确空间 label。\textbf{现象后果}：label 与真实落点几何对不上，训练出的预测器系统性偏。\textbf{根本原因}：那个 reward 是 Phase 1 的合并 service-area 奖励（不分 deuce/ad），不是精确空间判定。\textbf{正确做法}：label 用 ground-truth 坐标直接做几何判定。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[编程]} 写 \Verb[breaklines]|body_to_world_velocity| 并用上面两个四元数验证（验收：两 case 误差 $<10^{-5}$）。
+  \item \textbf{[设计]} 给 label 表扩 \Verb[breaklines]|first_bounce_pos| 与 \Verb[breaklines]|net_crossing_height| 两字段，说明它们对下游 reward 的用途（验收：每字段写清「来源 $+$ 用途」）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{球状态观测方案对比}
+\label{sec:rlmc-perc-obs}
+
+\paragraph{模块功能与在管线中的位置。}本节系统对比三种观测方案（直接状态 / 外部动捕 / 机载视觉），为教学项目选方案，并给出「信息退化阶梯」这把把问题拆开的工具。它决定了你在 \cref{sec:rlmc-perc-distill} 里从哪一阶起步、往哪一阶降级。
+
+\paragraph{配置详解：三种观测方案。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+方案 & 精度 & 延迟 & 硬件 & 适用阶段 \\
+\midrule
+直接状态（真值） & 完美 & $0$ & 无（仿真内置） & 验证控制上限 \\
+外部动捕（OptiTrack/Vicon） & 亚毫米 & $3$--$5$\,ms & $6$--$9$ 高速相机 & 实验室部署 \\
+机载视觉（RGB/depth） & 厘米级 & $20$--$100$\,ms & $1$--$2$ 相机 & 自主部署 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{方案 A：直接状态（仿真阶段唯一推荐起点）}。直接读球真值（mjlab \Verb[breaklines]|root_link_pos_w| / Isaac \verb|root_pos_w|），消除感知层全部误差，专注验证控制策略本身。\textbf{为什么不加噪声}？因为第一阶段目标是建\emph{控制上限}——完美感知下策略能到什么成功率？若完美感知下只有 $50\%$，问题在控制而非感知，你不该去改 detector。这就是 \cref{ch:rlmc-privileged} 特权学习的理念。
+
+\begin{codebox}[Python]{方案 A:privileged 球状态 obs term（9D）}
+def ball_state_privileged(env) -> torch.Tensor:
+    ball = env.scene["ball"]
+    # mjlab 1.4.0 属性名（连杆系）;Isaac Lab 把下面三处的 root_link_ 改成 root_
+    pos_c = ball.data.root_link_pos_w[:, :3] - env.scene.env_origins
+    vel_w = ball.data.root_link_lin_vel_w[:, :3]
+    ang_w = ball.data.root_link_ang_vel_w[:, :3]
+    return torch.cat([pos_c, vel_w, ang_w], dim=-1)        # [N, 9]
+\end{codebox}
+
+\textbf{方案 B：外部动捕（实验室阶段）}。HITTER 用 $9$ 台 OptiTrack @ $360$\,Hz\cite{tennis_hitter2025}，提供 3D 位置（球上反光标记）但\emph{不直接给速度}——速度需从位置差分或 EKF 估计。仿真里模拟：给真值位置加亚毫米噪声，速度交给 \cref{sec:rlmc-perc-ekf} 的 EKF。
+
+\textbf{方案 C：机载视觉（自主部署阶段）}。ETH ANYmal-D（四足）是少见的仅靠机载立体相机的球类全身控制系统，核心创新是 perception-aware training——训练时注入随距离/运动变化的噪声模型让策略学会在噪声下工作\cite{tennis_eth2025badminton}。噪声随距离（远处检测更不准）、运动模糊（机器人快速运动）、遮挡漏检（概率丢帧）而变，详见 \cref{sec:rlmc-perc-distill}。
+
+\paragraph{代码走读：从 2D 图像到 3D 球心的四条路线。}若最终用机载视觉，需把 2D 检测转 3D 球心，四种方法复杂度递增：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+路线 & 方法 & 短板 & 适用阶段 \\
+\midrule
+Depth 反投影 & 球 mask 内深度 $+$ 内参 & 小球 depth 噪声大 & 2--3 \\
+多相机三角化 & 2D ray 求最近点 & 需同步$+$标定 & 3--4 \\
+单目 $+$ EKF & 2D center $+$ 运动模型 & 可观测性差 & 4--5 \\
+端到端 latent & CNN/GRU $\to$ 轨迹 & debug 困难 & 研究 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{球在图像里有多大}？快速估算：球距相机 $15$\,m、$\mathrm{fovy}=45^\circ$、图像宽 $640$\,px，视场宽 $=2\times 15\times\tan 22.5^\circ\approx 12.4$\,m，球直径 $0.066$\,m 占 $0.066/12.4\times 640\approx 3.4$ 像素——远距离只有几个像素，标准 YOLO 对这么小目标效果很差。前沿方向用事件相机降延迟（如乒乓球事件相机检测的最坏情况总延迟低至 $4.5$\,ms，远低于 $30$\,FPS 帧相机最坏 $66$\,ms 的纯感知延迟，arXiv:2506.07860）。
+
+\paragraph{多视角：信息退化阶梯。}把方案排成「信息退化阶梯」，每步移除一个 privileged 信号源、记录性能下降——这是 \cref{ins:rlmc-perc-essence} 「逐层定位」的可执行版本：
+
+\begin{center}
+\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+阶段 & 输入 & 移除了什么 & 量化目的 \\
+\midrule
+1 & 真值球状态 & 无（上限） & 控制上限 \\
+2 & 真值位置 $+$ 差分速度 & 直接速度 & 速度估计影响 \\
+3 & 真值位置 $+$ 延迟 & 零延迟 & 延迟影响 \\
+4 & 真值位置 $+$ 噪声 $+$ 延迟 & 完美定位 & 噪声影响 \\
+5 & 动捕位置 $+$ EKF 速度 & 真值 & 动捕够吗 \\
+6 & RGB 视觉 $+$ EKF & 动捕 & 视觉可行性 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{每退一步记录下降}：若阶段 3 下降 $>30\%$（延迟是瓶颈），就投精力在延迟补偿而非改 detector；若阶段 4 与阶段 3 差不多（噪声不是瓶颈），就不需要更好的 detector。\textbf{用 impact point error 与 time-to-impact error 衡量，而非 reward}——reward 混入了控制因素，无法单独反映感知质量。
+
+\begin{insight}[privileged signal 不是作弊，而是把问题拆开的工具]\label{ins:rlmc-perc-ladder}
+仿真里的 privileged signal 不是作弊，而是\textbf{把问题拆开的手术刀}：先用真值建上限，再逐级移除真值，才能知道性能掉在哪一层。这与 \cref{ch:rlmc-diag} 的「smoke $\to$ zero $\to$ random $\to$ small $\to$ full」分级验证同源——都是「先排除已知、再暴露未知」。
+\end{insight}
+
+\paragraph{三框架对比：相机 sensor 配置（预规划）。}\rebuilt{当前\emph{网球}任务三框架都没有相机 sensor，但「框架本身有没有相机能力」是另一回事——这点源稿讲错了，需纠正。}\textbf{mjlab 并非「只有 Warp 渲染管线、没有相机配置类」}：经服务器实测（\cref{ch:rlmc-visuomotor}），mjlab 1.4.0 有一等的 \texttt{CameraSensorCfg}（\Verb[breaklines]|from mjlab.sensor import CameraSensorCfg|），\texttt{data\_types} 为 \texttt{Literal['rgb','depth','segmentation']}，输出 \texttt{rgb=[N,H,W,3] uint8} / \texttt{depth=[N,H,W,1] float32} / \texttt{segmentation=[N,H,W,2] int32}，且仓库\emph{已带}可直接跑的视觉任务 \Verb[breaklines]|Mjlab-Lift-Cube-Yam-Rgb| / \verb|-Depth| / \Verb[breaklines]|Mjlab-Multi-Cube-Seg-Yam|（虽是 Yam 机械臂 manip 而非网球）。Isaac Lab 侧提供 \texttt{CameraCfg}（USD 相机）与高吞吐的 \texttt{TiledCameraCfg}（继承自 \texttt{CameraCfg}，多环境瓦片渲染，强化学习首选），\texttt{data\_types} 支持 \texttt{rgb}、\texttt{distance\_to\_image\_plane}（深度）、\texttt{semantic\_segmentation} 等（确切类名/字段随版本演进，以你所装版本为准）。\textbf{所以「网球感知」缺的不是 mjlab 的相机能力，只是缺一个挂了相机的网球任务}。注意 segmentation 在仿真里给完美球像素 mask，但部署不可用，故只作 teacher signal（\cref{ch:rlmc-privileged}）；这个 teacher 信号\emph{今天就能在 mjlab 的 Seg 任务上跑出来看}（见本节末动手任务）。\textbf{UniLab 在此处与前两者本质不同}：经核源码（commit \texttt{99936e08}），UniLab 当前 $26$ 个注册任务\emph{全是本体感知}，\textbf{无 RGB/depth 相机观测任务、无训练时相机 sensor 接口}——MotrixSim 虽带原生 renderer，但仅用于回放可视化（如 \Verb[breaklines]|demo teaser|），不是训练时的相机观测。故本节相机配置 UniLab 列\textbf{无对应}，是 \cref{sec:rlmc-perc-essence} 所述「感知层只有 layer 1 真值、无 layer 2 相机」在 UniLab 上的真实写照；待官方补相机/视觉任务后再填。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+环节 & mjlab 1.4.0 & Isaac Lab 2.3.x & UniLab \\
+\midrule
+相机配置类 & \Verb[breaklines]|CameraSensorCfg|（一等） & \Verb[breaklines]|TiledCameraCfg|/\allowbreak\verb|CameraCfg| & 无（当前无视觉任务） \\
+深度数据键 & \Verb[breaklines]|data_types=('depth',)| & \Verb[breaklines]|distance_to_image_plane| & 无对应 \\
+分割（teacher） & \Verb[breaklines]|data_types=('segmentation',)| & \Verb[breaklines]|semantic_segmentation| & 无对应 \\
+多环境渲染 & MuJoCo Warp batched & tiled rendering & 仅回放渲染（非训练 obs） \\
+现成可跑视觉任务 & \Verb[breaklines]|Mjlab-Lift-Cube-Yam-Rgb/-Depth| & 随版本（见 \cref{ch:rlmc-visuomotor}） & 无 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[编程陷阱：仿真里让 PTZ 相机瞬间跟踪球心]
+\textbf{错误描述}：第一版就给相机加「瞬间对准球」的 PTZ 跟踪。\textbf{现象后果}：等于给了不真实的 privileged tracking，Sim2Real 时真实云台跟不上、性能崩。\textbf{根本原因}：真实相机云台有转速上限和延迟，瞬间跟踪物理上不可能。\textbf{正确做法}：第一版不做 PTZ；若做必须加转速限制与延迟（呼应 ETH 的 perception-aware 思想）。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[设计]} 设计退化阶梯实验：每步移除什么 privileged signal？用什么指标（impact point error / time-to-impact error，\emph{非} reward）衡量？（验收：六阶段各写「移除项 $+$ 指标」）
+  \item \textbf{[估算]} 球距相机 $15$\,m、$\mathrm{fovy}=45^\circ$、图像宽 $160$\,px，球占多少像素？（提示：视场宽 $=2\times 15\times\tan 22.5^\circ$；验收：给数 $+$ 评论是否够 detector）
+  \item \textbf{[实跑]} 网球任务暂无相机，但 mjlab \emph{已带}视觉任务——\textbf{$5$ 分钟亲眼看一帧相机张量}：先 \Verb[breaklines]|mjlab list-envs| 确认 \Verb[breaklines]|Mjlab-Lift-Cube-Yam-Rgb| 在列，再无显示器服务器上跑（关键两个环境变量）：
+\begin{codebox}[bash]{在 mjlab 真视觉任务上看相机 obs 形状（不必有网球任务）}
+# MUJOCO_GL=egl 让无显示器机器也能渲染;WANDB_MODE=disabled 免登录崩溃
+WANDB_MODE=disabled MUJOCO_GL=egl \
+  mjlab train Mjlab-Lift-Cube-Yam-Rgb --env.scene.num-envs 64 --agent.max-iterations 2
+# 启动日志里 obs 组会打印形如 camera_*_rgb (3,32,32) 的相机张量（CHW）.
+# 想看 depth/seg:把任务换成 -Depth 或 Mjlab-Multi-Cube-Seg-Yam.
+\end{codebox}
+  （验收：贴出你看到的相机 obs 键名与形状，并对照 \cref{ch:rlmc-visuomotor}：rgb 是 \texttt{uint8} 还是 float？depth 形状末维是几？这就是网球任务挂相机后 layer 2 会长的样子。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{扩展卡尔曼滤波器：从贝叶斯到批量 GPU 实现}
+\label{sec:rlmc-perc-ekf}
+
+\paragraph{模块功能与在管线中的位置。}本节是感知链条层 4（状态估计）的核心：从有噪声的观测里提取可靠球状态。它吃 \cref{sec:rlmc-perc-frame} 的观测、吐位置/速度/协方差给 \cref{sec:rlmc-perc-gru} 的预测器。\textbf{假定读者已掌握 EKF 的贝叶斯推导与高斯乘积}（理论课已讲），本节只在「网球轨迹」语境下复用，重点放在工程落地：批量 GPU、漏检处理、数值稳定。
+
+\paragraph{动机：为什么滤波而非直接观测。}观测完美无噪声时直接用即可。但现实中检测有抖动（像素噪声反投影为厘米级误差）、有遗漏、有延迟。EKF 的本质是\textbf{在有噪声观测与不完美模型之间做最优权衡}。类比：你有两个不太靠谱的朋友指路——一个看地图（模型预测，知道大方向但有偏差），一个站路口看（观测，能看实时但有时说错）；EKF 就是根据「谁更可信」综合两人意见的导航系统。
+
+\paragraph{状态空间与过程模型（纯重力版）。}最小状态 $\mathbf x=(p_x,p_y,p_z,v_x,v_y,v_z)^{\!\top}\in\mathbb R^6$。\textbf{为什么不含角速度}？若后续要估旋转（Magnus），可扩到 9D；但第一版不要过大——状态越大、观测越难约束、数值越不稳。先用 6D 验证基本功能。Euler 离散（$\Delta t$ 小时足够）：
+
+\begin{equation}
+\mathbf x_{k+1}=f(\mathbf x_k,\Delta t)=
+\begin{pmatrix}
+\mathbf p_k+\mathbf v_k\Delta t+\tfrac12\mathbf g\,\Delta t^2\\[2pt]
+\mathbf v_k+\mathbf g\,\Delta t
+\end{pmatrix},\quad \mathbf g=(0,0,-9.81)^{\!\top}.
+\label{eq:rlmc-perc-process}
+\end{equation}
+
+注意 $g_z=-9.81$ 已含负号，故位置/速度项用 $+$ 即得向下重力效果（与下文代码 \Verb[breaklines]|+= 0.5*self.g*dt**2| 一致）。其 Jacobian 对这个\emph{线性}过程就是转移矩阵本身：
+\begin{equation}
+F=\frac{\partial f}{\partial\mathbf x}=
+\begin{pmatrix} I_3 & \Delta t\,I_3\\ 0_3 & I_3\end{pmatrix}\in\mathbb R^{6\times 6}.
+\label{eq:rlmc-perc-jac-gravity}
+\end{equation}
+此时 EKF 退化为标准 Kalman 滤波；加入非线性项（阻力，\cref{sec:rlmc-perc-drag}）后 Jacobian 才变重要。
+
+\paragraph{预测步 / 观测模型 / 更新步。}预测步 $\hat{\mathbf x}_{k|k-1}=f(\hat{\mathbf x}_{k-1|k-1},\Delta t)$，$P_{k|k-1}=FP_{k-1|k-1}F^{\!\top}+Q$。观测直接看 3D 位置：$\mathbf z_k=H\mathbf x_k+\mathbf r_k$，$H=(I_3\ 0_3)$，$\mathbf r_k\sim\mathcal N(0,R)$。更新步：
+\begin{align}
+\mathbf y_k&=\mathbf z_k-H\hat{\mathbf x}_{k|k-1} && \text{(新息)}\label{eq:rlmc-perc-innov}\\
+S_k&=HP_{k|k-1}H^{\!\top}+R, \quad K_k=P_{k|k-1}H^{\!\top}S_k^{-1} && \text{(增益)}\label{eq:rlmc-perc-gain}\\
+\hat{\mathbf x}_{k|k}&=\hat{\mathbf x}_{k|k-1}+K_k\mathbf y_k,\quad P_{k|k}=(I-K_kH)P_{k|k-1}.&&\label{eq:rlmc-perc-update}
+\end{align}
+
+\paragraph{本质洞察：Kalman 增益的物理含义。}$K$ 是 EKF 最核心的量，自动权衡「信模型」还是「信观测」：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+情况 & 物理含义 & 滤波器表现 \\
+\midrule
+$R\to\infty$ & 观测完全不可信 & $K\to 0$，纯靠模型预测 \\
+$P\to\infty$ & 模型完全不可信 & 位置子空间增益趋于单位映射；未观测速度由 $P$ 的位置-速度交叉协方差修正 \\
+$R\approx 0$ & 观测非常精确 & $K$ 大，每次更新大幅修正 \\
+$Q\approx 0$ & 模型非常精确 & $P$ 缓慢增长、$K$ 小，观测影响有限 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个自适应机制让 EKF 能处理不同质量的观测：\textbf{漏检帧时只做预测不更新}，$P$ 逐步增大；一旦重新检测到球，$K$ 自动增大快速纠偏。\textbf{反事实：若不用 EKF、只做差分速度}？$v_k=(p_k-p_{k-1})/\Delta t$ 把观测噪声 $\sigma_p$ 放大为 $\sigma_v=\sqrt2\,\sigma_p/\Delta t$；对 $\sigma_p=2$\,cm、$\Delta t=1/60$\,s，$\sigma_v\approx 1.7$\,m/s（球速的 $5$--$10\%$）——完全不可用。EKF 通过融合模型预测平滑噪声，同时保持对真实变化的响应。
+
+\paragraph{代码走读：批量 GPU EKF（三框架共用）。}下面这份 \verb|BallEKF| 用 \verb|torch.bmm| 对所有环境并行——这是在 GPU 上跑 EKF 的关键（NumPy 单环境循环在 $4096$ 环境下不可接受）。它与物理引擎无关，mjlab/Isaac Lab/UniLab 共用同一份代码。
+
+\begin{codebox}[Python]{BallEKF:6D 纯重力批量 EKF（含 Joseph form）}
+class BallEKF:
+    def __init__(self, num_envs, device, sigma_a=5.0, sigma_obs=0.02):
+        self.num_envs, self.device = num_envs, device
+        self.state_dim, self.obs_dim = 6, 3
+        self.x = torch.zeros(num_envs, 6, device=device)              # (p3, v3)
+        self.P = torch.eye(6, device=device).expand(num_envs, 6, 6).clone() * 10.0
+        self.sigma_a = sigma_a
+        self.R = torch.eye(3, device=device) * sigma_obs**2
+        self.H = torch.zeros(3, 6, device=device); self.H[:3, :3] = torch.eye(3)
+        self.g = torch.tensor([0.0, 0.0, -9.81], device=device)
+
+    def predict(self, dt):
+        x = self.x.clone()
+        x[:, :3] += self.x[:, 3:6] * dt + 0.5 * self.g * dt**2        # 含重力
+        x[:, 3:6] += self.g * dt
+        self.x = x
+        F = torch.eye(6, device=self.device).expand(self.num_envs, 6, 6).clone()
+        F[:, :3, 3:6] = torch.eye(3, device=self.device) * dt
+        self.P = torch.bmm(torch.bmm(F, self.P), F.transpose(1, 2)) + self._Q(dt)
+
+    def update(self, z, detected):
+        if not detected.any():                                       # 全漏检:只预测
+            return
+        ids = detected.nonzero(as_tuple=True)[0]
+        H = self.H.expand(len(ids), 3, 6)
+        y = z[ids] - torch.bmm(H, self.x[ids].unsqueeze(-1)).squeeze(-1)
+        P = self.P[ids]
+        S = torch.bmm(torch.bmm(H, P), H.transpose(1, 2)) + self.R
+        K = torch.bmm(torch.bmm(P, H.transpose(1, 2)), torch.linalg.inv(S))
+        self.x[ids] = self.x[ids] + torch.bmm(K, y.unsqueeze(-1)).squeeze(-1)
+        # Joseph form:P = (I-KH)P(I-KH)^T + KRK^T，保证对称正定
+        I_KH = torch.eye(6, device=self.device).expand(len(ids), 6, 6) - torch.bmm(K, H)
+        Rb = self.R.expand(len(ids), 3, 3)
+        self.P[ids] = (torch.bmm(torch.bmm(I_KH, P), I_KH.transpose(1, 2))
+                       + torch.bmm(torch.bmm(K, Rb), K.transpose(1, 2)))
+
+    def _Q(self, dt):       # 连续白噪声加速度模型
+        s2 = self.sigma_a ** 2; I = torch.eye(3, device=self.device)
+        Q = torch.zeros(self.num_envs, 6, 6, device=self.device)
+        Q[:, :3, :3] = I * (s2 * dt**4 / 4); Q[:, :3, 3:6] = I * (s2 * dt**3 / 2)
+        Q[:, 3:6, :3] = I * (s2 * dt**3 / 2); Q[:, 3:6, 3:6] = I * (s2 * dt**2)
+        return Q
+
+    def reset(self, ids, init_pos, init_vel=None):
+        self.x[ids, :3] = init_pos
+        self.x[ids, 3:6] = init_vel if init_vel is not None else 0.0
+        self.P[ids] = torch.eye(6, device=self.device) * 10.0
+
+    @property
+    def estimated_pos(self): return self.x[:, :3]
+    @property
+    def estimated_vel(self): return self.x[:, 3:6]
+    @property
+    def position_uncertainty(self):     # 位置协方差 trace 的平方根
+        return self.P[:, :3, :3].diagonal(dim1=-2, dim2=-1).sum(dim=-1).sqrt()
+\end{codebox}
+
+\textbf{Joseph form 为什么必须用}：简化式 $P=(I-KH)P$ 在数值上不对称，可能让 $P$ 逐步变非正定 $\to$ Kalman gain 出 NaN、EKF 崩溃。Joseph form $P=(I-KH)P(I-KH)^{\!\top}+KRK^{\!\top}$ 保证对称正定（上面代码已用）；若仍有数值问题，可每步后强制对称化 $P\leftarrow(P+P^{\!\top})/2$。
+
+\paragraph{配置详解：$Q$ 与 $R$ 四维调参。}EKF 性能高度依赖 $Q$、$R$。下表四维给出（默认值来源 / 修改影响 / 合理范围 / 与其他配置耦合）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{2.4cm}p{2.6cm}p{2.5cm}p{2.6cm}@{}}
+\toprule
+参数 & 默认值来源 & 修改影响 & 合理范围 & 耦合 \\
+\midrule
+$\sigma_{\text{obs}}$（$R$） & 直接测：真值$-$观测的方差 & 大$\to$更信模型（平滑但滞后） & 动捕 $0.001$；RGB $0.03$--$0.05$ & 决定 $Q/R$ 比 \\
+$\sigma_a$（$Q$） & 遗漏加速度量级 & 大$\to$更信观测（反应快但嘈杂） & 纯重力 $5$；含 drag $1$--$3$ & 随球速增大 \\
+$Q/R$ 比 & 由上两者派生 & 决定滤波器「性格」 & 球速越快越大 & 弹跳后临时调大 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+调参流程：(1) \textbf{先定 $R$}——观测噪声可直接测，收集真值与 noisy obs 算差异方差。(2) \textbf{用 NIS 一致性检验调 $Q$}——EKF 工作良好时新息 $\mathbf y_k$ 应是白噪声（均值零、方差为预测的 $S_k$），归一化新息平方 $\mathrm{NIS}=\mathbf y_k^{\!\top}S_k^{-1}\mathbf y_k$ 应服从 $\chi^2$、长期均值约等于观测维数 $3$。若 NIS 长期偏大$\to$滤波器低估不确定性、$Q$（或 $R$）太小、应增大 $\sigma_a$；NIS 长期偏小$\to$ $Q/R$ 太大、应减小。若新息有\emph{系统性偏移}（始终偏正/偏负）$\to$ 有未建模确定性项（漏掉 drag/Magnus），该上 \cref{sec:rlmc-perc-drag}。(3) \textbf{按球速分档调 $Q$}——高速球 drag 更强（$\propto v^2$）、模型误差更大，$\sigma_a$ 应更大。
+
+\paragraph{把 NIS 从「公式」变成「跑一遍看见 $\approx 3$」。}NIS 配方只看文字很抽象；而 Quick Start 那条玩具轨迹\emph{有真值}，正是亲手算一次 NIS、看它是否压在 $3$ 附近的最佳场所。在那段 $6$D KF 的更新步里，新息 \verb|y| 与新息协方差 \verb|S| 都是现成的，加两行就能累计 NIS：
+
+\begin{codebox}[Python]{在 Quick Start 的 KF 里打印 NIS（应 ~3）}
+# 把下面两行加进 Quick Start 那个 for k 循环（在算出 y、S 之后）:
+nis_k = (y @ torch.linalg.inv(S) @ y).item()   # 标量 NIS_k = y^T S^-1 y
+nis_list.append(nis_k)                          # 循环外先 nis_list=[]
+# 循环结束后:
+import statistics
+print(f"mean NIS = {statistics.mean(nis_list):.2f}  (obs dim=3，健康区间约 [2,4])")
+# 解读:均值 ~3 => Q/R 标定一致;>>3 => 低估不确定性（调大 sigma_a/Q）;
+#       <<3 => 太保守（调小 Q）.比只看 RMSE 更能区分「该调 Q 还是该换模型」.
+\end{codebox}
+
+\noindent\textbf{为什么 NIS 比 RMSE 会调参}：RMSE 只告诉你「准不准」，NIS 告诉你「滤波器对自己不确定性的\emph{自估}诚不诚实」——后者才是 $Q/R$ 该往哪调的方向盘。新息若还有系统性偏移（均值非零），那是漏了 drag/Magnus 这类确定性项，调 $Q$ 治不了，得上 \cref{sec:rlmc-perc-drag}。
+
+\paragraph{运行验证。}在课程示例环境里跑 EKF demo：读球真值（mjlab \Verb[breaklines]|root_link_pos_w| / Isaac \verb|root_pos_w|）加 $2$\,cm 噪声当观测，记录三条曲线（真值 / 原始观测 / EKF 估计）与不确定性。\textbf{看什么——但先校准预期}：\textbf{位置 RMSE 的降幅取决于 $Q/R$ 与你评的是位置还是速度}。本节 Quick Start 设定（$2$\,cm 噪声、$\Delta t=0.01$、$R=4\times10^{-4}$、$Q$ 小）下，\textbf{实测位置 RMSE 只从约 $3.1$\,cm 降到约 $2.6$\,cm（仅 $\sim 18\%$）}——因为观测\emph{直接}看位置且噪声不大，位置已经够好、KF 平滑空间有限。\textbf{若你得到 $\sim 18\%$ 不是 bug}。KF 在此设定真正大赢的是\textbf{速度}：差分速度的噪声被放大成 $\sigma_v=\sqrt2\,\sigma_p/\Delta t\approx 2.8$\,m/s，而 KF 估的速度 RMSE 低一个量级——\textbf{所以验收应评速度 RMSE（或 NIS），不要只盯位置 RMSE}。要让位置降幅也明显（$50\%+$），需把噪声调到 $\sim 5$\,cm、$\Delta t$ 调粗到 $1/60$\,s（观测更稀更脏，模型预测的权重才显著）。不确定性曲线在收敛后应稳定在小值，漏检时上升、重新检测后回落。
+
+\paragraph{三框架对比。}EKF 代码本身与引擎无关，三框架仅观测获取方式不同（已在 \cref{sec:rlmc-perc-frame} 表给出）。Isaac Lab 作为仿真/强化学习框架本身\emph{不}内置 EKF 等状态估计器——但可在 Isaac Lab 环境里用完全相同的这份 PyTorch EKF；mjlab、UniLab 同理。这是分层设计的好处：感知层与物理层解耦。
+
+\begin{pitfall}[编程陷阱：$Q$ 与 $R$ 的单位不一致]
+\textbf{错误描述}：笼统说「$Q$ 用 m$^2/$s$^2$」、或 $R$ 用 cm$^2$ 而状态用米。\textbf{现象后果}：Kalman 增益无物理意义，估计要么过冲要么死板。\textbf{根本原因}：$Q$ 各块单位不同——位置-位置块 m$^2$、位置-速度块 m$^2/$s、速度-速度块 m$^2/$s$^2$。\textbf{正确做法}：全量统一 SI（米、秒），$R$ 的位置观测协方差用 m$^2$。
+\end{pitfall}
+
+\begin{pitfall}[编程陷阱：协方差更新不用 Joseph form]
+\textbf{错误描述}：图省事用 $P=(I-KH)P$。\textbf{现象后果}：$P$ 渐失对称、变非正定，某帧后 Kalman gain 全 NaN，整章管线崩。\textbf{根本原因}：简化式的浮点舍入破坏对称正定性。\textbf{正确做法}：用 Joseph form（上面代码已实现），必要时再加强制对称化。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[编程]} 用 \verb|BallEKF| 生成一条抛体真值轨迹、加 $\sigma=2$\,cm 噪声，跑 EKF 并画「估计 vs 真值 vs 纯观测」三曲线（验收：EKF RMSE $<$ raw RMSE，给出两数）。
+  \item \textbf{[分析]} 把 $R$ 增大 $10\times$、再把 $Q$ 增大 $10\times$，观察输出。什么情况下「太信模型」、什么情况下「太信观测」？（验收：用 $Q/R$ 比解释两种极端）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{含空气阻力的非线性 EKF}
+\label{sec:rlmc-perc-drag}
+
+\paragraph{模块功能与在管线中的位置。}本节把 \cref{ch:rlmc-tennisenv} 的空气动力学集成进 EKF 过程模型，让它真正「非线性」。这是 \cref{sec:rlmc-perc-ekf} 纯重力 EKF 的直接升级——也是把「Jacobian」从摆设变成关键的地方。
+
+\paragraph{动机：纯重力 EKF 的误差。}\cref{ch:rlmc-tennisenv} 算过：$30$\,m/s 下空气阻力约 $1.04$\,N，比重力（$0.56$\,N）还大。纯重力 EKF 会系统性高估飞行距离和速度。这个误差能被大 $Q$ 部分吸收（$Q$ 越大越不信模型），但更好的做法是在过程模型里直接含阻力。
+
+\paragraph{含阻力的过程模型与 Jacobian 推导。}令 $\alpha=\rho C_d A/(2m)$（标准网球 $\alpha\approx 0.0202$\,m$^{-1}$，沿用 \cref{ch:rlmc-tennisenv} 的 drag 参数），$\dot{\mathbf v}=\mathbf g-\alpha|\mathbf v|\mathbf v$。关键在对 $\alpha|\mathbf v|v_i$ 求偏导，用链式法则：
+\begin{equation}
+\frac{\partial(|\mathbf v|v_i)}{\partial v_j}=\frac{v_iv_j}{|\mathbf v|}+|\mathbf v|\delta_{ij}
+\;\Rightarrow\;
+\frac{\partial\dot{\mathbf v}}{\partial\mathbf v}=-\alpha\!\left(\frac{\mathbf v\mathbf v^{\!\top}}{|\mathbf v|}+|\mathbf v|I_3\right).
+\label{eq:rlmc-perc-drag-jac}
+\end{equation}
+离散化后的 Jacobian（$D\doteq\partial\dot{\mathbf v}/\partial\mathbf v$）：
+\begin{equation}
+F=\begin{pmatrix} I_3 & \Delta t\,I_3+\tfrac{\Delta t^2}{2}D\\[2pt] 0_3 & I_3+\Delta t\,D\end{pmatrix}.
+\label{eq:rlmc-perc-drag-F}
+\end{equation}
+当 $\alpha=0$ 时 $D=0$，\eqref{eq:rlmc-perc-drag-F} 退化为纯重力的 \eqref{eq:rlmc-perc-jac-gravity}——这是验证推导正确性的第一个 sanity check。
+
+\paragraph{代码走读：含阻力的预测步（继承 BallEKF）。}
+
+\begin{codebox}[Python]{BallEKFWithDrag:含二次阻力的非线性预测}
+class BallEKFWithDrag(BallEKF):
+    def __init__(self, num_envs, device, alpha=0.0202, **kw):
+        super().__init__(num_envs, device, **kw)
+        self.alpha = alpha                                  # rho*Cd*A / (2m)
+
+    def predict(self, dt):
+        vel = self.x[:, 3:6]
+        speed = vel.norm(dim=-1, keepdim=True).clamp(min=1e-6)   # 防除零！
+        a = self.g.unsqueeze(0) - self.alpha * speed * vel        # 重力 + 阻力
+        x = self.x.clone()
+        x[:, :3] += vel * dt + 0.5 * a * dt**2
+        x[:, 3:6] += a * dt
+        self.x = x
+        F = torch.eye(6, device=self.device).expand(self.num_envs, 6, 6).clone()
+        vvT = torch.bmm(vel.unsqueeze(-1), vel.unsqueeze(-2))     # [N,3,3]
+        I = torch.eye(3, device=self.device)
+        D = -self.alpha * (vvT / speed.unsqueeze(-1) + speed.unsqueeze(-1) * I)
+        F[:, :3, 3:6] = I * dt + 0.5 * D * dt**2
+        F[:, 3:6, 3:6] = I.unsqueeze(0) + D * dt
+        self.P = torch.bmm(torch.bmm(F, self.P), F.transpose(1, 2)) + self._Q(dt)
+\end{codebox}
+
+含 drag 模型误差更小（更接近真实物理），所以 $\sigma_a$ 可从 $5$ 降到 $1$--$3$（只需覆盖 Magnus 等遗漏项）。若已知角速度 $\boldsymbol\omega$（从真值或发球参数推算），Magnus 力可作\textbf{已知外力}加入过程模型而\emph{不}扩展状态——状态仍 6D、但模型更精确，代价是需要一个合理的 $\boldsymbol\omega$ 估计。Gray-box 乒乓球预测（Achterhold 等，L4DC 2023，arXiv:2305.15189）正是这么做：用神经网络从 launcher 参数预测初始旋转、再喂进 EKF，而非在线估计——他们证明「从 launcher 参数初始化 spin」比「纯从球位置估 spin」的长时预测性能\emph{大幅}更好\cite{achterhold2023graybox}。
+
+\paragraph{运行验证：Jacobian 有限差分检验。}非线性 Jacobian 是 EKF 最易出错处。开发阶段务必用有限差分验证解析 Jacobian：对每个状态分量 $j$ 做 $F_{:,j}\approx(f(\mathbf x+\epsilon e_j)-f(\mathbf x-\epsilon e_j))/(2\epsilon)$，与解析 $F$ 比较，断言 \Verb[breaklines]|max_diff < 1e-4|。\textbf{工程建议}：把它放进单元测试，\emph{每次改过程模型后自动跑}——Jacobian 里一个符号错就能让协方差传播完全错、$P$ 变非正定、gain 出 NaN。
+
+\paragraph{含 drag EKF 的预期改进。}标准发球条件（$20$--$45$\,m/s）下，含 drag 相比纯重力应有显著改进：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+指标 & 纯重力 EKF & 含 drag EKF & 改进 \\
+\midrule
+位置 RMSE（$0.5$\,s 预测） & $2$--$5$\,m & $0.3$--$0.8$\,m & $60$--$85\%$ \\
+速度 RMSE & $5$--$15$\,m/s & $1$--$3$\,m/s & $70$--$80\%$ \\
+落地点误差 & $3$--$8$\,m & $0.5$--$1.5$\,m & $70$--$85\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\pz{待核实：上表为源稿给出的量级估计，未在本仓库实测复现；含 drag 优于纯重力是定性确定的（\cref{ch:rlmc-tennisenv} 已证阻力让球减速 $30$--$50\%$），但具体百分比依发球分布、$\Delta t$、$\sigma_a$ 而变，部署前应在自己的轨迹上实测。}这些数字说明：\textbf{含 drag 不是锦上添花而是必需}——纯重力在高速球下误差大到无法用于击球控制。
+
+\paragraph{三框架对比。}与 \cref{sec:rlmc-perc-ekf} 同——核心代码三框架共用；唯一框架相关的输入是球角速度（用于 Magnus 已知外力），\textbf{属性名按框架取}：mjlab \Verb[breaklines]|root_link_ang_vel_w|、Isaac \Verb[breaklines]|root_ang_vel_w|、UniLab 经后端 getter 读（与 \Verb[breaklines]|get_body_lin_vel_w| 同一套，参 \cref{sec:rlmc-perc-frame} 的命名差异）。$\alpha$ 应\emph{可配置}并在训练中通过 DR（\cref{ch:rlmc-dr}）覆盖一个范围——\cref{ch:rlmc-tennisenv} 的 $\alpha$ 是\emph{仿真环境}参数，真实球的 $\alpha$ 可能不同，硬编码会埋 Sim2Real 雷。
+
+\begin{pitfall}[编程陷阱：speed 未 clamp 导致除零 NaN]
+\textbf{错误描述}：算 $\mathbf v\mathbf v^{\!\top}/|\mathbf v|$ 时没给 \verb|speed| 加下限。\textbf{现象后果}：球落地减速到 $|\mathbf v|\to 0$ 时阻力项分母趋零、产生 NaN，污染整个 batch。\textbf{根本原因}：\eqref{eq:rlmc-perc-drag-jac} 含 $1/|\mathbf v|$。\textbf{正确做法}：\Verb[breaklines]|speed.clamp(min=1e-6)|（上面代码已做）。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：含阻力的 EKF 一定比纯重力好]
+\textbf{错误描述}：以为加了 drag 就稳赢。\textbf{现象后果}：若 $\alpha$ 设得不准（高估/低估阻力），含阻力模型可能比「纯重力$+$大 $Q$」更差。\textbf{根本原因}：错误的确定性模型项比「诚实地承认不确定（大 $Q$）」更有害。\textbf{正确做法}：用真值轨迹标定 $\alpha$，或把 $\alpha$ 作可调参数并做 DR。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[推导]} 写出含二次阻力的完整 $6\times 6$ Jacobian，并验证 $\alpha=0$ 时退化为纯重力版（验收：写出 $D$ 的三维显式形式 $+$ 退化证明）。
+  \item \textbf{[编程]} 实现 \Verb[breaklines]|BallEKFWithDrag|，在同一条轨迹上对比纯重力与含 drag 的位置估计误差，并跑 Jacobian 有限差分检验（验收：max\_diff $<10^{-4}$ $+$ 两 EKF 的 RMSE 对比）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{弹跳检测与模式切换}
+\label{sec:rlmc-perc-bounce}
+
+\paragraph{模块功能与在管线中的位置。}EKF 处理「连续飞行」。但网球会弹跳——弹跳时速度方向突变，连续模型完全失效。本节专门处理弹跳检测与模式切换，是 EKF 过程模型的\textbf{必要补充}而非可选优化。
+
+\paragraph{动机：弹跳让 EKF 崩溃。}弹跳是\textbf{模式切换}（mode change）——飞行中的球突然变成弹跳后的球、法向速度反转。标准 EKF 的连续过程模型假设状态平滑，无法处理突变；不特殊处理的话，弹跳后 EKF 会继续按弹跳前速度外推（预测球穿过地面），而实际球在向上飞。类比：导航软件在高速上突遇 U 形弯——若 GPS 暂丢，导航按直线外推认为你直行，而你已转弯。弹跳检测就是「发现 U 形弯」并切换模型。
+
+\paragraph{配置详解：三种弹跳检测方法。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+方法 & 原理 & 短板 & 推荐阶段 \\
+\midrule
+Ground-truth 检测 & 直接读 $z<\epsilon$ 且 $v_z<0$ & 仅限仿真 & 第一阶段 \\
+接触事件检测 & MuJoCo \verb|contact| 中有球-地接触 & 需 API 支持 & 仿真阶段（最可靠） \\
+Innovation 检测 & $\|\mathbf y_k\|>\tau$ 时判 & 阈值敏感、易误报 & 所有阶段（部署） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{推荐方案}：仿真用接触事件检测（最可靠），部署用 innovation 检测（不需真值）。\textbf{切忌单用 innovation 的 OR 逻辑}——阈值松一点就在地面附近每帧误报。
+
+\paragraph{代码走读：带 cooldown 的弹跳检测 $+$ 弹跳后重置。}一个常见 bug 是弹跳检测每帧触发——球在地面附近被反复判「弹跳」、速度被反复反转。解法是加冷却（cooldown）并只在 $v_z$ 由负转正时触发：
+
+\begin{codebox}[Python]{带 cooldown 的弹跳检测与 EKF 重置}
+class BounceDetectorWithCooldown:
+    def __init__(self, num_envs, cooldown_steps=10, device='cuda'):
+        self.cd = torch.zeros(num_envs, dtype=torch.int, device=device)
+        self.cooldown_steps = cooldown_steps
+        self.prev_vz = torch.zeros(num_envs, device=device)
+    def detect(self, ekf):
+        vz = ekf.estimated_vel[:, 2]; z = ekf.estimated_pos[:, 2]
+        vz_flip = (self.prev_vz < -0.5) & (vz > 0.1)             # 由下落转上升
+        near_ground = z < 0.1
+        bounced = vz_flip & near_ground & (self.cd <= 0)         # 三条件 AND
+        self.cd[bounced] = self.cooldown_steps
+        self.cd = (self.cd - 1).clamp(min=0)
+        self.prev_vz = vz.clone()
+        return bounced
+    def reset(self, ids):
+        self.cd[ids] = 0; self.prev_vz[ids] = 0.0
+
+def handle_bounce(ekf, ids, cor=0.75):                          # COR 沿用 Ch26 标定
+    if len(ids) == 0: return
+    ekf.x[ids, 5] = -cor * ekf.x[ids, 5]                        # vz 反转衰减
+    ekf.x[ids, 3] *= 0.85; ekf.x[ids, 4] *= 0.85               # 切向摩擦减速
+    ekf.x[ids, 2] = torch.clamp(ekf.x[ids, 2], min=0.01)       # 位置修正 z>0
+    ekf.P[ids, 3:6, 3:6] = torch.eye(3, device=ekf.device) * 5.0   # 速度协方差重置
+\end{codebox}
+
+\textbf{为什么重置速度协方差}？弹跳后速度由接触力决定，而接触力受 COR、摩擦、入射角等多参数影响，因此弹跳后速度估计比弹跳前不确定得多——增大协方差让 EKF 在后续帧更信观测、快速重新收敛。\textbf{切向修正的精细化}：\cref{ch:rlmc-tennisenv} 验证了 topspin 球弹跳后水平速度\emph{增大}（旋转-摩擦耦合），若只做「切向一律减速」会错误地让 topspin 球弹后减速；更精确的处理需考虑 $\boldsymbol\omega$（球底表面速度 $\approx-\omega_y r$ 与切向速度之差决定摩擦冲量方向）。
+
+\paragraph{运行验证。}在一条含弹跳的轨迹上对比「有/无弹跳处理」的 EKF 误差。\textbf{看什么}：无处理时弹跳后误差单调发散（按旧速度外推）；有处理时弹跳后误差短暂上升（协方差重置期），几帧内重新收敛。断言「弹跳后误差降低 $80\%+$」。
+
+\paragraph{多视角：Phybot 的 prediction-free 变体。}Phybot（arXiv:2511.11218）提出有趣的替代：\textbf{不做轨迹预测}，让策略直接从当前球状态学击球，其实验显示 prediction-free 变体性能与用 EKF 预测的版本相当\cite{tennis_phybot2025}。这暗示一个工程洞察——若 observation 含足够历史（多帧球位置），策略本身可\emph{隐式}学到「预测」，不需要显式 EKF 或预测网络。但隐式预测的可解释性和 debug 能力远不如显式管线。
+
+\begin{insight}[弹跳检测是过程模型的必要补充，不是信号处理技巧]\label{ins:rlmc-perc-bounce}
+弹跳检测不是「加个滤波 trick」，而是 EKF 过程模型的\textbf{必要补充}。一个不处理弹跳的 EKF 在弹跳后等于「瞎了」——它会按弹跳前速度继续外推、与真实轨迹越来越远。这与 \cref{ins:rlmc-perc-essence} 一脉相承：感知的正确性不取决于单步滤波多平滑，而取决于模型是否覆盖了所有物理\emph{模式}。显式 vs 隐式（策略自学）的权衡——可解释性/debug/灵活性显式胜，工程复杂度隐式胜；教学项目推荐显式（本章方法），研究项目可探索 prediction-free。
+\end{insight}
+
+\paragraph{三框架对比。}弹跳处理核心代码共用；唯一框架相关的是「接触事件检测」的接口：\textbf{mjlab 有两条路}——底层 \Verb[breaklines]|MjData.contact|（\cref{ch:rlmc-tennisenv} 已用于语义撞网），以及实测确认的一等 \texttt{ContactSensorCfg}（\Verb[breaklines]|from mjlab.sensor import ContactSensorCfg|，带 force/netforce/maxforce 归约），\textbf{推荐用后者}：它是批量、GPU 友好的路径，过滤出球-地这一接触对即可，比每帧扫 \Verb[breaklines]|MjData.contact| 数组更省也更稳。Isaac Lab 用 \texttt{ContactSensorCfg} 读球-地接触（该 sensor 返回刚体净接触力，并可用 \texttt{filter\_prim\_paths\_expr} 过滤出与特定刚体的接触对）——\textbf{两框架在「接触事件源」上其实对称}（都有 \texttt{ContactSensorCfg}），源稿把 mjlab 只写成 \Verb[breaklines]|MjData.contact| 是不全的。UniLab 经后端统一的 \Verb[breaklines]|backend.get_sensor_data(name)| 读\textbf{命名接触 sensor}——其 MJCF 场景里以接触/力 sensor 暴露球-地接触（与定义足端接触 sensor 同一机制）；MuJoCoUni 后端底层即 MuJoCo，故低层 \Verb[breaklines]|MjData.contact| 概念上也可达，但 UniLab 惯用的是命名 sensor 读数。弹跳检测/重置本身基于 EKF 状态，三框架逐字相同。
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lLLL@{}}
+\toprule
+环节 & mjlab 1.4.0 & Isaac Lab 2.3.x & UniLab \\
+\midrule
+接触事件源 & \Verb[breaklines]|ContactSensorCfg|（推荐）/\Verb[breaklines]|MjData.contact| & \Verb[breaklines]|ContactSensorCfg| & \Verb[breaklines]|backend.get_sensor_data(name)| \\
+弹跳检测/重置 & \multicolumn{2}{c}{\emph{逐字相同}（基于 EKF 状态）} & 同左（基于 EKF 状态） \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{pitfall}[编程陷阱：弹跳检测在所有帧都触发]
+\textbf{错误描述}：阈值太松或只用「$z$ 低 $+$ $v_z<0$」单条件。\textbf{现象后果}：球在地面附近每帧被判弹跳、速度被反复反转，轨迹乱跳。\textbf{根本原因}：缺 cooldown、缺「$v_z$ 由负转正」的状态机条件。\textbf{正确做法}：加 cooldown（弹后 $N$ 帧不再检测）$+$ 只在 $v_z$ 符号翻转时触发（上面代码已做）。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[编程]} 实现 \Verb[breaklines]|BounceDetectorWithCooldown| 与 \verb|handle_bounce|，在含弹跳轨迹上对比有/无处理的 EKF 误差（验收：弹后误差降 $80\%+$，画两曲线）。
+  \item \textbf{[设计]} 设计 multiple-model filter：同时维护 airborne 与 bounced 两个 EKF，按 innovation likelihood 加权。与 event-based reset 比性能和复杂度（验收：列 $\ge 3$ 条权衡）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{GRU 残差预测器：\texorpdfstring{物理先验 $+$ 数据驱动}{物理先验 + 数据驱动}}
+\label{sec:rlmc-perc-gru}
+
+\paragraph{模块功能与在管线中的位置。}EKF 给「球现在在哪」，但控制器要「球将来在哪」。本节是感知链条层 5（轨迹预测）：在 EKF 估计基础上做未来预测。核心算法点是\textbf{「物理 baseline $+$ 学习残差」}——纯物理无法覆盖所有空气动力学细节，GRU 用数据驱动补偿建模误差。
+
+\paragraph{动机：为什么不直接用 GRU 替代物理模型。}抛体方程编码了重力恒加速度、drag 公式编码了阻力 $\propto v^2$——这些是人类几百年实验总结的物理定律。让网络重新「发现」它们既浪费已有知识、又需大量数据，更严重的是泛化性：纯 GRU 可能学到「第 $15$ 步球大概在 $x=-3$」这种\emph{分布统计量}（而非物理规律），发球参数一变就崩。物理模型天然泛化——不管球速多少，$g$ 都是 $9.81$。这像明知答案的选择题还靠猜。\textbf{反事实}：Gray-box 乒乓球预测（L4DC 2023）直接对比了 black-box（纯网络）与 gray-box（物理$+$残差），论文报告 gray-box 预测性能优于两种 black-box，真机回球率达 $29/30$（$97.7\%$）\cite{achterhold2023graybox}。\pz{源稿曾称 gray-box 误差比 black-box 低 $40$--$60\%$，经核查论文摘要未给出该百分比，故此处不引用具体数字、仅保留已证实的方向性结论（gray-box 分布外更优），具体降幅建议以原文实验表为准。}
+
+\paragraph{代码走读：残差架构（三框架共用）。}\Verb[breaklines]|forward = 物理 baseline + clamp(GRU 残差)|。残差必须 clamp，否则异常输入时 GRU 可能吐出极大残差、把预测点甩到球场外。
+
+\begin{codebox}[Python]{PhysicsResidualPredictor:物理 baseline + GRU 残差}
+import torch.nn as nn
+class PhysicsResidualPredictor(nn.Module):
+    def __init__(self, history_len=10, pred_horizon=20, hidden_dim=64,
+                 cmd_dim=8, alpha=0.0202):
+        super().__init__()
+        self.pred_horizon, self.alpha = pred_horizon, alpha
+        self.g = torch.tensor([0.0, 0.0, -9.81])
+        self.input_dim = 5 * history_len + cmd_dim          # 每帧 (pos3,dt1,conf1)
+        self.gru = nn.GRU(self.input_dim, hidden_dim, num_layers=2, batch_first=True)
+        self.head = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+                                  nn.Linear(hidden_dim, 3 * pred_horizon))
+        self.residual_clamp = 0.5                            # 最大 +-50cm
+
+    def physics_baseline(self, state_now, dt_steps):        # drag+gravity 前推
+        pos, vel = state_now[:, :3].clone(), state_now[:, 3:6].clone()
+        g = self.g.to(pos.device); out = []
+        for dt in dt_steps:
+            speed = vel.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            a = g - self.alpha * speed * vel
+            pos = pos + vel * dt + 0.5 * a * dt**2; vel = vel + a * dt
+            out.append(pos.clone())
+        return torch.stack(out, dim=1)                       # [N, H, 3]
+
+    def forward(self, state_now, obs_history, launch_cmd, dt_steps):
+        phys = self.physics_baseline(state_now, dt_steps)
+        gin = torch.cat([obs_history.reshape(obs_history.shape[0], -1),
+                         launch_cmd], dim=-1).unsqueeze(1)    # [N,1,input_dim]
+        res = self.head(self.gru(gin)[0][:, -1]).reshape(-1, self.pred_horizon, 3)
+        res = torch.clamp(res, -self.residual_clamp, self.residual_clamp)
+        return phys + res
+
+    def compute_impact_point(self, traj, strike_height=0.6):
+        # 击球点 = 球下降穿过击球高度处（不是落地点 z~=0！把球拍引向落地点
+        # 会让策略学到错误目标:球拍被拉向地面）.strike_height 按机器人/打法调.
+        below = traj[:, :, 2] < strike_height
+        has = below.any(dim=1)
+        step = below.float().argmax(dim=1); step[~has] = self.pred_horizon - 1
+        b = torch.arange(traj.shape[0], device=traj.device)
+        return traj[b, step], step
+\end{codebox}
+
+\textbf{击球点 $\neq$ 落地点（关键洞察）}：击球点是球\emph{下降穿过击球高度}（约 $0.6$\,m）之处，球拍在该高度迎球；落地点（$z\approx 0$）是球落到地上。若把球拍引向落地点，策略会学到错误的接近目标（球拍被拉向地面）。
+
+\paragraph{配置详解：训练与数据集分割。}训练用对时间步加权的 L2 loss（近期比远期重要）：\Verb[breaklines]|time_weights = exp(-0.1 * arange(H))|，配 \Verb[breaklines]|clip_grad_norm_(1.0)| 与 cosine 退火。\textbf{数据集分割是关键工程决策}：若只按 episode 随机分，训练/验证速度分布一样、无法检测泛化性。正确做法\textbf{按物理条件分割}：
+
+\begin{codebox}[Python]{按物理条件分割:测「对未见高速球的泛化」}
+def split_by_physics(dataset, speed_threshold=35.0):
+    train = [s for s in dataset if s["launch_cmd"][0] <  speed_threshold]
+    val   = [s for s in dataset if s["launch_cmd"][0] >= speed_threshold]
+    return train, val      # val 测试「对未见过的高速球的泛化能力」
+\end{codebox}
+
+也可按 elevation（训负角验正角）或 topspin（训无旋验有旋）分割，每种测不同维度的泛化。
+
+\paragraph{运行验证：三方消融。}本节最重要的实验——量化 GRU 残差的增量贡献。跑 physics-only / physics$+$GRU / pure-GRU 三方对比，评估指标：Impact Position RMSE（目标 $<30$\,cm）、Time-to-impact MAE（$<20$\,ms）、Trajectory ADE（$<10$\,cm）。\textbf{预期结果}：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+方法 & 训练分布内 & held-out 高速 \\
+\midrule
+Physics-only & 中（Magnus 未建模，$20$--$40$\,cm） & 中（物理泛化好） \\
+Physics$+$GRU & \textbf{最好}（$5$--$15$\,cm） & 好（GRU 补 Magnus 残差） \\
+Pure GRU & 可能稍好 & \textbf{明显更差}（OOD 崩） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\pz{待核实：上述误差量级（physics-only $20$--$40$\,cm、physics$+$GRU $5$--$15$\,cm、GRU 残差改进 $30$--$50\%$）为源稿教学预期，未在本仓库实测；定性结论（physics$+$GRU 在 OOD 优于 pure GRU）由 gray-box 论文\cite{achterhold2023graybox}支撑。}
+
+\paragraph{多视角：PACE 的双通道设计。}PACE（arXiv:2509.21690，乒乓球任务）用了一个优雅的双通道设计，已 zero-shot 部署到真实 Booster T1 人形（23 关节），仿真里 hit rate $\ge 96\%$、success rate $\ge 92\%$（真机命中约 $93\%$、回球约 $61\%$）\cite{tennis_pace2025}：
+
+\begin{itemize}
+  \item \textbf{通道 1 — Learned Predictor（运行时用）}：轻量预测器，输入近期球位置，输出目标击球点；训练和部署都用，其输出作为 policy observation 的一部分。
+  \item \textbf{通道 2 — Physics Predictor（训练时用）}：精确物理模型（含弹跳/Magnus），训练中身兼监督 learned predictor、构造 dense reward、作 critic 的 privileged 信息三职；部署时 actor 只用 learned predictor。
+\end{itemize}
+
+\textbf{为什么不用 learned predictor 构造 reward}？因为它在训练初期不准（没见过足够数据），用不准的预测构造 reward 会让 reward 噪声大、训练不稳；physics predictor 从第一天起就准（物理定律不需「学」），提供稳定 reward 信号。这个设计在后续击球章的 reward 工程里特别有用——让 reward 从第一天起就准确（基于物理预测），同时让 policy 逐步学会用 learned predictor 的（可能不那么准的）输出。
+
+\begin{paper}[PACE：物理增强的端到端人形乒乓 RL]\label{paper:rlmc-perc-pace}
+\textbf{问题}：人形乒乓球要同时协调手臂击球与腿部移动，球速快、反应窗口亚秒，端到端 RL 难以稳定探索。\textbf{核心思想}：把「预测」拆成双通道——运行时用 learned predictor 增广观测（输入近期球位置、输出未来球状态/目标击球点），训练时用 physics predictor 提供精确未来状态来构造 dense、physics-guided reward。\textbf{关键结果}\cite{tennis_pace2025}：仿真多发球区 hit rate $\ge 96\%$、success $\ge 92\%$；消融证实 learned predictor 与 predictive reward 对端到端学习都关键；zero-shot 部署到 Booster T1（23 关节）实现协调步法与快速回球。\textbf{与本书关系}：本章 \cref{sec:rlmc-perc-gru} 的「物理 baseline $+$ 学习残差」是其通道 1 的教学化实现；\cref{sec:rlmc-perc-interface} 的 \Verb[breaklines]|PredictorOutput| 正对接其「预测 $\to$ reward/obs」的数据流。\textbf{局限}：部署仍依赖外部球位置测量；乒乓球速度仍低于网球，迁移到网球需更高频感知。
+\end{paper}
+
+\begin{finenote}
+本节示例代码的「$10$ 帧输入 / $20$ 步输出 / 残差 $\pm 0.5$\,m」等具体维度是\textbf{本书教学项目设定}，并非 PACE 原始超参；PACE 官方 predictor 更轻量（近期若干帧 $\to$ 目标击球点）。引用其数字时请以官方为准。
+\end{finenote}
+
+\paragraph{三框架对比。}预测器是纯网络、与引擎无关，三框架共用；唯一框架相关的是\emph{训练数据从哪个仿真收集}——\Verb[breaklines]|collect_trajectory_data()| 调 \cref{sec:rlmc-perc-frame} 的 \Verb[breaklines]|collect_ground_truth_label()|，后者三框架同名同义。故「换框架重训预测器」只需换数据采集后端，网络与训练代码不动。
+
+\begin{pitfall}[编程陷阱：GRU 输入不含 $\Delta t$ / 残差不 clamp]
+\textbf{错误描述}：GRU 每帧只喂位置、不喂时间间隔；或残差不做 clamp。\textbf{现象后果}：帧率从 $100$\,Hz 变 $50$\,Hz 时 GRU 不知时间变了、预测全错；异常输入时残差爆炸、预测点飞出球场。\textbf{根本原因}：时间信息缺失 $+$ 无界输出。\textbf{正确做法}：每帧附 $\Delta t$；\Verb[breaklines]|torch.clamp(residual, -0.5, 0.5)|（上面代码已做）。
+\end{pitfall}
+
+\begin{pitfall}[编程陷阱：held-out split 不合理]
+\textbf{错误描述}：只按 episode 随机分训练/验证。\textbf{现象后果}：两集速度/角度分布一样，验证 loss 低但部署到新发球分布就崩——\emph{你以为泛化好，其实没测过泛化}。\textbf{根本原因}：随机分割不制造分布偏移。\textbf{正确做法}：按 speed/elevation/topspin 做物理条件分割（如训 $20$--$35$\,m/s、验 $35$--$45$\,m/s）。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[设计]} 设计 GRU 的输入输出维度：输入 $10$ 帧 $(\text{pos}_3,\text{conf}_1,dt_1)$ $+$ cmd$_8$，输出 $20$ 步残差 $(\text{pos}_3)$，总维度各多少？（验收：算出 input\_dim 与 output\_dim）
+  \item \textbf{[编程]} 收集 $\ge 1000$ 条仿真轨迹，训练 \Verb[breaklines]|PhysicsResidualPredictor|，按物理条件分割，对比 physics-only 与 physics$+$GRU 的 impact RMSE（验收：给出两数 $+$ 在 held-out 上的对比）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{延迟补偿的数学与工程}
+\label{sec:rlmc-perc-delay}
+
+\paragraph{模块功能与在管线中的位置。}延迟是网球感知中最隐蔽但影响最大的问题。预测器给的未来位置基于「过去的观测」——若观测有延迟，预测起点就已偏了。本节给延迟补偿的数学框架，并在仿真里注入模拟延迟来训练对延迟鲁棒的策略。它是 \cref{ch:rlmc-sim2real} Sim2Real 链路的关键一环。
+
+\paragraph{动机：延迟的定量分析。}总延迟可达 $20$--$100$\,ms：相机曝光 $1$--$16$\,ms、图像传输 $1$--$5$\,ms、检测推理 $5$--$20$\,ms、滤波 $<1$\,ms、控制通信 $1$--$5$\,ms、执行器响应 $5$--$50$\,ms。$30$\,m/s $+$ $30$\,ms $=$ $0.9$\,m 误差——整个球拍够不到。\textbf{关键认知}：仿真里 ground truth 没有延迟（\verb|root_pos_w| 是当前帧精确状态），所以延迟问题在\emph{纯仿真阶段不显现}，但 Sim2Real 时是最大性能杀手。本章处理延迟的双重目的：(1) 建立补偿的数学框架；(2) 在仿真里注入模拟延迟训练鲁棒策略。
+
+\paragraph{配置详解：延迟补偿三步法。}核心三步 $+$ 可选第四步：
+
+\begin{enumerate}
+  \item 给每个观测记采样 timestamp $t_{\text{obs}}$。
+  \item EKF 更新到 $t_{\text{obs}}$（\emph{而非}当前控制时间），得 $\hat{\mathbf x}(t_{\text{obs}})$、$P(t_{\text{obs}})$。
+  \item 用过程模型前推到当前控制时间 $t_{\text{ctrl}}$：$\hat{\mathbf x}(t_{\text{ctrl}})=f(\hat{\mathbf x}(t_{\text{obs}}),\,t_{\text{ctrl}}-t_{\text{obs}})$，协方差同步前推 $P(t_{\text{ctrl}})=FP(t_{\text{obs}})F^{\!\top}+Q\cdot\frac{t_{\text{ctrl}}-t_{\text{obs}}}{\Delta t_{\text{nominal}}}$。
+  \item （可选）继续前推到未来击球时间 $t_{\text{hit}}$。
+\end{enumerate}
+
+\paragraph{代码走读：补偿 $+$ 仿真注入延迟。}
+
+\begin{codebox}[Python]{延迟补偿与仿真延迟注入 buffer}
+def compensate_delay(ekf, obs_timestamp, ctrl_timestamp):
+    delay = ctrl_timestamp - obs_timestamp                  # 正值，秒
+    if delay <= 0:
+        return ekf.x.clone(), ekf.P.clone()
+    x = ekf.propagate_to(delay)                             # 前推 delay 秒（不改 self）
+    F = ekf._compute_F(delay); Q = ekf._Q(delay)
+    P = torch.bmm(torch.bmm(F, ekf.P), F.transpose(1, 2)) + Q
+    return x, P
+
+class DelayedObservationBuffer:                            # 仿真里模拟感知延迟
+    def __init__(self, num_envs, obs_dim, max_delay_steps, device):
+        self.max_delay = max_delay_steps
+        self.buffer = torch.zeros(num_envs, max_delay_steps + 1, obs_dim, device=device)
+    def push(self, obs, timestamp):
+        self.buffer = torch.roll(self.buffer, -1, dims=1); self.buffer[:, -1] = obs
+    def get_delayed(self, delay_steps):                    # delay_steps 可每环境随机！
+        b = torch.arange(self.buffer.shape[0], device=self.buffer.device)
+        return self.buffer[b, self.max_delay - delay_steps]
+\end{codebox}
+
+\textbf{延迟不只影响位置，还影响时间预测}：若观测延迟 $30$\,ms，你看到的是 $30$\,ms 前的球，但你不知道「它已在这位置待了 $30$\,ms」——不补偿的话 time-to-impact 会系统性偏大 $30$\,ms（以为还有时间，实际球已快到了）。这就是为什么 \Verb[breaklines]|time_to_impact| 比 position 更关键——$30$\,ms 时间误差可能让挥拍完全打空。
+
+\paragraph{运行验证：LATENT 的消融（最有说服力的工程证据）。}LATENT（arXiv:2603.12686）的消融是球类 RL 中颇有说服力的证据\cite{tennis_latent2026}：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+配置 & 真机正手成功率 & 真机反手成功率 \\
+\midrule
+完整（noise $+$ delay $+$ DR） & $\mathbf{90.9\%}$ & $\mathbf{77.8\%}$ \\
+去掉 dynamics DR & $14$--$29\%$ & $14$--$29\%$ \\
+去掉 observation noise & $50\%$ & $\mathbf{0\%}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{关键观察}：去掉 observation noise 后反手从 $77.8\%$ 降到 $0\%$——observation noise randomization 对反手是\emph{生死攸关}的。为什么反手更敏感？反手动作机械约束更多（手臂活动范围更小），需更精确的时机控制，而精确时机依赖准确的延迟补偿——训练时没见过延迟，部署时延迟就导致系统性时机偏差。LATENT 的 DR 配置（重构）：球位置噪声 $\sim 2$\,cm、速度噪声 $\sim 0.5$\,m/s、观测延迟 $0$--$3$ 帧（$50$\,Hz 下 $0$--$60$\,ms）、漏检率 $\sim 5\%$。\pz{待核实：LATENT 的逐项噪声/延迟数值（$2$\,cm/$0.5$\,m\,s$^{-1}$/$0$--$3$ 帧/$5\%$）系据论文文字描述重构，非官方逐字表格；成功率三档（$90.9\%$/$77.8\%$、$14$--$29\%$、$50\%$/$0\%$）已联网核实。}
+
+\paragraph{多视角：延迟补偿在训练中的三种用法。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+方式 & 描述 & 代表系统 \\
+\midrule
+训不补偿、部署补偿 & 训练用真值，部署加补偿模块 & 教学起步（最简单） \\
+训注入延迟、不补偿 & 策略直接学处理「旧观测」 & LATENT（隐式学提前量）\cite{tennis_latent2026} \\
+训注入延迟 $+$ 补偿 & 策略看到补偿后的预测状态 & ETH（perception-aware）\cite{tennis_eth2025badminton} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+对教学项目，推荐先用方式 1（最简单）验证后切到方式 3（最接近部署）。
+
+\paragraph{三框架对比。}延迟补偿与注入 buffer 是纯算法、与引擎无关，三框架共用。\textbf{唯一框架相关的是 timestamp 来源}——必须用\emph{仿真时钟绝对时间}。三框架\emph{均无} \verb|env.sim_time| 现成属性，而是由「步计数 $\times$ 控制步长」算：mjlab/Isaac Lab 用 \Verb[breaklines]|episode_length_buf * step_dt|（\Verb[breaklines]|step_dt = sim.dt * decimation|；如需跨 episode 的全局绝对时间则用 \Verb[breaklines]|common_step_counter * step_dt|），UniLab 用步计数 $\times$ \verb|ctrl_dt|。\textbf{切忌直接用帧计数器当时间}（帧率/控制频率不稳时帧计数不反映真实时间间隔，必须乘步长换算成秒）。
+
+\begin{pitfall}[编程陷阱：timestamp 用帧计数器而非真实时间]
+\textbf{错误描述}：用 \verb|step_count| 当 timestamp。\textbf{现象后果}：帧率波动（渲染卡顿、变频控制）时延迟补偿算错、time-to-impact 漂移。\textbf{根本原因}：帧计数不等于物理时间。\textbf{正确做法}：用仿真时钟绝对时间（秒）。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：把「EKF 平滑」当成延迟]
+\textbf{错误描述}：看到 EKF 输出比观测平滑就断定「有延迟」。\textbf{现象后果}：误删平滑、把 $Q$ 调爆、估计重新变嘈杂。\textbf{根本原因}：平滑来自模型-观测融合，不一定是延迟；但 timestamp 处理错确实会产生延迟。\textbf{正确做法}：同时记录 obs/filter/ctrl/predicted-impact 四个时间，看新息是否有系统性偏移来区分。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[估算]} 总延迟 $40$\,ms、球速 $35$\,m/s，延迟位置误差多少？是击球面半径 $15$\,cm 的几倍？（验收：给数 $+$ 倍数）
+  \item \textbf{[编程]} 实现 \Verb[breaklines]|DelayedObservationBuffer|，训练中注入 $0$--$3$ 帧随机延迟，对比有/无延迟时 predictor 误差（验收：两条 RMSE 曲线 $+$ 差距量化）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{PredictorOutput 接口与下游控制衔接}
+\label{sec:rlmc-perc-interface}
+
+\paragraph{模块功能与在管线中的位置。}所有技术组件就绪后，最后一步是组装成可被下游击球控制器直接调用的接口。控制器不关心 EKF 内部状态，只关心「球将到哪、还有多久、可信吗、值得打吗」。本节定义这份「输入规格书」——它是本章对下游章节的契约。
+
+\paragraph{配置详解：PredictorOutput 数据结构。}
+
+\begin{codebox}[Python]{PredictorOutput:感知管线输出给控制器的接口}
+from dataclasses import dataclass
+@dataclass
+class PredictorOutput:
+    predicted_state_now: torch.Tensor   # [N,6] 当前球状态估计 (pos3,vel3)
+    impact_pos_c:        torch.Tensor   # [N,3] 预测击球点（court-local）
+    impact_vel_c:        torch.Tensor   # [N,3] 击球时球速
+    time_to_impact:      torch.Tensor   # [N]   距击球还有多少秒
+    uncertainty:         torch.Tensor   # [N]   预测不确定性（标准差 trace）
+    validity:            torch.Tensor   # [N] bool 预测是否可用
+    mode:                torch.Tensor   # [N] int 0=airborne 1=bounced 2=lost
+    predicted_trajectory: torch.Tensor  # [N,H,3] 完整预测轨迹（可选）
+    bounce_count:        torch.Tensor   # [N] int 已弹跳次数
+\end{codebox}
+
+\paragraph{本质洞察：为什么 \texttt{time\_to\_impact} 比 \texttt{impact\_pos} 更关键。}控制器最紧迫的需求是「我还有多少时间准备」——这决定挥拍时机。\verb|impact_pos| 告诉「球在哪」，\Verb[breaklines]|time_to_impact| 告诉「我还能等多久」。\textbf{一个有 $20$\,cm 位置误差但时间准确的预测，比一个位置精确但时间偏 $50$\,ms 的预测更有用}——时间偏差意味着球拍在错误时刻到达正确位置（球还没来或已过去）。HITTER 的数据可作参考：击球前 $0.5$\,s 位置误差 $<7.5$\,cm（约球拍甜区半径——本章「有效击球面」按拍面直径 $30$\,cm/半径 $15$\,cm 计，甜区更小）、击球前 $0.3$\,s timing 误差 $<20$\,ms（约一个控制步）\cite{tennis_hitter2025}——即系统对位置和时间两项都有量化要求。\rebuilt{HITTER 论文并未提出「先 timing 后 position」的优化\emph{顺序}，此处仅强调两者都关键、且时间误差代价更隐蔽。}
+
+\paragraph{配置详解：每个字段对应哪类 reward。}\Verb[breaklines]|PredictorOutput| 的每个字段对应下游不同的 reward 组件——这是本章与后续击球控制章的接缝：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+字段 & 下游 reward 用途 & 形态 \\
+\midrule
+\verb|impact_pos_c| & approach reward & $r=-\|\text{racket}-\text{impact}\|$ \\
+\Verb[breaklines]|time_to_impact| & timing reward & $r=\exp(-|\text{swing}-\text{tti}|/\sigma)$ \\
+\verb|impact_vel_c| & racket alignment & $r=\cos\angle(\hat n_{\text{racket}},-\mathbf v_{\text{impact}})$ \\
+\verb|uncertainty| & confidence gating & \Verb[breaklines]|if unc>thr: r_swing=0| \\
+\verb|validity| & action masking & \Verb[breaklines]|if not valid: disable swing| \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{工程关键点}：PACE 的双通道设计（\cref{sec:rlmc-perc-gru}）在这里特别有用——训练时用 \textbf{physics predictor}（精确）构造上述 reward，确保 reward 从第一天起就准确；同时让 policy 的 obs 包含 \textbf{learned predictor} 输出，让策略逐步学会用不那么完美的预测。
+
+\paragraph{代码走读：完整感知管线集成（三框架共用骨架）。}把前面所有组件串成一条 \verb|step()|：延迟模拟 $\to$ EKF predict/update $\to$ 弹跳处理 $\to$ 延迟补偿 $\to$ 历史 buffer $\to$ 预测 $\to$ 提取 impact $\to$ validity 判断。
+
+\begin{codebox}[Python]{TennisPerceptionPipeline.step:一条 step 串起全章组件}
+def step(self, raw_obs, sim_time, launch_cmd, delay_steps=None) -> PredictorOutput:
+    # 1. 延迟模拟（启用时）
+    self.delay_buffer.push(raw_obs, sim_time)
+    if delay_steps is not None:
+        obs = self.delay_buffer.get_delayed(delay_steps)
+        obs_time = sim_time - delay_steps * self.dt
+    else:
+        obs, obs_time = raw_obs, sim_time
+    # 2-3. EKF 预测 + 更新（漏检时 detected=False）
+    self.ekf.predict(self.dt)
+    detected = torch.ones(obs.shape[0], dtype=torch.bool, device=obs.device)
+    self.ekf.update(obs, detected)
+    # 4. 弹跳检测与处理
+    bounced = self.bounce_detector.detect(self.ekf)
+    if bounced.any():
+        handle_bounce(self.ekf, bounced.nonzero(as_tuple=True)[0])
+    # 5. 延迟补偿
+    state_now = (compensate_delay(self.ekf, obs_time, sim_time)[0]
+                 if delay_steps is not None else self.ekf.x.clone())
+    # 6. 历史 buffer
+    conf = torch.ones(obs.shape[0], 1, device=obs.device)
+    dt_col = torch.full((obs.shape[0], 1), self.dt, device=obs.device)
+    self.history.push(torch.cat([obs, dt_col, conf], dim=-1), sim_time)
+    # 7-8. 预测 + 提取 impact
+    dt_steps = torch.full((self.predictor.pred_horizon,), self.dt, device=obs.device)
+    traj = self.predictor(state_now, self.history.buffer, launch_cmd, dt_steps)
+    impact_pos, impact_step = self.predictor.compute_impact_point(traj)
+    tti = (impact_step + 1).float() * self.dt
+    unc = self.ekf.position_uncertainty
+    # 10. validity:四条件 AND
+    validity = ((tti > 0.05) & (tti < 2.0) & (unc < 1.0)
+                & ((impact_pos[:, 2] - 0.6).abs() < 0.5))   # 接近击球高度
+    return PredictorOutput(predicted_state_now=state_now, impact_pos_c=impact_pos,
+        impact_vel_c=state_now[:, 3:6], time_to_impact=tti, uncertainty=unc,
+        validity=validity, mode=torch.zeros_like(impact_step),
+        predicted_trajectory=traj, bounce_count=torch.zeros_like(impact_step))
+\end{codebox}
+
+\paragraph{运行验证。}跨章综合实验：固定发球参数 $\to$ 收集真值轨迹 $\to$ 加噪声模拟观测 $\to$ 跑 EKF $\to$ GRU 预测 $\to$ 算 impact point error 与 time-to-impact error。\textbf{看什么}：\verb|validity| 应在球进入可击窗口时为 True、出窗口或不确定性大时为 False；\Verb[breaklines]|time_to_impact| 应随时间单调递减到零。
+
+\paragraph{三框架对比。}整条管线是纯算法，三框架共用同一份 \Verb[breaklines]|TennisPerceptionPipeline|；唯一框架相关的是构造时传入的「球状态读取后端」（\verb|raw_obs| 的来源）与 \verb|sim_time| 取法，已在前几节给出。这意味着\textbf{同一份感知管线代码可在三框架间无修改迁移}——这是本章「感知与物理解耦」主线的最终兑现。
+
+\begin{pitfall}[编程陷阱：只输出未来位置数组给控制器]
+\textbf{错误描述}：感知管线只吐 \verb|[N,H,3]| 的位置数组。\textbf{现象后果}：控制器拿不到决策语义（球是否可达、还剩多久、是否可信、是否放弃），只能自己再算一遍、或盲目挥拍。\textbf{根本原因}：接口缺 validity/uncertainty/time\_to\_impact 等决策字段。\textbf{正确做法}：输出完整 \Verb[breaklines]|PredictorOutput|，把决策语义前置到感知层。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[设计]} 控制器要决定「这球要不要打」（放弃不可达球），\Verb[breaklines]|PredictorOutput| 哪些字段参与？写出决策伪代码（验收：用 $\ge 3$ 字段，给出阈值逻辑）。
+  \item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-tennisenv} 的发球参数与本章 EKF$+$predictor，跑「固定发球 $\to$ 真值轨迹 $\to$ 加噪 $\to$ EKF $\to$ 预测 $\to$ impact/tti 误差」全流程（验收：给出 impact RMSE 与 tti MAE）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Teacher-Student 感知蒸馏}
+\label{sec:rlmc-perc-distill}
+
+\paragraph{模块功能与在管线中的位置。}本节是本章与 \cref{ch:rlmc-privileged}、\cref{ch:rlmc-sim2real} 的汇合点：如何从 privileged teacher 过渡到 deployable student。前面所有组件（EKF、预测、延迟补偿）都假定有「某种」观测；本节回答「部署时观测从哪来、teacher 的知识怎么迁移」。
+
+\paragraph{动机：为什么需要蒸馏。}\cref{ch:rlmc-privileged} 的核心：仿真里有完美信息（ground truth），部署时没有。直接用真值训的策略部署时面对从未见过的噪声/延迟，性能可能灾难性下降。蒸馏是桥梁——先用 privileged teacher 建上限，再把知识迁到只用 sensor observation 的 student。网球感知里有两种蒸馏：\textbf{状态估计蒸馏}（teacher 读真值球状态，student 从 noisy obs 估球状态，target 是真值）与\textbf{策略蒸馏}（teacher 用真值做决策，student 用 EKF 估计做决策，target 是 teacher 动作）。\textbf{推荐顺序}：先做状态估计蒸馏（更简单、更易 debug），成功后再考虑策略蒸馏——后者 teacher 的 action 与 student 的 obs 不一致时蒸馏困难，ETH 用 DAgger 而非纯离线蒸馏\cite{tennis_eth2025badminton}。
+
+\paragraph{代码走读：状态估计 student 网络。}student 从多帧 noisy obs 估当前球真值状态，loss $=$ L2(student\_state, ground\_truth)，是监督学习、易训易 debug：
+
+\begin{codebox}[Python]{BallStateEstimator:从 noisy 观测历史估真值状态}
+class BallStateEstimator(nn.Module):
+    def __init__(self, obs_per_frame=3, hidden=64, output_dim=6):
+        super().__init__()
+        self.encoder = nn.Sequential(nn.Linear(obs_per_frame, 128), nn.ReLU(),
+                                     nn.Linear(128, hidden), nn.ReLU())
+        self.gru = nn.GRU(hidden, hidden, num_layers=1, batch_first=True)
+        self.head = nn.Linear(hidden, output_dim)            # pos3 + vel3
+    def forward(self, obs_history):                          # [B,N,obs_per_frame]
+        B, N, D = obs_history.shape
+        enc = self.encoder(obs_history.reshape(B * N, D)).reshape(B, N, -1)
+        return self.head(self.gru(enc)[0][:, -1])            # 取最后一帧输出
+# 训练:teacher label = 球真值（mjlab root_link_pos_w/root_link_lin_vel_w;
+#       Isaac root_pos_w/root_lin_vel_w）;student input = +2cm 噪声历史
+# loss = pos_loss + 0.1 * vel_loss   （速度权重低——更难估）
+\end{codebox}
+
+\paragraph{配置详解：teacher vs student 观测 schema。}teacher 看完美球状态（\Verb[breaklines]|enable_corruption=False|），student 看感知管线输出（\Verb[breaklines]|enable_corruption=True|）。\textbf{两套 schema 必须显式分开}，评估时断言 privileged key 不在 student obs 里——这是防「离线好、部署崩」的硬护栏。
+
+\paragraph{多视角：非对称 Actor-Critic（HITTER 方案）。}HITTER 用更简洁的 asymmetric actor-critic\cite{tennis_hitter2025}：\textbf{Critic} 看真值球状态（privileged）$\to$ 准确估 value $\to$ 稳定训练信号；\textbf{Actor} 只看 noisy obs $\to$ 学会在噪声下决策。这在 \cref{ch:rlmc-privileged} 已介绍——critic 的 privileged obs 只训练时用，部署只需 actor。\textbf{反事实}：若 critic 也只看 noisy obs（对称 AC），value 估计因噪声不稳、PPO 的 advantage 嘈杂、收敛慢；privileged critic 提供「干净」value 信号，让 actor 在噪声观测下更高效学习。三框架都原生支持这种非对称：mjlab/Isaac 用 \texttt{obs\_groups=\{actor:[policy],critic:[privileged,...]\}} 路由观测组；UniLab 经 \texttt{NpEnv.\allowbreak obs\_groups\_spec} 返回 \texttt{\{"obs":A,"critic":C\}}（$C>A$，多出的维即特权量，由 \texttt{split\_obs\_dict} 分给 actor/critic），Hydra 侧 \texttt{algo.obs\_groups=\{actor:[actor],critic:[critic]\}}——即把「真值球状态」放进 critic 组、把「EKF/noisy 估计」放进 obs 组即得本节的非对称 AC。
+
+\paragraph{多视角：ETH 的 perception-aware training。}ETH ANYmal-D（四足）的创新不是蒸馏，而是在 RL 训练阶段就注入\emph{基于真实相机噪声模型}的误差\cite{tennis_eth2025badminton}：位置噪声随距离增大（远处像素少）、随机器人运动增大（运动模糊）、漏检随球速/遮挡增大。它与 LATENT 的固定噪声$+$DR 看似相同（都训练时注噪），但有关键区别：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & LATENT（固定噪声$+$DR） & ETH（动态噪声模型） \\
+\midrule
+噪声来源 & 固定 $\sigma$ $+$ 随机化 $\sigma$ 范围 & 基于物理/相机标定的模型 \\
+依赖状态 & 否 & 是（随距离、运动变化） \\
+能否学「主动感知」 & 不易 & 可以（减速$\to$噪声降$\to$「先稳再出手」） \\
+工程复杂度 & 低 & 高（需标定噪声模型参数） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+ETH 概念上更优雅，LATENT 工程上更简单。教学项目先用 LATENT 方案，高级项目再上 ETH。
+
+\paragraph{运行验证。}训练 \Verb[breaklines]|BallStateEstimator| 后评估：student 位置估计 RMSE vs 直接用 noisy obs 的 RMSE（baseline 约 $2$\,cm 位置、$\sim 1.7$\,m/s 速度）。\textbf{看什么}：student 应比 raw observation 显著改善（融合了时序）；\textbf{断言 student obs 里无 privileged key}（\Verb[breaklines]|assert "privileged" not in obs_keys|）。
+
+\paragraph{三框架对比：感知策略选择矩阵。}所有蒸馏/非对称 AC 代码与引擎无关，三框架共用；框架相关的只是「teacher label 从哪取」（同 \cref{sec:rlmc-perc-frame}）与「非对称 AC 的 critic obs 配置」（三框架的 actor/critic 观测组分离机制见 \cref{ch:rlmc-privileged}）。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+方法 & 适用场景 & 教学推荐 & 框架相关处 \\
+\midrule
+Ground-truth only & 纯仿真、验上限 & 第一步 & 球状态读取 \\
+Asymmetric AC & 有外部动捕的实验室 & 第二步 & actor/critic obs 分组 \\
+状态估计蒸馏 & 通用 & 第三步 & teacher label 来源 \\
+Perception-aware & 机载视觉部署 & 高级 & 相机 sensor 配置 \\
+策略蒸馏（DAgger） & 已有 teacher policy & 研究级 & 无（纯算法） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{UniLab 在这五行的支持现状（据 commit \texttt{99936e08} 源码）。}Ground-truth only / Asymmetric AC 原生支持（\texttt{obs\_groups\_spec} 的 obs/critic 两组）；状态估计蒸馏是纯监督学习、与框架无关可直接做；\textbf{策略蒸馏}方面 UniLab 内置的是 HORA 式「特权 teacher $\to$ 时序自适应 \texttt{adapt\_tconv} student」（RMA 范式，\texttt{algos/\allowbreak torch/\allowbreak hora/\allowbreak distill.\allowbreak py} 的 \texttt{HoraDistillationTrainer}），而\emph{通用在线 DAgger 交替 / camera-conditioned student 并非内置}，需自实现；Perception-aware 因 UniLab 无相机任务，同样需待官方补。
+
+\begin{pitfall}[编程陷阱：蒸馏/评估时 student obs 混入 teacher 信号]
+\textbf{错误描述}：评估 student 时 observation schema 仍含 ground-truth key。\textbf{现象后果}：离线指标漂亮、真机部署崩——典型的 privileged 泄漏。\textbf{根本原因}：两套 obs schema 没显式隔离。\textbf{正确做法}：硬断言 \Verb[breaklines]|assert "privileged" not in obs_keys|，把 teacher/student schema 物理分开。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[设计]} 设计完整 teacher$\to$student 蒸馏方案：teacher 用什么 obs？student 用什么？蒸馏 loss 是什么？评估时怎么保证 privileged 不泄漏？（验收：四问各答清）
+  \item \textbf{[编程]} 实现 \Verb[breaklines]|BallStateEstimator| 并在仿真里训练，对比 student 位置 RMSE 与直接用 noisy obs 的 RMSE，算改善百分比（验收：给两数 $+$ 百分比）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\label{sec:rlmc-perc-myths}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{6.2cm}p{8.0cm}@{}}
+\toprule
+误解 & 正确理解 \\
+\midrule
+detector mAP 高就能打好球 & mAP 不关心延迟与时间连续性；从控制需求反推感知指标（\cref{ins:rlmc-perc-essence}） \\
+EKF 是万能滤波器 & EKF 依赖过程模型正确性；不含弹跳就在弹跳时失效（\cref{sec:rlmc-perc-bounce}） \\
+纯 GRU 比 physics$+$residual 更灵活 & 纯 GRU 泛化差；物理 baseline 是最强先验（\cref{sec:rlmc-perc-gru}） \\
+延迟只影响位置估计 & 延迟同时影响位置和时间预测，且时间误差代价更隐蔽（\cref{sec:rlmc-perc-delay}） \\
+仿真中没有延迟问题 & Sim2Real 时延迟是最大性能杀手（LATENT 反手 $0\%$） \\
+弹跳后 EKF 自动适应 & 弹跳是 mode change，需显式检测$+$协方差重置 \\
+time-to-impact 不如 position 重要 & 挥拍时机比到达位置更关键 \\
+端到端视觉控制最简单 & 端到端最难 debug；分层验证效率更高（\cref{ins:rlmc-perc-ladder}） \\
+ETH 羽毛球是人形机器人 & ETH 是\emph{四足} ANYmal-D；机载感知 $60$\,Hz \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\addcontentsline{toc}{section}{小结}
+\label{sec:rlmc-perc-summary}
+
+\paragraph{术语速查。}\textbf{EKF}（扩展卡尔曼滤波）：非线性系统的递归状态估计，预测$+$更新两步。\textbf{Kalman 增益 $K$}：自动权衡信模型/信观测的系数。\textbf{新息（innovation）}$\mathbf y_k$：观测与预测之差，白噪声性是 EKF 健康的标志。\textbf{Joseph form}：保证协方差对称正定的更新式。\textbf{NIS}：归一化新息平方，做一致性检验。\textbf{物理 baseline $+$ 残差}：物理模型打底、网络补建模误差的预测范式。\textbf{延迟补偿}：从观测时刻前推到控制时刻。\textbf{信息退化阶梯}：逐级移除 privileged signal 以定位误差层。\textbf{PredictorOutput}：感知管线给控制器的接口契约。\textbf{非对称 AC}：critic 看 privileged、actor 看 sensor。
+
+\paragraph{知识点总表。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+编号 & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 感知五层分离 $+$ 六个失败原因 & \cref{sec:rlmc-perc-essence} & 中 \\
+2 & Label 设计 $+$ Frame 统一 $+$ 历史 buffer & \cref{sec:rlmc-perc-frame} & 中 \\
+3 & 三种观测方案 $+$ 信息退化阶梯 & \cref{sec:rlmc-perc-obs} & 中 \\
+4 & EKF 预测/更新 $+$ Kalman 增益 $+$ 批量 GPU & \cref{sec:rlmc-perc-ekf} & 高 \\
+5 & 含 drag 非线性 EKF $+$ Jacobian 推导/验证 & \cref{sec:rlmc-perc-drag} & 高 \\
+6 & 弹跳检测 $+$ cooldown $+$ 协方差重置 & \cref{sec:rlmc-perc-bounce} & 高 \\
+7 & GRU 残差预测 $+$ 物理条件分割 $+$ 三方消融 & \cref{sec:rlmc-perc-gru} & 高 \\
+8 & PACE 双通道（learned obs $+$ physics reward） & \cref{sec:rlmc-perc-gru} & 高 \\
+9 & 延迟补偿三步法 $+$ 仿真注入 & \cref{sec:rlmc-perc-delay} & 高 \\
+10 & PredictorOutput 接口 $+$ 字段-reward 映射 & \cref{sec:rlmc-perc-interface} & 高 \\
+11 & 状态估计蒸馏 $+$ 非对称 AC $+$ perception-aware & \cref{sec:rlmc-perc-distill} & 高 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{本章心智模型。}原始观测（噪声/延迟）$\to$ Frame 统一$+$timestamp 的 label $\to$ 观测方案选择（真值$\to$动捕$\to$视觉）$\to$ EKF 状态估计（预测$+$更新$+$弹跳处理）$\to$ GRU 残差预测（物理 baseline$+$学习残差）$\to$ 延迟补偿 $\to$ \Verb[breaklines]|PredictorOutput| 接口 $\to$ 下游击球控制。每一环都可用 ground truth 隔离测试——这是\cref{ins:rlmc-perc-ladder}的工程兑现。
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-perc-further}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+资料 & 出处 & 一句话教什么 \\
+\midrule
+Kalman 原始论文 & doi:10.1115/1.3662552\cite{kalman1960} & 线性高斯下的最优递归估计（EKF 理论根） \\
+GRU / Encoder-Decoder & arXiv:1406.1078\cite{cho2014gru} & 门控循环单元——残差网络的时序骨架 \\
+PACE & arXiv:2509.21690\cite{tennis_pace2025} & 双通道 predictor：learned 增广 obs $+$ physics 构 reward \\
+Gray-box 乒乓预测 & arXiv:2305.15189\cite{achterhold2023graybox} & EKF $+$ 神经旋转估计；gray-box 胜 black-box \\
+HITTER & arXiv:2508.21043\cite{tennis_hitter2025} & 解析弹道预测 $+$ 非对称 AC（$9\times$ OptiTrack） \\
+ETH ANYmal-D 羽毛球 & Science Robotics 2025\cite{tennis_eth2025badminton} & perception-aware training（机载立体相机） \\
+Phybot 羽毛球 & arXiv:2511.11218\cite{tennis_phybot2025} & EKF $+$ prediction-free 变体 \\
+LATENT & arXiv:2603.12686\cite{tennis_latent2026} & dynamics DR $+$ obs noise 消融（生死攸关） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-perc-trouble}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.0cm}p{3.0cm}p{5.5cm}c@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+轨迹预测「慢半拍」 & 延迟未补偿 & 记录 obs/ctrl time $\to$ 查 \Verb[breaklines]|compensate_delay| $\to$ 看新息偏移 & \ref{sec:rlmc-perc-delay} \\
+EKF 太抖 & $R$ 太小 & 打印新息方差 $\to$ 增大 $R$ $\to$ 核对观测噪声匹配 & \ref{sec:rlmc-perc-ekf} \\
+EKF 跟不上变化 & $Q$ 太小或漏 drag & 看 state lag $\to$ 增大 $Q$ $\to$ 切含 drag EKF & \ref{sec:rlmc-perc-ekf}/\ref{sec:rlmc-perc-drag} \\
+Kalman gain 出 NaN & 未用 Joseph form / speed 未 clamp & 检查协方差对称正定 $\to$ 加 clamp $\to$ 强制对称化 & \ref{sec:rlmc-perc-ekf}/\ref{sec:rlmc-perc-drag} \\
+GRU 分布外崩 & 过拟合 & 确认 physics$+$residual $\to$ 物理条件 split $\to$ clamp 残差 & \ref{sec:rlmc-perc-gru} \\
+弹跳后预测失效 & 无 mode switch & 查 bounce detection $\to$ 加 event reset $\to$ 重置协方差 & \ref{sec:rlmc-perc-bounce} \\
+time\_to\_impact 总偏大 & 漏 drag（球飞得比预测近）或延迟未补 & 切含 drag EKF $\to$ 降 $\sigma_a$ $\to$ 查延迟补偿 & \ref{sec:rlmc-perc-drag}/\ref{sec:rlmc-perc-delay} \\
+validity 总 False & 不确定性阈值太紧 & 打印 \verb|uncertainty| 分布 $\to$ 放宽阈值 $\to$ 查 $P$ 是否正常减小 & \ref{sec:rlmc-perc-interface} \\
+teacher 好 student 差 & 蒸馏不收敛或信号泄漏 & 断言 student obs 无 privileged key $\to$ 看蒸馏 loss $\to$ 增数据 & \ref{sec:rlmc-perc-distill} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-perc-versions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+组件 & 锚定版本 & 本章关键用途 \\
+\midrule
+PyTorch & $\ge 2.1$ & \verb|torch.bmm| / \Verb[breaklines]|torch.linalg.inv| / GRU \\
+mjlab & 1.4.0 & 球状态 \Verb[breaklines]|root_link_pos_w| / \Verb[breaklines]|CameraSensorCfg| / \Verb[breaklines]|ContactSensorCfg| \\
+MuJoCo Warp & 随 mjlab 1.4.0 & GPU batched worlds + 相机渲染 \\
+Isaac Lab & 2.3.x & \Verb[breaklines]|TiledCameraCfg| / \Verb[breaklines]|ContactSensorCfg| / 球状态 \verb|root_pos_w| \\
+UniLab & commit \texttt{99936e08} & 后端 getter 取球状态、接触 sensor（\emph{无相机/视觉任务}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{finenote}
+本章感知-预测核心代码（EKF / GRU 残差 / 延迟补偿 / \Verb[breaklines]|PredictorOutput|）为\emph{框架无关}的纯 PyTorch；mjlab / Isaac Lab / UniLab 的差异仅在「球状态读取」「相机 sensor 配置」「接触事件源」「actor/critic 观测分组」四处，已在各节三框架对比表标注。当前课程示例尚无相机与可学习动作（Phase 1），故相机/蒸馏/非对称 AC 多为「预规划」，待后续人形击球任务实装。UniLab 列已据源码（commit \texttt{99936e08}）实填：球状态读取改为后端 getter（\texttt{get\_body\_pos\_w}/\allowbreak\texttt{get\_body\_lin\_vel\_w}）、接触事件改为命名 sensor（\texttt{get\_sensor\_data}）、actor/critic 分组用 \texttt{obs\_groups\_spec} 两组（见 \cref{sec:rlmc-perc-distill}）；唯\textbf{相机/视觉}一项 UniLab 当前任务集确无（$26$ 任务全本体感知），故如实标「无对应」而非编造。论文数值（LATENT 成功率三档、HITTER 预测精度 $7.5$\,cm/$20$\,ms、PACE hit/success rate、ETH 频率与 $12.06$\,m/s 峰值速度、事件相机 $4.5$\,ms 延迟）均已联网核实；仍标 \pz{} 的量级（含 drag EKF 改进百分比、GRU 残差消融误差、LATENT 逐项噪声值、gray-box 误差降幅）为源稿教学估计或论文未逐字给出，部署前应自行实测或回原文核对。
+\end{finenote}

@@ -1,0 +1,1682 @@
+\chapter{特权学习与 Teacher-Student 蒸馏}\label{ch:rlmc-privileged}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实战章。
+%  主线：算法/概念领路 —— 先立「有哪些特权信息、为何要在 actor/critic/teacher/
+%  student 间划信息边界」，再在 mjlab / Isaac Lab / UniLab 三框架里对比落地。
+%  假定读者已掌握 RL 基础（理论部 P6_rl 已讲 PPO/A2C/重要性采样），不重教基础。
+%  源稿 RL运控/Ch09_Privileged_Learning与Teacher-Student蒸馏.md（实践偏重）已按本主线重构。
+%  关键 API/类名/论文归属/数值均联网核对（Isaac Lab + mjlab 官方文档/论文），
+%  存疑处包 \pz{待核实：..} 或 \rebuilt{..}，并在 claimsToVerify 列出。
+%  实战章弃图：导航树用 forest，其余用表/代码/数据流文本替代。
+% ════════════════════════════════════════════════════════════════
+
+强化学习运动控制的整条管线，从 \cref{ch:rlmc-obsact} 的观测设计、\cref{ch:rlmc-manager} 的 manager 架构，到奖励、课程、PPO 训练、域随机化（domain randomization, DR），始终绕不开一条根本矛盾：\textbf{仿真里能看到的信息，和真机上能拿到的信息，不是一回事}。在 MuJoCo 或 Isaac Sim 里，每个接触点的三维力、地形每一点的精确高度、机体质心的真实速度、所有物理参数（摩擦、质量分布、关节阻尼）都是「免费」的——一次物理步进之后直接读 \verb|data| 结构即可。但真机上，你只有带噪带偏的 IMU 角速度与加速度、有量化的关节编码器、噪声较大的速度差分、也许一个有 30--100\,ms 延迟的深度相机。这条信息鸿沟（information gap）就是\textbf{特权学习}（privileged learning）要正面解决的问题。
+
+本章遵循全书「先动机、先算法，后工程」的次序。先从算法层面把特权信息\emph{是什么}、有哪几类、应该交给哪个角色（actor / critic / teacher / student）讲清楚——这一步是 \cref{ch:rlmc-obsact} 「部署可得性原则」在\emph{系统层面}的兑现；再转入工程实践，在 mjlab、Isaac Lab、UniLab 三个框架里对比地配置非对称 actor-critic、接线 RMA 适应模块、搭建 teacher-student 蒸馏管线，并精读工业级项目 extreme-parkour。\textbf{算法领路，实践兑现}。
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-priv-setup}
+
+特权学习不引入新的依赖——它复用 \cref{ch:rlmc-setup} 已经装好的训练栈，本章只需确认\emph{版本}满足非对称配置与蒸馏的最低要求。关键卡点是 RSL-RL：非对称 actor/critic 与 \Verb[breaklines]|DistillationRunner| 都依赖较新的 RSL-RL（本书实测 \verb|rsl-rl-lib| 5.2.0，旧版本若缺这些类或字段则与本章代码不兼容）。\textbf{一个极易踩的坑：actor/critic 网络配置的「形态」因框架而异}——mjlab 用 per-model 的 \Verb[breaklines]|RslRlModelCfg(actor=, critic=)|（每个网络一套独立 cfg，含 \Verb[breaklines]|obs_normalization/cnn_cfg/rnn_type|），而 Isaac Lab 的 \verb|isaaclab_rl| 实测仍是\emph{统一}的 \Verb[breaklines]|RslRlPpoActorCriticCfg(actor_hidden_dims=..., critic_hidden_dims=..., actor_obs_normalization=..., critic_obs_normalization=...)|。两者都能让 critic 比 actor 大，但类名与字段名完全不同（\cref{sec:rlmc-priv-rslrl4} 按框架分开讲），照搬一套到另一框架会直接 \verb|ImportError|。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+组件 & 最低/推荐版本 & 本章用到的能力 \\
+\midrule
+Isaac Lab & $\ge 2.0$（实测 2.3.2，\verb|isaaclab_rl| 封装） & \verb|ObsGroup| 多组、RSL-RL 桥接、ONNX 导出 \\
+mjlab & 活跃开发中（实测 1.4.0，无稳定发行线） & \verb|obs_groups| routing、actor/critic 组 \\
+RSL-RL & 实测 \verb|rsl-rl-lib| 5.2.0 & 非对称 actor/critic、\Verb[breaklines]|DistillationRunner|、ONNX exporter \\
+PyTorch & $\ge 2.1$ & 训练 + \verb|torch.onnx| 导出 \\
+onnxruntime & $\ge 1.16$ & sim-to-sim 验证 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[把 mjlab 的 per-model cfg 照搬到 Isaac Lab]
+\textbf{错误描述}：在 Isaac Lab 项目里照 mjlab 风格写 \Verb[breaklines]|RslRlModelCfg(actor=..., critic=...)| 或臆造的 \Verb[breaklines]|RslRlMLPModelCfg|。\textbf{现象后果}：\Verb[breaklines]|ImportError: cannot import name 'RslRlModelCfg'|——\verb|isaaclab_rl| 根本没有这个类。\textbf{根本原因}：两框架的 RSL-RL 桥接形态不同：mjlab 用 per-model 的 \verb|RslRlModelCfg|，Isaac Lab（实测 2.3.2）用统一的 \Verb[breaklines]|RslRlPpoActorCriticCfg|（\Verb[breaklines]|actor_hidden_dims|/\allowbreak\Verb[breaklines]|critic_hidden_dims| 同处一类）。\textbf{正确做法}：\emph{不要照书假设}，打开你项目里现成的 \Verb[breaklines]|rsl_rl_ppo_cfg.py|（Isaac Lab 在 \Verb[breaklines]|source/.../<robot>/agents/| 下）看它实际用哪个类——见到 \Verb[breaklines]|actor_hidden_dims| 字段就是 Isaac Lab 统一形态，见到 \Verb[breaklines]|actor=RslRlModelCfg(...)| 就是 mjlab per-model 形态（\cref{sec:rlmc-priv-rslrl4} 给出按框架判别的 checklist）。
+\end{pitfall}
+
+各 OS 的安装与 \cref{ch:rlmc-setup} 完全一致（Linux 原生最稳，Windows 走 WSL2，macOS 仅 mjlab/MuJoCo 可跑、Isaac Lab 不支持），此处不再赘述；只需在装完后追加一步版本核对：
+
+\begin{codebox}[bash]{确认 RSL-RL 与 ONNX 栈版本}
+python -c "import torch, importlib.metadata as m; print('rsl_rl', m.version('rsl-rl-lib')); print('torch', torch.__version__)"
+python -c "import onnxruntime as ort; print('onnxruntime', ort.__version__)"
+# 实测:rsl_rl 5.2.0 ;torch >= 2.1 ;onnxruntime >= 1.16
+# 关键不是版本号大小，而是辨别你装的 Isaac Lab 用统一 cfg 还是 mjlab 用 per-model cfg:
+python -c "from isaaclab_rl.rsl_rl import RslRlPpoActorCriticCfg; print('Isaac Lab: 统一 ActorCritic cfg, 用 actor_hidden_dims/critic_hidden_dims')"
+# 上一行能 import 成功 => 你的 Isaac Lab 是统一形态(本书实测路径);若你的环境是 mjlab，则改查 mjlab.rl.RslRlModelCfg
+\end{codebox}
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：5 分钟把对称配置改成非对称}
+\addcontentsline{toc}{section}{Quick Start：非对称 actor-critic}
+\label{sec:rlmc-priv-quickstart}
+
+特权学习最轻量的形态——非对称 actor-critic——可以在一个\emph{已能跑通}的 velocity 任务上五分钟内启用：让 critic 多看几路特权信号，actor 保持不变。下面是 mjlab 风格的最小改动（Isaac Lab 等价写法见 \cref{sec:rlmc-priv-config}）。
+
+\begin{codebox}[Python]{velocity 任务:把 critic 扩成特权组（mjlab 风格）}
+# 1) actor 组:只放部署可得信号（保持原样、带噪）
+actor_terms = make_proprio_terms(noise=True)   # IMU/编码器/命令/上一拍动作
+
+# 2) critic 组:继承 actor 全部 terms，再补特权信号（无噪）
+# 注意 term 名取自 mjlab.tasks.velocity.mdp（实测真任务用的就是这几个接触/足态特权项;
+# 而 friction_coefficients 这类「摩擦真值」term 在 mjlab 全仓并不存在——勿照搬想象的名字）
+from mjlab.tasks.velocity import mdp as vel_mdp
+critic_terms = {
+    **actor_terms,                              # 继承（注意 key 不要拼错，见陷阱）
+    "foot_contact_forces": ObservationTermCfg(  # 仿真接触力，真机无
+        func=vel_mdp.foot_contact_forces,
+        params={"sensor_name": "feet_ground_contact"},
+    ),
+    "foot_height": ObservationTermCfg(          # 足端离地高度真值，真机不可测
+        func=vel_mdp.foot_height,
+    ),
+}
+
+# 3) 注册两个 observation group:actor 开噪、critic 关噪
+observations = {
+    "actor":  ObservationGroupCfg(terms=actor_terms,  enable_corruption=True),
+    "critic": ObservationGroupCfg(terms=critic_terms, enable_corruption=False),
+}
+
+# 4) 告诉 runner 把哪个 env 组路由给哪个网络（值是 env 组名的 list）
+obs_groups = {"actor": ["actor"], "critic": ["critic"]}
+\end{codebox}
+
+\begin{codebox}[Python]{训练前必做:维度自检（critic 必须比 actor 宽）}
+# 注意:mjlab 不走 gymnasium 注册，没有 gym.make("Mjlab-...")，
+# 用 mjlab.tasks.registry 取任务 cfg（任务 ID 无 -v0 后缀）
+from mjlab.tasks.registry import load_env_cfg
+env_cfg = load_env_cfg("Mjlab-Velocity-Rough-Unitree-Go1")
+groups = env_cfg.observations          # dict: 组名 -> ObservationGroupCfg
+print("obs 组:", list(groups.keys()))  # 应含 'actor' 与 'critic'
+# 维度差最直接的活体读法:跑一次极短训练，启动日志会打印 actor/critic 两个 MLP，
+# 首层 in_features 即各组拼接后的观测维（实测 critic 比 actor 多出特权维）:
+#   WANDB_MODE=disabled train Mjlab-Velocity-Rough-Unitree-Go1 \
+#       --env.scene.num-envs 64 --agent.max-iterations 1
+# 看终端里 ActorCritic( ... actor: Linear(in_features=A,...) critic: Linear(in_features=C,...) )
+\end{codebox}
+
+跑通后，对比开/关特权 critic 两条 \Verb[breaklines]|value_function| loss 曲线：特权版应明显更低、reward 收敛更快。这条最小实验就是本章 \cref{sec:rlmc-priv-decision} 收尾的 A/B 消融的雏形。\pz{上述 term 名（\texttt{foot\_contact\_forces}、\texttt{foot\_height}）取自实测 mjlab 1.4.0 的 \texttt{mjlab.\allowbreak tasks.\allowbreak velocity.\allowbreak mdp}——同命名空间下还有 \texttt{foot\_contact}/\allowbreak\texttt{foot\_air\_time} 可选；但「摩擦真值」类 term（\texttt{friction\_coefficients}/\allowbreak\texttt{friction\_coeffs}）在 mjlab 全仓\emph{不存在}，真任务的特权信息走的是接触/足态类。mjlab 仍在活跃开发，落地前用 \texttt{import mjlab.\allowbreak tasks.\allowbreak velocity.\allowbreak mdp as m; print([a for a in dir(m) if not a.\allowbreak startswith('\_')])} 自查实际有哪些函数。}
+
+% ════════════════════════════════════════════════════════════════
+\section*{前置自测}
+\addcontentsline{toc}{section}{前置自测}
+\label{sec:rlmc-priv-selftest}
+
+\begin{practice}[前置自测：答错 $\ge 3$ 题，建议先回相应前置节]
+\begin{enumerate}
+  \item actor 观测与 critic 观测可以不同吗？这在 PPO 里如何影响 advantage 计算？（答错回看 \cref{ch:rlmc-obsact} 与理论部 A2C 一章）
+  \item 部署时只需要 actor，还是 actor 与 critic 都要？为什么？（答错回看本章 \cref{sec:rlmc-priv-forms}）
+  \item 一个信号「仿真可得但真机不存在」，应放进 actor、critic、还是都不放？（答错回看 \cref{sec:rlmc-priv-taxonomy}）
+  \item DR 解决的是「参数不确定性」还是「信息不存在性」？二者区别何在？（答错回看 \cref{ch:rlmc-dr} 的 DR 部分）
+  \item 在 mjlab 中 \texttt{obs\_groups} 起什么作用？它如何把 env 的观测路由给 runner 的网络？（答错回看 \cref{ch:rlmc-manager}）
+  \item teacher-student 蒸馏的 student 损失，与 RL 的 reward 有何本质区别？（答错回看理论部「策略梯度 vs 监督学习」）
+  \item 观测归一化的 running mean/std 在从 checkpoint 恢复时要注意什么？（答错回看本章 \cref{sec:rlmc-priv-norm}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章目标}
+\addcontentsline{toc}{section}{本章目标}
+\label{sec:rlmc-priv-goals}
+
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{分类}所有常见观测信号到四个角色（actor / critic / teacher / student），并能说出每个信号的部署来源；
+  \item \textbf{配置} mjlab 与 Isaac Lab 的 actor/critic 观测组，包括两框架各自的 RSL-RL 网络 cfg 形态（mjlab per-model vs Isaac Lab 统一）、terms 选择、corruption 控制与 \verb|obs_groups| routing；
+  \item \textbf{接线} RMA 风格的适应模块（adaptation module），并能写出 history 输入维度与离线训练循环；
+  \item \textbf{搭建} teacher-student 蒸馏的完整流程——teacher 训练、数据收集、student 训练、双指标评估；
+  \item \textbf{定位}信息泄漏与归一化问题，用一张 checklist 系统排查 actor 中的不可部署信号；
+  \item \textbf{精读} extreme-parkour 的官方两阶段管线（教学上拆成三阶段），并复述 HOVER 与 VIRAL 的前沿蒸馏方案；
+  \item \textbf{导出}训练好的 actor/student 为 ONNX，正确烘焙 normalizer 并完成 sim-to-sim 验证；
+  \item \textbf{选型}：面对新项目，依信息差类型与工程预算，在非对称 AC / RMA / 多阶段蒸馏之间做出决策。
+\end{enumerate}
+本章目标是\emph{可测}的：每一条都对应后文一个可动手验证的小节，而非「理解/掌握」式口号。
+
+% ════════════════════════════════════════════════════════════════
+\section*{知识导航}
+\addcontentsline{toc}{section}{知识导航}
+\label{sec:rlmc-priv-nav}
+
+前置桥接（2--3 行重述）：\cref{ch:rlmc-obsact} 已把观测分成本体感知/外部感知/命令/特权四族，并立下「actor 观测即部署端传感器协议」的契约；\cref{ch:rlmc-dr} 的 DR 让策略对参数变化鲁棒，但\emph{不}解决「策略看不到这些参数」。本章接着回答：看不到的信息，如何在训练时借给 critic/teacher、又在部署时由 student 间接补回。
+
+\begin{figure}[ht]
+\centering
+\begin{forest}
+  navtreeLR
+  [特权学习与蒸馏
+    [算法主线
+      [{四个角色：actor/critic/teacher/student}]
+      [{三种形态：非对称AC \,$\to$\, BC蒸馏 \,$\to$\, 并发TS}]
+      [{特权信息四类 + DR 协同}]
+    ]
+    [工程实践（三框架对比）
+      [{非对称 obs 组配置（\cref{sec:rlmc-priv-config}）}]
+      [{RMA 适应模块（\cref{sec:rlmc-priv-estimator}）}]
+      [{teacher-student 蒸馏（\cref{sec:rlmc-priv-distill}）}]
+    ]
+    [工业管线与部署
+      [{精读 extreme-parkour（\cref{sec:rlmc-priv-parkour}）}]
+      [{ONNX 导出 + sim-to-sim（\cref{sec:rlmc-priv-onnx}）}]
+      [{方案选型决策树（\cref{sec:rlmc-priv-decision}）}]
+    ]
+  ]
+\end{forest}
+\caption{本章知识结构：算法主线（信息边界）领路，三框架对比实践兑现，终于工业管线与部署选型。}
+\label{fig:rlmc-priv-navtree}
+\end{figure}
+
+阅读时间三档：精读约 110 分钟（含动手跑 Quick Start 与 A/B 消融）；速读约 45 分钟（算法主线 + 各节「模块功能」段 + 小结表）；查阅约 10 分钟（直接跳 \cref{sec:rlmc-priv-config} 配置表、\nameref{sec:rlmc-priv-faq} 误解表、章末故障排查手册）。
+
+% ════════════════════════════════════════════════════════════════
+\section{算法主线：特权信息与四个角色}
+\label{sec:rlmc-priv-forms}
+
+\textbf{模块功能与在管线中的位置。} 本节是全章的算法地基：它不教某个框架的 API，而是建立一套\emph{框架无关}的概念词汇——四个角色、三种形态、四类信息。后续所有「在 mjlab/Isaac Lab/UniLab 里怎么配」的工程问题，都是把这套概念映射到具体配置。在管线里，它处于「奖励/课程已定、PPO 即将开训」之后、「写 observation 配置」之前——决定了哪一路信号流向哪个网络。
+
+\subsection{信息不对称：部署的核心矛盾}
+\label{sec:rlmc-priv-gap}
+
+回顾 \cref{ch:rlmc-obsact} 的「部署可得性原则」：每个 actor 观测项都必须在真机上有等价的传感器来源。把这条原则放到整条训练-部署链路上，就得到特权学习的出发点——仿真免费提供的高质量信息（接触力、地形真值、物理参数）不能直接喂给 actor，否则训练时一切正常、部署时策略因「决策所依赖的信号根本不存在」而崩溃。
+
+\begin{insight}[特权学习的本质是「在信息鸿沟上搭桥」]\label{ins:rlmc-priv-bridge}
+特权学习的本质不是「让策略作弊」，也不是「让训练更快」。它是在「训练时知道、部署时不知道」这条信息鸿沟上搭桥：critic 用特权信息提高训练信号质量，teacher 用特权信息生成高质量示范——但桥的\emph{终点}始终是一个只依赖部署可得信息的 actor 或 student。这与 \cref{ch:rlmc-obsact} 的契约视角一脉相承：契约的甲方（部署系统）从不改变，特权信息只是施工期的脚手架。
+\end{insight}
+
+一个边界清晰的类比：仿真像开「上帝视角」玩即时战略——地图全貌、每个单位血量位置尽收眼底；真机像正常视角——战争迷雾遮住大半地图。若你在上帝视角下训练出的策略依赖全局地图做战术决策，切回正常视角就会失效。但这个类比有一条重要边界：游戏的战争迷雾是\emph{显式}设计，你知道哪里看不到；而机器人部署中的信息缺失更隐蔽——仿真代码不会主动告诉你「这个观测项真机上没有」。这正是后文需要一张系统的信息分类表（\cref{sec:rlmc-priv-taxonomy}）和一套泄漏排查 checklist（\cref{sec:rlmc-priv-leak}）的原因。
+
+\subsection{四个角色的生命周期}
+\label{sec:rlmc-priv-roles}
+
+为彻底消除 actor / critic / teacher / student 的混淆，先用生命周期视角给出一张贯穿全章的总表。
+
+\begin{table}[H]
+\centering
+\small
+\caption{四个角色的生命周期与信息边界。最终被部署的只有 actor 或 student。}
+\label{tab:rlmc-priv-roles}
+\begin{tabular}{@{}llllll@{}}
+\toprule
+角色 & 何时创建 & 何时活跃 & 何时销毁 & 部署保留 & 信息来源 \\
+\midrule
+actor   & PPO 开训   & 训练+评估+部署       & 永不销毁          & 是 & 部署可得 \\
+critic  & PPO 开训   & 仅训练（估 value）    & 训练结束即弃       & 否 & 部署 + 特权 \\
+teacher & teacher 开训 & teacher 训练 + 收集 rollout & student 训完即弃 & 否 & 部署 + 特权 \\
+student & 蒸馏开训   & 蒸馏+评估+部署       & 永不销毁          & 是 & 仅部署可得 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[辅助角色的算力只影响训练时间，不影响部署延迟]\label{ins:rlmc-priv-free}
+critic 与 teacher 都是训练辅助角色，完成使命即可丢弃。这意味着它们的网络可以\emph{很大}——给 critic 更大的 MLP 以获得更准的 value、给 teacher 更丰富的观测以获得更强的策略——而完全不影响最终部署模型的推理延迟。这条洞察直接支撑 \cref{sec:rlmc-priv-config} 里「critic 用 \texttt{[512,256,128]}、actor 用 \texttt{[256,128,64]}」的非对称网络配置。
+\end{insight}
+
+另一条关键区分：actor 与 student 虽都是部署角色，但\emph{学习方式}不同。actor 通过 RL（policy gradient、试错）从 reward 中学「什么是好行为」；student 通过监督学习（模仿 teacher 的动作）从示范中学「teacher 认为什么是好行为」。工程含义截然不同：actor 训练需要好的 reward 设计（\cref{ch:rlmc-reward} 的主题），student 训练需要好的 teacher 和足够多样的蒸馏数据。
+
+\subsection{三种形态：非对称 AC \texorpdfstring{$\to$}{->} BC 蒸馏 \texorpdfstring{$\to$}{->} 并发 TS}
+\label{sec:rlmc-priv-three}
+
+特权学习有三种主要形态，问题层次不同、工程复杂度递增。
+
+\begin{table}[H]
+\centering
+\small
+\caption{三种特权学习形态对比。工程复杂度自左向右递增。}
+\label{tab:rlmc-priv-forms}
+\begin{tabular}{@{}p{2.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+维度 & 非对称 Actor-Critic & BC 蒸馏（Teacher-Student） & 并发 Teacher-Student \\
+\midrule
+核心思想 & critic 看特权，actor 看部署信息 & teacher 用特权训出最优策略，student 模仿 & teacher 与 student 同时训练，teacher 持续示范 \\
+特权角色 & critic（估值器） & teacher（策略） & teacher（策略） \\
+特权输出 & value（标量） & action 或 latent（向量） & action 或 latent \\
+部署角色学法 & RL（policy gradient） & 监督（imitation loss） & RL + imitation \\
+训练阶段数 & 1 & 2（先 teacher RL，再 student BC） & 1（同时但两个网络） \\
+工程复杂度 & 低（框架原生） & 高（多阶段） & 很高 \\
+经典论文 & Pinto 2018 & Kumar 2021、Lee 2020 & 多种变体 \\
+框架支持 & mjlab/Isaac Lab 原生 & RSL-RL \texttt{DistillationRunner} & 需自定义 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{形态一·非对称 Actor-Critic（Asymmetric AC）。} 最简单、最常用。critic 看完整特权观测（接触力、地形真值、环境参数），actor 只看部署可得信息，二者在 PPO 中同时训练；训练结束丢弃 critic、只部署 actor。其思想最早由 Pinto 等在面向图像的机器人学习中系统提出（RSS 2018，arXiv:1710.06542）：actor 与 critic 可以看到\emph{不同}的信息，critic 的额外信息只改善价值估计、不进入部署接口 \cite{pinto2018asymmetric}。mjlab 与 Isaac Lab 都原生支持——只需在 env 配置里分别定义 actor 组与 critic 组（\cref{sec:rlmc-priv-config}）。
+
+\paragraph{形态二·BC 蒸馏（Teacher-Student Distillation）。} 当 actor 与部署输入的信息差太大（如 actor 需从深度图决策、但训练时可直接用低维 state），非对称 AC 不够——critic 只能让训练信号更干净，无法替 actor 补回缺失的\emph{感知能力}。此时先训一个看特权的 teacher（它本身可以是一个非对称 AC 的 actor），再用监督学习把 teacher 行为蒸馏给只看部署信息的 student。Lee 等的四足越障工作（Science Robotics 2020）与 Kumar 等的 RMA（RSS 2021）是这一形态的奠基 \cite{lee2020quadruped,kumar2021rma}。
+
+\paragraph{形态三·并发 Teacher-Student。} teacher 与 student 同时在环境中运行训练：teacher 用 RL + 特权持续改进，student 同时模仿 teacher 的最新行为。它避开了两阶段管线的复杂性，但工程上更难稳定——teacher 的行为分布在不断变化，student 是在追一个移动目标。
+
+\begin{insight}[三种形态 = 信息蒸馏链的长度]\label{ins:rlmc-priv-chain}
+统一视角是「信息蒸馏链」的长度。非对称 AC 只有一级（特权 $\to$ value $\to$ advantage $\to$ actor 梯度），链最短。BC 蒸馏有两级（特权 $\to$ teacher action $\to$ student imitation loss $\to$ student 梯度），链更长。并发 TS 试图把两级压进同一个训练循环。链越长，信息损失越大，但能跨越的信息鸿沟也越宽。选型（\cref{sec:rlmc-priv-decision}）的核心，就是用\emph{最短的够用的链}解决你的信息差。
+\end{insight}
+
+\paragraph{两种方法可以组合。} 非对称 AC 与 teacher-student 不互斥：一个常见的工业管线是「用非对称 AC 训 teacher（teacher 的 critic 看特权、teacher 的 actor 也看特权）$\to$ 用 teacher-student 蒸馏把能力迁到只看部署信息的 student」。第一级是\emph{效率}优化（让 teacher 训得更好），第二级才是\emph{信息边界}的核心（让 student 在有限信息下行动）。
+
+\subsection{Multi-Critic：把不对称从「信息维度」推广到「目标维度」}
+\label{sec:rlmc-priv-multicritic}
+
+上面假设只有一个 critic。但当任务有多个相互冲突的目标时，让\emph{多个 critic 各自关注不同的 reward 子集}可显著改善训练。Huang 等的 HoST（人形起身控制，RSS 2025，arXiv:2502.08378）用了一套四组 multi-critic 架构 \cite{huang2025host}：把奖励分成 task（高层任务目标）、style（起身动作风格）、regularization（动作正则）、post-task（站起后的期望行为）四组，每组配一个独立 critic、共享同一份观测——这样弱的风格/正则信号不会被强的任务奖励稀释，每组都有自己的 baseline 与更精确的 advantage 估计。
+
+\begin{insight}[Multi-critic 解耦的是目标，不是状态]\label{ins:rlmc-priv-multic}
+传统非对称 AC 解决的是「critic 比 actor 看到更多\emph{状态}信息」的不对称；multi-critic 解决的是「不同训练\emph{目标}之间的价值估计冲突」。二者可以叠加：每个 critic 都看特权信息，但各自优化不同的 reward 子集。单 critic 被迫把多维价值压成一个标量，弱的子目标（如 HoST 的 style/regularization）易被强目标（task）的 bonus 掩盖；多 critic 让每组奖励有自己的 baseline，advantage 估计更精确。
+\end{insight}
+
+在 mjlab/Isaac Lab 里实现 multi-critic 需自定义 PPO 循环（标准 \Verb[breaklines]|OnPolicyRunner| 只支持单 critic）：为每个 critic 维护独立 value 网络与 advantage buffer，再把多个 advantage 加权合并用于策略梯度。具体实现属 \cref{ch:rlmc-manager} 训练管线的拓展，本章只需理解它与特权学习的关系。
+
+\begin{pitfall}[混淆非对称 AC 与 teacher-student]
+\textbf{错误描述}：因为「都涉及一个角色看到更多信息」，把两者当成一回事。\textbf{现象后果}：误把 teacher 的 checkpoint 当 critic 用、或反之，部署/训练逻辑全乱。\textbf{根本原因}：没抓住输出类型的本质区别。\textbf{正确做法}：记牢——非对称 AC 的 critic 输出 \emph{value}（标量），帮助训练但不产生动作；teacher-student 的 teacher 输出 \emph{action}（向量），直接产生可被模仿的动作。
+\end{pitfall}
+
+\begin{pitfall}[teacher checkpoint 被当作部署 actor]
+\textbf{错误描述}：把 teacher 的 checkpoint 直接导出 ONNX 部署。\textbf{现象后果}：真机上 shape error 或行为崩坏——teacher 的输入含特权信号。\textbf{根本原因}：忘了 teacher 是\emph{训练辅助}角色，部署只保留 student（蒸馏）或 actor（仅非对称 AC）。\textbf{正确做法}：部署前打印模型输入维度，确认与部署传感器提供的维度一致（见 \cref{sec:rlmc-priv-onnx}）。
+\end{pitfall}
+
+\paragraph{运行验证。} 本节无代码，但它的「验证」是后续一切配置的前提：你应当能对着 \cref{tab:rlmc-priv-roles} 说出，对你手上的任务，哪些信号进 actor、哪些只进 critic、是否需要 teacher。
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[概念]} 画出非对称 AC、BC 蒸馏、并发 TS 三种形态的数据流图，标注特权信息的流向（从 env 到哪个网络、经什么变换、最终如何影响部署策略）。验收：每张图都能指出「部署时哪个网络被保留」。
+  \item \textbf{[分析]} 解释「critic 看到特权信息不算作弊」依赖一个前提：critic 不能直接影响 actor 的输入。若某 shared-network 架构把 critic 的 hidden state 传给了 actor，这个前提还成立吗？验收：能给出「会泄漏」的具体路径。
+\end{enumerate}
+\end{practice}
+
+% ----------------------------------------------------------------
+过渡：上一节立了算法地基。但在写配置之前，必须先把「特权信息」这个模糊概念变成一张可操作的分类表——这正是下一节的主题，也是 \cref{ch:rlmc-dr} 的 DR 与本章衔接的关键。
+
+% ════════════════════════════════════════════════════════════════
+\section{特权信息分类与 DR 协同}
+\label{sec:rlmc-priv-taxonomy}
+
+\textbf{模块功能与在管线中的位置。} 本节把「特权信息」从二元标签变成一张分类表：按信息来源与时间特性分四类，每类对应不同的工程处理策略。它处于「角色概念已清」之后、「写 obs 组」之前——你得先知道某个信号属于哪一类，才能决定它该 critic-only、还是值得给 estimator 估、还是干脆禁用。
+
+\subsection{为什么必须分类}
+\label{sec:rlmc-priv-whyclass}
+
+「特权信息」不是有或没有的二元标签，而是一道光谱：不同信号的特权程度、变化速率、可估计性差异极大。不分类会落入两个工程陷阱：一是把所有非部署信号一刀切丢进 critic，忽视某些信号本可通过 estimator 间接恢复；二是不清楚哪些特权信号给 teacher 有益、哪些有害（例如未来信息会让 teacher 学出因果违反的行为）。反面例子：把摩擦系数和接触力都扔进 \verb|critic_terms|，觉得「反正都是特权」——但摩擦在整个 episode 内恒定、可由 5--10 步本体感知历史可靠估计，接触力却每步剧变、极难从历史推断。用同一个 estimator 去估这两类，窗口短了估不准摩擦、长了对接触力的时效性也没帮助。
+
+\subsection{四类特权信息}
+\label{sec:rlmc-priv-fourclass}
+
+\begin{table}[H]
+\centering
+\small
+\caption{四类特权信息及其工程处理策略。未来信息是唯一「即使给 teacher 也有害」的一类。}
+\label{tab:rlmc-priv-fourclass}
+\begin{tabular}{@{}p{2.0cm}p{3.0cm}p{1.7cm}p{1.6cm}p{3.4cm}@{}}
+\toprule
+类别 & 典型信号 & 变化速率 & student 可估？ & 处理策略 \\
+\midrule
+环境物理参数 & 摩擦、质量偏移、关节阻尼/刚度 & episode 内恒定 & 是（经历史） & RMA 适应模块 \\
+动态接触信息 & 足底力、接触法线、滑移速度、接触状态 & 每步变化 & 部分（经力估计） & critic-only 或力传感器替代 \\
+全局感知信息 & 地形高度真值、物体 6DoF 位姿 & 连续变化 & 视觉/LiDAR & teacher-student 蒸馏 \\
+未来信息 & 未来地形变化、未来命令、未来接触时序 & N/A & 否（违反因果） & \textbf{禁止使用} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+第一类（环境物理参数）是「慢变量」——就像天气预报里的「气候」而非「天气」，几秒钟的本体感知历史足以推断你在什么样的地面上走，这正是 RMA 的核心思路（\cref{sec:rlmc-priv-estimator}）。第二类（动态接触信息）「当前值重要、历史值帮助不大」——上一步的接触力对当前步决策参考有限。第三类（全局感知）「空间范围广、替代成本高」——你需要一整条感知管线来替代仿真里一行 raycast。第四类（未来信息）违反因果性：teacher 若学会「看到未来 3 步地形而提前减速」，student 只看当前信息，永远无法复现这种「提前反应」——蒸馏必败。
+
+\begin{insight}[蒸馏可行的前提：teacher 行为能被 student 的输入空间「近似解释」]\label{ins:rlmc-priv-explain}
+teacher 蒸馏成功的隐含前提是：触发 teacher 每个行为的信息，在 student 的输入空间里要么直接存在、要么可从历史/感知近似恢复。未来信息违反这一前提，所以哪怕只给 teacher 也禁用。例外：若「未来命令」在部署时由上层规划\emph{提前下发}（如 $T{+}0.5$\,s 的目标速度），那它不是真正的未来信息，而是一种 lookahead command，student 也能接收。
+\end{insight}
+
+\subsection{信号到角色的映射表（locomotion 实例）}
+\label{sec:rlmc-priv-mapping}
+
+下表覆盖 velocity/tracking 任务中常见观测，是你写 env 配置时的核心参考。注意 \verb|height_scan| 出现两次：actor 版带噪（模拟真实深度传感器），critic 版无噪（仿真真值）——这是非对称 AC 的典型模式：同一物理量，actor 看降质版、critic 看完美版。
+
+\begin{table}[H]
+\centering
+\small
+\caption{信号到角色的映射（mjlab velocity 任务为例）。term 名以本地安装版本为准。}
+\label{tab:rlmc-priv-mapping}
+\begin{tabular}{@{}p{2.7cm}p{3.0cm}cccp{2.6cm}@{}}
+\toprule
+信号 & mjlab term 名 & actor & critic & teacher & 部署来源 \\
+\midrule
+机体角速度 & \texttt{imu\_ang\_vel} & 是 & 是 & 是 & IMU \\
+重力投影 & \texttt{projected\_gravity} & 是 & 是 & 是 & IMU 姿态估计 \\
+关节位置/速度 & \texttt{joint\_pos\_rel}/\allowbreak\texttt{joint\_vel\_rel} & 是 & 是 & 是 & 编码器(差分) \\
+上一拍动作 & \texttt{last\_action} & 是 & 是 & 是 & 策略内部记忆 \\
+速度命令 & \texttt{generated\_commands} & 是 & 是 & 是 & 上层规划 \\
+机体线速度 & \texttt{imu\_lin\_vel} & 视估计器 & 是 & 是 & 需状态估计器 \\
+地形扫描(带噪) & \texttt{height\_scan}+noise & 是 & --- & --- & 深度相机/LiDAR \\
+地形扫描(无噪) & \texttt{height\_scan} & --- & 是 & 是 & 仿真 raycast \\
+足端接触/接触力 & \texttt{foot\_contact}/\allowbreak\texttt{foot\_contact\_forces} & --- & 是 & 是 & 仿真接触检测 \\
+摩擦系数/机体质量 & env 内部参数 & --- & 是 & 是 & 不可测（RMA 估计） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+以 Unitree Go1 在崎岖地形上行走为例走一遍决策：部署可得的是 \verb|joint_pos|(12) + \verb|joint_vel|(12) + \verb|base_ang_vel|(3) + \Verb[breaklines]|projected_gravity|(3) + \verb|commands|(3) + \verb|last_actions|(12) $=$ 45 维，构成 actor 组；critic 在此基础上再加 \verb|base_lin_vel| + \Verb[breaklines]|friction_coeffs| + \verb|body_mass| + \Verb[breaklines]|contact_forces| + \Verb[breaklines]|terrain_heights|。这个 actor 与 critic 之间的维度差，正是非对称 AC 对 locomotion 如此有效的原因：critic 用丰富信息估更准的 value，让 PPO 的策略梯度方向更精准，间接帮 actor 在有限信息下做出更好决策。\pz{待核实：源稿给出 critic 总维 249、信息差 204（含 187 维 terrain\_heights）。具体维度强依赖 height\_scan 网格分辨率与机器人关节数，请以你本地任务实际打印为准，不要照搬数字。}
+
+\subsection{DR 与特权学习是同一优化问题的两个面}
+\label{sec:rlmc-priv-dr}
+
+回顾 \cref{ch:rlmc-dr}：DR 通过随机化环境参数让策略对参数\emph{不确定性}鲁棒，但它\emph{不}解决「策略看不到这些参数」。特权学习补上这块拼图：teacher/critic 直接看参数真值，student/actor 从行为历史推断。二者构成当前工业级管线的标准 recipe——「在激进 DR 下训 teacher $\to$ 把 teacher 蒸馏到只看本体感知历史的 student」。
+
+\begin{insight}[DR 的宽度决定 student 能否做隐式系统辨识]\label{ins:rlmc-priv-drsysid}
+DR 范围直接决定 student 能否从历史中做隐式系统辨识（implicit system identification）。DR 太窄（如摩擦只在 $[0.95,1.05]$），本体感知历史里几乎看不出摩擦差异，适应模块学不到有意义信号；DR 太宽（如摩擦 $0.01$ 到 $10$），teacher 在极端参数组合下训练失败，蒸馏的源头就坏了。所以 \cref{ch:rlmc-dr} 与本章必须\emph{联合调参}：DR 范围与特权方案是同一优化问题的两个面。
+\end{insight}
+
+\begin{table}[H]
+\centering
+\small
+\caption{DR 范围对 teacher 训练与 student 蒸馏的联合影响。}
+\label{tab:rlmc-priv-drrange}
+\begin{tabular}{@{}llll@{}}
+\toprule
+DR 范围 & teacher 训练 & student 蒸馏 & 实际效果 \\
+\midrule
+太窄 & 易收敛 & 历史无法区分不同参数 & student 在 DR 外参数上失败 \\
+适中 & 稳定收敛 & 历史可区分且可学 & 最优 \\
+太宽 & 训练不稳定 & 蒸馏源头不可靠 & 全链路崩溃 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[把 \texttt{foot\_contact} 放进 actor 组]
+\textbf{错误描述}：为「让 actor 知道脚有没有着地」，把仿真 \verb|foot_contact| 二值信号加进 actor。\textbf{现象后果}：真机上没有等价的干净接触信号；即便装了力传感器，阈值不当也会让接触 timing 与仿真不一致，策略表现下降。\textbf{根本原因}：仿真 \verb|ContactSensor| 直接读取的二值接触，与真机力传感器/阻抗估计器在精度、延迟、语义上都不同。\textbf{正确做法}：\verb|foot_contact|/\allowbreak\Verb[breaklines]|foot_contact_forces| 默认只进 critic；确需 actor 用接触，须在仿真中模拟传感器噪声特性后再用真机触觉传感器替代。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[分类]} 判断下列信号属于四类中哪一类，并决定放 actor/critic/teacher：(a) IMU 角速度 (b) 仿真接触力 (c) 仿真地形高度真值 (d) 关节编码器位置 (e) 摩擦系数真值 (f) 下一步地形变化 (g) 物体 6DoF 位姿。验收：每个答案都附一句「部署来源/为何禁用」。
+  \item \textbf{[跨章综合]} 你为 Go1 选了 RMA 处理未知摩擦，但 \cref{ch:rlmc-dr} 里把摩擦 DR 设成 $[0.9,1.1]$。预测适应模块会学成什么？给出修复方向。验收：能指出「适应模块退化为常数输出」并提出先放宽 DR。
+\end{enumerate}
+\end{practice}
+
+% ----------------------------------------------------------------
+过渡：有了分类框架，下一步把它转成框架配置——在 mjlab、Isaac Lab、UniLab 里如何具体定义 actor 组与 critic 组。
+
+% ════════════════════════════════════════════════════════════════
+\section{三框架对比：非对称观测组配置}
+\label{sec:rlmc-priv-config}
+
+\textbf{模块功能与在管线中的位置。} 本节是「部署可得性原则」在 framework-level 的兑现：通过 actor/critic 组的分组机制，在代码层面\emph{强制}执行信息边界。它处于「分类已定」之后、「开训」之前。错误的后果极其隐蔽——信息泄漏可能在仿真中完全无感（训练正常、play 正常），只有部署到真机才暴露，像一个只在生产环境触发的 bug。
+
+\subsection{配置详解：mjlab}
+\label{sec:rlmc-priv-cfg-mjlab}
+
+mjlab 中观测组配置位于 task 的 \verb|env_cfg.py|。核心是把观测拆成两个 \Verb[breaklines]|ObservationGroupCfg|，并用 \Verb[breaklines]|enable_corruption| 控制各组是否加噪。
+
+\begin{codebox}[Python]{mjlab:actor/critic 双组配置（节选，velocity 任务）}
+# ——— actor 组:全部部署可得，带噪 ———
+actor_terms = {
+    "base_ang_vel": ObservationTermCfg(
+        func=mdp.builtin_sensor, params={"sensor_name": "robot/imu_ang_vel"},
+        noise=Unoise(n_min=-0.2, n_max=0.2)),          # actor 注入噪声
+    "projected_gravity": ObservationTermCfg(
+        func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05)),
+    "joint_pos": ObservationTermCfg(
+        func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01)),
+    "joint_vel": ObservationTermCfg(
+        func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5)),
+    "actions": ObservationTermCfg(func=mdp.last_action),
+    "command": ObservationTermCfg(
+        func=mdp.generated_commands, params={"command_name": "twist"}),
+    "height_scan": ObservationTermCfg(                  # actor 看带噪地形
+        func=envs_mdp.height_scan, params={"sensor_name": "terrain_scan"},
+        noise=Unoise(n_min=-0.1, n_max=0.1)),
+}
+
+# ——— critic 组:继承 actor + 特权（无噪）———
+critic_terms = {
+    **actor_terms,                                      # 字典展开继承
+    "height_scan": ObservationTermCfg(                  # 覆盖:去掉噪声
+        func=envs_mdp.height_scan, params={"sensor_name": "terrain_scan"}),
+    "foot_contact_forces": ObservationTermCfg(          # 额外:接触力
+        func=mdp.foot_contact_forces,
+        params={"sensor_name": "feet_ground_contact"}),
+}
+
+observations = {
+    "actor":  ObservationGroupCfg(terms=actor_terms,  concatenate_terms=True,
+                                  enable_corruption=True),   # actor 开噪
+    "critic": ObservationGroupCfg(terms=critic_terms, concatenate_terms=True,
+                                  enable_corruption=False),  # critic 关噪
+}
+\end{codebox}
+
+三处关键设计决策值得逐行理解。\textbf{第一，\texttt{enable\_corruption} 的不同语义。} actor 组 \verb|True| 表示训练时应用各 term 的 \verb|noise|（模拟真实传感器）；critic 组 \verb|False| 表示即便 term 定义了 noise 也不应用——critic 看「干净」数据，否则 value 估计因噪声方差增大、advantage 信号质量下降。\textbf{第二，\texttt{**actor\_terms} 字典展开的陷阱。} \Verb[breaklines]|{**dict, key: value}| 用后面的 key 覆盖同名 key，这是 critic 覆盖 \verb|height_scan|（去噪）的机制；但拼错 key（如 \verb|heigth_scan|）不会覆盖而是\emph{新增}，导致 critic 出现两个 height\_scan（一带噪一不带），维度翻倍且训练不报错。\textbf{第三，\texttt{obs\_groups} routing}（见下）告诉 runner 把哪个 env 组喂给哪个网络。
+
+\begin{codebox}[Python]{mjlab:RSL-RL runner 的 obs\_groups routing}
+obs_groups = {
+    "actor":  ["actor"],     # runner 的 actor 网络 <- env 的 "actor" 组
+    "critic": ["critic"],    # runner 的 critic 网络 <- env 的 "critic" 组
+}
+# routing 看似多余，实为灵活性:critic 可拼多组 ["actor","privileged"]，
+# 蒸馏时还能让 student/teacher 接不同组.
+\end{codebox}
+
+\subsection{配置详解：Isaac Lab}
+\label{sec:rlmc-priv-cfg-isaac}
+
+Isaac Lab 用 \verb|@configclass| + \verb|ObsTerm| 属性来声明观测组，组通常命名为 \verb|policy|（对应 mjlab 的 \verb|actor|）与 \verb|critic|；corruption 在 \verb|__post_init__| 里设。这套 \Verb[breaklines]|ObservationManager|/\allowbreak\verb|ObsGroup| 机制与 \cref{ch:rlmc-obsact} 一致 \cite{isaaclab2024}。
+
+\begin{codebox}[Python]{Isaac Lab:PolicyCfg / CriticCfg（节选）}
+@configclass
+class ObservationsCfg:
+    @configclass
+    class PolicyCfg(ObsGroup):            # 部署 actor
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel,
+                               noise=Unoise(n_min=-0.2, n_max=0.2))
+        projected_gravity = ObsTerm(func=mdp.projected_gravity)
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        actions  = ObsTerm(func=mdp.last_action)
+        velocity_commands = ObsTerm(func=mdp.generated_commands,
+                                    params={"command_name": "base_velocity"})
+        height_scan = ObsTerm(func=mdp.height_scan,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+            noise=Unoise(n_min=-0.1, n_max=0.1))
+        def __post_init__(self):
+            self.enable_corruption = True          # policy 开噪
+
+    @configclass
+    class CriticCfg(ObsGroup):            # 训练辅助 critic
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)        # 无噪
+        projected_gravity = ObsTerm(func=mdp.projected_gravity)
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        actions  = ObsTerm(func=mdp.last_action)
+        velocity_commands = ObsTerm(func=mdp.generated_commands,
+                                    params={"command_name": "base_velocity"})
+        height_scan = ObsTerm(func=mdp.height_scan,          # 无噪
+            params={"sensor_cfg": SceneEntityCfg("height_scanner")})
+        contact_forces = ObsTerm(func=mdp.contact_forces,    # 特权
+            params={"sensor_cfg": SceneEntityCfg("contact_sensor")})
+        def __post_init__(self):
+            self.enable_corruption = False         # critic 关噪
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+\end{codebox}
+
+（API 已联网核对：\texttt{base\_ang\_vel}/\allowbreak\texttt{projected\_gravity}/\allowbreak\texttt{joint\_pos\_rel}/\allowbreak\texttt{joint\_vel\_rel}/\allowbreak\texttt{last\_action}/\allowbreak\texttt{generated\_commands}/\allowbreak\texttt{height\_scan} 均为 \texttt{isaaclab.\allowbreak envs.\allowbreak mdp.\allowbreak observations} 的内置函数；但 \texttt{contact\_forces} \emph{不是}内置 obs 函数——Isaac Lab 内置的力类观测是 \texttt{body\_incoming\_wrench}，足底接触力须自定义一个读 \texttt{ContactSensor} 的 term，或改用 \texttt{body\_incoming\_wrench}。此处按多数 locomotion 工程的惯用自定义名书写，落地时以你项目里的实际 term 为准。）
+
+\subsection{配置详解：UniLab}
+\label{sec:rlmc-priv-cfg-unilab}
+
+UniLab 是一套\emph{异构} RL 运行时（物理仿真在 CPU、策略学习在 GPU，二者经共享内存 IPC 解耦），它\emph{不走}声明式 \verb|ObsGroup|/\allowbreak\verb|ObsTerm| 树，而是在环境子类里\textbf{命令式手写}两组观测 \cite{unilab2026}。机制由三处协同：env 子类的 \Verb[breaklines]|obs_groups_spec| 声明 \Verb[breaklines]|{"obs": A, "critic": C}|（组名映射到维度，\verb|C>A| 多出的维度即特权信号）；\Verb[breaklines]|base/observations.py| 的 \Verb[breaklines]|split_obs_dict()|（UniLab）把 \verb|obs["obs"]| 路由给 actor、\verb|obs["critic"]| 路由给 critic（无 \verb|critic| 组时复用 \verb|obs|）；\Verb[breaklines]|_compute_obs()| 里 actor 组只拼真机可得量并叠噪声、critic 组用无噪声干净值再追加特权项。换言之，mjlab/Isaac Lab 用\emph{配置}强制信息边界，UniLab 用\emph{代码里两个不同的 \texttt{np.\allowbreak concatenate}}强制——本质同构，差异只在声明式 vs 命令式。
+
+\begin{codebox}[Python]{UniLab:actor/critic 双组观测（go2 joystick，手写拼接 + 特权 linvel）}
+# env 侧固定两组:obs 喂 actor、critic 喂 critic（split_obs_dict 路由）
+@property
+def obs_groups_spec(self) -> dict[str, int]:
+    return {"obs": 49, "critic": 52}          # critic 比 obs 多 3 维 = 特权 base linvel
+
+def _compute_obs(self, info, linvel, gyro, gravity, dof_pos, dof_vel, feet_phase):
+    nc   = self._cfg.noise_config              # 噪声 level/scale 配置
+    diff = dof_pos - self.default_angles
+    obs = np.concatenate([                     # ——— actor 组:真机可得量 + 噪声 ———
+        self._obs_noise(gyro,    nc.scale_gyro),         # 机体角速度(3)，对应 IMU
+        -self._obs_noise(gravity, nc.scale_gravity),     # 投影重力(3)，IMU 姿态
+        self._obs_noise(diff,    nc.scale_joint_angle),  # 关节角差(12)，编码器
+        self._obs_noise(dof_vel, nc.scale_joint_vel),    # 关节速度(12)
+        info.get("current_actions", np.zeros_like(diff)),# 上一拍动作(12)
+        info["commands"],                                # 速度命令(3)
+        feet_phase,                                      # 步态相位(4)
+    ], axis=1)                                           # 合计 49
+    critic = np.concatenate([                  # ——— critic 组:无噪声 + 追加特权 ———
+        gyro, -gravity, diff, dof_vel, info["current_actions"],
+        info["commands"], feet_phase,
+        linvel,                                          # +特权 base linvel(3)，真机不可测
+    ], axis=1)                                           # 合计 52
+    return {"obs": obs, "critic": critic}
+# 噪声仅 actor 加:_obs_noise(data, scale) 幅度 = level*scale*U(-1,1)，level<=0 一键全关
+#   ——这就是 UniLab 的 "corruption" 开关:actor 组逐项叠噪、critic 组直接用干净值.
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:obs 组的 Hydra 路由与维度自检入口}
+# Hydra owner YAML:把 env 侧两组路由给 rsl-rl runner 的 actor/critic 网络
+# algo.obs_groups = {actor: [actor], critic: [critic]}   # rough/非对称任务用两组
+# algo.obs_groups = {actor: [actor]}                     # flat/对称任务可只一组
+#
+# 维度自检:env 侧直接读 obs_groups_spec（不必先 reset env）
+spec = env.obs_groups_spec                  # {"obs": 49, "critic": 52}
+assert spec["critic"] > spec["obs"], "critic 必须比 actor 多特权维，否则非对称没生效！"
+print("privileged_diff =", spec["critic"] - spec["obs"])   # = 3（特权 base linvel）
+# observation_space 默认 = 所有组维度之和的 Box（此处 49+52=101）
+\end{codebox}
+
+注意两层组名的对齐：env 侧 \Verb[breaklines]|obs_groups_spec| 内部固定用 \verb|obs|/\allowbreak\verb|critic| 两个键，而 YAML 里 \Verb[breaklines]|algo.obs_groups| 的键（\verb|actor|/\allowbreak\verb|critic|）是给 rsl-rl runner 的 obs-set 路由键，二者经 wrapper 对齐——这与 mjlab \Verb[breaklines]|obs_groups={"actor":["actor"],...}| 的「env 组名 $\to$ runner set 名」映射同思想。\textbf{UniLab 没有独立命名的 \texttt{"privileged"} 组}：非对称性就体现在 \verb|critic| 组多拼了 \verb|linvel|（人形 G1 同样多 3 维特权 base linvel，\Verb[breaklines]|{"obs":98,"critic":101}|）。
+
+\subsection{三框架对照表}
+\label{sec:rlmc-priv-cfgtable}
+
+\begin{table}[H]
+\centering
+\small
+\caption{三框架的非对称观测组配置对照。核心逻辑一致，差异主要在 API 形式。}
+\label{tab:rlmc-priv-cfgcompare}
+\begin{tabular}{@{}p{2.4cm}p{3.4cm}p{3.4cm}p{2.6cm}@{}}
+\toprule
+维度 & mjlab & Isaac Lab & UniLab \\
+\midrule
+组命名 & \texttt{"actor"}/\allowbreak\texttt{"critic"} & \texttt{"policy"}/\allowbreak\texttt{"critic"} & env 侧固定 \texttt{"obs"}/\allowbreak\texttt{"critic"} \\
+声明方式 & \texttt{ObservationTermCfg} 字典 & \texttt{@configclass}+\texttt{ObsTerm} 属性 & \texttt{\_compute\_obs} 命令式 \texttt{np.\allowbreak concatenate} \\
+继承机制 & \texttt{**actor\_terms} 字典展开 & 类继承或手动重复 & 手动重复拼接（critic 多拼特权数组） \\
+corruption 控制 & \texttt{ObservationGroupCfg(enable\_corruption=)} & \texttt{\_\_post\_init\_\_} 中设 & 逐项 \texttt{\_obs\_noise(x,scale)}（仅 actor 叠） \\
+routing & runner config 的 \texttt{obs\_groups} & runner 自动按组名匹配 & YAML \texttt{algo.\allowbreak obs\_groups}（\texttt{obs}/\allowbreak\texttt{critic} 对齐 runner set） \\
+维度检查 & 手动打印对比 & \texttt{observation\_manager} 可查 & \texttt{env.\allowbreak obs\_groups\_spec} 直接读 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+三框架核心逻辑完全一致：把观测分两组，部署组（actor/policy）只含可部署 terms 且加噪，训练辅助组（critic）含特权 terms 且无噪。区别仅在 API 形式。
+
+\subsection{从零搭一个非对称任务的最小步骤（工程真实路径）}
+\label{sec:rlmc-priv-fromzero}
+
+上面给的都是\emph{节选}代码框。但工程上你几乎\textbf{从不}从空白文件写一个 env cfg——那样最容易撞 import 路径错、类名错（如把 \Verb[breaklines]|ObservationGroupCfg| 写错位置，它实测在 \Verb[breaklines]|mjlab.managers.observation_manager|）。真实路径是\textbf{复制一个框架自带、已能跑通的任务，再增量改}。以 mjlab 把一个对称 velocity 任务改成非对称为例，最小五步：
+
+\begin{enumerate}
+  \item \textbf{找到现成任务源文件。} \Verb[breaklines]|python -c "import mjlab.tasks.velocity.config.go1.env_cfgs as c; print(c.__file__)"| 直接打印出 \verb|env_cfgs.py| 的绝对路径——这是你要复制的起点（Isaac Lab 同理找 \Verb[breaklines]|.../velocity/config/anymal_c/|）。
+  \item \textbf{先原样跑通。} 改之前确认基线能跑：\Verb[breaklines]|WANDB_MODE=disabled train Mjlab-Velocity-Rough-Unitree-Go1 --env.scene.num-envs 64 --agent.max-iterations 2|，看到 steps/s 与 value loss 正常（实测 1480--2376 steps/s、value loss $\approx$ 0.02--0.03）才动手——\emph{先有一个能回退的已知好状态}。
+  \item \textbf{只改 critic 组的 terms。} 在复制出的 cfg 里给 \verb|critic| 组的 \verb|terms| 加特权项（\Verb[breaklines]|foot_contact_forces|/\allowbreak\verb|foot_height|，函数取自 \Verb[breaklines]|mjlab.tasks.velocity.mdp|），\verb|actor| 组一字不动。这就是「增量改」的核心——只动信息边界这一处。
+  \item \textbf{改网络（可选，让 critic 更大）。} 若要让 critic 网络也更大，按 \cref{sec:rlmc-priv-rslrl4} 的\emph{你这个框架的形态}改 hidden\_dims（mjlab 改 \Verb[breaklines]|RslRlModelCfg.hidden_dims|、Isaac Lab 改 \Verb[breaklines]|critic_hidden_dims|）。
+  \item \textbf{跑 1 迭代验证维度差。} 再跑一次 \Verb[breaklines]|--agent.max-iterations 1|，看启动日志里 \verb|ActorCritic| 两网络的 \verb|in_features|：critic 应比 actor 宽出你加的特权维。宽了 $\Rightarrow$ 生效；相等 $\Rightarrow$ 回 \cref{sec:rlmc-priv-cfg-mjlab} 查 key 拼写。
+\end{enumerate}
+
+这条「复制现成 cfg → 改 critic\_terms → 改 hidden\_dims → 跑 1 迭代看 in\_features」的路径，比从空白写安全得多：每一步都有一个可对比的基线，出错能立刻定位是哪一处增量引入的。
+
+\subsection{配置项四维表}
+\label{sec:rlmc-priv-cfg4d}
+
+\begin{table}[H]
+\centering
+\small
+\caption{非对称 AC 关键配置项的四维解读。}
+\label{tab:rlmc-priv-cfg4dim}
+\begin{tabular}{@{}p{2.7cm}p{2.7cm}p{2.7cm}p{3.4cm}@{}}
+\toprule
+配置项 & 默认值来源 & 修改影响 & 与其他配置的耦合 \\
+\midrule
+\texttt{enable\_corruption}(actor) & 模板设 True & False 则 actor 无噪、过拟合仿真、sim2real 差 & 须与 DR、push event 配合 \\
+\texttt{enable\_corruption}(critic) & 模板设 False & True 则 value 方差增大 & 与 critic 网络容量耦合 \\
+critic 额外 terms & 任务相关 & 太少则 value 估不准；太多则拟合难 & 与 critic 网络大小、\cref{ch:rlmc-dr} DR 耦合 \\
+\texttt{obs\_groups} routing & 须显式写 & 配错则 actor/critic 拿到同组 & 与 env 组命名严格对应 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{RSL-RL 配置：actor/critic 网络两种形态（mjlab vs Isaac Lab）}
+\label{sec:rlmc-priv-rslrl4}
+
+非对称配置最易让读者一抄就报错的地方，是 actor/critic 网络 cfg 的「形态」——它\textbf{因框架而异}，而非「新旧版本」之分。本书在 gpufree（mjlab 1.4.0 / \verb|rsl-rl-lib| 5.2.0 / Isaac Lab 2.3.2）逐一 import 核实：两套形态\emph{同时存在}于当前生态，没有谁淘汰谁 \cite{schwarke2025rslrl}。
+
+\textbf{形态 A·mjlab：per-model \texttt{RslRlModelCfg}。} mjlab 把 actor 与 critic 各自封一套 model cfg 塞进 runner cfg，二者可用\emph{完全不同}的网络架构与\emph{各自独立}的 normalizer：
+
+\begin{codebox}[Python]{mjlab 形态:per-model RslRlModelCfg（critic 可更大）}
+# mjlab.rl:runner cfg 里 actor/critic 各一套 RslRlModelCfg（注意不是 RslRlMLPModelCfg）
+from mjlab.rl import RslRlModelCfg, RslRlOnPolicyRunnerCfg
+rl_cfg = RslRlOnPolicyRunnerCfg(
+    actor  = RslRlModelCfg(hidden_dims=[256, 128, 64],
+                           obs_normalization=True),     # actor 的 running mean/std
+    critic = RslRlModelCfg(hidden_dims=[512, 256, 128],  # critic 可更大！
+                           obs_normalization=True),     # critic 独立 normalizer
+    obs_groups = {"actor": ["actor"], "critic": ["critic"]},  # 值是 env 组名列表
+    # ... 其余 num_steps_per_env / max_iterations / algorithm=RslRlPpoAlgorithmCfg(...) 略
+)
+# 实测 RslRlModelCfg 字段含 obs_normalization / cnn_cfg / rnn_type:
+#   视觉任务可用 cnn_cfg 让 critic 用 CNN 处理特权 depth/height、actor 用纯 MLP.
+\end{codebox}
+
+\textbf{形态 B·Isaac Lab：统一 \texttt{RslRlPpoActorCriticCfg}。} Isaac Lab 的 \verb|isaaclab_rl|（实测 2.3.2 + \verb|rsl-rl-lib| 5.2.0）\emph{不是} per-model，而是一个统一 cfg，靠成对的 \verb|*_hidden_dims| 字段区分 actor 与 critic：
+
+\begin{codebox}[Python]{Isaac Lab 形态:统一 RslRlPpoActorCriticCfg（成对字段）}
+# isaaclab_rl.rsl_rl:一个 cfg 里用 actor_/critic_ 前缀字段区分两网络
+from isaaclab_rl.rsl_rl import RslRlPpoActorCriticCfg
+policy = RslRlPpoActorCriticCfg(
+    actor_hidden_dims  = [256, 128, 64],    # actor 网络
+    critic_hidden_dims = [512, 256, 128],   # critic 可更大！
+    actor_obs_normalization  = True,        # 各自独立 normalizer（按字段而非按对象）
+    critic_obs_normalization = True,
+    activation = "elu",
+)
+# obs_groups 在 RslRlOnPolicyRunnerCfg 上（policy=上面这个 cfg），按 env 组名路由.
+\end{codebox}
+
+\begin{pitfall}[张冠李戴：把 Isaac Lab 当 mjlab、或臆造 RslRlMLPModelCfg]
+\textbf{错误描述}：在 Isaac Lab 上写 \Verb[breaklines]|RslRlModelCfg(actor=...)|，或两框架都去 import 一个并不存在的 \Verb[breaklines]|RslRlMLPModelCfg|。\textbf{现象后果}：\Verb[breaklines]|ImportError: cannot import name ...|——\Verb[breaklines]|RslRlMLPModelCfg| 在 mjlab 与 Isaac Lab 都不存在；\verb|RslRlModelCfg| 只在 mjlab、\Verb[breaklines]|RslRlPpoActorCriticCfg| 只在 Isaac Lab。\textbf{根本原因}：把「per-model 解耦」误当成某个版本的统一升级，其实它是 mjlab 的设计；Isaac Lab 仍走成对字段。\textbf{正确做法}：用框架判别 checklist——\Verb[breaklines]|from mjlab.rl import RslRlModelCfg| 能成功就是 mjlab 形态、\Verb[breaklines]|from isaaclab_rl.rsl_rl import RslRlPpoActorCriticCfg| 能成功就是 Isaac Lab 形态；再打开你项目里现成的 PPO cfg 看它用哪套，\emph{别照书假设}。
+\end{pitfall}
+
+两种形态对特权学习的意义相同：critic 不仅能看更多观测，还能用\emph{更大的网络}处理这些额外信息（\cref{ins:rlmc-priv-free}），且 actor/critic 各有独立 normalizer（\verb|rsl-rl-lib| 5.2.0 中旧的 \Verb[breaklines]|empirical_normalization| 全局开关已被这套 per-network 归一化取代）。
+
+\begin{pitfall}[normalizer 归属：导出 ONNX 时务必用 actor 的]
+\textbf{错误描述}：手动操作 \verb|state_dict|（warm start/跨框架迁移）时漏掉 normalizer；或导出 ONNX 时用了 critic 的 normalizer。\textbf{现象后果}：key 名不匹配报错；或部署时 shape error/垃圾输出——critic 的 normalizer 含特权维度统计量、维度比 actor 宽。\textbf{根本原因}：normalizer 是 per-network 的，actor 与 critic 各一套。\textbf{正确做法}：迁移 checkpoint 时把 normalizer 一起搬；导出 ONNX 时\emph{必须}用 actor/student 的 normalizer（\cref{sec:rlmc-priv-onnx}）。
+\end{pitfall}
+
+\subsection{运行验证：维度一致性 + 逐 term 审计}
+\label{sec:rlmc-priv-verify}
+
+配置完成后第一件事是打印 actor 与 critic 维度，确认 critic $\ge$ actor。若两者\emph{相等}，说明特权 terms 没生效——最常见是 key 拼写错误（新增而非覆盖）或 routing 配错。
+
+\begin{codebox}[Python]{维度一致性检查（mjlab 与 Isaac Lab，注意组名差异）}
+# mjlab:不走 gym.make，从 registry 取 cfg，组名是 actor/critic
+from mjlab.tasks.registry import load_env_cfg
+groups = load_env_cfg("Mjlab-Velocity-Rough-Unitree-Go1").observations
+print("mjlab 组:", list(groups.keys()))   # ['actor', 'critic', ...]
+
+# Isaac Lab:算法侧 obs-set 名是 policy/critic（不是 actor！），须先 AppLauncher 起 sim
+# 最可靠的活体读法是看训练启动日志里 ActorCritic 两网络的 in_features:
+#   ./isaaclab.sh -p scripts/.../train.py --task Isaac-Velocity-Rough-Anymal-C-v0 \
+#       --headless --max_iterations 1
+# 若 runner cfg 的 obs_groups 缺 policy/critic 键，rsl_rl 会打印 deprecation warning
+# 并回退用 'policy' set 兼当 critic——见到该 warning 即说明你的 routing 没生效.
+\end{codebox}
+
+总维度对了不代表每个 term 都对。建议把下面的逐 term 审计工具放进项目 \verb|scripts/|，每次改 obs 配置后跑一次：它逐个 term 打印维度、是否带噪、是否疑似特权，并在最后报告 critic$-$actor 的特权维度差。
+
+\begin{codebox}[Python]{逐 term 维度审计（关键行:判定 critic 是否真比 actor 宽）}
+def audit_obs(env):
+    mgr = env.observation_manager
+    dims = {}
+    for g, terms in mgr.group_obs_terms.items():        # 遍历每个组
+        total = 0
+        for name, cfg in terms.items():
+            d = cfg.func(env, **cfg.params).shape[-1]    # 该 term 输出维度
+            total += d
+            priv = any(k in name.lower() for k in        # 启发式:疑似特权
+                       ["contact_force", "friction", "terrain_height",
+                        "body_mass", "restitution"])
+            print(f"[{g}] {name:<26} dim={d:<4} {'PRIV' if priv else 'ok'}")
+        dims[g] = total
+    diff = dims.get("critic", 0) - dims.get("actor", 0)  # 特权维度差
+    print(f"privileged dims (critic - actor) = {diff}")
+    assert diff > 0, "critic 没有额外特权信息——非对称配置未生效！"  # 关键断言
+\end{codebox}
+
+看什么：终端输出里每个 \verb|critic| 组应出现若干 \verb|PRIV| 标记的 term，且最后一行 \Verb[breaklines]|diff > 0|。若 \Verb[breaklines]|diff == 0| 或断言失败，回到 \cref{sec:rlmc-priv-cfg-mjlab} 检查 key 拼写与 routing。
+
+\subsection{为什么非对称 AC 在理论上合理：POMDP 视角}
+\label{sec:rlmc-priv-pomdp}
+
+理论上，非对称 AC 处理的是 POMDP。actor 只看观测 $o=h(s)$（\cref{eq:rlmc-obs-fn}），多个真实状态可能产生相同观测；critic 看到的特权信息让它\emph{接近}在完整状态上估值——相当于在 MDP（而非 POMDP）上做一个「更简单」的估值问题，故 value 更准。这给出一条工程指导：critic 的特权输入应尽可能接近完整状态（把前三类特权信号都给 critic 通常就够好）。另一条洞察：若 actor 的 $h(s)$ 对控制决策已是「充分信息」，非对称 AC 不会比对称好多少——它的真正价值体现在 actor 观测\emph{不足以唯一确定}最优行动时。
+
+\begin{pitfall}[Python 字典展开时 key 拼错导致覆盖失败]
+\textbf{错误描述}：\Verb[breaklines]|critic_terms = {**actor_terms, "heigth_scan": ...}| 想覆盖 \verb|height_scan|。\textbf{现象后果}：未覆盖而是新增，critic 多出一份 height\_scan 维度，训练不报错、几百 iter 后才发现维度不对。\textbf{根本原因}：字典展开按 key 字面量匹配，拼错即新键。\textbf{正确做法}：\Verb[breaklines]|assert len(critic_terms) == len(actor_terms) + N_priv|；并跑 \cref{sec:rlmc-priv-verify} 的逐 term 审计。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[编程]} 在 mjlab velocity 任务里故意给 actor 组加 \Verb[breaklines]|foot_contact_forces|，训 500 iter 记录 reward；再移除重训 500 iter。对比两条曲线并解释差异。验收：能指出「仿真里加了反而 reward 更高，正是泄漏的诱惑」。
+  \item \textbf{[跨框架]} 分别在 mjlab 与 Isaac Lab 打印 actor/critic 维度，列表对比。验收：能说清两框架的维度差分别来自哪些特权 terms。
+\end{enumerate}
+\end{practice}
+
+% ----------------------------------------------------------------
+过渡：非对称 AC 只能让训练信号更干净，无法让 actor 间接获取特权信息。当 actor 需要从历史中推断环境参数时，就需要 estimator 网络——下一节的主题。
+
+% ════════════════════════════════════════════════════════════════
+\section{RMA 适应模块：从历史估计环境 latent}
+\label{sec:rlmc-priv-estimator}
+
+\textbf{模块功能与在管线中的位置。} 适应模块（adaptation module，又称 estimator 网络）让 actor 在部署时\emph{间接}感知不可直接测量的环境参数：输入部署可得的本体感知历史，输出对特权环境信息的低维 latent 估计，拼接进 base policy 输入。它处于「非对称 AC 已能训出 teacher/base policy」之后——当 actor 的部署观测不足以支撑控制决策（如在未知摩擦地面行走）时启用。
+
+\subsection{动机：非对称 AC 为何不够}
+\label{sec:rlmc-priv-whyestimator}
+
+回顾理论部：PPO 的训练效率取决于 advantage 估计质量，而 $\hat A_t=R_t-V(s_t)$ 中 $V$ 由 critic 提供。非对称 AC（\cref{sec:rlmc-priv-config}）通过给 critic 更多信息解决了 value 估计\emph{精度}。但 actor 本身仍只看部署可得信息——若这些信息不足以支撑决策（actor 不知道当前地面有多滑），actor 的策略上限就被信息瓶颈卡死。跨域类比：考试时老师（critic）能看标准答案帮你批改（更准的分数反馈），但你（actor）仍只能用课本知识答题；若考题超纲（需知当前摩擦），老师的批改帮不了你获取课本里没有的知识。你需要一本「参考资料」——这就是 estimator：从已有信息（本体感知历史）推断课本没直接给的知识（环境参数 latent）。不用 estimator，actor 只能学一种「平均策略」——在所有摩擦下都还行、但在任何特定摩擦下都不最优。
+
+\subsection{RMA 的两阶段架构}
+\label{sec:rlmc-priv-rma2}
+
+RMA（Rapid Motor Adaptation，Kumar、Fu、Pathak、Malik，RSS 2021，arXiv:2107.04034）把训练分两阶段 \cite{kumar2021rma}。
+
+\textbf{阶段一}：训练 base policy + environment factor encoder。base policy 输入本体感知 $o_t^{\text{prop}}$ + 环境因子 latent $z_t$；encoder 从仿真特权环境参数 $e_t$ 编码出低维 latent $z_t=f_\phi(e_t)$。二者在 PPO 中同时训练——encoder 作为 actor 网络一部分参与策略梯度：
+\begin{equation}
+\pi_{\text{base}}(a_t \mid o_t^{\text{prop}}, z_t), \qquad z_t = f_\phi(e_t).
+\label{eq:rlmc-priv-rma-base}
+\end{equation}
+
+\textbf{阶段二}：冻结 base policy 与 encoder，训练适应模块 $g_\psi$ 从本体感知历史估计 latent $\hat z_t$，目标是最小化估计与真值的 MSE：
+\begin{equation}
+\mathcal{L}_{\text{adapt}} = \mathbb{E}\Big[\,\big\lVert\, g_\psi(o_{t-k:t}^{\text{prop}}) - f_\phi(e_t)\,\big\rVert^2\,\Big].
+\label{eq:rlmc-priv-rma-loss}
+\end{equation}
+部署时 $e_t$ 不可得，用 $g_\psi$ 从历史产生 $\hat z_t$ 代替 $z_t$ 输入 base policy。
+
+\subsection{为什么估 latent 而非直接预测物理参数}
+\label{sec:rlmc-priv-whylatent}
+
+一个自然的问题：为什么适应模块不直接预测摩擦、质量等物理量，而预测 latent？\textbf{其一}，物理参数量纲/范围不统一（摩擦 $[0.3,1.5]$、质量偏移 $[-2,+5]$\,kg、阻尼 $[0.1,5.0]$），多任务回归的损失权重难调。\textbf{其二}，并非所有参数对控制同等重要——latent 是一种自适应信息压缩，由策略梯度训练的 encoder 会自动把对控制最重要的信息编进 latent。\textbf{其三}，latent 空间经策略梯度优化，结构已是「对控制有用的表示」，适应模块只需映射到这个已优化空间，而非从零学一个从历史到物理参数的复杂非线性映射。
+
+\begin{insight}[适应模块 = POMDP 的 belief state 参数化近似]\label{ins:rlmc-priv-belief}
+真实机器人面对的是部分可观测 MDP，环境参数是隐藏状态。从观测历史提取的 latent 就是对隐藏状态的 belief（信念状态）。理想 belief 应是充分统计量——含历史中对控制有用的全部信息。RMA 的 latent 正是这个理想 belief 的参数化近似。这也解释了它的精度上限：若环境参数完全不影响本体感知的时间演变模式，那么无论网络多大、数据多多，适应模块都估不出该参数——这就是为什么\emph{选哪些参数进 latent}比优化网络结构更重要。
+\end{insight}
+
+\subsection{适应模块的工程参数与网络定义}
+\label{sec:rlmc-priv-estparam}
+
+\begin{table}[H]
+\centering
+\small
+\caption{适应模块的关键工程参数。}
+\label{tab:rlmc-priv-estparam}
+\begin{tabular}{@{}lll@{}}
+\toprule
+参数 & 典型值 & 选择依据 \\
+\midrule
+history\_length & 5--20 步 & 太短估计不稳，太长维度爆炸 \\
+latent 维度 & 4--16 维 & 从小起步，太大训练不稳 \\
+MLP 结构 & \texttt{[128,64]} 或 \texttt{[256,128]} & 输入维 $=$ proprio\_dim $\times$ history\_length \\
+训练数据 & teacher rollout $10^5$--$10^6$ 帧 & 需覆盖多种 DR 参数组合 \\
+损失函数 & latent 空间 MSE & 可选加 cosine 正则 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+维度计算示例：本体感知 36 维（12 joint\_pos + 12 joint\_vel + 12 last\_action），history\_length $=10$，则适应模块输入 $36\times10=360$ 维；若 latent $=8$、MLP 为 \verb|[128,64]|，参数量约 $360{\times}128+128{\times}64+64{\times}8\approx 5.5\times10^4$——很小，部署推理延迟可忽略。
+
+\begin{codebox}[Python]{RMA 三件套:EnvironmentEncoder / AdaptationModule / RMAPolicy}
+import torch, torch.nn as nn
+
+class EnvironmentEncoder(nn.Module):           # Phase 1:特权参数 -> latent
+    def __init__(self, privileged_dim, latent_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(privileged_dim, 64), nn.ELU(),
+            nn.Linear(64, 32), nn.ELU(), nn.Linear(32, latent_dim))
+    def forward(self, e): return self.net(e)
+
+class AdaptationModule(nn.Module):             # Phase 2:历史 -> latent 估计
+    def __init__(self, proprio_dim, history_length, latent_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(proprio_dim * history_length, 128), nn.ELU(),
+            nn.Linear(128, 64), nn.ELU(), nn.Linear(64, latent_dim))
+    def forward(self, history):                # history: (B, T, proprio_dim)
+        return self.net(history.reshape(history.shape[0], -1))  # 展平 T 维
+
+class RMAPolicy(nn.Module):                    # proprio + latent -> action
+    def __init__(self, proprio_dim, latent_dim, action_dim, hid=[256,128]):
+        super().__init__()
+        layers, d = [], proprio_dim + latent_dim
+        for h in hid: layers += [nn.Linear(d, h), nn.ELU()]; d = h
+        layers += [nn.Linear(d, action_dim)]
+        self.mlp = nn.Sequential(*layers)
+    def forward(self, proprio, latent):        # 训练时 latent 来自 encoder，
+        return self.mlp(torch.cat([proprio, latent], dim=-1))  # 部署时来自 adapter
+\end{codebox}
+
+训练与部署的数据流区别一目了然——RMAPolicy 权重在两阶段都冻结（Phase 2 只更新 AdaptationModule），区别仅在 latent 的来源：
+
+\begin{codebox}[text]{RMA 训练/部署数据流}
+Phase 1 (有特权):  e -→ EnvEncoder -→ z_gt +
+                   proprio ---------------+-→ RMAPolicy -→ action  (RL 更新全部)
+Phase 2 (离线监督): history -→ AdaptModule -→ z_pred
+                   MSE(z_pred, z_gt) -→ 仅反传更新 AdaptModule
+部署 (无特权):     history -→ AdaptModule -→ z_pred +
+                   proprio -------------------------+-→ RMAPolicy -→ action
+\end{codebox}
+
+\subsection{训练时机：在线 vs 离线}
+\label{sec:rlmc-priv-onlineoffline}
+
+\begin{table}[H]
+\centering
+\small
+\caption{适应模块的在线 vs 离线训练。多数项目推荐离线。}
+\label{tab:rlmc-priv-onoff}
+\begin{tabular}{@{}llp{4.0cm}@{}}
+\toprule
+维度 & 在线（与 policy 同步） & 离线（policy 冻结后） \\
+\midrule
+数据分布 & 自动适应 policy 诱导分布 & 固定在 teacher rollout 分布 \\
+工程复杂度 & 高（改训练循环） & 低（标准监督学习） \\
+训练稳定性 & 可能与 policy 更新竞争 & 稳定（固定目标） \\
+框架支持 & 需自定义 & RSL-RL \texttt{DistillationRunner} 支持 \\
+推荐场景 & 研究探索 & 生产部署 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+离线训练分两步：用已训好的 teacher 收集 \Verb[breaklines]|(history, latent)| 对，再监督训练适应模块。下面是数据收集的核心——注意 history buffer 的 FIFO 管理与「重置环境清空 history」。
+
+\begin{codebox}[Python]{离线训练 step 1:收集 (history, latent) 数据}
+def collect_adaptation_dataset(env, teacher_policy, encoder, cfg):
+    hist = torch.zeros(env.num_envs, cfg.history_length, cfg.proprio_dim,
+                       device=env.device)
+    H, Z = [], []
+    obs, _ = env.reset()
+    for step in range(cfg.num_steps):
+        proprio    = obs[:, :cfg.proprio_dim]          # 部署可得
+        privileged = obs[:, cfg.proprio_dim:]          # 仅仿真可得
+        hist = torch.roll(hist, shifts=-1, dims=1)      # FIFO:整体前移
+        hist[:, -1, :] = proprio                        # 最新帧放末尾
+        with torch.no_grad():
+            z_gt = encoder(privileged)                  # 真值 latent
+        if step >= cfg.history_length:                  # buffer 填满才收
+            H.append(hist.clone()); Z.append(z_gt.clone())
+        with torch.no_grad():
+            action = teacher_policy(obs)
+        obs, _, dones, _ = env.step(action)
+        hist[dones] = 0.0                               # 重置的环境清空历史
+    return {"histories": torch.cat(H), "latents": torch.cat(Z)}
+\end{codebox}
+
+\begin{pitfall}[history 拼接顺序错乱]
+\textbf{错误描述}：收集时最新帧在末尾，但推理时把最新帧当成在最前（或反之）。\textbf{现象后果}：适应模块学到的时间模式是\emph{反的}，latent 估计系统性错误，rollout 表现差却查不出原因。\textbf{根本原因}：训练与推理的时间轴约定不一致。\textbf{正确做法}：固定一个约定（本书用「最新帧在末尾」）贯穿收集、训练、部署；自检——给适应模块喂一个已知时间序列，确认输出符合预期。
+\end{pitfall}
+
+\subsection{损失函数变体与「以 rollout 为最终判据」}
+\label{sec:rlmc-priv-estloss}
+
+标准损失是 latent 空间 MSE（\cref{eq:rlmc-priv-rma-loss}）。变体：Normalized MSE（先对 encoder 输出做 z-score，使各维等权，适合 latent 方差不均时）、Cosine（$1-\cos(g,f)$，只看方向、忽略幅度）、混合（$\alpha\,\text{MSE}+(1-\alpha)\,\text{cos}$，典型 $\alpha=0.5$）。实践中标准 MSE 加 latent 空间 z-score 通常就够。
+
+\begin{insight}[MSE 低 $\ne$ rollout 好]\label{ins:rlmc-priv-msevsrollout}
+适应模块的 MSE 衡量「历史能多好地预测 latent」，但最终目标是「用估计 latent 时 policy 的 rollout 表现」。有时 MSE 中等但 rollout 好（estimator 抓住了对控制最重要的信息），MSE 很低但 rollout 差（estimator 过拟合了 training distribution）。\textbf{始终以 rollout 表现为最终判据。} 这与 \cref{ins:rlmc-priv-distmetric} 的「蒸馏双指标」同源——监督损失从不是部署性能的充分代理。
+\end{insight}
+
+\subsection{三种在线适应范式：RMA 不是唯一选择}
+\label{sec:rlmc-priv-paradigms}
+
+2021--2024 间发展出三条不同的在线适应路线，选型时需理解差异。\textbf{范式一·RMA（显式适应模块）}：两阶段，部署时适应模块以约 10\,Hz 运行（比 100\,Hz 的 base policy 慢一个量级），实现「分秒级适应」；latent 可解释、训练稳定，但需手动定义 latent 维度与目标参数。\textbf{范式二·Causal Transformer（隐式 attention 编码）}：Radosavovic 等的真实人形 locomotion（Science Robotics 2024，arXiv:2303.03381）不显式训练适应模块，而用一个 causal transformer 把完整观测-动作历史编码成策略输入，attention 自动「关注历史中与当前环境参数相关的时间步」，隐式完成系统辨识 \cite{radosavovic2024humanoid}；不需预定义要适应什么、也不需两阶段，但计算量远大于 MLP、推理延迟更高。\textbf{范式三·TTT（Test-Time Training）}：部署时持续用最新观测更新网络权重，能适应训练期从未见过的变化，但需在边缘设备跑反向传播、计算需求高且可能灾难性遗忘。\pz{经核查未能证实：源稿把 TTT 的腿足代表工作标注为「Sun et al. 2024」，但联网未检索到这一具体论文（TTT 的原始工作系 Sun 等 2020 的视觉分布漂移自监督训练，非腿足）；故正文不附引用键。若需引腿足上的真机在线适应，可考虑 Smith 等的 real-world 微调（arXiv:2110.05457）或 Hu 等 RTR（arXiv:2508.12252），但二者均非严格意义的 test-time weight-update。}
+
+\begin{table}[H]
+\centering
+\small
+\caption{三种在线适应范式对比。}
+\label{tab:rlmc-priv-paradigms}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+范式 & 代表工作 & 训练阶段 & 部署算力 & 适用场景 \\
+\midrule
+RMA & Kumar 2021 & 两阶段 & 低（MLP 前向） & 已知要适应的参数少（$<10$ 维） \\
+Causal Transformer & Radosavovic 2024 & 单阶段 & 中（attention） & 不确定需要适应什么 \\
+TTT & （腿足代表作未证实） & 单阶段+在线 & 高（反向传播） & 环境持续变化 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[System Identification 与 Representation Learning 的双重解读]\label{ins:rlmc-priv-dualview}
+这三种范式可从两个视角理解。\textbf{视角 A（系统辨识）}：环境有一组未知参数 $\theta$，策略先辨识 $\hat\theta$ 再据此决策——RMA 的适应模块就是显式 system identifier，latent 维应等于想辨识的参数数（4--16 维）。\textbf{视角 B（表示学习）}：真实 $\theta$ 不重要，重要的是学一个「对控制有用的环境表示」$z$，$z$ 不必对应任何物理量——causal transformer 天然属此，latent 维可更大（32--128 维）。RMA 之所以在四足 locomotion 中效果好，不是因为它精确辨识了物理参数，而是因为 locomotion 的「有用环境表示」恰好低维。任务更复杂（人形全身、loco-manipulation）时，transformer 的灵活性可能更合适。
+\end{insight}
+
+对本书目标读者（做四足/人形 locomotion），\textbf{推荐从 RMA 入手}（工程成熟、可解释、计算轻量），确认不够用时再上 causal transformer。
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[计算]} 本体感知 48 维（16+16+16），history\_length $=15$、latent $=12$、MLP \verb|[256,128]|。算出适应模块的总参数量与单次推理 FLOPs。验收：给出展平输入维 $48{\times}15=720$ 并据此算第一层参数。
+  \item \textbf{[设计]} 为 Go1 崎岖地形设计 RMA 的 latent 空间：列出 latent 应编码的环境特性（摩擦水平、质量偏移方向、地面倾斜度），并说明为何这些对控制有用。验收：每条特性都对应一种可观测的行为后果。
+\end{enumerate}
+\end{practice}
+
+% ----------------------------------------------------------------
+过渡：当 actor 的输入\emph{模态}发生根本变化（从低维 state 变成高维图像）时，estimator 也不够了——你需要一条完整的多阶段 teacher-student 蒸馏管线。
+
+% ════════════════════════════════════════════════════════════════
+\section{Teacher-Student 蒸馏：从数据收集到双指标评估}
+\label{sec:rlmc-priv-distill}
+
+\textbf{模块功能与在管线中的位置。} 当部署传感器是深度相机时，观测模态从低维向量跳到高维图像，需要 CNN 编码器，而 CNN 从稀疏 RL reward 学视觉特征极低效。teacher-student 蒸馏把这条鸿沟拆开：先让看特权的 teacher 快速学会任务，再用监督学习把行为蒸馏给只看部署信息的 student。它处于「teacher（可以是非对称 AC 的 actor）已训好」之后、「部署」之前。
+
+\subsection{蒸馏 \texorpdfstring{$\ne$}{!=} Actor-Critic，损失也不同}
+\label{sec:rlmc-priv-distillvsac}
+
+蒸馏损失是标准的行为克隆（behavior cloning, BC）：
+\begin{equation}
+\mathcal{L}_{\text{distill}} = \mathbb{E}\Big[\,\big\lVert\, \pi_{\text{student}}(o_t^{\text{deploy}}) - a_t^{\text{teacher}}\,\big\rVert^2\,\Big].
+\label{eq:rlmc-priv-distill-loss}
+\end{equation}
+它与 PPO 的本质区别在于：没有 advantage、没有 PPO clip，只最小化对 teacher 动作的模仿误差。RSL-RL 的 \Verb[breaklines]|DistillationRunner| 原生支持这种模式 \cite{schwarke2025rslrl}，其数据流与 \cref{ch:rlmc-manager} 的 \Verb[breaklines]|OnPolicyRunner| 完全不同：
+
+\begin{table}[H]
+\centering
+\small
+\caption{OnPolicyRunner（PPO）vs DistillationRunner（BC）的数据流差异。}
+\label{tab:rlmc-priv-runners}
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & OnPolicyRunner (PPO) & DistillationRunner (BC) \\
+\midrule
+数据来源 & student 自己在 env rollout & teacher 预收集的 rollout \\
+训练信号 & reward$\to$value$\to$advantage$\to$梯度 & teacher action$\to$MSE$\to$梯度 \\
+需要 critic？ & 是 & 否 \\
+需要 GAE？ & 是 & 否 \\
+训练终止 & iteration 数或 reward 阈值 & loss 收敛或 rollout 评估通过 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{蒸馏数据收集：多样性是生命线}
+\label{sec:rlmc-priv-collect}
+
+数据收集不是让 teacher 随便跑几个 episode。\textbf{数据多样性直接决定蒸馏质量}，需系统地覆盖 DR 参数空间（摩擦 $\times$ 质量 $\times$ 地形难度做网格或分层采样）。一个关键工程细节：收集时记录的应是 \textbf{student 的观测}（部署可得），而非 teacher 的观测（含特权）——因为 student 训练输入必须\emph{严格等于}部署输入；teacher 的观测只用于产生 action 标签。
+
+\begin{codebox}[Python]{蒸馏数据收集:网格化覆盖 DR 参数（记录 student obs + teacher action）}
+import numpy as np
+frictions = np.linspace(0.3, 1.5, 10)      # 10 种摩擦
+masses    = np.linspace(-2.0, 3.0, 8)      # 8 种质量偏移
+terrains  = range(0, 6)                     # 6 种地形难度
+data = []
+for f in frictions:
+    for m in masses:
+        for t in terrains:
+            env_cfg.events.friction = f
+            env_cfg.events.mass_offset = m
+            env_cfg.curriculum.terrain_level = t
+            roll = collect_rollout(env, teacher_policy, num_steps=1000)
+            data.append({"student_obs":   roll.student_observations,  # 部署可得
+                         "teacher_action": roll.actions})             # 标签
+# 共 10*8*6*1000 = 480K 帧;存盘留待监督训练
+\end{codebox}
+
+\subsection{用 DistillationRunner 训练 student}
+\label{sec:rlmc-priv-trainstudent}
+
+收集完即标准监督学习。两个工程要点：CNN+MLP 混合网络必须做梯度裁剪（CNN 梯度可比 MLP 大一个量级），并保存\emph{验证集 loss 最低}的 best model（监督学习会过拟合）。
+
+\begin{codebox}[Python]{student 蒸馏训练循环（关键行:梯度裁剪 + best model）}
+def train_student(student, obs_ds, act_ds, cfg):
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(obs_ds, act_ds),
+        batch_size=cfg.batch_size, shuffle=True)
+    opt = torch.optim.Adam(student.parameters(), lr=cfg.lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.num_epochs)
+    best = float("inf")
+    for epoch in range(cfg.num_epochs):
+        tot = 0.0
+        for ob, ac in loader:
+            loss = torch.nn.functional.mse_loss(student(ob), ac)
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)  # CNN 必备
+            opt.step(); tot += loss.item()
+        sched.step()
+        avg = tot / len(loader)
+        if avg < best:                                   # 存 best 而非 last
+            best = avg; torch.save(student.state_dict(), "student_best.pt")
+    return student
+\end{codebox}
+
+\begin{table}[H]
+\centering
+\small
+\caption{student 蒸馏的推荐超参数。}
+\label{tab:rlmc-priv-hp}
+\begin{tabular}{@{}lll@{}}
+\toprule
+超参数 & 推荐值 & 说明 \\
+\midrule
+batch\_size & 512--2048 & 太小梯度噪声大，太大收敛慢 \\
+lr & $1\text{e-}4$ \,--\, $3\text{e-}4$ & 配 cosine annealing \\
+num\_epochs & 200--500 & 看 loss 曲线决定 early stopping \\
+grad\_clip & 1.0 & CNN+MLP 混合网络必备 \\
+val\_split & 10\% & 留验证集检测过拟合 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{运行验证：双指标评估}
+\label{sec:rlmc-priv-eval}
+
+\begin{insight}[蒸馏成功需双指标同时通过]\label{ins:rlmc-priv-distmetric}
+student 训练看的是 imitation loss，但 loss 低\emph{不}代表 rollout 好——因为 BC 的复合误差（compounding error）：student 的微小误差使下一步状态偏移，偏移后的状态不在 teacher 数据分布内，输出进一步偏离，形成正反馈雪崩。所以评估 student 须\emph{两个指标同时通过}：imitation loss（held-out teacher rollout 上的 action MSE，典型 $<0.05$）与 rollout performance（student 独立运行的 reward，典型 $\ge$ teacher $\times 0.8$）。只有 imitation loss 低但 rollout 差 $\Rightarrow$ 复合误差严重，需增数据多样性或上 DAgger。
+\end{insight}
+
+\begin{codebox}[Python]{rollout 双指标评估（关键行:student/teacher reward 比）}
+def evaluate_student(env, student, teacher, num_ep=100):
+    s_rew = []
+    for _ in range(num_ep):
+        obs, _ = env.reset(); r = 0.0
+        for _ in range(env.max_episode_length):
+            with torch.no_grad():
+                a = student(obs["policy"])         # student 只用部署 obs
+            obs, rew, done, _ = env.step(a)         # 用 student 动作推进
+            r += rew.mean().item()
+        s_rew.append(r)
+    ratio = np.mean(s_rew) / max(teacher_ref_reward, 1e-6)  # 与 teacher 基准比
+    print(f"student/teacher = {ratio:.2%}  ", "PASS" if ratio >= 0.85 else "FAIL")
+\end{codebox}
+
+\subsection{DAgger：解决复合误差的在线蒸馏}
+\label{sec:rlmc-priv-dagger}
+
+标准 BC 的根本缺陷是复合误差：student 训练时见的是 teacher 诱导的状态分布 $d^{\pi_{\text{teacher}}}$，部署时却走自己的分布 $d^{\pi_{\text{student}}}$。DAgger（Dataset Aggregation，Ross、Gordon、Bagnell，AISTATS 2011）的解法是：在 \emph{student 诱导的状态分布}上收集 teacher 的标签，迭代聚合数据 \cite{ross2011dagger}。跨域类比是驾校：只在教练旁边练（teacher 分布），第一次独自上路（student 分布）会慌——因为你没被训练过如何从「教练在时不会犯的错」中恢复。
+
+\begin{codebox}[text]{DAgger 流程}
+1. 用 teacher rollout 初始化数据集 D = {(s, a_teacher)}
+2. for round i = 1,2,...:
+   a. 在 D 上 BC 训练 student
+   b. 让 student 在环境 rollout，收集状态序列 {s_1,...}
+   c. 对这些状态查询 teacher 动作 {(s_t, a_teacher(s_t))}   # 关键:student 分布
+   d. 把新数据并入 D（数据聚合）
+3. 返回最终 student
+\end{codebox}
+
+工程上常加「混合比例 $\beta$ 退火」：前几轮全用 teacher 执行（初始化一个好数据集），之后线性衰减到全用 student 执行（让 student 探索自己的分布）。RSL-RL 的 \Verb[breaklines]|DistillationRunner| 原生支持离线 BC，但不直接支持 DAgger 的在线交替——需自定义循环（Isaac Lab 生态已有 camera-conditioned student 的 DAgger 参考脚本可借鉴）。
+
+\textbf{UniLab 的对应物是 HORA 课程蒸馏。} UniLab 不提供通用的「state teacher $\to$ depth student」DAgger runner，但它原生提供一条\emph{特权 $\to$ 适应模块}的蒸馏路径——HORA（in-hand 操作的 RMA 式时序自适应蒸馏，入口 \Verb[breaklines]|scripts/train_hora_distill.py| + \Verb[breaklines]|conf/hora_distill/|，算法在 \Verb[breaklines]|algos/torch/hora/distill.py| 的 \Verb[breaklines]|HoraDistillationTrainer|）\cite{unilab2026}。它对应的正是本章 \cref{sec:rlmc-priv-estimator} 的 RMA 范式，而非 \cref{eq:rlmc-priv-distill-loss} 的通用 BC：stage-1 用特权 \verb|priv_info| 训一个 PPO teacher，stage-2 冻结 teacher 主干与 \Verb[breaklines]|obs_normalizer|、只训练一个从本体感知历史学的时序卷积适应编码器（\Verb[breaklines]|TemporalAdaptationEncoder|）。
+
+\begin{codebox}[Python]{UniLab:HORA 蒸馏 = 冻结 teacher 主干、只训时序适应模块（RMA 范式）}
+# HoraDistillationTrainer（algos/torch/hora/distill.py，UniLab）核心三步:
+# 1) 载入 stage-1 特权 teacher（在 sharpa_inhand/mujoco_hora 上训的 PPO）
+trainer.build_student_actor_and_normalizer(env, cfg)
+trainer._load_teacher_checkpoint(...)          # -> load_teacher_actor_weights
+# 2) 关键:只让"时序自适应模块"可训，teacher 主干 + normalizer 全冻结
+for name, p in student.named_parameters():
+    p.requires_grad = ("adapt_tconv" in name)  # 仅 TemporalAdaptationEncoder 学
+teacher.eval()                                 # 主干与 obs_normalizer 冻结（eval 模式）
+# 3) student 从本体感知历史回归 teacher 的特权 latent（即 RMA 的 phase-2 监督）
+#    priv_info 必需（observations.py）;这是"特权->历史估计"蒸馏，不是通用 DAgger.
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab:HORA 两步——先训特权 teacher，再蒸馏适应模块}
+uv run train --algo ppo --task sharpa_inhand --sim mujoco --profile hora  # stage-1 teacher
+python scripts/train_hora_distill.py task=sharpa_inhand/mujoco            # stage-2 蒸馏 student
+\end{codebox}
+
+也就是说，UniLab 在「特权 $\to$ 适应模块」这条蒸馏链上有一等公民支持（对应 RMA/ROA），但\textbf{通用 DAgger 在线交替与 camera-conditioned 视觉 student 并非内置}（其当前任务集全是本体感知，无 RGB/depth 观测任务）——这类管线在 UniLab 上需自定义循环，思路与上面 RSL-RL 段一致。
+
+\begin{pitfall}[认为「DAgger 一定比纯 BC 好」]
+\textbf{错误描述}：不管信息差大小，一律上 DAgger。\textbf{现象后果}：teacher 与 student 信息差很小时，DAgger 的额外轮次纯属浪费 2--3 倍训练时间。\textbf{根本原因}：DAgger 的价值只在弥合\emph{分布偏移}，若 student 输入几乎能复现 teacher 行为，纯 BC 就够。\textbf{正确做法}：先看 rollout performance 指标（而非 imitation loss）——只有 rollout 不合格时才上 DAgger。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[分析]} student 的 imitation loss 已 $<0.01$，但 rollout 中 3 秒后总摔倒。列出三个可能原因并给出对应诊断方法。验收：至少一个原因指向「复合误差/数据分布偏移」。
+  \item \textbf{[设计]} 设计一份蒸馏数据收集计划，使 480K 帧覆盖尽量多的 DR 组合而非堆在单一参数。验收：写出采样网格维度与每格步数，并说明为何「多样性 > 总量」。
+\end{enumerate}
+\end{practice}
+
+% ----------------------------------------------------------------
+过渡：把非对称 AC、estimator、蒸馏串成一条工业级管线长什么样？下一节精读 extreme-parkour。
+
+% ════════════════════════════════════════════════════════════════
+\section{精读：extreme-parkour 的多阶段蒸馏管线}
+\label{sec:rlmc-priv-parkour}
+
+\begin{paper}[Extreme Parkour with Legged Robots（Cheng 等，ICRA 2024，arXiv:2309.14341）]\label{paper:rlmc-priv-parkour}
+\textbf{问题}：让一台低成本四足（执行不精确、单前向深度相机、相机低频抖动多伪影）在极端地形做跑酷——跳台阶、跃沟壑、爬斜坡，最终只靠 IMU + 编码器 + 前向深度相机部署。\\
+\textbf{核心思想}：两阶段管线。Phase 1 用 RL（PPO）训练 base/oracle policy，特权是 scandots（地形高度采样）+ oracle 航向，并用 ROA（Regularized Online Adaptation）在\emph{单阶段内}同时学适应模块；Phase 2 用 DAgger 监督蒸馏，把 scandots 换成 depth（CNN-GRU），把航向预测一并学出，并从 Phase 1 的 actor 初始化（warm start）。\\
+\textbf{关键结果}：据官方仓库 README，base 约 10--15k iter（单张 3090 约 8--10\,h，建议至少 15k）、蒸馏约 5--10k iter（约 5--10\,h，建议至少 5k），合计可在单张 3090 上 $<20$\,h 训完；真机零样本部署完成跑酷 \cite{cheng2024parkour}。这些 iter/时长以你的硬件与配置为准。\\
+\textbf{与本书关系}：它把本章所有概念（非对称特权、ROA 式在线适应、DAgger 蒸馏、warm start、模态跨越）串成一条可执行管线，是 \cref{sec:rlmc-priv-distill} 蒸馏方法论的工业兑现。\\
+\textbf{局限}：原始代码基于已废弃的 Isaac Gym；scandots 的空间分辨率与航向真值依赖仿真，蒸馏质量强依赖 DR 多样性。
+\end{paper}
+
+\begin{pitfall}[把教学用「三阶段」当成官方结构]
+\textbf{错误描述}：以为 extreme-parkour 官方有一个独立的「depth teacher RL 阶段」，共三阶段。\textbf{现象后果}：照搬错误结构，多训一个本不存在的阶段。\textbf{根本原因}：官方 README 与论文明确是\emph{两阶段}（Phase 1 RL + ROA；Phase 2 DAgger 蒸馏）。\textbf{正确做法}：本书为教学、为可推广到通用蒸馏，把它\emph{重新分解}成「blind teacher $\to$ depth teacher $\to$ depth student」三阶段——其中「Stage 1+Stage 2 都用 RL」对应官方 Phase 1，「Stage 3 监督蒸馏」对应官方 Phase 2。读下文时请把「三阶段」理解为教学框架，把两阶段理解为项目真实结构。
+\end{pitfall}
+
+\subsection{为什么需要分阶段（教学三阶段）}
+\label{sec:rlmc-priv-whystages}
+
+若直接端到端训练（depth image $\to$ action），CNN 要从稀疏 RL reward 学视觉特征，极低效；若只用一阶段蒸馏（低维 state teacher $\to$ depth student），teacher 与 student 输入模态差太大，蒸馏质量难保。把过程拆成渐进阶段，每阶段只跨越一个「小鸿沟」：
+
+\begin{codebox}[text]{教学三阶段（对应官方两阶段:Stage1+2=Phase1, Stage3=Phase2）}
+Stage 1  blind teacher : proprio + 特权地形 + 特权环境参数 -→ action   [RL/PPO]
+                         目标:学会「如何运动」
+Stage 2  depth teacher : proprio + depth image + 特权环境参数 -→ action [RL, warm start]
+                         目标:学会「从深度图提取地形信息并运动」
+Stage 3  depth student : proprio + depth image (仅部署可得) -→ action   [监督蒸馏]
+                         目标:去掉最后的特权环境参数
+\end{codebox}
+
+类比渐进式语言教学：Stage 1 母语教学（最好条件学核心能力），Stage 2 双语教学（加入深度视觉），Stage 3 纯外语教学（只用部署可得信息）。每阶段「新挑战」只有一个维度，学生不会因同时面对多个全新挑战而崩溃。
+
+\subsection{Stage 1：Blind Teacher 与 ROA}
+\label{sec:rlmc-priv-stage1}
+
+Stage 1 的 teacher 用 RL（PPO + 非对称 AC）训练，输入是部署可得本体感知 + 特权地形（无噪 height\_scan、精确接触）+ 特权环境参数（摩擦、质量偏移、电机强度）。「blind」指不用任何视觉输入——teacher 通过特权低维信息「看到」地形。训练目标是尽可能高的任务表现，不考虑部署约束。
+
+\textbf{ROA 的创新：把两阶段压成一阶段。} 标准 RMA 需两阶段（先 base policy + encoder，再适应模块）。extreme-parkour 的 Stage 1 用 Regularized Online Adaptation（ROA）——在\emph{一个}训练阶段内同时训练 base policy 和适应模块：在 PPO 更新中加一个辅助正则损失，鼓励适应模块输出与 environment encoder 输出一致，但\emph{不冻结} encoder，二者协同演化。这省去了 RMA 的第二个独立阶段。代价：训练循环更复杂，正则权重设不当则适应模块与 encoder 可能「互相拉扯」导致不稳。
+
+\subsection{Stage 2：Depth Teacher 与 warm start}
+\label{sec:rlmc-priv-stage2}
+
+Stage 2 引入深度图作为额外输入，去掉 height\_scan 与精确接触（depth 已提供地形信息的替代），保留特权环境参数。\textbf{关键决策：用 Stage 1 的 teacher 做 warm start}——proprio$\to$MLP 部分的权重继承，CNN 编码器随机初始化。这大幅加速 Stage 2：policy 不必从零学运动技能，只需学会用 depth 替代 height\_scan。反事实理解：若从零训，CNN 初期输出随机特征，policy 要同时学「如何运动」和「如何看」，两任务耦合、训练极慢。
+
+\begin{codebox}[text]{Stage 2 网络架构}
+depth_image (58x87) -→ CNN encoder -→ latent (32)
+                                          |
+proprio (36) --------------- concat -----+-→ MLP [256,256,128] -→ action (12)
+env_params (8) --------------------------+
+\end{codebox}
+
+\paragraph{MTS（阈值切换的航向处理）。} extreme-parkour 蒸馏阶段用了一个精巧的 yaw-command 机制：student 的 heading command 不完全由自身预测决定，而按\emph{阈值规则}在 student 预测的 yaw 与 oracle（来自 waypoint 的真值方向）间切换——若预测 yaw $\theta_{\text{pred}}$ 与 oracle 方向 $\hat d_w$ 之差小于 0.6 弧度，用自己的预测，否则用 oracle 拉回：
+\begin{equation}
+\text{obs}_\theta =
+\begin{cases}
+\theta_{\text{pred}}, & |\theta_{\text{pred}} - \hat d_w| < 0.6,\\[2pt]
+\hat d_w, & \text{否则}.
+\end{cases}
+\label{eq:rlmc-priv-mts}
+\end{equation}
+注意这是\emph{阈值切换}，不是 $\beta$ 退火式的线性混合。当 student 航向预测已足够接近真值时用它自己的预测，否则用 oracle 把它「拉回」正确方向，避免因航向错误而「走错方向」导致 rollout 质量极差、蒸馏 state 分布严重偏离 teacher。其思想与 DAgger 类似——在 student 分布偏移最严重的维度上给予 teacher 指导。（已联网核对 extreme-parkour 论文：该 $0.6$\,rad 阈值与上式 $\mathrm{obs}_\theta$ 的切换形式与原文一致，$\hat d_w$ 即由 waypoint 给出的 oracle 航向。）
+
+\subsection{Stage 3：Depth Student 与可蒸馏性检查}
+\label{sec:rlmc-priv-stage3}
+
+Stage 3 用监督学习把 depth teacher 蒸馏到只看部署可得信息的 depth student，核心变化是\emph{移除特权环境参数}，用适应模块替代。蒸馏损失即 \cref{eq:rlmc-priv-distill-loss}，评估用 \cref{ins:rlmc-priv-distmetric} 的双指标。
+
+不是所有 teacher 都可蒸馏。下表是蒸馏前的可蒸馏性检查：
+
+\begin{table}[H]
+\centering
+\small
+\caption{teacher 可蒸馏性检查。任一项不过，蒸馏都可能失败。}
+\label{tab:rlmc-priv-distillable}
+\begin{tabular}{@{}p{6.2cm}p{5.6cm}@{}}
+\toprule
+检查项（通过条件） & 不通过的后果 \\
+\midrule
+teacher 每个特权输入都有 student 可观测代理（部署传感器替代或可从历史推断） & student action MSE 无法下降 \\
+teacher 不使用未来信息（输入都是当前/过去状态） & student 永远无法复现因果违反行为 \\
+teacher 行为对特权信息不过度敏感（略扰动不剧变） & student 近似误差被放大，rollout 不稳 \\
+teacher 与 student 动作空间一致（相同 action space 与 scale） & 蒸馏目标物理含义不一致 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{warm start 的工程细节：部分权重加载}
+\label{sec:rlmc-priv-warmstart}
+
+Stage 2 的 warm start 需特殊处理，因为新增了 depth 的 CNN 编码器、网络输入维度变了。正确做法是\emph{部分加载}——只加载维度兼容的层。
+
+\begin{codebox}[Python]{Stage 2 warm start:只加载维度兼容的层（CNN 随机初始化）}
+stage1 = torch.load(stage1_ckpt)["model_state_dict"]
+state  = model.state_dict()
+loaded = 0
+for k in stage1:
+    if k in state and stage1[k].shape == state[k].shape:  # 维度兼容才加载
+        state[k] = stage1[k]; loaded += 1
+model.load_state_dict(state)
+print(f"loaded {loaded}/{len(stage1)} layers from Stage 1")  # CNN 层不会被加载
+\end{codebox}
+
+\begin{pitfall}[warm start 时 strict=True 导致维度不匹配崩溃]
+\textbf{错误描述}：直接 \Verb[breaklines]|load_state_dict(stage1, strict=True)|。\textbf{现象后果}：PyTorch 抛维度不匹配异常（Stage 2 多了 CNN latent 维度）。\textbf{根本原因}：strict 模式要求 key 与 shape 全匹配。\textbf{正确做法}：用上面的部分加载；若用 \verb|strict=False|，务必打印\emph{实际加载了哪些 key}，否则可能遗漏关键层而不自知。
+\end{pitfall}
+
+\subsection{extreme-parkour 的四条通用工程原则}
+\label{sec:rlmc-priv-parkour-principles}
+
+\begin{insight}[复杂系统设计 = 逐步剥离脚手架]\label{ins:rlmc-priv-scaffold}
+extreme-parkour 揭示一条深刻工程原理：复杂系统不是「一步到位」，而是「逐步剥离辅助信息」。每阶段在前一阶段基础上去掉一层「脚手架」（特权信息），直到最终 student 只依赖部署可得信息。这和建筑施工先搭脚手架、再浇混凝土、最后拆脚手架完全一致——脚手架不出现在最终建筑里，但没有它建筑无法成型。四条可操作原则：(1) \textbf{渐进式信息降级}，每阶段只移除一类特权或加一种新模态；(2) \textbf{warm start 而非冷启动}，每阶段从上阶段 checkpoint 初始化；(3) \textbf{数据多样性是蒸馏生命线}；(4) \textbf{分离感知与控制}，Stage 1 学「如何控制」、Stage 2 学「如何感知」、Stage 3 学「如何适应」。
+\end{insight}
+
+\subsection{三框架的对应实现思路}
+\label{sec:rlmc-priv-parkour-frameworks}
+
+extreme-parkour 原始代码基于已废弃的 Isaac Gym，但其管线逻辑可在 Isaac Lab、mjlab 完整复现；UniLab 能复现\emph{盲控制 + 适应模块}部分（Stage 1 的非对称 AC 与 ROA/HORA 式适应），但\textbf{深度视觉那条线（Stage 2/3 的 depth teacher 与 depth student）当前缺失}——UniLab 现有任务集全是本体感知、无 RGB/depth 观测任务，相机 obs 与视觉 DR 需自实现。这一行诚实的「无对应」恰好说明：跨模态蒸馏对框架的视觉基础设施有硬依赖。
+
+\begin{table}[H]
+\centering
+\small
+\caption{extreme-parkour 概念到三框架的对应。UniLab 当前无视觉任务，depth 相关项以「无对应」如实标注。}
+\label{tab:rlmc-priv-parkourmap}
+\begin{tabular}{@{}p{3.0cm}p{3.2cm}p{2.8cm}p{2.2cm}@{}}
+\toprule
+extreme-parkour 概念 & Isaac Lab & mjlab & UniLab \\
+\midrule
+teacher obs 组 & \texttt{CriticCfg}+自定义 teacher 组 & \texttt{critic} 组+自定义 teacher 组 & \texttt{obs\_groups\_spec} 的 \texttt{critic} 组拼特权 \\
+depth image obs & \texttt{TiledCamera}+\texttt{ObsTerm} & 深度 sensor+\texttt{ObservationTermCfg} & 无对应（当前无视觉任务，需自实现） \\
+warm start & 指向上阶段 checkpoint & \texttt{load\_run} 指向上阶段目录 & \texttt{--load-run} / teacher checkpoint 路径 \\
+distillation & RSL-RL \texttt{DistillationRunner} & RSL-RL \texttt{DistillationRunner} & HORA 蒸馏（适应模块式，非通用 DAgger） \\
+DR 参数 & \texttt{EventTermCfg} & \texttt{EventTermCfg}（\texttt{mdp.dr.*}） & \texttt{DomainRandConfig}+\texttt{DomainRandomizationManager} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+注意 Stage 2$\to$Stage 3 的关键变化：\Verb[breaklines]|friction_coeffs|、\Verb[breaklines]|body_mass_offset|、\Verb[breaklines]|contact_forces|、\Verb[breaklines]|terrain_heights| 全部移除。这就是「信息降级」的工程含义——配置层面的差异清晰地定义了 teacher 与 student 的信息边界。
+
+\subsection{前沿视角：HOVER 与 VIRAL}
+\label{sec:rlmc-priv-frontier}
+
+\paragraph{HOVER：mask-conditioned distillation。} extreme-parkour 是 2024 年的工业标准，但 He 等的 HOVER（NVlabs/HOVER，ICRA 2025）提出更灵活的 mask-conditioned distillation \cite{he2025hover}：先训一个输入完整 SMPL 参考姿态 + 机器人状态（全特权）的 oracle teacher，再蒸馏到 student，但蒸馏时\emph{随机 mask 掉 teacher 命令的不同子集}——不同 mask 对应不同控制模式（全身跟踪 / 桌面操作 / 速度导航 / 遥操作）。DAgger 蒸馏中每个 mini-batch 随机采样不同 mask，训练完一个 student 网络即支持多种控制模式，切换模式只需改输入 mask 而非换网络。HOVER 论文明确称其在 19-DoF 人形上「支持 $>15$ 种对真实应用有用的模式」（上身/下身可独立组合三类跟踪，组合数远不止 15）。\pz{经核查未能证实：源稿给出的 RTX 4090/1024 envs 下 teacher$\approx$0.84\,s/iter、student$\approx$0.097\,s/iter 吞吐数据未在 HOVER 论文中出现，建议以官方仓库实测为准。}
+
+\paragraph{VIRAL：大规模视觉 teacher-student。} VIRAL（Visual Sim-to-Real at Scale，NVIDIA/CMU/Berkeley，arXiv:2511.15200）代表「大规模集群上的视觉 teacher-student」\cite{he2025viral}：privileged RL teacher（delta-action space + reference-state-initialization + 特权地形/物体真值）$\to$ 用 Isaac Lab 大规模 tiled rendering（\verb|TiledCamera|，可扩展到数十 GPU、最多 64）生成 RGB 观测，visual student 在 teacher 诱导的状态分布上用 DAgger + BC 训练；视觉 DR 覆盖光照、材质、相机内外参、图像质量降级、传感器延迟。部署在 Unitree G1 上，RGB-based policy 实现最多 54 个连续 loco-manipulation 循环，零真机微调。它强调：视觉管线中的 DR 不仅覆盖物理参数，还必须覆盖渲染参数——这正呼应 \cref{ins:rlmc-priv-drsysid} 的「DR-特权协同」。
+
+\begin{table}[H]
+\centering
+\small
+\caption{extreme-parkour vs HOVER vs VIRAL。}
+\label{tab:rlmc-priv-frontier}
+\begin{tabular}{@{}llll@{}}
+\toprule
+维度 & extreme-parkour & HOVER & VIRAL \\
+\midrule
+阶段/蒸馏维度 & 信息类型降级 & 命令模式（full$\to$masked） & 视觉模态（state$\to$RGB）+大规模 \\
+部署灵活性 & 一 student 一模式 & 一 student 多模式 & 一 student（RGB） \\
+适用对象 & 四足+深度相机 & 人形全身控制 & 人形 loco-manipulation \\
+框架 & Isaac Gym（废弃） & IsaacGym（论文评测，沿袭 OmniH2O 一脉） & Isaac Lab（数十 GPU） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+补充对照阅读：Miki 等的 ANYmal 野外感知 locomotion（Science Robotics 2022，arXiv:2201.08117）用注意力式 belief encoder 融合本体感知与外部感知，是「从盲控制到感知控制」的里程碑 \cite{miki2022perceptive}。（已联网核对：原文报告 ANYmal 在隧道/城市/洞穴等场景累计行走 $>1700$\,m 零跌倒，并完成阿尔卑斯山区长程徒步。）
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[设计]} 设计一个\emph{两阶段}（而非三阶段）管线：Stage 1 训 state-based teacher，Stage 2 直接蒸馏到 depth student。它在什么情况下可行、什么情况下会失败？验收：能用「模态差大小」与「teacher 行为是否 depth-compatible」两条判据回答。
+  \item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-reward} 与 \cref{ch:rlmc-dr}：若 Stage 1 teacher 存在 reward hacking（骗取 alive bonus 但没真在走），Stage 3 student 会继承这个 bug 吗？为什么？如何在蒸馏前检测？验收：能指出「BC 忠实迁移 teacher 行为，故会继承」。
+\end{enumerate}
+\end{practice}
+
+% ----------------------------------------------------------------
+过渡：管线训完，最后一公里是把 actor/student 导出 ONNX 并做 sim-to-sim 验证——这是信息边界设计接受真机检验前的最后一道软件关卡。
+
+% ════════════════════════════════════════════════════════════════
+\section{部署最后一公里：ONNX 导出与 sim-to-sim 验证}
+\label{sec:rlmc-priv-onnx}
+
+\textbf{模块功能与在管线中的位置。} 特权学习管线最终要部署的是 actor（非对称 AC）或 student（蒸馏）。Isaac Lab 的 \verb|isaaclab_rl| 桥接层提供 \Verb[breaklines]|export_policy_as_onnx()|（封装 RSL-RL 策略）把 PyTorch 模型转成 ONNX 用于边缘设备（如 Jetson Orin）实时推理 \cite{schwarke2025rslrl}。它处于整条管线的终点、真机部署之前。
+
+\subsection{normalizer 烘焙：导出 actor 的，不是 critic 的}
+\label{sec:rlmc-priv-norm}
+
+\Verb[breaklines]|export_policy_as_onnx()| 的关键机制是 \textbf{normalizer 烘焙}：把 normalizer（running mean/std）作为 ONNX 模型的第一层嵌入，部署时无需额外 Python 归一化代码——ONNX forward 第一步就是 $x\leftarrow(x-\mu)/\sigma$。
+
+\begin{codebox}[Python]{导出 ONNX:必须用 actor/student 的 normalizer}
+# exporter 由 Isaac Lab 的 isaaclab_rl 提供（非 rsl_rl 核心包）
+from isaaclab_rl.rsl_rl.exporter import export_policy_as_onnx
+export_policy_as_onnx(
+    policy     = runner.alg.actor,                   # 第一个位置参数是 policy
+    normalizer = runner.alg.actor.obs_normalizer,    # 必须是 actor 的！
+    path       = "./exported_models/",
+    filename   = "policy.onnx")
+\end{codebox}
+
+官方文档记录的签名（已联网核对当前版本）：\Verb[breaklines]|export_policy_as_onnx(policy, path, normalizer=None, filename="policy.onnx", verbose=False)|（\texttt{isaaclab\_rl.\allowbreak rsl\_rl.\allowbreak exporter}，内部用私有 \Verb[breaklines]|_OnnxPolicyExporter|；\Verb[breaklines]|normalizer=None| 时退化为 Identity）。\pz{该签名随 \texttt{isaaclab\_rl} 小版本仍可能微调（用关键字传参可规避位置变化）；落地前核对你所装版本的 \texttt{exporter.py}。}
+
+\textbf{三框架的 ONNX 导出对照。} mjlab 与 Isaac Lab 都直接复用上面的 RSL-RL exporter（mjlab 训练后自动落 \verb|<ts>.onnx|）。\textbf{UniLab 同样导出可部署 ONNX 并用 onnxruntime 自验}（PPO 经 \Verb[breaklines]|runner.export_policy_to_onnx|、APPO/off-policy 各自的导出路径都会起一个 \Verb[breaklines]|ort.InferenceSession| 比对 PyTorch 与 ONNX 输出的 max/mean diff 并打印「verified OK」），归一化层在 \Verb[breaklines]|empirical_normalization=True| 时同样烘焙进 ONNX \cite{unilab2026}。唯一差异在\emph{时机}：UniLab 的 PPO 在 \verb|play|/\allowbreak\verb|eval| 阶段才导（故 \Verb[breaklines]|training.no_play=true| 时不导），off-policy 由 \verb|export_onnx| flag 在训练流程内导——与 mjlab「训练后自动导」不同。UniLab 还多一套部署工具链（\Verb[breaklines]|scripts/deploy/| 的 \Verb[breaklines]|export_deploy_config.py|/\allowbreak\Verb[breaklines]|sim_prototype.py|）把 \verb|obs_layout| 显式记进 \Verb[breaklines]|deploy_config.yaml|，部署侧按它装配观测——这恰好对应本节末「部署前清单」第 (1)(5) 条的工程化落地。
+
+\begin{pitfall}[导出 critic 的 normalizer / RNN 非 LSTM 的导出限制]
+\textbf{错误描述}：导出时误用 critic 的 normalizer；或 actor 用 GRU/Transformer 却走默认 exporter。\textbf{现象后果}：前者因含特权维度统计量导致输入维度不匹配、shape error 或垃圾输出；后者——较早版本的 RSL-RL ONNX exporter 对 RNN 硬编码 LSTM 格式（Isaac Lab issue \#3008），GRU 会导出错误。\textbf{根本原因}：normalizer 是 per-model；exporter 曾假设所有 RNN 都是 LSTM。\textbf{正确做法}：始终导出 actor/student 的 normalizer；GRU/Transformer 须确认你的版本已修复或自定义导出逻辑。（已联网核对：issue \#3008 已关闭，修复 PR \#3009「Make GRU-based RNNs exportable in RSL RL」已于 2025-07 合入主干，为 GRU 增加了正确前向；故只要你装的版本在该 PR 之后即已含修复。）
+\end{pitfall}
+
+\subsection{Observation Normalization：沉默的训练杀手}
+\label{sec:rlmc-priv-normsilent}
+
+RSL-RL 默认用 running mean/std 归一化，在非对称 AC 场景下有几个微妙但致命的影响。\textbf{问题一：actor 与 critic 的 normalizer 必须独立}——二者观测维度不同，buffer 大小不同；mjlab 的 per-model \verb|RslRlModelCfg| 与 Isaac Lab 的 \Verb[breaklines]|*_obs_normalization| 字段都天然把二者分开，但自定义实现若共享 normalizer，特权维度统计量会污染 actor 维度的归一化。\textbf{问题二：新增观测维度后 normalizer buffer 未初始化}——训了 5000 iter 后给 critic 加新 term，若不重置 normalizer，新维度 running mean/std 为 0/1（甚至 0），与已积累 5000 iter 的统计量不一致，value 估计骤然恶化。\textbf{问题三：checkpoint 恢复时 normalizer 状态遗漏}——手动操作 state\_dict（warm start/跨框架迁移）易漏掉 normalizer，恢复后从零积累，表现为 value loss 突升后缓慢恢复。
+
+\begin{codebox}[Python]{normalizer 健康检查（关键行:维度匹配 + 无零方差）}
+def check_normalizer(runner):
+    an = runner.alg.actor.obs_normalizer
+    cn = runner.alg.critic.obs_normalizer
+    assert an.running_mean.shape[0] == runner.env.obs_dict["actor"].shape[-1]
+    assert cn.running_mean.shape[0] == runner.env.obs_dict["critic"].shape[-1]
+    assert (an.running_var > 1e-8).all(), "actor normalizer 有零方差维度（会除零 NaN）"
+    assert (cn.running_var > 1e-8).all(), "critic normalizer 有零方差维度"
+    print("actor count", an.count, "critic count", cn.count)
+\end{codebox}
+
+\subsection{运行验证：sim-to-sim ONNX 比对 + 部署前清单}
+\label{sec:rlmc-priv-sim2sim}
+
+部署前必须在仿真里用 ONNX 推理替代 PyTorch 推理（sim-to-sim），确认行为一致。
+
+\begin{codebox}[Python]{sim-to-sim:比对 ONNX 与 PyTorch 输出}
+import onnxruntime as ort
+def validate_onnx(onnx_path, pytorch_actor, test_obs, rtol=1e-4):
+    with torch.no_grad():
+        pt = pytorch_actor(test_obs).cpu().numpy()
+    sess = ort.InferenceSession(onnx_path)
+    name = sess.get_inputs()[0].name
+    ox = sess.run(None, {name: test_obs.cpu().numpy()})[0]
+    md = abs(pt - ox).max()
+    assert md < rtol, f"ONNX 与 PyTorch 不一致 max_diff={md}"
+    print("ONNX validation passed, max_diff =", md)
+\end{codebox}
+
+部署前清单：(1) 打印 ONNX 输入维度，确认与部署传感器一致；(2) sim-to-sim 比对通过；(3) 真机先以 zero action 跑通通信，再切策略输出；(4) 确认 \verb|base_lin_vel| 来源——真机 IMU 给角速度但\emph{不直接}给线速度，需状态估计器（如 EKF 融合 IMU + 腿部运动学），若 actor 训练时输入了 \verb|base_lin_vel|，部署必须有对应估计器，否则须把它移到 critic-only 并重训；(5) 检查物理单位——仿真 \verb|joint_pos| 是 rad、\verb|base_ang_vel| 是 rad/s，确认真机传感器一致而非 deg。
+
+\begin{insight}[base\_lin\_vel：特权学习最根本的工程动机之一]\label{ins:rlmc-priv-baselin}
+Isaac Lab 官方文档明确：真机 IMU 提供角速度（积分可得角速度），但\emph{不能}直接测线速度。这正是特权学习最根本的工程动机之一——\verb|base_lin_vel| 仿真直接可读、真机不可得。若 actor 训练时依赖它，这个信息必须在部署前移除或用估计器替代。这条与 \cref{ch:rlmc-obsact} 的 \cref{ins:rlmc-baselin} 同根：观测契约里写下的每一项，部署端都要兑现。
+\end{insight}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[编程]} 对一个训好的 actor 导出 ONNX，用 \verb|validate_onnx| 比对；故意把 normalizer 换成 critic 的，观察报错。验收：能复现 shape error 并解释原因。
+  \item \textbf{[排查]} 你的 ONNX 部署输出全是垃圾值。按部署前清单逐条排查，列出最可能的两个原因。验收：至少一个指向「normalizer 归属错」或「单位 deg/rad 混用」。
+\end{enumerate}
+\end{practice}
+
+% ----------------------------------------------------------------
+过渡：把全章知识整合成一套可操作的选型框架——面对新项目，如何在非对称 AC、RMA、多阶段蒸馏之间决策。
+
+% ════════════════════════════════════════════════════════════════
+\section{信息泄漏排查与方案选型}
+\label{sec:rlmc-priv-decision}
+
+\textbf{模块功能与在管线中的位置。} 本节是全章的收口：先给一套防泄漏的排查 checklist（贯穿配置全程），再给一棵选型决策树（项目初期用）。它既是开训前的最后一道闸门，也是项目立项时的第一个判断。
+
+\subsection{信息泄漏排查 checklist}
+\label{sec:rlmc-priv-leak}
+
+信息泄漏有三种隐蔽形式：\textbf{显式泄漏}（actor\_terms 直接含不可部署 term）、\textbf{隐式泄漏}（自定义 term 实现里暗中读了仿真内部状态）、\textbf{评估泄漏}（play 模式用了 critic tensor 做判断）。每次改配置后过一遍下表。
+
+\begin{table}[H]
+\centering
+\small
+\caption{信息边界排查 checklist（每次改 obs 配置后执行）。}
+\label{tab:rlmc-priv-checklist}
+\begin{tabular}{@{}rp{10.6cm}@{}}
+\toprule
+\# & 检查项 \\
+\midrule
+1 & actor\_terms 逐项审查：部署时由什么传感器提供？答不出 $\Rightarrow$ 疑似特权，移到 critic \\
+2 & critic 组 \texttt{enable\_corruption=False} \\
+3 & \texttt{obs\_groups} routing：actor 指向 actor 组、critic 指向 critic 组 \\
+4 & 维度：critic $\ge$ actor；相等 $\Rightarrow$ 特权未生效 \\
+5 & play 模式只加载 actor 权重、且关闭 actor corruption \\
+6 & 自定义 term 源码审查：没有直接读 \texttt{env.\allowbreak sim.\allowbreak data} 的特权字段 \\
+7 & \texttt{foot\_contact\_forces} 只在 critic（除非有等价传感器） \\
+8 & actor height\_scan 带噪、critic 更 clean \\
+9 & history 只加在有意义的 terms 上、且不致维度爆炸 \\
+10 & delay lag 换算成物理时间合理（mjlab 在 \texttt{ObservationTermCfg} 上实测有 \texttt{delay\_min\_lag}/\allowbreak\texttt{delay\_max\_lag}/\allowbreak\texttt{delay\_hold\_prob} 字段，lag 单位是 env step，乘 \texttt{decimation}$\times$\texttt{sim\_dt} 即物理时间） \\
+11 & 蒸馏：teacher 每个特权输入都有 student 可观测代理；student 训练 obs $=$ 部署 obs \\
+12 & 实验报告显式记录 actor/critic 的信息边界 \\
+13 & actor/critic 的 running mean/std 分别初始化；恢复 checkpoint 时一起加载 \\
+14 & 新增 obs 维度后重置 normalizer 统计；新维度 mean/std 初值合理 \\
+15 & ONNX 导出用 actor 的 normalizer，且经 \texttt{export\_policy\_as\_onnx} 烘焙进模型 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{诊断矩阵}
+\label{sec:rlmc-priv-diagmatrix}
+
+\begin{table}[H]
+\centering
+\small
+\caption{异常现象到信息边界问题的快速定位。}
+\label{tab:rlmc-priv-diag}
+\begin{tabular}{@{}p{3.4cm}p{4.0cm}p{4.2cm}@{}}
+\toprule
+现象 & 优先检查 & 修复方向 \\
+\midrule
+sim 好但 play 差 & actor corruption / push 配置 & 对比 train/play 配置（play 关 corruption 是正常的） \\
+sim 好但真机差 & actor\_terms 中的特权信号 & 移除不可部署 term \\
+value loss 长期偏高 & critic 是否缺特权 & 增强 critic 输入 \\
+student loss 不降 & teacher 是否含不可蒸馏信息 & 限制 teacher 特权 \\
+history 加大后无改善且显存暴涨 & history terms 选择 & 只给本体感知加 history \\
+critic 与 actor 维度相同 & routing / key 拼写 & 检查 \texttt{obs\_groups} 与 key \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{选型决策树}
+\label{sec:rlmc-priv-tree}
+
+\begin{insight}[选最简单的够用方案]\label{ins:rlmc-priv-simplest}
+不是所有项目都需要三阶段管线。在一个传感器充足的平地行走任务上上三阶段蒸馏，是典型的过度工程——你会花 3 倍时间管理多阶段配置与 checkpoint，最终 student 表现和直接用非对称 AC 的 actor 差不多。\textbf{选最简单的能解决问题的方案}，是区分工程新手与老手的标志。这与 \cref{ch:rlmc-dr} 的「DR 复杂度匹配任务难度」、\cref{ch:rlmc-reward} 的「reward 复杂度匹配任务难度」同一哲学。
+\end{insight}
+
+\begin{center}
+\small\textbf{特权学习方案选型决策树}\\[3pt]
+\begin{forest} dtree
+[{Q1 actor 与部署 sensor\\之间有信息差吗？}
+  [{否 → 不需要特权学习\\（直接 RL）}]
+  [{是 → Q2 这些特权信息\\只需帮助训练信号吗？}
+    [{是 → 非对称 AC\\（critic 看特权，actor 看部署信息）\\\quad 适用:多数 locomotion，\\\quad 接触力/地形真值只用于 value 估计}]
+    [{否 → Q3 actor 需在部署时\\间接获取环境参数吗？}
+      [{是 → RMA / 适应模块\\\quad 适用:实时适应摩擦/\\\quad 质量/地面倾斜变化}]
+      [{否 → Q4 部署输入模态是否\\与训练模态完全不同？}
+        [{是 → 多阶段 Teacher-Student 蒸馏\\（state → depth/RGB）}]
+        [{否 → 单阶段 Teacher-Student 蒸馏\\（信息类型同、精度不同）}]
+      ]
+    ]
+  ]
+]
+\end{forest}
+\end{center}
+
+\begin{table}[H]
+\centering
+\small
+\caption{四种方案的成本-收益对比（数量级参考，非保证值）。}
+\label{tab:rlmc-priv-costbenefit}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+方案 & 工程成本 & 训练时间 & 部署鲁棒性 & 适用场景 \\
+\midrule
+直接 RL & 低 & 基准 & 低 & 简单任务、信息充足 \\
+非对称 AC & 中低 & 约 1.2$\times$ & 中 & 多数 locomotion \\
+RMA & 中 & 约 2$\times$ & 高 & 环境参数自适应 \\
+多阶段 TS & 高 & 约 3--5$\times$ & 最高 & 视觉部署、极端地形 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\pz{待核实：上表「+10--30\% sim 表现」「1.2/2/3--5$\times$ 训练时间」等为源稿给出的经验数量级，强依赖任务/实现，正文已弱化为「数量级参考」，引用时勿当成保证值。}
+
+\subsection{技术演进脉络：从 Pinto 2018 到 VIRAL 2025}
+\label{sec:rlmc-priv-evolution}
+
+\begin{table}[H]
+\centering
+\small
+\caption{特权学习从概念到工业部署的演进。每代解决上一代的瓶颈。}
+\label{tab:rlmc-priv-timeline}
+\begin{tabular}{@{}llp{6.0cm}@{}}
+\toprule
+年份/工作 & 会议 & 解决了上一代什么问题 \\
+\midrule
+2018 Pinto et al. & RSS & 首提 actor/critic 可看不同信息 \\
+2020 Lee et al. & Sci.\ Robotics & 把特权学习从视觉扩展到 locomotion \\
+2021 Kumar et al.\ (RMA) & RSS & 让 student 部署时实时适应新环境 \\
+2022 Miki et al. & Sci.\ Robotics & 从盲控制到感知控制（注意力 belief encoder） \\
+2022 Rudin et al. & CoRL & 大规模并行 + 地形课程，训练时间从天降到分钟 \\
+2024 Cheng et al.\ (extreme-parkour) & ICRA & 跨模态（state$\to$depth）渐进蒸馏 + ROA \\
+2024 Radosavovic et al. & Sci.\ Robotics & causal transformer，不需显式适应模块 \\
+2025 He et al.\ (HOVER) & ICRA & 一个 student 多种控制模式 \\
+2025 Huang et al.\ (HoST) & RSS & multi-critic 解耦 task/style/regularization/post-task \\
+2025 He et al.\ (VIRAL) & arXiv & 大规模视觉 teacher-student 达真机鲁棒 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+两条清晰趋势：\textbf{其一，信息边界粒度越来越细}——从 Pinto 2018 的「actor vs critic 二分」，到 extreme-parkour 2024 的「三阶段渐进降级」，到 HOVER 2025 的「per-command-channel mask」。\textbf{其二，从手工设计走向数据驱动}——ASAP \cite{he2025asap} 用真机数据自动学 sim-to-real gap 补偿，VIRAL 用大规模渲染自动覆盖视觉域偏移；未来的特权学习可能不再需要工程师手动分类特权信号。Rudin 等的大规模并行训练 \cite{rudin2021minutes} 与 \cref{ch:rlmc-ecosystem} 讨论的吞吐优化同源。
+
+\subsection{四足 / 人形 / 操作的方案偏好}
+\label{sec:rlmc-priv-byrobot}
+
+\begin{table}[H]
+\centering
+\small
+\caption{不同机器人/任务的特权学习方案偏好。}
+\label{tab:rlmc-priv-byrobot}
+\begin{tabular}{@{}p{3.4cm}p{3.4cm}p{2.8cm}p{3.0cm}@{}}
+\toprule
+任务类型 & 核心特权信号 & 推荐方案 & 蒸馏跨度 \\
+\midrule
+四足 velocity（平地） & 接触力、摩擦 & 非对称 AC & 信息质量（噪$\to$无噪） \\
+四足 velocity（粗糙） & 地形真值、接触力、环境参数 & 非对称 AC + RMA & 信息存在性（需估计） \\
+四足 parkour（极端） & 完美地形 + 环境参数 & 多阶段蒸馏 & 模态跨越（state$\to$depth） \\
+人形 tracking & 全身关键点、角动量 & 非对称 AC & 信息质量 \\
+桌面抓取 & 物体位姿、接触法线 & 两阶段蒸馏 & 模态跨越（state$\to$depth/RGB） \\
+灵巧手操作 & 指尖接触力、物体滑移 & 非对称 AC + 力传感器 & 传感器精度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+人形比四足复杂得多：状态维更高、动量耦合更强（上半身运动影响下半身平衡），且\textbf{角动量管理}是独特挑战——四足有四个支撑点、静稳性强，人形只有两个（单脚支撑期只有一个），甩臂平衡、髋部扭转补偿都是关键行为，teacher 可直接读精确角动量、student 须从 IMU 与关节状态推断。回顾 \cref{ch:rlmc-obsact}：mjlab 的 tracking 任务提供 \Verb[breaklines]|has_state_estimation=False| 变体，从 actor 移除 \Verb[breaklines]|motion_anchor_pos_b| 与 \verb|base_lin_vel|——这正是 teacher-student 设计的天然起点：full-state actor 即 teacher，No-State actor 即 student 的目标输入空间。\pz{待核实：\texttt{has\_state\_estimation}/\allowbreak\texttt{motion\_anchor\_pos\_b} 的精确命名以本地 mjlab 版本为准。}
+
+\subsection{运行验证：A/B 消融实验}
+\label{sec:rlmc-priv-ab}
+
+理解特权学习工程价值最直接的方式是 A/B 消融：组 A 对称（critic $=$ actor），组 B 非对称（critic 多看 clean height + contact + friction），其余（seed、num\_envs、max\_iterations、lr、reward）完全相同。预期：组 B 的 \Verb[breaklines]|value_function| loss 从约第 100 iter 起显著低于 A，reward 在约 1000 iter 达到 A 在约 3000 iter 才到的水平，episode length 中期更长。若两组差异 $<5\%$，说明 actor 观测对此任务已够（可能是平地、信息差本就小），换粗糙地形重试；若组 A 反而更好，多半是 critic 特权 term 名拼错、实际没拿到额外信息（回 \cref{sec:rlmc-priv-verify} 审计）。
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[选型]} 双足机器人在室内平地行走，有 IMU + 编码器 + 足底力传感器。选哪种方案？验收：能据决策树走到「非对称 AC」并说明「信息充足、无需估计/蒸馏」。
+  \item \textbf{[选型]} 四足在户外草地走，有 IMU + 编码器 + 前向深度相机但无足底力传感器；若地形含台阶沟壑呢？验收：平地草地选「非对称 AC(+可选 RMA)」，台阶沟壑升级到「多阶段蒸馏」。
+  \item \textbf{[跨章综合]} 给你 2 周训一个 Go2 粗糙地形 locomotion 并部署真机。写时间分配：第几天做 DR baseline（\cref{ch:rlmc-dr}）、第几天加非对称 AC、什么条件升级 RMA、什么条件回退修 reward/DR。验收：含明确的「回退触发条件」。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\label{sec:rlmc-priv-faq}
+
+\begin{table}[H]
+\centering
+\small
+\caption{本章常见误解与澄清。}
+\label{tab:rlmc-priv-misconc}
+\begin{tabular}{@{}p{5.6cm}p{7.2cm}@{}}
+\toprule
+误解 & 澄清 \\
+\midrule
+特权学习只是可选的优化技巧 & 对需部署真机的项目，它是\emph{正确性保证}——没有信息边界设计的策略部署几乎必然失败 \\
+特权学习只用于 locomotion & manipulation 同样大量存在特权信息（物体位姿、接触法线、滑移）；只是 locomotion 文献研究得更系统 \\
+teacher 越强 student 越好 & teacher 太强可能因过度依赖特权做出 student 无法复现的行为；最好的 teacher 是「在特权帮助下找到 student 也能近似复现的高质量行为」 \\
+critic 维度越大越好 & 维度太高而对 value 帮助不大（如全身 100+ 关键点）反增拟合难度；应选对 value 帮助最大的（通常是接触/地形） \\
+所有特权信息价值相等 & 接触力直接影响步态切换、价值高；质量偏移 episode 内恒定、policy 适应后就不需再看 \\
+未来信息只要不给 actor 就没问题 & 即使只给 teacher，student 也无法复现基于未来信息的「提前反应」，蒸馏必败 \\
+Isaac Lab 与 mjlab 配置可直接复制粘贴 & 逻辑相同但 term 名、函数接口、sensor 配置不同；须参考各框架自己的 mdp 模块 \\
+adaptation module 的 MSE 越低越好 & 最终判据是 rollout 表现，不是 MSE（\cref{ins:rlmc-priv-msevsrollout}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\addcontentsline{toc}{section}{小结}
+\label{sec:rlmc-priv-summary}
+
+本章从算法主线（四个角色、三种形态、四类信息）出发，经三框架对比的工程配置（非对称 obs 组、RMA 适应模块、teacher-student 蒸馏），到工业管线精读（extreme-parkour）与部署落地（ONNX + sim-to-sim），终于选型决策树，构建了一条从「理解信息边界」到「部署可运行模型」的完整路径。
+
+\paragraph{术语速查。} 特权信息（privileged information，仿真可得真机不可得）；非对称 actor-critic（asymmetric AC，critic 看特权、actor 看部署信息）；适应模块/estimator（adaptation module，从历史估环境 latent）；RMA（Rapid Motor Adaptation，两阶段在线适应）；ROA（Regularized Online Adaptation，单阶段同时学 base 与适应模块）；teacher-student 蒸馏（行为克隆迁移技能）；DAgger（在 student 分布上聚合 teacher 标签）；复合误差（compounding error）；normalizer 烘焙（把 running mean/std 嵌入 ONNX）。
+
+\begin{table}[H]
+\centering
+\small
+\caption{本章知识点总表。难度：$\star$ 概念 / $\star\star$ 配置 / $\star\star\star$ 综合工程。}
+\label{tab:rlmc-priv-knowledge}
+\begin{tabular}{@{}clp{5.4cm}c@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 信息不对称是部署核心矛盾 & \cref{sec:rlmc-priv-gap} & $\star$ \\
+2 & 四个角色的生命周期与信息边界 & \cref{sec:rlmc-priv-roles} & $\star$ \\
+3 & 三种形态 = 信息蒸馏链长度 & \cref{sec:rlmc-priv-three} & $\star$ \\
+4 & Multi-critic 解耦目标维度 & \cref{sec:rlmc-priv-multicritic} & $\star\star$ \\
+5 & 特权信息四类分类 & \cref{sec:rlmc-priv-fourclass} & $\star\star$ \\
+6 & DR 宽度决定 student 隐式系统辨识 & \cref{sec:rlmc-priv-dr} & $\star\star\star$ \\
+7 & 三框架非对称 obs 组配置 & \cref{sec:rlmc-priv-config} & $\star\star\star$ \\
+8 & RSL-RL 网络 cfg 两形态（mjlab per-model / Isaac 统一） & \cref{sec:rlmc-priv-rslrl4} & $\star\star\star$ \\
+9 & RMA 适应模块（估 latent 而非物理量） & \cref{sec:rlmc-priv-estimator} & $\star\star\star$ \\
+10 & 三种在线适应范式 & \cref{sec:rlmc-priv-paradigms} & $\star\star$ \\
+11 & 蒸馏 $\ne$ AC；蒸馏双指标评估 & \cref{sec:rlmc-priv-distill} & $\star\star\star$ \\
+12 & DAgger 解决复合误差 & \cref{sec:rlmc-priv-dagger} & $\star\star$ \\
+13 & extreme-parkour 两阶段（教学三阶段） & \cref{sec:rlmc-priv-parkour} & $\star\star\star$ \\
+14 & ONNX normalizer 烘焙（用 actor 的） & \cref{sec:rlmc-priv-norm} & $\star\star$ \\
+15 & 信息泄漏 15 项 checklist & \cref{sec:rlmc-priv-leak} & $\star\star$ \\
+16 & 选型决策树 + 演进脉络 & \cref{sec:rlmc-priv-tree} & $\star\star$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+本章的信息边界设计上承 \cref{ch:rlmc-obsact} 的「部署可得性原则」、\cref{ch:rlmc-reward} 的 reward 质量、\cref{ch:rlmc-dr} 的 DR 协同，下接真机部署的残酷检验：\cref{ch:rlmc-obsact} 的契约若有遗漏，本章的 student 会忠实地把缺陷迁移下去；DR 若太窄，适应模块的 MSE 不降。蒸馏不能修复 reward 设计错误——它只忠实迁移 teacher 行为。
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-priv-further}
+
+\begin{itemize}
+  \item Pinto 等，\textit{Asymmetric Actor Critic for Image-Based Robot Learning}（RSS 2018，arXiv:1710.06542）——非对称 AC 的原始论文，教你「actor 与 critic 可看不同信息」\cite{pinto2018asymmetric}。
+  \item Kumar 等，\textit{RMA: Rapid Motor Adaptation for Legged Robots}（RSS 2021，arXiv:2107.04034）——适应模块设计与真机实验，教你「从历史估环境 latent」\cite{kumar2021rma}。
+  \item Lee 等，\textit{Learning Quadrupedal Locomotion over Challenging Terrain}（Science Robotics 2020）——四足特权学习经典，teacher-student 早期范例 \cite{lee2020quadruped}。
+  \item Cheng 等，\textit{Extreme Parkour with Legged Robots}（ICRA 2024，arXiv:2309.14341）——本章精读项目，教你多阶段蒸馏 + ROA 的工业实现 \cite{cheng2024parkour}。
+  \item Miki 等，\textit{Learning robust perceptive locomotion for quadrupedal robots in the wild}（Science Robotics 2022，arXiv:2201.08117）——注意力 belief encoder + 特权学习，教你「从盲控制到感知控制」\cite{miki2022perceptive}。
+  \item Radosavovic 等，\textit{Real-world humanoid locomotion with reinforcement learning}（Science Robotics 2024，arXiv:2303.03381）——causal transformer 隐式适应，RMA 的替代范式，教你 \cref{sec:rlmc-priv-paradigms} 的三范式对比 \cite{radosavovic2024humanoid}。
+  \item He 等，\textit{HOVER: Versatile Neural Whole-Body Controller for Humanoid Robots}（ICRA 2025）——mask-conditioned distillation，教你「一个 student 多种控制模式」\cite{he2025hover}。
+  \item Huang 等，\textit{Learning Humanoid Standing-up Control across Diverse Postures}（HoST，RSS 2025，arXiv:2502.08378）——multi-critic 架构，教你 \cref{sec:rlmc-priv-multicritic} 的 multi-critic 变体 \cite{huang2025host}。
+  \item He 等，\textit{VIRAL: Visual Sim-to-Real at Scale for Humanoid Loco-Manipulation}（arXiv:2511.15200）——大规模视觉 teacher-student + 视觉 DR \cite{he2025viral}。
+  \item Schwarke 等，\textit{RSL-RL}（arXiv:2509.10771）——actor/critic 解耦、\texttt{DistillationRunner}、ONNX exporter 的工程参考 \cite{schwarke2025rslrl}。
+  \item Ross 等，\textit{A Reduction of Imitation Learning to No-Regret Online Learning}（AISTATS 2011）——DAgger 原始论文，教你「在 student 分布上聚合标签」\cite{ross2011dagger}。
+\end{itemize}
+
+\textbf{阅读顺序建议}：先读 Pinto 2018（非对称 AC 原理）$\to$ Kumar 2021（RMA 两阶段）$\to$ Cheng 2024（多阶段蒸馏管线）$\to$ HOVER 2025（mask-conditioned distillation）。Miki 2022 与 Radosavovic 2024 作为「盲控制 vs 感知控制」「显式 vs 隐式适应」的对比阅读，RSL-RL 论文作为持续工程参考。
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-priv-trouble}
+
+\begin{table}[H]
+\centering
+\small
+\caption{本章故障排查手册：症状 $\to$ 原因 $\to$ 排查 $\to$ 相关节。}
+\label{tab:rlmc-priv-troubleshoot}
+\begin{tabular}{@{}p{3.4cm}p{2.8cm}p{4.6cm}p{1.8cm}@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+sim 好但真机崩溃 & actor 信息泄漏 & 逐项审 actor\_terms；查自定义 term 实现；过 15 项 checklist & \cref{sec:rlmc-priv-leak} \\
+value loss 长期偏高 & critic 缺特权 & 比 actor/critic 维度；查 routing；加 clean contact/height & \cref{sec:rlmc-priv-config} \\
+student imitation loss 不降 & teacher 不可蒸馏 & 查 teacher 是否用未来信息；限制特权；加 student history & \cref{sec:rlmc-priv-stage3} \\
+student loss 低但 rollout 差 & 复合误差 & 查训练/评估分布差异；增数据多样性；上 DAgger & \cref{sec:rlmc-priv-dagger} \\
+history 加大无改善且显存暴涨 & history 加在无意义 terms & 只给本体感知加 history；减 history\_length & \cref{sec:rlmc-priv-estparam} \\
+critic 与 actor 维度相同 & routing/key 拼错 & 打印两者维度；查 \texttt{obs\_groups} 与 key & \cref{sec:rlmc-priv-verify} \\
+Stage 2 warm start 后 reward 暴跌 & 权重加载维度不匹配 & 查 \texttt{strict} 参数；只加载兼容层；CNN 应随机初始化 & \cref{sec:rlmc-priv-warmstart} \\
+RMA latent 维度过大不稳 & 适应模块拟合难 & 从 4 维起；查 encoder latent 方差；降 latent 维 & \cref{sec:rlmc-priv-estparam} \\
+适应模块 MSE 低但 rollout 差 & latent 过拟合训练分布 & 查训练数据 DR 覆盖；在新 DR 参数上测 MSE & \cref{sec:rlmc-priv-estloss} \\
+前几百 iter value loss 异常高后缓慢恢复 & 恢复时 normalizer 丢失 & 确认 normalizer state\_dict 被加载；查 shape；不可恢复则重置并预热 & \cref{sec:rlmc-priv-normsilent} \\
+新增 obs term 后 critic value 暴跌 & normalizer 新维度未初始化 & 查 running\_var 新维是否为 0；重训或手动初始化 & \cref{sec:rlmc-priv-normsilent} \\
+ONNX 部署 shape error/垃圾输出 & 导出了 critic 的 normalizer 或 teacher 网络 & 打印 ONNX 输入 shape；对比部署维度；确认用 actor/student 的 normalizer & \cref{sec:rlmc-priv-onnx} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{一次真实排错：从「critic 维度不对」到定位}
+\label{sec:rlmc-priv-realdebug}
+
+上表是「症状$\to$原因」的速查；但工程上更要紧的是\emph{怎么自己一步步查}。下面演示一次真实的排错命令序列——场景是你给 critic 加了特权 term，却怀疑没生效（这是本章最高发的坑）。\textbf{核心方法论：让框架自带的输出当仪器，而不是空想。}
+
+\begin{codebox}[bash]{排错命令序列（critic 是否真比 actor 宽）}
+# 步骤1:先确认这一版 mjlab 到底有哪些 velocity 特权函数（别照书背名字）
+python -c "import mjlab.tasks.velocity.mdp as m; \
+print([a for a in dir(m) if not a.startswith('_') and 'foot' in a])"
+# 预期输出类似:['foot_air_time', 'foot_contact', 'foot_contact_forces', 'foot_height']
+# —— 若你写的 term 名不在这个 list 里，就是名字错了（如想象的 friction_coefficients）
+
+# 步骤2:跑 1 迭代，让训练启动日志打印两网络结构
+WANDB_MODE=disabled train Mjlab-Velocity-Rough-Unitree-Go1 \
+    --env.scene.num-envs 64 --agent.max-iterations 1 2>&1 | grep -A2 "ActorCritic"
+# 预期看到两行 Linear，actor 的 in_features < critic 的 in_features:
+#   actor:  ... Linear(in_features=A, out_features=...)
+#   critic: ... Linear(in_features=C, out_features=...)   且 C - A = 你加的特权维
+
+# 步骤3:若 C == A（特权没生效），最常见是 critic 组里 key 拼错变成"新增"而非"覆盖"，
+# 或 obs_groups 路由没把 critic 网络接到 critic 组——回到 sec:rlmc-priv-cfg-mjlab 对照.
+\end{codebox}
+
+这套序列把抽象的「检查 routing」落成三条可复制命令：步骤 1 用 \verb|dir()| 自查 API（替代背书里的名字）、步骤 2 用训练日志读真实维度（替代跑不通的 \verb|gym.make| 伪代码）、步骤 3 据维度差是否为 0 二分定位。\textbf{记住这个套路}：遇到任何「某配置没生效」，先问「框架的哪一行输出能证明它生效/没生效」，再去读那一行——而不是反复改配置碰运气。
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-priv-version}
+
+\begin{table}[H]
+\centering
+\small
+\caption{本章代码所依赖的关键版本（与 \cref{ch:rlmc-setup} 一致，此处只列特权学习相关增量）。}
+\label{tab:rlmc-priv-versions}
+\begin{tabularx}{\linewidth}{@{}lLL@{}}
+\toprule
+组件 & 本章假定版本 & 本章用到的特性 \\
+\midrule
+RSL-RL & 实测 \texttt{rsl-rl-lib} 5.2.0 & 非对称 actor/critic、per-network normalizer、\texttt{DistillationRunner}、ONNX exporter \\
+Isaac Lab & $\ge 2.0$（实测 2.3.2） & \texttt{ObsGroup} 多组、\texttt{TiledCamera}、\texttt{isaaclab\_rl} 桥接 \\
+mjlab & 活跃开发中（实测 1.4.0） & \texttt{obs\_groups} routing、actor/critic 组、深度 sensor \\
+UniLab & MuJoCoUni 3.8.0 / MotrixSim 0.8.2 后端 & \texttt{obs\_groups\_spec} 非对称组、HORA 适应蒸馏、ONNX 导出（play 阶段） \\
+PyTorch & $\ge 2.1$ & \texttt{torch.onnx} 导出、\texttt{clip\_grad\_norm\_} \\
+onnxruntime & $\ge 1.16$ & sim-to-sim 验证 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\pz{本章论文事实已联网核销一轮：Miki「$>1700$\,m 零跌倒」、extreme-parkour 阈值 $0.6$\,rad 与其 iter/时长、HOVER「$>15$ 模式」、ONNX exporter 签名、GRU 导出修复（PR \#3009）均已坐实并就地转为确定陈述。仍属版本/硬件相关、给不出唯一死值的（各框架版本号与字段名、HOVER 吞吐 s/iter、表中训练时间倍数、critic 各维数）已就地保留为精确化免责，落地前以你所装版本与官方文档为准。}

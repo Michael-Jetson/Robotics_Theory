@@ -1,0 +1,1059 @@
+\chapter{扩散式与端到端规划}
+\label{ch:diffusion-e2e}
+
+% ════════════════════════════════════════════════════════════════
+%  全吸收章：重渲染 Tutorial「70_端到端与扩散式规划.md」
+%   覆盖：UniAD(planning-oriented) / Diffusion Policy(action diffusion) / PLUTO(闭环模仿)
+%        + Diffuser(前驱) / VAD / Hydra-MDP / Diffusion Planner / EMMA + 安全过滤
+%  记号归一：R in SO(3)、T in SE(3)（preamble 宏 \SO \SE）；规划/学习领域自然记号保留。
+%  跨章去重：DDPM↔MPPI 同构、Tweedie、MBD 留在【采样式 MPC 章 ch:mppi-variants】，本章 \cref 指过去；
+%           MARL 基础（CTDE/非平稳/信用分配）留在 ch:plan-safemarl，本章 \cref 指过去；
+%           Frenet/PVD 留在 ch:frenet-st，本章 \cref 指过去。
+%  源由 AI 撰写、仅论文事实层联网核实，工程实现层为示意；存疑处就地 \pz/\rebuilt，入 claims 台账。
+%  教学层遵循 v5.0 理论教学规范。
+% ════════════════════════════════════════════════════════════════
+
+\rebuilt{本章重渲染自 Tutorial 笔记「端到端与扩散式规划」，其源稿由 AI 撰写、论文事实层（标题/作者/会议年份/arXiv 号/核心数值/代码仓库）经联网核实，但\emph{未}逐行核对源码、亦未逐页核对论文全文。故：代码走读均为\textbf{示意性}（模块名真实、行号指示性）；个别实验数值与论文-代码差异判定仍存疑，已就地 \texttt{\textbackslash pz}/\allowbreak\texttt{\textbackslash rebuilt} 标注，待二次校验。}
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。论文解读章不像方法章那样自包含——它假设你已掌握扩散模型、注意力机制、模仿学习的基础。若有两题以上答不上，建议先补对应基础（DDPM/Transformer、本部 \cref{ch:frenet-st,ch:mppi-variants}）。
+\begin{enumerate}
+  \item （扩散基础）DDPM 的前向过程对一段干净数据做什么？反向（去噪）过程训练网络预测什么？推理时从什么状态开始？
+  \item （注意力）DETR 的 object query 是什么？经过若干层 cross-attention 后它“吸收”了什么？它与一个检测框（中心 $+$ 长宽 $+$ 朝向 $+$ 类别）相比，携带的信息有何本质不同？
+  \item （评估）开环评估与闭环评估的本质区别是什么？为什么一个模仿学习模型可能开环 L2 很低、闭环却频频压线急刹？
+  \item （模仿学习）行为克隆（BC）的两大固有问题是什么？（提示：一个关于训练/测试分布，一个关于因果。）
+  \item （优化范式）“生成-验证”（或“生成-投影”）范式指什么？请从本部前几章举一个你已知的例子。
+\end{enumerate}
+\noindent\emph{答案线索}：1$\to$\cref{sec:de-ddpm}（前向加噪/反向去噪/纯噪声起步）；2$\to$\cref{sec:de-query}（query 吸收高维实例信息、不被压扁）；3$\to$\cref{sec:de-closedloop}（开环误差不累积、闭环自我放大）；4$\to$\cref{sec:de-closedloop}（分布偏移 $+$ 因果混淆）；5$\to$全章统一范式，\cref{sec:de-collision,sec:de-safety}。
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{阐述}端到端范式相对模块化经典栈的两个根本动机（信息瓶颈、目标不一致），并说明为何所有端到端/扩散方法都\emph{天然时空联合}——直接输出 $(x(t),y(t))$、绕过 \cref{ch:frenet-st} 的路径-速度分解（PVD）；
+  \item \textbf{复述} UniAD 的 planning-oriented 架构：query 接口如何让信息不被“压扁”、规划梯度如何反传到感知，以及基于占据的碰撞后优化为何是关键 trick；
+  \item \textbf{推导} Diffusion Policy 的前向加噪 / 反向去噪 / 训练目标，解释多模态从随机噪声起点而来，并清晰区分\emph{去噪步} $k$ 与\emph{动作时间步} $t$；
+  \item \textbf{解释}闭环为何比开环难（误差累积 $+$ 分布偏移），以及 PLUTO 的纵横感知 $+$ 对比学习 $+$ 数据增强如何各自缩小开环-闭环鸿沟；
+  \item \textbf{打通}“预测噪声 $=$ 预测 score”这座桥，把本章扩散方法接到 \cref{ch:mppi-variants} 的 DDPM$\leftrightarrow$MPPI 同构与采样式 MPC 上；
+  \item \textbf{横向选型}：在场景表示 / 输出形式 / 多模态 / 安全保证 / 训练范式 / 实时性等维度对七个方法做对比并按需选择；
+  \item \textbf{识别}端到端规划的核心未解难题（神经网络规划器的安全验证），理解“生成-验证”安全外壳为何是当前唯一务实答案。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是\textbf{论文解读}章，主线是一条技术演进线而非并列知识点：先给技术树全景（森林），再按“局限 $\to$ 下一篇动机”的因果链逐篇展开（树），最后综合对比（生态）。
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  adv/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (bg) {背景与动机\\ 为何端到端 / 为何天然时空联合};
+\node[grp, below=8mm of bg] (uniad) {核心 A：UniAD\\ planning-oriented，query 贯通};
+\node[grp, below left=9mm and -10mm of uniad] (dp) {核心 B：Diffusion Policy\\ 轨迹 $=$ 去噪对象，天然多模态};
+\node[grp, below right=9mm and -10mm of uniad] (pluto) {核心 C：PLUTO\\ 闭环超越规则派};
+\node[adv, below=30mm of uniad] (rest) {非核心群\\ VAD / Hydra-MDP / Diffusion Planner / EMMA\\ $+$ 安全过滤架构};
+\node[blk, below=8mm of rest, fill=main!8, draw=main!60!black] (sel) {设计空间全景\\ 七方法横向对比 $+$ 选型 $\to$ 范式总结};
+\draw[ln] (bg)--(uniad);
+\draw[ln] (uniad.south) -- ++(0,-3mm) -| (dp.north);
+\draw[ln] (uniad.south) -- ++(0,-3mm) -| (pluto.north);
+\draw[ln] (dp.south) |- (rest.west);
+\draw[ln] (pluto.south) |- (rest.east);
+\draw[ln] (rest)--(sel);
+\draw[ln, dashed] (uniad.east) to[bend left=18] node[midway,font=\scriptsize,right]{局限二：单模态} (dp.east);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：第一遍抓范式——\cref{sec:de-background} 背景 $\to$ 三篇核心论文各自的“一句话 $+$ 核心贡献 $+$ 局限”，跳过代码走读；第二遍吃方法——回到 \cref{sec:de-ddpm}（扩散数学）与 \cref{sec:de-cil}（对比学习），这是全章最硬的内核；第三遍建判断——\cref{sec:de-design,sec:de-safety} 从“理解方法”上升到“会选型、知边界”。
+
+\subsection*{前置知识桥接}
+本章重度依赖本部前几章建立的“显式建模”范式，作为“隐式学习”的对照基线，重叠处一律 交叉引用 指过去、不重复：
+\begin{itemize}
+  \item \textbf{路径-速度分解（PVD）与 Frenet}（\cref{ch:frenet-st}，\cref{sec:fs-pvd}）：经典栈先定几何路径 $\sigma(s)$ 再定速度剖面 $s(t)$。本章所有方法\emph{绕过} PVD、直接输出带时间戳的 $(x(t),y(t))$——\cref{sec:de-spatiotemporal} 专门论证这个连接点。
+  \item \textbf{采样式 MPC 与扩散的数学同构}（\cref{ch:mppi-variants}，\cref{sec:mv-bridge}，\cref{thm:mv-isomorphism}）：DDPM 反向去噪、MPPI 加权平均、score 上升是同一操作；Tweedie 恒等式（\cref{sec:mv-mbd}）连接 score 与后验均值。本章 \cref{sec:de-score} 的“预测噪声 $=$ 预测 score”直接接到这里，不重证 Tweedie。
+  \item \textbf{滚动时域（receding horizon）}（\cref{ch:st-corridor,ch:st-trajopt} 与 MPC）：Diffusion Policy 的 action-horizon 执行（\cref{sec:de-receding}）就是 MPC 滚动重规划思想在动作序列生成上的体现。
+  \item \textbf{博弈式交互规划}（\cref{ch:plan-diffgame,ch:plan-rtgame}）：自驾的多体交互（抢行/让行）本质是博弈；扩散“联合去噪逼近博弈均衡”（\cref{sec:de-diffplanner}）与这两章互为表里。
+  \item \textbf{MARL 基础}（\cref{ch:plan-safemarl}）：本章涉及多智能体学习的基础概念时指过去，不重复 CTDE/非平稳/信用分配。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+旋转矩阵记 $\mathbf{R}\in\SO(3)$、位姿 $\mathbf{T}\in\SE(3)$（preamble 宏 $\SO,\SE$，与全书一致，\nameref{ch:notation}）；规划/学习领域自然记号保留。
+\textbf{扩散的两个“步”严格分开}：上标 $k\in\{0,\dots,K\}$ 是\emph{去噪步}（denoising iteration，标量、做条件）；下标 $t$ 是\emph{动作/轨迹时间步}（序列维度）。故 $\boldsymbol{\tau}^k$ 表“去噪到第 $k$ 步的整段轨迹”，其内部仍有 $t=1,\dots,T_p$ 个时间步。
+轨迹记 $\boldsymbol{\tau}=[(x_t,y_t)]_{t=1}^{T}$（自车时空轨迹）或动作序列 $\mathbf{a}_{1:T_p}$；观测条件记 $\mathbf{O}$；噪声 $\boldsymbol{\epsilon}\sim\mathcal{N}(\mathbf{0},\mathbf{I})$；噪声调度 $\{\beta_k\}$、$\alpha_k=1-\beta_k$、$\bar\alpha_k=\prod_{i=1}^{k}\alpha_i$。
+\textbf{字母隔离声明}：本章 $\boldsymbol{\tau}$ 指轨迹/动作序列（非时间常数或 \cref{ch:mppi} 的控制序列 $U$），$\boldsymbol{\epsilon}_\theta$ 指噪声预测网络，$\mathbf{O}$ 指观测条件，均仅本章局部生效。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{背景与动机：从模块化流水线到端到端}
+\label{sec:de-background}
+
+\subsection{经典栈的两个深层问题}
+\label{sec:de-twoproblems}
+
+\paragraph{动机：把前几章的流水线在脑子里跑一遍。}
+经典自驾栈是一条手工设计、模块串联的流水线：相机/激光 $\to$ 感知（检测、跟踪、建图）$\to$ 预测（他车未来轨迹）$\to$ 规划（Frenet $+$ ST 图 $+$ QP，\cref{ch:frenet-st,ch:st-corridor}）$\to$ 控制。每个模块单独训练或单独调参，模块间用人为定义的接口（检测框、预测轨迹、代价函数）传递信息。这条流水线有两个深层问题，正是本章所有工作要回应的。
+
+\paragraph{问题一：累积误差与信息瓶颈。}
+感知模块输出的检测框丢掉了原始特征里的不确定性；预测模块基于这些框做预测，误差进一步放大；规划模块拿到的是被两层处理“压扁”过的信息。\textbf{每一道人为接口都是一个信息瓶颈}——上游一个漏检，下游规划无从补救。
+
+\paragraph{问题二：优化目标不一致。}
+感知优化检测精度（mAP），预测优化轨迹误差（ADE/FDE），规划优化舒适与安全。\textbf{没有一个模块在直接优化“最终把车开好”这件事。}检测精度高 $0.5\%$ 不一定让车开得更好，但模块化范式无法表达这种“以终为始”的目标。
+
+\begin{insight}[经典栈的本质是“用人类先验把端到端问题切成子问题”]
+经典栈把一个端到端问题切成若干子问题，每个子问题有清晰、可监督的中间表示（框、轨迹、代价）。这让系统\textbf{可解释、可调试、可验证}，代价是\textbf{信息在接口处损失、目标在模块间割裂}。本章的端到端范式做的恰好是反向操作——\textbf{拆掉中间接口，让梯度从最终目标一路反传到原始传感器}。这笔交易换来信息保真与目标一致，代价是可解释性与可验证性——而后者正是端到端方法至今未解的核心难题（\cref{sec:de-safety}）。
+\end{insight}
+
+\paragraph{扩散范式回应的是另一个问题——多模态。}
+在一个无保护左转路口，“现在抢行”和“等待让行”是两个都合理但完全不同的决策。经典优化器输出单条最优轨迹，会把两个模式“平均”成一条危险的中间轨迹（既没抢成也没让够）。扩散模型天然能表示多峰分布，一次采样出多条各自自洽的候选——这正是它在机械臂（多种抓取方式）和自驾（多种交互策略）上都奏效的原因。
+
+\subsection{为什么这两条范式天然“时空联合”}
+\label{sec:de-spatiotemporal}
+
+这是本章与前几章最根本的连接点。回忆 \cref{sec:fs-pvd}：经典栈做 \textbf{PVD（路径-速度分解）}——先定几何路径 $\sigma(s)$，再定速度剖面 $s(t)$。本章所有方法\emph{绕过} PVD：
+
+\begin{itemize}
+  \item UniAD 的 Planner 直接回归未来 $T$ 个时刻的自车位置 $(x_1,y_1),\dots,(x_T,y_T)$——\textbf{带时间戳的点序列}，路径与速度信息揉在一起，没有“先路径后速度”。
+  \item Diffusion Policy / Diffusion Planner 把整条轨迹 $\boldsymbol{\tau}=[(x_t,y_t)]_{t=1}^{T}$ 当作一个\textbf{去噪对象}，从噪声里一次性生成——同样时空联合。
+\end{itemize}
+
+\begin{insight}[PVD 是为实时求解做的妥协，神经网络让妥协不再必要]
+学习式方法回到了 \cref{ch:frenet-st} 一开始就放弃的“完整轨迹直接优化”——只不过经典方法因为这个问题非凸、高维、实时性差而放弃，学习方法则用“离线训练承担计算、在线只做前向”绕开实时性难题。一个漂亮的呼应：\textbf{PVD 是为了让人手设计的优化器能实时求解而做的妥协；当求解器换成神经网络，这个妥协就不再必要了。}
+\end{insight}
+
+\subsection{技术树全景}
+\label{sec:de-techtree}
+
+先看森林，再看树。端到端规划的演进可画成六代工作、两条主线（模仿学习主线 $+$ 扩散生成主线），在 $2024$--$2025$ 交汇：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=5mm and 6mm, >=Stealth,
+  g/.style={draw, rounded corners, align=center, font=\scriptsize, inner sep=3pt, fill=main!6, draw=main!60!black},
+  d/.style={draw, rounded corners, align=center, font=\scriptsize, inner sep=3pt, fill=second!8, draw=second!60!black},
+  c/.style={draw, rounded corners, align=center, font=\scriptsize, inner sep=2pt, fill=third!10, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[g] (g1) {G1 模仿开端（$2016$--$2020$）\\ ChauffeurNet / LBC\\ 因果混淆 $+$ 分布偏移};
+\node[g, below=of g1] (g2) {G2 模块化端到端（$2023$）★\\ UniAD（CVPR'23 Best Paper）\\ query 贯通、planning-oriented};
+\node[g, below left=8mm and -22mm of g2] (g3) {G3 矢量化（$2023$--$24$）\\ VAD / VADv2\\ 矢量场景、更快};
+\node[d, below right=8mm and -22mm of g2] (g4) {G4 扩散规划（$2022$--$25$）\\ Diffuser(前驱) $\to$\\ Diffusion Policy(RSS'23)};
+\node[g, below=14mm of g3] (g5) {G5 闭环 SOTA（$2024$）\\ PLUTO / Hydra-MDP\\ 模仿首超规则派};
+\node[d, below=14mm of g4] (g4b) {Diffusion Planner($2025$)\\ 自驾扩散、联合去噪};
+\node[g, below=24mm of g2] (g6) {G6 大模型驾驶（$2024$--$26$）\\ EMMA / DriveVLM / LMDrive\\ MLLM 直接输出轨迹};
+\node[c, right=4mm of g2] (cA) {核心 A};
+\node[c, right=4mm of g4] (cB) {核心 B};
+\node[c, left=4mm of g5] (cC) {核心 C};
+\draw[ln] (g1)--(g2);
+\draw[ln] (g2.south) -- ++(0,-3mm) -| (g3.north);
+\draw[ln] (g2.south) -- ++(0,-3mm) -| (g4.north);
+\draw[ln] (g3)--(g5); \draw[ln] (g4)--(g4b);
+\draw[ln] (g5.south) |- (g6.west);
+\draw[ln] (g4b.south) |- (g6.east);
+\end{tikzpicture}
+\end{center}
+
+\paragraph{读这棵树的三个关键转折。}
+\begin{enumerate}
+  \item \textbf{G1$\to$G2}：从“一个网络端到端模仿”到“模块化但梯度贯通”。UniAD 的贡献不是端到端本身（G1 就端到端了），而是\textbf{保留中间任务监督的同时让梯度贯通}——既要可解释的中间表示，又要端到端的目标一致。
+  \item \textbf{分叉}：G3 矢量化（VAD）和 G4 扩散（Diffusion Policy）是两条平行路线，分别优化“效率”和“多模态”。
+  \item \textbf{G5 的里程碑}：$2024$ 年 PLUTO/Hydra-MDP \textbf{首次让模仿学习在 nuPlan 闭环超越规则派}——在此之前，“学习方法开环指标好但闭环不如规则”是领域共识，G5 打破了它。
+\end{enumerate}
+
+三篇核心论文恰好踩在三个关键节点：UniAD（G2 范式奠基）、Diffusion Policy（G4 生成范式代表，且跨自驾/机械臂）、PLUTO（G5 闭环突破）。下面逐篇深读。
+
+% ════════════════════════════════════════════════════════════════
+\section{核心论文 A：UniAD —— Planning-oriented Autonomous Driving}
+\label{sec:de-uniad}
+
+\begin{paper}[UniAD：以规划为导向的统一自动驾驶]\label{paper:de-uniad}
+\textbf{问题}：模块化栈信息瓶颈 $+$ 目标割裂，纯端到端黑盒难调；能否走第三条路——保留中间监督又让梯度贯通到规划？
+\textbf{核心思想}\cite{hu2023uniad}：把检测、跟踪、建图、运动预测、占据预测、规划六个任务统一进\emph{一个网络}，所有任务以 \emph{query} 为接口串联，并以\emph{规划}为最终导向组织整个架构，使规划梯度可一路反传到感知。
+\textbf{关键结果}：CVPR 2023 Best Paper；首个在 nuScenes 上把六任务做到联合 SOTA 的系统；消融系统性证明“每个上游任务都对规划有正贡献”。报告规划平均碰撞率 $0.31\%$（已核实）。
+\textbf{与本书关系}：本章 G2 范式奠基；其“学习回归 $+$ 碰撞后优化”是全章“生成-投影”模板（\cref{sec:de-collision,sec:de-safety}）的第一例。
+\textbf{局限}：query 数 $\times$ 注意力 $O(N^2)$ 开销（$\to$ VAD）；单模态回归（$\to$ 扩散）；开环评估、无闭环与安全保证（$\to$ PLUTO）。
+\end{paper}
+
+\paragraph{动机：模块化 vs 端到端的“第三条路”。}
+UniAD 之前自驾系统有两种极端：\emph{模块化}（感知/预测/规划独立模块，可解释但信息瓶颈）；\emph{纯端到端}（G1 如 ChauffeurNet，单一网络从传感器直接到控制，目标一致但黑盒、无中间监督、难调试，且易因果混淆——可能学到“前车刹车灯亮 $\to$ 我刹车”的伪相关而非真正理解场景）。UniAD 走第三条路。
+
+\begin{insight}[反事实推理：UniAD 精确落在两个极端之间]
+若 UniAD 不保留中间任务监督、直接像 ChauffeurNet 那样端到端回归轨迹，会退回 G1 老路——失去可解释性、训练不稳、学到捷径特征；若不让梯度贯通、只把六个独立模块拼起来各自训练，那就是模块化范式，信息仍在接口处损失。UniAD 的设计精确地落在两极之间：\textbf{用中间任务监督保住可解释性与训练稳定性，用 query 接口 $+$ 联合训练保住信息保真与目标一致。}
+\end{insight}
+
+\paragraph{数据流总览。}
+UniAD 是一条“感知 $\to$ 预测 $\to$ 规划”的链，但每一环都通过 query 把信息喂给下一环：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=3mm and 6mm, >=Stealth,
+  b/.style={draw, rounded corners, align=center, font=\scriptsize, inner sep=3pt, fill=main!6, draw=main!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[b] (img) {多视角相机};
+\node[b, right=of img] (bev) {① BEV 编码\\ (BEVFormer) $\mathbf{B}$};
+\node[b, right=of bev] (trk) {② TrackFormer\\ track query $\mathbf{Q}_A$};
+\node[b, below=7mm of trk] (map) {③ MapFormer\\ map query $\mathbf{Q}_M$};
+\node[b, left=of map] (mot) {④ MotionFormer\\ agent 未来};
+\node[b, left=of mot] (occ) {⑤ OccFormer\\ 占据 $\mathbf{O}_t$};
+\node[b, below=7mm of occ] (plan) {⑥ Planner\\ $\boldsymbol{\tau}=[(x_t,y_t)]$};
+\draw[ln] (img)--(bev); \draw[ln] (bev)--(trk);
+\draw[ln] (bev.south) -- ++(0,-3.5mm) -| (map.north);
+\draw[ln] (trk)--(map);
+\draw[ln] (map)--(mot); \draw[ln] (mot)--(occ);
+\draw[ln] (trk.south) to[bend left=10] (mot.north);
+\draw[ln] (occ.south) -- ++(0,-3.5mm) -| (plan.north);
+\draw[ln] (mot.south) to[bend left=10] (plan.north east);
+\end{tikzpicture}
+\end{center}
+
+\noindent 下面三栏式精讲三个最关键组件：query 传递机制（②③④ 的灵魂）、MotionFormer 三类交互、Planner 的碰撞后优化（最关键、论文最语焉不详、代码 trick 最密集）。其余组件（① BEV、⑤ Occ、⑦ 两阶段训练）做要点说明。
+
+\subsection{组件 ②③④：query 作为统一接口}
+\label{sec:de-query}
+
+\paragraph{论文原文（转述）。}
+各任务节点不再通过显式的、人为定义的中间结果（检测框、栅格图）连接，而是通过 \textbf{query}（可学习特征向量）连接——每个 agent 对应一个 query，在 TrackFormer 中被初始化与更新，并作为后续 MotionFormer、Planner 的输入之一\cite{hu2023uniad}。
+
+\paragraph{用人话重新讲一遍。}
+在 DETR 系列里，一个 object query 是一个可学习向量，网络通过它“问”图像：“这里有没有目标？是什么？在哪？”经过若干层 cross-attention（query 去 attend 图像特征），它就“吸收”了某个目标的全部信息。UniAD 的关键 insight 是：\textbf{这个吸收了某 agent 全部信息的 query 向量，比一个检测框（中心点 $+$ 长宽 $+$ 朝向 $+$ 类别，区区十来个数）携带的信息丰富得多。}检测框是 query 经检测头“压扁”后的结果；query 本身还保留着这个 agent 的外观、运动趋势、上下文关系等高维信息。
+
+所以 UniAD 不把检测框传给下游，而是把 \textbf{query 本身}传下去：
+\begin{itemize}
+  \item \textbf{TrackFormer} 产出每个被跟踪 agent 的 track query（跨帧传播，实现端到端跟踪——同一 agent 的 query 在连续帧间延续，天然完成数据关联）；
+  \item 这些 track query 直接喂给 \textbf{MotionFormer} 做运动预测、喂给 \textbf{Planner} 做规划。下游拿到的是“完整的 agent 表示”而非“压扁的框”。
+\end{itemize}
+
+\begin{insight}[query 接口把“信息损失点”推迟到尽可能晚]
+经典栈在感知输出框时就损失了信息；UniAD 让高维 query 一直流到规划，只在每个任务需要可监督输出时才“分叉”出一个压扁的预测（框/轨迹）用于计算 loss，主干信息流不被压扁。这就是“既要中间监督、又要信息保真”如何同时实现的技术答案。
+\end{insight}
+
+\paragraph{代码实现走读（示意，行号需核实）。}
+注意检测框只用于算检测 loss、\emph{不参与下游信息流}——这是“中间监督但信息不压扁”的代码级体现，也是初学者读 UniAD 最易看错处（陷阱 1）。
+
+\begin{codebox}[Python]{UniAD：track query 跨帧传播且作为下游输入（示意）}
+# 来源：OpenDriveLab/UniAD，track_head / motion_head（源码结构，示意性走读）
+class UniADPipeline(nn.Module):                 # 示意：实际拆在多个 head 中
+    def forward_single_frame(self, imgs, prev_track_query):
+        bev = self.bev_encoder(imgs)            # (1) BEVFormer -> BEV 特征
+        # (2) TrackFormer：上一帧 track query + 新生 query 一起 attend BEV
+        #     track_query 跨帧延续 = 端到端跟踪（无需匈牙利匹配做数据关联）
+        track_query = self.track_former(bev, prev_track_query)   # [N_agent, C]
+        det_boxes  = self.det_head(track_query)  # 仅用于算检测 loss，不下传
+        map_query  = self.map_former(bev)        # (3) 在线建图 query
+        # (4) MotionFormer：直接吃 track_query / map_query，而非 det_boxes
+        agent_futures = self.motion_former(track_query, map_query, bev)
+        occ = self.occ_former(track_query, bev)  # (5) 未来占据
+        # (6) Planner：ego query + BEV + occupancy
+        ego_traj = self.planner(self.ego_query, bev, occ, agent_futures)
+        return ego_traj, track_query             # track_query 传给下一帧
+\end{codebox}
+
+\subsection{组件 ④（深入）：MotionFormer 的三类交互}
+\label{sec:de-motionformer}
+
+\paragraph{论文原文（转述）。}
+MotionFormer 通过建模 agent 与 agent、agent 与地图、agent 与目标点（goal）三类交互，联合预测所有 agent 的多模态未来轨迹\cite{hu2023uniad}。
+
+\paragraph{用人话重新讲一遍。}
+预测一辆车的未来，光看它自己不够，要看三样东西：
+\begin{enumerate}
+  \item \textbf{agent--agent 交互}：旁边的车在干什么（它要并线，我可能要让）。实现为 agent query 之间的 self-attention。
+  \item \textbf{agent--map 交互}：道路结构约束（车道要拐弯，车也得拐）。实现为 agent query 对 map query 的 cross-attention。
+  \item \textbf{agent--goal 交互}：每个 agent 可能去哪（goal point），不同 goal 对应不同模态——这是\emph{多模态}的来源（路口可直行也可右转，对应不同 goal、预测多条轨迹）。
+\end{enumerate}
+这三类交互是 GameFormer、VAD 等后续工作反复沿用的设计，可视为运动预测的“标准三件套”。
+
+\begin{codebox}[Python]{UniAD：MotionFormer 三类交互（示意）}
+# 来源：OpenDriveLab/UniAD，motion_head（源码结构，示意）
+class MotionFormerLayer(nn.Module):
+    def forward(self, agent_q, map_q, goal_anchors, bev):
+        agent_q = self.agent_self_attn(agent_q, agent_q, agent_q)        # 1) agent-agent
+        agent_q = self.agent_map_attn(q=agent_q, k=map_q, v=map_q)       # 2) agent-map
+        agent_q = self.agent_goal_attn(q=agent_q, k=goal_anchors,
+                                       v=goal_anchors)                   # 3) agent-goal -> 多模态
+        return agent_q                                                   # 每 agent 输出 K 条模态
+\end{codebox}
+
+\subsection{组件 ⑥（最关键）：Planner 与基于占据的碰撞后优化}
+\label{sec:de-collision}
+
+这是整篇论文\emph{理论上一笔带过、但实际最 work} 的一环，也是论文-代码差异最大的地方——典型的“论文没告诉你的”。
+
+\paragraph{论文原文（转述）。}
+Planner 以 ego query 结合 BEV 与场景信息回归自车未来轨迹；为提升安全性，在预测轨迹基础上利用未来占据进行碰撞规避的优化（对优化细节着墨很少）\cite{hu2023uniad}。
+
+\paragraph{用人话重新讲一遍。}Planner 分两步。
+\begin{enumerate}
+  \item \textbf{学习式回归}：ego query（代表自车）attend BEV 特征与场景信息，回归未来 $T$ 步轨迹点 $(x_t,y_t)$。这里直接输出带时间的轨迹点——\textbf{这就是“时空联合”在 UniAD 里的体现，没有 path/speed 解耦}。
+  \item \textbf{基于占据的碰撞后优化（关键 trick）}：纯学习回归的轨迹不保证不撞。UniAD 用 OccFormer 预测的未来占据栅格 $\mathbf{O}_t$ 做一次\emph{后优化}——把“轨迹点落在未来被占据的格子里”作为碰撞代价，用梯度下降微调轨迹点，把它从危险区“推”开。这一步把\emph{软的学习先验}和\emph{显式的安全约束}缝合起来。
+\end{enumerate}
+
+\begin{codebox}[Python]{UniAD：基于占据的碰撞后优化（示意性还原）}
+# 来源：OpenDriveLab/UniAD，planning_head（源码结构，示意性还原）
+def plan_with_collision_optimization(ego_query, bev, occ_future, init_traj):
+    traj = init_traj if init_traj is not None else regress_traj(ego_query, bev)  # 第一步：回归
+    # 第二步：用未来 occupancy 做碰撞后优化（论文几乎没展开的关键步骤）
+    traj = traj.clone().requires_grad_(True)
+    for _ in range(N_ITER):                       # N_ITER：论文未给，码中常数（UNSPECIFIED）
+        cost = collision_cost(traj, occ_future)   # 轨迹点落在占据格 -> 高代价
+        cost = cost + smoothness_cost(traj)       # 平滑正则
+        grad = torch.autograd.grad(cost, traj)[0]
+        traj = traj - LR * grad                   # 沿梯度把轨迹推离障碍
+    return traj.detach()
+\end{codebox}
+
+\begin{note}
+\textbf{论文没告诉你的（组件 ⑥）.}\;\rebuilt{以下来源待逐行核对：}碰撞优化迭代步数 \texttt{N\_ITER}、步长 \texttt{LR} 论文未给，为代码常数（UNSPECIFIED）——复现时这两个值直接决定“推得够不够远又不过冲”；碰撞代价的具体形式（占据阈值/软化）论文一笔带过，太硬则轨迹抖动、太软则推不开，是调参核心；占据与 planner 是否端到端联合训练，由组件 ⑦ 定性为 SPECIFIED（Stage 2 联合训练）。
+\end{note}
+
+\begin{insight}[trick 的可迁移性：一个通用的“生成-投影”模板]
+UniAD 的“学习回归 $+$ 基于预测占据的碰撞后优化”是一个\textbf{通用的“生成-投影”模板}——先用学习模型给一个高质量初值，再用显式代价做可微投影把它拉回可行域。这个模板会在本章反复出现：Diffusion Planner 的“去噪 $+$ 约束投影”（\cref{sec:de-diffplanner}）、Autoware 的“diffusion\_planner $+$ safety\_filter”（\cref{sec:de-safety}）都是它的变体；与 \cref{ch:mppi-variants} 的“采样 $+$ 后处理”亦同源。\textbf{记住这个模板，你就抓住了“如何给学习式规划器加安全兜底”的一般答案。}
+\end{insight}
+
+\subsection{组件 ①⑤⑦：地基、占据桥与两阶段训练}
+\label{sec:de-uniad-rest}
+
+\paragraph{组件 ①：BEV 编码（整条链的地基）。}
+六个相机各看一个方向的透视图，但规划需要一张“俯视地图”。BEVFormer 做两件事：① \emph{空间 cross-attention}——在 BEV 网格上放一组 BEV query（每个对应地面一个 $(x,y)$ 格子），让它按相机投影几何去对应图像区域“采样”特征（把透视图特征搬到俯视格子上）；② \emph{时序 self-attention}——把上一帧 BEV 特征用自车运动 warp 对齐到当前帧再融合，让运动信息（速度、加速度趋势）进入特征。输出 BEV 特征 $\mathbf{B}\in\mathbb{R}^{H\times W\times C}$ 是后面所有模块的共同输入。
+
+\begin{note}
+\textbf{论文没告诉你的（BEV 编码）.}\;BEV 网格分辨率 $H\times W$、感知范围（前后左右多少米）、时序融合用几帧都在 config 里（PARTIAL），直接决定精度与算力平衡：范围太小看不到远处快速接近的车，分辨率太粗定位不准。这也是 VAD 矢量化要绕开的“密集网格代价”（\cref{sec:de-vad}）。BEV 时序融合若用错自车位姿，运动物体会“拖影”（陷阱 4）。
+\end{note}
+
+\paragraph{组件 ⑤：OccFormer（未来占据，预测与规划之间的桥）。}
+普通占据预测只回答“未来某格子被占了吗”（二值）；UniAD 的 OccFormer 做\emph{实例级}占据——不仅知道格子被占，还知道\emph{被哪个 agent} 占。它让 agent query（带每个目标的身份与运动信息）与 BEV 特征交互，逐时间步“画”出每个 agent 在未来 $t$ 时刻会占据哪些格子，输出未来占据序列 $\mathbf{O}_1,\dots,\mathbf{O}_T$ 喂给 Planner 做碰撞后优化。
+
+\begin{insight}[实例级占据是“预测”与“规划”之间的桥]
+它把 MotionFormer 的“agent 未来轨迹”（稀疏点序列）翻译成 Planner 能直接用的“空间占用场”（稠密、可碰撞检测的栅格）。这一步转换正是组件 ⑥ 碰撞代价能算的前提。
+\end{insight}
+
+\paragraph{组件 ⑦：两阶段训练策略（论文一句话带过、却决定能否复现）。}
+为什么不一步到位端到端训练？三个现实原因（官方已说明）：\textbf{显存}——全模型六任务一起训练约需 $50$\,GB 显存\rebuilt{（数值待核）}，分阶段降低峰值占用；\textbf{训练稳定性}——感知基础（track/map）必须先立住，上层任务（motion/occ/plan）才学得动；\textbf{收敛速度}——预训练好的感知给端到端阶段一个好的初始化。具体配方（已核实）：
+
+\begin{table}[H]\centering\small
+\caption{UniAD 两阶段训练配方}
+\label{tab:de-uniad-stages}
+\begin{tabular}{p{0.12\textwidth} p{0.34\textwidth} p{0.10\textwidth} p{0.28\textwidth}}
+\toprule
+阶段 & 训练什么 & epoch & 产物 ckpt \\
+\midrule
+Stage 1 & 仅 track $+$ map（感知） & $\sim 6$ & \texttt{uniad\_base\_track\_map.\allowbreak pth} \\
+Stage 2 & 用 Stage 1 初始化，全部模块联合（track/map/motion/occ/planning） & $\sim 20$ & \texttt{uniad\_base\_e2e.\allowbreak pth} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{这恰好解决一个歧义.}\;“占据与 planner 是否端到端联合训练”——在 Stage 2，occ 与 planning 与其余模块\emph{一起}端到端联合优化（而非各自分阶段），故 SPECIFIED。这意味着 OccFormer 的占据预测误差会通过联合训练被规划目标\emph{部分纠正}，而非单向污染规划。复现时务必走完两阶段、用 Stage 1 的 ckpt 初始化 Stage 2，跳过会导致训练不稳、指标对不上。其原理是一种\textbf{课程式训练}（先立感知地基、再端到端联调），可迁移到任何“感知 $\to$ 决策”的复杂级联学习系统。
+\end{note}
+
+\subsection{关键实验数据与陷阱}
+\label{sec:de-uniad-exp}
+
+UniAD 在 \textbf{nuScenes} 上联合评估六个任务。以下数字来自官方仓库报告（已核实）：
+
+\begin{table}[H]\centering\small
+\caption{UniAD 关键指标（nuScenes，开环）}
+\label{tab:de-uniad-metrics}
+\begin{tabular}{p{0.40\textwidth} p{0.18\textwidth} p{0.32\textwidth}}
+\toprule
+指标 & 表现 & 说明 \\
+\midrule
+规划平均碰撞率（avg. collision） & $\mathbf{0.31\%}$ & 安全性核心指标，达当时 SOTA \\
+运动预测 minADE & $\mathbf{0.71}$\,m & 多智能体未来轨迹最小平均位移误差 \\
+占据预测 IoU & $\mathbf{63.4\%}$ & 未来占据栅格交并比 \\
+规划 L2（1s/2s/3s 平均） & $\sim 1$\,m 量级 & 优于此前端到端基线（分项见原论文） \\
+多任务 SOTA & 六任务达到或接近 SOTA & 证明联合不牺牲单任务 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{留意：这些是开环指标.}\;$0.31\%$ 的碰撞率亮眼，但\emph{开环碰撞率与真实闭环安全不能直接画等号}（\cref{sec:de-closedloop} 详述）。\textbf{消融实验是这篇论文的精华}：逐个去掉上游任务（tracking/mapping/motion/occ），观察规划指标——\emph{每去掉一个，规划都变差}，系统性证明了 planning-oriented 的核心论点“每个上游任务都对规划有正贡献”。好的消融不是证明方法好，而是证明每个设计选择都必要。
+\end{note}
+
+\begin{pitfall}[概念误区：以为下游模块吃的是检测框]
+读架构图时默认“TrackFormer 输出框 $\to$ MotionFormer 吃框”，按经典 pipeline 直觉理解。后果：复现/改造时把 query 接口改成框接口，信息被压扁，端到端优势消失、性能掉一大截却找不到原因。根本：UniAD 的灵魂恰恰是\textbf{不传框、传 query}，框只用于算 loss。正确做法：盯住代码里下游模块的输入张量——是 \texttt{[N\_agent, C]} 的 query，不是 \texttt{[N\_agent, 7]} 的框；改造时保持 query 接口。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：把“端到端 SOTA”理解为“可以上车了”]
+看到 UniAD 开环指标 SOTA，认为端到端已成熟。后果：忽视开环-闭环差距与安全验证缺失，对成熟度判断过于乐观。根本：nuScenes 是\emph{开环}评估（真实历史回放、不与环境闭环交互），开环好不代表闭环稳；且神经网络规划器缺乏形式化安全保证。正确做法：区分开环/闭环（\cref{sec:de-closedloop}），把“安全验证”视为未解难题（\cref{sec:de-safety}）。另一编程陷阱（陷阱 4）：BEV 时序对齐用错自车位姿 $\to$ 运动物体“拖影”、精度下降；核对 ego2global / 帧间相对位姿，用静止场景单元测试验证历史特征对齐后应与当前帧重合。
+\end{pitfall}
+
+\begin{insight}[研究视角：UniAD 为什么是 Best Paper]
+从“它作为一篇研究为什么够分量”看，三层贡献都强：\textbf{问题定义贡献}（最高级别）——它没发明新检测器/预测器，而是提出一个\emph{架构哲学}（planning-oriented），让整个领域重新思考“自驾系统该怎么组织”，比刷高某指标价值高得多，这是它拿 Best Paper 的根本；\textbf{框架贡献}——给出完整、可跑、可复现的端到端系统，把抽象哲学落地为具体 query 接口；\textbf{实验方法论贡献}——消融系统性、逐个验证“每个上游任务对规划的贡献”，用实验直接论证核心论点。评估一篇论文时问三层：它定义了新问题吗（最高）？给了完整框架吗（中）？实验论证了核心论点吗（基础）？
+\end{insight}
+
+\paragraph{局限（过渡到下一篇）。}
+\textbf{局限一}：query 数与注意力 $O(N^2)$ 开销，难高频实时 $\to$ 驱动 VAD（G3）矢量化（\cref{sec:de-vad}）。\textbf{局限二}：模仿学习的单模态倾向——Planner 回归单条轨迹，多模态场景会“平均”$\to$ 驱动扩散范式（G4），正是\textbf{下一篇 Diffusion Policy} 的核心卖点。\textbf{局限三}：开环训练、缺乏闭环与安全保证 $\to$ 驱动 G5 闭环 SOTA（PLUTO，\cref{sec:de-pluto}）。下一节顺着局限二进入扩散范式。
+
+% ════════════════════════════════════════════════════════════════
+\section{核心论文 B：Diffusion Policy —— 把轨迹生成表述为去噪}
+\label{sec:de-dp}
+
+\begin{paper}[Diffusion Policy：经动作扩散的视觉运动策略学习]\label{paper:de-dp}
+\textbf{问题}：MSE 回归把多峰动作分布平均成危险的中间值（UniAD 局限二）；如何用一种表示天然容纳多模态？
+\textbf{核心思想}\cite{chi2023diffusion}：把“从观测到动作序列”的策略，建模为一个\emph{以观测为条件的去噪扩散过程}（DDPM）——推理时从纯高斯噪声出发，在观测条件下反复调用去噪网络逐步“雕刻”出一段动作序列。
+\textbf{关键结果}：RSS 2023（扩展版 IJRR 2024）；跨 $15$ 任务、$4$ 套 benchmark 大幅超越显式策略表示（MSE/分类/混合高斯）；给出落地配方（CNN 1D-UNet / Transformer 两架构、receding-horizon、位置控制优于速度控制）。
+\textbf{与本书关系}：确立“动作序列 $=$ 去噪对象”范式，被自驾 Diffusion Planner 直接继承；其 score 视角接到 \cref{ch:mppi-variants} 的 DDPM$\leftrightarrow$MPPI 同构。
+\textbf{局限}：推理慢（多步去噪）；不保证硬约束；开环模仿、闭环未正面验证（$\to$ PLUTO）。
+\end{paper}
+
+\begin{note}
+\textbf{一个必要的提醒.}\;Diffusion Policy 诞生于\emph{机械臂操作}，动作是末端/关节指令而非车辆轨迹。本章把它列为核心，是因为它确立的“动作序列 $=$ 去噪对象”范式被自驾的 Diffusion Planner 直接继承——把“动作序列”换成“时空轨迹 $(x_t,y_t)$”，整套机制原样成立。读这一篇，重点抓\textbf{可迁移的范式}而非具体机械臂任务。
+\end{note}
+
+\paragraph{动机：为什么“回归一条轨迹”是错的表示。}
+UniAD 的 Planner 用 MSE 回归轨迹，隐含一个致命假设——\emph{目标分布是单峰高斯}。但人类驾驶/操作的决策天然多峰。把多峰分布用单峰去拟合，结果落在两峰之间的“平均值”，而平均往往是最差选择（抢行和让行的平均 $=$ 既没抢成也没让够，正好撞上）。逐个看此前尝试，理解扩散为何胜出：
+
+\begin{table}[H]\centering\small
+\caption{动作表示对比：扩散为何胜出}
+\label{tab:de-action-repr}
+\begin{tabular}{p{0.20\textwidth} p{0.32\textwidth} p{0.38\textwidth}}
+\toprule
+动作表示 & 怎么做 & 致命问题 \\
+\midrule
+MSE 回归 & 直接输出动作向量 & 多模态被平均（UniAD 的问题） \\
+离散分类 & 把动作空间离散成 bins 分类 & 高维动作 $\to$ bin 数指数爆炸（维度灾难） \\
+混合高斯 / MDN & 输出 $K$ 个高斯的混合 & 模式数 $K$ 要预设；训练易 mode collapse \\
+扩散（本文） & 学去噪过程，采样即生成 & 推理慢（多步去噪）——但表达力换来的 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[扩散不是“换了个更大的网络”，而是换了一种概率建模方式]
+若把去噪网络换成一个直接回归动作的 MLP，它就退化回 MSE 回归，多模态问题原样复发。所以扩散是从“预测分布的一个点估计”变成“学习从噪声到数据分布的随机映射”。更深一层：扩散把“直接建模复杂分布 $p(\boldsymbol{\tau}\mid\mathbf{O})$”这个难题，\textbf{拆解成一串简单的高斯去噪步}——每一步只需回答“当前这个稍微带噪的轨迹，噪声大概长什么样”（一个简单回归）。难的全局多模态分布被一串简单局部高斯步逐步逼近。这与 \cref{ch:st-trajopt} 的迭代优化（把难的非凸问题拆成一串凸子问题）在哲学上同构。
+\end{insight}
+
+\subsection{组件 ①（核心）：前向加噪与反向去噪}
+\label{sec:de-ddpm}
+
+\paragraph{论文原文（转述）。}
+论文将动作生成建模为 DDPM：定义一个前向过程逐步向动作序列添加高斯噪声，训练一个网络学习其反向（去噪）过程；以视觉观测作为去噪网络的条件输入\cite{chi2023diffusion}。其 DDPM 内核沿用 Ho 等\cite{ho2020ddpm}。
+
+\paragraph{前向过程（加噪，训练时用，无需学习）。}
+往干净动作序列 $\boldsymbol{\tau}^0$（如机械臂未来 $16$ 步位置）里一点点掺高斯噪声，掺 $K$ 次（典型 $K=100$），每次更大，最后 $\boldsymbol{\tau}^K$ 近似纯噪声。这个过程有闭式——任意一步 $k$ 的带噪动作可一步算出，不用真的迭代 $k$ 次：
+\begin{equation}
+  \boldsymbol{\tau}^k=\sqrt{\bar\alpha_k}\,\boldsymbol{\tau}^0+\sqrt{1-\bar\alpha_k}\,\boldsymbol{\epsilon},\qquad \boldsymbol{\epsilon}\sim\mathcal{N}(\mathbf{0},\mathbf{I}),
+  \label{eq:de-forward}
+\end{equation}
+其中 $\bar\alpha_k=\prod_{i=1}^{k}\alpha_i$、$\alpha_i=1-\beta_i$、$\{\beta_i\}$ 是预设噪声调度（从小到大）。$k$ 小时 $\bar\alpha_k\approx1$（基本干净），$k$ 大时 $\bar\alpha_k\approx0$（基本纯噪声）。\cref{eq:de-forward} 的闭式与 \cref{ch:mppi-variants} 中 DDPM 前向同构。
+
+\begin{note}
+\textbf{记号警告（初学者最大的混淆点，见陷阱 2）.}\;上标 $k$ 是\emph{去噪步}（denoising iteration，$0\sim K$），它与动作序列 $\boldsymbol{\tau}$ \emph{内部的时间索引} $t$（第几步动作）是\textbf{两个完全不同的维度}。$\boldsymbol{\tau}^k$ 是“去噪到第 $k$ 步的整段动作序列”，这段序列里还有 $t=1,\dots,T_p$ 个时间步。后面所有公式：上标 $=$ 去噪步、下标 $=$ 动作时间步。
+\end{note}
+
+\paragraph{反向过程（去噪，这才是要学的）。}
+训练一个网络 $\boldsymbol{\epsilon}_\theta(\boldsymbol{\tau}^k,k,\mathbf{O})$，输入带噪动作 $\boldsymbol{\tau}^k$、噪声级别 $k$、观测条件 $\mathbf{O}$，\textbf{预测当初掺进去的那团噪声 $\boldsymbol{\epsilon}$}。训练目标就是一个 MSE：
+\begin{equation}
+  \mathcal{L}=\mathbb{E}_{\boldsymbol{\tau}^0,k,\boldsymbol{\epsilon}}\big\|\,\boldsymbol{\epsilon}-\boldsymbol{\epsilon}_\theta\big(\sqrt{\bar\alpha_k}\,\boldsymbol{\tau}^0+\sqrt{1-\bar\alpha_k}\,\boldsymbol{\epsilon},\;k,\;\mathbf{O}\big)\big\|^2.
+  \label{eq:de-loss}
+\end{equation}
+
+\paragraph{推理（采样，生成动作）。}
+从纯噪声 $\boldsymbol{\tau}^K\sim\mathcal{N}(\mathbf{0},\mathbf{I})$ 开始，用学好的 $\boldsymbol{\epsilon}_\theta$ 一步步去噪（DDPM 更新式）：
+\begin{equation}
+  \boldsymbol{\tau}^{k-1}=\frac{1}{\sqrt{\alpha_k}}\Big(\boldsymbol{\tau}^k-\frac{1-\alpha_k}{\sqrt{1-\bar\alpha_k}}\,\boldsymbol{\epsilon}_\theta(\boldsymbol{\tau}^k,k,\mathbf{O})\Big)+\sigma_k\mathbf{z},\qquad \mathbf{z}\sim\mathcal{N}(\mathbf{0},\mathbf{I}),
+  \label{eq:de-reverse}
+\end{equation}
+迭代 $K$ 次得到干净动作 $\boldsymbol{\tau}^0$。
+
+\begin{insight}[多模态从哪来：随机起点落到分布的不同峰]
+每次推理的起点 $\boldsymbol{\tau}^K$ 是随机噪声——不同的随机起点，去噪后落到分布的不同峰上。采样 $10$ 次，可能得到“抢行”和“让行”两类轨迹各几条。这就是扩散天然多模态的机制：不靠预设 $K$ 个模式（如 MDN），而靠“随机起点 $+$ 确定性去噪场”自然涌现峰。这与 \cref{thm:mv-isomorphism}（采样式 MPC 的随机扰动 $+$ 加权）在“随机性诱导多样性”上同源。
+\end{insight}
+
+\begin{codebox}[Python]{Diffusion Policy：训练与推理核心（示意）}
+# 来源：real-stanford/diffusion_policy（源码结构，示意性走读）
+# 训练：加噪 -> 预测噪声 -> MSE（极简，这是扩散稳定的根源）
+def train_step(self, batch):
+    obs, action = batch['obs'], batch['action']      # action: [B, T_p, A_dim]
+    cond = self.obs_encoder(obs)                     # 观测编码为条件
+    noise = torch.randn_like(action)                 # 采样噪声 eps
+    k = torch.randint(0, self.K, (action.shape[0],)) # 随机去噪步 k
+    noisy_action = self.noise_scheduler.add_noise(action, noise, k)  # 一步加噪（前向闭式）
+    pred_noise = self.net(noisy_action, k, cond)     # eps_theta 预测噪声
+    return F.mse_loss(pred_noise, noise)             # 训练目标就是这一行
+
+# 推理：从噪声迭代去噪
+@torch.no_grad()
+def predict_action(self, obs):
+    cond = self.obs_encoder(obs)
+    traj = torch.randn(self.B, self.T_p, self.A_dim) # tau^K：纯噪声起点（多模态之源）
+    for k in self.noise_scheduler.timesteps:         # K 步去噪（DDPM）或少步（DDIM）
+        pred_noise = self.net(traj, k, cond)
+        traj = self.noise_scheduler.step(pred_noise, k, traj)   # DDPM 更新式
+    return traj                                      # tau^0：干净动作序列
+\end{codebox}
+
+\subsection{组件 ②：观测条件化与去噪架构}
+\label{sec:de-condition}
+
+\paragraph{论文原文（转述）。}
+观测通过条件机制注入去噪网络；CNN 版采用 FiLM 调制，Transformer 版采用交叉注意力\cite{chi2023diffusion}。
+
+\paragraph{用人话讲——两套去噪骨架。}
+去噪网络要“看着观测去噪”，观测怎么进网络背后是两套骨架：
+\begin{itemize}
+  \item \textbf{CNN（1D temporal U-Net）$+$ FiLM}：把动作序列当一维时间信号，用 1D 卷积 U-Net 去噪；把观测编码成一组 $(\boldsymbol{\gamma},\boldsymbol{\beta})$，对每层特征做仿射调制 $\mathrm{FiLM}(\mathbf{h})=\boldsymbol{\gamma}\odot\mathbf{h}+\boldsymbol{\beta}$。观测像一个“旋钮”逐层调制去噪过程。\emph{优点}：训练稳、对超参不敏感、小数据友好——论文\textbf{默认推荐}。
+  \item \textbf{Transformer $+$ cross-attention}：动作 token 通过 cross-attention 去 attend 观测 memory。\emph{优点}：建模长程依赖、高维动作更有潜力；\emph{代价}：对超参（学习率、warmup）更敏感，小数据上可能不如 CNN 稳。
+\end{itemize}
+
+\begin{codebox}[Python]{Diffusion Policy：两套去噪骨架共享同一训练/采样循环（示意）}
+# 来源：real-stanford/diffusion_policy（源码结构，示意性走读），只换 self.net
+# (A) CNN 版：1D U-Net + FiLM 注入观测
+class ConditionalUnet1D(nn.Module):       # diffusion_policy/model/diffusion/conditional_unet1d.py
+    def forward(self, noisy_action, k, cond):
+        t_emb = self.time_mlp(k)               # 去噪步 k 的嵌入
+        c = torch.cat([t_emb, cond], dim=-1)   # 观测条件并入
+        h = noisy_action
+        for block in self.down_blocks:
+            h = block(h, c)                    # FiLM: 用 c 生成 (gamma,beta) 调制每层
+        return self.final(h)                   # 预测噪声 eps（中间/上采样略）
+
+# (B) Transformer 版：动作 token cross-attend 观测 memory
+class TransformerForDiffusion(nn.Module):
+    def forward(self, noisy_action, k, cond):
+        x = self.input_emb(noisy_action) + self.time_emb(k)
+        return self.decoder(tgt=x, memory=cond)  # cross-attention 注入观测
+\end{codebox}
+
+\subsection{组件 ② 补充：预测噪声 \texorpdfstring{$=$}{=} 预测 score（接到采样式 MPC）}
+\label{sec:de-score}
+
+读到这里你可能有疑问：Diffusion Policy 训练网络\emph{预测噪声 $\boldsymbol{\epsilon}$}，但 Diffusion Planner（\cref{sec:de-diffplanner}）说它“学习轨迹 \emph{score 函数的梯度} $\nabla_{\boldsymbol{\tau}}\log p(\boldsymbol{\tau})$”。这两个说法是一回事吗？打通这座桥，你才能把本章扩散方法与 \cref{ch:mppi-variants} 的“score-based 生成 / 概率流 ODE / classifier guidance”全部串起来。
+
+\paragraph{结论先行。}
+\textbf{预测噪声、预测 score、预测干净样本 $\boldsymbol{\tau}^0$，是同一对象的三种等价参数化，彼此可线性换算。}对带噪分布 $p(\boldsymbol{\tau}^k)$，其 score 与噪声有干净关系：
+\begin{equation}
+  \nabla_{\boldsymbol{\tau}^k}\log p(\boldsymbol{\tau}^k)=-\frac{\boldsymbol{\epsilon}}{\sqrt{1-\bar\alpha_k}}.
+  \label{eq:de-score}
+\end{equation}
+
+\begin{insight}[“噪声 $=$ 负的 score $\times$ 系数”一旦看穿，三篇扩散工作合为一体]
+直觉上：score 指向“概率更高的方向”，也就是“更干净、噪声更少的方向”；而噪声 $\boldsymbol{\epsilon}$ 正是“当前样本偏离干净样本的方向”。两者\emph{方向相反、差一个缩放系数}——所以“预测 $\boldsymbol{\epsilon}$”和“预测 score”携带同一信息。\cref{eq:de-score} 正是 \cref{ch:mppi-variants} Tweedie 恒等式（\cref{sec:mv-mbd}）的另一面（噪声与后验均值/score 互通）。这座桥通向三处：① \textbf{score-based 与 DDPM 的统一}\cite{song2019score}——两套理论是同一框架的两种视角，Diffusion Planner 选 score 视角、Diffusion Policy 选 $\boldsymbol{\epsilon}$ 视角，本质等价；② \textbf{概率流 ODE}——知道 score 后反向去噪可写成确定性 ODE，用高阶数值解法少步求解（DDIM、DPM-Solver 的根基）；③ \textbf{classifier guidance}——要让生成偏向“满足某约束”，只需在 score 上\emph{加一项约束的梯度} $\nabla_{\boldsymbol{\tau}}\log p(\text{约束}\mid\boldsymbol{\tau})$，这就是 Diffusion Planner 把安全/风格偏好注入生成的数学机制，也是“生成-投影”模板在扩散里最优雅的体现——\textbf{投影不是事后做，而是融进每一步去噪的 score 里}。
+\end{insight}
+
+\subsection{组件 ③：receding-horizon 执行——这里才有“时间”}
+\label{sec:de-receding}
+
+这是把“生成一段动作”变成“持续控制”的关键，也是与本部“时空”最相关的一环。三个 horizon：
+
+\begin{table}[H]\centering\small
+\caption{Diffusion Policy 的三个 horizon}
+\label{tab:de-horizons}
+\begin{tabular}{p{0.10\textwidth} p{0.34\textwidth} p{0.46\textwidth}}
+\toprule
+符号 & 名字 & 含义 \\
+\midrule
+$T_o$ & observation horizon & 用过去 $T_o$ 步观测作为条件 \\
+$T_p$ & prediction horizon & 一次预测未来 $T_p$ 步动作 \\
+$T_a$ & action execution horizon & 实际只执行前 $T_a$ 步，然后重新观测预测 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+典型 $T_a<T_p$（预测 $16$ 步只执行 $8$ 步），这与 \cref{ch:st-corridor,ch:st-trajopt} 及 MPC 的\textbf{滚动时域}思想完全一致——预测一段、执行一截、滚动重规划。$T_a$ 太大反应慢（环境变了还在执行旧动作），太小则丢失扩散生成的时序一致性。
+
+\begin{note}
+\textbf{action chunk 与跟踪误差的权衡（已核实）.}\;论文把 receding-horizon 列为核心技术贡献之一。一个被后续工作反复确认的现象是——\textbf{$T_a$（action chunk）越大，去噪查询越少、推理越省，但轨迹跟踪误差越大}（连续两次生成之间环境已变，旧轨迹越执行越偏）。所以 $T_a$ 不是越大越省越好，而是“省算力”与“跟得准”的折中。这与 UniAD 碰撞优化的 \texttt{N\_ITER}、PLUTO 的扰动幅度一样，是个\emph{没有万能默认值、必须按任务调}的关键超参。消融确认 $T_a=8$ 为多数任务最优。
+\end{note}
+
+\subsection{关键实验数据与工程命脉}
+\label{sec:de-dp-exp}
+
+Diffusion Policy 的说服力来自\textbf{广度 $+$ 受控消融}。以下数字均已核实：
+
+\begin{table}[H]\centering\small
+\caption{Diffusion Policy 关键结果}
+\label{tab:de-dp-metrics}
+\begin{tabular}{p{0.24\textwidth} p{0.66\textwidth}}
+\toprule
+维度 & 结果（已核实） \\
+\midrule
+任务覆盖 & 跨 $15$ 任务、$4$ 套 benchmark（仿真 $+$ 真机），平均成功率显著高于 LSTM-GMM / IBC / BET \\
+长程多模态 & Block Push 的 p2 提升 $\mathbf{32\%}$、Kitchen 的 p4 提升 $\mathbf{213\%}$——多子目标任意顺序完成的场景优势最大 \\
+action horizon & 消融确认 $T_a=8$ 步为多数任务最优（太小反应快但时序不一致，太大一致但反应慢） \\
+位置 vs 速度控制 & 位置控制\emph{显著优于}速度控制；耐人寻味的是基线方法反而偏好速度控制 \\
+延迟鲁棒性 & 位置控制可容忍\emph{多达 4 步延迟}仍保持峰值；速度控制受延迟影响大得多 \\
+推理速度 & DDIM 训练 $100$ 步 / 推理 $10$ 步，在 Nvidia 3080 上做到 $\mathbf{0.1}$\,s 延迟——上真机闭环的关键 \\
+训练稳定性 & 最优超参跨任务基本一致；对比之下 IBC（隐式 BC）训练易不稳 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{两个值得记住的发现（论文精华，常被忽略）。}
+\begin{enumerate}
+  \item \textbf{对空闲动作（idle actions）的鲁棒性}：遥操作演示里常有“暂停”——机械臂停在原地，产生一串几乎相同的位置/近零速度动作。单步策略（BC-RNN、IBC）易\emph{过拟合这种暂停}，真机一遇就“卡住”不动。而 Diffusion Policy 预测的是\emph{一段}动作序列，天然跨过空闲段、不会卡死。这是“预测序列而非单步”的意外红利——它不只解决多模态，还顺带治了“卡顿”。
+  \item \textbf{位置控制为什么赢}：直觉上速度控制更“平滑”，但位置控制对延迟鲁棒得多——位置目标即使晚到几毫秒，机械臂仍能到大致正确位姿；速度命令一旦延迟就\emph{过冲}（积分放大误差）。这呼应本章反复出现的主题——\textbf{速度/增量类输出会累积误差，位置/绝对类输出更稳}，对自驾轨迹生成同样有借鉴意义。
+\end{enumerate}
+
+\begin{note}
+\textbf{论文没告诉你的（扩散策略的工程命脉）.}\;\rebuilt{以下来源待逐行核对：}\textbf{EMA 权重}——去噪网络用指数移动平均权重（decay$\approx0.9999$）做推理，对稳定\emph{至关重要}，关掉性能大跌（论文提及但易忽视，代码默认开启）；\textbf{噪声调度}——squared-cosine 比线性好，训练/推理调度必须一致；\textbf{推理步数}——DDPM 默认 $100$ 步太慢，换 DDIM 可降到 $\sim 10$ 步而质量损失小；\textbf{位置 vs 速度控制}——输出位置比输出速度更稳（速度误差会积分漂移）。EMA 是\emph{所有扩散/生成模型训练的通用稳定器}（也用于 BYOL 的 target network）：它对训练轨迹上的权重做指数平滑，等价于一种隐式模型集成，抹平高方差训练带来的权重震荡。
+\end{note}
+
+\begin{pitfall}[概念误区：搞错去噪网络的预测目标（预测噪声 vs 预测样本）]
+以为网络直接预测干净动作 $\boldsymbol{\tau}^0$，而代码/默认实现预测的是噪声 $\boldsymbol{\epsilon}$。后果：loss 看似能降，但采样出的动作发散或退化，调试极难。根本：DDPM 有多种等价参数化（预测 $\boldsymbol{\epsilon}$ / 预测 $\boldsymbol{\tau}^0$ / 预测 score，\cref{sec:de-score}），更新式各不相同；混用训练目标与采样更新式必然出错。正确做法：确认 \texttt{noise\_scheduler} 的 \texttt{prediction\_type}（\texttt{epsilon} 还是 \texttt{sample}），并用配套更新式；改参数化时整套同步改。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：把去噪步 $k$ 和动作时间步 $t$ 混为一谈]
+看到 $\boldsymbol{\tau}^k$ 以为是“第 $k$ 个动作”。后果：张量维度对不上（去噪步是标量条件，动作时间步是序列长度），代码里把 $k$ 喂到了时间维。根本：扩散有两个“步”——去噪迭代步（上标 $k$）和动作序列时间步（下标 $t$），初学极易混淆。正确做法：牢记上标 $=$ 去噪步（标量、做条件），下标 $=$ 动作时间步（序列维度）。另两个编程陷阱：推理用了非 EMA 权重、或训练/推理 schedule 不一致 $\to$ 性能比论文差一大截且“看起来代码没错”——推理强制用 EMA 权重、schedule 严格一致；以为扩散总比回归好 $\to$ 单模态/低维/强实时任务上多步推理拖慢系统、效果却不比 MSE 回归好，先判断任务是否真有多模态结构。
+\end{pitfall}
+
+\paragraph{局限（过渡到下一篇）。}
+\textbf{局限一}：推理慢（多步去噪），对高频控制不友好 $\to$ 驱动 DDIM/consistency 加速，也驱动 Diffusion Planner 在自驾做联合去噪与少步推理（\cref{sec:de-diffplanner}）。\textbf{局限二}：不保证硬约束，生成轨迹可能违反动力学/碰撞约束 $\to$ 驱动“扩散 $+$ 投影”范式（Autoware 的 diffusion\_planner $+$ safety\_filter，\cref{sec:de-safety}）。\textbf{局限三}：开环模仿、闭环未正面验证 $\to$ 把我们带到\textbf{核心论文 C：PLUTO}（\cref{sec:de-pluto}）。
+
+\paragraph{桥接：扩散从机械臂搬到自驾要改什么。}
+同一套去噪范式跨这么远的两个领域，到底哪些不变、哪些必须改？
+
+\begin{table}[H]\centering\small
+\caption{扩散范式：机械臂 vs 自驾的适配}
+\label{tab:de-arm-vs-av}
+\begin{tabular}{p{0.16\textwidth} p{0.26\textwidth} p{0.26\textwidth} p{0.20\textwidth}}
+\toprule
+维度 & 机械臂（Diffusion Policy） & 自驾（Diffusion Planner） & 为什么不同 \\
+\midrule
+去噪对象 & 末端/关节动作序列 & 自车 $+$ 他车时空轨迹 $(x_t,y_t)$ & 自驾须建模与他车交互 \\
+条件输入 & 视觉观测（图像/点云） & BEV $+$ agent 历史 $+$ 地图 $+$ 导航 & 自驾场景结构化程度高 \\
+多体交互 & 通常无 & 核心——联合去噪逼近博弈均衡 & 道路是多智能体博弈场 \\
+实时性 & 可容忍多步 & 须 $\sim 10$--$20$\,Hz，倒逼少步采样 & 车速高、反应窗口短 \\
+安全后果 & 抓取失败可重试 & 碰撞不可逆，须安全兜底 & 安全等级根本不同 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[内核不变、外壳适配：迁移一个范式先分离它的不变内核与领域外壳]
+扩散范式的\textbf{数学内核（去噪、score、guidance）跨领域完全不变}——这正是一篇机械臂论文能成为自驾方法范式源头的原因。变的只是三件事：去噪对象的语义（动作 $\to$ 多体轨迹）、交互建模的有无（单体 $\to$ 博弈）、实时与安全的标准（可重试 $\to$ 不可逆）。看清这点，你就能把扩散范式迁移到任何新领域（无人机集群、多臂协作、交通流控制），只需回答这三个适配问题。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{核心论文 C：PLUTO —— 把模仿学习规划推到闭环超越规则派}
+\label{sec:de-pluto}
+
+\begin{paper}[PLUTO：把基于模仿学习的自动驾驶规划推到极限]\label{paper:de-pluto}
+\textbf{问题}：UniAD/Diffusion Policy 都只在开环证明自己；自驾真正的考场是\emph{闭环}。在 PLUTO 之前领域共识是“学习派开环好看、闭环不如规则派”——能否推翻它？
+\textbf{核心思想}\cite{cheng2024pluto}：通过\emph{纵横解耦感知的轨迹表示}（longitudinal-lateral aware）、\emph{对比模仿学习}（CIL）、\emph{强数据增强}三件套，把纯模仿学习的规划性能首次推到在 nuPlan 闭环 benchmark 上超越精心设计的规则派规划器。
+\textbf{关键结果}：首次用\emph{纯模仿学习}（非 RL、非规则）在 nuPlan 闭环超越规则派（结论性贡献）；CIL 构造负样本教模型“什么是坏轨迹”，缓解分布偏移。
+\textbf{与本书关系}：本章 G5 闭环突破；其“训练时把安全/几何约束做成辅助损失”与 UniAD“推理时碰撞投影”是给学习式规划器注入安全先验的两个不同时机（\cref{sec:de-aux}）。
+\textbf{局限}：受限专家数据（$\to$ Hydra-MDP 多教师蒸馏）；闭环 SOTA 但无形式化安全保证（$\to$ 安全过滤，\cref{sec:de-safety}）；仍是任务专用模型（$\to$ EMMA）。
+\end{paper}
+
+\subsection{动机：闭环为什么比开环难得多}
+\label{sec:de-closedloop}
+
+这是本节最重要的概念，必须讲透——它是理解一切“学习式规划”成熟度的标尺。
+
+\paragraph{开环评估（open-loop）。}
+拿一段真实驾驶日志，每个时刻把\emph{真实的历史}喂给模型，让它预测下一段轨迹，与\emph{真实的未来}比 L2 误差。关键特征：\textbf{模型的输出不影响下一步的输入}——下一步仍喂真实历史。误差不累积。UniAD 在 nuScenes 就是这么评的。
+
+\paragraph{闭环评估（closed-loop）。}
+模型输出轨迹后，仿真器\emph{真的让车按这条轨迹走}，车到了新位置，再把\emph{这个由模型自己造成的新处境}喂回模型。关键特征：\textbf{输出反馈成输入，误差会累积、会自我放大}。
+
+\paragraph{两者的鸿沟来自模仿学习的两大固有病。}
+\begin{itemize}
+  \item \textbf{分布偏移（covariate shift）}：模型只在专家轨迹附近训练过。闭环中一旦有微小偏差，车进入专家从未到过的状态，模型没见过、不知所措，偏差进一步放大——雪球效应。这正是 DAgger\cite{ross2011dagger} 等方法试图解决的经典难题。
+  \item \textbf{因果混淆（causal confusion）}：模型可能学到伪相关（“前车刹车灯亮 $\to$ 我刹车”）而非真因果。开环下伪相关常“碰巧对”，闭环下一旦情境变化就失效。
+\end{itemize}
+
+\begin{note}
+\textbf{一个反直觉的实证（来自 PLUTO 前作 PlanTF，CIL 的动机源头）.}\;\rebuilt{以下转述自 PlanTF\cite{cheng2023plantf}，待核对：}PlanTF 系统研究后发现一个违反直觉的现象——\textbf{给模型喂自车的历史运动轨迹，反而让闭环性能显著下降}；只用自车\emph{当前位姿（位置 $+$ 航向）}表现最好；更甚者，连速度、加速度、转向角这些“显然对规划有用”的运动学量，喂进去都会让闭环变差。原因正是 shortcut learning：模型发现“延续我自己过去的运动”是个省力捷径（开环下碰巧对，因为人类驾驶有惯性），于是\emph{学会了外推自己的历史而非真正理解场景}——这就是因果混淆的具体形态。PlanTF 的解法是一个 attention-based state dropout encoder（随机丢弃部分自车状态特征，逼模型不依赖捷径）。这个发现直接启发了 PLUTO 的对比学习——既然模型会偷懒学捷径，那就\emph{主动造出“看起来像捷径但其实是坏轨迹”的负样本}，逼它学会判别好坏而非外推历史。
+\end{note}
+
+\begin{insight}[模仿学习闭环差的根因，与缩小鸿沟的三条路]
+根因是\textbf{训练分布（专家轨迹）与测试分布（模型自己造成的状态）不一致}。缩小这个鸿沟有三条路：① 让模型见过更多偏离状态（数据增强）；② 让模型知道什么是坏（对比学习）；③ 让表示对扰动鲁棒（纵横解耦）。PLUTO 三管齐下——它的成功不是某个网络创新，而是\textbf{对“模仿学习为什么闭环差”这个问题的系统性回应}。反事实推理：若 PLUTO 只做标准 BC、不加对比学习与数据增强，结果就是 $2021$--$2022$ 年 nuPlan 上的普遍现象——开环 L2 漂亮、闭环一放开就漂移/压线/急刹、输给简单规则派（PDM/IDM）。
+\end{insight}
+
+\paragraph{骨架。}
+PLUTO 延续 query-based 规划器（前作 PlanTF）的骨架：把 agent/map/ego 编码成 token，用 Transformer 交互后解码自车轨迹。三个关键创新如下，重点展开\emph{对比模仿学习}。
+
+\subsection{组件 ①：longitudinal-lateral aware 轨迹表示}
+\label{sec:de-lonlat}
+
+\paragraph{论文原文（转述）。}
+模型对自车轨迹的纵向（沿道）与横向（偏移）分量分别建模/感知，以更好地刻画驾驶行为\cite{cheng2024pluto}。
+
+\paragraph{用人话重新讲一遍。}
+回忆 \cref{sec:fs-frenet} 的 Frenet 直觉——驾驶行为天然分纵向（快慢、跟车、刹停）和横向（变道、居中、绕行）两条相对独立的轴。PLUTO 在 query/解码设计上显式区分这两个分量（而非在笛卡尔 $(x,y)$ 里混着学），让模型分别“管快慢”和“管左右”。这与 \cref{sec:fs-sl} 的 Frenet $(s,l)$ 分解一脉相承——\textbf{经典栈用 Frenet 解耦坐标，PLUTO 用网络结构解耦语义}，殊途同归。
+
+\paragraph{为什么解耦有用（深一层）。}
+把纵横揉在 $(x,y)$ 里学，网络要同时操心“往哪走”和“走多快”，两个语义纠缠在同一组输出里——一个变道动作和一个加速动作在 $(x,y)$ 空间会相互干扰梯度。解耦后：横向头专注“选哪条参考线/车道、横向偏移多少”，纵向头专注“在选定路径上的速度剖面”。这让多模态\emph{结构化}——横向的“变道 vs 保持”和纵向的“加速 vs 减速”可独立组合，天然覆盖“变道且加速”“保持且减速”等多种驾驶意图，而不必像单一回归头那样把它们平均掉。
+
+\begin{codebox}[Python]{PLUTO：纵横解耦解码（示意）}
+# 来源：jchengai/pluto，models（源码结构，示意性走读）
+class PlutoDecoder(nn.Module):  # 示意：横向(参考线/车道选择+偏移) 与 纵向(速度剖面) 分别解码
+    def forward(self, ego_query, scene_tokens, reference_lines):
+        # 横向分支：在若干候选参考线上选择 + 预测横向偏移 -> 多模态来源之一
+        lat_logits = self.lateral_head(ego_query, reference_lines)   # [K_ref] 选哪条线
+        lat_offset = self.offset_head(ego_query, reference_lines)    # 沿线横向偏移
+        # 纵向分支：在选定几何上预测速度/纵向位置剖面
+        lon_profile = self.longitudinal_head(ego_query, scene_tokens)  # 速度剖面 v(t)
+        # 合成：横向(路径) x 纵向(速度) -> 完整时空轨迹 (x_t, y_t)
+        traj = self.compose(lat_logits, lat_offset, lon_profile, reference_lines)
+        return traj, lat_logits     # lat_logits 用于多模态/对比
+\end{codebox}
+
+\begin{note}
+\textbf{论文-代码差异.}\;论文把“纵横感知”讲成一个\emph{表示原则}，但代码里它落地为\textbf{两个独立解码头 $+$ 参考线机制}——“参考线”（reference lines，来自地图中心线的候选路径）论文正文着墨不多，却是横向多模态的实际载体。复现时若忽略参考线、直接回归 $(x,y)$，“纵横感知”就名存实亡（这也是为什么 Diffusion Planner 把“使用预搜索参考线”单独标注——它降低规划难度，是个不可忽视的先验输入）。
+\end{note}
+
+\subsection{组件 ②（核心）：对比模仿学习（CIL）}
+\label{sec:de-cil}
+
+\paragraph{论文原文（转述）。}
+引入对比学习目标：构造正样本（专家或高质量轨迹）与负样本（扰动的/不良的轨迹），通过对比损失拉开二者在表示空间的距离，使模型习得对轨迹质量的判别能力\cite{cheng2024pluto}。
+
+\paragraph{用人话重新讲一遍。}
+标准模仿（BC）只做一件事：让模型输出\emph{贴近专家轨迹}。问题是——它\emph{只见过好的}，对“坏”没有任何概念。闭环中模型偏离专家分布后，它不知道自己正在变坏，于是越走越偏。对比学习补的就是这块：除了正样本（专家轨迹），额外造一批\textbf{负样本}（对专家轨迹做扰动，生成会压线/碰撞/急刹的“坏轨迹”），用一个对比损失（InfoNCE 风格）把正样本表示拉近、负样本推远——\textbf{让模型学会“什么是好、什么是坏”，而不只是“模仿好”}。这样闭环中模型对“我正在变坏”有了感知，能往回拉。
+
+类比：标准 BC 像只看正确答案背题的学生，遇到没背过的题就懵；对比学习像同时研究错题集的学生，知道哪些是陷阱，遇到偏题也能判断对错。边界：错题集类比强调“见过坏例子”，但对比学习更进一步——它在\emph{表示空间}显式拉开好坏，而不只是记住几个坏例子。
+
+\begin{codebox}[Python]{PLUTO：对比模仿损失 InfoNCE（示意）}
+# 来源：jchengai/pluto，contrastive 模块（源码结构，示意性走读）
+def contrastive_loss(self, traj_feat, pos_feat, neg_feats, tau=0.1):
+    # traj_feat : 模型预测轨迹的表示; pos_feat : 正样本(专家/高质量)表示
+    # neg_feats : 负样本(扰动/碰撞/压线)表示 [B, N_neg, D]
+    pos_sim = F.cosine_similarity(traj_feat, pos_feat, dim=-1) / tau
+    neg_sim = F.cosine_similarity(traj_feat.unsqueeze(1), neg_feats, dim=-1) / tau  # [B, N_neg]
+    logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)   # InfoNCE
+    labels = torch.zeros(logits.shape[0], dtype=torch.long)      # 正样本在 index 0
+    return F.cross_entropy(logits, labels)
+# 总损失 = 模仿回归 loss + lambda * 对比 loss（lambda 权重论文给范围，码中具体值需核实）
+\end{codebox}
+
+\begin{note}
+\textbf{论文没告诉你的（CIL 的“投影头”）.}\;\rebuilt{以下来源待核：}代码开关 \texttt{model.\allowbreak use\_hidden\_proj=true} 透露一个论文正文未强调的细节——对比损失不直接作用在轨迹特征上，而是先过一个\textbf{隐藏投影头}（hidden projection head）把特征映射到一个专门的对比空间再算相似度。这与 SimCLR 的设计如出一辙（对比学习在投影空间做、下游任务用投影前的表示）。为什么要投影头？因为“对比判别好坏”和“回归预测轨迹”需要的表示不完全一样，投影头让两个目标各取所需、互不干扰。复现时若把对比损失直接加在主干特征上（不加投影头），效果会打折——这是个容易踩的隐藏坑。
+\end{note}
+
+\subsection{组件 ③：数据增强——主动制造“偏离状态”}
+\label{sec:de-augment}
+
+\paragraph{论文原文（转述）。}
+引入一组数据增强策略，对自车状态/轨迹施加扰动以调节驾驶行为、缓解模仿学习的复合误差（compounding error）\cite{cheng2024pluto}。
+
+\paragraph{用人话重新讲一遍。}
+既然闭环的病根是“模型没见过偏离专家的状态”，那就在训练时\emph{主动制造}这些状态：对自车初始状态做扰动（横向平移、航向偏转、速度扰动），让模型学会“从一个偏离的处境如何开回正轨”。这本质上是 DAgger\cite{ross2011dagger} 思想的离线近似——不在线收集纠错数据，而是离线合成偏离状态 $+$ 专家纠错目标。\textbf{关键在“扰动后目标怎么定”}：只把起点挪歪还不够，还要给网络一个“从歪掉的起点该怎么开回去”的监督目标——扰动自车初始位姿后，用一个简单的几何/控制规则生成一条“从扰动点平滑回归到原专家轨迹”的纠正轨迹作为新标签。这样模型学到的不是“复读专家轨迹”，而是“无论我现在偏到哪，都知道怎么修正回正轨”——这正是闭环鲁棒性的来源。
+
+\begin{codebox}[Python]{PLUTO：自车状态扰动 + 纠正目标（示意）}
+# 来源：jchengai/pluto，数据增强（源码结构，示意性走读）
+def augment_ego_state(ego_traj, ref_path):
+    # 1) 对自车初始状态施加扰动（横移/航向/速度）
+    dx = uniform(-LAT_MAX, LAT_MAX)        # 横向平移幅度（PARTIAL，需核实范围）
+    dyaw = uniform(-YAW_MAX, YAW_MAX)      # 航向偏转
+    perturbed_init = apply_perturb(ego_traj[0], dx, dyaw)
+    # 2) 生成"从扰动点回归专家轨迹"的纠正目标（关键：不是照搬专家）
+    corrected_traj = smooth_return_to_path(perturbed_init, ref_path)
+    return perturbed_init, corrected_traj  # 新(状态, 标签)对
+\end{codebox}
+
+\begin{insight}[数据增强与 CIL 是一体两面：原料厂与加工车间]
+在 PLUTO 里，数据增强还有第二个身份——它正是 CIL 造正负样本的\emph{手段}。论文设计了\textbf{六个增强函数}，分两类：\emph{正增强 $T^+$}（保留 GT 轨迹合理性，如自车状态小扰动、丢弃与自车无交互的 agent——变换后原专家轨迹\emph{仍然是好的}，作正样本）；\emph{负增强 $T^-$}（构造会压线、碰撞、不合理的轨迹——看起来是合法输出但实际违反驾驶质量，作负样本喂给对比损失）。现在能看清 PLUTO 三件套不是三个孤立模块——\textbf{数据增强是“原料厂”，对比学习是“加工车间”}：增强函数批量生产正/负样本，CIL 用它们在表示空间拉开好坏。所以“造负样本质量决定 CIL 成败”本质上是说\emph{负增强函数设计得好不好}——CIL 不 work，先去查负增强函数，而不是调对比损失的温度。
+\end{insight}
+
+\subsection{组件 ④：辅助损失——被名字“剧透”的第三件贡献}
+\label{sec:de-aux}
+
+PLUTO 官方 checkpoint 叫 \texttt{pluto\_1M\_aux\_cil}——\texttt{cil} 是对比模仿学习，\texttt{aux} 就是这里的\textbf{辅助损失}（auxiliary loss）。它是论文摘要明确列出的三大改进之一（“一种广泛适用、可批量高效计算的辅助损失计算方法”），但比起 CIL 容易被忽略。
+
+\paragraph{用人话讲。}
+主损失是“预测轨迹贴近专家”，但只靠它，模型对“轨迹是否压线、是否离障碍太近、是否撞上他车预测”这些\emph{几何/安全属性}没有直接监督。辅助损失就是把这些属性显式做成附加的可微目标——轨迹点到车道边界的距离约束、与他车预测轨迹的碰撞惩罚、运动学平滑项——和主损失一起优化。\textbf{关键在“全程可微”}：辅助损失计算分三步——\emph{投影}（把轨迹点投到参考线/边界上算横向距离）、\emph{插值}（在离散轨迹点间插值以连续地算约束）、\emph{损失计算}（把违反量变成标量损失），三步全部可微，所以能和主模仿损失一起反传、端到端训练，而非一个不可导的事后检查。再加上\emph{可批量向量化}（在一个 batch 上并行算所有场景的几何约束），它在百万级数据训练中才负担得起。
+
+\begin{insight}[辅助损失 vs 碰撞后优化：训练时管 vs 推理时管]
+这与 UniAD 组件 ⑥ 的“碰撞后优化”是\textbf{两种思路}——UniAD 在\emph{推理时}对输出轨迹做一次碰撞投影（事后修正，\cref{sec:de-collision}），PLUTO 把安全/几何约束做成\emph{训练时}的辅助损失（让模型在学习阶段就内化这些约束）。前者是“生成-投影”，后者是“约束内化”。两者可以叠加，但代表了给学习式规划器注入安全先验的两个不同时机——记住这个对比，你就掌握了“训练时管 vs 推理时管”的设计选择。
+\end{insight}
+
+\begin{note}
+\textbf{PLUTO 复现命脉（部分已核实）.}\;\rebuilt{标 PARTIAL 者待逐行核对：}负样本如何生成（六个增强函数、正负两类，PARTIAL）——负样本质量直接决定 CIL 有没有用；数据增强扰动幅度分布（PARTIAL）——太小没效果，太大引入不现实状态；对比 loss 权重 $\lambda$ 与温度 $\tau$（码中具体值需核实）；\textbf{CIL 启用开关}（\emph{已核实}）——\texttt{model.\allowbreak use\_hidden\_proj=true} $+$ \texttt{custom\_trainer.\allowbreak use\_contrast\_loss=true}，复现 CIL 必须打开这两个开关否则退化成普通模仿；nuPlan 闭环的 reactive/non-reactive 设置（评估脚本）——背景车是否对你反应，闭环难度差异大。
+\end{note}
+
+\subsection{关键实验数据与陷阱}
+\label{sec:de-pluto-exp}
+
+PLUTO 在 nuPlan 标准闭环 benchmark 上评估。先理解这套 benchmark 的构成（已核实），才能读懂“超越规则派”的分量：
+
+\begin{table}[H]\centering\small
+\caption{nuPlan 闭环 benchmark 构成}
+\label{tab:de-nuplan-bench}
+\begin{tabular}{p{0.22\textwidth} p{0.68\textwidth}}
+\toprule
+评估设置 & 含义 \\
+\midrule
+Test14-random & 从 $14$ 类场景各随机采样固定的一批，常规难度 \\
+Test14-hard & 用规则派 PDM-Closed 跑每类 $100$ 个场景、\emph{取表现最差的 $20$ 个}——专挑长尾难例 \\
+Val14 & 验证集划分，常用于横向对比 \\
+NR / R & non-reactive（背景车回放）/ reactive（背景车用 IDM 等对你反应）两种模式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{PLUTO 核心结果（精确分数见原论文）}
+\label{tab:de-pluto-metrics}
+\begin{tabular}{p{0.24\textwidth} p{0.66\textwidth}}
+\toprule
+维度 & 结果 \\
+\midrule
+nuPlan 闭环综合得分 & \textbf{首次以纯模仿学习超越当时最强规则/混合基线 PDM}——全章里程碑级结论 \\
+Test14-hard（长尾） & 在专挑的难例上仍保持竞争力，体现三件套对分布偏移的缓解 \\
+开环 vs 闭环 & PLUTO 强调闭环；开环好 $\neq$ 闭环好，而 PLUTO 两者俱佳（对照 UniAD 只有开环） \\
+消融 & 去掉 CIL / 去掉数据增强 / 去掉纵横感知，闭环分数均下降，证明三件套各有贡献 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{为什么“超越 PDM”这么重要.}\;PDM（《Parting with Misconceptions\dots》，CoRL 2023\cite{dauner2023pdm}）是 nuPlan 上长期霸榜的规则/混合基线，闭环得分极高\rebuilt{（CLS$\approx 92$ 量级，待核）}。在 PLUTO 之前，学习派普遍\emph{开环好看、闭环输给 PDM}——这是领域共识。PLUTO 第一次用\textbf{纯模仿学习}（非 RL、非规则）在闭环把这个共识打破。这不是某个指标涨了几个点，而是\textbf{改变了“学习 vs 规则谁更强”的判断}——结论性贡献的价值正在于此。
+\end{note}
+
+\begin{pitfall}[思维陷阱（全章最重要）：用开环指标判断闭环性能]
+看到某模型开环 L2 低，就认为它能在真实闭环开好。后果：上车/闭环测试中漂移、压线、急刹，与开环指标严重背离，决策误判。根本：开环不累积误差，闭环累积；开环-闭环鸿沟是模仿学习的本质特征。正确做法：\textbf{永远以闭环指标为准评估规划器}；报告开环时必须同时报闭环（PLUTO 的做法）。
+\end{pitfall}
+
+\begin{pitfall}[论文误导：忽视负样本/增强的构造细节，CIL 失效]
+照搬“加个对比 loss”，但负样本随便造或不造。后果：对比 loss 加了却没用，闭环不见提升，误判为“CIL 没用”。根本：CIL 的效果\textbf{全系于负样本质量}，而负样本构造细节论文给得不全（PARTIAL）。正确做法：从代码提取负样本生成逻辑（扰动类型/幅度），确保负样本是“像样但确实坏”的轨迹。另两个陷阱：把 PLUTO 当强化学习（它是\emph{纯模仿 $+$ 对比 $+$ 增强}，不用 RL/在线交互/奖励工程，对比学习是自监督式辅助目标不是 RL 奖励）；nuPlan 闭环接口的坐标系（global vs ego）/时序坑（observation/trajectory 有特定坐标与时间约定，按 \texttt{pluto\_planner} 接口约定转换，用静止/直行场景先验证接口正确）。
+\end{pitfall}
+
+\begin{insight}[PLUTO 在技术史上的位置：承上启下]
+把 G2$\to$G5 的脉络连起来看——UniAD（G2）确立了 query 端到端架构但只在开环验证；领域随后发现 nuScenes 开环不可信、转向 nuPlan 闭环；PlanTF（PLUTO 前作）系统研究了闭环所需的“关键特征 $+$ 数据增强”并指出 imitation gap；PLUTO 在此基础上加入对比学习与辅助损失，\textbf{第一个在闭环越过规则派这道坎}。理解这条“架构 $\to$ 评估觉醒 $\to$ 闭环攻坚”的线，你就懂了为什么 $2023\to2024$ 这一年领域重心从“刷开环 SOTA”急速转向“闭环能不能赢规则派”——PLUTO 正是这个转向的句号。
+\end{insight}
+
+\paragraph{局限（过渡到非核心群）。}
+\textbf{局限一}：受限专家数据——模仿的天花板是专家质量与覆盖，罕见场景仍是软肋 $\to$ 驱动 Hydra-MDP 的\emph{多教师知识蒸馏}（\cref{sec:de-hydra}）。\textbf{局限二}：闭环 SOTA 但安全无形式化保证 $\to$ 引向安全过滤兜底架构（\cref{sec:de-safety}）。\textbf{局限三}：仍是任务专用模型，面对开放世界长尾、需常识推理的场景力不从心 $\to$ 驱动 G6 大模型驾驶 EMMA（\cref{sec:de-emma}）。
+
+% ════════════════════════════════════════════════════════════════
+\section{非核心论文群：演进线上的其余关键节点}
+\label{sec:de-rest}
+
+下面以精简模式解读四个非核心节点——它们或是三篇核心论文某条局限的回应，或是另一条平行路线。源稿对这些工作的事实层标注较粗，存疑处照登。
+
+\subsection{Diffuser：扩散规划的前驱}
+\label{sec:de-diffuser}
+
+\begin{paper}[Diffuser：用于灵活行为合成的规划即扩散]\label{paper:de-diffuser}
+\textbf{问题}：能否把“规划”本身表述为生成——直接对整条状态-动作轨迹做扩散，而非逐步决策？
+\textbf{核心思想}\cite{janner2022diffuser}：把离线 RL 的轨迹优化建模为对完整轨迹 $\boldsymbol{\tau}=(s_t,a_t)_{t}$ 的去噪扩散；目标/约束/奖励通过 guidance（在去噪 score 上加一项梯度）注入，从而“灵活”地合成满足不同目标的行为。
+\textbf{关键结果}：ICML 2022；确立“轨迹 $=$ 去噪对象 $+$ guidance 注入目标”范式，是 Diffusion Policy / Diffusion Planner 的共同前驱。
+\textbf{与本书关系}：它给出 \cref{sec:de-score} classifier guidance 的最早规划落地；与 \cref{ch:mppi-variants} 的“扩散即采样优化”一脉相承。
+\textbf{局限}：作为前驱主要在 D4RL 等离线 RL benchmark，未触及自驾闭环与实时性。
+\end{paper}
+
+\subsection{VAD：矢量化端到端（回应 UniAD 局限一）}
+\label{sec:de-vad}
+
+VAD/VADv2\cite{jiang2023vad} 回应 UniAD 的局限一（密集 BEV $+$ 大量 query 的 $O(N^2)$ 开销）。核心：用\textbf{矢量化}的实例表示（车道、agent 用矢量/折线而非密集栅格）替代密集 BEV，大幅降低计算与显存、提速。代价是矢量化需要更强的结构先验、对感知质量更敏感。它与 UniAD 是“同一目标（端到端规划）下精度-效率权衡的两个点”。\pz{VAD/VADv2 的会议、年份与具体提速倍数需联网核对；ICCV 2023 / 2024 的归属待确认。}
+
+\subsection{Hydra-MDP：多教师蒸馏（回应 PLUTO 局限一）}
+\label{sec:de-hydra}
+
+Hydra-MDP\cite{li2024hydramdp} 回应 PLUTO 的局限一（受限单一专家）。核心：\textbf{多教师知识蒸馏}——不止学人类一个老师，而是让 Traffic-Light、Lane-Keeping、Comfort 等多个\emph{规则教师}分别指导不同方面，学生模型综合多教师信号。这把“专家覆盖不足”转化为“多个专项规则教师补齐盲区”。\pz{Hydra-MDP 为 CVPR 2024 NAVSIM Challenge 工作，具体分数、教师集合与蒸馏权重需联网核对。}
+
+\subsection{Diffusion Planner：自驾扩散与 flexible guidance}
+\label{sec:de-diffplanner}
+
+\begin{paper}[Diffusion Planner：自动驾驶的扩散式规划]\label{paper:de-diffplanner}
+\textbf{问题}：把 Diffusion Policy 的“动作序列扩散”搬到自驾，需建模多体交互、保证约束、且少步实时。
+\textbf{核心思想}\cite{zheng2025diffplanner}：把自车 $+$ 他车的时空轨迹\emph{联合去噪}（逼近多体博弈均衡，呼应 \cref{ch:plan-diffgame}）；学习轨迹 score $\nabla_{\boldsymbol{\tau}}\log p(\boldsymbol{\tau})$，通过 \emph{flexible guidance}（在 score 上加约束/风格梯度，即 \cref{sec:de-score} 的 classifier guidance）注入安全/风格偏好；使用预搜索参考线降低难度。
+\textbf{关键结果}：报告为 ICLR 2025 Oral；把“生成-投影”做进每一步去噪的 score（投影不是事后做）。
+\textbf{与本书关系}：是 \cref{sec:de-dp} 范式向自驾的落地，且把 \cref{sec:de-score} 的 score/guidance 桥兑现为安全注入机制；与 \cref{ch:mppi-variants} 的 MBD（\cref{sec:mv-mbd}，模型直接算 score）形成“学 score vs 算 score”的对照。
+\textbf{局限}：联合去噪计算量大；guidance 的权重需调；参考线先验是不可忽视的人工输入。
+\end{paper}
+
+\subsection{EMMA：大模型驾驶（回应 PLUTO 局限三）}
+\label{sec:de-emma}
+
+EMMA\cite{hwang2024emma}（Waymo，基于 Gemini）回应 PLUTO 的局限三（任务专用、缺常识）。核心：用\textbf{多模态大语言模型}的世界知识直接输出规划轨迹（把驾驶任务表述成多模态语言任务）。它代表 G6 路线——用大模型的开放世界常识应对长尾，与 DriveVLM、LMDrive 同属一类。代价是推理成本高、实时性与可验证性更难保证。\pz{EMMA 为 Waymo 2024-10 arXiv 工作，是否基于 Gemini、具体 benchmark 与分数需联网核对。}
+
+% ════════════════════════════════════════════════════════════════
+\section{安全过滤架构：给学习式规划器加“生成-验证”外壳}
+\label{sec:de-safety}
+
+\paragraph{动机：神经网络规划器的安全验证是端到端的核心未解难题。}
+本章三篇核心论文都把“开得好”推到了新高度，但没有一个能\emph{形式化证明}“绝不撞”——它们都是神经网络，输出无硬保证。UniAD 的碰撞后优化、PLUTO 的辅助损失都是\emph{软}约束（降低碰撞概率，不杜绝）。务实的工业答案是给学习式规划器套一层\textbf{“生成-验证”（或“生成-投影”）安全外壳}：用学习模型\emph{生成}高质量/多模态候选，用显式规则或优化\emph{验证并兜底}安全。
+
+\begin{insight}[“生成-验证”是贯穿全章的统一范式]
+这个范式在本章反复出现，只是“验证/投影”发生的时机不同：UniAD 在\emph{推理后}对单条轨迹做碰撞投影（\cref{sec:de-collision}）；PLUTO 在\emph{训练时}把约束做成辅助损失内化（\cref{sec:de-aux}）；Diffusion Planner 把投影\emph{融进每一步去噪的 score}（guidance，\cref{sec:de-score,sec:de-diffplanner}）；Autoware 2025+ 的工程栈用独立的 \emph{diffusion\_planner $+$ safety\_filter} 两段式（生成器出候选、安全滤波器做硬校验与兜底）。它与 \cref{ch:plan-safemarl} 的 CBF 安全滤波（上层学策略、下层 CBF 最小修正保安全）、与 \cref{ch:mppi-variants} 的“采样 $+$ 后处理”是同一思想在不同载体上的体现。\textbf{记住这个模板，你就抓住了“如何给任何学习式规划器加安全兜底”的一般答案}：把追求性能的生成与不依赖模型的硬安全验证分层，用后者为前者的模型错误兜底。这也呼应本章开篇的洞察——端到端拆掉了可验证性，安全外壳正是把可验证性\emph{部分}补回来的务实手段（外壳可验证，但被外壳包住的生成器仍不可验证，这是当前的边界）。
+\end{insight}
+
+\begin{note}
+\textbf{“软安全”与“硬安全”的分工（接 \cref{ch:plan-safemarl}）.}\;学习式规划器（UniAD/Diffusion/PLUTO）提供的是\emph{软安全}——基于数据与预测，性能高但无形式化保证；安全滤波层（碰撞投影、safety\_filter、CBF）提供\emph{硬安全}——把生成轨迹当标称、做最小修正保不变集前向不变，不依赖学习模型正确。绝大多数时候生成本就安全、滤波不激活；只在生成出危险动作时滤波才介入，把错误后果从“碰撞”降级为“保守”。这是给端到端规划器兜底的通用工程原则。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{设计空间全景与选型}
+\label{sec:de-design}
+
+把全章七个方法（及 Diffuser 前驱）摆在统一维度上横向对比，这是选型时最常回查的表：
+
+\begin{table}[H]\centering\small
+\caption{端到端/扩散式规划七方法横向对比}
+\label{tab:de-seven}
+\begin{tabular}{p{0.13\textwidth} p{0.15\textwidth} p{0.13\textwidth} p{0.15\textwidth} p{0.13\textwidth} p{0.13\textwidth}}
+\toprule
+方法 & 场景表示 & 多模态来源 & 安全注入时机 & 评估 & 范式 \\
+\midrule
+UniAD & 密集 BEV $+$ query & agent--goal 锚点 & 推理时碰撞投影 & 开环 & 模块化端到端 \\
+VAD & 矢量化实例 & query/锚点 & （继承 UniAD 软约束） & 开环为主 & 矢量化端到端 \\
+Diffusion Policy & 视觉观测 & 随机噪声起点 & 无（开环） & 开环 $+$ 真机 & 动作扩散 \\
+Diffusion Planner & BEV $+$ agent $+$ 参考线 & 随机起点 $+$ 联合去噪 & guidance（去噪每步） & 闭环 & 自驾扩散 \\
+PLUTO & query $+$ 参考线 & 纵横解耦组合 & 训练时辅助损失 & 闭环 & 闭环模仿 \\
+Hydra-MDP & （多教师蒸馏） & 多教师/轨迹词表 & 教师规则内化 & 闭环(NAVSIM) & 多教师蒸馏 \\
+EMMA & MLLM 多模态输入 & 语言生成 & （弱/外部兜底） & 开环为主 & 大模型驾驶 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[一张表里藏着三条可读的轴]
+七方法的分布沿三条轴展开。\textbf{表示轴}：密集 BEV（UniAD）$\to$ 矢量化（VAD）$\to$ 参考线 $+$ token（PLUTO/Diffusion Planner）——越往后越省算力、越依赖结构先验。\textbf{多模态轴}：锚点/goal（UniAD）$\to$ 随机噪声去噪（扩散）$\to$ 纵横解耦组合（PLUTO）$\to$ 语言生成（EMMA）——表达多模态的机制越来越“原生”。\textbf{安全时机轴}：推理时投影（UniAD）$\to$ 训练时内化（PLUTO）$\to$ 去噪每步 guidance（Diffusion Planner）$\to$ 外部硬滤波（Autoware）——这正是 \cref{sec:de-safety} 的主题。一句话选型：\emph{要可解释中间结果}用 UniAD 式 query 架构；\emph{要原生多模态}用扩散；\emph{要闭环可靠}用 PLUTO 式（纵横解耦 $+$ CIL $+$ 增强）；\emph{要开放世界常识}用大模型；而\emph{安全攸关}时，无论选哪种生成器，都要在外面套“生成-验证”外壳（\cref{sec:de-safety}）。
+\end{insight}
+
+\begin{pitfall}[思维陷阱：以为“端到端 SOTA”等于“可以替代经典栈上车”]
+看到端到端在 benchmark 刷出高分，就认为它已能替代经典模块化栈直接上车。后果：低估了可验证性缺失、长尾鲁棒性、安全认证的工程鸿沟。根本：端到端用信息保真与目标一致换走了可解释性与可验证性（\cref{sec:de-twoproblems} 的洞察），而后者正是安全攸关系统量产的硬门槛；nuScenes 开环高分尤其不可直接外推到闭环安全（\cref{sec:de-closedloop}）。正确做法：把端到端定位为“生成高质量候选的强力组件”，外面必须有“生成-验证”安全外壳（\cref{sec:de-safety}），而非裸用其输出。检验方法：问“这个规划器输出一条危险轨迹时，谁来拦？”——若答案是“没有”，就还不能上车。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\addcontentsline{toc}{section}{本章常见误解汇总}
+
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+UniAD 下游模块吃的是检测框 & 传的是 query（\texttt{[N\_agent,C]}）非框；框只用于算 loss（\cref{sec:de-query}）\\
+碰撞后优化是可有可无的后处理 & 它是安全指标达标的关键，\texttt{N\_ITER}/\allowbreak\texttt{LR}/代价形式 UNSPECIFIED 须从码提取（\cref{sec:de-collision}）\\
+端到端开环 SOTA $=$ 可以上车 & 开环 $\neq$ 闭环；且无形式化安全保证（\cref{sec:de-closedloop,sec:de-safety}）\\
+扩散是“换了个更大的网络” & 是换了概率建模方式（点估计 $\to$ 噪声到数据的随机映射，\cref{sec:de-ddpm}）\\
+去噪步 $k$ $=$ 动作时间步 $t$ & 两个完全不同的维度：上标 $=$ 去噪步（标量条件）、下标 $=$ 时间步（序列维）\\
+网络直接预测干净样本 $\boldsymbol{\tau}^0$ & 默认预测噪声 $\boldsymbol{\epsilon}$；预测 $\boldsymbol{\epsilon}$/$\boldsymbol{\tau}^0$/score 等价但更新式不同（\cref{sec:de-score}）\\
+预测噪声与预测 score 是两套理论 & 同一对象的等价参数化，差一个已知系数（\cref{eq:de-score}，接 \cref{sec:mv-mbd}）\\
+扩散总比回归好 & 优势是多模态、代价是推理慢；单峰/强实时任务回归可能更优 \\
+推理用训练权重即可 & 须用 EMA 权重、训练/推理 schedule 一致，否则性能大跌 \\
+action chunk $T_a$ 越大越省越好 & $T_a$ 大省算力但跟踪误差大，是“省算力 vs 跟得准”折中（$T_a=8$ 多数最优）\\
+用开环 L2 判断闭环性能 & 开环不累积、闭环累积；永远以闭环为准（\cref{sec:de-closedloop}）\\
+PLUTO 靠强化学习超越规则派 & 纯模仿 $+$ 对比 $+$ 增强，不用 RL/在线交互/奖励工程 \\
+CIL 加个对比 loss 就行 & 效果全系于负样本质量（负增强函数），不行先查负样本不是调温度 \\
+辅助损失 $=$ 碰撞后优化 & 辅助损失是训练时内化、碰撞投影是推理时修正，两个不同时机 \\
+端到端 SOTA 可替代经典栈上车 & 缺可验证性；须套“生成-验证”外壳，问“危险轨迹谁来拦”\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+本章把“端到端学习规划”与“扩散式轨迹生成”两条 $2024$--$2026$ 前沿范式串成一条技术演进线，并贯穿一条主线：\textbf{这两条范式都天然产出时空联合轨迹}（直接输出 $(x(t),y(t))$、绕过 \cref{ch:frenet-st} 的 PVD），因为它们回到了经典方法为实时性而放弃的“完整轨迹直接优化”，只是把计算挪到离线训练。\cref{sec:de-background} 论证端到端的两个根本动机（信息瓶颈、目标不一致）与“为何天然时空联合”，并给出六代技术树。\cref{sec:de-uniad}（UniAD）确立 planning-oriented 的 query 贯通架构，其“学习回归 $+$ 基于占据的碰撞后优化”是全章“生成-投影”模板的第一例。\cref{sec:de-dp}（Diffusion Policy）把策略学习重述为条件去噪——前向加噪（\cref{eq:de-forward}）、噪声预测 MSE（\cref{eq:de-loss}）、反向去噪（\cref{eq:de-reverse}）、随机起点诱导多模态；并打通“预测噪声 $=$ 预测 score”（\cref{eq:de-score}）把它接到 \cref{ch:mppi-variants} 的采样式 MPC。\cref{sec:de-pluto}（PLUTO）把战场搬到 nuPlan 闭环、首次以纯模仿超越规则派，靠纵横解耦 $+$ 对比模仿学习 $+$ 数据增强系统性回应“模仿为何闭环差”。\cref{sec:de-rest} 补齐 Diffuser/VAD/Hydra-MDP/Diffusion Planner/EMMA，\cref{sec:de-safety} 给出“生成-验证”安全外壳作为端到端安全验证这一未解难题的务实答案，\cref{sec:de-design} 给出七方法横向对比与选型。一条更深的主线：\textbf{端到端拆掉中间接口换来信息保真与目标一致，代价是可解释与可验证；扩散把复杂分布建模拆成一串简单去噪步换来多模态，代价是推理慢——理解每个范式“换走了什么、留下了什么没解决”，比记住它怎么做更重要。}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\boldsymbol{\tau}=[(x_t,y_t)]_{t=1}^{T}$ & 自车时空轨迹 / 动作序列 & \cref{sec:de-spatiotemporal} \\
+$\mathbf{B}\in\mathbb{R}^{H\times W\times C}$ & BEV 特征 & \cref{sec:de-uniad-rest} \\
+$\mathbf{Q}_A,\ \mathbf{Q}_M$ & track query / map query & \cref{sec:de-query} \\
+$\mathbf{O}_t$ & 未来占据栅格（UniAD）& \cref{sec:de-collision} \\
+$\mathbf{O}$ & 去噪网络的观测条件（扩散）& \cref{eq:de-loss} \\
+$k\in\{0,\dots,K\}$ & 去噪步（上标，标量条件） & \cref{eq:de-forward} \\
+$t$ & 动作/轨迹时间步（下标，序列维） & \cref{eq:de-forward} \\
+$\boldsymbol{\epsilon},\ \boldsymbol{\epsilon}_\theta$ & 噪声 / 噪声预测网络 & \cref{eq:de-forward,eq:de-loss} \\
+$\beta_k,\ \alpha_k,\ \bar\alpha_k$ & 噪声调度 / $1-\beta_k$ / 累积 & \cref{eq:de-forward} \\
+$\nabla_{\boldsymbol{\tau}}\log p$ & score（对数概率梯度） & \cref{eq:de-score} \\
+$T_o,\ T_p,\ T_a$ & 观测 / 预测 / 执行 horizon & \cref{tab:de-horizons} \\
+$T^+,\ T^-$ & 正 / 负增强函数（PLUTO）& \cref{sec:de-augment} \\
+$\tau$（温度）, $\lambda$ & 对比损失温度 / 对比损失权重 & \cref{sec:de-cil} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{关键式与结论速查表}
+\begin{tabular}{lll}
+\toprule
+式 / 结论 & 一句话说明 & 对应 \\
+\midrule
+前向加噪 \cref{eq:de-forward} & 一步闭式到任意噪声级 $\boldsymbol{\tau}^k$ & \cref{sec:de-ddpm} \\
+噪声预测 MSE \cref{eq:de-loss} & 训练目标就是回归噪声（稳定之源）& \cref{sec:de-ddpm} \\
+反向去噪 \cref{eq:de-reverse} & 从纯噪声逐步去噪生成 & \cref{sec:de-ddpm} \\
+噪声 $=$ 负 score $\times$ 系数 \cref{eq:de-score} & 接 DDPM$\leftrightarrow$MPPI 同构、guidance & \cref{sec:de-score} \\
+碰撞后优化（UniAD）& 学习回归 $+$ 占据投影 $=$ 生成-投影 & \cref{sec:de-collision} \\
+对比模仿学习（PLUTO）& 造负样本教模型判别好坏 & \cref{sec:de-cil} \\
+开环 vs 闭环 & 闭环输出反馈成输入、误差自放大 & \cref{sec:de-closedloop} \\
+生成-验证安全外壳 & 学习生成 $+$ 硬安全验证兜底 & \cref{sec:de-safety} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表（难度用 \texorpdfstring{$\bigstar$}{star}）}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 端到端两动机 & 信息瓶颈 $+$ 目标不一致 & \(\bigstar\bigstar\) \\
+2 & 天然时空联合 & 绕过 PVD、直接出 $(x(t),y(t))$ & \(\bigstar\bigstar\) \\
+3 & UniAD query 接口 & 传 query 不传框，信息不压扁 & \(\bigstar\bigstar\bigstar\) \\
+4 & MotionFormer 三交互 & agent--agent/map/goal，goal $=$ 多模态源 & \(\bigstar\bigstar\bigstar\) \\
+5 & 碰撞后优化 & 占据投影、生成-投影模板 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+6 & 两阶段训练 & 先感知后端到端，课程式 & \(\bigstar\bigstar\) \\
+7 & DDPM 前向/反向 & 加噪闭式 $+$ 噪声预测 MSE $+$ 去噪 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+8 & 多模态机制 & 随机起点落到分布不同峰 & \(\bigstar\bigstar\bigstar\) \\
+9 & 噪声 $=$ score & 三种等价参数化，接采样 MPC & \(\bigstar\bigstar\bigstar\bigstar\) \\
+10 & receding-horizon & $T_o/T_p/T_a$，chunk-跟踪权衡 & \(\bigstar\bigstar\bigstar\) \\
+11 & 去噪步 vs 时间步 & 上标去噪、下标时间，勿混 & \(\bigstar\bigstar\) \\
+12 & 开环 vs 闭环 & 闭环误差累积 $+$ 分布偏移 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+13 & 纵横解耦 & 网络结构解耦语义，多模态结构化 & \(\bigstar\bigstar\bigstar\) \\
+14 & 对比模仿学习 CIL & 负样本教判别，缓解分布偏移 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+15 & 数据增强一体两面 & 原料厂(增强) $+$ 加工车间(CIL) & \(\bigstar\bigstar\bigstar\) \\
+16 & 辅助损失 & 训练时内化约束，可微 $+$ 可批量 & \(\bigstar\bigstar\bigstar\) \\
+17 & 安全注入时机 & 推理投影/训练内化/去噪 guidance & \(\bigstar\bigstar\bigstar\bigstar\) \\
+18 & 生成-验证外壳 & 学习生成 $+$ 硬安全兜底 & \(\bigstar\bigstar\bigstar\) \\
+19 & 七方法选型 & 表示/多模态/安全时机三轴 & \(\bigstar\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\begin{itemize}
+  \item \textbf{模块化端到端}：Hu 等\cite{hu2023uniad}（UniAD，本章 \cref{sec:de-uniad} 的源，CVPR'23 Best Paper）；Jiang 等\cite{jiang2023vad}（VAD 矢量化）。
+  \item \textbf{扩散生成范式}：Ho 等\cite{ho2020ddpm}（DDPM 内核）；Song--Ermon\cite{song2019score}（score-based 生成）；Janner 等\cite{janner2022diffuser}（Diffuser，规划即扩散的前驱）；Chi 等\cite{chi2023diffusion}（Diffusion Policy，本章 \cref{sec:de-dp} 的源）；Zheng 等\cite{zheng2025diffplanner}（Diffusion Planner，自驾扩散）。
+  \item \textbf{闭环模仿与多教师}：Cheng 等\cite{cheng2024pluto}（PLUTO，本章 \cref{sec:de-pluto} 的源）；Cheng 等\cite{cheng2023plantf}（PlanTF，CIL 动机源头）；Dauner 等\cite{dauner2023pdm}（PDM，nuPlan 强规则基线）；Li 等\cite{li2024hydramdp}（Hydra-MDP 多教师蒸馏）；Ross 等\cite{ross2011dagger}（DAgger，分布偏移的经典解法）。
+  \item \textbf{大模型驾驶}：Hwang 等\cite{hwang2024emma}（EMMA，Waymo 大模型驾驶）。
+  \item \textbf{与本书其他章的连接}：DDPM$\leftrightarrow$MPPI 同构与 Tweedie 见 \cref{ch:mppi-variants}（\cref{thm:mv-isomorphism,sec:mv-mbd}）；Frenet/PVD 见 \cref{ch:frenet-st}；博弈式交互规划见 \cref{ch:plan-diffgame,ch:plan-rtgame}；CBF 安全滤波见 \cref{ch:plan-safemarl}。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\addcontentsline{toc}{section}{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+章节 & 关系 & 本章铺垫 / 复用 \\
+\midrule
+\cref{ch:frenet-st} Frenet/ST 规划 & 本章绕过其 PVD、直接时空联合 & PVD（\cref{sec:fs-pvd}）、Frenet $(s,l)$（\cref{sec:fs-sl}）作对照基线 \\
+\cref{ch:mppi-variants} 采样式 MPC 变体 & 扩散与 MPPI 数学同构 & 噪声 $=$ score（\cref{sec:de-score}）接 \cref{thm:mv-isomorphism}、Tweedie（\cref{sec:mv-mbd}）\\
+\cref{ch:plan-diffgame,ch:plan-rtgame} 博弈规划 & 多体交互即博弈 & Diffusion Planner 联合去噪（\cref{sec:de-diffplanner}）逼近博弈均衡 \\
+\cref{ch:plan-safemarl} 安全证书与 MARL & 安全外壳的硬安全层 & 生成-验证（\cref{sec:de-safety}）与 CBF 安全滤波同源 \\
+\cref{ch:st-corridor,ch:st-trajopt} 时空走廊/轨迹优化 & 滚动时域同源 & receding-horizon（\cref{sec:de-receding}）与 MPC 滚动重规划 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：复现 UniAD 时把下游接口改成框，性能\emph{掉一大截}。\textbf{原因}：信息被压扁（query 接口被破坏，\cref{sec:de-query}）。\textbf{对策}：盯住下游输入张量是 \texttt{[N\_agent,C]} 的 query 非框；改造保持 query 接口。
+  \item \textbf{症状}：UniAD 碰撞率\emph{显著高于论文}、轨迹在障碍附近抖动。\textbf{原因}：碰撞后优化被跳过或参数乱设（\texttt{N\_ITER}/\allowbreak\texttt{LR} UNSPECIFIED，\cref{sec:de-collision}）。\textbf{对策}：从代码提取超参，把碰撞优化当一等公民复现并做敏感性实验。
+  \item \textbf{症状}：BEV 时序融合后\emph{运动物体拖影/错位}。\textbf{原因}：时序对齐用错自车位姿（\cref{sec:de-uniad-rest}）。\textbf{对策}：核对 ego2global/帧间相对位姿，静止场景单元测试验证对齐后与当前帧重合。
+  \item \textbf{症状}：扩散策略 loss 能降但\emph{采样动作发散/退化}。\textbf{原因}：训练目标与采样更新式参数化不一致（预测 $\boldsymbol{\epsilon}$ vs $\boldsymbol{\tau}^0$，\cref{sec:de-score}）。\textbf{对策}：确认 \texttt{prediction\_type} 并用配套更新式，改参数化整套同步改。
+  \item \textbf{症状}：扩散策略\emph{性能比论文差一大截、却看不出代码错}。\textbf{原因}：推理用了非 EMA 权重，或训练/推理 schedule 不一致。\textbf{对策}：推理强制用 EMA 权重；schedule 严格一致；DDIM 加速时正确设子序列。
+  \item \textbf{症状}：张量维度对不上、$k$ 被喂到\emph{时间维}。\textbf{原因}：把去噪步 $k$ 当动作时间步 $t$。\textbf{对策}：上标 $=$ 去噪步（标量条件），下标 $=$ 时间步（序列维）。
+  \item \textbf{症状}：扩散推理太慢，\emph{上不了高频控制}。\textbf{原因}：DDPM $100$ 步去噪。\textbf{对策}：换 DDIM/概率流 ODE 少步采样（\cref{sec:de-score}），可降到 $\sim 10$ 步而质量损失小。
+  \item \textbf{症状}：PLUTO 加了对比 loss\emph{却不见闭环提升}。\textbf{原因}：负样本质量差（负增强函数，\cref{sec:de-cil}）。\textbf{对策}：先查负增强函数（造“像样但确实坏”的轨迹），而非调对比温度；确认 \texttt{use\_contrast\_loss}/\allowbreak\texttt{use\_hidden\_proj} 开关已开。
+  \item \textbf{症状}：模型开环 L2 漂亮但\emph{闭环漂移/压线/急刹}。\textbf{原因}：用开环指标判断闭环（\cref{sec:de-closedloop}）。\textbf{对策}：永远以闭环为准；纵横解耦 $+$ CIL $+$ 数据增强缩小鸿沟。
+  \item \textbf{症状}：nuPlan 闭环里\emph{轨迹方向错乱/滞后、仿真失败}。\textbf{原因}：坐标系（global vs ego）/时间戳对齐错（\cref{sec:de-pluto-exp}）。\textbf{对策}：按 \texttt{pluto\_planner} 接口约定转换，用静止/直行场景先验证接口。
+  \item \textbf{症状}：学习式规划器输出一条危险轨迹\emph{无人拦截}。\textbf{原因}：缺“生成-验证”安全外壳（\cref{sec:de-safety}）。\textbf{对策}：在生成器外套硬安全滤波（碰撞投影/safety\_filter/CBF），把错误后果从碰撞降级为保守。
+\end{enumerate}

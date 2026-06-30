@@ -1,0 +1,1711 @@
+\chapter{多模态动作获取：文生动作与视频学习}\label{ch:rlmc-multimodal}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章。
+%  主线 = 算法/概念领路：先立「参考动作有哪几种来源（MoCap/视频/文本）、各自
+%  用什么观测/什么生成原理/什么技巧」，再把每个概念落到 mjlab / Isaac Lab(含
+%  ProtoMotions) / UniLab 三框架的工程接线对比。源材料只覆盖 mjlab+Isaac Lab；
+%  UniLab 一列已据服务器实装框架（commit 99936e08）实填：执行层 G1MotionTracking
+%  显式跟踪原生可用、视频 retarget 的 NPZ 直接喂入；生成侧（CLIP/CALM 条件判别器、
+%  motion inpainting、文本前端）UniLab 当前确无内置、需自实现——这是如实标注的真实
+%  局限，非占位（参考 docs/RL运控融合_UniLab参考.md）。
+%  假定读者已有 RL 基础（理论部已讲 MDP/策略梯度/AC/PPO/GAE），且已读
+%  \cref{ch:rlmc-imitation}（模仿学习：BeyondMimic 显式跟踪 + AMP/ASE/MaskedMimic
+%  对抗风格 + BC/DAgger 蒸馏 + AMASS/SMPL 数据管线）——本章是其直接后续。
+%  源稿 RL运控/Ch16_多模态动作获取_文生动作与视频学习.md 按本主线重构。
+%  关键 API/版本/论文归属经联网核（截至 2026-06）：
+%    - MDM = Tevet, Raab, Gordon, Shafir, Cohen-Or, Bermano, ICLR 2023, arXiv:2209.14916（已核）；预测 x0 而非噪声。
+%    - T2M-GPT = Zhang 等, CVPR 2023, arXiv:2301.06052（已核）；VQ-VAE+GPT，HumanML3D FID 0.116。
+%    - CLIP = Radford 等, ICML 2021, arXiv:2103.00020（已核）；400M 图文对；ViT-B/32 文本 512 维。
+%    - CALM = Tessler, Kasten, Guo, Mannor, Chechik, Peng, SIGGRAPH 2023, arXiv:2305.02195（已核）。
+%    - MaskedMimic = Tessler, Guo, Nabati, Chechik, Peng, SIGGRAPH Asia 2024(ACM TOG), arXiv:2409.14393（已核）。
+%    - HumanPlus = Fu, Zhao, Wu, Wetzstein, Finn, CoRL 2024, arXiv:2406.10454（已核）；
+%      实时遥操用 WHAM(身体)+HaMeR(手) → SMPL-X/MANO → retarget 到 33-DoF H1；HST/HIT 两个 decoder transformer；
+%      40 demos / 60–100% 成功率（已核）。HST 输出 19 维 / IsaacGym 训练以官方实现为准。
+%    - HDMI = Weng, Li 等, CMU, arXiv:2509.16757（已核）；Unitree G1；67 连续开门；6 真机 + 14 仿真任务；
+%      三设计：统一物体表示 + residual action + 通用交互 reward；每技能一策略（论文 Limitations）。
+%    - LeVERB = Xue 等, arXiv:2506.13751（已核，投稿 ICLR 2026 审稿中）；150+ tasks/10 类；58.5% 总体；
+%      80% zero-shot 导航；7.8× 优于 naive 分层 VLA；G1 in Isaac Lab。
+%    - WHAM = Shin, Kim, Halilaj, Black, CVPR 2024, arXiv:2312.07531（已核）；world-grounded 全局轨迹。
+%    - ProtoMotions(当前 ProtoMotions3, NVlabs, Apache-2.0)：支持 IsaacGym/IsaacLab/Newton/MuJoCo/Genesis；
+%      算法 PPO/AMP/ASE/MaskedMimic；入口 = dataclass train_agent.py --experiment-path .../*.py
+%      --robot-name --simulator --motion-file *.pt（已核，与 \cref{ch:rlmc-imitation} 一致；非旧 Hydra +exp=）。
+%  源稿中已修正：源稿 ProtoMotions 用旧 Hydra(+exp=/+robot=/+simulator=/motion_file=*.yaml)，实为 dataclass；
+%    TextOp arXiv「2602.07439」为未来日期/无法核实的预印本号 → 包 \pz{待核实}；
+%    WHAM/4DHumans/HybrIK 的精度与 FPS 为典型量级（依 benchmark/硬件而异）→ 措辞弱化、不当固定指标。
+% ════════════════════════════════════════════════════════════════
+
+\cref{ch:rlmc-imitation} 解决了模仿学习的核心问题：给定一条参考运动，策略能否在物理仿真中忠实复现它。无论是 BeyondMimic 的显式逐帧跟踪，还是 AMP 的对抗式风格约束，都默认\emph{参考运动已经存在}——它要么来自昂贵的光学动捕（AMASS），要么来自人工准备的 CSV。本章回答一个互补且更上游的问题：\textbf{参考运动从哪来}？我们将系统地考察三类来源——通过\textbf{文本描述}（"walk forward slowly"）、通过\textbf{视频}（互联网上的一段舞蹈）、以及通过\textbf{单 RGB 相机实时遥操作}——从「人工提供参考」跨越到「自动获取参考」。
+
+本章仍遵循全书「概念领路、实践兑现」的次序。这里的「概念」是动作来源的\textbf{技术谱系}（MoCap / 视频 / 文本三个时代，及其精度-成本-灵活性的本质权衡），以及把语义/像素映射到运动空间的生成原理（扩散、VQ-VAE 离散化、CLIP 文本嵌入、姿态估计）。理解主线之后，每一节都把对应概念落到 mjlab、Isaac Lab/ProtoMotions、UniLab 三个框架的工程接线上做对比。三框架在本章呈现一种清晰的分工：\emph{生成侧}的文本条件（CALM）与 motion inpainting（MaskedMimic）是 Isaac Lab/ProtoMotions 的内置一等公民，mjlab 与 UniLab 都以 BeyondMimic / \Verb[breaklines]|G1MotionTracking| 这类显式跟踪\emph{执行层}原生见长、而要复现 CALM/inpainting 这些生成侧组件则需自实现；视频这条来源的感知/retarget 是框架无关的离线步，三框架的 tracker 都能直接消费。这恰好印证了 \cref{ins:rlmc-mm-fuel} 的「来源换燃料、tracker 烧燃料」视角：mjlab 与 UniLab 把 tracker 这台发动机做得很完整，进料口的文本前端则要另接，ProtoMotions 则连进料口也一并备好。
+
+\begin{insight}[本章只是给 \cref{ch:rlmc-imitation} 的 tracker 换「燃料供给」]\label{ins:rlmc-mm-fuel}
+读懂本章最省力的方式，是把\cref{ch:rlmc-imitation} 训出的 tracking policy 看成一台\emph{发动机}——它把任意运动学参考轨迹烧成物理可行的关节力矩。本章讲的所有方法——文本生成（CALM/TextOp）、视频估计（WHAM/HDMI）、实时遥操（HumanPlus）——都只是给这台发动机换不同的\textbf{燃料供给}。它们的输出最终都要经过 tracker 转成关节控制信号，区别只在「获取参考运动的方式与精度」。抓住这条统一视角，任何新方法出现时你都能立刻定位它在管线中的位置。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-mm-setup}
+
+本章的实战在 \cref{ch:rlmc-imitation} 的「数据管线 + tracker」基础上，新增两条依赖链：\emph{生成侧}（文本编码 CLIP、扩散/自回归模型）与\emph{感知侧}（视频姿态估计 WHAM/HaMeR）。\cref{tab:rlmc-mm-req} 给出系统要求与版本兼容点。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{多模态动作获取三框架的环境要求与版本兼容}
+\label{tab:rlmc-mm-req}
+\begin{tabularx}{\linewidth}{@{}lLLL@{}}
+\toprule
+要求项 & mjlab 路线 & ProtoMotions / Isaac Lab 路线 & UniLab \\
+\midrule
+本体框架 & mjlab（\cref{ch:rlmc-setup}）+ tracker & ProtoMotions3 + 后端仿真器 & UniLab + 后端（MuJoCoUni\,3.8.0 / MotrixSim） \\
+底层 tracker & BeyondMimic（\cref{ch:rlmc-imitation}） & 内置 Mimic/AMP/CALM & 内置 \texttt{G1MotionTracking}（显式跟踪+PPO/SAC）；AMP/CALM 需自实现 \\
+Python & $\ge 3.10$ & $\ge 3.10$ & $\ge 3.10$（实测 3.13） \\
+文本编码 & \texttt{open\_clip} / \texttt{clip}（ViT-B/32） & 内置 CLIPTextEncoder & 无内置文本条件（CLIP/CALM 需自实现，见 \S\ref*{sec:rlmc-mm-calm-three}） \\
+视频姿态 & WHAM / 4D-Humans / HaMeR（独立 env） & 同左（数据预处理阶段） & 同左（框架无关离线步），产物 \texttt{.npz} 喂 \texttt{G1MotionTracking} \\
+高层生成 & 扩散/自回归模型（PyTorch，可无物理引擎） & 内置条件判别器 / inpainting & 无内置条件判别器/inpainting（需自实现） \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{额外版本约束：把感知/生成与仿真隔离成两个环境。}视频姿态估计（WHAM、HaMeR、4D-Humans）依赖一整套 SMPL/MANO 体模型、\verb|chumpy|、\verb|detectron2| 等\emph{视觉}侧依赖；而 tracker 训练依赖 MuJoCo/PhysX 仿真后端。两者的 PyTorch/CUDA 版本经常冲突。工程上推荐用两个独立的 \verb|uv|/\allowbreak\verb|conda| 环境：一个跑「视频$\to$SMPL$\to$retarget$\to$\texttt{.npz}」的离线数据管线，一个跑 tracker 训练与部署。它们之间只通过文件（\texttt{.npz}/\allowbreak\texttt{.pt} 动作数据）通信——这正是 \cref{ch:rlmc-imitation} 强调的「数据契约」思想的延伸。
+
+\begin{pitfall}[把「生成」与「跟踪」混在一个环境里]
+\textbf{错误描述}：在 tracker 训练环境里直接 \Verb[breaklines]|pip install| WHAM/HaMeR 的全部依赖。\textbf{现象后果}：\verb|detectron2| 或 \verb|chumpy| 拖动 PyTorch 降级，仿真后端（MuJoCo Warp / Isaac）随之报 ABI 不兼容或 CUDA kernel 失败。\textbf{根本原因}：视觉重建栈与 GPU 物理仿真栈对 PyTorch/CUDA 的版本要求不一致，且二者都「钉死」具体小版本。\textbf{正确做法}：物理隔离成两个环境，用文件作接口；本章所有「视频/文本$\to$动作」的产物都落成 \cref{ch:rlmc-imitation} 已定义的 \texttt{.npz}/\allowbreak\texttt{.pt} 契约，再交给 tracker。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{\texorpdfstring{Quick Start：五分钟跑通「文本 $\to$ 动作」最小回路}{Quick Start：五分钟跑通文本到动作最小回路}}
+\addcontentsline{toc}{section}{Quick Start：五分钟跑通文本到动作}
+\label{sec:rlmc-mm-quickstart}
+
+下面给出装好之后\emph{立即可复制}的最小路径。目标不是训出好策略，而是证明「文本$\to$运动学轨迹$\to$tracker」整条链是通的。最快的入口是先单独验证 CLIP 文本编码这一环（不需要仿真器），再用 ProtoMotions 的预训练 CALM 做一次文本条件评估。
+
+\textbf{先装 CLIP（第一步的前置，别跳）。}\verb|clip| 不是任何仿真框架的依赖——mjlab / UniLab / Isaac Sim 三个环境里默认\emph{都没有}它（在服务器上 \Verb[breaklines]|python -c 'import clip'| 三个环境一律 \Verb[breaklines]|ModuleNotFoundError|）。所以下面第一步若不先装就照抄会立即报错。按 \cref{sec:rlmc-mm-setup} 的双环境主张，CLIP 属于\emph{生成侧}依赖，应装进生成/感知那个 env，\textbf{不要}装进 tracker 训练 env：
+
+\begin{codebox}[bash]{第一步之前:在「生成侧」env 装 CLIP（mjlab/UniLab/Isaac 默认都没有）}
+# 官方 CLIP（含权重自动下载;ftfy/regex 是它的硬依赖，缺了会在 import 时报错）
+pip install ftfy regex git+https://github.com/openai/CLIP.git
+# 或用社区版 open_clip（API 略不同:open_clip.create_model_and_transforms）
+# pip install open_clip_torch
+python -c "import clip; print('clip ok')"        # 先确认能 import 再跑下一步
+\end{codebox}
+
+\begin{codebox}[Python]{第一步:验证 CLIP 文本编码（无需仿真器，秒级）}
+import clip, torch
+model, _ = clip.load("ViT-B/32", device="cuda")
+text = clip.tokenize(["a person walks forward slowly"]).to("cuda")
+with torch.no_grad():
+    emb = model.encode_text(text)        # (1, 512)
+print(emb.shape, emb.dtype)              # 期望: torch.Size([1, 512]) torch.float16
+\end{codebox}
+
+\begin{codebox}[bash]{第二步:ProtoMotions 推理（dataclass 入口;需先装 ProtoMotions，命令形式已核对 ProtoMotions3）}
+# 前置:ProtoMotions 不是 mjlab/UniLab 的子模块，须单独 clone+装（含 IsaacGym/IsaacLab 后端之一）.
+#   git clone https://github.com/NVlabs/ProtoMotions && cd ProtoMotions && pip install -e .
+# 用预训练 CALM 检查点做推理评估（推理脚本是 inference_agent.py，不是 eval_agent.py）
+python protomotions/inference_agent.py \
+    --checkpoint results/g1_calm/last.ckpt \
+    --motion-file data/calm_dataset.pt \
+    --simulator isaacgym --num-envs 16
+# 注:ProtoMotions 无 --text-prompt 这类 CLI 旗标;文本/技能条件由实验配置（StoryEnv 等
+#     条件环境）与 latent/text 编码器装配决定，不是命令行传一句字符串.
+\end{codebox}
+
+\begin{note}[本章三列的「可跑性」分级：哪列能直接跑、哪列是参考接线]
+为避免照抄踩空，先把三列的可执行性说清（\cref{sec:rlmc-mm-calm-three} 起的代码框沿用此约定）：\textbf{UniLab 第三列}的 \texttt{demo}/\allowbreak\texttt{train} 命令、NPZ 契约、\texttt{\_reward\_fns} 派发表均经服务器实装框架（commit 99936e08）实跑/读源码核对，\emph{可直接跑}；\textbf{ProtoMotions 第二列}的命令\emph{形式}已对照 ProtoMotions3 官方接口核对，但 ProtoMotions 需你自行单独安装（它与 mjlab/UniLab 不在同一仓），其下 CALM/MaskedMimic/TextOp 的「概念性实现」代码框是\emph{讲清原理的脚手架}、并非贴上即可运行；\textbf{mjlab 第一列}的 tracker 可跑，但喂 motion 的命令本章在 \cref{sec:rlmc-mm-calm-three} 末尾补齐（裸跑 tracking 任务会因缺 motion 直接报错）。一句话：UniLab 列照抄即跑，另两列照抄前先确认本机装了对应框架、并把概念代码接到真实训练入口上。
+\end{note}
+
+\textbf{UniLab（第三列）。}UniLab 当前\emph{无内置「文本$\to$动作」前端}（无 CLIP/CALM 一等公民），但它原生提供本章管线的\emph{执行层}——\texttt{G1MotionTracking} 系列显式动作跟踪任务（\Verb[breaklines]|envs/motion_tracking/g1|）。最快的 UniLab 验证是直接回放一个预训练的跟踪策略，确认「参考运动$\to$tracker$\to$G1」这一段是通的（文本生成那一段需自实现，见 \cref{sec:rlmc-mm-calm-three}）\,\cite{unilab2026}：
+
+\begin{codebox}[bash]{UniLab 第三列:回放预训练动作跟踪 demo（执行层;文本前端需自实现）}
+# 首跑要从 HuggingFace 拉 motion 资产/权重——无镜像会 RuntimeError(client closed).
+# 国内/离线务必先设镜像（demo 与下面的 train 都依赖它，不止 demo）:
+export HF_ENDPOINT=https://hf-mirror.com
+uv run demo dance            # dance->g1_motion_tracking;亦可 boxtracking / wallflip
+# 注:demo 默认后端是 MotrixSim（sim=motrix）、entry=eval，不是 mujoco;任务名真实，
+#     但若本机无 MotrixSim 或想统一用 mujoco，请走下面的 train（显式 --sim mujoco）.
+# 自己短训一个 G1 跟踪策略（g1_motion_tracking 同样从 HF 拉参考动作 dance1_subject2_part.npz）
+uv run train --algo ppo --task g1_motion_tracking --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=300
+\end{codebox}
+
+\begin{note}[最常踩的 Quick Start 坑]
+源稿与许多旧教程用的是 ProtoMotions 早期的 Hydra 风格（\Verb[breaklines]|+exp=calm_mlp +robot=g1 +simulator=isaacgym|，\Verb[breaklines]|motion_file=*.yaml|）。当前 ProtoMotions3 已改为 \emph{dataclass} 命令行（\Verb[breaklines]|--experiment-path/--robot-name/--simulator/--motion-file *.pt|，与 \cref{ch:rlmc-imitation} 一致）。如果你照搬 \verb|+exp=| 会直接报参数解析错误。本章正文统一用 dataclass 形式；CLIP 模型与 \verb|condition_dim| 必须配对（ViT-B/32 $\to$ 512），否则下游判别器输入维度对不上。
+\end{note}
+
+\begin{pitfall}[第一个小时最常撞的三堵墙：照抄 Quick Start 命令直接报错]
+本章命令在真服务器上跑，初学者第一个小时几乎必然撞到下面三个\emph{命令级}错误（不是算法错，是环境/资产/参数没就位）。把报错原文与对应一行修法记牢，比读懂任何公式都省时间：
+
+\begin{codebox}[bash]{三个一线错误的「症状 -> 一行修法」（均为服务器实测复现）}
+# 墙1: 第一步 import clip 即 ModuleNotFoundError: No module named 'clip'
+#   原因: 三框架 env 都不带 CLIP.修: 在生成侧 env 装（见上面安装框）
+pip install ftfy regex git+https://github.com/openai/CLIP.git
+
+# 墙2: UniLab demo/train 卡住后 RuntimeError: Cannot send a request, client closed
+#   原因: 从 huggingface.co 拉 motion 资产超时（国内直连基本必挂）.修: 设镜像再重跑
+export HF_ENDPOINT=https://hf-mirror.com
+
+# 墙3: mjlab 裸跑 tracking 任务 -> ValueError: provide --registry-name OR
+#       --env.commands.motion.motion-file /path/motion.npz
+#   原因: tracking 任务必须喂参考动作，没有「默认就能跑」的 motion.修: 显式给一份 npz
+WANDB_MODE=disabled mjlab train Mjlab-Tracking-Flat-Unitree-G1 \
+    --env.commands.motion.motion-file /abs/path/to/g1_walk.npz \
+    --env.scene.num-envs 64 --max-iterations 2
+\end{codebox}
+
+\noindent 排错心法：先\emph{读报错最后一行}（它通常直接点名缺什么——缺模块/缺网络/缺参数），再决定是装依赖、设环境变量、还是补命令行旗，而不是盲改代码。墙3 的那份 \verb|g1_walk.npz| 从哪来、什么格式，见 \cref{sec:rlmc-mm-calm-three} 末尾「给 mjlab tracker 喂 motion」。
+\end{pitfall}
+
+\begin{note}[「训练正常起了吗」的吞吐量级基准与显存边界（RTX 4090 实测）]
+冒烟跑通后，最该盯的单一信号是框架自带输出里的 \emph{steps per second} 行——它既证明训练真在推进，又是性能自检的现成尺子（你无需另写计时器，跑 N 迭代读这一行即可）。给几个本部在 RTX 4090（24\,GB）上的实测量级供对照：UniLab \Verb[breaklines]|go2_joystick_flat| 在 \verb|num_envs=16| 下约 \textbf{0.66\,s/iter}（小 env 数受 CPU/启动主导，吞吐远低于峰值，别被低数字吓到）；mjlab locomotion 在 64 envs 下首迭代约 1.5--1.8\,k steps/s、JIT/CUDA-graph 预热后升到约 2.5\,k；放大到 4096 envs 才进入 $10^4\sim10^5$ steps/s 量级。\textbf{显存}：24\,GB 上 \verb|num_envs=4096| 的纯 locomotion/tracking 一般装得下，但叠加视觉/大 history/大判别器时可能 OOM——先用 64 envs 冒烟、再二分逼近你显卡能吃的最大 env 数，比直接上 4096 撞 OOM 省事。判据：首迭代后 steps/s 稳定、\Verb[breaklines]|value loss| 有限不发散、无 NaN，即「正常起了」。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{前置自测}
+\addcontentsline{toc}{section}{前置自测}
+\label{sec:rlmc-mm-pretest}
+
+\begin{practice}[前置自测：答错 $\ge 3$ 题，建议先回相应章节]
+\begin{enumerate}
+  \item BeyondMimic 的 body-position tracking reward 为什么在 anchor/base 坐标系下计算，而非 world 系？（回看 \cref{sec:rlmc-imit-track}）
+  \item AMP 判别器与显式跟踪（Mimic）的核心区别是什么？梯度惩罚的作用是什么？（回看 \cref{ch:rlmc-imitation} 的 AMP 一节与 \cref{eq:rlmc-imit-amp-style}）
+  \item SMPL 的关节是 3-DoF ball joint，G1 的关节是 1-DoF revolute——为什么不能把 SMPL 的 $69$ 维直接喂给 G1？（回看 \cref{sec:rlmc-imit-data} 的 retarget）
+  \item 指数型 tracking reward $r=\exp(-\|e\|^2/\sigma^2)$ 里 $\sigma$ 的作用是什么？（回看 \cref{ch:rlmc-reward}）
+  \item CLIP 的 text encoder 输出什么格式的向量？ViT-B/32 与 ViT-L/14 的维度各是多少？（本章 \cref{sec:rlmc-mm-spectrum} 会用到）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章目标}
+\addcontentsline{toc}{section}{本章目标}
+\label{sec:rlmc-mm-goals}
+
+学完本章后，你应当能够：
+
+\begin{enumerate}
+  \item \textbf{区分} MoCap、视频、文本三类动作来源的精度-成本-灵活性权衡，面对具体项目能写出有依据的选型报告。
+  \item \textbf{配置} ProtoMotions 中的 CALM，用自然语言 prompt 控制 G1 的动作风格，并\textbf{调通}从 AMP/ASE 到 CALM 的配置切换。
+  \item \textbf{实现} MaskedMimic 两阶段（全约束 expert + 在线 mask 蒸馏）的训练接线，并\textbf{解释}为何部分约束能补全完整动作。
+  \item \textbf{配置} TextOp 风格的两层架构（高层自回归扩散生成器 + 低层 tracker），跑通「键盘文本$\to$仿真 G1 执行」的 sim-to-sim 回路。
+  \item \textbf{调通}「视频$\to$G1」的完整数据管线：WHAM 估计 $\to$ retarget $\to$ 坐标系/帧率对齐 $\to$ 物理过滤 $\to$ tracker，并\textbf{定位}穿地、抖动、漂移等失败模式。
+  \item \textbf{精读} HumanPlus 的 HST/HIT 与 HDMI 的 co-tracking + residual action，能复述每个组件的输入输出与训练方式。
+  \item \textbf{定位}多模态管线的常见失败（坐标系不一致、帧率不匹配、生成轨迹物理不可行、判别器对所有文本输出相同动作），并对照故障排查手册给出对策。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section*{知识导航与阅读时间}
+\addcontentsline{toc}{section}{知识导航与阅读时间}
+\label{sec:rlmc-mm-nav}
+
+本章承接 \cref{ch:rlmc-imitation}（模仿学习：tracker / AMP / 数据管线）与 \cref{ch:rlmc-obsact}（观测/动作契约）。一句话桥接前章：\cref{ch:rlmc-imitation} 给了我们一台「把运动学参考烧成关节力矩」的发动机，本章则把发动机的\emph{进料口}换成文本、视频、相机。本章结构如下树。建议精读 4--5 小时（含练习）；有 \cref{ch:rlmc-imitation} 基础者速读 2--3 小时（重点看三来源对比表、CALM/TextOp 配置与三框架命令对比）；遇到具体问题时速查 45 分钟（直接跳故障排查手册）。
+
+\begin{figure}[ht]
+\centering
+\begin{forest}
+navtreeLR
+[多模态动作获取
+  [来源谱系 (\S\ref*{sec:rlmc-mm-spectrum})
+    [MoCap {/} 视频 {/} 文本]
+    [MDM {/} VQ-VAE {/} CLIP]
+    [SMPL 与姿态估计]
+  ]
+  [文本条件 CALM (\S\ref*{sec:rlmc-mm-calm})
+    [text embedding 注入判别器]
+    [冻结 CLIP {+} 梯度惩罚]
+    [三框架配置对比]
+  ]
+  [MaskedMimic inpainting (\S\ref*{sec:rlmc-mm-masked})
+    [部分约束补全]
+    [两阶段在线蒸馏]
+  ]
+  [TextOp 实时管线 (\S\ref*{sec:rlmc-mm-textop})
+    [RobotMDAR 自回归扩散]
+    [Robot-Skeleton 表示]
+    [生成数据增强]
+  ]
+  [视频 {->} G1 管线 (\S\ref*{sec:rlmc-mm-video})
+    [WHAM 估计]
+    [retarget {+} 坐标系{/}帧率]
+    [质量门禁]
+  ]
+  [精读 HumanPlus (\S\ref*{sec:rlmc-mm-humanplus})]
+  [精读 HDMI (\S\ref*{sec:rlmc-mm-hdmi})]
+  [端到端 LeVERB (\S\ref*{sec:rlmc-mm-leverb})]
+  [选型决策 (\S\ref*{sec:rlmc-mm-choose})]
+]
+\end{forest}
+\caption{本章知识导航树。}
+\label{fig:rlmc-mm-navtree}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{算法主线：从 MoCap 到文本/视频}
+\label{sec:rlmc-mm-spectrum}
+
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-mm-spectrum-pos}
+
+\cref{ch:rlmc-imitation} 的所有方法都假定参考运动\emph{已经存在}。本节建立一张「动作来源地图」：参考运动可以来自动捕、视频或文本，三者在精度、成本、灵活性上呈现系统性的此消彼长。这张地图位于整个多模态管线的\emph{最上游}——它决定了下游 retarget、过滤、tracker 训练的难度与上限。
+
+\subsection{动作来源的三个时代}
+\label{sec:rlmc-mm-spectrum-eras}
+
+把动作获取的历史压成三个时代，能一眼看清权衡（\cref{tab:rlmc-mm-eras}）。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{动作来源的三个时代及其权衡}
+\label{tab:rlmc-mm-eras}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+时代 & 来源 & 代表方法 & 精度 & 成本{/}灵活性 \\
+\midrule
+MoCap & 光学{/}惯性动捕 & AMASS, Vicon & 极高（毫米级） & 极高成本{/}低灵活 \\
+视频 & 单目{/}多目 RGB & 4D-Humans, WHAM, HybrIK & 中等（厘米级） & 低成本{/}高灵活 \\
+文本 & 自然语言描述 & MDM, T2M-GPT, CALM & 低（十厘米级以上） & 极低成本{/}极高灵活 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[三个时代像绘画的三种方式]\label{ins:rlmc-mm-painting}
+MoCap 是「照相写实」——精确但昂贵，且受限于现场与演员穿戴。视频是「写生」——看着真实场景画，精度中等但便宜灵活，任何一段视频都能成为素材。文本是「命题创作」——只给一个题目（"画一个人在雨中跑步"），画出来的内容取决于模型的「想象力」，最灵活也最不可控。这条类比贯穿全章：来源越「便宜灵活」，下游就越需要 tracker 与物理过滤来「兜底」物理可行性。
+\end{insight}
+
+\cref{tab:rlmc-mm-eras} 里精度一栏的具体数值（如视频「厘米级」）是\emph{典型量级}而非固定指标——它随 benchmark、相机分辨率、遮挡程度大幅波动，本章后续表格凡涉及精度/FPS 都按此口径理解。
+
+\subsection{Motion Diffusion Model：把动作当「图像」去噪}
+\label{sec:rlmc-mm-mdm}
+
+文生动作的里程碑是 Motion Diffusion Model（MDM，Tevet 等，ICLR 2023，arXiv:2209.14916）\,\cite{tevet2023mdm}。它把一段动作序列看成一种「时间$\times$关节」的二维结构（类似图像），用扩散模型从噪声中去噪生成。前向加噪过程与反向去噪过程是标准 DDPM 形式：
+\begin{equation}
+q(x_t \mid x_{t-1}) = \mathcal{N}\!\big(x_t;\, \sqrt{1-\beta_t}\,x_{t-1},\, \beta_t \mathbf{I}\big),
+\label{eq:rlmc-mm-fwd}
+\end{equation}
+\begin{equation}
+p_\theta(x_{t-1} \mid x_t, c) = \mathcal{N}\!\big(x_{t-1};\, \boldsymbol\mu_\theta(x_t, t, c),\, \boldsymbol\Sigma_\theta(x_t, t, c)\big),
+\label{eq:rlmc-mm-rev}
+\end{equation}
+其中 $x_0$ 是一段动作序列（$T$ 帧 $\times$ $J$ 关节），$c$ 是 CLIP 文本嵌入作为条件。一个值得记住的工程细节：MDM 在每个扩散步\emph{预测原始样本 $x_0$ 而非噪声 $\boldsymbol\epsilon$}，这样便于直接在关节位置/速度上施加几何损失（如足部接触损失），这也是它生成质量好的原因之一。
+
+\begin{insight}[文生动作产出的是「动画」，不是「控制信号」]\label{ins:rlmc-mm-kinematic}
+新手最容易误以为 MDM/T2M-GPT 生成的就能直接驱动机器人。事实是：它们产出的是\textbf{运动学轨迹}（关节角随时间变化），\emph{不保证物理可行}——可能脚穿到地面以下、质心跑出支撑多边形。把这种轨迹直接发给关节 PD 控制器，若某帧要求脚悬空，PD 会产生巨大力矩使机器人剧烈振荡。所以文生动作必须经过 \cref{ch:rlmc-imitation} 的 tracking policy 转成物理可行的控制信号。这正是「\cref{ch:rlmc-imitation} 是本章物理执行层」的根本原因。
+\end{insight}
+
+\subsection{CLIP 文本嵌入：把语义映射到运动空间的入口}
+\label{sec:rlmc-mm-clip}
+
+文生动作的第一步是把文本语义编码成向量。CLIP（Radford 等，ICML 2021，arXiv:2103.00020）\,\cite{radford2021clip} 提供了一个在约 4 亿（400M）图文对上预训练的 text encoder——ViT-B/32 变体把任意自然语言描述映射到 $512$ 维向量。这个向量里「walks」对应运动类型、「forward」对应方向、「slowly」对应速度，模型需要学的是从这个\emph{语义空间}到\emph{运动空间}的映射。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{常用 CLIP 模型与文本嵌入维度（推理速度为典型量级）}
+\label{tab:rlmc-mm-clip}
+\begin{tabular}{@{}llll@{}}
+\toprule
+模型 & 文本嵌入维度 & 相对速度 & 备注 \\
+\midrule
+ViT-B/32 & 512 & 最快 & CALM/TextOp 默认 \\
+ViT-B/16 & 512 & 中 & 精度略高 \\
+ViT-L/14 & 768 & 慢 & 维度不同，需配套改下游 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[CLIP 文本嵌入维度不匹配]
+\textbf{错误描述}：假设所有 CLIP 模型都输出 512 维，把 ViT-L/14 当成 ViT-B/32 用。\textbf{现象后果}：下游判别器/生成器的输入维度对不上，要么直接报形状错误，要么（更隐蔽）用错误的 \verb|condition_dim| 静默初始化，训练永不收敛。\textbf{根本原因}：ViT-B/$\ast$ 输出 512 维，ViT-L/14 输出 768 维。\textbf{正确做法}：在配置里\emph{显式}写明 CLIP model name 与对应的 embedding dim（\cref{tab:rlmc-mm-clip}），并在加载后断言 \Verb[breaklines]|emb.shape[-1] == condition_dim|。
+\end{pitfall}
+
+\begin{insight}[为什么用预训练 CLIP，而不自己训一个文本编码器]\label{ins:rlmc-mm-whyclip}
+一个常见的反事实问题：若不用 CLIP 而训一个专用 text encoder 会怎样？CLIP 的优势在于 400M 图文对的预训练赋予它对各种自然语言的泛化能力。专用 encoder 只能在动作-文本配对数据上训练——而这类数据极其有限（BABEL 仅为约 43 小时 AMASS 提供标注，含 28k+ 序列级、63k+ 帧级标签），泛化能力差。对于训练集里没有的「a person moonwalks」，CLIP 凭借语义临近还有一定理解，专用 encoder 几乎必然失败。这是「冻结一个大预训练编码器、只学下游映射」这一范式的典型收益。
+\end{insight}
+
+\subsection{VQ-VAE：把连续动作离散成「词」}
+\label{sec:rlmc-mm-vqvae}
+
+文生动作的另一条主线是把连续运动\emph{离散化}，从而复用 NLP 的自回归语言模型。VQ-VAE（向量量化变分自编码器）把一段连续动作编码成一串离散 token——类似把句子切成词。\cref{ch:rlmc-imitation} 关注的是「动作$\to$力矩」，这里关注的是「动作$\leftrightarrow$离散码本」。其三个组件（编码器、码本、解码器）的概念实现如下：
+
+\begin{codebox}[Python]{VQ-VAE motion tokenizer（概念性实现，讲清三组件与量化）}
+import torch, torch.nn as nn, torch.nn.functional as F
+
+class MotionVQVAE(nn.Module):
+    def __init__(self, motion_dim=263, latent_dim=512, codebook_size=512):
+        super().__init__()
+        # 1. 编码器: 连续动作 -> 连续 latent（沿时间维 stride 下采样）
+        self.encoder = nn.Sequential(
+            nn.Conv1d(motion_dim, 512, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(512, latent_dim, kernel_size=4, stride=2, padding=1),
+        )
+        # 2. 码本: K 个离散向量（这就是动作的「词典」）
+        self.codebook = nn.Embedding(codebook_size, latent_dim)
+        # 3. 解码器: 离散 token -> 重建动作
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose1d(latent_dim, 512, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose1d(512, motion_dim, kernel_size=4, stride=2, padding=1),
+        )
+
+    def quantize(self, z_e):
+        # z_e: (B, latent_dim, T') -> 找码本中最近的向量
+        distances = torch.cdist(
+            z_e.permute(0, 2, 1),               # (B, T', latent_dim)
+            self.codebook.weight.unsqueeze(0))  # (1, K, latent_dim)
+        indices = distances.argmin(dim=-1)      # (B, T') token 索引
+        z_q = self.codebook(indices).permute(0, 2, 1)
+        return z_q, indices
+
+    def forward(self, motion):                  # motion: (B, motion_dim, T)
+        z_e = self.encoder(motion)
+        z_q, indices = self.quantize(z_e)
+        motion_recon = self.decoder(z_q)
+        # 损失 = 重建 + 码本对齐 + commitment（straight-through 近似见原论文）
+        recon = F.mse_loss(motion_recon, motion)
+        codebook = F.mse_loss(z_q.detach(), z_e) + 0.25 * F.mse_loss(z_q, z_e.detach())
+        return motion_recon, indices, recon + codebook
+\end{codebox}
+
+上面这段代码的关键不在网络层，而在 \verb|quantize|：它把连续 latent「吸附」到码本里最近的离散向量。token 化之后就能用 GPT 风格的自回归模型生成动作——输入 text token、输出 motion token，再经解码器还原为连续动作。T2M-GPT（Zhang 等，CVPR 2023，arXiv:2301.06052）\,\cite{zhang2023t2mgpt} 正是这种「离散 motion token + GPT」范式，在 HumanML3D 上取得了 FID 0.116 的强结果。
+
+\begin{note}[别把 TextOp 的高层误当成 VQ-VAE+GPT]
+\cref{sec:rlmc-mm-textop} 的 TextOp 高层生成器用的是\emph{自回归 motion diffusion}（连续 chunk），不是 T2M-GPT 那种「离散 token + GPT」。两者都「自回归」，但一个在连续空间扩散去噪、一个在离散码本上做语言建模——属于两类范式，读代码时务必分清。
+\end{note}
+
+码本大小 \verb|codebook_size| 的选择是个典型的容量权衡：太小（如 64）会过度压缩动作种类、重建质量差；太大（如 4096）会让很多 token 使用率极低、浪费容量。文献中常用 512--1024。
+
+\subsection{SMPL 表示：所有方法的公共中间语}
+\label{sec:rlmc-mm-smpl}
+
+无论文本还是视频，几乎所有方法都用 SMPL（Skinned Multi-Person Linear model，Loper 等，2015）\,\cite{loper2015smpl} 作为人体的中间表示。\cref{ch:rlmc-imitation} 的 retarget 一节已介绍其参数结构，这里只强调与本章直接相关的一点：SMPL 的每个关节是 \textbf{3-DoF ball joint}（用 axis-angle 表示），$23\times 3=69$ 维 body pose；而 G1 的每个关节是 \textbf{1-DoF revolute joint}，共 29 维。二者不能直接映射，必须经 IK 求解（\cref{tab:rlmc-mm-smpl}）。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{SMPL 核心参数及其在 retarget 中的角色}
+\label{tab:rlmc-mm-smpl}
+\begin{tabular}{@{}llll@{}}
+\toprule
+参数 & 维度 & 含义 & retarget 中的用途 \\
+\midrule
+\texttt{betas} & 10 & 体形 & 骨骼缩放（身高/胖瘦） \\
+\texttt{global\_orient} & 3 & root 朝向（axis-angle） & 转到机器人坐标系 \\
+\texttt{body\_pose} & 69 & 23 关节 $\times$ 3 & IK 求机器人关节角 \\
+\texttt{transl} & 3 & root 全局平移 & 按身高比缩放 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[绕过 SMPL 直接在机器人空间生成，能省掉一层误差]\label{ins:rlmc-mm-robotskel}
+TextOp（\cref{sec:rlmc-mm-textop}）的一个关键设计就是\emph{不经过 SMPL}——直接在 G1 的 29 维关节空间里训练生成模型（Robot-Skeleton 表示）。这样省掉了「SMPL 72 维 $\to$ G1 29 维」的 retarget 转换误差，生成的轨迹可被 tracker 直接消费。这条洞察的普适形式是：\emph{中间表示每多一层，就多一层误差与延迟}；当生成与执行用同一套表示时，接口最干净。
+\end{insight}
+
+\subsection{视频姿态估计技术栈}
+\label{sec:rlmc-mm-pose}
+
+从视频获取动作需要「人体姿态估计」——从 RGB 像素恢复 3D 关节位置与朝向。主流工具见 \cref{tab:rlmc-mm-pose}（精度/速度为典型量级）。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{常用视频/图像人体姿态估计工具（精度/FPS 依 benchmark 与硬件而异）}
+\label{tab:rlmc-mm-pose}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+工具 & 输入 & 输出 & 全局平移 & 特点 \\
+\midrule
+4D-Humans & 单目 RGB 视频 & SMPL body + 跟踪 & 弱 & 全身 body（不含手） \\
+WHAM & 单目 RGB 视频 & SMPL body + 全局平移 & 好 & world-grounded \\
+HybrIK & 单帧 RGB & SMPL pose（混合解析-神经 IK） & 弱 & 由 3D 关节解算旋转 \\
+HaMeR & 单帧 RGB & MANO hand & N/A & 专做手部 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+WHAM（Shin 等，CVPR 2024，arXiv:2312.07531）\,\cite{shin2024wham} 的关键价值在 \texttt{global\_orient} 之外还给出准确的\emph{全局平移}——它借助 SLAM 估计的相机角速度联合人体运动恢复世界坐标系下的轨迹。这对机器人控制至关重要：机器人需要知道「走了多远」，而不只是「关节怎么弯」。\cref{sec:rlmc-mm-humanplus} 的 HumanPlus 正是用 WHAM（身体）+ HaMeR（手部）$\to$ SMPL-X/MANO $\to$ retarget 到 H1，在「全身+手部」的精度与速度间取得平衡。
+
+\begin{pitfall}[视频估计的「平均 5cm」会在关键帧上爆掉]
+\textbf{错误描述}：看到「平均误差约 5cm」就认为够用，直接喂给 tracker。\textbf{现象后果}：大部分帧没问题，但接触瞬间、转向起始这类\emph{关键帧}的误差远大于平均值，导致 tracker 在物理上不可行（脚穿地、自碰撞）。\textbf{根本原因}：遮挡时（人体被物体或自身部位挡住）估计精度急剧下降，而关键帧往往伴随遮挡。\textbf{正确做法}：在 retarget 之后、tracker 训练之前，插入 \cref{ch:rlmc-imitation} 引入的物理过滤（physics filter）/质量门禁（\cref{sec:rlmc-mm-video}），过滤掉物理不可行的帧。
+\end{pitfall}
+
+\subsection{从来源到机器人控制的统一链路}
+\label{sec:rlmc-mm-pipeline}
+
+把本章所有方法压成一条链路，就能看清每个环节的归属：
+
+\begin{codebox}{多模态动作获取的统一管线（两个 [*] 是与 \cref{ch:rlmc-imitation} 的连接点）}
+文本 "walk forward slowly"  /  视频 MP4  /  实时 RGB 相机
+    | CLIP 文本编码 / WHAM 姿态估计
+语义向量 (512,)  /  SMPL 参数 (body_pose, global_orient, transl)
+    | MDM / T2M-GPT / TextOp RobotMDAR / retarget
+运动学轨迹 (T, J) —— 关节角序列（不保证物理可行）
+    | [*] 物理可行性过滤 (physics filter, 见 ch:rlmc-imitation)
+过滤后轨迹 (T', J)
+    | [*] tracking policy (BeyondMimic, 见 ch:rlmc-imitation)
+关节位置目标 50 Hz
+    | PD 控制器
+关节力矩 -> 机器人执行
+\end{codebox}
+
+\begin{insight}[「来源不同，下游同构」——这是本章的总纲]\label{ins:rlmc-mm-unified}
+本章的本质洞察只有一句：\textbf{所有方法都只是「参考动作来源」的不同实例}，它们的输出最终都要经过同一条「过滤 $\to$ tracker $\to$ PD」的下游。MoCap 最精确但最贵，文本最灵活但最不精确，视频居中。理解这个统一视角，你在任何新方法（明年又冒出一个新缩写）出现时，只需问三个问题：(1) 它替换了链路里的哪个环节？(2) 输入输出格式是什么？(3) 与现有环节的接口如何对齐？
+\end{insight}
+
+\begin{practice}[练习·来源谱系]
+\begin{enumerate}
+  \item \textbf{[分类]} 以下任务分别推荐哪类来源（MoCap/视频/文本），给出「精度需求」与「数据可得性」两条依据：(a) 精确复现一段太极拳编排；(b) 模仿一段 YouTube 街舞；(c) 让机器人按语音指令做日常动作。
+  \item \textbf{[计算]} CLIP ViT-B/32 文本嵌入是 512 维。若要把它映射到一段 $150$ 帧 $\times$ $29$ 关节的动作序列，中间至少需要什么结构（给出一种最简设计），并粗估其参数量级。
+  \item \textbf{[跨章综合，\cref{ch:rlmc-imitation}+本章]} \cref{ch:rlmc-imitation} 的 BeyondMimic tracking obs 含约 60 维 motion reference。若参考改为 MDM 生成（而非 MoCap），这些 reference 项的质量会如何变化？对 tracking 成功率有何影响？验收标准：从「精度」与「物理可行性」两方面作答。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{文本条件控制：CALM 在三框架的工程实现}
+\label{sec:rlmc-mm-calm}
+
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-mm-calm-pos}
+
+\cref{ch:rlmc-imitation} 已在算法层面提过 CALM 是 AMP 谱系里「加条件」的一步。本节把它落成\emph{工程实现}：text embedding 如何注入判别器、CLIP 如何冻结、以及在 ProtoMotions 中如何从 AMP/ASE 切到 CALM。在管线中，CALM 取代无条件 AMP 的位置——判别器不仅判断「像不像参考」，还判断「是否匹配这句文字」。
+
+\subsection{动机：AMP 不知道「哪一种」参考}
+\label{sec:rlmc-mm-calm-motivation}
+
+回顾 \cref{ch:rlmc-imitation} 的 AMP：判别器区分「策略动作」和「参考动作」，但不关心\emph{哪种}参考。AMP 学到的是「像参考数据集中的某个动作」——你无法指定「像走路」还是「像跑步」。CALM（Conditional Adversarial Latent Models，Tessler 等，SIGGRAPH 2023，arXiv:2305.02195）\,\cite{tessler2023calm} 在 AMP 基础上加入\textbf{条件}：判别器同时检查动作是否匹配文字描述 $c$。CALM 继承 AMP 的 LSGAN（最小二乘）判别器（参见 \cref{eq:rlmc-imit-amp-disc}），$D_{\mathrm{CALM}}(s,s',c)$ 输出回归值（参考且匹配 $c$ 时回归到 $+1$，否则 $-1$），style reward 沿用 AMP 的平滑 surrogate（参见 \cref{eq:rlmc-imit-amp-style}）：
+\begin{equation}
+r_{\mathrm{CALM}} = \max\!\Big[0,\; 1 - \tfrac14\big(D_{\mathrm{CALM}}(s, s', c) - 1\big)^2\Big].
+\label{eq:rlmc-mm-calm-reward}
+\end{equation}
+
+\subsection{配置详解：从 AMP 到 CALM 只差一个条件维}
+\label{sec:rlmc-mm-calm-config}
+
+\cref{ch:rlmc-imitation} 给出了 AMP 判别器的网络结构。CALM 的全部改动可以浓缩为「输入多了 \verb|condition_dim|」：
+
+\begin{codebox}[Python]{AMP 判别器（无条件）vs CALM 判别器（条件——text embedding 注入）}
+import torch, torch.nn as nn
+
+class AMPDiscriminator(nn.Module):           # 无条件（见 ch:rlmc-imitation）
+    def __init__(self, obs_dim, hidden=(1024, 512)):
+        super().__init__()
+        self.net = build_mlp(obs_dim * 2, hidden, out_dim=1)   # [s_t, s_{t+1}] 拼接
+    def forward(self, obs, next_obs):
+        return self.net(torch.cat([obs, next_obs], dim=-1))
+
+class ConditionalAMPDiscriminator(nn.Module):  # CALM: 多了 condition_dim
+    def __init__(self, obs_dim, condition_dim=512, hidden=(1024, 512)):
+        super().__init__()
+        self.net = build_mlp(obs_dim * 2 + condition_dim, hidden, out_dim=1)
+    def forward(self, obs, next_obs, text_embedding):
+        # 关键:把 text_embedding 与状态对拼接，判别器才能「按条件评判」
+        return self.net(torch.cat([obs, next_obs, text_embedding], dim=-1))
+\end{codebox}
+
+差异只在 \verb|input_dim| 多了 \verb|condition_dim|、\verb|forward| 多了 \Verb[breaklines]|text_embedding| 参数。text embedding 来自一个\emph{冻结}的 CLIP encoder：
+
+\begin{codebox}[Python]{CLIP 文本编码器（务必冻结，否则语义会在训练中漂移）}
+class CLIPTextEncoder(nn.Module):
+    def __init__(self, model_name="ViT-B/32"):
+        super().__init__()
+        import clip
+        self.model, _ = clip.load(model_name, device="cuda")
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False           # 冻结 CLIP:保证 text 语义一致
+    def forward(self, text_list):
+        tokens = clip.tokenize(text_list).to("cuda")
+        with torch.no_grad():
+            emb = self.model.encode_text(tokens)   # (B, 512)
+        return emb.float()
+\end{codebox}
+
+\cref{tab:rlmc-mm-calm-config} 用「配置四维」视角解释 CALM 的关键超参——这是本章配置详解的统一格式。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{CALM 关键配置的四维解读}
+\label{tab:rlmc-mm-calm-config}
+\begin{tabular}{@{}lp{2.6cm}p{3.0cm}p{3.4cm}@{}}
+\toprule
+配置项 & 默认值来源 & 修改影响 & 合理范围 / 耦合 \\
+\midrule
+\texttt{condition\_dim} & CLIP ViT-B/32 & 与 CLIP 维度不符则崩 & 须 $=512$（ViT-B/$\ast$），与 \texttt{model\_name} 强耦合 \\
+\texttt{gradient\_penalty\_weight} & AMP 经验值 5.0 & 太小判别器过拟合、reward 二值化 & $1\sim10$；与 \texttt{disc\_lr} 耦合 \\
+\texttt{latent\_dim} & ASE/CALM 默认 64 & 太大易采到 OOD latent，太小表达不足 & $32\sim128$ \\
+\texttt{learning\_rate} & 5e-4 & 太大判别器/策略震荡 & $1\text{e-}4\sim 1\text{e-}3$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[CLIP encoder 在训练中被误更新]
+\textbf{错误描述}：CLIP encoder 的 \Verb[breaklines]|requires_grad=True|，CALM 的判别器 loss 反传进了 CLIP。\textbf{现象后果}：训练初期正常，后期 text embedding 语义\emph{漂移}——相似文本却产生完全不同的动作。\textbf{根本原因}：判别器为降 loss 会顺带「改写」CLIP 的语义空间，破坏了「文本$\to$向量」的稳定映射。\textbf{正确做法}：\Verb[breaklines]|for p in clip_model.parameters(): p.requires_grad = False|，并在训练日志里周期性打印同一固定 prompt 的 embedding 范数确认不变。
+\end{pitfall}
+
+\subsection{代码走读：CALM 的训练 loss 组成}
+\label{sec:rlmc-mm-calm-loss}
+
+把 PPO、判别器、style reward、encoder 四块拼起来，就是 CALM 的一步训练。注意它与 \cref{ch:rlmc-imitation} 的 AMP 训练\emph{同构}，只是处处多了 \verb|text_emb|：
+
+\begin{codebox}[Python]{CALM 一步训练的 loss 组成（逐块对应 ch:rlmc-imitation 的 AMP）}
+def calm_training_step(agent, batch):
+    obs, next_obs = batch["obs"], batch["next_obs"]
+    text_labels = batch["text_labels"]
+
+    # 1. PPO loss:与 ch:rlmc-imitation 的 PPO 完全相同
+    ppo_loss = compute_ppo_loss(agent.actor, agent.critic, batch)
+
+    # 2. 判别器 loss
+    text_emb = agent.text_encoder(text_labels)                       # 冻结 CLIP
+    real_obs, real_next = sample_real_transitions(batch["motion_data"])
+    d_real = agent.discriminator(real_obs, real_next, text_emb)      # 参考且匹配 c
+    d_fake = agent.discriminator(obs, next_obs, text_emb)            # 策略生成
+    # LSGAN 回归目标:参考 -> +1，策略 -> -1（见 eq:rlmc-imit-amp-disc）
+    disc_loss = 0.5 * ((d_real - 1.0) ** 2).mean() \
+              + 0.5 * ((d_fake + 1.0) ** 2).mean()
+    gp = compute_gradient_penalty(agent.discriminator, real_obs, real_next, text_emb)
+    disc_total = disc_loss + 5.0 * gp                                # gp_weight = 5.0
+
+    # 3. style reward（给 PPO 用的额外 reward;见 eq:rlmc-mm-calm-reward）
+    with torch.no_grad():
+        style_reward = torch.clamp(1.0 - 0.25 * (d_fake - 1.0) ** 2, min=0.0)
+
+    # 4. encoder loss（ASE/CALM 特有:把 (obs, text) 映到紧凑 skill latent）
+    enc_loss = compute_encoder_loss(agent.encoder(obs, text_emb), batch) \
+               if hasattr(agent, "encoder") else 0.0
+    return ppo_loss, disc_total, style_reward, enc_loss
+\end{codebox}
+
+梯度惩罚的实现与 \cref{ch:rlmc-imitation} 的 WGAN-GP 风格一致——对真实数据的判别器输出关于输入求梯度，惩罚梯度范数偏离 1：
+
+\begin{codebox}[Python]{CALM 的梯度惩罚（与 ch:rlmc-imitation 同形，多了 text\_emb）}
+def compute_gradient_penalty(disc, real_obs, real_next, text_emb):
+    real_obs.requires_grad_(True); real_next.requires_grad_(True)
+    d_real = disc(real_obs, real_next, text_emb)
+    grads = torch.autograd.grad(
+        outputs=d_real, inputs=[real_obs, real_next],
+        grad_outputs=torch.ones_like(d_real),
+        create_graph=True, retain_graph=True)
+    grad_norm = sum(g.reshape(g.size(0), -1).norm(dim=1) for g in grads)
+    return ((grad_norm - 1.0) ** 2).mean()        # 惩罚偏离 1 的梯度
+\end{codebox}
+
+\Verb[breaklines]|gradient_penalty_weight = 5.0| 的含义：判别器总 loss = GAN loss + $5.0\times$ 梯度惩罚。较大的权重让判别器更「保守」、输出更平滑，策略拿到的 reward 信号更连续；太小（如 0.1）则判别器易过拟合训练数据，对策略新生成的动作给出极端判断。这与 \cref{ch:rlmc-imitation} 「理想判别器是稍好于瞎猜」的洞察一脉相承。
+
+\subsection{运行验证：盯住 disc/accuracy 这把尺子}
+\label{sec:rlmc-mm-calm-verify}
+
+CALM 训练健康与否，最关键的单一指标是判别器准确率（\cref{tab:rlmc-mm-calm-monitor}）。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{CALM 训练监控面板（Tensorboard）}
+\label{tab:rlmc-mm-calm-monitor}
+\begin{tabular}{@{}llll@{}}
+\toprule
+面板 & 健康趋势 & 异常信号 & 对应动作 \\
+\midrule
+\texttt{disc/loss} & 稳定 0.5--1.5 & 降到约 0 & 判别器过自信 $\to$ 增大 gp\_weight \\
+\texttt{disc/\allowbreak accuracy} & 50\%--70\% & $>90\%$ & 过拟合 $\to$ 增大 gp\_weight \\
+\texttt{style\_reward} & 缓慢上升 & 不涨或下降 & 策略没学到匹配风格 \\
+\texttt{policy/\allowbreak entropy} & 缓慢下降 & 快速到 0 & 熵坍塌 $\to$ 加 entropy bonus \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\verb|disc/accuracy| 应落在 50\%--70\%。$>90\%$ 说明判别器太强、style reward 太弱；$<50\%$ 说明判别器太弱、策略没受到有效风格约束。这与 \cref{ch:rlmc-imitation} 的 AMP 调试经验完全一致——CALM 只是把无条件判别器换成了条件判别器。
+
+\subsection{三框架对比：ProtoMotions / Isaac Lab 原生 / UniLab}
+\label{sec:rlmc-mm-calm-three}
+
+\paragraph{ProtoMotions（主战场）。}CALM 在 ProtoMotions 里通过一个实验配置启用，核心是把判别器换成条件版、加上 CLIP text encoder：
+
+\begin{codebox}[Python]{ProtoMotions CALM 实验配置（dataclass/结构化配置要点）}
+# 关键字段（实验配置 .py / 结构化配置;非旧 Hydra +exp=）
+agent.discriminator = ConditionalAMPDiscriminator(
+    hidden_dims=[1024, 512], gradient_penalty_weight=5.0,
+    condition_dim=512)                       # CLIP ViT-B/32
+agent.encoder = ConditionalSkillEncoder(
+    latent_dim=64, hidden_dims=[512, 256], condition_dim=512)
+agent.text_encoder = CLIPTextEncoder(model_name="ViT-B/32")
+agent.learning_rate = 5.0e-4
+agent.gamma = 0.99
+\end{codebox}
+
+训练与评估用 dataclass 命令行（与 \cref{ch:rlmc-imitation} 一致）。注意动作-文本配对数据：AMASS 本身无文字标注，需 BABEL/TEACH 等标注集（\cref{tab:rlmc-mm-textdata}），并在 motion manifest 的每条动作上加 \verb|text| 字段——AMP 忽略该字段，CALM 使用它，于是同一份 manifest 可被两种算法复用。
+
+\begin{codebox}[bash]{ProtoMotions CALM 训练/推理（dataclass 入口，已核 ProtoMotions3）}
+# 训练（先用 BABEL/TEACH 标注的 AMASS 子集打包成 .pt）
+# 训练时长经 --overrides 写进 agent 配置（具体 key 以所装版本的 experiment 文件为准）
+python protomotions/train_agent.py \
+    --experiment-path examples/experiments/calm/mlp.py \
+    --robot-name g1 --simulator isaacgym \
+    --motion-file data/calm_dataset.pt \
+    --num-envs 4096 --experiment-name g1_calm
+# 推理评估（脚本是 inference_agent.py;ProtoMotions 无 --text-prompt CLI，
+#   文本/技能条件经实验配置的条件环境与 latent/text 编码器装配，详见三框架对比小节）
+python protomotions/inference_agent.py \
+    --checkpoint results/g1_calm/last.ckpt \
+    --motion-file data/calm_dataset.pt \
+    --simulator isaacgym --num-envs 16
+\end{codebox}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{动作-文本配对标注数据集}
+\label{tab:rlmc-mm-textdata}
+\begin{tabular}{@{}llll@{}}
+\toprule
+数据集 & 规模 & 文字标注 & 适用 \\
+\midrule
+BABEL & 约 43h AMASS（28k+ 序列 / 63k+ 帧标签） & 自然语言动作描述 & 文本-动作标注 \\
+TEACH & 约 3K 标注 & 时间对齐文字-动作对 & 高质量对齐 \\
+HumanML3D & 约 14K & 每动作 3 段描述 & MDM/T2M-GPT 训练 \\
+KIT-ML & 约 3K & 英文动作描述 & 辅助数据 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Isaac Lab 原生。}如 \cref{ch:rlmc-imitation} 所述，Isaac Lab 既可作 ProtoMotions 的后端，也可借其 manager-based 架构把条件判别器作为自定义 reward term 原生集成——把 \cref{eq:rlmc-mm-calm-reward} 写成一个 reward 函数，text embedding 作为 command term 注入观测。
+
+\paragraph{UniLab（需自实现，非内置）。}必须如实说明：UniLab 的运动跟踪主线是\textbf{显式动作跟踪 + RL}（PPO/APPO/SAC），\emph{没有把对抗判别器（AMP/ASE）做成一等公民}，因此 CALM 的「条件判别器 + style reward」在 UniLab 里\textbf{需自实现}\,\cite{unilab2026}。但 UniLab 的工程范式恰好给出了清晰的接入点，无需自建训练循环：CALM 的 style reward（\cref{eq:rlmc-mm-calm-reward}）可写成一个吃 \verb|RewardContext| 的纯函数挂进 \Verb[breaklines]|envs/locomotion/common/rewards.py| 的 \verb|_reward_fns| 派发表（对照 \cref{ch:rlmc-reward} 讲的 UniLab「标量字典 + 派发表」范式），权重经 \verb|reward.scales| 注入；text embedding 与判别器输出则作为额外特权/命令通道在环境子类的 \verb|_compute_obs| 里拼进 \verb|critic| 组（UniLab 用 \Verb[breaklines]|obs_groups_spec| 的 \verb|obs|/\allowbreak\verb|critic| 两组实现非对称 actor-critic）。判别器网络本身需用 PyTorch 自建，并在 GPU learner 侧与 PPO 同步更新——这与 ProtoMotions 的 \Verb[breaklines]|ConditionalAMPDiscriminator| 同构，差别只在 UniLab 把它放进\emph{异构 collector/learner} 框架而非单进程。
+
+\begin{codebox}[Python]{UniLab:把 CALM style reward 挂进 \_reward\_fns 派发表（判别器需自建）}
+# UniLab —— CALM 非内置:style reward 写成 RewardContext 纯函数，权重经 reward.scales 注入
+# 前提:自建 ConditionalAMPDiscriminator（PyTorch）并在 learner 侧与 PPO 同步训练，
+#       把每步的 d_fake 写进 ctx（如 ctx.info["calm_d_fake"]）;text_emb 由冻结 CLIP 给.
+def calm_style_reward(ctx):                          # 放进 env._reward_fns
+    import numpy as np
+    d_fake = ctx.info["calm_d_fake"]                 # 判别器对策略动作的回归值
+    return np.clip(1.0 - 0.25 * (d_fake - 1.0) ** 2, 0.0, None)  # 见 eq:rlmc-mm-calm-reward
+# reward.scales 里给权重即生效（Hydra 覆盖）: reward.scales.calm_style_reward=1.0
+# 判别器/CLIP 不属于 UniLab 内置——它们与 PPO 在 GPU learner 侧自管更新;
+# 跨后端回放前注意 sim2sim 契约校验（training.sim2sim_strict=true）.
+\end{codebox}
+
+\paragraph{给 mjlab tracker 喂 motion：本章「发动机」真正能点火的最小命令。}本章反复把 tracker 当成「烧燃料的发动机」，但 mjlab 侧到底\emph{怎么喂燃料}此前没给闭环——直接裸跑 \Verb[breaklines]|Mjlab-Tracking-Flat-Unitree-G1| 会报 \verb|ValueError| 要 motion（见前面「墙3」）。下面给一条无需 WandB registry、纯本地文件就能点火的最小序列（CALM/生成轨迹换成 \verb|.npz| 后走的是同一条路）：
+
+\begin{codebox}[bash]{mjlab tracker 最小可跑闭环:CSV/生成轨迹 -> npz -> 训练（本地文件，无需 WandB）}
+# 第1步:把一段动作（CSV，或本章文本/视频生成出的关节角序列）转成 mjlab 的 .npz 契约.
+#   csv_to_npz 是 tyro 入口，自动把源 fps 重采样到 50Hz（--output-fps 默认 50）.
+python -m mjlab.scripts.csv_to_npz \
+    --input-file g1_walk.csv --input-fps 30 --output-name g1_walk
+#   产物落在 mjlab 约定的 motions 目录，得到 g1_walk.npz（键含 joint_pos/body_pos_w/... + fps）.
+# 第2步:用 --env.commands.motion.motion-file 指向它训练（这就是裸跑缺的那个旗）.
+WANDB_MODE=disabled mjlab train Mjlab-Tracking-Flat-Unitree-G1 \
+    --env.commands.motion.motion-file /abs/path/to/g1_walk.npz \
+    --env.scene.num-envs 4096 --max-iterations 2        # 先 2 迭代冒烟，确认不报错再放大
+# 看到 steps/s 与 value loss 正常打印、无 NaN，即说明「燃料 -> 发动机」这段通了.
+\end{codebox}
+
+\noindent 这条命令的价值在于把「来源$\to$tracker」从概念闭环变成\emph{工程闭环}：本章任何来源（CALM 条件采样、TextOp 生成、视频 retarget）产出的关节角序列，只要先经第 1 步落成 mjlab 的 \verb|.npz| 契约，就能用第 2 步的同一个旗喂进 tracker。ProtoMotions 侧对应 \Verb[breaklines]|--motion-file *.pt|、UniLab 侧把 \verb|.npz| 放进 \Verb[breaklines]|assets/motions/g1/|（\cref{sec:rlmc-mm-video} 给了 UniLab 的喂入命令），三框架\emph{喂燃料的入口虽不同名，契约思想一致}。
+
+\begin{insight}[CALM 是「约束风格分布」，不是「精确指定动作」]\label{ins:rlmc-mm-calm-style}
+新手常误以为「walk forward slowly」会得到一个确定动作。实际上 CALM 约束的是动作的\textbf{风格分布}：这句话约束了速度（慢）与方向（前），但没约束步幅（大步慢走 vs 小步慢走）或摆臂（自然摆 vs 手插口袋）。同一 prompt 配不同 latent 采样会生成多样动作。这种「约束但不完全指定」既是优势（灵活）也是局限（未约束维度可能出现不自然行为）。验证方法很直接：固定 prompt、扫不同 seed 录像，预期「都在走路但步幅/摆臂/节奏有别」。
+\end{insight}
+
+\begin{practice}[练习·CALM]
+\begin{enumerate}
+  \item \textbf{[实验]} 在 ProtoMotions 训练 CALM，用 5 个 prompt（走/跑/跳/转身/蹲下）评估。记录各 prompt 的动作质量并解释差异。验收标准：给出 \verb|disc/accuracy| 曲线，说明它是否落在 50\%--70\%。
+  \item \textbf{[配置]} 写出从 ASE 切到 CALM 需修改的具体字段，标注哪些是「替换」、哪些是「新增」。验收标准：至少覆盖判别器、encoder、text\_encoder 三处。
+  \item \textbf{[设计]} 若要支持中文 prompt（如「慢慢走」），需做哪些修改？CLIP 原生支持中文吗？若不支持，给出一个替代方案（提示：多语言文本编码器或翻译前置）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{MaskedMimic：用 motion inpainting 统一多模态}
+\label{sec:rlmc-mm-masked}
+
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-mm-masked-pos}
+
+CALM 用文本约束\emph{整体风格}，但只能给「整体约束」。MaskedMimic 更进一步——它从\textbf{部分约束}（一个关键帧、一个目标位置、一段文字，或任意组合）补全整段动作。在管线中，MaskedMimic 是一个「统一控制接口」：上游可以给任意模态的部分信息，下游永远输出关节位置目标交给 PD。\cref{ch:rlmc-imitation} 已在算法层介绍过它，本节落到两阶段训练的工程接线。
+
+\subsection{核心思想：所有指令都是「部分运动描述」}
+\label{sec:rlmc-mm-masked-idea}
+
+MaskedMimic（Tessler 等，SIGGRAPH Asia 2024，arXiv:2409.14393）\,\cite{tessler2024maskedmimic} 的关键洞察是：文本指定风格但不指定关节角；关键帧指定某些时刻的姿态但不指定中间过渡；目标位置指定末端位置但不指定到达路径——\emph{所有控制指令都可看作部分的运动描述}。于是一个统一的 motion inpainting 模型可以从任意部分描述\textbf{补全}完整动作。这与 NLP 的 masked language model（BERT）同构：给定句子中的部分词预测被遮挡的词。
+
+\subsection{配置详解：两阶段训练}
+\label{sec:rlmc-mm-masked-train}
+
+\paragraph{Phase 1：全约束专家（PPO）。}与 \cref{ch:rlmc-imitation} 的 motion tracking 完全相同——训练一个能精确跟踪参考的 expert，其 obs 含完整参考运动信息（约 160 维）。
+
+\paragraph{Phase 2：masked 在线蒸馏。}把 expert 的全信息策略蒸馏到一个能处理部分信息的 transformer。这里有一个\emph{极易误解}的点：它是\textbf{在线 teacher-student 蒸馏}，不是离线数据集 BC，也不是 PPO。训练中机器人被初始化到随机动作的随机帧，expert（Phase 1 冻结策略）观察\emph{未遮挡}的未来动作并实时给出 action 作为监督信号；student 观察\emph{随机遮挡}版本并预测 expert 的 action。它仍 rollout 与环境交互（student 用自己的动作推进），但学习信号来自实时查询冻结 expert，而非预录数据。
+
+\begin{codebox}[Python]{MaskedMimic Phase 2 蒸馏（概念性，讲清「在线查询 expert」）}
+class MaskedMimicTrainer:
+    def __init__(self, expert_policy, student_model, mask_ratio=0.7):
+        self.expert = expert_policy; self.expert.eval()   # 冻结 expert
+        self.student = student_model                      # transformer
+        self.mask_ratio = mask_ratio
+        self.opt = torch.optim.Adam(self.student.parameters(), lr=1e-4)
+
+    def train_step(self, obs_full, motion_description):
+        # 1. expert 在「未遮挡」观察下实时给出 ground-truth action
+        with torch.no_grad():
+            expert_action = self.expert(obs_full)
+        # 2. 随机遮挡运动描述（关键帧/文本/目标位置/身体部位 的组合）
+        mask = self.generate_random_mask(motion_description)
+        masked_desc = motion_description * mask
+        # 3. student 只看 proprio + masked 描述（不看完整 motion reference）
+        student_action = self.student(obs_full[:, :PROPRIO_DIM], masked_desc)
+        # 4. 蒸馏 loss:MSE 到 expert 的在线 action（监督式，不是 PPO 探索）
+        loss = F.mse_loss(student_action, expert_action)
+        self.opt.zero_grad(); loss.backward(); self.opt.step()
+        return loss.item()
+\end{codebox}
+
+\begin{codebox}[Python]{随机 mask 生成:每个 batch 看到不同的 mask 组合}
+def generate_random_mask(self, description):
+    import random
+    mask = torch.ones_like(description)
+    for mt in random.sample(["keyframes", "text", "target_pos", "body_parts"],
+                            k=random.randint(1, 3)):
+        if mt == "keyframes":              # 遮某些时间帧的姿态
+            fm = torch.rand(description.shape[1]) > self.mask_ratio
+            mask[:, fm, :KEYFRAME_DIM] = 0
+        elif mt == "text" and random.random() < self.mask_ratio:
+            mask[:, :, TEXT_START:TEXT_END] = 0
+        elif mt == "target_pos" and random.random() < self.mask_ratio:
+            mask[:, :, TARGET_START:TARGET_END] = 0
+        elif mt == "body_parts":           # 遮某些身体部位
+            for p in random.sample(range(NUM_BODY_PARTS),
+                                   k=int(self.mask_ratio * NUM_BODY_PARTS)):
+                mask[:, :, BODY_STARTS[p]:BODY_ENDS[p]] = 0
+    return mask
+\end{codebox}
+
+Phase 2 的三个关键设计：(1) student 是 \textbf{transformer} 而非 MLP——mask 后输入的长度与内容是变化的，attention 天然处理变长；(2) 用监督式蒸馏 loss 而非 PPO——在线查询 expert 直接学比重新探索稳定；(3) 每个 batch 的 mask 组合不同——模型在训练中见遍所有 mask 模式。
+
+\begin{pitfall}[把 MaskedMimic Phase 2 当成 RL 探索]
+\textbf{错误描述}：用 PPO 训练 Phase 2。\textbf{现象后果}：训练极不稳定——mask 后的输入信息不足以让 PPO 有效探索，reward 噪声淹没学习信号。\textbf{根本原因}：Phase 2 的目标是「模仿 expert 在未遮挡下的决策」，这是监督问题不是探索问题。\textbf{正确做法}：用在线 teacher-student 蒸馏，从 Phase 1 expert 实时取 action 作监督；它在 rollout 分布上学习（缓解 distribution shift），但不重新探索。
+\end{pitfall}
+
+\subsection{推理：一个模型、多种控制}
+\label{sec:rlmc-mm-masked-infer}
+
+训练完成后，只需提供不同的 mask 就得到不同的控制方式（\cref{tab:rlmc-mm-masked-modes}）。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{MaskedMimic 推理时的多模态控制（提供什么 = 不遮什么）}
+\label{tab:rlmc-mm-masked-modes}
+\begin{tabular}{@{}llll@{}}
+\toprule
+控制方式 & 提供的信息 & 遮挡的信息 & 应用 \\
+\midrule
+文本控制 & text embedding & 关键帧、目标 & "walk slowly" \\
+关键帧控制 & 起止姿态 & 文本、中间帧 & 动画插值 \\
+目标导航 & 目标 $(x,y,\mathrm{yaw})$ & 文本、关键帧 & 走到指定位置 \\
+混合控制 & 文本 + 起始姿态 & 目标、中间帧 & "从当前姿态起跑" \\
+全约束 & 全部 & 无 & 等同 expert \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[一个 mask 模型省掉 N 个独立模型，还隐式共享知识]\label{ins:rlmc-mm-masked-share}
+反事实：若为每种控制方式训一个独立模型，需要 5 个模型，训练与维护成本是 MaskedMimic 的 5 倍；更关键的是独立模型间\emph{不共享知识}——文本控制模型不知道关键帧控制模型学到的运动规律。MaskedMimic 通过共享 transformer 参数，让不同控制模式隐式传递知识。这与 \cref{ch:rlmc-privileged} 的 HOVER「按身体部位 mask」是同一思想的两个实例：HOVER 遮\emph{身体部位}，MaskedMimic 遮\emph{信息类型}；前者解耦导航/操作，后者统一文本/关键帧/目标。
+\end{insight}
+
+\paragraph{三框架定位。}MaskedMimic 是 ProtoMotions 的旗舰方法（在 IsaacGym/Isaac Lab/Genesis 后端可跑）。mjlab 侧目前以 BeyondMimic 显式跟踪为主，要复现 inpainting 需自行实现 transformer student 与 mask 逻辑。\textbf{UniLab} 同样\emph{无内置 motion inpainting}，transformer student 与 mask 逻辑需自实现\,\cite{unilab2026}；但与 mjlab 不同的是，MaskedMimic Phase 2 的「在线 teacher-student 蒸馏」这一\emph{机制}在 UniLab 里有现成脚手架——UniLab 自带 \textbf{HORA} 蒸馏（\Verb[breaklines]|scripts/train_hora_distill.py| + \Verb[breaklines]|algos/torch/hora/distill.py| 的 \Verb[breaklines]|HoraDistillationTrainer|），它把一个特权 PPO teacher 蒸馏给从历史学时序自适应的 student（RMA 范式，只解冻名字含 \verb|adapt_tconv| 的参数、teacher 主干冻结 \verb|eval()|）。注意这是「特权$\to$适应模块」蒸馏、不是「全约束$\to$mask 补全」蒸馏：要落 MaskedMimic 需把 student 换成处理变长 mask 输入的 transformer、把监督信号从「适应历史」改成「补全被遮挡的运动描述」，但 HORA 已证明 UniLab 的\emph{冻结 teacher + 在线查询 + 异构 collector/learner} 这套蒸馏基建是通的（对照 \cref{ch:rlmc-privileged} 的蒸馏一节）。
+
+\begin{practice}[练习·MaskedMimic]
+\begin{enumerate}
+  \item \textbf{[架构分析]} MaskedMimic 与 BERT 都用 mask。列出 3 个相同点与 2 个不同点（提示：监督信号来源、输出类型、是否在线 rollout）。
+  \item \textbf{[设计]} 要做「给定起始姿态 + 目标位置，补全中间过渡」，mask 应如何设置？哪些信息保留、哪些遮挡？
+  \item \textbf{[跨章综合，\cref{ch:rlmc-privileged}+本章]} 对比 MaskedMimic 的 Phase 2 与 \cref{ch:rlmc-privileged} HOVER 的 DAgger 蒸馏：(a) expert 训练方式；(b) student 架构（MLP vs transformer）；(c) mask 的含义；(d) 蒸馏是否在线。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{TextOp：实时文生动作的两层架构}
+\label{sec:rlmc-mm-textop}
+
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-mm-textop-pos}
+
+CALM 与 MaskedMimic 是学术方法——展示概念可行性。TextOp 把这些概念\emph{工程化}为可部署的实时系统：从键盘输入文本到 G1 执行动作、端到端闭环，且用户可在运行中随时改文本，机器人平滑过渡到新指令。在管线中，TextOp 占据「高层生成 + 低层 tracker」两个槽位，是本章「来源$\to$tracker」链路的一个完整落地范例。
+
+\begin{note}[TextOp 出处与可核实性]
+TextOp（Xie 等，arXiv:2602.07439，2026-02 提交，代码 \texttt{TeleHuman/\allowbreak TextOp}，项目页 text-op.github.io）\,\cite{xie2026textop} 是一个实时交互式文生动作系统。其论文标题为 ``TextOp: Real-time Interactive Text-Driven Humanoid Robot Motion Generation and Control''，「高层自回归 motion diffusion + 低层 tracking policy」的两层架构已联网核实。\pz{说明：源稿曾把 arXiv:2602.07439 当成无法核实的「未来日期」，实为 2026-02 的正式预印本（已核）；本章内部对高层生成器沿用源稿的描述性名称 RobotMDAR，该缩写不一定出现在论文中。}本节关键运行数据已对照论文核实：高层 generator 单步推理约 $29.63$\,ms、用户交互端到端延迟约 $0.73$\,s、generator $6.25$\,Hz / tracker $50$\,Hz、部署于 $29$-DoF Unitree G1；motion generation 模型训练约两天（VAE $200{,}000$ 步 + LDM $300{,}000$ 步）。其余未在论文逐字给出的实现细节以官方代码为准。
+\end{note}
+
+\subsection{核心思想：自回归生成短片段，换来实时响应}
+\label{sec:rlmc-mm-textop-arch}
+
+TextOp 的两层架构如下：
+
+\begin{codebox}{TextOp 两层架构（高层生成运动学，低层 tracker 兜底物理）}
+用户文本输入 (streaming)
+   |
+[ 高层 High-Level: RobotMDAR ]  Robot Motion Diffusion AutoRegressive
+   输入: text embedding + 最近动作上下文
+   输出: 短时域运动学轨迹 (约 1 秒)
+   |  运动学轨迹
+[ 低层 Low-Level: BeyondMimic Tracker ]  即 ch:rlmc-imitation 的 tracker
+   输入: proprio + reference motion
+   输出: joint position target @ 50 Hz
+   |  关节命令
+Robot (G1)
+\end{codebox}
+
+关键设计：RobotMDAR 是\textbf{自回归}的——不像 MDM 一次生成整段，而是每次基于当前文本与最近动作上下文生成约 1 秒的短片段（chunk）。这意味着用户在运行中改文本，下一个 chunk 就会响应新指令。
+
+\begin{codebox}[Python]{RobotMDAR 推理循环（概念性，讲清「逐 chunk 自回归」）}
+class RobotMDAR:
+    def __init__(self, model, clip_encoder, chunk_length=50):
+        self.model = model                  # 扩散 + 自回归 transformer
+        self.clip_encoder = clip_encoder
+        self.chunk_length = chunk_length    # 50 帧 = 1 秒 @ 50Hz
+        self.motion_context = []            # 最近动作上下文
+
+    def generate_chunk(self, text_prompt, current_state):
+        text_emb = self.clip_encoder(text_prompt)            # (512,)
+        context = (torch.cat(self.motion_context[-3:], dim=0)
+                   if self.motion_context else current_state.unsqueeze(0))
+        noise = torch.randn(self.chunk_length, 29)           # 29-DoF G1
+        trajectory = self.model.denoise(noise, text_emb, context)  # (chunk, 29)
+        self.motion_context.append(trajectory)
+        if len(self.motion_context) > 5:
+            self.motion_context.pop(0)
+        return trajectory                   # 关节角序列，交给 tracker 执行
+\end{codebox}
+
+\subsection{三个工程亮点}
+\label{sec:rlmc-mm-textop-tricks}
+
+\paragraph{1. Robot-Skeleton 运动表示。}TextOp 不用 SMPL ball-and-socket 表示，而直接用机器人骨骼的单自由度关节表示（呼应 \cref{ins:rlmc-mm-robotskel}）：SMPL 是 $24\times 3=72$ 维，G1 是 $29\times 1=29$ 维。直接用 SMPL 训练则生成轨迹需从 72 维转 29 维、引入转换误差；TextOp 从一开始就在 G1 的 29 维空间训练，生成轨迹可被 tracker 直接消费。
+
+\paragraph{2. 生成数据增强（Generator-Augmented Training）。}tracker 在 MoCap 上训练，但部署时要跟踪 RobotMDAR 生成的动作——两者分布不同。TextOp 把 RobotMDAR 生成的动作\emph{也}加入 tracker 训练集，缩小分布差距：
+
+\begin{codebox}[Python]{tracker 混合训练数据:MoCap 为主、生成数据为辅}
+from glob import glob
+def build_tracker_data(mocap_dir, generated_dir=None, gen_ratio=0.3):
+    motions = [{"file": f, "source": "mocap", "weight": 1.0}
+               for f in glob(f"{mocap_dir}/*.npy")]
+    if generated_dir:                       # 初次训练还没有生成数据 -> 先纯 MoCap
+        motions += [{"file": f, "source": "generated", "weight": gen_ratio}
+                    for f in glob(f"{generated_dir}/*.npy")]
+    return motions                          # gen_ratio~=0.3:生成数据占约三成
+\end{codebox}
+
+为什么要加生成数据？RobotMDAR 的轨迹通常更「平滑」但关节范围更小；tracker 只在 MoCap 上训练会在部署时遭遇 distribution shift。加约 30\% 生成数据可缩小这个 gap——这本质上是一次「用部署分布的样本做数据增强」，与 \cref{ch:rlmc-privileged} 的 DAgger「在 student 诱导分布上补标注」异曲同工。
+
+\paragraph{3. Streaming 指令修改。}支持运行中改文本，靠的就是自回归特性：每个 chunk 独立依赖当前文本，文本一变，下一个 chunk 自动响应。
+
+\subsection{训练与部署流程}
+\label{sec:rlmc-mm-textop-flow}
+
+TextOp 的训练分三个可独立验证的阶段（数据预处理 $\to$ tracker $\to$ 高层生成器），再加部署：
+
+\begin{codebox}[bash]{阶段 1-3:数据预处理 / tracker / RobotMDAR（命令为示意，以官方为准）}
+# 阶段 1: AMASS -> G1 29-DoF retarget + BABEL 文本对齐
+python dataset/retarget_smpl_to_g1.py --amass_dir data/amass/ \
+    --output_dir data/g1_motions/ --fps 50
+python dataset/prepare_babel_annotations.py --babel_dir data/babel/ \
+    --motion_dir data/g1_motions/ --output data/g1_motions_with_text.yaml
+# 阶段 2: 训练 tracker（复用 BeyondMimic 架构;先纯 MoCap）
+python TextOpTracker/train.py --config configs/g1_tracker.yaml \
+    --motion_file data/g1_motions_with_text.yaml --num_envs 4096 --max_iterations 30000
+# 阶段 3: 训练高层生成器（不需要物理引擎，只学 text->运动学）
+python TextOpRobotMDAR/train.py --config configs/g1_mdar.yaml \
+    --motion_file data/g1_motions_with_text.yaml --text_encoder clip_vit_b_32 \
+    --chunk_length 50 --num_diffusion_steps 100 --batch_size 256 --max_epochs 500
+\end{codebox}
+
+\begin{codebox}[bash]{阶段 4:部署（sim-to-sim 键盘交互 / sim-to-real）}
+# sim-to-sim（MuJoCo），键盘输入文本，新文本覆盖旧文本即平滑过渡
+python TextOpDeploy/sim2sim/run.py \
+    --tracker_ckpt TextOpTracker/checkpoints/last.pt \
+    --mdar_ckpt TextOpRobotMDAR/checkpoints/last.pt --keyboard
+# sim-to-real（真机 G1）
+python TextOpDeploy/sim2real/deploy.py \
+    --tracker_ckpt TextOpTracker/checkpoints/last.pt \
+    --mdar_ckpt TextOpRobotMDAR/checkpoints/last.pt \
+    --robot_ip 192.168.123.xxx --text "walk forward slowly"
+\end{codebox}
+
+\begin{insight}[响应延迟不是 chunk 长度，而是单 chunk 推理时间]\label{ins:rlmc-mm-textop-latency}
+最常见的误解是「chunk\_length=50 帧 = 1 秒 $\Rightarrow$ 响应延迟 1 秒」。错。chunk 长度是\emph{生成的轨迹时长}，不是响应延迟。按 TextOp 论文（arXiv:2602.07439）Table~II 实测：高层 motion generator 单步推理约 $29.63\pm3.56$\,ms（RTX 4090 + TensorRT），而\emph{用户交互延迟}（从键入新指令到机器人物理响应的端到端时间）平均 $0.73\pm0.10$\,s；论文同时给出生成器运行频率 $6.25$\,Hz、tracker $50$\,Hz。可见单步推理（约 30ms）远小于一个 chunk 的时长，用户改文本后，下一个 chunk 在推理时间内就开始按新指令生成。把「生成时长」与「响应延迟」分开，是理解一切自回归实时系统的关键。
+\end{insight}
+
+\begin{pitfall}[tracker 与生成器的动作表示不一致]
+\textbf{错误描述}：RobotMDAR 在 SMPL 空间生成、tracker 在 G1 关节空间训练，中间靠实时 retarget 转换。\textbf{现象后果}：部署时转换引入额外延迟与误差，过渡卡顿。\textbf{根本原因}：两个模块用了不同的运动表示，接口处必须转换。\textbf{正确做法}：TextOp 的设计本身就是为避免此问题——\emph{两者都在 G1 的 29-DoF 空间工作}，接口零转换（\cref{ins:rlmc-mm-robotskel}）。
+\end{pitfall}
+
+\begin{practice}[练习·TextOp]
+\begin{enumerate}
+  \item \textbf{[实验]} 用 sim-to-sim 部署，依次输入 "walk forward"、"turn left"、"jump"，观察过渡是否平滑。验收标准：录屏并标注每次文本切换到动作改变的时间。
+  \item \textbf{[设计]} chunk\_length 从 50 改成 25（0.5 秒）响应更快但质量可能降，改成 100（2 秒）质量更好但响应更慢。你会怎么选？给出依据（提示：交互场景 vs 编排场景）。
+  \item \textbf{[跨章综合，\cref{ch:rlmc-imitation}+本章]} TextOp 的 tracker 复用 BeyondMimic。列出需要的修改：(a) 训练数据（加入生成数据）；(b) 观测（是否需额外信息）；(c) reward 的 $\sigma$ 是否要调。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{\texorpdfstring{视频 $\to$ 机器人：完整数据管线}{视频到机器人：完整数据管线}}
+\label{sec:rlmc-mm-video}
+
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-mm-video-pos}
+
+本节把「一段互联网视频」变成「G1 可执行的动作」。它位于 \cref{ch:rlmc-imitation} 数据管线的\emph{更上游}——\cref{ch:rlmc-imitation} 从已有 MoCap/CSV 出发，本节从原始 RGB 像素出发。整条链是 \cref{ch:rlmc-imitation} 数据契约思想的最长实例。
+
+\subsection{端到端管线}
+\label{sec:rlmc-mm-video-pipeline}
+
+\begin{codebox}{视频 -> G1 端到端管线（每一步的工具与归属）}
+视频 (MP4)
+  | WHAM / 4D-Humans                         (本章 sec:rlmc-mm-pose)
+SMPL 参数 (body_pose, global_orient, transl)
+  | retarget_smpl_to_g1                       (ch:rlmc-imitation 的 retarget)
+G1 关节角 + root 轨迹 (CSV)
+  | 坐标系/帧率对齐 + 质量门禁 + physics filter  (本节 + ch:rlmc-imitation)
+过滤后的物理可行动作 (npz)
+  | BeyondMimic tracking                      (ch:rlmc-imitation)
+tracking policy -> ONNX -> G1 真机执行
+\end{codebox}
+
+\subsection{代码走读：WHAM 输出处理与 retarget}
+\label{sec:rlmc-mm-video-retarget}
+
+WHAM 的输出 pkl 按 subject id 组织，每个 subject 含 \verb|pose|/\allowbreak\verb|trans|/\allowbreak\verb|pose_world|/\allowbreak\verb|trans_world|/\allowbreak\verb|betas| 等（\Verb[breaklines]|pose[:, :3]| 是 root orient，\Verb[breaklines]|pose[:, 3:]| 是 body pose；\verb|*_world| 为世界坐标系结果）。retarget 时先选人、再拆字段、再逐帧 IK：
+
+\begin{codebox}[Python]{SMPL -> G1 29-DoF retarget（WHAM pkl 按 subject id 组织）}
+import pickle, numpy as np
+
+def retarget_smpl_to_g1(smpl_pkl, out_csv, person_id=0):
+    with open(smpl_pkl, "rb") as f:
+        data = pickle.load(f)
+    subj = data[person_id]                  # 顶层是 {subject_id: {...}}
+    pose = subj["pose_world"]               # (T, 72)
+    global_orient, body_pose = pose[:, :3], pose[:, 3:]   # (T,3), (T,69)
+    transl = subj["trans_world"]            # (T, 3) 世界系平移
+
+    T = len(body_pose)
+    g1_joints = np.zeros((T, 29)); g1_root_pos = np.zeros((T, 3))
+    g1_root_quat = np.zeros((T, 4))
+    for t in range(T):
+        smpl_joints_3d = smpl_forward_kinematics(
+            body_pose[t], global_orient[t], transl[t])    # SMPL FK -> 关节 3D 位置
+        g1_joints[t] = inverse_kinematics_g1(             # IK 求 G1 关节角
+            smpl_joints_3d, joint_limits=G1_JOINT_LIMITS)
+        g1_root_pos[t] = transl[t] * (1.32 / 1.70)        # 身高比缩放（G1~=1.32m）
+        g1_root_quat[t] = axis_angle_to_quat(global_orient[t])
+    save_csv(out_csv, g1_root_pos, g1_root_quat, g1_joints)
+\end{codebox}
+
+身高比缩放 \verb|1.32/1.70| 把人的全局平移缩放到 G1 尺度——这是「走了多远」能否对的关键，呼应 \cref{sec:rlmc-mm-pose} 强调的 WHAM 全局平移价值。
+
+\subsection{运行验证：先 MuJoCo 回放，再上 tracker}
+\label{sec:rlmc-mm-video-verify}
+
+在训练 tracker 之前，务必先在 MuJoCo 回放 retarget 后的动作做目视检查（脚是否在地面以上、关节是否在限位内、动作是否连续、是否自碰撞）。除目视外，用脚本自动门禁：
+
+\begin{codebox}[Python]{retarget 质量自动门禁（穿地/越限/速度突变三项检查）}
+import mujoco, numpy as np
+
+def assess_retarget_quality(npz_path, robot_xml):
+    m = mujoco.MjModel.from_xml_path(robot_xml)
+    mo = np.load(npz_path)
+    root_pos, joint_pos = mo["root_pos"], mo["joint_pos"]   # (T,3), (T,29)
+    T = len(root_pos)
+    issues = {"ground": 0, "limit": 0, "spike": 0}
+    for t in range(T):
+        if root_pos[t, 2] < 0.3:            # G1 root 最低约 0.4m -> 疑似穿地
+            issues["ground"] += 1
+        for j in range(m.njnt):             # 关节越限
+            if m.jnt_limited[j] and j < joint_pos.shape[1]:
+                lo, hi = m.jnt_range[j]
+                if joint_pos[t, j] < lo - 0.05 or joint_pos[t, j] > hi + 0.05:
+                    issues["limit"] += 1
+        if t > 0:                           # 相邻帧速度突变（50Hz, dt=0.02）
+            if np.max(np.abs(joint_pos[t] - joint_pos[t-1]) / 0.02) > 20.0:
+                issues["spike"] += 1
+    return {"ground_rate": issues["ground"] / T,
+            "spike_rate": issues["spike"] / T,
+            "pass": issues["ground"] / T < 0.05 and issues["spike"] / T < 0.02}
+\end{codebox}
+
+门禁不过时，下面的 post-processing 能修掉大部分问题——整体抬高 root 消穿地、clamp 越限关节、Savgol 低通平滑速度突变、Y-up$\to$Z-up 坐标系转换：
+
+\begin{codebox}[Python]{retarget 后处理:抬高/clamp/平滑/坐标系转换}
+from scipy.signal import savgol_filter
+import numpy as np
+
+def postprocess_retarget(motion, robot_model):
+    # 1. 脚底穿地修复:整体抬高 root
+    mfh = compute_min_foot_height(motion, robot_model)
+    if mfh < 0.0:
+        motion["root_pos"][:, 2] -= mfh + 0.01
+    # 2. 关节越限 clamp
+    for j in range(robot_model.njnt):
+        if robot_model.jnt_limited[j]:
+            lo, hi = robot_model.jnt_range[j]
+            motion["joint_pos"][:, j] = np.clip(motion["joint_pos"][:, j],
+                                                lo + 0.01, hi - 0.01)
+    # 3. 速度突变平滑（window=11 @50Hz~=0.22s;高动态动作改用 7）
+    for j in range(29):
+        motion["joint_pos"][:, j] = savgol_filter(
+            motion["joint_pos"][:, j], window_length=11, polyorder=3)
+    # 4. 坐标系 Y-up -> Z-up（最易遗漏的一步）
+    if is_y_up(motion):
+        R = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])
+        motion["root_pos"] = motion["root_pos"] @ R.T
+        motion["root_quat"] = rotate_quaternions(motion["root_quat"], R)
+    return motion
+\end{codebox}
+
+Savgol 窗口 \Verb[breaklines]|window_length=11|（约 0.22 秒）是经验值：太小（如 5）保留太多噪声；太大（如 21）会把挥拳这类快速动作也抹平。对功夫、跑酷等高动态动作建议用 7。
+
+\begin{pitfall}[SMPL 是 Y-up、MuJoCo 是 Z-up——忘了转就「躺地上」]
+\textbf{错误描述}：retarget 后不做坐标系转换，直接喂 MuJoCo。\textbf{现象后果}：G1「躺在地上」或「面朝天花板」，tracking reward 永远上不去。\textbf{根本原因}：SMPL 用 Y-up，MuJoCo 用 Z-up，二者前/上方向约定不同。\textbf{正确做法}：retarget 里做 Y-up$\to$Z-up 旋转（上面 post-processing 的第 4 步），且每次 retarget 后用 MuJoCo 回放\emph{目视}确认朝向——这是整条视频管线最易出错处。
+\end{pitfall}
+
+\begin{pitfall}[视频帧率与控制频率不匹配]
+\textbf{错误描述}：视频 24/30 FPS，WHAM 输出同帧率，直接当 50 Hz 动作用。\textbf{现象后果}：动作变速、tracker 跟不上或抖动。\textbf{根本原因}：G1 tracking 需 50 Hz，而视频/WHAM 是 24/30 FPS。\textbf{正确做法}：用插值把动作重采样到 50 Hz（\cref{ch:rlmc-imitation} 的 \texttt{csv\_to\_npz} 已有 \texttt{--input\_fps/\allowbreak --output\_fps} 处理）。
+\end{pitfall}
+
+\paragraph{三框架定位。}视频管线的\emph{感知}与\emph{retarget}部分是框架无关的离线步骤（WHAM/HaMeR + IK），产物落成 \texttt{.npz}/\allowbreak\texttt{.pt} 后，tracker 训练在 mjlab 或 ProtoMotions/Isaac Lab 上跑（\cref{ch:rlmc-imitation} 的三框架接线直接复用）。\textbf{UniLab} 在这条管线上是\emph{完整可用}的第三框架——它的 \Verb[breaklines]|G1MotionTracking| 任务（\Verb[breaklines]|envs/motion_tracking/g1| 的 \verb|MotionLoader|）原生消费 NPZ 参考运动，所以视频 retarget 出的 \texttt{.npz} 只要装成 UniLab 约定的键格式就能直接喂进 UniLab tracker 训练，与 mjlab/ProtoMotions 平行\,\cite{unilab2026}。UniLab 的 NPZ 契约键为 \Verb[breaklines]|fps / joint_pos / joint_vel / body_pos_w / body_quat_w / body_lin_vel_w / body_ang_vel_w|（经 \verb|MotionLoader| 读成 \verb|MotionData| dataclass）；坐标系/帧率对齐与质量门禁（本节的 Y-up$\to$Z-up、50\,Hz 重采样、穿地/越限/速度突变三项）是 UniLab 也需要的同一道离线门，与后端无关。
+
+\begin{codebox}[bash]{UniLab:把视频 retarget 的 NPZ 喂进 G1MotionTracking（NPZ 键格式见正文）}
+# 视频->SMPL->retarget 产物落成 UniLab MotionData 键格式的 .npz（fps/joint_pos/body_pos_w/...）
+# 放到 assets/motions/g1/ 后，用 G1MotionTracking 训练（显式跟踪 + PPO）
+uv run train --algo ppo --task g1_motion_tracking --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=30000
+# 部署闭环（UniLab 比 mjlab 更完整的一处）:参考运动导成 .bin，先在 MuJoCo 用 ONNX 逐段校验
+python scripts/deploy/export_motion_bin.py      # 参考运动 -> .bin
+python scripts/deploy/sim_prototype.py          # ONNX 策略在 MuJoCo 跑，校验 obs 装配==训练侧
+\end{codebox}
+
+\begin{practice}[练习·视频管线]
+\begin{enumerate}
+  \item \textbf{[实践]} 选一段 10 秒内的 YouTube 舞蹈，用 WHAM 提 SMPL、retarget 到 G1、MuJoCo 回放。验收标准：记录质量门禁三项指标，并说明遇到的问题与解决。
+  \item \textbf{[设计]} 视频里有多个人时 WHAM 输出什么？如何选要跟踪的人？（提示：pkl 顶层按 subject id 组织。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{精读：HumanPlus 的单 RGB 实时遥操作}
+\label{sec:rlmc-mm-humanplus}
+
+\subsection{系统概览与在管线中的位置}
+\label{sec:rlmc-mm-humanplus-pos}
+
+HumanPlus（Fu, Zhao, Wu, Wetzstein, Finn，CoRL 2024，arXiv:2406.10454，代码 \texttt{MarkFzp/\allowbreak humanplus}）\,\cite{fu2024humanplus} 是 Stanford 的全栈人形遥操作系统。其核心贡献：用\textbf{一个 RGB 相机}实时控制人形机器人做复杂任务（穿鞋、叠衣服等）。在本章管线中，它把「来源」换成\emph{实时相机 + 人体姿态估计}，低层仍是一个 tracking 风格的控制器（HST）。
+
+\subsection{两阶段架构}
+\label{sec:rlmc-mm-humanplus-arch}
+
+\begin{codebox}{HumanPlus 两阶段（HST 低层通用 tracker + HIT 高层技能）}
+Stage 1: Humanoid Shadowing Transformer (HST) —— 低层控制器
+  训练: AMASS（约 40h MoCap, 11000+ motions）+ PPO（IsaacGym，env 数/时长以官方为准）
+  输入: robot proprio + retargeted target pose
+  输出: 身体关节 setpoints（H1;约 19 维，以官方为准）
+  特点: zero-shot sim-to-real
+
+Stage 2: Humanoid Imitation Transformer (HIT) —— 高层技能策略
+  训练: 真机遥操作数据（约 25-40 demos/task）
+  输入: egocentric RGB + robot proprio
+  输出: target pose for HST
+  硬件: 真机 H1（33-DoF）+ 两个头部 RGB 相机 + 两只 6-DoF 灵巧手
+\end{codebox}
+
+\subsection{代码走读：HST 为何是 decoder-only transformer}
+\label{sec:rlmc-mm-humanplus-hst}
+
+HST 是一个 decoder-only transformer，在 AMASS 上用 PPO 训练，接收\emph{窗口化}的 obs 序列（而非单帧），让 attention 关注时间上下文：
+
+\begin{codebox}[Python]{HST 架构（decoder-only:只看历史，因果 mask）}
+import torch.nn as nn
+
+class HumanoidShadowingTransformer(nn.Module):
+    def __init__(self, obs_dim, action_dim=19, hidden=256, n_heads=4, n_layers=4):
+        super().__init__()
+        self.embed = nn.Linear(obs_dim, hidden)
+        self.transformer = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(hidden, n_heads, dim_feedforward=512),
+            num_layers=n_layers)
+        self.action_head = nn.Linear(hidden, action_dim)
+
+    def forward(self, obs_seq):              # (B, seq_len, obs_dim)
+        x = self.embed(obs_seq)
+        mask = nn.Transformer.generate_square_subsequent_mask(x.size(1))  # 因果
+        x = self.transformer(x, x, tgt_mask=mask)
+        return self.action_head(x[:, -1, :]) # 只取最后一步输出
+\end{codebox}
+
+为什么用 transformer 而非 MLP？AMASS 动作极其多样（从慢走到跳跃），MLP 缺时间上下文建模；transformer 的 attention 能利用「上一步左脚着地」这类历史信息决定「这一步抬右脚」。HST 的 obs 把当前关节状态、IMU、重力投影与 retarget 目标拼起来（约 82 维），并以最近若干步的序列形式输入。
+
+\subsection{HST 的训练 reward 与 DR}
+\label{sec:rlmc-mm-humanplus-reward}
+
+HST 的 reward 与 \cref{ch:rlmc-imitation} 的通用 motion tracking reward\emph{不完全相同}——它跟踪的是\textbf{目标速度与目标关节角}，而非完整 root 位姿轨迹（\cref{tab:rlmc-mm-hst-reward}）。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{HumanPlus HST 的 reward 项（对应论文 Table~1 的实际项）}
+\label{tab:rlmc-mm-hst-reward}
+\begin{tabular}{@{}lp{6.4cm}@{}}
+\toprule
+类别 & reward 项 \\
+\midrule
+指令跟踪 & target xy 速度、target yaw 速度（指数核匹配） \\
+姿态跟踪 & target joint positions、target roll \& pitch（L2 惩罚） \\
+正则/稳定 & energy（力矩$\times$速度）、feet contact/slipping、alive bonus \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[HST 是「通用 tracker」，不是「BeyondMimic 加 transformer」]\label{ins:rlmc-mm-hst-general}
+误区是把 HST 当成「\cref{ch:rlmc-imitation} 的 tracker 套个 transformer」。HST 确实是一种 tracking policy，但它在\textbf{整个 AMASS}（约 40 小时、11000+ motions）上训练，是一个\emph{通用}低层控制器；而 \cref{ch:rlmc-imitation} 的 BeyondMimic 通常在特定任务的少量动作子集上训练。规模差异带来质变：HST 能 zero-shot 跟踪几乎任意 retarget 目标，这正是它能给「单 RGB 实时遥操」当底座的前提。
+\end{insight}
+
+HST 的 zero-shot sim-to-real 依赖训练时的域随机化（DR，对应论文 Table~2 的实际项）：
+
+\begin{codebox}[Python]{HumanPlus DR 配置（对应论文 Table 2;范围相对保守）}
+dr_config = {
+    "base_payload":         [-3.0, 3.0],    # kg，基座负载
+    "end_effector_payload": [0.0, 0.5],     # kg，末端负载
+    "center_of_base_mass":  [-0.1, 0.1],    # m，基座质心偏移（每轴）
+    "motor_strength":       [0.8, 1.1],     # 电机力矩缩放
+    "friction":             [0.3, 0.9],     # 摩擦系数
+    "control_delay":        [0.02, 0.04],   # s，控制延迟
+}
+# 注:restitution / 电机零位 / 观测噪声 / 随机推力等属「可选扩展」，不在 Table 2.
+\end{codebox}
+
+为何 DR 范围相对保守？HST 要在\emph{极其多样}的动作上工作——DR 太强会让困难动作（如单脚站立）难以收敛。反事实：若完全不加 DR，仿真 tracking 质量更高，但部署到真机立即崩溃（真机摩擦/电机/噪声与仿真不同）。DR 是 zero-shot sim-to-real 的必要条件，这与 \cref{ch:rlmc-dr} 的结论一致。
+
+\subsection{实时遥操作的数据流与频率对齐}
+\label{sec:rlmc-mm-humanplus-flow}
+
+\begin{codebox}{HumanPlus 实时遥操数据流（频率对齐是工程关键）}
+外部 RGB 相机
+  +- WHAM:  身体姿态 (约 25 fps) -> SMPL body -> retarget -> H1 身体 target(19)
+  |         -> 频率提升 25->50Hz（线性插值）-> HST 输入 -> HST(约 1ms)
+  |         -> 19 维 joint position 命令 @50Hz -> PD -> 身体力矩
+  +- HaMeR: 手部姿态 (约 10 fps) -> MANO -> retarget -> Inspire 手 target
+            -> 直接进 PD（不经 HST）-> 手部力矩
+\end{codebox}
+
+频率对齐是关键：身体姿态约 25 fps、手部约 10 fps，而 HST 推理 50 Hz。身体 target 在两步推理间插值一次即可（25 Hz 下相邻帧变化小）；手部 target 角直接进 PD、不过 HST。
+
+\begin{paper}[HumanPlus：用单 RGB 把「人」变成「机器人的遥操接口」]\label{paper:rlmc-mm-humanplus}
+\textbf{问题}：如何用最廉价的传感（单 RGB 相机）实时全身遥操人形，并从少量 demo 学会自主技能。\textbf{核心思想}：分层——低层 HST（decoder transformer，AMASS+PPO）当通用 tracker，把 WHAM/HaMeR 估出的 retarget 目标 zero-shot 转成关节命令；高层 HIT（decoder transformer，约 40 demos）从 egocentric RGB 学「做什么」。\textbf{关键结果}：穿鞋/叠衣/整理/打字等任务以约 40 demo 达 60--100\% 成功率（论文 Table~5）。\textbf{与本书关系}：它是「实时相机$\to$tracker」这条来源链路的标杆，HST 印证了 \cref{ins:rlmc-mm-hst-general} 的「通用 tracker」观点。\textbf{局限}：基于 IsaacGym Preview（非 manager-based），代码结构与 mjlab/Isaac Lab 不同，不能直接复用；要在 mjlab 复现需自实现 transformer actor 与 obs 历史窗口化。
+\end{paper}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{HumanPlus HIT 自主任务成功率（论文 Table~5，whole-task success）}
+\label{tab:rlmc-mm-humanplus-succ}
+\begin{tabular}{@{}llll@{}}
+\toprule
+任务 & demos & 成功率 & 难度 \\
+\midrule
+叠衣服 Fold Clothes & 40 & 100\% & 中（灵巧操作） \\
+整理物体 Rearrange & 30 & 90\% & 中（全身协调） \\
+打字 "AI" Type AI & 30 & 80\% & 高（精细操作） \\
+双机打招呼 Greeting & 30 & 90\% & 低 \\
+仓库搬运 Warehouse & 25 & 90\% & 中（全身协调） \\
+穿鞋并行走 Wear a Shoe & 40 & 60\% & 高（接触丰富） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}[别把「打乒乓」列进 HIT 自主成功率]
+打乒乓球（table tennis）在 HumanPlus 论文里是\emph{shadowing（实时遥操作）}的展示任务，不是 HIT 自主策略的 40-demo 任务，不应列入 \cref{tab:rlmc-mm-humanplus-succ} 的自主成功率。这类「把演示任务误记成自主任务」的混淆很常见，引用数据前务必区分「遥操展示」与「自主评测」。
+\end{note}
+
+\begin{pitfall}[只 retarget 身体、忽略手部]
+\textbf{错误描述}：复现 HumanPlus 时只做 WHAM$\to$H1 body retarget，丢掉手部。\textbf{现象后果}：穿鞋/叠衣这类精细任务根本无法执行。\textbf{根本原因}：H1 用 6-DoF Inspire 手，SMPL-X 每手 15 关节；retarget 必须同时处理身体（WHAM$\to$H1 body）与手部（HaMeR$\to$Inspire hand）。\textbf{正确做法}：身体与手部双路 retarget，手部 target 角直接进 PD（\cref{sec:rlmc-mm-humanplus-flow}）。
+\end{pitfall}
+
+\begin{practice}[练习·HumanPlus]
+\begin{enumerate}
+  \item \textbf{[架构分析]} HST 用 decoder-only transformer。若改用 encoder-only（BERT 风格）有何问题？（提示：因果性——策略只能看过去。）
+  \item \textbf{[跨章综合，\cref{ch:rlmc-privileged}+\cref{ch:rlmc-imitation}+本章]} 对比 HumanPlus HST、\cref{ch:rlmc-privileged} HOVER、\cref{ch:rlmc-imitation} BeyondMimic 三者：(a) 训练数据规模；(b) 支持的控制模态；(c) 网络架构；(d) 部署平台。
+  \item \textbf{[设计]} 要用 HumanPlus 方法让 G1（而非 H1）学穿鞋，需哪些修改？从 retarget、HST 训练、HIT 数据收集三方面各列具体变化。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{精读：HDMI 从单目视频学物体交互}
+\label{sec:rlmc-mm-hdmi}
+
+\subsection{独特价值与在管线中的位置}
+\label{sec:rlmc-mm-hdmi-pos}
+
+前面的方法（CALM、TextOp、HumanPlus）都关注\emph{人体运动}——机器人在空旷空间移动。HDMI（Weng, Li 等，CMU，arXiv:2509.16757）\,\cite{weng2025hdmi} 解决\textbf{人与物体的交互}——从单目视频中\emph{同时}提取人的运动与物体的轨迹，训练人形的 loco-manipulation 技能。它把本章「视频来源」从「只学人体」扩展到「学人体+物体」。
+
+\subsection{三阶段管线}
+\label{sec:rlmc-mm-hdmi-pipeline}
+
+\begin{codebox}{HDMI 三阶段（视频提取 -> co-tracking RL -> zero-shot 部署）}
+Stage 1 视频提取（离线）
+  单目 RGB -> 人体姿态(SMPL) + 物体检测/位姿(6-DoF) -> retarget 到 G1
+  -> 输出 (human_motion, object_trajectory) 配对
+
+Stage 2 RL 训练（离线）:co-tracking reward
+  r = w_h * r_human + w_o * r_object + w_i * r_interaction
+  三个关键设计: 统一物体表示 / residual action space / 通用交互 reward
+
+Stage 3 zero-shot 部署（无 fine-tuning）
+  ONNX -> G1 真机
+  注: 论文真机在 pelvis 与被操作物体贴 mocap markers 以获取 root 全局位姿与
+      物体状态作为 observation，并非仅靠机载视觉（Limitations 将机载 RGB/depth 列为未来方向）
+\end{codebox}
+
+\subsection{配置详解：三个关键工程设计}
+\label{sec:rlmc-mm-hdmi-design}
+
+\paragraph{1. 统一物体表示。}不同物体（门、箱、杯）几何与交互各异，HDMI 用一个统一的 6-DoF 表示——不管什么物体，都用 (位置, 朝向) + 动力学状态 + 相对机器人的位姿表示（约 20 维）：
+
+\begin{codebox}[Python]{统一物体表示（让不同物体复用同一套 obs 接口）}
+object_obs = torch.cat([
+    object_position,       # (3,) 物体中心世界坐标
+    object_orientation,    # (4,) 物体朝向四元数
+    object_linear_vel,     # (3,)
+    object_angular_vel,    # (3,)
+    relative_position,     # (3,) 物体相对机器人位置
+    relative_orientation,  # (4,) 物体相对机器人朝向
+], dim=-1)                 # 共约 20 维
+\end{codebox}
+
+\begin{pitfall}[把 HDMI 当成「见过门和箱就能开抽屉」]
+\textbf{错误描述}：以为统一物体表示 = 单一策略 zero-shot 泛化到任意新物体。\textbf{现象后果}：换一类没训过的物体直接失败，却归因于「表示不够好」。\textbf{根本原因}：HDMI 论文 Limitations 明确是\emph{每技能一策略}（one policy per skill），统一表示只是省去为每类物体重写 obs 结构；跨新物体的鲁棒性靠训练随机化覆盖，不是「见过即泛化」。\textbf{正确做法}：把「统一物体表示」理解为\emph{工程复用接口}，不是\emph{泛化能力}；要泛化需扩训练分布或换更强的高层。
+\end{pitfall}
+
+\paragraph{2. Residual action space。}标准动作是关节增量 $a = q_{\text{default}} + \Delta q$，策略从零学完整控制。HDMI 用 residual：
+\begin{equation}
+a = q_{\text{ref}}(t) + \Delta q_{\text{residual}},
+\label{eq:rlmc-mm-hdmi-residual}
+\end{equation}
+其中 $q_{\text{ref}}(t)$ 来自视频提取的参考动作，策略只学「相对参考的微调」：
+
+\begin{codebox}[Python]{residual action:参考动作打底，策略只学微调}
+class ResidualActionEnv(BaseEnv):
+    def apply_actions(self, actions):       # actions: (N,29) 来自策略的 residual
+        ref = self.motion_ref.get_joint_pos(self.current_frame)   # (N,29) 参考
+        final = ref + actions * self.residual_scale   # residual_scale~=0.1~0.3
+        self.robot.set_joint_position_target(final)
+\end{codebox}
+
+工程好处：探索空间被压缩（residual 只在约 $\pm0.3$ rad 内搜索）；训练初期策略输出近零$\Rightarrow$执行接近参考$\Rightarrow$一开始就有合理行为；接触丰富任务（开门）在接触点附近需极精确控制，residual 让策略只需微调。反事实：若用标准 action，策略要从零学「走到门前+伸手+抓把手+推门」整条序列，PPO 需海量样本才能发现「抓住把手」。这与 \cref{ch:rlmc-imitation} 的「参考打底」思想一致，只是把参考用在了\emph{动作}而非\emph{reward}上。
+
+\paragraph{3. 通用交互 reward。}把人体跟踪、物体跟踪、接触三项加权相加：
+
+\begin{codebox}[Python]{HDMI 通用交互 reward（人体 + 物体 + 接触三项）}
+class HDMIReward:
+    def __init__(self):
+        self.w_body, self.w_object, self.w_contact = 1.0, 0.5, 0.3
+    def compute(self, env):
+        r_body = body_tracking_exp(env, sigma=0.1) + joint_tracking_exp(env, sigma=0.3)
+        obj_pos_err = torch.norm(env.object.root_pos - env.ref_object_pos, dim=-1)
+        obj_ori_err = quat_diff_rad(env.object.root_quat, env.ref_object_quat)
+        r_obj = torch.exp(-obj_pos_err**2 / 0.05**2) + torch.exp(-obj_ori_err**2 / 0.2**2)
+        hand_obj = torch.norm(env.robot.hand_pos - env.object.root_pos, dim=-1)
+        r_contact = (hand_obj < 0.05).float()        # 手距物体<5cm 给 bonus
+        return self.w_body * r_body + self.w_object * r_obj + self.w_contact * r_contact
+\end{codebox}
+
+\subsection{视频提取与关键结果}
+\label{sec:rlmc-mm-hdmi-result}
+
+HDMI 官方管线用 \textbf{GVHMR}（人体）+ \textbf{GMR/LocoMujoco}（转机器人 body/joint 状态）提取人体，物体则提取 6-DoF 轨迹并写入 \verb|meta.json|、与机器人 body 状态拼接对齐。
+
+\begin{note}[别把 HDMI 的工具栈记成 WHAM/Detic]
+HDMI 官方用 GVHMR + GMR/LocoMujoco，\emph{不是} WHAM/Detic/DINO；物体 6-DoF 估计工具（如 BundleSDF/FoundationPose）是\emph{可替代}的通用方法，并非 HDMI 论文/仓库所采用的组件。引用「HDMI 用什么工具」时务必以官方仓库 processing steps 为准。
+\end{note}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{HDMI 真机关键结果（Unitree G1）}
+\label{tab:rlmc-mm-hdmi-result}
+\begin{tabular}{@{}lll@{}}
+\toprule
+任务 & 真机结果 & 说明 \\
+\midrule
+开门穿越 Door & 67 次连续 & 双向开门 + 穿越 \\
+行李箱 Suitcase & 7 次连续成功 & 接触丰富操作 \\
+面包箱搬运 Breadbox & 2 次完整（含 $180^\circ$ 转身） & 抓取 + 搬运 \\
+长序列 Truman's Bow & 3 次完整（上台阶/鞠躬/坐下/挥手/跳） & 长序列全身协调 \\
+仿真任务 & 14 种 & 含上述 + 更多 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+「67 次连续开门穿越」是 HDMI 最亮眼的结果——说明策略不仅能做一次，还有足够鲁棒性反复执行。这得益于 DR（门的位置/方向/阻力随机化）与 residual action（接触点精确控制）。\cref{tab:rlmc-mm-hdmi-compare} 把 HDMI 与本章其它视频学习方法并列。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{HDMI 与其它视频学习方法的对比}
+\label{tab:rlmc-mm-hdmi-compare}
+\begin{tabular}{@{}llll@{}}
+\toprule
+维度 & HDMI & HumanPlus & KungfuBot 类 \\
+\midrule
+视频提取 & 人体 + 物体 & 人体 only & 人体 only \\
+物体交互 & 核心能力 & 无 & 无 \\
+训练方法 & RL + residual action & RL（PPO） & RL（PPO + 物理过滤） \\
+部署机器人 & G1 & H1 & G1 \\
+关键创新 & co-tracking + 统一 reward & HST + 40-demo & physics filter \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[物体位姿估计的累积漂移]
+\textbf{错误描述}：默认视频中物体位姿估计长期稳定。\textbf{现象后果}：物体轨迹随时间累积误差（尤其旋转），co-tracking reward 把策略带偏。\textbf{根本原因}：单目物体 6-DoF 估计本身有漂移。\textbf{正确做法}：用通用 6-DoF 跟踪（如 BundleSDF/FoundationPose，注意这\emph{不是} HDMI 官方组件）或加关键帧校正减小漂移；累积误差无法完全消除，需在 reward 权重上留余量。
+\end{pitfall}
+
+\begin{practice}[练习·HDMI]
+\begin{enumerate}
+  \item \textbf{[分析]} residual action 与标准 action 的区别是什么？在什么任务上 residual 更有优势？（提示：接触丰富 vs 自由空间。）
+  \item \textbf{[设计]} 要用 HDMI 学「从桌上拿杯子喝水」，需从视频提取什么信息？人体与物体各需哪些轨迹？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{端到端 VLA：LeVERB 与分层架构的对照}
+\label{sec:rlmc-mm-leverb}
+
+\subsection{从分层到端到端}
+\label{sec:rlmc-mm-leverb-pos}
+
+TextOp 是分层架构：高层（文本$\to$运动学轨迹）与低层（轨迹$\to$关节控制）明确分离，中间表示是\emph{人类可理解}的运动学轨迹。LeVERB（Xue 等，arXiv:2506.13751，投稿 ICLR 2026 审稿中）\,\cite{xue2025leverb} 代表另一条路线——\textbf{端到端 VLA}（Vision-Language-Action），中间表示是\emph{模型学到的、人类不可解释}的 latent action。本节用它作分层架构的对照，帮助你在两条路线间选型。
+
+\begin{codebox}{分层（TextOp）vs 端到端（LeVERB）:差别在中间表示}
+分层（TextOp）:  文本 -> [RobotMDAR] -> 运动学轨迹(可解释) -> [Tracker] -> 关节控制
+端到端（LeVERB）: 文本+视觉 -> [VLM] -> latent action(不可解释) -> [WBC] -> 关节控制
+\end{codebox}
+
+\subsection{LeVERB 的双层系统}
+\label{sec:rlmc-mm-leverb-arch}
+
+LeVERB 借 Kahneman 的「System 1/2」类比：System 2（高层 VLM，慢思考）吃视觉+语言，输出 latent action（CVAE）；System 1（低层 WBC，快反应）吃 proprio + latent action，输出关节位置目标，用 RL（PPO）在 Isaac Lab 训练。CVAE 让 latent space 连续紧凑（约 32 维），高层只需在低维空间决策——远比直接预测 29 维关节角容易：
+
+\begin{codebox}[Python]{LeVERB CVAE latent action space（概念性）}
+import torch, torch.nn as nn
+
+class LatentActionCVAE(nn.Module):
+    def __init__(self, obs_dim, action_dim, latent_dim=32):
+        super().__init__()
+        self.encoder = nn.Sequential(            # 训练时: obs+action -> latent
+            nn.Linear(obs_dim + action_dim, 256), nn.ReLU(),
+            nn.Linear(256, latent_dim * 2))      # mean + logvar
+        self.decoder = nn.Sequential(            # 推理时: obs+latent -> action
+            nn.Linear(obs_dim + latent_dim, 256), nn.ReLU(),
+            nn.Linear(256, action_dim))
+    def encode(self, obs, action):
+        return self.encoder(torch.cat([obs, action], -1)).chunk(2, dim=-1)
+    def decode(self, obs, latent):
+        return self.decoder(torch.cat([obs, latent], -1))
+    def reparameterize(self, mean, logvar):
+        return mean + torch.randn_like(logvar) * torch.exp(0.5 * logvar)
+\end{codebox}
+
+LeVERB 的 System 1（WBC）本质上是一个 conditioned-on-latent 的 tracking policy——与 \cref{ch:rlmc-imitation} 的 tracker 结构高度相似，区别只在参考信号形式：BeyondMimic 接运动学轨迹（约 60 维），LeVERB 接 latent action（约 32 维）。训练时 latent 由 CVAE encoder 从 ground-truth action 编码（不需 VLM 参与），部署时由 VLM 生成。
+
+\subsection{关键数字与选型对照}
+\label{sec:rlmc-mm-leverb-result}
+
+LeVERB 的评测（已核）：150+ tasks / 10 类；总体成功率 \textbf{58.5\%}；zero-shot 简单导航 \textbf{80\%}；对比 naive 分层 VLA 提升 \textbf{7.8$\times$}；平台 Unitree G1 in Isaac Lab。\cref{tab:rlmc-mm-leverb-compare} 给出与 TextOp 的选型对照。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{TextOp（分层）vs LeVERB（端到端）选型对照}
+\label{tab:rlmc-mm-leverb-compare}
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & TextOp（分层） & LeVERB（端到端） \\
+\midrule
+中间表示 & 运动学轨迹（可解释） & latent action（不可解释） \\
+视觉输入 & 无 & 有（RGB） \\
+训练数据 & AMASS + BABEL 文本 & 合成渲染视觉 demo \\
+部署复杂度 & 中（两独立模型） & 高（VLM + WBC） \\
+可调试性 & 高（可查中间轨迹） & 低（latent 不可解释） \\
+适用场景 & 纯文本交互控制 & 需视觉理解的复杂任务 \\
+成熟度 & 较高（有预训练模型） & 研究前沿 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[分层 vs 端到端 = 可解释性 vs 信息整合]\label{ins:rlmc-mm-hier-vs-e2e}
+两条路线的根本权衡是\textbf{可解释性 vs 信息整合}。分层（TextOp）的中间表示是运动学轨迹——可检查、可视化、可手改；失败时能定位（轨迹对但执行错$\Rightarrow$tracker 问题，轨迹错$\Rightarrow$生成器问题）。端到端（LeVERB）的 latent action 可能含比运动学轨迹更丰富的信息（如对环境的理解），但你无法直接检查其含义，失败时不知是高层理解错还是低层执行错。工程实践里分层因可调试性更受青睐；研究前沿端到端展示更强的任务泛化。需澄清：LeVERB 的「端到端」并非\emph{一个}模型从 RGB 到关节——它仍是两层（VLM + WBC），只是中间表示从运动学轨迹换成了 latent action，低层 WBC 仍需单独 RL 训练。
+\end{insight}
+
+\begin{pitfall}[以为「端到端一定比分层好」]
+\textbf{错误描述}：默认端到端 VLA 全面优于分层。\textbf{现象后果}：在简单任务（如「走到目的地」）上引入沉重的 VLM 推理，得不偿失，且失败时无从调试。\textbf{根本原因}：端到端避免了中间表示的信息瓶颈，但牺牲了可调试性与推理效率。\textbf{正确做法}：按\emph{任务需求}选——纯文本交互/可调试优先选分层；需视觉理解的复杂长程任务再考虑端到端。方法新旧不是选型依据（\cref{sec:rlmc-mm-choose}）。
+\end{pitfall}
+
+\begin{practice}[练习·LeVERB]
+\begin{enumerate}
+  \item \textbf{[对比]} TextOp 与 LeVERB 各在什么场景更合适？列 3 个场景及推荐方案。
+  \item \textbf{[设计]} 要做「看到桌上杯子$\to$走过去拿起」，用 TextOp 需加什么模块？用 LeVERB 呢？哪个更合适、为什么？
+  \item \textbf{[架构分析]} CVAE latent\_dim=32 改成 4 或 128 各有何 trade-off？（从信息瓶颈与 VLM 预测难度两角度。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{选型决策：MoCap / 视频 / 文本}
+\label{sec:rlmc-mm-choose}
+
+\subsection{三来源完整对比}
+\label{sec:rlmc-mm-choose-compare}
+
+把全章压成一张选型表（\cref{tab:rlmc-mm-choose}）。这是本章面向工程实践的总落点。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{MoCap / 视频 / 文本三来源完整对比}
+\label{tab:rlmc-mm-choose}
+\begin{tabular}{@{}llll@{}}
+\toprule
+维度 & MoCap & 视频 & 文本 \\
+\midrule
+精度 & 极高（毫米级） & 中（厘米级） & 低（十厘米级以上） \\
+成本 & 极高 & 低 & 极低 \\
+灵活性 & 低（需预录） & 高（任何视频） & 极高（打字） \\
+实时性 & 否 & 可（实时相机，如 HumanPlus） & 可（实时文本，如 TextOp） \\
+物体交互 & 可（需特殊设备） & 可（HDMI co-tracking） & 受限（需 VLA） \\
+物理一致性 & 高 & 需 physics filter & 需 tracker \\
+数据规模 & 有限（约 40h AMASS） & 近乎无限（互联网） & 近乎无限 \\
+代表系统 & \cref{ch:rlmc-imitation} BeyondMimic & HumanPlus / HDMI & TextOp / LeVERB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{选型决策树}
+\label{sec:rlmc-mm-choose-tree}
+
+\begin{center}
+\small\textbf{动作来源选型决策树（按「任务需要什么」而非「方法新旧」）}\\[3pt]
+\begin{forest} dtree
+[{你要解决什么问题？}
+  [{“精确复现特定动作”\\（科研复现/编排）}
+    [{有 MoCap 设备 → 自录 MoCap\\→ AMASS 格式 → BeyondMimic}]
+    [{否，AMASS 有类似动作\\→ AMASS 子集 → BeyondMimic}]
+    [{否 → 视频录制 → WHAM\\→ retarget → BeyondMimic}]
+  ]
+  [{“从视频学新技能”}
+    [{只有人体运动 → WHAM\\→ retarget → physics filter\\→ BeyondMimic/AMP}]
+    [{含物体交互 → HDMI\\（人体+物体 co-tracking\\→ residual RL）}]
+  ]
+  [{“文本控制实时交互”}
+    [{需视觉理解 → LeVERB（VLA）}]
+    [{纯文本指令 → TextOp\\（RobotMDAR + Tracker）}]
+  ]
+  [{“遥操作 + 自主学习”}
+    [{HumanPlus（单 RGB 遥操\\→ 40 demos → HIT 自主）}]
+  ]
+  [{“风格化运动”\\（“像老人一样走”）}
+    [{CALM（text embedding\\→ 条件判别器）}]
+  ]
+  [{“统一控制器”（多种信息源）}
+    [{MaskedMimic（motion inpainting）}]
+  ]
+]
+\end{forest}
+\end{center}
+
+\subsection{数据混合与发展趋势}
+\label{sec:rlmc-mm-choose-mix}
+
+实际项目通常\emph{混合}来源（\cref{tab:rlmc-mm-mix}），并按质量分层加权——高质量主导、低质量辅助但不丢弃（它们提供多样性）。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{典型数据混合策略}
+\label{tab:rlmc-mm-mix}
+\begin{tabular}{@{}llp{4.2cm}@{}}
+\toprule
+策略 & 组合 & 工程注意 \\
+\midrule
+MoCap + 文本 & MoCap 训 tracker，CALM 加文本条件 & text 标注须覆盖 MoCap \\
+MoCap + 视频 & MoCap 打底，视频做领域增强 & retarget 质量对齐 \\
+视频 + 文本 & 视频 + BABEL 标注 -> TextOp & 需 BABEL 标注 \\
+全部混合 & AMASS + 视频 + BABEL -> 大规模统一训练 & 数据质量分层管理 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[选型的唯一正确问题是「任务需要什么」]\label{ins:rlmc-mm-choose}
+本章最实用的结论：来源选择不是「哪个更先进」，而是「任务需要什么」。先进不等于适合——若只需 G1 走到目的地，\cref{ch:rlmc-quadloco} 的 velocity task 就够，不必上 TextOp/LeVERB。同理，多来源混合不总更好：低质量数据占比过高会把策略带向「平均化」行为，混合必须加权（高质量 $\ge 50\%$、低质量 $\le 20\%$ 是稳妥起点）。建立了「来源$\to$运动学轨迹$\to$tracker$\to$物理执行」这条链路的直觉，任何新系统出现你都能快速定位、快速选型。
+\end{insight}
+
+\begin{pitfall}[不同来源坐标系/四元数约定不一致]
+\textbf{错误描述}：混合 MoCap、WHAM 输出、生成数据前不统一约定。\textbf{现象后果}：部分数据「面朝错误方向」，混合训练后策略行为诡异。\textbf{根本原因}：不同来源可能用不同约定（Y-up vs Z-up、$wxyz$ vs $xyzw$ 四元数）。\textbf{正确做法}：混合前统一到同一约定，并对每个来源各自跑一遍 \cref{ch:rlmc-imitation} 的数据契约检查（这也是 \cref{sec:rlmc-mm-video} 坐标系陷阱的放大版）。
+\end{pitfall}
+
+\begin{practice}[练习·选型]
+\begin{enumerate}
+  \item \textbf{[决策]} 以下三场景分别推荐什么方案并说明理由：(a) G1 在展览表演太极；(b) G1 仓库搬箱；(c) G1 按语音做日常动作。
+  \item \textbf{[设计]} 为「机器人服务员」选来源方案：需走路送餐、避障、把盘子放桌上。设计一个混合方案，说明每个子任务用什么来源与算法。
+  \item \textbf{[跨章综合，\cref{ch:rlmc-quadloco}+\cref{ch:rlmc-imitation}+本章]} velocity（\cref{ch:rlmc-quadloco}）$\to$ tracking（\cref{ch:rlmc-imitation}）$\to$ multimodal（本章）形成能力递进。画出技术依赖图，标注每步复用了前一步的什么组件。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\label{sec:rlmc-mm-misconceptions}
+
+\begin{pitfall}[本章常见误解一览]
+(1)「文生动作能直接驱动机器人」——产出的是运动学轨迹，不保证物理可行，必经 tracker（\cref{ins:rlmc-mm-kinematic}）。\\
+(2)「所有 CLIP 都是 512 维」——ViT-L/14 是 768 维，须与 \verb|condition_dim| 配对（\cref{tab:rlmc-mm-clip}）。\\
+(3)「CALM 能精确指定动作」——它约束的是风格\emph{分布}，未约束维度可能不自然（\cref{ins:rlmc-mm-calm-style}）。\\
+(4)「MaskedMimic Phase 2 用 PPO」——是在线 teacher-student 蒸馏，非探索、也非离线 BC（\cref{sec:rlmc-mm-masked-train}）。\\
+(5)「TextOp 响应延迟 = chunk 长度」——延迟是单 chunk 推理时间，与生成时长无关（\cref{ins:rlmc-mm-textop-latency}）。\\
+(6)「视频估计平均 5cm 够用」——关键帧误差远大于平均，须物理过滤（\cref{sec:rlmc-mm-pose}）。\\
+(7)「忘了 Y-up$\to$Z-up」——G1 会躺地上，retarget 后必目视回放（\cref{sec:rlmc-mm-video}）。\\
+(8)「HST 就是 tracker 加 transformer」——它在整个 AMASS 上训练，是通用 tracker（\cref{ins:rlmc-mm-hst-general}）。\\
+(9)「HDMI 见过门和箱就能开抽屉」——每技能一策略，统一表示只是接口复用（\cref{sec:rlmc-mm-hdmi-design}）。\\
+(10)「端到端一定比分层好」——按任务需求选，可调试性常更重要（\cref{ins:rlmc-mm-hier-vs-e2e}）。\\
+(11)「ProtoMotions 还是 Hydra +exp=」——当前 ProtoMotions3 已改 dataclass \texttt{--experiment-path}（\cref{sec:rlmc-mm-calm-three}）。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\addcontentsline{toc}{section}{小结}
+\label{sec:rlmc-mm-summary}
+
+本章把「参考动作从哪来」这个上游问题，沿全书「算法领路、实践兑现」的主线展开：先立动作来源的三个时代与「精度-成本-灵活性」权衡（\cref{ins:rlmc-mm-painting}），并指出所有来源在下游同构——都要经「过滤$\to$tracker$\to$PD」（\cref{ins:rlmc-mm-unified}）。随后依次落地：文本侧用 CALM 把 CLIP 文本嵌入注入条件判别器（\cref{eq:rlmc-mm-calm-reward}，关键是冻结 CLIP 并盯住 \verb|disc/accuracy|）、MaskedMimic 用 mask 把多模态统一为 inpainting（在线蒸馏，\cref{sec:rlmc-mm-masked-train}）、TextOp 用自回归扩散 + Robot-Skeleton 表示做实时两层系统（\cref{ins:rlmc-mm-textop-latency}）；视频侧建立「WHAM$\to$retarget$\to$坐标系/帧率$\to$质量门禁$\to$tracker」完整管线（坐标系陷阱是头号坑）；精读 HumanPlus（HST 通用 tracker + HIT 40-demo）与 HDMI（co-tracking + residual action + 67 次开门）；最后用 LeVERB 对照分层 vs 端到端，落到「按任务需求选型」（\cref{ins:rlmc-mm-choose}）。贯穿全章的是 \cref{ins:rlmc-mm-fuel}：本章只是给 \cref{ch:rlmc-imitation} 的 tracker 换不同的燃料供给。
+
+\paragraph{术语速查。}
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 含义 \\
+\midrule
+运动学轨迹 & 关节角随时间序列，不含力/不保证物理可行（\cref{ins:rlmc-mm-kinematic}） \\
+CLIP 文本嵌入 & 预训练 text encoder 输出的语义向量（ViT-B/32 = 512 维） \\
+VQ-VAE & 把连续动作量化成离散 token，供 GPT 自回归生成 \\
+条件判别器 & CALM 把 text embedding 拼进判别器输入，按条件评判风格 \\
+motion inpainting & MaskedMimic 从部分约束补全完整动作 \\
+在线 teacher-student 蒸馏 & student 自己 rollout，实时查冻结 expert 的 action 作监督 \\
+RobotMDAR & TextOp 高层自回归 motion diffusion，逐 chunk 生成 \\
+Robot-Skeleton 表示 & 直接在机器人 29-DoF 空间生成，省 retarget 误差（\cref{ins:rlmc-mm-robotskel}） \\
+生成数据增强 & 把生成轨迹加入 tracker 训练集缩小分布差距 \\
+HST / HIT & HumanPlus 低层通用 tracker / 高层技能策略 \\
+residual action & $a=q_{\text{ref}}(t)+\Delta q$，策略只学相对参考的微调（\cref{eq:rlmc-mm-hdmi-residual}） \\
+co-tracking & HDMI 同时跟踪人体与物体轨迹 \\
+latent action & LeVERB 高层 VLM 输出的不可解释压缩动作（CVAE，约 32 维） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+\begin{center}
+\small
+\begin{tabular}{@{}cllc@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 三来源时代与精度-成本-灵活性权衡 & \cref{sec:rlmc-mm-spectrum} & 2 \\
+2 & MDM 扩散 / VQ-VAE 离散化 / CLIP 文本嵌入 & \cref{sec:rlmc-mm-mdm} & 2 \\
+3 & 统一管线与「来源不同下游同构」 & \cref{sec:rlmc-mm-pipeline} & 2 \\
+4 & CALM 条件判别器与冻结 CLIP & \cref{sec:rlmc-mm-calm-config} & 3 \\
+5 & CALM 训练 loss 与 disc/accuracy 监控 & \cref{sec:rlmc-mm-calm-loss} & 3 \\
+6 & MaskedMimic 两阶段在线蒸馏与 mask & \cref{sec:rlmc-mm-masked-train} & 3 \\
+7 & TextOp 两层架构与 Robot-Skeleton 表示 & \cref{sec:rlmc-mm-textop-arch} & 3 \\
+8 & 生成数据增强缩小分布差距 & \cref{sec:rlmc-mm-textop-tricks} & 3 \\
+9 & 视频管线：retarget + 坐标系/帧率 + 门禁 & \cref{sec:rlmc-mm-video} & 3 \\
+10 & HumanPlus HST 通用 tracker 与 reward & \cref{sec:rlmc-mm-humanplus-reward} & 3 \\
+11 & HumanPlus 实时遥操数据流与频率对齐 & \cref{sec:rlmc-mm-humanplus-flow} & 3 \\
+12 & HDMI 统一物体表示 + residual + 交互 reward & \cref{sec:rlmc-mm-hdmi-design} & 4 \\
+13 & LeVERB 端到端 VLA 与 CVAE latent action & \cref{sec:rlmc-mm-leverb-arch} & 3 \\
+14 & 分层 vs 端到端的可解释性权衡 & \cref{ins:rlmc-mm-hier-vs-e2e} & 2 \\
+15 & 三来源选型决策树与数据混合 & \cref{sec:rlmc-mm-choose} & 2 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{后续关系。}本章是「强化学习运动控制」部里把\emph{多模态来源}接到 tracker 的一章。它产出的 retarget 数据、文本/视频生成轨迹，与 \cref{ch:rlmc-imitation} 的 tracker、\cref{ch:rlmc-privileged} 的 teacher-student 蒸馏、\cref{ch:rlmc-dr} 的域随机化共同构成「从任意来源到真机」的完整路径。理解了「来源$\to$运动学轨迹$\to$tracker$\to$部署」这条主干，再叠加全身控制与 sim-to-real，就能把本章的选型框架与分层思想迁移到操作（机械臂/灵巧手）等更精细的场景。
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-mm-reading}
+
+\begin{itemize}
+  \item \textbf{MDM}（Tevet 等，ICLR 2023，arXiv:2209.14916）\,\cite{tevet2023mdm}——文生动作里程碑，教你扩散生成运动学轨迹（预测 $x_0$ 而非噪声）。
+  \item \textbf{T2M-GPT}（Zhang 等，CVPR 2023，arXiv:2301.06052）\,\cite{zhang2023t2mgpt}——VQ-VAE + GPT 的离散自回归范式。
+  \item \textbf{CLIP}（Radford 等，ICML 2021，arXiv:2103.00020）\,\cite{radford2021clip}——文本-图像对齐预训练，本章文本编码的基础。
+  \item \textbf{CALM}（Tessler 等，SIGGRAPH 2023，arXiv:2305.02195）\,\cite{tessler2023calm}——条件对抗潜模型，教技能级条件化判别器。
+  \item \textbf{MaskedMimic}（Tessler 等，SIGGRAPH Asia 2024，arXiv:2409.14393）\,\cite{tessler2024maskedmimic}——统一 motion inpainting，ProtoMotions 旗舰方法。
+  \item \textbf{TextOp}（Xie 等，2026，arXiv:2602.07439）\,\cite{xie2026textop}——实时交互式文生动作，高层自回归扩散 + 低层 tracker 两层架构落地。
+  \item \textbf{HumanPlus}（Fu 等，CoRL 2024，arXiv:2406.10454）\,\cite{fu2024humanplus}——单 RGB 遥操作全栈，教 HST/HIT 分层与 40-demo 学习。
+  \item \textbf{HDMI}（Weng 等，2025，arXiv:2509.16757）\,\cite{weng2025hdmi}——视频 co-tracking 人体+物体，教 residual action 与统一交互 reward。
+  \item \textbf{LeVERB}（Xue 等，2025，arXiv:2506.13751，投稿 ICLR 2026 审稿中）\,\cite{xue2025leverb}——层级 latent VLA，端到端路线的代表。
+  \item \textbf{WHAM}（Shin 等，CVPR 2024，arXiv:2312.07531）\,\cite{shin2024wham}——world-grounded 视频姿态估计，全局平移准确。
+  \item 框架文档：\textbf{ProtoMotions}（NVlabs）\,\cite{protomotions2024}——CALM/MaskedMimic 统一实现；\textbf{mjlab}\,\cite{mjlab2026} 与 \textbf{SMPL}（Loper 等，2015）\,\cite{loper2015smpl}——本章 tracker 底座与体模型。
+\end{itemize}
+
+\textbf{阅读顺序}：先 MDM/CLIP（文生动作原理）$\to$ CALM/MaskedMimic（条件与 inpainting）$\to$ TextOp（实时落地）；视频路线读 WHAM $\to$ HumanPlus $\to$ HDMI；研究路线再补 LeVERB。时间有限则精读 CALM、HumanPlus、HDMI 三篇——分别覆盖文本、遥操、视频物体交互三条最有代表性的来源。
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-mm-troubleshoot}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.4cm}p{3.0cm}p{4.4cm}l@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+\texttt{ModuleNotFoundError: clip} & 生成侧依赖没装 & \texttt{pip install ftfy regex git+.../\allowbreak CLIP.\allowbreak git}；装进生成侧 env 非 tracker env & \cref{sec:rlmc-mm-quickstart} \\
+\texttt{RuntimeError: client closed}（拉 HF 资产卡死） & 直连 huggingface.co 超时 & \texttt{export HF\_ENDPOINT=https:/\allowbreak /\allowbreak hf-mirror.\allowbreak com} 再重跑；或预下载本地指路径 & \cref{sec:rlmc-mm-quickstart} \\
+mjlab tracking 任务裸跑 \texttt{ValueError} 要 motion & 跟踪任务无默认参考动作 & 补 \texttt{--env.\allowbreak commands.\allowbreak motion.\allowbreak motion-file /\allowbreak abs/\allowbreak x.\allowbreak npz}（先 csv\_to\_npz 落 npz） & \cref{sec:rlmc-mm-calm-three} \\
+CALM 对所有文本生成相同动作 & text embedding 未正确注入 & 打印判别器输入维度，确认含 condition\_dim；查 manifest 有 text 字段 & \cref{sec:rlmc-mm-calm} \\
+CALM 动作不自然 & 文字标注覆盖不足 & 查 manifest 的 text 字段覆盖率；扩 BABEL/TEACH 子集 & \cref{sec:rlmc-mm-calm-three} \\
+CALM 相似文本动作差异大 & CLIP 未冻结、语义漂移 & 确认 requires\_grad=False；周期打印固定 prompt embedding 范数 & \cref{sec:rlmc-mm-calm-config} \\
+MaskedMimic Phase 2 loss 不降 & mask\_ratio 太高 & 降到约 0.5 再逐步增大；确认用蒸馏非 PPO & \cref{sec:rlmc-mm-masked-train} \\
+TextOp 响应延迟大 & RobotMDAR 推理慢 & 查 GPU 利用率；减小 chunk\_length；确认非每步重启 & \cref{sec:rlmc-mm-textop} \\
+TextOp tracker 跟不上生成动作 & 训练数据不含生成数据 & 把 RobotMDAR 生成数据加入 tracker 训练集 & \cref{sec:rlmc-mm-textop-tricks} \\
+视频 retarget 后脚穿地/躺地 & 坐标系未转换（Y-up$\to$Z-up） & 查旋转变换；MuJoCo 回放目视朝向 & \cref{sec:rlmc-mm-video} \\
+WHAM 估计抖动严重 & 视频质量差或遮挡 & Savgol 低通平滑；高动态用 window=7 & \cref{sec:rlmc-mm-video-verify} \\
+动作变速/tracker 抖动 & 帧率未对齐 & 用 csv\_to\_npz 把动作重采样到 50Hz & \cref{sec:rlmc-mm-video} \\
+HumanPlus 遥操延迟 & 25Hz 相机到 50Hz 策略插值问题 & 查线性插值逻辑；确认手部直进 PD & \cref{sec:rlmc-mm-humanplus-flow} \\
+HDMI 物体跟踪漂移 & 累积位姿误差 & 用通用 6-DoF 跟踪或加关键帧校正 & \cref{sec:rlmc-mm-hdmi} \\
+混合数据训练效果差 & 质量权重不当 & 高质量主导（$\ge50\%$）、低质量辅助（$\le20\%$）；统一坐标系 & \cref{sec:rlmc-mm-choose} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-mm-versions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+组件 & 本章基准（截至 2026-06） & 备注 \\
+\midrule
+CLIP & ViT-B/32（512 维文本） & ViT-L/14 = 768 维，需配套改下游 \\
+ProtoMotions & ProtoMotions3（dataclass 入口） & 支持 IsaacGym/IsaacLab/Newton/MuJoCo/Genesis \\
+CALM / MaskedMimic & ProtoMotions 内置 & arXiv:2305.02195 / arXiv:2409.14393 \\
+WHAM & CVPR 2024（arXiv:2312.07531） & world-grounded，全局平移准 \\
+HumanPlus & CoRL 2024（arXiv:2406.10454） & 基于 IsaacGym Preview，非 manager-based \\
+HDMI & arXiv:2509.16757 & G1；每技能一策略 \\
+LeVERB & arXiv:2506.13751 & 投稿 ICLR 2026 审稿中（已核） \\
+TextOp & arXiv:2602.07439（2026-02，已核） & 项目页 text-op.github.io；代码 TeleHuman/TextOp \\
+mjlab / BeyondMimic & 见 \cref{ch:rlmc-imitation} 版本表 & tracker 底座 \\
+\bottomrule
+\end{tabular}
+\end{center}

@@ -1,0 +1,719 @@
+\chapter{离线高精地图构建}
+\label{ch:lidar-map}
+
+% ════════════════════════════════════════════════════════════════
+%  本章：吸收 高翔《自动驾驶与机器人中的 SLAM 技术》Ch9（离线点云建图）。
+%  主线：数据包 → LIO 前端抽关键帧 → 两轮 PGO（RTK 绝对 + LIO 相对 + 鲁棒核）
+%        → Scan-to-Map 多分辨率 NDT 回环 → 100m 网格切分导出。
+%  系统集成章：零件全部回引（LIO=ch:lidar_slam，PGO/iSAM2=ch:isam2，
+%        RTK/UTM=ch:gins，多分辨率回环思想=ch:slam2d），本章只写"装配主线"。
+%  右扰动为主，与全书一致。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的流程图与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 你已经有了一套能跑 $0.1\%$ 漂移的紧耦合 LIO（\cref{ch:lidar_slam}）。为什么把它直接输出的轨迹拼成的点云地图，在十字路口、停车场这类反复经过的地方会出现“重影”（同一堵墙印成两道）？
+  \item 离线建图和在线 SLAM，输入的传感器、用的算法几乎一样，为什么还要单独拉出一章？“离线”到底买来了什么？
+  \item RTK 能直接给出车辆在地球上的\emph{绝对}坐标，精度厘米级；LIO 只能给\emph{相对}运动、且会漂。既然有了 RTK，为什么不直接拿 RTK 轨迹当地图骨架，反而要把两者放进一个优化里？
+  \item 城市峡谷、立交桥下、隧道口，RTK 会突然跳几米甚至几十米。如果把这种“坏读数”和正常读数一视同仁地塞进最小二乘，整条轨迹会怎样？怎样让优化器“自己看出”哪些 RTK 不可信？
+  \item 回环检测要在“空间上靠近、时间上隔很久”的两个关键帧之间做配准。单帧激光只有几万个点、还稀疏，直接拿两帧做 ICP 经常配不上。有什么补救？
+  \item 一座园区扫下来点云有几个 GB，实时定位时车载内存根本装不下。怎样切、怎样存，才能让定位程序只加载车辆周边那一小块？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{设计}一条“数据包进、分块高精地图出”的离线建图流水线，说清前端 / 后端 / 回环 / 导出四个阶段的输入输出与为什么离线比在线更易做强；
+  \item \textbf{实现}前端：复用 \cref{ch:lidar_slam} 的 LIO 跑里程计，按距离 / 角度阈值\textbf{抽关键帧}（点云存盘省内存），并用时间插值给每个关键帧赋 RTK 位姿；
+  \item \textbf{推导并实现}后端两轮位姿图优化（PGO）的三类因子——RTK 绝对位姿因子、LIO 相对运动因子、回环因子——写出各自残差与雅可比，并\textbf{掌握}鲁棒核“两阶段”策略如何自动剔除 RTK 异常值；
+  \item \textbf{掌握}回环检测的 Scan-to-Map 配准 + \textbf{多分辨率 NDT}（由粗至精）判据，理解它为何比单帧 ICP 更鲁棒、为何天然适合离线并发；
+  \item \textbf{完成}地图导出：按 $100$\,m 网格\textbf{切分}点云 + 体素滤波 + 索引文件，为 \cref{ch:lidar-loc} 的实时定位准备可按需加载的地图块。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{离线流水线}”的主线：把前面所有章节造好的零件（LIO、PGO、NDT、RTK/UTM）拼成一台“点云地图工厂”。与前几章不同，本章几乎不引入新的\emph{数学}，重点在\textbf{系统组织}——哪一步先做、产出什么、如何接续。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 6mm, >=Stealth,
+  io/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!8, draw=second!60!black},
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  bk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[io] (bag) {数据包\\ IMU/RTK/Lidar};
+\node[blk, right=of bag] (lio) {LIO 前端\\ \cref{ch:lidar_slam}};
+\node[blk, right=of lio] (kf) {抽关键帧\\ +RTK 位姿};
+\node[blk, right=of kf] (pgo1) {第一轮 PGO\\ RTK+LIO};
+\node[bk, below=8mm of bag] (loop) {回环检测\\ Scan-to-Map};
+\node[bk, right=of loop] (pgo2) {第二轮 PGO\\ 纳入回环};
+\node[bk, right=of pgo2] (split) {网格切分\\ 100m 导出};
+\node[io, right=of split] (map) {分块地图\\ +索引};
+\draw[ln] (bag)--(lio); \draw[ln] (lio)--(kf); \draw[ln] (kf)--(pgo1);
+\draw[ln] (pgo1.south) -- ++(0,-4mm) -| (loop.north);
+\draw[ln] (loop)--(pgo2); \draw[ln] (pgo2)--(split); \draw[ln] (split)--(map);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：第 \ref{sec:lidar-map-flow} 节（流程总览，理解离线的好处与四阶段划分）$\to$ 第 \ref{sec:lidar-map-frontend} 节（前端抽关键帧 + RTK 赋值）$\to$ 第 \ref{sec:lidar-map-pgo1} 节（第一轮 PGO 三因子 + 鲁棒核）$\to$ 第 \ref{sec:lidar-map-loop} 节（多分辨率 NDT 回环）$\to$ 第 \ref{sec:lidar-map-export} 节（第二轮 PGO + 网格切分导出）。本章无重数学推导，精读约 $3$ 小时即可掌握整条流水线。
+
+\subsection*{前置知识桥接}
+本章是\textbf{系统集成章}：它几乎不造新零件，而是把前几章的成品拼成整机。请先激活以下前置，本章对它们一律“调用而不复述”：
+\begin{itemize}
+  \item \textbf{激光惯性里程计}（\cref{ch:lidar_slam}）：紧耦合 LIO（IEKF / FAST-LIO）或松耦合 LIO 提供\emph{相对}运动估计与去畸变后的点云——本章前端直接把它当作一个“黑盒里程计模块”调用，抽取关键帧。
+  \item \textbf{组合导航与世界坐标系}（\cref{ch:gins}）：RTK-GNSS 的固定解 / 浮点解、UTM 投影把经纬度映到\emph{局部}笛卡尔系——本章后端把 RTK 位姿当作\emph{绝对}观测约束，并继承 \cref{ch:gins} 关于“单天线 RTK 只有平移、无航向”的处理。
+  \item \textbf{位姿图优化与增量平滑}（\cref{ch:isam2}、\cref{ch:nlopt}）：位姿图 = 顶点（$\SE(3)$ 位姿）+ 边（相对 / 绝对约束）的最小二乘；鲁棒核（Huber / Cauchy）、Levenberg–Marquardt 求解——本章的“两轮 PGO”是它的一个工程实例，残差雅可比沿用其右扰动框架。
+  \item \textbf{点云配准与 NDT}（\cref{ch:pointcloud}）：NDT 的体素正态分布表示、配准目标函数与梯度 / 海森；KD-tree 近邻、体素降采样——本章回环检测的 Scan-to-Map 配准与“多分辨率由粗至精”都建在 NDT 之上。
+  \item \textbf{多分辨率回环思想}（\cref{ch:slam2d}）：2D 子地图 SLAM 里“由粗到精的金字塔回环”——本章把同一思想搬到 3D，用多个体素分辨率的 NDT 串联，规避对初值的敏感。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你能跑通 LIO、能跑通 PGO，却不知道把它们\emph{怎样接}才能产出一张可用于量产定位的高精地图——会停在“里程计有重影、不敢导出”的半成品状态；
+  \item 进入 \cref{ch:lidar-loc}（实时定位）时会发现“定位”所依赖的\emph{先验地图}正是本章的产物：地图怎么切的、索引怎么建的、RTK 异常怎么剔的，全在本章定下，跳过则定位章的“九宫格加载”“冷启动搜索”都失去地基。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+位姿 $\mathbf{T}=\big[\begin{smallmatrix}\mathbf{R}&\mathbf{t}\\\mathbf{0}^\top&1\end{smallmatrix}\big]\in\SE(3)$，旋转 $\mathbf{R}\in\SO(3)$（与全书一致）。
+世界系 $W$（建图坐标系，由首个有效 RTK 读数定原点，见 \cref{ch:gins}）、车体 / IMU 系 $B$、激光系 $L$。
+关键帧 $i$ 的待优化位姿记 $\mathbf{T}_i=\mathbf{T}_{WB_i}$。
+扰动约定与 \cref{ch:gins} 的 \texttt{VertexPose} 一致：局部坐标 $\delta\boldsymbol{\xi}=[\delta\boldsymbol{\theta};\delta\mathbf{p}]\in\mathbb{R}^6$（\textbf{旋转在前}），旋转取右扰动 $\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\theta})$、平移取世界系增量 $\mathbf{p}+\delta\mathbf{p}$。
+反对称算子 $(\cdot)^\wedge$（叉积矩阵）。NDT 配准分值 $s_{\text{ndt}}$（PCL \texttt{getTransformationProbability}）。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{点云建图的流程：离线买到了什么}
+\label{sec:lidar-map-flow}
+
+\paragraph{从“能跑的里程计”到“能用的地图”。}
+读到这里，你已经握有一台不错的激光惯性里程计：紧耦合 LIO（\cref{ch:lidar_slam}）每行进千米只漂一米，去畸变、退化处理都做得很好。一个自然的想法是：把车开一圈，把每一帧 LIO 估出的位姿 $\mathbf{T}_i$ 拿来，把对应点云 $P_i$ 用 $\mathbf{T}_i$ 变换到世界系再叠加，不就得到一张地图了吗？
+
+\begin{equation}
+\label{eq:lidar-map-naive}
+\mathcal{M}_{\text{naive}}=\bigcup_i \mathbf{T}_i\!\cdot\! P_i .
+\end{equation}
+
+这正是 \cref{fig:lidar-map-ghost} 想说明的反面教材。问题出在 \cref{eq:lidar-map-naive} 把 $\mathbf{T}_i$ 当成了\emph{真值}，可它只是\emph{里程计估计}：漂移虽小却随路程\textbf{无界累积}。车第一次经过某个十字路口时位姿已经漂了 $0.3$\,m，半小时后绕回来再经过，又漂了 $0.5$\,m——两次叠加的同一堵墙便错开 $0.8$\,m，在地图上印成两道平行的“重影”。重影对人眼是瑕疵，对后续“拿这张地图做厘米级定位”却是灾难：定位算法不知道该往哪道墙上贴。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, scale=1.0]
+% ground truth wall (single)
+\draw[very thick, gray!50] (0,2.1) -- (6,2.1) node[right, font=\scriptsize, gray]{真实墙面（单一）};
+% first pass
+\draw[thick, main!70!black] (0,0) .. controls (1.5,0.1) and (3,0.0) .. (6,0.05);
+\node[font=\scriptsize, main!70!black] at (3,-0.35) {第一次经过：估计墙面 $A$};
+% second pass (drifted)
+\draw[thick, second!70!black] (0,1.0) .. controls (1.5,0.85) and (3,0.95) .. (6,0.8);
+\node[font=\scriptsize, second!70!black] at (3,1.32) {绕回再经过：估计墙面 $A'$（漂移）};
+% gap arrow
+\draw[<->, red!70!black, thick] (4.4,0.05) -- (4.4,0.86);
+\node[font=\scriptsize, red!70!black, right] at (4.45,0.45) {重影间隙 $\sim$ 累积漂移};
+\end{tikzpicture}
+\caption{里程计直接叠加的“重影”成因：同一堵墙在两次经过时因累积漂移被印成 $A$、$A'$ 两道。回环检测 + 位姿图优化的任务，就是把这两道“拉回”到同一处。}
+\label{fig:lidar-map-ghost}
+\end{figure}
+
+\paragraph{两层校正：绝对锚定 + 回环闭合。}
+要消除重影、得到一张\emph{全局一致}的地图，光靠局部里程计远远不够，必须引入两类“更高层”的约束（这也是本章后端的全部内容）：
+\begin{enumerate}
+  \item \textbf{绝对锚定（抗漂移的“地钉”）}：自动驾驶车通常还载有 RTK-GNSS 或组合导航（\cref{ch:gins}），能给出车辆在物理世界中的\emph{绝对}位置。把 RTK 位姿作为对每个关键帧的\emph{绝对}观测，相当于沿途打下一排“地钉”，把里程计轨迹钉在世界坐标上——只要 RTK 正常，全局漂移就被压住。
+  \item \textbf{回环闭合（抗漂移的“缝合”）}：当车回到曾经到过的地方，对“当时”和“此刻”两个关键帧做配准，得到一条相对约束，把绕了一大圈的轨迹两端\emph{缝}在一起，让重影区域的点云重新对齐。
+\end{enumerate}
+这两类约束 + 里程计的相对约束，一起构成一个位姿图（pose graph），用最小二乘求解即得校正后的全局一致轨迹。整套数学就是 \cref{ch:isam2}、\cref{ch:nlopt} 讲过的 PGO，本章只是把它实例化到“RTK + LIO + 回环”这一具体因子组合上。
+
+\paragraph{为什么单独离线做：确定性买来强能力。}
+离线建图与在线 SLAM 的输入（IMU / RTK / 激光）、核心算法（LIO / 配准 / PGO）几乎一样，区别只在一个词：\textbf{确定性}。在线系统受实时性约束，处处要权衡“线程间等待”——后端回环还没算完，是否先插入新子图？是否允许导出一张回环尚未闭合的地图？这些调度问题让在线系统的逻辑变得纠缠。离线则\emph{完全没有}这种顾虑\cite{gao2023slamad}：
+
+\begin{insight}[离线 = 把时间换成质量]
+离线建图的每一步\emph{该怎么做、产出什么}都可以事先规划、完全确定；模块之间没有线程 / 资源调度的竞争。这买来三样在线系统难以企及的能力：
+\begin{itemize}
+  \item \textbf{可一次性全局回环}：所有“空间近、时间远”的检查点可\emph{一次}全查完、并发配准，不必像在线那样边走边等；
+  \item \textbf{可多轮迭代}：可以先优化一轮、检出回环、再优化第二轮（本章的“两轮 PGO”正源于此），在线系统没有“重来一遍”的奢侈；
+  \item \textbf{可重处理}：参数不满意就改了重跑，数据包在硬盘上躺着随时可读。
+\end{itemize}
+代价是“非实时”——但建图本就是\emph{离线生产}任务，地图做好一次、车上用千百次，这笔时间花得值。
+\end{insight}
+
+\paragraph{流水线五步。}
+据此，本章把建图流程组织成五步（对应 \cref{fig:lidar-map-ghost} 之后的全部小节），逐步把“数据包”炼成“分块高精地图”\cite{gao2023slamad}：
+\begin{enumerate}
+  \item \textbf{前端}（\cref{sec:lidar-map-frontend}）：从 ROS 数据包解出 IMU / RTK / 激光；用 IMU + 激光跑 \cref{ch:lidar_slam} 的 LIO；按距离 / 角度阈值抽关键帧、点云存盘；按时间给每个关键帧查插一个 RTK 位姿。
+  \item \textbf{第一轮 PGO}（\cref{sec:lidar-map-pgo1}）：LIO 给相对约束、RTK 给绝对约束，优化整条轨迹，同时\emph{判定}各关键帧的 RTK 是否有效（鲁棒核两阶段去异常）。RTK 正常时，得到一条与 RTK 大体吻合的轨迹。
+  \item \textbf{回环检测}（\cref{sec:lidar-map-loop}）：在第一轮轨迹上找“空间近、时间远”的检查点对；用 Scan-to-Map + 多分辨率 NDT 配准；NDT 分值作有效性判据；并发执行。
+  \item \textbf{第二轮 PGO}（\cref{sec:lidar-map-export}）：把回环约束并入位姿图再优化一次，消除累积误差带来的重影，同时移除 RTK 失效区域。
+  \item \textbf{导出}（\cref{sec:lidar-map-export}）：按 $100$\,m 网格切分点云、体素滤波、写索引文件，供 \cref{ch:lidar-loc} 的实时定位按需加载。
+\end{enumerate}
+
+\begin{note}
+\textbf{为什么用关键帧而不是每一帧.}\;
+激光雷达 $10$\,Hz、跑十几分钟就是上万帧、几十 GB（高翔用的 NCLT 序列原始数据约 $55$\,GB）。但相邻帧之间车几乎没动，信息高度冗余。按“行进距离超过 $\Delta d$ 或转角超过 $\Delta\theta$ 才记一帧”抽取\textbf{关键帧}，数据量可压到约 $2$\,GB——既省内存、又让后端位姿图的顶点数量可控（位姿图规模 $\sim$ 关键帧数，直接决定优化耗时）。这是 SLAM 后端的通用做法，本章前端把它落到工程。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{前端：抽关键帧与赋 RTK 位姿}
+\label{sec:lidar-map-frontend}
+
+前端的任务是把“一长串原始传感器流”转成“一串带 RTK 位姿的关键帧”。由于 \cref{ch:lidar_slam} 已经造好了完整的 LIO，本章前端只需在它外面加一层\emph{数据包解算}与\emph{关键帧抽取}逻辑\cite{gao2023slamad}。它做三件事：
+
+\begin{enumerate}
+  \item \textbf{提取并对齐 RTK}：把数据包里的 RTK 读数取出，按采集时间排序放进一个队列。用\emph{第一个有效} RTK 读数作为\textbf{地图原点}（世界系 $W$ 的原点），其余 RTK 读数减去该原点，得到\emph{局部}世界系下的位置观测——这一步把动辄几十万米的 UTM 坐标（见 \cref{ch:gins}）平移到原点附近，避免大数相减的数值损失。
+  \item \textbf{跑 LIO 抽关键帧}：用 IMU + 激光数据驱动 LIO；每当当前位姿相对上一关键帧的\emph{行进距离}超过阈值 $\Delta d$、或\emph{转角}超过阈值 $\Delta\theta$，就记一个新关键帧，并把该帧位姿、点云一起保存。点云\emph{存盘}（写成 \texttt{.pcd}）后立即从内存清除，只在位姿图里留一个轻量索引——这是把几十 GB 数据“摊到硬盘”的关键。
+  \item \textbf{给关键帧赋 RTK 位姿}：按关键帧时间戳到 RTK 队列里\emph{查插}一个位姿，作为该帧的绝对观测。
+\end{enumerate}
+
+\paragraph{关键帧抽取判据。}
+设上一关键帧位姿 $\mathbf{T}_{\text{last}}$、当前 LIO 位姿 $\mathbf{T}_{\text{cur}}$，相对运动 $\Delta\mathbf{T}=\mathbf{T}_{\text{last}}^{-1}\mathbf{T}_{\text{cur}}$。抽帧判据为
+\begin{equation}
+\label{eq:lidar-map-kf}
+\big\|\,\Delta\mathbf{t}\,\big\|>\Delta d \quad\text{或}\quad \big\|\,\mathrm{Log}(\Delta\mathbf{R})\,\big\|>\Delta\theta,
+\end{equation}
+其中 $\Delta\mathbf{t}$、$\Delta\mathbf{R}$ 为 $\Delta\mathbf{T}$ 的平移、旋转部分，$\mathrm{Log}(\Delta\mathbf{R})$ 是旋转矢量、其模即转角（弧度）。两个阈值二选一满足即记帧：距离判据保证“走得够远才记”，角度判据保证“转得够多也记”（转弯处即使位移不大、视角变化也大，需要补帧以免回环 / 配准时缺视角覆盖）。典型取 $\Delta d\approx 1$\,m、$\Delta\theta\approx 15^\circ$。
+
+\begin{codebox}[C++]{前端主循环:解 RTK + 跑 LIO + 抽关键帧（仿 Gao Ch9）}
+void Frontend::Run() {
+  // 1) 先扫一遍数据包，把 RTK 读数收进队列（按时间排序）
+  RosbagIO rosbag_io(bag_path_);
+  rosbag_io
+    .AddAutoRTKHandle([this](GNSSPtr gnss) {
+      gnss_.emplace(gnss->unix_time_, gnss);   // map<time, gnss>，自动按时间有序
+      return true;
+    })
+    .Go();
+  RemoveMapOrigin();   // 以首个有效 RTK 为原点，其余减去原点 → 局部世界系
+
+  // 2) 再扫一遍:用 IMU + 激光跑 LIO，按阈值抽关键帧
+  rosbag_io
+    .AddAutoPointCloudHandle([&](PointCloudPtr cloud) -> bool {
+      lio_->PCLCallBack(cloud);
+      ExtractKeyFrame(lio_->GetCurrentState());   // 检查是否够阈值 → 记关键帧
+      return true;
+    })
+    .AddImuHandle([&](IMUPtr imu) {
+      lio_->IMUCallBack(imu);
+      return true;
+    })
+    .Go();
+  lio_->Finish();
+
+  SaveKeyframes();   // 落盘 keyframes.txt（各帧 RTK/LIO/优化位姿）
+}
+\end{codebox}
+
+\paragraph{关键帧抽取与点云落盘。}
+抽帧函数把 \cref{eq:lidar-map-kf} 落到代码：第一帧无条件记；之后逐帧算 $\Delta\mathbf{T}$、比阈值。每记一个关键帧，立刻调 \texttt{FindGPSPose} 给它配 RTK 位姿，再把点云存盘并从内存卸载（\texttt{SaveAndUnloadScan}）。
+
+\begin{codebox}[C++]{抽关键帧:阈值判据 + RTK 赋值 + 点云存盘卸载}
+void Frontend::ExtractKeyFrame(const NavStated& state) {
+  if (last_kf_ == nullptr) {             // 第一帧:无条件记
+    auto kf = std::make_shared<Keyframe>(
+        state.timestamp_, kf_id_++, state.GetSE3(), lio_->GetCurrentScan());
+    FindGPSPose(kf);                     // 查插 RTK 位姿
+    kf->SaveAndUnloadScan("./data/ch9/");// 点云写 pcd 后从内存清除
+    keyframes_.emplace(kf->id_, kf);
+    last_kf_ = kf;
+    return;
+  }
+  // 当前 state 相对上一关键帧的相对运动（关键帧抽取判据）
+  SE3 delta = last_kf_->lidar_pose_.inverse() * state.GetSE3();
+  if (delta.translation().norm() > kf_dis_th_ ||
+      delta.so3().log().norm() > kf_ang_th_deg_ * kDEG2RAD) {
+    auto kf = std::make_shared<Keyframe>(
+        state.timestamp_, kf_id_++, state.GetSE3(), lio_->GetCurrentScan());
+    FindGPSPose(kf);
+    kf->SaveAndUnloadScan("./data/ch9/");
+    keyframes_.emplace(kf->id_, kf);
+    last_kf_ = kf;
+  }
+}
+\end{codebox}
+
+\paragraph{按时间插值赋 RTK 位姿。}
+关键帧的时间戳通常落在两个 RTK 读数之间，需要\emph{内插}。平移用线性插值、旋转用四元数球面线性插值（SLERP），这是一个通用的“按时间查插位姿”操作：给定查询时间 $t$、一个按时间排序的位姿序列 $\{(t_k,\mathbf{T}_k)\}$，找到 $t_k\le t< t_{k+1}$ 的相邻两帧，令插值比例 $s=\frac{t-t_k}{t_{k+1}-t_k}\in[0,1)$，则
+\begin{equation}
+\label{eq:lidar-map-interp}
+\mathbf{q}(t)=\mathrm{SLERP}\big(\mathbf{q}_k,\mathbf{q}_{k+1};\,s\big),\qquad
+\mathbf{t}(t)=(1-s)\,\mathbf{t}_k+s\,\mathbf{t}_{k+1}.
+\end{equation}
+插值\emph{只在区间内}做（要求 $t$ 介于序列首末时间之间、绝不外推），否则 RTK 信号缺失段的端点会被错误延拓。若查插失败（如该时段 RTK 丢失），把该关键帧标记为 \texttt{rtk\_valid\_=false}，后端便不为它建 RTK 因子。
+
+\begin{codebox}[C++]{按时间查插 RTK 位姿（SLERP + 线性，式 \ref{eq:lidar-map-interp}）}
+void Frontend::FindGPSPose(std::shared_ptr<Keyframe> kf) {
+  SE3 pose; GNSSPtr match;
+  // 在 RTK map 中按时间内插;take_pose_func 指明从 GNSS 取 utm_pose_
+  if (PoseInterp<GNSSPtr>(kf->timestamp_, gnss_,
+        [](const GNSSPtr& g) -> SE3 { return g->utm_pose_; }, pose, match)) {
+    kf->rtk_pose_  = pose;
+    kf->rtk_valid_ = true;
+  } else {
+    kf->rtk_valid_ = false;   // 该时段无有效 RTK → 后端不建 RTK 因子
+  }
+}
+\end{codebox}
+
+前端跑完，硬盘上得到一串 \texttt{.pcd}（每个关键帧的点云）和一个 \texttt{keyframes.\allowbreak txt}（记录每帧的 RTK、LIO、（后续填入的）优化位姿）。此时若直接用 LIO 位姿把点云拼起来，会得到 \cref{fig:lidar-map-ghost} 那样\emph{有重影}的地图——这正是后端要消除的。
+
+\begin{pitfall}[地图原点不减，UTM 大数吃掉精度]
+UTM 投影下，城市坐标动辄是 $(5\times10^5,\ 4\times10^6)$ 量级的大数（米）。若不先减去地图原点就把这种坐标喂进优化器，单精度浮点的有效位会被高位“吃掉”——$4\times10^6$ 上叠加厘米级量在 \texttt{float} 下已逼近机器精度。务必如 \texttt{RemoveMapOrigin} 那样，以首个有效 RTK 为原点平移到局部系，再做一切优化与建图（这一约定与 \cref{ch:gins} 的 UTM→局部系处理一致）。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{第一轮位姿图优化与 RTK 异常剔除}
+\label{sec:lidar-map-pgo1}
+
+后端的核心是一个位姿图：顶点是各关键帧的待优化位姿 $\mathbf{T}_i\in\SE(3)$，边是把它们约束在一起的各类因子。我们希望最终轨迹能同时尊重\emph{所有}传感器输入，于是位姿图须包含三类因子\cite{gao2023slamad}：
+
+\begin{itemize}
+  \item \textbf{RTK 因子}（绝对位姿观测）：把关键帧位姿钉到 RTK 给的世界坐标上。若 RTK 含姿态，连姿态一起约束；若\emph{只含平移}（如单天线方案），只约束平移。
+  \item \textbf{LIO 相对运动因子}（局部连续性）：用前端 LIO 估出的相邻关键帧相对位姿作约束，提供局部光滑、连续的骨架。
+  \item \textbf{回环因子}（远程闭合）：来自 \cref{sec:lidar-map-loop} 的回环配准结果，把绕一圈后重逢的两帧缝合（\emph{第一轮}尚无回环，第二轮才加入）。
+\end{itemize}
+
+\subsection{三类因子的残差与雅可比}
+\label{sec:lidar-map-factors}
+
+\paragraph{RTK 绝对因子（单天线：只约束平移）。}
+NCLT 这类\emph{单天线} RTK 只测位置、不测航向。这种 RTK 给出的世界坐标，量的是\emph{天线}在世界系的位置，而我们的优化变量是\emph{车体} $\mathbf{T}_{WB}$，二者差一个车体→天线的外参 $\mathbf{T}_{BG}$（天线相对车体的安装位姿）。因此残差是“把车体位姿外推到天线、取其平移、与 RTK 观测相减”\cite{gao2023slamad}：
+\begin{equation}
+\label{eq:lidar-map-rtk-res}
+\mathbf{e}_{\text{rtk}}=\Big(\mathbf{T}_{WB}\,\mathbf{T}_{BG}\Big)\!\cdot\!\mathbf{t}\;-\;\mathbf{z}_{\text{rtk}}\ \in\mathbb{R}^3,
+\end{equation}
+其中 $(\cdot)\!\cdot\!\mathbf{t}$ 取齐次变换的平移分量，$\mathbf{z}_{\text{rtk}}$ 是该关键帧查插得到的 RTK 平移观测（已减地图原点）。按 \cref{ch:gins} 的 \texttt{VertexPose} 约定取扰动 $\delta\boldsymbol{\xi}=[\delta\boldsymbol{\theta};\delta\mathbf{p}]$（\textbf{旋转在前}；旋转右扰动 $\mathbf{R}_{WB}\leftarrow\mathbf{R}_{WB}\,\mathrm{Exp}(\delta\boldsymbol{\theta})$、平移世界系增量 $\mathbf{p}_{WB}\leftarrow\mathbf{p}_{WB}+\delta\mathbf{p}$）求导，得 $3\times6$ 雅可比
+\begin{equation}
+\label{eq:lidar-map-rtk-jac}
+\frac{\partial\mathbf{e}_{\text{rtk}}}{\partial\delta\boldsymbol{\xi}}
+=\Big[\ \underbrace{-\,\mathbf{R}_{WB}\,\big(\mathbf{t}_{BG}\big)^\wedge}_{\partial/\partial\delta\boldsymbol{\theta}}\quad
+\underbrace{\mathbf{I}_3}_{\partial/\partial\delta\mathbf{p}}\ \Big],
+\end{equation}
+即：旋转块（列 $0$–$2$）为 $-\mathbf{R}_{WB}(\mathbf{t}_{BG})^\wedge$，平移块（列 $3$–$5$）为单位阵 $\mathbf{I}_3$（$\mathbf{t}_{BG}$ 为外参平移）。其物理含义很直观——世界系平移扰动一比一推到天线（故为 $\mathbf{I}$）；旋转扰动则通过“绕车体转一点点会把外参臂 $\mathbf{t}_{BG}$ 的末端扫动”影响天线位置，故出现叉积矩阵。这与 \cref{eq:gins-edgegnss} 的 \texttt{EdgeGNSS}（六自由度版旋转块为 $\mathbf{J}_r^{-1}$、平移块为 $\mathbf{I}$）共享同一 \texttt{VertexPose} 约定，只是这里只观测平移、且旋转块来自外参臂 $\mathbf{t}_{BG}$ 的叉积。
+
+\begin{codebox}[C++]{RTK 单天线因子（g2o 一元边，对应式 \ref{eq:lidar-map-rtk-res}--\ref{eq:lidar-map-rtk-jac}）}
+// 三自由度 GNSS:只约束平移，考虑车体->天线外参 TBG
+class EdgeGNSSTransOnly : public g2o::BaseUnaryEdge<3, Vec3d, VertexPose> {
+ public:
+  EdgeGNSSTransOnly(VertexPose* v, const Vec3d& obs, const SE3& TBG)
+      : TBG_(TBG) { setVertex(0, v); setMeasurement(obs); }
+
+  void computeError() override {                       // RTK 残差:车体外推到天线取平移
+    VertexPose* v = (VertexPose*)_vertices[0];
+    _error = (v->estimate() * TBG_).translation() - _measurement;
+  }
+  void linearizeOplus() override {                     // 3x6 雅可比（右扰动）
+    VertexPose* v = (VertexPose*)_vertices[0];
+    SE3 TWB = v->estimate();
+    _jacobianOplusXi.setZero();
+    _jacobianOplusXi.block<3,3>(0,0) = -TWB.so3().matrix() * SO3::hat(TBG_.translation()); // 旋转块（旋转在前，列 0-2）
+    _jacobianOplusXi.block<3,3>(0,3) = Mat3d::Identity();                       // 平移块（世界系，列 3-5）
+  }
+ private:
+  SE3 TBG_;
+};
+\end{codebox}
+
+\paragraph{LIO 相对运动因子。}
+相邻关键帧 $i,j$ 之间，LIO 给出一个相对位姿观测 $\mathbf{z}_{ij}=\mathbf{T}_{ij}^{\text{lio}}$。残差是“两顶点的相对位姿与观测之差”，在 $\SE(3)$ 上取对数映射为 $6$ 维误差\cite{gao2023slamad}：
+\begin{equation}
+\label{eq:lidar-map-rel-res}
+\mathbf{e}_{ij}=\mathrm{Log}\!\Big(\,\mathbf{z}_{ij}^{-1}\,\mathbf{T}_i^{-1}\mathbf{T}_j\,\Big)\ \in\mathbb{R}^6 .
+\end{equation}
+这正是 \cref{ch:isam2}、\cref{ch:nlopt} 里位姿图的标准 \texttt{BetweenFactor} / \texttt{EdgeSE3} 形式（相对运动约束），其右扰动雅可比由 $\SE(3)$ 的右雅可比 $\mathbf{J}_r^{-1}$ 给出，本章不复述，直接复用。
+
+\begin{codebox}[C++]{LIO 相对运动因子（g2o 二元边，对应式 \ref{eq:lidar-map-rel-res}）}
+// 六自由度相对运动;误差平移在前、角度在后;观测 = T_ij
+class EdgeRelativeMotion : public g2o::BaseBinaryEdge<6, SE3, VertexPose, VertexPose> {
+ public:
+  EdgeRelativeMotion(VertexPose* v1, VertexPose* v2, const SE3& obs) {
+    setVertex(0, v1); setVertex(1, v2); setMeasurement(obs);
+  }
+  void computeError() override {                       // SE(3) 相对位姿残差
+    VertexPose* v1 = (VertexPose*)_vertices[0];
+    VertexPose* v2 = (VertexPose*)_vertices[1];
+    SE3 Tij = v1->estimate().inverse() * v2->estimate();
+    _error = (_measurement.inverse() * Tij).log();
+  }
+};
+\end{codebox}
+
+\subsection{鲁棒核两阶段：让优化器自己看出坏 RTK}
+\label{sec:lidar-map-robust}
+
+\paragraph{RTK 异常为什么致命。}
+城市峡谷、立交桥下、隧道口，RTK 信号被遮挡 / 多径污染，会突然跳几米甚至几十米（NCLT 序列里 RTK 在不少区域存在抖动、消失）。普通最小二乘对残差取\emph{平方}，一个跳了 $20$\,m 的坏 RTK 贡献的代价是正常点的 $\sim\!(20/0.1)^2=4\times10^4$ 倍——优化器会为了讨好这一个坏点，把整条轨迹\emph{扭向}它，正常区域反而被带偏。这是“最小二乘对外点零容忍”的通病（\cref{ch:nlopt} 讨论过）。
+
+\paragraph{鲁棒核 + 两阶段策略。}
+对策有两层。第一层是给 RTK 因子（和回环因子）套\textbf{鲁棒核}（Huber / Cauchy）：残差超过阈值 $\delta$ 后，代价从二次增长\emph{压}成线性（Huber）甚至次线性（Cauchy），坏点的“话语权”被削弱。但只套核还不够——核只是\emph{压低}坏点权重，坏点仍在图里。于是第二层是高翔的\textbf{两阶段}做法\cite{gao2023slamad}：
+
+\begin{algo}[第一轮 PGO：鲁棒核两阶段去 RTK 异常]
+\textbf{输入}：关键帧顶点、RTK 因子（带核）、LIO 相对因子。\\[2pt]
+\textbf{阶段 1（带核优化）}：给所有 RTK 因子挂鲁棒核，优化一次。坏 RTK 的残差大、被核压住，对解的影响有限；优化收敛后，\emph{逐因子}检查残差——残差仍异常大的 RTK 因子，判定为\textbf{外点}（\texttt{rtk\_valid\_=false}）。\\[2pt]
+\textbf{阶段 2（去核再优化）}：把判出的外点 RTK 因子\emph{移除}，对剩下的（可信）RTK 因子\textbf{去掉核}、按正常二次代价再优化一次。此时图里只剩好约束，去核能让它们充分发挥精度。\\[2pt]
+\textbf{补充（RTK 无姿态时的整体旋转）}：单天线 RTK 不含航向，LIO 轨迹与 RTK 轨迹可能整体差一个\emph{旋转}（绕原点）。优化前先对两条轨迹做一次\emph{整体} ICP，估出这个旋转、把 LIO 轨迹对齐到 RTK 朝向，再进位姿图。
+\end{algo}
+
+\noindent“先带核压住、再剔除、再去核精修”——这套两阶段是离线建图独有的奢侈：在线系统没有“优化两遍”的时间预算，只能一遍带核糊过去。
+
+\begin{codebox}[C++]{构建并求解第一轮位姿图（g2o LM;带核→去核两阶段）}
+void Optimization::BuildProblem() {
+  using BlockSolverType  = g2o::BlockSolverX;
+  using LinearSolverType = g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType>;
+  auto* solver = new g2o::OptimizationAlgorithmLevenberg(
+      g2o::make_unique<BlockSolverType>(g2o::make_unique<LinearSolverType>()));
+  optimizer_.setAlgorithm(solver);
+
+  AddVertices();     // 各关键帧位姿顶点
+  AddRTKEdges();     // RTK 因子（单天线 EdgeGNSSTransOnly，带鲁棒核）
+  AddLidarEdges();   // LIO 相对运动因子 EdgeRelativeMotion
+  AddLoopEdges();    // 回环因子（第一轮为空，第二轮才有）
+}
+// 求解:阶段1 带核 optimize → 标记残差异常的 RTK 为外点 → 阶段2 去核 optimize
+\end{codebox}
+
+\paragraph{第一轮结果。}
+第一轮跑完，RTK 正常的话，会得到一条与 RTK 轨迹\emph{大体吻合}的轨迹，且 RTK 失效区域被很好地识别出来（标记为无效、其因子被剔）。但\emph{此时点云仍有重影}——因为还没做回环检测：LIO 只约束\emph{连续时刻}的相对运动，对“不同时刻、不同方向经过同一地点”这种远程关联无能为力。消除重影要靠下一节的回环。
+
+\begin{note}
+\textbf{两轮 PGO 不是“同一优化跑两次”.}\;
+第一轮的输入是 RTK + LIO（无回环），目的是\emph{钉住全局 + 剔除坏 RTK}，产出一条干净的初始轨迹和可信的 RTK 集合；第二轮的输入多了\emph{回环因子}，目的是\emph{缝合重影}。两轮之间夹着一个“回环检测”步骤，正因离线可以“先算完第一轮、再据其找回环、再优化第二轮”——这种“优化 $\leftrightarrow$ 检测”交替正是离线相对在线买到的强能力。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{回环检测：Scan-to-Map 多分辨率 NDT}
+\label{sec:lidar-map-loop}
+
+点云地图的质量很大程度上取决于回环检测是否充分\cite{gao2023slamad}。没有回环，重影区域的点云在地图上始终是“两道”；有了正确回环，第二轮 PGO 才能把它们拉回一道。本节设计一套\emph{离线}回环检测：一次性把所有该检查的区域查完，并发配准。
+
+\paragraph{设计四要点。}
+\begin{enumerate}
+  \item \textbf{检查点对（空间近、时间远）}：遍历第一轮轨迹上的关键帧，对“空间上相隔较近、但\emph{ID}（时间）相隔较远”的两帧做回环检测，称这样一对为\textbf{检查点}（check point）。为防检查点数量爆炸，设一个 ID 间隔——每隔若干关键帧才查一次（高翔实验取间隔 $5$）；并要求同一段轨迹内 ID 间隔超过最小阈值（间隔太近不算回环，那只是“正常往前走”）。
+  \item \textbf{Scan-to-Map 而非 Scan-to-Scan}：单帧激光点云稀疏、点数少，两个\emph{单帧}直接配准常因点不够而配不准。改为在每个候选关键帧\emph{邻域}抽若干帧拼成一个\textbf{子地图}（submap），用“当前帧子地图”对“候选帧子地图”配准——点更密、结构更完整，配准更鲁棒。
+  \item \textbf{并发执行}：每个检查点对的配准互相独立，离线时可\emph{一次性}全派到多核并行（\texttt{std::for\_each(par\_unseq,\,\ldots)}），不像在线那样要等前端。
+  \item \textbf{多分辨率 NDT + 分值判据}：实际配准用 NDT，并以 NDT 的\emph{配准分值}作为回环\emph{有效性}判据。与里程计不同，回环检测对初值估计往往很差（绕一大圈回来，初始相对位姿误差可能很大），希望算法\emph{不太依赖}给定初值——于是给 NDT 加一个\textbf{由粗至精}的多分辨率过程（这和 \cref{ch:slam2d} 的多分辨率二维配准、以及 Cartographer 的分支定界思想同源）。
+\end{enumerate}
+
+\subsection{检测：找空间近、时间远的候选}
+\label{sec:lidar-map-loop-detect}
+
+回环检测本质是“先检测、再计算”两步：先用\emph{欧氏距离}快速圈出候选对（便宜），再对候选做 NDT 配准（昂贵）。检测是一个双重循环，对每对关键帧 $(i,j)$ 判断\cite{gao2023slamad}：(a) ID 差是否够大（$|i-j|>$ 最小间隔，排除“同段相邻”）；(b) 优化后位姿的\emph{平面}（$x,y$）距离是否够近（$<$ 距离阈值）；并用一个“已配过”标记避免对密集相邻的候选重复检查。满足者收为一个回环候选 \texttt{LoopCandidate}，记下两帧 ID 与初始相对位姿。
+
+\begin{codebox}[C++]{回环候选结构 + 检测（空间近、时间远;对应 \cref{sec:lidar-map-loop-detect}）}
+struct LoopCandidate {
+  LoopCandidate(IdType id1, IdType id2, SE3 Tij) : idx1_(id1), idx2_(id2), Tij_(Tij) {}
+  IdType idx1_ = 0, idx2_ = 0;
+  SE3    Tij_;
+  double ndt_score_ = 0.0;     // NDT 配准分值（有效性判据）
+};
+
+void LoopClosure::DetectLoopCandidates() {
+  KFPtr check_first = nullptr, check_second = nullptr;
+  for (auto iter_first = keyframes_.begin(); iter_first != keyframes_.end(); ++iter_first) {
+    auto kf_first = iter_first->second;
+    if (check_first != nullptr &&
+        abs(int(kf_first->id_) - int(check_first->id_)) <= skip_id_) continue;  // 跳过:与上个候选太近
+    for (auto iter_second = iter_first; iter_second != keyframes_.end(); ++iter_second) {
+      auto kf_second = iter_second->second;
+      if (check_second != nullptr &&
+          abs(int(kf_second->id_) - int(check_second->id_)) <= skip_id_) continue;
+      if (abs(int(kf_first->id_) - int(kf_second->id_)) < min_id_interval_) continue; // 同段相邻:非回环
+      // 平面 (x,y) 距离够近？
+      Vec3d dt = kf_first->opti_pose_1_.translation() - kf_second->opti_pose_1_.translation();
+      double range_2d = dt.head<2>().norm();
+      if (range_2d < min_distance_) {
+        loop_candidates_.emplace_back(kf_first->id_, kf_second->id_,
+            kf_first->opti_pose_1_.inverse() * kf_second->opti_pose_1_);          // 初始相对位姿
+        check_first = kf_first; check_second = kf_second;
+      }
+    }
+  }
+}
+\end{codebox}
+
+\subsection{计算：子地图配准 + 多分辨率 NDT}
+\label{sec:lidar-map-loop-compute}
+
+\paragraph{为什么子地图。}
+取候选关键帧 $i$ 的一个\emph{邻域}（ID 在 $[i-r,\,i+r]$ 内、按步长抽），把这些关键帧的点云各自用其优化位姿变换到世界系（或以 $i$ 为参考的局部系）后\emph{叠加}，得到一个子地图。子地图点更密、几何更完整，对“当前帧”这种稀疏单帧能提供足够的配准约束。对回环两端各建一个子地图，再做配准。
+
+\paragraph{多分辨率由粗至精。}
+对两个子地图做 NDT 配准时，\emph{不}用单一体素分辨率，而是按 $\{10,\,5,\,4,\,3\}$\,m 一串\emph{由粗至精}的分辨率依次配准，把上一分辨率的结果作为下一分辨率的\emph{初值}\cite{gao2023slamad}：
+\begin{equation}
+\label{eq:lidar-map-multires}
+\mathbf{T}^{(0)}\xrightarrow[\text{NDT }10\text{m}]{}\mathbf{T}^{(1)}
+\xrightarrow[\text{NDT }5\text{m}]{}\mathbf{T}^{(2)}
+\xrightarrow[\text{NDT }4\text{m}]{}\mathbf{T}^{(3)}
+\xrightarrow[\text{NDT }3\text{m}]{}\mathbf{T}^{(4)}=\mathbf{T}_{ij}^{\text{loop}}.
+\end{equation}
+其道理与“先用望远镜大致对准、再换显微镜精调”一样：粗分辨率（$10$\,m 大体素）的 NDT \emph{捕获半径大}、对差初值不敏感，能从很离谱的初始相对位姿里把两子地图“拉到大致对齐”；细分辨率（$3$\,m 小体素）\emph{精度高}但捕获半径小，只有在已经大致对齐后才不会跑飞。逐级缩小体素，正是用“大捕获半径换粗精度、再用小捕获半径换高精度”的接力。最后以\emph{最细}（$3$\,m）那级的 NDT 分值 $s_{\text{ndt}}$ 作为回环\emph{有效性}判据：$s_{\text{ndt}}>$ 阈值才认为这是一个可信回环。
+
+\begin{insight}[多分辨率 = 用粗尺度的大收敛域兜住差初值]
+回环的初始相对位姿可能错出好几米、几十度——这正是单分辨率精配准（小体素 NDT）会陷局部极小、配飞的根源。多分辨率把“收敛域”和“精度”\emph{解耦}：粗级负责\emph{收敛域}（把差初值兜进正确盆地），细级负责\emph{精度}（在盆地里精修）。这与 \cref{ch:slam2d} 的金字塔回环、与里程计里“用 IMU 预测给配准供好初值”是同一思想的不同实现——离线回环没有 IMU 预测可借，便用“粗尺度”自造一个大收敛域。
+\end{insight}
+
+\begin{codebox}[C++]{回环计算:建子地图 + 多分辨率 NDT（对应式 \ref{eq:lidar-map-multires}）}
+void LoopClosure::ComputeForCandidate(LoopCandidate& c) {
+  const int submap_idx_range = 40;
+  KFPtr kf1 = keyframes_.at(c.idx1_), kf2 = keyframes_.at(c.idx2_);
+
+  // 在某关键帧邻域抽点云、变换到（世界或局部）系，叠成子地图
+  auto build_submap = [this](int given_id, bool build_in_world) -> CloudPtr {
+    CloudPtr submap(new PointCloudType);
+    for (int idx = -submap_idx_range; idx < submap_idx_range; idx += 4) {
+      int id = idx + given_id;
+      auto iter = keyframes_.find(id);
+      if (id < 0 || iter == keyframes_.end()) continue;
+      CloudPtr cloud(new PointCloudType);
+      pcl::io::loadPCDFile("./data/ch9/" + std::to_string(id) + ".pcd", *cloud);
+      RemoveGround(cloud, 0.1);                       // 去地面，减干扰
+      SE3 Twb = iter->second->opti_pose_1_;
+      if (!build_in_world)                            // 局部系:以 given_id 为参考
+        Twb = keyframes_.at(given_id)->opti_pose_1_.inverse() * Twb;
+      CloudPtr cloud_trans(new PointCloudType);
+      pcl::transformPointCloud(*cloud, *cloud_trans, Twb.matrix());
+      *submap += *cloud_trans;
+    }
+    return submap;
+  };
+
+  auto submap_kf1 = build_submap(kf1->id_, true);     // 候选 1 子地图（世界系）
+  auto submap_kf2 = build_submap(kf2->id_, false);    // 候选 2 子地图（局部系）
+
+  pcl::NormalDistributionsTransform<PointType, PointType> ndt;
+  ndt.setTransformationEpsilon(0.05);
+  ndt.setStepSize(0.7);
+  ndt.setMaximumIterations(40);
+  Mat4f T = kf2->opti_pose_1_.matrix().cast<float>();
+
+  std::vector<double> res{10.0, 5.0, 4.0, 3.0};       // 由粗至精的多分辨率
+  CloudPtr output(new PointCloudType);
+  for (auto& r : res) {
+    ndt.setResolution(r);
+    ndt.setInputTarget(VoxelCloud(submap_kf1, r * 0.1)); // 体素降采样随分辨率自适应
+    ndt.setInputSource(VoxelCloud(submap_kf2, r * 0.1));
+    ndt.align(*output, T);
+    T = ndt.getFinalTransformation();                 // 上一级结果作下一级初值
+  }
+  c.Tij_       = kf1->opti_pose_1_.inverse() * Mat4ToSE3(T); // 回环相对位姿
+  c.ndt_score_ = ndt.getTransformationProbability();   // 最细级分值作判据
+}
+\end{codebox}
+
+\paragraph{并发与筛选。}
+所有候选的计算互相独立，离线时一次性并发跑完，再按分值筛掉低于阈值的：
+
+\begin{codebox}[C++]{回环并发计算 + 按 NDT 分值筛选}
+void LoopClosure::ComputeLoopCandidates() {
+  std::for_each(std::execution::par_unseq, loop_candidates_.begin(), loop_candidates_.end(),
+      [this](LoopCandidate& c) { ComputeForCandidate(c); });   // 多核并发
+  std::vector<LoopCandidate> succ;                              // 只留分值达标的
+  for (const auto& lc : loop_candidates_)
+    if (lc.ndt_score_ > ndt_score_th_) succ.emplace_back(lc);
+  loop_candidates_.swap(succ);
+}
+\end{codebox}
+
+\begin{pitfall}[假回环比没回环更危险]
+回环检测最怕\emph{假阳性}：两处结构相似但实际不同的地方（一排相同的立柱、对称的走廊）被误判为回环，硬塞进位姿图后会把轨迹“对折”、整张地图扭曲——比根本没检出回环更糟。本章的两道防线：(1) 多分辨率 NDT 的最细级\emph{分值阈值}（结构对不上则分值低、被筛掉）；(2) 后端给回环因子也挂\emph{鲁棒核}（万一漏网，优化时被压权）。研究上还可加几何验证（内点率、行进距离合理性），与 \cref{ch:loop} 的回环验证一脉相承。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{第二轮优化与地图的网格切分导出}
+\label{sec:lidar-map-export}
+
+\subsection{第二轮 PGO：纳入回环、消除重影}
+\label{sec:lidar-map-pgo2}
+
+把 \cref{sec:lidar-map-loop} 检出的有效回环作为\emph{回环因子}并入位姿图，连同 RTK 因子、LIO 相对因子，再优化一次——这就是\textbf{第二轮 PGO}\cite{gao2023slamad}。回环因子的残差形式与 LIO 相对因子（\cref{eq:lidar-map-rel-res}）完全相同（都是 $\SE(3)$ 相对位姿约束），只是观测来自回环配准而非里程计；同样挂鲁棒核以防假回环。第二轮把“绕一圈累积的误差”\emph{均摊}回整条轨迹，重影区域的两道墙被拉回一道，同时彻底移除前面判出的 RTK 失效区域。确定了优化位姿后，每个关键帧得到最终的 \texttt{opti\_pose\_2\_}，即可据此导出点云地图。
+
+\begin{insight}[回环把“线”闭成“环”、误差从端点均摊到全程]
+没有回环时，轨迹是一条\emph{开链}，误差只能在末端累积、无处释放。一条有效回环给开链补上一条“远程边”，把它闭成\emph{环}：优化器现在面对的是“环上累积误差必须自洽为零”的约束，于是把这点误差\emph{均匀摊}到环上每条边——单点的大漂移被稀释成全程的微小调整。这就是“千米漂一米的里程计 + 几个回环”能产出全局厘米级一致地图的原因，其数学即 \cref{ch:isam2} 的位姿图最小二乘。
+\end{insight}
+
+\subsection{地图导出：100m 网格切分 + 索引}
+\label{sec:lidar-map-grid}
+
+\paragraph{为什么要切分。}
+把整张点云存成一个文件固然方便查看，但\emph{实时定位}时这样用不行：一座园区的点云有几个 GB，车载内存装不下、也没必要全装——定位只需车辆\emph{周边}那一小块。因此本章按 $100$\,m 边长把地图\textbf{切成网格块}，每块单独存一个 \texttt{.pcd}，并写一个索引文件记录每块的位置。这样 \cref{ch:lidar-loc} 的实时定位就能“按当前位姿只加载周边九宫格、其余卸载”，把内存占用控制在恒定的一小块。
+
+\paragraph{切分规则。}
+点的归属由其平面坐标决定。对每个点 $(x,y)$，其所属网格的整数索引为\cite{gao2023slamad}
+\begin{equation}
+\label{eq:lidar-map-grid}
+g_x=\Big\lfloor\frac{x-50}{100}\Big\rfloor,\qquad
+g_y=\Big\lfloor\frac{y-50}{100}\Big\rfloor,
+\end{equation}
+其中减 $50$ 是把网格中心对齐到 $100$\,m 整倍数处（让原点附近的块以原点为中心、而非以原点为角），除 $100$ 再向下取整即得 $100$\,m 边长网格的行列号 $(g_x,g_y)$。\footnote{此处取整须用\emph{向下取整} $\lfloor\cdot\rfloor$（C++ 的 \texttt{floor}），不能用直接 \texttt{int}（向零截断）：地图原点平移后坐标以原点为中心、负值常见，而 $\lfloor-1.5\rfloor=-2$ 但 \texttt{int}$(-1.5)=-1$——若用截断，原点两侧的负坐标块会被错并到 $g=0$ 行列，导致跨块混叠。}把所有点按 $(g_x,g_y)$ 投到对应网格，每块内再做一次\emph{体素滤波}（降采样、去冗余），最后逐块存盘、并把每块的 $(g_x,g_y)$ 写进 \texttt{map\_index.\allowbreak txt} 索引。
+
+\begin{codebox}[C++]{地图网格切分 + 体素滤波 + 索引导出（对应式 \ref{eq:lidar-map-grid}）}
+int main(int argc, char** argv) {
+  std::map<IdType, KFPtr> keyframes;
+  LoadKeyFrames("./data/ch9/keyframes.txt", keyframes);
+
+  std::map<Vec2i, CloudPtr, less_vec<2>> map_data;   // 以网格 ID 为索引的地图块
+  pcl::VoxelGrid<PointType> voxel_grid_filter;
+  float resolution = FLAGS_voxel_size;
+  voxel_grid_filter.setLeafSize(resolution, resolution, resolution);
+
+  for (auto& kfp : keyframes) {
+    auto kf = kfp.second;
+    kf->LoadScan("./data/ch9/");                      // 从盘读回该帧点云
+    CloudPtr cloud_trans(new PointCloudType);
+    pcl::transformPointCloud(*kf->cloud_, *cloud_trans,
+                             kf->opti_pose_2_.matrix());   // 用第二轮优化位姿变换到世界系
+    CloudPtr kf_voxeled(new PointCloudType);
+    voxel_grid_filter.setInputCloud(cloud_trans);
+    voxel_grid_filter.filter(*kf_voxeled);
+
+    for (const auto& pt : kf_voxeled->points) {       // 每个点投到其 100m 网格
+      int gx = floor((pt.x - 50.0) / 100);            // 注意用 floor 而非 int:减原点后坐标含负值
+      int gy = floor((pt.y - 50.0) / 100);
+      Vec2i key(gx, gy);
+      auto iter = map_data.find(key);
+      if (iter == map_data.end()) {
+        CloudPtr cloud(new PointCloudType);
+        cloud->points.emplace_back(pt);
+        map_data.emplace(key, cloud);                 // 新网格:创建
+      } else {
+        iter->second->points.emplace_back(pt);        // 已有网格:追加
+      }
+    }
+  }
+
+  // 逐块再做一次体素滤波，存盘 + 写索引文件
+  std::ofstream fout("./data/ch9/map_data/map_index.txt");
+  for (auto& dp : map_data) {
+    fout << dp.first[0] << " " << dp.first[1] << std::endl; // 索引:网格行列号
+    VoxelGrid(dp.second, 0.1);
+    pcl::io::savePCDFileBinaryCompressed(
+        "./data/ch9/map_data/" + std::to_string(dp.first[0]) + "_"
+        + std::to_string(dp.first[1]) + ".pcd", *dp.second);
+  }
+  fout.close();
+  return 0;
+}
+\end{codebox}
+
+切分完成后，每块地图单独导出一个 \texttt{.pcd}（文件名即 \texttt{<gx>\_<gy>.\allowbreak pcd}），索引文件 \texttt{map\_index.\allowbreak txt} 以文本记录各块行列号，定位程序据此\emph{快速}定位到该加载哪几块。$100$\,m 只是本章的演示边长，可按场景规模与内存预算调大或调小。
+
+\paragraph{把整条流水线串起来。}
+最后，把前面五步按固定顺序调用，即得一个完整、自动、带回环修正的建图程序\cite{gao2023slamad}：前端 $\to$ 第一轮优化 $\to$ 回环检测 $\to$ 第二轮优化 $\to$ 切分导出。
+
+\begin{codebox}[C++]{建图主程序:五步定序调用（前端→两轮 PGO→回环→导出）}
+int main(int argc, char** argv) {
+  Frontend frontend(FLAGS_config_yaml);
+  if (!frontend.Init()) return -1;
+  frontend.Run();                                  // (1) 前端:LIO + 抽关键帧 + 赋 RTK
+
+  Optimization opti1(FLAGS_config_yaml);
+  if (!opti1.Init(1)) return -1;
+  opti1.Run();                                     // (2) 第一轮 PGO:RTK + LIO + 鲁棒核去异常
+
+  LoopClosure lc(FLAGS_config_yaml);
+  if (!lc.Init()) return -1;
+  lc.Run();                                        // (3) 回环检测:Scan-to-Map + 多分辨率 NDT
+
+  Optimization opti2(FLAGS_config_yaml);
+  if (!opti2.Init(2)) return -1;
+  opti2.Run();                                     // (4) 第二轮 PGO:纳入回环、消重影
+
+  // (5) split_map:100m 网格切分 + 导出（见上一个代码框）
+  return 0;
+}
+\end{codebox}
+
+只需在配置文件里指定一个数据包，就能自动建立一张完整、带回环修正的分块点云地图。这张地图正是 \cref{ch:lidar-loc} 实时高精定位的输入——让车辆 / 机器人在\emph{没有} RTK 的环境（隧道、地库、城市峡谷）里，靠激光与先验地图配准获取厘米级位姿。
+
+% ════════════════════════════════════════════════════════════════
+\section{本章小结}
+\label{sec:lidar-map-summary}
+
+本章演示了一条完整的离线高精地图\emph{生产线}：数据包进、分块地图出。它几乎不引入新数学，价值在\textbf{系统组织}——把前几章造好的零件（LIO、PGO、NDT、RTK/UTM）按“前端→两轮 PGO→回环→导出”的确定性顺序拼成整机，并用离线买来的“可多轮迭代、可全局并发”能力做出在线系统难以企及的质量。
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\label{tab:lidar-map-summary}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 离线建图流程 & 五步流水线；离线 = 确定性换质量（可多轮/可并发） & $\bigstar\bigstar$ \\
+2 & 前端抽关键帧 & 距离/角度阈值；点云存盘卸载；SLERP+线性插 RTK & $\bigstar\bigstar$ \\
+3 & RTK 绝对因子 & 单天线只约束平移；外参 $\mathbf{T}_{BG}$；$3\times6$ 雅可比 & $\bigstar\bigstar\bigstar$ \\
+4 & LIO 相对因子 & $\SE(3)$ 相对位姿约束（同 \texttt{BetweenFactor}） & $\bigstar\bigstar$ \\
+5 & 鲁棒核两阶段 & 带核压坏点→剔外点→去核精修；整体 ICP 对朝向 & $\bigstar\bigstar\bigstar$ \\
+6 & Scan-to-Map 回环 & 邻域子地图配准（比单帧密、鲁棒）；空间近/时间远 & $\bigstar\bigstar\bigstar$ \\
+7 & 多分辨率 NDT & 10/5/4/3 m 由粗至精；粗级大收敛域兜差初值 & $\bigstar\bigstar\bigstar$ \\
+8 & 两轮 PGO & 一轮钉全局/剔 RTK，二轮纳回环/消重影 & $\bigstar\bigstar$ \\
+9 & 100m 网格切分 & 平面坐标取整分块；体素滤波；索引文件 & $\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+章节 & 关系 & 本章用到/产出 \\
+\midrule
+\cref{ch:lidar_slam} 激光 SLAM & 提供 LIO 前端（里程计 + 去畸变） & 前端把它当黑盒里程计调用 \\
+\cref{ch:gins} 组合导航 & 提供 RTK/UTM 世界坐标系 & 后端 RTK 绝对因子、地图原点 \\
+\cref{ch:isam2} 增量平滑 & 位姿图最小二乘、鲁棒核 & 两轮 PGO 的数学骨架 \\
+\cref{ch:pointcloud} 点云处理 & NDT 配准、体素降采样 & 回环 Scan-to-Map、网格切分 \\
+\cref{ch:slam2d} 2D SLAM & 多分辨率金字塔回环思想 & 3D 多分辨率 NDT 同源 \\
+\cref{ch:lidar-loc} 实时定位 & 消费本章产出的分块地图 & 九宫格加载、冷启动定位的地基 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.24\textwidth} p{0.30\textwidth} p{0.36\textwidth}}
+\toprule
+症状 & 可能原因 & 排查步骤 \\
+\midrule
+导出地图处处“重影” & 回环没检出或第二轮没纳入 & 1.确认回环检测有成功候选（看 success/total）；2.放宽距离阈值/缩小 ID 间隔；3.确认 \texttt{opti\_pose\_2\_} 已用于导出（\cref{sec:lidar-map-export}）\\
+轨迹被某处“扯偏” & 坏 RTK 未剔（外点） & 1.确认鲁棒核已挂；2.检查两阶段是否真的剔了外点；3.看该段 RTK 是否本就抖动（NCLT 城市峡谷）（\cref{sec:lidar-map-robust}）\\
+整张地图整体歪一个角度 & 单天线 RTK 无航向、未对齐 & 1.确认优化前做了轨迹整体 ICP 估旋转；2.检查外参 $\mathbf{T}_{BG}$（\cref{sec:lidar-map-factors}）\\
+回环把地图“对折” & 假回环（结构混淆） & 1.提高 NDT 分值阈值；2.回环因子加鲁棒核；3.加几何验证（\cref{sec:lidar-map-loop}）\\
+回环配准总配飞 & 单分辨率/初值太差 & 1.确认用多分辨率 10→3 m；2.确认子地图点够密（邻域范围/步长）；3.去地面减干扰（\cref{sec:lidar-map-loop-compute}）\\
+坐标精度异常、抖动 & UTM 大数未减原点 & 1.确认 \texttt{RemoveMapOrigin}；2.优化与建图全在局部系（\cref{sec:lidar-map-frontend}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{API 速查表}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.30\textwidth} p{0.62\textwidth}}
+\toprule
+功能 & 接口 / 要点（一句话） \\
+\midrule
+LIO 前端 & 复用 \cref{ch:lidar_slam}（IEKF / 松耦合 LIO）；本章只加抽帧逻辑 \\
+位姿插值 & SLERP（旋转）+ 线性（平移），\emph{区间内不外推}（式 \ref{eq:lidar-map-interp}）\\
+RTK 因子 & g2o 一元边 \texttt{EdgeGNSSTransOnly}（单天线只平移 + 外参 $\mathbf{T}_{BG}$）\\
+相对/回环因子 & g2o 二元边 \texttt{EdgeRelativeMotion}（$\SE(3)$ 相对位姿）；或 GTSAM \texttt{BetweenFactor<Pose3>} \\
+位姿图求解 & g2o \texttt{OptimizationAlgorithmLevenberg}；鲁棒核 Huber/Cauchy \\
+NDT 配准 & PCL \texttt{NormalDistributionsTransform}；\texttt{getTransformationProbability} 取分值 \\
+多分辨率 & \texttt{setResolution} 依次 $10\to5\to4\to3$ m，逐级以上一结果为初值 \\
+体素降采样 & PCL \texttt{VoxelGrid::setLeafSize} \\
+地图存盘 & \texttt{savePCDFileBinaryCompressed}；索引文本 \texttt{map\_index.\allowbreak txt} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{研究实践建议}
+\begin{itemize}
+  \item \textbf{初学者}：在一个 NCLT 序列上跑通“前端→两轮 PGO→回环→导出”，用 \texttt{pcl\_viewer} 对比第一轮（有重影）与第二轮（重影消除）的点云，直观感受回环的作用。
+  \item \textbf{进阶}：把前端的 LIO 换成 LOAM 或其变体（\cref{ch:lidar_slam}），比较其与 LIO 前端的轨迹精度与重影程度；或把回环的多分辨率 NDT 换成 ScanContext\cite{kim2018scancontext} 等位置识别方法（\cref{ch:loop}），看后端是否更稳。
+  \item \textbf{有余力}：跨\emph{月份}数据验证——用某月数据建图、另一月数据定位（\cref{ch:lidar-loc}），考察高精地图对季节 / 场景变化的鲁棒性；并尝试把大场景点云压成 2D/2.5D 以进一步降存储。
+\end{itemize}
+
+\section*{习题}
+\begin{enumerate}
+  \item \textbf{（关键帧抽取）} 设车以 $10$\,m/s 匀速直行、激光 $10$\,Hz。取 $\Delta d=1$\,m，平均每隔几帧记一个关键帧？若改在以 $0.5$\,rad/s 原地旋转（不平移），仅靠距离判据会怎样？说明为何还需角度判据（\cref{eq:lidar-map-kf}）。
+  \item \textbf{（RTK 雅可比）} 推导式 \eqref{eq:lidar-map-rtk-jac}：对残差 $\mathbf{e}_{\text{rtk}}=(\mathbf{T}_{WB}\mathbf{T}_{BG})\!\cdot\!\mathbf{t}-\mathbf{z}$ 在 $\mathbf{T}_{WB}$ 上取右扰动 $\mathrm{Exp}(\delta\boldsymbol{\xi})$，逐步给出平移块 $\mathbf{R}_{WB}$ 与旋转块 $-\mathbf{R}_{WB}(\mathbf{t}_{BG})^\wedge$ 的来历（提示：用 $\SE(3)$ 右扰动作用于点的一阶近似）。
+  \item \textbf{（鲁棒核两阶段）} 为什么不能只“带核优化一遍”就完事，而要“带核→剔外点→去核再优化”？给坏点保留核与彻底剔除，对最终精度各有什么影响？在线系统为何往往只能做前者（\cref{sec:lidar-map-robust}）？
+  \item \textbf{（多分辨率 NDT）} 解释为什么单用 $3$\,m 细分辨率 NDT 做回环易配飞，而 $10\!\to\!3$\,m 由粗至精能兜住差初值。从“收敛域 vs 精度”的角度作答，并与 \cref{ch:slam2d} 的金字塔回环对比（\cref{eq:lidar-map-multires}）。
+  \item \textbf{（地图切分）} 式 \eqref{eq:lidar-map-grid} 里为何要先减 $50$ 再除 $100$？若直接 $\lfloor x/100\rfloor$ 会有什么不同？把边长从 $100$\,m 改成 $50$\,m，地图块数量、单块大小、定位时九宫格加载的内存各如何变化？
+  \item \textbf{（系统设计，开放）} 若数据集\emph{没有} RTK（纯 LIO + 回环），本章流水线要怎么改？失去“绝对锚定”后，全局尺度 / 朝向 / 平移的不可观（gauge freedom）如何处理？这与 \cref{ch:slam2d} 讨论的 Gauge Freedom 有何联系？
+\end{enumerate}

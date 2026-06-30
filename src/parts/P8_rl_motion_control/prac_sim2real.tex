@@ -1,0 +1,1057 @@
+\chapter{Sim2Real 部署全链路}\label{ch:rlmc-sim2real}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章 —— 收口章。
+%  主线：算法/方法论领路 —— 先立「Sim2Real 不是缩小一个 gap，而是把多个
+%  误差源约束在策略能承受的联合分布内」这条主线，再把它落到三大框架
+%  (mjlab / Isaac Lab / UniLab) 的导出、验证、部署对比实战。
+%  假定读者已学完强化学习理论部 (P6) 与本部前置章。本章大量「方法学」内容
+%  (DR / SysID / ASAP delta / distillation / RMA / sim2sim / 物理引擎差异 /
+%   ONNX 边界) 在前置章已讲透，本章一律 \cref 过去、不再重教，聚焦
+%  「从仿真策略到真机闭环」这条工程链路本身：导出边界、分级验收、延迟补偿、
+%   安全链路、telemetry 复盘。
+%  源稿 RL运控/Ch23_Sim2Real部署全链路.md (实践偏重) 已按本主线重构：
+%   - 把「14 节平铺」改为「概念领路 + 三框架横向对比实践」；
+%   - 对 ASAP(arXiv:2502.01143,RSS2025)、SPI-Active(arXiv:2505.14266)、
+%     ProtoMotions(NVlabs) baked-in obs、unitree_rl_lab / unitree_rl_mjlab
+%     部署管线、mjlab 1.4.0 / Isaac Lab 2.x ONNX 导出做了联网核对
+%     (见各 \rebuilt / \pz 标注与 claimsToVerify)；
+%   - 修正了源稿把 SPI-Active 与 ASAP 数值混淆等小问题。
+%  UniLab 侧已据本机实装框架的源码与实跑（scripts/deploy/、training/sim2sim.py、
+%   export_policy_to_onnx / as_export_module、deploy_config.yaml、NanGuard）补实：
+%   ONNX 导出时机随算法（PPO 在 eval 阶段）、deploy_config.yaml 承载 obs_layout/joint 顺序、
+%   sim2sim 契约关卡、以及「真机安全/telemetry 不属 UniLab 职责边界」的诚实标注。
+% ════════════════════════════════════════════════════════════════
+
+在仿真里把策略练到 reward 持续上升、回放稳如磐石，然后兴冲冲接上真机——第一步就摔倒、损坏一个膝关节电机。这是 sim-to-real 最经典的开场。问题几乎从来不是「RL 算法不行」，也常常不是「仿真不够逼真」，而是\textbf{部署链路上某一环与训练时的约定不一致}：关节顺序写反了一位、observation 没归一化、延迟没补偿、急停只挂在 GUI 按钮上。本章是本部的收口章——前面所有章节（观测/动作、奖励、物理、域随机化、特权学习、各形态任务）攒下的策略，最终都要经过这条链路才能落到真实机器人上。
+
+本章遵循全书「算法/方法论领路，后工程兑现」的次序，但这里的「算法主线」不是某个 RL 算法，而是一条\textbf{工程方法论}：\emph{Sim-to-Real 不是缩小一个 gap，而是把多个误差源约束在策略能承受的联合分布内，并用一条 D0--D6 分级验收的证据链把真机风险逐级压低}。沿这条主线，本章把「gap 怎么分类、用什么工具（这些工具大多已在前置章讲过）、策略文件包含什么、怎样在真机前交叉验证、延迟怎样分解补偿、安全怎样独立于策略、怎样从每次真机测试中榨出诊断信息」串成一张地图，并在三大框架——mjlab（MuJoCo Warp 后端）、Isaac Lab（PhysX/Newton）、UniLab——上给出导出与部署的对比实践。
+
+\textbf{一条贯穿全章的洞察先放在这里}：训练产出的只是一个函数 $\mathbf a=\pi(\mathbf o)$，而真机需要的是一个\emph{闭环系统}。把策略文件误当成完整系统，是 sim-to-real 最常见、代价最高的错误。
+
+\begin{note}
+本章是「方法学集大成」之处，但绝大多数\emph{方法本身}已在前置章讲透，本章不再重教，只在用到时 交叉引用 过去并聚焦「部署链路」这一新增维度：
+\begin{itemize}
+  \item 域随机化（DR）的鲁棒优化视角、ASAP delta action model、SPI-Active 系统辨识——见 \cref{ch:rlmc-dr}；
+  \item 特权学习 / teacher-student 蒸馏 / RMA 在线适应（adaptive control 的 RL 落地）——见 \cref{ch:rlmc-privileged}；
+  \item 物理引擎差异（MuJoCo 凸软接触 vs PhysX TGS）与 sim2sim 的物理根源——见 \cref{ch:rlmc-physics}；
+  \item ONNX 导出在训练管线中的位置、PPO wrapper 的 \verb|time_outs| 语义——见 \cref{ch:rlmc-training}；
+  \item 奖励 / 终止 / 课程（curriculum）——见 \cref{ch:rlmc-reward}；观测/动作接口与非对称 actor-critic——见 \cref{ch:rlmc-obsact}。
+\end{itemize}
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-s2r-env}
+
+本章不引入新的训练依赖——sim2real 的「训练侧」工具（DR、延迟注入、特权蒸馏）都在前置章的框架里。真正新增的是\textbf{部署侧}的一条工具链：ONNX 推理运行时、机器人 SDK、跨进程通信中间件。下表给出锚定版本与兼容性；\textbf{部署侧 API 与 SDK 版本漂移极快}，照抄旧博客的字段名到新 SDK 上常常直接对不上关节枚举。
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}llLLL@{}}
+\toprule
+组件 & 锚定版本 & 操作系统 & 角色 & 本章用途 \\
+\midrule
+mjlab & 1.4.0（最新） & Linux（训练）/ macOS（评估） & 训练 $+$ 导出 & runner 自动导出 ONNX $+$ metadata \\
+Isaac Lab & 2.x（主线）/ 3.0 Beta & Linux / Windows & 训练 $+$ 导出 & \verb|play.py| 导出 ONNX，Newton 后端 sim2sim \\
+unitree\_rl\_lab & GitHub main & Linux & 部署管线（Isaac Lab 侧） & Train$\to$Export$\to$Sim2Sim$\to$C++$\to$真机 \\
+unitree\_rl\_mjlab & GitHub main & Linux & 部署管线（mjlab 侧） & 与上对称的 mjlab 版管线 \\
+ONNX Runtime & 1.17+ & 跨平台 & 部署推理 & C++/Python 加载 \verb|policy.onnx| \\
+unitree\_sdk2 & 随机器人固件 & Linux & 真机 SDK & 关节读写、DDS 通信 \\
+CycloneDDS & 随 unitree\_sdk2 & Linux & 通信中间件 & 同一 C++ 控制器透明连仿真/真机 \\
+UniLab & GitHub main & Linux（CPU 仿真）/ macOS（评估） & 训练 $+$ 导出 $+$ sim2sim & \verb|eval| 阶段导 \verb|policy.onnx|；\Verb[breaklines]|scripts/deploy/| 工具链 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paragraph{分操作系统的部署要点。}与 \cref{ch:rlmc-physics} 一致：\textbf{Linux} 是唯一的一等部署平台——unitree\_sdk2、CycloneDDS、实时线程都依赖 Linux；\textbf{macOS} 仅能跑 CPU 评估与 ONNX 导出验证（无真机 SDK）；\textbf{Windows} 可训练（Isaac Lab）但不建议作部署机。真机控制循环对实时性敏感，部署机推荐配 \verb|PREEMPT_RT| 内核或至少把控制线程绑核并提高调度优先级（\cref{sec:rlmc-s2r-latency} 会讲为什么 jitter 比平均延迟更危险）。
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：五分钟读懂一个 ONNX 策略文件}
+\addcontentsline{toc}{section}{Quick Start：五分钟读懂 ONNX}
+\label{sec:rlmc-s2r-quickstart}
+
+最小可跑目标：用一次\textbf{两迭代}的短训练触发 ONNX 导出，然后\textbf{读出它的边界}——它包含什么 metadata、输入输出维度多大。这是 D0 静态核对（\cref{sec:rlmc-s2r-grading}）的内核，也是「部署前必做」的第一步。下面 mjlab/Isaac Lab 两段可直接复制；UniLab 的边界读取走另一条路——元信息不嵌 ONNX，而在独立的 \Verb[breaklines]|deploy_config.yaml| 里，见其后专属代码框。
+
+\begin{codebox}[bash]{mjlab:短训练触发 ONNX 导出（1.4.0）}
+# 两迭代 + 每迭代存档，就能在日志目录里拿到 model_*.pt 与对应 .onnx
+uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+  --env.scene.num-envs 64 \
+  --agent.max-iterations 2 \
+  --agent.save-interval 1 \
+  --agent.logger tensorboard
+# 通过标准:logs/ 下出现 model_1.pt 和同目录的 .onnx 文件
+\end{codebox}
+
+\begin{codebox}[Python]{三框架通用:读 ONNX metadata，确认边界}
+from pathlib import Path
+import onnx
+paths = sorted(Path("logs").glob("**/*.onnx"))
+assert paths, "没有 ONNX —— 训练日志里多半有 [WARN] ONNX export failed"
+model = onnx.load(paths[-1])
+meta = {p.key: p.value for p in model.metadata_props}
+print("metadata keys:", list(meta.keys()))   # 期望含 joint_names / action_scale / ...
+g = model.graph
+obs_dim = g.input[0].type.tensor_type.shape.dim[1].dim_value
+act_dim = g.output[0].type.tensor_type.shape.dim[1].dim_value
+print(f"obs_dim={obs_dim}  act_dim={act_dim}")   # 任一为 0 = 动态维度没固化，部署端会踩坑
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab:eval 阶段导出 policy.onnx（GitHub main）}
+# 关键差异:UniLab 的 PPO 不在「训练后」自动导 ONNX，而在 play/eval 阶段导出.
+# 故 train 时若 training.no_play=true 就不会产 ONNX —— 必须显式跑 eval.
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+  algo.num_envs=64 algo.max_iterations=2          # 两迭代触发存档 model_*.pt
+uv run eval --algo ppo --task go2_joystick_flat --sim mujoco --load-run -1
+# 通过标准:eval 的 log 目录里出现 policy.onnx（runner.export_policy_to_onnx 产出，
+#   且同时打印 "ONNX export verified OK" —— 见下一框的 onnxruntime 自验）.
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:读 deploy\_config.yaml 确认边界（对照 mjlab 的 metadata\_props）}
+import yaml
+# UniLab 的部署元信息不放在 ONNX metadata_props，而由 scripts/deploy/export_deploy_config.py
+# 单独导成 deploy_config.yaml（这是它比 mjlab 更完整的一处工具链）.
+cfg = yaml.safe_load(open("logs/.../deploy_config.yaml"))
+print("obs_layout:", cfg["obs_layout"])          # 逐段 obs 装配表，部署端 sim_prototype.py 据此拼 obs
+print("obs_dim:", cfg["obs_dim"], "action_scale:", cfg["action_scale"])
+print("default_angles:", cfg["default_angles"])  # 来自 keyframe home 的 qpos 尾段，= 真机 default pose
+# joint ordering 在 UniLab 侧由 deploy_config.yaml 显式记录（非 ONNX 内嵌）—— 这就是要和 SDK 逐一比对的表.
+\end{codebox}
+
+\noindent{}读出 metadata 后，请立刻\textbf{把 \texttt{joint\_names} 和真机 SDK 的关节名逐一比对}——这一步 90\% 的人会跳过，然后在真机上花两天排查「动作发给了错误的关节」。\cref{ins:rlmc-s2r-system} 会解释为什么这是最高频、最隐蔽的部署 bug。
+
+\paragraph{从零跑通一遍：命令序列 $+$ 预期输出 $+$ 一次真实排错。}下面这串命令在 RTX 4080S 上实测可跑通，照着敲一遍就把「短训练 $\to$ 找 ONNX $\to$ 读边界 $\to$ D0 推理」整条 D0 链路走通了。\textbf{重点不是结果对，而是教你怎么自己确认每一步「成没成」、出错时怎么读报错}：
+
+\begin{codebox}[bash]{mjlab:D0 全链路实跑命令序列（1.4.0，每条都附预期输出）}
+# (1) 两迭代短训练触发导出（64 env，~1300 steps/s;不要 --agent.logger wandb 否则要登录）
+WANDB_MODE=disabled uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+  --env.scene.num-envs 64 --agent.max-iterations 2 --agent.save-interval 1
+#   预期:终端滚动 "Mean reward / Mean value loss / Steps per second ~1300"，2 迭代后退出.
+
+# (2) 找产物:mjlab 每次存档自动导【单个】.onnx（不是每 ckpt 一个），与 model_*.pt 同目录
+find logs -name '*.onnx' -o -name 'model_*.pt' | sort
+#   预期:logs/<时间戳>/ 下有 model_0.pt model_1.pt 和一个 <时间戳>.onnx.
+#   若【没有】.onnx:训练日志里几乎一定有一行 "[WARN] ONNX export failed (training continues)"——
+#   去 grep 它看真实原因（trace 到带数据依赖分支等），而不是猜.
+
+# (3) 一行 dump ONNX 真实边界（不知道字段名时，这就是「自己查」的办法）
+uv run python -c "import onnx,sys; m=onnx.load(sys.argv[1]); \
+print('keys:',[p.key for p in m.metadata_props]); \
+print('in :',m.graph.input[0].name, [d.dim_value for d in m.graph.input[0].type.tensor_type.shape.dim]); \
+print('out:',m.graph.output[0].name,[d.dim_value for d in m.graph.output[0].type.tensor_type.shape.dim])" \
+  $(find logs -name '*.onnx' | head -1)
+#   预期(G1-velocity 实测):keys 为上述 7 个;in: obs [1, 99];out: actions [1, 29].
+#   注意 in 的【第 0 维=1】——batch 被写死，这正是下面要踩的坑.
+\end{codebox}
+
+\noindent{}\textbf{一次真实排错（照抄会踩、教你怎么爬出来）}：很多人拿到 ONNX 后第一反应是「批量喂一把 obs 快速看输出」，于是写 \Verb[breaklines]|sess.run(None,{"obs": np.zeros((64,99),np.float32)})|——结果\emph{不是} NaN、\emph{不是}维度对不上，而是抛：
+
+\begin{codebox}[text]{这条报错长这样（别慌，它在告诉你 batch 维被固化了）}
+onnxruntime.capi.onnxruntime_pybind11_state.InvalidArgument:
+  [ONNXRuntimeError] : 2 : INVALID_ARGUMENT :
+  Got invalid dimensions for input: obs for the following indices
+  index: 0 Got: 64 Expected: 1
+\end{codebox}
+
+\noindent{}\textbf{怎么读、怎么修}：报错点名 \Verb[breaklines]|index: 0 Got: 64 Expected: 1|——是\emph{第 0 维（batch）}不匹配，不是 obs\_dim(99) 的问题。根因：mjlab 1.4.0 用 legacy trace 导出，trace 时输入是单样本，batch 维就被「烤死」成 1（上一步 dump 已显示 \Verb[breaklines]|in: obs [1, 99]|，只是你当时没在意）。两条修法：(a) 部署/sim2sim 时\textbf{逐 env 单步推理}（每次喂 \verb|[1,99]|，见 \cref{sec:rlmc-s2r-sim2sim} 的 sim2sim 核心循环）；(b) 真要批量评估，导出时给 \Verb[breaklines]|torch.onnx.export(..., dynamic_axes={"obs":{0:"B"}, "actions":{0:"B"}})| 放开 batch 维再重导。\textbf{这就是工程：报错不是终点，把它读懂就直接定位到「导出时 batch 维固化」这个边界。}与之对偶的另一种坑是 obs\_dim 被导成动态 0（\cref{sec:rlmc-s2r-quickstart} 的 \verb|obs_dim==0| 提示）——两者一个把 batch 写死、一个把 obs 维放空，都要在部署前用上面的 dump 命令一眼看出。
+
+\begin{practice}[前置自测：答不出 $\ge 2$ 题，建议先回本部前置章或强化学习理论部]
+\begin{enumerate}
+  \item Domain randomization 解决 sim-to-real 的哪个层面的 gap？它\emph{不能}解决哪类 gap？（回看 \cref{ch:rlmc-dr} 的鲁棒优化视角）
+  \item 50\,Hz 控制频率下一帧周期是多少 ms？端到端延迟 30\,ms 对一个 1\,m/s 行走的步态相位意味着什么？（本章 \cref{sec:rlmc-s2r-latency}）
+  \item ONNX 文件包含策略网络的计算图，但\emph{不}包含哪三类东西？为什么状态估计器和安全限幅不在里面？（本章 \cref{sec:rlmc-s2r-onnx}）
+  \item SysID 与 DR 分别从哪个方向缩小 sim-to-real gap？为什么二者是互补而非替代？（回看 \cref{ch:rlmc-dr}）
+  \item 「特权观测只进 critic、不进 actor」这条原则，和「部署时 student 的输入必须全部来自真机可得传感器」是不是同一件事？（回看 \cref{ch:rlmc-privileged}）
+\end{enumerate}
+\end{practice}
+
+\paragraph{本章目标。}学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{分类}任一 sim-to-real 失败现象——按动力学/接触/执行器/传感器/时序/软件接口/安全七层定位 gap 来源；
+  \item \textbf{选择}正确的修复工具——能说清 SysID / DR / ASAP / Fine-tuning / Adaptive 各解决七层中的哪一层（这些方法的原理在前置章）；
+  \item \textbf{定位} ONNX 导出的边界——能读出 metadata、说清部署端必须自己补齐的每一环；
+  \item \textbf{配置}双引擎 sim2sim 交叉验证——能在 mjlab/Isaac Lab 间互导 ONNX 并按存活时间判通过；
+  \item \textbf{实现}延迟的四段分解与训练侧预补偿——能把真机测得的 p95 延迟映射成训练注入参数；
+  \item \textbf{设计}独立于策略的安全链路——能区分硬安全（L0--L2）与软安全（L3--L5），并主动触发每个分支测试；
+  \item \textbf{执行} D0--D6 分级验收——能为一个具体机器人写出每级的通过标准与回退规则；
+  \item \textbf{复盘}真机 telemetry——能从一次失败日志定位到七层 gap 中的具体层。
+\end{enumerate}
+
+\paragraph{知识导航与阅读时间。}本章结构如下树。建议精读 4--5 小时（含跑通 D0 脚本与 sim2sim 验证）；有 sim-to-real 经验者速读 2--3 小时（重点看 \cref{sec:rlmc-s2r-onnx} 导出边界与 \cref{sec:rlmc-s2r-grading} 分级验收）；真机出事时速查 30 分钟（直接跳故障排查手册与 \cref{ins:rlmc-s2r-fivemin} 五分钟法则）。
+
+\begin{center}
+\begin{forest} navtreeLR
+[Sim2Real 部署全链路
+  [七层 Gap 分类\\(诊断框架),name=theory]
+  [{五种修复工具\\(选型，原理见前章)}]
+  [ONNX 导出边界\\(策略文件含什么)]
+  [Sim2Sim 交叉验证\\(双引擎)]
+  [延迟四段分解\\(最隐蔽的 gap)]
+  [安全链路\\(独立于策略)]
+  [D0--D6 分级验收\\(证据链)]
+  [Telemetry 复盘\\(每次测试有诊断)]
+]
+\end{forest}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{Sim2Real Gap 的系统性分类：诊断框架}
+\label{sec:rlmc-s2r-taxonomy}
+
+\paragraph{模块功能与在管线中的位置。}本节不写代码，立的是整章的\emph{诊断主线}。Sim-to-real 的第一性问题是：真机失败时，到底该去调摩擦、修延迟、还是查关节映射？如果把所有问题都笼统叫「sim2real gap」，工程上会瘫痪——既无法定位，也无法选工具。本节给出一套七层穷举分类，它是后续每一节的索引：每种 gap 对应一个修复工具（\cref{sec:rlmc-s2r-methods}）、一个验证手段、一个排查入口。
+
+\subsection{为什么必须先分类}
+\label{sec:rlmc-s2r-why-taxonomy}
+
+每一次 sim-to-real 失败都有具体的物理来源：可能是连杆质量不对（动力学），可能是地面摩擦不对（接触），可能是电机慢了 5\,ms（执行器），可能是 IMU 漂移（传感器），可能是控制频率不稳（时序），可能是关节顺序写反（软件接口），也可能是根本没有急停（安全）。不分类的代价是双重的：\textbf{无法定位}（失败时不知道该查哪一层），\textbf{无法选工具}（SysID 治「参数不准」、DR 治「参数不确定」、Fine-tuning 治「模型结构不对」——用 DR 去治关节顺序写反，如同用抗生素治骨折）。
+
+\begin{insight}[Sim2Real 不是缩小一个 gap，而是约束一个联合分布]\label{ins:rlmc-s2r-joint}
+本章的元洞察：sim-to-real \emph{不是}把某一个 gap 调到零。即使你把摩擦辨识得分毫不差，部署仍可能因为延迟失败；即使你把延迟补偿得完美，部署仍可能因为相机外参失败；即使 ONNX 导出毫无问题，部署仍可能因为 joint order 或 action scale 失败。真正的目标是\textbf{把所有误差源同时约束在策略能承受的联合分布内}。这条洞察直接推翻了「找最大的 gap 先修」的直觉——七层之间会\emph{耦合}：执行器延迟（时序）会放大摩擦误差（接触）的后果，因为控制器对打滑的响应晚了 20\,ms，即使摩擦模型完全准确，机器人也可能因响应不及时而滑倒。
+\end{insight}
+
+这条「联合分布」视角和 \cref{ch:rlmc-dr} 的 DR 鲁棒优化是同一枚硬币的两面：DR 在\emph{训练侧}把策略撑成对一族参数都鲁棒，本章在\emph{部署侧}逐层确认真机的真实参数确实落在那一族里。一个跨领域类比能帮你记住这套分类法的精神：它就是医学的\textbf{鉴别诊断}——病人说「头疼」，好医生不会直接开止痛药，而是先按系统排查（神经？血管？感染？外伤？），每种病因对应不同治法。真机失败这个「头疼」，也必须先分类诊断再对症下药。
+
+\subsection{七层 Gap 分类体系}
+\label{sec:rlmc-s2r-seven-layers}
+
+下表是整章的总索引。最后一列「典型工具」指向 \cref{sec:rlmc-s2r-methods}，「框架入口」给出三框架里改动这层 gap 的代码位置。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{3.0cm}p{3.4cm}p{2.6cm}@{}}
+\toprule
+Gap 层 & 具体内容 & 框架入口（训练侧 / 部署侧） & 典型工具 \\
+\midrule
+动力学 & 质量、惯量、质心、关节阻尼 & DR events / SysID 参数 ; 称重、日志拟合 & SysID $+$ DR \\
+接触 & 足底摩擦、碰撞形状、软接触 & geom friction / contact cfg ; 地面测试 & SysID $+$ DR \\
+执行器 & PD gain、力矩限制、死区、饱和、延迟 & actuator cfg / action scale ; SDK 控制模式 & SysID \\
+传感器 & IMU bias、encoder noise、depth noise & noise cfg / camera DR ; 标定、滤波、同步 & DR $+$ 标定 \\
+时序 & 控制周期、通信延迟、图像延迟 & decimation / delay 注入 ; timestamp、实时线程 & 延迟注入 $+$ 测量 \\
+软件接口 & joint order、单位、坐标系 & ONNX metadata ; adapter $+$ schema test & 单元测试 \\
+安全 & 限幅、急停、跌倒检测 & termination/reward 只训练倾向 ; 硬件 watchdog & 外部安全系统 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这七层里，\textbf{下面三层（时序、软件接口、安全）是 RL 训练管不到的}——它们不是参数不确定性问题，而是确定性的工程问题（或硬件问题），只能靠代码修正和硬件配置解决。把它们交给 RL 去「适应」，就像让学生通过多做习题来适应考卷印错了一样荒谬。
+
+\begin{pitfall}[按 gap 大小排序解决，而非按修复成本排序]
+\textbf{错误描述}：初学者倾向先修「最大的 gap」——若摩擦 gap 导致最多失败，就先花两周做摩擦辨识。\textbf{现象后果}：辨识做完真机仍失败，因为真正的祸根是关节顺序错位（软件接口层），而这层 gap 用任何参数辨识都修不了。\textbf{根本原因}：gap 的「大小」和「修复成本/确定性」是两个正交维度——软件接口 gap 修复成本极低（几分钟），但不修则其他所有优化都白费。\textbf{正确做法}：按\emph{确定性}从高到低排查：软件接口 $\to$ 时序 $\to$ 执行器 $\to$ 传感器 $\to$ 接触 $\to$ 动力学 $\to$ 安全。先把确定性的工程错误清零，再处理不确定性的物理 gap。
+\end{pitfall}
+
+\begin{insight}[一个真实复盘：两周 DR 抵不过一行映射表]\label{ins:rlmc-s2r-system}
+一个四足策略在仿真中稳定行走，真机上走三步就摔。团队花两周把摩擦 DR 从 $[0.5,1.5]$ 扩到 $[0.1,2.0]$、重训五轮（每轮数小时 GPU），真机毫无改善。最终发现：左前腿膝关节的动作被发到了左前腿髋关节——关节顺序映射错了一位。这个 bug 在 reward 曲线上\emph{完全看不出来}，因为训练发生在仿真里，那里关节顺序是对的。若一开始就按七层从「软件接口」查起，用单关节小幅正弦波驱动每个关节目视确认（五分钟），当场就能发现。\textbf{这就是为什么本章把「读 ONNX metadata 的 joint\_names 并与 SDK 逐一比对」放在 Quick Start 的第一步。}
+\end{insight}
+
+还有一个反直觉的事实值得单独点明：\textbf{「仿真越逼真，sim2real gap 越小」并不总成立}。过于逼真的仿真会诱使策略\emph{过拟合}仿真器的特定数值行为（某个接触求解器的边界情况、某种碰撞检测的数值特性）；当真机物理与仿真器数值行为不同时（即便「更真实」），策略反而失效。适度的 domain randomization 往往比极度逼真更利于迁移——因为它逼策略学到对参数鲁棒的行为，而非利用特定参数下的「捷径」。这正是 \cref{ch:rlmc-dr} 那条「DR 优化期望而非逼真化」洞察在部署侧的回响。
+
+\begin{practice}[七层分类动手]
+\begin{enumerate}
+  \item \textbf{[分类]} 一个机械臂策略在仿真中能抓方块，真机总抓偏 2\,cm 向左。列出至少三个可能的 gap 层及对应排查步骤。
+  \item \textbf{[设计]} 为 Unitree Go2 写一份按七层分类的 sim2real 排查清单，每层 2--3 个具体检查项。验收标准：每个检查项都能在 10 分钟内给出「通过/不通过」的客观判据。
+  \item \textbf{[思考]} 为什么安全 gap（如「急停按钮不工作」）不能靠 DR 解决？用一个具体例子说明它是确定性工程缺陷而非参数不确定性。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{五种修复工具：选型而非重教}
+\label{sec:rlmc-s2r-methods}
+
+\paragraph{模块功能与在管线中的位置。}\cref{sec:rlmc-s2r-taxonomy} 给了「病在哪一层」，本节给「用哪味药」。这里要强调：\textbf{五种工具的原理在前置章已讲透，本节只做选型对照}——SysID / DR / ASAP 的数学与实现见 \cref{ch:rlmc-dr}，Adaptive control（RMA）的 latent 估计器与 teacher-student 蒸馏见 \cref{ch:rlmc-privileged}。本节的增量是：把它们摆在同一张决策表里，说清\emph{什么 gap 该用什么工具、为什么不能互相替代}。
+
+\subsection{\texorpdfstring{四味「学习」药 $+$ 一味「非学习」药}{四味学习药加一味非学习药}}
+\label{sec:rlmc-s2r-five-tools}
+
+把五种工具按「修正对象」一字排开，它们的分工立刻清晰：
+
+\begin{itemize}
+  \item \textbf{System Identification（SysID）}：测量真实物理参数（质量、摩擦、PD gain、延迟），把仿真器均值\emph{对齐}到真实值。核心假设是「模型结构对、只是参数不准」。它直接消除仿真均值偏差，从而让 DR 能用更窄范围覆盖残余不确定性。原理与实操（扫频辨识、CMA-ES 拟合、交叉验证、SPI-Active 主动探索）见 \cref{ch:rlmc-dr}。
+  \item \textbf{Domain Randomization（DR）}：在参数分布上训练，让策略对参数\emph{不敏感}。核心假设是「真实参数是训练分布里的一个点」。它优化的是分布上的\emph{期望}回报（\cref{ch:rlmc-dr} 的鲁棒优化视角），与 SysID 互补而非替代。
+  \item \textbf{Fine-tuning}：当模型\emph{结构}本身有系统偏差（刚体接触模型抓不住真实软接触、简化摩擦模型表达不了各向异性）时，无论怎么调参或扩 DR 都消不掉这种结构 gap。Fine-tuning 用少量真机数据修正策略中与结构偏差相关的部分，是流程的\emph{最后一步}。
+  \item \textbf{Adaptive Control}：上面三者都是\emph{离线}的（部署时参数固定）。但真实环境会变（地面瓷砖变地毯、抓了重物、电机升温、电池掉压）。Adaptive control 在运行时\emph{在线}估计环境参数并调整行为——在 RL 里通常通过一个低维 latent $\mathbf z$ 实现（estimator 从最近的 obs-action 历史推断），这正是 \cref{ch:rlmc-privileged} 的 RMA。
+  \item \textbf{Classical Safety（非学习）}：限幅、急停、监控。它\emph{不解决} gap，但保证 gap 导致策略失效时机器人不损坏、人不受伤。见 \cref{sec:rlmc-s2r-safety}。
+\end{itemize}
+
+\begin{insight}[SysID 与 DR：射击的「归零」与「散布」]\label{ins:rlmc-s2r-zero-spread}
+SysID 和 DR 的关系，就像射击中的归零与散布训练。\textbf{归零（SysID）}让弹着点中心对准靶心——消除系统性偏差。\textbf{散布训练（DR）}让射手在不同风速、距离下都能命中——增加鲁棒性。只归零不练散布，换个风就脱靶（策略对温度/磨损/负载的微小变化毫无抵抗力）；只练散布不归零，平均弹着点偏了一个靶宽，再鲁棒也够不着靶心（要用很宽的 DR 范围去覆盖「均值偏差 $+$ 不确定性」，训练更难、单点性能更差）。这就是为什么顶级 sim-to-real 工作（ETH 四足、MIT Cheetah）总是 SysID $+$ DR 并用：SysID 缩小搜索空间，DR 覆盖残余不确定性。
+\end{insight}
+
+源稿这部分还介绍了 \textbf{ASAP}（He et al., RSS 2025, arXiv:2502.01143）作为「第五味学习药」——它学一个\emph{残差动作模型} $\boldsymbol\delta(\mathbf s,\mathbf a)$ 来弥合 sim-to-real gap，处理 SysID 和 DR 都覆盖不了的结构性偏差。ASAP 的两阶段流程（仿真预训练 $\to$ 真机采数据训 $\boldsymbol\delta$ 网络 $\to$ 在注入 $\boldsymbol\delta$ 的仿真里闭环微调）、它是 open-loop RL 而非监督 MSE 的勘误、以及「最终实机只部署 fine-tuned 策略、\emph{不}携带 $\boldsymbol\delta$ 网络」这一关键边界，都在 \cref{ch:rlmc-dr} 详述，此处不再展开。源稿曾给「相对纯 DR 改善 30--50\%」，但这个区间在论文里查无对应：ASAP 论文真机闭环表（Unitree G1）报告的是 \emph{global position error} 约降 $18\%$（Kick）到 $30\%$（分布外的 LeBron Silencer 动作）、per-joint error 降 $8\%$--$14\%$，并未达到 $50\%$，故本书按论文 Table V 校正为\textbf{约 $18\%$--$30\%$}：global position error 在 Kick 上 $61.2\!\to\!50.2$\,mm（$18\%$）、在分布外的 LeBron Silencer 上 $159\!\to\!112$\,mm（$30\%$），per-joint error 同步降 $8\%$--$14\%$（具体数值随动作而异，已核对 arXiv:2502.01143 Table V）。注意\textbf{别把它与相邻的 SPI-Active 混淆}——后者（arXiv:2505.14266，CoRL 2025）报告的是「在 Unitree Go2/G1 多种 locomotion 任务上较 baseline 提升 $42\%$--$63\%$」，是另一套指标与另一篇工作。
+
+\subsection{Distillation 在部署中的双重角色}
+\label{sec:rlmc-s2r-distill}
+
+\cref{ch:rlmc-privileged} 把 teacher-student 蒸馏当成\emph{训练技术}讲（teacher 用特权信息、student 用部署可得输入）。在 sim-to-real 语境下，它还有第二重身份——\textbf{deployment gap 的管理工具}。Teacher 用的精确物体位姿、ground-truth 接触状态、segmentation mask，在真机上\emph{根本不存在}；蒸馏把这些特权信息\emph{编码进 student 的网络权重}，使 student 能从可部署输入（RGB/depth、proprioception、IMU）重建足够信息完成任务。
+
+从七层分类看，distillation 主要解决\textbf{传感器层中的「不可获得性」}——不是噪声或延迟，而是「某些量在真机上压根不存在」。这是 SysID 和 DR 都治不了的一类 gap：你没法通过辨识或随机化让真机「长出」ground-truth segmentation。
+
+\begin{finenote}
+传感器层里另有一类\emph{能}用 DR 覆盖、却最常被漏掉的 gap——\textbf{编码器零位偏置}。真实关节编码器在装配时有常值零位误差，每台机器人都不同；若训练时只随机化了编码器\emph{噪声}（每步抖动）而没随机化\emph{偏置}（整段 episode 的常值偏移），策略对「关节角系统性偏了 1 度」毫无抵抗力。mjlab 1.4.0 用一个 \Verb[breaklines]|mode="startup"| 的 event（\texttt{dr.\allowbreak encoder\_bias}，\Verb[breaklines]|bias_range=(-0.015,0.015)| rad，在\emph{建环境时}给每个并行机器人采一个常值零位偏置、整个训练期固定不变，正对应「每台真机装配偏差不同但自身恒定」）覆盖这层；Isaac Lab 在观测 noise / event 配置里同样可加常值 bias 项。这类「传感器 DR」在很多 sim2real 教程里几乎不提，却是站立漂移、足端定位偏差的隐形来源——把它归到\cref{sec:rlmc-s2r-seven-layers} 七层表的「传感器」行，用 DR 治，而非到真机上当 SysID 难题排查。
+\end{finenote}
+
+\begin{pitfall}[student 输入里混入了特权信息的统计量]
+\textbf{错误描述}：student 训练完直接部署，没逐维检查 observation schema。\textbf{现象后果}：真机行为不可预测、与仿真大相径庭。\textbf{根本原因}：student 的输入里间接混入了特权信息——典型如 observation normalization 的 running mean/std 是在含特权信息的统计上算的，等于把特权信息的统计量\emph{偷渡}进了部署输入。\textbf{正确做法}：student 训完后逐一检查 obs schema 的每个维度，确认每个维度在真机上都有明确来源（哪个传感器、什么单位、什么采样率）；normalizer 必须只在 student 可得输入上估计。
+\end{pitfall}
+
+\subsection{决策表：什么条件用什么工具}
+\label{sec:rlmc-s2r-decision}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{4.6cm}p{2.6cm}p{4.4cm}@{}}
+\toprule
+条件 & 推荐工具 & 理由 \\
+\midrule
+参数可测、不随时间变 & SysID & 直接消偏差，最高效 \\
+参数不可测或有不确定性 & DR & 覆盖不确定性范围 \\
+模型\emph{结构}有系统偏差 & Fine-tuning / ASAP & 调参无法消除结构差异 \\
+参数在部署中会变化 & Adaptive（RMA） & 离线方法应对不了在线变化 \\
+某些量真机上不存在 & Distillation & 把特权信息编码进权重 \\
+gap 失效时保命 & Classical Safety & 不解决 gap，但保护硬件/人 \\
+日常部署 & SysID $+$ DR $+$ Adaptive & 组合使用，各解决一部分 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[把 Fine-tuning 当成 SysID 和 DR 的替代品]
+\textbf{错误描述}：跳过 SysID/DR，直接拿仿真初始策略上真机做 fine-tuning。\textbf{现象后果}：真机采样几乎全是失败轨迹，有效梯度极少、收敛极慢，更糟的是不安全动作可能损坏机器人。\textbf{根本原因}：fine-tuning 的前提是初始策略「接近可用」才能高效采样；初始太差则采样无信息。\textbf{正确做法}：固定流程 SysID（消均值偏差）$\to$ DR（覆盖不确定性）$\to$ 仿真验证 $\to$ 分级真机测试 $\to$ Fine-tuning（修残余）。Fine-tuning 是打磨工具，不是万能工具。真机 fine-tuning 还须加额外安全约束（action 变化率限制、姿态保护阈值、力矩上限），它们会降低探索效率，但这是保护硬件和人员的前提。
+\end{pitfall}
+
+\begin{practice}[工具选型]
+\begin{enumerate}
+  \item \textbf{[分析]} 一个四足在瓷砖上完美、地毯上摔倒。按五种工具分别给方案并分析优劣。哪种是「最小代价的正确解」？
+  \item \textbf{[设计]} 部署一个手臂抓取策略，真实 gripper 闭合力比仿真大 30\%，每次把物体捏碎。SysID / DR / Fine-tuning 哪种最合适？为什么？验收标准：给出能在半天内验证你的选择是否正确的实验。
+  \item \textbf{[跨章综合]} 回看 \cref{ch:rlmc-dr} 的视觉 DR 与物理 DR。两者在 sim-to-real 里分别覆盖七层中的哪些层？画出覆盖范围。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{ONNX 导出：策略文件的精确边界}
+\label{sec:rlmc-s2r-onnx}
+
+\paragraph{模块功能与在管线中的位置。}\cref{ch:rlmc-training} 讲过 ONNX 导出\emph{在训练管线里的位置}（runner 在存档时触发）。本节聚焦一个部署专属问题：\textbf{这个文件的边界到底在哪里？部署端必须自己补齐什么？}大多数部署事故不是策略本身的问题，而是\emph{部署端对 ONNX 的使用方式与训练不一致}。理解边界，就是理解「训练产出一个函数 $\mathbf a=\pi(\mathbf o)$，部署需要一个闭环系统」这条洞察的具体含义。
+
+\subsection{ONNX 包含什么、不包含什么}
+\label{sec:rlmc-s2r-onnx-boundary}
+
+\textbf{ONNX \emph{包含}}：策略网络（actor）从 observation 张量到 action 张量的完整计算图；若策略含 CNN encoder，其权重也在内；还可以包含 metadata——\verb|joint_names|、\Verb[breaklines]|observation_names|、\verb|action_scale|、\Verb[breaklines]|default_joint_pos| 等，帮部署端正确映射输入输出。
+
+\textbf{ONNX \emph{不}包含}（这一行是本节的命门）：状态估计器（把 IMU 读数变成 base velocity 的算法）、observation normalizer 的 running mean/std（若训练时开了归一化）、安全限幅逻辑、PD 控制器参数、通信协议、相机采集线程、机器人 SDK adapter。
+
+\begin{insight}[ONNX 是发动机，不是汽车]\label{ins:rlmc-s2r-engine}
+ONNX 是\emph{发动机}——能把燃油（observation）变成动力（action）。但发动机不是汽车。你还需要传动系统（action scale 与关节映射）、刹车系统（安全限幅与急停）、油箱油泵（传感器采集与预处理）、方向盘仪表盘（状态估计与人机接口）。把发动机装上底盘之前，必须确认其他系统都已就位。这个类比直接破掉「训练好了就能部署」的错觉——真实闭环是：\textbf{传感器采集 $\to$ 预处理 $\to$ 状态估计 $\to$ observation 拼接 $\to$ ONNX 推理 $\to$ action 后处理 $\to$ 安全过滤 $\to$ SDK 发送 $\to$ 执行器响应 $\to$ 物理世界变化 $\to$（回到采集）}。ONNX 只覆盖正中间「推理」这一步，其余每一步都要部署端自己实现并验证。
+\end{insight}
+
+\begin{pitfall}[observation normalizer 没和 ONNX 一起部署]
+\textbf{错误描述}：训练时开了 observation normalization（running mean/std），但部署端没加载同样的 mean/std。\textbf{现象后果}：策略看到的输入尺度差几个数量级，输出动作接近饱和或接近零——常见表现是「第一步就最大力矩」。\textbf{根本原因}：归一化后策略期望输入均值约 0、标准差约 1；不归一化则输入量级完全错。一个真实复盘：团队训了三天的优秀人形策略，上真机 G1 第一步就摔、损坏膝关节电机（维修 ¥3000 $+$ 等件 2 周），事后发现就是导出时 normalizer 的 mean/std 没进文件、部署端 obs 未归一化。\textbf{正确做法}：先搞清本框架的归一化\emph{架构}——是\textbf{烤进计算图}（mjlab 1.4.0、UniLab \Verb[breaklines]|empirical_normalization=true| 即此，部署端无需另读 mean/std，ONNX metadata 里\emph{本就没有} \verb|obs_mean|），还是\textbf{外挂}一份 mean/std（此时该 state 必须和 ONNX 一起导出、一起部署）。D0 检查（\cref{sec:rlmc-s2r-grading}）的正确姿势不是断言 \verb|obs_mean| 一定在 metadata，而是先 \verb|print| 全部 key 判断走哪条路、再核「两端归一化是否一致」——本事故的根因正是\emph{外挂}架构下漏带了 mean/std。
+\end{pitfall}
+
+\subsection{三框架导出对比}
+\label{sec:rlmc-s2r-onnx-frameworks}
+
+三框架都用 \Verb[breaklines]|torch.onnx.export|（mjlab 1.4.0 实测 \Verb[breaklines]|opset_version=18|、\verb|dynamo=False| 的 legacy trace 路径）但触发时机、normalizer 处理、关节顺序来源各不相同。下表是部署前必查的对照（mjlab 训练时每次存档自动导出单个 \verb|.onnx|，权重内联、不产 \verb|.data| 旁文件；Isaac Lab 侧 \texttt{policy.\allowbreak onnx.\allowbreak data} 同样不是常规产物——\texttt{isaaclab\_rl.\allowbreak rsl\_rl.\allowbreak exporter} 的 \Verb[breaklines]|torch.onnx.export| 用 \Verb[breaklines]|export_params=True| 且不传 \Verb[breaklines]|save_as_external_data|，权重内联进单个 \texttt{policy.onnx}，仅当模型超过 protobuf 2\,GB 上限、自动走 ONNX external-data 时才另产 \texttt{.data}）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{3.2cm}p{3.4cm}p{2.4cm}@{}}
+\toprule
+维度 & mjlab (1.4.0) & Isaac Lab (unitree\_rl\_lab) & UniLab \\
+\midrule
+触发时机 & 每次 checkpoint 存档自动导出 & \verb|play.py| 运行时导出 & \verb|eval|/play 阶段导出（PPO）；off-policy 由 \verb|export_onnx| flag 训练内导 \\
+Normalizer & 单独文件或 baked-in & 通常 baked-in & \Verb[breaklines]|empirical_normalization=true| 时经 rsl-rl baked-in（同 mjlab） \\
+Metadata 载体 & ONNX \Verb[breaklines]|metadata_props| & \verb|deploy.yaml| $+$ ONNX & 独立 \Verb[breaklines]|deploy_config.yaml|（\verb|obs_layout|/\allowbreak\verb|action_scale|/\allowbreak\Verb[breaklines]|default_angles|） \\
+关节顺序来源 & 与 MJCF 一致 & 与 USD 一致（常 $\ne$ SDK） & 与 MJCF/Motrix XML 一致；部署端按 \Verb[breaklines]|deploy_config.yaml| 显式装配 \\
+输出文件 & \verb|policy.onnx| & \verb|policy.onnx| $(+$\verb|.data|$)$ & \verb|policy.onnx| $+$ \Verb[breaklines]|deploy_config.yaml|（动作跟踪另产 \verb|.bin|） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{mjlab 侧的源码路线（1.4.0）。}按数据流读四站即可掌握导出链路（遵循本书源码引用规范，只标文件 $+$ 函数 $+$ 版本，不标行号——行号随版本漂移）：
+\begin{enumerate}
+  \item 在 \texttt{src/\allowbreak mjlab/\allowbreak rl/\allowbreak runner.\allowbreak py} 的 \texttt{export\_policy\_to\_onnx()} 中用 \Verb[breaklines]|torch.onnx.export| 导出 actor。\textbf{关键细节}：用 \emph{trace} 模式（非 script），任何依赖输入值的 control flow（if-else 分支）都会被「烤死」为 trace 时的路径——若策略有「接触了就切模式」这类条件分支，导出可能不正确。
+  \item 在 \texttt{src/\allowbreak mjlab/\allowbreak rl/\allowbreak exporter\_utils.\allowbreak py} 的 \texttt{get\_base\_metadata()} 中从环境配置提取 \verb|joint_names|、\Verb[breaklines]|default_joint_pos|、\verb|command_names|、\Verb[breaklines]|observation_names|、\verb|action_scale|，再由同文件的 \texttt{attach\_metadata\_to\_onnx()} 写进 \Verb[breaklines]|metadata_props|；部署端用 \Verb[breaklines]|onnx.load(path).metadata_props| 读取。
+  \item \texttt{runner.py} 的 \texttt{save()} 会把 \Verb[breaklines]|common_step_counter| 存进 checkpoint 的 \verb|env_state|——这\emph{不是}策略权重，而是训练进度计数器。从 checkpoint 恢复训练却忘了恢复它，curriculum 会从零开始，策略「忘记」已学会的困难行为。
+  \item \textbf{ONNX 导出由每次 checkpoint 存档自动触发}（mjlab 1.4.0 实测）：基类 \texttt{MjlabOnPolicyRunner.\allowbreak save()} 只存 \verb|.pt| 不导 ONNX，但每个\emph{任务专属} runner（\texttt{VelocityOnPolicyRunner} / \texttt{ManipulationOnPolicyRunner} / 动作跟踪的 runner）都\emph{重写} \texttt{save()}：先 \texttt{super().\allowbreak save()}，再调 \texttt{export\_policy\_to\_onnx()} 与 \texttt{get\_base\_metadata()}$+$\texttt{attach\_metadata\_to\_onnx()}，且整段裹在 \verb|try/except| 里——失败只打 \Verb[breaklines]|[WARN] ONNX export failed (training continues)| 而不中断训练。所以训练过程中每存一次 model 就同步产出对应 \verb|.onnx|（unitree\_rl\_mjlab 实测一致）。各任务 metadata 略有不同：base metadata 含 \verb|joint_names|/\allowbreak\Verb[breaklines]|joint_stiffness|/\allowbreak\verb|joint_damping|/\allowbreak\Verb[breaklines]|default_joint_pos|/\allowbreak\verb|command_names|/\allowbreak\Verb[breaklines]|observation_names|/\allowbreak\verb|action_scale|，\emph{动作跟踪}任务再 \texttt{update} 进 \Verb[breaklines]|anchor_body_name|/\allowbreak\verb|body_names|（manipulation 任务则仅用 base metadata，不额外加字段）。
+\end{enumerate}
+
+\paragraph{UniLab 侧的源码路线（GitHub main）。}UniLab 同样导出可部署 ONNX 并自验，但有两处与 mjlab 不同的工程约定，部署前必须知道：
+\begin{enumerate}
+  \item \textbf{导出时机随算法分叉}。PPO 路径在 \emph{play/eval} 阶段才导（\texttt{rsl\_rl} 风格 runner 的 \texttt{export\_policy\_to\_onnx()} $+$ \texttt{export\_policy\_to\_jit()}）——因此 \Verb[breaklines]|training.no_play=true| 的纯训练\emph{不会}产出 ONNX，必须显式 \Verb[breaklines]|eval --load-run -1|。APPO 在 \texttt{train\_appo.\allowbreak py} 里用 \texttt{\_DeterministicAPPOActor(actor.\allowbreak mlp)} 包出确定性 actor 再 \Verb[breaklines]|torch.onnx.export|；off-policy（SAC 等）在 \texttt{train\_offpolicy.\allowbreak py} 里由 \Verb[breaklines]|training.export_onnx=true|（默认开）控制、用 \texttt{actor.\allowbreak as\_export\_module()} 在训练流程内导。这与 mjlab「训练即随存档自动导」是\emph{不同}的触发模型——照搬 mjlab 的「训练完去 logs 里找 ONNX」到 UniLab PPO 上会扑空。
+  \item \textbf{部署元信息走独立 YAML，不嵌 ONNX}。mjlab 把 \verb|joint_names|/\allowbreak\verb|action_scale| 写进 ONNX \Verb[breaklines]|metadata_props|；UniLab 则用 \texttt{scripts/\allowbreak deploy/\allowbreak export\_deploy\_config.\allowbreak py} 单独导出 \texttt{deploy\_config.\allowbreak yaml}（含 \verb|obs_layout|、\verb|obs_dim|、\Verb[breaklines]|default_angles|、action scale），关节顺序也在此显式记录。动作跟踪任务另由 \texttt{export\_motion\_bin.\allowbreak py} 把参考运动导成 \texttt{.bin}，\texttt{prepend\_warmup.\allowbreak py} / \texttt{append\_cooldown.\allowbreak py} 给部署轨迹加起停段。这条 \texttt{scripts/\allowbreak deploy/\allowbreak } 工具链比 mjlab 更完整，但代价是部署端要同时携带 \verb|policy.onnx| \emph{和} \Verb[breaklines]|deploy_config.yaml| 两个文件，缺一不可。
+  \item \textbf{normalizer 与 mjlab 同源}。\Verb[breaklines]|empirical_normalization=true| 时归一化层经 rsl-rl 写进 ONNX 计算图（baked-in），部署端无需另读 mean/std——但若该 flag 关闭则\emph{没有}归一化层，部署端也无需补，关键是\emph{两端一致}（参见 \cref{ins:rlmc-s2r-engine} 的 normalizer pitfall）。
+\end{enumerate}
+
+\begin{codebox}[Python]{三框架通用:导出后必做 PyTorch/ONNX 一致性核验}
+import torch, onnxruntime as ort, numpy as np
+# wrapped 是「actor (+ normalizer)」的 nn.Module;已 torch.onnx.export 到 path
+session = ort.InferenceSession(path)
+in_name = session.get_inputs()[0].name        # 别硬编码 "obs"，用真实输入名
+max_diff = 0.0
+for _ in range(10):
+    x = torch.randn(1, obs_dim)
+    with torch.no_grad():
+        pt = wrapped(x).numpy()
+    ox = session.run(None, {in_name: x.numpy()})[0]
+    max_diff = max(max_diff, np.abs(pt - ox).max())
+print(f"max |PyTorch - ONNX| = {max_diff:.2e}")
+assert max_diff < 1e-5, "导出不一致:多半是自定义 activation 在 ONNX 中行为不同"
+\end{codebox}
+
+这段核验是导出环节的「单元测试」：同一组随机输入，PyTorch 和 ONNX Runtime 的输出必须逐元素一致（阈值 $10^{-5}$）。差异过大几乎都来自自定义算子或动态 shape——\textbf{在部署前抓住，比在真机上抓住便宜几个数量级}。
+
+\begin{codebox}[Python]{UniLab:导出后的内置 onnxruntime 自验（APPO 路径，对照上框）}
+import torch, onnxruntime as ort, numpy as np
+# UniLab 自带这步:train_appo.py 把 actor.mlp 包成确定性 _DeterministicAPPOActor 后导出，
+# 立刻起一个 InferenceSession 比对 PyTorch 与 ONNX 的 max/mean diff，再打印 "ONNX export verified OK".
+session = ort.InferenceSession("policy.onnx")
+in_name = session.get_inputs()[0].name             # UniLab 约定输入名就是 "obs"
+x = torch.randn(1, obs_dim)
+with torch.no_grad():
+    pt = deterministic_actor(x).numpy()            # _DeterministicAPPOActor(actor.mlp)
+ox = session.run(None, {in_name: x.numpy()})[0]
+max_diff, mean_diff = np.abs(pt - ox).max(), np.abs(pt - ox).mean()
+print(f"max diff={max_diff:.2e}  mean diff={mean_diff:.2e}")
+assert max_diff < 1e-5, "ONNX export NOT verified"  # 通过则等价 UniLab 的 "ONNX export verified OK"
+# 注:off-policy 路径用 actor.as_export_module() 导出，自验逻辑相同;PPO 在 eval 阶段经 runner 完成.
+\end{codebox}
+
+\subsection{ProtoMotions「obs 烤入」导出模式}
+\label{sec:rlmc-s2r-baked}
+
+传统导出只含策略网络，部署端要\emph{自己重新实现} obs 计算（把传感器原始数据拼成策略输入向量）。这是高频错误源：obs 函数在 Python 训练代码和 C++ 部署代码里各写一遍，任何细微差异（归一化系数、history buffer 长度、frame 转换）都会让策略行为异常。
+
+ProtoMotions（NVlabs 的 GPU 加速人形仿真/学习框架）给了更干净的方案——\textbf{把 obs 计算图也「烤」进 ONNX}\cite{nvlabs_protomotions}。导出后的 ONNX 接收的不是「策略 obs 向量」而是「原始传感器信号」（关节角、IMU 读数），obs 的拼接、归一化、history 堆叠都在 ONNX 图\emph{内部}完成。官方表述是：ProtoMotions 导出\emph{单个} ONNX 模型、把 observation 计算 baked-in，部署框架只需提供原始传感器信号，无需重写 obs 函数或对齐训练内部细节。
+
+\begin{insight}[Baked-in obs 的双重解读]\label{ins:rlmc-s2r-baked}
+\textbf{从软件工程看}：它把部署端要遵守的契约从「重新实现 42 维 obs 的每一维」简化为「提供原始传感器读数」——大幅降低出错概率（这是一种「接口契约的简化」）。\textbf{从机器学习看}：它是一种「端到端导出」——ONNX 不仅含「obs $\to$ action」的映射，还含「传感器 $\to$ obs」的映射，使整条推理管线的数学行为在 Python 与 C++ 之间\emph{完全一致}。这正是消除「Python 训练 obs 与 C++ 部署 obs 不一致」这个最高频部署 bug 的根治法。ProtoMotions 自带的部署脚本（\texttt{deployment/\allowbreak export\_bm\_tracker\_onnx.\allowbreak py}，自动从 checkpoint 探测 actor obs keys）正是把 Level 2 可导出 obs 烤进单个 ONNX。\textbf{反例值得对照}：unitree\_rl\_lab 走的恰是\emph{另一条路}——它\emph{不}烤入 obs，而是把 Python \verb|mdp/| 里的 obs 函数\textbf{在 C++ 侧逐一对应重写}（经函数注册宏镜像），由 C++ 的 \Verb[breaklines]|ObservationManager| 从原始传感器拼出 obs 向量再喂 ONNX；这正是 baked-in 想消除的「两处各写一遍 obs」模式，靠严格的代码镜像 $+$ deploy.yaml 配置一致性来兜住 parity。
+\end{insight}
+
+ProtoMotions 把 obs 计算组织为 \texttt{MdpComponent}（一个把纯张量函数绑定到 context path 的组件），并按副作用分三个 compute level：\textbf{Level 1} 纯张量计算、\textbf{Level 2} 聚合（可导出 ONNX）、\textbf{Level 3} 含副作用（不可导出）。其工程边界因此很清楚：纯张量、无副作用的 obs 计算（Level 1/2）可烤入；有副作用的（文件 I/O、随机性、外部标定读取，Level 3）不可。此外，\textbf{RNN 的 hidden state 管理}（episode 边界重置）通常不在 ONNX 图内——C++ 端需自己维护 hidden state buffer。
+
+\textbf{UniLab 对同一个「Python/C++ obs 不一致」难题给的是另一条解法}，值得与 baked-in 并置：它\emph{不}把 obs 计算烤进 ONNX，而是把 obs 装配收敛到唯一权威表 \verb|obs_layout|（写在 \Verb[breaklines]|deploy_config.yaml| 里），训练侧与 C++ 部署侧都\emph{按同一张表}逐段拼 obs；再用 \texttt{scripts/\allowbreak deploy/\allowbreak sim\_prototype.\allowbreak py} 在 MuJoCo 里\emph{逐段校验}「部署端拼出的 obs $==$ 训练侧 obs」，这一验证专为「写 C++ \verb|State_WBT| 之前」设计。两种思路殊途同归——baked-in 是\textbf{把契约编进计算图}（运行时不可能不一致），UniLab 是\textbf{把契约编成单一数据表 $+$ 一道离线 parity 校验}（写 C++ 前先证伪不一致）；前者更省部署端心智，后者保留了 C++ 端自行装配 obs 的灵活性而用校验兜底。三框架在此正好覆盖了「obs parity」问题的两端解空间。
+
+\begin{practice}[ONNX 边界动手]
+\begin{enumerate}
+  \item \textbf{[实验]} 用短训练导出一个 ONNX，读出全部 metadata key-value，并把 \verb|joint_names| 与 MJCF/USD 的关节顺序逐一对比。验收标准：能明确指出两者是否一致、不一致在哪几位。
+  \item \textbf{[设计]} 为一个\emph{视觉}策略的 ONNX 导出包设计 metadata schema——除 \verb|joint_names|/\allowbreak\verb|action_scale| 外，还需含哪些视觉信息？（提示：camera intrinsics/extrinsics、preprocessing pipeline、CHW/HWC layout、near/far、cutoff\_distance）
+  \item \textbf{[概念]} 为什么 ONNX 不该包含安全限幅？若把限幅「烤」进 ONNX 计算图会带来什么问题？（提示：限幅参数需现场可调、且安全逻辑必须独立于策略进程，见 \cref{sec:rlmc-s2r-safety}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Sim2Sim 交叉验证：真机前的最后一道闸}
+\label{sec:rlmc-s2r-sim2sim}
+
+\paragraph{模块功能与在管线中的位置。}\cref{ch:rlmc-physics} 讲过两个引擎（MuJoCo 凸软接触 vs PhysX TGS）为什么会给出不同的物理行为。本节把那条物理知识\emph{用起来}：在真机部署前，先在\emph{第二个}物理引擎里跑同一个策略。若策略只在训练引擎里正常、换引擎就崩，说明它依赖了特定引擎的数值行为——这种依赖在真机上几乎必然失效。Sim2sim 是 sim-to-real 的「前置测试」，是性价比最高的一道闸。
+
+\subsection{动机：把双假设问题降成单假设}
+\label{sec:rlmc-s2r-sim2sim-why}
+
+如果策略在两个引擎里表现一致（存活时间/tracking error 差异在阈值内，经验上 $<15\%$），说明它学到的行为是\textbf{物理鲁棒}的——不依赖特定引擎实现细节，真机成功概率更高。反过来，跨引擎大幅掉性能就是一记预警。Sim2sim 验证已是足式 RL 社区的标准实践：humanoid-gym（arXiv:2404.05695）率先把「Isaac Gym 训练 $\to$ MuJoCo 交叉验证」这套范式做成开源框架而广为流传，unitree\_rl\_lab 则把它工程化成一条完整管线。
+
+\begin{insight}[Sim2Sim 是必要条件，不是充分条件]\label{ins:rlmc-s2r-sim2sim}
+Sim2sim 验证的价值在于\textbf{把一个双假设问题降成单假设}。设想真机第 5 秒摔倒，你面对两个假设：(a) sim-to-real gap（物理参数不对，要调 DR 重训）；(b) 策略本身的问题（reward 设计不好，要改 reward）。若事先做了 sim2sim：MuJoCo 里也第 5 秒摔 $\Rightarrow$ 大概率是策略本身（两引擎一致说明不是引擎特定问题）；MuJoCo 里稳但真机摔 $\Rightarrow$ 大概率是 sim-to-real gap。排查效率直接翻倍。\textbf{但务必记住边界}：sim2sim 验的是「对物理引擎差异的鲁棒性」，它\emph{验不了}传感器噪声、通信延迟、电机温升等真机特有问题。通过了\emph{才可以}尝试真机（必要条件），但通过\emph{不保证}真机成功（非充分条件）。
+\end{insight}
+
+\subsection{两条对称的部署管线}
+\label{sec:rlmc-s2r-pipelines}
+
+社区有两条互相对称的工业级管线，覆盖从训练到真机的全程。理解它们的差异就理解了「训练引擎选择如何影响 sim2sim 难度」。
+
+\paragraph{Isaac Lab 侧：unitree\_rl\_lab。}基于 Isaac Lab（PhysX）$+$ RSL-RL，支持 Unitree Go2 / H1 / G1-29dof\cite{unitree_rl_lab}。五阶段：
+
+\begin{enumerate}
+  \item \textbf{Train}：\Verb[breaklines]|./unitree_rl_lab.sh -t --task Unitree-G1-29dof-Velocity --num_envs 4096 --headless|。
+  \item \textbf{Play \& Export}：\verb|-p| 可视化并自动导出。产物在 \texttt{exported/} 下含 \texttt{policy.onnx}（及 TorchScript 的 \texttt{policy.pt}），部署参数走训练时生成的 \texttt{params/\allowbreak deploy.\allowbreak yaml}（关节映射、scale 等）；\texttt{policy.\allowbreak onnx.\allowbreak data} 仅在模型超 2\,GB、走 ONNX external-data 时才出现，并非必然产物。
+  \item \textbf{Sim2Sim}：\Verb[breaklines]|./unitree_mujoco -i 0 -n lo -r g1 -s scene_29dof.xml|（\verb|-i|=DDS domain id，\verb|-n|=网络接口名、仿真用回环 \verb|lo|，\verb|-r|=机器人类型）。它启动一个模拟 Unitree SDK DDS 接口的 MuJoCo 仿真——\textbf{同一个 C++ 控制器可透明连仿真或真机，只改网络接口}。
+  \item \textbf{C++ Controller}：\Verb[breaklines]|cmake .. && make|，依赖 unitree\_sdk2 / yaml-cpp / boost / eigen3 / CycloneDDS；\Verb[breaklines]|./g1_ctrl --network lo|（连 sim2sim，回环）或 \Verb[breaklines]|--network eth0|（连真机，填实际网卡名）。\textbf{注意 \texttt{--network} 收的是接口名而非 IP}。
+  \item \textbf{Sim2Real}：进 debug/damping 模式 $\to$ 启动控制器 $\to$ 低增益站立 1 分钟 $\to$ 逐步加增益和速度范围。
+\end{enumerate}
+
+deploy.yaml 的关键字段（unitree\_rl\_lab 导出脚本生成）：\texttt{joint\_ids\_map}（RL 策略输出向量 $\to$ SDK 物理电机 id 的排列表）、\texttt{stiffness}/\allowbreak\texttt{damping}（每关节 PD）、\texttt{default\_joint\_pos}，以及控制周期 \texttt{step\_dt} 与 \texttt{actions}（动作缩放/偏置）、\texttt{observations}（喂给 C++ ObservationManager 的观测组与项）配置——这些都是当前版本 deploy.yaml 的真实字段（精确拼写仍以你安装版本的导出脚本为准）。源稿示例里的 \texttt{control\_dt} / \texttt{motor\_kp} / \texttt{joint\_mapping.\allowbreak urdf\_to\_sdk} 则是\emph{概念化}字段名，用于说明需承载哪些信息，并非官方真实字段名。
+
+\begin{finenote}
+\textbf{诚实声明 $+$ 自行证伪的办法}：本章 mjlab/UniLab 侧命令与 API 均在 RTX 4080S 上实跑核实，但\textbf{本节 Isaac Lab 侧（\texttt{play.py} 导出时机、\texttt{deploy.yaml} 真实字段名、\texttt{policy.\allowbreak onnx.\allowbreak data} 何时产生）未在本配置实跑}，以官方 \Verb[breaklines]|unitree_rl_lab| README 与你安装版本的导出脚本为准。与其信书上的字段名，不如\textbf{一行命令 dump 出你这台机器上的真值}：跑完 \verb|-p| 导出后，\Verb[breaklines]|python -c "import yaml,sys; print(list(yaml.safe_load(open(sys.argv[1]))))" exported/.../params/deploy.yaml| 列出真实顶层字段；\verb|joint_ids_map| 的真值可直接 \verb|print| 它的列表看是不是恒等排列。读 \verb|exporter| 源码（\verb=grep -rnE "deploy.yaml|joint_ids_map" <repo>=）则能看到字段是谁写进去的——这套「读产物 $+$ 读导出脚本」的自验法，对任何版本漂移都比照抄书更可靠。
+\end{finenote}
+
+\paragraph{mjlab 侧：unitree\_rl\_mjlab。}与上完全对称，只是训练引擎换成 MuJoCo Warp\cite{unitree_rl_mjlab}：\verb|train.py| $\to$ \verb|play.py| 导出 $\to$ 同一个 C++ 控制器连 \Verb[breaklines]|unitree_mujoco| 做 sim2sim $\to$ 真机。
+
+\begin{insight}[mjlab 管线的 sim2sim 差异天然更小]\label{ins:rlmc-s2r-warp}
+mjlab 的训练引擎是 MuJoCo Warp（GPU 并行），sim2sim 验证引擎是 MuJoCo C（CPU）——\emph{共享同一个物理模型}，理论上跨引擎差异比「PhysX $\to$ MuJoCo」小得多。这是选 mjlab 路线的一个实在好处。\textbf{但别据此假设两者完全一致}：MuJoCo Warp 与 MuJoCo C 在浮点精度和求解器实现上仍有细微差异，sim2sim 这道闸\emph{依然要过}。两条管线的取舍：Isaac Lab 适合需要 RTX 渲染/USD 资产的场景，mjlab 适合偏好 MuJoCo 生态/轻量级的场景；二者的 C++ 控制器、ONNX 格式、deploy 配置格式可共用。
+\end{insight}
+
+\paragraph{UniLab 侧：sim2sim 被提升为「契约关卡」。}与上面两条「跑一遍存活时间看通过」的脚本式 sim2sim 不同，UniLab 把 sim2sim 做成框架\emph{内建的一等正确性关卡}（GPU-sim 框架里少见）。它的跨后端是 MuJoCo $\leftrightarrow$ Motrix——两个后端的 DR 能力与接触模型不同，同一策略迁移时行为可能漂移。\texttt{training/\allowbreak sim2sim.\allowbreak py} 的 \texttt{resolve\_sim2sim\_config()} 在回放\emph{前}先读源 run 的 \Verb[breaklines]|contract_snapshot|，把「决定策略行为的字段」与目标配置逐项比对：落在 \verb|DENYLIST|/\allowbreak\Verb[breaklines]|ENV_STRUCTURAL_DENYLIST| 里的字段一旦不一致就判 denial，\Verb[breaklines]|training.sim2sim_strict=true|（默认）直接抛 \texttt{CrossBackendIncompatibleError}。
+
+\begin{insight}[把 sim2sim 从「测试」升级为「编译期错误」]\label{ins:rlmc-s2r-contract}
+mjlab/Isaac Lab 的 sim2sim 是\emph{运行}一遍看存活时间——这是一种\textbf{事后}检测，跑完才知道哪里不对。UniLab 的契约校验把同一件事变成\textbf{事前}拦截：策略还没开始回放，框架就因「源/目标后端的关键字段不一致」启动失败。这正是软件工程里「把运行时错误左移成编译期错误」的思想（类型系统、契约式设计）落到 sim2real 上——\verb|joint_order| 错、obs 维度变、DR 字段缺失这类最高频的部署 bug，与其在真机上花两天排查，不如在跨后端迁移的\emph{那一刻}就被一个明确的异常挡下。\textbf{但要分清边界}：契约校验保证的是「两后端的配置一致」，它\emph{不验}物理行为本身是否鲁棒——配置一致但策略仍可能因接触模型差异在 Motrix 里摔。所以 UniLab 的 sim2sim 既包含契约关卡（事前），也仍需回放评估（事后），二者互补，缺一不可。
+\end{insight}
+
+\begin{codebox}[Python]{mjlab:用 ONNX Runtime 在 MuJoCo 里跑交叉验证（核心循环，1.4.0 实测）}
+import onnxruntime as ort, onnx, numpy as np, torch
+session = ort.InferenceSession(policy_path)
+in_name, out_name = session.get_inputs()[0].name, session.get_outputs()[0].name
+meta = {p.key: p.value for p in onnx.load(policy_path).metadata_props}
+# 关键:先看本框架到底有没有外挂 normalizer.mjlab 1.4.0 实测把归一化烤进计算图，
+#   metadata 里【没有】obs_mean/obs_var——别无脑读，否则下面的归一化分支永不触发还掩盖真相.
+has_norm = "obs_mean" in meta                  # mjlab baked-in 时为 False;外挂 mean/std 的框架才 True
+if has_norm:
+    obs_mean = np.array(eval(meta["obs_mean"]), dtype=np.float32)
+    obs_var  = np.array(eval(meta["obs_var"]),  dtype=np.float32)
+
+# 注意:mjlab 1.4.0 导出的 ONNX 把 batch 维写死=1（D0 的 [WARN] 会提示），
+#   不能把 [num_envs, obs_dim] 整批喂进去——实测会报 INVALID_ARGUMENT: Got:64 Expected:1.
+#   两条出路:(a) 向量化 env 但【逐 env】batch=1 推理（下面这条，不必重导）;
+#            (b) 导出时传 dynamic_axes={"obs":{0:"B"}} 放开 batch 维，再整批 run.
+env = make(mjlab_task, num_envs=64)            # mjlab G1 velocity（mjlab 无 Go2，仅 G1/Go1）
+obs, _ = env.reset()
+for step in range(5000):
+    o = obs["policy"].cpu().numpy()            # [num_envs, obs_dim]
+    if has_norm:                               # baked-in 时跳过;只有外挂 normalizer 才在这里补
+        o = (o - obs_mean) / (np.sqrt(obs_var) + 1e-8)
+    acts = [session.run([out_name], {in_name: o[i:i+1].astype(np.float32)})[0][0]
+            for i in range(o.shape[0])]        # 逐 env 单步推理（batch=1），绕开固定 batch 维
+    a = np.stack(acts, axis=0)
+    obs, rew, done, trunc, info = env.step(torch.from_numpy(a).to(env.device))
+# 汇总:平均存活时间 > 90% 训练值（如 20s episode 存活 > 18s）判通过
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:sim2sim 不是脚本而是「契约关卡」（training/sim2sim.py，GitHub main）}
+# UniLab 把 sim2sim 做成一等公民:跨后端（MuJoCo <-> Motrix）回放前，先比对
+# 「决定策略行为的字段」是否一致，不一致直接抛错——把不兼容前置成启动期错误.
+from unilab.training.sim2sim import resolve_sim2sim_config  # 名称取自源码
+# 读源 run 的 run_config.json 里 contract_snapshot，与目标 play 配置逐字段比对:
+cfg = resolve_sim2sim_config(source_run_dir, target_cfg, algo_name="ppo", strict=True)
+#   DENYLIST / ENV_STRUCTURAL_DENYLIST 里的字段一旦不一致（或一侧有一侧无）= "denial";
+#   strict=True（默认）抛 CrossBackendIncompatibleError，否则只打 [sim2sim] WARNING (non-strict).
+#   policy_load_dim_guard 还会把张量 shape 不匹配重抛成 sim2sim 诊断.
+# CLI/Hydra 等价开关:training.sim2sim_strict=true（默认致命）.
+# 之后才用 ONNX 在目标后端回放，并用 scripts/deploy/sim_prototype.py 逐段校验
+#   obs 装配 == 训练侧（按 deploy_config.yaml 的 obs_layout 拼 obs，写 C++ 控制器前的最后一验）.
+\end{codebox}
+
+\subsection{Sim2Sim 失败的诊断决策树}
+\label{sec:rlmc-s2r-sim2sim-debug}
+
+当验证引擎里明显差于训练引擎，按下述顺序定位（这是 \cref{sec:rlmc-s2r-seven-layers} 七层分类在 sim2sim 场景的具体化）：
+
+\begin{enumerate}
+  \item \textbf{两引擎里 zero-agent 的 base height 差 $>3$\,cm？}$\Rightarrow$ 接触参数差异（摩擦/弹性/阻尼）。修：对齐 MJCF 与 USD 的接触参数。
+  \item \textbf{同一 obs 输入，两引擎的 action 输出不同？}$\Rightarrow$ ONNX 加载或 obs 预处理差异。修：查 normalizer、joint order、obs schema。
+  \item \textbf{action 相同但关节追踪误差不同？}$\Rightarrow$ actuator 模型差异（PD gain、力矩限制）。修：对齐 PD 参数、查 \verb|effort_limit|。
+  \item \textbf{以上都一致仍失败？}$\Rightarrow$ sim step 精度差异（dt 太大、求解器迭代不同）。修：减小 dt、增求解器迭代。
+\end{enumerate}
+
+\begin{pitfall}[Sim2Sim 时 normalizer 处理与训练不一致]
+\textbf{错误描述}：sim2sim 脚本直接把环境 obs 喂给 ONNX，没确认训练时的归一化走哪条路。\textbf{现象后果}：策略在第二引擎里表现极差，你\emph{误判}成「物理引擎差异」并跑去调摩擦。\textbf{根本原因}：obs 归一化两端不一致，与 \cref{ins:rlmc-s2r-engine} 描述的部署事故同源——只是这次发生在 sim2sim 而非真机。\textbf{这里有个常见误区}：很多脚本无脑 \Verb[breaklines]|assert "obs_mean" in meta|，但归一化\emph{baked-in 进计算图}的框架（mjlab 1.4.0、UniLab \Verb[breaklines]|empirical_normalization=true|）根本\emph{没有}这个 key——此时强行断言会在合法 ONNX 上报错。\textbf{正确做法}：脚本开头先 \Verb[breaklines]|print(list(meta))| 判断本框架属于哪种——(a) 外挂 mean/std（metadata 或旁文件里有 \verb|obs_mean|/\allowbreak\verb|obs_var|，部署端\emph{要}补归一化）；(b) baked-in 计算图（无该 key，部署端\emph{不要}重复归一化）；(c) 干脆没归一化。上面代码框的 \verb|has_norm| 分支正是按这三种情形分流，而非默认有 \verb|obs_mean|。
+\end{pitfall}
+
+\begin{practice}[Sim2Sim 动手]
+\begin{enumerate}
+  \item \textbf{[实践]} 在 mjlab 训一个 Go2 速度跟踪策略，导出 ONNX，再在 Isaac Lab 里加载同一 ONNX 评估。记录两框架的 tracking error，按上面的决策树分析差异来源。
+  \item \textbf{[分析]} unitree\_rl\_lab 的 \verb|joint_ids_map| 为什么需要一个\emph{排列}表？若某机器人 URDF 关节顺序与 SDK 完全一致，这个排列表应是什么（提示：恒等排列 $[0,1,2,\dots]$）？
+  \item \textbf{[设计]} 为 sim2sim 设计一个 CI 流程：每次训练完自动在 MuJoCo 跑 100 episode，存活 $<15$\,s 自动标记失败并通知。写出伪代码，并说明它属于 \cref{sec:rlmc-s2r-grading} 的哪个验收等级。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{延迟补偿：控制闭环中最隐蔽的 Gap}
+\label{sec:rlmc-s2r-latency}
+
+\paragraph{模块功能与在管线中的位置。}延迟是七层分类里「时序层」的核心，也是最容易被低估的 gap。仿真默认「观测立即可用、动作立即执行」，真机则从传感器读数到电机响应每一步都耗时，而且延迟\emph{不是一个固定值}——它随负载、温度、通信、计算复杂度波动（jitter），这种波动比平均延迟更难处理。本节给出延迟的四段分解、四种补偿策略，以及如何把真机测得的延迟\emph{映射}回训练注入参数。
+
+\subsection{延迟不是一个数字，是四段}
+\label{sec:rlmc-s2r-latency-four}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{3.6cm}lp{3.4cm}@{}}
+\toprule
+延迟段 & 物理来源 & 典型范围 & 影响模式 \\
+\midrule
+Observation latency & 传感器采样、A/D、传输 & 1--20\,ms & 策略看到的是「过去」的状态 \\
+Policy inference latency & 神经网络前向 & 0.5--5\,ms & 延长 obs$\to$action 间隔 \\
+Action transport latency & 通信协议、串行、队列 & 1--10\,ms & 命令到达执行器的延迟 \\
+Actuator response latency & 电机电气时间常数、机械惯性 & 5--50\,ms & 命令发出到力矩生效的延迟 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+对一个 50\,Hz 控制循环（20\,ms 周期），若端到端延迟 30\,ms，策略的动作到电机时机器人已运动了 1.5 帧。对快速动态任务（步态、抓取），这个滞后可能造成相位错误或定位偏差。一个具体场景：四足以 1\,m/s 行走，足端触地需切换摆动/支撑相；延迟使切换\emph{晚}了 20\,ms，足端在空中多飘 2\,cm 才着地，着地偏差可能滑动或绊倒；切换\emph{早}了 20\,ms，足端没到目标位就被锁定，步幅缩短、稳定性下降。
+
+控制周期的时间预算可写成一行：\texttt{margin = control\_period $-$ (sensor + preprocess + policy + safety + transport)}。若 \texttt{margin} 经常 $<0$，降低网络/传感器成本比调 PPO 更要紧；若 \texttt{margin} 偶发 $<0$（jitter），偶发尖峰比平均延迟更危险——因为策略是为「大约 $k$ 帧延迟」训的，偶发的 $3k$ 帧延迟完全在训练分布之外。
+
+\begin{pitfall}[只测平均延迟，不测 jitter]
+\textbf{错误描述}：部署前只测了端到端延迟的均值（如 10\,ms），就按它配训练注入。\textbf{现象后果}：真机偶发 50\,ms 尖峰时策略行为崩坏，而均值看起来「很好」。\textbf{根本原因}：平均 10\,ms $+$ 偶发尖峰 50\,ms 比稳定 20\,ms 更危险——策略为「约 10\,ms」训练，50\,ms 完全超出训练分布。\textbf{正确做法}：测延迟的 p50/p95/p99，策略鲁棒性应覆盖 \emph{p95} 而非 p50；训练注入的 delay 上界 $\ge$ 真机 p95。
+\end{pitfall}
+
+\begin{finenote}
+\textbf{一个最常被误判成「jitter」的尖峰其实是 ONNX 冷启动}。实测 \Verb[breaklines]|onnxruntime.InferenceSession| 的\emph{第一次} \verb|.run()| 比之后慢一截——首调要做内核选择、内存竞技场分配、graph 优化等一次性工作；这个尖峰落在 policy inference 段，很容易被当成 \cref{sec:rlmc-s2r-latency-four} 里的「执行器/通信 jitter」误诊。\textbf{修法是部署/影子模式（D2）启动后、进入控制循环\emph{前}，先空跑若干次 warmup}（用 \Verb[breaklines]|np.zeros((1, obs_dim))| 喂 5--10 次再丢弃结果），把一次性开销摊在初始化阶段。这条对 Python D2 影子模式与 C++ 真机推理同样适用（\cref{sec:rlmc-s2r-trouble} 故障表「C++ 推理 jitter 大」一行即此），并和「控制线程绑核 $+$ 提高调度优先级」配合压住 p99。
+\end{finenote}
+
+\subsection{四种补偿策略与量纲映射}
+\label{sec:rlmc-s2r-latency-comp}
+
+\begin{itemize}
+  \item \textbf{训练时注入延迟}（最常用）：在仿真 observation buffer 里加 $k$ 帧延迟，逼策略学会在有延迟下控制。缺点是延迟越大训练越难，且只对注入范围鲁棒。
+  \item \textbf{状态预测}：用小网络/物理模型预测当前状态，补偿 observation latency。不增训练难度，但预测本身有误差（尤其接触切换等非线性事件附近）。
+  \item \textbf{降低控制频率}：端到端 15\,ms 时，从 100\,Hz 降到 50\,Hz（20\,ms），延迟占比从 150\% 降到 75\%。代价是对扰动响应变慢。
+  \item \textbf{Action hold/repeat}：新动作没算出来时重复上一个，避免「空白期」但可能动作不连续。
+\end{itemize}
+
+\textbf{量纲映射是这一节的工程命门}：训练注入的延迟以 sim step 为单位，必须和真机延迟对齐。若 sim \Verb[breaklines]|dt = 0.005|\,s，\Verb[breaklines]|delay_range = (1, 3)| 对应 $5$--$15$\,ms；若真机测得 p95 $=20$\,ms，应设 \Verb[breaklines]|delay_range = (1, 4)|（覆盖 $5$--$20$\,ms）。
+
+\begin{pitfall}[在 mjlab 里用 step-mode event 加 action 延迟]
+\textbf{错误描述}：照搬「\texttt{EventTermCfg(mode="step")} 调 \texttt{mdp.\allowbreak randomize\_action\_delay}」来注入动作延迟。\textbf{现象后果}：报错或延迟根本没生效——\texttt{randomize\_action\_delay} 不是框架内置事件，且 \texttt{step} 模式不会自动每步触发。\textbf{根本原因}：mjlab 把 actuation delay 放在\emph{执行器层}处理——\texttt{Actuator} 内建一个 \texttt{DelayBuffer} 缓冲控制信号、按 physics timestep 量化后延迟回放（见 mjlab 论文，arXiv:2601.22074），并\emph{不}走 EventManager。\textbf{正确做法}：action delay 配在 \verb|ActuatorCfg| 的延迟字段上（mjlab 1.4.0 实测字段名为 \verb|delay_min_lag| / \verb|delay_max_lag|，均以 physics timestep 为单位，\Verb[breaklines]|delay_max_lag>0| 才启用，外加 \Verb[breaklines]|delay_hold_prob| / \Verb[breaklines]|delay_update_period| / \Verb[breaklines]|delay_per_env_phase| 控制抖动与每环境相位）；observation delay（滞后 1--2 帧 obs）则在 observation term / obs 缓冲层处理，二者位置不同，别混。
+\end{pitfall}
+
+一个跨领域类比能锁住「为什么训练延迟要覆盖 p95」：延迟训练就像飞行员在模拟器里练\emph{不同风速}下着陆。真实阵风不可预测（像 jitter），但若训练里经历过比真实更极端的阵风，温和条件下的表现会更稳。同理，训练延迟范围覆盖真机 p95，部署时在 p50 延迟下就会非常稳健。
+
+\begin{practice}[延迟动手]
+\begin{enumerate}
+  \item \textbf{[计算]} 四段延迟为 obs 5\,ms、policy 2\,ms、transport 3\,ms、actuator 10\,ms，控制 50\,Hz。算端到端延迟占控制周期的比例，判断是否需要补偿（经验阈值 \texttt{delay/\allowbreak period} $>0.1$ 即需要）。
+  \item \textbf{[实验]} 在 mjlab 训一个零延迟四足策略，play 时注入 1/2/4 帧 observation 延迟，记录成功率与步态稳定性随延迟的退化曲线。验收标准：能指出「策略在第几帧延迟开始明显退化」。
+  \item \textbf{[设计]} 你的真机 policy inference 延迟 jitter 大（p50=2、p95=15、p99=40\,ms）。设计训练 $+$ 部署两端的补偿方案，说明各自怎么处理尖峰。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{安全链路：策略之外的独立保护层}
+\label{sec:rlmc-s2r-safety}
+
+\paragraph{模块功能与在管线中的位置。}安全是七层分类的最后一层，也是\emph{唯一不靠学习}的一层。一个常见误解是「用 reward shaping 让策略学会安全」——给不安全行为加负 reward。这在仿真里有效，但真机部署中安全\emph{不能依赖策略的「意愿」}：策略可能因输入异常（传感器故障）、推理错误（数值溢出）、环境突变（被人推）而输出不安全动作。本节给出安全链路的分层结构与「主动触发每个分支测试」的方法。
+
+\subsection{安全与控制：两个独立系统}
+\label{sec:rlmc-s2r-safety-two}
+
+\begin{insight}[安全系统不能依赖策略的正确性]\label{ins:rlmc-s2r-safety}
+策略文件只是一层函数 $\mathbf a=\pi(\mathbf o)$；真实机器人需要完整的控制协议\emph{和}安全协议。安全系统的两条设计原则是\textbf{独立性}与\textbf{可靠性优先于性能}。独立性：安全链路不能和控制链路共享同一个故障点——若策略推理的 Python 进程崩溃，安全限幅\emph{不能因此失效}，故安全逻辑应跑在独立线程（或独立硬件控制器）上。可靠性优先：安全代码越简单越不易出错——一个 200 行的 watchdog 比一个 5000 行的「智能安全系统」更可靠。一句话：\textbf{若策略因 sim-to-real gap 输出不安全动作，安全系统必须独立地检测并阻止它，即使策略「认为」自己在做正确的事}。
+\end{insight}
+
+\subsection{安全链路的六层结构}
+\label{sec:rlmc-s2r-safety-layers}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{3.0cm}p{2.8cm}@{}}
+\toprule
+层 & 监控内容 & 触发动作 & 实现位置 \\
+\midrule
+L0 物理急停 & 人按下按钮 & 断电或制动 & 硬件按钮 \\
+L1 硬件 watchdog & 通信超时 & 进入安全姿态 & 电机控制器内部 \\
+L2 姿态保护 & base pitch/roll 超限 & 锁定关节 & 独立安全线程 \\
+L3 动作限幅 & action 超范围 & 裁剪到安全范围 & 部署端 post-process \\
+L4 温度保护 & 电机温度过高 & 降低动作幅度 & telemetry 监控 \\
+L5 状态估计保护 & 传感器数据过旧 & 冻结动作 & obs 时间戳检查 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{L0--L2 是硬安全}——即使软件完全失效也能保护硬件和人员。\textbf{L3--L5 是软安全}——在软件正常前提下保护策略不做危险动作。两层必须都有：只有软安全的系统在软件崩溃时毫无保护；只有硬安全的系统挡不住策略「合法但危险」的输出（如持续高力矩导致电机过热）。
+
+\begin{codebox}[Python]{独立安全监控线程（节选:检查频率必须高于策略频率）}
+import threading, time
+class SafetySupervisor:
+    """独立于策略的保护层:在单独线程跑，策略进程崩溃也能急停."""
+    def __init__(self, sdk, cfg):
+        self.sdk, self.cfg, self.events = sdk, cfg, []
+    def emergency_stop(self):
+        pos = self.sdk.get_joint_positions()
+        # 低刚度 + 高阻尼锁到当前位置（damping 模式），而非硬切断
+        self.sdk.send_damping_mode(positions=pos,
+                                   kp=[5.0]*len(pos), kd=[2.0]*len(pos))
+    def run(self):
+        while True:
+            s = self.sdk.get_state()
+            tilt_ok = abs(s.imu.roll) < self.cfg.max_roll and \
+                      abs(s.imu.pitch) < self.cfg.max_pitch
+            wd_ok   = time.time() - s.last_cmd_time < self.cfg.watchdog_timeout
+            if not (tilt_ok and wd_ok):
+                self.emergency_stop(); break        # 触发后不自动恢复，需人工重启
+            time.sleep(0.002)                        # 500 Hz:必须高于 50 Hz 策略频率
+\end{codebox}
+
+\begin{note}[UniLab 无对应：独立真机安全线程不属于 UniLab 的职责边界]
+独立安全监控线程\textbf{在 UniLab 侧无对应实现}，且这是设计使然而非缺失。UniLab 是\emph{仿真/训练}框架（CPU 多后端），它的部署产物到 \verb|policy.onnx| $+$ \Verb[breaklines]|deploy_config.yaml| 为止——真机的 L0--L5 安全链路（\cref{sec:rlmc-s2r-safety-layers}）落在下游的 C++ 控制器（如 \verb|State_WBT|）与硬件 watchdog 上，与上文 mjlab/Isaac Lab 共用同一类 SDK 适配层。UniLab 自带的最接近「安全」语义的是\emph{训练期}的 \texttt{NanGuard}（\texttt{utils/\allowbreak nan\_guard.\allowbreak py}）：它环形缓存最近若干帧 physics state，\Verb[breaklines]|check(obs, reward, step)|/\allowbreak\Verb[breaklines]|check_ctrl(ctrl)| 一旦检出非有限值就 \verb|dump| 成 \verb|.npz|（可用 \Verb[breaklines]|unilab-viz-nan| 回放出事前几帧复现）。这是\textbf{训练侧的「NaN 急停 $+$ 黑匣子」}，目标是定位数值发散，不是真机保护——别把它当部署安全层。真机安全请按 \cref{ins:rlmc-s2r-safety} 的独立性原则在 C++ 控制器侧实现，无论训练框架是 mjlab、Isaac Lab 还是 UniLab。
+\end{note}
+
+\begin{insight}[为什么安全检查频率必须高于策略频率]\label{ins:rlmc-s2r-safety-freq}
+上面代码里安全线程跑 500\,Hz，远高于策略的 50\,Hz——这不是随手设的。\textbf{若安全检查频率低于策略频率，会出现「漏检窗口」}：策略在两次安全检查之间输出了危险动作而未被拦截。更要命的是\emph{同线程}方案：策略 ONNX 推理偶尔卡顿（GC、内存分配）使一帧从 2\,ms 涨到 50\,ms，这 50\,ms 内安全检查也被阻塞——若恰好此时倾斜或碰撞，安全系统无法响应。独立高频线程同时解决「漏检」和「被推理阻塞」两个问题。
+\end{insight}
+
+\begin{pitfall}[急停只挂在 UI 层]
+\textbf{错误描述}：急停是 GUI 按钮发一个「停止」命令到策略进程。\textbf{现象后果}：策略进程挂死（死循环、段错误）时急停命令无法被接收，机器人继续执行最后一个动作。\textbf{根本原因}：急停链路经过了它本该保护的那个进程——共享了故障点，违反独立性原则。\textbf{正确做法}：急停由独立硬件 watchdog 或独立进程执行，\emph{不经过}策略进程；L0 物理按钮直接作用于电源/制动。
+\end{pitfall}
+
+\begin{pitfall}[把 action clip 当成安全保护的全部]
+\textbf{错误描述}：以为「动作限幅 $=$ 安全」，只做了 L3。\textbf{现象后果}：通信丢包（没 action 可 clip）、传感器故障（action 基于错误输入算出、但数值在范围内）、温度过高（范围内的 action 长时间持续也过热）、跌倒（action 不越界但姿态已不可恢复）这些场景全裸奔。\textbf{根本原因}：限幅只约束\emph{动作数值范围}，管不了「输入错」「时间累积」「姿态不可恢复」。\textbf{正确做法}：安全要覆盖 L0--L5 全部六层，限幅只是其中一层。
+\end{pitfall}
+
+\subsection{Unitree 部署的 adapter 边界与四步上线验证}
+\label{sec:rlmc-s2r-adapter}
+
+mjlab/Isaac Lab 都能训 Unitree G1/Go1 等任务并导出 ONNX $+$ metadata，但真实部署还需一个\textbf{SDK adapter 层}——仿真策略与真实硬件之间的翻译器。它必须处理：状态读取、坐标转换、joint order 映射、控制模式确认（position/velocity/torque）、PD gain 复现、action scale 复现、限幅、急停。任一缺失都对应一类典型故障（如坐标转换缺失 $\Rightarrow$ 方向性动作全反；joint order 缺失 $\Rightarrow$ 关节错位）。
+
+\textbf{特别注意单位约定}：Unitree SDK 关节角是 rad，但某些接口的角速度可能是 rad/s 或 deg/s（取决于 SDK 版本）。若训练假设 rad/s 而真机发 deg/s，相差约 57 倍——策略看到的状态完全不对，\emph{却不报任何错}。解法：在 adapter 里显式写明每个输入量的单位，并用已知静态姿态做数值验证（关节角应等于 MJCF 的 default pose）。
+
+Adapter 不应只靠目视，应写自动化单元测试。最小测试集：(1) 静态一致性（default pose 下 SDK 关节角 vs MJCF \Verb[breaklines]|default_joint_pos|，差 $<0.01$\,rad）；(2) 动态一致性（已知正弦动作的反馈频率/幅度匹配，允许 PD 追踪误差）；(3) 单位验证（发 action $=1.0$，电机位移 $\approx$ \verb|action_scale|）；(4) 边界安全（发越界 action，确认被裁剪）。这四个测试 5 分钟可跑完，能挡掉大多数 adapter 事故，每次改 adapter 都应重跑。
+
+上线前的四步真机验证（与 \cref{sec:rlmc-s2r-grading} 的 D3/D4 对应）：\textbf{第一步}逐关节静态测试（$\pm0.05$\,rad、$0.5$\,Hz 正弦，目视确认方向/幅度/无联动，5 分钟抓 joint order 错）；\textbf{第二步}悬空低增益（四脚离地，PD gain 设训练值 20\%，看步态模式）；\textbf{第三步}低速 tethered（安全绳，$<0.3$\,m/s，首测急停、确认 100\,ms 内停）；\textbf{第四步}主动触发每个安全分支（watchdog 超时、姿态越限、通信中断、人工急停），确认每个触发到停止延迟在预算内。
+
+\begin{practice}[安全链路动手]
+\begin{enumerate}
+  \item \textbf{[设计]} 为 Unitree G1 设计 L0--L5 安全链路：每层监控哪个传感器、阈值多少、触发后执行什么。验收标准：每层都能在无危险条件下\emph{主动触发}并观察到预期保护动作。
+  \item \textbf{[分析]} 某机器人的 watchdog 与策略进程跑在同一 Python 进程。分析风险（提示：\cref{ins:rlmc-s2r-safety-freq} 的阻塞场景），并提出改进。
+  \item \textbf{[思考]} 移动操作机器人（底盘 $+$ 机械臂）比纯 locomotion 多需要哪些安全保护？为什么 base 与 arm 任一异常都必须能停\emph{全}系统？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{D0--D6 分级验收：把风险逐级压低}
+\label{sec:rlmc-s2r-grading}
+
+\paragraph{模块功能与在管线中的位置。}本节是整章方法论的\emph{执行框架}——把前面所有检查（gap 分类、ONNX 边界、sim2sim、延迟、安全）编排成一条从零风险到完整任务的证据链。直接把策略放真机跑完整任务是危险的：若有 bug（如关节顺序错），机器人可能第一帧就猛动、损坏硬件或伤人。分级验收的核心思想：\textbf{从最安全的测试开始，每次只增加一点风险，确认安全后再升级}。
+
+\subsection{七级验收体系}
+\label{sec:rlmc-s2r-seven-levels}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{2.4cm}p{2.6cm}p{2.8cm}@{}}
+\toprule
+等级 & 执行环境 & 允许动作 & 主要风险 & 通过标准 \\
+\midrule
+D0 静态核对 & 离线文件 & 无动作 & joint order、normalizer & schema 与训练一致 \\
+D1 仿真回放 & 训练框架 play & 策略动作 & train/play 不一致 & 固定 seed replay 通过 \\
+D2 影子模式 & 真机旁路 & 不下发电机 & 状态估计延迟 & 输出在安全范围内 \\
+D3 悬空低增益 & 真机支撑 & 小幅动作 & PD gain 错位 & 关节方向/幅度正确 \\
+D4 平地低速 & 真机平地 & 限速行走 & 延迟、摩擦 & 急停、watchdog 正常 \\
+D5 任务片段 & 受控场景 & 限定范围 & 目标感知、接触 & 任务片段可重复 \\
+D6 完整任务 & 真机任务区 & 完整策略 & 长时热稳定 & 达验收率 $+$ 失败归因 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{D0--D1 是离线验证}（零风险）：D0 查软件接口一致性（metadata vs 训练配置、normalizer 是否存在且匹配、action scale），D1 查 train/play 一致性（同一 checkpoint 在训练与回放产生相同行为）。\textbf{D2--D3 是低风险真机}：D2「影子模式」让策略接真实传感器但\emph{不下发电机}、只记日志（验证状态估计与预处理链路，完全安全）；D3 悬空 $+$ 低增益做小幅运动（验证关节方向映射，即使映射错、低增益也不致危险）。\textbf{D4--D6 是逐步升级的真机任务}，每级有明确通过标准与升级条件——只有当前级稳定通过才升级。
+
+\begin{insight}[失败必须回退诊断，不在原级反复重试]\label{ins:rlmc-s2r-grading}
+分级验收最反直觉、也最省时间的一条规则：\textbf{任何等级失败，先回退到上一级诊断原因，而非在当前级反复尝试}。若 D4（平地低速）不稳，正确做法是回 D3（悬空低增益）排查——是 PD gain、延迟还是摩擦？在 D4 反复重试只会浪费时间、增加硬件损坏风险。每次失败都要有明确的原因归因，修复后从前一级重新开始。这条规则把分级验收从「一串测试」升级为「一条带反馈的诊断流水线」——它和软件工程的 CI/CD 是同一种思想：现代软件不攒三个月一次性发布，而是每天小幅发布、每次都有自动化测试确认不破坏已有功能。
+\end{insight}
+
+\subsection{D0 自动化核对：5 分钟挡掉一半 bug}
+\label{sec:rlmc-s2r-d0}
+
+D0 只需 5 分钟却能发现 50\% 以上的部署 bug。下面是它的内核（完整版应再加 joint\_names 与 SDK 比对、输入输出维度检查）：
+
+\begin{codebox}[Python]{D0 静态核对（内核，mjlab 1.4.0 实测可跑）}
+import onnx, onnxruntime as ort, numpy as np
+def d0(onnx_path):
+    model = onnx.load(onnx_path)
+    onnx.checker.check_model(model)                       # 1. 文件完整性
+    meta = {p.key: p.value for p in model.metadata_props} # 2. metadata 完整性
+    print("metadata keys:", list(meta))                   # 先 print 看本框架到底放了哪些 key
+    # 注意:必查集要按框架定制！mjlab 1.4.0 实测 ONNX 只有 7 个 metadata key
+    #   (joint_names/joint_stiffness/joint_damping/default_joint_pos/
+    #    command_names/observation_names/action_scale)——obs_dim/obs_mean 都不在里面，
+    #   故只断言三者实测都在的 key;obs_dim 改从 graph 读（见下）.
+    for k in ("joint_names", "action_scale", "default_joint_pos"):
+        assert k in meta, f"缺少 metadata: {k}（本框架 metadata 集与 mjlab 不同？先看上面 print）"
+    g = model.graph                                        # 3. 维度从 graph 读（不是 metadata）
+    obs_dim = g.input[0].type.tensor_type.shape.dim[1].dim_value
+    assert obs_dim > 0, "obs 维度为 0:动态维度没固化"
+    batch_dim = g.input[0].type.tensor_type.shape.dim[0].dim_value
+    if batch_dim == 1:                                     # mjlab 1.4.0 实测 batch 维被写死=1
+        print("[WARN] batch 维固定=1:只能单 obs 推理;批量 sim2sim 需 dynamic_axes 重导")
+    # 4. 推理 + NaN/量级检查（normalizer 漏了的话 action 会爆量级）
+    sess = ort.InferenceSession(onnx_path)
+    name = sess.get_inputs()[0].name                      # 别硬编码 "obs"（mjlab 实测确为 "obs"）
+    a = sess.run(None, {name: np.zeros((1, obs_dim), np.float32)})[0]
+    assert not np.isnan(a).any(), "推理出 NaN"
+    if np.abs(a).max() > 10:
+        print("[WARN] action 绝对值 > 10:normalizer 可能没正确加载")
+    return True
+\end{codebox}
+
+\begin{pitfall}[把 \texttt{obs\_mean}/\allowbreak\texttt{obs\_dim} 当成「每个框架都有」的 metadata key 去断言]
+\textbf{错误描述}：照搬别人的 D0 脚本，开头就 \Verb[breaklines]|assert "obs_mean" in meta| 或 \Verb[breaklines]|assert "obs_dim" in meta|。\textbf{现象后果}：在一个\emph{完全合法}的 ONNX 上直接 \Verb[breaklines]|AssertionError|——读者反被误导，以为自己的 ONNX 坏了。\textbf{根本原因}：metadata key 集\emph{随框架而异}。mjlab 1.4.0 实测 G1-velocity ONNX 只有上述 7 个 key，\emph{既没有} \verb|obs_dim|（它从 graph 读）、\emph{也没有} \verb|obs_mean|/\allowbreak\verb|obs_var|——因为 mjlab 把归一化\textbf{烤进了计算图}（baked-in），部署端无需另读 mean/std；UniLab 走 \Verb[breaklines]|empirical_normalization=true| 时同样 baked-in，元信息另放 \Verb[breaklines]|deploy_config.yaml|。\textbf{正确做法}：先 \Verb[breaklines]|print(list(meta))| 看本框架到底放了哪些 key，据此判断归一化走哪条路（baked-in 计算图 / 外挂 mean-std / 干脆没归一化），再决定 D0 必查集——别假设某个 key 一定存在。
+\end{pitfall}
+
+\begin{codebox}[Python]{UniLab:D0 静态核对（查 ONNX $+$ deploy\_config.yaml 一致）}
+import onnx, onnxruntime as ort, numpy as np, yaml
+def d0_unilab(onnx_path, deploy_cfg_path):
+    onnx.checker.check_model(onnx.load(onnx_path))            # 1. ONNX 文件完整性
+    cfg = yaml.safe_load(open(deploy_cfg_path))               # 2. UniLab 元信息在独立 YAML，非 metadata_props
+    for k in ("obs_layout", "obs_dim", "action_scale", "default_angles"):
+        assert k in cfg, f"deploy_config.yaml 缺字段: {k}"
+    sess = ort.InferenceSession(onnx_path)
+    name = sess.get_inputs()[0].name                          # UniLab 约定为 "obs"
+    obs_dim = cfg["obs_dim"]                                  # 3. 维度一致性:YAML 声明 vs ONNX 实际
+    g = onnx.load(onnx_path).graph
+    assert g.input[0].type.tensor_type.shape.dim[1].dim_value == obs_dim, "obs_dim 与 ONNX 不符"
+    a = sess.run(None, {name: np.zeros((1, obs_dim), np.float32)})[0]   # 4. 推理 + NaN/量级
+    assert not np.isnan(a).any(), "推理出 NaN"
+    # 5. UniLab 特有的最强 D0:用 scripts/deploy/sim_prototype.py 在 MuJoCo 逐段比对
+    #    obs 装配 == 训练侧（按 cfg["obs_layout"]）——这一步等价「把 joint_names 与 SDK 比对」，
+    #    但更彻底:直接验证整条 obs 拼装逻辑而非仅关节名.
+    return True
+\end{codebox}
+
+D1 仿真回放则是固定 seed 重放、对齐训练末期行为。\textbf{一个易踩的坑}：只设 \Verb[breaklines]|torch.manual_seed| 不足以复现环境随机性（命令采样、DR、并行环境初始化）——要按 Gymnasium API 把 seed 传给 \Verb[breaklines]|env.reset(seed=...)|，vector env 还需固定每个子环境 seed 或记录随机配置；否则「回放」其实每次都不同，对齐无从谈起。
+
+\begin{pitfall}[跳过 D0 直接上真机]
+\textbf{错误描述}：「反正训练曲线很好，直接试真机吧」。\textbf{现象后果}：第一帧猛动、损坏硬件——这种事故比任何其他原因都多。\textbf{根本原因}：D0 能查出的 joint order/normalizer/action scale 错误，在仿真里\emph{看不出来}（两端共用 MJCF/USD），只有真机暴露。\textbf{正确做法}：D0 只要 5 分钟（读 metadata、比对 joint names、查 normalizer），能避免数小时甚至数周的硬件维修。把 D0 脚本设成「不通过就拒绝启动电机」的硬门。
+\end{pitfall}
+
+\subsection{长期运行与热稳定}
+\label{sec:rlmc-s2r-thermal}
+
+短时通过不等于长时无恙：电机温度随时间升（改变 PD 行为与力矩上限），电池电压降（改变动作幅度），通信可能间歇丢包。D6 验收必须含长时测试——设保守速度/动作幅度，跑固定时长低风险任务，每隔固定时间执行同一标准片段比较前后性能。若温度/电压/丢包率恶化，必须在恶化到失败\emph{之前}建立自动降级机制。\textbf{D6 通过的标准是「有人监督下完成任务」——无人值守需要更高等级验证}（长时续航、异常恢复、远程监控、自动降级），别把 D6 当成无人值守许可。
+
+\begin{practice}[分级验收动手]
+\begin{enumerate}
+  \item \textbf{[设计]} 为 mjlab 训练的 Go2 写完整 D0--D6 清单，每级 3--5 个具体检查项与客观通过标准。
+  \item \textbf{[分析]} D2（影子模式）为什么不需要安全限幅？在什么条件下影子模式本身仍可能有风险（提示：旁路计算机若误连了电机指令通道）？
+  \item \textbf{[跨章综合]} 回看 \cref{ch:rlmc-visuomotor} 的视觉策略。若部署的是视觉抓取策略（而非低维状态策略），D0--D6 每级要增加哪些视觉检查项？（提示：camera metadata、preprocessing parity、depth calibration）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Telemetry 与闭环迭代：每次测试都要有诊断}
+\label{sec:rlmc-s2r-telemetry}
+
+\paragraph{模块功能与在管线中的位置。}分级验收回答「怎么安全地推进」，本节回答「怎么从每次测试中\emph{学到东西}」。Sim-to-real 几乎不可能一次成功——它是「仿真训练 $\to$ 真机测试 $\to$ 发现问题 $\to$ 回仿真修正 $\to$ 重训 $\to$ 再测」的迭代循环。关键是让每次真机测试不只产出「成功/失败」，更产出「失败的具体原因」和「该在仿真里改什么」。Telemetry 是这条信息流的物理载体。
+
+\subsection{没有日志的测试等于白做}
+\label{sec:rlmc-s2r-telemetry-why}
+
+\begin{insight}[Telemetry 的目标不是「记录一切」]\label{ins:rlmc-s2r-telemetry}
+Telemetry 的目标是\textbf{确保任何一次失败都能在离线复盘中定位到七层 gap 分类中的具体层}——不多不少。一个不幸的现实：很多团队测了 20 次、失败 15 次，却只有「摔了」这一条信息，没记摔倒前一秒的 obs/action/latency，两周后无人记得、只能重测。有 telemetry 则不同：你知道「第 7.2 秒左前腿关节追踪误差从 0.02 突增到 0.15\,rad，同时 IMU pitch 开始偏，0.8 秒后 base 越限触发 safety stop」——这直接指向左前腿 PD 控制（Kp 不够或延迟太大）。\textbf{每次真机测试（哪怕 30 秒）都必须产出：完整 telemetry 日志、失败的第一触发条件、与仿真的逐维对比、下一步行动项。}
+\end{insight}
+
+最小 telemetry schema 每帧应含：硬件 timestamp、step、obs（归一化前后）、action（限幅前后）、关节命令/反馈位置与速度、IMU、估计的 base rpy、四段 latency、sensor age、电机温度（硬件支持时）、safety events。\textbf{一个工程细节}：telemetry 写盘必须用独立线程/异步队列，绝不能在控制线程里同步 \verb|write+flush|——磁盘 I/O 会给控制循环引入延迟尖峰（这与 \cref{sec:rlmc-s2r-latency} 的 jitter 同源）。
+
+\subsection{真机日志与仿真日志的逐维对比}
+\label{sec:rlmc-s2r-compare}
+
+真机日志最有价值的用途是\emph{与仿真日志对比}，找出差异最大的 obs 维度——前提是两端用\textbf{相同的 schema}（维度名、单位、顺序都一致），这样同一套分析脚本能处理两端数据。
+
+\begin{codebox}[Python]{仿真-真机日志逐维对比（核心）}
+import numpy as np
+def compare_sim_real(sim_frames, real_frames, obs_names):
+    n = min(len(sim_frames), len(real_frames))
+    diffs = {}
+    for i, name in enumerate(obs_names):
+        s = np.array([sim_frames[k]["obs"][i] for k in range(n)])
+        r = np.array([real_frames[k]["obs"][i] for k in range(n)])
+        d = np.abs(s - r)
+        diffs[name] = d.mean()
+    for name, m in sorted(diffs.items(), key=lambda x: -x[1])[:10]:
+        print(f"{name:16s} mean|sim-real| = {m:.4f}")
+    # 差异最大的维度 = gap 的主要来源:base_vel_z 大 -> 垂直速度估计(IMU/接触);
+    #   proj_grav_* 大 -> base 姿态估计偏;某 joint_pos 大 -> 该关节 PD 追踪差.
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:schema 对齐靠 obs\_layout（真机 telemetry 在下游 C++ 侧）}
+import yaml
+# UniLab 不直接采真机 telemetry（它是仿真框架），但它提供了「让两端 schema 必然一致」的根:
+# deploy_config.yaml 的 obs_layout 是唯一权威的 obs 装配表，仿真与 C++ 部署端都按它拼 obs.
+cfg = yaml.safe_load(open("logs/.../deploy_config.yaml"))
+obs_layout = cfg["obs_layout"]   # 逐段 [(name, dim), ...]:维度名+顺序+长度的单一真相源
+# scripts/deploy/sim_prototype.py 正是用它在 MuJoCo 逐段校验 obs 装配 == 训练侧，
+#   等价于「真机 telemetry 与仿真共用同一 schema」——只要 C++ 控制器也按 obs_layout 记日志，
+#   本节「仿真-真机日志逐维对比」的脚本就能直接复用.
+# 训练侧诊断黑匣子另有:NanGuard 的 .npz dump（环形缓存出事前几帧）+ run_config.json/run_summary.json
+#   （记 seed/硬件/git/任务），可作离线复盘的仿真侧证据，与真机日志对照.
+\end{codebox}
+
+\subsection{闭环迭代：每级失败反馈什么}
+\label{sec:rlmc-s2r-loop}
+
+迭代循环的每一环反馈\emph{不同性质}的问题，修复成本递增：D0--D1 失败反馈\textbf{软件接口}问题（映射/normalizer/scale，几分钟到几小时）；D2--D3 反馈\textbf{执行器与时序}问题（PD/延迟/方向，需调参重训，几小时到一天）；D4--D5 反馈\textbf{物理参数与感知}问题（摩擦/地形/视觉 gap，需 SysID $+$ 扩 DR 重训，一到几天）；D6 反馈\textbf{残余结构性差异}（模型抓不住的物理，需 Fine-tuning/ASAP，几天到几周）。
+
+\begin{insight}[五分钟法则：先定位方向，再使力]\label{ins:rlmc-s2r-fivemin}
+真机失败时，按优先级花 5 分钟快速定位，再决定下一步——\textbf{不是 5 分钟修好，而是 5 分钟知道该往哪个方向使力}：
+\textbf{第 1 分钟}查 ONNX 原始输出——全 NaN/固定值 $\to$ normalizer；全在 $\pm1$ 但行为错 $\to$ joint mapping/action scale。
+\textbf{第 2 分钟}查 obs 数值——某维与仿真差一个数量级 $\to$ 该维传感器读取/frame 转换。
+\textbf{第 3 分钟}查延迟——\Verb[breaklines]|latency_total_ms| 的 p95 $>$ 训练 budget $\to$ 延迟首要嫌疑。
+\textbf{第 4 分钟}查安全事件——\verb|tilt_warning|/\allowbreak\verb|joint_limit| 常发生在失败前 0.5--1\,s，指示根因。
+\textbf{第 5 分钟}对比 sim2sim——MuJoCo 里也失败 $\to$ 策略本身；MuJoCo 稳但真机崩 $\to$ sim-to-real gap 的某层。
+这就像急诊的 ABCDE 评估——用固定流程在几分钟内判断「最紧急的问题在哪」，再集中资源处理。若 5 分钟定位不了，说明 telemetry 不够细，回 \cref{sec:rlmc-s2r-telemetry-why} 加强日志再测。
+\end{insight}
+
+\begin{pitfall}[真机日志格式与仿真日志不兼容]
+\textbf{错误描述}：真机 observation 记录格式（维度顺序、单位、采样率）与仿真不同。\textbf{现象后果}：无法用同一套脚本逐维对比，复盘极困难。\textbf{根本原因}：两端 schema 不一致，\cref{sec:rlmc-s2r-compare} 的对比前提被破坏。\textbf{正确做法}：真机端复用与仿真\emph{完全相同}的 observation schema——维度名、单位、顺序都一致。
+\end{pitfall}
+
+\begin{practice}[Telemetry 与迭代动手]
+\begin{enumerate}
+  \item \textbf{[流程]} 四足在 D4 直线稳但转弯摔。按迭代循环：该回退到哪级？在仿真里改什么？下次真机测试的\emph{目标}是什么（要可证伪）？
+  \item \textbf{[设计]} 设计一个「真机测试诊断模板」：列出每次测试后必记的 10 个字段，及每个字段如何指导下一次迭代。
+  \item \textbf{[跨章综合]} 回看 \cref{ch:rlmc-visuomotor} 的视觉管线。若部署视觉抓取策略，迭代每一步要额外检查哪些视觉内容？（提示：camera calibration、depth noise profile、preprocessing parity）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{常见误解汇总}
+\label{sec:rlmc-s2r-misconceptions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.0cm}p{7.0cm}@{}}
+\toprule
+误解 & 纠正 \\
+\midrule
+仿真越逼真，sim2real gap 越小 & 过逼真会诱使策略过拟合引擎数值行为；适度 DR 往往更利于迁移（\cref{ins:rlmc-s2r-system} 上文） \\
+所有 gap 都能靠训练解决 & 软件接口/时序/安全是确定性工程问题，RL 管不到（\cref{sec:rlmc-s2r-seven-layers}） \\
+训练好了就能部署 & ONNX 只是发动机不是汽车，部署需完整闭环（\cref{ins:rlmc-s2r-engine}） \\
+observation normalizer 不重要 & 不一起部署则输入量级全错、动作饱和（\cref{ins:rlmc-s2r-engine} 的 pitfall） \\
+Fine-tuning 可替代 SysID 和 DR & 初始太差则真机采样全失败、梯度无信息（\cref{sec:rlmc-s2r-decision} 的 pitfall） \\
+sim2sim 通过就保证 sim2real 成功 & 它是必要非充分条件，验不了传感器/延迟/温升（\cref{ins:rlmc-s2r-sim2sim}） \\
+action 延迟比 observation 延迟更危险 & 影响模式不同：慢变系统 obs 延迟影响大，快变系统 action 延迟影响大（\cref{sec:rlmc-s2r-latency-four}） \\
+action clip 等同于安全保护 & 限幅只管数值范围，挡不住丢包/故障/累积/跌倒（\cref{sec:rlmc-s2r-safety-layers} 的 pitfall） \\
+D6 通过就能无人值守 & D6 标准是「有人监督下完成」，无人值守需更高验证（\cref{sec:rlmc-s2r-thermal}） \\
+真机数据越多越好 & 价值在多样性与标注质量，100 次重复不如 10 次诊断性试验（\cref{ins:rlmc-s2r-telemetry}） \\
+perception gap 只影响视觉策略 & 低维策略也有：状态估计漂移、编码器量化、力矩传感器温漂 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+\label{sec:rlmc-s2r-summary}
+
+本章从一条工程方法论主线出发：\textbf{Sim-to-Real 不是缩小一个 gap，而是把多个误差源约束在策略能承受的联合分布内（\cref{ins:rlmc-s2r-joint}），并用 D0--D6 分级验收的证据链把真机风险逐级压低}。沿这条主线，我们建立了：七层 gap 分类（按确定性从高到低排查，先修软件接口/时序/安全这些 RL 管不到的层）、五种修复工具的选型决策表（SysID 归零、DR 散布、Fine-tuning/ASAP 修结构、Adaptive/RMA 在线适应、Classical Safety 保命——原理都在 \cref{ch:rlmc-dr} 与 \cref{ch:rlmc-privileged}）、ONNX 的精确边界（「发动机不是汽车」$+$ ProtoMotions obs 烤入）、双引擎 sim2sim（把双假设问题降成单假设 $+$ 两条对称部署管线）、延迟四段分解与量纲映射（覆盖 p95 而非 p50）、独立安全链路（硬安全 L0--L2 $+$ 软安全 L3--L5，检查频率必须高于策略频率）、D0--D6 分级验收（失败回退诊断不原地重试）、telemetry 驱动的闭环迭代（每次测试必有诊断 $+$ 五分钟法则）。三框架对比贯穿全章：mjlab / Isaac Lab 给出可复制代码与对称部署管线，UniLab 则补齐了第三视角——\verb|eval| 阶段导 ONNX $+$ onnxruntime 自验、\Verb[breaklines]|deploy_config.yaml| 承载 obs 装配与关节顺序、\Verb[breaklines]|training/sim2sim.py| 把跨后端一致性提升为「契约关卡」（\cref{ins:rlmc-s2r-contract}），而真机安全/telemetry 则诚实标注为不属 UniLab 职责边界、落在下游 C++ 控制器。
+
+\paragraph{术语速查。}
+\begin{center}
+\small
+\begin{tabular}{@{}lp{8.6cm}@{}}
+\toprule
+术语 & 含义 \\
+\midrule
+七层 gap & 动力学/接触/执行器/传感器/时序/软件接口/安全 \\
+SysID vs DR & 归零（对齐均值）vs 散布（覆盖不确定性），互补 \\
+ASAP delta action model & 学残差动作 $\boldsymbol\delta(\mathbf s,\mathbf a)$ 弥合 gap（详见 \cref{ch:rlmc-dr}） \\
+Adaptive control / RMA & 在线估计环境 latent 并调整行为（详见 \cref{ch:rlmc-privileged}） \\
+ONNX 边界 & 只含 actor 计算图 $+$ metadata，不含状态估计/归一化/安全 \\
+baked-in obs & ProtoMotions 把 obs 计算图烤入 ONNX，部署端只供原始传感器 \\
+sim2sim & 在第二个物理引擎验证策略，真机前的必要非充分闸 \\
+sim2sim 契约（UniLab） & \Verb[breaklines]|training/sim2sim.py| 跨后端逐字段比对，不一致即抛 \Verb[breaklines]|CrossBackendIncompatibleError| \\
+\verb|joint_ids_map| & unitree\_rl\_lab 中策略输出 $\to$ SDK 电机 id 的排列表 \\
+\Verb[breaklines]|deploy_config.yaml| & UniLab 部署元信息载体（\verb|obs_layout|/\allowbreak\verb|action_scale|/\allowbreak\Verb[breaklines]|default_angles|/关节顺序） \\
+延迟四段 & observation / policy / transport / actuator latency \\
+jitter & 延迟的波动；策略须覆盖 p95，偶发尖峰最危险 \\
+硬安全 / 软安全 & L0--L2（软件失效也保护）/ L3--L5（软件正常时防危险动作） \\
+影子模式（D2） & 策略接真实传感器但不下发电机，零风险验证状态估计 \\
+D0--D6 & 从静态核对到完整任务的七级验收，失败回退诊断 \\
+telemetry & 每帧记录 obs/action/latency/safety，离线复盘定位 gap 层 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+\begin{center}
+\small
+\begin{tabular}{@{}rp{6.8cm}lc@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & Sim2Real 是约束联合分布，非缩小单个 gap & \cref{ins:rlmc-s2r-joint} & $\star\star$ \\
+2 & 按确定性排查：软件接口$\to$时序$\to\dots\to$安全 & \cref{sec:rlmc-s2r-seven-layers} & $\star\star$ \\
+3 & 软件接口/时序/安全 gap 是 RL 管不到的工程问题 & \cref{sec:rlmc-s2r-seven-layers} & $\star\star$ \\
+4 & SysID 归零 $+$ DR 散布，缺一不可 & \cref{ins:rlmc-s2r-zero-spread} & $\star\star$ \\
+5 & Fine-tuning 是最后一步，不能替代 SysID/DR & \cref{sec:rlmc-s2r-decision} & $\star\star$ \\
+6 & distillation 治「传感器量在真机不存在」 & \cref{sec:rlmc-s2r-distill} & $\star\star\star$ \\
+7 & ONNX 是发动机不是汽车 & \cref{ins:rlmc-s2r-engine} & $\star\star$ \\
+8 & normalizer 必须和 ONNX 一起部署 & \cref{ins:rlmc-s2r-engine} & $\star\star$ \\
+9 & baked-in obs 消除 Python/C++ obs 不一致 & \cref{ins:rlmc-s2r-baked} & $\star\star\star$ \\
+10 & sim2sim 把双假设问题降成单假设 & \cref{ins:rlmc-s2r-sim2sim} & $\star\star\star$ \\
+11 & MuJoCo Warp$\to$C 的 sim2sim 差异天然更小 & \cref{ins:rlmc-s2r-warp} & $\star\star$ \\
+12 & 延迟是四段，须覆盖 p95 非 p50 & \cref{sec:rlmc-s2r-latency-four} & $\star\star\star$ \\
+13 & 延迟量纲映射：sim step $\leftrightarrow$ 真机 ms & \cref{sec:rlmc-s2r-latency-comp} & $\star\star$ \\
+14 & 安全独立于策略，检查频率 $>$ 策略频率 & \cref{ins:rlmc-s2r-safety-freq} & $\star\star\star$ \\
+15 & 急停不能经过策略进程 & \cref{sec:rlmc-s2r-safety-layers} & $\star\star$ \\
+16 & 分级验收失败回退诊断，不原地重试 & \cref{ins:rlmc-s2r-grading} & $\star\star$ \\
+17 & D0 五分钟挡掉一半部署 bug & \cref{sec:rlmc-s2r-d0} & $\star\star$ \\
+18 & telemetry 目标是定位 gap 层，非记录一切 & \cref{ins:rlmc-s2r-telemetry} & $\star\star$ \\
+19 & 五分钟法则：先定位方向再使力 & \cref{ins:rlmc-s2r-fivemin} & $\star\star$ \\
+20 & UniLab 把 sim2sim 一致性提升为「契约关卡」（事前拦截） & \cref{ins:rlmc-s2r-contract} & $\star\star\star$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+本章建立了两个关键认知。\textbf{从「策略文件」到「闭环系统」}：训练产出 $\mathbf a=\pi(\mathbf o)$，部署需要传感器$\to$状态估计$\to$拼接$\to$推理$\to$后处理$\to$安全$\to$SDK 的完整闭环——ONNX 只覆盖正中间一步。\textbf{从「一次性跳跃」到「证据链」}：Sim-to-Real 不是「从仿真到真机」的一跃，而是一条由 D0--D6 分级、七层诊断、telemetry 驱动的证据链——证据链越完整，真机风险越可控。
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-s2r-further}
+
+\begin{itemize}
+  \item He et al., \emph{ASAP: Aligning Simulation and Real-World Physics for Learning Agile Humanoid Whole-Body Skills}, RSS 2025（arXiv:2502.01143）\cite{asap2025}——delta action model；教你「当 DR/SysID 不够时用真机数据精修仿真器」（实现详见 \cref{ch:rlmc-dr}）。
+  \item Sobanbabu et al., \emph{Sampling-Based System Identification with Active Exploration for Legged Robot Sim2Real Learning}（arXiv:2505.14266）\cite{sobanbabu2025spi}——主动探索辨识，报告较 baseline 提升 42--63\%；教你「主动激励出最可辨识的轨迹」。
+  \item Tan et al., \emph{Sim-to-Real: Learning Agile Locomotion for Quadruped Robots}, RSS 2018\cite{tan2018simtoreal}——SysID $+$ DR 的经典实践；教你「辨识缩小搜索空间、DR 覆盖残余」。
+  \item Kumar et al., \emph{RMA: Rapid Motor Adaptation for Legged Robots}, RSS 2021\cite{kumar2021rma}——adaptive control 的 latent 估计；教你「在线推断环境参数」（详见 \cref{ch:rlmc-privileged}）。
+  \item Hwangbo et al., \emph{Learning agile and dynamic motor skills for legged robots}, Science Robotics 2019\cite{hwangbo2019anymal}——actuator network $+$ sim2real；教你「用数据驱动模型补执行器 gap」。
+  \item Lee et al., \emph{Learning quadrupedal locomotion over challenging terrain}, Science Robotics 2020\cite{lee2020quadruped}——teacher-student $+$ terrain adaptation；教你「特权蒸馏的部署边界」。
+  \item OpenAI et al., \emph{Solving Rubik's Cube with a Robot Hand}（arXiv:1910.07113）\cite{openai2019rubik}——大规模 ADR 极致案例；教你「DR 范围随能力自动增长」。
+  \item ProtoMotions（NVlabs, GitHub）\cite{nvlabs_protomotions}、unitree\_rl\_lab\cite{unitree_rl_lab} 与 unitree\_rl\_mjlab\cite{unitree_rl_mjlab}——baked-in obs 导出与工业级五阶段部署管线；部署前务必对照目标版本 README 核字段名。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-s2r-trouble}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.4cm}p{3.6cm}p{4.8cm}@{}}
+\toprule
+症状 & 可能原因 & 排查步骤（相关节） \\
+\midrule
+ONNX 可运行但动作方向反 & joint order 映射错 & 读 metadata \verb|joint_names| $\to$ 与 SDK 逐一比对 $\to$ 单关节小幅测试（\cref{ins:rlmc-s2r-system}） \\
+站立几秒后摔倒 & 延迟未补偿 & 测端到端延迟 $\to$ 对比训练 decimation $\to$ 注入延迟重训（\cref{sec:rlmc-s2r-latency}） \\
+ONNX 输出 NaN/动作爆量级 & normalizer 没一起部署 & 跑 D0 量级检查 $\to$ 查 mean/std 文件 $\to$ 重导出（\cref{ins:rlmc-s2r-engine}） \\
+仿真稳定真机打滑 & 摩擦 gap $+$ 延迟耦合 & SysID 摩擦 $\to$ 查足底材料 $\to$ 扩 DR friction（\cref{ch:rlmc-dr}） \\
+sim2sim 差异 $>30\%$ & 接触/actuator 模型差异 & 对比 zero-agent base height $\to$ 调接触参数 $\to$ 对齐 PD（\cref{sec:rlmc-s2r-sim2sim-debug}） \\
+sim2sim 表现极差 & normalizer 处理与训练不一致 & \verb|print| metadata 判归一化架构（baked-in vs 外挂）$\to$ 两端对齐（\cref{sec:rlmc-s2r-sim2sim-debug}） \\
+安全急停无效 & 急停只在 UI 层 & 确认硬件 watchdog $\to$ 主动触发测试 $\to$ 与策略进程分离（\cref{sec:rlmc-s2r-safety-layers}） \\
+mjlab action 延迟没生效 & 用了 step-mode event & 改配在 \verb|ActuatorCfg| 字段上（\cref{sec:rlmc-s2r-latency-comp}） \\
+C++ 推理 jitter 大 & ONNX Runtime 没 warmup & 加 100 次 warmup $\to$ 绑核 $\to$ 固定实时线程（\cref{sec:rlmc-s2r-latency}） \\
+deploy.yaml 关节映射不对 & SDK 版本改了关节枚举 & 查 SDK 版本 $\to$ 重生成 \verb|joint_ids_map| $\to$ 单关节验证（\cref{sec:rlmc-s2r-pipelines}） \\
+真机日志无法复盘 & telemetry 与仿真 schema 不齐 & 统一维度名/单位/顺序 $\to$ 查视频时间戳（\cref{sec:rlmc-s2r-compare}） \\
+长时运行后性能衰退 & 电机温度/电池变化 & 记录温度电压趋势 $\to$ 对比冷热机 $\to$ 加降额（\cref{sec:rlmc-s2r-thermal}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[最后一句话：Sim2Real 的元法则]\label{ins:rlmc-s2r-oneliner}
+若只记一件事：\textbf{先确认输入语义（obs/单位/joint order），再确认训练目标（DR 是否覆盖真实参数），最后确认部署边界（ONNX 含什么、安全独立否）——三者不一致时，策略在仿真里越成功，迁移时越危险}。其余所有导出、验证、调参、排查，都是这一句的细化。Sim-to-Real 不是最后一步，而是一条贯穿训练、导出、验证、部署、复盘的证据链——证据链越完整，真机越可控。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-s2r-versions}
+
+本章代码与参数以下表版本为准。\textbf{部署侧 API（ONNX 导出字段、SDK 关节枚举、deploy 配置字段名）在版本间漂移快}，部署前请查各组件 CHANGELOG 与目标版本文档（尤其 \verb|joint_ids_map| 与 normalizer 的存放方式）。
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lLL@{}}
+\toprule
+组件 & 版本 & 相关内容 \\
+\midrule
+mjlab & 1.4.0（最新） & runner 自动导出 ONNX $+$ \Verb[breaklines]|metadata_props|；action delay 在 actuator cfg \\
+Isaac Lab & 2.x（主线）/ 3.0 Beta & \verb|play.py| 导出；Newton 后端 sim2sim \\
+unitree\_rl\_lab & GitHub main & Go2/H1/G1-29dof 五阶段管线；\verb|deploy.yaml| $+$ \verb|joint_ids_map| \\
+unitree\_rl\_mjlab & GitHub main & mjlab 版对称管线 \\
+ONNX Runtime & 1.17+ & C++/Python 部署推理 \\
+unitree\_sdk2 / CycloneDDS & 随固件 & DDS 通信；同一 C++ 控制器透明连 sim/真机 \\
+ASAP & 仓库 \Verb[breaklines]|LeCAR-Lab/ASAP|（RSS 2025） & delta action model（详见 \cref{ch:rlmc-dr}） \\
+ProtoMotions & 仓库 \Verb[breaklines]|NVlabs/ProtoMotions| & baked-in obs ONNX 导出 \\
+UniLab & GitHub main & \verb|eval| 阶段导 \verb|policy.onnx| $+$ onnxruntime 自验；\Verb[breaklines]|scripts/deploy/| 导 \Verb[breaklines]|deploy_config.yaml|；\Verb[breaklines]|training/sim2sim.py| 契约关卡 \\
+\bottomrule
+\end{tabularx}
+\end{center}

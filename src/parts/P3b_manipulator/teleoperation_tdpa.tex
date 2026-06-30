@@ -1,0 +1,592 @@
+\chapter{时间域无源性方法（TDPA）}
+\label{ch:teleop-tdpa}
+
+% ════════════════════════════════════════════════════════════════
+%  机械臂部·遥操作子部第 4 章：时间域无源性方法（TDPA）。
+%  源：Robotics_Tutorial/05_运动控制/20_机械臂/D07_TDPA与工程实现.md（提取理论，
+%  跳过 C++/ROS2/ros2_control/数据采集等纯工程）。
+%  定位：D06 波变量（ch:teleop-wave）给“事先预防”的结构性无源；本章给“事后纠正”的
+%  运行时安全网。与 P4 操作空间章互引：端口功率 eq:os-port-power、离散化破无源
+%  sec:os-discretization / eq:os-discrete-passive、能量罐 thm:os-energytank。
+%  记号归一：能量端口功率 P=f^T v；机械臂动力学 M qdd+C qd+g=tau；右扰动主线。
+%  源约定（输出端口 fv>0 为向外注入）已转换并 note 注明；个别非平凡断言打 \pz。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的对比表与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 写出一个端口的\emph{无源性}离散时间条件。若某监测量 $E_{\rm obs}(k)<0$，它在物理上意味着什么？
+  \item 波变量（\cref{ch:teleop-wave}）在\emph{常数}时延下保证什么？在\emph{时变}时延、丢包、抖动下又会出什么问题？
+  \item 一个数字实现的“无源”控制器，为何在零阶保持（ZOH）下\emph{未必}仍无源？（提示：\cref{sec:os-discretization} 的相位滞后）
+  \item 在遥操作里临时增大阻尼，会怎样影响稳定裕度？又会怎样影响\emph{透明度}（操作者对远端的真实感）？
+  \item 若你只在主端（master）放一个能量监测器、从端（slave）不放，从端控制器自身的 bug 凭空生成的能量，要多久才能被主端发现？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清} TDPA 的设计哲学——“事后纠正”相对波变量“事先预防”的承诺与代价，并准确陈述它\emph{只保证被监测端口}、且需要可耗散执行接口这两条失效边界；
+  \item \textbf{推导}无源性观测器（Passivity Observer, PO）就是端口无源性定义在 ZOH 下的\emph{精确}离散化（而非近似），并据此理解为何它对非线性系统同样成立；
+  \item \textbf{分析} PO 离散化的截断误差 $\varepsilon_k\le\tfrac12|\dot P|_{\max}T_s^2$，由此导出采样率下界，并解释为何 $50\,\mathrm{Hz}$ 硬接触下 PO 信噪比失效；
+  \item \textbf{推导}无源性控制器（Passivity Controller, PC）的串联最小阻尼 $\alpha$ 与并联最小阻尼 $\beta$，理解“刹车 vs 让墙退让”的物理直觉、对偶切换与零速发散保护；
+  \item \textbf{运用} Ryu (2005) 的参考能量跟踪（Reference Energy Following），把能量余量 $E_{\rm margin}$ 当作\emph{透明度–安全}旋钮；
+  \item \textbf{对比} TDPA 与波变量的工程失真特征（持续粘滞 vs 间歇脉冲），并理解双层架构——波变量提供结构性无源、TDPA 提供运行时安全网（类比 \cref{thm:os-energytank} 的能量罐）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把无源性的定义直接搬成在线监测器，再用最小干预把它强制成立}”的主线。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4.5mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (phil) {哲学\\事后纠正};
+\node[blk, right=of phil] (po) {PO\\端口能量监测};
+\node[blk, right=of po] (acc) {离散精度\\$\varepsilon_k\le\tfrac12|\dot P|T_s^2$};
+\node[grp, below=8mm of phil] (pc) {PC\\$\alpha,\beta$ 最小阻尼};
+\node[grp, right=of pc] (sw) {对偶切换\\串/并联};
+\node[grp, right=of sw] (ref) {参考能量\\$E_{\rm margin}$ 旋钮};
+\node[blk, below=8mm of pc, fill=third!8, draw=third!60!black] (cmp) {vs 波变量\\失真特征};
+\node[blk, right=of cmp, fill=third!8, draw=third!60!black] (two) {双层架构\\波变量$+$TDPA};
+\draw[ln] (phil)--(po); \draw[ln] (po)--(acc);
+\draw[ln] (po.south) -- ++(0,-4.5mm) -| (pc.north);
+\draw[ln] (pc)--(sw); \draw[ln] (sw)--(ref);
+\draw[ln] (pc.south)--(cmp.north);
+\draw[ln] (cmp)--(two);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:tdpa-philosophy} 建立“为什么要事后纠正”的动机；\cref{sec:tdpa-po,sec:tdpa-pc} 是核心——PO（无源性定义的离散实现）与 PC（恢复定义的最小干预），是任何读者的主干；\cref{sec:tdpa-ref} 的参考能量是工程透明度的关键旋钮；\cref{sec:tdpa-compare} 把 TDPA 放回与波变量并列的工程谱系，并给出工业上的双层组合。带 ZOH 截断误差分析（\cref{sec:tdpa-accuracy}）是理解“为何低频位控遥操作不适合 TDPA”的钥匙。
+
+\subsection*{前置知识桥接}
+本章承接 \cref{ch:teleop-wave}（波变量）：那里用散射变换把通信通道在\emph{常数}时延下变得天然无源——一种“事先预防”。但经典波变量有三处现实痛点：位置漂移、时变时延下无源性不再保证、波阻抗 $b$ 是固定参数无法自适应。TDPA 换一条路：不改信号表示，而是\emph{在线观测端口能量}，一旦检测到能量被凭空创生就注入自适应阻尼把它“消灭”。无源性、储能函数、端口功率这些地基由 \cref{ch:operational-space}（操作空间与阻抗）给出，本章只取遥操作所需的离散化与端口记账。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 在工程落地时你会发现：波变量是\emph{理论工具}，但真实网络（UDP/WiFi/5G）的抖动、突发丢包、ZOH 离散化、传感器噪声、控制器 bug 都可能凭空生成能量；没有一层\emph{运行时}的能量安全网，再漂亮的离线无源设计也可能在某次罕见事件中失稳。
+  \item 你会把 \cref{sec:os-discretization} 里“数字化破坏无源性”当成抽象告诫，而看不到它的运行时对策——本章正是把那条 \cref{eq:os-discrete-passive} 的静态裕度，升级成一个\emph{动态自适应}的能量账本。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与端口约定.}\;沿用本书能量端口记号：端口功率 $P=\mathbf f^\top\mathbf v$（与 \cref{eq:os-port-power} 一致），单端口标量情形 $P=fv$。机械臂动力学 $\mathbf M(\mathbf q)\ddot{\mathbf q}+\mathbf C(\mathbf q,\dot{\mathbf q})\dot{\mathbf q}+\mathbf g(\mathbf q)=\boldsymbol\tau$。采样周期记 $T_s$（典型 $1\,\mathrm{ms}$），离散步标记 $k$。\textbf{端口方向}：本章统一取\emph{输出端口}约定——$P=fv>0$ 表示被保护系统正\emph{向外}（向操作者/向环境）注入能量。许多源文献用\emph{输入端口}符号（$fv>0$ 为流入），二者只差端口力或速度取一个负号；只要 PO、PC、诊断三者用同一套方向即可。源讲义另用 $[F_h;-V_s]=H[V_m;F_e]$ 的二端口写法与 $f_v=(u^2-v^2)/2$ 的波-功率关系，本章不沿用其符号，统一回到 $P=fv$。\textbf{扰动方向}与全书一致取右扰动，但本章多在标量功率层面工作，几何扰动不显式出现。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{哲学：事后纠正 vs 事先预防}
+\label{sec:tdpa-philosophy}
+
+\paragraph{动机：通道无源还不够，端口也会“凭空生能”。}
+\cref{ch:teleop-wave} 用波变量把\emph{通信通道}在常数时延下做成无源——这是一种结构性保证。但稳定性的威胁不止来自通道：ZOH 把连续无源控制器变成等效有源元件（\cref{sec:os-discretization}）、力传感器噪声会注入虚假功率、从端控制器的 bug 会凭空生成能量、时变时延与丢包会破坏波变量赖以无源的前提。于是需要一种\emph{不依赖具体威胁来源}、只看“端口上有没有能量被创生”的运行时机制——这就是 TDPA。
+
+\paragraph{两种哲学的对照。}
+波变量与 TDPA 代表保证遥操作稳定的两条根本不同的路线。\cref{tab:tdpa-philosophy} 把它们并置。
+
+\begin{table}[H]\centering\small
+\caption{波变量（事先预防）与 TDPA（事后纠正）的哲学对照}
+\label{tab:tdpa-philosophy}
+\begin{tabular}{p{0.16\textwidth} p{0.36\textwidth} p{0.38\textwidth}}
+\toprule
+维度 & 波变量（\cref{ch:teleop-wave}） & TDPA（本章） \\
+\midrule
+策略 & 事先预防：改信号表示使通道天然无源 & 事后纠正：实时监测能量，异常时注入阻尼 \\
+对通信要求 & 必须在波域传输 & 任意域（力/速度/位置）均可 \\
+先验信息 & 需设定波阻抗 $b$ & 仅需实时 $(f,v)$ 测量 \\
+正常时透明度 & 持续的波阻抗粘滞感 & 零干预；异常时短暂阻尼脉冲 \\
+适用场景 & 常数/缓变时延 & 复杂时延/丢包/抖动下的\emph{端口}能量安全网 \\
+历史 & Anderson--Spong 1989 & Hannaford--Ryu 2002 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}
+波变量像\textbf{防火建筑}——用阻燃材料建造，使火灾根本无法发生，代价是日常使用受限（恒定粘滞）。TDPA 像\textbf{消防系统}——允许用普通材料建造，但装了烟雾报警（PO）和自动喷淋（PC），平时自由（零干预），灭火时才有短暂影响（阻尼脉冲）。二者并非互斥，工业系统常同时装。
+\end{insight}
+
+\paragraph{Hannaford--Ryu 的三条动机。}
+TDPA 的提出（Hannaford \& Ryu, 2002）针对波变量的三处不便：
+其一，波变量需要选 $b$，而最优 $b$ 依赖\emph{未知}的环境刚度，选不好就牺牲透明度；TDPA 不需要任何先验参数。
+其二，波变量在\emph{正常}操作（无延迟异常）时也带来粘滞感——“正常时不应付代价”；TDPA 正常时完全不介入。
+其三，真实网络的时延特性复杂（抖动、突发丢包），波变量的时变时延修复需要额外先验；TDPA 不显式建模时延曲线，而是按端口能量赤字介入。
+
+\paragraph{承诺与失效条件（务必内置）。}
+必须把 TDPA 的保证范围说清楚，否则极易误用：
+
+\begin{pitfall}[把 TDPA 当“万能稳定器”]
+TDPA \textbf{不是}“任意网络条件下无条件稳定”的替代品。它的严格承诺只有两条且都带前提：
+\begin{enumerate}
+  \item \textbf{只保证被监测端口的无源性}——未被测量的能量通道（如未纳入账本的 SEA 弹簧储能、未监测的从端局部环路）不在保证内；
+  \item \textbf{需要可耗散的执行接口}——PC 必须有权限修改力，或修改速度/位置/导纳参考来耗散能量。若控制器只有力命令接口而无速度/参考端口，就\emph{不能}严格实现并联 PC（见 \cref{sec:tdpa-dual}）。
+\end{enumerate}
+此外，执行器饱和、力测量不可靠都会让保证落空。正常操作时（PO 的能量预算未透支），PC 完全不介入；只有当被监测端口即将违反无源性时，PC 才注入最小必要耗散。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{TDPA 的数学本质：无源性定义的精确离散化}
+\label{sec:tdpa-essence}
+
+\paragraph{一句话本质。}
+TDPA 的全部数学内容可压缩成一句：\textbf{PO 是无源性定义的离散实现，PC 是使定义条件恢复成立的最小干预}。这条“定义 $\to$ 直接实现 $\to$ 最小干预”的范式，正是它普适性的来源——不依赖系统的具体模型，只依赖无源性的数学定义。
+
+\paragraph{从连续定义到离散观测器。}
+回顾端口无源性（\cref{ch:operational-space}）：以端口对 $(\mathbf u,\mathbf y)$ 为输入输出，系统无源当且仅当存在储能函数 $V(\mathbf x)\ge0$ 使
+\begin{equation}
+  V(\mathbf x(t))-V(\mathbf x(0))\le\int_0^t \mathbf u(\tau)^\top\mathbf y(\tau)\,\mathrm d\tau .
+  \label{eq:tdpa-passivity-def}
+\end{equation}
+在本章\emph{输出端口}约定下，$P=fv>0$ 表示向外输出能量，故“向外输出的累计能量不能超过初始储能”写成
+\begin{equation}
+  \int_0^t f(\tau)v(\tau)\,\mathrm d\tau\le V(\mathbf x(0)).
+  \label{eq:tdpa-out-passive}
+\end{equation}
+离散化（采样和）：$\sum_{i=0}^{k} f(i)v(i)\,T_s\le V(\mathbf x(0))$。把初始储能 $V(\mathbf x(0))$ 并入观测器初值后，定义\emph{可用无源性能量预算}
+\begin{equation}
+  \boxed{\,E_{\rm obs}(k)=V(\mathbf x(0))-\sum_{i=0}^{k} f(i)v(i)\,T_s\,},\qquad
+  \text{无源}\iff E_{\rm obs}(k)\ge0 .
+  \label{eq:tdpa-Eobs-def}
+\end{equation}
+
+\begin{insight}
+关键认识：\cref{eq:tdpa-Eobs-def} 不是无源性的\emph{近似}或\emph{估计}，而是它在 ZOH 条件下的\textbf{精确离散化}。没有线性化、没有小信号假设，因此对\emph{非线性}系统同样有效。这与 \cref{eq:os-discrete-passive}（Colgate--Schenkel 给出的虚拟墙\emph{静态}无源裕度）互补：那条是“为了无源，刚度上限是多少”的设计式；本章是“运行时能量账本”的监测式。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{无源性观测器（Passivity Observer）}
+\label{sec:tdpa-po}
+
+\subsection{离散时间能量观测器}
+\label{sec:tdpa-po-update}
+
+把 \cref{eq:tdpa-Eobs-def} 写成递推（设零初始储能 $V(\mathbf x(0))=0$，或并入 $E_{\rm obs}(0)$）：
+
+\begin{definition}[无源性观测器]\label{def:tdpa-po}
+在输出端口约定下，PO 的离散更新与被动条件为
+\begin{equation}
+  E_{\rm obs}(k)=E_{\rm obs}(k-1)-f(k)\,v(k)\,T_s,\qquad E_{\rm obs}(0)=0,
+  \label{eq:tdpa-po-update}
+\end{equation}
+\begin{equation}
+  \text{被动}\iff E_{\rm obs}(k)\ge0,\quad\forall k.
+  \label{eq:tdpa-po-passive}
+\end{equation}
+其中 $f(k)$ 为端口力、$v(k)$ 为端口速度。每个控制周期从预算里扣除向外输出的能量 $f(k)v(k)T_s$。
+\end{definition}
+
+\noindent\cref{tab:tdpa-po-states} 给出 $E_{\rm obs}$ 三种状态的物理含义。
+
+\begin{table}[H]\centering\small
+\caption{PO 状态的物理含义（输出端口约定）}
+\label{tab:tdpa-po-states}
+\begin{tabular}{p{0.20\textwidth} p{0.34\textwidth} p{0.36\textwidth}}
+\toprule
+$E_{\rm obs}$ 状态 & 含义 & 系统行为 \\
+\midrule
+$E_{\rm obs}>0$ & 预算仍有余量 & 被动——尚未透支可用能量 \\
+$E_{\rm obs}=0$ & 输出能量刚好用完预算 & 边界——不能再无代价向外输出 \\
+$E_{\rm obs}<0$ & 向外输出超过预算 & \textbf{违反被动性——凭空创生了能量！} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{符号方向的统一.}\;若实现采用\emph{输入端口}被动符号（$fv>0$ 表示能量\emph{流入}被保护系统），只需把端口力或速度取反，等价地用 $E_{\rm obs}(k)=E_{\rm obs}(k-1)+f(k)v(k)T_s$。要害是 PO、PC 与诊断必须共用同一套端口方向——否则 $E_{\rm obs}$ 方向反转，PC 会在\emph{不该介入时}介入。
+\end{note}
+
+\begin{pitfall}[误把累积量当瞬时量]
+新手常想：“$E_{\rm obs}$ 越来越大 $\Rightarrow$ 系统在无限累积能量 $\Rightarrow$ 要爆炸”。错。只要操作者持续输入能量（移动 master），$E_{\rm obs}$ 增大是\emph{正常}的——它是累积\emph{预算}，不是瞬时功率。只有 $E_{\rm obs}<0$ 才说明预算被透支。反过来，自由空间快速移动 master 时若 $E_{\rm obs}$ 持续向\emph{负}方向漂移，几乎一定是力/速度的符号约定弄反了——这是最常见的接线级错误，可用“自由空间扫一遍、看 $E_{\rm obs}$ 是否单调下负”自检。
+\end{pitfall}
+
+\subsection{多端口放置策略}
+\label{sec:tdpa-po-placement}
+
+把 PO 放在哪里，决定了能检测到哪些异常。常见三种方案：每个端口独立 PO（master、slave 各一）、通信通道两端 PO（专测延迟/丢包引起的能量不守恒）、系统级单个 PO（全局监测 $f_m v_m+f_s v_s$）。
+
+\begin{insight}
+\textbf{为何两端都要放 PO（反事实推理）.}\;若只在 master 端放 PO、slave 端不放，则 slave 控制器自身 bug 在 slave 端\emph{局部}创生的能量，要经过通信延迟 $T$ 才能传到 master 端的 PO。在 $T=100\,\mathrm{ms}$ 的系统里，slave 端的不稳定足以在这 $100\,\mathrm{ms}$ 内发展到破坏性程度。故\textbf{两端独立监测、两端独立控制}（方案 A）是工业最佳实践。多操作者共控同一从端时，还需在从端加一个\emph{全局} PO 监测合力功率 $\sum_i f_i v_i$——因为两条链路的“合力振荡”可能被单链路 PO 漏掉（详见 \cref{sec:tdpa-frontier}）。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{PO 的离散化精度与采样率下界}
+\label{sec:tdpa-accuracy}
+
+\paragraph{为何要算这笔误差。}
+\cref{eq:tdpa-po-update} 用的是矩形积分（ZOH）。在严格 ZOH 假设下（$f,v$ 在采样间隔内恒定）它是\emph{精确}的；但真实信号在一个周期内会变化，于是出现局部截断误差。这笔误差有多大，直接决定 PO 是“安全保护器”还是“随机阻尼器”。
+
+\begin{derivation}[PO 的局部截断误差]
+真实的连续功率积分为 $\int_{kT_s}^{(k+1)T_s} f(t)v(t)\,\mathrm dt$，ZOH 近似为 $f[k]v[k]\,T_s$。两者之差
+\begin{equation}
+  \varepsilon_k=\int_{kT_s}^{(k+1)T_s}\!\big[f(t)v(t)-f[k]v[k]\big]\,\mathrm dt .
+  \label{eq:tdpa-trunc}
+\end{equation}
+记功率 $P(t)=f(t)v(t)$。在 $[kT_s,(k{+}1)T_s)$ 内做一阶 Taylor 展开 $P(t)\approx P[k]+\dot P[k](t-kT_s)$，代入得 $\varepsilon_k\approx\dot P[k]\cdot\tfrac12 T_s^2$，故有界
+\begin{equation}
+  \boxed{\,|\varepsilon_k|\le\tfrac12\,|\dot P|_{\max}\,T_s^2\,},\qquad \dot P=\dot f\,v+f\,\dot v .
+  \label{eq:tdpa-trunc-bound}
+\end{equation}
+误差正比于功率变化率 $|\dot P|_{\max}$ 与采样周期的\emph{平方}。
+\end{derivation}
+
+\paragraph{典型数值：硬墙碰撞。}
+设硬墙碰撞时力在 $5\,\mathrm{ms}$ 内从 $0$ 冲到 $50\,\mathrm{N}$、速度同期从 $0.1\,\mathrm{m/s}$ 降到 $0$，则功率变化率量级
+\begin{equation}
+  |\dot P|_{\max}\approx\frac{50\times0.1}{0.005}=1000\ \mathrm{W/s}.
+  \label{eq:tdpa-Pdot-example}
+\end{equation}
+在 $1\,\mathrm{kHz}$（$T_s=1\,\mathrm{ms}$）下，$|\varepsilon_k|\le\tfrac12\times1000\times10^{-6}=5\times10^{-4}\,\mathrm{J/step}$；碰撞持续 $100\,\mathrm{ms}$（$100$ 步）累积约 $0.05\,\mathrm J$——与典型 $E_{\rm margin}$（$0.01$–$0.1\,\mathrm J$）同量级，可接受。
+在 $50\,\mathrm{Hz}$（$T_s=20\,\mathrm{ms}$）下，$|\varepsilon_k|\le\tfrac12\times1000\times4\times10^{-4}=0.2\,\mathrm{J/step}$；$5$ 步累积约 $1.0\,\mathrm J$——\textbf{远超} $E_{\rm margin}$。
+
+\begin{insight}
+\textbf{ALOHA 为何不适合 TDPA（深层原因）.}\;PO 的有效性本质上取决于信噪比 $E_{\rm margin}/\varepsilon_{\rm cumulative}$。若采样误差的累积量超过 $E_{\rm margin}$，PO 的判断就被噪声淹没——它无法区分“真实能量创生”和“采样误差”，PC 退化成\emph{随机阻尼器}而非安全保护器。所以 $50\,\mathrm{Hz}$ 位控遥操作（如 ALOHA）不适合 TDPA，\textbf{不是}因为“$50\,\mathrm{Hz}$ 太慢”这种笼统说法，而是因为采样误差使 PO 失去了信噪比。叠加上 ALOHA 无 F/T 传感器、只能从电流估力（噪声大），结论更稳固：低频位控遥操作应走学习方法而非力反馈无源理论。
+\end{insight}
+
+\paragraph{采样率下界。}
+要求“一次接触全程的累积截断误差不超过 $E_{\rm margin}$”，即 $N_{\rm contact}\cdot\tfrac12|\dot P|_{\max}T_s^2\le E_{\rm margin}$，其中 $N_{\rm contact}=T_{\rm contact}/T_s$。代入 $f_{\rm sample}=1/T_s$ 整理得
+\begin{equation}
+  f_{\rm sample}\ \ge\ \frac{|\dot P|_{\max}}{\,2\,E_{\rm margin}/T_{\rm contact}\,}.
+  \label{eq:tdpa-fsample-bound}
+\end{equation}
+对典型工业遥操作（$|\dot P|_{\max}=1000\,\mathrm{W/s}$、$E_{\rm margin}=0.01\,\mathrm J$、$T_{\rm contact}=0.1\,\mathrm s$），下界 $f_{\rm sample}\ge\dfrac{1000}{2\times0.01/0.1}=5000\,\mathrm{Hz}$。实践中把 $E_{\rm margin}$ 放宽到 $0.01$–$0.05\,\mathrm J$ 时 $1\,\mathrm{kHz}$ 通常够用，但 $50\,\mathrm{Hz}$ 在硬接触下确实不足。\pz{存疑：\cref{eq:tdpa-fsample-bound} 是按“累积误差 $\le E_{\rm margin}$”的工程量纲估计，非源文献中的正式定理；源 md 给出此式与 $5000\,\mathrm{Hz}$ 数值，作为量级判据使用，精确常数待联网核对是否有标准出处。}
+
+% ════════════════════════════════════════════════════════════════
+\section{无源性控制器（Passivity Controller）}
+\label{sec:tdpa-pc}
+
+\subsection{串联 PC 的最小阻尼推导}
+\label{sec:tdpa-pc-series}
+
+当 PO 检测到 $E_{\rm obs}(k)<0$（能量被创生），PC 注入阻尼把多余能量耗散掉。\emph{串联} PC 在力上叠加一个与速度反向的阻尼力：
+\begin{equation}
+  f_{\rm out}(k)=f(k)-\alpha(k)\,v(k),\qquad \alpha(k)\ge0 .
+  \label{eq:tdpa-pc-series-law}
+\end{equation}
+负号来自端口约定：$fv$ 是向外输出功率，阻尼力须与速度反向才能\emph{减少}向外输出。其耗散功率 $P_{\rm diss}=\alpha v^2\ge0$ 始终非负（$\alpha\ge0$ 且 $v^2\ge0$）——它\emph{只会耗能、不会生能}，故附加项本身无源。
+
+\begin{derivation}[串联最小阻尼 $\alpha$]
+\textbf{Step 1（修正后端口功率）.}\;
+\[
+  P_{\rm out}^{\rm corr}(k)=f_{\rm out}(k)\,v(k)=[f(k)-\alpha(k)v(k)]\,v(k)=f(k)v(k)-\alpha(k)v(k)^2 .
+\]
+\textbf{Step 2（修正后 PO）.}\;代入 \cref{eq:tdpa-po-update} 形式，
+\[
+  E_{\rm obs}^{\rm corr}(k)=E_{\rm obs}(k-1)-\big[f(k)v(k)-\alpha(k)v(k)^2\big]T_s
+  =E_{\rm obs}(k)+\alpha(k)v(k)^2T_s,
+\]
+末式用到未修正递推 $E_{\rm obs}(k)=E_{\rm obs}(k-1)-f(k)v(k)T_s$。
+\textbf{Step 3（最小阻尼原则）.}\;令修正后能量\emph{恰好}归零 $E_{\rm obs}^{\rm corr}(k)=0$，解出
+\begin{equation}
+  \boxed{\;\alpha(k)=\dfrac{-E_{\rm obs}(k)}{v(k)^2\,T_s}\quad(E_{\rm obs}(k)<0)\;},\qquad
+  \alpha(k)=0\quad(E_{\rm obs}(k)\ge0).
+  \label{eq:tdpa-alpha}
+\end{equation}
+\end{derivation}
+
+\begin{insight}
+\textbf{为什么是“最小”阻尼.}\;令 $E_{\rm obs}^{\rm corr}=0$ 而非 $>0$，意味着 PC 只耗散\emph{恰好等于能量赤字}的能量——不多不少。若令 $E_{\rm obs}^{\rm corr}=E_{+}>0$，则 $\alpha$ 更大，引入不必要的阻尼、降低透明度。$E_{\rm obs}\ge0$ 时 $\alpha=0$ 完全不介入——这就是“零干预透明度”的数学来源。
+\end{insight}
+
+\subsection{串联与并联的物理直觉}
+\label{sec:tdpa-pc-intuition}
+
+\paragraph{串联（$\alpha$）= 给轮子刹车。}
+想象操作者推一辆购物车：正常时车自由滑动（零干预）；PO 报警时，串联 PC 等效于在车轮上施加刹车——阻尼力与速度反向，\emph{减慢运动}以耗散多余能量。它适合\emph{运动状态}：有速度时阻尼才耗得动能量。
+
+\paragraph{并联（$\beta$）= 让墙退让。}
+当车被推到墙上（$v\approx0$ 但 $f$ 很大），轮刹车失效（$\alpha v^2\approx0$，耗不动能量）。此时需要对偶策略——并联 PC 等效于\emph{让墙稍微退让}（修改速度/导纳参考），使力与（被修改的）速度产生功率耗散：
+\begin{equation}
+  v_{\rm out}(k)=v(k)-\beta(k)\,f(k).
+  \label{eq:tdpa-pc-parallel-law}
+\end{equation}
+
+\begin{insight}
+\textbf{电路对偶.}\;串联/并联 PC 恰如电路里串联/并联电阻。串联电阻在有\emph{电流}时才耗能（$P=I^2R$），对应串联 PC 在有\emph{速度}时耗能（$P=\alpha v^2$）；并联电阻（与电压源并联）在有\emph{电压}时才耗能（$P=V^2/R$），对应并联 PC 在有\emph{力}时耗能（$P=\beta f^2$）。两者是功率耗散的两种对偶形式。
+\end{insight}
+
+\subsection{并联 PC、对偶切换与零速发散保护}
+\label{sec:tdpa-dual}
+
+\paragraph{并联最小阻尼。}
+对 \cref{eq:tdpa-pc-parallel-law} 重复 \cref{sec:tdpa-pc-series} 的三步（这次令修正速度产生的耗散 $\beta f^2 T_s$ 抵消赤字），得对偶公式
+\begin{equation}
+  \beta(k)=\dfrac{-E_{\rm obs}(k)}{f(k)^2\,T_s}\quad(E_{\rm obs}(k)<0),\qquad
+  E_{\rm pc}=\beta f^2 T_s .
+  \label{eq:tdpa-beta}
+\end{equation}
+
+\paragraph{零速发散与对偶切换。}
+观察 \cref{eq:tdpa-alpha}：当 $v\to0$（硬墙挤压），$\alpha=-E_{\rm obs}/(v^2T_s)\to\infty$——\emph{阻尼发散}。对偶地，\cref{eq:tdpa-beta} 在 $f\to0$（自由空间）时 $\beta\to\infty$。两者都会发散，但\emph{在不同操作条件下}——这恰好给出互补的切换策略（\cref{tab:tdpa-switch}）。
+
+\begin{table}[H]\centering\small
+\caption{串联/并联 PC 的对偶切换（按操作状态）}
+\label{tab:tdpa-switch}
+\begin{tabular}{p{0.18\textwidth} p{0.14\textwidth} p{0.14\textwidth} p{0.14\textwidth} p{0.24\textwidth}}
+\toprule
+操作状态 & 速度 $v$ & 力 $f$ & 应使用 & 理由 \\
+\midrule
+自由运动 & 大 & $\approx0$ & 串联 $\alpha$ & $\alpha=-E/(v^2T_s)$ 有限 \\
+硬墙挤压 & $\approx0$ & 大 & 并联 $\beta$ & $\beta=-E/(f^2T_s)$ 有限 \\
+过渡区 & 中 & 中 & 任一 & 两者皆有限 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+工程实现按速度阈值 $v_{\rm thresh}$ 切换：$|v|>v_{\rm thresh}$ 用串联，否则用并联；典型 $v_{\rm thresh}\in[0.005,0.05]\,\mathrm{m/s}$（太大→过早切并联、牺牲力精度；太小→串联 $\alpha$ 过大）。零速且零力时两者皆不介入（避免数值问题）。实现上还须加双保险：分母加 $\varepsilon$（如 $10^{-10}$）防除零，并对 $\alpha,\beta$ 限幅。
+
+\begin{pitfall}[低速大力硬接触：别硬用串联，且并联!=在力上加补偿]
+硬墙、夹紧、插孔卡住这类场景常见 $|v|\approx0$ 但 $|f|$ 很大。继续用串联会得到很大的 $\alpha$，表现为力反馈“锁死”或瞬时力突变。正确做法是切到并联 PC，用 $\beta$ 修改\emph{速度/导纳参考}。两点务必记牢：
+\begin{enumerate}
+  \item 并联 PC 不是“在力上再加一个补偿项”，而是修改\emph{速度侧}的量；
+  \item 若当前控制器只有\emph{力命令}接口、没有速度/位置/导纳参考端口，就\textbf{不能}严格实现并联 PC——此时应把 TDPA 放到拥有速度/参考输出的层，或在架构上改成能量罐/导纳外环（呼应 \cref{thm:os-energytank}）。这正是“需可耗散执行接口”这条失效边界的具体体现。
+\end{enumerate}
+\end{pitfall}
+
+\begin{pitfall}[PO/PC 更新顺序与 $\alpha_{\max}$ 不是越大越好]
+两个高频实现错误。其一，\textbf{顺序}：必须先用\emph{原始} $f,v$ 更新 $E_{\rm obs}$、再基于（可能为负的）$E_{\rm obs}$ 算 $\alpha$、输出 $f-\alpha v$、最后用耗散量 $\alpha v^2T_s$（并联时 $\beta f^2T_s$）补偿 $E_{\rm obs}$；若先把耗散并进 $E_{\rm obs}$ 再算 $\alpha$，因果颠倒会导致过度或不足介入。其二，\textbf{$\alpha_{\max}$ 过大}并不更安全：$f_{\rm out}=f-1000\,v$ 这样的大阻尼会让操作者突感反向“拽力”，不仅不适，还可能惊吓松手而\emph{更}不安全。$\alpha_{\max}$ 应限在操作者可接受的力范围内，典型 $50$–$500\,\mathrm{N\cdot s/m}$（取决于 master 惯量）。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{参考能量跟踪（Ryu 2005）}
+\label{sec:tdpa-ref}
+
+\paragraph{问题：正常波动也会触发 PC。}
+即便有串/并联切换，严格的 $E_{\rm obs}\ge0$ 仍会把\emph{无害}的能量波动当异常处理：正常缓慢操作中 $f\cdot v$ 的自然波动可能使 $E_{\rm obs}$ 暂时小幅变负——这不是真正的能量创生，但严格判据会让 PC 频繁介入，破坏透明度。Ryu 等（2005）的参考能量跟踪给 $E_{\rm obs}$ 留出一条可短暂下探的下界。
+
+\begin{algo}[参考能量跟踪 PC]\label{algo:tdpa-ref}
+每个采样步执行：
+\begin{enumerate}
+  \item \textbf{PO 更新}：$E_{\rm obs}(k)=E_{\rm obs}(k-1)-f(k)v(k)T_s$。
+  \item \textbf{自适应能量余量}：$E_{\rm margin}(k)=E_{\rm margin}^{0}+\gamma\,\bar P(k)\,T_{\rm window}$，其中 $\bar P(k)=\tfrac1N\sum_{i=k-N}^{k}|f(i)v(i)|$ 为近 $N$ 步平均绝对功率，$\gamma$ 为安全系数（典型 $0.1$–$0.5$）。
+  \item \textbf{参考边界}：$E_{\rm ref}(k)=-E_{\rm margin}(k)$。
+  \item \textbf{偏差}：$\Delta E(k)=\min\{0,\;E_{\rm obs}(k)-E_{\rm ref}(k)\}$。
+  \item \textbf{PC（仅 $\Delta E<0$ 时）}：按 \cref{tab:tdpa-switch} 切换，$\alpha=\dfrac{-\Delta E}{v^2T_s+\varepsilon}$ 或 $\beta=\dfrac{-\Delta E}{f^2T_s+\varepsilon}$（各自限幅），输出修正力/速度。
+  \item \textbf{能量记账}：$E_{\rm obs}\mathrel{+}=(\alpha v^2+\beta f^2)T_s$（把 PC 耗散归还预算）。
+\end{enumerate}
+\end{algo}
+
+\begin{pitfall}[别令 $E_{\rm ref}=E_{\rm obs}+E_{\rm margin}$]
+一个看似自然却错误的写法是 $E_{\rm ref}(k)=E_{\rm obs}(k)+E_{\rm margin}$。这样 $\Delta E=E_{\rm obs}-E_{\rm ref}=-E_{\rm margin}$ 会\emph{恒为负}，PC 将\emph{持续}介入，彻底失去“正常时零干预”的初衷。稳妥的工程简化是把允许透支的边界设为\emph{独立}阈值 $E_{\rm ref}=-E_{\rm margin}$（\cref{algo:tdpa-ref} 第 3 步）——只有 $E_{\rm obs}$ 跌破该下界时 PC 才耗散透支部分。
+\end{pitfall}
+
+\paragraph{$E_{\rm margin}$ 是透明度–安全旋钮。}
+\cref{tab:tdpa-margin} 把它的取值谱列清。物理含义是：剧烈操作（高功率）时允许更大的能量波动，安静操作（低功率）时收紧容忍——这正是第 2 步自适应的意义。
+
+\begin{table}[H]\centering\small
+\caption{$E_{\rm margin}$ 的取值谱：透明度与安全的折中旋钮}
+\label{tab:tdpa-margin}
+\begin{tabular}{p{0.16\textwidth} p{0.40\textwidth} p{0.34\textwidth}}
+\toprule
+$E_{\rm margin}$ & 效果 & 适用场景 \\
+\midrule
+$0$ & 退化为标准 TDPA（最严格、最安全） & 安全关键（手术机器人） \\
+$0.01\,\mathrm J$ & 允许微小波动 & 一般遥操作 \\
+$0.1\,\mathrm J$ & 允许较大波动 & 高透明度需求 \\
+$1.0\,\mathrm J$ & 几乎不介入 & 非安全关键 \\
+自适应 & 随操作强度比例缩放 & 推荐——兼顾安全与透明 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}
+$E_{\rm margin}$ 本质上是\textbf{透明度–安全性的旋钮}：$E_{\rm margin}=0$ 最安全但最不透明（任何波动都被消灭）；$E_{\rm margin}$ 越大越透明但越不安全（允许更大波动）。Ryu 等 (2005) 的自适应方案是工程最优——让旋钮按操作状态自动调节。后续改进（去抖的自适应参考、降保守性的能量反射、自适应能量参考）沿同一思路深化：去抖见 Choi--Balachandran--Ryu 的 Chattering-Free TDPA（IEEE T-Haptics, 2022，引入非零速度阈值在其内缩放阻尼以抑制高频颤振）；降保守性见 Ryu 组「考虑能量反射」的 TDPA 系列（Mechatronics 2019 起，及其 6-DoF 实现）；自适应能量参考见 Adaptive Energy Reference TDPA（IEEE T-Haptics, 2023）。\pz{存疑：上述「去抖/降保守性/自适应参考」三条方向已联网核实为真实文献（Chattering-Free 2022、Energy-Reflection 2019、Adaptive Energy Reference 2023 均经检索确认）；但源 md 另列的「Task-Aware Energy Margin 2020」未能在公开文献中定位到匹配的标题/年份，存疑保留——可能为对某篇任务自适应工作的不准确转述。}
+\end{insight}
+
+\begin{pitfall}[“TDPA 只在延迟场景下有用”是误解]
+新手想法：“没有延迟 $\Rightarrow$ 不需要 TDPA”。实则 TDPA 对若干\emph{非延迟}能量创生源同样有用：ZOH 离散化破坏被动性（\cref{sec:os-discretization}）时它是最后安全网；传感器噪声注入虚假能量时 PO 检测、PC 消除；控制器 bug 导致意外生能时它防失控。正确理解：TDPA 是\emph{系统级安全层}，不仅是延迟补偿工具。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{TDPA vs 波变量与双层架构}
+\label{sec:tdpa-compare}
+
+\subsection{工程失真特征对比}
+\label{sec:tdpa-compare-distortion}
+
+波变量与 TDPA 在“正常”与“异常”时的失真特征完全不同，这是工程选型的关键。波变量在\emph{所有时刻}都引入波阻抗粘滞——即便系统完全正常，操作者也感到额外阻尼 $B_{\rm eff}=bT$（自由空间）或刚度下降 $K_{\rm eff}=b/T$（硬接触）；这种失真\emph{连续、可预测}，操作者几分钟内即可适应补偿。TDPA 正常时\emph{完全不介入}（零失真），只有 $E_{\rm obs}$ 跌破 $E_{\rm ref}$ 时 PC 注入阻尼，失真表现为短暂“阻尼脉冲”；这种失真\emph{间歇、不可预测}，可能在精密操作的关键时刻突然来一下“拽力”。\cref{tab:tdpa-vs-wave} 汇总两者的工程优劣。
+
+\begin{table}[H]\centering\small
+\caption{TDPA 与波变量的系统性工程对比}
+\label{tab:tdpa-vs-wave}
+\begin{tabular}{p{0.20\textwidth} p{0.34\textwidth} p{0.36\textwidth}}
+\toprule
+特性 & 波变量（\cref{ch:teleop-wave}） & TDPA（本章） \\
+\midrule
+无源保证 & 常数时延严格；时变需修正 & 被监测端口严格；复杂时延/丢包/抖动靠 PO/PC 在线耗散，失效条件须显式检查 \\
+先验信息 & 需设 $b$（波阻抗） & 仅需 $(f,v)$ 实时测量 \\
+正常时透明度 & 中（持续粘滞感） & 高（零干预） \\
+失真模式 & 波反射振铃（连续性失真） & 偶发阻尼脉冲（离散性失真） \\
+实现复杂度 & 中（变换+反变换+wave integral） & 低（累加+比较+乘法） \\
+位置漂移 & 有（需 wave integral 修复） & 无（可直接传位置） \\
+对传感器要求 & 力+速度 & 力+速度（相同） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}
+\textbf{两种失真的同构.}\;反事实地想：若让波变量\emph{只}在检测到异常时才引入粘滞（平时零粘滞），它就变成了 TDPA；若让 TDPA 一直保持恒定阻尼（不切换），它就变成了波变量。二者差异本质上是“持续小失真”vs“间歇大失真”的权衡——与控制理论里“持续正则化”vs“事件触发正则化”同构。
+\end{insight}
+
+\subsection{双层架构：结构性无源 + 运行时安全网}
+\label{sec:tdpa-twolayer}
+
+\paragraph{它们互补，而非竞争。}
+波变量与 TDPA 不是互斥方案。\textbf{波变量提供结构性的无源性保证（通信通道），TDPA 提供运行时的端口能量安全网}。工业系统常组合使用：master/slave 之间走波变量编解码（结构性保证通道无源），同时在两端各放 PO/PC 作运行时监测，捕获被监测端口上的能量异常并通过可用接口耗散。\cref{fig:tdpa-twolayer} 画出这一组合。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, font=\small, node distance=6mm,
+  box/.style={draw, rounded corners, align=center, inner sep=4pt, minimum height=8mm},
+  wave/.style={box, fill=second!8, draw=second!60!black},
+  tdpa/.style={box, fill=main!8, draw=main!60!black},
+  ln/.style={->, thick, gray!55!black}]
+\node[box, fill=gray!8] (m) {Master};
+\node[wave, right=10mm of m] (enc) {波编码};
+\node[wave, right=8mm of enc] (ch) {延迟通道\\（UDP）};
+\node[wave, right=8mm of ch] (dec) {波解码};
+\node[box, fill=gray!8, right=10mm of dec] (s) {Slave};
+\draw[ln] (m)--(enc); \draw[ln] (enc)--(ch); \draw[ln] (ch)--(dec); \draw[ln] (dec)--(s);
+% TDPA safety layer underneath
+\node[tdpa, below=10mm of ch, minimum width=70mm] (safety)
+  {TDPA 安全层：\;PO/PC(master)\; + \;PO/PC(slave)\; + 参考能量跟踪};
+\draw[ln, dashed] (m.south) |- (safety.west);
+\draw[ln, dashed] (s.south) |- (safety.east);
+\node[align=center, font=\footnotesize, text=second!60!black, below=1mm of enc] {结构性：通道无源};
+\node[align=center, font=\footnotesize, text=main!60!black, below=1mm of safety] {运行时：捕获端口能量异常，经可用接口耗散};
+\end{tikzpicture}
+\caption{双层遥操作架构。波变量层（上）在常数时延下结构性地保证通信通道无源；TDPA 安全层（下）在两端独立监测端口能量，在被监测端口将违反无源性时注入最小耗散。二者独立工作、互为备份——类比飞机的“自动驾驶（结构性安全）+ 飞行包线保护（运行时安全网）”。}
+\label{fig:tdpa-twolayer}
+\end{figure}
+
+\paragraph{与能量罐的关系。}
+本书在 \cref{thm:os-energytank}（Ferraguti--Secchi 能量罐）已给出“双层”思想的另一种实例：上层控制律自由设计、下层用一个虚拟能量罐保证罐余额不为负。TDPA 的 PC 与能量罐是同一类“运行时无源保障”的两种形态——PC 按能量赤字注入阻尼，能量罐按罐余额缩放输出。Franken 等（2011）正是把 TDPA 思想做成显式的双层能量罐架构：上层透明、下层无源。
+
+\begin{insight}
+\textbf{能量罐的精髓（呼应 \cref{thm:os-energytank}）.}\;把能量守恒从\emph{全局}性质（“系统总能量不增”，难工程化）变成\emph{局部}账本（“罐余额不为负”，可用简单 if--else 实现）。TDPA 的 PO 也是同一哲学：把无源性这一全局积分不等式 \cref{eq:tdpa-passivity-def}，变成一个逐步可查的能量预算 $E_{\rm obs}\ge0$。这就是为什么这两套机制都能在不知道系统全部内部状态的前提下，保护选定端口的能量安全。
+\end{insight}
+
+\subsection{前沿方向（理论层面）}
+\label{sec:tdpa-frontier}
+
+TDPA 的核心理念——在线能量监测 + 自适应阻尼注入——是一种\emph{端口级}安全机制，不关心端口背后是什么系统，只关心端口上的功率流。这种\textbf{端口抽象}使其可推广到诸多“存在能量创生风险、且端口变量可测、输出可耗散”的场景：网络化多机器人、VR/AR 触觉渲染（计算延迟+ZOH 可能违反被动性）、人机协作（导纳控制器数值问题）、柔性关节（SEA）、模型中介遥操作（模型与真实环境不一致引起的能量脉冲）、以及 AI 辅助遥操作中作为策略输出的能量约束（允许短暂大力、禁止持续生能）。
+
+\begin{pitfall}[把 RL/主动系统直接塞进 PO 是危险的]
+PO 的全部意义建立在“被动系统的能量账本”之上。当回路里有\emph{主动}成分（如 RL 策略主动注入能量）时，$E_{\rm obs}<0$ 不再单纯意味着“故障”——主动系统本就可能合法地向外输出能量。此时需要超越纯无源性的稳定性框架（如输入-状态稳定 ISS、Lyapunov+RL）。把 PO 直接套在主动策略上、并据此频繁触发 PC，会把正常的主动行为误判为异常。柔性关节（SEA）同理：必须把弹簧储能纳入能量账本，否则 PO 会漏掉内部能量交换。多边/$N$-port TDPA 与「全局 PO 监测合力功率」方向已联网核实：DLR 的 Panzirsch 等长期研究多边遥操作的时域无源性（含可测力反馈的多边 TDPA、点对点三边无源控制、共享控制；其多边遥操作博士论文 2018），是该方向的代表性工作。\pz{存疑：上述「主动系统需超越纯无源性（ISS/Lyapunov+RL）」「SEA 须纳入弹簧储能」属方法论判断，方向可信；具体推广场景（VR 触觉/pHRI/模型中介/AI 辅助）的逐项落地文献未一一核验，按综述性陈述保留。}
+\end{pitfall}
+
+\paragraph{N-port 多边遥操作（要点）。}
+把 TDPA 扩展到 $N$ 个端口（$M$ 操作者 + $R$ 机器人）时，能量可在多条链路上流动，记账复杂度上升。每条链路两端各一对 PO/PC；当某条链路 PC 介入时，控制输出只作用在该链路，但机械结构与任务约束仍可能把力/速度耦合过去，故工程上还须监控全身能量与跨链路约束力。一个关键的多操作者难题：两人共控同一从端、指令冲突时，合力在从端相互抵消，\emph{单条}链路的 PO 各自看到的却是“能量输入”——若合力引起振荡，单链路 PO 可能漏检。对策是在从端加\emph{全局} PO 监测总端口功率 $\sum_i f_i v_i$。这印证了 \cref{sec:tdpa-po-placement} 的“每端口独立 PO + 全局 PO”建议。
+
+% ════════════════════════════════════════════════════════════════
+\section{本章小结}
+\label{sec:tdpa-summary}
+
+\cref{tab:tdpa-summary} 汇总本章核心结论。
+
+\begin{table}[H]\centering\small
+\caption{本章核心结论速查}
+\label{tab:tdpa-summary}
+\begin{tabular}{p{0.20\textwidth} p{0.56\textwidth} p{0.10\textwidth}}
+\toprule
+知识点 & 核心结论 & 难度 \\
+\midrule
+TDPA 哲学 & 事后纠正：正常时零干预、异常时最小阻尼；只保证被监测端口、需可耗散接口 & $\star\star$ \\
+数学本质 & PO 是无源性定义 \cref{eq:tdpa-passivity-def} 的精确 ZOH 离散化，非近似 & $\star\star\star$ \\
+PO & $E_{\rm obs}(k)=E_{\rm obs}(k-1)-fvT_s$；$<0$ 即透支异常（\cref{def:tdpa-po}） & $\star\star$ \\
+离散精度 & $|\varepsilon_k|\le\tfrac12|\dot P|_{\max}T_s^2$；$50\,\mathrm{Hz}$ 硬接触下 PO 信噪比失效 & $\star\star\star$ \\
+串联 PC & $\alpha=-E_{\rm obs}/(v^2T_s)$，$f_{\rm out}=f-\alpha v$（最小阻尼，\cref{eq:tdpa-alpha}） & $\star\star\star$ \\
+并联 PC & $\beta=-E_{\rm obs}/(f^2T_s)$，$v_{\rm out}=v-\beta f$（对偶，\cref{eq:tdpa-beta}） & $\star\star\star$ \\
+对偶切换 & $|v|>v_{\rm thresh}$ 用串联、否则并联；零速发散保护 & $\star\star$ \\
+参考能量 & $E_{\rm ref}=-E_{\rm margin}$ 留波动余量；$E_{\rm margin}$ 是透明度–安全旋钮 & $\star\star\star$ \\
+vs 波变量 & 持续粘滞 vs 间歇脉冲；互补，工业组合使用 & $\star\star$ \\
+双层架构 & 波变量结构性无源 + TDPA 运行时安全网（类比 \cref{thm:os-energytank}） & $\star\star\star$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item \textbf{（PO 实现与触发）}\;给定 1-DOF 遥操作数据 $(f(t),v(t))$，按 \cref{eq:tdpa-po-update} 计算 $E_{\rm obs}(k)$。在什么操作下 $E_{\rm obs}$ 会变负？（提示：在通道里加入延迟。）若系统有初始弹簧储能 $V(0)=\tfrac12Kx_0^2>0$，而 PO 初始化为 $E_{\rm obs}(0)=0$，会导致何种误判？
+  \item \textbf{（最小阻尼）}\;自行重推 \cref{eq:tdpa-alpha}：从 $f_{\rm out}=f-\alpha v$ 出发，要求修正后 $E_{\rm obs}^{\rm corr}(k)=0$，解出 $\alpha$。再对并联情形 \cref{eq:tdpa-pc-parallel-law} 推出 \cref{eq:tdpa-beta}。说明为何令 $E_{\rm obs}^{\rm corr}>0$ 会降低透明度。
+  \item \textbf{（采样率下界）}\;取 $|\dot P|_{\max}=1000\,\mathrm{W/s}$、$E_{\rm margin}=0.01\,\mathrm J$、$T_{\rm contact}=0.1\,\mathrm s$，用 \cref{eq:tdpa-fsample-bound} 估采样率下界。再解释：为何同一硬墙在 $1\,\mathrm{kHz}$ 与 $50\,\mathrm{Hz}$ 下，PO 的“信噪比”相差一个量级以上？
+  \item \textbf{（对偶切换）}\;在 $|v|\approx0$、$|f|$ 很大的硬墙挤压下，若坚持用串联 PC 会发生什么？给出 $v_{\rm thresh}$ 的一个合理取值并说明上下界各自的代价。若控制器只有力命令接口，能否严格实现并联 PC？为什么？
+  \item \textbf{（参考能量）}\;比较 $E_{\rm margin}=0,\,0.01,\,0.1\,\mathrm J$ 三档：记录 PC 介入频率与透明度的变化趋势。再分析：把 $E_{\rm margin}$ 设得过大，系统最多能“借”多少能量而不致可感知的不稳定？（提示：人手对力变化的感知阈值约 $0.5\,\mathrm N$。）
+  \item \textbf{（双层综合）}\;设计一个遥操作安全架构：通信层用波变量（\cref{ch:teleop-wave}）、系统层用 TDPA、时延 $=50\,\mathrm{ms}$ 常数 $+\,10\,\mathrm{ms}$ 随机抖动 $+\,2\%$ 丢包。给出每层的参数选择及理由，并说明为何丢包对 TDPA 的影响远小于对波变量。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{符号表}
+\label{sec:tdpa-symbols}
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\textwidth} p{0.62\textwidth} p{0.12\textwidth}}
+\toprule
+符号 & 含义 & 单位 \\
+\midrule
+$P=fv$ & 端口功率（与 \cref{eq:os-port-power} 一致，输出端口约定 $P>0$ 为向外注入） & W \\
+$E_{\rm obs}(k)$ & 无源性观测器：可用无源性能量预算（\cref{def:tdpa-po}） & J \\
+$T_s$ & 采样周期（典型 $1\,\mathrm{ms}$） & s \\
+$\varepsilon_k$ & PO 局部截断误差（\cref{eq:tdpa-trunc-bound}） & J \\
+$\dot P$ & 端口功率变化率 $\dot f v+f\dot v$ & W/s \\
+$\alpha(k)$ & 串联 PC 阻尼系数（\cref{eq:tdpa-alpha}） & N$\cdot$s/m \\
+$\beta(k)$ & 并联 PC 系数（\cref{eq:tdpa-beta}） & m/(N$\cdot$s) \\
+$f_{\rm out},v_{\rm out}$ & PC 修正后的端口力 / 速度 & N, m/s \\
+$v_{\rm thresh}$ & 串/并联切换的速度阈值（典型 $0.005$–$0.05$） & m/s \\
+$E_{\rm margin}$ & 参考能量余量（透明度–安全旋钮） & J \\
+$E_{\rm ref}$ & 参考能量下界 $=-E_{\rm margin}$ & J \\
+$\bar P(k)$ & 近 $N$ 步平均绝对功率（自适应余量用） & W \\
+$\gamma$ & 自适应余量安全系数（典型 $0.1$–$0.5$） & — \\
+$b$ & 波阻抗（波变量法的参数，本章对比用） & N$\cdot$s/m \\
+$\mathbf M,\mathbf C,\mathbf g$ & 机械臂动力学项 $\mathbf M\ddot{\mathbf q}+\mathbf C\dot{\mathbf q}+\mathbf g=\boldsymbol\tau$ & — \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{延伸阅读}
+\label{sec:tdpa-further}
+
+\begin{itemize}
+  \item \textbf{PO/PC 原始提出}：Hannaford \& Ryu（2002）首次给出时域在线无源性保证；Ryu--Kwon--Hannaford（2004）确立 TDPA 正式框架，无需已知时延大小、硬墙 $150\,\mathrm{kN/m}$ 稳定。
+  \item \textbf{零速发散与参考能量}：Ryu--Preusche--Hannaford--Hirzinger（2005）解决低速 $\alpha$ 发散、提出参考能量跟踪（\cref{algo:tdpa-ref} 的来源）。
+  \item \textbf{双层能量罐}：Franken 等（2011）把 TDPA 思想做成上层透明 + 下层能量罐保无源的双层架构；本书 \cref{thm:os-energytank} 给能量罐的无源性证明。
+  \item \textbf{离散化与无源性地基}：Colgate--Schenkel（1997）的采样数据无源充分条件（\cref{eq:os-discrete-passive}）与本章 ZOH 截断误差互补；端口/无源性完整理论见 \cref{ch:operational-space}。
+  \item \textbf{对比与组合}：波变量法（事先预防）见 \cref{ch:teleop-wave}；二端口/透明度框架与稳定性判据分别见 \cref{ch:teleop-twoport,ch:teleop-stability}；运动映射见 \cref{ch:teleop-mapping}；接触安全见 \cref{ch:arm-collision-safety}。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section{后续关系}
+\label{sec:tdpa-next}
+
+\begin{itemize}
+  \item \textbf{向上承接}：本章承 \cref{ch:teleop-wave}（波变量，事先预防）的对立面；无源性、储能函数、端口功率、离散化破无源等地基来自 \cref{ch:operational-space}（\cref{eq:os-port-power,sec:os-discretization,eq:os-discrete-passive}），能量罐类比来自 \cref{thm:os-energytank}。
+  \item \textbf{横向并列}：与 \cref{ch:teleop-twoport}（二端口/透明度）、\cref{ch:teleop-stability}（稳定性判据）、\cref{ch:teleop-mapping}（运动映射）共同构成遥操作子部；TDPA 是其中“运行时安全网”这一环。
+  \item \textbf{向下落地}：TDPA 的“端口能量安全”可与 \cref{ch:arm-collision-safety} 的接触/碰撞安全互补——前者管能量、后者管接触力/几何；双层架构（\cref{fig:tdpa-twolayer}）是工业遥操作系统的推荐组合。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section{故障排查}
+\label{sec:tdpa-troubleshoot}
+
+\begin{table}[H]\centering\small
+\caption{TDPA 常见故障速查}
+\label{tab:tdpa-troubleshoot}
+\begin{tabularx}{\linewidth}{p{0.28\textwidth} L L}
+\toprule
+现象 & 根因 & 对策 \\
+\midrule
+自由空间 $E_{\rm obs}$ 持续下负 & 力/速度符号约定反 & 统一端口方向（\cref{def:tdpa-po} 注），自检“扫一遍看是否单调下负” \\
+PC 在正常操作频繁介入 & $E_{\rm margin}$ 过小 / 采样率不足 & 加 $E_{\rm margin}$（\cref{tab:tdpa-margin}）；检查 $f_{\rm sample}$（\cref{eq:tdpa-fsample-bound}） \\
+硬墙挤压时力“锁死”/突变 & 低速大力仍用串联，$\alpha\to\infty$ & 切并联 PC、调大 $v_{\rm thresh}$（\cref{tab:tdpa-switch}） \\
+$v\approx0$ 时 $f_{\rm out}$ 飞出 & 串联 $\alpha$ 除零、未限幅 & 分母加 $\varepsilon$、$\alpha$ 限幅、切并联 \\
+PC 反向“拽力”惊吓操作者 & $\alpha_{\max}$ 过大、力突变 & $\alpha_{\max}$ 限在可接受力范围（$50$–$500\,\mathrm{N\cdot s/m}$） \\
+PC 过度/不足介入 & PO/PC 更新顺序颠倒 & 先用原始 $f,v$ 更 $E_{\rm obs}$，再算 $\alpha$，最后归还耗散 \\
+slave 端 bug 发现太晚 & 只在 master 放 PO & 两端各放 PO + 从端全局 PO（\cref{sec:tdpa-po-placement}） \\
+$50\,\mathrm{Hz}$ 系统 PC 形同随机阻尼 & 截断误差淹没 $E_{\rm margin}$ & 提采样率或弃用 TDPA、改学习方法（\cref{sec:tdpa-accuracy}） \\
+RL/主动回路中 PC 乱触发 & 主动系统违反无源性前提 & 改 ISS/Lyapunov+RL 框架，勿直接套 PO（\cref{sec:tdpa-frontier}） \\
+\bottomrule
+\end{tabularx}
+\end{table}

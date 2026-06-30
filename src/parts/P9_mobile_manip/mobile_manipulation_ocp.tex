@@ -1,0 +1,394 @@
+\chapter{移动操作的运动学最优控制}
+\label{ch:mm-ocp}
+
+% ════════════════════════════════════════════════════════════════
+%  本章吸收 Tutorial 05_运动控制/30_复合/130_OCS2_mobile_manipulator（理论部分）。
+%  纯工程（OCS2 容器/task.info/C++/ROS2/FCL）按规范跳过；只取运动学 OCP 的
+%  建模、代价、约束方法论。SE(3) 误差/松弛障碍/自碰撞梯度去重指向 ch:unified-multimodal-mpc。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的代价/约束速查表；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 一台「差速底盘 $+$ 六轴臂」的移动操作平台，要让末端去抓桌上一个杯子。你会把\emph{底盘的力矩、轮胎摩擦}也写进优化器吗？为什么这台机器人「低速搬运」的场景，往往\emph{不必}用完整刚体动力学？
+  \item 状态 $\mathbf x=(x_b,y_b,\theta_b,\mathbf q_a)$、输入 $\mathbf u=(v,\omega,\dot{\mathbf q}_a)$ 的「运动学流图」$\dot{\mathbf x}=\mathbf f(\mathbf x,\mathbf u)$ 长什么样？它对状态、对输入的雅可比为何\emph{极其稀疏}？
+  \item 末端跟踪误差用「位置差 $+$ 欧拉角差」会出什么事？为什么要换成 SE(3) 对数？（若忘了，回看 \cref{sec:umm-se3}。）
+  \item 一台\emph{差速}底盘不能横向平移。当末端目标在底盘侧方时，优化器会怎样「绕」过去？这是 bug 还是非完整约束的必然？
+  \item 关节速度限位、关节位置限位、自碰撞——这三类约束分别该写成对\emph{输入}的边界、对\emph{状态}的边界、还是对\emph{状态}的非线性不等式？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{论证}为何低速移动操作用\emph{运动学}模型即足够，并能给出「放进全动力学更真但不划算」的反事实分析；
+  \item \textbf{写出}差速底盘 $+$ $n$ 轴臂的状态、输入与流图 $\dot{\mathbf x}=\mathbf f(\mathbf x,\mathbf u)$，并手推其线性化矩阵 $\mathbf A=\partial\mathbf f/\partial\mathbf x$、$\mathbf B=\partial\mathbf f/\partial\mathbf u$ 的稀疏结构；
+  \item \textbf{把}末端 SE(3) 跟踪代价放进运动学 OCP，给出其一阶梯度与 Gauss--Newton 二阶近似 $\boldsymbol\ell_{xx}\approx\mathbf J_e^\top\mathbf Q\mathbf J_e$；
+  \item \textbf{设计}三类约束——关节速度边界（输入）、关节位置松弛障碍（状态）、自碰撞距离（状态非线性）——并解释各自进入 OCP 的恰当形态；
+  \item \textbf{厘清}本章 OCP 与上游 base placement（\cref{ch:mm-kinematics}）、分层导航栈的职责边界，知道「谁给初值、谁管全局、谁管局部连续」。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条「\emph{把底盘臂联合运动学，塞进一个有限时域最优控制问题}」的主线。它\emph{不}重新推导 SE(3) 误差与松弛障碍（那是 \cref{ch:unified-multimodal-mpc} 的核心结论），而是把它们\emph{安放}进运动学 OCP 这一具体语境，并补齐运动学模型特有的部分：低维稀疏流图、Gauss--Newton 末端代价、差速非完整约束的后果。
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4.5mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (why) {为何运动学足够\\（低速·下层闭环）};
+\node[blk, right=of why] (model) {状态/输入/流图\\稀疏线性化};
+\node[grp, right=of model] (cost) {末端 SE(3) 代价\\Gauss--Newton};
+\node[grp, below=8mm of why] (vlim) {关节/底盘速度\\$=$ 输入边界};
+\node[grp, right=of vlim] (qlim) {关节位置\\松弛障碍};
+\node[grp, right=of qlim] (col) {自碰撞\\$\hat{\mathbf n}^\top(\mathbf J_{p2}-\mathbf J_{p1})$};
+\node[blk, below=8mm of qlim, fill=third!8, draw=third!60!black] (stack) {与 base placement /\\ 分层导航的边界};
+\draw[ln] (why)--(model); \draw[ln] (model)--(cost);
+\draw[ln] (model.south) -- ++(0,-4mm) -| (vlim.north);
+\draw[ln] (vlim)--(qlim); \draw[ln] (qlim)--(col);
+\draw[ln] (qlim.south)--(stack.north);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:mmocp-why}（动机 $+$ 反事实）是本章的「为什么」，决定了后面一切简化的合法性；\cref{sec:mmocp-model}（状态/输入/流图/线性化）是任何读者的主干；\cref{sec:mmocp-cost}（末端代价）与 \cref{sec:mmocp-constraint}（三类约束）是把 \cref{ch:unified-multimodal-mpc} 的几何结论\emph{落到}运动学 OCP 的两块工作面；\cref{sec:mmocp-stack}（分层）面向系统集成，说明本章在「全局规划—局部 OCP—底层伺服」三明治里的位置。
+
+\subsection*{前置知识桥接}
+\cref{ch:mm-kinematics} 已建立移动操作平台的联合运动学：底盘 SE(2) 位姿 $\mathbf q_b=(x_b,y_b,\theta_b)$、body 与 world 速度的变换、联合雅可比 $\mathbf V_{\text{ee}}=[\mathbf J_b\ \mathbf J_a]\boldsymbol\nu$，以及 base placement（先把底盘停在何处再伸臂）。本章把这套\emph{瞬时}运动学，沿时间展开成一条\emph{轨迹}，并用最优控制为它配上代价与约束。\cref{ch:unified-multimodal-mpc} 则给出了将在此复用的两块几何利器：SE(3) 末端误差（\cref{sec:umm-se3}、\cref{eq:umm-xierr}）与自碰撞 $+$ 松弛障碍（\cref{sec:umm-collision}、\cref{eq:umm-relaxed}）。差速底盘的非完整本质，承自 \cref{ch:constrained-dynamics} 的 Pfaffian 约束（\cref{eq:cd-pfaffian}、\cref{thm:cd-frobenius}）。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会知道「末端误差用 SE(3) 对数」，却不知道把它放进一个\emph{运动学} OCP 后，Hessian 该用完整二阶还是 Gauss--Newton，以及为什么后者更稳；
+  \item 你会以为「底盘绕圈」是权重 bug，反复调权重——而真相往往是差速底盘\emph{不能横移}这一非完整约束的必然几何后果；
+  \item 在系统集成时，你会分不清这台 OCP 与上游 base placement、全局导航栈各自负责什么，把全局避障的责任错压给一个短时域局部优化器。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+底盘 SE(2) 位姿 $\mathbf q_b=(x_b,y_b,\theta_b)$，臂关节 $\mathbf q_a\in\mathbb R^{n_a}$；状态 $\mathbf x=(\mathbf q_b,\mathbf q_a)\in\mathbb R^{3+n_a}$。底盘线/角速度 $v,\omega$，臂关节速度 $\dot{\mathbf q}_a$；输入 $\mathbf u=(v,\omega,\dot{\mathbf q}_a)\in\mathbb R^{2+n_a}$。
+末端期望位姿 $\mathbf T_d\in\SE(3)$，当前 $\mathbf T=\mathbf T_{\text{ee}}(\mathbf x)$，SE(3) 误差与权重沿用 \cref{sec:umm-se3}。
+向量粗体小写、矩阵粗体大写；右扰动 $\mathbf R\,\mathrm{Exp}(\delta\boldsymbol\phi)$；$\se(3)$ 元素 $\boldsymbol\xi=[\boldsymbol\rho;\boldsymbol\phi]$（平移在前）。
+本章只用\emph{运动学}模型，输入即速度，无力矩/惯性项——这与 \cref{ch:unified-multimodal-mpc} 的全身动力学 $\mathbf M\dot{\mathbf v}+\mathbf h=\cdots$（\cref{eq:umm-core}）是\emph{两个抽象层次}，何时用哪个正是 \cref{sec:mmocp-why} 的主题。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为何运动学模型就足够}
+\label{sec:mmocp-why}
+
+\paragraph{动机：一台服务机器人去抓杯子。}
+设想 Ridgeback 差速底盘驮着一台 UR5 六轴臂，要去够桌上的杯子。整个动作慢条斯理：底盘以零点几米每秒挪动，臂以温和的关节速度伸展。此时若我们老老实实写出完整刚体动力学，把每个电机力矩、每条轮胎的摩擦、抓取重物时基座的微晃都建模进去，优化器固然「更真」，但要付出沉重代价——而这些代价，几乎全被浪费。
+
+\paragraph{核心观察：下层已经闭环。}
+关键在于\emph{分层}。现实平台几乎总是：底盘自带速度控制器（你给 $v,\omega$，它内部闭环去跟踪），臂自带关节速度或位置伺服（你给 $\dot{\mathbf q}_a$，它内部闭环）。于是「力矩 $\to$ 加速度 $\to$ 速度」这一段动力学，已经被下层控制器吃掉了。留给上层最优控制的任务，不是「施加多大力」，而是\emph{在哪个方向、走多快}——即生成一条平滑、避障、可达的\textbf{速度轨迹}。这正是运动学模型刻画的对象。
+
+\begin{insight}
+\textbf{运动学 OCP 的定位。}\;它\emph{不}追求真实力矩，而是直接把「可执行速度」当决策变量来优化。这一刀切下去，状态维度骤降（无需把速度纳入状态）、流图变得线性化稀疏、求解极快——快到足以\emph{高频重规划}（数十至上百赫兹滚动优化）。低速移动操作、服务机器人恰是这一权衡的最佳受益者。
+\end{insight}
+
+\paragraph{运动学模型放弃了什么。}
+诚实地讲，运动学模型\emph{无法}直接保证：电机力矩不饱和、轮胎不打滑、抓重物时基座不晃、动态接触力可行（\cref{tab:mmocp-kinpros}）。它把这些动态细节，\emph{委托}给了下层控制器与适度的输入边界（如限制 $v,\omega,\dot{\mathbf q}_a$ 的幅值，间接约束加速度需求）。
+
+\begin{table}[H]\centering\small
+\caption{运动学模型在移动操作 OCP 中的得与失。}
+\label{tab:mmocp-kinpros}
+\begin{tabular}{ll}
+\toprule
+得（优势） & 失（代价） \\
+\midrule
+状态维度低、流图稀疏 & 不预测力矩，不保证力矩不饱和 \\
+线性化简单、求解快 & 不建模轮胎打滑 \\
+适合高频滚动重规划 & 抓重物时基座晃动未建模 \\
+易与全局导航/运动规划共存 & 动态接触力可行性无法直接保证 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[反事实：硬把全动力学塞进移动操作 OCP]
+若坚持用完整多体动力学：状态须加入广义速度（维度近乎翻倍），输入从速度变为力矩，约束须加入驱动极限与接触力可行性。求解问题确实\emph{更真实}，但单步求解从毫秒级涨到数十毫秒，原本 $100\,\mathrm{Hz}$ 的滚动重规划直接超时。而对低速抓取，那些被「补上」的动态细节，本就由下层速度环处理得很好。结论：\textbf{统一塞进 MPC 不是更对，而是不划算}——抽象层次要与任务时间尺度、下层控制结构匹配。这与 \cref{ch:unified-multimodal-mpc} 的全身\emph{动力学} MPC 并不矛盾：那里处理的是腿足接触切换、动态平衡，动力学是任务的本质；这里处理的是低速、下层已闭环，动力学是可委托的细节。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{状态、输入与运动学流图}
+\label{sec:mmocp-model}
+
+\paragraph{状态与输入。}
+取差速底盘 $+$ $n_a$ 轴臂，状态由底盘平面位姿与臂关节角拼成，输入由底盘线/角速度与臂关节速度拼成：
+\begin{equation}
+  \mathbf x=\begin{bmatrix}x_b\\ y_b\\ \theta_b\\ \mathbf q_a\end{bmatrix}\in\mathbb R^{3+n_a},
+  \qquad
+  \mathbf u=\begin{bmatrix}v\\ \omega\\ \dot{\mathbf q}_a\end{bmatrix}\in\mathbb R^{2+n_a}.
+  \label{eq:mmocp-xu}
+\end{equation}
+注意状态\emph{不含}任何速度量——这是运动学模型与全动力学模型（其状态须含 $\dot{\mathbf q}$）的根本分野。
+
+\paragraph{流图。}
+底盘是差速驱动，在世界系里只能「沿当前朝向前进」加「原地转向」，不能横移；臂关节速度即输入本身。于是流图
+\begin{equation}
+  \dot{\mathbf x}=\mathbf f(\mathbf x,\mathbf u)=
+  \begin{bmatrix}v\cos\theta_b\\ v\sin\theta_b\\ \omega\\ \dot{\mathbf q}_a\end{bmatrix}.
+  \label{eq:mmocp-flow}
+\end{equation}
+前三行即 SE(2) 底盘 body 速度 $(v,0,\omega)$ 经朝向 $\theta_b$ 旋到世界系（承 \cref{ch:mm-kinematics} 的 body$\leftrightarrow$world 变换）；后 $n_a$ 行是单位映射。
+
+\begin{insight}
+\textbf{「$y$ 方向没有 $v_y$」就是非完整约束。}\;\cref{eq:mmocp-flow} 里底盘世界速度 $(\dot x_b,\dot y_b)$ 永远平行于朝向 $(\cos\theta_b,\sin\theta_b)$，即横向速度恒为零。写成 \cref{ch:constrained-dynamics} 的 Pfaffian 形式 $\mathbf A(\mathbf q)\dot{\mathbf q}=\mathbf 0$（\cref{eq:cd-pfaffian}），就是
+\begin{equation}
+  \underbrace{[\,-\sin\theta_b\quad \cos\theta_b\quad 0\,]}_{\mathbf A(\mathbf q_b)}
+  \begin{bmatrix}\dot x_b\\ \dot y_b\\ \dot\theta_b\end{bmatrix}=0
+  \quad(\text{底盘不能侧滑}).
+  \label{eq:mmocp-pfaffian}
+\end{equation}
+由 Frobenius 判据（\cref{thm:cd-frobenius}）这是\emph{不可积}的——你无法把它化成对位形的等式约束，它真正限制的是\emph{速度方向}而非可达位形。这一约束的下游后果（「底盘绕圈」）见 \cref{sec:mmocp-stack}。
+\end{insight}
+
+\paragraph{线性化的稀疏性。}
+SQP/iLQR 类求解器在每个节点需要流图的雅可比 $\mathbf A=\partial\mathbf f/\partial\mathbf x$、$\mathbf B=\partial\mathbf f/\partial\mathbf u$。逐项求导 \cref{eq:mmocp-flow}：
+
+\begin{derivation}[流图雅可比]
+对状态求导，唯一非平凡的耦合来自底盘朝向 $\theta_b$ 进入前两行：
+\begin{equation}
+  \frac{\partial\dot x_b}{\partial\theta_b}=-v\sin\theta_b,\qquad
+  \frac{\partial\dot y_b}{\partial\theta_b}=v\cos\theta_b,
+  \label{eq:mmocp-Adetail}
+\end{equation}
+其余状态偏导全为零（臂部分 $\dot{\mathbf q}_a$ 不依赖任何状态）。对输入求导：
+\begin{equation}
+  \frac{\partial\dot x_b}{\partial v}=\cos\theta_b,\quad
+  \frac{\partial\dot y_b}{\partial v}=\sin\theta_b,\quad
+  \frac{\partial\dot\theta_b}{\partial\omega}=1,\quad
+  \frac{\partial\dot{\mathbf q}_a}{\partial\dot{\mathbf q}_a}=\mathbf I_{n_a}.
+  \label{eq:mmocp-Bdetail}
+\end{equation}
+拼成矩阵（按 $\mathbf x=(x_b,y_b,\theta_b,\mathbf q_a)$、$\mathbf u=(v,\omega,\dot{\mathbf q}_a)$ 排序）：
+\begin{equation}
+  \mathbf A=\begin{bmatrix}
+  0&0&-v\sin\theta_b&\mathbf 0\\
+  0&0&\ \ v\cos\theta_b&\mathbf 0\\
+  0&0&0&\mathbf 0\\
+  \mathbf 0&\mathbf 0&\mathbf 0&\mathbf 0
+  \end{bmatrix},
+  \qquad
+  \mathbf B=\begin{bmatrix}
+  \cos\theta_b&0&\mathbf 0\\
+  \sin\theta_b&0&\mathbf 0\\
+  0&1&\mathbf 0\\
+  \mathbf 0&\mathbf 0&\mathbf I_{n_a}
+  \end{bmatrix}.
+  \label{eq:mmocp-AB}
+\end{equation}
+$\mathbf A$ 几乎全零（只有两个非零元，且都正比于 $v$）；$\mathbf B$ 是一个 $2\times2$ 朝向块加一个单位块。
+\end{derivation}
+
+\begin{insight}
+\textbf{稀疏 $=$ 快。}\;\cref{eq:mmocp-AB} 的极度稀疏，正是运动学移动操作 OCP 求解快的结构性原因：每个时间节点的线性化几乎免费，多重射击的带状 KKT 系统里每块都很瘦。这与 \cref{ch:unified-multimodal-mpc} 全身动力学那个稠密的 $\mathbf M(\mathbf q)$ 形成鲜明对照——后者每个节点都要算质量矩阵与其导数。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{末端 SE(3) 跟踪代价}
+\label{sec:mmocp-cost}
+
+\paragraph{为什么不在这里重推 SE(3) 误差。}
+末端「去哪」这件事的几何，\cref{sec:umm-se3} 已彻底讲清：欧拉角差有万向锁、不连续、非最短路径三宗罪，正解是 SE(3) 对数误差 $\boldsymbol\xi_{\text{err}}=\mathrm{Log}(\mathbf T_{\text{ee}}^{-1}\mathbf T_d)^\vee$（\cref{eq:umm-xierr}），平移分量还经左雅可比逆与旋转耦合。本节\emph{不}重复这些，只关心一件运动学 OCP 特有的事：把这个误差写成代价后，它对\emph{状态} $\mathbf x$（而非全动力学里的 $\mathbf q$）的导数长什么样，以及 Hessian 怎么取。
+
+\paragraph{末端位姿来自两段链。}
+运动学模型里，末端世界位姿是「底盘位姿 $\times$ 臂正运动学」：
+\begin{equation}
+  \mathbf T_{\text{ee}}(\mathbf x)=\mathbf T_{wb}(x_b,y_b,\theta_b)\,\mathbf T_{be}(\mathbf q_a),
+  \label{eq:mmocp-Twe}
+\end{equation}
+其中 $\mathbf T_{wb}$ 由 SE(2) 底盘位姿提升为平面内的 SE(3)，$\mathbf T_{be}$ 是臂从其基座到末端 frame 的正运动学。误差与代价：
+\begin{equation}
+  \mathbf e(\mathbf x)=\mathrm{Log}\big(\mathbf T_d^{-1}\mathbf T_{\text{ee}}(\mathbf x)\big)^\vee\in\mathbb R^6,
+  \qquad
+  \ell_{\text{ee}}(\mathbf x)=\tfrac12\,\mathbf e(\mathbf x)^\top\mathbf Q_{\text{ee}}\,\mathbf e(\mathbf x),
+  \label{eq:mmocp-ee}
+\end{equation}
+权重 $\mathbf Q_{\text{ee}}=\mathrm{diag}(q_x,q_y,q_z,q_{\text{roll}},q_{\text{pitch}},q_{\text{yaw}})$ 按任务裁剪（抓取重位姿、指向只重姿态、到达只重位置），其阻抗解释见 \cref{sec:umm-se3}。位置与姿态量纲不同，权重不可盲目取等。
+
+\begin{note}
+\textbf{误差方向一致即可。}\;\cref{eq:mmocp-ee} 取 $\mathbf T_d^{-1}\mathbf T_{\text{ee}}$（当前拉回期望系），与 \cref{eq:umm-xierr} 的 $\mathbf T_{\text{ee}}^{-1}\mathbf T_{\text{ref}}$ 互为逆，小误差下近似差一个符号、大姿态误差下还差一个伴随的坐标表达。重点不是「选左还是右」，而是\textbf{整个实现自始至终用同一个方向}——误差定义、雅可比、权重必须配套。本书右扰动约定下，对 $\mathbf q$ 的求导按 \cref{eq:umm-Jerr} 取用，工业 CLIK 实现亦然。
+\end{note}
+
+\paragraph{代价对状态的梯度与 Hessian。}
+
+\begin{derivation}[运动学末端代价的一阶/二阶展开]
+记 $\mathbf J_e=\partial\mathbf e/\partial\mathbf x\in\mathbb R^{6\times(3+n_a)}$ 为误差对状态的雅可比。它由两部分链接而成：误差对末端位姿的对数雅可比（\cref{eq:umm-Jerr} 的 $\mathbf J_{\log}$），再乘以末端位姿对状态的雅可比——后者正是 \cref{ch:mm-kinematics} 的联合雅可比 $[\mathbf J_b\ \mathbf J_a]$（底盘块 $+$ 臂块）。对二次型代价 $\ell_{\text{ee}}=\tfrac12\mathbf e^\top\mathbf Q\mathbf e$，链式法则给一阶梯度
+\begin{equation}
+  \boldsymbol\ell_x=\mathbf J_e^\top\mathbf Q\,\mathbf e\ \in\mathbb R^{3+n_a}.
+  \label{eq:mmocp-lx}
+\end{equation}
+精确 Hessian 含误差函数的二阶导（$\partial^2\mathbf e/\partial\mathbf x^2$ 的张量缩并），既贵又不保号。\textbf{Gauss--Newton 近似}丢弃这一项：
+\begin{equation}
+  \boldsymbol\ell_{xx}\approx\mathbf J_e^\top\mathbf Q\,\mathbf J_e\ \succeq\mathbf 0.
+  \label{eq:mmocp-lxx}
+\end{equation}
+当残差 $\mathbf e$ 较小时被丢弃项可忽略，近似足够好；更重要的是 \cref{eq:mmocp-lxx} 天然\emph{半正定}，给 SQP 的二次子问题提供良态 Hessian。
+\end{derivation}
+
+\begin{pitfall}[为何不用完整 Hessian]
+完整 Hessian 在残差大时可能\emph{不定}，使 SQP 子问题非凸、步长发散。Gauss--Newton 牺牲了远离目标时的二阶精度，换来全程半正定与数值稳定——这在滚动 MPC（每周期只迭代一两步）里尤其值得。代价是：当末端离目标极远时收敛偏慢，可由「随时间推进的末端参考轨迹」（而非一步到位的远目标）缓解。
+\end{pitfall}
+
+\paragraph{输入正则与关节正则。}
+末端代价之外，运动学 OCP 还需两类「软」项。输入正则
+\begin{equation}
+  \ell_u(\mathbf u)=\tfrac12(\mathbf u-\mathbf u_{\text{ref}})^\top\mathbf R(\mathbf u-\mathbf u_{\text{ref}}),
+  \qquad \mathbf R=\mathrm{diag}(R_v,R_\omega,R_{\dot q_1},\dots),
+  \label{eq:mmocp-lu}
+\end{equation}
+其对角元编码\emph{运动偏好}：$R_v$ 太小底盘爱前后蹭，$R_\omega$ 太小底盘爱原地转，$R_{\dot q}$ 太小臂动作激进，全体太大则末端跟踪迟钝。想「先动臂、少动底盘」就抬高 $R_v,R_\omega$。关节正则 $\ell_q=\tfrac12(\mathbf q_a-\mathbf q_a^{\text{nom}})^\top\mathbf Q_a(\mathbf q_a-\mathbf q_a^{\text{nom}})$ 不是主任务，而是用\emph{冗余零空间}把臂拉向舒适构型——远离限位、避免肘部怪姿、减少多解跳变（冗余与零空间的机理见 \cref{sec:ak-redundancy}）。
+
+\begin{insight}
+\textbf{末端抖动先加输入权重，别加末端权重。}\;直觉上末端抖动似乎该「抓得更紧」（抬高 $\mathbf Q_{\text{ee}}$），但这往往\emph{加剧}抖动——末端在每个中间时刻死贴参考，把底盘与臂的自由度榨干。正确做法常是先抬输入权重 $\mathbf R$ 让轨迹更平滑（呼应 \cref{eq:mmocp-lu} 的平滑作用），或平滑参考轨迹本身。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{三类约束的恰当形态}
+\label{sec:mmocp-constraint}
+
+约束是移动操作 OCP 的安全与可行性所在。关键认知是：\emph{同一个物理限制，依它依赖输入还是状态、是「不理想」还是「不允许」，进入 OCP 的形态截然不同}。本节按这条线索梳理三类约束。
+
+\paragraph{约束一：速度限位 $=$ 输入边界。}
+关节速度 $\dot{\mathbf q}_a$ 与底盘速度 $v,\omega$ 都\emph{直接是输入分量}（\cref{eq:mmocp-xu}），故它们的限位是最干净的形态——对输入的箱式边界：
+\begin{equation}
+  \dot{\mathbf q}_{\min}\le\dot{\mathbf q}_a\le\dot{\mathbf q}_{\max},\qquad
+  v_{\min}\le v\le v_{\max},\qquad
+  \omega_{\min}\le\omega\le\omega_{\max}.
+  \label{eq:mmocp-vlim}
+\end{equation}
+
+\begin{pitfall}[别漏掉底盘那两维]
+输入向量是 $[v,\omega,\dot{\mathbf q}_a]$，速度边界数组的长度必须等于\emph{整个}输入维 $2+n_a$，前两维是底盘线/角速度。常见 bug 是只给臂关节填了上下界、漏了底盘两维：优化器于是认为底盘速度无界，仿真里底盘「窜出去」。自检：边界数组长度 $\overset{?}{=}$ 输入维。
+\end{pitfall}
+
+\paragraph{约束二：关节位置限位 $=$ 状态松弛障碍。}
+关节位置 $\mathbf q_a$ 是\emph{状态}分量。仅限速度不限位置，长时间运行会缓慢漂到限位。位置约束 $\mathbf q_{\min}\le\mathbf q_a\le\mathbf q_{\max}$ 是真正的安全边界（「不允许」越界），宜用\emph{松弛障碍}软化——其完整定义、对数段在 $h\le\delta$ 处的二次延拓、以及为何要这样延拓（纯对数障碍在约束已被违反时返回 NaN 致求解崩溃），均见 \cref{eq:umm-relaxed} 与 \cref{ch:unified-multimodal-mpc} 的推导，此处不赘。设单侧约束 $h(\mathbf x)=q_{a,i}-q_{\min,i}\ge0$，惩罚项即 $B_\mu(h)$（\cref{eq:umm-relaxed}）。
+
+\begin{note}
+\textbf{松弛障碍的工程序。}\;调参常先用较大的 $\mu,\delta$（如 $\mu=0.1,\delta=0.01$）确保求解器能收敛，再逐步收紧使约束更贴边界。直接上小值，初值若违约则求解器可能找不到可行方向。「为什么需要在已违约时仍有有限梯度」这一动机，正是松弛障碍区别于纯内点障碍的要害（\cref{ch:unified-multimodal-mpc}）。
+\end{note}
+
+\paragraph{约束三：自碰撞 $=$ 状态非线性不等式。}
+臂在底盘上方挥舞，可能撞自己的底盘、夹爪可能磕另一连杆。对每对可能碰撞的连杆 $(i,j)$，安全约束
+\begin{equation}
+  h_{ij}(\mathbf x)=d_{ij}(\mathbf q)-d_{\min}\ge0,
+  \label{eq:mmocp-hcol}
+\end{equation}
+$d_{ij}$ 是两几何体最小距离，$d_{\min}$ 是安全裕度。其\emph{距离梯度}是把约束接进 SQP 的关键，已在 \cref{sec:umm-collision} 推得解析式（沿用该处约定：最近点 $\mathbf p_i\in\mathrm{link}_i$、$\mathbf p_j\in\mathrm{link}_j$，单位法向 $\hat{\mathbf n}=(\mathbf p_j-\mathbf p_i)/\|\mathbf p_j-\mathbf p_i\|$ 由 $i$ 指向 $j$）
+\begin{equation}
+  \nabla_{\mathbf q}\,d_{ij}=\hat{\mathbf n}^\top\big(\mathbf J_{p_j}-\mathbf J_{p_i}\big),
+  \label{eq:mmocp-ddq}
+\end{equation}
+$\mathbf J_{p_i},\mathbf J_{p_j}$ 为两最近点的位置雅可比（几何来源、最近点到 frame 的平移见 \cref{sec:umm-collision}）。法向方向与雅可比之差的次序须\emph{配套}：$\hat{\mathbf n}$ 指向 $i\!\to\!j$ 时配 $(\mathbf J_{p_j}-\mathbf J_{p_i})$，二者同时反号才仍得正确的「距离增大方向」。约束 \cref{eq:mmocp-hcol} 同样以松弛障碍软化进 OCP。
+
+\begin{pitfall}[碰撞对的两难：太少漏撞、太多超时]
+自碰撞约束有两个工程陷阱。其一，\textbf{忘记排除相邻连杆}：相邻连杆装配上本就「贴着」，$d_{ij}<d_{\min}$ 恒成立，松弛障碍持续输出巨大代价，把整个 OCP 带偏（现象：一启动就「求解成功但行为诡异」，末端怎么都到不了）。须用机器人描述里的相邻关系排除天然相邻对，只留真正可能相撞的远端对（如夹爪 vs 底盘、肘部 vs 底盘）。其二，\textbf{碰撞对太多}：约束维度 $=$ 碰撞对数，每对每节点要做一次最近距离查询加一次雅可比；把对数从几个加到几十个，求解时间可能翻几倍，$100\,\mathrm{Hz}$ MPC 直接超时。实践只保留几何上真有可能相撞的少数对（常 $3$--$10$ 对），这是精度与实时性的折中，而非偷懒。
+\end{pitfall}
+
+\begin{note}
+\textbf{距离函数的尖角。}\;自碰撞的难点\emph{不}在「距离公式不会写」，而在距离函数在\emph{穿透}与\emph{最近特征切换}（面-面跳到边-边）时不光滑，最近点法向 $\hat{\mathbf n}$ 会突变，使解析雅可比跳变、SQP 步长在碰撞临界处横跳。这类似 $|x|$ 在原点不可导。松弛障碍的二次延拓把约束推到「还没接触」就发力，意在让优化器\emph{永远走不到那个尖角}。
+\end{note}
+
+\paragraph{软约束谱：本章为何全用软约束。}
+速度、位置、碰撞三类约束在 OCP 中可硬可软（谱见 \cref{tab:mmocp-constr}）。低速移动操作的在线 MPC 几乎全选\emph{软}：软约束最坏只是被违反但代价有限、几乎总能求出解；硬约束在初值不可行时直接判 infeasible，使 MPC 当周期无输出。工程常见路线是先用二次惩罚把跟踪调通，再把安全相关项换成松弛障碍，最后仅在必须精确处才考虑硬约束。
+
+\begin{table}[H]\centering\small
+\caption{移动操作运动学 OCP 的三类约束及其恰当形态。}
+\label{tab:mmocp-constr}
+\begin{tabular}{llll}
+\toprule
+约束 & 依赖 & 约束函数 & 恰当形态 \\
+\midrule
+关节/底盘速度限位 & 输入 $\mathbf u$ & $\dot{\mathbf q}_a,v,\omega$ 箱界 & 输入边界（\cref{eq:mmocp-vlim}） \\
+关节位置限位 & 状态 $\mathbf x$ & $q_{a}-q_{\min}\ge0$ 等 & 状态松弛障碍（\cref{eq:umm-relaxed}） \\
+自碰撞 & 状态 $\mathbf x$ & $d_{ij}-d_{\min}\ge0$ & 状态松弛障碍 $+$ 解析梯度（\cref{eq:mmocp-ddq}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{与 base placement、分层导航的边界}
+\label{sec:mmocp-stack}
+
+\paragraph{这台 OCP 在系统里的位置。}
+本章的运动学 OCP 是一个\emph{短时域局部优化器}：它在数秒的预测窗口内，生成一条平滑、避自碰撞、可达的速度轨迹，并高频滚动。它\emph{不}是全局规划器，也\emph{不}是底层伺服。一个典型的分层是「全局运动规划 $\to$ 本章局部 OCP $\to$ 底盘/臂速度环」三明治：全局层管「绕开房间里的大障碍、给出粗路径」，本章局部层管「沿粗路径连续重规划、实时微避障、生成可执行速度」，底层管「把 $v,\omega,\dot{\mathbf q}_a$ 真正跟踪出来」。三者在\emph{时间尺度}上互补，不是替代关系。
+
+\paragraph{承 base placement：谁给初值。}
+\cref{ch:mm-kinematics} 的 base placement 回答的是「底盘该停在哪、以什么朝向，臂才够得舒服」——一个\emph{准静态}的可达性/可操作性问题。它为本章 OCP 提供两样东西：一个好的\emph{初始猜测}（底盘大致目标位姿），以及底盘朝向正则的参考 $\theta_{\text{ref}}$。这正是治「底盘绕圈」的良方。
+
+\begin{pitfall}[「底盘绕圈」多半不是 bug]
+现象：差速底盘不直奔目标，反而绕大圈。许多人误判为权重 bug，疯狂调参。真相常是 \cref{eq:mmocp-pfaffian} 的非完整约束：差速底盘\emph{不能横移}，当末端目标在底盘侧方、且姿态权重又逼它对准某朝向时，优化器只能用「转向 $+$ 前进」的组合去逼近，外观就是绕圈。对策不是无脑调权重，而是：用 base placement 给更好的初始底盘位姿、适度抬高角速度权重 $R_\omega$、降低不必要的姿态权重、或给底盘一个合理的朝向参考 $\theta_{\text{ref}}$。把几何成因（非完整 $+$ 目标在侧方）认出来，比盲调省十倍时间。
+\end{pitfall}
+
+\paragraph{与全局层的两种配合。}
+本章 OCP 与上游全局规划器有两种常见配合：其一，全局层生成粗路径，本章 OCP \emph{跟踪}该路径并实时避障、输出速度；其二，本章 OCP 直接优化短时域末端目标，全局层\emph{仅在}局部 OCP 陷入不可行或局部极小时才介入做全局重规划。前者把全局层当「领航」，后者把它当「兜底」。无论哪种，本章 OCP 都\emph{不}该独自承担全局避障——一个数秒预测窗口的局部优化器，看不见房间另一头的墙。把全局避障责任错压给它，是移动操作系统集成的高频设计错误。
+
+\begin{insight}
+\textbf{运行项与终端项分工。}\;滚动优化里，每个中间节点的末端代价（运行项）决定「路上贴不贴参考」，horizon 末端那一个（终端项）决定「最终收不收敛到目标」。终端末端权重通常设得比运行项更高，给优化器一个明确的「终点锚」；只有运行项、没有终端项时，有限窗口下优化器可能选「全程缓慢逼近、末端仍差一截」的低代价轨迹。这与本章把末端代价随时间展开成轨迹的视角一脉相承。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+本章把 \cref{ch:mm-kinematics} 的底盘臂联合运动学，沿时间展开成一个有限时域\emph{运动学}最优控制问题：因低速 $+$ 下层速度环已闭环，直接以可执行速度为决策变量即足够（\cref{sec:mmocp-why}）；状态/输入低维、流图 \cref{eq:mmocp-flow} 与其线性化 \cref{eq:mmocp-AB} 极度稀疏，故求解快、可高频重规划。末端「去哪」复用 \cref{sec:umm-se3} 的 SE(3) 对数误差，本章补齐其对状态的梯度与 Gauss--Newton 半正定 Hessian（\cref{eq:mmocp-lxx}）。三类约束按「依赖输入/状态、不理想/不允许」各取恰当形态：速度限位入输入边界，关节位置与自碰撞入状态松弛障碍（复用 \cref{eq:umm-relaxed} 与 \cref{sec:umm-collision} 的几何）。最后厘清本章 OCP 作为短时域局部优化器，与上游 base placement（给初值/朝向参考）、全局导航层（管全局避障）的职责边界，并把「底盘绕圈」还原为非完整约束的几何后果。核心结论汇于 \cref{tab:mmocp-summary}。
+
+\begin{table}[H]\centering\small
+\caption{本章核心公式速查。}
+\label{tab:mmocp-summary}
+\begin{tabular}{lll}
+\toprule
+对象 & 核心式 & 出处 \\
+\midrule
+状态/输入 & $\mathbf x=(x_b,y_b,\theta_b,\mathbf q_a)$，$\mathbf u=(v,\omega,\dot{\mathbf q}_a)$ & \cref{eq:mmocp-xu} \\
+运动学流图 & $\dot{\mathbf x}=(v\cos\theta_b,\,v\sin\theta_b,\,\omega,\,\dot{\mathbf q}_a)$ & \cref{eq:mmocp-flow} \\
+非完整约束 & $[-\sin\theta_b\ \cos\theta_b\ 0]\,\dot{\mathbf q}_b=0$（不侧滑） & \cref{eq:mmocp-pfaffian} \\
+流图雅可比 & $\mathbf A,\mathbf B$ 极稀疏（$\mathbf A$ 仅两元 $\propto v$） & \cref{eq:mmocp-AB} \\
+末端代价 & $\ell_{\text{ee}}=\tfrac12\mathbf e^\top\mathbf Q_{\text{ee}}\mathbf e$，$\mathbf e=\mathrm{Log}(\mathbf T_d^{-1}\mathbf T_{\text{ee}})^\vee$ & \cref{eq:mmocp-ee} \\
+代价梯度/Hessian & $\boldsymbol\ell_x=\mathbf J_e^\top\mathbf Q\mathbf e$，$\boldsymbol\ell_{xx}\approx\mathbf J_e^\top\mathbf Q\mathbf J_e\succeq0$ & \cref{eq:mmocp-lx,eq:mmocp-lxx} \\
+速度限位 & $\dot{\mathbf q}_{\min}\le\dot{\mathbf q}_a\le\dot{\mathbf q}_{\max}$ 等（输入边界） & \cref{eq:mmocp-vlim} \\
+自碰撞 & $d_{ij}-d_{\min}\ge0$，$\nabla d=\hat{\mathbf n}^\top(\mathbf J_{p_j}-\mathbf J_{p_i})$ & \cref{eq:mmocp-hcol,eq:mmocp-ddq} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{符号表}
+\addcontentsline{toc}{section}{符号表}
+
+\begin{table}[H]\centering\small
+\begin{tabular}{ll}
+\toprule
+符号 & 含义 \\
+\midrule
+$\mathbf x=(x_b,y_b,\theta_b,\mathbf q_a)$ & 状态：底盘 SE(2) 位姿 $+$ 臂关节角，$\in\mathbb R^{3+n_a}$ \\
+$\mathbf u=(v,\omega,\dot{\mathbf q}_a)$ & 输入：底盘线/角速度 $+$ 臂关节速度，$\in\mathbb R^{2+n_a}$ \\
+$\mathbf f(\mathbf x,\mathbf u)$ & 运动学流图（\cref{eq:mmocp-flow}） \\
+$\mathbf A,\mathbf B$ & 流图对状态/输入的雅可比（\cref{eq:mmocp-AB}） \\
+$\mathbf T_{\text{ee}}(\mathbf x),\mathbf T_d$ & 当前/期望末端位姿 $\in\SE(3)$ \\
+$\mathbf e(\mathbf x)$ & SE(3) 末端误差 $\mathrm{Log}(\mathbf T_d^{-1}\mathbf T_{\text{ee}})^\vee\in\mathbb R^6$ \\
+$\mathbf J_e$ & 误差对状态的雅可比 $\partial\mathbf e/\partial\mathbf x$ \\
+$\mathbf Q_{\text{ee}},\mathbf R,\mathbf Q_a$ & 末端/输入/关节正则权重 \\
+$\boldsymbol\ell_x,\boldsymbol\ell_{xx}$ & 代价对状态的一阶梯度 / Gauss--Newton Hessian \\
+$h_{ij},d_{ij},d_{\min}$ & 自碰撞约束值 / 连杆对距离 / 安全裕度 \\
+$\hat{\mathbf n},\mathbf J_{p_i}$ & 最近点连线单位法向 / 最近点位置雅可比 \\
+$\mathbf A(\mathbf q_b)$ & 底盘非完整约束的 Pfaffian 行（\cref{eq:mmocp-pfaffian}） \\
+$\theta_{\text{ref}}$ & 底盘朝向参考（来自 base placement，\cref{ch:mm-kinematics}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{本章与相邻章节的关系}
+\addcontentsline{toc}{section}{本章与相邻章节的关系}
+
+本章向上承接 \cref{ch:mm-kinematics}（底盘臂联合运动学、联合雅可比、base placement）与 \cref{ch:unified-multimodal-mpc}（SE(3) 误差几何 \cref{sec:umm-se3}、自碰撞 $+$ 松弛障碍 \cref{sec:umm-collision}），并以 \cref{ch:constrained-dynamics}（Pfaffian 非完整约束）、\cref{sec:ak-redundancy}（冗余零空间）为横向支柱。它与 \cref{ch:unified-multimodal-mpc} 的全身\emph{动力学} MPC 互为对照：那里动力学是任务本质（接触切换、动态平衡），这里动力学可委托给下层（低速、速度环已闭环）——同一套 SE(3) 误差与松弛障碍工具，在两个抽象层次上各得其所。
+
+\begin{practice}[本章练习]
+\begin{enumerate}
+  \item \textbf{（流图线性化）} 取 $n_a=2$。按 \cref{eq:mmocp-flow} 写出完整流图，手推 $\mathbf A=\partial\mathbf f/\partial\mathbf x$ 与 $\mathbf B=\partial\mathbf f/\partial\mathbf u$（应与 \cref{eq:mmocp-AB} 的结构一致），并指出 $\mathbf A$ 中两个非零元为何都正比于 $v$。
+  \item \textbf{（Gauss--Newton 的边界）} 解释为何残差 $\mathbf e$ 大时 \cref{eq:mmocp-lxx} 偏离真 Hessian，以及为何这在滚动 MPC 里仍可接受。设计一个「随时间推进的末端参考」如何缓解远目标收敛慢。
+  \item \textbf{（非完整后果）} 设末端目标恰在底盘正侧方 $1\,\mathrm{m}$ 处。结合 \cref{eq:mmocp-pfaffian} 说明：为什么差速底盘不能直接平移过去？给出两种\emph{不靠盲调权重}的对策。
+  \item \textbf{（约束归类）} 现要新增一项「底盘朝向正则」$\ell_b=\tfrac12 w_\theta\,\mathrm{wrap}(\theta_b-\theta_{\text{ref}})^2$。它依赖状态还是输入？是「不理想」还是「不允许」？据此判断它该作代价还是约束、用哪种惩罚，并说明 $\theta_{\text{ref}}$ 从哪来（\cref{ch:mm-kinematics}）。
+  \item \textbf{（碰撞对设计）} 对一台「差速底盘 $+$ 六轴臂 $+$ 夹爪」，列出你会保留的 $3$--$5$ 个自碰撞对，并说明为何\emph{不}把所有连杆两两组合。结合 \cref{eq:mmocp-ddq} 解释每加一对的求解开销。
+\end{enumerate}
+\end{practice}

@@ -1,0 +1,1717 @@
+\chapter{训练诊断与调参地图}\label{ch:rlmc-diag}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章（收口诊断章）。
+%  主线：算法/原理领路 —— 先讲「五大训练指标各自测量学习过程的哪个维度、
+%  它们的联合模式意味着什么」，再落到 mjlab / Isaac Lab / UniLab 三框架的
+%  对比工程实践（日志键名、配置入口、回放命令）。理论引导，工程兑现。
+%  源稿 RL运控/Ch25_训练诊断与全书调参地图.md（实践偏重）已按本主线重构。
+%  关键 API/版本/论文归属做了联网核对（见各 \rebuilt / \pz 标注与章末「待核实」）：
+%    - RSL-RL 自适应 KL：解析高斯 KL，阈值 desired_kl*2 / /2，lr ×1.5 / ÷1.5，
+%      界 [1e-5,1e-2]；desired_kl=0.01、entropy_coef=0.01、max_grad_norm=1.0
+%      （leggedrobotics/rsl_rl 源码核对）。当前 RSL-RL 不内置 reward/value 归一化。
+%    - HoST arXiv:2502.08378 RSS'25 Best Systems Paper Finalist（OpenRobotLab）。
+%    - ASAP arXiv:2502.01143 RSS'25（LeCAR-Lab/CMU）。
+%    - WoCoCo arXiv:2406.06005 CoRL'24（Zhang et al.）。
+%    - L2C2 arXiv:2202.07152 IROS'22（Kobayashi）；CAPS ICRA'21（Mysore et al.）。
+%    - Pardo time limits arXiv:1712.00378 ICML'18（PEB）。
+%    - AGILE arXiv:2603.20147（NVIDIA Isaac，2026-03，含三 GUI + reward visualizer）。
+%  UniLab 槽位：源稿仅含 mjlab + Isaac Lab；UniLab 三框架内容已据 gpufree 实跑核验
+%    填实（PPO 同 rsl-rl 族键名、APPO/off-policy 异构面板、sim2sim 契约关卡、
+%    NanGuard 离线复现、/dev/shm 容量溢出失败面），并非占位。诚实标注的真实局限：
+%    UniLab 26 任务全本体感知、无 AGILE 式预检 GUI——属有据事实，非待补。
+% ════════════════════════════════════════════════════════════════
+
+前面整部从接口契约（\cref{ch:rlmc-obsact} 的观测/动作）到价值形状（奖励/课程/终止），再到训练管线（\cref{ch:rlmc-training} 的 PPO 数据流与超参）一路把环境与训练器搭通了。大规模训练（\cref{ch:rlmc-largescale}）解决的是"如何把训练跑得更大更快"——多 GPU、NaN 排查、吞吐优化。但\textbf{跑得快不等于跑得好}：reward 在涨而机器人抖动、entropy 暴跌而动作退化、KL 突然飙升而策略崩溃——这些都是训练已经在运行、却结果不尽人意的问题。
+
+本章的主线不是再推一遍 PPO 公式（强化学习理论部已给出演员-评论家与策略梯度的完整数学，见 \cref{ch:rl-ac}），而是建立一套\textbf{系统性的训练诊断方法论}：让你不再靠直觉猜参数，而是\emph{从指标组合的模式出发，定位问题根源，再在全书已有的调参工具中找到对应修复手段}。换句话说，本章是一张\textbf{从症状到解法的路由地图}——它本身不发明新算法，而是把前面各章的工具按"训练病症"重新索引。
+
+\begin{note}
+本章假定读者已掌握 PPO 的基本量：策略熵（entropy）、KL 散度、优势函数与 GAE、价值损失（value loss）的含义。这些由理论部负责（\cref{ch:rl-ac}）。本章只讲\textbf{这些量在真实训练日志里长什么样、它们的联合形态意味着什么、以及在 mjlab/Isaac Lab 里去哪个键名读它们}。若对 timeout 自举（value bootstrap）不熟，先回看 \cref{ch:rlmc-training} 的 wrapper 四职责。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-diag-setup}
+
+诊断不引入新的物理后端，它复用训练管线已装好的栈，只额外要求\textbf{日志后端}（WandB 或 TensorBoard）和\textbf{回放能力}。三框架的诊断相关组件如下表。最关键的事实是：mjlab 与 Isaac Lab \textbf{共用 RSL-RL 训练后端}，因此本章绝大多数指标键名在两框架间高度一致；唯一的差异是两者打包的 \texttt{rsl-rl-lib} \textbf{版本不同}（mjlab 5.2.0 vs Isaac Lab 3.1.2），导致 value loss 键（\verb|Loss/value| vs \Verb[breaklines]|Loss/value_function|）与动作标准差键（\Verb[breaklines]|Policy/mean_std| vs \Verb[breaklines]|Policy/mean_noise_std|）两处不同名（源码核对，见 \cref{sec:rlmc-diag-dashboards} 的 pitfall），外加日志目录布局与少数 CLI 入口差异。
+
+\begin{table}[H]
+\centering
+\caption{三框架诊断栈（gpufree 实跑 + 联网核对，截至 2026-06；版本号均为本地实测）}
+\label{tab:rlmc-diag-versions}
+\begin{tabular}{llll}
+\hline
+组件 & mjlab & Isaac Lab & UniLab \\
+\hline
+RL 训练库 & RSL-RL 5.2.0 & RSL-RL 3.1.2 / RL-Games / SKRL & rsl-rl(PPO/APPO) $+$ SAC/TD3/FlashSAC \\
+日志后端 & TensorBoard / W\&B & TensorBoard / W\&B / Neptune & TensorBoard $+$ Viser web；APPO/off-policy 自带面板 \\
+回放命令 & \Verb[breaklines]|uv run play| & \Verb[breaklines]|rsl_rl/play.py| & \Verb[breaklines]|uv run eval ... --load-run -1| \\
+指标键名族 & RSL-RL 命名 & RSL-RL 命名（同 mjlab） & PPO 同 RSL-RL 族；APPO/SAC 另有键 \\
+NaN 守卫 & \Verb[breaklines]|--enable-nan-guard| & 视后端而定 & \verb|NanGuard|（默认开）$+$ \Verb[breaklines]|unilab-viz-nan| \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{note}
+Isaac Lab 2.3 同时内置 RSL-RL、RL-Games、SKRL、Stable-Baselines3、Ray 多个 RL 后端，其中多 GPU 训练仅 RSL-RL / RL-Games / SKRL 支持（官方文档核对）。本章诊断主线以 \textbf{RSL-RL 后端}为准（与 mjlab 同源，键名族基本一致），RL-Games 的差异单列。\textbf{版本实测}（gpufree，2026-06）：mjlab 1.4.0 装 \texttt{rsl-rl-lib} \textbf{5.2.0}、Isaac Lab 2.3.2 装 \texttt{rsl-rl-lib} \textbf{3.1.2}——两版的 PPO 默认超参一致（见下表），但少数日志键名因版本演进改名（\Verb[breaklines]|Loss/value(_function)|、\Verb[breaklines]|Policy/mean(_noise)_std|）。各环境请以 \texttt{pip show rsl-rl-lib} 实际输出为准。
+\end{note}
+
+\paragraph{分操作系统步骤（最小要点）。}诊断方法本身\emph{不依赖} OS：曲线读法、模式识别、症状索引在任何平台一致。仅日志可视化的本地查看略有差别——TensorBoard 在三平台命令相同（\Verb[breaklines]|tensorboard --logdir <dir>|），WandB 走浏览器无关 OS。UniLab 复用 \verb|uv| 工作流安装（\Verb[breaklines]|uv sync --extra mujoco| 或 \Verb[breaklines]|--extra motrix| 选物理后端），曲线走 TensorBoard，远程行为查看走 Viser web 3D（\Verb[breaklines]|--render-mode interactive|，无 X 服务器也能在浏览器看），回放走 \Verb[breaklines]|uv run eval ... --render-mode record|（headless 录视频）。UniLab 是\textbf{异构架构}（物理仿真在 CPU 多线程、策略学习在 GPU，二者经共享内存解耦），故诊断时多一个 mjlab/Isaac 没有的视角——\verb|/dev/shm| 共享内存预算（见 \cref{sec:rlmc-diag-advanced} 的 NaN 分类补注）。
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：五分钟读懂一次训练}
+\addcontentsline{toc}{section}{Quick Start：五分钟读懂一次训练}
+\label{sec:rlmc-diag-quickstart}
+
+诊断的"最小可跑"不是再启一次训练，而是\textbf{对着一次正在跑或已跑完的训练，五分钟内把五大指标和一次行为回放都看一遍}。下面给出 mjlab、Isaac Lab 与 UniLab 三框架的最小读盘序列。
+
+\begin{codebox}[bash]{mjlab:五分钟诊断读盘}
+# 0) 最稳的起手式（gpufree 实跑:第一条命令必跑通）——先不连 WandB，避免无 key 崩在第一步
+#    WANDB_MODE=disabled 让 logger 退化为本地 TensorBoard 事件，照样能看五大曲线
+WANDB_MODE=disabled uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+  --env.scene.num-envs 4096 --agent.max-iterations 500
+# 1) 确认要上 WandB 再去配 key（缺 key 时 --agent.logger wandb 会直接报错退出）
+uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+  --agent.logger wandb --agent.wandb-project diag_demo \
+  --env.scene.num-envs 4096 --agent.max-iterations 500
+
+# 2) 本地看曲线（五大维度:reward / entropy / value_loss / ep_len 直接有曲线;
+#    KL 不单独记，看 Loss/learning_rate 的自适应锯齿即等价读出 KL 步幅）
+tensorboard --logdir /tmp/mjlab/logs/
+
+# 3) 行为回放（数字看不出的问题靠眼睛）——每次只看 30 秒
+uv run play Mjlab-Velocity-Flat-Unitree-G1 \
+  --agent.load-run <run_name> --num-envs 4
+\end{codebox}
+
+\begin{codebox}[bash]{Isaac Lab:等价读盘（RSL-RL 后端）}
+# 训练 + WandB
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0 \
+  --logger wandb --num_envs 4096 --max_iterations 500
+
+# 回放
+python scripts/reinforcement_learning/rsl_rl/play.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab:等价读盘（rsl-rl PPO 后端，异构 CPU-sim）}
+# 1) 启一次带日志的小训练（env 数/迭代数走 Hydra 覆盖，不是 flag）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+  algo.num_envs=4096 algo.max_iterations=500
+# 注:物理在 CPU 多线程跑、策略在 GPU 学;二者经共享内存解耦
+
+# 2) 本地看曲线（PPO 走 rsl-rl，键名族同 mjlab:Train/mean_reward、Loss/entropy、
+#    Loss/value;KL 不单独记，看 Loss/learning_rate）
+tensorboard --logdir logs/
+
+# 3) 行为回放（远程无 X 用 Viser;本地录视频用 record）
+uv run eval --algo ppo --task go2_joystick_flat --sim mujoco \
+  --load-run -1 --render-mode record
+\end{codebox}
+
+\begin{note}
+mjlab 1.4.0 实测 \verb|list-envs| 的 Unitree 速度任务只有 \textbf{G1}（人形）与 \textbf{Go1}（四足）两种机器人（\Verb[breaklines]|Mjlab-Velocity-{Flat,Rough}-Unitree-{G1,Go1}|），\textbf{没有 Go2}（gpufree 实跑核对，共 12 个任务）；本章为与源稿四足案例连贯，正文常以"Go2"为例讲数值与现象，命令里出现的 \verb|...Go2...| 或 \verb|My-...-Go2-v0| 均是\emph{示意/你自建}的任务名，请替换成你机器上 \verb|list-envs| 真实输出的那一个（mjlab 真实四足请用 \verb|Go1|）。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{前置自测}
+\addcontentsline{toc}{section}{前置自测}
+\label{sec:rlmc-diag-pretest}
+
+\begin{practice}[前置自测：答错 $\ge 3$ 题，先回 \cref{ch:rlmc-reward} 与 \cref{ch:rlmc-training} 复习]
+\begin{enumerate}
+  \item PPO 的 \verb|desired_kl| 在 RSL-RL 中起什么作用？当实际 KL 超过它时框架做了什么？（答错回看 \cref{ch:rlmc-training} 的自适应 KL 学习率）
+  \item 你的 reward 由 tracking + regularization + contact 三类构成，WandB 上应看到几条分项曲线？只看到总 reward 说明遗漏了什么配置？（答错回看 \cref{ch:rlmc-reward} 的 RewardManager 分项日志）
+  \item PPO 的 entropy bonus 是什么？entropy 趋近零意味着什么？（答错回看 \cref{ch:rl-ac} 与 \cref{ch:rlmc-training}）
+  \item \verb|time_out=True| 与 \Verb[breaklines]|time_out=False| 对 value bootstrapping 有什么不同影响？（答错回看 \cref{ch:rlmc-reward} 的终止设计与 \cref{ch:rlmc-training} 的 wrapper 四职责）
+  \item 训练中出现 NaN 后，应先做什么、不应先做什么？（答错回看 \cref{ch:rlmc-largescale} 的 NaN 排查）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章目标}
+\addcontentsline{toc}{section}{本章目标}
+\label{sec:rlmc-diag-goals}
+
+学完本章，你应当能够：
+
+\begin{enumerate}
+  \item \textbf{联合阅读}五大训练指标（reward / KL / entropy / value\_loss / episode\_length），从曲线形态识别至少九种典型训练模式。
+  \item \textbf{使用}症状驱动调参索引表，在 30 秒内从训练症状定位到应调的参数与对应章节。
+  \item \textbf{执行}从 smoke test $\to$ zero agent $\to$ random agent $\to$ 小规模训练 $\to$ 诊断 $\to$ 修复的完整调试工作流，并在每个 Phase 说出验收标准。
+  \item \textbf{区分}并\textbf{配置} mjlab、Isaac Lab 与 UniLab 的日志系统，在三框架中都能定位分项 reward、KL、entropy、value\_loss 的键名（含 UniLab PPO 同 rsl-rl 族、APPO/off-policy 另有面板的差异）。
+  \item \textbf{设计}消融实验隔离 reward / obs / action / DR 各模块对训练结果的独立影响，并能算出公平对比所需的最小 seed 数。
+  \item \textbf{应用}三层平滑性检查与 L2C2 / action rescaler / Butterworth 工具，定位并修复策略在真机上的可部署性问题。
+  \item \textbf{分类}训练中的 NaN（数值崩溃 / 复现失败 / 性能退化 / 容量溢出）并定位到对应排查路径。
+\end{enumerate}
+
+目标全部用"能联合阅读 / 使用 / 执行 / 配置 / 设计 / 应用 / 分类"这类\emph{可测}动词，而非"理解/掌握/熟悉"。本章难度中上，核心在"指标的联合语义"与"症状到根因的因果链"，而非任何单一公式。
+
+% ════════════════════════════════════════════════════════════════
+\section*{知识导航}
+\addcontentsline{toc}{section}{知识导航}
+\label{sec:rlmc-diag-nav}
+
+\begin{forest} navtreeLR
+[{训练诊断与调参地图}
+  [{五大仪表盘}
+    [{Reward 形态解剖}]
+    [{KL / Entropy / Value Loss}]
+    [{Episode Length 信号}] ]
+  [{联合诊断}
+    [{九种通用模式}]
+    [{五种人形特有模式}]
+    [{识别速查流程}] ]
+  [{路由与工具}
+    [{症状$\to$参数索引表}]
+    [{三框架日志键名}]
+    [{贯穿案例六阶段}] ]
+  [{高级与部署}
+    [{Reward 分解 / Forensics}]
+    [{NaN 四类分类}]
+    [{三层平滑性 + L2C2}] ]
+]
+\end{forest}
+
+\paragraph{前置桥接。}\cref{ch:rlmc-training} 教了"每个 PPO 超参单独是什么意思"；本章关心的是"一组指标的\emph{联合}行为"——同一个学习过程在五条曲线上的投影。\cref{ch:rlmc-reward} 教了"怎么设计 reward"；本章关心"设计好之后，训练出来的 reward 曲线\emph{反过来}告诉了你什么"。诊断是这两章的\textbf{读出方向}（read-out），而它们是\textbf{写入方向}（write-in）。
+
+\paragraph{阅读时间（三档）。}精读全章约 150 分钟（含动手跑一次贯穿案例）；速读主线（\cref{sec:rlmc-diag-dashboards}、\cref{sec:rlmc-diag-patterns}、\cref{sec:rlmc-diag-index} 三节 + 各节本质洞察）约 50 分钟；查阅式（遇到具体症状直接跳 \cref{sec:rlmc-diag-index} 索引表 + 章末故障排查手册）约 10 分钟。
+
+% ════════════════════════════════════════════════════════════════
+\section{五大仪表盘：训练指标的物理直觉}
+\label{sec:rlmc-diag-dashboards}
+
+\paragraph{模块功能与在管线中的位置。}训练指标是 PPO 训练循环（rollout $\to$ GAE $\to$ update）在每个 iteration 末尾向日志后端吐出的\emph{投影}。它们不参与训练（不进梯度），但它们是你\textbf{唯一能看见训练内部状态的窗口}。这一节建立对五个核心指标的物理直觉，使你能"读懂"训练而非只是盯着 reward 等它涨。
+
+\subsection{动机：为什么必须同时看多个指标}
+
+一个跨领域类比能帮上忙：训练指标之于 RL 工程师，就像仪表盘之于驾驶员。油量表（reward）报目标方向是否正确，转速表（KL 散度）报引擎负荷是否合理，水温表（value loss）报散热是否正常，时速表（episode length）报实际行驶效率。有经验的驾驶员从不只盯油量表——"油量正常但转速飙红"意味着\emph{还在前进但引擎快坏了}。同理，"reward 在涨但 KL 也在飙"意味着\emph{策略在改善但学习过程在失控}。
+
+这个类比有边界，且边界本身有教学价值：汽车仪表之间的因果\emph{大多单向}（发动机过热$\to$水温升高），而训练指标之间的因果是\textbf{循环}的——reward 设计影响 value target $\to$ 影响 GAE $\to$ 影响策略更新 $\to$ 改变 rollout 分布 $\to$ 又改变 reward。正因为这个环路，单看一个指标永远不够。
+
+\begin{insight}[诊断的本质是读"相对模式"而非"绝对值"]\label{ins:rlmc-diag-pattern}
+训练诊断的核心\textbf{不是任何单个指标的绝对值}，而是\textbf{多个指标之间的相对变化模式}。一个指标的"异常"往往要靠另一个指标来\emph{确认与解释}：Reward 上涨 $+$ KL 稳定 $=$ 健康学习；Reward 上涨 $+$ KL 飙升 $=$ 即将崩溃。同一条上涨的 reward 曲线，配不同的 KL/entropy，结论可以完全相反。记住这一点，本章后面的"九种模式"就只是这条洞察的展开。
+\end{insight}
+
+\paragraph{反事实：只看 reward 会怎样。}假设你的诊断工具只有 reward 曲线，它在稳步上升，你判定一切正常。但实际上可能：(1) KL 已超 \verb|desired_kl| 三倍，每次 update 策略改变过大，崩溃在即；(2) entropy 已近零，策略锁定在一个\emph{恰好是 reward hacking} 的确定性动作上；(3) value loss 在振荡，critic 跟不上 actor，GAE 方差变大。等 reward 真掉下来，你已浪费数小时且不知何时起出的问题。同时监控五个指标，能让你在 reward 下降\emph{之前}就发现征兆。
+
+\subsection{配置详解：五大核心指标}
+
+下表给出五大指标的物理直觉、经验健康范围与异常信号。"经验值"一栏均为\emph{经验区间}而非硬阈值——具体任务会偏移，见各列注。
+
+\begin{table}[H]
+\centering
+\caption{五大核心训练指标速览（经验区间，非硬阈值）}
+\label{tab:rlmc-diag-five}
+\begin{tabular}{p{2.2cm}p{3.0cm}p{3.4cm}p{3.4cm}}
+\hline
+指标 & 物理直觉 & 健康范围（经验值） & 异常信号 \\
+\hline
+Reward（总/分项） & 策略的"成绩单" & 持续上升或稳定在合理水平 & 突降、振荡、过早饱和 \\
+KL 散度 & 每次 update 走了多远 & $0.005\sim0.02$（\verb|desired_kl| 附近） & $>0.05$ 学太快，$<0.001$ 学太慢 \\
+Entropy & 策略的"犹豫程度" & 缓慢下降（探索$\to$收敛） & 骤降（过早收敛），不降（学不到） \\
+Value Loss & Critic 预测误差 & 先升后降，最终稳定 & 持续上升或剧烈振荡 \\
+Episode Length & 策略"活了多久" & 逐步趋近 \Verb[breaklines]|max_episode_length| & 卡在很短值不增长 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{note}
+关于 KL 的一个实现事实：上表把 KL 当"核心仪表"是\emph{概念}层面的——它确实是判断学习步幅的关键量。但在 rsl-rl 的 \Verb[breaklines]|OnPolicyRunner|（mjlab 5.2.0 / Isaac 3.1.2 均如此）里，KL \textbf{只被算来驱动自适应学习率、并不单独 \texttt{add\_scalar} 成一条曲线}（源码核对）。所以面板上你\emph{直接}看到的是 \Verb[breaklines]|Loss/learning_rate| 的锯齿——它与 KL 一一对应（KL 偏高则 lr 被砍、偏低则 lr 被抬，见 \cref{sec:rlmc-diag-process}）。下文凡说"看 KL"，在 rsl-rl 后端即"看 learning\_rate 的自适应轨迹"；要 KL 数值曲线须自行加一行日志。RL-Games 后端则原生有 \verb|info/kl|。
+\end{note}
+
+配置项四维表（针对最易误配的 \verb|desired_kl| 与 \verb|entropy_coef|）：
+
+\begin{table}[H]
+\centering
+\caption{两个高频误配项的四维配置表（RSL-RL 后端，源码核对）}
+\label{tab:rlmc-diag-config4}
+\begin{tabular}{p{2.2cm}p{2.4cm}p{3.0cm}p{2.4cm}p{2.6cm}}
+\hline
+配置项 & 默认值（来源） & 修改影响 & 合理范围 & 与其他配置耦合 \\
+\hline
+\verb|desired_kl| & \verb|0.01|（RSL-RL \verb|ppo.py| 默认） & 自适应 lr 的目标步幅；调大$\to$学得猛 & $0.005\sim0.02$ & 与 \Verb[breaklines]|num_learning_epochs|、\Verb[breaklines]|num_mini_batches| 共同决定实际 off-policy 程度 \\
+\verb|entropy_coef| & \verb|0.01|（同上） & 探索强度；过大阻止收敛 & $0.001\sim0.01$ & 与 reward 是否易 hack 耦合；不能替代修 reward \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[把 RSL-RL 的 entropy\_coef 默认值记成 0.001]
+不少教程与旧仓库把 entropy bonus 系数写成 \verb|0.001|。经 leggedrobotics 的 \Verb[breaklines]|rsl_rl/algorithms/ppo.py| 源码核对，\textbf{当前 RSL-RL 的 \texttt{entropy\_coef} 默认值是 \texttt{0.01}}（\verb|desired_kl| 默认同为 \verb|0.01|，\verb|max_grad_norm| 默认 \verb|1.0|）\cite{schwarke2025rslrl}。\textbf{现象后果}：你以为自己"提高了探索"，实则只是把别人本就更高的默认值\emph{调回去}。\textbf{根本原因}：不同框架/不同年代默认值不同，凭记忆调参。\textbf{正确做法}：调任何超参前，先 \verb|print| 一次实际生效的配置（或读 run 目录里保存的 \verb|config.yaml|），以\emph{你这次训练真正加载的值}为基线。
+\end{pitfall}
+
+\subsection{代码走读：mjlab 与 Isaac Lab 的指标键名}
+
+在 mjlab 中，五大指标由 RSL-RL 的 on-policy runner 自动记录到 WandB/TensorBoard。下面是核心键名（路径名族两框架共享，因为同源）。
+
+\begin{codebox}[Python]{mjlab + RSL-RL 自动记录的核心指标键名（rsl\_rl 5.2.0，源码核对）}
+# WandB / TensorBoard 面板中的 key（mjlab 装的 rsl-rl-lib 5.2.0:utils/logger.py）
+"Loss/value"                 # value loss（loss_dict 键名 = "value"）
+"Loss/surrogate"             # PPO surrogate（策略损失）
+"Loss/entropy"              # 策略 entropy（nats）——经 loss_dict 落在 Loss/ 前缀，非 Policy/
+"Loss/learning_rate"         # 当前学习率（自适应 KL 调出，是 KL 步幅的可见代理）
+"Policy/mean_std"            # 动作分布平均标准差（与 entropy 同源）
+"Perf/total_fps"             # 训练吞吐
+"Train/mean_reward"          # 平均 episode 总回报（完成 episode 的 cur_reward_sum 均值）
+"Train/mean_episode_length"  # 平均 episode 长度
+"Episode_Reward/<term_name>" # 每个 reward term 的分项曲线（÷max_episode_length_s，关键！）
+# 注意:rsl-rl 5.2.0 不单独 add_scalar 记 KL（KL 仅用于自适应 lr）;
+#       要观察"步幅"看 Loss/learning_rate 的锯齿即可.
+\end{codebox}
+
+\begin{pitfall}[把 Isaac Lab 的 RSL-RL 键名当成 mjlab 的逐字节同名]
+\textbf{错误描述}：以为 mjlab 与 Isaac Lab 的 RSL-RL 键名完全一致。\textbf{现象后果}：照 Isaac 的 \Verb[breaklines]|Loss/value_function|/\allowbreak\Verb[breaklines]|Policy/mean_noise_std| 在 mjlab 面板里搜不到。\textbf{根本原因}：两框架打包的 \texttt{rsl-rl-lib} 版本不同——mjlab 装 \textbf{5.2.0}（\Verb[breaklines]|utils/logger.py|，value loss 键 \verb|Loss/value|、动作标准差键 \Verb[breaklines]|Policy/mean_std|），Isaac Lab 装 \textbf{3.1.2}（\Verb[breaklines]|on_policy_runner.py|，对应 \Verb[breaklines]|Loss/value_function|、\Verb[breaklines]|Policy/mean_noise_std|）。两版都\textbf{不}单独记 KL、都把 entropy 记成 \verb|Loss/entropy|、都把分项 reward 记成 \Verb[breaklines]|Episode_Reward/<term>|。\textbf{正确做法}：以\emph{你这台机器实际装的版本}（\Verb[breaklines]|pip show rsl-rl-lib|）为准读键名；本章下文凡涉及具体键名均按"mjlab=5.2.0 / Isaac=3.1.2"分别标注。
+\end{pitfall}
+
+关键工程细节：\Verb[breaklines]|Policy/mean_std|（Isaac 侧 \Verb[breaklines]|mean_noise_std|）与 entropy 是\textbf{同一件事的两种表述}。RSL-RL 的高斯策略熵由动作分布标准差决定，对动作维度 $d$、各维标准差 $\sigma_i$：
+\begin{equation}
+H(\pi) = \frac{d}{2}\big(1 + \ln 2\pi\big) + \sum_{i=1}^{d} \ln \sigma_i .
+\label{eq:rlmc-diag-entropy}
+\end{equation}
+因此 \verb|mean_std|（动作平均标准差）下降 $\Leftrightarrow$ entropy 下降。面板上分开显示只是为了两种直觉：\Verb[breaklines]|Policy/mean_std| 直接对应"动作随机性幅度"（更工程），\verb|Loss/entropy| 对应信息论度量（更数学）。
+
+Isaac Lab 用 RSL-RL 后端时键名族与 mjlab \textbf{基本同构}（都来自 rsl-rl 的 \Verb[breaklines]|OnPolicyRunner|），但因打包版本不同有两处差异：Isaac（3.1.2）的 value loss 键是 \Verb[breaklines]|Loss/value_function|、动作标准差键是 \Verb[breaklines]|Policy/mean_noise_std|，而 mjlab（5.2.0）分别是 \verb|Loss/value|、\Verb[breaklines]|Policy/mean_std|（见上方 pitfall）；其余键（\Verb[breaklines]|Loss/surrogate|、\verb|Loss/entropy|、\Verb[breaklines]|Train/mean_reward|、\Verb[breaklines]|Episode_Reward/<term>|）两版一致。换 RL-Games 后端则完全不同：
+
+\begin{codebox}[Python]{Isaac Lab + RL Games 后端的指标键名（与 RSL-RL 不可直接比）}
+"losses/a_loss"          # actor loss
+"losses/c_loss"          # critic loss
+"info/kl"                # KL（近似 KL，基于 ratio/log_ratio）
+"info/entropy"           # entropy
+"episode_lengths/step"   # episode length
+"rewards/step"           # reward
+\end{codebox}
+
+\begin{pitfall}[跨 RL 后端直接比较 KL / entropy / value\_loss 的绝对值]
+RL-Games 用\textbf{近似 KL}（基于 ratio 与 log\_ratio），RSL-RL 用\textbf{解析 KL}（高斯分布的闭式 KL，经 \texttt{rsl\_rl} 源码核对）。\textbf{现象后果}：同一份训练在两后端的 KL 数值不同，你若按同一阈值判读会误判。\textbf{根本原因}：KL/entropy/value 的计算口径随后端实现而变。\textbf{正确做法}：只在\emph{同一后端}的不同实验间比较绝对值；跨后端只看\emph{变化趋势}（升/降/振荡），不看具体数。
+\end{pitfall}
+
+\paragraph{UniLab：PPO 同族、APPO/SAC 另有键。}UniLab 的 PPO 也跑在 rsl-rl 上（用其自定义的 \Verb[breaklines]|FinalObservationAwarePPO|，源码核对 UniLab \Verb[breaklines]|algos/torch/rsl_rl_ppo.py|），因此 PPO 训练的指标键名\textbf{与 mjlab/Isaac 的 rsl-rl 族同构}（\verb|Loss/value|、\verb|Loss/entropy|、\Verb[breaklines]|Train/mean_reward| 等，具体 \verb|value| vs \Verb[breaklines]|value_function| 随其装的 rsl-rl 版本；KL 不单独记），分项 reward 由 \Verb[breaklines]|run_reward_dispatch| 写到 \verb|info["log"]| 的 \Verb[breaklines]|reward/<term_name>| 键（每 4 步一次，实跑核对，逐项均出现）。真正的差异在 UniLab 的\textbf{异步与 off-policy 算法}——它们各带一组 mjlab/Isaac 没有的诊断面板：
+
+\begin{codebox}[Python]{UniLab APPO / off-policy 特有诊断面板（实跑核对）}
+# APPO（异步 PPO，最能体现 CPU-sim/GPU-policy 异构解耦）独有面板:
+"Weight Sync"            # learner->collector 权重同步耗时（ms），异构开销度量
+"H2D Copy"               # CPU->GPU 主机到设备拷贝耗时（ms）
+"Rollouts Read"          # learner 每 iter 读到的 rollout slot 数
+"Staging Pool"           # ring buffer slot 占用（如 3/3）
+"Available On Arrive"    # learner 醒来时可用 slot 数（衡量 collector 是否喂得上）
+"Vtrace/Rho Clip Fraction"  # V-trace 离策略校正的 rho 截断比例（off-policy 程度）
+# off-policy(SAC/TD3/FlashSAC):标准 SAC 量 + replay/H2D 流水线计时
+\end{codebox}
+
+这些面板是异构架构的\emph{直接读数}：\Verb[breaklines]|Available On Arrive| 持续偏低说明 collector（CPU 物理）跟不上 learner（GPU 学习）、瓶颈在 CPU 核数；\Verb[breaklines]|Vtrace/Rho Clip Fraction| 偏高说明 collector 用的策略权重太旧（off-policy 程度大），需缩短权重同步周期。\textbf{诊断含义与 RL-Games 的 \cref{tab:rlmc-diag-logmap} 同理——跨算法只比趋势不比绝对值}：APPO 的 KL 因 V-trace 离策略校正、口径与同步 PPO 不同。
+
+\subsection{Episode Length：被低估的诊断信号}
+
+Episode length 常被忽视，却是最直观的任务成功度代理：在多数 locomotion 任务里，episode 提前结束 $=$ 机器人摔倒，所以 length 上升 $=$ 活得更久 $=$ 策略在变好。它真正的诊断价值在于与 reward 的\textbf{不一致性}：
+
+\begin{table}[H]
+\centering
+\caption{Reward 与 Episode Length 的四种组合及其含义}
+\label{tab:rlmc-diag-rewlen}
+\begin{tabular}{p{4.2cm}p{8.0cm}}
+\hline
+Reward vs Episode Length & 含义 \\
+\hline
+都涨 & 健康——活得更久且得分更高 \\
+Reward 涨 / length 不涨 & 在短 episode 内拿高分（可能 hacking） \\
+Reward 不涨 / length 涨 & 学会了"存活"但没学会"做任务" \\
+Reward 涨 / length 降 & 变快了——更短时间拿同样分（某些任务是好事） \\
+\hline
+\end{tabular}
+\end{table}
+
+特别注意：\Verb[breaklines]|max_episode_length| 触发的是 time\_out 终止，其 value bootstrapping 行为取决于 \verb|time_out=True|（回看 \cref{ch:rlmc-reward}：\verb|time_out=True| 表示这不是"失败终止"，PPO 会对末状态做 value bootstrap 而非假设后续 return 为零）。从诊断角度看：如果 episode length 始终顶到 max 且 reward 不再涨，可能需要增大 \Verb[breaklines]|max_episode_length|。
+
+\subsection{运行验证}
+
+启动一次 500 iteration 的小训练后，对照 \cref{tab:rlmc-diag-five} 检查：reward 有正向趋势、KL 落在 $0.001\sim0.03$、entropy 从初值开始下降、value loss 是有限非零数、episode length 有增长趋势。看日志时把 WandB smoothing 同时设 0.6（看趋势）和 0（看突变）两条线叠加——只设高 smoothing 会掩盖突发崩溃（见 \cref{sec:rlmc-diag-reward} 的平滑陷阱）。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[WandB 未记录分项 reward，只看得到总 mean\_reward]
+\textbf{错误描述}：面板里只有 \Verb[breaklines]|Train/mean_reward| 一条线，看不到每个 term 的分项曲线。\textbf{现象后果}：reward 行为异常时无法定位是\emph{哪一项}出了问题（tracking 太易？还是 regularization 太弱？）。\textbf{根本原因}：未在面板里展开分项曲线，或误以为分项要手动开。\textbf{正确做法}：mjlab/Isaac 的 RewardManager \emph{默认}就把每个 reward term 的每秒平均经 \verb|extras| 记到 \Verb[breaklines]|Episode_Reward/<term_name>|（rsl-rl 的 logger 见 key 含 \texttt{/} 即原样写出），面板里这些曲线本就在、只需找到并叠加；看不到一般是面板没加这一组、而非没记。终止/课程分项同理在 \Verb[breaklines]|Episode_Termination/<term>|、\Verb[breaklines]|Curriculum/<term>|（\cref{ch:rlmc-reward}）。
+\end{pitfall}
+
+\begin{pitfall}[误以为 KL 越小越好]
+\textbf{错误描述}：把 KL 接近零当作"训练稳"。\textbf{现象后果}：策略几乎不更新，训练停滞却被当成"收敛"。\textbf{根本原因}：把"步幅小"误读为"安全"。\textbf{正确做法}：KL 应围绕 \verb|desired_kl|（默认 0.01）波动；过高是更新过猛，过低是学习停滞——两者都要干预。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[操作]} 在 mjlab 启一个速度跟踪训练并配 WandB，跑 500 iteration，截图面板并标注五大指标位置。\emph{验收}：能指出哪些指标默认就在面板、哪些（如分项 reward 叠加图）需手动加。
+  \item \textbf{[分析]} 若 \Verb[breaklines]|Policy/mean_std|（Isaac 侧 \Verb[breaklines]|mean_noise_std|）从 1.0 降到 0.01 但 \Verb[breaklines]|Train/mean_reward| 没提升，说明什么？\emph{验收}：用 \eqref{eq:rlmc-diag-entropy} 解释"策略变确定但确定到了一个无用动作"，并指出这对应后文哪种模式。
+  \item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-training}：把 \Verb[breaklines]|num_learning_epochs| 从 5 提到 20，预测 KL 与 value\_loss 如何变，写出推理再用实验验证。\emph{验收}：预测里必须出现"每批数据被复用更多次$\to$更 off-policy$\to$KL 上升"的因果链。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Reward 曲线深度解读}
+\label{sec:rlmc-diag-reward}
+
+\paragraph{模块功能与在管线中的位置。}Reward 曲线是诊断里你最先看、也最容易被它\emph{骗}的指标。这一节把"涨了/跌了"细化为六种形态，并强调一个反直觉的结论：\textbf{Reward 是诊断数值问题时最后看的证据，不是最先看的}。
+
+\subsection{动机：reward 的六种典型形态}
+
+一条 reward 曲线的\textbf{形态}（上升速率、平台位置、波动幅度、是否突变）远比"最终涨了多少"信息量大。
+
+\begin{table}[H]
+\centering
+\caption{Reward 曲线的六种典型形态及对应操作}
+\label{tab:rlmc-diag-reward6}
+\begin{tabular}{p{2.0cm}p{3.6cm}p{3.6cm}p{3.4cm}}
+\hline
+形态 & 曲线特征 & 通常含义 & 对应操作 \\
+\hline
+健康上升 & 平滑单调、逐步减速 & 稳定学习 & 继续训练 \\
+过早饱和 & 快速升后卡在远低于上限 & reward 太易拿 / 任务太简单 / hacking & 检查上限、加难度、加 regularization \\
+振荡不收敛 & 反复涨跌无趋势 & lr 过高 / KL 过大 / reward 信号冲突 & 降 lr、收紧 clip、查 term 符号 \\
+突然崩溃 & 稳升后暴跌 & 进入不稳定区 / NaN / curriculum 跳变 & 查 KL 是否同飙、查 NaN 守卫、回退 curriculum \\
+缓慢下降 & 初期正常后逐步下滑 & value 发散 / obs 分布漂移 & 查 value\_loss、查 obs 归一化 \\
+零信号 & 始终在零附近 & 任务太难 / reward 太稀疏 / obs 缺信息 & 简化任务、加 dense reward、查 obs \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{分项 reward 的诊断价值}
+
+\paragraph{反事实。}只看总 reward 会错过什么？设总 reward 稳升到 100，但分项显示 velocity tracking $=150$、joint acceleration penalty $=-50$——策略学的是"暴力加速拿 tracking 分"，代价是关节震动。penalty 权重不够大时总 reward 还在涨，但行为已不可接受。这正是 \cref{ch:rlmc-reward} 提过的"reward 涨但动作丑"，\emph{只有分项 reward 能定位}到底是 tracking 太易还是 regularization 太弱。
+
+\begin{table}[H]
+\centering
+\caption{分项 reward 的阅读方法（健康走向 vs 异常走向）}
+\label{tab:rlmc-diag-rewterm}
+\begin{tabular}{p{2.6cm}p{3.6cm}p{6.0cm}}
+\hline
+分项类别 & 健康走向 & 异常走向及含义 \\
+\hline
+Tracking（速度跟踪） & 逐步上升 & 过快饱和$\to$tracking sigma 太大；不升$\to$obs 缺信息 \\
+Regularization（关节加速度惩罚） & 先增后稳 & 持续增大$\to$策略在 hack tracking \\
+Contact（足端滑移惩罚） & 先高后低 & 不降$\to$地面摩擦参数问题 \\
+Style（步态周期奖励） & 逐步上升 & 不升$\to$style 权重太低被 tracking 淹没 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{insight}[总 reward 是加权汇总，它隐藏了分项的此消彼长]\label{ins:rlmc-diag-decompose}
+总 reward 曲线是一个\textbf{加权汇总}——它把各分项之间的此消彼长抹平了。真正的诊断信息在分项里：哪项在涨、哪项在跌、涨跌速率是否匹配设计预期。这像看公司财报：总利润增长不代表每个部门都健康，可能是某部门暴利掩盖了其他部门亏损。\textbf{凡是只给你总 reward 的面板，都欠你一次分项展开}。
+\end{insight}
+
+\subsection{Reward 尺度、归一化与 PPO 级自动缩放}
+
+一个常被忽略的工程问题：不同 term 的数量级差异。设 velocity tracking 用 $\exp(-e^2/\sigma)$ 型、范围 $[0,1]$，而 energy penalty 直接用力矩平方和、范围 $[-500,0]$。即便 energy 权重设 $0.001$，其数值影响仍可能压过 tracking。
+
+\begin{codebox}[Python]{数量级不匹配的反例与归一化修正}
+# 反例:数量级不匹配
+tracking_reward = torch.exp(-vel_error**2 / 0.25)      # [0, 1]
+energy_penalty  = -torch.sum(torques**2, dim=1)        # [-500, 0]
+# 即便 weight=0.001，energy 仍有 [-0.5,0];策略可能先学"不动"而非"走起来"
+
+# 修正:除以关节数 + clamp 到同量级
+energy_penalty  = -torch.sum(torques**2, dim=1) / N     # 归一化
+energy_penalty  = torch.clamp(energy_penalty, -1, 0)    # [-1, 0]
+\end{codebox}
+
+mjlab 的 RewardManager 给每个 \verb|RewardTermCfg| 配 \verb|weight|，但\textbf{不自动归一化}各 term 输出；你需在 term 函数内或配置里手动控制范围。Isaac Lab 同理——\Verb[breaklines]|RewardTermCfg.weight|（常 import 重命名为 \Verb[breaklines]|RewTerm.weight|）只是乘法因子。
+
+除了手动控制每项，还有更系统的 PPO 级方案：对\textbf{总 reward} 做在线归一化，让 value function 始终处理量级稳定的 target。AGILE（《AGILE: A Comprehensive Workflow for Humanoid Loco-Manipulation Learning》，arXiv:2603.20147，教你把"准备$\to$训练$\to$评估$\to$部署"做成可复用工作流）给出明确公式：设 $r_t$ 为原始 reward，
+\begin{equation}
+\hat{r}_t = \frac{r_t}{\sigma_r \cdot \varphi_\gamma \cdot c + \epsilon},
+\qquad \varphi_\gamma = \frac{1}{\sqrt{1-\gamma^2}},
+\label{eq:rlmc-diag-rewnorm}
+\end{equation}
+其中 $\sigma_r$ 是 reward 的 EMA 标准差，$\varphi_\gamma$ 是与折扣因子相关的缩放（$\gamma=0.99$ 时约 $7.09$），$c$ 是在线更新的回报尺度修正项（见下方实现事实），$\epsilon$ 防除零 \cite{nvidia2026agile}。它解决的是：curriculum 升级导致 reward 量级突变时，未归一化的 value function 要大量样本才能适应新 target 范围，期间 GAE 估计失准、策略更新方向混乱；归一化后 $\hat{r}_t$ 恒在 $O(1)$，target 稳定。
+
+\begin{pitfall}[把"advantage 归一化"误当成"reward 归一化"]
+\textbf{错误描述}：以为开了某个归一化开关就同时稳住了 value target 与梯度方向。\textbf{现象后果}：curriculum 切换后 value\_loss 仍飙。\textbf{根本原因}：二者解决不同问题——advantage normalization（减均值除标准差）稳的是\emph{梯度方向}，reward normalization 稳的是\emph{value target 的量级}。\textbf{正确做法}：复杂带 curriculum 的任务两者都要。\textbf{实现事实}（rsl-rl 5.2.0 源码核对）：核心 PPO 路径\textbf{只对 observation 在线归一化}（\Verb[breaklines]|EmpiricalNormalization|，Welford 式增量更新）、\textbf{对主任务 reward / value target 不做归一化}；advantage 默认\emph{在整批上}归一化（\Verb[breaklines]|normalize_advantage_per_mini_batch=False|，可改为逐 mini-batch）。库里确有一个 reward 归一化器 \Verb[breaklines]|EmpiricalDiscountedVariationNormalization|（除以折扣回报的滑动 std），但\textbf{只在 RND 扩展里用于内在奖励}、不作用于任务 reward。所以 \eqref{eq:rlmc-diag-rewnorm} 这种主-reward 归一化在 rsl-rl 里需在环境层或额外 wrapper 实现。AGILE 论文（arXiv:2603.20147，Table~4）给出的取值为：EMA 系数 $\beta=0.999$、$\epsilon=10^{-2}$；其中 $c$ 并非固定常数 $1$，而是用 EMA 在线更新的\emph{回报尺度修正项} $c\leftarrow\beta c+(1-\beta)\sigma_G\,c$（$\sigma_G$ 为 GAE 回报的标准差），使训练对 curriculum 引起的 reward 量级变化基本不变 \cite{nvidia2026agile}。
+\end{pitfall}
+
+\subsection{两个隐蔽陷阱：scale\_by\_dt 与 nan\_to\_num}
+
+回看 \cref{ch:rlmc-reward}：mjlab 的 RewardManager 有 \Verb[breaklines]|scale_by_dt=True| 开关（多数任务默认，Isaac Lab 则\emph{总是} ×dt，无此开关——源码核对），让每步 reward 乘以 $dt$，把"每步收益率"变成"时间积分收益"。这对 value function 有益（累积回报量级不应因改 \verb|decimation| 而突变），但带来一个诊断陷阱：\textbf{分项曲线} \Verb[breaklines]|Episode_Reward/<term>| 是\textbf{该 term 整回合累加再除以最大时长 \texttt{max\_episode\_length\_s}（而非实际时长）}（rsl-rl/mjlab 的 reward\_manager reset 逻辑，源码核对）。于是早早摔倒（只活了 30\% 时长）的 episode 在这些分项曲线上被系统性\emph{低估}，因为分母是最大长度。注意 \Verb[breaklines]|Train/mean_reward| 不同：它是\textbf{完成 episode 的总回报（per-step reward 之和）的滑窗均值}（\Verb[breaklines]|cur_reward_sum| 不除时长，源码核对），但短 episode 因累加步数少、总回报本就偏小——\emph{两条曲线都会"惩罚"短 episode}，只是机理不同。
+
+\paragraph{推论。}"episode 变长后 reward 反而涨了"可能只是 episode 更长导致累加项更多（或分项的分母不变而活得久了），而非策略变好。正确做法是\textbf{同时看 episode length 与 reward}，只有 episode length 稳定后的 reward 变化才反映策略质量。
+
+更隐蔽的是 \verb|nan_to_num|。\cref{ch:rlmc-training} 提过 \Verb[breaklines]|RewardManager.compute()| 内部会把 NaN 悄悄换成 0.0、$\pm$Inf 换成有限大数，初衷是防单项数值异常拖垮训练。但从诊断看，它有严重副作用：\textbf{reward 曲线"干净" $\neq$ 物理状态健康}。
+
+\begin{insight}[Reward 曲线是"报喜不报忧"的信使]\label{ins:rlmc-diag-nantonum}
+设 contact reward 里有 \Verb[breaklines]|reward = contact_force / target_force|，当 \Verb[breaklines]|target_force=0| 时产生 NaN——\verb|nan_to_num| 把它变成 0，WandB 上 reward 只是略有波动，完全看不出 NaN。但 NaN 意味着物理状态已不正常（接触力计算有 bug，或 termination 没拦住无效状态）。所以\textbf{真正的数值问题要靠 obs 统计量（是否有 NaN/Inf）、物理状态日志（关节是否超限）和 NaN 守卫去发现，而不是看 reward 曲线}。Reward 是数值问题的\emph{最后}一个证人，不是第一个。
+\end{insight}
+
+\subsection{Reward 曲线的时间尺度与平滑陷阱}
+
+横轴选择至关重要：WandB 默认以 step 为横轴，但不同 \verb|num_envs| 下 step 不可比（4096 envs 一步产生 4096 个 step）。
+
+\begin{table}[H]
+\centering
+\caption{Reward 曲线横轴选择}
+\label{tab:rlmc-diag-xaxis}
+\begin{tabular}{p{3.4cm}p{4.0cm}p{5.0cm}}
+\hline
+横轴 & 适用场景 & 注意事项 \\
+\hline
+Step & 比较数据效率 & 不同 num\_envs 下不可比 \\
+Iteration & 比较同配置不同 seed & 不同 num\_envs 下一 iter 数据量不同 \\
+Wall-clock time & 端到端效率 & 受 GPU 型号、环境复杂度影响 \\
+Total env steps & 最公平的数据效率 & $=$ iter $\times$ num\_envs $\times$ steps\_per\_rollout \\
+\hline
+\end{tabular}
+\end{table}
+
+平滑也有陷阱：WandB/TensorBoard 默认对曲线做 EMA 平滑。过度平滑（smoothing $>0.9$）会把"从 100 跌到 0"显示成"小下降"；完全不平滑（$=0$）又太嘈杂。\textbf{推荐 smoothing $=0.6$ 看趋势，同时叠加 $=0$ 的原始线看突变}。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[reward term 输出 NaN 被 nan\_to\_num 静默掩盖]
+\textbf{错误描述}：某 term 偶尔返回 NaN（如除零），被悄悄变成 0。\textbf{现象后果}：根因（物理异常）未修，积累后爆发更严重问题。\textbf{根本原因}：保护机制掩盖了症状。\textbf{正确做法}：调试阶段在 term 函数里临时加 \Verb[breaklines]|assert not torch.isnan(reward).any()| 主动捕获，确认全部干净后再正式训练。
+\end{pitfall}
+
+\begin{pitfall}[把 online reward normalization 与 reward weight 调参混用]
+\textbf{错误描述}：既开了总 reward 在线归一化，又精细调各 term 的 weight 比例。\textbf{现象后果}：你调的比例被归一化"摊平"，调参不起作用。\textbf{根本原因}：两种缩放机制叠加冲突。\textbf{正确做法}：二选一——要么手动控制 term 量级（不用在线归一化），要么全交给归一化只调 weight 比例。不要混用。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[分析]} 四足训练总 reward 在 iter 2000 达 200 并饱和，分项 tracking $=250$、energy $=-30$、foot\_slip $=-20$。这是健康饱和还是需干预？\emph{验收}：必须回放行为或对比理论上限来判断，不能只凭数字。
+  \item \textbf{[计算]} tracking 用 $\exp(-e^2/0.25)$，要拿 $>0.9$ 的 reward，velocity error 需多小？若观察到 tracking 长期 $\approx0.3$，反推 error 约多少？\emph{验收}：给出 $e<0.16$（$\approx\sqrt{-0.25\ln0.9}$）量级的解，并说明这对调 sigma 的指导。
+  \item \textbf{[设计]} 设计一个同时显示总 reward 与三分项比例的 WandB Custom Chart，写出 Vega-Lite spec 的关键字段。\emph{验收}：spec 里出现分项的 \verb|fold| 或多 \verb|layer| 结构。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{KL、Entropy 与 Value Loss：学习过程的健康度}
+\label{sec:rlmc-diag-process}
+
+\paragraph{模块功能与在管线中的位置。}前一节的 reward 回答"策略成绩如何"。这一节的三个指标——KL、entropy、value loss——回答的是另一个问题："学习过程\emph{本身}是否健康"。它们不直接反映任务成功率，却直接预示训练会不会崩。
+
+\subsection{KL 散度：策略的"步幅"}
+
+回看 \cref{ch:rlmc-training}：PPO 用 clipping 限制每次更新的策略变化幅度。KL 散度精确测量这个"步幅"——新旧策略的差异。直觉：你在山上徒步，步幅太大（KL 高）可能跨过山脊跌入另一山谷（性能突然恶化），太小（KL 低）则原地踏步。最优步幅取决于地形——平坦处可大步（reward landscape 平滑），陡峭处须小步试探。
+
+这正是 RSL-RL 实现自适应学习率的动机。经 \Verb[breaklines]|rsl_rl/algorithms/ppo.py| 源码核对，它是一个\textbf{带死区的 bang-bang 控制器}（不是 PID）：
+
+\begin{codebox}[Python]{RSL-RL 自适应 KL 学习率的核心逻辑（源码核对，schedule="adaptive"）}
+# kl_mean 由解析高斯 KL 计算（新旧分布参数闭式）
+if kl_mean > desired_kl * 2.0:
+    learning_rate = max(1e-5, learning_rate / 1.5)
+elif kl_mean < desired_kl / 2.0 and kl_mean > 0.0:
+    learning_rate = min(1e-2, learning_rate * 1.5)
+# [0.5x, 2x] 死区内不调整;lr 被界在 [1e-5, 1e-2]
+\end{codebox}
+
+从控制论看：只有 KL 偏离目标超 2 倍才干预，每次幅度固定（$\times1.5$ 或 $\div1.5$），lr 轨迹是\textbf{阶梯型}而非平滑的。好处是简单鲁棒（无需调 PID 增益），代价是 \verb|desired_kl| 附近会持续小幅振荡——你在面板上看到 learning\_rate 像锯齿波\emph{是正常的}。
+
+\paragraph{反事实。}关掉自适应（固定 lr）会怎样？训练早期 reward landscape 剧变（策略从随机到可用），固定 lr 可能让 KL 暴涨$\to$崩溃；训练后期 landscape 变平（微调阶段），固定 lr 又让 KL 过低$\to$停滞。自适应的价值正在于让 PPO 在不同阶段自动调步幅。
+
+不同任务对 \verb|desired_kl| 的偏好不同，根源是 reward landscape 的"地形复杂度"：
+
+\begin{table}[H]
+\centering
+\caption{不同任务类型的 desired\_kl 经验取值（经验值，非硬规则）}
+\label{tab:rlmc-diag-kl}
+\begin{tabular}{p{3.6cm}p{2.4cm}p{3.2cm}p{3.0cm}}
+\hline
+任务类型 & 推荐 desired\_kl & 地形特征 & 理由 \\
+\hline
+简单 locomotion（平地） & $0.01\sim0.02$ & 相对平滑 & 可大步、加速收敛 \\
+复杂 locomotion（粗糙地形） & $0.008\sim0.01$ & 较多局部最优 & 中等步幅、平衡稳定 \\
+操作任务（抓放） & $0.01\sim0.02$ & 接触切换不连续 & 接触瞬间剧变、其余平滑 \\
+高动态（后空翻/功夫） & $0.005\sim0.008$ & 极端不连续 & 必须小步，否则飞出安全区 \\
+球类击打（网球等） & $0.005\sim0.01$ & 稀疏 $+$ 不连续 & 击中瞬间 reward 巨变 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Entropy：策略的"犹豫"}
+
+Entropy 由 \eqref{eq:rlmc-diag-entropy} 给出。这个公式告诉我们三件事：(1) \textbf{初始值由动作维度决定}——12 关节四足（$d=12$）若 $\sigma_0=1.0$，初始 entropy $\approx 17.0$ nats；(2) \textbf{单位是 nats}（自然对数），不是 bits，跨框架比较时注意对数底；(3) \textbf{变化速率} $=\sum_i d\ln\sigma_i/dt$——若各 $\sigma_i$ 均匀下降则 entropy 线性降，若部分维度的 $\sigma_i$ 快速趋零而其他不变（不均匀收敛），entropy 也降但行为上表现为"部分动作确定、部分随机"。
+
+\begin{table}[H]
+\centering
+\caption{Entropy 的生命周期}
+\label{tab:rlmc-diag-entropy-life}
+\begin{tabular}{p{2.6cm}p{4.4cm}p{5.0cm}}
+\hline
+训练阶段 & Entropy 行为 & 含义 \\
+\hline
+初始化 & 高（$d=12,\sigma_0=1$ 时 $\approx 17$ nats，每维约 $1.42$） & 接近随机，广泛探索 \\
+早期学习 & 逐步下降 & 收敛到有用动作范围 \\
+中期稳定 & 缓慢下降或稳定 & 在最优附近微调 \\
+收敛 & 接近某下限 & 基本确定性，少量随机 \\
+\hline
+\end{tabular}
+\end{table}
+
+两种异常要特别关注。\textbf{Entropy 骤降}（$50\sim100$ iter 内从初值降到近零）：过早收敛到某确定性动作，通常因 reward 有"易发现但非最优"的局部极值，策略发现 trick 并迅速锁定。\textbf{Entropy 不降}（几千 iter 后仍在初值附近）：学不到有用信息——obs 缺关键状态、reward 太稀疏、或 lr 太低。
+
+\begin{insight}[entropy\_coef 只能延缓收敛，不能修复 reward 缺陷]\label{ins:rlmc-diag-entcoef}
+面对 entropy 骤降，本能反应是加大 \verb|entropy_coef|。但要强调：\textbf{entropy bonus 不是万能药——它只能延缓收敛，不能修复 reward 设计的漏洞}。如果策略收敛到局部最优是因为 reward 有缝隙可钻，正确做法是\emph{修 reward}，而不是靠 entropy bonus 强行维持探索（那只会让策略在"被迫探索"与"想钻漏洞"之间拉扯，既学不好也不稳定）。
+\end{insight}
+
+\subsection{Value Loss：Critic 的预测质量，与崩溃的领先指标}
+
+Value loss 测量 Critic 预测的 $V(s)$ 与实际 return 的误差，典型行为是\textbf{先升后降}：初期 Critic 从随机初始化开始、return 方差大（策略还在随机探索），故 value loss 先升；策略稳定后 return 可预测，value loss 降。它承载\textbf{双重解读}：
+
+\begin{itemize}
+  \item \textbf{角度一（Critic 学习进度）}：value loss 降 $=$ Critic 越来越准 $=$ GAE 质量提高 $=$ 策略更新方向更可靠。
+  \item \textbf{角度二（reward scale 与 obs 质量的间接指标）}：若 reward scale 太大（某项输出 $[-1000,1000]$），value target 方差极高，Critic 难拟合，value loss 居高不下；若 obs 含噪声或无关信息，Critic 找不到 obs$\to$return 映射，value loss 同样高。所以 value loss 持续偏高\emph{不一定}是网络容量不够。
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{Value Loss 行为诊断}
+\label{tab:rlmc-diag-vloss}
+\begin{tabular}{p{3.2cm}p{4.6cm}p{4.4cm}}
+\hline
+行为 & 含义 & 操作 \\
+\hline
+先升后降 & 健康 & 继续 \\
+持续上升 & Critic 跟不上 Actor 变化 & 增 Critic 的 epochs 或网络容量 \\
+剧烈振荡 & reward scale 过大或 obs 不稳 & 归一化 reward、查 obs 归一化 \\
+始终很小 & reward 信号太弱 & 查 reward 数量级 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{insight}[Value loss 是训练崩溃的领先指标]\label{ins:rlmc-diag-vloss-lead}
+当 value loss 突然飙升而 reward 还没变时，这是\textbf{预警信号}——Critic 已"跟不上"，但影响还没传导到 reward。因为 PPO 用 Critic 的 $V(s)$ 算 GAE，Critic 不准$\to$advantage 不准$\to$策略更新方向不准，这个影响通常在几十到几百 iter 后才体现在 reward 上。\textbf{Reward 下降是结果，value loss 飙升是原因}——就像发烧是症状、白细胞异常是原因。监控 value loss 让你在 reward 掉之前就介入。
+\end{insight}
+
+\paragraph{Multi-Critic 分组诊断。}标准 PPO 只有一个 Critic。HoST（《Learning Humanoid Standing-up Control across Diverse Postures》，arXiv:2502.08378，RSS'25 Best Systems Paper Finalist，教你用多 critic + curriculum 学站起来）引入\textbf{multi-critic PPO}：把 reward 按功能分组（task / style / regularization / post-task），每组独立 Critic，advantage 分别归一化后加权求和 \cite{huang2025host}。其诊断优势是：某组 value loss 飙升而其他组稳定时，能精确定位是\emph{哪一类 reward} 出了问题（task 组飙$\to$tracking 量级/难度突变；style 组飙$\to$style 与 task 方向冲突；regularization 组飙$\to$正则量级与其他项严重不匹配）。
+
+\begin{codebox}[Python]{HoST 风格 multi-critic 分组（概念示意）}
+critic_groups = {
+    "task":           {"terms": ["velocity_tracking", "heading_tracking"]},
+    "style":          {"terms": ["gait_frequency", "foot_clearance"]},
+    "regularization": {"terms": ["action_rate", "joint_accel", "energy"]},
+}
+for name, group in critic_groups.items():
+    group_return = compute_return(group_rewards, group_values, gamma, lam)
+    group_adv = group_return - group_values
+    group_adv = (group_adv - group_adv.mean()) / (group_adv.std() + 1e-8)
+    wandb.log({f"Loss/value_{name}": group_value_loss})  # 逐组记录便于定位
+\end{codebox}
+
+即使不实现完整 multi-critic，也可用\textbf{近似法}获得类似诊断视角：分别画每个 reward 分组的 episode 平均值随时间变化，某组方差突增（曲线变嘈杂）就提示对应 Critic 在挣扎。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[认为 entropy\_coef 越大探索越好]
+\textbf{错误描述}：把探索系数一路调大。\textbf{现象后果}：策略无法收敛——相当于强制"每个动作维度都保持高随机性"。\textbf{根本原因}：探索与收敛的张力。\textbf{正确做法}：典型范围 $0.001\sim0.01$（RSL-RL 默认 $0.01$），超过 $0.05$ 通常严重干扰学习；只在观察到过早收敛时适度增加。
+\end{pitfall}
+
+\begin{pitfall}[entropy 为负当成 bug]
+\textbf{错误描述}：看到 entropy $<0$ 就以为出错。\textbf{现象后果}：误改正常训练。\textbf{根本原因}：微分熵可为负——高维连续动作下 $\sigma_i$ 很小时 $\ln\sigma_i<0$，由 \eqref{eq:rlmc-diag-entropy} 总 entropy 可负，数学上完全合法。\textbf{正确做法}：只有 entropy 突变成 NaN 或 $-\infty$ 才是数值问题。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[分析]} 日志显示 KL $=0.001$（远低于 $0.01$），lr 已被自适应调到上界 $10^{-2}$，但 reward 仍不涨。列至少 3 个可能原因及各自排查法。\emph{验收}：原因须覆盖 reward 稀疏 / obs 缺信息 / reward landscape 太平（advantage 全噪声）三类。
+  \item \textbf{[计算]} 12-DoF 四足，$\sigma_0=1.0$，用 \eqref{eq:rlmc-diag-entropy} 算初始 entropy；若所有维度 $\sigma$ 均匀降到 $0.1$，算最终 entropy 与下降量（nats）。\emph{验收}：下降量 $=12\ln 10 \approx 27.6$ nats。
+  \item \textbf{[思考]} curriculum 升级时 entropy 是否应短暂上升？为什么？\emph{验收}：答出"新难度下旧策略不再最优，PPO 重新探索$\to$$\sigma$ 回升$\to$entropy 短升"，对应后文模式七。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{训练曲线联合诊断：九种典型模式}
+\label{sec:rlmc-diag-patterns}
+
+\paragraph{模块功能与在管线中的位置。}前三节建立了\emph{单指标}阅读能力。但实战中你同时看到五条曲线在变，而它们强相关（reward 升的同时 entropy 可能在降——这不是两件事，是同一学习过程的两个侧面）。诊断效率的跃升来自识别\textbf{指标组合的模式}，而非孤立查每个指标。
+
+\subsection{动机：模式识别 vs 指标查表}
+
+类比：经验丰富的医生不逐项看化验单（"血糖高$\to$降糖药"），而是从症状组合识别综合征（"血糖高$+$血压高$+$血脂高$\to$代谢综合征$\to$综合治疗"）。训练诊断同理——"reward 不涨 $+$ entropy 不降 $+$ value\_loss 很小"是一个综合征，不能分项处理。下面九种模式，每种用五指标的联合行为描述，附根因与修复路线。
+
+\subsection{九种通用训练模式}
+
+\begin{table}[H]
+\centering
+\caption{九种典型训练模式的五指标联合签名}
+\label{tab:rlmc-diag-9modes}
+\begin{tabular}{p{2.7cm}p{1.9cm}p{1.9cm}p{1.9cm}p{1.7cm}p{1.9cm}}
+\hline
+模式 & Reward & KL & Entropy & Value Loss & Ep.\,Length \\
+\hline
+一·健康 & 平滑升后减速 & 围绕 desired & 缓慢单降 & 先升后降 & 升趋近 max \\
+二·Reward Hacking & 快速升到高值 & 正常 & 骤降近零 & 快速收敛 & 正常或很短 \\
+三·学习停滞 & 零附近 & 很低 $<0.001$ & 不降 & 很小 & 卡很短 \\
+四·训练震荡 & 大幅振荡 & 频繁超数倍 & 不稳 & 剧烈振荡 & 同步振荡 \\
+五·缓慢退化 & 先升后缓降 & 逐步增大 & 继续降 & 逐步增大 & 先增后缩 \\
+六·突然崩溃 & 某 iter 暴跌 & 同 iter 飙 $>0.1$ & 可能骤变 & 同步飙 & 骤降 1--2 \\
+七·Curriculum 阶梯 & 阶梯升 & 切换时短升 & 切换时短升 & 切换时短升 & 阶梯升 \\
+八·Entropy 崩塌+卡住 & 升后停滞 & 趋零 & 骤降近零 & 小但非零 & 稳定不增 \\
+九·自杀策略 & 反升或不高 & 逐步减 & 下降 & 很小 & 趋近零 1--5 \\
+\hline
+\end{tabular}
+\end{table}
+
+下面只对最易混淆与最致命的几种展开根因与修复（其余见表与速查流程）。
+
+\paragraph{模式二·Reward Hacking。}策略发现 reward 漏洞，例如四足把身体压地不动以躲所有 penalty 又不触发 termination。\textbf{修复}：(1) 回放行为确认是否 hacking；(2) 查 term 是否有可钻缝隙（\cref{ch:rlmc-reward}）；(3) 加 regularization 或改 termination。\emph{反事实}：只看数字会以为成功，部署到真机才发现机器人在地上滑而非走路——仿真"合法"但任务无意义。
+
+\paragraph{模式五·缓慢退化（最阴险）。}Critic 与 Actor 出现"分歧"：value function 不再准（obs 漂移 / reward scale 变 / 容量不足）$\to$GAE 质量降$\to$更新方向偏。因为退化渐进，不定期看 value\_loss 趋势可能到训练结束才发现后半段全废。一个有用的预警是滑窗检测：
+
+\begin{codebox}[Python]{value\_loss 退化滑窗检测（训练循环内）}
+value_loss_history = []
+def check_value_loss_trend(current_vl, window=200, threshold=1.5):
+    value_loss_history.append(current_vl)
+    if len(value_loss_history) > window:
+        recent  = value_loss_history[-window // 2:]
+        earlier = value_loss_history[-window:-window // 2]
+        ratio = np.mean(recent) / (np.mean(earlier) + 1e-8)
+        if ratio > threshold:
+            print(f"value loss rising: recent={np.mean(recent):.4f}, "
+                  f"earlier={np.mean(earlier):.4f}, ratio={ratio:.2f}")
+\end{codebox}
+
+\textbf{修复}：查 curriculum 是否致 obs 突变；确认 obs 归一化的 running mean/std 正常更新；增 Critic 容量；查 reward scale 是否漂移；后期退化考虑降 lr 或 early stopping。
+
+\paragraph{模式九·自杀策略（致命且隐蔽）。}策略学会\textbf{主动触发 termination} 以躲累积负 reward——"活得越久罚得越多"，于是"早死早超生"。数字上 reward 可能不负甚至为正（短 episode 积累的负分少），但行为完全不可用。
+
+\begin{insight}[自杀策略几乎总是 termination 的 value bootstrapping 设错]\label{ins:rlmc-diag-suicide}
+回看 \cref{ch:rlmc-reward}：因摔倒终止（\Verb[breaklines]|time_out=False|）时 PPO 假设 $V(s_T)=0$。若存活期间持续收负 reward（严厉 regularization penalty），终止状态的 $V(s_T)=0$ 反而\emph{高于}继续存活的预期回报——策略\textbf{理性地}选择了自杀。这不是策略"傻"，是你给的价值函数让"死"比"活"更优。
+\end{insight}
+
+学术上 Pardo et al.（《Time Limits in Reinforcement Learning》，arXiv:1712.00378，ICML'18，首次系统分析 time limit 对 value 的影响）提出 \textbf{partial-episode bootstrapping（PEB）}：对 time-out 终止用 $\gamma V(s_T)$ 而非 $0$ 作 bootstrap target \cite{pardo2018timelimits}。RSL-RL 已实现此机制——在 \Verb[breaklines]|extras["time_outs"]| 为真时不把 value 置零。\textbf{修复}：(1) 检查所有 \Verb[breaklines]|TerminationTermCfg| 的 \verb|time_out|：失败终止（摔倒/违规）应 \verb|False|，时间上限应 \verb|True|；(2) regularization 太重时降权重或加存活 bonus（\verb|alive_reward|）；(3) AGILE 实践用 scale-invariant bonus $\sigma=5$（全任务统一、无需逐任务调；$\gamma=0.99$ 时对应 value 空间约 $500$ 的正向激励）确保存活始终更有吸引力 \cite{nvidia2026agile}。
+
+\subsection{五种人形/足式机器人特有失败模式}
+
+上述九种通用，适用任何 RL 任务。人形/足式还有独有模式，它们\textbf{不一定体现在曲线上}（指标可能看起来正常），必须靠行为回放发现。以下来自 2024--2026 顶会论文记录的工程经验。
+
+\paragraph{模式 A·Foot Lift Hacking（飞行/拖地）。}症状：机器人"飞行"——脚不离地却移动（滑行），或脚不着地而 reward 正常。tracking reward 正常升（确实在移动），但接触力日志异常。\textbf{诊断}：play 时记录足端接触力时间线，所有脚长期为零（飞行）或长期非零（拖地）即异常。\textbf{修复}：WoCoCo（《Learning Whole-Body Humanoid Control with Sequential Contacts》，arXiv:2406.06005，CoRL'24，教你按接触阶段分解全身控制）的 "no fly" reward——所有足端离地时施惩罚 $r_{\text{no-fly}}=-w\cdot\mathbb{1}[\text{all feet off}]$，并确保地面摩擦与 \verb|condim| 正确 \cite{zhang2024wococo}。
+
+\paragraph{模式 B·Action Saturation（动作饱和）。}症状：动作大量聚在 $\pm 1.0$（边界），关节频繁撞限位、动作粗暴、真机可能损坏电机。\textbf{诊断}：画动作直方图，$\pm 1.0$ 处有尖峰（非正态形）即饱和。\textbf{修复}：HoST 的 action rescaler $\beta$：$p_t^d = p_t + \beta\cdot a_t$，$\beta\in(0,1]$ 控制动作空间有效范围，训练中用 curriculum 让 $\beta$ 从 0.3 升到 1.0，部署用 $\beta<1$ 作安全带（详见 \cref{sec:rlmc-diag-deploy}）\cite{huang2025host}。
+
+\paragraph{模式 C·Curriculum 边界 NaN。}症状：curriculum 切换瞬间 NaN，切换前正常。\textbf{诊断}：切换前后各冻结 curriculum 跑 100 iter——冻结在新级别仍 NaN 则新难度物理设置有问题；只在切换时 NaN 则是切换时 reward 权重重缩放致 value target 突变。\textbf{修复}：AGILE 实践是切换时\emph{不改 reward 权重}、只改难度；必须改权重时分 $5\sim10$ iter 线性过渡 \cite{nvidia2026agile}。
+
+\paragraph{模式 D·步态不对称。}症状：左右腿明显不对称（一腿大步/一腿小步，或一腿抬高/一腿拖地），曲线完全正常。\textbf{诊断}：分别记左右腿关节轨迹，算左右差异 L2 范数（健康应 $<$ 关节范围 10\%）。\textbf{修复}：symmetry augmentation——rollout 数据中把左右 obs/action 镜像作额外训练数据，迫使策略学对称行为。镜像映射须手动定义（哪些关节左右对称、velocity 的 $y$ 分量是否取反），配错反而更糟。
+
+\paragraph{模式 E·Sim OK Real Bad。}症状：仿真完美、真机退化（跌撞/抖动/无法前进）。\textbf{诊断}：\textbf{不要先怀疑现实——先做 sim-to-sim}：把策略导出 ONNX，在另一物理引擎（如 mjlab / unitree\_mujoco）加载评估。若 sim-to-sim 就失败，说明策略过拟合了训练引擎的物理特性，根本无需到真机才发现。\textbf{修复}：ASAP（《ASAP: Aligning Simulation and Real-World Physics for Learning Agile Humanoid Whole-Body Skills》，arXiv:2502.01143，RSS'25，教你用真机数据训 delta-action 对齐物理）的系统法：(1) sim-to-sim 交叉验证；(2) 扩大 DR；(3) 仍有 gap 则训 delta action model 对齐仿真与真实 \cite{he2025asap}。具体 sim2real 全链路见 \cref{ch:rlmc-dr} 与 \cref{ch:rlmc-sim2real}。
+
+\subsection{模式识别速查流程}
+
+面对一组曲线，按下面顺序判断（先排致命的自杀策略，再分流）：
+
+\begin{codebox}[text]{模式识别速查流程（自上而下短路）}
+Step 1  Episode Length 趋近零？
+        是 -> 模式九（自杀策略）:查 termination 的 time_out 与 alive bonus
+        否 -> 继续
+
+Step 2  Reward 在涨吗？
+        不涨 -> 看 KL 与 Entropy
+                KL 低 + Entropy 高/不降 -> 模式三（学习停滞:obs/reward 信号不足）
+                KL 高 + 振荡            -> 模式四（训练震荡，方向错）
+                Entropy 已骤降但 reward 仍不涨 -> 过早收敛/局部最优（模式八）
+        在涨 -> 看 Entropy
+                Entropy 骤降到零 -> 模式二（Hacking）或 模式八（局部最优）
+                                   区分靠回放:异常行为高 reward=Hacking;正常但次优=局部最优
+                Entropy 正常下降 -> 看 Value Loss
+                                   先升后降 -> 模式一（健康）
+                                   持续升   -> 模式五（缓慢退化，即将出问题）
+                                   突变     -> 模式六（突然崩溃，查 NaN）
+
+若通用诊断为"健康"但回放发现问题 -> 进入人形特有模式 A--E 检查
+\end{codebox}
+
+\begin{insight}[曲线正常不等于策略正常——回放是不可替代的]\label{ins:rlmc-diag-replay}
+九种通用模式能从曲线读出，但人形模式 A--E \textbf{几乎不可能仅从曲线发现}——曲线可能完全正常，问题只在行为里。所以必须把"每 $500\sim1000$ iter 做一次行为回放"作为\textbf{固定流程}，而非"有空再看"。数字面板与视觉回放是两个正交的证据源，缺一不可。
+\end{insight}
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[一个模式只有一个原因]
+\textbf{错误描述}：把模式三（停滞）归咎于单一原因就动手改。\textbf{现象后果}：改了一个没解决，浪费多轮训练。\textbf{根本原因}：模式三可由 reward 稀疏 / obs 不足 / lr 过低中任一或叠加导致。\textbf{正确做法}：用消融逐一排除——先简化任务确认 reward 能给分，再查 obs，最后调 lr。
+\end{pitfall}
+
+\begin{pitfall}[以为 Hacking 与局部最优很容易区分]
+\textbf{错误描述}：仅凭曲线区分模式二与模式八。\textbf{现象后果}：误判修复方向。\textbf{根本原因}：两者曲线唯一区别是 reward 是否"不合理地高"，而"不合理"依赖你对任务的理解。\textbf{正确做法}：唯一可靠区分是\emph{回放行为}——Hacking 产生明显怪异动作（腿不动身体滑），局部最优"正常但次优"。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[诊断]} 人形训练 reward 在 iter 1000 达 200 并缓升，但 episode\_length 自 iter 500 起一直 $3\sim5$ step，KL 正常。哪种模式？最可能根因？\emph{验收}：答模式九，根因为 \verb|time_out| 设错或 regularization penalty 过重致"活不如死"。
+  \item \textbf{[操作]} 写一个对称性检查脚本：play 时记左右腿各 6 关节轨迹（各 1000 step），算左右 L2 差异的均值与最大值，设阈值报告是否不对称。\emph{验收}：脚本输出均值/最大值并与"关节范围 10\%"比较。
+  \item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-reward} 设计实验验证 \verb|time_out=True| vs \verb|False| 对自杀策略出现概率的影响。用什么指标？需几个 seed？\emph{验收}：指标为 episode\_length 的稳态分布（或自杀率），seed $\ge 3$。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{症状驱动调参索引：全书路由表}
+\label{sec:rlmc-diag-index}
+
+\paragraph{模块功能与在管线中的位置。}识别出模式后，下一步是"具体查哪个参数、读哪一章"。这一节是一张\textbf{从症状到解法的路由表}——它本身不解决问题，而是把你 30 秒内导航到对应章节的工具箱。
+
+\subsection{症状索引总表}
+
+\begin{insight}[调参是症状驱动的因果推理，不是随机搜索]\label{ins:rlmc-diag-causal}
+调参\textbf{不是}"随机搜索超参空间"，而是"从症状出发的因果推理"。好工程师与差工程师的区别不在于谁跑了更多 sweep，而在于谁能更快\emph{从症状定位到根因}。索引表是导航工具，不是解决方案本身——查到章节后仍要读该章详解再动手。
+\end{insight}
+
+\paragraph{先学会"30 秒确认症状"：三条最小判据。}下面几张索引表给的是"症状$\to$参数$\to$章节"，但用表的前提是你能先\textbf{确认面前这条曲线到底是哪个症状}。最常用的判据只有三条，全是面板上 30 秒能读出的动作，建议形成肌肉记忆：
+
+\begin{enumerate}
+  \item \textbf{读 KL 步幅（rsl-rl 后端没有 KL 曲线）}：不要找 \verb|Loss/kl|（默认不存在），看 \Verb[breaklines]|Loss/learning_rate| 的形状——\emph{锯齿来回}=KL 在 \verb|desired_kl| 附近健康波动；\emph{一路被砍到下界 \texttt{1e-5} 后贴住}=KL 长期偏高（学太猛，对应模式四/六）；\emph{一路被抬到上界 \texttt{1e-2} 后贴住}=KL 长期偏低（学太慢/停滞，对应模式三）。
+  \item \textbf{叠加分项 reward 看是谁在动}：面板里把 \Verb[breaklines]|Episode_Reward/*| 这一组全部勾上叠加（mjlab/Isaac 默认就记了，见 \cref{sec:rlmc-diag-dashboards}）——只一项在涨而其余被压=可能 hacking（模式二）或某项权重失衡；这一步把"总 reward 涨"细分成"哪一项在涨"，是区分模式二/八的关键。
+  \item \textbf{打印 obs 的逐维 std 看信息是否进来了}：reward 不涨时，先确认 obs 不是常量——随机/小训练下打印每个 obs term 的 \verb|mean/std|，\emph{某维 std$\approx 0$}=该 term 返回常量（sensor 没接上或算错），策略根本拿不到这维信息（对应模式三"obs 缺信息"）。这条判据在下方 \cref{sec:rlmc-diag-walkthrough} 的 Phase 2/Phase 4 有可复制实现。
+\end{enumerate}
+
+记住这三条，下面的表才从"查得到"升级为"判得准"——查表定位\emph{方向}，判据确认\emph{就是它}。
+
+\textbf{类别一：Reward 相关症状}
+
+\begin{table}[H]
+\centering
+\caption{症状索引·Reward 类}
+\label{tab:rlmc-diag-idx-reward}
+\begin{tabular}{p{3.4cm}p{3.8cm}p{3.4cm}p{2.0cm}}
+\hline
+症状 & 可能原因 & 检查参数 & 参考章 \\
+\hline
+Reward 始终为零 & 任务太难 / 太稀疏 / obs 缺信息 & term 输出值、obs 内容、curriculum 初始难度 & \cref{ch:rlmc-obsact},\cref{ch:rlmc-reward} \\
+Reward 涨但动作丑 & regularization 不足 / action scale 过大 & reg 权重、action\_scale、smoothness penalty & \cref{ch:rlmc-obsact},\cref{ch:rlmc-reward} \\
+Reward 快速饱和 & tracking sigma 过大 / 太简单 / hacking & sigma、curriculum、行为回放 & \cref{ch:rlmc-reward} \\
+Reward 振荡不收敛 & lr 过高 / term 冲突 / mini\_batch 过大 & lr、num\_learning\_epochs、term 符号 & \cref{ch:rlmc-training} \\
+Reward 突然崩溃 & NaN / curriculum 跳变 / DR 过激 & NaN 守卫、curriculum trigger、DR 范围 & \cref{ch:rlmc-reward},\cref{ch:rlmc-dr} \\
+Reward 先涨后缓降 & Critic 发散 / obs 归一化漂移 & value\_loss、obs 归一化、Critic 容量 & \cref{ch:rlmc-training} \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{类别二：动作质量症状}
+
+\begin{table}[H]
+\centering
+\caption{症状索引·动作质量类}
+\label{tab:rlmc-diag-idx-action}
+\begin{tabular}{p{3.6cm}p{3.8cm}p{3.2cm}p{2.0cm}}
+\hline
+症状 & 可能原因 & 检查参数 & 参考章 \\
+\hline
+关节抖动/高频振荡 & 缺 action smoothness / PD gain 太高 / decimation 太小 & action\_rate penalty、Kp/Kd、decimation & \cref{ch:rlmc-obsact},\cref{ch:rlmc-reward} \\
+关节打到限位 & 无 joint\_limit penalty / obs 缺关节位置 & joint\_limit penalty、obs term 列表 & \cref{ch:rlmc-obsact},\cref{ch:rlmc-reward} \\
+动作幅度过大 & action\_scale / clip / rescaler $\beta$ 过大 & action\_scale、action\_clip、$\beta$ & \cref{ch:rlmc-obsact},\cref{sec:rlmc-diag-deploy} \\
+策略输出不变（死策略） & entropy 崩塌 / 停滞 / actor 冻结 & entropy、KL、gradient norm & \cref{ch:rlmc-training},本章 \\
+左右不对称 & obs/action 顺序不对称 / reward 隐含偏差 & obs 排列、reward 对称性、symmetry aug & \cref{ch:rlmc-obsact} \\
+真机抖动（仿真平滑） & actuator delay 未建模 / 未启 L2C2 & actuator delay DR、L2C2 权重 & \cref{ch:rlmc-dr},\cref{sec:rlmc-diag-deploy} \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{类别三：训练过程症状}
+
+\begin{table}[H]
+\centering
+\caption{症状索引·训练过程类}
+\label{tab:rlmc-diag-idx-train}
+\begin{tabular}{p{3.6cm}p{3.8cm}p{3.4cm}p{1.8cm}}
+\hline
+症状 & 可能原因 & 检查参数 & 参考章 \\
+\hline
+KL 始终很高（$>0.05$） & lr 过高 / epoch 过多 / 太 off-policy & lr、num\_learning\_epochs、num\_mini\_batches & \cref{ch:rlmc-training} \\
+KL 始终很低（$<0.001$） & lr 过低 / clip 过紧 / 梯度消失 & lr、clip\_range、网络初始化 & \cref{ch:rlmc-training} \\
+Entropy 骤降 & 过早收敛 / entropy\_coef 太小 & entropy\_coef、init\_std & \cref{ch:rlmc-training} \\
+Value loss 持续上升 & Critic 容量不足 / reward scale 过大 / obs 不稳 & Critic 层宽、reward 归一化、obs 归一化 & \cref{ch:rlmc-training} \\
+初期猛涨后快衰 & Critic 初始偏差大 / bootstrapping 错 & 网络初始化、time\_out 设置 & \cref{ch:rlmc-reward},\cref{ch:rlmc-training} \\
+env\_fps 忽降 & CUDA Graph 失效 / OOM / 传感器开销 & CUDA Graph 日志、GPU memory、sensor 配置 & \cref{ch:rlmc-largescale} \\
+Lagrange 乘子持续振荡 & cost 与 reward 量级不匹配 & lambda\_lr、约束阈值、cost scale & \cref{sec:rlmc-diag-deploy} \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{类别四：Sim-to-Real 症状}
+
+\begin{table}[H]
+\centering
+\caption{症状索引·Sim-to-Real 类}
+\label{tab:rlmc-diag-idx-sim2real}
+\begin{tabular}{p{3.6cm}p{3.8cm}p{3.4cm}p{1.8cm}}
+\hline
+症状 & 可能原因 & 检查参数 & 参考章 \\
+\hline
+仿真好真机差 & DR 不足 / actuator 偏差 / obs delay 未建模 & DR 范围、actuator 类型、obs delay & \cref{ch:rlmc-dr} \\
+sim2sim 跨引擎不一致 & 接触模型差异 / 物理参数不同步 & solref/solimp vs friction/restitution、gravity & \cref{ch:rlmc-physics} \\
+真机抖仿真平滑 & actuator delay 未建模 / Lipschitz 过大 & actuator delay DR、L2C2 权重、低通滤波 & \cref{ch:rlmc-dr},\cref{sec:rlmc-diag-deploy} \\
+策略拒绝在真机运动 & obs 归一化不匹配 / ONNX 丢 stats & 归一化烘焙、ONNX 推理验证 & \cref{ch:rlmc-training} \\
+ONNX 与 PyTorch 不一致 & joint ordering 错 / 归一化未冻结 & deploy.yaml 关节排列、归一化冻结 & \cref{ch:rlmc-training} \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{类别五：动作平滑性工具选型}（诊断到"动作抖动/真机不可部署"时用）
+
+\begin{table}[H]
+\centering
+\caption{三种平滑正则工具选型（决策：先 action\_rate L2 $\to$ 真机仍抖再加 L2C2）}
+\label{tab:rlmc-diag-smooth-pick}
+\begin{tabular}{p{2.2cm}p{3.4cm}p{3.0cm}p{2.8cm}p{2.2cm}}
+\hline
+工具 & 原理 & 适用场景 & 参数 & 来源 \\
+\hline
+action\_rate L2 & $\|a_t-a_{t-1}\|^2$ & 标准 locomotion & weight $0.01\sim0.1$ & 通用 \\
+CAPS & 时间 $+$ 空间平滑 & 需额外空间平滑 & temporal $+$ spatial & Mysore'21 \\
+L2C2 & 局部 Lipschitz 约束 & 高动态 $+$ 真机 & $\lambda_\pi{=}1.0,\lambda_V{=}0.1$ & Kobayashi'22 / HoST \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{常见诊断路径实战：从症状到代码级修复}
+
+索引表是导航，但初学者常在"查到参数"后不知如何在框架里改。下面用三个高频症状走完整路径。
+
+\paragraph{路径 1：reward 涨但动作丑。}WandB 上 tracking reward 稳升到 200，但回放中四足走路像"抽搐"。先确认分项构成（发现 \Verb[breaklines]|action_rate_penalty=-5| 太小），再在 env\_cfg 调权重：
+
+\begin{codebox}[Python]{在 env\_cfg 中提高 regularization 权重（用真实类名 RewardTermCfg）}
+# 注:mjlab 与 Isaac 都导出全名 RewardTermCfg;Isaac 用户常 import 重命名为 RewTerm，
+#     mjlab 无此短别名.两框架 action_rate_l2 / joint_acc_l2 均为真实 mdp 函数名.
+class MyRewardsCfg:
+    # 修改前:action_rate 权重太低（太弱）
+    # action_rate_l2 = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01)
+    # 修改后:提到 tracking 的 10--20%
+    action_rate_l2 = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.05)
+    joint_accel    = RewardTermCfg(func=mdp.joint_acc_l2,   weight=-2.5e-7)  # 量级需实验定
+\end{codebox}
+
+\begin{codebox}[bash]{重训对比}
+uv run train My-Velocity-Rough-Go2-v0 \
+  --num-envs 4096 --max-iterations 3000 \
+  --wandb-name go2_rough_fix_action_rate_v2
+\end{codebox}
+
+关键判断：修复后 tracking 会略降（策略不再能"暴力"达标），但行为质量应明显改善；若 tracking 降超 30\%，说明 regularization 加太重，回退。
+
+\paragraph{路径 2：episode length 趋近零（模式九）。}先查 termination 配置：
+
+\begin{codebox}[Python]{修正 time\_out 设置 + 加 alive bonus}
+class MyTerminationsCfg:
+    base_contact = TerminationTermCfg(func=mdp.illegal_contact, time_out=False)
+    # 错误:时间限制也设 time_out=False（这是 bug）
+    # time_limit = TerminationTermCfg(func=mdp.time_out, time_out=False)
+    # 修正:时间限制必须 time_out=True（PPO 才对它做 value bootstrap）
+    time_limit   = TerminationTermCfg(func=mdp.time_out, time_out=True)
+
+class MyRewardsCfg:
+    alive_bonus = RewardTermCfg(func=mdp.is_alive, weight=1.0)  # 每步活着拿 1.0，确保活>死
+\end{codebox}
+
+诊断关键：WandB 上 reward 可能"还行"（短 episode 负分少），但 episode\_length 是最直接的红旗——\textbf{永远把 episode\_length 放诊断面板第一行}。
+
+\paragraph{路径 3：sim-to-sim 行为不一致。}Isaac Lab（PhysX）训练的策略导出 ONNX 后在 mjlab（MuJoCo）回放，机器人完全不走。最常见根因是 joint ordering mismatch：
+
+\begin{codebox}[Python]{核对并对齐 joint ordering（两引擎关节顺序可能不同）}
+import onnx
+model = onnx.load("policy.onnx")
+print("Input dims:",
+      [d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim])
+# 维度对（如 [1,47]）不代表顺序对:
+# Isaac Lab MJCF/USD 与 mjlab MJCF 的每条腿关节顺序可能不同
+# 用 deploy 描述符做显式 reorder:
+obs_mjlab     = obs_raw[isaac_to_mjlab_order]
+action_isaac  = policy(obs_mjlab)
+action_mjlab  = action_isaac[mjlab_to_isaac_order]
+\end{codebox}
+
+这个问题在社区部署中反复出现——多用户遇到完全相同的 joint ordering mismatch。AGILE 的 YAML I/O 描述符（见 \cref{sec:rlmc-diag-experiment}）正是为系统性避免这类 bug 而设计 \cite{nvidia2026agile}。\pz{经核查未能证实：源稿引用的 \texttt{unitreerobotics/\allowbreak unitree\_rl\_lab} Issue \#82 作为「joint ordering mismatch」社区证据，未在该仓库逐字核到（部署类讨论确多见，如 \#70/\#87/\#114，但未定位到 \#82 即此主题）；正文已弱化为"社区部署中反复出现"，引用具体 issue 前请以仓库实际为准。}
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[只改第一个命中的参数 / 同时改多个参数]
+\textbf{错误描述}：要么改了一个就以为完事，要么一次改 lr 又改 reward weight。\textbf{现象后果}：前者一个原因没覆盖问题仍在；后者 reward 变好却不知是哪个改动起作用。\textbf{根本原因}：违反"一次一变量"。\textbf{正确做法}：按优先级逐一排除（先验证最易确认、影响最大的原因），或设计正交消融。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[诊断]} 人形训练 reward 在 2000 iter 达 150 后缓降到 100（4000 iter），同时 value\_loss 从 0.5 升到 2.0、KL 从 0.01 升到 0.03。在索引表找对应症状，列出排查顺序。\emph{验收}：定位到"先涨后缓降"+"value loss 持续升"两行，排查顺序含 obs 归一化/curriculum/Critic 容量。
+  \item \textbf{[操作]} 实现路径 2 的修复：在 mjlab 一个 locomotion 任务里故意把 \verb|time_limit| 设 \Verb[breaklines]|time_out=False| 训 500 iter 看 episode\_length，再改 \verb|True| 加 alive\_bonus 重训对比。\emph{验收}：给出两次 episode\_length 曲线对比。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{三框架日志与可视化系统}
+\label{sec:rlmc-diag-logging}
+
+\paragraph{模块功能与在管线中的位置。}所有诊断方法都依赖高质量日志数据。这一节对比 mjlab、Isaac Lab 与 UniLab 的日志系统，确保你知道"在哪看什么"。三框架有共性（都支持 TensorBoard，mjlab/Isaac 还支持 WandB），也有差异（目录布局、键名、自定义指标方式，以及 UniLab 异构架构独有的复现元数据与 NaN dump 目录）。
+
+\subsection{训练前的诊断：AGILE 三大交互式 GUI}
+
+在进日志系统前，值得介绍一套更\emph{前置}的诊断工具——AGILE 在准备阶段提供三个交互式 GUI，让你在\textbf{训练开始之前}就捕获大量 bug \cite{nvidia2026agile}：
+
+\begin{itemize}
+  \item \textbf{Joint Position GUI}：逐关节滑块控制、实时显示力矩，可选 symmetry 模式并排对比左右——几秒内发现关节轴符号错误（左/右髋 roll 旋转方向是否正确镜像）。类比：赛车手上赛道前在 pit lane 逐个检查轮胎刹车，而非开了才知道没装好。
+  \item \textbf{Object Manipulation GUI}：6-DOF 物体定位器 $+$ 实时接触传感可视化，验证操作类 reward 能否正确激活——手动把物体移到目标位，检查 reward 是否输出预期值。手动放到位 reward 仍为零，训练再久也学不会。
+  \item \textbf{Reward Visualizer}：每个 term 的权重与贡献以叠加条形图实时显示，同时可操纵场景——不跑训练循环就确认 reward 行为（手动让机器人摔倒检查 termination 是否触发，手动站直检查 orientation reward 是否最大）。
+\end{itemize}
+
+这三个工具投入产出比极高——10 分钟 GUI 检查可避免数小时无效训练。mjlab 中可用 \Verb[breaklines]|uv run demo| $+$ 自定义脚本实现类似功能；Isaac Lab 中 AGILE 的实现开源。\textbf{UniLab 侧}：它提供 \textbf{Viser web 3D 交互查看器}（\Verb[breaklines]|--render-mode interactive|，浏览器远程看，无 X 服务器也行）并可直接读取 \verb|NpEnvState|（每步 obs/reward/terminated 的不可变快照），但\textbf{没有 AGILE 那三个专职预检 GUI 的现成等价物}（无逐关节力矩滑块 GUI、无 reward 贡献叠加条形图）——要做同样的训练前预检，需在 Viser 会话里自写脚本手动驱动 \verb|env.step| 并打印 \verb|NpEnvState| 各分量（reward 分项可读 \verb|info["log"]| 的 \verb|reward/<term>| 键）。这是\textbf{UniLab 无对应}的诚实标注，而非占位。
+
+\subsection{三框架日志键名对照}
+
+\begin{table}[H]
+\centering
+\caption{三后端日志键名对照（RSL-RL 5.2.0/3.1.2 与 RL Games，源码核对）}
+\label{tab:rlmc-diag-logmap}
+\begin{tabular}{p{2.6cm}p{3.1cm}p{3.1cm}p{2.6cm}}
+\hline
+功能 & mjlab(rsl-rl 5.2.0) & Isaac Lab(rsl-rl 3.1.2) & Isaac Lab(RL Games) \\
+\hline
+启用 WandB & \Verb[breaklines]|--agent.logger wandb| & \Verb[breaklines]|--logger wandb| & \Verb[breaklines]|--logger wandb| \\
+Reward & \Verb[breaklines]|Train/mean_reward| & \Verb[breaklines]|Train/mean_reward| & \verb|rewards/step| \\
+KL & 不单独记（看 lr） & 不单独记（看 lr） & \verb|info/kl| \\
+Entropy & \verb|Loss/entropy| & \verb|Loss/entropy| & \verb|info/entropy| \\
+Value Loss & \verb|Loss/value| & \Verb[breaklines]|Loss/value_function| & \verb|losses/c_loss| \\
+动作 std & \Verb[breaklines]|Policy/mean_std| & \Verb[breaklines]|Policy/mean_noise_std| & — \\
+Ep.\,Length & \Verb[breaklines]|Train/mean_episode_length| & 同 mjlab & \Verb[breaklines]|episode_lengths/step| \\
+分项 Reward & \Verb[breaklines]|Episode_Reward/<term>| & \Verb[breaklines]|Episode_Reward/<term>| & 需手动配 \\
+Checkpoint & \verb|.pt| & \verb|.pt| & \verb|.pth| \\
+Config 保存 & \verb|config.yaml| & \verb|params/| 目录 & \verb|config.yaml| \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{note}
+两处 \Verb[breaklines]|不单独记（看 lr）|：rsl-rl 的 \Verb[breaklines]|OnPolicyRunner| 把 KL 只用于自适应学习率，\textbf{不}调 \verb|add_scalar| 单独记一条 KL 曲线（5.2.0 与 3.1.2 均如此，源码核对）。要"看 KL 步幅"，就看 \Verb[breaklines]|Loss/learning_rate| 的锯齿（自适应 KL 调 lr，二者一一对应，见 \cref{sec:rlmc-diag-process} 的 bang-bang 控制器）。若确需 KL 数值曲线，须自行在 wrapper 或 runner 里加一行 \verb|add_scalar|。RL-Games 后端则原生记 \verb|info/kl|（近似 KL）。
+\end{note}
+
+\paragraph{动手：给 rsl-rl 后端自加一条 KL 数值曲线（不改库源码）。}最轻的做法不是去改 \verb|rsl_rl| 的 \Verb[breaklines]|OnPolicyRunner|，而是\textbf{利用 logger 已有的"含 \texttt{/} 的 extras 键原样写出"行为}（5.2.0 \Verb[breaklines]|utils/logger.py:174| 实测如此）——你只要把一个名字带斜杠的标量塞进 \verb|extras|，它就自动落进 TensorBoard/WandB，无需碰 rsl-rl。rsl-rl 计算 KL 用的是高斯解析式（与自适应 lr 同一个量），你在 env wrapper 里复算一遍同样的 KL 即可：
+
+\begin{codebox}[Python]{在 env wrapper 往 extras 塞一条 Loss/kl（logger 见含 / 原样写出）}
+# rsl-rl 的高斯解析 KL（新旧策略各维 mean/std），与驱动自适应 lr 的是同一公式
+def gaussian_kl(mu_old, sigma_old, mu_new, sigma_new):  # 形状 [batch, action_dim]
+    kl = (torch.log(sigma_new / sigma_old)
+          + (sigma_old.pow(2) + (mu_old - mu_new).pow(2)) / (2.0 * sigma_new.pow(2))
+          - 0.5)
+    return kl.sum(dim=-1).mean()  # 标量
+
+# 在 wrapper 的每个 step（或每 iter）把它写进 extras —— key 必须带 '/' 才会被 logger 写出
+extras["log"]["Loss/kl"] = gaussian_kl(mu_old, sigma_old, mu_new, sigma_new).item()
+# 之后面板上就多出一条 Loss/kl 曲线，可与 Loss/learning_rate 的锯齿对照验证一一对应关系
+\end{codebox}
+
+为什么这比"改 runner"好：改库源码会被下次 \Verb[breaklines]|pip install| 覆盖、且污染所有项目；走 extras 是\emph{你自己工程层}的改动，可随项目走、可版本控制。这正是\cref{ins:rlmc-diag-pattern}所说"读出训练内部状态"在缺省键不够用时的自助补法。
+
+mjlab 日志目录结构（含完整配置快照与多 checkpoint）：
+
+\begin{codebox}[text]{mjlab 日志目录结构（任务 id 用真实存在的 Go1/G1，mjlab 无 Go2）}
+logs/Mjlab-Velocity-Flat-Unitree-Go1/2026-05-20_14-30-00/
+  config.yaml          # 完整训练配置快照（复现的根据）
+  model_0.pt           # 初始 checkpoint
+  model_500.pt         # 中间 checkpoint
+  model_last.pt        # 最后 checkpoint
+  <timestamp>.onnx     # 每存 checkpoint 自动导出的部署产物（任务专属 runner 重写 save()）
+  events.out.tfevents  # TensorBoard 事件
+\end{codebox}
+
+Isaac Lab 默认在 \verb|logs/rsl_rl/| 下按任务名 $+$ 时间戳组织；用 RL Games 后端则在 \Verb[breaklines]|logs/rl_games/|，键名也完全不同。
+
+\textbf{UniLab 日志目录}与 PPO 键名映射如下（实跑核对）：UniLab 的 PPO 同走 rsl-rl 的 \Verb[breaklines]|OnPolicyRunner|，故 \cref{tab:rlmc-diag-logmap} 的 mjlab 列\textbf{逐键适用于 UniLab PPO}（具体键名取决于 UniLab 实际装的 rsl-rl-lib 版本，键名族同上：\verb|Loss/value|、\verb|Loss/entropy|、\Verb[breaklines]|Train/mean_reward|，KL 不单独记）；UniLab 额外把分项 reward 经 \Verb[breaklines]|run_reward_dispatch| 写进 \verb|info["log"]| 的 \verb|reward/<term>| 键（每 4 步一次）。差异在它额外落两份复现元数据，且 NaN dump 单独成目录。
+
+\begin{codebox}[text]{UniLab 日志目录结构（PPO，对照 mjlab）}
+logs/<task>/<timestamp>/
+  run_config.json      # 完整训练配置快照（含 git/seed/任务，复现根据）
+  run_summary.json     # 硬件/吞吐/退出码摘要（mjlab/Isaac 无独立此文件）
+  git/UniLab.diff      # 源码改动 diff（保证"实验性改动"可追溯）
+  model_0.pt           # checkpoint（rsl-rl .pt 格式，与 mjlab 同）
+  events.out.tfevents  # TensorBoard 事件
+  policy.onnx          # 仅 play/eval 阶段导出（见下:导出时机差异）
+# NaN 守卫命中时另写:<nan_guard.output_dir>/nan_dump_<ts>_step<N>.npz
+\end{codebox}
+
+\subsection{EmpiricalNormalization：训练时在线、部署时必须冻结}
+
+RSL-RL 用 Welford 算法维护 running mean/std 对 observation 在线归一化，但\textbf{配置开关名随框架打包的 rsl-rl 版本而漂移}（gpufree 实跑核对，两版不同名，别凭记忆）：Isaac Lab（rsl-rl 3.1.2）在 \Verb[breaklines]|ActorCritic.__init__| 直接暴露 \Verb[breaklines]|actor_obs_normalization| / \Verb[breaklines]|critic_obs_normalization| 两个布尔（源码 \Verb[breaklines]|actor_critic_recurrent.py| 实测命中）；mjlab（5.2.0）则\textbf{不存在}这两个名字（在 rsl-rl 5.2.0 包内 \Verb[breaklines]|grep actor_obs_normalization| 零命中），它经 \verb|RslRlModelCfg| 的 \verb|actor=| / \verb|critic=| 两个块各暴露一个 \Verb[breaklines]|obs_normalization| 布尔（\Verb[breaklines]|rl_cfg.py:16/26|）。两版底层都用 \Verb[breaklines]|rsl_rl.modules.EmpiricalNormalization|（在 actor/critic 模块的 \Verb[breaklines]|update_normalization()| 中更新统计量），只是配置入口名不同。训练时它不断更新统计量保证输入恒在 $O(1)$，但\textbf{部署时必须冻结}——否则 ONNX 在真机上收到的 obs 会被一个从零开始的新 normalizer 处理，输出全是垃圾。
+
+\begin{pitfall}[把 Isaac 的 actor\_obs\_normalization 当成 mjlab 也有的同名开关]
+\textbf{错误描述}：以为"开 obs 归一化"在三框架是同一个开关名，照 Isaac 的 \Verb[breaklines]|actor_obs_normalization| 去 mjlab/UniLab 配置里改。\textbf{现象后果}：mjlab 侧改了个不存在的字段（tyro/dataclass 会直接报未知参数），或误以为没生效。\textbf{根本原因}：归一化开关名随 rsl-rl 版本演进而改，凭记忆套用。\textbf{正确做法}：\emph{不要背名字，自己查你这版到底叫什么}——这是本章反复强调的"以本机实际加载值为基线"在这张最易漂移的表上的落地：
+\begin{codebox}[bash]{自查 obs 归一化开关名（不背、现场列字段）}
+# mjlab（5.2.0）:列出 RslRlModelCfg 的真实字段，看到的是 obs_normalization 而非 actor_obs_normalization
+python -c "from mjlab.rl import RslRlModelCfg; import dataclasses; \
+print([f.name for f in dataclasses.fields(RslRlModelCfg)])"
+# 通用兜底:读 run 目录里框架保存的 config.yaml，搜 normalization —— 以这次训练真加载的键为准
+grep -i normalization logs/<task>/<timestamp>/config.yaml
+\end{codebox}
+\end{pitfall}
+
+\begin{pitfall}[ONNX 导出时忘了把归一化 $\mu/\sigma$ 烘焙为常量]
+\textbf{错误描述}：训练开了 obs 归一化，但 ONNX 导出时没把 running mean/std 固化进图。\textbf{现象后果}：play 时正常（PyTorch 模型自带统计量），ONNX 部署却输出垃圾——这是最常见的 sim-to-real 失败之一。\textbf{根本原因}：归一化统计量在模型外/未随图导出。\textbf{正确做法}：导出后用下面脚本验证图里含归一化常量。
+\end{pitfall}
+
+\begin{codebox}[Python]{检查 ONNX 是否含归一化常量}
+import onnx
+model = onnx.load("policy.onnx")
+found = False
+for init in model.graph.initializer:
+    if "running_mean" in init.name or "running_var" in init.name:
+        print(f"Found normalization constant: {init.name}"); found = True
+if not found:
+    print("normalization NOT baked -> deploy will fail")
+\end{codebox}
+
+Isaac Lab（rsl-rl 3.1.2）与 mjlab（5.2.0）的归一化\emph{类}都是 \Verb[breaklines]|rsl_rl.modules.EmpiricalNormalization|（源码核对，类名两版一致、行为一致）；但如上所述\textbf{配置开关名两版不同}（Isaac=\Verb[breaklines]|actor_obs_normalization|/\allowbreak\Verb[breaklines]|critic_obs_normalization| 在 \Verb[breaklines]|ActorCritic.__init__|；mjlab=\verb|RslRlModelCfg| 的 \verb|actor=|/\allowbreak\verb|critic=| 块各一个 \Verb[breaklines]|obs_normalization|），别把类名一致误当成开关名一致。Isaac Lab 的 \Verb[breaklines]|export_policy_as_onnx|（\Verb[breaklines]|isaaclab_rl/rsl_rl/exporter.py|）默认把 normalizer 一并写进 \verb|policy.onnx|（B 系列实测确证），故下方脚本应能找到归一化常量。
+
+\textbf{UniLab 侧的归一化与一个独有的导出陷阱。}UniLab 的 PPO 同样用 rsl-rl 的 obs 归一化（\Verb[breaklines]|empirical_normalization=true| 时归一化层经 rsl-rl 写进 ONNX，与 mjlab 一致），异构架构下还多一个 \Verb[breaklines]|SharedObsNormStats|（用 Queue 在 collector 与 learner 间传 \verb|(mean,std)|，因为统计量在 CPU collector 侧更新、要同步给 GPU learner）。但 UniLab 有一个 mjlab/Isaac 没有的\textbf{导出时机陷阱}：
+
+\begin{pitfall}[UniLab PPO 在 play/eval 阶段才导 ONNX，训练时加 \texttt{no\_play=true} 会拿不到部署产物]
+\textbf{错误描述}：照 mjlab"训练后自动出 \verb|.onnx|"的习惯，在 UniLab 跑 \Verb[breaklines]|train ... training.no_play=true| 后去 log 目录找 \verb|policy.onnx|。\textbf{现象后果}：目录里只有 \verb|.pt|、没有 ONNX，误以为导出失败。\textbf{根本原因}：UniLab 的 PPO 走 \Verb[breaklines]|export_policy_to_onnx| 在 \textbf{play/eval 路径}导出（源码核对 UniLab \Verb[breaklines]|scripts/train_rsl_rl.py|），\verb|no_play=true| 跳过 play 即不导；off-policy(SAC/TD3) 则由 \Verb[breaklines]|training.export_onnx|（默认 true）在训练流程内导，APPO 在 \verb|train_appo.py| 内导并起 \verb|onnxruntime| 自验。\textbf{正确做法}：要部署产物就跑一次 \Verb[breaklines]|uv run eval --algo ppo ... --load-run -1|（落 \verb|policy.onnx|），或对 off-policy 确认 \Verb[breaklines]|export_onnx=true|。导出后同样用上面脚本验证归一化常量已烘焙。
+\end{pitfall}
+
+\subsection{行为回放：视觉诊断的不可替代性}
+
+数字指标永远无法替代视觉检查（见 \cref{ins:rlmc-diag-replay}）。mjlab 回放：
+
+\begin{codebox}[bash]{mjlab 回放}
+uv run play My-Velocity-Rough-Go2-v0 \
+  --checkpoint logs/.../model_2000.pt --num-envs 16
+\end{codebox}
+
+\begin{table}[H]
+\centering
+\caption{行为回放的视觉检查清单}
+\label{tab:rlmc-diag-visual}
+\begin{tabular}{p{2.6cm}p{4.6cm}p{4.6cm}}
+\hline
+检查项 & 正常 & 异常 \\
+\hline
+步态对称性 & 左右交替、幅度相近 & 一腿大一腿小 \\
+身体姿态 & 基本水平、轻微晃动 & 严重倾斜、头部下沉 \\
+足端轨迹 & 清晰抬起-前摆-落地 & 拖地、打滑、不抬脚 \\
+速度跟踪 & 朝指令方向移动 & 走错方向或原地转圈 \\
+关节行为 & 平滑连续 & 抖动、跳变、打限位 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{WandB 诊断面板推荐布局与自定义指标}
+
+\begin{table}[H]
+\centering
+\caption{WandB 诊断面板推荐 $3\times3$ 布局}
+\label{tab:rlmc-diag-panel}
+\begin{tabular}{p{1.0cm}p{3.4cm}p{3.4cm}p{3.4cm}}
+\hline
+行 & 左列 & 中列 & 右列 \\
+\hline
+1 & 总 Reward & KL（rsl-rl 看 Learning Rate 代理） & Entropy（\texttt{Loss/\allowbreak entropy}） \\
+2 & 分项 Reward（叠加） & Value Loss & Episode Length \\
+3 & Learning Rate & env\_fps / total\_fps & Curriculum Stage \\
+\hline
+\end{tabular}
+\end{table}
+
+框架默认指标覆盖大部分需求，特定任务可加自定义指标。mjlab 中通过 MetricsManager 配置（每 episode 结束收集，记到 \verb|Metrics/| 前缀）：
+
+\begin{codebox}[Python]{mjlab 自定义诊断指标（接触率/跟踪误差/限位接近/动作平滑度）}
+class MyMetricsCfg:
+    contact_rate = MetricTermCfg(func=lambda env:
+        (env.contact_forces[:, feet_ids].norm(dim=-1) > 1.0).float().mean(dim=-1))
+    tracking_error = MetricTermCfg(func=lambda env:
+        (env.root_lin_vel_b[:, :2] - env.commands[:, :2]).norm(dim=-1))
+    joint_limit_proximity = MetricTermCfg(func=lambda env:
+        ((env.joint_pos - env.joint_pos_limits[:, 0]).abs() < 0.1).float().mean(dim=-1))
+    action_rate_rms = MetricTermCfg(func=lambda env:
+        (env.actions - env.previous_actions).norm(dim=-1))  # 部署预诊断指标
+\end{codebox}
+
+对长时间无人值守训练（如周末挂机），建议配 WandB Alert：reward 跌超 20\% 或出现 NaN 时自动告警。复现性上，把 git hash/branch/dirty、hostname、GPU 名写进 \verb|wandb.config|——框架自动保存的 config 只含框架内配置，你硬编码的源码改动不会被保存，故所有实验性修改应走 CLI override 或配置文件而非改源码。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[WandB run 名不含关键参数 / 误以为 TB 与 WandB 二选一]
+\textbf{错误描述}：跑 50 个实验后分不清哪个是哪个；或以为只能用一个日志后端。\textbf{现象后果}：实验无法回溯比较。\textbf{根本原因}：命名随意 + 工具认知误区。\textbf{正确做法}：\verb|--wandb-name| 含关键参数（如 \Verb[breaklines]|go2_lr3e4_ent001_v3|）；TB 与 WandB 可同时启用（开发用 TB 快看，正式实验用 WandB 多实验对比）。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[操作]} 在 mjlab 同时启 TB 与 WandB，对比两者 reward/KL 曲线是否一致，不一致则排查。\emph{验收}：给出两后端曲线截图并说明一致或定位差异源。
+  \item \textbf{[设计]} 记录"每 episode 机器人摔倒次数"这一自定义指标，写出 mjlab 与 Isaac Lab 各自实现。\emph{验收}：两实现都把计数挂到 MetricsManager/对应 wrapper 并出现在 \verb|Metrics/| 下。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{贯穿案例：从 Smoke Test 到诊断的完整流程}
+\label{sec:rlmc-diag-walkthrough}
+
+\paragraph{模块功能与在管线中的位置。}前几节给了零件（指标阅读、模式识别、索引、日志），这一节把它们串成一条\textbf{可执行流水线}：从环境能否创建，到物理是否正常，到 obs/reward/reset 是否工作，到能否学，最后到跨引擎一致性。\textbf{场景}：为 Unitree Go2 开发 rough terrain velocity tracking，以 mjlab 为主框架、Isaac Lab 做对照。
+
+\begin{insight}[Phase 0--2 只需 25 分钟，却能避免数小时到数天的浪费]\label{ins:rlmc-diag-phases}
+最常见的低效是\textbf{跳过 Phase 0--2 直接开大训练}。这三个阶段（环境能创建吗 / 物理正常吗 / obs-reward-reset 正常吗）合计约 25 分钟，但任何一个不过关，后续训练都建立在错误地基上。就像飞行员起飞前检查仪表——若静止状态下油表就是零，不必起飞就知道有问题。\textbf{诊断流水线的价值不在最后的大训练，而在前面这些便宜的早期关卡}。
+\end{insight}
+
+\paragraph{先用现成任务把流水线"空跑"一遍（可执行替身，照搬必通）。}下文 Phase 0--5.5 的命令一律用\emph{示意}任务名 \Verb[breaklines]|My-Velocity-Rough-Go2-v0|（你自建的，见 \cref{sec:rlmc-diag-quickstart} 的 note：mjlab 无 Go2、自建任务需另写 cfg）——\textbf{初学者第一关就会卡在"这个任务不存在"}。在动手搭自己的任务之前，强烈建议先把整套 Phase 流程用 mjlab \emph{自带的真实} rough 任务 \Verb[breaklines]|Mjlab-Velocity-Rough-Unitree-Go1| 走通一遍（gpufree 实跑：该任务存在、能 zero/random 体检、64 env 2 迭代即出 steps/s 与 value loss），把"流程肌肉记忆"和"自建任务"两件事解耦：
+
+\begin{codebox}[bash]{用现成 Go1 rough 任务把 Phase 0--3 空跑一遍（每条都实跑可通）}
+# Phase 0:现成任务一定在册（不必先建任务）
+uv run list-envs | grep "Velocity-Rough-Unitree-Go1"
+# Phase 1/2:zero / random 体检（play.py 的 --agent 真有这三档:zero/random/trained）
+uv run play Mjlab-Velocity-Rough-Unitree-Go1 --agent zero   --num-envs 4
+uv run play Mjlab-Velocity-Rough-Unitree-Go1 --agent random --num-envs 4
+# Phase 3:64 env 小训练 2 迭代，确认 steps/s、value loss、reward 三信号都正常
+WANDB_MODE=disabled uv run train Mjlab-Velocity-Rough-Unitree-Go1 \
+  --env.scene.num-envs 64 --agent.max-iterations 2
+\end{codebox}
+
+\paragraph{从零搭一个自建 rough 任务的最小步骤（不是从空白写，而是复制现成 cfg 再改）。}工程上真实的"从零搭一个任务"\textbf{几乎从不从空 cfg 手写}——那会一路踩 import 路径/类名坑；正确路径是\emph{复制框架自带的最接近任务、改三处、注册}。以在 mjlab 上从 Go1 velocity 派生一个自建变体为例，最小步骤是：
+
+\begin{enumerate}
+  \item \textbf{定位现成 cfg}：找到 mjlab 自带 \Verb[breaklines]|Mjlab-Velocity-Rough-Unitree-Go1| 的任务定义（\Verb[breaklines]|tasks/velocity/config/go1/| 下的 env\_cfg 与 rl\_cfg），它已是一个能跑的 rough 速度任务。
+  \item \textbf{复制并改三处}：复制成你的 \verb|env_cfgs.py|，只动你真正要改的——例如把机器人换成别的本体、调 \verb|num_envs| 默认、或改某个 reward term 权重（\Verb[breaklines]|--env.rewards.<name>.weight| 也能在命令行临时改，先命令行验证再写回 cfg）。\emph{不要}一上来重写 obs/action 组。
+  \item \textbf{注册}：用 mjlab 的 \Verb[breaklines]|register_mjlab_task(...)|（传\emph{已实例化}的 cfg，区别于 Isaac 的 \verb|gym.register| 传类）把它登记成一个新任务 id，例如 \Verb[breaklines]|My-Velocity-Rough-Go2-v0|。
+  \item \textbf{跑通即返回 Phase 0}：用 \verb!uv run list-envs! 配合 grep 看见你的新 id，再走上面的 zero/random/小训练三连。任一步失败就回到上一步——这正是"先让一个最小改动跑通，再逐步加复杂度"。
+\end{enumerate}
+
+理解了这条"复制现成→改三处→注册→跑通"的路子，下文 Phase 0--5.5 里所有 \verb|My-...-Go2| 命令你都能在自己机器上替换成真能跑的任务。
+
+\subsection{Phase 0--2：环境、物理、接口的早期关卡}
+
+\begin{codebox}[bash]{Phase 0 Smoke Test（5 分钟）:能注册能实例化（任务名替换成你上面注册的或现成 Go1）}
+uv run list-envs | grep "My-Velocity-Rough-Go2"   # 任务注册了吗（现成对照用 Velocity-Rough-Unitree-Go1）
+uv run demo My-Velocity-Rough-Go2-v0              # 能实例化吗（不训练）
+\end{codebox}
+
+\textbf{Phase 1 Zero Agent（10 分钟）}：所有动作置零，暴露默认姿态、重力响应、被动动力学。应看到 Go2 从站立在重力下缓慢下蹲。异常对照：
+
+\begin{table}[H]
+\centering
+\caption{Phase 1 Zero Agent 异常现象与修复}
+\label{tab:rlmc-diag-zero}
+\begin{tabular}{p{3.6cm}p{4.4cm}p{4.0cm}}
+\hline
+异常现象 & 根因 & 修复 \\
+\hline
+机器人飞到空中 & 重力方向错 / freejoint 未约束 & 查 MJCF/USD 重力（z-up vs y-up） \\
+穿过地面 & 碰撞检测问题 & 查 condim/contype、collision geometry \\
+关节瞬间弹到极限 & PD gain 初始化错 / default 姿态不合理 & 查 actuator Kp/Kd 与默认角 \\
+完全静止 & actuator 为 velocity 模式且默认速度 0 & 切 position 模式或设合理初始 target \\
+某些关节方向相反 & MJCF 关节轴定义与代码假设不一致 & 用 AGILE Joint Position GUI 逐个验证 \\
+\hline
+\end{tabular}
+\end{table}
+
+除视觉外应打印定量值：重力方向（期望 $[0,0,-9.81]$ 或 $[0,-9.81,0]$）、root 高度（Go2 站立约 $0.34$ m，应缓降）、关节位置（接近 default）、接触力（站立时四足均分约 $mg/4\approx 37$ N，Go2 含电池约 15 kg；实际随姿态/地形/控制器而变）。
+
+\textbf{Phase 2 Random Agent（10 分钟）}：随机动作，验证 reward/termination/reset。关键定量检查 obs 形状与范围、逐维统计量（某维 std$\approx 0$ 说明返回常量、需删该 obs term 或修 sensor；出现 NaN 立即定位）、reward 是否随状态变、termination 频率（random 下应 $>50\%$）。
+
+\subsection{Phase 3--4：小规模训练与诊断修复循环}
+
+\begin{codebox}[bash]{Phase 3 小规模训练（用 64--256 envs，不要 4096）}
+uv run train My-Velocity-Rough-Go2-v0 \
+  --num-envs 64 --max-iterations 500 \
+  --logger wandb --wandb-name go2_rough_smoke_v1
+\end{codebox}
+
+500 iter 后健康检查：reward 有正向趋势、KL 在 $0.001\sim0.03$、entropy 有下降趋势、value\_loss 是有限非零、episode\_length 有增长。任一不达标进 Phase 4 诊断循环。设 Phase 3 观察到\textbf{模式三（停滞）}，按 \cref{sec:rlmc-diag-index} 索引表逐步排查：
+
+\begin{enumerate}
+  \item \textbf{reward 在最简情况能给分吗}：把命令全设零速度，看"站立不动"是否有 reward。零速度下 tracking 仍为零$\to$term 函数 bug（查 velocity error 的坐标系/单位）；为 1.0$\to$reward 没问题，问题在别处。
+  \item \textbf{obs 含足够信息吗}：逐个打印 obs term 的 shape/mean/std。缺 \verb|commands|（目标速度）则策略不知"往哪走"；所有 std$\approx 0$ 则提不出有用信息。
+  \item \textbf{手动提高 lr}：\Verb[breaklines]|--agent.algorithm.learning_rate 3e-3|。KL 从 0.001 升到 0.01 且 reward 有动静$\to$原 lr 太低是根因；KL 升到 0.05 但 reward 仍不动$\to$回到 Step 1--2。
+  \item \textbf{Isaac Lab 交叉验证}：用尽量相同配置在 Isaac Lab 跑对照。IL 中 reward 正常$\to$问题在 mjlab 特有配置（condim/contype、actuator 差异）；IL 中同样停滞$\to$问题在与引擎无关的 obs/reward 设计逻辑。
+  \item \textbf{reward shape 验证}：reward 太平坦时 PPO 的 advantage 几乎全噪声。统计 random 动作下 reward 的 std，若 std $< 0.01\times|\text{mean}|$ 则信号太弱（可能 tracking sigma 太大，所有 error 都映射到近 1.0），缩小 sigma 增强区分度。
+\end{enumerate}
+
+\begin{insight}[双框架是两个独立"目击者"]\label{ins:rlmc-diag-twowitness}
+Step 4 体现了双框架教学在调试中的实际价值：mjlab 与 Isaac Lab 像两个独立目击者，若"证词一致"（都说 reward 不涨），你可\textbf{排除框架特有因素}（物理引擎、contact 模型、数值精度），把注意力聚焦到与引擎无关的任务设计层面。这是单框架工作者拿不到的诊断杠杆。
+\end{insight}
+
+\subsection{Phase 5--5.5：扩大训练、定量评估与 sim-to-sim}
+
+Phase 5 扩到 4096 envs / 5000 iter，除监控曲线与定期回放外，引入\textbf{定量行为质量评估}（AGILE 的 deployment-critical motion metrics，专评是否适合部署）\cite{nvidia2026agile}：
+
+\begin{table}[H]
+\centering
+\caption{Motion-quality 定量评估指标（AGILE，安全阈值为经验值）}
+\label{tab:rlmc-diag-motionq}
+\begin{tabular}{p{3.2cm}p{3.6cm}p{2.8cm}p{3.0cm}}
+\hline
+指标 & 定义 & 安全阈值 & 意义 \\
+\hline
+RMS 关节加速度 & $\sqrt{\frac1T\sum_t \ddot q_t^2}$ & $<500$ rad/s$^2$ & 过大$\to$电机过热 \\
+RMS jerk & $\sqrt{\frac1T\sum_t \dddot q_t^2}$ & $<5000$ rad/s$^3$ & 过大$\to$机械冲击 \\
+关节限位违规率 & $\frac1T\sum_t \mathbb{1}[|q_t|>q_{\max}]$ & $<5\%$ & 超限$\to$硬件损坏 \\
+高频能量比 & $E_{>10\text{Hz}}/E_{\text{total}}$ & $<20\%$ & 高频$\to$真机追不上 \\
+\hline
+\end{tabular}
+\end{table}
+
+这些指标弥补 reward 的盲区：reward 只衡量"任务完成度"，motion-quality 衡量"完成方式是否安全"。Phase 5.5 在 Phase 5 与部署之间插入 sim-to-sim：导 ONNX 到另一引擎评估，不一致则按"关节顺序$\to$PD gain$\to$重力方向$\to$归一化冻结"顺序排查。
+
+\paragraph{UniLab 把 sim-to-sim 做成一等公民的契约关卡。}在 mjlab/Isaac 里，sim-to-sim 是你手动搭的流程（上面路径 3）；UniLab 因为天生支持 MuJoCo 与 Motrix 双后端，\textbf{内建跨后端 sim2sim 契约校验}（源码核对 UniLab \Verb[breaklines]|training/sim2sim.py|）：把一份后端训出的策略拿到另一后端回放前，\Verb[breaklines]|resolve_sim2sim_config| 读源 run 的 \Verb[breaklines]|run_config.json| 里的 \Verb[breaklines]|contract_snapshot|，与目标 play 配置\textbf{逐字段比对}决定策略行为的量（obs 装配、动作缩放、归一化等）；\verb|DENYLIST|/\allowbreak\Verb[breaklines]|ENV_STRUCTURAL_DENYLIST| 里的字段若不一致就是"denial"，\Verb[breaklines]|training.sim2sim_strict=true|（默认）直接抛 \Verb[breaklines]|CrossBackendIncompatibleError|，把 Phase 5.5 才会暴露的不兼容\textbf{前置成"编译期"错误}。张量 shape 不匹配也被 \Verb[breaklines]|policy_load_dim_guard| 重抛成 sim2sim 诊断。\textbf{诊断启示}：模式 E（Sim OK Real Bad）的根因里，"训练侧与评估侧 obs 装配/归一化不一致"是高频项；UniLab 用契约把它在迁移瞬间拦下，而非等回放看出怪异行为——这正是 \cref{ins:rlmc-diag-twowitness} "双目击者"思想的工具化（同一策略在 MuJoCo$\leftrightarrow$Motrix 间的差异被显式审计）。
+
+\begin{codebox}[text]{完整流程总结（自上而下，每关卡有验收）}
+Phase 0 Smoke    -> 环境能创建吗
+Phase 1 Zero     -> 物理系统正常吗
+Phase 2 Random   -> obs/reward/reset 正常吗
+Phase 3 Small    -> reward 有正向趋势吗  (否 -> Phase 4 诊断循环)
+Phase 5 Full     -> 监控 + 定期回放 + motion-quality 评估
+Phase 5.5 Sim2Sim-> 跨引擎行为一致吗
+Phase 6 Deploy   -> ONNX + 真机（见 Sim2Real 部署章）
+\end{codebox}
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[Phase 3 的 num\_envs 太大 / 跳过 Phase 5.5 直接上真机]
+\textbf{错误描述}：用 4096 envs 做 smoke 训练；或跳过 sim-to-sim 直接上真机。\textbf{现象后果}：前者出问题 debug 时 GPU 内存不够同时开 debugger；后者到现场才发现 joint ordering/归一化/PD gain 的 bug，代价是硬件损坏 + 数小时现场调试。\textbf{根本原因}：贪快省关卡。\textbf{正确做法}：Phase 3 用 64--256 envs；sim-to-sim 能在几分钟暴露约 90\% 的部署 bug，绝不跳过。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[操作]} 在 mjlab 从 Phase 0 到 Phase 3 完整走一遍速度任务，每个 Phase 记录看到了什么、判断标准是什么。\emph{验收}：四个 Phase 各有"观察 + 通过/不通过判定"。
+  \item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-dr}：Phase 5 应在训练什么阶段加 DR？若一开始就加 DR 且失败，如何判断是 DR 问题还是基础环境问题？\emph{验收}：答出"先无 DR 跑通基础环境，再加 DR；失败时关掉 DR 复跑做 A/B 区分"。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{高级调试：Reward 分解、Checkpoint Forensics 与 NaN 分类}
+\label{sec:rlmc-diag-advanced}
+
+\paragraph{模块功能与在管线中的位置。}前面的模式识别对约 80\% 的问题足够。但有些问题更微妙——五指标都正常，行为却不好；或训练曾经很好、在某个不明时间点开始退化。这一节给更细粒度的工具：时间维度的 reward 分解、checkpoint 考古、以及 NaN 的系统分类。
+
+\subsection{Reward Decomposition：时间维度的显微镜}
+
+标准面板只显示 term 的 episode 平均值，但一个 episode 内部 reward 时间分布可能极不均匀。\emph{反事实}：只看平均会发现 contact\_reward $=0.5$（看似还行），时间分解后却见摆动阶段 $0.0$（对）、接地阶段 $1.0$（对）、过渡瞬间 $-2.0$（有问题）——平均掩盖了过渡瞬间的尖峰惩罚。
+
+\begin{codebox}[Python]{per-step reward 时间线可视化（少量环境，避免 I/O 瓶颈）}
+import matplotlib.pyplot as plt, numpy as np
+def plot_reward_decomposition(step_rewards, episode_id):
+    n = len(step_rewards)  # {term_name: values}
+    fig, axes = plt.subplots(n, 1, figsize=(12, 3 * n), sharex=True)
+    axes = np.atleast_1d(axes)  # n==1 时 subplots 返回单个 Axes
+    for i, (term, vals) in enumerate(step_rewards.items()):
+        axes[i].plot(vals); axes[i].set_ylabel(term)
+    axes[-1].set_xlabel("Step within episode")
+    plt.tight_layout(); plt.savefig(f"reward_decomp_ep{episode_id}.png")
+\end{codebox}
+
+\subsection{Checkpoint Forensics：时间旅行调试}
+
+训练在某时间点退化但不确定原因时，保存高频 checkpoint（如每 100 iter），对每个做\emph{相同的固定条件评估}，画"评估性能 vs 训练时间"曲线。精髓：训练 reward 是在变化的 obs 归一化与 curriculum 下测的，评估 reward 在固定条件下测——训练 reward 涨而评估 reward 降，说明策略"学会了适应当前训练条件"但"泛化在退化"。
+
+\begin{codebox}[Python]{自动检测退化拐点}
+import glob, numpy as np, pandas as pd
+def forensics_analysis(log_dir, env_cfg, n_eval=50):
+    ckpts = sorted(glob.glob(f"{log_dir}/model_*.pt"),
+                   key=lambda x: int(x.split("_")[-1].split(".")[0]))
+    rows = [{"iter": int(c.split("_")[-1].split(".")[0]),
+             "eval_reward": evaluate_checkpoint(c, env_cfg, n_eval)} for c in ckpts]
+    df = pd.DataFrame(rows)
+    df["roll"] = df["eval_reward"].rolling(5).mean()
+    df["diff"] = df["roll"].diff()
+    bad = df[df["diff"] < -0.05 * df["eval_reward"].max()]   # 跌超峰值 5%
+    if not bad.empty:
+        print(f"decline at iter {bad.iloc[0]['iter']}; revert before it")
+    return df
+\end{codebox}
+
+这种"考古式"调试在三种场景特别有用：周五挂训练周一发现后半段全退化；怀疑某 curriculum stage 切换致退化但不确定是哪个；需找"最佳 checkpoint"部署而非直接用最后一个。
+
+\paragraph{网络权重与梯度分析。}加载 checkpoint 检查每层 \Verb[breaklines]|mean/std/max_abs/has_nan|：某层 std 远大于其他层$\to$发散中；某层接近零$\to$梯度消失；含 NaN$\to$已崩但被掩盖。RSL-RL 默认启用 gradient clipping（\verb|max_grad_norm|，默认 $1.0$）；标准 locomotion 用 1.0，复杂多项 reward 用 0.5，稀疏 reward 用 2.0（梯度本小，clip 太紧反阻学习），大 batch（8192+）用 0.5--1.0。
+
+\subsection{NaN 系统性分类法：四类工程问题}
+
+NaN 并非不可分析。结合 \cref{ch:rlmc-largescale} 的框架，NaN 可系统分四类——先分诊再针对性检查，不分诊就做"全身 CT"既慢又漏：
+
+\begin{table}[H]
+\centering
+\caption{NaN 四类分类（先分诊后排查）}
+\label{tab:rlmc-diag-nan4}
+\begin{tabular}{p{2.0cm}p{2.8cm}p{3.0cm}p{2.4cm}p{2.4cm}}
+\hline
+类别 & 典型表现 & 根因域 & 证据来源 & 不要先做 \\
+\hline
+数值崩溃 & 训练循环报 NaN loss & 物理状态/接触 solver/reward 爆炸 & NaN dump（守卫） & 调 PPO lr \\
+复现失败 & "昨天炸今天不炸" & 随机种子/初始化/DR 边界 & rolling buffer + 固定 seed & 当"已修复" \\
+性能退化 & steps/s 降一半 & sensor 开销/manager 积累/CUDA Graph 失效 & benchmark 拆分 & 降任务难度 \\
+容量溢出 & OOM 或行为悄悄变异 & nconmax/njmax/sensor buffer & 容量扫描（ncon 分布） & 减半 num\_envs \\
+\hline
+\end{tabular}
+\end{table}
+
+五种具体根因（按频率）：\textbf{(1) 接触 solver 发散}（最常见）——高 \verb|condim| + 大摩擦 + 小 \verb|solref| 下 solver 一步内不收敛，NaN 经"接触力$\to$加速度$\to$速度$\to$位置$\to$obs"传播；修复查 solref/solimp、降摩擦到 $<2.0$、增 solver 迭代。\textbf{(2) Reward 爆炸}——$1/d$ 或 $\log d$ 型距离 reward 在 $d\to 0$ 时爆炸，改用有界形 $\exp(-d^2/\sigma)$ 或 $1/(1+d)$。\textbf{(3) Obs 溢出}——EmpiricalNormalization 预热不足时 std 估计近零致 $(x-\mu)/\sigma$ 爆炸，对 std 设 \Verb[breaklines]|clamp(min=1e-4)|。\textbf{(4) Log-prob NaN}——actor 直接输出 std 时可能变负致 $\log\sigma$ NaN；RSL-RL 默认用可学习的全局 std 参数（而非逐状态输出），故较少见，但自定义网络时须保证 std 恒正（\verb|softplus| 或 \Verb[breaklines]|exp(log_std.clamp(-5,2))|）。\textbf{(5) CUDA Graph 失效}——DR 改变内存布局致 captured 形状不匹配，通常不直接产 NaN 而是 CUDA 错误或无声错算。
+
+\paragraph{UniLab：NaN 守卫的离线复现，与异构架构独有的"容量溢出"。}UniLab 在 \verb|NpEnv| 内建 \verb|NanGuard|（源码核对 UniLab \Verb[breaklines]|utils/nan_guard.py|，默认开 \Verb[breaklines]|training.nan_guard.enabled=true|）：\verb|step()| 中 \verb|check_ctrl| 查动作 NaN、\verb|check| 查 obs/reward NaN，并用 \verb|capture| 把出事前最近若干帧的\textbf{物理状态}存进环缓冲（后端支持 \Verb[breaklines]|physics_state_playback| 时）；命中即写 \Verb[breaklines]|nan_dump_<ts>_step<N>.npz|，事后 \Verb[breaklines]|unilab-viz-nan <dump>| 用 \verb|mujoco.viewer| \textbf{逐帧回放出事前那几帧}——这是比 mjlab 的 \verb|viz-nan| 更进一步的"物理状态时间机器"。注意它 \verb|step()| 末尾同样有兜底 \Verb[breaklines]|np.nan_to_num(reward)|，故\textbf{看 reward 干净仍可能已 NaN}（与 \cref{ins:rlmc-diag-nantonum} 同理），要靠 NaN dump 而非 reward 曲线发现。
+
+更关键的是 UniLab 的异构架构\textbf{独有一类"容量溢出"失败面}：replay buffer / rollout ring buffer 都在 \verb|/dev/shm| 共享内存里，可能被撑爆。UniLab 在分配前算预算（源码核对 UniLab \Verb[breaklines]|ipc/memory_budget.py|）：超 \verb|/dev/shm| 容量 $80\%$ 直接抛 \verb|MemoryError|（提示"减小 \verb|algo.num_envs| 或 \Verb[breaklines]|algo.replay_buffer_n|，或加大 \verb|/dev/shm|"），超系统内存阈值打警告（\Verb[breaklines]|UNILAB_SKIP_MEMORY_CHECK=1| 关）。\textbf{这是 GPU-sim 框架（mjlab/Isaac）完全没有的失败模式}——它们数据在 GPU、无共享内存边界；映射到 \cref{tab:rlmc-diag-nan4} 的"容量溢出"类时，UniLab 的证据来源不是 \verb|ncon| 分布而是 \verb|/dev/shm| 用量与 \verb|MemoryError| 回溯。
+
+\begin{pitfall}[把 nconmax 当成 Isaac Lab/PhysX 的配置项]
+\textbf{错误描述}：在 Isaac Lab 里找 \verb|nconmax| 来修容量溢出。\textbf{现象后果}：找不到对应项、改错地方。\textbf{根本原因}：\verb|nconmax| 是 MuJoCo/MJCF 的容量概念（接触数上限），\textbf{不是} PhysX 配置。\textbf{正确做法}：MuJoCo/mjlab 侧把 contacts padding 到固定大小（MJCF 设 \verb|nconmax|，经验取 $1.5\times$ 观测到的最大 ncon）；Isaac Lab/PhysX 侧对应的是接触缓冲/contact sensor 配置，且较新版本已移除 \Verb[breaklines]|SimulationCfg.disable_contact_processing|，须按所用版本官方参数处理。
+\end{pitfall}
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[NaN 出现后只做一次 nan\_to\_num 就继续训练]
+\textbf{错误描述}：见 NaN 就 \verb|nan_to_num| 一把然后接着训。\textbf{现象后果}：症状被掩盖，根因仍在，积累后更严重。\textbf{根本原因}：把"消除症状"当"解决问题"。\textbf{正确做法}：用上面四类分类法定位根因，修复后从 clean checkpoint 重训。另：高频 checkpoint 会耗尽磁盘，用 \Verb[breaklines]|max_checkpoints| 只留最近 N 个。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[操作]} 对一个在训任务实现 per-step reward 分解记录，画一个 episode 的 reward 时间线，报告从图中发现了什么数字面板看不到的信息。\emph{验收}：指出至少一个被 episode 平均掩盖的瞬间尖峰或符号异常。
+  \item \textbf{[设计]} 设计自动化 checkpoint forensics 脚本：输入日志目录，加载所有 checkpoint、固定条件评估、画性能曲线、标注退化拐点。\emph{验收}：脚本能输出第一个显著下降的 iteration。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{实验设计的诊断视角}
+\label{sec:rlmc-diag-experiment}
+
+\paragraph{模块功能与在管线中的位置。}前面所有方法都假设"看一次训练"。但要得出\emph{可靠结论}（"这个配置好/坏"），单次训练不够——RL 训练有内在随机性（种子、初始化、reset、mini-batch 抽样）。这一节从诊断视角讲如何设计可比较、可复现的实验。
+
+\begin{insight}[单次训练的 seed 方差常大于参数调整的效果]\label{ins:rlmc-diag-seed}
+\emph{反事实}：你把 lr 从 3e-4 改到 1e-3 训一次，reward 提高 15\%，得出"1e-3 更好"。但换个 seed 重跑，可能 3e-4 反而更好。\textbf{在机器人 RL 中，不同 seed 的性能方差可高达 20--30\%，远大于许多参数调整带来的效果}。所以"一次实验的曲线"不能作为结论——每个配置至少 3 个 seed（5 个更好），且所有配置用\emph{同一组} seed。
+\end{insight}
+
+\subsection{消融实验设计}
+
+核心原则是"一次改一个变量"。但有些参数高度关联（改 reward weight 可能需同调 lr），需更谨慎设计：
+
+\begin{table}[H]
+\centering
+\caption{消融实验设计模式}
+\label{tab:rlmc-diag-ablation}
+\begin{tabular}{p{3.0cm}p{3.6cm}p{3.0cm}p{3.0cm}}
+\hline
+设计模式 & 适用场景 & 参数数量 & 实验次数 \\
+\hline
+单因素消融 & 验证一个参数影响 & 1 & 3--5 值 $\times$ 3 seed \\
+正交表 & 同时探索 2--3 参数 & 2--3，每个 2--3 level & L9 $=9\times3$ seed \\
+AGILE scaled-dict & 结构化参数组缩放 & 多参数绑为 1 标量 & 3--5 值 $\times$ 3 seed \\
+Bayesian 优化 & 空间大、每次贵 & 5+ & 自适应 50--100 trials \\
+\hline
+\end{tabular}
+\end{table}
+
+操作流程：(1) 先用默认配置训 3 seed 确认 baseline 性能与方差；(2) 基于 \cref{sec:rlmc-diag-index} 索引选 1--2 个最可能影响结果的参数；(3) 每参数选 3 值（默认/更大/更小）；(4) 每配置 3 seed，全用同一 seed 集；(5) 用 WandB Parallel Coordinates 或手绘"性能 vs 参数"分析。
+
+\begin{codebox}[bash]{消融脚本骨架（mjlab，统一 seed 集 + wandb-group）}
+TASK="My-Velocity-Rough-Go2-v0"; SEEDS="42 123 456"
+for seed in $SEEDS; do
+  uv run train $TASK --seed $seed \
+    --wandb-name baseline_seed${seed} --wandb-group ablation_v1
+done
+for lr in 1e-4 3e-4 1e-3; do for seed in $SEEDS; do
+  uv run train $TASK --seed $seed --agent.algorithm.learning_rate $lr \
+    --wandb-name ablation_lr${lr}_seed${seed} --wandb-group ablation_v1
+done; done
+\end{codebox}
+
+\paragraph{AGILE scaled-dict。}人形配置里常有\emph{结构性关联}的参数组（如所有腿部 PD 增益：6 关节 $\times$ Kp/Kd $=$ 12 参数）。逐个 sweep 这 12 个是天文数字。scaled-dict 把它们绑到一个标量：\verb|leg_pd_scale| 取 $\{0.3,0.5,0.7,1.0,1.5\}$，每个关节 \Verb[breaklines]|Kp[j]=base_Kp[j]*leg_pd_scale|——12 参数 sweep 变 1 参数 sweep，且保留组内相对结构 \cite{nvidia2026agile}。
+
+\subsection{AGILE 的描述符驱动 I/O 契约}
+
+AGILE 在部署阶段引入一个重要工程实践：每次训练自动生成一个 \textbf{YAML I/O 描述符}，记录策略的输入输出契约（obs\_dim/action\_dim、obs\_ordering、action\_ordering、normalization 的 type/frozen/mean/std、history\_length、action\_scale、dt）。\textbf{同一描述符既用于 sim-to-sim 验证器，也用于真机 C++ 控制器}——杜绝 joint ordering mismatch 这一经典 bug \cite{nvidia2026agile}。在自己项目里实现类似描述符很简单：训练结束后从 \Verb[breaklines]|env.observation_manager.active_terms| 与 \Verb[breaklines]|env.action_manager.joint_names| 导出顺序，把归一化 mean/std 一并写入 YAML。
+
+\subsection{公平对比检查清单}
+
+\begin{table}[H]
+\centering
+\caption{公平对比检查清单}
+\label{tab:rlmc-diag-fair}
+\begin{tabular}{p{3.2cm}p{4.2cm}p{4.4cm}}
+\hline
+检查项 & 要求 & 为什么重要 \\
+\hline
+相同随机种子 & 同一 seed 集 & 排除随机性 \\
+相同环境数量 & num\_envs 一致 & batch size 影响训练动态 \\
+相同训练步数 & max\_iterations 一致 & 不用"训到收敛" \\
+相同硬件 & 同机同卡 & 避免浮点精度差异 \\
+相同评估条件 & 评估时 DR/curriculum 关闭 & 训练可不同，评估必须统一 \\
+统计显著性 & 均值$\pm$标准差，$\ge 3$ seed & 单次不够 \\
+\hline
+\end{tabular}
+\end{table}
+
+结果呈现的最佳实践：展示均值$\pm$标准差的阴影区域（而非单条线）；统一 num\_envs 或转成 total env steps；展示完整训练过程（不截"好看"段）；训练与评估 reward 都展示；图注标明 smoothing 值。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[用训练曲线比较算法 / 用"训到不涨就停"做公平对比]
+\textbf{错误描述}：拿训练过程中的 reward 比算法优劣；或以"reward 不再增长"为统一停止点。\textbf{现象后果}：训练 reward 受 curriculum/DR/归一化影响、不反映真实能力；不同配置"收敛"时刻不同，比较不公平。\textbf{根本原因}：混淆训练态与评估态。\textbf{正确做法}：用\emph{固定条件的评估 reward} 比较，并固定 max\_iterations 而非"训到收敛"。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[设计]} 论文要对比"有 DR" vs "无 DR"在四足 rough terrain 上的性能，设计完整实验方案。\emph{验收}：含 seed 数、统一评估条件、统计指标。
+  \item \textbf{[思考]} 为什么不能用"训到 reward 不再增长就停"做公平对比？给反例。\emph{验收}：反例须体现"两配置收敛速度不同导致同一停止准则下步数不同"。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{策略平滑性与真机部署预诊断}
+\label{sec:rlmc-diag-deploy}
+
+\paragraph{模块功能与在管线中的位置。}至此所有工具都假设策略在仿真中运行。但最终目标是真机——真机引入一类全新诊断需求：策略输出的\emph{平滑性}是否满足硬件约束。这一节聚焦从策略层面保障真机可部署性。
+
+\subsection{动机：为什么仿真"好"的策略真机会抖}
+
+仿真器每步\emph{完美执行}策略输出，无论动作变多快。但真机电机有响应带宽（通常 $50\sim200$ Hz），超带宽的高频指令会被低通特性滤掉或产生不可预测振荡。若策略在相邻时步输出的关节目标差距很大（即便仿真中被 PD 平滑了），真机电机追不上，产生抖动、过热、噪声。\emph{反事实}：不做部署前平滑诊断，到实验室运行策略才发现机器人剧烈抖动、电机过热甚至齿轮打牙，花半天调 PD/换电机，最后才发现是策略动作变化太快——仿真中 5 分钟就能查出。
+
+\subsection{L2C2：从轨迹平滑到策略平滑}
+
+\verb|action_rate| penalty 惩罚 $\|a_t-a_{t-1}\|^2$，确保\textbf{轨迹平滑}，但不保证\textbf{策略函数本身平滑}。设 state $s$ 处输出 $a=0.5$，极近的 $s+\epsilon$ 处输出 $a=-0.5$，若训练轨迹没经过 $s+\epsilon$ 附近，\verb|action_rate| 发现不了这个"悬崖"；但真机传感器噪声让 obs 在 $s$ 与 $s+\epsilon$ 间跳动，输出就剧烈振荡。
+
+\begin{insight}[action\_rate 管轨迹平滑，L2C2 管策略平滑]\label{ins:rlmc-diag-l2c2}
+\verb|action_rate| 保障的是\textbf{轨迹平滑}（trajectory smoothness）——只管"训练数据覆盖到的路径"；L2C2 保障的是\textbf{策略平滑}（policy smoothness）——管"整个策略函数的行为"。\textbf{部署到有噪声的真机时，策略平滑性比轨迹平滑性更重要}，因为真机会把策略带到训练从未精确经过的 obs 点。这是"训练 reward 高但真机抖"的一类根因。
+\end{insight}
+
+L2C2（《L2C2: Locally Lipschitz Continuous Constraint towards Stable and Smooth Reinforcement Learning》，arXiv:2202.07152，IROS'22，教你用局部 Lipschitz 约束让策略/价值更平滑）直接约束策略函数在\textbf{局部邻域}内的变化率 \cite{kobayashi2022l2c2}。在每个时步用 state transition $(s_t,s_{t+1})$ 定义局部紧空间，生成插值输入 $\tilde s = s_t + \alpha(s_{t+1}-s_t)$，$\alpha\sim U(0,1)$，惩罚：
+\begin{equation}
+L_{\text{L2C2}} = \lambda_\pi \|\pi(\tilde s)-\pi(s_t)\|^2 + \lambda_V \|V(\tilde s)-V(s_t)\|^2 .
+\label{eq:rlmc-diag-l2c2loss}
+\end{equation}
+为何"局部"而非"全局"？全局 Lipschitz（如 spectral normalization）均匀限制\emph{所有}输入上的变化率，会让策略在需要快速响应的区域也"迟钝"；L2C2 的约束范围由实际 state transition 定义——状态变化大处（跑步）局部空间大、允许较大变化，状态变化小处（站立）空间小、要求几乎不变。
+
+\begin{codebox}[Python]{L2C2 正则（加入 RSL-RL 的 PPO update）}
+def compute_l2c2_loss(actor_critic, obs, next_obs, lambda_pi=1.0, lambda_v=0.1):
+    alpha = torch.rand(obs.shape[0], 1, device=obs.device)   # U(0,1)
+    obs_interp = obs + alpha * (next_obs - obs)              # 插值输入
+    with torch.no_grad():
+        pi_base = actor_critic.act(obs); v_base = actor_critic.evaluate(obs)
+    pi_interp = actor_critic.act(obs_interp)                 # 需要梯度
+    v_interp  = actor_critic.evaluate(obs_interp)
+    pi_loss = lambda_pi * (pi_interp - pi_base.detach()).pow(2).mean()
+    v_loss  = lambda_v  * (v_interp  - v_base.detach()).pow(2).mean()
+    return pi_loss + v_loss
+\end{codebox}
+
+HoST 与 AGILE 用 $\lambda_\pi=1.0$、$\lambda_V=0.1$——$\lambda_\pi$ 比 $\lambda_V$ 大 10 倍，因为 actor 平滑对部署更关键（抖动动作损坏硬件），critic 平滑主要影响训练稳定 \cite{huang2025host,nvidia2026agile}。与 CAPS（《Regularizing Action Policies for Smooth Control with Reinforcement Learning》，arXiv:2012.06644，ICRA'21，教你用时间+空间正则消除控制信号高频）相比：CAPS 在固定 Gaussian 邻域做时间+空间平滑，L2C2 的邻域由 state transition 自适应定义 \cite{mysore2021caps}。HoST 的消融（论文 Table~III）显示 L2C2 主要改善平滑性而非牺牲 reward：ground 地形的 smoothness 指标从 $4.05$ 降到 $2.90$（约 $28\%$，越低越平滑），且无 L2C2 时多场景出现运动振荡甚至起立失败 \cite{huang2025host}。
+
+\subsection{\texorpdfstring{Action Rescaler $\beta$：部署的安全阀}{Action Rescaler beta：部署的安全阀}}
+
+针对模式 B（action saturation），HoST 的 action rescaler：
+\begin{equation}
+p_t^d = p_t + \beta\cdot a_t , \qquad \beta\in(0,1],
+\label{eq:rlmc-diag-rescaler}
+\end{equation}
+策略不直接指定目标角度，而是指定\textbf{相对当前位置的增量}，$\beta$ 控制增量最大幅度 \cite{huang2025host}。两个角度：探索上 $\beta$ 大则动作空间宽（利于早期发现有效行为）、小则受限更安全；安全上 $\beta$ 直接限制单步关节位置最大变化（$\beta=0.3$ 意味着无论输出什么，关节位置最多变 $0.3\times$action\_range）。训练中用 curriculum 让 $\beta$ 从 0.3 线性升到 1.0；部署可用 $\beta=0.8$ 或更低作"安全带"，牺牲幅度换硬件安全。
+
+\subsection{三层平滑性检查}
+
+从策略输出到真机执行，平滑性需在三层都保障：
+
+\paragraph{第一层·动作层。}测策略输出 $a_t$ 的一/二/三阶差分（rate/accel/jerk）统计量。若 action rate 最大值超电机最大角速度 $\dot q_{\max}$，指令在真机一定被截断。
+
+\paragraph{第二层·关节层。}把 action 经 PD 转成力矩与加速度，检查是否超硬件限制：
+
+\begin{table}[H]
+\centering
+\caption{关节层安全指标（以 Unitree G1 为例，留裕量）}
+\label{tab:rlmc-diag-joint}
+\begin{tabular}{p{3.0cm}p{3.4cm}p{5.4cm}}
+\hline
+指标 & 计算 & 安全阈值 \\
+\hline
+关节速度峰值 & $\max_t|\dot q_t|$ & $<0.8\,\dot q_{\max}$（留 20\%） \\
+关节力矩峰值 & $\max_t|\tau_t|$ & $<0.7\,\tau_{\max}$（留 30\%） \\
+瞬间功率 & $\max_t|\tau_t\dot q_t|$ & $<$ 电机连续功率 $\times 1.5$ \\
+\hline
+\end{tabular}
+\end{table}
+
+ETH 的羽毛球机器人系统（ANYmal-D 四足 $+$ DynaArm，共 $18$ DoF，《Learning Coordinated Badminton Skills for Legged Manipulators》，\emph{Science Robotics} 2025，arXiv:2505.22974）用 constrained RL（whole-body 视觉运动策略）一个策略统控全部 $18$ 驱动来跟踪并截击羽毛球，同时把关节速度/力矩约束在安全范围内；论文报告策略可达到的\textbf{最大挥拍末端速度约 $12.06$ m/s}（即 racket swing velocity，非来球球速——原文未逐字给出来球速度）\cite{tennis_eth2025badminton}。对网球等高速击打（综合项目章），击球瞬间手臂/球拍的关节速度同样会逼近电机额定值，不加约束的策略可能输出远超限位的指令。
+
+\paragraph{第三层·网络层。}检查策略对 obs 噪声的敏感度（近似 Lipschitz 常数）：在 obs 附近加 1\% 噪声，测动作变化幅度比，若比值 $>10$ 说明对噪声过敏，强烈建议加 L2C2 重训。
+
+\begin{codebox}[Python]{网络层近似 Lipschitz 测试}
+def check_lipschitz_sensitivity(policy, obs, n=100):
+    with torch.no_grad():
+        base = policy(obs); max_ratio = 0.0
+        for _ in range(n):
+            noise = torch.randn_like(obs) * 0.01           # 1% 噪声
+            diff = (policy(obs + noise) - base).norm(dim=-1)
+            ratio = (diff / (noise.norm(dim=-1) + 1e-8)).max()
+            max_ratio = max(max_ratio, ratio.item())
+    print(f"approx Lipschitz: {max_ratio:.2f}")            # >10 -> 需 L2C2
+\end{codebox}
+
+\subsection{部署端最后防线：Butterworth 与 Constrained PPO}
+
+WoCoCo 在部署时用 \textbf{4 Hz 二阶 Butterworth 低通滤波}对策略输出滤波——硬件安全的"最后防线"，即便策略产生高频噪声也被滤掉 \cite{zhang2024wococo}。截止频率取策略频率的 8--10\%（50 Hz 策略 $\to$ 4--5 Hz；100 Hz $\to$ 8--10 Hz）；太低让策略"迟钝"，太高起不到保护。拿不准时对动作做 FFT，若 90\% 能量在 5 Hz 以下（多数 locomotion 如此）则 5--8 Hz 截止只滤噪声；击打类任务击球瞬间可能有 15--20 Hz 有用信号，截止需相应提高。
+
+\begin{pitfall}[Butterworth 引入相位延迟却被忽视]
+\textbf{错误描述}：加滤波只想着"去抖"，没算延迟。\textbf{现象后果}：高速击打类任务因延迟错过时机。\textbf{根本原因}：二阶 Butterworth 在截止 4 Hz 处有约 $90^\circ$ 相位滞后，对应该频率约 $1/4$ 周期、即约 62.5 ms 延迟（实际影响应按数字滤波器 group delay 算）。\textbf{正确做法}：locomotion 通常可接受；高速击打（综合项目章）考虑零相位双向滤波（仅离线评估可用）或降滤波器阶数。
+\end{pitfall}
+
+事后滤波（Butterworth）简单但可能滤掉策略认为必要的高频；事先约束（Constrained PPO）更优雅——直接在训练目标加安全约束。Lagrangian 把约束优化转无约束：$L(\pi,\lambda)=J(\pi)-\lambda(C(\pi)-\delta)$。\textbf{诊断关注点}：$\lambda$ 轨迹本身是重要信号——持续上升=策略无法在当前约束下完成任务（约束太紧/任务太难）；持续为零=约束从未触发（太松/不必要）；在两值间振荡="勉强满足"边缘，通常最理想。
+
+\begin{pitfall}[Constrained PPO 的 lambda\_lr 设太大]
+\textbf{错误描述}：把乘子学习率设得和策略 lr 同量级。\textbf{现象后果}：乘子振荡，策略在"满足约束"与"完成任务"间反复切换、无法稳定。\textbf{根本原因}：双时间尺度失衡。\textbf{正确做法}：lambda\_lr 设为策略 lr 的 $1/10\sim1/100$。\textbf{实现事实}：rsl-rl 5.2.0 的 \verb|algorithms/| 只有 \verb|ppo| 与 \verb|distillation| 两个文件（源码核对），\textbf{不内置} P3O / PPO-Lagrangian / 任何 constrained PPO；要做约束优化须参考 P3O（Penalized PPO，IJCAI'22）或 PPO-Lagrangian 思路自行在 PPO 上扩展（自加 cost critic 与乘子更新）。
+\end{pitfall}
+
+\subsection{完整部署前检查清单}
+
+\begin{table}[H]
+\centering
+\caption{部署前检查清单（综合本章与部署章）}
+\label{tab:rlmc-diag-deploylist}
+\begin{tabular}{p{0.6cm}p{3.0cm}p{3.6cm}p{4.4cm}}
+\hline
+\# & 检查内容 & 工具 & 通过标准 \\
+\hline
+1 & 动作层平滑性 & 一/二/三阶差分 & action rate max $<0.8\,\dot q_{\max}$ \\
+2 & 关节层安全性 & PD$\to$力矩/加速度 & 力矩峰 $<0.7\,\tau_{\max}$ \\
+3 & 网络层 Lipschitz & 噪声敏感度测试 & Lipschitz $<10$ \\
+4 & 频谱分析 & FFT & 90\% 能量 $<$ 电机带宽 $\times 0.5$ \\
+5 & ONNX 一致性 & PyTorch vs ONNX & max diff $<10^{-5}$ \\
+6 & 归一化冻结 & ONNX graph 检查 & 含 running\_mean/var \\
+7 & Joint ordering & deploy.yaml vs 真机 & 完全匹配 \\
+8 & Sim-to-sim & 跨引擎回放 & 行为一致（视觉） \\
+9 & 低速测试 & 真机 $\beta=0.3$ & 无异常振动 \\
+10 & 全速测试 & 真机逐步升 $\beta\to1.0$ & 行为匹配仿真 \\
+\hline
+\end{tabular}
+\end{table}
+
+步骤 9--10 是真机渐进部署：\textbf{不要直接 $\beta=1.0$}——先用小 $\beta$（0.3）让机器人"小幅度"执行、确认方向正确，再逐步升到 0.8 和 1.0。这比 Butterworth 更可控（直接限幅度而非频率）。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[平滑性检查只在部署前做一次 / 误以为仿真 PD 已"平滑"够了]
+\textbf{错误描述}：改了 reward/curriculum 重训后沿用旧平滑结论；或以为仿真 PD 把阶跃输入平滑了就够。\textbf{现象后果}：重训后的策略平滑性变了却未复检；检查错对象。\textbf{根本原因}：平滑性随策略变；仿真 PD 完美但真机 PD 带宽有限、有延迟、有非线性。\textbf{正确做法}：把平滑性检查集成进 Phase 5 评估、每次训练自动跑；检查的是\emph{策略输出}（PD 的输入），不是 PD 后的关节轨迹。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[操作]} 对一个已训练策略跑三层平滑性检查，报告 action rate、关节速度、Lipschitz 常数，判断是否满足 Unitree Go2 硬件约束。\emph{验收}：三层各给数值并对照阈值结论。
+  \item \textbf{[设计]} 比较三种部署平滑方案：(a) 仅 action\_rate 训练，(b) action\_rate + L2C2 训练，(c) action\_rate 训练 + Butterworth 部署。评估 tracking accuracy 与 RMS jerk，预测三者 Pareto 关系。\emph{验收}：预测中 (b)(c) 在 jerk 上优于 (a)，且讨论各自对 tracking 的代价。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\label{sec:rlmc-diag-myths}
+
+\begin{table}[H]
+\centering
+\caption{本章常见误解与正确理解}
+\label{tab:rlmc-diag-myths}
+\begin{tabular}{p{5.4cm}p{7.0cm}}
+\hline
+误解 & 正确理解 \\
+\hline
+Reward 涨就是好 & Reward 是代理指标，涨不代表行为好；须结合回放与分项 reward（\cref{ins:rlmc-diag-decompose}） \\
+KL 越小越好 & KL 近零意味策略不更新；应围绕 desired\_kl 波动 \\
+Entropy 应快速降到零 & 过快收敛常意味局部最优或 hacking \\
+Value loss 应一直下降 & 先升后降才健康；curriculum 切换时短升正常 \\
+一次训练就能判断好坏 & RL 随机性大，$\ge 3$ seed 才有统计意义（\cref{ins:rlmc-diag-seed}） \\
+调参就是 grid search & 好调参是症状驱动的因果推理（\cref{ins:rlmc-diag-causal}） \\
+两框架数值应一样 & 物理引擎/接触模型/数值精度都不同，趋势一致即可 \\
+高级工具比基础诊断更有价值 & 约 80\% 问题靠基础模式识别解决，高级工具是兜底 \\
+仿真平滑的策略真机也平滑 & 仿真 PD 完美执行任意指令，真机电机有带宽限制（\cref{ins:rlmc-diag-l2c2}） \\
+NaN 无法系统分析 & 可分四类（数值崩溃/复现失败/性能退化/容量溢出），各有路径 \\
+\hline
+\end{tabular}
+\end{table}
+
+\paragraph{本章心智模型。}训练运行中 $\to$ 五大仪表盘（reward/KL/entropy/value\_loss/ep\_len）$\to$ 模式识别（九种通用 + 五种人形特有）$\to$ 症状索引查表（哪个参数 $\times$ 哪一章）$\to$ 消融验证（一次一变量、多 seed）$\to$（必要时）高级调试（reward 分解 / forensics / L2C2 / NaN 分类）$\to$ 部署预诊断（三层平滑性 + Butterworth 兜底）。\textbf{若你能在看到一组曲线后 30 秒内说出"这是模式 X、应查参数 Y、详见某章"，本章核心已内化}。
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\addcontentsline{toc}{section}{小结}
+\label{sec:rlmc-diag-summary}
+
+本章把前面各章的工具按"训练病症"重新索引，建立了从指标阅读到部署预诊断的完整诊断方法论。核心是 \cref{ins:rlmc-diag-pattern}：诊断读的是\emph{多指标的相对模式}，不是单指标的绝对值。
+
+\paragraph{术语速查。}\textbf{自适应 KL}：RSL-RL 按实际 KL 与 desired\_kl 的比值二值调 lr 的 bang-bang 控制器（阈值 $\times2/\div2$，lr $\times1.5/\div1.5$，界 $[10^{-5},10^{-2}]$）。\textbf{PEB}：partial-episode bootstrapping，对 time-out 终止用 $\gamma V(s_T)$ 而非 0。\textbf{Reward hacking}：策略以"合法但非期望"方式拿高分。\textbf{自杀策略}：策略主动触发 termination 躲累积负 reward。\textbf{L2C2}：局部 Lipschitz 约束，保策略平滑性。\textbf{action rescaler $\beta$}：增量式动作缩放，兼顾探索与部署安全。\textbf{multi-critic}：按 reward 功能分组的独立 Critic，便于定位哪类 reward 出问题。
+
+\begin{table}[H]
+\centering
+\caption{本章知识点总表（难度：中=进阶 / 较难=深入）}
+\label{tab:rlmc-diag-kp}
+\begin{tabular}{p{0.7cm}p{4.6cm}p{5.0cm}p{1.8cm}p{1.4cm}}
+\hline
+\# & 知识点 & 核心要点 & 对应节 & 难度 \\
+\hline
+1 & 五大训练指标 & reward/KL/entropy/value\_loss/ep\_len 的物理直觉 & \cref{sec:rlmc-diag-dashboards} & 中 \\
+2 & Reward 六种形态 & 每种形态的含义与操作 & \cref{sec:rlmc-diag-reward} & 中 \\
+3 & 分项 reward 诊断 & 总 reward 掩盖分项此消彼长 & \cref{sec:rlmc-diag-reward} & 中 \\
+4 & Online reward 归一化 & AGILE 公式 + scale\_by\_dt + nan\_to\_num 误导 & \cref{sec:rlmc-diag-reward} & 较难 \\
+5 & KL 自适应机制 & bang-bang 控制器 + desired\_kl 经验表 & \cref{sec:rlmc-diag-process} & 较难 \\
+6 & Entropy 公式与生命周期 & 高斯熵公式 + 不均匀收敛 + entropy\_coef 非万能 & \cref{sec:rlmc-diag-process} & 较难 \\
+7 & Value loss 双重解读 & Critic 进度 + reward scale/obs 质量；multi-critic & \cref{sec:rlmc-diag-process} & 较难 \\
+8 & 九种训练模式 & 含模式九自杀策略（value-bootstrap termination） & \cref{sec:rlmc-diag-patterns} & 较难 \\
+9 & 五种人形特有模式 & foot lift / saturation / curriculum NaN / 不对称 / sim2real & \cref{sec:rlmc-diag-patterns} & 较难 \\
+10 & 症状驱动索引 & 五类症状 $\times$ 参数 $\times$ 章节路由表 & \cref{sec:rlmc-diag-index} & 较难 \\
+11 & AGILE 三大 GUI & Joint Position / Object Manipulation / Reward Visualizer & \cref{sec:rlmc-diag-logging} & 中 \\
+12 & EmpiricalNormalization & Welford + ONNX 冻结 bug + 排查 & \cref{sec:rlmc-diag-logging} & 较难 \\
+13 & 验证六阶段流程 & Smoke$\to$Zero$\to$Random$\to$Small$\to$Full$\to$Sim2Sim & \cref{sec:rlmc-diag-walkthrough} & 较难 \\
+14 & Motion-quality 评估 & RMS accel/jerk / 限位违规率 / 高频能量比 & \cref{sec:rlmc-diag-walkthrough} & 较难 \\
+15 & L2C2 平滑正则 & 局部 Lipschitz + CAPS 对比 + 参数 & \cref{sec:rlmc-diag-deploy} & 较难 \\
+16 & Action rescaler $\beta$ & 增量动作缩放 + curriculum + 部署安全阀 & \cref{sec:rlmc-diag-deploy} & 较难 \\
+17 & NaN 四类分类 & 数值崩溃/复现失败/性能退化/容量溢出 + 五根因 & \cref{sec:rlmc-diag-advanced} & 较难 \\
+18 & AGILE scaled-dict & 结构化参数绑为单标量 + I/O 描述符 & \cref{sec:rlmc-diag-experiment} & 中 \\
+19 & 公平实验设计 & 种子管理 + 统一评估 + 统计显著性 & \cref{sec:rlmc-diag-experiment} & 中 \\
+20 & 三层平滑性检查 & 动作层 + 关节层 + 网络层 Lipschitz & \cref{sec:rlmc-diag-deploy} & 较难 \\
+21 & Butterworth 部署滤波 & 4 Hz 截止 + 相位延迟权衡 & \cref{sec:rlmc-diag-deploy} & 中 \\
+\hline
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-diag-further}
+
+\begin{itemize}
+  \item \textbf{RSL-RL 源码（PPO 实现）}，\Verb[breaklines]|github.com/leggedrobotics/rsl_rl|——KL 自适应、entropy 计算、obs 归一化的源码级理解；本章数值即据此核对 \cite{schwarke2025rslrl}。
+  \item \textbf{AGILE}（arXiv:2603.20147）——四阶段工作流、三大 GUI、reward visualizer、motion-quality 评估、scaled-dict 与 I/O 描述符 \cite{nvidia2026agile}。
+  \item \textbf{L2C2}（Kobayashi，arXiv:2202.07152，IROS'22）——策略平滑性正则的数学基础 \cite{kobayashi2022l2c2}。
+  \item \textbf{CAPS}（Mysore et al.，arXiv:2012.06644，ICRA'21）——时间+空间动作平滑的经典基线 \cite{mysore2021caps}。
+  \item \textbf{HoST}（Huang et al.，arXiv:2502.08378，RSS'25）——multi-critic PPO、action rescaler、L2C2 参数 \cite{huang2025host}。
+  \item \textbf{WoCoCo}（Zhang et al.，arXiv:2406.06005，CoRL'24）——symmetry augmentation、"no fly" reward、Butterworth 部署滤波 \cite{zhang2024wococo}。
+  \item \textbf{ASAP}（He et al.，arXiv:2502.01143，RSS'25）——跨引擎 sim2real、delta-action 对齐 \cite{he2025asap}。
+  \item \textbf{Time Limits in RL}（Pardo et al.，arXiv:1712.00378，ICML'18）——value-bootstrapped termination（PEB）的理论基础 \cite{pardo2018timelimits}。
+  \item \textbf{Deep RL Doesn't Work Yet}（Irpan, 2018，搜博客标题）——RL 训练不稳定性的经典综述。
+  \item \textbf{The 37 Implementation Details of PPO}（ICLR Blog, 2022，搜博客标题）——PPO 实现细节对结果的影响。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-diag-troubleshoot}
+
+\begin{table}[H]
+\centering
+\caption{故障排查手册（症状 $\to$ 原因 $\to$ 排查 $\to$ 相关节）}
+\label{tab:rlmc-diag-troubleshoot}
+\begin{tabular}{p{3.0cm}p{3.2cm}p{4.2cm}p{2.0cm}}
+\hline
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\hline
+WandB 面板空白 & logger 未配 & 确认 logger 旗标（mjlab \Verb[breaklines]|--agent.logger wandb| / Isaac \Verb[breaklines]|--logger wandb|）；查 API key；查网络 & \cref{sec:rlmc-diag-logging} \\
+Reward 与 KL 都为零 & 环境注册错或 obs 维度为零 & Phase 0 smoke；打印 obs shape；查 reward term & \cref{sec:rlmc-diag-walkthrough} \\
+前 100 iter 正常后全 NaN & 梯度爆炸或 reward 出极值 & 开 NaN 守卫；查 reward 范围；降 lr & \cref{sec:rlmc-diag-advanced} \\
+两框架 reward 差异大 & obs/reward 配置不一致或物理差异 & 对比 obs term；对比 reward weight；查物理参数 & \cref{sec:rlmc-diag-logging} \\
+Curriculum 升级后不恢复 & 跳变太大或局部最优 & 减小跳变；延长观察；查回退机制 & \cref{sec:rlmc-diag-patterns} \\
+Value loss 持续升 & Critic 容量不足或 reward scale 变 & 增 Critic 宽度；查 reward 归一化；观察后续 reward & \cref{sec:rlmc-diag-process} \\
+Episode length 趋近零 & 自杀策略 / termination 设错 & 查 \verb|time_out| 设置；加 alive bonus；查 reg 权重 & \cref{sec:rlmc-diag-patterns} \\
+ONNX 推理输出垃圾 & 归一化未冻结 / joint ordering 错 & 查 ONNX 含 running\_mean；核对 deploy.yaml 关节序 & \cref{sec:rlmc-diag-logging} \\
+真机严重抖动 & Lipschitz 过大 / 电机带宽不足 & 三层平滑性检查；加 L2C2 重训；加 Butterworth & \cref{sec:rlmc-diag-deploy} \\
+\hline
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-diag-versioninfo}
+
+\begin{table}[H]
+\centering
+\caption{本章涉及的框架/库版本与核对状态（截至 2026-06）}
+\label{tab:rlmc-diag-versioninfo}
+\begin{tabular}{p{3.4cm}p{3.0cm}p{6.0cm}}
+\hline
+项目 & 版本/状态 & 备注 \\
+\hline
+RSL-RL（自适应 KL/默认值） & 已核对 & 解析高斯 KL；阈值 $\times2/\div2$；lr $\times1.5/\div1.5$ 界 $[10^{-5},10^{-2}]$；desired\_kl=0.01、entropy\_coef=0.01、max\_grad\_norm=1.0、clip\_param=0.2、value\_loss\_coef=1.0（\verb|ppo.py|，5.2.0 与 3.1.2 一致） \\
+RSL-RL（归一化） & 已核对 & 核心 PPO 仅 obs 用 \Verb[breaklines]|EmpiricalNormalization|（Welford）；主任务 reward/value \textbf{不归一化}（库里 \Verb[breaklines]|EmpiricalDiscountedVariationNormalization| 仅 RND 内在奖励用）；algorithms 仅 \verb|ppo|+\verb|distillation|，\textbf{不内置} constrained PPO；\Verb[breaklines]|normalize_advantage_per_mini_batch| 默认 False \\
+rsl-rl-lib 键名 & 已核对（5.2.0/3.1.2） & mjlab 装 5.2.0（\verb|Loss/value|、\Verb[breaklines]|Policy/mean_std|）、Isaac Lab 装 3.1.2（\Verb[breaklines]|Loss/value_function|、\Verb[breaklines]|Policy/mean_noise_std|）；两版均不单独记 KL、entropy 记 \verb|Loss/entropy|、分项 reward 记 \Verb[breaklines]|Episode_Reward/<term>| \\
+Isaac Lab & 2.3.2（已核对） & 内部包号 0.54.2；内置 RSL-RL/RL-Games/SKRL/SB3/Ray；多 GPU 仅前三者 \\
+mjlab & 1.4.0（已核对） & 与 Isaac Lab 共用 rsl-rl；任务 id 以 \verb|list-envs| 为准（有 Go1/G1，\textbf{无} Go2） \\
+UniLab & 已核对（\pz{commit 以本地为准}） & 异构架构：物理 CPU（mujoco-uni 3.8.0 / motrixsim 0.8.2）$+$ 策略 GPU；PPO 走 rsl-rl（键名同 RSL-RL 族）；APPO/SAC/TD3/FlashSAC 另有面板；\verb|NanGuard|$+$\Verb[breaklines]|unilab-viz-nan|；\verb|/dev/shm| 预算守卫；无 AGILE 式预检 GUI \\
+AGILE & arXiv:2603.20147 & NVIDIA Isaac，2026-03；公式/数值以官方代码为准 \\
+\hline
+\end{tabular}
+\end{table}
+
+\paragraph{给下一部分的桥。}本章建立了训练诊断的完整方法论——从指标阅读、模式识别到症状索引、高级调试与部署预诊断，让你"面对训练问题时不慌"。但目前的诊断对象都是"标准"的 locomotion / manipulation 任务。后续综合项目（如网球机器人）会把难度推到新维度：reward 极稀疏（击中球才有分）、curriculum 阶段多、接触物理敏感、感知与控制深度耦合——那正是本章诊断方法论最好的试炼场。把本章的五大仪表盘、九种模式、症状索引和三层平滑性检查带过去，你会发现它们在最难的任务上反而最有用。

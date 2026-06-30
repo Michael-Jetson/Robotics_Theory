@@ -1,0 +1,900 @@
+\chapter{机械臂轨迹生成与避障}
+\label{ch:arm-traj}
+
+% ════════════════════════════════════════════════════════════════
+%  P3b「机械臂建模、规划与控制」部 · 第 3 章。
+%  定位：把 P3 规划部的「轨迹优化思想」（min-snap/MINCO/CHOMP/CBF）落到
+%  定基串联臂的关节与任务空间，补齐「path!=trajectory→参数轨迹优化→时间参数化
+%  三件套（TOTG/TOPP-RA/Ruckig）→力矩约束 TOPP-RA→关节体避障→CBF 反应避障→
+%  规控解耦」这条主线。经典理论无教材抽取源，按编写规范§一.9 用 WebSearch
+%  重建到复现级、§一.8 自包含写入正文，\cite 仅标出处。
+%  料源：docs/Robot吸收_arm机械臂运控.md §2.2/2.3/4.3（arm_dm 六轴力矩臂实证）。
+%  复用：P3 sec:plan-minsnap/sec:st-minco/sec:plan-chomp/sec:plan-search/
+%        sec:sm-cbf-game/ch:planning；本部 ch:arm-dyn(逆动力学)、ch:arm-kin(雅可比)、
+%        ch:arm-ctrl(控制)、ch:arm-prac(实践)。
+%  纪律：M(q)q̈+Cq̇+g=tau 与 P4 eq:ctrl-manip 一致；诚实框定（占位惯量/离散守约束坑）。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的对比表与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 运动规划器（如 RRT、CHOMP）吐给你的是一串关节构型 $\mathbf{q}_0,\mathbf{q}_1,\dots,\mathbf{q}_K$。你能直接把它发给电机执行吗？这串点里\emph{缺}了什么、缺了会出什么物理事故？
+  \item 一段几何形状已定的路径 $\mathbf{q}(s)$，你要给它配上“走多快”的时间律 $s(t)$。如果只约束“关节加速度不超过某个常数盒子”，为什么这既可能让真机\emph{超出力矩极限}（不安全），又可能\emph{白白浪费}大半驱动力（不经济）？要修正它必须引入哪个矩阵？
+  \item 你想最小化一段五次多项式轨迹的总 jerk，决策变量是“每段分多少时间”。把更多时间分给位移大的段，还是位移小的段？能不能写出一个\emph{闭式}的最优时间分配律，并验证数值优化器解出的就是它？
+  \item TOTG、TOPP-RA、Ruckig 都做“给路径配时间”。哪一个能把\emph{机器人动力学（力矩）}直接吃进约束？哪一个保证 jerk 有界、能\emph{在线}每周期重算？为什么“时间最优”和“jerk 有界”往往不可兼得？
+  \item 末端要避开一个障碍球，你只想在标称速度指令 $\dot{\mathbf{q}}_{\mathrm{nom}}$ 上做一个\emph{最小修正}让它安全，而\emph{不}调用任何 QP 求解器。一个安全函数 $h(\mathbf{q})\ge 0$、它的梯度 $\nabla h$、再加一行投影公式，够不够？这个梯度要用哪个雅可比来算？
+  \item 你用反应式避障让末端绕开正前方的障碍球，结果末端\emph{贴}在障碍表面再也不动了（死锁）。为什么会死锁？把障碍中心沿“垂直于路径的方向”挪一点点，为什么就能解开？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{严格区分}路径 $\mathbf{q}(s)$（几何、无时间）与轨迹 $\mathbf{q}(t)$（含速度/加速度/jerk/力矩），并说清“乱配时间”的物理恶果（\cref{sec:at-path-vs-traj}）；
+  \item \textbf{表示}关节空间与任务空间轨迹——五次多项式、B 样条——并据“哪一阶导对应实际约束/控制”辨析在哪个空间插值（\cref{sec:at-repr}）；
+  \item \textbf{推导}以段时长为决策变量的参数轨迹优化，得到 min-jerk 五次的代价闭式与最优时间分配律 $T_s\propto a_s^{1/6}$，并理解“调库”与“吃透内核”之别（\cref{sec:at-paramopt}）；
+  \item \textbf{重建并对比}时间参数化三件套 TOTG / TOPP-RA / Ruckig 的最优性、约束类型、jerk 性质与在线性，掌握 TOPP-RA 基于可达/可控集的递推内核（\cref{sec:at-timeparam}）；
+  \item \textbf{把动力学吃进约束}：构造力矩约束的 TOPP-RA，理解“位形相关惯量 $\mathbf{M}(\mathbf{q})$ 使力矩感知时序必须走逆动力学”，并复现“比加速度盒既更安全又更省、快 $4.6\times$”的结论与其离散守约束陷阱（\cref{sec:at-torque-topp}）；
+  \item \textbf{规划期避障}：把碰撞搬到位形空间 $\mathcal{C}$，辨析采样式（概率完备）与优化式（局部最优）两条路、以及关节体（非质点）碰撞（\cref{sec:at-collision-global}）；
+  \item \textbf{反应式避障}：实现一个\emph{单约束闭式}的控制屏障函数（CBF）速度滤波器（无需 QP），并破解“死锁”与“不可达”两种失败模式（\cref{sec:at-cbf}）；
+  \item \textbf{工程落地}：理解规划与控制解耦（离线规划 $\to$ 在线执行、靠轨迹文件交接）的范式与边界（\cref{sec:at-decouple}）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把一条几何路径，变成真机能安全执行的时间律，并在执行中兜住未建模障碍}”的主线。它\emph{不}重证 P3 规划部已建的轨迹优化框架（min-snap、MINCO、CHOMP、博弈式 CBF），而是把那些思想\emph{落到定基串联臂}、补上臂特有的两块：时间参数化（尤其\emph{力矩约束}）与关节体/反应式避障。结构如下：
+
+\begin{center}
+\begin{forest} navtreeLR
+[{机械臂轨迹生成与避障}
+  [{path $\ne$ trajectory\\几何 vs 时间律}
+    [{乱配时间的恶果}] ]
+  [{轨迹表示\\五次多项式 / B 样条}
+    [{关节 vs 任务空间}] ]
+  [{参数轨迹优化\\段时长为决策}
+    [{$T_s\propto a_s^{1/6}$ 闭式}] ]
+  [{时间参数化三件套\\TOTG / TOPP-RA / Ruckig}
+    [{力矩约束 TOPP-RA}] ]
+  [{规划期避障\\C-space / 采样 vs 优化}
+    [{关节体碰撞}] ]
+  [{反应式避障\\CBF 速度滤波}
+    [{死锁 / 不可达破解}] ]
+]
+\end{forest}
+\end{center}
+
+\noindent\textbf{推荐路径}：第 1--3 节（path/表示/参数优化）是把规划思想落地的“几何—参数”基础，任何读者必读；第 4--5 节（时间参数化三件套与力矩约束 TOPP-RA）是本章核心，把动力学 $\mathbf{M}(\mathbf{q})\ddot{\mathbf{q}}+\mathbf{C}\dot{\mathbf{q}}+\mathbf{g}=\boldsymbol{\tau}$ 焊进时间律，是“机械臂区别于一般运动规划”的关键；第 6--8 节（关节体避障、CBF 反应避障、规控解耦）面向落地，其中 CBF 速度滤波（\cref{sec:at-cbf}）是与 P8 强化学习操作衔接的安全层。
+
+\subsection*{前置知识桥接}
+本章\textbf{承上}三处地基，\textbf{不重复}它们的推导，只在臂上复用并补本章视角：
+\begin{itemize}
+  \item \textbf{P3 规划部}给了轨迹优化的总框架（\cref{sec:plan-traj}）、多项式轨迹与凸 QP（minimum-snap，\cref{sec:plan-minsnap}）、协变梯度平滑（CHOMP，\cref{sec:plan-chomp}）、图/采样搜索（\cref{sec:plan-search}）、统一参数化 MINCO（\cref{sec:st-minco}）、博弈/安全滤波的控制屏障函数（\cref{sec:sm-cbf-game}）与位形空间 $\mathcal{C}$（\cref{sec:plan-cspace}）。本章把这些\emph{从飞行器/一般系统落到串联臂的关节空间}，并补“时间参数化”这一规划部未展开的环节。
+  \item \textbf{本部第 2 章动力学}（\cref{ch:arm-dyn}）给了 $\mathbf{M}(\mathbf{q})\ddot{\mathbf{q}}+\mathbf{C}(\mathbf{q},\dot{\mathbf{q}})\dot{\mathbf{q}}+\mathbf{g}(\mathbf{q})=\boldsymbol{\tau}$ 与 $O(n)$ 逆动力学 RNEA（\cref{sec:ad-rnea}）。\cref{sec:at-torque-topp} 的力矩约束 TOPP-RA 把逆动力学\emph{作为约束算子}直接调用。
+  \item \textbf{本部第 1 章运动学}（\cref{ch:arm-kin}）给了几何/位置雅可比（\cref{sec:ak-jacobian}）。\cref{sec:at-cbf} 的 CBF 用\emph{位置雅可比}把笛卡尔空间的障碍梯度拉回关节空间。
+  \item \textbf{P1 非线性优化}（\cref{ch:nlopt}）给了带约束优化（SQP/SLSQP）的内核，\cref{sec:at-paramopt} 的参数轨迹优化直接以它为求解器。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会把规划器吐出的关节路点\emph{直接}发给控制器，于是要么因 jerk 无界而激振齿轮、要么因时间律违反限速/限力矩而被电机饱和截断——“规划成功”却“执行失败”；
+  \item 你会用一个固定的“加速度盒子”给所有轨迹配时间，从而\emph{系统性地}既不安全（某些位形下真力矩超限）又浪费（大多数位形下只用了一小半驱动力）——这正是 \cref{sec:at-torque-topp} 要根除的；
+  \item 在执行期遇到未建模/动态障碍时，你只能停车重规划，而无法像 \cref{sec:at-cbf} 那样在标称指令上加一行闭式投影、平滑地“贴边绕过”。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导与练习） & 3--4 小时 & 首次系统学习、要落地一台真臂的规控 \\
+速读（跳过冗长推导细节） & 1.5 小时 & 有规划/控制基础、想对齐臂上的时间参数化 \\
+速查（只看小结表 + 三件套对比卡） & 15 分钟 & 写代码时回来查公式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+关节位置/速度/加速度记 $\mathbf{q},\dot{\mathbf{q}},\ddot{\mathbf{q}}\in\mathbb{R}^n$；关节力矩 $\boldsymbol{\tau}\in\mathbb{R}^n$。动力学方程统一写 $\mathbf{M}(\mathbf{q})\ddot{\mathbf{q}}+\mathbf{C}(\mathbf{q},\dot{\mathbf{q}})\dot{\mathbf{q}}+\mathbf{g}(\mathbf{q})=\boldsymbol{\tau}$（与 P4 \cref{eq:ctrl-manip}、本部 \cref{ch:arm-dyn} 一致）。\textbf{路径参数}用 $s\in[0,1]$（几何，无量纲弧长），\textbf{时间}用 $t$，时间律 $s(t)$ 把二者相连；本书\emph{严格区分}路径 $\mathbf{q}(s)$ 与轨迹 $\mathbf{q}(t)=\mathbf{q}(s(t))$。末端笛卡尔位置 $\mathbf{x}\in\mathbb{R}^3$，几何/位置雅可比 $\mathbf{J}(\mathbf{q})$（约定 $\dot{\mathbf{x}}=\mathbf{J}\dot{\mathbf{q}}$，详见 \cref{sec:ak-jacobian}）。贯穿全章的实证来自一台六轴\emph{力矩控制}串联臂 \texttt{arm\_dm}（重肩肘 + 轻腕的异质惯量臂，每关节力矩限 $\pm 26\,\mathrm{N\!\cdot\! m}$），其全栈实践见 \cref{ch:arm-prac}。所有实测数值如实标注边界条件（如“占位惯量下”“离散重构”）。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{path \texorpdfstring{$\ne$}{!=} trajectory：几何与时间律的分离}
+\label{sec:at-path-vs-traj}
+
+\paragraph{动机：规划器给的是“形状”，电机要的是“时间表”。}
+\cref{ch:planning} 的运动规划器——无论图搜索、采样（RRT/PRM）还是优化（CHOMP/min-snap）——本质都在回答一个\emph{几何}问题：在位形空间 $\mathcal{C}$ 里找一条从起点到终点、不穿障碍的连续曲线。它的产物是一串关节构型 $\mathbf{q}_0,\mathbf{q}_1,\dots,\mathbf{q}_K$（或一条参数曲线 $\mathbf{q}(s)$），\textbf{不含任何时间信息}：没说每一点该走多快、何时到。而真机的电机执行的是\emph{时间}指令——每一时刻 $t$ 给定 $\mathbf{q}(t)$（及前馈速度/力矩）。从“形状”到“时间表”的这一步，叫\textbf{时间参数化（time parameterization）}，是本章前半的主题。
+
+\begin{definition}[路径与轨迹]\label{def:at-path-traj}
+\textbf{路径（path）}是位形空间中的一条几何曲线 $\mathbf{q}:[0,1]\to\mathcal{C}$，$\mathbf{q}(s)$，其中 $s$ 是无量纲的\emph{路径参数}（弧长），\textbf{不含时间}。
+\textbf{时间律（time law / parameterization）}是一个单调非降映射 $s:[0,T]\to[0,1]$，$t\mapsto s(t)$，$s(0)=0,\ s(T)=1$。
+\textbf{轨迹（trajectory）}是二者的复合 $\mathbf{q}(t):=\mathbf{q}(s(t))$，它含时间，从而由链式法则诱导出速度、加速度、加加速度（jerk）：
+\begin{equation}
+  \dot{\mathbf{q}}=\mathbf{q}'(s)\,\dot{s},\qquad
+  \ddot{\mathbf{q}}=\mathbf{q}''(s)\,\dot{s}^2+\mathbf{q}'(s)\,\ddot{s},\qquad
+  \dddot{\mathbf{q}}=\mathbf{q}'''\dot{s}^3+3\mathbf{q}''\dot{s}\ddot{s}+\mathbf{q}'\dddot{s},
+  \label{eq:at-chain}
+\end{equation}
+其中 $(\cdot)'=\mathrm{d}/\mathrm{d}s$。\textbf{关键观察}：路径只决定 $\mathbf{q}',\mathbf{q}'',\dots$（几何导数），而\emph{速度/加速度/jerk 的大小由时间律 $\dot s,\ddot s,\dddot s$ 控制}。同一条路径配不同时间律，得到无穷多条轨迹，其动力学可行性天差地别。
+\end{definition}
+
+\paragraph{什么样的 \texorpdfstring{$\mathbf{q}(t)$}{q(t)} 才“配发给电机”？——可执行轨迹作为质量锚。}
+\cref{def:at-path-traj} 只说了轨迹\emph{是什么}（路径配上时间律），还没说一条轨迹要满足什么\emph{才配真机执行}。Siciliano（\cite{siciliano2009robotics}，§4.1）把这条门槛讲得最干净：机械臂运动的最低要求，是其运动律所要求驱动器施加的关节广义力\emph{不越过饱和极限}、且\emph{不激起结构已建模的谐振模态}——为此必须生成“足够光滑（suitably smooth）”的轨迹。把这句话形式化，就得到本章一切轨迹生成方法都要回答的\emph{质量判据}：
+
+\begin{definition}[物理可执行轨迹]\label{def:at-executable}
+称一条关节轨迹 $\mathbf{q}:[0,T]\to\mathcal{C}$ 为（对给定机械臂）\textbf{物理可执行的（physically executable）}，若它同时满足三类条件：
+\begin{enumerate}
+  \item \textbf{足够光滑}：$\mathbf{q}(t)$ 关于时间属 $C^k$，其中 $k$ 由\emph{所关心的最高阶约束/控制量}决定——位置/速度连续取 $k\!=\!1$；要力矩（$\propto\ddot{\mathbf{q}}$）连续、不冲击减速器则需加速度连续 $k\!=\!2$，进而 jerk 有界；
+  \item \textbf{逐时有界}：速度、加速度、（若关心）jerk 与\emph{关节力矩}处处不越限——
+  \begin{equation}
+    |\dot{\mathbf{q}}(t)|\le\mathbf{v}_{\max},\quad
+    |\ddot{\mathbf{q}}(t)|\le\mathbf{a}_{\max},\quad
+    |\dddot{\mathbf{q}}(t)|\le\mathbf{j}_{\max},\quad
+    |\boldsymbol{\tau}(t)|\le\boldsymbol{\tau}_{\max},
+    \label{eq:at-executable}
+  \end{equation}
+  其中力矩由逆动力学 $\boldsymbol{\tau}=\mathbf{M}(\mathbf{q})\ddot{\mathbf{q}}+\mathbf{C}(\mathbf{q},\dot{\mathbf{q}})\dot{\mathbf{q}}+\mathbf{g}(\mathbf{q})$（\cref{ch:arm-dyn}）沿轨迹求得——这一项把“可执行”从纯运动学（前三式）升级为含动力学的判据；
+  \item \textbf{满足边界条件}：在端点（及指定路点）取定的位置、速度、加速度值（rest-to-rest 即两端速度、加速度为零）。
+\end{enumerate}
+其中各上界（$\mathbf{v}_{\max}$ 等，皆按分量、可含正负不对称）是该臂的硬件能力；不等式逐时（$\forall t$）成立。
+\end{definition}
+
+\begin{insight}
+\textbf{把“可执行”立为后续一切方法的锚点。}\;\cref{def:at-executable} 不是又一段定义，而是本章前半的\emph{总靶}：从这里往后，多项式（\cref{def:at-quintic}）、梯形/LSPB（\cref{sec:at-trapezoidal}）、参数轨迹优化（\cref{sec:at-paramopt}）、时间参数化三件套 TOTG/TOPP-RA/Ruckig（\cref{sec:at-timeparam}）、力矩约束 TOPP-RA（\cref{sec:at-torque-topp}），\emph{无一例外都在回答同一个问题}——“如何造出一条满足 \cref{def:at-executable} 的 $\mathbf{q}(t)$”，区别只在\emph{覆盖到第几类条件、覆盖得多紧}。据此可一眼给各法定位：五次多项式靠\emph{阶数}直接保光滑（条件 1）并对齐边界（条件 3），但对“有界”只能事后核验；梯形/LSPB 给出条件 2 的\emph{一行可当场核验}的限值不等式（\cref{eq:at-trap-acond,eq:at-trap-vcond}），却只到 $C^1$；TOPP-RA 把条件 2 推到\emph{贴边最优}、且\emph{唯一}能直接吃下力矩这一项（\cref{eq:at-executable} 末式）；Ruckig 则\emph{在线}保 jerk 有界（条件 1 的 $C^2$ + 条件 2 的 jerk）。换言之，整章是一张“逐步把 \cref{def:at-executable} 的三类条件填满、填紧”的进度表——读每一节时不妨自问：它新覆盖了哪一类、放松或收紧了哪一类？
+\end{insight}
+
+\begin{note}
+\textbf{可行（feasible）与可执行（executable）的口径.}\;本书把仅满足运动学界限（\cref{eq:at-executable} 前三式）称作\emph{运动学可行}，把进一步满足\emph{力矩}界（末式）称作\emph{动力学可执行}——后者才是真机不被电机饱和截断的充分门槛。二者的鸿沟正源于 $\boldsymbol{\tau}=\mathbf{M}(\mathbf{q})\ddot{\mathbf{q}}+\cdots$ 中惯量 $\mathbf{M}(\mathbf{q})$ \emph{随位形而变}：同一加速度盒在不同构型下对应的力矩天差地别，故“加速度合规”\emph{不蕴含}“力矩合规”。这条鸿沟是 \cref{sec:at-torque-topp} 整节的由来；在那之前的方法（多项式、梯形、TOTG）默认只把守运动学可行，须读者另行核验力矩（最朴素的核验法即“走一遍逆动力学、比对力矩限”，见 \cref{ch:arm-dyn}）。
+\end{note}
+
+\paragraph{反面：乱配时间会出什么物理事故。}
+若忽视 \cref{def:at-path-traj} 的分离，把规划器的路点“按等时间间隔”硬塞给控制器，等于隐式地选了一个糟糕的时间律。后果是三类越界（由 \cref{eq:at-chain} 直接读出）：
+\begin{itemize}
+  \item \textbf{超速}：$\dot s$ 太大使某关节 $|\dot q_i|=|q_i'|\dot s>v_{\max}$，电机转速饱和，跟踪崩坏；
+  \item \textbf{超加速 / 超力矩}：$\ddot s$ 太大使 $|\ddot q_i|>a_{\max}$；更隐蔽的是\emph{力矩}越界——由动力学 $\boldsymbol{\tau}=\mathbf{M}(\mathbf{q})\ddot{\mathbf{q}}+\mathbf{C}\dot{\mathbf{q}}+\mathbf{g}$，同一加速度在不同位形需要的力矩天差地别（\cref{sec:at-torque-topp} 详述）；
+  \item \textbf{jerk 无穷}：相邻路点间若用直线段拼接、在拐点处 $\ddot s$ 不连续，则 $\dddot q\to\infty$，表现为对齿轮箱的\emph{冲击}——激起结构振动、磨损减速器、在视觉/力控回路里引入抖动。
+\end{itemize}
+
+\begin{insight}
+\textbf{为何要把几何与时间分离？}——因为二者受\emph{不同}约束、由\emph{不同}模块负责，且分离后各自是\emph{更好解}的子问题。几何（避障）是非凸、组合的，交给搜索/采样/优化的规划器；时间律（动力学可行性）在\emph{固定路径}上是一维问题（只有一个标量 $s$ 在动），可被高效甚至时间最优地求解（\cref{sec:at-timeparam}）。这种“先定形状、再定速度”的解耦，与 \cref{sec:plan-minsnap} 里“先搜走廊、再凸 QP 平滑”的解耦同源，是规划—控制流水线的核心架构。代价是\emph{次优}：联合优化形状与时间可能更快，但问题立刻变难（见 \cref{ch:st-trajopt} 的时空联合优化，那是另一条更重的路线）。
+\end{insight}
+
+\begin{note}
+\textbf{与 P3 时空轨迹优化的分工.}\;
+本章走的是\emph{解耦}路线：路径（\cref{ch:planning}）$\to$ 时间参数化（本章）。而 \cref{ch:st-trajopt} 的 MINCO（\cref{sec:st-minco}）走的是\emph{联合}路线：把空间形状与时间分配一起优化。两者各有适用面——解耦路线简单、可复用成熟规划器、时间参数化可证时间最优；联合路线上限更高（能为避障“弯一下并慢一下”），但优化更重、更易陷局部。机械臂工业实践（MoveIt、工业控制器）以解耦路线为主流，故本章详述之；联合路线在敏捷飞行/自动驾驶更常见，互链不重复。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{关节空间与任务空间的轨迹表示}
+\label{sec:at-repr}
+
+\paragraph{动机：用什么函数承载 $\mathbf{q}(s)$ 或 $\mathbf{q}(t)$？}
+要把一串离散路点变成可求导、可执行的连续轨迹，需要一个\emph{参数化的函数族}。两个工程要求决定了选型：(1) 足够的\emph{光滑阶}——若控制/约束关心到加速度，轨迹至少 $C^2$；关心 jerk（护减速器）则要 $C^3$；(2) \emph{局部可控、数值稳定}——改动一个路点不应剧烈扰动整条曲线，且高次拟合不应病态。两大主力是\textbf{分段多项式}（典型为五次）与\textbf{B 样条}。
+
+\subsection{五次多项式：rest-to-rest 段的最小阶选择}
+\label{subsec:at-quintic}
+
+\begin{definition}[分段五次多项式轨迹]\label{def:at-quintic}
+把轨迹按时间分 $M$ 段，第 $s$ 段在 $[0,T_s]$ 上对每个关节分量取五次多项式
+\begin{equation}
+  q(t)=c_0+c_1 t+c_2 t^2+c_3 t^3+c_4 t^4+c_5 t^5,\qquad t\in[0,T_s].
+  \label{eq:at-quintic}
+\end{equation}
+五次（$6$ 个系数）恰好能独立指定一段两端的\emph{位置、速度、加速度}共 $6$ 个边界条件——这正是 rest-to-rest（两端静止）或路点处导数连续所需的最小阶。给定端点 $(q_0,\dot q_0,\ddot q_0)$ 与 $(q_f,\dot q_f,\ddot q_f)$，系数由一个 $6\times 6$ 线性系统唯一解出。
+\end{definition}
+
+\paragraph{为何是五次（而非三次）？}
+三次多项式（$4$ 系数）只能定两端的\emph{位置与速度}，其加速度在段端\emph{跳变}——意味着力矩跳变、jerk 含 $\delta$ 冲量。五次把加速度也连续化，jerk 成为有界的二次函数，对减速器友好。这与 \cref{sec:plan-minsnap} 选 snap（四阶导）平滑四旋翼\emph{同理}：阶数的选择由“哪一阶导对应实际控制输入/物理约束”决定。机械臂关心\emph{力矩平滑}，力矩 $\propto$ 加速度，故要求加速度连续（jerk 有界）$\Rightarrow$ 五次。
+
+\begin{theorem}[min-jerk 段是五次多项式]\label{thm:at-minjerk-quintic}
+在 rest-to-rest 段上（两端位置给定、速度加速度为零），最小化 jerk 平方积分 $J=\int_0^{T}\dddot q(t)^2\,\mathrm{d}t$ 的轨迹\emph{恰是}五次多项式 \cref{eq:at-quintic}。
+\end{theorem}
+
+\begin{derivation}[min-jerk 的欧拉--拉格朗日方程]\label{der:at-minjerk}
+泛函 $J[q]=\int_0^T(\dddot q)^2\,\mathrm{d}t$ 的被积函数 $L=(\dddot q)^2$ 含到三阶导，对应的欧拉--拉格朗日方程是六阶的（高阶变分）：
+\begin{equation}
+  -\frac{\mathrm{d}^3}{\mathrm{d}t^3}\frac{\partial L}{\partial \dddot q}=0
+  \;\Longrightarrow\;
+  \frac{\mathrm{d}^6 q}{\mathrm{d}t^6}=0.
+  \label{eq:at-minjerk-el}
+\end{equation}
+$q^{(6)}\equiv 0$ 的通解正是五次多项式（六个待定系数由六个边界条件锁定）。\cref{eq:at-minjerk-el} 把“为什么 min-jerk = 五次”从约定升为\emph{变分必然}：要让 jerk 的能量最小，位置就只能是五次。同理 min-snap（\cref{def:plan-minsnap}）给出 $q^{(8)}=0$ 即七次多项式。\qed
+\end{derivation}
+
+\subsection{B 样条：以控制点为决策变量的局部表示}
+\label{subsec:at-bspline}
+
+分段多项式（\cref{def:at-quintic}）以\emph{系数}为变量，改一个段端会牵动相邻段；高次幂的系数矩阵条件数也大（\cref{der:plan-minsnap} 已指出 min-snap 的病态）。\textbf{B 样条}换一种参数化：曲线写成\emph{控制点}的凸组合
+\begin{equation}
+  \mathbf{q}(s)=\sum_{j=0}^{m} \mathbf{P}_j\, B_{j,p}(s),
+  \label{eq:at-bspline}
+\end{equation}
+其中 $\mathbf{P}_j\in\mathbb{R}^n$ 是控制点（决策变量），$B_{j,p}(s)$ 是 $p$ 次 B 样条基函数（由节点向量经 Cox--de Boor 递推定义，\cite{biagiotti2008trajectory}）。它有两个工程性质极好：
+\begin{itemize}
+  \item \textbf{局部支撑}：每个 $B_{j,p}$ 只在有限几个节点区间非零，故移动一个控制点只改局部曲线段——数值良态、易做局部重规划；
+  \item \textbf{凸包性质}：曲线落在控制点凸包内，使“轨迹 $\subseteq$ 安全凸区”可转成“控制点 $\subseteq$ 凸区”的\emph{凸约束}——与 \cref{sec:plan-minsnap} 的安全飞行走廊、\cref{ch:st-corridor} 的凸分解走廊天然契合。
+\end{itemize}
+
+\begin{insight}
+\textbf{多项式系数 vs B 样条控制点——同一曲线的两种坐标。}\;一条分段多项式既可由系数表示、也可由\emph{各路点的导数值}或\emph{控制点}表示，它们经线性映射互换（\cref{der:plan-minsnap} 的 Richter 重构 $\mathbf{p}=\mathbf{M}^{-1}\mathbf{d}$ 正是“系数 $\to$ 导数值”的换基）。选哪种坐标做\emph{决策变量}是数值与建模的权衡：系数坐标直观但病态、导数值/控制点坐标良态且约束（连续性、凸包）更自然。\cref{sec:st-minco} 的 MINCO 把这一思想推到极致——以“路点 + 段时长”为最小参数，系数由它\emph{解析}生成，是当代轨迹优化的统一参数化。
+\end{insight}
+
+\subsection{在关节空间还是任务空间插值？}
+\label{subsec:at-jointvstask}
+
+同一条任务（末端从 $A$ 到 $B$），可以\emph{在关节空间}插值（对 $\mathbf{q}$ 做多项式/样条），也可以\emph{在任务空间}插值（对末端位姿 $\mathbf{x}\in\mathrm{SE}(3)$ 插值，再逐点逆运动学回 $\mathbf{q}$）。两者本质不同：
+
+\begin{table}[H]\centering\small
+\caption{关节空间插值 vs 任务空间插值}
+\label{tab:at-jointvstask}
+\begin{tabular}{p{0.16\textwidth} p{0.38\textwidth} p{0.38\textwidth}}
+\toprule
+& 关节空间插值 & 任务空间插值 \\
+\midrule
+做法 & 直接对 $\mathbf{q}(s)$ 取多项式/样条 & 对末端 $\mathbf{x}(s)\in\mathrm{SE}(3)$ 插值，逐点 IK 回 $\mathbf{q}$ \\
+末端路径 & 一般是\emph{弯的}（FK 是非线性） & 可指定为\emph{直线/圆弧}（如焊接、涂胶需要） \\
+关节运动 & 平滑、无奇异问题、计算廉价 & 可能撞\emph{奇异}（IK 病态，\cref{sec:ak-singularity}）、跳构型 \\
+速度/加速度约束 & 直接在 $\mathbf{q}$ 上，干净 & 需经雅可比换算，奇异处放大 \\
+适用 & 点到点运动、避障路点跟踪（多数情形） & 末端几何精度优先（笛卡尔直线/恒姿态作业） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}
+\textbf{任务空间插值的奇异陷阱.}\;在任务空间画一条漂亮的笛卡尔直线，看似自然，但当这条直线经过机械臂的\emph{奇异构型}时，逆运动学的关节速度 $\dot{\mathbf{q}}=\mathbf{J}^{-1}\dot{\mathbf{x}}$ 会爆炸（\cref{sec:ak-singularity}）——末端只移动一点点，某关节却要瞬时转半圈。\texttt{arm\_dm} 工程在混合力位控的诊断中正撞过此坑：在折叠构型附近做笛卡尔直线趋近时，子雅可比奇异致使运动飞掉，最终改为\emph{在关节空间做趋近、只在接触相用任务空间}才稳定（详见 \cref{ch:arm-prac} 与 \cref{sec:actrl-hybrid}）。\textbf{经验法则}：除非作业明确要求末端走特定几何（焊接/涂胶/插装），否则\emph{优先关节空间插值}——它天然避开奇异、计算廉价、约束干净。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{参数轨迹优化：以段时长为决策变量}
+\label{sec:at-paramopt}
+
+\paragraph{动机：形状定了，怎么“分配时间”最优？}
+设路径已被切成 $M$ 段（每段位移 $\Delta_s$ 已知），用五次多项式承载（\cref{def:at-quintic}）。剩下的自由度是\emph{每段分多少时间} $T_s$。这是一个低维优化：决策变量 $\{T_s\}_{s=1}^{M}$，在“总时长预算 + 每段不破限”的约束下最优化某代价（典型为总 jerk）。这正是“调库”与“吃透内核”的分水岭——会调 \texttt{scipy} 不算懂，能写出\emph{闭式}最优解并验证数值解收敛到它，才证明吃透了“参数化 + 带约束优化”。
+
+\subsection{峰值约束的闭式反推}
+\label{subsec:at-peaks}
+
+要写约束，先要知道一段 min-jerk 五次的\emph{峰值}速度/加速度/jerk 与该段位移 $\Delta$、时长 $T$ 的关系。对 rest-to-rest 的归一化 min-jerk 五次（\cref{thm:at-minjerk-quintic}），三个峰值有\emph{闭式系数}：
+
+\begin{proposition}[min-jerk 五次段的峰值系数]\label{prop:at-peaks}
+对位移 $\Delta$、时长 $T$、两端静止的 min-jerk 五次段，
+\begin{equation}
+  \mathrm{peak}|\dot q|=\frac{15}{8}\frac{|\Delta|}{T}=1.875\frac{|\Delta|}{T},\quad
+  \mathrm{peak}|\ddot q|=\frac{10}{\sqrt 3}\frac{|\Delta|}{T^2}\approx 5.7735\frac{|\Delta|}{T^2},\quad
+  \mathrm{peak}|\dddot q|=60\frac{|\Delta|}{T^3}.
+  \label{eq:at-peaks}
+\end{equation}
+据此，使本段同时满足 $|\dot q|\le V_{\max},|\ddot q|\le A_{\max},|\dddot q|\le J_{\max}$ 的\emph{最小时长}是
+\begin{equation}
+  T_s^{\min}=\max\!\Big(\,1.875\,\tfrac{|\Delta_s|}{V_{\max}},\ \sqrt{5.7735\,\tfrac{|\Delta_s|}{A_{\max}}},\ \sqrt[3]{60\,\tfrac{|\Delta_s|}{J_{\max}}}\,\Big).
+  \label{eq:at-tmin}
+\end{equation}
+\end{proposition}
+
+\begin{note}
+\textbf{这三个系数为什么重要.}\;$1.875,\ 5.7735,\ 60$ 不是凑出来的，而是归一化 min-jerk 五次 $q(\sigma)=\Delta(10\sigma^3-15\sigma^4+6\sigma^5),\ \sigma=t/T$ 的导数峰值：$\dot q$ 在 $\sigma=1/2$ 取 $15\Delta/(8T)$，$\ddot q$ 在 $\sigma=\tfrac12\mp\tfrac{1}{2\sqrt3}$ 取 $\pm 10\Delta/(\sqrt3 T^2)$，$\dddot q$ 在端点取 $60\Delta/T^3$。\cref{eq:at-tmin} 是\emph{能落地复现}的关键：它把抽象的“限速/限加速/限 jerk”翻译成每段的硬下界 $T_s^{\min}$，作为 \cref{subsec:at-allocate} 优化的约束。\texttt{arm\_dm} 工程的自写参数优化正是用这组系数反推 $T_s^{\min}$（见 \cref{ch:arm-prac} 的 \cref{eq:ap-peaks}），与本式一致。
+\end{note}
+
+\subsection{时间分配：闭式最优律 \texorpdfstring{$T_s\propto a_s^{1/6}$}{Ts proportional to as^(1/6)}}
+\label{subsec:at-allocate}
+
+\begin{theorem}[min-jerk 总代价的最优时间分配]\label{thm:at-allocate}
+设总时长预算 $\sum_s T_s=T_{\mathrm{tot}}$ 固定，每段 min-jerk 五次的代价是 jerk 平方积分的闭式
+\begin{equation}
+  J_s=720\,\frac{\Delta_s^2}{T_s^{5}},\qquad J=\sum_{s=1}^{M}J_s,
+  \label{eq:at-jcost}
+\end{equation}
+则在约束 $\sum_s T_s=T_{\mathrm{tot}}$ 下最小化 $J$ 的最优时间分配满足
+\begin{equation}
+  T_s^\star \;\propto\; a_s^{1/6},\qquad a_s:=\Delta_s^2,
+  \label{eq:at-allocate}
+\end{equation}
+即\emph{把更多时间分给位移大的段}（位移以平方进入代价，故时间按 $1/6$ 次幂分配）。
+\end{theorem}
+
+\begin{derivation}[闭式时间分配的拉格朗日推导]\label{der:at-allocate}
+以拉格朗日乘子 $\lambda$ 处理预算约束：$\mathcal{L}=\sum_s 720\,\Delta_s^2 T_s^{-5}+\lambda\big(\sum_s T_s-T_{\mathrm{tot}}\big)$。对 $T_s$ 求偏导置零：
+\begin{equation}
+  \frac{\partial\mathcal{L}}{\partial T_s}=-5\cdot 720\,\Delta_s^2\,T_s^{-6}+\lambda=0
+  \;\Longrightarrow\;
+  T_s^{6}=\frac{3600\,\Delta_s^2}{\lambda}
+  \;\Longrightarrow\;
+  T_s=\Big(\tfrac{3600}{\lambda}\Big)^{1/6}\Delta_s^{1/3}.
+  \label{eq:at-allocate-kkt}
+\end{equation}
+即 $T_s\propto |\Delta_s|^{1/3}=(\Delta_s^2)^{1/6}=a_s^{1/6}$，得 \cref{eq:at-allocate}。乘子 $\lambda$ 由预算归一 $\sum_s T_s=T_{\mathrm{tot}}$ 定出：$T_s^\star=T_{\mathrm{tot}}\,\dfrac{|\Delta_s|^{1/3}}{\sum_k|\Delta_k|^{1/3}}$。再叠加每段硬下界 $T_s\ge T_s^{\min}$（\cref{eq:at-tmin}）即得带不等式约束的完整问题，用 \cref{ch:nlopt} 的 SLSQP/SQP 求解。\qed
+\end{derivation}
+
+\begin{insight}
+\textbf{“调库 vs 吃透内核”的判据.}\;\texttt{arm\_dm} 工程用 \texttt{scipy.\allowbreak optimize} 的 SLSQP 数值求解上述带约束问题，并\emph{验证数值解精确等于闭式} $T_s\propto a_s^{1/6}$——相对等分时间分配，总 jerk 代价从 $8910$ 降到 $7805$（$-12.4\%$）。这个吻合不是“顺便检查”，而是\emph{方法论的核心}：能写出闭式解并证明优化器收敛到它，才证明真正吃透了“参数化（决策=段时长）+ 带约束优化”这一内核，而非把目标函数丢给黑箱。这正是本节区别于“调用某规划库一行 API”的价值所在。把这条作为评判任何“自写优化器”是否可信的范例。
+\end{insight}
+
+\begin{algo}[参数轨迹优化（段时长决策）]\label{alg:at-paramopt}
+\textbf{输入}：路点序列 $\{\mathbf{q}_k\}$（定义各段位移 $\Delta_s$）；限值 $V_{\max},A_{\max},J_{\max}$；总预算 $T_{\mathrm{tot}}$（或留空让其最小化）。\\
+\textbf{输出}：每段五次系数与时长 $\{T_s\}$。
+\begin{enumerate}
+  \item 由 \cref{eq:at-tmin} 算每段硬下界 $T_s^{\min}$；
+  \item 以 $\{T_s\}$ 为决策、$J=\sum_s 720\Delta_s^2/T_s^5$（\cref{eq:at-jcost}）为代价，约束 $\sum T_s=T_{\mathrm{tot}},\ T_s\ge T_s^{\min}$，调 SLSQP 求解（\cref{ch:nlopt}）；
+  \item （可选验证）与闭式 $T_s\propto a_s^{1/6}$（\cref{eq:at-allocate}）对比，应在数值精度内吻合；
+  \item 由各段 $(T_s,\Delta_s,\text{边界导数})$ 解 $6\times 6$ 系统得五次系数（\cref{def:at-quintic}）。
+\end{enumerate}
+\end{algo}
+
+\begin{note}
+\textbf{与 minimum-snap 的关系.}\;本节与 \cref{sec:plan-minsnap} 是\emph{同一框架在不同系统上的实例}：min-snap 为微分平坦的四旋翼最小化\emph{snap}（四阶导，对应电机推力变化率），本节为机械臂最小化\emph{jerk}（三阶导，对应力矩变化率）。min-snap 把段时长\emph{固定}、对系数解凸 QP；本节反过来\emph{以段时长为决策}、给出闭式分配——二者可组合（先定时间分配、再 min-snap/jerk 定系数），也正是 \cref{sec:st-minco} 的 MINCO 统一处理的两类变量。读者应把“决策变量 = 段时长”看作与“决策变量 = 多项式系数”互补的视角。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{时间参数化三件套：TOTG、TOPP-RA、Ruckig}
+\label{sec:at-timeparam}
+
+\paragraph{动机：把任意路径“贴边跑”到最优。}
+\cref{sec:at-paramopt} 的参数优化要求路径先被切成 rest-to-rest 段，且代价是 jerk。但工程上更常见的需求是：给定一条\emph{任意}（不必分段静止的）路径，求一个\emph{时间最优}（或 jerk 有界）的时间律，使全程\emph{贴着}速度/加速度/力矩极限跑。这是经典的\textbf{时间最优路径参数化（Time-Optimal Path Parameterization, TOPP）}问题，工业界有三件主力工具，定位互补。
+
+\subsection{三件套定位对比}
+\label{subsec:at-trio}
+
+\begin{table}[H]\centering\small
+\caption{时间参数化三件套对比（最优性 · 约束 · jerk · 在线性）}
+\label{tab:at-trio}
+\begin{tabular}{p{0.14\textwidth} p{0.16\textwidth} p{0.22\textwidth} p{0.13\textwidth} p{0.21\textwidth}}
+\toprule
+算法 & 最优性 & 可吃的约束 & jerk & 在线? \\
+\midrule
+\textbf{TOTG}\newline (Kunz--Stilman 2012\cite{kunz2012totg}) & 路径\emph{严格跟随}下时间最优 & 速度 + 加速度 & $\infty$（bang-bang） & 否；MoveIt 默认平滑器 \\
+\textbf{TOPP-RA}\newline (Pham 2018\cite{pham2018toppra}) & 时间最优 & 速度 + 加速度 + \textbf{二阶/力矩}（任意线性二阶约束） & $\infty$ & 否；凸、快、稳，\textbf{可吃机器人动力学} \\
+\textbf{Ruckig}\newline (Berscheid 2021\cite{berscheid2021ruckig}) & \emph{非}路径跟随的到点时间最优 & 速度 + 加速度 + \textbf{jerk} & \textbf{有界}（S 曲线） & \textbf{是}（每周期重算，任意目标态） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+直觉上：\textbf{TOTG 与 TOPP-RA} 都是“在速度/加速度盒子里贴边跑最快”，加速度像开关一样在极限间切换（bang-bang）——结果最快，但加速度阶跃 $\Rightarrow$ jerk 无穷 $\Rightarrow$ 有冲击。\textbf{Ruckig} 反其道：\emph{限制 jerk}让加速度连续，得到 S 曲线（七段恒 jerk），慢一点但护电机/减速器，且能\emph{在线}对任意当前态（含非零速度/加速度）实时重算——适合到点运动与避障重规划。
+
+\subsection{TOTG：圆弧倒角 + 速度极限曲线上的 bang-bang}
+\label{subsec:at-totg}
+
+\begin{algo}[TOTG 的两步\cite{kunz2012totg}]\label{alg:at-totg}
+\textbf{第一步（圆弧倒角，path preprocessing）}：自动规划器吐出的路点常是\emph{折线}（拐点处不可微，$\mathbf{q}'$ 跳变 $\Rightarrow$ 加速度无穷）。在每个拐点处插入一段\emph{圆弧倒角（circular blend）}，把折线磨成 $C^1$ 可微曲线（以可调倒角半径换取与原折线的微小偏离）。\\
+\textbf{第二步（一维时间最优）}：把所有关节的速度/加速度限\emph{投影}到路径参数 $s$ 上，问题降为一维——在相平面 $(s,\dot s)$ 上，速度极限曲线 $\dot s_{\max}(s)$（由各关节限的最紧者给出）之下，做\emph{尽量大加速、必要时尽量大减速}的 bang-bang 控制（Shin--McKay 的经典数值积分思路，Kunz--Stilman 改进了其在密集路点与数值误差下的鲁棒性）。
+\end{algo}
+
+\begin{note}
+TOTG 是 MoveIt 的默认轨迹平滑器（\texttt{TimeOptimalTrajectoryGeneration}），它\emph{只}吃速度与加速度限，不吃 jerk、不吃力矩。其 bang-bang 性质使加速度在极限间硬切换——对刚性好的工业臂可接受，对柔性关节/精密力控则冲击偏大。需要 jerk 有界时改用 Ruckig；需要力矩感知时改用 TOPP-RA（\cref{sec:at-torque-topp}）。
+\end{note}
+
+\subsection{TOPP-RA：基于可达/可控集的递推}
+\label{subsec:at-toppra}
+
+TOPP-RA 是本章后续力矩约束的基础，值得把其内核重建清楚\cite{pham2018toppra}。它的高明之处在于：把 TOPP 的相平面问题离散化后，用\emph{可达集/可控集的递推}（每步只解一个小线性规划）求解，既快（线性规划）又稳（$100\%$ 成功率，避开数值积分法在奇异/切换点的脆弱）。
+
+\paragraph{状态变量与时间最优的相平面图像。}
+沿路径取 $s\in[0,1]$，定义\emph{平方路径速度} $x(s):=\dot s^2$ 与\emph{路径加速度} $u(s):=\ddot s$。二者满足关键恒等式（链式法则）：
+\begin{equation}
+  \frac{\mathrm{d}x}{\mathrm{d}s}=\frac{\mathrm{d}(\dot s^2)}{\mathrm{d}s}=2\dot s\frac{\mathrm{d}\dot s}{\mathrm{d}s}=2\ddot s=2u,
+  \label{eq:at-topp-xrel}
+\end{equation}
+即 $x'(s)=2u$——在以 $s$ 为自变量时，$x$ 的演化\emph{线性}于控制 $u$。用 $x$（而非 $\dot s$）作状态是 TOPP 的关键技巧：它把原本非线性的相平面动力学\emph{线性化}了。时间最优等价于“在每个 $s$ 处让 $x$（速度平方）尽量大”，因为通行时间 $T=\int_0^1\frac{\mathrm{d}s}{\dot s}=\int_0^1\frac{\mathrm{d}s}{\sqrt{x(s)}}$ 随 $x$ 增大而减小。
+
+\paragraph{约束的线性化。}
+\cref{ch:arm-dyn} 的动力学 $\boldsymbol{\tau}=\mathbf{M}(\mathbf{q})\ddot{\mathbf{q}}+\mathbf{C}(\mathbf{q},\dot{\mathbf{q}})\dot{\mathbf{q}}+\mathbf{g}(\mathbf{q})$ 沿路径求值。把 \cref{eq:at-chain} 的 $\ddot{\mathbf{q}}=\mathbf{q}''\dot s^2+\mathbf{q}'\ddot s=\mathbf{q}''x+\mathbf{q}'u$、$\dot{\mathbf{q}}=\mathbf{q}'\dot s$（其中 $\dot s^2=x$）代入，则\emph{任何}对 $(\boldsymbol{\tau},\dot{\mathbf{q}},\ddot{\mathbf{q}})$ 的线性约束都化为对 $(u,x)$ 的\textbf{线性不等式}：
+\begin{equation}
+  \mathbf{a}(s)\,u+\mathbf{b}(s)\,x+\mathbf{c}(s)\ \le\ \mathbf{0},
+  \label{eq:at-topp-lin}
+\end{equation}
+其中系数 $\mathbf{a}(s),\mathbf{b}(s),\mathbf{c}(s)$ 由路径几何 $\mathbf{q}',\mathbf{q}''$ 与机器人模型（$\mathbf{M},\mathbf{C},\mathbf{g}$ 及力矩/速度限）在 $s$ 处求值得到。例如力矩限 $-\boldsymbol{\tau}_{\max}\le\mathbf{M}\mathbf{q}'u+(\mathbf{M}\mathbf{q}''+\tilde{\mathbf{C}})x+\mathbf{g}\le\boldsymbol{\tau}_{\max}$ 即此形（$\tilde{\mathbf{C}}$ 吸收 $\mathbf{C}\dot{\mathbf{q}}$ 中 $\propto\dot s^2=x$ 的部分）；加速度限 $|\mathbf{q}''x+\mathbf{q}'u|\le\mathbf{a}_{\max}$ 也是此形。
+
+\paragraph{可控集递推（后向）+ 速度优先（前向）。}
+\begin{definition}[可控集与可达集]\label{def:at-controllable}
+在离散栅格 $0=s_0<s_1<\dots<s_N=1$ 上，\textbf{可控集} $\mathcal{K}_i\subseteq\mathbb{R}_{\ge 0}$ 是“从 $s_i$ 出发、存在满足 \cref{eq:at-topp-lin} 的控制序列把系统在终点合法停下（满足终端速度约束）”的所有 $x$ 之集；\textbf{可达集} $\mathcal{L}_i$ 是“从起点合法出发、能到达 $s_i$”的所有 $x$ 之集。每个 $\mathcal{K}_i,\mathcal{L}_i$ 都是区间 $[\underline{x}_i,\overline{x}_i]$（一维），其端点由小型线性规划求出。
+\end{definition}
+
+\begin{algo}[TOPP-RA\cite{pham2018toppra}]\label{alg:at-toppra}
+\textbf{后向遍 (computing controllable sets)}：从终点 $i=N$ 向 $i=0$ 递推。已知 $\mathcal{K}_{i+1}=[\underline{x}_{i+1},\overline{x}_{i+1}]$，解两个一维线性规划求 $\mathcal{K}_i$ 的上下界——求“在 $s_i$ 处取多大 $x$，仍能经一步合法的 $u$（满足 \cref{eq:at-topp-lin}）落入 $\mathcal{K}_{i+1}$”（用离散化 $x_{i+1}=x_i+2u\,\Delta s$，由 \cref{eq:at-topp-xrel}）。\\
+\textbf{前向遍 (greedy maximum velocity)}：从起点 $i=0$ 向前，每步在“当前 $x_i$ 可达 + 落入 $\mathcal{K}_{i+1}$”的约束下\emph{选最大的 $u$}（即最大加速），得到逐点最优 $x_i^\star$。\\
+\textbf{回放}：由 $x^\star(s)=\dot s^2$ 积分 $t(s)=\int_0^s\frac{\mathrm{d}\sigma}{\sqrt{x^\star(\sigma)}}$ 得时间律，再由 $s(t)$ 重建 $\mathbf{q}(t),\dot{\mathbf{q}}(t),\ddot{\mathbf{q}}(t)$。
+\end{algo}
+
+\begin{insight}
+\textbf{TOPP-RA 为何又快又稳.}\;经典 TOPP 的数值积分法（NI）沿速度极限曲线找切换点，在奇异/不可微处脆弱、难实现；凸优化法（CO）稳但慢。TOPP-RA 的洞见是：用 $x=\dot s^2$ 线性化、再以\emph{可控集递推}代替全局优化，每步只解\emph{一维小 LP}，总复杂度线性于栅格数 $N$，且因约束 \cref{eq:at-topp-lin} 线性、可控集为区间，递推数值稳定（论文报告 $100\%$ 成功率）。它还\emph{天然}支持任意线性二阶约束——把约束写成 \cref{eq:at-topp-lin} 即可，这正是下一节力矩约束的入口。这种“线性化状态 + 集合递推 + 小 LP”的范式，与控制里的可达性分析（\cref{sec:sm-cbf-game}）一脉相承。
+\end{insight}
+
+\subsection{Ruckig：在线 jerk 有界的七段 S 曲线}
+\label{subsec:at-ruckig}
+
+TOTG/TOPP-RA 都是\emph{离线}、\emph{路径跟随}、\emph{jerk 无界}的。许多场景反而要：\emph{在线}（每控制周期重算）、对\emph{任意当前态}（含非零速度/加速度）、\emph{jerk 有界}地到达目标态——这是\textbf{在线轨迹生成（Online Trajectory Generation, OTG）}，Ruckig 是其开源代表\cite{berscheid2021ruckig}。
+
+\begin{algo}[Ruckig 的七段 S 曲线\cite{berscheid2021ruckig}]\label{alg:at-ruckig}
+对每个自由度，在速度/加速度/jerk 三重限下，时间最优地从当前态 $(q,\dot q,\ddot q)$ 到目标态 $(q_f,\dot q_f,\ddot q_f)$ 的廓线由\emph{最多七段恒 jerk}组成（jerk 取 $\{+J_{\max},0,-J_{\max}\}$）：加加速 $\to$ 匀加速 $\to$ 减加速 $\to$ 匀速 $\to$ 加减速 $\to$ 匀减速 $\to$ 减减速。Ruckig 枚举四种非冗余 jerk 符号组合（衍生 $16$ 种廓线类型），解析求出各段时长；再对多自由度做\emph{时间同步}（让最慢的自由度定总时间、其余放慢以同时到达）。整套计算在亚毫秒内完成，可\emph{每周期重算}，从而对传感器输入即时反应。
+\end{algo}
+
+\begin{note}
+\textbf{“路径跟随”vs“到点”的本质差异.}\;TOTG/TOPP-RA 严格\emph{跟随}给定路径形状（只动时间律，不改几何），适合“路径已由避障规划器定好、只需配时间”。Ruckig \emph{不}保证跟随某条预定空间路径——它对每个自由度独立生成到点廓线，多自由度的合成路径由同步决定，可能\emph{不是}你画的那条线。故 Ruckig 适合\emph{到点/伺服/在线重规划}（目标会变、要即时响应），而非“必须走这条无碰路径”的场景。三者按需混用：避障规划 $\to$ TOPP-RA 配时间（执行标称）+ Ruckig 兜底在线扰动/目标变更。这与 \cref{ch:mppi} 的在线采样 MPC 互补——Ruckig 是\emph{无碰撞推理}的纯运动学在线生成器，MPPI 则在线做\emph{含代价/约束}的滚动优化。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{力矩约束的时间参数化：把动力学吃进时序}
+\label{sec:at-torque-topp}
+
+\paragraph{动机：加速度盒子为什么既不安全又浪费？}
+最常见的做法是给轨迹配一个\emph{固定加速度盒}（$|\ddot q_i|\le a_{\max}$）。但机械臂的真实硬约束是\emph{力矩}（电机能出多大 $\tau$），而由 \cref{ch:arm-dyn} 的动力学
+\begin{equation}
+  \boldsymbol{\tau}=\mathbf{M}(\mathbf{q})\ddot{\mathbf{q}}+\mathbf{C}(\mathbf{q},\dot{\mathbf{q}})\dot{\mathbf{q}}+\mathbf{g}(\mathbf{q}),
+  \label{eq:at-dyn}
+\end{equation}
+力矩与加速度之间隔着\emph{位形相关}的惯量矩阵 $\mathbf{M}(\mathbf{q})$。同一个加速度，在臂\emph{伸展}（惯量大）和\emph{蜷缩}（惯量小）时，需要的力矩天差地别。于是固定加速度盒的恶果是双向的：
+
+\begin{pitfall}
+\textbf{固定加速度盒的双重错误.}\;
+\begin{itemize}
+  \item \textbf{不安全}：在惯量大的位形，某个“合法”的加速度 $a_{\max}$ 经 $\mathbf{M}(\mathbf{q})$ 放大后所需力矩\emph{超过}电机极限 $\tau_{\max}$——盒子说合法，真机却饱和、跟踪崩坏甚至打滑。
+  \item \textbf{浪费}：为避免上一条，工程师把 $a_{\max}$ 调得很保守，于是在惯量小的位形，实际只用到电机力矩的一小部分，轨迹\emph{慢于}本可达到的速度。
+\end{itemize}
+两个错误同源：用一个\emph{位形无关}的盒子去近似一个\emph{位形强相关}的约束。根治之道只有一条——把 $\mathbf{M}(\mathbf{q})$ 显式算进去，即把约束写在\emph{力矩}上、经逆动力学映射。
+\end{pitfall}
+
+\paragraph{解法：力矩约束的 TOPP-RA。}
+TOPP-RA（\cref{alg:at-toppra}）的约束接口 \cref{eq:at-topp-lin} 恰好能吃力矩约束——把 \cref{eq:at-dyn} 沿路径代入 $\ddot{\mathbf{q}}=\mathbf{q}''x+\mathbf{q}'u$、$\dot{\mathbf{q}}=\mathbf{q}'\sqrt x$，力矩限 $|\boldsymbol{\tau}|\le\boldsymbol{\tau}_{\max}$ 即化为 $(u,x)$ 的线性不等式：
+\begin{equation}
+  \big|\underbrace{\mathbf{M}(\mathbf{q})\mathbf{q}'}_{\mathbf{a}(s)}\,u+\underbrace{\big(\mathbf{M}(\mathbf{q})\mathbf{q}''+\tilde{\mathbf{C}}(s)\big)}_{\mathbf{b}(s)}\,x+\underbrace{\mathbf{g}(\mathbf{q})}_{\mathbf{c}(s)}\big|\ \le\ \boldsymbol{\tau}_{\max},
+  \label{eq:at-torque-con}
+\end{equation}
+其中系数 $\mathbf{a},\mathbf{b},\mathbf{c}$ 用\emph{逆动力学}逐栅格点求值——把 RNEA（\cref{sec:ad-rnea}）当作约束算子。\texttt{arm\_dm} 工程用 \texttt{toppra} 的 \texttt{JointTorqueConstraint}，其内部 \texttt{inv\_dyn} 即 Pinocchio 的 \texttt{rnea}（\cref{ch:arm-prac} 的 \cref{eq:ap-tau-invdyn}）。
+
+\begin{insight}
+\textbf{力矩感知时序必须走逆动力学（核心结论）.}\;只要约束的物理本质是\emph{力矩}（驱动器极限），时间参数化就\emph{必须}调用逆动力学 \cref{eq:at-dyn} 把加速度映射成力矩——这是 $\mathbf{M}(\mathbf{q})$ 位形相关性的直接推论，没有捷径。固定加速度盒是对此的廉价替代，代价是系统性的“既不安全又浪费”。这一条对\emph{任何}用 TOPP-RA/凸 TOPP 做二阶约束参数化者都有直接迁移价值：把约束写在真实物理量（力矩、接触力）上，而非其位形无关的代理（加速度）上。
+\end{insight}
+
+\paragraph{实测：快 $4.6\times$ 且精确守约束。}
+\texttt{arm\_dm}（六轴、力矩限 $\pm 26\,\mathrm{N\!\cdot\! m}$）的对照实验（占位惯量下，详见 \cref{ch:arm-prac} 的 \cref{tab:ap-topp}）：
+
+\begin{table}[H]\centering\small
+\caption{加速度盒 vs 力矩约束 TOPP-RA（\texttt{arm\_dm}，占位惯量）}
+\label{tab:at-torque-cmp}
+\begin{tabular}{p{0.30\textwidth} c c p{0.30\textwidth}}
+\toprule
+约束 & 总时长 $T$ & 峰值 $|\tau|$ & 评价 \\
+\midrule
+加速度盒 $\pm 8$ & $3.496\,\mathrm{s}$ & $4.1\,\mathrm{N\!\cdot\! m}$ & 只用了 $\sim 16\%$ 力矩裕度（\emph{浪费} $84\%$） \\
+力矩约束 $\pm 26$ & $0.752\,\mathrm{s}$ & $26.0\,\mathrm{N\!\cdot\! m}$（精确贴满） & \textbf{快 $4.6\times$}，J1/J2 力矩 bang-bang \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+力矩约束版让 J1/J2 的力矩\emph{精确贴满} $26\,\mathrm{N\!\cdot\! m}$（力矩限下的 bang-bang，即时间最优），通行时间缩到 $0.752\,\mathrm{s}$；而加速度盒版峰值力矩仅 $4.1\,\mathrm{N\!\cdot\! m}$——同一条路径，因为没把 $\mathbf{M}(\mathbf{q})$ 算进去，白白浪费了 $84\%$ 的驱动力。
+
+\begin{pitfall}
+\textbf{离散“守约束”的隐蔽坑：栅格不够会假性越界.}\;TOPP-RA 在栅格点上施加 \cref{eq:at-torque-con}，但默认的配点法（collocation）+ 稀疏栅格在做\emph{常加速度重构}时，相邻栅格点\emph{之间} $\mathbf{M}(\mathbf{q})$ 仍在变——于是重构出的真实峰值力矩可能\emph{超出} $\pm 26$ 达 $6\%$（看似守约束、实则越界）。\texttt{arm\_dm} 的修法：\texttt{discretization\_scheme=Interpolation} + \emph{加密到 $401$ 个栅格点}，才把峰值修正回 $\le 26$。\textbf{教训}：力矩/二阶约束的 TOPP-RA，离散方案与栅格密度直接决定“纸面守约束”是否等于“真机守约束”——务必用插值重构 + 足够密的栅格验证真实峰值，而非只信栅格点上的约束。
+\end{pitfall}
+
+\begin{exercise}
+设某二连杆臂在伸展构型的等效关节惯量是蜷缩构型的 $4$ 倍。若用固定加速度盒 $a_{\max}$ 配时间，要保证\emph{两种}构型都不超力矩 $\tau_{\max}$，$a_{\max}$ 必须按\emph{哪种}构型取？由此估计在蜷缩构型下浪费了百分之多少的力矩裕度。再说明力矩约束 TOPP-RA 如何同时消除这种浪费与越界风险。
+\end{exercise}
+
+% ════════════════════════════════════════════════════════════════
+\section{梯形速度轮廓：工业基线 LSPB}
+\label{sec:at-trapezoidal}
+
+\paragraph{动机：在多项式与 S 曲线之间，工业现场最爱的“最简可行”时间律。}
+\cref{sec:at-paramopt} 的五次多项式让加速度连续、jerk 有界，是“数学上漂亮”的选择；\cref{sec:at-timeparam} 的 TOPP-RA/Ruckig 是“贴边最优 / 在线”的现代工具。但在它们之间，还有一个统治了工业控制器三十年、几乎所有商用机器人示教器都内置的\emph{基线}：\textbf{梯形速度轮廓（trapezoidal velocity profile）}，又称\textbf{带抛物线过渡的线性段（Linear Segment with Parabolic Blends, LSPB）}。它把一段点到点运动切成\emph{三段}——\emph{匀加速 $\to$ 匀速（巡航）$\to$ 匀减速}，速度曲线呈梯形，故得名。它之所以是“工业基线”，正因为它\emph{最简单却直接可验}：用户只需给定行程、时长、以及一个限速或限加速度，就能\emph{当场核验}所得速度/加速度是否在真机能力之内（这是 Siciliano 强调 LSPB 在工业实践中受青睐的原因——“allows a direct verification of whether the resulting velocities and accelerations can be supported by the physical manipulator”\cite{siciliano2009robotics}）。本节按 Siciliano §4.2.1、Craig §7.4、Paul §5 的三方视角融成统一阐述，并把它放回与多项式/S 曲线的坐标系中定位。
+
+\subsection{三段构造与位置--速度--加速度廓线}
+\label{subsec:at-trap-build}
+
+\begin{definition}[梯形速度轮廓 / LSPB]\label{def:at-trap}
+设单关节从 $q_i$（静止）到 $q_f$（静止），总时长 $t_f$ 给定。取\emph{两端等时长}的抛物线过渡（恒加速度 $\ddot q_c$ 与恒减速度 $-\ddot q_c$、同一大小），中间为恒速 $\dot q_c$ 的直线段。记过渡段时长 $t_c$（即“加速到巡航速度所需时间”），则位置律为分段二次--线性--二次（抛物线--直线--抛物线）：
+\begin{equation}
+  q(t)=
+  \begin{cases}
+    q_i+\tfrac12\,\ddot q_c\,t^2, & 0\le t\le t_c\quad(\text{匀加速}),\\[3pt]
+    q_i+\ddot q_c\,t_c\big(t-\tfrac{t_c}{2}\big), & t_c<t\le t_f-t_c\quad(\text{匀速巡航}),\\[3pt]
+    q_f-\tfrac12\,\ddot q_c\,(t_f-t)^2, & t_f-t_c<t\le t_f\quad(\text{匀减速}).
+  \end{cases}
+  \label{eq:at-trap-q}
+\end{equation}
+对应的速度是\emph{梯形}（线性升—平顶—线性降）、加速度是\emph{矩形脉冲}（$+\ddot q_c$、$0$、$-\ddot q_c$ 三段方波）。巡航速度与过渡的关系是 $\dot q_c=\ddot q_c\,t_c$。整条轨迹关于中点 $\big(t_m,q_m\big)=\big(t_f/2,(q_i+q_f)/2\big)$ \emph{对称}。
+\end{definition}
+
+\begin{derivation}[过渡时长 $t_c$ 与可行加速度的反推]\label{der:at-trap-feasible}
+在过渡末 $t_c$，速度连续要求“抛物线段终速 = 直线段速度”：$\ddot q_c t_c=\dfrac{q_m-q_c}{t_m-t_c}$，其中 $q_c=q_i+\tfrac12\ddot q_c t_c^2$ 是过渡末位置。代入整理得 $t_c$ 满足二次方程
+\begin{equation}
+  \ddot q_c\,t_c^2-\ddot q_c\,t_f\,t_c+(q_f-q_i)=0
+  \;\Longrightarrow\;
+  t_c=\frac{t_f}{2}-\frac12\sqrt{\frac{t_f^2\,\ddot q_c-4(q_f-q_i)}{\ddot q_c}}.
+  \label{eq:at-trap-tc}
+\end{equation}
+要使根号内非负（$t_c$ 实且 $\le t_f/2$），加速度必须够大：
+\begin{equation}
+  \boxed{\;|\ddot q_c|\ \ge\ \frac{4\,|q_f-q_i|}{t_f^2}\;}
+  \label{eq:at-trap-acond}
+\end{equation}
+这是 LSPB 的\textbf{可行性条件}：给定行程 $|q_f-q_i|$ 与时长 $t_f$，加速度有一个\emph{硬下界}。当 \cref{eq:at-trap-acond} 取\emph{等号}时，$t_c=t_f/2$，巡航段\emph{消失}，梯形退化为\textbf{三角形速度轮廓}（只有加速与减速两段）——这是“在给定 $t_f$ 内完成行程所允许的最小加速度”所对应的极限情形。\qed
+\end{derivation}
+
+\begin{note}
+\textbf{两种等价的参数化口径.}\;\cref{der:at-trap-feasible} 是“给定加速度 $\ddot q_c$ 反推 $t_c$”。工程上更常见的是\emph{给定巡航速度} $\dot q_c$（如“以最大速度的 $50\%$ 运行”）。此时可行性条件换成对巡航速度的双边界
+\begin{equation}
+  \frac{|q_f-q_i|}{t_f}\ <\ |\dot q_c|\ \le\ \frac{2\,|q_f-q_i|}{t_f},
+  \label{eq:at-trap-vcond}
+\end{equation}
+下界 $|q_f-q_i|/t_f$ 是“全程平均速度”（若巡航速度低于它，再快的加速也走不完）、上界 $2|q_f-q_i|/t_f$ 对应三角形极限。由 $\dot q_c$ 反求 $t_c=\dfrac{q_i-q_f+\dot q_c t_f}{\dot q_c}$、加速度 $\ddot q_c=\dfrac{\dot q_c^2}{q_i-q_f+\dot q_c t_f}$，再代回 \cref{eq:at-trap-q}。Siciliano 指出工业示教器普遍采用“限速百分比”这一口径，正是为了\emph{防止用户把 $t_f$ 设得过小}而隐式要求超出机械能力的速度/加速度\cite{siciliano2009robotics}。
+\end{note}
+
+\paragraph{多关节同步与 via point。}
+多自由度时，各关节\emph{共用同一 $t_f$}（让所有关节同时启停、同时到达，从而末端在路点处对齐）——由\emph{行程最大}的关节定 $t_f$，其余关节据 \cref{eq:at-trap-vcond} 放慢巡航速度以同步（与 \cref{alg:at-ruckig} 的时间同步同理）。若路径含多个中间\emph{途经点（via point）}而不要求在每点停车，可借 Paul 的“提前发起下一段”技巧\cite{paul1981robot}：在前一段结束\emph{之前} $t_c$ 就叠加下一段的参考，使关节\emph{不停车}地以非零速度掠过中间点（代价是中间点变成\emph{近似经过}的 via point、且过点时刻不再精确）。这与 Craig 的“线性段 + 抛物线过渡”多点版本\cite{craig2005introduction}、本章 \cref{subsec:at-bspline} 的局部支撑思想一脉相承。
+
+\subsection{与多项式、S 曲线的优劣对比}
+\label{subsec:at-trap-cmp}
+
+\begin{table}[H]\centering\small
+\caption{梯形速度轮廓 vs 五次多项式 vs S 曲线（jerk 有界）}
+\label{tab:at-trap-cmp}
+\begin{tabular}{p{0.16\textwidth} p{0.24\textwidth} p{0.24\textwidth} p{0.24\textwidth}}
+\toprule
+ & 梯形 / LSPB & 五次多项式 & S 曲线（7 段，Ruckig） \\
+\midrule
+加速度 & 矩形脉冲（\emph{段端跳变}） & 连续（线性/二次） & 连续 \\
+jerk & \emph{无穷}（加速度阶跃处 $\delta$ 冲量） & 有界（二次） & \textbf{有界（恒定 $\pm J_{\max}$）} \\
+平滑性 & $C^1$（位置、速度连续，加速度不连续） & $C^2$（加速度也连续） & $C^2$ \\
+参数 & 行程 + $t_f$ + 限速/限加速 & 6 个边界（位/速/加 两端） & 限速/加速/jerk + 目标态 \\
+代价 $\int\!\tau^2\mathrm dt$ & 比三次\emph{劣 $+12.5\%$}\cite{siciliano2009robotics} & 最优（min-jerk 基准） & 介于两者，护减速器 \\
+直接可验性 & \textbf{极强}（限值当场核验） & 中（需算峰值，见 \cref{eq:at-peaks}） & 中 \\
+适用 & 工业点到点基线、示教器默认 & rest-to-rest 需加速度连续 & 在线 / 柔性关节 / 精密力控 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}
+\textbf{“最简可行”为何能成为工业基线.}\;梯形轮廓的全部优点都源于它的\emph{极简}：三段、每段是低阶多项式（二次或一次）、参数只有“行程 + 时长 + 一个限值”，因而\emph{无需预计算}、可在示教器上\emph{当场核验}限值是否被满足（\cref{eq:at-trap-acond,eq:at-trap-vcond} 都是一行不等式）——这正是 Paul 强调其“require no precomputation”、Siciliano 强调其“direct verification”的工程价值\cite{paul1981robot,siciliano2009robotics}。代价是\emph{加速度在段端跳变 $\Rightarrow$ jerk 无穷}：对刚性好的工业臂可接受，但会激起柔性关节/减速器的振动。性能上，它的能耗指标 $\int\tau^2\mathrm dt$ 仅比最优三次差 $12.5\%$\cite{siciliano2009robotics}——\emph{劣化有限}，这解释了为何“简单且够用”足以让它长期占据工业基线地位。当 jerk 必须有界时，升级到\emph{S 曲线}（七段恒 jerk，即在梯形的每个加速度阶跃处再插入恒 jerk 过渡，正是 \cref{alg:at-ruckig} 的 Ruckig 廓线）；当要把\emph{动力学/力矩}吃进时序时，则越级到 \cref{sec:at-torque-topp} 的力矩约束 TOPP-RA。三者构成“简单—平滑—最优”的递进谱系。
+\end{insight}
+
+\begin{pitfall}
+\textbf{别把“限加速度”误当“限力矩”——梯形轮廓同样踩这个坑.}\;梯形轮廓的可行性条件 \cref{eq:at-trap-acond} 约束的是\emph{运动学加速度} $\ddot q_c$，而非真机的\emph{力矩}。由 \cref{eq:at-dyn} 的 $\boldsymbol\tau=\mathbf M(\mathbf q)\ddot{\mathbf q}+\dots$，同一个 $\ddot q_c$ 在惯量大的位形所需力矩可能\emph{超出}电机极限。故梯形轮廓与“固定加速度盒”同病（\cref{sec:at-torque-topp} 的 \cref{tab:at-torque-cmp}）：在位形相关惯量面前，限加速度既可能不安全又可能浪费。工业上之所以仍广泛用它，是因为对刚性臂/中低速作业，工程师按\emph{最坏位形}保守地取 $\ddot q_c$ 即可——简单可靠优先于极限性能。要榨干驱动力或保证力矩安全，才需越级到力矩约束的时序。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{驱动变换：有界加速度的位姿过渡}
+\label{sec:at-drive-transform}
+
+\paragraph{动机：在“变换”上插值，而非在“轨迹点”上插值。}
+\cref{subsec:at-jointvstask} 指出任务空间插值的两难：要末端走特定几何（直线/定姿），又怕撞奇异。Paul（1981）给出一个历史上极具教学价值的方案——\textbf{驱动变换（drive transform）}$\mathbf D(r)$\cite{paul1981robot}。它的核心思想与现代样条\emph{正交}：现代样条对一串\emph{轨迹点}（位置采样）做插值；驱动变换则对连接两位姿的\emph{相对变换本身}用一个标量参数 $r\in[0,1]$ 做\emph{几何参数插值}——把“从位姿 1 到位姿 2 的运动”分解为\emph{一次平移 + 两次旋转}，让这三者的\emph{量}都正比于 $r$。于是当 $r$ 随时间线性变化时，末端就以\emph{恒定线速度 + 两个恒定角速度}沿直线平移、并平滑地改变姿态。这是“在变换层面参数化运动”的早期典范，理解它能反衬出现代 TOPP/样条“在采样点层面参数化”的取舍。
+
+\subsection{驱动变换的构造：平移 + 两次旋转}
+\label{subsec:at-dt-build}
+
+\begin{definition}[驱动变换]\label{def:at-dt}
+设起始位姿 $\mathbf P_1,\mathbf P_2\in\mathrm{SE}(3)$（均相对同一参考系）。\textbf{驱动变换} $\mathbf D(r)$ 是单参数 $r\in[0,1]$ 的位姿插值，满足\emph{端点条件}
+\begin{equation}
+  \mathbf D(0)=\mathbf I,\qquad \mathbf D(1)=\mathbf P_1^{-1}\mathbf P_2,
+  \label{eq:at-dt-ends}
+\end{equation}
+使中间位姿 $\mathbf P(r)=\mathbf P_1\,\mathbf D(r)$ 从 $\mathbf P_1$（$r{=}0$）连续过渡到 $\mathbf P_2$（$r{=}1$）。Paul 取 $r=t/T$（$T$ 为该段总时长），并把 $\mathbf D(r)$ 分解为\emph{平移}与\emph{两次旋转}的复合
+\begin{equation}
+  \mathbf D(r)=\mathbf T(r)\,\mathbf R_a(r)\,\mathbf R_o(r),
+  \label{eq:at-dt-decomp}
+\end{equation}
+其中 $\mathbf T(r)$ 是沿 $\mathbf P_1\to\mathbf P_2$ 连线的平移、平移量 $=r\cdot(\text{总位移})$；$\mathbf R_a(r)$ 把工具指向（approach 向量）从 $\mathbf P_1$ 转到 $\mathbf P_2$、转角 $=r\theta$；$\mathbf R_o(r)$ 绕工具轴把姿态（orientation 向量）转到位、转角 $=r\phi$。\textbf{关键}：平移量与两个转角\emph{都正比于 $r$}，故 $r$ 线性于时间 $\Rightarrow$ 恒定线速度 + 两个恒定角速度。
+\end{definition}
+
+\begin{insight}
+\textbf{“对变换插值”$\ne$“对轨迹点插值”——两种参数化哲学.}\;现代做法（\cref{subsec:at-bspline} 的 B 样条、\cref{sec:at-timeparam} 的 TOPP）先把路径\emph{采样}成一串点（或控制点），再对这些\emph{点}拟合多项式/样条。驱动变换反其道：它\emph{不}采样中间点，而是对“起讫两位姿之间的相对运动”这一\emph{几何对象}直接参数化——把它拆成平移与两次旋转、各自线性展开。其好处是中间任意 $r$ 处的位姿\emph{解析可得}（一次 $\mathbf D(r)$ 求值即可，Paul 报告约 4 次三角函数 + 15 乘 + 6 加），无需存储轨迹点、无需在点间二次插值；末端\emph{严格}走直线、姿态\emph{严格}沿测地旋转。代价是它\emph{绑定}了“平移 + 两旋转”这一特定几何分解，不像样条那样能逼近任意形状，也不像 TOPP 那样能把速度/加速度/力矩约束\emph{贴边最优}。理解这一对比，是看清“轨迹参数化”这一概念有\emph{多个层次}（变换层 vs 采样点层）的关键。
+\end{insight}
+
+\subsection{段间过渡：四次多项式与有界加速度}
+\label{subsec:at-dt-transition}
+
+\cref{def:at-dt} 的 $\mathbf D(r)$ 让\emph{单段}内速度恒定，但相邻两段在路点处\emph{方向突变}——若直接拼接，速度不连续、加速度无穷。Paul 的解法与 \cref{subsec:at-quintic} 的多项式过渡同源：在每个路点周围开一个\emph{过渡窗} $[-t_{\mathrm{acc}},\,t_{\mathrm{acc}}]$，用一段低阶多项式把\emph{前一段的恒速}平滑接到\emph{后一段的恒速}，从而位置、速度、加速度三者连续。
+
+\begin{derivation}[过渡用四次多项式即可（对称性省一阶）]\label{der:at-dt-quartic}
+过渡两端各有“位置、速度、加速度”三个边界，共\emph{六}个条件，一般需五次多项式。但 Paul 观察到过渡\emph{关于中点对称}，可消去一个自由度，故\emph{四次}多项式
+\begin{equation}
+  q(t)=a_4 t^4+a_3 t^3+a_2 t^2+a_1 t+a_0,\qquad t\in[-t_{\mathrm{acc}},\,t_{\mathrm{acc}}]
+  \label{eq:at-dt-quartic}
+\end{equation}
+即足以满足六条件。记 $\Delta_C=\mathbf C-\mathbf B$（指向下一路点 $C$ 的位移）、$\Delta_B=\mathbf A-\mathbf B$（来自上一路点 $A$ 的位移）、归一化时间 $h=\dfrac{t+t_{\mathrm{acc}}}{2t_{\mathrm{acc}}}\in[0,1]$，解边界条件得过渡段的加速度
+\begin{equation}
+  \ddot q(t)=\Big(\Delta_C\,\frac{t_{\mathrm{acc}}}{T_1}+\Delta_B\Big)(1-h)\,\frac{3h}{t_{\mathrm{acc}}^2}.
+  \label{eq:at-dt-acc}
+\end{equation}
+\textbf{有界加速度的来历}：\cref{eq:at-dt-acc} 中 $h(1-h)$ 在 $h\in[0,1]$ 上有界（峰值在 $h=1/2$），且分母 $t_{\mathrm{acc}}^2$ 固定，故 $|\ddot q|$ 被一个\emph{有限常数}封顶——过渡期加速度恒有界。其物理含义：过渡窗 $2t_{\mathrm{acc}}$ 恰好留出“从最负速度变到最正速度”所需时间（单段加速 rest$\to$巡航用 $t_{\mathrm{acc}}$，过渡需双倍）；$t_{\mathrm{acc}}$ 越大、过渡越缓、峰值加速度越小。过渡\emph{之后}（$t\in[0,T_1]$）回到 $\mathbf D(r)$ 的恒速直线，$\ddot q=0$。\qed
+\end{derivation}
+
+\begin{proposition}[速度仅在终点为零]\label{prop:at-dt-velzero}
+在驱动变换 + 四次过渡的方案下，关节/末端速度\emph{只在轨迹的真正起讫点为零}，而在所有\emph{中间路点处非零}（以非零速度掠过，过点即 via point）。若需在某中间点\emph{停车}，须在路径规格里\emph{重复}该点一次（人为制造一个零速终点）。
+\end{proposition}
+
+\begin{derivation}[为何中间点必须非零速度，否则过冲]\label{der:at-dt-overshoot}
+若强行要求在每个中间\emph{极值点}速度非零地“精确穿过”，则因速度必须在过点前后\emph{改变符号}，末端会在该点\emph{过冲}（先冲过、再折返）\cite{paul1981robot}。Paul 的结论：要无过冲，中间极值点\emph{必须}零速——而这等价于“在该点停车”。故\emph{不停车}的平滑过点只能以\emph{非零速度近似经过}（via point），过点的精确位置与时刻都让位于平滑性。这正是 \cref{prop:at-dt-velzero} 的根据，也与 \cref{subsec:at-trap-build} 末“提前发起下一段”的 via point 处理\emph{同一权衡}：平滑掠过 $\Leftrightarrow$ 放弃精确过点。\qed
+\end{derivation}
+
+\subsection{对现代样条 / TOPP 的教学价值}
+\label{subsec:at-dt-modern}
+
+\begin{insight}
+\textbf{驱动变换今天还值得学吗？——值，作为“参数化层次”的活标本.}\;论\emph{落地}，今天笛卡尔直线运动多由现代库（\texttt{moveit\_servo}、\texttt{ruckig}、\texttt{toppra} 配合 $\mathrm{SE}(3)$ 插值）完成，驱动变换那套“平移 + 两旋转”的特定分解已少见于新代码。但论\emph{理解力}，它有三重不可替代的教学价值：(1) 它是“\emph{在变换上插值}”的最清晰范例——把 $\mathbf D(r)=\mathbf T(r)\mathbf R_a(r)\mathbf R_o(r)$ 与现代“在\emph{采样点}上插值”并置，学生才看清“轨迹参数化”原来分\emph{几何变换层}与\emph{离散采样层}两个层次；(2) 它的\emph{有界加速度过渡}（\cref{der:at-dt-quartic}）用最朴素的“四次多项式 + 对称性”就实现了 jerk 受控的平滑过点，是 \cref{alg:at-ruckig} 的 S 曲线、\cref{sec:at-timeparam} 的 TOPP 之\emph{思想前身}；(3) 它对\emph{奇异}的诚实态度——Paul 明确指出笛卡尔（驱动变换）运动在奇异处“joint rates unbounded”、且\emph{事前无法预知}某段是否会爆速\cite{paul1981robot}，与本章 \cref{subsec:at-jointvstask} 的奇异陷阱、\cref{sec:at-cbf} 对反应式方法局限的诚实框定一以贯之。
+\end{insight}
+
+\begin{note}
+\textbf{驱动变换 $\to$ 现代 TOPP 的演进线索.}\;把三者放在一条时间轴上看：驱动变换（1981）在\emph{变换层}参数化、过渡靠\emph{固定 $t_{\mathrm{acc}}$ 的四次多项式}、加速度\emph{有界但非最优}；梯形/S 曲线（\cref{sec:at-trapezoidal}、\cref{alg:at-ruckig}）在\emph{单自由度廓线层}参数化、限值\emph{显式可验}；TOPP-RA（\cref{subsec:at-toppra}，2018）在\emph{路径参数 $s$ 层}参数化、用可控集递推把\emph{任意线性二阶约束（含力矩）贴边最优}。演进的主线是：约束从“有界”走向“最优”、参数化从“绑定特定几何分解”走向“接受任意路径 + 任意线性约束”。读懂驱动变换这一起点，方知现代 TOPP 之所以“贵”（要逆动力学、要 LP 递推）换来了什么——把 $\mathbf M(\mathbf q)$ 的位形相关性\emph{算进}了时序（\cref{sec:at-torque-topp}），这是 1981 年的有界加速度方案做不到的。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{规划期避障：位形空间、采样 vs 优化、关节体碰撞}
+\label{sec:at-collision-global}
+
+\paragraph{动机：避障在哪个空间做？}
+机械臂避障的第一个概念门槛是：障碍在\emph{笛卡尔}空间（三维世界里的桌子、墙），但规划在\emph{位形}空间 $\mathcal{C}$（关节角的 $n$ 维空间）里做。一个关节构型 $\mathbf{q}$ 要么让整条臂（所有连杆的几何体）无碰、要么有碰——它在 $\mathcal{C}$ 里对应一个\emph{点}，落在自由区 $\mathcal{C}_{\mathrm{free}}$ 或障碍区 $\mathcal{C}_{\mathrm{obs}}$。规划就是在 $\mathcal{C}_{\mathrm{free}}$ 里找一条连接起终点的曲线（\cref{sec:plan-cspace} 已建 $\mathcal{C}$ 的概念，本节落到臂、补关节体碰撞细节）。
+
+\begin{definition}[位形空间障碍]\label{def:at-cobs}
+设第 $j$ 个连杆在构型 $\mathbf{q}$ 下占据的工作空间体为 $\mathcal{A}_j(\mathbf{q})\subset\mathbb{R}^3$，障碍集为 $\mathcal{O}\subset\mathbb{R}^3$。位形空间障碍
+\begin{equation}
+  \mathcal{C}_{\mathrm{obs}}=\Big\{\mathbf{q}\in\mathcal{C}\ \Big|\ \big(\textstyle\bigcup_j\mathcal{A}_j(\mathbf{q})\big)\cap\mathcal{O}\neq\varnothing\ \text{或}\ \mathcal{A}_i(\mathbf{q})\cap\mathcal{A}_j(\mathbf{q})\neq\varnothing\ (\text{自碰})\Big\},
+  \label{eq:at-cobs}
+\end{equation}
+自由区 $\mathcal{C}_{\mathrm{free}}=\mathcal{C}\setminus\mathcal{C}_{\mathrm{obs}}$。注意 $\mathcal{C}_{\mathrm{obs}}$ 一般\emph{无解析形式}（FK 非线性、几何体复杂），只能\emph{逐点查询}（给定 $\mathbf{q}$，用碰撞检测库判 in/out）。
+\end{definition}
+
+\begin{pitfall}
+\textbf{关节体不是质点：碰撞检查必须用几何体而非末端点.}\;初学者常只检查\emph{末端}是否撞障碍，但整条臂的\emph{每个连杆}都可能撞——肘部撞桌沿、上臂扫到旁边的人。\cref{eq:at-cobs} 的并集 $\bigcup_j\mathcal{A}_j(\mathbf{q})$ 与自碰项都必须查。\texttt{arm\_dm} 工程里就因“点检查不够、网格有体积”栽过跟头：手调障碍盒位置时，路径中点处\emph{某连杆网格}总与障碍相交（点判合法、体判非法，返回 \texttt{GOAL\_STATE\_INVALID}）。修法是用碰撞检测 API（\texttt{/\allowbreak check\_state\_validity}）\emph{自动驱动}放置——沿候选 EE 路径扫描，取“起点与终点合法、但中点非法”的首个障碍位姿，而非手试（详见 \cref{ch:arm-prac}）。\textbf{教训}：多花一次验数据 $>$ 盲调尺寸；碰撞永远按几何体（凸包/网格）查，不按点查。
+\end{pitfall}
+
+\subsection{两层避障框架}
+\label{subsec:at-twolayer}
+
+\begin{table}[H]\centering\small
+\caption{规划期（global）与反应式（local）避障的分工}
+\label{tab:at-twolayer}
+\begin{tabular}{p{0.14\textwidth} p{0.38\textwidth} p{0.38\textwidth}}
+\toprule
+& 规划期 / global & 反应式 / local / online \\
+\midrule
+何时 & 执行\emph{前}搜整条无碰路径 & 执行\emph{中}每周期微调速度 \\
+谁 & OMPL（采样拒碰）/ CHOMP（障碍代价梯度） & MoveIt Servo / \textbf{CBF}（\cref{sec:at-cbf}）/ 冗余零空间 \\
+保证 & 全局（概率完备 / 局部最优） & 局部安全，不保证到目标 \\
+局限 & 障碍变了要重规划 & 可能陷局部、非全局最优 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+实务是\emph{两层叠加}：规划期出标称无碰路径（应对已知静态障碍），反应式兜底动态/未建模障碍（\cref{sec:at-cbf}）。本节讲规划期，\cref{sec:at-cbf} 讲反应式。
+
+\subsection{采样式 vs 优化式：概率完备 vs 局部最优}
+\label{subsec:at-sampling-vs-opt}
+
+规划期有两条互补的技术路线，二者在\emph{自由空间几乎等价、加障碍后分野}：
+
+\paragraph{采样式（sampling-based）：RRT / PRM。}
+在 $\mathcal{C}$ 里\emph{随机采样}构型、用碰撞检测拒掉落入 $\mathcal{C}_{\mathrm{obs}}$ 的点，增量地建一棵树（RRT，\cite{kuffner2000rrtconnect}）或一张图（PRM），直到连通起终点。其理论保证是\textbf{概率完备}：若解存在，找到它的概率随采样数趋于 $1$（\cite{karaman2011sampling} 进一步给出渐近最优变体 RRT$^*$）。优点是\emph{不需要}障碍的梯度/解析形式，只需一个“这点碰不碰”的布尔查询，故能处理任意复杂几何；缺点是路径\emph{曲折、有冗余动作}，需后处理平滑（短切 + 时间参数化）。
+
+\paragraph{优化式（optimization-based）：CHOMP。}
+从一条初始轨迹（常是直线插值）出发，沿\emph{障碍代价场}的协变梯度做下降，把轨迹\emph{推离}障碍并保持光滑（\cref{sec:plan-chomp} 已详述其协变梯度 $\mathbf{A}^{-1}\bar\nabla\mathcal{U}$）。优点是产出\emph{直接光滑}、可吃可微代价；缺点是\textbf{只保证局部最优}——若直线初值\emph{穿过}障碍而障碍距离场的梯度推不出去，就\emph{卡死}在局部极小。
+
+\begin{insight}
+\textbf{“障碍梯度的价值需有障碍才显”——一组实证.}\;\texttt{arm\_dm} 的对照（\cref{ch:arm-prac}）极清楚地展示了两条路线的分野：在\emph{自由空间}，OMPL（采样）与 CHOMP（优化）找到\emph{同一条测地线}（路径长 $2.762$，几乎一致）——无障碍时优化的梯度无事可做、采样的随机性也收敛到直线，二者等价。\emph{加一个障碍盒}后立刻分野：OMPL 成功绕行（$2/3$ 成功，路径长 $\to 3.184$ 即 $+15\%$、更曲），而 CHOMP \emph{$0/3$ 卡死}——直线初值穿过盒子，障碍梯度推不出局部最优（CHOMP 协变梯度的经典弱点）。\textbf{这不是 bug 而是诚实的算法局限}：缓解靠多随机重启 / 用采样解暖启动 / 更多迭代，但局部性是优化式的本质。结论：采样式与优化式互补——前者完备但曲折，后者光滑但易陷局部，工程上常\emph{级联}（采样给全局初值 $\to$ 优化局部平滑），与 \cref{sec:plan-minsnap} 末的级联流水线同理。
+\end{insight}
+
+\begin{note}
+\textbf{“失败是诚实结果，非 bug”的工程态度.}\;CHOMP 在穿障直线初值下 $0/3$ 失败，\emph{不应}被掩盖成“调一调就过”。如实记录“在此初值下局部最优卡死”，并指出缓解手段的边界（仍可能陷局部），是比“宣称全过”更可信、更有教学价值的做法。这种诚实框定的素养贯穿 \texttt{arm\_dm} 全工程（\cref{ch:arm-prac} 的方法论一节），也是本书吸收工程案例时坚持的原则。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{反应式避障：CBF 速度滤波}
+\label{sec:at-cbf}
+
+\paragraph{动机：执行中遇到未建模障碍怎么办？}
+规划期路径只能应对\emph{已知静态}障碍。执行中若冒出动态/未建模障碍，重新跑一遍全局规划太慢。更轻的办法是在标称控制指令上加一个\emph{最小修正}，使之即时避障——这就是\textbf{反应式（reactive）安全滤波}。控制屏障函数（CBF）给了它一个有形式化安全保证、且\emph{单约束下无需 QP}的闭式实现（\cref{sec:sm-cbf-game} 已在博弈/规划语境建立 CBF，本节落到臂的速度级、补单约束闭式投影与失败模式破解）。
+
+\subsection{安全集与速度级 CBF}
+\label{subsec:at-cbf-def}
+
+\begin{definition}[安全函数与安全集]\label{def:at-cbf-h}
+设末端到障碍球心 $\mathbf{p}_{\mathrm{obs}}$ 的距离裕度
+\begin{equation}
+  h(\mathbf{q})=\|\mathbf{p}_{\mathrm{ee}}(\mathbf{q})-\mathbf{p}_{\mathrm{obs}}\|-(r+\text{margin}),
+  \label{eq:at-cbf-h}
+\end{equation}
+$r$ 为障碍半径、margin 为安全余量。安全集 $\mathcal{S}=\{\mathbf{q}:h(\mathbf{q})\ge 0\}$。目标：让系统\emph{前向不变}地留在 $\mathcal{S}$ 内（一旦在内、永不出）。
+\end{definition}
+
+机械臂在速度级（resolved-rate）控制时，控制量是关节速度 $\dot{\mathbf{q}}$，系统是\emph{一阶}的 $\dot{\mathbf{q}}=\mathbf{u}$。CBF 的前向不变条件（一阶相对度）是：
+
+\begin{theorem}[速度级 CBF 条件\cite{singletary2021safety,ames2017cbf}]\label{thm:at-cbf-cond}
+若控制 $\dot{\mathbf{q}}$ 在每一时刻满足
+\begin{equation}
+  \dot h=\nabla h(\mathbf{q})^\top\dot{\mathbf{q}}\ \ge\ -\alpha\,h(\mathbf{q}),\qquad \alpha>0,
+  \label{eq:at-cbf-ineq}
+\end{equation}
+则安全集 $\mathcal{S}=\{h\ge 0\}$ 前向不变（即 $h$ 在边界 $h=0$ 处 $\dot h\ge 0$，不会变负）。其中
+\begin{equation}
+  \nabla h(\mathbf{q})=\mathbf{J}_p(\mathbf{q})^\top\,\frac{\mathbf{p}_{\mathrm{ee}}-\mathbf{p}_{\mathrm{obs}}}{\|\mathbf{p}_{\mathrm{ee}}-\mathbf{p}_{\mathrm{obs}}\|}\ \in\mathbb{R}^n,
+  \label{eq:at-cbf-grad}
+\end{equation}
+$\mathbf{J}_p$ 是\emph{位置雅可比}（末端位置对关节角，$\dot{\mathbf{p}}_{\mathrm{ee}}=\mathbf{J}_p\dot{\mathbf{q}}$，见 \cref{sec:ak-jacobian}）——把笛卡尔空间的距离梯度\emph{拉回}关节空间。本书把 $\nabla h$ 取为\emph{列}向量（故 $\dot h=\nabla h^\top\dot{\mathbf{q}}$，与 \cref{eq:at-cbf-ineq} 一致）。\footnote{等价地 $\nabla h^\top=(\hat{\mathbf d})^\top\mathbf{J}_p$ 为行向量；两种写法仅差一个转置，本章统一以列向量记 $\nabla h$，使 \cref{der:at-cbf-proj} 的投影方向 $\nabla h$ 直接为关节空间的列向量。}
+\end{theorem}
+
+\begin{derivation}[$\nabla h$ 的链式法则]\label{der:at-cbf-grad}
+$h=\|\mathbf{d}\|-(r+\text{m})$，$\mathbf{d}=\mathbf{p}_{\mathrm{ee}}(\mathbf{q})-\mathbf{p}_{\mathrm{obs}}$。先对笛卡尔位置求导：$\partial\|\mathbf{d}\|/\partial\mathbf{p}_{\mathrm{ee}}=\mathbf{d}^\top/\|\mathbf{d}\|$（单位方向，行向量）。再经 $\partial\mathbf{p}_{\mathrm{ee}}/\partial\mathbf{q}=\mathbf{J}_p$ 链式得行梯度 $(\mathbf{d}/\|\mathbf{d}\|)^\top\mathbf{J}_p$，转置为列梯度 $\nabla_{\mathbf{q}}h=\mathbf{J}_p^\top(\mathbf{d}/\|\mathbf{d}\|)$，即 \cref{eq:at-cbf-grad}。直觉：障碍排斥力沿“末端指向障碍外”的单位方向，经雅可比转置分配到各关节速度。\qed
+\end{derivation}
+
+\subsection{单约束闭式投影：无需 QP}
+\label{subsec:at-cbf-proj}
+
+一般 CBF 安全滤波是个 QP（在所有约束下找离标称最近的安全控制）。但\emph{单个}约束（一个障碍）时，QP 退化成\emph{一行闭式投影}：
+
+\begin{proposition}[单约束 CBF 闭式投影]\label{prop:at-cbf-proj}
+给定标称控制 $\dot{\mathbf{q}}_{\mathrm{nom}}$（如 resolved-rate $\dot{\mathbf{q}}_{\mathrm{nom}}=\mathbf{J}_p^{+}\,k(\mathbf{p}_{\mathrm{goal}}-\mathbf{p}_{\mathrm{ee}})$）。若它已满足 \cref{eq:at-cbf-ineq}，直接采用；否则把它\emph{最小修正}到约束边界上：
+\begin{equation}
+  \dot{\mathbf{q}}=
+  \begin{cases}
+    \dot{\mathbf{q}}_{\mathrm{nom}}, & \nabla h^\top\dot{\mathbf{q}}_{\mathrm{nom}}\ge -\alpha h,\\[4pt]
+    \dot{\mathbf{q}}_{\mathrm{nom}}+\dfrac{-\alpha h-\nabla h^\top\dot{\mathbf{q}}_{\mathrm{nom}}}{\|\nabla h\|^2}\,\nabla h, & \text{否则}.
+  \end{cases}
+  \label{eq:at-cbf-proj}
+\end{equation}
+\end{proposition}
+
+\begin{derivation}[闭式投影即 KKT 的解析解]\label{der:at-cbf-proj}
+违反时求 $\min_{\dot{\mathbf{q}}}\tfrac12\|\dot{\mathbf{q}}-\dot{\mathbf{q}}_{\mathrm{nom}}\|^2$ s.t. $\nabla h^\top\dot{\mathbf{q}}=-\alpha h$（约束取等号，因要最小修正且原指令在不安全侧）。拉格朗日 $\mathcal{L}=\tfrac12\|\dot{\mathbf{q}}-\dot{\mathbf{q}}_{\mathrm{nom}}\|^2+\mu(-\alpha h-\nabla h^\top\dot{\mathbf{q}})$，$\partial_{\dot{\mathbf{q}}}\mathcal{L}=\dot{\mathbf{q}}-\dot{\mathbf{q}}_{\mathrm{nom}}-\mu\nabla h=\mathbf{0}\Rightarrow\dot{\mathbf{q}}=\dot{\mathbf{q}}_{\mathrm{nom}}+\mu\nabla h$。代回约束解 $\mu$：$\nabla h^\top(\dot{\mathbf{q}}_{\mathrm{nom}}+\mu\nabla h)=-\alpha h\Rightarrow\mu=(-\alpha h-\nabla h^\top\dot{\mathbf{q}}_{\mathrm{nom}})/\|\nabla h\|^2$，代回即 \cref{eq:at-cbf-proj}。这是“把违反约束的标称指令，沿约束法向 $\nabla h$ 正交投影到约束超平面”——单约束下 QP 有解析解，\emph{无需调用 QP 求解器}。\qed
+\end{derivation}
+
+\begin{insight}
+\textbf{CBF 速度滤波的最小可教实现.}\;\cref{eq:at-cbf-proj} 是反应式避障最干净的形态：一个 $h(\mathbf{q})\ge 0$、它的梯度 $\nabla h$（用位置雅可比算）、一行投影——就能给\emph{任意}标称控制器套上形式化安全外壳。\texttt{arm\_dm} 实测（\cref{ch:arm-prac} 的 \cref{eq:ap-cbf-proj}）：纯标称 resolved-rate 冲向障碍后方目标时穿入障碍（min $h=-0.046$）；加 CBF 滤波后 $h$ 始终 $\ge 0$（min $h=+0.008$，安全）且仍到达目标（绕行）。它可叠加在 PD、阻抗、resolved-rate 等\emph{任意}标称控制之上，是与 P8 强化学习操作衔接的安全层——RL 策略给标称动作、CBF 兜安全。多障碍时 \cref{eq:at-cbf-proj} 升级为小 QP（多个 $\nabla h_i$ 约束），但单/少障碍的闭式形态已覆盖大量实务。
+\end{insight}
+
+\subsection{两个失败模式与破解}
+\label{subsec:at-cbf-fail}
+
+CBF 保证\emph{安全}，但不保证\emph{到达目标}——反应式方法的本质局限。\texttt{arm\_dm} 暴露并破解了两个典型失败模式，其破解\emph{比失败本身更可迁移}：
+
+\begin{pitfall}
+\textbf{失败模式一：死锁（deadlock）.}\;当障碍球\emph{正卡}在起点与目标的连线上（``sphere squarely between start and goal''），末端会\emph{贴}在障碍表面停滞——排斥（CBF）与吸引（标称到目标）正好沿同一直线相消，合速度为零。\textbf{破解}：把障碍中心沿\emph{垂直于路径}的方向偏置一点，$\mathbf{p}_{\mathrm{obs}}=\mathbf{p}_{\mathrm{start}}+0.13\,\mathbf{d}+0.04\,\mathbf{d}_\perp$（其中 $\mathbf{d}$ 是起点$\to$目标方向、$\mathbf{d}_\perp=\mathbf{d}\times\hat{\mathbf{z}}$ 是垂直方向），使排斥力有一个\emph{侧向}分量，末端便从一侧\emph{贴边绕过（skirt）}而非顶死。
+\end{pitfall}
+
+\begin{pitfall}
+\textbf{失败模式二：不可达（unreachable）.}\;目标设得太远、或落入障碍的``阴影''（被障碍挡在背面）时，标称吸引拉不到、或拉过去必穿障碍。\textbf{破解}：把目标放在\emph{障碍阴影之外且靠近}，$\mathbf{p}_{\mathrm{goal}}=\mathbf{p}_{\mathrm{start}}+0.25\,\mathbf{d}$（off the shadow, kept close）——保证可达、无奇异。\textbf{诊断技巧}：用\emph{标称}（无 CBF）轨迹是否到目标，来区分“是 CBF 把路堵了（死锁）”还是“目标本身不可达”——若标称都到不了，问题在目标设置而非滤波器。
+\end{pitfall}
+
+\begin{insight}
+\textbf{“死锁/不可达怎么破”比“死锁存在”更值钱.}\;教科书常止于“反应式方法可能死锁/陷局部”。但工程落地需要的是\emph{具体破解}：垂直偏置障碍解死锁、阴影外置目标解不可达、用标称轨迹做\emph{可达性 vs 滤波器}的归因诊断。这三招把抽象局限变成可操作的设计法则，是 \texttt{arm\_dm} 反应式避障能复现的关键工程细节（源 \texttt{m2\_cbf.py}）。\textbf{更深的教训}：反应式安全（CBF）只负责\emph{不碰}，到达目标要靠\emph{全局规划}（\cref{sec:at-collision-global}）给出无死锁的标称路径——两层缺一不可，这正是 \cref{tab:at-twolayer} 两层框架的存在理由。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{规控解耦的工程落地}
+\label{sec:at-decouple}
+
+\paragraph{动机：把前面所有环节接成一条产线。}
+前面建立了：规划期出无碰路径（\cref{sec:at-collision-global}）$\to$ 时间参数化配可行时序（\cref{sec:at-timeparam,sec:at-torque-topp}）$\to$ 执行期 CBF 兜底（\cref{sec:at-cbf}）。落地时一个关键架构决策是：\textbf{规划与控制解耦}——规划\emph{离线}、控制\emph{在线}，二者不同进程、靠一个\emph{轨迹文件}交接。
+
+\begin{definition}[规控解耦范式]\label{def:at-decouple}
+\textbf{离线规划}（如 MoveIt \texttt{move\_group}，走 position/mock 接口）产出关节路点序列（存为轨迹文件，如 \texttt{.npz}）；\textbf{在线控制}（如 \texttt{ros2\_control} 的力矩桥，走 effort 接口）加载该文件并逐点执行。二者通过\emph{轨迹文件}这一干净接口解耦，互不依赖对方的进程/时序/硬件接口。这正是工业主流的“MoveIt 规划 $\to$ \texttt{ros2\_control} 执行”范式。
+\end{definition}
+
+\begin{insight}
+\textbf{解耦的收益与边界.}\;解耦让规划（重、非实时、可用复杂优化）与控制（轻、硬实时、$\ge$ 数百 Hz）\emph{各跑各的硬约束}：规划器不必满足实时性，控制器不必懂避障几何，二者只需对齐\emph{轨迹文件的格式与坐标系}。\texttt{arm\_dm} 工程的全栈会话即此架构——Phase 0 离线 MoveIt 规划存 \texttt{npz}，Phase A/B/C 在线力矩控制加载执行（\cref{ch:arm-prac}）。\textbf{边界}：解耦假定\emph{执行期环境不变}（标称路径仍无碰），故必须叠加反应式层（\cref{sec:at-cbf}）兜动态障碍；若环境高度动态、需边走边改形状，则解耦失效，要走在线重规划（\cref{ch:mppi} 的采样 MPC）或时空联合优化（\cref{ch:st-trajopt}）。\textbf{选择法则}：静态/半静态环境用解耦（简单、可靠、可复用成熟规划器）；强动态环境用在线优化。
+\end{insight}
+
+本章把规划部的轨迹优化思想落到了串联臂，并补齐了时间参数化与反应式避障两块。所产出的\emph{可执行轨迹}与\emph{安全速度指令}，下一步要交给控制器精确跟踪——计算力矩跟踪、操作空间控制、阻抗/力位混合——这是 \cref{ch:arm-ctrl} 的主题；而把规划、轨迹、控制接成一条真机连续会话的全栈实践，见 \cref{ch:arm-prac}。
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+
+\begin{description}
+  \item[“规划器给出路径就能直接执行。”] 错。路径 $\mathbf{q}(s)$ 无时间信息，直接等间隔执行会超速/超力矩/jerk 无穷（\cref{sec:at-path-vs-traj}）。必须经时间参数化得到 $\mathbf{q}(t)$。
+  \item[“限加速度等价于限力矩。”] 错。力矩 $=\mathbf{M}(\mathbf{q})\ddot{\mathbf{q}}+\dots$，$\mathbf{M}(\mathbf{q})$ 位形相关——固定加速度盒既可能超力矩（不安全）又可能浪费驱动力（\cref{sec:at-torque-topp}）。
+  \item[“TOTG、TOPP-RA、Ruckig 是同一类东西，随便用哪个。”] 错。TOTG/TOPP-RA 路径跟随、jerk 无界、离线；Ruckig 到点、jerk 有界、在线；只有 TOPP-RA 能吃力矩约束（\cref{tab:at-trio}）。
+  \item[“B 样条和分段多项式是两种不同的曲线。”] 不准确。它们是同一曲线族的\emph{两种坐标}（系数 vs 控制点），经线性映射互换；选哪种作决策变量是数值/约束的权衡（\cref{subsec:at-bspline}）。
+  \item[“在任务空间画直线总是更好。”] 错。任务空间插值会撞奇异（IK 病态、关节速度爆炸），除非作业要求末端特定几何，否则优先关节空间插值（\cref{subsec:at-jointvstask}）。
+  \item[“避障只需检查末端不碰障碍。”] 错。整条臂每个连杆都可能碰，还有自碰——碰撞必须按几何体查、不按点查（\cref{eq:at-cobs}）。
+  \item[“CHOMP 比采样法先进，应当首选。”] 不全对。自由空间二者等价；加障碍后 CHOMP 易陷局部最优卡死，采样法概率完备但路径曲折——二者互补、常级联（\cref{subsec:at-sampling-vs-opt}）。
+  \item[“CBF 保证机器人到达目标。”] 错。CBF 只保证\emph{安全}（不碰），可能死锁/不可达；到达目标要靠全局规划给无死锁的标称路径（\cref{subsec:at-cbf-fail}）。
+  \item[“反应式避障必须解 QP。”] 错。单约束（单障碍）时退化成一行闭式投影 \cref{eq:at-cbf-proj}，无需 QP 求解器。
+\end{description}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\addcontentsline{toc}{section}{小结}
+
+本章把 P3 规划部的轨迹优化思想落到定基串联臂，建立了“path $\to$ trajectory $\to$ 安全执行”的完整链路。核心要点：
+\begin{enumerate}
+  \item \textbf{path $\ne$ trajectory}：路径是几何（无时间），轨迹是路径 + 时间律；二者分离是规控流水线的核心架构（\cref{sec:at-path-vs-traj}）。
+  \item \textbf{表示与参数优化}：五次多项式（min-jerk 的变分必然，\cref{thm:at-minjerk-quintic}）/B 样条承载轨迹；以段时长为决策的参数优化有闭式最优分配 $T_s\propto a_s^{1/6}$（\cref{thm:at-allocate}），数值解应收敛到它。
+  \item \textbf{时间参数化三件套}：TOTG（速度+加速度、bang-bang）、TOPP-RA（可吃力矩、可达集递推）、Ruckig（jerk 有界、在线）定位互补（\cref{tab:at-trio}）。
+  \item \textbf{力矩约束 TOPP-RA}：因 $\mathbf{M}(\mathbf{q})$ 位形相关，力矩感知时序\emph{必须}走逆动力学；比加速度盒既更安全又更省（实测快 $4.6\times$、力矩精确贴满），但需注意离散守约束陷阱（\cref{sec:at-torque-topp}）。
+  \item \textbf{避障两层}：规划期（采样概率完备 vs 优化局部最优，关节体碰撞）+ 反应式（CBF 速度滤波，单约束闭式投影 + 死锁/不可达破解）（\cref{sec:at-collision-global,sec:at-cbf}）。
+  \item \textbf{规控解耦}：离线规划 $\to$ 在线执行、靠轨迹文件交接，静态环境主流（\cref{sec:at-decouple}）。
+\end{enumerate}
+
+\subsection*{符号表}
+\begin{longtable}{p{0.22\textwidth} p{0.72\textwidth}}
+\toprule
+符号 & 含义 \\
+\midrule
+\endhead
+$\mathbf{q}(s)$ / $\mathbf{q}(t)$ & 路径（几何，路径参数 $s\in[0,1]$）/ 轨迹（含时间 $t$） \\
+$s(t),\ \dot s,\ \ddot s,\ \dddot s$ & 时间律及其导数；$\dot s$ 控制速度幅度 \\
+$\mathbf{q}',\mathbf{q}'',\dots$ & 路径对 $s$ 的几何导数（$(\cdot)'=\mathrm{d}/\mathrm{d}s$） \\
+$T_s,\ \Delta_s$ & 第 $s$ 段的时长 / 位移 \\
+$V_{\max},A_{\max},J_{\max}$ & 速度/加速度/jerk 限 \\
+$\boldsymbol{\tau}_{\max}$ & 关节力矩限（\texttt{arm\_dm}：$\pm 26\,\mathrm{N\!\cdot\! m}$） \\
+$\mathbf{M}(\mathbf{q}),\mathbf{C}(\mathbf{q},\dot{\mathbf{q}}),\mathbf{g}(\mathbf{q})$ & 质量阵 / 科氏离心 / 重力（动力学 \cref{eq:at-dyn}，详见 \cref{ch:arm-dyn}） \\
+$x=\dot s^2,\ u=\ddot s$ & TOPP-RA 状态（平方路径速度）/ 控制（路径加速度） \\
+$\mathbf{a}(s),\mathbf{b}(s),\mathbf{c}(s)$ & TOPP-RA 约束 \cref{eq:at-topp-lin} 的系数（由几何 + 模型求值） \\
+$\mathcal{K}_i,\mathcal{L}_i$ & 第 $i$ 栅格点的可控集 / 可达集（一维区间） \\
+$\mathcal{C},\mathcal{C}_{\mathrm{free}},\mathcal{C}_{\mathrm{obs}}$ & 位形空间 / 自由区 / 障碍区 \\
+$\mathcal{A}_j(\mathbf{q})$ & 第 $j$ 连杆在构型 $\mathbf{q}$ 下占据的工作空间体 \\
+$h(\mathbf{q}),\ \nabla h,\ \alpha$ & CBF 安全函数 / 其关节空间梯度 / 类-$\mathcal{K}$ 增益 \\
+$\mathbf{J}_p(\mathbf{q})$ & 位置雅可比（$\dot{\mathbf{p}}_{\mathrm{ee}}=\mathbf{J}_p\dot{\mathbf{q}}$，详见 \cref{sec:ak-jacobian}） \\
+$\dot{\mathbf{q}}_{\mathrm{nom}}$ & 标称速度指令（如 resolved-rate） \\
+\bottomrule
+\end{longtable}
+
+\subsection*{定理 / 命题速查}
+\begin{longtable}{p{0.28\textwidth} p{0.66\textwidth}}
+\toprule
+结论 & 速记 \\
+\midrule
+\endhead
+路径/轨迹关系（\cref{eq:at-chain}） & $\dot{\mathbf{q}}=\mathbf{q}'\dot s,\ \ddot{\mathbf{q}}=\mathbf{q}''\dot s^2+\mathbf{q}'\ddot s$；速度/加速度幅度由时间律定 \\
+min-jerk = 五次（\cref{thm:at-minjerk-quintic}） & $q^{(6)}=0\Rightarrow$ 五次多项式（变分必然） \\
+峰值系数（\cref{prop:at-peaks}） & $1.875,\ 5.7735,\ 60$（速度/加速度/jerk 峰 $\propto|\Delta|/T^{1,2,3}$） \\
+最优时间分配（\cref{thm:at-allocate}） & $T_s\propto a_s^{1/6}=|\Delta_s|^{1/3}$；jerk 代价 $J_s=720\Delta_s^2/T_s^5$ \\
+TOPP-RA 线性化（\cref{eq:at-topp-xrel}） & $x=\dot s^2\Rightarrow x'=2u$；约束 $\mathbf{a}u+\mathbf{b}x+\mathbf{c}\le\mathbf{0}$ \\
+力矩约束（\cref{eq:at-torque-con}） & 把 RNEA 当约束算子；力矩感知时序必走逆动力学 \\
+速度级 CBF（\cref{thm:at-cbf-cond}） & $\nabla h^\top\dot{\mathbf{q}}\ge-\alpha h$，$\nabla h=\mathbf{J}_p^\top\hat{\mathbf{d}}$ \\
+单约束闭式投影（\cref{prop:at-cbf-proj}） & $\dot{\mathbf{q}}=\dot{\mathbf{q}}_{\mathrm{nom}}+\frac{-\alpha h-\nabla h^\top\dot{\mathbf{q}}_{\mathrm{nom}}}{\|\nabla h\|^2}\nabla h$ \\
+\bottomrule
+\end{longtable}
+
+\subsection*{难度分层}
+\begin{itemize}
+  \item \textbf{基础}（$\star$）：\cref{sec:at-path-vs-traj}（path$\ne$traj）、\cref{sec:at-repr}（轨迹表示）、\cref{subsec:at-twolayer}（两层框架）。
+  \item \textbf{进阶}（$\star\star$）：\cref{sec:at-paramopt}（参数优化闭式）、\cref{subsec:at-trio,subsec:at-totg,subsec:at-ruckig}（三件套对比与 TOTG/Ruckig）、\cref{subsec:at-sampling-vs-opt}（采样 vs 优化）、\cref{sec:at-cbf}（CBF 速度滤波）。
+  \item \textbf{选读}（$\star\star\star$）：\cref{subsec:at-toppra}（TOPP-RA 可达集递推内核）、\cref{sec:at-torque-topp}（力矩约束 TOPP-RA 与离散守约束陷阱）。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+
+\begin{itemize}
+  \item \textbf{时间最优路径参数化}：Pham 2018\cite{pham2018toppra} 的 TOPP-RA 原文给出可达/可控集递推的完整推导与凸性分析、参数不确定性鲁棒化；Kunz--Stilman 2012\cite{kunz2012totg} 的圆弧倒角 + 一维 bang-bang 是 MoveIt 默认平滑器的来源。
+  \item \textbf{在线轨迹生成}：Berscheid--Kröger 2021\cite{berscheid2021ruckig} 的 Ruckig 给出任意目标态（含非零加速度）的七段 S 曲线时间最优解析解与多自由度同步。
+  \item \textbf{轨迹表示与样条}：Biagiotti--Melchiorri\cite{biagiotti2008trajectory} 系统讲述多项式/样条/S 曲线轨迹与 Cox--de Boor 递推。
+  \item \textbf{规划期避障}：采样式见 RRT-Connect\cite{kuffner2000rrtconnect}、RRT$^*$ 渐近最优\cite{karaman2011sampling}；优化式见 CHOMP\cite{zucker2013chomp} 与本书 \cref{sec:plan-chomp,sec:plan-minsnap}。
+  \item \textbf{控制屏障函数}：Ames 等 2017\cite{ames2017cbf}、2019\cite{ames2019cbf} 的 CBF-QP 框架；Singletary 等\cite{singletary2021safety} 的运动学（速度级）安全控制；本书 \cref{sec:sm-cbf-game} 给出博弈/规划语境的 CBF。
+  \item \textbf{工程实现}：Pinocchio\cite{carpentier2019pinocchio} 提供 RNEA 逆动力学（力矩约束 TOPP-RA 的约束算子）；MoveIt + \texttt{ros2\_control} 是规控解耦的主流栈（\cref{ch:arm-prac}）。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{后续关系}
+\addcontentsline{toc}{section}{后续关系}
+
+\begin{itemize}
+  \item \textbf{上承}：\cref{ch:planning}（运动规划总框架、C-space、CHOMP、min-snap）、\cref{ch:st-trajopt}（时空联合优化、MINCO）、\cref{sec:sm-cbf-game}（CBF 安全滤波）；本部 \cref{ch:arm-dyn}（动力学与 RNEA）、\cref{ch:arm-kin}（雅可比）；\cref{ch:nlopt}（带约束优化）。
+  \item \textbf{下接}：本章产出的可执行轨迹与安全速度指令交给 \cref{ch:arm-ctrl}（机械臂控制）精确跟踪——尤其计算力矩跟踪用本章的 $\ddot{\mathbf{q}}_d$ 前馈、力位混合用本章的任务空间轨迹；\cref{ch:arm-prac}（全栈实践）把规划$\to$轨迹$\to$控制接成真机连续会话。
+  \item \textbf{启下到强化学习}：本章的 CBF 速度滤波（\cref{sec:at-cbf}）是 P8 强化学习操作（\cref{ch:rlmc-manip}）的安全层——RL 策略给标称动作、CBF 兜安全；本章的 path/trajectory 区分也是理解 RL“动作空间”（位置 vs 速度 vs 力矩）的前置。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查}
+\addcontentsline{toc}{section}{故障排查}
+
+\begin{table}[H]\centering\small
+\caption{机械臂轨迹生成与避障：现象 $\to$ 根因 $\to$ 处置}
+\label{tab:at-troubleshoot}
+\begin{tabularx}{\linewidth}{p{0.27\textwidth} L L}
+\toprule
+现象 & 可能根因 & 处置 \\
+\midrule
+执行时电机饱和 / 跟踪发散 & 时间律违反限速/限力矩；用了固定加速度盒在惯量大位形超力矩 & 改力矩约束 TOPP-RA（\cref{sec:at-torque-topp}）；按真力矩限配时序 \\
+关节有冲击 / 减速器异响 & jerk 无界（bang-bang 时序或三次拼接、拐点 $\ddot s$ 跳变） & 改 Ruckig（jerk 有界 S 曲线）或五次多项式（\cref{subsec:at-quintic,subsec:at-ruckig}） \\
+力矩“纸面守约束”但真机越界 $\sim 6\%$ & TOPP-RA 稀疏栅格 + 配点重构，栅格间 $\mathbf{M}(\mathbf{q})$ 在变 & \texttt{Interpolation} 重构 + 加密到 $\sim 401$ 栅格，验真实峰值（\cref{sec:at-torque-topp}） \\
+任务空间直线趋近时关节飞掉 & 路径经奇异，IK 关节速度爆炸 & 关节空间趋近，仅接触相用任务空间（\cref{subsec:at-jointvstask}） \\
+某构型规划报 \texttt{STATE\_INVALID} 但末端看似无碰 & 按点查碰撞、漏了连杆几何体/自碰 & 按几何体查（\cref{eq:at-cobs}），\texttt{check\_state\_validity} 自动驱动放置 \\
+CHOMP 加障碍后 $0/N$ 卡死 & 直线初值穿障，障碍梯度推不出局部最优 & 采样法暖启动 / 多随机重启；接受其为诚实局限（\cref{subsec:at-sampling-vs-opt}） \\
+CBF 避障时末端贴障碍停滞 & 死锁：障碍正卡在起点$\to$目标连线上 & 障碍中心沿垂直路径方向偏置，使末端 skirt 绕过（\cref{subsec:at-cbf-fail}） \\
+CBF 避障到不了目标 & 不可达：目标太远或落入障碍阴影 & 目标置于阴影外且靠近；用标称轨迹归因（\cref{subsec:at-cbf-fail}） \\
+参数优化“跑通”但时间分配明显次优 & 只调库未验内核，可能困在局部/约束设错 & 与闭式 $T_s\propto a_s^{1/6}$ 对比，应吻合（\cref{thm:at-allocate}） \\
+\bottomrule
+\end{tabularx}
+\end{table}

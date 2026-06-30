@@ -1,0 +1,1755 @@
+\chapter{视觉惯性里程计 VIO}
+\label{ch:vio}
+
+% ════════════════════════════════════════════════════════════════
+%  本章：吸收 SLAM Handbook ch11（惯性里程计：预积分 + 可观性）
+%  + VINS-Mono(qin2018vins) 全文（优化主线：滑窗紧耦合 + 边缘化 + 初始化 + 回环）
+%  + MSCKF(mourikis2007msckf) 全推导（滤波主线：零空间投影 + QR 压缩）
+%  + Forster(forster2017preintegration) 流形预积分（右雅可比解析式）
+%  + Huang(huang2019vins) 可观性综述（4 维不可观 + 退化运动 + 滤波/优化对比）
+%  自包含、全吸收、右扰动为主、Hamilton 四元数。教学层遵循 v5.0 算法工程教学规范。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 一个单目相机在静止时开机，能不能恢复出环境的\emph{度量尺度}（真实米数）？如果不能，缺了什么？
+  \item IMU 以 $200\,$Hz 输出，相机以 $20\,$Hz 输出。若把每个 IMU 采样都当成因子图里的一个状态，会发生什么？有没有办法把两图像帧之间的几百条 IMU 测量\emph{压缩}成一条约束？
+  \item 把相机和 IMU 融合，有人用扩展卡尔曼滤波（EKF），有人用滑动窗口的非线性优化（BA）。这两条路线的根本区别是什么？谁更准、谁更省？
+  \item 在滑窗优化里，最旧的关键帧要被丢掉以保持计算量恒定。直接删掉它会损失它携带的信息；如何\emph{不损失信息}地把它移出窗口？
+  \item 单目 VIO 长时间运行后，轨迹会漂移。漂移发生在哪几个自由度上？为什么不是全部 $6$ 个？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清} VIO 要解决的问题、松耦合与紧耦合的分界，以及单目视觉惯性系统相对纯视觉的根本增益（尺度 + roll/pitch 可观）；
+  \item \textbf{独立推导} IMU 预积分：从运动学积分到流形上的相对运动增量、噪声协方差线性传播、偏置一阶修正，并写出预积分因子残差（Forster 与 VINS 两套等价写法）；
+  \item \textbf{分析} VIO 的可观性：导出线性化测量模型，给出一般运动下 $4$ 维不可观零空间（全局位置 $+$ yaw）的显式结构，并枚举退化运动；
+  \item \textbf{完整推导优化主线}（VINS-Mono）：滑窗紧耦合视觉惯性 BA 的状态向量与残差、用 Schur 补做边缘化生成先验、以及 FEJ 一致性修正；
+  \item \textbf{完整推导滤波主线}（MSCKF）：状态增广（stochastic cloning）、多状态约束测量模型、零空间投影、QR 压缩后的 EKF 更新；
+  \item \textbf{对比}两条主线（再线性化、复杂度、一致性）并理解二者零空间投影的同源性；
+  \item \textbf{实现} VIO 的初始化：纯视觉 SfM 自举 $\to$ 陀螺偏置标定 $\to$ 速度/重力/尺度线性求解 $\to$ 重力精化；
+  \item \textbf{诊断} VIO 的常见故障（初始化失败、尺度漂移、滤波不一致、时间不同步）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把高频 IMU 与低频相机融成一个低延迟、度量级、可观的位姿估计器}”的主线。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (prob) {VIO 问题\\ 松/紧耦合};
+\node[blk, right=of prob] (pre) {IMU 预积分\\ 因子 $\Delta\mathbf{R},\Delta\mathbf{v},\Delta\mathbf{p}$};
+\node[blk, right=of pre] (obs) {可观性\\ 4 维零空间};
+\node[grp, below=8mm of prob] (init) {初始化\\ SfM$\to$对齐};
+\node[grp, right=of init] (opt) {优化主线\\ VINS 滑窗$+$边缘化};
+\node[grp, right=of opt] (filt) {滤波主线\\ MSCKF};
+\node[blk, below=8mm of opt, fill=third!8, draw=third!60!black] (cmp) {两线对比\\ 零空间同源 · FEJ};
+\draw[ln] (prob)--(pre); \draw[ln] (pre)--(obs);
+\draw[ln] (pre.south) -- ++(0,-4mm) -| (init.north);
+\draw[ln] (init)--(opt); \draw[ln] (opt)--(filt);
+\draw[ln] (opt.south)--(cmp.north); \draw[ln] (filt.south) |- (cmp.east);
+\draw[ln] (obs.south) -- ++(0,-4mm) -| (filt.north);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:vio-problem}（问题与耦合）与 \cref{sec:vio-preint}（预积分）是任何读者的骨干，VIO 的两条主线都建立在预积分之上；\cref{sec:vio-obs}（可观性）解释 VIO 为何只漂移 $4$ 自由度、为何不能静止起步，是理解初始化与一致性的钥匙；\cref{sec:vio-opt}（VINS 优化主线）与 \cref{sec:vio-msckf}（MSCKF 滤波主线）是本章两大重头，可按兴趣先读其一；\cref{sec:vio-compare}（对比）把两者放回同一数学框架；\cref{sec:vio-init}（初始化）面向工程落地。带 $\bigstar\bigstar\bigstar\bigstar$ 的 FEJ 与零空间投影为进阶。
+
+\subsection*{前置知识桥接}
+本章把前面几章的工具拧成一股绳，引用前先各用两三句激活：
+\begin{itemize}
+  \item \cref{ch:lie}（李群）：旋转 $\mathbf{R}\in\SO(3)$ 不是向量空间，更新要写成右乘指数 $\mathbf{R}\leftarrow\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\phi})$；右雅可比 $\mathbf{J}_r(\boldsymbol{\phi})$ 把“指数对加法的扰动”线性化。预积分把一串小旋转连乘，正是这套工具的密集应用。
+  \item \cref{ch:imu}（IMU 模型）：加速度计测“比力”$\mathbf{a}=\mathbf{R}^\top(\mathbf{a}^w-\mathbf{g}^w)+\mathbf{b}^a+\boldsymbol{\eta}^a$、陀螺测角速度 $\boldsymbol{\omega}=\boldsymbol{\omega}^b+\mathbf{b}^g+\boldsymbol{\eta}^g$，偏置 $\mathbf{b}$ 服从随机游走。本章把这两条测量模型沿时间积分。
+  \item \cref{ch:vo}（视觉里程计）：重投影误差 $\mathbf{z}-\pi(\mathbf{T}\mathbf{p})$、对极几何、PnP、三角化、束调整（BA）的 Schur 补稀疏求解。VIO 的视觉因子就是带 IMU 约束的 BA。
+  \item \cref{ch:nlopt}（非线性优化）：高斯--牛顿/LM、马氏范数 $\|\mathbf{r}\|^2_{\boldsymbol{\Sigma}}=\mathbf{r}^\top\boldsymbol{\Sigma}^{-1}\mathbf{r}$、信息矩阵 $\boldsymbol{\Lambda}=\boldsymbol{\Sigma}^{-1}$、Huber 鲁棒核。边缘化的 Schur 补就在这套正规方程里做。
+  \item \cref{ch:eskf}（误差状态卡尔曼）：EKF 的传播--更新、误差状态线性化、Joseph 形式协方差更新。MSCKF 就是一种特殊结构的 EKF。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你能写纯视觉 BA，却不知道为什么单目 SLAM 的轨迹\emph{尺度会缓慢漂移、且无法从静止启动}——加一颗 IMU 就能治，但不懂可观性就不知道该怎么加、何时会失败；
+  \item 你照抄了 VINS-Mono 或 OpenVINS 的代码，遇到“边缘化后协方差越来越小、轨迹却越来越偏”时无从下手——那是 FEJ 一致性问题，不读 \cref{sec:vio-opt}、\cref{sec:vio-compare} 就只能瞎调参数。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含两条主线全部推导与练习） & 7--9 小时 & 首次系统学习、要做 VIO 后端 \\
+速读（跳过协方差闭式与零空间细节） & 3 小时 & 有滤波/优化基础、想对齐记号 \\
+速查（只看小结的符号表 $+$ 速查表 $+$ API） & 20 分钟 & 写代码时回来查公式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+旋转矩阵记 $\mathbf{R}\in\SO(3)$，位姿 $\mathbf{T}\in\SE(3)$；下标语义 $\mathbf{R}^w_b$（$=\mathbf{R}_{wb}$）把 body 系坐标映到 world 系，$\mathbf{R}^b_w=(\mathbf{R}^w_b)^\top$。
+四元数取 \textbf{Hamilton} 约定（与 Eigen、VINS-Mono 一致），$\otimes$ 为 Hamilton 乘法；引用 MSCKF 的 JPL 约定处显式转换。
+\textbf{扰动以右扰动为主}：$\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\phi})$，右雅可比 $\mathbf{J}_r$ 为主；四元数右乘小扰动 $\mathbf{q}\otimes[1,\tfrac12\delta\boldsymbol{\theta}^\top]^\top$ 与之等价（$\delta\boldsymbol{\theta}\equiv\delta\boldsymbol{\phi}$）。引用 MSCKF 的 JPL 左扰动处并列给出转换。
+IMU 偏置记 $\mathbf{b}^g$（陀螺）、$\mathbf{b}^a$（加速度计），上标 $g/a$ 指\emph{传感器}而非坐标系。
+噪声协方差 $\boldsymbol{\Sigma}$，信息矩阵 $\boldsymbol{\Lambda}=\boldsymbol{\Sigma}^{-1}$；先验记 $\check{(\cdot)}$、后验记 $\hat{(\cdot)}$；预积分测量带 $\tilde{(\cdot)}$ 或 $\hat{(\cdot)}$。
+$\se(3)$ 坐标排序 $\boldsymbol{\xi}=[\boldsymbol{\rho};\boldsymbol{\phi}]$（平移在前，$\boldsymbol{\rho}\neq\mathbf{t}$）。公式、图、表按章编号。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{VIO 问题与松/紧耦合}
+\label{sec:vio-problem}
+
+\paragraph{动机：相机与 IMU 的互补。}
+相机和 IMU 是机器人状态估计里最受欢迎的传感器组合，因为它们\emph{廉价、轻、低功耗}，更因为它们的失效模式\emph{互补}\cite{carlone2026handbook,qin2018vins}。相机提供丰富的环境观测，能在缓慢运动下提供几乎无漂移的相对约束，但在快速运动、运动模糊、光照突变、无纹理处会跟踪失败；IMU 以高频（典型 $200$--$1000\,$Hz）输出加速度与角速度，能完美桥接相机的短暂失明，但其测量经过两次积分后误差迅速发散。把两者融合得到的系统通常称为\textbf{视觉惯性里程计}（Visual-Inertial Odometry, VIO）；若再加回环检测与全局优化，则称\textbf{视觉惯性 SLAM}。
+
+\paragraph{反面：只有相机，或只有 IMU，会怎样。}
+\emph{只有单目相机}：纯视觉 SfM/VO 在没有任何先验时\textbf{无法确定场景的度量尺度}——你看到的轨迹与地图只在“相差一个未知缩放因子”的意义下正确（\cref{ch:vo} 的对极几何只给出上尺度平移）。\emph{只有 IMU}：朴素地把加速度计读数减去重力再两次积分，位置误差以时间的\emph{三次方}增长（偏置项），数秒内即不可用。VIO 的核心价值正在于：相机压住 IMU 的积分漂移，IMU 又恢复相机缺失的度量尺度，并让重力方向（roll、pitch）变得可观（\cref{sec:vio-obs} 严格证明）。
+
+\begin{insight}
+单目 VIO 不是“相机为主、IMU 锦上添花”，也不是反过来。它是一个\textbf{两者缺一不可}的最小度量级 $6$ 自由度传感器套件：去掉 IMU 丢尺度与重力方向，去掉相机丢长期约束。这种“互补到彼此都不可或缺”的耦合，是 VIO 区别于松散传感器堆叠的本质。
+\end{insight}
+
+\paragraph{历史：从松耦合到紧耦合，从滤波到优化。}
+早期视觉惯性融合多为\emph{松耦合}\cite{huang2019vins}：把视觉当成一个黑盒输出位姿，IMU 在 EKF 里做状态传播、视觉位姿做更新。后来人们意识到，在\emph{原始测量层面}联合两类传感器（紧耦合）能保留更多信息、显著提高精度。紧耦合又沿两条技术路线发展：基于滤波（EKF，代表是 $2007$ 年 Mourikis \& Roumeliotis 的 MSCKF\cite{mourikis2007msckf}）与基于图优化/BA（代表是 OKVIS、$2018$ 年 Qin 等的 VINS-Mono\cite{qin2018vins}）。本章把这两条主线都完整推导一遍并对比。
+
+\paragraph{延迟约束：为什么不能简单地 full BA。}
+VIO 常作为闭环控制或 AR 显示的状态来源，必须产生\textbf{极低延迟}估计（典型 $10$--$50\,$ms）\cite{carlone2026handbook}。例如 Meta Quest 3 刷新率 $72$--$120\,$Hz，VIO 延迟直接影响 VR 体验、是缓解晕动症的关键；轨迹跟踪若延迟过大，控制器会不稳定甚至发散。这条硬约束正是 VIO 不能像离线 SfM 那样把所有历史状态一起 full BA、而必须用\emph{有界滑窗 $+$ 边缘化}（优化主线）或\emph{有界状态滤波}（滤波主线）的根本原因。
+
+\subsection{松耦合与紧耦合}
+\label{sec:vio-coupling}
+
+\begin{definition}[松耦合与紧耦合]\label{def:vio-coupling}
+设视觉测量为 $\mathcal{Z}_C$、惯性测量为 $\mathcal{Z}_I$。
+\begin{itemize}
+  \item \textbf{松耦合}（loosely-coupled）：先\emph{分别}处理两类测量，从 $\mathcal{Z}_C$ 用纯视觉 SfM/VO 得到位姿约束、从 $\mathcal{Z}_I$ 得到惯性约束，再融合这两个\emph{已加工}的约束（常用 EKF：IMU 传播、视觉位姿更新）。
+  \item \textbf{紧耦合}（tightly-coupled）：在\emph{单一}估计过程内直接融合\emph{原始}视觉与惯性测量（如把重投影误差与预积分因子放进同一个 BA，或放进同一个 EKF 的测量更新）。
+\end{itemize}
+\end{definition}
+
+松耦合计算高效、模块清晰，但\emph{解耦}视觉与惯性约束会损失信息\cite{huang2019vins}：纯视觉那一步把图像压成了一个位姿（丢掉了单个特征的不确定度结构），IMU 那一步又无从修正视觉的尺度。紧耦合保留原始测量间的全部交叉信息，精度更高，代价是状态空间更大、求解更复杂。MSCKF、OKVIS、VINS-Mono 的主体都是紧耦合。
+
+\begin{insight}
+一个实用的工程组合（VINS-Mono 即如此）是：\textbf{初始化阶段用松耦合}（先纯视觉 SfM 得到良好初值，再与 IMU 对齐恢复尺度/重力/速度，见 \cref{sec:vio-init}），\textbf{稳态运行用紧耦合}（联合优化 IMU 与视觉残差，见 \cref{sec:vio-opt}）。松耦合的鲁棒自举 $+$ 紧耦合的高精度，各取所长。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{视觉惯性融合的两个分类轴（合并自\cite{huang2019vins,qin2018vins}）}
+\label{tab:vio-taxonomy}
+\begin{tabular}{lll}
+\toprule
+分类轴 & 取值 & 一句话 \\
+\midrule
+耦合层级 & 松耦合 & 视觉先成位姿再融合，省但丢信息 \\
+         & 紧耦合 & 原始测量层联合，准但复杂 \\
+求解范式 & 滤波（EKF） & 复杂度随特征数\emph{线性}，测量一次性线性化 \\
+         & 优化（BA） & 可\emph{重线性化}，更准但更贵 \\
+视觉残差 & 间接法 & 最小化几何重投影误差（VINS、MSCKF、OKVIS） \\
+         & 直接法 & 最小化光度误差（DSO-VI），吸引域小、需好初值 \\
+是否建图 & VIO & 不把特征长期放入状态，里程计、误差可能无界 \\
+         & VI-SLAM & 特征入状态、可回环、误差有界但更贵 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[概念误区：“紧耦合一定比松耦合好，所以松耦合没用”]
+\textbf{错误描述}：初学者读到“紧耦合精度更高”，就认为松耦合是过时方案、应一律弃用。
+\textbf{现象/后果}：在初始化阶段强行紧耦合，因为没有好初值，高度非线性的联合优化常常陷入局部极小或直接发散。
+\textbf{根本原因}：紧耦合的高精度建立在\emph{良好初值}之上；冷启动时尺度、重力、速度都未知，紧耦合的代价函数地形极差。松耦合的纯视觉 SfM 恰恰有“相对运动法可自举”的好性质，能提供这个初值。
+\textbf{正确做法}：分阶段——冷启动/失败恢复用松耦合自举（\cref{sec:vio-init}），稳态用紧耦合精化。两者是流水线上的不同环节，不是二选一。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 解释为什么“纯 IMU 两次积分”的位置误差随时间以三次方增长（提示：把偏置 $\mathbf{b}^a$ 当常量，写出位置关于 $\mathbf{b}^a t^2/2$ 的项）。
+  \item 给一个具体场景，说明松耦合的“信息损失”体现在哪里（提示：考虑一个被很多帧观测、但每帧都很模糊的特征，纯视觉那步会怎样压缩它）。
+  \item （开放）查阅 OpenVINS 与 VINS-Mono 的文档，判断各自属于 \cref{tab:vio-taxonomy} 的哪些取值组合。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{IMU 预积分}
+\label{sec:vio-preint}
+
+\paragraph{动机：高频 IMU 不能逐个进因子图。}
+\cref{ch:imu} 给出了 IMU 测量模型，关联了测量与机器人状态（位姿、速度）及偏置。原则上可据此构造 \cref{ch:nlopt} 那样的 MAP 估计器，但 IMU 高频输出意味着测量模型要求在\emph{每个 IMU 采样时刻}都向因子图加一个状态\cite{carlone2026handbook}。$200\,$Hz 下，一秒就是 $200$ 个状态、数百条因子，因子图很快大到无法求解。
+
+\paragraph{反面：朴素地“按帧重积分”仍然太贵。}
+一个看似可行的办法是：只在图像帧（关键帧）处加状态，把两关键帧间的所有 IMU 测量\emph{积分}成一条相对运动约束。但朴素积分（\cref{sec:vio-motion-int}）有一个致命缺点：积分的初始条件依赖起始关键帧的\emph{位姿与速度}，而优化器每次迭代都会修改这些状态——于是每次迭代都要把这几百条 IMU 测量\emph{重新积分}一遍\cite{forster2017preintegration}。这正是\textbf{预积分}（preintegration）要消除的浪费。
+
+\paragraph{核心思想。}
+预积分把两关键帧 $i,j$ 之间的 IMU 测量积分成\emph{相对运动增量} $\Delta\mathbf{R}_{ij},\Delta\mathbf{v}_{ij},\Delta\mathbf{p}_{ij}$，并\emph{刻意把这些增量定义成只依赖 IMU 测量与偏置、而与起始状态 $\mathbf{R}_i,\mathbf{v}_i,\mathbf{p}_i$ 及重力 $\mathbf{g}$ 无关}。这样，优化器修改 $\mathbf{R}_i,\mathbf{v}_i$ 时，预积分量\emph{原封不动}，不必重积分。偏置一旦改变会影响增量，但可用\emph{一阶修正}避免重积分。预积分的原始思想可追溯到 Lupton \& Sukkarieh\cite{lupton2012visual}，被 Forster 等\cite{forster2017preintegration} 系统地搬到 $\SO(3)$ 流形上并加入后验偏置校正。
+
+\subsection{运动积分（预积分的出发点）}
+\label{sec:vio-motion-int}
+
+\paragraph{连续时间运动学。}
+body 系 $\{b\}$ 相对 world 系 $\{w\}$ 的旋转、速度、位置随时间演化为\cite{carlone2026handbook}
+\begin{equation}
+  \dot{\mathbf{R}}^w_b=\mathbf{R}^w_b\,(\boldsymbol{\omega}^b_b)^\wedge,\qquad
+  \dot{\mathbf{v}}^w=\mathbf{a}^w,\qquad
+  \dot{\mathbf{p}}^w=\mathbf{v}^w.
+  \label{eq:vio-kinematics}
+\end{equation}
+对 \cref{eq:vio-kinematics} 在一个 IMU 采样周期 $\Delta t$ 上积分，并假设区间内角速度方向不变、$\mathbf{a}^w,\boldsymbol{\omega}^b_b$ 恒定（Euler 积分），得
+\begin{equation}
+\begin{aligned}
+  \mathbf{R}(t+\Delta t)&=\mathbf{R}(t)\,\mathrm{Exp}\!\big(\boldsymbol{\omega}^b_b(t)\,\Delta t\big),\\
+  \mathbf{v}(t+\Delta t)&=\mathbf{v}(t)+\mathbf{a}^w(t)\,\Delta t,\\
+  \mathbf{p}(t+\Delta t)&=\mathbf{p}(t)+\mathbf{v}(t)\,\Delta t+\tfrac12\mathbf{a}^w(t)\,\Delta t^2.
+\end{aligned}
+  \label{eq:vio-euler}
+\end{equation}
+
+\paragraph{代入 IMU 测量模型。}
+把 \cref{ch:imu} 的测量模型解出真值（$\boldsymbol{\omega}^b_b=\tilde{\boldsymbol{\omega}}-\mathbf{b}^g-\boldsymbol{\eta}^{gd}$、$\mathbf{a}^w=\mathbf{R}(\tilde{\mathbf{a}}-\mathbf{b}^a-\boldsymbol{\eta}^{ad})+\mathbf{g}$，其中 $\tilde{(\cdot)}$ 为含噪测量，$\boldsymbol{\eta}^{\cdot d}$ 为离散白噪声）代入 \cref{eq:vio-euler}，省去坐标系下标得
+\begin{equation}
+\begin{aligned}
+  \mathbf{R}(t+\Delta t)&=\mathbf{R}(t)\,\mathrm{Exp}\!\big((\tilde{\boldsymbol{\omega}}(t)-\mathbf{b}^g-\boldsymbol{\eta}^{gd})\Delta t\big),\\
+  \mathbf{v}(t+\Delta t)&=\mathbf{v}(t)+\mathbf{g}\,\Delta t+\mathbf{R}(t)(\tilde{\mathbf{a}}(t)-\mathbf{b}^a-\boldsymbol{\eta}^{ad})\Delta t,\\
+  \mathbf{p}(t+\Delta t)&=\mathbf{p}(t)+\mathbf{v}(t)\Delta t+\tfrac12\mathbf{g}\,\Delta t^2+\tfrac12\mathbf{R}(t)(\tilde{\mathbf{a}}(t)-\mathbf{b}^a-\boldsymbol{\eta}^{ad})\Delta t^2.
+\end{aligned}
+  \label{eq:vio-imu-int}
+\end{equation}
+其中离散噪声协方差与采样率相关：$\mathrm{Cov}(\boldsymbol{\eta}^{gd})=\tfrac{1}{\Delta t}\mathrm{Cov}(\boldsymbol{\eta}^g)$，$\boldsymbol{\eta}^{ad}$ 同理\cite{forster2017preintegration}。在两关键帧 $t_i,t_j$ 间迭代 \cref{eq:vio-imu-int}（记 $\Delta t_{ij}\doteq\sum_{k=i}^{j-1}\Delta t$、$(\cdot)_i\doteq(\cdot)(t_i)$）得
+\begin{equation}
+\begin{aligned}
+  \mathbf{R}_j&=\mathbf{R}_i\prod_{k=i}^{j-1}\mathrm{Exp}\!\big((\tilde{\boldsymbol{\omega}}_k-\mathbf{b}^g_k-\boldsymbol{\eta}^{gd}_k)\Delta t\big),\\
+  \mathbf{v}_j&=\mathbf{v}_i+\mathbf{g}\,\Delta t_{ij}+\sum_{k=i}^{j-1}\mathbf{R}_k(\tilde{\mathbf{a}}_k-\mathbf{b}^a_k-\boldsymbol{\eta}^{ad}_k)\Delta t,\\
+  \mathbf{p}_j&=\mathbf{p}_i+\sum_{k=i}^{j-1}\Big[\mathbf{v}_k\Delta t+\tfrac12\mathbf{g}\,\Delta t^2+\tfrac12\mathbf{R}_k(\tilde{\mathbf{a}}_k-\mathbf{b}^a_k-\boldsymbol{\eta}^{ad}_k)\Delta t^2\Big].
+\end{aligned}
+  \label{eq:vio-iter-int}
+\end{equation}
+
+\begin{insight}
+\cref{eq:vio-iter-int} 已经能当因子图约束用了——但它的求和与连乘里出现了 $\mathbf{R}_k$（依赖 $\mathbf{R}_i$）与 $\mathbf{v}_k,\mathbf{p}_k$。$\mathbf{R}_i$ 一变，所有未来的 $\mathbf{R}_k$ 都变，整个求和要重算。预积分的全部技巧，就是把右端整理成\emph{与 $\mathbf{R}_i,\mathbf{v}_i,\mathbf{p}_i,\mathbf{g}$ 无关}的形式。
+\end{insight}
+
+\subsection{流形上的预积分增量}
+\label{sec:vio-preint-delta}
+
+\begin{definition}[预积分相对运动增量]\label{def:vio-delta}
+重排 \cref{eq:vio-iter-int}，定义与 $t_i$ 处位姿、速度及重力无关的相对运动增量\cite{forster2017preintegration,carlone2026handbook}：
+\begin{equation}
+\begin{aligned}
+  \Delta\mathbf{R}_{ij}&\doteq\mathbf{R}_i^\top\mathbf{R}_j=\prod_{k=i}^{j-1}\mathrm{Exp}\!\big((\tilde{\boldsymbol{\omega}}_k-\mathbf{b}^g_k-\boldsymbol{\eta}^{gd}_k)\Delta t\big),\\
+  \Delta\mathbf{v}_{ij}&\doteq\mathbf{R}_i^\top(\mathbf{v}_j-\mathbf{v}_i-\mathbf{g}\,\Delta t_{ij})=\sum_{k=i}^{j-1}\Delta\mathbf{R}_{ik}(\tilde{\mathbf{a}}_k-\mathbf{b}^a_k-\boldsymbol{\eta}^{ad}_k)\Delta t,\\
+  \Delta\mathbf{p}_{ij}&\doteq\mathbf{R}_i^\top\big(\mathbf{p}_j-\mathbf{p}_i-\mathbf{v}_i\,\Delta t_{ij}-\tfrac12\mathbf{g}\,\Delta t_{ij}^2\big)
+    =\sum_{k=i}^{j-1}\Big[\Delta\mathbf{v}_{ik}\Delta t+\tfrac12\Delta\mathbf{R}_{ik}(\tilde{\mathbf{a}}_k-\mathbf{b}^a_k-\boldsymbol{\eta}^{ad}_k)\Delta t^2\Big],
+\end{aligned}
+  \label{eq:vio-preint-def}
+\end{equation}
+其中 $\Delta\mathbf{R}_{ik}\doteq\mathbf{R}_i^\top\mathbf{R}_k$、$\Delta\mathbf{v}_{ik}\doteq\mathbf{R}_i^\top(\mathbf{v}_k-\mathbf{v}_i-\mathbf{g}\Delta t_{ik})$。
+\end{definition}
+
+\begin{pitfall}[概念误区：把 $\Delta\mathbf{v}_{ij},\Delta\mathbf{p}_{ij}$ 当成真实的速度/位置变化]
+\textbf{错误描述}：望文生义，以为 $\Delta\mathbf{v}_{ij}$ 就是 $\mathbf{v}_j-\mathbf{v}_i$ 在某坐标系下的表示。
+\textbf{现象/后果}：在残差或初始化里漏掉重力项或起始速度项，得到尺度/重力错误的结果。
+\textbf{根本原因}：$\Delta\mathbf{R}_{ij}$ 确实是真实的相对旋转，但 $\Delta\mathbf{v}_{ij},\Delta\mathbf{p}_{ij}$ 是\emph{人为定义}的量，刻意减去了 $\mathbf{v}_i,\mathbf{g}\Delta t_{ij}$ 等项，目的就是让右端只剩 IMU 测量、与起始状态和重力解耦\cite{carlone2026handbook}。它们不对应任何物理的速度/位置变化。
+\textbf{正确做法}：始终把 \cref{eq:vio-preint-def} 的左端（含 $\mathbf{R}_i,\mathbf{v}_i,\mathbf{g}$ 的组合）当成“状态侧”、右端（纯 IMU 求和）当成“测量侧”，残差是两者之差（\cref{sec:vio-imu-factor}）。
+\end{pitfall}
+
+\paragraph{分离噪声：把噪声“移到末尾”。}
+\cref{eq:vio-preint-def} 右端仍含噪声 $\boldsymbol{\eta}^{gd}_k,\boldsymbol{\eta}^{ad}_k$，且偏置 $\mathbf{b}_k$ 出现在指数里，不便建模似然。假设两关键帧间偏置恒定 $\mathbf{b}^g_i=\cdots=\mathbf{b}^g_{j-1}$、$\mathbf{b}^a_i=\cdots=\mathbf{b}^a_{j-1}$，用 \cref{ch:lie} 的两条 $\SO(3)$ 性质
+\begin{equation}
+  \mathrm{Exp}(\boldsymbol{\phi}+\delta\boldsymbol{\phi})\approx\mathrm{Exp}(\boldsymbol{\phi})\,\mathrm{Exp}\!\big(\mathbf{J}_r(\boldsymbol{\phi})\delta\boldsymbol{\phi}\big),
+  \qquad
+  \mathrm{Exp}(\boldsymbol{\phi})\,\mathbf{R}=\mathbf{R}\,\mathrm{Exp}(\mathbf{R}^\top\boldsymbol{\phi}),
+  \label{eq:vio-so3-props}
+\end{equation}
+把旋转增量的噪声逐项移到连乘末尾：
+
+\begin{derivation}[旋转增量的噪声分离]
+对 \cref{eq:vio-preint-def} 第一式，先用 \cref{eq:vio-so3-props} 左式把每个因子的噪声拆出（$\mathbf{J}_r^k\doteq\mathbf{J}_r((\tilde{\boldsymbol{\omega}}_k-\mathbf{b}^g_i)\Delta t)$）：
+\[
+  \Delta\mathbf{R}_{ij}\approx\prod_{k=i}^{j-1}\Big[\mathrm{Exp}\!\big((\tilde{\boldsymbol{\omega}}_k-\mathbf{b}^g_i)\Delta t\big)\,\mathrm{Exp}\!\big(-\mathbf{J}_r^k\boldsymbol{\eta}^{gd}_k\Delta t\big)\Big].
+\]
+反复用 \cref{eq:vio-so3-props} 右式（伴随性质）把所有无噪因子 $\mathrm{Exp}((\tilde{\boldsymbol{\omega}}_k-\mathbf{b}^g_i)\Delta t)$ 提到前面、噪声因子逐一“穿过”到末尾，得
+\[
+  \Delta\mathbf{R}_{ij}=\Delta\tilde{\mathbf{R}}_{ij}\prod_{k=i}^{j-1}\mathrm{Exp}\!\big(-\Delta\tilde{\mathbf{R}}_{k+1\,j}^\top\mathbf{J}_r^k\boldsymbol{\eta}^{gd}_k\Delta t\big)
+  \doteq\Delta\tilde{\mathbf{R}}_{ij}\,\mathrm{Exp}(-\delta\boldsymbol{\phi}_{ij}),
+\]
+其中\textbf{预积分旋转测量}与其噪声分别为
+\begin{equation}
+  \Delta\tilde{\mathbf{R}}_{ij}\doteq\prod_{k=i}^{j-1}\mathrm{Exp}\!\big((\tilde{\boldsymbol{\omega}}_k-\mathbf{b}^g_i)\Delta t\big),
+  \qquad
+  \delta\boldsymbol{\phi}_{ij}\approx\sum_{k=i}^{j-1}\Delta\tilde{\mathbf{R}}_{k+1\,j}^\top\mathbf{J}_r^k\boldsymbol{\eta}^{gd}_k\Delta t.
+  \label{eq:vio-dR-noise}
+\end{equation}
+最后一步对连乘取 $\mathrm{Log}$ 并反复用 $\mathrm{Log}(\mathrm{Exp}(\boldsymbol{\phi})\mathrm{Exp}(\delta\boldsymbol{\phi}))\approx\boldsymbol{\phi}+\mathbf{J}_r^{-1}(\boldsymbol{\phi})\delta\boldsymbol{\phi}$，因 $\boldsymbol{\eta}^{gd}_k$ 是小量、右雅可比近单位。至一阶，$\delta\boldsymbol{\phi}_{ij}$ 是零均值白噪声的线性组合，故零均值高斯。
+\end{derivation}
+
+\begin{derivation}[速度与位置增量的噪声分离]
+把 $\Delta\mathbf{R}_{ik}=\Delta\tilde{\mathbf{R}}_{ik}\mathrm{Exp}(-\delta\boldsymbol{\phi}_{ik})$ 代回 \cref{eq:vio-preint-def} 的速度式，用一阶近似 $\mathrm{Exp}(-\delta\boldsymbol{\phi})\approx\mathbf{I}-\delta\boldsymbol{\phi}^\wedge$ 与 wedge 性质 $\mathbf{a}^\wedge\mathbf{b}=-\mathbf{b}^\wedge\mathbf{a}$，丢弃二阶噪声：
+\[
+  \Delta\mathbf{v}_{ij}\approx\Delta\tilde{\mathbf{v}}_{ij}-\delta\mathbf{v}_{ij},
+  \quad
+  \Delta\tilde{\mathbf{v}}_{ij}\doteq\sum_{k=i}^{j-1}\Delta\tilde{\mathbf{R}}_{ik}(\tilde{\mathbf{a}}_k-\mathbf{b}^a_i)\Delta t,
+\]
+\begin{equation}
+  \delta\mathbf{v}_{ij}=\sum_{k=i}^{j-1}\Big[-\Delta\tilde{\mathbf{R}}_{ik}(\tilde{\mathbf{a}}_k-\mathbf{b}^a_i)^\wedge\delta\boldsymbol{\phi}_{ik}\Delta t+\Delta\tilde{\mathbf{R}}_{ik}\boldsymbol{\eta}^{ad}_k\Delta t\Big].
+  \label{eq:vio-dv-noise}
+\end{equation}
+同理对位置式得 $\Delta\mathbf{p}_{ij}\approx\Delta\tilde{\mathbf{p}}_{ij}-\delta\mathbf{p}_{ij}$，其中预积分位置测量 $\Delta\tilde{\mathbf{p}}_{ij}\doteq\sum_{k=i}^{j-1}[\Delta\tilde{\mathbf{v}}_{ik}\Delta t+\tfrac12\Delta\tilde{\mathbf{R}}_{ik}(\tilde{\mathbf{a}}_k-\mathbf{b}^a_i)\Delta t^2]$，噪声
+\begin{equation}
+  \delta\mathbf{p}_{ij}=\sum_{k=i}^{j-1}\Big[\delta\mathbf{v}_{ik}\Delta t-\tfrac12\Delta\tilde{\mathbf{R}}_{ik}(\tilde{\mathbf{a}}_k-\mathbf{b}^a_i)^\wedge\delta\boldsymbol{\phi}_{ik}\Delta t^2+\tfrac12\Delta\tilde{\mathbf{R}}_{ik}\boldsymbol{\eta}^{ad}_k\Delta t^2\Big].
+  \label{eq:vio-dp-noise}
+\end{equation}
+$\delta\mathbf{v}_{ij},\delta\mathbf{p}_{ij}$ 都是加速度噪声 $\boldsymbol{\eta}^{ad}$ 与旋转噪声 $\delta\boldsymbol{\phi}$ 的线性组合，故亦零均值高斯。
+\end{derivation}
+
+\begin{theorem}[预积分测量模型]\label{thm:vio-preint-model}
+两关键帧 $i,j$ 间的预积分测量满足“状态侧 $=$ 测量侧 $+$ 噪声”\cite{forster2017preintegration}：
+\begin{equation}
+\begin{aligned}
+  \Delta\tilde{\mathbf{R}}_{ij}&=\mathbf{R}_i^\top\mathbf{R}_j\,\mathrm{Exp}(\delta\boldsymbol{\phi}_{ij}),\\
+  \Delta\tilde{\mathbf{v}}_{ij}&=\mathbf{R}_i^\top(\mathbf{v}_j-\mathbf{v}_i-\mathbf{g}\,\Delta t_{ij})+\delta\mathbf{v}_{ij},\\
+  \Delta\tilde{\mathbf{p}}_{ij}&=\mathbf{R}_i^\top(\mathbf{p}_j-\mathbf{p}_i-\mathbf{v}_i\,\Delta t_{ij}-\tfrac12\mathbf{g}\,\Delta t_{ij}^2)+\delta\mathbf{p}_{ij},
+\end{aligned}
+  \label{eq:vio-preint-meas}
+\end{equation}
+其中复合噪声 $\boldsymbol{\eta}^\Delta_{ij}\doteq[\delta\boldsymbol{\phi}_{ij}^\top,\delta\mathbf{v}_{ij}^\top,\delta\mathbf{p}_{ij}^\top]^\top\sim\mathcal{N}(\mathbf{0}_{9\times1},\boldsymbol{\Sigma}_{ij})$。
+\end{theorem}
+
+\paragraph{协方差线性传播。}
+\cref{eq:vio-dR-noise,eq:vio-dv-noise,eq:vio-dp-noise} 把 $\boldsymbol{\eta}^\Delta_{ij}$ 表为 IMU 噪声 $\boldsymbol{\eta}^d_k\doteq[\boldsymbol{\eta}^{gd}_k;\boldsymbol{\eta}^{ad}_k]$ 的线性函数，故 $\boldsymbol{\Sigma}_{ij}$ 可由 IMU 规格给出的 $\mathrm{Cov}(\boldsymbol{\eta}^d_k)$ 经简单线性传播得到，并可\emph{增量}计算：写成 $\boldsymbol{\eta}^\Delta_{ij}=\mathbf{A}_{j-1}\boldsymbol{\eta}^\Delta_{i\,j-1}+\mathbf{B}_{j-1}\boldsymbol{\eta}^d_{j-1}$，则
+\begin{equation}
+  \boldsymbol{\Sigma}_{ij}=\mathbf{A}_{j-1}\boldsymbol{\Sigma}_{i\,j-1}\mathbf{A}_{j-1}^\top+\mathbf{B}_{j-1}\boldsymbol{\Sigma}^d\mathbf{B}_{j-1}^\top,\qquad \boldsymbol{\Sigma}_{ii}=\mathbf{0}_{9},
+  \label{eq:vio-cov-prop}
+\end{equation}
+$\mathbf{A},\mathbf{B}$ 的 $9\times9$、$9\times6$ 闭式可在 $\SO(3)$ 上解析写出\cite{forster2017preintegration}。每来一条新 IMU 测量就更新一次，最适合在线推断。
+
+\begin{insight}
+\cref{eq:vio-cov-prop} 与 \cref{ch:eskf} 的 EKF 协方差预测形式上完全一样（$\boldsymbol{\Sigma}\leftarrow\mathbf{A}\boldsymbol{\Sigma}\mathbf{A}^\top+\mathbf{B}\mathbf{Q}\mathbf{B}^\top$）。区别在于：EKF 在传播\emph{绝对状态}的协方差，预积分在传播\emph{相对测量}的协方差——后者一旦算完就冻结，不随后续优化变化。这正是预积分把“滤波式的协方差传播”嫁接到“优化式的因子”上的妙处。
+\end{insight}
+
+\subsection{偏置更新的一阶修正}
+\label{sec:vio-bias}
+
+预积分 \cref{eq:vio-preint-def} 用了一个固定的偏置估计 $\bar{\mathbf{b}}_i$。但优化中偏置估计会变小量 $\delta\mathbf{b}$，重算整段预积分代价高。Forster 的关键贡献是给定 $\mathbf{b}\leftarrow\bar{\mathbf{b}}+\delta\mathbf{b}$ 时用\emph{一阶展开}更新预积分量\cite{forster2017preintegration}：
+\begin{equation}
+\begin{aligned}
+  \Delta\tilde{\mathbf{R}}_{ij}(\mathbf{b}^g_i)&\approx\Delta\tilde{\mathbf{R}}_{ij}(\bar{\mathbf{b}}^g_i)\,\mathrm{Exp}\!\Big(\tfrac{\partial\Delta\bar{\mathbf{R}}_{ij}}{\partial\mathbf{b}^g}\delta\mathbf{b}^g\Big),\\
+  \Delta\tilde{\mathbf{v}}_{ij}&\approx\Delta\tilde{\mathbf{v}}_{ij}(\bar{\mathbf{b}}_i)+\tfrac{\partial\Delta\bar{\mathbf{v}}_{ij}}{\partial\mathbf{b}^g}\delta\mathbf{b}^g+\tfrac{\partial\Delta\bar{\mathbf{v}}_{ij}}{\partial\mathbf{b}^a}\delta\mathbf{b}^a,\\
+  \Delta\tilde{\mathbf{p}}_{ij}&\approx\Delta\tilde{\mathbf{p}}_{ij}(\bar{\mathbf{b}}_i)+\tfrac{\partial\Delta\bar{\mathbf{p}}_{ij}}{\partial\mathbf{b}^g}\delta\mathbf{b}^g+\tfrac{\partial\Delta\bar{\mathbf{p}}_{ij}}{\partial\mathbf{b}^a}\delta\mathbf{b}^a.
+\end{aligned}
+  \label{eq:vio-bias-corr}
+\end{equation}
+这些雅可比在积分时的偏置估计 $\bar{\mathbf{b}}_i$ 处求值，\emph{保持恒定、可在预积分时一并预计算}\cite{forster2017preintegration}。这正是 VINS-Mono 里“偏置略变时用一阶校正、否则重传播”的来源（\cref{sec:vio-preint-vins} 的 $\mathbf{J}^\alpha_{b_a}$ 等子块）。
+
+\paragraph{偏置随机游走因子。}
+偏置缓变，用积分白噪声（Brownian motion）建模：$\dot{\mathbf{b}}^g=\boldsymbol{\eta}^{bg}$、$\dot{\mathbf{b}}^a=\boldsymbol{\eta}^{ba}$，在 $[t_i,t_j]$ 积分得 $\mathbf{b}^g_j=\mathbf{b}^g_i+\boldsymbol{\eta}^{bgd}$、$\mathbf{b}^a_j=\mathbf{b}^a_i+\boldsymbol{\eta}^{bad}$，离散协方差 $\boldsymbol{\Sigma}^{bgd}=\Delta t_{ij}\mathrm{Cov}(\boldsymbol{\eta}^{bg})$、$\boldsymbol{\Sigma}^{bad}=\Delta t_{ij}\mathrm{Cov}(\boldsymbol{\eta}^{ba})$。对应因子
+\begin{equation}
+  \|\mathbf{r}_{\mathbf{b}_{ij}}\|^2\doteq\|\mathbf{b}^g_j-\mathbf{b}^g_i\|^2_{\boldsymbol{\Sigma}^{bgd}}+\|\mathbf{b}^a_j-\mathbf{b}^a_i\|^2_{\boldsymbol{\Sigma}^{bad}}.
+  \label{eq:vio-bias-factor}
+\end{equation}
+
+\subsection{预积分 IMU 因子残差}
+\label{sec:vio-imu-factor}
+
+\begin{theorem}[预积分 IMU 因子残差（Forster 形式）]\label{thm:vio-imu-residual}
+由测量模型 \cref{eq:vio-preint-meas} 与偏置修正 \cref{eq:vio-bias-corr}，定义将进入因子图优化的 $9$ 维残差 $\mathbf{r}_{\mathcal{I}_{ij}}=[\mathbf{r}_{\Delta\mathbf{R}_{ij}}^\top,\mathbf{r}_{\Delta\mathbf{v}_{ij}}^\top,\mathbf{r}_{\Delta\mathbf{p}_{ij}}^\top]^\top$\cite{forster2017preintegration}：
+\begin{equation}
+\begin{aligned}
+  \mathbf{r}_{\Delta\mathbf{R}_{ij}}&=\mathrm{Log}\!\Big(\big[\Delta\tilde{\mathbf{R}}_{ij}(\bar{\mathbf{b}}^g_i)\mathrm{Exp}(\tfrac{\partial\Delta\bar{\mathbf{R}}_{ij}}{\partial\mathbf{b}^g}\delta\mathbf{b}^g)\big]^\top\mathbf{R}_i^\top\mathbf{R}_j\Big),\\
+  \mathbf{r}_{\Delta\mathbf{v}_{ij}}&=\mathbf{R}_i^\top(\mathbf{v}_j-\mathbf{v}_i-\mathbf{g}\,\Delta t_{ij})-\big[\Delta\tilde{\mathbf{v}}_{ij}(\bar{\mathbf{b}}_i)+\tfrac{\partial\Delta\bar{\mathbf{v}}_{ij}}{\partial\mathbf{b}^g}\delta\mathbf{b}^g+\tfrac{\partial\Delta\bar{\mathbf{v}}_{ij}}{\partial\mathbf{b}^a}\delta\mathbf{b}^a\big],\\
+  \mathbf{r}_{\Delta\mathbf{p}_{ij}}&=\mathbf{R}_i^\top(\mathbf{p}_j-\mathbf{p}_i-\mathbf{v}_i\,\Delta t_{ij}-\tfrac12\mathbf{g}\,\Delta t_{ij}^2)-\big[\Delta\tilde{\mathbf{p}}_{ij}(\bar{\mathbf{b}}_i)+\tfrac{\partial\Delta\bar{\mathbf{p}}_{ij}}{\partial\mathbf{b}^g}\delta\mathbf{b}^g+\tfrac{\partial\Delta\bar{\mathbf{p}}_{ij}}{\partial\mathbf{b}^a}\delta\mathbf{b}^a\big].
+\end{aligned}
+  \label{eq:vio-imu-residual}
+\end{equation}
+把 $\|\mathbf{r}_{\mathcal{I}_{ij}}\|^2_{\boldsymbol{\Sigma}_{ij}}$（马氏范数平方）加入最小化目标即可直接实例化 $i$--$j$ 间的 IMU 因子。
+\end{theorem}
+
+\begin{insight}
+\cref{eq:vio-imu-residual} 三行各有清晰物理意义：旋转残差是“预测的相对旋转”与“实测预积分旋转”之差（在 $\SO(3)$ 上用 $\mathrm{Log}$ 度量）；速度/位置残差是“状态侧扣掉重力与起始速度后的相对运动”减“预积分测量”。这就是把 \cref{thm:vio-preint-model} 的等式移项。VINS-Mono 用四元数 $[\cdot]_{xyz}$ 写旋转残差、Forster 用 $\mathrm{Log}$，二者等价（\cref{sec:vio-preint-vins}）。
+\end{insight}
+
+\subsection{VINS-Mono 的四元数形式（并列复述）}
+\label{sec:vio-preint-vins}
+
+Forster 全程用旋转矩阵 $+$ 右雅可比；VINS-Mono\cite{qin2018vins} 给出等价的\emph{四元数}形式，更贴近 Eigen 实现。两书视角都记下来，便于对照代码。VINS 定义三个预积分量 $\boldsymbol{\alpha}^{b_k}_{b_{k+1}}$（位置）、$\boldsymbol{\beta}^{b_k}_{b_{k+1}}$（速度）、$\boldsymbol{\gamma}^{b_k}_{b_{k+1}}$（旋转，四元数），把 world 系状态传播左乘 $\mathbf{R}^{b_k}_w$ 换到局部系 $b_k$：
+\begin{equation}
+\begin{aligned}
+  \boldsymbol{\alpha}^{b_k}_{b_{k+1}}&=\iint_{[t_k,t_{k+1}]}\mathbf{R}^{b_k}_t(\hat{\mathbf{a}}_t-\mathbf{b}_{a_t})\,dt^2,\\
+  \boldsymbol{\beta}^{b_k}_{b_{k+1}}&=\int_{[t_k,t_{k+1}]}\mathbf{R}^{b_k}_t(\hat{\mathbf{a}}_t-\mathbf{b}_{a_t})\,dt,\\
+  \boldsymbol{\gamma}^{b_k}_{b_{k+1}}&=\int_{[t_k,t_{k+1}]}\tfrac12\boldsymbol{\Omega}(\hat{\boldsymbol{\omega}}_t-\mathbf{b}_{w_t})\,\boldsymbol{\gamma}^{b_k}_t\,dt,
+  \quad
+  \boldsymbol{\Omega}(\boldsymbol{\omega})=\begin{bmatrix}-\lfloor\boldsymbol{\omega}\rfloor_\times & \boldsymbol{\omega}\\ -\boldsymbol{\omega}^\top & 0\end{bmatrix}.
+\end{aligned}
+  \label{eq:vio-vins-preint}
+\end{equation}
+对应 Forster 的 $\Delta\mathbf{p},\Delta\mathbf{v},\Delta\mathbf{R}$。其中 $\boldsymbol{\Omega}$ 是四元数运动学 $\dot{\mathbf{q}}=\tfrac12\boldsymbol{\Omega}(\boldsymbol{\omega})\mathbf{q}$ 的右乘矩阵。
+
+\paragraph{离散实现（中点或欧拉）。}
+起始 $\hat{\boldsymbol{\alpha}}^{b_k}_{b_k}=\mathbf{0},\hat{\boldsymbol{\beta}}^{b_k}_{b_k}=\mathbf{0},\hat{\boldsymbol{\gamma}}^{b_k}_{b_k}=$ 单位四元数，噪声置零，欧拉积分递推：
+\begin{equation}
+\begin{aligned}
+  \hat{\boldsymbol{\alpha}}^{b_k}_{i+1}&=\hat{\boldsymbol{\alpha}}^{b_k}_{i}+\hat{\boldsymbol{\beta}}^{b_k}_{i}\delta t+\tfrac12\mathbf{R}(\hat{\boldsymbol{\gamma}}^{b_k}_{i})(\hat{\mathbf{a}}_i-\mathbf{b}_{a_i})\delta t^2,\\
+  \hat{\boldsymbol{\beta}}^{b_k}_{i+1}&=\hat{\boldsymbol{\beta}}^{b_k}_{i}+\mathbf{R}(\hat{\boldsymbol{\gamma}}^{b_k}_{i})(\hat{\mathbf{a}}_i-\mathbf{b}_{a_i})\delta t,\\
+  \hat{\boldsymbol{\gamma}}^{b_k}_{i+1}&=\hat{\boldsymbol{\gamma}}^{b_k}_{i}\otimes\begin{bmatrix}1\\ \tfrac12(\hat{\boldsymbol{\omega}}_i-\mathbf{b}_{w_i})\delta t\end{bmatrix}.
+\end{aligned}
+  \label{eq:vio-vins-discrete}
+\end{equation}
+
+\paragraph{协方差与雅可比递推。}
+四元数旋转误差定义为右乘小扰动 $\boldsymbol{\gamma}^{b_k}_t\approx\hat{\boldsymbol{\gamma}}^{b_k}_t\otimes[1,\tfrac12\delta\boldsymbol{\theta}^{b_k}_t]^\top$（\emph{与本书右扰动一致}，$\delta\boldsymbol{\theta}\equiv\delta\boldsymbol{\phi}$）。$15$ 维误差态 $[\delta\boldsymbol{\alpha},\delta\boldsymbol{\beta},\delta\boldsymbol{\theta},\delta\mathbf{b}_a,\delta\mathbf{b}_w]$ 的连续时间线性化动力学
+\begin{equation}
+  \dot{\delta\mathbf{z}}_t=\mathbf{F}_t\,\delta\mathbf{z}_t+\mathbf{G}_t\,\mathbf{n}_t,
+  \quad
+  \mathbf{F}_t=\begin{bmatrix}
+  \mathbf{0}&\mathbf{I}&\mathbf{0}&\mathbf{0}&\mathbf{0}\\
+  \mathbf{0}&\mathbf{0}&-\mathbf{R}^{b_k}_t\lfloor\hat{\mathbf{a}}_t-\mathbf{b}_{a_t}\rfloor_\times&-\mathbf{R}^{b_k}_t&\mathbf{0}\\
+  \mathbf{0}&\mathbf{0}&-\lfloor\hat{\boldsymbol{\omega}}_t-\mathbf{b}_{w_t}\rfloor_\times&\mathbf{0}&-\mathbf{I}\\
+  \mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{0}\\
+  \mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{0}
+  \end{bmatrix},
+  \label{eq:vio-vins-F}
+\end{equation}
+噪声雅可比 $\mathbf{G}_t$ 类似（把 $\mathbf{n}_a,\mathbf{n}_w,\mathbf{n}_{b_a},\mathbf{n}_{b_w}$ 注入对应行）。一阶离散递推协方差与雅可比（$\mathbf{P}^{b_k}_{b_k}=\mathbf{0}$、$\mathbf{J}_{b_k}=\mathbf{I}$）：
+\begin{equation}
+  \mathbf{P}^{b_k}_{t+\delta t}=(\mathbf{I}+\mathbf{F}_t\delta t)\mathbf{P}^{b_k}_t(\mathbf{I}+\mathbf{F}_t\delta t)^\top+(\mathbf{G}_t\delta t)\mathbf{Q}(\mathbf{G}_t\delta t)^\top,
+  \quad
+  \mathbf{J}_{t+\delta t}=(\mathbf{I}+\mathbf{F}_t\delta t)\mathbf{J}_t,
+  \label{eq:vio-vins-PJ}
+\end{equation}
+$\mathbf{Q}=\mathrm{diag}(\boldsymbol{\sigma}_a^2,\boldsymbol{\sigma}_w^2,\boldsymbol{\sigma}_{b_a}^2,\boldsymbol{\sigma}_{b_w}^2)$。偏置略变时用 $\mathbf{J}$ 的对应子块 $\mathbf{J}^\alpha_{b_a},\mathbf{J}^\alpha_{b_w},\mathbf{J}^\beta_{b_a},\mathbf{J}^\beta_{b_w},\mathbf{J}^\gamma_{b_w}$ 做一阶校正（即 \cref{eq:vio-bias-corr} 的数值递推版本，Forster 给出同名子块的解析闭式）。VINS 的 IMU 测量残差（$15$ 维，含偏置在线校正）：
+\begin{equation}
+  \mathbf{r}_{\mathcal{B}}=\begin{bmatrix}
+  \mathbf{R}^{b_k}_w(\mathbf{p}^w_{b_{k+1}}-\mathbf{p}^w_{b_k}+\tfrac12\mathbf{g}^w\Delta t_k^2-\mathbf{v}^w_{b_k}\Delta t_k)-\hat{\boldsymbol{\alpha}}^{b_k}_{b_{k+1}}\\
+  \mathbf{R}^{b_k}_w(\mathbf{v}^w_{b_{k+1}}+\mathbf{g}^w\Delta t_k-\mathbf{v}^w_{b_k})-\hat{\boldsymbol{\beta}}^{b_k}_{b_{k+1}}\\
+  2\big[(\mathbf{q}^w_{b_k})^{-1}\otimes\mathbf{q}^w_{b_{k+1}}\otimes(\hat{\boldsymbol{\gamma}}^{b_k}_{b_{k+1}})^{-1}\big]_{xyz}\\
+  \mathbf{b}_{a_{b_{k+1}}}-\mathbf{b}_{a_{b_k}}\\
+  \mathbf{b}_{w_{b_{k+1}}}-\mathbf{b}_{w_{b_k}}
+  \end{bmatrix},
+  \label{eq:vio-vins-residual}
+\end{equation}
+以 $\mathbf{P}^{b_k}_{b_{k+1}}$（\cref{eq:vio-vins-PJ}）加权。对照 \cref{eq:vio-imu-residual}：结构相同，旋转残差 VINS 用四元数虚部 $[\cdot]_{xyz}$、Forster 用 $\mathrm{Log}$。
+
+\begin{table}[H]\centering\small
+\caption{预积分两套记号对照（Forster 矩阵 vs VINS 四元数）}
+\label{tab:vio-preint-compare}
+\begin{tabular}{lll}
+\toprule
+量 & Forster\cite{forster2017preintegration} & VINS-Mono\cite{qin2018vins} \\
+\midrule
+旋转增量 & $\Delta\mathbf{R}_{ij}\in\SO(3)$ & $\boldsymbol{\gamma}^{b_k}_{b_{k+1}}$（四元数） \\
+速度增量 & $\Delta\mathbf{v}_{ij}$ & $\boldsymbol{\beta}^{b_k}_{b_{k+1}}$ \\
+位置增量 & $\Delta\mathbf{p}_{ij}$ & $\boldsymbol{\alpha}^{b_k}_{b_{k+1}}$ \\
+旋转误差 & $\delta\boldsymbol{\phi}$（右雅可比 $\mathbf{J}_r$） & $\delta\boldsymbol{\theta}$（四元数右乘扰动） \\
+偏置雅可比 & 解析闭式 $\partial\Delta\bar{\mathbf{R}}/\partial\mathbf{b}^g$ 等 & 数值递推 $\mathbf{J}^\alpha_{b_a}$ 等 \\
+旋转残差 & $\mathrm{Log}(\cdots)$ & $2[\cdots]_{xyz}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{谁更严谨、谁更直觉}：Forster\cite{forster2017preintegration} 在 $\SO(3)$ 上给出协方差 $\mathbf{A}/\mathbf{B}$ 阵与偏置雅可比的\emph{解析闭式}，理论最完整、最严谨；VINS\cite{qin2018vins} 的四元数 $+$ 数值递推 \cref{eq:vio-vins-PJ} 更贴近代码、易于实现，是工程主流。两者数学等价。本书优化主线两处残差（\cref{eq:vio-imu-residual} 与 \cref{eq:vio-vins-residual}）可互换使用。
+\end{note}
+
+\begin{codebox}[C++]{预积分中点积分递推（教学简化，对应 \cref{eq:vio-vins-discrete}）}
+// 状态:delta_p (alpha), delta_v (beta), delta_q (gamma, Eigen::Quaterniond)
+// 偏置 ba, bg 在本段视为常量;acc_0/gyr_0 为上一时刻测量，acc_1/gyr_1 为当前
+void midPointIntegrate(double dt,
+    const Eigen::Vector3d& acc_0, const Eigen::Vector3d& gyr_0,
+    const Eigen::Vector3d& acc_1, const Eigen::Vector3d& gyr_1,
+    Eigen::Vector3d& dp, Eigen::Vector3d& dv, Eigen::Quaterniond& dq,
+    const Eigen::Vector3d& ba, const Eigen::Vector3d& bg) {
+  // 中点角速度:两端去偏置后取平均，比欧拉法精度高
+  Eigen::Vector3d w_mid = 0.5 * (gyr_0 + gyr_1) - bg;
+  // 旋转增量:dq <- dq * Exp(w_mid * dt)，用小角四元数右乘（右扰动一致）
+  Eigen::Quaterniond dq_next = dq * deltaQ(w_mid * dt);   // deltaQ: [1, 0.5*theta]
+  // 中点加速度:把两端测量分别旋到 b_k 系再平均（dq 旋转 b_t -> b_k）
+  Eigen::Vector3d a0 = dq      * (acc_0 - ba);
+  Eigen::Vector3d a1 = dq_next * (acc_1 - ba);
+  Eigen::Vector3d a_mid = 0.5 * (a0 + a1);
+  // 位置/速度按运动学积分（注意 dp 用到旧 dv，顺序不能乱）
+  dp = dp + dv * dt + 0.5 * a_mid * dt * dt;   // alpha
+  dv = dv + a_mid * dt;                         // beta
+  dq = dq_next.normalized();                    // gamma，归一化防漂移
+  // 协方差 P 与雅可比 J 的递推 P <- (I+F dt) P (I+F dt)^T + (G dt) Q (G dt)^T
+  // J <- (I+F dt) J  （F/G 的装配按本节 F_t 公式逐块填入）
+}
+\end{codebox}
+
+\begin{pitfall}[编程陷阱：预积分递推里 \texttt{dp} 与 \texttt{dv} 的更新顺序写反]
+\textbf{错误描述}：先更新 \texttt{dv} 再用新 \texttt{dv} 算 \texttt{dp}。
+\textbf{现象/后果}：位置增量系统性偏大，VIO 轨迹尺度偏移，且在低速段误差较小、高速段放大，极难定位。
+\textbf{根本原因}：\cref{eq:vio-vins-discrete} 中 $\hat{\boldsymbol{\alpha}}_{i+1}$ 用的是\emph{本步开始时}的 $\hat{\boldsymbol{\beta}}_i$（即 $\mathbf{v}_k\Delta t$ 项），不是更新后的速度。
+\textbf{正确做法}：严格按 $\mathbf{p}\leftarrow\mathbf{p}+\mathbf{v}\Delta t+\tfrac12\mathbf{a}\Delta t^2$、\emph{再} $\mathbf{v}\leftarrow\mathbf{v}+\mathbf{a}\Delta t$ 的顺序写（如上代码框）。中点法尤其要小心用中点加速度而非端点加速度。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：以为预积分“消除”了偏置不确定性]
+\textbf{错误描述}：既然预积分把噪声分离出来了，就以为偏置 $\mathbf{b}$ 也被一并处理掉、不必再优化。
+\textbf{现象/后果}：把偏置当成固定常量喂进残差，长期运行后偏置漂移得不到修正，速度/位置缓慢发散。
+\textbf{根本原因}：预积分只是在\emph{固定偏置估计}下计算增量，并用 \cref{eq:vio-bias-corr} 一阶修正偏置的\emph{小}变化；偏置本身仍是待估状态，由 \cref{eq:vio-bias-factor} 的随机游走因子约束、由视觉/IMU 联合优化更新。
+\textbf{正确做法}：把 $\mathbf{b}^g,\mathbf{b}^a$ 放进状态向量优化（\cref{eq:vio-vins-state}），让随机游走因子与预积分因子共同确定它们。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （手推）由 \cref{eq:vio-so3-props} 的两条性质，独立完成 \cref{eq:vio-dR-noise} 中“噪声穿过到末尾”的伴随变换步骤，写清每一步用了哪条性质。
+  \item （实现）补全上面代码框里 $\mathbf{F}_t,\mathbf{G}_t$ 的装配（按 \cref{eq:vio-vins-F}），并验证当 $\mathbf{a}=\mathbf{g},\boldsymbol{\omega}=\mathbf{0}$（静止）时预积分位置增量为零。
+  \item （对比）写出 Forster 旋转残差 $\mathrm{Log}(\cdots)$ 与 VINS 残差 $2[\cdots]_{xyz}$，证明在小残差下两者一阶相等。
+\end{enumerate}
+\end{practice}
+
+\subsection{三视角合流：\texorpdfstring{$\mathrm{SE}_2(3)$}{SE2(3)} 整体视角与“群仿射统一”}
+\label{subsec:vio-se23-unify}
+
+\paragraph{动机：同一段预积分，本章已写了两副面孔。}
+\cref{sec:vio-preint-delta} 给的是 Forster 的\emph{矩阵分量}写法（$\Delta\mathbf R\in\SO(3)$ 配 $\Delta\mathbf v,\Delta\mathbf p\in\mathbb R^3$，右雅可比），\cref{sec:vio-preint-vins} 给的是 VINS-Mono 的\emph{四元数}写法（$\boldsymbol\alpha,\boldsymbol\beta,\boldsymbol\gamma$）。两者在本节练习中已证一阶等价。还有第三副面孔——把姿态、速度、位置打包进\emph{一个}扩展位姿群 $\mathrm{SE}_2(3)$ 元素（\cref{sec:se23} 权威定义、\cref{def:se23}），整段预积分写成群上的一次乘法。三副面孔携带\emph{同样}的信息，差别只在“用什么坐标记录”。本小节点明这层统一，完整的 $\mathrm{SE}_2(3)$ 群上推导（$\mathbf N$ 矩阵均值传播、时间机器、协方差、批量 MAP 因子、左右扰动）已在 IMU 章 \cref{subsec:imu-se23-preint} 展开，此处不重复，只做\emph{合流}。
+
+\paragraph{第三视角：把 $\Delta\mathbf R,\Delta\mathbf v,\Delta\mathbf p$ 装进一个群元素。}
+$\mathrm{SE}_2(3)$ 把 \cref{def:vio-delta} 的三个增量收成一个 $5\times5$ 群元素 $\boldsymbol\Xi$（\cref{eq:imu-Xi}），其左上是旋转增量、两并列列是速度/位置增量。单步均值传播由群乘法一次推进三者；与 Forster 欧拉式相比，群版多出 $\SO(3)$ 左雅可比 $\mathbf J$ 与新矩阵 $\mathbf N$（\cref{eq:imu-Nmatrix}）两个因子，\emph{精确}补偿“积分区间内姿态也在转”——当区间内不转时 $\mathbf J,\mathbf N\to\mathbf I$，群版逐字退回 Forster 欧拉式。关键之处：惯导运动学在 $\mathrm{SE}_2(3)$ 上是 Barrau--Bonnabel 的\textbf{群仿射}动力学（\cref{sec:se23}），其不变误差动力学\emph{自治}（系统矩阵不含状态）——这正是把预积分接到不变滤波 InEKF（\cref{paper:inekf}）、并解释 VIO 一致性（\cref{sec:vio-fej} 的 FEJ 同一主题）的群论根源。
+
+\begin{insight}[群仿射统一：分量是“拆开”，群是“打包”]\label{ins:vio-se23-unify}
+为什么三视角必然等价？因为它们都在离散化\emph{同一条}连续运动学 \cref{eq:vio-kinematics}。Forster 选 $\SO(3)\times\mathbb R^3\times\mathbb R^3$ 坐标、VINS 选\emph{四元数} $\times\mathbb R^3\times\mathbb R^3$ 坐标、Brossard/Barfoot 选 $\mathrm{SE}_2(3)$ 群坐标——\emph{流形是同一个，只是图卡（chart）不同}。分量视角贴近手算与 GTSAM/VINS 实现（雅可比逐块可查）；群视角贴近一致性分析（群仿射 $\Rightarrow$ 误差自治，InEKF 的收敛保证与轨迹无关）。“汇聚百家”不是把多种方法堆在一起，而是认出它们\emph{本就是一个东西}的不同写法：理解了 Forster 的 $\Delta\mathbf R,\Delta\mathbf v,\Delta\mathbf p$，$\mathrm{SE}_2(3)$ 只是把它们\emph{打包}；理解了 $\mathrm{SE}_2(3)$，分量式只是把它\emph{拆开}读分量。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{IMU 预积分的三种等价坐标（同一信息、同一流形、不同图卡）}
+\label{tab:vio-three-views}
+\begin{tabular}{llll}
+\toprule
+ & Forster 矩阵分量 & VINS-Mono 四元数 & $\mathrm{SE}_2(3)$ 群 \\
+\midrule
+旋转载体 & $\Delta\mathbf R\in\SO(3)$ & $\boldsymbol\gamma$（单位四元数）& $\boldsymbol\Xi$ 左上块 \\
+速度/位置 & $\Delta\mathbf v,\Delta\mathbf p\in\mathbb R^3$ & $\boldsymbol\beta,\boldsymbol\alpha\in\mathbb R^3$ & $\boldsymbol\Xi$ 两并列列 \\
+本章出处 & \cref{eq:vio-preint-meas} & \cref{eq:vio-vins-preint} & \cref{eq:imu-Xi}（IMU 章）\\
+残差 & $[\mathbf r_{\Delta\mathbf R};\mathbf r_{\Delta\mathbf v};\mathbf r_{\Delta\mathbf p}]$ & $2[\cdots]_{xyz}$ 等 & $\mathrm{Log}_{\mathrm{SE}_2(3)}(\cdots)^\vee$ \\
+最擅长 & 手算/解析雅可比 & Eigen/工程实现 & 一致性/InEKF/地球自转 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{practice}
+\begin{enumerate}
+  \item 对照 \cref{tab:vio-three-views}：把 VINS 的 $(\boldsymbol\alpha,\boldsymbol\beta,\boldsymbol\gamma)$ 逐一对应到 Forster 的 $(\Delta\mathbf p,\Delta\mathbf v,\Delta\mathbf R)$ 与 $\mathrm{SE}_2(3)$ 的 $\boldsymbol\Xi$ 各块，指出三者只是坐标不同。
+  \item （概念）解释“群仿射 $\Rightarrow$ 误差动力学自治”为何对 VIO 一致性有利，并把它与 \cref{sec:vio-fej} 的 FEJ 动机联系起来。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{VIO 的可观性}
+\label{sec:vio-obs}
+
+\paragraph{动机：能不能从测量唯一地反推状态。}
+引入 IMU 会增大待估状态（偏置、速度，乃至外参）。一个自然的问题是：相机 $+$ IMU 的测量\emph{是否足以无歧义地}估出所有这些状态？这就是\textbf{可观性}（observability）要回答的——它确定可用测量提供的信息是否足以唯一地确定状态\cite{carlone2026handbook,huang2019vins}。可观性分析的产出有三大用途：改善估计器\emph{一致性}（\cref{sec:vio-compare}）、确定初始化所需的\emph{最小测量}（\cref{sec:vio-init}）、识别应避免的\emph{退化运动}。
+
+\paragraph{反面：不分析可观性会怎样。}
+若不知道哪些方向不可观，你会让估计器去“估计”那些根本估不出来的量——结果是协方差给出虚假的确定性、误差悄悄累积、滤波器最终发散。VINS-Mono 论文\cite{qin2018vins} 把“在线评估可观性、必要时规划运动恢复可观性”列为未来工作，正源于此。
+
+\subsection{线性化测量模型}
+\label{sec:vio-obs-model}
+
+\paragraph{AINS 状态。}
+辅助惯性导航系统（aided inertial navigation system, AINS）每时刻的状态含机器人状态与外部特征\cite{carlone2026handbook}：
+\begin{equation}
+  \boldsymbol{x}=\{\mathbf{R}^w_b,\ \mathbf{b}^g,\ \mathbf{v}^w,\ \mathbf{b}^a,\ \mathbf{p}^w,\ \boldsymbol{x}^w_f\},
+  \label{eq:vio-ains-state}
+\end{equation}
+其中特征 $\boldsymbol{x}^w_f$ 可为点、线（Plücker 坐标 $\mathbf{l}^w=[\mathbf{n}_\ell^w;\mathbf{v}_\ell^w]$）、面（$\boldsymbol{\pi}^w=[\mathbf{n}_\pi^w;d_\pi^w]$）或其组合，均在 world 系表达。误差态记 $\tilde{\boldsymbol{x}}=\{\tilde{\boldsymbol{\theta}},\tilde{\mathbf{b}}^g,\tilde{\mathbf{v}}^w,\tilde{\mathbf{b}}^a,\tilde{\mathbf{p}}^w,\tilde{\boldsymbol{x}}^w_f\}$，旋转分量用线性化点处的右扰动 $\mathbf{R}^w_b=\hat{\mathbf{R}}^w_b\,\mathrm{Exp}(\tilde{\boldsymbol{\theta}})\simeq\hat{\mathbf{R}}^w_b(\mathbf{I}+\tilde{\boldsymbol{\theta}}^\wedge)$。
+
+\paragraph{线性化 IMU 运动学。}
+对 \cref{eq:vio-kinematics} 与偏置随机游走线性化，得连续时间误差态系统
+\begin{equation}
+  \dot{\tilde{\boldsymbol{x}}}(t)\simeq\mathbf{F}(t)\,\tilde{\boldsymbol{x}}(t)+\mathbf{G}(t)\,\boldsymbol{\eta}(t),
+  \quad
+  \mathbf{F}(t)=\begin{bmatrix}\mathbf{F}_c(t)&\mathbf{0}_{15\times n_f}\\ \mathbf{0}_{n_f\times15}&\mathbf{0}_{n_f}\end{bmatrix},
+  \label{eq:vio-err-dyn}
+\end{equation}
+特征块为零（特征在 world 系静止）。离散状态转移矩阵 $\boldsymbol{\Phi}_{(k+1,k)}$ 由 $\dot{\boldsymbol{\Phi}}_{(k+1,k)}=\mathbf{F}(t_k)\boldsymbol{\Phi}_{(k+1,k)}$（初值单位阵）积分得到，按状态序 $[\boldsymbol{\theta},\mathbf{b}^g,\mathbf{v},\mathbf{b}^a,\mathbf{p},\boldsymbol{x}_f]$ 呈下三角耦合结构：
+\begin{equation}
+  \boldsymbol{\Phi}_{(k+1,k)}=\begin{bmatrix}
+  \boldsymbol{\Phi}_{11}&\boldsymbol{\Phi}_{12}&\mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{0}\\
+  \mathbf{0}&\mathbf{I}_3&\mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{0}\\
+  \boldsymbol{\Phi}_{31}&\boldsymbol{\Phi}_{32}&\mathbf{I}_3&\boldsymbol{\Phi}_{34}&\mathbf{0}&\mathbf{0}\\
+  \mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{I}_3&\mathbf{0}&\mathbf{0}\\
+  \boldsymbol{\Phi}_{51}&\boldsymbol{\Phi}_{52}&\boldsymbol{\Phi}_{53}&\boldsymbol{\Phi}_{54}&\mathbf{I}_3&\mathbf{0}\\
+  \mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{I}_{n_f}
+  \end{bmatrix}.
+  \label{eq:vio-Phi}
+\end{equation}
+两个偏置行只有自身 $\mathbf{I}_3$（随机游走）；特征行只有 $\mathbf{I}_{n_f}$（静止）；旋转、速度、位置行含非平凡耦合块（旋转受陀螺偏置影响，速度受旋转/两偏置影响，位置受全部影响）。
+
+\paragraph{外感受测量模型（点特征）。}
+点特征测量一般是特征在传感器系位置 $\mathbf{p}_f^c=\mathbf{R}^c_w(\mathbf{p}_f^w-\mathbf{p}_c^w)$ 的 range/bearing 函数，线性化得
+\begin{equation}
+  \tilde{\mathbf{z}}_p\simeq\mathbf{H}_x\,\tilde{\boldsymbol{x}}+\boldsymbol{\eta}^p,
+  \qquad
+  \mathbf{H}_x=\boldsymbol{\Lambda}\begin{bmatrix}\mathbf{H}_r\\ \mathbf{H}_b\end{bmatrix}\mathbf{H}_f,
+  \label{eq:vio-Hx}
+\end{equation}
+$\boldsymbol{\Lambda}$ 为测量选择矩阵（决定含 range、bearing 还是两者），$\mathbf{H}_f=\partial\mathbf{p}_f^c/\partial\boldsymbol{x}$。对单目相机，$\boldsymbol{\Lambda}$ 只选 bearing（$\mathbf{H}_b$）——尺度不可观的根源就在这里（无 range 信息）。线、面特征有类似的线性化雅可比（线特征只有矩向量 $\mathbf{n}_\ell^c$ 参与图像投影，故线的 range 与朝向不可测）。
+
+\subsection{4 维不可观零空间}
+\label{sec:vio-obs-null}
+
+\begin{definition}[可观性矩阵与不可观子空间]\label{def:vio-obs-matrix}
+区间 $[1,k]$ 上的可观性矩阵把各时刻测量雅可比经状态转移搬到初始时刻堆叠\cite{carlone2026handbook}：
+\begin{equation}
+  \mathbf{M}(\hat{\boldsymbol{x}})=\begin{bmatrix}
+  \mathbf{H}_{x_1}\boldsymbol{\Phi}_{(1,1)}\\
+  \mathbf{H}_{x_2}\boldsymbol{\Phi}_{(2,1)}\\
+  \vdots\\
+  \mathbf{H}_{x_k}\boldsymbol{\Phi}_{(k,1)}
+  \end{bmatrix}.
+  \label{eq:vio-obs-matrix}
+\end{equation}
+其零空间 $\mathbf{U}=\{\mathbf{u}:\mathbf{M}\mathbf{u}=\mathbf{0}\}$ 即\textbf{不可观子空间}；$\mathbf{U}=\{\mathbf{0}\}$ 时系统完全可观。$\mathbf{M}$ 依赖线性化点 $\hat{\boldsymbol{x}}$。它与状态估计的 Fisher 信息（协方差）矩阵紧密相关。
+\end{definition}
+
+\begin{theorem}[AINS 的 4 维不可观零空间]\label{thm:vio-4dof}
+对一般运动下的视觉惯性（或更一般的 AINS）系统，可观性矩阵 \cref{eq:vio-obs-matrix} 有\textbf{恰好 $4$ 个}独立的零空间方向：$3$ 个对应\emph{全局 $3$D 平移}、$1$ 个对应\emph{绕重力轴的全局偏航}（yaw）\cite{carlone2026handbook,huang2019vins}。
+
+以含点、线、面各一的状态为例（行块按 $[\boldsymbol{\theta};\mathbf{b}^g;\mathbf{v};\mathbf{b}^a;\mathbf{p};\boldsymbol{x}_f]$），零空间显式为
+\begin{equation}
+  \mathrm{null}(\mathbf{M})=\mathrm{span}[\mathbf{u}_1\ \mathbf{u}_{2:4}]=\mathrm{span}\begin{bmatrix}
+  \mathbf{u}_g & \mathbf{0}_{12\times3}\\
+  -\mathbf{p}_1^w\times\mathbf{g}^w & \mathbf{I}_3\\
+  -\mathbf{p}_f^w\times\mathbf{g}^w & \mathbf{I}_3\\
+  -\mathbf{g}^w & \tfrac{\mathbf{v}_\ell^w}{d_\ell^w\|\mathbf{v}_\ell^w\|}(\mathbf{R}_\ell^w\mathbf{e}_1)^\top\\
+  0 & -(\mathbf{R}_\ell^w\mathbf{e}_3)^\top\\
+  -d_\pi^w\mathbf{n}_\pi^w\times\mathbf{g}^w & \mathbf{n}_\pi^w(\mathbf{R}_\pi^w\mathbf{e}_3)^\top
+  \end{bmatrix},
+  \label{eq:vio-nullspace}
+\end{equation}
+其中 $\mathbf{u}_g=[(\mathbf{R}_w^{c_1}\mathbf{g}^w)^\top,\ \mathbf{0}_{1\times3},\ -(\mathbf{v}_1^w\times\mathbf{g}^w)^\top,\ \mathbf{0}_{1\times3}]^\top$，$\mathbf{R}_\pi^w,\mathbf{R}_\ell^w$ 分别由面法向、线法向/方向经 Gram--Schmidt 构造。第一列 $\mathbf{u}_1$ 对应绕重力的旋转（yaw），后三列 $\mathbf{u}_{2:4}$ 对应平移。
+\end{theorem}
+
+\begin{insight}
+\cref{thm:vio-4dof} 是 VIO 全章最重要的结论之一，它一次性解释了三件事：(1) VIO 作为里程计长期\textbf{只漂移 $4$ 自由度}（$3$D 位置 $+$ yaw）；(2) VINS-Mono 的全局位姿图为何只做 \textbf{$4$-DOF} 优化（\cref{sec:vio-opt-loop}）；(3) 为什么 roll/pitch \emph{不}漂移——加速度计能测到重力方向，把这两个自由度钉死。直观上：没有任何测量携带全局帧信息（IMU、未知路标观测都只给\emph{相对}量），\emph{除了重力方向}——它固定了 roll、pitch，但绕重力的 yaw 与原点仍可任意设。
+\end{insight}
+
+\paragraph{与纯视觉对比。}
+不用 IMU 时，纯 landmark-based SLAM 的零空间\emph{至少 $6$ 维}——整个 $3$D 旋转（除位置外）都不可观\cite{carlone2026handbook}。IMU 把不可观维数从 $6$ 降到 $4$（钉死 roll、pitch），并通过加速度激励让\emph{尺度}可观。这个“$6\to4$”正是 IMU 对可观性的核心贡献。这种 $4$ 维不可观\emph{并非病态}：它只意味着可任意选世界帧的 yaw 与 $3$D 原点（这些变量只有相对测量）；加一个绝对传感器（GPS）即可消除。
+
+\begin{theorem}[线性化 VINS 零空间（Huang 综述形式）]\label{thm:vio-null-huang}
+对仅含点特征的单目 VINS，区间 $[k_o,k]$ 上的零空间为\cite{huang2019vins}
+\begin{equation}
+  \mathbf{N}=\begin{bmatrix}
+  \mathbf{0}_3 & \mathbf{C}(\hat{\mathbf{q}}_k)\,{}^G\mathbf{g}\\
+  \mathbf{0}_3 & \mathbf{0}_3\\
+  \mathbf{0}_3 & -\lfloor{}^G\mathbf{v}_k\rfloor_\times\,{}^G\mathbf{g}\\
+  \mathbf{0}_3 & \mathbf{0}_3\\
+  \mathbf{I}_3 & -\lfloor{}^G\mathbf{p}_k\rfloor_\times\,{}^G\mathbf{g}\\
+  \mathbf{I}_3 & -\lfloor{}^G\mathbf{p}_f\rfloor_\times\,{}^G\mathbf{g}
+  \end{bmatrix},
+  \label{eq:vio-null-huang}
+\end{equation}
+行块按 $[\delta\boldsymbol{\theta};\tilde{\mathbf{b}}_g;{}^G\tilde{\mathbf{v}};\tilde{\mathbf{b}}_a;{}^G\tilde{\mathbf{p}}_I;{}^G\tilde{\mathbf{p}}_f]$。第一列对应全局平移（$3$ 维），第二列对应绕重力的全局旋转（yaw，$1$ 维），合计 $4$ 维——与 \cref{thm:vio-4dof} 一致，只是状态参数化不同。
+\end{theorem}
+
+\begin{note}
+\textbf{谁更严谨、谁更直觉}：Handbook\cite{carlone2026handbook} 的 \cref{eq:vio-nullspace} 把点/线/面统一处理、给出最一般的零空间结构，覆盖面广；Huang 综述\cite{huang2019vins} 的 \cref{eq:vio-null-huang} 专注单目点特征 VINS，更简洁直观、便于看出“平移 $+$ yaw”。两者结论一致（$4$ 维），互为印证。Martinelli\cite{martinelli2014closed} 进一步用连续对称性给出 VINS 闭式解，证明 IMU 偏置、$3$D 速度、全局 roll/pitch 可观。
+\end{note}
+
+\subsection{退化运动}
+\label{sec:vio-degenerate}
+
+某些特殊运动会在 $4$ 维之外引入\emph{额外}不可观方向，称\textbf{退化运动}\cite{carlone2026handbook,huang2019vins}。它们实践上很危险：会导致状态某些方向大误差乃至导航失败，且常发生在初始化阶段。
+
+\begin{table}[H]\centering\small
+\caption{AINS/VIO 退化运动（合并自\cite{carlone2026handbook,huang2019vins,martinelli2014closed}）}
+\label{tab:vio-degenerate}
+\begin{tabular}{lll}
+\toprule
+退化运动 & 额外不可观量 & 直觉 \\
+\midrule
+纯平移（无旋转） & 全局朝向（roll/pitch/yaw） & 无旋转激励，重力测量与加计偏置混淆 \\
+常加速度（含匀速、零加速度） & 系统尺度（位置/速度/加计偏置/特征） & 尺度可观依赖加速度的\emph{变化}激励 \\
+匀速直线（$\mathbf{a}=\mathbf{0}$） & 尺度（常加速度特例） & 无加速度激励，度量尺度无法恢复 \\
+纯旋转 & 特征尺度（单目） & 无平移基线，特征不能三角化 \\
+朝点特征方向运动 & 特征尺度（单目） & 视线方向无横向视差 \\
+静止 & 尺度 $+$ 全局位置 $+$（视情）部分姿态 & 零激励，单目 VINS 退化最严重 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 注意：除纯平移外的几种单目退化运动仅在“传感器到特征距离 $\gg$ 传感器与机体间外参平移”（$\|\mathbf{p}_f^c\|\gg\|\mathbf{p}_b^c\|$，实践中通常成立）时成立。
+
+\begin{insight}
+退化运动表 \cref{tab:vio-degenerate} 直接给出工程铁律：\textbf{单目 VIO 不能静止启动，必须在含旋转与加速度变化的运动中初始化}。VINS-Mono\cite{qin2018vins} 开篇即言“尺度可观需要加速度激励 $\to$ 估计器不能从静止起步”，根源就在这张表。这也是 \cref{sec:vio-init} 初始化要专门做“激励充分性检查”的原因。
+\end{insight}
+
+\begin{pitfall}[思维陷阱：协方差小就以为估计准]
+\textbf{错误描述}：看到滤波器输出的协方差很小，就认为状态估计很准、可以信任。
+\textbf{现象/后果}：在退化运动（如长时间匀速直线）下，尺度其实不可观，但标准 EKF 仍报告很小的尺度协方差——“自信地错着”，下游控制据此做激进动作导致失败。
+\textbf{根本原因}：标准 EKF 在当前估计点线性化，其线性化系统的不可观维数可能\emph{少于}真实的 $4$ 维（\cref{sec:vio-compare} 的一致性问题），于是从不存在信息的方向“获取”了虚假信息（spurious information），协方差被错误地压小。
+\textbf{正确做法}：用 FEJ/OC 等一致性方法（\cref{sec:vio-compare}）保证线性化系统的零空间维数正确；同时监控运动激励，退化时主动报告“尺度不可观”而非给出虚假的小协方差。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （手推）验证 \cref{eq:vio-null-huang} 的第一列（全局平移）确实落在零空间：说明位置行的 $\mathbf{I}_3$ 与特征位置行的 $\mathbf{I}_3$ 为何对应“整体平移世界帧不改变任何相对测量”。
+  \item （概念）解释为什么纯旋转下单目特征不能三角化（提示：三角化需要基线，画两条从不同位置出发但平行的视线）。
+  \item （跨章综合）结合 \cref{ch:vo} 的对极几何：单目 VO 的尺度不可观与本节 VIO 的尺度可观（非退化时），差别在于 IMU 提供了什么？用一句话说清。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{优化主线：VINS-Mono 滑窗紧耦合}
+\label{sec:vio-opt}
+
+\paragraph{动机：把 IMU 因子、视觉因子放进同一个有界 BA。}
+有了预积分因子（\cref{sec:vio-preint}），优化主线的思路就清晰了：在一个\emph{滑动窗口}内，把若干关键帧的状态当变量，用预积分 IMU 因子约束相邻帧、用重投影视觉因子约束帧与特征，联合做最大后验（MAP）估计\cite{qin2018vins}。窗口有界保证计算量恒定（满足 \cref{sec:vio-problem} 的延迟约束），落出窗口的状态用\emph{边缘化}变成先验、不丢信息。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=14mm,
+  pose/.style={latent, minimum size=8mm, fill=main!12, draw=main!70!black},
+  feat/.style={latent, minimum size=7mm, fill=third!15, draw=third!70!black},
+  fac/.style={rectangle, draw, fill=black, minimum size=2.2mm, inner sep=0pt},
+  bf/.style={rectangle, draw=second!70!black, fill=second!60, minimum size=2.2mm, inner sep=0pt}]
+  % keyframe states
+  \node[pose] (x0) {$\mathbf{x}_0$};
+  \node[pose, right=of x0] (x1) {$\mathbf{x}_1$};
+  \node[pose, right=of x1] (x2) {$\mathbf{x}_2$};
+  \node[pose, right=of x2] (x3) {$\mathbf{x}_3$};
+  % imu (preintegration) factors between poses
+  \node[fac] (i01) at ($(x0)!0.5!(x1)$) {};
+  \node[fac] (i12) at ($(x1)!0.5!(x2)$) {};
+  \node[fac] (i23) at ($(x2)!0.5!(x3)$) {};
+  \draw (x0)--(i01)--(x1); \draw (x1)--(i12)--(x2); \draw (x2)--(i23)--(x3);
+  % features
+  \node[feat, below=10mm of x1] (l0) {$\lambda_0$};
+  \node[feat, below=10mm of x2] (l1) {$\lambda_1$};
+  % visual factors
+  \node[fac] (v00) at ($(x0)!0.5!(l0)$) {};
+  \node[fac] (v10) at ($(x1)!0.5!(l0)$) {};
+  \node[fac] (v12) at ($(x2)!0.5!(l1)$) {};
+  \node[fac] (v32) at ($(x3)!0.5!(l1)$) {};
+  \draw (x0)--(v00)--(l0); \draw (x1)--(v10)--(l0);
+  \draw (x2)--(v12)--(l1); \draw (x3)--(v32)--(l1);
+  % prior on x0
+  \node[bf, left=8mm of x0] (p) {};
+  \draw (p)--(x0); \node[anchor=east, font=\scriptsize] at (p.west) {先验$\{\mathbf{r}_p,\mathbf{H}_p\}$};
+  % legend
+  \node[anchor=west, font=\scriptsize] at (1.2,-2.6) {黑方块 $=$ 预积分IMU因子/视觉因子};
+  \node[anchor=west, font=\scriptsize] at (1.2,-3.1) {绿方块 $=$ 边缘化先验};
+\end{tikzpicture}
+\caption{滑窗紧耦合 VIO 的因子图：关键帧状态 $\mathbf{x}_k$（圆）由预积分 IMU 因子（相邻帧间）与重投影视觉因子（帧--特征 $\lambda$）约束，最旧帧被边缘化为先验。仿\cite{qin2018vins,carlone2026handbook} 重绘。}
+\label{fig:vio-factor-graph}
+\end{figure}
+
+\subsection{问题表述}
+\label{sec:vio-opt-problem}
+
+\begin{definition}[滑窗全状态向量]\label{def:vio-state}
+VINS-Mono 的滑窗状态\cite{qin2018vins}：
+\begin{equation}
+\begin{aligned}
+  \mathcal{X}&=[\mathbf{x}_0,\mathbf{x}_1,\dots,\mathbf{x}_n,\ \mathbf{x}^b_c,\ \lambda_0,\lambda_1,\dots,\lambda_m],\\
+  \mathbf{x}_k&=[\mathbf{p}^w_{b_k},\mathbf{v}^w_{b_k},\mathbf{q}^w_{b_k},\mathbf{b}_a,\mathbf{b}_g],\quad k\in[0,n],\\
+  \mathbf{x}^b_c&=[\mathbf{p}^b_c,\mathbf{q}^b_c],
+\end{aligned}
+  \label{eq:vio-vins-state}
+\end{equation}
+$\mathbf{x}_k$ 是第 $k$ 关键帧的 IMU 状态（world 系位置/速度/姿态 $+$ body 系两偏置）；$n$ 为关键帧数；$m$ 为窗内特征数；$\lambda_l$ 是第 $l$ 个特征\emph{从其首次观测帧起的逆深度}（避免远特征数值病态）；$\mathbf{x}^b_c$ 是相机-IMU 外参，\emph{在线}标定。
+\end{definition}
+
+\begin{theorem}[视觉惯性 BA（MAP 估计）]\label{thm:vio-ba}
+最小化先验、IMU、视觉三类残差的马氏范数之和\cite{qin2018vins}：
+\begin{equation}
+  \min_{\mathcal{X}}\Big\{\|\mathbf{r}_p-\mathbf{H}_p\mathcal{X}\|^2
+  +\sum_{k\in\mathcal{B}}\|\mathbf{r}_{\mathcal{B}}(\hat{\mathbf{z}}^{b_k}_{b_{k+1}},\mathcal{X})\|^2_{\mathbf{P}^{b_k}_{b_{k+1}}}
+  +\sum_{(l,j)\in\mathcal{C}}\rho\big(\|\mathbf{r}_{\mathcal{C}}(\hat{\mathbf{z}}^{c_j}_l,\mathcal{X})\|^2_{\mathbf{P}^{c_j}_l}\big)\Big\},
+  \label{eq:vio-ba}
+\end{equation}
+其中 Huber 鲁棒核 $\rho(s)=s$（$s\ge1$）、$2\sqrt{s}-1$（$s<1$）；$\{\mathbf{r}_p,\mathbf{H}_p\}$ 是边缘化产生的先验（\cref{sec:vio-marg}）；$\mathcal{B}$ 为 IMU 测量集，$\mathcal{C}$ 为窗内被观测 $\ge2$ 次的特征集。用 Ceres 等求解。
+\end{theorem}
+
+IMU 残差 $\mathbf{r}_{\mathcal{B}}$ 即 \cref{eq:vio-vins-residual}。视觉残差 $\mathbf{r}_{\mathcal{C}}$ 在\emph{单位球切平面}上定义（适配广角/鱼眼）：第 $l$ 特征首次在第 $i$ 帧观测、在第 $j$ 帧再观测，
+\begin{equation}
+  \mathbf{r}_{\mathcal{C}}=\begin{bmatrix}\mathbf{b}_1&\mathbf{b}_2\end{bmatrix}^\top\Big(\hat{\bar{\mathcal{P}}}^{c_j}_l-\frac{\mathcal{P}^{c_j}_l}{\|\mathcal{P}^{c_j}_l\|}\Big),
+  \label{eq:vio-vis-residual}
+\end{equation}
+$\hat{\bar{\mathcal{P}}}^{c_j}_l=\pi_c^{-1}([\hat u^{c_j}_l,\hat v^{c_j}_l]^\top)$ 是观测的单位射线，$\mathcal{P}^{c_j}_l$ 是把第 $i$ 帧逆深度 $\lambda_l$ 的特征经“$i$ 相机 $\to$ $i$ body $\to$ world $\to$ $j$ body $\to$ $j$ 相机”链变到第 $j$ 帧的预测射线，$\mathbf{b}_1,\mathbf{b}_2$ 张成切平面（视觉残差仅 $2$ 自由度）。其雅可比对位姿用右扰动按 \cref{ch:lie} 与 \cref{ch:vo} 的重投影雅可比链式求得（VINS 论文称“detailed 略”，本书按右扰动约定补：位姿块含 $-\mathbf{R}(\cdot)^\wedge$ 项，再乘投影到切平面的 $2\times3$ 矩阵）。\footnote{VINS-Mono 原文此处仅称“detailed 略”、未给闭式；这里的右扰动雅可比是本书按全章统一的右扰动主线补全的一步。}
+
+\subsection{边缘化与 Schur 补}
+\label{sec:vio-marg}
+
+\paragraph{动机：丢掉旧帧但不丢信息。}
+为保持窗口大小恒定，每来一新关键帧就要移除一旧状态。直接删除会损失该状态携带的全部约束信息；\textbf{边缘化}（marginalization）把被移除状态对应的测量\emph{转成一个作用在保留状态上的先验}，做到“移出窗口、信息不丢”\cite{qin2018vins,sibley2010sliding}。
+
+\begin{theorem}[Schur 补边缘化]\label{thm:vio-schur}
+设当前一次高斯--牛顿迭代的正规方程（信息形式）为 $\boldsymbol{\Lambda}\,\delta\mathbf{x}=\mathbf{g}$，其中 $\boldsymbol{\Lambda}=\mathbf{J}^\top\boldsymbol{\Sigma}^{-1}\mathbf{J}$ 为 Hessian/信息矩阵、$\mathbf{g}=-\mathbf{J}^\top\boldsymbol{\Sigma}^{-1}\mathbf{r}$。把状态分为待边缘化 $\delta\mathbf{x}_m$（最旧帧及仅其可见的特征）与保留 $\delta\mathbf{x}_r$：
+\begin{equation}
+  \begin{bmatrix}\boldsymbol{\Lambda}_{mm}&\boldsymbol{\Lambda}_{mr}\\ \boldsymbol{\Lambda}_{rm}&\boldsymbol{\Lambda}_{rr}\end{bmatrix}
+  \begin{bmatrix}\delta\mathbf{x}_m\\ \delta\mathbf{x}_r\end{bmatrix}
+  =\begin{bmatrix}\mathbf{g}_m\\ \mathbf{g}_r\end{bmatrix}.
+  \label{eq:vio-marg-block}
+\end{equation}
+由第一块行解出 $\delta\mathbf{x}_m=\boldsymbol{\Lambda}_{mm}^{-1}(\mathbf{g}_m-\boldsymbol{\Lambda}_{mr}\delta\mathbf{x}_r)$，代入第二块行消去 $\delta\mathbf{x}_m$，得只含保留状态的先验方程 $\boldsymbol{\Lambda}_p\,\delta\mathbf{x}_r=\mathbf{g}_p$，其中
+\begin{equation}
+  \boldsymbol{\Lambda}_p=\boldsymbol{\Lambda}_{rr}-\boldsymbol{\Lambda}_{rm}\boldsymbol{\Lambda}_{mm}^{-1}\boldsymbol{\Lambda}_{mr},
+  \qquad
+  \mathbf{g}_p=\mathbf{g}_r-\boldsymbol{\Lambda}_{rm}\boldsymbol{\Lambda}_{mm}^{-1}\mathbf{g}_m.
+  \label{eq:vio-schur}
+\end{equation}
+$\boldsymbol{\Lambda}_p$（先验信息矩阵）就是 $\boldsymbol{\Lambda}_{rr}$ 关于 $\boldsymbol{\Lambda}_{mm}$ 的\emph{Schur 补}。
+\end{theorem}
+
+\begin{derivation}[从信息矩阵到可塞进最小二乘的先验残差]
+\cref{thm:vio-ba} 把先验写成残差形式 $\|\mathbf{r}_p-\mathbf{H}_p\mathcal{X}\|^2$，对应代价 $\tfrac12\delta\mathbf{x}_r^\top\boldsymbol{\Lambda}_p\delta\mathbf{x}_r-\mathbf{g}_p^\top\delta\mathbf{x}_r$。把信息先验“平方根化”：对 $\boldsymbol{\Lambda}_p$ 做特征分解 $\boldsymbol{\Lambda}_p=\mathbf{U}\boldsymbol{\Sigma}\mathbf{U}^\top$，取
+\[
+  \mathbf{H}_p=\boldsymbol{\Sigma}^{1/2}\mathbf{U}^\top,\qquad \mathbf{r}_p=\boldsymbol{\Sigma}^{-1/2}\mathbf{U}^\top\mathbf{g}_p,
+\]
+则 $\mathbf{H}_p^\top\mathbf{H}_p=\boldsymbol{\Lambda}_p$、$\mathbf{H}_p^\top\mathbf{r}_p=\mathbf{g}_p$，最小二乘项 $\|\mathbf{r}_p-\mathbf{H}_p\delta\mathbf{x}_r\|^2$ 展开后正好复现上述二次代价。OKVIS、VINS-Mono 即如此存储边缘化先验\cite{sibley2010sliding}。
+\end{derivation}
+
+\paragraph{VINS-Mono 的边缘化策略。}
+不是无脑边缘化最旧帧，而是看次新帧是否为关键帧\cite{qin2018vins}：
+\begin{itemize}
+  \item 若\emph{次新帧是关键帧}：保留它，\textbf{边缘化最旧帧}及其视觉/惯性测量，新先验叠加到已有先验。
+  \item 若\emph{次新帧不是关键帧}：直接\emph{丢弃}该帧及其全部视觉测量，但\emph{保留}连到它的预积分惯性测量（预积分继续向下一帧推进）——以维持系统稀疏性。
+\end{itemize}
+策略目标：让窗内关键帧\emph{空间分散}，保证足够视差三角化特征，并最大化保留大加速度激励的概率（利于尺度可观，回应 \cref{sec:vio-degenerate}）。
+
+\subsection{FEJ 一致性}
+\label{sec:vio-fej}
+
+\paragraph{反面：边缘化破坏一致性。}
+边缘化把先验的雅可比在\emph{边缘化时刻的线性化点}算得并\emph{冻结}。后续优化中保留状态会更新到新线性化点，于是先验雅可比与新因子雅可比的线性化点\emph{不一致}——这会沿不可观方向（\cref{thm:vio-4dof} 的 $4$ 维）\textbf{注入虚假信息}（spurious information），人为地“观测”到本不可观的 yaw 与全局位置，破坏一致性、压小协方差、导致误差增大乃至发散\cite{huang2019vins}。
+
+\begin{theorem}[First-Estimate Jacobian, FEJ]\label{thm:vio-fej}
+为保持线性化系统的不可观子空间维数正确（仍为 $4$），\emph{所有}涉及某变量的因子，其对该变量的雅可比一律在该变量的\textbf{首次估计}（first estimate）处求值，而非在每次迭代的当前估计处\cite{huang2019vins}。这样不同因子共享同一线性化点，零空间结构得以保持。
+\end{theorem}
+
+\begin{insight}
+FEJ 的本质是“为了正确性，牺牲一点点线性化精度”：在当前点线性化更准，但会让不同因子的零空间“对不齐”，凭空造出可观性。FEJ 强制对齐线性化点，宁可稍欠精确，也要保证估计器“不知道自己不知道的东西”。这与 \cref{ch:eskf} 里 EKF 的一致性讨论是同一主题（\cref{sec:vio-compare} 会看到滤波主线也用 FEJ/OC 解决同一问题）。
+\end{insight}
+
+\subsection{初始化、相机率与失败恢复}
+\label{sec:vio-opt-misc}
+
+\paragraph{多速率输出。}
+完整紧耦合 VIO 在嵌入式上可能 $>50\,$ms，达不到相机率\cite{qin2018vins}。VINS 用两层加速：(1) \emph{仅运动视觉惯性 BA}——只优化最新若干 IMU 状态的位姿与速度，固定特征深度/外参/偏置/旧状态，约 $5\,$ms，提供相机率（$\approx30\,$Hz）估计；(2) \emph{IMU 前向传播}——用最近 IMU 测量直接传播最新 VIO 估计到 IMU 率，作闭环控制的状态反馈。
+
+\paragraph{失败检测与恢复。}
+独立模块监控：最新帧跟踪特征数过低、两次输出间位置/旋转大跳变、偏置/外参大变化。一旦触发 $\to$ 系统切回初始化（\cref{sec:vio-init}），重初始化成功后\emph{新建独立的位姿图段}。
+
+\subsection{回环与 4-DOF 位姿图}
+\label{sec:vio-opt-loop}
+
+\paragraph{重定位（紧耦合）。}
+滑窗 $+$ 边缘化界定了计算量，但引入累积漂移（恰是 \cref{thm:vio-4dof} 的 $3$D 位置 $+$ yaw）。VINS 用 DBoW2 词袋\cite{galvez2012bags} 检测回环（额外提 $500$ 角点用 BRIEF 描述），经时间/几何一致性检查（$2$D-$2$D 基础矩阵 RANSAC $+$ $3$D-$2$D PnP RANSAC 两步剔外点）后，把回环帧检索到的特征对应\emph{紧耦合}进当前滑窗优化（回环帧位姿当常量）：在 \cref{eq:vio-ba} 上加回环视觉项，\emph{待解状态维数不变}。
+
+\paragraph{4-DOF 位姿图优化。}
+因 roll/pitch 可观（\cref{thm:vio-4dof}），累积漂移仅 $4$-DOF $(x,y,z,\text{yaw})$，故全局位姿图只优化 $4$ 自由度，固定 roll/pitch。关键帧从滑窗边缘化时入位姿图，经\emph{序列边}（相邻关键帧相对位姿，取自 VIO）与\emph{回环边}（取自重定位）连接。边残差
+\begin{equation}
+  \mathbf{r}_{i,j}=\begin{bmatrix}\mathbf{R}(\hat\phi_i,\hat\theta_i,\psi_i)^{-1}(\mathbf{p}^w_j-\mathbf{p}^w_i)-\hat{\mathbf{p}}^i_{ij}\\ \psi_j-\psi_i-\hat\psi_{ij}\end{bmatrix},
+  \label{eq:vio-posegraph}
+\end{equation}
+$\hat\phi_i,\hat\theta_i$（roll/pitch）取自 VIO 固定不优化。整图最小化 $\sum_{(i,j)\in\mathcal{S}}\|\mathbf{r}_{i,j}\|^2+\sum_{(i,j)\in\mathcal{L}}\rho(\|\mathbf{r}_{i,j}\|^2)$，序列边不用鲁棒核（已含外点剔除）、回环边用 Huber 核（再防错误回环）。
+
+\begin{practice}
+\begin{enumerate}
+  \item （手推）由 \cref{eq:vio-marg-block} 推 \cref{eq:vio-schur}：逐步写出消去 $\delta\mathbf{x}_m$ 的代数，指出哪一步要求 $\boldsymbol{\Lambda}_{mm}$ 可逆，并说明为什么被边缘化的特征“只被最旧帧观测”能让 $\boldsymbol{\Lambda}_{mm}$ 块对角、求逆便宜。
+  \item （调试）一个滑窗 VIO 边缘化后协方差越来越小但轨迹越来越偏，给出至少两条排查路径（提示：FEJ、线性化点一致性）。
+  \item （设计扩展）VINS 的视觉残差定义在单位球切平面上。说明若改成普通针孔像平面残差，会在什么相机类型上出问题，为什么。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{滤波主线：MSCKF}
+\label{sec:vio-msckf}
+
+\paragraph{动机：用 EKF 做 VIO，但别把上千特征塞进状态。}
+EKF-SLAM 把所有特征位置放进状态向量，协方差矩阵随特征数\emph{平方}增长，上千特征即不可行。Mourikis \& Roumeliotis 的多状态约束卡尔曼滤波（Multi-State Constraint Kalman Filter, MSCKF）\cite{mourikis2007msckf} 的核心贡献是：用同一静止特征被\emph{多个相机位姿}观测产生的几何约束做更新，\textbf{却不把特征位置放进状态向量}——于是复杂度仅与特征数\emph{线性}。
+
+\begin{note}
+\textbf{记号转换（JPL $\to$ 本书）}：MSCKF 用 JPL 四元数（虚部在前、左手复合、被动），其旋转矩阵 $\mathbf{C}(\bar{\mathbf{q}})$ 是 Hamilton 的转置、$\otimes$ 顺序相反。${}^I_G\bar{\mathbf{q}}$ 表 global$\to$IMU 旋转（与 VINS 的 body$\to$world 相反）。其姿态误差 $\delta\bar{\mathbf{q}}\approx[\tfrac12\delta\boldsymbol{\theta}^\top,1]^\top$ 因 JPL 是\emph{左乘/global} 误差，方向与本书右扰动相反，按“左扰动并列”处理。下文保留 MSCKF 原记号 $\mathbf{C}(\cdot)$ 以便对照原文，读者转写到本书时按上述规则即可。
+\end{note}
+
+\subsection{状态向量与传播}
+\label{sec:vio-msckf-state}
+
+\paragraph{演进 IMU 状态与误差态。}
+跟踪 IMU 系 $\{I\}$ 相对 global 系 $\{G\}$ 的位姿，$16$ 维 IMU 状态（含单位四元数）
+\begin{equation}
+  \mathbf{X}_{IMU}=[{}^I_G\bar{\mathbf{q}}^\top,\ \mathbf{b}_g^\top,\ {}^G\mathbf{v}_I^\top,\ \mathbf{b}_a^\top,\ {}^G\mathbf{p}_I^\top]^\top,
+  \label{eq:vio-msckf-imu}
+\end{equation}
+对应 $15$ 维误差态 $\tilde{\mathbf{X}}_{IMU}=[\delta\boldsymbol{\theta}_I^\top,\tilde{\mathbf{b}}_g^\top,{}^G\tilde{\mathbf{v}}_I^\top,\tilde{\mathbf{b}}_a^\top,{}^G\tilde{\mathbf{p}}_I^\top]^\top$。时刻 $k$ 状态含 $N$ 个历史相机位姿，完整误差态
+\begin{equation}
+  \tilde{\mathbf{X}}_k=[\tilde{\mathbf{X}}_{IMU}^\top,\ \delta\boldsymbol{\theta}_{C_1}^\top,{}^G\tilde{\mathbf{p}}_{C_1}^\top,\dots,\delta\boldsymbol{\theta}_{C_N}^\top,{}^G\tilde{\mathbf{p}}_{C_N}^\top]^\top,
+  \quad
+  \dim\tilde{\mathbf{X}}_k=15+6N.
+  \label{eq:vio-msckf-full}
+\end{equation}
+
+\paragraph{传播。}
+连续时间 IMU 误差态模型 $\dot{\tilde{\mathbf{X}}}_{IMU}=\mathbf{F}\tilde{\mathbf{X}}_{IMU}+\mathbf{G}\mathbf{n}_{IMU}$，按误差态序 $[\delta\boldsymbol{\theta},\tilde{\mathbf{b}}_g,{}^G\tilde{\mathbf{v}},\tilde{\mathbf{b}}_a,{}^G\tilde{\mathbf{p}}]$（含地球自转 $\boldsymbol{\omega}_G$，多数机器人应用可忽略）：
+\begin{equation}
+  \mathbf{F}=\begin{bmatrix}
+  -\lfloor\hat{\boldsymbol{\omega}}\rfloor_\times&-\mathbf{I}_3&\mathbf{0}&\mathbf{0}&\mathbf{0}\\
+  \mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{0}\\
+  -\mathbf{C}_{\hat q}^\top\lfloor\hat{\mathbf{a}}\rfloor_\times&\mathbf{0}&-2\lfloor\boldsymbol{\omega}_G\rfloor_\times&-\mathbf{C}_{\hat q}^\top&-\lfloor\boldsymbol{\omega}_G\rfloor_\times^2\\
+  \mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{0}&\mathbf{0}\\
+  \mathbf{0}&\mathbf{0}&\mathbf{I}_3&\mathbf{0}&\mathbf{0}
+  \end{bmatrix}.
+  \label{eq:vio-msckf-F}
+\end{equation}
+协方差分块 $\mathbf{P}_{k|k}=\big[\begin{smallmatrix}\mathbf{P}_{II}&\mathbf{P}_{IC}\\ \mathbf{P}_{IC}^\top&\mathbf{P}_{CC}\end{smallmatrix}\big]$（$\mathbf{P}_{II}$ 为 $15\times15$、$\mathbf{P}_{CC}$ 为 $6N\times6N$）。传播时 IMU 块由 Lyapunov 方程 $\dot{\mathbf{P}}_{II}=\mathbf{F}\mathbf{P}_{II}+\mathbf{P}_{II}\mathbf{F}^\top+\mathbf{G}\mathbf{Q}_{IMU}\mathbf{G}^\top$ 数值积分，交叉块由状态转移阵 $\boldsymbol{\Phi}$ 搬运，相机块不变（历史位姿不随 IMU 动力学演化）。
+
+\subsection{状态增广（stochastic cloning）}
+\label{sec:vio-msckf-clone}
+
+录新图时由 IMU 位姿估计算相机位姿估计 ${}^C_G\hat{\bar{\mathbf{q}}}={}^C_I\bar{\mathbf{q}}\otimes{}^I_G\hat{\bar{\mathbf{q}}}$、${}^G\hat{\mathbf{p}}_C={}^G\hat{\mathbf{p}}_I+\mathbf{C}_{\hat q}^\top{}^I\mathbf{p}_C$（外参 ${}^C_I\bar{\mathbf{q}},{}^I\mathbf{p}_C$ 已知），把它\emph{追加}到状态、协方差相应增广
+\begin{equation}
+  \mathbf{P}_{k|k}\leftarrow\begin{bmatrix}\mathbf{I}_{6N+15}\\ \mathbf{J}\end{bmatrix}\mathbf{P}_{k|k}\begin{bmatrix}\mathbf{I}_{6N+15}\\ \mathbf{J}\end{bmatrix}^\top,
+  \quad
+  \mathbf{J}=\begin{bmatrix}\mathbf{C}({}^C_I\bar{\mathbf{q}})&\mathbf{0}_{3\times9}&\mathbf{0}_{3\times3}&\mathbf{0}_{3\times6N}\\ \lfloor\mathbf{C}_{\hat q}^\top{}^I\mathbf{p}_C\rfloor_\times&\mathbf{0}_{3\times9}&\mathbf{I}_3&\mathbf{0}_{3\times6N}\end{bmatrix}.
+  \label{eq:vio-msckf-clone}
+\end{equation}
+这就是“stochastic cloning”：把当前相机位姿克隆进状态，并\emph{正确传递}它与已有状态的相关性（$\mathbf{J}$ 编码了相机位姿对 IMU 状态的依赖）。
+
+\begin{insight}
+MSCKF 的精妙在于把“多视图约束”转化为“被克隆的相机位姿之间的约束”。它不存特征，但存\emph{一串历史相机位姿}；一个特征被这串位姿观测，就给出关于它们的约束。这与优化主线“窗内多关键帧”异曲同工——只是 MSCKF 把这些位姿放在 EKF 状态里、用一次更新消化约束。
+\end{insight}
+
+\subsection{多状态约束测量模型与零空间投影}
+\label{sec:vio-msckf-meas}
+
+考虑单特征 $f_j$ 被 $M_j$ 个相机位姿（$i\in\mathcal{S}_j$）观测，归一化像素观测 $\mathbf{z}_i^{(j)}=\tfrac{1}{{}^{C_i}Z_j}[{}^{C_i}X_j,{}^{C_i}Y_j]^\top+\mathbf{n}_i^{(j)}$，特征相机系位置 ${}^{C_i}\mathbf{p}_{f_j}=\mathbf{C}({}^{C_i}_G\bar{\mathbf{q}})({}^G\mathbf{p}_{f_j}-{}^G\mathbf{p}_{C_i})$。\textbf{第一步}用最小二乘三角化得特征全局位置估计 ${}^G\hat{\mathbf{p}}_{f_j}$（逆深度参数化，高斯--牛顿求解，\cref{sec:vio-msckf-tri}）。再算残差并对相机位姿与特征位置线性化，堆叠该特征全部 $M_j$ 观测：
+\begin{equation}
+  \mathbf{r}^{(j)}\simeq\mathbf{H}_X^{(j)}\tilde{\mathbf{X}}+\mathbf{H}_f^{(j)}\,{}^G\tilde{\mathbf{p}}_{f_j}+\mathbf{n}^{(j)},
+  \quad \mathbf{R}^{(j)}=\sigma_{im}^2\mathbf{I}_{2M_j}.
+  \label{eq:vio-msckf-stack}
+\end{equation}
+
+\begin{theorem}[零空间投影（MSCKF 的灵魂）]\label{thm:vio-nullproj}
+\cref{eq:vio-msckf-stack} 中 ${}^G\tilde{\mathbf{p}}_{f_j}$ 与状态误差 $\tilde{\mathbf{X}}$ \emph{相关}（特征位置由状态估计算得），故不符合 EKF 标准形 $\mathbf{r}=\mathbf{H}\tilde{\mathbf{X}}+\text{noise}$，不能直接更新。设 $\mathbf{A}$ 的列张成 $\mathbf{H}_f^{(j)}$ 的\textbf{左零空间}（$\mathbf{A}^\top\mathbf{H}_f^{(j)}=\mathbf{0}$，$\mathbf{A}$ 酉），把残差投到该零空间\cite{mourikis2007msckf}：
+\begin{equation}
+  \mathbf{r}_o^{(j)}=\mathbf{A}^\top(\mathbf{z}^{(j)}-\hat{\mathbf{z}}^{(j)})\simeq\mathbf{A}^\top\mathbf{H}_X^{(j)}\tilde{\mathbf{X}}+\mathbf{A}^\top\mathbf{n}^{(j)}=\mathbf{H}_o^{(j)}\tilde{\mathbf{X}}+\mathbf{n}_o^{(j)}.
+  \label{eq:vio-nullproj}
+\end{equation}
+因 $\mathbf{H}_f^{(j)}$（$2M_j\times3$）满列秩，其左零空间维数为 $2M_j-3$，故 $\mathbf{r}_o^{(j)}$ 是 $(2M_j-3)$ 维、\emph{与特征坐标误差无关}，可直接做 EKF 更新。$\mathbf{A}$ 无需显式构造，投影可用 Givens 旋转在 $O(M_j^2)$ 算得；因 $\mathbf{A}$ 酉，$\mathbf{n}_o^{(j)}$ 协方差仍 $\sigma_{im}^2\mathbf{I}_{2M_j-3}$。
+\end{theorem}
+
+\subsection{QR 压缩与 EKF 更新}
+\label{sec:vio-msckf-update}
+
+\paragraph{更新触发。}
+(a) 一个跟踪多帧的特征移出视野（最常见）$\to$ 处理其所有测量；(b) 克隆位姿达上限 $N_{\max}$ 必删旧位姿——删前用其全部特征约束做一次更新（删 $N_{\max}/3$ 个时间均匀分布的位姿，\emph{总保留最旧位姿}因其基线大、信息多）。
+
+\paragraph{QR 压缩。}
+设处理 $L$ 个特征，堆叠各 $\mathbf{r}_o^{(j)},\mathbf{H}_o^{(j)}$ 为 $\mathbf{r}_o,\mathbf{H}_X$，维数 $d=\sum_j(2M_j-3)$ 可能很大（$10$ 特征各 $10$ 位姿即 $d=170$）。对 $\mathbf{H}_X$ 做 QR 分解 $\mathbf{H}_X=[\mathbf{Q}_1\ \mathbf{Q}_2]\big[\begin{smallmatrix}\mathbf{T}_H\\ \mathbf{0}\end{smallmatrix}\big]$，$\mathbf{Q}_2^\top\mathbf{r}_o$ 全是噪声可弃，得压缩残差
+\begin{equation}
+  \mathbf{r}_n=\mathbf{Q}_1^\top\mathbf{r}_o=\mathbf{T}_H\tilde{\mathbf{X}}+\mathbf{n}_n,
+  \quad \mathbf{R}_n=\sigma_{im}^2\mathbf{I}_r.
+  \label{eq:vio-msckf-qr}
+\end{equation}
+卡尔曼增益、状态校正、Joseph 形式协方差更新（$\xi=6N+15$）：
+\begin{equation}
+  \mathbf{K}=\mathbf{P}\mathbf{T}_H^\top(\mathbf{T}_H\mathbf{P}\mathbf{T}_H^\top+\mathbf{R}_n)^{-1},
+  \quad \Delta\mathbf{X}=\mathbf{K}\mathbf{r}_n,
+  \quad \mathbf{P}_{k+1|k+1}=(\mathbf{I}_\xi-\mathbf{K}\mathbf{T}_H)\mathbf{P}_{k+1|k}(\mathbf{I}_\xi-\mathbf{K}\mathbf{T}_H)^\top+\mathbf{K}\mathbf{R}_n\mathbf{K}^\top.
+  \label{eq:vio-msckf-ekf}
+\end{equation}
+
+\subsection{特征三角化}
+\label{sec:vio-msckf-tri}
+
+以首次观测帧 $C_n$ 为参考，设特征在 $C_n$ 系坐标的逆深度参数化 $(\alpha,\beta,\rho)=(X/Z,Y/Z,1/Z)$，对每观测帧写重投影、组成非线性最小二乘 $\min_{\alpha,\beta,\rho}\sum_i\|\mathbf{z}_i^{(j)}-\hat{\mathbf{z}}_i^{(j)}(\alpha,\beta,\rho)\|^2$，高斯--牛顿求解，再恢复 ${}^G\hat{\mathbf{p}}_{f_j}={}^{C_n}_G\hat{\mathbf{C}}^\top\tfrac{1}{\rho}[\alpha,\beta,1]^\top+{}^G\hat{\mathbf{p}}_{C_n}$。逆深度避免远特征的数值病态。
+
+\begin{algo}[MSCKF 一个周期]\label{alg:vio-msckf}
+\begin{enumerate}
+  \item \textbf{传播}：用 IMU 测量积分 \cref{eq:vio-msckf-imu} 的状态、按 Lyapunov 方程传播 $\mathbf{P}_{II}$、用 $\boldsymbol{\Phi}$ 搬运交叉块。
+  \item \textbf{增广}：录新图，按 \cref{eq:vio-msckf-clone} 克隆当前相机位姿进状态与协方差。
+  \item \textbf{特征处理}：对“移出视野”或“因删位姿而需处理”的特征，三角化（\cref{sec:vio-msckf-tri}）得 ${}^G\hat{\mathbf{p}}_{f_j}$。
+  \item \textbf{零空间投影}：对每特征算 \cref{eq:vio-nullproj} 的 $\mathbf{r}_o^{(j)},\mathbf{H}_o^{(j)}$，堆叠。
+  \item \textbf{QR 压缩 $+$ 更新}：\cref{eq:vio-msckf-qr,eq:vio-msckf-ekf} 算增益、校正状态、Joseph 更新协方差。
+  \item \textbf{管理}：删除已处理特征对应的旧克隆位姿，保持 $N\le N_{\max}$。
+\end{enumerate}
+\end{algo}
+
+\begin{pitfall}[概念误区：以为 MSCKF “不用三角化特征”]
+\textbf{错误描述}：既然 MSCKF 不把特征放进状态，就以为它完全不需要特征的 $3$D 位置。
+\textbf{现象/后果}：实现时跳过三角化，直接用观测构造残差，残差无意义、更新发散。
+\textbf{根本原因}：MSCKF 不\emph{长期维护}特征于状态，但每次更新前仍要\emph{临时}三角化出 ${}^G\hat{\mathbf{p}}_{f_j}$ 来算预测观测 $\hat{\mathbf{z}}$ 与雅可比 $\mathbf{H}_f$；零空间投影正是把这个临时特征位置\emph{消去}（边缘化）掉。
+\textbf{正确做法}：先三角化（\cref{sec:vio-msckf-tri}）得 ${}^G\hat{\mathbf{p}}_{f_j}$，再算 $\mathbf{H}_X,\mathbf{H}_f$，再零空间投影消去特征。三角化是必需的中间步，不是可省的。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （手推）证明 \cref{eq:vio-msckf-stack} 中 $\mathbf{H}_f^{(j)}$ 满列秩时其左零空间维数为 $2M_j-3$，并解释为什么这等于“$M_j$ 个观测对位姿提供的独立约束数”。
+  \item （实现）写出零空间投影的 Givens 旋转实现思路（不显式构造 $\mathbf{A}$），说明复杂度为何是 $O(M_j^2)$。
+  \item （对比）MSCKF 用 Joseph 形式更新协方差（\cref{eq:vio-msckf-ekf}）而非简单的 $(\mathbf{I}-\mathbf{K}\mathbf{T}_H)\mathbf{P}$。结合 \cref{ch:eskf}，说明 Joseph 形式的数值优势。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{两条主线对比}
+\label{sec:vio-compare}
+
+\paragraph{零空间投影同源——两线的数学桥。}
+优化主线（Forster 的 structureless 视觉因子）与滤波主线（MSCKF）都用了\emph{零空间投影消去路标}，且是\textbf{同一个线性代数操作}。Forster 在每次高斯--牛顿迭代里把视觉残差投到路标雅可比 $\mathbf{E}_l$ 的零空间：
+\begin{equation}
+  \sum_{l=1}^L\|\mathbf{Q}(\mathbf{F}_l\delta\mathbf{T}_{\mathcal{X}(l)}-\mathbf{b}_l)\|^2,
+  \quad
+  \mathbf{Q}\doteq\mathbf{I}-\mathbf{E}_l(\mathbf{E}_l^\top\mathbf{E}_l)^{-1}\mathbf{E}_l^\top,
+  \label{eq:vio-structureless}
+\end{equation}
+$\mathbf{Q}$ 是 $\mathbf{E}_l$ 的正交投影补——与 MSCKF 的 $\mathbf{A}^\top$（$\mathbf{A}^\top\mathbf{H}_f=\mathbf{0}$）作用完全相同：都把“含位姿 $+$ 路标的大因子”化为“只含位姿的小因子”\cite{forster2017preintegration,mourikis2007msckf}。
+
+\begin{insight}
+\textbf{这是本章对比的本质}：MSCKF 与 structureless BA 用同一招消去特征。差别只在\emph{何时线性化}：MSCKF 一次性线性化后投影、\emph{不再}重线性化特征非线性测量（近似随时间变差）；Forster/VINS \emph{每次 GN 迭代都重做消元与重线性化}，故仍得 MAP 最优。“滤波 vs 优化”的根本权衡，就浓缩在“能否重线性化”这一点上。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{滤波（MSCKF）vs 优化（VINS/OKVIS）（合并自\cite{huang2019vins,mourikis2007msckf,qin2018vins}）}
+\label{tab:vio-filter-vs-opt}
+\begin{tabular}{lll}
+\toprule
+维度 & 滤波（MSCKF） & 优化（VINS/OKVIS） \\
+\midrule
+原理 & EKF：IMU 传播、视觉更新；特征零空间边缘化 & 非线性最小二乘 BA；滑窗 $+$ 边缘化 \\
+再线性化 & 测量\emph{一次性}线性化（处理前） & 窗内可\emph{反复}重线性化 \\
+精度风险 & 大线性化误差风险、退化性能 & 误差更小 \\
+特征处理 & 不共估上千特征，零空间消去 & 窗内可反复 relinearize \\
+复杂度 & 与特征数\emph{线性}（核心优势） & 高（迭代解非线性系统） \\
+一致性 & 标准 EKF 零空间维数错（$3$ 而非 $4$）& 边缘化致线性化点固定 \\
+一致性修法 & FEJ / OC / 不变滤波 / SR-ISWF & FEJ（活动窗内仍重线性化） \\
+代表系统 & MSCKF、OpenVINS、SR-ISWF、R-VIO & VINS-Mono、OKVIS、Kimera、DM-VIO、iSAM2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{一致性：两线共同的痛点。}
+标准 EKF 在当前估计点线性化，其线性化系统的不可观子空间\emph{只有 $3$ 维}（而非真实的 $4$ 维，\cref{thm:vio-4dof}）$\to$ 从可用测量获取\emph{不存在}的信息 $\to$ 不一致（协方差过小、误差变大、发散）\cite{huang2019vins}。修法谱系：
+\begin{itemize}
+  \item \textbf{FEJ}（First-Estimates Jacobian）：所有涉及某变量的雅可比在其首次估计处求，保持零空间维数（\cref{thm:vio-fej}，两线通用）。
+  \item \textbf{OC}（Observability-Constrained）：显式约束估计器线性化系统具正确可观性（OC-VINS）。
+  \item \textbf{R-VIO}（robocentric VIO）：机器人中心化表述，\emph{不依赖}线性化点即保持正确可观性。
+  \item \textbf{(右)不变卡尔曼滤波、迭代 EKF}：用群结构改善滤波一致性。
+\end{itemize}
+
+\paragraph{VIO vs VI-SLAM。}
+VIO（MSCKF、VINS 局部）\emph{不}把特征长期放入状态，是里程计（dead reckoning），误差可能\emph{无界}增长，除非用全局信息（GPS/先验地图）或回环；VI-SLAM 把特征与位姿一起放入状态联合估计，易纳回环、误差有界，但复杂度高。多数系统用两线程：局部窗优化少量关键帧（限短期漂移）$+$ 后台长期稀疏位姿图含回环（长期一致），VINS-Mono 即如此（\cref{sec:vio-opt-loop}）。
+
+\begin{table}[H]\centering\small
+\caption{VIO 系统性能锚点（取自\cite{carlone2026handbook,qin2018vins}）}
+\label{tab:vio-performance}
+\begin{tabular}{lll}
+\toprule
+指标 & 数值 & 出处/场景 \\
+\midrule
+好 VIO 漂移 & $<1\%$ 行进距离（可低至 $0.1\%$） & 一般\cite{carlone2026handbook} \\
+FEJ-WBA-VINS & ATE $\approx2.05^\circ/21.2\,$m（$0.18\%$） & KAIST seq38，$11.42\,$km 无回环 \\
+VINS-Mono 无人机 & $61.97\,$m 后漂移 $0.18\,$m & 室内八字回环 \\
+连续局部加速度模型 & VIO 精度 $+5\%$ & EuRoC \\
+连续旋转预积分 & 精度 $\ge1$ 个数量级 & 对比标准离散预积分 \\
+VR 延迟要求 & $10$--$50\,$ms（Quest 3 刷新 $72$--$120\,$Hz）& AR/VR \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{practice}
+\begin{enumerate}
+  \item （手推）证明 \cref{eq:vio-structureless} 的 $\mathbf{Q}=\mathbf{I}-\mathbf{E}(\mathbf{E}^\top\mathbf{E})^{-1}\mathbf{E}^\top$ 满足 $\mathbf{Q}\mathbf{E}=\mathbf{0}$ 且 $\mathbf{Q}^2=\mathbf{Q}=\mathbf{Q}^\top$（正交投影），并说明它与 MSCKF 的 $\mathbf{A}^\top$ 投影到同一子空间。
+  \item （对比）给一个具体场景，说明“一次性线性化”（MSCKF）相对“可重线性化”（优化）在大初值误差下会怎样退化。
+  \item （开放）查阅 SR-ISWF（平方根逆滑窗滤波），说明它如何“用滤波的形式达到接近优化的精度”。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{初始化}
+\label{sec:vio-init}
+
+\paragraph{动机：单目 VIO 不能直接紧耦合冷启动。}
+紧耦合单目 VIO 高度非线性、尺度不直接可观（\cref{sec:vio-degenerate}），没有好初值难以直接联合优化两类测量\cite{qin2018vins}。假设静止起步不合适（实际常在运动中初始化），IMU 大偏置时更复杂。初始化是单目 VINS 最脆弱的环节，需鲁棒过程。
+
+\paragraph{核心思路：松耦合自举。}
+利用纯视觉 SfM 可由相对运动法（五点/八点）自举的好性质，先得纯视觉（上尺度）轨迹与地图，再\emph{把度量 IMU 预积分与纯视觉结果对齐}，粗恢复尺度、重力、速度乃至偏置，足以自举紧耦合估计器\cite{qin2018vins}。
+
+\begin{algo}[VINS-Mono 初始化流程]\label{alg:vio-init}
+\begin{enumerate}
+  \item \textbf{滑窗纯视觉 SfM}（\cref{sec:vio-init-sfm}）：五点法恢复两帧相对位姿、任意设尺度三角化、PnP 估其余帧、全局 BA。得 $c_0$ 参考系下所有帧位姿与特征。
+  \item \textbf{陀螺偏置标定}（\cref{sec:vio-init-sfm}）：用视觉相对旋转与预积分旋转一致性，线性最小二乘解 $\delta\mathbf{b}_w$，重传播预积分。
+  \item \textbf{速度/重力/尺度初始化}（\cref{sec:vio-init-vgs}）：线性最小二乘解每帧速度、$c_0$ 系重力、尺度 $s$。
+  \item \textbf{重力精化}（\cref{sec:vio-init-vgs}）：约束重力幅值，在切平面迭代精化到 $2$-DOF。
+  \item \textbf{完成}：把重力旋到 $z$ 轴得 world 系，所有量旋到 world、平移按 $s$ 缩放到度量。喂给紧耦合 VIO。
+\end{enumerate}
+\end{algo}
+
+\subsection{纯视觉 SfM 与陀螺偏置标定}
+\label{sec:vio-init-sfm}
+
+维护有界滑窗：检查最新帧与先前帧的对应，若稳定跟踪（$>30$ 特征）且足够视差（$>20$ 旋转补偿像素），用五点法恢复两帧相对旋转与上尺度平移，任意设尺度三角化，PnP 估窗内其余帧，最后全局 BA 最小化总重投影误差。设第一相机系 $c_0$ 为 SfM 参考系。给粗略外参 $(\mathbf{p}^b_c,\mathbf{q}^b_c)$，把位姿从相机系转到 body 系：
+\begin{equation}
+  \mathbf{q}^{c_0}_{b_k}=\mathbf{q}^{c_0}_{c_k}\otimes(\mathbf{q}^b_c)^{-1},
+  \qquad
+  s\,\bar{\mathbf{p}}^{c_0}_{b_k}=s\,\bar{\mathbf{p}}^{c_0}_{c_k}-\mathbf{R}^{c_0}_{b_k}\mathbf{p}^b_c,
+  \label{eq:vio-init-cam2body}
+\end{equation}
+$s$ 是把视觉结构对齐到度量的尺度——求 $s$ 是初始化成功的关键。
+
+\paragraph{陀螺偏置标定。}
+窗内两连续帧的视觉相对旋转 $(\mathbf{q}^{c_0}_{b_{k+1}})^{-1}\otimes\mathbf{q}^{c_0}_{b_k}$ 应与预积分旋转 $\boldsymbol{\gamma}^{b_k}_{b_{k+1}}$ 抵消为单位四元数。把预积分对陀螺偏置线性化，最小化
+\begin{equation}
+  \min_{\delta\mathbf{b}_w}\sum_{k\in\mathcal{B}}\big\|(\mathbf{q}^{c_0}_{b_{k+1}})^{-1}\otimes\mathbf{q}^{c_0}_{b_k}\otimes\boldsymbol{\gamma}^{b_k}_{b_{k+1}}\big\|^2,
+  \quad
+  \boldsymbol{\gamma}^{b_k}_{b_{k+1}}\approx\hat{\boldsymbol{\gamma}}^{b_k}_{b_{k+1}}\otimes\begin{bmatrix}1\\ \tfrac12\mathbf{J}^\gamma_{b_w}\delta\mathbf{b}_w\end{bmatrix}.
+  \label{eq:vio-init-gyro}
+\end{equation}
+取上式四元数虚部为残差，化为线性最小二乘：令 $\mathbf{r}=2[(\mathbf{q}^{c_0}_{b_{k+1}})^{-1}\otimes\mathbf{q}^{c_0}_{b_k}\otimes\hat{\boldsymbol{\gamma}}^{b_k}_{b_{k+1}}]_{xyz}$，对 $\delta\mathbf{b}_w$ 线性化得正规方程 $\sum_k\mathbf{J}^\gamma_{b_w}{}^\top\mathbf{J}^\gamma_{b_w}\,\delta\mathbf{b}_w=\sum_k\mathbf{J}^\gamma_{b_w}{}^\top\mathbf{r}$。\footnote{从最小化目标到正规方程的这一步 VINS-Mono 原文略去，此处按标准高斯--牛顿做法补全。}\;解出 $\delta\mathbf{b}_w$ 后用新陀螺偏置\emph{重传播}所有预积分量。
+
+\subsection{速度、重力、尺度与重力精化}
+\label{sec:vio-init-vgs}
+
+陀螺偏置定后，待估状态 $\mathcal{X}_I=[\mathbf{v}^{b_0}_{b_0},\dots,\mathbf{v}^{b_n}_{b_n},\mathbf{g}^{c_0},s]$（维数 $3(n+1)+3+1$）。由 \cref{eq:vio-vins-preint} 写两连续帧关系并联立 \cref{eq:vio-init-cam2body}，得\emph{线性}测量模型
+\begin{equation}
+  \hat{\mathbf{z}}^{b_k}_{b_{k+1}}=\begin{bmatrix}\hat{\boldsymbol{\alpha}}^{b_k}_{b_{k+1}}-\mathbf{p}^b_c+\mathbf{R}^{b_k}_{c_0}\mathbf{R}^{c_0}_{b_{k+1}}\mathbf{p}^b_c\\ \hat{\boldsymbol{\beta}}^{b_k}_{b_{k+1}}\end{bmatrix}=\mathbf{H}^{b_k}_{b_{k+1}}\mathcal{X}_I+\mathbf{n}^{b_k}_{b_{k+1}},
+  \label{eq:vio-init-z}
+\end{equation}
+\begin{equation}
+  \mathbf{H}^{b_k}_{b_{k+1}}=\begin{bmatrix}
+  -\mathbf{I}\Delta t_k&\mathbf{0}&\tfrac12\mathbf{R}^{b_k}_{c_0}\Delta t_k^2&\mathbf{R}^{b_k}_{c_0}(\bar{\mathbf{p}}^{c_0}_{c_{k+1}}-\bar{\mathbf{p}}^{c_0}_{c_k})\\
+  -\mathbf{I}&\mathbf{R}^{b_k}_{c_0}\mathbf{R}^{c_0}_{b_{k+1}}&\mathbf{R}^{b_k}_{c_0}\Delta t_k&\mathbf{0}
+  \end{bmatrix},
+  \label{eq:vio-init-H}
+\end{equation}
+四列块对应 $[\mathbf{v}^{b_k}_{b_k},\mathbf{v}^{b_{k+1}}_{b_{k+1}},\mathbf{g}^{c_0},s]$。求解线性最小二乘 $\min_{\mathcal{X}_I}\sum_k\|\hat{\mathbf{z}}^{b_k}_{b_{k+1}}-\mathbf{H}^{b_k}_{b_{k+1}}\mathcal{X}_I\|^2$ 得每帧速度、$c_0$ 系重力与尺度 $s$。
+
+\begin{note}
+\textbf{与 ORB-SLAM 初始化的差异}：VINS \emph{初始步忽略加速度计偏置}——因加计偏置与重力耦合，重力幅值远大于平台动力学、初始化阶段又短，加计偏置难观测\cite{qin2018vins}。详细加计偏置标定留给在线 VIO 阶段。这与 \cref{tab:vio-degenerate} 一致：短窗、低激励下尺度/偏置耦合，强求加计偏置会病态。
+\end{note}
+
+\paragraph{重力精化。}
+重力幅值已知 $\to$ 重力只剩 $2$-DOF。在切平面用两变量重参数化 $\mathbf{g}=g\cdot\hat{\bar{\mathbf{g}}}+w_1\mathbf{b}_1+w_2\mathbf{b}_2$（$g\approx9.81$，$\hat{\bar{\mathbf{g}}}$ 为重力方向单位向量，$\mathbf{b}_1,\mathbf{b}_2$ 张成切平面）。把 \cref{eq:vio-init-z} 里的 $\mathbf{g}$ 替换后连同其他状态一起解 $w_1,w_2$，迭代到 $\hat{\mathbf{g}}$ 收敛。切平面基由叉积构造：
+\begin{equation}
+  \mathbf{b}_1=\mathrm{normalize}\big(\hat{\bar{\mathbf{g}}}\times\mathbf{e}\big),
+  \quad
+  \mathbf{b}_2=\hat{\bar{\mathbf{g}}}\times\mathbf{b}_1,
+  \quad
+  \mathbf{e}=\begin{cases}[1,0,0]^\top,&\hat{\bar{\mathbf{g}}}\neq[1,0,0]^\top\\ [0,0,1]^\top,&\text{否则}\end{cases}
+  \label{eq:vio-init-tangent}
+\end{equation}
+精化后把重力旋到 $z$ 轴得 $\mathbf{q}^w_{c_0}$，所有量旋到 world、平移按 $s$ 缩放到度量。初始化完成。
+
+\begin{pitfall}[思维陷阱：在静止或匀速下尝试初始化]
+\textbf{错误描述}：为求“稳定”，在机器人静止或匀速直线时启动 VIO 初始化。
+\textbf{现象/后果}：\cref{eq:vio-init-H} 的尺度列与重力列退化、$\mathbf{H}^\top\mathbf{H}$ 接近奇异，解出的尺度 $s$ 极不可靠，初始化频繁失败或给出错误尺度。
+\textbf{根本原因}：\cref{tab:vio-degenerate} 表明常加速度（含静止、匀速）下尺度不可观；尺度的可观性依赖加速度的\emph{变化}激励。
+\textbf{正确做法}：等待含旋转与加速度变化的运动再初始化；实现“激励充分性检查”（如预积分速度增量方差、视差是否足够），不足则继续等待而非强行求解。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （手推）由 \cref{eq:vio-vins-preint} 的 $\boldsymbol{\alpha},\boldsymbol{\beta}$ 定义与 \cref{eq:vio-init-cam2body}，推导 \cref{eq:vio-init-H} 的速度/重力/尺度块（逐列对应）。
+  \item （实现）实现 \cref{eq:vio-init-tangent} 的切平面基构造，验证 $\mathbf{b}_1\perp\hat{\bar{\mathbf{g}}}$、$\mathbf{b}_2\perp\hat{\bar{\mathbf{g}}}$、$\mathbf{b}_1\perp\mathbf{b}_2$。
+  \item （跨章综合）结合 \cref{ch:vo} 的五点法与本节：写出从“两帧图像”到“度量尺度 VIO 初值”的完整数据流，标出每步用了哪类测量（纯视觉/IMU）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{ORB-SLAM3：系统级整合（惯性初始化编排、Atlas 多地图与地图融合）}
+\label{sec:vio-orbslam3}
+
+前面几节把 VIO 的\emph{算法零件}讲透了：预积分因子（\cref{sec:vio-preint}）、可观性（\cref{sec:vio-obs}）、优化主线（\cref{sec:vio-opt}）、初始化理论（\cref{sec:vio-init}）。本节换一个视角，看一个把这些零件\emph{装成一个完整产品}的代表——ORB-SLAM3\cite{campos2021orbslam3}：它在 ORB-SLAM2 的三线程视觉 SLAM（\cref{sec:sys-orbslam}）之上，新增了三件本书别处未覆盖的\textbf{系统级}能力：(1) 把通用三段式初始化（\cref{sec:vio-init}）改造成\emph{放在局部建图子线程、不阻塞跟踪、用因子图分阶段递进}的 MAP 初始化；(2) IMU 模式下的\emph{跟踪状态机}（短/长丢失二态、IMU 预测找回、重定位换 MLPnP）；(3) \textbf{Atlas 多地图}与\textbf{地图融合}——把“跟丢即新建子图、再相遇即缝合”做成一等公民。本节只讲这三件系统级差异，\emph{不重推}任何已在前文给出的残差/雅可比/线性解，凡涉及处一律 交叉引用 回指。
+
+\begin{insight}
+ORB-SLAM3 三大系统级创新可以一句话概括各自的“为什么”：MAP 初始化把 \cref{sec:vio-init} 的“一次性松耦合自举”升级为\emph{随时间递进精化}（先快后准、且不卡住实时跟踪）；跟踪状态机回答“跟丢的几秒里该信谁”（短丢信 IMU、长丢认输）；Atlas $+$ 融合回答“认输之后怎么办”（不报错退出，而是\emph{断臂求生}另起一张图、待回到旧区域再缝合）。三者合力把 VIO 从“一条会断的里程计”变成“一个跌倒能爬起来的系统”。
+\end{insight}
+
+\subsection{MAP-based IMU 三阶段初始化：局部建图线程内的工程编排}
+\label{sec:vio-orbslam3-init}
+
+\paragraph{与通用三段式初始化的关系。}
+\cref{sec:vio-init} 的 VINS-Mono 式初始化（纯视觉 SfM $\to$ 陀螺偏置 $\to$ 线性解速度/重力/尺度 $\to$ 重力精化）与本节互为印证：二者都先用纯视觉拿到\emph{上尺度}结构、再与 IMU 对齐恢复尺度/重力/速度。差异\emph{不在理论本体}，而在\textbf{系统编排}\cite{campos2021orbslam3,campos2020inertialinit}：ORB-SLAM3 把整个初始化放进\emph{局部建图子线程}，用一组因子图（\cref{fig:vio-orbslam3-init}）把它拆成四个\emph{随时间递进}的阶段，且全程\textbf{不阻塞跟踪线程的实时性}。下面只讲这套编排，预积分残差仍用 \cref{thm:vio-imu-residual}、线性解仍如 \cref{eq:vio-init-H}。
+
+\paragraph{为什么要把初始化“放进后台、分阶段做”。}
+单目 VIO 冷启动时尺度、重力方向、偏置都未知（\cref{sec:vio-degenerate} 已证尺度需加速度激励），强行一次性联合优化既慢又易陷局部极小（\cref{sec:vio-coupling} 的 pitfall）。ORB-SLAM3 的设计哲学是\emph{先用最便宜的视觉自举、再逐步把惯性量“拧准”}：跟踪线程始终以高帧率（视觉或视觉惯性）跑，初始化在局部建图线程后台推进，每完成一个阶段就把更准的尺度/重力/偏置\emph{回灌}给系统。这样既保证实时位姿输出不中断，又让惯性参数随时间收敛到高精度。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, node distance=5mm and 9mm,
+  st/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, minimum height=12mm, fill=second!8, draw=second!60!black},
+  ann/.style={font=\scriptsize, align=center, text=gray!50!black},
+  ar/.style={->, thick, main!60!black}]
+\node[st] (a) {\textbf{(a) 纯视觉 MAP}\\ 运动恢复结构\\ 尺度未知};
+\node[st, right=of a] (b) {\textbf{(b) 纯惯性 MAP}\\ 固定轨迹\\ 优化 $\{s,\mathbf{R}_{wg},\mathbf{b},\bar{\mathbf{v}}_{0:k}\}$};
+\node[st, right=of b] (c) {\textbf{(c) 视觉惯性}\\ \textbf{联合 MAP}\\ $5\!\sim\!15\,$s 联合 BA};
+\node[st, right=of c] (d) {\textbf{(d) 尺度/重力}\\ \textbf{精化}（单目）\\ 每 $10\,$s 跑};
+\draw[ar] (a)--(b); \draw[ar] (b)--(c); \draw[ar] (c)--(d);
+\node[ann, below=2.5mm of a] {$4\!\sim\!10\,$Hz 插帧\\ $\le 2\,$s/$10$ KF};
+\node[ann, below=2.5mm of b] {尺度/偏置\\ 显式独立变量\\ 收敛快};
+\node[ann, below=2.5mm of c] {误差 $\to 5\%$\\ ($5\!\sim\!15\,$s 后 $1\%$)};
+\node[ann, below=2.5mm of d] {收尾：$100$ KF\\ 或 $75\,$s};
+\node[ann, above=2mm of b, xshift=-6mm] {\texttt{mbImuInitialized}};
+\node[ann, above=2mm of c] {\texttt{mbIMU\_BA1}};
+\node[ann, above=2mm of d] {\texttt{mbIMU\_BA2}};
+\end{tikzpicture}
+\caption{ORB-SLAM3 的 MAP-based IMU 初始化四阶段（因子图仿\cite{campos2021orbslam3,campos2020inertialinit} 重绘）。从纯视觉到纯惯性到联合再到精化，惯性参数随时间递进收敛；阶段标志位标在上方。整个过程在局部建图子线程完成，不阻塞跟踪。}
+\label{fig:vio-orbslam3-init}
+\end{figure}
+
+\paragraph{阶段 (a)：纯视觉 MAP。}
+纯视觉单目 SLAM 用运动恢复结构完成地图初始化，以较高频率（$4$--$10\,$Hz）插关键帧；因帧间时间短，预积分不确定度较小，约 $2\,$s 内即得一张由 $10$ 个关键帧位姿与数百地图点构成的地图\cite{campos2021orbslam3}。\emph{此时地图尺度仍未知}，对应因子图 \cref{fig:vio-orbslam3-init}(a)：只有重投影误差项，关键帧的尺度相关量被“固定不优化”。其位姿精度高（视觉不确定度远小于纯惯性），故下一步可\emph{把视觉轨迹当常量}、只解惯性量。
+
+\paragraph{阶段 (b)：纯惯性 MAP（固定轨迹，显式解尺度）。}
+这是 ORB-SLAM3 初始化最关键的一步\cite{campos2020inertialinit}。\emph{不}直接做视觉惯性联合优化（无良好尺度初值时易陷局部极小、计算量大），而是\textbf{固定阶段 (a) 的视觉轨迹}、只优化惯性变量
+\begin{equation}
+  \mathcal{X}_k=\{s,\ \mathbf{R}_{wg},\ \mathbf{b},\ \bar{\mathbf{v}}_{0:k}\},
+  \label{eq:vio-orbslam3-inertial-state}
+\end{equation}
+其中 $s$ 是纯视觉地图的\emph{尺度因子}、$\mathbf{b}=(\mathbf{b}^a,\mathbf{b}^g)$ 是加计/陀螺偏置、$\mathbf{R}_{wg}\in\SO(3)$ 是\emph{重力方向}（世界系重力 $\mathbf{g}=\mathbf{R}_{wg}\mathbf{g}_I$，$\mathbf{g}_I=(0,0,G)^\top$、$G$ 为重力幅值）、$\bar{\mathbf{v}}_{0:k}$ 是各关键帧\emph{不含尺度}的速度（真实速度 $\mathbf{v}=s\bar{\mathbf{v}}$、真实位置 $\mathbf{p}=s\bar{\mathbf{p}}$）。把尺度与偏置写成\emph{显式独立变量}（而非藏在别的量里间接优化），收敛远快。优化中重力方向与尺度的更新方式保号：
+\begin{equation}
+  \mathbf{R}_{wg}^{\text{new}}=\mathbf{R}_{wg}^{\text{old}}\,\mathrm{Exp}(\delta\alpha_g,\delta\beta_g,0),
+  \qquad
+  s^{\text{new}}=s^{\text{old}}\exp(\delta s),
+  \label{eq:vio-orbslam3-grav-update}
+\end{equation}
+$\mathrm{Exp}$ 的第三分量恒为 $0$——重力只有 $2$-DOF（绕重力轴的 yaw 不可观，正是 \cref{thm:vio-4dof}），$\exp(\delta s)$ 则保证尺度恒正。此步只优化\emph{惯性残差}，残差直接复用第 \cref{sec:vio-preint} 节的预积分推导（带尺度信息）：
+\begin{equation}
+\begin{aligned}
+  \mathbf{r}_{\Delta\mathbf{R}_{ij}}&=\mathrm{Log}\big[(\Delta\tilde{\mathbf{R}}_{ij}\,\mathrm{Exp}(\tfrac{\partial\Delta\tilde{\mathbf{R}}_{ij}}{\partial\mathbf{b}^g}\delta\mathbf{b}^g_i))^\top\mathbf{R}_{wi}^\top\mathbf{R}_{wj}\big],\\
+  \mathbf{r}_{\Delta\mathbf{v}_{ij}}&=\mathbf{R}_{wi}^\top(s\bar{\mathbf{v}}_{wj}-s\bar{\mathbf{v}}_{wi}-\mathbf{R}_{wg}\mathbf{g}_I\Delta t_{ij})-\Delta\hat{\mathbf{v}}_{ij},\\
+  \mathbf{r}_{\Delta\mathbf{p}_{ij}}&=\mathbf{R}_{wi}^\top(s\bar{\mathbf{p}}_{wj}-s\bar{\mathbf{p}}_{wi}-s\bar{\mathbf{v}}_{wi}\Delta t_{ij}-\tfrac12\mathbf{R}_{wg}\mathbf{g}_I\Delta t_{ij}^2)-\Delta\hat{\mathbf{p}}_{ij},
+\end{aligned}
+  \label{eq:vio-orbslam3-inertial-res}
+\end{equation}
+$\Delta\hat{\mathbf{v}}_{ij},\Delta\hat{\mathbf{p}}_{ij}$ 是用偏置一阶修正（\cref{eq:vio-bias-corr}）后的预积分测量。对应因子图 \cref{fig:vio-orbslam3-init}(b)：惯性残差 $+$ 偏置随机游走 $+$ 先验，轨迹固定不优化。\emph{初始化阶段须注入传感器不确定度}（信息矩阵系数 $\text{priorG},\text{priorA}$），否则惯性量约束不足会给出不可预测的错误——这与 \cref{sec:vio-init} “短窗低激励下加计偏置难观测、初始化阶段先弱化”同源。解完用 $s$ 把视觉地图缩放到真实尺度、把世界系 $z$ 轴转到与重力对齐，并用最新惯性参数\emph{重传播}预积分以降后续线性化误差。
+
+\paragraph{阶段 (c)：视觉惯性联合 MAP。}
+有了 (b) 的良好惯性初值，再做\emph{视觉惯性联合优化}调优（因子图 \cref{fig:vio-orbslam3-init}(c)，重投影 $+$ 惯性 $+$ 偏置游走全开）。EuRoC 上实验：$2\,$s 内轨迹误差即 $\le 5\%$；为提精度，初始化后 $5$--$15\,$s 再跑一次视觉惯性全 BA，误差收敛到约 $1\%$\cite{campos2021orbslam3}。至此尺度、IMU 参数、重力方向、地图均准确，系统自动切入视觉惯性 SLAM。
+
+\paragraph{阶段 (d)：尺度/重力精化（仅单目）。}
+某些低激励运动（如长时间慢速）下惯性参数可观性差，$15\,$s 内未必收敛到精解。为此 ORB-SLAM3 加一道\emph{尺度精化}：在纯惯性优化基础上\emph{只优化尺度与重力方向两个参数}（其余状态固定，因子图 \cref{fig:vio-orbslam3-init}(d)，计算极廉），每 $10\,$s 在局部建图线程跑一次，直到自初始化以来地图已超 $100$ 个关键帧或超 $75\,$s 才停止精化\cite{campos2021orbslam3}。
+
+\begin{table}[H]\centering\small
+\caption{ORB-SLAM3 IMU 初始化的阶段标志与产物（整理自\cite{campos2021orbslam3,campos2020inertialinit}）}
+\label{tab:vio-orbslam3-init}
+\begin{tabular}{llll}
+\toprule
+阶段 & 标志位 & 优化什么 & 触发/收尾 \\
+\midrule
+(a) 纯视觉 MAP & --- & 重投影（尺度固定） & $\ge 10$ KF 且时间跨度 $\ge 2\,$s \\
+(b) 纯惯性 MAP & \texttt{mbImuInitialized} & $s,\mathbf{R}_{wg},\mathbf{b},\bar{\mathbf{v}}$（轨迹固定） & 第一阶段：快速初始化、尽用 IMU 跟踪 \\
+(c) 联合 MAP & \texttt{mbIMU\_BA1} & 重投影 $+$ 惯性 $+$ 偏置 & 累计 $>5\,$s：短时修正 IMU \\
+(c$'$) 联合全 BA & \texttt{mbIMU\_BA2} & 同上（再精化） & 累计 $>15\,$s：保证高精度 \\
+(d) 尺度精化 & --- & 仅 $s,\mathbf{R}_{wg}$ & 每 $10\,$s，至 $100$ KF / $75\,$s 收尾 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}
+对比 \cref{sec:vio-init}：VINS-Mono 把初始化当成“一次性、做完即用”的开关；ORB-SLAM3 把它当成“随系统运行持续精化”的\emph{过程}——(b) 提供能用的粗解（几秒）、(c)/(c$'$) 提供准解（十几秒）、(d) 兜底低激励场景（一分多钟）。代价是更复杂的状态机（三个标志位 $+$ 计时），换来的是“边跑边校准”而非“校准好才敢跑”。双目惯性模式则\emph{固定尺度} $s\!=\!1$、把 $s$ 从优化变量删去（双目本身有度量基线），加速收敛——这也回应了 \cref{sec:vio-degenerate}：双目天然不受单目尺度退化之苦。
+\end{insight}
+
+\subsection{IMU 模式的跟踪状态机：短/长丢失与 MLPnP}
+\label{sec:vio-orbslam3-track}
+
+ORB-SLAM3 的跟踪线程主体仍是 ORB-SLAM2 的两阶段结构（先参考关键帧/恒速模型/重定位之一拿到粗位姿，再用局部地图精化，\cref{sec:sys-orbslam}）。引入 IMU 后，最重要的变化是把“跟踪丢失”从一个状态\textbf{细分为两个}\cite{campos2021orbslam3}：
+
+\begin{description}
+  \item[\texttt{RECENTLY\_LOST}（短期丢失）] IMU 模式下，当前地图关键帧数 $>10$ 且丢失时间 $<5\,$s。此时\emph{先用 IMU 预积分预测一个粗位姿}（\texttt{PredictStateIMU()}），再在更大的图像窗口内投影匹配、视觉惯性联合优化找回。这是 IMU “桥接相机短暂失明”能力（\cref{sec:vio-problem} 的互补性）的直接兑现。
+  \item[\texttt{LOST}（长期丢失）] 短期丢失超 $5\,$s 仍未找回；或纯视觉模式重定位失败。进入此态即\emph{认输}——触发 Atlas \emph{新建地图}（\cref{sec:vio-atlas} 的“断臂求生”）。
+\end{description}
+
+这两个状态在“参考关键帧跟踪与恒速模型跟踪\emph{都}失败”时设置：若距上次重定位不到 $1\,$s 且为 IMU 模式，标 \texttt{LOST}（积累的 IMU 太少，预测不可靠）；否则若地图关键帧 $>10$ 标 \texttt{RECENTLY\_LOST}，记下丢失时刻待 IMU 挽救。
+
+\paragraph{IMU 模式下的三处放宽与一处替换。}
+有了 IMU，跟踪可以“更大胆”——成功跟踪的门槛被系统性放宽\cite{campos2021orbslam3}：
+\begin{itemize}
+  \item \textbf{恒速模型用 IMU 积分代替位姿差}：IMU 已初始化且距上次重定位较久时，用 \texttt{PredictStateIMU()} 给当前帧初值，而非纯靠上一帧的恒速外推（后者在快速变速时不准）；
+  \item \textbf{降低成功判定门槛}：纯视觉模式要求末次位姿优化后内点 $>10$ 才算跟踪成功；IMU 模式下，只要有 IMU 约束兜底即认为成功（局部地图跟踪在 \texttt{RECENTLY\_LOST} 态要求 $\ge 10$ 内点、IMU 模式 $\ge 15$ 内点，其余情况 $>30$）；
+  \item \textbf{局部地图跟踪联合惯性}：第二阶段不再只优化位姿，而是用“上一帧/上一关键帧 $+$ 当前帧”的视觉与 IMU 信息\emph{联合优化}位姿、速度、偏置（\texttt{PoseInertialOptimizationLastFrame/\allowbreak LastKeyFrame}）；
+  \item \textbf{重定位 EPnP $\to$ MLPnP}：重定位流程不变，仅把求位姿的 EPnP（至少 $4$ 对点、为标定好的针孔模型推导、不具普适性）换成 \textbf{MLPnP}（最大似然 PnP，至少 $6$ 对点）。MLPnP \emph{把相机投影模型解耦}出来，对针孔/鱼眼等任意标定模型都适用——这正是 ORB-SLAM3 能同时支持针孔与鱼眼镜头的一块基石。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{跟踪状态：ORB-SLAM2 vs ORB-SLAM3（整理自\cite{campos2021orbslam3,murartal2017orbslam2}）}
+\label{tab:vio-track-states}
+\begin{tabular}{lll}
+\toprule
+状态 & ORB-SLAM2 & ORB-SLAM3 \\
+\midrule
+\texttt{OK} & 正常跟踪 & 正常跟踪（IMU 模式判定门槛更松） \\
+\texttt{RECENTLY\_LOST} & ——（无） & IMU 模式：KF$>10$ 且丢失 $<5\,$s，用 IMU 预测找回 \\
+\texttt{LOST} & 重定位失败即丢 & IMU 模式丢 $>5\,$s / 纯视觉重定位失败 $\to$ 新建地图 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[概念误区：把 \texttt{RECENTLY\_LOST} 当成“快要丢了”的预警]
+\textbf{错误描述}：望文生义，以为 \texttt{RECENTLY\_LOST} 是“即将丢失”的中间预警态，跟踪其实还在正常进行。
+\textbf{现象/后果}：误以为此态下视觉仍在工作，调试时忽略 IMU 预测路径，找不到“轨迹在丢失段是怎么续上的”。
+\textbf{根本原因}：\texttt{RECENTLY\_LOST} 是\emph{已经丢了}（参考关键帧与恒速模型跟踪都失败）、但\emph{还在抢救}的状态——视觉已经接不上，靠 IMU 预积分预测位姿、在大窗口里再试图重新匹配（\cref{sec:vio-problem} 的“IMU 桥接相机失明”）。能救回则回 \texttt{OK}，超 $5\,$s 救不回才真正 \texttt{LOST}。
+\textbf{正确做法}：把它理解为“IMU 接管的抢救窗口”：纯视觉模式根本没有这个态（无 IMU 可抢救），只有 IMU 模式且地图够成熟（KF$>10$）才启用。
+\end{pitfall}
+
+\subsection{多地图系统 Atlas}
+\label{sec:vio-atlas}
+
+\paragraph{动机：跟丢之后不退出，而是另起一张图。}
+传统单地图 VIO/SLAM 一旦跟踪丢失且重定位失败，要么报错退出、要么把错误位姿硬塞进优化（污染整条轨迹）。ORB-SLAM3 的 \textbf{Atlas（地图集）}\cite{elvira2019atlas,campos2021orbslam3} 换了个思路：\emph{跟丢就把当前地图冻结为“非活跃地图”、另建一张新的“活跃地图”继续跑}，待日后回到旧区域、检测到共同区域时再把两图\emph{融合}。这就是“断臂求生”——宁可暂时分成多张子图，也不让一次坏闭环把全局轨迹拉飞。
+
+\begin{definition}[Atlas 多地图]\label{def:vio-atlas}
+Atlas 是一组\emph{不连续}子地图的集合，外加一个\textbf{所有子图共享}的 DBoW2 关键帧数据库（视觉字典 $+$ 识别数据库），以保证跨子图的位置识别效率\cite{elvira2019atlas}。每张子图各有自己的关键帧、地图点、共视图与生成树（\cref{sec:sys-orbslam}），参考帧固定为其第一帧。按状态分两类：
+\begin{itemize}
+  \item \textbf{活跃地图}（active map）：当前输入视频流正在更新、跟踪线程用于定位的地图。系统中\emph{始终恰有一张}。
+  \item \textbf{非活跃地图}（non-active map）：除活跃地图外的其余子图，数目随运行动态增减。
+\end{itemize}
+两类可互相转化：跟丢时活跃地图被冻结为非活跃、新建一张活跃地图；融合时非活跃地图并入活跃地图。
+\end{definition}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, font=\small,
+  db/.style={draw, rounded corners, align=center, fill=third!10, draw=third!60!black, inner sep=4pt, minimum height=16mm},
+  am/.style={draw, rounded corners, align=center, fill=main!12, draw=main!70!black, inner sep=4pt},
+  nm/.style={draw, rounded corners, align=center, fill=gray!12, draw=gray!60!black, inner sep=4pt}]
+\node[db] (db) {DBoW2\\ 关键帧数据库\\[2pt] \scriptsize 视觉字典\\ \scriptsize 识别数据库};
+\node[am, right=10mm of db] (am) {\textbf{活跃地图}\\[2pt] \scriptsize 地图点 · 关键帧\\ \scriptsize 共视图 · 生成树};
+\node[nm, right=8mm of am, yshift=2mm] (nm1) {};
+\node[nm, right=7mm of am, yshift=1mm] (nm2) {};
+\node[nm, right=6mm of am] (nm3) {\textbf{非活跃地图}\\[2pt] \scriptsize 地图点 · 关键帧\\ \scriptsize 共视图 · 生成树};
+\draw[<->, thick, gray!60!black] (am) -- node[above, font=\scriptsize]{融合 / 冻结} (nm3);
+\draw[->, thick, third!60!black] (db.east) -- (am.west);
+\node[draw, dashed, rounded corners, fit=(db)(am)(nm3), inner sep=6mm, label={[font=\small]above:地图集 Atlas}] {};
+\end{tikzpicture}
+\caption{Atlas 地图集结构（仿\cite{elvira2019atlas} 重绘）：所有子图共享一个 DBoW2 关键帧数据库；活跃地图恒为一张，非活跃地图数目动态变化。}
+\label{fig:vio-atlas}
+\end{figure}
+
+\paragraph{量化收益。}
+Atlas 对精度与鲁棒性的提升很显著：在 EuRoC 上，ORB-SLAM3 的单目惯性精度约为 VINS-Mono 的 $2.6$ 倍（单段运行），多段（多地图）运行更达 $3.2$ 倍\cite{campos2021orbslam3}。\cref{tab:vio-multimap} 给出量化对比：覆盖率（成功定位帧数占比）从单地图基线的 $10\%$--$15\%$ 提到 $70\%$--$90\%$，绝对轨迹误差（ATE）亦改善（区间结论与具体数值均出自 ORBSLAM-Atlas\cite{elvira2019atlas}）。
+
+\begin{table}[H]\centering\small
+\caption{多地图量化收益：EuRoC 上多地图 vs 单地图（数据自 ORBSLAM-Atlas\cite{elvira2019atlas} 表 I，纯视觉单目，$5$ 次中位数；该多地图机制即 ORB-SLAM3 之 Atlas 前身）}
+\label{tab:vio-multimap}
+\begin{tabular}{lcccccc}
+\toprule
+& \multicolumn{3}{c}{ORBSLAM-Atlas 多地图} & \multicolumn{3}{c}{ORB-SLAM 单地图} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+EuRoC 序列 & ATE/m & 覆盖率/\% & 地图数 & ATE/m & 覆盖率/\% & 地图数 \\
+\midrule
+V1\_03 & 0.106 & 90.74 & 2 & 0.132 & 10.32 & 1 \\
+V2\_03 & 0.093 & 70.74 & 2 & 0.146 & 15.71 & 1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{何时新建地图。}
+新建地图的时机要拿捏（太频繁伤效率、太保守伤鲁棒）\cite{campos2021orbslam3}。三种情形触发新建（\texttt{CreateNewMap()}：把当前活跃地图标为非活跃 $\to$ 建新地图标为活跃 $\to$ 插入地图集）：
+\begin{enumerate}
+  \item \textbf{系统启动}：地图集为空，建第一张地图；
+  \item \textbf{跟踪线程时间戳异常}：当前帧时间戳比上帧\emph{还小}（时间戳颠倒）或比上帧大 $>1\,$s（时间戳跳变）——数据流出错，弃旧图建新图；
+  \item \textbf{跟踪丢失（\texttt{LOST}）}：若当前活跃地图关键帧 $<10$（有效信息太少），直接重置丢弃；否则（关键帧 $\ge 10$，有价值）\emph{冻结为非活跃、另建新图}——这就是断臂求生。
+\end{enumerate}
+
+\paragraph{宽基线匹配：多地图融合的关键使能。}
+为什么多地图能带来这么大收益？关键在于地图融合需要在\emph{不同地图之间}做\textbf{宽基线匹配}\cite{campos2021orbslam3}。视觉 SLAM 里“基线”引申为两相机位姿之间的距离：\emph{窄基线}假设两帧位姿相近（无大旋转/平移/尺度变化），对应区域相似、易由 PnP 投影搜索匹配，是同一地图内相邻关键帧的常态；\emph{宽基线}则两帧在光照、视角、尺度上差异都大，匹配困难、易误匹配。ORB-SLAM2 只把宽基线匹配用于\emph{同一}地图的不同关键帧之间，ORB-SLAM3 把它\emph{扩展到不同地图之间}，这正是地图融合的几何基础。
+
+\begin{insight}
+Atlas 的精髓不是“能存多张图”，而是把\textbf{失败局部化}：单地图系统里一次跟丢/坏闭环会污染\emph{整条}轨迹，多地图系统把它\emph{隔离}在一张子图里，其余子图毫发无损，等条件好了再融合。这与 \cref{sec:vio-opt} 滑窗边缘化“有界计算量”的思路互补——边缘化管\emph{时间}维度的有界，Atlas 管\emph{失败}维度的隔离。代价是引入了“多图管理 $+$ 融合”这套额外机制（\cref{sec:vio-merge}）。
+\end{insight}
+
+\subsection{检测共同区域与闭环/融合分流}
+\label{sec:vio-merge-detect}
+
+\paragraph{闭环与地图融合：同源而分流。}
+ORB-SLAM2 的闭环（\cref{ch:loop}）只在\emph{单一}地图内找“与当前帧不直接相邻、但有足够公共单词”的回环关键帧。ORB-SLAM3 把这一步推广为\textbf{检测共同区域}\cite{campos2021orbslam3}：在闭环及地图融合线程里，先找当前活跃地图关键帧 $K_a$ 的候选关键帧 $K_m$（统称融合/闭环候选），再按 $K_m$ 所属地图\emph{分流}：
+\begin{itemize}
+  \item $K_m$ 来自\emph{当前活跃地图} $\Rightarrow$ \textbf{闭环}（\texttt{CorrectLoop()}，同 \cref{ch:loop} 的回环矫正）；
+  \item $K_m$ 来自\emph{非活跃子图} $\Rightarrow$ \textbf{地图融合}（\cref{sec:vio-merge}）；
+  \item \emph{同时}检到二者 $\Rightarrow$ 优先\textbf{融合}、忽略闭环（融合是多地图间的，优先级更高）。
+\end{itemize}
+
+\paragraph{“集卡式”验证：召回率与精度双升。}
+ORB-SLAM2 验证回环候选要求\emph{时序上连续 $3$ 次}成功（须等 $3$ 个新关键帧进来），牺牲召回率换精度。ORB-SLAM3 改用新的位置识别策略\cite{campos2021orbslam3}：\textbf{先做共视几何校验、再做时序几何校验}——理想情况下不必等新关键帧即可完成验证，召回率与精度都升，计算量略增。比喻为“集卡式”（凑齐 $3$ 张即可、不要求连续）：
+\begin{enumerate}
+  \item \textbf{共视几何校验}：取候选 $K_m$（及当前帧 $K_a$）的最佳共视关键帧组（实现取 $10$ 个）依次做几何校验，累计成功次数。若成功次数 $\ge 3$，直接通过、跳过时序校验（\emph{所有关键帧已在地图中，无须等待}——这是召回率提升的关键）；若成功数 $\in(0,3)$，进入第 2 步;若为 $0$，验证失败。\footnote{共视组规模以源码 \texttt{DetectCommonRegionsFromBoW} 中 \texttt{nNumCovisibles}$=10$ 为准；通过门槛为累计共视/时序成功 $\ge 3$（\texttt{nNumCoincidences}$\ge 3$）。}
+  \item \textbf{时序几何校验}：对随后\emph{新进来}的关键帧继续校验，两步累计凑齐 $3$ 个成功即通过；连续两个新关键帧都失败则判整体失败。
+\end{enumerate}
+每次几何校验的内核：记当前帧 $K_a$ 到 $K_m$ 的变换 $\mathbf{T}_{am}$、$K_a$ 某共视帧 $K_j$ 到 $K_a$ 的变换 $\mathbf{T}_{ja}$，则 $K_m$ 到 $K_j$ 的变换 $\mathbf{T}_{jm}=\mathbf{T}_{ja}\mathbf{T}_{am}$；把 $K_m$ 局部窗口内的地图点经 $\mathbf{T}_{jm}$ 投影到 $K_j$，成功匹配数达阈值即该次校验通过。
+
+\begin{table}[H]\centering\small
+\caption{检测共同区域（ORB-SLAM3）vs 检测回环候选（ORB-SLAM2）（整理自\cite{campos2021orbslam3}）}
+\label{tab:vio-commonregion}
+\begin{tabular}{lll}
+\toprule
+对比项 & ORB-SLAM2 & ORB-SLAM3 \\
+\midrule
+候选范围 & 仅当前地图 & 当前地图 $+$ 所有非活跃子图（同时检闭环/融合候选） \\
+验证方式 & 时序连续性校验（须等 $3$ 新 KF） & 先共视几何、后时序几何（多数无须等待） \\
+召回率 & 较低 & 较高 \\
+精度 & 较低 & 较高 \\
+计算量 & 正常 & 略有增加 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{求解相对位姿 $\mathbf{T}_{am}$。}
+拿到候选 $K_m$ 后，求 $K_m$ 到 $K_a$ 的相对变换 $\mathbf{T}_{am}$：\emph{单目/单目惯性}模式下是\textbf{相似变换 Sim(3)}（$7$-DOF，含尺度，吸收两图间尺度差，呼应 \cref{thm:vio-4dof} 单目尺度可漂）；\emph{双目/RGB-D}模式下尺度固定为 $1$、$\mathbf{T}_{am}$ 退化为普通 SE(3)。求解流程：词袋得初始匹配 $\to$ RANSAC 解初始 $\mathbf{T}_{am}$ $\to$ 用 $\mathbf{T}_{am},\mathbf{T}_{am}^{-1}$ 双向\emph{引导匹配}（两次互投影误差都达标才算可靠对应）拿到更多匹配 $\to$ 非线性优化重投影误差精化。Sim(3) 求解与 RANSAC 同 ORB-SLAM2，但数据关联是 $1$-$N$（当前关键帧 $1$ 对候选窗口内 $N$ 帧），见 \cref{tab:vio-merge-stages}。
+
+\subsection{地图融合：纯视觉与视觉惯性}
+\label{sec:vio-merge}
+
+检到跨地图共同区域、求得 $\mathbf{T}_{am}$ 后，\textbf{地图融合}把活跃地图与非活跃子图缝成一张（融合后作为新的活跃地图）。按传感器分两支：纯视觉融合（\texttt{MergeLocal()}）与视觉惯性融合（\texttt{MergeLocal2()}）。
+
+\paragraph{纯视觉融合 \texttt{MergeLocal()}（十步）。}
+其骨架与 ORB-SLAM2 单目闭环矫正（Sim(3) 位姿/地图点传播，\cref{sec:loop-backend} 衔接的位姿图后端）\emph{非常类似}，差别在“当前帧与融合帧位于\emph{不同世界系}”\cite{campos2021orbslam3}：
+\begin{enumerate}
+  \item 融合前\emph{停止全局 BA 与局部建图线程}（生成树将被改写）；
+  \item 构造当前关键帧与融合关键帧的\emph{局部窗口}（一/二级共视关键帧 $+$ 其地图点）；
+  \item 用 $\mathbf{T}_{am}$ 做 Sim(3) \emph{位姿传播与矫正}（把当前地图关键帧/地图点变到融合帧所在世界系）；
+  \item 用新地图（当前帧侧）的关键帧位姿/地图点\emph{替换}旧地图（融合帧侧）的，在 Atlas 里冻结当前图、激活旧图；
+  \item \textbf{融合生成树}：两图生成树不能粗暴相连（否则某节点会有两个父节点，违反树结构），须\emph{父子换向}——记当前关键帧为新父 \texttt{pNewParent}、其旧父为 \texttt{pNewChild}，沿当前图反向遍历，逐对“删旧父子边 $+$ 换向”，直到全图父子关系调换完毕（\cref{fig:vio-spanning-tree}）;
+  \item 把融合关键帧共视窗口的地图点投影到当前关键帧共视窗口，检测并融合重复点;
+  \item 因点变化，更新关键帧连接关系；
+  \item \textbf{熔接 BA}（Welding BA，因子图 \cref{fig:vio-welding}）：优化\emph{活跃图}熔接窗口 $W_a$ 内的关键帧位姿、以及 $W_a,W_m$ 所观测到的地图点，而\emph{固定} $W_m$ 关键帧位姿（实现上把 $W_a$ 作为可调关键帧、$W_m$ 作为固定关键帧传入局部 BA\footnote{以 \texttt{MergeLocal()} 中 \texttt{LocalBundleAdjustment(mpCurrentKF, $W_a$, $W_m$, \dots)} 的实参为准：$W_a$ 进可调集、$W_m$ 进固定集。原文叙述笼统地称“优化两图熔接窗口内的关键帧”，此处以源码实际固定 $W_m$ 为准。}）；纯视觉故因子图只有重投影项;
+  \item 用熔接 BA 结果做\emph{校正传播} $+$ \emph{本质图优化}（固定 $W_a,W_m$、只优化窗外关键帧），把矫正从熔接窗口传到整图;
+  \item 如需要，再做全局 BA。
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\scriptsize, node distance=7mm,
+  kf/.style={circle, draw, minimum size=4.5mm, inner sep=0pt},
+  mkf/.style={kf, fill=second!25, draw=second!70!black},
+  ckf/.style={kf, fill=main!20, draw=main!70!black},
+  ed/.style={->, thick, gray!55!black},
+  revar/.style={->, very thick, red!75!black}]
+% merge map (non-active) spanning tree -- top
+\node[mkf] (m0){}; \node[mkf, right=of m0] (m1){}; \node[mkf, right=of m1] (m2){}; \node[mkf, right=of m2] (mM){\,};
+\draw[ed] (m0)--(m1); \draw[ed] (m1)--(m2); \draw[ed] (m2)--(mM);
+\node[left=1.5mm of m0, font=\scriptsize] {\texttt{mpMergeMatchedKF}};
+% current map (active) -- bottom, parent chain to be reversed
+\node[ckf, below=12mm of m0] (oldp){}; \node[ckf, right=of oldp] (nc){}; \node[ckf, right=of nc] (np){};
+\draw[ed] (oldp)--(nc); \draw[ed] (nc)--(np);
+\node[below=1mm of oldp]{\texttt{pOldParent}}; \node[below=1mm of nc]{\texttt{pNewChild}}; \node[below=1mm of np]{\texttt{pNewParent}};
+\node[ckf, right=14mm of np] (cur){}; \node[right=1mm of cur]{\texttt{mpCurrentKF}};
+% reversed edge: current -> merge matched (cross-map)
+\draw[revar] (cur) to[bend left=18] (mM);
+% reverse the parent chain in current map
+\draw[revar] (np) -- (cur);
+\node[red!75!black, font=\scriptsize] at ($(nc)!0.5!(np)+(0,3mm)$) {换向};
+\end{tikzpicture}
+\caption{生成树父子换向（仿\cite{campos2021orbslam3} 图 19-6$\sim$19-8）：当前关键帧接到融合关键帧后，沿当前图反向把父子关系逐对调换，避免出现“一子两父”的非法树结构。}
+\label{fig:vio-spanning-tree}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\scriptsize, node distance=4mm and 6mm,
+  kf/.style={circle, draw, minimum size=4mm, inner sep=0pt, font=\tiny},
+  ckf/.style={kf, fill=main!18, draw=main!70!black},
+  mkf/.style={kf, fill=second!22, draw=second!70!black},
+  rp/.style={rectangle, draw, fill=second!55, minimum size=1.8mm, inner sep=0pt},
+  lk/.style={-, gray!55!black}]
+% active map window Wa (top row of KFs)
+\foreach \i in {0,1,2,3} { \node[ckf] (a\i) at (\i*9mm, 9mm) {$T$}; }
+\node[font=\scriptsize] at (-9mm, 9mm) {$W_a\,(K_a)$};
+% map point ellipse (center)
+\node[draw, ellipse, fill=third!12, draw=third!60!black, minimum width=24mm, minimum height=7mm] (mp) at (13.5mm, 0) {地图点 $M_a,M_m$};
+% inactive map window Wm (bottom, fixed)
+\foreach \i in {0,1,2,3} { \node[mkf] (b\i) at (\i*9mm, -9mm) {$T$}; }
+\node[font=\scriptsize] at (-9mm, -9mm) {$W_m\,(K_m)$};
+\node[font=\scriptsize] at (32mm, -9mm) {固定};
+% reprojection factors (square) to map points
+\foreach \i in {0,1,2,3} { \node[rp] (ra\i) at ($(a\i)!0.5!(mp.north)$) {}; \draw[lk] (a\i)--(ra\i)--(mp.north);
+                            \node[rp] (rb\i) at ($(b\i)!0.5!(mp.south)$) {}; \draw[lk] (b\i)--(rb\i)--(mp.south); }
+\node[anchor=west, font=\scriptsize] at (38mm, 2mm) {绿方块 $=$ 重投影项};
+\node[anchor=west, font=\scriptsize] at (38mm, -2mm) {$W_m$ 关键帧位姿固定};
+\end{tikzpicture}
+\caption{纯视觉熔接 BA 因子图（仿\cite{campos2021orbslam3} 图 19-4）：只优化活跃窗口 $W_a$ 的关键帧位姿与 $W_a,W_m$ 观测到的地图点；固定 $W_m$ 关键帧位姿。纯视觉故只有重投影项。视觉惯性熔接 BA 在此基础上加入 IMU 预积分项与偏置随机游走项。}
+\label{fig:vio-welding}
+\end{figure}
+
+\paragraph{视觉惯性融合 \texttt{MergeLocal2()}。}
+与纯视觉融合\emph{基本一致但更简略}（如省略本质图优化）\cite{campos2021orbslam3}，关键差异：
+\begin{itemize}
+  \item 用 $\mathbf{T}_{am}$ 把整个当前活跃地图变到融合帧世界系时，\emph{固定尺度} $s\!=\!1$（视觉惯性已恢复度量尺度，无尺度自由度）;
+  \item 若当前地图 IMU 未完全初始化，先做\emph{一次 IMU 快速优化}（\texttt{InertialOptimization}）、强制认为已完成初始化;
+  \item 熔接窗口内做\textbf{视觉惯性熔接 BA}（\texttt{MergeInertialBA}，因子图 \cref{fig:vio-welding} 的注脚所述：重投影 $+$ IMU 预积分 $+$ 偏置游走三类残差），其惯性因子直接复用 \cref{thm:vio-imu-residual} 的预积分残差构造。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{Sim(3) 求解的数据关联：ORB-SLAM2 闭环 vs ORB-SLAM3 融合（整理自\cite{campos2021orbslam3}）}
+\label{tab:vio-merge-stages}
+\begin{tabular}{lll}
+\toprule
+阶段 & ORB-SLAM2 & ORB-SLAM3 \\
+\midrule
+Sim(3) 初值计算 & $1$-$1$ & $1$-$N$ \\
+基于初值的 Sim(3) 优化 & $1$-$1$ & $1$-$N$ \\
+Sim(3) 验证 & $1$-$N$ & $1$-$N$ \\
+熔接 BA & 无 & $N$-$N$ 熔接 BA \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{线程间配合。}
+地图融合在\emph{独立线程}进行，须与跟踪、局部建图、全局 BA 线程协调\cite{campos2021orbslam3}：\emph{融合前}停止局部建图（避免新关键帧混入）、若全局 BA 在跑也停（生成树将变）;\emph{融合中}跟踪线程\emph{继续在原活跃地图上跑}以保实时，其余线程停;\emph{融合后}恢复局部建图，若全局 BA 曾停则重启处理新数据。
+
+\begin{pitfall}[概念误区：地图融合 = 把两张图“拼”在一起]
+\textbf{错误描述}：以为融合就是把两组关键帧/地图点放进同一容器、首尾相连即可。
+\textbf{现象/后果}：直接相连生成树会让某关键帧有两个父节点（非法树结构）；不矫正世界系会让两图位姿/尺度对不齐，融合处轨迹错位。
+\textbf{根本原因}：两张子图建立在\emph{不同世界坐标系}（各自第一帧为参考）、单目下还\emph{尺度不一致}。融合须先用 $\mathbf{T}_{am}$（Sim(3)/SE(3)）把一图整体变到另一图的世界系、再\emph{父子换向}融合生成树（\cref{fig:vio-spanning-tree}）、最后熔接 BA $+$ 本质图把矫正传播到全图。
+\textbf{正确做法}：按 \cref{sec:vio-merge} 的十步走，核心是“先对齐世界系（$\mathbf{T}_{am}$）、再缝合结构（生成树换向）、最后联合优化（熔接 BA $+$ 本质图 $+$ 全局 BA）”。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （概念）说清 ORB-SLAM3 IMU 初始化阶段 (b) 为何要\emph{固定视觉轨迹只解惯性量}，而不直接做视觉惯性联合优化（提示：\cref{sec:vio-coupling} 的 pitfall $+$ 阶段 (a) 视觉精度高）。
+  \item （对照）把 \cref{eq:vio-orbslam3-inertial-res} 的三行惯性残差与 \cref{eq:vio-imu-residual}（Forster 形式）逐行对应，指出多出的尺度因子 $s$ 出现在哪几项、为什么旋转残差里没有 $s$。
+  \item （系统）画出从“跟踪丢失”到“新建地图”再到“检测共同区域 $\to$ 地图融合”的状态流，标出每步触发条件（\cref{sec:vio-orbslam3-track}、\cref{sec:vio-atlas}、\cref{sec:vio-merge-detect}）。
+  \item （开放）双目惯性融合为何把尺度固定为 $1$、能省哪些计算？与单目融合的 Sim(3) $\to$ SE(3) 退化对应（提示：\cref{thm:vio-4dof} 单目尺度可漂、双目有度量基线）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{外参标定与时间同步}
+\label{sec:vio-calib}
+
+\paragraph{外参标定。}
+准确 VIO 需估计相机相对 IMU 的位姿（外参）\cite{carlone2026handbook}。两类方法：\emph{离线}标定（部署前用标定靶、已知运动或环境先验，更准但繁琐、需专门设备）；\emph{在线}标定（把外参作为状态的一部分估计，如 VINS 的 $\mathbf{x}^b_c$，能适应系统变化无需重标，但可能不如离线准、且可能使问题更复杂甚至病态）。
+
+\paragraph{时间同步。}
+未处理的错误同步会致轨迹显著误差。可在：\emph{硬件}（公共时钟信号触发各传感器，最准但不总可行）；\emph{传感器内置}（如 PTP 经以太网软件同步）；\emph{时间戳对齐}（后处理，较弱）；\emph{把时间偏移作为状态}（在线估计 $t_d$，无法硬件同步时的兜底）\cite{carlone2026handbook}。
+
+\begin{pitfall}[编程陷阱：忽略相机与 IMU 的时间偏移]
+\textbf{错误描述}：直接用各传感器自带时间戳，假设相机曝光时刻与 IMU 采样时刻精确对齐。
+\textbf{现象/后果}：在快速运动段轨迹系统性弯曲、ATE 偏大，benchmark 指标被时间偏移污染，且“越快越偏”难以归因。
+\textbf{根本原因}：相机时间戳常对应“图像传输完成”而非“曝光中点”，与 IMU 存在毫秒级固定偏移 $t_d$；运动越快，同一 $t_d$ 引起的空间错位越大。
+\textbf{正确做法}：标定或在线估计 $t_d$，把视觉残差的相机位姿用 $t_d$ 处的 IMU 插值位姿表示；或用硬件触发同步。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （概念）解释为什么时间偏移在快速运动下危害更大（提示：错位 $\approx v\cdot t_d$）。
+  \item （设计扩展）在 \cref{thm:vio-ba} 的视觉残差里加入时间偏移 $t_d$ 作为待估状态，写出相机位姿如何用 $t_d$ 处的 IMU 插值表示。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{前沿与延伸}
+\label{sec:vio-frontier}
+
+\paragraph{先进预积分（指针）。}
+本章 \cref{sec:vio-preint} 用的是标准 Euler 预积分。把它升级为连续时间/GP 预积分（梯形/常 jerk 模型、平方指数核 GP、旋转向量 GP 虚拟观测，以及它与 STEAM 连续时间估计的同源关系）——常局部加速度模型在 EuRoC 上提升 VIO 精度约 $5\%$、连续旋转预积分较离散精度高一个数量级——本书已在 IMU 章 \cref{sec:imu-advanced} 完整展开，此处不重复。需要异步查询预积分（如与事件相机融合）时，那套连续时间表示是关键（\cref{ch:event}）。
+
+\paragraph{扩展位姿与连续时间状态。}
+本章 \cref{subsec:vio-se23-unify} 已点明 $\mathrm{SE}_2(3)$ 整体视角与 Forster/VINS 分量视角的合流，其完整群上推导（$\mathbf N$ 矩阵均值传播、时间机器、协方差、批量 MAP 因子）在 IMU 章 \cref{subsec:imu-se23-preint}。在工程上它的额外价值有二：用高阶噪声传播改进不确定度建模、并干净纳入标准预积分忽略的地球自转 Coriolis 与离心力\cite{brossard2021associating}，配合不变滤波即得与轨迹无关的误差动力学（\cref{paper:inekf}）——一个海上导航实例可量化其威力：导航级 IMU 配线速度传感器、在 $\mathrm{SE}_2(3)$ 上做扩展位姿预积分，行驶 $1.8\,\mathrm{km}$、历时一小时后平移误差仅约 $5\,\mathrm m$\cite{carlone2026handbook}。连续时间状态表示（B-spline 基、GP 先验）也能容纳众多 IMU 测量而不增状态维度（\cref{sec:est-steam}）。
+
+\paragraph{学习增强的惯性里程计。}
+当视觉辅助暂时缺位——手部跟踪时手快速移出相机视野、或无纹理场景使 VIO 退化到仅靠 IMU——朴素积分会迅速发散。近期工作用神经网络压低\emph{仅惯性}里程计的漂移，其立场与本书学习 SLAM 一章（\cref{ch:learning}）一致：不推翻 MAP 母方程，而是把方程里手工设计的零件换成可学习的。落到惯性里程计有三类：(1) \textbf{数据驱动偏置/去噪 $+$ 可微积分模块}——TLIO\cite{liu2020tlio} 用网络回归位移与不确定度再以 EKF 融合；(2) \textbf{直接回归相对运动}——IONet\cite{chen2018ionet} 开此路、RoNIN\cite{herath2020ronin} 给出行人惯性里程计强基线，把“测量模型 $+$ 积分”整体换成学习式残差；(3) \textbf{概率式偏置}——用条件扩散模型把偏置建成分布而非点估计\cite{carlone2026handbook}。这些方法降漂显著，但泛化有限（换 IMU、换运动易失效），与 \cref{ch:learning} 对纯回归“易过拟合训练分布”的批评同源。\textbf{本体感受}里程计（足式接触、轮装 IMU 的单平面约束）则不依赖外感受即可把死推漂移压到亚百分比——足式接触辅助惯导见 \cref{ch:leg}。
+
+\paragraph{边缘端的超高效与鲁棒 VIO。}
+把 VIO 塞进手环、微型无人机等\emph{低 SWaP}（尺寸/重量/功耗）平台时，瓶颈往往\emph{不在算力而在数据搬运}：在 Meta XR 可穿戴设备的 SLAM 与手部跟踪模块里，最大能耗来自 RAM 的数据访问而非浮点运算\cite{carlone2026handbook}。由此催生几条专门的工程前沿：
+\begin{itemize}
+  \item \textbf{量化 VIO（QVIO）}：把状态、协方差与中间量用低位宽定点/低精度浮点表示，大幅削减内存带宽与功耗，配套\emph{在传感器上就近计算}的架构减少数据传输；
+  \item \textbf{平方根（信息/协方差）滤波}：在只支持单精度浮点、或为提速而\emph{被迫}用单精度的计算单元上，直接传播协方差易因舍入误差失去正定性；改传播其\emph{平方根因子}（如 SR-ISWF，对照 \cref{ch:eskf} 的平方根滤波）可在保持数值稳定的同时提速——这与 \cref{tab:vio-filter-vs-opt} 列的“滤波一致性修法”里 SR-ISWF 是同一支；
+  \item \textbf{专用硬件（ASIC）}：为片上 VIO 定制集成电路，把预积分、特征跟踪、滤波更新固化进硅片，以远低于通用处理器的功耗达到实时。
+\end{itemize}
+这条线提醒我们：\cref{sec:vio-problem} 的延迟约束在边缘平台上会进一步收紧为\emph{能耗}约束，算法选型（滤波 vs 优化、状态维数、数值精度）必须连同硬件一起考量。
+
+\paragraph{解析式初始化（与本章流程对照）。}
+本章 \cref{sec:vio-init} 的初始化走“松耦合自举”：纯视觉 SfM $\to$ 陀螺偏置 $\to$ 线性解速度/重力/尺度 $\to$ 重力精化，是\emph{迭代式}流程。另一类思路是\emph{解析式}初始化——把视觉惯性 SfM 写成可\emph{闭式}求解的形式，一次性解出速度、重力、尺度乃至偏置，无需良好初值。其理论根在 Martinelli\cite{martinelli2014closed} 的连续对称性分析（证明 IMU 偏置、3D 速度、全局 roll/pitch 可观，并给出闭式解）。解析式初始化对“冷启动鲁棒性”更友好，与本章 VINS-Mono 式的迭代初始化各有取舍：闭式快、对初值不敏感，但对噪声与退化运动（\cref{tab:vio-degenerate}）更敏感；迭代式稳健但需要 SfM 自举的好初值。二者在工程上常\emph{互补}使用。
+
+\paragraph{主流 VI-SLAM 框架与标准数据集（横向对比）。}
+视觉（惯性）SLAM 的发展可粗分三阶段\cite{campos2021orbslam3}：\emph{早期缓慢期}（$1960$ Kalman $\to$ $1979$ EKF $\to$ $2007$ MonoSLAM，首个单目 EKF-SLAM）；\emph{快速发展期}（$2007$ PTAM 开“前端跟踪 $+$ 后端优化”范式、$2014$ LSD-SLAM/SVO 直接法、$2017$ DSO/ORB-SLAM2）；\emph{成熟期}（视觉惯性紧耦合主导，MSCKF/OKVIS/ROVIO/ICE-BA/Kimera/BASALT/VINS-Fusion/ORB-SLAM3 等）。本章正文已分别展开 MSCKF（\cref{sec:vio-msckf}）、VINS（\cref{sec:vio-opt}）、OKVIS、Kimera 等；这里只补一张\emph{统一横向对比表}（\cref{tab:vio-vislam-frameworks}）与一张\emph{标准数据集表}（\cref{tab:vio-datasets}），便于选型，不重述各框架。
+
+\begin{table}[H]\centering\small
+\caption{主流视觉惯性 SLAM 框架横向对比（$\checkmark$ 具备 / -- 不具备；整理自\cite{campos2021orbslam3}）}
+\label{tab:vio-vislam-frameworks}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccccc}
+\toprule
+ & MSCKF & ROVIO & OKVIS & ICE-BA & Kimera & BASALT & \shortstack{VINS-\\Fusion} & \shortstack{ORB-\\SLAM3} \\
+\midrule
+前端 & 特征点 & 直接法 & 特征点 & \shortstack{特征点\\$+$光流} & 特征点 & \shortstack{特征点\\$+$光流} & \shortstack{特征点\\$+$光流} & 特征点 \\
+后端 & EKF & EKF & 优化 & 优化 & 优化 & 优化 & 优化 & 优化 \\
+闭环 & -- & -- & -- & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+耦合 & 紧 & 紧 & 紧 & 紧 & 紧 & 紧 & 紧 & 紧 \\
+多地图 & -- & -- & -- & -- & -- & -- & -- & $\checkmark$ \\
+单目 & -- & -- & -- & -- & -- & -- & -- & $\checkmark$ \\
+双目 & -- & -- & -- & -- & -- & -- & -- & $\checkmark$ \\
+RGB-D & -- & -- & -- & -- & -- & -- & -- & $\checkmark$ \\
+单目$+$IMU & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+双目$+$IMU & $\checkmark$ & -- & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+RGB-D$+$IMU & -- & -- & -- & -- & -- & -- & -- & $\checkmark$ \\
+鱼眼相机 & -- & -- & -- & -- & -- & -- & -- & $\checkmark$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\noindent 表中可见 ORB-SLAM3 是少有的“全勾”系统（多地图 $+$ 全传感器组合 $+$ 鱼眼），代价是工程复杂度最高（\cref{sec:vio-orbslam3}）；MSCKF/ROVIO 走滤波路线、最轻量但无闭环（对照 \cref{sec:vio-compare} 滤波 vs 优化的取舍）；BASALT 把高频视觉惯性信息归入非线性因子（取自 VIO 层边缘化先验），在重力/地图对齐上提升精度，与本章 \cref{sec:vio-fej} 的一致性主题相通。
+
+\begin{table}[H]\centering\small
+\caption{视觉惯性 SLAM 常用数据集对比（整理自\cite{campos2021orbslam3}）}
+\label{tab:vio-datasets}
+\begin{tabular}{llllll}
+\toprule
+ & EuRoC & TUM-VI & \shortstack{Zurich\\Urban MAV} & Canoe & PennCOSYVIO \\
+\midrule
+发布 & 2016 & 2018 & 2017 & 2018 & 2017 \\
+载体 & MAV & 手持 & MAV & 独木舟 & 手持 \\
+相机 & \shortstack{双目灰度\\$20\,$Hz} & \shortstack{双目灰度\\$20\,$Hz} & \shortstack{单目 RGB\\$30\,$Hz} & \shortstack{双目 RGB\\$20\,$Hz} & \shortstack{$4$ RGB$+$\\鱼眼} \\
+IMU & \shortstack{ADIS16448\\$200\,$Hz} & \shortstack{BMI160\\$200\,$Hz} & $10\,$Hz & \shortstack{ADIS16448\\$200\,$Hz} & \shortstack{ADIS16488\\$200\,$Hz} \\
+同步 & 硬件 & 硬件 & 软件 & 软件 & 硬件 \\
+真值 & \shortstack{Vicon/Leica\\$\approx1\,$mm} & \shortstack{OptiTrack\\$120\,$Hz} & Pix4D/GPS & GPS/INS & \shortstack{AprilTag\\$15\,$cm} \\
+环境 & 室内 & 室内外 & 室外 & 室外 & 室内外 \\
+规模 & \shortstack{$11$ 序列\\$0.9\,$km} & \shortstack{$28$ 序列\\$20\,$km} & \shortstack{$1$ 序列\\$2\,$km} & \shortstack{$28$ 序列\\$2.7\,$km} & \shortstack{$4$ 序列\\$150\,$m} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent EuRoC（MAV、室内、毫米级 Vicon 真值，含慢飞/运动模糊/弱光序列）是 VIO 评测的事实标准——本章 \cref{sec:vio-orbslam3-init} 引用的 $5\%$/$1\%$ 初始化误差、\cref{tab:vio-multimap} 的多地图收益均在其上测得；PennCOSYVIO 专测大型玻璃面/重复结构/快速旋转等\emph{退化条件}（\cref{tab:vio-degenerate}），是压力测试首选。
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{6.2cm}p{7.2cm}}
+\toprule
+误解 & 正确理解 \\
+\midrule
+单目 VIO 静止开机也能恢复尺度 & 尺度需加速度\emph{变化}激励，静止/匀速尺度不可观，不能静止起步（\cref{tab:vio-degenerate}） \\
+预积分把偏置一并消除了 & 预积分在固定偏置估计下算增量，偏置仍是待估状态、由随机游走因子约束、用一阶修正（\cref{sec:vio-bias}） \\
+$\Delta\mathbf{v}_{ij},\Delta\mathbf{p}_{ij}$ 是真实速度/位置变化 & 它们是人为定义、刻意扣除重力与起始速度的量（\cref{def:vio-delta}） \\
+紧耦合永远优于松耦合，松耦合无用 & 初始化用松耦合自举、稳态用紧耦合精化，是流水线不同环节（\cref{sec:vio-coupling}） \\
+VIO 会在 $6$ 个自由度上都漂移 & 只漂移 $4$-DOF（$3$D 位置 $+$ yaw），roll/pitch 被重力钉死（\cref{thm:vio-4dof}） \\
+协方差小就说明估计准 & 退化运动下标准 EKF 报告虚假小协方差，需 FEJ/OC 保证一致性（\cref{sec:vio-fej}） \\
+MSCKF 完全不需要特征 $3$D 位置 & 每次更新前仍临时三角化特征，再用零空间投影消去（\cref{sec:vio-msckf-tri}） \\
+滤波与优化是完全不同的两套数学 & 二者用同一零空间投影消去特征，差别在能否重线性化（\cref{sec:vio-compare}） \\
+边缘化只是简单删除旧帧 & 边缘化用 Schur 补把旧帧信息转成先验，不丢信息（\cref{thm:vio-schur}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\label{tab:vio-symbols}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\Delta\mathbf{R}_{ij},\Delta\mathbf{v}_{ij},\Delta\mathbf{p}_{ij}$ & 预积分相对运动增量 & \cref{def:vio-delta} \\
+$\tilde{(\cdot)},\delta\boldsymbol{\phi}_{ij},\delta\mathbf{v}_{ij},\delta\mathbf{p}_{ij}$ & 预积分测量 / 其噪声 & \cref{thm:vio-preint-model} \\
+$\boldsymbol{\Sigma}_{ij},\boldsymbol{\Lambda}=\boldsymbol{\Sigma}^{-1}$ & 预积分协方差 / 信息矩阵 & \cref{eq:vio-cov-prop} \\
+$\boldsymbol{\alpha},\boldsymbol{\beta},\boldsymbol{\gamma}$ & VINS 预积分（位置/速度/旋转四元数）& \cref{eq:vio-vins-preint} \\
+$\mathbf{b}^g,\mathbf{b}^a$ & 陀螺 / 加速度计偏置 & \cref{eq:vio-bias-factor} \\
+$\mathbf{M}(\hat{\boldsymbol{x}}),\mathbf{U}$ & 可观性矩阵 / 不可观子空间 & \cref{def:vio-obs-matrix} \\
+$\mathcal{X},\lambda_l,\mathbf{x}^b_c$ & 滑窗状态 / 逆深度 / 相机-IMU 外参 & \cref{def:vio-state} \\
+$\boldsymbol{\Lambda}_p,\mathbf{g}_p,\{\mathbf{r}_p,\mathbf{H}_p\}$ & Schur 补先验信息/梯度/残差 & \cref{thm:vio-schur} \\
+$\mathbf{A},\mathbf{H}_f,\mathbf{H}_X$ & MSCKF 零空间基 / 特征/状态雅可比 & \cref{thm:vio-nullproj} \\
+${}^I_G\bar{\mathbf{q}},\mathbf{C}(\cdot)$ & MSCKF JPL 四元数 / 旋转矩阵 & \cref{eq:vio-msckf-imu} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{定理速查表}
+\label{tab:vio-theorems}
+\begin{tabular}{lll}
+\toprule
+定理 / 公式 & 一句话说明 & 对应 \\
+\midrule
+预积分测量模型 \cref{eq:vio-preint-meas} & 状态侧 $=$ 测量侧 $+$ 噪声 & \cref{thm:vio-preint-model} \\
+IMU 因子残差 \cref{eq:vio-imu-residual} & 进因子图的 $9$ 维残差 & \cref{thm:vio-imu-residual} \\
+偏置一阶修正 \cref{eq:vio-bias-corr} & 偏置小变不必重积分 & \cref{sec:vio-bias} \\
+4 维零空间 \cref{eq:vio-nullspace} & 全局位置 $+$ yaw 不可观 & \cref{thm:vio-4dof} \\
+视觉惯性 BA \cref{eq:vio-ba} & 先验 $+$ IMU $+$ 视觉 MAP & \cref{thm:vio-ba} \\
+Schur 补边缘化 \cref{eq:vio-schur} & 旧帧信息转先验 & \cref{thm:vio-schur} \\
+FEJ \cref{thm:vio-fej} & 首次估计处线性化保一致性 & \cref{sec:vio-fej} \\
+零空间投影 \cref{eq:vio-nullproj} & MSCKF 消去特征 & \cref{thm:vio-nullproj} \\
+零空间同源 \cref{eq:vio-structureless} & 优化与滤波同一招消特征 & \cref{sec:vio-compare} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\label{tab:vio-knowledge}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & VIO 问题与耦合 & 互补性、松/紧耦合、延迟约束 & \(\bigstar\bigstar\) \\
+2 & IMU 预积分 & 相对增量与起始状态/重力解耦 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+3 & 噪声协方差传播 & 线性传播、增量计算 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+4 & 偏置一阶修正 & 避免重积分 & \(\bigstar\bigstar\bigstar\) \\
+5 & 可观性 4 维零空间 & 全局位置 $+$ yaw 不可观 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+6 & 退化运动 & 尺度需加速度激励 & \(\bigstar\bigstar\bigstar\) \\
+7 & VINS 滑窗紧耦合 BA & 状态、残差、Ceres 求解 & \(\bigstar\bigstar\bigstar\) \\
+8 & Schur 补边缘化 & 旧帧转先验、平方根化 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+9 & FEJ 一致性 & 首次估计线性化 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+10 & MSCKF 滤波主线 & 克隆、零空间投影、QR 压缩 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+11 & 两线对比 & 零空间同源、能否重线性化 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+12 & 初始化 & SfM$\to$对齐$\to$重力精化；解析式对照 & \(\bigstar\bigstar\bigstar\) \\
+13 & 前沿：扩展位姿/学习 IO & $\mathrm{SE}_2(3)$$+$地球自转；TLIO/RoNIN/IONet；本体感受 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+14 & 前沿：边缘超高效 VIO & QVIO/平方根滤波/ASIC；能耗即瓶颈 & \(\bigstar\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{累积项目：本章新增模块}
+为 VO/VIO 累积项目新增“惯性融合模块”：(1) \texttt{Preintegrator} 类——封装 \cref{eq:vio-vins-discrete} 的中点积分、\cref{eq:vio-vins-PJ} 的协方差/雅可比递推、\cref{eq:vio-bias-corr} 的偏置一阶修正，输出 IMU 因子残差 \cref{eq:vio-vins-residual} 与协方差；(2) \texttt{VioInitializer} 类——实现 \cref{alg:vio-init} 的 SfM$\to$陀螺偏置$\to$速度/重力/尺度$\to$重力精化；(3) \texttt{SlidingWindow} 类——管理 \cref{def:vio-state} 的状态、装配 \cref{eq:vio-ba} 的因子（复用 \cref{ch:vo} 的视觉因子）、用 \cref{eq:vio-schur} 边缘化。三者共同把 \cref{ch:vo} 的纯视觉 BA 升级为带 IMU 的滑窗紧耦合 VIO。
+
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{预积分理论}：Forster 等《On-Manifold Preintegration for Real-Time Visual-Inertial Odometry》\cite{forster2017preintegration}（arXiv:1512.02363）——$\SO(3)$ 上预积分的完整协方差与偏置雅可比闭式，本章 \cref{sec:vio-preint} 的严谨主线出处。
+  \item \textbf{优化主线系统}：Qin 等《VINS-Mono》\cite{qin2018vins}（arXiv:1708.03852）——单目滑窗紧耦合、在线外参、初始化、$4$-DOF 位姿图，本章优化主线与初始化的主源；代码 \texttt{HKUST-Aerial-Robotics/\allowbreak VINS-Mono}。
+  \item \textbf{滤波主线}：Mourikis \& Roumeliotis《A Multi-State Constraint Kalman Filter》\cite{mourikis2007msckf}——MSCKF 零空间投影与 QR 压缩，本章滤波主线的奠基论文；现代实现见 OpenVINS。
+  \item \textbf{可观性与综述}：Huang《Visual-Inertial Navigation: A Concise Review》\cite{huang2019vins}（arXiv:1906.02650）——$4$ 维不可观、退化运动、FEJ/OC、滤波 vs 优化全面对比。
+  \item \textbf{广度与前沿}：SLAM Handbook 第 $11$ 章\cite{carlone2026handbook}——惯性里程计、AINS 可观性、先进预积分、学习增强的 IO。
+  \item \textbf{闭式初始化理论}：Martinelli《Closed-form solution of visual-inertial structure from motion》\cite{martinelli2014closed}——VINS 可观性的连续对称性证明。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+章节 & 关系 & 衔接点 \\
+\midrule
+\cref{ch:lie} 李群 & 本章大量用右雅可比、伴随 & 预积分的 $\SO(3)$ 连乘求导 \\
+\cref{ch:imu} IMU 模型 & 本章把其测量沿时间积分 & 比力/角速度模型、偏置随机游走 \\
+\cref{ch:vo} 视觉里程计 & 本章视觉因子复用其重投影 BA & 逆深度、Schur 稀疏、单位球残差 \\
+\cref{ch:nlopt} 非线性优化 & 本章边缘化在其正规方程里做 & Schur 补、马氏范数、Huber 核 \\
+\cref{ch:eskf} 误差状态 KF & MSCKF 是其特殊结构 & 传播-更新、Joseph 形式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：VIO 初始化频繁失败或给出错误尺度。\textbf{可能原因}：运动激励不足（静止/匀速，尺度不可观）。\textbf{排查}：检查 \cref{eq:vio-init-H} 的尺度列条件数、预积分速度增量方差、视差；不足则等待充分激励再初始化（\cref{sec:vio-init}、\cref{tab:vio-degenerate}）。
+  \item \textbf{症状}：边缘化后协方差越来越小，轨迹却越来越偏。\textbf{可能原因}：FEJ 缺失，沿不可观方向注入虚假信息。\textbf{排查}：确认所有涉及被边缘化变量的因子雅可比在\emph{首次估计}处求（\cref{thm:vio-fej}），核对线性化系统零空间是否仍为 $4$ 维（\cref{sec:vio-fej}）。
+  \item \textbf{症状}：轨迹尺度系统性偏大/偏小。\textbf{可能原因}：预积分递推 \texttt{dp}/\allowbreak\texttt{dv} 顺序写反，或加计偏置未优化。\textbf{排查}：按 \cref{eq:vio-vins-discrete} 顺序自检；确认 $\mathbf{b}^a$ 在状态向量内被优化（\cref{sec:vio-bias} 陷阱）。
+  \item \textbf{症状}：快速运动段轨迹弯曲、ATE 偏大。\textbf{可能原因}：相机-IMU 时间偏移未处理。\textbf{排查}：标定或在线估 $t_d$，用 $t_d$ 处 IMU 插值位姿（\cref{sec:vio-calib} 陷阱）。
+  \item \textbf{症状}：MSCKF 更新发散或残差异常大。\textbf{可能原因}：跳过特征三角化，或零空间投影维数错。\textbf{排查}：确认更新前已三角化得 ${}^G\hat{\mathbf{p}}_{f_j}$、$\mathbf{r}_o^{(j)}$ 维数为 $2M_j-3$（\cref{sec:vio-msckf-meas} 陷阱）。
+\end{enumerate}
+
+\section*{API 速查表}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+功能 & 接口（示意） & 备注 \\
+\midrule
+预积分递推 & \texttt{Preintegrator::push\_back(dt, acc, gyr)} & 中点积分，递推 $\boldsymbol{\alpha}/\boldsymbol{\beta}/\boldsymbol{\gamma},\mathbf{P},\mathbf{J}$ \\
+偏置修正 & \texttt{Preintegrator::repropagate(ba, bg)} & 偏置大变时重传播 \\
+IMU 残差 & \texttt{IMUFactor::Evaluate(...)} & 输出 \cref{eq:vio-vins-residual} 与雅可比 \\
+视觉残差 & \texttt{ProjectionFactor::Evaluate(...)} & 单位球切平面 \cref{eq:vio-vis-residual} \\
+边缘化 & \texttt{MarginalizationInfo::marginalize()} & Schur 补 \cref{eq:vio-schur}，平方根化先验 \\
+小角四元数 & \texttt{deltaQ(theta) -> [1, 0.5*theta]} & 右乘小扰动 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{版本信息速查}
+本章代码示意基于：Eigen 3.3+、Ceres 1.14/2.x、Sophus（latest）、OpenCV 4.x（特征前端）、ROS（VINS-Mono 参考实现）。算法描述基于 VINS-Mono（TRO 2018）、MSCKF（ICRA 2007）、Forster 预积分（TRO 2017）、SLAM Handbook ch11。

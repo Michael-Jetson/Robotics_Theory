@@ -1,0 +1,1661 @@
+\chapter{单刚体模型预测控制}
+\label{ch:quad_mpc}
+
+% \cnum（字体无关带圈数字）已上提到 common/preamble.tex，全书统一，勿在此重定义。
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 四足机器人小跑（对角步态）时只有两条腿着地，两个支撑足的球心连成一条“支撑线”。无论这两条腿用多大的力，机器人都\emph{无法}主动产生绕哪个方向的力矩？这一方向是“可控”还是“欠驱”的？
+  \item 一个只看“当前误差”的控制器（如 PID 或纯瞬时优化），在机器人即将\emph{腾空}（飞行相）前的最后一刻，能否提前为“接下来没有地面反作用力”做准备？为什么？
+  \item 刚体的完整欧拉方程是 $\mathbf{I}\dot{\boldsymbol{\omega}}+\boldsymbol{\omega}\times(\mathbf{I}\boldsymbol{\omega})=\boldsymbol{\tau}$。若把它直接放进一个需要\emph{在线滚动求解}的优化里，会遇到什么困难？工程上通常怎么近似？这个近似在什么条件下成立？
+  \item 真实的摩擦锥 $\mu f^z\ge\sqrt{(f^x)^2+(f^y)^2}$ 是一个\emph{二阶锥}约束。为什么四足 MPC 几乎总把它换成四个线性不等式（“摩擦金字塔”）？换成\emph{内接}金字塔而非外切，对“是否打滑”这件事有何保证？
+  \item 重力 $m\mathbf{g}$ 是常数项，会让动力学写成 $\dot{\mathbf{x}}=\mathbf{A}_c\mathbf{x}+\mathbf{B}_c\mathbf{u}+\mathbf{g}_0$（带常数偏置），而不是干净的 $\dot{\mathbf{x}}=\mathbf{A}_c\mathbf{x}+\mathbf{B}_c\mathbf{u}$。有没有办法不引入仿射项，就把重力“吸收”进线性结构里？
+  \item MPC 求出的是“足端力 $\mathbf{f}_i$”，但电机能直接控制的是“关节力矩 $\boldsymbol{\tau}$”。这两者之间靠什么映射连接？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}四足动态步态为何是\emph{间歇欠驱系统}，以及“欠驱方向需提前准备”如何\emph{逼出}对预测（MPC）的需求，而无预测的 WBC/PID 为何不够（\cref{sec:why-predict}）；
+  \item \textbf{论证}把四足整机简化为\emph{单刚体}（SRBD）的动机与代价，并把它放在 LIPM / 质心动力学 / 单刚体三模型谱系里定位（\cref{sec:srbd}）；
+  \item \textbf{推导}单刚体的三条动力学方程——牛顿平动、角动量（欧拉）转动、$\dot{\mathbf{R}}=\boldsymbol{\omega}^\wedge\mathbf{R}$——从密度积分起，每步不跳（\cref{sec:srbd}）；
+  \item \textbf{掌握}凸化所需的三处关键线性化：忽略陀螺项 $\boldsymbol{\omega}\times(\mathbf{I}\boldsymbol{\omega})$、惯性张量世界系变换 $\mathbf{I}_s=\mathbf{R}\mathbf{I}_b\mathbf{R}^\top$、角速度$\leftrightarrow$ZYX 欧拉角率的小角度映射 $\mathbf{R}_z^\top(\psi)$（\cref{sec:convexify}）；
+  \item \textbf{构造}足端力约束：摆动腿零力、法向幅值上下界、摩擦锥的四线性约束（金字塔内接）整合为 $\underline{\mathbf{c}}_i\le\mathbf{C}_i\mathbf{f}_i\le\overline{\mathbf{c}}_i$（\cref{sec:convexify}）；
+  \item \textbf{建立}$13$ 维状态 $[\boldsymbol{\Theta},\mathbf{p},\boldsymbol{\omega},\dot{\mathbf{p}},g]$ 的连续状态空间（含重力增广技巧），并前向欧拉离散化为 $\mathbf{A}_k,\mathbf{B}_k$（\cref{sec:state-space}）；
+  \item \textbf{推导}滚动预测方程（堆叠 $\mathbf{X}=\mathbf{A}_{qp}\mathbf{x}_0+\mathbf{B}_{qp}\mathbf{U}$），并理解预测时域 $N_p$ 与控制时域 $N_c$ 的取舍（\cref{sec:prediction}）；
+  \item \textbf{化简}带约束 QP 为标准形 $\min\tfrac12\mathbf{U}^\top\mathbf{H}\mathbf{U}+\mathbf{U}^\top\mathbf{g}$ s.t. $\underline{\mathbf{c}}\le\mathbf{C}\mathbf{U}\le\overline{\mathbf{c}}$，写出无约束闭式解、降维技巧，并取首步 $\mathbf{f}^{\mathrm{MPC}}=\mathbf{u}(0)$（\cref{sec:qp}）；
+  \item \textbf{辨析}凸 MPC 与瞬时 QP/WBC 的关系——瞬时 QP 是 MPC 的 $N=1$ 退化、WBC 无预测性——并说清 MPC 算虚拟力、下游逆动力学转关节力矩的控制链（\cref{sec:relation}）；
+  \item \textbf{落地}质量属性实验整定、权重 $\mathbf{Q}/\mathbf{R}_u$ 与 $\Delta T$ 选取、qpOASES/OSQP 求解器与部署要点（\cref{sec:practice}）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把高维非线性的整机动力学，压成可实时滚动求解的凸 QP}”的主线。结构如下：
+
+\begin{center}
+\begin{forest} navtreeLR
+[{单刚体模型 MPC\\（四足运动控制）}
+  [{为何预测\\间歇欠驱$\to$飞行相}
+    [{WBC 无预测性}] ]
+  [{单刚体建模\\牛顿+欧拉+$\dot{\mathbf{R}}=\boldsymbol{\omega}^\wedge\mathbf{R}$}
+    [{三模型对照\\LIPM/质心/SRBD}] ]
+  [{凸化\\三处线性近似}
+    [{摩擦锥$\to$金字塔}] ]
+  [{状态空间\\13 维+重力增广}
+    [{前向欧拉离散}] ]
+  [{预测+QP\\堆叠$\to\frac12\mathbf{U}^\top\mathbf{H}\mathbf{U}$}
+    [{取首步 $\mathbf{u}(0)$}] ]
+]
+\end{forest}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:why-predict,sec:srbd} 建立“为什么要预测”和“为什么能用单刚体”的两大立论，是任何读者的主干；\cref{sec:convexify,sec:state-space} 是把动力学“拍平成线性时变模型”的核心机械步骤（凸化三近似 + 离散化），写代码前必须吃透；\cref{sec:prediction,sec:qp} 把单步模型沿时间堆叠成一个凸 QP，是 MPC 之所以为 MPC 的地方；\cref{sec:relation} 用与瞬时 QP/WBC 的对照把 MPC 在控制栈中的位置钉死；\cref{sec:practice} 是工程落地（参数整定 + 求解器），可在跑通仿真后回看。
+
+\subsection*{前置知识桥接}
+本章把前几部的几何与估计工具直接用作地基：
+\begin{itemize}
+  \item \cref{ch:lie}（李群与李代数）给出旋转随时间演化的微分方程 $\dot{\mathbf{R}}=\boldsymbol{\omega}^\wedge\mathbf{R}$（世界系空间角速度）与 $\dot{\mathbf{R}}=\mathbf{R}\,\boldsymbol{\omega}_b^\wedge$（机体系），以及反对称算子 $(\cdot)^\wedge$、$(\cdot)^\vee$。本章转动动力学与“角速度$\to$欧拉角率”映射都建在这条微分方程上；
+  \item \cref{ch:rigid_body}（刚体运动）给出旋转矩阵、ZYX 欧拉角与基本旋转 $\mathbf{R}_x,\mathbf{R}_y,\mathbf{R}_z$ 的定义，本章姿态运动学直接复用；
+  \item \cref{ch:eskf}（卡尔曼滤波与误差状态滤波）给出 MPC 的“当前状态” $\mathbf{x}(0)$——质心位姿、速度、角速度——的来源：状态估计器（在四足里常用足式里程计 + IMU 的 ESKF/InEKF）。MPC 是\emph{控制器}，它假定状态已由估计器给出；
+  \item \cref{ch:control}（控制导论）给出 LQR/MPC 的一般理论——代价函数、预测/控制时域、滚动优化、把约束优化化为 QP。本章是这套一般理论在“四足单刚体”上的\emph{具体落地}，侧重四足专属的单刚体建模与足端力约束；通用的 MPC 概念在该章已建立，本章不再从零复述，仅在用到处 \cref{ch:control}。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会理解“四足为什么能跑/跳”停留在“迈腿 + 平衡”的直觉层面，而\emph{无法}解释为什么动态步态（含腾空）的控制器\emph{必须}有预测能力——这正是本章 \cref{sec:why-predict} 的立论；
+  \item 在读 MIT Cheetah、Mini-Cheetah、宇树等开源/论文代码时，你会看到一个反复出现的 $13$ 维状态、足端力作决策变量、摩擦金字塔约束的 QP，却不知道每一块从哪条物理方程来、为何要做那三处近似——只能照抄而不会调参、不会排错。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导与练习） & 5--7 小时 & 首次系统学习、要做四足运动控制 \\
+速读（跳过冗长堆叠推导） & 2 小时 & 有 MPC 基础、想对齐单刚体建模与记号 \\
+速查（只看小结的符号表 + 公式速查表） & 15 分钟 & 写控制器代码时回来查公式/维度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+旋转矩阵记 $\mathbf{R}\in\SO(3)$；位姿姿态用 ZYX 欧拉角 $\boldsymbol{\Theta}=[\phi,\theta,\psi]^\top$（roll/pitch/yaw，\cref{ch:rigid_body}）。
+反对称算子 $(\cdot)^\wedge:\mathbb{R}^3\to\mathbb{R}^{3\times3}$、其逆 $(\cdot)^\vee$（\cref{ch:lie}），亦写 $[\cdot]_\times$。
+\textbf{足端反作用力（GRF）记 $\mathbf{f}_i\in\mathbb{R}^3$}（第 $i$ 腿，世界系），是 MPC 的决策变量。
+\textbf{时域：预测时域记 $N_p$、控制时域记 $N_c$}（以专名记号避免与足端力 $f$、速度 $v$ 撞名）。
+\textbf{MPC 权重：状态跟踪权重记 $\mathbf{Q}$，控制（力）正则权重记 $\mathbf{R}_u$}（或 $\mathbf{W}_u$）——\emph{切勿}用 $\mathbf{R}$，它已被旋转矩阵占用。
+世界（惯性）系记 $\mathcal{O}$（亦可读作 world 系 $\mathcal{W}$）；本体系 $\mathcal{B}$；\textbf{定向本体系} $\mathcal{P}$：方向与世界系平行、原点与本体系重合（与本体系仅差一个旋转、与世界系仅差一个平移）。
+\textbf{角速度采用世界系“空间角速度”} ${}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}$，满足 $\dot{\mathbf{R}}\mathbf{R}^\top=\boldsymbol{\omega}^\wedge$——这是“左形式”，因为 MPC 状态在世界系最自然；它与本书右扰动主线 $\dot{\mathbf{R}}=\mathbf{R}\,\boldsymbol{\omega}_b^\wedge$ 的换算见 \cref{note:spatial-omega}。
+MPC 周期 $\Delta T$、其他控制环周期 $\Delta t$。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么需要预测：间歇欠驱与 MPC 的必要性}
+\label{sec:why-predict}
+
+\paragraph{全局控制方案：MPC + WBC。}
+四足机器人控制系统要回答三个问题——\emph{在哪儿、去哪儿、怎么去}，分别对应\emph{状态估计器、轨迹规划器、控制器}\cite{dicarlo2018cheetah}。本章聚焦控制器，且采用工业界主流的\textbf{MPC + WBC 双层方案}：上层 MPC 用\emph{简化的单刚体模型}，在\emph{较长的未来时域}上求解\emph{最优的足端反力}序列；下层 WBC（全身控制）用\emph{多刚体模型}，把 MPC 的力/加速度作为任务、在每个高频控制周期解算关节指令。典型频率为 MPC 周期 $\Delta T=0.01\,\mathrm{s}$（$100\,\mathrm{Hz}$），其余控制环 $\Delta t=0.002\,\mathrm{s}$（$500\,\mathrm{Hz}$）\cite{dicarlo2018cheetah}。本章只讲 MPC 这一层。
+
+\paragraph{动机：先用一个“运动员越障”的直觉。}
+要理解四足为何需要\emph{预测}，先看一个最朴素的间歇欠驱例子。一名运动员跃过障碍可分三阶段：起跳、飞行（腾空）、落地。忽略空气阻力，系统外力只有足底反力与重力。
+\begin{itemize}
+  \item \textbf{腾空阶段}：系统只受重力，质心轨迹是一条\emph{抛物线}。无论此刻肌肉如何发力，都改变不了质心的轨迹——这是一个\emph{典型的欠驱系统}。
+  \item \textbf{起跳/落地阶段}：可通过控制肌肉发力改变足底反力，从而\emph{控制}质心位置。
+\end{itemize}
+关键在于：跳得多高、多远，\emph{完全取决于起跳阶段}地面作用力的大小与方向。这就要求运动员\textbf{在起跳阶段就考虑好未来一段时间内质心位置的变化}；而腾空阶段虽不能改变质心轨迹，却可以\emph{调整四肢姿态为落地做准备}。机器人控制器理应有同样的“前瞻”能力：在当前控制周期求控制量时，不仅要跟踪当前期望，还要解出未来一段时间的多个控制量以跟踪未来轨迹——这就要求控制器能\textbf{根据控制量与系统模型预测未来一段时间的状态}\cite{dicarlo2018cheetah}。
+
+\begin{definition}[间歇欠驱系统]\label{def:underactuated}
+若一个系统的某些自由度会\emph{间歇性}地进入欠驱状态（即在某些时间区间内，无论控制输入如何取值，该自由度的运动都无法被改变），则称之为\emph{间歇欠驱系统}。四足动态步态是其典型代表。
+\end{definition}
+
+\paragraph{反面：四足对角步态本身就是间歇欠驱的。}
+以最常用的\textbf{对角步态}（trot）为例（\cref{fig:underactuated}）：右前腿与左后腿为摆动腿（足端与地面无相互作用），剩下两条腿为支撑腿。把两个支撑足简化为球，球心连线称为\emph{支撑线}。由于两个支撑足的反力作用点\emph{都在支撑线上}，无论足底反力多大，\textbf{都不可能产生绕支撑线的力矩}——机器人绕支撑线旋转的方向是\emph{欠驱}的。半个迈步周期后支撑腿与摆动腿切换，支撑线变为另一对足端连线，绕新支撑线的方向\emph{仍然}欠驱\cite{dicarlo2018cheetah}。于是结论自然浮现：为保证欠驱方向不失稳，控制器应在某方向\emph{即将}成为欠驱方向\emph{之前}就为它做准备，并在\emph{即将}脱离欠驱之前为可驱状态做准备。\textbf{因此四足对角步态控制器必须具备预测特性。}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=1.0,>=Stealth]
+  % body
+  \draw[rounded corners=3pt, fill=main!8, draw=main!60!black] (-1.6,0.6) rectangle (1.6,1.2);
+  \node[main!60!black] at (0,0.9) {\small 躯干（单刚体）};
+  % stance feet (RF + LH): draw as filled balls on ground, connected by support line
+  \fill (1.3,-1.2) circle (3pt) node[below right] {\scriptsize 右前(支撑)};
+  \fill (-1.3,-1.2) circle (3pt) node[below left] {\scriptsize 左后(支撑)};
+  % swing feet (LF + RH): hollow, above ground
+  \draw (-1.3,-0.6) circle (3pt) node[above left] {\scriptsize 左前(摆动)};
+  \draw (1.3,-0.6) circle (3pt) node[above right] {\scriptsize 右后(摆动)};
+  % legs (schematic) from body corners to feet
+  \draw[gray!60!black, thick] (1.4,0.6)--(1.3,-1.2);
+  \draw[gray!60!black, thick] (-1.4,0.6)--(-1.3,-1.2);
+  \draw[gray!50, thick, dashed] (-1.5,0.6)--(-1.3,-0.6);
+  \draw[gray!50, thick, dashed] (1.5,0.6)--(1.3,-0.6);
+  % support line
+  \draw[second, very thick, dash dot] (-1.3,-1.2)--(1.3,-1.2);
+  \node[second] at (0,-1.5) {\small 支撑线};
+  % ground reaction forces at stance feet (red, up-ish)
+  \draw[red!70!black, -{Stealth[length=2.5mm]}, thick] (1.3,-1.2)--(1.05,-0.35) node[right] {\scriptsize $\mathbf{f}_i$};
+  \draw[red!70!black, -{Stealth[length=2.5mm]}, thick] (-1.3,-1.2)--(-1.05,-0.35) node[left] {\scriptsize $\mathbf{f}_j$};
+  % torque about support line (curved arrow) labelled underactuated
+  \draw[third, -{Stealth[length=2.5mm]}, thick] (0,-0.55) arc (90:-90:0.28 and 0.45);
+  \node[third, align=center] at (0.95,-0.95) {\scriptsize 绕支撑线\\\scriptsize 欠驱};
+  % ground
+  \draw[gray] (-2.2,-1.2)--(2.2,-1.2);
+  \foreach \x in {-2.0,-1.6,...,2.0} \draw[gray] (\x,-1.2)--(\x-0.15,-1.35);
+\end{tikzpicture}
+\caption{对角步态的欠驱性：右前 + 左后为支撑腿，其足底反力 $\mathbf{f}_i,\mathbf{f}_j$ 作用点都在支撑线上，故无法产生绕支撑线的力矩——机器人绕支撑线旋转的方向是欠驱的。半个周期后支撑/摆动切换，欠驱方向随之改变。控制器须在欠驱来临前预先准备。}
+\label{fig:underactuated}
+\end{figure}
+
+\begin{insight}[WBC 无预测性，故需 MPC（全章立论）]\label{ins:wbc-no-predict}
+为什么不能只用 WBC（全身控制）这种考虑了完整机器人动力学的强方法？因为\textbf{WBC 只求解\emph{瞬时}的关节力矩与力}——它用浮动基逆动力学，把当前任务（位姿、力）映射成当前关节指令，\emph{无法理解和考虑系统未来的状态}，也就无法提前为未来做准备。在动态步态里这一短板是致命的：在\emph{支撑相的后半段}，纯 WBC（及其他无预测算法）\emph{不会为即将到来、没有地面反作用力的飞行相做准备}；而在\emph{飞行相的后半程}，控制系统又\emph{不会为后续的地面冲击做准备}。换言之，相位切换处（起跳前、落地前）恰恰需要\emph{前瞻}，而这正是反应式控制（WBC/PID）做不到、MPC 的预测时域却天然覆盖的。\textbf{“需要为未来的相位切换预先调整力分配”是本章一切的起点。}
+\end{insight}
+
+\begin{insight}[MPC 与 PID 的本质区别]\label{ins:mpc-vs-pid}
+把上一条洞见提炼成一句话：\textbf{MPC 有预测/前瞻，PID 只看当前误差}。PID（及一切纯反馈律）是\emph{反应式}的——误差出现了才纠正；MPC 则用模型\emph{预演}未来若干步、统筹地选出当下该施加的控制。四足动态步态的相位是\emph{已知}的（步态规划器给出谁何时触地），MPC 正好利用这一已知的未来去“排兵布阵”。这条与 \cref{ins:wbc-no-predict} 互为表里，是贯穿全章的主旨线索。
+\end{insight}
+
+\begin{pitfall}[误区：“欠驱 = 控制器设计失败/硬件不行”]
+欠驱不是缺陷，而是\emph{动态运动的内禀属性}。任何依靠间歇接触移动的腿式系统（人、马、四足机器人），在腾空相、在对角支撑相绕支撑线方向，都\emph{必然}欠驱——这是“用离散落足点驱动连续质心”这件事的物理后果，与控制器好坏无关。正确的态度不是消除欠驱（做不到），而是\emph{承认它并提前规划}：在可驱的窗口里为欠驱的窗口攒够“初速度/姿态”。这正是 MPC 预测时域存在的理由。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 画出四足\emph{踱步}（pace，同侧两腿同时摆动）的支撑线，说明它在哪个方向欠驱，并与对角步态（\cref{fig:underactuated}）对比。
+  \item 设运动员起跳离地速度为 $v_0$、离地角 $\alpha$，写出腾空段质心的抛物线轨迹，并据此说明“跳多远完全由起跳决定、腾空无法更改”。这与 \cref{def:underactuated} 的哪一句对应？
+  \item （概念）一个只用 PID 跟踪机身高度的四足，在小跑切换到“飞奔含腾空”时为何容易在落地瞬间崩溃？用 \cref{ins:wbc-no-predict} 的语言解释。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{单刚体模型：为何这样简化}
+\label{sec:srbd}
+
+\paragraph{动机：MPC 的计算预算逼出简化。}
+MPC 每个周期都要对未来预测并选出最优控制序列，\emph{相当于做多次仿真}，计算量很大。若不简化，每次求解都要推演整机的高维非线性多刚体动力学，无法在 $10\,\mathrm{ms}$ 的周期内实时完成。于是采用\textbf{单刚体模型}（Single Rigid Body Dynamics, SRBD）：忽略关节位置变化导致的腿部质量分布变化，把整机当成一个刚体；考虑单刚体在空间中的 $6$ 自由度位置与速度，\textbf{仅用 $12$ 个变量}即可完整描述机器人状态。相关研究表明，这一简化足以把 MPC 计算量降到可接受水平，同时不损失太多控制精度\cite{dicarlo2018cheetah}。
+
+\begin{insight}[质心/单刚体简化的“建模—硬件—反馈”三位一体]\label{ins:com-simplify}
+这里有一条教科书很少直述的工程闭环：单刚体（质心）简化\emph{为何可行}，其实由三件事共同保证。
+\begin{enumerate}
+  \item \textbf{建模简化}：把所有质量集中到躯干、当成单刚体，是为了\emph{求解速度}——否则每次 MPC 都近似于对整机做多次仿真，计算量暴增。
+  \item \textbf{硬件配合}：为了让\emph{真实机器人}逼近这个被简化的模型，串联腿四足通常把\emph{膝关节驱动电机上移到髋关节处}、用连杆传动膝关节，从而\emph{降低腿部转动惯量}——腿越轻、质量分布越集中，单刚体假设被破坏得越少。
+  \item \textbf{反馈补偿}：实时反馈 + 滚动重解，把简化带来的模型误差\emph{逐步校正}掉。
+\end{enumerate}
+即“为追求实时性而简化模型，再用硬件设计与反馈把简化的代价压到最小”。理解这一点，才知道单刚体 MPC 不是“偷懒近似”，而是\emph{系统级}的取舍。
+\end{insight}
+
+\paragraph{历史与三模型对照：单刚体在简化谱系里的位置。}
+单刚体并非唯一的简化模型，把它放进历史谱系里看得最清楚（\cref{fig:three-models},\cref{tab:three-models}）：
+\begin{itemize}
+  \item \textbf{落足启发式（Raibert, 1986）}\cite{raibert1986legged}：单腿/双足跳跃机器人的奠基工作，提出把足端落在“中性点”附近、落点 $=$ 机身速度的\emph{线性函数}即可调速并稳定。这是“用落足控平衡”的源头，至今仍作凸 MPC 的落足初值/对照。
+  \item \textbf{线性倒立摆 LIPM（Kajita, 2001）}\cite{kajita2001lipm}：把双足机器人简化成“质点 + 无质量伸缩腿”，令质心高度恒定 $\Rightarrow$ 线性动力学 $\Rightarrow$ 解析步态生成（ZMP/捕获点框架）。其特点是\emph{质量集中于一点、完全没有转动}。
+  \item \textbf{质心动力学（Orin, 2013）}\cite{orin2013centroidal}：把全身动量压成 $6$ 维质心动量（线动量 $+$ \emph{角动量}），比 LIPM 多了角动量，但需外接质心动量矩阵（CMM）映射，且角动量项使其一般\emph{非凸}。
+  \item \textbf{单刚体凸 MPC（Di Carlo, 2018）}\cite{dicarlo2018cheetah}：本章主角。相对 LIPM \emph{保留了完整的三维转动}（有惯量 $\mathbf{I}$、有姿态 $\SO(3)$）；相对质心模型，用“忽略陀螺项 + 小角近似 + 重力增广”三处近似\emph{换来凸性}，从而能在嵌入式 CPU 上实时跑出高度动态的步态。其硬件载体是 MIT Cheetah 3 平台\cite{bledt2018cheetah3}。
+\end{itemize}
+一句话对照：\textbf{LIPM $=$ 质点无转动；质心模型 $=$ 6 维动量（含角动量、一般非凸）；单刚体凸 MPC $=$ 完整刚体转动 $+$ 三处近似换凸性}。单刚体是“实时性与建模保真度折中的甜点”，也是理解整个谱系的基线\cite{wensing2024legged}。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=5mm,
+  mdl/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, minimum height=1.5cm, minimum width=2.7cm}]
+  \node[mdl, fill=third!8, draw=third!60!black] (lipm) {\textbf{LIPM}\\质点 + 无质量腿\\无转动\\（线性）};
+  \node[mdl, right=of lipm, fill=second!8, draw=second!60!black] (cent) {\textbf{质心动力学}\\6 维质心动量\\含角动量\\（一般非凸）};
+  \node[mdl, right=of cent, fill=main!10, draw=main!60!black] (srbd) {\textbf{单刚体 SRBD}\\刚体 + 惯量 $\mathbf{I}$\\完整 $\SO(3)$ 转动\\（凸 QP）};
+  \draw[->, thick, gray!60!black] (lipm)--(cent) node[midway, above, font=\scriptsize] {+角动量};
+  \draw[->, thick, gray!60!black] (cent)--(srbd) node[midway, above, font=\scriptsize] {+姿态/惯量};
+  \draw[->, thick, gray!60!black] (cent.south) to[out=-90,in=-90] node[midway,below,font=\scriptsize]{三处近似换凸性} (srbd.south);
+\end{tikzpicture}
+\caption{三种简化模型的谱系：从“质点无转动”的 LIPM，到含角动量但一般非凸的质心动力学，再到保留完整三维转动、用三处近似换得凸性的单刚体模型。本章主线即最右者。}
+\label{fig:three-models}
+\end{figure}
+
+\begin{table}[H]\centering\small
+\caption{三种简化模型对照（行星号为难度，见知识点总表）}
+\begin{tabular}{p{0.16\textwidth} p{0.24\textwidth} p{0.24\textwidth} p{0.24\textwidth}}
+\toprule
+维度 & LIPM\cite{kajita2001lipm} & 质心动力学\cite{orin2013centroidal} & 单刚体凸 MPC\cite{dicarlo2018cheetah} \\
+\midrule
+简化对象 & 质点 + 无质量伸缩腿 & 全身压成 6 维质心动量 & 集中质心的单刚体（忽略腿动力学） \\
+转动 & 无（仅平移） & 有角动量，无显式姿态 & 有姿态 $\SO(3)$ + 惯量 $\mathbf{I}$ \\
+凸性 & 线性（解析） & 一般非凸（角动量耦合） & \textbf{凸 QP}（三处近似换来） \\
+控制量 & ZMP / 落足点 & 质心力/力矩 & \textbf{足底反作用力 $\mathbf{f}_i$} \\
+典型用途 & 双足 ZMP 步态生成 & 人形多接触规划 & \textbf{四足实时动态步态} \\
+主要近似代价 & 丢转动、恒质心高 & 需 CMM、非凸 & 大角度/强自旋失真 \\
+\bottomrule
+\end{tabular}
+\label{tab:three-models}
+\end{table}
+
+\subsection{平动动力学与转动动力学}
+\label{subsec:dynamics-three}
+
+我们先给出单刚体的三条动力学方程的“结论形态”，再在 \cref{subsec:srbd-full-derivation} 从密度积分出发给出完整的一手推导，使读者既见全貌又见每一步。记四足质心位置为 ${}^{\mathcal{O}}\boldsymbol{p}_{com}$、质心速度 $\dot{\boldsymbol{p}}_{com}$、角速度 ${}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}$；惯性张量 $\mathbf{I}$ 描述质量分布（忽略关节变化导致的分布变化）；第 $i$ 腿触地点位置与触地力为 ${}^{\mathcal{O}}\boldsymbol{p}_i$、${}^{\mathcal{O}}\boldsymbol{f}_i$；总质量 $m$、重力加速度 ${}^{\mathcal{O}}\boldsymbol{g}$。
+
+\paragraph{\cnum{1} 平动动力学（牛顿第二定律）。}
+世界系下，刚体平动加速度等于合力除以质量。合力为四条腿足端力之和加上重力\cite{dicarlo2018cheetah}：
+\begin{equation}
+  {}^{\mathcal{O}}\ddot{\boldsymbol{p}}_{com}=\frac{1}{m}\sum_{i=1}^{4}{}^{\mathcal{O}}\boldsymbol{f}_i+{}^{\mathcal{O}}\boldsymbol{g}.
+  \label{eq:newton}
+\end{equation}
+
+\paragraph{\cnum{2} 转动动力学（角动量定理）。}
+质心处角动量对时间的微分，等于作用于刚体的所有外力在质心处产生力矩的矢量和。重力作用线过质心，对质心\emph{不产生力矩}，故只剩各足端力的力矩\cite{dicarlo2018cheetah}：
+\begin{equation}
+  \frac{\mathrm{d}}{\mathrm{d}t}\!\left({}^{\mathcal{P}}\mathbf{I}\cdot{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}\right)
+  =\sum_{i=1}^{4}{}^{\mathcal{O}}\boldsymbol{r}_i\times{}^{\mathcal{O}}\boldsymbol{f}_i
+  +\underbrace{\mathbf{0}_{3\times1}\times(m\,{}^{\mathcal{O}}\boldsymbol{g})}_{=\,\mathbf{0}\ (\text{重力过质心})}.
+  \label{eq:euler-angmom}
+\end{equation}
+其中 ${}^{\mathcal{P}}\mathbf{I}$ 是惯性张量在\emph{定向本体系} $\mathcal{P}$ 下的描述，${}^{\mathcal{O}}\boldsymbol{r}_i={}^{\mathcal{O}}\boldsymbol{p}_i-{}^{\mathcal{O}}\boldsymbol{p}_{com}$ 是\emph{质心指向第 $i$ 足端}的向量。重力作用线过质心、对质心力臂为零，故 \cref{eq:euler-angmom} 右端第二项整体恒为 $\mathbf{0}$。
+
+\paragraph{\cnum{3} 姿态运动学（旋转矩阵的演化）。}
+旋转矩阵的变化率与角速度的关系，由 \cref{ch:lie} 的李群微分给出（世界系空间角速度形式）\cite{dicarlo2018cheetah,gaoxiang2019slam14}：
+\begin{equation}
+  \dot{\mathbf{R}}={}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}\,\mathbf{R}.
+  \label{eq:R-kinematics}
+\end{equation}
+
+\begin{note}[空间角速度与本书右扰动主线的换算]\label{note:spatial-omega}
+\cref{eq:R-kinematics} 用的是\emph{空间（左）形式} $\dot{\mathbf{R}}\mathbf{R}^\top=\boldsymbol{\omega}^\wedge$，其中 ${}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}$ 是\emph{世界系下表达的空间角速度}（body-to-world）。本书的几何主线（\cref{ch:lie}）以\emph{右扰动}为主，对应\emph{机体角速度}形式 $\dot{\mathbf{R}}=\mathbf{R}\,\boldsymbol{\omega}_b^\wedge$。二者的换算是
+\[
+  {}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}=\mathbf{R}\,{}^{\mathcal{B}}\boldsymbol{\omega}_{\mathcal{OB}},
+  \qquad(\text{由 } \boldsymbol{\omega}_w^\wedge=\dot{\mathbf{R}}\mathbf{R}^\top,\ \boldsymbol{\omega}_b^\wedge=\mathbf{R}^\top\dot{\mathbf{R}},\ \text{及 } \mathbf{R}\,\mathbf{a}^\wedge\mathbf{R}^\top=(\mathbf{R}\mathbf{a})^\wedge).
+\]
+本章\emph{有意保留世界系空间角速度表述}，因为 MPC 的状态（姿态、位置、速度）放在世界系最自然，凸 MPC 标准范式亦用此形式。读者只需记住：本章的 ${}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}$ 与机体角速度差一个 $\mathbf{R}$，需要切到右扰动主线时按上式换算即可。
+\end{note}
+
+\begin{pitfall}[误区：把角速度当成欧拉角的导数 $\boldsymbol{\omega}=\dot{\boldsymbol{\Theta}}$]
+不能把角速度简单定义为欧拉角对时间的一阶微分。欧拉角三个分量的旋转轴随姿态变化、彼此\emph{不正交}，若以它们为基描述角速度会违背物理（牛顿第一定律）。角速度刻画的是“刚体上点的位置矢量 $\to$ 线速度矢量”的映射，由 \cref{eq:R-kinematics} 的 $\dot{\mathbf{R}}\mathbf{R}^\top$ 严格定义。欧拉角率 $\dot{\boldsymbol{\Theta}}$ 与角速度 $\boldsymbol{\omega}$ 之间差一个依赖姿态的映射矩阵——这正是 \cref{subsec:euler-map} 要推的东西。
+\end{pitfall}
+
+\subsection{从密度积分到欧拉方程：单刚体动力学的完整推导}
+\label{subsec:srbd-full-derivation}
+
+\cref{eq:newton,eq:euler-angmom} 是“结论形态”。本小节从\emph{密度积分}出发，给出一手完整推导（比多数 MPC 论文详尽），使读者看清牛顿方程与欧拉方程\emph{每一项的来历}\cite{unitree2023quadruped}。约定：机身系 $\{b\}$ 取为一个\emph{当前时刻与机身重合的惯性系}（牛顿第二定律只在惯性系成立），原点取在\emph{重心}。
+
+\paragraph{质量与重心。}
+设密度场 $\rho(x,y,z)$，刚体总质量与“重心在原点”的定义为
+\begin{equation}
+  m=\int_B\rho\,\mathrm{d}V,
+  \qquad
+  \int_B\rho\,\boldsymbol{p}_b\,\mathrm{d}V=\mathbf{0}_{3\times1}
+  \;(\text{把 } \{b\}\text{ 原点建在重心}).
+  \label{eq:mass-com}
+\end{equation}
+由 $\int_B\rho\,\boldsymbol{p}_b\,\mathrm{d}V=\mathbf{0}$ 立刻有两条\emph{推论}（后面反复用来消项）：$\int_B\rho\,\boldsymbol{p}_b^\wedge\,\mathrm{d}V=\mathbf{0}$、$\int_B\rho\,\boldsymbol{p}_b^\top\,\mathrm{d}V=\mathbf{0}$。
+
+\paragraph{刚体上一点的速度与加速度。}
+设机身系下机身线速度 $\boldsymbol{v}_b$、角速度 $\boldsymbol{\omega}_b$。刚体上一点 $P$（坐标 $\boldsymbol{p}_P$）的速度由“平移 + 绕轴转动”叠加；又因当前时刻 $\{b\}$ 原点与机身重合（$\boldsymbol{p}_{O'}=\mathbf{0}$），化简得
+\begin{align}
+  \dot{\boldsymbol{p}}_P&=\boldsymbol{v}_b+\boldsymbol{\omega}_b^\wedge\,\boldsymbol{p}_P,\label{eq:point-vel}\\
+  \ddot{\boldsymbol{p}}_P&=\dot{\boldsymbol{v}}_b+\dot{\boldsymbol{\omega}}_b^\wedge\,\boldsymbol{p}_P+\boldsymbol{\omega}_b^\wedge\boldsymbol{\omega}_b^\wedge\,\boldsymbol{p}_P.\label{eq:point-acc}
+\end{align}
+
+\paragraph{合外力 $\to$ 牛顿方程。}
+合外力等于各微元 $\rho\,\mathrm{d}V$ 的“质量 $\times$ 加速度”积分。把 $\boldsymbol{v}_b,\boldsymbol{\omega}_b$ 及其导数作为积分常量提出 \cref{eq:point-acc}：
+\begin{equation}
+  \boldsymbol{f}_b=\int_B\rho\,\ddot{\boldsymbol{p}}_b\,\mathrm{d}V
+  =\dot{\boldsymbol{v}}_b\!\int_B\!\rho\,\mathrm{d}V
+  +\dot{\boldsymbol{\omega}}_b^\wedge\!\underbrace{\int_B\!\rho\,\boldsymbol{p}_b\,\mathrm{d}V}_{=\,\mathbf{0}}
+  +\boldsymbol{\omega}_b^\wedge\boldsymbol{\omega}_b^\wedge\!\underbrace{\int_B\!\rho\,\boldsymbol{p}_b\,\mathrm{d}V}_{=\,\mathbf{0}}
+  \;\Longrightarrow\;
+  \boxed{\boldsymbol{f}_b=m\,\dot{\boldsymbol{v}}_b}.
+  \label{eq:newton-derived}
+\end{equation}
+后两项因含 $\int_B\rho\,\boldsymbol{p}_b\,\mathrm{d}V=\mathbf{0}$（重心定义）而消失——这就是“把坐标系建在重心”大幅简化方程的体现\cite{dicarlo2018cheetah}。
+
+\paragraph{合外力矩 $\to$ 欧拉方程。}
+力矩等于力臂与力的向量积，刚体重心处所受合外力矩 $\boldsymbol{m}_b$ 是各微元力矩 $\boldsymbol{p}_b^\wedge\,\mathrm{d}\boldsymbol{f}=\boldsymbol{p}_b^\wedge\rho\ddot{\boldsymbol{p}}_b\,\mathrm{d}V$ 的积分。把 \cref{eq:point-acc} 的三项加速度代入，并把常量 $\dot{\boldsymbol{v}}_b,\dot{\boldsymbol{\omega}}_b,\boldsymbol{\omega}_b$ 提出积分号\cite{unitree2023quadruped}：
+\begin{equation}
+\begin{aligned}
+  \boldsymbol{m}_b&=\int_B\boldsymbol{p}_b^\wedge\,\rho\,\ddot{\boldsymbol{p}}_b\,\mathrm{d}V
+  =\int_B\rho\,\boldsymbol{p}_b^\wedge\big(\dot{\boldsymbol{v}}_b+\dot{\boldsymbol{\omega}}_b^\wedge\boldsymbol{p}_b+\boldsymbol{\omega}_b^\wedge\boldsymbol{\omega}_b^\wedge\boldsymbol{p}_b\big)\,\mathrm{d}V\\
+  &=\underbrace{\Big(\!\int_B\rho\,\boldsymbol{p}_b^\wedge\,\mathrm{d}V\Big)\dot{\boldsymbol{v}}_b}_{\text{第 1 项}}
+  +\underbrace{\int_B\rho\,\boldsymbol{p}_b^\wedge\dot{\boldsymbol{\omega}}_b^\wedge\,\boldsymbol{p}_b\,\mathrm{d}V}_{\text{第 2 项}}
+  +\underbrace{\int_B\rho\,\boldsymbol{p}_b^\wedge\boldsymbol{\omega}_b^\wedge\boldsymbol{\omega}_b^\wedge\,\boldsymbol{p}_b\,\mathrm{d}V}_{\text{第 3 项}}.
+\end{aligned}
+\label{eq:moment-expand}
+\end{equation}
+\textbf{第 1 项}含 $\int_B\rho\,\boldsymbol{p}_b^\wedge\,\mathrm{d}V$，由重心定义 \cref{eq:mass-com}（$\int_B\rho\,\boldsymbol{p}_b\,\mathrm{d}V=\mathbf{0}\Rightarrow\int_B\rho\,\boldsymbol{p}_b^\wedge\,\mathrm{d}V=\mathbf{0}$）整体为零。\textbf{第 2 项}用反对称矩阵的反交换律 $\boldsymbol{a}^\wedge\boldsymbol{b}=-\boldsymbol{b}^\wedge\boldsymbol{a}$（取 $\boldsymbol{a}=\dot{\boldsymbol{\omega}}_b,\boldsymbol{b}=\boldsymbol{p}_b$，即 $\dot{\boldsymbol{\omega}}_b^\wedge\boldsymbol{p}_b=-\boldsymbol{p}_b^\wedge\dot{\boldsymbol{\omega}}_b$）把 $\dot{\boldsymbol{\omega}}_b$ 移到右端、提出积分号\cite{unitree2023quadruped}：
+\begin{equation}
+  \int_B\rho\,\boldsymbol{p}_b^\wedge\dot{\boldsymbol{\omega}}_b^\wedge\,\boldsymbol{p}_b\,\mathrm{d}V
+  =-\int_B\rho\,\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge\,\dot{\boldsymbol{\omega}}_b\,\mathrm{d}V
+  =\Big(\underbrace{-\!\int_B\rho\,\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge\,\mathrm{d}V}_{\mathbf{I}_b}\Big)\dot{\boldsymbol{\omega}}_b
+  =\mathbf{I}_b\dot{\boldsymbol{\omega}}_b,
+  \label{eq:moment-term2}
+\end{equation}
+其中\textbf{惯性张量}首次涌现：$\mathbf{I}_b:=-\int_B\rho\,\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge\,\mathrm{d}V$（与 \cref{eq:Kt-3} 能量法所得\emph{同一式}，见 \cref{ins:inertia-two-routes}）。\textbf{第 3 项}最繁，逐步用二重向量积 $\boldsymbol{a}^\wedge\boldsymbol{b}^\wedge\boldsymbol{c}=\boldsymbol{b}(\boldsymbol{a}^\top\boldsymbol{c})-\boldsymbol{c}(\boldsymbol{a}^\top\boldsymbol{b})$、点积标量可自由移位、再逆用二重向量积，化出陀螺项\cite{unitree2023quadruped}：
+\begin{equation}
+\begin{aligned}
+  \int_B\rho\,\boldsymbol{p}_b^\wedge\boldsymbol{\omega}_b^\wedge\boldsymbol{\omega}_b^\wedge\,\boldsymbol{p}_b\,\mathrm{d}V
+  &=\int_B\rho\,\boldsymbol{p}_b^\wedge\big[(\boldsymbol{\omega}_b^\top\boldsymbol{p}_b)\boldsymbol{\omega}_b-(\boldsymbol{\omega}_b^\top\boldsymbol{\omega}_b)\boldsymbol{p}_b\big]\,\mathrm{d}V
+  &&(\text{对内层 }\boldsymbol{\omega}_b^\wedge\boldsymbol{\omega}_b^\wedge\boldsymbol{p}_b\text{ 用二重向量积})\\
+  &=\int_B\rho\,(\boldsymbol{\omega}_b^\top\boldsymbol{p}_b)\,\boldsymbol{p}_b^\wedge\boldsymbol{\omega}_b\,\mathrm{d}V
+  &&(\boldsymbol{p}_b^\wedge\boldsymbol{p}_b=\mathbf{0}\text{ 使第二块消失})\\
+  &=-\int_B\rho\,(\boldsymbol{\omega}_b^\top\boldsymbol{p}_b)\,\boldsymbol{\omega}_b^\wedge\boldsymbol{p}_b\,\mathrm{d}V
+  &&(\text{反交换律 }\boldsymbol{p}_b^\wedge\boldsymbol{\omega}_b=-\boldsymbol{\omega}_b^\wedge\boldsymbol{p}_b)\\
+  &=-\int_B\rho\,\boldsymbol{\omega}_b^\wedge\big[(\boldsymbol{\omega}_b^\top\boldsymbol{p}_b)\boldsymbol{p}_b-(\boldsymbol{p}_b^\top\boldsymbol{p}_b)\boldsymbol{\omega}_b\big]\,\mathrm{d}V
+  &&(\text{补回 }(\boldsymbol{p}_b^\top\boldsymbol{p}_b)\boldsymbol{\omega}_b^\wedge\boldsymbol{\omega}_b=\mathbf{0}\text{ 一项})\\
+  &=\boldsymbol{\omega}_b^\wedge\Big(\underbrace{-\!\int_B\rho\,\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge\,\mathrm{d}V}_{\mathbf{I}_b}\Big)\boldsymbol{\omega}_b
+  =\boldsymbol{\omega}_b^\wedge\mathbf{I}_b\boldsymbol{\omega}_b
+  &&(\text{逆用二重向量积写回 }\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge).
+\end{aligned}
+\label{eq:moment-term3}
+\end{equation}
+末步中括号 $(\boldsymbol{\omega}_b^\top\boldsymbol{p}_b)\boldsymbol{p}_b-(\boldsymbol{p}_b^\top\boldsymbol{p}_b)\boldsymbol{\omega}_b$ 恰是 $\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge\boldsymbol{\omega}_b$ 的二重向量积展开（$\boldsymbol{a}=\boldsymbol{b}=\boldsymbol{p}_b,\boldsymbol{c}=\boldsymbol{\omega}_b$），故方括号外的 $-\!\int_B\rho(\cdot)$ 正是 $\mathbf{I}_b\boldsymbol{\omega}_b$，提出 $\boldsymbol{\omega}_b^\wedge$ 即得 $\boldsymbol{\omega}_b^\wedge\mathbf{I}_b\boldsymbol{\omega}_b$；补的那一项 $(\boldsymbol{p}_b^\top\boldsymbol{p}_b)\boldsymbol{\omega}_b^\wedge\boldsymbol{\omega}_b$ 因 $\boldsymbol{\omega}_b^\wedge\boldsymbol{\omega}_b=\boldsymbol{\omega}_b\times\boldsymbol{\omega}_b=\mathbf{0}$ 不改变等式。三项合并（第 1 项零、第 2 项 $\mathbf{I}_b\dot{\boldsymbol{\omega}}_b$、第 3 项 $\boldsymbol{\omega}_b^\wedge\mathbf{I}_b\boldsymbol{\omega}_b$），得旋转刚体的\textbf{欧拉方程}\cite{dicarlo2018cheetah,unitree2023quadruped}：
+\begin{equation}
+  \boxed{\boldsymbol{m}_b=\mathbf{I}_b\dot{\boldsymbol{\omega}}_b+\boldsymbol{\omega}_b^\wedge\mathbf{I}_b\boldsymbol{\omega}_b}.
+  \label{eq:euler-full}
+\end{equation}
+末项 $\boldsymbol{\omega}_b^\wedge\mathbf{I}_b\boldsymbol{\omega}_b$ 即\emph{陀螺项}（角动量叉乘项），它是 \cref{sec:convexify} 凸化时要忽略的关键对象。
+
+\begin{note}[第 3 项化简的“补项”技法为何合法]\label{note:gyro-add-zero}
+\cref{eq:moment-term3} 第三步到第四步\emph{凭空补}了一项 $(\boldsymbol{p}_b^\top\boldsymbol{p}_b)\boldsymbol{\omega}_b$，看似无中生有，实则因为补的是 $\boldsymbol{\omega}_b^\wedge\big[(\boldsymbol{p}_b^\top\boldsymbol{p}_b)\boldsymbol{\omega}_b\big]=(\boldsymbol{p}_b^\top\boldsymbol{p}_b)\,\boldsymbol{\omega}_b^\wedge\boldsymbol{\omega}_b=\mathbf{0}$（任意向量与自身叉乘为零）。补它的\emph{目的}是把方括号凑成标准二重向量积的形态 $(\boldsymbol{a}^\top\boldsymbol{c})\boldsymbol{b}-(\boldsymbol{a}^\top\boldsymbol{b})\boldsymbol{c}$，从而能逆向折回 $\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge\boldsymbol{\omega}_b$、识别出惯性张量。这是一种“加零配方”的常用代数技巧：加一个恒为零的项不改变等式，却把表达式整理成可识别的结构。它与能量法 \cref{eq:Kt-3} 末步“逆用二重向量积”是同一招的两次运用——力矩路与能量路在\emph{同一步}殊途同归地认出 $\mathbf{I}_b$。
+\end{note}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:point-vel} 出发推 \cref{eq:point-acc}（对 $t$ 求导，注意 $\dot{\boldsymbol{\omega}}_b^\wedge$ 与 $\boldsymbol{\omega}_b^\wedge\boldsymbol{\omega}_b^\wedge$ 两项的来历）。
+  \item 用反对称矩阵恒等式 $\boldsymbol{a}^\wedge\boldsymbol{b}=-\boldsymbol{b}^\wedge\boldsymbol{a}$ 与二重向量积 $\boldsymbol{a}^\wedge\boldsymbol{b}^\wedge\boldsymbol{c}=\boldsymbol{b}(\boldsymbol{a}^\top\boldsymbol{c})-\boldsymbol{c}(\boldsymbol{a}^\top\boldsymbol{b})$，把欧拉方程第 2、3 项化出来（参 \cref{eq:euler-full}）。
+  \item （概念）解释为什么“把机身系原点建在重心”能让牛顿方程从三项塌缩成 $m\dot{\boldsymbol{v}}_b$ 一项。
+\end{enumerate}
+\end{practice}
+
+\subsection{单刚体动能、惯性张量的显式分量与能量法验证}
+\label{subsec:srbd-energy}
+
+\cref{subsec:srbd-full-derivation} 用\emph{力 / 力矩}的积分得到了牛顿方程与欧拉方程，其间“顺手”定义了惯性张量 $\mathbf{I}_b:=-\int_B\rho\,\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge\,\mathrm{d}V$。本小节补上\emph{动能}一手推导（与力 / 力矩推导互为表里）：它让惯性张量\emph{第二次}、从能量视角自然涌现，写出其六个显式分量，并由“转动动能与坐标系无关”反过来\emph{独立地}证出 \cref{eq:inertia-transform} 的世界系惯量变换 $\mathbf{I}_s=\mathbf{R}\mathbf{I}_b\mathbf{R}^\top$——这是凸化第一处近似（\cref{subsec:drop-gyro}）所依赖的关键式，此前只给了角动量等价的一条推导，这里给出能量法的\emph{第二条独立证明}，两证互验。
+
+\paragraph{微元动能与刚体总动能。}
+刚体内一速度为 $\boldsymbol{v}=[v_x,v_y,v_z]^\top$ 的微元 $\rho\,\mathrm{d}V$，其动能写成内积形式\cite{unitree2023quadruped}：
+\begin{equation}
+  \mathrm{d}K=\tfrac12\rho\,(v_x^2+v_y^2+v_z^2)\,\mathrm{d}V=\tfrac12\rho\,\boldsymbol{v}^\top\boldsymbol{v}\,\mathrm{d}V,
+  \label{eq:dK}
+\end{equation}
+即用内积 $\boldsymbol{v}^\top\boldsymbol{v}$ 表示分量平方和。代入刚体上点的速度 \cref{eq:point-vel}（$\boldsymbol{v}=\boldsymbol{v}_b+\boldsymbol{\omega}_b^\wedge\boldsymbol{p}_b$），对全体积积分，并用转置展开 $(\boldsymbol{v}_b+\boldsymbol{\omega}_b^\wedge\boldsymbol{p}_b)^\top=\boldsymbol{v}_b^\top+\boldsymbol{p}_b^\top(\boldsymbol{\omega}_b^\wedge)^\top$\cite{unitree2023quadruped}：
+\begin{equation}
+\begin{aligned}
+  K&=\int_B\tfrac12\rho\,\boldsymbol{v}^\top\boldsymbol{v}\,\mathrm{d}V
+  =\tfrac12\int_B\rho\big(\boldsymbol{v}_b^\top+\boldsymbol{p}_b^\top(\boldsymbol{\omega}_b^\wedge)^\top\big)\big(\boldsymbol{v}_b+\boldsymbol{\omega}_b^\wedge\boldsymbol{p}_b\big)\,\mathrm{d}V\\
+  &=\underbrace{\tfrac12\int_B\rho\,\boldsymbol{v}_b^\top\boldsymbol{v}_b\,\mathrm{d}V}_{\text{第 1 项}}
+  +\underbrace{\tfrac12\boldsymbol{v}_b^\top\boldsymbol{\omega}_b^\wedge\!\int_B\rho\,\boldsymbol{p}_b\,\mathrm{d}V}_{\text{第 2 项}}
+  +\underbrace{\tfrac12\!\int_B\rho\,\boldsymbol{p}_b^\top\,\mathrm{d}V\,(\boldsymbol{\omega}_b^\wedge)^\top\boldsymbol{v}_b}_{\text{第 3 项}}
+  +\underbrace{\tfrac12\!\int_B\rho\,\boldsymbol{p}_b^\top(\boldsymbol{\omega}_b^\wedge)^\top\boldsymbol{\omega}_b^\wedge\boldsymbol{p}_b\,\mathrm{d}V}_{\text{第 4 项}}.
+\end{aligned}
+\label{eq:K-expand}
+\end{equation}
+其中 $\boldsymbol{v}_b,\boldsymbol{\omega}_b$ 对积分为常量、已提到积分号外。
+
+\paragraph{交叉项消失：重心定义的又一次兑现。}
+\cref{eq:K-expand} 的第 2、3 项都含因子 $\int_B\rho\,\boldsymbol{p}_b\,\mathrm{d}V$（第 3 项含其转置 $\int_B\rho\,\boldsymbol{p}_b^\top\,\mathrm{d}V$）。由 \cref{eq:mass-com} 的重心定义 $\int_B\rho\,\boldsymbol{p}_b\,\mathrm{d}V=\mathbf{0}$，二者皆为零\cite{unitree2023quadruped}。于是动能\emph{解耦}为纯平动与纯转动两块——这正是“把坐标系建在重心”的第二重红利（第一重是牛顿方程塌缩，\cref{eq:newton-derived}）：
+\begin{equation}
+  K=\underbrace{\tfrac12\int_B\rho\,\boldsymbol{v}_b^\top\boldsymbol{v}_b\,\mathrm{d}V}_{K_m\ (\text{移动动能})}
+  +\underbrace{\tfrac12\int_B\rho\,\boldsymbol{p}_b^\top(\boldsymbol{\omega}_b^\wedge)^\top\boldsymbol{\omega}_b^\wedge\boldsymbol{p}_b\,\mathrm{d}V}_{K_t\ (\text{转动动能})}.
+  \label{eq:K-split}
+\end{equation}
+
+\paragraph{移动动能 $\to\tfrac12 m\boldsymbol{v}_b^\top\boldsymbol{v}_b$。}
+$\boldsymbol{v}_b$ 提出积分号、$\int_B\rho\,\mathrm{d}V=m$（\cref{eq:mass-com}）\cite{unitree2023quadruped}：
+\begin{equation}
+  K_m=\tfrac12\int_B\rho\,\boldsymbol{v}_b^\top\boldsymbol{v}_b\,\mathrm{d}V
+  =\tfrac12\Big(\int_B\rho\,\mathrm{d}V\Big)\boldsymbol{v}_b^\top\boldsymbol{v}_b
+  =\tfrac12 m\,\boldsymbol{v}_b^\top\boldsymbol{v}_b,
+  \label{eq:Km}
+\end{equation}
+形式上即标量动能公式 $\tfrac12 m v^2$ 的向量内积版（$\boldsymbol{v}_b^\top\boldsymbol{v}_b$ 即各分量平方和）。
+
+\paragraph{转动动能 $\to\tfrac12\boldsymbol{\omega}_b^\top\mathbf{I}_b\boldsymbol{\omega}_b$（惯性张量的能量法涌现）。}
+先用反对称性 $(\boldsymbol{\omega}_b^\wedge)^\top=-\boldsymbol{\omega}_b^\wedge$ 把 $K_t$ 的两个反对称算子并到一起\cite{unitree2023quadruped}：
+\begin{equation}
+  K_t=\tfrac12\int_B\rho\,\boldsymbol{p}_b^\top(\boldsymbol{\omega}_b^\wedge)^\top\boldsymbol{\omega}_b^\wedge\boldsymbol{p}_b\,\mathrm{d}V
+  =-\tfrac12\int_B\rho\,\boldsymbol{p}_b^\top\boldsymbol{\omega}_b^\wedge\boldsymbol{\omega}_b^\wedge\boldsymbol{p}_b\,\mathrm{d}V.
+  \label{eq:Kt-1}
+\end{equation}
+对被积标量用二重向量积展开 $\boldsymbol{\omega}_b^\wedge\boldsymbol{\omega}_b^\wedge\boldsymbol{p}_b=\boldsymbol{\omega}_b(\boldsymbol{\omega}_b^\top\boldsymbol{p}_b)-\boldsymbol{p}_b(\boldsymbol{\omega}_b^\top\boldsymbol{\omega}_b)$（即 $\boldsymbol{a}^\wedge\boldsymbol{b}^\wedge\boldsymbol{c}=\boldsymbol{b}(\boldsymbol{a}^\top\boldsymbol{c})-\boldsymbol{c}(\boldsymbol{a}^\top\boldsymbol{b})$ 取 $\boldsymbol{a}=\boldsymbol{b}=\boldsymbol{\omega}_b,\boldsymbol{c}=\boldsymbol{p}_b$），左乘 $\boldsymbol{p}_b^\top$\cite{unitree2023quadruped}：
+\begin{equation}
+  K_t=-\tfrac12\int_B\rho\big[(\boldsymbol{\omega}_b^\top\boldsymbol{p}_b)(\boldsymbol{p}_b^\top\boldsymbol{\omega}_b)-(\boldsymbol{\omega}_b^\top\boldsymbol{\omega}_b)(\boldsymbol{p}_b^\top\boldsymbol{p}_b)\big]\,\mathrm{d}V.
+  \label{eq:Kt-2}
+\end{equation}
+括号内两项都是\emph{标量乘标量}；标量点积满足交换律，可自由移位，把 $\boldsymbol{\omega}_b$ 提到两端，凑成对 $\boldsymbol{\omega}_b$ 的二次型\cite{unitree2023quadruped}：
+\begin{equation}
+\begin{aligned}
+  K_t&=-\tfrac12\int_B\rho\,\boldsymbol{\omega}_b^\top\big[(\boldsymbol{p}_b^\top\boldsymbol{\omega}_b)\boldsymbol{p}_b-(\boldsymbol{p}_b^\top\boldsymbol{p}_b)\boldsymbol{\omega}_b\big]\,\mathrm{d}V\\
+  &=\tfrac12\,\boldsymbol{\omega}_b^\top\Big(\underbrace{-\!\int_B\rho\,\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge\,\mathrm{d}V}_{\mathbf{I}_b}\Big)\boldsymbol{\omega}_b
+  =\tfrac12\,\boldsymbol{\omega}_b^\top\mathbf{I}_b\boldsymbol{\omega}_b,
+\end{aligned}
+\label{eq:Kt-3}
+\end{equation}
+末步逆用二重向量积把方括号写回 $-\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge\boldsymbol{\omega}_b$，于是\emph{再次}得到与 \cref{subsec:srbd-full-derivation} 力矩推导\emph{完全相同}的惯性张量定义 $\mathbf{I}_b=-\int_B\rho\,\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge\,\mathrm{d}V$。
+
+\begin{insight}[惯性张量两条独立来路：力矩积分 vs 动能二次型]\label{ins:inertia-two-routes}
+惯性张量在本章\emph{两次}独立涌现：一次在力矩积分 \cref{eq:euler-full} 的第 2 项（$\mathbf{I}_b\dot{\boldsymbol{\omega}}_b$），一次在转动动能 \cref{eq:Kt-3} 的二次型（$\tfrac12\boldsymbol{\omega}_b^\top\mathbf{I}_b\boldsymbol{\omega}_b$）。两条路殊途同归、给出\emph{同一个} $\mathbf{I}_b=-\int_B\rho\,\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge\,\mathrm{d}V$，这不是巧合：它正是“惯量是转动惯性的唯一度量”的体现——无论从“力矩使角加速度”还是从“转动储能”看，质量分布对转动的影响都凝聚为这同一个 $3\times3$ 对称矩阵。把转动动能写成二次型 $\tfrac12\boldsymbol{\omega}^\top\mathbf{I}\boldsymbol{\omega}$（对照平动 $\tfrac12 m\boldsymbol{v}^\top\boldsymbol{v}$）——\emph{二次型即“向量的二次方”、$\mathbf{I}$ 即转动版的 $m$}——是后续 QP 代价 $\tfrac12\mathbf{U}^\top\mathbf{H}\mathbf{U}$（\cref{eq:qp-cost}）等一切二次型的认知母题。
+\end{insight}
+
+\paragraph{惯性张量的显式六分量。}
+把 $\mathbf{I}_b=-\int_B\rho\,\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge\,\mathrm{d}V$ 按 $\boldsymbol{p}_b=[p_x,p_y,p_z]^\top$ 展开。反对称矩阵自乘
+\begin{equation}
+  \boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge
+  =\begin{bmatrix}0&-p_z&p_y\\p_z&0&-p_x\\-p_y&p_x&0\end{bmatrix}^2
+  =\begin{bmatrix}-(p_y^2+p_z^2)&p_xp_y&p_xp_z\\ p_xp_y&-(p_x^2+p_z^2)&p_yp_z\\ p_xp_z&p_yp_z&-(p_x^2+p_y^2)\end{bmatrix},
+  \label{eq:pwedge-sq}
+\end{equation}
+取负号、逐元积分得\cite{unitree2023quadruped}：
+\begin{equation}
+  \mathbf{I}_b=\int_B\rho\begin{bmatrix}p_y^2+p_z^2&-p_xp_y&-p_xp_z\\-p_xp_y&p_x^2+p_z^2&-p_yp_z\\-p_xp_z&-p_yp_z&p_x^2+p_y^2\end{bmatrix}\mathrm{d}V
+  =\begin{bmatrix}I_{xx}&I_{xy}&I_{xz}\\I_{xy}&I_{yy}&I_{yz}\\I_{xz}&I_{yz}&I_{zz}\end{bmatrix},
+  \label{eq:inertia-components-mat}
+\end{equation}
+即\textbf{三个转动惯量}（对角）与\textbf{三个惯量积}（非对角）\cite{unitree2023quadruped}：
+\begin{equation}
+\begin{aligned}
+  &I_{xx}=\int_B\rho(p_y^2+p_z^2)\,\mathrm{d}V,\quad
+  I_{yy}=\int_B\rho(p_x^2+p_z^2)\,\mathrm{d}V,\quad
+  I_{zz}=\int_B\rho(p_x^2+p_y^2)\,\mathrm{d}V,\\
+  &I_{xy}=-\int_B\rho\,p_xp_y\,\mathrm{d}V,\quad
+  I_{xz}=-\int_B\rho\,p_xp_z\,\mathrm{d}V,\quad
+  I_{yz}=-\int_B\rho\,p_yp_z\,\mathrm{d}V.
+\end{aligned}
+\label{eq:inertia-components}
+\end{equation}
+$\mathbf{I}_b$ 对称（$\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge$ 对称），故只有 $6$ 个独立量。本书的惯量积约定将负号并入定义（$I_{xy}=-\int_B\rho\,p_xp_y\,\mathrm{d}V$ 等），从而矩阵 \cref{eq:inertia-components-mat} 的非对角位置直接填入 $I_{xy},I_{xz},I_{yz}$。对密度均匀、棱沿坐标轴的长方体（边长 $l,w,h$），\cref{eq:inertia-components} 的积分可解析算出，惯量积全为零、得对角阵\cite{unitree2023quadruped}：
+\begin{equation}
+  \mathbf{I}_b=\tfrac{1}{12}\,\mathrm{diag}\!\big(m(w^2+h^2),\,m(l^2+h^2),\,m(l^2+w^2)\big),
+  \label{eq:inertia-box}
+\end{equation}
+这正是 \cref{exam:inertia} 把机器人“等效为匀质长方体”取惯量初值的依据。
+
+\paragraph{能量法独立证出惯量的世界系变换。}
+\cref{eq:inertia-transform} 此前由“角动量两系等价”得出。这里给\emph{第二条独立证明}：转动动能是\emph{标量}、与坐标系选择无关，故世界系 $\{s\}$ 与机身系 $\{b\}$ 下 $K_t$ 相等\cite{unitree2023quadruped}：
+\begin{equation}
+\begin{aligned}
+  K_{st}&=K_{bt}\;\Longrightarrow\;\tfrac12\boldsymbol{\omega}_s^\top\mathbf{I}_s\boldsymbol{\omega}_s=\tfrac12\boldsymbol{\omega}_b^\top\mathbf{I}_b\boldsymbol{\omega}_b,\\
+  \boldsymbol{\omega}_s^\top\mathbf{I}_s\boldsymbol{\omega}_s
+  &=(\mathbf{R}_{bs}\boldsymbol{\omega}_s)^\top\mathbf{I}_b(\mathbf{R}_{bs}\boldsymbol{\omega}_s)
+  =\boldsymbol{\omega}_s^\top\mathbf{R}_{bs}^\top\mathbf{I}_b\mathbf{R}_{bs}\boldsymbol{\omega}_s
+  =\boldsymbol{\omega}_s^\top\big(\mathbf{R}_{sb}\mathbf{I}_b\mathbf{R}_{sb}^\top\big)\boldsymbol{\omega}_s,
+\end{aligned}
+\label{eq:Kt-equal}
+\end{equation}
+其中代入了机体角速度 $\boldsymbol{\omega}_b=\mathbf{R}_{bs}\boldsymbol{\omega}_s$（同一角速度在两系的换算）与 $\mathbf{R}_{bs}=\mathbf{R}_{sb}^\top$（\cref{eq:qk-R-orth} 风格的正交性，见 \cref{ch:rigid_body}）。由于 \cref{eq:Kt-equal} 对\emph{任意} $\boldsymbol{\omega}_s$ 都成立，两端二次型的矩阵必相等，得\cite{unitree2023quadruped}：
+\begin{equation}
+  \boxed{\,\mathbf{I}_s=\mathbf{R}_{sb}\,\mathbf{I}_b\,\mathbf{R}_{sb}^\top\,}\qquad(\text{即 }{}^{\mathcal{P}}\mathbf{I}={}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}\,{}^{\mathcal{B}}\mathbf{I}\,{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}^\top,\ \cref{eq:inertia-transform}).
+  \label{eq:inertia-transform-energy}
+\end{equation}
+
+\begin{insight}[同一式两证：角动量等价 vs 转动动能不变（互验的范式）]\label{ins:inertia-transform-two-proofs}
+世界系惯量变换 $\mathbf{I}_s=\mathbf{R}\mathbf{I}_b\mathbf{R}^\top$ 在本章被\emph{两条互不依赖}的路径证出：(1) \cref{eq:angmom-transform} 由“角动量 $\boldsymbol{l}$ 在两系等价 ${}^{\mathcal{P}}\boldsymbol{l}={}^{\mathcal{P}}\mathbf{R}_{\mathcal{B}}{}^{\mathcal{B}}\boldsymbol{l}$、插单位阵重组”得出；(2) \cref{eq:Kt-equal} 由“转动动能 $K_t$ 是标量、与坐标系无关”得出。前者用\emph{矢量}（角动量）的协变性，后者用\emph{标量}（能量）的不变性——一个量在不同坐标系下要么按张量协变、要么作为标量不变，两条都把 $\mathbf{R}\,\mathbf{I}_b\,\mathbf{R}^\top$ 这个相似变换\emph{逼}了出来。出版级教材给出两证不是冗余，而是让读者看清\emph{为何这个变换必然是 $\mathbf{R}(\cdot)\mathbf{R}^\top$ 的相似形式}。它直接服务于 \cref{subsec:drop-gyro}：离散化时每个周期按当前 $\psi$ 用 \cref{eq:inertia-transform-energy} 重算 ${}^{\mathcal{P}}\mathbf{I}_k$。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:dK} 出发，代入 \cref{eq:point-vel} 并展开转置，逐项核对 \cref{eq:K-expand} 的四项；指出哪两项因重心定义为零。
+  \item 直接展开 $\boldsymbol{p}_b^\wedge\boldsymbol{p}_b^\wedge$（\cref{eq:pwedge-sq}）的矩阵自乘，验证对角元为 $-(p_y^2+p_z^2)$ 等、非对角元为 $p_xp_y$ 等，进而由 \cref{eq:inertia-components-mat} 读出六分量 \cref{eq:inertia-components}。
+  \item 对密度 $\rho$ 均匀、棱沿轴的长方体（$x\in[-\tfrac l2,\tfrac l2]$ 等），积分算出 $I_{xx}=\int\rho(p_y^2+p_z^2)\mathrm{d}V$，验证 \cref{eq:inertia-box} 的第一个对角元 $\tfrac1{12}m(w^2+h^2)$，并说明惯量积为何全为零（被积函数关于某轴为奇函数）。
+  \item 用“转动动能与坐标系无关”重走 \cref{eq:Kt-equal}，并解释“对任意 $\boldsymbol{\omega}_s$ 成立 $\Rightarrow$ 二次型矩阵相等”这一步为何需要 $\mathbf{I}$ 对称（提示：二次型 $\boldsymbol{\omega}^\top\mathbf{M}\boldsymbol{\omega}$ 只决定 $\mathbf{M}$ 的对称部分）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{凸化与线性化：把动力学拍平}
+\label{sec:convexify}
+
+\cref{eq:newton,eq:euler-full,eq:R-kinematics} 已是完整的单刚体动力学，但它\emph{不是}线性的：欧拉方程含陀螺项 $\boldsymbol{\omega}^\wedge\mathbf{I}\boldsymbol{\omega}$（$\boldsymbol{\omega}$ 的二次项），姿态运动学 $\dot{\mathbf{R}}=\boldsymbol{\omega}^\wedge\mathbf{R}$ 在 $\SO(3)$ 上演化，惯性张量在世界系下还随姿态变化。要把它喂给一个需要在线滚动求解的 QP，必须做\textbf{三处关键线性化}。本节逐一推导，并对每处近似显式给出适用条件。
+
+\subsection{近似一：忽略陀螺项，得线性欧拉方程}
+\label{subsec:drop-gyro}
+
+\paragraph{先看惯性张量的转动变换。}
+惯性张量 $\mathbf{I}$ 描述质量在刚体中的分布。在\emph{本体系} $\mathcal{B}$ 下它是\emph{常值}（刚体随体），但 MPC 的转动方程在世界系下写、需要\emph{定向本体系} $\mathcal{P}$ 下的惯量 ${}^{\mathcal{P}}\mathbf{I}$（$\mathcal{P}$ 方向同世界、随姿态转）。设角动量 $\boldsymbol{l}$、角速度 $\boldsymbol{\omega}_{\mathcal{OB}}$，由角动量在两系下的等价 ${}^{\mathcal{P}}\boldsymbol{l}={}^{\mathcal{P}}\mathbf{R}_{\mathcal{B}}\,{}^{\mathcal{B}}\boldsymbol{l}$ 与 ${}^{\mathcal{B}}\boldsymbol{l}={}^{\mathcal{B}}\mathbf{I}\,{}^{\mathcal{B}}\boldsymbol{\omega}_{\mathcal{OB}}$，插入 ${}^{\mathcal{P}}\mathbf{R}_{\mathcal{B}}^\top{}^{\mathcal{P}}\mathbf{R}_{\mathcal{B}}=\mathbf{I}$ 重组\cite{dicarlo2018cheetah}：
+\begin{equation}
+\begin{aligned}
+  {}^{\mathcal{P}}\boldsymbol{l}
+  &={}^{\mathcal{P}}\mathbf{R}_{\mathcal{B}}\,{}^{\mathcal{B}}\mathbf{I}\,{}^{\mathcal{B}}\boldsymbol{\omega}_{\mathcal{OB}}
+  ={}^{\mathcal{P}}\mathbf{R}_{\mathcal{B}}\,{}^{\mathcal{B}}\mathbf{I}\,{}^{\mathcal{P}}\mathbf{R}_{\mathcal{B}}^\top\,{}^{\mathcal{P}}\mathbf{R}_{\mathcal{B}}\,{}^{\mathcal{B}}\boldsymbol{\omega}_{\mathcal{OB}}\\
+  &=\underbrace{\left({}^{\mathcal{P}}\mathbf{R}_{\mathcal{B}}\,{}^{\mathcal{B}}\mathbf{I}\,{}^{\mathcal{P}}\mathbf{R}_{\mathcal{B}}^\top\right)}_{{}^{\mathcal{P}}\mathbf{I}}\underbrace{\left({}^{\mathcal{P}}\mathbf{R}_{\mathcal{B}}\,{}^{\mathcal{B}}\boldsymbol{\omega}_{\mathcal{OB}}\right)}_{{}^{\mathcal{P}}\boldsymbol{\omega}_{\mathcal{OB}}}.
+\end{aligned}
+\label{eq:angmom-transform}
+\end{equation}
+由于定向本体系与世界系平行，${}^{\mathcal{P}}\mathbf{R}_{\mathcal{B}}={}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}=\mathbf{R}$，于是得惯性张量的\textbf{转动变换}\cite{dicarlo2018cheetah,unitree2023quadruped}：
+\begin{equation}
+  \boxed{\,{}^{\mathcal{P}}\mathbf{I}={}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}\,{}^{\mathcal{B}}\mathbf{I}\,{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}^\top
+  \quad(\text{亦记 } \mathbf{I}_s=\mathbf{R}\,\mathbf{I}_b\,\mathbf{R}^\top)\,}.
+  \label{eq:inertia-transform}
+\end{equation}
+这与由“转动动能守恒 $K_{st}=K_{bt}$”推出的世界系惯量变换 $\mathbf{I}_s=\mathbf{R}_{sb}\mathbf{I}_b\mathbf{R}_{sb}^\top$ \emph{完全一致}（两条独立路径互证，详见 \cref{eq:Kt-equal}）\cite{unitree2023quadruped}。本体系惯量是常值，世界系惯量随姿态变——这是后面离散化时每步要按当前 $\psi$ 重算 ${}^{\mathcal{P}}\mathbf{I}_k$ 的原因。
+
+\begin{example}[本体系惯性张量数值例与对角化工程取值]\label{exam:inertia}
+本章四足机器人由三维建模软件导出的本体系惯性张量为\cite{dicarlo2018cheetah}
+\begin{equation}
+  {}^{\mathcal{B}}\mathbf{I}=\begin{bmatrix} 0.31 & 0 & -0.05 \\ 0 & 1.09 & 0 \\ -0.05 & 0 & 1.12 \end{bmatrix}\,\mathrm{kg\cdot m^2}.
+  \label{eq:inertia-num}
+\end{equation}
+工程上，由于单刚体已是简化模型，通常\emph{无需}高精度惯量：可把机器人等效为匀质长方体（边长 $l,w,h$）$\mathbf{I}_b=\tfrac{1}{12}\mathrm{diag}\!\big(m(w^2+h^2),\,m(l^2+h^2),\,m(l^2+w^2)\big)$，或由软件导出后\emph{将非对角元强制置 $0$}。宇树 A1 的取值即 $\mathbf{I}_b=\mathrm{diag}(0.1320,\,0.3475,\,0.3775)\,\mathrm{kg\cdot m^2}$\cite{unitree2023quadruped}。
+\end{example}
+
+\paragraph{对惯性张量变换求导，揭示陀螺项。}
+现在对 \cref{eq:inertia-transform} 两边求导，看角动量的微分长什么样。由 \cref{eq:R-kinematics} 即 ${}^{\mathcal{O}}\dot{\mathbf{R}}_{\mathcal{B}}={}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}\,{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}$，且 ${}^{\mathcal{B}}\mathbf{I}$ 为常值\cite{dicarlo2018cheetah}：
+\begin{equation}
+\begin{aligned}
+  {}^{\mathcal{P}}\dot{\mathbf{I}}
+  &={}^{\mathcal{O}}\dot{\mathbf{R}}_{\mathcal{B}}\,{}^{\mathcal{B}}\mathbf{I}\,{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}^\top
+  +{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}\,{}^{\mathcal{B}}\mathbf{I}\,{}^{\mathcal{O}}\dot{\mathbf{R}}_{\mathcal{B}}^\top\\
+  &=\left({}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}\,{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}\right){}^{\mathcal{B}}\mathbf{I}\,{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}^\top
+  +{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}\,{}^{\mathcal{B}}\mathbf{I}\left({}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}^\top\,({}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge})^\top\right)\\
+  &={}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}\,{}^{\mathcal{P}}\mathbf{I}+{}^{\mathcal{P}}\mathbf{I}\,({}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge})^\top
+  ={}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}\,{}^{\mathcal{P}}\mathbf{I}-{}^{\mathcal{P}}\mathbf{I}\,{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge},
+\end{aligned}
+\label{eq:inertia-dot}
+\end{equation}
+末步用了反对称性 $({}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge})^\top=-{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}$。于是 \cref{eq:euler-angmom} 左端角动量的微分为\cite{dicarlo2018cheetah}：
+\begin{equation}
+\begin{aligned}
+  \frac{\mathrm{d}}{\mathrm{d}t}\!\left({}^{\mathcal{P}}\mathbf{I}\,{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}\right)
+  &={}^{\mathcal{P}}\mathbf{I}\,{}^{\mathcal{O}}\dot{\boldsymbol{\omega}}_{\mathcal{OB}}+{}^{\mathcal{P}}\dot{\mathbf{I}}\,{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}\\
+  &={}^{\mathcal{P}}\mathbf{I}\,{}^{\mathcal{O}}\dot{\boldsymbol{\omega}}_{\mathcal{OB}}
+  +\left({}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}\,{}^{\mathcal{P}}\mathbf{I}-{}^{\mathcal{P}}\mathbf{I}\,{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}\right){}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}\\
+  &={}^{\mathcal{P}}\mathbf{I}\,{}^{\mathcal{O}}\dot{\boldsymbol{\omega}}_{\mathcal{OB}}
+  +{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}\,{}^{\mathcal{P}}\mathbf{I}\,{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}
+  \;\approx\;{}^{\mathcal{P}}\mathbf{I}\,{}^{\mathcal{O}}\dot{\boldsymbol{\omega}}_{\mathcal{OB}}.
+\end{aligned}
+\label{eq:angmom-dot}
+\end{equation}
+第三步用了 ${}^{\mathcal{P}}\mathbf{I}\,{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}\,{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}=\mathbf{0}$（因 $\boldsymbol{\omega}^\wedge\boldsymbol{\omega}=\boldsymbol{\omega}\times\boldsymbol{\omega}=\mathbf{0}$）；末步即\textbf{忽略陀螺项} ${}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}\,{}^{\mathcal{P}}\mathbf{I}\,{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}$。把它代回 \cref{eq:euler-angmom}（重力项已为零），得\textbf{线性化的欧拉方程}：
+\begin{equation}
+  {}^{\mathcal{P}}\mathbf{I}\,{}^{\mathcal{O}}\dot{\boldsymbol{\omega}}_{\mathcal{OB}}\approx\sum_{i=1}^{4}{}^{\mathcal{O}}\boldsymbol{r}_i\times{}^{\mathcal{O}}\boldsymbol{f}_i
+  \quad\Longleftrightarrow\quad
+  {}^{\mathcal{O}}\dot{\boldsymbol{\omega}}_{\mathcal{OB}}\approx{}^{\mathcal{P}}\mathbf{I}^{-1}\sum_{i=1}^{4}\boldsymbol{r}_i^{\wedge}\,{}^{\mathcal{O}}\boldsymbol{f}_i.
+  \label{eq:euler-linear}
+\end{equation}
+
+\begin{insight}[忽略陀螺项——为凸 QP 主动牺牲陀螺耦合（核心）]\label{ins:drop-gyro}
+这是本章最核心的两处“为什么”之一。完整欧拉方程 \cref{eq:euler-full} 的陀螺项 $\boldsymbol{\omega}\times(\mathbf{I}\boldsymbol{\omega})$ 让方程成为\emph{非线性耦合微分方程}。丢弃它有四重理由：
+\begin{enumerate}
+  \item \textbf{线性化 + 解耦}：在 MPC 这类需要\emph{滚动在线求解}的问题里，去掉陀螺项是把模型线性化、解耦的“好方法”，直接让转动方程对 $\mathbf{f}_i$ \emph{线性}；
+  \item \textbf{降低求解难度、提高速度}：线性 $\Rightarrow$ 每步 MPC 退化为 QP，可实时解；
+  \item \textbf{小角速度条件}：$\boldsymbol{\omega}\times(\mathbf{I}\boldsymbol{\omega})$ 是 $\boldsymbol{\omega}$ 的\emph{二次项}，刚体角速度小时它是高阶小量、可忽略——四足正常运动机身角速度确实不大；
+  \item \textbf{反馈兜底}：即便单步预测有模型误差，滚动重解 + 反馈可逐步校正，避免模型失效。
+\end{enumerate}
+一句话：\textbf{为追求凸 QP 而主动牺牲陀螺耦合}，再用“小角速度”和“反馈”把代价压住。这正是凸 MPC 标准范式直接忽略 $[\boldsymbol{\omega}_b]_\times\mathbf{I}_b\boldsymbol{\omega}_b$ 的理由\cite{dicarlo2018cheetah,unitree2023quadruped}。代价是大角速度/强自旋（如剧烈翻滚）时模型失真——这是后续 SO(3)/几何 MPC\cite{ding2021repfree} 要修的。
+\end{insight}
+
+\begin{pitfall}[误区：以为“线性化欧拉方程 = 丢了惯量耦合的全部”]
+忽略的只是\emph{陀螺项}（$\boldsymbol{\omega}$ 的二次耦合），并\emph{没有}丢惯量本身：\cref{eq:euler-linear} 里 ${}^{\mathcal{P}}\mathbf{I}$ 仍在，且仍随姿态 $\psi$ 变化（\cref{eq:inertia-transform}）。也就是说，转动惯量的“各轴不同、随姿态旋转”这件事被保留了，被丢的是“自旋导致的进动/章动”那一项。把二者混为一谈会高估近似的破坏力。
+\end{pitfall}
+
+\subsection{近似二：角速度到 ZYX 欧拉角率的小角度映射}
+\label{subsec:euler-map}
+
+姿态运动学 \cref{eq:R-kinematics} 是在 $\SO(3)$ 上的，但 MPC 状态用欧拉角 $\boldsymbol{\Theta}=[\phi,\theta,\psi]^\top$ 表示，故需要\emph{欧拉角率 $\dot{\boldsymbol{\Theta}}$ 与角速度 $\boldsymbol{\omega}$ 之间的映射}。设 ${}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}(\boldsymbol{\Theta})=\mathbf{R}_z(\psi)\mathbf{R}_y(\theta)\mathbf{R}_x(\phi)$（ZYX 序，\cref{ch:rigid_body}），记 $\mathbf{R}_z,\mathbf{R}_y,\mathbf{R}_x$ 为各自简写。把它代入 ${}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}={}^{\mathcal{O}}\dot{\mathbf{R}}_{\mathcal{B}}\,{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}^\top$，用乘积求导并逐项约去正交块\cite{yu2021quadruped}：
+\begin{equation}
+\begin{aligned}
+  {}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}
+  &=\left(\dot{\mathbf{R}}_z\mathbf{R}_y\mathbf{R}_x+\mathbf{R}_z\dot{\mathbf{R}}_y\mathbf{R}_x+\mathbf{R}_z\mathbf{R}_y\dot{\mathbf{R}}_x\right)\mathbf{R}_x^\top\mathbf{R}_y^\top\mathbf{R}_z^\top\\
+  &=\dot{\mathbf{R}}_z\mathbf{R}_z^\top+\mathbf{R}_z\dot{\mathbf{R}}_y\mathbf{R}_y^\top\mathbf{R}_z^\top+\mathbf{R}_z\mathbf{R}_y\dot{\mathbf{R}}_x\mathbf{R}_x^\top\mathbf{R}_y^\top\mathbf{R}_z^\top\\
+  &=(\hat{\mathbf{z}}\dot{\psi})^{\wedge}+\mathbf{R}_z(\hat{\mathbf{y}}\dot{\theta})^{\wedge}\mathbf{R}_z^\top+\mathbf{R}_z\mathbf{R}_y(\hat{\mathbf{x}}\dot{\phi})^{\wedge}\mathbf{R}_y^\top\mathbf{R}_z^\top,
+\end{aligned}
+\label{eq:euler-map-1}
+\end{equation}
+其中用到\emph{单轴旋转的 $\dot{\mathbf{R}}\mathbf{R}^\top$ 是以“该轴单位向量 $\times$ 角速率”为轴的反对称矩阵}，即 $\dot{\mathbf{R}}_z\mathbf{R}_z^\top=(\hat{\mathbf{z}}\dot{\psi})^{\wedge}$ 等（$\hat{\mathbf{x}},\hat{\mathbf{y}},\hat{\mathbf{z}}$ 为标准基轴）。此处的反对称算子应取\emph{基本轴单位向量} $\hat{\mathbf{x}},\hat{\mathbf{y}},\hat{\mathbf{z}}$（而非旋转矩阵的列向量），逐式完整推导见 \cref{eq:euler-map-1,eq:euler-rate-to-omega,eq:omega-to-euler-rate} 与 \cref{deriv:euler-inverse}。
+
+用相似变换 $\mathbf{R}\,\boldsymbol{a}^{\wedge}\mathbf{R}^\top=(\mathbf{R}\boldsymbol{a})^{\wedge}$ 把 \cref{eq:euler-map-1} 三项的反对称算子合并，再去掉 $(\cdot)^\wedge$\cite{yu2021quadruped}：
+\begin{equation}
+  {}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}
+  =\hat{\mathbf{z}}\dot{\psi}+\mathbf{R}_z\hat{\mathbf{y}}\dot{\theta}+\mathbf{R}_z\mathbf{R}_y\hat{\mathbf{x}}\dot{\phi}
+  =\begin{bmatrix} c_\theta c_\psi & -s_\psi & 0 \\ c_\theta s_\psi & c_\psi & 0 \\ -s_\theta & 0 & 1 \end{bmatrix}\begin{bmatrix} \dot{\phi} \\ \dot{\theta} \\ \dot{\psi} \end{bmatrix},
+  \label{eq:euler-rate-to-omega}
+\end{equation}
+其中 $c_\theta=\cos\theta$ 等。该矩阵可逆，逆映射给出\textbf{角速度 $\to$ ZYX 欧拉角率}\cite{yu2021quadruped}：
+\begin{equation}
+  \begin{bmatrix} \dot{\phi} \\ \dot{\theta} \\ \dot{\psi} \end{bmatrix}
+  =\begin{bmatrix} c_\psi/c_\theta & s_\psi/c_\theta & 0 \\ -s_\psi & c_\psi & 0 \\ c_\psi s_\theta/c_\theta & s_\psi s_\theta/c_\theta & 1 \end{bmatrix}{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}.
+  \label{eq:omega-to-euler-rate}
+\end{equation}
+当横滚角 $\phi$ 与俯仰角 $\theta$ 都很小时（$c_\theta\to1,s_\theta\to0$），\cref{eq:omega-to-euler-rate} \textbf{近似}为只依赖偏航 $\psi$ 的旋转\cite{yu2021quadruped,dicarlo2018cheetah}：
+\begin{equation}
+  \boxed{\begin{bmatrix} \dot{\phi} \\ \dot{\theta} \\ \dot{\psi} \end{bmatrix}
+  \approx\begin{bmatrix} c_\psi & s_\psi & 0 \\ -s_\psi & c_\psi & 0 \\ 0 & 0 & 1 \end{bmatrix}{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}
+  =\mathbf{R}_z^\top(\psi)\,{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}}.
+  \label{eq:euler-map-small}
+\end{equation}
+
+\begin{insight}[第二处近似：把姿态运动学线性化为仅含偏航]\label{ins:euler-small}
+\cref{eq:euler-map-small} 是凸化的第二处关键近似。它把“欧拉角率—角速度”这个本依赖 $\phi,\theta,\psi$ 三个角、含 $\sec\theta$ 的非线性映射，近似为\emph{仅含偏航 $\psi$} 的旋转 $\mathbf{R}_z^\top(\psi)$。其意义有二：(1) 让姿态运动学\emph{线性}（对状态 $\boldsymbol{\omega}$ 线性）；(2) 让系统矩阵\emph{只依赖当前偏航 $\psi$}（而非全姿态），从而每个 MPC 时刻得到一个\emph{线性时变}（LTV）模型——按当前 $\psi$ 装配一次系数即可。其适用条件与 \cref{ins:drop-gyro} 同源：小横滚/俯仰角。四足平稳行走时机身近似水平，$\phi,\theta$ 确实小；这也解释了为何剧烈翻滚需要避开欧拉角奇异（$\theta\to\pi/2$ 时 \cref{eq:omega-to-euler-rate} 的 $\sec\theta$ 发散）的几何 MPC。
+\end{insight}
+
+\begin{pitfall}[陷阱：俯仰接近 $\pm 90^\circ$ 时欧拉角映射奇异]
+\cref{eq:omega-to-euler-rate} 含 $c_\psi/c_\theta$ 等项，当俯仰 $\theta\to\pm\pi/2$（$c_\theta\to0$）时\emph{发散}——这就是欧拉角的“万向锁”奇异（\cref{ch:rigid_body}）。小角度近似 \cref{eq:euler-map-small} 回避了这一项（$c_\theta\approx1$），但代价是只在 $\theta$ 小时有效。若机器人要做近乎竖直的攀爬或空翻，欧拉角参数化本身就会失效，须改用旋转矩阵/四元数直接演化的几何 MPC\cite{ding2021repfree}。这是用欧拉角换“仅依赖偏航的线性映射”所付的代价。
+\end{pitfall}
+
+\subsection{近似三：摩擦锥的线性化（摩擦金字塔）与足端力约束}
+\label{subsec:friction}
+
+足端力 $\mathbf{f}_i$ 作为决策变量，必须满足物理约束，否则解出的力无法被真实地面/电机实现。约束有三类。
+
+\paragraph{\cnum{1} 摆动腿零力约束。}
+摆动腿在空中、足端不与地面接触，故其足底反力为零\cite{dicarlo2018cheetah,yu2021quadruped}：
+\begin{equation}
+  {}^{\mathcal{O}}\boldsymbol{f}_i=\mathbf{0}_{3\times1},\qquad \forall i:\ s_i=0,
+  \label{eq:swing-zero}
+\end{equation}
+其中 $s_i\in\{0,1\}$ 为第 $i$ 腿的接触（支撑相）布尔量（$1=$ 支撑/stance，$0=$ 摆动/swing），由步态规划器给出。
+
+\begin{insight}[摆动腿零力约束的双层近似]\label{ins:swing-zero}
+\cref{eq:swing-zero} 其实含\emph{两层}近似：(1) 腿在空中不与地面接触 $\Rightarrow$ 无地面反力，这层很硬；(2) 摆动腿\emph{自身运动}对机身的反作用力（摆腿的惯性力经髋关节传给机身）也\emph{忽略不计}，这层是“腿轻”假设的延伸。在单刚体框架里两层都被一个干净的 $\mathbf{0}$ 约束吸收。这与 \cref{ins:com-simplify} 的“腿轻”一脉相承：腿越轻，第二层近似越准。
+\end{insight}
+
+\paragraph{\cnum{2} 法向力幅值约束。}
+腿部电机力矩有物理上限，对应足端法向力有上限；支撑腿又需法向力非负（不能“拉”地面）\cite{dicarlo2018cheetah,yu2021quadruped}：
+\begin{equation}
+  0\le{}^{\mathcal{O}}f_i^{z}\le f_{\max}.
+  \label{eq:normal-bound}
+\end{equation}
+（有的实现还加一个正的最小值 $f_{\min}\le f_i^z$，保证支撑腿不脱离地面。）
+
+\paragraph{\cnum{3} 摩擦锥及其线性化。}
+为保证足底与地面不发生相对滑动，足底反力的水平分量不能超过竖直分量乘以摩擦系数 $\mu$，即\emph{摩擦锥条件}\cite{dicarlo2018cheetah,yu2021quadruped}：
+\begin{equation}
+  \mu\cdot{}^{\mathcal{O}}f_i^{z}\ge\sqrt{({}^{\mathcal{O}}f_i^{x})^2+({}^{\mathcal{O}}f_i^{y})^2}.
+  \label{eq:friction-cone}
+\end{equation}
+\cref{eq:friction-cone} 是一个\emph{二阶锥}（非线性）约束，不利于 QP。把它换成\textbf{内接摩擦金字塔}的四个线性面 $|f_i^x|\le\mu f_i^z$、$|f_i^y|\le\mu f_i^z$，并与法向幅值 \cref{eq:normal-bound} 一起整合进一个矩阵\cite{dicarlo2018cheetah,yu2021quadruped}：
+\begin{equation}
+  \underbrace{\begin{bmatrix} 0 \\ 0 \\ 0 \\ 0 \\ 0 \end{bmatrix}}_{\underline{\mathbf{c}}_i}
+  \le
+  \underbrace{\begin{bmatrix} -1 & 0 & \mu \\ 0 & -1 & \mu \\ 1 & 0 & \mu \\ 0 & 1 & \mu \\ 0 & 0 & 1 \end{bmatrix}}_{\mathbf{C}_i}
+  \begin{bmatrix} {}^{\mathcal{O}}f_i^{x} \\ {}^{\mathcal{O}}f_i^{y} \\ {}^{\mathcal{O}}f_i^{z} \end{bmatrix}
+  \le
+  \underbrace{\begin{bmatrix} +\infty \\ +\infty \\ +\infty \\ +\infty \\ f_{\max} \end{bmatrix}}_{\overline{\mathbf{c}}_i},
+  \qquad\text{紧凑：}\ \underline{\mathbf{c}}_i\le\mathbf{C}_i\,{}^{\mathcal{O}}\boldsymbol{f}_i\le\overline{\mathbf{c}}_i.
+  \label{eq:friction-matrix}
+\end{equation}
+前四行成对给出 $\mu f_i^z\pm f_i^x\ge0$、$\mu f_i^z\pm f_i^y\ge0$（金字塔四面），第五行 $0\le f_i^z\le f_{\max}$ 同时编码法向幅值上限与非负下限。矩阵 $\mathbf{C}_i$、上下界 $\underline{\mathbf{c}}_i,\overline{\mathbf{c}}_i$ 的内容\emph{与腿编号 $i$ 无关}（四腿同形）。等价地亦可写成单边形式 $\mathbf{F}_\mu\mathbf{f}_{is}\ge\mathbf{0}$\cite{unitree2023quadruped}。
+
+\begin{figure}[ht]
+\centering
+\tdplotsetmaincoords{70}{120}
+\begin{tikzpicture}[scale=1.0,>=Stealth,tdplot_main_coords]
+  \begin{scope}
+    % ground
+    \draw[gray!50] (-2,-2,0)--(2,-2,0)--(2,2,0)--(-2,2,0)--cycle;
+    % true friction cone (circular), drawn as ellipse at top + slant lines
+    \draw[third, thick] (0,0,0) -- (1.4,0,2);
+    \draw[third, thick] (0,0,0) -- (-1.4,0,2);
+    \draw[third, thick] (0,0,0) -- (0,1.4,2);
+    \draw[third, thick] (0,0,0) -- (0,-1.4,2);
+    \draw[third, thick, dashed] (0,0,2) ellipse (1.4 and 1.4);
+    \node[third] at (1.7,0.2,2.1) {\small 摩擦圆锥};
+    % inscribed pyramid (4 faces): apex at origin, base square inscribed in circle radius 1.4 -> half-diagonal 1.4 -> side corners at (±0.99,±0.99)
+    \coordinate (A) at (0.99,0.99,2);
+    \coordinate (B) at (-0.99,0.99,2);
+    \coordinate (C) at (-0.99,-0.99,2);
+    \coordinate (D) at (0.99,-0.99,2);
+    \draw[main, very thick] (0,0,0)--(A); \draw[main, very thick] (0,0,0)--(B);
+    \draw[main, very thick] (0,0,0)--(C); \draw[main, very thick] (0,0,0)--(D);
+    \draw[main, very thick, fill=main!12, fill opacity=0.4] (A)--(B)--(C)--(D)--cycle;
+    \node[main] at (1.2,1.4,2.1) {\small 内接金字塔};
+    % normal axis
+    \draw[->, thick] (0,0,0)--(0,0,2.6) node[above] {\small $f^z$};
+    % a feasible force vector
+    \draw[red!70!black, -{Stealth[length=2.5mm]}, very thick] (0,0,0)--(0.4,0.3,2) node[right] {\small $\mathbf{f}_i$};
+  \end{scope}
+\end{tikzpicture}
+\caption{摩擦锥的线性化：真实摩擦锥（蓝）是二阶锥，QP 难处理；取其\emph{内接}四棱锥（绿，摩擦金字塔）得四个线性面。内接 $\Rightarrow$ 可行域是圆锥的子集 $\Rightarrow$ 线性约束的可行解\emph{严格满足}原非线性摩擦锥（保守但安全，不会“线性满足却实际打滑”）。}
+\label{fig:friction-pyramid}
+\end{figure}
+
+\begin{insight}[为何取内接金字塔——保守换线性，且严格不打滑]\label{ins:pyramid}
+一个容易被忽略的点：金字塔要取圆锥的\emph{内接}（而非外切）。原因是——内接金字塔的四个线性面围成的可行域是\emph{圆锥的子集}（\cref{fig:friction-pyramid}），因此线性化后的任何可行解都\emph{严格满足}原非线性摩擦锥 \cref{eq:friction-cone}。这是一种\emph{保守但安全}的近似：宁可少用一点摩擦余量，也不会出现“线性约束满足、实际却打滑”的危险。若取外切金字塔则相反——可行域比圆锥大，会允许略微越过摩擦锥的解，有打滑风险。这就是“凸 QP 化的代价（可行域略缩）换收益（线性约束）”的精确权衡。
+\end{insight}
+
+\begin{pitfall}[误区：摩擦金字塔“各向同性”，与真实摩擦锥等价]
+四棱锥\emph{不是}圆锥——它在对角方向（如 $f^x=f^y$）能用的摩擦力比轴向更小（内接），在沿轴方向恰好贴合。也就是说，金字塔近似是\emph{各向异性}的，把同样的法向力在不同水平方向上能产生的最大摩擦力做了方向相关的保守缩减。多数情况下这点保守无害；但若需要各向同性的精确摩擦约束（如对摩擦极限非常敏感的高速转向），应改用二阶锥规划（SOCP）而非 QP，或用更多面（如六/八棱锥）逼近圆锥。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:euler-rate-to-omega} 出发，验证其逆即 \cref{eq:omega-to-euler-rate}（直接对 $3\times3$ 矩阵求逆，注意第三行）。
+  \item 写出 \cref{eq:friction-matrix} 前四行展开的四条不等式，确认它们等价于 $|f_i^x|\le\mu f_i^z$、$|f_i^y|\le\mu f_i^z$。
+  \item （几何）在 $f^z=1$ 的截面上画出摩擦圆（半径 $\mu$）与内接正方形，标出二者在轴向与对角向的差距，直观说明 \cref{ins:pyramid} 的“各向异性保守”。
+  \item 用 \cref{eq:inertia-transform} 与 \cref{eq:inertia-num}，取偏航 $\psi=30^\circ$、$\phi=\theta=0$，数值算出 ${}^{\mathcal{P}}\mathbf{I}=\mathbf{R}_z(30^\circ)\,{}^{\mathcal{B}}\mathbf{I}\,\mathbf{R}_z(30^\circ)^\top$。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{连续到离散状态空间：13 维状态与重力增广}
+\label{sec:state-space}
+
+三处线性近似就绪后，把 \cref{eq:euler-map-small}（姿态运动学）、\cref{eq:euler-linear}（线性欧拉）、\cref{eq:euler-angmom} 的力矩项、\cref{eq:newton}（牛顿）整合进\emph{一个}矩阵方程。取状态序 $[\boldsymbol{\Theta};\,{}^{\mathcal{O}}\boldsymbol{p}_{com};\,{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}};\,{}^{\mathcal{O}}\dot{\boldsymbol{p}}_{com}]$（姿态、位置、角速度、线速度），控制为四腿足端力堆叠 $\boldsymbol{u}=[{}^{\mathcal{O}}\boldsymbol{f}_1;\dots;{}^{\mathcal{O}}\boldsymbol{f}_4]$\cite{dicarlo2018cheetah,yu2021quadruped}：
+\begin{equation}
+\frac{\mathrm{d}}{\mathrm{d}t}\!\begin{bmatrix} \boldsymbol{\Theta} \\ {}^{\mathcal{O}}\boldsymbol{p}_{com} \\ {}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}} \\ {}^{\mathcal{O}}\dot{\boldsymbol{p}}_{com} \end{bmatrix}
+=
+\begin{bmatrix}
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{R}_z^\top(\psi) & \mathbf{0}_{3} \\
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{I}_3 \\
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} \\
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3}
+\end{bmatrix}
+\begin{bmatrix} \boldsymbol{\Theta} \\ {}^{\mathcal{O}}\boldsymbol{p}_{com} \\ {}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}} \\ {}^{\mathcal{O}}\dot{\boldsymbol{p}}_{com} \end{bmatrix}
++
+\begin{bmatrix}
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} \\
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} \\
+{}^{\mathcal{P}}\mathbf{I}^{-1}\boldsymbol{r}_1^{\wedge} & {}^{\mathcal{P}}\mathbf{I}^{-1}\boldsymbol{r}_2^{\wedge} & {}^{\mathcal{P}}\mathbf{I}^{-1}\boldsymbol{r}_3^{\wedge} & {}^{\mathcal{P}}\mathbf{I}^{-1}\boldsymbol{r}_4^{\wedge} \\
+\mathbf{I}_3/m & \mathbf{I}_3/m & \mathbf{I}_3/m & \mathbf{I}_3/m
+\end{bmatrix}
+\begin{bmatrix} {}^{\mathcal{O}}\boldsymbol{f}_1 \\ {}^{\mathcal{O}}\boldsymbol{f}_2 \\ {}^{\mathcal{O}}\boldsymbol{f}_3 \\ {}^{\mathcal{O}}\boldsymbol{f}_4 \end{bmatrix}
++
+\begin{bmatrix} \mathbf{0}_{3\times1} \\ \mathbf{0}_{3\times1} \\ \mathbf{0}_{3\times1} \\ {}^{\mathcal{O}}\boldsymbol{g} \end{bmatrix}.
+\label{eq:cont-12state}
+\end{equation}
+逐块对照来源：第一行块 $\mathbf{R}_z^\top(\psi)$ 即 \cref{eq:euler-map-small}（$\dot{\boldsymbol{\Theta}}=\mathbf{R}_z^\top\boldsymbol{\omega}$）；第二行块 $\mathbf{I}_3$ 表示 $\dot{\boldsymbol{p}}_{com}$ 积分得 $\boldsymbol{p}_{com}$；输入矩阵第三行块 ${}^{\mathcal{P}}\mathbf{I}^{-1}\boldsymbol{r}_i^{\wedge}$ 来自 \cref{eq:euler-linear}（$\boldsymbol{r}_i^{\wedge}$ 为 ${}^{\mathcal{O}}\boldsymbol{r}_i$ 的反对称矩阵，使 $\boldsymbol{r}_i\times\boldsymbol{f}_i=\boldsymbol{r}_i^{\wedge}\boldsymbol{f}_i$）；第四行块 $\mathbf{I}_3/m$ 来自牛顿 \cref{eq:newton}（$\ddot{\boldsymbol{p}}=\tfrac1m\sum\boldsymbol{f}_i$）；末尾仿射项 ${}^{\mathcal{O}}\boldsymbol{g}$ 即重力。
+
+\paragraph{重力增广：把仿射项吸收进线性结构。}
+\cref{eq:cont-12state} 含一个\emph{常数仿射项} ${}^{\mathcal{O}}\boldsymbol{g}$，形如 $\dot{\boldsymbol{x}}=\mathbf{A}_c\boldsymbol{x}+\mathbf{B}_c\boldsymbol{u}+\mathbf{g}_0$，\emph{不是}标准线性系统 $\dot{\boldsymbol{x}}=\mathbf{A}_c\boldsymbol{x}+\mathbf{B}_c\boldsymbol{u}$。解决办法是\textbf{状态增广}：把重力的非零分量 ${}^{\mathcal{O}}g(3)=-9.8\,\mathrm{m/s^2}$ 作为\emph{第 $13$ 个状态分量}（其导数恒为 $0$），从而把仿射项变成“乘一个恒定状态”的线性项。增广后的 $13$ 维连续状态方程为\cite{dicarlo2018cheetah,yu2021quadruped}：
+\begin{equation}
+\underbrace{\frac{\mathrm{d}}{\mathrm{d}t}\!\begin{bmatrix} \boldsymbol{\Theta} \\ {}^{\mathcal{O}}\boldsymbol{p}_{com} \\ {}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}} \\ {}^{\mathcal{O}}\dot{\boldsymbol{p}}_{com} \\ {}^{\mathcal{O}}g(3) \end{bmatrix}}_{\dot{\boldsymbol{x}}}
+=
+\underbrace{\begin{bmatrix}
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{R}_z^\top(\psi) & \mathbf{0}_{3} & \mathbf{0}_{3\times1} \\
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{I}_3 & \mathbf{0}_{3\times1} \\
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3\times1} \\
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & [0,0,1]^\top \\
+\mathbf{0}_{1\times3} & \mathbf{0}_{1\times3} & \mathbf{0}_{1\times3} & \mathbf{0}_{1\times3} & 0
+\end{bmatrix}}_{\mathbf{A}_c(\psi)}
+\underbrace{\begin{bmatrix} \boldsymbol{\Theta} \\ {}^{\mathcal{O}}\boldsymbol{p}_{com} \\ {}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}} \\ {}^{\mathcal{O}}\dot{\boldsymbol{p}}_{com} \\ {}^{\mathcal{O}}g(3) \end{bmatrix}}_{\boldsymbol{x}}
++
+\underbrace{\begin{bmatrix}
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} \\
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} \\
+{}^{\mathcal{P}}\mathbf{I}^{-1}\boldsymbol{r}_1^{\wedge} & {}^{\mathcal{P}}\mathbf{I}^{-1}\boldsymbol{r}_2^{\wedge} & {}^{\mathcal{P}}\mathbf{I}^{-1}\boldsymbol{r}_3^{\wedge} & {}^{\mathcal{P}}\mathbf{I}^{-1}\boldsymbol{r}_4^{\wedge} \\
+\mathbf{I}_3/m & \mathbf{I}_3/m & \mathbf{I}_3/m & \mathbf{I}_3/m \\
+\mathbf{0}_{1\times3} & \mathbf{0}_{1\times3} & \mathbf{0}_{1\times3} & \mathbf{0}_{1\times3}
+\end{bmatrix}}_{\mathbf{B}_c(\boldsymbol{r}_1,\dots,\boldsymbol{r}_4,\psi)}
+\underbrace{\begin{bmatrix} {}^{\mathcal{O}}\boldsymbol{f}_1 \\ {}^{\mathcal{O}}\boldsymbol{f}_2 \\ {}^{\mathcal{O}}\boldsymbol{f}_3 \\ {}^{\mathcal{O}}\boldsymbol{f}_4 \end{bmatrix}}_{\boldsymbol{u}}.
+\label{eq:cont-13state}
+\end{equation}
+
+\begin{insight}[重力增广——用一个常状态换回标准线性形]\label{ins:gravity-aug}
+标准线性系统 $\dot{\boldsymbol{x}}=\mathbf{A}\boldsymbol{x}+\mathbf{B}\boldsymbol{u}$ 没有常数偏置项，而重力 $\boldsymbol{g}$ 恰是这样一个常数项，破坏了标准形。把 ${}^{\mathcal{O}}g(3)$ 当成一个额外状态（$\dot g=0$），就把仿射项“吸收”进了 $\mathbf{A}_c$ 矩阵——\cref{eq:cont-13state} 中 $\dot{\boldsymbol{p}}_{com}$ 那一行的 $[0,0,1]^\top$ 列正是“$\ddot z$ 由重力状态 $g(3)$ 驱动”，末行全 $0$ 表示 $\dot g=0$。这是为了\emph{直接套用}标准 MPC/QP 框架的实用技巧，也是这一范式的标志性小手段。代价仅是状态从 $12$ 维升到 $13$ 维。
+\end{insight}
+
+紧凑地，\cref{eq:cont-13state} 即连续时间状态方程\cite{yu2021quadruped}：
+\begin{equation}
+  \dot{\boldsymbol{x}}(t)=\mathbf{A}_c(\psi)\,\boldsymbol{x}(t)+\mathbf{B}_c(\boldsymbol{r}_1,\boldsymbol{r}_2,\boldsymbol{r}_3,\boldsymbol{r}_4,\psi)\,\boldsymbol{u}(t).
+  \label{eq:cont-compact}
+\end{equation}
+注意：$\mathbf{A}_c$ \emph{仅依赖偏航 $\psi$}；$\mathbf{B}_c$ 依赖四个质心$\to$足端向量 $\boldsymbol{r}_1\!\sim\!\boldsymbol{r}_4$ 与偏航 $\psi$。这是一个\textbf{线性时变（LTV）}系统——每个 MPC 时刻按当前 $\psi$ 与落足点重新装配 $\mathbf{A}_c,\mathbf{B}_c$。
+
+\paragraph{前向欧拉离散化。}
+计算机只能离散处理。用 $\Delta T$ 表 MPC 周期，在一个周期内\emph{近似认为系统状态的微分未变}（零阶保持/前向欧拉的依据：单周期内微分近似不变），则\cite{yu2021quadruped}
+\begin{equation}
+  \dot{\boldsymbol{x}}\approx\frac{\boldsymbol{x}(k+1)-\boldsymbol{x}(k)}{\Delta T}=\mathbf{A}_c\boldsymbol{x}(k)+\mathbf{B}_c\boldsymbol{u}(k)
+  \;\Longrightarrow\;
+  \boldsymbol{x}(k+1)=(\mathbf{I}+\Delta T\,\mathbf{A}_c)\boldsymbol{x}(k)+\Delta T\,\mathbf{B}_c\boldsymbol{u}(k).
+  \label{eq:fwd-euler}
+\end{equation}
+记 $\mathbf{A}_k=\mathbf{I}+\Delta T\,\mathbf{A}_c$、$\mathbf{B}_k=\Delta T\,\mathbf{B}_c$，得离散状态方程 $\boldsymbol{x}(k+1)=\mathbf{A}_k\boldsymbol{x}(k)+\mathbf{B}_k\boldsymbol{u}(k)$，其中\cite{yu2021quadruped}：
+\begin{equation}
+\mathbf{A}_k=\begin{bmatrix}
+\mathbf{I}_3 & \mathbf{0}_{3} & \mathbf{R}_z^\top(\psi_d^k)\Delta T & \mathbf{0}_{3} & \mathbf{0}_{3\times1} \\
+\mathbf{0}_{3} & \mathbf{I}_3 & \mathbf{0}_{3} & \mathbf{I}_3\Delta T & \mathbf{0}_{3\times1} \\
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{I}_3 & \mathbf{0}_{3} & \mathbf{0}_{3\times1} \\
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{I}_3 & [0,0,\Delta T]^\top \\
+\mathbf{0}_{1\times3} & \mathbf{0}_{1\times3} & \mathbf{0}_{1\times3} & \mathbf{0}_{1\times3} & 1
+\end{bmatrix},\;
+\mathbf{B}_k=\begin{bmatrix}
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} \\
+\mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} & \mathbf{0}_{3} \\
+{}^{\mathcal{P}}\mathbf{I}_k^{-1}\boldsymbol{r}_{1}^{\wedge,k}\Delta T & {}^{\mathcal{P}}\mathbf{I}_k^{-1}\boldsymbol{r}_{2}^{\wedge,k}\Delta T & {}^{\mathcal{P}}\mathbf{I}_k^{-1}\boldsymbol{r}_{3}^{\wedge,k}\Delta T & {}^{\mathcal{P}}\mathbf{I}_k^{-1}\boldsymbol{r}_{4}^{\wedge,k}\Delta T \\
+\tfrac{\Delta T}{m}\mathbf{I}_3 & \tfrac{\Delta T}{m}\mathbf{I}_3 & \tfrac{\Delta T}{m}\mathbf{I}_3 & \tfrac{\Delta T}{m}\mathbf{I}_3 \\
+\mathbf{0}_{1\times3} & \mathbf{0}_{1\times3} & \mathbf{0}_{1\times3} & \mathbf{0}_{1\times3}
+\end{bmatrix}.
+\label{eq:disc-AB}
+\end{equation}
+对比连续 $\mathbf{A}_c$：对角线全部由 $\mathbf{0}$ 变为 $\mathbf{I}_3$（来自 $\mathbf{I}$ 项），耦合块乘上 $\Delta T$。维度上 $\mathbf{A}_k$ 是 $13\times13$、$\mathbf{B}_k$ 是 $13\times12$。重力注入列（第 $5$ 列）在 $\dot{\boldsymbol{p}}$ 块为 $[0,0,\Delta T]^\top$（连续 $[0,0,1]^\top$ 乘 $\Delta T$）、末行为 $[0,\dots,0,1]$，与连续型 \cref{eq:cont-13state} 经前向欧拉一致。其中 $\psi_d^k$ 是质心轨迹规划器给出的第 $k$ 周期\emph{期望偏航}；第 $k$ 周期惯量 ${}^{\mathcal{P}}\mathbf{I}_k$ 取忽略横滚/俯仰、用 ${}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}^k\approx\mathbf{R}_z(\psi_d^k)$ 代入 \cref{eq:inertia-transform} 算得。
+
+\paragraph{名义落足点与预测时域上界。}
+$\mathbf{B}_k$ 需要第 $k$ 周期第 $i$ 腿的质心$\to$足端向量 $\boldsymbol{r}_i^{\wedge,k}$：支撑腿取当前足底坐标，摆动腿取规划器给的落足点\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{r}_{i}^{k}=\begin{cases} {}_i^{\mathcal{O}}\boldsymbol{p}^{t}, & s_i^{t}=1\ (\text{支撑}) \\ {}_i^{\mathcal{O}}\boldsymbol{p}_{sw\cdot end}^{t}, & s_i^{t}=0\ (\text{摆动}) \end{cases}
+  \label{eq:nominal-foot}
+\end{equation}
+
+\paragraph{质心$\to$足端向量的计算：质心未必在机身中心。}
+\cref{eq:nominal-foot} 默认 $\boldsymbol{r}_i={}^{\mathcal{O}}\boldsymbol{p}_i-{}^{\mathcal{O}}\boldsymbol{p}_{com}$ 已知（\cref{eq:euler-angmom} 后），但其中的 $\boldsymbol{p}_{com}$ 需要落实：\textbf{机器人重心未必落在机身坐标系原点（机身几何中心）}——电池、电路板等使质心偏置。记机身中心为 $P_b$（即机身系 $\mathcal{B}$ 原点）、真实重心为 $P_g$、第 $i$ 足端为 $P_i$，则质心指向第 $i$ 足端的向量（世界系坐标，记 $\boldsymbol{p}_{g,i}$）为\cite{unitree2023quadruped}
+\begin{equation}
+\begin{aligned}
+  \boldsymbol{p}_{g,i}&=\{\overrightarrow{P_gP_i}\}_{\mathcal{O}}=\{\overrightarrow{P_bP_i}-\overrightarrow{P_bP_g}\}_{\mathcal{O}}
+  =\{\overrightarrow{P_bP_i}\}_{\mathcal{O}}-\{\overrightarrow{P_bP_g}\}_{\mathcal{O}}\\
+  &={}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}\,\{\overrightarrow{P_bP_i}\}_{\mathcal{B}}-{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}\,\{\overrightarrow{P_bP_g}\}_{\mathcal{B}},
+\end{aligned}
+\label{eq:com-to-foot}
+\end{equation}
+即“机身中心$\to$足端”与“机身中心$\to$重心”两个\emph{机体系常向量}之差，再用 ${}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}$ 旋到世界系。这个 $\boldsymbol{p}_{g,i}$ 就是 \cref{eq:nominal-foot} 的 $\boldsymbol{r}_i$，也是瞬时 QP 平衡控制器 \cref{eq:srbd-matrix-unitree} 中力矩臂 $\boldsymbol{p}_{gi}^{\wedge}$ 的来源。
+
+\begin{insight}[力臂用“质心$\to$足端”而非“机身中心$\to$足端”——重心偏置的必要修正]\label{ins:com-offset}
+\cref{eq:com-to-foot} 揭示一处易被忽略的工程要点：力矩是绕\emph{质心}取的（\cref{eq:euler-angmom} 重力对质心无力矩的前提），故力臂必须是\emph{质心}$P_g$ 指向足端、而非\emph{机身中心}$P_b$ 指向足端。二者相差一个机体系常向量 $\{\overrightarrow{P_bP_g}\}_{\mathcal{B}}$（重心相对机身中心的偏置）。若错用 $P_b$ 当力臂原点，转动方程会引入一个与偏置成正比的系统性力矩误差，使机身姿态控制出现稳态偏差（典型表现为机器人持续“低头/抬头”）——这恰是 \cref{sec:practice} 中“重心位置需实验整定”要补偿的物理根源。两个机体系向量 $\{\overrightarrow{P_bP_i}\}_{\mathcal{B}}$（由正运动学 \cref{ch:quad_kin} 给）与 $\{\overrightarrow{P_bP_g}\}_{\mathcal{B}}$（由质量属性给）都是\emph{已知常量}，故 $\boldsymbol{p}_{g,i}$ 仍是 MPC 求解前的已知量，不破坏 \cref{ins:Ak-known} 的“对 $\boldsymbol{u}$ 线性”。
+\end{insight}
+
+\begin{insight}[$\mathbf{A}_k,\mathbf{B}_k$ 是已知量 $\Rightarrow$ 预测对 $\boldsymbol{u}$ 线性 $\Rightarrow$ 可化 QP]\label{ins:Ak-known}
+一个看似平凡却关键的观察：$\mathbf{A}_k,\mathbf{B}_k$ 仅依赖\emph{期望轨迹、落足点坐标、当前系统状态}——这些都是 MPC 求解\emph{之前}就已知的量（期望偏航 $\psi_d^k$ 来自规划器、落足点 \cref{eq:nominal-foot} 来自步态规划、当前状态来自估计器）。因此整个预测序列对\emph{控制量 $\boldsymbol{u}$ 是线性的}：把 LTV 的“时变”参数都归入“已知系数”后，剩下唯一的优化变量就是力序列。这正是后面能把 MPC 写成关于 $\boldsymbol{u}$ 的 QP 的前提（\cref{sec:qp}）。
+\end{insight}
+
+\begin{pitfall}[陷阱：预测时域不能超过半个迈步周期]\label{pit:horizon-bound}
+\cref{eq:disc-AB} 隐含一个假设：\emph{预测时域内每条腿作为支撑腿期间，其足底坐标不变}。因此预测时域长度\textbf{不能超过半个迈步周期}\cite{yu2021quadruped}——否则同一条腿可能在时域内经历“支撑$\to$摆动$\to$支撑”，第二次支撑若仍沿用第一次的足底坐标，会产生较大的预测误差。这是用“常落足点”近似换取 LTV 简洁性所付的代价，也是 $N_p$ 取值的硬上界（见 \cref{sec:practice}）。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:cont-13state} 与 \cref{eq:fwd-euler} 推出 \cref{eq:disc-AB} 的 $\mathbf{A}_k$，逐块核对对角 $\mathbf{I}_3$ 与耦合块的 $\Delta T$。
+  \item 解释为什么状态增广后 $\mathbf{B}_k$ 末行（重力状态的输入通道）全为 $0$。
+  \item （工程）取 $\Delta T=0.01\,\mathrm{s}$、迈步周期 $0.3\,\mathrm{s}$，由 \cref{pit:horizon-bound} 估计预测时域步数 $N_p$ 的上界。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{预测方程：滚动堆叠与预测/控制时域}
+\label{sec:prediction}
+
+MPC 的核心是\emph{预测系统未来一段时间的状态}，再求最优控制序列。本节把单步离散方程 \cref{eq:disc-AB} 沿时间\emph{堆叠}成一个把“未来全部状态”用“当前状态 + 待优化力序列”表出的预测方程。
+
+\paragraph{预测/控制时域与控制量冻结。}
+先厘清两个时域概念（\cref{ch:control} 已建立一般理论，这里复述其在四足里的取舍）。\emph{预测时域} $N_p$ 是“向前预测多少步”，\emph{控制时域} $N_c$ 是“真正优化多少个控制量”。\cref{fig:horizon} 示意了二者关系。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, scale=1.0]
+  % time axis
+  \draw[->, thick] (-0.3,0)--(9.2,0) node[right] {\small 时间步};
+  \foreach \i in {0,1,...,8} \draw (\i,0.08)--(\i,-0.08);
+  \node[below] at (0,-0.12) {\scriptsize $k$};
+  \node[below] at (3,-0.12) {\scriptsize $k{+}N_c$};
+  \node[below] at (8,-0.12) {\scriptsize $k{+}N_p$};
+  % control horizon region
+  \fill[second!12] (0,0) rectangle (3,2.2);
+  \fill[third!8] (3,0) rectangle (8,2.2);
+  \node[second!60!black] at (1.5,2.45) {\small 控制时域 $N_c$（优化变量）};
+  \node[third!60!black] at (5.5,2.45) {\small 预测时域余段（控制量冻结）};
+  % control inputs as steps
+  \foreach \i/\h in {0/0.6,1/1.1,2/0.9} {
+    \draw[main, very thick] (\i,\h)--(\i+1,\h);
+    \fill[main] (\i,\h) circle (1.5pt);
+  }
+  % frozen control (constant) after N_c
+  \draw[main, very thick, dashed] (3,0.9)--(8,0.9);
+  \node[main] at (5.5,0.7) {\scriptsize $\mathbf{u}$ 恒定 $=\mathbf{u}(k{+}N_c{-}1)$};
+  % predicted state trajectory (blue curve)
+  \draw[red!70!black, thick] plot[smooth] coordinates {(0,1.5)(1.5,1.75)(3,1.9)(5,2.0)(8,2.05)};
+  \node[red!70!black] at (6.5,1.85) {\scriptsize 预测状态轨迹};
+  \draw[gray!70, dashed] plot[smooth] coordinates {(0,1.3)(2,1.55)(4,1.75)(6,1.9)(8,2.0)};
+  \node[gray!60!black] at (1.8,1.2) {\scriptsize 期望轨迹};
+\end{tikzpicture}
+\caption{预测时域 $N_p$ 与控制时域 $N_c$。MPC 在 $[k,k{+}N_p]$ 上预测状态（红），但只在前 $N_c$ 步把控制量作为优化变量（绿，蓝底区）；控制时域之后的控制量\emph{冻结}为最后一个值（虚线，蓝底区）。这样既“看得远”（$N_p$ 大），又“优化变量少”（$N_c$ 小）。许多四足实现取 $N_c=N_p$（每步都优化），则无冻结段。}
+\label{fig:horizon}
+\end{figure}
+
+\begin{insight}[预测时域 $>$ 控制时域 + 控制量冻结：解耦“看得远”与“算得快”]\label{ins:horizon-tradeoff}
+这是 MPC 实时性的关键工程妥协。一方面，预测要\emph{看得远}（$N_p$ 大，才能为未来的相位切换、欠驱窗口做准备，呼应 \cref{ins:wbc-no-predict}）；另一方面，优化变量要\emph{少}（控制量个数少才能在线快速求解，否则 $N_p$ 个 $12$ 维力向量会让 QP 维度爆炸）。这对矛盾用“\emph{控制时域之后控制量冻结}（恒等于控制时域最后一个控制量）”来解耦：默认 $N_p>N_c$，$[k{+}N_c,\,k{+}N_p]$ 段的控制量不再新增优化变量、只把它们的系数\emph{合并}到前面的块里。于是优化变量维度锁死在 $N_c$ 个、与 $N_p$ 无关。这也是下面“脱离控制时域后系数合并”的动机。
+\end{insight}
+
+\paragraph{逐步预测，递推找规律。}
+由 \cref{eq:disc-AB} 从当前状态 $\boldsymbol{x}(0)$ 递推（记 $\boldsymbol{u}(i)$ 为第 $i$ 步控制量）\cite{yu2021quadruped}：
+\begin{equation}
+\begin{aligned}
+  \boldsymbol{x}(1) &= \mathbf{A}_0\boldsymbol{x}(0)+\mathbf{B}_0\boldsymbol{u}(0),\\
+  \boldsymbol{x}(2) &= \mathbf{A}_1\mathbf{A}_0\boldsymbol{x}(0)+\mathbf{A}_1\mathbf{B}_0\boldsymbol{u}(0)+\mathbf{B}_1\boldsymbol{u}(1),\\
+  \boldsymbol{x}(3) &= \mathbf{A}_2\mathbf{A}_1\mathbf{A}_0\boldsymbol{x}(0)+\mathbf{A}_2\mathbf{A}_1\mathbf{B}_0\boldsymbol{u}(0)+\mathbf{A}_2\mathbf{B}_1\boldsymbol{u}(1)+\mathbf{B}_2\boldsymbol{u}(2),\\
+  &\;\;\vdots\\
+  \boldsymbol{x}(N_p) &= \Big(\prod_{i=N_p-1}^{0}\mathbf{A}_i\Big)\boldsymbol{x}(0)+\sum_{i=0}^{N_p-2}\Big[\Big(\prod_{j=N_p-1}^{i+1}\mathbf{A}_j\Big)\mathbf{B}_i\boldsymbol{u}(i)\Big]+\mathbf{B}_{N_p-1}\boldsymbol{u}(N_p-1),
+\end{aligned}
+\label{eq:recursion}
+\end{equation}
+其中连乘 $\prod_{i=N_p-1}^{0}\mathbf{A}_i=\mathbf{A}_{N_p-1}\mathbf{A}_{N_p-2}\cdots\mathbf{A}_0$（下标递减，按时间逆序左乘）。
+
+\paragraph{堆叠为预测方程。}
+把未来 $N_p$ 步控制量堆成 $\mathbf{U}=[\boldsymbol{u}^\top(0),\dots,\boldsymbol{u}^\top(N_p-1)]^\top$，状态堆成 $\mathbf{X}=[\boldsymbol{x}^\top(1),\dots,\boldsymbol{x}^\top(N_p)]^\top$，则 \cref{eq:recursion} 写成紧凑的\textbf{预测方程}\cite{yu2021quadruped}：
+\begin{equation}
+  \boxed{\,\mathbf{X}=\mathbf{A}_{qp}\,\boldsymbol{x}(0)+\mathbf{B}_{qp}\,\mathbf{U}\,},
+  \label{eq:prediction}
+\end{equation}
+各块展开为\cite{yu2021quadruped}：
+\begin{equation}
+\mathbf{A}_{qp}=\begin{bmatrix} \mathbf{A}_0 \\ \mathbf{A}_1\mathbf{A}_0 \\ \mathbf{A}_2\mathbf{A}_1\mathbf{A}_0 \\ \vdots \\ \prod_{i=N_p-1}^{0}\mathbf{A}_i \end{bmatrix},
+\quad
+\mathbf{B}_{qp}=\begin{bmatrix}
+\mathbf{B}_0 & \mathbf{0} & \cdots & \mathbf{0} \\
+\mathbf{A}_1\mathbf{B}_0 & \mathbf{B}_1 & \cdots & \mathbf{0} \\
+\mathbf{A}_2\mathbf{A}_1\mathbf{B}_0 & \mathbf{A}_2\mathbf{B}_1 & \cdots & \mathbf{0} \\
+\vdots & \vdots & \ddots & \vdots \\
+\big(\prod_{j=N_p-1}^{1}\mathbf{A}_j\big)\mathbf{B}_0 & \big(\prod_{j=N_p-1}^{2}\mathbf{A}_j\big)\mathbf{B}_1 & \cdots & \mathbf{B}_{N_p-1}
+\end{bmatrix}.
+\label{eq:Aqp-Bqp}
+\end{equation}
+维度：$\boldsymbol{x}(0)$ 为 $13\times1$（来自状态估计器）；$\mathbf{U}$ 为 $12N_p\times1$；$\mathbf{X}$ 为 $13N_p\times1$；$\mathbf{A}_{qp}$ 为 $13N_p\times13$；$\mathbf{B}_{qp}$ 为 $13N_p\times12N_p$（块下三角，即“强迫响应”/脉冲响应堆叠矩阵，$\mathbf{A}_{qp}$ 为“自由响应”矩阵）。
+
+\begin{note}[本书取 $N_c=N_p$ 的简化与一般情形]\label{note:Nc-eq-Np}
+\cref{eq:prediction,eq:Aqp-Bqp} 取的是 $N_c=N_p$（每步控制量都作优化变量、无冻结段），这是凸 MPC 范式的常用选择，记号最干净。一般情形（$N_c<N_p$）须按 \cref{ins:horizon-tradeoff} 把 $[k{+}N_c,k{+}N_p]$ 段的冻结控制量系数合并：例如脱离控制时域后第一步的末块由 $\mathbf{C}\mathbf{A}\mathbf{B}$ 变为 $\mathbf{C}(\mathbf{A}+\mathbf{I})\mathbf{B}$（两步对同一冻结控制量的累积响应），更一般地末块为 $\mathbf{C}\big(\mathbf{A}^{N_p-N_c}+\cdots+\mathbf{A}+\mathbf{I}\big)\mathbf{B}$。其完整堆叠推导见 \cref{ch:control}；本章主线用 $N_c=N_p$，仅在 \cref{sec:practice} 提工程上常取 $N_p$ 小（$\sim10$）故二者差别不大。
+\end{note}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:recursion} 写出 $\boldsymbol{x}(4)$，并核对它在 $\mathbf{A}_{qp},\mathbf{B}_{qp}$（\cref{eq:Aqp-Bqp}）中对应的行。
+  \item 若 $N_p=10$，写出 $\mathbf{U},\mathbf{X},\mathbf{A}_{qp},\mathbf{B}_{qp}$ 的具体维度。
+  \item （概念）解释为什么 $\mathbf{B}_{qp}$ 是块\emph{下三角}的——“未来的控制量不能影响过去的状态”如何体现在矩阵结构上？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{QP 求解：代价、约束、标准形与降维}
+\label{sec:qp}
+
+预测方程 \cref{eq:prediction} 把未来状态 $\mathbf{X}$ 表成待优化力序列 $\mathbf{U}$ 的线性函数。现在加上“跟踪期望 + 力正则”的代价与足端力约束，化为标准凸 QP。
+
+\paragraph{从朴素代价到带力正则的代价。}
+设规划器给出未来 $N_p$ 步的期望状态轨迹 $\mathbf{D}=[({}_d\boldsymbol{x}^1)^\top,\dots,({}_d\boldsymbol{x}^{N_p})^\top]^\top$（每个 ${}_d\boldsymbol{x}^k$ 是 $13$ 维期望状态，末位为常数 ${}^{\mathcal{O}}g(3)=-9.8$）。最朴素的想法是只最小化跟踪误差 $\min_{\mathbf{U}}\|\mathbf{X}-\mathbf{D}\|_2^2$。但这\emph{不够}。
+
+\begin{insight}[朴素跟踪代价的缺陷——必须惩罚控制输入（核心）]\label{ins:must-penalize-u}
+只跟踪误差有一个致命问题：它\textbf{无法约束控制输入的幅度}。求出的足端力可能\emph{非常大}以至于越过执行器范围，导致实际不可行；更糟的是可能引发\emph{执行器饱和}，进而对反馈控制回路造成\emph{灾难性后果}。因此必须在代价里对控制输入加\emph{惩罚（正则）项}：既要误差小（跟得准），又要力小（不饱和、省电、低噪、保护机构）。这就是为什么四足 MPC 的代价\emph{总}含 $\|\mathbf{U}\|^2$ 这一项——它是软约束，把“力别太大”编码进目标函数（硬约束 vs 软约束的区分见 \cref{ins:hard-soft}）。
+\end{insight}
+
+\begin{insight}[硬约束 vs 软约束]\label{ins:hard-soft}
+约束分两类。\emph{硬约束}：物理上\emph{不可突破}的极限（电机力矩上限、摩擦不打滑），对应 QP 的\emph{不等式约束} $\mathbf{C}\mathbf{U}\le\overline{\mathbf{c}}$（\cref{eq:friction-matrix} 即此类）。\emph{软约束}：通过\emph{性能指标}（代价惩罚）让某量“尽量不要太大”（太大则代价过高），如力正则项。理解这一区分，就知道为什么摩擦锥、法向幅值进\emph{约束}，而“力别太大、别突变”进\emph{代价}——前者必须满足，后者只是偏好。
+\end{insight}
+
+故 MPC 优化问题为（结合 \cref{eq:swing-zero,eq:friction-matrix}）\cite{yu2021quadruped,dicarlo2018cheetah}：
+\begin{equation}
+\begin{aligned}
+  \min_{\mathbf{U}}\;& J(\mathbf{U})=(\mathbf{X}-\mathbf{D})^\top\mathbf{Q}(\mathbf{X}-\mathbf{D})+\mathbf{U}^\top\mathbf{R}_u\,\mathbf{U}\\
+  \text{s.t.}\;& {}^{\mathcal{O}}\boldsymbol{f}_i=\mathbf{0}_{3\times1},\quad\forall i:s_i=0,\\
+  & \underline{\mathbf{c}}_i\le\mathbf{C}_i\,{}^{\mathcal{O}}\boldsymbol{f}_i\le\overline{\mathbf{c}}_i.
+\end{aligned}
+\label{eq:mpc-problem}
+\end{equation}
+
+\begin{note}[代价两项的物理对偶与“惩罚幅度 + 变化率”]\label{note:cost-dual}
+代价函数两项的物理意义\emph{对偶}：跟踪误差项 $(\mathbf{X}-\mathbf{D})^\top\mathbf{Q}(\mathbf{X}-\mathbf{D})$（误差均方）代表\emph{追踪性能良好}，力正则项 $\mathbf{U}^\top\mathbf{R}_u\mathbf{U}$（输入均方）代表\emph{输入小、能量损耗小/省力}；最优即二者权衡。更细地，力正则可拆成两类——力的\emph{幅度}项（防过大、防饱和）与相邻力的\emph{差分}项 $(\mathbf{f}_{k}-\mathbf{f}_{k-1})$（防突变、抑制抖振），后者即“变化率软约束”（瞬时 QP 代价的第三项 \cref{eq:unitree-qp-cost} 即此差分平滑）。\cref{eq:mpc-problem} 只显式写了幅度项 $\mathbf{U}^\top\mathbf{R}_u\mathbf{U}$，工程上可按需追加差分项。
+\end{note}
+
+\paragraph{权重矩阵。}
+$\mathbf{Q}$（状态跟踪权重）是 $13N_p\times13N_p$ 对角阵，$\mathbf{Q}(i,i)$ 越大、第 $i$ 分量跟得越紧；工程上不同周期同一闭环权重相等（$\mathbf{Q}(i,i)=\mathbf{Q}(i\%13,i\%13)$）。一组可复现的前 $13$ 个对角元（对应状态序 $[\phi,\theta,\psi,p_x,p_y,p_z,\omega_x,\omega_y,\omega_z,v_x,v_y,v_z,g]$）为\cite{yu2021quadruped}：
+\begin{equation}
+  \mathrm{diag}(\mathbf{Q})_{0:13}=[\,25,\,25,\,10,\;1,\,1,\,100,\;0,\,0,\,0.3,\;0.2,\,0.2,\,20,\;0\,]^\top.
+  \label{eq:Q-diag}
+\end{equation}
+$\mathbf{R}_u$（控制/力正则权重，\emph{切勿写成 $\mathbf{R}$}）是 $12N_p\times12N_p$ 对角阵，保证力不至于太大（否则持续高扭矩致电机发热、精度下降、机构寿命缩短、噪音大），一个常用取值为\cite{yu2021quadruped}：
+\begin{equation}
+  \mathbf{R}_u=5\times10^{-5}\cdot\mathbf{I}_{12N_p}.
+  \label{eq:Ru}
+\end{equation}
+
+\begin{insight}[半正定权重矩阵编码“哪个状态更重要”]\label{ins:weight-Q}
+为什么不用 $\mathbf{e}^\top\mathbf{e}$ 而用 $\mathbf{e}^\top\mathbf{Q}\mathbf{e}$？因为每个状态变量的\emph{重要性不同}（有时更看重高度 $p_z$、有时更看重偏航 $\psi$），引入对角的半正定矩阵 $\mathbf{Q}$ 就能把“更看重谁”编码进优化目标。\cref{eq:Q-diag} 是个活例子：$p_z$ 权重 $100$（高度最要紧，跌倒最致命）、$v_z$ 权重 $20$（竖直速度也重要）、$\phi,\theta$ 权重 $25$（姿态要稳）、而 $\omega_x,\omega_y$ 权重 $0$（横滚/俯仰角速度不直接惩罚）。读权重表即读“控制器在乎什么”。
+\end{insight}
+
+\paragraph{化为二次规划标准形。}
+把预测方程 \cref{eq:prediction} 代入 \cref{eq:mpc-problem} 的代价。记 $\mathbf{E}:=\mathbf{A}_{qp}\boldsymbol{x}_0-\mathbf{D}$（其中 $\boldsymbol{x}_0=\boldsymbol{x}(0)$），用 $\mathbf{Q}=\mathbf{Q}^\top$（对角）展开\cite{yu2021quadruped}：
+\begin{equation}
+\begin{aligned}
+  J(\mathbf{U}) &= (\mathbf{X}-\mathbf{D})^\top\mathbf{Q}(\mathbf{X}-\mathbf{D})+\mathbf{U}^\top\mathbf{R}_u\mathbf{U}\\
+  &= (\mathbf{E}+\mathbf{B}_{qp}\mathbf{U})^\top\mathbf{Q}(\mathbf{E}+\mathbf{B}_{qp}\mathbf{U})+\mathbf{U}^\top\mathbf{R}_u\mathbf{U}\\
+  &= \mathbf{U}^\top\big(\mathbf{B}_{qp}^\top\mathbf{Q}\mathbf{B}_{qp}+\mathbf{R}_u\big)\mathbf{U}+\mathbf{U}^\top\big(2\mathbf{B}_{qp}^\top\mathbf{Q}\mathbf{E}\big)+\underbrace{\mathbf{E}^\top\mathbf{Q}\mathbf{E}}_{\text{const}}.
+\end{aligned}
+\label{eq:cost-expand}
+\end{equation}
+常数项 $\mathbf{E}^\top\mathbf{Q}\mathbf{E}$ 不依赖 $\mathbf{U}$，对“$\mathbf{U}$ 取何值时 $J$ 最小”无影响，可弃。令\cite{yu2021quadruped}
+\begin{equation}
+  \mathbf{H}=2\big(\mathbf{B}_{qp}^\top\mathbf{Q}\mathbf{B}_{qp}+\mathbf{R}_u\big),\qquad
+  \mathbf{g}=2\mathbf{B}_{qp}^\top\mathbf{Q}\big(\mathbf{A}_{qp}\boldsymbol{x}_0-\mathbf{D}\big),
+  \label{eq:H-g}
+\end{equation}
+则代价化为标准二次型
+\begin{equation}
+  J(\mathbf{U})=\tfrac12\mathbf{U}^\top\mathbf{H}\mathbf{U}+\mathbf{U}^\top\mathbf{g}.
+  \label{eq:qp-cost}
+\end{equation}
+
+\paragraph{约束整合。}
+把每腿每周期的足端力约束 \cref{eq:friction-matrix} 块对角地堆成对 $\mathbf{U}$ 的约束\cite{yu2021quadruped}：
+\begin{equation}
+  \underline{\mathbf{c}}\le\mathbf{C}\mathbf{U}\le\overline{\mathbf{c}},\qquad
+  \underline{\mathbf{c}}=\mathbf{0}_{20N_p\times1},\;\;
+  \mathbf{C}=\mathrm{blkdiag}(\mathbf{C}_i,\dots,\mathbf{C}_i),\;\;
+  \overline{\mathbf{c}}=[\overline{\mathbf{c}}_i^\top,\dots,\overline{\mathbf{c}}_i^\top]^\top,
+  \label{eq:qp-constraint}
+\end{equation}
+约束行数为 $20N_p=5(\text{每腿})\times4(\text{腿})\times N_p(\text{周期})$。于是得\textbf{二次规划标准形}\cite{yu2021quadruped}：
+\begin{equation}
+  \boxed{\;\min_{\mathbf{U}}\;\tfrac12\mathbf{U}^\top\mathbf{H}\mathbf{U}+\mathbf{U}^\top\mathbf{g}\quad\text{s.t.}\quad\underline{\mathbf{c}}\le\mathbf{C}\mathbf{U}\le\overline{\mathbf{c}}\;}.
+  \label{eq:qp-standard}
+\end{equation}
+$\mathbf{H}$ 对称正定（$\mathbf{B}_{qp}^\top\mathbf{Q}\mathbf{B}_{qp}$ 半正定 $+$ $\mathbf{R}_u\succ0$），故这是\emph{凸}二次规划，有唯一全局最优。工程实现用基于 C++ 的 \texttt{qpOASES} 库求解\cite{yu2021quadruped}。
+
+\paragraph{无约束情形的闭式解（理解 QP 内核）。}
+若暂去掉不等式约束，最优解有闭式——这是理解 QP 内核的关键。把代价写成等价的 $J=(\mathbf{s}-\mathbf{M}\mathbf{U})^\top\mathbf{P}(\mathbf{s}-\mathbf{M}\mathbf{U})+\mathbf{U}^\top\mathbf{W}\mathbf{U}$ 形式（$\mathbf{M}=\mathbf{B}_{qp}$ 为强迫响应矩阵、$\mathbf{s}=\mathbf{D}-\mathbf{A}_{qp}\boldsymbol{x}_0$ 为期望减自由响应、$\mathbf{P}=\mathbf{Q}$、$\mathbf{W}=\mathbf{R}_u$），令 $\partial J/\partial\mathbf{U}=\mathbf{0}$\cite{yu2021quadruped}：
+\begin{equation}
+  \frac{\partial J}{\partial\mathbf{U}}=-2\mathbf{M}^\top\mathbf{P}\mathbf{s}+2(\mathbf{M}^\top\mathbf{P}\mathbf{M}+\mathbf{W})\mathbf{U}=\mathbf{0}
+  \;\Longrightarrow\;
+  \boxed{\hat{\mathbf{U}}=(\mathbf{M}^\top\mathbf{P}\mathbf{M}+\mathbf{W})^{-1}\mathbf{M}^\top\mathbf{P}\mathbf{s}}.
+  \label{eq:qp-closed-form}
+\end{equation}
+
+\begin{insight}[二次型 $\Rightarrow$ 导数为零即唯一全局最优；MPC 本质 = 化为 QP]\label{ins:qp-essence}
+两条要点收束整个推导。其一：因为代价是\emph{二次型}（凸），找最优很容易——\emph{导数为零}处即最优，\emph{一阶必要条件即充分条件}，无需迭代搜索（\cref{eq:qp-closed-form}）。其二（方法论总结）：上述全过程\textbf{实际上就是根据系统状态方程和矩阵方法，把控制问题转化为一个 QP 问题}，再交给各种 QP 求解器。\emph{无}约束时有闭式解 \cref{eq:qp-closed-form}；\emph{有}约束（幅值/摩擦锥）时则交给 \texttt{qpOASES}/\allowbreak\texttt{OSQP} 等求解 \cref{eq:qp-standard}。这就是“MPC = 把带约束的最优控制化成 QP”这句话的全部含义。
+\end{insight}
+
+\paragraph{降维技巧：剔除摆动腿的零力变量。}
+对角步态每时刻摆动/支撑各两腿，由 \cref{eq:swing-zero} 摆动腿足端力恒为 $\mathbf{0}$，故 $\mathbf{U}$ 有一半元素是 $0$；若让它们参与优化会降低效率。工程做法是：若第 $k$ 周期第 $i$ 腿为摆动腿，则从 $\mathbf{H},\mathbf{g}$ 剔除第 $n_{ki}\!\sim\!n_{ki}+2$ 个元素、从 $\mathbf{H}$ 剔除对应行列、从 $\mathbf{C}$ 剔除对应列、再删 $\mathbf{C}$ 中全 $0$ 行及 $\underline{\mathbf{c}},\overline{\mathbf{c}}$ 对应元素，其中\cite{yu2021quadruped}
+\begin{equation}
+  n_{ki}=12(k-1)+3(i-1)+1.
+  \label{eq:dim-index}
+\end{equation}
+
+\paragraph{取首步作为当前控制量。}
+求解 \cref{eq:qp-standard} 得 $\mathbf{U}$ 后，只取\emph{第一组}控制量 $\boldsymbol{u}(0)$ 作为当前控制周期实际施加的力（其余被下一周期的重新求解覆盖——这就是“滚动”）。因降维剔除，$\boldsymbol{u}(0)$ 的维度不再是 $12$，而是 $3n_{st}$（$n_{st}$ 为当前支撑腿数）。记为\cite{yu2021quadruped}：
+\begin{equation}
+  \boxed{\,{}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}=\boldsymbol{u}(0)\,}.
+  \label{eq:mpc-output}
+\end{equation}
+
+\begin{pitfall}[误区：把整段预测出的 $\mathbf{U}$ 都施加出去]
+MPC 的“滚动”精髓在于\emph{只执行第一步} \cref{eq:mpc-output}，下一周期用最新状态\emph{重新}求解整段。若把求出的 $\mathbf{U}$ 整段开环施加（不重解），就退化成开环预测控制，丢失了反馈校正——模型误差、扰动会累积发散。这也是 \cref{ins:drop-gyro} 里“反馈兜底”得以成立的前提：每周期重解才有反馈。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:cost-expand} 补全中间被略的一步（展开 $(\mathbf{E}+\mathbf{B}_{qp}\mathbf{U})^\top\mathbf{Q}(\mathbf{E}+\mathbf{B}_{qp}\mathbf{U})$ 为四项并合并），核对 \cref{eq:H-g} 的 $\mathbf{H},\mathbf{g}$。
+  \item 由 \cref{eq:qp-closed-form} 出发，说明为什么 $\mathbf{M}^\top\mathbf{P}\mathbf{M}+\mathbf{W}$ 必可逆（用 $\mathbf{W}=\mathbf{R}_u\succ0$）。
+  \item （工程）$N_p=10$、四腿、对角步态（每步 2 支撑），用 \cref{eq:dim-index} 算降维后 $\mathbf{U}$ 的维度，并与不降维的 $12N_p$ 对比。
+  \item 读 \cref{eq:Q-diag} 的权重，说出这台机器人“最在乎”和“最不在乎”的状态各是哪几个，并用 \cref{ins:weight-Q} 解释。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{与瞬时 QP / WBC 的关系}
+\label{sec:relation}
+
+本章的凸 MPC 与读者可能已熟悉的“瞬时足底力 QP 分配”（如平衡控制器）、以及 WBC，是同一族方法的不同切面。把三者的关系讲清，MPC 在控制栈中的位置就钉死了。
+
+\paragraph{瞬时 QP = MPC 的 $N=1$ 退化。}
+一类常见的四足\emph{平衡控制器}并\emph{未}做未来预测——它是“单刚体动力学 + 单步（瞬时）QP 足底力分配”，只考虑\emph{当前时刻}\cite{unitree2023quadruped}。其内核是：机身位姿 PD 反馈给出期望加速度 $\dot{\boldsymbol{v}}_s,\dot{\boldsymbol{\omega}}_s$（这对反馈律本身的完整推导见 \cref{subsec:bal-feedback}），足端力 $\mathbf{f}$ 经动力学映射 \cref{eq:srbd-matrix-unitree} 生成它们，但该映射\emph{欠定}（$6$ 个方程、$12$ 个未知力），故用 QP 选最优解：
+\begin{equation}
+  \begin{bmatrix}\mathbf{I}_3&\mathbf{I}_3&\mathbf{I}_3&\mathbf{I}_3\\ \boldsymbol{p}_{g0}^{\wedge}&\boldsymbol{p}_{g1}^{\wedge}&\boldsymbol{p}_{g2}^{\wedge}&\boldsymbol{p}_{g3}^{\wedge}\end{bmatrix}
+  \begin{bmatrix}\mathbf{f}_{0}\\\mathbf{f}_{1}\\\mathbf{f}_{2}\\\mathbf{f}_{3}\end{bmatrix}
+  =\begin{bmatrix}m(\dot{\boldsymbol{v}}_s-\boldsymbol{g})\\ \mathbf{R}_{sb}\mathbf{I}_b\mathbf{R}_{sb}^\top\dot{\boldsymbol{\omega}}_s\end{bmatrix}
+  \;\;(\text{记 }\mathbf{A}\mathbf{f}=\mathbf{b}_d),
+  \label{eq:srbd-matrix-unitree}
+\end{equation}
+其 QP 代价为\cite{unitree2023quadruped}
+\begin{equation}
+  J=(\mathbf{A}\mathbf{f}-\mathbf{b}_d)^\top\mathbf{S}(\mathbf{A}\mathbf{f}-\mathbf{b}_d)+\mathbf{f}^\top\alpha\mathbf{W}\mathbf{f}+(\mathbf{f}-\mathbf{f}_{\text{prev}})^\top\beta\mathbf{U}(\mathbf{f}-\mathbf{f}_{\text{prev}}),
+  \label{eq:unitree-qp-cost}
+\end{equation}
+三项分别是：\cnum{1} 满足动力学（$\mathbf{S}$ 权方程满足度）、\cnum{2} 力幅值正则（$\alpha\mathbf{W}$）、\cnum{3} 与上一步力差异小、抑制突变（$\beta\mathbf{U}$）；约束为摩擦锥 \cref{eq:friction-matrix} 与摆动腿零力。把 \cref{eq:unitree-qp-cost} 与本章 MPC 代价 \cref{eq:mpc-problem} 对照即一目了然：\textbf{瞬时 QP 恰是凸 MPC 在预测时域 $N_p=1$ 时的退化}——它的代价 = MPC 在单一时间步的 stage cost（动力学项 + 力幅值正则 + 平滑项），它的约束 = MPC 的等式/摩擦锥约束。把 \cref{eq:srbd-matrix-unitree} 沿预测时域堆叠、加上 SRBD 离散状态转移，就得到本章的凸 MPC。\textbf{瞬时 QP 缺的，正是“预测时域”这一维}\cite{unitree2023quadruped}。
+
+\begin{insight}[从瞬时 QP 到 MPC 的动机锚点]\label{ins:unitree-motivation}
+瞬时 QP 平衡控制器的根本局限，正是“为何升级到 MPC”的最好锚点：用 QP 计算各足端期望足底力来控制机身运动与平衡，\emph{只能考虑当前状态、不能预测未来时刻运动的影响}；要解决这一问题就需引入 MPC——通过对未来一段时间运动的预测，用二次规划等优化算法计算下一瞬间的目标位姿与足底力\cite{unitree2023quadruped}。这与本章 \cref{ins:wbc-no-predict,ins:mpc-vs-pid} 的立论\emph{完全合拍}：瞬时 QP 与 WBC 一样是\emph{反应式}的，加上预测时域才成为 MPC。
+\end{insight}
+
+\paragraph{升级路径：静力学 $\to$ WBC、瞬时 QP $\to$ MPC。}
+\emph{简化逆动力学}（足端力 $\to$ 关节力矩）用单腿静力学近似（触地腿速度变化小 + 腿质量小 $\Rightarrow$ 总功率约 $0$）\cite{unitree2023quadruped}：
+\begin{equation}
+  \boldsymbol{\tau}_i=-\mathbf{J}_i^\top\mathbf{f}_{ib}=-\mathbf{J}_i^\top\mathbf{R}_{sb}^\top\mathbf{f}_{is},
+  \label{eq:inverse-statics}
+\end{equation}
+（负号：$\mathbf{f}_{is}$ 是地面对足端力，与足端对地面力互为反作用；$\mathbf{J}_i$ 为单腿雅可比。）这一近似在高速时误差大，升级路径是引入完整关节空间动力学 $\boldsymbol{\tau}=\mathbf{M}(\boldsymbol{\theta})\ddot{\boldsymbol{\theta}}+\mathbf{h}(\boldsymbol{\theta},\dot{\boldsymbol{\theta}})$ 的\emph{浮动基逆动力学}，即 WBC\cite{unitree2023quadruped}。工业级的成熟做法是\textbf{MPC + WBC 分层}\cite{kim2019wbic}：上层 MPC（单刚体、低频、定反作用力/质心轨迹）+ 下层全身脉冲控制 WBIC（高频、含全身动力学，把 MPC 的力/加速度作为任务），使 Mini-Cheetah 等获得优异的高动态性能。这恰好回填了 \cref{sec:why-predict} 开头“MPC + WBC 双层方案”的全貌。
+
+\begin{insight}[控制栈定位：MPC 算虚拟力，逆运动学/逆动力学转关节力矩]\label{ins:control-stack}
+MPC 在控制链中的位置很精确：四足是物理系统，\emph{施加力才能改变运动状态}。MPC 的作用是\emph{考虑未来一段时间的运动、算出一系列合理的足端（虚拟）力}来实现运动控制；然后\emph{逆运动学/雅可比/逆动力学等方法把这些虚拟力转换为腿部电机的真实力矩}去驱动（如 \cref{eq:inverse-statics} 的 $\boldsymbol{\tau}_i=-\mathbf{J}_i^\top\mathbf{R}_{sb}^\top\mathbf{f}_{is}$ 前馈，再叠加全身/关节反馈）。即 MPC 工作在\emph{任务空间（笛卡尔足端力）}，下游映射到\emph{执行器空间（关节力矩）}，与虚拟模型控制 VMC 的“虚拟力 $\to$ 雅可比 $\to$ 关节力矩”思路一致。这条链条把“MPC 输出什么、谁来执行”讲清了。
+\end{insight}
+
+\begin{insight}[选择矩阵 $\mathbf{D}_i$：步态相位与 MPC 的接口]\label{ins:selection-matrix}
+在 Di Carlo 的标准形里，摆动腿零力约束 \cref{eq:swing-zero} 常写成\emph{选择约束} $\mathbf{D}_i\boldsymbol{u}_i=\mathbf{0}$：选择矩阵 $\mathbf{D}_i$ 挑出“哪些足端力应为 $0$”。$\mathbf{D}_i$ 与\emph{足端相位变量}（接触序列）挂钩——因为摆动腿不受力，故按该步的接触状态动态装配 $\mathbf{D}_i$，强制摆动腿对应的 $\boldsymbol{u}$ 分量为零。这是\emph{步态规划（相位）}与\emph{MPC（力优化）}的接口：步态调度器（gait scheduler）给出谁何时触地，MPC 据此装配每步的 $\mathbf{D}_i$。\textbf{注意：步态/触地时序由独立的有限状态机给出、不进 MPC 优化}——这正是“凸”的前提，一旦把“哪条腿何时触地”也作决策，问题就变成含整数变量的混合整数/非凸问题。
+\end{insight}
+
+\paragraph{标准形的等价写法（Di Carlo 范式）。}
+为对接文献，给出 Di Carlo 凸 MPC 的逐步（stagewise）标准形——它与本章堆叠形 \cref{eq:qp-standard} 数学等价、只是没有提前消去状态\cite{dicarlo2018cheetah}：
+\begin{equation}
+\begin{aligned}
+  \min_{\boldsymbol{x},\boldsymbol{u}}\;& \sum_{i=0}^{N_p-1}\big\|\boldsymbol{x}_{i+1}-\boldsymbol{x}_{i+1}^{\mathrm{ref}}\big\|_{\mathbf{Q}_i}^2+\big\|\boldsymbol{u}_i\big\|_{\mathbf{R}_{u,i}}^2\\
+  \text{s.t.}\;& \boldsymbol{x}_{i+1}=\mathbf{A}_i\boldsymbol{x}_i+\mathbf{B}_i\boldsymbol{u}_i,\quad &&\text{(离散单刚体动力学)}\\
+  & \underline{\mathbf{c}}_i\le\mathbf{C}_i\boldsymbol{u}_i\le\overline{\mathbf{c}}_i,\quad &&\text{(摩擦锥 + 力幅值)}\\
+  & \mathbf{D}_i\boldsymbol{u}_i=\mathbf{0},\quad &&\text{(选择矩阵：摆动腿零力)}.
+\end{aligned}
+\label{eq:dicarlo-form}
+\end{equation}
+其中 $\|\cdot\|_{\mathbf{Q}_i}^2=(\cdot)^\top\mathbf{Q}_i(\cdot)$ 为加权二次型，$\mathbf{Q}_i,\mathbf{R}_{u,i}$ 为对角半正定权重。\cref{eq:dicarlo-form} 与本章 \cref{eq:mpc-problem} 是同一问题：把等式约束（动力学）代入消去状态，即得本章的堆叠凝聚形 \cref{eq:qp-standard}\cite{dicarlo2018cheetah}。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=4mm and 10mm,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=main!8, draw=main!60!black, minimum height=1cm, text width=2.4cm},
+  est/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=third!8, draw=third!60!black, minimum height=1cm, text width=2.2cm},
+  ln/.style={->, thick, gray!55!black}]
+  \node[est] (plan) {步态/轨迹规划\\（相位 $s_i$、期望 $\mathbf{D}$）};
+  \node[blk, right=of plan] (mpc) {\textbf{MPC}\\单刚体, $\sim$100 Hz\\算足端力 $\mathbf{f}^{\mathrm{MPC}}$};
+  \node[blk, right=of mpc] (wbc) {WBC / 逆动力学\\$\sim$500 Hz\\$\mathbf{f}\!\to\!\boldsymbol{\tau}$};
+  \node[draw, rounded corners, fill=gray!8, right=of wbc, align=center, font=\small, minimum height=1cm, text width=1.8cm] (robot) {机器人\\（电机 $\boldsymbol{\tau}$）};
+  \node[est, below=8mm of wbc] (est) {状态估计器\\（ESKF/InEKF）};
+  \draw[ln] (plan)--(mpc);
+  \draw[ln] (mpc)--node[above,font=\scriptsize]{$\mathbf{f}^{\mathrm{MPC}}$}(wbc);
+  \draw[ln] (wbc)--node[above,font=\scriptsize]{$\boldsymbol{\tau}$}(robot);
+  \draw[ln] (robot.south) |- (est.east);
+  \draw[ln] (est.west) -| node[pos=0.25,below,font=\scriptsize]{$\boldsymbol{x}(0)$}(mpc.south);
+  \draw[ln] (est.north) -- (wbc.south);
+\end{tikzpicture}
+\caption{四足运动控制栈：步态/轨迹规划给出相位 $s_i$ 与期望轨迹 $\mathbf{D}$；MPC（单刚体、$\sim$100 Hz）算出足端力 $\mathbf{f}^{\mathrm{MPC}}$；WBC/逆动力学（$\sim$500 Hz）把力映射成关节力矩 $\boldsymbol{\tau}$；状态估计器（\cref{ch:eskf}）为 MPC 提供当前状态 $\boldsymbol{x}(0)$、为 WBC 提供反馈。瞬时 QP 平衡控制器相当于把 MPC 块换成 $N_p=1$ 的退化版。}
+\label{fig:control-arch}
+\end{figure}
+
+\begin{practice}
+\begin{enumerate}
+  \item 把瞬时 QP 代价 \cref{eq:unitree-qp-cost} 的三项与本章 MPC 代价 \cref{eq:mpc-problem} 的项一一对应，指出哪一项是 MPC 多出来的“跨时间”结构。
+  \item 写出对角步态某一步的选择矩阵 $\mathbf{D}_i$（$3\times12$ 或更大），使它强制右前 + 左后为支撑、左前 + 右后零力。
+  \item （概念）为什么“哪条腿何时触地”若作为决策变量会破坏 QP 的凸性？用 \cref{ins:selection-matrix} 的语言解释“凸的前提”。
+\end{enumerate}
+\end{practice}
+
+% ----------------------------------------------------------------
+\subsection{平衡控制器的位姿反馈律：期望加速度从哪来}
+\label{subsec:bal-feedback}
+
+\cref{eq:srbd-matrix-unitree} 把“足端力 $\to$ 机身合力/合力矩”钉死了，但其右端的期望线加速度 $\dot{\boldsymbol{v}}_s$ 与期望角加速度 $\dot{\boldsymbol{\omega}}_s$ 本身\emph{从哪来}？答案是：\textbf{把机身位姿当成被控对象，用一对 PD 反馈律生成它们}。这是瞬时 QP 平衡控制器（\cref{ins:unitree-motivation}）里与 MPC 共享、却同样不可省的“参考生成”层——无论瞬时 QP 还是凸 MPC，最终都要回答“这一刻机身该产生多大的线/角加速度”。本小节把这对反馈律——位置的\emph{离散双积分 PD}与姿态的\emph{$\SO(3)$ 几何 PD}——逐式推全，并点明它与本章 MPC、与 \cref{ch:quad_wbc} WBC 任务命令的关系\cite{unitree2023quadruped}。
+
+\paragraph{总思路：位姿误差 $\to$ 期望加速度 $\to$ 足底力。}
+由 \cref{eq:srbd-matrix-unitree}，控制各足端力 $\boldsymbol{f}_{is}$ 即可生成任意期望的机身线加速度 $\dot{\boldsymbol{v}}_s$ 与角加速度 $\dot{\boldsymbol{\omega}}_s$（二者都在世界系 $\mathcal{O}$，$\boldsymbol{\omega}_s\equiv{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}$ 即本章一贯的世界系空间角速度，\cref{note:spatial-omega}）。因此把 $\dot{\boldsymbol{v}}_s,\dot{\boldsymbol{\omega}}_s$ \emph{视为可直接指定的控制输入}，问题就退化为经典的“给定位姿误差、设计反馈加速度使误差收敛”。其中机身位置 $\boldsymbol{p}_s$ 在 $x,y,z$ 三轴\emph{解耦}、可逐轴用标量 PD；机身姿态 $\mathbf{R}_{sb}\in\SO(3)$ \emph{不可}解耦、须整体用几何 PD。下面分别处理。下文 $\Delta t$ 指平衡/全身控制环的周期（$500\,\mathrm{Hz}$，$\Delta t=0.002\,\mathrm{s}$，\cref{note:spatial-omega} 上方记号约定），而 $\Delta\boldsymbol{p},\Delta\dot{\boldsymbol{p}}$ 专指位置/速度\emph{跟踪误差}（粗体，与标量时间步 $\Delta t$ 不混）。
+
+\paragraph{\cnum{1} 位置反馈：离散双积分运动学。}
+设机身在世界系坐标为 $\boldsymbol{p}_s$，线速度 $\boldsymbol{v}_s=\dot{\boldsymbol{p}}_s$、线加速度 $\dot{\boldsymbol{v}}_s=\ddot{\boldsymbol{p}}_s$。控制是离散系统，$k$ 到 $k+1$ 时刻（时长 $\Delta t$）内机身位置与速度按匀加速更新\cite{unitree2023quadruped}：
+\begin{equation}
+  \boldsymbol{p}_{s,k+1}=\boldsymbol{p}_{s,k}+\Delta t\,\dot{\boldsymbol{p}}_{s,k}+\tfrac{(\Delta t)^2}{2}\ddot{\boldsymbol{p}}_{s,k},
+  \qquad
+  \dot{\boldsymbol{p}}_{s,k+1}=\dot{\boldsymbol{p}}_{s,k}+\Delta t\,\ddot{\boldsymbol{p}}_{s,k}.
+  \label{eq:bal-disc-kin}
+\end{equation}
+
+\paragraph{误差状态与离散状态空间。}
+令机身目标位置 $\boldsymbol{r}$、目标速度 $\dot{\boldsymbol{r}}$、目标加速度 $\ddot{\boldsymbol{r}}=\boldsymbol{0}$，定义位置偏差 $\Delta\boldsymbol{p}_k=\boldsymbol{r}_k-\boldsymbol{p}_{s,k}$、速度偏差 $\Delta\dot{\boldsymbol{p}}_k=\dot{\boldsymbol{r}}_k-\dot{\boldsymbol{p}}_{s,k}$。把 \cref{eq:bal-disc-kin} 代入偏差定义（$\boldsymbol{r}_{k+1}=\boldsymbol{r}_k+\Delta t\,\dot{\boldsymbol{r}}_k$，因 $\ddot{\boldsymbol{r}}=\boldsymbol{0}$）得偏差递推\cite{unitree2023quadruped}：
+\begin{equation}
+  \Delta\boldsymbol{p}_{k+1}=\Delta\boldsymbol{p}_k+\Delta t\,\Delta\dot{\boldsymbol{p}}_k-\tfrac{(\Delta t)^2}{2}\ddot{\boldsymbol{p}}_{s,k},
+  \qquad
+  \Delta\dot{\boldsymbol{p}}_{k+1}=\Delta\dot{\boldsymbol{p}}_k-\Delta t\,\ddot{\boldsymbol{p}}_{s,k}.
+  \label{eq:bal-err-dyn}
+\end{equation}
+以 $(\Delta\boldsymbol{p}_k,\Delta\dot{\boldsymbol{p}}_k)$ 为状态、$\ddot{\boldsymbol{p}}_{s,k}$ 为输入，得离散状态空间\cite{unitree2023quadruped}：
+\begin{equation}
+  \begin{bmatrix}\Delta\boldsymbol{p}_{k+1}\\[2pt] \Delta\dot{\boldsymbol{p}}_{k+1}\end{bmatrix}
+  =\begin{bmatrix}\mathbf{I}_3 & \Delta t\,\mathbf{I}_3\\[2pt] \mathbf{0}_3 & \mathbf{I}_3\end{bmatrix}
+  \begin{bmatrix}\Delta\boldsymbol{p}_k\\[2pt] \Delta\dot{\boldsymbol{p}}_k\end{bmatrix}
+  -\begin{bmatrix}\tfrac{(\Delta t)^2}{2}\mathbf{I}_3\\[2pt] \Delta t\,\mathbf{I}_3\end{bmatrix}\ddot{\boldsymbol{p}}_{s,k}.
+  \label{eq:bal-ss}
+\end{equation}
+\cref{eq:bal-ss} 在 $x,y,z$ 三轴间\emph{无耦合}，故取 $x$ 轴单独分析（$y,z$ 同理）\cite{unitree2023quadruped}：
+\begin{equation}
+  \begin{bmatrix}\Delta x_{k+1}\\ \Delta\dot x_{k+1}\end{bmatrix}
+  =\begin{bmatrix}1 & \Delta t\\ 0 & 1\end{bmatrix}
+  \begin{bmatrix}\Delta x_k\\ \Delta\dot x_k\end{bmatrix}
+  -\begin{bmatrix}\tfrac{(\Delta t)^2}{2}\\ \Delta t\end{bmatrix}\ddot x_k.
+  \label{eq:bal-ss-x}
+\end{equation}
+
+\paragraph{PD 控制律与闭环矩阵。}
+为镇定，取控制量 $\ddot x_k$ 为偏差的\emph{比例-微分}函数\cite{unitree2023quadruped}：
+\begin{equation}
+  \ddot x_k=k_p\,\Delta x_k+k_d\,\Delta\dot x_k,\qquad k_p,k_d>0.
+  \label{eq:bal-pd}
+\end{equation}
+代入 \cref{eq:bal-ss-x} 消去 $\ddot x_k$，得自治闭环 $\boldsymbol{x}_{k+1}=\mathbf{A}\boldsymbol{x}_k$（$\boldsymbol{x}_k=[\Delta x_k,\Delta\dot x_k]^\top$）\cite{unitree2023quadruped}：
+\begin{equation}
+  \begin{bmatrix}\Delta x_{k+1}\\ \Delta\dot x_{k+1}\end{bmatrix}
+  =\underbrace{\begin{bmatrix}1-\tfrac{(\Delta t)^2}{2}k_p & \Delta t-\tfrac{(\Delta t)^2}{2}k_d\\[3pt] -\Delta t\,k_p & 1-\Delta t\,k_d\end{bmatrix}}_{\mathbf{A}}
+  \begin{bmatrix}\Delta x_k\\ \Delta\dot x_k\end{bmatrix}.
+  \label{eq:bal-closed}
+\end{equation}
+
+\paragraph{稳定性：离散特征值配置。}
+由 $\boldsymbol{x}_{k+1}=\mathbf{A}\boldsymbol{x}_k$ 得 $\boldsymbol{x}_k=\mathbf{A}^k\boldsymbol{x}_0$。设 $\mathbf{A}=\mathbf{P}\mathbf{D}\mathbf{P}^{-1}$ 对角化（$\mathbf{D}=\mathrm{diag}(\lambda_1,\lambda_2)$ 为特征值），则 $\mathbf{A}^k=\mathbf{P}\mathbf{D}^k\mathbf{P}^{-1}$\cite{unitree2023quadruped}：
+\begin{equation}
+  \boldsymbol{x}_k=\mathbf{A}^k\boldsymbol{x}_0
+  =\mathbf{P}\begin{bmatrix}\lambda_1^k & 0\\ 0 & \lambda_2^k\end{bmatrix}\mathbf{P}^{-1}\boldsymbol{x}_0.
+  \label{eq:bal-diag}
+\end{equation}
+收敛（$\boldsymbol{x}_k\to\boldsymbol{0}$）的充要条件是 $|\lambda_1|,|\lambda_2|<1$。但对四足平衡控制器，\textbf{不希望收敛过程出现振荡}（振荡意味着机身来回晃、足底力反复换向，损伤步态与硬件）——而振荡的来源正是\emph{复}特征值。故进一步要求 $\lambda_1,\lambda_2$ 是落在 $(0,1)$ 的\emph{实数}：此时 $\lambda_i^k$ 按指数函数\emph{单调无振荡}地衰减到 $0$（\cref{fig:bal-convergence}）\cite{unitree2023quadruped}。
+
+下面求 $\mathbf{A}$ 的特征值并配置之。由 $\det(\mathbf{A}-\lambda\mathbf{I})=0$，利用 $\det(\mathbf{A}-\lambda\mathbf{I})=\lambda^2-\operatorname{tr}(\mathbf{A})\lambda+\det(\mathbf{A})$ 及 \cref{eq:bal-closed} 的 $\mathbf{A}$（$\operatorname{tr}\mathbf{A}=2-\tfrac{(\Delta t)^2}{2}k_p-\Delta t\,k_d$、$\det\mathbf{A}=1+\tfrac{(\Delta t)^2}{2}k_p-\Delta t\,k_d$），整理成一元二次\cite{unitree2023quadruped}：
+\begin{equation}
+  a\lambda^2+b\lambda+c=0,\qquad
+  \begin{cases}
+    a=1,\\[2pt]
+    b=-2+\tfrac{(\Delta t)^2}{2}k_p+\Delta t\,k_d,\\[2pt]
+    c=1+\tfrac{(\Delta t)^2}{2}k_p-\Delta t\,k_d.
+  \end{cases}
+  \label{eq:bal-chareq}
+\end{equation}
+特征值 $\lambda_{1,2}=\tfrac{-b\pm\sqrt{b^2-4ac}}{2a}$。要两根为\emph{实数}须判别式 $b^2-4ac\ge0$；又由 \cref{fig:bal-convergence}，特征值\emph{越小收敛越快}，故取临界 $b^2-4ac=0$（实根中收敛最速者）。代入并因式分解\cite{unitree2023quadruped}：
+\begin{equation}
+  b^2-4ac=\Big[\tfrac{(\Delta t)^2}{2}k_p+\Delta t\,k_d\Big]^2-4(\Delta t)^2k_p
+  =\Big[\tfrac{(\Delta t)^2}{2}k_p+\Delta t\,k_d+2\Delta t\sqrt{k_p}\Big]\Big[\tfrac{(\Delta t)^2}{2}k_p+\Delta t\,k_d-2\Delta t\sqrt{k_p}\Big]=0.
+  \label{eq:bal-discr}
+\end{equation}
+因 $k_p,k_d>0$，第一个方括号恒\emph{正}，故必是第二个方括号为零；除以 $\Delta t$ 即解出临界阻尼增益 $k_d=2\sqrt{k_p}-\tfrac{\Delta t}{2}k_p$。此时 $b^2-4ac=0$、两根相等 $\lambda_1=\lambda_2=\tfrac{-b}{2a}$，再代入该 $k_d$\cite{unitree2023quadruped}：
+\begin{equation}
+  \lambda_1=\lambda_2=\frac{-b}{2a}=1-\frac{(\Delta t)^2}{4}k_p-\frac{\Delta t}{2}k_d
+  \;\xrightarrow{\;k_d=2\sqrt{k_p}-\frac{\Delta t}{2}k_p\;}\;
+  1-\Delta t\sqrt{k_p}.
+  \label{eq:bal-lambda}
+\end{equation}
+系统稳定的另一条件 $\lambda>0$ 给出 $1-\Delta t\sqrt{k_p}>0$，即 $k_p<1/(\Delta t)^2$。汇成定理：
+
+\begin{theorem}[离散双积分 PD 的临界阻尼整定]\label{thm:bal-critical-damp}
+对 \cref{eq:bal-closed} 的离散闭环 $\boldsymbol{x}_{k+1}=\mathbf{A}\boldsymbol{x}_k$（PD 增益 $k_p,k_d>0$、周期 $\Delta t>0$），其两特征值\emph{相等、为实数且落在 $(0,1)$}（即无振荡、最速收敛的临界阻尼）当且仅当
+\begin{equation}
+  k_d=2\sqrt{k_p}-\frac{\Delta t}{2}k_p,
+  \qquad
+  0<k_p<\frac{1}{(\Delta t)^2}.
+  \label{eq:bal-kd}
+\end{equation}
+此时重根为 $\lambda_1=\lambda_2=1-\Delta t\sqrt{k_p}$（\cref{eq:bal-lambda}）。\cref{eq:bal-discr,eq:bal-lambda} 即其证明。
+\end{theorem}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth,scale=1.0]
+  \draw[->] (0,0)--(6.5,0) node[right,font=\scriptsize]{时间步 $k$};
+  \draw[->] (0,-1.15)--(0,2.35) node[above,font=\scriptsize]{偏差 $\Delta x_k$};
+  \draw[dashed,gray!60] (0,0)--(6.3,0);
+  % monotone real eigenvalues in (0,1): desired
+  \draw[main,very thick] plot[smooth] coordinates {(0,2)(0.7,1.4)(1.4,0.98)(2.1,0.69)(2.8,0.48)(3.5,0.34)(4.2,0.24)(4.9,0.17)(5.6,0.12)(6.2,0.08)};
+  \node[main,font=\scriptsize,align=left] at (4.45,1.05) {实根 $\lambda_{1,2}\in(0,1)$\\无振荡收敛（期望）};
+  % complex eigenvalues: oscillatory, undesired
+  \draw[third,very thick,densely dashed] plot[smooth] coordinates {(0,2)(0.6,1.05)(1.2,0.18)(1.9,-0.52)(2.6,-0.72)(3.3,-0.46)(4.0,-0.1)(4.7,0.16)(5.4,0.2)(6.2,0.08)};
+  \node[third,font=\scriptsize,align=left] at (2.95,-0.98) {复特征值 $\Rightarrow$ 振荡（不期望）};
+\end{tikzpicture}
+\caption{离散闭环 \cref{eq:bal-closed} 的两种收敛形态。实线：两特征值为 $(0,1)$ 内实数（临界阻尼，\cref{thm:bal-critical-damp}），偏差按指数\emph{单调}衰减——四足平衡控制器所求。虚线：特征值为复数，偏差\emph{振荡}衰减（机身来回晃），虽仍稳定但对四足不可取。这正是“要求实特征值”而非仅“要求模长 $<1$”的理由。}
+\label{fig:bal-convergence}
+\end{figure}
+
+\begin{insight}[离散极点配置：先定 $k_p$ 求速度、再由 \cref{eq:bal-kd} 算 $k_d$]\label{ins:bal-deadbeat}
+\cref{thm:bal-critical-damp} 给的是一套\emph{离散域}的极点配置纪律，三条要点值得记牢。其一，\textbf{重根 $\lambda=1-\Delta t\sqrt{k_p}$ 越小收敛越快}，故 $k_p$ 是“收敛速度旋钮”：先按所需快慢选 $k_p$，$k_d$ 不独立整定、而由 \cref{eq:bal-kd} \emph{算出}（临界阻尼一线绑定）。其二，\textbf{稳定上界 $k_p<1/(\Delta t)^2$ 在实践中几乎从不触发}：$500\,\mathrm{Hz}$（$\Delta t=0.002\,\mathrm{s}$）给 $k_p<250000$，远超常用值，故约束\emph{不紧}、可放心调大 $k_p$ 追速度，真正的上限来自关节力矩饱和与高频振荡（\cref{ins:must-penalize-u} 同理）。其三，\textbf{$k_d$ 含\emph{离散修正项} $-\tfrac{\Delta t}{2}k_p$}：连续域临界阻尼是 $k_d=2\sqrt{k_p}$，离散化多出的 $-\tfrac{\Delta t}{2}k_p$ 项在高频（小 $\Delta t$）时虽小却不可丢——丢掉它会让两特征值\emph{略偏复}、引入轻微振荡。把这套“位姿误差 $\to$ 期望加速度”的参考层与 MPC 摆在一起看：瞬时 QP 平衡控制器用它\emph{单步}生成 $\dot{\boldsymbol{v}}_s,\dot{\boldsymbol{\omega}}_s$ 再解 \cref{eq:srbd-matrix-unitree}；凸 MPC 则把同样的“跟踪期望位姿/速度”写进沿时域的 stage cost（\cref{eq:dicarlo-form} 的 $\|\boldsymbol{x}-\boldsymbol{x}^{\mathrm{ref}}\|_{\mathbf{Q}}^2$）——二者共享参考，区别只在 MPC 多了\emph{预测时域}这一维（\cref{ins:unitree-motivation}）。
+\end{insight}
+
+\paragraph{三轴合并。}
+把 $x,y,z$ 三轴的标量 PD 合成对角矩阵形式，即得机身位置反馈控制律\cite{unitree2023quadruped}：
+\begin{equation}
+  \ddot{\boldsymbol{p}}_s=\mathbf{K}_p\,\Delta\boldsymbol{p}+\mathbf{K}_d\,\Delta\dot{\boldsymbol{p}},
+  \qquad
+  \mathbf{K}_p=\mathrm{diag}(k_{px},k_{py},k_{pz}),\;\;
+  \mathbf{K}_d=\mathrm{diag}(k_{dx},k_{dy},k_{dz}).
+  \label{eq:bal-pos-3axis}
+\end{equation}
+这个 $\ddot{\boldsymbol{p}}_s=\dot{\boldsymbol{v}}_s$ 正是 \cref{eq:srbd-matrix-unitree} 右端第一块 $m(\dot{\boldsymbol{v}}_s-\boldsymbol{g})$ 所需的期望线加速度。
+
+\paragraph{\cnum{2} 姿态反馈：$\SO(3)$ 上的几何 PD。}
+与位置不同，机身姿态 $\mathbf{R}_{sb}\in\SO(3)$ \textbf{无法}分解到互不相关的 $x,y,z$ 三轴分别处理（欧拉角三轴的旋转轴随姿态变化、彼此不正交，\cref{ins:euler-small} 同源），必须作为一个整体看待。其 PD 控制要用到李群/李代数工具（\cref{ch:lie}）。需要的两件东西是“当前姿态到目标姿态的差”与“当前角速度到目标角速度的差”。\textbf{姿态差}：设当前姿态 $\mathbf{R}_{sb}$、目标姿态 $\mathbf{R}_d$，存在旋转 $\mathbf{R}_e$ 使 $\mathbf{R}_e\mathbf{R}_{sb}=\mathbf{R}_d$，取其指数坐标作为姿态偏差\cite{unitree2023quadruped}：
+\begin{equation}
+  \mathbf{R}_e=\mathbf{R}_d\mathbf{R}_{sb}^{-1}=\mathbf{R}_d\mathbf{R}_{sb}^{\top},
+  \qquad
+  \hat{\boldsymbol{\omega}}\theta=\log(\mathbf{R}_e)^{\vee}
+  \quad(\hat{\boldsymbol{\omega}}\ \text{单位转轴},\ \theta\ \text{转角}).
+  \label{eq:bal-att-error}
+\end{equation}
+几何意义（\cref{eq:R-kinematics} 的左/空间形式）：对当前姿态 $\mathbf{R}_{sb}$ \emph{左乘} $\mathbf{R}_e$ 得目标，即把 $\mathbf{R}_{sb}$ 绕\emph{世界系} $\{s\}$ 中的 $\hat{\boldsymbol{\omega}}$ 轴转 $\theta$ 角即达 $\mathbf{R}_d$，故 $\hat{\boldsymbol{\omega}}\theta$ 是一个无奇异的三维姿态误差向量。\textbf{P 控制}：让反馈角加速度沿误差轴、幅值正比于误差角\cite{unitree2023quadruped}：
+\begin{equation}
+  \dot{\boldsymbol{\omega}}_s=k_p\,\hat{\boldsymbol{\omega}}\theta=k_p\theta\,\hat{\boldsymbol{\omega}}
+  \qquad(k_p\ \text{为标量}).
+  \label{eq:bal-att-p}
+\end{equation}
+其几何意义是：既然绕 $\hat{\boldsymbol{\omega}}$ 轴旋转可接近 $\mathbf{R}_d$，就让反馈角加速度 $\dot{\boldsymbol{\omega}}_s$ 也沿 $\hat{\boldsymbol{\omega}}$、大小 $k_p\theta$，从而产生该轴向角速度驱使 $\mathbf{R}_{sb}\to\mathbf{R}_d$。\textbf{D 控制}：角速度差直接定义为 $\boldsymbol{\omega}_d-\boldsymbol{\omega}_s$\cite{unitree2023quadruped}：
+\begin{equation}
+  \dot{\boldsymbol{\omega}}_s=\mathbf{K}_d(\boldsymbol{\omega}_d-\boldsymbol{\omega}_s),
+  \qquad
+  \mathbf{K}_d=\mathrm{diag}(k_{dx},k_{dy},k_{dz}).
+  \label{eq:bal-att-d}
+\end{equation}
+注意此处 $k_p$ 是\emph{标量}（误差已是单一轴-角向量）、$\mathbf{K}_d$ 是\emph{对角矩阵}。二者叠加即机身姿态的 PD 控制\cite{unitree2023quadruped}：
+\begin{equation}
+  \boxed{\;\dot{\boldsymbol{\omega}}_s=k_p\,\hat{\boldsymbol{\omega}}\theta+\mathbf{K}_d(\boldsymbol{\omega}_d-\boldsymbol{\omega}_s)\;}.
+  \label{eq:bal-att-pd}
+\end{equation}
+只要机身产生该角加速度 $\dot{\boldsymbol{\omega}}_s$，姿态即收敛到 $\mathbf{R}_d$、角速度收敛到 $\boldsymbol{\omega}_d$；而 $\dot{\boldsymbol{\omega}}_s$ 正是 \cref{eq:srbd-matrix-unitree} 右端第二块 $\mathbf{R}_{sb}\mathbf{I}_b\mathbf{R}_{sb}^\top\dot{\boldsymbol{\omega}}_s$ 所需的期望角加速度。至此“位姿误差 $\to$ 期望加速度”的参考层闭合：位置给 $\ddot{\boldsymbol{p}}_s$（\cref{eq:bal-pos-3axis}）、姿态给 $\dot{\boldsymbol{\omega}}_s$（\cref{eq:bal-att-pd}），二者皆\emph{通过控制各足底力}实现——这就回到了 \cref{eq:srbd-matrix-unitree} 的 QP 足底力分配。
+
+\begin{insight}[几何 PD vs 欧拉角变基：同一姿态误差的两种合法写法]\label{ins:bal-geometric-pd}
+\cref{eq:bal-att-error} 的指数坐标姿态误差，与 \cref{ch:quad_wbc} WBC 任务 $2$ 用的\emph{欧拉角误差经 $\mathbf{T}(\boldsymbol{\Theta})$ 变基}（\cref{eq:qw-e2}）是\textbf{同一件事的两种合法表述}，并排看最透：
+\begin{itemize}
+  \item \textbf{本节·轴-角（指数坐标）}：误差 $\hat{\boldsymbol{\omega}}\theta=\log(\mathbf{R}_d\mathbf{R}_{sb}^\top)^\vee$ 直接活在 $\SO(3)$ 上，\emph{无奇异}、大姿态也成立，是“表示无关”的几何写法（与 \cref{ins:euler-small} 指出的几何 MPC 前沿同源）；
+  \item \textbf{WBC·欧拉角 $+\mathbf{T}(\boldsymbol{\Theta})$}：用最小三参数欧拉角误差 $\boldsymbol{\Theta}_d-\boldsymbol{\Theta}$ 再经 $\mathbf{T}(\boldsymbol{\Theta})$ 变到角速度基（\cref{eq:qw-e2}），实现简单但在俯仰 $\pm90^\circ$ 处 $\mathbf{T}$ 奇异。
+\end{itemize}
+两者都把“姿态误差”映成角速度基下的三维量去做 PD，小角度下数值接近。\textbf{与本书右扰动主线的接口}：\cref{eq:bal-att-error} 取的是 $\mathbf{R}_e=\mathbf{R}_d\mathbf{R}_{sb}^\top$，是一个\emph{左/世界系}误差（与本章一贯的空间角速度 $\boldsymbol{\omega}_s$ 自洽，\cref{note:spatial-omega}）；本书右扰动主线（\cref{ch:lie}）对应的\emph{机体系}误差应取 $\mathbf{R}_{sb}^\top\mathbf{R}_d$，其指数坐标给出机体系修正轴。选哪种取决于把 $\boldsymbol{\omega}$ 放在世界系还是机体系——四足平衡控制器把状态放世界系，故用左误差，与 MPC 一致。
+\end{insight}
+
+\begin{pitfall}[误区：把姿态也“三轴解耦 PD”、或把临界阻尼当连续域公式]
+两个易错点。其一，\textbf{切勿把姿态像位置那样拆成 roll/pitch/yaw 三个独立标量 PD}：欧拉角轴不正交、大角度强耦合，三轴独立 PD 会产生错误的交叉力矩、在大姿态下失稳甚至奇异——姿态必须用 \cref{eq:bal-att-pd} 的整体几何 PD。其二，\textbf{临界阻尼增益 $k_d=2\sqrt{k_p}-\tfrac{\Delta t}{2}k_p$ 是\emph{离散}结论}（\cref{eq:bal-kd}），别套用连续域的 $k_d=2\sqrt{k_p}$：漏掉离散修正项 $-\tfrac{\Delta t}{2}k_p$ 会让两特征值略偏复、引入轻微振荡（\cref{ins:bal-deadbeat}），高频控制环里这项虽小但系统性存在。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:bal-closed} 的 $\mathbf{A}$ 直接算 $\operatorname{tr}(\mathbf{A})$ 与 $\det(\mathbf{A})$，核对 \cref{eq:bal-chareq} 的 $b=-\operatorname{tr}(\mathbf{A})$、$c=\det(\mathbf{A})$。
+  \item 取 $\Delta t=0.002\,\mathrm{s}$、$k_p=400$，由 \cref{eq:bal-kd} 算 $k_d$ 与重根 $\lambda=1-\Delta t\sqrt{k_p}$；它离 $1$ 多近、收敛快还是慢？再取 $k_p=1600$ 比较。
+  \item 由 \cref{eq:bal-discr} 出发，写清“第一个方括号恒正、故第二个为零”这一步，独立解出 \cref{eq:bal-kd} 的 $k_d$。
+  \item （概念）为什么机身姿态不能像位置那样三轴解耦做 PD？用 \cref{ins:bal-geometric-pd} 的语言解释，并指出 \cref{eq:bal-att-error} 与 \cref{ch:quad_wbc} 的 \cref{eq:qw-e2} 在奇异性上的差异。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{实践：参数整定、求解器与部署}
+\label{sec:practice}
+
+理论之外，单刚体 MPC 能否在真机上跑稳，很大程度取决于几个\emph{需要实验整定}的参数——这正是 MPC 论文通常略过、却对工程落地至关重要的部分。本节凝练给出工程要点，不铺开纯工程细节。
+
+\paragraph{\cnum{1} 质量属性的实验整定（论文常略的工程关键）。}
+单刚体模型做了三重简化（单刚体 + 忽略陀螺项 + 静力学逆动力学近似），故质量属性需要在调试中“修修补补”\cite{unitree2023quadruped}：
+\begin{itemize}
+  \item \textbf{等效质量 $m$ 不等于整机/躯干质量}：足端附加质量由地面承担（不计入），腿上质量需关节克服（部分计入）。结论：$m$ 介于躯干质量与整机质量之间，\emph{靠实验定}——减小位置 PD 增益后让机器人站立，站太高则 $m$ 偏大需减小、站太低则增大。
+  \item \textbf{重心位置}：减小姿态 PD 增益后站立，若低头（后腿力大）说明重心偏后、需前移；抬头则后移。
+  \item \textbf{转动惯量 $\mathbf{I}_b$}：与重力无关、不能靠站立实验调，由三维软件得整机 $\mathbf{I}_w$、称重得 $m_w$，按质量比缩放\cite{unitree2023quadruped}：
+  \begin{equation}
+    \mathbf{I}_b=\mathbf{I}_w\cdot\frac{m}{m_w}.
+    \label{eq:inertia-scale}
+  \end{equation}
+\end{itemize}
+
+\paragraph{\cnum{2} 权重 $\mathbf{Q}/\mathbf{R}_u$ 与周期 $\Delta T$。}
+\cref{eq:Q-diag,eq:Ru} 给了可复现初值。整定经验：$\mathbf{Q}$ 中高度 $p_z$、姿态 $\phi,\theta$ 权重取大（跌倒最致命）；$\mathbf{R}_u$ 取小（$\sim10^{-5}$）以免过度抑制必要的支撑力，但需非零以防力饱和（\cref{ins:must-penalize-u}）。周期 $\Delta T=0.01\,\mathrm{s}$（$100\,\mathrm{Hz}$）是常用值；预测步数 $N_p$ 受 \cref{pit:horizon-bound} 上界约束（不超过半迈步周期），实践常取 $N_p\approx10$（对应约 $0.1\sim0.5\,\mathrm{s}$ 预测窗）。
+
+\begin{pitfall}[$\mathbf{Q}$ 权重应随机器人质量重标定]\label{pit:Q-mass-rescale}
+$\mathbf{Q}/\mathbf{R}_u$ 不是“调一次就通用”的常数：它们隐含地与机器人的\emph{质量、惯量量级}耦合（代价里跟踪误差与力 $\mathbf{f}\sim mg$ 的相对权衡随 $m$ 漂移）。一个常见的移植陷阱是把轻机器人的 $\mathbf{Q}$ 整套照抄到重机器人上而不重标定——例如把一台 $12.0\,\mathrm{kg}$ 平台的 $\mathbf{Q}$ 直接搬到一台 $14.7\,\mathrm{kg}$（$+22\%$）的同构机器人，姿态/高度跟踪的“硬度”相对支撑力就被悄悄稀释，表现为更软、更易在动态步态里积累漂移。\textbf{质量是一个守恒核对量}：移植后第一时间用三维软件/称重核对真实 $m,\mathbf{I}_w$（\cref{eq:inertia-scale}），并据此复查 $\mathbf{Q}$ 是否仍合理，比事后盲调稳定性参数更早定位问题。这条与 \cref{ch:quad_advanced} 中“对照实验 $+$ 不变量守恒核对优于盲调”的方法论一脉相承。
+\end{pitfall}
+
+\paragraph{\cnum{3} 求解器与时序。}
+标准形 \cref{eq:qp-standard} 用稠密 QP 求解器：经典实现用 \texttt{qpOASES}（C++ + Eigen）\cite{dicarlo2018cheetah,yu2021quadruped}，近年也常用 \texttt{OSQP}（ADMM、对大规模/温启动友好）。Di Carlo 报告在 MIT Cheetah 3 上预测窗约 $0.5\,\mathrm{s}$（约 10 步）、单次求解时间约 $<1\,\mathrm{ms}$、MPC 频率约 $20\sim30\,\mathrm{Hz}$，实现 trot/gallop/flying-trot/pace/bound/pronk 等多种步态与鲁棒变速行走\cite{dicarlo2018cheetah}。
+
+\begin{codebox}[text]{单刚体 MPC 单周期主循环（伪代码，纯 ASCII 注释）}
+# 输入: 当前状态估计 x0 (13 维), 期望轨迹 D, 步态相位 s_i, 落足点 r_i
+# 输出: 当前周期足端力 f_mpc
+
+for k in 0 .. Np-1:                     # 沿预测时域装配 LTV 模型
+    psi_k   = desired_yaw(k)            # 期望偏航 (规划器)
+    I_P_k   = Rz(psi_k) * I_body * Rz(psi_k)^T   # 世界系惯量 (式 inertia-transform)
+    A_k, B_k = build_discrete(psi_k, I_P_k, r_i(k), dt)   # 式 disc-AB
+stack A_qp, B_qp                        # 式 Aqp-Bqp
+
+H = 2*(B_qp^T * Q * B_qp + Ru)          # 式 H-g
+g = 2*B_qp^T * Q * (A_qp * x0 - D)
+C, c_lo, c_hi = assemble_friction()     # 式 qp-constraint (摩擦锥 + 幅值)
+
+drop_swing_legs(H, g, C, c_lo, c_hi)    # 降维: 剔除摆动腿零力变量 (式 dim-index)
+U = qp_solve(H, g, C, c_lo, c_hi)       # qpOASES / OSQP 解 式 qp-standard
+f_mpc = U[0 : 3*n_stance]               # 只取首步 (式 mpc-output)
+
+# 下游: tau_i = -J_i^T * R_sb^T * f_is  (逆动力学转关节力矩, 式 inverse-statics)
+\end{codebox}
+
+\begin{pitfall}[部署陷阱：状态估计漂移直接毒化 MPC]
+MPC 的预测从 $\boldsymbol{x}(0)$ 起步（\cref{eq:prediction}），而 $\boldsymbol{x}(0)$ 来自状态估计器（\cref{ch:eskf}）。四足缺乏全局位置观测，质心位置/速度主要靠足式里程计 + IMU 积分得到，\emph{容易漂移}。漂移的 $\boldsymbol{x}(0)$ 会让 MPC 在一个错误的“起点”上做正确的优化——力分配看似合理、实际却推着机器人偏离。工程上：(1) 位置/偏航这类不可直接观测的量在代价里权重不宜过大（\cref{eq:Q-diag} 中 $p_x,p_y$ 权重仅 $1$、偏航 $\psi$ 权重 $10$，远小于高度 $p_z$ 的 $100$）；(2) MPC 通常跟踪\emph{速度}指令而非绝对位置，把漂移影响降到最低。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （工程）按“减小 PD 后站立看站高/低头”流程，写出整定等效质量 $m$ 与重心位置的操作步骤（参 \cref{eq:inertia-scale} 之外的两条）。
+  \item 用 \cref{eq:inertia-scale} 把整机 $\mathbf{I}_w=\mathrm{diag}(0.2,0.5,0.6)$、$m_w=12\,\mathrm{kg}$ 缩放到等效质量 $m=10\,\mathrm{kg}$ 的 $\mathbf{I}_b$。
+  \item （概念）为什么 MPC 跟踪\emph{速度}比跟踪\emph{绝对位置}对状态漂移更鲁棒？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{延伸与前沿}
+\label{sec:frontier}
+
+\begin{paper}[Di Carlo et al., 凸 MPC 四足运动控制（IROS 2018）]\label{paper:dicarlo}
+\textbf{问题.}\;如何让四足在嵌入式 CPU 上\emph{实时}跑出高度动态的多种步态，而不必求解高维非线性全身动力学？\\
+\textbf{核心思想.}\;把整机近似为\emph{单刚体}（忽略腿动力学），以\emph{足底反作用力}为决策变量；用三处近似——忽略陀螺项、小横滚/俯仰角的欧拉角率线性映射 $\mathbf{R}_z^\top(\psi)$、重力增广为第 $13$ 状态——把动力学化为\emph{线性时变}模型，沿预测时域堆叠成\emph{凸 QP}（摩擦锥线性化为金字塔），用 \texttt{qpOASES} 实时求解、取首步施加。\\
+\textbf{关键结果.}\;在 MIT Cheetah 3\cite{bledt2018cheetah3} 上预测窗约 $0.5\,\mathrm{s}$、求解 $<1\,\mathrm{ms}$、$20\sim30\,\mathrm{Hz}$，实现 trot/gallop/bound/pronk 等步态与鲁棒变速。\\
+\textbf{与本书关系.}\;本章 \cref{sec:srbd,sec:convexify,sec:state-space,sec:prediction,sec:qp} 即此范式的逐式展开，其中角速度$\to$欧拉角映射等一手推导更为详尽\cite{yu2021quadruped}。\\
+\textbf{局限.}\;三处近似在大横滚/俯仰、强自旋时失真；步态时序须由外部调度器给定（否则非凸）。这两点正是几何 MPC 与混合整数/接触隐式方法要修的。
+\end{paper}
+
+\noindent 下面梳理单刚体 MPC 的历史脉络与最新进展。
+\begin{itemize}
+  \item \textbf{历史脉络}：从 Raibert 的落足启发式\cite{raibert1986legged}（落点 = 机身速度线性函数，至今作凸 MPC 落足初值/对照），到 Kajita 的 LIPM\cite{kajita2001lipm}（质点 + 无质量腿、解析步态），到 Orin 的质心动力学\cite{orin2013centroidal}（含角动量、一般非凸），再到 Di Carlo 的单刚体凸 MPC\cite{dicarlo2018cheetah}——见 \cref{tab:three-models} 与 \cref{sec:srbd} 的对照。
+  \item \textbf{分层 WBIC + MPC}\cite{kim2019wbic}：MPC（单刚体、低频）+ 全身脉冲控制 WBIC（高频、含全身动力学），是把单刚体 MPC 真正跑上高动态硬件的标准工业级架构（\cref{ins:control-stack} 的全貌）。
+  \item \textbf{几何 / 表示无关 MPC}\cite{ding2021repfree}（先驱 \cite{ding2019realtime}）：直接在 $\SO(3)$ 上用\emph{变分线性化}演化旋转矩阵，\emph{避开}欧拉角奇异与小角近似（修的正是 \cref{ins:euler-small} 的失真），仍化为实时 QP，能做更剧烈的翻滚/跳跃。
+  \item \textbf{综述与谱系}：Wensing 等的优化控制综述\cite{wensing2024legged} 系统对比 SRBD 凸 MPC、全质心非线性 MPC、全阶 NMPC。教学定位：\textbf{单刚体凸 MPC = 实时性与建模保真度折中的“甜点”}，是理解全谱系的基线。
+\end{itemize}
+
+\subsection{从凸 SRBD 到质心 NMPC：OCS2 这一档}
+\label{subsec:mpc-nmpc}
+
+上面把单刚体凸 MPC 钉在了简化谱系（\cref{tab:three-models}）的“甜点”位置。本小节往谱系\emph{右侧}再走一格：当我们\emph{不再}用“忽略陀螺项 $+$ 小角近似 $+$ 重力增广”三处线性化去换凸性，而是\emph{保留}完整的非线性质心动力学，凸 QP 就升级为\textbf{非线性 MPC（NMPC）}。工业级开源栈 \texttt{OCS2}/\allowbreak\texttt{legged\_control}\cite{grandia2022perceptive,sleiman2021unified} 正是这一档的代表。本书把 NMPC 的\emph{完整全栈实战}（数据流、移植、sim2real 调试）留到 \cref{ch:quad_advanced} 专章展开；这里只做\textbf{建模—约束—代价—求解四个维度的深度对照}，把“凸 SRBD 与质心 NMPC 各换回了什么”讲透——它正是 \cref{ins:com-simplify}“系统级取舍”观点在更高一档的延续。
+
+\paragraph{维度一·建模保真度：三处近似换回了什么。}
+本章 \cref{sec:convexify} 的三处线性化各自付出了\emph{保真度}、换来了\emph{凸性与实时性}。把它们与质心 NMPC 的对应处置并排（\cref{tab:srbd-vs-nmpc}），就看清两档的分水岭：质心 NMPC 用一个\textbf{$6$ 维质心动量}态（线动量 $+$ 角动量，沿用 \cref{sec:srbd} 提到的 Orin 质心动力学\cite{orin2013centroidal}）描述整机，保留了完整的姿态依赖与动量耦合，代价是动力学\emph{非线性}、每周期须做\emph{迭代}线性化求解。凸 SRBD 则把同一物理在三处“拍平”，换来一个每周期\emph{一次}凸 QP 即解的实时模型。
+
+\begin{table}[H]\centering\small
+\caption{凸 SRBD-MPC 与质心 NMPC 的逐维度对照（“换回什么”视角）}
+\begin{tabular}{p{0.21\textwidth} p{0.34\textwidth} p{0.34\textwidth}}
+\toprule
+维度 & 凸 SRBD-MPC（本章，\cref{sec:convexify}） & 质心 NMPC（OCS2 这一档） \\
+\midrule
+陀螺项 $\boldsymbol{\omega}\!\times\!(\mathbf{I}\boldsymbol{\omega})$ & \textbf{忽略}（\cref{ins:drop-gyro}），换线性欧拉方程 & \textbf{保留}，进非线性动力学 \\
+姿态表示 & 小角 ZYX 欧拉角率映射 $\mathbf{R}_z^\top(\psi)$（\cref{eq:euler-map-small}），大角失真 & 完整质心动量积分，无小角假设 \\
+重力 & 增广为第 $13$ 状态（\cref{ins:gravity-aug}）保线性 & 作非线性项直接进动力学 \\
+状态/输入维 & $13$ 维状态、$3\!\times\!n_{\text{stance}}$ 力 & 态 $24$（$\mathbf{h}_{\text{com}}6+\mathbf{q}_b6+\mathbf{q}_j12$）、输入 $24$（接触力 $12+$ 关节速度 $12$）\\
+求解 & 单次凸 QP（\cref{eq:qp-standard}） & 多重打靶 $+$ 迭代 SQP（见下） \\
+换得 / 代价 & \textbf{凸性、实时}；大角/强自旋失真 & \textbf{高保真}；非凸、单周期更贵 \\
+\bottomrule
+\end{tabular}
+\label{tab:srbd-vs-nmpc}
+\end{table}
+
+\begin{insight}[凸 SRBD 与质心 NMPC：不是优劣，而是“在哪一档付学费”]\label{ins:mpc-nmpc-compare}
+两档的差别不是“谁更好”，而是\textbf{把保真度的学费交在哪里}。凸 SRBD 把学费交在\emph{建模}（三处近似，但求解极廉），质心 NMPC 把学费交在\emph{求解}（每周期迭代线性化解非凸问题，但建模几乎无损）。选择取决于工况：大多数中等动态步态（trot/walk）下三处近似的失真可被反馈吸收（\cref{ins:com-simplify} 的“反馈补偿”），凸 SRBD 足够且省算力；而需要大姿态摆幅、含臂操作、强角动量耦合（如人形多接触）时，质心 NMPC 的保真度才物有所值。\cref{tab:three-models} 的“甜点”定位在此显出边界：甜点之所以甜，是因为它\emph{恰好}在多数四足工况下用最低算力买到了够用的保真度。
+\end{insight}
+
+\paragraph{维度二·约束表示：同一可行集的两层不同写法。}
+一个容易忽略却很能体现“分层”思想的细节是：\textbf{摩擦约束在 NMPC 层与 WBC 层用了\emph{两种不同的数学写法}去逼近\emph{同一个}物理可行集}。NMPC 层（OCS2）用\textbf{平滑摩擦锥}
+\begin{equation}
+  \mu\,F_z-\sqrt{F_x^2+F_y^2+\varepsilon^2}\ \ge\ 0,
+  \label{eq:smooth-friction-cone}
+\end{equation}
+其中 $\varepsilon$（与 $\mu/\delta$ 等松弛参数）把硬二阶锥软化成可微的 log-barrier，便于 SQP 的梯度/Hessian 计算（$\mu\approx0.3\!\sim\!0.5$）。而下游 WBC 层则把同一摩擦锥\emph{线性化}成\textbf{摩擦金字塔}（每支撑足 $5$ 行线性不等式，正是本章 \cref{eq:friction-matrix} 的金字塔内接思路、\cref{ins:pyramid}），喂给它的瞬时 QP。\textbf{为什么分两层写}：NMPC 是非线性求解器、要可微平滑锥；WBC 是线性 QP、要线性金字塔——\emph{同一可行集，按各层求解器的“口味”取不同近似}。这正是 \cref{ins:hard-soft} 软硬约束区分在跨层工程里的具体体现，WBC 侧的 $42$ 维 QP 与各 task 的精确写法见 \cref{ch:quad_wbc}。
+
+\paragraph{维度三·代价构造：参考力取 $mg$ 消除模型偏置。}
+质心 NMPC 的代价是标准二次跟踪 $\tfrac12\|\mathbf{x}-\mathbf{x}_{\text{ref}}\|_{\mathbf{Q}}^2+\tfrac12\|\mathbf{u}-\mathbf{u}_{\text{ref}}\|_{\mathbf{R}_u}^2$，与本章 \cref{eq:dicarlo-form} 同构（NMPC 标准形的具体维度见 \cref{ch:quad_prac} 已建立的 \cref{eq:qp-nmpc}，此处不复述）。一个值得点出的工程细节：\textbf{输入参考 $\mathbf{u}_{\text{ref}}$ 不取零，而取“配平输入”}——即让四足静止悬停所需的、各支撑足竖直分力之和恰好抵消重力的那组力（\emph{weight-compensating input}，幅值 $\sim mg$）。这样做的意义是：代价在\emph{平衡点}处对力的惩罚为零，模型\emph{不会}莫名其妙地偏好“总支撑力小于 $mg$”的解。若误把 $\mathbf{u}_{\text{ref}}$ 取零，代价会把“零支撑力”当成最省、引入一个 below-$mg$ 的系统性偏置——这正是 \cref{ch:quad_advanced} 里一桩“支撑力似乎不足”的红鲱鱼之所以是\emph{假象}的根因：模型本身无此偏置。
+
+\paragraph{维度四·求解链与 RTI 实时机理（本章谱系的算力收口）。}
+凸 SRBD 每周期解一个凸 QP（\cref{sec:qp}）即可；质心 NMPC 的非凸问题则要一条更长的求解链：\textbf{多重打靶}（把长时域切成若干段、各段独立积分，端点用连续性约束缝合）$\to$ \textbf{SQP}（在当前轨迹处线性化，得线性二次（LQ）子问题）$\to$ \textbf{HPIPM} 求解该 QP 子问题（沿时域做 Riccati 递归一遍解出）$\to$ 滤波线搜索 $\to$ \textbf{warm-start}（用上周期解作下周期初值）。完整跑若干次 SQP 迭代到收敛，单周期开销远超 $10\,\mathrm{ms}$ 预算。\textbf{NMPC 之所以能实时，靠的不是把它解到收敛，而是\emph{每周期只做一次} Newton/SQP 步}——这就是\textbf{实时迭代（Real-Time Iteration, RTI）}\cite{diehl2002realtime,gros2020linear}：每个采样时刻只走一次 SQP 迭代，靠周期间 warm-start 的连续性逐步逼近最优，并把求解拆成“预备相（线性化、可提前算）$+$ 反馈相（拿到最新状态后只解 QP）”两段以消除反馈延迟（对应 OCS2 配置中的 \texttt{sqpIteration=1}）。
+
+\begin{insight}[“加核救不了串行 solver”：实时的加速是\emph{少算}而非\emph{多算并行}]\label{ins:mpc-rti}
+RTI 揭示了一条实时最优控制里反直觉、却极重要的机理：\textbf{增加 CPU 核数并不能让一个昂贵的 NMPC 变实时}。原因要拆开 SQP 的两部分看其\emph{可并行性}：
+\begin{itemize}
+  \item \textbf{LQ 近似 / 线性化}（沿时域对每个节点算动力学雅可比、代价 Hessian）是\emph{逐节点独立}的，$\Rightarrow$ embarrassingly parallel——加线程近似线性提速（实测某栈线程 $3\!\to\!6$：约 $2.0\!\to\!1.25\,\mathrm{ms}$）；线搜 rollout 同样可并行。
+  \item \textbf{HPIPM 解 QP} 的 Riccati 递归沿时域\emph{前后依赖}（第 $k$ 步的因式分解依赖第 $k\!+\!1$ 步的代价-到-去），\emph{本质串行} $\Rightarrow$ 存在一个\textbf{并行地板}（实测约 $0.29\,\mathrm{ms}$，再加核也压不下去）。
+\end{itemize}
+于是若硬把 \texttt{sqpIteration} 设成 $10$ 去“求收敛”，单周期会被串行的 Riccati $\times10$ 顶到 $\sim13\,\mathrm{ms}$（$>10\,\mathrm{ms}$ 预算），\emph{无论几核}都救不回——求解器喂出滞后（stale）的策略，宏观表现为“边缘稳定/缓慢漂移”。\textbf{正解是 \texttt{sqpIteration=1}（RTI）：用\emph{少算}（每周期一迭代 $+$ warm-start）换实时，而不是用多核去并行一个串行地板。}这条“加核救不了串行 solver”的实证，与“相机软渲染加核\emph{确实}能救”恰成镜像——同是算力受限，要先分清瓶颈是否\emph{可并行}。完整的侦探故事（一桩 \texttt{sqpIteration=10} 诊断 crutch 如何把无数下游症状误判为模型不对称）见 \cref{ch:quad_advanced}，那里也给出“\texttt{mpcTimer} 的 Max/Avg $<$ 周期预算”这一判据。RTI 仍不够准时的进一步提速菜单（GNRK 高效离散化、Multi-level RTI、partial condensing、move-blocking）属数值最优控制专题，可参 \cite{gros2020linear,frison2020hpipm}。
+\end{insight}
+
+\paragraph{维度五·ReferenceManager 在线更新：步态如何\emph{不进}优化地喂给 horizon。}
+最后一处与本章 \cref{ins:selection-matrix} 直接呼应：质心 NMPC 同样\emph{不把}“哪条腿何时触地”作为决策变量（否则非凸/混合整数），而是由一个独立的\textbf{参考管理器}（OCS2 的 \texttt{SwitchedModelReferenceManager} $=$ 步态时序表 \texttt{GaitSchedule} $+$ 摆动足轨迹规划 \texttt{SwingTrajectoryPlanner}）在线生成、并在每个 MPC 周期把\emph{接触序列}（模式时间表 ModeSchedule）与\emph{摆动足 $z$ 曲线}注入整个预测 horizon。其 \texttt{getContactFlags($t$)} 在任意预测时刻给出当前是哪几条腿支撑——这恰是本章选择矩阵 $\mathbf{D}_i$（\cref{eq:dicarlo-form} 的摆动腿零力约束）在 NMPC 里的\emph{工业级实现}：步态由有限状态机给定、摆动足轨迹由独立规划器给定，优化器只在\emph{给定接触序列下}解力与运动。
+
+\begin{insight}[ReferenceManager $=$“凸/可解的前提”的工业级实例]\label{ins:mpc-refmgr}
+\cref{ins:selection-matrix} 的核心论断——“步态时序由外部调度器给、不进优化，才保住凸性”——在 OCS2 这里得到了一个干净的工程印证：把接触序列\emph{外置}到 ReferenceManager，是\emph{凸 SRBD 与质心 NMPC 两档共享}的结构性前提。差别只在 SRBD 用它装配每步的选择矩阵 $\mathbf{D}_i$、NMPC 用它注入 ModeSchedule $+$ 摆动 $z$ 曲线；\emph{把接触也作决策}则两档都会退化为非凸（含整数变量）的接触隐式/混合整数问题。这说明“接触序列外置”不是凸 SRBD 的权宜之计，而是\textbf{当前所有实时腿足 MPC（凸的或非线性的）共同的设计选择}：在线优化\emph{力与轨迹}、把\emph{何时触地}交给规划层。完整的步态调度、模式编号与目标轨迹生成数据流见 \cref{ch:quad_advanced}。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+欠驱是控制器/硬件缺陷 & 间歇接触运动的内禀属性，须提前规划（\cref{def:underactuated}）\\
+WBC 强大，足以做动态步态 & WBC 只解瞬时力、无预测性，相位切换处无法准备（\cref{ins:wbc-no-predict}）\\
+单刚体是“偷懒近似” & 建模—硬件—反馈三位一体的系统级取舍（\cref{ins:com-simplify}）\\
+忽略陀螺项 = 丢了全部惯量耦合 & 只丢 $\boldsymbol{\omega}$ 的二次项，惯量 ${}^{\mathcal{P}}\mathbf{I}$ 及其姿态依赖仍保留（\cref{ins:drop-gyro}）\\
+角速度就是欧拉角的导数 $\boldsymbol{\omega}=\dot{\boldsymbol{\Theta}}$ & 差一个映射，小角时 $\dot{\boldsymbol{\Theta}}\approx\mathbf{R}_z^\top(\psi)\boldsymbol{\omega}$（\cref{eq:euler-map-small}）\\
+摩擦金字塔与摩擦锥等价 & 内接金字塔是各向异性、保守的子集（\cref{ins:pyramid}）\\
+取外切金字塔也行 & 外切会允许越过摩擦锥的解、有打滑风险；须取内接（\cref{ins:pyramid}）\\
+重力让系统非线性 & 重力是仿射项，增广为第 13 状态即恢复线性（\cref{ins:gravity-aug}）\\
+只跟踪误差就够了 & 必须加力正则，否则执行器饱和、反馈灾难（\cref{ins:must-penalize-u}）\\
+摩擦锥/幅值进代价 & 它们是硬约束、进不等式；力正则才进代价（\cref{ins:hard-soft}）\\
+预测时域越长越好 & 受“支撑期足底不变”约束，不超过半迈步周期（\cref{pit:horizon-bound}）\\
+把整段 $\mathbf{U}$ 都施加出去 & 只取首步、下周期重解，才有反馈（\cref{eq:mpc-output}）\\
+瞬时 QP 与 MPC 是两回事 & 瞬时 QP 是 MPC 的 $N_p=1$ 退化（\cref{ins:unitree-motivation}）\\
+步态时序也该由 MPC 优化 & 那会变非凸（混合整数）；时序由外部调度器给（\cref{ins:selection-matrix}）\\
+MPC 直接输出关节力矩 & MPC 输出足端虚拟力，逆动力学转关节力矩（\cref{ins:control-stack}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\mathbf{R}\in\SO(3)$ & 机身姿态旋转矩阵 & \cref{eq:R-kinematics} \\
+$\boldsymbol{\Theta}=[\phi,\theta,\psi]^\top$ & ZYX 欧拉角（roll/pitch/yaw） & \cref{def:underactuated} 后 \\
+$(\cdot)^\wedge,(\cdot)^\vee$ & 反对称化 / 其逆 & \cref{eq:euler-linear} \\
+${}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}$ & 世界系空间角速度（$\dot{\mathbf{R}}\mathbf{R}^\top=\boldsymbol{\omega}^\wedge$） & \cref{eq:R-kinematics} \\
+${}^{\mathcal{O}}\boldsymbol{p}_{com},\dot{\boldsymbol{p}}_{com}$ & 质心位置 / 速度（世界系） & \cref{eq:newton} \\
+$\mathbf{f}_i\in\mathbb{R}^3$ & 第 $i$ 腿足底反力（GRF，决策变量） & \cref{eq:newton} \\
+$\boldsymbol{r}_i=\boldsymbol{p}_i-\boldsymbol{p}_{com}$ & 质心指向第 $i$ 足端向量 & \cref{eq:euler-angmom} \\
+${}^{\mathcal{B}}\mathbf{I},{}^{\mathcal{P}}\mathbf{I}$ & 本体系 / 定向本体系惯性张量 & \cref{eq:inertia-transform} \\
+$s_i\in\{0,1\}$ & 第 $i$ 腿接触布尔量（1 支撑/0 摆动） & \cref{eq:swing-zero} \\
+$\mu,f_{\max}$ & 摩擦系数 / 法向力上限 & \cref{eq:normal-bound} \\
+$\mathbf{C}_i,\underline{\mathbf{c}}_i,\overline{\mathbf{c}}_i$ & 摩擦锥 + 幅值约束矩阵与上下界 & \cref{eq:friction-matrix} \\
+$\boldsymbol{x}\in\mathbb{R}^{13}$ & 状态 $[\boldsymbol{\Theta};\boldsymbol{p};\boldsymbol{\omega};\dot{\boldsymbol{p}};g]$（重力增广） & \cref{eq:cont-13state} \\
+$\boldsymbol{u}\in\mathbb{R}^{12}$ & 控制 $[\mathbf{f}_1;\dots;\mathbf{f}_4]$ & \cref{eq:cont-13state} \\
+$\mathbf{A}_c,\mathbf{B}_c$ / $\mathbf{A}_k,\mathbf{B}_k$ & 连续 / 离散系统矩阵（LTV） & \cref{eq:cont-compact,eq:disc-AB} \\
+$N_p,N_c$ & 预测时域 / 控制时域步数 & \cref{ins:horizon-tradeoff} \\
+$\mathbf{X},\mathbf{U},\mathbf{D}$ & 堆叠状态 / 控制 / 期望轨迹 & \cref{eq:prediction} \\
+$\mathbf{A}_{qp},\mathbf{B}_{qp}$ & 自由响应 / 强迫响应堆叠矩阵 & \cref{eq:Aqp-Bqp} \\
+$\mathbf{Q},\mathbf{R}_u$ & 状态跟踪 / 力正则权重（非旋转 $\mathbf{R}$） & \cref{eq:Q-diag,eq:Ru} \\
+$\mathbf{H},\mathbf{g}$ & QP 海森矩阵 / 梯度向量 & \cref{eq:H-g} \\
+$\mathbf{D}_i$ & 选择矩阵（摆动腿零力） & \cref{eq:dicarlo-form} \\
+$\Delta T,\Delta t$ & MPC 周期 / 其他控制环周期 & \nameref{ch:notation} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{公式速查表}
+\begin{tabular}{lll}
+\toprule
+公式 / 结论 & 一句话说明 & 对应 \\
+\midrule
+牛顿平动 \cref{eq:newton} & $\ddot{\boldsymbol{p}}=\tfrac1m\sum\mathbf{f}_i+\boldsymbol{g}$ & 平动动力学 \\
+欧拉转动（完整）\cref{eq:euler-full} & 含陀螺项 $\boldsymbol{\omega}^\wedge\mathbf{I}\boldsymbol{\omega}$ & \cref{subsec:srbd-full-derivation} \\
+姿态运动学 \cref{eq:R-kinematics} & $\dot{\mathbf{R}}=\boldsymbol{\omega}^\wedge\mathbf{R}$（世界系） & \cref{note:spatial-omega} \\
+惯量变换 \cref{eq:inertia-transform} & $\mathbf{I}_s=\mathbf{R}\mathbf{I}_b\mathbf{R}^\top$ & \cref{exam:inertia} \\
+线性欧拉 \cref{eq:euler-linear} & 丢陀螺项 $\Rightarrow$ 对 $\mathbf{f}_i$ 线性 & \cref{ins:drop-gyro} \\
+欧拉角率映射 \cref{eq:euler-map-small} & $\dot{\boldsymbol{\Theta}}\approx\mathbf{R}_z^\top(\psi)\boldsymbol{\omega}$（小角） & \cref{ins:euler-small} \\
+摩擦金字塔 \cref{eq:friction-matrix} & $\underline{\mathbf{c}}_i\le\mathbf{C}_i\mathbf{f}_i\le\overline{\mathbf{c}}_i$ & \cref{ins:pyramid} \\
+13 维状态方程 \cref{eq:cont-13state} & 重力增广为第 13 态 & \cref{ins:gravity-aug} \\
+前向欧拉离散 \cref{eq:disc-AB} & $\mathbf{A}_k=\mathbf{I}+\Delta T\mathbf{A}_c$ & \cref{ins:Ak-known} \\
+预测方程 \cref{eq:prediction} & $\mathbf{X}=\mathbf{A}_{qp}\boldsymbol{x}_0+\mathbf{B}_{qp}\mathbf{U}$ & \cref{eq:Aqp-Bqp} \\
+QP 标准形 \cref{eq:qp-standard} & $\min\tfrac12\mathbf{U}^\top\mathbf{H}\mathbf{U}+\mathbf{U}^\top\mathbf{g}$ & \cref{ins:qp-essence} \\
+QP 闭式解 \cref{eq:qp-closed-form} & $(\mathbf{M}^\top\mathbf{P}\mathbf{M}+\mathbf{W})^{-1}\mathbf{M}^\top\mathbf{P}\mathbf{s}$ & 无约束情形 \\
+MPC 输出 \cref{eq:mpc-output} & 取首步 $\mathbf{f}^{\mathrm{MPC}}=\boldsymbol{u}(0)$ & 滚动 \\
+逆动力学 \cref{eq:inverse-statics} & $\boldsymbol{\tau}_i=-\mathbf{J}_i^\top\mathbf{R}_{sb}^\top\mathbf{f}_{is}$ & \cref{ins:control-stack} \\
+平衡器位置 PD \cref{eq:bal-pos-3axis} & $\ddot{\boldsymbol{p}}_s=\mathbf{K}_p\Delta\boldsymbol{p}+\mathbf{K}_d\Delta\dot{\boldsymbol{p}}$ & \cref{subsec:bal-feedback} \\
+临界阻尼增益 \cref{eq:bal-kd} & $k_d=2\sqrt{k_p}-\tfrac{\Delta t}{2}k_p,\;k_p<\tfrac{1}{(\Delta t)^2}$ & \cref{thm:bal-critical-damp} \\
+姿态几何 PD \cref{eq:bal-att-pd} & $\dot{\boldsymbol{\omega}}_s=k_p\hat{\boldsymbol{\omega}}\theta+\mathbf{K}_d(\boldsymbol{\omega}_d-\boldsymbol{\omega}_s)$ & \cref{ins:bal-geometric-pd} \\
+惯量缩放 \cref{eq:inertia-scale} & $\mathbf{I}_b=\mathbf{I}_w\,m/m_w$ & \cref{sec:practice} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 间歇欠驱与预测必要性 & 支撑线欠驱、飞行相须预备 $\Rightarrow$ MPC & \(\bigstar\bigstar\) \\
+2 & 单刚体简化 & 建模—硬件—反馈三位一体；三模型对照 & \(\bigstar\bigstar\) \\
+3 & 三条动力学方程 & 牛顿 + 欧拉 + $\dot{\mathbf{R}}=\boldsymbol{\omega}^\wedge\mathbf{R}$，密度积分推 & \(\bigstar\bigstar\bigstar\) \\
+4 & 忽略陀螺项 & 小角速度 $\Rightarrow$ 线性欧拉，为凸牺牲耦合 & \(\bigstar\bigstar\bigstar\) \\
+5 & 惯量世界系变换 & $\mathbf{I}_s=\mathbf{R}\mathbf{I}_b\mathbf{R}^\top$，随姿态变 & \(\bigstar\bigstar\bigstar\) \\
+6 & 欧拉角率映射 & 小角近似 $\mathbf{R}_z^\top(\psi)$，仅依赖偏航 & \(\bigstar\bigstar\bigstar\) \\
+7 & 摩擦锥线性化 & 内接金字塔、保守严格不打滑 & \(\bigstar\bigstar\bigstar\) \\
+8 & 13 维状态 + 重力增广 & 仿射项吸收进线性结构 & \(\bigstar\bigstar\bigstar\) \\
+9 & 前向欧拉离散化 & $\mathbf{A}_k,\mathbf{B}_k$；LTV 按 $\psi$ 装配 & \(\bigstar\bigstar\bigstar\) \\
+10 & 预测方程堆叠 & $\mathbf{X}=\mathbf{A}_{qp}\boldsymbol{x}_0+\mathbf{B}_{qp}\mathbf{U}$ & \(\bigstar\bigstar\bigstar\bigstar\) \\
+11 & 预测/控制时域 & 看得远 vs 算得快；控制量冻结 & \(\bigstar\bigstar\bigstar\) \\
+12 & QP 化与闭式解 & $\tfrac12\mathbf{U}^\top\mathbf{H}\mathbf{U}+\mathbf{U}^\top\mathbf{g}$；二次型唯一最优 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+13 & 降维与取首步 & 剔摆动腿零力；滚动取 $\boldsymbol{u}(0)$ & \(\bigstar\bigstar\bigstar\) \\
+14 & 与瞬时 QP/WBC 关系 & 瞬时 QP = $N_p{=}1$ 退化；MPC+WBC 分层 & \(\bigstar\bigstar\bigstar\) \\
+15 & 工程整定 & 质量/重心/惯量实验定；权重/求解器 & \(\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{奠基范式}：Di Carlo 等\cite{dicarlo2018cheetah}（IROS 2018）——单刚体凸 MPC 的标准范式，本章主线的直接出处；硬件平台见 Bledt 等\cite{bledt2018cheetah3}。
+  \item \textbf{一手详尽推导}：于宪元《基于稳定性的仿生四足机器人控制系统设计》\cite{yu2021quadruped}（北航硕论，2021）——含角速度$\to$ZYX 欧拉角映射 §3.2.5 等 $65$ 式逐步推导，本章理论主线据此展开。
+  \item \textbf{工程落地与瞬时 QP 对照}：宇树《四足机器人控制算法》\cite{unitree2023quadruped}——SRBD 从密度积分起的完整推导、平衡控制器（瞬时 QP = $N_p{=}1$ 退化）、质量属性实验整定，配套 \texttt{unitree\_guide} 开源代码。
+  \item \textbf{分层架构}：Kim 等\cite{kim2019wbic}——MPC + 全身脉冲控制 WBIC，把单刚体 MPC 跑上高动态硬件的工业级架构。
+  \item \textbf{几何 / 表示无关 MPC}：Ding 等\cite{ding2021repfree}（先驱 \cite{ding2019realtime}）——直接在 $\SO(3)$ 上变分线性化，避开欧拉角奇异，修本章 \cref{ins:euler-small} 的失真。
+  \item \textbf{综述与谱系}：Wensing 等\cite{wensing2024legged}（T-RO 2024）——动态腿式机器人优化控制的系统综述（SRBD 凸 MPC / 全质心 NMPC / 全阶 NMPC 谱系）；简化模型源头见 Raibert\cite{raibert1986legged}、Kajita\cite{kajita2001lipm}、Orin\cite{orin2013centroidal}。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+相关章节 & 关系 & 本章接口 \\
+\midrule
+\cref{ch:lie} 李群与李代数 & 提供 $\dot{\mathbf{R}}=\boldsymbol{\omega}^\wedge\mathbf{R}$、$(\cdot)^\wedge$ & \cref{eq:R-kinematics,note:spatial-omega} \\
+\cref{ch:rigid_body} 刚体运动 & 提供 ZYX 欧拉角、$\mathbf{R}_x,\mathbf{R}_y,\mathbf{R}_z$ & \cref{eq:euler-rate-to-omega} \\
+\cref{ch:eskf} 误差状态滤波 & 提供 MPC 的当前状态 $\boldsymbol{x}(0)$ & \cref{eq:prediction} 起点 \\
+\cref{ch:control} 控制导论 & MPC/LQR 一般理论、$N_c{<}N_p$ 堆叠 & \cref{note:Nc-eq-Np} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：QP \emph{无解 / 求解器报 infeasible}。\textbf{排查}：检查摩擦锥约束是否与“必须支撑住体重”冲突（$\mu$ 太小、$f_{\max}$ 太小）；检查降维（\cref{eq:dim-index}）是否误剔了支撑腿的力变量；确认 $\mathbf{R}_u\succ0$ 使 $\mathbf{H}$ 正定（\cref{eq:H-g}）。
+  \item \textbf{症状}：机器人\emph{站不稳 / 站高站低}。\textbf{原因}：等效质量 $m$ 整定不当（\cref{sec:practice}）。\textbf{对策}：减小 PD 后站立，站太高减小 $m$、站太低增大；重心偏则按低头/抬头前移/后移。
+  \item \textbf{症状}：高速时机身\emph{姿态发散 / 翻车}。\textbf{原因}：陀螺项忽略（\cref{ins:drop-gyro}）或小角近似（\cref{ins:euler-small}）在大角速度/大俯仰下失真。\textbf{对策}：降低速度，或改用几何/$\SO(3)$ MPC\cite{ding2021repfree}。
+  \item \textbf{症状}：足端力\emph{抖振 / 电机过热}。\textbf{原因}：力正则权重 $\mathbf{R}_u$ 太小（\cref{ins:must-penalize-u}）或缺力差分平滑。\textbf{对策}：适当增大 $\mathbf{R}_u$，或在代价加 $(\mathbf{f}-\mathbf{f}_{\text{prev}})$ 平滑项（即 \cref{eq:unitree-qp-cost} 第三项的差分平滑）。
+  \item \textbf{症状}：预测越走越偏 / \emph{长时域反而变差}。\textbf{原因}：预测时域超过半迈步周期、违反“支撑期足底不变”（\cref{pit:horizon-bound}）。\textbf{对策}：缩短 $N_p$ 到半迈步周期内；或在时域内更新落足点。
+  \item \textbf{症状}：仿真好、\emph{真机偏移}。\textbf{原因}：状态估计漂移毒化 $\boldsymbol{x}(0)$（\cref{sec:practice} 部署陷阱）。\textbf{对策}：跟踪速度而非绝对位置；降低位置/偏航在 $\mathbf{Q}$ 中的权重。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section{本章推导附录}
+\label{sec:appendix-deriv}
+
+\begin{derivation}[角速度$\to$ZYX 欧拉角率映射的完整逆矩阵验证（\cref{eq:omega-to-euler-rate}）]\label{deriv:euler-inverse}
+\cref{eq:euler-rate-to-omega} 给出 $\boldsymbol{\omega}=\mathbf{T}(\boldsymbol{\Theta})\dot{\boldsymbol{\Theta}}$，其中
+\[
+  \mathbf{T}=\begin{bmatrix} c_\theta c_\psi & -s_\psi & 0 \\ c_\theta s_\psi & c_\psi & 0 \\ -s_\theta & 0 & 1 \end{bmatrix}.
+\]
+直接验证 \cref{eq:omega-to-euler-rate} 的 $\mathbf{T}^{-1}$：
+\[
+  \mathbf{T}^{-1}=\begin{bmatrix} c_\psi/c_\theta & s_\psi/c_\theta & 0 \\ -s_\psi & c_\psi & 0 \\ c_\psi s_\theta/c_\theta & s_\psi s_\theta/c_\theta & 1 \end{bmatrix}.
+\]
+计算 $\mathbf{T}^{-1}\mathbf{T}$：第 $(1,1)$ 元 $=\tfrac{c_\psi}{c_\theta}c_\theta c_\psi+\tfrac{s_\psi}{c_\theta}c_\theta s_\psi+0=c_\psi^2+s_\psi^2=1$；第 $(1,2)$ 元 $=\tfrac{c_\psi}{c_\theta}(-s_\psi)+\tfrac{s_\psi}{c_\theta}c_\psi+0=0$；第 $(3,1)$ 元 $=\tfrac{c_\psi s_\theta}{c_\theta}c_\theta c_\psi+\tfrac{s_\psi s_\theta}{c_\theta}c_\theta s_\psi+1\cdot(-s_\theta)=s_\theta(c_\psi^2+s_\psi^2)-s_\theta=0$。其余元类似可得，故 $\mathbf{T}^{-1}\mathbf{T}=\mathbf{I}_3$，即 \cref{eq:omega-to-euler-rate} 成立。当 $\phi,\theta$ 小（$c_\theta\to1,s_\theta\to0$）时第三行的 $s_\theta$ 项消失、$c_\theta\to1$，退化为 \cref{eq:euler-map-small} 的 $\mathbf{R}_z^\top(\psi)$。
+\end{derivation}
+
+\begin{derivation}[控制时域冻结后的系数合并（\cref{note:Nc-eq-Np} 的一般情形）]\label{deriv:freeze}
+当 $N_c<N_p$ 时，$[k{+}N_c,k{+}N_p]$ 段控制量冻结：$\boldsymbol{u}_{k+N_c}=\dots=\boldsymbol{u}_{k+N_p-1}=\boldsymbol{u}_{k+N_c-1}$。以输出预测的某一步为例（设系统时不变 $\mathbf{A}_k\equiv\mathbf{A},\mathbf{B}_k\equiv\mathbf{B},\mathbf{C}_k\equiv\mathbf{C}$ 以看清结构），脱离控制时域第一步：
+\[
+  \boldsymbol{z}_{k+N_c+1}=\mathbf{C}\mathbf{A}^{N_c+1}\boldsymbol{x}_k+\big[\mathbf{C}\mathbf{A}^{N_c}\mathbf{B}\;\cdots\;\mathbf{C}\mathbf{A}^2\mathbf{B}\;\;\mathbf{C}(\mathbf{A}+\mathbf{I})\mathbf{B}\big]\mathbf{U},
+\]
+末块由原本的两项 $\mathbf{C}\mathbf{A}\mathbf{B}$（来自 $\boldsymbol{u}_{k+N_c}$）与 $\mathbf{C}\mathbf{B}$（来自 $\boldsymbol{u}_{k+N_c-1}$）因二者相等而\emph{合并}为 $\mathbf{C}(\mathbf{A}+\mathbf{I})\mathbf{B}$。更一般地，预测到第 $j$ 步（$j>N_c$）的末块为
+\[
+  \mathbf{C}\big(\mathbf{A}^{j-N_c}+\mathbf{A}^{j-N_c-1}+\cdots+\mathbf{A}+\mathbf{I}\big)\mathbf{B}=\mathbf{C}\,\bar{\mathbf{A}}_{j,N_c}\,\mathbf{B},\quad\bar{\mathbf{A}}_{j,N_c}:=\sum_{l=0}^{j-N_c}\mathbf{A}^l,
+\]
+即对同一冻结控制量的多步累积响应之和。这样优化变量维度锁死在 $N_c$ 个、与 $N_p$ 无关（\cref{ins:horizon-tradeoff}），堆叠后仍是 \cref{eq:qp-standard} 的 QP 标准形。完整的逐步堆叠推导见 \cref{ch:control}。
+\end{derivation}
+
+\begin{derivation}[陀螺项作为高阶小量的量级分析（\cref{ins:drop-gyro} 的定量依据）]\label{deriv:gyro-order}
+被忽略的陀螺项是 ${}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}^{\wedge}\,{}^{\mathcal{P}}\mathbf{I}\,{}^{\mathcal{O}}\boldsymbol{\omega}_{\mathcal{OB}}$（\cref{eq:angmom-dot}）。设角速度量级为 $\|\boldsymbol{\omega}\|\sim\epsilon$、惯量量级 $\|\mathbf{I}\|\sim O(1)$，则陀螺项量级 $\sim\|\mathbf{I}\|\,\|\boldsymbol{\omega}\|^2\sim O(\epsilon^2)$；而保留的 ${}^{\mathcal{P}}\mathbf{I}\,\dot{\boldsymbol{\omega}}$ 项在角加速度量级 $\|\dot{\boldsymbol{\omega}}\|\sim O(1)$ 时为 $O(1)$。故两者之比 $\sim O(\epsilon^2)$：当机身角速度小（$\epsilon\ll1$）时陀螺项是\emph{二阶}小量，相对主项可忽略。四足平稳行走时机身角速度通常 $\lesssim1\,\mathrm{rad/s}$，该近似成立；剧烈翻滚（$\|\boldsymbol{\omega}\|$ 大）时则不再成立，须保留陀螺项或改用几何 MPC\cite{ding2021repfree}。这与宇树“四足正常运动 $\boldsymbol{\omega}_b$ 很小、直接忽略 $[\boldsymbol{\omega}_b]_\times\mathbf{I}_b\boldsymbol{\omega}_b$”的工程判断一致\cite{unitree2023quadruped}。
+\end{derivation}

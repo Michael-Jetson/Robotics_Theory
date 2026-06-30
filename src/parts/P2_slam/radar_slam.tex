@@ -1,0 +1,795 @@
+\chapter{雷达 SLAM}
+\label{ch:radar}
+
+% ════════════════════════════════════════════════════════════════
+%  本章：吸收 SLAM Handbook ch9（Radar SLAM）
+%  + Kellner/Doer-Trommer 多普勒里程计 + Kramer 雷达-惯性因子图
+%  + Adolfsson CFEAR/TBV-SLAM + Burnett 连续时间雷达 + 4DRadarSLAM/4D iRIOM。
+%  本章是 P2「新型传感器与平台里程计」章群之一（兄弟章：事件相机 ch:event、腿式 ch:leg）。
+%  承接 sec:lidar-rae 的 RAE 球坐标观测，把多普勒径向速度作为雷达独有的第四维度引出；
+%  配准复用 ch:pointcloud 的 GICP/NDT；地点识别复用 sec:lidar-place 的 ScanContext；
+%  多普勒因子写进 ch:imu/ch:vio 的预积分/因子图记号（信息矩阵 Lambda）。
+%  FMCW 传感原理与多普勒里程计推导自包含、可独立读懂；CFAR/系统/数据集用综述笔法。
+%  右扰动为主，Hamilton 四元数；R 专留旋转，雷达观测噪声协方差用 Sigma_v。
+%  教学层遵循全书 v5.0 规范。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的对照表与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item \cref{sec:lidar-rae} 把激光读作“一距 $+$ 两角”的 RAE 球坐标观测。毫米波雷达也测距离与角度，但它还\emph{免费}多给一个量——是什么？这个量从激光的什么物理效应来，在激光里为什么“可有可无”，到雷达里却成了里程计的主心骨？
+  \item 一台 $4$\,Hz 的旋转雷达在车辆以 $20$\,m/s 行驶时扫一圈，帧首与帧尾相隔多久、位置差多远？这和 \cref{sec:lidar-deskew} 的激光运动畸变是同一回事吗？
+  \item 雷达单帧能测到每个目标的\emph{径向}速度。仅凭这些径向速度，能不能解出传感器自身的\emph{完整}线速度？能不能解出\emph{角}速度？各需要几个目标、什么前提？
+  \item 雷达点云比激光稀疏、噪声大、还有“幽灵目标”。\cref{ch:pointcloud} 的 GICP/NDT 能直接搬过来用吗？要做哪些稳健化改造？
+  \item \cref{sec:lidar-place} 的 ScanContext 描述子靠“每个极坐标格子里的最大高度”编码结构。二维旋转雷达根本测不到高度，这个描述子还能用吗？拿什么代替高度？
+\end{enumerate}
+\textbf{答错 $\ge2$ 题}：第 1、3 题指向本章 \cref{sec:radar-sensing,sec:radar-doppler}；第 2 题回看 \cref{sec:lidar-deskew} 再读 \cref{sec:radar-reg}；第 4 题指向 \cref{sec:radar-reg}；第 5 题指向 \cref{sec:radar-place}。
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{自包含地推导}调频连续波（FMCW）雷达的测距、测速、测角原理：从中频（IF）信号写出距离 $d=cf_0/2S$、锯齿调制的相位差测速 $v=\lambda\Delta\phi/4\pi T$、三角调制对距离/多普勒的解耦、以及相控阵的到达角公式；
+  \item \textbf{区分}旋转雷达（极坐标 radargram）与片上（SoC）雷达（数据立方体 $3{+}1$D / $2{+}1$D），并说清雷达相对激光的“多一维径向速度、少一维高度”这一根本差异；
+  \item \textbf{独立完成}多普勒里程计的核心推导：把每个目标的径向速度写成传感器线速度在视线方向的投影，叠成线性最小二乘解出本体速度（ego-velocity），\textbf{证明}单雷达为何观测不到角速度、需 IMU 陀螺补旋转；
+  \item \textbf{把多普勒因子接进因子图}：写出雷达-惯性速度估计的多普勒残差与信息矩阵，说清它与 \cref{ch:imu} 的 IMU 预积分因子如何并列进同一张图；
+  \item \textbf{复用并稳健化}\cref{ch:pointcloud} 的配准内核：解释 CFAR/$k$-最强等雷达滤波如何先把 radargram 抽成点云，再用多关键帧 GICP/NDT（CFEAR、APDGICP）抗稀疏与噪声；
+  \item \textbf{迁移}\cref{sec:lidar-place} 的位置识别：说清把 ScanContext/RING 等描述子“雷达化”（以 RCS/强度代高度、应对窄 FoV）的关键改动；
+  \item \textbf{选型}：面对全天候、低能见度、长测程等需求，判断何时该用雷达补充或替代激光/相机。
+\end{enumerate}
+
+\subsection*{本章在全书中的位置}
+本章是“感知与 SLAM”部末尾\textbf{新型传感器与平台里程计}章群的第一章。前面几章已用相机（\cref{ch:camera}）、激光（\cref{ch:lidar_slam}）、IMU（\cref{ch:imu}、\cref{ch:vio}）为主线搭好了 SLAM 的完整骨架——观测模型、扫描配准、预积分、因子图、位置识别。本章群的任务是把\emph{同一套数学}迁移到三类新兴传感与平台：毫米波雷达（本章）、事件相机（\cref{ch:event}）、足式机器人（\cref{ch:leg}）。它们各有独门物理，但共享我们已经建立的语言，因此本章处处以“对照激光与 IMU 已学内容”的方式展开，而非另起炉灶。
+
+\subsection*{本章知识导航}
+本章主线与激光 SLAM 同构：先理解雷达\emph{怎么测}（传感原理）、怎么把含噪原始信号抽成可用点云（滤波），再做\emph{里程计}（多普勒/直接法/特征法/配准），最后接\emph{位置识别}与\emph{SLAM 后端}。差别只在每个环节都要为雷达的低分辨率、高噪声、稀疏、以及“自带速度”做定制。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\scriptsize, inner sep=3pt, fill=second!6, draw=second!60!black},
+  bk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+% 传感列
+\node[blk] (sense) {FMCW 传感\\ 距离/速度/角};
+\node[blk, below=9mm of sense] (filt) {雷达滤波\\ CFAR / $k$-最强};
+% 里程计列：四类前端（多普勒免对应；直接/特征/配准逐级稀疏化）
+\node[grp, right=14mm of sense] (dopp) {多普勒里程计\\ ego-velocity（免对应）};
+\node[grp, below=3mm of dopp] (direct) {直接法里程计\\ 相位相关 / Fourier-Mellin};
+\node[grp, below=3mm of direct] (feat) {特征法里程计\\ SIFT/ORB, FSCD/BASD};
+\node[grp, below=3mm of feat] (reg) {配准里程计\\ CFEAR / GICP / NDT};
+% 后端列
+\node[bk, right=14mm of direct] (pr) {位置识别\\ ScanContext$_\text{radar}$};
+\node[bk, below=4mm of pr] (slam) {雷达 SLAM\\ 因子图 + 回环};
+\node[bk, below=4mm of slam] (mm) {多模态\\ 雷达-激光/相机/IMU};
+% 里程计虚线框 + 标注
+\coordinate (oNW) at ($(dopp.north west)+(-2.5mm,2.5mm)$);
+\coordinate (oSE) at ($(reg.south east)+(2.5mm,-2.5mm)$);
+\coordinate (oNE) at (oNW -| oSE);
+\draw[second!55!black, dashed, rounded corners] (oNW) rectangle (oSE);
+\node[second!60!black, font=\scriptsize, anchor=south] at ($(oNW)!0.5!(oNE)$) {四类里程计前端};
+% 箭头
+\draw[ln] (sense)--(filt);
+\draw[ln] (filt.east) -- (filt.east -| oNW);
+\draw[ln] (pr.west -| oSE) -- (pr.west);
+\draw[ln] (pr)--(slam); \draw[ln] (slam)--(mm);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径（骨干 only 速通）}：\cref{sec:radar-why}（为什么需要雷达）$\to$ \cref{sec:radar-sensing}（FMCW 传感原理，自包含）$\to$ \cref{sec:radar-doppler}（多普勒里程计与因子，雷达的招牌内核）$\to$ \cref{sec:radar-direct-feature}（直接法与特征法，radargram 的另两条里程计路线）$\to$ \cref{sec:radar-reg}（配准里程计，复用 GICP/NDT）$\to$ \cref{sec:radar-place}（位置识别雷达化）$\to$ \cref{sec:radar-slam}（系统与回环），约需精读 $4$--$5$ 小时。\cref{sec:radar-filter}（雷达滤波）与 \cref{sec:radar-multimodal}（多模态、数据集）面向工程与研究，可选深潜。
+
+\subsection*{前置知识桥接}
+本章把前几章的工具“换一种传感器”重新装配，请先激活以下前置：
+\begin{itemize}
+  \item \textbf{RAE 球坐标观测模型}（\cref{sec:lidar-rae}）：激光的“一距 $+$ 两角”观测 $\mathbf s(\boldsymbol\rho)=[r,\alpha,\epsilon]^\top$。\cref{sec:lidar-rae} 已声明声呐、\emph{雷达}等“一束 $+$ 两角”传感器共享同一观测几何——本章从这里出发，把雷达的第四维（径向速度）补上。
+  \item \textbf{点云配准内核}（\cref{ch:pointcloud}）：点到点/点到面 ICP、GICP 的概率统一、NDT 的分布化表示、KD-tree 近邻、法向/曲率估计——本章配准里程计直接复用，只做稀疏/含噪稳健化。
+  \item \textbf{IMU 预积分与因子图}（\cref{ch:imu}、\cref{ch:vio}）：预积分相对增量 $\Delta\tilde{\mathbf R}_{ij},\Delta\tilde{\mathbf v}_{ij}$、$9$ 维 IMU 残差 $\mathbf r_{\mathcal I_{ij}}$、信息矩阵 $\boldsymbol\Lambda=\boldsymbol\Sigma^{-1}$、MAP 即因子图最小二乘——本章的多普勒因子与它们并列进同一张图。
+  \item \textbf{位置识别方法学}（\cref{sec:lidar-place}）：ScanContext 的极坐标 BEV 描述子 $+$ 偏航对齐、RING++ 的不变性、回环 $+$ 鲁棒 PGO——本章只讲把它们“雷达化”的差异。
+  \item \textbf{李群与右扰动}（\cref{ch:lie}）：$\mathbf R\,\mathrm{Exp}(\delta\boldsymbol\phi)$、反对称算子 $(\cdot)^\wedge$、$\SE(3)$ 复合——多普勒因子的雅可比与去畸变用到。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 当激光/相机在雨、雪、烟尘、沙暴里集体退化时，你会知道“该上雷达”却不知道雷达的里程计\emph{自成一套数学}（多普勒、相位、极坐标 radargram），只能把它当成“噪声很大的激光”硬塞进 LOAM，结果发散；
+  \item 你会看到 $4$D 毫米波雷达每个点“自带速度”却不知如何利用，浪费掉雷达相对激光最珍贵的那一维信息——而这正是 \cref{ch:event} 与 \cref{ch:leg} 反复出现的主题：每种新传感器都有一维“别人没有”的信号，融合的艺术就在于把它正确地写进因子图。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\label{tab:radar-reading}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含 FMCW 推导、多普勒因子、配准稳健化） & 4--5 小时 & 首次系统学雷达里程计、要做雷达-惯性融合 \\
+速读（跳过 FMCW 信号细节与系统综述） & 1.5 小时 & 已熟激光/IMU，想对齐记号、抓多普勒主干 \\
+速查（只看小结的符号表 $+$ 对照表 $+$ 速查卡） & 15 分钟 & 写代码、调参时回来查公式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+沿用全书：旋转 $\mathbf R\in\SO(3)$（\textbf{$\mathbf R$ 专留旋转}）、位姿 $\mathbf T\in\SE(3)$；扰动以\textbf{右扰动}为主 $\mathbf R\,\mathrm{Exp}(\delta\boldsymbol\phi)$；姿态四元数 $\mathbf q_s^w$ 取 \textbf{Hamilton} 约定。帧下标取“源$\to$目标”方向 $\mathbf R_{ab}$（把点从 $b$ 系映到 $a$ 系），传感器系记 $s$、体系记 $b$、世界系记 $w$。
+\textbf{雷达观测}：单个目标 $d$ 测得四元组 $[\,r,\;v,\;\theta,\;\phi\,]^\top$——距离 $r$、\textbf{径向（多普勒）速度} $v$、方位角 $\theta$、俯仰角 $\phi$（与 \cref{sec:lidar-rae} 的 RAE $[r,\alpha,\epsilon]$ 同义，本章随 Handbook 雷达文献惯例改用 $\theta,\phi$；多出的 $v$ 即雷达独有的第四维）。
+\textbf{噪声协方差}：观测噪声 $\boldsymbol\Sigma_{\mathbf v}$（\textbf{避与旋转 $\mathbf R$、速度 $\mathbf v$ 撞用，下标 $\mathbf v$ 指“观测 measurement”沿用 \cref{ch:lidar_slam} 约定}）；\textbf{信息矩阵} $\boldsymbol\Lambda=\boldsymbol\Sigma^{-1}$。
+雷达散射截面记 RCS，调频连续波记 FMCW，中频记 IF，恒虚警率记 CFAR。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么需要雷达：全天候与“自带速度”}
+\label{sec:radar-why}
+
+\paragraph{动机：当光退化时，电磁波还在工作。}
+相机靠环境光、激光靠近红外脉冲，二者的波长都在微米量级——遇到雨滴、雪花、烟尘、沙尘这些与波长同量级的悬浮颗粒就被强烈散射、衰减。\cref{ch:lidar_slam} 的隧道烟雾实验里，激光测程被烟雾压到几米。毫米波雷达（mmWave radar）发射波长 $1$--$10$\,mm（频率 $30$--$300$\,GHz，车载多在 $76$--$81$\,GHz）的电磁波，远大于这些颗粒，因而能\textbf{穿透}它们继续成像\cite{carlone2026handbook}。代价是分辨率低、噪声大：雷达\emph{看不清}，但它在别人\emph{什么都看不见}时还能\emph{看见}。这是雷达进入 SLAM 的第一动机——全天候鲁棒。
+
+\paragraph{第二动机：径向速度“免费”到手。}
+\cref{sec:lidar-why} 末尾留过一个伏笔：FMCW 激光雷达用频移直接测\emph{径向速度}，但在激光里“只是锦上添花”。原因是激光点云已足够稠密、度量精确，速度是冗余信息。雷达则不同：它的点云稀疏、含噪、配准困难，而 FMCW 调制\emph{天生}就携带多普勒频移——\textbf{每个目标点的径向速度是“免费”测到的}，无需任何点对应关系（\cref{sec:radar-doppler}）。于是径向速度从激光里的配角，一跃成为雷达里程计的主心骨：哪怕配准失败，雷达靠多普勒也能给出本体速度。这正是雷达相对激光的根本差异——\textbf{多一维径向速度（多普勒），少一维高度}（二维旋转雷达不测俯仰）。
+
+\begin{insight}[雷达 vs 激光：信息互补，而非孰优孰劣]\label{ins:radar-vs-lidar}
+把两者放进 \cref{sec:lidar-rae} 的 RAE 观测框架对照最清楚：激光给\emph{稠密、精确、各向同性}的度量结构 $[r,\alpha,\epsilon]$，但无速度、且依赖光学可见；雷达给\emph{稀疏、含噪}的 $[r,\theta,\phi]$ 外加一维\emph{径向速度} $v$，且全天候、长测程（旋转雷达可超 $100$\,m）。所以二者不是替代关系，而是\textbf{互补}：清朗时信任激光的结构、恶劣时信任雷达的穿透、动态场景靠雷达的速度剔除动目标。\cref{sec:radar-multimodal} 的雷达-激光融合正是据能见度在两者间动态加权。
+\end{insight}
+
+\paragraph{两类雷达：旋转式与片上式。}
+机器人里常见两类雷达，主要差别在“怎么扫描出角度”（\cref{fig:radar-types}、\cref{tab:radar-types}）\cite{carlone2026handbook}：
+\begin{itemize}
+  \item \textbf{旋转雷达}（spinning / scanning / imaging radar）：机械旋转单根天线，在每个方位发一束、收一束，拼出一张\textbf{极坐标 radargram}（方位 $\times$ 距离的强度图，形如鸟瞰图像）。测程远（$>100$\,m）、$360^\circ$ 视场，但\emph{只在二维平面}成像（无俯仰）、转速慢（典型 $4$\,Hz，新型 $10$--$50$\,Hz），且单脉冲常不给速度。代表器件 Navtech CIR304/RAS3。
+  \item \textbf{片上雷达}（system-on-a-chip, SoC）：多根收发天线集成在芯片上，靠\emph{相位阵}（phased array）合成角度，输出\textbf{数据立方体}（datacube：方位 $\times$ 俯仰 $\times$ 距离 $\times$ 多普勒）。轻、省电、无运动部件、更新快，但视场窄、测程短。按是否测俯仰分 $3{+}1$D（4D，方位/俯仰/距离 $+$ 速度）与 $2{+}1$D（无俯仰）。
+\end{itemize}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=5mm,
+  box/.style={draw, rounded corners, align=center, minimum height=8mm, inner sep=3pt},
+  s/.style={box, fill=main!8, draw=main!60!black},
+  c/.style={box, fill=second!8, draw=second!60!black},
+  ln/.style={->, thick, gray!55!black}]
+  \node[s] (spin) {旋转雷达\\ 单天线机械旋转};
+  \node[s, below=4mm of spin] (radargram) {极坐标 radargram\\ 方位 $\times$ 距离（2D）};
+  \node[c, right=24mm of spin] (soc) {SoC 相控阵\\ 多收发天线};
+  \node[c, below=4mm of soc] (cube) {数据立方体\\ 方位$\times$俯仰$\times$距离$\times$速度};
+  \node[box, fill=third!8, draw=third!60!black, below=11mm of $(radargram)!0.5!(cube)$] (pc) {雷达滤波（\cref{sec:radar-filter}）\\ $\to$ 稀疏点云 $[r,v,\theta,\phi]$};
+  \draw[ln] (spin)--(radargram); \draw[ln] (soc)--(cube);
+  \draw[ln] (radargram.south) -- ++(0,-3mm) -| (pc.north);
+  \draw[ln] (cube.south) -- ++(0,-3mm) -| (pc.north);
+\end{tikzpicture}
+\caption{机器人中两类雷达及其主数据产品：旋转雷达产生二维极坐标 radargram，SoC 相控阵产生 $3{+}1$D/$2{+}1$D 数据立方体；二者经雷达滤波（\cref{sec:radar-filter}）抽成带径向速度的稀疏点云，下游里程计/SLAM 即建在这点云上。（仿 \cite{carlone2026handbook} 图 9.2 重绘）}
+\label{fig:radar-types}
+\end{figure}
+
+\begin{table}[H]\centering\small
+\caption{旋转雷达 vs SoC 雷达（选型背景）}
+\label{tab:radar-types}
+\begin{tabular}{lll}
+\toprule
+ & 旋转雷达 & SoC 雷达 \\
+\midrule
+角度来源 & 机械旋转单天线 & 相控阵多天线相位差 \\
+主数据产品 & 极坐标 radargram（2D 图像） & 数据立方体（$3{+}1$D / $2{+}1$D） \\
+视场 / 测程 & $360^\circ$ / 远（$>100$\,m） & 窄 / 近 \\
+俯仰（高度） & \textbf{无} & $3{+}1$D 有，$2{+}1$D 无 \\
+更新率 & 慢（$4$--$50$\,Hz） & 快（无机械部件） \\
+运动畸变 & 显著（慢扫） & 轻 \\
+每点速度 & 常缺（需多脉冲） & \textbf{自带}（多普勒） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{雷达传感原理：FMCW 测距、测速、测角}
+\label{sec:radar-sensing}
+
+本节自包含地把“电磁波回波”变成 $[r,v,\theta,\phi]$ 四元组——这是雷达观测模型的物理来历，正如 \cref{sec:lidar-rae} 把“激光飞行时间”变成 RAE。读懂本节，下游一切（多普勒里程计、点云配准）才有根。
+
+\paragraph{回波强度：RCS 与雷达强度。}
+雷达发射电磁脉冲，遇物体反射回来。回波强弱由\textbf{雷达散射截面}（Radar Cross Section, RCS）决定——RCS 是“一个能反射同样能量的等效金属球”的截面积，由目标的材质、尺寸、形状共同决定：大而实的车辆、混凝土墙 RCS 高，行人、细杆 RCS 低\cite{carlone2026handbook}。雷达\textbf{强度}（intensity）则是回波能量，正比于发射功率与目标 RCS。强度是雷达点云携带的“类反射率”通道——后面位置识别会用它来\emph{替代激光的高度信息}（\cref{sec:radar-place}）。
+
+\paragraph{FMCW 测距：把时间编码进频率。}
+雷达至少有一根发射天线（TX）和一根接收天线（RX）。FMCW（Frequency-Modulated Continuous-Wave，调频连续波）雷达的 TX 发出一段频率\emph{线性增长}的脉冲，称\textbf{啁啾}（chirp，常用锯齿调制）。回波被 RX 收到后，与原始 TX 啁啾\textbf{混频}（相减），得到一个\textbf{中频信号}（Intermediate Frequency, IF）——因收发啁啾斜率相同，IF 是一个频率恒定的正弦波 $\sin(2\pi f_0 t+\phi_0)$（\cref{fig:radar-fmcw}）\cite{carlone2026handbook}。
+
+设光速 $c$、回波相对发射的时延 $t_0$，则到目标的距离
+\begin{equation}
+  d=\frac{c}{2}\,t_0,
+  \label{eq:radar-tof}
+\end{equation}
+即“飞行时间 $\times$ 半光速”——与 \cref{sec:lidar-why} 激光的 $d=\tfrac12 c\Delta t$ 完全同形（雷达与激光都是\emph{测距}传感器，这是它们能共享 RAE 几何的根）。FMCW 的妙处在于不直接测 $t_0$（太短），而是测 IF 频率 $f_0$：设啁啾时长 $T$、带宽 $B=f_M-f_m$、斜率 $S=B/T$，由“时延 $t_0$ 对应的频率落差 $=$ 斜率 $\times$ 时延”得 $f_0=S t_0=2Sd/c$，反解
+\begin{equation}
+  f_0=\frac{2Bd}{Tc}=\frac{2Sd}{c}
+  \quad\Longrightarrow\quad
+  d=\frac{c\,f_0}{2S}.
+  \label{eq:radar-range}
+\end{equation}
+工程上对 IF 信号高速采样（每 $\le100$\,ns 一次），做\textbf{快速傅里叶变换}（FFT）找频谱峰，峰的频率即 $f_0$、对应一个目标的距离。这就是“距离 FFT”。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, scale=1.0]
+  % axes
+  \draw[->, thick] (0,0) -- (5.2,0) node[right]{$t$};
+  \draw[->, thick] (0,0) -- (0,2.6) node[above]{$f$};
+  % sawtooth TX (two up-chirps)
+  \draw[very thick, main!70!black] (0,0.4) -- (2,2.2);
+  \draw[very thick, main!70!black] (2,0.4) -- (4,2.2);
+  \node[main!70!black, font=\scriptsize] at (1.0,1.9) {TX};
+  % RX delayed copy
+  \draw[very thick, second!70!black, dashed] (0.35,0.4) -- (2,1.85);
+  \draw[very thick, second!70!black, dashed] (2.35,0.4) -- (4,1.85);
+  \node[second!70!black, font=\scriptsize] at (2.7,1.0) {RX (延时 $t_0$)};
+  % bandwidth bracket
+  \draw[<->, gray] (-0.15,0.4) -- (-0.15,2.2) node[midway,left,font=\scriptsize,gray]{$B$};
+  % chirp time
+  \draw[<->, gray] (0,-0.18) -- (2,-0.18) node[midway,below,font=\scriptsize,gray]{$T$};
+  % IF region marker
+  \draw[<->, third!70!black] (0.35,0.55) -- (0.35,0.95);
+  \node[third!70!black, font=\scriptsize, right] at (0.4,0.75) {$f_0$};
+\end{tikzpicture}
+\caption{FMCW 锯齿调制：TX 发出频率线性增长的啁啾（实线），回波是延时 $t_0$ 的副本（虚线）。二者混频得恒频中频 $f_0\propto d$（\cref{eq:radar-range}）。相邻两啁啾的回波相位差 $\Delta\phi$ 编码径向速度（\cref{eq:radar-doppler-saw}）。三角调制（一上一下啁啾）则可把距离项与多普勒项解耦（\cref{eq:radar-tri-solve}）。（仿 \cite{carlone2026handbook} 图 9.3 重绘）}
+\label{fig:radar-fmcw}
+\end{figure}
+
+\paragraph{锯齿调制测速：相位差读多普勒。}
+IF 信号除频率外还有相位 $\phi_0$，它与波长 $\lambda$、距离 $d$ 的关系为
+\begin{equation}
+  \phi_0=2\pi f_m t_0=\frac{4\pi d}{\lambda}
+  \label{eq:radar-phase}
+\end{equation}
+（往返 $2d$、每波长 $2\pi$，故系数 $4\pi/\lambda$）。相位对距离极敏感且会缠绕，不适合直接测距，却恰好适合测\emph{微小位移}。连发两个相邻上啁啾（间隔约 $40\,\mu$s），目标距离几乎不变（$f_0$ 不变），但若目标与雷达有相对运动，两啁啾回波的\textbf{相位}会差一个 $\Delta\phi$。由 \cref{eq:radar-phase}，在间隔 $T$ 内位移 $\Delta d=vT$，故
+\begin{equation}
+  \Delta\phi=\frac{4\pi\Delta d}{\lambda}=\frac{4\pi vT}{\lambda}
+  \quad\Longrightarrow\quad
+  v=\frac{\lambda\,\Delta\phi}{4\pi T}.
+  \label{eq:radar-doppler-saw}
+\end{equation}
+这就是\textbf{多普勒（径向）速度}。因相位缠绕，唯一可测的速度范围由 $|\Delta\phi|<\pi$ 限定，最大无模糊速度 $v_{\max}=\lambda/(4T)$。对多个啁啾序列再做一次 FFT（“多普勒 FFT”）即得每个距离单元的速度。\textbf{$v$ 就是雷达独有的第四维}——它直接、按目标地、无需任何配准地测到，这一点对下一节的多普勒里程计是决定性的。
+
+\paragraph{三角调制：解耦距离与多普勒。}
+锯齿调制的 \cref{eq:radar-range} 其实\emph{没}修正多普勒：运动目标的 IF 频率同时含“时延项” $f_{0,t}$（来自距离）与“多普勒项” $f_{0,d}$（来自速度）。三角调制用一上一下两段啁啾把它们分开：上啁啾时延项为正、下啁啾时延项变号，而多普勒项符号不变，
+\begin{equation}
+  f_{0,\text{up}}=f_{0,t}+f_{0,d},\qquad
+  f_{0,\text{down}}=-f_{0,t}+f_{0,d},
+  \label{eq:radar-tri}
+\end{equation}
+两式相加减即解出
+\begin{equation}
+  f_{0,t}=\frac{f_{0,\text{up}}-f_{0,\text{down}}}{2},\quad
+  f_{0,d}=\frac{f_{0,\text{up}}+f_{0,\text{down}}}{2},
+  \quad
+  d=\frac{c\,f_{0,t}}{2S},\quad
+  v=\frac{c\,f_{0,d}}{2ST}.
+  \label{eq:radar-tri-solve}
+\end{equation}
+代价是延迟略增（需等下啁啾），好处是测距已对多普勒去偏、且不必处理相位缠绕。旋转雷达常用三角调制，SoC 雷达常用锯齿调制。
+
+\paragraph{SoC 测角：相位阵的到达角。}
+旋转雷达靠机械朝向直接给方位；SoC 雷达靠\textbf{到达角}（angle of arrival）估计。设两根 RX 天线相距 $\ell$，同一回波到两天线多走 $\Delta d=\ell\sin\theta$，由 \cref{eq:radar-phase} 对应相位差 $\Delta\phi=(2\pi/\lambda)\ell\sin\theta$，反解
+\begin{equation}
+  \theta=\arcsin\frac{\lambda\,\Delta\phi}{2\pi\ell}.
+  \label{eq:radar-aoa}
+\end{equation}
+两根 RX 原则上够定一个角，更多 RX 提高角分辨率（区分邻近目标）；对天线阵做 FFT（“角度 FFT”）即得方位/俯仰。多发多收（MIMO）阵列用频分/码分/时分让各 TX 信号正交，可用更少天线达到同样分辨率，二维阵列则同时测方位与俯仰，产出 $3{+}1$D。
+
+\begin{insight}[三个 FFT 与 RAE 的对应]\label{ins:radar-three-fft}
+把本节归拢：距离 FFT 给 $r$（\cref{eq:radar-range}）、多普勒 FFT 给 $v$（\cref{eq:radar-doppler-saw}）、角度 FFT 给 $\theta,\phi$（\cref{eq:radar-aoa}）。于是每个目标得 $[r,v,\theta,\phi]^\top$。去掉 $v$，这与 \cref{sec:lidar-rae} 的 RAE 观测 $[r,\alpha,\epsilon]$ \textbf{完全同构}——同一套“球坐标 $\to$ 笛卡尔”正逆映射（\cref{eq:lidar-rae-fwd,eq:lidar-rae-model}）、同一个 $3\times3$ 雅可比（\cref{eq:lidar-rae-jac}）原样适用，只需把激光的角分辨率噪声换成雷达更大的宽波束角误差。雷达\emph{额外}的那一维 $v$，正是下节里程计的主角。
+\end{insight}
+
+\paragraph{雷达的独门噪声（陷阱预告）。}
+雷达观测远比激光“脏”（\cref{fig:radar-noise} 概念示意），三类噪声最需警惕\cite{carlone2026handbook}：
+\begin{itemize}
+  \item \textbf{斑点噪声}（speckle）：电磁波在物体上散射后相干叠加，时而相长（假峰）、时而相消（漏真峰），radargram 上铺满散点。
+  \item \textbf{多路径“幽灵目标”}（multipath ghosts）：回波先撞地/墙再回天线，雷达“以为”目标在路面下或墙后，生成虚假静态外点。剔除它们对建图/定位至关重要。
+  \item \textbf{运动畸变}：与 \cref{sec:lidar-deskew} 的激光同源——慢扫旋转雷达扫一圈期间平台已移动，帧首尾的同一目标位置不一致。$4$\,Hz 雷达在车上尤其显著。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section{雷达滤波：从 radargram 到稀疏点云}
+\label{sec:radar-filter}
+
+下游里程计要的是\emph{点云}，而原始 radargram/数据立方体里真目标与斑点、幽灵混在一起。雷达滤波就是沿每个方位判断哪些距离单元是真目标、哪些是虚警。因虚警分布随时间/环境变化，简单固定阈值会漏检或误检，故需\emph{自适应}阈值。
+
+\paragraph{CFAR：恒虚警率检测。}
+\textbf{恒虚警率}（Constant False Alarm Rate, CFAR）滤波\cite{carlone2026handbook}沿一个方位把信号切成单元，用滑窗判别：窗口中心是\textbf{待检单元}（CUT），两侧若干\textbf{训练单元}估计本地杂波水平，二者间留\textbf{保护单元}避免 CUT 能量泄漏污染训练单元。若 CUT 强度超过“训练单元统计量 $\times$ 阈值因子”（因子由期望虚警率定），即判为目标。常见两变体：\emph{单元平均} CA-CFAR（训练单元取均值）、\emph{有序统计} OS-CFAR（取中位数，更鲁棒）。专为雷达里程计设计的 \textbf{BFAR}（Bounded FAR）则在 CFAR 输出上加仿射变换 $T=aZ+b$，$b$ 可学习，在 CFAR 自适应阈值与固定阈值间平滑过渡。
+
+\paragraph{里程计常用更简单的滤波。}
+CFAR 是为\emph{目标检测}设计（宁可错收也别漏弱目标），而里程计的诉求相反——只保留那些\emph{能在多帧、多视角下稳定重现}的点。故许多雷达里程计改用更保守的策略：沿每个方位取 \textbf{$k$ 个最强回波}（$k$ 从 $1$ 起），或取“强度高于均值 $+1$ 标准差”的统计阈值。\cref{ch:lidar_slam} 已强调激光特征要选“可稳定重现”的边/面点，这里是同一原则在雷达上的体现。也有用机器学习（以激光为真值训练 GAN/回归器）把 radargram“超分”成类激光点云的做法。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small]
+  \draw[->, thick] (0,0) -- (6.2,0) node[right]{距离单元};
+  \draw[->, thick] (0,0) -- (0,2.4) node[above]{强度};
+  % signal (gray) with spikes
+  \draw[gray!70] (0.2,0.3) .. controls (0.6,0.5) and (0.9,0.2) .. (1.1,0.35)
+    -- (1.15,1.7) -- (1.25,0.4)
+    .. controls (1.6,0.3) and (2.0,0.6) .. (2.3,0.45)
+    -- (2.35,0.95) -- (2.45,0.4)
+    .. controls (3.0,0.5) and (3.6,0.25) .. (4.0,0.4)
+    -- (4.05,1.95) -- (4.15,0.45)
+    .. controls (4.6,0.35) and (5.4,0.5) .. (6.0,0.3);
+  % adaptive CFAR threshold (black)
+  \draw[thick, black] (0.2,0.7) .. controls (1.5,0.85) and (3,0.8) .. (4.5,0.95) .. controls (5.2,0.9) .. (6.0,0.75);
+  \node[black, font=\scriptsize, right] at (4.6,1.0) {CFAR 自适应阈值};
+  % detections
+  \fill[main!70!black] (1.15,1.7) circle (1.6pt);
+  \fill[main!70!black] (4.05,1.95) circle (1.6pt);
+  \fill[red!60!black] (2.35,0.95) circle (1.6pt);
+  \node[red!60!black, font=\scriptsize] at (2.55,1.25) {虚警};
+  \node[main!70!black, font=\scriptsize] at (1.15,2.0) {真目标};
+\end{tikzpicture}
+\caption{雷达滤波概念示意：沿一个方位的强度-距离曲线（灰）含真目标尖峰与若干模糊峰。CFAR 给出随杂波起伏的自适应阈值（黑）；超阈者判为检测（蓝），其中可能混入“虚警”（红）。$k$-最强策略更保守，只取主峰附近少数点。（仿 \cite{carlone2026handbook} 图 9.6/9.7 重绘）}
+\label{fig:radar-noise}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{多普勒里程计：雷达独有的免对应内核}
+\label{sec:radar-doppler}
+
+这是雷达里程计最有别于激光的部分，也是本章\textbf{必须自包含}的招牌推导。核心问题：仅凭单帧雷达每个目标的\emph{径向}速度，能恢复多少自运动？答案——能直接、无需对应关系地解出\textbf{本体线速度}，但\emph{解不出角速度}，须配 IMU 陀螺。
+
+\subsection{单帧本体速度：径向速度的线性最小二乘}
+\label{subsec:radar-egovel}
+
+\paragraph{从一个目标的多普勒到一条速度约束。}
+设传感器系 $\mathcal F_s$ 下，目标 $d$ 的位置向量为 $\mathbf r_d^s\in\mathbb R^3$（由 $[r,\theta,\phi]$ 经 \cref{eq:lidar-rae-fwd} 球坐标映射而来），传感器自身相对环境的线速度为 $\mathbf v^s\in\mathbb R^3$。\textbf{关键假设}：场景中目标静止、只有平台在动（动目标稍后剔除）。那么雷达测到的径向速度 $v_d$，正是“平台速度在该目标视线方向上的投影”的负值——平台朝目标去，目标在径向上\emph{逼近}。记视线单位向量 $\mathbf u_d^s=\mathbf r_d^s/\|\mathbf r_d^s\|$，则
+\begin{equation}
+  v_d=-\,\mathbf v^{s\top}\mathbf u_d^s
+   =-\,\mathbf v^{s\top}\frac{\mathbf r_d^s}{\|\mathbf r_d^s\|}.
+  \label{eq:radar-doppler-proj}
+\end{equation}
+这是一个\emph{标量}约束，对未知的 $3$ 维 $\mathbf v^s$ 只定了一个方向上的分量。但雷达单帧给出\emph{许多}目标，每个目标各贡献一条这样的约束——把它们叠起来就能解出整个 $\mathbf v^s$。
+
+\begin{insight}[为什么“免对应关系”是雷达的杀手锏]\label{ins:radar-corr-free}
+\cref{ch:lidar_slam} 的激光里程计、\cref{ch:vio} 的视觉里程计都\emph{必须先建立点对应}（哪个点对哪个点、哪个特征对哪个特征）才能估运动——而数据关联恰是最易出错、最耗时的一环。多普勒里程计完全\textbf{绕过}了这一步：\cref{eq:radar-doppler-proj} 只用\emph{当前帧单点}的速度与方向，不牵涉前一帧、不需要任何匹配。这就是为什么在特征稀疏、配准失败的环境（空旷、隧道、烟雾）里，多普勒里程计反而最稳——它不依赖“看见同一个东西两次”。
+\end{insight}
+
+\paragraph{叠成线性最小二乘（自包含推导）。}
+设单帧滤波后得 $N$ 个（静止）目标 $d=1,\dots,N$，各测得径向速度 $v_d$ 与视线方向 $\mathbf u_d^s$。把 \cref{eq:radar-doppler-proj} 对所有目标堆叠，未知量是 $\mathbf v^s\in\mathbb R^3$：
+\begin{equation}
+  \underbrace{\begin{bmatrix} -\mathbf u_1^{s\top}\\ -\mathbf u_2^{s\top}\\ \vdots\\ -\mathbf u_N^{s\top}\end{bmatrix}}_{\mathbf A\in\mathbb R^{N\times3}}\mathbf v^s
+  =\underbrace{\begin{bmatrix} v_1\\ v_2\\ \vdots\\ v_N\end{bmatrix}}_{\mathbf b\in\mathbb R^{N}}.
+  \label{eq:radar-egovel-stack}
+\end{equation}
+这是标准的超定线性方程组（$N\gg3$）。雷达测速含非高斯噪声、且 \cref{sec:radar-filter} 滤完仍有外点（动目标、幽灵），故用\textbf{加权最小二乘 $+$ 稳健核}求解：以各目标归一化强度 $w_d$（\cref{eq:radar-doppler-weight}）为权、记权阵 $\mathbf W=\operatorname{diag}(w_1,\dots,w_N)$，
+\begin{equation}
+  \mathbf v^{s\star}=\arg\min_{\mathbf v^s}\;(\mathbf A\mathbf v^s-\mathbf b)^\top\mathbf W(\mathbf A\mathbf v^s-\mathbf b)
+   \;\;\Longrightarrow\;\;
+  \mathbf v^{s\star}=(\mathbf A^\top\mathbf W\mathbf A)^{-1}\mathbf A^\top\mathbf W\,\mathbf b.
+  \label{eq:radar-egovel-wls}
+\end{equation}
+法方程 $\mathbf A^\top\mathbf W\mathbf A\,\mathbf v^s=\mathbf A^\top\mathbf W\mathbf b$ 由对 $\mathbf v^s$ 求导置零即得（与 \cref{ch:pointcloud} 的点到点 ICP 的法方程同套路）。可解的几何条件：\textbf{视线方向 $\{\mathbf u_d^s\}$ 必须张成 $\mathbb R^3$}（即 $\mathbf A$ 列满秩 $3$）。若所有目标挤在一个窄方位扇区（如只朝正前方），$\mathbf A$ 退化、横向速度不可观——这正是窄视场 SoC 雷达的固有困难。实践中先用\textbf{三点 RANSAC}（任取三个方向不共面的目标算一个候选 $\mathbf v^s$、投票选内点）剔除动目标与幽灵，再在内点上做 \cref{eq:radar-egovel-wls}\cite{carlone2026handbook}。
+
+权重取归一化强度，强回波（高 RCS、更可信）权大：
+\begin{equation}
+  w_d=\frac{i_d}{\sum_{j=1}^{N} i_j},
+  \label{eq:radar-doppler-weight}
+\end{equation}
+$i_d$ 为目标 $d$ 的强度。
+
+\begin{derivation}[为什么单雷达观测不到角速度——秩的论证]
+\cref{eq:radar-doppler-proj} 只含\emph{线}速度 $\mathbf v^s$，角速度 $\boldsymbol\omega$ 根本没出现，这并非疏漏。设平台以线速度 $\mathbf v^s$、角速度 $\boldsymbol\omega^s$ 运动，则\emph{固连于传感器}的某点速度场为 $\mathbf v^s+\boldsymbol\omega^s\times\mathbf r$。但雷达测的是\emph{环境中静止目标}相对传感器的径向速度——环境点不随传感器转，其相对传感器的速度是\emph{整体刚体运动的逆}：目标 $d$ 在传感器系下的速度为 $-(\mathbf v^s+\boldsymbol\omega^s\times\mathbf r_d^s)$。投到视线方向：
+\[
+  v_d=-\big(\mathbf v^s+\boldsymbol\omega^s\times\mathbf r_d^s\big)^\top\mathbf u_d^s
+   =-\mathbf v^{s\top}\mathbf u_d^s-(\boldsymbol\omega^s\times\mathbf r_d^s)^\top\mathbf u_d^s.
+\]
+注意 $\mathbf u_d^s=\mathbf r_d^s/\|\mathbf r_d^s\|$ 与 $\mathbf r_d^s$ \emph{共线}，而叉积 $\boldsymbol\omega^s\times\mathbf r_d^s$ 必\emph{垂直}于 $\mathbf r_d^s$，故 $(\boldsymbol\omega^s\times\mathbf r_d^s)^\top\mathbf u_d^s=0$——\textbf{角速度项恒为零}，退回 \cref{eq:radar-doppler-proj}。物理直觉：纯旋转时，传感器原点处的目标既不远离也不接近（切向运动无径向分量），故多普勒测不到自转。这就是单个\emph{点}雷达的根本盲区，必须靠陀螺补 $\boldsymbol\omega$，或用多个分散安装的雷达（不同 $\mathbf r$ 处的速度场含 $\boldsymbol\omega$），或对车辆假设阿克曼无侧滑运动学（已知安装点相对转动中心，则 $\mathbf v^s$ 与 $\boldsymbol\omega$ 经车辆模型耦合，可反解偏航\cite{carlone2026handbook}）。
+\end{derivation}
+
+\begin{pitfall}[概念误区：把多普勒里程计当成“完整”里程计]
+多普勒单帧只给\emph{线速度}，要积成轨迹还缺两样：(1) \textbf{姿态}——把体系速度旋到世界系需要 $\mathbf R_{wb}$，否则积分方向错；(2) \textbf{角速度}——见上方推导，单雷达测不到。所以裸多普勒里程计\emph{必然}发散在朝向上。正确做法是配 IMU：陀螺给 $\boldsymbol\omega$（积出 $\mathbf R$）、多普勒给 $\mathbf v$，二者进同一因子图互补（\cref{subsec:radar-doppler-factor}）。这与 \cref{ch:imu} 强调的“纯惯性会漂、需外部约束”是一枚硬币的两面：多普勒给速度约束、陀螺给旋转约束，缺一不可。
+\end{pitfall}
+
+\paragraph{非共置雷达的杆臂耦合（补 Handbook 的“一般推导”）。}
+上面默认雷达与体原点重合。一般地，雷达系 $s$ 相对体系 $b$ 有外参旋转 $\mathbf R_{bs}$ 与杆臂 $\mathbf r_b^{sb}$（体原点指向雷达的位移，记号同 \cref{ch:imu} 的 IMU 外参）。体系角速度 $\boldsymbol\omega^b$ 会在雷达处\emph{诱发}一个附加平动速度。仿 \cref{ch:imu} 的杆臂推导，雷达系下的速度
+\begin{equation}
+  \mathbf v^s=\mathbf R_{bs}^\top\big(\mathbf v^b+\boldsymbol\omega^b\times\mathbf r_b^{sb}\big),
+  \label{eq:radar-leverarm}
+\end{equation}
+即体速度加上“角速度 $\times$ 杆臂”的切向项，再旋到雷达系。把它代回 \cref{eq:radar-doppler-proj}，多普勒残差就同时约束了体速度 $\mathbf v^b$ 与角速度 $\boldsymbol\omega^b$——这揭示了\textbf{体角速率与雷达系速度的耦合}：杆臂越长，单帧多普勒对 $\boldsymbol\omega^b$ 的敏感度越高，多雷达分散安装即借此恢复转动。这正是 Handbook 一笔带过（“文献 [605] 给出一般推导”）而本书补全的环节。
+
+\subsection{多普勒因子：接进因子图}
+\label{subsec:radar-doppler-factor}
+
+多普勒里程计的现代实现不是孤立解一帧速度，而是把多帧速度与 IMU 一起放进\textbf{因子图}联合估计——与 \cref{ch:imu} 的 IMU 预积分、\cref{ch:vio} 的视觉因子\emph{并列进同一张图}（\cref{fig:radar-factor}）。下面给出残差与信息矩阵，记号与 \cref{eq:imu-residual} 一脉相承。
+
+\paragraph{状态与残差。}
+在 $K$ 帧滑窗内联合估计各帧体速度。IMU 测量受偏置 $\mathbf b$ 与重力 $\mathbf g^w$ 影响，而雷达速度\emph{无偏}——故可借雷达速度反过来标定加速度计偏置；补偿重力则需姿态的俯仰/横滚，由 Hamilton 四元数 $\mathbf q_s^w$ 表示。第 $k$ 帧的状态取
+\begin{equation}
+  \mathbf x_k=\begin{bmatrix}\mathbf v^{s\top}_k & \mathbf q_{s,k}^{w\top} & \mathbf b_k^\top\end{bmatrix}^\top,
+  \label{eq:radar-state}
+\end{equation}
+（沿 \cref{ch:vio} 约定，旋转扰动用右扰动 $\mathbf q\otimes[\tfrac12\delta\boldsymbol\phi;1]$）。雷达-惯性速度估计的代价函数把两类约束并列：
+\begin{equation}
+  J(\mathbf x)=\underbrace{\sum_{k=1}^{K}\sum_{d\in\mathcal D_k} w_{d,k}\,\rho\!\big(e_{d,k}^2\big)}_{\text{多普勒项}}
+   \;+\;\underbrace{\sum_{k=1}^{K-1}\big\|\mathbf r_{\mathcal I_{k,k+1}}\big\|^2_{\boldsymbol\Lambda_{k,k+1}}}_{\text{惯性项（预积分）}},
+  \label{eq:radar-cost}
+\end{equation}
+其中 $\mathcal D_k$ 是第 $k$ 帧的目标集，惯性项 $\mathbf r_{\mathcal I_{k,k+1}}$ 即 \cref{ch:imu} 的预积分残差 \cref{eq:imu-residual}、信息矩阵 $\boldsymbol\Lambda_{k,k+1}=\boldsymbol\Sigma_{k,k+1}^{-1}$（预积分协方差之逆），$\rho(\cdot)$ 为稳健核。单个多普勒残差由 \cref{eq:radar-doppler-proj} 直接得：
+\begin{equation}
+  e_{d,k}=v_{d,k}-\Big(-\mathbf v^{s\top}_k\frac{\mathbf r_{d,k}^s}{\|\mathbf r_{d,k}^s\|}\Big)
+   =v_{d,k}+\mathbf v^{s\top}_k\,\mathbf u_{d,k}^s,
+  \label{eq:radar-doppler-residual}
+\end{equation}
+权 $w_{d,k}$ 取归一化强度（\cref{eq:radar-doppler-weight}）。雷达噪声非高斯、含外点，故多普勒残差套 \textbf{Cauchy 稳健核} $\rho(s)=\log(1+s)$ 压制大残差。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=14mm,
+  st/.style={circle, draw, fill=main!12, minimum size=8mm, inner sep=0pt},
+  ft/.style={rectangle, draw, fill=second!20, minimum size=2.6mm, inner sep=0pt},
+  dp/.style={rectangle, draw, fill=third!25, minimum size=2.6mm, inner sep=0pt},
+  ln/.style={thick, gray!60!black}]
+  \node[st] (x1) {$\mathbf x_{k}$};
+  \node[st, right=of x1] (x2) {$\mathbf x_{k+1}$};
+  \node[st, right=of x2] (x3) {$\mathbf x_{k+2}$};
+  % IMU preintegration factors (between states)
+  \node[ft] (i1) at ($(x1)!0.5!(x2)$) {};
+  \node[ft] (i2) at ($(x2)!0.5!(x3)$) {};
+  \draw[ln] (x1)--(i1)--(x2); \draw[ln] (x2)--(i2)--(x3);
+  % doppler factors (unary, below)
+  \node[dp, below=7mm of x1] (d1) {};
+  \node[dp, below=7mm of x2] (d2) {};
+  \node[dp, below=7mm of x3] (d3) {};
+  \draw[ln] (x1)--(d1); \draw[ln] (x2)--(d2); \draw[ln] (x3)--(d3);
+  \node[font=\scriptsize, second!50!black, above=0.5mm of i1] {IMU 预积分因子 $\mathbf r_{\mathcal I}$};
+  \node[font=\scriptsize, third!50!black, below=0.5mm of d2] {多普勒因子 $e_{d,k}$（一元，约束速度）};
+\end{tikzpicture}
+\caption{雷达-惯性速度估计的因子图：节点为各帧状态 $\mathbf x_k$（含体速度、姿态、偏置，\cref{eq:radar-state}）；相邻节点间是 IMU 预积分因子 $\mathbf r_{\mathcal I}$（\cref{ch:imu} 的 \cref{eq:imu-residual}），每个节点下挂多普勒因子（\cref{eq:radar-doppler-residual}，由该帧所有目标的径向速度约束本体速度）。与 \cref{ch:vio} 的 VIO 因子图同构，只是把视觉重投影因子换成多普勒速度因子。（仿 \cite{carlone2026handbook} 图 9.9 重绘）}
+\label{fig:radar-factor}
+\end{figure}
+
+\begin{insight}[一种新传感器进因子图，只需回答三个问题]\label{ins:radar-factor-recipe}
+\cref{eq:radar-doppler-residual} 示范了本书反复出现的套路：要把任何新传感器接进因子图，只需回答——(1) \emph{它约束哪些状态}？（多普勒约束体速度 $\mathbf v^s$）(2) \emph{残差怎么写}？（测量 $-$ 预测，预测来自状态经传感器模型）(3) \emph{信息矩阵多大}？（噪声协方差之逆 $\boldsymbol\Lambda$）。答完这三问，新因子就和 IMU、视觉因子一样被优化器一视同仁地处理。\cref{ch:event} 的事件因子、\cref{ch:leg} 的接触/速度预积分因子都将照这三问构造——这是全书“异构传感器、同一张图”的统一范式。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{直接法与特征法里程计：在 radargram 与特征上估计运动}
+\label{sec:radar-direct-feature}
+
+\cref{sec:radar-doppler} 的多普勒里程计免对应、却只给\emph{线}速度。要拿到含旋转的\emph{完整}相对位姿，就得回到“两帧之间建立对应、再最小化某种距离”的经典里程计范式（与 \cref{ch:lidar_slam} 激光、\cref{ch:vio} 视觉同源）。难点在于：旋转雷达的原始产品是一张\textbf{极坐标 radargram}（鸟瞰强度图），用它估运动有三条层层“稀疏化”的路线\cite{carlone2026handbook}——
+\begin{enumerate}
+  \item \textbf{直接法}（\cref{subsec:radar-direct}）：\emph{不抽点}，把整张（或大部分）radargram 当图像，用相位相关/Fourier--Mellin 直接求两帧相对旋转与平移；
+  \item \textbf{特征法}（\cref{subsec:radar-feature}）：先从 radargram 提一组\emph{关键点 $+$ 描述子}，靠描述子匹配建稀疏对应，再 SVD 解位姿；
+  \item \textbf{配准法}（\cref{sec:radar-reg}）：先把 radargram 滤成\emph{点云}，再套 \cref{ch:pointcloud} 的 ICP/GICP/NDT。
+\end{enumerate}
+三者从“用全部像素”到“用稀疏点云”逐级丢弃信息、换取效率与稳健，恰好对应 \cref{fig:radar-types} 中 radargram 的三种下游用法。本节补齐前两条，与前面的多普勒（免对应）、后面的配准（点云）合成雷达里程计的完整谱系。
+
+\begin{note}
+\textbf{雷达里程计的精度基准.}\;旋转雷达的平移漂移约为每 $100$\,m 累积 $1$--$2\%$\cite{carlone2026handbook}；无回环时误差必然无界增长（与 \cref{ch:lidar_slam} 纯里程计同理）。一个值得记的对照：Kubelka 等比较 $3{+}1$D 雷达的多种配准法与“免配准的多普勒 $+$ IMU”，发现\emph{免配准}法误差最低（$4.5$\,km 轨迹漂移低至 $0.3\%$），尤其在特征贫乏处——再次印证 \cref{ins:radar-corr-free}：能绕开数据关联就绕开。但免配准只给速度，故本节与下节“找对应”的方法仍不可少：它们才给出含朝向的完整位姿。
+\end{note}
+
+\subsection{直接法：相位相关与 Fourier--Mellin}
+\label{subsec:radar-direct}
+
+\paragraph{动机：旋转雷达的招牌技巧——极坐标里“竖移 $=$ 转角”。}
+直接法的出发点是一个漂亮的几何观察。把一帧 radargram 摆成图像，约定\textbf{纵轴为方位角 $\theta$、横轴为距离 $r$}。当平台\emph{原地旋转} $\Delta\theta$，环境相对雷达整体转了 $\Delta\theta$，于是同一静止目标在新帧里出现在方位 $\theta+\Delta\theta$、距离 $r$ 不变——也就是说，\textbf{整张极坐标图沿纵轴（方位）竖直平移了 $\Delta\theta$，沿横轴（距离）纹丝不动}\cite{carlone2026handbook}。一个看似要解三角的“估两帧旋转”问题，被极坐标\emph{化归}成“估一张图相对另一张图的竖直像素位移”，而后者有成熟、快速、\emph{全局}的解——相位相关。
+
+\paragraph{相位相关：用傅里叶相移把“平移”读成“相位”。}
+相位相关（phase correlation）是图像配准的经典工具，借\textbf{傅里叶平移定理}把图像平移变成频域的线性相移。设两图相差平移 $\boldsymbol\delta$，即 $I_2(\mathbf x)=I_1(\mathbf x-\boldsymbol\delta)$，各做二维 FFT 得 $\hat I_1,\hat I_2$，则
+\begin{equation}
+  \hat I_2(\mathbf k)=\hat I_1(\mathbf k)\,e^{-\mathrm{i}\,2\pi\,\mathbf k\cdot\boldsymbol\delta},
+  \label{eq:radar-phasecorr-shift}
+\end{equation}
+平移信息\emph{全部}进了那个纯相位因子。构造\textbf{归一化互功率谱}恰好把幅度抵消、只留相位：
+\begin{equation}
+  C(\mathbf k)=\frac{\hat I_1(\mathbf k)\,\overline{\hat I_2(\mathbf k)}}{\bigl|\hat I_1(\mathbf k)\,\overline{\hat I_2(\mathbf k)}\bigr|}
+   =e^{\mathrm{i}\,2\pi\,\mathbf k\cdot\boldsymbol\delta},
+  \label{eq:radar-phasecorr-cps}
+\end{equation}
+其中 $\overline{(\cdot)}$ 为复共轭。对 $C(\mathbf k)$ 再做一次\emph{逆} FFT，得到一个集中在 $\boldsymbol\delta$ 处的尖锐脉冲——\textbf{峰的位置即平移量 $\boldsymbol\delta$}（符号随 FFT 约定）。这是个\emph{全局}解：无需初值、无需迭代、无需点对应，一两次 FFT 即定，且因信息集中在相位、对加性噪声相当鲁棒。
+
+\paragraph{两步求位姿：极坐标定转角，笛卡尔定平移。}
+直接法据此分两步取两帧相对位姿\cite{carlone2026handbook}：
+\begin{enumerate}
+  \item \textbf{定旋转}：在两帧\emph{极坐标} radargram 上做相位相关，竖直像素位移即方位转角 $\Delta\theta$（上文“竖移 $=$ 转角”）；取使两图吻合度最高的位移。
+  \item \textbf{定平移}：用 $\Delta\theta$ 把上一帧转正，转到\emph{笛卡尔}坐标后再做一次相位相关，求出平面平移 $(\Delta x,\Delta y)$。
+\end{enumerate}
+这正是 \textbf{Fourier--Mellin} 配准思想的雷达特例：Fourier--Mellin 变换本是“幅度谱 $\to$ 对数极坐标重采样 $\to$ 相位相关”的流水线，把\emph{旋转与缩放}也化成平移来求；雷达里没有尺度变化，且方位旋转已天然是极坐标里的竖移，于是退化成上面干净的两步。
+
+\paragraph{致命前提：功率回波的“时间平稳性”。}
+相位相关成立暗含一条强假设：\textbf{同一地点的功率回波在不同时刻保持平稳}（stationary）——唯其如此，两帧对应像素的强度才一致、互相关才有意义\cite{carlone2026handbook}。可雷达数据恰最不满足：动目标会在 radargram 上移动，斑点噪声逐帧随机起伏，接收器饱和随观测角剧变（\cref{fig:radar-aliasing}）。这些\emph{非平稳}的功率回波是相关的“假信号”，会把峰值拉偏，让直接法估出错误的转角或平移。这是直接法相对特征法/配准法的根本软肋：它\emph{不加甄别}地相信每一个像素。
+
+\paragraph{Barnes 的“以动制动”（Masking by Moving）：让网络学出该信谁。}
+Barnes 等\cite{barnes2020masking} 给出一个优雅修补。其里程计仍是相关式：在一组规则网格的位姿候选上，计算当前帧与\emph{旋转过的}上一帧副本的二维互相关，相关最高者即相对位姿。关键创新在\textbf{不再盲信整张 radargram}——他们训练一个卷积神经网络（CNN）预测一张\textbf{掩膜}（mask），只保留 radargram 中\emph{平稳、对配准有用}的部分，把动目标、噪声、饱和伪迹等非平稳成分压掉再做相关。方法因此得名“Masking by Moving”：掩膜的监督来自\emph{运动本身}——能在连续帧间稳定重现、与自运动一致的像素才该保留。它把“功率平稳假设”从一条\emph{脆弱前提}变成一个\emph{可学习的筛选器}，是直接法走向稳健的代表作，也预示了 \cref{subsec:radar-feature} 末尾“学习式特征”的思路。
+
+\begin{insight}[直接法的取舍：全局无初值 vs 怕非平稳]\label{ins:radar-direct-tradeoff}
+直接法最大的好处是\textbf{全局、免初值}：相位相关一两次 FFT 就给出转角/平移，不像 ICP 那样要好初值才不陷局部极小（\cref{ch:pointcloud}）。代价是它对\emph{所有}像素一视同仁，因而对非平稳功率回波（动目标、噪声、饱和）格外敏感。这条取舍与全书反复出现的“稠密 vs 稀疏”主题一致：用全部数据（直接法、光度法）换全局性与免特征，却赔上对离群与外观变化的鲁棒性；下节特征法与 \cref{sec:radar-reg} 配准法则反过来，先稀疏化、再稳健匹配。Barnes 的可学习掩膜，本质是想\emph{两头通吃}——既保留直接法的全局相关，又借掩膜获得近似特征法的选择性。
+\end{insight}
+
+\subsection{特征法：借用视觉特征与雷达专用描述子}
+\label{subsec:radar-feature}
+
+\paragraph{动机：radargram 是鸟瞰图像，CV 的特征军火库可直接搬。}
+二维旋转 FMCW 雷达的 radargram 本质是一张\textbf{鸟瞰强度图}（bird's-eye-view image）。既是图像，计算机视觉几十年积累的特征工具就有了用武之地\cite{carlone2026handbook}：在 radargram 上检测 \textbf{SIFT}、\textbf{SURF}、\textbf{ORB} 等关键点与描述子（与 \cref{ch:vo} 的视觉特征同源），跨帧匹配建稀疏对应，再解相对运动。早期工作据此匹配过群岛中各岛屿的大尺度轮廓、也有从星载雷达图像提特征做配准的。
+
+\paragraph{反面：为什么雷达描述子“更难”？}
+直接搬 CV 特征却不那么顺，根因是雷达图像的统计特性远逊于相机\cite{carlone2026handbook}：
+\begin{itemize}
+  \item \textbf{噪声高且随环境剧变}：斑点、幽灵、饱和（\cref{sec:radar-sensing}）使 radargram 的信噪比远低于光学图像，且噪声分布随场景大幅变化——为相机设计（默认光度较稳）的描述子在雷达上\emph{检测重复性差、描述向量不稳}。
+  \item \textbf{描述子更“因地而变”（place-variant）}：同一目标从不同位姿看，雷达回波因波束宽、各向异性散射、饱和而显著不同（\cref{fig:radar-aliasing}）。于是\emph{同一物理点}在两帧的描述子可能对不上，位姿差异越大数据关联越易错（这与 \cref{sec:radar-place} 位置识别更难是同一病根）。
+\end{itemize}
+正因如此，研究者设计了\textbf{雷达专用}的关键点检测子与描述子，如 \textbf{FSCD} 与 \textbf{BASD}（二进制环形统计描述子，binary annular statistics descriptor），专门迁就 radargram 的噪声与极坐标结构，而非照搬光学描述子。
+
+\paragraph{流程：关键点 $\to$ 描述子匹配 $\to$ RANSAC $\to$ SVD 解位姿。}
+特征法的标准管线与视觉里程计同构\cite{carlone2026handbook}：
+\begin{enumerate}
+  \item \textbf{提点 $+$ 描述}：取一组\emph{显著且能在后续帧稳定重现}的关键点，对每点算一个刻画其邻域的描述子；
+  \item \textbf{匹配 $+$ 稳健化}：用描述子匹配建立两帧对应，常配 \textbf{RANSAC} 等稳健估计器剔误匹配（雷达误匹配尤多，稳健化绝不可省）；
+  \item \textbf{解位姿}：给定内点对应 $\{(\mathbf p_i,\mathbf p_i')\}$，最小化对应点空间距离——这是 \cref{ch:pointcloud} 已推导的\emph{带对应点集配准}（Procrustes/Wahba）问题，闭式解由\textbf{奇异值分解}（SVD）给出。
+\end{enumerate}
+记去心后的互协方差 $\mathbf M=\sum_i \mathbf p_i'\,\mathbf p_i^\top$（$\mathbf p,\mathbf p'$ 均已减各自质心），其 SVD 为 $\mathbf M=\mathbf U\mathbf S\mathbf V^\top$，则
+\begin{equation}
+  \mathbf R^\star=\mathbf U\,\operatorname{diag}\!\bigl(1,\dots,1,\det(\mathbf U\mathbf V^\top)\bigr)\,\mathbf V^\top,
+  \qquad
+  \mathbf t^\star=\bar{\mathbf p}'-\mathbf R^\star\,\bar{\mathbf p},
+  \label{eq:radar-feature-svd}
+\end{equation}
+末位的 $\det(\cdot)$ 修正保证 $\mathbf R^\star\in\SO(d)$（杜绝反射解）——与 \cref{ch:pointcloud} 点到点 ICP 每步的旋转闭式解\emph{完全一致}，差别只在这里的对应来自\emph{描述子匹配}而非最近邻搜索（故本章遵循 \cref{sec:radar-reg} 的约定，不重推此式）。
+
+\begin{insight}[特征法 vs 配准法：何时更稳？]\label{ins:radar-feature-vs-reg}
+特征法与下一节配准法都靠“找对应 $+$ 最小化距离”，区别在\textbf{对应怎么来}：特征法靠\emph{描述子}匹配（看“长得像不像”），配准法靠\emph{空间邻近}匹配（看“离得近不近”，如 ICP 的最近邻）。这决定了适用边界——\textbf{两帧初始位姿差很大时，特征法更稳}：描述子匹配不依赖初值，哪怕雷达晃动剧烈也能把“长得像”的点对上；而配准法的最近邻对应在大初始误差下会大面积配错、陷入局部极小。反过来，雷达描述子\emph{本就更弱}（见上“更难”），在结构丰富、初值又好时，配准法（尤其配到多关键帧，\cref{sec:radar-reg}）凭海量点的几何约束往往更精、更抗噪。故现代旋转雷达里程计常\emph{特征法粗对齐、配准法精化}，与 \cref{ch:vio} 的“特征跟踪给初值、光束法平差精修”异曲同工。
+\end{insight}
+
+\paragraph{走向学习式特征。}
+手工描述子（FSCD/BASD）之外，关键点与描述子也可由深度网络\emph{端到端}学出，让特征自动适应雷达统计\cite{carlone2026handbook}（与 \cref{subsec:radar-direct} 的可学习掩膜一脉相承）。代价同样是\textbf{需要训练数据}——成对的 radargram 加相近环境下的位姿真值，这也解释了 \cref{sec:radar-slam} 为何反复强调“含激光真值的数据集”之珍贵。
+
+\begin{pitfall}[把相机描述子直接套到 radargram]
+SIFT/ORB 等描述子的可重复性建立在\emph{光度大体稳定}、噪声近高斯的假设上。radargram 的斑点、饱和与各向异性散射同时破坏了这两条，照搬常导致关键点检测不重复、描述向量跨帧漂移、匹配内点率骤降。正确做法是\emph{要么}换雷达专用描述子（FSCD/BASD），\emph{要么}用学习式特征让网络吸收雷达噪声统计；并\textbf{务必}加 RANSAC 等稳健估计器兜底——这一步在相机上是保险，在雷达上是必需。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{配准里程计：复用 GICP/NDT 于含噪稀疏点云}
+\label{sec:radar-reg}
+
+多普勒只给速度，要拿到\emph{完整}相对位姿（含旋转）仍要靠点云配准——这部分\textbf{直接复用} \cref{ch:pointcloud} 的内核，本节只讲为雷达做的稳健化，绝不重推 ICP。
+
+\paragraph{先抽点云，再配准。}
+旋转雷达先经 \cref{sec:radar-filter} 的 CFAR/$k$-最强把 radargram 抽成点云；SoC 雷达的点检测在传感器内部完成，直接输出点云（但仍含噪）。难点在\textbf{选点数量}的权衡：太少丢信息、太多引噪声——CFAR 在这点上恰恰难调\cite{carlone2026handbook}。抽出点云后，可像激光一样估局部法向、平面性、点分布，喂给配准。
+
+\paragraph{核心稳健化：配到“多关键帧”而非单帧。}
+雷达点云稀疏、含噪，两帧之间直接配准（pairwise）极不稳。通行做法是把新帧配到\emph{多个}历史关键帧（聚合成子图或一组点云）\cite{carlone2026handbook}：更多对应 $\Rightarrow$ 更多约束 $\Rightarrow$ 在特征贫乏处更抗漂移；多帧冗余还让突发遮挡、动目标的伪对应影响变小。这是“用时间冗余换空间稀疏”，是 \cref{ch:lidar_slam} 子图思想（LIO-SAM 的滑窗 sub-keyframe）在雷达上的强化。
+
+\paragraph{代表方法：都是 \cref{ch:pointcloud} 内核的雷达变体。}
+\begin{itemize}
+  \item \textbf{CFEAR}\cite{carlone2026handbook}（\emph{勿}与滤波的 CFAR 混淆）：沿每方位取 $k$ 最强点抽云，每帧联合配到最近 $s$ 个关键帧，残差用点到点/点到线/点到分布（即 \cref{ch:pointcloud} 的 NDT 式 D2D）。每点法向由邻域协方差估出，对应按\emph{法向一致性}、\emph{平面性}（协方差条件数）、\emph{邻域点数}加权——本质是 \cref{ch:pointcloud} 的 GICP“概率加权”思想在低质雷达点上的精细化。
+  \item \textbf{功率加权 NDT}：抽点云后聚成雷达子图的 NDT 表示，每点贡献按回波强度加权——把 \cref{ch:pointcloud} 的 NDT 单元统计加上雷达强度信息。
+  \item \textbf{连续时间 ICP}：用 BFAR 抽点、聚成局部子图，把点关联到\textbf{高斯过程运动先验}上做连续时间 ICP（\cref{ch:imu} 的 GP/连续预积分思想，\cref{sec:imu-advanced}），自然处理慢扫畸变。
+  \item \textbf{$3{+}1$D 的 APDGICP / 4D iRIOM}：SoC $4$D 雷达先用多普勒最小二乘（\cref{eq:radar-egovel-wls}）估本体速度作\emph{初值}并剔动目标，再做配准精化。4DRadarSLAM 的 APDGICP 是 \cref{ch:pointcloud} 的 \textbf{GICP 变体}——按协方差给\emph{远点}更大不确定度（雷达方位/俯仰角精度有限，远点横向误差大）；4D iRIOM 用\emph{一对多}分布到分布匹配（每点配到一组最近分布的加权和）抗稀疏噪声。
+\end{itemize}
+
+\begin{insight}[多普勒与配准：先验与精化的分工]\label{ins:radar-doppler-reg}
+$4$D 雷达里程计的现代范式是\textbf{两段式}：多普勒最小二乘（\cref{eq:radar-egovel-wls}）先给一个\emph{免对应、抗动目标}的速度初值，配准（GICP/NDT 变体）再据此精化出\emph{完整}相对位姿。这与 \cref{ch:lidar_slam} 里“IMU 预测给初值、ICP 精化”的分工同构——多普勒在雷达里扮演了 IMU 在激光里的“初值供给者”角色。这也呼应 \cref{ins:radar-vs-lidar}：雷达多出的那一维速度，恰好补上了它配准能力的短板。
+\end{insight}
+
+\paragraph{运动补偿：和激光去畸变同源。}
+慢扫旋转雷达（$4$\,Hz）扫一圈期间平台已移动，须按 \cref{sec:lidar-deskew} 的思路去畸变：用相邻两帧相对位姿与逐点时间戳，把每点校正到统一参考时刻。文献报告匀速模型去畸变可降 ATE 约 $29\%$\cite{carlone2026handbook}。更精细者用样条/高斯过程的\emph{连续时间}轨迹，在每个点的采样时刻查询位姿去畸变——这正是 \cref{sec:imu-advanced} 连续时间表示对\emph{非同步}传感器有用的又一例证。
+
+% ════════════════════════════════════════════════════════════════
+\section{雷达位置识别：把描述子“雷达化”}
+\label{sec:radar-place}
+
+回环检测对雷达 SLAM 同样不可或缺。好消息是 \cref{sec:lidar-place} 的方法学大体可迁移，本节只讲雷达特有的改动，\textbf{不重讲描述子原理}。
+
+\paragraph{雷达位置识别的独门困难。}
+比激光更难，因为（\cref{fig:radar-aliasing} 概念）\cite{carlone2026handbook}：分辨率低 $\Rightarrow$ 可辨特征少；波束宽 $\Rightarrow$ 远处目标成“大斑块”、近看远看差异大（角度模糊）；信噪比低 $\Rightarrow$ 不充分滤波则描述子被噪声污染；接收器饱和 $\Rightarrow$ 强目标随观测角剧变。结果是\textbf{同一地点从不同位置看，雷达外观可能大不相同}——视觉混淆（aliasing）比激光严重。此外旋转雷达与 SoC 雷达要分开处理：前者是 $360^\circ$ 长测程二维图像（近视觉位置识别），后者窄视场、高稀疏（近激光点云位置识别，但 FoV 窄使旋转不变性更难）。
+
+\paragraph{两条迁移路线。}
+\begin{itemize}
+  \item \textbf{学习法}：把旋转雷达的二维 radargram 当图像做检索。早期工作用\emph{圆柱卷积}（cylindrical convolution）处理极坐标的环绕性以学到\textbf{旋转不变}表示，再用 NetVLAD 聚合成全局描述子（与 \cref{ch:vo} 视觉位置识别的 NetVLAD 同源）。SoC 雷达则把点云投到二维平面、用时空编码器 $+$ NetVLAD，并按 RCS 重排序滤掉无关静态点。
+  \item \textbf{描述子适配（复用 \cref{sec:lidar-place}）}：直接搬激光描述子，只改“雷达不友好”的部分——
+  \begin{itemize}
+    \item \textbf{ScanContext$_\text{radar}$}：原版 ScanContext 用每个极坐标格子的\emph{最大高度}编码结构（\cref{sec:lidar-place}）。二维旋转雷达\emph{无高度}，故\textbf{以 RCS/强度代高度}——存格子内强度之和（兼顾强度与点密度，即\emph{强度 ScanContext}）。$3{+}1$D 雷达虽有高度，但噪声点易扰乱高度测量，故仍多用强度而非最大高度。窄 FoV 时旋转不变性差，可借里程计做\emph{回环预筛}（只匹配偏航相近的帧）。
+    \item \textbf{RING / M2DP 适配}：RING 的正弦图（sinogram）形式天生旋转-平移不变，但雷达噪声大，需加自相关增强；M2DP 从三维改用于 radargram 抽出的二维点云，并用 PCA 两特征值判断点云是否“够独特”（高速公路这类一向延展的场景特征值悬殊，剔除不用）。
+  \end{itemize}
+\end{itemize}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=8mm]
+  \node[draw, rounded corners, fill=main!8, minimum width=22mm, minimum height=14mm, align=center] (a) {同一地点\\ 视角 A};
+  \node[draw, rounded corners, fill=second!8, minimum width=22mm, minimum height=14mm, align=center, right=14mm of a] (b) {同一地点\\ 视角 B};
+  \draw[<->, thick, red!60!black] (a) -- node[midway, above, font=\scriptsize, red!60!black]{噪声/饱和致外观大变} (b);
+  \node[font=\scriptsize, below=1mm of a] {强斑点、幽灵};
+  \node[font=\scriptsize, below=1mm of b] {饱和径向条纹};
+\end{tikzpicture}
+\caption{雷达位置识别的视觉混淆：同一地点从两个视角采集的 radargram 因斑点噪声、接收器饱和而外观显著不同，使“同地点应匹配”的朴素比较失效——故须更鲁棒的描述子与回环验证。（仿 \cite{carlone2026handbook} 图 9.10 重绘）}
+\label{fig:radar-aliasing}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{雷达 SLAM 系统与多模态}
+\label{sec:radar-slam}
+
+把前面的部件（多普勒/配准里程计 $+$ 位置识别 $+$ 地图）按 \cref{ch:lidar_slam} 的因子图后端串起来，就是完整雷达 SLAM。架构与激光/视觉 SLAM 无异（前端里程计 $\to$ 回环 $\to$ 位姿图全局优化），定制只在适配雷达数据。
+
+\paragraph{地图表示。}
+随用途而异\cite{carlone2026handbook}：\emph{路标图}（每个检测目标为一路标，适合 SoC 二维雷达这类检测稀少者）、\emph{占据栅格}（把目标点当激光点）、\emph{点云/surfel/NDT 图}（CFEAR 式带法向与权重）、\emph{热力图}（峰检测前的原始强度栅格，用相关对齐）、乃至\emph{神经场}（物理感知的雷达隐式几何与反射模型）。雷达穿透性还启发了改造的占据更新——不假设“第一回波即唯一占据点”，而在视场内按有无回波增减体素概率（应对雷达可穿透部分材质）。动态栅格则用 PHD（概率假设密度）多伯努利滤波处理动目标。
+
+\paragraph{代表系统（综述笔法）。}
+本书把雷达 SLAM 系统概括为三条线\cite{carlone2026handbook}：
+\begin{itemize}
+  \item \textbf{二维旋转雷达}：TBV-SLAM（“trust but verify”）以 CFEAR 里程计为前端，关键帧入位姿图，用\emph{强度 ScanContext} 取回多个回环候选、再几何验证选最优（含 CorAl 对齐度量）；一个值得记的实证——它发现用\emph{预设小对角协方差}比用配准代价 Hessian 估的协方差\emph{更好}（Hessian 常过/欠估不确定度，拧偏后端）。RadarSLAM 用 radargram 上的 blob 关键点 $+$ KLT 跟踪做里程计、M2DP 描述子做回环。
+  \item \textbf{二维 SoC 雷达}：因检测稀少，可维护\emph{含路标节点}的图（而非只位姿图），用 BASD 二进制描述子关联特征。
+  \item \textbf{$3{+}1$D SoC 雷达}：4DRadarSLAM 与 4D iRIOM 都用多普勒剔动目标 $+$ 速度初值 $+$ 配准（APDGICP / 一对多 D2D），ScanContext（含/不含高度）做回环——是当前全 $6$ 自由度雷达 SLAM 的代表。
+\end{itemize}
+
+\paragraph{多模态：据能见度信任不同传感器。}
+\label{sec:radar-multimodal}
+雷达最自然的归宿是与其他传感器融合（呼应 \cref{ins:radar-vs-lidar} 的互补）\cite{carlone2026handbook}：
+\begin{itemize}
+  \item \textbf{雷达-激光}：按估计测程判断信任谁（清朗信激光、低能见信雷达），或把雷达配到激光地图做跨模态位置识别。
+  \item \textbf{雷达-相机 / 雷达-热像}：把雷达多普勒速度并入滤波式 VIO（如扩展 ROVIO 纳多普勒），或用雷达点云改善热像帧间匹配的深度——在低能见场景给出鲁棒里程计。
+  \item \textbf{雷达-IMU}：即 \cref{sec:radar-doppler} 的主线，陀螺补旋转、多普勒给速度。
+  \item \textbf{先验地图}：把二维 radargram 定位到 OpenStreetMap 的建筑墙线，或卫星图（RSL-Net 用深网把俯视图“译”成合成 radargram 再配准）——多用于\emph{定位}而非完整 SLAM。
+  \item \textbf{超宽带（UWB）雷达：与 mmWave 机理迥异的“另类雷达”}。有些系统借\textbf{超宽带}（ultra-wideband, UWB）射频感知\cite{carlone2026handbook}。UWB 虽同属无线电波、也被称作“UWB 雷达”，但其\emph{测距机理与 mmWave 大不相同}，在雷达 SLAM 里扮演的角色也随之不同——
+  \begin{itemize}
+    \item \textbf{签名式回环（最常见）}：发一记宽带宽波束脉冲，回波的\emph{频率响应}即可作当前地点的一枚“指纹”签名；为每个地点（图节点）存一份回波签名 $+$ 估计位姿，靠签名相似性检测\textbf{重访}，连成位姿图优化。此处 UWB 只供\emph{回环}，而\textbf{度量}（节点间距离）仍来自轮速计/IMU 里程计——它回答“是不是同一地方”，不回答“走了多远”。
+    \item \textbf{三边定位的路标 SLAM}：另有工作反其道而行，用 UWB 雷达检测\emph{点特征}做路标式 SLAM——机器人两侧各装多个 UWB 模块，对两侧信号里匹配上的回波峰做\textbf{三边定位}（trilateration）解出路标位置，纳入因子图。
+    \item \textbf{锚-签（anchor--tag）定位：不算 SLAM}。还有大量 UWB 方案用\emph{锚点-标签}配置：若干锚点固定在\emph{已知}位置，机器人带一枚电池供电的 UWB 标签，靠到各锚点的测距三边定位自身。但这需\emph{预先布设基础设施}、且地图（锚点位置）已知，本质是\textbf{已知地图中的定位}而非 SLAM——与本章“边走边建图”的设定不同，列此以划清边界。
+  \end{itemize}
+\end{itemize}
+
+\paragraph{数据集（点到为止）。}
+雷达 SLAM 研究依赖少数公开数据集\cite{carlone2026handbook}：旋转雷达的 Oxford Radar RobotCar（城市、多天气）、MulRan（多样环境、面向位置识别）、Boreas（跨一年、含雨雪等恶劣天气，是全天候研究的标杆）；SoC 雷达的 nuScenes、ColoRadar（含原始 ADC 与数据立方体、室内外及矿井、$6$ 自由度真值）、K-Radar 等。选数据集的关键是看它是否含\emph{恶劣天气}与\emph{激光真值}——前者检验雷达的看家本领、后者用于训练“雷达超分”模型。
+
+\paragraph{趋势与开放问题（选读）。}
+全三维（含俯仰）雷达里程计与位置识别仍少，随高分辨 SoC 发展会增多，尤其对无人机（当前雷达用得少）意义大；窄视场多雷达\emph{星座}的标定与融合是近期热点；更充分利用\emph{原始} radargram/数据立方体的频谱信息（而非过早抽成点云）、雷达\emph{语义分割}辅助位置识别、以及与地理先验的多模态融合，是几条主要方向。
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+雷达就是“噪声大的激光”，沿用 LOAM 即可 & 雷达多一维多普勒、少一维高度，噪声非高斯含幽灵，里程计自成一套（\cref{ins:radar-vs-lidar}）\\
+多普勒里程计是完整里程计 & 只给线速度，缺姿态与角速度，须配 IMU 陀螺（\cref{subsec:radar-egovel} 的陷阱）\\
+多普勒能测出平台自转 & 不能：纯旋转下视线方向无径向分量，角速度项恒为零（秩的论证）\\
+单帧任意几个目标就能解 ego-velocity & 须视线方向张成 $\mathbb R^3$（$\mathbf A$ 列满秩），窄扇区退化（\cref{eq:radar-egovel-stack}）\\
+$f_0$（基频）也能像相位一样测速 & $f_0$ 测距、相位差 $\Delta\phi$ 测速；相位会缠绕，只宜测微位移（\cref{eq:radar-phase}）\\
+锯齿调制的距离已含速度修正 & 没有；三角调制才解耦距离与多普勒（\cref{eq:radar-tri-solve}）\\
+CFAR 是给里程计用的最佳滤波 & CFAR 为目标检测设计；里程计常用更保守的 $k$-最强（\cref{sec:radar-filter}）\\
+ScanContext 直接搬到二维雷达 & 雷达无高度，须以 RCS/强度代高度（\cref{sec:radar-place}）\\
+直接法相关对任意 radargram 都成立 & 它假设功率回波时间平稳；动目标/噪声/饱和致非平稳，须掩膜（Masking by Moving）筛选（\cref{subsec:radar-direct}）\\
+radargram 直接套 SIFT/ORB 即可做特征里程计 & 雷达噪声高、描述子更 place-variant，须 FSCD/BASD 专用描述子 $+$ RANSAC（\cref{subsec:radar-feature}）\\
+雷达点云直接两帧配准即可 & 太稀太噪；须配到多关键帧/子图，GICP/NDT 稳健化（\cref{sec:radar-reg}）\\
+配准代价 Hessian 是回环协方差的好估计 & 实证表明预设小对角协方差常更好（TBV-SLAM 的发现）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$r,v,\theta,\phi$ & 雷达目标四元组：距离/径向速度/方位/俯仰 & \cref{ins:radar-three-fft} \\
+$f_0,\phi_0$ & 中频（IF）基频 / 相位 & \cref{eq:radar-range,eq:radar-phase} \\
+$B,T,S$ & 啁啾带宽 / 时长 / 斜率 $S=B/T$ & \cref{eq:radar-range} \\
+$\Delta\phi$ & 相位差（测速或测角） & \cref{eq:radar-doppler-saw,eq:radar-aoa} \\
+$\lambda$ & 雷达波长 & \cref{eq:radar-phase} \\
+$\mathbf r_d^s,\mathbf u_d^s$ & 目标 $d$ 在传感器系的位置 / 视线单位向量 & \cref{eq:radar-doppler-proj} \\
+$\mathbf v^s$ & 传感器（本体）线速度 & \cref{eq:radar-doppler-proj} \\
+$\mathbf A,\mathbf b,\mathbf W$ & ego-velocity 最小二乘的系数阵/观测/权阵 & \cref{eq:radar-egovel-stack,eq:radar-egovel-wls} \\
+$w_d,i_d$ & 目标归一化强度权 / 强度 & \cref{eq:radar-doppler-weight} \\
+$\mathbf R_{bs},\mathbf r_b^{sb}$ & 雷达到体外参旋转 / 杆臂 & \cref{eq:radar-leverarm} \\
+$\mathbf x_k=[\mathbf v^s;\mathbf q_s^w;\mathbf b]$ & 第 $k$ 帧状态（速度/姿态/偏置） & \cref{eq:radar-state} \\
+$e_{d,k}$ & 多普勒残差 & \cref{eq:radar-doppler-residual} \\
+$\mathbf r_{\mathcal I},\boldsymbol\Lambda$ & IMU 预积分残差 / 信息矩阵 & \cref{eq:radar-cost} \\
+$\boldsymbol\Sigma_{\mathbf v}$ & 观测噪声协方差 & 记号约定 note \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{公式速查表}
+\begin{tabular}{lll}
+\toprule
+公式 & 一句话说明 & 对应 \\
+\midrule
+FMCW 测距 \cref{eq:radar-range} & 中频 $f_0\propto$ 距离 $d=cf_0/2S$ & \cref{sec:radar-sensing} \\
+锯齿测速 \cref{eq:radar-doppler-saw} & 相邻啁啾相位差读多普勒 $v=\lambda\Delta\phi/4\pi T$ & \cref{sec:radar-sensing} \\
+三角解耦 \cref{eq:radar-tri-solve} & 上下啁啾分离距离项与多普勒项 & \cref{sec:radar-sensing} \\
+到达角 \cref{eq:radar-aoa} & RX 天线相位差 $\to$ 方位/俯仰 & \cref{sec:radar-sensing} \\
+多普勒投影 \cref{eq:radar-doppler-proj} & 径向速度 $=$ 本体速度在视线上的投影 & \cref{subsec:radar-egovel} \\
+ego-velocity LS \cref{eq:radar-egovel-wls} & 多目标叠成加权最小二乘解 $\mathbf v^s$ & \cref{subsec:radar-egovel} \\
+杆臂耦合 \cref{eq:radar-leverarm} & 非共置雷达让多普勒也含 $\boldsymbol\omega$ & \cref{subsec:radar-egovel} \\
+多普勒残差 \cref{eq:radar-doppler-residual} & 进因子图、与 IMU 预积分并列 & \cref{subsec:radar-doppler-factor} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabularx}{\linewidth}{cLLl}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 雷达 vs 激光的信息差异 & 多一维多普勒、少一维高度；全天候 & $\bigstar\bigstar$ \\
+2 & FMCW 测距/测速/测角 & 三个 FFT 给 $r,v,\theta,\phi$；自包含推导 & $\bigstar\bigstar\bigstar$ \\
+3 & 雷达噪声与滤波 & 斑点/幽灵/畸变；CFAR vs $k$-最强 & $\bigstar\bigstar$ \\
+4 & 多普勒 ego-velocity & 免对应线性最小二乘；视线张成条件 & $\bigstar\bigstar\bigstar$ \\
+5 & 单雷达角速度不可观 & 视线与径向共线 $\Rightarrow$ 叉积投影为零 & $\bigstar\bigstar\bigstar$ \\
+6 & 多普勒因子进因子图 & 残差/权/稳健核；与预积分并列 & $\bigstar\bigstar\bigstar$ \\
+7 & 直接法与特征法里程计 & 相位相关/Fourier--Mellin（竖移即转角）；SIFT/ORB$+$FSCD/BASD$+$RANSAC/SVD & $\bigstar\bigstar$ \\
+8 & 配准里程计稳健化 & 多关键帧 $+$ GICP/NDT 变体（CFEAR） & $\bigstar\bigstar\bigstar$ \\
+9 & 位置识别雷达化 & 以 RCS/强度代高度；窄 FoV 预筛 & $\bigstar\bigstar$ \\
+10 & 雷达 SLAM 系统与多模态 & 因子图后端；据能见度融合 & $\bigstar\bigstar$ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{系统综述}：SLAM Handbook\cite{carlone2026handbook} 第 9 章——雷达传感原理、滤波、里程计、位置识别、SLAM 系统与数据集（本章框架与分类的出处）。
+  \item \textbf{多普勒里程计}：Kellner 等\cite{kellner2013doppler}（IROS 2013，单雷达 ego-motion）；Doer--Trommer\cite{doer2020radarinertial}（雷达-惯性 ego-velocity，三点 RANSAC $+$ 最小二乘）；Kramer 等\cite{kramer2021radarinertial}（雷达-惯性因子图，\cref{eq:radar-cost} 的出处）。
+  \item \textbf{配准里程计}：CFEAR / Adolfsson 等\cite{adolfsson2021cfear}（多关键帧法向加权）；Burnett 等的连续时间雷达里程计\cite{burnett2021radarct}；4DRadarSLAM\cite{zhang20234dradarslam}（APDGICP）；4D iRIOM\cite{zhang20234diriom}（一对多 D2D）。
+  \item \textbf{直接法}：Barnes 等“Masking by Moving”\cite{barnes2020masking}（CNN 掩膜 $+$ 相关，\cref{subsec:radar-direct}）。
+  \item \textbf{特征法}：radargram 上借 SIFT/SURF/ORB 与雷达专用 FSCD/BASD 描述子、RANSAC $+$ SVD 求解，综述见\cite{carlone2026handbook}（\cref{subsec:radar-feature}）。
+  \item \textbf{完整 SLAM 系统}：TBV-SLAM / Adolfsson 等\cite{adolfsson2023tbv}（“trust but verify” 回环）；RadarSLAM / Hong 等\cite{hong2022radarslam}。
+  \item \textbf{位置识别}：Saftescu 等\cite{saftescu2020kidnapped}（圆柱卷积旋转不变 $+$ NetVLAD）；雷达 ScanContext 适配见 \cite{adolfsson2023tbv}；激光描述子原理见 \cref{sec:lidar-place}。
+  \item \textbf{数据集}：Oxford Radar RobotCar\cite{barnes2020oxford}、MulRan\cite{kim2020mulran}、Boreas\cite{burnett2023boreas}（全天候）。
+\end{itemize}
+
+\section*{本章与相邻章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+章节 & 关系 & 衔接点 \\
+\midrule
+\cref{sec:lidar-rae} RAE 观测 & 雷达 $[r,\theta,\phi]$ 与激光 RAE 同构 & 本章 \cref{ins:radar-three-fft} 复用其正逆映射与雅可比 \\
+\cref{ch:pointcloud} 点云配准 & 提供 GICP/NDT 内核 & 本章 \cref{sec:radar-reg} 做稀疏/含噪稳健化 \\
+\cref{ch:imu} IMU 预积分 & 多普勒因子与预积分因子并列进同一图 & 本章 \cref{eq:radar-cost} 复用残差 $\mathbf r_{\mathcal I}$、$\boldsymbol\Lambda$ \\
+\cref{ch:vio} VIO & 雷达-惯性因子图与 VIO 同构 & 把视觉重投影因子换成多普勒因子 \\
+\cref{sec:lidar-place} 位置识别 & ScanContext/RING 描述子 & 本章 \cref{sec:radar-place} 讲雷达化改动 \\
+\cref{ch:event} 事件相机 & 兄弟章：另一种“多一维信号”的传感器 & 同走“三问入图”范式（\cref{ins:radar-factor-recipe}） \\
+\cref{ch:leg} 腿式里程计 & 兄弟章：接触/速度因子亦与预积分同构 & 同走“异构传感器、同一张图” \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.24\textwidth} p{0.30\textwidth} p{0.36\textwidth}}
+\toprule
+症状 & 可能原因 & 排查步骤 \\
+\midrule
+多普勒里程计朝向缓慢漂移 & 缺角速度/姿态约束 & 1.确认接入 IMU 陀螺补 $\boldsymbol\omega$；2.检查重力补偿用的俯仰/横滚是否在估；3.单雷达切勿期望测自转（\cref{subsec:radar-egovel}）\\
+ego-velocity 横向分量乱跳 & 视线方向退化（窄扇区） & 1.检查 $\mathbf A$ 列秩/条件数；2.窄 FoV 改用多雷达或车辆模型；3.加 IMU 约束补该方向 \\
+速度估计被动目标带偏 & 未剔外点 & 1.先三点 RANSAC 选内点；2.多普勒残差套 Cauchy 核；3.剔与 LS 速度不符的点 \\
+直接法转角/平移突然跳变 & 功率回波非平稳（动目标/饱和）污染相关 & 1.改用掩膜（Masking by Moving）剔非平稳像素；2.或改用特征法/配准法；3.先去畸变再相关（\cref{subsec:radar-direct}）\\
+高速/转弯地图拖尾 & 慢扫未去畸变 & 1.开匀速/连续时间去畸变；2.核对逐点时间戳；3.估 $v\cdot T_{\text{scan}}$ 是否超分辨率（\cref{sec:radar-reg}）\\
+回环频繁误匹配 & 视觉混淆/描述子被噪声污染 & 1.先充分滤波 $+$ 去畸变再建描述子；2.以强度代高度；3.里程计预筛 $+$ 几何验证（\cref{sec:radar-place}）\\
+两帧配准发散 & 点云太稀太噪 & 1.改配到多关键帧子图；2.用法向/平面性加权（CFEAR）；3.用多普勒速度给初值 \\
+墙后/路面下出现假目标 & 多路径幽灵 & 1.RANSAC/速度一致性剔除静态外点；2.占据更新勿假设单回波 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{API 速查表}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.30\textwidth} p{0.62\textwidth}}
+\toprule
+功能 & 接口 / 要点（一句话） \\
+\midrule
+点云配准 & PCL \texttt{GeneralizedIterativeClosestPoint}（GICP，雷达 APDGICP 的基底）、\texttt{NormalDistributionsTransform}（NDT/CFEAR 式） \\
+多普勒最小二乘 & 自实现 \cref{eq:radar-egovel-wls}：堆叠视线方向 $\to$ 加权法方程；外点用三点 RANSAC \\
+因子图 / 多普勒因子 & GTSAM 自定义一元 \texttt{NoiseModelFactor}（残差 \cref{eq:radar-doppler-residual}）$+$ \texttt{ImuFactor}（预积分） \\
+李群 / 右扰动 & Sophus \texttt{SO3d}/\allowbreak\texttt{SE3d}；姿态更新右乘 \texttt{q * Exp(delta)} \\
+开源系统 & 4DRadarSLAM、CFEAR Radar Odometry、TBV-SLAM、4D iRIOM（均 ROS） \\
+数据集工具 & Oxford Radar RobotCar SDK、MulRan devkit、Boreas devkit \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{研究实践建议}
+\begin{itemize}
+  \item \textbf{初学者}：在 ColoRadar 或 Boreas 上可视化 radargram 与 $k$-最强点云，手推 \cref{eq:radar-range,eq:radar-doppler-saw}；用 \cref{eq:radar-egovel-wls} 实现单帧 ego-velocity 并与真值比。
+  \item \textbf{进阶}：复现多普勒 $+$ IMU 因子图（\cref{eq:radar-cost}），逐项核对多普勒残差雅可比与预积分残差；在 $4$D 数据上做“多普勒初值 $+$ APDGICP 精化”两段式里程计。
+  \item \textbf{有余力}：在恶劣天气序列（Boreas 雪/雨）上对比雷达与激光里程计退化情形，复现雷达-激光据能见度融合（\cref{sec:radar-multimodal}）。
+\end{itemize}

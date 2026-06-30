@@ -1,0 +1,1529 @@
+\chapter{大规模训练：性能优化与 NaN 排查}\label{ch:rlmc-largescale}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章——「训练工程」收口章。
+%  主线：算法/概念领路 —— 先立「这个工程环节在管线里解决什么 + 原理与反面」，
+%  再把每个概念落到 mjlab / Isaac Lab / UniLab 三框架的工程接线对比。
+%  假定读者已有 RL 基础（理论部 P6_rl 已讲 PPO/GAE/Actor-Critic）与前面实践章基础
+%  （观测·动作·奖励·Manager·DR·特权·训练管线·物理引擎·四足/人形/操作实战·DIY），
+%  本章只讲「规模化 + 稳定化 + 可复现」，不重教 RL 基础。
+%  源稿 RL运控/Ch24_大规模训练_性能优化与NaN排查.md（mjlab + Isaac Lab 双框架）按本主线重构；
+%  UniLab 列已据「RL运控融合_UniLab参考.md」(gpufree 实跑+读源, commit 99936e08) 补全为三框架：
+%    多 GPU=training.num_gpus(off-policy, rank-local H2D+local SGD, 无 DDP, MultiGPUCPUPinnedReplayPipeline)；
+%    NaN=NanGuard(默认开)+unilab-viz-nan；profiling=training.trace_enabled(off-policy, TraceRecorder)；
+%    /dev/shm 预算守卫(memory_budget.py)；AGILE 工具箱多为「需自实现」+少数内建近似(PenaltyCurriculum/EmpiricalNormalization)。
+%    源码引用统一「文件+类/函数 + UniLab commit 99936e08」；UniLab 论文 arXiv:2605.30313\cite{unilab2026}。
+%  关键 API/版本/命令/论文归属经联网核对（2026-06）：
+%    - mjlab：github.com/mujocolab/mjlab，arXiv:2601.22074\cite{mjlab2026}；Isaac Lab 风格 API +
+%      MuJoCo-Warp；CLI=uv run train/play；多 GPU=--gpu-ids "[0,1]"（README 已核）；
+%      多 GPU 后端=RSL-RL + torchrunx（arXiv 已核）；NaN guard：复核(2)经 mjlab 1.4.0 安装源确证——
+%      train --enable-nan-guard(置 sim.nan_guard.enabled)、console-script viz-nan、NanGuard.watch、
+%      默认 dump /tmp/mjlab/nan_dumps、dump npz 键 states_step_*/_metadata 全对（原 \rebuilt 已解）。
+%    - Isaac Lab：Mittal 等\cite{mittal2025isaaclab}，arXiv:2511.04831（2025，已核）；多 GPU=torchrun +
+%      --distributed，支持 RL-Games/RSL-RL/skrl，仅 Linux（官方 multi_gpu 文档已核）；
+%      RL 入口 scripts/reinforcement_learning/<lib>/train.py（已核）；OSMO 为生产级多节点编排（已核）。
+%    - RSL-RL：Schwarke 等\cite{schwarke2025rslrl}，arXiv:2509.10771；EmpiricalNormalization
+%      在 process_env_step() 内 update_normalization(obs)（已核）。
+%    - AGILE：Zhao 等\cite{zhao2026agile}，arXiv:2603.20147，标题「A Comprehensive Workflow for
+%      Humanoid Loco-Manipulation Learning」，引擎名 AGILE=A Generic Isaac-Lab based Engine；
+%      在 Unitree G1 + Booster T1 上跨 5 类技能验证（已核）。L2C2/virtual harness/value-bootstrap
+%      等内部技术名未在摘要逐字确认→具体默认值/签名包 \rebuilt 或 \pz{待核实}。
+%    - 凡未在官方文档/论文逐字确认的具体字符串/默认值/吞吐数字，包 \rebuilt{} 或 \pz{待核实：}。
+% ════════════════════════════════════════════════════════════════
+
+前面整部把强化学习运控的\emph{零件}逐一磨好，又在四足（\cref{ch:rlmc-quadloco}）、人形、操作等\emph{内置任务}上组合演练，最后在 DIY 章（\cref{ch:rlmc-diy}）学会为自己的机器人从零搭一个环境。到这一步，你已经\textbf{能让一次训练跑起来}。本章要跨过的，是从“能训练”到“\emph{高效、稳定、可复现地}大规模训练”的工程跨越。
+
+这道坎的特征与 DIY 章恰好相反：DIY 的难在“错误不报错、只表现为不收敛”；而大规模训练的难在“\textbf{错误以最猝不及防的方式报错}”——训练跑了三小时、reward 曲线正喜人地往上爬，突然某一步整批环境的 reward 变成 \texttt{NaN}，从此不可恢复；或者你以为加一块 GPU 能把训练提速一倍，结果只是“看了两倍的数据”却得出“多 GPU 收敛更快”的错误论文结论。本章把这些工程陷阱系统化为四件工具：\textbf{多 GPU 配置}（规模）、\textbf{NaN 排查}（稳定）、\textbf{性能 profiling}（速度）、\textbf{实验管理与 AGILE 工业级流程}（可复现）。
+
+本章仍遵循全书「概念领路、实践兑现」的次序。每一节先立\textbf{方法论/概念主线}（这个工程环节解决什么问题、原理、反面教训），再在其下排布\textbf{三框架对比实战}：mjlab 与 Isaac Lab 给出 GPU 仿真主导范式下的工程接线，UniLab 则给出异构 CPU 仿真 $+$ GPU 策略范式下的对照实现（多 GPU 走 rank-local H2D 管线而非 DDP、NaN 守卫默认开、profiling 看三段流水线重叠、并多一个 \verb|/dev/shm| 预算守卫）。本质洞察先行：\textbf{大规模训练的工具几乎都不是“加速按钮”，而是“工程复杂度的放大器”——它们让你能做更大的实验，但同时也放大了每一个被忽视的细节（样本量口径、rank 写冲突、数值边界）所带来的代价。}
+
+% ════════════════════════════════════════════════════════════════
+\section{环境配置与版本兼容}
+\label{sec:rlmc-ls-setup}
+
+\textbf{本节解决什么问题}：本章不重复 \cref{ch:rlmc-setup} 的通用安装流程，只补充\emph{做大规模训练时}额外要核对的系统点与工具链。比起单 GPU 跑内置任务，大规模训练多依赖三类东西：\textbf{分布式启动器}（torchrunx / torchrun）、\textbf{性能与显存监控}（\texttt{nvidia-smi} / \texttt{nsys} / \texttt{torch.\allowbreak profiler}）、以及\textbf{云端编排}（SkyPilot / OSMO，可选）。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.0cm}p{3.5cm}p{3.8cm}p{2.6cm}@{}}
+\toprule
+要求项 & mjlab & Isaac Lab & UniLab \\
+\midrule
+操作系统（多 GPU） & Linux & \textbf{仅 Linux}（多 GPU/多节点） & Linux CUDA/ROCm/XPU（多 GPU） \\
+分布式启动器 & torchrunx（\texttt{--gpu-ids}） & torchrun（\texttt{--nproc\_per\_node} \texttt{+ --distributed}） & 内建多进程（\texttt{training.\allowbreak num\_gpus}，off-policy） \\
+通信后端 & NCCL（经 PyTorch DDP） & NCCL（经 PyTorch DDP） & \textbf{无 DDP}：每 rank 独立 H2D 管线 \\
+RL 后端 & RSL-RL & RSL-RL / RL-Games / skrl & RSL-RL(PPO) + 自带 APPO/SAC/TD3 \\
+多节点编排 & torchrunx（SSH） & torchrun + NVIDIA OSMO & 无专用编排器（见 \cref{sec:rlmc-ls-cloud}） \\
+性能 profiler & \texttt{torch.\allowbreak profiler} / \texttt{nsys} & \texttt{torch.\allowbreak profiler} / \texttt{nsys} & 内建 chrome-trace（\texttt{trace\_enabled}，off-policy） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[多 GPU 仅限 Linux，且 GPU 间通信经 NCCL]
+经 Isaac Lab 官方 multi-GPU 文档核对：\textbf{多 GPU/多节点训练目前仅在 Linux 上支持}（Windows 不支持），且底层统一用 PyTorch 的 \texttt{DistributedDataParallel}（DDP），梯度在进程间通过 NCCL all-reduce 同步\cite{mittal2025isaaclab}。这意味着两条硬约束：(1) 多机训练前要确保各节点 NCCL 可达（防火墙放行 \verb|master_port|，常用 29500）；(2) GPU 间最好有 NVLink/高带宽互联，否则 all-reduce 通信会成为新瓶颈。
+\end{note}
+
+\begin{note}[mjlab core 与 unitree\_rl\_mjlab 的区分仍然适用]
+与前几章一致：\textbf{mjlab core}（\Verb[breaklines]|github.com/mujocolab/mjlab|，arXiv:2601.22074\,\cite{mjlab2026}）是 Isaac Lab 风格 API 的 MuJoCo-Warp 复刻，自带 Go1+G1+YAM，CLI 为 \Verb[breaklines]|uv run train/play|，多 GPU 用 \verb|--gpu-ids| + torchrunx\cite{schwarke2025rslrl}。本章 mjlab 主线全部以 mjlab core 为准；凡涉及 mjlab \emph{确切}类名/函数签名/调试子命令而官方 README 未逐字给出者，本章加 \rebuilt{} 或 \pz{待核实}。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{Quick Start：五分钟把单 GPU 训练扩到双 GPU}
+\label{sec:rlmc-ls-quickstart}
+
+真正的大规模训练（多机、超参 sweep、云端）需要分钟级以上的 provisioning，不适合做 5 分钟 Quick Start。但有一个\textbf{最小可跑的规模化动作}能在几分钟内建立“我能把训练摊到多块卡上”的肌肉记忆：\emph{在一台双 GPU 机器上，把一个内置任务从 \texttt{--gpu-ids "[0]"} 改成 \texttt{--gpu-ids "[0, 1]"}，并\textbf{同步把迭代数减半}以保持总样本量不变}。这一步不碰模型、不碰 reward，只验证“分布式启动—DDP 同步—rank 0 落盘”这条最外层链路通。
+
+\begin{codebox}[bash]{mjlab:单 GPU $\to$ 双 GPU（保持总样本量不变）}
+# 单 GPU 基准:4096 envs x 10000 iter
+uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+    --env.scene.num-envs 4096 --agent.max-iterations 10000 --gpu-ids "[0]"
+# 双 GPU:每卡仍 4096 envs（总 8192），每次 update 样本量翻倍 -> iter 减半才等样本量
+uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+    --env.scene.num-envs 4096 --agent.max-iterations 5000  --gpu-ids "[0, 1]"
+\end{codebox}
+
+\begin{codebox}[bash]{Isaac Lab:单 GPU $\to$ 双 GPU（torchrun + --distributed）}
+# 单 GPU 基准（官方 RL 入口在 scripts/reinforcement_learning/<lib>/train.py）
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+    --task Isaac-Velocity-Flat-G1-v0 --num_envs 4096 --headless
+# 双 GPU:用 torch.distributed.run 起 2 个进程，必须加 --distributed
+python -m torch.distributed.run --nnodes=1 --nproc_per_node=2 \
+    scripts/reinforcement_learning/rsl_rl/train.py \
+    --task Isaac-Velocity-Flat-G1-v0 --num_envs 4096 --headless --distributed
+\end{codebox}
+
+UniLab 这条 Quick Start 与上面两框架\textbf{结构相同、机制不同}：它\emph{不走} torchrun/DDP，而是用内建多进程把每个 rank 配一条独立的 CPU$\to$GPU 数据管线；多 GPU 是 \textbf{off-policy（SAC/TD3）原生能力}，开关是一个 Hydra 覆盖 \Verb[breaklines]|training.num_gpus|（不是 CLI flag）。同样的「单 GPU 基准 $\to$ 多 rank $\to$ 同步缩放迭代数」纪律照样适用——因为每多一个 rank，每次 update 见到的样本量同样翻倍。
+
+\begin{codebox}[bash]{UniLab:单 GPU $\to$ 双 GPU（off-policy 内建多进程，无 torchrun）}
+# 单 GPU 基准（SAC，env 数/迭代数走 Hydra 覆盖，不是 flag）
+uv run train --algo sac --task g1_walk_flat --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=10000
+# 双 GPU:training.num_gpus=2 起 2 个 rank，每 rank 独立 host slot + H2D stream
+#   （不经 rank0 漏斗）;样本量翻倍 -> 等样本量需把 max_iterations 减半
+uv run train --algo sac --task g1_walk_flat --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=5000 \
+    training.num_gpus=2 training.multi_gpu_sync_mode=local_sgd
+\end{codebox}
+
+\begin{pitfall}[双 GPU 跑相同 iterations 而不缩放，把“看了两倍数据”误当“收敛更快”]
+\textbf{错误描述}：把 \Verb[breaklines]|--gpu-ids "[0]"| 直接换成 \Verb[breaklines]|"[0, 1]"|，\Verb[breaklines]|max-iterations| 照旧。\textbf{现象后果}：双 GPU 的 reward 曲线“更好看”，写进报告说“多 GPU 收敛更快/算法更优”。\textbf{根本原因}：每次 PPO update 的样本量随 GPU 数翻倍——双 GPU 同 iter 总共看了 \emph{2 倍}数据；这就像两个学生做不同数量的练习题再比考试分。\textbf{正确做法}：比较时\textbf{固定总样本量}（total env steps，见 \cref{sec:rlmc-ls-multigpu} 的核算公式），相应缩放 \Verb[breaklines]|max-iterations|；论文里 x 轴标注为 \texttt{env\_steps} 而非 \texttt{iterations}。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{前置自测}
+\label{sec:rlmc-ls-pretest}
+
+本章是“训练工程”收口实战，依赖前面几乎所有实践章与理论部 PPO 基础。下面五题覆盖最关键的前置概念，\textbf{答不出 $\ge 2$ 题，先回对应章节复习再继续}。
+
+\begin{practice}[开课前自测]
+\begin{enumerate}
+\item （PPO 数据流）\cref{ch:rlmc-training}：\Verb[breaklines]|num_steps_per_env| 与 \Verb[breaklines]|num_mini_batches| 各控制 rollout 的哪个维度？它们如何影响显存？（答错回看 \cref{ch:rlmc-training}）
+\item （观测归一化）理论部 + \cref{ch:rlmc-training}：obs normalizer 在训练\emph{最初几步}为什么可能除零？这与 PPO loss 溢出有何关系？（答错回看 \cref{sec:rlmc-ls-nan}）
+\item （DR 与物理）\cref{ch:rlmc-dr}、\cref{ch:rlmc-physics}：把摩擦 DR 范围从 $[0.5,1.0]$ 扩到 $[0.1,2.0]$ 后训练频繁 NaN，最可能的物理根因是什么？（答错回看 \cref{sec:rlmc-ls-nan}）
+\item （系统）\Verb[breaklines]|CUDA_VISIBLE_DEVICES=2,3| 之后，PyTorch 的 \verb|cuda:0| 对应物理 GPU 几号？这个映射为什么容易出错？（答错回看 \cref{sec:rlmc-ls-multigpu}）
+\item （DIY 排查）\cref{ch:rlmc-diy}：一个 smoke test 通过、但 500 iterations 后 NaN 的自定义环境，应按什么优先级排查？（答错回看 \cref{sec:rlmc-ls-nan}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{本章目标}
+\label{sec:rlmc-ls-goals}
+
+学完本章，你应该\textbf{能够}（每条都可当场验收）：
+
+\begin{enumerate}
+\item \textbf{配置}双框架的多 GPU 训练——mjlab 的 \verb|--gpu-ids| + torchrunx 与 Isaac Lab 的 torchrun \Verb[breaklines]|+ --distributed|，并能用样本量核算公式设定公平的 \Verb[breaklines]|max-iterations|；
+\item \textbf{定位并修复}训练中的 \texttt{NaN}——按五大根因与排查优先级表，配合 \Verb[breaklines]|--enable-nan-guard| / \verb|viz-nan|（mjlab）系统化收敛到根因；
+\item \textbf{量化}环境的性能瓶颈——用 \Verb[breaklines]|torch.profiler| / \verb|nsys| 区分 physics / sensor / manager / PPO 四层开销，并定位热点；
+\item \textbf{调通} \verb|nconmax|/\allowbreak\verb|njmax| 与 \verb|num_envs|——记录实际分布后给出推荐值，画出吞吐与显存曲线找峰值；
+\item \textbf{组织}可复查的大规模实验——产出含样本量账本的“运行包”，并按 AGILE 四阶段 workflow 串起准备$\to$训练$\to$评估$\to$部署。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section{知识导航与阅读建议}
+\label{sec:rlmc-ls-nav}
+
+\textbf{前置桥接}：本章把前面零散教过的工程习惯（\cref{ch:rlmc-training} 的 PPO 数据流与 wrapper、\cref{ch:rlmc-dr} 的 DR、\cref{ch:rlmc-physics} 的接触求解、\cref{ch:rlmc-diy} 的验证三步走）整合成“大规模训练”的系统方法论。你在前面学的每一项技术，到了规模化阶段都会暴露出新的工程挑战；本章提供应对这些挑战的工具箱。
+
+\begin{center}
+\begin{forest}
+navtreeLR,
+[{大规模训练（本章）}
+  [{规模}
+    [{多 GPU 配置（§\ref{sec:rlmc-ls-multigpu}）}]
+    [{样本量核算 / 公平比较}]
+  ]
+  [{稳定}
+    [{NaN 五大根因（§\ref{sec:rlmc-ls-nan}）}]
+    [{NaN Guard / 排查优先级表}]
+  ]
+  [{速度}
+    [{profiling 四层（§\ref{sec:rlmc-ls-perf}）}]
+    [{nconmax / num\_envs 调优}]
+  ]
+  [{可复现}
+    [{运行包协议（§\ref{sec:rlmc-ls-repro}）}]
+    [{AGILE 四阶段（§\ref{sec:rlmc-ls-agile}）}]
+    [{训练诊断五信号（§\ref{sec:rlmc-ls-diag}）}]
+  ]
+]
+\end{forest}
+\end{center}
+
+\textbf{阅读时间三档}：\emph{精读}（全章代码走读 + 动手）约 6--8 小时；\emph{速读}（只读每节“解决什么问题”+ 陷阱 + 决策表）约 90 分钟；\emph{查阅}（遇到具体故障）直接跳 \cref{sec:rlmc-ls-troubleshoot} 故障排查手册按症状定位。第一次读建议只精读 \cref{sec:rlmc-ls-nan}（NaN）与 \cref{sec:rlmc-ls-perf}（性能）——这是训练中最高频的两类问题；做论文实验时再回看 \cref{sec:rlmc-ls-repro}；团队协作/云端训练时回看 \cref{sec:rlmc-ls-multigpu} 与 \cref{sec:rlmc-ls-agile}。
+
+% ════════════════════════════════════════════════════════════════
+\section{多 GPU 训练：双框架配置详解}
+\label{sec:rlmc-ls-multigpu}
+
+\paragraph{\texorpdfstring{\cnum{1} 模块功能与在管线中的位置}{1 模块功能与在管线中的位置}}多 GPU 是训练管线最外层的“规模放大器”：它不改变 \cref{ch:rlmc-training} 里 PPO 的任何内部逻辑（rollout$\to$优势估计$\to$clip 更新），只是把同一套循环复制到多块卡上，再用 DDP 把梯度对齐。先看一个判断标准——\textbf{不是“越多越好”，而是有明确触发信号}：
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{7.4cm}p{4.6cm}@{}}
+\toprule
+信号 & 建议 \\
+\midrule
+单 GPU 4096 envs 吞吐已饱和（增 envs 不增速） & 多 GPU 环境并行 \\
+需要 $>10$k envs 做大 DR 范围覆盖 & 多 GPU 环境并行 \\
+需要同时跑 $5+$ seed & 多 GPU 各跑一个 seed \\
+需要搜索 $10+$ 超参组合 & 多 GPU + WandB Sweep（见 \cref{sec:rlmc-ls-repro}） \\
+单 GPU 显存不足（放不下目标 envs/模型） & 多 GPU 或减小模型 \\
+以上都不是 & \textbf{不需要多 GPU} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[多 GPU 不是“加速按钮”，而是工程复杂度的放大器]\label{ins:rlmc-ls-multigpu}
+单 GPU 上的 bug，在多 GPU 上更难排查——因为要先区分“是哪个 rank 的问题”；checkpoint 更难管理——多个 rank 可能写同一个文件；实验结果更难比较——样本量核算更复杂。\textbf{每多一块 GPU，工程复杂度增加的不是线性而是超线性}。这条洞察贯穿本节：下面所有“单写者原则”“样本量账本”“rank 日志隔离”，本质都是在驯服这个被放大的复杂度。只有当单 GPU 确实不够用时才引入多 GPU。
+\end{insight}
+
+\subsection{算法主线：数据并行 vs 环境并行}
+\label{sec:rlmc-ls-dp-vs-ep}
+
+GPU 仿真 RL 的多 GPU 有两种范式，理解它们的差异是配置一切的前提：
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.6cm}p{4.5cm}p{4.7cm}@{}}
+\toprule
+维度 & 数据并行（Data Parallel） & 环境并行（Environment Parallel） \\
+\midrule
+核心思想 & 每卡跑相同数量 envs，梯度在卡间同步 & 每卡跑\emph{独立}的 envs，总样本量翻倍 \\
+实现 & DDP all-reduce 梯度 & 各卡独立 rollout，汇总后 PPO update \\
+总 envs 数 & 不变（$4096=4\times1024$） & 翻倍（$4096\times N_{\text{GPU}}$） \\
+PPO batch & 不变 & 翻倍 \\
+通信开销 & 每 update 一次 all-reduce & 每 update 一次 gather $+$ all-reduce \\
+适用场景 & 显存放不下目标 envs & 需要更多 envs 做 DR 覆盖 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{关键差异}：在 GPU 仿真 RL 中，env step 通常是计算瓶颈（占总时间 60--80\%，见 \cref{sec:rlmc-ls-perf} 的 profiling），而非 PPO update。因此\textbf{环境并行}（更多 envs $\to$ 更多数据 $\to$ 更快收敛）比纯数据并行（相同数据量 $\to$ 梯度同步 $\to$ 不增加收敛速度）更有效。\textbf{mjlab 和 Isaac Lab 都默认走“环境并行 + DDP 梯度同步”的混合模式}——每块 GPU 运行独立的环境集合（环境并行），PPO update 时梯度通过 DDP all-reduce 同步（数据并行的同步机制）。
+
+\begin{insight}[多 GPU 的两个解读视角：统计学 vs 系统工程]\label{ins:rlmc-ls-twoview}
+\textbf{从统计学角度}：更多 GPU $=$ 更多并行 envs $=$ 每次 PPO update 的 batch 更大。大 batch 降低梯度估计的方差（更多样本 $\to$ 更准的梯度），但也可能损害泛化（过拟合于大 batch 的统计特性）——这就是为什么经验上 4096 envs 常是平衡点，增到 8192+ 收益递减。\textbf{从系统工程角度}：更多 GPU $=$ 更高通信开销（DDP all-reduce）$+$ 更复杂的日志管理 $+$ 更难排查的 bug（rank 间异步）。两个视角的交汇点在于：多 GPU 的最优配置不是“尽可能多”，而是“刚好够用”——从统计角度确定需要多少 envs，从工程角度确定能稳定管理多少 GPU。
+\end{insight}
+
+\subsection{配置详解：样本量核算（三框架共用的硬通货）}
+\label{sec:rlmc-ls-sample-ledger}
+
+无论哪个框架，多 GPU 训练\textbf{第一件要算清的事}是总样本量。它是后续一切“公平比较”的硬通货：
+
+\begin{codebox}[Python]{多 GPU 样本量核算公式（语义层，三框架通用）}
+# 每次 PPO update 实际消费的样本数
+samples_per_update = num_envs_per_gpu * num_steps_per_env * num_gpus
+# 整轮训练消费的总样本数
+total_env_steps    = samples_per_update * max_iterations
+
+# 单 GPU 基准
+single_gpu        = 4096 * 24 * 1 * 10000   # = 983,040,000
+# 双 GPU + 相同 iterations（看了 2x 数据，不公平！）
+dual_same_iter    = 4096 * 24 * 2 * 10000   # = 1,966,080,000
+# 双 GPU + 公平比较（缩放 iter 使总样本量相同）
+dual_fair         = 4096 * 24 * 2 * 5000    # = 983,040,000（与单 GPU 等价）
+\end{codebox}
+
+\begin{table}[H]\centering\small
+\caption{多 GPU 关键配置的四维表（默认值来源/修改影响/合理范围/耦合）}
+\label{tab:rlmc-ls-multigpu-cfg}
+\begin{tabular}{@{}p{2.4cm}p{2.6cm}p{3.0cm}p{2.2cm}p{2.4cm}@{}}
+\toprule
+配置项 & 默认值来源 & 修改影响 & 合理范围 & 与其他配置耦合 \\
+\midrule
+\texttt{--gpu-ids} (mjlab) & CLI，默认 \verb|"[0]"| & 决定环境并行度与总样本量 & $\le$ 本机可见卡数 & 与 \Verb[breaklines]|CUDA_VISIBLE_DEVICES| 强耦合 \\
+\texttt{--nproc\_per\_node} (Isaac Lab) & torchrun 标准参数 & 每节点进程数（$=$卡数） & $\le$ 本节点卡数 & 须与 \verb|--distributed| 同用 \\
+\texttt{num\_steps\_per\_env} & 任务 cfg & rollout 时间维度长度 & 16--48 & 直接进样本量公式 \\
+\texttt{max\_iterations} & agent cfg & 训练总轮数 & 任务相关 & 多 GPU 须按卡数反比缩放 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{代码走读：mjlab 多 GPU（torchrunx + --gpu-ids）}
+\label{sec:rlmc-ls-mjlab-multigpu}
+
+mjlab 用 \textbf{torchrunx} 实现多 GPU——这是一个基于 SSH 的纯 Python 分布式启动器，比标准 torchrun 更灵活（可从单个 Python 脚本启动多节点，无需 SLURM）\cite{schwarke2025rslrl}。在 mjlab 1.x 中，多 GPU 的对外接口就是一个 \verb|--gpu-ids| 列表参数（经官方 README 核对）。
+
+\begin{codebox}[bash]{mjlab:单/双/四 GPU（注意四 GPU 的等样本量缩放）}
+# 单 GPU 基准
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 4096 --agent.max-iterations 10000 --gpu-ids "[0]"
+# 双 GPU:每卡 4096 envs，总 8192;等样本量需 iter 减半
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 4096 --agent.max-iterations 5000  --gpu-ids "[0, 1]"
+# 四 GPU:每次 update 样本量 x4，等样本量需 iter / 4
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 4096 --agent.max-iterations 2500  --gpu-ids "[0, 1, 2, 3]"
+# 校验:4096 x 24 x 4 x 2500 == 4096 x 24 x 1 x 10000（与单 GPU 基准等价）
+\end{codebox}
+
+每块 GPU 上发生的事情，用一段“伪时间线”描述比一张图更直观（本章遵循实战章“缺图用文字/表替代、勿引不存在的图”的约定）：
+
+\begin{codebox}[text]{torchrunx 下每个 iteration 的执行时序}
+rank 0 (GPU 0): 建 4096-env 环境 + PPO runner(actor/critic) + DDP wrapper
+rank 1 (GPU 1): 建 4096-env 环境 + PPO runner(actor/critic) + DDP wrapper
+每个 iteration:
+  1. 每个 rank 独立 rollout num_steps_per_env 步
+  2. 每个 rank 计算 local gradients
+  3. DDP all-reduce: 跨 rank 平均梯度
+  4. 每个 rank 用平均梯度更新 -> 所有 rank 权重保持同步
+\end{codebox}
+
+\begin{pitfall}[\texttt{CUDA\_VISIBLE\_DEVICES} 与 \texttt{--gpu-ids} 的双重映射撞车]
+\textbf{错误描述}：设了 \Verb[breaklines]|CUDA_VISIBLE_DEVICES=2,3|，又传 \Verb[breaklines]|--gpu-ids "[2, 3]"|。\textbf{现象后果}：报“设备不可见 / invalid device ordinal”。\textbf{根本原因}：\Verb[breaklines]|CUDA_VISIBLE_DEVICES=2,3| 之后，PyTorch 眼里只剩两块卡，逻辑编号是 \verb|cuda:0|（物理 2）和 \verb|cuda:1|（物理 3）——逻辑 id 2、3 根本不存在。\textbf{正确做法}：在已设 \Verb[breaklines]|CUDA_VISIBLE_DEVICES| 时，\verb|--gpu-ids| 传\emph{逻辑} id \Verb[breaklines]|"[0, 1]"|，让框架自动映射到被 \Verb[breaklines]|CUDA_VISIBLE_DEVICES| 选中的物理卡。记住：日志里的 \verb|cuda:0| 不等于物理 GPU 0。
+\end{pitfall}
+
+\subsection{代码走读：Isaac Lab 多 GPU（torchrun + --distributed）}
+\label{sec:rlmc-ls-isaac-multigpu}
+
+Isaac Lab 用标准 PyTorch \textbf{torchrun}（\Verb[breaklines]|torch.distributed.run|）启动分布式训练，每个进程一块 GPU、各起一份 Isaac Sim 与环境、各持一份策略网络，update 时梯度经 DDP 聚合（经官方 multi-GPU 文档核对）\cite{mittal2025isaaclab}。\textbf{关键开关是} \verb|--distributed|——不加它，多进程之间不会建立进程组，等于各跑各的。
+
+\begin{codebox}[bash]{Isaac Lab:双 GPU 与多节点（注意 --distributed 与 master 地址）}
+# 双 GPU（单节点 2 进程）
+python -m torch.distributed.run --nnodes=1 --nproc_per_node=2 \
+    scripts/reinforcement_learning/rsl_rl/train.py \
+    --task Isaac-Velocity-Flat-G1-v0 --num_envs 4096 --headless --distributed
+# 多节点（2 节点 x 4 卡）:node_rank / master_addr / master_port 须一致
+# 节点 0:
+python -m torch.distributed.run --nnodes=2 --nproc_per_node=4 \
+    --node_rank=0 --master_addr=10.0.0.1 --master_port=29500 \
+    scripts/reinforcement_learning/rsl_rl/train.py \
+    --task Isaac-Velocity-Flat-G1-v0 --headless --distributed
+# 节点 1:
+python -m torch.distributed.run --nnodes=2 --nproc_per_node=4 \
+    --node_rank=1 --master_addr=10.0.0.1 --master_port=29500 \
+    scripts/reinforcement_learning/rsl_rl/train.py \
+    --task Isaac-Velocity-Flat-G1-v0 --headless --distributed
+\end{codebox}
+
+\begin{note}[大规模集群（$>8$ GPU）：NVIDIA OSMO]
+对于跨节点的大规模集群训练，Isaac Lab 推荐用 \textbf{NVIDIA OSMO}——一个生产级多节点编排器，支持主流公有云与本地 K8s，比手动维护多条 torchrun 命令更可靠（经 NVIDIA 官方资料核对）\cite{mittal2025isaaclab}。本章只覆盖到手动 torchrun 这一层；OSMO 的 YAML/调度细节属于集群运维范畴，超出训练工程的边界。
+\end{note}
+
+\subsection{代码走读：UniLab 多 GPU（异构 rank-local H2D，无 torchrun/DDP）}
+\label{sec:rlmc-ls-unilab-multigpu}
+
+到 UniLab 这里出现本节最重要的一处\textbf{范式差异}：前两框架的多 GPU 都假定「物理与策略都在 GPU、靠 torchrun 起 DDP、梯度 all-reduce」的\emph{同构}范式；而 UniLab 是\emph{异构}的——物理仿真在 CPU（MuJoCoUni/MotrixSim 多线程），策略在 GPU\,\cite{unilab2026}。因此它的多卡机制也根本不同：\textbf{off-policy（SAC/TD3）原生支持} \Verb[breaklines]|training.num_gpus=N|，每个 rank 持\emph{独立}的 host slot 与 H2D stream（UniLab commit \texttt{99936e08}，\Verb[breaklines]|ipc/replay_pipelines/| 的 \Verb[breaklines]|MultiGPUCPUPinnedReplayPipeline|），CPU 采的 transition 直接 pinned-host$\to$对应 GPU 异步搬运，\textbf{不经 rank 0 漏斗}；权重经版本化共享内存（\Verb[breaklines]|ipc/weight_sync.py| 的 \Verb[breaklines]|SharedWeightSync|，单写多读、零序列化）回传，而非 DDP 的梯度 all-reduce。
+
+\begin{codebox}[bash]{UniLab:off-policy 多 GPU 与异步 collector-learner（APPO）}
+# off-policy 多 GPU:每 rank 独立 H2D 管线，无 rank0 漏斗、无 NCCL all-reduce
+uv run train --algo sac --task g1_walk_flat --sim mujoco \
+    algo.num_envs=4096 training.num_gpus=4 \
+    training.multi_gpu_sync_mode=local_sgd
+# APPO（异步 PPO，最能体现异构解耦）:collector 不等 learner，旧 rollout 被覆盖、V-trace 校正
+uv run train --algo appo --task go2_joystick_flat --sim mujoco algo.num_envs=2048
+#   控制台仪表盘有 Weight Sync / H2D Copy / Rollouts Read / Staging Pool / Vtrace
+#   Rho Clip Fraction 等面板（实测）——即 SharedWeightSync + RolloutRingBuffer + H2D 管线在跑
+\end{codebox}
+
+\begin{note}[UniLab 的「多 GPU 同步模式」是 local SGD，不是逐步 all-reduce]
+\Verb[breaklines]|training.multi_gpu_sync_mode=local_sgd| 这个开关名本身就点明：UniLab 多卡走的是 local SGD（经 commit \texttt{99936e08} 源核对：\Verb[breaklines]|multi_gpu_sync_mode| 取值 \verb|local_sgd| 或 \verb|sync_sgd|，默认 \verb|local_sgd|；每隔 \Verb[breaklines]|multi_gpu_sync_interval| 个 iteration 调一次 \Verb[breaklines]|learner.average_distributed_parameters()| 做\emph{周期性参数平均}——默认 interval $=1$，可调大到「真·local SGD」少同步），而非 mjlab/Isaac Lab 那种\emph{逐 update} 梯度 all-reduce（梯度平均模式在 UniLab 对应 \verb|sync_sgd|）——这与异构架构一脉相承：collector 与 learner 已经异步解耦，跨 rank 再强求每步同步会抵消掉「rank-local 不走漏斗」的好处。代价是各 rank 权重在两次同步之间会短暂发散；好处是几乎没有 DDP 通信墙。\textbf{这里藏着一个“默认值陷阱”}：interval 默认 $=1$ 意味着\emph{每个 iteration 都同步一次}——此时 \verb|local_sgd| 名不副实，跨 rank 通信量与 \verb|sync_sgd| 同量级，你以为开了“少同步省通信”其实没省。真要拿“少同步换吞吐”，必须\textbf{显式}把 \Verb[breaklines]|training.multi_gpu_sync_interval| 调大（如 $8$/$16$），用“两次同步之间多走几个本地 iteration”换通信下降；调多大是吞吐 vs 收敛的权衡，得在你的任务上扫一下。\textbf{on-policy PPO 的多卡支持不如 off-policy 完整}——UniLab 的多 GPU 一等公民是 off-policy（SAC/TD3）与异步 APPO，把物理留在 CPU 的设计本就为异步而生。
+\end{note}
+
+\begin{pitfall}[别给 UniLab 的多 GPU 套用 torchrun/\texttt{--distributed} 心智模型]
+\textbf{错误描述}：照 Isaac Lab 习惯写 \Verb[breaklines]|python -m torch.distributed.run --nproc_per_node=4 ... --distributed| 去起 UniLab。\textbf{现象后果}：要么参数不被识别，要么起来 4 个互不通信的进程各跑各的。\textbf{根本原因}：UniLab 不用 torchrun 起进程组——它的并行轴是\emph{CPU collector 进程 $+$ rank-local H2D 管线}，多 GPU 由 \Verb[breaklines]|training.num_gpus| 这个 Hydra 覆盖驱动，且主要面向 off-policy。\textbf{正确做法}：用 \Verb[breaklines]|uv run train --algo sac ... training.num_gpus=N training.multi_gpu_sync_mode=local_sgd|；把「多卡 $=$ 每 rank 一条独立数据管线」而非「多卡 $=$ DDP 同步一份梯度」当作 UniLab 侧的正确直觉。
+\end{pitfall}
+
+\subsection{三框架多 GPU 对比}
+\label{sec:rlmc-ls-multigpu-compare}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.4cm}p{3.4cm}p{3.6cm}p{2.4cm}@{}}
+\toprule
+维度 & mjlab & Isaac Lab & UniLab \\
+\midrule
+启动器 & torchrunx (\verb|--gpu-ids|) & torchrun (\Verb[breaklines]|--nproc_per_node|) & 内建多进程 (\Verb[breaklines]|training.num_gpus|) \\
+配置方式 & CLI 参数 & CLI 参数 \Verb[breaklines]|+ --distributed| & Hydra 覆盖 (off-policy) \\
+通信后端 & NCCL (PyTorch DDP) & NCCL (PyTorch DDP) & 无 DDP；rank-local H2D + local SGD \\
+多节点 & torchrunx SSH & torchrun + OSMO & 无专用编排器 \\
+日志隔离 & 每 rank 独立日志目录 & 每 rank 独立日志目录 & 每 rank 独立 host slot/日志 \\
+Checkpoint & rank 0 写入 & rank 0 写入 & rank 0 写入 \\
+兼容 RL 库 & RSL-RL & RSL-RL / RL-Games / skrl & RSL-RL(PPO) + 自带 APPO/SAC/TD3 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{运行验证 \& 常见陷阱：单写者原则与 checkpoint/resume}
+\label{sec:rlmc-ls-single-writer}
+
+\paragraph{\texorpdfstring{\cnum{4} 运行验证：看什么}{4 运行验证：看什么}}多 GPU 跑起来后，先确认\textbf{两件事}：(1) 每个 rank 的环境都建起来了（看各 rank 日志里 “created N envs on cuda:k”）；(2) 日志/checkpoint 只被 rank 0 写了一份（看磁盘上没有重复文件、TensorBoard 里没有多条重叠曲线）。
+
+\paragraph{\texorpdfstring{只有一块卡时，怎么先“烟雾测试”多卡配置不报错？}{只有一块卡时，怎么先烟雾测试多卡配置}}多卡命令的不少错误（旗标拼写、\verb|--distributed| 漏加、进程组建不起来、CLI 解析失败）\emph{并不需要第二块卡就能暴露}——你完全可以在单卡机上先把“启动链路”跑通，再换到多卡机扩规模。诀窍是\textbf{用 \texttt{world\_size}=1 的最小启动跑 1--2 个 iteration}：命令骨架与多卡完全一致，只是进程数/卡数填 1，看它能不能进训练循环、日志里有没有打印出预期的 rank/device 信息。
+
+\begin{codebox}[bash]{单卡先烟雾测试多卡启动链路（world\_size=1，命令骨架不变）}
+# Isaac Lab:用 torchrun 起「1 个进程」跑 1 迭代——验证 --distributed 解析、进程组初始化、入口路径
+python -m torch.distributed.run --nnodes=1 --nproc_per_node=1 \
+    scripts/reinforcement_learning/rsl_rl/train.py \
+    --task Isaac-Velocity-Flat-G1-v0 --num_envs 256 --headless --distributed --max_iterations 2
+#   看到「Initialized process group ... rank 0 / world_size 1」+ 进入训练循环 = 启动链路 OK
+#   (此步不验证 all-reduce/梯度同步本身——那需要真的 >=2 卡,但能把 90% 的“起不来”错误前移到单卡暴露)
+
+# mjlab:单卡传 --gpu-ids "[0]" 跑 2 迭代——验证 --gpu-ids 解析与 torchrunx 单节点启动
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 256 --agent.max-iterations 2 --gpu-ids "[0]"
+#   能进训练、打印 created N envs on cuda:0 = --gpu-ids 链路 OK,换到双卡只需改 "[0, 1]"
+\end{codebox}
+
+\begin{note}[单卡烟雾测试能验证什么、不能验证什么]
+\textbf{能验证（90\% 的“多卡起不来”错误）}：CLI 旗标拼写/解析、入口脚本路径、\verb|--distributed| 是否漏加、进程组能否初始化、环境/runner/DDP wrapper 能否构建、rank/device 日志格式。\textbf{不能验证（必须真有 $\ge 2$ 卡）}：跨 rank 的梯度 all-reduce 数值是否正确、NCCL 互联与带宽、多 rank 日志隔离与单写者是否真生效、样本量翻倍后的收敛行为。所以正确流程是\textbf{“单卡 \texttt{world\_size}=1 先把链路跑通 $\to$ 上多卡机验证同步与单写者 $\to$ 再扩规模”}——别在多卡机上才第一次发现一个本可在单卡暴露的拼写错。
+\end{note}
+
+多 GPU 训练中一个高频 bug 是\textbf{多个 rank 同时写同一个文件}——导致 checkpoint 损坏、日志混乱或视频帧交错。核心原则只有一句：\textbf{所有文件写操作只在 rank 0 执行}。
+
+\begin{codebox}[Python]{单写者原则:rank 0 守门（语义示例，置于训练副作用前）}
+import torch.distributed as dist
+
+def is_main_process() -> bool:
+    """是否为 rank 0（主进程）.未初始化分布式时按单进程处理."""
+    if not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
+
+if is_main_process():
+    torch.save(policy.state_dict(), "model.pt")      # checkpoint
+if is_main_process():
+    wandb.log({"reward": reward_mean}, step=it)       # WandB
+if is_main_process():
+    writer.add_scalar("reward", reward_mean, it)      # TensorBoard
+if is_main_process():
+    recorder.record_frame(env.render())               # 视频
+\end{codebox}
+
+如果忘了 rank 判断——比如每个 rank 都往同一个 TensorBoard 目录写 events——TensorBoard 会显示混乱的多条曲线（每 rank 一条、x 轴重叠），你可能误以为训练不稳定（看到多条振荡曲线），实际上只是日志重复。
+
+Checkpoint 的保存与恢复在多 GPU 下也要多处理两件事：\textbf{从哪个 rank 加载}（所有 rank 都加载同一个文件即可，因权重经 DDP 已同步）和 \textbf{resume 后卡数变化}（须重新核算样本量）。
+
+\begin{codebox}[Python]{Checkpoint 保存/恢复:记录 world\_size 以便 resume 时核算}
+def save_checkpoint(runner, path, iteration):
+    if is_main_process():                              # 单写者
+        state = {
+            "iteration": iteration,
+            "policy_state_dict": runner.policy.state_dict(),
+            "optimizer_state_dict": runner.optimizer.state_dict(),
+            "obs_normalizer": runner.obs_normalizer.state_dict(),
+            "world_size": dist.get_world_size() if dist.is_initialized() else 1,
+            "num_envs_per_gpu": runner.env.num_envs,
+        }
+        torch.save(state, path)
+
+def load_checkpoint(runner, path):
+    state = torch.load(path, map_location=runner.device)
+    runner.policy.load_state_dict(state["policy_state_dict"])
+    runner.optimizer.load_state_dict(state["optimizer_state_dict"])
+    if "obs_normalizer" in state:                      # 别漏了 normalizer!
+        runner.obs_normalizer.load_state_dict(state["obs_normalizer"])
+    saved_ws   = state.get("world_size", 1)
+    current_ws = dist.get_world_size() if dist.is_initialized() else 1
+    if saved_ws != current_ws:                         # 卡数变了 -> 样本量要重算
+        print(f"[WARN] world_size {saved_ws} -> {current_ws}; 重新核算 max_iterations")
+    return state["iteration"]
+\end{codebox}
+
+\begin{pitfall}[四连发：多 GPU 最常见的四个写冲突/口径错误]
+\textbf{(1) 多个 rank 都建 WandB run} $\to$ 出现 $N$ 个重复 run；正确：只 rank 0 \verb|wandb.init|。
+\textbf{(2) GPU id 映射错} $\to$ 设备不可见；正确：\Verb[breaklines]|--gpu-ids "[0, 1]"|（逻辑 id，见上一个陷阱）。
+\textbf{(3) 多 GPU 不缩放 iterations} $\to$ 把“看了更多数据”误当“更优”；正确：固定 total env steps。
+\textbf{(4) torchrunx rank 1 崩了但 rank 0 日志正常} $\to$ 只看 rank 0 stdout 漏掉 rank 1 的 CUDA crash；正确：检查\emph{所有} rank 的日志，尤其 stderr。
+\end{pitfall}
+
+\begin{practice}[多 GPU 配置练习]
+\begin{enumerate}
+\item （计算题）4 GPU、每卡 4096 envs、\Verb[breaklines]|num_steps_per_env=24|、\Verb[breaklines]|max_iterations=5000|，求 total env steps；若要与“单 GPU $\times$ 4096 envs $\times$ 24 steps $\times$ 20000 iters”公平比较，应如何设？\emph{验收}：写出两边相等的等式。
+\item （实践题）在双 GPU 机器上分别用 mjlab \Verb[breaklines]|--gpu-ids "[0]"| 与 \Verb[breaklines]|"[0, 1]"| 跑 100 iter，记录 wall-clock 与 total env steps，算加速比。\emph{预期}：双 GPU wall-clock 略增但 total env steps 翻倍，单位数据耗时下降。
+\item （分析题）为何 GPU 仿真 RL 偏好环境并行而非纯数据并行？从“env step 是瓶颈”角度解释。\emph{验收}：能说出“瓶颈在 env step、加 env 才加吞吐，数据并行不增数据量”。
+\end{enumerate}
+\end{practice}
+
+多 GPU 解决了“训练规模”。但训练过程中一个更紧迫的问题经常出现——训练突然崩溃、reward 变成 NaN。这在多 GPU 下更难排查，所以我们先在单 GPU 上建立方法论。
+
+% ════════════════════════════════════════════════════════════════
+\section{NaN 排查：从症状到根因的系统方法论}
+\label{sec:rlmc-ls-nan}
+
+\paragraph{\texorpdfstring{\cnum{1} 模块功能与在管线中的位置}{1 模块功能与在管线中的位置}}NaN 排查不是管线里的某个模块，而是一道\textbf{横切所有模块}的诊断流程：physics（接触求解）、reward、obs normalizer、policy、CUDA Graph，任何一环都可能把 NaN 注入数据流。NaN（Not a Number）是 RL 训练中最高频的致命错误——策略输出、reward 结果或某维 obs 突然变成 NaN，从此训练不可恢复。在 GPU 并行仿真中尤其危险：\textbf{一个 env 的 NaN 可能通过 batch 操作（如归一化里的全局 mean/std）在一帧内传播到所有 env}。
+
+\begin{insight}[NaN 是“终端表现”，不是“病因”——排查要分两步]\label{ins:rlmc-ls-nan-cpr}
+NaN 在 RL 训练中就像临床上的心脏骤停——它不是疾病本身，而是某种底层病因（物理/算法/数值配置）的终端表现。你不能只“清除 NaN”（这等于只做 CPR 不找病因），必须分两步：\textbf{先定位}哪个 env / step / 变量\emph{最先}出现 NaN（等价于 CPR：先稳住、先定位），\textbf{再追溯}导致它的根因（reward 除零？接触发散？normalizer 未预热？）。本节的 NaN Guard（\cref{sec:rlmc-ls-nanguard}）就是把“先定位”这一步自动化的工具。
+\end{insight}
+
+\subsection{算法主线：NaN 的五大根因（按频率排序）}
+\label{sec:rlmc-ls-nan-causes}
+
+根据 mjlab、Isaac Lab 社区与源教材作者经验，NaN 根因按频率排序如下（频率为经验量级，非严格统计，故标注\pz{经验比例}）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}cp{3.4cm}p{4.4cm}c@{}}
+\toprule
+排名 & 根因 & 典型症状 & 频率\pz{经验值} \\
+\midrule
+1 & 接触求解器发散 & 高冲击接触后 \verb|qvel| 出现 NaN & $\sim$30\% \\
+2 & reward 除零/溢出 & reward 计算出 inf $\to$ NaN & $\sim$25\% \\
+3 & obs normalizer 未预热 & 前几步 obs 方差为 0，归一化除零 & $\sim$20\% \\
+4 & policy std 变负 & \verb|log_prob| 计算出 NaN & $\sim$15\% \\
+5 & CUDA Graph capture 失效 & 随机化改内存布局后 graph 失效 & $\sim$10\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+下面对每个根因走“动机$\to$反面$\to$操作”：先说症状与物理/算法机理，再给排查与修复代码。这五个根因里，\textbf{根因 1（接触）与根因 3（normalizer）}最值得记牢——前者是物理侧最常见、后者是算法侧最隐蔽（只在训练最早期发作）。
+
+\subsubsection{根因 1：接触求解器发散}
+
+\textbf{症状}：前 $\sim$1000 iterations 正常，然后某些 env 的 \verb|qvel| 突然 NaN。通常发生在策略学到高速动作（接触力增大）或 DR 引入低摩擦（接触更易滑动）之后。\textbf{机理}：MuJoCo 的接触求解器在处理高 \verb|condim|（如 \verb|condim=6| 带扭转摩擦）+ 高摩擦值（如 \verb|friction=5.0|）时，可能产生数值不稳定的 constraint force；PhysX 同理——\Verb[breaklines]|solver_position_iteration_count| 太少时穿透修正不足（参见 \cref{ch:rlmc-physics} 的接触求解对比）。
+
+\begin{codebox}[Python]{接触发散 NaN 排查:逐步运行并在 NaN 前捕获物理状态}
+def diagnose_contact_nan(env, policy, max_steps=10000):
+    obs, _ = env.reset()
+    prev_action = prev_qpos = None
+    for step in range(max_steps):
+        action = policy(obs["policy"])
+        obs, reward, done, truncated, info = env.step(action)
+        qvel = env.robot.data.joint_vel                 # Isaac Lab/mjlab 通用数据视图
+        if torch.isnan(qvel).any():
+            nan_envs = torch.isnan(qvel).any(dim=-1).nonzero().squeeze()
+            print(f"NaN at step {step}, envs: {nan_envs.tolist()}")
+            if prev_action is not None:                 # 打印 NaN 前一步
+                print(f"  prev action: {prev_action[nan_envs[0]]}")
+                print(f"  prev qpos  : {prev_qpos[nan_envs[0]]}")
+            break
+        prev_action = action.clone()
+        prev_qpos   = env.robot.data.joint_pos.clone()
+\end{codebox}
+
+\begin{pitfall}[mjContact 没有 \texttt{force} 字段，接触力要单独算]
+\textbf{错误描述}：想打印接触力时写 \verb|contact.force|。\textbf{现象后果}：\Verb[breaklines]|AttributeError| 或读到无意义的值。\textbf{根本原因}：MuJoCo 的 \verb|mjContact| 结构体里只有 \Verb[breaklines]|geom1/geom2/dist| 等几何量，\emph{没有} \verb|force| 字段。\textbf{正确做法}：用 \Verb[breaklines]|mj_contactForce(model, data, c_idx, buf)| 把第 \verb|c_idx| 个接触的 6 维力/力矩写进 \verb|buf| 再读。
+\end{pitfall}
+
+\textbf{修复方向}（四选一或组合，从“改物理参数”到“改积分精度”逐级加力度）：
+
+\begin{codebox}[Python]{接触发散的四类修复}
+# 修复 1（最轻）:降低 condim 与摩擦（MJCF）
+#   <geom condim="4" friction="0.8 0.005 0.001"/>   # 而非 condim=6 friction=5.0
+# 修复 2:增加求解器迭代次数
+sim = SimCfg(mujoco=MujocoCfg(iterations=15, ls_iterations=25))   # 默认 10/20
+# 修复 3:减小 timestep（更精确积分），但要同步调 decimation 保持策略频率
+sim = SimCfg(mujoco=MujocoCfg(timestep=0.002))                    # 0.005 -> 0.002
+#   新 decimation = 旧 decimation * (旧 dt / 新 dt) = 4 * (0.005/0.002) = 10
+# 修复 4（PhysX 侧，Isaac Lab）:增加求解器迭代
+articulation_props = sim_utils.ArticulationRootPropertiesCfg(
+    solver_position_iteration_count=8, solver_velocity_iteration_count=8)  # 4 -> 8
+\end{codebox}
+
+\subsubsection{根因 2：reward 函数中的除零/溢出}
+
+\textbf{症状}：某个 reward term 在特定 env 状态下返回 inf 或 NaN，通常是 $1/\text{distance}$ 形式在距离趋零时溢出。\textbf{排查}：逐项检查每个 reward term 的输出范围（\cref{ch:rlmc-reward} 已讲过分项打印 reward 的接线，这里复用）。
+
+\begin{codebox}[Python]{reward NaN 排查:分项检查 reward\_manager 的每个 term}
+def diagnose_reward_nan(env, policy, num_steps=100):
+    obs, _ = env.reset()
+    for step in range(num_steps):
+        obs, reward, done, truncated, info = env.step(policy(obs["policy"]))
+        for name, value in env.reward_manager.compute_terms().items():
+            if torch.isnan(value).any():
+                print(f"  NaN in reward '{name}' at step {step}")
+            if torch.isinf(value).any():
+                print(f"  Inf in reward '{name}' at step {step}")
+\end{codebox}
+
+\textbf{修复}：永远不用 $1/d$ 形式，改用有界且处处可导的指数核 $\exp(-d^2/\sigma^2)$：
+
+\begin{codebox}[Python]{反面 vs 正面:距离类 reward 的安全写法}
+def bad_distance_reward(env):       # 错:d=0 时返回 1e8，梯度爆炸
+    d = compute_distance(env)
+    return 1.0 / (d + 1e-8)
+def good_distance_reward(env, sigma=0.25):   # 对:d=0->1.0，d->inf->0，有界可导
+    d = compute_distance(env)
+    return torch.exp(-d**2 / sigma**2)
+\end{codebox}
+
+\subsubsection{根因 3：obs normalizer 未预热}
+
+\textbf{症状}：训练\emph{最初} 1--10 个 iteration 就 NaN（非常早期）。\textbf{机理}：RSL-RL 的 \Verb[breaklines]|EmpiricalNormalization| 用 Welford 在线算法维护 running mean/std（经核对，其更新在 \Verb[breaklines]|process_env_step()| 内调用 \Verb[breaklines]|update_normalization(obs)|）\cite{schwarke2025rslrl}。训练刚开始时 std 可能为零（所有 obs 相同）或接近零（方差极小），归一化 $(obs-\text{mean})/\text{std}$ 产生极大数值 $\to$ PPO loss 溢出 $\to$ 梯度 NaN。
+
+\begin{codebox}[Python]{normalizer 预热:用随机动作跑若干步先填好统计量}
+def warmup_normalizer(env, policy, num_warmup_steps=500):
+    obs, _ = env.reset()
+    for _ in range(num_warmup_steps):
+        action = torch.randn(env.num_envs, env.action_space.shape[-1], device=env.device)
+        obs, _, _, _, _ = env.step(action)            # normalizer 在 step 内自动更新
+    # 体检:有没有零方差维度（常是固定 command 等常数 obs）
+    # RSL-RL EmpiricalNormalization 暴露 .std 属性（无 running_var），方差用 std**2
+    var = policy.obs_normalizer.std ** 2
+    zero_var = (var < 1e-8).nonzero()
+    if len(zero_var) > 0:
+        print(f"[WARN] 零方差 obs 维度: {zero_var.squeeze().tolist()}（检查是否合理）")
+\end{codebox}
+
+\subsubsection{根因 4：policy std 变负}
+
+\textbf{症状}：PPO update 时 \verb|log_prob| 出现 NaN。\textbf{机理}：某些实现里 policy 的 action std 直接用线性层输出，若被梯度更新成负数，\Verb[breaklines]|Normal(mean, std)| 中 $\text{std}<0$ 导致 NaN。\textbf{修复}：用 \verb|log| 或 \verb|softplus| 参数化保证恒正。
+
+\begin{codebox}[Python]{std 的安全参数化}
+# 错:std 可能被更新为负
+self.std = nn.Parameter(torch.ones(action_dim) * init_noise_std)
+# 对:log 参数化，std = exp(log_std) > 0 恒成立
+self.log_std = nn.Parameter(torch.zeros(action_dim) + np.log(init_noise_std))
+# 对:softplus 参数化，std = softplus(raw_std) > 0
+self.raw_std = nn.Parameter(torch.ones(action_dim))
+\end{codebox}
+
+\subsubsection{根因 5：CUDA Graph capture 失效}
+
+\textbf{症状}：训练中出现\emph{随机}的 NaN——不固定在同一 step 或同一 env。\textbf{机理}：DR 的某些 EventTerm 改变了 GPU 数组的地址或形状（如把共享模型字段展开为 per-world 摩擦数组），但 CUDA Graph 仍在 replay 旧地址的 kernel，访问了无效内存。CUDA Graph 是 mjlab/Isaac Lab 高吞吐的关键机制，也是 NaN 与性能异常的隐蔽来源。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.0cm}p{3.6cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+失效场景 & 触发条件 & 症状 & 修复 \\
+\midrule
+DR 扩展 model fields & 共享字段展开为 per-world 数组 & 随机 NaN/物理异常 & 确认 graph 在展开后被\emph{重新} capture \\
+sensor 配置变更 & 改变传感器数组形状 & sense graph 失效、传感器返回旧值 & 重新 capture sense graph \\
+env 数量变化 & resume 时 num\_envs 与 capture 时不同 & 维度不匹配崩溃 & 用相同 num\_envs resume \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[mjlab 的 graph 重建由 sim 内部自动完成，用户不要手动调 \texttt{create\_graph()}]
+\textbf{错误描述}：照抄某段“DR 后\emph{手动}调用 \texttt{create\_graph()} 重建”代码。\textbf{根本原因}：mjlab 1.4.0 确有 \Verb[breaklines]|sim.create_graph()|（\verb|sim/sim.py|，捕获 4 张图 \Verb[breaklines]|step_graph/forward_graph/reset_graph/sense_graph|，门控 \Verb[breaklines]|wp.is_mempool_enabled|），但它在 \Verb[breaklines]|expand_model_fields()| 换数组后由 sim \emph{自动}在末尾重捕——\textbf{用户不需要也不应手动碰} \Verb[breaklines]|create_graph()| 或 \Verb[breaklines]|_graph_captured| 之类内部标志。\textbf{正确做法}：把“是否 graph 问题”当作一个\emph{诊断假设}来验证——\textbf{在不启用 mempool 的设备/配置上禁用 CUDA Graph 重跑}：若 NaN 消失，确认是 graph 问题；若 NaN 仍在，graph 不是根因。换言之，graph 的捕获/重捕是 mjlab 自动管理的实现细节，你的着力点是“禁用 graph 复跑”这个二分实验，而非去改 \texttt{create\_graph()}。
+\end{pitfall}
+
+\subsection{配置详解 + 代码走读：NaN Guard 工具（mjlab 与 UniLab）}
+\label{sec:rlmc-ls-nanguard}
+
+把 \cref{ins:rlmc-ls-nan-cpr} 里“先定位”这一步\emph{自动化}的内建工具，是三框架里 mjlab 与 UniLab 共有、Isaac Lab 欠缺的工程亮点（Isaac Lab 的 NaN 常直接 crash、无 dump-回放工具链）。先看 mjlab。\textbf{以下接口经 mjlab 1.4.0 安装源核对属实}：\verb|train| 有布尔旗标 \Verb[breaklines]|--enable-nan-guard|（置 \Verb[breaklines]|cfg.env.sim.nan_guard.enabled=True|，源 \Verb[breaklines]|mjlab/scripts/train.py|），\verb|viz-nan| 是已装的 console-script（\Verb[breaklines]|mjlab/scripts/nan_viz.py|），守卫实现 \verb|NanGuard| 经 \Verb[breaklines]|sim.nan_guard.watch(data)| 上下文管理器逐步监控（\Verb[breaklines]|mjlab/utils/nan_guard.py|），默认 dump 目录为 \Verb[breaklines]|/tmp/mjlab/nan_dumps|。
+
+\begin{codebox}[bash]{mjlab NaN Guard:发生 NaN 时自动 dump 并可交互回放}
+# 启用 NaN guard（用小 env 数 + 短训练复现，见黄金法则）
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 256 --agent.max-iterations 100 --enable-nan-guard True
+# NaN 发生时自动 dump 到默认目录（cfg.env.sim.nan_guard.output_dir 可改）:
+#   /tmp/mjlab/nan_dumps/nan_dump_latest.npz   （latest 软链 + 同名 model_*.mjb）
+# 用官方交互式查看器（viser）逐步回放、对比 env、可视化机器人状态:
+uv run viz-nan /tmp/mjlab/nan_dumps/nan_dump_latest.npz
+\end{codebox}
+
+若要脚本化分析 dump，\textbf{必须按 NaN Guard 真实的 npz 结构读取}（而非想当然的顶层 \verb|qpos/qvel| 键）：
+
+\begin{codebox}[Python]{分析 NaN dump:按 states\_step\_* + \_metadata 结构定位首个 NaN}
+import numpy as np
+def analyze_nan_dump(path):
+    dump = np.load(path, allow_pickle=True)
+    meta = dump["_metadata"].item()                    # dict: num_envs_total/nan_env_ids/...
+    print("nan_env_ids :", meta.get("nan_env_ids"))
+    # 遍历每个 step 的状态数组 [num_envs_dumped, state_size]，定位首次 NaN
+    for k in sorted(x for x in dump.files if x.startswith("states_step_")):
+        states = dump[k]
+        nan_mask = np.isnan(states)
+        if nan_mask.any():
+            rows = np.where(nan_mask.any(axis=1))[0]
+            print(f"  {k}: NaN 出现在 dumped-env 行 {rows[:10]}")
+            break
+    # 根因仍需结合 reward/obs 侧日志:接触发散->qvel/qacc 爆;reward 除零;normalizer 等
+\end{codebox}
+
+\paragraph{\texorpdfstring{NaN 防线要分层：\texttt{nan-policy}（obs 入口的第一道闸）在 \texttt{--enable-nan-guard}（事故现场 dump）之前。}{NaN 防线要分层}}\Verb[breaklines]|--enable-nan-guard| 是一道\emph{重型}闸——它要 dump 整批物理快照、配交互式回放，适合“已经反复 NaN、要彻查根因”的场景；但日常开发里你更想要一道\emph{更早、更轻}的闸，在 NaN 还停留在某一维 obs 时就拦下并直接告诉你是哪一维。mjlab 1.4.0 正好提供了这道闸（\textbf{经安装源 \texttt{train --help} 核实存在}）：每个 obs 组都带一个 \verb|nan-policy| 与逐项检查开关，是 NaN Guard 之外、更靠近观测入口的第一道防线。
+
+\begin{codebox}[bash]{mjlab obs 组级 nan-policy:开发期 error 立即抛、per-term 定位是哪一维（轻量闸）}
+# nan-policy 四档:disabled(不查)/warn(打日志)/sanitize(就地 nan_to_num,慎用)/error(直接抛)
+#   --nan-check-per-term True(默认) 时报错会带「是 actor/critic 组的第几个 term」——直接定位
+# 开发期推荐:actor/critic 两组都设 error,让 NaN 一出现就崩、且打印到 term 级
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 256 --agent.max-iterations 100 \
+    --env.observations.actor.nan-policy error \
+    --env.observations.critic.nan-policy error
+# 注意:sanitize 档会悄悄把 NaN 替成 0(等于框架替你做 nan_to_num),会掩盖根因——
+#   它与本节后面「别用 nan_to_num 掩盖 NaN」是同一个坑,只在“先保命跑完”时临时用
+\end{codebox}
+
+\begin{insight}[NaN 防线分层：obs 入口 \texttt{error} $\to$ 整训 \texttt{nan-guard} dump，由轻到重]\label{ins:rlmc-ls-nan-layered}
+把 NaN 防御想成由轻到重的两道闸，比“只会一个 \Verb[breaklines]|--enable-nan-guard|”更工程化：\textbf{第一道（轻、早）} obs 组级 \Verb[breaklines]|nan-policy error| $+$ \Verb[breaklines]|--nan-check-per-term|——在观测进网络之前就拦，报错精确到“actor 组第 $k$ 个 term”，开发期开它能让 99\% 的“某维 obs 算出 NaN”当场暴露、且不必事后翻 dump；\textbf{第二道（重、全）} \Verb[breaklines]|--enable-nan-guard| 的物理快照 dump $+$ \verb|viz-nan| 回放——当 NaN 不在 obs 入口、而在物理（\verb|qvel| 爆）或 reward 深处时，才需要这道能还原“出事前几帧整机状态”的重型闸。\textbf{先用轻闸把能在入口拦的拦掉，剩下真正深的再上重闸}——这正是 \cref{tab:rlmc-ls-nan-priority} 优先级表“先查最易查”在工具选择上的体现。
+\end{insight}
+
+\paragraph{UniLab 的 NaN 守卫：与 mjlab \emph{同级}、且默认就开。}UniLab 把 NaN 守卫做成 CPU 环境核的内建设施——\verb|NpEnv| 内嵌 \verb|NanGuard|（UniLab commit \texttt{99936e08}，\texttt{utils/\allowbreak nan\_guard.\allowbreak py} 的同名类）：每步 \verb|step()| 里 \verb|check_ctrl| 查动作 NaN、\verb|check| 查 obs/reward NaN、\verb|capture| 把物理快照存进一个最近 \verb|buffer_size| 帧的环缓冲；命中即 \verb|dump| 写 \Verb[breaklines]|nan_dump_*.npz|（含状态环缓冲 $+$ 复制的 \verb|model_file| $+$ \verb|latest| 软链），事后 \Verb[breaklines]|unilab-viz-nan <dump>| 用 \verb|mujoco.viewer| 离线\textbf{回放出事前那几帧}来复现\,\cite{unilab2026}。与 mjlab 不同的是它在\emph{训练时默认就开}（\Verb[breaklines]|conf/{ppo,offpolicy,appo}/config.yaml| 三处训练配置都把 \Verb[breaklines]|training.nan_guard.enabled| 覆盖为 \verb|true|），这对「CPU collector 子进程静默死亡」这一异构架构最难调的失败模式尤其值钱。
+
+\begin{pitfall}[查“某开关真实默认开没开”要看 conf 覆盖、不是看 dataclass 裸默认]
+\textbf{错误描述}：想确认 UniLab NaN 守卫是否默认开，直接去读 \verb|NanGuardCfg| 这个 dataclass，看到字段裸默认是 \verb|enabled=False|，就断言“默认是关的”。\textbf{现象后果}：与实际训练行为相反——真正训练时它是\emph{开}的，你据“关的”去排错会南辕北辙。\textbf{根本原因}：Hydra/OmegaConf 这类配置系统有\textbf{两层默认}：dataclass 里的\emph{裸默认}（没人覆盖时的兜底）与 \verb|conf/*.yaml| 里的\emph{训练默认}（实际 \verb|train| 入口加载、会覆盖裸默认）。UniLab 的 \Verb[breaklines]|NanGuardCfg.enabled| 裸默认 \verb|False|，但 \Verb[breaklines]|conf/{ppo,offpolicy,appo}/config.yaml| 把它覆盖成 \verb|true|——所以“训练时默认开”这句在工程语义上是对的。\textbf{正确做法}：判断一个开关的\emph{真实生效默认}，要看“你这条 \verb|train| 命令实际加载的那棵 conf 树合成后的值”，而不是源码 struct 的字段默认；可在训练启动时打印合成后的完整 config（多数 Hydra 应用会把它落盘到运行目录），直接读那一份才作数。这条“查默认值看 conf 不看 struct”的方法，对任何 Hydra/OmegaConf 项目都适用。
+\end{pitfall}
+
+\begin{codebox}[bash]{UniLab NaN Guard:默认开 + dump + 离线回放（对照 mjlab \texttt{--enable-nan-guard}）}
+# 守卫默认开;可显式配 dump 目录与每次最多 dump 的 env 数（小 env + 短训练复现，见黄金法则）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=256 algo.max_iterations=100 \
+    training.nan_guard.enabled=true training.nan_guard.output_dir=/tmp/nan
+# NaN 命中时自动写 nan_dump_<ts>_step<N>.npz（states 环缓冲 + meta_* + 复制 model_file + latest 软链）
+# 用官方查看器离线回放出事前那几帧（mujoco.viewer 复现）:
+unilab-viz-nan /tmp/nan/nan_dump_latest.npz
+\end{codebox}
+
+\begin{pitfall}[UniLab 的 \texttt{step()} 末尾有兜底 \texttt{np.\allowbreak nan\_to\_num(reward)}——别被它掩盖了根因]
+\textbf{错误描述}：以为 UniLab 默认开 NaN 守卫就万事大吉，对偶发的“reward 被悄悄归零”视而不见。\textbf{现象后果}：守卫已 dump 了事故现场，但训练\emph{看起来照常进行}（reward 不再 NaN），于是没人去看 dump，根因（如某 reward term 在边界态除零）一直留在代码里。\textbf{根本原因}：UniLab \verb|NpEnv.step()| 末尾有一道兜底 \Verb[breaklines]|np.nan_to_num(reward, ...)|（与本节后面 \cref{sec:rlmc-ls-nan-multigpu} 警告的“别用 \verb|nan_to_num| 掩盖 NaN”是同一个坑，只是这里是框架替你兜的）。\textbf{正确做法}：把 \Verb[breaklines]|unilab-viz-nan| 的 dump 当成\emph{必看}的事故报告，按 \cref{tab:rlmc-ls-nan-priority} 的优先级追溯根因，而不是依赖兜底让训练硬跑下去。
+\end{pitfall}
+
+\subsection{NaN 排查优先级表与黄金法则}
+\label{sec:rlmc-ls-nan-priority}
+
+NaN 发生时，按下表优先级逐步排查——每步确认无问题再进下一步。表的排序刻意把“最容易查、最高频”的放前面（reward 分项打印 5 分钟出结果；CUDA Graph 要禁用重跑、最费时放最后）：
+
+\begin{table}[H]\centering\small
+\caption{NaN 排查优先级表（从最易查到最难查）}
+\label{tab:rlmc-ls-nan-priority}
+\begin{tabular}{@{}cp{3.4cm}p{3.4cm}p{3.6cm}@{}}
+\toprule
+优先级 & 检查项 & 检查方法 & 修复方向 \\
+\midrule
+1 & reward 是否除零 & 分项打印 reward term & 替换为 $\exp(-d^2/\sigma^2)$ \\
+2 & action scale 是否过大 & 打印 action 范围 & 减小到 $0.5\times$ 试 \\
+3 & obs normalizer 是否预热 & 打印 normalizer \verb|.std| & 加 warmup \\
+4 & actuator gains 是否合理 & PD 阶跃响应测试 & 降 \verb|kp/kd| \\
+5 & timestep 是否太大 & 自由落体弹跳测试 & 减小 \verb|dt| \\
+6 & solver iterations 是否够 & 接触力稳定性检查 & 增 iterations \\
+7 & \verb|nconmax/njmax| 是否够 & 看 warning & 增大 buffer（\cref{sec:rlmc-ls-perf}） \\
+8 & 接触参数 & \verb|solref/solimp| 检查 & 用更软的接触 \\
+9 & policy std 参数化 & 检查 std 有无负值 & 用 \verb|softplus/log| \\
+10 & CUDA Graph 是否有效 & 禁用 graph 重试 & 重新 capture \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[排查黄金法则：先缩小复现范围，再定位根因]\label{ins:rlmc-ls-nan-shrink}
+\textbf{不要在 4096 envs 上排查 NaN}——先用 16 envs + 短训练复现。若 16 envs 不复现，逐步增大 env 数直到复现：这能帮你判断 NaN 是否和 env 数量相关（内存、CUDA Graph 类问题往往\emph{只在}大 env 数出现）。反过来想：\textbf{若不用 NaN Guard 凭经验猜}，你看到 reward 变 NaN、猜“可能是 contact 参数不对”，花两天调 \verb|solref/solimp|——结果根因是 reward 里的 $1/d$ 溢出；而 NaN Guard 的 dump 能在 5 分钟内告诉你“NaN 首先出现在 reward，不是 qvel”，直接指向 reward 函数。这就是“先定位再追溯”相对于“凭经验猜”的全部价值。
+\end{insight}
+
+\paragraph{\texorpdfstring{补一手 PyTorch 侧的细粒度定位：\texttt{CUDA\_LAUNCH\_BLOCKING} $+$ \texttt{detect\_anomaly}}{补一手 PyTorch 侧的细粒度定位：CUDA\_LAUNCH\_BLOCKING + detect\_anomaly}}框架自带的 NaN dump（mjlab \Verb[breaklines]|--enable-nan-guard| / UniLab \verb|NanGuard|）擅长告诉你“NaN 首先出现在物理还是 reward”，但当 NaN 出在 PPO update 内部（某个 loss/反传算子）时，还需要一手更细的 PyTorch 原生定位。它与“禁用 graph 二分”是\emph{互补}的两个维度——前者定位\textbf{是哪个算子}，后者定位\textbf{是不是 graph 问题}：
+
+\begin{codebox}[bash]{把“随机 NaN”定位到具体 kernel/算子（PyTorch 原生，开发期临时开）}
+# CUDA 默认异步派发,报错栈常指向不相关的后续 kernel;设 =1 强制同步,栈才指向真正出错的 kernel
+CUDA_LAUNCH_BLOCKING=1 uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 64 --agent.max-iterations 50
+\end{codebox}
+
+\begin{codebox}[Python]{反传里抓首个产生 NaN 的算子（仅诊断时开，常态会显著拖慢）}
+import torch
+# 训练循环外层包一层:任一前向/反传产生 NaN/Inf 时立即抛,并打印是哪个 op 制造的
+with torch.autograd.set_detect_anomaly(True):
+    runner.train_one_iteration()
+# 代价:detect_anomaly 会逐 op 检查、显著变慢,定位完务必关掉,别留在正式训练里
+\end{codebox}
+
+\subsection{多 GPU 环境下的 NaN 特殊处理}
+\label{sec:rlmc-ls-nan-multigpu}
+
+多 GPU 下 NaN 更难排查——它可能只发生在某个 rank，而其他 rank 日志看起来正常。需要一个\textbf{跨 rank 的 NaN 监控}，用 all-reduce 汇总“哪个 rank 有 NaN”：
+
+\begin{codebox}[Python]{跨 rank NaN 监控:all-reduce 汇总后报告问题 rank}
+def check_nan_all_ranks(tensor, name="tensor") -> bool:
+    has_nan = torch.isnan(tensor).any()
+    if dist.is_initialized():
+        counts = torch.tensor([has_nan.int()], device=tensor.device)
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)   # 汇总所有 rank
+        if counts.item() > 0:
+            if has_nan:
+                print(f"[WARN] Rank {dist.get_rank()}: NaN in {name}, shape={tuple(tensor.shape)}")
+            dist.barrier()                              # 所有 rank 同步后再继续
+            return True
+    elif has_nan:
+        print(f"[WARN] NaN in {name}")
+        return True
+    return False
+\end{codebox}
+
+\begin{pitfall}[别用 \texttt{torch.\allowbreak nan\_to\_num()} 把 NaN 掩盖掉]
+\textbf{错误描述}：在 reward 计算后加 \verb|nan_to_num| 把 NaN 替换为 0“让训练继续”。\textbf{现象后果}：错误信号被静默吞掉，训练能跑但策略行为诡异（某些 reward 被悄悄置 0）。\textbf{根本原因}：这只消除了 NaN 的\emph{表现}，没修\emph{根因}。\textbf{正确做法}：定位并修复根因；NaN 应当让你“停下来查”，而不是“掩盖后继续”。另：\textbf{NaN $+$ 多 GPU 不要一起排查}——先缩到单 GPU $+$ 小 env 数定位根因，修好再扩回多 GPU 验证。
+\end{pitfall}
+
+\begin{practice}[NaN 排查练习]
+\begin{enumerate}
+\item （实践题）在你的自定义环境里故意引入一个 $1/d$ 形式的 reward，运行训练观察 NaN 何时出现；再用 \Verb[breaklines]|--enable-nan-guard| 重跑并分析 dump。\emph{验收}：能从 dump 指出“NaN 首先出现在 reward 而非 qvel”。
+\item （分析题）一个训练在第 3000 iteration 才 NaN（前 2999 正常）。列出三个可能触发条件，并解释为何它们\emph{在训练后期}才触发。\emph{验收}：至少答出“策略学到高速接触 / curriculum 推进新增 reward term / DR 课程扩大到低摩擦”之一。
+\item （跨章综合题）结合 \cref{ch:rlmc-dr}：DR 摩擦范围从 $[0.5,1.0]$ 扩到 $[0.1,2.0]$ 后频繁 NaN，根因与修复？\emph{验收}：指出“低摩擦 $+$ 高速接触 $\to$ 求解器发散”，修复走根因 1。
+\end{enumerate}
+\end{practice}
+
+NaN 排查建立了“训练能稳定运行”的基础。但“能运行”不等于“运行得快”——瓶颈可能在物理、传感器或 Python 层。下一节讲如何量化并优化性能。
+
+% ════════════════════════════════════════════════════════════════
+\section{性能优化：从 Profiling 到 Tuning}
+\label{sec:rlmc-ls-perf}
+
+\paragraph{\texorpdfstring{\cnum{1} 模块功能与在管线中的位置}{1 模块功能与在管线中的位置}}性能优化作用在“env step $+$ PPO update”这条主循环上。关键前提是：\textbf{RL 训练的性能不是“steps/s”一个数字}，要分层度量，否则你根本不知道时间花在哪。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.8cm}p{5.0cm}p{4.4cm}@{}}
+\toprule
+度量 & 定义 & 含义 \\
+\midrule
+\verb|physics_sps| & 物理步/秒（含 decimation 内所有 substep） & 物理引擎原始吞吐 \\
+\verb|env_sps| & 环境步/秒（不含 decimation） & 策略频率下的吞吐 \\
+\verb|train_sps| & 训练步/秒（含 PPO update） & 端到端训练速度 \\
+\verb|VRAM_MB| & GPU 显存占用 & 决定能跑多少 envs \\
+\Verb[breaklines]|wall_time_per_iter| & 每次 PPO iteration 的墙钟时间 & 决定总训练时间 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{关键关系}：$\texttt{env\_sps}=\texttt{physics\_sps}/\allowbreak\texttt{decimation}$，且 $\texttt{train\_sps}<\texttt{env\_sps}$（PPO update 也耗时）。诊断逻辑由此而来：若 \verb|physics_sps| 高但 \verb|env_sps| 低，瓶颈在传感器或 Manager 的 Python 逻辑；若 \verb|env_sps| 高但 \verb|train_sps| 低，瓶颈在 PPO update（网络太大或 mini-batch 太多）。
+
+\subsection{配置详解 + 代码走读：profiling 工具链（三框架通用）}
+\label{sec:rlmc-ls-profiling}
+
+profiling 工具几乎与框架无关——\Verb[breaklines]|torch.profiler| 与 \verb|nsys| 对 mjlab / Isaac Lab 通用，差别只在启动命令。先用\textbf{5 分钟快速 benchmark}定位“是 env 慢还是 train 慢”：
+
+\begin{codebox}[bash]{快速 benchmark:测 train 吞吐（mjlab train 默认 headless，无 --headless 旗标）}
+# 测 train 吞吐（含 PPO update）;mjlab train 本就无 viewer，无需也无 --headless 旗标
+time uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 4096 --agent.max-iterations 10
+#   train_sps = num_envs * num_steps_per_env * 10 / wall_time
+# 只测 env 吞吐（不含 PPO update）:mjlab play 是 viewer 驱动、无 --max-steps/--no-render 这类
+#   「跑 N 步即退」旗标，故纯 env 吞吐用下一小节 find_optimal_num_envs() 那样的自定义 step 循环测
+#   （在脚本里 env.step N 次计时），不要用 play 当 headless benchmark.
+\end{codebox}
+
+\begin{note}[小 env 数的 steps/s 几乎没有参考价值——首跑别被低数字吓到]
+第一次跑这条 benchmark，你很可能看到一个\emph{远低于}预期的数字，并误以为框架慢或装坏了。实测对照（gpufree、RTX 4090）：mjlab \texttt{Mjlab-Velocity-Flat-Unitree-Go1} 在 \Verb[breaklines]|--env.scene.num-envs 64| 下仅 $\sim$1{,}300 steps/s，而同机 4096 envs 才是 \cref{sec:rlmc-ls-perf-table} 给的 $10^5$ 量级；Isaac Cartpole 头几次迭代 100k、稳态可到 300k steps/s。差距来自两点：(1) \textbf{小 env 数下 GPU kernel 远未饱和}，吞吐受启动/调度开销主导；(2) \textbf{头几次迭代还在做 CUDA Graph 一次性捕获与 JIT 预热}，把它们计入会进一步压低数字。所以 benchmark 必须\textbf{按 \cref{sec:rlmc-ls-unilab-perf} 末尾十字段协议先 warmup 再测、且用目标 env 数（如 4096）}——小规模、含 warmup 的数字不能用来判断“快不快”，更不能拿去和别人的 4096-env 数字比。
+\end{note}
+
+再用\textbf{深度 profiling}看四层时间分布（\Verb[breaklines]|torch.profiler| 输出可直接在 TensorBoard 看 timeline）：
+
+\begin{codebox}[Python]{torch.profiler:抓训练几个 iteration 的时间分布}
+import torch.profiler as tp
+def profile_training(runner, num_iters=5):
+    with tp.profile(
+        activities=[tp.ProfilerActivity.CPU, tp.ProfilerActivity.CUDA],
+        schedule=tp.schedule(wait=1, warmup=1, active=3, repeat=1),   # 跳过 warmup
+        on_trace_ready=tp.tensorboard_trace_handler("./profile"),
+        record_shapes=True, with_stack=True,
+    ) as prof:
+        for _ in range(num_iters):
+            runner.train_one_iteration()
+            prof.step()
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+\end{codebox}
+
+\begin{codebox}[bash]{nsys:GPU kernel 级 timeline（定位具体 kernel 热点）}
+nsys profile --trace=cuda,nvtx --output=train_profile \
+    uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 4096 --agent.max-iterations 5
+nsys-ui train_profile.nsys-rep        # 打开 UI 看 timeline
+\end{codebox}
+
+\textbf{各组件典型成本比例}（A100、4096 envs、29-DOF 人形，数量级参考，标 \pz{量级参考}）：物理引擎 \verb|mj_step| 占 40--50\%（接触检测 $+$ 求解器）、传感器 \verb|sense| 占 15--30\%（height scan $>$ contact $>$ raycast）、Manager（obs/reward/term）占 10--20\%（Python dispatch $+$ tensor ops）、PPO update 占 10--20\%、其他（reset/logging/CUDA sync）占 5--10\%。\textbf{传感器与 PPO 网络大小是两个最常见的“可优化”热点}——下面的真实案例正是栽在这两处。
+
+\subsection{\texorpdfstring{运行验证：一个真实的 2.5$\times$ 加速案例}{运行验证：一个真实的 2.5x 加速案例}}
+\label{sec:rlmc-ls-perf-case}
+
+\textbf{背景}：Unitree G1 29-DOF locomotion，4096 envs，单 A100。初始 \verb|train_sps| $\approx$ 45k，目标 $>$ 100k。流程是“分层测量$\to$逐项优化”，正好印证 \cref{ins:rlmc-ls-perf-guess} 的洞察：
+
+\begin{codebox}[text]{分层测量定位瓶颈（数字为该案例实测，标 \pz{案例值}）}
+1. 纯物理 step          : 220,000 sps
+2. + sensor             : 120,000 sps   -> sensor 开销 45%!  (1024-ray height scan)
+3. + managers           :  95,000 sps   -> manager 开销 21%  (reward 里有 per-env 循环)
+4. + PPO update(完整训练):  45,000 sps   -> PPO 开销 53%!     (critic 网络 [1024,512,256] 太大)
+逐项修复:
+  sensor : height scan 1024 -> 121 rays(11x11)   开销 45% -> 15%
+  PPO    : critic [1024,512,256] -> [512,256,128] 开销 53% -> 25%
+  manager: reward per-env 循环 -> batch tensor 操作 开销 21% -> 8%
+结果: train_sps 45,000 -> 115,000 (2.56x 加速)
+\end{codebox}
+
+\begin{insight}[性能瓶颈很少在你猜测的地方——先 profile 再优化]\label{ins:rlmc-ls-perf-guess}
+这个案例里，用户最初坚信“MuJoCo Warp 物理引擎太慢”，但物理层 220k sps 完全够用——真正的瓶颈在 sensor（1024-ray height scan）和 PPO 网络大小。没有 profiling 的“猜测式优化”只会浪费时间：你可能花一周换框架，却没注意到把 height scan 从 1024 降到 121 条射线就能立刻翻倍。\textbf{先 profile，找到瓶颈再决定}——这是性能工程的第一纪律。
+\end{insight}
+
+\subsection{配置详解：nconmax/njmax 与 num\_envs 调优}
+\label{sec:rlmc-ls-nconmax}
+
+\verb|nconmax| 与 \verb|njmax| 直接影响 GPU 显存与性能，且二者语义\textbf{不同}，极易混淆：
+
+\begin{pitfall}[\texttt{nconmax} 是“全局容量推导”，\texttt{njmax} 是“每 world 严格上限”——别混用]
+\textbf{错误描述}：以为 \verb|nconmax| 是“每个 world 的最大接触数”。\textbf{根本原因}：在 MJWarp 里 contacts 存放在\emph{异构}数组里——单个 world 的接触数\emph{可以}超过 \verb|nconmax|，只要所有 world 的\emph{总}接触数不超过 $n_{\text{world}}\times\texttt{nconmax}$；而 \verb|njmax| 是\emph{每个 world 严格}的最大约束行数上限。\textbf{现象后果}：把 \verb|nconmax| 当 per-world 上限设置，会在多接触 world 上截断（穿透、物理不稳定）。\textbf{正确做法}：先用默认值跑、记录实际接触数分布，再把 \verb|nconmax| 设为 $1.5\times$ 最大观测值；设太小会截断，设太大浪费显存并降低 cache locality。
+\end{pitfall}
+
+\begin{codebox}[Python]{nconmax 调优:记录接触数分布并给推荐值}
+def find_optimal_nconmax(env, num_steps=1000):
+    obs, _ = env.reset()
+    ncon_history = []
+    for _ in range(num_steps):
+        env.step(torch.randn(env.num_envs, env.action_space.shape[-1], device=env.device))
+        ncon = env.sim.data.ncon
+        ncon_history.extend(ncon.tolist() if hasattr(ncon, "tolist") else [ncon])
+    arr = np.array(ncon_history)
+    print(f"p50={np.percentile(arr,50):.0f} p95={np.percentile(arr,95):.0f} max={arr.max():.0f}")
+    recommended = int(arr.max() * 1.5)
+    print(f"Recommended nconmax: {recommended}")
+    return recommended
+\end{codebox}
+
+\verb|num_envs| 的选择则是“逐步增大找吞吐峰值”——过了某点继续加 envs 只增显存不增速（GPU 计算饱和），甚至因 cache 压力略降：
+
+\begin{codebox}[Python]{自动扫描最优 num\_envs:吞吐与显存联合看}
+def find_optimal_num_envs(make_fn, task, env_range=(256,512,1024,2048,4096,8192)):
+    results = []
+    for n in env_range:
+        try:
+            env = make_fn(task, num_envs=n); env.reset()
+            for _ in range(50):                          # warmup，排除 graph capture 等一次性开销
+                env.step(torch.randn(n, env.action_space.shape[-1], device="cuda"))
+            t0 = time.perf_counter()
+            for _ in range(200):
+                env.step(torch.randn(n, env.action_space.shape[-1], device="cuda"))
+            sps  = n * 200 / (time.perf_counter() - t0)
+            vram = torch.cuda.max_memory_allocated() / 1e6
+            results.append({"num_envs": n, "sps": sps, "vram_mb": vram})
+            print(f"  n={n:5d}: {sps:.0f} sps, {vram:.0f} MB")
+            env.close(); torch.cuda.empty_cache()
+        except RuntimeError as e:
+            if "out of memory" in str(e): print(f"  n={n:5d}: OOM"); break
+            raise
+    best = max(results, key=lambda x: x["sps"])
+    print(f"Optimal: num_envs={best['num_envs']} ({best['sps']:.0f} sps)")
+    return best
+\end{codebox}
+
+\begin{note}[显存估算公式只是“下界玩具”，不要据此判断能否放下 4096 envs]
+网上常见的“per-env 物理状态 $+$ rollout buffer $+$ 网络参数”显存估算公式，\textbf{严重低估}真实训练显存——它未计入 CUDA context、MJWarp 的 data/constraint buffer、sensor buffer、actor/critic 前向激活、Adam 的两组动量状态、多个 obs group、logging/video 等。\textbf{真实显存请用} \Verb[breaklines]|torch.cuda.max_memory_allocated()| \textbf{/} \verb|nvidia-smi| \textbf{/ 官方 benchmark 脚本实测}，估算公式只配做数量级直觉，不配做容量决策。
+\end{note}
+
+\subsection{性能调优决策表 \& 框架对比}
+\label{sec:rlmc-ls-perf-table}
+
+\begin{table}[H]\centering\small
+\caption{性能调优决策表（现象 $\to$ 优先怀疑 $\to$ 第一检查项 $\to$ 调整）}
+\label{tab:rlmc-ls-perf-decision}
+\begin{tabular}{@{}p{3.2cm}p{2.6cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+现象 & 优先怀疑 & 第一检查项 & 调整方向 \\
+\midrule
+steps/s $<$ 预期 50\% & sensor 过重 & 关 sensor 对比 & 降 sensor 数量/分辨率 \\
+GPU 利用率 $<$ 50\% & \verb|num_envs| 太小 & 增大 \verb|num_envs| & 翻倍到 GPU 饱和 \\
+VRAM 接近上限 & envs/buffer 太大 & \verb|nvidia-smi| 监控 & 降 \Verb[breaklines]|num_envs/nconmax| \\
+前几步极慢 & CUDA Graph capture & 看 warning & 等 capture 完成 \\
+PPO update $>$ 30\% & 网络大/mini-batch 多 & profiler 检查 & 减小网络/mini-batch \\
+\verb|physics_sps| 低但 \verb|env_sps| 合理 & timestep/iter 过多 & 增大 timestep 试 & 权衡精度与速度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Isaac Lab vs mjlab 性能}（数量级参考，标 \pz{量级参考}；\textbf{不应仅凭 steps/s 选框架}）：两框架差异主要来自物理引擎（mjlab 的 MuJoCo-Warp Newton 全局求解 vs Isaac Lab 的 PhysX TGS 迭代求解，见 \cref{ch:rlmc-physics}）与框架层开销。四足任务 \verb|env_sps| 大致 mjlab 150k--250k、Isaac Lab 120k--200k；人形大致 mjlab 80k--120k、Isaac Lab 60k--100k。但这些数字\emph{强烈依赖}具体任务配置、GPU 型号与框架版本——物理精度、API 设计、生态与部署管线的完整性比裸吞吐更重要。\textbf{UniLab 的性能画像与两框架\emph{不在同一坐标系}}：物理在 CPU，吞吐受 CPU 核数与 collector-learner-H2D 流水线重叠主导，瓶颈不在 GPU 显存——这意味着本节 \cref{sec:rlmc-ls-nconmax} 的 \verb|nconmax|/\allowbreak\verb|njmax| 显存大户与 VRAM 容量决策在 UniLab \textbf{无对应}（CPU-sim 不占仿真显存，GPU 只放策略），profiling 的重心也从「四层 GPU kernel」换成「三段流水线是否对齐」。下一小节给出 UniLab 侧的 profiler 接线。
+
+\subsection{代码走读：UniLab 的流水线 profiling（chrome-trace，off-policy）}
+\label{sec:rlmc-ls-unilab-perf}
+
+UniLab 的异构架构里，collector（CPU）、learner（GPU）、H2D 拷贝分处不同进程/设备并发，所以它的 profiler 不是 \Verb[breaklines]|torch.profiler| 的 GPU timeline，而是\textbf{自带的 chrome-trace 风格时间片}：off-policy 路径经 Hydra 覆盖 \Verb[breaklines]|training.trace_enabled=true| 打开，由 \Verb[breaklines]|logging/trace_event.py| 的 \verb|TraceRecorder|（UniLab commit \texttt{99936e08}）写出 Perfetto/Chrome-trace JSON，可视化 \verb|weight_sync/*|、\verb|replay/*|、\Verb[breaklines]|replay_pipeline/*| 三类时间片的重叠\,\cite{unilab2026}。它回答的核心问题与 mjlab/Isaac 的「物理慢还是 PPO 慢」不同——是\textbf{「GPU 算得慢，还是 CPU 喂不上 / H2D 拖后腿」}。
+
+\begin{codebox}[bash]{UniLab profiling:产 chrome-trace JSON 看三段流水线重叠（无 \texttt{--profile} flag）}
+# 注意:UniLab 无字面 --profile flag，profiling 走 Hydra training.trace_* 覆盖;trace 是 off-policy 特性
+uv run train --algo sac --task g1_walk_flat --sim mujoco \
+    training.trace_enabled=true training.trace_output_dir=/tmp/trace \
+    training.trace_cuda_events=true
+#   -> 写 perfetto_offpolicy_timeline.json（{"traceEvents":[...]}）
+# 解析（看 learner/training_e2e 等时长与间隙，定位是 GPU 慢还是 CPU/H2D 拖后腿）:
+python scripts/analyze_offpolicy_trace.py /tmp/trace/perfetto_offpolicy_timeline.json
+\end{codebox}
+
+\begin{note}[UniLab 独有的失败面：\texttt{/dev/shm} 共享内存预算（GPU-sim 框架没有）]
+mjlab/Isaac Lab 的并行度受\emph{显存}限制；UniLab 的并行度还受 \verb|/dev/shm| 限制——大 replay buffer / ring buffer 直接占共享内存。它在分配前用 \Verb[breaklines]|estimate_offpolicy_bytes| / \Verb[breaklines]|estimate_appo_bytes|（UniLab commit \texttt{99936e08}，\Verb[breaklines]|ipc/memory_budget.py|）估字节数，超 \verb|/dev/shm| 的 $80\%$ 直接抛 \verb|MemoryError| 并提示“减小 \verb|algo.num_envs| 或 \Verb[breaklines]|algo.replay_buffer_n|，或加大 \verb|/dev/shm|”（\Verb[breaklines]|UNILAB_SKIP_MEMORY_CHECK=1| 可关）。这是 \cref{sec:rlmc-ls-nconmax} 里“OOM 优先减半 \verb|num_envs|”那条经验在 UniLab 的对应物，只是瓶颈从 GPU 显存换成了 CPU 共享内存。
+\end{note}
+
+\begin{pitfall}[benchmark 报数字必须附完整协议，否则不可复查]
+\textbf{错误描述}：报“mjlab 比 X 快 3 倍”。\textbf{现象后果}：结论无法被复查、无法被反驳。\textbf{根本原因}：缺了使结论有效的全部上下文——什么 task？什么机器人/DOF？什么 sensor？多少 envs？什么 GPU？warmup 怎么处理？CUDA Graph 开没开？viewer 开没开？\textbf{正确做法}：一个规范的性能结论形如——“在 \texttt{Mjlab-Velocity-Flat-Unitree-Go1} 上，RTX 4090、4096 envs、无 viewer/video、121-ray height scan、100 步 warmup 后测 1000 步，steady-state \verb|env_sps| 为 185{,}000；该数字只代表环境步吞吐，不代表训练收敛速度”。task\_id / robot / sensors / num\_envs / GPU / framework\_version / warmup / metric / CUDA-Graph / viewer 这十个字段缺一不可。
+\end{pitfall}
+
+\begin{practice}[性能优化练习]
+\begin{enumerate}
+\item （实践题）对你的自定义环境跑 \Verb[breaklines]|find_optimal_num_envs()|，画出 num\_envs--steps/s 与 num\_envs--VRAM 曲线。\emph{验收}：找到吞吐峰值对应的 num\_envs 并说明为何过峰后不再提速。
+\item （实验题）在有 height scan 的四足任务上分别测有/无 height scan 的 \verb|env_sps|。\emph{预期}：sensor 开销通常占 15--45\%，给出你的百分比。
+\item （分析题）为什么过大的 \verb|nconmax| 反而降性能？从 GPU cache locality 角度解释。\emph{验收}：能说出“大数组降 cache 命中、且多算空接触槽位”。
+\end{enumerate}
+\end{practice}
+
+性能优化确保训练“跑得快”。但若训练在云端进行，还要管理集群生命周期与成本——这是下节内容；之后转向更重要的“可复现”。
+
+% ════════════════════════════════════════════════════════════════
+\section{云端训练与成本控制}
+\label{sec:rlmc-ls-cloud}
+
+\paragraph{\texorpdfstring{\cnum{1} 模块功能与在管线中的位置}{1 模块功能与在管线中的位置}}云端训练是多 GPU 的延伸——当本地卡不够、或要并行跑大量 seed/超参时，把训练搬到云上。本节只讲“训练工程”需要的最小面：用 \textbf{SkyPilot}（mjlab/Isaac Lab 社区常用的跨云编排）启动一次训练、控住成本、并用 \textbf{WandB Sweep} 自动化超参搜索。SkyPilot 抽象了不同云厂商的 GPU 资源，用统一 YAML 描述。
+
+\begin{codebox}[bash]{SkyPilot:用固定 cluster name 启动/查看/释放(重要)}
+# 关键:YAML 里的 name 只是 task name(仅展示);不带 -c 时 SkyPilot 自动生成 cluster name.
+# sky logs/down 针对的是 cluster name —— 故显式用 -c 固定一个，后续命令才稳定引用.
+sky launch -c go1-velocity sky_train.yaml        # 启动并固定 cluster name
+sky status                                        # 查看
+sky logs go1-velocity                             # 查看日志(针对 cluster name)
+sky down go1-velocity                             # 释放资源(忘了会持续计费!)
+\end{codebox}
+
+\begin{codebox}[text]{sky\_train.yaml 骨架(资源/setup/run 三段)}
+name: go1-velocity-training        # task name(仅展示)
+resources:
+  accelerators: A100:1             # 1 块 A100
+  use_spot: true                   # spot 实例省成本(需处理中断)
+  disk_size: 100
+setup: |
+  pip install uv
+  uvx --from mjlab demo            # 验证安装
+run: |
+  uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 4096 --agent.max-iterations 10000 --agent.logger wandb
+\end{codebox}
+
+\begin{insight}[云端成本的“周末陷阱”：idle 也计费]\label{ins:rlmc-ls-cloud-cost}
+SkyPilot 启动的 GPU 实例\emph{不会}自动关闭（除非配置了自动关闭）。一块 A100 闲置一天约烧 \pz{量级参考}\,\$72；一个周五下午忘关的实例，到周一上午已烧掉约 \$200。\textbf{成本控制清单}：(1) 用 spot 实例（省 50--70\%）但要处理中断（每 500 iter 存 checkpoint 并上传 WandB/S3）；(2) 训练完\emph{立刻} \Verb[breaklines]|sky down|；(3) 设 \Verb[breaklines]|max_iterations| 上限防训练跑飞；(4) 先用小 num\_envs smoke test 确认能跑再启大规模；(5) 用 WandB 远程监控，不必 SSH 进去看日志。最稳的做法是在“训练完成 callback”里自动 \Verb[breaklines]|sky down|，或设最大运行时间。
+\end{insight}
+
+\Verb[breaklines]|WandB Sweep| 把超参搜索自动化——配置里 \verb|program| 是必填（agent 要知道启动哪个脚本），\verb|command| 把超参映射到 CLI：
+
+\begin{codebox}[text]{wandb\_sweep.yaml + 多卡各起一个 agent}
+program: train                     # 必填: agent 据此启动训练脚本
+method: bayes                      # 贝叶斯优化
+metric: {name: reward_mean, goal: maximize}
+parameters:
+  learning_rate: {min: 0.0001, max: 0.01}
+  action_scale:  {values: [0.15, 0.2, 0.25, 0.3]}
+# 多卡并行搜索: 每个 agent 绑定独立 GPU(否则全抢 GPU 0)
+#   CUDA_VISIBLE_DEVICES=0 wandb agent <SWEEP_ID> &
+#   CUDA_VISIBLE_DEVICES=1 wandb agent <SWEEP_ID> &
+\end{codebox}
+
+\paragraph{UniLab 的云端：无专用编排器，但有一个 GPU-sim 框架没有的成本变量。}UniLab \textbf{不内置 SkyPilot/OSMO 这类云编排器}（其 README 未提供等价工具），云端训练走通用路径：因为它不依赖 Isaac Sim、也不依赖 GPU 物理后端，任何能跑 MuJoCo/Motrix $+$ 一块支持的加速卡的云实例都能直接 \Verb[breaklines]|uv sync| 后开训；超参搜索同样用\emph{通用} sweep（外层起多个 \Verb[breaklines]|uv run train| 进程、用 Hydra 覆盖喂不同超参），SkyPilot 那套 \Verb[breaklines]|sky launch -c <cluster> / sky down| 的成本纪律照搬即可。但 UniLab 多一个云端易踩的资源维度——\verb|/dev/shm|：云镜像的共享内存默认配额常偏小，大 replay buffer 会在实例上直接 \verb|MemoryError|（见上一节的预算守卫）。
+
+\begin{codebox}[bash]{UniLab:云实例上的最小训练 + 通用 sweep（无 SkyPilot/OSMO 内建）}
+# 任意云 GPU 实例:不需 Isaac Sim / GPU 物理后端，uv sync 后即可
+uv sync --extra mujoco            # 或 --extra motrix
+# 单次训练（spot 实例记得每若干 iter 存 checkpoint 防回收）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=10000
+# 通用 sweep:外层脚本对每组超参起一个进程、绑独立 GPU（否则全抢 cuda:0）
+#   CUDA_VISIBLE_DEVICES=0 uv run train --algo ppo --task ... algo.learning_rate=0.001 &
+#   CUDA_VISIBLE_DEVICES=1 uv run train --algo ppo --task ... algo.learning_rate=0.003 &
+# 云端易踩:共享内存配额小 -> off-policy 大 buffer MemoryError;按需加大 /dev/shm 或减 replay_buffer_n
+\end{codebox}
+
+\begin{pitfall}[两个云端高频坑：spot 丢 checkpoint \& sweep agent 抢卡]
+\textbf{(1) spot 实例被回收丢 checkpoint}：spot 可被云厂商随时回收；正确做法是每 500 iter 自动存 checkpoint 并上传 WandB/S3。
+\textbf{(2) sweep agent 抢同一 GPU}：多个 agent 不加 \Verb[breaklines]|CUDA_VISIBLE_DEVICES| 限制会全用 GPU 0，利用率冲突、曲线互相污染；正确做法是\textbf{每个 agent 绑定独立 GPU，agent 数 $=$ GPU 数}。
+\end{pitfall}
+
+\begin{practice}[云端训练练习]
+\begin{enumerate}
+\item （设计题）为 3 seed $\times$ 4 配置 $=$ 12 个实验设计云端方案（单实验 A100 $\times$ 2 小时）。\emph{验收}：算出总 GPU-hours 与 spot 价预估成本。
+\item （实践题）用 \Verb[breaklines]|sky launch| 起一次 10-iteration smoke test，验证 \Verb[breaklines]|sky down| 能成功释放资源，记录 provision/setup/run 各阶段耗时。\emph{预期}：\Verb[breaklines]|sky status| 在 down 后不再显示该 cluster。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{实验管理与可复现性}
+\label{sec:rlmc-ls-repro}
+
+\paragraph{\texorpdfstring{\cnum{1} 模块功能与在管线中的位置}{1 模块功能与在管线中的位置}}实验管理不产出策略，但决定你的训练结论“能不能被信”。它给每次训练套一个\textbf{可交接的“运行包”}，让任何关于“多少数据 / 收敛快慢 / 谁更优”的结论都能追溯到具体配置与样本量。这是从“单次训练”走向“论文级实验”的分水岭。
+
+\begin{codebox}[text]{运行包目录结构(每次训练都应产出)}
+runs/go1_flat_v2_seed0/
+  command.txt           # 完整命令(从 shell history 复制,不是回忆版)
+  sample_ledger.yaml    # 样本量账本(运行包核心)
+  params/env_cfg.yaml   # rank 0 写出的完整环境配置快照
+  params/agent_cfg.yaml # PPO 超参
+  git_info.txt          # commit hash + branch + status
+  git_diff.patch        # 完整未提交 patch(git diff --binary,可复现修改)
+  logs/                 # tensorboard / wandb 本地备份
+  checkpoints/          # model_5000.pt / model_10000.pt
+  eval/                 # 评估报告 + 视频(见 AGILE Stage 3)
+  deployment/           # policy.onnx + deploy.yaml
+\end{codebox}
+
+\textbf{样本量账本}（\Verb[breaklines]|sample_ledger.yaml|）是运行包的核心——没有它，任何“多少数据/收敛快慢”的结论都无法验证：
+
+\begin{codebox}[text]{sample\_ledger.yaml(把 §\ref{sec:rlmc-ls-sample-ledger} 的核算落盘)}
+num_envs_per_gpu: 4096
+num_steps_per_env: 24
+num_gpus: 1
+max_iterations: 10000
+samples_per_update: 98304          # 4096 * 24
+total_env_steps: 983040000         # 98304 * 10000
+comparison_mode: same_total_samples
+x_axis: env_steps                  # 论文里的 x 轴(不是 iterations!)
+seed: 42
+gpu_type: A100-40GB
+framework: mjlab
+\end{codebox}
+
+\begin{codebox}[Python]{自动生成运行包(git 信息要存完整 patch 才可复现)}
+def create_run_package(run_dir, env_cfg, agent_cfg, command):
+    os.makedirs(f"{run_dir}/params", exist_ok=True)
+    open(f"{run_dir}/command.txt", "w").write(command)
+    # git: --stat 只记统计、无法复现改动; 必须存完整 patch(--binary 兼顾二进制)+status
+    h = subprocess.check_output(["git","rev-parse","HEAD"]).decode().strip()
+    st = subprocess.check_output(["git","status","--porcelain=v1"]).decode()
+    diff = subprocess.check_output(["git","diff","--binary"]).decode()
+    diff += subprocess.check_output(["git","diff","--cached","--binary"]).decode()
+    open(f"{run_dir}/git_info.txt","w").write(f"commit:{h}\nstatus:\n{st}")
+    open(f"{run_dir}/git_diff.patch","w").write(diff)
+    # 配置快照: vars() 只取浅层 __dict__,对嵌套 configclass/tensor/callable 无法复现;
+    # 优先用框架递归导出工具(Isaac Lab: isaaclab.utils.io.dump_yaml/class_to_dict),下面仅占位
+    yaml.dump(vars(env_cfg),   open(f"{run_dir}/params/env_cfg.yaml","w"))
+    yaml.dump(vars(agent_cfg), open(f"{run_dir}/params/agent_cfg.yaml","w"))
+\end{codebox}
+
+\subsection{算法主线：公平对比的原则与结论分级}
+\label{sec:rlmc-ls-fair}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.0cm}p{4.6cm}p{5.0cm}@{}}
+\toprule
+维度 & 公平做法 & 不公平做法 \\
+\midrule
+样本量 & 相同 total env steps & 相同 iterations（但每 iter 样本量不同） \\
+seed & 多 seed（$\ge 3$）$+$ 标准差 & 单 seed \\
+x 轴 & \verb|env_steps| 或 wall\_time & \verb|iterations|（不同 GPU 数时误导） \\
+基准 & 冻结的 baseline & 每次实验都调 baseline \\
+配置 & 只改一个变量 & 同时改多个变量 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[结论分级：不是所有“我发现 A 比 B 好”都有相同可信度]\label{ins:rlmc-ls-levels}
+把训练结论分五级，能让你诚实地知道“现在能说什么、不能说什么”：\textbf{L1}（smoke test 通过）只能说“配置可启动”；\textbf{L2}（单 seed 训完）只能说“reward 有上升趋势”；\textbf{L3}（$\ge 3$ seed $+$ 标准差）才能说“方法 A 平均 reward 高于 B”；\textbf{L4}（消融 $+$ 统计检验）才能说“改进来自组件 X（$p<0.05$）”；\textbf{L5}（跨任务/机器人验证）才能说“方法有泛化性”。绝大多数“翻车的论文结论”都是把 L2 的证据当 L3/L4 来写——单 seed 看着好就宣称“更优”，却没做样本量对齐与多 seed。
+\end{insight}
+
+\begin{pitfall}[三个实验管理高频坑]
+\textbf{(1) 不记录就开调}：“跑了十次、第三次最好但不记得配置”；正确：每次自动生成运行包，用 WandB/Git 追踪。
+\textbf{(2) checkpoint 名不匹配}：resume 传 \Verb[breaklines]|model_latest.pt| 但磁盘只有 \verb|model_500.pt|；正确：显式指定存在的文件名。
+\textbf{(3) 报“双 GPU 更快达 90\% success”却缺 world\_size/num\_steps/x\_axis}：读者无法判断是“更优”还是“看了更多数据”；正确：附齐样本量账本三件套。
+\end{pitfall}
+
+\begin{practice}[实验管理练习]
+\begin{enumerate}
+\item （设计题）为“双 GPU 同总样本量”实验写 \Verb[breaklines]|sample_ledger.yaml|，验证单 GPU baseline 与双 GPU variant 的 \Verb[breaklines]|total_env_steps| 相等。\emph{验收}：两个 ledger 的 \Verb[breaklines]|total_env_steps| 字段数值相同。
+\item （分析题）一份报告写“双 GPU 训练更快达 90\% success”，但缺 world\_size、num\_steps\_per\_env、x\_axis。列出需补字段及各自缺失会导致的误读。\emph{验收}：能把每个缺失字段对应到一种具体误读。
+\item （实践题）用 \Verb[breaklines]|create_run_package()| 为一次训练生成运行包，检查是否含复现所需的全部信息。\emph{验收}：用 \Verb[breaklines]|git apply git_diff.patch| 能在干净 checkout 上还原改动。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{精读：AGILE 四阶段工业级 Workflow}
+\label{sec:rlmc-ls-agile}
+
+\begin{paper}[AGILE：人形 loco-manipulation 的工业级工作流]\label{paper:rlmc-ls-agile}
+\textbf{问题}：人形 RL 训练的质量长期依赖“最有经验的人是否在场”——同一套代码，不同人跑出的可复现性与 sim2real 成功率天差地别。\textbf{核心思想}：把“好的工程实践”\emph{标准化}为可强制执行的四阶段流程（Prepare $\to$ Train $\to$ Evaluate $\to$ Deploy），并配一套可开关的 PPO 增强工具箱——AGILE 不是新算法，而是\emph{流程}。引擎名 AGILE 展开为 \emph{A Generic Isaac-Lab based Engine}；论文题名为 \emph{A Comprehensive Workflow for Humanoid Loco-Manipulation Learning}（NVIDIA，arXiv:2603.20147）\cite{zhao2026agile}。\textbf{关键结果}：在 Unitree G1 与 Booster T1 两个平台、跨 locomotion/recovery/motion-imitation/loco-manipulation 等 5 类技能上验证，取得一致的 sim2real 迁移（经联网核对）。\textbf{与本书关系}：AGILE 把本部前面零散教过的工程最佳实践（Prepare 对应 \cref{ch:rlmc-diy} 的 zero/random agent 验证、Train 对应本章 \cref{sec:rlmc-ls-repro} 运行包、Evaluate 对应运动质量诊断、Deploy 对应 ONNX 导出）组织成一条流水线——它运行在 Isaac Lab 之上、用 RSL-RL 训练。\textbf{局限}：以 Isaac Lab 为底座，迁到其他仿真器需重写；工具箱默认值（见下）已对照论文超参表核实，仅本节展示的代码接口为示意实现。
+\end{paper}
+
+\subsection{算法主线：四阶段架构}
+\label{sec:rlmc-ls-agile-stages}
+
+\begin{codebox}[text]{AGILE 四阶段(每阶段的目标都是"把某类 bug 挡在前面")}
+Stage 1 Prepare : Joint GUI(逐关节 slider) + Object GUI(6-DOF) + Reward Viz(逐项叠加)
+                  目标: 几分钟内发现配置 bug
+Stage 2 Train   : git commit/branch/diff 自动记录 + Docker 可复现 + WandB + scaled-dict 搜参
+                  目标: 可复现的训练
+Stage 3 Evaluate: 确定性场景(fixed cmd) + 随机 rollout(1k envs) + 运动质量诊断
+                  (RMS 关节加速度 / RMS jerk / 关节限位违规率 / 高频能量比)
+                  目标: 自动化 HTML 评估报告
+Stage 4 Deploy  : TorchScript/ONNX 导出 + 自动生成 YAML descriptor + Sim2Sim + 真机 C++ controller
+                  目标: 部署描述符自动对齐(joint_names/obs_ordering/history_len/action_scale)
+\end{codebox}
+
+\begin{insight}[AGILE 的核心贡献是“把经验变成流程”]\label{ins:rlmc-ls-agile}
+在没有 AGILE 时，一个团队的训练质量取决于最有经验的成员是否在场；有了 AGILE，即使新手也能通过遵循四阶段流程达到接近专家的工程质量。\textbf{这就是“流程”相对于“经验”的价值——它让质量不再依赖个人}。这条洞察与本章 \cref{ins:rlmc-ls-perf-guess}（先 profile）、\cref{ins:rlmc-ls-nan-shrink}（先缩小复现）一脉相承：\textbf{它们都是把“高手的直觉”外化为“人人可执行的步骤”}。
+\end{insight}
+
+\subsection{代码走读：AGILE 的 PPO 增强工具箱}
+\label{sec:rlmc-ls-agile-toolbox}
+
+AGILE 提供一系列可开关的 PPO 增强技术。经核 AGILE 论文（arXiv:2603.20147）的训练增强表，本节四项技术——L2C2、在线 reward 归一化、Virtual Harness、Value-Bootstrapped Terminations——及其关键系数均与原文一致；\textbf{下面的 Python 函数/类接口为便于讲解的示意实现，非 AGILE 官方代码 API}，落地时以官方实现为准。这里只讲四个最有代表性的——它们恰好分别针对“策略平滑”“尺度归一”“探索冷启动”“防自杀”四类典型痛点。
+
+\textbf{L2C2（Locally Lipschitz Continuous Constraint）}\cite{kobayashi2022l2c2}：相邻状态的策略输出应相似（Lipschitz 约束），做法是在「以转移前状态为中心、转移后状态为顶点」的局部盒内插值采样、要求策略/价值输出变化也小。动机是\textbf{平滑策略利于 sim2real}（真机噪声下不抖）；反面是不加约束的策略常在相邻帧间输出剧变。（原始 L2C2 由 Kobayashi 在 IROS 2022 提出，AGILE 将其纳入工具箱。）
+
+\begin{codebox}[Python]{L2C2 正则: 在相邻状态间插值,要求输出接近}
+def l2c2_loss(policy, obs, obs_next, lambda_pi=1.0, lambda_v=0.1):
+    alpha = torch.rand(obs.shape[0], 1, device=obs.device)
+    obs_interp = obs + alpha * (obs_next - obs)
+    pi_loss = lambda_pi * (policy.actor(obs_interp) - policy.actor(obs)).pow(2).mean()
+    v_loss  = 0.0
+    if hasattr(policy, "critic"):
+        v_loss = lambda_v * (policy.critic(obs_interp) - policy.critic(obs)).pow(2).mean()
+    return pi_loss + v_loss
+\end{codebox}
+
+\textbf{Virtual Harness（虚拟安全绳）}：训练初期用外部 PD 力辅助机器人站立，随训练进展按衰减曲线降到零——像婴儿学步器。动机最直接：\textbf{没有它，人形在初期几乎立刻摔倒}（策略还是随机的），产生的数据全是“摔倒”的经历，PPO 学不到“如何站立”；有了它，人形初期能维持站立、在站立状态下探索，随辅助力衰减再逐步自己平衡。
+
+\begin{codebox}[Python]{Virtual Harness: 按 iteration 算辅助力强度 s in [0,1]}
+class VirtualHarness:
+    def __init__(self, decay_mode="exponential", decay_iters=2000):
+        self.decay_mode, self.decay_iters = decay_mode, decay_iters
+    def get_scale(self, iteration):                    # s: 1.0 -> ~0
+        t = min(iteration / self.decay_iters, 1.0)
+        if self.decay_mode == "linear":       return 1.0 - t
+        if self.decay_mode == "exponential":  return float(np.exp(t * np.log(0.01)))  # ->0.01
+        return None                                    # adaptive: 由外部 standing_ratio 驱动
+\end{codebox}
+
+\textbf{Value-Bootstrapped Terminations（防“自杀”）}：按 RL 定义 terminal state 的 $V(s)=0$；但若 termination 是因摔倒（负 reward 状态），策略可能学到“早点摔倒结束 episode”来\emph{逃避}累积更多负 reward。AGILE 的做法是给 terminal state 也 bootstrap 一个（大负的）value，让“摔倒”的代价远大于“继续活着”。
+
+\begin{codebox}[Python]{Value bootstrapping: terminal 处不置 0,而是减一个惩罚}
+def value_bootstrapped_terminal(value, done, sigma=5.0):
+    # 正常 GAE 中 done=True 时 V(s')=0; 这里改为 V(s')=V_pred - sigma
+    # 让"主动摔倒结束"不再是逃避负 reward 的捷径
+    return value - done.float() * sigma
+\end{codebox}
+
+\textbf{在线 reward 归一化}：不同 reward term 量级差异大，用 EMA 估计 reward 的 std 动态归一化（含折扣回报修正因子）。这与 \cref{ch:rlmc-reward} 里手工配 reward 权重是互补的——前者解决“跨 term 量级”，后者解决“跨 term 重要性”。
+
+\paragraph{UniLab 对照：AGILE 这套工具箱\emph{绑定 Isaac Lab}，UniLab 多为「需自行实现」加少数内建近似。}AGILE 不是算法而是\emph{运行在 Isaac Lab 之上}的工程流程，其 PPO 增强开关并非框架无关——把它们搬到 UniLab，多数要自己在 \verb|NpEnv| / reward 派发表里重写。逐项核对 UniLab 现状（commit \texttt{99936e08}）：
+
+\begin{table}[H]\centering\small
+\caption{AGILE PPO 工具箱在 UniLab 的对应状况（诚实标注，避免照搬 Isaac Lab 假设）}
+\label{tab:rlmc-ls-agile-unilab}
+\begin{tabular}{@{}p{3.4cm}p{3.0cm}p{6.0cm}@{}}
+\toprule
+AGILE 工具 & UniLab 内建？ & 说明 \\
+\midrule
+L2C2 平滑正则 & 无；需自实现 & 在自定义 actor loss 里加相邻状态插值惩罚即可（与框架无关）；UniLab 另有 \verb|action_rate|/\allowbreak\verb|action_smooth| 共享 reward 项可部分替代平滑诉求 \\
+Virtual Harness & 无；需自实现 & UniLab 无“训练初期辅助力按曲线衰减”工具；可在 \verb|apply_action| 注入随 iteration 衰减的外力近似 \\
+Value-Bootstrap（防自杀） & 部分；机制不同 & UniLab 用 \Verb[breaklines]|FinalObservationAwarePPO| $+$ \Verb[breaklines]|TransitionBootstrapContract|（\Verb[breaklines]|base/final_observation.py|）严格区分超时与失败终止、把 bootstrap 用对 \verb|next_obs|；但 AGILE 那种“给 terminal 减一个大负 value”的反逃避技巧仍需自加 \\
+在线 reward 归一化 & 近似有 & off-policy（SAC）默认 \Verb[breaklines]|obs_normalization=true|$+$\Verb[breaklines]|use_layer_norm=true|；PPO 复用 RSL-RL 的 \Verb[breaklines]|EmpiricalNormalization|（obs 侧）；逐 reward-term 的 EMA std 归一化无现成开关，需自实现 \\
+负权重课程 & 有（非 AGILE 同名） & \Verb[breaklines]|PenaltyCurriculum|（\Verb[breaklines]|base/curriculum.py|）按 episode 长度自适应缩放\textbf{负权重} reward——与 AGILE 工具箱不同名，但同属“训练中自适应调节惩罚”一类 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{代码走读：AGILE Stage 3 运动质量诊断}
+\label{sec:rlmc-ls-agile-motion}
+
+AGILE 的 Stage 3 不只看 reward 曲线——它计算一系列\textbf{运动质量指标}判断行为是否适合真机部署。动机是 \cref{ins:rlmc-ls-agile-motion} 的本质洞察：reward 高 $\ne$ 动作可部署。
+
+\begin{codebox}[Python]{运动质量诊断: 关节加速度/jerk/限位违规/高频能量(核心片段)}
+def evaluate_motion_quality(env, policy, num_steps=5000):
+    obs, _ = env.reset()
+    prev_vel = torch.zeros_like(env.robot.data.joint_vel)
+    prev_acc = torch.zeros_like(env.robot.data.joint_vel)
+    acc_rms, jerk_rms, viol = [], [], []
+    for step in range(num_steps):
+        with torch.no_grad():
+            action = policy(obs["policy"])
+        obs, reward, done, truncated, info = env.step(action)
+        acc  = (env.robot.data.joint_vel - prev_vel) / env.dt;  prev_vel = env.robot.data.joint_vel.clone()
+        jerk = (acc - prev_acc) / env.dt;                       prev_acc = acc.clone()
+        if step > 10:                                            # 跳过初始化
+            acc_rms.append(acc.pow(2).mean(-1).sqrt().mean().item())
+            jerk_rms.append(jerk.pow(2).mean(-1).sqrt().mean().item())
+            jp = env.robot.data.joint_pos
+            lo = env.robot.data.soft_joint_pos_limits[..., 0]
+            hi = env.robot.data.soft_joint_pos_limits[..., 1]
+            viol.append(((jp < lo) | (jp > hi)).float().sum(-1).mean().item())
+    # 高频能量比: 对 acc_rms 序列做 FFT,统计 >10 Hz 占比
+    from scipy.fft import rfft, rfftfreq
+    spec = np.abs(rfft(np.array(acc_rms))); freqs = rfftfreq(len(acc_rms), d=env.dt)
+    hf_ratio = spec[freqs > 10.0].sum() / (spec.sum() + 1e-8)
+    print(f"RMS acc={np.mean(acc_rms):.1f}  RMS jerk={np.mean(jerk_rms):.0f}  "
+          f"viol={np.mean(viol):.2f}/step  hf>{10}Hz={hf_ratio:.1%}")
+    return dict(rms_acc=np.mean(acc_rms), rms_jerk=np.mean(jerk_rms),
+                viol=np.mean(viol), hf_ratio=hf_ratio)
+\end{codebox}
+
+\begin{table}[H]\centering\small
+\caption{运动质量判定标准（\pz{阈值为经验参考}）}
+\label{tab:rlmc-ls-motion-quality}
+\begin{tabular}{@{}p{3.6cm}p{2.6cm}p{2.6cm}p{2.6cm}@{}}
+\toprule
+指标 & 良好 & 可接受 & 需要修复 \\
+\midrule
+RMS 关节加速度 & $<50$ rad/s$^2$ & 50--100 & $>100$ \\
+RMS jerk & $<500$ rad/s$^3$ & 500--2000 & $>2000$ \\
+关节限位违规 & $0$/step & $<0.1$ & $>0.5$ \\
+高频能量比（$>10$ Hz） & $<10\%$ & 10--30\% & $>30\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[reward 高 $\ne$ 动作可部署：运动质量是 sim2real 的先行指标]\label{ins:rlmc-ls-agile-motion}
+仿真里就有高频振荡或关节限位违规的策略，到真机上只会更差（真实电机响应比仿真慢，高频指令根本跟不上、还伤硬件）。所以 \cref{tab:rlmc-ls-motion-quality} 的四个指标本质是 sim2real 成功率的\emph{先行指标}——它们在 sim 端就能预警“这个策略别急着上真机”。这也解释了为什么 AGILE 把运动质量诊断设为 Deploy 之前的强制门：把“真机才暴露的问题”提前到 sim 端的廉价检查里。
+\end{insight}
+
+\subsection{AGILE 的 PPO 默认配置（可作新项目起点）}
+\label{sec:rlmc-ls-agile-ppo}
+
+下表是 AGILE 在 Unitree G1 / Booster T1 上验证过的 PPO 默认配置，已对照 AGILE 论文（arXiv:2603.20147）的超参表逐项核对（除「steps/env」一项论文表未单列、为示意值外，其余均与原文一致）；它与 \cref{ch:rlmc-training} 教的 PPO 超参一脉相承，差异主要在“critic 更大（处理 privileged obs，见 \cref{ch:rlmc-privileged}）”与“entropy 略小”：
+
+\begin{table}[H]\centering\small
+\caption{AGILE 的 PPO 默认配置（核对于 arXiv:2603.20147 超参表）}
+\label{tab:rlmc-ls-agile-ppo}
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.2cm}@{}}
+\toprule
+参数 & AGILE 默认值 & 说明 \\
+\midrule
+Actor 网络 & $[256,256,128]$, ELU & 比 $[256,128]$ 多一层 \\
+Critic 网络 & $[512,256,128]$, ELU & 更大（处理 privileged obs） \\
+Learning rate & $1\mathrm{e}{-3}$ & 自适应 LR schedule \\
+$\gamma$ & 0.99（loco）/ 0.995（stand-up） & 长时程任务需更大 $\gamma$ \\
+GAE $\lambda$ & 0.95 & 标准值 \\
+Clip $\epsilon$ & 0.2 & 标准值 \\
+Epochs / update & 5 & \\
+Mini-batches & 4 & \\
+Entropy coeff & 0.005 & 比默认 0.01 略小 \\
+Num envs / steps & 4096 / 24 & 4096 envs 见论文表；\pz{steps/env 论文表未单列，24 为示意值，以官方实现为准} \\
+Max iterations & $\sim$20k & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[别把 AGILE 当“又一个 RL 框架”，也别跳过 Stage 1]
+\textbf{(1) 概念误区}：AGILE 不提供 \verb|env.step()|、不实现 PPO——它是\emph{工程流程}的组织框架，运行在 Isaac Lab 之上、用 RSL-RL 训练。
+\textbf{(2) 跳过 Stage 1 直接 Stage 2}：“我的 reward 应该没问题，直接训”——AGILE 的经验是\textbf{约 90\% 的训练失败能在 Stage 1 的 5 分钟 GUI 检查中提前发现}（\pz{比例为经验值}）。
+\end{pitfall}
+
+\begin{practice}[AGILE 练习]
+\begin{enumerate}
+\item （实践题）用 \cref{tab:rlmc-ls-agile-ppo} 的默认配置训四足速度跟踪 5000 iter，与你之前的配置比 reward 曲线。\emph{验收}：在相同 total env steps 下对比，给出两条曲线。
+\item （设计题）为人形站立任务实现 Virtual Harness：前 1000 iter 保持、再 exponential 衰减到 3000 iter 为零。\emph{验收}：画出 \verb|get_scale| 在 $[0,3000]$ 的曲线，端点分别为 $1$ 与 $\approx0$。
+\item （分析题）用一个简化 2-state MDP 说明：若 terminal $V(s)=0$，策略如何利用这点逃避负 reward；Value-Bootstrap 如何堵住它。\emph{验收}：写出两种情形下 terminal 的 return 比较。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{训练诊断：reward 曲线之外的五个信号}
+\label{sec:rlmc-ls-diag}
+
+\paragraph{\texorpdfstring{\cnum{1} 模块功能与在管线中的位置}{1 模块功能与在管线中的位置}}训练诊断是“训练健康监测仪”——“reward 在涨”是\textbf{必要但不充分}的信号：策略可能在 reward hacking（找到不合理但高 reward 的行为）、action 在饱和（输出都贴 $\pm1$）、entropy 塌缩（变确定性、不再探索）、value function 不准（GAE baseline 偏差大）。这些都不会让 reward 下降，却会让部署失败。本节给出\textbf{五信号联合阅读}的方法。
+
+\begin{insight}[训练诊断像医生查房：单看 reward 等于只看血压就开药]\label{ins:rlmc-ls-diag}
+不能只看血压（reward），还要看心率（KL）、体温（entropy）、血氧（value loss）、意识状态（episode length）。\textbf{五个指标联合阅读才能得出正确诊断}：reward 涨但 entropy 陡降 $=$ 策略找到固定解不再探索（mode collapse）；reward 平坦但 KL$\approx 0$ $=$ LR 太小几乎不更新；reward 平坦但 KL$>0.05$ $=$ LR 太大每步震荡；reward 涨但 value\_loss 持续升 $=$ critic 拟合不了 value function。只看一个指标做决策，和只看血压就开药一样危险。
+\end{insight}
+
+\begin{codebox}[Python]{五信号联合监控(记到 WandB)}
+def log_diagnostics(stats, iteration, logger=None):
+    d = {
+        "diag/reward_mean": stats["reward_mean"],
+        "diag/kl":          stats["kl"],          # 正常 0.005-0.02; >0.05 LR 大; ~0 LR 小
+        "diag/entropy":     stats["entropy"],     # 正常缓降; 陡降=mode collapse
+        "diag/value_loss":  stats["value_loss"],  # 正常先升后降; 持续升=critic 拟合不了
+        "diag/ep_len_mean": stats["ep_len_mean"], # 正常渐长; 始终短=termination 太严/初始化问题
+    }
+    if logger: logger.log(d, step=iteration)
+    return d
+\end{codebox}
+
+\begin{table}[H]\centering\small
+\caption{五信号联合诊断表（症状组合 $\to$ 原因 $\to$ 修复）}
+\label{tab:rlmc-ls-five-signals}
+\begin{tabular}{@{}p{4.6cm}p{3.6cm}p{3.4cm}@{}}
+\toprule
+症状组合 & 可能原因 & 修复方向 \\
+\midrule
+reward$\uparrow$ + entropy 陡降 & mode collapse & 增大 entropy coeff \\
+reward 平坦 + KL$\approx0$ & LR 太小 & 增大 LR \\
+reward 平坦 + KL$>0.05$ & LR 太大 & 减小 LR \\
+reward$\uparrow$ + value\_loss 持续升 & critic 拟合不了 & 增大 critic 网络 \\
+reward$\uparrow$ + ep\_len 不变 & 可能 reward hacking & 看 viewer 确认行为 \\
+reward$\downarrow$ + ep\_len 短 & 训练崩溃/NaN & 转 \cref{sec:rlmc-ls-nan} \\
+reward$\uparrow$ + action 饱和 & action\_scale 太小/探索不足 & 增大 action\_scale 或 init\_noise \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+两个最容易被忽视的“沉默故障”值得单独检测：\textbf{action 饱和}（输出持续贴 $\pm1$，意味着策略被困在角落、无法精细调节）与 \textbf{reward hacking}（技术上满足 reward 定义但物理上不合理，如靠快速抖动凑出平均速度、或把脚卡进地面裂缝刷 air\_time）：
+
+\begin{codebox}[Python]{action 饱和检测 + reward hacking 检测(核心判据)}
+def check_action_saturation(env, policy, num_steps=500):
+    obs, _ = env.reset(); acts = []
+    for _ in range(num_steps):
+        with torch.no_grad(): a = policy(obs["policy"])
+        acts.append(a.abs()); obs, *_ = env.step(a)
+    sat = torch.cat(acts).gt(0.9).float().mean().item()   # |a|>0.9 的比例
+    if sat > 0.3: print(f"[WARN] action 饱和 {sat:.0%} -> 增大 action_scale/init_noise")
+    return sat
+
+def detect_reward_hacking(env, policy, num_steps=1000):
+    obs, _ = env.reset(); R, err = [], []
+    for _ in range(num_steps):
+        with torch.no_grad(): a = policy(obs["policy"])
+        obs, r, *_ = env.step(a); R.append(r.mean().item())
+        # 直接量实际跟踪误差(不经 reward 函数),与 reward 对照
+        v   = env.robot.data.root_link_lin_vel_b[:, :2]
+        cmd = env.command_manager.get_command("base_velocity")[:, :2]
+        err.append((v - cmd).norm(dim=-1).mean().item())
+    if np.mean(R) > 0.5 and np.mean(err) > 0.3:           # reward 高但 tracking 差
+        print("[WARN] 可能 reward hacking: reward 高但 tracking error 也高")
+\end{codebox}
+
+\begin{pitfall}[两个诊断思维陷阱]
+\textbf{(1) reward 在涨就不看其他指标}：reward 涨但 entropy 陡降 $=$ 策略找到固定解不再探索；正确：五信号联合阅读。
+\textbf{(2) 性能不好先换算法}：“PPO 太慢换 SAC”——更可能是 env step 慢或 reward 设计不好；正确：先 profile（\cref{sec:rlmc-ls-perf}）区分是 env 慢还是 PPO 慢。
+\end{pitfall}
+
+\begin{practice}[训练诊断练习]
+\begin{enumerate}
+\item （实践题）对你的策略跑 \Verb[breaklines]|check_action_saturation()|，找出饱和的 action 维度，并联系你的 \verb|action_scale| 设置。\emph{验收}：指出哪些维度 $>30\%$ 饱和并给出调整方向。
+\item （分析题）设计一个 WandB Dashboard 同时显示五信号，描述布局与“训练健康”的图形模式。\emph{验收}：能说出健康时五条曲线各自的形状（如 entropy 缓降、KL 稳定在 0.01 附近）。
+\item （跨章综合题）结合 \cref{ch:rlmc-reward} 与 \cref{sec:rlmc-ls-agile-motion}，设计一个每 1000 iter 自动跑的“训练健康检查”脚本。\emph{验收}：脚本同时输出五信号 $+$ 饱和率 $+$ 运动质量三类结果。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{常见误解汇总}
+\label{sec:rlmc-ls-misconceptions}
+
+\begin{table}[H]\centering\small
+\caption{本章常见误解汇总}
+\label{tab:rlmc-ls-misconceptions}
+\begin{tabular}{@{}p{5.4cm}p{6.4cm}@{}}
+\toprule
+误解 & 纠正 \\
+\midrule
+“多 GPU $=$ 加速按钮” & 它是工程复杂度的放大器（\cref{ins:rlmc-ls-multigpu}）；多看的数据 $\ne$ 更优算法 \\
+“双 GPU 收敛更快” & 多半只是看了 $2\times$ 数据；须固定 total env steps 比较 \\
+\verb|cuda:0| $=$ 物理 GPU 0 & 受 \Verb[breaklines]|CUDA_VISIBLE_DEVICES| 重映射，常不相等 \\
+“NaN 就清掉/\verb|nan_to_num|” & 那是掩盖症状；要先定位再追溯根因（\cref{ins:rlmc-ls-nan-cpr}） \\
+“训练慢就换框架” & 先 profile；瓶颈常在 sensor/网络大小而非引擎（\cref{ins:rlmc-ls-perf-guess}） \\
+“显存估算公式能判断容量” & 公式严重低估，只配做数量级直觉；容量用实测 \\
+“reward 在涨就没问题” & 必要不充分；要五信号联合阅读（\cref{ins:rlmc-ls-diag}） \\
+“AGILE 是又一个 RL 框架” & 它是工程流程组织框架，跑在 Isaac Lab 上、用 RSL-RL 训 \\
+“UniLab 多 GPU 也用 torchrun/DDP” & 不；它走 rank-local H2D $+$ local SGD，off-policy 原生（\Verb[breaklines]|training.num_gpus|，\cref{sec:rlmc-ls-unilab-multigpu}） \\
+“UniLab 大规模也盯 \verb|nconmax|/显存” & 物理在 CPU、不占仿真显存；瓶颈在 CPU 核 $+$ H2D 流水线 $+$ \verb|/dev/shm| 预算 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{小结}
+\label{sec:rlmc-ls-summary}
+
+本章把“训练工程”浓缩为三条可迁移到任何复杂系统的方法论：\textbf{(一) 分层诊断}——无论 NaN、性能还是不收敛，都不要猜，先用工具定位问题层级（物理层?算法层?系统层?）再针对性排查（NaN Guard 定位物理/算法层、profiler 定位 sensor/PPO 层、五信号定位 reward/超参）；\textbf{(二) 先缩小再放大}——多 GPU 出 NaN 先缩到单 GPU 16 envs 复现，训练太慢先关所有 sensor 测基础吞吐，结果不可复现先固定单 seed 确认基线；\textbf{(三) 流程标准化}——运行包保证可追溯、样本量账本保证比较公平、AGILE 四阶段保证每环节不被跳过，让质量不再依赖“最有经验的人是否在场”。
+
+\subsection*{术语速查}
+
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}p{3.4cm}p{8.4cm}@{}}
+\toprule
+术语 & 含义 \\
+\midrule
+环境并行 & 每卡跑独立 envs、总样本量翻倍；GPU 仿真 RL 的主用多 GPU 模式 \\
+数据并行 & 每卡相同 envs、梯度 all-reduce 同步；显存不足时才优先 \\
+total env steps & $=\texttt{envs}\times\texttt{steps}\times\texttt{gpus}\times\texttt{iters}$；公平比较的硬通货 \\
+单写者原则 & 所有文件写操作只在 rank 0 执行 \\
+NaN Guard & mjlab 的 NaN 自动 dump 机制（\Verb[breaklines]|--enable-nan-guard| / \verb|viz-nan|，1.4.0 源已核） \\
+\verb|nconmax| & 全局接触容量推导基数（非 per-world 上限） \\
+\verb|njmax| & 每个 world 严格的最大约束行数上限 \\
+env\_sps / train\_sps & 环境步/秒（不含 update）/ 训练步/秒（含 PPO update） \\
+运行包 & 含命令/git patch/配置快照/样本量账本的可交接训练产物 \\
+样本量账本 & \Verb[breaklines]|sample_ledger.yaml|，记录样本量核算与比较口径 \\
+AGILE & 人形 loco-manipulation 的四阶段工业级 workflow（arXiv:2603.20147） \\
+Virtual Harness & 训练初期辅助力、随训练衰减，解决人形冷启动立刻摔倒 \\
+五信号 & reward / KL / entropy / value\_loss / episode\_length 的联合诊断 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{知识点总表}
+
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}cp{7.6cm}p{2.6cm}c@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 多 GPU 何时该上：六条触发信号 & \cref{sec:rlmc-ls-multigpu} & 2 \\
+2 & 环境并行 vs 数据并行的取舍 & \cref{sec:rlmc-ls-dp-vs-ep} & 3 \\
+3 & 样本量核算与公平比较 & \cref{sec:rlmc-ls-sample-ledger} & 2 \\
+4 & mjlab \texttt{--gpu-ids} / Isaac Lab torchrun 接线 & \cref{sec:rlmc-ls-mjlab-multigpu} & 2 \\
+5 & 单写者原则与 checkpoint/resume & \cref{sec:rlmc-ls-single-writer} & 2 \\
+6 & NaN 五大根因与机理 & \cref{sec:rlmc-ls-nan-causes} & 3 \\
+7 & NaN Guard 与 dump 分析 & \cref{sec:rlmc-ls-nanguard} & 3 \\
+8 & NaN 排查优先级表与黄金法则 & \cref{sec:rlmc-ls-nan-priority} & 2 \\
+9 & 性能四层度量与 profiling 工具链 & \cref{sec:rlmc-ls-profiling} & 3 \\
+10 & \texttt{nconmax/\allowbreak njmax} 与 \texttt{num\_envs} 调优 & \cref{sec:rlmc-ls-nconmax} & 3 \\
+11 & 性能 benchmark 协议十字段 & \cref{sec:rlmc-ls-perf-table} & 2 \\
+12 & 云端 SkyPilot 生命周期与成本控制 & \cref{sec:rlmc-ls-cloud} & 2 \\
+13 & 运行包协议与结论分级 L1--L5 & \cref{sec:rlmc-ls-repro} & 2 \\
+14 & AGILE 四阶段与工具箱 & \cref{sec:rlmc-ls-agile} & 3 \\
+15 & 运动质量诊断作为 sim2real 先行指标 & \cref{sec:rlmc-ls-agile-motion} & 3 \\
+16 & 训练诊断五信号联合阅读 & \cref{sec:rlmc-ls-diag} & 2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{延伸阅读}
+\label{sec:rlmc-ls-further}
+
+\begin{itemize}
+\item \textbf{AGILE}（arXiv:2603.20147）\cite{zhao2026agile}——教你把准备/训练/评估/部署形式化为四阶段工业级 workflow 并配 PPO 增强工具箱。
+\item \textbf{Isaac Lab}（Mittal 等，arXiv:2511.04831）\cite{mittal2025isaaclab}——教你 GPU 加速多模态机器人学习框架的架构与多 GPU/多节点训练。
+\item \textbf{mjlab}（arXiv:2601.22074）\cite{mjlab2026}——教你 Isaac Lab 风格 API 如何在 MuJoCo-Warp 上复刻并用 \verb|--gpu-ids| 扩到多卡。
+\item \textbf{UniLab}（arXiv:2605.30313）\cite{unilab2026}——教你「GPU 仿真主导」之外的第三条路：异构 CPU 物理 $+$ GPU 策略经共享内存 IPC 解耦 collector/learner，多卡走 rank-local H2D 管线（\Verb[breaklines]|training.num_gpus|）而非 DDP，并带来一个 GPU-sim 没有的失败面 \verb|/dev/shm| 预算守卫；对照本章 \cref{sec:rlmc-ls-unilab-multigpu} 与 \cref{sec:rlmc-ls-unilab-perf} 看大规模训练的工程代价如何随算力拓扑而变。
+\item \textbf{RSL-RL}（Schwarke 等，arXiv:2509.10771）\cite{schwarke2025rslrl}——教你一个机器人优先的轻量 PPO/蒸馏库（含 \Verb[breaklines]|EmpiricalNormalization|）。
+\item \textbf{PPO}（Schulman 等，arXiv:1707.06347）\cite{schulman2017ppo} 与 \textbf{GAE}（arXiv:1506.02438）\cite{schulman2016gae}——本章诊断信号（KL/entropy/value loss）的算法出处。
+\item \textbf{大规模并行 RL}（Rudin 等，CoRL 2021，arXiv:2109.11978）\cite{rudin2022legged}——教你“数千并行环境分钟级训练腿足策略”的奠基性实践。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section{故障排查手册}
+\label{sec:rlmc-ls-troubleshoot}
+
+\begin{table}[H]\centering\small
+\caption{大规模训练故障速查（症状 $\to$ 原因 $\to$ 排查 $\to$ 相关节）}
+\label{tab:rlmc-ls-troubleshoot}
+\begin{tabular}{@{}p{3.4cm}p{2.8cm}p{3.6cm}p{2.0cm}@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+训练后突然 NaN & 接触/reward/normalizer & 1.\,nan-guard 2.\,viz-nan 3.\,按优先级表 & \cref{sec:rlmc-ls-nan} \\
+多 GPU reward 曲线重复 & 多 rank 都写日志 & 1.\,检查 rank 判断 2.\,只 rank 0 写 & \cref{sec:rlmc-ls-single-writer} \\
+\verb|--gpu-ids| 设备不可见 & \Verb[breaklines]|CUDA_VISIBLE_DEVICES| 冲突 & 传逻辑 id \verb|[0,1]| 而非物理 id & \cref{sec:rlmc-ls-mjlab-multigpu} \\
+steps/s 远低于预期 & sensor/nconmax/num\_envs & 1.\,关 sensor 对比 2.\,调 nconmax 3.\,找最优 num\_envs & \cref{sec:rlmc-ls-perf} \\
+GPU 利用率 $<50\%$ & num\_envs 太小 & 1.\,增大 num\_envs 2.\,profiler 检查 & \cref{sec:rlmc-ls-nconmax} \\
+SkyPilot job 失败仍计费 & 未 \Verb[breaklines]|sky down| & 1.\,\Verb[breaklines]|sky status| 2.\,\Verb[breaklines]|sky down| & \cref{sec:rlmc-ls-cloud} \\
+sweep agent 抢同一 GPU & 未绑 \Verb[breaklines]|CUDA_VISIBLE_DEVICES| & 每个 agent 绑定独立 GPU & \cref{sec:rlmc-ls-cloud} \\
+curriculum 推进后 NaN & 新 reward term 有除零风险 & 固定 curriculum 两侧各跑 100 iter & \cref{sec:rlmc-ls-nan} \\
+resume 后行为不同 & normalizer 未恢复 & 1.\,检查 state\_dict 2.\,加载 normalizer & \cref{sec:rlmc-ls-single-writer} \\
+CUDA Graph 失效警告 & DR 改了数组地址 & 禁用 graph 重试以确认是否根因 & \cref{sec:rlmc-ls-nan} \\
+reward 涨但行为怪 & reward hacking/action 饱和 & 看 viewer + 运动质量诊断 & \cref{sec:rlmc-ls-diag} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{版本信息速查}
+\label{sec:rlmc-ls-versions}
+
+\begin{table}[H]\centering\small
+\caption{本章涉及框架/工具版本与关键接口（核对于 2026-06；标「已核」者为已逐字核实项）}
+\label{tab:rlmc-ls-versions}
+\begin{tabular}{@{}p{2.6cm}p{2.4cm}p{6.8cm}@{}}
+\toprule
+框架/工具 & 版本/出处 & 关键接口 \\
+\midrule
+mjlab & 1.4.0 / arXiv:2601.22074 & \Verb[breaklines]|uv run train/play|；多 GPU \Verb[breaklines]|--gpu-ids "[0,1]"|（已核）；NaN \Verb[breaklines]|--enable-nan-guard|/\allowbreak\verb|viz-nan|（1.4.0 源已核） \\
+Isaac Lab & arXiv:2511.04831（2025） & \Verb[breaklines]|scripts/reinforcement_learning/<lib>/train.py|；多 GPU \Verb[breaklines]|torch.distributed.run --nproc_per_node=N ... --distributed|（仅 Linux，已核） \\
+UniLab & arXiv:2605.30313（commit \texttt{99936e08}） & \Verb[breaklines]|uv run train --algo {ppo,sac,appo,td3}|；多 GPU \Verb[breaklines]|training.num_gpus=N|（off-policy，无 DDP）；NaN \verb|NanGuard|+\Verb[breaklines]|unilab-viz-nan|（训练 conf 默认开）；profiling \Verb[breaklines]|training.trace_enabled|（off-policy）；\verb|/dev/shm| 预算守卫 \\
+RSL-RL & arXiv:2509.10771 & \Verb[breaklines]|EmpiricalNormalization|（\Verb[breaklines]|update_normalization| 于 \Verb[breaklines]|process_env_step|，已核）；PPO / student-teacher \\
+torchrunx & mjlab 依赖 & 基于 SSH 的纯 Python 分布式启动器（已核 arXiv 提及） \\
+SkyPilot & 社区工具 & \Verb[breaklines]|sky launch -c <cluster> / sky status / sky logs / sky down| \\
+AGILE & arXiv:2603.20147 & 四阶段 workflow + PPO 增强工具箱（PPO 默认值已核对于论文超参表） \\
+NVIDIA OSMO & NVIDIA & Isaac Lab 生产级多节点编排器（已核） \\
+\bottomrule
+\end{tabular}
+\end{table}

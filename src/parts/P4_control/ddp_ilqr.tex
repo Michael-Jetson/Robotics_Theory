@@ -1,0 +1,628 @@
+\chapter{微分动态规划与 iLQR（含约束）}
+\label{ch:ddp-ilqr}
+
+% ════════════════════════════════════════════════════════════════
+%  控制部 C1b · 第 H 章：DDP/iLQR 与约束 DDP 家族
+%  源：Tutorial 40/90（无约束 DDP/iLQR）+ 40/100（约束 DDP/Crocoddyl，剔库 API）
+%  定位：把"非线性轨迹优化的局部迭代求解器"讲透；G 章 NMPC 的内层、P3 CILQR/iLQGames 的算法地基。
+%  与 sec:ctrl-ilqr-ddp（控制导论已给最小骨架）严格去重：本章只增量深化。
+% ════════════════════════════════════════════════════════════════
+
+\paragraph{承上：从一串 LQR 到一个研究生级的求解器。}
+在 \cref{ch:control} 的 \cref{sec:ctrl-ilqr-ddp}，我们已经用一段最小骨架刻画了 iLQR/DDP 的轮廓：围绕一条标称轨迹反复做“二次近似 $\to$ 解一次 LQR $\to$ 前向滚动改进”，其中 Q 函数六系数（\cref{eq:ctrl-ilqr-Q}）、前馈--反馈更新律（\cref{eq:ctrl-ilqr-gain}）、值函数后向递推（\cref{eq:ctrl-ilqr-V}）与一次迭代算法（\cref{alg:ctrl-ilqr}）都已就位，并指出了 DDP 与 Pontryagin、Riccati、MPC 的三条联系。本章不重抄这套基础，而是把它当作起点，沿七个方向把它做到研究生密度：（a）Q 系数的逐项链式法则与张量缩并的物理解释；（b）iLQR 作为 Gauss--Newton 近似的严格最小二乘对偶；（c）正则化与 Levenberg--Marquardt／信赖域的精确等价；（d）局部二次收敛的严格定理；（e）约束如何嵌入 DDP 而保持 $O(N)$ 复杂度（Box/AL/ALTRO/FDDP/ProxDDP）；（f）接触、摩擦锥、终端约束与 MPC 递归可行性；（g）李群 DDP 与序列二次规划（SQP）的统一谱系。
+
+\paragraph{启下：本章在控制部脉络中的位置。}
+本章是 \cref{ch:mpc-advanced}（MPC 深化）的\emph{内层求解器}——它提供 warm-start、实时迭代（RTI）与天然的反馈增益，而 MPC 的稳定性、鲁棒、经济性\emph{外层}理论由那一章承接。终端约束的 Mayne 四条件因约束 DDP 直接落地它，故\emph{主证放本章}（\cref{sec:ddp-terminal}），\cref{ch:mpc-advanced} 引用并扩展到 tube／economic。本章的内核又是 \cref{ch:st-trajopt}（时空轨迹优化的 CILQR）、\cref{ch:plan-rtgame}（实时博弈 iLQGames）与 \cref{ch:mppi}（路径积分 MPPI）这些规划部章节的算法地基：它们是 DDP/iLQR 在特定场景的\emph{应用}，本章给\emph{通用算法内核}，彼此互引而不重复。
+
+\begin{note}
+\textbf{本章记号约定（两处冲突在此钉死，与 \cref{sec:ctrl-ilqr-ddp} 完全对齐）.}\;
+状态 $\mathbf{x}\in\mathbb{R}^n$、控制 $\mathbf{u}\in\mathbb{R}^m$；离散动力学 $\mathbf{x}_{k+1}=f(\mathbf{x}_k,\mathbf{u}_k)$，阶段代价 $\ell$、终端代价 $\ell_f$。值函数二阶展开系数记 $V_{k,\mathbf{x}},V_{k,\mathbf{xx}}$，并把下一步简记为 $V_{\mathbf{x}}'\equiv V_{k+1,\mathbf{x}}$、$V_{\mathbf{xx}}'\equiv V_{k+1,\mathbf{xx}}$。Q 系数 $Q_{\mathbf{x}},Q_{\mathbf{u}},Q_{\mathbf{xx}},Q_{\mathbf{ux}},Q_{\mathbf{uu}}$ 与导论一致。
+\textbf{冲突一（前馈量 vs 时间步）}：前馈量用粗体 $\mathbf{k}$、第 $k$ 步写作 $\mathbf{k}_k$；反馈增益 $\mathbf{K}_k$。下标 $k$ 永远是时间步。
+\textbf{冲突二（正则化 vs 摩擦系数）}：DDP/AL 的正则化与罚参数用 $\mu$；库仑摩擦系数一律记 $\mu_{\mathrm{fric}}$。
+\textbf{李群约定}：流形状态用本书\emph{右扰动}（\cref{ch:lie}）$\mathbf{x}=\bar{\mathbf{x}}\oplus\delta\boldsymbol{\xi}=\bar{\mathbf{x}}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$、$\delta\boldsymbol{\xi}=\bar{\mathbf{x}}\ominus\mathbf{x}$ 的右差分，雅可比取右雅可比 $\mathbf{J}_r$，$\se(3)$ 排序 $\boldsymbol{\xi}=[\boldsymbol{\rho};\boldsymbol{\phi}]$。共态 $\boldsymbol{\lambda}_k\triangleq V_{k,\mathbf{x}}$ 与 \cref{ch:opt-variational-pmp} 的 Pontryagin 协态统一。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{非线性轨迹优化与 DDP 思想}
+\label{sec:ddp-thought}
+
+\paragraph{动机：高维非线性系统逼得我们放弃全局法。}
+真实机器人——四足、人形、机械臂、四旋翼——是高维强非线性系统，状态维 $n$ 从四旋翼的 $12$ 到人形全身的 $74$ 不等。\cref{ch:opt-variational-pmp} 的 Pontryagin 极小值原理只给开环必要条件、且边值问题对初值极敏感；\cref{ch:dp-hjb} 的动态规划在全状态空间求解值函数，遭遇维数灾难（$n=14$ 的机械臂每维 $100$ 格即 $10^{28}$ 个网格点）；\cref{ch:lqr-lqg-riccati} 的 LQR 只对线性动力学加二次代价成立。把通用非线性最优控制丢给大规模 NLP 求解器（如 IPOPT）虽可行，却 cold-start 慢、不自然给出反馈增益、warm-start 不及 DDP 高效。DDP/iLQR 同时解决这三难：\textbf{线性复杂度 $O(N)$、天然产生反馈增益 $\mathbf{K}_k$、warm-start 极佳}。
+
+\subsection{标准形式与单射击表述}
+\label{sec:ddp-ocp}
+
+考虑离散时间有限时域最优控制问题（OCP）：
+\begin{equation}
+  \min_{\mathbf{u}_{0:N-1}}\ J=\sum_{k=0}^{N-1}\ell(\mathbf{x}_k,\mathbf{u}_k)+\ell_f(\mathbf{x}_N)
+  \quad\text{s.t.}\quad \mathbf{x}_{k+1}=f(\mathbf{x}_k,\mathbf{u}_k),\ \mathbf{x}_0\ \text{给定}.
+  \label{eq:ddp-ocp}
+\end{equation}
+$f$ 通常来自连续 ODE 的数值积分（Euler/RK4），$N$ 是预测时域（典型 $20$--$200$）。
+
+\textbf{DDP 的单射击表述}把 $\mathbf{u}_{0:N-1}$ 视为唯一决策变量，状态由 $\mathbf{x}_{k+1}=f(\mathbf{x}_k,\mathbf{u}_k)$ 前向滚动消去，于是 \cref{eq:ddp-ocp} 退化为对 $\mathbf{u}$ 的\emph{无约束}非线性优化（暂不计 box／路径约束，留待 \cref{sec:ddp-constr-proj}）。与之对照，\emph{直接配点／多射击}把 $\mathbf{x}_{0:N}$ 也作决策变量、动力学作等式约束，规模更大但结构更稀疏。DDP 的精髓在于：\textbf{用 Bellman 原理在时间维上把这个 $Nm$ 维问题分解为 $N$ 个 $m$ 维子问题}，由此换来线性复杂度。
+
+\begin{pitfall}[变量少 $\neq$ 容易]
+单射击 DDP 只有 $Nm$ 个变量（仅控制），看似比多射击的 $N(n+m)$ “简单”。但在长时域加不稳定系统中，单射击的 reduced Hessian 条件数随不稳定模态 $\lambda$ 指数膨胀为 $\sim e^{2\lambda T}$，实际上\emph{更难}求解。多射击（FDDP，\cref{sec:ddp-fddp}）把非线性“分配到每个节点”，每段只承担一步动力学，条件数仅 $\sim e^{2\lambda T/N}$——这正是 \cref{sec:ddp-fddp} 引入 defect 变量的深层动因。
+\end{pitfall}
+
+\subsection{DDP 思想：沿标称轨迹做 Bellman 二阶展开}
+\label{sec:ddp-idea}
+
+回顾 \cref{ch:dp-hjb} 的 Bellman 最优性原理：值函数 $V_k(\mathbf{x})=\min_{\mathbf{u}}[\ell(\mathbf{x},\mathbf{u})+V_{k+1}(f(\mathbf{x},\mathbf{u}))]$，$V_N=\ell_f$。这个方程精确成立，但对非线性 $f$、非二次 $\ell$ 无法解析求 $\min_{\mathbf{u}}$。DDP 的关键一步：\textbf{沿当前标称轨迹 $(\bar{\mathbf{x}}_{0:N},\bar{\mathbf{u}}_{0:N-1})$ 把每步 $\min_{\mathbf{u}}$ 做二阶 Taylor 展开，化为一个时变 LQR（TVLQR）子问题}，用 \cref{ch:lqr-lqg-riccati} 的 Riccati 后向递推解出局部反馈 $\delta\mathbf{u}^\star=\mathbf{k}+\mathbf{K}\,\delta\mathbf{x}$，再前向滚动得新轨迹，迭代收敛。其深层意义在于：它把全局 Bellman 方程“局域化”——不再需要在整个状态空间知道 $V(\mathbf{x})$，只需在标称轨迹邻域知道 $V$ 的二阶行为 $(V_{\mathbf{x}},V_{\mathbf{xx}})$，把存储从 $O(|\mathcal{X}|^n)$ 压到 $O(N\cdot n^2)$。
+
+为何恰好是二阶？一阶展开退化为梯度法：$\delta\mathbf{u}=-\alpha Q_{\mathbf{u}}$，无反馈结构、线性收敛，对病态问题需数千次迭代。三阶展开理论上三次收敛，却要四阶张量 $f_{\mathbf{xxx}}$（$n^4$ 量级）且子问题不再凸。二阶展开给出 $\delta\mathbf{u}=\mathbf{k}+\mathbf{K}\,\delta\mathbf{x}$，其中 $\mathbf{K}$ 是\emph{反馈增益}——正是 MPC 需要的闭环控制律，且具二次／超线性收敛，是精度与计算量的最佳平衡。
+
+\begin{pitfall}[DDP 不是“一种近似 DP”]
+新手常想“DDP 是 DP 的近似，所以精度不高”。实情是：DDP 不在近似值函数，而在\emph{迭代求解最优控制}。在光滑问题上，DDP 的收敛点恰好满足 Pontryagin 一阶必要条件，与全空间 DP 的解一致（对无约束凸问题即全局最优）。它的“近似”仅指\emph{每次迭代内用二阶展开代替精确 Bellman 极小化}，多次迭代后收敛到精确解。
+\end{pitfall}
+
+\subsection{历史脉络}
+\label{sec:ddp-history}
+
+DDP 由 Mayne 于 $1966$ 年首次提出\cite{mayne1966ddp}，核心贡献不在效率，而在\emph{把 Bellman 方程的精确递推替换为局部二阶近似}这一思想范式；Jacobson 与 Mayne 在 $1970$ 年的专著中系统化理论并证明收敛\cite{jacobson1970ddp}。Pantoja $1988$ 年证明 DDP 等价于对离散最优性条件做 stagewise Newton\cite{pantoja1988ddp}；Liao 与 Shoemaker $1991$ 年给出严格的局部二次收敛分析\cite{liao1991convergence}。Li 与 Todorov $2004$ 年提出 iLQR——丢弃动力学二阶导以简化计算\cite{li2004ilqr}。真正让 DDP 在机器人“复活”的，是 Tassa 团队 $2012$ 年的工程化版本（正则化、line search、阻尼调度）\cite{tassa2012ilqg} 与 $2014$ 年的控制约束版 Box-DDP\cite{tassa2014ddp}。此后 Neunert 等在四足（HyQ／ANYmal）上以\emph{最高约 $190$\,Hz} 运行全身非线性 MPC\cite{neunert2018wholebody}；Mastalli 等 $2020$／$2022$ 年发布 FDDP／Box-FDDP 并使 Crocoddyl 成为多接触轨迹优化的标准\cite{mastalli2020crocoddyl,mastalli2022boxfddp}；Jallet 等 $2025$ 年提出 ProxDDP，把硬约束原生嵌入单次 Riccati\cite{jallet2025proxddp}。
+
+% ════════════════════════════════════════════════════════════════
+\section{后向传播：Q 函数六系数的完整推导}
+\label{sec:ddp-backward}
+
+\cref{sec:ctrl-ilqr-ddp} 已直接给出 Q 系数（\cref{eq:ctrl-ilqr-Q}）的结果。本节补上导论略去的\emph{逐项链式法则推导}与张量缩并的维度／物理解释——这是后续约束 DDP 的共享基座。
+
+\subsection{Q 函数定义与逐步展开}
+\label{sec:ddp-Q-deriv}
+
+沿标称轨迹定义第 $k$ 步的 action-value 函数（Q 函数），以 $\delta\mathbf{x}=\mathbf{x}-\bar{\mathbf{x}}_k$、$\delta\mathbf{u}=\mathbf{u}-\bar{\mathbf{u}}_k$ 为自变量、减去与 $\delta\mathbf{u}$ 无关的常数使 $Q_k(0,0)=0$：
+\begin{equation}
+  Q_k(\delta\mathbf{x},\delta\mathbf{u})\triangleq\ell(\bar{\mathbf{x}}_k+\delta\mathbf{x},\bar{\mathbf{u}}_k+\delta\mathbf{u})+V_{k+1}\big(f(\bar{\mathbf{x}}_k+\delta\mathbf{x},\bar{\mathbf{u}}_k+\delta\mathbf{u})\big)-\text{const}.
+  \label{eq:ddp-Qdef}
+\end{equation}
+
+\textbf{第一步：展开阶段代价 $\ell$。}\;二阶 Taylor：$\ell\approx\ell_{\mathbf{x}}^\top\delta\mathbf{x}+\ell_{\mathbf{u}}^\top\delta\mathbf{u}+\tfrac12\delta\mathbf{x}^\top\ell_{\mathbf{xx}}\delta\mathbf{x}+\delta\mathbf{u}^\top\ell_{\mathbf{ux}}\delta\mathbf{x}+\tfrac12\delta\mathbf{u}^\top\ell_{\mathbf{uu}}\delta\mathbf{u}$。其中交叉项 $\ell_{\mathbf{ux}}$ 对最常见的可分二次代价 $\tfrac12(\mathbf{x}-\mathbf{x}_{\mathrm{ref}})^\top\mathbf{Q}(\mathbf{x}-\mathbf{x}_{\mathrm{ref}})+\tfrac12\mathbf{u}^\top\mathbf{R}\mathbf{u}$ 为零，但对状态--控制耦合代价非零，为通用性保留。
+
+\textbf{第二步：展开动力学 $f$（含三阶张量）。}\;记 $\bar{\mathbf{x}}'=f(\bar{\mathbf{x}}_k,\bar{\mathbf{u}}_k)$，则
+\begin{equation}
+  f(\bar{\mathbf{x}}+\delta\mathbf{x},\bar{\mathbf{u}}+\delta\mathbf{u})\approx\bar{\mathbf{x}}'+f_{\mathbf{x}}\delta\mathbf{x}+f_{\mathbf{u}}\delta\mathbf{u}+\tfrac12\begin{pmatrix}\delta\mathbf{x}\\\delta\mathbf{u}\end{pmatrix}^\top\!\mathcal{F}\begin{pmatrix}\delta\mathbf{x}\\\delta\mathbf{u}\end{pmatrix},
+  \label{eq:ddp-fexp}
+\end{equation}
+$\mathcal{F}$ 是三阶张量的向量化：对每个输出维 $i=1,\dots,n$ 有一个 $(n+m)\times(n+m)$ 的 Hessian $\nabla^2 f^i$，分块为 $f^i_{\mathbf{xx}},f^i_{\mathbf{xu}},f^i_{\mathbf{uu}}$。
+
+\textbf{第三步：展开 $V_{k+1}$。}\;设下一状态偏差 $\delta\mathbf{x}'$，归纳假设 $V_{k+1}$ 的二阶展开已知（由后一步递推给出，基情形 $V_N=\ell_f$）：
+$V_{k+1}(\bar{\mathbf{x}}'+\delta\mathbf{x}')\approx V_{k+1}(\bar{\mathbf{x}}')+V_{\mathbf{x}}'^{\top}\delta\mathbf{x}'+\tfrac12\delta\mathbf{x}'^{\top}V_{\mathbf{xx}}'\delta\mathbf{x}'$。
+
+\textbf{第四步：链式法则代入。}\;把 $\delta\mathbf{x}'=f_{\mathbf{x}}\delta\mathbf{x}+f_{\mathbf{u}}\delta\mathbf{u}+\tfrac12(\text{二阶项})$ 代入。一阶项 $V_{\mathbf{x}}'^{\top}\delta\mathbf{x}'$ 既贡献线性项 $V_{\mathbf{x}}'^{\top}(f_{\mathbf{x}}\delta\mathbf{x}+f_{\mathbf{u}}\delta\mathbf{u})$，又通过 $\delta\mathbf{x}'$ 的二阶项产生 $\tfrac12 V_{\mathbf{x}}'^{\top}\mathcal{F}$——这正是 DDP 张量缩并项的来源；二阶项 $\tfrac12\delta\mathbf{x}'^{\top}V_{\mathbf{xx}}'\delta\mathbf{x}'$ 展开给出 $\tfrac12\delta\mathbf{x}^\top f_{\mathbf{x}}^\top V_{\mathbf{xx}}'f_{\mathbf{x}}\delta\mathbf{x}+\delta\mathbf{u}^\top f_{\mathbf{u}}^\top V_{\mathbf{xx}}'f_{\mathbf{x}}\delta\mathbf{x}+\tfrac12\delta\mathbf{u}^\top f_{\mathbf{u}}^\top V_{\mathbf{xx}}'f_{\mathbf{u}}\delta\mathbf{u}+O(3)$。
+
+\textbf{第五步：按阶整理。}\;合并上述各项，按 $(\delta\mathbf{x},\delta\mathbf{u})$ 的阶次得六系数：
+\begin{equation}
+  \boxed{\;
+  \begin{aligned}
+    Q_{\mathbf{x}}&=\ell_{\mathbf{x}}+f_{\mathbf{x}}^\top V_{\mathbf{x}}', &
+    Q_{\mathbf{u}}&=\ell_{\mathbf{u}}+f_{\mathbf{u}}^\top V_{\mathbf{x}}', \\
+    Q_{\mathbf{xx}}&=\ell_{\mathbf{xx}}+f_{\mathbf{x}}^\top V_{\mathbf{xx}}'f_{\mathbf{x}}+\textstyle\sum_{i}(V_{\mathbf{x}}')_i\,f^i_{\mathbf{xx}}, &
+    Q_{\mathbf{ux}}&=\ell_{\mathbf{ux}}+f_{\mathbf{u}}^\top V_{\mathbf{xx}}'f_{\mathbf{x}}+\textstyle\sum_{i}(V_{\mathbf{x}}')_i\,f^i_{\mathbf{ux}}, \\
+    Q_{\mathbf{uu}}&=\ell_{\mathbf{uu}}+f_{\mathbf{u}}^\top V_{\mathbf{xx}}'f_{\mathbf{u}}+\textstyle\sum_{i}(V_{\mathbf{x}}')_i\,f^i_{\mathbf{uu}}. &&
+  \end{aligned}\;}
+  \label{eq:ddp-Q6}
+\end{equation}
+带 $\sum_i(V_{\mathbf{x}}')_i f^i_{\bullet\bullet}$ 的三项即 \cref{eq:ctrl-ilqr-Q} 括号里的“DDP only”张量项，丢弃它们即得 iLQR（\cref{sec:ddp-ilqr-gn}）。
+
+\subsection{张量缩并的维度与物理解释}
+\label{sec:ddp-tensor}
+
+以 $Q_{\mathbf{uu}}$ 的 DDP 项为例：$V_{\mathbf{x}}'$ 是 $n$ 维向量（值函数梯度，亦即共态），$f_{\mathbf{uu}}$ 是形状 $(n,m,m)$ 的三阶张量，缩并 $\sum_i(V_{\mathbf{x}}')_i f^i_{\mathbf{uu}}$ 对每个输出维 $i$ 取权 $(V_{\mathbf{x}}')_i$、乘对应 $m\times m$ Hessian $f^i_{\mathbf{uu}}$ 求和，得 $m\times m$ 矩阵。其物理含义是：\textbf{动力学的曲率被值函数梯度加权后影响最优控制方向}——若某状态维对未来代价敏感（$(V_{\mathbf{x}}')_i$ 大）且控制对该维有显著二阶效应（$f^i_{\mathbf{uu}}$ 大），则 $Q_{\mathbf{uu}}$ 需额外修正。当动力学近似线性时（如短采样间隔），这些项很小、可安全丢弃——这正是 iLQR 的数学依据。
+
+\begin{insight}
+\textbf{计算量决定取舍.}\;三项缩并的代价分别为 $\sum_i(V_{\mathbf{x}}')_i f^i_{\mathbf{xx}}\sim O(n^3)$、$f^i_{\mathbf{ux}}\sim O(n^2m)$、$f^i_{\mathbf{uu}}\sim O(nm^2)$。对 $7$ 自由度臂（$n=14,m=7$）DDP 项总开销约为 $f_{\mathbf{x}}^\top V_{\mathbf{xx}}'f_{\mathbf{x}}$（$\sim n^3$）的 $2$ 倍；但高维人形（$n=74$）时额外开销增长为 $O(n/m)$ 倍，代价显著。这就是 iLQR 在机器人上几乎总是默认选择的算力根源。
+\end{insight}
+
+\subsection{最优修正、值函数递推与非线性 Riccati}
+\label{sec:ddp-riccati}
+
+对 \cref{eq:ddp-Q6} 关于 $\delta\mathbf{u}$ 求导令零得 $Q_{\mathbf{u}}+Q_{\mathbf{uu}}\delta\mathbf{u}+Q_{\mathbf{ux}}\delta\mathbf{x}=0$，即 $\delta\mathbf{u}^\star=\mathbf{k}+\mathbf{K}\,\delta\mathbf{x}$，与 \cref{eq:ctrl-ilqr-gain} 同：$\mathbf{k}=-Q_{\mathbf{uu}}^{-1}Q_{\mathbf{u}}$、$\mathbf{K}=-Q_{\mathbf{uu}}^{-1}Q_{\mathbf{ux}}$。回代得值函数后向递推的\emph{完整}形式（导论 \cref{eq:ctrl-ilqr-V} 省略了零阶项与交叉补偿，此处补全）：
+\begin{equation}
+  \Delta V_k=-\tfrac12\mathbf{k}^\top Q_{\mathbf{uu}}\mathbf{k},\quad
+  V_{k,\mathbf{x}}=Q_{\mathbf{x}}+\mathbf{K}^\top Q_{\mathbf{uu}}\mathbf{k}+\mathbf{K}^\top Q_{\mathbf{u}}+Q_{\mathbf{ux}}^\top\mathbf{k},\quad
+  V_{k,\mathbf{xx}}=Q_{\mathbf{xx}}+\mathbf{K}^\top Q_{\mathbf{uu}}\mathbf{K}+\mathbf{K}^\top Q_{\mathbf{ux}}+Q_{\mathbf{ux}}^\top\mathbf{K}.
+  \label{eq:ddp-Vrec}
+\end{equation}
+利用 $\mathbf{k}=-Q_{\mathbf{uu}}^{-1}Q_{\mathbf{u}}$、$\mathbf{K}=-Q_{\mathbf{uu}}^{-1}Q_{\mathbf{ux}}$ 化简，后两式恰为 \textbf{Schur 补}：
+\begin{equation}
+  V_{k,\mathbf{x}}=Q_{\mathbf{x}}-Q_{\mathbf{ux}}^\top Q_{\mathbf{uu}}^{-1}Q_{\mathbf{u}},\qquad
+  V_{k,\mathbf{xx}}=Q_{\mathbf{xx}}-Q_{\mathbf{ux}}^\top Q_{\mathbf{uu}}^{-1}Q_{\mathbf{ux}}.
+  \label{eq:ddp-schur}
+\end{equation}
+与 \cref{ch:lqr-lqg-riccati} 的 TVLQR 差分 Riccati 对照：$Q_{\mathbf{xx}}$ 对应 $\mathbf{Q}+\mathbf{A}^\top\mathbf{P}'\mathbf{A}$、$Q_{\mathbf{uu}}$ 对应 $\mathbf{R}+\mathbf{B}^\top\mathbf{P}'\mathbf{B}$、$Q_{\mathbf{ux}}$ 对应 $\mathbf{B}^\top\mathbf{P}'\mathbf{A}$，可见 \textbf{DDP 的 $V_{k,\mathbf{xx}}$ 递推就是非线性版 Riccati}（额外含动力学 Hessian 贡献）。终端初始化 $V_{N,\mathbf{x}}=\nabla\ell_f(\bar{\mathbf{x}}_N)$、$V_{N,\mathbf{xx}}=\nabla^2\ell_f(\bar{\mathbf{x}}_N)$，从 $k=N-1$ 递推至 $k=0$ 即一次后向传播。
+
+\begin{theorem}[$V_{\mathbf{xx}}$ 半正定保持]
+\label{thm:ddp-vxx-psd}
+设终端 $V_{N,\mathbf{xx}}=\nabla^2\ell_f\succeq0$，且每步 $Q_{\mathbf{uu}}\succ0$、$\ell_{\mathbf{xx}}\succeq0$（iLQR 情形），则 $V_{k,\mathbf{xx}}\succeq0$ 对所有 $k$。
+\end{theorem}
+\begin{proof}
+$V_{k,\mathbf{xx}}=Q_{\mathbf{xx}}-Q_{\mathbf{ux}}^\top Q_{\mathbf{uu}}^{-1}Q_{\mathbf{ux}}$ 是分块矩阵 $\begin{psmallmatrix}Q_{\mathbf{xx}}&Q_{\mathbf{ux}}^\top\\Q_{\mathbf{ux}}&Q_{\mathbf{uu}}\end{psmallmatrix}$ 关于 $Q_{\mathbf{uu}}$ 的 Schur 补。由 Schur 补定理，$Q_{\mathbf{uu}}\succ0$ 时该分块矩阵 $\succeq0$ 当且仅当 $V_{k,\mathbf{xx}}\succeq0$。iLQR 下 $Q_{\mathbf{xx}}=\ell_{\mathbf{xx}}+f_{\mathbf{x}}^\top V_{\mathbf{xx}}'f_{\mathbf{x}}\succeq0$（归纳假设 $V_{\mathbf{xx}}'\succeq0$、$\ell_{\mathbf{xx}}\succeq0$），配合 $Q_{\mathbf{uu}}\succ0$ 使分块矩阵半正定，故 $V_{k,\mathbf{xx}}\succeq0$。
+\end{proof}
+
+\begin{remark}
+浮点运算中反复矩阵乘会使 $V_{k,\mathbf{xx}}$ 丧失精确对称（$10^{-15}$ 量级，累积可达 $10^{-12}$），若拿去对 $Q_{\mathbf{uu}}$ 做 Cholesky 会触发数值故障。每步递推后强制对称化 $V_{k,\mathbf{xx}}\leftarrow\tfrac12(V_{k,\mathbf{xx}}+V_{k,\mathbf{xx}}^\top)$ 即可。此外 $\Delta V_k=-\tfrac12\mathbf{k}^\top Q_{\mathbf{uu}}\mathbf{k}$ 只是值函数在标称点的零阶修正量，并非轨迹代价的实际改进——后者由前向传播的 line search 实测（\cref{sec:ddp-forward}）。
+\end{remark}
+
+% ════════════════════════════════════════════════════════════════
+\section{iLQR 作为 Gauss--Newton 近似}
+\label{sec:ddp-ilqr-gn}
+
+\paragraph{动机：用收敛率降级换正定性与简洁。}
+完整 DDP 需算动力学二阶导（三阶张量），在高维系统中代价极高——人形全身 $f_{\mathbf{xx}}$ 有 $74^3\approx4\times10^5$ 个元素。Li 与 Todorov 的观察是：机器人动力学几乎线性（短采样 + 物理平滑），张量缩并项远小于 $f_{\mathbf{x}}^\top V_{\mathbf{xx}}'f_{\mathbf{x}}$，丢弃它们能大幅降算量、收敛率仅从二次降为超线性。
+
+\subsection{严格定义与最小二乘对偶}
+\label{sec:ddp-gn-dual}
+
+iLQR 丢弃 \cref{eq:ddp-Q6} 全部三个张量缩并项：$Q_{\mathbf{xx}}^{\mathrm{iLQR}}=\ell_{\mathbf{xx}}+f_{\mathbf{x}}^\top V_{\mathbf{xx}}'f_{\mathbf{x}}$、$Q_{\mathbf{uu}}^{\mathrm{iLQR}}=\ell_{\mathbf{uu}}+f_{\mathbf{u}}^\top V_{\mathbf{xx}}'f_{\mathbf{u}}$、$Q_{\mathbf{ux}}^{\mathrm{iLQR}}=\ell_{\mathbf{ux}}+f_{\mathbf{u}}^\top V_{\mathbf{xx}}'f_{\mathbf{x}}$，其余不变。这三式与 LQR 形式完全相同，唯一区别是 $f_{\mathbf{x}},f_{\mathbf{u}}$ 每步随非线性轨迹线性化而不同。
+
+把 OCP 代价写成非线性最小二乘 $J=\tfrac12\sum_k\|r_k(\mathbf{x}_k,\mathbf{u}_k)\|^2+\tfrac12\|r_N(\mathbf{x}_N)\|^2$，残差如 $r_k=[\mathbf{Q}^{1/2}(\mathbf{x}_k-\mathbf{x}_{\mathrm{ref}});\,\mathbf{R}^{1/2}\mathbf{u}_k]$，对整体残差 $r(U)$ 构造 Jacobian $\mathbf{J}_r=\partial r/\partial U$。则：
+
+\begin{theorem}[iLQR $=$ Gauss--Newton 的 Riccati 求解]
+\label{thm:ddp-gn}
+对上述最小二乘 OCP，\textbf{DDP $=$ 完整 Newton}：Hessian $\mathbf{H}=\mathbf{J}_r^\top\mathbf{J}_r+\sum_i r_i\nabla^2 r_i$；\textbf{iLQR $=$ Gauss--Newton}：丢弃残差 Hessian 项 $\sum_i r_i\nabla^2 r_i$，$\mathbf{H}_{\mathrm{GN}}=\mathbf{J}_r^\top\mathbf{J}_r$。二者的 Newton／GN 方程经残差 Jacobian 时间递归结构做 Riccati factorization，所得步方向与 DDP／iLQR 后向传播完全一致。
+\end{theorem}
+
+这个对偶由 Pantoja $1988$ 年从 stagewise Newton 的角度奠基\cite{pantoja1988ddp}，并由 Giftthaler 等 $2018$ 年系统化、推广到多射击 Gauss--Newton 射击方法族\cite{giftthaler2018gnms}（故宜称其“系统化”了 iLQR$=$GN 的视角，而非“首次证明”）。其深刻处在于三点对应：DDP 的张量项 $\sum_i(V_{\mathbf{x}}')_i f^i_{\bullet\bullet}$ $\leftrightarrow$ 残差 Hessian 项 $\sum_i r_i\nabla^2 r_i$；GN 丢残差 Hessian 的理由（残差小时该项小）$\leftrightarrow$ iLQR 丢动力学 Hessian 的理由；GN 的 $\mathbf{J}_r^\top\mathbf{J}_r$ 自动半正定 $\leftrightarrow$ iLQR 的 $f_{\mathbf{u}}^\top V_{\mathbf{xx}}'f_{\mathbf{u}}$ 自动半正定。这与 \cref{ch:nlopt} 的 Gauss--Newton／Levenberg--Marquardt 是\emph{同一种近似哲学}。
+
+\begin{proposition}[$Q_{\mathbf{uu}}^{\mathrm{iLQR}}$ 自动正定]
+\label{prop:ddp-quu-pd}
+若 $\ell_{\mathbf{uu}}\succ0$（即 $\mathbf{R}\succ0$）且 $V_{\mathbf{xx}}'\succeq0$，则 $Q_{\mathbf{uu}}^{\mathrm{iLQR}}=\ell_{\mathbf{uu}}+f_{\mathbf{u}}^\top V_{\mathbf{xx}}'f_{\mathbf{u}}\succ0$。
+\end{proposition}
+\begin{proof}
+$f_{\mathbf{u}}^\top V_{\mathbf{xx}}'f_{\mathbf{u}}$ 是半正定 $V_{\mathbf{xx}}'$ 的合同变换 $\mathbf{B}^\top\mathbf{A}\mathbf{B}$（$\mathbf{B}=f_{\mathbf{u}}$），仍半正定；加正定 $\ell_{\mathbf{uu}}$ 得正定。
+\end{proof}
+
+\cref{prop:ddp-quu-pd} 是 iLQR 的一大工程优势：只要 $\mathbf{R}\succ0$，$Q_{\mathbf{uu}}$ 自动正定，每步后向子问题严格凸、Cholesky 稳定可解，几乎不需正则化——这消除了完整 DDP 最常见的数值故障源（$Q_{\mathbf{uu}}$ 含可正可负的 $\sum_i(V_{\mathbf{x}}')_i f^i_{\mathbf{uu}}$ 项）。
+
+\subsection{收敛率对照与何时必须用完整 DDP}
+\label{sec:ddp-gn-rate}
+
+DDP 二次收敛（$\|e^{(j+1)}\|\le C\|e^{(j)}\|^2$，需 $f\in C^3$、$Q_{\mathbf{uu}}\succ0$）；iLQR 超线性（$\|e^{(j+1)}\|/\|e^{(j)}\|\to0$）。对零残差问题（如从静止摆起到直立，$x_{\mathrm{ref}}$ 可达），收敛时 $V_{\mathbf{x}}'\to0$ 使被丢弃的 $(V_{\mathbf{x}}')_i f^i_{\mathbf{xx}}\to0$，iLQR 实测近二次。工程经验：iLQR 每次迭代比 DDP 快 $3$--$5$ 倍（省张量），但需 $1.5$--$2$ 倍迭代，\emph{总耗时大致相当}；光滑问题 DDP 略胜，接触／非光滑问题 iLQR 反而更稳（$f_{\mathbf{xx}}$ 在接触切换处噪声大、可能使 $Q_{\mathbf{uu}}$ 不定）。仅在“高精度 + 强非线性 + 长采样（$\Delta t>50$\,ms）”的少数场景才显著需要完整 DDP；在 $95\%$ 的机器人实时控制（$\Delta t=5$--$20$\,ms、刚性关节）中，iLQR 是正确选择。
+
+\begin{pitfall}[二次收敛未必优于超线性]
+“iLQR $10$ 次、DDP $6$ 次收敛，所以 DDP 更好”忽略了每步算量。收敛率是\emph{渐近}概念，二次收敛 $\|e^{(j+1)}\|\le C\|e^{(j)}\|^2$ 的常数 $C$ 可能很大（接触场景的张量噪声会使 $C$ 爆炸）。正确比较维度是\emph{达到容差的 wall-clock 时间}：高维问题里 iLQR 的 $6\times2$\,ms 常快于 DDP 的 $4\times5$\,ms。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{与 Pontryagin、DP、LQR 的统一视角}
+\label{sec:ddp-unify}
+
+DDP/iLQR 不是孤立算法，而是 Pontryagin、DP、LQR 三条理论线的精确交汇点。\cref{sec:ctrl-ilqr-ddp} 已用一段 note 点出三条关系，本节给出可引用的等式与统一表，并接 \cref{ch:opt-variational-pmp,ch:dp-hjb,ch:lqr-lqg-riccati} 的定义，不重证其结论。
+
+\paragraph{DDP $\leftrightarrow$ LQR。}\;
+若 $\ell$ 二次、$f$ 线性，则 $f_{\mathbf{xx}}=f_{\mathbf{ux}}=f_{\mathbf{uu}}=0$ 使 DDP $=$ iLQR，且 Q 函数二阶展开\emph{精确}，后向递推即 \cref{ch:lqr-lqg-riccati} 的差分 Riccati，\textbf{一次迭代即收敛到全局最优}（Mayne $1966$\cite{mayne1966ddp}）。由此 DDP 可理解为“在非线性问题上反复做 LQR”：每次后向沿当前轨迹建一个 TVLQR 并解之，前向用新律重仿真，迭代至轨迹不变。
+
+\paragraph{DDP $\leftrightarrow$ Pontryagin。}\;
+定义共态 $\boldsymbol{\lambda}_k\triangleq V_{k,\mathbf{x}}$、离散 Hamilton 量 $H_k=\ell+\boldsymbol{\lambda}^\top f$，则 $Q_{\mathbf{x}}=\ell_{\mathbf{x}}+f_{\mathbf{x}}^\top\boldsymbol{\lambda}_{k+1}=\partial H_k/\partial\mathbf{x}$、$Q_{\mathbf{u}}=\partial H_k/\partial\mathbf{u}$，后向递推 $V_{\mathbf{x}}$ 即在积分共态方程 $\boldsymbol{\lambda}_k=\ell_{\mathbf{x}}+f_{\mathbf{x}}^\top\boldsymbol{\lambda}_{k+1}+(\text{反馈修正})$。\textbf{收敛时 $Q_{\mathbf{u}}=0$ 正是 Pontryagin 一阶最优性 $\partial H/\partial\mathbf{u}=0$}（\cref{ch:opt-variational-pmp}）。Pantoja 进一步证明：后向传播等价于对离散最优性 KKT 系统做 stagewise Newton——对 $3Nn$ 维系统的 Newton，利用时间结构分解为 $N$ 步递推（这也解释了 $O(N)$ 复杂度来自 KKT 的带状结构）\cite{pantoja1988ddp}。反馈增益 $\mathbf{K}_k=-Q_{\mathbf{uu}}^{-1}Q_{\mathbf{ux}}$ 是\emph{共态反馈的矩阵实现}。
+
+\paragraph{DDP $\leftrightarrow$ DP。}\;
+DP 在全空间 $\mathbb{R}^n$ 精确求值函数面 $V(\mathbf{x})$（维数灾难）；DDP 只在标称轨迹 $\bar{\mathbf{x}}_k$ 处拟合\emph{局部二次抛物面}，把 HJB PDE 化为一族耦合 Riccati 差分方程，避开维数灾难，代价是只得局部最优（需好初值）。从信息论看，这是从全局值函数（$O(|\mathcal{X}|^n)$ 空间）到一条轨迹上二阶系数（$O(N\cdot n^2)$ 空间）的极致压缩。
+
+\begin{table}[H]\centering\small
+\caption{DDP 与三条理论线的统一对照}
+\label{tab:ddp-unify}
+\begin{tabular}{llll}
+\toprule
+对象 & Pontryagin 视角 & DP 视角 & LQR 视角 \\
+\midrule
+$V_{\mathbf{x}}$ & 共态 $\boldsymbol{\lambda}$ & 值函数梯度 & $\mathbf{P}\mathbf{x}$（线性情形）\\
+$V_{\mathbf{xx}}$ & 共态灵敏度 $\partial\boldsymbol{\lambda}/\partial\mathbf{x}$ & 值函数 Hessian & Riccati 矩阵 $\mathbf{P}$ \\
+$\mathbf{K}$ & 共态反馈增益 & 值函数曲率$\to$控制 & LQR 增益 \\
+$Q_{\mathbf{u}}=0$ & 最优性 $\nabla_{\mathbf{u}}H=0$ & Bellman 极小化 FOC & $\nabla_{\mathbf{u}}H=0$ \\
+后向传播 & 积分共态 ODE & 值迭代的二阶版 & Riccati 递推 \\
+前向传播 & 用反馈律仿真 & 策略改进 & 闭环 rollout \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}
+\textbf{DDP 是间接--直接的混合体.}\;后向传播是\emph{间接法}风格（积分共态 + 灵敏度矩阵，Pontryagin 味），前向传播是\emph{直接法}风格（仿真 + line search，直接评估 $J$）。这种混合让 DDP 兼得间接法的二阶收敛速度与直接法的全局搜索能力（经 line search），这是它在机器人实时 MPC 中重新崛起、压过纯直接法 NLP 求解器的根本原因。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{前向传播与 Line Search}
+\label{sec:ddp-forward}
+
+后向传播给出局部二次模型下的最优修正 $(\mathbf{k}_k,\mathbf{K}_k)$，但这只是“方向”；还需确定“步长”。直接取 $\alpha=1$ 在远离最优时可能使代价增加甚至数值爆炸。Line search 是 DDP 从“玩具算法”变为“真机可用”的关键。
+
+\subsection{前向公式与反馈不缩放}
+\label{sec:ddp-forward-formula}
+
+给定步长 $\alpha\in(0,1]$，新轨迹为
+\begin{equation}
+  \hat{\mathbf{x}}_0=\mathbf{x}_0,\qquad
+  \hat{\mathbf{u}}_k=\bar{\mathbf{u}}_k+\alpha\mathbf{k}_k+\mathbf{K}_k(\hat{\mathbf{x}}_k-\bar{\mathbf{x}}_k),\qquad
+  \hat{\mathbf{x}}_{k+1}=f(\hat{\mathbf{x}}_k,\hat{\mathbf{u}}_k).
+  \label{eq:ddp-forward}
+\end{equation}
+\textbf{关键设计：反馈项 $\mathbf{K}_k$ 不随 $\alpha$ 缩放}（前馈项 $\mathbf{k}_k$ 才乘 $\alpha$），理由有三：（i）闭环稳定性——$\mathbf{K}_k$ 编码值函数曲率，任何步长下都应保持轨迹跟踪；（ii）数学正确性——$\hat{\mathbf{x}}_k-\bar{\mathbf{x}}_k$ 本身已是 $O(\alpha)$ 量级，故 $\mathbf{K}_k(\hat{\mathbf{x}}_k-\bar{\mathbf{x}}_k)$ 自然是 $O(\alpha)$；（iii）小 $\alpha$ 时前馈主导（开环修正）、大 $\alpha$ 时反馈发挥闭环跟踪，使大步长下轨迹仍稳定。若误写 $\hat{\mathbf{u}}_k=\bar{\mathbf{u}}_k+\alpha(\mathbf{k}_k+\mathbf{K}_k\Delta\mathbf{x})$，则 $\alpha\to0$ 时反馈消失、闭环退化为开环，不稳定系统的轨迹会漂移。
+
+\subsection{期望下降量与修正 Armijo 准则}
+\label{sec:ddp-armijo}
+
+沿步长 $\alpha$ 的代价改进可由二阶模型预测：
+\begin{equation}
+  \Delta J(\alpha)\approx\alpha\underbrace{\textstyle\sum_k\mathbf{k}_k^\top Q_{\mathbf{u},k}}_{\Delta_1}+\frac{\alpha^2}{2}\underbrace{\textstyle\sum_k\mathbf{k}_k^\top Q_{\mathbf{uu},k}\mathbf{k}_k}_{\Delta_2}.
+  \label{eq:ddp-deltaJ}
+\end{equation}
+由 $\mathbf{k}_k=-Q_{\mathbf{uu},k}^{-1}Q_{\mathbf{u},k}$ 得 $\mathbf{k}_k^\top Q_{\mathbf{u},k}=-Q_{\mathbf{u},k}^\top Q_{\mathbf{uu},k}^{-1}Q_{\mathbf{u},k}<0$，故 $\Delta_1<0$——\textbf{方向确实下降}；$\Delta_2>0$（$Q_{\mathbf{uu}}\succ0$）是二阶修正。定义\emph{实际／预测下降比} $z=\big(J(\bar{\mathbf{u}})-J(\hat{\mathbf{u}})\big)/(-\Delta J(\alpha))$，Tassa 的修正 Armijo 准则\cite{tassa2012ilqg}接受 $\alpha$ 当且仅当
+\begin{equation}
+  c_1<z<c_2,
+  \label{eq:ddp-armijo}
+\end{equation}
+backtracking 序列取 $\alpha\in\{1,\tfrac12,\tfrac14,\dots,2^{-10}\}$，全部失败则增大正则化 $\mu$ 重做后向。下界 $c_1$ 保证有足够实际下降，上界 $c_2$ 防止二次模型严重偏离实际时接受“侥幸下降”的步（下一步突然暴增）。注意 $z$ 的分母必须含二阶项 $\tfrac{\alpha^2}2\Delta_2$，否则在 $\alpha=1$ 处分母偏大、$z$ 偏小、频繁拒绝好步长。
+
+\begin{remark}
+本节出现的数值 $c_1=0.1$、$c_2=10$（以及后文 $\mu$ 调度的 $\mu_{\min}=10^{-6}$、$\Delta_0=2$、罚因子 $\phi\in[2,10]$）是 Tassa $2012$／ALTRO 等实现的\emph{经验默认}，论文明言其需平衡相互冲突的需求、非理论最优。它们属实现细节，本章按理论为主的密度只点到为止、不展开调参表。收敛后期 $\alpha=1$ 几乎总被接受（二阶方法的标志），此时 DDP 处于纯 Newton 模式、享二次收敛；若 $\alpha$ 持续很小，说明二次模型失效，正确响应是增大 $\mu$ 缩小信赖域，而非报错退出。
+\end{remark}
+
+% ════════════════════════════════════════════════════════════════
+\section{正则化：Levenberg--Marquardt 与信赖域}
+\label{sec:ddp-reg}
+
+当 $Q_{\mathbf{uu}}$ 非正定（接近奇异姿态、$V_{\mathbf{xx}}'$ 丢失正定性、或 DDP 张量项贡献负特征值）时，Cholesky 失败、后向传播崩溃。正则化保证 $Q_{\mathbf{uu}}\succ0$，同时尽量不破坏搜索方向质量。它不是打补丁，而有深刻含义：在 Levenberg--Marquardt（LM）／信赖域框架下，正则化参数 $\mu$ 等价于信赖域半径的对偶变量——$\mu$ 大则信赖域小、保守步（近梯度方向），$\mu$ 小则信赖域大、大胆步（近 Newton 方向）。
+
+\subsection{控制空间 vs 状态空间正则化}
+\label{sec:ddp-reg-two}
+
+\textbf{方案 A（控制空间，经典 Jacobson--Mayne）}：$\tilde Q_{\mathbf{uu}}=Q_{\mathbf{uu}}+\mu\mathbf{I}_m$。等价于子问题加约束 $\|\delta\mathbf{u}\|^2\le\Delta^2$（$\mu$ 是 KKT 乘子）或代价加罚 $\tfrac{\mu}2\|\delta\mathbf{u}\|^2$。实现最简，但 $\mu\to\infty$ 时 $\mathbf{K}=-\tilde Q_{\mathbf{uu}}^{-1}Q_{\mathbf{ux}}\to0$，反馈消失、退化为开环梯度法——对人形站立这类不稳定系统是灾难（轨迹按 $e^{\lambda T}$ 发散，再小 $\alpha$ 也救不回）。
+
+\textbf{方案 B（状态空间，Tassa $2012$）}：把 $V_{\mathbf{xx}}'$ 替换为 $V_{\mathbf{xx}}'+\mu\mathbf{I}_n$：
+\begin{equation}
+  \tilde Q_{\mathbf{uu}}=\ell_{\mathbf{uu}}+f_{\mathbf{u}}^\top(V_{\mathbf{xx}}'+\mu\mathbf{I}_n)f_{\mathbf{u}},\qquad
+  \tilde Q_{\mathbf{ux}}=\ell_{\mathbf{ux}}+f_{\mathbf{u}}^\top(V_{\mathbf{xx}}'+\mu\mathbf{I}_n)f_{\mathbf{x}}.
+  \label{eq:ddp-reg-state}
+\end{equation}
+等价于代价加罚 $\tfrac{\mu}2\|\delta\mathbf{x}_{k+1}\|^2$——\emph{信赖域在状态空间}。$\mu\to\infty$ 时 $\mathbf{K}\to-(f_{\mathbf{u}}^\top f_{\mathbf{u}})^{-1}f_{\mathbf{u}}^\top f_{\mathbf{x}}$（伪逆），反馈把新轨迹拉回旧轨迹、保跟踪；且对量纲更鲁棒（$\mu$ 的单位是“状态曲率”，与系统尺度无关）。
+
+\begin{theorem}[状态正则化 $\equiv$ Levenberg--Marquardt 信赖域]
+\label{thm:ddp-lm}
+考虑子问题 $\min_{\delta\mathbf{u}}Q(\delta\mathbf{x},\delta\mathbf{u})$ s.t.\ $\|\delta\mathbf{x}'\|^2\le\Delta^2$（信赖域加在下一步状态）。其拉格朗日 $\mathcal{L}=\tfrac12\delta\mathbf{u}^\top Q_{\mathbf{uu}}\delta\mathbf{u}+Q_{\mathbf{u}}^\top\delta\mathbf{u}+\mu(\|f_{\mathbf{x}}\delta\mathbf{x}+f_{\mathbf{u}}\delta\mathbf{u}\|^2-\Delta^2)$ 对 $\delta\mathbf{u}$ 求导令零得 $(Q_{\mathbf{uu}}+\mu f_{\mathbf{u}}^\top f_{\mathbf{u}})\delta\mathbf{u}=-(Q_{\mathbf{u}}+\mu f_{\mathbf{u}}^\top f_{\mathbf{x}}\delta\mathbf{x})$，恰为 \cref{eq:ddp-reg-state} 的后向方程。故 Tassa 状态正则化\emph{精确等价}于 LM 的信赖域形式，$\mu$ 是信赖域约束的 Lagrange 乘子，自适应 $\mu$ 调度等价于 LM 的信赖域半径自适应。
+\end{theorem}
+
+\subsection{自适应调度}
+\label{sec:ddp-reg-schedule}
+
+Tassa 采用二次调度：失败时（Cholesky 或 line search 全败）$\Delta\leftarrow\max(\Delta_0,\Delta\cdot\Delta_0)$、$\mu\leftarrow\max(\mu_{\min},\mu\cdot\Delta)$；成功时 $\Delta\leftarrow\min(1/\Delta_0,\Delta/\Delta_0)$、$\mu\leftarrow\mu\cdot\Delta$（小于 $\mu_{\min}$ 则清零）。失败则加大正则（$\mu$ 倍增上升）、成功则尝试减小（$\mu$ 指数下降回到纯 Newton/GN 步）。\emph{为何用指数而非线性调度}：$Q_{\mathbf{uu}}$ 的特征值可能跨多个数量级（$10^{-3}$ 到 $10^3$），$\mu$ 需快速跨越该范围；线性调度在条件数 $10^6$ 时要百万步才能从 $\mu=10^{-6}$ 调到 $\mu=1$。实际工程中最安全的是状态 + 极小控制混合 $\tilde Q_{\mathbf{uu}}=\ell_{\mathbf{uu}}+f_{\mathbf{u}}^\top(V_{\mathbf{xx}}'+\mu\mathbf{I}_n)f_{\mathbf{u}}+\epsilon\mathbf{I}_m$（$\epsilon=10^{-8}$），以极小代价覆盖 $f_{\mathbf{u}}$ 某些奇异值极小（冗余自由度方向）时状态正则失效的漏洞。
+
+\begin{pitfall}[正则化越大越安全是错觉]
+$\mu$ 过大使步方向退化为梯度方向，丧失 Newton 二阶优势——极端情况 $\mu=10^6$ 的 DDP 还不如一阶梯度法快（后向传播算量白付）。应从 $\mu=10^{-6}$ 或 $0$ 起，仅在失败时增大。另一坑：永远不要对非正定 $Q_{\mathbf{uu}}$ 直接求逆（`inv`），而应先试 Cholesky、失败则增 $\mu$ 重启，并用 `cho\_solve` 求解。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{连续--离散关系与采样时间}
+\label{sec:ddp-cont-disc}
+
+连续时间 DDP（Jacobson--Mayne 原著）推导微分 Riccati 方程 $-\dot{\mathbf{P}}=\mathbf{A}^\top\mathbf{P}+\mathbf{P}\mathbf{A}-\mathbf{P}\mathbf{B}\mathbf{R}^{-1}\mathbf{B}^\top\mathbf{P}+\mathbf{Q}$，值函数由连续 ODE 后向积分；离散时间 DDP（Mayne $1966$）用差分 Riccati，工程更直接（无需 ODE 积分器、与刚体动力学库接口自然），现代实践几乎全用离散。设连续系统 $\dot{\mathbf{x}}=f_c(\mathbf{x},\mathbf{u})$，Euler 离散 $\mathbf{x}_{k+1}=\mathbf{x}_k+f_c\Delta t$，则 $f_{\mathbf{x}}=\mathbf{I}+\tfrac{\partial f_c}{\partial\mathbf{x}}\Delta t$、$f_{\mathbf{u}}=\tfrac{\partial f_c}{\partial\mathbf{u}}\Delta t$，代入 $Q_{\mathbf{uu}}^{\mathrm{iLQR}}=\mathbf{R}\Delta t+(\tfrac{\partial f_c}{\partial\mathbf{u}}\Delta t)^\top V_{\mathbf{xx}}'(\tfrac{\partial f_c}{\partial\mathbf{u}}\Delta t)$。当 $\Delta t\to0$，$Q_{\mathbf{uu}}\to\mathbf{R}\Delta t$、$\mathbf{K}\sim1/\Delta t$ 发散——这不是 bug 而是物理正确：连续反馈 $\mathbf{K}_c=\mathbf{R}^{-1}\mathbf{B}^\top\mathbf{P}$ 有限，离散反馈 $\mathbf{K}_d\approx\mathbf{K}_c/\Delta t$。采样时间 $\Delta t$ 是隐含超参数（操作臂典型 $10$--$50$\,ms、腿足步态 $5$--$20$\,ms、激进机动 $2$--$10$\,ms）：太大则线性化误差大、iLQR 近似失效、可能跨越接触事件，太小则 $N=T/\Delta t$ 暴增、算量线性膨胀、累积舍入误差按 $\sqrt N$ 增长。接触切换处加密、自由飞行段加粗的\emph{变步长} DDP 可省 $50\%+$ 算量。连续代价 $\int\tfrac12\mathbf{x}^\top\mathbf{Q}\mathbf{x}\,\mathrm dt$ 离散后阶段代价须乘 $\Delta t$、而终端代价（瞬时评估）不乘——忘乘会使权重随采样率漂移、改变采样率时“最优轨迹”莫名变化。
+
+% ════════════════════════════════════════════════════════════════
+\section{收敛性的严格分析}
+\label{sec:ddp-convergence}
+
+本节给出 \cref{sec:ctrl-ilqr-ddp} 完全没有的教材级收敛证明——这是本章存在价值的核心之一。
+
+\begin{theorem}[DDP 局部二次收敛（Liao--Shoemaker $1991$）]
+\label{thm:ddp-quad-conv}
+设 OCP 最优解 $(\mathbf{x}^\star,\mathbf{u}^\star)$ 满足：(1) $f\in C^3$；(2) $\ell,\ell_f\in C^3$；(3) 各步 $Q_{\mathbf{uu},k}\succ0$（二阶充分条件）；(4) $\alpha=1$ 在最优解邻域被 Armijo 接受。则存在 $\delta>0,C>0$，当 $\|U^{(j)}-U^\star\|<\delta$ 时
+\begin{equation}
+  \|U^{(j+1)}-U^\star\|\le C\,\|U^{(j)}-U^\star\|^2,
+  \label{eq:ddp-quad}
+\end{equation}
+其中 $U=(\mathbf{u}_0,\dots,\mathbf{u}_{N-1})$ 为控制序列堆叠。
+\end{theorem}
+\begin{proof}[证明骨架]
+把一次后向 + 前向看作映射 $\Phi$：$U^{(j+1)}=\Phi(U^{(j)})$。在 $U^\star$ 处 Taylor 展开 $\Phi(U^\star+\delta U)=U^\star+D\Phi|_{U^\star}\delta U+O(\|\delta U\|^2)$。关键是证 $D\Phi|_{U^\star}=0$：在 $U^\star$ 处 $\mathbf{k}_k=-Q_{\mathbf{uu}}^{-1}Q_{\mathbf{u}}=0$（因 $Q_{\mathbf{u}}=0$ 是一阶最优性），前向修正 $\delta\mathbf{u}=\alpha\mathbf{k}+\mathbf{K}\delta\mathbf{x}$ 中 $\alpha\mathbf{k}=0$，而 $\delta\mathbf{x}$ 是前序步的 $\mathbf{k}$ 经动力学传播产生、亦全为零，故 $\Phi(U^\star)=U^\star$ 且 $D\Phi|_{U^\star}=0$。一阶项消失即给出二次收敛 \cref{eq:ddp-quad}；常数 $C$ 依赖迭代映射的二阶导 $D^2\Phi$，其有界性由 $f,\ell\in C^3$ 与 $Q_{\mathbf{uu}}\succ0$ 保证（这正是要求 $C^3$ 而非 $C^2$ 的原因）。
+\end{proof}
+
+\paragraph{iLQR 为何超线性而非二次。}\;
+iLQR 丢弃 $(V_{\mathbf{x}}')_i f^i_{\mathbf{xx}}$ 等项后 Q 系数有 $O(\|V_{\mathbf{x}}'\|)$ 误差，故 $D\Phi|_{U^\star}\neq0$ 但 $\|D\Phi\|\propto\|V_{\mathbf{x}}'^{\star}\|$。残差趋零时 $\|V_{\mathbf{x}}'^{\star}\|\to0$、$D\Phi\to0$——超线性。Giftthaler 等给出非零残差下的线性退化\cite{giftthaler2018gnms}：
+
+\begin{proposition}[iLQR 非零残差的线性收敛因子]
+\label{prop:ddp-ilqr-rho}
+当最优残差 $\|r(U^\star)\|>0$（$x_{\mathrm{ref}}$ 不可达），iLQR 退化为线性收敛，因子
+\begin{equation}
+  \rho=\frac{\|V_{\mathbf{x}}'\!\cdot f_{\mathbf{xx}}\|}{\|Q_{\mathbf{uu}}\|}\le\frac{\max_k\|V_{k,\mathbf{x}}'\|\cdot\max_k\|f_{k,\mathbf{xx}}\|}{\min_k\lambda_{\min}(Q_{\mathbf{uu},k})}.
+  \label{eq:ddp-rho}
+\end{equation}
+$\rho<1$ 时线性收敛，$\rho\ge1$ 时 iLQR 可能不收敛（需正则化或切换完整 DDP）。
+\end{proposition}
+
+工程含义：可达问题 $V_{\mathbf{x}}'^{\star}\approx0$、$\rho\approx0$，iLQR 与 DDP 几乎一样；不可达问题（$Q_f$ 权重小、轨迹不可精确跟踪）$\rho$ 可能接近 $1$、iLQR 变慢但通常仍可接受（$\rho=0.7$ 即每步误差缩减 $30\%$）。
+
+\paragraph{全局收敛（弱结果）与扩盆手段。}\;
+DDP 无全局二次收敛保证——依赖初值落在最优解的吸引盆内（否则将使任意非凸 OCP 在 $O(N)$ 内可解，把 NP-hard 化为 P，显然不可能）。实际扩盆手段：line search + 正则化保每步代价不增（全局下降）；MPPI／CEM warm-start 找粗略好初值（\cref{ch:mppi}）；FDDP 多射击允许 infeasible 初始化、吸引盆更大（\cref{sec:ddp-fddp}）；课程学习从简单问题逐步加难、每步以上一步解 warm-start。这套收敛理论并非独立发明，而继承自非线性优化：DDP 二次收敛对应 Newton 法的 Kantorovich 定理，iLQR 超线性对应 Gauss--Newton 的 Dennis--Moré 定理，DDP + Armijo 全局收敛对应阻尼 Newton 的 Zoutendijk 定理（\cref{ch:nlopt}）。
+
+% ════════════════════════════════════════════════════════════════
+\section{约束 DDP（一）：投影与增广拉格朗日}
+\label{sec:ddp-constr-proj}
+
+至此的无约束 DDP 在每步后向给出闭式 $\delta\mathbf{u}^\star=-Q_{\mathbf{uu}}^{-1}Q_{\mathbf{u}}$。但真实机器人须满足力矩极限、关节限位、摩擦锥、终端到达等约束。任何一条都使闭式解失效，需在 Bellman 递推框架内处理约束并保持 $O(N)$。
+
+\subsection{约束分类与核心命题}
+\label{sec:ddp-constr-class}
+
+标准约束离散 OCP 在 \cref{eq:ddp-ocp} 上加 $g_k(\mathbf{x}_k,\mathbf{u}_k)\le0$、$h_k=0$、$\underline{\mathbf{u}}\le\mathbf{u}_k\le\bar{\mathbf{u}}$、$\mathbf{x}_N\in\mathcal{X}_f$。约束类型涵盖控制箱（力矩极限）、线性等式（接触零速度 $\mathbf{J}_c\dot{\mathbf{q}}=0$）、非线性不等式（避障 SDF、关节限位）、二阶锥（摩擦锥）、互补（接触法向冲量）、终端。
+
+\begin{proposition}[约束破坏解析极小化 $\to$ KKT 子问题]
+\label{prop:ddp-kkt}
+设第 $k$ 步约束 Bellman 算子 $V_k(\mathbf{x})=\min_{\mathbf{u}}\{\ell_k+V_{k+1}(f_k)\mid g_k\le0\}$。在活动集 $\mathcal{A}_k=\{i:g_k^i=0\}$ 下，最优 $\delta\mathbf{u}^\star$ 满足 KKT 系统
+\begin{equation}
+  \begin{bmatrix}Q_{\mathbf{uu}}&\mathbf{G}_{\mathcal{A}}^\top\\\mathbf{G}_{\mathcal{A}}&\mathbf{0}\end{bmatrix}
+  \begin{bmatrix}\delta\mathbf{u}^\star\\\boldsymbol{\lambda}_{\mathcal{A}}\end{bmatrix}
+  =-\begin{bmatrix}Q_{\mathbf{u}}\\\mathbf{g}_{\mathcal{A}}\end{bmatrix},
+  \label{eq:ddp-kkt-sub}
+\end{equation}
+而非 $\delta\mathbf{u}^\star=-Q_{\mathbf{uu}}^{-1}Q_{\mathbf{u}}$，其中 $\mathbf{G}_{\mathcal{A}}=\partial\mathbf{g}_{\mathcal{A}}/\partial\mathbf{u}$。
+\end{proposition}
+\begin{proof}
+对带约束子问题写拉格朗日 $\mathcal{L}=\tfrac12\delta\mathbf{u}^\top Q_{\mathbf{uu}}\delta\mathbf{u}+Q_{\mathbf{u}}^\top\delta\mathbf{u}+\boldsymbol{\lambda}^\top\mathbf{g}_{\mathcal{A}}(\bar{\mathbf{u}}+\delta\mathbf{u})$。驻点条件 $\nabla_{\delta\mathbf{u}}\mathcal{L}=Q_{\mathbf{uu}}\delta\mathbf{u}+Q_{\mathbf{u}}+\mathbf{G}_{\mathcal{A}}^\top\boldsymbol{\lambda}=0$ 加原始可行 $\mathbf{g}_{\mathcal{A}}+\mathbf{G}_{\mathcal{A}}\delta\mathbf{u}=0$ 即给出 \cref{eq:ddp-kkt-sub}。$\mathcal{A}=\varnothing$ 时退化为无约束 DDP。
+\end{proof}
+
+\cref{prop:ddp-kkt} 是后文所有约束法的共享基座：它们的区别只在于\emph{如何处理 $\delta\mathbf{u}$ 极小化这一步}，\cref{eq:ddp-Q6} 的 Q 系数递推照常。关键在活动约束的\emph{数量与识别}，而非约束总数——$100$ 个 box 约束中只有 $3$ 个活动，则额外算量极小。
+
+\subsection{Box-DDP：Projected Newton 活动集}
+\label{sec:ddp-box}
+
+控制箱 $\underline{\mathbf{u}}\le\mathbf{u}\le\bar{\mathbf{u}}$ 是最普遍的约束。Tassa--Mansard--Todorov 把每步无约束极小化替换为 box-QP\cite{tassa2014ddp}：$\min_{\delta\mathbf{u}}\tfrac12\delta\mathbf{u}^\top Q_{\mathbf{uu}}\delta\mathbf{u}+Q_{\mathbf{u}}^\top\delta\mathbf{u}$ s.t.\ 边界，用 Projected Newton 求解：定义\emph{夹紧集} $\mathcal{C}=\{i:\delta\mathbf{u}_i^\star\text{ 在边界}\}$、\emph{自由集} $\mathcal{F}=\mathcal{C}^c$，对自由块解 Newton $Q_{\mathcal{FF}}\delta\mathbf{u}_{\mathcal{F}}=-(Q_{\mathbf{u},\mathcal{F}}+Q_{\mathcal{FC}}\delta\mathbf{u}_{\mathcal{C}})$（用 $Q_{\mathcal{FF}}$ 的 Cholesky），夹紧块锁到边界。物理上活动约束“消耗”了 $|\mathcal{C}|$ 个自由度，优化只发生在剩余 $|\mathcal{F}|$ 维上。反馈增益分块置零：
+\begin{equation}
+  \mathbf{K}_k[\mathcal{C},:]=\mathbf{0},\qquad \mathbf{K}_{k,\mathcal{F}}=-Q_{\mathcal{FF}}^{-1}Q_{\mathcal{F}\mathbf{x}}.
+  \label{eq:ddp-box-K}
+\end{equation}
+$\mathbf{K}_k[\mathcal{C},:]=\mathbf{0}$ 的含义：若第 $i$ 个控制已饱和在边界，则无论状态如何偏离，该控制都不应改变（已“顶到天花板”）——否则反馈 $\mathbf{K}_i\delta\mathbf{x}$ 会试图修改已饱和控制、导致闭环 chattering。
+
+\begin{pitfall}[朴素 clip 会毁掉收敛]
+新手直觉：照常求 $\delta\mathbf{u}^\star=-Q_{\mathbf{uu}}^{-1}Q_{\mathbf{u}}$，再把 $\hat{\mathbf{u}}$ 逐元素 clip 到 $[\underline{\mathbf{u}},\bar{\mathbf{u}}]$。Tassa $2014$ 指出三大缺陷：(i) clip 后 $Q_{\mathbf{u}}^\top\delta\mathbf{u}$ 不再保证为负，方向不再下降；(ii) 求逆时忽略边界耦合项 $Q_{\mathcal{FC}}\delta\mathbf{u}_{\mathcal{C}}$；(iii) 反馈 $\mathbf{K}$ 在活动约束上本应置零，否则闭环振荡。其余“简单”处理同样失败：$\tanh$ squashing $\mathbf{u}=\bar{\mathbf{u}}\tanh(\mathbf{v})$ 在饱和区 $Q_{\mathbf{uu}}\to0$（Hessian 奇异）；对数 barrier 远离边界梯度微弱、近边界病态。Box-DDP 使力矩饱和场景从“不收敛”变为“$<20$ 次迭代”。
+\end{pitfall}
+
+\begin{theorem}[Box-DDP 局部二次收敛（Bertsekas $1982$ + Tassa $2014$）]
+\label{thm:ddp-box-conv}
+设 $Q_{\mathbf{uu}}\succ0$，解 $\delta\mathbf{u}^\star$ 满足严格互补（活动约束乘子 $>0$）与二阶充分条件。则存在 $\delta\mathbf{u}^\star$ 邻域使 $\varepsilon$-活动集 Projected Newton 在有限步正确辨识 $\mathcal{C}^\star$，其后等价于自由子空间纯 Newton，具局部 q-二次收敛\cite{bertsekas1982projected}。
+\end{theorem}
+
+严格互补要求每个活动约束乘子严格为正（$\lambda_i^\star=-(Q_{\mathbf{uu}}\delta\mathbf{u}+Q_{\mathbf{u}})_i>0$）；若 $\lambda_i^\star=0$（退化互补），活动集辨识困难、微扰使约束反复切换。一旦 $\mathcal{C}^\star$ 正确辨识，约束 QP 退化为 $|\mathcal{F}|$ 维无约束 Newton（精确一步到位），其 q-二次收敛由 Kantorovich 定理保证。难点在“辨识”本身，但严格互补保证活动约束“显著”、连续性保证邻域内活动集不变。工程上对 $m=12$--$30$ 维控制，box-QP 通常只需 $1$--$2$ 次 Projected Newton 迭代即收敛（前一步活动集是极好 warm-start），总复杂度 $O(Nm^3)$ 与无约束 DDP\emph{同阶}，但仅支持控制箱——状态约束、摩擦锥须交给增广拉格朗日或 ProxDDP。
+
+\subsection{AL-iLQR 与 ALTRO}
+\label{sec:ddp-altro}
+
+处理\emph{通用}约束（状态约束、非线性等式、二阶锥）的经典方法是增广拉格朗日法（ALM）。合并所有约束为 $\mathbf{c}_k\in\mathbb{R}^{p_k}$（含等式 $h_k=0$、不等式 $g_k\le0$），增广拉格朗日
+\begin{equation}
+  \mathcal{L}_A=\ell_N+\sum_{k=0}^{N-1}\Big[\ell_k+\boldsymbol{\lambda}_k^\top\mathbf{c}_k+\tfrac{\mu}2\mathbf{c}_k^\top\mathbf{I}_\mu\mathbf{c}_k\Big],
+  \label{eq:ddp-LA}
+\end{equation}
+对角 $\mathbf{I}_\mu$ 对等式分量恒取 $\mu$，对不等式分量\emph{切换}：$(\mathbf{I}_\mu)_{ii}=\mu$ 若 $c_i>0$ 或 $\lambda_i>0$（违反或活动）、否则 $0$。这个切换让不活动不等式约束（$c_i<0$ 远离边界）“安静待着”，只在被违反时激活，避免无端惩罚可行点。ALM 是两层迭代：\emph{内层}固定 $(\boldsymbol{\lambda},\mu)$ 对 $\mathcal{L}_A$ 跑一次无约束 iLQR（约束已融入代价）；\emph{外层}更新 $\boldsymbol{\lambda}_k^+=\Pi_+(\boldsymbol{\lambda}_k+\mu\mathbf{c}_k)$、$\mu^+=\phi\mu$（$\phi\in[2,10]$），$\Pi_+$ 对不等式取 $\max(0,\cdot)$ 保对偶可行。直觉：$\boldsymbol{\lambda}$ 是“对约束违反的价格估计”，$\mu$ 是“耐心”。AL 代价对 iLQR（GN 近似）Q 系数的影响只有一个半正定增项：
+\begin{equation}
+  Q_{\mathbf{uu}}^{\mathrm{AL\text{-}GN}}=Q_{\mathbf{uu}}+\mu\,\nabla_{\mathbf{u}}\mathbf{c}^\top\nabla_{\mathbf{u}}\mathbf{c},
+  \label{eq:ddp-al-quu}
+\end{equation}
+$\mu\,\mathbf{G}_{\mathbf{u}}^\top\mathbf{G}_{\mathbf{u}}\succeq0$ 不破坏正定性、反而增强它——AL-iLQR 的 Cholesky 比纯 iLQR 更稳健。
+
+\begin{theorem}[AL 外层 q-linear 收敛（Bertsekas $1982$）]
+\label{thm:ddp-al-conv}
+设 $(\mathbf{x}^\star,\boldsymbol{\lambda}^\star)$ 满足 LICQ 与二阶充分条件。存在 $\bar\mu$ 使对所有 $\mu_k\ge\bar\mu$，乘子迭代满足 $\|\boldsymbol{\lambda}^{k+1}-\boldsymbol{\lambda}^\star\|\le\tfrac{M}{\mu_k}\|\boldsymbol{\lambda}^k-\boldsymbol{\lambda}^\star\|$；$\mu_k\to\infty$ 时退化为 q-superlinear\cite{bertsekas1982projected}.
+\end{theorem}
+
+AL 优于纯罚的原因：纯罚需 $\mu\to\infty$ 才精确满足约束、Hessian 病态；AL 用乘子 $\boldsymbol{\lambda}$ 吸收约束梯度信息，$\boldsymbol{\lambda}$ 接近 $\boldsymbol{\lambda}^\star$ 后 $\mu\sim100$ 即够。Howell--Jackson--Manchester 的 \textbf{ALTRO} 进一步“不让 $\mu\to\infty$”，用三阶段代替罚尾巴\cite{howell2019altro}：\emph{阶段一} AL-iLQR 固定 $\mu$ 跑到 $\|\mathbf{c}\|_\infty$ 降至 $\sqrt\varepsilon$（只求“接近可行”）；\emph{阶段二} Projected Newton 在整条轨迹（而非单步）上组装活动约束 KKT 系统 $\begin{psmallmatrix}\mathbf{H}&\mathbf{D}_{\mathcal{A}}^\top\\\mathbf{D}_{\mathcal{A}}&\mathbf{0}\end{psmallmatrix}\begin{psmallmatrix}\delta Y\\\delta\boldsymbol{\lambda}\end{psmallmatrix}=-\begin{psmallmatrix}\nabla\mathcal{L}\\\mathbf{c}_{\mathcal{A}}\end{psmallmatrix}$（$Y=(\mathbf{x}_{0:N},\mathbf{u}_{0:N-1})$），其中 $\mathbf{H}$ 的 block-tridiagonal 结构使 $\mathbf{H}^{-1}$ 可经 Riccati 递推高效计算、无需显式构造，每步 $O(N(n+m)^3+p^2N)$；\emph{阶段三} 可行性精炼做少量 Newton 步保 $\|\mathbf{c}\|_\infty\le\varepsilon$。
+
+\begin{insight}
+\textbf{为何不用大 $\mu$ 代替阶段二.}\;大 $\mu$ 使 $\mathrm{cond}(\mathbf{H}+\mu\mathbf{G}^\top\mathbf{G})\sim\mu$、数值精度 $\sim\epsilon_{\mathrm{mach}}\cdot\mu$；要达 $\|\mathbf{c}\|\le10^{-8}$ 需 $\mu>10^8$，双精度已无法准确表示 Hessian。Projected Newton 在活动集稳定后\emph{本身 q-二次收敛}（自由子空间 Newton），无需 $\mu$ 增长，实际只需 $3$--$5$ 步即达 $\|\mathbf{c}\|<10^{-10}$。ALTRO 的设计哲学是“AL 做粗活（全局收敛 + 活动集辨识），Projected Newton 做精活（高精度满足约束）”——两者数学保证互补。
+\end{insight}
+
+\paragraph{锥约束（ALTRO-C）。}\;
+摩擦锥 $\{\mathbf{f}:\|\mathbf{f}_t\|\le\mu_{\mathrm{fric}}f_n\}$ 是二阶锥（SOC）。ALTRO-C 用\emph{锥投影} $\Pi_{\mathcal{K}}$ 替换 box 投影 $\Pi_+$，AL 迭代变为锥 AL\cite{jackson2021altroc}，SOC 投影有闭式（锥内恒等、锥外按对偶锥规则投影、极锥外置零）。这把 SOC 约束无须多面体近似地原生纳入 ALTRO 框架。
+
+% ════════════════════════════════════════════════════════════════
+\section{约束 DDP（二）：FDDP 与 ProxDDP}
+\label{sec:ddp-fddp}
+
+\subsection{FDDP / Box-FDDP：可行性驱动}
+\label{sec:ddp-fddp-core}
+
+经典 DDP 是单射击：$U$ 是唯一变量、$\mathbf{x}_k$ 由前向 rollout 唯一确定。若初始控制序列导致轨迹爆炸（如人形前空翻，任何“合理”初始控制都翻不过去、前向 rollout 第 $3$--$5$ 步即 $\mathbf{x}_k\to\infty$），DDP 根本无法开始——标称轨迹本身无意义。多射击的解法：把 $(\mathbf{x}_k,\mathbf{u}_k)$ 视为独立变量，允许 $\mathbf{x}_{k+1}\neq f(\mathbf{x}_k,\mathbf{u}_k)$ 的动力学\emph{gap／defect}，从一个“不满足动力学但结构合理”的轨迹（关键帧插值、动捕数据）出发逐步消 gap。Mastalli 的 \textbf{FDDP} 把这个思想嵌入 DDP\cite{mastalli2020crocoddyl}。定义每节点 defect
+\begin{equation}
+  \bar f_{k+1}\triangleq f_k(\mathbf{x}_k,\mathbf{u}_k)\ominus\mathbf{x}_{k+1}\in T_{\mathbf{x}_{k+1}}\mathcal{X},
+  \label{eq:ddp-defect}
+\end{equation}
+$\bar f_{k+1}=0$ 即轨迹满足动力学（$\ominus$ 用本书右差分 $\mathrm{Log}$，流形状态\emph{勿}做欧氏减法，否则破坏单位约束、环绕处产生虚假 defect）。引入 $\ell_1$ 精确罚 merit
+\begin{equation}
+  \Phi(\mathbf{x},\mathbf{u};\nu)=J(\mathbf{x},\mathbf{u})+\nu\sum_{k=0}^{N}\|\bar f_k\|_1.
+  \label{eq:ddp-merit}
+\end{equation}
+当 $\nu>\max_k\|\boldsymbol{\lambda}_k^\star\|_\infty$（$\boldsymbol{\lambda}$ 是动力学约束乘子）时 $\Phi$ 是精确罚——其无约束极小等于原约束问题的解（Nocedal--Wright 定理 $17.3$\cite{nocedal2006numerical}）。FDDP 最关键的创新是后向传播的 \textbf{defect 修正}：
+\begin{equation}
+  \boxed{\;V_{\mathbf{x}}'\leftarrow V_{\mathbf{x}}'+V_{\mathbf{xx}}'\,\bar f_{k+1}\;}
+  \label{eq:ddp-defect-corr}
+\end{equation}
+然后 Q 系数照 \cref{eq:ddp-Q6} 计算。直觉：$\bar f_{k+1}$ 是下一节点的“状态偏移”，值函数在 $\mathbf{x}_{k+1}$ 而非 $f(\mathbf{x}_k,\mathbf{u}_k)$ 处展开；要让优化“知道”这个偏移的代价，须把它通过值函数曲率 $V_{\mathbf{xx}}'$ 转为梯度修正 $V_{\mathbf{xx}}'\bar f$。严格地说，对多射击 NLP 的 KKT 系统做 block elimination（Riccati condensation），恰好得到带 \cref{eq:ddp-defect-corr} 修正的 DDP 递推。前向传播保持 gap：
+\begin{equation}
+  \hat{\mathbf{x}}_0=\tilde{\mathbf{x}}_0\oplus(\alpha-1)\bar f_0,\qquad \hat{\mathbf{x}}_{k+1}=f(\hat{\mathbf{x}}_k,\hat{\mathbf{u}}_k)\oplus(\alpha-1)\bar f_{k+1}.
+  \label{eq:ddp-fddp-forward}
+\end{equation}
+$\alpha=1$ 时 gap 一步关闭（退化为标准 DDP），$\alpha<1$ 时 gap 按 $(1-\alpha)$ 线性收缩。这与 Bock--Plitt 的多射击 SQP 步完全等价：$\alpha=1$ 对应 full Newton（gap 一步消除）、$\alpha<1$ 对应 damped Newton。
+
+\begin{theorem}[FDDP $=$ 多射击 SQP 的 condensed Riccati（Mastalli $2020$ Prop.\ 2）]
+\label{thm:ddp-fddp-sqp}
+对多射击 NLP $\min_{X,U}J$ s.t.\ $\mathbf{x}_{k+1}=f(\mathbf{x}_k,\mathbf{u}_k)$ 做一步 SQP（对 KKT 的 Newton），其 block-tridiagonal KKT 系统经 Riccati 递推 block elimination 所得步方向，与 FDDP 的 defect-corrected 后向传播\emph{完全等价}\cite{mastalli2020crocoddyl}.
+\end{theorem}
+
+故 FDDP 不是 DDP 的 ad-hoc 修改，而是\emph{多射击 SQP 在 Bellman 语言下的严格重述}，\cref{eq:ddp-defect-corr} 是 KKT 动力学残差吸收进值函数梯度的数学必然，而非补丁。\textbf{Box-FDDP} 在 FDDP 后向每步用与 \cref{sec:ddp-box} 完全相同的 Projected Newton box-QP 解 $(\mathbf{k}_k,\mathbf{K}_{k,\mathcal{F}})$（$Q_{\mathbf{u}}$ 含 defect 修正），前向对控制 clip 并保 defect，兼得 infeasible warm-start 与硬控制箱\cite{mastalli2022boxfddp}。Mastalli $2022$ 验证 Box-FDDP 在人形 pull-up、front-flip 等场景比 Box-DDP 收敛失败率低一个数量级——因多射击把非线性分配到每节点、允许从动捕关键帧或离线运动库 warm-start。
+
+\begin{pitfall}[漏掉 defect 修正]
+若 FDDP 忘记 \cref{eq:ddp-defect-corr}，当 gap $>0$ 时产生错误 Newton 方向——merit 不降反升，表现为“第一步 gap 消除但代价反增”的异常。
+\end{pitfall}
+
+\subsection{ProxDDP / Aligator：近端 primal-dual}
+\label{sec:ddp-proxddp}
+
+ALTRO 的 AL 需外层循环（乘子更新 $\to$ 重跑 iLQR $\to$ 再更新），每次外层调用一次完整 iLQR，总算量可能是无约束的 $5$--$10$ 倍。Jallet 等的 \textbf{ProxDDP} 把约束处理直接融入单次 Riccati 后向、免外层循环\cite{jallet2025proxddp}，核心是近端点算法 + primal-dual AL。第 $k$ 次外迭代解 $\min_{\mathbf{x},\mathbf{u}}\sum_t\ell_t+\ell_N+\tfrac1{2\rho_k}(\|\mathbf{u}-\mathbf{u}^k\|^2+\|\mathbf{x}-\mathbf{x}^k\|^2)$ s.t.\ 动力学与约束，近端项把当前迭代锚定在上次解附近、防 AL 罚因子过大时的病态。把 AL-KKT 代入 DDP 的 Hamilton 量得扩展后向递推：
+\begin{equation}
+  \tilde Q_{\mathbf{uu}}=Q_{\mathbf{uu}}+\mu\,\mathbf{G}_{\mathbf{u}}^\top\mathbf{G}_{\mathbf{u}}+\tfrac1\rho\mathbf{I}_m,\qquad
+  \tilde Q_{\mathbf{u}}=Q_{\mathbf{u}}+\mathbf{G}_{\mathbf{u}}^\top(\boldsymbol{\lambda}+\mu\,\mathbf{g}),
+  \label{eq:ddp-prox-Q}
+\end{equation}
+然后照常 Riccati $\mathbf{k}=-\tilde Q_{\mathbf{uu}}^{-1}\tilde Q_{\mathbf{u}}$、$\mathbf{K}=-\tilde Q_{\mathbf{uu}}^{-1}\tilde Q_{\mathbf{ux}}$。关键区别：乘子 $\boldsymbol{\lambda}_t$ 现在是后向传播的一部分，与 $(V_{\mathbf{x}},V_{\mathbf{xx}})$ 一起后向传播，使\emph{一次后向 + 前向同时更新 primal 与 dual}（近端项 $\tfrac1\rho\mathbf{I}_m$ 还保证正定，即使 $Q_{\mathbf{uu}}$ 本身不定）。
+
+收敛性分两层。\emph{全局}：近端点算法在\emph{凸}问题上有 $O(1/k)$ 级 KKT 残差衰减——Rockafellar $1976$ 证明的是渐近收敛与局部线性，$O(1/k)$ 速率属后续非精确 PPA 文献\cite{rockafellar1976proximal}；对非凸 OCP \emph{无全局速率保证}，仅在 KKT 邻域局部线性。\emph{局部}：LICQ + 二阶充分条件下，KKT 邻域内 $\|w^{k+1}-w^\star\|\le\kappa(\rho)\|w^k-w^\star\|$，$\kappa(\rho)=M/(\rho+M)$，$\rho$ 越大收敛越快但子问题偏离原问题越多（精度--速度 trade-off）；配合 Gauss--Newton 步可在 KKT 邻域达超线性（Aligator 的实际实现）。近端项天然抑制 MPC 扰动放大，比 ALTRO 的“纯 AL + Newton”对扰动更鲁棒——这与 ADMM 有深层联系（ADMM 可视为对偶空间的近端点法），但 ProxDDP 直接在 primal-dual 空间操作、避免 ADMM 分裂的收敛减慢。定性结论：ProxDDP 使含硬摩擦锥的 whole-body MPC 达 kHz 级，把约束处理开销从“外层循环 $\times$ 内层迭代”压缩到“单次扩展 Riccati”。
+
+\begin{table}[H]\centering\small
+\caption{ALTRO 与 ProxDDP 对比}
+\label{tab:ddp-altro-prox}
+\begin{tabular}{lll}
+\toprule
+维度 & ALTRO & ProxDDP \\
+\midrule
+外层循环 & 需要（$3$--$10$ 次） & 不需要（嵌入 Riccati）\\
+每步计算 & iLQR（无约束）+ 乘子更新 & 扩展 Riccati（含约束项）\\
+warm-start & 好（shift AL 变量） & 极好（shift primal+dual）\\
+数值稳定 & $\mu$ 大时病态 & 近端项抑制病态 \\
+约束类型 & 任意 + SOC & 等式/不等式/SOC \\
+适用场景 & 离线/中频 & 实时 MPC（kHz 级）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{remark}
+Crocoddyl／Aligator／OCS2／ALTRO 是上述算法的开源实现，均接 Pinocchio 解析导数。其中 Pinocchio 对刚体动力学解析偏导（Carpentier--Mansard $2018$\cite{carpentier2018derivatives}）比有限差分快 $10$--$50$ 倍，是 whole-body DDP 实时化的关键瓶颈点（\cref{ch:rigid_body} 的 $\mathbf{M}(\mathbf{q})\ddot{\mathbf{q}}+\dots=\boldsymbol{\tau}$ 由此求导，不在本章重推）。
+\end{remark}
+
+% ════════════════════════════════════════════════════════════════
+\section{接触、摩擦锥与终端约束}
+\label{sec:ddp-contact}
+
+\subsection{Coulomb 摩擦锥与 wrench cone}
+\label{sec:ddp-friction}
+
+点接触三维力 $\mathbf{f}=(f_x,f_y,f_n)$ 满足 $\sqrt{f_x^2+f_y^2}\le\mu_{\mathrm{fric}}f_n$、$f_n\ge0$，定义二阶锥 $\mathcal{K}_{\mu_{\mathrm{fric}}}$（半角 $\arctan\mu_{\mathrm{fric}}$ 的圆锥）。精确 SOC 在 DDP 内不易处理（除非 ProxDDP／ALTRO-C），工程常用\emph{多面体内接}：\textbf{4 面}有效摩擦系数 $\mu_{\mathrm{eff}}=\mu_{\mathrm{fric}}/\sqrt2\approx0.707\mu_{\mathrm{fric}}$（保守），\textbf{8 面} $\mu_{\mathrm{eff}}=\mu_{\mathrm{fric}}\cos(\pi/8)\approx0.924\mu_{\mathrm{fric}}$（较精确），化为线性不等式 $\mathbf{W}\mathbf{f}\le0$。若接触面是矩形脚底（$2l_x\times2l_y$）而非点，还需约束压力中心（CoP）在支撑面内（$|p_x|\le l_x,|p_y|\le l_y$，即 $-l_x f_n\le m_y\le l_x f_n$ 等）与绕法向扭矩 $|m_z|\le\mu_t f_n$，这些合为 $16$--$24$ 面的 \textbf{6D wrench cone}（Caron $2015$\cite{caron2015wrench}）。CoP 约束对人形尤其重要（脚底面积有限，重心偏移大时 CoP 到脚底边缘即开始倾倒），四足因支撑点分散较少激活。接触序列可\emph{预设}（Contact-Scheduled，由外部步态规划器定，ms 级实时 MPC）或\emph{优化发现}（Contact-Implicit，Posa $2014$\cite{posa2014contact}，互补约束自动发现接触、规模大、秒--分钟级离线）。
+
+\begin{pitfall}[摩擦系数不保守化]
+规划用 $\mu_{\mathrm{fric}}=0.8$（干水泥），实际地面有水（$\mu_{\mathrm{real}}=0.4$）则滑倒。正确做法：$\mu_{\mathrm{plan}}=0.6\,\mu_{\mathrm{nominal}}$，再经 4 面内接折 $1/\sqrt2$，总安全系数约 $0.6/\sqrt2\approx0.42$。斜坡上还须把摩擦锥轴对齐接触面法向而非世界 $z$ 轴，否则可用摩擦力被低估。
+\end{pitfall}
+
+\subsection{终端约束与 MPC 递归可行性}
+\label{sec:ddp-terminal}
+
+MPC 只优化有限视域 $N$ 步，但机器人需无限时间运行。若视域内最优轨迹把系统“抛”到第 $N$ 步的不可恢复状态，下一周期可能无可行解、系统崩溃。终端约束／代价保证“视域末端还能救”。本节给出 Mayne 四条件的\emph{主证}（约束 DDP 直接落地它）；\cref{ch:mpc-advanced} 引用并扩展到 tube／robust／economic／RTI 外层，故此处只证 nominal 情形。
+
+\begin{theorem}[Mayne--Rawlings--Rao--Scokaert 四条件（$2000$）]
+\label{thm:ddp-mayne}
+设存在局部终端反馈 $\kappa_f(\mathbf{x})$ 满足：
+\textbf{A1（容许）} $\mathcal{X}_f\subseteq\mathcal{X}$ 闭、$\mathbf{0}\in\mathcal{X}_f$，对所有 $\mathbf{x}\in\mathcal{X}_f$ 有 $\kappa_f(\mathbf{x})\in\mathcal{U}$；
+\textbf{A2（正不变）} $f(\mathbf{x},\kappa_f(\mathbf{x}))\in\mathcal{X}_f$；
+\textbf{A3（终端代价为局部 CLF）} $V_f(f(\mathbf{x},\kappa_f(\mathbf{x})))-V_f(\mathbf{x})\le-\ell(\mathbf{x},\kappa_f(\mathbf{x}))$；
+\textbf{A4（阶段代价正定）} $\ell(\mathbf{x},\mathbf{u})\ge\alpha(|\mathbf{x}|)$、$V_f\ge0$、$V_f(\mathbf{0})=0$。
+则闭环 MPC 使原点渐近稳定，吸引域为可行集 $\mathcal{X}_N$（递归可行）\cite{mayne2000constrained}.
+\end{theorem}
+\begin{proof}[证明骨架]
+\emph{递归可行性}：设第 $k$ 步有可行解 $(\mathbf{u}_0^\star,\dots,\mathbf{u}_{N-1}^\star)$，构造第 $k+1$ 步候选解为 shifted 序列 $(\mathbf{u}_1^\star,\dots,\mathbf{u}_{N-1}^\star,\kappa_f(\mathbf{x}_N^\star))$。由 A1+A2，$\kappa_f(\mathbf{x}_N^\star)\in\mathcal{U}$ 且 $f(\mathbf{x}_N^\star,\kappa_f(\mathbf{x}_N^\star))\in\mathcal{X}_f$——候选解对新初值 $\mathbf{x}_1$ 可行。\emph{Lyapunov 下降}：令 $V_N(\mathbf{x})=J_N^\star(\mathbf{x})$（最优代价），比较 $V_N(\mathbf{x}_1)$（候选解代价，上界）与 $V_N(\mathbf{x}_0)$：$V_N(\mathbf{x}_1)\le V_N(\mathbf{x}_0)-\ell(\mathbf{x}_0,\mathbf{u}_0^\star)-V_f(\mathbf{x}_N^\star)+V_f(\mathbf{x}_{N+1})$，由 A3 知 $V_f(\mathbf{x}_{N+1})-V_f(\mathbf{x}_N^\star)\le-\ell(\mathbf{x}_N^\star,\kappa_f)$，合并得 $V_N(\mathbf{x}_1)-V_N(\mathbf{x}_0)\le-\ell(\mathbf{x}_0,\mathbf{u}_0^\star)\le-\alpha(|\mathbf{x}_0|)$。由 A4，$V_N$ 是 Lyapunov 函数 $\Rightarrow$ 渐近稳定。
+\end{proof}
+
+\paragraph{终端代价取 LQR 值函数。}\;
+线性化系统 $\dot{\mathbf{x}}\approx\mathbf{A}\mathbf{x}+\mathbf{B}\mathbf{u}$，取 $V_f(\mathbf{x})=\mathbf{x}^\top\mathbf{P}\mathbf{x}$（DARE 解，\cref{ch:lqr-lqg-riccati}）、$\kappa_f(\mathbf{x})=-\mathbf{K}\mathbf{x}$（LQR 反馈），四条件\emph{自动满足}：A1 取 $\mathcal{X}_f=\{\mathbf{x}:\mathbf{x}^\top\mathbf{P}\mathbf{x}\le\alpha\}$（椭球，$\alpha$ 足够小使 $\mathbf{K}\mathbf{x}\in\mathcal{U}$）；A2 由 LQR 闭环 Lyapunov 稳定 $\Rightarrow$ 正不变；A3 即 DARE 恒等式 $V_f(f(\mathbf{x},\kappa_f))-V_f(\mathbf{x})=-\mathbf{x}^\top(\mathbf{Q}+\mathbf{K}^\top\mathbf{R}\mathbf{K})\mathbf{x}=-\ell(\mathbf{x},\kappa_f(\mathbf{x}))$；A4 由 $V_f$ 连续正定与 $\mathcal{X}_f$ 紧性直接满足。
+
+\begin{insight}
+\textbf{终端代价 $V_f=\mathbf{x}^\top\mathbf{P}\mathbf{x}$ 不是“随便取的大权重”.}\;它有精确含义——\emph{视域结束后仍有 LQR 兜底}，整个无限时问题被两段式界定：前 $N$ 步显式优化 + 第 $N$ 步后 LQR 托底。若终端代价只是小权重的 $\|\mathbf{x}_N-\mathbf{x}_{\mathrm{goal}}\|^2$（优化器“不在乎” $\mathbf{x}_N$ 之后），闭环 MPC 会 drift。视域 $N$ 也并非越长越好：过长视域在不稳定系统中使 Hessian 条件数 $\sim e^{2\lambda N\Delta t}$ 爆炸，经验法则 $T=N\Delta t$ 覆盖 $2$--$3$ 个系统时间常数（如步态周期）即可。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{李群 DDP 与 SQP 统一谱系}
+\label{sec:ddp-lie-sqp}
+
+\subsection{李群 DDP}
+\label{sec:ddp-lie}
+
+浮动基座机器人的配置空间含 $\SE(3)$，旋转矩阵／四元数不能做欧氏减法（破坏正交／单位约束、产生虚假 defect）。在流形 $\mathcal{M}$ 上，标准 DDP 的三个操作按本书右扰动约定（\cref{ch:lie}）替换：状态差分 $\delta\boldsymbol{\xi}=\bar{\mathbf{x}}\ominus\mathbf{x}=\mathrm{Log}(\bar{\mathbf{x}}^{-1}\mathbf{x})$（切空间向量），积分 $\mathbf{x}=\bar{\mathbf{x}}\oplus\delta\boldsymbol{\xi}=\bar{\mathbf{x}}\,\mathrm{Exp}(\delta\boldsymbol{\xi})$，Jacobian 经\emph{右雅可比} $\mathbf{J}_r$ 修正 $f_{\boldsymbol{\xi}}=\mathbf{J}_r^{-1}\cdot\partial f/\partial\mathbf{x}$（源用左作用 $J_{\log}$，此处统一为右雅可比版）。切空间维度即李代数维（$\SE(3)$ 为 $6$，故四元数 $12$ 维四旋翼的 $\delta\mathbf{x}$ 是 $12$ 而非 $13$ 维）。\textbf{Q 系数 \cref{eq:ddp-Q6} 的公式形式不变}——只是所有 Jacobian 乘 $\mathbf{J}_r$ 补偿流形曲率；defect、merit、代价残差均改用 $\mathrm{Log}$／$\ominus$ 而非欧氏量（如位姿残差用 $\log_{\SE(3)}(\mathbf{M}_{\mathrm{ref}}^{-1}\mathbf{M})$）。这把无约束/约束 DDP 无缝推广到浮动基系统，且与本书全书右扰动约定一致。
+
+\subsection{SQP 统一谱系}
+\label{sec:ddp-sqp}
+
+\cref{sec:ddp-unify} 从 Pontryagin/DP/LQR 理解 DDP，本节从序列二次规划（SQP）收口——这让我们直接对比 DDP 与 acados、IPOPT 等直接法的本质异同。把 OCP 写成单射击无约束 NLP $\min_U J(U)$，对 $J$ 做二阶 Taylor 解 Newton 方程 $\nabla^2 J\cdot\delta U=-\nabla J$；$J$ 的 Hessian 具时间递归结构，从后向前 block elimination 恰是 DDP 后向传播——\textbf{DDP $=$ 单射击 Newton 的 Riccati factorization}（精神上与 FFT 利用频率结构把 DFT 从 $O(N^2)$ 降为 $O(N\log N)$ 一致）。把代价写成最小二乘并对残差做一阶展开，则 \textbf{iLQR $=$ 单射击 Gauss--Newton 的 Riccati 求解}；转多射击则 \textbf{FDDP $=$ 多射击 SQP 的 condensed Riccati}（\cref{thm:ddp-fddp-sqp}）。
+
+\begin{table}[H]\centering\small
+\caption{DDP 家族与直接法的 SQP 统一谱系}
+\label{tab:ddp-sqp}
+\begin{tabular}{lllll}
+\toprule
+方法 & NLP 表述 & Hessian 近似 & KKT 求解 & 局部收敛率 \\
+\midrule
+DDP & 单射击 & Exact Newton & Riccati & 二次 \\
+iLQR & 单射击 & Gauss--Newton & Riccati & 超线性（零残差近二次）\\
+FDDP & 多射击 & GN + defect & Riccati condensation & 超线性 \\
+ALTRO & 多射击 & GN + AL 外层 & Riccati + Proj-Newton & q-linear $\to$ q-二次 \\
+acados SQP & 多射击 & GN（显式） & HPIPM/Riccati & 超线性 \\
+IPOPT & 多射击 & Exact/L-BFGS & 稀疏 LDL & 超线性 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}
+\textbf{DDP 家族与 acados 的区别不在数学、在代码组织.}\;两者求解的是同一个 KKT 系统：DDP 用 Bellman 语言（Q 函数、值函数），SQP 用 NLP 语言（拉格朗日、active set、稀疏线代）。Bellman 语言的优势是\emph{自然给出反馈增益 $\mathbf{K}$}，NLP 语言的优势是\emph{原生支持路径约束}。这解释了 $2020$--$2025$ 年 Crocoddyl／Aligator／OCS2 在机器人实时 MPC 上重新崛起、压过通用 NLP 求解器：机器人需要的恰是天然反馈增益 + 极佳 warm-start + 无须稀疏线代库。
+\end{insight}
+
+\paragraph{两条跨部指针。}\;
+\emph{可微 MPC}（Amos $2018$\cite{amos2018diffmpc}）把 box-iLQR 视作可微层：在不动点 $(\mathbf{x}^\star,\mathbf{u}^\star)$ 处经 KKT 隐式微分反传关于 cost／dynamics 参数的梯度 $\partial\mathbf{u}^\star/\partial\theta=-(\partial^2\mathcal{L}/\partial\mathbf{u}^2)^{-1}(\partial^2\mathcal{L}/\partial\mathbf{u}\partial\theta)$，该线性系统本身具 LQR 结构、可用 Riccati 反向递推 $O(Nn^3)$ 求解（远优于通用 KKT LU 的 $O(N^3n^3)$）——切忌展开（unroll）iLQR 所有迭代成计算图，那会使梯度爆炸/消失。这接 P8 强化学习运控部（端到端策略学习、inverse RL、sim2real）。\emph{MPPI 与 iLQR}是\emph{启发式联系}而非可引用等式：路径积分控制在线性-二次-高斯特例下化为可解的线性 HJB（Cole--Hopf 变换），该结果归 Kappen $2005$\cite{kappen2005linear}，常把 iLQR 比作 MPPI 的“确定性极限”——但 MPPI 是 Monte-Carlo 采样、iLQR 是局部梯度，文献普遍视为两类不同方法、常组合使用（如用 iLQG 跟踪 MPPI），详见 \cref{ch:mppi}。
+
+% ════════════════════════════════════════════════════════════════
+\section{桥接与小结}
+\label{sec:ddp-summary}
+
+\paragraph{DDP 类方法 vs 通用 NLP 求解器。}\;
+DDP 家族以单射击/多射击的 Bellman 递推求解，相比通用 NLP（如 IPOPT-DirCol）变量更少（仅 $\mathbf{u}$ 或 $(\mathbf{u},\bar f)$）、天然给出反馈增益 $\mathbf{K}_k$、warm-start 极佳、不需稀疏线代库；代价是不擅长稀疏路径约束（须经 AL/projected/proximal 处理）。配合 Pinocchio 解析导数，DDP 类方法达 ms 级求解，比通用 NLP 快约两个数量级，但对复杂稀疏约束的离线轨迹设计，直接法 + 稀疏 NLP 仍更灵活——两者互补。
+
+本章从 \cref{sec:ctrl-ilqr-ddp} 的最小骨架出发，把非线性轨迹优化的局部迭代求解器做到研究生密度：Q 函数六系数的逐项推导与张量缩并物理解释（\cref{sec:ddp-backward}）、iLQR 作为 Gauss--Newton 的严格最小二乘对偶（\cref{thm:ddp-gn}）、正则化与 Levenberg--Marquardt 信赖域的精确等价（\cref{thm:ddp-lm}）、局部二次收敛定理（\cref{thm:ddp-quad-conv}）与 iLQR 非零残差线性退化（\cref{prop:ddp-ilqr-rho}）；约束侧建立了“约束破坏解析极小化 $\to$ KKT 子问题”的统一基座（\cref{prop:ddp-kkt}），并讲透 Box-DDP（\cref{thm:ddp-box-conv}）、AL-iLQR/ALTRO（\cref{thm:ddp-al-conv}）、FDDP（\cref{thm:ddp-fddp-sqp}）、ProxDDP（\cref{eq:ddp-prox-Q}）四法如何保 $O(N)$；最后落到接触/摩擦锥/wrench cone、终端约束 Mayne 四条件主证（\cref{thm:ddp-mayne}）、李群 DDP 与 SQP 统一谱系（\cref{tab:ddp-sqp}）。
+
+\paragraph{前向钩子。}\;
+向 \cref{ch:mpc-advanced}：本章的 warm-start 与 RTI 是 MPC 实时机制的内层，那一章承接 receding horizon、tube/economic/robust MPC 与 RTI 收缩性的外层理论（Diehl--Bock--Schlöder $2005$ 的实时迭代收缩定理\cite{diehl2005realtime}）。向 \cref{ch:hj-reachability}：DDP 是局部轨迹优化，与 HJ 可达性的全局集合计算路线互补、不重叠。向规划部 \cref{ch:st-trajopt}（CILQR）与 \cref{ch:plan-rtgame}（iLQGames）：本章给通用内核，它们给具体应用。向力控部 \cref{ch:force-wbc}：约束 DDP 的接触/摩擦锥/HQP 与 WBC 复用同一 KKT 接触模型，可互引。
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\label{tab:ddp-summary}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & OCP 与单射击 & Bellman 时间分解为 $N$ 个 $m$ 维子问题 & $\bigstar\bigstar$ \\
+2 & Q 函数六系数 & 链式法则 + 张量缩并 + Schur 补非线性 Riccati & $\bigstar\bigstar\bigstar$ \\
+3 & iLQR $=$ Gauss--Newton & 丢张量项 $=$ 丢残差 Hessian；自动 PSD & $\bigstar\bigstar\bigstar$ \\
+4 & Pontryagin/DP/LQR 统一 & $\boldsymbol{\lambda}_k=V_{k,\mathbf{x}}$；三线交汇 & $\bigstar\bigstar\bigstar$ \\
+5 & Line search & 修正 Armijo 比 $z$；$\mathbf{K}$ 不缩放 & $\bigstar\bigstar$ \\
+6 & 正则化 LM 等价 & 状态正则 $\equiv$ 信赖域；$\mu$ 是对偶乘子 & $\bigstar\bigstar\bigstar$ \\
+7 & 收敛性 & Liao--Shoemaker 二次；$\rho$ 线性退化 & $\bigstar\bigstar\bigstar\bigstar$ \\
+8 & Box-DDP & Projected Newton + $\mathbf{K}[\mathcal{C}]=\mathbf{0}$ & $\bigstar\bigstar\bigstar$ \\
+9 & AL-iLQR/ALTRO & 半正定增项 + 三阶段（AL/Proj-Newton/精炼） & $\bigstar\bigstar\bigstar$ \\
+10 & FDDP & defect 修正 $=$ 多射击 condensed SQP & $\bigstar\bigstar\bigstar\bigstar$ \\
+11 & ProxDDP & 近端 primal-dual 嵌入单次 Riccati & $\bigstar\bigstar\bigstar\bigstar$ \\
+12 & 摩擦锥/wrench cone & SOC/多面体内接；CoP 约束 & $\bigstar\bigstar$ \\
+13 & Mayne 四条件 & 递归可行 + 渐近稳定；$V_f=\mathbf{x}^\top\mathbf{P}\mathbf{x}$ 兜底 & $\bigstar\bigstar\bigstar$ \\
+14 & 李群 DDP / SQP 谱系 & 右扰动 $\mathbf{J}_r$；DDP$=$单射击 Newton-Riccati & $\bigstar\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{常见误解}
+\begin{enumerate}
+  \item \textbf{“iLQR 与 DDP 是完全不同的算法。”}\;iLQR 是 DDP 的 Gauss--Newton 近似——在后向传播中丢弃 \cref{eq:ddp-Q6} 的张量缩并项 $\sum_i(V_{\mathbf{x}}')_i f^i_{\bullet\bullet}$，两者共享同一 Bellman 递推，仅 $Q_{\mathbf{uu}}$ 的 Hessian 近似不同。
+  \item \textbf{“DDP 是全局最优算法。”}\;DDP/iLQR 本质是 Newton/GN 法，只找局部最优；不同初值可能收敛到不同局部极小，需多初始点或 MPPI warm-start。
+  \item \textbf{“正则化 $\mu$ 是固定超参数。”}\;$\mu$ 须自适应（LM 策略）：$Q_{\mathbf{uu}}$ 不正定时增大、line search 成功后减小；固定 $\mu$ 会收敛缓慢或不收敛。
+  \item \textbf{“DDP 总优于直接配点法。”}\;DDP 利用 Bellman 结构达 $O(Nm^3)$，适合无约束或简单约束；直接法 + 稀疏 NLP 对复杂约束更灵活，两者互补。
+  \item \textbf{“iLQR 与 DDP 收敛率只看迭代数。”}\;须看达容差的 wall-clock 时间——iLQR 每步省张量计算，总耗时常与 DDP 相当甚至更短。
+  \item \textbf{“DDP 只能处理欧氏状态空间。”}\;李群 DDP 已推广到 $\SO(3)$、$\SE(3)$——用 $\oplus/\ominus$ 替代加减、右雅可比 $\mathbf{J}_r$ 替代欧氏导数（\cref{sec:ddp-lie}）。
+\end{enumerate}
+
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{易读引论}：Tedrake《Underactuated Robotics》第 $10$ 章\cite{tedrake_underactuated}——最平易的 DDP/iLQR 入门，与 \cref{sec:ctrl-ilqr-ddp} 一致。
+  \item \textbf{工程化标准}：Tassa--Erez--Todorov IROS $2012$\cite{tassa2012ilqg}（正则化 + line search）、Tassa--Mansard--Todorov ICRA $2014$\cite{tassa2014ddp}（Box-DDP）。
+  \item \textbf{收敛理论}：Liao--Shoemaker IEEE TAC $1991$\cite{liao1991convergence}（二次收敛严格分析）、Pantoja IJC $1988$\cite{pantoja1988ddp}（DDP$=$stagewise Newton）、Giftthaler et al.\ IROS $2018$\cite{giftthaler2018gnms}（iLQR$=$GN 系统化）；历史源头 Mayne $1966$\cite{mayne1966ddp}、Jacobson--Mayne $1970$ 专著\cite{jacobson1970ddp}。
+  \item \textbf{约束 DDP}：Howell--Jackson--Manchester IROS $2019$\cite{howell2019altro}（ALTRO）、Mastalli et al.\ ICRA $2020$\cite{mastalli2020crocoddyl}（FDDP/Crocoddyl）、Mastalli et al.\ Auton.\ Robots $2022$\cite{mastalli2022boxfddp}（Box-FDDP）、Jallet et al.\ T-RO $2025$\cite{jallet2025proxddp}（ProxDDP）、Bertsekas $1982$\cite{bertsekas1982projected}（Projected Newton/AL 收敛）。
+  \item \textbf{接触与 MPC}：Caron--Pham--Nakamura ICRA $2015$\cite{caron2015wrench}（wrench cone 闭式）、Posa--Cantu--Tedrake IJRR $2014$\cite{posa2014contact}（contact-implicit）、Mayne et al.\ Automatica $2000$\cite{mayne2000constrained}（MPC 稳定性四条件）；可微 MPC 见 Amos et al.\ NeurIPS $2018$\cite{amos2018diffmpc}。
+\end{itemize}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：后向传播 Cholesky 失败。\textbf{排查}：检查 $V_{\mathbf{xx}}'$ 是否正定（打印最小特征值）；增大 $\mu$；确认 $\mathbf{R}\succ0$；若用完整 DDP 检查张量项符号。对应 \cref{sec:ddp-reg}。
+  \item \textbf{症状}：line search 全部失败。\textbf{排查}：打印 $\Delta_1,\Delta_2$ 与 $z$ 分布；增大 $\mu$ 缩小信赖域；检查动力学有无接触切换不连续。对应 \cref{sec:ddp-forward}。
+  \item \textbf{症状}：收敛但代价远非最优。\textbf{排查}：多随机初值；增大 $N$（视域不足）；MPPI warm-start；减小 $Q_f$（终端代价过强可能锁定次优）。对应 \cref{sec:ddp-convergence}。
+  \item \textbf{症状}：Box-DDP 在边界附近振荡。\textbf{排查}：确认 box-QP 后 $\mathbf{K}[\mathcal{C},:]=\mathbf{0}$、前向 clip 一致。对应 \cref{sec:ddp-box}。
+  \item \textbf{症状}：FDDP gap 不收敛。\textbf{排查}：打印 $\max\|\boldsymbol{\lambda}^\star\|$、增大 merit $\nu$、核对 defect 修正 \cref{eq:ddp-defect-corr} 是否正确实现。对应 \cref{sec:ddp-fddp}。
+  \item \textbf{症状}：MPC 闭环 drift。\textbf{排查}：解 DARE 得 $\mathbf{P}$ 作终端代价、增大终端状态权重、核对 Mayne 四条件。对应 \cref{sec:ddp-terminal}。
+\end{enumerate}

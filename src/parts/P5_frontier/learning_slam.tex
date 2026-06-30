@@ -1,0 +1,665 @@
+\chapter{学习赋能的 SLAM}
+\label{ch:learning}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「学习时代的 SLAM 与空间 AI」首章。
+%  吸收 SLAM Handbook ch13《Boosting SLAM with Deep Learning》(Teed, Deng,
+%  Chidlovskii, Revaud, Wimbauer, Cremers)：学习式深度/位姿、学习式特征/光流
+%  (SuperPoint/SuperGlue/LoFTR/RAFT)、可微分 BA 与 DROID-SLAM/DPVO、
+%  pointmap 范式 (DUSt3R/MASt3R)。
+%  最高准则：经典→学习的过渡桥头堡，必须是全书叙事的自然延伸——开篇直接接住
+%  母方程 eq:intro-nls 与 sec:intro-frontier 的「经典→学习→具身」弧线；
+%  把「学习赋能」框定为「把母方程的残差/权重/状态表示换成可学习的」。
+%  关键融合避重：可微分 BA 的反传机理(隐函数定理/展开式反传/HVP)已由
+%  sec:nlopt-diffopt 自包含，本章 \cref 过去、聚焦「BA 作为可微层」在架构里怎么用。
+%  右扰动为主线；网络 f_θ；光流场 f^flow (避让 dense 章视线 \mathbf{f})。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。它们勾勒了本章——也是\emph{学习时代}这一部——要回答的核心疑问。若已能流畅作答，可只速读本章的框架图与速查表；若卡住，正是本章要为你打通的。
+\begin{enumerate}
+  \item 经典后端的母方程 $\arg\min_X\sum_k\|h_k(X_k)-\mathbf{z}_k\|^2_{\boldsymbol\Omega_k}$ 里，残差函数 $h_k$ 与权重 $\boldsymbol\Omega_k$ 是\emph{谁}设计的？如果把它们交给一个神经网络去学，整套框架会塌掉吗？
+  \item 一个网络直接吃两张图、吐出相对位姿 $\mathbf{T}\in\SE(3)$，听上去很美。可为什么这类“端到端回归位姿”往往\emph{打不过}老老实实做几何的经典 SfM？问题出在哪一环？
+  \item “可微分 BA”里那个 BA 还是你在 \cref{ch:nlopt} 学的那个光束法平差吗？如果是，它怎么会“可微”——梯度要从 Gauss--Newton 的解\emph{反向}穿回到网络权重，这一步凭什么算得动？
+  \item DROID-SLAM 用稠密\emph{光流}当中间表示、再喂进 BA。为什么不让网络直接出深度和位姿，偏要绕一道光流？光流比位姿“好学”在哪里？
+  \item DUSt3R 干脆把整条 SLAM 流水线（找对应、建因子图、解优化）压成\emph{一次网络前向}，从两张\emph{无标定无位姿}的图直接吐出三维点云。这是否意味着因子图与 BA 被淘汰了？大场景重建里它还需要优化吗？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}“学习赋能 SLAM”的统一立场——它\emph{不}推翻 \cref{eq:intro-nls} 的 MAP 母方程，而是把方程里的\emph{残差} $\mathbf{e}_\theta$、\emph{权重} $\boldsymbol\Sigma_\theta$、乃至\emph{状态表示}（pointmap）换成可学习的，并据此把本章三条主线（替换组件、端到端可微分 BA、pointmap 全栈）排进同一坐标；
+  \item \textbf{复述}用网络预测三维属性（单图深度、相对位姿、光度不确定性）增强经典 SLAM 的几条路径，并解释为何“位姿直接回归”不如把几何\emph{嵌进}系统（D3VO/DVSO 的因子化思路）；
+  \item \textbf{推导}把\emph{光流}当视觉测量的因子图（\cref{eq:learn-flow-cost}）：由位姿与逆深度诱导的光流预测函数、以及“给定光流反解位姿与深度”的最小二乘——并说清它与 \cref{ch:vo} 重投影 BA 的同构关系；
+  \item \textbf{解释}可微分 BA 的核心思想（用网络“塑造”代价函数 $J(\mathbf{x})=\|\mathbf{e}_\theta\|^2_{\boldsymbol\Sigma_\theta}$，\cref{eq:learn-diffba-cost}），并\textbf{看懂} DROID-SLAM 的迭代更新算子：相关金字塔 $\to$ Conv-GRU $\to$ 光流修正 $\delta\mathbf{f}$ 与置信 $w$ $\to$ 展开式 BA；其反传机理交给 \cref{sec:nlopt-diffopt}，本章只用其结论；
+  \item \textbf{掌握} pointmap 范式（\cref{eq:learn-pointmap}）：DUSt3R 如何从无标定无位姿图像对回归同坐标系点图 $\mathbf{X}$ 与置信图，以及如何从点图下游恢复内参、相对位姿与多图全局对齐（仍是一个因子图！）；MASt3R 的匹配头与 SLAM 化；
+  \item \textbf{辨析}三条主线的取舍与失效边界（端到端回归的泛化与累积、可微分 BA 的回环能力、pointmap 的两视局限与全局对齐成本），并把每条线\emph{定位}回经典框架的哪一块。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是全书“经典 $\to$ 学习”弧线（\cref{sec:intro-frontier}）的\textbf{桥头堡}：前面整部 SLAM（\cref{ch:vo,ch:nlopt,ch:loop,ch:dense}）把残差、权重、对应关系都\emph{手工}设计好；本章问的是——\emph{当这些手工件被神经网络逐步接管，因子图与 BA 还在不在？}答案是：在，而且成了\emph{可微的一层}。我们沿“替换组件 $\to$ 端到端可微分 BA $\to$ pointmap 全栈”三级深入，深度学习介入得一级比一级彻底，却始终扣着同一条母方程。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  bk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (eq) {母方程\\$\min\sum\|\mathbf{e}_i\|^2_{\boldsymbol\Sigma_i}$};
+\node[blk, right=of eq] (pred) {替换组件\\深度/位姿/特征/光流};
+\node[grp, right=of pred] (flow) {光流即测量\\因子图重写};
+\node[grp, below=8mm of eq] (diffba) {可微分 BA\\$\mathbf{e}_\theta,\boldsymbol\Sigma_\theta$ 可学};
+\node[grp, right=of diffba] (droid) {DROID-SLAM\\迭代更新算子};
+\node[grp, right=of droid] (dpvo) {DPVO\\稀疏 patch};
+\node[bk, below=8mm of diffba] (dust3r) {DUSt3R\\pointmap};
+\node[bk, right=of dust3r] (align) {全局对齐\\（又是因子图）};
+\node[bk, right=of align] (mast3r) {MASt3R\\匹配头 + SLAM};
+\draw[ln] (eq)--(pred); \draw[ln] (pred)--(flow);
+\draw[ln] (flow.south) -- ++(0,-4.5mm) -| (diffba.north);
+\draw[ln] (diffba)--(droid); \draw[ln] (droid)--(dpvo);
+\draw[ln] (diffba.south) -- (dust3r.north);
+\draw[ln] (dust3r)--(align); \draw[ln] (align)--(mast3r);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:learning-frame}（统一立场，把学习框进母方程）是全章的“锚”，任何读者都应先读；\cref{sec:learning-predict}（用网络预测深度/位姿/特征/光流增强经典系统）门槛最低，是替换组件这一级；\cref{sec:learning-diffba}（可微分 BA 与 DROID-SLAM）是全章理论核心，含光流因子图与迭代更新算子的完整解剖——其反传机理在 \cref{sec:nlopt-diffopt} 已自包含，这里只用结论；\cref{sec:learning-pointmap}（pointmap 范式）是介入最彻底的一级。带（选读）标记的 DPVO patch 图、MASt3R-SLAM 系统细节、近期趋势面向研究，可选深潜。
+
+\subsection*{前置知识桥接}
+本章把前几部的工具与这一部的“学习”视角缝在一起，请先激活以下前置：
+\begin{itemize}
+  \item \textbf{MAP 母方程与因子图}（\cref{sec:intro-two-views,eq:intro-nls}；\cref{ch:nlopt}）：$\arg\min_X\sum_k\|h_k(X_k)-\mathbf{z}_k\|^2_{\boldsymbol\Omega_k}$ 是本章一切“学习层”的接驳口——可微分 BA 只是把 $h_k,\boldsymbol\Omega_k$ 换成网络，pointmap 全局对齐仍是它的一个实例。
+  \item \textbf{重投影误差与 BA}（\cref{sec:vo-pnp-ba,sec:nlopt-ba}）：本章的“光流因子”与重投影因子同构（都是“把三维结构按位姿投到像平面、比对观测”），\cref{eq:learn-flow-pred} 的光流预测函数即重投影之差。
+  \item \textbf{光流与直接法}（\cref{sec:vo-flow,sec:vo-direct}）：经典 Lucas--Kanade 把光流写成灰度不变下的优化；本章的 RAFT 把它换成“相关体 $+$ 迭代更新”的学习器，是 \cref{sec:vo-flow} 的网络化升级。
+  \item \textbf{可微优化（双层优化 / 隐式微分 / HVP）}（\cref{sec:nlopt-diffopt}）：\textbf{本章的命脉前置}。“梯度如何从 BA 的最优解反传回网络权重”——展开式微分、隐函数定理、海森-向量积——已在那里自包含推导。本章\emph{不重复}这套通用机理，只在用到处 \cref{sec:nlopt-diffopt} 引过去，聚焦“BA 作为一层”在 SLAM 架构里怎么搭。
+  \item \textbf{深度地点识别}（\cref{sec:loop-dl}）：本书已讲过位姿回归（PoseNet）与 NetVLAD 用于\emph{重定位/回环}；本章补的是位姿回归用于\emph{里程计}时的累积误差，与那条线互补、交叉引用。
+  \item \textbf{单目稠密与深度滤波}（\cref{sec:dense-depth-filter}）：本章的学习式单图深度与多视稠密，可与那里的概率深度滤波对照——“学习式稠密”某种意义上是“把逐像素深度滤波器换成一个吃过海量数据的网络”。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会看到 DROID-SLAM、DPVO、DUSt3R/MASt3R 这些近年屠榜的系统，却以为它们是与经典 SLAM \emph{无关}的“另一套深度学习”，从而既学不会把网络\emph{接进}自己的因子图，也读不懂它们其实仍在解 \cref{eq:intro-nls} 的母方程；
+  \item 在后续各章——动态与可变形（\cref{ch:dynamic}）、度量-语义（\cref{ch:semantic}）、开放世界（\cref{ch:openworld}）——你会反复遇到“网络出残差 / 网络出特征 / 网络出表示”的套路；本章是这一整部的\emph{方法论入口}，跳过它，后面每章都要从头解释“学习怎么接进几何”。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+本章在前几部记号上新增一层“学习层”符号，并\emph{严格避让}全书已占用者，登记如下。
+\textbf{网络}统一记 $f_\theta$（下标 $\theta$ 为可学习参数；与 \cref{sec:loop-dl} 的 NetVLAD 描述子记法一致）；网络产出的\emph{学习式残差}记 $\mathbf{e}_\theta$、\emph{学习式协方差/信息}记 $\boldsymbol\Sigma_\theta$（与全书 $\boldsymbol\Sigma/\boldsymbol\Omega=\boldsymbol\Sigma^{-1}$ 同体系，只是由网络给出）。
+\textbf{相机位姿}沿用 $\mathbf{T}\in\SE(3)$ 与\emph{本书帧下标} $\mathbf{T}_{ij}$（把 $j$ 系坐标变到 $i$ 系；\textbf{Handbook 原文的上下标式 $\mathbf{T}_i^j$ 一律改写为本书下标式}，见 \nameref{ch:notation}）；扰动\textbf{以右扰动为主线} $\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol\xi)$（局部参数化，正合 \cref{sec:nlopt-manifold}）。
+\textbf{逆深度}沿用 $\rho_{\mathrm{inv}}=1/d$（\cref{sec:dense-depth-filter}），稠密深度图记 $\mathbf{d}$。
+\textbf{光流场}记 $\mathbf{f}^{\mathrm{flow}}$、其网络修正量记 $\delta\mathbf{f}$、逐像素\emph{置信权重}记 $w$（\textbf{注意}：本书 \cref{ch:dense} 用 $\mathbf{f}$ 表“单位视线方向”、$\mathbf{w}$ 表过程噪声，故本章光流一律带上标 $^{\mathrm{flow}}$、置信权重用标量 $w_{ij}$ 并组成对角阵 $\boldsymbol\Sigma_{ij}^{-1}=\mathrm{diag}\,w_{ij}$ 以避歧义）。
+\textbf{pointmap（点图）}记 $\mathbf{X}\in\mathbb{R}^{W\times H\times 3}$（一张二维像格上每点配一个三维坐标），其逐像素\emph{置信图}记 $\mathbf{C}$；$\mathbf{X}^{m}$ 读作“在 $m$ 号相机坐标系下表达的点图”。
+\textbf{相关体}记 $\mathbf{C}^{\mathrm{corr}}$（与置信图 $\mathbf{C}$ 区分）。帧图（frame graph）记 $\mathcal{G}=(\mathcal V,\mathcal E)$，与因子图同构。投影/反投影记 $\boldsymbol\pi,\boldsymbol\pi^{-1}$（\cref{ch:camera}）。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{统一立场：把学习框进母方程}
+\label{sec:learning-frame}
+
+\paragraph{动机：经典框架的“接口”而非“替身”。}
+深度学习在图像分割、光流、蛋白质结构预测上的成功，靠的是“大规模标注数据 $+$ 高度过参数化的网络 $+$ 强表示”，从输入直接学到标签的映射\cite{teed2026boosting}。一个自然的问题是：能不能把这套成功搬到 SLAM？最朴素的想法是“端到端”——让一个网络吃进视频、直接吐出轨迹和地图。但只要回到本书反复打磨的母方程，就会看清：这既不必要，也不是最好的切入点。回忆 \cref{sec:intro-two-views} 推出的、贯穿全书后端的\textbf{MAP 母方程}（\cref{eq:intro-nls}）：现代 SLAM 的后端，本质上是在因子图上解一个非线性最小二乘
+\begin{equation}
+  X^\star=\arg\min_X\ \sum_{i} \big\|\mathbf{e}_i(\mathbf{x}_i)\big\|_{\boldsymbol\Sigma_i^{-1}}^2,
+  \qquad \mathbf{e}_i(\mathbf{x}_i)=\mathbf{z}_i-\mathbf{h}_i(\mathbf{x}_i),
+  \label{eq:learn-mother}
+\end{equation}
+其中 $\mathbf{e}_i$ 是“世界模型与观测之差”的\emph{残差}（特征点法里它是重投影误差、直接法里是光度误差，\cref{ch:vo}），$\boldsymbol\Sigma_i$ 是它的\emph{权重}（信息矩阵 $\boldsymbol\Sigma_i^{-1}$，\cref{ch:nlopt}）。整本书前半部，残差函数 $\mathbf{h}_i$ 与权重 $\boldsymbol\Sigma_i$ 都是\emph{人}根据几何与传感器物理\emph{手工}写下的。
+
+\begin{insight}[本章的统一立场——一句话]
+\textbf{“学习赋能 SLAM”不是推翻 \cref{eq:learn-mother}，而是把方程里手工设计的几样东西逐一交给网络去学：}残差 $\mathbf{e}_i\!\to\!\mathbf{e}_\theta$、权重 $\boldsymbol\Sigma_i\!\to\!\boldsymbol\Sigma_\theta$、对应关系（数据关联）、乃至\emph{状态表示本身}（从“位姿 $+$ 路标”换成 pointmap）。介入越深，被网络接管的部分越多，但\emph{优化即推断}这条主干始终未变——因子图与 BA 不仅没被淘汰，反而成了网络可以\emph{反向传播穿过}的一层。本章三节正是按“介入深度”递增排列的。
+\end{insight}
+
+\paragraph{三级介入，一条母方程。}
+\cref{tab:learn-spectrum} 把本章三条主线放进同一坐标：它们的差别只在“母方程的哪些零件被网络接管”。这张表就是本章的地图。
+
+\begin{table}[H]\centering\small
+\caption{学习赋能 SLAM 的三级介入：被网络接管的母方程零件}
+\label{tab:learn-spectrum}
+\begin{tabular}{p{0.17\textwidth} p{0.30\textwidth} p{0.27\textwidth} p{0.14\textwidth}}
+\toprule
+介入级别 & 网络接管了什么 & 母方程怎么变 & 本章 \\
+\midrule
+\textbf{替换组件}\newline（最浅） & 单图深度、相对位姿、特征/描述子、光流——当作\emph{额外观测}或更好的对应 & 在 \cref{eq:learn-mother} 里\emph{新增因子}（深度因子、位姿因子）或替换 $\mathbf{z}_i$（学习式光流/匹配作测量） & \cref{sec:learning-predict} \\
+\textbf{可微分 BA}\newline（端到端） & 残差 $\mathbf{e}_\theta$ 与协方差 $\boldsymbol\Sigma_\theta$ 一起由网络给出；优化层\emph{可反传}、端到端训练 & $J(\mathbf{x})=\|\mathbf{e}_\theta(\mathbf{z},\mathbf{x})\|^2_{\boldsymbol\Sigma_\theta(\mathbf{z},\mathbf{x})}$（\cref{eq:learn-diffba-cost}）；网络“塑造”代价地形 & \cref{sec:learning-diffba} \\
+\textbf{pointmap 全栈}\newline（最深） & 连\emph{状态表示}都换：一次前向从无标定无位姿图像直出三维点图 & 因子图被压进网络；但多图拼接\emph{仍要}一个全局对齐因子图（\cref{eq:learn-pointmap-align}） & \cref{sec:learning-pointmap} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[把“学习式 SLAM”当成“扔掉几何、纯靠网络”]
+最常见的误解，是以为深度学习要把 \cref{ch:vo,ch:nlopt} 的对极几何、三角化、BA 统统替换成一个黑箱网络。事实恰相反：本章最成功的几个系统（DROID-SLAM、DUSt3R/MASt3R）都\emph{保留}了几何核心——前者把 BA 做成可微的一层、后者在多图重建时又退回因子图全局对齐。\textbf{几何不是被学习取代，而是被学习\emph{包裹}}：网络负责它擅长的（从像素里榨出鲁棒的对应、深度、置信），几何负责它擅长的（用刚体约束把这些证据\emph{一致地}融成轨迹与地图）。读本章时，每遇到一个系统，先问一句：\emph{它把母方程的哪个零件换成了网络？几何核心还在哪里？}
+\end{pitfall}
+
+\paragraph{为什么不一步到位“端到端回归位姿”。}
+也有人确实尝试过最激进的路线——网络直接吃视频、回归整条轨迹。本章 \cref{sec:learning-predict} 会看到，这类方法（PoseNet/DeepVO 一系）虽可行，却\emph{系统性地打不过}把几何嵌进系统的做法\cite{teed2026boosting}。直觉上的原因，正是本书一以贯之的立场：几何约束（对极、刚体、投影）是\emph{免费的、精确的先验}，硬要网络从数据里把它们“重新学一遍”，既浪费样本、又难泛化。所以本章真正的主角，是\emph{把几何留在环里、让网络只补它补得最好的那块}——这也解释了为何介入最浅的“替换组件”和介入最深的“pointmap”都没有丢掉因子图。
+
+% ════════════════════════════════════════════════════════════════
+\section{替换组件：用网络预测深度、位姿、特征与光流}
+\label{sec:learning-predict}
+
+介入最浅的一级，是\emph{保留}经典流水线、只把其中某个手工模块换成网络。换法又分两类：(i) 让网络直接预测\emph{三维属性}（深度、位姿），当作母方程的\emph{额外因子}或初值（本节前半）；(ii) 让网络预测更鲁棒的\emph{观测}（特征、匹配、光流），即母方程里的 $\mathbf{z}_i$（本节后半）。后者往往比前者更可靠——道理我们在 \cref{sec:learning-frame} 已点破：让网络补它擅长的（从像素榨证据），把几何留在环里。
+
+\subsection{学习式深度：抵御单目尺度漂移}
+\label{sec:learning-depth}
+
+\paragraph{从单图回归深度。}
+给定海量“图像-深度”配对（来自深度相机、激光雷达，或渲染引擎合成的三维数据集），网络可学到从单张图像到稠密深度图的映射 $f_\theta:\;I\mapsto\mathbf{d}$\cite{teed2026boosting}。这一思路自 Eigen 等\cite{eigen2014depth} 用卷积网络首次实现以来持续演进；现代单图深度网络多用预训练的视觉 Transformer（ViT，\cref{sec:learning-pointmap} 还会再遇到它）做主干、配卷积解码器上采样，并在二十余个真实与合成数据集的并集上训练以求泛化\cite{ranftl2021dpt}。
+
+\paragraph{为什么这对单目 SLAM 是雪中送炭。}
+回忆 \cref{thm:intro-scale}：单目 SLAM 有\emph{尺度不确定性}，且单纯靠视差恢复的尺度会随里程\emph{漂移}。若网络能直接给出\emph{度量}深度（带真实单位的米），就能用它\emph{钉住}尺度——把“预测深度”与“SLAM 解出的深度”的一致性写成母方程里的\emph{一个深度因子}，迫使单目重建不再漂移\cite{teed2026boosting}。这也正是 \cref{sec:learning-diffba} 里 DROID-SLAM 推广到 RGB-D 时所加的那个深度因子（\cref{eq:learn-droid-rgbd}）的雏形——只不过那里的“深度”来自传感器，这里来自网络。除抵御尺度漂移外，深度先验还能在\emph{纯旋转}、\emph{相机参数突变}、\emph{动态物体}等经典退化情形里救场。
+
+\paragraph{从稀疏到稠密：代价体与动态掩膜（选读）。}
+特征点法的重建是\emph{稀疏}的，弱纹理处几乎没有点。要补成稠密，最直接是为每帧预测稠密深度、再用 SLAM 位姿把所有像素抬进三维累积。但单图深度网络逐帧预测会在相邻帧间\emph{几何不一致}，且动态物体会在静态重建里拖出“鬼影”。一种代表性补救（如 MonoRec\cite{wimbauer2021monorec}）是：为每帧 $I_t$ 沿邻帧聚合一个\emph{代价体}（cost volume）$C_t(\rho_{\mathrm{inv}})$——在若干离散（逆）深度上比对各像素的光度一致性，给网络更多多视上下文以产出几何一致的深度；同时另起一个\emph{掩膜网络}从代价体预测\emph{运动物体分割}，把动态像素在抬入三维时剔除。这其实是把 \cref{sec:dense-depth-filter} 的“多视深度估计 $+$ 外点剔除”整体网络化了。更进一步，有方法（如 BTS）不预测深度图而预测\emph{体积密度场} $\phi(\mathbf{x}):\mathbb{R}^3\to\mathbb{R}^+$——给相机视锥内任一点一个密度，连\emph{遮挡背后}的区域也补全；从密度场经体渲染即可合成新视角。体渲染的积分形式属神经渲染范畴，本书在结语部分（\cref{ch:epilogue}）指明其归属，此处只取其“稠密化”用途。
+
+\subsection{学习式位姿回归：为何不如把几何嵌进系统}
+\label{sec:learning-pose}
+
+\paragraph{两视位姿回归与其累积病。}
+对称地，网络也能吃一对图像 $I_1,I_2$、直接回归相对位姿 $\mathbf{T}_{12}=f_\theta(I_1,I_2)\in\SE(3)$。训练时以真值位姿 $\mathbf{T}_{12}^\star$ 监督，损失取\emph{本书右扰动度量}下两位姿之差（把 Handbook 原文抽象的 $\|(\mathbf{T}_1^2)^{-1}\mathbf{T}_1^{2\star}\|$ 落到本书记号）：
+\begin{equation}
+  \mathcal{L}_{\mathrm{pose}}
+  =\big\|\,\mathrm{Log}\!\big(\mathbf{T}_{12}^{-1}\,\mathbf{T}_{12}^{\star}\big)\big\|^2,
+  \qquad \mathbf{T}_{12}=f_\theta(I_1,I_2),
+  \label{eq:learn-pose-loss}
+\end{equation}
+其中 $\mathrm{Log}:\SE(3)\to\mathbb{R}^6$ 把“预测与真值之差”这个相对位姿拉回李代数度量（\cref{ch:lie}）；也可只罚旋转角或四元数距离。把相邻帧的相对位姿\emph{链式相乘}即得整条轨迹。这正是 \cref{sec:loop-dl} 提到的 PoseNet/DeepVO 一系——本书已在那里讲过它们\emph{用于重定位}；这里补它们\emph{用于里程计}时的要害。
+
+\begin{insight}[位姿回归用于里程计的累积病，与经典漂移同源]
+两视回归的相对位姿误差，会沿链式相乘\emph{累积}成长程漂移——这与 \cref{ex:intro-drift} 里经典 VO 的“一度之差”\emph{同源}：都是“相邻估计独立、误差只进不出”。补救之一是用\emph{循环网络}（DeepVO 的 LSTM）吃一\emph{段}帧、输出一\emph{段}位姿，让网络隐式记住更长历史；另一是给输入补上预测光流与内参（TartanVO）以改善泛化。但即便如此，\textbf{直接回归位姿仍系统性地不如把几何深植于系统的经典 SfM/SLAM}\cite{teed2026boosting}：几何约束（对极、投影）是精确的免费先验，硬让网络从数据里重学既费样本又难泛化，且这类网络易\emph{过拟合}训练分布。这条经验，正是 \cref{sec:learning-frame} “把几何留在环里”立场的实证，也直接催生了下一级——可微分 BA：与其让网络\emph{替代}几何，不如让它\emph{喂养}几何。
+\end{insight}
+
+\paragraph{自监督：用视图合成代替三维真值。}
+监督深度/位姿都需三维真值，未必易得。一条绕开真值的路是\emph{视图合成}（view synthesis）自监督\cite{godard2017unsupervised,zhou2017unsupervised}：给定 $I_1,I_2$ 与相对位姿 $\mathbf{T}_{12}$、深度图 $\mathbf{d}$，可把 $I_2$ 的像素\emph{反向映射}（warp）到 $I_1$ 视角。记投影 $\boldsymbol\pi$、反投影 $\boldsymbol\pi^{-1}$（\cref{ch:camera}），像素 $\mathbf{x}^1$（深度 $d^1$）在 $I_2$ 里的对应是
+\begin{equation}
+  \mathbf{x}^2=\boldsymbol\pi\!\big(\mathbf{T}_{21}\,\boldsymbol\pi^{-1}(\mathbf{x}^1,d^1)\big)
+  =\omega_{1\to2}(\mathbf{x}^1,d^1),
+  \label{eq:learn-warp}
+\end{equation}
+于是合成图 $\tilde I_2(\mathbf{x})=I_1\big(\omega_{1\to2}(\mathbf{x},\mathbf{d}(\mathbf{x}))\big)$（$I_1(\cdot)$ 取\emph{双线性插值}）。双线性插值对像素坐标\emph{局部可微}，故合成图对深度与位姿可导——把“合成图与真实图的光度差”当损失，就能\emph{无三维真值}地联合训练深度网与位姿网。注意 \cref{eq:learn-warp} 与 \cref{sec:vo-direct} 直接法的\emph{光度残差}是同一个 warp，只是这里用它训网络、那里用它估运动。
+
+\paragraph{把网络预测“因子化”进直接法：DVSO 与 D3VO。}
+比“纯回归”高明得多的用法，是把网络预测\emph{当作因子}喂进经典系统。本书直述两种代表方法。\emph{其一}，把视图合成自监督训出的\emph{单目深度}加进直接法 VO（如 DSO，\cref{sec:vo-direct}）：在代价里添一项“鼓励 SLAM 深度贴合网络深度”的因子，单目系统由此获得近乎双目的精度与\emph{度量尺度}（DVSO 称之“虚拟双目”——网络替单目“幻视”出第二个相机）\cite{yang2018dvso}。\emph{其二}，更进一步同时喂\emph{深度、相对位姿与光度不确定性}三样（D3VO\cite{yang2020d3vo}）：真实世界的光度一致性对\emph{非朗伯面}（金属、玻璃）不成立，显式建模反射代价太高；于是训一个网络预测“哪里的颜色跨帧可靠”，把不可靠处的光度残差\emph{降权}——这恰是给母方程的权重 $\boldsymbol\Sigma_i$ 注入\emph{学习式}的逐像素不确定性，已经一只脚踏进了下一节的“可微分 BA”。
+
+\begin{insight}[降权非朗伯面 $=$ 学习式鲁棒核]
+D3VO 用网络预测光度不确定性、再据此给残差降权，与 \cref{sec:nlopt-robust} 的\emph{鲁棒核}（M-估计）异曲同工：鲁棒核按\emph{残差大小}自适应降权（“看上去像外点就少信”），D3VO 则按\emph{网络对该像素的信心}降权（“网络觉得这里颜色不可靠就少信”）。前者是\emph{手工设计}的权函数、后者是\emph{从数据学}的权函数——又一次印证本章主线：母方程的零件（这里是权重 $\boldsymbol\Sigma_i$）正被逐个换成可学习的。
+\end{insight}
+
+\subsection{学习式特征与匹配：升级母方程里的对应关系}
+\label{sec:learning-feature}
+
+\paragraph{学习关键点与描述子。}
+特征点法（\cref{sec:vo-feature}）靠手工检测子（FAST/Harris）找关键点、手工描述子（ORB/BRIEF）做匹配。网络可\emph{同时}学这两件事：如 SuperPoint\cite{detone2018superpoint} 用一个卷积网络既\emph{检测}显著点、又给每个点\emph{赋}描述子；通常以\emph{对比损失}训练——让匹配点的描述子相近、非匹配点的相远。训好后即可\emph{即插即用}地替换经典前端的特征模块，在弱纹理、强光照变化下往往更鲁棒。这与 \cref{sec:loop-dl} 的 NetVLAD 同属“学习式视觉表示”，只是那里学\emph{全图}描述子做地点识别、这里学\emph{局部}描述子做几何匹配。
+
+\paragraph{学习匹配：注意力出分配矩阵。}
+给定两图的关键点集，匹配本身也能交给网络。SuperGlue\cite{sarlin2020superglue} 用\emph{自注意力}（图内点互相看）与\emph{交叉注意力}（跨图点互相看）反复更新每个关键点的特征向量，最后输出一个\emph{分配矩阵}——每个点匹配到另一图各点（外加一个“不匹配”列）的似然；LightGlue\cite{lindenberger2023lightglue} 在精度与速度上进一步改良。它们的共性，是把“匹配”从硬性的最近邻搜索，升级为\emph{可学习、带全局上下文}的软分配。
+
+\paragraph{无检测器稠密匹配。}
+SuperGlue/LightGlue 仍受限于\emph{稀疏}关键点，弱纹理处可匹配的点本就少。LoFTR\cite{sun2021loftr} 干脆\emph{不检测关键点}，直接在稠密特征格上做自/交叉注意力、产出\emph{稠密}匹配（先在粗分辨率匹配、再在细分辨率精化以省算力）。无论稀疏还是稠密，这些网络产出的匹配都可\emph{直接}当作母方程里的视觉测量 $\mathbf{z}_i$ 及其因子——几何后端\emph{原样不动}，只是吃到了更干净的对应。
+
+\subsection{学习式光流：RAFT 作为 DROID 的基石}
+\label{sec:learning-flow}
+
+\paragraph{光流即逐像素运动，可当视觉测量。}
+光流（optical flow）是匹配的“稠密极限”——估计一对帧间\emph{每个像素}的运动，得到一个流场 $\mathbf{f}^{\mathrm{flow}}$。这个流场可直接当作因子图 SLAM 的视觉测量（\cref{sec:learning-diffba} 正是这么用的）。经典上，光流被写成“数据项（视觉相似）$+$ 正则项（运动平滑）”的优化（\cref{sec:vo-flow} 的 Lucas--Kanade 即一例）；近年学习式光流后来居上，其中 RAFT\cite{teed2020raft} 因是 DROID-SLAM 的基石，值得作为“学习式光流”的样板拆开看。
+
+\paragraph{RAFT 的三件套：相关体、查找、迭代更新。}
+RAFT 巧妙地把深度学习与“一阶迭代优化”的思想缝在一起，三个关键件如下\cite{teed2020raft}：
+
+\emph{（1）相关体（correlation volume）。}\;先用一对残差网络把两图编码成低分辨率特征图（默认 $1/8$ 分辨率）。设 $g_\theta(I_1),g_\theta(I_2)$ 为两图特征，对\emph{所有}像素对取内积，得一个四维相关体
+\begin{equation}
+  \mathbf{C}^{\mathrm{corr}}_{ijkl}
+  =\big\langle g_\theta(I_1)_{ij},\ g_\theta(I_2)_{kl}\big\rangle
+  =\sum_m g_\theta(I_1)_{ijm}\,g_\theta(I_2)_{klm},
+  \label{eq:learn-raft-corr}
+\end{equation}
+它一次性算出“$I_1$ 每点与 $I_2$ 每点的视觉相似度”（实现上是一次 GPU 友好的矩阵乘）。相关体本身形如 $h\times w\times h\times w$（$h,w$ 为特征图边长，即输入的 $1/8$）。再对其\emph{后两维}（$I_2$ 一侧）反复平均池化，堆成 $4$ 级多分辨率\emph{相关金字塔} $\{\mathbf{C}^{\mathrm{corr},0},\dots,\mathbf{C}^{\mathrm{corr},3}\}$，其中第 $l$ 级 $\mathbf{C}^{\mathrm{corr},l}$ 形如 $h\times w\times \tfrac{h}{2^l}\times\tfrac{w}{2^l}$——\emph{只缩 $I_2$ 一侧、保 $I_1$ 全分辨率}，于是同一像素既能借细层看清小位移、又能借粗层覆盖大位移。
+
+\emph{（2）查找算子（lookup）。}\;给定\emph{当前}光流估计 $\mathbf{f}^{\mathrm{flow}}$，对 $I_1$ 中像素 $(u,v)$ 先算其在 $I_2$ 的估计对应 $(u',v')=(u,v)+\mathbf{f}^{\mathrm{flow}}(u,v)$，再以 $(u',v')$ 为心、取一个半径 $r$（超参）的\emph{邻域网格}
+\begin{equation}
+  N(u',v')=\big\{\,(u'+\Delta u,\ v'+\Delta v)\ \big|\ \Delta u,\Delta v\in\{-r,\dots,r\}\,\big\},
+  \label{eq:learn-raft-lookup}
+\end{equation}
+即一张 $(2r+1)\times(2r+1)$ 的整数偏移格。用它在最细层 $\mathbf{C}^{\mathrm{corr},0}$ 上\emph{双线性插值}采样；在第 $l$ 粗层则换用按比例缩放、以 $N(u'/2^l,\,v'/2^l)$ 为心的网格采样。把各层采到的相关特征\emph{拼接}成一个向量——它就是“当前流估计下，这块邻域的视觉证据长什么样”，并因金字塔多层并采，\emph{同时}握有小位移的细节与大位移的概览。
+
+\emph{（3）迭代更新算子（update operator）。}\;从零流场 $\mathbf{f}^{\mathrm{flow},0}=\mathbf{0}$ 出发，反复用一个\emph{权重共享}的卷积 GRU 更新流场。每步吃四样——上一步隐状态、上下文特征、当前流估计、查找来的相关特征——输出流场的\emph{增量} $\delta\mathbf{f}$，叠加得下一步：
+\begin{equation}
+  \mathbf{f}^{\mathrm{flow},k+1}=\mathbf{f}^{\mathrm{flow},k}+\delta\mathbf{f}^{k}.
+  \label{eq:learn-raft-iter}
+\end{equation}
+卷积让信息在图像上空间传播，权重共享与有界激活鼓励迭代收敛到一个\emph{不动点}。
+
+\begin{insight}[RAFT $=$“学过的”迭代优化器]
+\cref{eq:learn-raft-iter} 这种“当前估计 $\to$ 算增量 $\to$ 更新”的循环，与本书一以贯之的迭代优化（GN/LM 每步算 $\Delta\mathbf{x}$ 再更新，\cref{ch:nlopt}）\emph{形式完全一致}——区别在增量怎么来：GN 由解析雅可比与正规方程算出，RAFT 由一个\emph{学过怎么走}的 GRU 直接吐出。可以说 RAFT 是一台“从数据里学到了下降方向”的迭代优化器。正因这种“迭代更新”的骨架与 BA 的“迭代求解”天然合拍，下一节 DROID-SLAM 才能把 RAFT 的更新算子与一个\emph{真正的} BA 优化层无缝串起来——这是从“替换组件”跨入“可微分 BA”的关键一跃。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{可微分光束法平差与 DROID-SLAM}
+\label{sec:learning-diffba}
+
+这是本章理论的核心，也是“经典 $\to$ 学习”缝合得最紧的一节。\cref{sec:learning-predict} 的“替换组件”有一个软肋：各模块\emph{各自}训练，前一模块的误差会喂给后一模块、层层放大——光流网络是按“光流准不准”训的，并不直接对“位姿准不准”负责\cite{teed2026boosting}。治本之道，是把\emph{优化层本身}（BA）做成网络的一层、让监督信号从最终的位姿误差\emph{反向穿过}它，端到端地把整条链一起训出来。本节先把“光流当测量”的因子图写清楚（\cref{sec:learning-diffba-flow}），再点出“可微分 BA”的核心思想（\cref{sec:learning-diffba-core}），最后解剖 DROID-SLAM 怎么用它（\cref{sec:learning-diffba-droid}）。
+
+\subsection{光流即测量：与重投影 BA 同构的因子图}
+\label{sec:learning-diffba-flow}
+
+\paragraph{由位姿与逆深度诱导的光流。}
+先看几何方向：\emph{静态}场景里，一对帧间的光流完全由\emph{深度与相对位姿}决定。设两帧 $I_i,I_j$ 位姿为 $\mathbf{T}_{wi},\mathbf{T}_{wj}$（相机到世界，本书下标式）。像素 $(u,v)$ 配深度 $d$，先反投影到三维、再变到 $j$ 系、最后投到 $j$ 的像平面，与原像素之差即\emph{诱导光流}：
+\begin{equation}
+  \mathbf{h}_{ij}(\mathbf{T}_{wi},\mathbf{T}_{wj},\mathbf{d}_i)
+  =\boldsymbol\pi\!\Big(\mathbf{T}_{ji}\,\boldsymbol\pi^{-1}(u,v,\mathbf{d}_i)\Big)-\begin{bmatrix}u\\v\end{bmatrix},
+  \qquad \mathbf{T}_{ji}=\mathbf{T}_{wj}^{-1}\,\mathbf{T}_{wi},
+  \label{eq:learn-flow-pred}
+\end{equation}
+这里 $\boldsymbol\pi,\boldsymbol\pi^{-1}$ 已重载为作用在整张 $h\times w$ 像格上的稠密版本，$\mathbf{d}_i$ 是一张稠密（逆）深度图。把 \cref{eq:learn-flow-pred} 与 \cref{sec:vo-pnp-ba} 的重投影模型并排：重投影 BA 把\emph{路标点}按位姿投到像平面、比对\emph{观测像素}；这里把\emph{深度图抬出的点}按相对位姿投到另一帧、比对\emph{光流}。\textbf{两者是同一件事的两种记法}——都是“用位姿与结构预测一个像平面量、再与观测作差”。
+
+\paragraph{给定光流，反解位姿与深度。}
+有了预测函数，就能反过来用因子图\emph{求解}：取一组帧 $\{I_1,\dots,I_n\}$，建\emph{帧图} $\mathcal{G}$——边 $(i,j)\in\mathcal{E}$ 表示我们对帧 $i,j$ 间有一个光流测量 $\mathbf{z}_{ij}$（每条边生一个因子）。状态是所有位姿 $\{\mathbf{T}_{wi}\}$ 与稠密深度图 $\{\mathbf{d}_i\}$。把“状态应诱导出的光流”与“观测到的光流”之差写成最小二乘，即得\emph{光流因子图}的代价
+\begin{equation}
+  J(\mathbf{x})
+  =\sum_{(i,j)\in\mathcal{E}}
+  \big\|\,\mathbf{z}_{ij}-\mathbf{h}_{ij}(\mathbf{T}_{wi},\mathbf{T}_{wj},\mathbf{d}_i)\,\big\|_{\boldsymbol\Sigma_{ij}^{-1}}^2.
+  \label{eq:learn-flow-cost}
+\end{equation}
+这\emph{正是} \cref{eq:intro-nls} 母方程的一个实例（残差 $\mathbf{e}_{ij}=\mathbf{z}_{ij}-\mathbf{h}_{ij}$），其因子图每个因子牵三个变量：源帧位姿、目标帧位姿、源帧深度（\cref{fig:learn-flowgraph}）。两点参数化沿用全书约定：深度用\emph{逆深度} $\rho_{\mathrm{inv}}$（\cref{sec:dense-depth-filter}，使代价更接近二次、局部近似更好），位姿用\emph{右扰动}局部参数化 $\mathbf{T}_{wi}\,\mathrm{Exp}(\delta\boldsymbol\xi_i)$（\cref{sec:nlopt-manifold}）。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=10mm,
+  pose/.style={draw, circle, fill=main!12, draw=main!60!black, minimum size=8mm, inner sep=1pt},
+  dep/.style={draw, circle, fill=third!12, draw=third!60!black, minimum size=8mm, inner sep=1pt},
+  fac/.style={draw, fill=black, minimum size=1.6mm, inner sep=0pt},
+  ln/.style={thick, gray!55!black}]
+\node[pose] (T1) {$\mathbf{T}_{w1}$};
+\node[pose, right=20mm of T1] (T2) {$\mathbf{T}_{w2}$};
+\node[pose, right=20mm of T2] (T3) {$\mathbf{T}_{w3}$};
+\node[dep, below=9mm of T1] (d1) {$\mathbf{d}_1$};
+\node[dep, below=9mm of T2] (d2) {$\mathbf{d}_2$};
+\node[dep, below=9mm of T3] (d3) {$\mathbf{d}_3$};
+% factor between T1,T2,d1
+\node[fac] (f12) at ($(T1)!0.5!(T2)$) {};
+\draw[ln] (f12)--(T1); \draw[ln] (f12)--(T2); \draw[ln] (f12) to[bend right=10] (d1);
+\node[fac] (f23) at ($(T2)!0.5!(T3)$) {};
+\draw[ln] (f23)--(T2); \draw[ln] (f23)--(T3); \draw[ln] (f23) to[bend right=10] (d2);
+% long-range / loop edge T1-T3
+\node[fac] (f13) at ($(T1)!0.5!(T3)+(0,7mm)$) {};
+\draw[ln, dashed] (f13) to[bend left=12] (T1); \draw[ln, dashed] (f13) to[bend right=12] (T3);
+\draw[ln, dashed] (f13) to[bend left=8] (d1);
+\node[font=\scriptsize, second!50!black] at ($(f13)+(0,3.5mm)$) {长程边（中距回环）};
+\end{tikzpicture}
+\caption{光流因子图（仿 \cite{teed2026boosting,teed2021droid} 重绘）。圆圈为变量（位姿 $\mathbf{T}_{wi}$、稠密深度图 $\mathbf{d}_i$），黑方块为光流因子——每条帧图边生一个因子，牵\emph{源位姿、目标位姿、源深度}三者，残差为“诱导光流 \cref{eq:learn-flow-pred} 与观测光流之差”。实线为时序相邻边，虚线为帧间光流距离小于阈值时加入的长程边（中距回环，\cref{sec:learning-diffba-droid}）。它是 \cref{eq:intro-nls} 母方程在“光流测量”下的实例。}
+\label{fig:learn-flowgraph}
+\end{figure}
+
+\paragraph{为何绕一道光流，而不直接回归位姿。}
+\cref{eq:learn-flow-cost} 解答了本章前置自测的第 4 问。直接回归位姿（\cref{sec:learning-pose}）要网络从零学会多视几何（深度、位姿、内参怎样耦合），\emph{难学又难泛化}；而光流是\emph{逐像素的局部对应}，只关乎“这块纹理移到哪了”，远比全局位姿\emph{好学、好泛化}\cite{teed2026boosting}。把好学的光流交给网络、把多视几何交给 \cref{eq:learn-flow-cost} 的 BA——\emph{各司其职}，正是 DROID-SLAM 取胜的关键设计。
+
+\subsection{可微分 BA 的核心思想：让网络“塑造”代价地形}
+\label{sec:learning-diffba-core}
+
+\paragraph{把残差与权重都交给网络。}
+\cref{eq:learn-flow-cost} 里测量 $\mathbf{z}_{ij}$ 是网络给的、权重 $\boldsymbol\Sigma_{ij}$ 还是手工的。可微分 BA 把\emph{这两样都}交给网络：定义一个网络 $\mathbf{e}_\theta$，吃当前状态 $\mathbf{x}$（位姿等）与测量 $\mathbf{z}$（图像等），\emph{同时}吐出残差向量与（参数化的）协方差，把母方程写成
+\begin{equation}
+  \boxed{\;J(\mathbf{x})=\big\|\,\mathbf{e}_\theta(\mathbf{z},\mathbf{x})\,\big\|_{\boldsymbol\Sigma_\theta(\mathbf{z},\mathbf{x})}^{2}\;}
+  \label{eq:learn-diffba-cost}
+\end{equation}
+对比 \cref{eq:learn-mother}：经典后端\emph{手工}写 $\mathbf{e}_i,\boldsymbol\Sigma_i$，这里让网络 $\mathbf{e}_\theta,\boldsymbol\Sigma_\theta$ 去\emph{塑造}整个代价地形——网络可以决定“信哪个残差、信多少”，把优化的极小值\emph{往对的地方挪}。这是 \cref{tab:learn-spectrum} 中“可微分 BA”一级的数学核心，也是本章统一立场（残差 $+$ 权重换成可学的）最直白的体现。BANet\cite{tang2019banet} 是把 BA 接进端到端可训练架构的早期代表（它在网络抽取的特征图上定义光度误差）。
+
+\paragraph{“可微”从何而来：交给 \cref{sec:nlopt-diffopt}。}
+要端到端训练，就得让损失对网络参数 $\theta$ 的梯度\emph{穿过} \cref{eq:learn-diffba-cost} 的优化层——也就是求“BA 最优解 $\mathbf{x}^\star$ 如何随网络输出（残差/权重）而变”，再链式回传到 $\theta$。\textbf{这套“梯度如何穿过一个优化层”的通用机理，本书已在 \cref{sec:nlopt-diffopt} 自包含地给出}：它把“学习前端 $+$ 几何后端”写成\emph{双层优化}（\cref{eq:nlopt-blo}），并给了两条求间接梯度 $\partial\mathbf{x}^\star/\partial\theta$ 的路——\emph{展开式微分}（把 GN 的每步迭代摊成可自动微分的计算图、对整条链反传，见 \cref{eq:nlopt-blo} 及其后文）与\emph{隐式微分}（对最优性条件用隐函数定理求导，得 $\partial\mathbf{x}^\star/\partial\theta=-\mathbf{H}_{xx}^{-1}\mathbf{H}_{x\theta}$，\cref{eq:nlopt-implicit-grad}），并用\emph{海森-向量积}（HVP，\cref{eq:nlopt-hvp}）避免显式求海森逆。
+
+\begin{insight}[“一个作者、不重复”：本章只用结论，机理在 \cref{sec:nlopt-diffopt}]
+为何本章\emph{不}在此重推一遍反传？因为“可微优化”是一套\emph{通用}机理——它对任何把优化嵌进学习的场景都成立，不专属于 SLAM，故本书把它\emph{一次性}安放在非线性优化章（\cref{sec:nlopt-diffopt}），并已在那里用本书右扰动约定推导了展开式/隐式微分与 HVP。\textbf{本章只取其结论、聚焦“BA 作为一层”在 SLAM 架构里怎么搭}——即下面 DROID-SLAM 怎样把更新算子与 BA 层串起来。这正是“同一个作者写、不在两处重复同一推导”的连贯性。值得一提的是，\cref{sec:nlopt-diffopt} 点过的“把 BA 当网络一层”的陷阱（监督仍来自真值位姿、未真正双向连接前后端常\emph{次优}），与本章 \cref{sec:learning-pose} 位姿回归的累积病同根——真正的好处来自让前端从\emph{几何优化本身}学习。
+\end{insight}
+
+\subsection{DROID-SLAM：迭代更新算子 \texorpdfstring{$+$}{+} 展开式 BA}
+\label{sec:learning-diffba-droid}
+
+DROID-SLAM\cite{teed2021droid} 是把上述思想跑通的第一个成功系统——可视为“RAFT 的迭代更新算子”与“\cref{eq:learn-flow-cost} 的光流 BA”的结合体。它吃一段图像与一个帧图、吐出位姿与深度序列。
+
+\paragraph{架构：复用 RAFT，按帧图边并行。}
+DROID 复用 RAFT（\cref{sec:learning-flow}）的两支特征提取器（上下文编码器 $+$ 外观编码器，均出 $1/8$ 分辨率特征），并\emph{为帧图每条边} $(i,j)$ 建一个相关金字塔。更新算子（一个卷积 GRU）\emph{对称地作用在每条边上}：每次迭代，用\emph{当前}位姿与深度经 \cref{eq:learn-flow-pred} 算出每条边的诱导光流，查找相关特征，再吐出该边的光流修正 $\delta\mathbf{f}_{ij}$ 与一张逐像素\emph{置信图} $w_{ij}$（\cref{fig:learn-droid}）。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=6mm,
+  box/.style={draw, rounded corners, align=center, minimum height=8mm, inner sep=3pt},
+  n/.style={box, fill=main!8, draw=main!60!black},
+  g/.style={box, fill=second!8, draw=second!60!black},
+  b/.style={box, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!55!black}]
+\node[n] (img) {图像段\\$(I_1,\dots,I_n)$};
+\node[n, right=8mm of img] (corr) {相关金字塔\\（每边一个）};
+\node[g, right=8mm of corr] (gru) {Conv-GRU\\更新算子};
+\node[g, right=8mm of gru] (out) {$\delta\mathbf{f}_{ij},\,w_{ij}$};
+\node[b, below=9mm of gru] (ba) {可微分 BA\\展开 GN 数步};
+\node[b, left=8mm of ba] (state) {位姿 $\mathbf{T}_{wi}$\\深度 $\mathbf{d}_i$};
+\draw[ln] (img)--(corr); \draw[ln] (corr)--(gru); \draw[ln] (gru)--(out);
+\draw[ln] (out.south) |- (ba.east);
+\draw[ln] (ba)--(state);
+\draw[ln] (state.north) |- node[pos=0.25,left,font=\scriptsize]{诱导光流 \cref{eq:learn-flow-pred}} (gru.west);
+\draw[ln, dashed, second!60!black] (state) to[bend left=18] node[below,font=\scriptsize]{迭代回灌} (corr);
+\end{tikzpicture}
+\caption{DROID-SLAM 一次迭代的数据流（仿 \cite{teed2021droid,teed2026boosting} 重绘）。当前位姿/深度经 \cref{eq:learn-flow-pred} 算诱导光流 $\to$ 查找相关特征 $\to$ Conv-GRU 出光流修正 $\delta\mathbf{f}_{ij}$ 与置信 $w_{ij}$ $\to$ 喂入可微分 BA（\cref{eq:learn-droid-cost}），展开数步 Gauss--Newton 更新位姿与深度 $\to$ 回灌下一迭代。反传穿过每步 GN（机理见 \cref{sec:nlopt-diffopt}），端到端训练。}
+\label{fig:learn-droid}
+\end{figure}
+
+\paragraph{可微分 BA 层：让光流修正驱动状态更新。}
+关键在于：网络不直接出位姿，而是出光流修正与置信，再由一个 BA 层把它们\emph{翻译}成位姿与深度的更新。把置信 $w_{ij}$ 摆成对角权重 $\boldsymbol\Sigma_{ij}^{-1}=\mathrm{diag}\,w_{ij}$，构造代价
+\begin{equation}
+  J(\mathbf{x})
+  =\sum_{(i,j)\in\mathcal{E}}
+  \Big\|\,\delta\mathbf{f}_{ij}-\big[\mathbf{h}_{ij}(\mathbf{x}_{ij})-\mathbf{h}_{ij}(\mathbf{x}_{ij}^{0})\big]\,\Big\|_{\boldsymbol\Sigma_{ij}^{-1}}^2,
+  \label{eq:learn-droid-cost}
+\end{equation}
+其中 $\mathbf{x}_{ij}^0$ 是本次迭代起点的位姿与深度。这个代价在说：\emph{更新状态，使诱导光流的变化量 $\mathbf{h}_{ij}(\mathbf{x}_{ij})-\mathbf{h}_{ij}(\mathbf{x}_{ij}^0)$ 去匹配网络预测的修正 $\delta\mathbf{f}_{ij}$}；置信 $w_{ij}$ 让网络对“自己有把握的像素”加大话语权——这正是 \cref{eq:learn-diffba-cost} 让网络\emph{塑造}代价地形的具体落地。位姿与深度的更新由\emph{展开数步} Gauss--Newton 得到（\cref{sec:nlopt-gn}），训练时梯度穿过每一步 GN（用 \cref{sec:nlopt-diffopt} 的展开式微分）。这条因子图的稀疏结构（位姿少、逐像素深度多）与 \cref{sec:nlopt-sparse} 的 BA 稀疏性同型，故同样用 Schur 消元高效求解。
+
+\paragraph{训练：合成数据 $+$ 位姿损失 $+$ 光流损失。}
+DROID 在带真值深度与位姿的合成数据集 TartanAir 上训练，损失是\emph{位姿损失}（预测位姿与真值之差，用 \cref{eq:learn-pose-loss} 式的右扰动度量）与\emph{光流损失}（预测位姿/深度诱导的光流 \cref{eq:learn-flow-pred} 与真值诱导光流之差）的加权和\cite{teed2021droid}。正因有了端到端可微，位姿损失才能一路反传、教会前端“出怎样的光流修正与置信才让最终位姿最准”。
+
+\paragraph{在线推断：关键帧、帧图与中距回环。}
+训练在固定帧数下进行；在线运行需几处改造\cite{teed2021droid}：\emph{运动滤波}——新帧来时先建一条单边帧图跑一次更新算子，若光流修正 $\delta\mathbf{f}$ 幅度低于阈值（运动太小）就丢弃，否则留作关键帧；\emph{前端}——新关键帧与时序近邻双向连边，并用诱导光流算\emph{所有}关键帧对的距离、给高共视对加边（辅以非极大抑制免边过密）；\emph{后端全局优化}——对全帧图联合优化，并在\emph{光流距离小于阈值}的帧对间加\emph{长程边}（\cref{fig:learn-flowgraph} 虚线），实现\textbf{中距回环}。
+
+\begin{pitfall}[DROID 能关“中距”回环，但关不上“大”回环]
+要点睛一句：DROID 的长程边靠“光流距离小”来发现回环——这只在\emph{漂移不大}时成立。一旦轨迹漂移严重、回到旧地时两帧已对不上光流，就发现不了这个回环。\textbf{DROID 本身不含重定位模块，故\emph{大尺度}回环关不上}\cite{teed2021droid}。这与 \cref{ch:loop} 的立场一脉相承：消大漂移要靠\emph{外观}地点识别（词袋/NetVLAD）做长期数据关联，而非几何邻近。换言之，DROID 把\emph{里程计 $+$ 中距回环}做到了极致，但全局一致仍需 \cref{ch:loop} 那套重定位——两者互补，不冲突。
+\end{pitfall}
+
+\paragraph{免重训推广到多模态。}
+\cref{eq:learn-droid-cost} 是因子图，故\emph{加因子}即可推广 DROID 到新传感器、\emph{无须}重训网络\cite{teed2026boosting}。最典型是 RGB-D：在原代价上添一项“鼓励预测深度贴合传感器深度”的深度因子
+\begin{equation}
+  J(\mathbf{x})
+  =\sum_{(i,j)\in\mathcal{E}}\big\|\mathbf{z}_{ij}-\mathbf{h}_{ij}(\mathbf{x})\big\|^2
+  +\sum_{i}\big\|\bar{\mathbf{d}}_i-\mathbf{d}_i\big\|_{\boldsymbol\Sigma_d^{-1}}^2,
+  \label{eq:learn-droid-rgbd}
+\end{equation}
+$\bar{\mathbf{d}}_i$ 为传感器深度（稀疏时 $\boldsymbol\Sigma_d^{-1}$ 在缺测处置零）。同理可加“左右目同名点”因子推广到\emph{双目}（顺带解掉尺度漂移）、加 IMU 预积分因子（\cref{ch:vio}）推广到\emph{视觉-惯性}、乃至推广到\emph{事件相机}（\cref{ch:event}）。这正是 \cref{eq:intro-nls} “后端只面对因子、不关心传感器”统一性的又一次兑现——只不过现在因子图里多了一层可学习的残差。
+
+\paragraph{DPVO：稀疏 patch 版（选读）。}
+DROID 在稠密像素上跑，算力开销大。DPVO\cite{teed2023dpvo} 改在\emph{稀疏图像块}（patch）上工作：用\emph{patch 图}（二部图，边连 patch 与帧）记录每个 patch 的生命周期，每个 patch 视为一个\emph{正平面}、只用\emph{单个}逆深度参数化；重投影函数相应改为对 patch 的版本，更新算子加入跨 patch 生命周期的\emph{时间卷积}与跨帧/跨 patch 的聚合层，展开\emph{两步} GN。稀疏化不仅省算力，精度反而常更高。DPVO 是纯里程计；其扩展 DPVS\cite{lipson2024dpvs} 补上重定位驱动的长程回环与全局优化，可在单块 GPU 上实时——恰好补上了上面那个“关不上大回环”的短板。
+
+% ════════════════════════════════════════════════════════════════
+\section{Pointmap 范式：把整条流水线压进一次前向}
+\label{sec:learning-pointmap}
+
+介入最深的一级，连\emph{状态表示}都换掉了。\cref{sec:learning-diffba} 仍把 SLAM 拆成熟悉的步骤——找对应、建因子图、解优化——只是每步插了网络。Pointmap 范式（DUSt3R\cite{wang2024dust3r} 一系）则更激进：\emph{仅给图像}，让一个网络\emph{一次前向}直接吐出相机位姿、稠密深度、甚至内参，\emph{无须}任何显式求解器或迭代算法。它甚至不假设输入图像有时序关系，故不止于 SLAM，更通向运动恢复结构（SfM）与稠密三维重建。但读到最后会看到一个意味深长的结论：要把许多张图拼成大场景，\emph{因子图与优化又回来了}——这恰是本章统一立场最有力的注脚。
+
+\subsection{什么是 pointmap：像素到三维点的稠密场}
+\label{sec:learning-pointmap-def}
+
+\paragraph{定义。}
+\emph{点图}（pointmap）是一张二维像格上、每个像素配一个三维点坐标的稠密场 $\mathbf{X}\in\mathbb{R}^{W\times H\times 3}$\cite{wang2024dust3r}。它与同分辨率的 RGB 图像 $I$ 一一对应：像素 $(i,j)$ 对应三维点 $\mathbf{X}_{i,j}$（假设每条相机光线只打中一个不透明点）。给定内参 $\mathbf{K}$ 与深度图 $\mathbf{D}$，点图可直接由 $\mathbf{X}_{i,j}=\mathbf{K}^{-1}\mathbf{D}_{i,j}[i,j,1]^\top$ 得到（此时 $\mathbf{X}$ 表达在该相机系下）。记 $\mathbf{X}^{n\to m}$ 为“$n$ 号相机的点图、表达在 $m$ 号相机坐标系下”，用本书帧下标与齐次变换即
+\begin{equation}
+  \mathbf{X}^{n\to m}=\mathbf{T}_{mn}\,\mathbf{X}^{n\to n},
+  \qquad \mathbf{T}_{mn}=\mathbf{T}_{wm}^{-1}\,\mathbf{T}_{wn},
+  \label{eq:learn-pointmap-frame}
+\end{equation}
+（对每个三维点施齐次变换；$\mathbf{T}_{mn}$ 把 $n$ 系坐标变到 $m$ 系，正合本书 $\mathbf{R}_{ab}$ 下标约定）。点图同时编码了三样东西：\emph{场景几何}（三维点本身）、\emph{像素与点的对应}（一一映射）、\emph{两视关系}（若两张点图表达在同一坐标系）。
+
+\paragraph{核心招法：让两图的点图落在\emph{同一}坐标系。}
+DUSt3R 的网络 $f_\theta$ 吃一对图像 $I^1,I^2$，输出两张点图 $\mathbf{X}^{1\to1},\mathbf{X}^{2\to1}$ 及对应\emph{置信图} $\mathbf{C}^{1},\mathbf{C}^{2}$\cite{wang2024dust3r}。\textbf{要害是：两张点图都表达在第一张图 $I^1$ 的坐标系里}（上标 $\to1$）。这一步“偷天换日”地把许多经典步骤一次性解决了——既然两图的三维点已在同一坐标系，那么两图的\emph{相对位姿}、\emph{稠密对应}、\emph{各自深度}都已隐含其中，下游只需\emph{读出}（\cref{sec:learning-pointmap-down}），无须再解对极几何或三角化。
+
+\begin{equation}
+  (\mathbf{X}^{1\to1},\,\mathbf{C}^{1}),\ (\mathbf{X}^{2\to1},\,\mathbf{C}^{2})=f_\theta(I^1,I^2).
+  \label{eq:learn-pointmap}
+\end{equation}
+
+\subsection{网络与训练：Siamese ViT \texorpdfstring{$+$}{+} 置信加权回归}
+\label{sec:learning-pointmap-net}
+
+\paragraph{架构。}
+$f_\theta$ 是一对结构相同的分支（\cref{fig:learn-dust3r}）。两图先经\emph{共享权重}的 ViT 编码器以 Siamese 方式编码成 token 表示 $F^1,F^2$；再各进一个带\emph{交叉注意力}的 Transformer 解码器——每个解码块先做自注意力（看本图 token）、再做交叉注意力（看\emph{另一图} token）、最后过 MLP。\textbf{两支在解码全程不断交换信息}（每块都注意对方分支的 token），这是输出能落在同一坐标系的关键。最后各接一个回归头，吐出点图与置信图。注意这套通用架构\emph{从不显式}施加任何几何约束，全靠在“几何一致的点图”上训练让网络自己学到几何与形状先验（如纹理推形、轮廓推形）。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=5mm,
+  box/.style={draw, rounded corners, align=center, minimum height=7mm, inner sep=2.5pt},
+  e/.style={box, fill=main!8, draw=main!60!black},
+  d/.style={box, fill=second!8, draw=second!60!black},
+  h/.style={box, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!55!black},
+  cx/.style={<->, thick, second!60!black, dashed}]
+\node[e] (i1) {$I^1$};
+\node[e, below=12mm of i1] (i2) {$I^2$};
+\node[e, right=7mm of i1] (enc1) {ViT 编码器\\（共享权重）};
+\node[e, right=7mm of i2] (enc2) {ViT 编码器\\（共享权重）};
+\node[d, right=7mm of enc1] (dec1) {解码器 1\\自+交叉注意力};
+\node[d, right=7mm of enc2] (dec2) {解码器 2\\自+交叉注意力};
+\node[h, right=7mm of dec1] (head1) {回归头 1\\$\mathbf{X}^{1\to1},\mathbf{C}^1$};
+\node[h, right=7mm of dec2] (head2) {回归头 2\\$\mathbf{X}^{2\to1},\mathbf{C}^2$};
+\draw[ln] (i1)--(enc1); \draw[ln] (i2)--(enc2);
+\draw[ln] (enc1)--(dec1); \draw[ln] (enc2)--(dec2);
+\draw[ln] (dec1)--(head1); \draw[ln] (dec2)--(head2);
+\draw[cx] (dec1)--(dec2);
+\end{tikzpicture}
+\caption{DUSt3R 网络架构（仿 \cite{wang2024dust3r,teed2026boosting} 重绘）。两图经共享 ViT 编码器，再各进带交叉注意力的解码器、全程交换信息（虚线双箭头），最后回归两张点图与置信图。两张点图\emph{都}表达在 $I^1$ 坐标系（上标 $\to1$），故相对位姿、稠密对应、深度皆隐含其中。}
+\label{fig:learn-dust3r}
+\end{figure}
+
+\paragraph{置信加权回归损失（自包含）。}
+训练只用一个\emph{三维回归损失}：在有真值的像素上，罚预测点与真值点的欧氏距离。为消解\emph{尺度}歧义（预测与真值各差一个全局尺度），先各按“所有有效点到原点的平均距离” $z,\bar z$ 归一化，再比对。逐像素回归损失为 $\ell_{\mathrm{regr}}(v,i)=\big\|\tfrac1z\mathbf{X}^{v\to1}_i-\tfrac1{\bar z}\hat{\mathbf{X}}^{v\to1}_i\big\|$（$v\in\{1,2\}$ 标视图、$\hat{(\cdot)}$ 为真值）。但天空、半透明物体等处的三维点\emph{本就病态}、难预测；于是让网络\emph{同时}输出每像素一个置信分 $\mathbf{C}^v_i$、用它\emph{加权}回归损失并加一个对数正则：
+\begin{equation}
+  \mathcal{L}_{\mathrm{conf}}
+  =\sum_{v\in\{1,2\}}\sum_{i}\Big(\mathbf{C}^v_i\,\ell_{\mathrm{regr}}(v,i)-\alpha\log\mathbf{C}^v_i\Big),
+  \qquad \mathbf{C}^v_i=1+\exp c^v_i>0,
+  \label{eq:learn-dust3r-loss}
+\end{equation}
+$\alpha$ 是正则权重。直觉很清楚：网络可对\emph{难预测}的像素调低 $\mathbf{C}$ 以减小该处回归损失的话语权，但 $-\alpha\log\mathbf{C}$ 又惩罚“一味调低”，逼它在\emph{有把握}处给高置信。这样\emph{无须显式监督}就学出了置信图。注意这与 \cref{eq:learn-dust3r-loss} 之外、DROID 的置信 $w_{ij}$（\cref{eq:learn-droid-cost}）异曲同工——都是让网络自报“信我几分”，再融进几何。
+
+\subsection{下游：从点图读出几何，以及——又一个因子图}
+\label{sec:learning-pointmap-down}
+
+\paragraph{读出内参与相对位姿。}
+点图的丰富性让所有相机参数都能\emph{直接}解出，且每步都化归为本书已讲过的小优化\cite{wang2024dust3r}。\emph{内参}：因 $\mathbf{X}^{1\to1}$ 表达在 $I^1$ 系，设主点居中、像素为方，只剩焦距 $f_1$ 待估，解一个置信加权的最小二乘 $f_1^\star=\arg\min_{f_1}\sum_{i,j}\mathbf{C}^1_{i,j}\big\|(i',j')-f_1(\mathbf{X}^{1\to1}_{i,j,0:1}/\mathbf{X}^{1\to1}_{i,j,2})\big\|$（$i',j'$ 为去中心化像素），可用 Weiszfeld 迭代几步求得。\emph{相对位姿}：比对两张表达在不同视图系的点图（$\mathbf{X}^{1\to1}\!\leftrightarrow\!\mathbf{X}^{1\to2}$），用\emph{带尺度的 Procrustes 对齐}（\cref{ch:vo} 已讲 3D-3D 的 SVD 闭式对齐，含尺度的 Umeyama 版见 \cref{ch:pointcloud}）即得 $\sigma^\star[\mathbf{R}^\star|\mathbf{t}^\star]$；Procrustes 对噪声/外点敏感，更鲁棒的做法是配 RANSAC $+$ PnP（\cref{sec:vo-pnp}）。\textbf{这些下游步骤本书他章都已自包含，此处只需指明用哪一招、交叉引用即可}。
+
+\paragraph{多图全局对齐：因子图回来了。}
+单次前向只吃\emph{两张}图。要重建大场景（成百上千张图），DUSt3R 的办法是——\emph{再解一个全局优化}\cite{wang2024dust3r}。先建连通图 $\mathcal{G}=(\mathcal V,\mathcal E)$：$N$ 张图为顶点，共视的图对连边（用检索或网络置信筛选）。每条边 $e=(n,m)$ 跑一次网络得成对点图。再求一组\emph{全局对齐}的点图 $\{\boldsymbol\chi^n\}$、每条边一个相对位姿 $\mathbf{P}_e$ 与尺度 $\sigma_e$，最小化
+\begin{equation}
+  \{\boldsymbol\chi^\star,\mathbf{P}^\star,\sigma^\star\}
+  =\arg\min_{\boldsymbol\chi,\mathbf{P},\sigma}
+  \sum_{e\in\mathcal{E}}\sum_{v\in e}\sum_{i}
+  \mathbf{C}^{v,e}_i\,\big\|\,\boldsymbol\chi^v_i-\sigma_e\,\mathbf{P}_e\,\mathbf{X}^{v,e}_i\,\big\|,
+  \label{eq:learn-pointmap-align}
+\end{equation}
+即“同一条边的刚体变换 $\mathbf{P}_e$ 应把该边的两张点图都对齐到全局点图”，并约束 $\prod_e\sigma_e=1$ 防止退化到零。
+
+\begin{insight}[最深的介入，仍逃不出母方程]
+盯住 \cref{eq:learn-pointmap-align}：它是\emph{置信加权}（$\mathbf{C}^{v,e}_i$ 即 \cref{eq:learn-dust3r-loss} 学出的置信，扮演 \cref{eq:intro-nls} 里的信息权重）的最小二乘，变量是全局点云与逐边相对位姿——\textbf{这分明又是一张因子图、又在解母方程 \cref{eq:intro-nls}}！DUSt3R 把\emph{两视}重建压进了网络，但\emph{多视}拼接仍退回因子图全局优化。再把 \cref{eq:learn-pointmap-align} 里的 $\boldsymbol\chi^n$ 用标准针孔模型 $\boldsymbol\chi^n=\mathbf{T}_{wn}^{-1}\mathbf{K}_n^{-1}\mathbf{D}^n$ 重参数化，优化变量就直接变回\emph{相机位姿 $+$ 内参 $+$ 深度图}——\emph{标准的 BA 变量}。这就是本章统一立场（\cref{sec:learning-frame}）最有力的证据：介入再深，“优化即推断、几何把证据融成一致解”这条主干始终不倒。这也回答了本章前置自测的第 5 问——因子图与 BA 没被淘汰。
+\end{insight}
+
+\subsection{MASt3R：补一个匹配头，再 SLAM 化（选读）}
+\label{sec:learning-pointmap-mast3r}
+
+\paragraph{为何要匹配头。}
+DUSt3R 其实\emph{也能}从点图里找对应——在某个不变特征空间里寻找\emph{互为最近邻}的点即可，这套办法即便在\emph{极端视角变化}下也照样可用\cite{leroy2024mast3r}。但它的对应\emph{不够精确}，原因有二：(i) 回归输出天生带噪；(ii) DUSt3R \emph{从未}为“匹配”这件事专门训练过。对要求亚像素对应的下游（相对位姿、三角化）来说，这是个短板。MASt3R 的对策很直接：给 DUSt3R \emph{并联一个匹配头}，专门吐出可做高精度匹配的稠密描述子。
+
+\paragraph{匹配头：稠密局部描述子。}
+匹配头与点图回归头\emph{共用同一主干}，只在每个分支再接一个浅头，输出一张稠密\emph{局部描述子}图（记 $\boldsymbol\Phi^v$，避让本章深度图 $\mathbf{D}$；源文记 $D$）：
+\begin{equation}
+  \boldsymbol\Phi^1=\mathrm{Head}^1_{\mathrm{desc}}\big([\,F^1,\,G^1\,]\big),\qquad
+  \boldsymbol\Phi^2=\mathrm{Head}^2_{\mathrm{desc}}\big([\,F^2,\,G^2\,]\big),
+  \label{eq:learn-mast3r-desc}
+\end{equation}
+其中 $F^v$ 为 \cref{eq:learn-pointmap} 那对编码器 token、$G^v$ 为对应分支的解码器 token，$[\,\cdot,\cdot\,]$ 表拼接；$\mathrm{Head}_{\mathrm{desc}}$ 仅是\emph{两层 MLP 夹一个 GELU 激活}的浅网络。两图各得 $\boldsymbol\Phi^1,\boldsymbol\Phi^2\in\mathbb{R}^{W\times H\times d_\Phi}$（逐像素一个 $d_\Phi$ 维描述子），并把每个描述子\emph{归一化到单位范数} $\|\boldsymbol\Phi^v_i\|=1$，使后续相似度退化为方向余弦。
+
+\paragraph{匹配目标：InfoNCE，且是“分类”而非“回归”。}
+有了描述子，MASt3R 的目标是：\emph{一图里每个局部描述子，至多只与另一图中“同一三维点”的那\emph{一个}描述子匹配}。形式上，在真值对应集 $\hat{\mathcal{M}}=\{(i,j)\mid \hat{\mathbf{X}}^{1\to1}_i=\hat{\mathbf{X}}^{2\to1}_j\}$（像素 $i\in I^1$ 与 $j\in I^2$ 打中\emph{同一}三维点）上施 \emph{InfoNCE} 对比损失。先以温度 $\tau$ 定义相似度
+\begin{equation}
+  s_\tau(i,j)=\exp\!\big[-\tau\,(\boldsymbol\Phi^1_i)^{\top}\boldsymbol\Phi^2_j\big],
+  \label{eq:learn-mast3r-stau}
+\end{equation}
+再令匹配损失为两个方向的对称交叉熵
+\begin{equation}
+  \mathcal{L}_{\mathrm{match}}
+  =-\!\!\sum_{(i,j)\in\hat{\mathcal{M}}}\!\!\left[
+  \log\frac{s_\tau(i,j)}{\sum_{k\in\mathcal{P}^1}s_\tau(k,j)}
+  +\log\frac{s_\tau(i,j)}{\sum_{k\in\mathcal{P}^2}s_\tau(i,k)}\right],
+  \label{eq:learn-mast3r-match}
+\end{equation}
+其中 $\mathcal{P}^1=\{i\mid(i,j)\in\hat{\mathcal{M}}\}$、$\mathcal{P}^2=\{j\mid(i,j)\in\hat{\mathcal{M}}\}$ 是两图中参与匹配的像素子集。第一项把分母对 $I^1$ 的候选像素配分（softmax）、奖励“选中真值 $i$”，第二项对称地对 $I^2$ 配分。最终训练目标把它与置信回归损失（\cref{eq:learn-dust3r-loss}）加权相加：
+\begin{equation}
+  \mathcal{L}_{\mathrm{total}}=\mathcal{L}_{\mathrm{conf}}+\beta\,\mathcal{L}_{\mathrm{match}},
+  \label{eq:learn-mast3r-total}
+\end{equation}
+$\beta$ 为权重。
+
+\begin{insight}[“回归到附近”与“分类到正确像素”之别]
+\cref{eq:learn-mast3r-match} 与 \cref{sec:learning-feature} 的 SuperPoint \emph{同根}——都是\emph{对比损失}（拉近真匹配、推远假匹配）。但它点破 DUSt3R 回归与 MASt3R 匹配的关键分野：回归损失（\cref{eq:learn-dust3r-loss}）按欧氏距离惩罚，\emph{预测落在真值附近就给奖励}；而 InfoNCE 是\emph{交叉熵分类}，\textbf{只有押中\emph{那一个}正确像素才得分，押到旁边一格也算错}。正是这种“非对即错”的分类压力把匹配逼向\emph{亚像素级高精度}——这也呼应本章主线：要更准的对应（母方程里的 $\mathbf{z}_i$），就把“按距离回归”换成“按身份分类”的可学损失。
+\end{insight}
+
+\paragraph{从两视先验到完整系统：三条路线。}
+有了\emph{快速、精确}的两视重建与匹配，就能据以搭起完整的 SfM/SLAM 系统。难点其实是同一个：DUSt3R/MASt3R 本质上\emph{只处理图像对}，面对成百上千张图时既有“成对点图各落在不同坐标系、须全局后处理”的麻烦，又有“两两组合数 $O(N^2)$”的复杂度之忧。下面三条代表路线，正是对这一两难的不同回应（本书指明 idea、不复述其完整工程管线\cite{leroy2024mast3r}）。
+
+\paragraph{MASt3R-SfM：检索去平方、两步梯度下降去 RANSAC。}
+MASt3R-SfM 要处理\emph{完全不受限}的图像集合——从单张图到大场景、甚至毫无相机运动皆可。针对 MASt3R“只吃图像对、对大集合伸缩性差”的软肋，它\emph{复用冻结的编码器}做\emph{快速图像检索}（额外开销可忽略），只在检索出的相关对上跑网络，把复杂度压到\emph{近线性}。又借 MASt3R 对外点的强鲁棒性，\emph{彻底去掉 RANSAC}；在冻结的局部重建之上分\emph{两次}梯度下降求解全局结构——先用\emph{三维空间}的匹配损失对齐，再用\emph{二维重投影}损失精修前一步的估计。
+
+\paragraph{MUSt3R：对称架构 \texorpdfstring{$+$}{+} 工作记忆，直接同坐标系。}
+当图像更多时，DUSt3R/MASt3R 的\emph{成对}本性从优点变成累赘：每对点图各自落在“该对第一张图”的坐标系里，必须再做全局后处理才能拼合，朴素做法很快不可行（且是二次复杂度）。MUSt3R 另辟蹊径，改造 DUSt3R 架构——\emph{令其对称}并加一套\emph{工作记忆}机制（复杂度增量有限），使\emph{所有}图的点图\emph{一次性}落在\emph{同一}坐标系、免去成对后处理，且能\emph{高帧率}推断。如此一来，同一个网络无须改架构即可“身兼两职”：既做无序集合的离线 SfM，又做视频流的在线稠密 VO/SLAM。
+
+\paragraph{MASt3R-SLAM：两视先验作统一基座。}
+MASt3R-SLAM 把两视先验当作\emph{跟踪、建图、重定位}的\emph{统一基座}。与离线、无序的 SfM 不同，SLAM \emph{增量}收数据、且须\emph{实时}，这就对低延迟匹配、谨慎的地图维护与高效的大规模优化提出要求。它的做法正合本章 \cref{sec:learning-diffba} 的滤波/优化思想：\emph{前端}对点图做\emph{局部滤波}、\emph{后端}做\emph{大规模全局优化}；又像 MASt3R 一样\emph{不假设}具体相机模型（只要求所有光线过同一光心），于是得到一个\emph{免相机模型}、可处理\emph{时变内参}的实时稠密单目 SLAM——已知标定时，其轨迹精度与稠密几何均达当时最优。可以看到，越往系统层走，越是“网络两视先验”与“因子图全局优化”的再度联手。
+
+\paragraph{近期趋势（选读）。}
+两条线在快速演进\cite{teed2026boosting}：一是继续\emph{扩规模}的前馈网络（如 VGGT）一次重建上百张图、直接出位姿/内参/深度/点图/特征轨迹，但若要\emph{高精度}仍用预测的特征轨迹再跑一遍 BA——\emph{因子图依然不可或缺}；用于长序列时（如 VGGT-SLAM）则用网络重建局部子图、再用因子图对齐到全局。二是继续精炼\emph{因子图 $+$ 网络}的组合（如 MegaSAM、ViPE），在高度动态、无标定场景下\emph{联合}优化内参、融合多模型预测——它们都\emph{依赖因子图}融合多个网络的预测。这些系统本书只作研究指引；其共性再次印证本章主线：\textbf{学习与几何不是替代，而是互补——网络榨证据、因子图融一致}。开放词汇、语义、基础模型驱动的更高层表示，则留待本部后续章节（\cref{ch:semantic,ch:openworld}）。
+
+% ════════════════════════════════════════════════════════════════
+\section{常见误解}
+\label{sec:learning-myths}
+
+\begin{pitfall}[误解一：深度学习要把几何 SLAM 整个替换掉]
+本章反复证伪了这一点。最成功的学习式系统都\emph{保留}几何核心：DROID-SLAM 把 BA 做成可微的一层（\cref{eq:learn-droid-cost}），DUSt3R 多图拼接退回因子图全局对齐（\cref{eq:learn-pointmap-align}），VGGT 高精度时仍补一遍 BA。正确图景是\emph{互补}：网络榨证据（鲁棒的深度/对应/置信），几何融一致（用刚体约束把证据拧成轨迹与地图）。判断任何“学习式 SLAM”的第一问永远是：\emph{它把母方程的哪个零件换成了网络？几何核心还在哪里？}
+\end{pitfall}
+
+\begin{pitfall}[误解二：端到端回归位姿“最先进”，几何过时了]
+恰相反。直接回归相对位姿（\cref{sec:learning-pose}）\emph{系统性地}不如把几何嵌进系统的方法：几何约束是免费且精确的先验，硬让网络从数据重学既费样本又难泛化、易过拟合训练分布，且相对位姿误差会沿链\emph{累积}（与 \cref{ex:intro-drift} 经典漂移同源）。DROID 之所以绕道\emph{光流}再喂 BA，正因光流是好学的局部对应、位姿是难学的全局量——各司其职才胜出。
+\end{pitfall}
+
+\begin{pitfall}[误解三：“可微分 BA”是一种新的优化器]
+不是。\cref{eq:learn-droid-cost} 里那个 BA 仍是 \cref{ch:nlopt} 的光束法平差、仍用 Gauss--Newton 解、仍靠 Schur 消元利用稀疏性。“可微”指的是\emph{训练时}让梯度\emph{反向穿过}这个优化层（机理见 \cref{sec:nlopt-diffopt} 的展开式/隐式微分 $+$ HVP），从而端到端训练前端网络。推断时它就是一次普通 BA。把它当“新优化器”，会错失它真正的价值——让前端从\emph{几何优化本身}学习（而非从外部真值），这才是它优于“分开训练各模块”的根源。
+\end{pitfall}
+
+\begin{pitfall}[误解四：pointmap 一次前向出三维，因子图被淘汰了]
+对\emph{两视}成立，对\emph{多视}不成立。DUSt3R 把两图重建压进网络，但拼成大场景要解 \cref{eq:learn-pointmap-align} 的全局对齐——那是一张置信加权的因子图，重参数化后变量就是标准 BA 的位姿 $+$ 内参 $+$ 深度。MASt3R-SLAM、VGGT-SLAM 等系统级方案，无一例外仍用因子图融合网络预测。pointmap 改了\emph{状态表示}与\emph{两视求解方式}，没改“多视一致性靠优化”这条主干。
+\end{pitfall}
+
+\begin{pitfall}[误解五：把光流场 $\mathbf{f}^{\mathrm{flow}}$ 与视线方向 $\mathbf{f}$、把置信图 $\mathbf{C}$ 与相关体 $\mathbf{C}^{\mathrm{corr}}$ 混为一谈]
+本章记号有几处易混，已在“本章记号与约定”框严格区分：光流场带上标 $\mathbf{f}^{\mathrm{flow}}$（区别于 \cref{ch:dense} 的单位视线方向 $\mathbf{f}$）、其修正量 $\delta\mathbf{f}$、逐像素置信用标量 $w_{ij}$；pointmap 的置信图记 $\mathbf{C}$、RAFT/DROID 的相关体记 $\mathbf{C}^{\mathrm{corr}}$。读公式时认准上标与字体，免得把“逐像素相似度”当成“逐像素置信”。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+本章是全书“经典 $\to$ 学习”弧线（\cref{sec:intro-frontier}）的桥头堡，也是“学习时代”这一部的方法论入口。一条主线贯穿始终：\textbf{学习赋能 SLAM 不推翻 MAP 母方程（\cref{eq:intro-nls}），而是把其中手工设计的残差、权重、乃至状态表示逐一换成可学习的}——介入越深，被网络接管的越多，但“优化即推断、几何融证据”这条主干始终不倒。三级介入：\emph{替换组件}（深度/位姿/特征/光流作额外因子或更好测量）$\to$ \emph{可微分 BA}（残差与权重都由网络给、优化层可反传、端到端训练，DROID-SLAM/DPVO）$\to$ \emph{pointmap 全栈}（连表示都换，但多视拼接又退回因子图，DUSt3R/MASt3R）。可微分 BA 的反传机理已由 \cref{sec:nlopt-diffopt} 自包含，本章只用其结论、聚焦“BA 作为一层”在架构里怎么搭。
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$f_\theta$ & 可学习网络（$\theta$ 为参数）& \cref{sec:learning-depth} \\
+$\mathbf{e}_\theta,\ \boldsymbol\Sigma_\theta$ & 学习式残差 / 学习式协方差（信息 $\boldsymbol\Sigma_\theta^{-1}$）& \cref{eq:learn-diffba-cost} \\
+$\mathbf{T}_{ij}\in\SE(3)$ & 把 $j$ 系坐标变到 $i$ 系的相对位姿（本书下标式）& \cref{eq:learn-pose-loss} \\
+$\rho_{\mathrm{inv}},\ \mathbf{d}$ & 逆深度 / 稠密深度图 & \cref{eq:learn-flow-cost} \\
+$\mathbf{f}^{\mathrm{flow}},\ \delta\mathbf{f}$ & 光流场 / 其网络修正量（区别于视线 $\mathbf{f}$）& \cref{eq:learn-raft-iter} \\
+$w_{ij},\ \boldsymbol\Sigma_{ij}^{-1}=\mathrm{diag}\,w_{ij}$ & 逐像素置信权重 / 对角信息阵 & \cref{eq:learn-droid-cost} \\
+$\mathbf{C}^{\mathrm{corr}}$ & 四维相关体（RAFT/DROID）& \cref{eq:learn-raft-corr} \\
+$\mathbf{h}_{ij}$ & 由位姿与深度诱导的光流预测函数 & \cref{eq:learn-flow-pred} \\
+$\mathcal{G}=(\mathcal V,\mathcal E)$ & 帧图（与因子图同构）& \cref{eq:learn-flow-cost} \\
+$\mathbf{X}\in\mathbb{R}^{W\times H\times3}$ & 点图（pointmap）；$\mathbf{X}^{n\to m}$ 表达在 $m$ 系 & \cref{eq:learn-pointmap-frame} \\
+$\mathbf{C}$ & pointmap 逐像素置信图 & \cref{eq:learn-pointmap} \\
+$\boldsymbol\Phi^1,\boldsymbol\Phi^2$ & MASt3R 稠密局部描述子图（单位范数；避让深度 $\mathbf{D}$）& \cref{eq:learn-mast3r-desc} \\
+$\boldsymbol\chi^n,\ \mathbf{P}_e,\ \sigma_e$ & 全局对齐点图 / 逐边相对位姿 / 逐边尺度 & \cref{eq:learn-pointmap-align} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{定理 / 公式速查表}
+\begin{tabular}{lll}
+\toprule
+公式 & 一句话说明 & 对应 \\
+\midrule
+统一立场 \cref{eq:learn-mother} & 把母方程的残差/权重/表示换成可学的 & \cref{sec:learning-frame} \\
+位姿损失 \cref{eq:learn-pose-loss} & 右扰动度量下预测与真值之差；用于里程计会累积 & \cref{sec:learning-pose} \\
+视图合成 warp \cref{eq:learn-warp} & 双线性插值可微 $\Rightarrow$ 自监督训深度/位姿 & \cref{sec:learning-pose} \\
+RAFT 相关体 \cref{eq:learn-raft-corr} & 全对像素内积；多分辨率金字塔 & \cref{sec:learning-flow} \\
+RAFT 迭代 \cref{eq:learn-raft-iter} & “学过的”迭代优化器，吐流场增量 & \cref{sec:learning-flow} \\
+RAFT 查找 \cref{eq:learn-raft-lookup} & 邻域网格 $\times$ 金字塔多层采样 & \cref{sec:learning-flow} \\
+光流预测函数 \cref{eq:learn-flow-pred} & 与重投影 BA 同构 & \cref{sec:learning-diffba-flow} \\
+光流因子图 \cref{eq:learn-flow-cost} & 母方程在“光流测量”下的实例 & \cref{fig:learn-flowgraph} \\
+可微分 BA \cref{eq:learn-diffba-cost} & 网络出 $\mathbf{e}_\theta,\boldsymbol\Sigma_\theta$ 塑造代价地形 & \cref{sec:learning-diffba-core} \\
+DROID BA \cref{eq:learn-droid-cost} & 光流修正 $+$ 置信驱动状态更新，展开 GN & \cref{fig:learn-droid} \\
+DROID RGB-D \cref{eq:learn-droid-rgbd} & 加深度因子即推广，免重训 & \cref{sec:learning-diffba-droid} \\
+pointmap 帧变换 \cref{eq:learn-pointmap-frame} & 同坐标系点图编码相对位姿/对应/深度 & \cref{sec:learning-pointmap-def} \\
+DUSt3R 输出 \cref{eq:learn-pointmap} & 一次前向出两张同系点图 $+$ 置信 & \cref{sec:learning-pointmap-def} \\
+置信回归损失 \cref{eq:learn-dust3r-loss} & 加权 $+$ 对数正则，自学置信 & \cref{sec:learning-pointmap-net} \\
+全局对齐 \cref{eq:learn-pointmap-align} & 多视拼接又是因子图（解母方程）& \cref{sec:learning-pointmap-down} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 统一立场 & 学习 = 换母方程的零件，几何不倒 & $\bigstar\bigstar$ \\
+2 & 学习式深度 & 度量深度钉住单目尺度、抗漂移 & $\bigstar\bigstar$ \\
+3 & 位姿回归与其累积病 & 不如嵌几何；右扰动损失；链式累积 & $\bigstar\bigstar\bigstar$ \\
+4 & 视图合成自监督 & warp 可微，无三维真值训深度/位姿 & $\bigstar\bigstar\bigstar$ \\
+5 & 学习式特征/匹配 & SuperPoint/SuperGlue/LoFTR 升级对应 & $\bigstar\bigstar$ \\
+6 & 学习式光流 RAFT & 相关体 $+$ 查找 $+$ 迭代更新 & $\bigstar\bigstar\bigstar$ \\
+7 & 光流即测量 & 光流因子图，与重投影 BA 同构 & $\bigstar\bigstar\bigstar$ \\
+8 & 可微分 BA 思想 & 网络塑造代价；反传见 \cref{sec:nlopt-diffopt} & $\bigstar\bigstar\bigstar\bigstar$ \\
+9 & DROID-SLAM & 更新算子 $+$ 展开 BA；中距回环 & $\bigstar\bigstar\bigstar\bigstar$ \\
+10 & 因子图加因子推广 & RGB-D/双目/VI 免重训 & $\bigstar\bigstar\bigstar$ \\
+11 & pointmap 范式 & 同系点图，一次前向出三维 & $\bigstar\bigstar\bigstar\bigstar$ \\
+12 & 全局对齐 = 因子图 & 多视拼接退回母方程 & $\bigstar\bigstar\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{本章蓝本}：SLAM Handbook\cite{teed2026boosting} 第 13 章《Boosting SLAM with Deep Learning》——学习式深度/位姿、学习式特征/光流、可微分 BA 与 pointmap 的系统综述（本章框架与系统选择的出处）。
+  \item \textbf{可微分 BA 与 DROID 系}：DROID-SLAM\cite{teed2021droid}、DPVO\cite{teed2023dpvo}、DPVS\cite{lipson2024dpvs}；早期端到端 BA 的 BANet\cite{tang2019banet}。可微优化的反传机理见本书 \cref{sec:nlopt-diffopt}。
+  \item \textbf{学习式光流/特征/匹配}：RAFT\cite{teed2020raft}、SuperPoint\cite{detone2018superpoint}、SuperGlue\cite{sarlin2020superglue}、LightGlue\cite{lindenberger2023lightglue}、LoFTR\cite{sun2021loftr}。
+  \item \textbf{深度/位姿预测与因子化}：单图深度\cite{eigen2014depth,ranftl2021dpt}、自监督\cite{godard2017unsupervised,zhou2017unsupervised}、DVSO\cite{yang2018dvso}、D3VO\cite{yang2020d3vo}、稠密化 MonoRec\cite{wimbauer2021monorec}。
+  \item \textbf{pointmap 范式}：DUSt3R\cite{wang2024dust3r}、MASt3R\cite{leroy2024mast3r}。
+\end{itemize}
+
+\section*{本章与前后章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+章节 & 关系 & 衔接点 \\
+\midrule
+\cref{ch:intro} 初识 SLAM & 提供 MAP 母方程与前沿弧线 & \cref{eq:intro-nls}、\cref{sec:intro-frontier} 是本章的锚 \\
+\cref{ch:vo} 视觉里程计 & 重投影 BA、光流、直接法 & 光流因子与重投影同构；RAFT 升级 LK \\
+\cref{ch:nlopt} 非线性优化 & BA、GN、稀疏性、\emph{可微优化} & \cref{sec:nlopt-diffopt} 给可微分 BA 反传机理 \\
+\cref{ch:loop} 回环检测 & 深度地点识别、长期数据关联 & 补 DROID 关不上的大回环；位姿回归互补 \\
+\cref{ch:dense} 稠密建图 & 深度滤波、稠密表示 & 学习式稠密 = 深度滤波器的网络化 \\
+\cref{ch:dynamic} 动态可变形 & 网络出残差/掩膜 & 本章是“学习接进几何”的方法论入口 \\
+\cref{ch:semantic} 度量-语义 & 网络出语义因子 & 闭集语义沿用本章“学习层接母方程” \\
+\cref{ch:openworld} 开放世界 & 基础模型、开放词汇 & 把表示推到语言嵌入；ViT 主干同源 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{习题}
+\begin{enumerate}
+  \item \textbf{统一立场的落地。}\;对下列四个系统，各指出它把母方程 \cref{eq:learn-mother} 的\emph{哪个}零件（残差 $\mathbf{e}_i$ / 权重 $\boldsymbol\Sigma_i$ / 测量 $\mathbf{z}_i$ / 状态表示）换成了网络，几何核心保留在何处：(a) 用 SuperGlue 替换前端匹配的 ORB-SLAM；(b) D3VO；(c) DROID-SLAM；(d) DUSt3R 多图重建。
+  \item \textbf{光流因子与重投影 BA 同构。}\;写出 \cref{eq:learn-flow-pred} 的光流预测函数，并与 \cref{sec:vo-pnp-ba} 的重投影模型逐项对应：哪个量对应“路标点”、哪个对应“观测像素”？再说明为何这里用\emph{逆深度} $\rho_{\mathrm{inv}}$ 而非深度 $d$ 参数化（提示：回看 \cref{sec:dense-depth-filter} 与“局部二次近似”）。
+  \item \textbf{位姿回归的累积病。}\;设网络对每对相邻帧的相对旋转有固定偏差 $+1^\circ$（绕同一轴）。链式相乘 $N$ 帧后，估计朝向与真值差多少？把它与 \cref{ex:intro-drift} 经典 VO 的“一度之差”对照，说明二者同源；再说明 DeepVO 的循环网络为何能\emph{缓解}（而非根除）它。
+  \item \textbf{可微分 BA 为何“可微”。}\;用一段话向同学解释：DROID 训练时，损失对网络参数 $\theta$ 的梯度如何\emph{穿过} \cref{eq:learn-droid-cost} 的 BA 层？指出本书在哪一节（给标签）自包含地推导了这套机理，并说出“展开式微分”与“隐式微分”各自的一句话要点（不必重抄推导）。
+  \item \textbf{为何绕道光流。}\;论证“让网络出光流、再喂 BA”为何优于“让网络直接回归位姿”。从\emph{可学性}（局部对应 vs 全局量）与\emph{泛化}（几何先验是否被重学）两个角度各给一条理由。
+  \item \textbf{加因子推广 DROID。}\;照 \cref{eq:learn-droid-rgbd} 的样式，为\emph{双目} DROID 写出新增的因子（提示：左右目同一时刻、相对位姿已知且固定）。说明为何双目顺带解掉了单目的尺度漂移（回看 \cref{thm:intro-scale}）。
+  \item \textbf{中距回环的边界。}\;DROID 用“光流距离小”发现回环边。举一个它\emph{发现不了}的回环场景，并说明为什么；再说明要补上这个能力，应接入 \cref{ch:loop} 的哪类技术（外观地点识别 vs 几何邻近）。
+  \item \textbf{pointmap 仍逃不出母方程。}\;把 \cref{eq:learn-pointmap-align} 的全局点图 $\boldsymbol\chi^n$ 用标准针孔模型 $\boldsymbol\chi^n=\mathbf{T}_{wn}^{-1}\mathbf{K}_n^{-1}\mathbf{D}^n$ 重参数化，写出此时的优化变量。论证“它本质上就是一个带尺度的 BA”，并指出置信图 $\mathbf{C}^{v,e}$ 在 \cref{eq:intro-nls} 里扮演什么角色。
+  \item \textbf{（选读）置信图的自监督。}\;解释 \cref{eq:learn-dust3r-loss} 里 $-\alpha\log\mathbf{C}$ 这一项为何不可或缺：若去掉它，网络会把所有像素的置信 $\mathbf{C}$ 学成什么？这与 \cref{sec:nlopt-robust} 的鲁棒核“按残差大小降权”有何相通之处？
+  \item \textbf{（选读）综述式定位。}\;查阅 VGGT 或 MegaSAM/ViPE 的原文，用本章统一立场（\cref{tab:learn-spectrum}）给它定位：它把母方程的哪些零件交给网络？为何即便“一次前向出三维”，高精度时仍要因子图/BA？
+\end{enumerate}

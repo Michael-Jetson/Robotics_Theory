@@ -1,0 +1,1144 @@
+\chapter{回环检测}
+\label{ch:loop}
+
+% ════════════════════════════════════════════════════════════════
+%  教材化全吸收章：十四讲 ch11 回环检测 + DBoW2(Galvez-Lopez&Tardos TRO2012)
+%  + Nister-Stewenius 词汇树 + NetVLAD + FAB-MAP/VPR 综述。
+%  自包含、零外部 punt、右扰动主线、对接位姿图后端 ch:nlopt。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 前端里程计明明已经在估计运动了，为什么轨迹绕一圈回到起点时，地图却“对不齐”？后端优化为什么救不了它？
+  \item 判断“两幅图像是不是同一个地方”，能不能把两幅图像逐像素相减、看差值大小？这会出什么问题？
+  \item 一座写字楼里每层走廊长得一模一样。一个只看外观的回环检测器会犯什么错误？这种错误叫什么？
+  \item 在“词袋”里，为什么“天空”“地面”这种到处都有的特征反而\emph{不}该被重视，而“某面带涂鸦的墙”却很有用？怎么用一个权重把这件事写出来？
+  \item 回环检测器报告“当前帧和 $300$ 帧前是同一地点”，后端凭这条信息能做什么？如果这条信息是\emph{错}的，会发生什么？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}回环检测在 SLAM 中的位置与作用——为什么仅有前端、后端不足以消除累积漂移，回环边如何把漂移“拉回”；并\textbf{辨析}找回环的两条思路（基于里程计 vs 基于外观），说明为何累积漂移使里程计法“倒果为因”、外观法成为主流；
+  \item \textbf{推导}基于视觉词袋（Bag-of-Words）的外观相似度全链路：从特征到单词、从单词到 TF-IDF 加权的稀疏向量、从两向量到 $L_1$ 相似度评分；
+  \item \textbf{构建}层次 $k$ 叉树词典（层次 $K$-means），并解释它为何能把 $O(W)$ 的单词查找降到对数级；
+  \item \textbf{设计}一条完整的回环检测流水线：相似度归一化、岛屿分组、时间一致性、几何验证，并说明每一关各挡掉哪一类错误；
+  \item \textbf{运用}准确率/召回率与混淆矩阵评价回环检测器，并解释“SLAM 为何宁可牺牲召回率也要保准确率”；
+  \item \textbf{对接}几何验证产出的回环边到 \cref{ch:nlopt} 的位姿图后端，写出回环边的残差与信息矩阵；
+  \item \textbf{了解}深度学习地点识别（NetVLAD）如何替换流水线的检索阶段，以及它为何\emph{不能}省去几何验证。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{从两幅图像的相似度，到一条可信的位姿图回环边}”的主线。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  outb/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},  % 注意：样式名不能用 out（TikZ 保留键 to[out=..]），否则 /tikz/out 冲突、连锁污染后续所有 enhanced tcolorbox
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (why) {为何需要\\（消漂移）};
+\node[blk, right=of why] (meth) {去哪儿找\\里程计 vs 外观};
+\node[blk, right=of meth] (pr) {评价\\ P-R / 感知混叠};
+\node[blk, right=of pr] (bow) {视觉词袋\\ 词典 / TF-IDF / 评分};
+\node[grp, below=8mm of why] (norm) {相似度归一化\\ + 岛屿};
+\node[grp, right=of norm] (temp) {时间一致性\\ $k$ 连续};
+\node[grp, right=of temp] (geo) {几何验证\\ RANSAC + 对极/PnP};
+\node[outb, below=8mm of norm] (pg) {回环边 $\to$ 位姿图\\（对接 \cref{ch:nlopt}）};
+\node[outb, right=of pg] (dl) {深度地点识别\\ NetVLAD};
+\draw[ln] (why)--(meth); \draw[ln] (meth)--(pr); \draw[ln] (pr)--(bow);
+\draw[ln] (bow.south) -- ++(0,-4.5mm) -| (norm.north);
+\draw[ln] (norm)--(temp); \draw[ln] (temp)--(geo);
+\draw[ln] (geo.south) -- ++(0,-4.5mm) -| (pg.north);
+\draw[ln] (pg)--(dl);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：第 \ref{sec:loop-why}--\ref{sec:loop-pr} 节立动机、回环检测的方法分野与评价框架，是理解后面所有阈值取舍的根基（其中 \cref{sec:loop-detect-methods} 回答“去哪儿找回环”，定下基于外观这条主线）；第 \ref{sec:loop-bow}--\ref{sec:loop-score} 节是视觉词袋的完整理论与实践（本章主体）；第 \ref{sec:loop-pipeline} 节把词袋装进一条工业级流水线（DBoW2 四阶段）；第 \ref{sec:loop-backend} 节对接位姿图后端；第 \ref{sec:loop-dl} 节展望深度学习地点识别，面向研究，可选读。
+
+\subsection*{前置知识桥接}
+\cref{ch:vo}（视觉里程计）已经给出本章要复用的两块积木：ORB 特征（FAST 关键点 + 带方向的 BRIEF 二进制描述子）与对极几何/PnP 的位姿求解。本章不重提这些推导，而是站在它们之上回答一个里程计\emph{回避}的问题：当机器人重新回到曾经到过的地方时，如何\emph{察觉}到这件事，并把它变成一条能消除累积漂移的约束。\cref{ch:nlopt}（非线性优化）已经给出位姿图的目标函数（\cref{eq:nlopt-pg-cost}）；本章产出的回环边正是喂给它的输入。\cref{ch:lidar_slam}（激光 SLAM）则给出本章思想在点云上的对应物——Scan Context 与基于欧氏距离的激光回环\cite{kim2018scancontext}，与本章的视觉外观法互为镜像。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你能搭出一个里程计，但它\emph{只能}是里程计：轨迹会随时间单调漂移，绕场一周后起点与终点对不上，地图出现“双重墙”，且无法重定位（跟踪丢失后再也找不回自己在地图里的位置）。
+  \item 在 \cref{ch:nlopt} 的位姿图实践里，你会看到“里程计边 + 回环边”混合的稀疏图（如本书的“球”位姿图，$2500$ 个位姿、$9799$ 条边），却不知道那些跨越很远的回环边\emph{从何而来}——它们正是本章的产物。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+待比较的两幅图像记 $A,B$ 或 $I_t,I_{t'}$；其视觉词袋向量记 $\boldsymbol v_A,\boldsymbol v_t\in\mathbb{R}^W$，$W$ 为词典单词数。单词记 $w_i$，其 TF-IDF 权重记 $\eta_i$（沿用十四讲\cite{gaoxiang2019slam14}、DBoW2\cite{galvez2012bags}）。词典 $k$ 叉树的分支因子记 $k$、深度记 $L$（十四讲用 $d$，本书统一 $L$，与 DBoW2/DBoW3 输出一致）。
+相似度评分 $s(\cdot,\cdot)\in[0,1]$（$1$ 最相似）；归一化后的评分记 $s'(\cdot,\cdot)$ 或 $\eta(\boldsymbol v_t,\boldsymbol v_{t_j})$（带双参数括号，以区别于权重标量 $\eta_i$）。
+本章前 $90\%$ 是“如何\emph{正确}检出回环对 $(i,j)$”，几何验证产出的相对位姿 $\hat{\mathbf T}_{ij}\in\SE(3)$ 与信息矩阵 $\boldsymbol\Lambda_{ij}$ 就是喂给 \cref{ch:nlopt} 的回环边测量；这一对接见 \cref{sec:loop-backend}，残差遵全书右扰动约定。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么需要回环检测}
+\label{sec:loop-why}
+
+\paragraph{回顾：前端给的是“相邻”，不是“全局”。}
+\cref{ch:vo} 的视觉里程计逐帧估计相邻关键帧之间的相对运动；\cref{ch:nlopt} 的后端在已有约束下做最优估计。这套“前端 + 后端”已经能跑，但它有一个结构性的缺陷：前端给出的只是\emph{局部}的位姿间约束\cite{gaoxiang2019slam14}，例如相邻关键帧之间的相对位姿
+\begin{equation}
+  x_1 - x_2,\quad x_2 - x_3,\quad x_3 - x_4,\quad\dots
+  \label{eq:loop-odom-chain}
+\end{equation}
+（这里 $x_i$ 抽象地指代第 $i$ 个位姿节点，对应一个 $\mathbf T_i\in\SE(3)$）。
+
+\paragraph{动机：误差会逐级累积成漂移。}
+设想自动驾驶建图：采集车在某区域绕若干圈以覆盖全部范围\cite{gaoxiang2019slam14}。前端提取特征、忽略特征点本身，只把相邻帧的相对位姿丢给后端做位姿图优化。问题在于——$x_1$ 的估计带有误差，$x_2$ 是\emph{根据} $x_1$ 决定的，$x_3$ 又由 $x_2$ 决定，依此类推。误差被一级一级累积下去，使后端优化出来的轨迹慢慢偏离真实轨迹。这就是\textbf{累积误差（accumulated drift）}：长时间运行后，估计轨迹与真实地点不再一致，无法构建\textbf{全局一致（globally consistent）}的轨迹和地图。在建图这种场景下，我们真正要保证的是：当车实际经过同一地点时，估计轨迹也必须经过同一点。
+
+\paragraph{反面：只靠后端救不了漂移。}
+有人会问：后端不是在做最大后验估计吗，为什么消不掉漂移？答案是一句工程箴言——\textbf{“好模型架不住烂数据”}。当手里只有相邻关键帧的约束时，后端能做的事并不多：它能让\emph{已有}的相对约束彼此协调，却无从知道“此处其实等于很久以前的彼处”。\cref{eq:loop-odom-chain} 这条链上没有任何一条边把 $x_1$ 和 $x_{100}$ 联系起来，于是这两端的累积偏差在后端看来是“合法”的，无法被纠正。
+
+\paragraph{核心思想：补一条“时隔久远”的约束。}
+回环检测模块的作用，正是给出\textbf{除相邻帧之外、时隔更久远的约束}\cite{gaoxiang2019slam14}——例如 $x_1$ 与 $x_{100}$ 之间的位姿变换。之所以这两个相隔很远的位姿之间会有约束，是因为我们\emph{察觉到相机经过了同一个地方，采集到了相似的数据}。一旦成功检测出这件事，就为后端位姿图提供了一条横跨长时间跨度的有效约束，从而得到更好的、特别是\emph{全局一致}的估计。
+
+\begin{insight}[回环边 = 给位姿图加一根弹簧]\label{ins:loop-spring}
+位姿图可以看成一个\textbf{质点--弹簧系统}：每个位姿是一个质点，每条相对位姿约束是一根弹簧，把两个质点往“满足该约束”的相对位置上拉\cite{gaoxiang2019slam14}。里程计边构成一条松散的弹簧链，链越长越容易整体歪斜。回环检测相当于在链的两个远端之间\emph{额外架一根弹簧}：它把带有累积误差的那一段“拉”回正确的位置，提高了整个系统的稳定性——\textbf{前提是这根弹簧本身架对了地方}。这个“前提”将贯穿全章：架错一根弹簧（假阳性回环）比少架一根（漏检）危害大得多。
+\end{insight}
+
+\paragraph{第二个作用：重定位。}
+回环检测还有一层意义\cite{gaoxiang2019slam14}：它提供了\emph{当前数据与所有历史数据的关联}，因此可直接用于\textbf{重定位（relocalization）}。例如事先对某场景录一条轨迹、建好地图，之后机器人在该场景中可一直沿这条轨迹导航；当跟踪丢失时，重定位用同一套“地点识别”机制把当前帧匹配到地图里的历史关键帧，从而恢复自己在轨迹上的位置。回环与重定位\emph{共用同一个地点识别引擎}，区别仅在于：回环是“已知大致在哪、找闭环”，重定位是“完全不知在哪、全局查”。
+
+\begin{note}
+\textbf{VO 与 SLAM 的分界.}\;
+正因为回环检测带来了全局一致性，业界常以它划界\cite{gaoxiang2019slam14}：\emph{仅有前端和局部后端}的系统称为\textbf{视觉里程计（VO）}，而\emph{带有回环检测和全局后端}的系统才称为\textbf{SLAM}。本章正是 VO 升级为 SLAM 的关键一步。回环检测在目标和方法上都与前后端相差很大，工程上通常作为一个\emph{独立模块}（甚至独立线程）运行——它很少触发，但一触发就极大地改变全局地图。
+\end{note}
+
+\begin{pitfall}[概念误区：“多检出几次回环总没坏处”]
+直觉上似乎回环越多越好。\cref{ins:loop-spring} 已经埋下伏笔：\emph{架错一根弹簧会毁掉整张图}。一条错误的回环边会把两个本不该相连的位姿强行拉到一起，后端为了“满足”这条假约束，会把整段轨迹和地图掰到错误的位置。后面 \cref{sec:loop-pr} 会用准确率/召回率把这件事量化，并得出本章最重要的工程结论：\textbf{回环检测宁可漏检，也不可误检}。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 画一条绕圈的真实轨迹与一条带累积漂移的估计轨迹，标出二者在“回到起点”处的偏差。再画上一条回环边，直观说明它如何把偏差拉回。
+  \item 解释：为什么 GPS 能在室外轻松判断“车是否回到经过的点”，而在室内不行？这与“基于外观”的回环检测有何互补？
+  \item 重定位与回环检测共用地点识别引擎，但触发时机不同。各举一个触发场景。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{回环检测的方法：去哪儿找回环？}
+\label{sec:loop-detect-methods}
+
+\paragraph{桥接：知道“为什么”，还要知道“去哪儿找”。}
+\cref{sec:loop-why} 立了动机：回环就是“察觉相机经过同一地方”这件事。但在着手判断“两帧像不像”之前，有一个更前置的问题：面对一条已经积累了成百上千个关键帧的轨迹，\textbf{当前帧到底该拿去和\emph{哪些}历史帧比对}？这个“候选从何而来”的问题，决定了回环检测能否实时，也决定了下一节“如何算相似度”究竟要算多少次。看待它有若干种思路，理论上的与工程上的都有\cite{gaoxiang2019slam14}。
+
+\paragraph{反面一：朴素全配对，$O(N^2)$ 不可行。}
+最直白的想法是\emph{对任意两幅图像都做一遍特征匹配}，按正确匹配的数量判定哪两帧存在关联——这确实朴素而有效\cite{gaoxiang2019slam14}。但它盲目假设了“任意两帧都可能回环”，于是对 $N$ 个关键帧要检测
+\begin{equation}
+  \binom{N}{2}=\frac{N(N-1)}{2}=O(N^2)
+  \label{eq:loop-allpairs}
+\end{equation}
+次。$O(N^2)$ 随轨迹变长增长得太快：跑十分钟攒下几千帧，配对数就是百万量级，绝大多数实时系统吃不消。
+
+\paragraph{反面二：随机抽样，命中率随 $N$ 暴跌。}
+另一个朴素折中是\emph{随机抽取历史帧}与当前帧比，例如在 $N$ 帧里随机抽 $5$ 帧\cite{gaoxiang2019slam14}。它把每帧的运算量压成\emph{常数}，看似解决了实时性。可惜这种盲目试探有个致命弱点：当历史帧数 $N$ 增大时，恰好抽中“真回环那一帧”的概率随 $1/N$ 衰减，检测效率随轨迹变长而崩塌。随机检测在个别实现里确实管用\cite{lowry2016vpr}，但终究太粗糙——我们至少希望先有一个“\emph{哪处可能出现回环}”的预判，才好不那么盲目地去比对。
+
+\paragraph{核心二分：基于里程计 vs 基于外观。}
+给出这个“预判”的方式大体有两条思路\cite{gaoxiang2019slam14}：
+\begin{itemize}
+  \item \textbf{基于里程计（odometry-based）的几何关系}：当发现\emph{当前估计位姿}运动到了\emph{之前某个估计位姿}附近时，才去检测这两帧有没有回环。直观、省事——只在“空间上挨得近”的帧对里找。
+  \item \textbf{基于外观（appearance-based）的几何关系}：完全\emph{不依赖}前后端给出的位姿估计，仅凭两幅图像的\emph{外观相似性}判定回环。
+\end{itemize}
+这两条思路的命运截然不同，分野的根子在\cref{sec:loop-why} 反复强调的那件事——累积漂移。
+
+\begin{pitfall}[里程计法的逻辑硬伤：倒果为因]\label{pit:loop-odom}
+基于里程计的回环检测看似自洽，实则\textbf{逻辑上倒果为因}\cite{gaoxiang2019slam14}。回环检测的\emph{目的}本是“发现相机回到旧地，从而\emph{消除}累积漂移”；可里程计法却要\emph{先}知道“相机回到了旧地附近”\emph{才}去检测。问题在于：判断“是否回到旧地附近”靠的正是那个\emph{带着累积漂移}的位姿估计——漂移一大，估计轨迹早已偏离真实位置，绕一圈回到起点时估计位姿可能差出几米甚至几十米（见 \cref{sec:loop-why} 的“双重墙”），于是“运动到之前位置附近”这一事实\emph{根本无法被可靠察觉}，回环也就无从谈起。换言之，里程计法把\emph{待消除的漂移}当成了\emph{判断回环的依据}，在漂移较大时必然失效\cite{cummins2008fabmap}。这正是它没能成为主流的根本原因。
+\end{pitfall}
+
+\paragraph{外观法：摆脱累积误差，成为主流。}
+基于外观的方法绕开了这个死结\cite{gaoxiang2019slam14}：它与前端、后端的位姿估计\emph{都无关}，仅根据两幅图像的相似性确定回环关系，因此\textbf{彻底摆脱了累积误差}——无论轨迹漂得多远，只要相机真的回到旧地、拍到相似的画面，外观法就有机会检出。这一独立性还带来工程上的好处：回环检测得以成为 SLAM 中一个\emph{相对独立的模块}（当然，前端仍可为它提供现成的特征点）。自 $21$ 世纪初被提出以来，基于外观的回环检测能在各种场景下稳定工作，迅速\textbf{成为视觉 SLAM 的主流做法}，并被诸多实际系统采用（如 FAB-MAP\cite{cummins2008fabmap}、DBoW2\cite{galvez2012bags}、ORB-SLAM\cite{murartal2015orbslam}）。本章余下部分讲的全是外观法。
+
+\begin{note}
+\textbf{工程视角：GPS 等外部传感器.}\;
+除上述两条思路外，工程上还能借\emph{外部传感器}判回环\cite{gaoxiang2019slam14}。例如室外无人车常配 GPS，能直接给出全局位置，于是“车是否回到某个经过的点”几乎可以白送地判断出来。但 GPS 在室内、隧道、城市峡谷里信号差或不可用，这类方法便失灵——这恰好与基于外观的回环检测形成\emph{互补}：外观法不依赖任何外部定位，室内外通吃。本章主线（视觉外观法）正是为“无 GPS 也要闭环”而生。
+\end{note}
+
+\begin{insight}[“预判候选”这件事贯穿全章]\label{ins:loop-prefilter}
+本节的真正主题，是回环检测里一个一以贯之的张力：\textbf{既要避免 $O(N^2)$ 的盲目全配对，又要让候选预判本身可靠}。里程计法用“位姿相近”预判，却因累积漂移而不可靠（\cref{pit:loop-odom}）；外观法用“画面相似”预判，可靠却仍要解决“别真去比 $N$ 次”的效率问题。后者正是 \cref{sec:loop-bow} 视觉词袋要回答的——把每帧压成一个稀疏向量，再用 \cref{sec:loop-stageA} 的\emph{倒排索引}做\emph{数据库查询}：来一新帧，只与“和它有共同单词”的少数历史帧比较，从而把 \cref{eq:loop-allpairs} 的 $O(N^2)$ 全配对，降成一次高效的库查询。可以说，本章从这里到流水线，都是在把“基于外观”这条正确思路打磨成\emph{又对又快}的工程方案。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 设关键帧以 $1$\,Hz 产生、系统跑 $30$ 分钟。用 \cref{eq:loop-allpairs} 估算朴素全配对的检测次数；若每次特征匹配耗时 $1$\,ms，全配对共需多久？据此说明为何必须用倒排索引（\cref{sec:loop-stageA}）。
+  \item 用一句话概括“里程计法倒果为因”的逻辑漏洞，并指出它在什么情形下\emph{尚能}凑合工作（提示：漂移很小的短轨迹）。
+  \item \textbf{（据标准轨迹反算回环）}人工标注回环很费力，可改用真值轨迹自动生成回环标签：取 TUM 数据集给出的标准轨迹（groundtruth），若两帧位姿的平移距离小于阈值 $d_{\max}$（如 $0.3$\,m）、时间戳间隔又大于 $\Delta t_{\min}$（排除相邻帧），就判定为一对回环。写出该判据的伪码，对某条 TUM 序列跑出回环对集合。然后\emph{打开这些回环对的真实图像逐一查看}：它们\textbf{真的相似吗}？讨论“位姿相近”与“外观相似”何时不一致（如背对同一地点、强光照变化），以及这对“用真值轨迹评测外观式回环检测器”意味着什么。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{相似度、感知混叠与准确率/召回率}
+\label{sec:loop-pr}
+
+\paragraph{桥接：要检回环，先要会量“像不像”。}
+上一节说回环检测的关键是“察觉相机经过同一地方”。在\emph{基于外观}的方法里，这件事被归结为一个核心问题\cite{gaoxiang2019slam14}：\textbf{如何计算两幅图像的相似性} $s(A,B)$？设计一个评分，大于某阈值就认为出现回环。在动手设计评分之前，本节先把“好评分”的评价标准立起来——这决定了后面所有阈值往哪个方向调。
+
+\paragraph{先看一个错误示范：直接相减。}
+一个朴素得近乎本能的想法是：图像就是矩阵，把两幅图像相减取范数
+\begin{equation}
+  s(\mathbf A,\mathbf B)=\lVert\mathbf A-\mathbf B\rVert.
+  \label{eq:loop-naive}
+\end{equation}
+评分越小越像。这个想法在实践中\emph{很差}，原因有二\cite{gaoxiang2019slam14}：
+\begin{enumerate}
+  \item \textbf{像素灰度是不稳定的测量值}，严重受光照与曝光影响。相机一动不动，仅仅打开一盏灯，整幅图就会变亮，对\emph{同一份}场景也会算出很大的差异值。
+  \item \textbf{视角的少量变化}会让每个物体的像素在图像里整体位移，即使物体本身光度不变，逐像素相减也会得到很大的差异值。
+\end{enumerate}
+于是即便两幅图像非常相似，\cref{eq:loop-naive} 也常给出（不符合实际的）很大值。我们需要一种\emph{对光照和小幅视角变化都鲁棒}的相似度——这正是 \cref{sec:loop-bow} 词袋模型的动机。但在此之前，得先有办法判断“一个相似度好不好用”。
+
+\paragraph{从直觉到形式化：四种判断结果。}
+人类能以很高的精度判断“两张照片是不是同一地方拍的”，但我们尚不掌握人脑的工作原理\cite{gaoxiang2019slam14}。退而求其次，我们希望\emph{算法}的判断与事实一致：事实是回环时算法应说“是”，事实不是回环时算法应说“否”。可惜算法的判断不总与事实一致，于是出现四种情况，构成一张\textbf{混淆矩阵}。
+
+\begin{definition}[回环检测的混淆矩阵]\label{def:loop-confusion}
+把“算法判定”与“真值”交叉，得四类结果（借用医学的阴/阳性说法）：
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+ & 真值：是回环 & 真值：不是回环 \\
+\midrule
+算法：是回环 & 真阳性 TP & 假阳性 FP（= 感知偏差）\\
+算法：不是回环 & 假阴性 FN（= 感知变异）& 真阴性 TN \\
+\bottomrule
+\end{tabular}
+\end{center}
+其中 TP=true positive，FP=false positive，FN=false negative，TN=true negative。我们希望 TP、TN 尽量高，FP、FN 尽量低。
+\end{definition}
+
+\noindent 两类错误各有名字与典型成因\cite{gaoxiang2019slam14}。\textbf{假阳性（FP）又称感知偏差（Perceptual Aliasing，亦译感知混叠）}：算法把\emph{不同}地点误判为同一地点。典型例子是两条长得很像但其实不同的走廊被当成回环。\textbf{假阴性（FN）又称感知变异（Perceptual Variability）}：算法\emph{漏检}了真实回环。典型例子是同一地点在不同光照、不同时刻拍出的照片差别太大，被判为不同。
+
+\paragraph{形式化：准确率与召回率。}
+统计某算法在某数据集上 TP、FP、FN、TN 的次数，便可定义两个统计量\cite{gaoxiang2019slam14}：
+\begin{equation}
+  \mathrm{Precision}=\frac{\mathrm{TP}}{\mathrm{TP}+\mathrm{FP}},\qquad
+  \mathrm{Recall}=\frac{\mathrm{TP}}{\mathrm{TP}+\mathrm{FN}}.
+  \label{eq:loop-pr}
+\end{equation}
+它们的字面意义很直白：\textbf{准确率（Precision）}=算法报出的所有“是回环”里，\emph{确实是}真实回环的比例（检出的对不对）；\textbf{召回率（Recall）}=所有真实回环里，\emph{被算法检出}的比例（漏没漏）。
+
+\paragraph{讨论：准确率与召回率是一对矛盾。}
+为什么偏要看这两个量？因为它们有代表性，且\emph{通常此消彼长}\cite{gaoxiang2019slam14}。一个算法往往有许多可调参数：把阈值\emph{调严}，算法更“挑剔”，检出的回环更少——准确率上升，但原本是回环的也被漏掉，召回率下降；把阈值\emph{调松}，检出更多回环——召回率上升，但混进非回环，准确率下降。把不同参数配置下的 $(\mathrm{Recall},\mathrm{Precision})$ 点连起来，就是\textbf{准确率--召回率曲线（P-R 曲线）}：以召回率为横轴、准确率为纵轴。比较两个算法时，关心整条曲线\emph{偏向右上}的程度，常用的实用单点指标是\textbf{“$100\%$ 准确率下的召回率”}与“$50\%$ 召回率时的准确率”。综合指标则用 $F_1$ 值（准确率与召回率的调和平均）：
+\begin{equation}
+  F_1=\frac{2\,\mathrm{Precision}\cdot\mathrm{Recall}}{\mathrm{Precision}+\mathrm{Recall}}.
+  \label{eq:loop-f1}
+\end{equation}
+除非两个算法“天壤之别”，否则通常不能一概而论说 A 优于 B——可能 A 在高准确率端更好，而 B 在高召回率端更好。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=1.0,>=Stealth]
+  \draw[->] (0,0) -- (5.2,0) node[right,font=\small] {Recall};
+  \draw[->] (0,0) -- (0,4.0) node[above,font=\small] {Precision};
+  \foreach \y/\l in {3.6/1.0} \draw (0,\y) node[left,font=\scriptsize] {\l};
+  \draw[dashed,gray] (0,3.6) -- (5,3.6);
+  % good algorithm: stays high then drops
+  \draw[thick, main] (0.1,3.55) .. controls (3.0,3.5) and (3.8,3.2) .. (4.6,1.3)
+       node[pos=0.35,above,font=\scriptsize,main] {好算法};
+  % weaker algorithm: drops earlier
+  \draw[thick, second] (0.1,3.5) .. controls (1.6,3.0) and (2.6,1.8) .. (3.6,0.7)
+       node[pos=0.55,below left,font=\scriptsize,second] {弱算法};
+\end{tikzpicture}
+\caption{准确率--召回率曲线示意。随召回率上升、检测条件变宽松，准确率随之下降；好算法在较高召回率下仍能保持较好准确率（曲线更靠右上）。}
+\label{fig:loop-prcurve}
+\end{figure}
+
+\begin{insight}[SLAM 的取舍：宁缺毋滥]\label{ins:loop-precision}
+P-R 是对称的两个指标，但 SLAM 对它们的态度\emph{严重不对称}\cite{gaoxiang2019slam14}：\textbf{对准确率的要求远高于召回率}。理由直击 \cref{ins:loop-spring}：
+\begin{itemize}
+  \item 一个\textbf{假阳性}回环会往位姿图里加一条\emph{根本错误}的边，后端为满足它而把整段轨迹和地图掰飞——设想 SLAM 错把所有办公桌当成同一张，走廊不直了、墙壁交错、整个地图失效。这是\emph{灾难性}的。
+  \item 一个\textbf{假阴性}（漏检）只是少消了一次漂移，损失有限——而且\emph{仅需一两次正确回环就能消除整段累积误差}，后续重访还有机会补检。
+\end{itemize}
+所以选择回环检测算法时，倾向于把参数设得更\emph{严格}，或在检测之后再加一道\textbf{回环验证}步骤（\cref{sec:loop-pipeline}）。这条原则解释了后面流水线为什么要层层设卡（归一化阈值、时间一致性、几何验证），每一关都在拿召回率换准确率。
+\end{insight}
+
+\begin{pitfall}[陷阱：用“准确率高”单方面宣布算法更好]
+有人看到算法 A 的准确率比 B 高就下结论 A 更优。这忽略了二者是\emph{曲线}而非\emph{单点}。正确做法是看整条 P-R 曲线，或在固定工作点（如 $100\%$ 准确率）下比召回率。DBoW2 的评测就专门强调要\emph{用不同数据集调参与评估}以证明鲁棒性\cite{galvez2012bags}：用一组数据画 P-R 曲线选阈值，用另一组独立数据当黑盒验证，避免在同一数据上“调参 + 报告”造成的过拟合假象。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 某回环检测器在测试集上得 $\mathrm{TP}=80,\mathrm{FP}=5,\mathrm{FN}=40,\mathrm{TN}=10000$。算出准确率、召回率与 $F_1$。
+  \item 写一段伪码：给定一串带真值标签的 $(s,\text{label})$ 评分，扫描阈值画出 P-R 曲线。
+  \item 用 \cref{ins:loop-precision} 的逻辑解释：为什么 SLAM 论文常报告“$100\%$ 准确率下的召回率”，而图像检索论文更常报告 $F_1$ 或 mAP？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{视觉词袋模型}
+\label{sec:loop-bow}
+
+\paragraph{桥接：把“像不像”从像素层抬到“语义”层。}
+\cref{eq:loop-naive} 的失败在于它停留在像素灰度。一个更鲁棒的思路是：\emph{不看像素值，看图像里出现了哪几种特征}。这正是\textbf{词袋（Bag-of-Words, BoW）}的核心\cite{gaoxiang2019slam14}：用“图像上有哪几种特征”来描述一幅图像。
+
+\paragraph{直觉：用“有哪些概念”描述一幅图。}
+例如一张照片里有“一个人、一辆车”，另一张里有“两个人、一只狗”。我们据此度量两图的相似性。把这个想法落地，需要三步\cite{gaoxiang2019slam14}：
+\begin{enumerate}
+  \item 确定“人”“车”“狗”这些概念——它们就是 BoW 里的\textbf{单词（Word）}；许多单词放在一起组成\textbf{字典（Dictionary）}。
+  \item 确定一幅图像里出现了字典中的哪些概念——用单词出现的情况（直方图）描述整幅图像，把图像转成一个\textbf{向量}。
+  \item 比较两个向量的相似程度。
+\end{enumerate}
+
+\paragraph{形式化：图像 $\to$ 单词向量。}
+设字典只记三个单词 $w_1,w_2,w_3$（“人”“车”“狗”）。对图像 $A$，按其含有的单词写成线性组合：
+\begin{equation}
+  A = 1\cdot w_1 + 1\cdot w_2 + 0\cdot w_3.
+  \label{eq:loop-word-lincomb}
+\end{equation}
+字典固定，所以只用向量 $[1,1,0]^{\top}$ 就能表达 $A$ 的“意义”。这个向量描述的是“图像是否含有某类特征”，比单纯的灰度值稳定得多。
+
+\begin{insight}[为什么叫 Bag 而不是 List]\label{ins:loop-bag}
+词袋向量说的是单词\emph{是否出现}，而\emph{不管它出现在哪里}\cite{gaoxiang2019slam14}。因此它\textbf{与物体的空间位置和排列顺序无关}：相机发生少量运动时，只要物体仍在视野里，描述向量就不变。正因为强调“词的有无”而无关“词的顺序”，才叫 \emph{Bag}-of-Words 而非 List-of-Words——字典就像单词的一个\emph{集合}。这个“无序性”是词袋对视角变化鲁棒的根源；但 \cref{sec:loop-pitfalls} 会看到，它同时也是\emph{感知混叠}的温床——丢掉空间结构的代价，要靠几何验证补回。
+\end{insight}
+
+\paragraph{形式化：两向量的相似度（计数版）。}
+用同样的方式，图像 $B$ 可写成 $[2,0,1]^{\top}$（若只看“是否出现”则为二值向量 $[1,0,1]^{\top}$）。对两个向量 $\boldsymbol a,\boldsymbol b\in\mathbb{R}^{W}$，一种朴素的相似度是
+\begin{equation}
+  s(\boldsymbol a,\boldsymbol b)=1-\frac{1}{W}\lVert\boldsymbol a-\boldsymbol b\rVert_1,
+  \label{eq:loop-l1-simple}
+\end{equation}
+其中 $\lVert\cdot\rVert_1$ 取 $L_1$ 范数（各元素绝对值之和），$W$ 为字典单词数。它的边界值很好理解\cite{gaoxiang2019slam14}：两向量\emph{完全一样}时得 $1$；\emph{完全相反}（$\boldsymbol a$ 为 $0$ 处 $\boldsymbol b$ 为 $1$）时得 $0$。这样就把“图像间相似度”定义成了“描述向量间相似度”。
+
+\paragraph{过渡：留下两个待解的问题。}
+到这里，词袋的骨架立起来了，但还有两件事悬而未决\cite{gaoxiang2019slam14}：(1) 字典到底\emph{怎么来}的（一个真实场景的“人车狗”级别概念该如何自动获得）？这是 \cref{sec:loop-dict} 的内容。(2) 即便能算两图相似度，\emph{就足以判断回环了吗}？这是 \cref{sec:loop-score} 与 \cref{sec:loop-pipeline} 的内容。\cref{eq:loop-l1-simple} 还有一个隐患：它对所有单词“一视同仁”，而我们马上会看到，这并不合理。
+
+% ════════════════════════════════════════════════════════════════
+\section{字典：层次 \texorpdfstring{$k$}{k} 叉树}
+\label{sec:loop-dict}
+
+\paragraph{动机：字典生成是一个聚类问题。}
+字典由许多单词组成，每个单词代表一个概念。但单词\emph{不是}从单幅图像里提取的——它不对应某一个特征点，而是\textbf{某一类特征的组合}\cite{gaoxiang2019slam14}。所以“从大量特征里造出字典”本质上是一个\textbf{聚类（Clustering）}问题，属于无监督机器学习。设对大量图像提取了 $N$ 个特征点，想找一个含 $k$ 个单词的字典（每个单词看作一簇局部相邻的特征），最经典的工具就是 $K$-means（$K$ 均值）算法。
+
+\begin{algo}[$K$-means 聚类]\label{alg:loop-kmeans}
+输入：$N$ 个数据点；目标类数 $k$。
+\begin{enumerate}
+  \item \textbf{随机选取} $k$ 个中心点 $c_1,\dots,c_k$。
+  \item 对每个样本，计算它与每个中心点的距离，取最小者作为它的归类。
+  \item 重新计算每个类的中心点（取该类样本的均值）。
+  \item 若每个中心点的变化都很小，则\emph{收敛、退出}；否则\emph{返回第 2 步}。
+\end{enumerate}
+\end{algo}
+
+\noindent $K$-means 朴素、简单、有效，但有几处不足\cite{gaoxiang2019slam14}：需要事先指定聚类数量；随机初始化使每次结果不同；以及一些效率问题。为弥补，研究者提出了\textbf{层次聚类}与 $K$-means++（一种更聪明的初始中心播种法，使结果更稳定均匀）。本章稍后的层次 $k$ 叉树就用 $K$-means++ 来播种每一层。
+
+\paragraph{反面：单层字典的“查找”会变成瓶颈。}
+把 $N$ 个特征聚成含 $k$ 个单词的字典后，立刻冒出一个新问题\cite{gaoxiang2019slam14}：给定图像里的某个特征点，如何在字典里\emph{查到}它对应的单词？最朴素的办法是和每个单词逐一比对、取最相似——这是 $O(W)$ 的线性查找。但为了字典的通用性，实用字典往往很大（一万、十万乃至百万个单词），逐一比较慢得不可接受。一个自然的改进是把字典排序后做二分查找，达到对数级；更进一步，可以用专门的数据结构，例如 FAB-MAP\cite{cummins2008fabmap} 用的 Chow-Liu 树。本书采用的是另一种简单实用的\textbf{树结构}——层次 $k$ 叉树（即 Nister-Stewenius 词汇树\cite{nister2006scalable}），它既组织字典又加速查找。
+
+\begin{algo}[层次 $k$ 叉树字典（层次 $K$-means）]\label{alg:loop-ktree}
+目标：用一棵分支因子为 $k$、深度为 $L$ 的树表达字典（思路是 \cref{alg:loop-kmeans} 的层次化扩展）。设有 $N$ 个特征点：
+\begin{enumerate}
+  \item 在\textbf{根节点}，用 $K$-means（实际中用 $K$-means++ 播种以保证聚类均匀）把所有样本聚成 $k$ 类——这是\emph{第一层}的 $k$ 个节点。
+  \item 对第一层的\emph{每个}节点，把属于它的样本\emph{再聚成 $k$ 类}，得到下一层（$k^2$ 个节点）。
+  \item 依此类推，做满 $L$ 层，最后得到\emph{叶子层}。\textbf{叶子层即为所谓的单词（Words）}；中间节点只用于快速查找。
+\end{enumerate}
+\end{algo}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=1.0,>=Stealth,
+  nd/.style={circle, draw, inner sep=1.4pt, fill=second!20},
+  lf/.style={circle, draw, inner sep=1.4pt, fill=main!25}]
+  \node[nd] (r) at (0,2.4) {};
+  \node[font=\scriptsize] at (-1.4,2.4) {根（$L$ 层）};
+  \node[nd] (a) at (-2,1.2) {}; \node[nd] (b) at (0,1.2) {}; \node[nd] (c) at (2,1.2) {};
+  \foreach \x in {-2.7,-2,-1.3} \node[lf] at (\x,0) {};
+  \foreach \x in {-0.7,0,0.7} \node[lf] at (\x,0) {};
+  \foreach \x in {1.3,2,2.7} \node[lf] at (\x,0) {};
+  \node[font=\scriptsize] at (3.9,0) {叶=单词};
+  \draw (r)--(a) (r)--(b) (r)--(c);
+  \foreach \x in {-2.7,-2,-1.3} \draw (a)--(\x,0.13);
+  \foreach \x in {-0.7,0,0.7} \draw (b)--(\x,0.13);
+  \foreach \x in {1.3,2,2.7} \draw (c)--(\x,0.13);
+\end{tikzpicture}
+\caption{$k=3$、$L=2$ 的层次 $k$ 叉树字典示意。训练时逐层用 $K$-means 聚类；查找单词时从根到叶逐层比对，每层只与 $k$ 个聚类中心比较。}
+\label{fig:loop-ktree}
+\end{figure}
+
+\begin{theorem}[$k$ 叉树字典的容量与查找复杂度]\label{thm:loop-tree-complexity}
+一棵分支因子为 $k$、深度为 $L$ 的字典树，叶子层（单词）数目为
+\begin{equation}
+  W = k^{L}.
+  \label{eq:loop-tree-capacity}
+\end{equation}
+查找某给定特征对应的单词，只需从根到叶逐层进行：每层把该特征与当前节点的 $k$ 个子节点聚类中心比较、选最近者下行，共 $L$ 层，故查找代价为 $O(L\,k)=O(\log_k W)$，即\textbf{对数级别}。
+\end{theorem}
+\begin{proof}
+容量：第一层 $k$ 个节点，第二层每个再分 $k$ 个共 $k^2$，归纳到第 $L$ 层得 $k^L$ 个叶子。查找：每层做 $k$ 次描述子距离比较选最近子节点，共下行 $L$ 层，总比较次数 $Lk$；由 \cref{eq:loop-tree-capacity} 取对数，$L=\log_k W$，故 $O(Lk)=O(k\log_k W)$，对固定 $k$ 即 $O(\log W)$。
+\end{proof}
+
+\begin{insight}[对数查找是词袋能实时的根基]\label{ins:loop-logsearch}
+\cref{thm:loop-tree-complexity} 是整个视觉词袋能在 SLAM 里实时运行的关键。设想一个百万单词的字典（$k=10,L=6$，$k^L=10^6$，DBoW2 默认\cite{galvez2012bags}）：线性查找一个特征要比 $10^6$ 次，而树查找只要 $Lk=60$ 次——\emph{快了约一万倍}。一幅图几百个特征，逐个查单词的总开销因此从“不可接受”降到“毫秒级”。这棵树后面还会“一树两用”：除了检索，几何验证时它还充当近似最近邻索引（\cref{sec:loop-pipeline} 的直接索引）。
+\end{insight}
+
+\subsection{实践：用 DBoW3 训练 ORB 字典}
+\label{sec:loop-dict-practice}
+
+\paragraph{实验设置。}
+我们演示如何生成并使用一个 \textbf{ORB 字典}\cite{gaoxiang2019slam14}。选取 TUM 数据集里的 $10$ 幅图像，来自一组真实相机运动轨迹，其中\emph{第一幅与最后一幅明显采自同一地方}——看算法能否检出这个回环。实用字典通常在更大、更接近目标环境的数据集上训练：字典越大单词越丰富、越容易找到对应单词，但不能大到超出算力与内存。这里先从 $10$ 幅图训练一个小字典练手。所用的词袋库是 DBoW3。
+
+\begin{codebox}[C++]{训练 ORB 字典 feature\_training.cpp}
+int main(int argc, char **argv) {
+    // read the image
+    cout << "reading images... " << endl;
+    vector<Mat> images;
+    for (int i = 0; i < 10; i++) {
+        string path = "./data/" + to_string(i + 1) + ".png";
+        images.push_back(imread(path));
+    }
+    // detect ORB features
+    cout << "detecting ORB features ... " << endl;
+    Ptr<Feature2D> detector = ORB::create();
+    vector<Mat> descriptors;
+    for (Mat &image : images) {
+        vector<KeyPoint> keypoints;
+        Mat descriptor;
+        detector->detectAndCompute(image, Mat(), keypoints, descriptor);
+        descriptors.push_back(descriptor);
+    }
+    // create vocabulary (default: k = 10, L = 5)
+    cout << "creating vocabulary ... " << endl;
+    DBoW3::Vocabulary vocab;
+    vocab.create(descriptors);
+    cout << "vocabulary info: " << vocab << endl;
+    vocab.save("vocabulary.yml.gz");
+    cout << "done" << endl;
+    return 0;
+}
+\end{codebox}
+
+\noindent 流程是：对 $10$ 张图提取 ORB 特征存进 \verb|vector|，再调 DBoW3 的字典生成接口\cite{gaoxiang2019slam14}。\Verb[breaklines]|DBoW3::Vocabulary| 的构造函数可指定树的分支数与深度，这里用默认的 \textbf{$k=10,\ L=5$}——一个小字典，最多容纳 $k^L=10^5=100{,}000$ 个单词（由 \cref{eq:loop-tree-capacity}）。图像特征用默认的每幅 $500$ 个特征点。最后把字典存成压缩文件。运行输出为：
+
+\begin{codebox}[text]{feature\_training 运行输出}
+$ build/feature_training
+reading images...
+detecting ORB features ...
+creating vocabulary ...
+vocabulary info: Vocabulary: k = 10, L = 5, Weighting = tf-idf, \
+Scoring = L1-norm, Number of words = 4983
+done
+\end{codebox}
+
+\noindent 读出：分支数 $k=10$、深度 $L=5$、单词数 $4983$（未达 $10^5$ 上限，因为只用了 $10$ 幅图、特征不够多）。还有两项 \Verb[breaklines]|Weighting = tf-idf|（权重方案）和 \Verb[breaklines]|Scoring = L1-norm|（评分方式）——它们正是 \cref{sec:loop-score} 要讲的 TF-IDF 加权与 $L_1$ 相似度。
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 \cref{eq:loop-tree-capacity} 算：$k=10,L=6$ 与 $k=6,L=10$ 各能容纳多少单词？两者查找代价 $Lk$ 各是多少？说明“宽而浅”与“窄而深”的取舍。
+  \item 为什么从 $10$ 幅图只训出 $4983$ 个单词而非满额 $10^5$？这对回环检测的区分力有何影响（提示：见 \cref{sec:loop-score-practice} 的大字典实验）。
+  \item 用别人训练好的字典时，为什么\emph{必须}核对它用的特征类型（ORB/SURF/SIFT）与你的一致？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{相似度计算：TF-IDF 加权与 \texorpdfstring{$L_1$}{L1} 评分}
+\label{sec:loop-score}
+
+\paragraph{桥接：有了字典，把每幅图变成一个加权稀疏向量。}
+有了字典后，给定任意特征 $f_i$，在字典树中从根到叶逐层查找（\cref{thm:loop-tree-complexity}），就找到它对应的单词 $w_j$——字典足够大时可认为 $f_i$ 与 $w_j$ 来自同一类物体（这只是聚类意义下的近似，无理论保证）\cite{gaoxiang2019slam14}。从一幅图提取 $N$ 个特征、各自找到单词后，就得到该图在单词上的\emph{分布（直方图）}，即一个 Bag。但 \cref{eq:loop-l1-simple} 对所有单词一视同仁，这并不合理——本节就来修正它。
+
+\paragraph{动机：不是所有单词都同样有用。}
+类比文本检索\cite{gaoxiang2019slam14}：“的”“是”在几乎每句话里都出现，对判别句子主题毫无帮助；而“文档”“足球”这类词一出现就极有信息量。视觉单词同理——“天空”“地面”到处都是，区分力低；“某面带涂鸦的墙”很罕见，区分力高。我们希望给单词的\emph{区分性}赋一个权重。最常用的方案是 \textbf{TF-IDF（Term Frequency--Inverse Document Frequency，词频--逆文档频率）}\cite{sivic2003video}，它由两部分相乘构成。
+
+\paragraph{形式化：IDF（建字典时算，全局量）。}
+\textbf{IDF 思想}：某单词在\emph{整个训练语料}里出现得越罕见，它的区分力越高。统计叶节点单词 $w_i$ 对应的特征数占所有特征的比例：设训练语料的特征总数为 $n$、其中落入 $w_i$ 的特征数为 $n_i$，则
+\begin{equation}
+  \mathrm{IDF}_i = \log\frac{n}{n_i}.
+  \label{eq:loop-idf}
+\end{equation}
+单词越罕见（$n_i$ 越小），$\log(n/n_i)$ 越大，IDF 权重越高\cite{gaoxiang2019slam14}。IDF 在\emph{建字典时}一次算好、存进字典。
+
+\paragraph{形式化：TF（来一幅图时算，局部量）。}
+\textbf{TF 思想}：某单词在\emph{当前这一幅图}里出现得越频繁，它对描述这幅图越重要。设图像 $A$ 中一共出现的单词次数为 $n$、其中单词 $w_i$ 出现 $n_i$ 次，则
+\begin{equation}
+  \mathrm{TF}_i = \frac{n_i}{n}.
+  \label{eq:loop-tf}
+\end{equation}
+
+\begin{pitfall}[陷阱：IDF 与 TF 的 $n,n_i$ 含义不同]
+\cref{eq:loop-idf} 与 \cref{eq:loop-tf} 沿用了同一对字母 $n,n_i$，但\textbf{含义完全不同}\cite{gaoxiang2019slam14}：IDF 里的 $n,n_i$ 是\emph{训练语料全局}的特征计数（建字典时统计），是\emph{每个单词固定}的属性；TF 里的 $n,n_i$ 是\emph{当前单幅图像}的单词计数（来图时现算），\emph{随图而变}。把两者混为一谈是初学者读这两式时最常见的误读。读代码时切记：IDF 存在字典里、TF 在 \verb|transform| 一幅图时计算。
+\end{pitfall}
+
+\paragraph{形式化：权重与图像的词袋向量。}
+单词 $w_i$ 的权重就是二者之积：
+\begin{equation}
+  \eta_i = \mathrm{TF}_i \times \mathrm{IDF}_i.
+  \label{eq:loop-weight}
+\end{equation}
+于是图像 $A$ 的全部特征点对应到许多带权单词，组成它的词袋向量\cite{gaoxiang2019slam14}：
+\begin{equation}
+  A = \{(w_1,\eta_1),(w_2,\eta_2),\dots,(w_N,\eta_N)\}\ \stackrel{\mathrm{def}}{=}\ \boldsymbol v_A.
+  \label{eq:loop-bowvec}
+\end{equation}
+相似的特征会落到同一单词上，因此 $\boldsymbol v_A$ 中存在\emph{大量的零}——它是一个\textbf{稀疏向量}，非零部分指示图像 $A$ 含有哪些单词、其值即对应的 TF-IDF 权重。把图像 $I_t$ 转成 $\boldsymbol v_t$ 时，每个 ORB 描述子从根到叶遍历字典树（每层选 Hamming 距离最小的子节点），到达叶子即得其单词\cite{galvez2012bags}。
+
+\paragraph{形式化：两词袋向量的 $L_1$ 相似度评分。}
+给定 $\boldsymbol v_A,\boldsymbol v_B$，如何算它们的相似度？DBoW2 采用的标准 $L_1$ 评分是\cite{galvez2012bags}：
+\begin{equation}
+  s(\boldsymbol v_A,\boldsymbol v_B)=1-\frac{1}{2}\left\lVert\frac{\boldsymbol v_A}{\lvert\boldsymbol v_A\rvert}-\frac{\boldsymbol v_B}{\lvert\boldsymbol v_B\rvert}\right\rVert_1,
+  \label{eq:loop-dbow-score}
+\end{equation}
+即先把两向量按 $L_1$ 范数归一化（$\boldsymbol v/\lvert\boldsymbol v\rvert$，使 $\lVert\widehat{\boldsymbol v}\rVert_1=1$），再取归一化向量之差的 $L_1$ 范数、除以 $2$、用 $1$ 减。归一化保证评分 $s\in[0,1]$：$s=1$ 完全相同，$s=0$ 完全不同；除以 $2$ 是因为两个 $L_1$ 单位向量之差的 $L_1$ 范数最大为 $2$。
+
+\begin{derivation}[\cref{eq:loop-dbow-score} 的等价“直方图交”形式]
+\cref{eq:loop-dbow-score} 还有一个直观的等价写法，便于和常见的“差异性求和”形式对照\cite{gaoxiang2019slam14}。记归一化向量 $\widehat{\boldsymbol v}_A=\boldsymbol v_A/\lvert\boldsymbol v_A\rvert$（各分量非负，且 $\sum_i\widehat v_{Ai}=1$），同理 $\widehat{\boldsymbol v}_B$。对任意两非负标量 $a,b$ 有恒等式
+\[
+  \lvert a-b\rvert = a+b-2\min(a,b).
+\]
+对所有分量求和并利用 $\sum_i\widehat v_{Ai}=\sum_i\widehat v_{Bi}=1$：
+\[
+  \lVert\widehat{\boldsymbol v}_A-\widehat{\boldsymbol v}_B\rVert_1
+  =\sum_i\big(\widehat v_{Ai}+\widehat v_{Bi}-2\min(\widehat v_{Ai},\widehat v_{Bi})\big)
+  =2-2\sum_i\min(\widehat v_{Ai},\widehat v_{Bi}).
+\]
+代回 \cref{eq:loop-dbow-score}：
+\[
+  s(\boldsymbol v_A,\boldsymbol v_B)=1-\tfrac12\Big(2-2\textstyle\sum_i\min(\widehat v_{Ai},\widehat v_{Bi})\Big)
+  =\sum_i\min(\widehat v_{Ai},\widehat v_{Bi}).
+\]
+即 $L_1$ 评分等于两归一化直方图的\textbf{交（重叠量）}：只在两图\emph{都}含有的单词上累加较小的那个权重。这解释了为什么它越大越像——共有的、且权重都高的单词越多，重叠量越大。等价地，可写成只对两图都非零的分量求和的“差异性”形式 $s=\tfrac12\sum_i\big(\lvert v_{Ai}\rvert+\lvert v_{Bi}\rvert-\lvert v_{Ai}-v_{Bi}\rvert\big)$，两种写法描述同一个 $L_1$ 思想。
+\end{derivation}
+
+\begin{note}
+\textbf{其它评分与权重方案.}\;
+DBoW2 库还实现了 $L_2$、$\chi^2$、KL 散度、Bhattacharyya、点积等多种评分，权重方案除 tf-idf 外还有 binary、$\mathrm{TF}$、$\mathrm{IDF}$ 单用等\cite{galvez2012bags}。本书统一采用最常用的 \textbf{tf-idf 权重 + $L_1$ 归一化评分}（即 \cref{eq:loop-weight,eq:loop-dbow-score}，也是 ORB-SLAM\cite{murartal2015orbslam} 与 DBoW3 的默认）。\cref{eq:loop-l1-simple} 是它的“无权重、无归一化”简化版，用于建立直觉。
+\end{note}
+
+\subsection{实践：计算图像间相似度与数据库查询}
+\label{sec:loop-score-practice}
+
+\paragraph{两种比对方式。}
+用 \cref{sec:loop-dict-practice} 训出的字典，可以\emph{图像两两直接比较}，也可以\emph{把历史图像建库、用当前图查库}\cite{gaoxiang2019slam14}。后者更接近真实回环检测（来一新帧，查历史库里最像的几帧）。
+
+\begin{codebox}[C++]{计算相似度 / 数据库查询 loop\_closure.cpp}
+int main(int argc, char **argv) {
+    // read the vocabulary and images
+    cout << "reading database" << endl;
+    DBoW3::Vocabulary vocab("./vocabulary.yml.gz");
+    // DBoW3::Vocabulary vocab("./vocab_larger.yml.gz"); // use large vocab if you want
+    if (vocab.empty()) {
+        cerr << "Vocabulary does not exist." << endl;
+        return 1;
+    }
+    cout << "reading images... " << endl;
+    vector<Mat> images;
+    for (int i = 0; i < 10; i++) {
+        string path = "./data/" + to_string(i + 1) + ".png";
+        images.push_back(imread(path));
+    }
+    // NOTE: here we compare images with a vocabulary generated by
+    // themselves, this may lead to overfit.
+
+    // detect ORB features
+    cout << "detecting ORB features ... " << endl;
+    Ptr<Feature2D> detector = ORB::create();
+    vector<Mat> descriptors;
+    for (Mat &image : images) {
+        vector<KeyPoint> keypoints;
+        Mat descriptor;
+        detector->detectAndCompute(image, Mat(), keypoints, descriptor);
+        descriptors.push_back(descriptor);
+    }
+
+    // (1) compare images directly
+    cout << "comparing images with images " << endl;
+    for (int i = 0; i < images.size(); i++) {
+        DBoW3::BowVector v1;
+        vocab.transform(descriptors[i], v1);
+        for (int j = i; j < images.size(); j++) {
+            DBoW3::BowVector v2;
+            vocab.transform(descriptors[j], v2);
+            double score = vocab.score(v1, v2);
+            cout << "image " << i << " vs image " << j << " : " << score << endl;
+        }
+        cout << endl;
+    }
+
+    // (2) compare an image with a database
+    cout << "comparing images with database " << endl;
+    DBoW3::Database db(vocab, false, 0);
+    for (int i = 0; i < descriptors.size(); i++)
+        db.add(descriptors[i]);
+    cout << "database info: " << db << endl;
+    for (int i = 0; i < descriptors.size(); i++) {
+        DBoW3::QueryResults ret;
+        db.query(descriptors[i], ret, 4); // max result = 4
+        cout << "searching for image " << i << " returns " << ret << endl << endl;
+    }
+    cout << "done." << endl;
+}
+\end{codebox}
+
+\noindent 程序先把每幅图 \verb|transform| 成稀疏的 BoW 向量（每个条目是 \Verb[breaklines]|<单词ID, 权重>|），再用 \verb|score| 按 \cref{eq:loop-dbow-score} 算相似度。数据库版本则用\textbf{倒排索引}：查询时只与“和当前图有共同单词”的历史图比较，而非遍历全库（\cref{sec:loop-pipeline} 详述）。以 image 0 为例的相似度输出：
+
+\begin{codebox}[text]{image 0 与各图相似度（小字典 4983 词）}
+image 0 vs image 0 : 1
+image 0 vs image 1 : 0.0234552
+image 0 vs image 2 : 0.0225237
+image 0 vs image 3 : 0.0254611
+image 0 vs image 4 : 0.0253451
+image 0 vs image 5 : 0.0272257
+image 0 vs image 6 : 0.0217745
+image 0 vs image 7 : 0.0231948
+image 0 vs image 8 : 0.0311284
+image 0 vs image 9 : 0.0525447
+\end{codebox}
+
+\noindent 数据库查询会按相似度排序返回最像的几帧（这里取 $4$ 个）：
+
+\begin{codebox}[text]{数据库查询结果（小字典，节选）}
+searching for image 0 returns 4 results:
+<EntryId: 0, Score: 1>
+<EntryId: 9, Score: 0.0525447>
+<EntryId: 8, Score: 0.0311284>
+<EntryId: 5, Score: 0.0272257>
+
+searching for image 9 returns 4 results:
+<EntryId: 9, Score: 1>
+<EntryId: 0, Score: 0.0525447>
+<EntryId: 3, Score: 0.0357317>
+<EntryId: 2, Score: 0.0348702>
+\end{codebox}
+
+\paragraph{讨论：结果对了，但“没那么明显”。}
+明显相似的图 1 和图 10（C++ 下标 $0$ 和 $9$）相似度约 $0.0525$，其他图约 $0.02$\cite{gaoxiang2019slam14}。从人类视角，我们觉得图 1、10 至少有七八成相似、其他图两三成；但程序给出的是无关图约 $2\%$、相似图约 $5\%$——\emph{数值差距没有想象中那么大}。这是不是我们想要的结果？这个“不明显”正是下面两节要处理的：先增大字典（\cref{sec:loop-score-bigdict}），再用归一化和流水线放大真回环的相对优势（\cref{sec:loop-pipeline}）。
+
+\subsection{增大字典规模的效果}
+\label{sec:loop-score-bigdict}
+
+\paragraph{动机：先怀疑“字典太小”。}
+机器学习里结果不满意，第一反应常是“数据/模型规模是否够大”\cite{gaoxiang2019slam14}。这里也一样：小字典只从 $10$ 幅图训练，单词太少、太“粗”，区分力自然有限。换一个对同一数据序列\emph{全部约 $2900$ 幅图}训练的较大字典（规模仍 $k=10,L=5$，实测 $99566$ 个单词，接近 $10^5$ 上限），重跑数据库查询：
+
+\begin{codebox}[text]{数据库查询结果（大字典 99566 词，节选）}
+database info: Database: Entries = 10, Using direct index = no. \
+Vocabulary: k = 10, L = 5, Weighting = tf-idf, \
+Scoring = L1-norm, Number of words = 99566
+searching for image 0 returns 4 results:
+<EntryId: 0, Score: 1>
+<EntryId: 9, Score: 0.0320906>
+<EntryId: 8, Score: 0.0103268>
+<EntryId: 4, Score: 0.0066729>
+\end{codebox}
+
+\paragraph{讨论：相对优势被放大了。}
+对比小、大两个字典对 image 0 的查询：
+
+\begin{table}[H]\centering\small
+\caption{小字典 vs 大字典：image 0 的 top 匹配评分}
+\label{tab:loop-bigdict}
+\begin{tabular}{lll}
+\toprule
+image 0 的 top 匹配 & 小字典（$4983$ 词）& 大字典（$99566$ 词）\\
+\midrule
+回环帧 EntryId 9（真回环）& $0.0525$ & $0.0321$ \\
+次相似帧 EntryId 8 & $0.0311$ & $0.0103$ \\
+回环帧 / 次相似帧 之比 & $\approx 1.7$ & $\approx 3.1$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 字典增大后，\emph{无关图像的相似度明显变小}（从约 $0.02$ 降到约 $0.006$--$0.01$）；真回环帧的分值虽也略降（$0.0525\to0.0321$），但\textbf{相对于其他图像变得更显著}——回环帧与次相似帧的比值从 $1.7$ 拉大到 $3.1$\cite{gaoxiang2019slam14}。这说明\textbf{增大字典训练样本是有益的}：更细的单词让“无关”更彻底地无关，真回环更容易脱颖而出。这也再次印证：判断回环不该看相似度的\emph{绝对值}，而要看它\emph{相对}于参照的高低——这正是下一节归一化的思想。
+
+% ════════════════════════════════════════════════════════════════
+\section{从评分到回环：检测流水线}
+\label{sec:loop-pipeline}
+
+\paragraph{桥接：单看一个评分不足以判回环。}
+\cref{sec:loop-score-practice} 已经暴露问题：相似度的绝对值随环境与查询图剧烈变化，无法设一个统一阈值。\cref{ins:loop-precision} 又要求我们把准确率逼到接近 $100\%$。工业级回环检测（以 DBoW2\cite{galvez2012bags} 为代表）因此把“从评分到回环”拆成四个阶段，层层设卡，每一关挡掉一类错误：\textbf{A 数据库查询与归一化 $\to$ B 岛屿分组 $\to$ C 时间一致性 $\to$ D 几何验证}。本节逐阶段展开。
+
+\subsection{阶段 A：数据库查询与相似度归一化}
+\label{sec:loop-stageA}
+
+\paragraph{倒排索引：只和“有共同单词”的图比。}
+新图 $I_t$ 来时，先转成词袋向量 $\boldsymbol v_t$，再用\textbf{倒排索引（inverse index）}检索数据库\cite{galvez2012bags}：对词典每个单词 $w_i$，库里存一份“含该单词的历史图像列表”及其权重。查询时只与“和 $\boldsymbol v_t$ 有共同单词”的历史图比较，而非遍历全库——这是检索能实时的第二个加速点（第一个是 \cref{thm:loop-tree-complexity} 的对数查找）。
+
+\paragraph{动机：绝对评分不可比，要归一化。}
+检索得到一串候选 $\langle\boldsymbol v_t,\boldsymbol v_{t_j}\rangle$ 及评分 $s(\boldsymbol v_t,\boldsymbol v_{t_j})$。但 \cref{sec:loop-score-practice} 已说明：评分的取值范围强烈依赖查询图本身（有些环境处处相似、有些处处不同），不同查询图的 $s$ 不可直接比、不可设统一阈值。
+
+\paragraph{解法：用“先验相似度”归一化。}
+取一个\textbf{先验相似度} $s(\boldsymbol v_t,\boldsymbol v_{t-\Delta t})$——当前关键帧与\emph{上一关键帧}的相似度，作为“这一段序列里 $\boldsymbol v_t$ 能期望达到的满分参照”（相邻帧外观应当最像）。其余评分都参照它归一化\cite{galvez2012bags,gaoxiang2019slam14}：
+\begin{equation}
+  s'(\boldsymbol v_t,\boldsymbol v_{t_j})=\frac{s(\boldsymbol v_t,\boldsymbol v_{t_j})}{s(\boldsymbol v_t,\boldsymbol v_{t-\Delta t})}.
+  \label{eq:loop-normscore}
+\end{equation}
+归一化后，判据变成相对的、与环境无关的：一个常用的实用门限是\textbf{“当前帧与某历史关键帧的相似度超过它与上一关键帧相似度的 $3$ 倍”}（即 $s'\gtrsim 3$）才作回环候选\cite{gaoxiang2019slam14}。这避免了引入绝对相似度阈值，使算法适应更多环境。一般地，把 $s'$ 的接受门限记为 $\alpha$。
+
+\begin{pitfall}[陷阱：转弯时先验相似度会“塌方”]
+\cref{eq:loop-normscore} 有一个退化情形\cite{galvez2012bags}：机器人\emph{转弯}时，相邻两帧外观差异很大，先验相似度 $s(\boldsymbol v_t,\boldsymbol v_{t-\Delta t})$ 变得很小，作分母会把 $s'$ \emph{错误地抬高}，制造假候选。对策：\textbf{跳过}那些先验相似度达不到最小值、或特征数不足的图像（认为此刻无法可靠归一化）。这个最小值要在“可用图像数”与“$s'$ 的正确性”之间权衡，通常\emph{取小}以免丢弃有效图像。
+\end{pitfall}
+
+\subsection{阶段 B：匹配分组成岛屿}
+\label{sec:loop-stageB}
+
+\paragraph{动机：连续帧会“分票”。}
+时间上相近的历史图像（同一段重访里的连续帧）会\emph{互相竞争}评分，把“票”分散到好几帧上，使任何单独一帧都不够突出\cite{galvez2012bags}。解决办法是把它们\textbf{聚成一个“岛屿（island）”当作一个匹配整体}处理。
+
+\begin{definition}[岛屿与岛屿评分]\label{def:loop-island}
+记 $T_i$ 为一段连续的时间戳区间 $t_{n_i},\dots,t_{m_i}$，$V_{T_i}$ 为把这些条目 $\boldsymbol v_{t_{n_i}},\dots,\boldsymbol v_{t_{m_i}}$ 聚到一起的\textbf{岛屿}。若连续匹配之间的时间间隙很小，则把多条匹配 $\langle\boldsymbol v_t,\boldsymbol v_{t_{n_i}}\rangle,\dots,\langle\boldsymbol v_t,\boldsymbol v_{t_{m_i}}\rangle$ 合并为单条 $\langle\boldsymbol v_t,V_{T_i}\rangle$。岛屿评分定义为岛内各帧归一化评分之和\cite{galvez2012bags}：
+\begin{equation}
+  H(\boldsymbol v_t,V_{T_i})=\sum_{j=n_i}^{m_i} s'(\boldsymbol v_t,\boldsymbol v_{t_j}).
+  \label{eq:loop-island}
+\end{equation}
+取 $H$ 最高的岛屿 $V_{T'}$ 作为匹配组，进入下一阶段。
+\end{definition}
+
+\begin{insight}[岛屿天然偏好真回环]\label{ins:loop-island}
+\cref{eq:loop-island} 用\emph{求和}而非取最大，这一选择别有深意\cite{galvez2012bags}：若 $I_t$ 与 $I_{t'}$ 是真实回环，那么 $I_t$ 很可能也与 $I_{t'\pm\Delta t},I_{t'\pm2\Delta t},\dots$ 相似，从而形成一个\emph{长岛屿}；而偶发的感知混叠往往只命中孤立的一两帧，形成短岛。因为 $H$ 是和，\textbf{长岛得分高}——岛屿机制因此天然偏向真回环，既避免了连续帧互撞分票，又把“一片连续的相似”作为正回环的证据。
+\end{insight}
+
+\subsection{阶段 C：时间一致性}
+\label{sec:loop-stageC}
+
+\paragraph{动机：真回环应当“持续”出现。}
+得到最佳岛屿 $V_{T'}$ 后，还要检查它与\emph{前若干次查询}的\textbf{时间一致性}\cite{galvez2012bags}。直觉是：真回环不会只闪现一帧——当机器人持续走过一段重访区域时，连续几帧都应指向历史中\emph{同一片}区域，且随时间平滑移动。偶发的感知混叠很难连续多次自洽。
+
+\begin{definition}[时间一致性判据]\label{def:loop-temporal}
+匹配 $\langle\boldsymbol v_t,V_{T'}\rangle$ 必须与 $k$ 个先前匹配 $\langle\boldsymbol v_{t-\Delta t},V_{T_1}\rangle,\dots,\langle\boldsymbol v_{t-k\Delta t},V_{T_k}\rangle$ \emph{一致}，且要求相邻区间 $T_j$ 与 $T_{j+1}$ 近似重叠（历史几次回环都指向同一片区域、随时间平滑移动）\cite{galvez2012bags}。通过后，只保留岛内使 $s'$ 最大的那条匹配 $\langle\boldsymbol v_t,\boldsymbol v_{t'}\rangle$ 作为\textbf{回环候选}，交给几何验证最终裁决。
+\end{definition}
+
+\noindent 参数 $k$ 由实验确定\cite{galvez2012bags}：测 $k\in[0,4]$，从 $k=0$（关闭时间一致性）到 $k>0$ 在各工作频率下都\emph{大幅改善}准确率；$k$ 越大、$100\%$ 准确率下召回率越高，但过大只能找到很长的闭环（召回反降）。DBoW2 最终取 \textbf{$k=3$}，并验证它对帧率稳定。十四讲与 ORB-SLAM\cite{murartal2015orbslam} 的表述一致：某一位姿附近\emph{连续 $3$ 次}与历史某位姿附近出现回环，才判为回环；ORB-SLAM 进一步要求\emph{共视一致性}（候选须在连续 $3$ 个共视关键帧组中都出现）\cite{gaoxiang2019slam14}。
+
+\subsection{阶段 D：几何验证}
+\label{sec:loop-stageD}
+
+\paragraph{动机：词袋丢了空间结构，必须补回。}
+回顾 \cref{ins:loop-bag}——词袋只看“单词有无”、不看“单词排列”，因此完全丢失了空间结构信息，且\emph{完全依赖外观、不用任何几何}。这让外观相似的不同地点极易被误判（感知混叠）。所以候选回环最后必须过一道\textbf{几何验证}：检查两幅图能否用\emph{同一个几何变换}解释足够多的特征对应——这是对感知混叠最强的一道关卡。
+
+\paragraph{形式化：RANSAC 求几何模型。}
+DBoW2 的几何验证是\cite{galvez2012bags}：在候选回环的两幅图 $I_t,I_{t'}$ 之间，用 \textbf{RANSAC 估一个基础矩阵 $\mathbf F$}（对极几何，见 \cref{ch:vo}），要求至少 \textbf{$12$ 个对应点}支持，否则拒绝该候选。求对应点本可以穷举（$I_t$ 每个特征与 $I_{t'}$ 全部特征比，$O(n^2)$），但 DBoW2 用了一个巧思——\textbf{直接索引（direct index）}。
+
+\begin{insight}[一棵树两用：直接索引]\label{ins:loop-direct}
+DBoW2 把\emph{同一棵词汇树}既当检索器、又当近似最近邻匹配器\cite{galvez2012bags}。入库时，对每幅图记录“它的各单词在词汇树\emph{第 $l$ 层}的祖先节点”及挂在这些节点上的局部特征列表。几何验证时，\emph{只在“第 $l$ 层属于同一祖先节点”的特征之间}找对应——把 $O(n^2)$ 穷举降为局部匹配。$l$ 是个权衡旋钮：$l=0$（只比同一单词）最快但对应点少、会因缺对应而拒掉部分正确回环（降召回）；$l$ 越大召回越不受影响、但提速越小。实测取 $l=2$ 或 $3$ 时，几何验证约 $0.8$ ms，召回 $56$--$57\%$，逼近穷举的 $61\%$，而穷举/$k$-d 树要 $14$ ms——\emph{约 $18$ 倍提速、召回仅略降}。
+\end{insight}
+
+\noindent 几何验证还有一个“买一送一”的好处\cite{galvez2012bags}：算完 $\mathbf F$ 后，顺带就得到了两图之间的\emph{特征数据关联}，可零成本提供给后端构建回环约束（即 \cref{sec:loop-backend} 的回环边测量）。
+
+\paragraph{讨论：单目用对极几何，有 3D 用 PnP。}
+几何验证的具体形式取决于是否有 $3$D 信息\cite{gaoxiang2019slam14}：
+\begin{itemize}
+  \item \textbf{纯单目}（无尺度、无 $3$D 路标）：用\emph{对极几何（基础/本质矩阵）+ RANSAC}，如 DBoW2、以及 VINS-Mono 的第一步 $2$D-$2$D 验证\cite{qin2018vins}。
+  \item \textbf{有 $3$D 路标}（双目/RGB-D/已三角化）：用 \emph{PnP + RANSAC}，如 VINS-Mono 的第二步 $3$D-$2$D 验证。无论哪种，回环候选都\emph{仍须做特征匹配、内点足够才确认回环}\cite{gaoxiang2019slam14}。
+\end{itemize}
+两者的对极几何/PnP 推导都在 \cref{ch:vo} 给出，本章直接调用。VINS-Mono 正是把这两步 RANSAC 串起来：先 $2$D-$2$D 基础矩阵剔外点，再 $3$D-$2$D PnP，内点数超阈值才确认回环并重定位\cite{qin2018vins}。
+
+\subsection{关键帧的处理：稀疏化与回环聚类}
+\label{sec:loop-keyframe}
+
+\paragraph{动机：用于回环的帧应当稀疏。}
+还有两个实践细节决定流水线好不好用\cite{gaoxiang2019slam14}。其一，\textbf{关键帧不能选得太近}：若两关键帧靠得太近，它们相似度本就过高，相比之下反而不易检出历史里的真回环（检测结果老是“第 $n$ 帧最像第 $n-2,n-3$ 帧”，平凡而无意义）。所以用于回环检测的帧最好\emph{稀疏}些，彼此不太像、又能覆盖整个环境。
+
+\paragraph{动机：避免反复检测同一回环。}
+其二，\textbf{回环聚类}：若成功检出第 $1$ 帧与第 $n$ 帧的回环，那么第 $n+1,n+2$ 帧很可能也与第 $1$ 帧构成回环。但确认第 $1$ 帧与第 $n$ 帧的回环已经帮后端消除了那段累积误差，\emph{后续这些“近亲”回环带来的新信息很有限}。所以应把“相近”的回环\emph{聚成一类}，避免反复检测同一类回环、徒增后端负担\cite{gaoxiang2019slam14}。
+
+\begin{algo}[完整视觉回环检测流水线]\label{alg:loop-pipeline}
+对每个新关键帧 $I_t$：
+\begin{enumerate}
+  \item 提 ORB 特征 $\to$ 经词汇树（\cref{thm:loop-tree-complexity}）转 TF-IDF 词袋向量 $\boldsymbol v_t$（\cref{eq:loop-bowvec}）；
+  \item 经倒排索引检索数据库，得候选及评分 $s$（\cref{eq:loop-dbow-score}）；
+  \item 用先验相似度归一化得 $s'$（\cref{eq:loop-normscore}），跳过转弯等退化帧，按门限 $\alpha$ 取候选；
+  \item 把连续候选聚成岛屿、取 $H$ 最高岛 $V_{T'}$（\cref{eq:loop-island}）；
+  \item 检查与前 $k=3$ 次查询的时间一致性（\cref{def:loop-temporal}），保留岛内最佳候选 $\langle\boldsymbol v_t,\boldsymbol v_{t'}\rangle$；
+  \item 几何验证：RANSAC 求 $\mathbf F$（或 PnP），$\ge 12$ 内点才确认（\cref{sec:loop-stageD}）；
+  \item 确认后，把相对位姿 $\hat{\mathbf T}_{t,t'}$ 与信息矩阵作为\emph{回环边}加入位姿图（\cref{sec:loop-backend}），触发一次全局优化；做回环聚类避免重复。
+\end{enumerate}
+\end{algo}
+
+% ════════════════════════════════════════════════════════════════
+\section{感知混叠：本质与四道防线}
+\label{sec:loop-pitfalls}
+
+\paragraph{桥接：把散落各处的“防 FP”串成一条逻辑。}
+\cref{sec:loop-pr} 立了“SLAM 重准确率”的原则，\cref{sec:loop-pipeline} 给了四个阶段；本节把它们的内在逻辑挑明——这些设计统统是在对抗同一个敌人：感知混叠。
+
+\begin{definition}[感知混叠]\label{def:loop-aliasing}
+\textbf{感知混叠（perceptual aliasing）}指\emph{不同地点产生相似视觉结构}（走廊、建筑立面、重复纹理、同款家具），导致算法把它们错误匹配为同一地点，即产生\emph{假阳性（FP）}\cite{cummins2008fabmap}。它是回环检测中假阳性的主因，也是 \cref{ins:loop-bag} 所说“词袋丢空间结构”的直接代价。
+\end{definition}
+
+\begin{insight}[防 FP 的四道防线]\label{ins:loop-defense}
+本章对抗感知混叠的手段，恰好构成层层递进的四道防线，每道各拦一类 FP：
+\begin{enumerate}
+  \item \textbf{TF-IDF 降权高频单词}（\cref{eq:loop-weight}）：罕见单词区分度高，削弱“到处都有的常见结构”的迷惑性——从\emph{特征层}抑制混叠。
+  \item \textbf{相似度归一化 $s'$ + 门限 $\alpha$}（\cref{eq:loop-normscore}）：用先验相似度归一，滤掉“环境本就相似”造成的虚高分——从\emph{评分层}抑制混叠。
+  \item \textbf{时间一致性 $k$}（\cref{def:loop-temporal}）：要求连续 $k$ 帧都指向同一历史区域——偶发混叠很难连续 $k$ 次自洽，从\emph{时间层}抑制混叠。
+  \item \textbf{几何验证（RANSAC + 对极/PnP）}（\cref{sec:loop-stageD}）：外观像但几何对不上（无法用同一 $\mathbf F$/位姿解释足够多对应）的候选被剔除——从\emph{空间结构层}抑制混叠，是最强的一道关。
+\end{enumerate}
+四道防线层层把召回率换准确率，正是 \cref{ins:loop-precision} “宁缺毋滥”原则的工程落地。DBoW2 正因这套设计，在五个公开数据集上报告\emph{零假阳性}\cite{galvez2012bags}。
+\end{insight}
+
+\paragraph{延伸：FAB-MAP 的概率应对。}
+还有一条不同的技术路线——FAB-MAP\cite{cummins2008fabmap} 把词袋扩展为\emph{外观空间的生成模型 + 贝叶斯滤波}，\textbf{显式建模感知混叠}：它学习“地点外观的生成模型”，从而能区分“两观测相似是因为同一地点”还是“因为不同地点恰好长得像”，用概率的方式把后者压下去。它本质上是“外观空间里的 SLAM”，复杂度对地图中地点数是线性的，适合在线回环检测。本章主线（DBoW2 四道防线）与 FAB-MAP（概率建模）是应对感知混叠的两种代表性范式。
+
+% ════════════════════════════════════════════════════════════════
+\section{与位姿图后端的接口}
+\label{sec:loop-backend}
+
+\paragraph{桥接：把检出的回环变成后端能吃的“一条边”。}
+\cref{alg:loop-pipeline} 的终点是一条确认的回环。本节交代它如何对接 \cref{ch:nlopt} 的位姿图后端——这是回环检测“消漂移”承诺的最终兑现。
+
+\paragraph{形式化：回环检测的产物。}
+回环检测的最终产物是\textbf{一条位姿图回环边}：一对回环关键帧 $(i,j)$ + 几何验证（\cref{sec:loop-stageD}）解出的\emph{相对位姿测量} $\hat{\mathbf T}_{ij}\in\SE(3)$ + 信息矩阵 $\boldsymbol\Lambda_{ij}=\boldsymbol\Sigma_{ij}^{-1}$。它与里程计边\emph{形式完全相同}，只是连接的两个节点在时间上相距很远。
+
+\paragraph{对接：位姿图残差（右扰动主线）。}
+\cref{ch:nlopt}（\cref{eq:nlopt-pg-cost}）给出的位姿图目标函数，按全书右扰动约定，残差为
+\begin{equation}
+  \mathbf e_{ij}=\mathrm{Log}\!\big(\hat{\mathbf T}_{ij}^{-1}\,\mathbf T_i^{-1}\mathbf T_j\big)\in\mathbb{R}^6,\qquad
+  \min_{\{\mathbf T_i\}}\ \frac12\sum_{(i,j)\in\mathcal E}\lVert\mathbf e_{ij}\rVert_{\boldsymbol\Sigma_{ij}}^2,
+  \label{eq:loop-pg-residual}
+\end{equation}
+其中 $\mathcal E$ = \emph{里程计边} $\cup$ \emph{回环边}。里程计边的 $\hat{\mathbf T}_{ij}$ 来自前端相邻关键帧（\cref{ch:vo}）；\textbf{回环边} 的 $\hat{\mathbf T}_{ij}$ 就是本章 \cref{sec:loop-stageD} 几何验证解出的相对位姿。这正是 \cref{ch:nlopt} “球”位姿图里那些层间长程边的物理来源。
+
+\begin{insight}[回环边是稀疏图变“loopy”的唯一原因]\label{ins:loop-loopy}
+\cref{ch:nlopt} 指出：直线前进得到带状（稀疏）位姿图，来回环绕（loopy）得到含长程边的图。把这两件事接起来就清楚了——\textbf{回环边就是制造“loopy”的那些长程边}。没有它，位姿图只是一条链，后端只能让链内部协调、无法消除整链的累积偏移（呼应 \cref{sec:loop-why} 的动机）。一条正确的回环边一旦加入并优化，整段漂移被瞬间“拉回”（\cref{ins:loop-spring} 的弹簧）。
+\end{insight}
+
+\begin{pitfall}[陷阱：假阳性回环边 = 后端灾难，需双保险]
+\cref{ins:loop-precision} 的“宁缺毋滥”在后端有第二层含义\cite{gaoxiang2019slam14}：哪怕几何验证已经很严，仍可能漏过个别假阳性回环边，它们在 \cref{eq:loop-pg-residual} 的二次代价里会\emph{主导}优化、把回环处的轨迹“拉飞”。所以工程上设两道保险：\emph{几何验证（RANSAC 预剔）}在前端挡掉大部分错匹配（\cref{sec:loop-stageD}），\emph{鲁棒核（Huber/Cauchy），非凸情形用 GNC} 在后端再降低残余外点的影响（见 \cref{ch:nlopt}）。两者首尾呼应，缺一不可。
+\end{pitfall}
+
+\paragraph{讨论：触发时机与自由度。}
+几个常被忽略的工程点\cite{gaoxiang2019slam14,murartal2015orbslam,qin2018vins}：
+\begin{itemize}
+  \item \textbf{触发全局优化的时机}：前端每关键帧检测回环，但只有\emph{检出并验证通过后}才触发一次全局位姿图优化或回环后完整 BA——回环线程平时几乎不工作，一触发则代价较大。
+  \item \textbf{增量后端}：激光 SLAM（LIO-SAM/LeGO-LOAM）常用 iSAM2/Bayes 树把回环因子\emph{增量}并入因子图\cite{kaess2012isam2}，避免每次回环都全量重解。
+  \item \textbf{尺度自由度}：单目回环后位姿图是 \emph{$7$-DOF}（含尺度，ORB-SLAM 用 Sim$(3)$ 闭环\cite{murartal2015orbslam}）；VIO 因 IMU 固定了尺度与重力，漂移仅 \emph{$4$-DOF}（$3$D 平移 + yaw），故 VINS-Mono 只优化 $4$-DOF 位姿图\cite{qin2018vins}。
+\end{itemize}
+
+\subsection{单目闭环的 Sim(3) 计算与矫正}
+\label{sec:loop-sim3}
+
+\paragraph{桥接：把上面一句带过的“$7$-DOF/Sim(3)”补全。}
+上面“尺度自由度”一条说单目回环后位姿图是 $7$-DOF、ORB-SLAM 用 Sim$(3)$ 闭环\cite{murartal2015orbslam}。这一节把这件只点了一句的事讲透：\emph{为什么}单目偏要在相似变换群上闭环、相对位姿\emph{怎么解}、解出后又如何把它\textbf{传播}到整张地图把漂移“拉回”。\cref{eq:loop-pg-residual} 的回环边假设测量是 $\hat{\mathbf T}_{ij}\in\SE(3)$；单目的特殊之处恰在这里失效，需要换一个群——这正是本节要补的“缺口”。
+
+\paragraph{动机：单目的累积漂移不止于位姿，还有\emph{尺度}。}
+回顾 \cref{ch:vo}：纯单目视觉里程计\emph{无法观测绝对尺度}，三角化出的路标与平移量都只确定到一个未知的全局比例因子。更要命的是，这个尺度因子本身\emph{会随时间漂移}（scale drift）——每段里程计各自“以为”的单位长度并不一致，绕场一周回到旧地时，新老两段轨迹不仅\emph{平移/朝向}对不上，连\emph{尺寸}都不一样大。于是几何验证（\cref{sec:loop-stageD}）即便正确配上了两帧的特征，用一个刚体变换 $\hat{\mathbf T}_{ij}\in\SE(3)$（$6$-DOF：$3$ 旋转 $+$ $3$ 平移）也\emph{无法}把它们对齐——刚体变换不含缩放。必须给相对位姿测量\textbf{额外松一个尺度自由度}，凑成 $7$-DOF，才能同时吸收旋转、平移与尺度漂移\cite{murartal2015orbslam}。这就是相似变换群 Sim$(3)$。
+
+\begin{definition}[三维相似变换群 \texorpdfstring{$\mathrm{Sim}(3)$}{Sim(3)}]\label{def:loop-sim3}
+\textbf{三维相似变换（similarity transformation）}在刚体变换上再叠一个正的均匀缩放 $s>0$。把空间点 $\mathbf p\in\mathbb R^3$ 变到 $\mathbf p'$ 的作用为
+\begin{equation}
+  \mathbf p' = s\,\mathbf R\,\mathbf p + \mathbf t,\qquad \mathbf R\in\SO(3),\ \mathbf t\in\mathbb R^3,\ s>0,
+  \label{eq:loop-sim3-action}
+\end{equation}
+其矩阵表示（齐次坐标下）记为
+\begin{equation}
+  \mathbf S=\begin{bmatrix} s\,\mathbf R & \mathbf t\\ \mathbf 0^\top & 1\end{bmatrix}\in\mathrm{Sim}(3).
+  \label{eq:loop-sim3-mat}
+\end{equation}
+全体这样的 $\mathbf S$ 在矩阵乘法下构成李群 $\mathrm{Sim}(3)$，自由度为 $7$（$3+3+1$），其李代数 $\mathfrak{sim}(3)$ 相应有 $7$ 维，比 $\SE(3)$ 多出的那一维正对应尺度。令 $s=1$ 即退化回 $\SE(3)$。
+\end{definition}
+
+\noindent$\mathrm{Sim}(3)$ 的指数/对数映射、右雅可比与伴随，与 \cref{ch:lie} 对 $\SO(3)/\SE(3)$ 所建的那套工具同构（只是多一维尺度分量），本章不重复推导；下文凡涉及 $\mathrm{Sim}(3)$ 上的扰动与残差求导，一律沿用全书\textbf{右扰动}约定（\cref{ch:lie}），即在状态\emph{右乘}一个小量 $\mathrm{Exp}(\delta\boldsymbol\xi)$、对 $\delta\boldsymbol\xi\in\mathbb R^7$ 求导。
+
+\paragraph{形式化：单目回环边的残差升级为 \texorpdfstring{$\mathrm{Sim}(3)$}{Sim(3)}。}
+把 \cref{eq:loop-pg-residual} 的位姿图残差从 $\SE(3)$ 平行搬到 $\mathrm{Sim}(3)$：节点存各关键帧的相似变换 $\mathbf S_i\in\mathrm{Sim}(3)$（含各自的累积尺度），回环边测量是几何验证解出的\emph{相对相似变换} $\hat{\mathbf S}_{ij}\in\mathrm{Sim}(3)$，残差与代价为
+\begin{equation}
+  \mathbf e_{ij}=\mathrm{Log}\!\big(\hat{\mathbf S}_{ij}^{-1}\,\mathbf S_i^{-1}\mathbf S_j\big)\in\mathbb R^{7},\qquad
+  \min_{\{\mathbf S_i\}}\ \tfrac12\!\!\sum_{(i,j)\in\mathcal E}\!\!\lVert\mathbf e_{ij}\rVert_{\boldsymbol\Sigma_{ij}}^2 .
+  \label{eq:loop-sim3-residual}
+\end{equation}
+里程计边的 $\hat{\mathbf S}_{ij}$ 取 $s=1$（前端相邻关键帧间无显著尺度跳变），回环边的 $s$ 则\emph{自由}，用来在优化中把整段累积的尺度漂移\textbf{均摊}到链上。在相似变换群上做位姿图优化以消尺度漂移，最早由 Strasdat 等提出\cite{strasdat2012thesis}；ORB-SLAM 将其落地为 \textbf{$\mathrm{Sim}(3)$ 位姿图优化（本质图优化）}\cite{murartal2015orbslam}：$\SE(3)$ 版（\cref{eq:loop-pg-residual}）只能拉回位姿，$\mathrm{Sim}(3)$ 版连尺度一起拉回。
+
+\paragraph{求解：闭环边的 \texorpdfstring{$\mathrm{Sim}(3)$}{Sim(3)} 怎么算出来。}
+几何验证（\cref{sec:loop-stageD}）确认回环候选后，要先解出这一条 $\hat{\mathbf S}_{ij}$ 的\emph{初值}。流程是“闭式解 $+$ RANSAC $+$ 引导匹配优化”三步\cite{murartal2015orbslam,campos2021orbslam3}：
+\begin{enumerate}
+  \item \textbf{词袋匹配给种子}：先用词袋（\cref{sec:loop-stageA}）在当前关键帧 $K_a$ 与候选关键帧 $K_m$ 之间得到一批 $3$D-$3$D 路标对应（两帧各自三角化出的地图点）。
+  \item \textbf{闭式解 $+$ RANSAC 求初值}：$\mathrm{Sim}(3)$ 由\emph{至少 $3$ 对} $3$D 点即可\textbf{闭式}求解——这正是 Horn 的绝对定向问题（用单位四元数解旋转、由两组点的质心间距比解尺度 $s$、再回代解平移）\cite{horn1987closed}。把它套进 RANSAC（书中实现为 \texttt{Sim3Solver}），随机抽 $3$ 对算候选 $\hat{\mathbf S}_{am}$、统计重投影内点，迭代取内点最多者，剔除词袋错配。
+  \item \textbf{引导匹配再优化}：词袋匹配点通常不多，用上一步的初值 $\hat{\mathbf S}_{am}$ 做\emph{引导}——把 $K_m$ 的局部地图点按 $\hat{\mathbf S}_{am}$ \textbf{投影}回 $K_a$，在投影邻域内搜更多对应；要求用 $\hat{\mathbf S}_{am}$ 与 $\hat{\mathbf S}_{am}^{-1}$ \emph{双向投影都互相匹配}才算可靠对应，再以这批更稠密的对应\emph{非线性优化}重投影误差，得到高精度的 $\hat{\mathbf S}_{am}$。内点足够多才最终确认这条回环\cite{campos2021orbslam3}。
+\end{enumerate}
+
+\paragraph{闭式解的全推导：去质心 $\to$ 平移 $\to$ 尺度 $\to$ 旋转。}
+上面第 $2$ 步只用一句“$3$ 对点即可闭式解出 $\mathrm{Sim}(3)$”带过，背后其实是一段干净的最小二乘推导（Horn 的绝对定向\cite{horn1987closed}）。它的骨架与 \cref{ch:vo} 的 ICP 几乎逐字相同——去质心把平移剥离、再各自求旋转与尺度——\emph{唯一}多出来、也正是 $\mathrm{Sim}(3)$ 区别于 $\SE(3)$ 的那一处，就是\textbf{尺度因子的求解}。值得先点破一个朴素弯路：仅用 $3$ 个不共线点各自搭一个正交基 $\mathbf M_1,\mathbf M_2$、令 $\mathbf R=\mathbf M_2^\top\mathbf M_1$ 也能“算”出旋转，但它\emph{依赖选点顺序}、又\emph{用不上多于 $3$ 对}的点，故弃之不用，改走下面对任意 $n$ 都成立的最小二乘\cite{horn1987closed}。整段推导在旋转一步\emph{接回} ICP 的 SVD 解（\cref{thm:vo-icp-svd}），不重复造轮子。
+
+\begin{derivation}[$\mathrm{Sim}(3)$ 闭式解：去质心剥平移、对称尺度、旋转复用 ICP]
+设几何验证给出 $n\ge 3$ 对匹配的 $3$D 路标 $\{\mathbf p_i\}\leftrightarrow\{\mathbf q_i\}$（$\mathbf p_i$ 在候选帧 $K_m$、$\mathbf q_i$ 在当前帧 $K_a$，各为对方帧三角化出的地图点），按 \cref{eq:loop-sim3-action} 的作用要找 $(s,\mathbf R,\mathbf t)$ 使
+\begin{equation}
+  \mathbf q_i \approx s\,\mathbf R\,\mathbf p_i+\mathbf t,\qquad \mathbf R\in\SO(3),\ s>0 ,
+  \label{eq:loop-sim3-lsq}
+\end{equation}
+在最小二乘意义下成立。理想无噪声时 $3$ 对点足以严格求解；有噪声时定义误差 $\mathbf e_i=\mathbf q_i-s\mathbf R\mathbf p_i-\mathbf t$，求 $\min_{s,\mathbf R,\mathbf t}\sum_{i=1}^n\lVert\mathbf e_i\rVert^2$，对 $n>3$ 也稳定\cite{horn1987closed}。
+
+\textbf{(一) 去质心，剥离平移.}\;
+记两组点的质心 $\bar{\mathbf p}=\tfrac1n\sum_i\mathbf p_i$、$\bar{\mathbf q}=\tfrac1n\sum_i\mathbf q_i$，去质心坐标 $\mathbf p_i'=\mathbf p_i-\bar{\mathbf p}$、$\mathbf q_i'=\mathbf q_i-\bar{\mathbf q}$，于是去质心后求和为零（后续反复要用）：
+\begin{equation}
+  \sum_i\mathbf p_i'=\mathbf 0,\qquad \sum_i\mathbf q_i'=\mathbf 0 .
+  \label{eq:loop-sim3-decentroid}
+\end{equation}
+在 $\mathbf e_i$ 里加减 $s\mathbf R\bar{\mathbf p}$，并令常量 $\mathbf t_0=\bar{\mathbf q}-s\mathbf R\bar{\mathbf p}-\mathbf t$，把误差拆成“去质心项 $+$ 常量项”：
+\begin{equation}
+\begin{aligned}
+  \sum_i\lVert\mathbf e_i\rVert^2
+  &=\sum_i\big\lVert(\mathbf q_i'-s\mathbf R\mathbf p_i')+\mathbf t_0\big\rVert^2\\
+  &=\sum_i\lVert\mathbf q_i'-s\mathbf R\mathbf p_i'\rVert^2
+   +2\,\mathbf t_0^\top\!\Big(\underbrace{\textstyle\sum_i(\mathbf q_i'-s\mathbf R\mathbf p_i')}_{=\,\mathbf 0}\Big)
+   +n\lVert\mathbf t_0\rVert^2 .
+\end{aligned}
+  \label{eq:loop-sim3-expand}
+\end{equation}
+中间交叉项因 \cref{eq:loop-sim3-decentroid} 而整体为零（$\sum_i\mathbf q_i'=\mathbf 0$ 且 $s\mathbf R\sum_i\mathbf p_i'=\mathbf 0$），故 $\sum_i\lVert\mathbf e_i\rVert^2=\sum_i\lVert\mathbf q_i'-s\mathbf R\mathbf p_i'\rVert^2+n\lVert\mathbf t_0\rVert^2$。两项皆非负且\emph{只有}后项含 $\mathbf t$，故最优平移使 $\mathbf t_0=\mathbf 0$：
+\begin{equation}
+  \boxed{\ \mathbf t^\ast=\bar{\mathbf q}-s\,\mathbf R\,\bar{\mathbf p}\ }
+  \label{eq:loop-sim3-trans}
+\end{equation}
+——与 ICP 的平移公式（\cref{thm:vo-icp-svd}）形式完全一致，只是中间多了尺度 $s$。剩下的核心问题只含 $s,\mathbf R$：$\min_{s,\mathbf R}\sum_i\lVert\mathbf q_i'-s\mathbf R\mathbf p_i'\rVert^2$。
+
+\textbf{(二) 尺度——朴素解及其不对称.}\;
+展开核心目标，并用旋转保模长 $\lVert\mathbf R\mathbf p_i'\rVert=\lVert\mathbf p_i'\rVert$，引入三个标量 $S_P=\sum_i\lVert\mathbf p_i'\rVert^2$、$S_Q=\sum_i\lVert\mathbf q_i'\rVert^2$、$D=\sum_i\mathbf q_i'^\top\mathbf R\,\mathbf p_i'$，得到一个关于 $s$ 的一元二次式 $\sum_i\lVert\mathbf q_i'-s\mathbf R\mathbf p_i'\rVert^2=S_Q-2sD+s^2S_P$。把 $\mathbf R$ 暂视为已知，对 $s$ 求导置零 $-2D+2sS_P=0$，得\textbf{朴素（非对称）尺度}
+\begin{equation}
+  s=\frac{D}{S_P}=\frac{\sum_i\mathbf q_i'^\top\mathbf R\,\mathbf p_i'}{\sum_i\lVert\mathbf p_i'\rVert^2}
+  \qquad(\text{ORB-SLAM2 采用此式\,\cite{murartal2015orbslam}}).
+  \label{eq:loop-sim3-scale-asym}
+\end{equation}
+但它\textbf{不具对称性}：若把 $\{\mathbf p_i\}$ 与 $\{\mathbf q_i\}$ 对调（改求 $\mathbf p\approx s'\mathbf R^\top\mathbf q$），同理得 $s'=D/S_Q$（注意 $\sum_i\mathbf p_i'^\top\mathbf R^\top\mathbf q_i'=D$ 仍是同一标量）。本该有 $s'=1/s$，然而
+\begin{equation}
+  s'=\frac{D}{S_Q}\ \overset{?}{=}\ \frac1s=\frac{S_P}{D}
+  \quad\Longleftrightarrow\quad D^2=S_PS_Q ,
+  \label{eq:loop-sim3-asym}
+\end{equation}
+而 Cauchy--Schwarz 给出 $D\le\sqrt{S_PS_Q}$，仅在\emph{无噪声}时取等；有噪声时 $D^2<S_PS_Q$，故 $s'\ne 1/s$。也就是说“$P\!\to\!Q$ 的尺度”\emph{不等于}“$Q\!\to\!P$ 的尺度”的倒数——方向一换、答案就变，这说明 \cref{eq:loop-sim3-scale-asym} 解出的尺度并不稳定。
+
+\textbf{(三) 尺度——对称解.}\;
+为消除这种不对称，把尺度对称地劈到两侧（$\sqrt s$ 与 $1/\sqrt s$），构造对称目标\cite{horn1987closed}（它与原目标仅差一个正因子 $1/s$，最小点处的 $\mathbf R$ 不变）：
+\begin{equation}
+\begin{aligned}
+  \sum_i\Big\lVert\tfrac{1}{\sqrt s}\,\mathbf q_i'-\sqrt s\,\mathbf R\mathbf p_i'\Big\rVert^2
+  &=\tfrac1s\,S_Q-2D+s\,S_P\\
+  &=\Big(\sqrt{s\,S_P}-\sqrt{S_Q/s}\Big)^2+2\big(\sqrt{S_PS_Q}-D\big) .
+\end{aligned}
+  \label{eq:loop-sim3-square}
+\end{equation}
+右端第一项\emph{只}含 $s$、第二项\emph{只}含 $\mathbf R$（经 $D$），二者\textbf{彻底解耦}。令第一个平方项为零，得\textbf{对称尺度}
+\begin{equation}
+  \boxed{\ s^\ast=\sqrt{\frac{S_Q}{S_P}}=\sqrt{\frac{\sum_i\lVert\mathbf q_i'\rVert^2}{\sum_i\lVert\mathbf p_i'\rVert^2}}\ }
+  \label{eq:loop-sim3-scale-sym}
+\end{equation}
+它\emph{只}取决于两组点云相对各自质心的“铺开程度”之比，与 $\mathbf R$ 无关；对调 $P\leftrightarrow Q$ 立得 $1/s^\ast$，对称性一目了然。直观上，尺度因子就是两片点云“到各自均值中心的均方距离”之比的平方根。
+
+\textbf{(四) 旋转——复用 ICP 的闭式解.}\;
+\cref{eq:loop-sim3-square} 第二项 $2(\sqrt{S_PS_Q}-D)$ 与 $s$ 无关，最小化它等价于在 $\mathbf R\in\SO(3)$ 上\textbf{最大化}
+\begin{equation}
+  D=\sum_i\mathbf q_i'^\top\mathbf R\,\mathbf p_i'=\operatorname{tr}\!\big(\mathbf R\,\mathbf W^\top\big),\qquad
+  \mathbf W=\sum_i\mathbf q_i'\,\mathbf p_i'^\top .
+  \label{eq:loop-sim3-rot}
+\end{equation}
+这\emph{正是} \cref{ch:vo} ICP 去质心后那个 $\max_{\mathbf R}\operatorname{tr}(\mathbf R\mathbf W^\top)$ 旋转子问题（即 Wahba / 正交 Procrustes 问题），$\mathbf W$ 的结构与 \cref{thm:vo-icp-svd} 的互协方差阵\emph{一模一样}。其闭式全局最优早已在那里给出：对 $\mathbf W$ 作 SVD $\mathbf W=\mathbf U\boldsymbol\Sigma\mathbf V^\top$，则 $\mathbf R=\mathbf U\mathbf V^\top$（若 $\det(\mathbf U\mathbf V^\top)<0$ 取反射修正，全局最优性见 \cref{thm:vo-icp-opt}）\cite{arun1987leastsquares}。Horn 原文走的\textbf{单位四元数路线}是\emph{同一问题的等价路径}\cite{horn1987closed}：把 $D$ 写成二次型 $D=\mathbf u^\top\mathbf N\mathbf u$（$\mathbf u$ 为表示 $\mathbf R$ 的单位四元数，$\mathbf N$ 是由 $\mathbf W$ 各元素拼出的对称 $4\times4$ 矩阵），在约束 $\lVert\mathbf u\rVert=1$ 下由 Rayleigh 商，最大值在 $\mathbf N$ \emph{最大特征值}对应的特征向量处取得，该特征向量即所求旋转的四元数。矩阵-SVD 与四元数-特征分解两条路给出\emph{同一个} $\mathbf R$，仅参数化不同（前者免去四元数到矩阵的转换，后者免去 $\det$ 符号修正）——故本节不再重复推导，直接复用 \cref{thm:vo-icp-svd}。
+
+\textbf{(五) 回代.}\;
+求得 $\mathbf R$ 后，由 \cref{eq:loop-sim3-scale-sym}（推荐）或 \cref{eq:loop-sim3-scale-asym}（ORB-SLAM2 实现）算出 $s$，再由 \cref{eq:loop-sim3-trans} 算出 $\mathbf t$；三参数 $(s,\mathbf R,\mathbf t)$ 齐备，即拼成 \cref{eq:loop-sim3-mat} 的相对相似变换 $\hat{\mathbf S}_{am}$。整个过程一次算出、无需迭代，正是第 $2$ 步“闭式解”的全部内容；它再嵌进 RANSAC（每轮抽 $3$ 对、统计重投影内点）即得鲁棒初值。
+\end{derivation}
+
+\begin{insight}[尺度的“不对称”正是 \texorpdfstring{$\mathrm{Sim}(3)$}{Sim(3)} 区别于 \texorpdfstring{$\SE(3)$}{SE(3)} 的唯一新东西]\label{ins:loop-sim3-asym}
+把上面五步与 \cref{ch:vo} 的 ICP 对照，会发现\textbf{去质心剥平移}（\cref{eq:loop-sim3-trans}）与\textbf{求旋转}（\cref{eq:loop-sim3-rot}）两步\emph{逐字照搬}了 $\SE(3)$ 的 ICP——$\mathrm{Sim}(3)$ 真正多出来、也是\emph{唯一}需要新推导的，只有\textbf{尺度因子}这一维。而恰是这一维带来一个 $\SE(3)$ 里不存在的陷阱：朴素尺度 $s=D/S_P$（\cref{eq:loop-sim3-scale-asym}）\textbf{方向相关}——“$P\!\to\!Q$”与“$Q\!\to\!P$”算出的尺度互不为倒数（\cref{eq:loop-sim3-asym}），其差距正是 Cauchy--Schwarz 不等式 $D\le\sqrt{S_PS_Q}$ 的“噪声间隙”。$\SE(3)$ 没有这个问题，因为它根本没有尺度可解（$s\equiv 1$）。Horn 的对称构造（\cref{eq:loop-sim3-square}）用一招“两侧各劈 $\sqrt s$”把尺度与旋转\emph{解耦}：尺度 $s^\ast=\sqrt{S_Q/S_P}$（\cref{eq:loop-sim3-scale-sym}）只看两片点云各自的铺开程度、与 $\mathbf R$ 无关且天然对称，旋转则退化为与 ICP 全等的子问题。\textbf{记住这条分野}：闭环求解里凡 $\SE(3)$ 与 $\mathrm{Sim}(3)$ 写法不同之处，差异\emph{必定}集中在尺度那一维，别处与刚体 ICP 无异。
+\end{insight}
+
+\begin{insight}[为什么 \texorpdfstring{$\mathrm{Sim}(3)$}{Sim(3)} 只用 $3$ 对点，而对极几何要更多]\label{ins:loop-sim3-3pt}
+\cref{sec:loop-stageD} 的纯单目几何验证用对极几何（基础矩阵）需 $\ge 8$（或 $5$）对、且只得到\emph{无尺度}的相对位姿；这里 $\mathrm{Sim}(3)$ 却只要 $3$ 对就闭式解出\emph{含尺度}的完整变换。差别的根源是\textbf{信息来源不同}：对极几何只用 $2$D-$2$D 像素对应、对绝对尺度天然不可观；而 $\mathrm{Sim}(3)$ 求解吃的是两帧各自\emph{已三角化}的 $3$D-$3$D 点对——两套点云本身带着各自的（虽不一致的）尺度，比对它们的\emph{质心间距之比}就直接读出了相对尺度 $s$\cite{horn1987closed}。这也解释了 \cref{sec:loop-stageD} “有 $3$D 路标就用 PnP/$3$D 对应”的那条分支：一旦手里有 $3$D 信息，回环验证与求解都能升级到带尺度的 $\mathrm{Sim}(3)$。
+\end{insight}
+
+\paragraph{矫正：把一条 \texorpdfstring{$\mathrm{Sim}(3)$}{Sim(3)} 边\emph{传播}成整张地图的修正。}
+解出 $\hat{\mathbf S}_{am}$ 只是第一步。直接把它丢进 \cref{eq:loop-sim3-residual} 做全图优化当然可以，但 ORB-SLAM 在优化\emph{之前}先做一步\textbf{闭环矫正（loop correction）}\cite{murartal2015orbslam,campos2021orbslam3}，给优化一个好初值、并立刻把可见的“鬼影/双重墙”消掉。矫正沿\emph{共视图与生成树}（\cref{ch:slam_system} 的本质图骨架）局部传播，分两路：
+\begin{itemize}
+  \item \textbf{位姿传播}：以当前关键帧 $K_a$ 为起点，先把它的位姿用 $\hat{\mathbf S}_{am}$ 拉到与回环帧一致的“正确”位姿 $\mathbf S_a^{\text{corr}}$；再沿共视图把这个修正量\emph{相对地}传给 $K_a$ 的共视关键帧 $K_j$——保持各对相邻帧间\emph{原有}的相对变换不变（认为局部窗内\emph{无尺度漂移}），只把整个窗口作为刚性整体随 $K_a$ 一起搬正。每个被矫正帧记下矫正前后两份位姿（实现中即 \texttt{NonCorrectedSim3} 与 \texttt{CorrectedSim3} 两张表）。
+  \item \textbf{地图点传播}：被矫正关键帧观测到的\emph{地图点坐标}也要跟着搬。对每个点，用它所属关键帧“矫正前 $\to$ 矫正后”的 $\mathrm{Sim}(3)$ 复合变换把它的世界坐标重新投影一遍（含尺度缩放），使点云与挪正后的位姿保持一致。
+\end{itemize}
+矫正只动\emph{当前帧的局部窗口}；窗口之外、乃至整张地图的全局一致，交给紧接着的\textbf{本质图优化}\cite{murartal2015orbslam}：固定（或弱约束）已矫正的局部窗，在本质图（高权共视边 $+$ 生成树 $+$ 这条新回环边）上跑 \cref{eq:loop-sim3-residual} 的 $\mathrm{Sim}(3)$ 位姿图优化，把“窗口内的修正与新增的尺度自由度”平滑地\emph{扩散}到全图——这正是 \cref{ins:loop-loopy} 所说“一条回环边让整段漂移被瞬间拉回”的具体机制，只不过这里拉回的不只是位姿、还有尺度。如需更高精度，最后可再跑一遍\textbf{全局 BA}（联合优化所有关键帧位姿与地图点，见 \cref{ch:nlopt}）收尾。
+
+\begin{insight}[闭环矫正 = “先搬正局部、再扩散全局”的两级结构]\label{ins:loop-sim3-twostage}
+为什么不直接全图优化、非要先做一步局部矫正？因为 \cref{eq:loop-sim3-residual} 是\emph{非凸}最小二乘，强烈依赖初值（同 \cref{ch:nlopt} 对 PGO 的告诫）。回环刚检出时，回环两端的位姿在地图里差着整段累积漂移（位姿 $+$ 尺度），\emph{直接}优化极易落入坏局部极小。闭环矫正先用解析的 $\hat{\mathbf S}_{am}$ 把当前局部窗\emph{刚性}搬到回环帧近旁，等于给全图优化喂了一个\emph{已经接近正确}的初值；本质图优化再把这个局部修正\emph{平滑扩散}到全图。两级结构——\textbf{局部解析搬正}（快、给初值）$+$\textbf{全局本质图优化}（慢、保一致）——是 ORB-SLAM 闭环又快又稳的关键\cite{murartal2015orbslam}。这与 \cref{ins:loop-spring} 的“弹簧”图像一致：先把弹簧的一端\emph{手动}拉到大致正确处，再松手让整张弹簧网自行松弛到平衡。
+\end{insight}
+
+\paragraph{延伸：ORB-SLAM3 的“集卡式”验证与多地图融合。}
+ORB-SLAM3 把上述单目闭环进一步推广\cite{campos2021orbslam3}。两点值得记下：
+\begin{itemize}
+  \item \textbf{“集卡式”共同区域检测}：\cref{sec:loop-stageC} 的时间一致性要求回环候选\emph{连续 $3$ 次}出现才确认，召回偏低。ORB-SLAM3 改为\emph{先做几何一致性、后做时间一致性}的“集卡式”验证：先用词袋取\emph{ $3$ 个}候选关键帧、为每个候选连同其共视邻域和地图点建一个\emph{局部窗口}，在窗口与当前帧间用 RANSAC 求对齐变换 $\mathbf T_{am}$（纯单目取 $\mathrm{Sim}(3)$，否则 $\SE(3)$）并引导匹配加密\cite{campos2021orbslam3}。其几何验证不再等连续帧，而是在活跃地图里另找\emph{ $2$ 个}与当前帧共视、且与局部窗口匹配点数超阈值的关键帧来佐证；验证\emph{持续到累计有 $3$ 个关键帧确认 $\mathbf T_{am}$}（或连续两个新关键帧验证失败即放弃），从而\textbf{在不牺牲准确率的前提下提高召回}（这与 \cref{ins:loop-precision} 的“宁缺毋滥”不矛盾：换的是\emph{更早确认}而非\emph{放松门槛}）。相对 ORB-SLAM2 的关键增益是这一步在共视\emph{局部窗口}内补充的\emph{中期}数据关联——把求 $\mathrm{Sim}(3)$ 的匹配从单帧扩展到整个共视窗，对应更充分。\footnote{此处“ $3$ 候选 $+$ $2$ 共视佐证 $+$ 累计 $3$ 帧确认”的数字依 ORB-SLAM3 原文“Place Recognition”一节六步流程（\cite{campos2021orbslam3} 步骤 1、5）核定。}
+  \item \textbf{回环 vs 地图融合的分流}：得到共同区域后，若它落在\emph{同一张活跃地图}内 $\to$ 走上述\textbf{闭环矫正}；若落在\emph{不同地图}之间 $\to$ 走\textbf{地图融合}（把两张子地图拼成一张，同时检出则优先融合）。融合复用闭环的同一套 $\mathrm{Sim}(3)$ 传播矫正，只是两帧位于\emph{不同世界坐标系}，还需额外处理生成树父子关系的换向、熔接（Welding）BA 等——这套多地图机制超出本章范围，属系统级整合内容，不在此展开。
+\end{itemize}
+
+\begin{pitfall}[陷阱：把 \texorpdfstring{$\mathrm{Sim}(3)$}{Sim(3)} 矫正用到 VIO/双目上]
+$\mathrm{Sim}(3)$ 闭环是为\emph{纯单目}的尺度漂移量身定做的。一旦系统能观测尺度——\textbf{双目/RGB-D}（基线/深度给绝对尺度）或\textbf{VIO}（IMU 固定尺度与重力）——回环就\emph{不该}再放开尺度自由度：此时 $\hat{\mathbf S}_{ij}$ 退化为 $\hat{\mathbf T}_{ij}\in\SE(3)$（即 \cref{eq:loop-pg-residual}），ORB-SLAM3 在这些模式下求位姿用的也正是 $\SE(3)$ 而非 $\mathrm{Sim}(3)$\cite{campos2021orbslam3}。VIO 漂移更只剩 $4$-DOF（$3$D 平移 $+$ yaw，见上文“尺度自由度”一条），强行用 $7$-DOF 优化反而引入\emph{本不存在}的尺度自由度、可能被噪声带偏。\textbf{用哪个群闭环，取决于该传感器配置下尺度\emph{可不可观}}。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 写出 $\mathrm{Sim}(3)$ 矩阵 \cref{eq:loop-sim3-mat} 的逆 $\mathbf S^{-1}$（提示：缩放因子取倒数，旋转转置，平移相应变换），验证 $\mathbf S\mathbf S^{-1}=\mathbf I$。再说明为何 $\hat{\mathbf S}_{ij}^{-1}\mathbf S_i^{-1}\mathbf S_j$（\cref{eq:loop-sim3-residual}）在“测量与状态完全一致”时等于单位元、残差为零。
+  \item 给定两组对应的 $3$D 点 $\{\mathbf p_k\}\leftrightarrow\{\mathbf q_k\}$（$k=1,2,3$），按 Horn\cite{horn1987closed} 的思路：先各自去质心，由两组点到质心的\emph{均方距离之比}解出尺度 $s$；这一步为什么必须用\emph{已三角化的 $3$D 点}、而纯 $2$D 对极几何做不到（呼应 \cref{ins:loop-sim3-3pt}）？
+  \item 对照 \cref{eq:loop-pg-residual}（$\SE(3)$）与 \cref{eq:loop-sim3-residual}（$\mathrm{Sim}(3)$）：在一条\emph{绕大圈}的单目轨迹上，若误用 $\SE(3)$ 位姿图优化闭环，回到起点处最可能残留哪种几何不一致（位姿？尺度？）？为什么本质图优化能近线性时间解出（提示：\cref{ch:slam_system} 的本质图稀疏性）？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{深度学习地点识别简介}
+\label{sec:loop-dl}
+
+\paragraph{桥接：回环检测本质是个“分类/度量学习”问题。}
+回环检测很像一个分类问题，只是\emph{类别极多、每类样本极少}\cite{gaoxiang2019slam14}——机器人一动就产生“新地点”。换个角度，它也是在\emph{学习}“图像间相似性”这个概念。而词袋的字典本就是对特征描述子的\emph{聚类}（\cref{alg:loop-ktree}）。于是自然要问两件事：能否对\emph{学习得到}的特征聚类（而非人工设计的 ORB/SURF）？有没有比“树 + $K$-means”更好的聚合方式？深度学习地点识别正是对这两问的回答。VLAD 及其可学习版 NetVLAD\cite{arandjelovic2016netvlad} 是其中的代表，它们\emph{替换}的是流水线的检索阶段（\cref{sec:loop-stageA}），而\emph{不替换}时间一致性与几何验证。
+
+\paragraph{任务设定：学一个好用的全局描述子。}
+大尺度视觉地点识别的做法\cite{arandjelovic2016netvlad}是把图像表示参数化为一个 CNN $f_\theta(I)$，用\emph{欧氏距离}
+\begin{equation}
+  d_\theta(I_i,I_j)=\lVert f_\theta(I_i)-f_\theta(I_j)\rVert
+  \label{eq:loop-netvlad-dist}
+\end{equation}
+检索：对查询 $q$ 按 $d_\theta(q,I_i)$ 排序数据库图像，取最近者为同一地点。问题于是转化为“学一个在欧氏距离下好用的特征映射 $f_\theta$”。检索流水线两步：(i) 提局部描述子；(ii) \emph{无序池化}（对平移/遮挡鲁棒，与词袋的“无序”同理）。NetVLAD 把第 (ii) 步设计成一个\emph{可学习层}。
+
+\paragraph{原始 VLAD：存残差而非计数。}
+\textbf{VLAD（Vector of Locally Aggregated Descriptors）}与词袋的关键区别\cite{arandjelovic2016netvlad}：词袋\emph{数每个单词出现几次}（$0$ 阶统计），VLAD \emph{存每个单词的残差和}（$1$ 阶统计，信息更丰富）。给定 $N$ 个 $D$ 维局部描述子 $\{x_i\}$ 与 $K$ 个聚类中心 $\{c_k\}$，VLAD 输出 $K\times D$ 矩阵 $V$，其 $(j,k)$ 元：
+\begin{equation}
+  V(j,k)=\sum_{i=1}^{N} a_k(x_i)\,\big(x_i(j)-c_k(j)\big),
+  \label{eq:loop-vlad}
+\end{equation}
+其中 $a_k(x_i)$ 是\emph{硬分配}（$x_i$ 离 $c_k$ 最近则为 $1$、否则 $0$），第 $k$ 列记录“分到 $c_k$ 的描述子残差 $(x_i-c_k)$ 之和”。$V$ 随后逐列 $L_2$ 归一化、拉直、再整体 $L_2$ 归一化。
+
+\paragraph{从硬分配到软分配：让它可微。}
+VLAD 不可微的根源是硬分配 $a_k$。NetVLAD 换成\emph{软分配}\cite{arandjelovic2016netvlad}：
+\begin{equation}
+  \bar a_k(x_i)=\frac{e^{-\alpha\lVert x_i-c_k\rVert^2}}{\sum_{k'} e^{-\alpha\lVert x_i-c_{k'}\rVert^2}},
+  \label{eq:loop-softassign}
+\end{equation}
+按“与各中心的相对接近程度”分配权重，$\bar a_k\in[0,1]$，最近中心权重最大；$\alpha>0$ 是温度，$\alpha\to+\infty$ 退化为原始硬分配 VLAD。
+
+\begin{derivation}[软分配化简为 softmax（\cref{eq:loop-netvlad-layer} 的来由）]
+展开 \cref{eq:loop-softassign} 指数里的平方：
+\[
+  -\alpha\lVert x_i-c_k\rVert^2=-\alpha\big(\lVert x_i\rVert^2-2c_k^\top x_i+\lVert c_k\rVert^2\big).
+\]
+分子分母都含与 $k$ 无关的因子 $e^{-\alpha\lVert x_i\rVert^2}$，约去后得
+\[
+  \bar a_k(x_i)=\frac{e^{\,2\alpha c_k^\top x_i-\alpha\lVert c_k\rVert^2}}{\sum_{k'}e^{\,2\alpha c_{k'}^\top x_i-\alpha\lVert c_{k'}\rVert^2}}
+  =\frac{e^{\,w_k^\top x_i+b_k}}{\sum_{k'} e^{\,w_{k'}^\top x_i+b_{k'}}},\qquad
+  w_k=2\alpha c_k,\quad b_k=-\alpha\lVert c_k\rVert^2.
+\]
+这正是一个 softmax（$1\times1$ 卷积 $w_k$ + 偏置 $b_k$ 再取 soft-max）。把它代回 \cref{eq:loop-vlad}，得 \textbf{NetVLAD 层}：
+\begin{equation}
+  V(j,k)=\sum_{i=1}^{N}\frac{e^{\,w_k^\top x_i+b_k}}{\sum_{k'} e^{\,w_{k'}^\top x_i+b_{k'}}}\,\big(x_i(j)-c_k(j)\big).
+  \label{eq:loop-netvlad-layer}
+\end{equation}
+关键收获：原始 VLAD 只有一组参数 $\{c_k\}$，而 NetVLAD 把 $\{w_k\},\{b_k\},\{c_k\}$ \emph{解耦}成三组独立可学习参数——这带来更大灵活性，可在监督下学到比聚类中心更好的“锚点”。整层就是标准 CNN 算子（卷积 $\to$ softmax $\to$ 聚合 $\to$ 两次 $L_2$ 归一化），可端到端反向传播。
+\end{derivation}
+
+\paragraph{弱监督三元组排序损失。}
+监督来自 Google Street View Time Machine——同一地点不同时间的全景图，带 GPS\cite{arandjelovic2016netvlad}。\emph{弱}在于 GPS 只给“地理近/远”、不给图像间对应：对查询 $q$ 只能给\emph{潜在正样本} $\{p_i^q\}$（地理近，但可能朝向不同/被遮挡）与\emph{确定负样本} $\{n_j^q\}$（地理远）。三步构造损失：先取距离最小的潜在正样本 $p_{i^\ast}^q=\arg\min_{p_i^q}d_\theta(q,p_i^q)$；再要求它比\emph{每个}负样本都近 $d_\theta(q,p_{i^\ast}^q)<d_\theta(q,n_j^q),\forall j$；最后写成铰链形式的\textbf{弱监督三元组排序损失}：
+\begin{equation}
+  L_\theta=\sum_j l\!\left(\min_i d_\theta^2(q,p_i^q)+m-d_\theta^2(q,n_j^q)\right),\qquad l(x)=\max(x,0),
+  \label{eq:loop-triplet}
+\end{equation}
+$m$ 为间隔（margin）常数。解读：若“查询到某负样本的距离”比“到最佳正样本的距离”大出至少 $m$，该项损失为 $0$；否则正比于违反量。这是把常用三元组损失适配到弱监督（用 $\min$ 选最佳正样本，类似多示例学习）。实现上基网用 AlexNet/VGG-16 裁到最后卷积层，$K=64$，得 $16$k/$32$k 维全局描述子，$m=0.1$。
+
+\begin{insight}[深度描述子仍需几何验证]\label{ins:loop-dl-geo}
+一个极易被忽略却至关重要的结论\cite{arandjelovic2016netvlad}：NetVLAD（以及 GeM、PointNetVLAD 等深度全局描述子）产出的是\emph{单一全局描述子向量}，用欧氏距离检索——它\emph{替换}的只是 \cref{sec:loop-stageA} 的检索阶段。但深度描述子\textbf{对感知混叠同样不鲁棒}，因此\emph{下游仍需几何验证}才能产出准确回环。换言之，\cref{ins:loop-defense} 的第 $3$、$4$ 道防线（时间一致性、几何验证）\emph{一个都不能省}。这是“换了更强的检索器，但流水线骨架不变”——本章的四阶段框架（\cref{alg:loop-pipeline}）对传统词袋和深度方法\emph{同样适用}。
+\end{insight}
+
+\paragraph{展望。}
+词袋目前仍是工程主流，但作者们普遍相信深度学习方法很有希望胜过人工设计特征\cite{gaoxiang2019slam14}——毕竟词袋在物体识别上已明显不如神经网络，而回环检测是非常相似的问题。除 NetVLAD 外，也有网络在训练后能从图像\emph{直接回归}相机位姿（PoseNet 类\cite{kendall2015posenet}）。这些都可能成为新一代回环检测的基石；\cref{ch:lidar_slam} 的 Scan Context\cite{kim2018scancontext} 则是同一“地点识别”思想在激光点云上的对应实现。
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+后端足够强就能消除漂移 & 后端只协调已有约束；消整段漂移须靠回环边补一条长程约束（\cref{sec:loop-why}）\\
+逐像素相减能判相似 & 对光照/视角不鲁棒，准召率都差（\cref{eq:loop-naive}）\\
+回环越多越好 & 一条假阳性回环可毁掉整张图；SLAM 重准确率（\cref{ins:loop-precision}）\\
+所有单词同等重要 & 高频单词区分度低，须 TF-IDF 降权（\cref{eq:loop-weight}）\\
+IDF 与 TF 的 $n,n_i$ 同义 & IDF 是训练集全局量、TF 是单幅图局部量（\cref{eq:loop-idf,eq:loop-tf}）\\
+相似度看绝对值 & 须用先验相似度归一化、看相对高低（\cref{eq:loop-normscore}）\\
+词袋检出即回环 & 词袋丢空间结构，必须几何验证（\cref{sec:loop-stageD}）\\
+NetVLAD 能省掉几何验证 & 深度描述子对混叠仍不鲁棒，验证不可省（\cref{ins:loop-dl-geo}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\boldsymbol v_A,\boldsymbol v_t$ & 图像的词袋向量（稀疏，$\in\mathbb R^W$）& \cref{eq:loop-bowvec} \\
+$w_i,\ \eta_i$ & 第 $i$ 个单词 / 其 TF-IDF 权重 & \cref{eq:loop-weight} \\
+$\mathrm{TF}_i,\mathrm{IDF}_i$ & 词频（局部）/ 逆文档频率（全局）& \cref{eq:loop-idf,eq:loop-tf} \\
+$k,\ L,\ W$ & 树分支因子 / 深度 / 单词数（$W=k^L$）& \cref{eq:loop-tree-capacity} \\
+$s(\cdot,\cdot),\ s'(\cdot,\cdot)$ & $L_1$ 相似度评分 / 归一化评分 & \cref{eq:loop-dbow-score,eq:loop-normscore} \\
+$\alpha,\ k$（一致性）& 归一化门限 / 时间一致性连续数（$=3$）& \cref{sec:loop-stageA,def:loop-temporal} \\
+$V_{T_i},\ H(\cdot)$ & 岛屿 / 岛屿评分 & \cref{eq:loop-island} \\
+TP/FP/FN/TN & 真假阳/阴性（FP=感知混叠）& \cref{def:loop-confusion} \\
+$\hat{\mathbf T}_{ij},\boldsymbol\Lambda_{ij}$ & 回环边相对位姿测量 / 信息矩阵 & \cref{eq:loop-pg-residual} \\
+$f_\theta,V(j,k)$ & NetVLAD 描述子 / VLAD 输出 & \cref{eq:loop-vlad} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{定理 / 公式速查表}
+\begin{tabular}{lll}
+\toprule
+公式 & 一句话说明 & 对应 \\
+\midrule
+准确率/召回率 \cref{eq:loop-pr} & 评价回环检测，SLAM 重准确率 & \cref{def:loop-confusion} \\
+TF-IDF 权重 \cref{eq:loop-weight} & 高频降权、罕见升权 & \cref{eq:loop-idf,eq:loop-tf} \\
+$L_1$ 评分 \cref{eq:loop-dbow-score} & 归一化直方图交，$\in[0,1]$ & \cref{sec:loop-score} \\
+树容量/查找 \cref{eq:loop-tree-capacity} & $W=k^L$，查找 $O(\log W)$ & \cref{thm:loop-tree-complexity} \\
+归一化评分 \cref{eq:loop-normscore} & 用先验相似度去环境依赖 & \cref{sec:loop-stageA} \\
+岛屿评分 \cref{eq:loop-island} & 求和偏好长岛=真回环 & \cref{def:loop-island} \\
+位姿图回环边 \cref{eq:loop-pg-residual} & 几何验证产物喂后端 & \cref{ch:nlopt} \\
+NetVLAD 层 \cref{eq:loop-netvlad-layer} & 软分配化为可学习 softmax & \cref{sec:loop-dl} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 回环的作用与思路 & 补长程约束、消漂移、重定位；里程计 vs 外观法 & $\bigstar\bigstar$ \\
+2 & 准召率 / 感知混叠 & 混淆矩阵；SLAM 重准确率 & $\bigstar\bigstar$ \\
+3 & 视觉词袋 & 特征 $\to$ 单词 $\to$ 加权稀疏向量 & $\bigstar\bigstar\bigstar$ \\
+4 & 层次 $k$ 叉树 & $W=k^L$，对数查找 & $\bigstar\bigstar\bigstar$ \\
+5 & TF-IDF 与 $L_1$ 评分 & 加权 + 归一化直方图交 & $\bigstar\bigstar\bigstar$ \\
+6 & 四阶段流水线 & 归一化/岛屿/时间一致性/几何验证 & $\bigstar\bigstar\bigstar\bigstar$ \\
+7 & 位姿图接口 & 回环边 = 长程相对位姿约束 & $\bigstar\bigstar\bigstar$ \\
+8 & 深度地点识别 & NetVLAD 软分配；仍需几何验证 & $\bigstar\bigstar\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{词袋回环的奠基}：Gálvez-López \& Tardós《Bags of Binary Words for Fast Place Recognition in Image Sequences》\cite{galvez2012bags}——本章四阶段流水线、$L_1$ 评分、归一化、岛屿、时间一致性、直接索引几何验证的完整出处（即 DBoW2 库）。
+  \item \textbf{词汇树}：Nistér \& Stewénius《Scalable Recognition with a Vocabulary Tree》\cite{nister2006scalable}——层次 $k$ 叉树字典与对数查找的原始论文。
+  \item \textbf{几何直觉与代码}：视觉 SLAM 十四讲\cite{gaoxiang2019slam14} 第 11 讲——准召率、TF-IDF、关键帧处理、DBoW3 实践的教材底本。
+  \item \textbf{感知混叠的概率建模}：Cummins \& Newman《FAB-MAP》\cite{cummins2008fabmap}——外观空间 SLAM，显式建模感知混叠。
+  \item \textbf{地点识别方法综述}：Lowry 等《Visual Place Recognition: A Survey》\cite{lowry2016vpr}——系统梳理基于外观的地点识别（含里程计法 vs 外观法、随机检测等思路的取舍），是 \cref{sec:loop-detect-methods} 的延伸读物。
+  \item \textbf{深度地点识别}：Arandjelović 等《NetVLAD》\cite{arandjelovic2016netvlad}——可端到端训练的广义 VLAD 层；位姿回归见 Kendall 等《PoseNet》\cite{kendall2015posenet}。
+  \item \textbf{文本检索之源}：Sivic \& Zisserman《Video Google》\cite{sivic2003video}——把 TF-IDF 词袋引入视觉检索的开创工作。
+\end{itemize}
+
+\section*{本章与前后章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+相邻章节 & 关系 & 衔接点 \\
+\midrule
+\cref{ch:vo} 视觉里程计 & 提供 ORB 特征、对极/PnP & 词袋建在 ORB 上；几何验证调对极/PnP \\
+\cref{ch:nlopt} 非线性优化 & 接收回环边做位姿图优化 & \cref{eq:loop-pg-residual} 残差、鲁棒核防 FP \\
+\cref{ch:lidar_slam} 激光 SLAM & 点云上的地点识别 & Scan Context 对应本章外观法\cite{kim2018scancontext} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：回环\emph{几乎检不出来}（召回过低）。\textbf{排查}：字典是否太小/特征类型不匹配（\cref{sec:loop-score-bigdict}）；归一化门限 $\alpha$ 或时间一致性 $k$ 是否设得过严（\cref{sec:loop-stageA,def:loop-temporal}）；关键帧是否选得太密导致历史回环被相邻帧压制（\cref{sec:loop-keyframe}）。
+  \item \textbf{症状}：地图在某处\emph{被拉飞/扭曲}（疑似假阳性回环）。\textbf{原因}：感知混叠导致 FP 回环边主导后端二次代价（\cref{ins:loop-precision}）。\textbf{对策}：收紧几何验证内点阈值（$\ge 12$）、提高 $k$，后端加鲁棒核（Huber/Cauchy）或 GNC（\cref{ch:nlopt}）。
+  \item \textbf{症状}：转弯时频繁误报回环。\textbf{原因}：相邻帧差异大使先验相似度塌方、归一化分母过小（\cref{eq:loop-normscore} 的退化）。\textbf{对策}：跳过先验相似度/特征数不足的帧。
+  \item \textbf{症状}：同一段重访\emph{反复}触发回环、后端负担骤增。\textbf{原因}：未做回环聚类（\cref{sec:loop-keyframe}）。\textbf{对策}：把相近回环聚成一类，每类只用一次。
+  \item \textbf{症状}：相似度评分整体偏低、真回环\emph{不突出}。\textbf{原因}：字典区分力不足或未归一化。\textbf{对策}：增大字典（\cref{tab:loop-bigdict}）、用 $s'$ 看相对优势而非绝对值。
+\end{enumerate}

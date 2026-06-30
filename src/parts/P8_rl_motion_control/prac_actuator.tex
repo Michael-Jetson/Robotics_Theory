@@ -1,0 +1,1216 @@
+\chapter{Actuator 建模与系统辨识}\label{ch:rlmc-actuator}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章。
+%  主线：算法/原理领路 —— 先立「actuator 建模四层级」这条递进主线
+%  (Ideal PD -> DC Motor -> Actuator Network -> Delta Action Model)，
+%  再把每一层级落到三大框架 (mjlab / Isaac Lab / UniLab) 的对比实战。
+%  假定读者已学完强化学习理论部 (P6) 与本部前置章 (观测/动作、奖励、
+%  物理、manager 架构、域随机化)，不再重教 MDP / PPO / PD 控制基础，
+%  聚焦「actuator 这层物理保真度怎么配、怎么辨识、怎么排查」。
+%  源稿 RL运控/Ch12_Actuator建模与系统辨识.md (实践偏重) 已按本主线重构：
+%   - 把「按节铺工具」改为「概念领路 + 三框架横向对比实践」；
+%   - 对 Isaac Lab actuators (ImplicitActuatorCfg / IdealPDActuatorCfg /
+%     DCMotorCfg / DelayedPDActuatorCfg / ActuatorNetMLPCfg / network_file /
+%     saturation_effort / effort_limit_sim)、MuJoCo <general>/<dcmotor>
+%     actuator、Hwangbo 2019 actuator net、ASAP delta、UAN 等做了联网核对
+%     (见各 \rebuilt / \pz 标注与 claimsToVerify)；
+%   - 保留并强化了源稿对 actuator network 原创归因的勘误
+%     (Hwangbo 2019 ANYmal，而非 walk-these-ways)。
+%  UniLab 框架已在服务器实装并实跑核对(commit 99936e08；mujoco-uni 3.8.0 /
+%  motrixsim-core 0.8.2)，原 \pz{UniLab 实现待补} 槽位已据源码填实：actuator =
+%  PdControlConfig + 后端位置执行器(Ideal PD)；DC Motor/forcerange 在模型层；
+%  actuator network 与 pseudo_inertia 惯量 DR 在 UniLab 无对应(如实标注)，
+%  sim2real 主力为 kp/kd 域随机化。
+% ════════════════════════════════════════════════════════════════
+
+机器人的几何与运动学骨架搭好之后，它的运动能力最终由「肌肉」——actuator——决定。\cref{ch:rlmc-physics} 把物理引擎的接触求解讲透了，\cref{ch:rlmc-dr} 又用域随机化覆盖了参数不确定性。但 sim-to-real 领域有一条朴素却容易被忽视的共识：\textbf{当域随机化与视觉增强都已做到位时，残余的 sim-to-real gap 主要来自关节力矩跟踪与通信/控制延迟}。换句话说，把策略从仿真搬到真机最后那一公里，常常卡在「仿真器假设的电机太理想」。本章解决这个最后的瓶颈。
+
+本章遵循全书「先动机、先原理，后工程」的次序。这里的主线不是 RL 原理，而是 actuator 建模的\emph{保真度阶梯}：从「力矩可瞬时达到任意值」的 Ideal PD，到加入力矩-速度饱和的 DC Motor，到用神经网络直接拟合真机响应的 Actuator Network，再到不建模电机物理、只在动作空间补差的 Delta Action Model。四个层级逐级提升精度，也逐级提高工程成本。弄清「每一级解决什么问题、什么时候该升级」，再把每一级翻译成 mjlab（MuJoCo Warp 后端）、Isaac Lab（PhysX 默认）、UniLab 三框架上可复制的配置与辨识代码——这是本章的组织方式。\textbf{actuator 建模的工程难点从来不是「配一个更复杂的模型」，而是「判断当前任务到底需不需要更复杂的模型」}——这是本章最核心的一条洞察。
+
+假定你已经读过本部前置章：\cref{ch:rlmc-obsact} 建立了观测/动作接口（策略通常输出目标关节角 $q^*$，由 actuator 映射成力矩 $\boldsymbol\tau$），\cref{ch:rlmc-physics} 讲了接触求解与跨引擎对齐，\cref{ch:rlmc-dr} 讲了域随机化如何随机化电机增益。若这些尚不熟悉，建议先回相应章节，否则本章的「actuator 配置耦合」「与 DR 互补」会缺少地基。
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-act-env}
+
+本章的 actuator 能力分散在两套仿真栈里：mjlab 通过 MuJoCo 的 \verb|<general>|/\allowbreak\verb|<dcmotor>| actuator 与 \verb|MjSpec| API 配置，Isaac Lab 通过 \Verb[breaklines]|isaaclab.actuators| 下的一族 \verb|*Cfg| 数据类配置。系统要求与版本兼容性如下表——\textbf{actuator 的 API 在版本间漂移}：Isaac Lab 2.x 起把硬限制拆成 \verb|effort_limit| 与 \Verb[breaklines]|effort_limit_sim| 两个字段（详见本章末「\nameref{sec:rlmc-act-versions}」），MuJoCo 较新版本才内置 \verb|<dcmotor>| actuator，照抄旧博客的写法到新版上可能行为不符甚至报错。
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}llLLL@{}}
+\toprule
+组件 & 锚定版本 & 操作系统 & GPU 要求 & 本章用途 \\
+\midrule
+mjlab & 1.4.0（与本部一致） & Linux / macOS（仅评估） & 训练需 NVIDIA & \verb|<general>| actuator、\verb|MjSpec| 改参 \\
+MuJoCo & 3.x（含 \verb|<dcmotor>|） & Linux / macOS & 训练需 NVIDIA & \verb|<position>|/\allowbreak\verb|<general>|/\allowbreak\verb|<dcmotor>|、\verb|mjcb_control| \\
+Isaac Lab & 2.3.0（主线） & Linux / Windows & NVIDIA RTX & \Verb[breaklines]|ImplicitActuatorCfg| … \Verb[breaklines]|ActuatorNetMLPCfg| \\
+Isaac Lab & 3.0 Beta & Linux & NVIDIA RTX & Newton 后端下的 actuator 管线 \\
+PhysX & 5.4+ & 随 Isaac Sim & NVIDIA & 隐式 PD、力矩饱和求解 \\
+PyTorch & 2.x & 随框架 & NVIDIA（训练 net 时） & actuator network / delta model 训练 \\
+UniLab & main（commit 99936e08） & Linux CUDA/ROCm/XPU、macOS & 物理在 CPU、策略需 GPU & \Verb[breaklines]|PdControlConfig| PD 增益、\verb|kp/kd| 域随机化 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paragraph{分操作系统的安装要点。}与 \cref{ch:rlmc-physics} 一致：\textbf{Linux} 是三框架的一等公民，下文命令默认 Linux；\textbf{macOS} 仅能跑 CPU MuJoCo 与 mjlab 评估（无 CUDA，无法大规模并行训练，但可在 CPU 上验证 actuator 配置的数值正确性——本章大量小脚本正是为此设计）；\textbf{Windows} 仅 Isaac Lab 官方支持，mjlab 建议走 WSL2。本章不引入超出 \cref{ch:rlmc-setup} 之外的新依赖——actuator 是上述框架的内建能力，训练 actuator network/delta model 只额外需要 PyTorch（已随框架安装）。
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：五分钟看见「带宽限制」如何改变力矩}
+\addcontentsline{toc}{section}{Quick Start：五分钟看见带宽限制}
+\label{sec:rlmc-act-quickstart}
+
+最小可跑目标：在一个最简单的单关节 MuJoCo 模型上，对比 Ideal PD 与「加了一阶低通（带宽限制）」两种 actuator 对同一个阶跃命令的响应，\textbf{亲眼看见真机的力矩不会瞬间跳变}。下面这段纯 CPU 代码可直接复制运行（无需 GPU、无需 Isaac Sim）：
+
+\begin{codebox}[Python]{mjlab/MuJoCo:Ideal PD vs 带宽限制的阶跃响应（CPU 可跑）}
+import mujoco, numpy as np
+
+def make_xml(general: bool) -> str:
+    act = ('<general name="a" joint="j" gaintype="fixed" gainprm="100" '
+           'biastype="affine" biasprm="0 -100 -4" '
+           'dyntype="filter" dynprm="0.02" '          # 一阶低通，tau=20ms
+           'forcelimited="true" forcerange="-33.5 33.5"/>') if general else (
+           '<position name="a" joint="j" kp="100" kv="4" '
+           'forcelimited="true" forcerange="-33.5 33.5"/>')
+    return f'''<mujoco><option timestep="0.002"/><worldbody>
+      <body><joint name="j" type="hinge" axis="0 0 1"/>
+      <geom type="cylinder" size="0.05 0.2" mass="1.0"/></body>
+      </worldbody><actuator>{act}</actuator></mujoco>'''
+
+def step_response(xml, target=0.2, n=500):
+    # 关键: 命令力矩 kp*target = 100*0.2 = 20 N*m < forcerange 33.5,
+    # 不饱和才看得见「带宽限制让力矩爬升」的差异.若用 target=1.0,
+    # 命令力矩 100 N*m 远超 33.5, 两版都顶满 33.5, 反而看不出区别(见下方说明).
+    m = mujoco.MjModel.from_xml_string(xml); d = mujoco.MjData(m)
+    pos, tau = [], []
+    for k in range(n):
+        d.ctrl[0] = target if k >= 50 else 0.0   # 第 50 步开始阶跃
+        mujoco.mj_step(m, d)
+        pos.append(d.qpos[0]); tau.append(d.actuator_force[0])
+    return np.array(pos), np.array(tau)
+
+def rise_time_ms(tau, dt=0.002):           # 力矩从 10% 爬到 90% 峰值的时间
+    peak = tau.max(); i10 = np.argmax(tau > 0.1 * peak)
+    i90 = np.argmax(tau > 0.9 * peak); return (i90 - i10) * dt * 1e3
+
+p_ideal, t_ideal = step_response(make_xml(general=False))
+p_bw,    t_bw    = step_response(make_xml(general=True))
+# 看「峰值」也看「上升快慢」: 不饱和时两者峰值接近(都~=20), 但带宽版上升明显更慢
+print(f"Ideal PD : 峰值 {t_ideal.max():.1f} N*m  上升时间 {rise_time_ms(t_ideal):.1f} ms")
+print(f"带宽限制 : 峰值 {t_bw.max():.1f} N*m  上升时间 {rise_time_ms(t_bw):.1f} ms (更慢, 更像真机)")
+\end{codebox}
+
+\begin{codebox}[Python]{Isaac Lab:把同一关节从 Ideal PD 切到 DC Motor（配置层）}
+from isaaclab.actuators import ImplicitActuatorCfg, DCMotorCfg
+
+# Level 0:理想 PD，PhysX 内部积分（吞吐最高，看不到中间力矩）
+ideal = ImplicitActuatorCfg(
+    joint_names_expr=[".*"], stiffness=100.0, damping=4.0,
+    effort_limit=33.5, velocity_limit=21.0,
+)
+
+# Level 1:DC Motor，加入「力矩随速度衰减」的饱和曲线
+dc = DCMotorCfg(
+    joint_names_expr=[".*"], stiffness=100.0, damping=4.0,
+    saturation_effort=33.5,   # 堵转(零速)力矩 tau_stall
+    effort_limit=33.5, velocity_limit=21.0,   # 空载最大转速 q_dot_max
+)
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:actuator 配置（位置执行器 + PD 增益，Level 0 原生）}
+# UniLab 不在 task 代码里配 actuator 类树, 而是把 PD 增益交给"后端位置执行器".
+# 增益来自 PdControlConfig (unilab/envs/locomotion/common/base.py), 经 create_backend 注入:
+from unilab.base.backend import create_backend
+backend = create_backend(
+    backend_type, cfg.scene, num_envs, cfg.sim_dt,
+    base_name="base",
+    position_actuator_gains={"kp": cfg.control_config.Kp,    # == stiffness
+                             "kd": cfg.control_config.Kd})   # == damping
+# 动作 -> 控制: apply_action 给位置目标 _motor_targets += act*action_scale + default_angles,
+# 后端位置执行器按 kp/kd 算力矩 (= Ideal PD).Hydra 改增益:
+#   env.control_config.Kp=100 env.control_config.Kd=4
+# 工程细节(实跑核对): go2 rough 任务并非全关节同一 action_scale, 而是 per-joint——
+#   hip 0.125 / 非 hip 0.25 (源码 go2/rough.py).对 hip 用更小 scale 是四足常见技巧:
+#   缩小侧摆(hip abduction)动作幅度以抑制乱晃、稳住步态.action_scale 越小=策略每步
+#   能偏离 default_angles 越少=动作越保守, 是除 kp/kd 外另一个稳定性旋钮.
+# DC Motor / 带宽限制: UniLab 无 Python actuator 类, 由 MJCF <general>/forcerange
+#   在模型层表达 (与上面 mjlab 列同一份 MJCF), 不在 task 代码里切类.
+\end{codebox}
+
+\noindent{}跑完 mjlab 版（\verb|target=0.2|，命令力矩 $20<33.5$ 不饱和）你会看到：两版\emph{峰值}力矩都接近 $20$~N$\cdot$m，但带宽限制版的\emph{上升时间}明显更长（Ideal PD 几乎瞬达，filter 版需若干步爬升）——力矩是\emph{爬升}而非\emph{跳变}的，这就是真实电机与理想 PD 最直观的差别。
+
+\begin{pitfall}[别让「饱和」遮蔽「带宽」：Quick Start 演示的第一个坑]
+\textbf{错误描述}：把 \verb|target| 设成 $1.0$（命令力矩 $k_p\times1.0=100$~N$\cdot$m）后跑这段脚本，期待看到带宽版峰值低于 Ideal 版。\textbf{现象后果}：两版峰值都\emph{恰好}顶到 $33.5$——因为 $100\gg33.5$，无论有无带宽限制，力矩都被 \verb|forcerange| 钳到饱和上限，filter 只把「到达饱和」推迟约一步，看 \verb|peak.max()| 完全分不出区别，读者会误以为带宽限制没生效或环境装错。\textbf{根本原因}：\emph{饱和}（\verb|forcerange| 钳幅）与\emph{带宽}（\Verb[breaklines]|dyntype=filter| 让力矩爬升）是两个独立现象（与 \cref{sec:rlmc-act-dcmotor} 的「filter$\neq$力矩-速度饱和」是同一类区分）；命令力矩一旦超过 \verb|forcerange|，饱和就把带宽差异盖住了。\textbf{正确做法}：先用 \verb|target=0.2| 让命令力矩 $k_p\times\text{误差}<\verb|forcerange|$，并对比\emph{上升时间}而非仅峰值——这才看得见带宽限制的物理效果。一句口诀：\textbf{想看带宽，先让它别饱和}。
+\end{pitfall}
+
+\noindent\textbf{Quick Start 的目的不是讲清原理，而是先让你看见「actuator 模型选择会实实在在改变施加到关节上的力矩」}，后面各节再展开为什么、怎么选、怎么辨识。
+
+\begin{practice}[前置自测：答不出 $\ge 3$ 题，建议先回本部前置章或控制基础]
+\begin{enumerate}
+  \item PD 控制器的输出力矩公式是什么？$k_p$ 与 $k_d$ 分别控制哪个物理量？（控制基础）
+  \item \cref{ch:rlmc-obsact} 里 position action 与 torque action 各有什么优缺点？（动作空间设计）
+  \item \cref{ch:rlmc-dr} 为什么要随机化 actuator 的 $k_p/k_d$？这与「精确建模 actuator」是什么关系？
+  \item MJCF 里 \verb|<position>| 与 \verb|<motor>| 两类 actuator 有什么区别？（MJCF 基础）
+  \item 一阶低通 $\tau\dot y + y = x$ 的时间常数 $\tau$ 的物理意义是什么？它和「带宽」如何换算？（信号处理基础）
+\end{enumerate}
+\end{practice}
+
+\paragraph{本章目标。}学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{区分} actuator 建模的四个层级（Ideal PD $\to$ DC Motor $\to$ Actuator Network $\to$ Delta Action Model），并说清每一级解决什么问题、引入什么成本；
+  \item \textbf{配置} mjlab 与 Isaac Lab 中各级 actuator——从 MuJoCo \verb|<position>|/\allowbreak\verb|<general>| 到 \Verb[breaklines]|ImplicitActuatorCfg|/\allowbreak\verb|DCMotorCfg|/\allowbreak\Verb[breaklines]|ActuatorNetMLPCfg|，并给出每个参数的物理含义；
+  \item \textbf{实现}一个简化的 actuator network 的完整链路：数据收集 $\to$ MLP 训练 $\to$ 仿真器集成 $\to$ 力矩预测精度评估；
+  \item \textbf{设计}系统辨识实验（扫频 / 阶跃响应 / 摩擦测量），并从实验数据反求 $k_p$、$k_d$、带宽与摩擦参数；
+  \item \textbf{实现} ASAP 风格的 delta action model，并能讲清它与 actuator network 在「建模目标」与「数据需求」上的本质区别；
+  \item \textbf{诊断} actuator 模型不匹配导致的 sim-to-real 问题，依据任务难度选择正确的建模层级——\textbf{先问「DR 够不够」，不够才升级}。
+\end{enumerate}
+
+\paragraph{知识导航与阅读时间。}本章结构如下树。建议精读 4--5 小时（含练习与跑通验证脚本）；有 sim-to-real 经验者速读 2--3 小时（重点看 \cref{sec:rlmc-act-level01} 的三框架配置对照与 \cref{sec:rlmc-act-decision} 的选型决策）；遇到「真机跳不起来 / 动作拖沓」时速查 30 分钟（直接跳故障排查手册）。
+
+\begin{center}
+\begin{forest} navtreeLR
+[Actuator 建模实战
+  [{四层级全景\\(为什么默认 actuator 不够)}]
+  [{Level 0--1\\(Ideal PD / DC Motor)}]
+  [{Level 2\\(Actuator Network)}]
+  [{Level 3\\(Delta Action Model)}]
+  [{系统辨识\\(扫频/阶跃/摩擦)}]
+  [{选型决策\\(任务难度 vs 投入)}]
+]
+\end{forest}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{算法主线：actuator 建模的四个层级}
+\label{sec:rlmc-act-levels}
+
+\paragraph{模块功能与在管线中的位置。}actuator 不是一个独立模块，而是\emph{动作执行链}的最后一环：策略输出目标关节角 $q^*$（\cref{ch:rlmc-obsact}），actuator 模型把 $q^*$ 转换为实际施加在关节上的力矩 $\tau$，再由物理引擎（\cref{ch:rlmc-physics}）积分出下一状态。这一节先不碰任何框架 API，而是立起本章的算法主线：四个层级、各解决什么问题、如何递进。
+
+\subsection{为什么仿真器的默认 actuator 不够}
+\label{sec:rlmc-act-why}
+
+最简单的 actuator 模型是 Ideal PD（理想比例-微分控制）：
+\begin{equation}
+\tau = K_p\,(q^* - q) - K_d\,\dot q.
+\label{eq:rlmc-act-idealpd}
+\end{equation}
+它隐含三个假设：(1) 力矩可\emph{瞬时}达到任意值（无带宽限制）；(2) 力矩与位置误差\emph{严格线性}；(3) 没有摩擦、死区或饱和。\textbf{真实电机没有一个满足这三条}。若用 Ideal PD 训练再直接部署，策略学到的是「理想世界中的最优行为」——它可能依赖瞬时大力矩（真机做不到）、忽略摩擦补偿（真机需要）、不考虑饱和（真机有上限）。这些差异叠加，正是 sim-to-real gap 的最大来源之一。
+
+\begin{insight}[一个具体的「半翻」失败]\label{ins:rlmc-act-halfflip}
+仿真中策略学到「空中快速摆腿可加速翻转」——这需要在 20~ms 内产生约 30~N$\cdot$m 的力矩反转。但真实电机带宽只有约 30~Hz（响应时间 $\approx 33$~ms），且关节高速旋转时反电动势降低了可用力矩。结果：仿真里漂亮的空翻，到真机上变成尴尬的\emph{半翻}——因为策略规划的力矩时序在真机上根本执行不出来。\textbf{这说明 sim-to-real gap 不一定来自「参数值不对」（那是 DR 的范畴），也可能来自「仿真器的 actuator 动态结构本身就缺失了带宽与饱和」——后者 DR 再宽也补不上}。
+\end{insight}
+
+\subsection{为什么只做 DR 还不够}
+\label{sec:rlmc-act-vs-dr}
+
+\cref{ch:rlmc-dr} 的 DR 能在一定程度上覆盖 actuator 差异——随机化 $k_p/k_d$，逼策略适应不同的力矩响应。但 DR 的覆盖是「粗暴的均匀覆盖」：它不知道真机的 actuator 特性朝哪个方向偏，只能在一大片范围上撒网。actuator 建模则是「精确的定点修正」：它直接告诉仿真器「真机就是这样的」。
+
+\begin{insight}[配镜类比：渐进多焦镜 vs 验光配镜]\label{ins:rlmc-act-glasses}
+DR 像「配一副度数范围很宽的渐进多焦镜」——在任何度数下都看得\emph{差不多}；actuator 建模像「先验光再配精确度数」——在\emph{你的}度数下看得最清。前者更通用但不精确，后者更精确但需要额外的「验光」（数据收集）步骤。更关键的是：\textbf{二者正交、互补，而非互斥}。即使用了最精确的 actuator network，真机特性仍会随温度、磨损、电量漂移，DR 依然需要——只是范围可以收窄（如从 $U(0.5,2.0)$ 缩到 $U(0.85,1.15)$）。这条「model 提名义精度、DR 覆盖剩余变化」的分工，是 \cref{ins:rlmc-dr-vs-delta} 在 actuator 层面的具体化。
+\end{insight}
+
+\subsection{四个层级及其递进关系}
+\label{sec:rlmc-act-fourlevels}
+
+四个层级沿「精度 $\uparrow$、成本 $\uparrow$」一条线递进：
+
+\begin{codebox}{actuator 建模四层级（精度递增）}
+Level 0: Ideal PD          tau = Kp(q* - q) - Kd*q_dot
+   |  + 带宽限制 / 力矩-速度饱和
+Level 1: DC Motor          tau = clip( PD,  -tau_max(q_dot), +tau_max(q_dot) )
+   |  + 用神经网络拟合真机响应 (q*, q, q_dot, 历史) -> tau
+Level 2: Actuator Network  tau = MLP(q*, q, q_dot, history)
+   |  + 不建模电机物理, 直接在动作空间补差
+Level 3: Delta Action      a_corrected = a_policy + MLP_delta(s, a)
+\end{codebox}
+
+四个层级的关系类似地图的精度等级：Level 0 是「世界地图」——看得到大陆看不到城市；Level 1 是「国家地图」——主要城市与公路；Level 2 是「街道地图」——每条小路都标注；Level 3 不画新地图，而是在现有地图上贴「纠错贴纸」——只修正差异最大处。下表是本章其余各节的总目录：
+
+\begin{center}
+\small
+\begin{tabular}{@{}clllll@{}}
+\toprule
+层级 & 方法 & 精度 & 工程复杂度 & 数据需求 & 典型用途 \\
+\midrule
+0 & Ideal PD & 低 & 极低 & 无 & 初期算法验证 \\
+1 & DC Motor & 中 & 低 & 电机数据手册 & 大多数四足项目 \\
+2 & Actuator Network & 高 & 中 & 5--10 min 真机数据（带力矩） & 高精度 sim2real \\
+3 & Delta Action Model & 最高 & 高 & 真机 rollout（仅状态） & 极致 agility \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{历史演进与一处归因勘误}
+\label{sec:rlmc-act-history}
+
+actuator 建模在足式 sim-to-real 中的演进脉络清晰：2018 年 Tan et al.（Google，RSS 2018，arXiv:1804.10332）\cite{tan2018simtoreal} 首次在四足 sim-to-real 中用解析 actuator 模型 $+$ 延迟建模 $+$ 系统辨识 $+$ DR 弥合 gap；2019 年 Hwangbo et al.（Science Robotics，arXiv:1901.08652）\cite{hwangbo2019} 在 ANYmal 上首创用 MLP 直接拟合 actuator 的\emph{黑箱神经网络} actuator model；2025 年 ASAP（He et al., RSS 2025，arXiv:2502.01143）\cite{he2025asap} 提出在动作空间做残差修正的 delta action model；同年 UAN（Fey et al., MIT, arXiv:2502.10894）\cite{fey2025uan} 用 5~分钟真机数据无监督拟合 actuator。
+
+\begin{pitfall}[把 actuator network 的原创归因给 walk-these-ways]
+\textbf{错误描述}：不少中文资料把「actuator network」说成 walk-these-ways 的贡献，甚至把 walk-these-ways 标成「RSS'23」。\textbf{现象后果}：引用与时间线全错，误导读者去 walk-these-ways 找 actuator net 的方法细节（找不到）。\textbf{根本原因}：把同组不同论文、把「用了 DR 的 locomotion 工作」与「actuator net 原创」混为一谈。\textbf{正确做法}：actuator network 的原创是 \textbf{Hwangbo et al. 2019}（ANYmal, Science Robotics）\cite{hwangbo2019}；walk-these-ways（Margolis \& Agrawal, \textbf{CoRL 2022}, arXiv:2212.03238）\cite{margolis2022walk} 的核心贡献是 \emph{Multiplicity-of-Behavior（MoB）} 步态条件化，它用的是标准 Isaac Gym DR（\cite{rudin2021minutes}），\textbf{并非} actuator network。本书已联网核对两篇的题名、年份与 arXiv 编号后做此勘误。
+\end{pitfall}
+
+\begin{insight}[更高精度的 actuator 模型并不「总是更好」]\label{ins:rlmc-act-notalways}
+如果你的 DR 范围足够宽（\cref{ch:rlmc-dr} 的 $k_p$ 随机化已覆盖真机差异），Ideal PD $+$ DR 可能\emph{已经够用}。只有当 DR 不够时（跳跃、旋转等需在力矩极限附近精确操作的极限动作），才值得投入 Level 2--3 的工程量。\textbf{第二个常见误解是「actuator network 与 delta action model 互斥」}——其实它们建模的是不同层面：actuator network 建「电机物理」（命令$\to$力矩），delta action model 建「整体 gap」（含电机、延迟、软件栈差异）。理论上可叠加，但 ASAP 的结果表明 delta action 单独往往就够。
+\end{insight}
+
+\paragraph{运行验证。}本节无代码可跑，但有一个\emph{决策自测}：给定三个场景，你能不能立即说出推荐层级？(a) 博士第一周学 RL locomotion；(b) 准备 demo 的 G1 跳旋；(c) 工厂里 Go1 巡逻行走。（参考答案分别是 Ideal PD$+$DR / ASAP delta / DC Motor$+$DR；判定依据见 \cref{sec:rlmc-act-decision} 的选型方法论与 \cref{ins:rlmc-act-roi} 的「先问 DR 够不够」——其中 (a)(b) 正对应该节三场景表的前两行，(c) 这类低速巡逻按 ROI 原则落在 DC Motor$+$DR。）
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[分类题]} 上面三个场景 (a)(b)(c) 各适合哪个 actuator 建模层级？\emph{验收}：能各给出一句物理理由（如「跳旋需在力矩极限附近操作 $\to$ Ideal PD 不够」）。
+  \item \textbf{[思考题]} 为什么 ASAP 的 delta 在\emph{动作}空间而非\emph{状态}空间做修正？若在状态空间做残差（预测下一状态的修正），会遇到什么问题？\emph{提示}：状态残差需要可微仿真器或前向模型，且修正后的状态可能违反动力学一致性。
+  \item \textbf{[跨章综合题]} 结合 \cref{ch:rlmc-dr}：若真机 $k_p$ 实测为 $100\pm20$，DR 该如何设置覆盖它？若真机 $k_p=100$ 但带宽只有 30~Hz（仿真假设无限带宽），DR 能覆盖这个差异吗？\emph{验收}：第一问用 \verb|scale| 或 \verb|add| 给出范围；第二问答「不能——带宽是 actuator 的动态结构缺失，靠随机化 $k_p$ 这个\emph{静态}增益补不上」。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Level 0--1：Ideal PD 与 DC Motor 模型}
+\label{sec:rlmc-act-level01}
+
+\paragraph{模块功能与在管线中的位置。}这是最基础也最常用的两级——绝大多数四足 locomotion 项目止步于此。本节给出三框架下「怎么配、每个参数什么物理意义、何时从 Level 0 升到 Level 1」的完整对照。算法点先讲动机（理想 PD 缺什么）、反面（不补会怎样）、再到操作（怎么配）。
+
+\subsection{Ideal PD：三框架配置对照}
+\label{sec:rlmc-act-idealpd-cfg}
+
+Ideal PD 直接实现式~\eqref{eq:rlmc-act-idealpd}。三框架的写法与一处关键耦合如下。
+
+\begin{codebox}[Python]{mjlab/MuJoCo:<position> actuator 就是 Ideal PD}
+# MJCF 片段（写在 <actuator> 内）
+# <position name="hip_act" joint="hip_joint"
+#           kp="100"                 比例增益 (N*m/rad)
+#           kv="4"                   微分增益 (N*m*s/rad)
+#           ctrlrange="-1.57 1.57"   控制输入(目标角)范围
+#           forcelimited="true" forcerange="-33.5 33.5"/>  输出力矩限制
+# MuJoCo 内部: tau = kp*(q* - q) - kv*q_dot，其中 q* = ctrl
+\end{codebox}
+
+\begin{codebox}[Python]{Isaac Lab:Implicit vs IdealPD 两种实现}
+from isaaclab.actuators import ImplicitActuatorCfg, IdealPDActuatorCfg
+
+# 方式 1:ImplicitActuator —— PhysX 内部做 PD（最快，但看不到中间力矩）
+legs_implicit = ImplicitActuatorCfg(
+    joint_names_expr=[".*hip.*", ".*thigh.*", ".*calf.*"],
+    stiffness=100.0,     # == MuJoCo kp
+    damping=4.0,         # == MuJoCo kv + joint damping 之和（见下方耦合警告）
+    effort_limit=33.5, velocity_limit=21.0,
+)
+
+# 方式 2:IdealPDActuator —— Python 层显式算 PD（略慢，可逐步 log 力矩）
+legs_explicit = IdealPDActuatorCfg(
+    joint_names_expr=[".*hip.*", ".*thigh.*", ".*calf.*"],
+    stiffness=100.0, damping=4.0, effort_limit=33.5, velocity_limit=21.0,
+)
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:Ideal PD = PdControlConfig + 后端位置执行器}
+from dataclasses import dataclass
+# UniLab 的 actuator 不是 *Cfg 类树, 而是 unilab/envs/locomotion/common/base.py 里的
+# PdControlConfig(继承 ControlConfigBase).注意: PdControlConfig 自身只新增 Kp/Kd,
+# action_scale 与 simulate_action_latency 是从基类 ControlConfigBase 继承来的:
+@dataclass
+class PdControlConfig:                      # (= ControlConfigBase + Kp/Kd)
+    Kp: float = 35.0          # == Isaac Lab stiffness / MuJoCo kp  (本类新增)
+    Kd: float = 0.5           # == Isaac Lab damping  / MuJoCo kv (+ joint damping) (本类新增)
+    # 下面两项继承自 ControlConfigBase, 非 PdControlConfig 自有字段:
+    action_scale: float = 0.25
+    simulate_action_latency: bool = False  # 实测默认 False! (不要写成 True)
+                                           # 置 True 才用上一步动作模拟一帧延迟
+
+# 增益经 create_backend 下沉到后端位置执行器 (见上节 Quick Start);
+# effort/velocity 限制不在这里, 而由 MJCF/Motrix 模型本身的 actuator
+# (ctrlrange/forcerange/gear) 承担——这正是 UniLab 与 Isaac Lab 的关键差别:
+#   Isaac Lab: effort_limit 等限制是 Python *Cfg 字段;
+#   UniLab:    限制写在模型 (MJCF/XML) 里, Python 侧只配 Kp/Kd/action_scale.
+\end{codebox}
+
+\begin{insight}[三框架的 actuator 哲学：Python 类树 vs 模型层 + 后端执行器]\label{ins:rlmc-act-unilab-philosophy}
+同一个「Ideal PD」，三框架放在不同的抽象层：\textbf{Isaac Lab} 把 actuator 做成一棵 Python \verb|*Cfg| 类树（\Verb[breaklines]|ImplicitActuatorCfg|/\allowbreak\Verb[breaklines]|IdealPDActuatorCfg|…），增益、力矩限、延迟都是数据类字段；\textbf{mjlab/MuJoCo} 把它写进 MJCF 的 \verb|<actuator>|（\verb|kp|/\allowbreak\verb|kv|/\allowbreak\verb|forcerange|），Python 侧的 \Verb[breaklines]|BuiltinPdActuatorCfg| 只是「往 MJCF 注入这些字段」的薄包装；\textbf{UniLab} 走第三条路——Python 侧只有一个极简 \Verb[breaklines]|PdControlConfig|（\Verb[breaklines]|Kp/Kd/action_scale|），把增益交给「后端位置执行器」算力矩，而力矩-速度饱和、\verb|forcerange| 等\emph{物理约束统一落在模型文件}（MJCF/Motrix XML）里。\textbf{这条分野解释了后面几节的一个反复现象：在 Isaac Lab 里「升级 actuator」是换一个 Python 类，在 UniLab 里却是改模型文件 $+$ 调 \texttt{Kp/Kd}$+$靠 DR}——UniLab 把 actuator 复杂度从代码层挪到了资产层。
+\end{insight}
+
+\begin{pitfall}[MuJoCo 的 \texttt{kv} 与 \texttt{joint damping} 效果叠加]
+\textbf{错误描述}：以为 \Verb[breaklines]|<position kv="4"/>| 就是关节的全部阻尼，跨框架对齐时只搬这一个数。\textbf{现象后果}：若同时设了 \Verb[breaklines]|<joint damping="0.5"/>|，真实总阻尼是 $4.5$；照搬 $4.0$ 到 Isaac Lab 的 \verb|damping| 上，两端阻尼不一致，sim2sim 就对不上。\textbf{根本原因}：MuJoCo 把「actuator 速度增益」与「关节本身阻尼」当成两个独立来源、效果相加。\textbf{正确做法}：Isaac Lab 的 \verb|damping| 应填 MuJoCo 的 \verb|kv| $+$ \Verb[breaklines]|joint damping| 之和（此例 $4.5$）。这是跨框架对齐最常见的 bug 来源之一，呼应 \cref{ch:rlmc-physics} 的 sim2sim 关切。
+\end{pitfall}
+
+\begin{insight}[ImplicitActuator vs IdealPDActuator：吞吐 vs 可观测]\label{ins:rlmc-act-implicit}
+两者数学等价，差别全在工程：Implicit 在 PhysX（C++）内部算 PD，减少 Python$\leftrightarrow$C++ 通信，\emph{训练吞吐更高}，但你拿不到每步的中间力矩；IdealPD 在 Python 层算，\emph{可 log 每步力矩}、可继承改写，但略慢。\textbf{经验法则：训练用 Implicit（吞吐优先），调试 / 想看力矩曲线时切 IdealPD}。注意二者在 DR 下行为略有差异——Implicit 的 DR 改 PhysX 内部参数，IdealPD 的 DR 在 Python 改，混用做对比实验时要留意这点数值差。
+\end{insight}
+
+\subsection{DC Motor：加入力矩-速度约束}
+\label{sec:rlmc-act-dcmotor}
+
+真实直流电机有一条关键物理约束：\textbf{力矩与转速不能同时达到最大}。关节高速旋转时反电动势（back-EMF）减小可用力矩。DC Motor 模型用一条线性力矩-速度曲线近似：
+\begin{equation}
+\tau_{\max}(\dot q) = \tau_{\mathrm{stall}}\,\Big(1 - \frac{|\dot q|}{\dot q_{\max}}\Big),
+\label{eq:rlmc-act-torquespeed}
+\end{equation}
+其中 $\tau_{\mathrm{stall}}$ 是堵转（零速）力矩，$\dot q_{\max}$ 是空载最大转速。最终施加力矩 $= \mathrm{clip}\big(\text{PD 命令},\,-\tau_{\max}(\dot q),\,+\tau_{\max}(\dot q)\big)$。
+
+\begin{codebox}[Python]{Isaac Lab:DCMotorCfg 一行开启力矩-速度饱和}
+from isaaclab.actuators import DCMotorCfg
+
+legs_dc = DCMotorCfg(
+    joint_names_expr=[".*hip.*", ".*thigh.*", ".*calf.*"],
+    stiffness=100.0, damping=4.0,
+    saturation_effort=33.5,  # 堵转力矩 tau_stall (N*m)
+    effort_limit=33.5,       # 力矩硬上限（通常 == saturation_effort）
+    velocity_limit=21.0,     # 空载最大转速 q_dot_max (rad/s)
+)
+\end{codebox}
+
+\begin{codebox}[Python]{DC Motor 力矩计算逻辑（Isaac Lab 内部简化版）}
+import torch
+def dc_motor_torque(q_star, q, q_dot, kp, kd, tau_stall, q_dot_max):
+    tau_cmd = kp * (q_star - q) - kd * q_dot          # 1. PD 命令力矩
+    speed_ratio = torch.abs(q_dot) / q_dot_max
+    tau_avail = tau_stall * (1.0 - speed_ratio).clamp(min=0.0)  # 2. 可用力矩
+    return tau_cmd.clamp(-tau_avail, tau_avail)        # 3. clip 到可用范围
+\end{codebox}
+
+\noindent{}上式与式~\eqref{eq:rlmc-act-torquespeed} 用对称的 $|\dot q|$ 近似，便于教学。Isaac Lab 的 \Verb[breaklines]|DCMotor._clip_effort| 实际是\textbf{带符号的四象限曲线}（已联网核对源码）：上限 $\tau_{\max}=\tau_{\mathrm{stall}}\big(1-\dot q/\dot q_{\max}\big)$ 截到 $[0,\text{effort\_limit}]$，下限 $\tau_{\min}=\tau_{\mathrm{stall}}\big(-1-\dot q/\dot q_{\max}\big)$ 截到 $[-\text{effort\_limit},0]$，再 \Verb[breaklines]|clip(effort, tau_min, tau_max)|——即正/负向力矩上限随\emph{有符号}转速非对称变化（正转时正向力矩衰减、反向力矩反而更足），而非上面的对称 $\pm\tau_{\mathrm{avail}}$。教学用对称版即可，但与真机/源码精确对齐时要用四象限式。
+
+mjlab/MuJoCo 一侧有两条路。\textbf{首选}：较新版本 MuJoCo（3.x）已内置 \verb|<dcmotor>| actuator，自带 resistance、motor constant、saturation、LuGre 摩擦等属性，可直接按数据手册建模力矩-速度特性（本书已在 MuJoCo~3.8.1 实跑核对其\emph{存在性}）。\textbf{但注意一个实跑坑}：\textbf{裸标签} \Verb[breaklines]|<dcmotor name="m" joint="j"/>| \textbf{编译即报 \texttt{ValueError: motor constant K must be positive}}——\verb|<dcmotor>| 必须给出正的电机常数等属性才能编译，不能照搬「只填 name/joint」的写法。它需要哪几个必填属性、各属性的精确名与单位，以你装的 MuJoCo 版本的官方 XMLReference〈actuator〉节为准（不同小版本属性名有别，\textbf{自己查文档而非照抄博客}是这里的关键工程习惯）。\textbf{退路（本节用作可跑演示）}：用 \verb|<general>|（带宽）$+$ \verb|mjcb_control| 里按式~\eqref{eq:rlmc-act-torquespeed} 显式 clip（真正的力矩-速度约束），两步都已实跑验证，见下方。
+
+\begin{codebox}[Python]{MuJoCo:用 <general> 近似带宽限制（注意它不是真正的力矩-速度约束）}
+# <general name="hip" joint="hip_joint"
+#          gaintype="fixed" gainprm="100"        gain = kp
+#          biastype="affine" biasprm="0 -100 -4"  bias = -kp*q - kd*q_dot
+#          dyntype="filter" dynprm="0.02"         一阶低通, tau=20ms (带宽限制)
+#          ctrllimited="true" ctrlrange="-1.57 1.57"
+#          forcelimited="true" forcerange="-33.5 33.5"/>
+\end{codebox}
+
+\noindent 既然裸 \verb|<dcmotor>| 需要正确电机常数、不便直接演示，下面给一段\textbf{已实跑、零外部依赖}的替代：用 \verb|mjcb_control| 回调按式~\eqref{eq:rlmc-act-torquespeed} 显式实现「力矩随转速衰减」的真正 DC Motor 约束，并扫一遍速度打印出 $\tau_{\max}(\dot q)$ 曲线——这正是 \verb|<dcmotor>| 想要的物理效果，且看得见、可自验：
+
+\begin{codebox}[Python]{MuJoCo:用 mjcb\_control 显式实现力矩-速度约束 + 打印 tau\_max(q\_dot)}
+import mujoco, numpy as np
+XML = '''<mujoco><option timestep="0.002"/><worldbody>
+  <body><joint name="j" type="hinge" axis="0 0 1"/>
+  <geom type="cylinder" size="0.05 0.2" mass="1.0"/></body>
+  </worldbody><actuator>
+  <motor name="m" joint="j" ctrllimited="true" ctrlrange="-100 100"/>
+  </actuator></mujoco>'''                       # 用 <motor> 直接给力矩(单位增益), clip 在回调里做
+KP, KD, TAU_STALL, QDOT_MAX = 100.0, 4.0, 33.5, 21.0
+
+def torque_speed_cb(model, data, q_star=0.5):
+    q, q_dot = data.qpos[0], data.qvel[0]
+    tau_cmd = KP * (q_star - q) - KD * q_dot      # PD 命令
+    # 四象限上下限(与 Isaac DCMotor 同构, 见上方四象限说明):
+    tau_hi = np.clip(TAU_STALL * (1 - q_dot / QDOT_MAX),  0, TAU_STALL)
+    tau_lo = np.clip(TAU_STALL * (-1 - q_dot / QDOT_MAX), -TAU_STALL, 0)
+    data.ctrl[0] = np.clip(tau_cmd, tau_lo, tau_hi)
+
+m = mujoco.MjModel.from_xml_string(XML); d = mujoco.MjData(m)
+mujoco.set_mjcb_control(torque_speed_cb)
+for _ in range(300): mujoco.mj_step(m, d)
+mujoco.set_mjcb_control(None)                     # 用完务必清回调, 否则污染后续模型!
+# 预期: 关节加速后, 高 q_dot 时正向可用力矩 tau_hi 明显 < TAU_STALL(33.5)
+for qd in (0.0, 5.0, 10.0, 20.0):
+    print(f"q_dot={qd:5.1f} rad/s -> 正向可用力矩上限 ="
+          f" {np.clip(TAU_STALL*(1-qd/QDOT_MAX),0,TAU_STALL):.1f} N*m")
+# 预期输出: 0->33.5, 5->25.5, 10->17.5, 20->1.6  (随转速线性跌落, 这才是 DC Motor)
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:DC Motor 饱和——无 Python 类，写进模型层}
+# UniLab 没有 DCMotorCfg 这样的 Python actuator 类 (已读源码核对, 见 §版本信息速查).
+# 力矩-速度饱和 / forcerange 由 MJCF (mujoco-uni 后端) 或 Motrix XML 的 actuator 承担:
+#   <general ... forcelimited="true" forcerange="-33.5 33.5"/>   # 与上面 mjlab 列同源
+# Python 侧只配 PD 增益与动作缩放:
+#   env.control_config.Kp=100  env.control_config.Kd=4  (Hydra 覆盖)
+# 若要"力矩随转速衰减"的真正 DC Motor 约束(本节力矩-速度公式), 需在 MJCF 用
+#   <dcmotor> (mujoco-uni 3.8.0 支持), 或靠 kp/kd 域随机化覆盖该差异 (UniLab 主力路线).
+\end{codebox}
+
+\begin{pitfall}[把 \texttt{dyntype="filter"} 当成 DC Motor 的力矩-速度约束]
+\textbf{错误描述}：以为给 \verb|<general>| 加上 \Verb[breaklines]|dyntype="filter"| 就等价于 Isaac Lab 的 \verb|DCMotorCfg|。\textbf{现象后果}：高速运动时仿真力矩仍可达上限，与真机「高速时力矩跌落」对不上，照样跳不动。\textbf{根本原因}：\Verb[breaklines]|dyntype="filter"| 只是\emph{一阶低通/带宽限制}（让力矩\emph{爬升}而非跳变），它\textbf{不会}按关节速度改变力矩上限；而式~\eqref{eq:rlmc-act-torquespeed} 的力矩-速度约束是\emph{随速度衰减的上限}，两者是不同的物理效应。\textbf{正确做法}：要真正的力矩-速度约束，用 MuJoCo \verb|<dcmotor>|，或在 \verb|mjcb_control| 里按式~\eqref{eq:rlmc-act-torquespeed} 显式 clip；\Verb[breaklines]|<general>+filter| 只负责带宽这一项。
+\end{pitfall}
+
+\begin{insight}[\texttt{<general>} 是 MuJoCo 的「线性 actuator 瑞士军刀」]\label{ins:rlmc-act-general}
+\verb|<general>| 通过组合三件套表达\emph{任何线性时不变} actuator：\Verb[breaklines]|gaintype="fixed" gainprm="100"| 设 $k_p=100$；\Verb[breaklines]|biastype="affine" biasprm="0 -100 -4"| 设 $\text{bias}=0+(-k_p)q+(-k_d)\dot q$，于是 $\tau=k_p q^* + 0 - k_p q - k_d\dot q = k_p(q^*-q)-k_d\dot q$；\Verb[breaklines]|dyntype="filter" dynprm="0.02"| 再叠加 20~ms 一阶低通模拟带宽。这三个旋钮的组合实现了一个带宽限制的 PD 控制器，\textbf{不写一行 Python}。对\emph{非线性}模型（actuator network），MuJoCo 走 \verb|mjcb_control| 回调——但回调在 CPU 执行，牺牲 GPU 并行；Isaac Lab 的 \Verb[breaklines]|ActuatorNetMLP| 则在 GPU 上跑，更适合大规模训练。\textbf{这条「MuJoCo 灵活/CPU 回调、Isaac Lab 分层/GPU 原生」的分野，是两框架 actuator 哲学的根本差异}。
+\end{insight}
+
+\subsection{各 dyntype/gaintype/biastype 速查}
+\label{sec:rlmc-act-general-table}
+
+\verb|<general>| 的力矩计算管线为：\verb|ctrl| $\to$ [dynamics] $\to$ 内部状态 \verb|act| $\to$ [gain]$\times$\verb|act|$+$[bias]$\cdot(1,q,\dot q)$ $\to$ 力矩。各 \verb|dyntype| 含义：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllp{3.2cm}@{}}
+\toprule
+dyntype & 公式 & 物理意义 & 用途 \\
+\midrule
+\verb|none| & $\text{act}=\text{ctrl}$ & 无动态 & Ideal PD（默认） \\
+\verb|filter| & $\tau\dot a + a = \text{ctrl}$ & 一阶低通 & 模拟电机带宽 \\
+\verb|integrator| & $\dot a = \text{ctrl}$ & 积分器 & 速度控制$\to$位置 \\
+\verb|filterexact| & 精确一阶滤波 & 同 filter 更精确 & 数值敏感场景 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{配置项四维表：DC Motor 的关键参数}
+\label{sec:rlmc-act-cfg4d}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{2.6cm}p{3.2cm}p{3.4cm}@{}}
+\toprule
+配置项 & 默认值来源 & 修改影响 & 与其他配置的耦合 \\
+\midrule
+\Verb[breaklines]|saturation_effort| & 电机数据手册堵转力矩 & 决定零速时力矩上限 & 与 \verb|effort_limit| 通常相等；高速时实际上限按式~\eqref{eq:rlmc-act-torquespeed} 更低 \\
+\Verb[breaklines]|velocity_limit| & 数据手册空载转速 & 决定力矩衰减到 0 的速度 & 设太小 $\to$ 中速就没力矩；与 gear ratio 有关 \\
+\verb|stiffness| ($k_p$) & 调参 / 辨识 & 跟踪刚度 & 与 \verb|damping| 共同决定二阶响应 $\omega_n,\zeta$ \\
+\verb|damping| ($k_d$) & 临界阻尼估计 & 抑制振荡 & 含 MuJoCo \Verb[breaklines]|joint damping| 叠加项 \\
+\Verb[breaklines]|effort_limit_sim| & 同 \verb|effort_limit| & PhysX 求解器硬限制 & 不设则可能突破 \verb|effort_limit|（见版本信息速查） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{从电机数据手册配置参数}
+\label{sec:rlmc-act-datasheet}
+
+工程上第一步常是从数据手册估初值。下面脚本演示从手册参数生成 MJCF 与 Isaac Lab 两端配置：
+
+\begin{codebox}[Python]{从数据手册估 kp/kd/带宽（两端配置同源）}
+def datasheet_to_cfg(peak_torque, no_load_speed, bandwidth_hz=30):
+    tau_max = peak_torque
+    kp = 0.6 * tau_max / 0.1            # 让 0.1rad 误差产生 ~60% 峰值力矩
+    J = 0.01                            # 四足腿关节惯量经验值 (kg*m^2)
+    kd = 2 * (kp * J) ** 0.5            # 临界阻尼 kd = 2*sqrt(kp*J)
+    tau_filter = 1.0 / (2 * 3.14159 * bandwidth_hz)  # 带宽 -> 滤波时间常数
+    print(f"kp~{kp:.1f}  kd~{kd:.2f}  forcerange=+/-{tau_max:.1f}  "
+          f"filter={tau_filter*1000:.1f}ms")
+    return kp, kd, tau_max
+
+# 示例:A1 级输出端规格（本章为示例连贯统一沿用）
+datasheet_to_cfg(peak_torque=33.5, no_load_speed=21.0, bandwidth_hz=30)
+\end{codebox}
+
+\begin{note}
+本章为示例连贯统一沿用 \textbf{33.5~N$\cdot$m / 21~rad/s}（对应 Unitree A1 级输出端关节规格，已联网核对 Unitree A1 官方电机页：最大输出扭矩 33.5~N$\cdot$m、最大关节转速 21~rad/s）。但严谨建模 Go1 时应改用其实际关节电机 \textbf{GO-M8010-6} 的官方规格——输出端最大约 23.7~N$\cdot$m、最大约 30~rad/s（24~V 供电）、减速比 1:6.33（已联网核对 GO-M8010-6 官方《Motor Data User Manual V1.0》规格表，工作电压 12--30~V、推荐 24~V），力矩常数 0.63895~N$\cdot$m/A（同表给出，未标注电机侧/输出端口径，使用前请结合减速比自行确认换算方向）。请按你的目标机器人手册替换。
+\end{note}
+
+\paragraph{进阶（mjlab）：用反射惯量\emph{物理推导}增益，而非手调。}上面 \Verb[breaklines]|datasheet_to_cfg| 用经验式估 $k_p/k_d$，工程上够快，但 mjlab 1.4.0 在 G1 上给出了更严谨的范式：先算电机经减速器折算到关节侧的\textbf{反射惯量}（reflected inertia），再令 PD 增益由「期望二阶响应」反推。mjlab 的 \Verb[breaklines]|utils/actuator.py| 提供 \Verb[breaklines]|reflected_inertia()| 与 \Verb[breaklines]|reflected_inertia_from_two_stage_planetary()|（两级行星减速）两个工具，把电机转子惯量 $\times$ 减速比$^2$ 折算到关节（注意工具在 \Verb[breaklines]|mjlab.utils.actuator|，actuator \emph{类}才在 \Verb[breaklines]|mjlab.actuator|）。随后按 $\omega_n,\zeta$ 设增益（这正是临界阻尼式 $k_d=2\sqrt{k_p J}$ 的「指定 $\omega_n/\zeta$」版本）：
+
+\begin{codebox}[Python]{mjlab:从两级行星减速反射惯量物理推导 PD 增益（G1 范式）}
+from mjlab.actuator import BuiltinPositionActuatorCfg
+from mjlab.utils.actuator import reflected_inertia_from_two_stage_planetary  # 注意: 在 utils.actuator
+import math
+# 1. 反射惯量: 电机转子惯量经两级行星减速折算到关节侧 (armature, kg*m^2)
+armature = reflected_inertia_from_two_stage_planetary(...)   # 按电机/减速器参数
+# 2. 指定期望二阶响应 (mjlab G1 用 wn=10Hz, zeta=2.0), 反推增益:
+wn = 2 * math.pi * 10.0; zeta = 2.0
+STIFFNESS = armature * wn ** 2                # kp = armature * wn^2
+DAMPING   = 2 * zeta * armature * wn          # kd = 2*zeta*armature*wn
+leg_act = BuiltinPositionActuatorCfg(
+    target_names_expr=[".*_hip_.*", ".*_knee_.*"],   # 实体层按关节名绑定(动作层才用 actuator_names)
+    stiffness=STIFFNESS, damping=DAMPING, armature=armature,
+    effort_limit=...)                          # effort_limit 来自电机规格
+\end{codebox}
+
+\begin{insight}[mjlab 的完整 actuator 模型族：比「一个 PD 类」丰富得多]\label{ins:rlmc-act-mjlab-family}
+mjlab 1.4.0 的 \verb|actuator/| 不止一个 \verb|ActuatorCfg|，而是一族（已读 \Verb[breaklines]|actuator/__init__.py| 导出核对）：基类 \verb|ActuatorCfg|（字段 \Verb[breaklines]|armature/frictionloss/viscous_damping| 与延迟模型 \Verb[breaklines]|delay_min_lag/max_lag/hold_prob|）派生出 \Verb[breaklines]|BuiltinPositionActuatorCfg|、\Verb[breaklines]|BuiltinPdActuatorCfg|（\Verb[breaklines]|stiffness=kp/damping=kd|）、\Verb[breaklines]|BuiltinMotorActuatorCfg|、\Verb[breaklines]|BuiltinVelocityActuatorCfg|、\Verb[breaklines]|BuiltinMuscleActuatorCfg|、\Verb[breaklines]|DcMotorActuatorCfg|（直流电机）、\Verb[breaklines]|IdealPdActuatorCfg|、\Verb[breaklines]|LearnedMlpActuatorCfg|（\textbf{学习型 actuator 网络}，对应本章 Level 2）、\Verb[breaklines]|XmlActuatorCfg|。\textbf{这棵族谱与 Isaac Lab 的继承树（\cref{ins:rlmc-act-tree}）一一呼应，但有两点 mjlab 独有}：(1) 反射惯量工具族（\Verb[breaklines]|reflected_inertia*|），让增益可由电机$+$减速器参数\emph{物理推导}；(2) \Verb[breaklines]|pseudo_inertia| 这类「物理合法的惯量随机化」（见 \cref{sec:rlmc-act-inertia-dr}）。\textbf{第三框架对照}：UniLab 没有这套 actuator 族谱——它只有 \Verb[breaklines]|PdControlConfig|（\cref{ins:rlmc-act-unilab-philosophy}），\Verb[breaklines]|LearnedMlpActuatorCfg| 这类学习型 actuator 在 UniLab 无对应（见 \cref{sec:rlmc-act-net-integrate} 的三框架对照）。
+
+注意 mjlab 的一处命名陷阱：实体层执行器绑定用 \Verb[breaklines]|target_names_expr|（关节名），但动作层 \Verb[breaklines]|JointPositionActionCfg| 用 \Verb[breaklines]|actuator_names|（执行器名），内部经 \Verb[breaklines]|entity.find_joints_by_actuator_names()| 解析——两者别混（Isaac Lab 无此区分，动作直接落到 \verb|joint_names|）。
+\end{insight}
+
+\begin{pitfall}[把数据手册「峰值扭矩」直接当训练 forcerange]
+\textbf{错误描述}：直接把手册峰值扭矩填进 \verb|forcerange|/\allowbreak\verb|effort_limit|。\textbf{现象后果}：训练中关节长期顶在力矩上限，真机持续输出该扭矩会过热降额，仿真却不会，导致真机「跑着跑着没劲」。\textbf{根本原因}：手册峰值是\emph{短时}峰值（常 $<1$~s），\emph{持续可用}扭矩通常只有峰值的 30\%--50\%。\textbf{正确做法}：训练 forcerange 应设为\emph{持续}扭矩而非峰值扭矩；若任务确需短时峰值，配合温度/占空比约束或留出余量。
+\end{pitfall}
+
+\subsection{从 Level 0 到 Level 1 的升级决策}
+\label{sec:rlmc-act-upgrade01}
+
+\begin{codebox}{何时从 Ideal PD 升到 DC Motor}
+策略是否需要极端力矩(跳跃/翻转)?  是 -> 需力矩饱和 -> Level 1
+真机是否高速运动时力矩不足?        是 -> 需力矩-速度约束 -> Level 1 (DC Motor)
+DR 是否已覆盖 actuator 差异?       是 -> 不必升级; 否 -> 考虑 Level 1/2
+\end{codebox}
+
+\paragraph{运行验证。}把 Quick Start 的 mjlab 脚本扩展为对比（务必保持 \verb|target=0.2| 让命令力矩 $k_p\times\text{误差}=20<\verb|forcerange|$，否则饱和遮蔽带宽，见前节 pitfall）：Ideal PD 的力矩几乎\emph{瞬间}冲到约 $20$~N$\cdot$m，带宽限制版则\emph{爬升}着到达同一峰值（上升时间更长）；DC Motor（用 \verb|<dcmotor>| 或显式 clip）在让关节高速运动时还会看到可用力矩随速度下降。\textbf{看什么}：\Verb[breaklines]|d.actuator_force[0]| 的\emph{上升斜率/上升时间}（这才是带宽差异，不是峰值——不饱和时两版峰值接近）；\textbf{预期}：带宽限制上升更缓、超调更小。
+
+\paragraph{从零跑通一次「改了 actuator 增益的训练」并自检（含实测锚点）。}光验证单关节脚本不够——你迟早要把改好的 \verb|kp/kd| 喂进真正的训练，并判断「这次起训正不正常」。下面给一条\textbf{端到端、可复制}的最小命令序列（以本章 autodl 实测为锚点；命令默认 Linux $+$ headless），\textbf{每条都标出预期看到什么}：
+
+\begin{codebox}[bash]{从零:改 actuator 增益 -> 起训 -> 用日志自检（带预期输出）}
+# --- mjlab 侧 (Go1 velocity, 64 env 小冒烟) ---
+# WANDB_MODE=disabled: 不联网不登录; 缺它会卡在 wandb 登录提示 (常见首跑坑)
+WANDB_MODE=disabled uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 64 --agent.max-iterations 2
+# 预期(RTX 4080S 实测锚点): ~1000 steps/s(64env 小并行, 偏低属正常, 见下);
+#   Mean value loss ~1e-2(实测 0.026)、Mean surrogate loss ~ -1e-2(实测 -0.021);
+#   Episode_Reward/* 各项有数、无 NaN; 2 迭代约几秒跑完 = 起训成功.
+# 改 actuator 增益: mjlab 经 tyro 把配置树暴露成 --env.<点路径> flag,
+# 增益/动作缩放等走 --env.scene.*/--env.actions.* 路径覆盖(无需改文件).
+# 具体 flag 名以 `uv run train <TASK> --help | grep -i 'stiffness\|scale'` 查到为准
+# ——这正是"自己查而非背"的工程习惯: 配置树会随版本变, --help 才是当前真值.
+
+# --- UniLab 侧 (go2, 16 env), 增益走 Hydra 点路径覆盖 ---
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=16 algo.max_iterations=1 training.no_play=true \
+    env.control_config.Kp=100 env.control_config.Kd=4      # <-- 本节 kp/kd 在这里落地
+# 预期(实测锚点): ~400 steps/s(16env CPU 物理, 冷启更低);
+#   value loss ~1e-2(实测 0.016); reward/tracking_lin_vel 等有数; 注册名 Go2JoystickFlat.
+\end{codebox}
+
+\begin{insight}[实测锚点：怎么判断「我这台机的 steps/s 算不算正常」]\label{ins:rlmc-act-sps-anchor}
+新手最容易在「跑出来该长什么样」上犯嘀咕。给两条本章在 \textbf{RTX 4080 SUPER} 上的实测锚点：\textbf{mjlab Go1 flat @64~env $\approx$ 1000~steps/s}、\textbf{UniLab go2 @16~env(mujoco 后端，物理在 CPU) $\approx$ 400~steps/s}；两框架的 \Verb[breaklines]|value loss|/\allowbreak\Verb[breaklines]|surrogate loss| 量级都在 $10^{-2}$。\textbf{心法}：稳态 \verb|steps/s| $\approx$ \verb|num_envs| $\times$ 控制频率 $\times$ 并行效率，所以\emph{小并行（几十上百 env）的 steps/s 必然远低于大并行（几千 env）的稳态值，这是良性的}，不是性能 bug；JIT/Warp 首次编译还会让头几次迭代更慢（冷启）。判正常看三点：(1) loss/reward 有数且\emph{无 NaN}；(2) \verb|steps/s| 随 \verb|num_envs| 大致线性增长；(3) 热身后趋稳。只有当大并行也远低于同类机器、或 loss 出 NaN，才该怀疑装错（CPU 核不足、显存不够、传感器/viewer 拖累等）。
+\end{insight}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[计算题]} $k_p=100$, $k_d=4$, $q^*=0.5$, $q=0.3$, $\dot q=2$。Ideal PD 输出力矩多少？若 DC Motor 的 $\tau_{\mathrm{stall}}=33.5$, $\dot q_{\max}=21$，最终施加力矩多少？\emph{验收}：PD $=100\times0.2-4\times2=12$~N$\cdot$m；可用上限 $33.5(1-2/21)\approx30.3$，$12<30.3$ 故施加 $12$~N$\cdot$m。
+  \item \textbf{[编码题]} 用 Quick Start 脚本，改 \verb|dynprm| 从 0.005 到 0.05，记录上升时间随时间常数的变化。\emph{验收}：给出三组 (\verb|dynprm|, 上升时间) 并说明单调关系。
+  \item \textbf{[跨章综合题]} 结合 \cref{ch:rlmc-physics}：若 DC Motor 显示关节高速时力矩不足，除增大 $k_p$ 外还能调哪些 actuator 参数？\emph{验收}：列出 \Verb[breaklines]|velocity_limit|（决定衰减斜率）、\Verb[breaklines]|saturation_effort|、gear ratio 至少两项。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Level 2：Actuator Network}
+\label{sec:rlmc-act-net}
+
+\paragraph{模块功能与在管线中的位置。}当 DC Motor 的线性近似不够（真机力矩响应含复杂非线性）时，用神经网络直接拟合真机的 $(q^*,q,\dot q,\text{历史})\to\tau$ 映射，替换掉解析 PD。本节从数据收集 $\to$ MLP 训练 $\to$ 仿真器集成 $\to$ 精度评估完整走一遍。
+
+\subsection{动机：哪些非线性解析模型抓不住}
+\label{sec:rlmc-act-net-why}
+
+DC Motor 假设力矩-速度线性，但真实电机有：Coulomb（库仑）摩擦（恒定、有方向、与速度无关）；库仑$+$粘性混合（低速以库仑为主、高速以粘性为主）；齿轮间隙（backlash，方向反转有死区）；温度依赖（升温后效率变）；位置依赖摩擦（某些角度齿轮啮合更紧）。这些很难用解析式精确描述——但一个小 MLP 能从数据中学到。
+
+\subsection{Hwangbo 2019 的原始结构}
+\label{sec:rlmc-act-net-hwangbo}
+
+\begin{paper}[Hwangbo et al. 2019：ANYmal 上的 actuator network（原创）]\label{paper:rlmc-act-hwangbo}
+\textbf{问题}：串联弹性 actuator（SEA）的力矩响应高度非线性、含延迟，解析模型难精确刻画，导致 sim-to-real gap。\textbf{核心思想}：用 MLP 从\emph{真机数据}直接学「命令历史 $+$ 状态 $\to$ 实际力矩」的黑箱映射，把这个学到的 actuator 模型嵌进仿真器再训策略。\textbf{关键结果}：ANYmal 四足实现了此前方法达不到的精确速度跟踪、更快奔跑与复杂构型下的摔倒恢复（Science Robotics，arXiv:1901.08652）\cite{hwangbo2019}。\textbf{与本书关系}：actuator network 的开山之作，是本节 Level 2 的方法源头；其「用监督学习拟合物理子系统」的思路也启发了后续 UAN/ASAP。\textbf{局限}：需要力矩传感器（或可靠的电流$\times$力矩常数估计）来提供监督标签；训练数据分布须覆盖部署时的命令分布，否则外推不准。
+\end{paper}
+
+结构要点：输入为过去 $H$ 步的命令历史 $q^*$、过去 $H$ 步的位置历史 $q$、当前速度 $\dot q$；网络为 2 层 MLP $[128,128]$、ELU 激活；输出预测力矩 $\tau$。\textbf{为什么要历史？}因为真实 actuator 有延迟与动态——当前力矩不仅取决于当前命令，还取决于之前的命令与状态（如同有惯性的系统，踩油门后车速逐渐而非瞬间改变）。
+
+\subsection{数据收集与 MLP 训练}
+\label{sec:rlmc-act-net-train}
+
+\begin{codebox}[Python]{真机数据收集协议（单关节随机正弦扫频）}
+import numpy as np
+# 协议:机器人站地不动;对每关节施加随机正弦命令;记录命令角/实际角/
+# 实际角速度/实际力矩;总时长 5-10 min.无力矩传感器时用 电流*力矩常数 近似.
+def collect_single_joint(robot, j, dur=30.0, freq=(0.5, 5.0),
+                         amp=(0.2, 0.8), ctrl_hz=200):
+    n = int(dur * ctrl_hz); dt = 1.0 / ctrl_hz; t = 0.0
+    rec = {k: np.zeros(n) for k in
+           ("cmd", "pos", "vel", "tau")}
+    f = a = 0.0
+    for s in range(n):
+        if s % (ctrl_hz * 3) == 0:          # 每 3 秒换一次 频率/幅度
+            f = np.random.uniform(*freq); a = np.random.uniform(*amp)
+        cmd = a * np.sin(2 * np.pi * f * t)
+        robot.set_joint_position(j, cmd)
+        rec["cmd"][s] = cmd
+        rec["pos"][s] = robot.get_joint_position(j)
+        rec["vel"][s] = robot.get_joint_velocity(j)
+        rec["tau"][s] = robot.get_joint_torque(j)
+        t += dt
+    return rec
+\end{codebox}
+
+\begin{codebox}[Python]{Actuator Network 定义与训练（与 Hwangbo 2019 / UAN 一致）}
+import torch, torch.nn as nn
+
+class ActuatorNet(nn.Module):
+    def __init__(self, H=6):
+        super().__init__()
+        in_dim = H * 2 + 1                  # q* 历史 + q 历史 + 当前 q_dot
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 128), nn.ELU(),
+            nn.Linear(128, 128),   nn.ELU(),
+            nn.Linear(128, 1))             # 输出: 预测力矩
+    def forward(self, x):
+        return self.net(x)
+
+def prepare(rec, H=6):
+    cmd, pos, vel, tau = (rec[k] for k in ("cmd", "pos", "vel", "tau"))
+    N = len(cmd) - H
+    X = np.zeros((N, H * 2 + 1)); Y = np.zeros((N, 1))
+    for i in range(N):
+        k = i + H
+        X[i, :H]     = cmd[k:k - H:-1]      # 命令历史(近->远)
+        X[i, H:2 * H] = pos[k:k - H:-1]     # 位置历史
+        X[i, -1]     = vel[k]               # 当前速度
+        Y[i, 0]      = tau[k]               # 标签: 实际力矩
+    return torch.FloatTensor(X), torch.FloatTensor(Y)
+\end{codebox}
+
+训练时务必做\textbf{输入/输出归一化}（按训练集均值方差），并把 \Verb[breaklines]|X_mean/X_std/Y_mean/Y_std| 一并存进 checkpoint——部署时要用同一组统计量反归一化，否则力矩量纲全错。
+
+\subsection{集成进仿真器：三框架对照}
+\label{sec:rlmc-act-net-integrate}
+
+\begin{codebox}[Python]{Isaac Lab:一行指向 .pt 即用 actuator network}
+from isaaclab.actuators import ActuatorNetMLPCfg
+
+legs_net = ActuatorNetMLPCfg(
+    joint_names_expr=[".*hip.*", ".*thigh.*", ".*calf.*"],
+    network_file="/path/to/actuator_net.pt",  # 训练好的权重
+    saturation_effort=33.5, velocity_limit=21.0,  # 作为兜底物理约束
+    stiffness=None, damping=None,             # 由网络输出力矩，不用解析 PD
+)
+\end{codebox}
+
+\begin{codebox}[Python]{mjlab/MuJoCo:mjcb\_control 回调注入网络力矩}
+import mujoco, torch
+def setup_actuator_net_callback(net_wrapper):
+    def cb(model, data):                       # MuJoCo control callback
+        cmd = torch.from_numpy(data.ctrl.copy()).float()
+        pos = torch.from_numpy(data.qpos[7:].copy()).float()  # 去掉浮动基
+        vel = torch.from_numpy(data.qvel[6:].copy()).float()
+        tau = net_wrapper.compute_torque(
+            cmd[None], pos[None], vel[None]).squeeze(0)
+        data.qfrc_applied[6:] = tau.numpy()    # 直接写入广义力
+    mujoco.set_mjcb_control(cb)
+\end{codebox}
+
+\noindent 上面的 \verb|mjcb_control| 回调在 \textbf{CPU} 执行（牺牲 GPU 并行，见 \cref{ins:rlmc-act-general}）。但 mjlab~1.4.0 其实\textbf{原生提供了一个跑在训练管线里的学习型 actuator} \Verb[breaklines]|LearnedMlpActuatorCfg|（实跑核对其字段，对应本章 Level 2，无需自己写回调）——这正是 mjlab 与 Isaac Lab \Verb[breaklines]|ActuatorNetMLPCfg| 对位的那一档：
+
+\begin{codebox}[Python]{mjlab:原生学习型 actuator LearnedMlpActuatorCfg（GPU 路径，对位 Isaac ActuatorNetMLPCfg）}
+from mjlab.actuator import LearnedMlpActuatorCfg     # actuator 类在 mjlab.actuator
+# 实跑 dataclasses.fields 确认的字段(注意命名与 Isaac 不同):
+leg_net = LearnedMlpActuatorCfg(
+    target_names_expr=[".*_hip_.*", ".*_knee_.*"],   # 实体层按关节名绑定
+    network_file="/path/to/actuator_net.pt",         # 训练好的 MLP 权重
+    history_length=6,        # 命令/状态历史步数 H (对应 Hwangbo 的历史输入)
+    input_order=...,         # 输入特征顺序(须与训练时一致, 否则力矩全错)
+    pos_scale=1.0, vel_scale=1.0, torque_scale=1.0,  # 归一化尺度(= 训练集统计量)
+)
+# 关键: pos_scale/vel_scale/torque_scale 必须与训练网络时用的归一化一致——
+# 这就是上一节"把 X_mean/X_std/Y_mean/Y_std 存进 checkpoint"在 mjlab 侧的落点.
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:actuator network —— 无内置等价物（需自实现）}
+# UniLab 没有 ActuatorNetMLPCfg / LearnedMlpActuatorCfg 这类"学习型 actuator"等价物
+# (已读源码核对: 后端只提供位置执行器 + {kp,kd} PD, 见 §版本信息速查与 §6 欠缺清单).
+# 若确需 actuator network, 两条路:
+#   (a) 自实现: 在 NpEnv 子类的 apply_action 里, 用训练好的 MLP 把
+#       (cmd, dof_pos, dof_vel, 历史) -> 力矩, 经后端"力矩执行器"或 set 广义力写入;
+#       (需后端支持力矩输入, mujoco-uni 经 MJCF <motor> 可行);
+#   (b) 实践更常见: 用 kp/kd 域随机化覆盖 actuator 非线性 (DomainRandConfig.randomize_kp/kd),
+#       即 UniLab 主线——用"宽 DR"代替"精确 actuator 模型"(呼应本章选型决策的 ROI 原则).
+\end{codebox}
+
+\begin{insight}[Isaac Lab 的 actuator 继承树：从简到繁逐级升级]\label{ins:rlmc-act-tree}
+Isaac Lab 把 actuator 组织成一棵继承树（本书已联网核对类名）：抽象基类 \verb|ActuatorBase| 派生出 \Verb[breaklines]|ImplicitActuator|（PhysX 内部 PD）与 \Verb[breaklines]|IdealPDActuator|（Python 显式 PD）；后者再派生 \verb|DCMotor|（$+$力矩-速度饱和），\verb|DCMotor| 又派生 \Verb[breaklines]|ActuatorNetMLP| 与 \Verb[breaklines]|ActuatorNetLSTM|（$+$MLP/LSTM 力矩预测）；\Verb[breaklines]|IdealPDActuator| 还派生 \Verb[breaklines]|DelayedPDActuator|（$+$通信延迟）与 \Verb[breaklines]|RemotizedPDActuator|（$+$遥控杆非线性）。\textbf{这棵树让你能从 Implicit 起步训练、确认 baseline 后再切到 DCMotor 或 ActuatorNet 做最后微调}——逐级升级、可归因。对应的 \verb|*Cfg| 数据类一一对应（\Verb[breaklines]|ImplicitActuatorCfg|/\allowbreak\verb|DCMotorCfg|/\allowbreak\Verb[breaklines]|ActuatorNetMLPCfg|…）。
+\end{insight}
+
+\subsection{力矩预测精度评估}
+\label{sec:rlmc-act-net-eval}
+
+训练完必须在留出测试集上评估，关键指标：RMSE（N$\cdot$m）、相对误差（\%）、最大误差、$R^2$ 决定系数。经验阈值：RMSE $<0.5$ 且 $R^2>0.95$ 为优秀（可用于训练）；RMSE $<1.0$ 且 $R^2>0.85$ 为一般（建议加数据或调架构）；更差则需检查数据质量。
+
+\subsection{UAN：无监督 actuator network（2025 前沿）}
+\label{sec:rlmc-act-net-uan}
+
+\begin{paper}[Fey et al. 2025：UAN，无力矩传感器的 actuator network]\label{paper:rlmc-act-uan}
+\textbf{问题}：消费级机器人（如 Go1）常\emph{没有}关节力矩传感器，无法为 actuator network 提供力矩标签。\textbf{核心思想}：不直接监督力矩，而是监督\emph{状态转移}——让仿真器在 actuator network 修正后的力矩下产生的下一状态，接近真机观测的下一状态；用预训练$+$微调、以参考轨迹引导探索，缓解 reward hacking。\textbf{关键结果}：仅 5~分钟真机 rollout 即可拟合 actuator，捕捉到 actuator 滞后与谐波减速器非线性，使机器人能高保真地 lift/throw/drag（arXiv:2502.10894，MIT Improbable AI，项目页 uan.csail.mit.edu）\cite{fey2025uan}。\textbf{与本书关系}：把 Level 2 从「需力矩传感器」放宽到「只需状态轨迹」，与 \cref{sec:rlmc-act-delta} 的 ASAP 同属「无力矩标签」路线。\textbf{局限}：监督信号经过仿真器一步，需要可微或可反传的仿真步；状态转移的拟合质量受状态估计噪声影响。
+\end{paper}
+
+\textbf{UAN 与 ASAP delta 的关系}：两者都只需 $(s,a,s'_{\text{real}})$、不需力矩传感器；区别是 UAN 修正的是\emph{力矩}（actuator 层面），ASAP 修正的是\emph{动作}（策略层面）。这也预告了下一节。
+
+\begin{pitfall}[训练数据与部署数据的频率分布不匹配]
+\textbf{错误描述}：在低频正弦（0.5--5~Hz）上收集数据，却部署在产生高频命令（$>10$~Hz）的策略上。\textbf{现象后果}：网络在高频命令上外推，预测力矩失准，仿真行为与真机背离。\textbf{根本原因}：MLP 对训练分布外的输入没有保证。\textbf{正确做法}：数据收集的频率范围应覆盖 RL 策略实际产生的命令频率；另外历史长度 $H$ 取 4--8（200~Hz 下对应 20--40~ms），太小抓不住延迟、太大徒增维度且收益递减。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[编码题]} 用 MuJoCo 的 Ideal PD 当「真机」：收集数据训练上面的 \verb|ActuatorNet|，再把 MLP 输出力矩与 Ideal PD 力矩对比。\emph{验收}：给出 RMSE 与 $R^2$，并解释为何应当非常接近（因为「真机」本身就是确定性 PD）。
+  \item \textbf{[设计题]} 机器人无力矩传感器时如何间接获取 actuator 数据？\emph{验收}：答「电机电流 $\times$ 力矩常数 $\approx$ 力矩」，或改走 UAN/ASAP 这类只需状态轨迹的无标签路线。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Level 3：ASAP Delta Action Model}
+\label{sec:rlmc-act-delta}
+
+\paragraph{模块功能与在管线中的位置。}当 actuator network 仍不够精确（或力矩数据难取）时，ASAP 换一个思路：\textbf{不建模 actuator 物理，直接在动作空间学一个残差修正}。它处在「策略输出动作」与「动作送入仿真器」之间，把仿真器「掰」向现实。
+
+\subsection{动机与核心思路}
+\label{sec:rlmc-act-delta-motivation}
+
+actuator network 建的是 $(q^*,q,\dot q)\to\tau$，但 sim-to-real gap 不止来自 actuator——还含通信延迟、控制器内部非线性、离散化、甚至积分误差，这些「非 actuator」因素 actuator network 抓不到。ASAP 的关键洞察：\textbf{与其建模 gap 的物理原因，不如直接在动作空间修正 gap 的效果}。
+
+\begin{codebox}{ASAP 管线 vs 标准管线}
+标准:  policy(s) -> a -> simulator -> s'_sim   (!=  s'_real)
+ASAP:  policy(s) -> a -> a + da -> simulator -> s'_sim  (~= s'_real)
+                          ^  da = MLP_delta(s, a)  <- 从真机数据学
+\end{codebox}
+
+\begin{paper}[He et al. 2025：ASAP，对齐仿真与现实物理]\label{paper:rlmc-act-asap}
+\textbf{问题}：agile 全身动作（跳、转、翻）对 sim-to-real 的动力学失配极其敏感，而 SysID 与 DR 都依赖费力的手动调参且有上限。\textbf{核心思想}：两阶段——先在仿真中用重定向人类动作预训练 motion-tracking 策略，再在真机部署、用真机数据训一个 delta（残差）动作模型补偿动力学失配，最后在「修正后的仿真器」里微调策略。\textbf{关键结果}：在 IsaacGym$\to$IsaacSim、IsaacGym$\to$Genesis、IsaacGym$\to$真机 Unitree G1 三种迁移上，跟踪误差均显著低于 SysID/DR/delta-dynamics 基线（RSS 2025，arXiv:2502.01143，LeCAR-Lab）\cite{he2025asap}。\textbf{与本书关系}：本节 Level 3 的方法源头，也是 \cref{ch:rlmc-dr}「超越 DR」的另一条腿——\cref{sec:rlmc-dr-beyond} 已埋伏笔，本节补齐其在 actuator/动作层面的定位。\textbf{局限}：需真机 rollout 数据（含状态轨迹）；delta 训练是 open-loop RL 而非监督回归（见下方勘误）；阶段较多、工程链路长。
+\end{paper}
+
+\subsection{与 Actuator Network 的本质区别}
+\label{sec:rlmc-act-delta-vs-net}
+
+\begin{insight}[两个视角看清 delta model 与 actuator network]\label{ins:rlmc-act-delta-dual}
+\textbf{视角 A（建模目标）}：actuator network 是\emph{前向模型}——告诉仿真器「真电机收到命令会施加什么力矩」；delta action model 是\emph{残差模型}——不关心差异的物理原因，只补偿差异的\emph{效果}。\textbf{视角 B（数据需求）}：actuator network 需 $(q^*,q,\dot q,\tau)$——要力矩传感器或电流测量；delta action model 需 $(s,a,s'_{\text{real}})$——只需状态观测（IMU $+$ 关节编码器）。\textbf{后者意味着 delta action model 可用在没有力矩传感器的消费级机器人上}——这正是 G1 跳旋选 ASAP 而非 actuator net 的关键工程理由。
+\end{insight}
+
+\subsection{简化版 delta action model 与集成}
+\label{sec:rlmc-act-delta-impl}
+
+\begin{codebox}[Python]{ASAP 风格 delta action model（简化版）}
+import torch, torch.nn as nn
+
+class DeltaActionModel(nn.Module):
+    def __init__(self, state_dim, action_dim, max_delta=0.1):
+        super().__init__()
+        self.max_delta = max_delta
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + action_dim, 256), nn.ELU(),
+            nn.Linear(256, 128), nn.ELU(),
+            nn.Linear(128, action_dim), nn.Tanh())   # 输出 in [-1, 1]
+    def forward(self, state, action):
+        x = torch.cat([state, action], dim=-1)
+        return self.net(x) * self.max_delta          # 缩放到 +/- max_delta
+\end{codebox}
+
+集成比 actuator network 更简单——只改策略输出的动作，不替换仿真器力矩计算：
+
+\begin{codebox}[Python]{mjlab/Isaac Lab 通用:包一层 env 自动加 delta（冻结 delta）}
+class EnvWithDeltaAction:
+    def __init__(self, base_env, delta_model):
+        self.env = base_env
+        self.delta_model = delta_model
+        self.delta_model.eval()                       # 冻结! 不参与策略微调
+    def step(self, action):
+        state = self.env.get_observations()["policy"]
+        with torch.no_grad():
+            da = self.delta_model(state, action)
+        return self.env.step(action + da)
+    def reset(self):
+        return self.env.reset()
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:delta action 包装（NpEnv，注意 NumPy I/O）}
+import numpy as np, torch
+# delta action 修正在"动作空间", 与后端无关——上面的通用包装思路可移植到 UniLab,
+# 但 UniLab 的 NpEnv.step 收/发 NumPy (CPU), 需在边界做 torch<->numpy 转换:
+class NpEnvWithDeltaAction:
+    def __init__(self, np_env, delta_model):
+        self.env = np_env
+        self.delta_model = delta_model.eval()      # 冻结! 不参与策略微调
+    def step(self, action_np):                     # action_np: (num_envs, act_dim) ndarray
+        obs = self.env.state.obs["obs"]            # NpEnvState 的 actor 观测
+        with torch.no_grad():
+            s = torch.from_numpy(obs).float(); a = torch.from_numpy(action_np).float()
+            da = self.delta_model(s, a).cpu().numpy()
+        return self.env.step(action_np + da)       # NpEnv.step 收 NumPy
+    def reset(self): return self.env.reset()
+# 重要说明: ASAP 官方"管线"不在 UniLab 上跑 (支持 IsaacGym/IsaacSim/Genesis,
+# 见下方 ASAP 勘误); 这里只是把"动作空间残差"这一通用思想适配到 UniLab 的 CPU env.
+# UniLab 内置的"sim2real 主力"仍是 kp/kd 域随机化, 而非 delta action model.
+\end{codebox}
+
+\subsection{为什么部署时不需要 delta model}
+\label{sec:rlmc-act-delta-deploy}
+
+ASAP 完整管线分五步：(1) 仿真中预训练多个 motion-tracking 策略；(2) 真机 rollout 收集 $(s,a,s'_{\text{real}})$；(3) 训 delta action model（最小化 $\|\text{step}(s,a+\Delta a)-s'_{\text{real}}\|$）；(4) \textbf{冻结} delta，在修正后的仿真器里微调策略；(5) 部署——\emph{不带} delta。\textbf{为什么部署不带 delta？}因为第 4 步策略已在「修正后的仿真器」里微调、把修正内化进了自身；部署时直接输出动作给真机即可，零额外计算开销。这是 delta action model 相对 actuator network 的一个工程优势。
+
+\begin{pitfall}[把 ASAP 的 delta 当成「对仿真 step 反传的监督 MSE」]
+\textbf{错误描述}：望文生义，以为 delta 是用 \Verb[breaklines]|mse_loss(sim_step(s, a+delta), s_real)| 直接对仿真 step 反向传播训练的监督回归。\textbf{现象后果}：照此实现既要求仿真器可微，又对不上官方代码，复现失败。\textbf{根本原因}：ASAP 官方 delta 是 \textbf{open-loop RL（PPO）} 训练——reward 最小化 sim/real 状态误差并带 action-norm 惩罚，随后再微调 policy；统一入口靠配置切换，\textbf{没有}独立的 \Verb[breaklines]|train_delta.py|，也\textbf{不用} mjlab（支持 IsaacGym/IsaacSim/Genesis）。\textbf{正确做法}：把 delta 训练理解为 RL 而非监督回归（本书已联网核对官方仓库 LeCAR-Lab/ASAP；与 \cref{paper:rlmc-dr-asap} 的勘误一致）。
+\end{pitfall}
+
+\begin{pitfall}[\texttt{max\_delta} 设太大导致微调不稳定]
+\textbf{错误描述}：为追求修正幅度把 \verb|max_delta| 设得很大。\textbf{现象后果}：修正后动作超出策略训练时见过的动作范围，策略在「陌生」动作下行为不可预测，微调发散。\textbf{根本原因}：delta 把动作推出了策略的有效域；另外若 delta 与策略\emph{同时}训练，两网络互相「追逐」也会不稳。\textbf{正确做法}：从 \Verb[breaklines]|max_delta=0.05| 起步，逐步增大到不超过 0.2；且严格按 ASAP 第 4 步\emph{冻结} delta 再微调策略。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[设计题]} 只有 5~分钟真机时间，如何设计 rollout 以最大化数据信息量？\emph{验收}：在「多样性（不同速度/转向/步态命令）」与「覆盖度（足够长的连续轨迹含完整步态周期）」间给出权衡方案。
+  \item \textbf{[分析题]} \verb|max_delta=0.1| 表示动作最大修正 0.1~rad。若真实 gap 需 0.3~rad 修正，这模型能工作吗？如何\emph{诊断}「\verb|max_delta| 不够大」？\emph{验收}：答「不能（修正被夹住）」；诊断法——观察 $\Delta a$ 是否常顶在 $\pm$\verb|max_delta| 边界，或验证集 state 误差改善停滞。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{系统辨识方法}
+\label{sec:rlmc-act-sysid}
+
+\paragraph{模块功能与在管线中的位置。}无论选哪个层级，都需要真机实验数据来确定参数或训练网络。本节给出三种基本辨识实验——扫频、阶跃响应、摩擦测量——它们是所有 actuator 建模的「数据基础」，也是 \cref{ch:rlmc-dr} 里「DR 范围该多宽」的物理依据来源。
+
+\subsection{三种基本实验}
+\label{sec:rlmc-act-sysid-three}
+
+\textbf{实验 1：扫频（chirp）}——对关节施加频率线性增长的正弦，从 $q$ 对 $q^*$ 的频率响应读出带宽（$-3$~dB 频率）、相位裕量、谐振频率与阻尼比。
+
+\textbf{实验 2：阶跃响应}——施加阶跃命令，从响应读出上升时间（10\%$\to$90\%）、超调量、稳态误差、安定时间（进入 $\pm2\%$ 带）。
+
+\textbf{实验 3：摩擦测量}——在不同恒定速度下测稳态力矩，拟合 $\tau_{\text{fric}}=\tau_c\,\mathrm{sign}(\dot q)+b\,\dot q$，得库仑摩擦 $\tau_c$ 与粘性系数 $b$。
+
+\begin{codebox}[Python]{从阶跃响应反求 omega\_n / zeta / kp / kd}
+import numpy as np
+def fit_step(t, actual, target, step_time, J=0.01):
+    t = np.asarray(t); actual = np.asarray(actual)
+    after = actual[np.argmax(t > step_time):]
+    i10 = np.argmax(after > 0.1 * target)
+    i90 = np.argmax(after > 0.9 * target)
+    dt = t[1] - t[0]
+    rise = (i90 - i10) * dt
+    overshoot = (after.max() - target) / target * 100
+    omega_n = 1.8 / rise if rise > 0 else 0.0          # 二阶系统经验式
+    if overshoot > 0:                                   # 由超调反求 zeta
+        lo = np.log(overshoot / 100)
+        zeta = -lo / np.sqrt(np.pi ** 2 + lo ** 2)
+    else:
+        zeta = 1.0
+    kp = omega_n ** 2 * J                               # kp = wn^2 * J
+    kd = 2 * zeta * omega_n * J                         # kd = 2*zeta*wn * J
+    print(f"rise={rise*1e3:.1f}ms over={overshoot:.1f}% "
+          f"wn={omega_n:.1f} zeta={zeta:.2f} kp={kp:.1f} kd={kd:.3f}")
+    return omega_n, zeta, kp, kd
+\end{codebox}
+
+\begin{codebox}[Python]{摩擦:恒速扫描 + 最小二乘拟合库仑/粘性}
+import numpy as np
+def fit_friction(velocity, torque):
+    v = np.asarray(velocity); tau = np.asarray(torque)
+    A = np.column_stack([np.sign(v), v])               # [sign(q_dot), q_dot]
+    (tau_c, b), *_ = np.linalg.lstsq(A, tau, rcond=None)
+    print(f"Coulomb tau_c={abs(tau_c):.3f} N*m  viscous b={abs(b):.4f}")
+    return abs(tau_c), abs(b)
+\end{codebox}
+
+\subsection{把辨识结果写回仿真器}
+\label{sec:rlmc-act-sysid-apply}
+
+\begin{codebox}[Python]{mjlab/MuJoCo:用 MjSpec 把辨识参数原地写回 actuator}
+import mujoco
+def apply_sysid_mjspec(mjcf_path, sysid, out_path):
+    spec = mujoco.MjSpec.from_file(mjcf_path)
+    bw = sysid["bandwidth_hz"]; tau_f = 1.0 / (2 * 3.14159 * bw)
+    for act in spec.actuators:
+        act.gainprm[0] = sysid["kp"]
+        act.biasprm[1] = -sysid["kp"]; act.biasprm[2] = -sysid["kd"]
+        act.dyntype = mujoco.mjtDyn.mjDYN_FILTER
+        act.dynprm[0] = tau_f
+    for jnt in spec.joints:
+        if jnt.type == mujoco.mjtJoint.mjJNT_HINGE:
+            jnt.frictionloss = sysid["coulomb_friction"]   # frictionloss 是标量, 直接赋
+            jnt.damping[0]   = sysid["viscous_friction"]   # damping 是 [3,1] 数组! 须 [0]= 索引赋值
+    model = spec.compile()
+    mujoco.mj_saveLastXML(out_path, model)
+\end{codebox}
+
+\begin{pitfall}[MjSpec 改参：数组字段直接标量赋值会抛 \texttt{TypeError}]
+\textbf{错误描述}：照「属性=值」直觉写 \Verb[breaklines]|jnt.damping = 0.05|（在 MuJoCo~3.8.x 实测会抛 \verb|TypeError|）。\textbf{现象后果}：脚本在写回这一步就崩，前面辨识白做。\textbf{根本原因}：\verb|MjsJoint| 的某些字段是\emph{定长数组}而非标量——\verb|damping| 是 \verb|[3,1]| 数组（为兼容多自由度关节），\Verb[breaklines]|gainprm/biasprm/dynprm| 也都是数组；只有 \verb|frictionloss| 这类才是标量。直接整体赋一个 Python float，类型对不上。\textbf{正确做法}：\textbf{数组字段用索引赋值}（\Verb[breaklines]|jnt.damping[0]=...|、\Verb[breaklines]|act.gainprm[0]=...|、\Verb[breaklines]|act.biasprm[1]=...|），\textbf{标量字段直接赋}（\Verb[breaklines]|jnt.frictionloss=...|、\Verb[breaklines]|act.dyntype=...|）。怎么自己查某字段是标量还是数组？跑一行 \Verb[breaklines]|print(type(jnt.damping), getattr(jnt.damping,"shape",None))|——返回 \Verb[breaklines]|ndarray (3,1)| 就是数组、得用 \verb|[i]=|；这就是排这类 \verb|TypeError| 的通用手段（先 \Verb[breaklines]|print(type(...))| 再决定赋值方式），而非死记哪个字段是数组。
+\end{pitfall}
+
+\begin{codebox}[Python]{Isaac Lab:把辨识结果填进 DCMotorCfg / DelayedPDActuatorCfg}
+from isaaclab.actuators import DCMotorCfg, DelayedPDActuatorCfg
+# 注意: Isaac Lab/PhysX 的 friction 是无量纲 joint friction coefficient,
+# 不能直接等于辨识得到的 N*m 库仑摩擦; 下面 friction=... 仅占位, 需单独标定.
+dc = DCMotorCfg(joint_names_expr=[".*"], stiffness=120.0, damping=3.5,
+                saturation_effort=23.7, velocity_limit=30.0,
+                friction=0.30)                          # 占位, 见上注释
+# 带宽 -> 离散延迟步数 (近似), 用 DelayedPD 模拟通信延迟
+delayed = DelayedPDActuatorCfg(joint_names_expr=[".*"],
+                stiffness=120.0, damping=3.5, effort_limit=23.7,
+                min_delay=1, max_delay=2)
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:辨识结果分两处写回（增益走 Hydra，摩擦/力矩限走模型）}
+# UniLab 没有"actuator 配置类"可整体写回, 辨识结果按归属分两路:
+# (1) PD 增益 kp/kd -> Hydra 覆盖 (改 PdControlConfig):
+#   train --algo ppo --task go2_joystick_flat --sim mujoco \
+#       env.control_config.Kp=120 env.control_config.Kd=3.5
+# (2) 库仑/粘性摩擦、forcerange、力矩-速度饱和 -> 写进 MJCF/Motrix 模型文件:
+#   <joint frictionloss="0.30" damping="0.05"/>      # frictionloss = 辨识 tau_c (N*m)
+#   <general ... forcerange="-23.7 23.7"/>           # 力矩硬限
+#   (mujoco-uni 后端可直接用与上面 mjlab MjSpec 列同一份 MJCF)
+# (3) 带宽/延迟 -> 用 PdControlConfig.simulate_action_latency=True 模拟一帧控制延迟,
+#     更精细的力矩低通需在 MJCF 用 <general dyntype="filter">.
+# (4) 辨识不确定度 -> kp/kd 域随机化 (DomainRandConfig.randomize_kp/kd +
+#     kp_multiplier_range), 让 DR 覆盖辨识残差——这是 UniLab 的主力 sim2real 手段.
+\end{codebox}
+
+\begin{pitfall}[把 N$\cdot$m 库仑摩擦直接填进 Isaac Lab 的 \texttt{friction}]
+\textbf{错误描述}：把扫频/摩擦实验得到的 $\tau_c$（单位 N$\cdot$m）直接填进 Isaac Lab/PhysX 的 \verb|friction| 字段。\textbf{现象后果}：摩擦量级与语义全错，关节阻力与真机对不上。\textbf{根本原因}：MuJoCo \Verb[breaklines]|<joint frictionloss>| 是\emph{N$\cdot$m 干摩擦}，而 Isaac Lab/PhysX 的 \verb|friction| 是\emph{无量纲关节摩擦系数}——单位与语义都不同。\textbf{正确做法}：MuJoCo 一侧可直接填 \Verb[breaklines]|frictionloss=tau_c|；Isaac Lab 一侧需单独标定 PhysX 摩擦，或把它当作待校准参数，切勿把 N$\cdot$m 数值直接搬过去。
+\end{pitfall}
+
+\begin{pitfall}[冷机辨识、热机部署]
+\textbf{错误描述}：在电机冷机状态下做辨识，却在热机（连续运行后）状态下部署。\textbf{现象后果}：热机后摩擦降低、效率变化，辨识参数偏离实际，sim2real 重新出现 gap。\textbf{根本原因}：电机特性随温度漂移（这也正是 \cref{ins:rlmc-act-glasses} 里「DR 仍需保留」的原因）。\textbf{正确做法}：在「热机稳态」下辨识（先运行 5--10~min 暖机），且扫频幅度 $<30\%$ 关节范围以免撞限位/饱和引入非线性。
+\end{pitfall}
+
+\subsection{进阶：惯量的「物理合法」随机化（pseudo\_inertia）}
+\label{sec:rlmc-act-inertia-dr}
+
+actuator 增益辨识之外，连杆\emph{惯量}也是 sim-to-real 的一项（尤其前述反射惯量 \verb|armature| 直接进关节空间惯量、影响二阶响应）。\cref{ch:rlmc-dr} 教了随机化质量与质心，但惯量张量有一个隐藏约束：\textbf{它必须正定且满足三角不等式才物理可实现}。「直接给惯量分量乘个随机数」可能生成一个\emph{不存在的刚体}（违反三角不等式的惯量），让接触求解出怪异行为。\cref{ch:rlmc-dr} 已就此立了完整的三框架对照（见其惯量 DR 一节），这里只点出与 actuator 建模直接相关的结论。
+
+\begin{insight}[惯量 DR 的三框架能力差：mjlab 独有物理合法保证]\label{ins:rlmc-act-pseudo-inertia}
+\textbf{mjlab} 1.4.0 把 pseudo-inertia 做成一等公民——\Verb[breaklines]|envs/mdp/dr/body.py| 的 \Verb[breaklines]|pseudo_inertia| 不直接扰动 $3\times3$ 惯量分量，而是在 $4\times4$ 伪惯量矩阵上扰动、再经 Cholesky 分解/重构（含平行轴定理把 COM 惯量搬回 body 原点）保证扰动后惯量\emph{仍正定、物理可实现}。\textbf{Isaac Lab} 无现成函数，需在质量随机化的 \Verb[breaklines]|recompute_inertia| 基础上手动加 Cholesky 重构。\textbf{UniLab 无对应}：其 reset 期 DR 只到 \Verb[breaklines]|body_inertia/body_ipos/body_iquat| 级（已读 \verb|dr/types.py| 与两后端 \Verb[breaklines]|get_dr_capabilities()| 核对），\emph{不保证}扰动后惯量正定，无 Cholesky 重构这一步——在 UniLab 上做惯量 DR 须自行约束幅度或退而只随机化质量。\textbf{这与本章主线呼应：actuator 物理保真度（增益$+$反射惯量$+$惯量 DR）的「物理合法性」也分框架——mjlab 在这一项上最完备}。
+\end{insight}
+
+\begin{codebox}[Python]{mjlab:pseudo\_inertia 随机化（与本书 DR 章同款，保证正定）}
+from mjlab.managers import EventTermCfg, SceneEntityCfg
+import mjlab.envs.mdp as mdp        # DR 函数在 mdp.dr 子包 (mjlab/envs/mdp/dr/body.py)
+# 加进 task cfg 的 events 字典 (与 friction DR 同范式):
+events = {
+    "link_inertia": EventTermCfg(
+        func=mdp.dr.pseudo_inertia,            # 4x4 伪惯量扰动 + Cholesky 重构
+        mode="startup",                        # 出厂个体差异: 每 env 一组、episode 内不变
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+                # 注意: pseudo_inertia 不收 operation/ranges, 而用 10 个具名 *_range:
+                "alpha_range": (-0.05, 0.05),  # 全局质量-密度对数尺度 (质量+惯量 ~ e^{2a})
+                "d_range": (-0.02, 0.02),      # 三轴拉伸/压缩 (d1=d2=d3 的便捷写法)
+                "t_range": (-0.01, 0.01)}),    # 质心平移 (t1=t2=t3 的便捷写法)
+}
+# 对比"直接乘惯量分量": 后者可能生成违反三角不等式的非物理刚体;
+# pseudo_inertia 经 Cholesky 重构(Rucker & Wensing 2022 参数化), 扰动后仍是合法惯量张量.
+\end{codebox}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[动手题]} 有真机就对一个关节做阶跃响应；没有就用 MuJoCo \Verb[breaklines]|<general>+dyntype="filter"| 当「真机」，跑阶跃并用 \verb|fit_step| 拟合。\emph{验收}：给出 $\omega_n,\zeta,k_p,k_d$，并与你设的 \verb|biasprm|/\allowbreak\verb|dynprm| 对照是否自洽。
+  \item \textbf{[计算题]} 阶跃响应：上升时间 50~ms、超调 15\%、稳态误差 0.02~rad。估等效 $k_p$、$k_d$、带宽（取 $J=0.01$）。\emph{验收}：$\omega_n\approx1.8/0.05=36$~rad/s；由超调 $0.15$ 得 $\zeta\approx0.52$；$k_p\approx36^2\times0.01\approx13$，$k_d\approx2\times0.52\times36\times0.01\approx0.37$；带宽 $\approx36/2\pi\approx5.7$~Hz。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{选型决策：actuator 建模与 sim-to-real gap}
+\label{sec:rlmc-act-decision}
+
+\paragraph{模块功能与在管线中的位置。}面对具体项目，到底选哪一级、投入值不值得？本节用「误差累积」的定量直觉 $+$ 三个真实场景 $+$ 一张决策流程图，把前面五节收束成可操作的选型方法论。\textbf{贯穿全节的一条原则：先问「DR 够不够」，不够才升级}。
+
+\subsection{为什么小的力矩误差会被放大}
+\label{sec:rlmc-act-decision-accum}
+
+单步力矩误差看似不大，但在 rollout 中会\emph{累积}：每步力矩误差$\to$角加速度误差$\to$角速度误差$\to$角度误差，下一步状态偏了，策略据此选了不同动作，整条轨迹越漂越远。粗略估算（$J=0.01$, $\mathrm{d}t=5$~ms，Ideal PD 单步力矩误差 $\varepsilon_\tau\approx4.8$~N$\cdot$m）：单步角度误差 $\varepsilon_q=\varepsilon_\tau/J\cdot\mathrm{d}t^2\approx0.012$~rad；约 10 步累积 $\approx0.12$~rad $\approx7^\circ$，已是四足膝关节角度变化的 10\%--20\%；上百步后策略进入训练时从未见过的状态空间，行为退化、episode 提前终止。\textbf{这解释了为什么「看起来很小」的 actuator 误差，在闭环里会成为 sim-to-real 失败的主因}。
+
+\subsection{三个真实场景的选型}
+\label{sec:rlmc-act-decision-scenarios}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.5cm}p{2.4cm}p{3.0cm}p{4.0cm}@{}}
+\toprule
+场景 & 硬件 & 推荐层级 & 关键理由 \\
+\midrule
+A. 博一学 locomotion & 无真机、纯仿真 & Ideal PD $+$ 标准 DR & 关注算法、吞吐最高；先收敛再谈保真 \\
+B. ICRA demo：G1 跳旋 & 有 G1、\emph{无}力矩传感器 & ASAP delta action & 跳旋需力矩极限附近精确控制（Ideal PD 不够）；无力矩传感器（actuator net 难取数）；delta 只需 $(s,a,s')$ \\
+C. ANYmal 工厂巡检 & 有 ANYmal $+$ 力矩传感器 & Actuator Network & 有力矩传感器（可取高质量数据）；需高可靠而非极限动作；可定期重采数据应对磨损 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[ROI 与任务难度正相关：先问「DR 够不够」]\label{ins:rlmc-act-roi}
+actuator 建模的投资回报率与任务难度强正相关。\textbf{走路}（$v<1$~m/s）几乎不需要精确 actuator——步态周期中的力矩变化远大于模型误差，且 DR 的 $k_p$ 随机化（如 $0.75$--$1.5$ 倍）已覆盖 Ideal PD 与真机之差；\textbf{快跑/转向}（1--3~m/s）反电动势开始显著，DC Motor $+$ DR 更稳；\textbf{跳跃/翻转/旋转}必须在力矩极限附近精确控制，DR 的范围覆盖不了非线性效应，才轮到 Actuator Network / Delta Action。\textbf{选层级时第一个问题永远是「DR 够不够」——够，就把省下的工程时间投到 reward 设计（\cref{ch:rlmc-reward}）和 DR 调优（\cref{ch:rlmc-dr}）}。
+\end{insight}
+
+下面这段「快速诊断」脚本能帮你判断 Ideal PD $+$ DR 是否已够：
+
+\begin{codebox}[Python]{快速诊断:看力矩是否常饱和 / 是否高频抖动}
+import torch
+def quick_diagnosis(env, policy, steps=1000):
+    log = []
+    for _ in range(steps):
+        a = policy(env.get_observations()); env.step(a)
+        log.append(env.robot.actuator_forces.clone())
+    tau = torch.stack(log)
+    sat = (tau.abs() > 0.9 * env.robot.effort_limit).float().mean()
+    hf  = (torch.diff(tau, dim=0).abs() > 5.0).float().mean()
+    print(f"力矩饱和比例={sat*100:.1f}%  高频变化比例={hf*100:.1f}%")
+    if sat > 0.1: print("  -> 常饱和: 考虑 DC Motor 模型")
+    if hf  > 0.2: print("  -> 高频抖动: 考虑带宽限制(dyntype=filter)")
+    if sat < 0.05 and hf < 0.1: print("  -> Ideal PD + DR 可能已足够")
+\end{codebox}
+
+\subsection{选型决策流程图}
+\label{sec:rlmc-act-decision-flow}
+
+\begin{center}
+\small\textbf{actuator 建模层级选型}\\[3pt]
+\begin{forest} dtree
+[有真机吗？
+  [{否 → Ideal PD $+$ DR\\（纯仿真研究）}]
+  [{是 → 有力矩传感器/电流测量吗？}
+    [{是 → 任务需极限力矩？}
+      [{是 → Actuator Network}]
+      [{否 → DC Motor $+$ DR}]
+    ]
+    [{否 → 任务需极限力矩？}
+      [{是 → ASAP Delta\\（免力矩传感器）}]
+      [{否 → Ideal PD $+$ DR}]
+    ]
+  ]
+  [{最后：DR 在真机上够不够？\\（真机性能 $\geq$ 80\% 仿真）}
+    [{够 → 当前层级足够}]
+    [{不够 → 升一级}]
+  ]
+]
+\end{forest}
+\end{center}
+
+\subsection{经验法则表}
+\label{sec:rlmc-act-decision-rules}
+
+下表汇总 2024--2025 文献的经验共识（\rebuilt{经核查，各论文多以\emph{动作跟踪误差}下降而非「相对 Ideal PD baseline 的 reward 下降百分比」报告，故下列数字为作者综合多源后的量级估计，随任务/机器人/DR 配置变化，仅作选型参考、不作定量承诺}）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+任务难度 & 推荐层级 & 预估 sim-to-real gap \\
+\midrule
+平地行走（$v<1$~m/s） & Ideal PD $+$ DR & 10\%--20\% reward 下降 \\
+快跑/转向（$v$ 1--3~m/s） & DC Motor $+$ DR & 15\%--25\% reward 下降 \\
+跳跃/翻转 & Actuator Net 或 Delta Action & 5\%--15\% reward 下降 \\
+极限动作（旋转跳、空翻） & ASAP Delta Action & $<10\%$ reward 下降 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[做了 actuator 建模就不再需要 DR]
+\textbf{错误描述}：上了最精确的 actuator network 后，把 DR 全关掉。\textbf{现象后果}：真机温度/磨损/电量一变，名义模型再准也覆盖不了，策略变脆。\textbf{根本原因}：actuator 建模提高的是\emph{名义}精度（某一时刻的电机），DR 覆盖的是\emph{时变}不确定性——二者正交（\cref{ins:rlmc-act-glasses}）。\textbf{正确做法}：保留 DR，但范围可收窄（如从 $U(0.5,2.0)$ 缩到 $U(0.85,1.15)$）。另：训练时启用 actuator network 会降吞吐（前向计算在 Python/GPU kernel，比 C++ 内核 PD 慢 2--3$\times$）——推荐先用 Ideal PD 训到 80\% 性能，再切 actuator network 做最后微调。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[决策题]} 你的四足在仿真里能 2~m/s 快跑，真机只能 1.2~m/s 且高速时「腿软」。按决策流程图，下一步该做什么？\emph{验收}：先用 \Verb[breaklines]|quick_diagnosis| 看是否常饱和；若是，升 DC Motor 并检查 \Verb[breaklines]|velocity_limit| 是否过小。
+  \item \textbf{[综合题]} 给场景 B（G1 跳旋）排一条 3--6 个月的工程时间线。\emph{验收}：含「DC Motor$+$DR 预训练 $\to$ 真机 5--10~min 采集 $\to$ 训 delta $\to$ 修正仿真器微调 $\to$ 真机部署调试」五阶段及大致工期。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总表}
+\addcontentsline{toc}{section}{常见误解汇总表}
+\label{sec:rlmc-act-misconceptions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.0cm}p{8.2cm}@{}}
+\toprule
+误解 & 纠正 \\
+\midrule
+更高精度的 actuator 模型总是更好 & 任务不需极限力矩时，Ideal PD $+$ DR 常已够；先问「DR 够不够」（\cref{ins:rlmc-act-roi}） \\
+actuator network 与 delta model 互斥 & 建模层面不同（电机物理 vs 整体 gap），可叠加；但 ASAP 表明 delta 常单独够（\cref{ins:rlmc-act-notalways}） \\
+actuator network 是 walk-these-ways 的贡献 & 原创是 Hwangbo 2019（ANYmal）；walk-these-ways 是 MoB 步态条件化（\cref{paper:rlmc-act-hwangbo}） \\
+\Verb[breaklines]|dyntype="filter"| 等于 DC Motor & filter 只是带宽限制（力矩爬升），不改力矩\emph{上限}；力矩-速度约束要 \verb|<dcmotor>| 或显式 clip \\
+\Verb[breaklines]|saturation_effort| 就是电机最大力矩 & 它是\emph{堵转}（零速）力矩；高速时按式~\eqref{eq:rlmc-act-torquespeed} 衰减 \\
+ASAP delta 是监督 MSE 回归 & 官方是 open-loop RL（PPO）训练（\cref{ch:rlmc-dr} 同款勘误） \\
+做了 actuator 建模就不需要 DR & 二者正交：model 提名义精度、DR 覆盖时变；保留 DR 但收窄范围 \\
+系统辨识一次到位 & 电机随温度漂移；应在热机稳态下辨识，且 DR 长期保留 \\
+N$\cdot$m 库仑摩擦可直接填 Isaac Lab \verb|friction| & Isaac Lab \verb|friction| 是无量纲系数，需单独标定 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\addcontentsline{toc}{section}{小结}
+\label{sec:rlmc-act-summary}
+
+本章从「actuator 建模的保真度阶梯」这条主线出发：Ideal PD（式~\eqref{eq:rlmc-act-idealpd}，无带宽/无饱和的理想假设）$\to$ DC Motor（式~\eqref{eq:rlmc-act-torquespeed}，加力矩-速度约束）$\to$ Actuator Network（Hwangbo 2019，MLP 拟合真机非线性，需力矩标签；UAN 放宽为无标签）$\to$ Delta Action Model（ASAP，动作空间残差，只需状态轨迹、部署零开销）。沿这条主线我们建立了：四层级的精度/成本权衡与递进关系、三框架配置对照（MuJoCo \verb|<position>|/\allowbreak\verb|<general>|/\allowbreak\verb|<dcmotor>| 与 \verb|mjcb_control| vs Isaac Lab \Verb[breaklines]|ImplicitActuatorCfg|…\Verb[breaklines]|ActuatorNetMLPCfg| 继承树）、三种系统辨识实验（扫频$\to$带宽、阶跃$\to\omega_n/\zeta/k_p/k_d$、恒速$\to$库仑/粘性摩擦）与把辨识结果写回仿真器的三框架代码、以及「先问 DR 够不够」的选型决策方法论。三框架对比贯穿全章（mjlab / Isaac Lab / UniLab 并列）：一条关键发现是\textbf{三框架把 actuator 复杂度放在不同抽象层}——Isaac Lab 用 Python \verb|*Cfg| 类树、mjlab 用 MJCF $+$ Python 薄包装（且独有反射惯量与 pseudo-inertia）、UniLab 用极简 \Verb[breaklines]|PdControlConfig| $+$ 模型层 $+$ kp/kd 域随机化（无学习型 actuator、无物理合法惯量 DR，如实标注）。
+
+若只记一件事：\textbf{actuator 建模与 DR 正交互补——model 提名义精度、DR 覆盖时变不确定性；任务不需极限力矩时 Ideal PD $+$ DR 往往就够，需要时才沿四层级逐级升级，且每升一级都要能归因}。
+
+\paragraph{术语速查。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{9.5cm}@{}}
+\toprule
+术语 & 一句话定义 \\
+\midrule
+Ideal PD & $\tau=K_p(q^*-q)-K_d\dot q$，无带宽/饱和的理想 actuator（Level 0） \\
+DC Motor & 加力矩-速度饱和的 actuator：力矩随转速线性衰减（Level 1） \\
+saturation\_effort & 堵转（零速）力矩 $\tau_{\mathrm{stall}}$，非任意速度下的力矩上限 \\
+带宽 / dyntype=filter & 一阶低通造成的力矩爬升（非瞬变）；与力矩饱和是两回事 \\
+Actuator Network & MLP 从 $(q^*,q,\dot q,\text{历史})$ 拟合真机力矩（Level 2，需力矩标签） \\
+UAN & 无监督 actuator network，用状态转移代替力矩标签（免传感器） \\
+Delta Action Model & 在动作空间学残差 $\Delta a=\mathrm{MLP}(s,a)$ 补 gap（Level 3，ASAP） \\
+扫频 / chirp & 频率渐增正弦激励，频域读带宽与阻尼 \\
+库仑/粘性摩擦 & $\tau_{\text{fric}}=\tau_c\,\mathrm{sign}(\dot q)+b\,\dot q$ 的两个成分 \\
+effort\_limit\_sim & Isaac Lab 中 PhysX 求解器的硬力矩限制（区别于软限制 effort\_limit） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 四层级递进：Ideal PD$\to$DC$\to$Net$\to$Delta & \cref{sec:rlmc-act-fourlevels} & $\star$ \\
+2 & actuator 建模与 DR 正交互补 & \cref{sec:rlmc-act-vs-dr} & $\star\star\star\star$ \\
+3 & actuator net 原创=Hwangbo 2019（非 walk-these-ways） & \cref{sec:rlmc-act-history} & $\star\star$ \\
+4 & MuJoCo \verb|kv| 与 joint damping 叠加 & \cref{sec:rlmc-act-idealpd-cfg} & $\star\star\star$ \\
+5 & \verb|<general>| = gain/bias/dyn 组合任意线性 actuator & \cref{ins:rlmc-act-general} & $\star\star\star$ \\
+6 & Isaac Lab actuator 继承树（Implicit$\to$…$\to$ActuatorNet） & \cref{ins:rlmc-act-tree} & $\star\star\star$ \\
+7 & 力矩-速度约束 $\tau_{\max}(\dot q)$（DC Motor 核心） & \cref{sec:rlmc-act-dcmotor} & $\star\star\star$ \\
+8 & filter 是带宽限制、非力矩饱和 & \cref{sec:rlmc-act-dcmotor} & $\star\star\star$ \\
+9 & Actuator Network 架构 $[128,128]$ ELU $+$ 历史输入 & \cref{sec:rlmc-act-net-hwangbo} & $\star\star\star$ \\
+10 & UAN：无力矩传感器，只需 $(s,a,s')$ & \cref{sec:rlmc-act-net-uan} & $\star\star\star$ \\
+11 & ASAP delta：动作空间残差、部署零开销 & \cref{sec:rlmc-act-delta} & $\star\star\star$ \\
+12 & delta vs actuator net：目标$+$数据需求不同 & \cref{ins:rlmc-act-delta-dual} & $\star\star\star$ \\
+13 & ASAP delta 是 open-loop RL、非监督 MSE & \cref{sec:rlmc-act-delta-deploy} & $\star\star\star$ \\
+14 & 扫频/阶跃/摩擦三实验 & \cref{sec:rlmc-act-sysid-three} & $\star\star$ \\
+15 & 阶跃$\to\omega_n/\zeta/k_p/k_d$ 反求 & \cref{sec:rlmc-act-sysid-three} & $\star\star$ \\
+16 & N$\cdot$m 摩擦$\neq$Isaac Lab 无量纲 friction & \cref{sec:rlmc-act-sysid-apply} & $\star\star$ \\
+17 & 选型：先问「DR 够不够」 & \cref{ins:rlmc-act-roi} & $\star\star\star$ \\
+18 & 误差累积：小力矩误差闭环放大 & \cref{sec:rlmc-act-decision-accum} & $\star\star$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-act-further}
+
+\begin{itemize}
+  \item Hwangbo et al., \emph{Learning agile and dynamic motor skills for legged robots}, Science Robotics 2019（arXiv:1901.08652）\cite{hwangbo2019}——actuator network 的\textbf{原创论文}，教你「用 MLP 把真机 actuator 拟进仿真器」，必读。
+  \item He et al., \emph{ASAP}, RSS 2025（arXiv:2502.01143）\cite{he2025asap}——delta action model，教你「当 actuator net/DR 都不够时，用真机数据在动作空间补 gap」，2025 sim2real SOTA。
+  \item Fey et al., \emph{Bridging the Sim-to-Real Gap for Athletic Loco-Manipulation}（UAN, arXiv:2502.10894）\cite{fey2025uan}——无监督 actuator network，教你「没有力矩传感器、只用 5~分钟真机数据」也能拟 actuator。
+  \item Tan et al., \emph{Sim-to-Real: Learning Agile Locomotion for Quadruped Robots}, RSS 2018（arXiv:1804.10332）\cite{tan2018simtoreal}——首次在四足 sim2real 用解析 actuator 模型$+$延迟$+$系统辨识，教你 actuator 建模的「史前史」。
+  \item Margolis \& Agrawal, \emph{Walk These Ways}, CoRL 2022（arXiv:2212.03238）\cite{margolis2022walk}——MoB 步态条件化（\textbf{注意：非 actuator net 原创}），教你「一个策略编码一族步态」。
+  \item MuJoCo 官方 XMLReference 的 actuator 章节 \cite{todorov2012mujoco}——\verb|<general>|/\allowbreak\verb|<dcmotor>| 的 gaintype/biastype/dyntype 完整参数；Isaac Lab actuators API 文档 \cite{mittal2025isaaclab}——\Verb[breaklines]|ImplicitActuator|/\allowbreak\verb|DCMotor|/\allowbreak\Verb[breaklines]|ActuatorNetMLP| 的字段与继承关系。
+\end{itemize}
+
+\textbf{阅读顺序建议}：先读 Hwangbo 2019（理解 actuator network 的原始动机与方法），再读 ASAP 2025（理解 delta action model 为何更优、何时该用），然后查 MuJoCo / Isaac Lab 官方文档（掌握双框架配置）；UAN 与 Tan 2018 作为前沿与史前史的补充。
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-act-troubleshoot}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.4cm}p{3.0cm}p{4.2cm}p{2.0cm}@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+仿真跳得高、真机跳不起 & Ideal PD 无力矩饱和 & 加 forcerange $\to$ 升 DC Motor $\to$ 查 $\tau_{\mathrm{stall}}$ & \cref{sec:rlmc-act-dcmotor} \\
+真机动作「拖沓」、响应慢 & 仿真无带宽限制 & 加 \Verb[breaklines]|dyntype="filter"| $\to$ 扫频测带宽 $\to$ 设 \verb|dynprm| & \cref{sec:rlmc-act-dcmotor} \\
+真机高速时正常仿真不行 & 力矩-速度约束未建模 & 查 \Verb[breaklines]|velocity_limit| $\to$ 对比高速可用力矩 & \cref{sec:rlmc-act-dcmotor} \\
+actuator net 预测力矩偏大 & 冷机下采的数据 & 热机后重采 $\to$ 增数据多样性 & \cref{sec:rlmc-act-net-train} \\
+ActuatorNetMLP 加载失败 & \verb|.pt| 格式/路径不符 & 查 \verb|network_file| 路径 $\to$ 确认 MLP 架构匹配 & \cref{sec:rlmc-act-net-integrate} \\
+delta 微调后策略退化 & \verb|max_delta| 太大 / 数据少 & 减 \verb|max_delta| $\to$ 增真机 rollout & \cref{sec:rlmc-act-delta-impl} \\
+真机关节「抖动」 & $k_d$ 太小 / 通信延迟 & 增 $k_d$ $\to$ 加 \verb|filter| $\to$ 查延迟 & \cref{sec:rlmc-act-idealpd-cfg} \\
+Isaac Lab DCMotor 与 MuJoCo 不一致 & 力矩-速度曲线实现差异 & 对比两端 $\tau(\dot q)$ 曲线 $\to$ 手动对齐 & \cref{sec:rlmc-act-dcmotor} \\
+扫频数据嘈杂无法拟合 & 幅度太小 / 外扰 & 增幅度 $\to$ 静止环境 $\to$ 多次重复 & \cref{sec:rlmc-act-sysid-three} \\
+阶跃无超调（过阻尼） & $k_d$ 太大 / 摩擦大 & 减 $k_d$ $\to$ 测摩擦 $\to$ 查 armature & \cref{sec:rlmc-act-sysid-three} \\
+$k_p$ 随机化范围太大不收敛 & DR 超出物理合理值 & 参考数据手册 $\to$ 阶跃测真实 $k_p$ & \cref{ch:rlmc-dr} \\
+\verb|<general>| 力矩异常 & \verb|biasprm| 符号错 & 手验力矩公式 $\to$ 打印 \Verb[breaklines]|actuator_force| 对比 & \cref{ins:rlmc-act-general} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-act-versions}
+
+\begin{itemize}
+  \item \textbf{Isaac Lab 2.x 起：\texttt{effort\_limit} 与 \texttt{effort\_limit\_sim} 分离}——\verb|effort_limit| 是 actuator 模型的软限制（Python 层 clip），\Verb[breaklines]|effort_limit_sim| 是 PhysX 求解器的硬限制。\textbf{只设 \texttt{effort\_limit} 而漏设 \texttt{effort\_limit\_sim} 时，PhysX 可能允许超过 \texttt{effort\_limit} 的力矩}，导致仿真与真机不一致——推荐两者设为相同值（本书已联网核对 Isaac Lab 文档与 issue 讨论）。
+  \item \textbf{MuJoCo \texttt{<dcmotor>}}——较新版本（3.x）才内置，自带 resistance / motor constant / saturation / LuGre 摩擦；旧版需用 \verb|<general>| 近似（仅带宽，非力矩-速度约束）。
+  \item \textbf{Isaac Lab actuator 类名}——\Verb[breaklines]|ImplicitActuatorCfg| / \Verb[breaklines]|IdealPDActuatorCfg| / \verb|DCMotorCfg| / \Verb[breaklines]|DelayedPDActuatorCfg| / \Verb[breaklines]|RemotizedPDActuatorCfg| / \Verb[breaklines]|ActuatorNetMLPCfg| / \Verb[breaklines]|ActuatorNetLSTMCfg|；网络权重字段统一为 \verb|network_file|；DC Motor 堵转力矩字段为 \Verb[breaklines]|saturation_effort|（均已联网核对）。
+  \item \textbf{mjlab actuator 族（1.4.0）}——\Verb[breaklines]|actuator/__init__.py| 导出 \Verb[breaklines]|BuiltinPositionActuatorCfg| / \Verb[breaklines]|BuiltinPdActuatorCfg|（\Verb[breaklines]|stiffness/damping|）/ \Verb[breaklines]|BuiltinMotorActuatorCfg| / \Verb[breaklines]|BuiltinVelocityActuatorCfg| / \Verb[breaklines]|BuiltinMuscleActuatorCfg| / \Verb[breaklines]|DcMotorActuatorCfg| / \Verb[breaklines]|IdealPdActuatorCfg| / \Verb[breaklines]|LearnedMlpActuatorCfg|（学习型）/ \Verb[breaklines]|XmlActuatorCfg|；基类 \verb|ActuatorCfg| 带 \Verb[breaklines]|armature/frictionloss/viscous_damping| 与延迟字段；另有反射惯量工具 \Verb[breaklines]|reflected_inertia()| / \Verb[breaklines]|reflected_inertia_from_two_stage_planetary()|。实体层绑定用 \Verb[breaklines]|target_names_expr|，动作层用 \Verb[breaklines]|actuator_names|（别混）。
+  \item \textbf{UniLab actuator（main，commit 99936e08；mujoco-uni 3.8.0 / motrixsim-core 0.8.2）}——\textbf{无 actuator 类树}：Python 侧只有 \Verb[breaklines]|PdControlConfig|（继承 \Verb[breaklines]|ControlConfigBase|；\textbf{自有}字段仅 \verb|Kp| 默认 35.0、\verb|Kd| 默认 0.5，而 \verb|action_scale| 默认 0.25、\Verb[breaklines]|simulate_action_latency| \textbf{默认 \texttt{False}} 是\emph{继承自基类}的——勿误记为 \verb|True| 或当成本类字段），增益经 \Verb[breaklines]|create_backend| 的 \Verb[breaklines]|position_actuator_gains={"kp","kd"}| 下沉到后端位置执行器（= Ideal PD）。\textbf{DC Motor 饱和 / forcerange 写在模型层}（MJCF \verb|<general>|/\allowbreak\verb|<dcmotor>| 或 Motrix XML），不在 Python 配类。\textbf{无学习型 actuator 网络等价物}（\Verb[breaklines]|LearnedMlpActuatorCfg| / \Verb[breaklines]|ActuatorNetMLPCfg| 无对应，需自实现或靠 DR 覆盖）。\textbf{无 \texttt{pseudo\_inertia} 物理合法惯量 DR}（reset 项只到 \Verb[breaklines]|body_inertia/body_ipos/body_iquat| 级，不保证正定）。sim2real 主力是 \verb|kp/kd| 域随机化（\Verb[breaklines]|DomainRandConfig.randomize_kp/kd| $+$ \Verb[breaklines]|*_multiplier_range|，MuJoCo 后端原生支持、Motrix 经能力门控）。以上均据源码核对（路径 \Verb[breaklines]|unilab/envs/locomotion/common/base.py|、\verb|dr/types.py|、两后端 \Verb[breaklines]|get_dr_capabilities()|）。
+\end{itemize}

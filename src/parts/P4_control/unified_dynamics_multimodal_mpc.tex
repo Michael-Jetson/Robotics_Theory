@@ -1,0 +1,924 @@
+\chapter{复合系统统一动力学与多模态 MPC（浮动基座 + 臂 · 全身最优控制）}
+\label{ch:unified-multimodal-mpc}
+
+% ════════════════════════════════════════════════════════════════
+%  控制部「浮动基座/接触/力控」子部收口章（卷五《机器人最优控制》）。
+%  吸收 Robotics_Tutorial 05/复合 20(浮基臂统一动力学 2002 行)+30(多模态 MPC 1720 行)，研究生密度。
+%  一条「全身动力学建模 → 全身最优控制」的连续主线：统一方程三类力 → M 分块/CMM/角动量 →
+%  零空间层级 → SE(3) 误差/约束几何 → 多模态 MPC → 架构权衡。是 J/M/N/O/P 五章工具的复合系统总装。
+%  记号归一（设计稿 §3）：右扰动主线(接口对齐 ch:lie)；质心动量取本书 [线;角]=(l_G;k_G)（=Pinocchio
+%  序、对齐 se(3) ξ=[rho;φ]），与 J 章空间向量 [omega;v] 由置换 P 互换，§Q.5 放一次对照表。
+%  勘误（设计稿 §2 + 复审裁决）：E1(Deep-WBC=端到端单一 RL)、E2(RAMBO 2025 QP前馈+RL反馈)、
+%  E3(CMM 概念 Orin-Goswami 2008 / M-关系+O(N) Orin-Goswami-Lee 2013，按复审「修正有误」用 Lee 版而非 Wensing)、
+%  E7(UMI-on-Legs=manipulation-centric WBC) 已应用；E5(Z1 4.3kg) 按复审「误报」保留源原值。
+% ════════════════════════════════════════════════════════════════
+
+\begin{note}
+\textbf{本章定位与记号约定.}\;
+这是控制部「浮动基座/接触/力控」子部的收口章，也是\emph{全身控制的总装节点}。在它之前，刚体动力学子部已备齐计算地基：空间向量代数与 $O(n)$ 递推算法（\cref{ch:spatial-dynamics}）给出 $\mathbf M(\mathbf q)$、$\mathbf h(\mathbf q,\mathbf v)$、$\mathbf M^{-1}$ 的线性复杂度计算；几何力学（\cref{ch:geometric-mechanics}）给出动力学方程的变分来源与守恒律；约束动力学（\cref{ch:constrained-dynamics}）给出接触约束与解析微分。腿足/接触/力控子部则分别建立了浮基简化模型（\cref{ch:reduced-models}，LIPM/SRBD/质心动量）、接触力学（\cref{ch:contact-mechanics}，摩擦锥/GIWC）、操作空间与阻抗（\cref{ch:operational-space}）、力位混合与 WBC/TSID（\cref{ch:force-wbc}）。本章要回答的核心问题是：当一台\textbf{四足或人形机器人额外背上一条机械臂}时，如何把上述工具统一进\emph{同一个动力学方程与同一个最优控制问题}，让行走与操作不再各自为政。
+
+\textbf{记号统一}（承全书与 \cref{ch:lie}、\cref{ch:spatial-dynamics}）：旋转 $\mathbf R\in\SO(3)$、位姿 $\mathbf T\in\SE(3)$，Hamilton 四元数；广义坐标 $\mathbf q$、广义速度 $\mathbf v$（浮基的 $\mathbf v_b\in\mathbb R^6$ 是切空间 twist，非 $\dot{\mathbf q}_b$）；扰动求导\textbf{以右扰动 $\mathbf R\,\mathrm{Exp}(\delta\boldsymbol\phi)$ 为主}（右雅可比 $\mathbf J_r$）。$\mathfrak{se}(3)$ 坐标 $\boldsymbol\xi=[\boldsymbol\rho;\boldsymbol\phi]$（线在前）。\textbf{质心动量本章统一取 $[\text{线};\text{角}]=(\mathbf l_G;\mathbf k_G)$ 序}（与 $\boldsymbol\xi$ 同序，亦与 Pinocchio 实现一致）；这与 \cref{ch:spatial-dynamics} 的空间向量 $[\boldsymbol\omega;\mathbf v]$（角在前）相反，二者由置换矩阵互换，详见 \cref{tab:umm-perm}。6×6 空间惯性沿用花体 $\mathcal I$。$\mathbf M,\mathbf h,\mathbf M^{-1}$ 的 $O(n)$ 计算、摩擦锥、操作空间惯性、HQP/TSID 等已由前述各章建立，本章直接\emph{用结论并作复合扩展}，不重证。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{动机：为什么复合系统不能分开设计}
+\label{sec:umm-motivation}
+
+\paragraph{一个朴素的错觉。}
+把机械臂装到四足机器人上，最自然的想法是「分而治之」：让腿部控制器照常维持平衡与行走，让臂控制器照常完成抓取，二者各管各的。固定基座的机械臂学了几十年，浮动基座的四足也成熟了，把两套现成控制器拼起来，似乎顺理成章。然而真机上这套方案极易失败：臂一伸出去抓重物，机器人就晃、就滑，甚至直接倾覆。问题出在一个被「分而治之」悄悄抹掉的物理事实——
+
+\begin{insight}
+\textbf{臂看似在操作外部物体，实际上同时在「操作」自己的基座。}\;
+机械臂每一次加速、每一次施力，都会通过关节链把反作用传回基座；而四足的基座\emph{没有电机直接驱动}，它的运动只能由足端接触力、末端操作力与系统内部动量的此消彼长共同决定。臂与腿因此被同一具刚体动力学紧紧耦合，分开设计就是假装这种耦合不存在。
+\end{insight}
+
+\paragraph{固定基座 vs 浮动基座的根本差异。}
+固定基座机械臂的底座被螺栓锚死，是一个理想的「无穷大惯量的支点」：无论臂如何运动，底座纹丝不动，反作用力被地基无声吸收。浮动基座系统则没有这样的支点——基座是一个会动的刚体，前 6 个自由度（位置 + 姿态）上\emph{没有任何执行器}。基座的平衡方程必须靠「接触力 + 末端力 + 惯性耦合」来配平，关节力矩 $\boldsymbol\tau$ 甚至无法直接出现在这 6 行里（见 \cref{sec:umm-mblocks}）。这一结构性差异，是本章一切复杂性的源头，也是「不能分开设计」的数学根据。
+
+\paragraph{全身控制的本质。}
+所谓\emph{全身控制}（whole-body control），其本质是在\textbf{同一个方程里同时决定三类量}：关节力矩、足端接触力、末端操作力。三者通过统一动力学方程相互约束——多分配一点接触力给配平臂的反力矩，就少一点裕度给行走推进；末端要精确对位，就得牺牲一部分姿态调节能力。分开设计之所以「局部合理、全局矛盾」，正因为每个子控制器都在自己的小天地里最优，却看不见这本全局的「预算账」。
+
+\paragraph{维度的代价与出路。}
+从纯四足到复合系统，广义速度维数从约 $18$（四足 $12$ + 浮基 $6$）增长到 $24$（再加臂 $6$），人形则更高。维数增长不只是变量变多，更让基于全动力学的优化代价急剧上升——后文 \cref{sec:umm-model-spectrum} 将看到，全身 MPC 的求解代价随状态维数约呈\emph{立方}增长。本章的一条暗线，就是如何用\textbf{质心动量}这一 $6$ 维紧凑表示（\cref{sec:umm-cmm}）把 $O(n_v^3)$ 的动力学约束压缩到 $6$ 维，从而在维数爆炸与实时性之间找到出路。这条暗线把「建模」（第一部分）与「最优控制」（第二部分）焊接成一个整体。
+
+% ════════════════════════════════════════════════════════════════
+\section{统一动力学方程：三类力的完整推导}
+\label{sec:umm-unified}
+
+\paragraph{从 Lagrange 力学出发。}
+考虑一台「四足 + 臂」复合机器人（以 Unitree Go2 + Z1 为具体载体）。把广义坐标与广义速度按浮基 $b$、腿 $\ell$、臂 $a$ 三段排列：
+\begin{equation}
+  \mathbf q=\begin{pmatrix}\mathbf q_b\\ \mathbf q_\ell\\ \mathbf q_a\end{pmatrix}\in\mathbb R^{n_q},
+  \qquad
+  \mathbf v=\begin{pmatrix}\mathbf v_b\\ \dot{\mathbf q}_\ell\\ \dot{\mathbf q}_a\end{pmatrix}\in\mathbb R^{n_v},
+  \label{eq:umm-qv}
+\end{equation}
+其中 $\mathbf q_b\in\SE(3)$（位置 + 四元数），$\mathbf v_b\in\mathbb R^6$（线速度 + 角速度的 twist），$\mathbf q_\ell\in\mathbb R^{12}$（四腿各 $3$ 关节），$\mathbf q_a\in\mathbb R^{6}$（臂 $6$ 关节）。Go2 + Z1 因而有 $n_v=24$。这里特意用 $\mathbf v$ 而非 $\dot{\mathbf q}$：浮基速度 $\mathbf v_b$ 不是 $\dot{\mathbf q}_b$ 的逐元素导数，二者通过 $\dot{\mathbf q}_b=\mathbf E(\mathbf q_b)\,\mathbf v_b$ 相联（$\mathbf E$ 与四元数的运动学映射有关）——这正是 \cref{ch:lie} 所述「位姿生活在流形上、速度生活在切空间」的体现。
+
+\begin{derivation}[统一动力学方程的变分推导]
+系统总动能为各刚体（基座 + 腿连杆 + 臂连杆）动能之和，写成二次型
+\begin{equation}
+  T(\mathbf q,\mathbf v)=\tfrac12\,\mathbf v^\top\mathbf M(\mathbf q)\,\mathbf v,
+  \label{eq:umm-kinetic}
+\end{equation}
+其中 $\mathbf M(\mathbf q)$ 是\emph{关节空间质量矩阵}（joint-space inertia matrix），由全部连杆惯性参数经 CRBA 递推得到（\cref{ch:spatial-dynamics}）。总势能 $V(\mathbf q)=-\sum_i m_i\,\mathbf g^\top\mathbf p_{c,i}(\mathbf q)$，Lagrangian $\mathcal L=T-V$。
+
+浮基严格生活在 $\SE(3)$ 上，姿态不能像欧氏向量那样直接相减；工程上在\emph{当前姿态的切空间}里用广义速度 $\mathbf v$ 做局部坐标化，于是 Euler--Lagrange 方程
+\begin{equation}
+  \frac{\mathrm d}{\mathrm dt}\frac{\partial\mathcal L}{\partial\mathbf v}-\frac{\partial\mathcal L}{\partial\mathbf q}=\boldsymbol\tau_{\text{gen}}
+  \label{eq:umm-el}
+\end{equation}
+展开后得到与固定基座操纵器\emph{同形}的方程
+\begin{equation}
+  \mathbf M(\mathbf q)\dot{\mathbf v}+\mathbf C(\mathbf q,\mathbf v)\mathbf v+\mathbf g(\mathbf q)=\boldsymbol\tau_{\text{gen}},
+  \label{eq:umm-manip}
+\end{equation}
+其中 $\mathbf M\dot{\mathbf v}$ 为惯性力、$\mathbf C\mathbf v$ 为科氏-离心力、$\mathbf g$ 为重力。合并后两项为\emph{非线性力} $\mathbf h(\mathbf q,\mathbf v)=\mathbf C(\mathbf q,\mathbf v)\mathbf v+\mathbf g(\mathbf q)$（在 RNEA 中以零加速度一次调用即得，\cref{ch:spatial-dynamics}）。「同形」是关键：浮基系统经局部坐标化后，左端与固定基座完全一样，全部特殊性都被赶到了\emph{右端的广义力} $\boldsymbol\tau_{\text{gen}}$ 里。
+\end{derivation}
+
+\paragraph{广义力的三类分解。}
+$\boldsymbol\tau_{\text{gen}}$ 是所有外力在广义坐标上的投影。复合机器人的外力恰有三个源头，逐一写出：
+
+\emph{源头一 —— 关节力矩。}\;
+电机只能驱动铰链关节，无法直接驱动浮动基座。用\textbf{欠驱动选择矩阵} $\mathbf S$ 刻画这一约束：
+\begin{equation}
+  \mathbf S=\begin{pmatrix}\mathbf 0_{n_a'\times6} & \mathbf I_{n_a'}\end{pmatrix}\in\mathbb R^{n_a'\times n_v},
+  \qquad n_a'=n_\ell+n_a,
+  \label{eq:umm-S}
+\end{equation}
+即 $\mathbf S$ 的前 $6$ 列为零（浮基不可驱动）、后 $n_a'$ 列为单位阵。Go2 + Z1 有 $\mathbf S\in\mathbb R^{18\times24}$。关节力矩 $\boldsymbol\tau\in\mathbb R^{n_a'}$ 对广义力的贡献为 $\mathbf S^\top\boldsymbol\tau$。
+
+\emph{源头二 —— 足端接触力。}\;
+设第 $i$ 只接触足的接触力为 $\boldsymbol\lambda_i\in\mathbb R^3$（点接触 $3$D 力），接触雅可比 $\mathbf J_{c,i}\in\mathbb R^{3\times n_v}$，则
+\begin{equation}
+  \sum_{i\in\mathcal C}\mathbf J_{c,i}^\top\boldsymbol\lambda_i,
+  \label{eq:umm-contact}
+\end{equation}
+$\mathcal C$ 为当前接触足集合（随步态相位变化）。摩擦锥约束 $\boldsymbol\lambda_i\in\mathcal{FC}_i$ 与 GIWC 的几何主体见 \cref{ch:contact-mechanics}。
+
+\emph{源头三 —— 末端力旋量。}\;
+这是复合机器人相对纯四足的\textbf{核心新增项}。臂末端可能主动施力（推门、搬运）或承受被动外力（碰撞、被抓物重力）。设末端 $6$D wrench $\mathbf f_{\text{ee}}\in\mathbb R^6$、末端雅可比 $\mathbf J_{\text{ee}}\in\mathbb R^{6\times n_v}$，贡献为 $\mathbf J_{\text{ee}}^\top\mathbf f_{\text{ee}}$。
+
+\paragraph{核心方程。}
+三类力代入 \cref{eq:umm-el}，得到本章（及后续 RL 全身控制章）反复引用的统一动力学方程：
+\begin{equation}
+  \boxed{\;
+  \mathbf M(\mathbf q)\dot{\mathbf v}+\mathbf h(\mathbf q,\mathbf v)
+  =\mathbf S^\top\boldsymbol\tau+\sum_{i\in\mathcal C}\mathbf J_{c,i}^\top\boldsymbol\lambda_i+\mathbf J_{\text{ee}}^\top\mathbf f_{\text{ee}}.
+  \;}
+  \label{eq:umm-core}
+\end{equation}
+它把「腿 + 臂 + 浮基」的全部刚体动力学压进一行；本章后续所有结构分析（M 分块、CMM、零空间、MPC 代价/约束）都是对这一方程的不同侧面剖视。
+
+\begin{table}[H]\centering\small
+\caption{统一动力学方程中三类广义力的可控性分级。}
+\label{tab:umm-forces}
+\begin{tabular}{llll}
+\toprule
+力类型 & 符号 & 物理来源 & 可控性 \\
+\midrule
+关节力矩 & $\mathbf S^\top\boldsymbol\tau$ & 电机输出 & 完全可控（决策变量） \\
+足端接触力 & $\mathbf J_{c,i}^\top\boldsymbol\lambda_i$ & 地面反力 & 间接可控（经步态/接触规划） \\
+末端力旋量 & $\mathbf J_{\text{ee}}^\top\mathbf f_{\text{ee}}$ & 操作力 / 外力 & 部分可控（力控）或不可控（扰动） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}
+\textbf{三类力的可控性分级，决定了它们在最优控制里的不同角色。}\;
+$\boldsymbol\tau$ 是\emph{直接决策变量}；$\boldsymbol\lambda_i$ 只能\emph{通过决定何时何地落足}来间接塑形，因而与步态调度强绑定；$\mathbf f_{\text{ee}}$ 在力控任务里是被追踪的目标、在自由运动里又退化为扰动。这一分级是第二部分「多模态」一词的物理根源：MPC 必须同时驾驭三种性质迥异的力。
+\end{insight}
+
+\paragraph{承上启下。}
+\cref{eq:umm-core} 的左端 $\mathbf M(\mathbf q)$ 看似只是个系数矩阵，实则编码了腿与臂如何「隔山打牛」地相互推搡。下一节剖开 $\mathbf M$ 的分块结构，揭示「臂操作自己的基座」这一洞察的精确数学形态。
+
+% ════════════════════════════════════════════════════════════════
+\section{质量矩阵的 \texorpdfstring{$3\times3$}{3x3} 分块物理}
+\label{sec:umm-mblocks}
+
+\paragraph{按子系统分块。}
+把 $\mathbf M(\mathbf q)$ 按浮基 $b$、腿 $\ell$、臂 $a$ 三段分块（对称矩阵，只写上三角与对角块的物理）：
+\begin{equation}
+  \mathbf M(\mathbf q)=\begin{pmatrix}
+  \mathbf M_{bb} & \mathbf M_{b\ell} & \mathbf M_{ba}\\
+  \mathbf M_{b\ell}^\top & \mathbf M_{\ell\ell} & \mathbf M_{\ell a}\\
+  \mathbf M_{ba}^\top & \mathbf M_{\ell a}^\top & \mathbf M_{aa}
+  \end{pmatrix}.
+  \label{eq:umm-Mblocks}
+\end{equation}
+对角块是各子系统的\emph{自惯量}，非对角块是子系统间的\emph{惯性反作用}。
+
+\begin{table}[H]\centering\small
+\caption{质量矩阵各分块的物理含义（Go2 + Z1，$n_v=24$）。}
+\label{tab:umm-mblocks}
+\begin{tabular}{llll}
+\toprule
+分块 & 维度 & 物理含义 & 数值特征 \\
+\midrule
+$\mathbf M_{bb}$ & $6\times6$ & 基座\emph{锁关节惯量}（locked inertia）：诸关节锁死时基座的等效惯量 & 最大，主导 \\
+$\mathbf M_{\ell\ell}$ & $12\times12$ & 腿关节等效惯量 & 近对角，腿间耦合弱 \\
+$\mathbf M_{aa}$ & $6\times6$ & 臂关节等效惯量 & 构型依赖强 \\
+$\mathbf M_{b\ell}$ & $6\times12$ & 基座-腿耦合：腿运动对基座的惯性反力矩 & 中等 \\
+$\mathbf M_{ba}$ & $6\times6$ & 基座-臂耦合：\textbf{臂运动对基座的惯性反力矩}（本节核心） & 构型依赖极强 \\
+$\mathbf M_{\ell a}$ & $12\times6$ & 腿-臂耦合：臂经基座间接影响腿 & 通常较小 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{基座子方程揭示耦合。}
+把 \cref{eq:umm-core} 取前 $6$ 行（基座行），并代入分块，得基座子方程
+\begin{equation}
+  \mathbf M_{bb}\dot{\mathbf v}_b+\mathbf M_{b\ell}\ddot{\mathbf q}_\ell+\underbrace{\mathbf M_{ba}\ddot{\mathbf q}_a}_{\text{臂惯性反力矩}}+\mathbf h_b
+  =\sum_{i\in\mathcal C}\mathbf J_{c,i,b}^\top\boldsymbol\lambda_i+\mathbf J_{\text{ee},b}^\top\mathbf f_{\text{ee}}.
+  \label{eq:umm-base-eq}
+\end{equation}
+注意右端\emph{没有 $\mathbf S^\top\boldsymbol\tau$ 的贡献}——因为 $\mathbf S$ 前 $6$ 列为零（\cref{eq:umm-S}）。这一行因此成为「检验账本」：基座的加速度 $\dot{\mathbf v}_b$ 必须由接触力、末端力与惯性耦合项三者配平，关节力矩\emph{无权直接介入}。
+
+\begin{insight}
+\textbf{基座的六个自由度不能当作可控关节。}\;
+\cref{eq:umm-base-eq} 左端的 $\mathbf M_{ba}\ddot{\mathbf q}_a$ 正是臂加速度对基座产生的\emph{惯性反力矩}：臂一加速，这一项就把扰动注入基座方程，必须由接触力 $\boldsymbol\lambda_i$ 重新配平。忽略 $\mathbf M_{ba}$ 项、假装臂与基座解耦，正是「独立控制方案」失败的数学根源。$\mathbf M_{ba}$ 随臂伸远、负载加重而显著增大，它来自\emph{质量分布与杠杆臂}，不是可以调参消掉的小量。
+\end{insight}
+
+\paragraph{末端力的整机视角。}
+末端 wrench 经 $\mathbf J_{\text{ee}}^\top$ 投影后，同样要按浮基/腿/臂分块阅读：
+\begin{equation}
+  \mathbf J_{\text{ee}}^\top\mathbf f_{\text{ee}}=\begin{pmatrix}\mathbf w_b\\ \boldsymbol\tau_\ell\\ \boldsymbol\tau_a\end{pmatrix},
+  \label{eq:umm-ee-blocks}
+\end{equation}
+其中 $\mathbf w_b$ 是末端力在基座行投影出的\emph{空间力}、$\boldsymbol\tau_\ell$ 是其在腿关节的耦合力矩、$\boldsymbol\tau_a$ 才是臂关节力矩。只盯着 $\boldsymbol\tau_a$（「臂自己扛住操作力就行」）会漏掉 $\mathbf w_b$（基座需要接触力来平衡的部分）与 $\boldsymbol\tau_\ell$（腿被牵连的部分），从而低估倾覆与打滑风险。
+
+\begin{insight}
+\textbf{操作力是约束来源，不是可事后补偿的小扰动。}\;
+推门、拉抽屉、搬运时，末端力 $\mathbf f_{\text{ee}}$ 往往是\emph{任务成功的必要条件}（门必须被推开），其量级可与机器人自重相当。把它当成「干扰」事后抑制，逻辑上就错了——它应当作为\emph{约束}进入规划与控制：既是任务目标，又是必须被接触力配平的负担。这正是 \cref{eq:umm-ee-blocks} 的 $\mathbf w_b$ 项不可省略的理由。
+\end{insight}
+
+\paragraph{承上启下。}
+$\mathbf M_{ba}$ 从「足端是否撑得住」的角度刻画了臂扰动。但还有一个更本质的视角：臂运动如何改变\emph{整个系统的动量}？下一节先用 ZMP 把臂负载翻译成稳定性裕度，再在 \cref{sec:umm-cmm} 升华到质心动量。
+
+% ════════════════════════════════════════════════════════════════
+\section{臂反力矩对稳定性：ZMP 偏移与摩擦锥收紧}
+\label{sec:umm-zmp}
+
+\paragraph{动机：一公斤就能掀翻四足？}
+Unitree Go2 总质量约 $15\,\mathrm{kg}$，Z1 臂自重约 $4.3\,\mathrm{kg}$（含夹爪）\footnote{$4.3\,\mathrm{kg}$（负载 $2\,\mathrm{kg}$）取自 Unitree Z1 官方主页规格；其技术文档另有 $4.1\,\mathrm{kg}$（Z1~Air）口径，量级一致，不影响下文算例结论。}。当臂完全外伸抓取 $1\,\mathrm{kg}$ 物体、末端相对基座中心力臂约 $0.5\,\mathrm{m}$ 时，臂施加于系统的附加力矩
+\begin{equation}
+  \tau_{\text{arm}}\approx(m_{\text{arm}}+m_{\text{load}})\,g\,r_{\text{arm}}
+  =(4.3+1.0)\times9.81\times0.5\approx26\,\mathrm{N\!\cdot\!m}.
+  \label{eq:umm-tau-arm}
+\end{equation}
+而四足步态的稳定裕度（支撑多边形内的 ZMP 余量）通常只有几厘米。$26\,\mathrm{N\!\cdot\!m}$ 足以把 ZMP 推到支撑边缘，导致倾覆。这就是复合机器人的第一个稳定性挑战。
+
+\paragraph{ZMP 基线（LIPM）。}
+零力矩点（Zero Moment Point, ZMP）是地面上使绕该点的合力矩水平分量为零的点（定义与基础见 \cref{ch:reduced-models}）。在线性倒立摆模型（LIPM）近似下，所有质量集中于质点、忽略角动量效应，ZMP 的实用简化式为
+\begin{equation}
+  x_{\text{ZMP}}=x_{\text{CoM}}-\frac{z_{\text{CoM}}}{g+\ddot z_{\text{CoM}}}\,\ddot x_{\text{CoM}}.
+  \label{eq:umm-zmp-lipm}
+\end{equation}
+
+\begin{derivation}[含臂外力的 ZMP 偏移]
+当末端施加/承受外力时，系统在质心处的角动量平衡须修正。质心处的牛顿--欧拉角动量方程为
+\begin{equation}
+  \dot{\mathbf L}_G=\sum_{i\in\mathcal C}(\mathbf p_{c,i}-\mathbf p_G)\times\boldsymbol\lambda_i+(\mathbf p_{\text{ee}}-\mathbf p_G)\times\mathbf f_{\text{ee,lin}},
+  \label{eq:umm-Ldot}
+\end{equation}
+$\mathbf f_{\text{ee,lin}}$ 为末端力的线性分量。取 $y$ 分量（pitch 方向），并利用 ZMP 定义（绕 ZMP 的水平力矩为零）消去接触力矩，化简得
+\begin{equation}
+  \boxed{\;
+  x_{\text{ZMP}}=x_{\text{CoM}}-\frac{z_{\text{CoM}}}{g}\,\ddot x_{\text{CoM}}+\frac{\tau_{\text{arm},y}}{m_{\text{tot}}\,g}.
+  \;}
+  \label{eq:umm-zmp-arm}
+\end{equation}
+第三项 $\tau_{\text{arm},y}/(m_{\text{tot}}g)$ 即\emph{臂引起的 ZMP 偏移}。上式在准静态近似 $\dot{\mathbf L}_G\approx0$ 下精确；动态情形须补上修正项 $\dot L_{G,y}/(m_{\text{tot}}g)$，它把系统角动量的变化率也算进 ZMP——这正是 \cref{sec:umm-cmm} 质心动量视角的入口。
+\end{derivation}
+
+\paragraph{数值算例。}
+取 $m_{\text{tot}}=15+4.3+1.0=20.3\,\mathrm{kg}$、$\tau_{\text{arm},y}=26\,\mathrm{N\!\cdot\!m}$、支撑多边形半长约 $0.15\,\mathrm{m}$，准静态偏移
+\begin{equation}
+  \Delta x_{\text{ZMP}}=\frac{\tau_{\text{arm},y}}{m_{\text{tot}}\,g}=\frac{26}{20.3\times9.81}\approx0.131\,\mathrm m.
+  \label{eq:umm-zmp-num}
+\end{equation}
+即 $13.1\,\mathrm{cm}$，已逼近 $15\,\mathrm{cm}$ 的支撑半长，极易倾覆。\cref{tab:umm-zmp} 给出不同臂姿态的对照：从收拢到满载全伸展，ZMP 偏移占支撑半长比从 $7\%$ 飙升到 $100\%$ 以上。
+
+\begin{table}[H]\centering\small
+\caption{不同臂姿态下的 ZMP 偏移（Go2 + Z1，准静态）。}
+\label{tab:umm-zmp}
+\begin{tabular}{lccc}
+\toprule
+臂姿态 & $\tau_{\text{arm},y}\,(\mathrm{N\!\cdot\!m})$ & $\Delta x_{\text{ZMP}}\,(\mathrm m)$ & 占支撑半长比 \\
+\midrule
+收拢（Home） & 2.1 & 0.011 & 7\,\% \\
+半伸展（$45^\circ$） & 12.5 & 0.063 & 42\,\% \\
+全伸展、空载 & 21.1 & 0.106 & 71\,\% \\
+全伸展、$1\,\mathrm{kg}$ & 26.0 & 0.131 & 87\,\% \\
+全伸展、$2\,\mathrm{kg}$ & 30.9 & 0.155 & $>100\,\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{摩擦锥收紧。}
+除 ZMP 偏移外，臂的\emph{水平}操作力还会蚕食足端摩擦裕度。设末端水平力 $f_{\text{ee},x}$，水平方向牛顿第二定律要求足端提供额外水平反力 $\sum_i\lambda_{i,x}=m\ddot x_{\text{CoM}}-f_{\text{ee},x}$。足端水平力受摩擦锥约束 $|\lambda_{i,x}|\le\mu\,\lambda_{i,z}$；当 $f_{\text{ee},x}$ 消耗部分裕度后，系统可用的\emph{等效}摩擦系数降为
+\begin{equation}
+  \mu_{\text{eff}}=\mu-\frac{|f_{\text{ee},x}|}{\sum_i\lambda_{i,z}}.
+  \label{eq:umm-mueff}
+\end{equation}
+推门 $10\,\mathrm N$、法向力合 $200\,\mathrm N$ 时，$\mu$ 从 $0.70$ 降到 $0.65$；力越大、法向支撑越弱，打滑风险越高。摩擦锥的几何与 GIWC 主体见 \cref{ch:contact-mechanics}，本节给出的是「臂操作如何收紧摩擦裕度」的复合系统实例。
+
+\paragraph{三种补偿策略。}
+面对臂反力矩，控制器有三条定性路线：(i)~\emph{主动前馈}——在 WBC/MPC 中预测臂的反力矩并提前用接触力/姿态配平（需准确模型）；(ii)~\emph{反应式 WBC}——把臂扰动当作实时测得的外力，由高频 WBC 即时抵消（鲁棒但滞后）；(iii)~\emph{被动姿态}——通过预先调整站姿/质心位置扩大裕度（简单但保守）。三者并非互斥，实际系统常叠加使用。它们的共同前提，是把臂反力矩\emph{显式建模}进动力学——这正是本章统一方程的价值。
+
+\paragraph{承上启下。}
+ZMP 是「足端视角」：它回答地面反力够不够，却没直接回答系统动量如何演化。下一节引入质心动量矩阵，把臂负载、姿态稳定与角动量守恒统一到一个 $6$ 维对象上。
+
+% ════════════════════════════════════════════════════════════════
+\section{质心动量矩阵 CMM 的复合扩展}
+\label{sec:umm-cmm}
+
+\paragraph{从 ZMP 到质心动量。}
+\emph{质心动量矩阵}（Centroidal Momentum Matrix, CMM）提供了比 ZMP 更本质、更统一的视角：直接从\emph{质心动量}描述整个系统的动力学，把维数爆炸的关节空间压缩到 $6$ 维质心空间，同时保留每个关节对总动量的贡献信息。系统在质心处的空间动量（取本书 $[\text{线};\text{角}]$ 序，见 \cref{tab:umm-perm}）为
+\begin{equation}
+  \mathbf h_G=\begin{pmatrix}\mathbf l_G\\ \mathbf k_G\end{pmatrix}\in\mathbb R^6,
+  \qquad
+  \mathbf l_G=m_{\text{tot}}\dot{\mathbf p}_{\text{CoM}},\quad \mathbf k_G=\text{绕质心角动量},
+  \label{eq:umm-hG}
+\end{equation}
+CMM $\mathbf A_G(\mathbf q)\in\mathbb R^{6\times n_v}$ 是连接广义速度与质心动量的线性映射：
+\begin{equation}
+  \boxed{\;\mathbf h_G=\mathbf A_G(\mathbf q)\,\mathbf v.\;}
+  \label{eq:umm-cmm-def}
+\end{equation}
+
+\begin{table}[H]\centering\small
+\caption{质心动量分量序：本书/Pinocchio $[\text{线};\text{角}]$ 与 Featherstone/Orin $[\text{角};\text{线}]$ 的置换对照。}
+\label{tab:umm-perm}
+\begin{tabular}{lll}
+\toprule
+约定 & 分量序 & 出处 \\
+\midrule
+本书（对齐 $\boldsymbol\xi=[\boldsymbol\rho;\boldsymbol\phi]$） / Pinocchio \texttt{data.Ag} & $\mathbf h_G=(\mathbf l_G;\mathbf k_G)$（线在前） & 本章、\cref{ch:lie} \\
+Featherstone / Orin 动力学约定 & $\mathbf h_G=(\mathbf k_G;\mathbf l_G)$（角在前） & 多数动力学教材 \\
+空间向量（\cref{ch:spatial-dynamics}） & $\hat{\mathbf v}=(\boldsymbol\omega;\mathbf v)$（角在前） & 算法文献主流 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{关于分量序的一次性约定.}\;
+动量是 wrench 类对象，理论上应与空间向量 $[\boldsymbol\omega;\mathbf v]$ 同序。本书为与 $\mathfrak{se}(3)$ 坐标 $\boldsymbol\xi=[\boldsymbol\rho;\boldsymbol\phi]$（线在前）一致、且与 Pinocchio 的 \texttt{data.Ag}/\allowbreak\texttt{data.hg} 实现同序（省一次置换），\textbf{统一取 $\mathbf h_G=(\mathbf l_G;\mathbf k_G)$}。它与 \cref{ch:spatial-dynamics} 的空间向量序相反，二者由置换矩阵 $\mathbf P=\begin{psmallmatrix}\mathbf 0&\mathbf I\\ \mathbf I&\mathbf 0\end{psmallmatrix}$ 互换。下文凡涉及 $\mathbf A_G$ 的角动量子块均记 $\mathbf A_G^{\text{ang}}$（取 $\mathbf A_G$ 的后 $3$ 行）、线动量子块记 $\mathbf A_G^{\text{lin}}$（前 $3$ 行），不再依赖具体下标位置。
+\end{note}
+
+\paragraph{CMM 的子系统分块。}
+按浮基/腿/臂分块 $\mathbf A_G=\begin{pmatrix}\mathbf A_{G,b} & \mathbf A_{G,\ell} & \mathbf A_{G,a}\end{pmatrix}$，质心动量随之分解为三贡献：
+\begin{equation}
+  \mathbf h_G=\underbrace{\mathbf A_{G,b}\mathbf v_b}_{\text{基座}}+\underbrace{\mathbf A_{G,\ell}\dot{\mathbf q}_\ell}_{\text{腿}}+\underbrace{\mathbf A_{G,a}\dot{\mathbf q}_a}_{\text{臂}}.
+  \label{eq:umm-hG-decomp}
+\end{equation}
+其中基座列块 $\mathbf A_{G,b}$ 由总质量主导、近似常数；腿列块 $\mathbf A_{G,\ell}$ 构型依赖、对称步态时部分抵消；臂列块 $\mathbf A_{G,a}$ 构型依赖极强，是本节的主角——它的角动量子块 $\mathbf A_{G,a}^{\text{ang}}\dot{\mathbf q}_a$ 意味着\emph{臂可像反作用轮一样调节系统角动量}（详见 \cref{sec:umm-momentum}）。
+
+\begin{derivation}[CCRBA：质心动量矩阵的构造]
+质心动量是各连杆动量在质心处的汇总。第 $i$ 连杆在质心处的动量贡献为
+\begin{equation}
+  \mathbf h_{G,i}={}^G\mathbf X_i^*\,\mathcal I_i\,{}^i\mathbf v_i,
+  \label{eq:umm-ccrba-body}
+\end{equation}
+其中 ${}^G\mathbf X_i^*$ 是从连杆 $i$ 坐标系到质心坐标系的\emph{力变换}（$\mathbf X^*=\mathbf X^{-\top}=\mathrm{Ad}^*$，见 \cref{ch:spatial-dynamics}），$\mathcal I_i$ 是连杆 $i$ 的 $6\times6$ 空间惯性，${}^i\mathbf v_i$ 是其体坐标空间速度。把连杆速度用体雅可比表为 ${}^i\mathbf v_i={}^i\mathbf J_i(\mathbf q)\,\mathbf v$，对全部连杆求和：
+\begin{equation}
+  \mathbf h_G=\sum_{i=1}^{N_b}{}^G\mathbf X_i^*\,\mathcal I_i\,{}^i\mathbf J_i\,\mathbf v
+  =\underbrace{\Big(\sum_{i=1}^{N_b}{}^G\mathbf X_i^*\,\mathcal I_i\,{}^i\mathbf J_i\Big)}_{\mathbf A_G(\mathbf q)}\mathbf v.
+  \label{eq:umm-ccrba-sum}
+\end{equation}
+故
+\begin{equation}
+  \mathbf A_G(\mathbf q)=\sum_{i=1}^{N_b}{}^G\mathbf X_i^*\,\mathcal I_i\,{}^i\mathbf J_i.
+  \label{eq:umm-Ag}
+\end{equation}
+直接按 \cref{eq:umm-Ag} 计算为 $O(N_b\,n_v)$；与 CRBA 共享复合惯量的递推可降到 $O(n_v)$（即 Pinocchio 的 \texttt{ccrba}）。
+\end{derivation}
+
+\paragraph{与质量矩阵的关系，以及归属辨析。}
+CCRBA 与 CRBA 本质上汇总的是\emph{同一组复合惯量}，区别只在最终汇聚的参考点：CRBA 汇聚到关节空间得 $\mathbf M(\mathbf q)\in\mathbb R^{n_v\times n_v}$，CCRBA 汇聚到质心得 $\mathbf A_G\in\mathbb R^{6\times n_v}$。二者的精确关系为
+\begin{equation}
+  \mathbf A_G={}^G\mathbf X_0^*\,\mathbf M_{:6,:},
+  \label{eq:umm-Ag-M}
+\end{equation}
+即 CMM 可由质量矩阵的\emph{前 $6$ 行}（基座行）经一个从基座原点到质心的力变换得到；此式在数值验证时极有用。
+
+\begin{note}
+\textbf{文献归属（须分清概念与算法）.}\;
+质心动量矩阵这个\emph{概念、结构与性质}由 Orin 与 Goswami 在 IROS~2008 建立\cite{orin2008centroidal}（该文仅引入 CMM、给出结构与性质，未给 $O(N)$ 算法、亦未建立与 $\mathbf M$ 的关系）。其\emph{与关节空间质量矩阵的关系}（\cref{eq:umm-Ag-M}）与\emph{紧凑 $O(N)$ 计算算法}（Pinocchio \texttt{ccrba} 所实现者）则由 Orin、Goswami 与 Lee 在 2013 年给出\cite{orin2013centroidal}（\emph{Autonomous Robots} 35(2--3):161--176）——该文明确「证明 CMM 及其导数可从质量矩阵与科氏项算出」并给出紧凑空间记号的 $O(N)$ 算法。引用时务必把「概念 2008 / 算法 + $\mathbf M$ 关系 2013」分开，以免引错文献。
+\end{note}
+
+\paragraph{CMM 的时间导数与质心动力学约束。}
+质心动量的时间导数等于所有外力之和（质心处的牛顿--欧拉方程）：
+\begin{equation}
+  \dot{\mathbf h}_G=\begin{pmatrix}\dot{\mathbf l}_G\\ \dot{\mathbf k}_G\end{pmatrix}
+  =\begin{pmatrix}
+  m_{\text{tot}}\mathbf g+\sum_i\boldsymbol\lambda_i+\mathbf f_{\text{ee,lin}}\\[2pt]
+  \sum_i(\mathbf p_{c,i}-\mathbf p_G)\times\boldsymbol\lambda_i+(\mathbf p_{\text{ee}}-\mathbf p_G)\times\mathbf f_{\text{ee,lin}}+\boldsymbol\tau_{\text{ee}}
+  \end{pmatrix}.
+  \label{eq:umm-hGdot}
+\end{equation}
+\cref{eq:umm-hGdot} 的右端\emph{只含外力、不含关节加速度}——这正是质心动力学的计算优势：动力学约束从 $n_v$ 维降为 $6$ 维。第二部分的 centroidal MPC（\cref{sec:umm-model-spectrum}）正建立在此式上。$\dot{\mathbf A}_G$ 的计算（Pinocchio \texttt{dccrba}）使 $\dot{\mathbf h}_G=\dot{\mathbf A}_G\mathbf v+\mathbf A_G\dot{\mathbf v}$ 与 \cref{eq:umm-hGdot} 互为验证。
+
+\paragraph{承上启下。}
+\cref{eq:umm-hGdot} 的第二行（角动量方程）在「唯一外力为重力」时退化为一条优美的守恒律，并赋予机械臂一个出人意料的稳定化角色。
+
+% ════════════════════════════════════════════════════════════════
+\section{角动量守恒与机械臂的「反作用轮」效应}
+\label{sec:umm-momentum}
+
+\paragraph{重力不产生绕质心力矩。}
+重力作用线恒过质心，故对质心\emph{不产生}力矩。当系统唯一外力是重力时，\cref{eq:umm-hGdot} 的角动量行给出 $\dot{\mathbf k}_G=\mathbf 0$，即\textbf{角动量守恒}：
+\begin{equation}
+  \mathbf k_G=\mathbf A_G^{\text{ang}}(\mathbf q)\,\mathbf v=\text{const}.
+  \label{eq:umm-kG-cons}
+\end{equation}
+这条守恒律在复合机器人的三个运动相位有不同的精确程度，列于 \cref{tab:umm-phases}。
+
+\begin{table}[H]\centering\small
+\caption{三个运动相位的角动量守恒性与机械臂角色。}
+\label{tab:umm-phases}
+\begin{tabular}{llll}
+\toprule
+运动相位 & 角动量守恒？ & 臂的角色 & 典型应用 \\
+\midrule
+多支撑相（四脚站立） & 否（地面反力提供力矩） & 操作工具 & 正常操作 \\
+单支撑相（一脚站立） & 近似守恒 & 反作用轮 + 操作 & 抗推恢复（push recovery） \\
+空中相（跳跃/飞行） & 严格守恒 & 纯反作用轮 & 空中翻转、猫式着陆 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}
+\textbf{机械臂是一只「免费的反作用轮」。}\;
+卫星上的反作用轮要专门装电机、专门耗能来调节姿态角动量。机械臂却\emph{在执行操作任务的同时}，自然地改变了系统角动量（\cref{eq:umm-hG-decomp} 的 $\mathbf A_{G,a}^{\text{ang}}\dot{\mathbf q}_a$ 项）。若控制器意识到这一点，就能\emph{同时}优化操作精度与姿态稳定：抓取物体的那条臂，同一时刻也在帮机器人站稳。在单支撑抗推与空中姿态调整中，这一效应尤为关键——臂的摆动可像体操运动员的手臂一样，在角动量守恒约束下重新分配身体各部分的转动。
+\end{insight}
+
+\paragraph{与捕获点/质心角动量调节的联系。}
+\cref{eq:umm-kG-cons} 是腿足稳定性理论的一块基石。捕获点（capture point）理论\cite{pratt2006capture} 把「一步迈到何处能刹住」与质心动量直接挂钩；近年的在线质心角动量（CAM）参考生成\cite{schuller2021online} 进一步把 $\mathbf k_G$ 作为优化变量用于抗推恢复。复合系统的臂为这套理论提供了一个额外的、可主动操纵的角动量调节自由度。捕获点与 LIPM 稳定性的基础主体见 \cref{ch:reduced-models}，本节给出的是「臂如何参与角动量调节」的复合扩展。
+
+\paragraph{承上启下。}
+角动量守恒揭示了臂的「多用途」：同一次摆动既服务操作又服务稳定。如何\emph{系统地}把这些彼此竞争又彼此兼容的目标排好优先级、分配到冗余自由度上？答案是零空间投影。
+
+% ════════════════════════════════════════════════════════════════
+\section{零空间投影与冗余度利用}
+\label{sec:umm-nullspace}
+
+\paragraph{冗余度从何而来。}
+Go2 + Z1 有 $n_v=24$ 维广义速度，而典型控制任务只占用有限维度：末端 $6$D 位姿跟踪占 $6$ 维，四足接触约束（$4$ 足 $\times3$D）占 $12$ 维，浮基「虚约束」$6$ 维由接触力间接实现而不额外占维。总约束约 $18$ 维，剩余 $24-18=6$ 维\emph{冗余度}可自由利用；人形冗余度更大。冗余度是复合机器人相对纯四足的核心优势，问题是如何系统地利用它。
+
+\paragraph{零空间投影。}
+给定主任务雅可比 $\mathbf J_1\in\mathbb R^{m\times n}$（$m<n$），其\emph{零空间投影矩阵}
+\begin{equation}
+  \mathbf N_1=\mathbf I_n-\mathbf J_1^{\dagger}\mathbf J_1
+  \label{eq:umm-N1}
+\end{equation}
+（$\mathbf J_1^{\dagger}$ 为伪逆）把任意速度投影到 $\mathbf J_1$ 的零空间——即\emph{不影响主任务}的速度子空间。物理直觉：抓住门把手（$6$D 约束）时仍可调整肘部，$\mathbf N_1$ 精确描述了这种「手不动、肘自由」的运动。
+
+\begin{table}[H]\centering\small
+\caption{复合机器人典型的任务优先级栈（从高到低）。}
+\label{tab:umm-stack}
+\begin{tabular}{clll}
+\toprule
+优先级 & 任务 & 维度 & 原因 \\
+\midrule
+P0（硬约束） & 接触脚不滑 & 12 & 违反则摔倒 \\
+P1 & 基座稳定性（ZMP/CoM） & 3--6 & 倾覆则任务失败 \\
+P2 & 末端位姿跟踪 & 6 & 操作任务目标 \\
+P3 & 关节居中 / 限位避免 & $n_v$ & 防止关节到极限 \\
+P4 & 姿态舒适度 / 可操作度 & $n_v$ & 优化性能指标 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{层级任务级联。}
+按 \cref{tab:umm-stack} 的优先级，任务间通过零空间级联保证「高优先级绝不被低优先级干扰」：
+\begin{equation}
+  \dot{\mathbf q}=\mathbf J_1^{\dagger}\dot{\mathbf x}_1+\mathbf N_1\Big(\mathbf J_2^{\dagger}\dot{\mathbf x}_2+\mathbf N_2\big(\mathbf J_3^{\dagger}\dot{\mathbf x}_3+\cdots\big)\Big),
+  \label{eq:umm-cascade}
+\end{equation}
+其中 $\mathbf N_2=\mathbf I-(\mathbf J_2\mathbf N_1)^{\dagger}(\mathbf J_2\mathbf N_1)$ 是 $\mathbf J_2$ 在 $\mathbf J_1$ 零空间内的再投影。每下一级任务只在上一级留下的零空间里「见缝插针」。
+
+\paragraph{阻尼伪逆与数值稳定。}
+雅可比接近奇异时标准伪逆 $\mathbf J^{\dagger}=\mathbf J^\top(\mathbf J\mathbf J^\top)^{-1}$ 发散。\emph{阻尼最小二乘}（DLS）引入正则化：
+\begin{equation}
+  \mathbf J_{\text{DLS}}^{\dagger}=\mathbf J^\top(\mathbf J\mathbf J^\top+\lambda^2\mathbf I)^{-1}.
+  \label{eq:umm-dls}
+\end{equation}
+工程上用\emph{自适应阻尼}，按最小奇异值 $\sigma_{\min}$ 与奇异性阈值 $\epsilon$ 动态调整：
+\begin{equation}
+  \lambda^2=\begin{cases}0, & \sigma_{\min}>\epsilon,\\[2pt](1-(\sigma_{\min}/\epsilon)^2)\,\lambda_{\max}^2, & \sigma_{\min}\le\epsilon,\end{cases}
+  \label{eq:umm-adaptive-damp}
+\end{equation}
+远离奇异时无阻尼（精确），逼近奇异时平滑加阻尼（牺牲精度换稳定）。
+
+\paragraph{HQP vs 加权 QP。}
+零空间级联 \cref{eq:umm-cascade} 在求解器层面有两种实现，权衡列于 \cref{tab:umm-hqp}：\emph{层级 QP}（HQP/TSID）逐级求解 QP + 零空间投影，\textbf{严格}保证优先级（高级任务绝不被低级影响）；\emph{加权 QP} 用单个 QP、以权重差异\emph{近似}体现优先级，更快但优先级只是「软」的。准则很直接：若优先级是\emph{绝对}的（「宁可末端偏差也不能摔倒」）用 HQP；若任务间需\emph{柔性折中}（末端精度与能耗的 trade-off）用加权 QP。HQP/TSID/加权 QP 的完整理论主体见 \cref{ch:force-wbc}，本节给出的是复合系统的层级栈实例。
+
+\begin{table}[H]\centering\small
+\caption{层级 QP（HQP）与加权 QP 的对比。}
+\label{tab:umm-hqp}
+\begin{tabular}{lll}
+\toprule
+特性 & HQP（层级 QP） & 加权 QP \\
+\midrule
+优先级保证 & 严格（零空间隔离） & 近似（权重差异） \\
+数学形式 & 逐级 QP + 零空间投影 & 单一 QP，多任务异权重 \\
+求解时间 & 较慢（多次 QP） & 快（单次 QP） \\
+调参难度 & 低（自然优先级） & 高（权重比需细调） \\
+代表框架 & TSID、Hierarchical WBC & OCS2 WBC、加权 WBC \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{承上启下。}
+零空间层级假设 $\mathbf q,\mathbf v$ 精确已知。真机上浮基状态须靠传感器融合估计，且臂运动会反过来扰乱估计。下一节给出复合系统状态估计的接口（主体在估计部）。
+
+% ════════════════════════════════════════════════════════════════
+\section{浮基 + 臂联合状态估计（接口）}
+\label{sec:umm-estimation}
+
+\paragraph{统一模型需要统一估计。}
+前几节假设广义坐标/速度精确可知，但浮基的位姿与速度必须由 IMU、关节编码器、足端力/接触等多源融合估计。复合系统的估计比纯四足更复杂：\emph{臂的运动会影响基座状态估计}。
+
+\paragraph{EKF 框架（薄）。}
+经典做法是扩展卡尔曼滤波，状态含基座位姿/速度、IMU 零偏与足端世界系位置（用于腿式里程计）：
+\begin{equation}
+  \mathbf x_{\text{est}}=(\mathbf p_b,\mathbf R_b,\mathbf v_b,\mathbf b_a,\mathbf b_\omega,\mathbf p_{c,1},\dots,\mathbf p_{c,4}).
+  \label{eq:umm-ekf-state}
+\end{equation}
+IMU 驱动预测、腿式里程计提供观测；其中姿态预测用 $\SO(3)$ 指数映射 $\hat{\mathbf R}_b^{-}=\hat{\mathbf R}_b\,\mathrm{Exp}((\boldsymbol\omega_m-\hat{\mathbf b}_\omega)\Delta t)$（见 \cref{ch:lie}）。臂关节角 $\mathbf q_a$ 由编码器\emph{直接测量}、无须估计，但臂的存在会改变观测模型——若末端抓住已知固定物，前向运动学便提供一个额外的\textbf{末端锚点观测}，约束基座位姿。
+
+\paragraph{臂运动对估计的耦合。}
+臂运动以三种方式复杂化估计：(i)~臂的快速摆动增大 IMU 测得的躯干加速度噪声；(ii)~臂改变系统质心，使「质心 $=$ 基座固定偏移」的假设失效；(iii)~臂参与的接触（如末端撑墙）改变接触模式集合，使腿式里程计的零速更新条件复杂化。
+
+\paragraph{不变滤波接口。}
+基于矩阵李群的\emph{不变扩展卡尔曼滤波}（InEKF）把基座位姿、速度与足端位置组织进扩展位姿群 $SE_{2+N_c}(3)$，其\emph{右不变误差}的线性化误差动力学与状态无关，从而比经典 EKF 一致性更好。复合系统把臂锚点观测也纳入同一群框架。\textbf{InEKF 的群结构、右不变误差、对数线性误差动力学等理论主体见估计部 \cref{ch:invariant-filter}}（亦见 \cref{ch:lie} 的 $SE_2(3)$ 一节），本节只点明「复合系统的估计接口」并指向之，不重铺群论。
+
+\paragraph{承上启下（第一部分小结）。}
+至此，第一部分把复合系统的\emph{建模}完整铺开：统一方程（\cref{eq:umm-core}）$\to$ 质量矩阵分块（耦合的代数）$\to$ ZMP/摩擦锥（稳定性裕度）$\to$ 质心动量（$6$ 维紧凑表示）$\to$ 角动量守恒（臂作反作用轮）$\to$ 零空间层级（冗余度分配）$\to$ 联合估计（状态接口）。这套模型工具是「全身动力学」的全貌。第二部分将把它整体塞进一个有限时域最优控制问题，得到「全身最优控制」——多模态 MPC。
+
+% ════════════════════════════════════════════════════════════════
+\section{从足式 MPC 到复合 MPC：代价扩展与权重分层}
+\label{sec:umm-cost}
+
+\paragraph{为什么不能把臂简单「加进去」。}
+模型预测控制（MPC）把控制问题写成一个滚动时域的最优控制问题（OCP），其稳定性、数值与 SQP/RTI 机制主体见 \cref{ch:mpc-advanced}，足式 centroidal MPC 的代价结构见 \cref{ch:reduced-models}。把臂并入足式 MPC 看似只是给代价加几项，实则牵一发动全身：臂的反作用扰动改变基座方程（\cref{eq:umm-base-eq}）、臂运动须与步态相位协调、决策变量维数翻倍、还凭空多出自碰撞的可能。逐一应对，正是「多模态」MPC 的内容。
+
+\paragraph{复合代价的分层。}
+在足式代价 $J_{\text{legged}}$（质心/基座/腿/接触力项）之上，复合 MPC 追加末端跟踪、力跟踪与臂正则项：
+\begin{equation}
+  J_{\text{compound}}=J_{\text{legged}}
+  +\big\|\mathrm{Log}(\mathbf T_{\text{ee}}^{-1}\mathbf T_{\text{ref}})^{\vee}\big\|_{\mathbf Q_{\text{ee}}}^2
+  +\|\mathbf f_{\text{ee}}-\mathbf f_{\text{ref}}\|_{\mathbf Q_f}^2
+  +\|\mathbf q_a-\mathbf q_a^{\text{ref}}\|_{\mathbf Q_a}^2.
+  \label{eq:umm-Jcompound}
+\end{equation}
+末端跟踪项的 $\mathrm{Log}(\cdot)$ 是 SE(3) 误差（\cref{sec:umm-se3}），力跟踪项见 \cref{sec:umm-force}，臂正则项把臂拉向舒适构型。
+
+\begin{insight}
+\textbf{核心设计原则：locomotion 代价权重应比 manipulation 高出一到两个数量级。}\;
+原因是一句残酷的事实——\emph{跌倒等于任务彻底失败}。若末端跟踪权重过高，MPC 会为了把夹爪对准目标而牺牲基座稳定，结果连人带臂一起栽倒，操作精度无从谈起。因此 $\mathbf Q_{\text{ee}}$ 通常远小于 $J_{\text{legged}}$ 中的稳定性权重；仅当机器人\emph{静止站立}、平衡裕度充裕时，才提高末端权重以求精确操作。更精细的做法是\emph{按步态相位调度}权重：支撑相多、裕度大时偏重操作，飞行相/单支撑时偏重平衡。
+\end{insight}
+
+\paragraph{承上启下。}
+\cref{eq:umm-Jcompound} 的末端跟踪项里藏着一个 $\mathrm{Log}$——它远不是「位置差 + 姿态差」那么简单。下一节深入 SE(3) 误差的几何，这是第二部分的第一座理论高地。
+
+% ════════════════════════════════════════════════════════════════
+\section{SE(3) 末端跟踪误差几何}
+\label{sec:umm-se3}
+
+\paragraph{欧拉角的三宗罪。}
+最朴素的末端误差是「位置差拼姿态差」，姿态用欧拉角之差。这有三个致命问题（\cref{tab:umm-euler}）：万向锁使 pitch $=\pm90^\circ$ 时丢一个自由度，MPC 在该姿态无解；表示不连续使绕轴转过 $360^\circ$ 时误差跳变，SQP 线性化得到错误梯度；欧拉角差非最短路径，末端走「冤枉路」。四元数避开了万向锁，却仍有\emph{双覆盖}（$\mathbf q$ 与 $-\mathbf q$ 表示同一旋转），在 MPC 中引起抖动。正解是用李群\emph{对数映射}。
+
+\begin{table}[H]\centering\small
+\caption{欧拉角姿态误差的三宗罪。}
+\label{tab:umm-euler}
+\begin{tabular}{lll}
+\toprule
+问题 & 表现 & 后果 \\
+\midrule
+万向锁 & pitch $=\pm90^\circ$ 时失一自由度 & MPC 在特定姿态无解 \\
+表示不连续 & 绕 $z$ 轴转过 $360^\circ$ 误差跳变 & SQP 线性化产生错误梯度 \\
+非最短路径 & 欧拉角差 $\neq$ 实际最短旋转 & 末端走冤枉路 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{左不变误差。}
+两位姿之间的误差定义为\emph{左不变误差}（left-invariant error）
+\begin{equation}
+  \mathbf T_{\text{err}}=\mathbf T_{\text{ee}}^{-1}\mathbf T_{\text{ref}}\in\SE(3),
+  \label{eq:umm-Terr}
+\end{equation}
+它表达在\emph{当前末端（body）坐标系}中，其微分轨迹无关——正是 MPC 与状态估计偏好的性质（与 \cref{ch:invariant-filter} 的右不变误差互为镜像）。经对数映射投到李代数 $\mathfrak{se}(3)\cong\mathbb R^6$：
+\begin{equation}
+  \boldsymbol\xi_{\text{err}}=\mathrm{Log}(\mathbf T_{\text{err}})^{\vee}=\mathrm{Log}(\mathbf T_{\text{ee}}^{-1}\mathbf T_{\text{ref}})^{\vee}\in\mathbb R^6.
+  \label{eq:umm-xierr}
+\end{equation}
+
+\begin{derivation}[SE(3) 对数映射]
+\emph{第一步（$\SO(3)$ 对数）.}\;对 $\mathbf R\in\SO(3)$，$\mathrm{Log}(\mathbf R)=\theta\,\hat{\mathbf a}$，其中
+\begin{equation}
+  \theta=\arccos\!\Big(\frac{\mathrm{tr}(\mathbf R)-1}{2}\Big),\qquad
+  \hat{\mathbf a}=\frac{\mathbf R-\mathbf R^\top}{2\sin\theta}.
+  \label{eq:umm-so3-log}
+\end{equation}
+$\theta\approx0$ 时用 Taylor 展开 $\mathrm{Log}(\mathbf R)\approx(\mathbf R-\mathbf R^\top)/2$；$\theta\approx\pi$（$\mathrm{tr}\,\mathbf R\approx-1$）时从 $\mathbf R$ 的列向量提轴（避免 $\sin\theta\to0$）。这两式即 \cref{ch:lie} 的罗德里格斯逆公式。
+
+\emph{第二步（$\SE(3)$ 对数）.}\;对 $\mathbf T=(\mathbf R,\mathbf p)$，$\mathrm{Log}(\mathbf T)=\begin{psmallmatrix}\hat{\boldsymbol\omega}&\mathbf v\\ \mathbf 0^\top&0\end{psmallmatrix}$，其中 $\hat{\boldsymbol\omega}=\mathrm{Log}(\mathbf R)$，平移分量经\emph{左雅可比逆}与旋转耦合：
+\begin{equation}
+  \mathbf v=\mathbf J^{-1}(\boldsymbol\omega)\,\mathbf p,\qquad
+  \mathbf J^{-1}(\boldsymbol\omega)=\mathbf I-\tfrac12\hat{\boldsymbol\omega}+\frac1{\theta^2}\Big(1-\frac{\theta\sin\theta}{2(1-\cos\theta)}\Big)\hat{\boldsymbol\omega}^2.
+  \label{eq:umm-se3-Jinv}
+\end{equation}
+\cref{eq:umm-se3-Jinv} 与 \cref{ch:lie} 给出的 Barfoot 标准式逐项恒等（二者代数等价，可数值验证）。
+\end{derivation}
+
+\begin{insight}
+\textbf{SE(3) 的对数不是「分别取旋转和平移的 log」。}\;
+平移分量 $\mathbf v$ 经 $\mathbf J^{-1}(\boldsymbol\omega)$ 与旋转\emph{耦合}（\cref{eq:umm-se3-Jinv}）。这意味着旋转误差很大时，平移误差的方向也随之改变——这正是把 $\boldsymbol\rho$ 与 $\mathbf t$ 区分开的来由（\cref{ch:lie} 的 $\boldsymbol\rho\neq\mathbf t$）。在 MPC 里，它保证误差度量是\emph{测地}的，末端沿群上最短路径收敛。
+\end{insight}
+
+\paragraph{末端跟踪代价与权重的阻抗解释。}
+最终代价是误差的加权二次型
+\begin{equation}
+  J_{\text{ee}}=\tfrac12\,\boldsymbol\xi_{\text{err}}^\top\mathbf W\,\boldsymbol\xi_{\text{err}},
+  \qquad \mathbf W=\mathrm{diag}(w_{\omega_x},w_{\omega_y},w_{\omega_z},w_{v_x},w_{v_y},w_{v_z}),
+  \label{eq:umm-Jee}
+\end{equation}
+对角权重按任务裁剪：抓取（精确对位）旋转/平移权重皆高，指向（pointing）只重旋转，到达（reaching）只重平移，擦拭则法向重、切向轻。权重 $\mathbf W$ 可解释为\emph{虚拟刚度}，由此自然过渡到笛卡尔阻抗（\cref{sec:umm-force}）。
+
+\begin{derivation}[代价对关节角的梯度（右扰动对齐）]
+SQP/iLQR 需要 $\partial J_{\text{ee}}/\partial\mathbf q$。由链式法则
+\begin{equation}
+  \frac{\partial J_{\text{ee}}}{\partial\mathbf q}=\boldsymbol\xi_{\text{err}}^\top\mathbf W\,\mathbf J_{\text{err}},
+  \qquad
+  \mathbf J_{\text{err}}=\frac{\partial\boldsymbol\xi_{\text{err}}}{\partial\mathbf q}
+  =-\,\mathbf J_{\log}(\mathbf T_{\text{err}}^{-1})\,\mathbf J_{\text{ee}}^{\text{LOCAL}}(\mathbf q),
+  \label{eq:umm-Jerr}
+\end{equation}
+其中 $\mathbf J_{\text{ee}}^{\text{LOCAL}}$ 是 \texttt{LOCAL}（body）帧下的末端雅可比，$\mathbf J_{\log}=\partial\,\mathrm{Log}(\mathbf T)/\partial\mathbf T$ 是对数映射的雅可比（即 \cref{ch:lie} 的 $\mathbf J_r$/$\mathbf J_l$ 的具体取用）。\textbf{记号对齐}：$\mathbf J_{\log}$ 须以 $\mathbf T_{\text{err}}^{-1}$ 为参数，负号源于 $\mathbf T_{\text{err}}$ 对 $\mathbf q$ 的扰动方向，伴随变换 $\mathrm{Ad}$ 已被该处的 $\mathbf J_{\log}$ 吸收，无需再单独乘出。本书以右扰动 $\mathbf R\,\mathrm{Exp}(\delta\boldsymbol\phi)$ 为主，\cref{eq:umm-Jerr} 中「左不变\emph{误差定义}」与「右扰动\emph{求导约定}」是两件事：前者决定误差乘在哪一侧，后者决定如何对 $\mathbf q$ 求微分；二者在 \cref{ch:lie} 的伴随框架下一致化，工业实现（Pinocchio CLIK）取的正是 \cref{eq:umm-Jerr} 这一形式。
+\end{derivation}
+
+\paragraph{承上启下。}
+SE(3) 误差把「末端去哪」写成了可微的代价。但臂在自己身边挥舞，还可能撞上自己的腿。下一节给出自碰撞约束的几何——第二部分的第二座理论高地。
+
+% ════════════════════════════════════════════════════════════════
+\section{自碰撞约束几何}
+\label{sec:umm-collision}
+
+\paragraph{为什么复合机器人必须考虑自碰撞。}
+纯四足的腿在正常步态中工作空间互不重叠，自碰撞罕见。加上臂后，手臂末端可能撞前腿、肘部可能撞身体、夹爪可能磕地面。仿真里这只是「不真实」，真机上\emph{一次自碰撞就可能损坏昂贵的关节模组}，必须作为硬性安全约束进入 MPC。
+
+\paragraph{约束的数学形式。}
+对每对可能碰撞的连杆 $(i,j)$，定义安全距离约束
+\begin{equation}
+  h_{\text{col}}(\mathbf q)=d\big(\mathrm{link}_i(\mathbf q),\mathrm{link}_j(\mathbf q)\big)-d_{\text{safe}}\ge0,
+  \label{eq:umm-hcol}
+\end{equation}
+$d(\cdot,\cdot)$ 是两几何体的最小距离，$d_{\text{safe}}$ 是安全裕度（如 $5\,\mathrm{cm}$）。
+
+\begin{derivation}[距离梯度的解析式]
+SQP 线性化需要 $\partial d/\partial\mathbf q$。设两几何体上的\emph{最近点}为 $\mathbf p_1$（在 $\mathrm{link}_i$ 上）、$\mathbf p_2$（在 $\mathrm{link}_j$ 上），最近点连线单位法向 $\hat{\mathbf n}=(\mathbf p_2-\mathbf p_1)/\|\mathbf p_2-\mathbf p_1\|$。距离对构型的梯度为
+\begin{equation}
+  \frac{\partial d}{\partial\mathbf q}=\hat{\mathbf n}^\top\big(\mathbf J_{p_2}(\mathbf q)-\mathbf J_{p_1}(\mathbf q)\big),
+  \label{eq:umm-ddq}
+\end{equation}
+其中 $\mathbf J_{p_k}\in\mathbb R^{3\times n_v}$ 是最近点 $\mathbf p_k$ 的\emph{位置雅可比}。后者由连杆 frame 雅可比平移到最近点：若最近点相对 frame 原点偏移 $\mathbf r$，则
+\begin{equation}
+  \mathbf J_{p}=\mathbf J_v-[\mathbf r]_\times\mathbf J_\omega,
+  \label{eq:umm-Jp}
+\end{equation}
+$\mathbf J_v,\mathbf J_\omega$ 分别是 frame 雅可比的线/角部分（点雅可比的几何来源见 \cref{ch:rigid_body}）。直觉上 \cref{eq:umm-ddq} 说：距离的变化率 $=$ 两最近点沿连线方向的相对速度，符合常识。
+\end{derivation}
+
+\paragraph{软约束与硬约束谱。}
+\cref{eq:umm-hcol} 在 MPC 中有四种实现，权衡列于 \cref{tab:umm-barrier}。硬约束严格安全但 QP 可能不可行；罚函数总有解但可能轻微违约；对数障碍光滑但 $d\to d_{\text{safe}}$ 时梯度爆炸。OCS2 默认用\emph{松弛障碍}（relaxed barrier），在约束临界处把对数延拓为二次，兼顾光滑与有界梯度：
+\begin{equation}
+  B_\mu(h)=\begin{cases}
+  -\mu\ln(h), & h>\delta,\\[3pt]
+  \dfrac{\mu}{2}\Big(\dfrac{(h-2\delta)^2}{\delta^2}-1\Big)-\mu\ln(\delta), & h\le\delta,
+  \end{cases}
+  \label{eq:umm-relaxed}
+\end{equation}
+$\delta$ 为光滑化参数，确保约束活跃时梯度不趋于无穷。该松弛障碍是标准形，归 Feller 与 Ebenbauer\cite{feller2017relaxed}。
+
+\begin{table}[H]\centering\small
+\caption{自碰撞约束的四种实现及其权衡。}
+\label{tab:umm-barrier}
+\begin{tabular}{lll}
+\toprule
+方法 & 形式 & 权衡 \\
+\midrule
+硬约束 & $h(\mathbf q)\ge0$ 作 QP 不等式 & 严格安全；QP 可能不可行 \\
+罚函数 & $\mu\max(0,d_{\text{safe}}-d)^2$ & 总有解；可能轻微违约 \\
+对数障碍 & $-\mu\ln(d-d_{\text{safe}})$ & 光滑；$d\to d_{\text{safe}}$ 梯度爆炸 \\
+松弛障碍 & \cref{eq:umm-relaxed} & 光滑且梯度有界；需调 $\mu,\delta$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{碰撞对选择的权衡。}
+$n$ 个连杆有 $\binom n2$ 对，Go2 + Z1 约 $20$ 连杆即 $190$ 对，每步 MPC 全算不现实。实践中只选\emph{关键对}（臂-腿、臂-身、夹爪-地面等约 $10$--$15$ 对）或用层次包围盒（AABB）先验过滤。这与规划部的安全走廊/SDF 及 CBF 安全滤波同源——后者从控制障碍函数视角给避碰提供前向不变性保证，可与本节的距离约束几何互引。
+
+\paragraph{承上启下。}
+代价（SE(3) 误差）与约束（自碰撞、摩擦锥）都备齐了。把它们装进滚动时域 OCP，立刻撞上维数墙：$24$--$37$ 维全身 MPC 能否实时求解？下一节是答案。
+
+% ════════════════════════════════════════════════════════════════
+\section{求解维度挑战与简化模型谱}
+\label{sec:umm-model-spectrum}
+
+\paragraph{QP 规模的立方代价。}
+把 OCP 离散为 $N$ 段，决策变量约 $N(n_x+n_u)$、约束约 $Nn_c$，每次 SQP 迭代求解一个稀疏 QP，代价约正比于 $\big(N(n_x+n_u)\big)^{2\sim3}$（数值机制见 \cref{ch:mpc-advanced}）。状态维 $n_x$ 从纯四足到复合系统的增长，因而以\emph{立方}放大求解时间——这是「不能把全动力学硬塞进 MPC」的定量根据。
+
+\paragraph{简化模型谱。}
+出路是降低 $n_x$。沿「精度$\leftrightarrow$实时性」存在一条简化模型谱（\cref{tab:umm-models}）：全动力学（$2n_v$）最准最慢；质心动力学 $+$ 全运动学（$6+n_v$）把动力学约束压到 $6$ 维、保留完整运动学，是当前复合系统全身 MPC 的主流；再激进可把臂固定、或退到单刚体模型（SRBD，$12$ 维）。
+
+\begin{table}[H]\centering\small
+\caption{复合系统 MPC 的简化模型谱。}
+\label{tab:umm-models}
+\begin{tabular}{lccc}
+\toprule
+模型 & 状态维 & 精度 & 实时性 \\
+\midrule
+全动力学 & $2n_v$（$\sim48$） & 最高 & 最差 \\
+质心动力学 $+$ 全运动学 & $6+n_v$（$\sim30$） & 高 & 好 \\
+质心 $+$ 固定臂 & $6+n_\ell$（$\sim18$） & 中 & 最好 \\
+单刚体 SRBD & 12 & 低 & 极好 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{质心动力学方程。}
+主流的质心动力学以质心动量 $\mathbf h_G$ 为状态，动力学约束就是 \cref{eq:umm-hGdot}，常写成
+\begin{equation}
+  \dot{\mathbf h}_G=\sum_{i=1}^{n_c}\begin{pmatrix}\boldsymbol\lambda_i\\ (\mathbf p_i-\mathbf c)\times\boldsymbol\lambda_i\end{pmatrix}+\begin{pmatrix}m_{\text{tot}}\mathbf g\\ \mathbf 0\end{pmatrix},
+  \qquad \dot{\mathbf q}=\mathbf u_{\text{joint}},
+  \label{eq:umm-centroidal-dyn}
+\end{equation}
+关节由速度输入 $\mathbf u_{\text{joint}}$ 一阶积分驱动（取本书 $[\text{线};\text{角}]$ 序，与 \cref{eq:umm-hGdot} 一致）。
+
+\paragraph{臂作慢变量的折中模型。}
+复合系统的实用折中：在质心动力学上把臂关节视为\emph{慢变量}——MPC 只规划臂的关节位置，不优化臂的完整动力学，但把臂运动对质心的\emph{附加扰动}显式加进 \cref{eq:umm-centroidal-dyn}：
+\begin{equation}
+  \dot{\mathbf h}_G\;{+}{=}\;\Delta\dot{\mathbf h}_G^{\text{arm}},
+  \qquad \Delta\dot{\mathbf h}_G^{\text{arm}}=\text{臂质心雅可比对动量率的贡献}.
+  \label{eq:umm-arm-disturb}
+\end{equation}
+这一项正是 \cref{eq:umm-hG-decomp} 中 $\mathbf A_{G,a}\dot{\mathbf q}_a$ 的时间导数在质心方程里的投影：它让 locomotion 层「感知」臂的存在，却不为臂付出额外的动力学优化维度。
+
+\paragraph{热启动与实时迭代。}
+进一步的提速来自\emph{热启动}：相邻两次 MPC 的解高度相似，把上一次的解平移一个时间步作为本次初值，
+\begin{equation}
+  \mathbf x_k^{\text{init}}(t)=\mathbf x_{k-1}^*(t+\Delta t),
+  \label{eq:umm-warmstart}
+\end{equation}
+配合实时迭代（RTI，每个采样周期只做一次 SQP 迭代）即可把全身 MPC 压进毫秒级。RTI/热启动的稳定性与收敛性主体见 \cref{ch:mpc-advanced}。
+
+\paragraph{承上启下。}
+简化模型让全身 MPC 可解，但「解一个大 MPC」与「解几个小问题」之间仍有架构抉择。下一节给出统一、分层、混合三种架构的理论权衡框架。
+
+% ════════════════════════════════════════════════════════════════
+\section{架构权衡：统一 vs 分层 vs 混合 MPC}
+\label{sec:umm-arch}
+
+\paragraph{三种架构。}
+复合机器人控制最核心的架构决策是：用一个大 MPC 统一优化所有自由度，还是拆成多个小问题级联？
+\begin{itemize}
+  \item \textbf{统一 MPC}（whole-body MPC）：全自由度单一 OCP，臂扰动\emph{被优化进}解里。臂的反作用被显式配平，动态抛接等强耦合任务\emph{可实现}；代价是维数爆炸。
+  \item \textbf{分层架构}：locomotion MPC（仅腿 + 基座 + 接触力）$\to$ 臂 IK/MPC（以基座轨迹为已知）$\to$ WBC 融合两层、解算关节力矩。模块化、可扩展、调试容易；代价是 locomotion 层\emph{忽略臂扰动}。
+  \item \textbf{混合架构}：locomotion MPC 内\emph{预测}臂扰动（把 \cref{eq:umm-arm-disturb} 的臂动量率作为已知外力加入），但\emph{不优化}臂轨迹。介于二者之间——感知臂却不为其付优化代价。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{统一 MPC 与分层架构的定性对比。}
+\label{tab:umm-arch}
+\begin{tabular}{lll}
+\toprule
+指标 & 统一 MPC & 分层架构 \\
+\midrule
+基座稳定性 & 最优（臂扰动被优化） & 次优（臂扰动被忽略） \\
+末端精度 & 最优（全局优化） & 次优（基座已固定） \\
+动态抛接等任务 & 可实现 & 很难（需动量耦合） \\
+实现复杂度 & 高（大型 OCP） & 低（模块化） \\
+调试难度 & 高（代价冲突难诊断） & 低（逐层排查） \\
+可扩展性（增 DOF） & 差（维数爆炸） & 好（加模块即可） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{决策因素框架。}
+选型不是非此即彼，而由若干因素共同决定：总自由度（$\le24$ 偏统一、$>30$ 偏分层）、任务类型（动态推/抛偏统一、静态抓/放偏分层）、是否需行走与操作\emph{同时}进行、可用算力、安全要求。把这些因素摆上桌、按场景权衡，比盲目追求「统一」或「模块化」更务实。
+
+\paragraph{两极的代表工作。}
+统一与分层各有学术与工程的代表（\cref{tab:umm-rep}）。\emph{模型侧统一}的标志是 Sleiman 等 2021 的工作\cite{sleiman2021unified}（原题《A Unified MPC Framework for Whole-Body Dynamic Locomotion and Manipulation》，在 ANYmal-C $+$ DynaArm 上以 centroidal $+$ SQP-RTI 实时求解），以及 Dadiotis 等 2023 在 CENTAURO（$37$ 自由度双臂四足）上的高冗余全身 MPC\cite{dadiotis2023wholebody}。
+
+\begin{insight}
+\textbf{「统一」不只有模型（MPC）一极，还有学习（RL）一极。}\;
+模型侧的统一是\emph{一个大 OCP 同时优化所有自由度}；学习侧的统一则是\emph{一个端到端策略同时输出全身动作}。Deep-WBC（Fu、Cheng、Pathak，CoRL 2022）的核心贡献正是\textbf{用强化学习学一个统一策略同时完成操作与运动}（其论文恰\emph{反对}把控制器解耦为 manipulation 与 locomotion），全程 RL、不含 MPC\cite{fu2022deep}。它与 Sleiman 2021 分立于「统一」的两极——一个用模型最优化、一个用端到端学习——共同对照出「分层」的反面。RL 一侧的算法主体见强化学习运控部，本章只在架构层面把它作为「统一」的学习侧代表引出。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{统一/分层架构的代表工作。}
+\label{tab:umm-rep}
+\begin{tabular}{lll}
+\toprule
+范式 & 侧 & 代表 \\
+\midrule
+统一 & 模型（MPC） & Sleiman 2021（ANYmal-C）、Dadiotis 2023（CENTAURO 37-DOF） \\
+统一 & 学习（RL） & Deep-WBC（端到端单一 RL 策略，反对解耦） \\
+分层 & 工程实现 & MIT Cheetah loco $+$ 臂 IK、Boston Dynamics Spot Arm \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{承上启下。}
+架构权衡解决了「在哪里优化」。还剩一类任务模态尚未纳入：当末端不仅要到位、还要施\emph{力}时，MPC 该如何处理？下一节给出力跟踪与阻抗模式的入口。
+
+% ════════════════════════════════════════════════════════════════
+\section{力跟踪与阻抗模式（接口）}
+\label{sec:umm-force}
+
+\paragraph{并非所有任务只需位置。}
+SE(3) 跟踪解决「到达指定位姿」，但抓取、推门、擦拭、装配、拧螺丝都需要\emph{力}控制：抓力过大会压碎物体，推门须持续施力，擦拭须维持法向压力，装配须低刚度以容错。复合 MPC 因此须支持位置/力/阻抗三种模态及其切换。
+
+\paragraph{力作代价项的困难。}
+最直接的做法是把力作为代价项 $J_f=\tfrac12\|\mathbf f_{\text{ee}}-\mathbf f_{\text{ref}}\|_{\mathbf Q_f}^2$，其中末端力经雅可比从臂关节力矩反推 $\mathbf f_{\text{ee}}=(\mathbf J_{\text{ee}}^\top)^{-1}\boldsymbol\tau_a$。困难在于：\emph{在质心动力学 MPC 中 $\boldsymbol\tau_a$ 不是决策变量}（输入只有关节速度），故力跟踪通常须由下层 WBC 实现，或额外引入臂动力学约束。这是 centroidal 简化模型「省了臂动力学维度」所付的代价。
+
+\paragraph{笛卡尔阻抗。}
+更实用的是笛卡尔阻抗——让末端表现为一个虚拟弹簧-阻尼器：
+\begin{equation}
+  \mathbf f_{\text{ee}}^{\text{des}}=\mathbf K_{\text{imp}}(\mathbf x_{\text{ref}}-\mathbf x_{\text{ee}})+\mathbf D_{\text{imp}}(\dot{\mathbf x}_{\text{ref}}-\dot{\mathbf x}_{\text{ee}}).
+  \label{eq:umm-impedance}
+\end{equation}
+这与 \cref{eq:umm-Jee} 的末端代价等价：把跟踪权重 $\mathbf W$ 解释为\emph{虚拟刚度} $\mathbf K_{\text{imp}}$。高刚度（$K\sim10^3$）给精确位置跟踪、刚性碰撞，适合空中运动与精确定位；低刚度（$K\sim10^1$）给柔顺、柔性碰撞，适合接触操作与人机交互。位置/力/阻抗三模态的切换即按接触状态调整 $\mathbf W$（位置模态高位置权重、力模态高力权重、阻抗模态用可变刚度）。
+
+\paragraph{WBC 中的力分配。}
+无论 MPC 层选何种模态，下层 WBC 都把期望末端力分配到关节力矩：
+\begin{equation}
+  \boldsymbol\tau=\mathbf J_{\text{ee}}^\top\mathbf f_{\text{ee}}^{\text{des}}+\mathbf N^\top\boldsymbol\tau_{\text{null}},
+  \label{eq:umm-force-alloc}
+\end{equation}
+主任务力经 $\mathbf J_{\text{ee}}^\top$ 实现，零空间力矩 $\mathbf N^\top\boldsymbol\tau_{\text{null}}$ 在不干扰末端力的前提下完成次级目标（关节居中等）。操作空间惯性 $\boldsymbol\Lambda$、阻抗/导纳/无源性的完整理论主体见 \cref{ch:operational-space}，力位混合与笛卡尔阻抗/WBC 主体见 \cref{ch:force-wbc}；本节给出的是「复合/MPC 框架下的力跟踪入口」，与之互引去重。
+
+\paragraph{承上启下。}
+单臂之后，自然要问：双臂、乃至多机协作，能否纳入同一框架？下一节给出统一扩展的桥接。
+
+% ════════════════════════════════════════════════════════════════
+\section{双末端/双臂统一扩展（桥接）}
+\label{sec:umm-dualarm}
+
+\paragraph{多末端的统一处理。}
+统一方程 \cref{eq:umm-core} 的末端项天然支持多末端——对每个末端 $k$ 各取一项求和：
+\begin{equation}
+  \sum_k\mathbf J_{\text{ee},k}^\top\mathbf f_{\text{ee},k},
+  \label{eq:umm-multiee}
+\end{equation}
+CMM 的臂列块也随之分裂为左右两块 $\mathbf A_{G,aL},\mathbf A_{G,aR}$。双臂可同优先级（平等竞争零空间）或一主一从（主臂占先、从臂在其零空间内配合），由 \cref{sec:umm-nullspace} 的层级栈直接刻画。
+
+\begin{insight}
+\textbf{单机双臂是多机协作的「零延迟、强耦合」退化。}\;
+双臂协同搬运一个刚体，与两台机器人协同搬运，在数学上同构：都用\emph{抓取矩阵} $\mathbf G$ 把各末端 wrench 映到物体合力、把多余维度分解为\emph{内力}（互相挤压而不推动物体）。区别只在于双臂共享同一基座与同一控制器，是零通信延迟、强动力学耦合的「二机」。因此双臂内力分解、虚拟耦合等技巧，与多机分布式力控同源。
+\end{insight}
+
+\paragraph{去重与互引。}
+抓取矩阵 $\mathbf G$、内力分解、多机协同的完整理论主体见规划部的分布式 MPC/协同力控章，本节只给出「单机双臂 $=$ 多机退化」的一段桥接，凡用到处指向之，不重证。
+
+\paragraph{承上启下。}
+所有工具与扩展已就位。最后一节把全章脉络收束成一张全景图，并把 MPC 侧接口对接到学习/前沿一侧。
+
+% ════════════════════════════════════════════════════════════════
+\section{本章脉络与展望}
+\label{sec:umm-outlook}
+
+\paragraph{全章脉络。}
+本章把复合系统的「全身动力学建模」与「全身最优控制」编织成一条主线，全景见 \cref{fig:umm-roadmap}：统一动力学方程是主梁，质量矩阵分块 / CMM / 角动量守恒揭示其结构，零空间层级分配冗余度，SE(3) 误差与自碰撞约束几何提供 MPC 的代价与约束，简化模型谱解决可解性，架构权衡决定在哪里优化，力跟踪/双臂把模态与末端推广开去。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  node distance=5mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  mpc/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  ln/.style={->, thick, gray!55!black}]
+\node[blk] (uni) {统一动力学方程\\ $\mathbf M\dot{\mathbf v}+\mathbf h=\mathbf S^\top\boldsymbol\tau+\sum\mathbf J_c^\top\boldsymbol\lambda+\mathbf J_{\text{ee}}^\top\mathbf f_{\text{ee}}$};
+\node[blk, below left=8mm and -10mm of uni] (mblk) {M 分块\\ $\mathbf M_{ba}$ 耦合};
+\node[blk, below=8mm of uni] (cmm) {质心动量 CMM\\ $\mathbf h_G=\mathbf A_G\mathbf v$};
+\node[blk, below right=8mm and -10mm of uni] (null) {零空间层级\\ $\mathbf N_1=\mathbf I-\mathbf J_1^\dagger\mathbf J_1$};
+\node[mpc, below=8mm of cmm] (cost) {多模态 MPC 代价/约束\\ SE(3) 误差 · 自碰撞 · 力};
+\node[mpc, below left=8mm and -6mm of cost] (model) {简化模型谱\\ centroidal $\to$ SRBD};
+\node[mpc, below right=8mm and -6mm of cost] (arch) {架构权衡\\ 统一 / 分层 / 混合};
+\draw[ln] (uni)--(mblk); \draw[ln] (uni)--(cmm); \draw[ln] (uni)--(null);
+\draw[ln] (mblk.south) |- (cost.west);
+\draw[ln] (cmm)--(cost);
+\draw[ln] (null.south) |- (cost.east);
+\draw[ln] (cost)--(model); \draw[ln] (cost)--(arch);
+\end{tikzpicture}
+\caption{复合系统统一动力学与多模态 MPC 的全章脉络：统一方程为主梁，结构分析（上）支撑最优控制（下）。}
+\label{fig:umm-roadmap}
+\end{figure}
+
+\paragraph{学习/前沿侧的桥接。}
+模型侧 MPC 之外，近年「学习上层 $+$ 模型/MPC 安全层」的混合范式快速发展，其边界划分大体是：\emph{学习}负责高层操作策略与泛化，\emph{模型/MPC}负责底层安全与全身协调。三例可作定性桥接：
+\begin{itemize}
+  \item \textbf{UMI-on-Legs}（Ha 等 2024）：上层 diffusion 操作策略在 task frame 输出末端轨迹，下层是一个\emph{以操作为中心}（manipulation-centric）的全身控制器（RL 训练）跟踪该轨迹——接口是末端轨迹，下层并非单纯「locomotion」，而是一个跟踪末端的全身控制器\cite{ha2024umi}。
+  \item \textbf{RAMBO}（2025）：\emph{模型基 QP 求前馈反应力} $+$ \emph{RL 策略提供反馈修正项}，二者\emph{同时叠加}（而非按任务阶段切换），在跟踪精度与柔顺性之间折中\cite{rambo2025}。
+  \item \textbf{Deep-WBC}（CoRL 2022）：端到端单一 RL 策略统一 loco-manipulation（\cref{sec:umm-arch}），代表纯学习侧统一的一极\cite{fu2022deep}。
+\end{itemize}
+这些工作的\emph{学习算法}主体见强化学习运控部，\emph{扩散/大模型}规划主体见规划部；本章只规范「MPC/模型侧」对外提供的接口（末端轨迹、前馈反应力、安全约束），与那些章互补——与全书「传统 vs 学习」的互补主线一致。
+
+\paragraph{对外的钩子。}
+本章把 \cref{ch:spatial-dynamics}（$O(n)$ 动力学）、\cref{ch:reduced-models}（浮基简化/LIPM/CMM 基础）、\cref{ch:contact-mechanics}（摩擦锥）、\cref{ch:operational-space}（操作空间/阻抗）、\cref{ch:force-wbc}（WBC/TSID）、\cref{ch:mpc-advanced}（MPC 数值）、\cref{ch:lie}（SE(3) 误差几何）、\cref{ch:constrained-dynamics}（解析微分）、\cref{ch:invariant-filter}（不变滤波）九条线索，在「四足/人形 $+$ 臂」复合系统上完成总装。它既是控制部「浮动基座/接触/力控」子部的收口，也是通往规划部（多机协同、安全走廊、扩散式规划）与强化学习运控部的转接站。
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+本章沿「全身动力学建模 $\to$ 全身最优控制」一条主线，把浮动基座复合系统（四足/人形 $+$ 臂）的统一动力学与多模态 MPC 编织成一个整体。核心结论汇于 \cref{tab:umm-summary}。
+
+\begin{table}[H]\centering\small
+\caption{本章核心公式速查。}
+\label{tab:umm-summary}
+\begin{tabular}{lll}
+\toprule
+对象 & 核心式 & 出处 \\
+\midrule
+统一动力学方程 & $\mathbf M\dot{\mathbf v}+\mathbf h=\mathbf S^\top\boldsymbol\tau+\sum\mathbf J_{c,i}^\top\boldsymbol\lambda_i+\mathbf J_{\text{ee}}^\top\mathbf f_{\text{ee}}$ & \cref{eq:umm-core} \\
+欠驱动选择矩阵 & $\mathbf S=[\mathbf 0_{n_a'\times6}\ \mathbf I_{n_a'}]$（基座行无 $\boldsymbol\tau$） & \cref{eq:umm-S} \\
+基座-臂耦合 & $\mathbf M_{ba}\ddot{\mathbf q}_a$ $=$ 臂惯性反力矩 & \cref{eq:umm-base-eq} \\
+含臂力 ZMP & $x_{\text{ZMP}}=x_{\text{CoM}}-\frac z g\ddot x_{\text{CoM}}+\frac{\tau_{\text{arm},y}}{m g}$ & \cref{eq:umm-zmp-arm} \\
+摩擦锥收紧 & $\mu_{\text{eff}}=\mu-|f_{\text{ee},x}|/\sum_i\lambda_{i,z}$ & \cref{eq:umm-mueff} \\
+质心动量矩阵 & $\mathbf h_G=\mathbf A_G\mathbf v$，$\mathbf A_G=\sum_i{}^G\mathbf X_i^*\mathcal I_i{}^i\mathbf J_i$ & \cref{eq:umm-cmm-def,eq:umm-Ag} \\
+角动量守恒 & $\dot{\mathbf k}_G=\mathbf 0\Rightarrow\mathbf k_G=\mathbf A_G^{\text{ang}}\mathbf v=$ const & \cref{eq:umm-kG-cons} \\
+零空间级联 & $\dot{\mathbf q}=\mathbf J_1^\dagger\dot{\mathbf x}_1+\mathbf N_1(\cdots)$ & \cref{eq:umm-cascade} \\
+SE(3) 误差 & $\boldsymbol\xi_{\text{err}}=\mathrm{Log}(\mathbf T_{\text{ee}}^{-1}\mathbf T_{\text{ref}})^{\vee}$ & \cref{eq:umm-xierr} \\
+距离梯度 & $\partial d/\partial\mathbf q=\hat{\mathbf n}^\top(\mathbf J_{p_2}-\mathbf J_{p_1})$ & \cref{eq:umm-ddq} \\
+松弛障碍 & 对数（$h>\delta$）/ 二次延拓（$h\le\delta$） & \cref{eq:umm-relaxed} \\
+质心动力学 & $\dot{\mathbf h}_G=\sum[\boldsymbol\lambda_i;(\mathbf p_i-\mathbf c)\times\boldsymbol\lambda_i]+[m\mathbf g;\mathbf 0]$ & \cref{eq:umm-centroidal-dyn} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{常见误解辨析}
+\addcontentsline{toc}{section}{常见误解辨析}
+
+\begin{itemize}
+  \item \textbf{「臂只操作外部物体，对基座是小扰动」}：错。臂经 $\mathbf M_{ba}\ddot{\mathbf q}_a$（\cref{eq:umm-base-eq}）把惯性反力矩注入基座方程，量级随伸展/负载显著增大；它同时也在「操作」自己的基座，分开设计即源于忽略此项。
+  \item \textbf{「基座六个自由度可当普通可控关节」}：错。$\mathbf S$ 前 $6$ 列为零（\cref{eq:umm-S}），基座行没有 $\boldsymbol\tau$ 贡献，只能由接触力 $+$ 末端力 $+$ 惯性耦合配平。
+  \item \textbf{「操作力是干扰，事后补偿即可」}：错。推门/搬运时 $\mathbf f_{\text{ee}}$ 是任务成功的必要条件、量级可比自重，应作\emph{约束}进入规划，而非事后抑制。
+  \item \textbf{「质心动量序角在前还是线在前无所谓」}：影响下标。本书取 $[\text{线};\text{角}]$（\cref{tab:umm-perm}）与 $\boldsymbol\xi=[\boldsymbol\rho;\boldsymbol\phi]$、Pinocchio 一致，与 Featherstone $[\text{角};\text{线}]$ 差一个置换 $\mathbf P$；切 $\mathbf A_G^{\text{ang}}$ 时须按所用约定取行。
+  \item \textbf{「CMM 的 $O(N)$ 算法与 $\mathbf M$ 关系都出自 Orin-Goswami 2008」}：错。2008 仅立\emph{概念}\cite{orin2008centroidal}；$O(N)$ 算法与 $\mathbf A_G={}^G\mathbf X_0^*\mathbf M_{:6,:}$ 出自 Orin-Goswami-Lee 2013\cite{orin2013centroidal}。
+  \item \textbf{「末端跟踪 $=$ 位置差拼欧拉角差」}：错。欧拉角有万向锁/不连续/非最短路径三宗罪（\cref{tab:umm-euler}），四元数有双覆盖；正解是 SE(3) 对数误差，且平移经左雅可比逆与旋转耦合（\cref{eq:umm-se3-Jinv}）。
+  \item \textbf{「locomotion 与 manipulation 权重该差不多」}：错。跌倒 $=$ 任务失败，locomotion 权重通常高一到两个数量级，仅静止站立时才提高末端权重。
+  \item \textbf{「Deep-WBC 是 RL 运动 $+$ MPC 操作」}：错。它是\emph{端到端单一 RL 策略}统一 loco-manipulation，明确反对解耦、全程无 MPC\cite{fu2022deep}。
+\end{itemize}
+
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+
+复合系统统一动力学的计算地基（空间向量、RNEA/CRBA/ABA/CCRBA）见 Featherstone \emph{Rigid Body Dynamics Algorithms}\cite{featherstone2008rigid} 与高性能实现 Pinocchio\cite{carpentier2019pinocchio}。质心动量矩阵的概念、结构与性质见 Orin-Goswami IROS 2008\cite{orin2008centroidal}，其与质量矩阵的关系及 $O(N)$ 算法见 Orin-Goswami-Lee 2013\cite{orin2013centroidal}。浮基全身控制的里程碑：操作空间公式 Khatib 1987\cite{khatib1987unified}、层级零空间 WBC Sentis-Khatib 2005\cite{sentis2005synthesis}、浮基逆动力学正交分解 Mistry 等 2010\cite{mistry2010inverse} 与外约束统一视角 Righetti 等 2011\cite{righetti2011inverse}、最优接触力分配 Righetti 等 2013\cite{righetti2013optimal}。角动量与抗推恢复见捕获点 Pratt 等 2006\cite{pratt2006capture} 与在线质心角动量参考 Schuller 等 2021\cite{schuller2021online}。SE(3) 误差几何与左右雅可比见 Barfoot \emph{State Estimation for Robotics}\cite{barfoot2024state}；松弛障碍函数 MPC 见 Feller-Ebenbauer 2017\cite{feller2017relaxed}；腿式一致 EKF 见 Bloesch 等\cite{bloesch2013state}。复合系统全身 MPC 的代表：统一 MPC 框架 Sleiman 等 2021\cite{sleiman2021unified}、高冗余 CENTAURO 37-DOF 全身 MPC Dadiotis 等 2023\cite{dadiotis2023wholebody}。学习/混合前沿：端到端统一 RL 策略 Deep-WBC（Fu 等 2022\cite{fu2022deep}）、操作中心全身控制 UMI-on-Legs（Ha 等 2024\cite{ha2024umi}）、模型基 QP 前馈 $+$ RL 反馈混合 RAMBO 2025\cite{rambo2025}。最优控制框架 OCS2 见\cite{ocs2library}。
+
+\section*{本章与后续章节的关系}
+\addcontentsline{toc}{section}{本章与后续章节的关系}
+
+本章是控制部「浮动基座/接触/力控」子部的收口，向上承接 \cref{ch:spatial-dynamics,ch:geometric-mechanics,ch:constrained-dynamics}（动力学计算与变分地基）与 \cref{ch:reduced-models,ch:contact-mechanics,ch:operational-space,ch:force-wbc}（腿足简化/接触/操作空间/WBC），并以 \cref{ch:lie}（SE(3) 误差几何）、\cref{ch:mpc-advanced}（MPC 数值）为横向支柱；向下转接估计部 \cref{ch:invariant-filter}（复合系统不变滤波）、规划部（多机协同力控、安全走廊/CBF、扩散式规划）与强化学习运控部（统一/混合策略的学习侧）。把本章作为「全身控制总装」节点：凡需把腿、臂、接触、操作力放进\emph{同一个方程与同一个优化}处，皆回到 \cref{eq:umm-core} 与 \cref{eq:umm-Jcompound}。

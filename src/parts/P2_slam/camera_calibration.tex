@@ -1,0 +1,1368 @@
+\chapter{相机标定}
+\label{ch:calib}
+
+% ════════════════════════════════════════════════════════════════
+%  本章：吸收 张正友 A Flexible New Technique for Camera Calibration
+%  (MSR-TR-98-71 / TPAMI 2000) 全推导 + Brown-Conrady 畸变模型
+%  + OpenCV calibrateCamera 工具实践 + 标定板/采图/陷阱。
+%  方向 = 通用标定教学（非研究综述）；研究向 Kalibr/相机-IMU/多传感器不在本章。
+%  自包含独立记录：每步推导/每条定理+证明/每张表/每段代码全录，读者无需翻原书。
+%  教学层遵循 v5.0 算法工程教学规范（动机→反面→历史→理论→陷阱→练习）。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的小结与速查表；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 相机内参矩阵 $\mathbf{K}$ 有哪几个元素？它们各自的物理含义是什么？为什么投影方程里要带一个“任意尺度因子”$s$？
+  \item 已知一个平面图案（如棋盘格）和它在一幅图里的成像，“单应矩阵 $\mathbf{H}$”把什么映到什么？它有几个自由度？
+  \item 旋转矩阵 $\mathbf{R}$ 的两列 $\mathbf{r}_1,\mathbf{r}_2$ 满足什么关系？这种关系能不能反过来约束内参？
+  \item 给一堆 $2$ 维–$3$ 维点对，怎样用线性代数（无迭代）解出一个齐次方程组 $\mathbf{V}\mathbf{b}=\mathbf{0}$？解在哪儿？
+  \item 镜头“桶形畸变”和“枕形畸变”有什么区别？为什么手机拍出来的直线会变弯？
+  \item 用 OpenCV 标定完一个相机，它返回一个数字 \texttt{ret}。这个数字是什么？它越小是不是就一定越好？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{推导}平面图案与其像之间的单应 $\mathbf{H}=\lambda\mathbf{K}[\mathbf{r}_1\,\mathbf{r}_2\,\mathbf{t}]$，并说明 $Z=0$ 如何把 $3\times4$ 投影退化为 $3\times3$ 单应；
+  \item \textbf{独立完成}由旋转两列正交归一性导出对内参的两个约束 $\mathbf{h}_1^\top\boldsymbol{\omega}\mathbf{h}_2=0$、$\mathbf{h}_1^\top\boldsymbol{\omega}\mathbf{h}_1=\mathbf{h}_2^\top\boldsymbol{\omega}\mathbf{h}_2$，并用绝对二次曲线（圆环点）给出第二种几何证明；
+  \item \textbf{实现}张正友闭式解：把约束写成 $\mathbf{V}\mathbf{b}=\mathbf{0}$（$\boldsymbol{\omega}=\mathbf{K}^{-\top}\mathbf{K}^{-1}$ 的 $6$ 维向量），用 SVD 求 $\mathbf{b}$，再用闭式公式提取 $\mathbf{K}$ 全部内参与每幅图外参；
+  \item \textbf{建模}径向/切向（Brown--Conrady）镜头畸变，写出 OpenCV 的 $5$/$8$/$12$/$14$ 参数畸变模型，并用线性最小二乘给出 $k_1,k_2$ 初值；
+  \item \textbf{构造}含畸变的完整最大似然目标，并说明它为何要用 Levenberg--Marquardt、初值从何而来、与本书非线性优化章的关系；
+  \item \textbf{操作} OpenCV 工具链：从 \texttt{findChessboardCorners} 到 \texttt{calibrateCamera} 到去畸变到重投影误差评估，并解读返回的 RMS；
+  \item \textbf{判别}退化构型（平面平行/纯平移）并给出规避办法；
+  \item \textbf{选型}标定板（棋盘/圆点/ChArUco）、设计采图“舞步”、识别低 RMS 误导等工程陷阱。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{用一张廉价平面图案、几张随手拍的照片，反解出相机内参与畸变}”的主线。它把前面所有抽象的投影/优化工具落地成一个能真正运行的工程流程。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 6mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  eng/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (pin) {针孔模型\\ $s\tilde{\mathbf{m}}=\mathbf{K}[\mathbf{R}\,\mathbf{t}]\tilde{\mathbf{M}}$};
+\node[blk, right=of pin] (hom) {单应\\ $\mathbf{H}=\lambda\mathbf{K}[\mathbf{r}_1\,\mathbf{r}_2\,\mathbf{t}]$};
+\node[blk, right=of hom] (con) {内参两约束\\ IAC $\boldsymbol{\omega}$};
+\node[grp, below=8mm of pin] (clo) {闭式解\\ $\mathbf{V}\mathbf{b}=\mathbf{0}\to\mathbf{K}$};
+\node[grp, right=of clo] (ext) {恢复外参\\ + 投影回 $\SO(3)$};
+\node[grp, right=of ext] (dist) {畸变\\ $k_1,k_2$ 初值};
+\node[blk, below=8mm of clo, fill=second!8, draw=second!60!black] (mle) {完整 MLE\\ LM 精化};
+\node[eng, right=of mle] (cv) {OpenCV\\ 工具实践};
+\node[eng, right=of cv] (prac) {板型 / 采图\\ / 陷阱};
+\draw[ln] (pin)--(hom); \draw[ln] (hom)--(con);
+\draw[ln] (con.south) -- ++(0,-4.5mm) -| (clo.north);
+\draw[ln] (clo)--(ext); \draw[ln] (ext)--(dist);
+\draw[ln] (dist.south) -- ++(0,-4.5mm) -| (mle.north);
+\draw[ln] (mle)--(cv); \draw[ln] (cv)--(prac);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}（骨干 only 速通，约 $3$ 小时）：\cref{sec:calib-why}（为什么需要标定）$\to$\cref{sec:calib-homography}（单应与两约束）$\to$\cref{sec:calib-closed}（闭式解）$\to$\cref{sec:calib-distortion}（畸变）$\to$\cref{sec:calib-opencv}（OpenCV 实践）。这五节构成可独立复现的完整标定链。\cref{sec:calib-iac}（绝对二次曲线几何证明，含 \cref{sec:calib-vanishing} 的消失点第三视角）、\cref{sec:calib-uncertainty}（参数不确定度）、\cref{sec:calib-degenerate}（退化构型）、\cref{sec:calib-numerical}（数值例与敏感性）是加深理解的进阶内容，可在主线读通后回看。\cref{sec:calib-boards}（标定板）与\cref{sec:calib-capture}（采图与陷阱）是工程落地必读，但不含新推导，可随时查阅。
+
+\subsection*{前置知识桥接}
+\cref{ch:camera} 已经给出了\emph{正向}的相机几何：针孔投影方程 $s\tilde{\mathbf{m}}=\mathbf{K}[\mathbf{R}\,\mathbf{t}]\tilde{\mathbf{M}}$（\cref{eq:pinhole}）、内参矩阵 $\mathbf{K}$ 的定义（\cref{def:K,eq:K}）、以及镜头畸变模型（\cref{sec:cam-distortion,eq:distortion}）。在那一章，内参 $\mathbf{K}=\big[\begin{smallmatrix}f_x&0&c_x\\0&f_y&c_y\\0&0&1\end{smallmatrix}\big]$ 与畸变系数都被\emph{当作已知}，我们用它们把 $3$ 维点投影到像素。本章解决的是上一章\emph{回避}的问题：这些数从哪里来？——\textbf{从图像里反解出来}。换言之，从“已知相机怎么成像”进到“\emph{怎么测出这台相机}”。
+
+回顾 \cref{ch:lie}：旋转 $\mathbf{R}\in\SO(3)$ 不是向量空间，它的两列 $\mathbf{r}_1,\mathbf{r}_2$ 满足\emph{正交归一}（$\mathbf{r}_1^\top\mathbf{r}_2=0$，$\|\mathbf{r}_1\|=\|\mathbf{r}_2\|=1$）——本章的全部内参约束，正是从这个简单事实“挤”出来的。回顾 \cref{ch:nlopt}：非线性最小二乘的高斯--牛顿/LM 框架与“代数解作初值、迭代精化”的范式——本章的标定后端就是它的一个具体而完整的应用实例。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 在 \cref{ch:vo}（视觉里程计）里，你会写重投影误差 $\|\mathbf{z}-\pi(\mathbf{K},\mathbf{T},\mathbf{p})\|$，但若 $\mathbf{K}$ 与畸变是错的，所有几何都\emph{系统性偏移}——三角化的深度、估计的轨迹都会带尺度与弯曲误差，且无论后端优化多努力都无法纠正（错误已编码进观测）；
+  \item 拿到一台新相机却不会标定，你只能照抄出厂参数或乱猜，无法判断“重投影误差 $0.8$ 像素”到底算好还是糟，更不会区分“模型欠拟合”与“过拟合”。
+\end{itemize}
+
+\begin{table}[ht]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导、数值例与代码） & 5--7 小时 & 首次系统学标定、要自己实现或调通标定 \\
+速读（跳过几何证明与敏感性分析） & 2--3 小时 & 会用 OpenCV、想搞懂闭式解原理 \\
+速查（只看小结的符号表与流程速查） & 15 分钟 & 现场标相机时回来查公式与陷阱 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+内参矩阵本书统一记 $\mathbf{K}$（与 OpenCV、\cref{ch:camera} 一致）；其元素 $f_x,f_y$（$u,v$ 轴焦距，像素单位）、$(c_x,c_y)$（主点）。
+张正友原文\cite{zhang2000calibration}用 $\mathbf{A}$ 记内参、$(\alpha,\beta,\gamma,u_0,v_0)$ 记元素，其中 $\gamma$ 为斜交（skew）参数——对应关系 $\alpha=f_x,\ \beta=f_y,\ u_0=c_x,\ v_0=c_y$，$\gamma=$ skew（本书与 OpenCV 标定一般设 $\gamma=0$）。本章正文叙述统一用 $\mathbf{K}$ 与 $f_x,f_y,c_x,c_y$，但在闭式解的逐元素公式里\emph{保留张正友的 $\alpha,\beta,\gamma,u_0,v_0$}（公式更紧凑、与原文逐字可核），并在首次出现处对照。
+旋转 $\mathbf{R}\in\SO(3)$，列向量 $\mathbf{r}_1,\mathbf{r}_2,\mathbf{r}_3$；外参 $(\mathbf{R},\mathbf{t})$ 把\textbf{世界系}变到\textbf{相机系}（$\mathbf{X}_c=\mathbf{R}\mathbf{X}_w+\mathbf{t}$），与本书投影约定一致。
+$2$ 维像点 $\mathbf{m}=[u,v]^\top$，齐次 $\tilde{\mathbf{m}}=[u,v,1]^\top$；$3$ 维物点 $\mathbf{M}=[X,Y,Z]^\top$，齐次 $\tilde{\mathbf{M}}$。
+绝对二次曲线的像（IAC）本书记 $\boldsymbol{\omega}=\mathbf{K}^{-\top}\mathbf{K}^{-1}$（多视几何标准记号），张正友记 $\mathbf{B}=\mathbf{A}^{-\top}\mathbf{A}^{-1}$——\emph{同一对象}。
+畸变方向：本章所有畸变公式都是\textbf{正向}（无畸变 $\to$ 有畸变，ideal $\to$ distorted）；“去畸变（undistort）”是其逆，无闭式解。
+\textbf{两个尺度别混}：投影深度 $s$（逐点）与单应整体尺度 $\lambda$（$\mathbf{H}=\lambda\mathbf{K}[\mathbf{r}_1\,\mathbf{r}_2\,\mathbf{t}]$）是两个不同的标量。
+本章标定后端是经典“轴角（Rodrigues）参数化 $+$ LM”，不显式区分左/右扰动；若要严格化为本书右扰动 $\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\phi})$ 雅可比，做法见 \cref{sec:calib-mle} 的注。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么需要相机标定}
+\label{sec:calib-why}
+
+\paragraph{动机：度量信息要从像素里量出来。}
+\cref{ch:camera} 告诉我们相机怎么把 $3$ 维世界压成 $2$ 维像素，但那条投影链上的内参 $\mathbf{K}$ 与畸变系数一直被当作“天上掉下来的已知量”。现实是：你买来一台相机或一块镜头，厂商标称的“焦距 $6\,\mathrm{mm}$”是\emph{物理焦距}，不是投影方程里以\emph{像素}为单位的 $f_x,f_y$；主点 $(c_x,c_y)$ 几乎从不严格在图像中心；镜头总有畸变。要从图像里提取任何\textbf{度量信息}（深度、尺寸、角度、位姿），必须先知道这台相机的 $\mathbf{K}$ 与畸变。这就是\emph{相机标定（camera calibration）}：用已知几何的标定物在图像上的成像，反解相机参数\cite{zhang2000calibration}。
+
+\paragraph{反面：不标定（或标错）会怎样。}
+若把 $f_x$ 估大 $10\%$，重建的整个场景就会被等比例拉伸，单目尺度本就不可观，再叠加错误内参，轨迹与地图全盘偏。若忽略畸变，广角镜头边缘的直线在图像里是弯的，特征匹配、直线检测、平面拟合全部带系统误差，而这种误差\emph{不随帧数增加而平均消失}——它是确定性的偏置（bias），不是随机噪声。后端优化只能压随机噪声，压不动模型偏置。因此“先标定、标准、再上算法”是计算机视觉的铁律。
+
+\paragraph{历史：三类标定技术的演进。}
+标定方法大致分两类\cite{zhang2000calibration}：
+
+\begin{enumerate}
+  \item \textbf{摄影测量标定（photogrammetric calibration）}：观测一个几何\emph{已知且高精度}的 $3$ 维标定物——通常是两三个相互正交的平面（如 INRIA 的双正交平面装置），或一个做\emph{精确已知平移}的平面（Tsai 法\cite{tsai1987versatile}）。优点是可非常精确；缺点是需要昂贵装置与繁琐布置。
+  \item \textbf{自标定（self-calibration）}：\emph{不用任何标定物}，仅靠相机在静态刚性场景中运动来提供约束——一次相机位移、仅用图像信息就能给出对内参的两个约束\cite{luong1997selfcalib}；若内参固定，三幅图间的对应足以恢复内外参（重建到一个相似变换以内）。优点是极灵活；缺点是不成熟、参数太多、难以总能得到可靠结果。
+\end{enumerate}
+此外还有用正交方向\emph{消失点}的方法、\emph{纯旋转}标定等。
+
+\paragraph{核心思想：张正友法的定位。}
+张正友 $1998$ 年提出的平面标定法\cite{zhang2000calibration}\emph{介于两者之间}：用 $2$ 维度量信息（平面图案上点的已知度量），而非 $3$ 维信息或纯隐式信息。它只要求相机从\emph{几个（至少两个）不同朝向}观测一个\emph{平面图案}；图案可激光打印后贴到任何“还算平”的平面（硬书皮即可）；相机或图案任一可手持移动，\emph{运动无需已知}；建模径向畸变；整个流程 $=$ \textbf{闭式解 $+$ 基于最大似然的非线性精化}。它既比摄影测量法廉价灵活，又比自标定鲁棒可靠——这正是它成为 OpenCV、MATLAB、几乎所有标定工具事实标准的原因。Sturm \& Maybank\cite{sturm1999plane} 几乎同期独立提出了同一技术（假设方像素 $\gamma=0$ 并研究了退化构型）。
+
+\begin{insight}
+相机标定的本质，是把“相机参数”这个\textbf{不可直接观测}的量，转化为一个\textbf{可由几何约束求解}的问题。张正友法的关键洞察是：旋转矩阵两列的\emph{正交归一性}——一个纯几何、与内参无关的事实——经过单应一“折射”，就变成了对内参的代数约束。我们不需要知道相机在哪、图案怎么放（外参未知），照样能把内参从外参里“分离”出来。这种“用已知的结构约束未知的参数”的思路，贯穿整个状态估计与标定领域。
+\end{insight}
+
+\paragraph{针孔模型回顾（本章起点）。}
+本章一切从针孔投影方程出发。$3$ 维点 $\mathbf{M}$ 与其像 $\mathbf{m}$ 满足（\cref{eq:pinhole} 的标定章记法\cite{zhang2000calibration}）：
+\begin{equation}
+  s\,\tilde{\mathbf{m}} = \mathbf{K}\,[\,\mathbf{R}\ \ \mathbf{t}\,]\,\tilde{\mathbf{M}},
+  \qquad
+  \mathbf{K}=\begin{bmatrix} \alpha & \gamma & u_0\\ 0 & \beta & v_0\\ 0 & 0 & 1\end{bmatrix},
+  \label{eq:calib-pinhole}
+\end{equation}
+其中 $s$ 是任意尺度因子（投影深度），$(\mathbf{R},\mathbf{t})$ 为外参（世界系$\to$相机系），$\mathbf{K}$ 为内参矩阵。$\alpha,\beta$ 是 $u,v$ 轴的尺度因子（即 $f_x,f_y$），$(u_0,v_0)$ 是主点（即 $c_x,c_y$），$\gamma$ 是描述两像轴斜交的参数（两轴夹角 $\theta$ 时 $\gamma=\alpha\cot\theta$，矩形像素 $\theta=90^\circ\Rightarrow\gamma=0$）。约定 $\mathbf{K}^{-\top}$ 表示 $(\mathbf{K}^{-1})^\top=(\mathbf{K}^\top)^{-1}$。
+
+\paragraph{自由度盘点。}
+旋转矩阵有 $9$ 个元素但仅 $3$ 个自由度（\cref{ch:lie}），平移 $3$ 个，故\textbf{外参 $6$ 个}；内参 $\alpha,\beta,\gamma,u_0,v_0$ 共 \textbf{$5$ 个}。一幅图共 $11$ 个参数。这个计数在后面解释“一幅单应为何只给 $2$ 个内参约束”时是关键。
+
+\begin{pitfall}[概念误区：物理焦距就是 $f_x$]
+新手常把镜头标称的“$6\,\mathrm{mm}$”直接当成 $f_x$。\textbf{现象}：投影/反投影全错，深度差几个数量级。\textbf{根本原因}：投影方程里的 $f_x,f_y$ 单位是\emph{像素}，等于物理焦距除以像元在该方向的物理尺寸 $f_x=f/d_x$。$6\,\mathrm{mm}$ 焦距、像元 $7.4\,\mu\mathrm{m}$ 时 $f_x\approx811$ 像素——这与张正友实验里 $\alpha\approx832$ 的量级一致（见 \cref{sec:calib-numerical}）。\textbf{正确做法}：永远从标定结果（像素单位）取 $f_x,f_y$，不要用物理焦距。\textbf{自检}：标定出的 $f_x$ 应与“物理焦距 $\div$ 像元尺寸”大致吻合。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{单应与内参约束}
+\label{sec:calib-homography}
+
+\paragraph{这一节解决什么。}
+张正友法的第一环：把“平面图案在一幅图里的成像”浓缩成一个 $3\times3$ 单应矩阵 $\mathbf{H}$，再从 $\mathbf{H}$ 里榨出对内参的约束。
+
+\subsection{平面图案与图像之间的单应}
+\label{sec:calib-homography-derive}
+
+\paragraph{推导：$Z=0$ 让投影退化为单应。}
+不失一般性，把模型平面放在世界系的 $Z=0$ 平面上。记 $\mathbf{R}$ 第 $i$ 列为 $\mathbf{r}_i$。代入 \cref{eq:calib-pinhole}\cite{zhang2000calibration}：
+\begin{equation}
+  s\begin{bmatrix}u\\v\\1\end{bmatrix}
+  =\mathbf{K}\,[\,\mathbf{r}_1\ \mathbf{r}_2\ \mathbf{r}_3\ \mathbf{t}\,]\begin{bmatrix}X\\Y\\0\\1\end{bmatrix}
+  =\mathbf{K}\,[\,\mathbf{r}_1\ \mathbf{r}_2\ \mathbf{t}\,]\begin{bmatrix}X\\Y\\1\end{bmatrix}.
+  \label{eq:calib-z0}
+\end{equation}
+\textbf{中间步}：因为 $Z\equiv0$，列 $\mathbf{r}_3$ 被乘以 $0$ 而消去，$4\times3$ 的 $[\mathbf{r}_1\,\mathbf{r}_2\,\mathbf{r}_3\,\mathbf{t}]$ 降为 $3\times3$ 的 $[\mathbf{r}_1\,\mathbf{r}_2\,\mathbf{t}]$。这一步是整个方法的几何核心——平面物点的第三维信息无关紧要，于是 $3\times4$ 的投影矩阵塌缩成 $3\times3$ 的单应。
+
+滥用记号，仍用 $\mathbf{M}$ 记平面上点，但 $\mathbf{M}=[X,Y]^\top$（因 $Z\equiv0$），齐次 $\tilde{\mathbf{M}}=[X,Y,1]^\top$。于是平面点 $\mathbf{M}$ 与其像 $\mathbf{m}$ 由一个\emph{单应 $\mathbf{H}$} 联系（张正友式 (2)\cite{zhang2000calibration}）：
+\begin{equation}
+  s\,\tilde{\mathbf{m}} = \mathbf{H}\,\tilde{\mathbf{M}},
+  \qquad
+  \mathbf{H}=\mathbf{K}\,[\,\mathbf{r}_1\ \mathbf{r}_2\ \mathbf{t}\,].
+  \label{eq:calib-homography}
+\end{equation}
+$3\times3$ 矩阵 $\mathbf{H}$ 定义到一个尺度因子以内（齐次），有 $8$ 个自由度。
+
+\begin{insight}
+单应是平面成像的“万能压缩器”：无论相机内参、镜头朝向如何，一个平面图案在一幅图里的全部几何，都被一个 $3\times3$ 矩阵完全捕获。张正友法的精妙之处，是把“估相机参数”这个难问题，先\emph{分解}为“每幅图各估一个单应”（容易、线性、成熟）的若干子问题，再从这一堆单应里\emph{聚合}出内参。分而治之。
+\end{insight}
+
+\subsection{从单应到内参的两个约束}
+\label{sec:calib-two-constraints}
+
+\paragraph{推导：用旋转两列的正交归一性。}
+给定一幅图，可先估出单应 $\mathbf{H}=[\mathbf{h}_1\ \mathbf{h}_2\ \mathbf{h}_3]$（怎么估见 \cref{sec:calib-homography-estimate}）。由 \cref{eq:calib-homography}\cite{zhang2000calibration}：
+\begin{equation}
+  [\,\mathbf{h}_1\ \mathbf{h}_2\ \mathbf{h}_3\,]=\lambda\,\mathbf{K}\,[\,\mathbf{r}_1\ \mathbf{r}_2\ \mathbf{t}\,],
+\end{equation}
+其中 $\lambda$ 是单应的整体尺度。逐列读出 $\mathbf{h}_1=\lambda\mathbf{K}\mathbf{r}_1$、$\mathbf{h}_2=\lambda\mathbf{K}\mathbf{r}_2$，反解：
+\begin{equation}
+  \mathbf{r}_1=\tfrac1\lambda\mathbf{K}^{-1}\mathbf{h}_1,\qquad
+  \mathbf{r}_2=\tfrac1\lambda\mathbf{K}^{-1}\mathbf{h}_2.
+  \label{eq:calib-r1r2}
+\end{equation}
+现在动用旋转矩阵的纯几何事实：$\mathbf{r}_1,\mathbf{r}_2$ 是\textbf{单位正交（orthonormal）}的（\cref{ch:lie} 中 $\mathbf{R}\in\SO(3)$ 的列构成标准正交基）。
+\begin{itemize}
+  \item \emph{正交} $\mathbf{r}_1^\top\mathbf{r}_2=0$：代入 \cref{eq:calib-r1r2} 得 $\tfrac1{\lambda^2}\mathbf{h}_1^\top\mathbf{K}^{-\top}\mathbf{K}^{-1}\mathbf{h}_2=0$，即
+  \begin{equation}
+    \mathbf{h}_1^\top\,\mathbf{K}^{-\top}\mathbf{K}^{-1}\,\mathbf{h}_2 = 0.
+    \label{eq:calib-constraint1}
+  \end{equation}
+  \item \emph{等模长} $\mathbf{r}_1^\top\mathbf{r}_1=\mathbf{r}_2^\top\mathbf{r}_2=1$：两式相减消 $\tfrac1{\lambda^2}$，得
+  \begin{equation}
+    \mathbf{h}_1^\top\,\mathbf{K}^{-\top}\mathbf{K}^{-1}\,\mathbf{h}_1 = \mathbf{h}_2^\top\,\mathbf{K}^{-\top}\mathbf{K}^{-1}\,\mathbf{h}_2.
+    \label{eq:calib-constraint2}
+  \end{equation}
+\end{itemize}
+注意尺度 $\lambda$ 在两式中都被消掉了——这正是“外参未知也能约束内参”的代数原因。
+
+\begin{proposition}[一幅单应只给两个内参约束]\label{prop:calib-two-constraints}
+每估出一幅模型平面的单应 $\mathbf{H}$，恰好给出 \cref{eq:calib-constraint1,eq:calib-constraint2} 两个对内参矩阵 $\mathbf{K}$ 的约束，不多不少。
+\end{proposition}
+\begin{proof}
+自由度计数：单应 $\mathbf{H}$ 有 $8$ 个自由度，其中外参占 $6$ 个（旋转 $3$、平移 $3$），故每幅单应能“留给”内参的约束恰为 $8-6=2$ 个。\cref{eq:calib-constraint1,eq:calib-constraint2} 就是这两个。
+\end{proof}
+
+\begin{insight}
+\textbf{本质洞察}：矩阵 $\boldsymbol{\omega}:=\mathbf{K}^{-\top}\mathbf{K}^{-1}$ 是这两个约束的唯一载体——约束 \cref{eq:calib-constraint1,eq:calib-constraint2} 都是关于 $\boldsymbol{\omega}$ 的双线性型 $\mathbf{h}_i^\top\boldsymbol{\omega}\mathbf{h}_j$。$\boldsymbol{\omega}$ 只由内参决定、与外参无关，它有个响亮的几何名字：\emph{绝对二次曲线的像（image of the absolute conic, IAC）}。所以张正友法的全部秘密就是：用多幅单应把 $\boldsymbol{\omega}$ 解出来，再从 $\boldsymbol{\omega}$ 反解 $\mathbf{K}$。\cref{sec:calib-iac} 会从射影几何给出 $\boldsymbol{\omega}$ 为何是约束载体的第二种证明。
+\end{insight}
+
+\subsection{如何估计单应：DLT 与最大似然}
+\label{sec:calib-homography-estimate}
+
+\paragraph{这是链条的第 $0$ 环。}
+前面假设“单应已估出”，但单应本身也要从点对里求。张正友附录 A\cite{zhang2000calibration} 给出了\emph{线性初值（DLT）$+$ 最大似然精化}的标准做法。
+
+\paragraph{线性 DLT 初值。}
+设模型点 $\mathbf{M}_i$ 与像点 $\mathbf{m}_i=[u_i,v_i]^\top$ 满足 \cref{eq:calib-homography}。把 $\mathbf{H}$ 的三行记为 $\bar{\mathbf{h}}_1^\top,\bar{\mathbf{h}}_2^\top,\bar{\mathbf{h}}_3^\top$，令 $\mathbf{x}=[\bar{\mathbf{h}}_1^\top,\bar{\mathbf{h}}_2^\top,\bar{\mathbf{h}}_3^\top]^\top\in\mathbb{R}^9$。消去尺度 $s$（用第三行除前两行）后，每个点对给出两行齐次方程\cite{zhang2000calibration}：
+\begin{equation}
+  \begin{bmatrix} \tilde{\mathbf{M}}^\top & \mathbf{0}^\top & -u\,\tilde{\mathbf{M}}^\top\\
+                  \mathbf{0}^\top & \tilde{\mathbf{M}}^\top & -v\,\tilde{\mathbf{M}}^\top\end{bmatrix}\mathbf{x}=\mathbf{0}.
+  \label{eq:calib-dlt-row}
+\end{equation}
+$n$ 个点堆叠成 $\mathbf{L}\mathbf{x}=\mathbf{0}$（$\mathbf{L}$ 为 $2n\times9$）。$\mathbf{x}$ 定义到尺度以内，解是 $\mathbf{L}$ 最小奇异值对应的\emph{右奇异向量}（等价地 $\mathbf{L}^\top\mathbf{L}$ 最小特征值的特征向量），把 $\mathbf{x}$ 重排回 $3\times3$ 即得 $\hat{\mathbf{H}}$。单应有 $8$ 自由度、每点给 $2$ 个方程，故\textbf{至少需 $4$ 个点}\cite{stachniss2021zhang}。
+
+\paragraph{为什么要先做数据归一化。}
+$\mathbf{L}$ 中有的元素恒为 $1$、有的是像素（量级 $10^2$）、有的是世界坐标、有的是二者乘积（量级 $10^4$），数值上严重\emph{病态}。Hartley\cite{hartley1995defence} 的归一化（在 \cref{eq:calib-dlt-row} 之前）显著改善条件数：构造平移$+$各向同性缩放变换 $\mathbf{N}$（图像点）、$\mathbf{N}'$（模型点），把点集质心移到原点、到原点的平均距离归一化为 $\sqrt2$；求归一化后的 $\hat{\mathbf{H}}$，再去归一化 $\mathbf{H}=\mathbf{N}^{-1}\hat{\mathbf{H}}\mathbf{N}'$。
+
+\begin{derivation}[Hartley 各向同性归一化矩阵的构造]
+设图像点集 $\{\mathbf{m}_i=[u_i,v_i]^\top\}_{i=1}^n$。\textbf{第一步}求质心 $\bar{\mathbf{m}}=\tfrac1n\sum_i\mathbf{m}_i$ 与到质心的平均距离 $\bar d=\tfrac1n\sum_i\|\mathbf{m}_i-\bar{\mathbf{m}}\|$。\textbf{第二步}取缩放因子 $s=\sqrt2/\bar d$，使平移$+$缩放后点集到原点的平均距离恰为 $\sqrt2$（即各点到原点距离的“典型值”为 $\sqrt2$，二维下令 $u,v$ 两分量的典型标准差均约 $1$，数值条件最佳\cite{hartley1995defence,hartley2004multiview}）。归一化变换写成 $3\times3$ 齐次矩阵
+\[
+  \mathbf{N}=\begin{bmatrix} s & 0 & -s\,\bar u\\ 0 & s & -s\,\bar v\\ 0 & 0 & 1\end{bmatrix},
+  \qquad \tilde{\mathbf{m}}_i' = \mathbf{N}\,\tilde{\mathbf{m}}_i .
+\]
+模型点 $\{\mathbf{M}_i\}$ 同法构造 $\mathbf{N}'$（用模型坐标的质心与平均距离）。\textbf{第三步}对归一化点 $\{\tilde{\mathbf{m}}_i',\tilde{\mathbf{M}}_i'\}$ 跑 \cref{eq:calib-dlt-row} 的 DLT 得 $\hat{\mathbf{H}}$，它满足 $\tilde{\mathbf{m}}_i'\sim\hat{\mathbf{H}}\tilde{\mathbf{M}}_i'$。\textbf{第四步}代回 $\mathbf{N}\tilde{\mathbf{m}}_i\sim\hat{\mathbf{H}}\mathbf{N}'\tilde{\mathbf{M}}_i$，即 $\tilde{\mathbf{m}}_i\sim(\mathbf{N}^{-1}\hat{\mathbf{H}}\mathbf{N}')\tilde{\mathbf{M}}_i$，故\textbf{去归一化} $\mathbf{H}=\mathbf{N}^{-1}\hat{\mathbf{H}}\mathbf{N}'$。$\mathbf{N}$ 上三角且对角非零，求逆有闭式，几乎不增计算。
+\end{derivation}
+
+\paragraph{最大似然精化。}
+DLT 最小化的是代数距离，无物理意义。设 $\mathbf{m}_i$ 被均值 $\mathbf{0}$、协方差 $\boldsymbol{\Sigma}_{\mathbf{m}_i}$ 的高斯噪声污染，则 $\mathbf{H}$ 的最大似然估计最小化\cite{zhang2000calibration}：
+\begin{equation}
+  \sum_i (\mathbf{m}_i-\hat{\mathbf{m}}_i)^\top\,\boldsymbol{\Sigma}_{\mathbf{m}_i}^{-1}\,(\mathbf{m}_i-\hat{\mathbf{m}}_i),
+  \qquad
+  \hat{\mathbf{m}}_i=\frac{1}{\bar{\mathbf{h}}_3^\top\tilde{\mathbf{M}}_i}\begin{bmatrix}\bar{\mathbf{h}}_1^\top\tilde{\mathbf{M}}_i\\ \bar{\mathbf{h}}_2^\top\tilde{\mathbf{M}}_i\end{bmatrix}.
+  \label{eq:calib-h-mle}
+\end{equation}
+实践中取 $\boldsymbol{\Sigma}_{\mathbf{m}_i}=\sigma^2\mathbf{I}$（点用同一流程独立提取时合理），问题化为非线性最小二乘 $\min_{\mathbf{H}}\sum_i\|\mathbf{m}_i-\hat{\mathbf{m}}_i\|^2$，用 Levenberg--Marquardt\cite{more1978lm}（以 DLT 为初值）求解。
+
+\begin{note}
+\textbf{摄影测量视角的等价写法（Stachniss\cite{stachniss2021zhang}）.}\;
+把 $\mathbf{h}=\mathrm{vec}(\mathbf{H}^\top)$，每点生成两行 $\mathbf{a}_{x_i}^\top\mathbf{h}=0$、$\mathbf{a}_{y_i}^\top\mathbf{h}=0$，其中（\emph{已删去 $Z_i$ 项因平面 $Z=0$}）：
+\[
+  \mathbf{a}_{x_i}^\top=(-X_i,\,-Y_i,\,-1,\,0,\,0,\,0,\,x_iX_i,\,x_iY_i,\,x_i),\qquad
+  \mathbf{a}_{y_i}^\top=(0,\,0,\,0,\,-X_i,\,-Y_i,\,-1,\,y_iX_i,\,y_iY_i,\,y_i).
+\]
+这与 \cref{eq:calib-dlt-row} 是同一组方程的另一种排布。Stachniss 的课件用红框逐图划掉 $3\times4$ 投影 DLT 的第三列（$Z$ 列），直观展示“张正友法 $=$ 平面 DLT”：把 $12$ 维投影 DLT 退化为 $9$ 维单应 DLT，“其余完全相同”。这是理解本方法本质的最干净视角。
+\end{note}
+
+\begin{pitfall}[编程陷阱：不做数据归一化直接跑 DLT]
+\textbf{错误做法}：直接把原始像素/世界坐标填进 \cref{eq:calib-dlt-row} 的 $\mathbf{L}$ 再 SVD。\textbf{现象}：估出的 $\mathbf{H}$ 在干净仿真下看似还行，真实图像里却莫名不准，最终内参漂移。\textbf{根本原因}：$\mathbf{L}$ 各列量级相差 $10^4$ 倍，SVD 的最小奇异向量被大数列主导，小数列（含关键约束）被数值淹没。\textbf{正确做法}：先做 Hartley 各向同性归一化\cite{hartley1995defence}，求解后去归一化。\textbf{自检}：归一化后 $\mathbf{L}$ 各列范数应在同一量级；OpenCV 的 \texttt{findHomography} 内部已自动归一化。
+\end{pitfall}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 验证 \cref{eq:calib-dlt-row}：从 $s\tilde{\mathbf{m}}=\mathbf{H}\tilde{\mathbf{M}}$ 出发，写出 $u=\frac{\bar{\mathbf{h}}_1^\top\tilde{\mathbf{M}}}{\bar{\mathbf{h}}_3^\top\tilde{\mathbf{M}}}$，交叉相乘消分母，整理成 $\mathbf{a}^\top\mathbf{x}=0$ 的形式，确认系数与 \cref{eq:calib-dlt-row} 一致。
+  \item 为什么 $3$ 个点不足以估单应？从“$8$ 自由度、每点 $2$ 方程”说明，并解释“$4$ 点中任意三点不可共线”的几何要求。
+  \item （实现）用 NumPy 写一个 \texttt{estimate\_homography(obj\_pts, img\_pts)}，含 Hartley 归一化，返回 $3\times3$ 的 $\mathbf{H}$；用合成数据（已知 $\mathbf{H}$ 投影出点）验证恢复误差。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{绝对二次曲线视角（几何证明）}
+\label{sec:calib-iac}
+
+\paragraph{这一节解决什么。}
+\cref{sec:calib-two-constraints} 用代数（旋转两列正交归一）导出了两约束。这里给出第二种、更深刻的\emph{射影几何}证明：两约束等价于“模型平面的圆环点投影到绝对二次曲线的像上”。两种视角并列，互为印证——代数视角更直接好算，几何视角更揭示本质。
+
+\subsection{绝对二次曲线及其不变性}
+
+\paragraph{定义。}
+在 $3$ 维射影空间用齐次坐标 $\tilde{\mathbf{x}}=[x_1,x_2,x_3,x_4]^\top$。\emph{无穷远平面} $\Pi_\infty$ 为 $x_4=0$。\emph{绝对二次曲线（absolute conic）} $\Omega$ 定义为\cite{zhang2000calibration}
+\begin{equation}
+  x_1^2+x_2^2+x_3^2=0,\qquad x_4=0.
+  \label{eq:calib-omega-def}
+\end{equation}
+令 $\mathbf{x}_\infty=[x_1,x_2,x_3]^\top$ 为 $\Omega$ 上点，则 $\mathbf{x}_\infty^\top\mathbf{x}_\infty=0$。它是 $\Pi_\infty$ 上一条由\emph{纯虚点}构成的二次曲线（令 $x=x_1/x_3,y=x_2/x_3$ 得 $x^2+y^2=-1$，半径 $\sqrt{-1}$ 的虚圆）。
+
+\paragraph{对刚体变换不变。}
+设刚体变换 $\mathbf{H}_{\mathrm{rigid}}=\big[\begin{smallmatrix}\mathbf{R}&\mathbf{t}\\\mathbf{0}^\top&1\end{smallmatrix}\big]$，$\mathbf{x}_\infty$ 在 $\Omega$ 上，$\tilde{\mathbf{x}}_\infty=[\mathbf{x}_\infty^\top,0]^\top$。变换后 $\tilde{\mathbf{x}}'_\infty=\mathbf{H}_{\mathrm{rigid}}\tilde{\mathbf{x}}_\infty=[(\mathbf{R}\mathbf{x}_\infty)^\top,0]^\top$ 仍在无穷远平面，且仍在同一 $\Omega$ 上，因为
+\begin{equation}
+  \mathbf{x}_\infty'^\top\mathbf{x}_\infty'=(\mathbf{R}\mathbf{x}_\infty)^\top(\mathbf{R}\mathbf{x}_\infty)=\mathbf{x}_\infty^\top(\mathbf{R}^\top\mathbf{R})\mathbf{x}_\infty=\mathbf{x}_\infty^\top\mathbf{x}_\infty=0.
+\end{equation}
+
+\paragraph{$\Omega$ 的像只由内参决定。}
+$\Omega$ 上点 $\mathbf{x}_\infty$ 经相机投影：$\tilde{\mathbf{m}}_\infty=s\mathbf{K}[\mathbf{R}\,\mathbf{t}][\mathbf{x}_\infty^\top,0]^\top=s\mathbf{K}\mathbf{R}\mathbf{x}_\infty$。于是
+\begin{equation}
+  \tilde{\mathbf{m}}_\infty^\top\,\boldsymbol{\omega}\,\tilde{\mathbf{m}}_\infty
+  =\tilde{\mathbf{m}}_\infty^\top\mathbf{K}^{-\top}\mathbf{K}^{-1}\tilde{\mathbf{m}}_\infty
+  =s^2\mathbf{x}_\infty^\top\mathbf{R}^\top\mathbf{R}\mathbf{x}_\infty
+  =s^2\mathbf{x}_\infty^\top\mathbf{x}_\infty=0.
+  \label{eq:calib-iac-invariant}
+\end{equation}
+\textbf{结论}：绝对二次曲线的像 $\boldsymbol{\omega}=\mathbf{K}^{-\top}\mathbf{K}^{-1}$ 是一条虚二次曲线，\emph{只由内参决定、与外参（$\mathbf{R},\mathbf{t}$）无关}。若能确定 $\boldsymbol{\omega}$，就能解出内参——这正是张正友法的几何核心。
+
+\subsection{圆环点投影给出两约束}
+
+\paragraph{推导（第二种证明）。}
+在相机系中，模型平面（本约定下）由 $\big[\begin{smallmatrix}\mathbf{r}_3\\\mathbf{r}_3^\top\mathbf{t}\end{smallmatrix}\big]^\top[x,y,z,w]^\top=0$ 描述（无穷远点 $w=0$，否则 $w=1$）\cite{zhang2000calibration}。该平面与无穷远平面交于一条直线，易见 $[\mathbf{r}_1^\top,0]^\top$ 与 $[\mathbf{r}_2^\top,0]^\top$ 是该直线上两个特殊点，线上任一点是二者线性组合：
+\begin{equation}
+  \mathbf{x}_\infty=a\begin{bmatrix}\mathbf{r}_1\\0\end{bmatrix}+b\begin{bmatrix}\mathbf{r}_2\\0\end{bmatrix}=\begin{bmatrix}a\mathbf{r}_1+b\mathbf{r}_2\\0\end{bmatrix}.
+\end{equation}
+求该直线与 $\Omega$ 的交点：\emph{圆环点（circular point）} $\mathbf{x}_\infty$ 满足 $\mathbf{x}_\infty^\top\mathbf{x}_\infty=0$，即
+\begin{equation}
+  (a\mathbf{r}_1+b\mathbf{r}_2)^\top(a\mathbf{r}_1+b\mathbf{r}_2)=a^2\underbrace{\mathbf{r}_1^\top\mathbf{r}_1}_{1}+2ab\underbrace{\mathbf{r}_1^\top\mathbf{r}_2}_{0}+b^2\underbrace{\mathbf{r}_2^\top\mathbf{r}_2}_{1}=a^2+b^2=0.
+\end{equation}
+解为 $b=\pm a\,i$（$i^2=-1$），故两个圆环点
+\begin{equation}
+  \mathbf{x}_\infty=a\begin{bmatrix}\mathbf{r}_1\pm i\,\mathbf{r}_2\\0\end{bmatrix}.
+\end{equation}
+它们在像平面的投影（到尺度以内）：
+\begin{equation}
+  \tilde{\mathbf{m}}_\infty=\mathbf{K}(\mathbf{r}_1\pm i\,\mathbf{r}_2)=\mathbf{h}_1\pm i\,\mathbf{h}_2.
+\end{equation}
+$\tilde{\mathbf{m}}_\infty$ 在 IAC $\boldsymbol{\omega}$ 上（由 \cref{eq:calib-iac-invariant} 的不变性），故
+\begin{equation}
+  (\mathbf{h}_1\pm i\,\mathbf{h}_2)^\top\,\boldsymbol{\omega}\,(\mathbf{h}_1\pm i\,\mathbf{h}_2)=0.
+\end{equation}
+展开并\textbf{要求实部、虚部分别为零}：
+\begin{itemize}
+  \item 实部：$\mathbf{h}_1^\top\boldsymbol{\omega}\mathbf{h}_1-\mathbf{h}_2^\top\boldsymbol{\omega}\mathbf{h}_2=0$，即 \cref{eq:calib-constraint2}；
+  \item 虚部：$2\,\mathbf{h}_1^\top\boldsymbol{\omega}\mathbf{h}_2=0$，即 \cref{eq:calib-constraint1}。
+\end{itemize}
+两种推导殊途同归。$\blacksquare$
+
+\begin{insight}
+\textbf{两视角对比}：代数视角（\cref{sec:calib-two-constraints}）说“因为旋转两列正交归一”，直接、可算、适合编码；几何视角（本节）说“因为平面的圆环点不变地落在 IAC 上”，揭示了\emph{为什么}约束载体偏偏是 $\boldsymbol{\omega}$——它是绝对二次曲线的像，对欧氏变换不变。物理意义：\emph{平行平面与无穷远平面交于相同的圆环点}，故它们提供\emph{相同}约束——这一句直接预告了 \cref{sec:calib-degenerate} 的退化构型根源。在严谨度上几何证明更深刻（揭示不变量），在直觉与可实现性上代数证明更友好。本书两者都记，读者可按需取用。
+\end{insight}
+
+\subsection{第三种视角：消失点与正交方向}
+\label{sec:calib-vanishing}
+
+\paragraph{把约束“看得见”。}
+圆环点是虚的、画不出来。但同一个 $\boldsymbol{\omega}$ 还有一个\emph{完全实、可在图上指出来}的解读，它把抽象的“$\mathbf{h}_i^\top\boldsymbol{\omega}\mathbf{h}_j$”翻译成关于\emph{消失点（vanishing point）}的语言，也顺手把 \cref{sec:calib-why} 提到的“用正交方向消失点标定”那条历史支线接上。
+
+\paragraph{推导：单应的列就是棋盘格两轴的消失点。}
+回到 \cref{eq:calib-homography} 的单应 $\mathbf{H}=[\mathbf{h}_1\,\mathbf{h}_2\,\mathbf{h}_3]=\lambda\mathbf{K}[\mathbf{r}_1\,\mathbf{r}_2\,\mathbf{t}]$。棋盘格沿其 $X$ 轴方向的无穷远点（齐次坐标 $[1,0,0]^\top$，模型平面坐标）经单应映到
+\begin{equation}
+  \tilde{\mathbf{v}}_X = \mathbf{H}\,[1,0,0]^\top = \mathbf{h}_1,
+  \qquad
+  \tilde{\mathbf{v}}_Y = \mathbf{H}\,[0,1,0]^\top = \mathbf{h}_2.
+  \label{eq:calib-vanishing}
+\end{equation}
+\textbf{含义}：$\mathbf{h}_1,\mathbf{h}_2$ 正是棋盘格两条网格方向（$X$、$Y$ 轴）在图像里的\emph{消失点}（一族平行线在像平面相交之处）。而棋盘格的 $X$、$Y$ 轴在世界里\emph{相互垂直}——于是“两约束”有了最朴素的解读：
+
+\begin{itemize}
+  \item \cref{eq:calib-constraint1}（$\mathbf{h}_1^\top\boldsymbol{\omega}\mathbf{h}_2=0$）说的是：\emph{两个相互正交的世界方向，其消失点关于 $\boldsymbol{\omega}$ 共轭}。这正是用正交消失点标定的核心不变式 $\mathbf{v}_i^\top\boldsymbol{\omega}\mathbf{v}_j=0$\cite{hartley2004multiview}——两条垂直直线（如建筑的水平/竖直棱）的消失点，落在 IAC 的极线关系里。
+  \item \cref{eq:calib-constraint2}（$\mathbf{h}_1^\top\boldsymbol{\omega}\mathbf{h}_1=\mathbf{h}_2^\top\boldsymbol{\omega}\mathbf{h}_2$）说的是：这两个方向在世界里\emph{等长的基向量}（$\|\mathbf{r}_1\|=\|\mathbf{r}_2\|$），其消失点关于 $\boldsymbol{\omega}$ 有\emph{相等的二次型值}——一种“度量一致性”。
+\end{itemize}
+
+\begin{insight}
+\textbf{为什么这是同一回事（统一三视角）}：代数视角看“旋转两列正交归一”，几何视角看“圆环点落在 IAC 上”，消失点视角看“正交世界方向的消失点关于 $\boldsymbol{\omega}$ 共轭”——三者是同一组方程 $\mathbf{h}_i^\top\boldsymbol{\omega}\mathbf{h}_j$ 的不同读法。\emph{$\boldsymbol{\omega}=\mathbf{K}^{-\top}\mathbf{K}^{-1}$ 把图像里的角度量回真实世界角度}：两像点 $\tilde{\mathbf{m}}_1,\tilde{\mathbf{m}}_2$ 对应的视线夹角 $\theta$ 满足 $\cos\theta=\frac{\tilde{\mathbf{m}}_1^\top\boldsymbol{\omega}\tilde{\mathbf{m}}_2}{\sqrt{\tilde{\mathbf{m}}_1^\top\boldsymbol{\omega}\tilde{\mathbf{m}}_1}\sqrt{\tilde{\mathbf{m}}_2^\top\boldsymbol{\omega}\tilde{\mathbf{m}}_2}}$\cite{hartley2004multiview}——$\boldsymbol{\omega}$ 就是像平面上的“角度度量”。垂直方向（$\theta=90^\circ$）让分子为零，得 \cref{eq:calib-constraint1}；这也是为什么知道了 $\boldsymbol{\omega}$ 就等于知道了内参——它编码了相机的全部度量能力。
+\end{insight}
+
+\begin{note}
+\textbf{一个漂亮的副产物：主点 $=$ 三正交消失点的垂心.}\;
+若一幅图里能找到\emph{三个两两正交}的世界方向（如长方体的三条棱）的消失点 $\mathbf{v}_1,\mathbf{v}_2,\mathbf{v}_3$，则在零斜交（$\gamma=0$）、方像素（$f_x=f_y$）假设下，可证主点 $(c_x,c_y)$ 恰为以 $\mathbf{v}_1,\mathbf{v}_2,\mathbf{v}_3$ 为顶点的三角形的\emph{垂心（orthocenter）}\cite{hartley2004multiview}。这是消失点标定法的经典结论，也给“主点大致在图像中心”一个几何直觉：相机大致正对场景时，三消失点的三角形大致以图心为垂心。本书张正友法不依赖此结论，但它生动说明 $\boldsymbol{\omega}$ 与可观测几何（消失点）的紧密联系。
+\end{note}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 展开 $(\mathbf{h}_1+i\mathbf{h}_2)^\top\boldsymbol{\omega}(\mathbf{h}_1+i\mathbf{h}_2)$，逐项分出实部与虚部，确认得到 \cref{eq:calib-constraint1,eq:calib-constraint2}。为什么 $+i$ 与 $-i$ 两支给出相同的两个实约束？
+  \item 解释“为什么 $\boldsymbol{\omega}$ 与外参无关”——从 \cref{eq:calib-iac-invariant} 中 $\mathbf{R}^\top\mathbf{R}=\mathbf{I}$ 消掉旋转、$s^2$ 不影响“等于 $0$”这两点说明。
+  \item 由 \cref{eq:calib-vanishing} 说明：当棋盘格的某条网格轴\emph{平行于像平面}（该方向的平行线在图里仍平行、消失点跑到无穷远）时，对应的 $\mathbf{h}_i$ 第三分量趋于 $0$，从消失点角度解释这会让该约束“变弱”——与 \cref{sec:calib-degenerate} 的近平行退化呼应。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{闭式解：从约束到内参}
+\label{sec:calib-closed}
+
+\paragraph{这一节解决什么。}
+有了每幅图的两约束，本节把它们整理成一个齐次线性方程组 $\mathbf{V}\mathbf{b}=\mathbf{0}$，用 SVD 一次解出，再用闭式公式提取全部内参与外参——\emph{无需任何迭代}。这是张正友法的“代数解”，将作为后续 LM 精化的初值。
+
+\subsection{构造对称矩阵与 \texorpdfstring{$6$}{6} 维向量}
+\label{sec:calib-b-vector}
+
+\paragraph{$\boldsymbol{\omega}$ 的逐元素展开。}
+定义 $\boldsymbol{\omega}=\mathbf{K}^{-\top}\mathbf{K}^{-1}$（张正友记 $\mathbf{B}$），它是对称阵：
+\begin{equation}
+  \boldsymbol{\omega}=\begin{bmatrix} B_{11}&B_{12}&B_{13}\\ B_{12}&B_{22}&B_{23}\\ B_{13}&B_{23}&B_{33}\end{bmatrix}.
+\end{equation}
+
+\begin{derivation}[由 $\mathbf{K}^{-1}$ 算出 $\boldsymbol{\omega}$ 的元素]
+上三角的 $\mathbf{K}$（\cref{eq:calib-pinhole}）求逆仍上三角，逐元素为
+\[
+  \mathbf{K}^{-1}=\begin{bmatrix}
+  \dfrac{1}{\alpha} & -\dfrac{\gamma}{\alpha\beta} & \dfrac{\gamma v_0-\beta u_0}{\alpha\beta}\\[1.6ex]
+  0 & \dfrac{1}{\beta} & -\dfrac{v_0}{\beta}\\[1.2ex]
+  0 & 0 & 1
+  \end{bmatrix}
+  \quad(\text{可由 }\mathbf{K}\mathbf{K}^{-1}=\mathbf{I}\text{ 逐列回代验证}).
+\]
+则 $\boldsymbol{\omega}=\mathbf{K}^{-\top}\mathbf{K}^{-1}=(\mathbf{K}^{-1})^\top(\mathbf{K}^{-1})$ 的第 $(p,q)$ 元 $=\mathbf{K}^{-1}\text{ 第 }p\text{ 列与第 }q\text{ 列的内积}$。取最简两项体会：$B_{11}=$（第 $1$ 列自内积）$=1/\alpha^2$；$B_{12}=$（第 $1$、$2$ 列内积）$=\tfrac{1}{\alpha}\cdot(-\tfrac{\gamma}{\alpha\beta})=-\tfrac{\gamma}{\alpha^2\beta}$；右下角 $B_{33}=$（第 $3$ 列自内积）$=\big(\tfrac{\gamma v_0-\beta u_0}{\alpha\beta}\big)^2+\big(\tfrac{v_0}{\beta}\big)^2+1$。其余元同法可得，整理即 \cref{eq:calib-omega-elements}（与张正友式 (5) 逐字一致）。
+\end{derivation}
+
+代入 $\mathbf{K}$（含 $\alpha,\beta,\gamma,u_0,v_0$）求逆并相乘，得逐元素显式（张正友式 (5)\cite{zhang2000calibration}）：
+\begin{equation}
+  \boldsymbol{\omega}=\begin{bmatrix}
+  \dfrac{1}{\alpha^2} & -\dfrac{\gamma}{\alpha^2\beta} & \dfrac{v_0\gamma-u_0\beta}{\alpha^2\beta}\\[2.2ex]
+  -\dfrac{\gamma}{\alpha^2\beta} & \dfrac{\gamma^2}{\alpha^2\beta^2}+\dfrac{1}{\beta^2} & -\dfrac{\gamma(v_0\gamma-u_0\beta)}{\alpha^2\beta^2}-\dfrac{v_0}{\beta^2}\\[2.2ex]
+  \dfrac{v_0\gamma-u_0\beta}{\alpha^2\beta} & -\dfrac{\gamma(v_0\gamma-u_0\beta)}{\alpha^2\beta^2}-\dfrac{v_0}{\beta^2} & \dfrac{(v_0\gamma-u_0\beta)^2}{\alpha^2\beta^2}+\dfrac{v_0^2}{\beta^2}+1
+  \end{bmatrix}.
+  \label{eq:calib-omega-elements}
+\end{equation}
+$\boldsymbol{\omega}$ 对称，仅 $6$ 个独立量，用 $6$ 维向量表示（张正友式 (6)\cite{zhang2000calibration}）：
+\begin{equation}
+  \mathbf{b}=[\,B_{11},\,B_{12},\,B_{22},\,B_{13},\,B_{23},\,B_{33}\,]^\top.
+  \label{eq:calib-b}
+\end{equation}
+
+\subsection{把约束写成 \texorpdfstring{$\mathbf{b}$}{b} 的线性方程并堆叠}
+\label{sec:calib-Vb}
+
+\paragraph{双线性型关于 $\mathbf{b}$ 是线性的。}
+记 $\mathbf{H}$ 第 $i$ 列 $\mathbf{h}_i=[h_{i1},h_{i2},h_{i3}]^\top$。则（张正友式 (7)\cite{zhang2000calibration}）
+\begin{equation}
+  \mathbf{h}_i^\top\boldsymbol{\omega}\mathbf{h}_j=\mathbf{v}_{ij}^\top\mathbf{b}.
+  \label{eq:calib-vij-bilinear}
+\end{equation}
+\textbf{推导}：展开 $\mathbf{h}_i^\top\boldsymbol{\omega}\mathbf{h}_j=\sum_{p,q}h_{ip}B_{pq}h_{jq}$，用对称性 $B_{pq}=B_{qp}$ 合并同类项，按 $\mathbf{b}$ 的 $6$ 个分量分组——$B_{11}$ 配 $h_{i1}h_{j1}$，$B_{12}$ 配 $h_{i1}h_{j2}+h_{i2}h_{j1}$，$B_{22}$ 配 $h_{i2}h_{j2}$，$B_{13}$ 配 $h_{i1}h_{j3}+h_{i3}h_{j1}$，$B_{23}$ 配 $h_{i2}h_{j3}+h_{i3}h_{j2}$，$B_{33}$ 配 $h_{i3}h_{j3}$——得
+\begin{equation}
+  \mathbf{v}_{ij}=[\,h_{i1}h_{j1},\ h_{i1}h_{j2}+h_{i2}h_{j1},\ h_{i2}h_{j2},\ h_{i3}h_{j1}+h_{i1}h_{j3},\ h_{i3}h_{j2}+h_{i2}h_{j3},\ h_{i3}h_{j3}\,]^\top.
+  \label{eq:calib-vij}
+\end{equation}
+
+\paragraph{单幅图两方程。}
+两约束 \cref{eq:calib-constraint1,eq:calib-constraint2} 写成关于 $\mathbf{b}$ 的两个齐次方程（张正友式 (8)\cite{zhang2000calibration}）：
+\begin{equation}
+  \begin{bmatrix} \mathbf{v}_{12}^\top\\ (\mathbf{v}_{11}-\mathbf{v}_{22})^\top\end{bmatrix} \mathbf{b}=\mathbf{0}.
+  \label{eq:calib-single}
+\end{equation}
+第一行 $\mathbf{v}_{12}^\top\mathbf{b}=\mathbf{h}_1^\top\boldsymbol{\omega}\mathbf{h}_2=0$ 即 \cref{eq:calib-constraint1}（来自 $\mathbf{r}_1^\top\mathbf{r}_2=0$）；第二行 $(\mathbf{v}_{11}-\mathbf{v}_{22})^\top\mathbf{b}=\mathbf{h}_1^\top\boldsymbol{\omega}\mathbf{h}_1-\mathbf{h}_2^\top\boldsymbol{\omega}\mathbf{h}_2=0$ 即 \cref{eq:calib-constraint2}（来自 $\|\mathbf{r}_1\|=\|\mathbf{r}_2\|$）。
+
+\paragraph{多幅图堆叠求解。}
+观测 $n$ 幅图，把 $n$ 个形如 \cref{eq:calib-single} 的方程堆叠（张正友式 (9)\cite{zhang2000calibration}）：
+\begin{equation}
+  \mathbf{V}\,\mathbf{b}=\mathbf{0},\qquad \mathbf{V}\in\mathbb{R}^{2n\times6}.
+  \label{eq:calib-Vb}
+\end{equation}
+
+\begin{proposition}[$\mathbf{V}\mathbf{b}=\mathbf{0}$ 的可解性]\label{prop:calib-solvability}
+对 \cref{eq:calib-Vb}：
+\begin{enumerate}
+  \item $n\ge3$：一般有唯一解 $\mathbf{b}$（到一个尺度因子以内）；
+  \item $n=2$：可加零斜交约束 $\gamma=0$，即追加方程 $[0,1,0,0,0,0]\,\mathbf{b}=0$；
+  \item $n=1$：只能解两个内参（如 $\alpha,\beta$），需假设 $u_0,v_0$ 已知（如取图像中心）且 $\gamma=0$。
+\end{enumerate}
+解是 $\mathbf{V}^\top\mathbf{V}$ 最小特征值对应的特征向量（等价地 $\mathbf{V}$ 最小奇异值对应的右奇异向量）。
+\end{proposition}
+\begin{proof}
+每幅图贡献两个独立约束（\cref{prop:calib-two-constraints}），$\mathbf{b}$ 有 $6$ 个分量、因齐次定义到尺度以内故实际 $5$ 个自由度。$n$ 幅图给 $2n$ 个约束：$n=3$ 时 $2n=6>5$，超定，零空间一维（含噪时取最小奇异向量的最小二乘解）；$n=2$ 时 $2n=4<5$，欠定，加 $\gamma=0$ 补一条；$n=1$ 时 $2n=2$，须再固定 $u_0,v_0,\gamma$ 三量才可解出 $\alpha,\beta$。求最小二乘解 $\min_{\|\mathbf{b}\|=1}\|\mathbf{V}\mathbf{b}\|$ 的标准结果即 $\mathbf{V}^\top\mathbf{V}$ 最小特征值的特征向量。
+\end{proof}
+
+\begin{note}
+\textbf{排序约定的陷阱（务必全程一致）.}\;
+张正友\cite{zhang2000calibration} 的 $\mathbf{b}$ 排序为 $(B_{11},B_{12},B_{22},B_{13},B_{23},B_{33})$（见 \cref{eq:calib-b}）；Stachniss\cite{stachniss2021zhang} 用对角优先的 $(B_{11},B_{12},B_{13},B_{22},B_{23},B_{33})$，其 $\mathbf{v}_{ij}$ 的第 $3$、$4$ 分量随之互换。两套各自自洽，但\textbf{绝不可混用}——一旦 $\mathbf{b}$ 与 $\mathbf{v}_{ij}$ 排序对不上，解出来的 $\boldsymbol{\omega}$ 是错的。本书正文统一采用张正友原排序 \cref{eq:calib-b,eq:calib-vij}（与原文逐字可核）。实现时只要保证“构造 $\mathbf{v}_{ij}$ 的顺序”与“从 $\mathbf{b}$ 还原 $\boldsymbol{\omega}$ 的顺序”严格匹配即可。
+\end{note}
+
+\subsection{从 \texorpdfstring{$\boldsymbol{\omega}$}{omega} 提取内参}
+\label{sec:calib-extract-K}
+
+\paragraph{闭式提取公式。}
+$\boldsymbol{\omega}$ 估到尺度以内（即 $\boldsymbol{\omega}=\lambda\mathbf{K}^{-\top}\mathbf{K}^{-1}$，$\lambda$ 为尺度）。由 \cref{eq:calib-omega-elements} 反解，可\emph{唯一}地按固定顺序提取全部内参（张正友附录 B\cite{zhang2000calibration}，已含 $u_0$ 公式的官方勘误修正）：
+\begin{equation}
+  \begin{aligned}
+  v_0 &= \frac{B_{12}B_{13}-B_{11}B_{23}}{B_{11}B_{22}-B_{12}^2},\\[1ex]
+  \lambda &= B_{33}-\frac{B_{13}^2+v_0(B_{12}B_{13}-B_{11}B_{23})}{B_{11}},\\[1ex]
+  \alpha &= \sqrt{\lambda/B_{11}},\qquad
+  \beta = \sqrt{\frac{\lambda\,B_{11}}{B_{11}B_{22}-B_{12}^2}},\\[1ex]
+  \gamma &= -\frac{B_{12}\,\alpha^2\,\beta}{\lambda},\qquad
+  u_0 = \frac{\gamma\,v_0}{\beta}-\frac{B_{13}\,\alpha^2}{\lambda}.
+  \end{aligned}
+  \label{eq:calib-extract}
+\end{equation}
+解算顺序固定：先 $v_0$，再 $\lambda$，再 $\alpha,\beta$，再 $\gamma$，最后 $u_0$。这里的 $\lambda$ 是把估出的 $\boldsymbol{\omega}$ 归一化到 $\mathbf{K}^{-\top}\mathbf{K}^{-1}$ 的整体尺度，与单应尺度同字母但不同语境。
+
+\begin{note}
+\textbf{Cholesky 提取路径（等价，Stachniss\cite{stachniss2021zhang}）.}\;
+因 $\boldsymbol{\omega}=\mathbf{K}^{-\top}\mathbf{K}^{-1}$ 对称正定，可对它做 Cholesky 分解 $\boldsymbol{\omega}=\mathbf{G}\mathbf{G}^\top$，则 $\mathbf{K}^{-\top}=\mathbf{G}$，即 $\mathbf{K}=(\mathbf{G})^{-\top}$。两条路径等价：\cref{eq:calib-extract} 给逐元素闭式公式，便于实现且不要求显式判定正定；Cholesky 路径概念更清晰，但要求估出的 $\boldsymbol{\omega}$ 数值正定（含噪时未必，需先投影到最近正定阵）。
+\end{note}
+
+\subsection{恢复外参并投影回 \texorpdfstring{$\SO(3)$}{(3)}}
+\label{sec:calib-extrinsics}
+
+\paragraph{每幅图的外参。}
+$\mathbf{K}$ 已知后，由 \cref{eq:calib-homography} 反解每幅图外参（张正友式\cite{zhang2000calibration}）：
+\begin{equation}
+  \mathbf{r}_1=\lambda\mathbf{K}^{-1}\mathbf{h}_1,\quad
+  \mathbf{r}_2=\lambda\mathbf{K}^{-1}\mathbf{h}_2,\quad
+  \mathbf{r}_3=\mathbf{r}_1\times\mathbf{r}_2,\quad
+  \mathbf{t}=\lambda\mathbf{K}^{-1}\mathbf{h}_3,
+  \label{eq:calib-extrinsics}
+\end{equation}
+其中尺度 $\lambda=1/\|\mathbf{K}^{-1}\mathbf{h}_1\|=1/\|\mathbf{K}^{-1}\mathbf{h}_2\|$（因 $\mathbf{h}_1=\lambda^{-1}\mathbf{K}\mathbf{r}_1$ 反解、$\|\mathbf{r}_1\|=1$）。$\mathbf{r}_3$ 由右手系叉乘补全。
+
+\paragraph{噪声让 $\mathbf{R}$ 不正交：投影回 $\SO(3)$。}
+因数据有噪，如此算出的 $\mathbf{Q}=[\mathbf{r}_1,\mathbf{r}_2,\mathbf{r}_3]$ 一般\emph{不严格正交}。要把它投影到最近的旋转矩阵。
+
+\begin{theorem}[最近旋转矩阵：正交 Procrustes]\label{thm:calib-nearest-rotation}
+给定一般 $3\times3$ 矩阵 $\mathbf{Q}$，求 Frobenius 范数意义下最近的旋转矩阵
+\begin{equation}
+  \min_{\mathbf{R}}\|\mathbf{R}-\mathbf{Q}\|_F^2\quad\text{s.t.}\quad \mathbf{R}^\top\mathbf{R}=\mathbf{I},
+  \label{eq:calib-procrustes}
+\end{equation}
+其解为 $\mathbf{R}=\mathbf{U}\mathbf{V}^\top$，其中 $\mathbf{Q}=\mathbf{U}\mathbf{S}\mathbf{V}^\top$ 为 $\mathbf{Q}$ 的奇异值分解。
+\end{theorem}
+\begin{proof}
+（张正友附录 C\cite{zhang2000calibration}）展开范数并用 $\mathrm{trace}(\mathbf{R}^\top\mathbf{R})=\mathrm{trace}(\mathbf{I})=3$：
+\[
+  \|\mathbf{R}-\mathbf{Q}\|_F^2=\mathrm{trace}\big((\mathbf{R}-\mathbf{Q})^\top(\mathbf{R}-\mathbf{Q})\big)=3+\mathrm{trace}(\mathbf{Q}^\top\mathbf{Q})-2\,\mathrm{trace}(\mathbf{R}^\top\mathbf{Q}),
+\]
+故 \cref{eq:calib-procrustes} 等价于\emph{最大化} $\mathrm{trace}(\mathbf{R}^\top\mathbf{Q})$。设 $\mathbf{Q}=\mathbf{U}\mathbf{S}\mathbf{V}^\top$，$\mathbf{S}=\mathrm{diag}(\sigma_1,\sigma_2,\sigma_3)$。定义正交矩阵 $\mathbf{Z}=\mathbf{V}^\top\mathbf{R}^\top\mathbf{U}$，则
+\[
+  \mathrm{trace}(\mathbf{R}^\top\mathbf{Q})=\mathrm{trace}(\mathbf{R}^\top\mathbf{U}\mathbf{S}\mathbf{V}^\top)=\mathrm{trace}(\mathbf{V}^\top\mathbf{R}^\top\mathbf{U}\mathbf{S})=\mathrm{trace}(\mathbf{Z}\mathbf{S})=\sum_{i=1}^3 z_{ii}\sigma_i\le\sum_{i=1}^3\sigma_i,
+\]
+末不等式因 $\mathbf{Z}$ 正交故 $|z_{ii}|\le1$、$\sigma_i\ge0$。当 $\mathbf{Z}=\mathbf{I}$ 即 $\mathbf{R}=\mathbf{U}\mathbf{V}^\top$ 时取到最大。
+\end{proof}
+
+\begin{note}
+\textbf{行列式符号修正（实现必加）.}\;
+\cref{thm:calib-nearest-rotation} 的 $\mathbf{U}\mathbf{V}^\top$ 可能行列式为 $-1$（是反射而非旋转）。标准做法（Procrustes/Kabsch）：若 $\det(\mathbf{U}\mathbf{V}^\top)=-1$，取 $\mathbf{R}=\mathbf{U}\,\mathrm{diag}(1,1,-1)\,\mathbf{V}^\top$，强制 $\det\mathbf{R}=+1$。张正友原文未显式写此修正，但工程实现不可省。这与 \cref{ch:lie} 中“把噪声矩阵投影回 $\SO(3)$”的思路一致。
+\end{note}
+
+\begin{example}[完整闭式标定流程的代数走查]\label{ex:calib-closed-walkthrough}
+把 \cref{sec:calib-homography,sec:calib-closed} 串成一条可执行链：
+\begin{enumerate}
+  \item 对每幅图 $k$，用 \cref{eq:calib-dlt-row}（含 Hartley 归一化）估单应 $\mathbf{H}^{(k)}=[\mathbf{h}_1^{(k)}\,\mathbf{h}_2^{(k)}\,\mathbf{h}_3^{(k)}]$；
+  \item 对每幅图按 \cref{eq:calib-vij} 构造 $\mathbf{v}_{11},\mathbf{v}_{12},\mathbf{v}_{22}$，组装两行 $[\mathbf{v}_{12}^\top;\,(\mathbf{v}_{11}-\mathbf{v}_{22})^\top]$；
+  \item 堆叠所有图的两行成 $\mathbf{V}$（$2n\times6$，$n=2$ 时追加 $[0,1,0,0,0,0]$）；SVD 取最小右奇异向量得 $\mathbf{b}$；
+  \item 由 $\mathbf{b}$ 还原对称 $\boldsymbol{\omega}$，按 \cref{eq:calib-extract} 依序解 $v_0,\lambda,\alpha,\beta,\gamma,u_0$，组装 $\mathbf{K}$；
+  \item 对每幅图按 \cref{eq:calib-extrinsics} 解 $\mathbf{r}_1,\mathbf{r}_2,\mathbf{r}_3,\mathbf{t}$，再用 \cref{thm:calib-nearest-rotation}（含 $\det$ 修正）把 $[\mathbf{r}_1\,\mathbf{r}_2\,\mathbf{r}_3]$ 投影回 $\SO(3)$。
+\end{enumerate}
+输出 $\mathbf{K}$ 与每幅图 $(\mathbf{R}_k,\mathbf{t}_k)$——这就是张正友闭式解，将作为 \cref{sec:calib-mle} 中 LM 的初值。
+\end{example}
+
+\begin{pitfall}[思维陷阱：闭式解已经够好，不需要再优化]
+\textbf{错误想法}：“代数解一步算出，干净利落，何必再迭代？”\textbf{现象}：闭式解的内参在不同图数下\emph{波动较大}（见 \cref{sec:calib-numerical} 的表，$3$ 图时 $\alpha$ 估到 $917$，最终 MLE 才收到 $830$），畸变系数甚至\emph{符号都可能错}。\textbf{根本原因}：闭式解最小化的是\emph{代数距离}（无物理意义的量），对噪声敏感、未建模畸变。\textbf{正确做法}：闭式解只作\emph{初值}，必须接最大似然 LM 精化（\cref{sec:calib-mle}）。\textbf{自检}：对比闭式解与 MLE 的内参，若差异 $>$ 几个百分点，说明噪声/畸变显著，更要做 MLE。
+\end{pitfall}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item （实现）按 \cref{ex:calib-closed-walkthrough} 用 NumPy 写完整闭式标定，输入若干单应、输出 $\mathbf{K}$；用 \cref{sec:calib-numerical} 的仿真真值（$\alpha=1250,\beta=900,\gamma=1.09083,u_0=v_0=255$）合成数据，验证恢复误差。
+  \item 手推 \cref{eq:calib-vij} 的第 $4$ 分量：从 $\mathbf{h}_i^\top\boldsymbol{\omega}\mathbf{h}_j=\sum_{p,q}h_{ip}B_{pq}h_{jq}$ 出发，找出所有与 $B_{13}$ 相关的项并合并，确认系数为 $h_{i1}h_{j3}+h_{i3}h_{j1}$。
+  \item 若只拍了 $1$ 幅图、且已知主点在图像中心、$\gamma=0$，写出此时能解出的内参个数与对应方程。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{镜头畸变模型与标定}
+\label{sec:calib-distortion}
+
+\paragraph{这一节解决什么。}
+到目前为止全用理想针孔模型，但真实镜头有畸变——尤其桌面/手机/广角相机。本节建立径向与切向畸变模型（Brown--Conrady 及 OpenCV 扩展），并给出张正友的“先线性求 $k_1,k_2$ 初值”的两阶段做法。这接续 \cref{sec:cam-distortion} 的畸变方程（\cref{eq:distortion}），把那里“已知畸变系数”的设定补完为“怎么标出畸变系数”。
+
+\subsection{畸变的物理来源与分类}
+
+\paragraph{两类主要畸变。}
+\begin{itemize}
+  \item \textbf{径向畸变（radial distortion）}：因透镜元件并非完美球面，使本应是直线的物体在图像中弯曲。理想像点沿过畸变中心的\emph{径向}偏移。$k_1>0$ 为\emph{枕形（pincushion）}，$k_1<0$ 为\emph{桶形（barrel）}\cite{vorobyev2023distortion}。中心附近畸变小，越往边缘越大。手机广角拍出的“鼓出来”的画面就是典型桶形。
+  \item \textbf{切向畸变（tangential / decentering distortion，偏心畸变）}：因透镜各元件的光学中心未共线（装配未对齐）。由 Conrady $1919$ 首次建模\cite{tangram2021brown}；理想像点在径向与切向都偏移。
+\end{itemize}
+此外还有\emph{薄棱镜畸变（thin prism）}（镜头与传感器轻微楔形误差）和\emph{倾斜传感器（tilted/Scheimpflug）}（传感器相对镜头平面倾斜），均为 OpenCV 的高级可选项，常规标定不启用。
+
+\paragraph{历史脉络（Brown--Conrady）。}
+\begin{itemize}
+  \item \textbf{Conrady $1919$}\cite{tangram2021brown}：发表于《皇家天文学会月报》，首次提出镜头偏心畸变的理论模型；
+  \item \textbf{Brown $1966$}\cite{tangram2021brown}：把 Conrady 的理论转化为可实践的标定工具，证明偏心畸变可被解析地标定，形成现今常用的 \emph{Brown--Conrady 模型}；
+  \item \textbf{Brown $1971$}\cite{brown1971closerange}：铅垂线法（plumb line）——用图像中本应是直线的物体来标定畸变。
+\end{itemize}
+
+\subsection{Brown--Conrady 模型与 OpenCV 扩展}
+\label{sec:calib-distortion-model}
+
+\paragraph{标准 $5$ 参数模型（教学版/OpenCV 默认）。}
+设归一化无畸变坐标 $(x,y)$（即把 $3$ 维点变到相机系、透视除法 $x=X_c/Z_c,y=Y_c/Z_c$ 得到，主点尚未加），径向距离平方 $r^2=x^2+y^2$。畸变后归一化坐标 $(x_d,y_d)$ 为\cite{vorobyev2023distortion,opencv2024calib}：
+\begin{align}
+  x_d &= x(1+k_1r^2+k_2r^4+k_3r^6) + [\,2p_1xy+p_2(r^2+2x^2)\,],\notag\\
+  y_d &= y(1+k_1r^2+k_2r^4+k_3r^6) + [\,p_1(r^2+2y^2)+2p_2xy\,].
+  \label{eq:calib-brown-conrady}
+\end{align}
+前一括号是\emph{径向}（系数 $k_1,k_2,k_3$），后一括号是\emph{切向}（系数 $p_1,p_2$）。最后加主点与焦距得像素：$u=f_xx_d+c_x$，$v=f_yy_d+c_y$。\emph{径向畸变中心 $=$ 主点}（畸变作用在归一化坐标上，主点已在内参里移除）。畸变系数向量默认 $5$ 元 $(k_1,k_2,p_1,p_2,k_3)$。
+
+\paragraph{OpenCV 完整模型（$14$ 参数）。}
+OpenCV 把 Brown--Conrady 扩展为有理径向 $+$ 切向 $+$ 薄棱镜，正向畸变（$(x,y)\to(x'',y'')$）为\cite{opencv2024calib}：
+\begin{equation}
+  \begin{aligned}
+  x'' &= x\,\frac{1+k_1r^2+k_2r^4+k_3r^6}{1+k_4r^2+k_5r^4+k_6r^6}+2p_1xy+p_2(r^2+2x^2)+s_1r^2+s_2r^4,\\
+  y'' &= y\,\frac{1+k_1r^2+k_2r^4+k_3r^6}{1+k_4r^2+k_5r^4+k_6r^6}+p_1(r^2+2y^2)+2p_2xy+s_3r^2+s_4r^4.
+  \end{aligned}
+  \label{eq:calib-opencv-dist}
+\end{equation}
+$k_4,k_5,k_6$ 为有理模型分母项（广角/鱼眼更稳健，启用 \texttt{CALIB\_RATIONAL\_MODEL}），$s_1\ldots s_4$ 为薄棱镜（\texttt{CALIB\_THIN\_PRISM\_MODEL}）。再加倾斜传感器 $\tau_x,\tau_y$（\texttt{CALIB\_TILTED\_MODEL}）则为 $14$ 参数。畸变系数向量按\textbf{固定顺序}排列，长度可为 $4,5,8,12,14$：
+\begin{equation}
+  (\,k_1,\,k_2,\,p_1,\,p_2[,\,k_3[,\,k_4,\,k_5,\,k_6[,\,s_1,\,s_2,\,s_3,\,s_4[,\,\tau_x,\,\tau_y]]]]\,).
+  \label{eq:calib-dist-order}
+\end{equation}
+
+\begin{pitfall}[编程陷阱：以为顺序是 $k_1,k_2,k_3,p_1,p_2$]
+\textbf{错误做法}：手填畸变向量时按“先三个径向再两个切向”排成 $(k_1,k_2,k_3,p_1,p_2)$。\textbf{现象}：去畸变后图像比原图更歪，或 $k_3$ 被当成切向项。\textbf{根本原因}：OpenCV 默认顺序是 $(k_1,k_2,p_1,p_2,k_3)$——\emph{切向 $p_1,p_2$ 排在 $k_3$ 之前}（\cref{eq:calib-dist-order}），这是与不少文献的常见冲突点。\textbf{正确做法}：严格按 \cref{eq:calib-dist-order}；优先直接用 \texttt{calibrateCamera} 返回的 \texttt{dist} 向量，不要手拼。\textbf{自检}：打印 \texttt{dist.shape}，确认是 $1\times5$ 且第 $3,4$ 项是切向。
+\end{pitfall}
+
+\paragraph{去畸变无闭式：迭代逆。}
+\cref{eq:calib-brown-conrady,eq:calib-opencv-dist} 都是\emph{正向}（无畸变$\to$有畸变）。其逆——“去畸变（undistort）”——\emph{无闭式解}。给定畸变点 $\mathbf{n}_d=(x_d,y_d)$，求无畸变 $\mathbf{n}_u$ 用不动点迭代\cite{vorobyev2023distortion}：
+\begin{equation}
+  \mathbf{n}_u^{(k+1)}=\mathbf{n}_d-\big(D(\mathbf{n}_u^{(k)})-\mathbf{n}_u^{(k)}\big),\qquad \mathbf{n}_u^{(0)}=\mathbf{n}_d,
+  \label{eq:calib-undistort-iter}
+\end{equation}
+其中 $D$ 是正向畸变映射。默认迭代 $8$ 次；当畸变映射雅可比谱半径 $<1$ 时收敛。这正是 OpenCV \texttt{undistortPoints} 的内部思路。
+
+\subsection{张正友的径向畸变标定（两阶段）}
+\label{sec:calib-radial}
+
+\paragraph{张正友只取径向前两项。}
+张正友主文只建模径向 $k_1,k_2$、\emph{不含切向}\cite{zhang2000calibration}。理由（文献\cite{tsai1987versatile,weng1992distortion} 报告）：畸变函数几乎完全由径向分量主导，尤其第一项主导；更精细建模\emph{不仅无益}（与传感器量化相比可忽略），\emph{反而引起数值不稳定}。
+
+\paragraph{像素层畸变方程。}
+设理想（无畸变、不可观测）归一化坐标 $(x,y)$、真实（畸变）$(\breve x,\breve y)$，只取径向前两项\cite{zhang2000calibration}：
+\begin{equation}
+  \breve x = x + x\,[\,k_1(x^2+y^2)+k_2(x^2+y^2)^2\,],\qquad
+  \breve y = y + y\,[\,k_1(x^2+y^2)+k_2(x^2+y^2)^2\,].
+\end{equation}
+代入 $\breve u=u_0+\alpha\breve x+\gamma\breve y$、$\breve v=v_0+\beta\breve y$ 并设 $\gamma=0$，与无畸变关系 $u=u_0+\alpha x$ 相减，得\emph{像素层}畸变方程（张正友式 (11)(12)\cite{zhang2000calibration}）：
+\begin{equation}
+  \breve u = u + (u-u_0)\,[\,k_1(x^2+y^2)+k_2(x^2+y^2)^2\,],\qquad
+  \breve v = v + (v-v_0)\,[\,k_1(x^2+y^2)+k_2(x^2+y^2)^2\,].
+  \label{eq:calib-radial-pixel}
+\end{equation}
+\textbf{中间步}：$\breve u-u=\alpha\,x[\cdots]=(u-u_0)[\cdots]$（因 $u-u_0=\alpha x$），方括号内用的是\emph{归一化坐标}的半径平方。
+
+\paragraph{阶段一：线性求 $k_1,k_2$ 初值。}
+径向畸变通常很小，故先忽略它用 \cref{sec:calib-closed} 把其它五参估“足够好”，得理想像素 $(u,v)$；再事后估 $k_1,k_2$。由 \cref{eq:calib-radial-pixel}，每幅图每点给两个方程\cite{zhang2000calibration}：
+\begin{equation}
+  \begin{bmatrix}
+  (u-u_0)(x^2+y^2) & (u-u_0)(x^2+y^2)^2\\
+  (v-v_0)(x^2+y^2) & (v-v_0)(x^2+y^2)^2
+  \end{bmatrix}
+  \begin{bmatrix}k_1\\k_2\end{bmatrix}
+  =\begin{bmatrix}\breve u-u\\ \breve v-v\end{bmatrix}.
+\end{equation}
+$n$ 幅图共 $m$ 点堆叠成 $2mn$ 个方程 $\mathbf{D}\mathbf{k}=\mathbf{d}$（$\mathbf{k}=[k_1,k_2]^\top$），线性最小二乘解（张正友式 (13)\cite{zhang2000calibration}）：
+\begin{equation}
+  \mathbf{k}=(\mathbf{D}^\top\mathbf{D})^{-1}\mathbf{D}^\top\mathbf{d}.
+  \label{eq:calib-radial-linear}
+\end{equation}
+
+\begin{pitfall}[概念误区：畸变越多项越精确]
+\textbf{错误想法}：“多加几项 $k_3,k_4,k_5,k_6$，模型越复杂越准。”\textbf{现象}：训练图重投影误差降到接近零，换一批图却变差。\textbf{根本原因}：径向畸变由第一项主导，高阶项与传感器量化噪声同量级，多估的项在拟合\emph{噪声}而非\emph{信号}——过拟合，且引入数值不稳定\cite{zhang2000calibration}。\textbf{正确做法}：由简到繁，常规镜头用 $k_1,k_2(,k_3)$ 足矣，广角/鱼眼才开有理模型；切向若镜头对齐良好可置 $0$（\texttt{CALIB\_ZERO\_TANGENT\_DIST}）。\textbf{自检}：用交叉验证（见 \cref{sec:calib-capture}）判断加项是否真改善。
+\end{pitfall}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 从 $\breve x=x+x[k_1r^2+k_2r^4]$ 出发，用 $u=u_0+\alpha x$、$\breve u=u_0+\alpha\breve x$（设 $\gamma=0$），推出 \cref{eq:calib-radial-pixel} 的第一式，说明为何系数是 $(u-u_0)$ 而非 $\alpha$。
+  \item 解释为什么去畸变没有闭式解：从 \cref{eq:calib-brown-conrady} 看，已知 $(x_d,y_d)$ 反解 $(x,y)$ 是一个关于 $(x,y)$ 的高次多项式方程组，无一般根式解。验证 \cref{eq:calib-undistort-iter} 在小畸变下一步即近似收敛。
+  \item （调试）给一段把畸变向量写成 $(k_1,k_2,k_3,p_1,p_2)$ 的 OpenCV 代码，指出 bug 并改正。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{完整最大似然精化}
+\label{sec:calib-mle}
+
+\paragraph{这一节解决什么。}
+闭式解（$\mathbf{K}$、外参）与线性畸变解（$k_1,k_2$）都只是初值。本节把全部参数放进一个含畸变的重投影误差目标，用 Levenberg--Marquardt 一起精化——这才是最终标定结果的来源。它是 \cref{ch:nlopt} 非线性优化的一个完整应用实例。
+
+\paragraph{无畸变 MLE。}
+设 $n$ 幅图、每幅 $m$ 个点，图像点被独立同分布噪声污染。最大似然估计最小化重投影误差（张正友式 (10)\cite{zhang2000calibration}）：
+\begin{equation}
+  \min_{\mathbf{K},\{\mathbf{R}_i,\mathbf{t}_i\}}\ \sum_{i=1}^{n}\sum_{j=1}^{m}\big\|\,\mathbf{m}_{ij}-\hat{\mathbf{m}}(\mathbf{K},\mathbf{R}_i,\mathbf{t}_i,\mathbf{M}_j)\,\big\|^2,
+  \label{eq:calib-mle}
+\end{equation}
+$\hat{\mathbf{m}}$ 是点 $\mathbf{M}_j$ 在第 $i$ 幅图中按 \cref{eq:calib-homography} 的投影。
+
+\paragraph{含畸变的完整 MLE。}
+把畸变并入，最小化（张正友式 (14)\cite{zhang2000calibration}）：
+\begin{equation}
+  \min_{\mathbf{K},k_1,k_2,\{\mathbf{R}_i,\mathbf{t}_i\}}\ \sum_{i=1}^{n}\sum_{j=1}^{m}\big\|\,\mathbf{m}_{ij}-\breve{\mathbf{m}}(\mathbf{K},k_1,k_2,\mathbf{R}_i,\mathbf{t}_i,\mathbf{M}_j)\,\big\|^2,
+  \label{eq:calib-mle-dist}
+\end{equation}
+$\breve{\mathbf{m}}$ $=$ 先按 \cref{eq:calib-homography} 投影、再按 \cref{eq:calib-radial-pixel} 加畸变。
+
+\paragraph{旋转参数化与求解器。}
+旋转 $\mathbf{R}$ 用 $3$ 维向量 $\mathbf{r}$ 参数化（方向 $=$ 旋转轴、模 $=$ 旋转角，即轴角/Rodrigues 向量），$\mathbf{R}$ 与 $\mathbf{r}$ 由 Rodrigues 公式（\cref{ch:lie}）联系。\cref{eq:calib-mle-dist} 是非线性最小二乘，用 Levenberg--Marquardt\cite{more1978lm}（Minpack 实现）求解；$\mathbf{K},\{\mathbf{R}_i,\mathbf{t}_i\}$ 初值来自闭式解（\cref{ex:calib-closed-walkthrough}），$k_1,k_2$ 初值来自 \cref{eq:calib-radial-linear} 或\emph{直接置 $0$}。LM 通常 $3$--$5$ 次迭代收敛\cite{zhang2000calibration}。
+
+\paragraph{为什么不用纯交替法。}
+一个朴素策略是“估五参$\to$估畸变$\to$再估五参”两步交替。张正友实验发现这\emph{收敛慢}\cite{zhang2000calibration}，故改为把全部参数一起放进 \cref{eq:calib-mle-dist} 联合优化。这是“分块坐标下降慢、联合优化快”的一个具体例证。
+
+\subsection{参数不确定度：标定结果该带多大的误差棒}
+\label{sec:calib-uncertainty}
+
+\paragraph{这一节解决什么。}
+\cref{tab:calib-table1} 每个内参后面都跟一个 $\sigma$（如 $\alpha=832.50\pm1.41$）。这个“误差棒”不是事后凭感觉填的，而是从 LM 收敛点的\emph{雅可比}里反推出来的——它告诉你“这次标定到底有多可信”，是判断标定好坏\emph{比 RMS 更本质}的量。本节给出它的来历。
+
+\paragraph{从最小二乘到协方差。}
+把 \cref{eq:calib-mle-dist} 的全部待估参数堆成一个向量 $\boldsymbol{\theta}=[\,\underbrace{f_x,f_y,c_x,c_y,\gamma,k_1,k_2}_{\text{相机参数，全图共享}};\ \underbrace{\mathbf{r}_1,\mathbf{t}_1,\ldots,\mathbf{r}_n,\mathbf{t}_n}_{\text{每图外参}}\,]$。设残差向量 $\mathbf{e}(\boldsymbol{\theta})$ 堆叠所有图所有点的重投影残差（长度 $2mn$），LM 在最优 $\hat{\boldsymbol{\theta}}$ 处的雅可比为 $\mathbf{J}=\partial\mathbf{e}/\partial\boldsymbol{\theta}$。在“残差近独立同分布高斯、噪声方差 $\sigma_0^2$”的标准假设下（\cref{ch:nlopt} 的非线性最小二乘理论），估计的协方差由 Gauss--Newton 的逆海森近似给出：
+\begin{equation}
+  \mathrm{Cov}(\hat{\boldsymbol{\theta}}) \approx \hat\sigma_0^2\,(\mathbf{J}^\top\mathbf{J})^{-1},
+  \qquad
+  \hat\sigma_0^2 = \frac{\mathbf{e}^\top\mathbf{e}}{2mn - \dim\boldsymbol{\theta}},
+  \label{eq:calib-covariance}
+\end{equation}
+其中 $\hat\sigma_0^2$ 是\emph{后验单位权方差}（噪声方差的无偏估计，分母为残差数减参数数的\emph{自由度}）。各参数的标准差 $\sigma$ 即 $\mathrm{Cov}(\hat{\boldsymbol{\theta}})$ 对角元的平方根——这正是 \cref{tab:calib-table1} 的 $\sigma$ 列\cite{zhang2000calibration}，也正是 OpenCV \texttt{calibrateCameraExtended} 返回的 \texttt{stdDeviationsIntrinsics}/\allowbreak\texttt{stdDeviationsExtrinsics}（其内部即 $\sqrt{\hat\sigma_0^2\,[(\mathbf{J}^\top\mathbf{J})^{-1}]_{kk}}$\cite{opencv2024calib}）。
+
+\begin{insight}
+\textbf{协方差比 RMS 信息量大得多}。RMS 是一个标量，只告诉你“整体拟合多紧”；协方差 \cref{eq:calib-covariance} 是一整个矩阵，告诉你\emph{每个参数各自}多可信、\emph{哪些参数相互纠缠}。最典型的纠缠是\textbf{焦距 $f_x$ 与主点 $c_x$、以及焦距与板距}：若采图全是正面板，$(\mathbf{J}^\top\mathbf{J})^{-1}$ 在 $f$--$c$ 子块上会出现大的非对角元（强相关），对角元（方差）随之暴涨——这就是“为什么必须倾斜板”（\cref{sec:calib-capture} 的洞见）在数值上的体现：倾斜让 $\mathbf{J}$ 的列更线性无关、$\mathbf{J}^\top\mathbf{J}$ 更良态、方差更小。\emph{退化构型（\cref{sec:calib-degenerate}）在这里表现为 $\mathbf{J}^\top\mathbf{J}$ 接近奇异、某些方向方差趋于无穷}。
+\end{insight}
+
+\begin{note}
+\textbf{主点不确定度要相对焦距看（Triggs\cite{triggs1998autocalib}）.}\;
+\cref{sec:calib-numerical} 已提到：主点的\emph{绝对}误差 $\sigma_{c_x}$（像素）无直接几何意义，因为把相机后退并增大焦距能在很大范围内补偿主点偏移。应看\emph{相对}量 $\sigma_{c_x}/f_x$（无量纲）。这也是 \cref{tab:calib-table1} 中 $c_x,c_y$ 的 $\sigma$（约 $0.7$--$1.4$ 像素）看似不小、却完全可接受的原因：除以 $f_x\approx832$ 后只有约 $0.1\%$。协方差公式 \cref{eq:calib-covariance} 是按标准最小二乘不确定度理论（\cref{ch:nlopt}）的统一表述：张正友原文给出 $\sigma$ 数值与“用 $\mathbf{J}^\top\mathbf{J}$ 求逆乘后验方差”的做法，与此一致；逐元素实现可对照 OpenCV \texttt{calibrateCameraExtended} 与最小二乘教材。
+\end{note}
+
+\begin{note}
+\textbf{与本书右扰动约定的衔接（严格化）.}\;
+张正友/OpenCV 用“Rodrigues 把 $\mathbf{R}$ 转成 $3$ 维 $\mathbf{r}$、再对 $\mathbf{r}$ 做无约束 LM”，等价于在 $\SO(3)$ 切空间做局部优化——本书\emph{右扰动}框架（\cref{ch:lie}）的一个特例。若要严格写成 $\mathbf{R}\leftarrow\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\phi})$ 的右扰动雅可比：重投影误差 $\mathbf{e}=\mathbf{m}-\pi(\mathbf{K},\mathbf{R}\mathbf{M}_j+\mathbf{t})$ 对 $\delta\boldsymbol{\phi}$ 的雅可比含 $-\mathbf{R}\mathbf{M}_j^\wedge$ 项（\cref{ch:lie} 的右扰动求导），再链式乘上投影 $\pi$ 与畸变对相机系点的雅可比。原文用轴角直参未给这一层；本书在 \cref{ch:vo} 重投影误差求导处给出完整右扰动雅可比（与轴角直参等价，仅参数化记号不同），标定 BA 可直接复用。
+\end{note}
+
+\begin{example}[一个真实标定结果长什么样]\label{ex:calib-real-result}
+张正友\cite{zhang2000calibration} 用现成 PULNiX CCD 相机（$6\,\mathrm{mm}$ 镜头、$640\times480$），$8\times8$ 方格图案（$256$ 角点）拍 $5$ 幅，最终 MLE 结果（取 $5$ 图）：$\alpha\approx832.5,\ \beta\approx832.5,\ \gamma\approx0.2,\ u_0\approx304.0,\ v_0\approx206.6,\ k_1\approx-0.228,\ k_2\approx0.190$，RMS 重投影误差 $\approx0.335$ 像素。这给读者一个量级直觉：$640\times480$ 相机焦距约 $830$ 像素、主点接近图像中心 $(320,240)$ 但有偏移、$k_1<0$（桶形）、亚像素 RMS。完整数值（含闭式初值与不确定度）见 \cref{sec:calib-numerical} 的表。
+\end{example}
+
+\begin{pitfall}[思维陷阱：把 LM 当黑盒，初值随便给]
+\textbf{错误想法}：“LM 会自己收敛，初值无所谓。”\textbf{现象}：标定不收敛、收敛到荒谬值、或畸变符号翻转。\textbf{根本原因}：\cref{eq:calib-mle-dist} 非凸，LM 只保证局部收敛；离谱初值会掉进坏极小。\textbf{正确做法}：内参/外参初值\emph{必须}来自闭式解，畸变初值用线性解或 $0$。\textbf{自检}：LM 应在 $3$--$5$ 次迭代内收敛；若迭代很多或残差不降，多半初值或数据有问题。
+\end{pitfall}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 写出 \cref{eq:calib-mle-dist} 关于焦距 $f_x$ 的偏导（链式：误差 $\to$ 像素 $\to$ 畸变 $\to$ 归一化 $\to$ 相机系点），说明为什么需要数值或解析雅可比。
+  \item 解释为什么 \cref{eq:calib-mle} 是“最大似然”：在高斯独立同分布噪声假设下，写出似然函数并说明最小化平方和等价于最大化对数似然。
+  \item （跨章综合）结合 \cref{ch:nlopt}：把 \cref{eq:calib-mle-dist} 写成高斯--牛顿正规方程 $\mathbf{H}\delta=-\mathbf{J}^\top\mathbf{e}$ 的形式，指出参数向量 $\boldsymbol{\theta}=[\mathbf{K}\text{ 五参};\{\mathbf{r}_i,\mathbf{t}_i\};k_1,k_2]$ 的维度随图数线性增长，并说明它具有“相机参数共享、各图外参独立”的箭头/稀疏结构（与 BA 同构）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{退化构型}
+\label{sec:calib-degenerate}
+
+\paragraph{这一节解决什么。}
+不是随便拍几张图都能标定。某些构型下追加图像\emph{不提供新约束}，本节给出最重要的一条命题及其完整证明，并给出规避办法。
+
+\paragraph{根源。}
+因约束 \cref{eq:calib-constraint1,eq:calib-constraint2} 来自旋转矩阵性质，若 $\mathbf{R}_2$ 与 $\mathbf{R}_1$ 不独立，则第 $2$ 幅图不提供新约束\cite{zhang2000calibration}。特别地，平面\emph{纯平移}时 $\mathbf{R}_2=\mathbf{R}_1$，第 $2$ 幅图完全无用。
+
+\begin{theorem}[平行平面退化，张正友命题 1]\label{thm:calib-degenerate}
+若第二位置的模型平面与第一位置\emph{平行}，则第二个单应不提供任何额外内参约束。
+\end{theorem}
+\begin{proof}
+（张正友 §4\cite{zhang2000calibration}）本约定下，$\mathbf{R}_2$ 与 $\mathbf{R}_1$ 相差一个绕 $z$ 轴的旋转：
+\[
+  \mathbf{R}_1\begin{bmatrix}\cos\theta&-\sin\theta&0\\ \sin\theta&\cos\theta&0\\ 0&0&1\end{bmatrix}=\mathbf{R}_2,
+\]
+$\theta$ 为相对旋转角。用上标 $(1),(2)$ 区分图 $1$、图 $2$ 的量。用 $\mathbf{H}=\lambda\mathbf{K}[\mathbf{r}_1\,\mathbf{r}_2\,\mathbf{t}]$ 与上面绕 $z$ 轴的旋转关系展开（$\mathbf{r}^{(1)},\mathbf{r}^{(2)}$ 指 $\mathbf{R}_1$ 前两列）：
+\[
+  \mathbf{h}_1^{(2)}=\frac{\lambda^{(2)}}{\lambda^{(1)}}\big(\mathbf{h}_1^{(1)}\cos\theta+\mathbf{h}_2^{(1)}\sin\theta\big),\qquad
+  \mathbf{h}_2^{(2)}=\frac{\lambda^{(2)}}{\lambda^{(1)}}\big(-\mathbf{h}_1^{(1)}\sin\theta+\mathbf{h}_2^{(1)}\cos\theta\big).
+\]
+代入图 $2$ 的第一个约束 \cref{eq:calib-constraint1}：
+\[
+  \mathbf{h}_1^{(2)\top}\boldsymbol{\omega}\mathbf{h}_2^{(2)}
+  =\frac{\lambda^{(2)}}{\lambda^{(1)}}\Big[(\cos^2\theta-\sin^2\theta)\big(\mathbf{h}_1^{(1)\top}\boldsymbol{\omega}\mathbf{h}_2^{(1)}\big)
+  -\cos\theta\sin\theta\big(\mathbf{h}_1^{(1)\top}\boldsymbol{\omega}\mathbf{h}_1^{(1)}-\mathbf{h}_2^{(1)\top}\boldsymbol{\omega}\mathbf{h}_2^{(1)}\big)\Big],
+\]
+它是 $\mathbf{H}_1$ 给出的两个约束的\emph{线性组合}。类似可证图 $2$ 的第二个约束也是 $\mathbf{H}_1$ 两约束的线性组合。故从 $\mathbf{H}_2$ 得不到任何新约束。
+\end{proof}
+
+\paragraph{几何解释与规避。}
+平行平面在无穷远平面上交于\emph{相同}的圆环点（\cref{sec:calib-iac}），故按几何视角它们提供相同约束——这是 \cref{sec:calib-iac} 那句预告的落地。实践规避极易：\textbf{每次拍摄改变模型平面朝向}即可。虽纯平移时本法失效，但若平移已知（如 Tsai 装置\cite{tsai1987versatile}）仍可标定：由 $\mathbf{t}^{(ij)}=\mathbf{t}^{(i)}-\mathbf{t}^{(j)}=\mathbf{K}^{-1}(\lambda^{(i)}\mathbf{h}_3^{(i)}-\lambda^{(j)}\mathbf{h}_3^{(j)})$，知平移方向给 $2$ 个约束、再知大小给 $1$ 个，两个平面即可完整标定\cite{zhang2000calibration}。
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 补全 \cref{thm:calib-degenerate} 证明中“图 $2$ 第二个约束也是线性组合”的部分：把 $\mathbf{h}_1^{(2)\top}\boldsymbol{\omega}\mathbf{h}_1^{(2)}-\mathbf{h}_2^{(2)\top}\boldsymbol{\omega}\mathbf{h}_2^{(2)}$ 展开，确认它是图 $1$ 两约束的线性组合。
+  \item 解释为什么“纯平移”是“平行平面”的特例（$\theta=0$ 时退化关系变成什么）。
+  \item 设计一个采图方案，保证 $5$ 幅图两两不平行——给出每幅图大致的朝向（用绕哪个轴转多少度描述）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{OpenCV 工具实践}
+\label{sec:calib-opencv}
+
+\paragraph{这一节解决什么。}
+前面是理论与算法，本节落到工程：OpenCV 的 \texttt{calibrateCamera} \emph{就是}张正友法的实现（闭式初值 $+$ LM 精化），只是畸变模型扩展为 \cref{eq:calib-opencv-dist}。我们走完“角点检测 $\to$ 标定 $\to$ 去畸变 $\to$ 误差评估”全流程。
+
+\subsection{OpenCV 的相机与畸变模型}
+
+\paragraph{投影分步。}
+OpenCV 内参不含斜交\cite{opencv2024calib}：先把世界点变到相机系并归一化 $x'=X_c/Z_c,\ y'=Y_c/Z_c$；加畸变得 $(x'',y'')$（\cref{eq:calib-opencv-dist}）；最后 $u=f_xx''+c_x,\ v=f_yy''+c_y$。内参矩阵 $\mathbf{K}=\big[\begin{smallmatrix}f_x&0&c_x\\0&f_y&c_y\\0&0&1\end{smallmatrix}\big]$。畸变默认 $5$ 元 $(k_1,k_2,p_1,p_2,k_3)$。
+
+\subsection{标定工作流（棋盘格，Python）}
+\label{sec:calib-opencv-workflow}
+
+\begin{codebox}[Python]{OpenCV 棋盘格标定:角点检测 + 标定}
+import numpy as np
+import cv2 as cv
+import glob
+
+# 亚像素角点优化终止准则:30 次迭代 或 移动 < 0.001 像素
+criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+
+# 准备棋盘 3D 物点 (0,0,0),(1,0,0),...,(6,5,0)，Z=0（单位 = 方格边长）
+# 7x6 指内角点数，不是方格数
+objp = np.zeros((6 * 7, 3), np.float32)
+objp[:, :2] = np.mgrid[0:7, 0:6].T.reshape(-1, 2)
+
+objpoints = []   # 世界系 3D 物点 (object points)
+imgpoints = []   # 图像系 2D 像点 (image points)
+images = glob.glob('*.jpg')
+
+for fname in images:
+    img = cv.imread(fname)
+    gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+    # 找棋盘内角点 (7x6)
+    ret, corners = cv.findChessboardCorners(gray, (7, 6), None)
+    if ret == True:
+        objpoints.append(objp)
+        # 亚像素精化角点（搜索窗 11x11，无死区）
+        corners2 = cv.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+        imgpoints.append(corners2)
+        cv.drawChessboardCorners(img, (7, 6), corners2, ret)  # 可视化质检
+        cv.imshow('img', img); cv.waitKey(500)
+cv.destroyAllWindows()
+
+# 标定:内部 = 张正友闭式初值 + 全局 LM 精化
+# 返回: ret=整体 RMS 重投影误差, mtx=内参 K, dist=畸变系数,
+#       rvecs=每幅图旋转向量(Rodrigues), tvecs=每幅图平移
+ret, mtx, dist, rvecs, tvecs = cv.calibrateCamera(
+        objpoints, imgpoints, gray.shape[::-1], None, None)
+\end{codebox}
+
+\paragraph{逐行对应理论。}
+\texttt{findChessboardCorners} 检测内角点（对应张正友“检测特征点”）；\texttt{cornerSubPix} 亚像素精化（对应“高精度角点检测”，直接决定标定上限）；\texttt{calibrateCamera} 内部先用张正友闭式解初始化内参、\texttt{solvePnP} 初始化外参，再跑全局 LM 最小化重投影误差（即 \cref{eq:calib-mle-dist} 的实现）\cite{opencv2024calib}。参数 \texttt{gray.\allowbreak shape[::-1]} 是 $(w,h)$；末两个 \texttt{None} 是内参/畸变初值（不给则内部自动初始化）。\texttt{rvecs} 是 Rodrigues 旋转向量（对应张正友的 $3$ 维 $\mathbf{r}$），用 \texttt{cv.\allowbreak Rodrigues} 可转 $\mathbf{R}$。
+
+\subsection{去畸变}
+
+\begin{codebox}[Python]{去畸变:两种方法}
+img = cv.imread('left12.jpg')
+h, w = img.shape[:2]
+# 新内参:alpha=1 保留全部像素(含黑边)并返回有效 ROI;alpha=0 裁掉无效像素
+newcameramtx, roi = cv.getOptimalNewCameraMatrix(mtx, dist, (w, h), 1, (w, h))
+
+# 方法 1:直接去畸变
+dst = cv.undistort(img, mtx, dist, None, newcameramtx)
+x, y, w, h = roi
+dst = dst[y:y+h, x:x+w]          # 按 ROI 裁掉黑边
+cv.imwrite('calibresult.png', dst)
+
+# 方法 2:重映射（适合批量/视频，先算映射表再多次复用）
+mapx, mapy = cv.initUndistortRectifyMap(mtx, dist, None, newcameramtx, (w, h), 5)
+dst2 = cv.remap(img, mapx, mapy, cv.INTER_LINEAR)
+x, y, w, h = roi
+dst2 = dst2[y:y+h, x:x+w]
+\end{codebox}
+
+\paragraph{说明。}
+\texttt{getOptimalNewCameraMatrix} 按自由缩放参数 $\alpha\in[0,1]$ 调整视场：$\alpha=1$ 保留全部像素（含黑边）、$\alpha=0$ 裁掉无效像素，返回新内参与有效 ROI。去畸变内部用 \cref{eq:calib-undistort-iter} 的迭代逆。方法 $2$ 先算映射表 \texttt{mapx,mapy} 再 \texttt{remap}，对视频流更高效。
+
+\subsection{重投影误差评估}
+
+\begin{codebox}[Python]{重投影误差:标定质量评估}
+mean_error = 0
+for i in range(len(objpoints)):
+    # 用估计的内外参 + 畸变把物点重新投影（即 Zhang 式(14) 的 m_breve）
+    imgpoints2, _ = cv.projectPoints(objpoints[i], rvecs[i], tvecs[i], mtx, dist)
+    # 每点平均 L2 距离
+    error = cv.norm(imgpoints[i], imgpoints2, cv.NORM_L2) / len(imgpoints2)
+    mean_error += error
+print("total error: {}".format(mean_error / len(objpoints)))
+\end{codebox}
+
+\paragraph{\texttt{ret} 与手算 \texttt{mean\_error} 不是一回事。}
+\texttt{calibrateCamera} 返回的 \texttt{ret} 是\emph{整体 RMS}：对所有图、所有点的\emph{所有坐标分量}做均方根，
+\begin{equation}
+  \texttt{ret}=\sqrt{\frac{\sum_{\text{所有点}}\big[(u-\hat u)^2+(v-\hat v)^2\big]}{N_{\text{点}}}},
+  \label{eq:calib-rms}
+\end{equation}
+而上面手算的 \texttt{mean\_error} 是“每点 L2 距离取均值再对图平均”。两者量纲都是像素但\emph{数值不同}（RMS $\ge$ 平均）。务必区分，否则会困惑于“为什么两个误差对不上”。\footnote{\cref{eq:calib-rms} 给出与 \texttt{ret} 量纲一致的形式；其精确归一化常数为 OpenCV 源码级细节，以源码为准。}
+
+\subsection{进阶质检：参数不确定度与逐图误差}
+\label{sec:calib-opencv-quality}
+
+\paragraph{用 \texttt{calibrateCameraExtended} 拿到误差棒。}
+\cref{sec:calib-uncertainty} 推导的协方差 \cref{eq:calib-covariance} 在 OpenCV 里直接可取：把 \texttt{calibrateCamera} 换成 \texttt{calibrateCameraExtended}，它额外返回每个参数的标准差与每幅图的重投影误差\cite{opencv2024calib}。
+
+\begin{codebox}[Python]{calibrateCameraExtended:参数标准差 + 逐图误差}
+# 扩展版额外返回参数不确定度，用于判断标定是否可信
+ret, mtx, dist, rvecs, tvecs, \
+    std_int, std_ext, per_view_errors = cv.calibrateCameraExtended(
+        objpoints, imgpoints, gray.shape[::-1], None, None)
+
+# std_int: 内参标准差, 顺序 (fx, fy, cx, cy, k1, k2, p1, p2, k3, ...)
+#          即 sqrt(sigma0^2 * diag((J^T J)^-1)), 见正文协方差公式
+fx, fy, cx, cy = mtx[0, 0], mtx[1, 1], mtx[0, 2], mtx[1, 2]
+print("fx = %.2f +/- %.2f" % (fx, std_int[0]))
+print("cx = %.2f +/- %.2f  (relative: %.4f)"      # 主点要相对焦距看 (Triggs)
+      % (cx, std_int[2], std_int[2] / fx))
+
+# per_view_errors: 每幅图的 RMS, 用来揪出坏图
+import numpy as np
+bad = np.where(per_view_errors > 2.0 * per_view_errors.mean())[0]
+print("suspicious views (RMS >> mean):", bad)   # 远高于均值的图建议剔除重标
+\end{codebox}
+
+\paragraph{逐图误差是揪坏图的利器。}
+整体 RMS 是平均量，一两张烂图（角点检测偏、板有翘曲、运动模糊）会被平均“稀释”掉。\texttt{per\_view\_errors} 给\emph{每幅图各自}的 RMS——某图显著高于其余（如 $>2$ 倍均值），多半该图有问题，剔除后重标往往明显改善。\texttt{std\_int} 则对应 \cref{tab:calib-table1} 的 $\sigma$ 列：若某内参的标准差大到与其本身同量级，说明该参数\emph{不可观}（多半采图退化，回看 \cref{sec:calib-degenerate,sec:calib-capture}）。
+
+\paragraph{先验质检：角点清晰度。}
+标定的精度上限由角点定位决定，而角点定位被\emph{模糊/欠采样}毁掉。OpenCV 提供 \texttt{estimateChessboardSharpness} 评估棋盘清晰度，经验上清晰度值应\emph{低于约 $3$ 像素}\cite{opencv2024calib}；超过则该图偏糊，应改善对焦/光照/曝光后重拍。这是把“避免运动模糊”（\cref{sec:calib-capture}）从口号变成可执行判据的工具。
+
+\begin{pitfall}[思维陷阱：只看整体 RMS 一个数]
+\textbf{错误做法}：标完只 \texttt{print(ret)}，$<0.5$ 就收工。\textbf{现象}：整体 RMS 漂亮，实测投影却在边角系统性偏；或换一批图标出的 $\mathbf{K}$ 差很多。\textbf{根本原因}：整体 RMS 把逐图差异、参数相关性、边角覆盖不足全平均掉了，看不出隐藏问题。\textbf{正确做法}：三件套一起看——逐图误差 \texttt{per\_view\_errors}（揪坏图）、参数标准差 \texttt{std\_int}（看可观性、主点除以 $f_x$）、交叉验证（\cref{sec:calib-capture}，看过拟合）。\textbf{自检}：逐图误差应大致同量级且无离群；内参相对标准差应远小于 $1\%$。
+\end{pitfall}
+
+\subsection{标定标志位}
+
+\begin{table}[ht]\centering\small
+\caption{\texttt{calibrateCamera} 常用标志位\cite{opencv2024calib}}
+\label{tab:calib-flags}
+\begin{tabular}{ll}
+\toprule
+标志位 & 含义 \\
+\midrule
+\texttt{CALIB\_USE\_INTRINSIC\_GUESS} & 用传入 \texttt{cameraMatrix} 作初值（否则自动初始化）\\
+\texttt{CALIB\_FIX\_PRINCIPAL\_POINT} & 固定主点 $(c_x,c_y)$ 不优化 \\
+\texttt{CALIB\_FIX\_ASPECT\_RATIO} & 固定 $f_x/f_y$ 比值（像素正方形时用）\\
+\texttt{CALIB\_FIX\_FOCAL\_LENGTH} & 固定 $f_x,f_y$ \\
+\texttt{CALIB\_ZERO\_TANGENT\_DIST} & 强制 $p_1=p_2=0$（对齐良好的镜头）\\
+\texttt{CALIB\_FIX\_K1}$\ldots$\texttt{CALIB\_FIX\_K6} & 固定对应径向系数 \\
+\texttt{CALIB\_RATIONAL\_MODEL} & 启用有理模型 $k_4,k_5,k_6$（$8$ 元，广角）\\
+\texttt{CALIB\_THIN\_PRISM\_MODEL} & 启用薄棱镜 $s_1\ldots s_4$（$12$ 元）\\
+\texttt{CALIB\_TILTED\_MODEL} & 启用倾斜传感器 $\tau_x,\tau_y$（$14$ 元，Scheimpflug）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[编程陷阱：误把 \texttt{(7,6)} 当成方格数]
+\textbf{错误做法}：棋盘有 $8\times7$ 个方格，就填 \texttt{findChessboardCorners(gray,(8,7))}。\textbf{现象}：检测一直返回 \texttt{ret=False}，一张图都用不上。\textbf{根本原因}：参数是\emph{内角点}数，等于（每方向方格数 $-1$）。$8\times7$ 方格的内角点是 $7\times6$。\textbf{正确做法}：填内角点数 \texttt{(7,6)}；\texttt{objp} 的尺寸也要对应。\textbf{自检}：打印检测到的 \texttt{corners.\allowbreak shape[0]}，应等于内角点总数 $7\times6=42$。
+\end{pitfall}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item （实现）跑通上面三段代码：拍 $15$ 张棋盘图，标出 $\mathbf{K}$ 与 \texttt{dist}，并对比 \texttt{ret} 与手算 \texttt{mean\_error}，解释二者差异。
+  \item （设计扩展）用 \cref{tab:calib-flags} 的标志位，从“固定主点、纵横比、所有畸变”开始，逐步解冻参数，记录每步 RMS，画出“参数数 vs RMS”曲线，找到过拟合拐点。
+  \item 用 \texttt{cv.\allowbreak Rodrigues(rvecs[0])} 把第一幅图的旋转向量转成 $\mathbf{R}$，验证 $\mathbf{R}^\top\mathbf{R}=\mathbf{I}$、$\det\mathbf{R}=1$。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{标定板类型}
+\label{sec:calib-boards}
+
+\paragraph{这一节解决什么。}
+标定精度的上限由角点定位精度决定，而后者强烈依赖标定板类型。本节系统分类常见板型并给选型建议。
+
+\begin{table}[ht]\centering\small
+\caption{OpenCV 支持的标定板分类\cite{opencv2024pattern,garrido2014aruco}}
+\label{tab:calib-boards}
+\begin{tabular}{p{0.20\textwidth} p{0.28\textwidth} p{0.42\textwidth}}
+\toprule
+板型 & 检测函数 & 特点 / 歧义 \\
+\midrule
+棋盘格 & \texttt{findChessboardCorners}（或 \texttt{...SB}）& 黑白方格交点；角点最准（交点亚像素可定位）；偶数尺寸有 $180^\circ$ 位姿歧义、正方形板有 $90^\circ$ 歧义 \\
+对称圆点网格 & \texttt{findCirclesGrid} & 圆心亚像素直接得到；与偶数棋盘一样有 $180^\circ$ 歧义 \\
+非对称圆点网格 & \texttt{findCirclesGrid} & 每偶数行平移半格，\emph{消除}位姿歧义；圆心亚像素、无需额外精化；需无歧义位姿/立体标定时首选 \\
+ChArUco 板 & \texttt{aruco::CharucoDetector} & 棋盘 $+$ 角上 ArUco 标记；每角点由相邻标记\emph{唯一标识}；支持遮挡/部分可见、旋转不变 \\
+Radon 棋盘 & \texttt{findChessboardCornersSB} & 带标记格的专用图案，配合 SB 检测器 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{ChArUco $=$ 棋盘 $+$ ArUco。}
+ArUco 标记（Garrido-Jurado 等\cite{garrido2014aruco}）是带纠错编码的方形基准标记，其字典生成遵循“最大化标记间汉明距离”准则以抗误识别与遮挡。把 ArUco 嵌入棋盘格即 ChArUco：每个内角点被相邻标记唯一标识，于是即便板被部分遮挡/出框，仍能识别哪些角点是哪些——这是相对纯棋盘“必须全部可见”的关键优势。OpenCV 文档强烈推荐用 ChArUco 角点，因其比 ArUco 标记角点准得多，且允许遮挡与部分视图\cite{opencv2024charuco}。
+
+\begin{codebox}[C++]{ChArUco 标定核心（创建板、检测、标定）}
+// 创建 ChArUco 板与检测器
+aruco::CharucoBoard board(Size(squaresX, squaresY), squareLength,
+                          markerLength, dictionary);
+aruco::CharucoDetector detector(board, charucoParams, detectorParams);
+
+// 采集循环（每帧检测 + 匹配点对）
+while (inputVideo.grab()) {
+    Mat image; inputVideo.retrieve(image);
+    Mat curCorners, curIds;
+    detector.detectBoard(image, curCorners, curIds);
+    if (key == 'c' && curCorners.total() > 3) {       // 至少 4 个角点
+        board.matchImagePoints(curCorners, curIds, curObjPts, curImgPts);
+        allObjectPoints.push_back(curObjPts);
+        allImagePoints.push_back(curImgPts);
+        imageSize = image.size();
+    }
+}
+// 标定（内部仍是张正友法 + LM）
+double repError = calibrateCamera(allObjectPoints, allImagePoints,
+                                  imageSize, cameraMatrix, distCoeffs,
+                                  noArray(), noArray(), noArray(),
+                                  noArray(), noArray(), calibrationFlags);
+\end{codebox}
+
+\paragraph{选型建议。}
+\begin{itemize}
+  \item \textbf{多数场景}：非对称圆点网格（无位姿歧义 $+$ 亚像素）或棋盘格（角点最准）\cite{opencv2024pattern}；
+  \item \textbf{会遮挡/部分可见}：ChArUco；
+  \item \textbf{圆点 vs 棋盘之争（两面观点）}：OpenCV 认为圆点圆心亚像素好、推荐非对称圆点；mrcal\cite{kogan2024mrcal} 则\emph{反对}圆点——“在被非针孔镜头行为影响的倾斜图像里，从外轮廓/斑点得到准确圆心很难，会向求解引入偏差”，主张用棋盘（倾斜畸变下直接观测角点、偏差最小）。mrcal 也反对 AprilTag（其假设各点噪声独立，而单标记角点噪声相关）。两面并列，读者按镜头与场景取舍。
+\end{itemize}
+
+\paragraph{生成图案。}
+OpenCV 的 \texttt{gen\_pattern.\allowbreak py}（位于 \texttt{apps/\allowbreak pattern-tools}）可生成 SVG 图案\cite{opencv2024pattern}：
+
+\begin{codebox}[bash]{gen\_pattern.py 生成标定图案}
+# 棋盘:9 行 6 列，20mm 方格
+python gen_pattern.py -o chessboard.svg --rows 9 --columns 6 \
+       --type checkerboard --square_size 20
+# 非对称圆点:7x5，10mm，间距比 radius_rate=2
+python gen_pattern.py -o acircles.svg --rows 7 --columns 5 \
+       --type acircles --square_size 10 --radius_rate 2
+# ChArUco:7x5，30mm 方格，15mm 标记，字典 DICT_5X5_100
+python gen_pattern.py -o charuco.svg --rows 7 --columns 5 -T charuco_board \
+       --square_size 30 --marker_size 15 -f DICT_5X5_100.json.gz
+\end{codebox}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 解释为什么对称圆点网格有 $180^\circ$ 位姿歧义而非对称网格没有——画图说明“平移半格”如何打破对称。
+  \item 列出 ChArUco 相对纯棋盘的两个优势，并说明各对应哪种采图困难（边角覆盖、遮挡）。
+  \item 复述“圆点 vs 棋盘”两派的核心论据各一条，并说明你会在什么镜头条件下选哪个。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{采图建议与工程陷阱}
+\label{sec:calib-capture}
+
+\paragraph{这一节解决什么。}
+理论再对，采图烂也标不准。本节汇总工程界（Galeone\cite{galeone2018guidelines}、mrcal\cite{kogan2024mrcal}）的具体采图规则与高频陷阱——这些“心法”都配可执行判据，不停在格言。
+
+\subsection{先锁定镜头，再采图}
+\begin{itemize}
+  \item \textbf{关自动对焦}：相机若有自动对焦必须禁用\cite{galeone2018guidelines}；手动对焦到清晰后\emph{机械锁死}对焦环，之后不再碰。
+  \item \textbf{镜头机械敏感}：mrcal\cite{kogan2024mrcal} 强调“镜头内参对任何机械操作都极敏感”——把焦距、对焦距离、光圈设到\emph{最终工作配置}并锁死，再采标定数据；采图期间不重新对焦或变焦。
+  \item \textbf{避免运动模糊}：机械锁定相机、最小化振动；模糊会污染角点定位。
+\end{itemize}
+
+\subsection{标定板物理要求}
+\begin{itemize}
+  \item \textbf{平面性}：图案必须\emph{完全平面}（标定假设每个方格是完美正方形）\cite{galeone2018guidelines}；
+  \item \textbf{材料}：打印在极硬、不透明、哑光的白色材料上（避免反光）；保留与边长相当的白边；
+  \item \textbf{不要在家打印}：去专业打印店，家用打印机的尺寸误差会直接进标定\cite{galeone2018guidelines}；
+  \item \textbf{刚性背板}：mrcal\cite{kogan2024mrcal} 推荐 $1\,\mathrm{m}\times1\,\mathrm{m}$ 大板装在刚性铝蜂窝背板上（泡沫背板会随温湿度翘曲）。
+\end{itemize}
+
+\subsection{采图“舞步”（chessboard dance）}
+\begin{itemize}
+  \item \textbf{遍历整个标定体}：把图案移到工作空间每一处，均匀分布\cite{galeone2018guidelines}（推荐以视场为底、工作距离为高的锥形体）；
+  \item \textbf{倾斜}：把图案相对光轴倾斜并移遍空间，mrcal 一般倾斜约 $45^\circ$\cite{kogan2024mrcal}；
+  \item \textbf{填满画面}：棋盘尽量填满整个画面以最大化每次观测信息；宁用大板靠近，不用小板（小板靠近有非中心投影风险）\cite{kogan2024mrcal}；
+  \item \textbf{覆盖整个视场尤其边角}：内参\emph{只在观测到棋盘的区域准确}，边角数据最难拿却最重要（径向畸变在边角最大），用实时预览确认\cite{kogan2024mrcal}；
+  \item \textbf{距离变化}：拍近也拍远，保证清晰且占画面相当部分。
+\end{itemize}
+
+\begin{insight}
+\textbf{为什么必须倾斜（关键洞察）}\cite{kogan2024mrcal}：倾斜把\emph{焦距与板距分离}。不倾斜（正面板）时，“增大焦距”与“相机后退一步”对投影的影响几乎相同——二者\emph{退化}，无法分辨。只有大幅倾斜板，诱导的透视畸变才依赖真实 $3$ 维距离与朝向（而非仅焦距），从而解耦。这正是张正友仿真（\cref{sec:calib-numerical}）里“最佳角度约 $45^\circ$、太平行（$5^\circ$）退化失败”的根源。倾斜视图也帮助按方向定义畸变场。
+\end{insight}
+
+\subsection{图像数量}
+\begin{itemize}
+  \item 理论最少 $2$ 张，但因噪声实际\emph{至少 $10$ 张}好图\cite{opencv2013calib}；
+  \item Galeone 经验约 $50$ 张\cite{galeone2018guidelines}；mrcal 瞄准约 $100$ 可用帧、宁多勿少（检测器会丢掉找不到棋盘的帧）\cite{kogan2024mrcal}；
+  \item 关键是\emph{多样性}（角度、距离、覆盖），不是数量本身。
+\end{itemize}
+
+\subsection{结果评估：RMS 不是唯一指标}
+\begin{itemize}
+  \item \textbf{RMS 经验阈值}\cite{galeone2018guidelines}：$\ge1$ 像素不可接受、$<1$ 开始 OK、$<0.5$ 好；
+  \item \textbf{看每角点误差直方图}：理想居中于 $0$；若双峰或偏斜，拒绝并重标；
+  \item \textbf{低 RMS 可能误导（mrcal 反向警告）}\cite{kogan2024mrcal}：参数过多的镜头模型能在训练数据上拟合到近零残差，却引入不在残差中显现的\emph{系统误差}（过拟合）。正确做法是\emph{交叉验证}：用独立数据（如奇/偶帧切分）各标一次比较投影——差异 $\approx$ 两次不确定度之和则模型合身，差异为其 $2$--$3$ 倍则有未建模系统误差。
+\end{itemize}
+
+\begin{table}[ht]\centering\small
+\caption{相机标定常见陷阱清单\cite{kogan2024mrcal,galeone2018guidelines}}
+\label{tab:calib-pitfalls}
+\begin{tabular}{p{0.26\textwidth} p{0.36\textwidth} p{0.28\textwidth}}
+\toprule
+陷阱 & 表现 / 原因 & 对策 \\
+\midrule
+低 RMS $\ne$ 好标定 & 过拟合：参数过多在训练集残差近零、有隐藏系统误差 & 交叉验证（奇/偶帧）；看投影不确定度 \\
+板不平/不刚 & 优化假设板形恒定；板形变违背此假设 & 刚性铝蜂窝背板；直尺查翘曲 \\
+运动模糊/曝光问题 & 角点定位偏差 & 静态采图；充足均匀光照 \\
+卷帘快门 & 逐行曝光跨毫秒，运动违背“同时观测”；残差呈方向性 & 用全局快门或保持完全静止 \\
+只观测中心/近距 & 内参只在观测区准，边角/远场无信息 & 覆盖整个视场含边角 \\
+改焦/变焦后内参失效 & 内参对镜头机械操作极敏感 & 标定前锁死焦距/对焦/光圈 \\
+退化构型（平面平行/纯平移）& 平行平面给相同圆环点 $\to$ 同约束、无新信息（\cref{thm:calib-degenerate}）& 每次拍摄改变板朝向 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 设计一次完整采图：列出锁镜头步骤、$15$ 幅图各自的朝向与距离、如何确认边角覆盖。给出每条对应的可执行判据（如“实时预览看到角点落在画面四角”）。
+  \item 实现 mrcal 式交叉验证：把图集按奇/偶帧切两份各标一次，比较两组 $\mathbf{K}$；写出判断“模型是否过拟合”的具体阈值规则。
+  \item （跨章综合）结合 \cref{ch:camera} 的投影链与本章：解释为什么“内参标错”属于\emph{系统误差}（bias）而非随机噪声，并说明它为何无法被 \cref{ch:vo} 的后端优化消除。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{数值例与敏感性分析}
+\label{sec:calib-numerical}
+
+\paragraph{这一节解决什么。}
+用张正友原文的完整数值例\cite{zhang2000calibration}，给出“真实标定结果与稳定性长什么样”的具体感受，并量化各种误差源的影响。
+
+\subsection{真实数据：PULNiX 相机标定全表}
+
+相机：PULNiX CCD，$6\,\mathrm{mm}$ 镜头，$640\times480$；$8\times8$ 方格（$256$ 角点），$17\,\mathrm{cm}\times17\,\mathrm{cm}$ 贴玻璃；拍 $5$ 幅不同朝向。分别用前 $2,3,4,5$ 幅标定，每组三列：\emph{init}（闭式解）、\emph{final}（MLE）、$\sigma$（估计标准差）。
+
+\begin{table}[ht]\centering\scriptsize
+\caption{张正友 $2$--$5$ 幅图的真实数据标定结果（Table 1）\cite{zhang2000calibration}}
+\label{tab:calib-table1}
+\begin{tabular}{lccc ccc ccc ccc}
+\toprule
+ & \multicolumn{3}{c}{$2$ 图} & \multicolumn{3}{c}{$3$ 图} & \multicolumn{3}{c}{$4$ 图} & \multicolumn{3}{c}{$5$ 图}\\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}\cmidrule(lr){11-13}
+量 & init & final & $\sigma$ & init & final & $\sigma$ & init & final & $\sigma$ & init & final & $\sigma$\\
+\midrule
+$\alpha$ & 825.59 & 830.47 & 4.74 & 917.65 & 830.80 & 2.06 & 876.62 & 831.81 & 1.56 & 877.16 & 832.50 & 1.41\\
+$\beta$ & 825.26 & 830.24 & 4.85 & 920.53 & 830.69 & 2.10 & 876.22 & 831.82 & 1.55 & 876.80 & 832.53 & 1.38\\
+$\gamma$ & 0 & 0 & 0 & 2.2956 & 0.1676 & 0.109 & 0.0658 & 0.2867 & 0.095 & 0.1752 & 0.2045 & 0.078\\
+$u_0$ & 295.79 & 307.03 & 1.37 & 277.09 & 305.77 & 1.45 & 301.31 & 304.53 & 0.86 & 301.04 & 303.96 & 0.71\\
+$v_0$ & 217.69 & 206.55 & 0.93 & 223.36 & 206.42 & 1.00 & 220.06 & 206.79 & 0.78 & 220.41 & 206.59 & 0.66\\
+$k_1$ & 0.161 & $-$0.227 & 0.006 & 0.128 & $-$0.229 & 0.006 & 0.145 & $-$0.229 & 0.005 & 0.136 & $-$0.228 & 0.003\\
+$k_2$ & $-$1.955 & 0.194 & 0.032 & $-$1.986 & 0.196 & 0.034 & $-$2.089 & 0.195 & 0.028 & $-$2.042 & 0.190 & 0.025\\
+\textbf{RMS} & 0.761 & \textbf{0.295} & & 0.987 & \textbf{0.393} & & 0.927 & \textbf{0.361} & & 0.881 & \textbf{0.335} & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{观察。}
+闭式解合理；最终估计在 $2/3/4/5$ 幅间\emph{高度一致}；不确定度 $\sigma$ 随图数增加而下降；末行 RMS（检测点与重投影点的均方根距离）显示 MLE 显著改善（从 $\sim0.9$ 降到 $\sim0.3$）。
+
+\begin{insight}
+\textbf{$k_1$ 符号翻转的物理洞察}\cite{zhang2000calibration}：注意 \cref{tab:calib-table1} 里闭式解 $k_1>0$（枕形），MLE 后 $k_1<0$（桶形）——\emph{符号翻了}！原因：闭式解假设无畸变估内参，预测的外圈点比检测点更\emph{靠近}图心；随后的畸变估计为减小距离而“撑开”外圈点、增大尺度，但这种形状（正 $k_1$，枕形）\emph{不符}真实畸变。非线性精化（MLE）才恢复正确的桶形（$k_1<0$）。这生动说明了“闭式解只能作初值、必须 MLE 精化”——它连畸变的\emph{符号}都可能初值错。
+\end{insight}
+
+\subsection{稳定性：四元组实验}
+
+把算法用于 $5$ 幅中所有 $4$ 幅的组合：
+
+\begin{table}[ht]\centering\small
+\caption{所有四元组的标定结果变化（Table 2）\cite{zhang2000calibration}}
+\label{tab:calib-table2}
+\begin{tabular}{lccccc cc}
+\toprule
+量 & (1234) & (1235) & (1245) & (1345) & (2345) & mean & deviation\\
+\midrule
+$\alpha$ & 831.81 & 832.09 & 837.53 & 829.69 & 833.14 & 832.85 & 2.90\\
+$\beta$ & 831.82 & 832.10 & 837.53 & 829.91 & 833.11 & 832.90 & 2.84\\
+$\gamma$ & 0.2867 & 0.1069 & 0.0611 & 0.1363 & 0.1096 & 0.1401 & 0.086\\
+$u_0$ & 304.53 & 304.32 & 304.57 & 303.95 & 303.53 & 304.18 & 0.44\\
+$v_0$ & 206.79 & 206.23 & 207.30 & 207.16 & 206.33 & 206.76 & 0.48\\
+$k_1$ & $-$0.229 & $-$0.228 & $-$0.230 & $-$0.227 & $-$0.229 & $-$0.229 & 0.001\\
+$k_2$ & 0.195 & 0.191 & 0.193 & 0.179 & 0.190 & 0.190 & 0.006\\
+\textbf{RMS} & 0.361 & 0.357 & 0.262 & 0.358 & 0.334 & 0.334 & 0.04\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{观察。}
+样本偏差都很小，算法\emph{稳定}。斜交 $\gamma$ 与 $0$ 无显著差异（变异系数 $0.086/0.1401=0.6$ 很大）；$\gamma=0.1401$ 配 $\alpha=832.85$ 对应两像轴夹角 $89.99^\circ$，极近 $90^\circ$。纵横比 $\alpha/\beta$ 五组均值 $0.99995$、样本偏差 $0.00012$，像素近乎正方形——这印证了现代相机设 $\gamma=0$、$f_x=f_y$ 是合理近似。
+
+\subsection{仿真敏感性分析}
+
+\paragraph{仿真真值。}
+$\alpha=1250,\ \beta=900,\ \gamma=1.09083$（等价 $89.95^\circ$），$u_0=v_0=255$，分辨率 $512\times512$，$10\times14=140$ 角点，图案 $18\,\mathrm{cm}\times25\,\mathrm{cm}$\cite{zhang2000calibration}。
+
+\paragraph{(i) 对噪声水平。}
+对投影像点加均值 $0$、标准差 $\sigma$ 的高斯噪声（$0.1$ 到 $1.5$ 像素，每水平 $100$ 次）。误差随噪声\emph{线性增长}；$\sigma=0.5$（已大于实际正常噪声）时 $\alpha,\beta$ 误差 $<0.3\%$、$u_0,v_0$ 误差约 $1$ 像素；$u_0$ 误差大于 $v_0$（$u$ 向数据少）。
+
+\paragraph{(ii) 对图像数。}
+图数从 $2$ 到 $16$（$\sigma=0.5$）。误差随图数增加而下降，\emph{从 $2$ 到 $3$ 下降最显著}——这是“至少拍 $3$ 张、多多益善”的量化依据。
+
+\paragraph{(iii) 对平面朝向。}
+$3$ 幅图，平面初始与像平面平行，绕随机轴转 $\theta$（$5^\circ$ 到 $75^\circ$，$\sigma=0.5$）。\emph{$\theta=5^\circ$ 时 $40\%$ 试验失败}（近平行 $\to$ 退化构型）；\emph{最佳约 $45^\circ$}——这正是 \cref{sec:calib-capture} “倾斜约 $45^\circ$”的理论根据。
+
+\paragraph{(iv) 对模型不精确。}
+模型点加噪（方格边长 $1.27\,\mathrm{cm}$ 的 $1\%$--$15\%$）：$\alpha,\beta$ 极稳（$15\%$ 噪声仅 $<0.02\%$ 误差），主点较稳，$k_1,k_2$ 变不可靠。系统性非平面（球面 $z=p\sqrt{x^2+y^2}$、柱面 $z=px$）比随机误差影响更大；柱面比球面更糟（尤其主点，因柱面只单轴对称——这也是 $u_0$ 误差远大于 $v_0$ 的原因）；若系统非平面 $<3\%$ 结果仍可用。Triggs\cite{triggs1998autocalib} 指出 $(u_0,v_0)$ 绝对误差无几何意义，应量相对焦距的误差 $\Delta u_0/\alpha$。
+
+\subsection{对照：\texorpdfstring{$3$}{3} 维标定物（DLT）法}
+
+\paragraph{作为传统法基线。}
+张正友平面法的对照是经典“$3$ 维标定物 $+$ 投影矩阵 $\mathbf{P}$ 分解”法\cite{zhang2000calibration}。每个 $2$ 维–$3$ 维对应 $\mathbf{m}_i\leftrightarrow\mathbf{M}_i$ 给两个方程：
+\begin{equation}
+  \begin{bmatrix} X_i&Y_i&Z_i&1&0&0&0&0&-u_iX_i&-u_iY_i&-u_iZ_i&-u_i\\
+                  0&0&0&0&X_i&Y_i&Z_i&1&-v_iX_i&-v_iY_i&-v_iZ_i&-v_i\end{bmatrix}\mathbf{p}=\mathbf{0},
+  \label{eq:calib-3d-dlt}
+\end{equation}
+$\mathbf{p}=[p_{11},\ldots,p_{34}]^\top$ 为 $\mathbf{P}=\mathbf{K}[\mathbf{R}\,\mathbf{t}]$ 的 $12$ 个元素。$n$ 点堆叠 $\mathbf{G}\mathbf{p}=\mathbf{0}$（$\mathbf{G}$ 为 $2n\times12$），解 $\min\|\mathbf{G}\mathbf{p}\|$ s.t. $\|\mathbf{p}\|=1$，取最小奇异向量。从 $\mathbf{P}\equiv[\mathbf{B}\ \mathbf{b}]$（前 $3\times3$ 为 $\mathbf{B}$）分解：$\mathbf{B}=\mathbf{K}\mathbf{R}$，$\mathbf{b}=\mathbf{K}\mathbf{t}$，由 $\mathbf{B}\mathbf{B}^\top=\mathbf{K}\mathbf{K}^\top$ 提取内参，$\mathbf{R}=\mathbf{K}^{-1}\mathbf{B}$、$\mathbf{t}=\mathbf{K}^{-1}\mathbf{b}$。
+
+\begin{insight}
+\textbf{两法对比}：$3$ 维物体法用\emph{一幅}图 $+$ 一个\emph{高精度 $3$ 维}标定物即可解 $11$ 参，但标定物昂贵难造；张正友平面法用\emph{多幅}图 $+$ 一个\emph{廉价 $2$ 维}平面，靠多单应叠加约束。二者后端同构——“代数线性解 $+$ LM 精化 $+$ 畸变”。张正友法以“多拍几张廉价图”换掉了“昂贵 $3$ 维标定物”，这是它普及的根本原因。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[ht]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+物理焦距 $6\,\mathrm{mm}$ 就是 $f_x$ & $f_x=f/d_x$（像素单位），$6\,\mathrm{mm}$ 镜头 $f_x$ 约几百到上千像素 \\
+一幅图能解出全部内参 & 一幅单应只给 $2$ 个内参约束（\cref{prop:calib-two-constraints}），需 $\ge3$ 幅 \\
+闭式解已足够好 & 只作初值；闭式 $k_1$ 连符号都可能错（\cref{tab:calib-table1}）\\
+畸变模型越多项越准 & 高阶项拟合噪声、过拟合、数值不稳定；常规镜头 $k_1,k_2$ 足矣 \\
+去畸变有闭式解 & 正向畸变是高次多项式，逆映射无闭式，须迭代（\cref{eq:calib-undistort-iter}）\\
+畸变系数顺序是 $k_1,k_2,k_3,p_1,p_2$ & OpenCV 是 $(k_1,k_2,p_1,p_2,k_3)$，切向在 $k_3$ 之前 \\
+\texttt{ret} 等于手算 \texttt{mean\_error} & 一个是整体 RMS（分量级），一个是点级平均 L2，数值不同 \\
+低 RMS 一定是好标定 & 可能过拟合；需交叉验证看投影不确定度（mrcal）\\
+只看一个整体 RMS 数就够 & 还要看逐图误差与参数标准差（\cref{sec:calib-opencv-quality}）；用 \texttt{calibrateCameraExtended} \\
+主点 $\sigma$ 大就是标坏了 & 主点不确定度要相对焦距看 $\sigma_{c_x}/f_x$（\cref{sec:calib-uncertainty}，Triggs）\\
+单应只是个抽象矩阵 & 其前两列就是棋盘两轴的消失点（\cref{eq:calib-vanishing}），约束 $=$ 正交方向 \\
+随便拍几张都能标 & 平行平面/纯平移退化（\cref{thm:calib-degenerate}）；须改变朝向、倾斜约 $45^\circ$ \\
+\texttt{findChessboardCorners(7,6)} 是方格数 & 是\emph{内角点}数 $=$ 方格数 $-1$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\paragraph{符号表。}
+\begin{table}[ht]\centering\small
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\mathbf{K}$（张 $\mathbf{A}$）& 内参矩阵，元素 $\alpha,\beta,\gamma,u_0,v_0$（$=f_x,f_y,$skew$,c_x,c_y$）& \cref{eq:calib-pinhole} \\
+$s$ / $\lambda$ & 投影尺度（逐点）/ 单应整体尺度 & \cref{eq:calib-pinhole,eq:calib-homography} \\
+$\mathbf{H}=[\mathbf{h}_1\,\mathbf{h}_2\,\mathbf{h}_3]$ & 平面图案到图像的单应 & \cref{eq:calib-homography} \\
+$\boldsymbol{\omega}$（张 $\mathbf{B}$）& IAC，$=\mathbf{K}^{-\top}\mathbf{K}^{-1}$，对称 & \cref{eq:calib-omega-elements} \\
+$\mathbf{b}$ & $\boldsymbol{\omega}$ 的 $6$ 维向量 $[B_{11},B_{12},B_{22},B_{13},B_{23},B_{33}]$ & \cref{eq:calib-b} \\
+$\mathbf{v}_{ij}$ & 使 $\mathbf{h}_i^\top\boldsymbol{\omega}\mathbf{h}_j=\mathbf{v}_{ij}^\top\mathbf{b}$ 的 $6$ 维系数 & \cref{eq:calib-vij} \\
+$\mathbf{V}$ & 堆叠的 $2n\times6$ 约束矩阵 & \cref{eq:calib-Vb} \\
+$k_1,k_2,k_3$ / $p_1,p_2$ & 径向 / 切向畸变系数 & \cref{eq:calib-brown-conrady} \\
+$(x,y)\to(x_d,y_d)$ & 无畸变 $\to$ 有畸变（正向）归一化坐标 & \cref{eq:calib-brown-conrady} \\
+RMS & 重投影误差均方根（像素）& \cref{eq:calib-rms} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{定理与公式速查表。}
+\begin{table}[ht]\centering\small
+\begin{tabular}{lll}
+\toprule
+定理 / 公式 & 一句话说明 & 对应 \\
+\midrule
+单应 \cref{eq:calib-homography} & $Z=0$ 把投影退化为 $\mathbf{H}=\lambda\mathbf{K}[\mathbf{r}_1\,\mathbf{r}_2\,\mathbf{t}]$ & \cref{sec:calib-homography} \\
+两约束 \cref{eq:calib-constraint1,eq:calib-constraint2} & 旋转两列正交归一 $\to$ 对 $\boldsymbol{\omega}$ 的约束 & \cref{prop:calib-two-constraints} \\
+$\mathbf{V}\mathbf{b}=\mathbf{0}$ \cref{eq:calib-Vb} & 堆叠多图、SVD 求 $\boldsymbol{\omega}$ & \cref{prop:calib-solvability} \\
+提取内参 \cref{eq:calib-extract} & 从 $\boldsymbol{\omega}$ 闭式解 $\mathbf{K}$ & \cref{sec:calib-extract-K} \\
+最近旋转 \cref{eq:calib-procrustes} & $\mathbf{R}=\mathbf{U}\mathbf{V}^\top$，把噪声 $\mathbf{Q}$ 投回 $\SO(3)$ & \cref{thm:calib-nearest-rotation} \\
+畸变模型 \cref{eq:calib-brown-conrady} & 径向 $+$ 切向，正向（无$\to$有）& \cref{sec:calib-distortion-model} \\
+畸变初值 \cref{eq:calib-radial-linear} & 线性最小二乘求 $k_1,k_2$ & \cref{sec:calib-radial} \\
+完整 MLE \cref{eq:calib-mle-dist} & 全参数 LM 联合精化重投影误差 & \cref{sec:calib-mle} \\
+参数协方差 \cref{eq:calib-covariance} & $\mathrm{Cov}\approx\hat\sigma_0^2(\mathbf{J}^\top\mathbf{J})^{-1}$，给每个内参误差棒 & \cref{sec:calib-uncertainty} \\
+消失点约束 \cref{eq:calib-vanishing} & $\mathbf{h}_1,\mathbf{h}_2$ 是两轴消失点，正交 $\to$ 约束 & \cref{sec:calib-vanishing} \\
+退化 \cref{thm:calib-degenerate} & 平行平面不给新约束 & \cref{sec:calib-degenerate} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{知识点总表。}
+\begin{table}[ht]\centering\small
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 标定动机与分类 & 摄影测量 / 自标定 / 张正友介于其间 & $\bigstar$ \\
+2 & 单应与两约束 & $\mathbf{H}=\lambda\mathbf{K}[\mathbf{r}_1\,\mathbf{r}_2\,\mathbf{t}]$；正交归一挤约束 & $\bigstar\bigstar$ \\
+3 & 绝对二次曲线 & 圆环点投到 IAC 上；消失点第三视角、$\boldsymbol{\omega}$ 是角度度量 & $\bigstar\bigstar\bigstar\bigstar$ \\
+4 & 闭式解 & $\mathbf{V}\mathbf{b}=\mathbf{0}$、SVD、提取 $\mathbf{K}$、投回 $\SO(3)$ & $\bigstar\bigstar\bigstar$ \\
+5 & 畸变模型 & Brown--Conrady、OpenCV $5/14$ 参、正向 & $\bigstar\bigstar$ \\
+6 & 畸变标定 & 线性初值 $+$ 完整 MLE & $\bigstar\bigstar\bigstar$ \\
+7 & 参数不确定度 & $\mathrm{Cov}\approx\hat\sigma_0^2(\mathbf{J}^\top\mathbf{J})^{-1}$；主点相对焦距看 & $\bigstar\bigstar\bigstar$ \\
+8 & 退化构型 & 平行平面/纯平移、命题 1 证明 & $\bigstar\bigstar\bigstar$ \\
+9 & OpenCV 实践 & 角点$\to$标定$\to$去畸变$\to$误差$\to$不确定度质检 & $\bigstar\bigstar$ \\
+10 & 标定板与采图 & 板型选型、舞步、倾斜 $45^\circ$、陷阱 & $\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{原论文（理论骨架）}：张正友《A Flexible New Technique for Camera Calibration》\cite{zhang2000calibration}（MSR-TR-98-71 / TPAMI 2000）——本章全部推导、附录 A--D、实验表的出处，强烈建议对照阅读。
+  \item \textbf{独立同期工作}：Sturm \& Maybank《On Plane-Based Camera Calibration》\cite{sturm1999plane}——几乎同时独立提出平面标定，研究了退化构型（假设 $\gamma=0$）。
+  \item \textbf{射影几何与 IAC}：Hartley \& Zisserman《Multiple View Geometry in Computer Vision》\cite{hartley2004multiview}——绝对二次曲线、IAC $\boldsymbol{\omega}$ 作为“角度度量”、消失点/正交方向标定与“主点 $=$ 三正交消失点垂心”等结论的权威出处（\cref{sec:calib-iac,sec:calib-vanishing} 的理论靠山）。
+  \item \textbf{经典 $3$ 维标定}：Tsai《A versatile camera calibration technique》\cite{tsai1987versatile}——畸变四步分解、纯平移标定的来源。
+  \item \textbf{畸变模型史}：Brown《Close-range camera calibration》\cite{brown1971closerange}——Brown--Conrady 模型与铅垂线法原始文献。
+  \item \textbf{工具文档}：OpenCV calib3d 模块\cite{opencv2024calib}、相机标定教程\cite{opencv2013calib}、标定图案生成\cite{opencv2024pattern}、ChArUco 标定\cite{opencv2024charuco}。
+  \item \textbf{工程实践}：Galeone《Camera calibration guidelines》\cite{galeone2018guidelines}、mrcal《How to run a calibration》\cite{kogan2024mrcal}——采图舞步、交叉验证、低 RMS 误导的关键素材。
+  \item \textbf{ArUco 原理}：Garrido-Jurado 等《Automatic generation and detection of highly reliable fiducial markers under occlusion》\cite{garrido2014aruco}——ArUco 字典生成与检测。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\begin{table}[ht]\centering\small
+\begin{tabular}{lll}
+\toprule
+后续章节 & 关系 & 本章铺垫 \\
+\midrule
+\cref{ch:vo} 视觉里程计 & 重投影误差需准确 $\mathbf{K}$ 与畸变 & 标定出的内参/畸变、去畸变 \\
+\cref{ch:vio} VIO & 相机内参 $+$ 相机-IMU 外参（研究向）& 本章内参标定为其前提 \\
+\cref{ch:nlopt} 非线性优化 & 标定后端 $=$ LM 的完整实例；不确定度 $=$ 逆海森 & \cref{eq:calib-mle-dist} 与 BA 同构、\cref{eq:calib-covariance} \\
+\cref{ch:lie} 李群 & 旋转投回 $\SO(3)$、右扰动雅可比 & \cref{thm:calib-nearest-rotation}、MLE 注 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{table}[ht]\centering\small
+\begin{tabular}{p{0.24\textwidth} p{0.30\textwidth} p{0.36\textwidth}}
+\toprule
+症状 & 可能原因 & 排查步骤 \\
+\midrule
+\texttt{findChessboardCorners} 总返回 False & 填了方格数而非内角点数；光照差/模糊；板不全可见 & 改为内角点数（\cref{sec:calib-opencv-workflow}）；加光照、关自动对焦；用 \texttt{...SB} 或 ChArUco \\
+标定不收敛或值荒谬 & 初值差、退化构型、单应估错 & 确认闭式解作初值；改变板朝向避退化（\cref{thm:calib-degenerate}）；检查单应是否做了归一化 \\
+RMS 很低但实测不准 & 过拟合（畸变项过多）& 减畸变项；交叉验证（奇/偶帧，\cref{sec:calib-capture}）\\
+去畸变后图像更歪 & 畸变向量顺序错；用了别处的系数 & 按 \cref{eq:calib-dist-order} 排序；直接用 \texttt{calibrateCamera} 返回的 \texttt{dist} \\
+内参与物理焦距对不上 & 把物理焦距当 $f_x$；像元尺寸搞错 & 核对 $f_x\approx f/d_x$；以标定结果为准 \\
+不同图集标出的 $\mathbf{K}$ 差异大 & 采图覆盖不足、边角无数据、板不刚 & 覆盖整个视场含边角、倾斜约 $45^\circ$、用刚性背板 \\
+某内参标准差大到与其本身同量级 & 该参数不可观（采图退化/覆盖不足）& 看 \texttt{std\_int}（\cref{sec:calib-opencv-quality}）；增多样性；必要时固定该参数 \\
+个别图重投影误差远高于均值 & 该图角点偏、板翘、运动模糊 & 看 \texttt{per\_view\_errors} 揪出并剔除；先 \texttt{estimateChessboardSharpness} 预检 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{API 速查表}
+\begin{table}[ht]\centering\small
+\begin{tabular}{ll}
+\toprule
+函数 & 用途 / 注意 \\
+\midrule
+\texttt{findChessboardCorners(gray,(w,h))} & 检测内角点；$(w,h)$ 是内角点数 \\
+\texttt{cornerSubPix(...)} & 亚像素精化角点（决定标定上限）\\
+\texttt{calibrateCamera(obj,img,size,...)} & 张正友法 $+$ LM；返回 RMS, $\mathbf{K}$, dist, rvecs, tvecs \\
+\texttt{calibrateCameraExtended(...)} & 额外返回参数标准差 std\_int/std\_ext、逐图误差 \\
+\texttt{estimateChessboardSharpness(...)} & 角点清晰度预检（经验 $<3$ 像素）\\
+\texttt{Rodrigues(rvec)} & 旋转向量 $\leftrightarrow$ 旋转矩阵 \\
+\texttt{getOptimalNewCameraMatrix(...)} & 按 $\alpha$ 调视场、返回 ROI \\
+\texttt{undistort /\allowbreak  initUndistortRectifyMap+remap} & 去畸变两法；后者适合视频 \\
+\texttt{projectPoints(...)} & 物点重投影（评估误差用）\\
+\texttt{findCirclesGrid /\allowbreak  CharucoDetector} & 圆点 / ChArUco 板检测 \\
+\bottomrule
+\end{tabular}
+\end{table}

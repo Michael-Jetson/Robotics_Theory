@@ -1,0 +1,1442 @@
+\chapter{共识算法与分布式优化}
+\label{ch:mr-consensus}
+
+% ════════════════════════════════════════════════════════════════
+%  全吸收章：重渲染 Tutorial 笔记
+%   - 04_移动机器人规控/50_多机器人协作/30_共识算法与分布式优化.md
+%     （线性共识 / 时延切换拓扑 / ADMM 分布式优化 / 编队三范式 / 动态共识 / 综合实战）
+%   - 背景取用 20_多机系统全景.md
+%  记号归一：R in SO(3)、T in SE(3)（preamble 宏 \SO \SE \so \se）；图论/共识/优化自然记号保留。
+%  源由 AI 生成，作者归属/年份/数值/前沿论文编号存疑处就地 \pz/\rebuilt，并入 claims 台账。
+%  教学层遵循 v5.0 理论教学规范（动机→反面→历史→理论→陷阱→练习 + 误解汇总/小结/速查/故障排查）。
+% ════════════════════════════════════════════════════════════════
+
+% —— 本章局部数学算子（章文件 \input 入正文，故不能用 \DeclareMathOperator，
+%    改用 \providecommand + \operatorname 兜底，避免与 preamble 既有定义冲突）——
+\providecommand{\sgn}{\operatorname{sign}}
+\providecommand{\Real}{\operatorname{Re}}
+\providecommand{\sigp}{\operatorname{sig}}
+\providecommand{\argminop}{\operatorname*{arg\,min}}
+\providecommand{\proxop}{\operatorname{prox}}
+
+\rebuilt{本章重渲染自 Tutorial 笔记《共识算法与分布式优化》，其源稿由 AI 撰写，论文归属、年份、卷期与前沿工作（如 Zeng--Hamed、ACLM）的编号可能有误。本章忠实重述、不擅自“修正”，逐处 \texttt{\textbackslash cite} 标源；存疑断言已登记 claims 台账，待联网核对后二次校验。}
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住（答不出 $\ge 2$ 题），第 1、2 题回多机系统图论基础、第 3 题回线性系统稳定性、第 4 题回凸优化对偶/KKT，再来读本章。本章会大量复用这些前置，但不重新教它们。
+\begin{enumerate}
+  \item Laplacian 矩阵 $\mathbf{L}=\mathbf{D}-\mathbf{A}$ 的\textbf{零特征值}对应哪个特征向量？为什么“$\mathbf{L}$ 有且仅有一个零特征值”等价于“图连通”？
+  \item 代数连通性 $\lambda_2$ 是 $\mathbf{L}$ 的第几个特征值？它“决定共识收敛速率”的指数形式 $e^{-\lambda_2 t}$ 你能复述其含义吗？
+  \item 连续时间线性系统 $\dot{\mathbf{x}}=\mathbf{M}\mathbf{x}$ 渐近稳定的充要条件是什么（用 $\mathbf{M}$ 的特征值表述）？离散时间系统 $\mathbf{x}(k{+}1)=\mathbf{W}\mathbf{x}(k)$ 呢？
+  \item 什么是\textbf{拉格朗日对偶}？KKT 条件包含哪几组？什么叫\textbf{对偶可行}与\textbf{原始可行}？
+  \item 为什么把 $N$ 台机器人的轨迹优化拼成一个联合 QP，其求解成本会随 $N$ 三次方甚至更高地膨胀？这正是本章 ADMM 要解决的痛点。
+  \item 若 $N$ 个独立、零均值、方差 $\sigma^2$ 的噪声测量取平均，平均后的方差是多少？（提示：这解释了为什么多机协同感知融合能把噪声方差缩减到 $1/N$。）
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{证明}连续时间共识 $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$ 与离散时间共识 $\mathbf{x}(k{+}1)=\mathbf{W}\mathbf{x}(k)$ 的收敛性，并推导出收敛速率分别由 $\lambda_2$ 和 $\mathbf{W}$ 的第二大特征值模 $|\rho_2(\mathbf{W})|$ 决定；
+  \item \textbf{构造}满足收敛条件的离散共识权重矩阵 $\mathbf{W}$（双随机 + 连通），并说明为什么非双随机的 $\mathbf{W}$ 会导致漂移或不收敛；
+  \item \textbf{分析}通信时延对共识的影响，推导出无向固定拓扑下的临界时延阈值 $\tau^\star=\pi/(2\lambda_N)$，并说明它为什么由\textbf{最大}特征值 $\lambda_N$（而非 $\lambda_2$）决定；
+  \item \textbf{推导并实现}标准 ADMM：从增广拉格朗日出发，导出 $\mathbf{x}$-更新、$\mathbf{z}$-更新、$\mathbf{y}$-更新三步迭代，并用它求解一个分布式 QP；
+  \item \textbf{解释} ADMM 罚参数 $\rho$ 的作用与选取——为什么太大让本地子问题主导、太小收敛慢，以及它与“全局协调 vs 局部自主”权衡的对应；
+  \item \textbf{区分}编队控制的三种范式（position / displacement / distance-based），写出 displacement-based 控制律，并说明它本质上就是共识协议作用在“相对位置误差”上；
+  \item \textbf{设计并实现}动态平均共识估计器，让各 agent 实时跟踪时变输入的瞬时平均，并解释它为何是分布式估计/共识卡尔曼滤波的基础、为何 ADMM 能跨周期 warm-start；
+  \item \textbf{辨析}渐近共识与有限时间共识的本质区别（反馈在误差趋零处的增益结构），知道何时必须用非光滑的分数次幂反馈换取“卡点精确同步”；
+  \item \textbf{综合}把共识、时延、ADMM、编队、动态共识五件工具组装成一个完整多机任务（协同围捕）的分层数据流，并能判断分层 vs 集中、做层间时间尺度匹配。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+\textbf{一句话定位}：本章把图论语言“用起来”——给定一张通信图，如何让图上的 $N$ 个机器人通过\emph{只和邻居说话}收敛到一致（共识），以及当每个机器人要协调的是一整个优化问题时如何分布式求解（ADMM）。它把“$\lambda_2$ 决定协调快慢”这个\emph{定性}结论，升级为一整套\emph{定量}的收敛理论与可落地的分布式优化算法。
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=5mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  fin/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (lin) {线性共识\\ $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$、$\lambda_2$};
+\node[grp, right=of lin] (del) {时延 / 切换\\ $\tau^\star=\tfrac{\pi}{2\lambda_N}$、联合连通};
+\node[blk, right=of del] (admm) {分布式优化\\ ADMM、$\rho$};
+\node[grp, below=9mm of lin] (form) {编队三范式\\ displacement $=$ 共识};
+\node[blk, below=9mm of del, fill=main!8, draw=main!60!black] (dyn) {动态共识\\ 实时跟踪平均};
+\node[fin, below=9mm of admm] (sys) {综合实战\\ 协同围捕分层流水线};
+\draw[ln] (lin)--(del); \draw[ln] (del)--(admm);
+\draw[ln] (lin.south)--(form.north);
+\draw[ln] (del.south)--(dyn.north);
+\draw[ln] (admm.south)--(sys.north);
+\draw[ln] (form.east)--(dyn.west);
+\draw[ln] (dyn.east)--(sys.west);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:cs-linear}（线性共识）是全章地基（收敛证明，必读且需跟着推一遍）；\cref{sec:cs-delay}（时延/切换）是工程现实（理论方向必读，纯应用可速读阈值结论）；\cref{sec:cs-admm}（ADMM）是全 Part 复用最多的算法（必读且需动手实现）；\cref{sec:cs-formation}（编队）把共识落到队形（会发现它就是共识的变体）；\cref{sec:cs-dynamic}（动态共识/分布式估计）做协同感知/多机 SLAM 的必读，纯编队任务可后置；\cref{sec:cs-integration}（综合实战）把五件工具串成一条流水线。\cref{sec:cs-linear} 与 \cref{sec:cs-admm} 是两个硬核小节，值得花最多时间。
+
+\subsection*{前置知识桥接}
+本章紧接多机系统的图论基础，这里把三个最关键的前置点重新激活——你不必翻回去就能跟上：
+\begin{itemize}
+  \item \textbf{Laplacian $\mathbf{L}=\mathbf{D}-\mathbf{A}$ 与它的谱}。为通信图构造邻接矩阵 $\mathbf{A}$、度矩阵 $\mathbf{D}$、Laplacian $\mathbf{L}=\mathbf{D}-\mathbf{A}$，有三条性质：$\mathbf{L}\mathbf{1}=\mathbf{0}$（全 1 向量是零特征值的特征向量）、$\mathbf{L}$ 半正定（$\mathbf{L}=\mathbf{B}\mathbf{B}^\top$，$\mathbf{B}$ 为关联矩阵）、$\lambda_2>0\iff$ 图连通。本章 \cref{sec:cs-linear} 会让这三条性质\emph{直接变成共识收敛的证明步骤}。
+  \item \textbf{代数连通性 $\lambda_2$ 的双重含义}。$\lambda_2$ 既度量图的“最难切口”（Fiedler 向量/谱聚类），又给出共识收敛速率 $e^{-\lambda_2 t}$。本章把后一含义\emph{严格证明出来}，并补上它的离散对应、时延修正。
+  \item \textbf{集中式联合优化的 $O(N^3)$ 爆炸}。把 $N$ 台机器人拼成一个联合 QP，求解成本随 $N$ 三次方膨胀。本章 \cref{sec:cs-admm} 的 ADMM 正是这个痛点的解药——它把“一个大优化”切成“$N$ 个小优化 + 邻居间协调”。
+  \item \textbf{独立测量取平均的方差缩减}。$N$ 个独立、零均值、方差 $\sigma^2$ 的测量取平均，平均值的方差是 $\sigma^2/N$。这条初等结论是 \cref{sec:cs-dynamic} 分布式估计精度收益的根：$N$ 台机器人协同观测、用共识把测量平均掉，等效测量噪声标准差缩到 $1/\sqrt N$。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item \textbf{共识“看起来收敛了”其实是错的}：你照着网上代码写离散共识 $\mathbf{x}(k{+}1)=\mathbf{W}\mathbf{x}(k)$，随手把 $\mathbf{W}$ 设成“每个 agent 取自己和邻居的简单平均”。某些拓扑下能收敛，换一个（尤其各 agent 度数不同时）就慢慢漂移，收敛值也不是期望的平均。\cref{sec:cs-linear} 会告诉你：$\mathbf{W}$ 必须\emph{双随机}，否则平均值不守恒——而朴素的“度归一化”恰恰破坏了这一点。
+  \item \textbf{分布式 MPC 不收敛，你却以为是 bug}：把编队 MPC 用 ADMM 切分，$\rho$ 随手取值，结果要么剧烈震荡要么几百轮才勉强收敛，你在代码里到处找 bug。\cref{sec:cs-admm} 会告诉你：这不是 bug，是 $\rho$ 没调好——它控制“本地子问题”与“全局一致性”的相对权重，量级直接决定收敛速度与稳定性。
+  \item \textbf{多机协同感知，估计越跑越偏}：让一群机器人跟踪移动目标，想当然用静态共识把测量“平均一下”。结果目标一动，融合估计就滞后于真值，长时间还慢慢漂移。\cref{sec:cs-dynamic} 会告诉你：跟踪\emph{时变}量必须用\emph{动态共识}（注入输入增量做前馈），而漂移是因为它是积分型估计器，需要鲁棒化。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\label{tab:cs-reading}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（跟着推完所有收敛证明、手写 ADMM 求解一个 QP） & 15--21 小时 & 第一次系统学共识/分布式优化 \\
+速读（读懂结论与算法流程，跳过证明细节） & 5--6 小时 & 已有背景，查漏补缺 \\
+速查（只看共识收敛条件 + ADMM 三步 + $\rho$ 选取 + 故障排查） & 40--50 分钟 & 实现分布式 MPC 时回查 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+旋转矩阵记 $\mathbf{R}\in\SO(3)$、位姿 $\mathbf{T}\in\SE(3)$（preamble 宏 $\SO,\SE,\so,\se$，与全书一致，\nameref{ch:notation}）；图论/共识/优化领域的自然记号保留。
+通信图 $\mathcal{G}=(\mathcal{V},\mathcal{E})$，$N=|\mathcal{V}|$ 个 agent；邻接矩阵 $\mathbf{A}=[a_{ij}]$、度矩阵 $\mathbf{D}=\mathrm{diag}(d_{ii})$、Laplacian $\mathbf{L}=\mathbf{D}-\mathbf{A}$；$\mathcal{N}_i$ 为 agent $i$ 的邻居集；$\mathbf{1}$ 为全 1 向量。
+$\mathbf{L}$ 特征值升序记 $0=\lambda_1\le\lambda_2\le\dots\le\lambda_N$，$\lambda_2$ 为代数连通性、$\lambda_N$ 为最大特征值。
+离散共识权重矩阵记 $\mathbf{W}=[w_{ij}]$，其特征值按模降序，第二大模记 $|\rho_2(\mathbf{W})|$。
+\textbf{字母隔离声明}：本章 $\rho$ 在 \cref{sec:cs-admm} 起指 ADMM 罚参数（非密度/谱半径）、$\rho_2(\mathbf{W})$ 专指 $\mathbf{W}$ 第二大特征值模；$\mathbf{y}_i$ 指对偶变量、$\mathbf{u}_i$ 指缩放对偶变量、$\mathbf{z}$ 指协调变量；$\alpha$ 在有限时间共识处指分数次幂指数、在过松弛处指松弛因子（就地声明），均仅本章局部生效。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{线性共识协议}
+\label{sec:cs-linear}
+
+\paragraph{动机：一群机器人如何就“朝哪走”达成一致。}
+设想 $N$ 台机器人组成一支编队要一起前进，但没有中央指挥，每台只能和通信范围内的少数邻居交换信息。现在它们要就一件事达成一致——比如“整个编队的前进方向”。每台机器人初始各有各的想法，记 agent $i$ 的“意见”为标量 $x_i$。问题是：\textbf{在只能和邻居通信的约束下，这 $N$ 个各不相同的 $x_i$ 能不能、以及怎样收敛到同一个值？} 这正是\textbf{共识（consensus）}问题。它看似抽象，却是多机系统里反复出现的原子操作：编队对齐朝向、同步速度、分布式估计让各机器人对同一量的估计收敛，甚至 \cref{sec:cs-admm} 的 ADMM 协调本质上也是让各 agent 对“全局变量”达成共识。
+
+\paragraph{反面：用最朴素的办法会怎样。}
+最朴素的想法：让每台机器人不断“往邻居的方向挪一点”——邻居整体比自己大就把意见调大，反之调小。这个直觉\emph{就是对的}（它正是连续时间共识协议），但留下三个必须回答的问题：其一，\textbf{它真的会收敛吗，还是震荡甚至发散？} 若拓扑特殊（有向、不对称），会不会出现 A 追 B、B 追 C、C 追 A 的循环？其二，\textbf{如果收敛，收敛到什么值？} 是所有初始意见的平均，还是被某个“意见领袖”主导？其三，\textbf{收敛要多久？} 这直接决定每个控制周期要留多少时间给共识迭代。这三个问题，朴素直觉一个都答不了——需要把它写成方程来分析。
+
+\paragraph{历史：从 Vicsek 模型到 Olfati-Saber 的形式化。}
+共识的思想源头可追到 1995 年 Vicsek 等人的自驱动粒子模型——一群粒子各自朝“邻居平均朝向”对齐，涌现出群体的一致运动，这是统计物理学家观察鸟群、鱼群时提出的\cite{vicsek1995novel}。2003 年 Jadbabaie 等人给 Vicsek 模型做了严格的收敛性分析，首次用图论解释了“为什么对齐会成功”\cite{jadbabaie2003coordination}。真正把“共识”这个词和完整理论框架确立下来的，是 Olfati-Saber 与 Murray 在 2004 年的工作——他们系统分析了固定拓扑、切换拓扑、含时延三种情形下的收敛条件，并建立了“代数连通性 $\lambda_2$ 决定协商速度”这一核心联系\cite{olfatisaber2004consensus}。本节走的就是他们奠定的路线：先连续、再离散，把收敛性和速率都证清楚。
+
+\subsection{连续时间共识协议}
+\label{sec:cs-cont}
+
+把“向邻居靠拢”写成微分方程。agent $i$ 的意见 $x_i$ 的变化率，正比于它与每个邻居意见之差的总和：
+\begin{equation}
+  \dot x_i = \sum_{j\in\mathcal{N}_i} a_{ij}\,(x_j - x_i),\qquad i=1,\dots,N.
+  \label{eq:cs-cont-scalar}
+\end{equation}
+$(x_j-x_i)$ 是“邻居 $j$ 比我高出多少”：邻居整体比我高则右边为正、意见往上调；反之往下调；与所有邻居一致时右边为零、停止变化。
+
+\paragraph{关键一步：把 $N$ 个方程写成矩阵形式。}
+这是把“局部规则”变成“可分析的全局动力学”的转折点。展开 \cref{eq:cs-cont-scalar} 的右边：
+\begin{equation}
+  \dot x_i = \sum_{j} a_{ij}x_j - \Big(\sum_{j}a_{ij}\Big)x_i = \sum_j a_{ij}x_j - d_{ii}x_i,
+  \label{eq:cs-expand}
+\end{equation}
+其中 $d_{ii}=\sum_j a_{ij}$ 正是 agent $i$ 的\emph{度}。把所有 $i$ 叠起来，用向量 $\mathbf{x}=(x_1,\dots,x_N)^\top$：右边第一项是 $\mathbf{A}\mathbf{x}$、第二项是 $\mathbf{D}\mathbf{x}$，于是
+\begin{equation}
+  \dot{\mathbf{x}} = \mathbf{A}\mathbf{x} - \mathbf{D}\mathbf{x} = -(\mathbf{D}-\mathbf{A})\mathbf{x} = -\mathbf{L}\mathbf{x}.
+  \label{eq:cs-cont-matrix}
+\end{equation}
+\textbf{这就是连续时间共识协议的矩阵形式 $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$。} 辛苦构造的 Laplacian $\mathbf{L}=\mathbf{D}-\mathbf{A}$ 在这里以最自然的方式出现了——它不是凭空定义的矩阵，而正是“向邻居靠拢”这条局部规则的全局算子\cite{olfatisaber2004consensus}。值得停下来体会：一个纯粹局部的、每个机器人只看自己邻居的规则，叠加起来恰好是 $-\mathbf{L}$ 这个由整张图拓扑决定的矩阵。
+
+\begin{insight}[共识的全部行为编码在 $\mathbf{L}$ 的谱里]\label{ins:cs-spectrum}
+$\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$ 把“协调”还原成最简单的线性动力系统，而它的全部行为（收没收敛、敛到哪、多快）都编码在 $\mathbf{L}$ 的\textbf{谱}（特征值与特征向量）里。花大力气研究 $\mathbf{L}$ 的谱不是数学游戏——正因为共识、编队、分布式优化这些“协调”过程本质上都是 $-\mathbf{L}$（或其变体）驱动的线性系统，$\mathbf{L}$ 的谱就是它们的“DNA”。理解了这一点，你就明白为什么 $\lambda_2$ 会一遍遍出现在多机系统的每个角落。
+\end{insight}
+
+\subsection{连续时间共识的收敛性证明}
+\label{sec:cs-cont-proof}
+
+$\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$ 是线性常微分方程，其解为
+\begin{equation}
+  \mathbf{x}(t) = e^{-\mathbf{L}t}\,\mathbf{x}(0).
+  \label{eq:cs-matexp}
+\end{equation}
+要分析 $\mathbf{x}(t)$ 的行为，就要分析矩阵指数 $e^{-\mathbf{L}t}$，这要用到 $\mathbf{L}$ 的特征值分解。先聚焦最常用也最干净的情形：\textbf{无向连通图}（对称 $\mathbf{L}$）。
+
+\begin{theorem}[连续平均共识]\label{thm:cs-cont-conv}
+设 $\mathcal{G}$ 为无向连通图，$\mathbf{L}$ 对称半正定，特征值 $0=\lambda_1<\lambda_2\le\dots\le\lambda_N$，$\lambda_1=0$ 为单根、对应单位特征向量 $\mathbf{v}_1=\tfrac{1}{\sqrt N}\mathbf{1}$。则 $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$ 的解满足
+\begin{equation}
+  \lim_{t\to\infty}\mathbf{x}(t)=\bar x\,\mathbf{1},\qquad \bar x=\frac1N\sum_{i=1}^N x_i(0),
+  \label{eq:cs-avg}
+\end{equation}
+且共识误差以速率 $\lambda_2$ 指数衰减：$\|\mathbf{x}(t)-\bar x\mathbf{1}\|\le e^{-\lambda_2 t}\,\|\mathbf{x}(0)-\bar x\mathbf{1}\|$。
+\end{theorem}
+
+\begin{proof}
+因 $\mathbf{L}$ 对称，其特征向量 $\{\mathbf{v}_1,\dots,\mathbf{v}_N\}$ 可取为标准正交基（$\lambda_2,\dots,\lambda_N>0$ 因图连通）。把初值在该基下展开 $\mathbf{x}(0)=\sum_{k=1}^N c_k\mathbf{v}_k$，$c_k=\mathbf{v}_k^\top\mathbf{x}(0)$。由 $\mathbf{L}\mathbf{v}_k=\lambda_k\mathbf{v}_k$，矩阵指数作用在每个特征向量上就是标量指数 $e^{-\mathbf{L}t}\mathbf{v}_k=e^{-\lambda_k t}\mathbf{v}_k$，故
+\begin{equation}
+  \mathbf{x}(t)=\sum_{k=1}^N c_k\,e^{-\lambda_k t}\,\mathbf{v}_k.
+  \label{eq:cs-modal}
+\end{equation}
+逐项分析 $t\to\infty$：$k=1$ 项 $\lambda_1=0$，$e^{0}=1$ 永不衰减，且
+\[
+  c_1\mathbf{v}_1=(\mathbf{v}_1^\top\mathbf{x}(0))\mathbf{v}_1=\Big(\tfrac1N\mathbf{1}^\top\mathbf{x}(0)\Big)\mathbf{1}=\bar x\,\mathbf{1};
+\]
+$k\ge2$ 项 $\lambda_k>0$，$e^{-\lambda_k t}\to0$ 全部衰减到零。故 $\mathbf{x}(t)\to\bar x\mathbf{1}$，即 \cref{eq:cs-avg}。共识误差 $\mathbf{x}(t)-\bar x\mathbf{1}$ 恰是 \cref{eq:cs-modal} 中 $k\ge2$ 之和，其范数（用标准正交性，范数平方等于系数平方和）
+\begin{equation}
+  \|\mathbf{x}(t)-\bar x\mathbf{1}\|^2=\sum_{k\ge2}c_k^2 e^{-2\lambda_k t}\le e^{-2\lambda_2 t}\sum_{k\ge2}c_k^2=e^{-2\lambda_2 t}\|\mathbf{x}(0)-\bar x\mathbf{1}\|^2,
+  \label{eq:cs-errbound}
+\end{equation}
+末步因 $\lambda_k\ge\lambda_2$ 对所有 $k\ge2$ 成立。开方即得指数收敛界。
+\end{proof}
+
+\textbf{三个问题一次性答完}：(1) 收敛——只要图连通；(2) 收敛到\emph{初始意见的平均} $\bar x$，这叫\textbf{平均共识}；(3) 多快——由衰减最慢的非零模态决定，即\textbf{最小非零特征值 $\lambda_2$}。\cref{eq:cs-errbound} 严格证明了“图越连通（$\lambda_2$ 越大）协调越快”：$\lambda_2$ 大一倍，达到同样精度的时间减半。$\lambda_2$ 在这里被称为系统的\textbf{收敛速率}或代数连通性。
+
+\paragraph{为什么偏偏收敛到平均？守恒量视角。}
+这里主动回答一个初学者常有的疑问。关键在 $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$ 有一个\textbf{守恒量}。把 \cref{eq:cs-cont-matrix} 两边左乘 $\mathbf{1}^\top$：$\mathbf{1}^\top\dot{\mathbf{x}}=-\mathbf{1}^\top\mathbf{L}\mathbf{x}$。由 $\mathbf{L}$ 对称且 $\mathbf{L}\mathbf{1}=\mathbf{0}$，有 $\mathbf{1}^\top\mathbf{L}=(\mathbf{L}\mathbf{1})^\top=\mathbf{0}^\top$，所以 $\mathbf{1}^\top\dot{\mathbf{x}}=0$，即 $\tfrac{d}{dt}\sum_i x_i=0$——\textbf{所有意见之和（因而平均值）在整个演化过程中恒定不变}。既然平均值守恒、又最终收敛到某个一致值，那个一致值必然就是初始平均。这个“守恒”视角比特征值展开更直观，值得记住：平均共识之所以收敛到平均，是因为协议本身保持了总和不变。
+
+\subsection{离散时间共识协议}
+\label{sec:cs-disc}
+
+工程上机器人按离散控制周期运行，通信也是一个周期发一次。更贴近实现的是\textbf{离散时间共识}：每个周期，机器人把自己的新意见设为“自己和邻居意见的加权平均”：
+\begin{equation}
+  x_i(k{+}1) = w_{ii}\,x_i(k) + \sum_{j\in\mathcal{N}_i} w_{ij}\,x_j(k)\quad\Longleftrightarrow\quad \mathbf{x}(k{+}1)=\mathbf{W}\mathbf{x}(k),\ \ \mathbf{x}(k)=\mathbf{W}^k\mathbf{x}(0),
+  \label{eq:cs-disc}
+\end{equation}
+其中 $\mathbf{W}=[w_{ij}]$ 是\textbf{权重矩阵}（共识矩阵）。注意离散情形不再直接用 $\mathbf{L}$，而用新矩阵 $\mathbf{W}$——两者关系马上讲清。
+
+\begin{theorem}[离散平均共识：双随机条件]\label{thm:cs-disc-conv}
+设 $\mathbf{W}$ 对称且\textbf{双随机}（行和与列和都为 1），对应图连通。则 $\mathbf{W}$ 最大特征值 $\rho_1=1$ 为单根（对应 $\mathbf{1}$），其余特征值模严格小于 1。离散共识 \cref{eq:cs-disc} 收敛到初始平均 $\bar x\mathbf{1}$，误差以每步乘 $|\rho_2(\mathbf{W})|$ 的几何速率衰减：
+\begin{equation}
+  \|\mathbf{x}(k)-\bar x\mathbf{1}\| \le |\rho_2(\mathbf{W})|^k\,\|\mathbf{x}(0)-\bar x\mathbf{1}\|.
+  \label{eq:cs-disc-bound}
+\end{equation}
+\end{theorem}
+
+\pz{存疑（前提需补一条，结论与速率均正确）：仅“对称双随机 + 连通”尚\textbf{不足}以保证收敛——还须\emph{非周期}（aperiodic，等价于有正自权/无 $-1$ 特征值）。反例：$\mathbf{W}=\big[\begin{smallmatrix}0&1\\1&0\end{smallmatrix}\big]$（及 $C_4$ 等邻居权 $\mathbf{W}=\mathbf{A}/2$）对称、双随机、连通，却有特征值 $-1$，状态在 $[1,0]\!\leftrightarrow\![0,1]$ 间永远振荡、不收敛。本定理其实已隐含此条——“其余特征值模\emph{严格}小于 1”正排除了 $-1$；只是把它读作\emph{结论}而非\emph{前提}时有缝。补法：前提加“非周期/正自权”。本章自身的构造（Metropolis、$\mathbf{W}=\mathbf{I}-\varepsilon\mathbf{L}$）均含正对角、自动非周期，不受影响。出处：Xiao--Boyd 2004\cite{xiaoboyd2004fast} 式(8)后注（双随机+irreducible+aperiodic）。}
+
+\noindent 所谓双随机，指
+\begin{equation}
+  \mathbf{W}\mathbf{1}=\mathbf{1}\ (\text{行和为 1}),\qquad \mathbf{1}^\top\mathbf{W}=\mathbf{1}^\top\ (\text{列和为 1}).
+  \label{eq:cs-doubly}
+\end{equation}
+这两个条件各有深意，必须分开理解（一个\emph{双重解读}）：
+\begin{itemize}
+  \item \textbf{行和为 1 $\Rightarrow$ 一致状态是不动点}。$\mathbf{W}\mathbf{1}=\mathbf{1}$ 意味着若已一致（$\mathbf{x}=c\mathbf{1}$），则 $\mathbf{W}\mathbf{x}=c\mathbf{W}\mathbf{1}=c\mathbf{1}=\mathbf{x}$ 保持不动。即每步取的是真正的\emph{加权平均}而非加权求和。
+  \item \textbf{列和为 1 $\Rightarrow$ 平均值守恒}。$\mathbf{1}^\top\mathbf{W}=\mathbf{1}^\top$ 意味着 $\mathbf{1}^\top\mathbf{x}(k{+}1)=\mathbf{1}^\top\mathbf{W}\mathbf{x}(k)=\mathbf{1}^\top\mathbf{x}(k)$，即总和（平均值）逐周期守恒——保证收敛值是初始平均。
+\end{itemize}
+收敛速率的证明仿照 \cref{eq:cs-modal} 的模态展开：$\mathbf{x}(k)=\mathbf{W}^k\mathbf{x}(0)=\sum_k c_k\rho_k^k\mathbf{v}_k$，$k=1$ 项给出 $\bar x\mathbf{1}$（因 $\rho_1^k=1$），其余以 $|\rho_k|^k\le|\rho_2|^k\to0$ 衰减，即得 \cref{eq:cs-disc-bound}。$|\rho_2(\mathbf{W})|$ 越接近 0 收敛越快、越接近 1 越慢。
+
+\begin{pitfall}[编程陷阱：离散共识用非双随机的 $\mathbf{W}$（典型：度归一化）]
+很多人随手把 $\mathbf{W}$ 设成“度归一化”，即 agent $i$ 对自己和每个邻居都取权重 $\tfrac{1}{d_{ii}+1}$。这样每行和确实是 1（满足行和条件），但当各 agent 度数不同时，\textbf{列和一般不为 1}——平均值不守恒，收敛值会偏离初始平均（被高度数节点“拉偏”），甚至某些拓扑下不收敛。debug 时你会发现“收敛了，但收敛到的值不对”。\textbf{正确做法}：用对称双随机权重，最常用的是 \textbf{Metropolis--Hastings 权重}
+\[
+  w_{ij}=\frac{1}{1+\max(d_{ii},d_{jj})}\ (i,j\text{ 相邻}),\qquad w_{ii}=1-\sum_{j\in\mathcal{N}_i}w_{ij},
+\]
+它自动对称（故双随机）、只需邻居的度数（局部可算）。自检：打印 \verb|W.sum(0)| 与 \verb|W.sum(1)|，两者都应为全 1 向量。
+\end{pitfall}
+
+\paragraph{双重解读：共识 $=$ 马尔可夫链混合。}
+\textbf{双随机矩阵 $\mathbf{W}$ 也是一个马尔可夫链的转移矩阵}。若 $\mathbf{W}$ 行随机（行和为 1、元素非负），它定义一个马尔可夫链——状态 $i$ 以概率 $w_{ij}$ 转移到 $j$。于是离散共识可从两个角度看：（共识视角）$\mathbf{W}$ 把每个 agent 的值更新为邻居加权平均，各值收敛到一致；（马尔可夫/随机游走视角）$\mathbf{W}^k$ 描述图上随机游走 $k$ 步的概率分布演化，$\mathbf{W}$ 双随机 $\iff$ 平稳分布是均匀分布，收敛速率 $|\rho_2(\mathbf{W})|$ 正是马尔可夫链的\textbf{混合速率}。这意味着共识收敛快慢 $=$ 随机游走混合快慢 $=$ 谱隙 $1-|\rho_2(\mathbf{W})|$ 大小，三者是同一件事的三种说法。\textbf{边界提醒}：类比在 $\mathbf{W}$ 双随机时最干净（平稳分布均匀）；若只行随机（非双随机），平稳分布偏向高连接度节点，共识值也被它们拉偏——这从马尔可夫链角度再次解释了“为什么必须双随机才收敛到正确平均”。
+
+\subsection{连续与离散的桥梁}
+\label{sec:cs-bridge}
+
+连续用 $\mathbf{L}$、离散用 $\mathbf{W}$，两者什么关系？最简单的联系是对 $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$ 做\textbf{前向欧拉离散化}，步长 $\varepsilon$：
+\begin{equation}
+  \mathbf{x}(k{+}1)=\mathbf{x}(k)-\varepsilon\mathbf{L}\mathbf{x}(k)=(\mathbf{I}-\varepsilon\mathbf{L})\mathbf{x}(k),\qquad \mathbf{W}=\mathbf{I}-\varepsilon\mathbf{L}.
+  \label{eq:cs-euler}
+\end{equation}
+检验：$\mathbf{W}\mathbf{1}=(\mathbf{I}-\varepsilon\mathbf{L})\mathbf{1}=\mathbf{1}-\varepsilon\mathbf{0}=\mathbf{1}$（行和为 1，因 $\mathbf{L}\mathbf{1}=\mathbf{0}$）；无向图 $\mathbf{L}$ 对称故 $\mathbf{W}$ 对称，列和也为 1。所以 \textbf{$\mathbf{W}=\mathbf{I}-\varepsilon\mathbf{L}$ 自动双随机}——这是构造合法 $\mathbf{W}$ 的捷径。$\mathbf{W}$ 的特征值是 $1-\varepsilon\lambda_k$，故 $\rho_2(\mathbf{W})=1-\varepsilon\lambda_2$。
+
+但 $\varepsilon$ 不能随便取：要让所有 $|1-\varepsilon\lambda_k|<1$（否则发散），需 $0<\varepsilon<2/\lambda_N$（由最大特征值 $\lambda_N$ 卡住上界）。这给出一个重要提示——\textbf{离散步长的稳定上界由 $\lambda_N$ 决定，而收敛速度由 $\lambda_2$ 决定}。比值 $\lambda_N/\lambda_2$（类似条件数）越大，意味着“为了稳定必须用小步长、但小步长又让慢模态收敛更慢”，收敛越困难。
+
+\begin{insight}[$\lambda_2$ 与 $\lambda_N$：图上一切迭代的两个端点]\label{ins:cs-two-eig}
+连续与离散共识不是两个独立的东西，而是同一个“图上扩散过程”的两种时间刻度。$\lambda_2$ 决定“能多快收敛”（慢模态），$\lambda_N$ 决定“每步能迈多大而不失稳”（快模态）。这一对特征值——最小非零的 $\lambda_2$ 和最大的 $\lambda_N$——几乎主宰图上一切迭代算法的行为：共识的速度与步长、\cref{sec:cs-admm} ADMM 的收敛、乃至分布式 MPC 的迭代轮数，都逃不开这两个量的支配。
+\end{insight}
+
+\begin{pitfall}[概念误区：把 $\lambda_2$ 的“速度”和 $\lambda_N$ 的“稳定步长”混为一谈]
+认为只要 $\lambda_2$ 大、离散共识就一定快——忽略了步长上界由 $\lambda_N$ 卡住。在一个 $\lambda_N$ 很大的稠密图上，你为了稳定不得不用很小的 $\varepsilon$，结果即便 $\lambda_2$ 不小，实际收敛（每步 $\rho_2=1-\varepsilon\lambda_2$）也快不起来。\textbf{正确做法}：评估离散共识快慢看比值 $\lambda_2/\lambda_N$（谱的“条件数”），稠密但“病态”（谱很宽）的图未必比稀疏图收敛快——结构比边数更重要。
+\end{pitfall}
+
+\subsection{有向图共识：收敛到加权平均}
+\label{sec:cs-directed}
+
+前面都假设无向图（对称 $\mathbf{L}$），收敛到初始\emph{平均}值。但现实中通信常是单向的——leader 广播但不接收、UAV 把目标发给地面机器人但不反向接收。这时拓扑是\textbf{有向图}，$\mathbf{L}$ 不再对称，“收敛到平均”的结论需修正。
+
+有向图共识 $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$ 仍成立（局部规则没变），关键变化在 $\mathbf{L}$ 的谱结构。有向图的连通性判据从“无向连通”换成“\textbf{存在有向生成树}”（存在一个根节点，沿有向边能到达所有其它节点）。在含生成树的条件下：
+\begin{itemize}
+  \item $\mathbf{L}$ 仍有单重零特征值（$\mathbf{L}\mathbf{1}=\mathbf{0}$ 对有向图同样成立——每行仍是“度减邻接”、行和为零），对应右特征向量仍是 $\mathbf{1}$；
+  \item 但 $\mathbf{L}$ 的\textbf{左}零特征向量不再是 $\mathbf{1}$。记其为 $\boldsymbol{\gamma}$（满足 $\boldsymbol{\gamma}^\top\mathbf{L}=\mathbf{0}^\top$，归一化 $\boldsymbol{\gamma}^\top\mathbf{1}=1$，各分量 $\gamma_i\ge0$），它就是有向图共识的“权重”。
+\end{itemize}
+仿照模态分析（有向图需用 Jordan 分解，但主导项逻辑相同），有向共识收敛到
+\begin{equation}
+  \lim_{t\to\infty}\mathbf{x}(t)=(\boldsymbol{\gamma}^\top\mathbf{x}(0))\,\mathbf{1}=\Big(\sum_i\gamma_i x_i(0)\Big)\mathbf{1},
+  \label{eq:cs-directed-avg}
+\end{equation}
+即收敛到由 $\boldsymbol{\gamma}$ 加权的\textbf{加权平均}，而非简单平均\cite{olfatisaber2007consensus}。$\boldsymbol{\gamma}$（左 Perron 特征向量）的物理含义是各 agent 在最终共识值里的“话语权”——根节点/信息源头的权重大，纯接收者（只听不说的 follower）权重可能为零。
+
+什么时候有向图也收敛到简单平均？当且仅当图\textbf{平衡（balanced）}——每个节点入度等于出度。平衡有向图的 $\boldsymbol{\gamma}=\tfrac1N\mathbf{1}$（均匀权重），退回平均共识。至于收敛速率，有向图不再由实数 $\lambda_2$ 决定，而由 $\mathbf{L}$ 的非零特征值里\textbf{实部最小的那个}决定（有向图特征值可为复数，实部为负保证对应模态衰减）。完整的有向共识分析（含复特征值、Jordan 块）属于更深内容，这里掌握结论即可：\textbf{含生成树则收敛、收敛到 $\boldsymbol{\gamma}$ 加权平均、平衡图退回简单平均、速率由最小非零实部定}。
+
+\begin{insight}[有向图打破了共识的“民主”]\label{ins:cs-directed}
+无向图人人话语权相等（收敛到平均），有向图的话语权由左 Perron 特征向量 $\boldsymbol{\gamma}$ 决定，信息源头说话更管用。极端情形：有向星型（leader 只广播）的 $\boldsymbol{\gamma}$ 全部集中在 leader 上，共识值 $=$ leader 的值——这正是“收敛到 leader 而非平均”的数学根。理解了 $\boldsymbol{\gamma}$，你就能预测任意有向拓扑会收敛到谁主导的值，这对设计 leader-follower 编队至关重要。
+\end{insight}
+
+\subsection{最优权重设计：把“收敛多快”变成可优化问题}
+\label{sec:cs-fdla}
+
+前面构造离散共识权重给了两条现成路子：Metropolis 权重、$\mathbf{W}=\mathbf{I}-\varepsilon\mathbf{L}$。它们都是\textbf{启发式}——能保证双随机和收敛，但未必收敛\emph{最快}。一个自然的问题：给定一张图，存不存在“最优”权重让 $|\rho_2(\mathbf{W})|$ 最小？Xiao 与 Boyd 在 2004 年回答了这个问题，答案很漂亮\cite{xiaoboyd2004fast}。“设计最快共识”就是
+\begin{equation}
+  \min_{\mathbf{W}}\ \big\|\mathbf{W}-\tfrac1N\mathbf{1}\mathbf{1}^\top\big\|_2\quad\text{s.t.}\quad \mathbf{W}\mathbf{1}=\mathbf{1},\ \mathbf{1}^\top\mathbf{W}=\mathbf{1}^\top,\ w_{ij}=0\text{ 若 }(i,j)\notin\mathcal{E},
+  \label{eq:cs-fdla}
+\end{equation}
+目标里 $\|\mathbf{W}-\tfrac1N\mathbf{1}\mathbf{1}^\top\|_2$ 正是“去掉一致方向后” $\mathbf{W}$ 的谱范数，等于 $|\rho_2(\mathbf{W})|$（对对称 $\mathbf{W}$）；约束是双随机 + 只能用图上存在的边。Xiao--Boyd 证明了关键结论：\textbf{当限定权重对称时，这个“最快分布式线性平均（FDLA）”问题是一个半定规划（SDP），可高效、全局地求解}。也就是说，“哪套权重让这张图上共识最快”不是只能靠试，而是能精确解出的凸优化。这个结果有两层教学价值：
+\begin{itemize}
+  \item \textbf{最优权重常显著快于启发式}。Xiao--Boyd 的实验显示，最大度权重、局部度权重这些常见启发式收敛最慢，SDP 解出的最优对称权重明显更快。所以“Metropolis 够用”是工程方便、不是最优；对收敛速度极敏感的场合，值得花一次离线 SDP 求最优权重。
+  \item \textbf{一个深刻的反直觉：最优权重可以是负的}。直觉上共识权重应都是正的，但 Xiao--Boyd 发现最优对称权重里某些边/节点的权重是\textbf{负}的。负权重意味着“反着邻居调一点”，与“向邻居靠拢”的朴素直觉相悖，却能更有效地压制慢模态、让整体收敛更快。这提醒：\textbf{让单步看起来“最合理”（都正向平均）未必让整体收敛最快；最优是全局谱的性质，不是逐边的直觉}。
+\end{itemize}
+\textbf{边界}：SDP 最优权重需\textbf{集中地、离线地}求解（要知道整张图），适合拓扑固定、可预先计算的场合；拓扑动态变化时，还是用 Metropolis 这类\emph{局部可算}的权重更实际。值得一提：FDLA 问题与“图上最快混合马尔可夫链”是对偶的两面——又一次印证 \cref{sec:cs-disc} 的马尔可夫链视角。
+
+\subsection{加速共识与有限时间共识}
+\label{sec:cs-finite}
+
+\paragraph{加“动量”（重球/Nesterov 类比）。}
+最优权重是在\emph{静态权重}里挑最好。还有一条正交的提速路：\textbf{加历史项（动量）}。标准离散共识 $\mathbf{x}(k{+}1)=\mathbf{W}\mathbf{x}(k)$ 是“无记忆”的——下一步只看当前。借鉴优化里的重球法/Nesterov 加速，可让更新参考上一步的变化：
+\begin{equation}
+  \mathbf{x}(k{+}1)=\mathbf{W}\mathbf{x}(k)+\beta\big(\mathbf{x}(k)-\mathbf{x}(k{-}1)\big),\qquad \beta\in[0,1),
+  \label{eq:cs-momentum}
+\end{equation}
+$\beta$ 是动量系数，多出的项是“惯性”——沿上一步方向再冲一点。普通共识在接近一致时步子越迈越小（误差按 $|\rho_2|$ 几何衰减），动量项让它保持惯性冲过去。\textbf{精心选 $\beta$ 的动量共识，可把收敛速率从依赖 $\rho_2$ 改善到依赖 $\sqrt{\rho_2}$ 量级}（类比 Nesterov 把梯度法的 $\kappa$ 改善为 $\sqrt\kappa$）——对慢收敛的图（长链、大环，$\rho_2$ 接近 1）提速尤其明显。\pz{存疑（记号宜收紧，结论本身正确）：严格说被改善的是\emph{谱隙}而非 $\rho_2$ 本身——迭代复杂度从 $1/(1-\rho_2)$ 改善到 $1/\sqrt{1-\rho_2}$（等价 Chebyshev/重球加速）。字面写“$\rho_2\!\to\!\sqrt{\rho_2}$”在 $\rho_2\!\to\!1$ 的慢混合区会失真（$\sqrt{\rho_2}$ 反而几乎无加速）；此乃领域惯用简写，意图无误。建议改述为“把对谱隙 $1-\rho_2$ 的依赖从 $1/(1-\rho_2)$ 改善到 $1/\sqrt{1-\rho_2}$”。佐证：Bach“Chebyshev polynomials”；Scaman 等 2017（最优 gossip 加速）；Loizou--Richtárik（加速 gossip）。}代价是多存一步历史、且 $\beta$ 要调好（太大会过冲振荡），且在切换拓扑/有延迟时动量与延迟叠加可能加剧振荡，需重新评估稳定性。
+
+\paragraph{有限时间共识：在有界时间内精确达成一致。}
+前面所有共识（连续、离散、动量、最优权重）有一个共同的“软肋”——都是\textbf{渐近收敛}：误差以 $e^{-\lambda_2 t}$ 或 $|\rho_2(\mathbf{W})|^k$ 衰减，理论上\emph{永远}到不了精确一致。对很多任务这够用，但有些场景\emph{不行}：多机要在确定时刻同步触发动作（同时起跳、同时合拢抓取），需要“在一个事先知道、且与初值无关的有限时间内\emph{精确}达成一致”。这就是\textbf{有限时间共识}。
+
+\emph{为什么线性协议做不到？}（一次反事实推理）线性系统 $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$ 的解 $e^{-\mathbf{L}t}\mathbf{x}(0)$ 里 $e^{-\lambda_k t}$ 对任意有限 $t$ 都严格大于零——非零模态永远衰减不到精确的零。直觉上：线性协议里调整速度正比于差 $\dot x_i\propto\sum(x_j-x_i)$，差越小调整越慢，像芝诺悖论永远差最后一步。\textbf{要打破“接近就变慢”，必须让协议在误差小时仍保持足够的调整力度}——用\textbf{次线性（非 Lipschitz）反馈}。标准构造是把线性协议里的“差”换成它的\textbf{分数次幂}（带符号）：
+\begin{equation}
+  \dot x_i=\sum_{j\in\mathcal{N}_i}a_{ij}\,\sigp(x_j-x_i)^{\alpha},\qquad \sigp(y)^\alpha:=\sgn(y)\,|y|^{\alpha},\quad 0<\alpha<1.
+  \label{eq:cs-finite}
+\end{equation}
+对比线性协议（$\alpha=1$）：当差 $|y|$ 很小时，$|y|^\alpha$（因 $\alpha<1$）比 $|y|$ \textbf{大}——例如 $|y|=0.01$、$\alpha=0.5$ 时 $|y|^\alpha=0.1$，是线性的 10 倍。即\textbf{越接近一致，分数次幂反而提供相对越强的“拉拢力”}，恰好补偿线性协议“接近就变慢”的毛病。用 Lyapunov 方法可证（取 $V=\tfrac12\sum(x_i-\bar x)^2$，可证 $\dot V\le-c\,V^{(1+\alpha)/2}$，这种“$\dot V\le-cV^\theta$ 且 $\theta<1$”的微分不等式正是有限时间稳定的标准判据）：\cref{eq:cs-finite} 在无向连通图下于\textbf{有限时间} $T$ 收敛到精确平均，$T$ 有上界（依赖 $\alpha$、$\lambda_2$ 和初始误差）。$\alpha$ 越接近 0 收敛越“急”，但太小会带来数值/抖振问题；$\alpha\to1$ 退回渐近的线性共识。
+
+\begin{insight}[有限时间 vs 渐近：误差趋零处的增益结构]\label{ins:cs-finite}
+有限时间共识与渐近共识的本质分野，在于反馈在“误差趋零处”的\textbf{增益结构}。线性共识（Lipschitz 反馈）在误差 $\to0$ 时增益不变、绝对调整量 $\to0$，于是渐近；有限时间共识用非 Lipschitz 的分数次幂反馈，在误差 $\to0$ 时\textbf{相对增益 $\to\infty$}，把“最后一段”强行走完。这与控制里“有限时间镇定必须用非光滑反馈（terminal sliding mode、bang-bang）”是同一深刻原理——光滑线性反馈只能指数收敛，要有限时间必须牺牲光滑性。代价也相通：非光滑反馈带来抖振、对噪声敏感。\textbf{所以有限时间不是免费的“更快”，而是用“反馈的光滑性/鲁棒性”换“精确有限时间到达”}——任务真的需要“卡点精确同步”时才值得上。
+\end{insight}
+
+\textbf{进一步推广（边界提醒）}：有限时间共识的 $T$ 虽有限，但\emph{依赖初始误差}。更强的\textbf{固定时间共识}通过组合两个不同幂次（$\alpha<1$ 与 $\beta>1$）的反馈项，使收敛时间有一个\emph{与初值无关}的统一上界 $T_{\max}$。记住谱系：\textbf{渐近（$\alpha=1$）$\to$ 有限时间（$\alpha<1$，$T$ 依赖初值）$\to$ 固定时间（$\alpha<1$ 与 $\beta>1$ 组合，$T$ 有统一上界）}，反馈越非线性，时间保证越强，但鲁棒性/可调性代价越大。最优权重、动量、有限/固定时间分别从权重、历史、反馈非线性三个正交维度发力，可按任务需求组合。
+
+\subsection{代码验证：连续/离散收敛与有限时间对照}
+\label{sec:cs-linear-code}
+
+理论说“连续收敛率是 $\lambda_2$、离散是 $|\rho_2(\mathbf{W})|$，且 $\mathbf{W}=\mathbf{I}-\varepsilon\mathbf{L}$ 时 $\rho_2=1-\varepsilon\lambda_2$”。下面用代码一次性验证：同一张图，既跑连续也跑离散共识，确认收敛值都是初始平均、速率与谱预测一致。注意 \Verb[breaklines]|eps = 1.0/lamN| 这一步——若取 $\varepsilon>2/\lambda_N$，离散迭代会发散。
+
+\begin{codebox}[Python]{连续与离散共识:收敛到初始平均、速率由谱预测}
+import numpy as np
+
+def laplacian_from_edges(N, edges):
+    """由无向边集构造 Laplacian L = D - A."""
+    A = np.zeros((N, N))
+    for i, j in edges:
+        A[i, j] = 1.0; A[j, i] = 1.0
+    return np.diag(A.sum(axis=1)) - A
+
+N = 6                                       # N=6 环图
+edges = [(i, (i + 1) % N) for i in range(N)]
+L = laplacian_from_edges(N, edges)
+eig = np.sort(np.linalg.eigvalsh(L))
+lam2, lamN = eig[1], eig[-1]
+
+x0 = np.array([3.0, -1.0, 4.0, 1.0, -2.0, 0.0])
+x_bar = x0.mean()                           # 连续/离散都应收敛到它
+
+# 连续共识 dx/dt = -L x（小步长积分逼近）
+def continuous_consensus(L, x0, dt=1e-3, T=20.0):
+    x = x0.copy()
+    for _ in range(int(T / dt)):
+        x = x - dt * (L @ x)
+    return x
+xc = continuous_consensus(L, x0)
+
+# 离散共识 W = I - eps*L，eps 必须 < 2/lamN 才稳定
+eps = 1.0 / lamN
+W = np.eye(N) - eps * L                      # 自动双随机
+rho2 = np.sort(np.abs(np.linalg.eigvals(W)))[-2]
+assert abs(rho2 - (1 - eps * lam2)) < 1e-9   # rho2(W) == 1 - eps*lam2
+x = x0.copy()
+for k in range(200):
+    x = W @ x
+print(f"连续收敛到 {xc.mean():.4f}, 离散收敛到 {x.mean():.4f}, 初始平均 {x_bar:.4f}")
+print(f"W 行和={W.sum(1).round(4)}, 列和={W.sum(0).round(4)}（都应为 1）")
+\end{codebox}
+
+\noindent 运行要点：连续与离散都收敛到同一初始平均 $\bar x$；$\mathbf{W}=\mathbf{I}-\varepsilon\mathbf{L}$ 的行和列和都是 1（双随机）；$\rho_2(\mathbf{W})$ 数值上恰等于 $1-\varepsilon\lambda_2$。补充验证有限时间 vs 渐近：把线性（$\alpha=1$）与分数次幂（$\alpha<1$）协议放同一初值积分，$\alpha=1$ 的误差一路指数下降但有限时间内到不了 $10^{-6}$（渐近），$\alpha<1$ 的误差在某有限时刻\emph{精确归零}（对数坐标下“撞到地板”），且 $\alpha$ 越小到达越早；有限时间共识的收敛值仍是初始平均（分数次幂的“差”反对称、总和守恒照样成立）。
+
+\begin{pitfall}[思维陷阱：以为“平均共识”是唯一的共识；期望线性共识有限时间精确一致]
+其一，认为共识必然收敛到初始平均。实际上收敛到\emph{平均}只在双随机（无向对称是特例）时成立；有向/leader-follower 一般收敛到由图结构决定的凸组合（如有向星型收敛到 leader 的值）。明确你要的是“平均共识”（需双随机）还是“一般共识”（只需含生成树）。其二，用线性协议 $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$ 却要求“在某确定时刻 $T$ 各 agent 精确相等”（如多机同时触发）。线性共识只渐近收敛，任意有限时刻都残留非零误差。需要“卡点精确同步”用\textbf{有限时间共识}（\cref{eq:cs-finite}）或固定时间共识；只需“足够接近”则给渐近共识留够裕量（按 $e^{-\lambda_2 T}<\epsilon$ 反推 $T$）。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 对 $N=6$ 构造全连接、环、星、路径四种拓扑，分别用 Metropolis 权重与 $\mathbf{W}=\mathbf{I}-\varepsilon\mathbf{L}$（$\varepsilon=1/\lambda_N$）跑离散共识。验证两种 $\mathbf{W}$ 都双随机、都收敛到初始平均，比较 $|\rho_2(\mathbf{W})|$ 与实际收敛速度。哪种拓扑最快？用 $\lambda_2/\lambda_N$ 解释。
+  \item \textbf{[推导]} 证明：若 $\mathbf{W}$ 行随机但\textbf{不}列随机，则离散共识 \cref{eq:cs-disc} 的不动点仍是一致状态 $c\mathbf{1}$，但 $\sum_i x_i(k)$ 一般不守恒；给一个 3 节点反例（度归一化星型），手算它收敛到的值，说明它\textbf{不}等于初始平均。
+  \item \textbf{[设计/思考]} 假设 agent 3 是“顽固 leader”——不更新自己（$\dot x_3=0$），其余正常向邻居靠拢。系统最终收敛到什么？（提示：等价于把 $\mathbf{L}$ 第 3 行置零。）它还是“平均”吗？这个“锚定一个节点”的技巧将在编队里用来把队形“钉”在期望全局位置上。
+  \item \textbf{[实现/分析]} 构造一个含生成树但不平衡的有向图，数值求左零特征向量 $\boldsymbol{\gamma}$（$\boldsymbol{\gamma}^\top\mathbf{L}=\mathbf{0}$），积分有向共识验证收敛值等于 $\boldsymbol{\gamma}^\top\mathbf{x}(0)$ 而非简单平均。再构造一个\textbf{平衡}有向图，验证退回简单平均（$\boldsymbol{\gamma}=\tfrac1N\mathbf{1}$）。
+  \item \textbf{[实现/对比]} 对固定的 $N=8$ 稀疏图，比较三种权重收敛速度：最大度权重、Metropolis 权重、SDP 求最优对称权重（\verb|cvxpy| 解 FDLA \cref{eq:cs-fdla}）。比较 $|\rho_2(\mathbf{W})|$ 与实际收敛轮数，验证最优权重显著最快，观察是否出现\textbf{负}权重。
+  \item \textbf{[实现/对比]} 实现有限时间共识（\cref{eq:cs-finite}），对 $N=6$ 环图取 $\alpha\in\{0.3,0.5,0.7\}$ 与线性 $\alpha=1$ 对照。验证 $\alpha<1$ 有限时间精确归零、$\alpha=1$ 渐近不到零；$\alpha$ 越小收敛越短但末段越“急”（注意小 $\alpha$ 的数值抖振）。
+\end{enumerate}
+\end{practice}
+
+\noindent 上一节在\emph{理想条件}下证清了共识：通信无延迟、拓扑固定。但真实多机系统两条都不满足——无线通信有延迟，机器人移动导致链路时通时断。\cref{sec:cs-delay} 把共识理论推进到这两种非理想情形，并推导出对工程极重要的\textbf{临界时延阈值}——它恰恰由 \cref{sec:cs-bridge} 反复强调的最大特征值 $\lambda_N$ 决定。
+
+% ════════════════════════════════════════════════════════════════
+\section{时延与切换拓扑下的共识}
+\label{sec:cs-delay}
+
+\paragraph{动机：几十毫秒的延迟会不会毁掉协调。}
+回到 \cref{sec:cs-linear} 的编队，现在加入两个现实因素。第一，agent $i$ 收到邻居 $j$ 的意见时，这个意见其实是 $j$ 在 $\tau$ 秒之前的状态——无线传输、编解码、排队都要时间，$\tau$ 可能是几毫秒到几十毫秒。第二，机器人在动，$i$ 和 $j$ 之间的链路随距离忽通忽断，通信拓扑 $\mathcal{G}$ 不再固定，而是随时间变化的 $\mathcal{G}(t)$。这两个因素都直觉上“有害”：延迟意味着每个机器人都在根据“过时信息”做调整，很像控制系统里的纯滞后（出了名的会引起振荡和失稳）；拓扑切换意味着某些时刻图甚至可能分裂成几块（$\lambda_2=0$），那一刻根本不连通。问题是：\textbf{这两个因素是会彻底毁掉共识，还是在某个范围内系统依然能扛住？} 工程上必须知道这个“范围”——它直接决定通信硬件的延迟预算和编队的最大间距。
+
+\paragraph{反面：忽视延迟会怎样。}
+拿 \cref{sec:cs-linear} 的无延迟结论直接上实机，而实际通信有不可忽略的延迟，后果是：延迟较小、图较稀疏时，系统可能侥幸还能收敛，只是慢一些、带点振荡；但一旦延迟超过某个临界值，或你为了“协调更快”把拓扑加密（增大了 $\lambda_N$），系统会突然从“收敛”翻转为“持续振荡甚至发散”——编队不再稳定，机器人开始周期性来回摆动。更隐蔽的是，这个失稳和延迟、拓扑的关系不是线性的，很难靠试错找到边界。所以需要一个\textbf{解析的临界阈值}，事先算出来。
+
+\paragraph{历史：Olfati-Saber 与 Murray 的时延分析、Ren--Beard 的切换拓扑。}
+\cref{sec:cs-linear} 提过 Olfati-Saber 与 Murray 2004 年系统分析了三种情形\cite{olfatisaber2004consensus}，其中第三种正是本节主题：\textbf{无向固定拓扑 + 通信时延}。他们用频域方法（对每个特征模态做 Nyquist 判据）证明了一个干净结论——存在临界时延 $\tau^\star$，当所有通信延迟 $\tau<\tau^\star$ 时共识仍指数收敛，而 $\tau^\star$ 由图的最大 Laplacian 特征值 $\lambda_N$ 唯一决定。同年 Ren 与 Beard 处理了切换拓扑，给出“联合连通性”条件\cite{renbeard2005consensus}。本节把这两个结论分别讲清，临界时延做完整推导。
+
+\subsection{带时延的共识模型与临界时延推导}
+\label{sec:cs-delay-deriv}
+
+把延迟加进连续共识。agent $i$ 在时刻 $t$ 用到的邻居 $j$ 的意见，是 $j$ 在 $t-\tau$ 时刻的值（设所有链路延迟相同为 $\tau$，最经典也最易分析）：
+\begin{equation}
+  \dot x_i(t)=\sum_{j\in\mathcal{N}_i}a_{ij}\big(x_j(t-\tau)-x_i(t-\tau)\big)\quad\Longleftrightarrow\quad \dot{\mathbf{x}}(t)=-\mathbf{L}\,\mathbf{x}(t-\tau).
+  \label{eq:cs-delay-model}
+\end{equation}
+注意：Olfati-Saber--Murray 模型里\textbf{自己和邻居都用延迟值}（矩阵形式整体延迟 $\mathbf{x}(t-\tau)$），这样才保持平均守恒。这是\textbf{时滞微分方程}。$\tau=0$ 时退回 $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$；$\tau>0$ 时稳定性不再只看 $\mathbf{L}$ 特征值符号，还要看延迟与特征值的相互作用。
+
+\begin{theorem}[无向固定拓扑下的临界时延]\label{thm:cs-critical-delay}
+设 $\mathcal{G}$ 无向连通、$\mathbf{L}$ 对称、所有链路延迟相同为 $\tau$。则 \cref{eq:cs-delay-model} 收敛到初始平均当且仅当
+\begin{equation}
+  \tau<\tau^\star=\frac{\pi}{2\lambda_N},
+  \label{eq:cs-tau-star}
+\end{equation}
+$\lambda_N$ 为 $\mathbf{L}$ 的最大特征值；$\tau$ 超过 $\tau^\star$ 时，与 $\lambda_N$ 对应的“最快模态”率先失稳、系统持续振荡。
+\end{theorem}
+
+\begin{proof}
+用\textbf{频域 + 模态解耦}。\emph{第一步：模态解耦。} 设 $\mathbf{L}=\sum_k\lambda_k\mathbf{v}_k\mathbf{v}_k^\top$，令 $\eta_k(t)=\mathbf{v}_k^\top\mathbf{x}(t)$。对 \cref{eq:cs-delay-model} 左乘 $\mathbf{v}_k^\top$，用 $\mathbf{v}_k^\top\mathbf{L}=\lambda_k\mathbf{v}_k^\top$：
+\begin{equation}
+  \dot\eta_k(t)=-\lambda_k\,\eta_k(t-\tau).
+  \label{eq:cs-modal-delay}
+\end{equation}
+$N$ 维耦合系统被解耦成 $N$ 个独立标量时滞方程。$k=1$：$\lambda_1=0$，$\dot\eta_1=0$ 恒定（守恒的平均值，永远稳定）；$k\ge2$：$\lambda_k>0$，需判断 $\dot\eta=-\lambda_k\eta(t-\tau)$ 是否稳定。整个共识稳定 $\iff$ 所有 $k\ge2$ 模态都稳定。
+
+\emph{第二步：单模态频域判据。} 标量时滞方程 $\dot\eta=-\lambda\eta(t-\tau)$（$\lambda>0$）的特征方程（设 $\eta\sim e^{st}$）是
+\begin{equation}
+  s+\lambda e^{-s\tau}=0.
+  \label{eq:cs-char}
+\end{equation}
+稳定要求所有特征根 $s$ 实部为负。随 $\tau$ 增大，根从左半平面向右移动；\emph{临界}是某根恰落在虚轴上 $s=j\omega$（$\omega>0$）。代入：$j\omega+\lambda e^{-j\omega\tau}=0$，即 $\lambda e^{-j\omega\tau}=-j\omega$。两边取模 $\lambda=\omega$（因 $|e^{-j\omega\tau}|=1$）；比较相位 $e^{-j\omega\tau}=-j=e^{-j\pi/2}$，故 $-\omega\tau=-\pi/2$，得 $\tau=\tfrac{\pi}{2\omega}=\tfrac{\pi}{2\lambda}$。这是单模态（参数 $\lambda$）的临界时延。
+
+\emph{第三步：取最严格约束。} 整网稳定需\textbf{所有} $k\ge2$ 满足 $\tau<\tfrac{\pi}{2\lambda_k}$。由于 $\tfrac{\pi}{2\lambda_k}$ 随 $\lambda_k$ 增大而减小，最严格约束来自\textbf{最大特征值 $\lambda_N$}，即 \cref{eq:cs-tau-star}。
+\end{proof}
+
+\begin{insight}[临界时延由 $\lambda_N$ 而非 $\lambda_2$ 决定]\label{ins:cs-delay-lamN}
+临界时延由 $\lambda_N$（最大特征值）决定，初看反直觉，值得品味。$\lambda_2$ 管的是“收敛多快”（慢模态），$\lambda_N$ 管的是“延迟容限”（快模态最先被延迟拖垮）。直观：$\lambda_N$ 对应图里“反应最剧烈”的模态（通常度数最高的节点附近），它对信息的响应增益最大，因而对“信息过时”也最敏感——延迟一大，就是它先过冲、振荡。这给了一个深刻的工程权衡：\textbf{把拓扑加密（加边）会增大 $\lambda_2$ 让收敛更快，但通常也增大 $\lambda_N$ 让延迟容限更小}。所以“为了协调更快而疯狂加密通信”在有延迟的现实里可能适得其反——加得太密，稍有延迟就失稳。
+\end{insight}
+
+\paragraph{经典控制视角：延迟蚕食相位裕度。}
+给熟悉 Bode/Nyquist 的读者一个更亲切的语言。上面的临界时延推导，本质就是\textbf{相位裕度（phase margin）}分析。把单模态系统看成开环传递函数 $G(s)=\lambda_k/s$（积分器，增益 $\lambda_k$），加延迟环节 $e^{-s\tau}$，开环就是 $\tfrac{\lambda_k}{s}e^{-s\tau}$。其\textbf{穿越频率}（开环幅值 $=1$ 处）是 $\omega_c=\lambda_k$；在该频率处积分器贡献 $-90^\circ$ 相位，延迟贡献 $-\omega_c\tau=-\lambda_k\tau$ 相位。无延迟时相位裕度 $90^\circ$；延迟把相位裕度吃光（到 $-180^\circ$）时失稳，即 $90^\circ=\lambda_k\tau\cdot\tfrac{180^\circ}{\pi}$，解出 $\tau=\tfrac{\pi}{2\lambda_k}$——与 \cref{eq:cs-char} 完全一致。这让 $\tau^\star=\pi/(2\lambda_N)$ 一下子有了工程直觉：\textbf{$\lambda_N$ 模态的穿越频率最高（$\omega_c=\lambda_N$），同样的延迟在它身上吃掉的相位最多（$\lambda_N\tau$ 最大），所以它的相位裕度最先耗尽、最先失稳}。
+
+\paragraph{一个量化直觉。}
+代入具体数字。全连接图 $K_N$ 的 $\lambda_N=N$，所以 $\tau^\star=\tfrac{\pi}{2N}$——团队越大，能容忍的延迟越小，且反比于 $N$。例如 $N=10$ 全连接，$\tau^\star=\pi/20\approx0.157$ 秒；$N=50$ 时 $\tau^\star\approx0.031$ 秒（31 毫秒）。这意味着大规模密集编队对通信延迟极其敏感——这也是为什么大集群往往用稀疏拓扑（环、网格）而非全连接：稀疏拓扑 $\lambda_N$ 小，延迟容限大得多。\rebuilt{错因辨正（复核裁决，源稿 claims 台账此条曾被错读）：$\lambda_N=N$ 与上面两个数（$0.157$\,s、$31$\,ms）都正确，且此处已正确地把 $\tau^\star$ 当作\emph{延迟容限/最大可容忍均匀通信时延}（delay margin）。务必\textbf{不要}把 $\tau^\star=\pi/(2\lambda_N)$ 误读成共识的“时间常数/收敛(整定)时间”——后者由代数连通性 $\lambda_2$（约 $1/\lambda_2$）决定，是另一个特征值。佐证：作为延迟容限，$N$ 越大 $\tau^\star$ 越\emph{小}（越难稳），与“收敛更快”的时间常数读法恰好相反。出处：Olfati-Saber--Murray 2004 定理 10；Olfati-Saber--Fax--Murray 2007 综述。}
+
+\subsection{切换拓扑与联合连通性}
+\label{sec:cs-switching}
+
+第二个现实因素：拓扑随时间变化。机器人移动，通信图从 $\mathcal{G}(t_0)$ 切换到 $\mathcal{G}(t_1)$……每段用一个可能不同的 Laplacian $\mathbf{L}(t)$，系统是 $\dot{\mathbf{x}}(t)=-\mathbf{L}(t)\mathbf{x}(t)$，其中 $\mathbf{L}(t)$ 在一组拓扑 $\{\mathbf{L}_1,\mathbf{L}_2,\dots\}$ 之间切换。这时\textbf{单看某一刻是否连通已不够}。Ren--Beard 2005 的核心结论是\cite{renbeard2005consensus}：
+
+\begin{theorem}[联合连通性]\label{thm:cs-jointly-conn}
+即使每个瞬间的图 $\mathcal{G}(t)$ 都\emph{不连通}，只要在任意长度为 $T$ 的时间窗口内，这段时间出现过的所有图的\textbf{并集}（union graph）是连通的（含一棵生成树），共识仍然收敛。
+\end{theorem}
+
+这个条件叫\textbf{联合连通性（jointly connected）}。直觉上：信息不需要“同时”在所有链路上流通，只要“在一段时间里”每条必要的信息通路都曾经打开过，信息就能“接力”传遍全网。严格证明用\textbf{共同 Lyapunov 函数}：取 $V(\mathbf{x})=\tfrac12\|\mathbf{x}-\bar x\mathbf{1}\|^2$（共识误差能量），对每个 $\mathbf{L}_p$ 都有 $\dot V=-\mathbf{x}^\top\mathbf{L}_p\mathbf{x}\le0$（因 $\mathbf{L}_p$ 半正定），即每段拓扑下误差能量都不增；再用联合连通性保证“长期看 $V$ 严格下降到 0”。完整的切换系统稳定性分析属于混杂系统理论，这里点到为止，关键是记住结论：\textbf{联合连通即可收敛，不要求时刻连通}。
+
+\subsection{二阶共识：当机器人是双积分器}
+\label{sec:cs-second-order}
+
+前面的共识都假设一阶动力学 $\dot x_i=u_i$（单积分器）：状态的导数直接是控制。但真实机器人（尤其有惯性的）更接近\textbf{双积分器} $\ddot p_i=u_i$——你控制的是加速度/力，不是直接控制速度。这时“对位置达成一致”还要兼顾速度，称为\textbf{二阶共识}。二阶共识的协议要同时用邻居的\textbf{位置差和速度差}：
+\begin{equation}
+  \ddot p_i=-\sum_{j\in\mathcal{N}_i}a_{ij}\big[(p_i-p_j)+\gamma_d(\dot p_i-\dot p_j)\big],\qquad
+  \begin{bmatrix}\dot{\mathbf{p}}\\\ddot{\mathbf{p}}\end{bmatrix}=\begin{bmatrix}\mathbf{0}&\mathbf{I}\\-\mathbf{L}&-\gamma_d\mathbf{L}\end{bmatrix}\begin{bmatrix}\mathbf{p}\\\dot{\mathbf{p}}\end{bmatrix},
+  \label{eq:cs-second-order}
+\end{equation}
+其中 $\gamma_d>0$ 是速度耦合（阻尼）增益。\textbf{关键区别：仅靠位置差不够，必须有速度阻尼项}。这是二阶共识最容易栽的坑。若去掉 $\gamma_d$ 项（只用位置差），系统变成无阻尼的耦合振子——位置不会收敛到一致，而是永远\textbf{振荡}（像一堆用弹簧连起来、没有阻尼的小球，能量守恒、荡个不停）。$2N\times2N$ 系统矩阵的特征值可证与 $\mathbf{L}$ 的特征值 $\lambda_k$ 通过一个二次方程关联——每个 $\lambda_k$ 贡献一对特征值，其实部为负（该模态收敛）的条件依赖 $\gamma_d$ 和 $\lambda_k$。结论：\textbf{存在合适的 $\gamma_d$ 使二阶共识收敛，且 $\gamma_d$ 太小则欠阻尼振荡、太大则过阻尼也慢}——又一个需要权衡的增益。
+
+\begin{insight}[从一阶到二阶：质变在于“惯性”]\label{ins:cs-inertia}
+一阶系统状态能瞬间响应控制，纯阻尼即可单调收敛；二阶系统有惯性、会“冲过头”，必须靠速度差耦合提供阻尼才能稳下来。这解释了为什么真实机器人编队（有质量、有惯性）的控制器总带一个“速度/阻尼”项，而不只是位置反馈——不是工程师多此一举，是二阶系统不加阻尼必振荡的数学必然。
+\end{insight}
+
+\subsection{随机 gossip：异步共识}
+\label{sec:cs-gossip}
+
+前面所有共识都隐含\textbf{同步}假设——所有 agent 在同一时刻一起更新、一起通信。但真实分布式系统往往是\textbf{异步}的：没有全局时钟让大家齐步走，每个节点按自己的节奏、和碰巧能联系上的邻居零星通信。\textbf{随机 gossip（randomized gossip）}正是为异步场景设计的共识，由 Boyd、Ghosh、Prabhakar、Shah 在 2006 年系统分析\cite{boyd2006gossip}。机制极简，是一个\textbf{边平均（edge-averaging）}过程：每个节点带独立的 Poisson 时钟，时钟一响就随机挑一个邻居，两者把各自的值\emph{替换为它们俩的平均}：
+\begin{equation}
+  x_i,\,x_j\leftarrow\tfrac12(x_i+x_j),\qquad\text{其余节点不变}.
+  \label{eq:cs-gossip}
+\end{equation}
+单次边平均\textbf{保持总和不变}（$x_i+x_j$ 平均后总和没变），所以 gossip 自动保持平均值守恒——这是它收敛到正确平均的根。
+
+\textbf{收敛性与速率}：gossip 是随机过程，收敛要谈期望。Boyd 等人证明：只要图连通，gossip 几乎必然收敛到初始平均；而\textbf{平均时间（averaging time，误差期望降到给定比例所需的更新次数）由刻画该 gossip 方案的双随机矩阵 $\bar{\mathbf{W}}=\mathbb{E}[\mathbf{W}_{ij}]$ 的第二大特征值决定}。换句话说，异步 gossip 的收敛速率还是落回“某个双随机矩阵的谱隙”上——和同步离散共识是同一套谱分析。\textbf{工程权衡}：gossip 收敛慢——每步只动一对节点，信息传播比同步慢得多。Boyd 等人给出的上界显示，某些稀疏图（如环）上 gossip 的平均时间随节点数增长很快（环上约是节点数的三次方量级）。所以选择是：\textbf{同步共识快但要全局时钟和齐步通信（脆弱）；gossip 慢但完全异步、对节点掉线/拓扑变化极鲁棒}。
+
+\subsection{非均匀与非对称延迟：把理想阈值推向现实}
+\label{sec:cs-hetero-delay}
+
+\cref{thm:cs-critical-delay} 有一个干净的简化假设——\textbf{所有链路延迟相同}。真实系统里这往往不成立（一次反事实推理：如果延迟非均匀/非对称会怎样）。
+
+\textbf{非均匀延迟（各链路 $\tau_{ij}$ 不同，但每条对称）}。此时模态解耦不再像 \cref{eq:cs-modal-delay} 那样干净（不同模态混在一起），严格临界条件要用更复杂的频域分析。但有一个对工程极有用的\textbf{稳健结论}：只要所有链路延迟都小于由\textbf{最大}延迟决定的保守阈值，系统仍稳定——即用 $\tau_{\max}=\max_{ij}\tau_{ij}$ 代入，保证 $\tau_{\max}<\pi/(2\lambda_N)$ 是一个偏保守但可靠的充分条件。直觉：最坏的那条链路最可能引发失稳，守住它就守住了全局。所以工程上的简单做法是\textbf{按最大延迟来卡裕量}。
+
+\textbf{非对称延迟（同一链路两方向延迟不同，$\tau_{ij}\ne\tau_{ji}$）}。这更棘手，因为它破坏了 $\mathbf{L}$ 作用的对称性——本质上让系统行为像一个\textbf{有向图}（\cref{sec:cs-directed}：有向图共识收敛到 $\boldsymbol{\gamma}$ 加权平均而非简单平均）。后果：非对称延迟不仅影响稳定性，还可能让收敛值\textbf{偏离初始平均}（延迟大的方向“话语权”被削弱）。所以在对“收敛到精确平均”敏感的任务里（如分布式估计要无偏），非对称延迟是一个隐蔽的偏差源，需要用时间戳对齐、双向延迟补偿等机制处理。
+
+\begin{insight}[两个延迟结论稳健性不同]\label{ins:cs-delay-robust}
+从“均匀延迟”到“非均匀/非对称延迟”，理想的解析阈值 $\tau^\star=\pi/(2\lambda_N)$ 从“精确边界”退化为“保守准则”（用 $\tau_{\max}$ 卡），而非对称延迟更会把问题从“稳定性”牵连到“收敛值正确性”（像有向图那样拉偏平均）。启示：\textbf{“稳定性有上限”很稳健（用最大延迟保守估计即可），“收敛到精确平均”很脆弱（非对称延迟就会破坏）}。所以实机部署时，对“是否稳定”可以靠 $\tau_{\max}<\pi/(2\lambda_N)$ 放心；但对“收敛值准不准”，必须额外关注延迟的对称性。这也是为什么高精度分布式估计系统（共识卡尔曼）要在通信层做时间戳同步——不是为了稳定，是为了不让非对称延迟悄悄拉偏估计。
+\end{insight}
+
+\subsection{代码验证：临界时延阈值}
+\label{sec:cs-delay-code}
+
+理论预测 $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}(t-\tau)$ 在 $\tau<\pi/(2\lambda_N)$ 时收敛、超过则振荡。数值积分这个时滞方程，扫不同 $\tau$，看失稳是否恰好发生在 $\tau^\star=\pi/(2\lambda_N)$ 附近。
+
+\begin{codebox}[Python]{时滞共识仿真:失稳点与解析阈值吻合}
+import numpy as np
+
+def laplacian_from_edges(N, edges):
+    A = np.zeros((N, N))
+    for i, j in edges:
+        A[i, j] = 1.0; A[j, i] = 1.0
+    return np.diag(A.sum(1)) - A
+
+# 全连接 K4: lamN = N = 4, 理论 tau* = pi/(2*4) ~ 0.3927
+N = 4
+edges = [(i, j) for i in range(N) for j in range(i + 1, N)]
+L = laplacian_from_edges(N, edges)
+lamN = np.linalg.eigvalsh(L)[-1]
+tau_star = np.pi / (2 * lamN)
+
+def sim_delayed(L, tau, dt=1e-3, T=40.0):
+    """积分 dx/dt = -L x(t-tau)，用历史缓冲实现延迟.返回末段误差幅度."""
+    N = L.shape[0]
+    x0 = np.array([1.0, -1.0, 2.0, -2.0])[:N]
+    d = max(1, int(round(tau / dt)))         # 延迟对应步数
+    buf = [x0.copy() for _ in range(d + 1)]   # 历史缓冲
+    x = x0.copy(); xbar = x0.mean(); tail = []
+    for k in range(int(T / dt)):
+        x_delayed = buf[0]                    # tau 秒前的状态
+        x = x + dt * (-(L @ x_delayed))       # 整个 Lx 项用同一延迟状态（保守恒）
+        buf.append(x.copy()); buf.pop(0)
+        if k > int(T / dt) * 0.8:
+            tail.append(np.linalg.norm(x - xbar))
+    return np.max(tail)                       # 趋0=收敛, 不衰减=振荡
+
+for tau in [0.1, 0.3, 0.38, 0.40, 0.45, 0.6]:
+    amp = sim_delayed(L, tau)
+    status = "收敛" if amp < 1e-2 else ("临界" if amp < 0.5 else "振荡/发散")
+    print(f"  tau={tau:.2f} (tau/tau*={tau/tau_star:.2f}): 末段幅度={amp:.3e} -> {status}")
+\end{codebox}
+
+\noindent 运行要点：$\tau$ 明显小于 $\tau^\star\approx0.393$ 时（如 0.1、0.3）末段误差趋于 0（收敛）；$\tau$ 跨过 $\tau^\star$ 后（如 0.45、0.6）误差不再衰减、维持振荡——失稳点与解析阈值吻合。
+
+\begin{pitfall}[编程陷阱：仿真延迟共识时只延迟邻居项、不延迟自身项]
+实现 \cref{eq:cs-delay-model} 时写成 $\dot x_i=\sum_j a_{ij}(x_j(t-\tau)-x_i(t))$——邻居用延迟值、自己却用当前值。这个“半延迟”模型不再保持平均值守恒，收敛值会漂移，且稳定性边界与 $\pi/(2\lambda_N)$ 对不上，你会以为是阈值公式错了。\textbf{根本原因}：Olfati-Saber--Murray 的守恒性依赖“自身与邻居都取同一时刻的延迟值”，即矩阵形式 $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}(t-\tau)$ 整体延迟；拆开延迟破坏了 $\mathbf{L}$ 作用的对称结构。\textbf{正确做法}：整个 $\mathbf{L}\mathbf{x}$ 项用同一延迟状态（代码里就是 \Verb[breaklines]|-(L @ x_delayed)|，而非把 $\mathbf{L}$ 拆成对角与非对角分别延迟）。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：以为“加密通信总能让协调更稳更快”；把“时刻连通”当成收敛必要条件]
+其一，遇到协调慢或不稳，第一反应是给机器人之间多连通信链路（加边），以为越密越好。加边确实增大 $\lambda_2$（收敛更快），但通常也增大 $\lambda_N$，使临界时延 $\tau^\star=\pi/(2\lambda_N)$ 变小；在有延迟的实机上，加密后反而更容易踩过失稳边界。\textbf{正确做法}：有延迟的场景同时看 $\lambda_2$（够快）和 $\lambda_N$（够稳），估算 $\tau^\star$ 并留够裕量（如实际延迟 $<0.5\tau^\star$）。其二，看到某些时刻通信图分裂（瞬时 $\lambda_2=0$）就断定共识一定失败。动态拓扑下收敛的正确条件是\textbf{联合连通}（时间窗内并集连通），而非时刻连通；监控的是“窗口并集的 $\lambda_2$”而非每一刻的 $\lambda_2$。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现/分析]} 用时滞共识仿真，对环 $C_8$ 和全连接 $K_8$ 分别扫描 $\tau$ 找数值失稳点，与各自的 $\tau^\star=\pi/(2\lambda_N)$ 对比。哪种拓扑能容忍更大延迟？用 $\lambda_N$ 解释，并说明对“大编队该用稀疏还是密集拓扑”的工程含义。
+  \item \textbf{[推导]} 完整复现临界时延推导：从 $s+\lambda e^{-s\tau}=0$ 出发，令 $s=j\omega$，分别由模相等和相位相等解出临界 $\omega=\lambda$ 与 $\tau=\pi/(2\lambda)$。然后说明为什么整网阈值取 $\lambda=\lambda_N$ 而非 $\lambda_2$。
+  \item \textbf{[设计/思考]} 联合连通性说“时间窗内并集连通即可”。设计一个 4 机器人轮转通信方案：任意时刻只允许开 1 条边，但通过轮流开不同的边，在一个周期内让并集连通。画出轮转序列，说明一个周期需至少几条不同的边、对应并集是什么图。
+  \item \textbf{[实现/分析]} 实现二阶共识（\cref{eq:cs-second-order}），对 $N=5$ 环图扫描阻尼增益 $\gamma_d$ 从 0 到较大值。验证 $\gamma_d=0$ 时位置持续振荡不收敛、$\gamma_d>0$ 时收敛，并找出收敛最快的 $\gamma_d$（欠阻尼与过阻尼之间）。
+  \item \textbf{[实现/对比]} 实现随机 gossip（每步随机选一条边做平均），对 $N=10$ 的环和全连接两种图，记录误差降到 1\% 所需的边激活次数。验证 gossip 收敛到正确平均、环图平均时间远大于全连接，并与同步离散共识对比“达到同等精度的总通信量”。
+  \item \textbf{[实现/分析，非均匀延迟]} 把时滞共识仿真改成每条链路延迟不同，对 $K_4$ 扫描整体延迟水平。验证用 $\tau_{\max}$ 代入 $\pi/(2\lambda_N)$ 作稳定判据偏保守但可靠；再做一组\textbf{非对称}延迟，观察收敛值是否偏离初始平均（应像有向图那样被拉偏），并解释为什么。
+\end{enumerate}
+\end{practice}
+
+\noindent \cref{sec:cs-linear,sec:cs-delay} 把“共识”这个标量协调过程彻底讲透了。但有一个根本局限——共识处理的是每个 agent 持有一个标量意见、目标是让意见\emph{相等}。可现实中每个机器人要解的不是“持有一个意见”，而是一整个\textbf{优化问题}（比如它自己的 MPC），机器人之间的耦合也不只是“意见相等”，可能是共享一个负载、要满足联合约束。这种场景共识不够用——需要\textbf{分布式优化}。\cref{sec:cs-admm} 引入 ADMM。
+
+% ════════════════════════════════════════════════════════════════
+\section{ADMM 分布式优化}
+\label{sec:cs-admm}
+
+\paragraph{动机：每个机器人解自己的优化，如何拼出全局协调。}
+$N$ 台机器人协同搬运一个负载，每台机器人 $i$ 要决定自己未来若干步的动作 $\mathbf{x}_i$（局部决策变量，比如足端力轨迹），最小化自己的代价 $f_i(\mathbf{x}_i)$（跟踪误差 + 能量）。若机器人之间互不耦合，各解各的 $\min_{\mathbf{x}_i}f_i(\mathbf{x}_i)$ 就完事了。但它们共享一个刚性负载——存在一个全局量（合力、或一个所有机器人都要同意的“参考点”）必须一致。最干净的抽象是：每个 agent 有本地变量 $\mathbf{x}_i$ 和本地代价 $f_i$，但所有 $\mathbf{x}_i$ 必须等于一个公共变量 $\mathbf{z}$：
+\begin{equation}
+  \min_{\mathbf{x}_1,\dots,\mathbf{x}_N,\,\mathbf{z}}\ \sum_{i=1}^N f_i(\mathbf{x}_i)\quad\text{s.t.}\quad \mathbf{x}_i=\mathbf{z},\ \ i=1,\dots,N.
+  \label{eq:cs-consensus-opt}
+\end{equation}
+这个“一致性约束 $\mathbf{x}_i=\mathbf{z}$”就是把 $N$ 个本地问题耦合起来的纽带。问题是：\textbf{怎样在不把所有 $f_i$ 汇总到一个中央求解器的前提下，解出这个带耦合约束的问题？} ADMM 正是为此而生。
+
+\paragraph{反面：朴素办法会怎样。}
+\textbf{朴素办法一：直接集中式求解。} 把 \cref{eq:cs-consensus-opt} 当成一个大优化丢给中央求解器，求解的线性系统规模随 $N$ 增长——回到 $O(N^3)$ 乃至更高，机器人一多就超时，且中央节点是单点故障。\textbf{朴素办法二：各解各的，再投影到一致。} 让每个 agent 先独立解 $\min_{\mathbf{x}_i}f_i(\mathbf{x}_i)$ 得各自最优 $\mathbf{x}_i^*$，然后简单取平均 $\mathbf{z}=\tfrac1N\sum\mathbf{x}_i^*$ 强行拉一致。问题是这个平均点通常\textbf{不是}原问题的最优解——每个 agent 是在“无视一致性约束”下最优的，事后取平均既不满足各自最优性、合起来也不是全局最优。\textbf{朴素办法三：罚函数法。} 把约束变软惩罚 $\min\sum_i f_i(\mathbf{x}_i)+\tfrac\rho2\sum_i\|\mathbf{x}_i-\mathbf{z}\|^2$。这能让各 $\mathbf{x}_i$ 互相靠拢，但要让约束\textbf{严格}满足，罚参数 $\rho$ 必须趋于无穷，而 $\rho$ 越大问题越病态。纯罚函数法在“精确满足约束”和“数值可解”之间无法兼得。ADMM 的高明之处，正是\textbf{同时}保留罚函数法的“可分解性”和拉格朗日法的“精确性”，用一个适中的、固定的 $\rho$ 就能收敛到精确最优。
+
+\paragraph{历史：从对偶分解到 ADMM。}
+ADMM 的思想根植于 1970 年代的优化理论，融合两条线：一是\textbf{对偶分解（dual decomposition）}——通过拉格朗日对偶把耦合约束“价格化”，让子问题可分解，但要求严格凸且收敛慢；二是\textbf{增广拉格朗日法（method of multipliers）}——给拉格朗日函数加二次罚项改善收敛和鲁棒性，但二次罚项破坏了可分解性。ADMM 由 Gabay、Mercier 以及 Glowinski、Marrocco 在 1975--76 年前后提出，巧妙地\textbf{交替}优化各组变量，既得增广拉格朗日的鲁棒收敛，又恢复了可分解性。它沉寂了几十年，直到 2011 年 Boyd 等人的长综述把它系统化、并指出特别适合大规模分布式优化，才大放异彩\cite{boyd2011admm}。本节沿 Boyd 综述的标准形式来讲。
+
+\subsection{增广拉格朗日与 ADMM 三步迭代}
+\label{sec:cs-admm-derive}
+
+处理带约束的优化，经典工具是\textbf{拉格朗日函数}：给每个约束配对偶变量（乘子）。对一致性约束 $\mathbf{x}_i=\mathbf{z}$ 配乘子 $\mathbf{y}_i$，再加二次罚项（罚参数 $\rho>0$），得\textbf{增广拉格朗日}：
+\begin{equation}
+  \mathcal{L}_\rho(\{\mathbf{x}_i\},\mathbf{z},\{\mathbf{y}_i\})=\sum_i\Big[f_i(\mathbf{x}_i)+\mathbf{y}_i^\top(\mathbf{x}_i-\mathbf{z})+\frac{\rho}{2}\|\mathbf{x}_i-\mathbf{z}\|^2\Big].
+  \label{eq:cs-aug-lag}
+\end{equation}
+乘子 $\mathbf{y}_i$ 是约束 $\mathbf{x}_i=\mathbf{z}$ 的“价格”——违反约束要付出 $\mathbf{y}_i^\top(\mathbf{x}_i-\mathbf{z})$ 的代价。二次项 $\tfrac\rho2\|\mathbf{x}_i-\mathbf{z}\|^2$ 在约束附近形成一个“碗”，把 $\mathbf{x}_i$ 往 $\mathbf{z}$ 拉，改善收敛性和数值条件，且对每个 $i$ 可分离——为分解埋下伏笔。
+
+直接对 $\mathcal{L}_\rho$ 同时优化所有变量，二次项把 $\mathbf{x}_i$ 和 $\mathbf{z}$ 耦合在一起，无法分解。ADMM 的核心技巧是\textbf{交替（alternating）}：固定其它变量，轮流优化 $\{\mathbf{x}_i\}$、$\mathbf{z}$、$\{\mathbf{y}_i\}$。每一轮（第 $k\to k{+}1$ 步）三个更新：
+
+\begin{algo}[标准 ADMM（一致性形式）]\label{alg:cs-admm}
+(1) \textbf{$\mathbf{x}$-更新（各 agent 并行）}：固定 $\mathbf{z}^k$ 和 $\mathbf{y}_i^k$，对每个 $\mathbf{x}_i$ 独立求最小
+\begin{equation}
+  \mathbf{x}_i^{k+1}=\argminop_{\mathbf{x}_i}\Big[f_i(\mathbf{x}_i)+(\mathbf{y}_i^k)^\top(\mathbf{x}_i-\mathbf{z}^k)+\frac{\rho}{2}\|\mathbf{x}_i-\mathbf{z}^k\|^2\Big].
+  \label{eq:cs-x-update}
+\end{equation}
+(2) \textbf{$\mathbf{z}$-更新（协调）}：固定 $\{\mathbf{x}_i^{k+1}\}$ 和 $\{\mathbf{y}_i^k\}$，对 $\mathbf{z}$ 求最小，求导置零得
+\begin{equation}
+  \mathbf{z}^{k+1}=\frac1N\sum_i\Big(\mathbf{x}_i^{k+1}+\frac1\rho\mathbf{y}_i^k\Big).
+  \label{eq:cs-z-update}
+\end{equation}
+(3) \textbf{$\mathbf{y}$-更新（对偶上升，各 agent 并行）}：
+\begin{equation}
+  \mathbf{y}_i^{k+1}=\mathbf{y}_i^k+\rho\,(\mathbf{x}_i^{k+1}-\mathbf{z}^{k+1}).
+  \label{eq:cs-y-update}
+\end{equation}
+\end{algo}
+
+\paragraph{逐步看每步的意义。}
+\cref{eq:cs-x-update} \textbf{是分布式的关键}：因为 $\mathcal{L}_\rho$ 对 $\{\mathbf{x}_i\}$ 可分离（每个 $\mathbf{x}_i$ 只出现在第 $i$ 项里），$N$ 个 $\mathbf{x}_i$ 的更新\emph{完全独立、可并行}——每个 agent 只用自己的 $f_i$ 和当前 $\mathbf{z}^k,\mathbf{y}_i^k$ 解一个本地小问题（单体规模 $O(n^3)$ 而非 $O((Nn)^3)$）。这就是 ADMM 把 $O(N^3)$ 打散成 $N$ 个 $O(n^3)$ 的地方。\cref{eq:cs-z-update} 把 $\mathbf{z}$ 更新为“各 agent 本地解 + 缩放对偶变量”的\textbf{平均}——这一步需把各 $\mathbf{x}_i^{k+1}$ 汇总求平均，可由轻量协调器做，\emph{也可以用 \cref{sec:cs-linear} 的平均共识分布式地算}（这正是共识与 ADMM 的连接点：$\mathbf{z}$-更新就是一次平均共识）。\cref{eq:cs-y-update} 用本地约束违反量更新对偶变量：若 $\mathbf{x}_i^{k+1}$ 仍偏离 $\mathbf{z}^{k+1}$，就按偏离量调整“价格”，逼着下一轮的 $\mathbf{x}_i$ 更靠近 $\mathbf{z}$。\textbf{每一轮 ADMM $=$ 各 agent 并行解本地优化（步 1）$\to$ 汇总求平均得协调变量（步 2）$\to$ 各 agent 并行更新对偶价格（步 3）}，只需在步 2 处做一次“求平均”的通信。
+
+\subsection{缩放形式：更简洁的等价写法}
+\label{sec:cs-admm-scaled}
+
+工程实现常用\textbf{缩放对偶变量} $\mathbf{u}_i=\mathbf{y}_i/\rho$，把 \cref{eq:cs-x-update,eq:cs-y-update} 写得更干净。代入并配方：
+\begin{align}
+  \mathbf{x}_i^{k+1}&=\argminop_{\mathbf{x}_i}\Big[f_i(\mathbf{x}_i)+\frac{\rho}{2}\|\mathbf{x}_i-\mathbf{z}^k+\mathbf{u}_i^k\|^2\Big],
+  \label{eq:cs-x-scaled}\\
+  \mathbf{z}^{k+1}&=\frac1N\sum_i\big(\mathbf{x}_i^{k+1}+\mathbf{u}_i^k\big),\qquad \mathbf{u}_i^{k+1}=\mathbf{u}_i^k+\mathbf{x}_i^{k+1}-\mathbf{z}^{k+1}.
+  \label{eq:cs-zu-scaled}
+\end{align}
+这是 Boyd 综述里最常用的形式。缩放形式把对偶变量和原变量合进同一个二次项 $\|\mathbf{x}_i-\mathbf{z}+\mathbf{u}_i\|^2$，实现时更顺手——$\mathbf{x}$-更新就是“在本地代价上加一个把 $\mathbf{x}_i$ 往 $(\mathbf{z}^k-\mathbf{u}_i^k)$ 拉的二次项”。
+
+\begin{insight}[ADMM 三步 $=$ 分散决策 + 中央协调 + 价格调节]\label{ins:cs-admm-econ}
+ADMM 三步的分工，恰好对应一个“分散决策 + 中央协调 + 价格调节”的经济系统。$\mathbf{x}$-更新是各 agent 在当前“价格”$\mathbf{u}_i$ 下自利地优化自己（分散决策）；$\mathbf{z}$-更新是把大家的意愿汇总成一个共识方案（中央协调）；$\mathbf{y}/\mathbf{u}$-更新是根据“谁还没对齐”调整价格，逼着下一轮更一致（价格调节）。也正因如此，$\rho$（价格调整的步长/罚的强度）成了整个过程的关键旋钮。
+\end{insight}
+
+\subsection{罚参数 \texorpdfstring{$\rho$}{rho} 的作用与选取}
+\label{sec:cs-rho}
+
+$\rho$ 是 ADMM 唯一的核心超参，是一个\textbf{权衡旋钮}，从两个互补角度理解（双重解读）：
+\begin{itemize}
+  \item \textbf{优化视角（原始 vs 对偶残差的平衡）}：ADMM 的收敛由两个残差刻画——\textbf{原始残差} $\mathbf{r}^k=\{\mathbf{x}_i^k-\mathbf{z}^k\}$（约束违反程度，衡量“各 agent 对齐了没”）和\textbf{对偶残差} $\mathbf{s}^k=\rho(\mathbf{z}^k-\mathbf{z}^{k-1})$（衡量“协调变量还在不在动”）。$\rho$ \textbf{大}$\to$更重罚约束违反$\to$原始残差降得快（快速对齐）但对偶残差大（协调变量剧烈波动，易过冲震荡）；$\rho$ \textbf{小}$\to$各 agent 更自由地优化自己的 $f_i$（对偶残差小）但原始残差降得慢（迟迟对不齐）。好的 $\rho$ 让两个残差同量级地一起下降。
+  \item \textbf{协调视角（全局一致 vs 局部自主）}：$\rho$ 大 $=$ 强调“全局一致性约束”压过“本地代价”，各 agent 被迫牺牲自己的最优来对齐；$\rho$ 小 $=$ 各 agent 更多按自己的 $f_i$ 走、慢慢协调。$\rho$ 调的就是“协调 vs 自主”的相对话语权。
+\end{itemize}
+\textbf{实用选取}：固定 $\rho$ 难以兼顾，标准做法是\textbf{自适应调节}——监控两个残差，若原始残差远大于对偶残差（对齐太慢）就增大 $\rho$，反之减小，常用规则
+\begin{equation}
+  \rho^{k+1}=\begin{cases}\tau^{\text{incr}}\rho^k & \|\mathbf{r}^k\|>\mu\|\mathbf{s}^k\|\\[2pt]\rho^k/\tau^{\text{decr}} & \|\mathbf{s}^k\|>\mu\|\mathbf{r}^k\|\\[2pt]\rho^k&\text{否则}\end{cases}
+  \label{eq:cs-rho-adapt}
+\end{equation}
+典型取 $\mu=10$、$\tau^{\text{incr}}=\tau^{\text{decr}}=2$。这是 Boyd 综述推荐的残差平衡法，能让 ADMM 对 $\rho$ 初值不那么敏感\cite{boyd2011admm}。\pz{源稿提到 $\rho$ 与 MPPI 温度参数 $\lambda$ 的“同构”：两者都在调“全局一致/集体”与“局部自主/个体探索”的平衡。但要标清边界——$\rho$ 是优化算法的罚参数（凸问题下任何 $\rho>0$ 最终都收敛到同一最优，不改变最优解位置），而 MPPI 温度直接改变采样分布形状和最终策略；作用机制并不等同。}
+
+\subsection{收敛性：凸保证，非凸“通常可用但无保证”}
+\label{sec:cs-admm-conv}
+
+ADMM 的收敛性结论要分清，这是一个\textbf{极易被误解}的点：
+\begin{itemize}
+  \item \textbf{凸问题}：若所有 $f_i$ 是闭凸函数（允许取 $+\infty$，即可含凸约束），ADMM \textbf{保证收敛到全局最优}。收敛率：一般凸是 $O(1/k)$，强凸 + 光滑等条件下可达线性收敛；实践中对 QP 常观察到线性收敛——这也是为什么 ADMM 在分布式 MPC（子问题是 QP）里好用。\pz{存疑（引用归属：这两条速率不出自 Boyd 等 2011\cite{boyd2011admm}）：Boyd 综述只给渐近收敛（残差、目标、对偶变量收敛），\emph{未做速率分析}，全文无“$O(1/k)$/线性收敛/强凸/Lipschitz”等结论。一般凸 $O(1/k)$ 速率首证见 He--Yuan 2012；强凸+光滑下的线性收敛见 Deng--Yin、Nishihara 等 2015、Giselsson--Boyd 2016——\textbf{均晚于 2011}。本句结论数学上为真，但勿挂在 boyd2011admm 名下，宜改引上述后续工作。}
+  \item \textbf{非凸问题}：当 $f_i$ 非凸（带非线性动力学、接触切换的 MPC 子问题），ADMM \textbf{没有一般的收敛保证}。某些结构化非凸问题在额外假设下可证收敛到 KKT 点（局部驻点），但有条件、不保证全局最优。
+\end{itemize}
+
+\paragraph{停止准则的工程细节。}
+前面说“迭代到残差足够小”，但“足够小”要量化。标准做法是同时检查原始残差和对偶残差都低于各自容差，容差由\textbf{绝对 + 相对}两部分组成：
+\begin{equation}
+  \|\mathbf{r}^k\|\le\epsilon^{\text{abs}}\sqrt{n}+\epsilon^{\text{rel}}\max(\|\mathbf{x}^k\|,\|\mathbf{z}^k\|),\qquad \|\mathbf{s}^k\|\le\epsilon^{\text{abs}}\sqrt{n}+\epsilon^{\text{rel}}\|\mathbf{y}^k\|.
+  \label{eq:cs-stopping}
+\end{equation}
+绝对容差 $\epsilon^{\text{abs}}$（如 $10^{-4}$）防止变量量级很小时残差判据过松，相对容差 $\epsilon^{\text{rel}}$（如 $10^{-3}$）让判据随问题规模自适应缩放。\textbf{为什么不能只看目标函数值收敛？} 因为 ADMM 的目标值可能早就接近最优，但约束（原始残差）还没满足——此时解还不可行，停下来会得到一个违反一致性的“伪解”。\textbf{必须两个残差都达标}：原始残差小 $=$ 约束基本满足，对偶残差小 $=$ 协调变量基本不动了（到了驻点）。在实时 MPC 里则换一种策略：不等收敛，每周期跑固定轮数 + warm-start，把收敛摊到多个控制周期上。
+
+\begin{pitfall}[概念误区：把“ADMM 凸时收敛到全局最优”外推到非凸 MPC；$\rho$ 取极端不自查残差]
+其一，知道 ADMM 凸问题保证全局最优，就默认用在含非线性动力学/接触约束的非凸 MPC 上也“一定收敛到最优”。非凸子问题下 ADMM 可能收敛到不同局部解、对初值敏感、甚至不收敛，你却以为拿到了“最优解”。\textbf{正确做法}：非凸 MPC 用 ADMM 时当“工程上通常有效的启发式”而非“有保证的最优求解器”；配 warm-start、自适应 $\rho$、限制每周期迭代轮数（3--10 轮）、监控残差；关键安全约束不要只靠 ADMM 收敛来保证。其二，$\rho$ 随手取（常取很大，以为“强约束=快对齐”）且只看目标不看残差。$\rho$ 太大$\to$对偶残差大、迭代震荡或过冲；$\rho$ 太小$\to$原始残差降得极慢、几百轮还对不齐，误以为代码有 bug。\textbf{正确做法}：同时监控 $\|\mathbf{r}^k\|$ 和 $\|\mathbf{s}^k\|$，用残差平衡规则自适应调 $\rho$，把“两个残差都降到阈值以下”作为收敛判据。
+\end{pitfall}
+
+\subsection{去中心化的共识型 ADMM}
+\label{sec:cs-admm-decentral}
+
+前面的 $\mathbf{z}$-更新（\cref{eq:cs-z-update}）是一个\textbf{全局平均}——它需把所有 agent 的本地解汇总。如果由一个中央协调器来做，那 ADMM 就还残留一个“准中央节点”。对真正去中心化的多机系统，我们希望\textbf{连 $\mathbf{z}$-更新都只靠邻居通信}完成。这就是\textbf{共识型 ADMM（consensus ADMM）}。关键观察：$\mathbf{z}$-更新要算的“全局平均”，正是 \cref{sec:cs-linear} 的\textbf{平均共识}能分布式计算的东西。有两条路线：
+\begin{itemize}
+  \item \textbf{路线一：用平均共识子程序算 $\mathbf{z}$}。每轮 ADMM 的 $\mathbf{z}$-更新内部跑若干步离散平均共识（用双随机权重 $\mathbf{W}$），让各 agent 对 $\tfrac1N\sum_i(\mathbf{x}_i+\mathbf{u}_i)$ 达成一致。整个 ADMM 只需邻居通信，无中央节点。代价是每轮内嵌共识循环（通信轮数增加），但彻底去中心化。
+  \item \textbf{路线二：为每个 agent 配本地副本 $\mathbf{z}_i$，把“$\mathbf{z}_i$ 相等”也作为一致性约束}。每个 agent $i$ 持有自己的局部副本 $\mathbf{z}_i$，要求相邻 agent 的副本一致（$\mathbf{z}_i=\mathbf{z}_j$ 对 $(i,j)\in\mathcal{E}$）。这把一致性约束从“$\mathbf{x}_i=\mathbf{z}$”（全局）改写为“边上的一致”，约束结构正好对应关联矩阵 $\mathbf{B}$。这种“边一致性（edge consistency）”形式的 ADMM，$\mathbf{x}$-更新和对偶更新都只涉及邻居，是完全去中心化的——它正是 node-edge splitting 和许多分布式 MPC 的数学骨架。
+\end{itemize}
+
+\begin{insight}[ADMM 的协调步内核就是一次共识]\label{ins:cs-admm-consensus}
+从“中央协调的 ADMM”到“共识型去中心化 ADMM”，变的不是优化的数学（还是那三步），而是 $\mathbf{z}$-更新这一步\textbf{由谁来算、怎么算}。中央版让一个节点算全局平均；共识版让所有节点通过邻居接力算出同一个平均。这再次印证本章主线——共识（$\mathbf{z}$-更新的分布式实现）和 ADMM（整体框架）不是两个孤立工具，而是咬合在一起的：\textbf{ADMM 的协调步，内核就是一次共识}。
+\end{insight}
+
+需要权衡：去中心化虽消除了中央节点，但每轮内嵌共识会增加通信轮数（路线一）或增加变量与对偶维度（路线二）。$N$ 很小（2--4 台）时，带轻量协调器的中央版可能更简单高效；$N$ 大或要求绝对无单点时，才值得上完全去中心化的共识型。
+
+\subsection{ADMM 的家族与加速：对偶分解、sharing 形式、过松弛}
+\label{sec:cs-admm-family}
+
+\paragraph{与对偶分解的对比——为什么 ADMM 更好用。}
+ADMM 的直接前辈是对偶分解：同样给一致性约束配乘子，但用的是\textbf{普通}拉格朗日（没有二次罚项），迭代是“各 agent 解本地问题 $\to$ 用约束违反量做对偶梯度上升更新 $\mathbf{y}$”\cite{nedic2009distributed}。\pz{存疑（引用边界）：Nedi\'c--Ozdaglar 2009\cite{nedic2009distributed} 的核心确是“共识 + 本地次梯度”的分布式次梯度法（奠基之作），此归属正确；但把它当作\emph{对偶分解}的代表来引用并不贴切——该文通篇\textbf{未出现}“dual decomposition”，其相关工作对比的是 Tsitsiklis 的分布式计算与网络效用最大化，文中“dual”均指另一篇配套论文。此处“对偶分解”宜另引经典对偶分解文献，本键仅作“共识型分布式（次）梯度”的代表。}对偶分解可分解性同样好，但有两个硬伤：(1) \textbf{要求每个 $f_i$ 严格凸}，否则本地 $\argminop$ 可能无界或不唯一；(2) \textbf{收敛慢且对步长敏感}。ADMM 加的二次罚项 $\tfrac\rho2\|\mathbf{x}_i-\mathbf{z}\|^2$ 恰好治这两个病：罚项让本地问题即使 $f_i$ 只是凸（不严格凸）也良定、数值条件更好，同时大幅改善收敛。一句话：\textbf{ADMM $=$ 对偶分解的可分解性 $+$ 增广拉格朗日的鲁棒收敛}。
+
+\paragraph{consensus 形式 vs sharing 形式。}
+Boyd 综述区分了 ADMM 的两类典型分布式形式，对应两种不同的耦合结构：
+\begin{itemize}
+  \item \textbf{consensus 形式（我们一直用的）}：$\min\sum_i f_i(\mathbf{x}_i)$ s.t. $\mathbf{x}_i=\mathbf{z}$。耦合是“所有本地变量要等于一个公共变量”。典型场景：各 agent 对一个\emph{全局量}（全局参考点、共享负载状态）达成一致。
+  \item \textbf{sharing 形式}：$\min\sum_i f_i(\mathbf{x}_i)+g(\sum_i\mathbf{x}_i)$。耦合在一个作用于\emph{各 agent 贡献之和}的公共代价 $g$ 上。典型场景：各 agent 共享一个\emph{总资源/总量}（如总功率预算、对负载的合力 $\sum_i\mathbf{F}_i$ 要等于期望值）。
+\end{itemize}
+两者通过对偶可互相转化，但建模时选对形式很关键：\textbf{协调“大家要一致”用 consensus 形式，协调“大家之和要满足某约束”用 sharing 形式}。协同搬运里“各机器人出力之和 $=$ 负载所需合力”就是天然的 sharing 结构，而“各机器人对负载位姿的估计要一致”是 consensus 结构。
+
+\paragraph{过松弛（over-relaxation）——几乎免费的加速。}
+一个实用的 ADMM 加速技巧：在 $\mathbf{z}$-更新和 $\mathbf{y}$-更新里，把 $\mathbf{x}_i^{k+1}$ 替换成一个“过松弛”组合
+\begin{equation}
+  \hat{\mathbf{x}}_i^{k+1}=\alpha_{\text{ovr}}\,\mathbf{x}_i^{k+1}+(1-\alpha_{\text{ovr}})\,\mathbf{z}^k,
+  \label{eq:cs-overrelax}
+\end{equation}
+其中松弛因子 $\alpha_{\text{ovr}}\in(1,2)$（取 1 退回标准 ADMM）。直觉：让更新“多走一点”（外推），加快收敛。Boyd 综述指出 $\alpha_{\text{ovr}}\in[1.5,1.8]$ 经验上常带来明显加速，且几乎不增加计算量、不破坏收敛保证（凸问题下仍收敛）——实现分布式 MPC 时值得默认开启。
+
+\subsection{在多机 MPC 中的落地形态与 KKT 含义}
+\label{sec:cs-admm-mpc}
+
+ADMM 在多机 MPC 里的典型用法：每个机器人 $i$ 把自己的 MPC 作为本地子问题（对应 $\mathbf{x}$-更新），机器人间的耦合（避碰、编队、共享负载）写成一致性约束（对应 $\mathbf{z}$），通过 ADMM 迭代协调。这里点破一个工程上极重要却常被忽视的细节——\textbf{每周期跑几轮 ADMM}。理论上 ADMM 要迭代到残差收敛；但实时 MPC 每个控制周期只有几毫秒到几十毫秒，跑不起几百轮。实践做法是每周期只跑固定的少数几轮（如 3--10），配合 \textbf{warm-start}——用上一个控制周期收敛的对偶变量 $\mathbf{u}_i$ 和协调变量 $\mathbf{z}$ 作为本周期的初值。因为相邻控制周期的最优解变化很小，warm-start 让 ADMM 从“已经接近”的地方启动，几轮就够用。这是分布式 MPC 能实时运行的关键技巧。
+
+值得记下两个真实的前沿落地形态：
+\begin{itemize}
+  \item \textbf{共享负载的星形耦合（ACLM）}：Zhou 等人的 ACLM 处理多个“四足+臂”协同搬一个负载\cite{zhou2026aclm}。关键洞察是——\emph{机器人之间并不直接耦合，而是都通过那个共享负载耦合}，形成一个“星形”结构（负载在中心）。于是 consensus ADMM 把问题拆成一个负载子问题 + $N$ 个并行的机器人子问题，\emph{一致性约束只加在 manipulation wrench（交互力/力矩）上}。\pz{已联网核实（hold 解除）：arXiv:2603.07095，\emph{ACLM: ADMM-Based Distributed Model Predictive Control for Collaborative Loco-Manipulation}，作者 Ziyi Zhou、Pengyuan Shu、Ruize Cao、Yuntian Zhao、Ye Zhao（Georgia Tech LIDAR 实验室），2026-03-07 提交、已被 IROS 2026 接收；共享负载星形耦合 + 仅对交互 wrench 加 consensus 约束、均与正文一致。源稿担心的“arXiv 编号格式异常/年份”实为虚惊（26xx 系列即 2026 年）。}
+  \item \textbf{含 CBF 耦合的安全 MPC}：当机器人间加入避碰的控制屏障函数（CBF）约束时，这些约束本身引入耦合，使集中问题不能直接分解。Zeng--Hamed 等用一个 \textbf{node-edge splitting}（节点-边分裂）的 consensus 形式，把全局问题分解成可并行的 node-local 和 edge-local QP，只需邻居通信，在两台 Go2 上实机、仿真到 4 台\cite{zeng2026admmcbf}。\pz{已联网核实（hold 解除）：arXiv:2603.19170，\emph{ADMM-Based Distributed MPC with Control Barrier Functions for Safe Multi-Robot Quadrupedal Locomotion}，作者 Zeng、Sambhus、Imran、Kim、Pastore、Akbari Hamed，2026-03-19 提交；node-edge splitting、CBF 引入耦合、两台 Unitree Go2 实机、仿真至 4 台均与正文一致。注：目前为 arXiv 预印本（cs.RO/math.OC），尚无同行评审刊源，引用宜标“预印本”。该工作与 \cref{ch:plan-safemarl} 的 ADMM-CBF 安全层相呼应。}
+\end{itemize}
+
+\paragraph{收敛点的 KKT 与对偶变量的含义。}
+凸问题下 ADMM 收敛时，$(\mathbf{x}_i^\star,\mathbf{z}^\star,\mathbf{y}_i^\star)$ 满足原问题 \cref{eq:cs-consensus-opt} 的 \textbf{KKT 最优性条件}：
+\begin{itemize}
+  \item \textbf{原始可行}：$\mathbf{x}_i^\star=\mathbf{z}^\star$ 对所有 $i$——一致性约束精确满足，对应原始残差 $\mathbf{r}\to0$。
+  \item \textbf{对偶可行 + 稳定性}：每个本地问题的最优性给出 $\mathbf{0}\in\partial f_i(\mathbf{x}_i^\star)+\mathbf{y}_i^\star$，即 $-\mathbf{y}_i^\star\in\partial f_i(\mathbf{x}_i^\star)$，对应对偶残差 $\mathbf{s}\to0$。
+\end{itemize}
+把所有本地稳定性条件加起来，并用 $\sum_i\mathbf{y}_i^\star=\mathbf{0}$（收敛时对偶变量之和归零，由 $\mathbf{z}$-更新最优性给出），就得到 $\sum_i\nabla f_i(\mathbf{x}_i^\star)=\mathbf{0}$ 且所有 $\mathbf{x}_i^\star=\mathbf{z}^\star$——这正是原问题“在一致约束下最小化 $\sum f_i$”的最优性条件。\textbf{所以 ADMM 不是近似：凸问题下它收敛到的 $\mathbf{z}^\star$ 就是带约束原问题的精确全局最优}，对偶变量 $\mathbf{y}_i^\star$ 就是约束 $\mathbf{x}_i=\mathbf{z}$ 的最优拉格朗日乘子。
+
+\begin{insight}[对偶变量是一致性约束的影子价格]\label{ins:cs-shadow-price}
+对偶变量 $\mathbf{y}_i^\star$ 是一致性约束的\textbf{影子价格（shadow price）}——它度量“如果允许 agent $i$ 稍微偏离一致，总代价能降多少”。在协同搬运中，wrench 一致性约束的对偶变量就是各机器人为“力达成一致”所承受的“内部应力”；在编队中，它是各机器人为维持队形相对邻居付出的“协调努力”。\textbf{对偶变量不是算法的副产品，而是携带了“协调代价”信息的量}——监控它的大小能告诉你哪个 agent 在协调中“最吃力”（对偶变量最大），这对诊断编队里哪台机器人快到能力极限很有用。需重申边界：以上 KKT 等价性\emph{只在凸问题下成立}；非凸 MPC 下即便残差都降到很小，得到的也只是一个 KKT 点。
+\end{insight}
+
+\subsection{x-更新里有不等式约束怎么办：proximal 与投影}
+\label{sec:cs-admm-prox}
+
+前面讲 $\mathbf{x}$-更新时，本地子问题大多是无约束或只含等式约束的二次问题（有闭式解）。但真实 MPC 的本地子问题几乎总带\textbf{不等式约束}——控制量有上下界（执行器饱和）、状态有安全区域、足端力有摩擦锥约束。$\mathbf{x}$-更新此时不再有闭式解（一次理论-工程桥接）。关键认识：$\mathbf{x}$-更新本质是一个 \textbf{proximal（邻近）算子}求值。把 \cref{eq:cs-x-scaled} 写成
+\begin{equation}
+  \mathbf{x}_i^{k+1}=\argminop_{\mathbf{x}_i}\Big[f_i(\mathbf{x}_i)+\frac{\rho}{2}\|\mathbf{x}_i-\mathbf{v}_i^k\|^2\Big]=\proxop_{f_i/\rho}(\mathbf{v}_i^k),\qquad \mathbf{v}_i^k:=\mathbf{z}^k-\mathbf{u}_i^k,
+  \label{eq:cs-prox}
+\end{equation}
+即“在最小化 $f_i$ 和靠近 $\mathbf{v}_i^k$ 之间折中”。当 $f_i$ 含约束（写成示性函数 $+\infty$），proximal 算子自然处理约束，只是没了闭式解。怎么算？
+\begin{itemize}
+  \item \textbf{本地子问题仍是凸 QP（带不等式约束）$\to$ 用 QP 求解器}。最常见：$f_i$ 是二次代价 + 线性不等式约束，本地子问题就是带约束的 QP，直接用 OSQP（它本身就是基于 ADMM 的 QP 求解器，故有“ADMM 套 ADMM”的层次）、qpOASES 等解。外层 ADMM 协调机器人间耦合，内层 QP 解单机带约束子问题。
+  \item \textbf{约束是简单集合（盒约束/范数球）$\to$ 用投影代替求解}。若约束只是“控制量在 $[\mathbf{u}_{\min},\mathbf{u}_{\max}]$ 内”这类简单集合，proximal 退化为先无约束求解、再\textbf{投影}到可行集（$\operatorname{clip}$ 到盒子、或归一化到范数球），几乎免费。
+\end{itemize}
+
+\begin{insight}[约束被吸收进 proximal 算子]\label{ins:cs-prox}
+ADMM 的 $\mathbf{x}$-更新 $=$ 本地代价的 proximal 算子，这个视角把“ADMM 怎么处理约束”统一起来——\textbf{约束不是 ADMM 框架之外的麻烦，而是被吸收进 proximal 算子里}：无约束 $\to$ 闭式解；凸约束 $\to$ 内层 QP；简单集合约束 $\to$ 投影。这也解释了 ADMM 为何在带约束的分布式 MPC 里如此自然：它天然把“满足本地约束”（proximal 内部）和“满足耦合约束”（ADMM 的一致性）分到两个层次各自处理。
+\end{insight}
+
+\subsection{代码验证：用 ADMM 求解分布式 QP}
+\label{sec:cs-admm-code}
+
+考虑最经典的可分布式问题：$N$ 个 agent，每个有本地二次代价 $f_i(x)=\tfrac12 a_i(x-b_i)^2$，所有 agent 必须对一个公共标量 $z$ 达成一致。这其实是个“加权平均”问题——闭式最优解 $z^\star=\tfrac{\sum a_i b_i}{\sum a_i}$。用 ADMM 解它，验证收敛到这个已知最优，并观察 $\rho$ 对收敛速度的影响。
+
+\begin{codebox}[Python]{缩放形式 ADMM 解分布式 QP:凸下任何 rho 收敛到同一最优}
+import numpy as np
+
+np.random.seed(0)
+a = np.array([1.0, 2.0, 0.5, 3.0, 1.5])   # 各 agent 代价权重
+b = np.array([4.0, 1.0, 7.0, 2.0, 5.0])   # 各 agent 本地目标
+z_star = (a @ b) / a.sum()                 # 已知闭式最优:加权平均
+
+def admm_consensus_qp(a, b, rho, iters=60):
+    """min Σ 0.5 a_i (x_i-b_i)^2 s.t. x_i=z（缩放形式）."""
+    N = len(a); x = np.zeros(N); u = np.zeros(N); z = 0.0; hist = []
+    for k in range(iters):
+        # (1) x-更新（各 agent 并行，本地 QP 有闭式解）:
+        #    x_i = (a_i b_i + rho(z - u_i)) / (a_i + rho)
+        x = (a * b + rho * (z - u)) / (a + rho)
+        z = np.mean(x + u)                  # (2) z-更新（平均）
+        u = u + x - z                       # (3) u-更新（对偶）
+        hist.append(abs(z - z_star))
+    return z, np.array(hist)
+
+for rho in [0.1, 1.0, 10.0, 100.0]:
+    z_final, hist = admm_consensus_qp(a, b, rho)
+    conv = np.argmax(hist < 1e-6) if np.any(hist < 1e-6) else len(hist)
+    print(f"rho={rho:6.1f}: 收敛到 z={z_final:.6f}, 误差<1e-6 需 {conv:3d} 轮")
+\end{codebox}
+
+\noindent 运行要点：凸问题下只要迭代足够多，任何 $\rho>0$ 的 ADMM 都收敛到同一闭式最优 $z^\star$——印证“$\rho$ 不改变最优解的位置，只影响到达它的速度”。但\textbf{有限轮数内不同 $\rho$ 的进度天差地别}：$\rho=1$ 几十轮就高精度收敛，而 $\rho$ 太小（$0.1$）收敛慢、$\rho$ 太大（$100$）在同样轮数内甚至还停在远离最优的地方。这就是为什么实际中每周期只跑有限轮 ADMM 时，$\rho$ 必须调好（或自适应）。源稿另给了一个“两个单积分器 + 末端编队约束”的 ADMM-MPC 玩具例子（每个 $\mathbf{x}$-更新是一台机器人的轨迹 QP，$\mathbf{z}$-更新投影到编队约束 $p_2-p_1=d^\star$），展示“单体 MPC（本地子问题）+ ADMM（协调编队约束）”如何拼起来——把它跑通就抓住了分布式 MPC 的全部骨架，剩下的都是把子问题“加重”。
+
+\begin{pitfall}[编程陷阱：$\mathbf{z}$-更新漏对偶项；x-更新含不等式约束却用无约束闭式解]
+其一，实现缩放形式时 $\mathbf{z}$-更新写成 $\mathbf{z}=\tfrac1N\sum\mathbf{x}_i$（漏掉了 $\mathbf{u}_i$），让对偶变量的修正无法反馈到协调变量，收敛变慢或收敛到错误点。\textbf{正确做法}：严格按 \cref{eq:cs-zu-scaled} 实现 $\mathbf{z}=\tfrac1N\sum(\mathbf{x}_i+\mathbf{u}_i)$；分布式实现里这一步用平均共识算，共识本身要用双随机权重；自检：收敛时应有 $\sum_i\mathbf{u}_i\to\mathbf{0}$。其二，本地子问题带控制量上下界/避障等不等式约束，却照搬无约束二次问题的闭式解，忽略约束，解出的 $\mathbf{x}_i$ 违反本地约束（控制量超饱和、轨迹穿障），整个 ADMM 协调出的“解”不可执行。\textbf{正确做法}：带凸不等式约束的本地子问题用内层 QP 求解器（OSQP/qpOASES）解，即 $\mathbf{x}$-更新 $=$ 一次小 QP；若约束是盒/范数球这类简单集合，用“无约束解 + 投影”代替。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 把标量 $x_i$ 换成 2 维向量，$f_i(\mathbf{x})=\tfrac12(\mathbf{x}-\mathbf{b}_i)^\top\mathbf{Q}_i(\mathbf{x}-\mathbf{b}_i)$（$\mathbf{Q}_i$ 随机正定）。实现向量版 ADMM，验证收敛到闭式最优 $\mathbf{z}^\star=(\sum\mathbf{Q}_i)^{-1}(\sum\mathbf{Q}_i\mathbf{b}_i)$。画出原始残差与对偶残差随迭代曲线，观察它们如何一起下降。
+  \item \textbf{[实现/分析]} 在练习 1 基础上加自适应 $\rho$（残差平衡，$\mu=10$、$\tau=2$）。对比固定 $\rho$（取 0.1、1、10、100）与自适应 $\rho$ 的收敛轮数，验证自适应版对初值 $\rho$ 不敏感。
+  \item \textbf{[B型·精读]} 精读 Keviczky--Borrelli\cite{keviczky2008decentralized} 或 Zeng--Hamed\cite{zeng2026admmcbf} 中的问题分解。画数据流图：每个 agent 的本地 MPC（QP）如何对应 ADMM 的 $\mathbf{x}$-更新，邻居间交换什么量，$\mathbf{z}$-更新在哪里完成。说明它与标准一致性 ADMM 的对应关系。
+  \item \textbf{[实现/扩展]} 在 ADMM-MPC 玩具例子（两个单积分器 + 末端编队约束）基础上：(a) 改成约束\emph{整条轨迹}的相对位置；(b) 加 warm-start——每个“控制周期”用上周期对偶变量作初值，每周期只跑 3 轮 ADMM；(c) 把 $\rho$ 换成自适应残差平衡。比较“每周期跑到收敛”与“每周期只跑 3 轮 + warm-start”在总计算量上的差异。
+  \item \textbf{[推导/思考]} (a) 写出 sharing 形式 ADMM（$\min\sum_if_i(\mathbf{x}_i)+g(\sum_i\mathbf{x}_i)$）的三步迭代，说明它与 consensus 形式的对偶关系；给一个多机例子说明何时该用 sharing（提示：协调“各机器人出力之和 $=$ 负载合力”）。(b) 给分布式 QP 加过松弛（$\alpha_{\text{ovr}}\in\{1.0,1.5,1.8\}$），比较收敛轮数。
+  \item \textbf{[实现/约束处理]} 给分布式 QP 加\textbf{盒约束} $x_i\in[\ell,h]$。两种实现：(a) $\mathbf{x}$-更新里无约束解后\textbf{投影}（clip）；(b) 用 \verb|cvxpy|/OSQP 把 $\mathbf{x}$-更新写成带约束的小 QP。验证两者收敛到同一个（满足约束的）最优，并解释为什么投影法对盒约束等价于解带约束 QP（盒约束的 proximal 就是 clip）。
+\end{enumerate}
+\end{practice}
+
+\noindent \cref{sec:cs-linear,sec:cs-delay,sec:cs-admm} 已给出“协调”的两大数学引擎。最后两节把它们落到多机控制里最经典、最直观的任务：\cref{sec:cs-formation} 编队，会看到编队控制律本质上就是共识协议作用在“相对位置误差”上；\cref{sec:cs-dynamic} 动态共识，把共识从“固定输入”推广到“时变信号”。
+
+% ════════════════════════════════════════════════════════════════
+\section{编队控制三范式}
+\label{sec:cs-formation}
+
+\paragraph{动机：保持队形需要每个机器人知道什么。}
+设想 $N$ 台机器人要保持一个楔形（雁阵）队形前进。每台都没有全局视角，只能感知/通信到邻居。要维持队形，机器人 $i$ 需要不断调整自己的位置。问题是——\textbf{它到底需要知道什么，才能算出该往哪调？} 有三种可能的答案，对应三种\textbf{编队范式}：它可能需要知道邻居的\textbf{绝对位置}（在某个全局坐标系下），或只需邻居相对于自己的\textbf{相对位置}（方向 + 距离），或者甚至只需要和邻居的\textbf{距离}（连方向都不要）。这三种答案对传感器和通信的要求递减，但对队形的“刚性”保证也递减。选错范式，要么你装了用不上的昂贵传感器（GPS/动捕），要么你的队形会出现意想不到的自由度（整体旋转或镜像）。所以编队控制的第一课不是“控制律怎么写”，而是“我能拿到什么信息，据此该选哪种范式”。
+
+\paragraph{反面：不区分范式会怎样。}
+照着教科书写了个“position-based”控制律（要用邻居绝对位置），部署到野外才发现机器人根本没有共同的全局坐标系（没有 GPS、动捕，只有相对测量）——控制律里的绝对位置量根本拿不到。反过来，用只需测距的“distance-based”省传感器，却没意识到仅靠距离约束的队形存在\textbf{翻转/旋转的歧义}（同样的两两距离，队形可以整体旋转、甚至镜像翻转），结果编队“形状对了但朝向乱了”或出现镜像。范式决定了“什么信息够用、什么队形能唯一确定”，必须先想清楚。
+
+\paragraph{历史：编队控制的范式分类。}
+编队控制研究在 2000 年代随多机系统兴起而系统化。一个被广泛接受的分类框架（可见于 Oh、Park、Ahn 2015 的综述）按\textbf{机器人之间需要测量/通信的量}把编队控制分成三类：position-based、displacement-based、distance-based\cite{oh2015formation}。这个分类的深刻之处在于它把“控制律设计”和“传感/通信能力”直接挂钩——你有什么样的感知能力，就决定了你能用哪种范式、能实现什么样的队形约束。
+
+\subsection{三范式概览}
+\label{sec:cs-form-three}
+
+\begin{table}[H]\centering\small
+\caption{编队控制三范式：信息需求与队形保证递减}
+\label{tab:cs-three-paradigm}
+\begin{tabular}{p{2.4cm}p{3.3cm}p{2.2cm}p{2.8cm}}
+\toprule
+范式 & 每个 agent 需要的信息 & 全局信息需求 & 能确定的队形 \\
+\midrule
+Position-based & 邻居绝对位置 $\mathbf{p}_j$（及自身 $\mathbf{p}_i$） & 共同参考系（全局坐标） & 绝对位置 + 朝向（最强） \\
+Displacement-based & 相对位置 $\mathbf{p}_j-\mathbf{p}_i$（向量） & 共同朝向（各轴对齐） & 形状 + 朝向，位置自由 \\
+Distance-based & 距离 $\|\mathbf{p}_j-\mathbf{p}_i\|$（标量） & 无 & 仅形状（差刚体运动/镜像） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 信息需求从上到下递减（绝对位置 $\to$ 相对位置向量 $\to$ 仅距离标量），全局协调需求也递减（共同坐标系 $\to$ 共同朝向 $\to$ 无），但能唯一确定的队形也越来越“松”。这是一个清晰的\textbf{权衡谱系}：用更弱的感知，换更松的队形保证。
+
+\subsection{displacement-based 控制律：就是共识的变体}
+\label{sec:cs-form-displacement}
+
+取最常用的 displacement-based 范式（野外编队主力，因为只需相对位置 + IMU 对齐朝向，不需要 GPS）。期望队形由一组\textbf{期望相对位置}给定：记机器人 $i$ 在队形中的标称位置为 $\mathbf{p}_i^\star$（只用来定义期望相对量，不需真实存在的全局坐标），则期望相对位置是 $\mathbf{p}_j^\star-\mathbf{p}_i^\star$。控制目标：让实际相对位置 $\mathbf{p}_j-\mathbf{p}_i$ 等于期望相对位置。对单积分器模型（$\dot{\mathbf{p}}_i=\mathbf{u}_i$），displacement-based 编队控制律是：
+\begin{equation}
+  \mathbf{u}_i=\sum_{j\in\mathcal{N}_i}\Big[(\mathbf{p}_j-\mathbf{p}_i)-(\mathbf{p}_j^\star-\mathbf{p}_i^\star)\Big].
+  \label{eq:cs-disp-law}
+\end{equation}
+方括号里是“当前相对位置”与“期望相对位置”之差，即\textbf{相对位置误差}；机器人 $i$ 朝着减小与所有邻居的相对位置误差的方向移动。当所有相对位置都达到期望时，每个方括号为零，$\mathbf{u}_i=\mathbf{0}$，队形保持。
+
+\begin{theorem}[displacement 编队 $=$ 误差变量上的共识]\label{thm:cs-form-consensus}
+定义误差变量 $\tilde{\mathbf{p}}_i=\mathbf{p}_i-\mathbf{p}_i^\star$（实际位置减标称位置）。则 \cref{eq:cs-disp-law} 的误差动力学是连续共识协议
+\begin{equation}
+  \dot{\tilde{\mathbf{p}}}_i=\sum_{j\in\mathcal{N}_i}(\tilde{\mathbf{p}}_j-\tilde{\mathbf{p}}_i)\quad\Longleftrightarrow\quad \dot{\tilde{\mathbf{p}}}=-\mathbf{L}\tilde{\mathbf{p}},
+  \label{eq:cs-form-err}
+\end{equation}
+故 $\tilde{\mathbf{p}}$ 收敛到一致 $\tilde{\mathbf{p}}_i\to\mathbf{c}$（对所有 $i$ 相同的常向量），即 $\mathbf{p}_i\to\mathbf{p}_i^\star+\mathbf{c}$——所有机器人收敛到“标称队形整体平移 $\mathbf{c}$”的位置，队形（相对关系）被精确恢复，整体平移 $\mathbf{c}$ 等于初始误差的平均，收敛速率仍是 $\lambda_2$。
+\end{theorem}
+
+\begin{proof}
+把 \cref{eq:cs-disp-law} 改写：$\mathbf{u}_i=\sum_{j}[(\mathbf{p}_j-\mathbf{p}_j^\star)-(\mathbf{p}_i-\mathbf{p}_i^\star)]=\sum_{j}(\tilde{\mathbf{p}}_j-\tilde{\mathbf{p}}_i)$。而 $\dot{\tilde{\mathbf{p}}}_i=\dot{\mathbf{p}}_i=\mathbf{u}_i$（因 $\mathbf{p}_i^\star$ 是常量），故 $\dot{\tilde{\mathbf{p}}}=-\mathbf{L}\tilde{\mathbf{p}}$，即 \cref{eq:cs-form-err}。由 \cref{thm:cs-cont-conv}，$\tilde{\mathbf{p}}$ 收敛到初始误差的平均 $\mathbf{c}=\tfrac1N\sum_i\tilde{\mathbf{p}}_i(0)$，速率 $\lambda_2$。
+\end{proof}
+
+\begin{insight}[编队是共识的几何化身]\label{ins:cs-form}
+编队控制律本质上就是\textbf{共识协议作用在“相对位置误差”上}。\cref{sec:cs-linear} 让标量意见达成一致；这里让“位置误差”达成一致，而“误差一致”就意味着“队形恢复”。这解释了为什么编队的收敛性、收敛速率（还是 $\lambda_2$）、对拓扑/延迟的依赖，全部继承自共识理论——编队不是一个新问题，而是共识的几何化身。你在 \cref{sec:cs-linear} 推的所有结论（指数收敛、$\lambda_2$ 决定速度、$\lambda_N$ 决定延迟容限）对编队原样成立。这也是为什么本章把共识放在编队之前：吃透共识，编队是水到渠成的推论。
+\end{insight}
+
+\subsection{三范式的歧义与刚性}
+\label{sec:cs-form-rigidity}
+
+为什么 distance-based 的队形“只确定形状，差一个旋转/平移/镜像”？因为它只约束两两距离 $\|\mathbf{p}_j-\mathbf{p}_i\|$。一组距离约束下，整个队形可以刚性地旋转、平移而距离不变，甚至镜像翻转也不改变距离。要让距离约束\textbf{唯一确定}队形（差一个全局刚体运动），需要图满足\textbf{刚性（rigidity）}条件——不是任意连通图都能用距离锁定队形，图必须“刚性”（边足够多且位置合适）。三范式歧义对比：
+\begin{itemize}
+  \item \textbf{Position-based} 无歧义：绝对位置直接钉死每个机器人，位置和朝向都确定。代价：需要全局坐标系。
+  \item \textbf{Displacement-based} 差一个平移：队形形状和朝向确定，但整体位置（平移 $\mathbf{c}$）自由。代价：需要共同朝向（IMU/磁力计对齐）。
+  \item \textbf{Distance-based} 差一个刚体运动（旋转 + 平移）甚至镜像：只锁形状。代价最小（仅测距），歧义最大，且需图刚性才能锁住形状。
+\end{itemize}
+
+\paragraph{刚性矩阵：把“距离能否锁住队形”代数化。}
+关联矩阵 $\mathbf{B}$ 在这里升级为\textbf{刚性矩阵（rigidity matrix）} $\mathbf{R}_g(\mathbf{p})$。对每条边 $(i,j)$，distance-based 约束是 $\|\mathbf{p}_i-\mathbf{p}_j\|^2=\text{const}$；对它求导得到速度约束 $(\mathbf{p}_i-\mathbf{p}_j)^\top(\dot{\mathbf{p}}_i-\dot{\mathbf{p}}_j)=0$，把所有边叠起来写成 $\mathbf{R}_g(\mathbf{p})\dot{\mathbf{p}}=\mathbf{0}$。$\mathbf{R}_g(\mathbf{p})$ 的每一行对应一条边，是该边在关联结构 $\mathbf{B}$ 上再“加权”上相对位置向量 $(\mathbf{p}_i-\mathbf{p}_j)$。队形\textbf{无穷小刚性（infinitesimally rigid）}的判据是 $\mathbf{R}_g(\mathbf{p})$ 的秩达到最大可能值（$2N-3$ 在平面、$3N-6$ 在空间，扣掉整体平移 + 旋转的自由度）。秩不够 $=$ 存在不改变所有边长的“柔性形变” $=$ 距离锁不住队形。\textbf{距离约束能否唯一确定队形，等价于刚性矩阵满秩；而刚性矩阵就是关联矩阵 $\mathbf{B}$ 的几何加权版}。
+
+\paragraph{distance-based 控制律：距离误差势函数的梯度。}
+displacement-based 用相对位置向量；distance-based 只有距离标量，控制律是一个\textbf{距离误差势函数}的负梯度。定义势函数（对每条边，实际距离平方与期望距离平方之差的平方）
+\begin{equation}
+  V(\mathbf{p})=\frac14\sum_{(i,j)\in\mathcal{E}}\big(\|\mathbf{p}_i-\mathbf{p}_j\|^2-(d_{ij}^\star)^2\big)^2,\qquad
+  \dot{\mathbf{p}}_i=-\nabla_{\mathbf{p}_i}V=-\sum_{j\in\mathcal{N}_i}\big(\|\mathbf{p}_i-\mathbf{p}_j\|^2-(d_{ij}^\star)^2\big)(\mathbf{p}_i-\mathbf{p}_j),
+  \label{eq:cs-dist-law}
+\end{equation}
+其中 $d_{ij}^\star$ 是期望边长。直觉：对每个邻居，若当前距离大于期望（括号为正）就把自己朝邻居拉近，小于期望则推远。与 displacement 控制律 \cref{eq:cs-disp-law} 的关键区别：\cref{eq:cs-disp-law} 是\textbf{线性}的（$\dot{\tilde{\mathbf{p}}}=-\mathbf{L}\tilde{\mathbf{p}}$，全局收敛），而 \cref{eq:cs-dist-law} 是\textbf{非线性}的（势函数非凸），只能保证局部收敛到满足距离约束的某个构型，且可能收敛到镜像/翻转的“错误”构型——这正是 distance-based 歧义在控制律层面的体现。
+
+\subsection{把编队“钉”在期望位置 + 二阶编队与机动}
+\label{sec:cs-form-anchor}
+
+\paragraph{锚定 leader。}
+displacement-based 留下的“整体平移自由”（$\mathbf{c}$ 由初值决定）在很多任务里不可接受——你要编队去某个\textbf{指定}的全局位置。解决办法：\textbf{锚定一个或多个 leader}。让某个机器人（leader）不跟随共识、而是直接跟踪一个期望的全局位置（它有 GPS 或被指定目标），其余机器人按 \cref{eq:cs-disp-law} 跟随。数学上这相当于给共识系统加一个“锚”：$\tilde{\mathbf{p}}$ 不再收敛到任意平移，而是被 leader 钉到确定值。这把“相对队形”和“绝对定位”解耦——大多数机器人只需相对感知（便宜），少数 leader 负责绝对定位（贵）。
+
+\paragraph{二阶编队。}
+前面的编队控制律是一阶的（单积分器）。但真实机器人有惯性，更接近双积分器 $\ddot{\mathbf{p}}_i=\mathbf{u}_i$——这与 \cref{sec:cs-second-order} 的二阶共识完全平行。\textbf{二阶编队控制律必须同时用相对位置误差和相对速度误差}：
+\begin{equation}
+  \ddot{\mathbf{p}}_i=-\sum_{j\in\mathcal{N}_i}\Big\{\big[(\mathbf{p}_i-\mathbf{p}_j)-(\mathbf{p}_i^\star-\mathbf{p}_j^\star)\big]+\gamma_d(\dot{\mathbf{p}}_i-\dot{\mathbf{p}}_j)\Big\},
+  \label{eq:cs-form-second}
+\end{equation}
+第一项是位置编队误差，第二项 $\gamma_d(\dot{\mathbf{p}}_i-\dot{\mathbf{p}}_j)$ 是速度一致（阻尼）项。和 \cref{sec:cs-second-order} 同样的道理：\textbf{没有速度阻尼项，有惯性的编队会持续振荡}。误差动力学是二阶的 $\ddot{\tilde{\mathbf{p}}}=-\mathbf{L}\tilde{\mathbf{p}}-\gamma_d\mathbf{L}\dot{\tilde{\mathbf{p}}}$，收敛性与二阶共识同构。
+
+\paragraph{编队机动：让整个队形动起来。}
+实际任务要编队\textbf{整体运动}——平移、旋转、缩放。关键洞察：displacement-based 编队的“整体平移自由”在这里从“缺陷”变成“特性”——既然队形对整体平移不敏感，那就让期望队形 $\mathbf{p}_i^\star$ 变成\textbf{时变}的来携带整体运动。最简洁的做法是把期望位置设为 $\mathbf{p}_i^\star(t)=\mathbf{s}(t)+\mathbf{R}_f(t)\,\mathbf{p}_i^{\text{shape}}$，其中 $\mathbf{p}_i^{\text{shape}}$ 是固定的标称形状，$\mathbf{s}(t)$ 描述整体平移轨迹、$\mathbf{R}_f(t)$ 描述整体旋转与缩放。各机器人仍只用相对信息维持形状，而 $\mathbf{s}(t),\mathbf{R}_f(t)$ 这个“整体运动”由 leader 或全局指令驱动。\textbf{形状（相对、分布式维持）和位姿（整体、由少数 leader 或指令驱动）解耦}。
+
+\begin{insight}[编队的两个解耦]\label{ins:cs-form-decouple}
+一阶到二阶编队、静止队形到编队机动，看似在加复杂度，实则都在复用同两个解耦：\textbf{(1) 形状 vs 位姿解耦}——形状靠相对信息分布式维持（共识/编队律），整体位姿靠少数 leader 或指令驱动；\textbf{(2) 位置一致 vs 速度阻尼}——有惯性就必须补速度协调项防振荡。抓住这两个解耦，从“双机静态保持队形”到“大编队动态穿越地形”，都是同一套共识思想的展开。
+\end{insight}
+
+\subsection{代码验证：displacement-based 编队 \texorpdfstring{$=$}{=} 共识}
+\label{sec:cs-form-code}
+
+验证“编队控制律就是共识作用在误差上”：跑一个 displacement-based 编队，确认误差变量 $\tilde{\mathbf{p}}$ 按 $\dot{\tilde{\mathbf{p}}}=-\mathbf{L}\tilde{\mathbf{p}}$ 收敛、队形被恢复、且整体平移等于初始误差均值。
+
+\begin{codebox}[Python]{displacement 编队:误差按共识收敛、队形恢复、平移=初始误差均值}
+import numpy as np
+
+def laplacian_from_edges(N, edges):
+    A = np.zeros((N, N))
+    for i, j in edges:
+        A[i, j] = 1.0; A[j, i] = 1.0
+    return np.diag(A.sum(1)) - A
+
+N = 4                                                # 期望队形:正方形
+p_star = np.array([[0., 0.], [1., 0.], [1., 1.], [0., 1.]])
+edges = [(0, 1), (1, 2), (2, 3), (3, 0), (0, 2)]     # 含对角，保证刚性
+L = laplacian_from_edges(N, edges)
+
+rng = np.random.default_rng(1)
+p = p_star + rng.normal(scale=0.5, size=(N, 2))      # 随机打乱初始位置
+err0 = p - p_star
+dt = 0.01
+for _ in range(2000):
+    u = -L @ (p - p_star)                            # 控制律 = 误差的共识
+    p = p + dt * u
+err_final = p - p_star
+print(f"误差 std（各机器人间，应~=0=队形已恢复）: {err_final.std(axis=0).round(5)}")
+print(f"整体平移 c（实际）= {err_final.mean(axis=0).round(4)}")
+print(f"初始误差均值（理论平移）= {err0.mean(axis=0).round(4)}  -> 应相等")
+\end{codebox}
+
+\noindent 运行要点：最终各机器人误差 $\tilde{\mathbf{p}}_i$ 全部相等（等于整体平移 $\mathbf{c}$），说明队形形状被精确恢复；这个 $\mathbf{c}$ 恰等于初始误差的平均（继承自共识的“收敛到平均”）；每条边上的相对位置误差趋于 0。这就直观坐实了“编队 $=$ 共识作用在误差上”。
+
+\begin{pitfall}[陷阱：不区分范式默认能拿绝对位置；distance-based 忽视刚性与镜像歧义；控制律符号写反]
+其一，照搬 position-based 控制律（用邻居绝对位置 $\mathbf{p}_j$），不检查机器人是否真有共同全局坐标系，部署到无 GPS 野外失效。\textbf{正确做法}：先盘点真实感知能力（有无全局定位、能否对齐朝向、能否测相对位置/距离），再据“信息需求表”选范式（野外无 GPS 通常用 displacement-based）。其二，为省传感器用 distance-based 却随便连个连通图就以为能锁住队形，结果出现整体旋转、甚至镜像翻转。\textbf{正确做法}：检查图的刚性，需要消除镜像时增加约束（锚定额外节点或混入少量 displacement 信息）。其三，实现 \cref{eq:cs-disp-law} 时把某个差写反方向（$\mathbf{p}_i-\mathbf{p}_j$），控制律变成“放大误差”而非“消除误差”。\textbf{正确做法}：统一约定相对量方向（一律 $\mathbf{p}_{\text{邻居}}-\mathbf{p}_{\text{自己}}$），验证退化情形——当 $\mathbf{p}=\mathbf{p}^\star$ 时控制律必须给出 $\mathbf{u}_i=\mathbf{0}$；代码里用矩阵形式 $\mathbf{u}=-\mathbf{L}(\mathbf{p}-\mathbf{p}^\star)$ 最不易错（符号由 $-\mathbf{L}$ 统一保证）。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 对同一个 6 机器人期望队形（正六边形），分别写 position/displacement/distance-based 控制律，从同一打乱初始位置出发。观察：position 收敛到绝对队形；displacement 收敛到“形状对、整体平移随初值”；distance 收敛到“形状对、但可能整体旋转/镜像”。
+  \item \textbf{[推导]} 从 \cref{eq:cs-disp-law} 出发，严格推导误差动力学 $\dot{\tilde{\mathbf{p}}}=-\mathbf{L}\tilde{\mathbf{p}}$，并据 \cref{sec:cs-linear} 的共识结论说明：(a) 队形为何恢复；(b) 整体平移 $\mathbf{c}$ 为何等于初始误差均值；(c) 收敛速率为何仍是 $\lambda_2$。
+  \item \textbf{[设计/思考]} 你要让一个 5 机器人编队\textbf{去到}指定全局位置。设计“锚定 leader”方案：哪台机器人当 leader（需要什么传感器）、其余用什么范式、leader 如何把队形“拖”到目标。说明它如何把“相对队形（便宜的相对感知）”和“绝对定位（只有 leader 需要贵的全局定位）”解耦。
+  \item \textbf{[实现/分析]} 实现二阶编队控制律（\cref{eq:cs-form-second}），对 4 机器人正方形队形，从打乱初始位置 + 零初速出发，扫描阻尼增益 $\gamma_d$。验证 $\gamma_d=0$ 时队形持续振荡、$\gamma_d>0$ 时收敛。
+  \item \textbf{[实现/综合]} 实现一个\textbf{编队机动}：4 机器人保持正方形形状，同时整体沿一条直线平移并缓慢旋转。用时变期望队形 $\mathbf{p}_i^\star(t)=\mathbf{s}(t)+\mathbf{R}_f(t)\mathbf{p}_i^{\text{shape}}$，各机器人用 \cref{eq:cs-form-second} 跟踪。验证机动过程中内部形状基本保持。讨论：要让形状在快速机动中也保持好，为什么需要给控制律加一个“整体运动的前馈项”？
+\end{enumerate}
+\end{practice}
+
+\noindent 至此 \cref{sec:cs-linear,sec:cs-delay,sec:cs-admm,sec:cs-formation} 把“共识—延迟/切换—分布式优化—编队”这条主线走完了。但前面所有共识协议都假设每个 agent 持有的初值是\emph{固定}的。现实中机器人要“共识”的量往往是\textbf{时变}的：一群机器人各自用传感器测同一个移动目标。这就是\textbf{动态共识}，\cref{sec:cs-dynamic} 把静态共识推广到这个时变情形。
+
+% ════════════════════════════════════════════════════════════════
+\section{动态共识与分布式估计}
+\label{sec:cs-dynamic}
+
+\paragraph{动机：让一群机器人实时跟踪一个移动目标的平均。}
+设想 $N$ 台机器人分散在一片区域，共同观测一个\textbf{移动}的目标（需要被多机包围的入侵者、或要协同搬运的漂浮物）。每台机器人 $i$ 用自己的传感器得到对目标某个量（位置、速度、信号强度）的本地测量 $r_i(t)$——由于视角、噪声、遮挡不同，各机器人的测量值各不相同，且因为目标在动，\textbf{每个 $r_i(t)$ 时刻都在变}。现在协调目标变了：要让\textbf{每台机器人都实时持有一个对“全体测量的瞬时平均” $\bar r(t)=\tfrac1N\sum_i r_i(t)$ 的估计}——这个瞬时平均通常比任何单台机器人的测量都更准（平均抵消独立噪声）。问题是：\textbf{在只能和邻居通信、且输入信号一直在变的约束下，怎样让每个 agent 的估计实时跟上这个时变的平均，而不滞后、不漂移？}
+
+这个问题看似只是“加个时变输入”，但有一个本质的新困难：静态共识收敛到平均后就\textbf{停在那里}（$\dot{\mathbf{x}}\to\mathbf{0}$）；而这里平均值本身在动，估计必须\textbf{持续地动}才能跟住——一旦“停下来”就立刻落后于移动的真值。所以静态共识协议（收敛即静止）直接用在时变输入上会\textbf{系统性滞后}，必须改造。
+
+\paragraph{反面：直接套用静态共识会怎样。}
+\textbf{朴素做法一：反复用静态共识“重新平均”}。每隔一段时间把所有 agent 状态重置为当前测量 $x_i\leftarrow r_i(t)$，再跑若干步静态共识收敛到这一时刻的平均。问题：目标在动，“重置—收敛”一轮需要好几个时间常数 $1/\lambda_2$，等收敛完目标早移到别处——得到的是\textbf{过时}的平均，且跟踪是一跳一跳的锯齿。\textbf{朴素做法二：直接把静态共识的输入接成时变}。若简单地 $\dot x_i=-\sum_j a_{ij}(x_i-x_j)+(r_i-x_i)$（让状态既向邻居靠拢、又向本地测量靠拢），稳态时各 agent 收敛到的是一个\textbf{被本地测量拉偏}的值，不是真正的全体平均——因为每个 agent 都额外被自己的 $r_i$ 往回拽，破坏了平均的对称性（这恰恰和度归一化破坏双随机、收敛值被拉偏是同一类病）。核心矛盾：\textbf{要跟踪时变平均，既要让估计“持续动”（跟上变化），又要保证“动的方向是对的”（不被本地输入拉偏、稳态无偏）}。
+
+\paragraph{历史：从静态共识到动态平均共识。}
+动态共识（也叫\textbf{动态平均共识}，dynamic average consensus）的提出，源于把共识从“一次性协商”推广到“持续估计”的需求。2005--2008 年间，Spanos、Olfati-Saber、Freeman、Lynch、Kumar 等人针对“输入时变、要实时跟踪平均”的传感器网络场景，提出并分析了动态平均共识估计器——核心思想是把输入信号的\textbf{导数}（变化率）作为前馈注入共识动力学。这一族算法后来成为分布式估计、分布式卡尔曼滤波、多机协同感知的基础工具。Kia 等人 2019 年在 IEEE Control Systems Magazine 上的综述系统总结了这条线，是本节的主要参考\cite{kia2019dynamic}。
+
+\subsection{动态平均共识的连续协议}
+\label{sec:cs-dyn-cont}
+
+目标形式化：每个 agent $i$ 有时变输入 $r_i(t)$，要让每个 agent 的估计 $x_i(t)$ 都跟踪全体输入的瞬时平均 $\bar r(t)=\tfrac1N\sum_i r_i(t)$。动态共识的关键修正是——不让状态直接跟踪本地输入，而是让状态的“相对邻居的偏差”由共识消除，同时用输入的导数 $\dot r_i$ 做前馈。一个经典的连续动态共识协议（基于“内部模型 + 积分”）是：
+\begin{equation}
+  \dot x_i=\dot r_i-\sum_{j\in\mathcal{N}_i}a_{ij}\big[(x_i-r_i)-(x_j-r_j)\big]-\sum_{j\in\mathcal{N}_i}a_{ij}(p_i-p_j),\qquad \dot p_i=\sum_{j\in\mathcal{N}_i}a_{ij}(x_i-x_j),
+  \label{eq:cs-dyn-cont}
+\end{equation}
+其中 $p_i$ 是辅助的\textbf{积分状态}。拆开看每一项（一次多视角理解）：
+\begin{itemize}
+  \item \textbf{前馈项 $\dot r_i$}：直接把本地输入的变化率喂进来。若所有输入同步地以速率 $\dot r$ 变化，平均值也以 $\dot r$ 变化，这一项让估计“预判”地跟上——它对应经典控制里的“前馈补偿”，是消除稳态滞后的关键。
+  \item \textbf{比例共识项 $-\sum a_{ij}[(x_i-r_i)-(x_j-r_j)]$}：让“估计减去本地输入”这个量（本地估计偏差）在邻居间达成一致——正是共识协议作用在偏差变量上。
+  \item \textbf{积分项 $p_i$}：消除常值扰动/初值误差带来的稳态偏差（类似 PID 里的积分项）。没有它，估计会有一个不随时间消失的固定偏移。
+\end{itemize}
+可证（用类似模态分析 + 内部模型原理）：在无向连通图下，只要输入变化不太剧烈（导数有界），\cref{eq:cs-dyn-cont} 的估计 $x_i(t)$ \textbf{渐近跟踪} $\bar r(t)$。
+
+\begin{insight}[动态共识是跟踪问题，静态共识是镇定问题]\label{ins:cs-dyn-tracking}
+动态共识与静态共识的本质区别，在于“目标是不是在动”。静态共识是\textbf{镇定问题}（把误差打到零就停）；动态共识是\textbf{跟踪问题}（目标在动，估计必须持续运动去跟）。这解释了为什么动态共识非要引入输入导数 $\dot r_i$ 的前馈——它对应控制论里“跟踪时变参考必须有前馈或内部模型”的基本原理（内部模型原理：要无误差跟踪某类信号，控制器内部必须包含该信号的动力学模型）。把静态共识比作“让一群人对一个静止靶心达成共识”，动态共识就是“让一群人持续瞄准一个移动靶”——后者必须预判靶的运动（前馈），只靠反馈会永远滞后一个身位。\textbf{边界提醒}：这个“移动靶”类比在输入变化平缓时贴切，但若输入突变（不可微），$\dot r_i$ 前馈会失效（导数无界）。
+\end{insight}
+
+\subsection{离散动态共识估计器：可落地的形式}
+\label{sec:cs-dyn-disc}
+
+工程实现要离散。一个更简洁、广泛使用的\textbf{离散动态平均共识}估计器：每个 agent 维护估计 $x_i(k)$，每步先做一次共识混合、再注入本地输入的增量：
+\begin{equation}
+  x_i(k{+}1)=\sum_j w_{ij}\,x_j(k)+\big[r_i(k{+}1)-r_i(k)\big],
+  \label{eq:cs-dyn-disc}
+\end{equation}
+其中 $\mathbf{W}=[w_{ij}]$ 仍是\textbf{双随机}共识权重矩阵。拆成两步看：\textbf{共识混合步 $\sum_j w_{ij}x_j(k)$} 和静态离散共识完全一样——把各 agent 的当前估计向邻居平均；\textbf{输入增量注入 $r_i(k{+}1)-r_i(k)$} 是动态共识相对静态的唯一新增项——它是离散版的“导数前馈”。
+
+\begin{theorem}[离散动态共识的无偏跟踪]\label{thm:cs-dyn-conserve}
+若初始化 $x_i(0)=r_i(0)$ 且 $\mathbf{W}$ 双随机，则 \cref{eq:cs-dyn-disc} 满足 $\sum_i x_i(k)=\sum_i r_i(k)$ 对所有 $k$ 成立，即估计平均恒等于输入瞬时平均；各 agent 的估计以 $|\rho_2(\mathbf{W})|$ 的速率收敛到这个共同平均。
+\end{theorem}
+
+\begin{proof}
+两点配合（一次理论-工程桥接）：(1) $\mathbf{W}$ 双随机 $\Rightarrow$ 共识混合步保持估计之和不变（列和为 1，$\mathbf{1}^\top\mathbf{W}=\mathbf{1}^\top$）；(2) 输入增量项让“全体估计之和”每步恰增加 $\sum_i[r_i(k{+}1)-r_i(k)]=\sum_i r_i(k{+}1)-\sum_i r_i(k)$，即估计的总和精确跟随输入总和的变化。对 $\mathbf{1}^\top\mathbf{x}(k{+}1)=\mathbf{1}^\top\mathbf{W}\mathbf{x}(k)+\mathbf{1}^\top[\mathbf{r}(k{+}1)-\mathbf{r}(k)]=\mathbf{1}^\top\mathbf{x}(k)+\mathbf{1}^\top\mathbf{r}(k{+}1)-\mathbf{1}^\top\mathbf{r}(k)$ 归纳，配合初始 $\mathbf{1}^\top\mathbf{x}(0)=\mathbf{1}^\top\mathbf{r}(0)$，即得 $\mathbf{1}^\top\mathbf{x}(k)=\mathbf{1}^\top\mathbf{r}(k)$。而共识混合步让各 agent 估计收敛到这个共同平均（差异以 $|\rho_2(\mathbf{W})|$ 衰减）。
+\end{proof}
+
+只要输入变化的速度比共识收敛速度（$1-|\rho_2(\mathbf{W})|$ 决定）慢，各 agent 的估计就能紧跟瞬时平均。这给出一个\textbf{跟踪速度 vs 共识速度}的权衡：若每步共识把估计间差异乘以 $|\rho_2(\mathbf{W})|$，而输入每步变化 $\delta$，则稳态跟踪误差大致是 $\sum_k|\rho_2|^k\delta\sim\tfrac{\delta}{1-|\rho_2(\mathbf{W})|}$ 量级——\textbf{误差正比于输入变化速度 $\delta$、反比于谱隙 $1-|\rho_2(\mathbf{W})|$}。这立刻告诉你两条提精度的路：减小 $\delta$（对测量先平滑）或增大谱隙（加边/换最优权重让 $|\rho_2|$ 更小）。
+
+\begin{insight}[动态共识 $=$ 静态共识 $+$ 输入增量前馈]\label{ins:cs-dyn-decompose}
+离散动态共识 \cref{eq:cs-dyn-disc} $=$ 静态离散共识（混合步）$+$ 输入增量（前馈步），这个“分解”揭示了它和静态共识是同一个东西的延伸，而非新算法。静态共识是动态共识在“输入不变（$r_i$ 恒定 $\Rightarrow$ 增量为零）”时的特例。理解这点，你就能把 \cref{sec:cs-linear} 的全部谱分析（$\lambda_2$、$|\rho_2(\mathbf{W})|$、双随机、最优权重）\emph{原样迁移}到动态共识。这也是为什么 ADMM 能跨控制周期 warm-start——每个控制周期的 $\mathbf{z}$-更新（平均）正是一次共识，而相邻周期的输入（各 agent 的本地解）变化很小，本质上就是在跑一个慢变输入的动态共识，所以上周期的结果是这周期极好的初值。
+\end{insight}
+
+\subsection{与分布式估计、共识卡尔曼滤波的联系}
+\label{sec:cs-dyn-kalman}
+
+动态共识最重要的应用是\textbf{分布式估计}——多个机器人各持一个带噪声的本地传感器，要协同得到一个比任何单传感器都好的全局一致估计。把动态共识 \cref{eq:cs-dyn-disc} 的输入 $r_i(k)$ 设成 agent $i$ 的本地测量，各 agent 的估计就会收敛到所有测量的平均——而独立噪声的平均会\textbf{以 $1/N$ 的方差缩减}，这正是多传感器融合的核心收益：$N$ 台机器人协同观测，等效测量精度提升 $\sqrt N$ 倍，且无需中央融合中心。
+
+更进一步，把动态共识嵌进卡尔曼滤波框架，就得到\textbf{分布式卡尔曼滤波/共识卡尔曼滤波（consensus Kalman filter）}\cite{olfatisaber2007kalman}：每个机器人跑一个本地卡尔曼滤波器，并在每步用动态共识把各自的状态估计（或信息矩阵/信息向量）向邻居平均、达成一致。这样每台机器人都得到接近“集中式卡尔曼滤波”的估计，却只需邻居通信、无中央节点。
+
+\begin{insight}[共识是“分布式平均原语”]\label{ins:cs-dyn-primitive}
+从动态共识到分布式卡尔曼滤波，体现了共识作为“分布式平均原语”的威力——\textbf{任何“需要把分散在各 agent 的量平均/融合成全局一致结果”的任务，都可以用共识来分布式地实现，无需中央节点}。集中式融合是“所有数据汇到一处算”，共识式融合是“各算各的 + 邻居反复平均达成一致”，两者收敛后给出几乎相同的结果，但后者无单点、可扩展、抗节点失效。理解了这个“共识 $=$ 分布式平均原语”，你看分布式优化（ADMM 的 $\mathbf{z}$-更新）、分布式估计（共识卡尔曼）、分布式学习（联邦平均）会发现它们共享同一个内核。
+\end{insight}
+
+\subsection{动态共识的限制与比例/比例-积分选择}
+\label{sec:cs-dyn-limit}
+
+动态共识不是万能的，它的跟踪能力有明确边界（一次反事实推理：不了解这些边界会怎样）：
+\begin{itemize}
+  \item \textbf{对常值/匀速输入零稳态误差，对加速输入有残差}。带积分项的动态共识能无误差跟踪常值和匀速变化的平均（类比 PID：积分项消除阶跃稳态误差）；但若输入以恒定\textbf{加速度}变化（$\ddot r\ne0$），只有一阶前馈的估计器会有不为零的稳态跟踪误差。要消除需要更高阶的前馈/内部模型——这是“内部模型原理”的直接推论。
+  \item \textbf{输入突变（不可微）时前馈失效}。$\dot r_i$ 前馈依赖输入可微；若 $r_i$ 突跳（传感器跳变、目标瞬移），导数无界，前馈给出脉冲式的错误修正。工程上对测量先做平滑/限幅，或用只依赖增量（离散形式 \cref{eq:cs-dyn-disc}）而非导数的实现来缓解。
+  \item \textbf{通信噪声/丢包累积}。离散形式靠“估计之和精确跟随输入之和”保证无偏，但这依赖每步共识精确保持总和（双随机）。若通信有噪声或丢包，双随机性被破坏，误差会\textbf{累积}（因为它是个积分型估计器，没有遗忘机制），长期运行会漂移。
+\end{itemize}
+
+\paragraph{比例型 vs 比例-积分型：两种动态共识的工程选择。}
+两者的差别，恰好是经典控制里 P 控制器与 PI 控制器之争在共识上的翻版（一次对比性思维）：
+\begin{itemize}
+  \item \textbf{比例型（P）动态共识}：最简形式 $\dot x_i=-\sum_j a_{ij}(x_i-x_j)+\gamma(r_i-x_i)$，\textbf{没有积分状态}，结构简单、无累积、对丢包/噪声鲁棒（误差有界、不漂移）。代价：对时变输入有\textbf{稳态跟踪误差}。适合“输入变化平缓、通信不可靠、只需大致跟踪”的场景。
+  \item \textbf{比例-积分型（PI）动态共识}：就是 \cref{eq:cs-dyn-cont}/\cref{eq:cs-dyn-disc} 那一族，\textbf{带积分状态}。对常值/匀速输入\textbf{零稳态误差}，跟踪精度高。代价：积分带来对丢包/噪声的误差累积、长期漂移、对输入突变敏感。适合“要高精度跟踪、通信较可靠”的场景。
+\end{itemize}
+它和 PID 选型逻辑完全同构——P 快但有稳态误差、加 I 消除稳态误差但引入累积与超调风险。你在单机控制里建立的 P/PI 直觉可\emph{原样迁移}来判断动态共识选型。
+
+\paragraph{接到共识卡尔曼（信息形式）。}
+最干净的共识卡尔曼实现用\textbf{信息形式（information form）}：卡尔曼滤波的测量更新在信息空间里是\textbf{加法}——融合 $N$ 个传感器，就是把各自的信息向量 $\boldsymbol{\iota}_i=\mathbf{H}_i^\top\mathbf{R}_i^{-1}\mathbf{z}_i$ 和信息矩阵 $\boldsymbol{\Omega}_i=\mathbf{H}_i^\top\mathbf{R}_i^{-1}\mathbf{H}_i$ \textbf{相加}。而“求和”正是共识能分布式算的东西（平均后乘 $N$ 即得和）。于是共识卡尔曼的做法是：每台机器人本地算出自己的 $(\boldsymbol{\iota}_i,\boldsymbol{\Omega}_i)$，用动态共识对它们求平均达成一致，各机器人就都得到了“等效于汇总所有测量”的融合信息，再转回状态空间。\textbf{信息形式把“融合多传感器”变成了“求和/求平均”，而求平均恰是共识的本行}。
+
+\subsection{代码验证：动态共识跟踪移动目标的平均}
+\label{sec:cs-dyn-code}
+
+验证离散动态共识 \cref{eq:cs-dyn-disc}：让 $N$ 个 agent 的输入是同一个移动目标的带噪测量，看各 agent 的估计能否实时跟踪输入的瞬时平均，并对比“静态共识（不注入输入增量）”的滞后。
+
+\begin{codebox}[Python]{动态共识:注入输入增量实时跟踪移动平均、各 agent 一致}
+import numpy as np
+
+def metropolis_weights(N, edges):
+    A = np.zeros((N, N))
+    for i, j in edges:
+        A[i, j] = 1.0; A[j, i] = 1.0
+    deg = A.sum(1); W = np.zeros((N, N))
+    for i, j in edges:
+        w = 1.0 / (1.0 + max(deg[i], deg[j])); W[i, j] = w; W[j, i] = w
+    for i in range(N):
+        W[i, i] = 1.0 - W[i].sum()
+    return W
+
+N = 6
+edges = [(i, (i + 1) % N) for i in range(N)]          # 环 C6
+W = metropolis_weights(N, edges)
+rng = np.random.default_rng(0)
+bias = rng.normal(scale=0.5, size=N)                  # 各 agent 固定测量偏置
+def measurements(k):
+    m = 2.0 * np.sin(0.02 * k)                         # 移动目标真值（平缓变化）
+    return m + bias + rng.normal(scale=0.1, size=N), m
+
+r_prev, _ = measurements(0)
+x_dyn = r_prev.copy()                                  # 关键:初始化 x_i(0)=r_i(0)
+x_sta = r_prev.copy()
+err_dyn, err_sta = [], []
+for k in range(1, 400):
+    r_now, m = measurements(k)
+    x_dyn = W @ x_dyn + (r_now - r_prev)               # 动态共识（式 cs-dyn-disc）
+    x_sta = W @ x_sta + 0.3 * (r_now - x_sta)          # 朴素对照（拉向当前测量）
+    r_prev = r_now
+    avg_now = r_now.mean()
+    err_dyn.append(np.abs(x_dyn - avg_now).mean())
+    err_sta.append(np.abs(x_sta - avg_now).mean())
+print(f"动态共识 稳态误差(后100步)= {np.mean(err_dyn[-100:]):.4f}")
+print(f"朴素对照 稳态误差(后100步)= {np.mean(err_sta[-100:]):.4f}")
+print(f"动态共识 各 agent 末步一致性 std = {x_dyn.std():.4f}")
+\end{codebox}
+
+\noindent 运行要点：动态共识（注入输入增量）的稳态跟踪误差远小于朴素对照——它实时跟住了移动目标的瞬时平均，且各 agent 估计彼此一致；朴素做法（每步轻微拉向本地测量）既滞后于移动平均、又被各自的固定偏置拉偏。把目标移动速度调大，会看到动态共识的跟踪误差也增大——印证“跟踪速度受共识速度 $|\rho_2(\mathbf{W})|$ 限制”。
+
+\begin{pitfall}[陷阱：忘记初始化 $x_i(0)=r_i(0)$ 或漏注入增量；误以为静态共识喂时变输入能跟踪；忽视积分型漂移]
+其一，把估计初始化为零而非 $r_i(0)$，或只做共识混合 $\mathbf{x}=\mathbf{W}\mathbf{x}$、忘了加输入增量。漏初始化 $\Rightarrow$ “估计之和 $=$ 输入之和”这个不变量从一开始就不成立，估计平均永远偏离真平均一个常数；漏注入增量 $\Rightarrow$ 退回静态共识，估计收敛到某固定值后就不动了，跟不上移动平均。\textbf{正确做法}：严格初始化 $x_i(0)=r_i(0)$，每步先共识混合再加输入增量；自检：任意步打印“全体估计之和”与“全体输入之和”应始终相等。其二，把静态共识 $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$ 的固定初值换成时变 $r_i(t)$ 就以为能跟踪，稳态被各 agent 本地输入拉偏（这与度归一化破坏双随机是同一类病根）。\textbf{正确做法}：用真正的动态共识（注入输入导数/增量做前馈 + 积分项消稳态误差）。其三，把动态共识当成“无偏且永远准”的黑箱长期运行而不加鲁棒化，丢包/噪声破坏双随机守恒后误差会被永久“积分”进去而漂移。\textbf{正确做法}：加遗忘因子、周期性重置、或改用纯比例型；并监控“全体估计之和 vs 输入之和”作漂移报警。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 实现离散动态共识 \cref{eq:cs-dyn-disc}，对 $N=8$ 环图，输入设为各 agent 测同一个匀速移动目标。验证：(a) 各 agent 估计收敛到一致并跟踪瞬时平均；(b) 任意步“全体估计之和 $=$ 全体输入之和”；(c) 把目标速度逐步加大，记录稳态跟踪误差如何随 $v/(1-|\rho_2(\mathbf{W})|)$ 增长。
+  \item \textbf{[推导]} 证明 \cref{thm:cs-dyn-conserve}：若 $x_i(0)=r_i(0)$ 且 $\mathbf{W}$ 双随机，则 \cref{eq:cs-dyn-disc} 满足 $\sum_i x_i(k)=\sum_i r_i(k)$ 对所有 $k$ 成立。再说明若漏掉初始化或某步丢包破坏双随机，这个守恒如何被打破。
+  \item \textbf{[设计/思考]} 设计一个\textbf{分布式协同目标跟踪}方案：$N$ 台机器人各用本地传感器测一个移动目标的位置（带独立噪声），用动态共识让每台都得到融合后的全局一致估计。说明：(a) 为什么融合后精度更高（噪声方差如何随 $N$ 缩减）；(b) 这相比“发给中央节点融合”的优劣；(c) 若某台传感器突然失效，方案会怎样、如何鲁棒化。
+  \item \textbf{[实现/分析]} 对比动态共识两种形式：带积分项的 \cref{eq:cs-dyn-cont} 离散化、纯比例型（去掉积分 $p_i$）。对匀速和匀加速移动目标分别测试，验证带积分型对匀速输入零稳态误差、对匀加速有残差；纯比例型对匀速也有稳态误差但对丢包更鲁棒。
+  \item \textbf{[实现/综合]} 把动态共识接到 ADMM 上：实现一个分布式 MPC 的玩具循环，每个控制周期 $\mathbf{z}$-更新用动态共识（而非中央求平均）分布式地算各 agent 本地解的平均，且用上周期共识状态 warm-start 本周期。验证：因相邻周期本地解变化小（慢变输入），动态共识每周期只需很少几步就能跟上，整个分布式 MPC 无需中央节点也能实时协调。
+\end{enumerate}
+\end{practice}
+
+\noindent 至此本章理论工具彻底齐备。这五节看似各讲一块，实则是同一套“图上协调”思想的不同切面。\cref{sec:cs-integration} 把它们\textbf{拼到一个任务上}，看清它们如何咬合协作。
+
+% ════════════════════════════════════════════════════════════════
+\section{综合实战：分布式协同围捕}
+\label{sec:cs-integration}
+
+\paragraph{任务设定：把五件工具放进同一个场景。}
+设想 $N=4$ 台移动机器人要\textbf{协同围捕}一个在平面上移动的目标。这个任务自然分解成四个子问题，每个恰好对应本章的一节工具：
+
+\begin{table}[H]\centering\small
+\caption{协同围捕的四层分解：每层对应一件分布式工具}
+\label{tab:cs-pursuit-decomp}
+\begin{tabular}{p{2.6cm}p{6.2cm}p{3.2cm}}
+\toprule
+子问题 & 这一环要做什么 & 用本章哪节工具 \\
+\midrule
+(1) 协同感知目标在哪 & 每台机器人只能带噪声地局部观测目标，要融合出一个全队一致的目标位置估计 & \cref{sec:cs-dynamic} 动态共识 \\
+(2) 就“何时合拢”达成一致 & 各机器人要对一个共同标量（合拢时刻、围捕半径）达成共识 & \cref{sec:cs-linear} 共识（必要时有限时间共识） \\
+(3) 保持围捕队形 & 机器人以目标为中心，均匀分布成一个包围圈（正多边形） & \cref{sec:cs-formation} 编队（displacement + 时变队形） \\
+(4) 协调各自轨迹 & 每台机器人解自己的轨迹优化（避碰、省力），但要满足“合拢到包围圈”的耦合约束 & \cref{sec:cs-admm} ADMM 分布式优化 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 而 \cref{sec:cs-delay}（时延/切换）是贯穿所有环节的\textbf{现实约束}：四个子问题里的每一次通信都有延迟、机器人移动导致拓扑切换，所以每一环都要用 \cref{sec:cs-delay} 的结论保证鲁棒（延迟 $<\tau^\star$、联合连通）。
+
+\paragraph{数据流：五件工具如何交接。}
+这四层构成一条\textbf{自下而上的信息流水线}——感知层先把“世界状态”（目标在哪）从含噪局部观测中提炼出来，决策层据此定下“做什么”（围捕参数），队形层把决策翻译成“每台机器人该在哪”（期望位置），轨迹层再把期望位置变成“怎么动到那”（可执行轨迹）。这种“感知$\to$决策$\to$规划$\to$控制”的分层正是机器人系统的经典架构，而本章的贡献是给每一层都配上了\textbf{分布式、只靠邻居通信}的实现：
+\begin{enumerate}
+  \item \textbf{感知层（\cref{sec:cs-dynamic}）}：各机器人跑\textbf{动态共识}，实时融合出一个全队一致的目标位置估计 $\hat{\mathbf{q}}(t)\approx\tfrac1N\sum_i\mathbf{r}_i(t)$。这一步把“$N$ 个含噪局部观测”变成“$1$ 个高精度一致估计”，噪声方差缩减 $1/N$，无中央融合节点。
+  \item \textbf{决策层（\cref{sec:cs-linear}）}：基于一致的目标估计 $\hat{\mathbf{q}}$，各机器人对“围捕参数”达成共识——比如包围圈半径 $R$（标准平均共识）；若任务要求“所有机器人在同一精确时刻合拢”，则用\textbf{有限时间共识}保证卡点同步。
+  \item \textbf{队形层（\cref{sec:cs-formation}）}：期望围捕队形是以 $\hat{\mathbf{q}}$ 为中心、半径 $R$ 的正 $N$ 边形顶点。因为目标在动，期望队形是\textbf{时变}的：$\mathbf{p}_i^\star(t)=\hat{\mathbf{q}}(t)+R\,[\cos\theta_i,\sin\theta_i]^\top$，这正是\textbf{编队机动}。各机器人用 displacement-based 控制律维持相对队形，中心 $\hat{\mathbf{q}}(t)$ 的运动由感知层实时提供。
+  \item \textbf{轨迹协调层（\cref{sec:cs-admm}）}：每台机器人解一个本地轨迹优化（平滑、省力、避免与队友相撞地抵达自己的包围圈顶点）。机器人间的避碰是\textbf{耦合约束}，用 \textbf{ADMM} 协调：每个 $\mathbf{x}$-更新是一台机器人的本地轨迹 QP，一致性约束保证“各自轨迹合起来不碰撞、且都收敛到包围圈”。
+\end{enumerate}
+
+\begin{insight}[五件工具的协作分工，全部建立在同一张图的谱上]\label{ins:cs-pipeline}
+这条流水线揭示了本章五件工具的\textbf{协作分工}——它们不是五个孤立算法，而是一个分布式协调系统的五个层次：\textbf{动态共识管“感知融合” $\to$ 共识管“参数协商” $\to$ 编队管“几何队形” $\to$ ADMM 管“轨迹协调”，而时延理论是贯穿全程的鲁棒性保证}。更深一层：这五层全都建立在\textbf{同一张通信图 $\mathcal{G}$ 和它的谱}之上——感知融合的速度、共识的速度、编队的收敛、ADMM 的协调，全由这张图的 $\lambda_2$、$\lambda_N$、$|\rho_2(\mathbf{W})|$ 支配。所以“设计一张好的通信拓扑”（够大的 $\lambda_2$、不过大的 $\lambda_N$）是整个系统所有层次共同的地基——这就是为什么本章反复强调谱：它是所有分布式协调的公共 DNA。
+\end{insight}
+
+\paragraph{反面：如果不分层、用一个集中式大优化会怎样。}
+为什么要这样分层，而不是把整个围捕任务写成一个集中式大优化（一次反事实推理）？
+\begin{itemize}
+  \item \textbf{计算爆炸}：集中式大问题的规模随 $N$ 和时域 $T$ 增长，求解成本 $O((NT)^3)$，机器人一多就实时跑不动。分层 + ADMM 把它打散成 $N$ 个本地小问题并行解。
+  \item \textbf{单点故障}：中央节点一挂，整个围捕瘫痪；且所有机器人都要把数据发给中央，通信是星形瓶颈。分布式方案只需邻居通信，任一节点失效系统仍能降级运行。
+  \item \textbf{感知与决策耦合死}：集中式里目标估计、队形、轨迹是一个耦合大问题，改任何一环都要重解全局；分层后各层接口清晰，可独立替换升级。
+\end{itemize}
+还有一个常被忽视的好处——\textbf{优雅降级（graceful degradation）}。集中式系统是“全有或全无”：中央节点或其与某机器人的链路一断，要么整个任务瘫痪，要么那台机器人彻底失联。分层分布式系统则能逐级降级：某台机器人传感器失效，感知层（动态共识）的其余机器人仍能融合出目标估计（只是精度从 $1/\sqrt N$ 略降到 $1/\sqrt{N-1}$）；某条通信链路断开，只要图仍联合连通，各层照常工作，只是收敛慢一点。这种“局部失效只导致局部、可预测的性能下降，而非系统崩溃”的特性，是分布式方案在真实、不可靠环境里最被看重的工程价值。
+
+\subsection{代码验证：四层串联的协同围捕骨架}
+\label{sec:cs-pursuit-code}
+
+把四层串成一个最小可跑的骨架：动态共识估计移动目标 $\to$ 据估计生成时变包围圈队形 $\to$ displacement 控制律驱动机器人合拢。为聚焦“工具如何交接”，这里把 ADMM 轨迹层简化为直接的编队跟踪，重点展示感知层与队形层的衔接。
+
+\begin{codebox}[Python]{协同围捕骨架:感知（动态共识）+ 队形（时变编队）交接}
+import numpy as np
+
+def metropolis_weights(N, edges):
+    A = np.zeros((N, N))
+    for i, j in edges:
+        A[i, j] = 1.0; A[j, i] = 1.0
+    deg = A.sum(1); W = np.zeros((N, N))
+    for i, j in edges:
+        w = 1.0 / (1.0 + max(deg[i], deg[j])); W[i, j] = w; W[j, i] = w
+    for i in range(N):
+        W[i, i] = 1.0 - W[i].sum()
+    return W
+
+def laplacian_from_edges(N, edges):
+    A = np.zeros((N, N))
+    for i, j in edges:
+        A[i, j] = 1.0; A[j, i] = 1.0
+    return np.diag(A.sum(1)) - A
+
+N = 4
+edges = [(i, (i + 1) % N) for i in range(N)]          # 环形通信
+W = metropolis_weights(N, edges); L = laplacian_from_edges(N, edges)
+R = 1.5                                                # 围捕半径（设已由共识协商）
+theta = np.array([2 * np.pi * i / N for i in range(N)])
+offset = R * np.stack([np.cos(theta), np.sin(theta)], axis=1)  # 圈上标称偏移
+
+rng = np.random.default_rng(2)
+def target_truth(t):
+    return np.array([2.0 * np.cos(0.3 * t), 1.5 * np.sin(0.3 * t)])
+
+robots = rng.normal(scale=1.0, size=(N, 2)) + np.array([3.0, 0.0])
+meas = target_truth(0.0)[None, :] + rng.normal(scale=0.3, size=(N, 2))
+q_hat = meas.copy()                                    # 动态共识估计，init=本地测量
+meas_prev = meas.copy(); dt = 0.05
+for step in range(400):
+    t = step * dt; q_true = target_truth(t)
+    # 感知层（动态共识）:融合含噪测量为一致估计
+    meas = q_true[None, :] + rng.normal(scale=0.3, size=(N, 2))
+    q_hat = W @ q_hat + (meas - meas_prev); meas_prev = meas
+    # 队形层（时变编队）:期望位置 = 估计中心 + 圈上偏移
+    p_star = q_hat + offset
+    # 控制层（displacement）:编队误差共识 + 跟随中心运动
+    u = -L @ (robots - p_star)
+    robots = robots + dt * (u + (p_star - robots) * 1.5)
+
+q_hat_mean = q_hat.mean(0)
+dists = np.linalg.norm(robots - q_hat_mean, axis=1)
+print(f"目标真值末位置 = {target_truth(400 * dt).round(3)}")
+print(f"融合估计(均值) = {q_hat_mean.round(3)}（应接近真值）")
+print(f"各 agent 估计一致性 std = {q_hat.std(0).round(4)}（应~=0）")
+print(f"各机器人到中心距离 = {dists.round(3)}（应都~=R={R}）")
+\end{codebox}
+
+\noindent 运行要点：动态共识把 4 台机器人的含噪测量融合成一个一致、接近真值的目标估计（各机器人估计 std $\approx0$、均值接近真值）；据此生成的时变包围圈队形被 displacement 控制律精确维持（各机器人到目标中心距离都 $\approx R$）；整个过程目标在动、队形随之移动——这就是感知与队形两件工具交接的最小闭环。源稿还补了\textbf{决策层（\cref{sec:cs-linear}）}的半径协商：各机器人据自身情况（电量、距离）有偏好半径 $R_i^{\text{pref}}$，通过平均共识（双随机 $\mathbf{W}=\mathbf{I}-\varepsilon\mathbf{L}$）收敛到一个全队一致的 $R$（偏好的平均），再喂给队形层——四层（感知/决策/队形/轨迹）的接口至此全部打通。
+
+\subsection{本章工具全景图}
+\label{sec:cs-tools-overview}
+
+\begin{table}[H]\centering\small
+\caption{本章工具全景：输入、输出、背后的谱量、在围捕里的角色}
+\label{tab:cs-tools}
+\begin{tabular}{p{2.4cm}p{2.6cm}p{2.6cm}p{2.8cm}p{2.2cm}}
+\toprule
+工具（节） & 输入 & 输出 & 收敛/性能由谁定 & 围捕角色 \\
+\midrule
+静态共识（\cref{sec:cs-linear}） & 各 agent 固定标量 & 一致的平均值 & $\lambda_2$ / $|\rho_2(\mathbf{W})|$ & 协商围捕半径 \\
+有限时间共识 & 各 agent 固定标量 & 有限时间精确一致 & $\alpha$、$\lambda_2$ & 同时合拢同步 \\
+时延/切换（\cref{sec:cs-delay}） & 延迟 $\tau$、切换拓扑 & 稳定性/收敛保证 & $\lambda_N$（$\tau^\star$）、联合连通 & 全程鲁棒约束 \\
+ADMM（\cref{sec:cs-admm}） & 本地优化 + 耦合约束 & 全局协调最优解 & $\rho$、子问题凸性 & 轨迹协调（避碰） \\
+编队（\cref{sec:cs-formation}） & 期望相对队形 & 维持队形控制律 & $\lambda_2$（$=$共识） & 生成围捕队形 \\
+动态共识（\cref{sec:cs-dynamic}） & 各 agent 时变测量 & 实时一致融合估计 & $|\rho_2(\mathbf{W})|$、输入变化率 & 协同感知目标 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 这张表把本章压缩成一句话：\textbf{六件工具，六个不同的输入输出，但收敛快慢全部回到同一张图的谱（$\lambda_2$、$\lambda_N$、$|\rho_2(\mathbf{W})|$）}。这也是为什么要先讲图与谱——它是本章一切的地基。设计多机系统的第一步永远是“设计一张好的通信图”。更进一步，“共识 $=$ 分布式平均原语”的视角还能把本章工具与更广领域连起来（一次多视角理解）：\textbf{联邦学习的参数平均}本质是一次共识、\textbf{分布式 SGD 的梯度同步}是对梯度求共识、\textbf{区块链/分布式数据库的状态一致}也是共识的变体。它们与本章的多机共识共享同一个内核——让分散在各节点的量，只靠节点间通信收敛到一致。
+
+\begin{pitfall}[陷阱：分层忽略时间尺度匹配；以为分布式一定优于集中式；各层用不一致的目标估计]
+其一，把四层各自独立设计，不考虑收敛速度是否匹配。若感知层动态共识收敛慢于目标移动，下游拿到的是过时目标估计，队形追着错误位置跑；若 ADMM 每周期轮数不够就执行，机器人可能相撞。\textbf{根本原因}：分层系统的整体性能由\emph{最慢的那层}和\emph{层间时间尺度的匹配}决定。\textbf{正确做法}：按“感知 $\gg$ 决策 $\ge$ 队形 $\ge$ 轨迹”的时间尺度分离设计——感知层要快到目标移动看起来“准静态”，内层 ADMM 在外层队形的一个周期内跑够轮数收敛。其二，认为“分布式 $=$ 先进”，任何多机任务都该上分层分布式。在 $N$ 很小（2--3 台）、通信可靠、有算力的场景，硬上分布式反而引入不必要的协调迭代、调参负担，比直接集中式更慢更难调。\textbf{正确做法}：按 $N$ 规模、通信可靠性、单点容忍度综合判断；不要为分布式而分布式。其三，队形层用 agent $i$ 自己的目标估计 $\hat{\mathbf{q}}_i$、避碰协调层却用另一台机器人的估计或一个全局平均，各层引用的“目标在哪”不一致，机器人朝不同“圈心”合拢。\textbf{正确做法}：约定同一台机器人的所有层都用它\emph{自己}的、当前最新的目标估计 $\hat{\mathbf{q}}_i$（保证单机内部一致），并确保动态共识已基本收敛再驱动下游。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现/综合]} 扩展围捕骨架：把控制层换成真正的 ADMM——每台机器人解一个本地轨迹 QP，相邻机器人间加避碰一致性约束。验证：(a) 动态共识融合的目标估计驱动时变包围圈；(b) ADMM 协调出的轨迹既合拢成圈又互不碰撞；(c) 全程无中央节点。
+  \item \textbf{[设计/分析]} 为围捕任务设计通信拓扑：$N=6$ 台机器人，兼顾感知融合够快（动态共识跟得上目标移动）、对延迟鲁棒（$\tau^\star$ 够大）。比较环、完全图、两个备选稀疏图的 $\lambda_2$ 与 $\lambda_N$，论证你的选择。
+  \item \textbf{[实现/分析，时间尺度]} 在骨架里故意制造“时间尺度不匹配”：把目标移动速度调到接近动态共识收敛速度，观察队形如何因“追过时估计”而滞后/散乱。然后减小 $|\rho_2(\mathbf{W})|$（加边或换 Metropolis）让感知层变快，验证队形重新跟稳。
+  \item \textbf{[设计/思考]} 把“协同围捕”改写成“协同搬运”：目标变成被多机抬着的负载，感知层估计的是负载位姿，轨迹协调层的耦合约束从“避碰”变成“各机器人对负载的合力 $=$ 期望 wrench”（sharing 形式 ADMM）。说明哪些层可原样复用、哪些层要改，以及为什么搬运比围捕多了一个“力一致性”约束。
+  \item \textbf{[实现/综合，有限时间]} 给围捕任务加一个“同时合拢”要求：所有机器人必须在同一精确时刻 $T$ 同时到达包围圈。用有限时间共识协调各机器人的“合拢进度变量”，对比用普通线性共识时各机器人到达时刻的错开。讨论有限时间协议的抖振在这个任务里的实际问题（控制量峰值、执行器饱和）。
+  \item \textbf{[实现/容错]} 在骨架里注入两类故障观察\textbf{优雅降级}：(a) 某台机器人传感器中途失效，验证感知层在剔除其测量后其余机器人仍能融合出估计，精度从 $1/\sqrt N$ 略降到 $1/\sqrt{N-1}$；(b) 某条通信链路中途断开，验证只要剩余图仍联合连通系统仍工作。对照“集中式实现”——中央节点失效会怎样。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\addcontentsline{toc}{section}{本章常见误解汇总}
+
+\begin{table}[H]\centering\small
+\caption{共识与分布式优化常见误解辨正}
+\label{tab:cs-misconceptions}
+\begin{tabular}{p{6.0cm}p{8.2cm}}
+\toprule
+常见误解 & 正确理解 \\
+\midrule
+共识总是收敛到初始平均值 & 仅当权重双随机（无向对称是特例）时收敛到平均；有向/leader-follower 一般收敛到由图结构决定的凸组合（如 leader 的值） \\
+离散共识权重“取平均”就行 & 必须双随机（行和 + 列和都为 1）；度归一化只满足行和，平均值不守恒、收敛值被高度数节点拉偏 \\
+$\lambda_2$ 越大离散共识就越快 & 离散收敛率是 $1-\varepsilon\lambda_2$，步长 $\varepsilon<2/\lambda_N$ 受 $\lambda_N$ 限制；真正决定快慢的是比值 $\lambda_2/\lambda_N$ \\
+加密通信（加边）总让协调更好 & 加边增大 $\lambda_2$（更快）但通常也增大 $\lambda_N$，使临界时延 $\tau^\star=\pi/(2\lambda_N)$ 变小（更易因延迟失稳） \\
+临界时延由 $\lambda_2$ 决定 & 由\textbf{最大}特征值 $\lambda_N$ 决定（$\tau^\star=\pi/(2\lambda_N)$）；最快模态对延迟最敏感、最先失稳 \\
+临界时延公式对任何延迟都精确 & 它假设均匀延迟；非均匀延迟用 $\tau_{\max}$ 保守卡，非对称延迟还会像有向图那样拉偏收敛值 \\
+拓扑必须时刻连通共识才收敛 & 切换拓扑只需\textbf{联合连通}（时间窗内并集含生成树），信息可跨时间接力 \\
+ADMM 用了就保证收敛到全局最优 & 仅凸问题保证全局最优；非凸（如含接触约束的 MPC）一般无收敛保证，至多在条件下收敛到 KKT 点 \\
+$\rho$ 越大约束满足越快越好 & $\rho$ 大$\to$对偶残差大、易震荡；$\rho$ 小$\to$原始残差降得慢；需平衡两个残差，常自适应调节 \\
+$\rho$ 会改变 ADMM 的最优解 & 凸问题下任何 $\rho>0$ 收敛到同一最优，$\rho$ 只影响收敛速度（但有限轮数内进度差异巨大） \\
+ADMM 的 x-更新总有闭式解 & 仅无约束二次问题有；含不等式约束时 x-更新是 proximal 算子，要内层 QP 或投影求解 \\
+编队控制是独立于共识的新问题 & 编队控制律本质是共识协议作用在“相对位置误差”上（$\dot{\tilde{\mathbf{p}}}=-\mathbf{L}\tilde{\mathbf{p}}$），收敛性全部继承 \\
+distance-based 编队连通就能锁住队形 & 仅距离约束在旋转/平移/镜像下不变；唯一确定形状需图\textbf{刚性}，普通连通不够 \\
+共识权重应该都是正的 & 最快（SDP 最优）的对称权重里某些可为\textbf{负}；让单步最“合理”未必整体最快，最优是全局谱性质 \\
+线性共识能在有限时间内精确达成一致 & 线性（$\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$）只渐近收敛、永远差一点；要有限时间精确一致须用非光滑分数次幂反馈（$\alpha<1$），代价是抖振 \\
+gossip 异步共识和同步共识没本质区别 & gossip 每步只动一对节点、收敛慢得多，但完全异步、对掉线/拓扑变化极鲁棒；是速度换鲁棒的权衡 \\
+有惯性的编队只要位置反馈就能保持队形 & 双积分器编队缺速度阻尼项必持续振荡；真实机器人编队控制器必含速度协调/阻尼项 \\
+静态共识协议直接喂时变输入就能跟踪 & 跟踪时变平均是跟踪问题，必须注入输入导数/增量做前馈；只把状态拉向本地输入会滞后且被拉偏 \\
+动态共识无偏、可永远准 & 它是积分型估计器，靠“估计之和 $=$ 输入之和”保证无偏；丢包/噪声破坏双随机守恒会让误差累积漂移 \\
+分布式估计必须有中央融合节点 & 动态共识/共识卡尔曼可用纯邻居通信达成与集中式几乎相同的融合估计，无单点、可扩展 \\
+分布式分层方案一定优于集中式 & 分布式的价值在 $N$ 大/通信弱/高鲁棒时才显著；小队伍、好通信、有算力时集中式更简单更优 \\
+分层系统各层可独立设计 & 整体性能受最慢层与层间时间尺度匹配制约；感知须快到目标“准静态”，内层在外层一周期内收敛 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+本章把图论语言“用起来”，建立了分布式多机协调的两大数学引擎。
+
+\textbf{共识（\cref{sec:cs-linear,sec:cs-delay}）}：把“向邻居靠拢”写成 $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$，严格证明了它收敛到初始平均、收敛速率正是 $\lambda_2$（\cref{thm:cs-cont-conv}）。离散情形用双随机权重矩阵 $\mathbf{W}$，收敛率是 $|\rho_2(\mathbf{W})|$（\cref{thm:cs-disc-conv}），步长受 $\lambda_N$ 限制。加入现实因素：通信延迟有临界阈值 $\tau^\star=\pi/(2\lambda_N)$（\cref{thm:cs-critical-delay}，由最大特征值决定，反直觉但深刻）；拓扑切换只要联合连通就不影响收敛（\cref{thm:cs-jointly-conn}）。这里浮现出一对主宰图上一切迭代算法的特征值——$\lambda_2$（管收敛速度）与 $\lambda_N$（管步长与延迟容限）。
+
+\textbf{分布式优化（\cref{sec:cs-admm}）}：ADMM 把“一个大优化”拆成“$N$ 个本地小优化 + 协调变量 + 对偶变量”的三步迭代（\cref{alg:cs-admm}），既避开 $O(N^3)$ 爆炸、又（凸时）保证收敛到全局最优。罚参数 $\rho$ 是权衡“全局一致 vs 局部自主”的旋钮。非凸 MPC 下 ADMM 是“工程有效但无保证”的启发式。
+
+\textbf{编队控制（\cref{sec:cs-formation}）}：三范式（position/displacement/distance-based）对信息的需求递减、队形保证递减；displacement-based 控制律的误差动力学恰好是 $\dot{\tilde{\mathbf{p}}}=-\mathbf{L}\tilde{\mathbf{p}}$（\cref{thm:cs-form-consensus}）——编队就是共识的几何化身。
+
+\textbf{动态共识与分布式估计（\cref{sec:cs-dynamic}）}：把共识从“固定输入收敛到固定平均”推广到“时变输入实时跟踪瞬时平均”。关键是注入输入的导数/增量做前馈，靠双随机保持“估计之和 $=$ 输入之和”实现无偏跟踪（\cref{thm:cs-dyn-conserve}）。它是分布式估计、共识卡尔曼滤波的引擎。
+
+\textbf{综合实战（\cref{sec:cs-integration}）}：用协同围捕任务把五件工具串成“感知$\to$决策$\to$队形$\to$轨迹协调”的分层数据流，时延理论贯穿全程作鲁棒保证。关键工程洞察：分层系统要做\textbf{时间尺度匹配}，且分布式不总优于集中式。
+
+\subsection*{符号表}
+\begin{table}[H]\centering\small
+\caption{本章主要符号}
+\label{tab:cs-symbols}
+\begin{tabular}{ll}
+\toprule
+符号 & 含义 \\
+\midrule
+$\mathcal{G}=(\mathcal{V},\mathcal{E})$，$N$ & 通信图与 agent 数 \\
+$\mathbf{A},\mathbf{D},\mathbf{L}=\mathbf{D}-\mathbf{A}$ & 邻接 / 度 / Laplacian 矩阵 \\
+$\mathcal{N}_i,\ d_{ii}$ & agent $i$ 的邻居集 / 度 \\
+$\mathbf{1}$ & 全 1 向量 \\
+$0=\lambda_1\le\lambda_2\le\dots\le\lambda_N$ & $\mathbf{L}$ 特征值；$\lambda_2$ 代数连通性、$\lambda_N$ 最大特征值 \\
+$\mathbf{W}=[w_{ij}]$ & 离散共识权重（双随机）矩阵 \\
+$|\rho_2(\mathbf{W})|$ & $\mathbf{W}$ 第二大特征值模（离散收敛率） \\
+$\bar x=\tfrac1N\sum_i x_i(0)$ & 初始平均（平均共识的收敛值） \\
+$\boldsymbol{\gamma}$ & 有向图 $\mathbf{L}$ 的左 Perron 特征向量（话语权） \\
+$\tau,\ \tau^\star=\pi/(2\lambda_N)$ & 通信延迟 / 临界时延 \\
+$\sigp(y)^\alpha=\sgn(y)|y|^\alpha$ & 有限时间共识的分数次幂反馈（$0<\alpha<1$） \\
+$\gamma_d$ & 二阶共识/编队的速度阻尼增益 \\
+$f_i,\ \mathbf{x}_i,\ \mathbf{z}$ & 本地代价 / 本地变量 / 协调变量 \\
+$\mathbf{y}_i,\ \mathbf{u}_i=\mathbf{y}_i/\rho$ & 对偶变量 / 缩放对偶变量 \\
+$\rho,\ \mathbf{r}^k,\ \mathbf{s}^k$ & ADMM 罚参数 / 原始残差 / 对偶残差 \\
+$\proxop_{f/\rho}(\mathbf{v})$ & proximal 算子（ADMM 的 $\mathbf{x}$-更新本质） \\
+$\mathbf{p}_i^\star,\ \tilde{\mathbf{p}}_i=\mathbf{p}_i-\mathbf{p}_i^\star$ & 标称队形位置 / 编队误差变量 \\
+$\mathbf{R}_g(\mathbf{p})$ & 刚性矩阵（关联矩阵的几何加权版） \\
+$r_i(t),\ \bar r(t)=\tfrac1N\sum_i r_i(t)$ & 时变输入 / 输入瞬时平均（动态共识跟踪目标） \\
+$\boldsymbol{\iota}_i,\ \boldsymbol{\Omega}_i$ & 信息向量 / 信息矩阵（共识卡尔曼，融合即求和） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{定理速查表}
+\begin{table}[H]\centering\small
+\caption{本章核心定理/结论速查}
+\label{tab:cs-theorems}
+\begin{tabular}{p{3.2cm}p{7.2cm}p{3.0cm}}
+\toprule
+结论 & 内容 & 出处 \\
+\midrule
+连续平均共识 & $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$ 收敛到初始平均，误差 $\le e^{-\lambda_2 t}\|\mathbf{x}(0)-\bar x\mathbf{1}\|$ & \cref{thm:cs-cont-conv} \\
+离散平均共识 & $\mathbf{W}$ 双随机 + 连通，误差以 $|\rho_2(\mathbf{W})|^k$ 衰减 & \cref{thm:cs-disc-conv} \\
+欧拉桥梁 & $\mathbf{W}=\mathbf{I}-\varepsilon\mathbf{L}$ 自动双随机；$0<\varepsilon<2/\lambda_N$ 保稳定 & \cref{eq:cs-euler} \\
+有向图共识 & 含生成树则收敛到 $\boldsymbol{\gamma}$ 加权平均；平衡图退回简单平均 & \cref{eq:cs-directed-avg} \\
+临界时延 & $\tau<\tau^\star=\pi/(2\lambda_N)$ 收敛，由\textbf{最大}特征值定 & \cref{thm:cs-critical-delay} \\
+联合连通性 & 切换拓扑下时间窗内并集连通即收敛，不要求时刻连通 & \cref{thm:cs-jointly-conn} \\
+ADMM 三步 & $\mathbf{x}$-更新（并行）$\to$ $\mathbf{z}$-更新（协调）$\to$ $\mathbf{y}$-更新（对偶） & \cref{alg:cs-admm} \\
+ADMM 收敛 & 凸$\to$全局最优、对偶变量 $=$ 最优乘子；非凸$\to$至多 KKT 点 & \cref{ins:cs-shadow-price} \\
+编队 $=$ 共识 & displacement 误差动力学 $\dot{\tilde{\mathbf{p}}}=-\mathbf{L}\tilde{\mathbf{p}}$，收敛性继承 & \cref{thm:cs-form-consensus} \\
+动态共识无偏 & $x_i(0)=r_i(0)$ + 双随机 $\Rightarrow$ 估计之和恒等于输入之和 & \cref{thm:cs-dyn-conserve} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{知识点总表}
+\begin{table}[H]\centering\small
+\caption{本章知识点与难度}
+\label{tab:cs-knowledge}
+\begin{tabular}{p{4.4cm}p{8.0cm}c}
+\toprule
+知识点 & 核心要点 & 难度 \\
+\midrule
+连续共识与收敛证明 & $\dot{\mathbf{x}}=-\mathbf{L}\mathbf{x}$；模态展开，收敛到初始平均、速率 $\lambda_2$ & $\bigstar\bigstar\bigstar$ \\
+平均值守恒 & $\mathbf{1}^\top\dot{\mathbf{x}}=0$；解释为何收敛到平均 & $\bigstar\bigstar$ \\
+离散共识与双随机 & $\mathbf{x}(k{+}1)=\mathbf{W}\mathbf{x}(k)$；行和$\to$不动点，列和$\to$平均守恒 & $\bigstar\bigstar\bigstar$ \\
+$\lambda_2$ vs $\lambda_N$ & 速度 vs 步长/延迟容限；比值 $\lambda_2/\lambda_N$ 是关键 & $\bigstar\bigstar\bigstar$ \\
+有向图共识 & 收敛到左 Perron 向量 $\boldsymbol{\gamma}$ 加权平均；平衡图退回平均 & $\bigstar\bigstar\bigstar$ \\
+最优权重（FDLA） & 最快共识权重是 SDP；最优权重可为负（反直觉） & $\bigstar\bigstar\bigstar\bigstar$ \\
+有限时间共识 & 分数次幂反馈 $\sigp(\cdot)^\alpha$，$\alpha<1$；有限时间精确一致 & $\bigstar\bigstar\bigstar\bigstar$ \\
+临界时延 & $\tau^\star=\pi/(2\lambda_N)$；频域 + 模态解耦推导 & $\bigstar\bigstar\bigstar$ \\
+联合连通性 & 切换拓扑下时间窗并集连通即收敛 & $\bigstar\bigstar\bigstar$ \\
+非均匀/非对称延迟 & 稳定性用 $\tau_{\max}$ 保守卡；非对称像有向图拉偏收敛值 & $\bigstar\bigstar\bigstar$ \\
+二阶共识 & 双积分器；须速度差（阻尼）项，否则振荡 & $\bigstar\bigstar\bigstar$ \\
+随机 gossip & 异步边平均；速率由 $\bar{\mathbf{W}}$ 第二大特征值定；慢但鲁棒 & $\bigstar\bigstar\bigstar$ \\
+增广拉格朗日 & 拉格朗日 + 二次罚；兼顾精确与可分解 & $\bigstar\bigstar\bigstar\bigstar$ \\
+ADMM 三步迭代 & $\mathbf{x}$-更新（并行）$\to$ $\mathbf{z}$-更新（协调）$\to$ $\mathbf{y}$-更新（对偶） & $\bigstar\bigstar\bigstar\bigstar$ \\
+罚参数 $\rho$ & 平衡原始/对偶残差；自适应调节 & $\bigstar\bigstar\bigstar$ \\
+ADMM 收敛性 & 凸$\to$全局最优；非凸$\to$无保证（至多 KKT） & $\bigstar\bigstar\bigstar\bigstar$ \\
+共识型 ADMM & $\mathbf{z}$-更新分布式（邻居平均/边一致）；warm-start 保实时 & $\bigstar\bigstar\bigstar\bigstar$ \\
+ADMM 家族 & 对偶分解$\to$ADMM$\to$过松弛；consensus vs sharing & $\bigstar\bigstar\bigstar$ \\
+x-更新含约束 & x-更新 $=$ proximal 算子；凸约束用内层 QP、简单集合用投影 & $\bigstar\bigstar\bigstar$ \\
+编队三范式 & position/displacement/distance；信息需求递减 & $\bigstar\bigstar$ \\
+displacement 控制律 & $\dot{\tilde{\mathbf{p}}}=-\mathbf{L}\tilde{\mathbf{p}}$；编队 $=$ 共识作用在误差上 & $\bigstar\bigstar$ \\
+图刚性与刚性矩阵 & 刚性矩阵满秩唯一确定队形；锚定 leader 钉绝对位置 & $\bigstar\bigstar\bigstar$ \\
+二阶编队与机动 & 双积分器编队需阻尼；时变期望队形实现整体机动 & $\bigstar\bigstar\bigstar$ \\
+动态共识估计器 & 共识混合 + 输入增量；靠双随机保“估计之和 $=$ 输入之和” & $\bigstar\bigstar\bigstar$ \\
+分布式估计/共识卡尔曼 & 共识作分布式平均原语；噪声按 $1/N$ 缩减，无中央节点 & $\bigstar\bigstar\bigstar$ \\
+动态共识的限制 & 积分型估计器：零稳态误差但对丢包/突变敏感、会漂移 & $\bigstar\bigstar\bigstar$ \\
+分层数据流与时间尺度匹配 & 感知$\to$决策$\to$队形$\to$轨迹四层；性能受最慢层制约 & $\bigstar\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\begin{itemize}
+  \item \textbf{共识奠基与综述}：Olfati-Saber--Murray\cite{olfatisaber2004consensus}（共识奠基，收敛速率-$\lambda_2$ 与临界时延 $\tau^\star=\pi/(2\lambda_N)$ 都出自这里）；Ren--Beard\cite{renbeard2005consensus}（切换拓扑与联合连通性的源头）；Olfati-Saber--Fax--Murray\cite{olfatisaber2007consensus}（把共识、编队、同步统一的综述）；Jadbabaie 等\cite{jadbabaie2003coordination}（Vicsek 模型的严格收敛分析）；Vicsek 等\cite{vicsek1995novel}（自驱动粒子模型，思想源头）。
+  \item \textbf{最优权重与异步}：Xiao--Boyd\cite{xiaoboyd2004fast}（FDLA 最快共识权重的 SDP，最优权重可为负）；Boyd--Ghosh--Prabhakar--Shah\cite{boyd2006gossip}（随机 gossip 异步共识，平均时间由双随机矩阵第二大特征值定）。
+  \item \textbf{分布式优化}：Boyd 等\cite{boyd2011admm}（ADMM 标准参考，\cref{sec:cs-admm} 全部内容的源头，含大量分布式优化范例与 $\rho$ 调节细节）；Nedi\'c--Ozdaglar\cite{nedic2009distributed}（分布式次梯度法，共识 + 本地梯度）\pz{存疑（措辞为编者回溯，非该文内容）：该文是\emph{确定性凸}次梯度优化，全文无“随机梯度/SGD/联邦/学习”等字样；称其为“分布式 SGD/联邦平均的理论雏形”是后世谱系叙述、合理但非 2009 原文主张，已删此从句以免误读为该文结论。}。
+  \item \textbf{动态共识与分布式估计}：Kia 等\cite{kia2019dynamic}（动态平均共识系统综述，涵盖各类估计器、稳态误差分析）；Olfati-Saber\cite{olfatisaber2007kalman}（共识卡尔曼滤波奠基之一）。
+  \item \textbf{编队控制}：Oh--Park--Ahn\cite{oh2015formation}（编队三范式分类的系统综述）。
+  \item \textbf{教材}：Bullo\cite{bullo2019network}（《Lectures on Network Systems》，共识与分布式控制的最佳入门，免费在线）；Bullo--Cort\'es--Mart\'inez\cite{bullo2009distributed}（《Distributed Control of Robotic Networks》，把共识、覆盖、聚合统一在一个框架下）。
+  \item \textbf{前沿（分布式 MPC 标杆）}：Keviczky--Borrelli 等\cite{keviczky2008decentralized}（分布式 MPC 用于编队的早期标杆）；Zeng--Hamed 等\cite{zeng2026admmcbf}（node-edge splitting 的 consensus ADMM，含 CBF 耦合，两台 Go2 实机）；Zhou 等\cite{zhou2026aclm}（ACLM：共享负载星形耦合 + wrench 一致性 ADMM）。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\addcontentsline{toc}{section}{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{3.2cm}p{6.4cm}p{4.0cm}}
+\toprule
+后续章节 & 关系 & 本章铺垫的知识点 \\
+\midrule
+任务分配与 MAPF & CBBA 用共识/拍卖解决分布式任务分配的冲突裁决 & 共识、双随机 \\
+分布式 MPC 编队 & 单体 MPC 接入 ADMM 协调器；displacement 编队落地；锚定 leader & ADMM 三步、$\rho$、编队 $=$ 共识 \\
+协同搬运与力控 & wrench 一致性正是 ADMM 的 $\mathbf{x}_i=\mathbf{z}$ 在“力”上的具体化 & ADMM、一致性约束、sharing 形式 \\
+异构多机协同感知 & 协同感知用动态共识/共识卡尔曼融合 & 共识、编队三范式、动态共识、分布式估计 \\
+\cref{ch:plan-safemarl} 安全证书与 MARL & 在通信图上叠加 ADMM-CBF 安全层（Zeng--Hamed） & ADMM、CBF 耦合分解、共识 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：共识不收敛/发散。\textbf{原因}：拓扑不连通（$\lambda_2=0$）或离散步长 $\varepsilon\ge2/\lambda_N$。\textbf{对策}：算 $\lambda_2$ 查连通；算 $\max|\mathrm{eig}(\mathbf{W})|$ 应 $<1$；减小 $\varepsilon$。
+  \item \textbf{症状}：共识收敛了但值不对（非平均）。\textbf{原因}：$\mathbf{W}$ 非双随机（常见度归一化只满足行和）。\textbf{对策}：打印 \verb|W.sum(0)|、\verb|W.sum(1)| 都应全 1；改用 Metropolis 权重。
+  \item \textbf{症状}：共识在实机上振荡（仿真却正常）。\textbf{原因}：通信延迟超临界 $\tau^\star=\pi/(2\lambda_N)$。\textbf{对策}：测实际延迟；算 $\tau^\star$；降延迟或用稀疏拓扑（减小 $\lambda_N$）。
+  \item \textbf{症状}：分布式估计稳定但收敛值有系统偏差。\textbf{原因}：链路非对称延迟（$\tau_{ij}\ne\tau_{ji}$），像有向图拉偏平均。\textbf{对策}：检查双向延迟是否对称；时间戳对齐/双向延迟补偿；用 $\tau_{\max}$ 保守卡稳定。
+  \item \textbf{症状}：移动编队偶发协调失败。\textbf{原因}：拓扑瞬时分裂且时间窗内并集也不连通。\textbf{对策}：监控窗口并集 $\lambda_2$；调整通信范围/轮转保证联合连通。
+  \item \textbf{症状}：ADMM 震荡不收敛。\textbf{原因}：$\rho$ 太大（对偶残差主导）或非凸子问题。\textbf{对策}：同时看原始/对偶残差；减小或自适应 $\rho$；确认子问题凸性。
+  \item \textbf{症状}：ADMM 收敛极慢（几百轮）。\textbf{原因}：$\rho$ 太小（原始残差降得慢）。\textbf{对策}：看原始残差是否远大于对偶；增大 $\rho$ 或启用残差平衡。
+  \item \textbf{症状}：ADMM 收敛到错误点。\textbf{原因}：$\mathbf{z}$-更新漏了对偶项 $\mathbf{u}_i$；或分布式平均用了非双随机共识。\textbf{对策}：检查 $\mathbf{z}=\tfrac1N\sum(\mathbf{x}_i+\mathbf{u}_i)$；检查共识权重双随机。
+  \item \textbf{症状}：ADMM 解出的轨迹违反本地约束（超饱和/穿障）。\textbf{原因}：$\mathbf{x}$-更新含不等式约束却用了无约束闭式解。\textbf{对策}：$\mathbf{x}$-更新改用 QP 求解器或投影；检查每步 $\mathbf{x}_i$ 是否在可行集内。
+  \item \textbf{症状}：编队发散/收敛到错误构型。\textbf{原因}：控制律相对量符号写反。\textbf{对策}：验证 $\mathbf{p}=\mathbf{p}^\star$ 时 $\mathbf{u}_i=\mathbf{0}$；用矩阵形式 $\mathbf{u}=-\mathbf{L}(\mathbf{p}-\mathbf{p}^\star)$。
+  \item \textbf{症状}：distance-based 编队形状对但朝向乱。\textbf{原因}：图非刚性，存在旋转/镜像歧义。\textbf{对策}：检查图刚性；加边或锚定节点消除歧义。
+  \item \textbf{症状}：有惯性的编队持续振荡不收敛。\textbf{原因}：二阶编队律缺速度阻尼项（$\gamma_d=0$）。\textbf{对策}：加入速度差耦合 $\gamma_d(\dot{\mathbf{p}}_i-\dot{\mathbf{p}}_j)$；调 $\gamma_d$ 到临界阻尼附近。
+  \item \textbf{症状}：动态共识跟踪移动目标持续滞后。\textbf{原因}：漏注入输入增量（退回静态共识），或目标动得快过共识收敛。\textbf{对策}：确认每步加了 $r_i(k{+}1)-r_i(k)$；减小 $|\rho_2(\mathbf{W})|$；评估目标速度 vs 共识速度。
+  \item \textbf{症状}：动态共识估计长期缓慢漂移。\textbf{原因}：积分型估计器 + 丢包/噪声破坏双随机守恒，误差累积。\textbf{对策}：监控“全体估计之和 vs 输入之和”偏离；加遗忘因子/周期重置；改纯比例型换鲁棒。
+  \item \textbf{症状}：分布式估计收敛到有偏值（非真平均）。\textbf{原因}：忘记初始化 $x_i(0)=r_i(0)$；或共识权重非双随机。\textbf{对策}：检查初始化；打印 $\mathbf{W}$ 行和列和应全 1；改用 Metropolis 权重。
+  \item \textbf{症状}：多机“同时触发”动作时序错开。\textbf{原因}：用线性共识（只渐近），预定时刻仍残留不一致。\textbf{对策}：改用有限时间共识（$\alpha<1$）；或按 $e^{-\lambda_2 T}<\epsilon$ 留够裕量。
+  \item \textbf{症状}：分层围捕系统队形追不上目标。\textbf{原因}：感知层（动态共识）收敛慢于目标移动，下游用过时估计。\textbf{对策}：加快感知层（减小 $|\rho_2(\mathbf{W})|$）；对测量平滑降变化率；检查时间尺度分离。
+\end{enumerate}

@@ -1,0 +1,1375 @@
+\chapter{奖励、课程与终止设计}\label{ch:rlmc-reward}
+
+% ════════════════════════════════════════════════════════════════
+%  「强化学习运动控制」(P8_rl_motion_control) 第二章（实践章）。
+%  主线：算法/原理领路 —— 先讲「奖励在 MDP 里扮演什么角色、势函数塑形为何安全、
+%  优势/GAE 如何被 termination 语义左右」，再落到三大框架
+%  (mjlab / Isaac Lab / UniLab) 的对比接线。理论引导，实践兑现。
+%  源稿 RL运控/Ch06_奖励课程与终止设计.md（实践偏重，仅含 mjlab+Isaac Lab）
+%  已按本主线重构；UniLab 槽位已据实装框架（commit 99936e08）源码+实跑回填，
+%  把每个概念从「mjlab+Isaac Lab 两框架」补成真正的三框架对比。
+%  关键 API/类名/论文归属/数值经 WebSearch/WebFetch 对 Isaac Lab、mjlab
+%  官方源码与论文核对（见各 \rebuilt / \pz 标注与本章末 claimsToVerify）。
+% ════════════════════════════════════════════════════════════════
+
+上一章（见 \cref{ch:rlmc-obsact}）把观测与动作接口立了起来——它写下了策略\emph{能看见什么}、\emph{能改变什么}。但接口本身不产生学习信号：策略真正优化的目标是\textbf{奖励}（reward），真正经历的任务难度是\textbf{课程}（curriculum），真正理解的回合边界是\textbf{终止}（termination）。这三者共同决定了 PPO 的梯度\emph{从哪里来、指向哪里}。若奖励设计错误，PPO 会高效且稳定地学到错误行为；若课程过于激进，策略会在太难的分布上早期崩溃；若终止语义不清，价值函数的自举（bootstrap）会把"时间到了"当成"失败了"。
+
+本章沿用全书「算法领路、实践兑现」的次序：先从马尔可夫决策过程里奖励的角色出发，讲清\emph{势函数塑形定理}（potential-based shaping）给出的"安全塑形"边界，以及它为何在工程中几乎总被突破；再把腿足速度跟踪的奖励拆成\textbf{四层}（tracking / regularization / style / contact），逐层给出原理、配置与代码；接着从优势估计（GAE）出发讲清\textbf{终止 vs 截断}如何左右价值自举，从训练数据分布出发讲清\textbf{课程的三条轴}。每一个概念之下，都横向排布\textbf{三大框架的对比实战}：mjlab、Isaac Lab、UniLab。读者应已掌握强化学习理论部的基础（MDP、贝尔曼方程、策略梯度、演员-评论家、GAE/PPO），本章\emph{不重教}这些，只做面向运控的扩展与动手。
+
+\begin{practice}[前置自测：答不出 $\ge 3$ 题，建议先回前置章节复习]
+\begin{enumerate}
+  \item 一个奖励项（reward term）返回的张量形状应是什么？为何必须是 \verb|[num_envs]| 而非标量？（不确定 $\to$ 回 \cref{ch:rlmc-obsact} 观测项铁律）
+  \item 标了"时间到"（time-out）的回合结束与普通终止有何区别？对评论家的价值自举有何影响？（不确定 $\to$ 回顾 \cref{ch:rl-ac} 与 GAE）
+  \item 为何不能只看总奖励曲线判断训练是否成功？还需同时看哪些分项指标？
+  \item 课程学习应改变\emph{任务难度}还是\emph{物理规律}？它与域随机化的根本区别是什么？
+  \item 给定指数核 $r=\exp(-e^2/\sigma^2)$，当误差 $e\to\infty$ 时 $r$ 趋向何值？这与直接用负二次 $r=-e^2$ 有何本质区别？
+  \item 上一章定下的观测/动作接口与本章奖励之间，有哪些约束关系？（不确定 $\to$ 回 \cref{sec:rlmc-deployable} 可部署性原则）
+  \item 改变 \verb|decimation| 后奖励权重需要重新调吗？为什么？
+\end{enumerate}
+\end{practice}
+
+\textbf{本章目标}：学完本章，你应当能够：(1) 用势函数塑形定理\emph{判断}一个新增奖励项是否会改变最优策略，并解释为何工程中多用非势函数项；(2) \emph{配置}四足速度跟踪的四层奖励（在 mjlab、Isaac Lab、UniLab 三框架中各写一遍），让 tracking 主导梯度；(3) \emph{调通}指数核 $\sigma$ 与 reward 课程，使训练全程都有可用梯度；(4) 正确\emph{标记} \verb|time_out|，保证 PPO 评论家的自举逻辑不把截断当失败；(5) \emph{实施}一次受控变量的奖励消融（ablation），用 return + 分项 + 行为视频联合判定某项的必要性；(6) 在 TensorBoard 中\emph{定位} reward hacking 与课程切换导致的非平稳崩溃。
+
+\begin{note}[阅读时间与导航]
+精读全章约需 $150$ 分钟；只求"能配通一套奖励并跑起训练"，可速读 \cref{sec:rlmc-rew-layers,sec:rlmc-rew-track,sec:rlmc-rew-term}（约 $50$ 分钟）；查阅式使用则直接跳到本章末的\nameref{sec:rlmc-rew-trouble}与\nameref{sec:rlmc-rew-summary}的速查表。本章在全书中的位置：它是「强化学习运动控制」部的\textbf{第二道接口层}——\cref{ch:rlmc-obsact} 定义了状态空间与动作空间的\emph{结构}，本章定义了价值函数的\emph{形状}，后续的策略优化章则在这个形状上做 PPO 优化。三者构成运控 RL 的核心三角，改变任何一个，训练结果都可能完全不同。
+\end{note}
+
+\begin{note}[环境配置与三框架版本兼容]
+本章代码在三大框架间对比。各框架的安装与版本基线（与 \cref{ch:rlmc-obsact} 一致，此处只列与本章 reward/termination/curriculum API 相关者）：
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lLLL@{}}
+\toprule
+框架 & 物理后端 & 配置范式 & 本章相关入口 \\
+\midrule
+Isaac Lab & Isaac Sim (PhysX) & \verb|@configclass| 类属性 & \verb|RewardsCfg|/\allowbreak\Verb[breaklines]|TerminationsCfg|/\allowbreak\verb|CurriculumCfg| \\
+mjlab & MuJoCo-Warp & dict / dataclass & \verb|RewardManager|（\verb|scale_by_dt|） \\
+UniLab & MuJoCoUni / MotrixSim（CPU） & Hydra dataclass + \verb|reward.scales| 字典 & 无 manager 类；\Verb[breaklines]|RewardConfig.scales|/\allowbreak\verb|update_state|/\allowbreak\Verb[breaklines]|PenaltyCurriculum| \\
+\bottomrule
+\end{tabularx}
+\end{center}
+mjlab 自述为「Isaac Lab API, powered by MuJoCo-Warp」\,\cite{mjlab2026}，因此两者的 manager 语义高度一致，差异主要在 config 范式（类属性 vs.\ dict）与张量访问路径——这与上一章观测配置的差异完全对应。\textbf{UniLab 走的是第三条路}\,\cite{unilab2026}：它不是 Manager-Based 架构，没有 \verb|RewardManager|/\allowbreak\Verb[breaklines]|TerminationManager|/\allowbreak\Verb[breaklines]|CurriculumManager| 这套类——奖励是一张 \verb|reward.scales| 标量字典加 env 内的派发表，终止直接在 \verb|update_state| 里算，课程用独立的 \Verb[breaklines]|PenaltyCurriculum|/\allowbreak\Verb[breaklines]|TerrainCurriculumCfg|。更根本的差异在运行时：UniLab 是\textbf{异构 CPU 仿真 $+$ GPU 策略}——物理在 CPU 多线程跑（MuJoCoUni 或 MotrixSim），策略学习在 GPU，二者经共享内存 IPC 解耦。这对本章的影响是：reward 函数返回 \verb|np.ndarray| 而非 \verb|torch.Tensor|（在 CPU 算），且按 \verb|ctrl_dt| 缩放而非 \verb|physics_dt|$\times$\verb|decimation|。所有具体版本号见本章末\nameref{sec:rlmc-rew-version}。
+\end{note}
+
+\begin{codebox}[bash]{Quick Start:5 分钟最小可跑（验证 reward 日志字段就位）}
+# -- Isaac Lab:随机策略跑几步，确认 RewardManager 各项有日志 --
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0 --num_envs 64 --max_iterations 2
+# 期望:2 个 iteration 正常结束;TensorBoard 出现 Episode_Reward/* 与 Episode_Termination/*
+
+# -- mjlab:随机策略 play，确认各 reward term 名称/权重被打印 --
+uv run play Mjlab-Velocity-Flat-Unitree-Go1 --agent random --num-envs 4 --viewer viser
+# 期望:控制台列出 reward term（名称、weight）;tracking 项 raw 值约 0.0-0.3（随机行为跟不准）
+
+# -- UniLab:极短训练冒烟，确认 reward 各项有日志（reward/<name>）--
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+  algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+# 期望:3 个 iteration 正常结束;日志出现 reward/tracking_lin_vel、reward/swing_feet_z
+#   等分项（每 4 步写一次）.注意:env 数/迭代数走 Hydra 覆盖（algo.num_envs=...），不是 flag.
+# 吞吐别死记:RTX4080S 实测 64env mujoco 冷启 ~1500 steps/s、热身后 ~3569（CPU 物理强依赖核数/
+#   sim_substeps）;steps/s 随机器/线程差几倍很正常，判据见 §sec:rlmc-rew-smoke「怎么判断 sps 正常」.
+\end{codebox}
+
+\begin{center}
+\begin{forest} navtreeLR
+[{本章：奖励/课程/终止}
+  [{奖励的算法角色\\势函数塑形定理（\S\ref{sec:rlmc-rew-theory}）}]
+  [{四层奖励分解\\track/reg/style/contact（\S\ref{sec:rlmc-rew-layers}）}]
+  [{跟踪奖励\\指数核与 $\sigma$（\S\ref{sec:rlmc-rew-track}）}]
+  [{辅助三层\\reg/style/contact 详解（\S\ref{sec:rlmc-rew-aux}）}]
+  [{时间缩放与日志\\scale\_by\_dt（\S\ref{sec:rlmc-rew-dt}）}]
+  [{终止与价值自举\\term vs trunc（\S\ref{sec:rlmc-rew-term}）}]
+  [{课程学习\\三条轴（\S\ref{sec:rlmc-rew-curr}）}]
+  [{消融方法论\\reward hacking（\S\ref{sec:rlmc-rew-ablation}）}]
+]
+\end{forest}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{算法视角：奖励在 MDP 里的角色与势函数塑形}
+\label{sec:rlmc-rew-theory}
+
+\begin{quote}\small
+\textbf{这一节解决什么问题}：为什么需要奖励塑形（reward shaping）？随意添加奖励项会不会改变最优策略？什么样的塑形是"安全"的？这是后续一切工程配置的理论地基。
+\end{quote}
+
+\subsection{从 MDP 到奖励：语义鸿沟与塑形动机}
+\label{sec:rlmc-rew-gap}
+
+回顾强化学习理论部对马尔可夫决策过程的定义（见 \cref{sec:rl-basic-mdp}）：MDP 是五元组 $(\mathcal S,\mathcal A,P,R,\gamma)$，策略 $\pi(a\mid s)$ 的目标是最大化期望折扣回报
+\begin{equation}
+J(\pi)=\mathbb E_{\pi}\!\left[\sum_{t=0}^{\infty}\gamma^{t} r_t\right].
+\label{eq:rlmc-rew-return}
+\end{equation}
+这个目标式简洁，却藏着运控 RL 的核心难点：\textbf{我们想让机器人学会的行为（"自然地走路"）与我们能直接写下的标量目标之间，存在巨大的语义鸿沟}。"自然地走路"意味着速度跟上命令、动作平滑不抖、姿态保持直立、脚步规律交替、支撑脚不打滑、落脚冲击小——这些子目标彼此耦合甚至冲突，无法用一个简洁标量完美表达。奖励塑形就是弥合这道鸿沟的工程手段：把高层行为期望拆成每步可测的局部信号，再加权组合反馈给优化器。
+
+这与本科控制课的 PID 设计有深层类比：P 项对应跟踪奖励（当前误差越小越好），D 项对应动作变化率惩罚与机体角速度惩罚（变化不要太剧烈），I 项在某种意义上对应课程的长期目标（逐步覆盖更宽的任务分布）。类比并不完美——PID 是固定的三项线性组合，奖励的结构则完全由设计者决定，可以是任意函数的加权和；但二者都在处理同一件事：\textbf{把抽象的行为目标变成可调的控制信号}。
+
+\begin{insight}[奖励塑形不是"打分艺术"，而是"把不可微长时域任务拆成可估优势的局部信号"]\label{ins:rlmc-rew-shaping}
+四足 locomotion 的奖励设计，本质是\emph{帕累托优化的标量化}——把多个互相冲突的行为目标（速度跟踪 vs.\ 动作平滑 vs.\ 姿态稳定 vs.\ 脚步质量）通过加权和压成一个标量。改变权重等价于在帕累托前沿上移动权衡点。设计者的任务不是找"全局最优"（不存在），而是在可接受的权衡空间里找一个"我们能接受的点"。更深一层：奖励的质量直接决定 PPO 的梯度方向——好奖励让梯度指向期望行为，差奖励让梯度指向 reward hacking。这条洞察贯穿全章。
+\end{insight}
+
+\subsection{势函数塑形定理：唯一"安全"的塑形子类}
+\label{sec:rlmc-rew-pbrs}
+
+奖励塑形最大的理论风险是：新增项可能改变 MDP 的最优策略。1999 年 Ng、Harada、Russell 证明了一个充分必要条件\,\cite{ng1999shaping}（"Policy invariance under reward transformations"，ICML'99），给出了"安全塑形"的边界。
+
+\begin{theorem}[势函数塑形的策略不变性，Ng--Harada--Russell 1999]\label{thm:rlmc-rew-pbrs}
+设原始奖励为 $R(s,a,s')$，加入塑形项 $F(s,a,s')$ 得 $R'(s,a,s')=R(s,a,s')+F(s,a,s')$。当且仅当 $F$ 是\textbf{势函数型}（potential-based）的——即存在势函数 $\Phi:\mathcal S\to\mathbb R$ 使得
+\begin{equation}
+F(s,a,s')=\gamma\,\Phi(s')-\Phi(s),
+\label{eq:rlmc-rew-pbrs}
+\end{equation}
+塑形后 MDP 的最优策略集合与原始 MDP\emph{完全相同}。
+\end{theorem}
+
+\begin{derivation}[为什么势函数型是安全的：伸缩求和]
+直觉来自 telescoping（伸缩求和）。在无限时域折扣设置下，势函数型塑形项的累积和为
+\begin{equation}
+\sum_{t=0}^{\infty}\gamma^{t}F_t=\sum_{t=0}^{\infty}\gamma^{t}\big[\gamma\Phi(s_{t+1})-\Phi(s_t)\big]
+=-\Phi(s_0)+\lim_{T\to\infty}\gamma^{T+1}\Phi(s_{T+1}).
+\label{eq:rlmc-rew-telescope}
+\end{equation}
+当 $\gamma<1$ 且 $\Phi$ 有界时，极限项为零，总和等于 $-\Phi(s_0)$——一个\emph{与策略无关}的常数。任何策略在塑形后 MDP 下的总回报，只是原始回报加上同一个常数，不改变策略之间的排序，故最优策略不变。
+\end{derivation}
+
+\begin{insight}[工程现实：几乎所有 locomotion 奖励项都\emph{不是}势函数型的——而这正是我们要的]\label{ins:rlmc-rew-nonpotential}
+\Verb[breaklines]|action_rate_l2| 惩罚 $\lVert a_t-a_{t-1}\rVert^2$，依赖连续两步的动作，写不成 $\gamma\Phi(s')-\Phi(s)$；脚滑（foot slide）惩罚依赖足端速度与接触状态的组合，同样不是势函数型。这意味着我们加的每一个 regularization/style/contact 项都在\emph{改变最优策略}——但这恰是目的：原始"最小化速度跟踪误差"的最优策略，可能是剧烈抖动、关节过度加速的行为；只有引入非势函数塑形，才能把解空间约束到物理上合理的区域。\cref{thm:rlmc-rew-pbrs} 告诉我们"什么不会出错"，但不告诉我们"什么是好奖励"。工程中的关键不是让奖励满足势函数条件（那会极大限制设计空间），而是\textbf{承认非势函数项会改变最优策略，并通过消融实验验证每项的实际效果}（见 \cref{sec:rlmc-rew-ablation}）。
+\end{insight}
+
+反事实推理：若坚持只用势函数型塑形会怎样？我们只能用势函数加速学习（如 $\Phi(s)=-\lVert v_{\text{actual}}-v_{\text{cmd}}\rVert$ 让策略更快靠近命令速度），却无法表达"动作平滑""脚步规律""姿态直立"——这些都不是状态的函数，而是涉及动作或历史的函数。结果是策略找到速度追踪精确、但行为完全不可部署的解。
+
+\subsection{稠密 vs.\ 稀疏奖励：与 GAE 的耦合}
+\label{sec:rlmc-rew-densesparse}
+
+locomotion 的奖励通常是\emph{稠密}的——每步都有非零奖励。但某些任务（如"到达目标点""成功抓取"）的奖励是\emph{稀疏}的——只有成功时才有正奖励。稀疏奖励的麻烦在于：PPO 用广义优势估计（GAE，见 \cref{eq:rlmc-gae}）需要短 rollout 内的奖励信号来估计优势。若 rollout 长度是 $24$ 步、而成功需 $500$ 步，则大部分 rollout 中奖励全为零、优势全为零、策略没有学习信号。解决稀疏奖励的标准手段正是奖励塑形：把最终目标拆成中间步骤的稠密信号。操作类任务的 staged（分阶段门控）奖励是这一思想的系统化体现，详见 \cref{sec:rlmc-rew-staged}。
+
+\begin{pitfall}[本节三个高频认知误区]
+\textbf{误区一·"塑形 = 加项直到行为看起来对"}：这种试错法在简单任务可行，但在 $20$ 项以上的 locomotion 奖励里会导致"改一个权重全盘崩溃"。正确路径是分层设计（\cref{sec:rlmc-rew-layers}）$+$ 消融验证（\cref{sec:rlmc-rew-ablation}）。
+
+\textbf{误区二·"安全的奖励才是好奖励"}：几乎所有有用的项都不是势函数型的——这没关系。\cref{thm:rlmc-rew-pbrs} 的价值是提供一个"理论安全"的参考子类，不是设计约束。
+
+\textbf{误区三·奖励里用了部署不可得的信号}：奖励\emph{可以}使用任意 env 状态（接触力真值、地形精确高度），因为奖励不参与部署；但要在设计时\emph{标注}哪些信号只供奖励、不进 actor 观测，否则后续若把它复用进 actor 就埋下 sim-to-real 隐患（呼应 \cref{sec:rlmc-deployable} 可部署性原则）。
+\end{pitfall}
+
+\begin{practice}[练习·理论基础]
+\begin{enumerate}
+  \item \textbf{[推导]} 由 \cref{eq:rlmc-rew-telescope} 出发，证明 $\gamma<1$ 且 $\Phi$ 有界时势函数型塑形的累积和与策略无关；再说明 $\gamma=1$（无折扣）时该论证在哪一步失效。
+  \item \textbf{[判断]} \Verb[breaklines]|action_rate_l2| 是势函数型的吗？若不是，它改变了最优策略的哪个方面？这种改变在工程上是否是期望的？
+  \item \textbf{[编程]} 用 Python 实现一个势函数型塑形 $\Phi(s)=-\lVert v_{\text{actual}}-v_{\text{cmd}}\rVert$，计算 $F=\gamma\Phi(s')-\Phi(s)$，在一条随机轨迹上验证多步累积和趋向常数 $-\Phi(s_0)$。验收：打印累积和随步数的曲线，末值与 $-\Phi(s_0)$ 之差 $<10^{-3}$。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{四足 Locomotion 的四层奖励分解}
+\label{sec:rlmc-rew-layers}
+
+\begin{quote}\small
+\textbf{这一节解决什么问题}：四足速度跟踪的奖励应怎样分层组织？每层解决什么问题？层与层之间如何冲突、如何平衡？三大框架的代码各放在哪里？
+\end{quote}
+
+\subsection{分层框架：把多目标优化结构化}
+\label{sec:rlmc-rew-fourlayers}
+
+四足 locomotion 不是单目标优化，而是带接触、带机械限制、带风格偏好的\textbf{多目标优化}。四层各管一件事，且彼此冲突：tracking 想让机器人跟命令走；regularization 想让动作温和省力；style 想让姿态步态自然；contact 想让脚合理地与地面交互。奖励塑形的第一原则是\textbf{承认冲突的存在}——不要幻想一个权重能同时修好所有问题。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+层级 & 核心问题 & 典型项 & 权重方向 & 物理意义 \\
+\midrule
+\textbf{Tracking} & 是否完成任务 & 线速度/角速度跟踪 & 正（奖励） & 策略存在的意义 \\
+\textbf{Regularization} & 是否平滑省力 & 动作率、关节限位、能耗、关节加速度 & 负（惩罚） & 排除不可部署的解 \\
+\textbf{Style} & 是否像合理步态 & 直立、目标高度、机体角速度 & 正或负 & 约束解空间到可接受行为 \\
+\textbf{Contact} & 脚是否正确交互 & 腾空时间、滑移、落地力、非法接触 & 正或负 & 约束物理交互的合理性 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[四层分解是社区"事实共识"，不是框架强制的 API]\label{ins:rlmc-rew-consensus}
+这套四层分解\emph{不是} mjlab 或 Isaac Lab 的强制接口，而是从 legged\_gym（Rudin 等\,\cite{rudin2021minutes}）、Walk-These-Ways（Margolis \& Agrawal，CoRL 2022\,\cite{margolis2022walk}）、Extreme Parkour（Cheng 等，ICRA 2024\,\cite{cheng2024parkour}）等多个前沿项目里总结出的\textbf{事实性共识}。它的价值在于提供"组织框架 $+$ 调参入口"，不在于分类的绝对正确。对操作类任务，更合适的分层可能是 reaching/grasping/transporting/placing（见 \cref{sec:rlmc-rew-staged}）。
+\end{insight}
+
+\subsection{四层之间的三组冲突}
+\label{sec:rlmc-rew-conflict}
+
+理解层间冲突是奖励调参的基础。最常见的三组：
+
+\textbf{冲突一·Tracking vs.\ Regularization。} tracking 鼓励大幅关节运动以跟踪高速命令，regularization 的动作率惩罚则压制关节运动的变化率。若 tracking 权重远大于动作率权重，策略会用高频抖动"暴力追踪"速度命令——奖励很高但行为不可部署（电机会过热）。反之若动作率权重过大，策略会选择"不动"以最小化动作变化——tracking 奖励接近零，但惩罚也接近零，总奖励看上去还行。诊断：同时盯 \Verb[breaklines]|Episode_Reward/track_lin_vel| 与 \Verb[breaklines]|Episode_Reward/action_rate_l2|；若 tracking 上升的同时 action\_rate 绝对值也大幅上升，说明策略在用动作代价换 tracking，通常不健康。
+
+\textbf{冲突二·Style vs.\ Tracking。} 站立姿态的 style 奖励（如惩罚机体倾斜）与高速运动时的自然倾斜冲突。四足动物高速奔跑时身体会自然前倾以平衡惯性——若 style 强制竖直，策略在高速命令下无法自然奔跑。解决：用\emph{速度依赖}的 style 参数。Walk-These-Ways\,\cite{margolis2022walk} 即采用这种思路——站立时（命令接近零）用紧 $\sigma$ 的姿态奖励，行走时放宽，奔跑时进一步放宽或关闭，等价于告诉策略"站着要站直，走快可以倾斜"。
+
+\textbf{冲突三·Contact vs.\ 快速学习。} 严格的脚滑与落地力惩罚，会让早期还不会走的策略大量被罚，导致奖励几乎全负——策略学不到"怎样移动才不滑"，甚至学到"完全不动"以避开所有 contact 惩罚。解决：用 reward 课程（\cref{sec:rlmc-rew-curr}），初期宽松（或关闭）contact 惩罚，等策略学会基本步态后逐步收紧。这与人学游泳类似：先不纠正动作细节（否则什么都学不会），能浮起来再优化姿势。
+
+\begin{insight}[本质洞察：调权重就是在帕累托前沿上选点，没有"全对"的配置]\label{ins:rlmc-rew-pareto}
+三组冲突的共同点是：它们都是同一个标量化里互相拉扯的子目标。承认这一点，调参才有方向——你不是在"修 bug"，而是在"移动权衡点"。这也是为什么本章反复强调\emph{分项}观察：只有把总奖励拆回各层，才能看清当前权衡点落在哪。
+\end{insight}
+
+\subsection{三框架的代码组织与配置范式}
+\label{sec:rlmc-rew-codeorg}
+
+奖励代码在三大框架中的分布与配置范式如下。先看文件布局：
+
+\begin{codebox}[text]{三框架 reward 相关文件布局（路径以核对到的官方仓库结构为准）}
+# ============= Isaac Lab =============
+source/isaaclab/isaaclab/envs/mdp/rewards.py                 # 通用 reward 函数
+source/isaaclab_tasks/.../locomotion/velocity/mdp/rewards.py # velocity 任务特定 reward
+source/isaaclab_tasks/.../locomotion/velocity/velocity_env_cfg.py # RewardsCfg 配置
+
+# ============= mjlab =============
+src/mjlab/managers/reward_manager.py        # RewardManager（scale_by_dt）
+src/mjlab/envs/mdp/rewards.py               # 通用 reward 函数
+src/mjlab/tasks/velocity/mdp/rewards.py     # velocity 任务特定 reward
+src/mjlab/tasks/velocity/velocity_env_cfg.py# reward 配置（weights, params）
+
+# ============= UniLab（非 Manager-Based:reward 分散在 env + 共享函数库）=============
+src/unilab/envs/locomotion/common/rewards.py      # 共享 reward 函数（~40 个）+ run_reward_dispatch + RewardContext
+src/unilab/envs/locomotion/common/base.py         # LocomotionBaseEnv:_init_reward_functions / _compute_reward
+src/unilab/envs/locomotion/go2/joystick.py        # 任务 env + robot 特有 reward 方法（_reward_swing_feet_z 等）
+src/unilab/base/curriculum.py                      # PenaltyCurriculum（按 episode 长度缩放负权重）
+conf/ppo/task/go2_joystick_flat/mujoco.yaml       # reward.scales 标量字典 + tracking_sigma（owner YAML）
+\end{codebox}
+
+\begin{note}[关于 mjlab 路径：与 Isaac Lab 镜像，细节以仓库为准]
+mjlab 是「Isaac Lab API, powered by MuJoCo-Warp」\,\cite{mjlab2026}，故 \verb|RewardManager| 等 manager 的语义与 Isaac Lab 一致。上面 mjlab 的文件路径已对照公开仓库核实\,\cite{mjlab2026}：\Verb[breaklines]|src/mjlab/managers/reward_manager.py|、通用函数 \Verb[breaklines]|src/mjlab/envs/mdp/rewards.py|、velocity 任务特定函数 \Verb[breaklines]|src/mjlab/tasks/velocity/mdp/rewards.py| 与配置 \Verb[breaklines]|.../velocity/velocity_env_cfg.py| 均确实存在（目录命名随版本或有微调，以你安装版本为准）。Isaac Lab 的通用 reward 函数确在 \Verb[breaklines]|isaaclab.envs.mdp.rewards|、locomotion 任务特定函数在 \Verb[breaklines]|.../locomotion/velocity/mdp/rewards.py|（已核对\,\cite{isaaclab2024}）。
+\end{note}
+
+Isaac Lab 与 mjlab 的 \verb|RewardManager| 语义一致：初始化时深拷贝配置（运行时课程修改内部副本，不污染原始 dataclass），每步 \verb|compute(dt)| 清零奖励缓冲、逐项调用函数、检查形状为 \verb|[num_envs]|、乘权重与缩放（dt 或 1.0）、用 \Verb[breaklines]|torch.nan_to_num| 清理 NaN/Inf、累加到奖励缓冲与回合累积；reset 时生成 \Verb[breaklines]|Episode_Reward/<term>| 日志。\textbf{UniLab 没有} \verb|RewardManager| \textbf{类}——同样的职责由 \Verb[breaklines]|common/rewards.py| 的 \Verb[breaklines]|run_reward_dispatch| 函数承担：它把 \Verb[breaklines]|scales[name]*fns[name](ctx)| 逐项累加（$r=\sum_i \text{scale}_i\cdot f_i(\text{ctx})$）、跳过 \verb|scale==0| 或派发表里没有的项、每 \Verb[breaklines]|log_every_n_steps=4| 步把 \verb|reward/<name>| 均值写进 \verb|info["log"]|、最后乘 \verb|ctrl_dt| 缩放并兜底 \verb|np.nan_to_num|（NaN 守卫另在 \verb|NpEnv.step| 末尾）。配置范式的差异与上一章观测完全对应——Isaac Lab 用类属性，mjlab 用 dict，UniLab 用标量字典（见 \cref{ins:rlmc-rew-threeparadigm}）：
+
+\begin{codebox}[Python]{Isaac Lab:RewardsCfg（类属性范式，函数名已核对官方源码）}
+# source/isaaclab_tasks/.../locomotion/velocity/velocity_env_cfg.py
+import math
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.utils import configclass
+import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
+
+@configclass
+class RewardsCfg:
+    # Tracking（正权重）—— 指数核，std = sqrt(0.25) 是 legged_gym 沿用值
+    track_lin_vel_xy_exp = RewTerm(
+        func=mdp.track_lin_vel_xy_exp, weight=1.0,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+    )
+    track_ang_vel_z_exp = RewTerm(
+        func=mdp.track_ang_vel_z_exp, weight=0.5,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+    )
+    # Regularization（负权重）
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    dof_acc_l2     = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
+    dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5)
+    # ... 更多项见 §\ref{sec:rlmc-rew-aux}
+\end{codebox}
+
+\begin{codebox}[Python]{mjlab:dict 配置范式（字段名以仓库为准）}
+# src/mjlab/tasks/velocity/velocity_env_cfg.py
+rewards = {
+    "track_linear_velocity": RewardTermCfg(
+        func=track_linear_velocity, weight=2.0, params={"std": 0.5},
+    ),
+    "track_angular_velocity": RewardTermCfg(
+        func=track_angular_velocity, weight=1.0, params={"std": 0.5},
+    ),
+    "action_rate_l2": RewardTermCfg(func=action_rate_l2, weight=-0.01),
+    # ... 更多项
+}
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:reward.scales 标量字典范式（非 RewardTermCfg 类树）}
+# conf/ppo/task/go2_joystick_flat/mujoco.yaml —— reward 是「标量权重字典」，不是 term 类
+reward:
+  scales:                            # 名 -> 权重;env 内 _reward_fns 派发表把名映射到函数
+    tracking_lin_vel: 1.0            # 正权重（tracking 主导）
+    tracking_ang_vel: 0.2
+    lin_vel_z: -5.0                  # 负权重（penalty）
+    action_rate: -0.005
+  tracking_sigma: 0.25               # 指数核 sigma（全局，所有 tracking 共用）
+  base_height_target: 0.3
+# env 侧（envs/locomotion/common/base.py 的 _init_reward_functions）建派发表:
+#   self._reward_fns = {"tracking_lin_vel": rewards.tracking_lin_vel, ...}
+# 每步 _compute_reward 调 run_reward_dispatch(scales=, fns=, ctx=RewardContext(...), ...)
+\end{codebox}
+
+\begin{insight}[三框架的 reward 配置范式：类树 vs.\ dict vs.\ 标量字典 $+$ 派发表]\label{ins:rlmc-rew-threeparadigm}
+同一件事（声明"哪些 reward 项、各多大权重、什么参数"）三框架给了三种范式。\textbf{Isaac Lab}：\verb|@configclass| 类属性，每项是一个 \Verb[breaklines]|RewardTermCfg(func=, weight=, params=)| 对象——结构化、IDE 可补全、但冗长。\textbf{mjlab}：Python \verb|dict|，键是项名、值是 \verb|RewardTermCfg|——比类属性轻，仍是"项即对象"。\textbf{UniLab}：把 \emph{权重} 与 \emph{函数} 彻底拆开——YAML 里只有一张 \verb|scales| 标量字典（纯数值，Hydra 友好），函数在 env 的 \verb|_reward_fns| 派发表里按同名键映射。三者本质相同（每项 $=$ 函数 $\times$ 权重 $\times$ 参数），但 UniLab 的拆分让"调权重"变成纯改 YAML 数字（连函数引用都不碰），代价是项名拼错时不像类属性那样在构建期就报错，只是被 \Verb[breaklines]|run_reward_dispatch| 静默跳过（见后文陷阱）。这条差异贯穿本章所有 UniLab 槽位。
+\end{insight}
+
+\begin{pitfall}[跨框架迁移奖励：别直接抄权重，也别直接抄 $\sigma$]
+注意不同框架的同名项 weight 数值\emph{可能不同}（如 mjlab tracking 给 $2.0$、Isaac Lab 给 $1.0$）。这\emph{不是} bug——不同框架的默认任务配置（机器人型号、decimation、PD 增益）不同，导致最优权重也不同。跨框架迁移奖励时\textbf{不要直接复制权重}，而应按 \cref{sec:rlmc-rew-ablation} 的方法重新调优。\textbf{迁移到 UniLab 还有一个额外坑}：UniLab 的 \Verb[breaklines]|tracking_sigma| 直接当 $\sigma^2$ 用（核里 \Verb[breaklines]|exp(-e/tracking_sigma)|），而 Isaac Lab/mjlab 的 \verb|std| 是 $\sigma$、核里 \Verb[breaklines]|exp(-e/std**2)|——所以 Isaac Lab 的 \verb|std=0.5| 要写成 UniLab 的 \Verb[breaklines]|tracking_sigma=0.25|（详见 \cref{sec:rlmc-rew-trackimpl}）。
+\end{pitfall}
+
+\subsection{完整 velocity 奖励配置一览}
+\label{sec:rlmc-rew-fulltable}
+
+下表列出四足 velocity 任务的一套典型奖励项（以四层归类；具体 weight 取自 mjlab 风格示例，Isaac Lab 等价项名见各项标注）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llrll@{}}
+\toprule
+项（mjlab 风格名） & 层级 & weight & 核心形式 & Isaac Lab 等价 \\
+\midrule
+\Verb[breaklines]|track_linear_velocity| & Tracking & $+2.0$ & $\exp(-e_{\text{lin}}/\sigma^2)$ & \Verb[breaklines]|track_lin_vel_xy_exp| \\
+\Verb[breaklines]|track_angular_velocity| & Tracking & $+1.0$ & $\exp(-e_{\text{ang}}^2/\sigma^2)$ & \Verb[breaklines]|track_ang_vel_z_exp| \\
+\Verb[breaklines]|action_rate_l2| & Reg. & $-0.01$ & $-\lVert a_t-a_{t-1}\rVert^2$ & \Verb[breaklines]|action_rate_l2| \\
+\Verb[breaklines]|dof_acceleration| & Reg. & $-2.5\!\times\!10^{-7}$ & $-\lVert\ddot{\mathbf q}\rVert^2$ & \verb|joint_acc_l2| \\
+\verb|dof_torque| & Reg. & $-1.0\!\times\!10^{-5}$ & $-\lVert\boldsymbol\tau\rVert^2$ & \Verb[breaklines]|joint_torques_l2| \\
+\Verb[breaklines]|dof_pos_limits| & Reg. & $-5.0$ & soft 限位惩罚 & \Verb[breaklines]|joint_pos_limits| \\
+\verb|base_height| & Style & $-10.0$ & $-(h-h_{\text{tgt}})^2$ & \Verb[breaklines]|base_height_l2| \\
+\Verb[breaklines]|flat_orientation| & Style & $-2.0$ & $-(g_x^2+g_y^2)$ & \Verb[breaklines]|flat_orientation_l2| \\
+\Verb[breaklines]|body_lin_vel_z| & Style & $-1.0$ & $-v_z^2$ & \verb|lin_vel_z_l2| \\
+\Verb[breaklines]|body_ang_vel_xy| & Style & $-0.05$ & $-(\omega_x^2+\omega_y^2)$ & \verb|ang_vel_xy_l2| \\
+\verb|air_time| & Contact & $+1.0$ & 每脚每摆动相 bonus & \verb|feet_air_time| \\
+\verb|foot_slip| & Contact & $-0.1$ & $-v_{\text{foot},xy}^2\!\cdot\!\mathbb 1_{\text{contact}}$ & \verb|feet_slide| \\
+\Verb[breaklines]|undesired_contact| & Contact & $-1.0$ & 非法 body 接触 & \Verb[breaklines]|undesired_contacts| \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Isaac Lab 的等价函数名均已对官方源码核对\,\cite{isaaclab2024}：通用项 \Verb[breaklines]|action_rate_l2|/\allowbreak\verb|joint_acc_l2|/\allowbreak\Verb[breaklines]|joint_torques_l2|/\allowbreak\Verb[breaklines]|flat_orientation_l2|/\allowbreak\Verb[breaklines]|base_height_l2|/\allowbreak\Verb[breaklines]|undesired_contacts| 在 \Verb[breaklines]|isaaclab.envs.mdp.rewards|；locomotion 特定项 \Verb[breaklines]|track_lin_vel_xy_exp|/\allowbreak\Verb[breaklines]|track_ang_vel_z_exp|/\allowbreak\verb|feet_air_time|/\allowbreak\verb|feet_slide| 在 locomotion velocity 任务的 \Verb[breaklines]|mdp/rewards.py|。\textbf{注意一处常被源稿写错、且 mjlab 内部函数名与配置键名还不一致的命名}：四足"脚滑"惩罚在 Isaac Lab 里叫 \verb|feet_slide|；在 mjlab 里\emph{函数}叫 \verb|feet_slip|，但实跑确认它在 reward dict / 训练日志里的\emph{键名}是单数 \verb|foot_slip|（同理 \verb|feet_air_time| 函数对应的 dict 键是 \verb|air_time|，另有 \Verb[breaklines]|foot_clearance|/\allowbreak\Verb[breaklines]|foot_swing_height|）——做命令行覆盖（如 \cref{sec:rlmc-rew-ablation} 的消融）时\textbf{要用 dict 键 \texttt{foot\_slip} 而非函数名}，否则 tyro 会报 unrecognized；"非法接触"惩罚在 Isaac Lab 叫 \Verb[breaklines]|undesired_contacts|（复数）。\textbf{再注意 Style 行的 \texttt{base\_height} 是"典型示例"而非 mjlab 实装项}：实跑 grep 确认 mjlab 的 \Verb[breaklines]|envs/mdp/rewards.py| 与 velocity 实际 wiring 里\emph{并无} \verb|base_height| 项（Isaac Lab 侧 \Verb[breaklines]|base_height_l2| 则存在）；mjlab 的 Style 约束实际靠 \verb|upright| 与 \Verb[breaklines]|variable_posture|（pose）这类项实现。把上表当"四层各应有哪类项"的组织框架看即可，落到 mjlab 任务时以你安装版本 \Verb[breaklines]|velocity_env_cfg.py| 里真实 wiring 的项名为准（怎么列出真实项名见 \cref{sec:rlmc-rew-ablation} 的"从零定位 reward 键"）。
+
+\begin{insight}[多视角：一张奖励表有两种读法]\label{ins:rlmc-rew-tworead}
+\textbf{读法一（自上而下，按重要性）}：先看 Tracking 行——这是策略存在的意义；再看 Regularization——这是排除不可部署解的约束；然后 Style——行为质量的调节器；最后 Contact——物理交互的安全网。\textbf{读法二（横向，按符号）}：所有 Regularization 与多数 Contact 项的 weight 都是\emph{负数}（penalty）。这意味着若只看总奖励曲线，你可能看到"奖励在上升"，实则是因为\emph{惩罚在下降}（策略学会"不犯错"），tracking 未必在上升（策略未必在"做对事"）。这正是必须看分项奖励的根本原因——\textbf{只看 total 曲线是 reward hacking 的温床}。
+\end{insight}
+
+\begin{pitfall}[两个最常见的配置错误]
+\textbf{符号错}：奖励用正 weight、惩罚用负 weight。若把 \Verb[breaklines]|action_rate_l2| 的 weight 设成正数，策略会学到"尽量大幅抖动"以最大化它。此 bug 不在代码层报错，只在训练数百 iteration 后以"机器人疯狂抖动"暴露。
+
+\textbf{把 weight 当重要性}：项的"重要性" $=$ \verb|weight| $\times$ \verb|raw_value| 的乘积。若 raw 范围是 $[0,1]$（指数核 tracking），weight $=2.0$ 贡献约 $2.0$；若 raw 范围是 $[0,100]$（未归一化的力矩平方），weight $=0.01$ 贡献也约 $1.0$。比较 weight 前必须先了解 raw 的范围（见 \cref{sec:rlmc-rew-ablation} 的量纲分析）。
+\end{pitfall}
+
+\begin{practice}[练习·四层分解]
+\begin{enumerate}
+  \item \textbf{[手推]} 命令 $v_{\text{cmd}}=(1.0,0.0)$ m/s，实际速度 $v=(0.5,0.2,0.1)$ m/s，$\sigma=0.5$。计算线速度跟踪误差 $e_{\text{lin}}$（含 $v_z^2$）与 mjlab 风格 tracking 奖励，解释 $v_z=0.1$ 对奖励的贡献。
+  \item \textbf{[设计]} 为机械臂抓取任务设计四层奖励：Tracking 对应什么？Regularization 对应什么？Contact 对应什么？是否需要 Style？给出每层至少一项。
+  \item \textbf{[跨框架]} 在 Isaac Lab 与 mjlab 中分别找到"脚滑"惩罚（Isaac Lab \verb|feet_slide| / mjlab \verb|feet_slip|）的实现，列出它们的参数签名差异；再写出 UniLab 等价项的签名——它是 \Verb[breaklines]|fn(ctx)->np.ndarray| 形态（从 \verb|RewardContext| 取量、返回 \verb|[num_envs]| 的 NumPy 数组），权重在 \verb|reward.scales| 而非 \verb|params|。验收：能说清前两框架该函数靠什么判定"接触中"，以及 UniLab 为何把接触判定所需的量放进 \verb|ctx| 而非函数签名。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{\texorpdfstring{跟踪奖励：指数核与 $\sigma$ 的梯度分析}{跟踪奖励：指数核与 sigma 的梯度分析}}
+\label{sec:rlmc-rew-track}
+
+\begin{quote}\small
+\textbf{这一节解决什么问题}：指数核奖励的 $\sigma$ 怎么选？不同 $\sigma$ 对学习有何影响？如何理解指数核在大误差与小误差区域的梯度行为？三框架的实现差异在哪？
+\end{quote}
+
+\subsection{算法原理：为什么用指数核而非负二次}
+\label{sec:rlmc-rew-expkernel}
+
+velocity 任务的主跟踪奖励使用\textbf{指数核}：
+\begin{equation}
+r_{\text{lin}}=\exp\!\left(-\frac{e_{\text{lin}}}{\sigma^2}\right),\qquad
+e_{\text{lin}}=\lVert v_{\text{cmd},xy}-v_{\text{actual},xy}\rVert^2+v_{\text{actual},z}^2,
+\label{eq:rlmc-rew-explin}
+\end{equation}
+其中 $e_{\text{lin}}$ 是速度误差的\emph{平方和}（注意不是欧氏距离，没有取根号），$\sigma^2$ 控制核宽。$\sigma$ 的物理含义：当 $e_{\text{lin}}=\sigma^2$ 时 $r=\exp(-1)\approx0.368$——故 $\sigma$ 大致对应"奖励降到 $1/3$ 时的速度误差幅度"。$\sigma=0.5$（即 $\sigma^2=0.25$）时，误差 $e_{\text{lin}}=0.25$ 对应速度误差约 $0.5$ m/s，此时奖励已降到约 $1/3$。
+
+\begin{insight}[本质：指数核是"大误差不急着追、小误差精调"的梯度整形]\label{ins:rlmc-rew-expgrad}
+反事实推理：若不用指数核而直接用负二次 $r=-e_{\text{lin}}$ 会怎样？在大误差区（如 $e=4$），$r=-4$，梯度 $\partial r/\partial e=-1$ 是\emph{恒定大梯度}，策略会把大部分优化预算花在"减少大误差"上——听起来合理，但此时策略可能还没学会稳定站立，过大的 tracking 梯度会鼓励"用任何手段追速度"，包括不稳定行为。指数核在大误差时梯度\emph{趋于零}（$\partial r/\partial e=-\tfrac{1}{\sigma^2}r\to0$），相当于说"误差太大时先别急着追——先把其他惩罚降下来"；在小误差区梯度才显著，实现精调。这种"大误差不管、小误差精调"正是指数核的核心工程价值。
+\end{insight}
+
+$\sigma$ 选择的经验法则：\textbf{$\sigma$ 约等于"期望可接受误差"的 $1\!\sim\!2$ 倍}。配置项四维表（来源 / 修改影响 / 合理范围 / 耦合）：
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}llLLL@{}}
+\toprule
+$\sigma$ & $\sigma^2$ & 默认来源 & 合理范围/影响 & 与其他配置耦合 \\
+\midrule
+$0.25$ & $0.0625$ & 苛刻设定 & 误差 $0.25$ m/s 奖励就很低；精度高、早期可能无梯度 & 需配 reward 课程逐步收紧 \\
+$0.5$ & $0.25$ & legged\_gym 附近\,\cite{rudin2021minutes} & 适中，常用起点 & 与命令范围、action scale 联动 \\
+$1.0$ & $1.0$ & 宽容设定 & 适合训练初期或高速命令；精度上限低 & 后期应收紧 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+$\sigma$ \emph{太小}的问题：若 $\sigma=0.1$，速度误差超过 $0.1$ m/s 奖励就接近零。训练初期策略完全不会走，误差可能 $1\!\sim\!2$ m/s，此时 $\exp(-4/0.01)\approx0$——策略没有任何梯度指引"往哪改进"。这与高中物理"场强"类比：若势能只在极小范围内有意义地变化，远处的物体感受不到"力"。$\sigma$ \emph{太大}的问题：若 $\sigma=5$，误差 $2$ m/s 时奖励仍约 $\exp(-4/25)\approx0.85$——策略会觉得"大误差也还行"，精度无法提升。
+
+\subsection{\texorpdfstring{三框架的 tracking 实现与 $v_z$ 放置差异}{三框架的 tracking 实现与 vz 放置差异}}
+\label{sec:rlmc-rew-trackimpl}
+
+\begin{codebox}[Python]{Isaac Lab:track\_lin\_vel\_xy\_exp（已核对官方签名，不含 $v_z$）}
+# source/isaaclab/isaaclab/envs/mdp/rewards.py
+def track_lin_vel_xy_exp(
+    env: ManagerBasedRLEnv, std: float, command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """xy 平面线速度跟踪（指数核）.注意:官方实现只含 xy，不含 v_z."""
+    asset = env.scene[asset_cfg.name]
+    lin_vel_error = torch.sum(
+        torch.square(
+            env.command_manager.get_command(command_name)[:, :2]
+            - asset.data.root_lin_vel_b[:, :2]
+        ), dim=1,
+    )
+    return torch.exp(-lin_vel_error / std**2)            # [num_envs]
+\end{codebox}
+
+\begin{codebox}[Python]{mjlab:track\_linear\_velocity（把 $v_z^2$ 内嵌进误差;形态以仓库为准）}
+# src/mjlab/tasks/velocity/mdp/rewards.py
+def track_linear_velocity(
+    env, std: float, command_name: str = "base_velocity",
+) -> torch.Tensor:
+    command = env.command_manager.get_command(command_name)
+    root_vel = env.scene.robot.data.root_lin_vel_b        # body frame [N, 3]
+    error = torch.sum(torch.square(command[:, :2] - root_vel[:, :2]), dim=1) \
+            + torch.square(root_vel[:, 2])                # xy 误差平方 + z 速度平方
+    return torch.exp(-error / std**2)                     # [num_envs]
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:tracking\_lin\_vel（NumPy/CPU，sigma 经 ctx.tracking\_sigma 注入）}
+# src/unilab/envs/locomotion/common/rewards.py 的 tracking_lin_vel(ctx)
+def tracking_lin_vel(ctx) -> np.ndarray:
+    # ctx = RewardContext，bundle 了 info/linvel/gyro/dof_pos/tracking_sigma/...
+    e = np.sum(np.square(ctx.info["commands"][:, :2] - ctx.linvel[:, :2]), axis=1)
+    return np.exp(-e / ctx.tracking_sigma)   # [num_envs];只含 xy（不内嵌 v_z）
+# 关键差异:(1) 返回 np.ndarray（CPU 上算，UniLab 物理在 CPU）;
+#   (2) sigma 不是 per-term params，而是全局 reward.tracking_sigma 经 RewardContext 注入（所有
+#      tracking 项共用同一 sigma）;(3) 注意分母是 tracking_sigma（直接当 sigma²用），不是 std**2，
+#      故 YAML 里 tracking_sigma=0.25 等价 Isaac Lab/mjlab 的 std=sqrt(0.25)=0.5.
+\end{codebox}
+
+三点关键差异：(1) Isaac Lab 官方版\emph{不}含 $v_z^2$ 惩罚（已核对\,\cite{isaaclab2024}）——$v_z$ 惩罚通过单独的 \verb|lin_vel_z_l2| 项实现；mjlab 风格把 $v_z^2$ 内嵌进 tracking 误差；UniLab 同 Isaac Lab，tracking 只含 xy，$v_z$ 由单独的 \verb|lin_vel_z| 项（负权重）惩罚。(2) Isaac Lab 经 \verb|asset_cfg| 参数化访问 robot（更灵活但更冗长），mjlab 直接 \Verb[breaklines]|env.scene.robot|，UniLab 经 \verb|RewardContext| 预取的 \verb|ctx.linvel|（env 用 \Verb[breaklines]|get_local_linvel()| 从后端直接拿机体系速度）。(3) \textbf{$\sigma$ 的语义陷阱}：UniLab 的 \Verb[breaklines]|tracking_sigma| 直接当 $\sigma^2$ 用（核里是 \Verb[breaklines]|exp(-e/tracking_sigma)|），而 Isaac Lab/mjlab 的 \verb|std| 是 $\sigma$、核里是 \Verb[breaklines]|exp(-e/std**2)|——所以跨框架搬数值时 UniLab 的 \Verb[breaklines]|tracking_sigma=0.25| 对应 Isaac Lab 的 \verb|std=0.5|，别直接照抄。
+
+这个"$\sigma$ vs.\ $\sigma^2$"的坑是本章最容易让人静默翻车的反直觉点（拼错不报错，只是核宽差了一个平方、训练莫名学不好），值得配一个\textbf{可跑的自检}而非只记文字警告。下面三行打印各框架配置项对应的\emph{等效} $\sigma$ 与"误差降到 $1/e$ 时的速度误差"，搬数值前先跑一遍对齐：
+
+\begin{codebox}[Python]{跨框架 sigma 自检:把各框架的配置数值换算成同一物理 sigma 再对比}
+import math
+# 各框架"误差 e（速度误差平方和）的指数核分母"语义不同，统一折算成物理 sigma（m/s）:
+cfgs = {
+    "IsaacLab.std":        ("std",            0.5),    # 核 exp(-e/std**2)  -> sigma = std
+    "mjlab.std":           ("std",            0.5),    # 同 Isaac:sigma = std
+    "UniLab.tracking_sigma": ("tracking_sigma", 0.25), # 核 exp(-e/tracking_sigma) -> sigma = sqrt(它)
+}
+for name, (kind, val) in cfgs.items():
+    sigma = val if kind == "std" else math.sqrt(val)   # 折算到统一物理 sigma
+    print(f"{name:24s} 配置值={val:<6} -> 等效 sigma={sigma:.3f} m/s "
+          f"(误差~={sigma:.3f} m/s 时奖励降到 1/e~=0.368)")
+# 预期三行的「等效 sigma」应全部~=0.5 —— 若你直接把 UniLab 写成 tracking_sigma=0.5，
+#   等效 sigma 会变成 0.707，核宽放大 ~1.4×，这就是"照抄 std 数值"翻车的根源.
+\end{codebox}
+
+\begin{insight}[$v_z$ 放在哪里：两种等价但调参自由度不同的工程选择]\label{ins:rlmc-rew-vzplace}
+mjlab 把 $v_z^2$ 放进 tracking 误差内部——$v_z$ 越大 tracking 奖励越低，策略同时追求水平速度准确与垂直弹跳小，但二者共享一个 weight，无法单独调。Isaac Lab 把 $v_z^2$ 放进单独的 \verb|lin_vel_z_l2| penalty——有独立 weight，可单独调节。两种方式效果上等价，但 Isaac Lab 给了更多调参自由度。\textbf{这也提醒做消融时}：在 mjlab 里"关掉 $v_z$ 惩罚"需改 tracking 函数本身，而在 Isaac Lab 里只需把 \verb|lin_vel_z_l2| 的 weight 置零——后者更利于受控变量。
+\end{insight}
+
+\subsection{角速度跟踪的对称设计}
+\label{sec:rlmc-rew-angtrack}
+
+角速度跟踪用完全对称的指数核，但\emph{只}跟 yaw：
+\begin{equation}
+r_{\text{ang}}=\exp\!\left(-\frac{(\omega_{\text{cmd},z}-\omega_{\text{actual},z})^2}{\sigma_{\text{ang}}^2}\right).
+\label{eq:rlmc-rew-angexp}
+\end{equation}
+只跟踪 yaw 角速度 $\omega_z$（转弯命令），不跟 roll/pitch——后者期望值永远是零（保持直立），由 style 层的 \verb|ang_vel_xy_l2| 惩罚实现。为什么把 yaw 跟踪与 roll/pitch 惩罚分开？因为 yaw 有非零命令（"请转弯"），roll/pitch 目标永远是零。若把三个角速度分量塞进一个 tracking 项，$\sigma$ 的选择会很尴尬——yaw 命令可能很大（$\pm1$ rad/s），roll/pitch 目标恒零但波动很小（$\pm0.1$ rad/s）。分开处理让每个分量都能有合适的 $\sigma$ 或 weight。
+
+\subsection{\texorpdfstring{用课程控制 $\sigma$：从宽容到苛刻}{用课程控制 sigma：从宽容到苛刻}}
+\label{sec:rlmc-rew-sigmacurr}
+
+训练初期用大 $\sigma$（宽容，有梯度），后期收紧 $\sigma$（提高精度）——这是 reward 课程的典型应用（机制详见 \cref{sec:rlmc-rew-curr}）：
+
+\begin{codebox}[Python]{mjlab 风格:逐步收紧 tracking std 的 reward 课程（示意）}
+# 课程项:按训练步数分阶段下调 std（字段名以实装框架为准）
+curriculum = {
+    "track_lin_tighten": CurriculumTermCfg(
+        func=mdp.reward_curriculum,
+        params={
+            "reward_name": "track_linear_velocity",
+            "stages": [
+                {"step": 0,      "params": {"std": 0.7}},   # 早期宽容
+                {"step": 120000, "params": {"std": 0.5}},   # 中期适中
+                {"step": 240000, "params": {"std": 0.35}},  # 后期苛刻
+            ],
+        },
+    ),
+}
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:sigma 课程——无现成"按步收紧 sigma"函数，需手动分阶段或自定义回调}
+# UniLab 当前无内置「按训练步收紧 tracking_sigma」的课程函数（已读源码确认，见本节正文）.
+# 它内置的课程只有两类:PenaltyCurriculum（按 episode 长度自适应缩放负权重 reward）
+#   与 TerrainCurriculumCfg/TerrainSpawnManager（地形等级）.tracking_sigma 是 RewardConfig
+#   的全局标量，故"收紧 sigma"有两条务实路径:
+# 路径一（分阶段手动重启）:每阶段用上一阶段 checkpoint 续训、Hydra 覆盖收紧 sigma
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    reward.tracking_sigma=0.49 algo.max_iterations=120   # 早期宽容（sigma~=0.7）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    reward.tracking_sigma=0.25 algo.max_iterations=120 --load-run -1   # 续训收紧（sigma=0.5）
+# 路径二（自定义回调）:在训练循环按 common_step 改 env._reward_cfg.tracking_sigma
+#   （RewardConfig 是 dataclass，运行时可改其 tracking_sigma 字段）.
+\end{codebox}
+
+stage 间隔至少几万 step（对应几百个 PPO update），确保策略有时间适应当前难度（每次 $\sigma$ 收紧幅度建议 $\le30\%$，原因见 \cref{ins:rlmc-rew-nonstationary}）。\textbf{三框架的"收紧 $\sigma$ 课程"成熟度并不一致}：mjlab 在 \Verb[breaklines]|envs/mdp/curriculums.py| 里确有 \Verb[breaklines]|reward_curriculum|\,\cite{mjlab2026}——它按训练步阈值分阶段覆盖某 reward 项的 \verb|weight| 与 \verb|params|，故"收紧 $\sigma$"可写成对 \verb|tracking| 项 \verb|params| 的分阶段覆盖（是\emph{阶梯式}换挡，非逐步平滑收紧）；Isaac Lab 的 \Verb[breaklines]|CurriculumManager| 提供机制但收紧 reward 参数需自定义课程项；UniLab 则\textbf{明确无现成"按步收紧 reward std"函数}\,\cite{unilab2026}，只能按上面两条路径手动做。这说明逐步平滑的 reward-参数课程在三框架里都更接近"自己拼"而非"现成调"，与地形课程（mjlab/Isaac Lab 均有一等公民 \Verb[breaklines]|terrain_levels_vel|）形成对比。
+
+\begin{pitfall}[两个 std 别搞混 / $\sigma$ 不是越小越好]
+\textbf{编程陷阱}：奖励核的 \verb|std|（物理空间宽度，单位 m/s 或 rad/s）与 PPO 策略的 \verb|init_std|（raw action 空间的高斯标准差，无量纲，见 \cref{sec:rlmc-rew-track} 上游的动作章）概念完全无关，但名字相似。务必在代码与文档中标明 std 的物理含义与单位。
+
+\textbf{思维陷阱}：以为"$\sigma$ 越小越精确所以越好"。$\sigma$ 太小会让早期策略完全没有 tracking 梯度，可能学不会走。正确思路是从大 $\sigma$ 起步、用课程逐步收紧。
+\end{pitfall}
+
+\begin{practice}[练习·跟踪奖励]
+\begin{enumerate}
+  \item \textbf{[计算]} $\sigma^2=0.25$，$e_{\text{lin}}=1.0$（命令 $1.5$、实际 $0.5$ m/s）。计算 tracking 奖励；若改 $\sigma^2=1.0$，奖励变为多少？用 \cref{ins:rlmc-rew-expgrad} 解释两者对梯度的影响。
+  \item \textbf{[设计]} 高速奔跑任务（命令 $v_x$ 最大 $3.0$ m/s），早期误差可达 $3.0$ m/s。选择初始 $\sigma$ 与课程 schedule，确保全程都有 tracking 梯度。验收：写出至少三个 stage 的 $(step,\sigma)$，并论证 step $0$ 处误差 $3.0$ 时奖励不接近零。
+  \item \textbf{[跨框架]} 对比 Isaac Lab（$v_z$ 独立项）、mjlab（$v_z$ 内嵌）与 UniLab（同 Isaac Lab，$v_z$ 由单独的 \verb|lin_vel_z| 负权重项惩罚，tracking 只含 xy）三种 tracking 实现，讨论各自对"$v_z$ 惩罚消融"实验的便利度差异（提示：哪种只需改一个标量、哪种要改函数本身）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Regularization、Style 与 Contact：辅助三层详解}
+\label{sec:rlmc-rew-aux}
+
+\begin{quote}\small
+\textbf{这一节解决什么问题}：除 tracking 外的三层各含哪些项？每项的物理含义与调参方向是什么？怎么写一个自定义奖励项？操作类任务为何要用 staged 门控奖励？
+\end{quote}
+
+\subsection{Regularization 层：排除不可部署的解}
+\label{sec:rlmc-rew-reg}
+
+Regularization 层全是 penalty（负 weight），目标是排除"仿真可行、真机失败"的行为。
+
+\textbf{\texttt{action\_rate\_l2}}：惩罚相邻 env step 的\emph{raw} action 差分 $\lVert a_t-a_{t-1}\rVert^2$，等价于对动作施加低通滤波——高频抖动被压制。注意是 raw action（无量纲），不是 processed action（有物理单位，见上一章动作变换链）。
+
+\begin{codebox}[Python]{action\_rate\_l2:Isaac Lab 与 mjlab 几乎一致}
+# mjlab
+def action_rate_l2(env) -> torch.Tensor:
+    return torch.sum(
+        torch.square(env.action_manager.action - env.action_manager.prev_action),
+        dim=1,
+    )
+# Isaac Lab: mdp.action_rate_l2 同样从 env.action_manager 读 current/prev action（已核对）
+# UniLab: common/rewards.py 的 action_rate(ctx) —— 从 ctx.info 读 current/last action 差分
+def action_rate(ctx) -> np.ndarray:                      # NumPy/CPU
+    cur  = ctx.info["current_actions"]
+    last = ctx.info.get("last_actions", cur)
+    return np.sum(np.square(cur - last), axis=1)         # [num_envs]
+\end{codebox}
+
+\textbf{\texttt{joint\_acc\_l2}（关节加速度）}：惩罚 $\lVert\ddot{\mathbf q}\rVert^2$。加速度越大、电机所需力矩越大、磨损越快。weight 通常极小（如 $-2.5\times10^{-7}$），因为 $\ddot{\mathbf q}$ 量级可能很大（几千 rad/s$^2$）。\textbf{\texttt{joint\_torques\_l2}（力矩/能耗）}：惩罚 $\lVert\boldsymbol\tau\rVert^2$，直接限能耗——真机电池有限，过大力矩导致发热、缩短续航。\textbf{\texttt{joint\_pos\_limits}（软限位）}：关节接近物理限位时施加递增惩罚，比硬限位（直接 clip）友好——硬限位在边界处梯度不连续。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+现象 & 首先怀疑 & 调整方向 \\
+\midrule
+高频抖动 & \Verb[breaklines]|action_rate_l2| 太弱 & 增大 $|weight|$ \\
+动作保守 & \Verb[breaklines]|action_rate_l2| $+$ \Verb[breaklines]|joint_torques_l2| 太强 & 减小 $|weight|$ \\
+关节撞限位 & \Verb[breaklines]|joint_pos_limits| 太弱 & 增大 $|weight|$ \\
+初期奖励全负 & 所有 penalty 太强 & 先减小，等有基本行为再加回（用课程延后） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Style 层：约束行为质量}
+\label{sec:rlmc-rew-style}
+
+Style 层定义"什么样的行为看起来合理"。与 Regularization 的区别：后者排除"硬件不允许"的行为，前者排除"外观不可接受"的行为。
+
+\textbf{\texttt{flat\_orientation\_l2}}：惩罚 projected gravity 的 $x/y$ 分量偏离零（身体不直立），$r=-(g_x^2+g_y^2)$，其中 $g=\mathbf R_{wb}^{\mathsf T}\,\mathbf g/\lVert\mathbf g\rVert$ 是重力在机体系的投影。\textbf{此项与上一章} \Verb[breaklines]|projected_gravity| \textbf{观测读的是同一份 env 状态}——奖励函数读 env 状态的方式与观测项一样（呼应 \cref{ins:rlmc-rew-shaping} 与上一章观测族划分）。
+
+\begin{codebox}[Python]{flat\_orientation\_l2:用 projected gravity 惩罚倾斜}
+# mjlab
+def flat_orientation(env, asset_cfg) -> torch.Tensor:
+    gravity = env.scene[asset_cfg.name].data.projected_gravity_b
+    return torch.sum(torch.square(gravity[:, :2]), dim=1)
+# Isaac Lab: mdp.flat_orientation_l2（已核对，惩罚 projected_gravity_b 的 xy 分量）
+# UniLab: common/rewards.py 的 orientation(ctx) —— 同样惩罚投影重力的 xy 分量
+def orientation(ctx) -> np.ndarray:                      # NumPy/CPU
+    g = ctx.gravity                                      # RewardContext 预取的机体系投影重力
+    return np.sum(np.square(g[:, :2]), axis=1)           # [num_envs]
+# 另有 upright / roll 等姿态项（common/rewards.py 的 ~40 个共享函数之一），按 reward.scales 取舍.
+\end{codebox}
+
+\textbf{\texttt{lin\_vel\_z\_l2}（垂直速度）}：惩罚 $v_z^2$，四足行走不应大幅上下弹跳。若 tracking 已内嵌 $v_z$ 惩罚（mjlab 风格），此项可不用或减小 weight；若 tracking 不含 $v_z$（Isaac Lab 风格），则需要它（呼应 \cref{ins:rlmc-rew-vzplace}）。\textbf{\texttt{ang\_vel\_xy\_l2}（roll/pitch 角速度）}：与 \Verb[breaklines]|flat_orientation_l2| 互补——前者惩罚"倾斜"，后者惩罚"快速倾斜"，类似 PD 的 P 项与 D 项。
+
+\textbf{速度依赖的姿态奖励（进阶）}。Walk-These-Ways\,\cite{margolis2022walk} 用一种更精细的设计：定义 standing\_std 与 walking\_std，按命令速度在两者间切换/插值：
+
+\begin{codebox}[Python]{速度依赖姿态奖励（伪代码，三框架通用思路）}
+speed = torch.norm(command[:, :2], dim=1)
+standing_mask = speed < 0.1
+posture_tight = exp_kernel(orientation_error, std=0.1)   # 站立:紧 std，必须站直
+posture_loose = exp_kernel(orientation_error, std=0.5)   # 行走:松 std，允许倾斜
+reward = torch.where(standing_mask, posture_tight, posture_loose)
+\end{codebox}
+
+\subsection{Contact 层：约束物理交互}
+\label{sec:rlmc-rew-contact}
+
+Contact 层控制脚与地面的交互质量。
+
+\textbf{\texttt{feet\_air\_time}（腾空时间 bonus）}：鼓励脚在摆动相抬离地面足够久。没有它，策略可能学到"脚贴地快速拖动"来跟踪速度——仿真接触摩擦能实现这种"溜冰"，但真机会磨损脚底。Isaac Lab 官方签名（已核对\,\cite{isaaclab2024}）为 \Verb[breaklines]|feet_air_time(env, command_name, sensor_cfg, threshold)|；双足版另有 \Verb[breaklines]|feet_air_time_positive_biped|。
+
+\begin{codebox}[Python]{feet\_air\_time（mjlab 风格简化实现，展示三处精妙设计）}
+def feet_air_time(env, command_name, sensor_cfg, threshold) -> torch.Tensor:
+    sensor = env.scene.sensors[sensor_cfg.name]
+    command = env.command_manager.get_command(command_name)   # 取速度命令
+    air_time = sensor.data.current_air_time               # [N, num_feet]
+    contact = sensor.data.net_forces_w_history
+    in_air = contact[:, :, 2].abs() < threshold
+    first_contact = (air_time > 0) & (~in_air)            # 仅落地瞬间
+    reward = torch.sum((air_time - 0.5) * first_contact, dim=1)
+    reward *= torch.norm(command[:, :2], dim=1) > 0.1     # 命令~=0 时关闭
+    return reward
+\end{codebox}
+
+三处精妙：(1) 只在\emph{落地瞬间}给奖励（不是连续给）；(2) 减去 $0.5$ 秒阈值——空中时间短于 $0.5$ s 得负贡献（惩罚拖步），长于 $0.5$ s 才得正奖励（\textbf{注意此式让奖励随 air time 线性增长、未对过长腾空设上限；若需上限应改用 clamp 或窗口形式}）；(3) 命令接近零时关闭——站立时不应鼓励抬脚。
+
+\textbf{\texttt{feet\_slide}（脚滑，源稿误作 \texttt{foot\_slip}）}：惩罚支撑脚接触地面时的水平滑动速度，$r=-\lVert v_{\text{foot},xy}\rVert^2\cdot\mathbb 1_{\text{contact}}$，只在足端接触时计算（空中的脚没有"滑移"）。Isaac Lab 签名 \Verb[breaklines]|feet_slide(env, sensor_cfg, asset_cfg)|（已核对\,\cite{isaaclab2024}）。
+
+\begin{note}[读源码范例：一个 reward 函数顺便产出一个 metric——\texttt{slip\_velocity\_mean} 从哪来]
+本章多张表把 \Verb[breaklines]|Metrics/slip_velocity_mean| 当现成字段用（判断"溜冰"行为质量），它其实就出自 mjlab 的脚滑奖励函数本身。实跑读 mjlab \verb|foot_slip| 源码可见两个常被忽略的工程细节：(1) 它内部用 \Verb[breaklines]|command_threshold| \textbf{门控}——命令速度接近零时不罚滑移（站立时脚本就不该有"该抬却滑"的语义，与 \cref{sec:rlmc-rew-contact} 的 \verb|feet_air_time| 命令门控同理）；(2) 它在算惩罚的同时，把滑移速度的均值直接写进 \Verb[breaklines]|env.extras["log"]["slip_velocity_mean"]| ——于是日志里那条 \Verb[breaklines]|Metrics/slip_velocity_mean| 不是另设的探针，而是\textbf{这个 reward 函数顺手产出的副产品}。这是一个很好的"reward 函数兼做可观测性"范例：你自定义安全 penalty 时，也可以顺便把它判定用的中间量（如接触力、滑移速度）写进 \verb|extras["log"]|，消融时就多一个能直接看的行为 metric，而不用再单独加 metric 项。
+\end{note}
+
+\textbf{\texttt{undesired\_contacts}（非法接触，复数）}：惩罚不应触地的 body 部位（膝盖、大腿、躯干）——这是安全 penalty，真机这些部位触地通常意味着摔倒或碰撞。
+
+\subsection{自定义奖励项的编写模式与四条铁律}
+\label{sec:rlmc-rew-custom}
+
+编写自定义奖励项的模式与上一章观测项一致——返回 \verb|[num_envs]| 张量、不修改 env 状态。下面以"步态对称性"奖励为例，给出 mjlab（类式）与 Isaac Lab（函数式）两种风格：
+
+\begin{codebox}[Python]{mjlab:步态对称性奖励（类式 term，继承 ManagerTermBase）}
+# src/mjlab/tasks/velocity/mdp/rewards.py
+import torch
+from mjlab.managers import ManagerTermBase   # mjlab 唯一的 term 基类（无 RewardTermBase）
+
+class GaitSymmetryReward(ManagerTermBase):
+    """鼓励左右脚 air time 对称;返回 [num_envs]，范围 [0,1]."""
+    # ManagerTermBase.__init__(self, env) 缓存 env;有状态项可在此预取常量、并可选 reset(env_ids)
+    def __call__(self, env, sensor_cfg, std: float = 0.3) -> torch.Tensor:
+        air_time = env.scene.sensors[sensor_cfg.name].data.current_air_time
+        left_mean  = air_time[:, [0, 2]].mean(dim=1)      # Go1: 0,2=左侧
+        right_mean = air_time[:, [1, 3]].mean(dim=1)      # 1,3=右侧
+        asymmetry = (left_mean - right_mean) ** 2
+        return torch.exp(-asymmetry / std**2)
+\end{codebox}
+
+\begin{codebox}[Python]{Isaac Lab:步态对称性奖励（函数式 term）}
+# source/isaaclab_tasks/.../locomotion/velocity/mdp/rewards.py
+def gait_symmetry(env, sensor_cfg, std: float = 0.3) -> torch.Tensor:
+    """左右脚 air time 对称性奖励."""
+    air_time = env.scene.sensors[sensor_cfg.name].data.current_air_time
+    left_mean  = air_time[:, [0, 2]].mean(dim=1)
+    right_mean = air_time[:, [1, 3]].mean(dim=1)
+    return torch.exp(-((left_mean - right_mean) ** 2) / std**2)
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:步态对称性奖励（自定义函数 $+$ 派发表 $+$ scales 一行）}
+# (1) 写函数（放进 envs/locomotion/common/rewards.py 或 env 模块），返回 np.ndarray [num_envs]
+import numpy as np
+def gait_symmetry(ctx, std: float = 0.3) -> np.ndarray:
+    at = ctx.info["feet_air_time"]                  # (N, 4)，env 在 info 里自维护
+    left_mean  = at[:, [0, 2]].mean(axis=1)         # Go2: 0,2=左侧
+    right_mean = at[:, [1, 3]].mean(axis=1)         # 1,3=右侧
+    return np.exp(-((left_mean - right_mean) ** 2) / std**2)   # [0,1]
+# (2) 在 env._init_reward_functions 注册进派发表
+#   self._reward_fns["gait_symmetry"] = gait_symmetry
+# (3) 在 owner YAML 的 reward.scales 给权重即生效（正权重=奖励对称）
+#   reward.scales.gait_symmetry: 0.5
+# 注意 std 这类 per-term 参数:UniLab 的 RewardContext 不像 RewardTermCfg.params 那样直接透传，
+#   要么写死默认、要么把它也搬进 RewardConfig 字段经 ctx 注入（见 ins:rlmc-rew-threeparadigm）.
+\end{codebox}
+
+\begin{pitfall}[编写奖励项的四条铁律]
+\textbf{一·形状必须是 \texttt{[num\_envs]}}：若中间产生 \Verb[breaklines]|[num_envs, num_feet]|，最后必须 reduce（如 \Verb[breaklines]|torch.sum(..., dim=1)|）。
+
+\textbf{二·必须是无副作用的纯函数}：只读状态、不改数据——与观测项要求完全相同（mjlab 零拷贝桥下改张量会污染底层数组，见上一章观测项铁律）。
+
+\textbf{三·显式处理可能的 NaN}：\verb|RewardManager| 会用 \Verb[breaklines]|torch.nan_to_num| 自动清零 NaN，但这\emph{掩盖}了根因。若你的项可能产生 NaN（如除以可能为零的接触力），应显式处理。
+
+\textbf{四·数值范围尽量在 $[-10,10]$ 以内}：若 raw 范围很大（力矩平方可达几千），需在 weight 中补偿或在项内归一化。
+\end{pitfall}
+
+\subsection{操作类任务的 Staged 奖励：乘法/二值门控}
+\label{sec:rlmc-rew-staged}
+
+locomotion 的四层奖励是\emph{并行}的（所有项同时激活）。操作类任务（如抓取-搬运方块）则需\emph{串行}的 staged 奖励：先 reach（手靠近物体）$\to$ 再 grasp/lift（举起）$\to$ 最后 place（搬到目标）。若并行给所有奖励，策略可能同时优化三个目标却没有一个做好。其核心机制是\textbf{门控}（gating）：后一阶段的奖励只有在前一阶段达成时才"放行"。
+
+\begin{insight}[本质：staged 奖励是在 MDP 里"声明学习顺序"]\label{ins:rlmc-rew-staged}
+staged 奖励不是简单的奖励堆叠，而是在 MDP 中声明先后：先让末端进入可抓窗口，再让物体进入目标窗口。门控在数学上保证了这种顺序——前一阶段没学好，后一阶段的梯度被自然抑制。这把一个\emph{稀疏}的成功信号（"放对了"才有奖励）拆成了\emph{稠密}的、有方向的梯度（呼应 \cref{sec:rlmc-rew-densesparse}）。
+\end{insight}
+
+经核对，Isaac Lab 的 lift-cube 任务（已核对\,\cite{isaaclab2024}）用三个奖励函数实现门控，且是 \textbf{tanh 核 $+$ 二值门控}（不是源稿描述的指数核 \Verb[breaklines]|reaching + reaching*bringing| 形式）：
+
+\begin{codebox}[Python]{Isaac Lab lift-cube:三个奖励 + 二值门控（已核对官方实现）}
+# source/isaaclab_tasks/.../manipulation/lift/mdp/rewards.py
+def object_ee_distance(env, std, object_cfg, ee_frame_cfg) -> torch.Tensor:
+    """Stage 1 reaching:末端到物体距离的 tanh 核，1 - tanh(d/std)."""
+    # ... 计算末端-物体距离 d
+    return 1 - torch.tanh(distance / std)
+
+def object_is_lifted(env, minimal_height, object_cfg) -> torch.Tensor:
+    """二值:物体高度超过 minimal_height 即 1，否则 0."""
+    return (obj.data.root_pos_w[:, 2] > minimal_height).float()
+
+def object_goal_distance(env, std, minimal_height, command_name,
+                         robot_cfg, object_cfg) -> torch.Tensor:
+    """Stage 2 bringing:被 object_is_lifted 二值门控的 tanh 核."""
+    lifted = (obj.data.root_pos_w[:, 2] > minimal_height).float()   # <- 门控
+    return lifted * (1 - torch.tanh(goal_distance / std))           # 举起后才放行
+\end{codebox}
+
+\begin{codebox}[Python]{mjlab / UniLab:staged 奖励}
+# mjlab 的 lift 任务（lift_cube_env_cfg.py）确有 staged_position_reward
+# （tasks/manipulation/mdp/rewards.py）:返回 reaching * (1 + bringing)，二者都是
+# 位置误差上的高斯核——即「乘法门控」而非 Isaac Lab lift-cube 的二值(object_is_lifted)门控.
+# 故两框架的 staged 奖励数学形式不同:mjlab 乘法-指数核，Isaac Lab 二值-tanh 核.
+# UniLab: 当前操作任务（AllegroInhandRotation / SharpaInhandRotation 等）是「in-hand 旋转」，
+#   reward 是并行的连续项（rotate / obj_linvel / pose_diff / torque / work / drop），
+#   不是 reach->lift->place 的串行门控;故 UniLab 无与 Isaac Lab lift-cube 对应的二值门控 staged 奖励.
+#   要复现门控，可在标量字典里加一个二值「门」函数、再让后阶段函数乘上它（手动实现，见正文）.
+\end{codebox}
+
+门控的数学意义（以 Isaac Lab 的二值门控为例）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+场景 & \Verb[breaklines]|object_is_lifted| & \Verb[breaklines]|object_goal_distance| & 梯度方向 \\
+\midrule
+方块未举起 & $0$ & $0$（被门控清零） & 先把方块举过 \Verb[breaklines]|minimal_height| \\
+方块已举起、远离目标 & $1$ & $1-\tanh(d/\sigma)$ 显著 & 减小物体到目标距离 \\
+方块到达目标 & $1$ & $\approx1$ & 维持 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+关键在第一行：方块没举起时，\Verb[breaklines]|object_goal_distance| 被 \Verb[breaklines]|object_is_lifted=0| \emph{二值清零}——策略无法靠"把方块推向目标"刷分，必须先举起。这与"乘法门控"（如 mjlab 风格的 \Verb[breaklines]|reaching + reaching*bringing|，用连续的 reaching $\in[0,1]$ 当门）异曲同工，区别只在门是\emph{二值}还是\emph{连续}。
+
+\begin{pitfall}[只学 reach 不学 lift：staged 奖励的典型失败]
+现象：reaching 收敛到约 $1.0$，但 bringing 几乎为零。根因：reaching 梯度太强，策略在手到达物体后找到了"停那不动"的局部最优；门控虽让 bringing 梯度在 reaching 达成后传递，但 reaching 已提供足够高奖励，策略没动力探索风险更大的 lift。修复：(1) 减小 reaching 的 weight；(2) 加一次性的 grasp success bonus；(3) 用课程先训 reaching、冻结后再训 lifting。
+\end{pitfall}
+
+\begin{practice}[练习·辅助三层]
+\begin{enumerate}
+  \item \textbf{[分析]} 若去掉 \verb|feet_air_time| 但保留 \verb|feet_slide|，策略会学到什么行为？（提示：考虑"脚贴地滑动"是否被 \verb|feet_slide| 完全惩罚。）
+  \item \textbf{[编程]} 实现一个惩罚左右脚 air time 差异的自定义项，三框架各写一遍：mjlab 用类式 term、Isaac Lab 用函数式 term、UniLab 写 \Verb[breaklines]|fn(ctx)->np.ndarray| 并注册进 \verb|_reward_fns| 派发表 $+$ 在 \verb|reward.scales| 给权重（可参照 \cref{sec:rlmc-rew-custom} 给出的三框架样例）。验收：random agent 下三者均返回形状 \verb|[num_envs]|、值域 $[0,1]$。
+  \item \textbf{[跨章综合]} 回顾上一章 obs 设计：\Verb[breaklines]|foot_contact_forces| 在 actor obs 里吗？若不在，\verb|feet_slide| 奖励用了 actor obs 之外的信息——这对策略学习有何影响？（提示：奖励可用任何 env 状态，即使 actor 看不到；策略通过试错隐式学到被奖励激励的行为模式。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{奖励的时间缩放与日志系统}
+\label{sec:rlmc-rew-dt}
+
+\begin{quote}\small
+\textbf{这一节解决什么问题}：改变仿真频率后奖励数量级为何会变？\texttt{scale\_by\_dt} 做了什么？日志里的数值是什么含义？
+\end{quote}
+
+\subsection{\texttt{scale\_by\_dt}：让奖励权重独立于仿真频率}
+\label{sec:rlmc-rew-scalebydt}
+
+mjlab 的 \verb|RewardManager| 有一个 \verb|scale_by_dt| 开关（构造签名 \Verb[breaklines]|RewardManager(cfg, env, *, scale_by_dt=True)|，env 经 \Verb[breaklines]|cfg.scale_rewards_by_dt| 透传），默认 \verb|True|；Isaac Lab 的 \verb|RewardManager| 则\emph{没有}这个开关——它\textbf{总是} $\times$\verb|dt|（\verb|compute(dt)| 内恒做 \Verb[breaklines]|func()*weight*dt|）。两者默认行为一致：在 \verb|compute(dt)| 中，每项被乘以 \verb|weight| $\times$ \verb|dt|（其中 \verb|dt| $=$ \verb|physics_dt| $\times$ \verb|decimation|），即返回给 PPO 的奖励是\textbf{按时间积分的量}。这解决了一个微妙但重要的问题：若把 \verb|decimation| 从 $4$ 改为 $2$（policy step 频率加倍），\emph{不}按 dt 缩放会导致同一秒内累计奖励翻倍——PPO 的 loss scale 随之变化，所有精心调好的超参数都要重调。按 dt 缩放让权重更接近"物理时间权重"，类似物理学中"密度"比"总量"更具可比性。\textbf{UniLab 也有等价语义}\,\cite{unilab2026}：\Verb[breaklines]|run_reward_dispatch| 在 \Verb[breaklines]|common/rewards.py| 中最后返回 \Verb[breaklines]|reward * ctrl_dt|——只是缩放因子用控制周期 \verb|ctrl_dt|（本身已是 \verb|sim_dt|$\times$\verb|sim_substeps|，即一个 policy step 的时长），而非 mjlab/Isaac 写成的 \verb|physics_dt|$\times$\verb|decimation|，二者数值含义一致。
+
+\begin{codebox}[Python]{RewardManager.compute() 核心逻辑（三框架语义一致）}
+def compute(self, dt: float) -> torch.Tensor:
+    self._reward_buf[:] = 0.0
+    for name, term_cfg in self._terms.items():
+        raw = term_cfg.func(self._env, **term_cfg.params)        # [num_envs]
+        raw = torch.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+        scale = dt if self.cfg.scale_by_dt else 1.0
+        weighted = raw * term_cfg.weight * scale
+        self._reward_buf += weighted
+        self._episode_sums[name] += weighted                     # 用于日志
+    return self._reward_buf
+\end{codebox}
+
+数值示例：设 \Verb[breaklines]|track_linear_velocity| 的 raw $=0.8$，weight $=2.0$，dt $=0.02$ s。每步贡献 $0.8\times2.0\times0.02=0.032$；一个 $1000$ 步 episode 中 tracking 累积约 $32.0$。若改 decimation $=2$（dt $=0.01$ s），每步贡献变 $0.016$，但 episode 有 $2000$ 步，累积仍约 $32.0$——这就是 dt 缩放的价值。
+
+\subsection{Episode Reward 日志的归一化与陷阱}
+\label{sec:rlmc-rew-logging}
+
+\Verb[breaklines]|RewardManager.reset()| 时，\Verb[breaklines]|Episode_Reward/<name>| 的值等于 episode sum 除以 \Verb[breaklines]|max_episode_length_s|（\emph{最大}回合时长，而非\emph{实际}时长）。这让不同长度 episode 的日志可比。但若一个 episode 很短（早期机器人很快摔倒），少量极端 step 的奖励会被摊到最大回合秒数上，数值看上去比实际"稀释"了。\textbf{因此 termination 计数必须和 Episode Reward 一起看}。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+日志类别 & 字段示例 & 用途 \\
+\midrule
+回合奖励率 & \Verb[breaklines]|Episode_Reward/feet_slide| & 判断每项的梯度贡献 \\
+行为指标 & \Verb[breaklines]|Metrics/slip_velocity_mean| & 判断物理行为质量 \\
+课程状态 & \Verb[breaklines]|Curriculum/terrain_levels/mean| & 判断任务难度进展 \\
+终止计数 & \Verb[breaklines]|Episode_Termination/bad_orientation| & 判断失败原因分布 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[把 Episode\_Reward 当 per-step 平均]
+它是 episode sum（已按 dt 缩放）除以 \Verb[breaklines]|max_episode_length_s|，\emph{不是} per-step 平均。短 episode 的值会被系统性"稀释"。要判断单步奖励质量，应结合回合长度与 termination 分布一起看。
+\end{pitfall}
+
+\begin{practice}[练习·时间缩放]
+\begin{enumerate}
+  \item \textbf{[计算]} sim timestep $=0.005$ s、decimation $=4$、policy dt $=0.02$ s、max episode $=20.0$ s。一个 episode 跑 $500$ 步后摔倒，\Verb[breaklines]|track_linear_velocity| 每步 raw $=0.8$、weight $=2.0$。计算 \Verb[breaklines]|Episode_Reward/track_linear_velocity| 的日志值。
+  \item \textbf{[思考]} 把 decimation 从 $4$ 改为 $8$，\Verb[breaklines]|scale_by_dt=True| 下同一秒的 tracking 累积值如何变化？$\gamma$ 的有效时间尺度如何变化？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{终止与价值自举：True Termination vs.\ Truncation}
+\label{sec:rlmc-rew-term}
+
+\begin{quote}\small
+\textbf{这一节解决什么问题}：episode 什么时候结束？不同类型的"结束"对 PPO 的价值函数有何本质不同的影响？三框架怎么标记？
+\end{quote}
+
+\subsection{算法原理：终止语义是价值函数定义的一部分}
+\label{sec:rlmc-rew-termsemantics}
+
+回到演员-评论家（见 \cref{ch:rl-ac}）与 GAE（见 \cref{eq:rlmc-gae}）。终止分两类。\textbf{True termination（真失败）}：episode 到达"没有未来"的状态——机器人摔倒了，继续运行没有意义，评论家应将未来价值估计为零。\textbf{Truncation（截断）}：episode 因外部原因（时间到、离开有效区域）结束，但任务本身\emph{没有}失败——若继续运行机器人可能还会获得正奖励，评论家\emph{不}应将未来价值清零，而应用当前价值函数的估计做\textbf{自举}（bootstrap）。
+
+\begin{insight}[本质洞察：错标终止 = 给评论家错误的训练 target]\label{ins:rlmc-rew-bootstrap}
+true termination vs.\ truncation 的区别不是"日志细节"——它是\textbf{价值函数定义的一部分}。把 timeout 当 failure，会系统性\emph{低估}长期稳定行走的价值；把 failure 当 timeout，会\emph{高估}摔倒状态的价值。两种错误都会通过 GAE 反向传播到整个 rollout。这与金融"折现"类比：一家盈利企业若估值时把未来现金流截断为零（把 timeout 当 failure），估值会严重偏低，导致投资决策错误。评论家的价值函数就是策略的"估值模型"，终止语义的错误等价于估值模型的系统性偏差。
+\end{insight}
+
+\subsection{三框架的终止实现与 RSL-RL 自举接口}
+\label{sec:rlmc-rew-termimpl}
+
+mjlab/Isaac Lab 用终止项的 \verb|time_out=True| 标记截断。\Verb[breaklines]|TerminationManager| 把 timeout 项聚合进 \Verb[breaklines]|_truncated_buf|、非 timeout 项聚合进 \Verb[breaklines]|_terminated_buf|；RSL-RL 包装器合并二者为 \verb|dones|，并在\emph{无限时域}任务中把 \verb|truncated| 放进 \Verb[breaklines]|extras["time_outs"]| 供 GAE 决定是否自举。Isaac Lab 终止函数 \verb|time_out|、\Verb[breaklines]|illegal_contact|、\Verb[breaklines]|bad_orientation|（"摔倒"）、\Verb[breaklines]|root_height_below_minimum| 均已核对存在\,\cite{isaaclab2024}。
+
+\begin{codebox}[Python]{Isaac Lab:TerminationsCfg（函数名已核对官方源码）}
+@configclass
+class TerminationsCfg:
+    time_out = DoneTerm(func=mdp.time_out, time_out=True)        # 截断，不是失败
+    base_contact = DoneTerm(
+        func=mdp.illegal_contact, time_out=False,                # 真失败
+        params={"sensor_cfg": SceneEntityCfg("contact_forces",
+                body_names="base"), "threshold": 1.0},
+    )
+    # 平地任务常加:bad_orientation（大角度倾斜=摔倒）
+\end{codebox}
+
+\begin{codebox}[Python]{mjlab:terminations 配置（dict 范式）}
+terminations = {
+    "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
+    # 注意:mjlab 无 mdp.fell_over 函数——"fell_over" 只是 term 名（dict 键），
+    #   底层用真实函数 mdp.bad_orientation（Episode_Termination/fell_over 即由此项产生）
+    "fell_over": TerminationTermCfg(            # 对应 Isaac Lab 的 bad_orientation
+        func=mdp.bad_orientation, time_out=False,
+        params={"limit_angle": 1.0}),           # 倾角阈值（rad）:此处 1.0 为示例;
+                                                #   实跑确认 mjlab shipped 默认是 radians(70°)~=1.22 rad
+    "illegal_contact": TerminationTermCfg(
+        func=mdp.illegal_contact,
+        params={"sensor_cfg": ..., "threshold": 1.0}),
+    # 实跑还印证:mjlab 的 out_of_terrain_bounds 终止项标 time_out=True（截断而非失败），
+    #   正是下表「离开生成地形边界 -> 截断」决策的活样例（实装反向印证决策框架）.
+}
+\end{codebox}
+
+\begin{codebox}[Python]{RSL-RL 包装器的关键转换（三框架共享语义）}
+dones = (terminated | truncated).to(torch.long)
+if not self.unwrapped.cfg.is_finite_horizon:                    # 无限时域任务
+    extras["time_outs"] = truncated.to(torch.long)             # GAE 据此决定自举
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:终止/截断与 bootstrap 契约（无 TerminationManager，逻辑显式）}
+# UniLab 没有 DoneTerm/TerminationTermCfg 类.终止在 env.update_state 里直接算:
+def update_state(self, state):                           # envs/locomotion/.../base.py 思路
+    gravity = self._backend.get_sensor_data("upvector")
+    terminated = gravity[:, 2] <= 0.5                    # 投影重力翻过阈值 = 摔倒（真失败）
+    # ... 算 obs/reward ...
+    return state.replace(terminated=terminated, ...)
+# 超时 truncated 由基类 _compute_truncated 按 max_episode_steps 自动算;done = terminated | truncated.
+# bootstrap 正确性由 base/final_observation.py 的 TransitionBootstrapContract 固化:
+#   它显式区分 timeout_terminal_mask（截断，要 bootstrap）与失败终止（不 bootstrap），
+#   并用模块级函数 patch_transition_next_obs(base/final_observation.py) 给终止帧的 next_obs 打补丁，
+#   保证 PPO（FinalObservationAwarePPO）/SAC 用的是真终止观测、而非 autoreset 后的新 obs.
+# 即:mjlab/Isaac 的 time_out 标记，在 UniLab 是一份显式的 bootstrap 契约数据结构.
+\end{codebox}
+
+\subsection{正确标记 \texttt{time\_out} 的决策框架}
+\label{sec:rlmc-rew-termdecide}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+条件 & 是否物理失败 & 建议 \verb|time_out| & 理由 \\
+\midrule
+固定回合长度到达 & 否（若无限时域） & \verb|True| & rollout 边界，不应清零未来价值 \\
+离开生成地形边界 & 多数否 & \verb|True| & 采样边界而非物理失败 \\
+平地大角度倾斜摔倒 & 是 & \verb|False| & 真实失败 \\
+大腿/膝盖非法接触 & 是 & \verb|False| & 真实失败 \\
+物理引擎 NaN & 是 & \verb|False| & 不可恢复错误 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[多视角：终止不是通用真理，依赖地形与任务边界]\label{ins:rlmc-rew-terrain}
+四足 rough（粗糙地形）配置常\emph{移除} \Verb[breaklines]|bad_orientation|/\allowbreak\verb|fell_over|：粗糙地形上机器人会明显倾斜，斜坡上的合理姿态可能触发基于姿态的终止，导致合理动作被误杀。flat（平地）配置则\emph{恢复}它：平地上大角度倾斜通常是真摔倒。同一个终止项，在不同地形下语义不同——这说明 termination 必须随任务边界一起设计，不能照搬。
+\end{insight}
+
+\begin{codebox}[Python]{自定义终止项:偏离路径（标为截断而非失败）}
+def path_deviation(env, max_deviation=2.0,
+                   asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+    """偏离目标路径超过阈值则提前结束（不是物理失败）."""
+    robot = env.scene[asset_cfg.name]
+    lateral = torch.abs(robot.data.root_pos_w[:, 1])           # y 偏移
+    return lateral > max_deviation                             # [num_envs] bool
+# 注册时 time_out=True:偏离路径不是"摔倒"，标为截断;否则评论家会把它当 V=0 失败，
+# 策略学到"宁可不走也不偏离".
+\end{codebox}
+
+\begin{pitfall}[两个高频终止错误]
+\textbf{编程陷阱}：所有 episode 结束都用同一个 done 信号、不区分截断与真失败。现象：PPO 评论家在 episode 尾部系统性低估。正确做法：用 \verb|time_out=True| 标记截断，并确认包装器把 \Verb[breaklines]|extras["time_outs"]| 传给 RSL-RL。
+
+\textbf{思维陷阱}：以为 termination 只影响日志。它直接决定价值函数的 target——是价值定义的一部分，不是日志细节（\cref{ins:rlmc-rew-bootstrap}）。
+\end{pitfall}
+
+\begin{practice}[练习·终止]
+\begin{enumerate}
+  \item \textbf{[分类]} 把以下条件分成 true termination 与 truncation：(a) 摔倒；(b) 时间到；(c) 地形边缘到达；(d) NaN 物理；(e) 越出生成地形。说明每个对自举的影响。
+  \item \textbf{[设计]} "跳过障碍物"任务：策略跳跃成功后 episode 应结束吗？标 true termination 还是 truncation？讨论不同选择对评论家价值估计的影响。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{课程学习：控制训练数据的分布}
+\label{sec:rlmc-rew-curr}
+
+\begin{quote}\small
+\textbf{这一节解决什么问题}：如何在训练中逐步增加任务难度？三条轴各控制什么？何时用 performance-driven、何时用 step-driven？
+\end{quote}
+
+\subsection{算法原理：课程改变的是数据分布，不是奖励梯度}
+\label{sec:rlmc-rew-currtheory}
+
+课程学习的核心思想源自 Bengio 等（ICML 2009\,\cite{bengio2009curriculum}）："由易到难"的训练顺序能加速学习并改善最终性能。在 RL 语境中，课程\emph{不}改变奖励函数（那是奖励塑形做的事），而是\textbf{改变训练数据的采样分布}。若不用课程，直接让策略在最难分布（高速命令 $+$ 粗糙地形 $+$ 严格惩罚）上训练，早期所有 episode 都会快速失败，奖励日志只显示低 tracking、高终止计数——策略在"太难以至于每步都没信息"的状态打转。这时再调 PPO 通常没用：\textbf{问题不是优化器，而是采样分布太难}。
+
+\begin{insight}[课程 vs.\ 域随机化：改难度还是改物理]\label{ins:rlmc-rew-currvsdr}
+课程改变\emph{任务难度}（命令范围、地形复杂度），但物理规律不变；域随机化（domain randomization，见后续 sim-to-real 章）改变\emph{物理规律}（摩擦、质量、延迟），但任务难度不变。两者可同时使用，但别混淆——"把摩擦系数范围从 $[0.5,1.5]$ 逐步扩大"是 DR，不是课程；"把速度命令从 $[0,1]$ 扩到 $[0,3]$ m/s"是课程。一个更生活化的类比：地形课程像按考试成绩升级（会走平地才上斜坡），命令课程像按学期推进（一年级只要求加减法），reward 课程像评分标准逐渐严格（一年级作文只要求写够字数）——三者都叫课程，但控制对象完全不同。
+\end{insight}
+
+\subsection{三条课程轴}
+\label{sec:rlmc-rew-curraxes}
+
+课程沿三条轴展开，每条控制不同维度。\textbf{三条轴不要同时大幅变化}，否则训练失败时无法定位原因。
+
+\textbf{轴一·地形难度（performance-driven）。} 这是 Rudin 等\,\cite{rudin2021minutes} 的"game-inspired curriculum"——一个 $10$ 行 $\times$ $20$ 列的地形网格，从前到后难度递增（平地 $\to$ 缓坡 $\to$ 阶梯 $\to$ 粗糙 $\to$ 间隙）。每个 environment 被分配到网格一个位置，按 episode 内位移决定升/降级：
+
+\begin{codebox}[Python]{地形课程核心逻辑（Isaac Lab terrain\_levels\_vel，已核对存在）}
+# mdp.curriculums.terrain_levels_vel（语义已核对;具体实现以仓库为准）
+def terrain_levels_vel(env, env_ids, command_name):
+    distance = torch.norm(                                       # episode 内前进距离
+        env.scene.robot.data.root_pos_w[env_ids, :2]
+        - env.scene.env_origins[env_ids, :2], dim=1)
+    move_up = distance > env.scene.terrain.cfg.size[0] / 2       # 走够远: 升级
+    expected = torch.norm(env.command_manager.get_command(command_name)[env_ids, :2],
+                          dim=1) * env.max_episode_length_s
+    move_down = distance < expected * 0.5                        # 没跟上命令: 降级
+    levels = env.scene.terrain.terrain_levels
+    levels[env_ids] += move_up.long() - move_down.long()
+    levels.clamp_(0, env.scene.terrain.max_terrain_level)
+    return levels.float().mean()
+\end{codebox}
+
+mjlab 的同名机制在 \Verb[breaklines]|tasks/velocity/mdp/curriculums.py| 的 \Verb[breaklines]|terrain_levels_vel|（mjlab 1.4.0），语义一致：按跟踪表现升/降地形难度，初始难度由 \Verb[breaklines]|TerrainGenerator| 的 \Verb[breaklines]|max_init_terrain_level| 控；运行日志会出现 \Verb[breaklines]|Curriculum/terrain_levels/mean| 这类曲线，可直接观察难度进展。UniLab 的地形课程在 \Verb[breaklines]|TerrainCurriculumCfg| $+$ \Verb[breaklines]|TerrainSpawnManager|（见 \cref{ins:rlmc-rew-penaltycurr} 的范式对照），是它少数与 Isaac Lab/mjlab 对齐为一等公民的课程类型。
+
+\begin{pitfall}[低速命令会"卡死"地形课程——官方已知问题]
+\Verb[breaklines]|terrain_levels_vel| 的升级条件依赖"机器人是否走出当前地形格"。若命令速度很低（如 $0.25$ m/s），机器人即使忠实跟随命令也可能永远走不出格子，地形难度无法提升。Isaac Lab 社区明确记录了这一限制\,\cite{isaaclab2024}。修复：确保命令课程让速度足够大，或调整升级判据。
+\end{pitfall}
+
+\textbf{轴二·命令范围（step-driven）。} 按训练步数（\Verb[breaklines]|common_step_counter|）逐步扩大速度命令范围：
+
+\begin{codebox}[Python]{命令课程（mjlab 风格，step 单位是 env step 不是 PPO iteration）}
+curriculum = {
+    "commands_vel": CurriculumTermCfg(
+        func=mdp.commands_vel_curriculum,
+        params={"command_name": "base_velocity", "stages": [
+            {"step": 0,          "ranges": {"lin_vel_x": (-1.0, 1.0)}},
+            {"step": 5000 * 24,  "ranges": {"lin_vel_x": (-1.5, 2.0)}},
+            {"step": 10000 * 24, "ranges": {"lin_vel_x": (-2.0, 3.0)}},
+        ]},
+    ),
+}
+\end{codebox}
+
+注意 step 是 \Verb[breaklines]|common_step_counter|（env steps），不是 PPO iteration。$5000\times24$ 大约对应第 $5000$ 个 PPO update（因 \Verb[breaklines]|num_steps_per_env=24|）。mjlab 把这套做成了一等公民：\Verb[breaklines]|tasks/velocity/mdp/curriculums.py| 的 \verb|commands_vel|（mjlab 1.4.0）用一个 \verb|VelocityStage| TypedDict 声明各阶段的速度范围，逐步放宽指令；训练日志会出现 \Verb[breaklines]|Curriculum/command_vel/lin_vel_x_max| 这样的曲线，可直接确认命令范围是否如期扩大。UniLab 侧无现成 step-driven 命令课程函数，需经 Hydra 分阶段覆盖 \Verb[breaklines]|env.commands.*| 或写自定义回调（与 $\sigma$ 课程同处境，见 \cref{sec:rlmc-rew-sigmacurr}）。
+
+\textbf{轴三·Reward/Termination 严格度（step-driven）。} 逐步收紧 reward 参数（如 tracking $\sigma$，见 \cref{sec:rlmc-rew-sigmacurr}）或 termination 阈值。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+策略类型 & 优点 & 缺点 & 适用 \\
+\midrule
+Performance-driven & 自适应，没学会就不升级 & 可能被 reward hacking 欺骗 & 地形难度 \\
+Step-driven & 简单稳定，不依赖 reward 质量 & 可能在没学会时强行加难 & 命令范围、reward 参数 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+推荐训练顺序：(1) 平地 $+$ 窄命令 $+$ 基础 reward $\to$ (2) 平地 $+$ 扩命令 $\to$ (3) 引入粗糙地形 $+$ 适中命令 $\to$ (4) 粗糙地形 $+$ 扩命令 $\to$ (5) 后期加严格 contact/style 惩罚。
+
+\begin{codebox}[Python]{三框架课程配置范式对照}
+# Isaac Lab: @configclass CurriculumCfg, 用 CurriculumTermCfg;
+#   地形课程项 func=mdp.terrain_levels_vel（已核对）.
+# mjlab: dict 形式，如上面的 commands_vel;地形课程 mjlab/tasks/velocity/mdp/curriculums.py
+#   的 terrain_levels_vel（按跟踪表现升/降）+ commands_vel（VelocityStage 分阶段放宽指令速度）.
+# UniLab: 无统一 CurriculumManager;课程拆成两个独立机制——
+#   (a) PenaltyCurriculum（base/curriculum.py）:自动识别 reward.scales 里 <0 的项，按 episode 长度
+#       在 [min_scale, max_scale] 间自适应缩放负权重（走得久=收紧 penalty;走不久=放松）;
+#   (b) 地形:TerrainCurriculumCfg + TerrainSpawnManager（地形等级，对应 terrain_levels_vel）.
+#   命令范围课程无现成 step-driven 函数，经 Hydra 分阶段覆盖 env.commands.* 或自定义回调.
+penalty_curriculum:                  # owner YAML（go2 rough）可覆盖项;默认值见 base/curriculum.py
+  enabled: true
+  min_scale: 0.5                     # dataclass 默认 0.5（不是 0）:早期把负权重缩到一半，而非全关
+  max_scale: 1.0                     # 后期:负权重恢复满额
+  level_up_threshold: 750.0          # 实装默认 750.0，是「绝对 episode 长度计数」不是比例 -> 升级（收紧 penalty）
+  level_down_threshold: 50.0         # 同为绝对计数;低于此 -> 降级（放松 penalty）
+# 注意:上面是实装 dataclass 的真实默认（min_scale=0.5 / level_up_threshold=750.0 绝对步数）.
+#   照抄"0.0 / 0.8 当比例"会得到与预期不同的课程行为——owner YAML 可覆盖，但默认务必查源码确认.
+\end{codebox}
+
+\begin{insight}[课程范式差异：UniLab 的 PenaltyCurriculum 是"performance-driven 的 reward 课程"]\label{ins:rlmc-rew-penaltycurr}
+本节正文把课程分成 performance-driven（地形）与 step-driven（命令/reward 参数）两类。UniLab 的 \Verb[breaklines]|PenaltyCurriculum| 是个有意思的杂交：它对 \emph{reward 权重} 做课程（像 reward 课程），却用 \emph{episode 长度} 当推进信号（像 performance-driven 地形课程）——即"活得越久，惩罚收得越紧"。这正是 \cref{sec:rlmc-rew-conflict} 冲突三（contact penalty vs.\ 快速学习）的自动化解：早期策略还不会走、episode 短，penalty 被自动缩到接近零让它先学基本步态；学会站稳、episode 变长后，penalty 自动恢复以精修行为。mjlab/Isaac Lab 要手写 step-driven 课程项才能近似这个效果，UniLab 把它做成了开箱机制（但只作用于负权重项）。
+\end{insight}
+
+\subsection{Reward 课程的非平稳风险}
+\label{sec:rlmc-rew-nonstationary}
+
+\begin{insight}[反直觉：reward 课程让 PPO 优化一个"会动的目标"]\label{ins:rlmc-rew-nonstationary}
+PPO 假设自己在优化一个\emph{固定} MDP，但 reward 课程正在改变奖励函数——这导致\textbf{非平稳}（non-stationarity）问题：策略为旧 reward 优化好的行为，在新 reward 下可能不再最优。反事实推理：若每个 PPO iteration 都微调 reward 参数会怎样？策略追踪的目标不断变化，优势估计的 baseline 不断失效——等价于在非平稳环境里做 on-policy 学习，收敛性没有保证。缓解：(1) stage 间隔至少几十到几百个 PPO update；(2) 参数变化幅度不宜过大（如 $\sigma$ 每次收紧 $\le30\%$）；(3) 若训练曲线在 stage 切换点骤降且不恢复，延长间隔或减小变化。
+\end{insight}
+
+\begin{pitfall}[两个课程高频错误]
+\textbf{编程陷阱}：课程 step 误用 PPO iteration 而非 common step。配 \Verb[breaklines]|"step": 5000| 以为是第 $5000$ 个 PPO iteration，实际是 \Verb[breaklines]|common_step_counter|（env steps）。换算：\verb|iteration| $\times$ \Verb[breaklines]|num_steps_per_env|。
+
+\textbf{思维陷阱}：以为课程能修复奖励设计错误。课程改变的是数据分布，不是奖励梯度方向。若奖励本身指向错误行为，课程只会让策略按部就班地学到错误行为。课程是好奖励的辅助，不是替代。
+\end{pitfall}
+
+\begin{practice}[练习·课程]
+\begin{enumerate}
+  \item \textbf{[设计]} 设计命令课程：先学前后走（只 $v_x$）$\to$ 再学侧移（加 $v_y$）$\to$ 最后学转弯（加 $\omega_z$）。写出 stage 配置（含 step 单位换算）。
+  \item \textbf{[分析]} 地形课程用 performance-driven，但策略学会原地打转（位移大但没跟命令）。地形难度会怎样变化？如何修复？（提示：结合 \cref{sec:rlmc-rew-curraxes} 的升级判据与命令期望距离。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{奖励消融方法论与 reward hacking 诊断}
+\label{sec:rlmc-rew-ablation}
+
+\begin{quote}\small
+\textbf{这一节解决什么问题}：怎样验证每个奖励项的必要性？如何识别"奖励高但行为差"的 reward hacking？
+\end{quote}
+
+\subsection{从失败现象出发：最小验证流程}
+\label{sec:rlmc-rew-smoke}
+
+正式训练前，先用四步流程确认奖励配置无误（三框架命令对照）：
+
+\begin{codebox}[bash]{四步验证（三框架:Isaac Lab / mjlab / UniLab）}
+# -- Isaac Lab --
+# Step1-2 zero/random agent:验证日志字段就位、数值无 NaN
+python scripts/reinforcement_learning/rsl_rl/play.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0 --num_envs 4
+# Step3 极小训练:2 iter，验证 PPO 能消费 reward/done
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0 --num_envs 64 --max_iterations 2
+# Step4 中等训练:200 iter，验证 tracking 上升
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0 --num_envs 1024 --max_iterations 200
+
+# -- mjlab --
+uv run play Mjlab-Velocity-Flat-Unitree-Go1 --agent random --num-envs 4 --viewer viser
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+  --env.scene.num-envs 64 --agent.max-iterations 2 --agent.logger tensorboard
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+  --env.scene.num-envs 1024 --agent.max-iterations 200 --agent.logger tensorboard
+
+# -- UniLab（env 数/迭代数走 Hydra 覆盖，不是 flag）--
+# Step1-2 极短训练:验证 reward/<name> 日志就位、无 NaN（NanGuard 默认开）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+  algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+# Step3 中等训练:验证 tracking 上升（reward/tracking_lin_vel）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+  algo.num_envs=2048 algo.max_iterations=300
+# Step4 回放看行为（PPO 在 play/eval 阶段才导 ONNX 并自验）
+uv run eval --algo ppo --task go2_joystick_flat --sim mujoco --load-run -1 --render-mode record
+\end{codebox}
+
+\textbf{TensorBoard 解读 workflow（按优先级）}：Step1 看 \Verb[breaklines]|Episode_Termination/*|——若 \verb|fell_over|/\allowbreak\Verb[breaklines]|bad_orientation| 占主导（$>50\%$），先解决稳定性再调 tracking；若 \verb|time_out| 占主导（$>80\%$），策略能存活到回合结束，可开始关注 tracking 质量。Step2 看 \Verb[breaklines]|Episode_Reward/track_*|——应持续上升，$200$ iter 后仍 $<0.3$ 则检查 $\sigma$/命令范围/action scale。Step3 看 penalty——\Verb[breaklines]|action_rate_l2| 绝对值应随训练下降（动作越来越平滑）。Step4 若以上都正常但 play 视频显示异常行为，就是 reward hacking。
+
+\textbf{怎么判断我这台机的 steps/s 算不算正常（而不是死记一个数字）}。书里出现的吞吐数（如某机 $\sim$8900 env-steps/s）只是\emph{某硬件某并行度}的点值，换机器/换并行度差几倍都正常，照搬去判断"性能回归"必翻车。该记的是\textbf{判据}而非数值：(1) \textbf{量级估算}——稳态 $\text{sps}\approx \verb|num_envs|\times\text{控制频率}\times\text{并行效率}$，故小并行（如 16/64 env）冷启时 sps 远低于大并行稳态是\emph{良性}的，不是故障；本机 RTX4080S 实测 UniLab 64env mujoco 后端冷启仅 $\sim$1500、热身后 $\sim$3569，mjlab Go1 64env $\sim$1000，与"大并行稳态"差一个量级正是因为并行不足 $+$ JIT 未热。(2) \textbf{线性性}——把 \verb|num_envs| 翻倍，sps 应近似翻倍；若不随并行增长，才该怀疑 CPU 核不足 / 共享内存抖动 / viewer 没关 / sensor 过多。(3) \textbf{冷热}——头几个 iter 慢（JIT/CUDA Graph 首次编译、缓存未热）属正常，看\emph{热身后是否稳定}而非首屏数字。(4) \textbf{结构比}——更可靠的健康信号是看 \Verb[breaklines]|Collection time| 与 \Verb[breaklines]|Learning time| 的比例（采样 vs 反传谁是瓶颈），它跨机器比绝对 sps 更可移植。一句话：\textbf{sps 看趋势与结构、不看绝对值}。
+
+\subsection{从零定位一个任务的 reward 键（消融前必做）}
+\label{sec:rlmc-rew-locatekeys}
+
+消融第一个会踩的坑不是判据，而是\textbf{覆盖路径里的项名写错}——因为同一个任务里"函数名 / dict 键名 / YAML scales 名"三者可能不一致（如 mjlab 函数 \verb|feet_slip| 对应 dict 键 \verb|foot_slip|），换个任务键名又全变。所以无论用哪个框架，扫消融前的第一步永远是\textbf{把当前任务真实注册了哪些 reward 键列出来}，而不是照抄书里的示例名。下面给三框架"从零定位 reward 键"的可复制流程（每条都给预期输出形态）：
+
+\begin{codebox}[bash]{从零定位 reward 键:三框架各一条防呆流程（先列键，再扫消融）}
+# -- mjlab:跑一次 2-iter 冒烟，日志里的 Episode_Reward/<键> 就是真实 dict 键 --
+WANDB_MODE=disabled uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+  --env.scene.num-envs 64 --agent.max-iterations 2 --agent.logger tensorboard 2>&1 \
+  | grep -oE 'Episode_Reward/[A-Za-z_]+' | sort -u
+# 预期形态（节选，这些才是覆盖时该用的键，注意是 foot_slip 单数 / air_time）:
+#   Episode_Reward/track_linear_velocity
+#   Episode_Reward/foot_slip
+#   Episode_Reward/air_time
+#   Episode_Reward/foot_clearance
+# 拿到键名后，覆盖路径 = --env.rewards.<键名把下划线换成连字符>.weight 0.0
+
+# -- mjlab（更直接，不跑训练）:实例化任务 cfg，打印 rewards dict 的键 --
+uv run python -c "from mjlab.tasks.velocity.velocity_env_cfg import *; \
+import mjlab.tasks.velocity.velocity_env_cfg as m; \
+cfg=[v for v in vars(m).values() if hasattr(v,'rewards')][0](); \
+print(sorted(cfg.rewards.keys()))"   # 直接拿到真实 reward 键集合（按你装的版本为准）
+
+# -- UniLab:打印 env 的 _reward_fns 派发表键（这才是 scales 能生效的名字）--
+uv run python -c "import unilab; from unilab.registry import *; \
+ensure_registries(); \
+print('登记任务:', list_registered_envs())"          # 先确认任务注册名（CamelCase）
+# 再在交互式里建出 env 后 print(sorted(env._reward_fns.keys()));
+# 预期:tracking_lin_vel / tracking_ang_vel / swing_feet_z / foot_drag / ...
+#   —— 这些是 reward.scales.<名> 覆盖时的合法键，拼错不会报错只会被静默跳过（见下）.
+\end{codebox}
+
+\begin{insight}[防呆调试技巧：mjlab 拼错键即报错，UniLab 拼错键静默跳过——利用前者、提防后者]\label{ins:rlmc-rew-keytypo}
+两框架对"覆盖了一个不存在的 reward 键"的反应正相反，这正好可当调试杠杆。\textbf{mjlab（tyro）}：覆盖路径里键名拼错（如把 \verb|foot_slip| 写成 \verb|feet_slip|）会立刻以 \Verb[breaklines]|unrecognized arguments| \textbf{报错退出}——所以 mjlab 这边可以"故意先拼一个错的，看报错信息里它建议的合法键名是什么"来反查正确键。\textbf{UniLab（run\_reward\_dispatch）}：\verb|scales| 里多出来的、派发表里没有的键被\emph{静默跳过}（源码末尾 \Verb[breaklines]|if scale==0 or name not in fns: continue|），不报错也不警告——于是"消融了半天 reward 曲线纹丝不动"往往不是该项不重要，而是键名压根没匹配上。\textbf{铁律}：UniLab 侧消融前务必先 \Verb[breaklines]|print(env._reward_fns.keys())| 核对键名（mjlab 侧可省，反正拼错会报错）。这条"一个报错一个静默"的差异，比单纯记住"哪个名对"更能让你举一反三到任何新任务。
+\end{insight}
+
+\begin{note}[把"作者已核对"变成你自己的技能：在已装库里 grep/inspect 反查函数签名]
+本章大量"已核对官方源码"的结论（如 Isaac Lab \Verb[breaklines]|track_lin_vel_xy_exp| 不含 $v_z$、mjlab \Verb[breaklines]|RewardManager(cfg, env, *, scale_by_dt=True)|）——其实都是在\emph{已安装的库}里用下面这套命令查出来的，而不是背文档。读者完全可以在自己的环境复现同样的核对，把"听作者讲"升级成"自己证"。三招（对任何框架/任何函数通用）：
+\begin{codebox}[bash]{自己核对函数签名/源码位置（举一反三到任何库）}
+# 招1:定位某符号在哪个文件、哪一行（最常用——书里文件名随版本会漂）
+PKG=$(uv run python -c "import mjlab,os;print(os.path.dirname(mjlab.__file__))")
+grep -rn "def track_linear_velocity" $PKG        # 直接拿到真实文件:行号
+
+# 招2:打印某函数的真实签名（参数名/默认值，比文档准）
+uv run python -c "import inspect, mjlab.envs.mdp.rewards as r; \
+print(inspect.signature(r.track_linear_velocity))"   # 形如 (env, std, command_name='base_velocity')
+
+# 招3:直接打印整段源码（确认有没有内嵌 v_z、用的是 std**2 还是 sigma 等实现细节）
+uv run python -c "import inspect, mjlab.envs.mdp.rewards as r; \
+print(inspect.getsource(r.track_linear_velocity))"
+\end{codebox}
+\textbf{为什么这比记文件名重要}：reward/curriculum 函数的源码位置常随框架小版本迁移（书里写的路径可能在你的版本已移走），而 \Verb[breaklines]|grep -rn| / \Verb[breaklines]|inspect.getsource| 永远指向\emph{你这台机上真实装着}的那份实现——这正是本章对 mjlab/UniLab 所有"已核对"结论的产出方式，也是工程教学最该留给你的"怎么核实而非背诵"的肌肉记忆。
+\end{note}
+
+\subsection{受控变量消融：判据不止 Final Return}
+\label{sec:rlmc-rew-ablationmethod}
+
+好的消融要严格控制变量：固定 seed、训练步数、命令范围、环境数、PPO 参数，每次只改一个项（项名先按 \cref{sec:rlmc-rew-locatekeys} 定位，别照抄示例名）。
+
+\begin{codebox}[bash]{消融工作流（mjlab，逐项关闭/调整后对比 TensorBoard）}
+export ABLATION_DIR="/tmp/mjlab/ablation_$(date +%Y%m%d)"; mkdir -p $ABLATION_DIR
+# baseline
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 --env.scene.num-envs 1024 \
+  --agent.max-iterations 1000 --agent.run-name baseline --agent.seed 42 \
+  --agent.logger tensorboard --agent.log-dir $ABLATION_DIR
+# 关闭脚滑惩罚（实跑确认 mjlab reward dict 键是 foot_slip 单数，func 才叫 feet_slip;
+#   覆盖路径用 dict 键 -> tyro 把下划线转连字符 -> --env.rewards.foot-slip.weight）
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 --env.scene.num-envs 1024 \
+  --agent.max-iterations 1000 --agent.run-name no_foot_slip --agent.seed 42 \
+  --env.rewards.foot-slip.weight 0.0 \
+  --agent.logger tensorboard --agent.log-dir $ABLATION_DIR
+# 收紧 tracking sigma
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 --env.scene.num-envs 1024 \
+  --agent.max-iterations 1000 --agent.run-name tight_sigma --agent.seed 42 \
+  --env.rewards.track-linear-velocity.params.std 0.25 \
+  --agent.logger tensorboard --agent.log-dir $ABLATION_DIR
+tensorboard --logdir $ABLATION_DIR
+# Isaac Lab: 改 velocity_env_cfg.py 中的 weight 或用 hydra override.
+# UniLab: 消融最干净——改 reward.scales 里的标量即可（Hydra 覆盖，无需碰函数/类）:
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+  algo.num_envs=1024 algo.max_iterations=1000 algo.seed=42      # baseline
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+  algo.num_envs=1024 algo.max_iterations=1000 algo.seed=42 \
+  reward.scales.foot_drag=0.0                  # 关脚拖/滑（UniLab go2 的 _reward_foot_drag 是脚滑类比项;置 0）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+  algo.num_envs=1024 algo.max_iterations=1000 algo.seed=42 \
+  reward.tracking_sigma=0.0625                                  # 收紧 sigma（=0.25²，等价 std 0.25）
+\end{codebox}
+
+\begin{insight}[多视角：UniLab 的标量字典让消融成本最低]\label{ins:rlmc-rew-ablationparadigm}
+\cref{ins:rlmc-rew-threeparadigm} 的范式差异在消融时兑现成实打实的便利：Isaac Lab 改 weight 要动 \Verb[breaklines]|velocity_env_cfg.py| 的类属性（或用 hydra override），mjlab 改 dict，而 UniLab 因为权重就是一张纯标量字典，\textbf{受控变量消融只需在命令行追加一个} \Verb[breaklines]|reward.scales.<name>=<value>| \textbf{覆盖}——既不碰代码、也不重编译，天然适合脚本化扫一组 ablation。代价已在 \cref{ins:rlmc-rew-threeparadigm} 指出：项名拼错（如 \Verb[breaklines]|reward.scales.foot_slipp=0.0|）不会报错，\Verb[breaklines]|run_reward_dispatch| 会把字典里多出来的、\verb|_reward_fns| 里没有的键\emph{静默跳过}——所以 UniLab 消融前务必先确认项名确在派发表里（可临时打印 \Verb[breaklines]|self._reward_fns.keys()|）。
+\end{insight}
+
+至少看四类判据：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+判据 & 含义 & TensorBoard 字段 & 怎么看 \\
+\midrule
+Final return & PPO 是否优化成功 & \Verb[breaklines]|Loss/mean_reward| & 应持续上升 \\
+Tracking reward & 主任务是否完成 & \Verb[breaklines]|Episode_Reward/track_*| & 应接近 $1.0$ \\
+Contact metrics & 行为质量是否变差 & \Verb[breaklines]|Metrics/slip_velocity_mean| & 应趋近零 \\
+Play video & 是否 reward hacking & 录视频 & 人工判断行为合理性 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Reward Hacking：本质与识别}
+\label{sec:rlmc-rew-hacking}
+
+\begin{insight}[本质洞察：reward hacking 的定义就是"奖励高但行为不符合设计意图"]\label{ins:rlmc-rew-hacking}
+唯一能检测 reward hacking 的方法是\textbf{看分项 reward $+$ metrics $+$ video}，绝不能只看总奖励曲线（呼应 \cref{ins:rlmc-rew-tworead}）。消融决策树：去掉项 $X$ 后——\textbf{(a)} return$\downarrow$ $+$ 视频变差 $\Rightarrow$ $X$ 必要，保留；\textbf{(b)} return$\downarrow$ $+$ 视频不变/变好 $\Rightarrow$ $X$ 可能与他项冲突，调 weight 而非删；\textbf{(c)} return$\uparrow$ $+$ 视频变好 $\Rightarrow$ $X$ 过度约束，考虑去掉或减 $|weight|$；\textbf{(d)} return$\uparrow$ $+$ 视频\emph{变差} $\Rightarrow$ \textbf{reward hacking！}$X$ 是必要的安全约束，策略在利用"去掉约束"刷更高奖励，必须保留、可能还需增 $|weight|$；\textbf{(e)} return$\approx$ $+$ 视频$\approx$ $\Rightarrow$ $X$ 贡献可忽略，可删以简化配置。
+\end{insight}
+
+反事实推理：去掉 \verb|feet_slide| 后 return 变高？不一定说明该项没用——可能只是少了一个负项。必须同时看 slip velocity metric 与视频：若 slip 明显变大但 return 更高，正是策略在"利用"去掉的惩罚刷分——reward hacking 的经典表现（对应决策树 (d)）。
+
+\textbf{多 seed 鲁棒性}：单 seed 结果可能被随机性误导。对关键决策（"是否保留某项"），用 $3$ 个 seed（如 42/123/456）重跑。若三个 seed 中有一个差异很大（一个收敛、两个不收敛），说明该配置对初始化敏感，不是鲁棒设计。
+
+\begin{pitfall}["奖励曲线高 = 行为好"是最危险的错觉]
+这条单列，因为它是运控 RL 最隐蔽、代价最高的失败模式。训练日志上一切"绿色"，部署却原地踏步/溜冰/跳跃前进。把它刻进肌肉记忆：\textbf{evidence before assertions}——下"训练成功"结论前，必须有分项奖励 $+$ 行为 metric $+$ 视频三重证据。
+\end{pitfall}
+
+\begin{practice}[练习·消融]
+\begin{enumerate}
+  \item \textbf{[实验]} 对 Go1 velocity flat（各 $1000$ iter）：(a) baseline；(b) 关 \verb|feet_slide|；(c) 关 \verb|feet_air_time|；(d) tracking $\sigma$ $0.5\to0.25$。对比四者的 tracking reward、action std、play video，按决策树给出每项决策。
+  \item \textbf{[分析]} 若 (b) 的 total return 高于 baseline，但 play 显示脚明显滑动，你如何决策？引用 \cref{ins:rlmc-rew-hacking} 的哪一支？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{常见误解汇总}
+\label{sec:rlmc-rew-misconceptions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.42\linewidth}p{0.52\linewidth}@{}}
+\toprule
+误解 & 纠正 \\
+\midrule
+"塑形 = 加项直到行为看起来对" & $20$ 项以上会"改一个崩全盘"；分层设计 $+$ 消融验证（\cref{sec:rlmc-rew-layers,sec:rlmc-rew-ablation}） \\
+"安全（势函数型）的奖励才好" & 几乎所有有用项都非势函数型；定理只给参考子类，非设计约束（\cref{ins:rlmc-rew-nonpotential}） \\
+"weight 越大越重要" & 重要性 $=$ weight $\times$ raw；比较前先看 raw 范围（\cref{sec:rlmc-rew-fulltable}） \\
+"penalty 越多行为越好" & 每加一项就多一个与 tracking 冲突的梯度；先 tracking $+$ 基础 reg，再逐步加 \\
+"$\sigma$ 越小越精确越好" & $\sigma$ 太小早期无梯度，学不会走；从大 $\sigma$ 起步用课程收紧（\cref{ins:rlmc-rew-expgrad}） \\
+"termination 只影响日志" & 它是价值函数 target 的一部分，错标系统性偏置评论家（\cref{ins:rlmc-rew-bootstrap}） \\
+"课程能修复奖励设计错误" & 课程改数据分布，不改梯度方向；奖励错则学得"井井有条的错"（\cref{sec:rlmc-rew-curr}） \\
+"奖励曲线高 = 训练成功" & reward hacking 的定义就是"高奖励 $+$ 错行为"；需分项 $+$ metric $+$ video（\cref{ins:rlmc-rew-hacking}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{小结}
+\label{sec:rlmc-rew-summary}
+
+本章把强化学习\emph{理论}里的"奖励"落到一台机器人上，主线始终是\textbf{算法领路、实践兑现}：先从 MDP 看奖励\emph{是什么}（\cref{eq:rlmc-rew-return}）、势函数塑形定理给出"安全塑形"的边界（\cref{thm:rlmc-rew-pbrs}）且工程中几乎总被突破（\cref{ins:rlmc-rew-nonpotential}）；再把速度跟踪奖励拆成四层（\cref{sec:rlmc-rew-layers}），逐层落成 mjlab / Isaac Lab / UniLab 三框架的配置与代码——tracking 的指数核实现"大误差不急追、小误差精调"的梯度整形（\cref{ins:rlmc-rew-expgrad}），\verb|scale_by_dt| 让权重独立于仿真频率（\cref{sec:rlmc-rew-dt}），终止语义是价值自举 target 的一部分（\cref{ins:rlmc-rew-bootstrap}），课程改变数据分布而非梯度方向（\cref{ins:rlmc-rew-currvsdr}），最后用受控变量消融把 reward hacking 从"训练成功"的错觉中揪出来（\cref{ins:rlmc-rew-hacking}）。
+
+\paragraph{术语速查表。}
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 含义 \\
+\midrule
+势函数塑形 (PBRS) & $F=\gamma\Phi(s')-\Phi(s)$，唯一保最优策略不变的塑形子类（\cref{thm:rlmc-rew-pbrs}） \\
+四层分解 & tracking / regularization / style / contact，社区事实共识（\cref{ins:rlmc-rew-consensus}） \\
+指数核 & $r=\exp(-e^2/\sigma^2)$，$e=\sigma$ 时 $r\approx0.368$ \\
+$\sigma$（reward std） & 物理空间核宽，$\approx$ 期望可接受误差的 $1\!\sim\!2$ 倍 \\
+\verb|scale_by_dt| & 每项乘 \verb|weight*dt|，使奖励独立于 decimation（\cref{sec:rlmc-rew-dt}） \\
+true termination & 真失败，评论家未来价值清零 \\
+truncation (\verb|time_out|) & 截断，评论家用 $V$ 自举不清零 \\
+performance/step-driven & 课程推进方式：按表现 / 按步数 \\
+staged reward & 操作类任务的串行门控奖励，声明学习顺序（\cref{ins:rlmc-rew-staged}） \\
+reward hacking & 奖励高但行为不符设计意图（\cref{ins:rlmc-rew-hacking}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+\begin{center}
+\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 奖励是 MDP 优化目标，塑形弥合语义鸿沟 & \cref{sec:rlmc-rew-gap} & 中 \\
+2 & 势函数塑形保策略不变；工程多用非势函数项 & \cref{sec:rlmc-rew-pbrs} & 较难 \\
+3 & 四层分解承认冲突，tracking 应主导梯度 & \cref{sec:rlmc-rew-layers} & 中 \\
+4 & 指数核大误差梯度趋零、小误差精调；$\sigma$ 选取 & \cref{sec:rlmc-rew-track} & 较难 \\
+5 & reg/style/contact 各自的物理含义与调参 & \cref{sec:rlmc-rew-aux} & 中 \\
+6 & 自定义项四铁律：形状/纯函数/NaN/范围 & \cref{sec:rlmc-rew-custom} & 中 \\
+7 & staged 门控把稀疏任务变稠密、声明顺序 & \cref{sec:rlmc-rew-staged} & 较难 \\
+8 & \verb|scale_by_dt| 与 Episode\_Reward 归一化 & \cref{sec:rlmc-rew-dt} & 中 \\
+9 & 终止 vs 截断 = 价值 target 的差别 & \cref{sec:rlmc-rew-term} & 较难 \\
+10 & 课程三轴；performance vs step-driven & \cref{sec:rlmc-rew-curr} & 中 \\
+11 & 受控变量消融 + reward hacking 决策树 & \cref{sec:rlmc-rew-ablation} & 较难 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{两大认知转变。} \textbf{从"一个奖励函数"到"多目标优化的标量化"}——奖励设计不是找一个正确函数，而是在帕累托前沿上选一个可接受的权衡点，承认冲突是正确调参的前提。\textbf{从"训练成功 = 奖励高"到"训练成功 = 行为对 + 奖励高"}——reward hacking 是运控 RL 最隐蔽的失败模式，唯一检测方法是分项奖励 $+$ 行为 metric $+$ 视频。
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\label{sec:rlmc-rew-further}
+\addcontentsline{toc}{section}{延伸阅读}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.30\linewidth}cp{0.50\linewidth}@{}}
+\toprule
+资料 & 难度 & 教什么 \\
+\midrule
+Ng--Harada--Russell 1999, "Policy invariance under reward transformations"（ICML'99）\,\cite{ng1999shaping} & 较难 & 势函数塑形的策略不变性定理——本章 \cref{thm:rlmc-rew-pbrs} 的来源 \\
+Rudin 等 2021, "Learning to Walk in Minutes"（arXiv:2109.11978）\,\cite{rudin2021minutes} & 中 & legged\_gym 的 locomotion 奖励体系与 game-inspired 地形课程 \\
+Bengio 等 2009, "Curriculum Learning"（ICML 2009）\,\cite{bengio2009curriculum} & 中 & 课程学习的理论基础——"由易到难"加速收敛 \\
+Margolis \& Agrawal 2022, "Walk These Ways"（arXiv:2212.03238，CoRL 2022）\,\cite{margolis2022walk} & 中 & 多命令 locomotion 与速度依赖的步态/姿态奖励 \\
+Cheng 等 2024, "Extreme Parkour with Legged Robots"（arXiv:2309.14341，ICRA 2024）\,\cite{cheng2024parkour} & 较难 & 视觉 $+$ 本体的极限跑酷，奖励与课程的极端案例 \\
+Schulman 等 2017, PPO（arXiv:1707.06347）\,\cite{schulman2017ppo} & 中 & 本章奖励所服务的优化器；clip ratio 与 reward scale 的交互 \\
+Isaac Lab 文档\,\cite{isaaclab2024} / mjlab\,\cite{mjlab2026} / RSL-RL\,\cite{schwarke2025rslrl} & 易 & 三框架的 reward/termination/curriculum manager 与自举接口 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{跨章联系}：本章建立的 reward/termination/curriculum 系统是后续多章的基础。策略优化章的超参数（learning rate、clip ratio、entropy bonus）必须与本章的 reward scale 匹配；域随机化章的随机化参数会影响奖励的期望与方差；师生蒸馏章的 teacher 与 student 可用不同奖励；操作章将展开 \cref{sec:rlmc-rew-staged} 的 staged 门控——一种与 locomotion 完全不同的奖励架构。
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\label{sec:rlmc-rew-trouble}
+\addcontentsline{toc}{section}{故障排查手册}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}p{0.24\linewidth}p{0.22\linewidth}Lc@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+奖励日志全为零 & 项未注册或 weight$=0$ & 查 cfg 项拼写；打印 active terms；确认 weight 非零 & \cref{sec:rlmc-rew-smoke} \\
+tracking 接近零但机器人在动 & $\sigma$ 太小 & 增大 std；查命令范围；打印 raw error & \cref{sec:rlmc-rew-track} \\
+机器人原地高频抖动 & \Verb[breaklines]|action_rate_l2| 太弱或符号错 & 确认 weight 为负且足够大 & \cref{sec:rlmc-rew-reg} \\
+溜冰步态（脚贴地拖） & \verb|feet_air_time|/\allowbreak\verb|feet_slide| 太弱 & 加大二者 $|weight|$ & \cref{sec:rlmc-rew-contact} \\
+episode 极短 & termination 过严或课程太难 & 查 \Verb[breaklines]|Episode_Termination/*| 分项；移除可疑 termination；降初始难度 & \cref{sec:rlmc-rew-term} \\
+曲线升但视频差 & reward hacking & 查分项 reward；查 metrics；做消融；录视频 & \cref{sec:rlmc-rew-ablation} \\
+课程切换时曲线骤降 & 非平稳 & 增大 stage 间隔；减小参数变化幅度 & \cref{sec:rlmc-rew-curr} \\
+改 decimation 后 reward scale 变 & \verb|scale_by_dt| 设置不一致 & 确认 \Verb[breaklines]|scale_by_dt=True|；检查是否重复乘 dt & \cref{sec:rlmc-rew-dt} \\
+terminated/truncated 不区分 & 包装器不传 \verb|time_outs| & 查 \Verb[breaklines]|is_finite_horizon|；确认 extras 含 \verb|time_outs| & \cref{sec:rlmc-rew-termimpl} \\
+penalty 过强导致不走路 & 早期 penalty 占主导 & 查分项 reward；减小 penalty weight；用课程延后 & \cref{sec:rlmc-rew-aux,sec:rlmc-rew-curr} \\
+地形难度一直不升 & 命令速度太低卡死课程 & 提高命令速度或改升级判据 & \cref{sec:rlmc-rew-curraxes} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\label{sec:rlmc-rew-version}
+\addcontentsline{toc}{section}{版本信息速查}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lLL@{}}
+\toprule
+框架/工具 & 本章核对版本 & 关键入口（本章用到） \\
+\midrule
+Isaac Lab & 2.3.2（内部包号 0.54.2） & \Verb[breaklines]|isaaclab.envs.mdp.rewards|/\allowbreak\verb|terminations|；\verb|RewardTermCfg|/\allowbreak\verb|DoneTerm|（\verb|time_out|） \\
+mjlab & 1.4.0\,\cite{mjlab2026} & \verb|RewardManager|（\verb|scale_by_dt|）/\Verb[breaklines]|TerminationManager|/\allowbreak\Verb[breaklines]|CurriculumManager| \\
+RSL-RL（\verb|rsl-rl-lib|） & 随宿主框架而异：mjlab 1.4.0 装 5.2.0、Isaac Lab 钉 \Verb[breaklines]|RSL_RL_VERSION=3.0.1|\,\cite{schwarke2025rslrl} & GAE 用 \Verb[breaklines]|extras["time_outs"]| 决定自举 \\
+UniLab & commit 99936e08（mujoco-uni 3.8.0 / motrixsim-core 0.8.2）\,\cite{unilab2026} & \verb|reward.scales| 字典 $+$ \Verb[breaklines]|run_reward_dispatch|；\verb|update_state| 算 terminated；\Verb[breaklines]|PenaltyCurriculum| \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{finenote}
+本章 Isaac Lab 的 reward/termination 函数名（\Verb[breaklines]|track_lin_vel_xy_exp|、\Verb[breaklines]|track_ang_vel_z_exp|、\Verb[breaklines]|action_rate_l2|、\verb|joint_acc_l2|、\Verb[breaklines]|joint_torques_l2|、\Verb[breaklines]|flat_orientation_l2|、\Verb[breaklines]|base_height_l2|、\Verb[breaklines]|undesired_contacts|、\verb|feet_air_time|、\Verb[breaklines]|feet_air_time_positive_biped|、\verb|feet_slide|、\verb|time_out|、\Verb[breaklines]|illegal_contact|、\Verb[breaklines]|bad_orientation|、\Verb[breaklines]|root_height_below_minimum|）与 lift-cube 的 \Verb[breaklines]|object_ee_distance|/\allowbreak\Verb[breaklines]|object_is_lifted|/\allowbreak\Verb[breaklines]|object_goal_distance| 二值门控，以及地形课程 \Verb[breaklines]|terrain_levels_vel|，均经联网核对官方源码与文档\,\cite{isaaclab2024}。源稿中"\verb|foot_slip|"已据官方更正为 \verb|feet_slide|，"非法接触"更正为 \Verb[breaklines]|undesired_contacts|（复数），"摔倒"终止对应官方 \Verb[breaklines]|bad_orientation|；Isaac Lab lift-cube 的门控经核对为二值（\Verb[breaklines]|object_is_lifted|）$\times$ tanh 核；而 mjlab 同名任务的 \Verb[breaklines]|staged_position_reward| 经核对确为乘法-指数核 \Verb[breaklines]|reaching*(1+bringing)|（两框架数学形式不同，已在正文区分，非编造）。\textbf{UniLab 各槽位已据实装框架（commit \texttt{99936e08}）的源码与实跑回填}\,\cite{unilab2026}：reward 范式为 \verb|reward.scales| 标量字典 $+$ \Verb[breaklines]|run_reward_dispatch| 派发表（非 Manager-Based），tracking 用 \Verb[breaklines]|tracking_lin_vel(ctx)| 指数核且 \Verb[breaklines]|tracking_sigma| 直接当 $\sigma^2$，终止在 \verb|update_state| 里算 $+$ \Verb[breaklines]|TransitionBootstrapContract| 管自举，\Verb[breaklines]|reward*ctrl_dt| 对应 \verb|scale_by_dt|；UniLab \emph{无} 现成"按步收紧 $\sigma$"课程函数（只有 \Verb[breaklines]|PenaltyCurriculum| 与地形课程）、\emph{无} 与 lift-cube 对应的二值门控 staged 奖励，已在对应处如实标注（非编造）。mjlab 的文件路径、\verb|RewardManager|（manager 级 \verb|scale_by_dt|）、\Verb[breaklines]|reward_curriculum|、\Verb[breaklines]|staged_position_reward| 与 \Verb[breaklines]|terrain_levels_vel| 均经公开仓库核实\,\cite{mjlab2026}；版本号亦已坐实——Isaac Lab 2.3.2、mjlab 1.4.0，\verb|rsl-rl-lib| 随宿主而异（mjlab 装 5.2.0、Isaac Lab 钉 3.0.1），具体均以你安装版本为准。
+\end{finenote}

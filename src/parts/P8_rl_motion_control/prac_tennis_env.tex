@@ -1,0 +1,1456 @@
+\chapter{网球场环境构建与球物理}\label{ch:rlmc-tennisenv}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章。
+%  主线：算法/概念领路 —— 先立「球类运动 RL 任务在概念上有哪些观测/奖励/
+%  物理建模技巧 + 原理」，再把每个概念落到 mjlab / Isaac Lab / UniLab 三框架
+%  的工程接线。假定读者已学完强化学习理论部与本部前置实践章（观测·动作·奖励·
+%  Manager·DR·特权·物理引擎），不再重教 MDP/PPO/接触求解基础，聚焦「目标在
+%  高速飞行」这一新设定下的环境建模与 hands-on 验证。
+%  源稿 RL运控/Ch26_网球场环境构建与球物理.md（实践偏重）按本主线重构：
+%   - 把「mjlab 逐节讲」改为「概念领路 + 三框架横向对比实践」；UniLab 一列已据
+%     服务器实装框架（UniLab main, commit 99936e08；mujoco-uni 3.8.0 / motrixsim-core
+%     0.8.2）的源码+实跑补实——因 UniLab 官方 26 个任务无网球任务，UniLab 槽位给的是
+%     「用其真实编程模型（NpEnv 子类 + MJCF + @registry + run_reward_dispatch）自建该
+%     任务」的接线，并诚实标注真实欠缺（无 zero agent / 无 task-space IK action 类 /
+%     无 restitution 直控）。事实来源 docs/RL运控融合_UniLab参考.md。
+%   - 关键 API/版本/论文归属/数值经联网核对（见各 \rebuilt / \pz 标注与
+%     claimsToVerify），已纠正源稿若干错处：
+%       * 源稿称「mjlab 内置 Tennis Launcher」——经核 mjlab core(1.4.0) 只内置
+%         velocity / motion-tracking 任务，无 tennis；本章统一改述为「基于 mjlab
+%         的课程示例任务」。
+%       * Isaac Lab 的 set_external_force_and_torque() 自 v2.3.2 弃用，改用可组合
+%         wrench 系统（permanent_wrench_composer.set_forces_and_torques()）；mjlab 施外力
+%         真实 API 是 write_external_wrench_to_sim()（实测），正文已标注。
+%       * 论文真机成功率按官方数字校正（LATENT 90.9%/77.8%，HITTER 92.3%/106 拍）。
+%       * Phybot 出球速度 19.1 m/s 系误植——官方为「出球上限约 10 m/s、挥拍约
+%         5.3 m/s、平均回球落点距拦截区约 3.5 m」，已就地校正（arXiv:2511.11218）。
+%       * 复核(2)实测 mjlab：EventTerm/TerminationTerm 基类不存在（唯一基类 ManagerTermBase，
+%         CommandTerm 真实存在），施外力 API = write_external_wrench_to_sim()；已就地改正。
+%       * MuJoCo friction 三元组与 condim 生效维数按官方 XML reference 重述。
+% ════════════════════════════════════════════════════════════════
+
+强化学习运动控制走到这里，机器人面对的目标第一次\emph{在高速运动}。前面所有单形态实战——四足速度跟踪（\cref{ch:rlmc-quadloco}）、人形 locomotion、操作——目标要么静止（地形不动），要么缓变（命令缓慢切换）。本章起步的网球场景把设定推到另一端：一颗时速 $20$--$45$\,m/s 的球飞过来，机器人要在几百毫秒内感知、预测、决策、出手。这种「目标在飞」的设定会\textbf{放大}前面每一个模块的设计缺陷——坐标系含糊一点，感知标注就错；球的自由度漏一维，轨迹预测就错；reward 语义与物理几何对不齐，策略就学到错误目标。
+
+所以本章的产物\emph{不是}一个好看的场景，而是一份后续所有模块共同依赖的\textbf{数据协议}（data contract）：球场坐标系、球体物理参数、发球命令格式、弹道模型、接触语义、reset 协议。它是综合项目的「地基与施工图」。本章遵循全书「概念领路、实践兑现」的次序：每一节先立\textbf{物理建模/工程主线}（这个环节有哪些设计量、背后的物理原理与反面教训），再在其下排布\textbf{三框架对比实战}：mjlab（MuJoCo Warp 后端）与 Isaac Lab（PhysX 后端）给出可运行接线，UniLab（CPU 物理 $+$ GPU 策略的异构栈）则据服务器实装框架的源码与实跑给出「用其真实编程模型自建该任务」的接线，并诚实标注真实欠缺（详见下文事实边界）。
+
+本质洞察先行：\textbf{球类运动 RL 的核心难点不在算法（PPO 足够），而在工程设计——仿真频率、坐标约定、观测/奖励语义、接触参数、Sim2Real 随机化。这些决策绝大多数在「环境层」做出，而非算法层。}本章就是把这层地基讲透。假定你已熟悉 \cref{ch:rlmc-obsact}（观测/动作）、\cref{ch:rlmc-reward}（奖励/终止）、\cref{ch:rlmc-manager}（Manager-Based 架构）、\cref{ch:rlmc-dr}（域随机化）、\cref{ch:rlmc-physics}（物理引擎接触求解）；若生疏，建议先回相应章节。
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-tennis-env}
+
+本章的物理验证以 mjlab（MuJoCo Warp）为主、Isaac Lab（PhysX）为对照。两套栈对「高速小球 + 薄体碰撞」这一难点的处理差异很大，先把版本与系统要求对齐——\textbf{版本错配是本章代码跑不通的头号原因}。
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}llLLL@{}}
+\toprule
+组件 & 锚定版本 & 操作系统 & GPU 要求 & 本章用途 \\
+\midrule
+mjlab & 1.4.0 & Linux / macOS（仅评估） & 训练需 NVIDIA & MjSpec 构球、\Verb[breaklines]|uv run play| 验证 \\
+MuJoCo & $\ge 3.8.0$ & 全平台 & CPU 可跑 & \verb|condim|/\allowbreak\verb|solref|/\allowbreak\verb|solimp| 语义 \\
+MuJoCo Warp & 随 mjlab 1.4.0 & Linux & NVIDIA & GPU batched worlds、外力 buffer \\
+Isaac Lab & 2.3.x（主线） & Linux / Windows & NVIDIA RTX & \Verb[breaklines]|RigidObjectCfg|、\Verb[breaklines]|PhysicsMaterial| \\
+PhysX & 5.4+ & 随 Isaac Sim & NVIDIA & restitution 直控、ghost contact \\
+UniLab & main（commit \texttt{99936e08}） & Linux / macOS & 物理在 CPU、策略需 GPU & \verb|NpEnv| 子类建球场+球、\verb|train/eval| 验证 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paragraph{UniLab 侧的事实边界（与 mjlab/Isaac Lab 同样诚实）。}本章三框架对照里 UniLab 一列的依据是服务器实装框架（UniLab main，commit \texttt{99936e08}；后端 \verb|mujoco-uni| 3.8.0 / \Verb[breaklines]|motrixsim-core| 0.8.2）的源码与实跑\,\cite{unilab2026}。需先说清：\textbf{UniLab 官方任务集（实测 $26$ 个注册任务）全是 locomotion / manipulation / motion-tracking，没有任何网球或球类任务}，也没有「内置 Tennis Launcher」。因此 UniLab 一列与 mjlab「课程示例」、Isaac Lab「完全自建」同属\textbf{「在框架之上 DIY 一个新任务」}的形态——下文凡 UniLab 槽位，给的是「\emph{若}用 UniLab 真实编程模型搭这个网球任务，该怎么接线」，而非框架自带的现成命令。UniLab 的范式还与前两家正交：它\textbf{不是} Manager-Based（无 \Verb[breaklines]|ObservationManager|/\allowbreak\verb|RewardManager|/\allowbreak\verb|EventManager| 等类），MDP 逻辑集中在 \verb|NpEnv| 子类的 \Verb[breaklines]|update_state()| 里，物理跑 CPU、策略跑 GPU、二者经共享内存 IPC 解耦（\cref{sec:rlmc-eco-manager} 已讲）。
+
+\paragraph{一个必须先说清的事实边界。}源课程把网球场景称作「mjlab 内置 Tennis Launcher」。mjlab 官方只内置 velocity tracking、motion imitation（运动模仿）与 manipulation 三类参考任务，并\emph{不}附带 tennis 任务（本书锚定 mjlab 1.4.0 核实；参考任务清单随版本可能增删，以你装的 README 为准）。因此本章把它统一表述为\textbf{「基于 mjlab 搭建的课程示例任务」}（task id 沿用 \Verb[breaklines]|Mjlab-Tennis-Launcher| 作占位拼写）——它复用 mjlab 的 Manager/Entity/CLI 体系，但球场、球、发球命令、空气动力学事件都是课程在 mjlab 之上自定义的。Isaac Lab 侧则\textbf{没有}任何官方网球任务，需要完全自建。这条边界很重要：下文「已有」指课程示例已实现的对象，「预规划」指综合项目后续（人形网球击球）应当设计、当前仓库尚不存在的对象。
+
+\paragraph{分操作系统要点。}\textbf{Linux} 是两框架一等公民，下文命令默认 Linux。\textbf{macOS} 只能跑 CPU MuJoCo 与 mjlab 评估（无 CUDA、不能训练），但足够做本章绝大多数\emph{单环境物理验证}（弹道、COR 标定、碰撞分离）——这恰恰是本章主体。\textbf{Windows} 建议走 Isaac Lab 官方支持或 WSL2。
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：五分钟看球飞起来}
+\addcontentsline{toc}{section}{Quick Start：五分钟看球飞起来}
+\label{sec:rlmc-tennis-quickstart}
+
+最小可跑目标：不训练、不写任何策略，用 zero agent 让一颗球在场上发射、飞行、弹跳、reset——亲眼确认「球能飞、方向对、多环境不串台」。这是本章一切验证的起点。
+
+\begin{codebox}[bash]{mjlab:zero agent 看球发射（约两分钟）}
+pip install mjlab
+# zero agent = 策略恒输出 0;Phase 1 无动作维度，本来就只能用 zero/random.
+# 应看到:蓝色球场 + 黄色球，从 x>0 侧飞向 x<0 侧，弹跳后停住再 reset.
+uv run play Mjlab-Tennis-Launcher --agent zero --num-envs 16 --viewer viser
+\end{codebox}
+
+\begin{codebox}[bash]{Isaac Lab:自建网球场景的最小入口（示意）}
+# Isaac Lab 无官方网球任务;下面是「自建 task 后」的运行形态，仅示意 CLI 形状.
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py \
+  --task Isaac-Tennis-Launcher-v0 --num_envs 16
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab:自建网球任务后的最小入口（示意;无官方网球任务）}
+# UniLab 官方 26 个任务全是 locomotion/manip/motion-tracking，无网球任务（commit 99936e08）.
+# 下面是「自建 NpEnv 子类 + 注册 TennisLauncher 后」的运行形态，仅示意 CLI 形状.
+# UniLab 无现成「zero agent」:play/eval 路径动作来自策略;看球纯发射可跑极短训练或回放.
+uv run eval --algo ppo --task tennis_launcher --sim mujoco \
+    --load-run -1 --render-mode interactive   # Viser web 3D 看球场+球
+# env 数/迭代数走 Hydra 覆盖（不是 flag）;首跑拉 HF 资产须 export HF_ENDPOINT=https://hf-mirror.com
+\end{codebox}
+
+UniLab 这条命令与 mjlab/Isaac Lab 同列\emph{意图相同}（确认场景能加载、球能发、方向对、多 env 不串台），但形态因「CPU 仿真 $+$ 无 zero agent」范式而异：UniLab 的 \verb|NpEnv| 每步走 \verb|apply_action|$\to$后端 CPU 物理步$\to$\verb|update_state|，没有「control 恒零」的 zero agent 入口，所以「看球纯发射」要么跑一次极短训练在 Viser 里观察前几帧、要么回放已训策略\,\cite{unilab2026}。本章 Phase 1（无动作维）在 UniLab 里更自然的做法是\textbf{把发球写进 reset、动作空间留空（或仅占位）}，下文 \cref{sec:rlmc-tennis-manager} 的全链路槽位给出骨架。
+
+\begin{pitfall}[\texttt{Mjlab-Tennis-Launcher} 今天敲不出来——先用现成任务把可迁移概念跑通]
+\textbf{错误描述}：照抄 \Verb[breaklines]|uv run play Mjlab-Tennis-Launcher| 期望直接看到球场。\textbf{现象后果}：\Verb[breaklines]|uv run list-envs| 实测只有 $12$ 个任务（全是 locomotion/manip，\textbf{无任何 tennis 任务}），该命令报「task not found」。\textbf{根本原因}：tennis 任务是本章\emph{要你自建}的（mjlab 不内置，见 \cref{sec:rlmc-tennis-env} 事实边界），上面的 CLI 只示意\emph{建好后}的形状。\textbf{正确做法（从零搭起的读者）}：本章 freejoint / COR / condim / 速度分解这些概念全部\textbf{可迁移}，不必等 tennis 任务就位——先用两条今天就能跑的路径建立手感：(1) 纯物理概念（COR/condim/freejoint）走 \cref{sec:rlmc-tennis-contact} 的\textbf{纯 MuJoCo standalone 脚本}（不依赖 mjlab，照敲即跑）；(2) 框架链路（list-envs/play/train/viewer）拿现成 stock 任务 \Verb[breaklines]|uv run play Mjlab-Velocity-Flat-Unitree-Go1 --num-envs 16| 跑通，把「命令怎么敲、viewer 怎么开、num-envs 怎么改」先练熟，再回来套 tennis。
+\end{pitfall}
+
+\paragraph{一手吞吐与启动时间预期（RTX 4090 单卡，校准你自己的环境）。}本章命令多为单环境物理验证（秒级），但你迟早要训练，先给一组实测锚点免得被「慢得不正常」误导：mjlab（MuJoCo Warp）在\textbf{RTX 4090} 上跑 \Verb[breaklines]|Mjlab-Velocity-Flat-Unitree-Go1 --num-envs 64| 约 \textbf{$2400$--$2500$ steps/s}（本章 gpufree 实测 $\approx2473$），且\textbf{秒级启动}——这是 mjlab 相对 Isaac 的体感优势之一。对照：\textbf{Isaac Sim/Isaac Lab 首次启动通常要数分钟}（编译 USD/PhysX kernel、拉资产），适合大批量长训而非快速迭代；\textbf{UniLab 物理在 CPU}、吞吐取决于 CPU 核数与 env 数，与前两者不可直接比。看到自己 $64$-env 训练只有几百 steps/s 时，先排查是不是 num-envs 太小、viewer 没关、或 GPU 被占——而非以为框架坏了。
+
+\begin{practice}[前置自测：答不出 $\ge 3$ 题，先回对应章节复习]
+\begin{enumerate}
+  \item （Manager）\cref{ch:rlmc-manager}：九大 Manager 中，哪个负责在 episode reset 时设置随机初始条件？哪个负责每步施加外力？（答错回看 \cref{ch:rlmc-manager}）
+  \item （观测）\cref{ch:rlmc-obsact}：多环境并行时 \verb|env_origins| 起什么作用？写入物理状态与读取观测时，对它的处理有何不同？（答错回看 \cref{sec:rlmc-obsgroups}）
+  \item （物理）\cref{ch:rlmc-physics}：MuJoCo 的 \verb|freejoint| 给 body 几个自由度？\verb|qpos| 与 \verb|qvel| 维数为何不等？（答错回看 \cref{ch:rlmc-physics}）
+  \item （物理常识）抛体运动忽略空气阻力时，水平方向为何匀速、竖直方向加速度多少？为什么真实网球必须考虑阻力？
+  \item （奖励）\cref{ch:rlmc-reward}：若把「球落在发球区」的 reward 区域写得比真实 ITF 发球区宽，训练曲线会怎样？这种 bug 为何不在 loss 上显现？（答错回看 \cref{ch:rlmc-reward}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章目标}
+\addcontentsline{toc}{section}{本章目标}
+\label{sec:rlmc-tennis-goals}
+
+学完本章，你应当\textbf{能够}（每条都可当场验收）：
+
+\begin{enumerate}
+  \item \textbf{画出} court-local 坐标系并标注网/baseline/service line 的 ITF 标准尺寸，说清「球飞行方向为何取 $-x$」；
+  \item \textbf{配置}网球的 \verb|freejoint| + \verb|condim|/\allowbreak\verb|friction|/\allowbreak\verb|solref|/\allowbreak\verb|solimp|，并说清每个接触参数的物理含义、合理范围与耦合关系；
+  \item \textbf{实现}八维发球命令（CommandTerm），写出球面到笛卡尔的速度分解公式并解释 $v_x$ 的负号与 \verb|env_origins| 加减法则；
+  \item \textbf{实现}三层空气动力学事件（真空 $\to$ 二次阻力 $\to$ Magnus），并用三层对照实验验证每层的增量贡献；
+  \item \textbf{调通} COR 标定（从 $2.54$\,m 落体）使球-地面弹跳落在硬地 $0.73$--$0.76$ 区间，并定位「球不弹/弹太高/穿网」三类故障；
+  \item \textbf{设计}后续人形网球击球任务（机器人 + 球拍 MJCF）的阶段化引入路线，为 Privileged Critic / Dynamics DR / 高频仿真「留接口」。
+\end{enumerate}
+
+\paragraph{知识导航与阅读时间。}本章结构如下树。建议精读 $4$--$5$ 小时（含动手实验）；有仿真经验者速读 $2$--$3$ 小时（重点看三框架对比表与三层对照实验）；遇到具体物理问题速查 $40$ 分钟（直接跳故障排查手册）。
+
+\begin{center}
+\begin{forest} navtreeLR
+[网球环境实战
+  [{环境即数据协议\\（跨模块契约）},name=contract]
+  [{球场几何\\（坐标系$+$碰撞分离）}]
+  [{球体物理\\（freejoint$+$接触参数）}]
+  [{发球命令\\（八维$+$速度分解）}]
+  [{弹道物理\\（三层空气动力学）}]
+  [{接触验证\\（COR$+$语义撞网）}]
+  [{Manager 全链路\\（注册$\to$termination）}]
+  [{机器人$+$球拍\\（阶段化路线）}]
+  [{验收实验\\（构建/轨迹/接触）}]
+  [{前沿系统\\（LATENT$\to$HITTER）}]
+]
+\end{forest}
+\end{center}
+
+\paragraph{前置桥接。}本章把前面打磨的零件用在一个「快变目标」任务上：Entity/Scene/Registry（\cref{ch:rlmc-manager}）承载球场与球；CommandTerm（\cref{ch:rlmc-reward} 里 velocity command 的同构推广）生成发球；EventManager（\cref{ch:rlmc-dr}）每步施加空气动力学外力；接触求解（\cref{ch:rlmc-physics}）决定弹跳；Privileged Critic（\cref{ch:rlmc-privileged}）将在击球任务里区分 actor/critic 观测。读本章时不妨随时回看这些章——本章只补「球类运动特有的环节」。
+
+% ════════════════════════════════════════════════════════════════
+\section{环境为什么是综合项目的地基}
+\label{sec:rlmc-tennis-contract}
+
+\paragraph{模块功能与在管线中的位置。}单一任务（如四足速度跟踪）只有一个模块，observation/reward/termination 由同一份 env cfg 定义，出问题改一处即可。网球这类综合项目不同：感知、轨迹预测、控制三个模块\textbf{共享}同一套坐标系、同一组物理参数、同一个 reset 协议。这一节先立全章的工程主线——\emph{环境是跨模块的数据协议}——后面所有几何、物理、命令、奖励的设计都是它的推论。
+
+\paragraph{动机：错误会被下游模块「学进去」并放大。}如果球场坐标在环境层定义得含糊，感知模块可能把 $y$ 轴正方向解释反，预测模块可能把发球方向搞错，控制模块可能把落点区域画偏。要命的是这些错误\textbf{不在单模块的指标上显现}：检测 loss 可能很低、预测 RMSE 可能正常、控制 reward 可能缓慢上升——但系统级测试时策略持续打空。
+
+\begin{insight}[环境是综合项目里杠杆效应最大的一层]\label{ins:rlmc-tennis-contract}
+综合项目的环境不是「场景渲染」，而是\textbf{跨感知/预测/控制/训练共同依赖的数据协议}。坐标与语义一旦含糊，下游模块会用\emph{更复杂}的模型把错误放大，而非自动修正它。反事实更尖锐：在 RL 里，策略甚至会\emph{学到补偿坐标偏差}的行为——你事后修正坐标，性能反而下降，于是陷入「一改环境策略就崩」的困境。这就是为什么环境层「每省 1 小时仔细验证，后面可能赔上 10 小时调试」。
+\end{insight}
+
+类比理解：这像建筑的地基与图纸——地基歪一度，一楼看不出，二十楼偏好几米。但类比有边界：建筑地基歪了无法回改，仿真环境却可以修改；只是修改意味着\emph{所有下游模块都要重新验证}，代价随项目规模指数增长。所以「先把协议定对」比「先写算法」省钱得多。
+
+\paragraph{三个反事实（为什么不能先写算法、后补环境）。}
+\begin{itemize}
+  \item \textbf{先写控制再补环境}：控制基于某种隐含坐标假设开发，集成时才发现与感知坐标不一致；此时两边内部逻辑都已「适应」各自约定，改任一方都引新 bug。
+  \item \textbf{不验证 reward 语义就训练}：把「球落在发球区」写进配置，但代码里其实是整条近端后场（合并两个 service box、不分 deuce/ad）。日志显示 reward 很高，拿 ITF 规则一查根本不是合法发球。
+  \item \textbf{不验证 freejoint 就写轨迹预测}：球被建成普通 body（无 joint），相对 parent 刚性焊接——无论你怎么写速度球都不飞，但 PPO 不会报错，observation 里速度甚至会短暂非零（写了 \verb|qvel|），视觉上球却纹丝不动。
+\end{itemize}
+
+\paragraph{前沿系统的仿真频率：环境参数的第一性约束。}在动手配 \verb|timestep|/\allowbreak\verb|decimation| 前，先看前沿系统对仿真频率的要求——它直接决定本章的频率配置。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llllll@{}}
+\toprule
+系统 & 物理引擎 & 仿真频率 & 控制频率 & 球速 & 接触时长 \\
+\midrule
+LATENT（网球）\cite{tennis_latent2026} & MuJoCo JAX & $2000$\,Hz & $50$\,Hz & peak $>15$\,m/s & $3$--$5$\,ms \\
+HITTER（乒乓）\cite{tennis_hitter2025} & Isaac Lab & — & $50$\,Hz & — & $\sim1$\,ms \\
+ETH 羽毛球 \cite{tennis_eth2025badminton} & Isaac Gym & $\sim1000$\,Hz & $\sim100$\,Hz & $\le12$\,m/s & $\sim5$\,ms \\
+Phybot 羽毛球 \cite{tennis_phybot2025} & Isaac Gym & — & $50$\,Hz & out $\le10$\,m/s & $\sim5$\,ms \\
+课程示例 Tennis & MuJoCo Warp & $500$\,Hz & $100$\,Hz & $20$--$45$\,m/s & $2$--$4$\,ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+LATENT 论文明确「仿真频率设为 $2000$\,Hz 以准确建模球-拍与球-地接触」\cite{tennis_latent2026}。原理很直白：球拍-球接触只持续 $3$--$5$\,ms，若仿真步长 $0.001$\,s（$1000$\,Hz），一次接触只有 $3$--$5$ 个仿真步解算接触力，可能不足以捕捉冲量传递；$2000$\,Hz（$0.0005$\,s 步长）保证每次接触至少 $6$--$10$ 步。课程示例的 \Verb[breaklines]|timestep=0.002|（$500$\,Hz）对\emph{纯弹道飞行}够用，但对\emph{球拍-球接触}不足——这是后续击球任务必须提频的根本原因。\pz{HITTER（Isaac Lab）与 Phybot（Isaac Gym）的底层仿真频率官方未逐字给出，表中仿真频率列以「—」留空。球速列为量级：Phybot 官方报「出球速度上限约 $10$\,m/s、挥拍速度约 $5.3$\,m/s」（已据此校正，原 $19.1$ 系误植）；ETH 报「挥拍峰值 $12.06$\,m/s（命令 $19$\,m/s 时的实际执行值）」，表中「$\le12$」按此挥拍量级记。}
+
+\paragraph{Isaac Lab 侧的对照（同一协议，不同实现）。}Isaac Lab 没有网球任务，自建时核心差异在物理表达：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & mjlab（MuJoCo） & Isaac Lab（PhysX） \\
+\midrule
+模型格式 & MJCF XML + \verb|MjSpec| & USD + Python spawn cfg \\
+碰撞参数 & \verb|condim|/\allowbreak\verb|friction|/\allowbreak\verb|solref|/\allowbreak\verb|solimp| & \Verb[breaklines]|PhysicsMaterial|（static/dynamic friction, restitution） \\
+自由刚体 & \verb|freejoint| & \Verb[breaklines]|RigidObjectCfg|（根 prim 加 USD RigidBodyAPI） \\
+外力施加 & \Verb[breaklines]|write_external_wrench_to_sim()| & wrench composer（\Verb[breaklines]|set_forces_and_torques|）$+$\Verb[breaklines]|write_data_to_sim()| \\
+接触检测 & \Verb[breaklines]|MjData.contact| + 语义检测 & \Verb[breaklines]|ContactSensorCfg| \\
+仿真频率 & 直接设 \verb|timestep| & 经 \verb|PhysxCfg.dt| 与 substeps 控制 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+一个关键的引擎本质差异：PhysX 用 restitution coefficient 直接控制弹跳（即 COR），而 MuJoCo 经 \verb|solref|/\allowbreak\verb|solimp| 间接控制。所以在 Isaac Lab 里标定 COR 更直接——设 \Verb[breaklines]|restitution=0.75| 即可，不必像 MuJoCo 那样迂回标定 \verb|solref|。但 PhysX 对\textbf{薄体高速碰撞}的处理不如 MuJoCo 稳：某些配置下高速小物体撞薄面会出现「幽灵接触」（ghost contact）。\pz{LATENT 选 MuJoCo（JAX）而非 PhysX：论文未逐字给出「接触求解更稳」这一理由，此处为工程经验推断，非论文确证。}双框架的教学价值见 \cref{ins:rlmc-tennis-sim2sim}。
+
+\begin{insight}[双引擎都跑得好 = 策略学到了任务本质]\label{ins:rlmc-tennis-sim2sim}
+如果同一策略在 MuJoCo 与 PhysX 两个接触模型下都表现良好，说明它学到的是「任务本质」而非「某引擎的数值特性」——这是 Sim2Real 鲁棒性的强信号，与 \cref{ch:rlmc-physics} 的 sim-to-sim 交叉验证同源。反之，若策略只在训练引擎里好、换引擎就崩，几乎可以断定它 overfit 了接触求解器的怪癖。
+\end{insight}
+
+\begin{pitfall}[在 Phase 1（无 action）任务上跑 PPO 训练]
+\textbf{错误描述}：把课程示例当普通 RL 任务，直接 \Verb[breaklines]|uv run train|。\textbf{现象后果}：训练能启动、loss 有数字，但策略学不到任何东西，浪费 GPU。\textbf{根本原因}：Phase 1 的 \Verb[breaklines]|actions: dict = {}|——没有动作维度，策略「没有手」。\textbf{正确做法}：Phase 1 只用 \Verb[breaklines]|--agent zero| 或 \Verb[breaklines]|--agent random| 做物理验证；训练要等 \cref{sec:rlmc-tennis-robot} 规划的机器人 + 球拍 + 可学习动作就位（后续击球章）。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[协议清单]} 设三人分别负责感知/预测/控制，列出他们必须共享的环境信息 $\ge 5$ 项；任选一项，给出「它在环境层定义含糊」时的具体 bug 场景（验收：每项写清「字段 + 含糊后果」）。
+  \item \textbf{[频率手算]} 一颗 $30$\,m/s 的球撞球拍，接触时长按 $3$\,ms 计：$500$\,Hz 与 $2000$\,Hz 各有多少仿真步落在接触窗口内？据此判断哪种频率会让接触冲量解算失真（验收：给出步数与结论）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{球场几何：坐标系与碰撞分离}
+\label{sec:rlmc-tennis-court}
+
+\paragraph{模块功能与在管线中的位置。}球场是整个项目的坐标参考系。「球落在发球区」「球过了网」「机器人在底线附近」——这些语义全部依赖球场几何定义的坐标系。改了球场坐标，所有 reward/termination/observation 的几何判断都要同步改。这一节立的算法点是：\textbf{球场不是装饰，它是坐标系约定}。
+
+\paragraph{坐标约定与 ITF 标准尺寸。}课程示例把 court center 放在世界原点 $(0,0,0)$：$x$ 轴沿长边，球从远端（$x>0$）飞向近端（$x<0$），网在 $x=0$；$y$ 轴沿宽边，右侧为正；$z$ 轴向上，地面在 $z=0$。下表的几何数字在后续 reward/termination/感知标注中反复出现，是本章第一组「魔法常量」。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+元素 & 方向 & 精确值 & 代码中的用法 \\
+\midrule
+球场总长 & $x$ & $23.77$\,m（$78$\,ft） & \verb|env_spacing| 下限 \\
+半场长（中线$\to$baseline） & $x$ & $11.885$\,m & 发球初始位置 \\
+单打半宽（中线$\to$单打边线） & $y$ & $4.115$\,m & reward box $y$ 范围 \\
+双打半宽（中线$\to$双打边线） & $y$ & $5.485$\,m & oob termination $y$ 范围 \\
+发球线距网 & $x$ & $6.40$\,m & reward box $x$ 范围 \\
+网高（中央） & $z$ & $0.914$\,m（$3$\,ft） & 撞网 termination 阈值 \\
+网高（柱端） & $z$ & $1.067$\,m（$3.5$\,ft） & 网 geom 高度 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{codebox}[text]{tennis\_court.xml 核心结构（MJCF，简化）}
+<mujoco model="tennis_court">
+  <worldbody>
+    <body name="court" pos="0 0 0">
+      <!-- 物理接触面:球弹跳的地面 -->
+      <geom name="court_surface" type="plane" size="12 6 0.01"
+            condim="3" friction="0.6 0.005 0.001"/>
+      <!-- 网（碰撞 + 半透明视觉）:pos z = 0.914/2 = 0.457 -->
+      <geom name="net_collision" type="box" pos="0 0 0.457"
+            size="0.01 5.5 0.457" contype="1" conaffinity="1"
+            condim="1" solref="0.001 1.0"/>
+      <!-- 底线:仅视觉，contype=0 不参与碰撞 -->
+      <geom name="baseline_far" type="box" pos="11.885 0 0.001"
+            size="0.025 5.485 0.001" contype="0" conaffinity="0"/>
+      <!-- 发球线:仅视觉 -->
+      <geom name="service_line_near" type="box" pos="-6.40 0 0.001"
+            size="0.025 4.115 0.001" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+</mujoco>
+\end{codebox}
+
+\paragraph{配置详解：碰撞分离原则。}这是球场建模的第一条铁律：\textbf{视觉 geom 与物理 geom 分离}。下表给出哪些 geom 参与碰撞、哪些只渲染。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+geom & contype & conaffinity & 用途 \\
+\midrule
+球场地面 court\_surface & 1 & 1 & 球弹跳的物理接触面 \\
+网碰撞体 net\_collision & 1 & 1 & 球-网接触检测 \\
+所有线条（baseline/service/center） & 0 & 0 & 仅视觉渲染 \\
+网柱 net\_post & 1 & 1 & 偶尔球击中网柱 \\
+网带 net\_tape（网顶白带） & 0 & 0 & 仅视觉 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{为什么必须分离（反面）}：若把所有线条 \verb|contype| 设为 $1$，球滚过底线会被一条宽 $5$\,cm、高 $2$\,mm 的白线「绊住」——被线的边缘碰撞体弹起，产生完全不真实的物理。现实中线条是漆在地面上的，没有物理高度。这条原则在 Isaac Lab 同样适用：USD 下用 Physics API 的 collider 组件控制，渲染几何与碰撞几何分离的\emph{思想}一致。
+
+\paragraph{网的建模：刚性近似与薄体问题。}真实网球网是柔性编织物，球撞网后变形吸能。但柔性织物仿真本身是一个完整研究方向，会把调参焦点从「击球」拽到「织物」。\textbf{工程决策：用刚性 box 近似网}——球撞网后弹回（而非被兜住），但对 RL 不重要，因为撞网即 termination、episode 结束；重要的是\emph{检测到撞网}。网 box 三个参数的权衡：
+
+\begin{itemize}
+  \item \textbf{厚度 \texttt{size[0]=0.01}\,m（$1$\,cm，half-size）}：太薄（$<1$\,mm）高速球会穿过（tunnel effect）；太厚（$>5$\,cm）本应过网的球被过早拦截。$1$\,cm 是折中。
+  \item \textbf{\texttt{condim=1}（仅法向）}：球撞网只需法向弹回，不需要在网面「滑动」，也省碰撞求解量。
+  \item \textbf{语义保险层}：即便有刚性 box，$>25$\,m/s 的球在 $500$\,Hz 下单步移动 $5$\,cm，仍可能穿过 $1$\,cm 的 box。所以 \cref{sec:rlmc-tennis-contact} 的\textbf{语义撞网检测}是必要安全层——它检查球心轨迹是否穿越 $x=0$ 平面，\emph{不依赖物理碰撞}。
+\end{itemize}
+
+\paragraph{用 site 固化关键几何位置。}除 geom 外，MuJoCo 的 \verb|site| 是「只有位姿、无碰撞无质量」的标记点，适合定义球场关键位置供 reward/obs/termination 引用：
+
+\begin{codebox}[text]{关键位置 site（不参与物理，仅提供位置参考）}
+<site name="net_center"               pos="0 0 0.914"/>
+<site name="service_box_center_deuce" pos="-3.2 -2.06 0"/>
+<site name="service_box_center_ad"    pos="-3.2  2.06 0"/>
+<site name="baseline_near_center"     pos="-11.885 0 0"/>
+<site name="baseline_far_center"      pos="11.885 0 0"/>
+\end{codebox}
+
+代码里用 \Verb[breaklines]|env.scene.get_site_position("net_center")| 取位置，比硬编码数字健壮（改 XML 后代码自动更新）。这与 \cref{ch:rlmc-diy} 里用 site/descriptor 管理语义几何的做法一致——\textbf{把坐标约定固化为代码级文档，而非只写在 README}。
+
+\paragraph{env\_spacing 与多环境布局。}多环境并行时每个球场在世界坐标里按 \verb|env_origins| 偏移。\verb|env_spacing| 必须大于球场对角线，否则球飞出一个环境后会进入相邻环境的碰撞区。
+
+\begin{codebox}[Python]{env\_spacing 估算}
+import math
+court_diagonal = math.sqrt(23.77**2 + 10.97**2)  # ~= 26.2 m
+# 留余量（球可能飞出底线 3-5 m）
+recommended_spacing = 30.0  # 课程示例设置
+\end{codebox}
+
+\textbf{反面}：若 \Verb[breaklines]|env_spacing=15|（$<$ 球场长 $23.77$\,m），多环境球场重叠，球从 env 0 飞出底线后撞进 env 1 的碰撞区，产生「幽灵碰撞」——球突然变向或被不存在的障碍弹回。此 bug 极难定位，\emph{因为单环境测试完全正常}。
+
+\paragraph{运行验证：坐标系搞反长什么样。}假设把发射方向写成 $+x$（球从近端飞向远端）：球会从 baseline 飞向场外，而 reward 仍算近端 service area（$x<0$），于是 reward 长期为零。你可能误判「速度太快/角度太高」，实际只是\emph{符号错了}。这种 bug 几乎无法从数值日志发现——必须看 viewer 才注意到球飞错方向（参见 \cref{sec:rlmc-tennis-suite} 实验三的检查清单）。
+
+\begin{pitfall}[球场线条 geom 的 contype 未设为 0]
+\textbf{错误描述}：复制地面 geom 写线条时漏改 \verb|contype|，线条默认参与碰撞。\textbf{现象后果}：球滚过底线/发球线时被「绊」起或不自然弹跳，弹道验证数据全乱。\textbf{根本原因}：MuJoCo geom 默认 \Verb[breaklines]|contype=1, conaffinity=1|。\textbf{正确做法}：所有视觉装饰 geom 显式写 \Verb[breaklines]|contype="0" conaffinity="0"|。
+\end{pitfall}
+
+\begin{pitfall}[只在单环境下验证物理]
+\textbf{错误描述}：\Verb[breaklines]|--num-envs 1| 一切正常就收工。\textbf{现象后果}：上多卡训练后球行为诡异、reward 在部分环境恒零。\textbf{根本原因}：\verb|env_origins|/\allowbreak\verb|env_spacing| 相关 bug 只在多环境暴露。\textbf{正确做法}：验证流程必须含 \Verb[breaklines]|--num-envs 16| 与 \Verb[breaklines]|--num-envs 256|。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[手算]} 标准网球场单打区域面积是多少 $\mathrm{m}^2$？近端两个 service box 合并面积是多少？若 reward 区域设为合并 service box，策略学到的「合法发球」占单打区域百分之几？（验收：给出三个数字与推导）
+  \item \textbf{[操作]} 把 \Verb[breaklines]|tennis_court.xml| 中 baseline 的 \verb|contype| 从 $0$ 改 $1$，在 viewer 里观察球滚过底线的行为差异，恢复后记录现象（验收：描述改前/改后球的运动）。
+  \item \textbf{[设计]} 在 Isaac Lab（USD）里如何实现「碰撞分离」？提示：查 PhysX 的 collider 组件与 \Verb[breaklines]|visual_material|（验收：写出渲染几何与碰撞几何各自的配置入口）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{球体：freejoint 自由刚体与接触参数}
+\label{sec:rlmc-tennis-ball}
+
+\paragraph{模块功能与在管线中的位置。}球场定义了坐标系，球是坐标系里「移动的东西」。球的 MuJoCo 建模方式直接决定后续所有弹道计算与接触物理的基础。这一节的算法点：\textbf{网球必须是 freejoint 刚体，且其接触参数要「定性合理」而非「精确标定」}。
+
+\paragraph{为什么必须 freejoint。}MuJoCo 中 body 的运动自由度由 joint 类型决定。\emph{没有 joint 的 body 相对 parent 刚性焊接}——即便你写入速度它也不动。网球要在三维空间自由平移 + 旋转，必须用 \verb|freejoint|（$6$ DoF：$3$ 平移 $+$ $3$ 旋转）。反面：若球建成 court 子 body 且无 joint，你在 reset 里写入的初速会改 \verb|qvel| 对应位，但下一仿真步 MuJoCo 因「该 body 无 joint」而忽略——球像被钉住；只看日志会发现 \verb|ball_velocity| 在 reset 后第一步非零、第二步归零，极其隐蔽。
+
+\paragraph{freejoint 的状态表示与四元数顺序陷阱。}自由球体的状态由两个数组描述：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+数组 & 维度 & 含义 & 顺序 \\
+\midrule
+\verb|qpos| & 7 & 位置 $+$ 姿态四元数 & \Verb[breaklines]|[x,y,z, qw,qx,qy,qz]| \\
+\verb|qvel| & 6 & 线速度 $+$ 角速度 & \Verb[breaklines]|[vx,vy,vz, wx,wy,wz]| \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[四元数顺序：MuJoCo 标量在前，多数框架标量在后]
+\textbf{错误描述}：从 PyBullet / ROS tf2 迁移代码，沿用 \verb|[qx,qy,qz,qw]|（标量在后）写入 MuJoCo 的 \verb|qpos|。\textbf{现象后果}：球初始 body frame 方向错；对各向同性的 sphere 视觉上看不出，但 body-frame 角速度观测与 world 转换全部错位。\textbf{根本原因}：MuJoCo 用 \textbf{Hamilton 四元数、标量在前} \verb|[qw,qx,qy,qz]|（与本书全局约定一致）。\textbf{正确做法}：用常量或工具函数显式标注四元数约定——跨框架协作时这是必要文档（经核查 LATENT 论文与其公开 README 均未专门记载四元数顺序约定，原稿此处的来源归属未能证实，故只作通用工程建议）。
+\end{pitfall}
+
+\begin{pitfall}[mjlab 数据访问没有 Isaac 的 \texttt{root\_pos\_w} 短名别名]
+\textbf{错误描述}：从 Isaac Lab 迁代码，沿用 \Verb[breaklines]|ball.data.root_pos_w| / \Verb[breaklines]|root_lin_vel_w| / \Verb[breaklines]|root_ang_vel_w| / \Verb[breaklines]|root_lin_vel_b| 读球状态。\textbf{现象后果}：mjlab 1.4.0 直接 \Verb[breaklines]|AttributeError: 'EntityData' object has no attribute 'root_pos_w'|——代码连第一步都跑不起来。\textbf{根本原因}：mjlab 的 \verb|EntityData| \emph{显式区分} link 帧与 com 帧，真名是 \Verb[breaklines]|root_link_pos_w| / \Verb[breaklines]|root_link_lin_vel_w| / \Verb[breaklines]|root_link_ang_vel_w| / \Verb[breaklines]|root_link_lin_vel_b|（以及质心帧的 \Verb[breaklines]|root_com_*_w/_b| 一族）；\verb|root_pos_w| 这种「不带 link/com 限定」的短名只是 Isaac Lab 的习惯，mjlab \emph{不导出}它作别名。\textbf{正确做法}：mjlab 一律用 \verb|root_link_*|（link 帧）或 \verb|root_com_*|（质心帧）长名。对单体球 link 帧$\approx$质心帧（几何中心即质心），随便用哪个都对；但下游人形/球拍是非均质多体，喂给 predictor 的是 link 位姿还是 com 位姿\emph{结果不同}，长名强制你想清楚用哪个帧——这正是 mjlab 不给短名别名的设计意图。
+\end{pitfall}
+
+\paragraph{工程动作：怎么\emph{自己}发现数据字段的真名（而非照抄踩坑）。}上面这个坑的根因是「跨框架字段名不一致」，而跨框架迁移最可迁移的技能不是背名字，是\textbf{当场把对象的字段打出来核对}。第一行代码就该这么做：
+
+\begin{codebox}[Python]{发现真名的两条排错路径（任何 mjlab 任务都能跑）}
+# 路径 A:实例化任一现成任务，dir 出 EntityData 的真实字段
+#   （tennis 任务不存在时，用 stock 任务 Mjlab-Velocity-Flat-Unitree-Go1 等价验证）
+import gymnasium as gym
+env = gym.make("Mjlab-Velocity-Flat-Unitree-Go1", num_envs=1)
+data = env.unwrapped.scene["robot"].data
+print([a for a in dir(data) if "pos_w" in a or "vel" in a])
+#   实测 mjlab 1.4.0 → 含 root_link_pos_w / root_link_lin_vel_w / root_link_ang_vel_w
+#                       / root_com_pos_w / root_com_lin_vel_b ...;无 root_pos_w
+# 路径 B:先照写，靠 AttributeError 的报错信息反查——mjlab 的报错会列出近似名
+#   ball.data.root_pos_w   # AttributeError: ... did you mean 'root_link_pos_w'?
+\end{codebox}
+
+这套「\verb|dir()| 看字段 / 让报错告诉你真名」的动作，比把任何一张 API 对照表背下来都管用——它对所有框架、所有版本通用，是「从零搭一个任务」时第一个该养成的肌肉记忆。本章后文所有 \verb|root_link_*| 读法都已按实测真名写，但你换 mjlab 版本时仍应先跑一次路径 A 自查。
+
+\paragraph{代码走读：用 MjSpec 在 Python 里构球。}课程示例用 \verb|MjSpec|（而非 XML）构造球体，好处是参数可在运行时经 CLI/配置 override 修改，不必编辑 XML（与 \cref{ch:rlmc-physics} 讲的 \verb|MjSpec| 动态构造一脉相承）。
+
+\begin{codebox}[Python]{在 \_get\_ball\_spec() 中创建球 Entity（mjlab 1.4.0 风格，简化）}
+def _get_ball_spec(self):
+    spec = MjSpec()
+    body = spec.worldbody.add_body(name="ball")
+    body.add_freejoint(name="ball_freejoint")  # ← 这一行是球能飞的根本原因
+    body.add_geom(
+        name="ball_geom", type="sphere",
+        size=[_BALL_RADIUS],            # 0.033 m（直径 6.6 cm）
+        mass=_BALL_MASS,                # 0.057 kg
+        condim=3,                       # 法向 + 切向滑动摩擦
+        friction=[0.6, 0.005, 0.001],  # [slide, torsion, roll];见下文 condim 生效说明
+        rgba=[0.8, 1.0, 0.0, 1.0],     # 网球黄
+    )
+    return spec
+\end{codebox}
+
+逐行看这段做了什么：(1) \verb|MjSpec()| 建空模型规格；(2) \verb|add_body| 在 worldbody 下加球 body；(3) \verb|add_freejoint| 赋 $6$ DoF——\textbf{忘了这一行球永远不动}，是 Phase 1 最易漏的一行；(4) \verb|add_geom| 定义形状/大小/质量/碰撞。XML 与 MjSpec 功能等价：XML 适合静态模型（球场、网），MjSpec 适合需运行时改的动态模型（如 \Verb[breaklines]|--ball-radius 0.04| 换球）——mjlab 的 EntityCfg 支持两者混用（court 用 XML，ball 用 MjSpec）。
+
+\paragraph{配置详解：球体参数四维表。}下表给每个参数的默认值来源、修改影响、合理范围、与其他配置的耦合。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{2.0cm}p{3.0cm}p{2.4cm}p{2.6cm}@{}}
+\toprule
+参数 & 默认值/来源 & 修改影响 & 合理范围 & 耦合 \\
+\midrule
+半径 $r$ & $0.033$\,m（ITF $6.54$--$6.86$\,cm 中值） & 太小高速时穿薄体 & $0.032$--$0.034$ & 与 \verb|timestep|、网厚度耦合 \\
+质量 $m$ & $0.057$\,kg（ITF $56.0$--$59.4$\,g） & 影响惯量与旋转响应 & $0.056$--$0.059$ & 球-拍质量比 $\approx1{:}6$，高刚度易振荡 \\
+\verb|condim| & $3$（法向+滑动） & 决定摩擦维数 & $\{1,3,4,6\}$ & 与 \verb|friction| 生效维数耦合 \\
+\verb|friction| & $[0.6,0.005,0.001]$ & 控滑动减速/旋转传递 & slide $0.4$--$0.8$ & 仅 slide 在 \verb|condim=3| 生效 \\
+\verb|solref| & 见下 & 控弹起快慢/高低 & 见 COR 表 & 与 \verb|solimp| 共同定弹跳 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{惯量自动计算}：MuJoCo 从 \verb|mass| 与 \verb|type=sphere| 自动算转动惯量 $I=\tfrac{2}{5}mr^2$。对标准网球 $I=\tfrac{2}{5}\times0.057\times0.033^2\approx2.48\times10^{-5}\ \mathrm{kg\cdot m^2}$。只有非均质体（如球拍，质心不在几何中心）才需手动指定 \verb|inertia|。
+
+\begin{pitfall}[friction 三元组与 condim 生效维数：写了不一定生效]
+\textbf{错误描述}：以为 \Verb[breaklines]|friction=[0.6,0.005,0.001]| 三个分量都在起作用。\textbf{现象后果}：调第二/三个分量却毫无变化，误以为参数无效。\textbf{根本原因}：MuJoCo 的 \texttt{friction} 是 \texttt{[slide, torsion, roll]} 三元组，\emph{实际生效维数由 condim 决定}：\texttt{condim=3} 只用第一个（slide）；torsion 需 \texttt{condim}$\ge4$、roll 需 \texttt{condim=6} 才被使用（见 MuJoCo XML reference 的 contact 章节）。\textbf{正确做法}：要让 torsion/roll 生效就提 \verb|condim|；否则只调 slide。所以「纯滚动的球在 \verb|condim=3| 平面上不会因滚动阻力停下」——只有滑动阶段被 slide 摩擦减速。
+\end{pitfall}
+
+condim 选择按物理语义走，给出一棵决策树（注意 \verb|condim=1| 会让球落地后像冰面一样无限滑）：
+
+\begin{codebox}[text]{condim 选择决策树}
+球-地面:condim=3   # 需切向滑动摩擦:减速 + 耦合线速度/角速度（topspin 弹跳）
+球-网:  condim=1   # 仅法向弹回，不需在网上滑动
+球-球拍:condim=3   # 需摩擦传递旋转——正手 topspin 靠的就是摩擦
+球-网柱:condim=1   # 仅弹回
+\end{codebox}
+
+\paragraph{solref 与 solimp：接触刚度与阻尼。}除 \verb|friction|，弹跳「弹多高、多快」由这两组参数决定（\cref{ch:rlmc-physics} 已讲其在求解器里的角色，这里讲调参直觉）。MuJoCo 的 \verb|solref| 有\textbf{两种格式}，二者调出网球弹性的能力\emph{很不一样}，本章实跑（gpufree, MuJoCo 3.8.1, $2.54$\,m 落体）把这点钉死，先讲清再给数：
+\begin{itemize}
+  \item \textbf{正格式 \texttt{solref}=[timeconst, dampratio]}（两值为正）：\verb|timeconst| 是接触时间常数、\verb|dampratio| 是阻尼比。直觉上「timeconst 小=硬=弹得快」没错，\textbf{但别据此推断恢复系数}——实测在常规 \verb|solimp|（如默认 \Verb[breaklines]|[0.9,0.95,0.001]|）下，\emph{整个}正格式区间（\verb|timeconst| $0.005$--$0.02$、\verb|dampratio| $1.0$--$1.5$）落体 COR 都只有 $0.06$--$0.14$（几乎是死球），且 \verb|dampratio| 在此量级几乎\emph{不动} COR。原因是恢复系数主要由 \verb|solimp| 的阻抗上限 \verb|dmax| 与接触刚度共同决定，正格式默认刚度对 $57$\,g 的网球偏软、动能在接触中被吸收殆尽。\textbf{所以「正格式 + 调 dampratio」基本调不出网球的弹性}——这是源稿最易误导处。
+  \item \textbf{直接格式 \texttt{solref}=[$-$stiffness, $-$damping]}（两值为负）：直接指定接触刚度与阻尼，是\textbf{真正能把 COR 调进网球区间的旋钮}。本章示例球-地面用 \texttt{solref=(-3500.0,-2.0)}、\texttt{solimp=(0.95,0.99,0.001,0.5,2.0)}——但注意：\textbf{这组参数实测从 $2.54$\,m 落体测得 COR$\approx0.95$（回弹约 $89\%$），远超硬地目标 $0.73$--$0.76$，是\emph{过弹}的}。要命中目标，保持刚度 $-3500$ 不变、把第二项（阻尼）调到约 $-12$ 即得 COR$\approx0.74$（实测）。
+\end{itemize}
+\textbf{结论：COR 的主旋钮是直接负格式 \texttt{solref} 的第二项（阻尼绝对值）}，越大耗散越多、COR 越低。下表是本章实跑的单调标定数据（刚度固定 $-3500$、\Verb[breaklines]|solimp=(0.95,0.99,0.001,0.5,2.0)|、$2.54$\,m 落体），可直接照查反推：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\verb|solref| 阻尼项 & 实测 COR & 回弹高度比 & 落在哪种场地 \\
+\midrule
+$-2$  & $0.95$ & $\sim89\%$ & 过弹（无真实场地这么弹） \\
+$-12$ & $0.74$ & $\sim55\%$ & 硬地 Hard（命中目标 $0.73$--$0.76$） \\
+$-30$ & $0.50$ & $\sim25\%$ & 偏死（介于慢草地与吸能面之间） \\
+$-60$ & $0.29$ & $\sim8\%$  & 几乎不弹 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{教学要点（别背数、要会测）}：上面这张表是\emph{本章这套几何/质量/timestep 下}的实测值，换了球质量、\verb|timestep| 或地面 geom 就会漂移。所以正确工作流不是「抄一组 solref」，而是\textbf{先按 \cref{sec:rlmc-tennis-contact} 跑一次落体测出 COR、对照目标 $0.73$--$0.76$ 反推阻尼项该加还是该减，迭代两三次定死}。要把不同\emph{场地}的 COR 映射成 \verb|solref|，照此法各标一次即可（硬地 $\approx-12$、草地阻尼更大、红土阻尼更小）。教学上建议：先用直接负格式（唯一能调出网球弹性的格式）建立「阻尼项 $\leftrightarrow$ COR」的单调直觉，正格式仅作了解（它在常规 solimp 下调不出真实弹性）。\pz{以上 COR $\leftrightarrow$ solref 数据为 gpufree 实跑（MuJoCo 3.8.1, $2.54$\,m 落体）实测，非外部论文；换几何/质量/timestep 须按本节工作流重标。}
+
+\paragraph{Isaac Lab 对照：参数解耦到 PhysicsMaterial。}PhysX 用 \Verb[breaklines]|SphereGeometry| 作碰撞形状，但材质参数（restitution、friction）经 \Verb[breaklines]|PhysicsMaterial| 单独配置——COR 直接设 \verb|restitution|，比 MuJoCo 直观。
+
+\begin{codebox}[Python]{Isaac Lab 中球体 Entity 配置（伪代码，字段以官方文档为准）}
+class BallCfg(RigidObjectCfg):
+    spawn = sim_utils.SphereCfg(
+        radius=0.033,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            solver_position_iteration_count=4,
+            solver_velocity_iteration_count=1,
+        ),
+        mass_props=sim_utils.MassPropertiesCfg(mass=0.057),
+        collision_props=sim_utils.CollisionPropertiesCfg(
+            contact_offset=0.002, rest_offset=0.0,
+        ),
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            static_friction=0.6, dynamic_friction=0.6, restitution=0.75,  # ← COR 直控
+        ),
+    )
+    init_state = RigidObjectCfg.InitialStateCfg(pos=(11.0, 0.0, 2.5))
+\end{codebox}
+
+\paragraph{UniLab 对照：球就是 scene MJCF 里的 freejoint body（与 mjlab 同根）。}UniLab 的 mujoco 后端经 \verb|mujoco-uni| 3.8.0 加载 MJCF，所以\textbf{球的物理建模与本节 mjlab 完全同源}——一个带 \verb|freejoint| 的 body、\verb|sphere| geom、同一套 \Verb[breaklines]|condim/friction/solref/solimp| 语义（\cref{sec:rlmc-tennis-ball} 的 condim 决策树与 COR 表对 UniLab mujoco 后端逐字适用）。差异在\emph{怎么把它喂进框架}：UniLab \textbf{不用} \verb|MjSpec| 运行时构模、也\textbf{不用} \Verb[breaklines]|RigidObjectCfg| 这类资产配置类——它只认 \Verb[breaklines]|SceneCfg.model_file| 指向的 XML 文件（\verb|base/scene.py| 的 \verb|SceneCfg|，UniLab commit \texttt{99936e08}）；球与球场写在同一份（或经 \Verb[breaklines]|fragment_files| 拼装的）MJCF 里，由后端一次性\emph{编译}\,\cite{unilab2026}。
+
+\begin{codebox}[text]{UniLab:球场+球的 scene MJCF（mujoco 后端，与 mjlab XML 同写法）}
+<!-- assets/.../tennis_scene.xml —— SceneCfg.model_file 指向它 -->
+<mujoco model="tennis_launcher">
+  <worldbody>
+    <body name="court" pos="0 0 0">
+      <geom name="court_surface" type="plane" size="12 6 0.01"
+            condim="3" friction="0.6 0.005 0.001"
+            solref="-3500 -12" solimp="0.95 0.99 0.001 0.5 2.0"/>  <!-- 直接负格式;阻尼项-12实测COR~=0.74(硬地);须自标 -->
+    </body>
+    <body name="ball" pos="11 0 2.5">
+      <freejoint name="ball_freejoint"/>            <!-- ← 球能飞的根本，同 mjlab -->
+      <geom name="ball_geom" type="sphere" size="0.033" mass="0.057"
+            condim="3" friction="0.6 0.005 0.001" rgba="0.8 1 0 1"/>
+    </body>
+  </worldbody>
+</mujoco>
+\end{codebox}
+
+\begin{codebox}[Python]{UniLab:在 SceneCfg 里指向该 XML（NpEnv 子类的 cfg，简化）}
+from unilab.base.scene import SceneCfg
+# scene 经 model_file 指 MJCF;球/球场都在这份 XML（或经 fragment_files 拼装）
+scene = SceneCfg(model_file="assets/robots/tennis/tennis_scene.xml")
+# 后端编译后，球的 6-DoF 状态经 backend getter 读写:
+#   get_body_pos_w("ball") / get_body_lin_vel_w("ball") / set_state(env_idx, qpos, qvel)
+# 接触/恢复系数对应关系（UniLab mujoco 后端 = MuJoCo 原生）:
+#   condim/friction/solref/solimp 语义 == 本节 mjlab 表;COR 仍经 solref 间接标定，
+#   非 PhysX 那样的 restitution 直控（motrix 后端的恢复系数能力另见后端文档）.
+\end{codebox}
+
+诚实记录两点边界：(1) UniLab 没有 Isaac Lab \Verb[breaklines]|RigidBodyMaterialCfg.restitution| 那种「COR 直控」旋钮——mujoco 后端走 MuJoCo 的 \verb|solref| 间接标定（与本节 mjlab 一致），所以 \cref{sec:rlmc-tennis-contact} 的 $2.54$\,m 落体标定法在 UniLab 里照用；(2) UniLab 的球-物理 DR（半径/摩擦/恢复）经任务 \Verb[breaklines]|DomainRandConfig| $+$ 后端能力声明实现，其中 \verb|geom_friction| 是 mujoco 后端支持的 reset 项（\verb|dr/types.py|，UniLab commit \texttt{99936e08}），与 \cref{ins:rlmc-tennis-dr} 强调的「DR 比精确标定重要」同一思路。
+
+\paragraph{为什么用 sphere 而非 mesh。}MuJoCo 的 primitive collision（sphere/box/cylinder/capsule）比 mesh collider 更快、数值更稳。网球近似球体，sphere geom 既准又快。若后续要加缝线/旋转可视化标记，加一个 \verb|contype=0| 的视觉 mesh geom 即可，物理 geom 保持 sphere。
+
+\begin{insight}[物理参数要「定性合理 + DR」，不要「精确标定」]\label{ins:rlmc-tennis-dr}
+仿真物理参数不需要完美匹配真实世界——它们只需\textbf{定性合理}（球弹起而非穿地、旋转方向正确），再用域随机化（\cref{ch:rlmc-dr}）让策略对偏差鲁棒。LATENT 明确指出「球的 dynamics randomization」是 Sim2Real 成功的必要条件：去掉后真机成功率从正手 $90.9\%$ / 反手 $77.8\%$ 骤降到正手 $16.7\%$ / 反手 $25.0\%$\cite{tennis_latent2026}。这意味着\textbf{精力应花在 DR 范围设计上，而非精确标定}。把这条记牢，能省下大量徒劳的标定工时。
+\end{insight}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[手算]} 对均质球（$m=0.057$\,kg，$r=0.033$\,m）算 $I=\tfrac{2}{5}mr^2$；若 $\omega=200$\,rad/s（约 $1900$\,rpm，典型 topspin），旋转动能多少？与 $20$\,m/s 平动动能相比如何？（验收：给出两动能与比值）
+  \item \textbf{[实验]} 用 \cref{sec:rlmc-tennis-contact} 的纯 MuJoCo 落体脚本跑 COR 标定（$2.54$\,m），扫直接负格式 \Verb[breaklines]|solref=[-3500,-2]|、\verb|[-3500,-12]|、\verb|[-3500,-30]|，记录 COR（验收：三组 COR 数值 + 「阻尼项绝对值越大 COR 越低」的单调趋势；应分别约 $0.95/0.74/0.50$）。再用正格式 \verb|[0.005,1.0]| 与 \verb|[0.02,1.5]| 各跑一次，验证「正格式在常规 solimp 下 COR 仅 $0.06$--$0.14$ 且 dampratio 几乎不动 COR」——体会为何 COR 主旋钮是负格式而非 dampratio。
+  \item \textbf{[设计]} 为 Isaac Lab 建同款球，列出需配置的 PhysX 参数及其 MuJoCo 对应；哪些有直接对应、哪些没有？（验收：对应表，restitution$\leftrightarrow$solref 一栏需说明「非线性、需标定」）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{LaunchCommand：八维随机发球}
+\label{sec:rlmc-tennis-launch}
+
+\paragraph{模块功能与在管线中的位置。}球体定义了「什么在飞」，发球命令定义「怎么飞起来」。它在每个 episode reset 时采样一组发球参数、写入球的初始 pose + velocity。这一节的算法点：\textbf{随机发球是泛化的来源}，且它是 \cref{ch:rlmc-reward} 里 velocity command 的同构推广——只是参数空间从 $3$ 维速度变成 $8$ 维发球参数。
+
+\paragraph{动机：为什么必须随机。}若每个 episode 都用固定发球（固定速度/角度/位置），策略只学会「对这一种球反应」，真实场景换来球即失效。随机发球逼策略\textbf{泛化}到各种来球。回顾 \cref{ch:rlmc-reward}：velocity tracking 里 \Verb[breaklines]|VelocityCommand| 每 episode 采样目标速度；\verb|LaunchCommand| 就是它的「发球版」。
+
+\paragraph{配置详解：八维参数空间与物理依据。}每个范围都有物理或规则依据，不是随意取的：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llllp{4.0cm}@{}}
+\toprule
+维 & 参数 & 单位 & 默认范围 & 物理/规则依据 \\
+\midrule
+0 & speed & m/s & $[20,45]$ & $20$ 慢二发($\sim72$\,km/h)，$45$ 中速一发($\sim162$\,km/h) \\
+1 & elevation & deg & $[-8,2]$ & 负值向下（发球点高于网，方向朝下）；$2^\circ$ 为 kick serve \\
+2 & azimuth & deg & $[-10,10]$ & 左右散布；$>20^\circ$ 球易飞出侧线 \\
+3 & x & m & $[10.5,11.5]$ & 远端 baseline($x=11.885$)附近，留 $\sim1$\,m 站位随机 \\
+4 & y\_offset & m & $[-3,3]$ & 横向站位 \\
+5 & height & m & $[1.5,3.0]$ & 击球点高度；矮个 $1.5$、高抛 $3.0$ \\
+6 & topspin & rad/s & $[-100,300]$ & 正上旋；$300\approx2864$\,rpm（中等），负为下旋 \\
+7 & sidespin & rad/s & $[-100,100]$ & 正右偏；$100$ 温和侧旋 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{为什么范围需要物理约束（反面）}：若 \Verb[breaklines]|speed_range=[0,100]|，低速球（$<5$\,m/s）几乎飞不过网，在阻力下迅速落在发球者面前，这些「无效发球」占大量样本却不提供学习信号；高速球（$>60$\,m/s）又因仿真精度不足产生不稳定碰撞。范围应覆盖「物理合理」区间。对后续击球训练还要叠加 \textbf{curriculum 控制范围}（\cref{ch:rlmc-reward} 的 CurriculumManager 职责）——它不改 \verb|LaunchCommand| 代码，只改传入的范围配置：
+
+\begin{codebox}[Python]{Curriculum 控制发球难度（后续击球章预规划）}
+class TennisCurriculumCfg:
+    class Stage0:  # 静态球——只训移动到位
+        speed_range = (0.0, 0.0); elevation_range = (0.0, 0.0); topspin_range = (0.0, 0.0)
+    class Stage1:  # 慢速直线
+        speed_range = (15.0, 20.0); elevation_range = (-5.0, 0.0); topspin_range = (0.0, 0.0)
+    class Stage2:  # 中速带旋
+        speed_range = (20.0, 30.0); elevation_range = (-8.0, 2.0); topspin_range = (0.0, 150.0)
+    class Stage3:  # 完整随机
+        speed_range = (20.0, 45.0); elevation_range = (-8.0, 2.0)
+        topspin_range = (-100.0, 300.0); sidespin_range = (-100.0, 100.0)
+\end{codebox}
+
+\paragraph{算法点：速度分解公式。}从球面坐标（speed, elev, azim）到笛卡尔速度：
+\begin{align}
+v_x &= -\,\text{speed}\cdot\cos(\text{elev})\cdot\cos(\text{azim}),\label{eq:rlmc-tennis-vx}\\
+v_y &= \phantom{-}\text{speed}\cdot\cos(\text{elev})\cdot\sin(\text{azim}),\label{eq:rlmc-tennis-vy}\\
+v_z &= \phantom{-}\text{speed}\cdot\sin(\text{elev}).\label{eq:rlmc-tennis-vz}
+\end{align}
+\textbf{为什么 $v_x$ 带负号}：球从远端（$x>0$）飞向近端（$x<0$），即沿 $-x$。\verb|speed| 为正、$\cos(\text{elev})\cos(\text{azim})$ 也为正（角度都不大），故须手动加负号保 $v_x<0$（见 \eqref{eq:rlmc-tennis-vx}）。忘了这个负号，球会向场外飞、reward 恒零——是 Phase 1 最常见 bug。
+
+\paragraph{代码走读：CommandTerm 实现。}\verb|LaunchCommand| 继承 \verb|CommandTerm|，核心在 \Verb[breaklines]|_resample_command(env_ids)|。\verb|env_ids| 是关键参数——它告诉你\emph{哪些环境需要重采样}（不是所有环境同时 reset）。
+
+\begin{codebox}[Python]{LaunchCommand 核心（mjlab 1.4.0 风格，简化）}
+class LaunchCommand(CommandTerm):
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.ball = env.scene["ball"]
+        self.launch_params = torch.zeros(env.num_envs, 8, device=env.device)
+
+    def _resample_command(self, env_ids: torch.Tensor):
+        n = len(env_ids); dev = env_ids.device
+        def U(rng):  # 区间均匀采样小工具
+            return torch.rand(n, device=dev) * (rng[1] - rng[0]) + rng[0]
+        speed   = U(self.cfg.speed_range)
+        elev    = torch.deg2rad(U(self.cfg.elevation_range))  # ← 度→弧度，必做
+        azim    = torch.deg2rad(U(self.cfg.azimuth_range))
+        x_pos   = U(self.cfg.x_range);   y_off = U(self.cfg.y_offset_range)
+        height  = U(self.cfg.height_range)
+        topspin = U(self.cfg.topspin_range); sidespin = U(self.cfg.sidespin_range)
+
+        vx = -speed * torch.cos(elev) * torch.cos(azim)   # ← 负号！见式 (vx)
+        vy =  speed * torch.cos(elev) * torch.sin(azim)
+        vz =  speed * torch.sin(elev)
+
+        pose = torch.zeros(n, 7, device=dev)
+        pose[:, 0], pose[:, 1], pose[:, 2] = x_pos, y_off, height
+        pose[:, 3] = 1.0                                   # qw=1（单位四元数）
+        pose[:, :3] += self._env.scene.env_origins[env_ids]  # ← 写入加 env_origins！
+
+        vel = torch.zeros(n, 6, device=dev)
+        vel[:, 0], vel[:, 1], vel[:, 2] = vx, vy, vz
+        vel[:, 4] = -topspin                              # wy:topspin 让球下弯，取负
+        vel[:, 5] =  sidespin                             # wz:侧旋
+
+        self.ball.write_root_link_pose_to_sim(pose, env_ids)
+        self.ball.write_root_link_velocity_to_sim(vel, env_ids)
+        self.launch_params[env_ids] = torch.stack(
+            [speed, torch.rad2deg(elev), torch.rad2deg(azim),
+             x_pos, y_off, height, topspin, sidespin], dim=1)
+
+    def _update_command(self, dt):  # 发球是一次性事件，episode 内不更新
+        pass
+\end{codebox}
+
+\begin{pitfall}[pose 写入前忘记加 env\_origins]
+\textbf{错误描述}：直接 \Verb[breaklines]|write_root_link_pose_to_sim(pose, env_ids)|，pose 用的是 court-local 坐标。\textbf{现象后果}：多环境时所有球都出现在 env 0 的位置，其余球场看不到球。\textbf{根本原因}：MuJoCo 状态是 world frame，而参数是 court-local。\textbf{正确做法}：写入加、读取减——\Verb[breaklines]|pose[:, :3] += env.scene.env_origins[env_ids]|；读 obs 时 \Verb[breaklines]|ball_world_pos - env.scene.env_origins|。读取忘减则 env 0 的 reward 正常、其余因偏移恒零。
+\end{pitfall}
+
+\begin{pitfall}[角度单位搞混：对度数直接做三角函数]
+\textbf{错误描述}：\Verb[breaklines]|torch.sin(elev_deg)| 直接喂度数。\textbf{现象后果}：球飞得异常高/方向乱——\verb|sin(15)| 被当 $15$\,rad（$\approx37^\circ$ 的效果）。\textbf{根本原因}：配置里是度、三角函数吃弧度。\textbf{正确做法}：先 \verb|torch.deg2rad|。自检：\verb|elevation=90|$^\circ$ 时 $v_x$ 应 $\approx0$（球竖直上飞）。
+\end{pitfall}
+
+\paragraph{算法点：topspin 角速度的方向约定。}\Verb[breaklines]|vel[:,4]=-topspin| 的负号需解释：topspin（上旋）让球在飞行中更快下坠（Magnus 力向下）、弹跳后加速前进。物理上 topspin 是球绕 $y$ 轴旋转，但方向取决于右手定则：球沿 $-x$ 飞行时，topspin 应让球顶部向前转（像向前滚的车轮），在右手系对应 $\omega_y<0$，故正的 \verb|topspin| 参数转成负 $\omega_y$。\textbf{反面}：符号搞反则 Magnus 力反向，球不是更快下坠而是更「飘」——数值上不明显（球还会飞会弹），但 Sim2Real 时策略对旋转球的响应全部反向。
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[手算]} 给定 speed$=30$, elev$=5^\circ$, azim$=0^\circ$, height$=2.5$\,m, $x=11.0$\,m，忽略阻力：(a) 算 $v_x,v_y,v_z$；(b) 落地时间 $t_{\text{land}}$（令 $z(t)=0$）；(c) 落点 $x$；(d) 判断球在 $x=0$（网）处高度是否 $>0.914$\,m（验收：四问全答）。
+  \item \textbf{[验证]} 跑固定参数发球，每 $50$ step 打印球的 local position，确认从 $x>0$ 向 $x<0$ 运动、落点在 reward 区间内（验收：贴出几行打印 + 结论）。
+  \item \textbf{[设计]} 扩展 \verb|LaunchCommand| 支持 slice serve（侧旋 + 下旋组合）需改哪些参数？旋转轴应朝哪？（验收：写出新增/修改的维与 $\boldsymbol\omega$ 方向）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{弹道物理：三层空气动力学模型}
+\label{sec:rlmc-tennis-aero}
+
+\paragraph{模块功能与在管线中的位置。}发球定义了球射出的初态，射出后怎么飞由空气动力学决定。这层在每个仿真步通过 EventManager（\cref{ch:rlmc-dr}）给球施加外力。这一节的算法主线：\textbf{从简到繁分三层——真空 $\to$ 二次阻力 $\to$ Magnus}，逐层加力、逐层验证增量贡献。
+
+\paragraph{动机：真空抛体为什么不够。}真空抛体只受重力：
+\begin{equation}
+x(t)=x_0+v_{x0}t,\quad y(t)=y_0+v_{y0}t,\quad z(t)=z_0+v_{z0}t-\tfrac12 g t^2.
+\label{eq:rlmc-tennis-vacuum}
+\end{equation}
+但真实网球还受\textbf{阻力}（与速度反向、减速）与 \textbf{Magnus 力}（垂直于速度与自旋轴、改变弧线弯曲）。在 $20$--$45$\,m/s 球速下，阻力能让水平速度衰减 $30$--$50\%$——忽略阻力会严重高估飞行距离。类比：真空抛体像在太空扔球，现实网球更像在水里扔石头（阻力与漩涡力显著改轨迹），边界是空气密度远低于水，影响虽显著但不极端。
+
+\paragraph{第一层：真空（无外力）。}禁用空气动力学事件时，MuJoCo 只施重力，运动满足 \eqref{eq:rlmc-tennis-vacuum}。
+
+\begin{codebox}[bash]{真空抛体实验:关空气动力学事件}
+uv run play Mjlab-Tennis-Launcher --agent zero --num-envs 1 \
+  --env.commands.launch.speed-range "[30.0, 30.0]" \
+  --env.commands.launch.elevation-range "[5.0, 5.0]" \
+  --env.commands.launch.azimuth-range "[0.0, 0.0]" \
+  --env.commands.launch.topspin-range "[0.0, 0.0]" \
+  --env.events.ball-aerodynamics.params.enabled False
+\end{codebox}
+
+\textbf{sanity check（运行验证）}：$v_{z0}=30\sin5^\circ\approx2.62$\,m/s，初高 $h_0=2.5$\,m，落地时间 $t=\frac{v_{z0}+\sqrt{v_{z0}^2+2gh_0}}{g}\approx1.03$\,s，落点 $x=11.0-29.9\times1.03\approx-19.8$\,m——远超球场。这恰恰证明\emph{真空里 $30$\,m/s 发球会飞太远}，阻力是必需的。
+
+\paragraph{第二层：二次阻力。}阻力与速度平方成正比、方向与速度相反：
+\begin{equation}
+\mathbf{F}_{\text{drag}}=-\tfrac12\,\rho\,C_d\,A\,\|\mathbf v\|\,\mathbf v,
+\label{eq:rlmc-tennis-drag}
+\end{equation}
+其中 $\rho\approx1.225$\,kg/m$^3$（海平面空气密度），$C_d\approx0.55$（网球阻力系数），$A=\pi r^2\approx3.42\times10^{-3}$\,m$^2$（迎风面积）。\textbf{为什么是二次而非线性}：线性阻力 $F=-bv$（Stokes）只在低雷诺数（$Re<1$）适用；网球 $Re=\rho v d/\mu\approx1.3\times10^5$ 远超此范围，阻力从粘性主导转为惯性主导、$\propto v^2$。误用线性阻力会严重低估阻力，球飞得比真实远得多。
+
+对标准网球，$\tfrac12\rho C_d A\approx1.15\times10^{-3}$\,N$\cdot$s$^2$/m$^2$。在 $30$\,m/s 时阻力 $F_d\approx1.15\times10^{-3}\times900\approx1.04$\,N——比重力 $mg\approx0.56$\,N 还大！故高速飞行时阻力是主导力。
+
+\begin{derivation}[一维匀速阻力下的速度衰减解析解]
+忽略重力只看水平方向，分离变量：
+\[
+m\frac{dv}{dt}=-\tfrac12\rho C_d A v^2\ \Rightarrow\ \frac{dv}{v^2}=-\frac{\rho C_d A}{2m}\,dt.
+\]
+积分得
+\begin{equation}
+v(t)=\frac{v_0}{1+t/\tau},\qquad \tau=\frac{2m}{\rho C_d A\, v_0}.
+\label{eq:rlmc-tennis-vtau}
+\end{equation}
+位移
+\[
+x(t)=\int_0^t v(s)\,ds=v_0\tau\ln\!\big(1+t/\tau\big),
+\]
+对数关系意味着飞行距离增速随时间放缓——球不会飞到无穷远。对标准网球在 $30$\,m/s 下 $\tau=\frac{2\times0.057}{1.225\times0.55\times3.42\times10^{-3}\times30}\approx1.65$\,s；飞 $0.8$\,s 后水平速度从 $30$ 衰减到 $30/(1+0.8/1.65)\approx20.1$\,m/s，位移 $\approx19.8$\,m。
+\end{derivation}
+
+一个反直觉结论值得点透：在\textbf{固定飞行距离}下，二次阻力造成的速度衰减\emph{比例}与初速无关——由 $v(x)=v_0\exp(-\tfrac{\rho C_d A}{2m}x)$ 知 $v/v_0=\exp(-x\cdot\rho C_d A/2m)=\exp(-11/49.5)\approx0.80$ 为常数，即各初速飞过 $11$\,m 后都约剩 $80\%$、衰减约 $20\%$。但若改比\textbf{固定飞行时间}，则初速越大、同时间走得越远、累积阻力冲量越大、衰减比例越大。无论哪种口径，阻力都解释了「真空飞出底线、有阻力后落点合理」，且把弹道从对称抛物线压成不对称弧线。
+
+\begin{insight}[阻力模型错了，策略的所有时间预判都会错]\label{ins:rlmc-tennis-aero}
+若在无阻力环境训练（\verb|enabled=False|），策略会学到「球飞得远、速度不衰减」的物理；在有阻力环境评估、或真机部署时，策略的时间预判全错（真实球比它预期的「慢得多」），表现为持续「挥拍太早」。这是 \cref{sec:rlmc-tennis-aero} 三层对照实验如此重要的根本原因——\textbf{它确保策略在正确的物理模型上训练}。物理建模的错误不是「不够精确」，而是会被策略当成真理学进去。
+\end{insight}
+
+\paragraph{第三层：Magnus 力。}旋转球受垂直于速度与自旋轴的 Magnus 力：
+\begin{equation}
+\mathbf{F}_{\text{Magnus}}=C_L\,\frac{4\pi r^3}{3}\,\rho\,(\boldsymbol\omega\times\mathbf v),
+\label{eq:rlmc-tennis-magnus}
+\end{equation}
+其中 $C_L$ 为升力系数（课程取 $1.0$ 作 Magnus 缩放因子）。效果：topspin 让球更快下坠（弧线更弯、弹跳后加速前进）；backspin 更慢下坠（弧线更平）；sidespin 横向偏移（空中「拐弯」）。
+
+真实网球 $C_L$ 随自旋升高而\emph{饱和}（实验文献中高转速段约 $0.3$--$0.4$），并非常数；课程示例用 $C_L=1.0$ 结合体积项近似，并以一个 \texttt{max\_lift\_coefficient} 旋钮限幅（\pz{该旋钮名为本章示例代码所用，非框架内置 API}）。对标准网球，在 $v=20$\,m/s、$\omega=200$\,rad/s 时 $|\mathbf F_{\text{Magnus}}|\approx0.74$\,N，约为重力（$0.56$\,N）的 $130\%$——纯 topspin 下向下合力可达约 $2.3$ 倍重力（重力 $+$ 向下 Magnus），弧线显著更弯。\textbf{注意此处取 $C_L=1.0$ 幅度偏大；按真实饱和值 Magnus 会更小}——这正是要把 $C_L$ 纳入 DR 的理由。
+
+\paragraph{旋转角速度的衰减（一个被略去的简化）。}真实物理中阻力也减缓旋转，旋转阻力矩简化为 $\boldsymbol\tau_{\text{spindrag}}=-C_r\rho r^5|\boldsymbol\omega|\boldsymbol\omega$。本章课程示例的 BallAerodynamics 事件\emph{未}实现旋转衰减——角速度在飞行中保持不变。对短距飞行（$<20$\,m）影响小；远距 rally 若需更精确，可在外力施加时同时填 \verb|torques|。
+
+\paragraph{弹跳后的旋转-线速度耦合（自动发生）。}旋转球落地弹跳时，\verb|condim=3| 的摩擦接触模型\emph{自动}处理旋转与线速度的耦合（切向摩擦把旋转动量转成线速度变化）：topspin 弹跳后顶部向前转、获向前冲量；backspin 反之；sidespin 产生横向偏移。\textbf{不需要手写}——但 \verb|condim=1| 时这些效应全部消失（与 \cref{sec:rlmc-tennis-ball} 的 condim 决策树呼应）。
+
+\paragraph{代码走读：event 项实现。}三层模型落到一个\textbf{有状态 term} 里（继承 mjlab 唯一的 term 基类 \Verb[breaklines]|ManagerTermBase|——mjlab 并\emph{无} \verb|EventTerm| 这个基类，那是 Isaac Lab 的 import 重命名习惯，见 \cref{ch:rlmc-manager}），由 \Verb[breaklines]|EventTermCfg(func=BallAerodynamics, mode="interval", params=...)| 注册进 EventManager。三个设计决策标在注释。
+
+\begin{codebox}[Python]{BallAerodynamics 核心计算（mjlab 1.4.0 风格，继承 ManagerTermBase，简化）}
+from mjlab.managers import ManagerTermBase    # mjlab 唯一的 term 基类（无 EventTerm）
+
+class BallAerodynamics(ManagerTermBase):
+    def __call__(self, env, env_ids, **params):
+        if not params.get("enabled", True):
+            return
+        ball = env.scene["ball"]
+        vel     = ball.data.root_link_lin_vel_w  # [N,3] world frame（mjlab 长名，无 Isaac 短名别名）
+        ang_vel = ball.data.root_link_ang_vel_w  # [N,3] world frame
+        speed   = vel.norm(dim=-1, keepdim=True)
+
+        rho, Cd = params["air_density"], params["drag_coefficient"]
+        A = math.pi * params["ball_radius"]**2
+        drag_force = -0.5 * rho * Cd * A * speed * vel        # 决策(1):speed*vel 避免除零
+
+        CL = params["lift_coefficient"]; r = params["ball_radius"]
+        volume = (4.0/3.0) * math.pi * r**3
+        magnus_force = CL * volume * rho * torch.cross(ang_vel, vel, dim=-1)  # 决策(2):omega×v 顺序
+
+        total_force = drag_force + magnus_force
+        ball.write_external_wrench_to_sim(                   # mjlab:写外力 buffer（非 Isaac 的 set_*）
+            forces=total_force,
+            torques=torch.zeros_like(total_force),           # 决策(3):当前不施旋转阻力矩
+            body_ids=[0],
+        )
+\end{codebox}
+
+三个决策解释：(1) \verb|speed*vel| 等价 $|v|^2\hat v$ 即二次阻力的 $|v|\mathbf v$，但避免在 \verb|speed=0| 时除零；(2) \Verb[breaklines]|torch.cross(ang_vel, vel)| 给出 $\boldsymbol\omega\times\mathbf v$ 的正确 Magnus 方向——写反成 \Verb[breaklines]|cross(vel, ang_vel)| 则 topspin 球会「飘」而非「坠」；(3) \verb|torques=0| 即不施旋转阻力矩，要实现旋转衰减就在此填 $\boldsymbol\tau_{\text{spindrag}}$。施力用 mjlab 的 \Verb[breaklines]|write_external_wrench_to_sim(forces, torques, env_ids=None, body_ids=None)|（实测签名）——\textbf{不是} Isaac Lab 的 \Verb[breaklines]|set_external_force_and_torque/set_forces_and_torques|。\textbf{一个易漏的落盘细节}：\Verb[breaklines]|write_external_wrench_to_sim| 只把外力写进 Entity 的 buffer，mjlab 在仿真步推进时统一刷入 MuJoCo 的 \verb|xfrc_applied|；若你在 event 之外的自定义代码路径里手动改 root 状态或外力，须配合 Entity 的 \Verb[breaklines]|write_data_to_sim()| 把 buffer 落盘到底层 \verb|MjData|（与下文 Isaac Lab 侧的 \Verb[breaklines]|write_data_to_sim()| 同理）——写了外力却不生效，十有八九是漏了这步落盘时机。
+
+\begin{pitfall}[Magnus 力叉积顺序写反]
+\textbf{错误描述}：写成 \Verb[breaklines]|torch.cross(vel, ang_vel, dim=-1)|。\textbf{现象后果}：topspin 球向上「飘」而非向下「坠」，与物理直觉完全矛盾；数值上球照样飞照样弹，难以从日志发现。\textbf{根本原因}：$\boldsymbol\omega\times\mathbf v$ 与 $\mathbf v\times\boldsymbol\omega$ 方向相反。\textbf{正确做法}：固定写 \Verb[breaklines]|torch.cross(ang_vel, vel, dim=-1)|，并用「topspin 应更快下坠」做对照验证（\cref{sec:rlmc-tennis-suite} 实验七）。
+\end{pitfall}
+
+\paragraph{Isaac Lab 对照与 DR 接口。}Isaac Lab 里施加外力后须 \Verb[breaklines]|write_data_to_sim()| 落盘（Isaac Lab v2.3.2 起，旧的 \texttt{set\_external\_force\_and\_torque()}（articulation / rigid body 上）已\emph{弃用}，官方改用新的\textbf{可组合 wrench 系统}——经 \texttt{permanent\_wrench\_composer} 施加跨步持续力（\texttt{set\_forces\_and\_torques()} 替换 / \texttt{add\_forces\_and\_torques()} 叠加），另有 \texttt{instantaneous\_wrench\_composer} 作单步力；迁移旧代码时注意这一 API 变化，确切签名以你所装版本为准）。两框架都应为后续训练预留 DR 接口（\cref{ins:rlmc-tennis-dr}）：
+
+\begin{codebox}[Python]{空气动力学 DR 配置（后续击球章使用）}
+class BallAerodynamicsDRCfg:
+    drag_coefficient_range = (0.4, 0.7)   # ±27% 围绕 0.55（不同表面粗糙度确在此区间）
+    lift_coefficient_range = (0.5, 1.5)   # ±50% 围绕 1.0（C_L 取决于转速与 Re，1.0 仅近似中心）
+    air_density_range      = (1.1, 1.35)  # ±10% 围绕 1.225
+    # 不随机化重力:g 在地表变化 < 0.5%，可忽略
+\end{codebox}
+
+\paragraph{UniLab 对照：无 EventTerm，外力在 NpEnv 的 step 路径里逐步施加。}这里出现一处\textbf{范式差异}：mjlab/Isaac Lab 都把空气动力学做成\emph{声明式}的 EventTerm（注册进 EventManager，每步被框架调度）；UniLab \textbf{不是} Manager-Based，没有 \verb|EventManager|/\allowbreak\verb|EventTerm| 类，per-step 外力是在 \verb|NpEnv| 子类自己的 step 模板里\emph{命令式}地算、命令式地写（\Verb[breaklines]|base/np_env.py| 的 \verb|NpEnv.step|，UniLab commit \texttt{99936e08}）\,\cite{unilab2026}。要点：阻力$+$Magnus 是\emph{每个仿真步都随速度变}的力，\textbf{不是} interval-DR 那种「每 $N$ 步一次的随机推力」，所以它落在 \verb|apply_action| 之后、\verb|backend.step| 之前的外力写入，而非 DR 的 \Verb[breaklines]|apply_interval_randomization|。
+
+\begin{codebox}[Python]{UniLab:空气动力学外力在 NpEnv 子类里逐步施加（简化）}
+import numpy as np
+class TennisLauncherEnv(NpEnv):
+    # 物理与公式同 mjlab:F_drag=-0.5 rho Cd A |v| v;F_magnus=CL (4/3 pi r³) rho (omega×v)
+    def _aero_force(self):                     # 返回 (num_envs, 3)，world frame
+        v   = self._backend.get_body_lin_vel_w("ball")    # CPU NumPy，机/世系直接可得
+        w   = self._backend.get_body_ang_vel_w("ball")
+        spd = np.linalg.norm(v, axis=-1, keepdims=True)
+        A   = np.pi * self._cfg.ball_radius**2
+        f_drag   = -0.5 * self._cfg.air_density * self._cfg.drag_coef * A * spd * v
+        vol      = (4.0/3.0) * np.pi * self._cfg.ball_radius**3
+        f_magnus = self._cfg.lift_coef * vol * self._cfg.air_density * np.cross(w, v)
+        return f_drag + f_magnus               # omega×v 顺序同 mjlab，写反则 topspin 飘而非坠
+
+    def apply_action(self, actions, state):    # Phase 1 动作空间空:仅施外力，不写 ctrl
+        self._backend.apply_body_force("ball", self._aero_force())  # 经后端 body-force 能力（名示意）
+        return state                           # 之后基类调 backend.step → update_state
+\end{codebox}
+
+诚实记录：UniLab 的 mujoco 后端\textbf{声明支持 body force}（\Verb[breaklines]|get_dr_capabilities()| 的 \Verb[breaklines]|supports_interval_body_force=True|，\Verb[breaklines]|backend/mujoco/backend.py|，UniLab commit \texttt{99936e08}），这正是 per-step 外力的底座；但 UniLab \textbf{没有把「每步空气动力学」封装成可注册的 event 一等公民}——它是任务代码自己的责任（对照 mjlab \Verb[breaklines]|EventTermCfg(func=)| / Isaac Lab 的 wrench composer）。好处是直观可控，代价是失去声明式 DR 的统一调度。后续训练要给 $C_d/\rho/C_L$ 加 DR 时，把它们做成 \verb|NpEnv| 的 reset 项（每 episode 采一组、存进 \verb|self._cfg|），与 \cref{ch:rlmc-dr} 的 UniLab DR 范式一致。
+
+\paragraph{三层对照实验（本章最关键的物理验证）。}通过对比三层弹道差异直观理解每层增量贡献。固定 speed$=30$, elev$=5^\circ$, azim$=0$，命令见下，预期见表。
+
+\begin{codebox}[bash]{三层对照:真空 / 仅 drag / drag+Magnus}
+# 真空
+uv run play Mjlab-Tennis-Launcher --agent zero --num-envs 1 \
+  --env.events.ball-aerodynamics.params.enabled False
+# 仅 drag（设升力系数为 0，关掉 Magnus）
+uv run play Mjlab-Tennis-Launcher --agent zero --num-envs 1 \
+  --env.events.ball-aerodynamics.params.lift-coefficient 0.0
+# 完整（drag + Magnus，配合 topspin）
+uv run play Mjlab-Tennis-Launcher --agent zero --num-envs 1 \
+  --env.commands.launch.topspin-range "[200.0, 200.0]"
+\end{codebox}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+模型 & 预期飞行距离 & 水平速度衰减 & 弧线形态 \\
+\midrule
+真空 & 远超球场（$\sim20$\,m 过底线） & 无衰减 & 标准抛物线 \\
+仅 drag & 适中（落场内） & $\sim30$--$40\%$ & 压缩抛物线 \\
+drag $+$ topspin & 更短 & $\sim30$--$40\%$ & 弧线更弯（更快下坠） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+三者若无差异，说明 BallAerodynamics 事件未正确注册或 \verb|enabled| 未生效。\textbf{为什么不做完整 CFD}：CFD 计算量比 RL 训练本身大几个数量级（一次飞行数分钟 vs 训练数十亿步），精度过剩、速度过慢。二次阻力 $+$ Magnus 近似对 RL「足够好」——LATENT、ETH 羽毛球等顶会系统都用类似简化模型 $+$ DR 处理模型误差。
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[推导]} 对匀速直线飞行（忽略重力）推导 \eqref{eq:rlmc-tennis-vtau}，并算标准网球在 $30$\,m/s 时的 $\tau$（验收：推导 + 数值 $\approx1.65$\,s）。
+  \item \textbf{[实验]} 跑三层对照，记录三种模型下球的落点 $x$ 与弹起高度，定量对比（验收：三行数据 + 增量差异描述）。
+  \item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-dr}：训练中该随机化 $C_d$ 还是 $\rho$？推荐 DR 范围？为何不随机化 $g$？（验收：给出选择与理由）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{接触物理验证：球-地面、球-网、球-球拍}
+\label{sec:rlmc-tennis-contact}
+
+\paragraph{模块功能与在管线中的位置。}弹道飞行是「光滑」的微分方程（小误差不放大），但接触是\textbf{不连续事件}——球拍碰球那一帧，接触力可以是零或几百牛顿；接触参数微小变化可能让出球方向差 $10^\circ$、速度差 $20\%$。这一节系统验证三种关键接触，建立接触调参方法论。算法点：\textbf{接触是最敏感的物理环节，验证必须独立于训练}。
+
+\paragraph{球-地面：COR 标定（ITF 标准）。}从 $2.54$\,m（$100$ inch）自由落体测弹起高度比。
+
+\begin{codebox}[bash]{ITF 弹跳测试:2.54 m 落体、关阻力}
+uv run play Mjlab-Tennis-Launcher --agent zero --num-envs 1 \
+  --env.commands.launch.speed-range "[0.0, 0.0]" \
+  --env.commands.launch.height-range "[2.54, 2.54]" \
+  --env.commands.launch.topspin-range "[0.0, 0.0]" \
+  --env.events.ball-aerodynamics.params.enabled False
+\end{codebox}
+
+\textbf{通过标准}：球落地明显弹起，弹起高度约为落高的 $53$--$58\%$（对应硬地 COR $0.73$--$0.76$）。\textbf{怎么调（按 \cref{sec:rlmc-tennis-ball} 实测的主旋钮，用直接负格式 \texttt{solref}）}：弹太高（COR$>0.8$，本章默认 \texttt{-3500 -2} 即 COR$\approx0.95$ 就属此列）$\to$ 增大阻尼项绝对值（如 $-2\to-12$ 把 COR 拉到 $\approx0.74$）；弹太低（COR$<0.5$）$\to$ 减小阻尼项绝对值；球「粘」地不弹则刚度太软或阻尼过大，提刚度（如 $-3500$）并减阻尼。\textbf{注意}：\emph{别}用正格式的 dampratio 来调 COR——实测正格式在常规 solimp 下 COR 仅 $0.06$--$0.14$ 且 dampratio 几乎不动它（见 \cref{sec:rlmc-tennis-ball} 的两格式对比）。
+
+\begin{codebox}[Python]{COR 标定核心（从 2.54 m 落体测恢复系数）}
+import math, torch
+def calibrate_cor(env, drop_height=2.54, n_trials=10):
+    cors = []
+    for _ in range(n_trials):
+        env.reset()
+        max_z, bounced, prev_vz = 0.0, False, 0.0
+        for _ in range(1000):
+            env.step(torch.zeros(1, 0, device=env.device))
+            z  = (env.scene["ball"].data.root_link_pos_w[0, 2]
+                  - env.scene.env_origins[0, 2]).item()
+            vz = env.scene["ball"].data.root_link_lin_vel_w[0, 2].item()
+            if not bounced and z < 0.05 and prev_vz < 0 and vz > 0:  # 触底 + vz 变号
+                bounced, max_z = True, z
+            if bounced:
+                max_z = max(max_z, z)
+                if vz < 0 and max_z > 0.01:                          # 已过最高点
+                    cors.append(math.sqrt(max_z / drop_height)); break
+            prev_vz = vz
+    mean = sum(cors)/len(cors)
+    std  = (sum((c-mean)**2 for c in cors)/len(cors))**0.5
+    return mean, std
+# COR = sqrt(h_bounce / h_drop);目标硬地 0.73-0.76
+\end{codebox}
+
+\paragraph{先验收一次再写死：纯 MuJoCo 落体标定（不依赖 mjlab，照敲即跑）。}上面的 \verb|calibrate_cor| 走 \verb|env.step|、与整个 mjlab 任务耦合，调试期太重。\textbf{标定 COR 根本不需要 mjlab}——一个独立 \verb|MjModel| 加一颗球就够，几行就能把「这组 solref 到底是几」量出来。这是本章主张「先测、再信参数」的工程闭环：\textbf{拿到任何一组 solref，先跑这段量出真实 COR，再决定写不写进任务}。
+
+\begin{codebox}[Python]{纯 MuJoCo standalone COR 标定（与本章实跑同款，约 20 行）}
+import mujoco, numpy as np
+XML = """
+<mujoco>
+  <option timestep="0.0005"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1" condim="3"
+          friction="0.6 0.005 0.001" solref="-3500 -2" solimp="0.95 0.99 0.001 0.5 2.0"/>
+    <body name="ball" pos="0 0 2.54">
+      <freejoint/>
+      <geom type="sphere" size="0.033" mass="0.057" condim="3"
+            solref="-3500 -2" solimp="0.95 0.99 0.001 0.5 2.0"/>
+    </body>
+  </worldbody>
+</mujoco>"""
+m = mujoco.MjModel.from_xml_string(XML); d = mujoco.MjData(m)
+drop_h, touched, h_bounce = 2.54, False, 0.0
+for _ in range(8000):                       # 4 s @ 2000 Hz
+    mujoco.mj_step(m, d)
+    z = d.qpos[2]                            # freejoint qpos = [x y z qw qx qy qz]
+    if z < 0.04: touched = True              # 触底
+    if touched: h_bounce = max(h_bounce, z)  # 记录弹起最高点
+print(f"COR = {np.sqrt(h_bounce/drop_h):.3f}")
+# 实跑输出（gpufree, MuJoCo 3.8.1）:solref 阻尼项 -2 → COR~=0.95（过弹）;
+#   把两处 solref 的 -2 改成 -12 重跑 → COR~=0.74（命中硬地目标 0.73-0.76）.
+\end{codebox}
+
+把这段当 COR 调参的「示波器」：改一个 solref 跑一次、看 COR 往哪走，比对着纸面参数猜高效得多。\textbf{两处 solref 要一起改}（地面 geom 与球 geom 的接触取两者组合，只改一处效果减半）。
+
+\begin{insight}[COR 标定是一次性调音，但参数耦合时要重标]\label{ins:rlmc-tennis-cor}
+COR 标定像调音：「音叉」是 ITF 标准弹高，「弦的张力」是 \verb|solref|，调到「音高」（COR）匹配即可——标好后\emph{不必每次训练重做}。但若改了地面 geom 材质或 \verb|timestep|，接触求解的数值条件变了，就\textbf{必须重标}。这呼应本章反复出现的主题：物理参数之间高度耦合，「改一个、验全部」。
+\end{insight}
+
+\paragraph{斜入射弹跳验证。}除垂直 COR，还要验斜入射——出射角与速度同时受法向恢复与切向摩擦影响。预期：球以俯角入射后弹起，弹起角\emph{大于}入射角（法向 COR$<1$ 使法向速度减小，切向速度因摩擦也减小但比例不同）。若弹起角几乎等于入射角，说明接触接近完全弹性、需增阻尼；若几乎贴地前进，说明法向恢复太弱。
+
+\paragraph{球-网：语义撞网检测（保险层）。}高速球可能在一个 timestep 内穿过薄网 box（tunnel effect）。\Verb[breaklines]|BallNetPlaneContact| termination 不只依赖 MuJoCo 接触求解，还额外检查球心轨迹是否穿越 $x=0$ 平面且高度低于网高——\textbf{即便物理接触检测失败（球穿过薄 box），语义检测仍能捕获撞网}。
+
+\begin{codebox}[Python]{语义撞网检测核心逻辑（有状态 term，继承 ManagerTermBase）}
+from mjlab.managers import ManagerTermBase    # mjlab 无 TerminationTerm 基类;用 TerminationTermCfg(func=) 注册
+class BallNetPlaneContact(ManagerTermBase):
+    def __call__(self, env) -> torch.Tensor:
+        local = env.scene["ball"].data.root_link_pos_w[:, :3] - env.scene.env_origins
+        prev_x, curr_x = self._prev_ball_x, local[:, 0]
+        crossed = (prev_x > 0) & (curr_x < 0)                 # 穿越 x=0 平面
+        t = prev_x / (prev_x - curr_x + 1e-8)                 # 在穿越点插值高度
+        cross_z = self._prev_ball_z + t * (local[:, 2] - self._prev_ball_z)
+        hit_net = crossed & (cross_z < 0.95)                  # 略高于 0.914 留裕量
+        self._prev_ball_x = curr_x.clone()
+        self._prev_ball_z = local[:, 2].clone()
+        return hit_net
+\end{codebox}
+
+\paragraph{球-球拍接触预览（最敏感环节）。}Phase 1 无球拍，但接触设计思路要提前规划——出球速度与方向直接决定任务成功率。三个挑战：(1) \textbf{质量比悬殊}（球拍 $\sim300$\,g vs 球 $\sim57$\,g），高刚度接触易数值振荡；(2) \textbf{接触时间极短}（$3$--$5$\,ms），需足够高仿真频率；(3) \textbf{面法向敏感}（球拍面偏 $5^\circ$，出球方向可能差 $10^\circ$）。LATENT 用 $2000$\,Hz 仿真\cite{tennis_latent2026}，确保每次球拍-球接触至少 $6$--$10$ 步；用 $500$\,Hz 则一次 $3$\,ms 接触只有 $1$--$2$ 步，接触力解算严重不足。后续击球章应把 \verb|timestep| 从 $0.002$ 调到 $0.0005$（$2000$\,Hz）或至少 $0.001$（$1000$\,Hz），并相应调 \verb|decimation| 保持 $50$\,Hz 控制（$50$\,Hz 控制 $\to$ decimation $=40$ @ $2000$\,Hz）。
+
+\begin{pitfall}[在 500 Hz 仿真下调球拍接触参数]
+\textbf{错误描述}：沿用 Phase 1 的 $500$\,Hz 去调球拍-球接触。\textbf{现象后果}：调来调去出球行为都不稳，浪费大量时间。\textbf{根本原因}：频率不够时接触力本身就不准，调参毫无意义。\textbf{正确做法}：先把仿真频率提到 $1000$--$2000$\,Hz，再调接触参数。
+\end{pitfall}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[实验]} 跑 ITF 弹跳测 COR；再把 \verb|friction| 第一分量从 $0.6$ 改 $0.2$ 重测。摩擦系数变化对垂直 COR 有影响吗？为什么？（验收：两组 COR + 解释「垂直落体无切向滑移，故 slide 摩擦不影响垂直 COR」）
+  \item \textbf{[设计]} 设计实验验证「语义撞网比物理接触更可靠」：固定参数让球以不同速度刚好过网/撞网，比较两种检测的一致性（验收：实验方案 + 预期差异点）。
+  \item \textbf{[思考]} 为何 LATENT 选 $2000$\,Hz 而非更高？对 $4096$ 环境 $\times$ $8$ GPU，频率翻倍意味着什么？（验收：从精度-吞吐权衡作答）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{mjlab 全链路：从注册到 termination}
+\label{sec:rlmc-tennis-manager}
+
+\paragraph{模块功能与在管线中的位置。}前几节分别讲了球场、球、发球、弹道、接触；这一节把它们在 Manager 架构（\cref{ch:rlmc-manager}）里串起来，给后续新增击球任务建立模式。算法点：\textbf{Phase 1 的边界是「actions 为空」——策略「没有手」，任何训练都无意义}。
+
+\paragraph{任务注册链路。}经统一 registry 进入，CLI（\Verb[breaklines]|uv run list-envs/play/train|）才找得到你的 task；绕过 registry 自建 env 等于脱离整个工具链。
+
+\begin{codebox}[Python]{任务注册（课程示例）}
+# tasks/tennis/__init__.py
+register_mjlab_task(
+    task_id="Mjlab-Tennis-Launcher",
+    env_cfg_entry_point=tennis_launcher_env_cfg,
+    rl_cfg_entry_point=tennis_launcher_rl_cfg,
+)
+# 后续 Mjlab-Tennis-Strike 等都应经同一 registry 进入
+\end{codebox}
+
+\paragraph{Manager 职责分工。}下表是当前 Phase 1 各 Manager 的内容与职责——注意 \textbf{Actions 为空}这一关键边界。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{5.2cm}@{}}
+\toprule
+Manager & 当前内容 & 职责 \\
+\midrule
+Scene & court $+$ ball $+$ terrain & 物理世界里有哪些对象 \\
+Commands & \Verb[breaklines]|launch: LaunchCommandCfg| & 每 episode 随机发球参数 \\
+Observations & actor: \{ball\_pos, ball\_vel, ball\_ang\_vel\} & 策略能看到什么 \\
+Actions & \verb|{}|（空） & 策略能做什么——\textbf{当前什么都不能做} \\
+Rewards & \verb|ball_in_box| & Phase 1 落点信号 \\
+Terminations & timeout / net\_contact / stopped / oob & 何时结束 episode \\
+Events & \Verb[breaklines]|BallAerodynamics| & 每步施加空气动力学外力 \\
+Curriculum & 空 & 后续击球章添加 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Observation 的 frame 一致性陷阱。}课程示例里 \verb|ball_position| 返回 court-local（world-aligned，即 world 减 \verb|env_origins|），而 \verb|ball_velocity|/\allowbreak\Verb[breaklines]|ball_angular_velocity| 取的是 body frame。对 sphere，body frame 姿态视觉上不明显，但 API 语义不同。
+
+\begin{codebox}[Python]{Observation terms（注意 frame 不一致）}
+def ball_position(env):          # court-local（world 减 env_origins）
+    return env.scene["ball"].data.root_link_pos_w[:, :3] - env.scene.env_origins
+def ball_velocity(env):          # body frame —— 与 position 的 frame 不一致！
+    return env.scene["ball"].data.root_link_lin_vel_b[:, :3]
+def ball_velocity_world(env):    # 建议:world frame，推荐给 predictor 用
+    return env.scene["ball"].data.root_link_lin_vel_w[:, :3]
+\end{codebox}
+
+\begin{pitfall}[obs 的 frame 不一致：position 用 world-aligned、velocity 用 body]
+\textbf{错误描述}：后续轨迹预测器把 body-frame 速度当 world-frame 用。\textbf{现象后果}：当球有显著旋转时（body 与 world frame 不一致），预测器产生系统性偏差，且不在单步指标上显现。\textbf{根本原因}：同一组 obs 混用两种 frame。\textbf{正确做法}：统一所有球 obs 到 world-aligned frame（用 \Verb[breaklines]|ball_velocity_world| / \Verb[breaklines]|root_link_ang_vel_w|），为感知/预测模块预做准备。
+\end{pitfall}
+
+\paragraph{后续击球任务的 Observation 与 Privileged Critic。}Phase 1 只有球状态（无机器人）。后续击球任务需加机器人本体、球拍状态、上一步动作，并区分 actor/critic 观测——这正是 \cref{ch:rlmc-privileged} 的非对称 actor-critic 在球类运动里的直接应用：
+
+\begin{codebox}[Python]{后续击球任务的 obs（预规划，含 privileged critic）}
+class StrikeObservationsCfg:
+    # mjlab 真名 ObservationTermCfg（Isaac Lab 用户常 import 重命名为 ObsTerm;mjlab 不导出短名）
+    class ActorCfg:    # actor 看有噪声的可部署观测
+        ball_position = ObservationTermCfg(func=ball_position,       enable_corruption=True)
+        ball_velocity = ObservationTermCfg(func=ball_velocity_world, enable_corruption=True)
+        ball_history  = ObservationTermCfg(func=ball_position_history, params={"length": 5})
+        joint_pos = ObservationTermCfg(func=mdp.joint_pos_rel); joint_vel = ObservationTermCfg(func=mdp.joint_vel_rel)
+        racket_pos = ObservationTermCfg(func=racket_face_position); racket_normal = ObservationTermCfg(func=racket_face_normal)
+        last_action = ObservationTermCfg(func=mdp.last_action)
+    class CriticCfg:   # critic 看完美球状态（privileged）
+        ball_position_perfect = ObservationTermCfg(func=ball_position,       enable_corruption=False)
+        ball_velocity_perfect = ObservationTermCfg(func=ball_velocity_world, enable_corruption=False)
+\end{codebox}
+
+\paragraph{Termination 分类与 timeout 的 value bootstrapping。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{5.0cm}@{}}
+\toprule
+termination & 类别 & 触发条件 \\
+\midrule
+\verb|time_out| & 仿真安全 & 达 episode 时长上限 \\
+\Verb[breaklines]|ball_net_contact| & 任务语义 & 球心轨迹穿越网平面且高度 $<$ 网高 \\
+\verb|ball_stopped| & 任务语义 & $z<0.05$ 且 speed $<0.5$ \\
+\verb|ball_oob| & 仿真安全 & $|x|>15$ 或 $|y|>8$ 或 $z<-0.5$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\verb|time_out| 须设 \verb|time_out=True|（回顾 \cref{ch:rlmc-training}）：episode 因 timeout 结束时 PPO 要对终态做 value bootstrapping（$V(s_T)\neq0$），因为这不是真正的「失败终止」；误设 \verb|False| 会让价值函数产生偏差、甚至诱发「自杀策略」。
+
+\paragraph{Phase 1 reward 与 ITF 规则的五处差异（别把训练信号当比赛规则）。}当前 reward 检查球是否落在\emph{合并}的近端 service area（不分 deuce/ad、不处理 let）。这对 Phase 1（验证球能否落目标区）足够，但与标准发球规则有五处差异：左右不分区、不检查对角、不处理触网 let、不处理线宽、不分一发二发。后续若要标准发球训练，必须新增独立的精确 reward。
+
+\begin{codebox}[Python]{Phase 1 落点 reward（合并 service area，简化）}
+def ball_landed_in_service_box(env):
+    local = env.scene["ball"].data.root_link_pos_w[:, :3] - env.scene.env_origins
+    in_x = (local[:, 0] > -6.40) & (local[:, 0] < 0.0)
+    in_y = (local[:, 1] > -4.115) & (local[:, 1] < 4.115)
+    in_z = local[:, 2] < 0.1
+    return (in_x & in_y & in_z).float()
+\end{codebox}
+
+\paragraph{UniLab 对照：八个 Manager 塌进一个 NpEnv 子类。}前面这张 Manager 职责表是 mjlab/Isaac Lab 的 Manager-Based 视角；UniLab \textbf{没有这八个 Manager 类}，同样的职责\emph{塌进}一个 \verb|NpEnv| 子类（\Verb[breaklines]|base/np_env.py|，UniLab commit \texttt{99936e08}）\,\cite{unilab2026}。逐项对位：Scene$\to$\Verb[breaklines]|SceneCfg.model_file|；Observations/Rewards/Terminations \textbf{合并进} \Verb[breaklines]|update_state()| \textbf{一处算}（obs 在 \verb|_compute_obs| 拼、reward 经 \Verb[breaklines]|run_reward_dispatch| 派发、terminated 直接判）；Events（空气动力学外力）$\to$上一节 \verb|apply_action| 里命令式施加；Commands（发球）$\to$ reset 时采样写球初态；Curriculum$\to$\Verb[breaklines]|PenaltyCurriculum| 或手调。注册不走 gym、也不走 \Verb[breaklines]|register_mjlab_task|，而是 \Verb[breaklines]|@registry.envcfg/env| 双装饰器（\Verb[breaklines]|base/registry.py|）。
+
+\begin{codebox}[Python]{UniLab:Tennis Launcher 的 NpEnv 骨架（Phase 1，动作空间空）}
+from unilab.base import registry
+from unilab.base.np_env import NpEnv
+
+@registry.envcfg("TennisLauncher")                 # 注册 cfg（CamelCase = task_name）
+@dataclass
+class TennisLauncherCfg(EnvCfg):
+    scene: SceneCfg = field(default_factory=lambda: SceneCfg(
+        model_file="assets/robots/tennis/tennis_scene.xml"))   # 球场+球 MJCF
+    sim_dt: float = 0.002       # 500 Hz 纯弹道够;击球任务提到 0.0005（2000 Hz）
+    ctrl_dt: float = 0.01       # 100 Hz;sim_substeps = ctrl_dt/sim_dt = 5
+
+@registry.env("TennisLauncher", sim_backend="mujoco")          # 多后端可多标
+class TennisLauncherEnv(NpEnv):
+    @property
+    def obs_groups_spec(self):                     # actor 看球状态;critic 同（Phase 1 无特权）
+        return {"obs": 9}                          # ball_pos(3)+vel(3)+ang_vel(3)
+    def _reset_idx(self, env_ids):                 # 发球 = reset 时采样 8 维参数写球初态
+        self._sample_launch_into_ball(env_ids)     # 对应 mjlab 的 LaunchCommand
+    def update_state(self, state):                 # Obs/Reward/Term 一处算（替代三 Manager）
+        local = self._ball_local_pos()             # world 减 env_origins
+        obs = {"obs": self._compute_obs(local)}
+        reward = self._ball_in_box(local)          # Phase 1 落点信号
+        terminated = self._net_contact(local) | self._ball_stopped(local)
+        return state.replace(obs=obs, reward=reward, terminated=terminated)
+    # 动作空间:Phase 1 留空（apply_action 只施空气动力学外力，见上一节）.
+\end{codebox}
+
+注意三处与本章 mjlab 版的语义对齐：(1) \verb|env_origins| 加减法则一样（写球初态\,$+$、读 obs\,$-$）；(2) timeout 的 value bootstrapping 在 UniLab 由 \Verb[breaklines]|TransitionBootstrapContract| 显式处理（\Verb[breaklines]|base/final_observation.py|，区分 \Verb[breaklines]|timeout_terminal_mask| 与失败终止，等价 mjlab/Isaac 的 \verb|time_out| 字段，UniLab commit \texttt{99936e08}）；(3) Phase 1「动作空间空」这条边界三框架一致——没有动作维就别训练（\cref{ch:rlmc-training}）。
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[追踪]} 追 \verb|env_origins| 在 pose 写入与 reward 读取中的加减关系，画出 world frame 与 court-local 的转换路径图（验收：一张转换图，标注「写入 $+$、读取 $-$」）。
+  \item \textbf{[设计]} 在 Tennis Launcher 基础上加一个静态挡板（固定 racket geom），需改哪些 Manager 配置？不需改哪些？（验收：列出需改/不需改的 Manager）
+  \item \textbf{[对照]} 把同一个静态挡板需求映射到 UniLab：在 \verb|NpEnv| 非 Manager-Based 架构里，分别要动哪几处（scene XML / \verb|update_state| / 注册）？与 mjlab 的「改哪些 Manager」相比，哪种更易定位改动面？（验收：UniLab 改动清单 $+$ 一句对比结论）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{机器人 + 球拍 MJCF 建模路线}
+\label{sec:rlmc-tennis-robot}
+
+\paragraph{模块功能与在管线中的位置。}Phase 1 只有球没有机器人。但机器人的几何与质量会改变 scene 的碰撞动力学，必须\textbf{提前规划}而非到击球章再说——否则可能发现球拍碰撞体与球场冲突、机器人 \verb|env_origins| 与球场不一致、球拍质量影响了球弹跳的接触参数，这些 scene 级问题改起来要重验本章所有物理实验。算法点：\textbf{为后续击球任务预留环境接口，按阶段逐步引入}。
+
+\paragraph{球拍建模。}真实球拍有线床（椭圆面）、框架（椭圆环）、握柄（圆柱）。第一版把线床简化成薄 box 或 ellipsoid，握柄与机器人末端刚性连接（无 joint）。
+
+\begin{codebox}[text]{球拍简化 MJCF（附着在 robot wrist body 上）}
+<!-- 线床 box:size 为 half-size → 全尺寸 24cm×30cm×1cm;euler 模拟握拍角 -->
+<body name="racket" pos="0 0 0.2" euler="0 -15 0">
+  <geom name="racket_face" type="box" size="0.12 0.15 0.005"
+        mass="0.15" condim="3" friction="0.4 0.01 0.001" solref="0.001 1.0"/>
+  <site name="racket_face_center" pos="0 0 0"/>     <!-- IK 目标 -->
+  <site name="racket_face_normal" pos="0 0 0.01"/>  <!-- 判断击球角度 -->
+</body>
+\end{codebox}
+
+\begin{pitfall}[把 CCD 误当「连续碰撞检测」来防穿透]
+\textbf{错误描述}：以为加大 \verb|margin| 或开 MuJoCo「CCD」就能让薄球拍面不被高速球穿透。\textbf{现象后果}：仍然偶发穿透，且误判为参数没调对。\textbf{根本原因}：MuJoCo 的 \texttt{margin}/\allowbreak\texttt{gap} 是接触检测阈值与 inactive contact 缓冲，并\emph{非}连续碰撞检测；MuJoCo 文档中的 CCD 指 Convex Collision Detection（GJK/EPA 凸碰撞检测管线），不是「连续碰撞检测」。在 $2000$\,Hz 下 $30$\,m/s 球单步移动 $0.015$\,m，约为 $1$\,cm 面厚的 $1.5$ 倍，理论上仍可能穿透。\textbf{正确做法}：靠更高仿真频率 $+$ 增厚碰撞体 $+$ 合理 margin $+$ 语义穿越检测/自定义 swept test 组合防穿透。
+\end{pitfall}
+
+\paragraph{机器人选择与前沿适配。}网球/球拍机器人有三种形态：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{3.2cm}p{3.2cm}@{}}
+\toprule
+形态 & 代表系统 & 优势 & 劣势 \\
+\midrule
+人形 & LATENT(G1)、HITTER(G1) & 类人运动、全身协调 & 控制维高、训练难 \\
+四足 $+$ 手臂 & ETH 羽毛球(ANYmal-D) & 底盘稳、手臂灵活 & 不自然、覆盖范围有限 \\
+固定底座机械臂 & 经典乒乓球台机械臂 & 控制简单 & 移动范围受限 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+教学项目建议从\textbf{固定底座机械臂}起步（最简单），验证击球物理后再升级移动底盘。LATENT 论文报告在 Unitree G1 上的硬件适配涉及三处工程改动\cite{tennis_latent2026}：(1) 用 3D 打印适配器把标准球拍装到机器人右末端执行器（拍柄相对前臂带一固定倾角，MJCF 里对应一个 \texttt{euler} 偏置，\pz{论文未给出该角度的精确度数，正文示意的 $\sim15^\circ$ 为工程占位值}）；(2) 末端关节连接器重新设计以提升动态运动下的结构稳定性（仿真中对应 actuator 的 \texttt{forcerange}/\allowbreak\texttt{ctrlrange}，太小则策略学到「不敢用力挥拍」）；(3) 机器人表面加散光材料以提升动捕稳定性、消除杂散反射（仿真不需处理，但提醒真机 perception 需额外工程）。
+
+\paragraph{Scene 集成与动作空间预览。}在 mjlab 集成 G1 $+$ 球拍可参考 HUSKY（基于 mjlab 的人形 $+$ 外部物体「滑板」集成项目\cite{husky2026}）的范式——机器人与外部物体作为独立 Entity，接触由 MuJoCo contact model 自动处理。后续击球的 action 表示，前沿系统各异：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llllp{3.0cm}@{}}
+\toprule
+系统 & Action 表示 & 维度 & 控制频率 & 优劣 \\
+\midrule
+LATENT & latent action（VAE decode$\to$PD 目标） & $\sim16$ & $50$\,Hz & 自然、表达力高，需 motion data \\
+HITTER & 全关节 PD targets & $29$ & $50$\,Hz & 简单直接，可能动作不自然 \\
+ETH 羽毛球 & 全关节 PD $+$ 步态相位 & $12{+}1$ & $50$\,Hz & 步态相位助协调 \\
+Phybot & 全关节 PD targets & $21$ & $50$\,Hz & 三阶段 curriculum 弥补无 motion prior \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+教学项目推荐\textbf{全关节 PD targets}（最透明、最易调试），配合 \cref{ch:rlmc-quadloco} 的 action 平滑正则（action\_rate 惩罚）。方案 B「上下身分离」（下肢用 pretrained locomotion、上肢用 IK/RL 控拍）是 HITTER/Phybot 的做法，大幅降低训练难度——RL 只需学「怎么挥拍」而非「怎么走路 $+$ 挥拍」。
+
+\paragraph{阶段化引入路线（本节最重要的工程建议）。}不要一次搭完整环境。按阶段推进，每阶段过验收才进下一阶段：
+
+\begin{codebox}[text]{阶段化路线与验收}
+Stage 0  只有球 launcher              验收:三层对照实验（本章）
+Stage 1  + 静态 racket geom          验收:球以不同速度/角度撞拍，不穿透、不"粘球"
+Stage 2  + kinematic racket          验收:scripted 轨迹打 10 球，>=7 球过网
+Stage 3  + 固定底座机械臂(IK action) 验收:IK 到目标精度 < 1 cm
+Stage 4  + 移动底盘(base-arm 协调)    验收:动态目标下跟踪误差达标
+Stage 5  + 视觉/动作延迟             验收:加延迟后 Stage 3 仍能工作
+Stage 6  + reward 与 curriculum      验收:PPO reward 上升（按 Ch 训练诊断）
+\end{codebox}
+
+\begin{pitfall}[直接从 Stage 0 跳到 Stage 6]
+\textbf{错误描述}：跳过中间阶段，一步到位搭机器人 $+$ 球拍 $+$ 训练。\textbf{现象后果}：出 bug 时无法定位是物理接触问题还是策略问题。\textbf{根本原因}：多个不确定性（racket 几何、racket-ball contact、robot action/obs、击球 reward）同时引入。\textbf{正确做法}：严格按阶段推进，每阶段必须过验收。另：第一版\emph{不要}引入柔性网（会把调参焦点从击球转到织物仿真），刚性障碍即可。
+\end{pitfall}
+
+\paragraph{UniLab 对照：机器人$+$球拍$+$球场都进 scene MJCF，用 fragment 拼装。}UniLab 同样走 MJCF（mujoco 后端），机器人$+$球拍的集成\textbf{不用} Isaac Lab \Verb[breaklines]|RigidObjectCfg|/\allowbreak\Verb[breaklines]|ArticulationCfg| 那套资产配置类，而是把多份 XML 经 \verb|SceneCfg| 的 \verb|model_file| $+$ \Verb[breaklines]|fragment_files| 在编译期拼成一份模型（\verb|base/scene.py| 的 \Verb[breaklines]|SceneCfg.fragment_files|，UniLab commit \texttt{99936e08}）——这正是 UniLab 把「locomotion 任务片段拼进机器人 XML」用的同一机制\,\cite{unilab2026}。球拍与 wrist 的连接同 mjlab：在 kinematic tree 里作 wrist body 的子 body（无 joint 即刚性焊接），\textbf{不需要} weld constraint。
+
+\begin{codebox}[Python]{UniLab:用 fragment 拼 robot+racket+court（SceneCfg，简化）}
+from unilab.base.scene import SceneCfg
+scene = SceneCfg(
+    model_file="assets/robots/g1/g1.xml",          # 主模型:机器人本体
+    fragment_files=[                                # 编译期拼入（冷路径）
+        "assets/robots/tennis/racket.xml",         # 球拍:作 wrist body 子 body，无 joint
+        "assets/robots/tennis/court.xml",          # 球场+球
+    ],
+)
+# 球拍面中心/法向用 MJCF <site>，经后端 get_sensor_data / body getter 读位姿（同 mjlab site）.
+\end{codebox}
+
+诚实记录一处真实欠缺：UniLab 的动作\textbf{固定是关节位置目标残差}（\verb|apply_action| 里 \Verb[breaklines]|ctrl = act*action_scale + default_angles|），\textbf{没有}与 Isaac Lab \Verb[breaklines]|DifferentialInverseKinematicsActionCfg| / mjlab differential-IK action 等价的 task-space IK action 类（\cref{ch:rlmc-tenniscontrol} 的 IK action 一节就此详述）。所以后续击球任务若想用「球拍 task-space 增量」动作，在 UniLab 里要在 \verb|apply_action| 中\emph{手写} DLS 逆运动学再转成关节位置目标——这印证了本节「把运动学编码进 action 是框架便利、缺了就自己补」。球拍-球接触本身则由后端 MuJoCo contact model 自动处理，与 mjlab 同源。
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[设计]} 设计薄 box 球拍线床的 MuJoCo geom 参数（type/size/mass/condim/friction），解释每个选择理由（验收：参数表 $+$ 理由）。
+  \item \textbf{[手算]} 线床厚 $0.005$\,m、球速 $40$\,m/s、\Verb[breaklines]|timestep=0.002|\,s，球单步移动多少？与线床厚之比说明什么？改 \Verb[breaklines]|timestep=0.0005| 后比值变为多少？（验收：两个比值 $+$ 穿透风险结论）
+  \item \textbf{[跨章综合]} 参考 HUSKY 的 Scene 配置，在 mjlab 集成 G1 $+$ 球拍 $+$ 球场需哪些 Entity？它们间有碰撞交互吗？（验收：Entity 清单 $+$ 交互关系）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{最小可运行实验序列与三层验收}
+\label{sec:rlmc-tennis-suite}
+
+\paragraph{模块功能与在管线中的位置。}前面各节分别验证了单个组件，这一节把它们编成从 smoke test 到弹道验证的\textbf{实验序列}，并定义三层验收标准——这是本章的「验收门」，不过不应进入后续感知/击球章。
+
+\paragraph{实验序列。}下表浓缩八个实验（命令在前文各节已给，这里给目的与通过标准）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{6.0cm}@{}}
+\toprule
+实验 & 目的 & 通过标准 \\
+\midrule
+1 任务注册 & \Verb[breaklines]|uv run list-envs| 含 Tennis & 输出含 \Verb[breaklines]|Mjlab-Tennis-Launcher| \\
+2 导出 scene & \verb|export-scene| 无 compile error & 导出 XML 含 court geom 与 ball body \\
+3 zero 可视化 & 看球场/球/方向/多环境 & 见下「检查清单」逐项正常 \\
+4 固定单发球 & 轨迹可复现 & 沿 $-x$ 飞、先升后降、落场内附近 \\
+5 三层对照 & 增量贡献 & 真空/仅 drag/drag+Magnus 落点差异显著 \\
+6 COR 标定 & 弹跳恢复 & 弹起 $53$--$58\%$（硬地 COR $0.73$--$0.76$） \\
+7 topspin 弹跳 & 旋转-线速度耦合 & topspin 与无 topspin 弹跳后 $v_x$/出射角/$\omega$ 明显不同 \\
+8 多环境统计 & 落点分布 & 分布在场内合理散布、过网率合理 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{实验三的检查清单（最常用）。}zero agent 可视化时逐项确认：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+检查项 & 正常 & 异常及原因 \\
+\midrule
+球场可见 & 蓝面 $+$ 白线 & 看不到 $\to$ XML 加载失败 \\
+球可见 & 黄色小球 & 看不到 $\to$ freejoint 缺失或 spawn 位置错 \\
+飞行方向 & $x>0$ 向 $x<0$ & 反向 $\to$ $v_x$ 符号错 \\
+多环境不重叠 & 16 个独立球场 & 重叠 $\to$ \verb|env_spacing| 太小 \\
+弹跳后停止 & 弹 $1$--$3$ 次停住 & 不弹 $\to$ solref；不停 $\to$ friction 太小 \\
+Reset 正常 & 停后重新发射 & 不 reset $\to$ termination 配置错 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[tyro CLI 的 range 参数不加引号]
+\textbf{错误描述}：\Verb[breaklines]|--env.commands.launch.speed-range [20.0, 45.0]|（无引号）。\textbf{现象后果}：被 shell 拆成多个参数，报错或参数错位。\textbf{根本原因}：方括号与逗号被 shell 解释。\textbf{正确做法}：加引号 \Verb[breaklines]|"[20.0, 45.0]"|；用 \verb|--help| 核对参数名拼写。
+\end{pitfall}
+
+\paragraph{topspin 弹跳验证的正确预期（纠正一个常见错误结论）。}源材料早期版本说「topspin 弹跳后一定加速」，这并不严格：此处 $r|\omega|=0.033\times300\approx9.9$\,m/s $<|v_x|=20$\,m/s，接触点仍沿来球方向滑移，摩擦对水平速度的增减取决于滑移方向、摩擦系数与接触模型，\textbf{不应预设「一定加速」}；只有旋转足够大（$r|\omega|>|v_x|$）等特定滑移条件下才可能净增大水平速度。验证时应记录弹跳前后的 $v_x$ 与 $\omega_y$；两组\emph{完全无差异}才说明 \verb|condim| 不是 $3$（切向摩擦是传递旋转效应的必要条件）。
+
+\paragraph{三层验收标准。}
+\begin{itemize}
+  \item \textbf{第一层 构建验收}：task 能注册、scene 能导出、court XML 能编译、ball freejoint 能写状态、多环境 origin 正确（实验 1--3）。
+  \item \textbf{第二层 轨迹验收}：固定参数轨迹可复现；speed/elev/azim 改变后飞行特征显著变化；三层空气动力学有明显增量差异（实验 4--5）。
+  \item \textbf{第三层 接触验收}：COR 在合理范围（$0.55$--$0.80$）；topspin 弹跳效应可观测；timeout/oob 正常；落点分布合理（实验 6--8）。
+\end{itemize}
+三层未过\textbf{不应进入}后续感知/击球章——后续会至少新增五个不确定性（racket 几何、racket-ball contact、robot action/obs、击球 reward），让 bug 更难定位。这与 \cref{ch:rlmc-setup} 的 zero/random/small/large 四阶段验证、\cref{ch:rlmc-quadloco} 的渐进验证同源——\textbf{先把地基钉死，再往上盖楼}。
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[操作]} 从实验 1 到 8 完整走一遍，每个实验记录「看到了什么 / 判断标准 / pass 还是 fail」，提交验收日志（验收：八条记录）。
+  \item \textbf{[设计]} 把实验序列封装成自动化验收脚本（启动 headless play、收集数据、判 pass/fail），覆盖至少第一层与第二层（验收：可运行脚本骨架）。
+  \item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-setup} 的验证流程：smoke test / zero / random 与本节三层验收如何对应？能否统一成一个通用环境验收框架？（验收：对应表 $+$ 统一框架草图）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{前沿系统：从 LATENT 到 HITTER}
+\label{sec:rlmc-tennis-frontier}
+
+\paragraph{模块功能与在管线中的位置。}本章到此都在讲「怎么搭环境」，但环境设计选择受最终训练目标约束。这一节综述球类运动 RL 的前沿系统，提炼共性工程模式，帮你在环境层就为后续训练「留好接口」。算法点：\textbf{环境层的设计决策（频率/观测/分层/DR）直接决定系统上限}。
+
+\paragraph{LATENT：人形网球（arXiv:2603.12686）。}清华/北大/Galbot 等合作\cite{tennis_latent2026}，目前最完整的人形网球系统之一，在 Unitree G1（$29$ DoF）上实现人-机多拍对打。核心是三层分层：(1) 从不完美人类动捕学 latent action space（VAE）$+$ \textbf{Latent Action Barrier(LAB)} 约束探索在数据流形上；(2) high-level PPO 在 latent space 决策、输出 latent action $+$ wrist correction；(3) low-level 把 latent decode 为 $29$-DoF PD 目标。训练在 MuJoCo JAX、PPO、$50$\,Hz policy、$2000$\,Hz 仿真；真机成功率 $90.9\%$ 正手 / $77.8\%$ 反手，可与人类稳定多拍对打。
+
+\begin{paper}[LATENT：从不完美人类动捕学习人形网球技能]\label{paper:rlmc-tennis-latent}
+\textbf{问题}：人形机器人在高速、强对抗的网球场景下，如何用\emph{不完美}的业余人类动捕数据学到可迁移真机的全身击球技能？\\
+\textbf{核心思想}：先把动捕片段编码成 latent action space（运动原语库），再用 high-level PPO 在 latent space 决策、叠加 wrist correction 微调；用 Latent Action Barrier 把 RL 探索约束在数据覆盖的流形内，避免学出怪异动作。\\
+\textbf{关键结果}：真机 $90.9\%$ 正手 / $77.8\%$ 反手成功率，可与人类多拍对打；消融显示去掉 ball dynamics randomization 真机成功率跌到正手 $16.7\%$ / 反手 $25.0\%$，去掉观测噪声反手成功率跌到 $0\%$（正手仍约 $50\%$）。\\
+\textbf{与本书关系}：印证本章两大主线——\cref{ins:rlmc-tennis-dr}（DR 比精确标定重要）与高频仿真（$2000$\,Hz）；其 latent action 是 \cref{ch:rlmc-imitation} 模仿学习在球类运动里的延伸。\\
+\textbf{局限}：依赖动捕数据与 latent 库构造；$2000$\,Hz $+$ 多 GPU 是生产级算力，教学需降配。
+\end{paper}
+
+\paragraph{HITTER：人形乒乓球（arXiv:2508.21043）。}用「分层规划 $+$ 学习」在 Unitree G1（$29$ 关节）上实现乒乓球\cite{tennis_hitter2025}：model-based planner 由解析弹道模型预测击球点、优化器算球拍目标速度，再用 RL policy 做全身控制；$50$\,Hz、asymmetric actor-critic（critic 用 privileged 完美球状态，actor 只用可部署观测）。真机返球率 $92.3\%$（命中率 $96.2\%$）、对人类可维持 $106$ 拍连续 rally、返击人类扣杀的反应时低至 $0.42$\,s（自对手击球到机器人回球）。与 LATENT 的端到端 RL$+$motion prior 不同，HITTER 用 planner 精确算击球参数、RL 只学「身体到位 $+$ 指定速度挥拍」，映射更简单；但 planner 的弹道模型精度限制系统上限。感知用 $9$ 个 OptiTrack 相机、动捕系统 $360$\,Hz、毫米级精度；\pz{底层训练仿真频率官方未逐字给出（仅说明用 Isaac Lab）}。
+
+\paragraph{ETH 羽毛球（Science Robotics 2025）。}Yuntao Ma 等「Learning coordinated badminton skills for legged manipulators」\cite{tennis_eth2025badminton}，在 ANYmal-D 四足 $+$ 6-DoF DynaArm $+$ 球拍（拍面相对腕关节约 $45^\circ$）上实现人机羽毛球；用\emph{统一端到端 RL}（不分 perception/planning/control），一个 policy 直接从观测输出全身动作。最大特色是\textbf{机载立体相机感知}（非外部动捕）$+$ \textbf{perception-aware training}（训练时注入运动诱发的视觉跟踪误差模型而非简单高斯噪声），可与人类维持约 $10$ 拍 rally。启示：若目标是端到端 policy，observation 需含球的\emph{飞行历史}（多帧位置）而非只当前帧，环境要提供 history buffer。
+
+\paragraph{Phybot 羽毛球（arXiv:2511.11218）。}「Humanoid Whole-Body Badminton via Multi-Stage RL」\cite{tennis_phybot2025}，自研 Phybot C1（$1.28$\,m、$30$\,kg、$21$ DoF），用三阶段 curriculum（footwork $\to$ swing $\to$ task）实现\emph{无需运动先验}的全身羽毛球；部署用 EKF 估计与预测羽毛球轨迹。仿真两机可维持 $21$ 拍 rally，真机出球速度上限约 $10$\,m/s、挥拍速度约 $5.3$\,m/s、平均回球落点距拦截区约 $3.5$\,m。启示：后续击球章的 curriculum 可参考此三阶段；环境要支持把同一 scene 注册为多个 task（footwork/swing/strike，不同 reward 与 termination）。CyboRacket（arXiv:2603.14605，Unitree G1 上「onboard 视觉 $+$ 物理弹道预测 $+$ 预训练 WBC」的感知-动作框架\cite{tennis_cyboracket2026}）是另一参考系统；\pz{其具体 benchmark 数字本章未引用，需要时以原文为准}。
+
+\paragraph{共性工程模式（环境层要留的接口）。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{4.6cm}@{}}
+\toprule
+模式 & 描述 & 在环境中的实现 \\
+\midrule
+高频仿真 & $\ge1000$\,Hz 物理、$\le50$\,Hz 控制 & \verb|timestep|$\le0.001$、\verb|decimation|$\ge20$ \\
+分层架构 & 感知$\to$规划$\to$控制 或 high$\to$low & 多 obs group $+$ 分层 action \\
+Privileged Critic & critic 看完美、actor 看可部署 & actor/critic obs 分离（\cref{ch:rlmc-privileged}） \\
+Dynamics DR & 随机化球物理参数 & EventManager 加 DR term（\cref{ch:rlmc-dr}） \\
+Observation Noise & 球状态加噪 & obs term \Verb[breaklines]|enable_corruption=True| \\
+Staged Curriculum & 由简到繁分阶段 & CurriculumManager 多 stage \\
+球的历史 & 多帧球状态作 obs & obs history buffer \\
+Motion Priors & 人类动捕作先验 & latent action 或 AMP reward（\cref{ch:rlmc-imitation}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[球类运动 RL 的胜负手在工程，不在算法]\label{ins:rlmc-tennis-engineering}
+四个顶会系统（LATENT/HITTER/ETH/Phybot）用的都是 PPO 家族——\textbf{算法不是瓶颈}。拉开差距的是工程设计：仿真频率、观测设计、分层架构、curriculum、Sim2Real 随机化。而这些决策\emph{绝大多数在环境层做出}。所以「把环境搭对」不是体力活，而是这一整类任务里杠杆最高的智力活——这正是本章从第一节（\cref{ins:rlmc-tennis-contract}）就立、贯穿全章的主线。
+\end{insight}
+
+\begin{practice}[本节动手任务]
+\begin{enumerate}
+  \item \textbf{[分析]} 对比 LATENT（分层）与 ETH 羽毛球（端到端），各列 $\ge3$ 优势/劣势；单 GPU 条件下你选哪种？为什么？（验收：对比表 $+$ 选择理由）
+  \item \textbf{[设计]} 基于 Phybot 三阶段 curriculum，为网球任务设计多阶段训练计划，每阶段的 reward/termination/obs 如何不同？（验收：三阶段表）
+  \item \textbf{[跨章综合]} 结合 \cref{ch:rlmc-privileged} 与本节 Privileged Critic：critic 看完美球状态、actor 看有噪声估计时，蒸馏 student actor 的 obs 应含什么？latency 如何处理？（验收：obs 设计 $+$ latency 方案）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\label{sec:rlmc-tennis-myths}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{6.0cm}p{7.5cm}@{}}
+\toprule
+误解 & 正确理解 \\
+\midrule
+环境构建是低技术含量的搭建 & 环境是综合项目里杠杆效应最大的环节（\cref{ins:rlmc-tennis-contract}） \\
+球体参数需要精确标定 & 定性合理即可，DR 比精确标定重要（\cref{ins:rlmc-tennis-dr}） \\
+$500$\,Hz 仿真对所有场景够用 & 纯弹道够，球拍-球接触需 $1000$--$2000$\,Hz \\
+所有 geom 都该参与碰撞 & 视觉装饰 geom 必须 \verb|contype=0| \\
+四元数顺序无所谓 & MuJoCo 用 \verb|[qw,qx,qy,qz]|，搞混致 body frame 错 \\
+\verb|env_origins| 只影响视觉 & 它影响所有物理状态的读写（写入加、读取减） \\
+friction 三个分量都生效 & 生效维数由 \verb|condim| 决定（slide/torsion/roll） \\
+$C_d$ 是常数 & $C_d$ 与 $Re$ 有关，RL 里简化为常数 $+$ DR \\
+先写算法再调环境 & 环境 bug 会被算法学进去，修正代价极高 \\
+分层系统总比端到端好 & 各有优劣，取决于任务复杂度与算力 \\
+更多运动数据 $=$ 更好系统 & LATENT $5$ 小时数据即够，Phybot 完全不用数据 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\addcontentsline{toc}{section}{小结}
+\label{sec:rlmc-tennis-summary}
+
+\paragraph{术语速查。}
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 一句话 \\
+\midrule
+数据协议(data contract) & 跨感知/预测/控制共享的坐标、物理参数与语义约定 \\
+court-local frame & world 坐标减 \verb|env_origins|，所有 obs/reward 统一用 \\
+freejoint & MuJoCo 的 $6$-DoF 自由刚体关节（\verb|qpos|7/\verb|qvel|6） \\
+condim & 接触维数：$1$ 仅法向、$3$ 加滑动、$4$ 加扭转、$6$ 加滚动 \\
+solref/solimp & 接触参考动力学/阻抗，决定弹跳快慢与高低 \\
+COR & 恢复系数，$\sqrt{h_{\text{bounce}}/h_{\text{drop}}}$，硬地 $0.73$--$0.76$ \\
+Magnus 力 & $C_L\frac{4\pi r^3}{3}\rho(\boldsymbol\omega\times\mathbf v)$，旋转球的偏转力 \\
+语义撞网检测 & 查球心轨迹穿越 $x=0$ 平面且高度 $<$ 网高，不依赖物理碰撞 \\
+Privileged Critic & critic 看完美信息、actor 看可部署观测 \\
+LAB & LATENT 的 Latent Action Barrier，约束 RL 探索在数据流形内 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+\begin{center}
+\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+编号 & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 环境是数据协议 & \cref{sec:rlmc-tennis-contract} & 1 \\
+2 & 球场几何与坐标系 & \cref{sec:rlmc-tennis-court} & 2 \\
+3 & 碰撞分离原则 & \cref{sec:rlmc-tennis-court} & 2 \\
+4 & freejoint 物理与四元数顺序 & \cref{sec:rlmc-tennis-ball} & 2 \\
+5 & 球体接触参数(condim/friction/solref/solimp) & \cref{sec:rlmc-tennis-ball} & 2 \\
+6 & COR 标定方法 & \cref{sec:rlmc-tennis-ball}, \cref{sec:rlmc-tennis-contact} & 3 \\
+7 & 八维发球命令与速度分解 & \cref{sec:rlmc-tennis-launch} & 3 \\
+8 & env\_origins 加减法则 & \cref{sec:rlmc-tennis-launch} & 2 \\
+9 & 二次阻力模型 & \cref{sec:rlmc-tennis-aero} & 3 \\
+10 & Magnus 力模型 & \cref{sec:rlmc-tennis-aero} & 3 \\
+11 & 语义撞网检测 & \cref{sec:rlmc-tennis-contact} & 2 \\
+12 & Manager 全链路与 frame 一致性 & \cref{sec:rlmc-tennis-manager} & 2 \\
+13 & 球拍 MJCF 建模与防穿透 & \cref{sec:rlmc-tennis-robot} & 3 \\
+14 & 阶段化引入路线 & \cref{sec:rlmc-tennis-robot} & 3 \\
+15 & 三层验收标准 & \cref{sec:rlmc-tennis-suite} & 2 \\
+16 & 前沿系统仿真频率 & \cref{sec:rlmc-tennis-frontier} & 3 \\
+17 & 分层 vs 端到端架构 & \cref{sec:rlmc-tennis-frontier} & 3 \\
+18 & DR 比精确标定重要 & \cref{sec:rlmc-tennis-frontier} & 3 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+本章建立的心智模型：球场 MJCF（定坐标系）$\to$ 球 Entity（freejoint $+$ sphere $+$ 接触参数）$\to$ LaunchCommand（八维 $\to$ 速度分解，注意 $v_x$ 负号 $\to$ 写 pose$+$vel）$\to$ BallAerodynamics（重力 $\to$ $+$drag $\to$ $+$Magnus）$\to$ 接触验证（COR $+$ 语义撞网 $+$ 碰撞分离）$\to$ Manager 全链路（Scene$\to$Commands$\to$Obs$\to$Actions 空$\to$Reward$\to$Termination）$\to$ 三层验收 $\to$ 前沿系统接口（$2000$\,Hz / Privileged Critic / Staged Curriculum / DR）。若你能在给定发球参数后十秒内画出大致弹道、指出落点区域、预测 reward 与 termination 的触发，本章核心已内化。
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-tennis-reading}
+
+\begin{itemize}
+  \item \textbf{LATENT}（arXiv:2603.12686）\cite{tennis_latent2026}——人形网球完整系统，MuJoCo JAX $2000$\,Hz、latent action $+$ LAB；教你「用不完美动捕 $+$ DR 做高速球类 Sim2Real」。代码 \Verb[breaklines]|github.com/GalaxyGeneralRobotics/LATENT|。
+  \item \textbf{HITTER}（arXiv:2508.21043）\cite{tennis_hitter2025}——人形乒乓球，分层规划 $+$ 学习、asymmetric actor-critic；教你「planner 算击球参数、RL 只学到位 $+$ 挥拍」。
+  \item \textbf{ETH 羽毛球}（Science Robotics 2025）\cite{tennis_eth2025badminton}——四足 $+$ 手臂端到端 RL、机载视觉、perception-aware 训练；教你「端到端 policy 如何处理真实视觉误差」。
+  \item \textbf{Phybot 羽毛球}（arXiv:2511.11218）\cite{tennis_phybot2025}——三阶段 curriculum、无 motion prior、EKF 预测；教你「无运动数据下用 curriculum 学全身击球」。
+  \item \textbf{CyboRacket}（arXiv:2603.14605）\cite{tennis_cyboracket2026}——人形球类感知-动作框架，onboard 视觉 $+$ 弹道预测 $+$ 预训练 WBC；教你「闭环感知-规划与预训练 WBC 的拼装」。
+  \item \textbf{MuJoCo XML Reference}（\Verb[breaklines]|mujoco.readthedocs.io|）\cite{mujoco_docs}——\verb|freejoint|/\allowbreak\verb|condim|/\allowbreak\verb|friction|/\allowbreak\verb|solref|/\allowbreak\verb|solimp| 权威语义；本章接触参数的一手依据。
+  \item \textbf{Cross et al. 2003}「Measurements of tennis court surface properties」\cite{cross2003tennis}——真实场地弹跳数据，COR 标定参考。
+  \item \textbf{mjlab}（arXiv:2601.22074）\cite{mjlab2026}——MuJoCo Warp 后端、Manager-Based API、\verb|MjSpec| 构模；本章环境实现的框架基础。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-tennis-trouble}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.4cm}p{3.2cm}p{4.4cm}l@{}}
+\toprule
+症状 & 可能原因 & 排查 & 相关节 \\
+\midrule
+球向远端飞（不过网） & $v_x$ 符号错 & 打印 velocity；查速度分解负号；确认 far side 为正 $x$ & \cref{sec:rlmc-tennis-launch} \\
+球落地贴地不弹 & solref 太软或多层碰撞面 & 查 court geoms 的 contype；调 dampratio；跑 COR 标定 & \cref{sec:rlmc-tennis-contact} \\
+多环境球飞到邻场 & \verb|env_spacing| 太小 & 查 spacing $\ge30$；查 \verb|env_origins| 偏移 & \cref{sec:rlmc-tennis-court} \\
+reward 全零 & 坐标系错或发射反向 & 打印 ball\_local\_pos；确认 $x>0\to x<0$；查 reward box & \cref{sec:rlmc-tennis-launch} \\
+viewer 看不到球 & freejoint 缺失/相机配置 & 查 freejoint；只看 env 0；确认球 rgba alpha$>0$ & \cref{sec:rlmc-tennis-suite} \\
+CLI 参数不生效 & range 未加引号 & \verb|--help| 查参数名；加引号 & \cref{sec:rlmc-tennis-launch} \\
+球弹太高(COR$>0.8$) & 直接负格式 solref 阻尼项太小 & 跑纯 MuJoCo 落体测真实 COR；增大 \verb|solref| 阻尼项绝对值（如 $-2\to-12$）；重标 & \cref{sec:rlmc-tennis-ball} \\
+Magnus 方向反 & 叉积顺序错 & 查 \Verb[breaklines]|cross(omega,v)| vs \Verb[breaklines]|cross(v,omega)|；topspin 应更快下坠 & \cref{sec:rlmc-tennis-aero} \\
+episode 不结束 & termination 阈值过宽 & 查 ball\_stopped 阈值；查 timeout/oob & \cref{sec:rlmc-tennis-manager} \\
+球穿网不触发 termination & 网太薄 $+$ 缺语义检测 & 增大网 size[0]；确认语义检测已注册；提频 & \cref{sec:rlmc-tennis-contact} \\
+topspin 对弹跳无影响 & \verb|condim=1| 无切向摩擦 & 查球-地面 condim；改 $3$；重跑对照 & \cref{sec:rlmc-tennis-aero} \\
+阻力开关不生效 & 事件未注册 & 查 events 配置；确认 \verb|enabled| 路径；打印事件日志 & \cref{sec:rlmc-tennis-aero} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{调参决策树。}实验结果不符预期时按序排查：
+
+\begin{codebox}[text]{球类环境调参决策树}
+球不动？ -- 是 → 查 freejoint（球体节）
+        + 否 → 球飞错方向？
+              -- 是 → 查 vx 符号（发球节）
+              + 否 → 球飞太远/太近？
+                    -- 太远 → 查阻力是否启用（弹道节）
+                    -- 太近 → 查 speed 范围 / elevation 角度
+                    + 距离合理 → 弹跳正常吗？
+                          -- 不弹 → 查 solref / contype（接触节）
+                          -- 弹太高 → 增大直接负格式 solref 阻尼项绝对值(-2→-12)
+                          + 正常 → reward 正常吗？
+                                -- 全零 → 查坐标系 / reward box（全链路节）
+                                + 正常 → 环境验收通过
+\end{codebox}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-tennis-versions}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}llL@{}}
+\toprule
+组件 & 锚定版本 & 关键 API/命令 \\
+\midrule
+mjlab & 1.4.0 & \Verb[breaklines]|uv run play/train/list-envs|；\Verb[breaklines]|--agent zero/random|；\verb|MjSpec| \\
+MuJoCo & $\ge3.8.0$ & \verb|freejoint|、\verb|condim|、\verb|solref|/\allowbreak\verb|solimp|、\verb|friction|[slide,torsion,roll] \\
+Isaac Lab & 2.3.x & \Verb[breaklines]|RigidObjectCfg|、\Verb[breaklines]|PhysicsMaterial(restitution)|；外力经 wrench composer（v2.3.2 弃用 \Verb[breaklines]|set_external_force_and_torque|） \\
+PhysX & 5.4+ & restitution 直控 COR；注意薄体高速 ghost contact \\
+UniLab & main（commit \texttt{99936e08}） & \Verb[breaklines]|SceneCfg.model_file|（MJCF）；\Verb[breaklines]|NpEnv.update_state|；\Verb[breaklines]|@registry.envcfg/env|；\verb|train/eval|（无网球任务，需自建） \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{finenote}
+本章数值与论文归属经联网核对：mjlab 当前版 1.4.0、官方不含 tennis 内置任务（课程示例自建）；Isaac Lab \Verb[breaklines]|set_external_force_and_torque()| 自 v2.3.2 弃用、改用可组合 wrench 系统（\Verb[breaklines]|permanent_wrench_composer.set_forces_and_torques()|）；mjlab 施外力用 Entity 的 \Verb[breaklines]|write_external_wrench_to_sim()|（实测签名，底层即 MuJoCo 的 \verb|xfrc_applied|；方法名以你所装版本源码为准）；LATENT(arXiv:2603.12686) 真机 $90.9\%$/$77.8\%$、HITTER(arXiv:2508.21043) 返球率 $92.3\%$/$106$ 拍/反应时 $0.42$\,s/$9$ 个 OptiTrack@$360$\,Hz、Phybot(arXiv:2511.11218) 出球上限约 $10$\,m/s（原稿 $19.1$ 已校正）、ETH 羽毛球（arXiv:2505.22974，Science Robotics 2025）控制 $100$\,Hz/感知 $60$\,Hz/状态估计 $400$\,Hz。仍存疑项（CyboRacket 具体 benchmark、HITTER/Phybot 底层仿真频率）官方未逐字给出，以原文/你所装版本为准。UniLab 一列已据服务器实装框架（UniLab main，commit \texttt{99936e08}；\verb|mujoco-uni| 3.8.0 / \Verb[breaklines]|motrixsim-core| 0.8.2）的源码与实跑补实\,\cite{unilab2026}：因 UniLab 官方任务集（实测 $26$ 个）\emph{无}网球任务，本章 UniLab 槽位给的是「用其真实编程模型（\verb|NpEnv| 子类 $+$ MJCF $+$ \verb|@registry| $+$ \Verb[breaklines]|run_reward_dispatch|）自建该任务」的接线，并诚实标注真实欠缺（无 zero agent、无 task-space IK action 类、无 \verb|restitution| 直控旋钮）。
+\end{finenote}
+
+\paragraph{给下一章的桥。}本章建立了球类综合项目的物理底座——球场坐标系、球体物理、发球命令、弹道模型、接触验证。它向后续\textbf{感知与轨迹预测章}传递 observation 规格（\verb|ball_position| court-local、\verb|ball_velocity|/\allowbreak\Verb[breaklines]|ball_angular_velocity| 建议 world-aligned）、坐标约定与 BallAerodynamics 物理先验；向后续\textbf{击球控制章}传递 Scene 配置、接触参数基线、发球命令 $+$ curriculum 接口、三层验收（作每次改环境后的回归测试）、以及「$1000$--$2000$\,Hz 提频 $+$ 按 Stage 0--6 推进」的工程路线。坐标系与 frame 一致性是后续感知模块的「输入规格书」——这正是本章在坐标约定上着墨最多的原因。

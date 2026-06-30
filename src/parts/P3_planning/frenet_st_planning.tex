@@ -1,0 +1,995 @@
+\chapter{Frenet 坐标系、ST 图与路径-速度解耦}
+\label{ch:frenet-st}
+
+% ════════════════════════════════════════════════════════════════
+%  规划部·时空规划章：吸收 Tutorial「20_Frenet坐标系与ST图.md」
+%  （Kant-Zucker 1986 PVD + Werling 2010 Frenet + Fan 2018 Apollo EM Planner
+%   + piecewise-jerk QP/OSQP）。自包含独立记录，读者无需翻原笔记。
+%  承接 \cref{ch:planning} 导论的构型空间、动态规划、轨迹优化（重叠处 交叉引用 指过去，不重复）。
+%  记号：构型空间 SE(2)/SE(3) 用 preamble 宏 \SE；Frenet 自然记号 (s,l) 保留；
+%   撇号 (') 对弧长 s 求导、点号(·)对时间 t 求导（PVD「路径看 s、速度看 t」的记号体现）。
+%  来源 md 由 AI 生成、经多轮审，仍可能有错；存疑处打 \pz / \rebuilt，并入 claimsToVerify。
+%  教学层遵循 v5.0 理论教学规范。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。能流畅作答者，可只速读本章表格与速查卡；卡住之处，正是本章要为你解决的。
+\begin{enumerate}
+  \item 二次规划（quadratic programming, QP）的标准形式是 $\min_{\mathbf{x}}\tfrac12\mathbf{x}^\top\mathbf{P}\mathbf{x}+\mathbf{q}^\top\mathbf{x}$，受约束 $\mathbf{l}\le\mathbf{A}\mathbf{x}\le\mathbf{u}$。$\mathbf{P}$ 满足什么条件该问题才\emph{凸}？$\mathbf{P}\succ0$ 与 $\mathbf{P}\succeq0$ 对解的唯一性各意味着什么？
+  \item 给定一条平面曲线，“弧长参数化”是什么意思？为什么用弧长 $s$ 当参数比用时间 $t$ 在\emph{几何}上更自然？
+  \item 一个平面刚体变换（旋转 $\mathbf{R}(\theta)$ + 平移 $\mathbf{t}$）怎么写成矩阵？$\mathbf{R}(\theta)$ 的两列分别代表什么方向？它与 $\SE(2)$（\cref{eq:plan-se2}）有何关系？
+  \item 如果把“走哪条线”和“沿这条线走多快”两件事\emph{分开}决定，相比同时决定，直觉上简单在哪、又可能漏掉什么？
+  \item 一个避障可行域被障碍“挖”出两个互不相连的区域（从左绕 / 从右绕），用一个凸优化器去解，会发生什么？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{写出}路径-速度解耦（path--velocity decomposition, PVD）的数学形式：把轨迹 $\mathbf{r}(t)$ 拆成几何路径 $\boldsymbol{\sigma}(s)$ 与速度剖面 $s(t)$，并说清这一拆为何把 $\mathcal{O}(5N)$ 的非凸问题降为两个低维凸问题；
+  \item \textbf{推导} Frenet 坐标 $(s,l)$ 的正变换与逆变换，并由正变换对时间求导得出 $\dot s=v\cos(\theta-\theta_r)/(1-\kappa_r l)$，解释曲率项 $1-\kappa_r l$ 在何条件下导致坐标退化/奇异；
+  \item \textbf{建立} SL 图（station--lateral），把静态障碍投影成横向边界，并把路径规划写成 piecewise-jerk 凸 QP；推导其连续性等式与 $l''$ 上下界为何要\emph{减去}参考线曲率；
+  \item \textbf{建立} ST 图（station--time），把动态障碍预测投影成时变阻挡，理解 yield/overtake 是\emph{离散同伦决策}、是非凸的根源，并用 DP-ST 搜索（Bellman 递推）切出凸走廊；
+  \item \textbf{写出} piecewise-jerk speed QP 的代价与约束，推导向心加速度对速度上界的折减 $v\le\sqrt{a_{\mathrm{lat,max}}/|\kappa|}$，并说明它是 path$\to$speed 的单向耦合；
+  \item \textbf{解释} Apollo EM Planner 的 E-step/M-step 迭代为何只保证联合代价单调不增、却不保证全局最优（块坐标下降本质），及其在强耦合场景的失效与震荡；
+  \item \textbf{判别} PVD 在哪些强交互场景（cut-in、无保护左转）下解耦失败，从而理解后续时空联合方法的动机。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{先拆解 $\to$ 再表示 $\to$ 后求解 $\to$ 最后认识局限}”的主线：把一个高维非凸的时空轨迹问题，借 Frenet 坐标这门公共语言，拆成路径与速度两个凸子问题分别求解，再用 EM 迭代缝合、并诚实地标出解耦失效的边界。结构如下：
+
+\begin{center}
+\begin{forest} navtreeLR
+[{PVD\\（解耦框架/反面基线）}
+  [{Frenet 坐标\\ $(s,l)$（公共语言）}
+    [{SL 图 + 路径 QP\\（静态障碍）}]
+    [{ST 图 + DP 搜索\\（动态障碍）}
+      [{speed QP\\（向心折减/精修）}]]]
+  [{EM 迭代\\（块坐标下降）}]
+]
+\end{forest}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:fs-pvd}（PVD）是总纲与反面基线，定义“拆”这个动作；\cref{sec:fs-frenet}（Frenet 坐标）是公共语言，SL 图与 ST 图都建在其上，是任何读者的主干；\cref{sec:fs-sl}（SL 图 + 路径 QP）与 \cref{sec:fs-st}（ST 图 + DP）是 PVD 两个子问题的表示空间，二者并列；\cref{sec:fs-speedqp}（speed QP）是 \cref{sec:fs-st} 的精修求解器，向心折减一节焊接“路径曲率 $\to$ 速度”；\cref{sec:fs-em}（EM 迭代）把两个子问题缝回“准联合”，并引出“为何还需真正的时空联合”。有规划基础、只想补“语言”的读者可从 \cref{sec:fs-frenet} 切入，遇陌生术语再回 \cref{sec:fs-pvd}。
+
+\subsection*{前置知识桥接}
+本章是 \cref{ch:planning}（运动规划导论）在\emph{结构化道路}场景的专门化，复用其三块地基，重叠处一律 交叉引用 指过去、不重复：
+\begin{itemize}
+  \item \textbf{构型空间}（\cref{sec:plan-cspace}）：本章自车的构型是 $\SE(2)$（\cref{eq:plan-se2}：平面位置 + 朝向），三维场景推广到 $\SE(3)$（\cref{eq:plan-se3}）。PVD 正是利用结构化道路上一条参考线，把 $\SE(2)$ 规划降到 $(s,l)$ 两个标量自由度。
+  \item \textbf{动态规划与 Bellman 递推}（\cref{sec:plan-dp}，\cref{thm:plan-bellman}）：\cref{sec:fs-st} 的 DP-ST 搜索就是 Bellman 最优性原理在 ST 网格（分层有向无环图）上的实例，与 Dijkstra（\cref{sec:plan-dijkstra}）同源。
+  \item \textbf{轨迹优化}（\cref{sec:plan-traj}，\cref{def:plan-trajopt}）：本章的路径/速度子问题都是“代价泛函 + 端点约束”的轨迹优化（\cref{eq:plan-trajopt}）落到一维的特例；其中 piecewise-jerk QP 与 \cref{sec:plan-minsnap} 的 minimum-snap（\cref{def:plan-minsnap}）都属\emph{多项式/分段光滑轨迹的等式约束 QP}家族——一个以\emph{时间}分段优化 snap，一个以\emph{弧长/时间}为自变量优化 jerk。
+\end{itemize}
+本章用到的 QP 基础（凸性、$\mathbf{P}\succeq0$ 的全局最优、$\mathbf{P}\succ0$ 的唯一性）默认读者已具备；不再重证。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 直接学时空\emph{联合}优化而不先建立 PVD 这个反面基线，你会不理解“为什么要费劲做联合优化”——联合方法的每个设计动机，本质都是在补解耦留下的洞；没有洞，补丁就成了无源之水。
+  \item 跳过 Frenet/ST 直接读 Apollo 一类工业规划器源码，SL 图、ST 图、\verb@STBoundary@、参考线（reference line）这些概念会像天书——整个规划模块就是用这套语言写成的。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\label{tab:fs-reading}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导与练习） & 6--8 小时 & 首次系统学习、要独立实现 Frenet 库 + speed QP \\
+速读（跳过 QP 矩阵细节） & 2.5 小时 & 有规划基础、只需建立时空规划语言体系 \\
+速查（只看小结的符号表 + 速查表） & 20 分钟 & 写代码时回来查 Frenet 变换 / QP 形式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+自车构型空间为 $\SE(2)$（\cref{eq:plan-se2}），三维推广为 $\SE(3)$（\cref{eq:plan-se3}），群/代数宏沿用全书 $\SO,\SE$。
+\textbf{Frenet 自然记号}：纵向弧长（station）$s$、横向偏移（lateral）$l$（约定\emph{左正右负}）。
+\textbf{导数约定}：\emph{撇号} $(\cdot)'$ 表示对弧长 $s$ 求导（$l'=\mathrm{d}l/\mathrm{d}s$、$l''=\mathrm{d}^2l/\mathrm{d}s^2$），\emph{点号} $(\dot{\cdot})$ 表示对时间 $t$ 求导（$\dot s,\dot l$）——这正是 PVD“路径看 $s$、速度看 $t$”的记号体现。
+参考线在投影点处的切向朝向、曲率记 $\theta_r,\kappa_r$；车辆朝向 $\theta$、车速 $v$；纵向加速度、jerk 记 $a,j$；静态/动态障碍集合 $\mathcal{O}_{\mathrm{static}},\mathcal{O}_{\mathrm{dynamic}}$。
+本章 $s,l,\kappa$ 等为规划领域局部记号，仅本章生效，与 SLAM 章同字母无关。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{路径-速度解耦的形式化}
+\label{sec:fs-pvd}
+
+\paragraph{动机：完整时空轨迹问题有多难。}
+先看最朴素、最“诚实”的提法：一辆车要在动态交通里从当前状态走到目标，我们想直接求出带时间参数的最优轨迹 $\mathbf{r}(t)=(x(t),y(t))$\cite{kant1986toward}：
+\begin{equation}
+  \min_{\mathbf{r}(\cdot)}\ J(\mathbf{r})\quad\text{s.t.}\quad
+  \underbrace{\mathbf{r}(0)=\mathbf{r}_0,\ \dot{\mathbf{r}}(0)=\mathbf{v}_0}_{\text{初值}},\ \
+  \underbrace{\mathbf{r}(t)\notin\mathcal{O}(t),\ \forall t}_{\text{无碰撞}},\ \
+  \underbrace{\|\dot{\mathbf{r}}\|\le v_{\max},\ \|\ddot{\mathbf{r}}\|\le a_{\max}}_{\text{动力学}}.
+  \label{eq:fs-tpp}
+\end{equation}
+逐项读懂：$J(\mathbf{r})$ 是代价泛函（平滑性、靠近目标、远离障碍等的加权，结构同 \cref{def:plan-trajopt}）；初值约束保证轨迹接得上当前车辆状态；$\mathcal{O}(t)$ 是\emph{随时间变化}的障碍占据集合——动态障碍在不同时刻占据不同位置，故带 $t$；动力学约束限制速度与加速度的物理上界。注意 $\mathbf{r}$ 是一个\emph{函数}（无穷维对象），求解前必须先离散化。
+
+把 \cref{eq:fs-tpp} 离散成 $N$ 步，每步的决策状态至少是 $(x,y,\theta,v,a)$ 五维（还没算曲率 $\kappa$ 或 jerk），整条轨迹就是一个 $\sim5N$ 维的决策向量。更糟的是约束的\emph{几何性质}：避障约束 $\mathbf{r}(t)\notin\mathcal{O}(t)$ 在配置空间里\emph{非凸}——障碍把可行域挖成带洞、不连通的形状（“从障碍左边绕”和“从右边绕”是两个互不相连的可行区域）。
+
+\begin{insight}
+直接优化完整时空轨迹，难点不在“维度高”，而在“高维 $\times$ 非凸”的乘积。高维但凸（如一个 $1000$ 维 QP）现代求解器几毫秒就能解；低维但非凸（如二维带洞可行域）也能暴力搜。真正棘手的是两者相乘——既没有多项式时间的全局最优算法，局部方法又极易卡在“既不左也不右”的鞍点上。\textbf{PVD 的全部价值，就是把这个乘积拆开。}
+\end{insight}
+
+\paragraph{反面：硬解 $5N$ 维非凸问题会怎样。}
+假设我们头铁，坚持直接优化 \cref{eq:fs-tpp} 的离散版，会撞上三堵墙：
+\begin{enumerate}
+  \item \textbf{维度灾难压垮实时性}。$N=40$ 即 $200$ 维决策变量；通用非线性求解器（如内点法）单次迭代要分解约 $200\times200$ 的 KKT 矩阵，且非凸下须多次随机重启以躲局部最优——单次规划从数百毫秒到秒级，远超约 $10\,\mathrm{ms}$ 的重规划预算。车都开过去了，轨迹还没算完。
+  \item \textbf{非凸陷阱产生危险轨迹}。避障约束的非凸性让求解器极易停在“绕左”与“绕右”两个吸引盆之间的鞍点，输出一条\emph{既不充分左也不充分右}的轨迹——数值上“收敛”了，物理上正对着障碍开。
+  \item \textbf{耦合放大噪声}。位置和速度挤在同一个优化里，障碍预测的一点抖动会\emph{同时}扰动路径与速度，输出在时间上前后不连贯（这一帧决定绕左、下一帧又减速让行）。
+\end{enumerate}
+这三条不是理论臆测，而是研究者反复撞到的墙——正是这堵墙催生了 PVD。
+
+\paragraph{历史：从 Kant--Zucker 到 Apollo。}
+路径-速度解耦的形式化，最早由 Kant 与 Zucker 在 1986 年提出\cite{kant1986toward}。他们把轨迹规划问题（trajectory planning problem, TPP）拆成两个子问题：路径规划问题（path planning problem, PPP）负责躲静态障碍、回答“走哪”；速度规划问题（velocity planning problem, VPP）负责沿已定路径躲动态障碍、回答“何时走到路径上哪一点”。关键的是，他们已把 VPP 放进\emph{路径-时间空间}（path-time space），把“时间”显式当作额外一维，并化为该空间里的图搜索。
+
+\begin{insight}
+ST 图（path-time / station-time 图）\textbf{不是某工程团队的发明}，而是 1986 年 Kant--Zucker 就给出的构造\cite{kant1986toward}。后续 Werling 等\cite{werling2010frenet} 把 PVD 升级为 Frenet 坐标下的末端状态采样（\cref{sec:fs-frenet}），Apollo（Fan 等\cite{fan2018baidu}）再把它工业化为 SL+ST 图的 DP+QP 管线（\cref{sec:fs-sl,sec:fs-st,sec:fs-speedqp,sec:fs-em}）。理解这条四十年的连续脉络，你读 ST 图时就不会把它当作“奇技淫巧”。
+\end{insight}
+
+\paragraph{前提：什么时候可以放心解耦。}
+Kant--Zucker 的“$\text{TPP}\Rightarrow\text{PPP}+\text{VPP}$”是\emph{有条件}的，把条件讲清楚，才知道本章方法何时靠得住、何时翻车。核心前提有三条：
+\begin{enumerate}
+  \item \textbf{障碍独立于自车（不“追”自车）}。VPP 把动态障碍的预测当成\emph{外生}的、不随自车决策改变的时变占据。这对多数交通参与者近似成立（前车按自己的意图走），但对\emph{强交互}对象（会因你减速而加塞的车、博弈型对手）不成立——障碍轨迹依赖你的轨迹，“独立”假设破裂，属博弈式规划的疆域。
+  \item \textbf{路径与速度弱耦合}。解耦默认“先定的几何路径不会让速度无解”。弯道的向心折减（\cref{sec:fs-speedqp}）是一处\emph{单向}耦合（路径限速度），尚可在解耦框架内用速度上界吸收；但当“改路径能显著改善速度可行性”时（cut-in、窄道会车），耦合变\emph{双向}，顺序求解会落到次优/不可行。
+  \item \textbf{存在合理的参考线}。Frenet/SL/ST 这套表示都依赖一条参考线（车道中心线）。结构化道路天然有；但停车场、路口内部等\emph{非结构化}场景没有清晰参考线，整套解耦语言失效，要改用笛卡尔/自由空间规划（\cref{sec:plan-cspace} 的一般构型空间方法）。
+\end{enumerate}
+
+\begin{table}[H]\centering\small
+\caption{PVD 适用性检查表}
+\label{tab:fs-applicability}
+\begin{tabular}{lll}
+\toprule
+前提 & 满足时（本章方法适用） & 不满足时该去哪 \\
+\midrule
+障碍独立于自车 & 常规交通流 & 强交互/博弈 $\to$ 博弈式规划 \\
+路径-速度弱耦合 & 多数结构化道路 & 强耦合 $\to$ EM 迭代（\cref{sec:fs-em}）或时空联合 \\
+有合理参考线 & 车道内行驶 & 非结构化 $\to$ 笛卡尔/自由空间（\cref{sec:plan-cspace}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{理论：PVD 的两个子问题。}
+PVD 把 \cref{eq:fs-tpp} 这个 $5N$ 维非凸问题，换成两个低维凸子问题。\textbf{子问题一——路径规划}（在静态/准静态环境中求几何路径 $\boldsymbol{\sigma}(s)$）：
+\begin{equation}
+  \min_{\boldsymbol{\sigma}(\cdot)}\ J_{\mathrm{path}}(\boldsymbol{\sigma})\quad\text{s.t.}\quad
+  \boldsymbol{\sigma}(0)=\mathbf{r}_0,\ \ \boldsymbol{\sigma}\notin\mathcal{O}_{\mathrm{static}},\ \ |\kappa(\boldsymbol{\sigma})|\le\kappa_{\max}.
+  \label{eq:fs-ppp}
+\end{equation}
+这里 $\boldsymbol{\sigma}$ 以\emph{弧长} $s$ 为参数（几何对象，不含时间），代价 $J_{\mathrm{path}}$ 关注平滑与居中，约束含静态避障与曲率上界 $\kappa_{\max}$（车辆最小转弯半径的倒数）。\textbf{子问题二——速度规划}（在已知路径上求速度剖面 $s(t)$）：
+\begin{equation}
+  \min_{s(\cdot)}\ J_{\mathrm{speed}}(s)\quad\text{s.t.}\quad
+  s(0)=0,\ \dot s(0)=v_0,\ \ \text{无碰撞},\ \ 0\le\dot s\le v_{\max},\ |\ddot s|\le a_{\max}.
+  \label{eq:fs-vpp}
+\end{equation}
+$s(t)$ 描述“在时刻 $t$ 已沿路径走到弧长 $s$ 处”，它把动态避障（什么时候到哪）与舒适性（加速度、jerk）都收进来。
+
+\begin{table}[H]\centering\small
+\caption{完整时空问题 vs.\ PVD 拆解后（系统对比，而非笼统说“更简单”）}
+\label{tab:fs-pvd-cmp}
+\begin{tabular}{lll}
+\toprule
+维度 & 完整时空问题 \cref{eq:fs-tpp} & PVD 拆解后 \cref{eq:fs-ppp}+\cref{eq:fs-vpp} \\
+\midrule
+决策变量规模 & $\sim5N$（$N{=}40\Rightarrow200$ 维） & path $\sim3N$ + speed $\sim3M$（稀疏带状） \\
+凸性 & \textbf{非凸}（可行域带洞、不连通） & path 凸 QP，speed 凸 QP \\
+全局最优 & 无多项式算法、易卡鞍点 & 每个凸子问题有唯一全局最优 \\
+实时性 & 数百 ms$\sim$秒级 & 每个子问题 ms 级 \\
+信息耦合 & 静态地图与动态预测混在一起 & path 吃静态地图，speed 吃动态预测 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+对同一个解耦动作，给两个互补视角：\emph{几何视角}——PVD 把一条二维轨迹曲线分解为“形状（path，画在地面上的线）”加“沿形状的进度（speed，何时走到线上哪一点）”两个解耦自由度；\emph{信息视角}——path 子问题只吃慢变的静态/准静态地图，speed 子问题吃快变的动态障碍预测，于是可把两者放到\emph{不同的求解频率}上（地图变得慢，路径就能算得久一点；预测变得快，速度就得刷得勤一点）。后一点直接连到工程实现：正因 path 只依赖静态环境，才能用相对长的周期算路径、用更短周期更新速度——这不是随意分频，而是 PVD 解耦的直接红利。当 path 与 speed 必须互相喂数据时（\cref{sec:fs-em}），这个红利就开始打折。
+
+\begin{pitfall}[概念误区：把 PVD 当成“两步彼此独立、各算一次就完事”]
+\textbf{错误想法}：path 和 speed 是两个独立模块，顺序跑一遍即可，互不影响。\textbf{后果}：在 cut-in（旁车切入）等强耦合场景，先定的路径让速度无解——为了不撞必须急刹，但路径已经选了贴近障碍的线，规划器频繁报失败或输出生硬的急动作。\textbf{根本原因}：PVD 的“解耦”是\emph{建模假设}，不是物理事实；路径与速度强耦合时，顺序求解会落进联合问题的次优甚至不可行区域。\textbf{正确做法}：弱耦合场景用纯解耦；强耦合场景用 EM 迭代（\cref{sec:fs-em}）让两阶段互相喂几轮数据，或直接上时空联合。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：认为“维度降低 = 近似 = 结果一定更差”]
+\textbf{错误想法}：解耦丢掉了信息，所以解耦解一定不如联合解，联合恒优。\textbf{实际情况}：在弱耦合场景，解耦的两个\emph{凸}子问题各自求到全局最优，合起来就是联合问题的（近）全局最优；而联合的\emph{非凸}问题反而可能卡在局部最优——此时解耦解\emph{更好}，不是更差。\textbf{正确思维}：解耦与联合的优劣取决于耦合强度，而非“联合天然更优”。面对一个场景，先问“这里路径和速度耦合多强”，再决定用哪种。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[推导]} 写出 \cref{eq:fs-tpp} 离散化后的决策维度，以及 PVD 拆解后两子问题各自的维度；取 $N=40$ 给出具体数字对比。再用一两句论证：为什么“两个凸问题”相比“一个非凸问题”在实时性上是\emph{质变}（可解 vs 不可解）而非量变。
+  \item \textbf{[设计]} 给定场景“前车急刹 + 相邻车道有并行车辆”，判断它属于强耦合还是弱耦合，并说明：纯 PVD 会在哪一步、以什么形式失败？EM 迭代（\cref{sec:fs-em}）能否救？什么情况下必须上时空联合？
+  \item \textbf{[联系]} PVD 的速度子问题在 $(t,s)$ 平面规划，机械臂的时间最优路径参数化（TOPP）则在 $(s,\dot s^2)$ 相平面规划。论证两者都是“路径已定、只优化沿路径的运动”的 PVD 实例。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Frenet 坐标系：定义、正逆变换与退化}
+\label{sec:fs-frenet}
+
+\paragraph{动机：弯道上笛卡尔坐标无法自然表达“偏离车道多少”。}
+在弯道上问一个最基本的问题：“这辆车偏离车道中心线多少？”笛卡尔坐标 $(x,y)$ 答不上来——因为“偏离量”是相对于一条\emph{弯曲}参考线定义的，而笛卡尔坐标的两个轴是固定的全局方向。你需要一套“贴着参考线走”的坐标：一个数表示“沿车道走了多远”，另一个表示“离车道中心偏了多少”。这正是 Frenet 坐标 $(s,l)$。
+
+\begin{insight}
+可以把 Frenet 坐标想成给弯曲车道铺一条\textbf{橡皮尺}：尺子沿车道中心线弯曲，$s$ 是尺子上的刻度（纵向进度），$l$ 是垂直于尺子的偏移（横向，左正右负）。\emph{像}的地方——和直角坐标一样，两个数定位平面一点；\emph{不像}的地方——这把尺子在急弯处会被“挤皱”：法向射线在凹侧会交汇，刻度不再均匀甚至重叠。所以\textbf{不要}把 Frenet 的 $(s,l)$ 当成全局笛卡尔那样处处线性、处处一一对应。这个“挤皱”就是后面的坐标退化。
+\end{insight}
+
+\paragraph{反面：不用 Frenet 硬在笛卡尔系里解耦会怎样。}
+假设硬在笛卡尔系里对弯道做横纵向解耦：（1）“横向偏移”的定义会随曲率不断变化，没有统一基准；（2）把障碍“投影”到这套坐标需要复杂的最近点搜索，且映射高度非线性；（3）SL 图、ST 图这类“以纵向进度为横轴”的规则表示根本建不起来。一句话：没有 Frenet，整条 SL/ST 管线无从谈起。
+
+\paragraph{历史：Werling 的 Frenet 末端状态采样。}
+Frenet--Serret 标架来自十九世纪微分几何，本是描述空间曲线的“活动标架”（在曲线每点定义切向、法向、副法向）。把它系统用于自动驾驶轨迹生成，公认的奠基工作是 Werling 等的《Optimal Trajectory Generation for Dynamic Street Scenarios in a Frenét Frame》\cite{werling2010frenet}：在 $(s,l)$ 下对横纵向分别做末端状态采样 + 解析多项式连接，$(s,l)$ 从此成为 SL/ST 图的坐标基础。
+
+\begin{note}
+\textbf{论文版本易混点（辨析）.}\;
+Werling 团队另有一篇常被一并引用的期刊文章《Optimal Trajectories for Time-Critical Street Scenarios Using Discretized Terminal Manifolds》\cite{werling2012optimal}。它与 \cite{werling2010frenet} 是\emph{两篇不同论文}（标题不同、作者序不同），并非同一篇的“会议版/期刊版”。引用时不要把二者合并成一条。两者署名确有差异：会议版（2010 ICRA）为 Werling/Ziegler/Kammel/Thrun，期刊版（2012 IJRR \texttt{31(3):346--359}）为 Werling/Kammel/Ziegler/Gröll（\emph{无} Thrun、\emph{多} Gröll）。
+\end{note}
+
+\begin{definition}[Frenet 坐标]\label{def:fs-frenet}
+给定参考线 $\boldsymbol{\gamma}(s)$（以弧长 $s$ 参数化，通常是车道中心线），平面上任一点 $P$ 的 Frenet 坐标为：（i）\textbf{纵向} $s$：$P$ 在 $\boldsymbol{\gamma}$ 上\emph{最近投影点}的弧长参数；（ii）\textbf{横向} $l$：$P$ 到该投影点的\emph{有符号距离}（约定左正右负）。
+\end{definition}
+
+\begin{theorem}[Frenet 正变换：$(s,l)\to(x,y)$]\label{thm:fs-forward}
+设参考线在弧长 $s$ 处的点为 $(x_r(s),y_r(s))$、切向朝向为 $\theta_r(s)$，则单位法向为 $\mathbf{n}=(-\sin\theta_r,\cos\theta_r)$（切向 $(\cos\theta_r,\sin\theta_r)$ 逆时针转 $90^\circ$）。沿法向偏移 $l$，得 $P$：
+\begin{equation}
+  x=x_r(s)-l\sin\theta_r(s),\qquad y=y_r(s)+l\cos\theta_r(s).
+  \label{eq:fs-forward}
+\end{equation}
+\end{theorem}
+\begin{proof}
+从参考点 $(x_r,y_r)$ 出发，沿单位法向 $(-\sin\theta_r,\cos\theta_r)$ 走 $l$ 个单位：$x$ 分量加 $l\cdot(-\sin\theta_r)$、$y$ 分量加 $l\cdot\cos\theta_r$，即 \cref{eq:fs-forward}。$l>0$ 偏向法向（左侧），$l<0$ 偏向右侧。
+\end{proof}
+
+\paragraph{逆变换：$(x,y)\to(s,l)$。}
+给定 $P=(x_P,y_P)$，要找它在 $\boldsymbol{\gamma}$ 上的最近投影点。最近点 $s^*$ 满足\emph{投影正交条件}——连线 $P-\boldsymbol{\gamma}(s^*)$ 垂直于参考线切向：
+\begin{equation}
+  \big(P-\boldsymbol{\gamma}(s^*)\big)\cdot\boldsymbol{\gamma}'(s^*)=0.
+  \label{eq:fs-projection}
+\end{equation}
+这是关于 $s$ 的一维求根问题。工程上不解析求解，而是在参考线离散点上找最近点做初值、再做几步局部牛顿/割线迭代。求得 $s^*$ 后，$l$ 是带符号距离 $\pm\|P-\boldsymbol{\gamma}(s^*)\|$，符号由 $P$ 在切向的左右侧决定（用叉积符号判定）。
+
+\paragraph{招牌推导：一阶运动学关系与退化的来源。}
+把 $P$ 换成随时间运动的车辆，对正变换关系微分，就能挤出退化的根源。别停在“整理可得”——我们把每一步展开。对 \cref{eq:fs-forward} 关于时间求导，用参考线弧长参数化的三个事实 $\dot x_r=\dot s\cos\theta_r$、$\dot y_r=\dot s\sin\theta_r$、$\dot\theta_r=\kappa_r\dot s$（曲率定义：朝向随弧长的变化率为曲率）：
+\begin{align}
+  \dot x &= \dot s\cos\theta_r\,(1-\kappa_r l)-\dot l\sin\theta_r, \label{eq:fs-xdot}\\
+  \dot y &= \dot s\sin\theta_r\,(1-\kappa_r l)+\dot l\cos\theta_r. \label{eq:fs-ydot}
+\end{align}
+把车辆速度向量 $(\dot x,\dot y)=(v\cos\theta,v\sin\theta)$ 分别投影到参考线\emph{切向} $(\cos\theta_r,\sin\theta_r)$ 与\emph{法向} $(-\sin\theta_r,\cos\theta_r)$（投影即点乘），交叉项相消，得两条干净关系：
+\begin{equation}
+  v\cos(\theta-\theta_r)=\dot s\,(1-\kappa_r l),\qquad
+  v\sin(\theta-\theta_r)=\dot l.
+  \label{eq:fs-tangnorm}
+\end{equation}
+由第一条解出纵向进度速率：
+\begin{equation}
+  \boxed{\ \dot s=\frac{v\cos(\theta-\theta_r)}{1-\kappa_r l}\ }.
+  \label{eq:fs-sdot}
+\end{equation}
+逐项理解：分子 $v\cos(\theta-\theta_r)$ 是车速在参考线切向上的投影（“沿车道方向的速度”）；分母 $1-\kappa_r l$ 是曲率引入的\emph{几何放缩因子}——车辆偏离参考线 $l$ 后，它实际走过的弧长进度被曲率拉伸或压缩了。直觉：在内弯且偏向内侧（$\kappa_r l>0$）时，分母 $<1$，同样的切向速度对应更大的 $\dot s$（内圈半径小、转得“快”）；在外侧则相反。第二条关系 $\dot l=v\sin(\theta-\theta_r)$ 是横向速率。两者相比，得\emph{横向几何关系}：
+\begin{equation}
+  l'=\frac{\mathrm{d}l}{\mathrm{d}s}=\frac{\dot l}{\dot s}=(1-\kappa_r l)\tan(\theta-\theta_r).
+  \label{eq:fs-lprime}
+\end{equation}
+这条把“航向偏差 $\theta-\theta_r$”与“横向斜率 $l'$”换算起来——Werling 的横向采样\cite{werling2010frenet} 正是在 $l(s)$ 这个量上做多项式拟合。
+
+\begin{theorem}[车辆路径曲率的小偏差近似]\label{thm:fs-kappa-path}
+把 \cref{eq:fs-lprime} 再对 $s$ 求导、代回曲率定义，车辆实际轨迹在笛卡尔下的曲率 $\kappa_{\mathrm{path}}$ 是 $(\kappa_r,l,l',l'')$ 的（较繁）完整函数；在\emph{小航向偏差、小偏移}的常见工况下，它线性化为
+\begin{equation}
+  \kappa_{\mathrm{path}}\approx\kappa_r+l''.
+  \label{eq:fs-kappa-path}
+\end{equation}
+\end{theorem}
+\begin{note}
+\textbf{这条小近似是 \cref{sec:fs-sl} 路径 QP 曲率约束的理论根据}：车辆能提供的总曲率受最大转向限制，$|\kappa_{\mathrm{path}}|\le a^\kappa_{\max}$，代入 \cref{eq:fs-kappa-path} 即 $|\kappa_r+l''|\le a^\kappa_{\max}$，移项得 $l''\in[-a^\kappa_{\max}-\kappa_r,\ a^\kappa_{\max}-\kappa_r]$——这正是 \cref{sec:fs-sl} 那个“\emph{减去}参考线曲率”的界（\cref{eq:fs-ddl-bound}）的来历。完整非线性式（笛卡尔曲率经 Frenet 帧换算\cite{werling2010frenet}）为
+\[
+  \kappa_{\mathrm{path}}=\frac{\Big(\dfrac{\big(l''+(\dot\kappa_r l+\kappa_r l')\tan\Delta\theta\big)\cos^2\Delta\theta}{1-\kappa_r l}+\kappa_r\Big)\cos\Delta\theta}{1-\kappa_r l},
+  \qquad \Delta\theta=\theta-\theta_r;
+\]
+在小航向偏差（$\Delta\theta\to0$，故 $\cos\Delta\theta\to1$、$\tan\Delta\theta\to0$）下化为 $\kappa_{\mathrm{path}}=\frac{l''}{(1-\kappa_r l)^2}+\frac{\kappa_r}{1-\kappa_r l}$，再取小偏移（$\kappa_r l\ll1$，$1-\kappa_r l\to1$）即得 \cref{eq:fs-kappa-path} 的 $\kappa_r+l''$。两条近似都需 $|\kappa_r l|$ 远小于 $1$。
+\end{note}
+
+\begin{theorem}[Frenet 坐标退化与可用区]\label{thm:fs-degeneracy}
+当 $\kappa_r l\to1$ 时，\cref{eq:fs-sdot} 的分母 $\to0$、$\dot s\to\infty$，变换\emph{奇异}。几何含义：偏移 $l$ 达到曲率半径 $1/\kappa_r$ 时，参考线两侧的法向射线在曲率中心交汇，多个笛卡尔点映到同一 $(s,l)$ 附近，一一对应关系破裂。Frenet 坐标的可用区有两条线：
+\begin{equation}
+  \underbrace{|\kappa_r l|<1}_{\text{严格}};\qquad\underbrace{|\kappa_r l|<0.3}_{\text{经验}}.
+  \label{eq:fs-usable}
+\end{equation}
+\end{theorem}
+前者是不退化的严格界，后者是工程上留足裕度的经验取法。超过经验阈值（大曲率匝道、停车场、路口内部等无清晰车道线场景），就应改用笛卡尔坐标规划。\pz{存疑：经验阈值 $0.3$ 是工程经验值、非定理，不同实现取值可能不同；源 md 未给出处。}
+
+\begin{insight}
+Frenet 坐标系的本质不是“换一个坐标系”，而是把\textbf{参考线的曲率信息一次性吸收进坐标定义}，从而让横纵向在新坐标里近似解耦——\cref{sec:fs-sl} 的横向规划与 \cref{sec:fs-st} 的纵向规划之所以能各做各的，全靠这次吸收。代价是它在 $|\kappa_r l|\to1$ 时失效：曲率越大、偏移越大，这套“拉直”越不可信。Frenet 不是免费的几何魔法，而是一笔有息贷款——道路越直，利息越低。
+\end{insight}
+
+\paragraph{代码与验证：正逆互逆。}
+Frenet 变换是规划热路径上的高频操作（每帧要对自车和几十个障碍反复做），实现质量直接影响实时性。下面这份无外部依赖的实现以一段已知半径的圆弧作参考线，验证“笛卡尔 $\to$ Frenet $\to$ 笛卡尔”能还原回原点（正逆互逆）。代码角色是\emph{把 \cref{eq:fs-forward} 与 \cref{eq:fs-projection} 落地并亲眼验证}。
+
+\begin{codebox}[C++]{Frenet 正逆变换的最小可运行实现（圆弧参考线验证正逆互逆）}
+#include <vector>
+#include <cmath>
+#include <cstdio>
+#include <limits>
+
+struct Pt { double x, y; };
+// reference point: cartesian coord + cumulative arclength s + tangent angle theta
+struct RefPoint { double x, y, s, theta; };
+
+// arc reference line of radius R (center at (0,R), start at origin)
+std::vector<RefPoint> MakeArcRef(double R, double s_max, double ds) {
+  std::vector<RefPoint> ref;
+  for (double s = 0; s <= s_max; s += ds) {
+    double phi = s / R;                       // arc: arclength s -> central angle phi
+    ref.push_back({R * std::sin(phi), R - R * std::cos(phi), s, phi});
+  }
+  return ref;
+}
+
+// cartesian -> Frenet: nearest projection, then (s, l)
+void CartesianToFrenet(const Pt& q, const std::vector<RefPoint>& ref,
+                       double* s_out, double* l_out) {
+  int best = 0; double best_d2 = std::numeric_limits<double>::infinity();
+  for (int i = 0; i < (int)ref.size(); ++i) {      // linear scan (use KD-tree in prod)
+    double dx = q.x - ref[i].x, dy = q.y - ref[i].y, d2 = dx * dx + dy * dy;
+    if (d2 < best_d2) { best_d2 = d2; best = i; }
+  }
+  const RefPoint& r = ref[best];
+  double dx = q.x - r.x, dy = q.y - r.y;
+  // l = offset projected onto NORMAL (-sin, cos); left positive, right negative
+  *l_out = -std::sin(r.theta) * dx + std::cos(r.theta) * dy;
+  *s_out = r.s;
+}
+
+// Frenet -> cartesian: offset along the SAME normal by l
+Pt FrenetToCartesian(double s, double l, const std::vector<RefPoint>& ref) {
+  int best = 0; double best_ds = std::numeric_limits<double>::infinity();
+  for (int i = 0; i < (int)ref.size(); ++i) {
+    double d = std::fabs(ref[i].s - s);
+    if (d < best_ds) { best_ds = d; best = i; }
+  }
+  const RefPoint& r = ref[best];
+  return {r.x + (-std::sin(r.theta)) * l, r.y + (std::cos(r.theta)) * l};
+}
+
+int main() {
+  auto ref = MakeArcRef(/*R=*/20.0, /*s_max=*/30.0, /*ds=*/0.05);
+  Pt q{8.0, 3.5};                              // a point ~1.5 m left of the arc
+  double s, l;
+  CartesianToFrenet(q, ref, &s, &l);
+  Pt q2 = FrenetToCartesian(s, l, ref);        // transform back
+  double err = std::hypot(q.x - q2.x, q.y - q2.y);
+  std::printf("cart (%.3f,%.3f) -> frenet (s=%.3f,l=%.3f) -> cart (%.3f,%.3f) err=%.4f\n",
+              q.x, q.y, s, l, q2.x, q2.y, err);   // err < ds means inverse is consistent
+  return 0;
+}
+\end{codebox}
+跑完会看到：笛卡尔点变换到 $(s,l)$ 再变回去，落回几乎同一位置（还原误差约 $0.019\,\mathrm{m}$，小于离散步长 $0.05\,\mathrm{m}$，正是离散化的固有精度），把“正逆互逆”从公式变成了可验的事实。\pz{存疑：源 md 给出具体输出 $(s{=}9.050,l{=}1.663)$、误差 $0.0192\,\mathrm{m}$，为该实现的运行结果，数值待复跑核对。}代码里两处和理论对应：$l$ 用法向 $(-\sin\theta,\cos\theta)$ 投影——正是 \cref{def:fs-frenet} 的“左正右负”；逆变换沿同一法向偏移——正逆用同一个法向，互逆才成立。
+
+这份玩具实现用“线性扫描找全局最近点”，简单但藏着两个工程必须正视的问题。其一是\emph{最近点可能不唯一或会突变}：车辆位于参考线曲率中心附近、或参考线有急弯时，最近点可能有多个候选，或随车辆微动从一处跳到另一处——表现为 $s$ 值的突然跳变，下游基于 $s$ 的速度规划会因此抖动。工业实现会维护上一帧的投影点、在其邻域内局部搜索，而非每帧全局重找，既快又避免跳变。其二是\emph{全局扫描的复杂度}：线性扫描是 $\mathcal{O}(N)$（$N$ 为参考线点数），参考线长、点密时不划算；可用 KD-tree 或基于弧长的索引降到对数级，或用局部搜索做到近似 $\mathcal{O}(1)$。还有一个更隐蔽的点：这份实现把 $l$ 取为“偏移向量在法向的投影”，隐含假设车辆离参考线不太远（$|\kappa_r l|<1$，即 \cref{thm:fs-degeneracy}）；偏移一旦接近曲率半径，法向投影本身就不再良定义。
+
+\begin{pitfall}[编程陷阱：逆变换的最近点搜索用全局线性扫描、且每帧从头扫]
+\textbf{错误做法}：每帧、对每个查询点，遍历整条参考线找最近点。\textbf{现象}：参考线数百点 $\times$ 几十个障碍 $\times$ 每帧若干次 $\to$ 投影函数吃掉热路径大半时间，规划频率上不去。\textbf{根本原因}：没利用“车和障碍在相邻帧的投影点几乎不动”这一时间连续性。\textbf{正确做法}：缓存上一帧最近点索引，本帧只在其邻域做局部窗口搜索，或用 KD-tree 把单次查询降到 $\mathcal{O}(\log N)$。\textbf{自检}：用 profiler 看投影函数占比，正常应远低于 QP 求解耗时。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：认为 Frenet 变换处处精确、可无脑使用]
+\textbf{错误想法}：$(s,l)$ 与 $(x,y)$ 一一对应、随便用。\textbf{实际情况}：仅在 $|\kappa_r l|<1$ 时一一对应（\cref{thm:fs-degeneracy}）；大曲率 + 大偏移时退化，$1-\kappa_r l\to0$ 使 $\dot s$ 与诸多 Frenet 量数值爆炸。停车场、路口内部、急匝道等场景强行用 Frenet 会得到发散的离谱结果。\textbf{正确做法}：运行时监控 $\kappa_r l$，超过经验阈值（如 $0.3$）就告警并切到笛卡尔规划。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：认为“参考线随便给一条就行，反正只是个参考”]
+\textbf{错误想法}：参考线只是辅助基准，光不光滑无所谓。\textbf{实际情况}：参考线不光滑（$\kappa_r$ 跳变）会让 Frenet 量——尤其 $l'$ 与 $\kappa_r$——剧烈抖动，把 \cref{sec:fs-sl} 的 QP 喂成病态问题；参考线质量决定整张 SL/ST 图的质量。\textbf{正确思维}：参考线必须\emph{先平滑}（工业系统专门有 reference line smoother 这一前置步骤，本身也是一个“平方和代价 + 线性约束”的凸 QP）。这是典型的“垃圾进、垃圾出”——再好的 QP 也救不了一条锯齿状参考线。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 实现 \cref{eq:fs-forward} 与逆变换（后者含局部最近点的牛顿/割线迭代）。用一条已知解析解的圆弧参考线验证：任取若干 $(s,l)$ 正变换到 $(x,y)$ 再逆变换回来，往返误差应小于 $10^{-6}$。
+  \item \textbf{[调试]} 给定一段用全局 \verb@argmin@ 找最近离散点、未处理 U 形弯“一个查询点对应多个近似最近段”的逆变换。定位：为什么车辆经过 U 形弯顶点时 $s$ 会突然跳变？给出修复（提示：用上一帧 $s$ 约束本帧搜索窗口）。
+  \item \textbf{[推导]} 从 \cref{eq:fs-forward} 出发完整推出 \cref{eq:fs-sdot} 中分母 $1-\kappa_r l$ 的来源。再代入数值：参考线曲率半径 $1/\kappa_r=10\,\mathrm{m}$、横向偏移 $l=2\,\mathrm{m}$，计算 $\dot s$ 相对 $v\cos(\theta-\theta_r)$ 被放大了多少倍？这对“高速 + 大曲率匝道”意味着什么风险？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{SL 图与 piecewise-jerk 路径 QP}
+\label{sec:fs-sl}
+
+\paragraph{动机：从“画一条线”到“一个可求解的优化问题”。}
+有了 Frenet 坐标（\cref{sec:fs-frenet}），PVD 的路径子问题（\cref{eq:fs-ppp}）就是求横向偏移关于纵向进度的函数 $l(s)$——“沿车道走到弧长 $s$ 处时，偏离中心线多少”。难点：$l(s)$ 是函数（无穷维），静态障碍把某些 $(s,l)$ 区域挡死，我们要在剩下的“自由走廊”里挑一条最平滑、最居中的 $l(s)$。怎么把这个无穷维、带障碍的问题压成计算机能在毫秒级解出全局最优的形式？答案分两步：先把“画线”搬到一张 SL 图上，再整理成一个凸 QP。
+
+\paragraph{反面：不走“离散化 + 凸 QP”这条路会怎样。}
+用通用非线性求解器直接解，若代价或约束没刻意整理成凸的，会卡在局部最优、单次求解几十到上百毫秒，撑不住高频重规划；用纯采样（Werling 的末端状态采样\cite{werling2010frenet}）在简单场景很优雅，但采样点无法覆盖整个走廊，复杂窄走廊里经常采不到可行解；不离散化、停留在函数空间，则根本无法交给数值求解器。
+
+\paragraph{历史：从 spline-QP 到 piecewise-jerk。}
+Apollo EM Planner 最初用 spline-QP\cite{fan2018baidu}：把 $l(s)$ 表示成分段多项式（样条），优化样条系数。后来改用 \textbf{piecewise-jerk} 表示——不再优化样条系数，而是直接以每个 station 上的状态 $[l,l',l'']$ 为决策变量，相邻 station 之间假设 jerk（$l'''$）为常数来做积分。换的理由很实在：piecewise-jerk 的 QP 是\emph{稀疏带状}的（只有相邻 station 耦合）、状态有\emph{直接物理意义}（偏移/斜率/曲率）、box 约束好加、求解更快也更好调。\pz{存疑：源 md 称 piecewise-jerk 是 Apollo「约 v2.0 起」改用、非 Fan 2018 论文原文（论文为 spline-QP），版本号与归属待联网核对——勿把 piecewise-jerk 算到 Fan 2018 头上。}
+
+\begin{insight}
+piecewise-jerk 把“找一条曲线”重写成“找一串满足积分约束的状态”，换来的最大好处是 QP 矩阵的\textbf{稀疏带状结构}——只有相邻 station 的变量耦合，Hessian 与约束矩阵都是带状的。吃稀疏性的 QP 求解器因此能毫秒级解几百维问题。换句话说，piecewise-jerk 的“快”不是求解器的魔法，而是\emph{问题结构被刻意设计成了稀疏的}。
+\end{insight}
+
+\paragraph{SL 图构建（四步）。}
+（i）从地图取参考线（\emph{必须已平滑}，见 \cref{sec:fs-frenet} 思维陷阱），沿弧长离散成 station 序列 $s_0,s_1,\dots,s_{N-1}$，间距 $\Delta s$；（ii）每个静态障碍投影到 Frenet，占据某段 $[s_a,s_b]\times[l_c,l_d]$，折算成每个 station 上的横向上下界 $[l_{\mathrm{lb}}(s_i),l_{\mathrm{ub}}(s_i)]$（障碍与道路边界共同决定）；（iii）动态障碍此刻只做保守占位，动态交互留给 \cref{sec:fs-st} 的 ST 图；（iv）路径 $l(s)$ = 在这些逐 station 横向边界内、从起点到终点的一条光滑曲线。
+
+对 piecewise-jerk 的状态表示，给两个互补视角：\emph{代数视角}——$[l_i,l'_i,l''_i]$ 是一串受积分等式约束的数，QP 在这些约束下最小化平滑代价；\emph{控制视角}——把 $l'''$（jerk）当“控制输入”，$l,l',l''$ 当被它积分的“状态”，这就是一个以\emph{弧长 $s$ 当“时间”}的离散最优控制问题，piecewise-jerk 即“假设控制 jerk 在每段内恒定”的一阶保持。理解这个视角后你会发现：它和 \cref{sec:fs-speedqp} 的速度 QP、乃至一般 MPC，是同一套数学的不同实例。
+
+\paragraph{决策变量与连续性等式。}
+决策变量为每个 station $i$ 上的 $[l_i,l'_i,l''_i]$，共 $3N$ 个。相邻 station 间设 $l'''\equiv\mathrm{jerk}_i$（匀 jerk），由对 $s$ 的泰勒展开得三条积分关系：
+\begin{align}
+  l''_{i+1} &= l''_i+\mathrm{jerk}_i\,\Delta s, \label{eq:fs-jerk-ddl}\\
+  l'_{i+1}  &= l'_i+l''_i\,\Delta s+\tfrac12\mathrm{jerk}_i\,\Delta s^2, \label{eq:fs-jerk-dl}\\
+  l_{i+1}   &= l_i+l'_i\,\Delta s+\tfrac12 l''_i\,\Delta s^2+\tfrac16\mathrm{jerk}_i\,\Delta s^3. \label{eq:fs-jerk-l}
+\end{align}
+由 \cref{eq:fs-jerk-ddl} 解出 $\mathrm{jerk}_i=(l''_{i+1}-l''_i)/\Delta s$，代回 \cref{eq:fs-jerk-dl,eq:fs-jerk-l}，即得\emph{只含状态、不含 jerk}的两条等式约束，把相邻三元组 $[l_i,l'_i,l''_i]$ 与 $[l_{i+1},l'_{i+1},l''_{i+1}]$ 线性地锁在一起——这两条就是 QP 里的等式约束行。
+
+\paragraph{代价函数。}
+\begin{equation}
+  J_{\mathrm{path}}=\sum_i\Big[w_l\,(l_i-l_{\mathrm{ref},i})^2+w_{l'}\,(l'_i)^2+w_{l''}\,(l''_i)^2\Big]
+  +w_{l'''}\sum_i\Big(\frac{l''_{i+1}-l''_i}{\Delta s}\Big)^2.
+  \label{eq:fs-path-cost}
+\end{equation}
+逐项读：$w_l$ 把路径拉向参考线（居中或跟随预设参考路径）；$w_{l'}$ 抑制横向斜率（别斜着冲出车道）；$w_{l''}$ 抑制横向曲率（弯得别太急）；$w_{l'''}$ 抑制 jerk（更平滑）。这些项全是平方和，故 Hessian 半正定——QP 是凸的。
+
+\paragraph{约束（box bounds）。}
+横向位置 $l_{\mathrm{lb}}(s_i)\le l_i\le l_{\mathrm{ub}}(s_i)$（障碍 + 道路边界）；横向曲率界由 \cref{thm:fs-kappa-path} 给出——车辆实际路径曲率 $\approx\kappa_r+l''$、总曲率被最大转向角 $\delta_{\max}$ 限死在 $\pm a^\kappa_{\max}$，故
+\begin{equation}
+  l''_i\in\big[-a^\kappa_{\max}-\kappa_r(s_i),\ \ a^\kappa_{\max}-\kappa_r(s_i)\big],
+  \qquad a^\kappa_{\max}=\frac{\tan(\delta_{\max}/r_{\mathrm{steer}})}{L_{\mathrm{wheelbase}}},
+  \label{eq:fs-ddl-bound}
+\end{equation}
+其中 $r_{\mathrm{steer}}$ 为转向传动比、$L_{\mathrm{wheelbase}}$ 为轴距。\textbf{为什么要减去参考线曲率 $\kappa_r(s_i)$？}因为留给 $l''$ 的曲率裕度，是车辆能提供的总曲率上限\emph{扣掉}参考线本身占掉的那部分 $\kappa_r$。这是个论文不会写、只在代码里现身的细节，弯道场景必须处理对。注意 $a^\kappa_{\max}$ 量纲是曲率（$1/\mathrm{m}$）而非加速度——代码里它叫 \texttt{lat\_acc\_bound}，名字带“acc”是工程命名的历史包袱。边界条件 $l_0,l'_0,l''_0$ 锁定为起点状态（接当前车辆），终点按需给软或硬约束。（此式与 Apollo \texttt{piecewise\_jerk\_path} 源码一致：\texttt{lat\_acc\_bound = tan(max\_steer\_angle/\allowbreak steer\_ratio)/\allowbreak wheel\_base}，\texttt{ddl\_bounds = (-lat\_acc\_bound - kappa,\ lat\_acc\_bound - kappa)}。）
+
+\begin{note}
+\textbf{凸性回收.}\;
+代价 \cref{eq:fs-path-cost} 是平方和 $\Rightarrow$ Hessian $\mathbf{P}\succeq0$；约束全线性（等式 + box）$\Rightarrow$ 这是个\emph{凸 QP}，毫秒级给全局最优。这正兑现了“解耦之后，路径子问题落进了最温顺的那类优化”的承诺。
+\end{note}
+
+\paragraph{把矩阵摊开看：一个最小算例 $N=3$。}
+取 $N=3$ 个 station、$\Delta s=1\,\mathrm{m}$，决策向量九维 $\mathbf{x}=[l_0,l'_0,l''_0,\ l_1,l'_1,l''_1,\ l_2,l'_2,l''_2]^\top$。起点固定 $l_0=l'_0=l''_0=0$。设一个小障碍要求 station $1$ 处向右让出，即 $l_1\le-0.5$。权重取 $w_l=w_{l'}=w_{l''}=w_{l'''}=1$。$\Delta s=1$ 时的连续性两式（消去 jerk 后）为 $l'_{i+1}=l'_i+\tfrac12(l''_i+l''_{i+1})$、$l_{i+1}=l_i+l'_i+\tfrac13 l''_i+\tfrac16 l''_{i+1}$。
+
+只看 $l''$ 子块：曲率项 $w_{l''}\sum(l''_i)^2$ 贡献单位阵 $\mathbf{I}$，jerk 项 $w_{l'''}\sum(l''_{i+1}-l''_i)^2$ 贡献一个“一阶差分 Gram 矩阵” $\mathbf{L}$，合起来（只看结构本质）
+\begin{equation}
+  \mathbf{P}_{l''}\ \propto\ \mathbf{I}+\mathbf{L}
+  =\begin{bmatrix}1&&\\&1&\\&&1\end{bmatrix}
+  +\begin{bmatrix}1&-1&\\-1&2&-1\\&-1&1\end{bmatrix}
+  =\begin{bmatrix}2&-1&0\\-1&3&-1\\0&-1&2\end{bmatrix}.
+  \label{eq:fs-tridiag}
+\end{equation}
+这就是“稀疏带状”的来历——它不是抽象口号，就是这个\emph{三对角}。QP 解会让 $l_1$ 恰好压到约 $-0.5$（障碍约束起作用），$l_0,l_2$ 附近回到 $0$，整条 $l(s)$ 是一条平滑的小“右凸”。把 $w_{l'''}$ 调到 $0$ 再解一遍，$l(s)$ 在 station $1$ 会出现更尖的折角——这就是 jerk 项在“磨平”路径。
+
+\paragraph{权重怎么调（一点工程手感）。}
+$w_l,w_{l'},w_{l''},w_{l'''}$ 之间是\emph{相对}关系——只有比值有意义，整体同乘常数不改变最优解。常见手感：先把 $w_l$（贴参考线）定为基准 $1$，再调其余。$w_{l''}$（曲率/舒适）调大，路径“懒得拐”、更贴近直线，太大则贴不够障碍裕度；$w_{l'''}$（jerk）调大，转向更柔，太大则响应迟钝、避障不利落。障碍与边界是\emph{硬约束}（box），不靠权重控制——权重只在“已经可行的解集合”内部挑舒适度。
+
+\begin{pitfall}[思维陷阱：以为权重能调出“绕左还是绕右”的决策]
+\textbf{错误想法}：避障方向不对，就调权重。\textbf{实际情况}：绕左还是绕右、让还是抢，是离散决策（横向边界 $[l_{\mathrm{lb}},l_{\mathrm{ub}}]$ 怎么取、以及 \cref{sec:fs-st} 的 yield/overtake），不是连续权重能调出来的；权重只在选定的同伦类\emph{内部}塑形。\textbf{正确思维}：见过太多人把“避障方向不对”当成调权重的问题，怎么调都不对——因为那根本是上游决策错了。
+\end{pitfall}
+
+\paragraph{代码：连续性等式与 $l''$ 界落成线性行。}
+\begin{codebox}[C++]{piecewise-jerk 路径 QP:连续性等式行 + ddl 上下界（教学实现）}
+// decision layout: per station [l, dl, ddl], stacked [l0,dl0,ddl0, l1,dl1,ddl1, ...]
+inline int IdxL  (int i) { return 3 * i + 0; }  // l_i
+inline int IdxDL (int i) { return 3 * i + 1; }  // l'_i  (dl/ds)
+inline int IdxDDL(int i) { return 3 * i + 2; }  // l''_i (d2l/ds2)
+
+// one continuity equality (l relation after eliminating jerk):
+//   l_{i+1} - l_i - l'_i*ds - 1/2*l''_i*ds^2 - 1/6*(l''_{i+1}-l''_i)*ds^2 = 0
+// sparse row A_row*x = 0 touches only 6 vars of two adjacent stations -> banded matrix
+void AddLContinuityRow(SparseTriplets* A, int row, int i, double ds) {
+  const double ds2 = ds * ds;
+  A->emplace_back(row, IdxL(i + 1),    1.0);                    // +l_{i+1}
+  A->emplace_back(row, IdxL(i),       -1.0);                    // -l_i
+  A->emplace_back(row, IdxDL(i),      -ds);                     // -l'_i*ds
+  A->emplace_back(row, IdxDDL(i),     -0.5 * ds2 + ds2 / 6.0);  // merged l''_i coeff
+  A->emplace_back(row, IdxDDL(i + 1), -ds2 / 6.0);              // l''_{i+1} (from jerk)
+  // equality: lb[row] = ub[row] = 0
+}
+
+// l''(ddl) per-station bounds: curvature budget = vehicle max curvature MINUS ref kappa
+// a_kappa_max: path curvature at max steer (dimension is 1/m, despite the "acc" naming)
+void SetDdlBounds(const RefLine& ref, const Vehicle& veh, const std::vector<double>& s,
+                  std::vector<double>* ddl_lb, std::vector<double>* ddl_ub) {
+  const double a_kappa_max =
+      std::tan(veh.max_steer_angle / veh.steer_ratio) / veh.wheel_base;
+  for (int i = 0; i < (int)s.size(); ++i) {
+    const double kappa_r = ref.NearestPoint(s[i]).kappa;        // ref curvature at s_i
+    (*ddl_lb)[i] = -a_kappa_max - kappa_r;   // subtract kappa: drop ref's own curvature
+    (*ddl_ub)[i] =  a_kappa_max - kappa_r;
+  }
+}
+\end{codebox}
+两处错误最常见：连续性只用一阶 Euler（漏掉 $\tfrac12\Delta s^2$、$\tfrac16\Delta s^3$ 高阶项），解出的 $l(s)$ 与其声称的 $l',l''$ 自相矛盾、在曲率约束下不可行；以及 \verb@ddl@ 上下界忘了减 $\kappa_r$（\cref{eq:fs-ddl-bound}），直道没事、弯道上可行域被错误收紧或过保守。还有一个跨求解器版本的坑见下。
+
+\begin{pitfall}[编程陷阱：交叉项填进下三角，被只读上三角的 QP 求解器丢弃]
+\textbf{错误做法}：把 $\mathbf{P}$ 的交叉项\emph{只}填在下三角、或把本该成对出现的对称元拆开填，却交给一个只读上三角的求解器。\textbf{现象}：结果数值不对——被放进\emph{下三角}的那些非对角元被求解器\emph{直接丢弃}、相应的交叉项凭空消失（这正是 Apollo \texttt{piecewise\_jerk\_path} 早期踩的坑：OSQP 把 $\mathbf{P}$ 转上三角时\emph{drop} 掉了下三角元素，使 $w_{l'''}$ 的相邻耦合项失效）。\textbf{根本原因}：OSQP 的 C 接口约定 $\mathbf{P}$ 以\emph{上三角}稀疏（CSC）格式提供、\emph{只读} $i\le j$ 的元素\cite{stellato2020osqp}（下三角被忽略而非报错——故易被无声吞掉）。\textbf{正确做法}：所有二次项都按上三角约定组装（每个对称对只在 $i\le j$ 处放一次完整系数）；新版 OSQP 也接受“完整对称 $\mathbf{P}$”输入并自动\emph{只取}上三角，但跨版本/跨接口迁移时仍应显式核对。\textbf{自检}：用一个有解析解的两点小 QP 核对求解器输出。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：以为路径 QP 里的 “jerk” 就是乘客感受到的那个 jerk]
+\textbf{错误想法}：调大 $w_{l'''}$ 就能让乘坐更舒适。\textbf{实际情况}：这里的 jerk 是 $\mathrm{d}^3l/\mathrm{d}s^3$——横向偏移对\emph{弧长}的三阶导，是路径的\emph{空间平滑度}，不是对\emph{时间}的 jerk；乘客感受到的时间 jerk 由速度规划（\cref{sec:fs-speedqp}）决定。\textbf{正确做法}：空间平滑找路径 QP（$w_{l'''}$），时间舒适找 speed QP。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 实现一个最简 piecewise-jerk 路径 QP：输入逐 station 的 $[l_{\mathrm{lb}},l_{\mathrm{ub}}]$ 与起点状态，组装连续性等式 + box 约束 + 平滑代价，求解并重建 $l(s)$。对比开启与关闭 $w_{l'''}$ 项时路径的平滑度差异。
+  \item \textbf{[调试]} 给定把连续性写成一阶 Euler（漏掉 $\tfrac12\Delta s^2,\tfrac16\Delta s^3$）的代码，解释为何求得的 $l(s)$ 与它声称的 $l',l''$ 自相矛盾、在曲率约束下不可行，并改回完整三次积分。
+  \item \textbf{[推导]} 从匀 jerk 运动学 \cref{eq:fs-jerk-ddl,eq:fs-jerk-dl,eq:fs-jerk-l} 推导连续性等式并消去 jerk。再用 \cref{thm:fs-kappa-path} 论证 \cref{eq:fs-ddl-bound} 为何要减去参考线曲率 $\kappa_r(s_i)$。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{ST 图与 DP-ST 速度搜索}
+\label{sec:fs-st}
+
+\paragraph{动机：速度规划要回答的是“何时到哪”。}
+\cref{sec:fs-sl} 给出的是一条画在地面上的几何路径，它没有时间。可真实交通里，能不能走、走多快，取决于动态障碍\emph{在什么时刻}占据路径的哪一段。把这件事画清楚的工具就是 ST 图：横轴是时间 $t$，纵轴是沿\emph{那条固定路径}的弧长 $s$。自车的速度计划就是这张图上一条曲线 $s(t)$——“到时刻 $t$ 我已沿路径走到了 $s$ 处”。这正是 Kant--Zucker 1986\cite{kant1986toward} 的 path-time 空间在动态障碍预测下的现代工程形态（\cref{sec:fs-pvd} 的历史洞察）。
+
+\begin{insight}
+可以把 ST 图当成物理里的\textbf{时空图}（spacetime diagram）：横轴时间、纵轴位置（这里是沿路径的弧长 $s$）。每个动态障碍画出一条“世界线管道”——它在各时刻占据的 $s$ 区间；自车的 $s(t)$ 是自己的世界线；“不碰撞”即自车世界线不穿过任何障碍管道。\emph{像}的地方——都在 (时间, 位置) 平面用曲线描述运动，“曲线不相交”即“不碰撞”；\emph{不像}的地方——物理时空图里粒子可前可后、时空近乎对称，这里 $s$ 被强制\textbf{单调不减}（车不能沿路径倒退），时间也只能前进，所以自车世界线只能是一条朝右上方单调延伸的曲线。别把相对论时空图的自由度套到这里。
+\end{insight}
+
+\paragraph{反面：不先 DP、直接对 $s(t)$ 上凸 QP 会怎样。}
+你会立刻撞上一个结构性障碍：每个动态障碍在 ST 平面挖出一块阻挡区域，自车曲线要么从它\emph{上方}穿过（抢行 overtake），要么从\emph{下方}穿过（让行 yield）。这两类路线\emph{互不连通}——可行域非凸、分裂。凸 QP 只能在一个\emph{连通}的凸区域里找最优，面对“上方 or 下方”这种分裂选择，它无法自己决定该钻哪个洞，给一个错误初值就卡死在错误一侧。这正是速度规划要分两段的原因：\textbf{先用 DP 在 ST 图上做“让不让”的离散决策、把非凸切成连通的凸走廊，再交给 QP 精修}（\cref{sec:fs-speedqp}）。
+
+\paragraph{ST 图构建。}
+（i）路径已固定（\cref{sec:fs-sl}），把每个动态障碍的\emph{预测轨迹}投影到 $(t,s)$ 平面：对每个时刻 $t$，问“障碍此刻占据了自车路径上哪一段 $s$”，得一块随时间变化的阻挡区域；（ii）阻挡形状反映障碍运动——匀速 $\to$ 平行四边形（占据的 $s$ 带随 $t$ 线性平移），横穿且匀速 $\to$ 近似矩形（固定 $s$ 段在固定时间窗内被占），加/减速 $\to$ 梯形；这块区域在工程上就是 \verb@STBoundary@ 数据结构；（iii）自车速度剖面 $s(t)$ 从 $(t{=}0,s{=}s_0)$ 出发、单调不减；（iv）\emph{关键决策}：$s(t)$ 从每个阻挡上方过（overtake）还是下方过（yield）。
+
+\begin{insight}
+速度规划真正的难点不是“让多少”，而是“让不让”。每个动态障碍把 ST 平面切成“从上方过（抢行）”和“从下方过（让行）”两个\textbf{互不连通}的可行类（同伦类）——这是离散决策，非凸的根源就在这里。DP-ST 搜索本质上不是在求最优速度曲线，而是在替每个障碍做出 yield/overtake 决策、从而把非凸问题切成一个 QP 能精修的凸走廊。这也解释了“DP 构造凸空间 $\to$ QP 精修”范式为何必须是两段、而非一段。
+\end{insight}
+
+\paragraph{DP-ST 搜索。}
+把 ST 平面用 $(\Delta t,\Delta s)$ 离散成网格，节点 $(t_i,s_j)$ 表示“自车在时刻 $t_i$ 处于弧长 $s_j$”。做前向动态规划——这正是 \cref{thm:plan-bellman} 的 Bellman 最优性原理在 ST 网格上的实例，与 Dijkstra（\cref{sec:plan-dijkstra}）同源。其要素：\textbf{边}从 $(t_i,s_j)$ 到 $(t_{i+1},s_k)$，表示 $\Delta t$ 内从 $s_j$ 走到 $s_k$；\textbf{约束} $s$ 单调不减（$s_k\ge s_j$）、$v=(s_k-s_j)/\Delta t\in[0,v_{\max}]$、$a\in[a_{\min},a_{\max}]$；\textbf{碰撞检测} 若节点落在任一阻挡区域内部则不可达（代价 $+\infty$）。Bellman 累积代价递推为
+\begin{equation}
+  J^*(t_i,s_k)=\min_{s_j}\Big[J^*(t_{i-1},s_j)+c_{\mathrm{edge}}(s_j\to s_k)\Big],
+  \label{eq:fs-dp-bellman}
+\end{equation}
+逐层从 $t_0$ 推到末层、记下每节点最优前驱，再从末层最小代价节点回溯，得世界线。边代价把“从上一层 $s_j$ 走到这一层 $s_k$”打包成一个数：
+\begin{equation}
+  c_{\mathrm{edge}}=w_a\,a^2+w_j\,j^2+w_v\,(v-v_{\mathrm{ref}})^2+w_{\mathrm{obs}}\,\phi_{\mathrm{dist}},
+  \label{eq:fs-edge-cost}
+\end{equation}
+其中 $v,a,j$ 由相邻段差分估计，$\phi_{\mathrm{dist}}$ 是离阻挡越近惩罚越大的项。\textbf{为什么 DP 边代价要放这些“舒适性”项，而不只判可行/不可行？}因为同一个 yield 决策下可能有很多条可行折线，DP 要在\emph{选决策的同时}粗略偏好平滑、接近期望速度的那条——否则它可能选出“虽让行但急刹到底再猛加速”的极端可行解，让后续 QP 起点很差。DP 不求精确，但要求“决策对、起点不离谱”。
+
+DP 产出一条粗粒度速度 profile，有两个用途：（a）给出对每个障碍的 yield/overtake \emph{决策}；（b）作为 \cref{sec:fs-speedqp} QP 的 warm start 与 ST 上下界 $[s_{\mathrm{lb}}(t),s_{\mathrm{ub}}(t)]$。第二点是关键——DP 把“该钻哪个洞”固定下来后，QP 面对的就是一个连通的凸走廊了。
+
+\begin{theorem}[DP-ST 复杂度]\label{thm:fs-dp-complexity}
+节点数为 $N_t\times N_s$，每个节点向不超过 $N_s$ 个 $s_k$ 连边，故时间复杂度 $\mathcal{O}(N_t\cdot N_s^2)$。它对 $s$ 方向分辨率 $N_s$ 是\emph{平方}敏感的。
+\end{theorem}
+\begin{note}
+$N_s$ 翻倍、计算量翻四倍，而 $N_s$ 太小又会漏掉障碍间的窄缝——这是网格分辨率陷阱的代价根源。又：ST 图里时间单向流动、$s$ 单调不减，整张图是\emph{分层有向无环图}（DAG），故不需要 Dijkstra 的优先队列，只要按时间层 $t_0,t_1,\dots$ 顺序前向递推即可，比一般 Dijkstra（\cref{thm:plan-dijkstra}）更简单；若想加速，可像 A$^*$ 那样用“到目标的乐观代价估计”剪枝。
+\end{note}
+
+\paragraph{一个最小算例。}
+前车 $t{=}0$ 在 $s{=}30$、匀速 $6\,\mathrm{m/s}$，自车 $v_0=8$。ST 网格离散为 $\Delta t=0.5\,\mathrm{s}$、$t\in\{0,0.5,1.0,1.5,2.0\}$（五层），$s$ 每 $2\,\mathrm{m}$ 一格。前车阻挡带（含约 $4\,\mathrm{m}$ 膨胀）在 $t$ 时刻占据 $s\in[30+6t-2,\ 30+6t+L]$，即一条以 $6\,\mathrm{m/s}$ 向上平移的斜带。自车从 $(0,0)$ 出发做前向 DP：若维持 $8\,\mathrm{m/s}$（每层 $+4\,\mathrm{m}$），近处不冲突，但时域拉长到追上点时会撞进阻挡带（代价 $+\infty$，不可行）；DP 因此在更早的层就偏好减速边，让 $s(t)$ 斜率降到约 $6\,\mathrm{m/s}$、贴着阻挡带下沿走——这一串“减速”低代价边连起来，就是 \textbf{yield 决策}。输出：决策 = yield；走廊 $s_{\mathrm{ub}}(t)=$ 阻挡带下沿、$s_{\mathrm{lb}}(t)=$ 不倒退下限，交给 \cref{sec:fs-speedqp} 精修。若 $\Delta s$ 取太粗（如 $5\,\mathrm{m}$），DP 可能“看不见”前车与某条边的薄接触、误判可行——这正是分辨率陷阱的具体长相。
+
+\paragraph{代码：前向 DP。}
+\begin{codebox}[C++]{ST 网格 + 前向 DP:求最小到达代价，回溯得粗速度 profile（教学实现）}
+// dp[ti][sj] = min accumulated cost to reach (t_i, s_j); back stores predecessor s-index
+std::vector<SpeedPoint> DpStSearch(const std::vector<STBoundary>& obs,
+                                   double s0, double v0, const STGrid& g) {
+  Grid2D<double> dp(g.Nt, g.Ns, +INF);
+  Grid2D<int>    back(g.Nt, g.Ns, -1);
+  dp(0, g.IdxS(s0)) = 0.0;
+
+  for (int ti = 0; ti + 1 < g.Nt; ++ti) {
+    for (int sj = 0; sj < g.Ns; ++sj) {
+      if (dp(ti, sj) == INF) continue;
+      for (int sk = sj; sk < g.Ns; ++sk) {            // sk >= sj: s monotone (no reverse)
+        const double v = (g.S(sk) - g.S(sj)) / g.dt;  // segment average speed
+        if (v > g.v_max) break;                       // v grows with sk -> break once over
+        const double a = (v - g.PrevV(ti, sj)) / g.dt;
+        if (a < g.a_min || a > g.a_max) continue;     // acceleration limit
+        if (InAnyBoundary(obs, g.T(ti + 1), g.S(sk))) continue;  // inside block -> blocked
+        const double c = dp(ti, sj) + EdgeCost(v, a /*, jerk, v_ref deviation */);
+        if (c < dp(ti + 1, sk)) { dp(ti + 1, sk) = c; back(ti + 1, sk) = sj; }
+      }
+    }
+  }
+  return Backtrack(dp, back, g);  // backtrack min-cost end -> coarse profile + decisions
+}
+\end{codebox}
+注意 \verb@if (v > g.v_max) break;@ 用 \verb@break@ 而非 \verb@continue@：\verb@sk@ 递增时 $v$ 单调增，一旦越界更大的 \verb@sk@ 必然也越界——这是利用单调性的小优化。三类错误最常见：允许 $s$ 递减（内层 \verb@sk@ 从 $0$ 开始）会让 DP 选出“自车沿路径倒退”的荒谬解；碰撞检测只判几何中心点、不按尺寸 + 裕度膨胀阻挡，会让 $s(t)$ 贴着边缘“擦过”、实车剐蹭；网格过粗会漏掉两障碍间的窄缝。
+
+\begin{pitfall}[编程陷阱：ST 碰撞检测忘了按“自车 + 障碍尺寸 + 安全裕度”膨胀阻挡区域]
+\textbf{错误做法}：把障碍预测轨迹直接投影成一条线/一个点，碰撞检测只判自车质心是否落在其中。\textbf{现象}：DP 选出的 $s(t)$ 贴着阻挡边缘“恰好不碰”，可视化没穿过去，实车却剐蹭或惊险擦行。\textbf{根本原因}：阻挡区域应是“障碍占据 + 自车半长 + 安全裕度”的闵可夫斯基膨胀，只判点等于把车和障碍都当质点。\textbf{正确做法}：构建 \verb@STBoundary@ 时按自车纵向半长、障碍尺寸、纵向安全时距统一膨胀。\textbf{自检}：可视化时把膨胀后的阻挡和 $s(t)$ 一起画，确认有可见间隙。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：以为 DP-ST 输出的就是最终精确速度曲线]
+\textbf{错误想法}：DP 既然给出了 $s(t)$，直接拿去跟踪就行。\textbf{实际情况}：DP 结果是\emph{网格量化的粗解}，加速度/jerk 都是阶梯状、不平滑，不能直接执行；它的真正职责是（a）定下每个障碍的 yield/overtake 决策，（b）给 \cref{sec:fs-speedqp} 的 QP 提供 warm start 和 ST 上下界。\textbf{正确做法}：DP 定决策 + 给走廊，QP 在走廊内精修出平滑的 $s(t)$。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：把 yield/overtake 当成一个连续的“让多少”问题]
+\textbf{错误想法}：让行和抢行是同一条曲线的连续调节，调个参数就能从让滑到抢。\textbf{实际情况}：从阻挡上方过和从下方过是 ST 平面上两个\emph{互不连通}的可行类（同伦类），中间隔着阻挡区域，没法连续过渡——这是离散决策。\textbf{正确思维}：先认清非凸性来源是这个离散决策，才能理解“为何必须先 DP（选类）再 QP（类内精修）”，而不是指望一个优化器一步到位。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 手写 ST 图构建器 + DP-ST 搜索：给定一条固定路径和 $3$ 个匀速动态障碍（投影成平行四边形/矩形），在网格上做前向 DP，输出粗速度 profile，并可视化它对每个障碍做出的 yield/overtake 决策。
+  \item \textbf{[调试]} 给定允许 $s$ 递减（内层 \verb@sk@ 从 $0$ 开始）的 DP 代码，解释它为何产出“自车沿路径倒退”的荒谬解；再给一个网格过粗、漏掉两障碍间窄缝的例子，分析“分辨率 vs 可行性 vs 计算量”的三方权衡（用 \cref{thm:fs-dp-complexity}）。
+  \item \textbf{[综合]} 给定一个 cut-in 场景：（a）用 \cref{sec:fs-sl} 在 SL 图上规划几何路径；（b）用本节 ST 图 + DP 规划速度；（c）指出在哪一步暴露出 \cref{sec:fs-pvd} 所说的“路径与速度强耦合导致顺序解耦失败”（提示：先定的路径贴近切入车，使速度阶段在 ST 图上\emph{两侧都不可行}）。这正是 \cref{sec:fs-em} 要缓解的问题。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{piecewise-jerk speed QP 与向心折减}
+\label{sec:fs-speedqp}
+
+\paragraph{动机：把 DP 的粗解精修成能执行的平滑速度。}
+\cref{sec:fs-st} 的 DP 已替每个动态障碍做出 yield/overtake 决策、给出一条连通的 ST 走廊 $[s_{\mathrm{lb}}(t),s_{\mathrm{ub}}(t)]$，但 DP 解是网格量化的阶梯状解。本节用一个凸 QP 在这条走廊里把它\emph{精修}成平滑、舒适、动力学可行的速度剖面 $s(t)$。这是\emph{同一台机器换一个维度}：把自变量从弧长 $s$ 换成时间 $t$，状态从横向 $[l,l',l'']$ 换成纵向 $[s,v,a]$，约束来源从“道路 + 障碍横向边界”换成“DP 给的 ST 走廊”。机器一样，物理含义不同。
+
+\paragraph{反面：为什么不直接执行 DP 粗解、也不抛开走廊重新优化。}
+直接执行 DP 粗解，加速度阶跃、jerk 无界，车开起来一顿一顿；抛开 DP 走廊对 $s(t)$ 重新上无约束优化，又掉回 \cref{sec:fs-st} 的非凸陷阱——没有走廊约束，优化器不知道该从障碍上方还是下方过。正确姿势只能是：\emph{继承 DP 的决策与走廊，在凸走廊内做凸 QP 精修}。
+
+\paragraph{决策变量与连续性等式。}
+决策变量为每时间步 $i=0,\dots,N$ 上的 $[s_i,v_i,a_i]$（$v_i=\dot s_i,\ a_i=\ddot s_i$）。设段内 $\dddot s\equiv j_i$（与 \cref{sec:fs-sl} 同构，但对时间 $t$）：
+\begin{align}
+  a_{i+1} &= a_i+j_i\,\Delta t, \label{eq:fs-sp-a}\\
+  v_{i+1} &= v_i+a_i\,\Delta t+\tfrac12 j_i\,\Delta t^2, \label{eq:fs-sp-v}\\
+  s_{i+1} &= s_i+v_i\,\Delta t+\tfrac12 a_i\,\Delta t^2+\tfrac16 j_i\,\Delta t^3. \label{eq:fs-sp-s}
+\end{align}
+由 \cref{eq:fs-sp-a} 解 $j_i=(a_{i+1}-a_i)/\Delta t$ 代回，得只含状态的两条等式约束。
+
+\paragraph{代价函数。}
+\begin{equation}
+  J_{\mathrm{speed}}=w_s\sum_i(s_i-s_{\mathrm{ref},i})^2+w_v\sum_i(v_i-v_{\mathrm{ref},i})^2+w_a\sum_i a_i^2+w_j\sum_i\Big(\frac{a_{i+1}-a_i}{\Delta t}\Big)^2.
+  \label{eq:fs-speed-cost}
+\end{equation}
+逐项：$w_s$ 拉向期望进度，$w_v$ 拉向期望速度（限速/巡航），$w_a$ 抑加速度，$w_j$ 抑 jerk。
+
+\begin{note}
+\textbf{两个 jerk 彻底闭合.}\;
+\cref{eq:fs-speed-cost} 里的 jerk $\frac{a_{i+1}-a_i}{\Delta t}\approx\dddot s=\mathrm{d}^3s/\mathrm{d}t^3$ 是对\emph{时间}的三阶导——\textbf{正是乘客身体感受到的那个 jerk}。请对照 \cref{sec:fs-sl} 的概念误区：那里的 jerk 是 $\mathrm{d}^3l/\mathrm{d}s^3$（路径的空间平滑度），这里才是时间 jerk（乘坐舒适度）。同一套 piecewise-jerk 机器，跑在不同自变量上，调的是完全不同的“舒适”。
+\end{note}
+
+\paragraph{约束与向心折减。}
+ST 走廊（来自 DP）$s_{\mathrm{lb}}(t_i)\le s_i\le s_{\mathrm{ub}}(t_i)$——yield 把上界压低（停在阻挡下方），overtake 把下界抬高（冲到阻挡上方）；单调性 $s_{i+1}\ge s_i$；加速度/jerk 约束 $a_{\min}\le a_i\le a_{\max}$、$|j_i|\le j_{\max}$。\emph{速度上界含向心折减}：
+
+\begin{theorem}[向心加速度对速度上界的折减]\label{thm:fs-centripetal}
+车辆沿曲率为 $\kappa$ 的路径以速度 $v$ 行驶时，横向（向心）加速度为 $a_{\mathrm{lat}}=v^2\kappa$。要其不超 $a_{\mathrm{lat,max}}$，速度须满足 $v\le\sqrt{a_{\mathrm{lat,max}}/|\kappa|}$，故速度上界为
+\begin{equation}
+  v_{\mathrm{limit}}(s)=\min\!\Big(v_{\max},\ \sqrt{a_{\mathrm{lat,max}}/|\kappa(s)|}\Big).
+  \label{eq:fs-vlimit}
+\end{equation}
+\end{theorem}
+\begin{proof}
+质点沿曲率 $\kappa$（曲率半径 $\rho=1/|\kappa|$）的曲线以速率 $v$ 运动，其法向（向心）加速度为 $v^2/\rho=v^2|\kappa|$。令 $v^2|\kappa|\le a_{\mathrm{lat,max}}$ 解出 $v\le\sqrt{a_{\mathrm{lat,max}}/|\kappa|}$，与限速 $v_{\max}$ 取小即 \cref{eq:fs-vlimit}。
+\end{proof}
+\textbf{关键：$\kappa(s)$ 来自 \cref{sec:fs-sl} 已经定死的路径}——弯越急，速度被压得越低。这是 path$\to$speed 的\emph{单向}耦合，是解耦“漏”出来的一条线。代价平方和 $\Rightarrow\mathbf{P}\succeq0$；约束全线性 $\Rightarrow$ 凸 QP。
+
+\paragraph{数值算例：把约束落到具体数字。}
+弯道 $\kappa=0.04$、$a_{\mathrm{lat,max}}=2$、$\Delta t=0.2\,\mathrm{s}$、自车 $v_0=8$、前车 $6\,\mathrm{m/s}$。向心折减：$v_{\mathrm{limit}}^{\mathrm{curve}}=\sqrt{2/0.04}=\sqrt{50}\approx7.07\,\mathrm{m/s}$——哪怕限速是 $12$，进这段弯也不能超 $7.07$，否则 $a_{\mathrm{lat}}=v^2\kappa$ 破 $2$。连续性一行（$\Delta t^2=0.04$，代入 \cref{eq:fs-sp-v,eq:fs-sp-s}）：$v_{i+1}=v_i+0.1(a_i+a_{i+1})$、$s_{i+1}=s_i+0.2v_i+0.0133a_i+0.0067a_{i+1}$（系数来自 $\tfrac12\Delta t=0.1$、$\tfrac13\Delta t^2\approx0.0133$、$\tfrac16\Delta t^2\approx0.0067$）。走廊与速度界叠加：前车 yield 把 $s_{\mathrm{ub}}(t)$ 压在前车后方、把 $v$ 拉向 $6$；向心界把 $v$ 顶在 $7.07$ 以下；本例 $6<7.07\Rightarrow$ 跟车约束更紧，弯道里稳定在约 $6\,\mathrm{m/s}$。\emph{反事实核对}：若没有前车，QP 会想加速到接近限速 $12$，但 $v_{\mathrm{limit}}^{\mathrm{curve}}=7.07$ 这个 box 上界把它截在 $7.07$；再把 $a_{\mathrm{lat,max}}$ 从 $2$ 调到 $4$，$v_{\mathrm{limit}}$ 升到 $\sqrt{100}=10$，过弯就能更快——这条 $v\le\sqrt{a_{\mathrm{lat,max}}/\kappa}$ 正是给整车调“过弯激进度”的旋钮。\pz{存疑：以上数值为源 md 构造的讲解算例，非真实求解输出，仅用于展示因果，数值不必精确核验。}
+
+\paragraph{硬约束不可行时：软化与松弛。}
+实车上走廊偶尔会“无解”——如前车急刹使 $s_{\mathrm{ub}}(t)$ 压得过低、与“起点速度 + 减速度上限”冲突。若全用硬约束，QP 直接报不可行，规划器这一周期哑火，高速上是安全事故。标准做法是把部分约束\emph{软化}：引入非负松弛变量 $\xi_i\ge0$，把硬约束 $s_i\le s_{\mathrm{ub}}(t_i)$ 改写成
+\begin{equation}
+  s_i\le s_{\mathrm{ub}}(t_i)+\xi_i,\qquad\xi_i\ge0,
+  \label{eq:fs-slack}
+\end{equation}
+并在代价里加大权重惩罚 $w_\xi\sum_i\xi_i^2$（$w_\xi$ 取得很大）。这样：能满足时 $\xi=0$（与硬约束等价），实在满足不了时也给出“尽量少越界”的解，规划器永远有输出，下游控制不会断流。\textbf{哪些该软、哪些必须硬？}经验法则：\emph{安全相关}约束（碰撞边界、速度上限）尽量硬、或用很大的 $w_\xi$ 重罚软化；\emph{舒适/偏好}相关的（贴近期望速度/参考线）本就以代价项形式存在、天然是软的。把碰撞约束随手软化会埋安全隐患，把舒适约束做成硬约束又会频繁不可行——分清这条边界，是把规划器从“demo 能跑”推进到“实车不哑火”的关键。
+
+\begin{insight}
+speed QP 之所以“温顺”，是因为 \cref{sec:fs-st} 的 DP 已经吞掉了非凸的 yield/overtake 决策，留给 QP 的 $[s_{\mathrm{lb}},s_{\mathrm{ub}}]$ 走廊是\emph{连通的凸区域}。两段式分工的全部回报在这里兑现：\textbf{DP 吞非凸（选类），QP 独享凸性（精修）}。硬要把两段合成一段，要么丢掉决策能力（纯 QP 不会自己选边），要么丢掉凸性与速度（纯非凸搜索又慢又易陷局部最优）。这与 \cref{ch:planning} 的级联范式“全局搜索/采样 + 安全走廊 + 局部优化”一脉相承。
+\end{insight}
+
+\begin{note}
+\textbf{与 MPC 的关系（多视角）.}\;
+若学过模型预测控制（MPC），会发现这里的 speed QP 就是一个\emph{单步 MPC 问题}——状态 $[s,v,a]$、控制量 jerk、有限时域、软硬约束混合、滚动求解。整条规控本质上是“每个周期解一个带约束的最优控制问题”，piecewise-jerk QP 只是它在速度维度的具体实例。\emph{像}：都是有限时域带约束最优控制；\emph{不像}：这里目标二次、约束线性（凸 QP），而一般 MPC 的模型可非线性。
+\end{note}
+
+\paragraph{代码：向心折减的速度上界。}
+\begin{codebox}[C++]{speed QP 的连续性行 + 向心折减速度上界（教学实现）}
+// decision layout: per step [s_i, v_i, a_i]
+inline int IdxS(int i){ return 3 * i + 0; }
+inline int IdxV(int i){ return 3 * i + 1; }
+inline int IdxA(int i){ return 3 * i + 2; }
+
+// one continuity equality (s relation after eliminating jerk, cubic integration over t):
+//   s_{i+1} - s_i - v_i*dt - 1/2*a_i*dt^2 - 1/6*(a_{i+1}-a_i)*dt^2 = 0
+void AddSContinuityRow(SparseTriplets* A, int row, int i, double dt){
+  const double dt2 = dt * dt;
+  A->emplace_back(row, IdxS(i + 1),  1.0);
+  A->emplace_back(row, IdxS(i),     -1.0);
+  A->emplace_back(row, IdxV(i),     -dt);
+  A->emplace_back(row, IdxA(i),     -0.5 * dt2 + dt2 / 6.0);   // merged a_i coeff
+  A->emplace_back(row, IdxA(i + 1), -dt2 / 6.0);               // a_{i+1} (from jerk)
+}
+
+// centripetal limit -> speed upper bound: a_lat = v^2 * kappa <= a_lat_max
+//   => v <= sqrt(a_lat_max / |kappa|).  kappa comes from the FIXED path (path->speed coupling)
+double SpeedLimitAt(double kappa_at_s, double a_lat_max, double v_max){
+  if (std::abs(kappa_at_s) < 1e-6) return v_max;              // near-straight: no reduction
+  return std::min(v_max, std::sqrt(a_lat_max / std::abs(kappa_at_s)));
+}
+// v_ub[i] = SpeedLimitAt(kappa(s_i)) as box upper bound. Here s_i is a decision variable,
+// so kappa is pre-evaluated at the DP-estimated s_i: a LINEAR QP approximation of the
+// curvature-speed coupling (exact handling needs a nonlinear optimizer).
+\end{codebox}
+三类错误最常见：把 DP 的离散 $s$ 当\emph{硬等式}（\verb@s_lb[i]=s_ub[i]=dp_s[i]@）要求 QP 逐点复现——DP 多粗、精修后就多粗，甚至不可行；忘了向心折减、速度只用 $v_{\max}$ 限——自车以限速冲进急弯、横向加速度爆表；把加速度 $a$ 当“控制”、不建模也不惩罚 jerk——相邻步加速度可阶跃、jerk 无界、顿挫。
+
+\begin{pitfall}[编程陷阱：把 DP 的离散 $s$ 当硬等式约束喂给 QP]
+\textbf{错误做法}：令 $s_{\mathrm{lb}}[i]=s_{\mathrm{ub}}[i]=$ DP 解的 $s_i$，要求 QP 精确复现 DP 轨迹。\textbf{现象}：QP 频繁报不可行（DP 阶梯解本就违反 jerk/连续性约束），或即便可行也输出和 DP 一样的阶梯状——精修完全失效。\textbf{根本原因}：DP 给的是“决策 + 走廊”，不是要逐点复现的轨迹；把走廊压成一条线，等于扔掉 QP 的全部精修自由度。\textbf{正确做法}：用 $[s_{\mathrm{lb}},s_{\mathrm{ub}}]$ \emph{区间}做 box 约束 + 用 DP 解做 warm start。\textbf{自检}：精修后加速度/jerk 应明显比 DP 解平滑。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：以为速度只受 $v_{\max}$ 限制，忘了向心折减]
+\textbf{错误想法}：速度上界就是限速 $v_{\max}$，弯道直道一个样。\textbf{实际情况}：弯道处必须满足 $v\le\sqrt{a_{\mathrm{lat,max}}/|\kappa(s)|}$（\cref{thm:fs-centripetal}），否则横向加速度超限——车会甩、乘客会被甩；曲率越大、上限越低。漏了这一项，规划器会让车以限速冲进急弯，仿真里看着达标、实车直接失稳。\textbf{正确做法}：按已定路径的曲率剖面逐点折减 $v_{\mathrm{limit}}(s)$，或用非线性优化器精确处理耦合。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：以为到了速度阶段就和路径彻底无关、解耦无害]
+\textbf{错误想法}：路径定完就翻篇了，速度规划是独立的一维问题。\textbf{实际情况}：速度上界 $v_{\mathrm{limit}}$ 由 \cref{sec:fs-sl} 的路径曲率 $\kappa$ 决定（path$\to$speed 单向耦合）；更彻底的耦合是\emph{双向}的——现实里有时“把路径修直一点就能开快一点”才是全局最优，但纯 PVD 的顺序结构无法让速度反过来改路径。\textbf{正确思维}：解耦不是无害的，它默认了“路径不该为速度让步”。看到 $v_{\mathrm{limit}}$ 依赖 $\kappa$，你就摸到了解耦的边界——这道裂缝正是 \cref{sec:fs-em} 要缝合的地方。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 实现 piecewise-jerk speed QP：输入 \cref{sec:fs-st} DP 给的走廊 $[s_{\mathrm{lb}},s_{\mathrm{ub}}]$、起点 $[s_0,v_0,a_0]$、按路径曲率折减的 $v_{\mathrm{limit}}$，求 $s(t)/v(t)/a(t)$。做两组对比：（a）开/关 jerk 项时加速度的平滑度；（b）有/无向心折减时的过弯速度。
+  \item \textbf{[调试]} 给定把 DP 的 $s$ 当硬等式约束的代码，解释它为何经常报不可行或输出阶梯状；改成走廊区间约束 + warm start，说明精修后应观察到什么变化。
+  \item \textbf{[推导]} 从 $a_{\mathrm{lat}}=v^2\kappa$ 推导 \cref{eq:fs-vlimit}。讨论：这个上界依赖路径曲率、属 path$\to$speed 单向耦合；若允许“为了开得更快而把路径修直”（双向耦合），纯 PVD 的顺序结构还能处理吗？这把你引向 \cref{sec:fs-em}。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{EM 迭代：解耦中的“准联合”}
+\label{sec:fs-em}
+
+\paragraph{动机：在不放弃凸子问题的前提下，缝合解耦的裂缝。}
+回顾这一章的因果链：\cref{sec:fs-pvd} 指出强耦合场景解耦会失败；\cref{sec:fs-st} 的 cut-in 练习里先定的路径让速度在 ST 图上\emph{两侧都不可行}；\cref{sec:fs-speedqp} 末点明 $v_{\mathrm{limit}}$ 对路径曲率的依赖只是单向耦合，真正的双向耦合解耦给不了。EM 迭代回答的是：\textbf{能不能不上重武器（时空联合），只靠多跑几轮解耦，就把大部分耦合补回来？}
+
+\paragraph{反面：纯一次性解耦 vs.\ 直接时空联合。}
+纯一次性 path$\to$speed 在强耦合场景输出次优甚至不可行；直接上时空联合能拿到联合最优，但要解非凸问题、计算更重、工程更复杂，对弱到中等耦合的绝大多数场景是杀鸡用牛刀。EM 迭代正是这两者之间的中间档：仍解凸子问题（快、稳），但靠交替迭代逼近联合。
+
+\paragraph{历史与命名辨析。}
+Apollo EM Planner\cite{fan2018baidu} 的 “EM” 借喻自统计学的期望最大化（expectation--maximization）算法——用 E-step/M-step 交替来描述“路径估计 $\leftrightarrow$ 速度估计”的轮流优化。
+
+\begin{note}
+\textbf{“EM”是借喻，不是统计 EM（一个常见误解的预防）.}\;
+统计 EM 在 E-step 求隐变量的期望、M-step 最大化期望似然；这里没有隐变量、没有概率期望，是\emph{确定性的交替优化}。下文会看到它的真名是“块坐标下降”。\cite{fan2018baidu} 用 EM 这个名字，是因为它的交替结构形似 EM，而非数学等价。
+\end{note}
+
+\paragraph{理论：E-step/M-step 与收敛性。}
+迭代结构：\textbf{E-step}（用上一轮速度 profile，估计动态障碍在 SL 图上的准静态投影，做 \cref{sec:fs-sl} 的路径 DP+QP，得新路径）；\textbf{M-step}（用新路径更新 ST 图中障碍投影，做 \cref{sec:fs-st}+\cref{sec:fs-speedqp} 的速度 DP+QP，得新速度）；重复 $2$--$3$ 轮。给两个互补视角，这是理解 EM 性质的关键：
+
+\emph{优化视角（它的真名）}——EM 迭代就是\textbf{块坐标下降}（block coordinate descent）：把联合决策变量分成“路径块”与“速度块”，轮流固定一块、优化另一块。坐标下降的经典性质直接套用：每步在各自凸子问题内求最优 $\Rightarrow$ 总代价\emph{单调不增}；收敛到一个\emph{坐标驻点}（沿任一坐标方向都无法再降）；但在非凸的联合问题上\emph{不保证全局最优}。\emph{概率视角（命名来源）}——形似统计 EM 的 E/M 交替，\emph{像}在“固定一部分、优化另一部分”，\emph{不像}在这里没有 E-step 的概率期望。别把统计 EM 的收敛理论硬套过来。
+
+\begin{theorem}[块坐标下降的单调不增]\label{thm:fs-bcd}
+记联合代价 $J(\mathrm{path},\mathrm{speed})$。每个 E-step 与 M-step 都在各自凸子问题内取到最优，故
+\begin{equation}
+  J(\mathrm{path}^{(k+1)},\mathrm{speed}^{(k)})\le J(\mathrm{path}^{(k)},\mathrm{speed}^{(k)}),\quad
+  J(\mathrm{path}^{(k+1)},\mathrm{speed}^{(k+1)})\le J(\mathrm{path}^{(k+1)},\mathrm{speed}^{(k)}).
+  \label{eq:fs-monotone}
+\end{equation}
+总代价沿迭代\emph{单调不增}；又因代价有下界，单调有界数列必收敛。但收敛到的是\emph{坐标驻点}，联合可行域非凸时不等于全局最优。
+\end{theorem}
+
+\paragraph{为什么单调不增却不保证全局：一个二维直觉。}
+设最小化联合变量 $(p,q)$ 的代价 $J(p,q)$（$p$ 代表路径决策，$q$ 代表速度决策）。坐标下降轮流做：固定 $q$ 优化 $p$（E-step）、固定 $p$ 优化 $q$（M-step）。\emph{为什么单调不增}——每步都是“在另一坐标固定下取最小”，$J$ 只会降或不变，一连串“只降不升”叠起来自然单调不增（即 \cref{eq:fs-monotone}）。\emph{为什么不保证全局}——坐标下降每步只沿\emph{坐标轴方向}（纯 $p$ 或纯 $q$）移动。想象 $J$ 的等高线是沿 $45^\circ$ 拉长的“斜山谷”：从谷壁某点出发，沿 $p$ 轴走到该行最低、再沿 $q$ 轴走到该列最低……你会在谷壁上走出一串越来越小的台阶，收敛到谷壁上某点——但那点沿斜对角（同时改 $p$ 和 $q$）还能继续下降。“坐标方向都改不动”不等于“真到了谷底”。搬回规划：$(p,q)$ 的“斜山谷”对应路径与速度的\emph{强耦合}——最优改进需要同时动路径和速度，而 EM 一次只能动一个，于是停在次优坐标驻点；耦合越强（山谷越斜），停得越早、离全局越远。
+
+\paragraph{震荡是怎么发生的。}
+上面是“卡住不动”，更糟的是“反复横跳”。当存在两个相互竞争的局部解（“绕左 + 减速” vs “绕右 + 加速”），E-step 把路径推向左、M-step 发现左路径下该减速、下一轮 E-step 又因这个减速觉得右更好……$(p,q)$ 在两个吸引盆之间来回跳，$2$--$3$ 轮预算内不收敛。这正是必须\emph{硬限轮数}的原因，也是“该转时空联合”的最直接信号。
+
+\paragraph{一个两轮 EM 的数值轨迹（弱 vs 强耦合）。}
+把上面的文字变成你能在日志里认出的形状（下面的联合代价是\emph{示意数值}，重点看趋势）。\emph{弱耦合}（绕抛锚车 + 跟前车，两者几乎不牵制）：轮 0 速度取巡航初值，E-step 出路径（向右让 $0.6\,\mathrm{m}$），M-step 出速度（跟车降到 $6$），联合代价约 $100$；轮 1 E-step 用新速度重算路径几乎不变、M-step 速度也几乎不变，联合代价约 $99$，降幅已小于阈值 $\to$ 早停，\textbf{两轮收敛}。\emph{强耦合}（cut-in，前车正切入自车道）：轮 0 E-step 路径仍走原车道（切入车此刻还偏）、M-step 速度发现前方将被占而急减，联合代价约 $200$；轮 1 E-step 用“急减”的速度重算、发现可更早右避让出空间 $\to$ 路径右移、M-step 速度因路径让开而不必那么急减，联合代价约 $150$；轮 2 E-step 又因“不必急减”觉得右移过头想收回……联合代价约 $155$（\textbf{回升了}），在两个解之间震荡。\textbf{判据落地}：联合代价单调下降且降幅逐轮收窄 $\to$ 收敛（取最后一轮）；出现回升或降幅不收窄 $\to$ 震荡（强耦合），硬限轮数后取迄今最优解，并打上“建议时空联合”的标记。\pz{存疑：上述联合代价数值（100/99/200/150/155）为源 md 构造的示意值，非真实求解输出，仅用于展示趋势。}
+
+\begin{insight}
+EM 迭代不是“把解耦变成联合”，而是“\textbf{用多轮解耦逼近联合}”。它换来的是：每轮仍解凸子问题（快、稳、有全局最优）；代价是整体只收敛到坐标驻点，且耦合很强时，$2$--$3$ 轮的实时预算内可能来不及收敛、甚至在两个局部解之间震荡。它是“解耦的可解性”与“联合的最优性”之间的一个\emph{中间档位}，不是免费的联合替代品。把它认成交替优化家族里“最轻量的一档”（更讲究的有 ADMM，在分块之上引入对偶变量与一致性约束、能处理子问题间的耦合约束），它的长处（实现简单、每轮只解一个凸子问题）和短板（只在原始变量上交替、对强耦合无能为力）就都有了出处。
+\end{insight}
+
+\paragraph{代码：EM 外循环。}
+\begin{codebox}[C++]{EM 外循环:交替优化路径(E-step)与速度(M-step)，硬限轮数 + 联合代价早停}
+PlanningResult EmPlan(const ReferenceLine& ref, const std::vector<Obstacle>& obs,
+                      int max_iter = 3, double cost_eps = 1e-2) {
+  SpeedData speed = WarmStartSpeed(ref);   // init: previous cycle's speed or simple cruise
+  PathData  path;
+  double prev_cost = std::numeric_limits<double>::infinity();
+
+  for (int k = 0; k < max_iter; ++k) {     // MUST hard-cap iters: real-time budget + anti-oscillation
+    // E-step: estimate dynamic-obstacle projection using current speed -> SL path DP+QP
+    path  = PlanPathInSL(ref, ProjectObstacles(obs, speed));
+    // M-step: update ST projection using new path -> ST speed DP + QP
+    speed = PlanSpeedInST(path, ProjectObstacles(obs, path));
+
+    const double cost = JointCost(path, speed);   // evaluate on the JOINT cost
+    if (prev_cost - cost < cost_eps) break;       // cost barely drops -> early stop (near stationary)
+    prev_cost = cost;
+  }
+  return {path.points(), speed.points()};
+}
+\end{codebox}
+三类错误最常见：不限迭代轮数、用 \verb@while (!converged)@ 等收敛——强耦合下 E/M 在两个局部解间震荡、死循环、规划超时；不在\emph{联合}代价上评估早停（只看子问题代价）——path 块降了但 speed 块升了、总代价没降甚至升却误判“收敛”；每轮把 warm start 清零——每个 E/M 都冷启动、QP 迭代翻倍、$2$--$3$ 轮预算跑不完。
+
+\begin{table}[H]\centering\small
+\caption{三档求解方案（由轻到重）}
+\label{tab:fs-three-tier}
+\begin{tabular}{lllll}
+\toprule
+方案 & 最优性 & 实时性 & 收敛保证 & 适用耦合强度 \\
+\midrule
+一次性解耦（path$\to$speed） & 最低 & 最快 & 无迭代 & 弱耦合 \\
+EM 迭代（$2$--$3$ 轮） & 中（坐标驻点） & 快 & 总代价单调不增、不保证全局 & 弱$\sim$中等 \\
+时空联合 & 最高（联合最优） & 最重 & 视方法（非凸，可能局部最优） & 强耦合 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[编程陷阱：EM 外循环不限轮数，“等收敛再停”]
+\textbf{错误做法}：用 \verb@while (!converged)@ 跑到收敛为止。\textbf{现象}：强耦合（cut-in）场景里 E/M 在两个局部解之间震荡，循环永不退出 $\to$ 规划周期超时，控制断流，车失控。\textbf{根本原因}：坐标下降在非凸联合问题上\emph{不保证收敛到单点}（\cref{thm:fs-bcd}）；实时系统不能把“是否收敛”当循环条件。\textbf{正确做法}：硬限 $2$--$3$ 轮 + 在联合代价上设早停阈值。\textbf{自检}：日志记录每轮联合代价，确认单调不增且轮数受控。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：把 “EM” 当成统计学的 EM 算法]
+\textbf{错误想法}：套用 EM 算法的隐变量、期望步、似然单调上升等理论来分析它。\textbf{实际情况}：这里的 EM 是\emph{借喻}——确定性的块坐标下降，没有隐变量、没有 E-step 期望；该套用的是坐标下降理论（单调下降、坐标驻点），不是统计 EM 理论。用错理论框架会得出错误的收敛性预期（误以为它像统计 EM 那样有良好收敛保证）。
+\end{pitfall}
+
+\begin{pitfall}[思维陷阱：以为 EM 迭代等价于时空联合，跑几轮就能拿到联合最优]
+\textbf{错误想法}：EM 迭代会收敛到和联合优化一样的解，所以不需要时空联合。\textbf{实际情况}：EM 是坐标下降，强耦合下会停在次优坐标驻点、甚至震荡；它\emph{逼近}联合，不\emph{等于}联合。\textbf{正确思维}：EM 是中间档——弱到中等耦合够用，强耦合必须上时空联合。判据：若 $2$--$3$ 轮内联合代价仍明显下降或在震荡，说明耦合超出了 EM 的能力范围。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[实现]} 在 \cref{sec:fs-sl} 的路径 + \cref{sec:fs-st}/\cref{sec:fs-speedqp} 的速度之上，加一层 $2$--$3$ 轮的 EM 外循环；每轮记录联合代价，用一个弱耦合场景验证它\emph{单调不增}，并观察通常两轮即近收敛。
+  \item \textbf{[设计/分析]} 构造一个强耦合场景（如 cut-in），观察 EM 在 $2$--$3$ 轮内是收敛还是震荡；给出“何时该放弃 EM、转向时空联合”的可操作判据（提示：联合代价的轮间下降量/是否在两个解间来回跳）。
+  \item \textbf{[理论]} 论证 \cref{thm:fs-bcd}：为什么块坐标下降在每个凸子问题上能保证总代价单调不增，却在非凸联合可行域上不保证全局最优？用一个二维非凸等高线 + 坐标轮换搜索停在“轴向都改不动但斜向还能降”的反例说明。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{完整管线：从参考线到时空轨迹}
+\label{sec:fs-pipeline}
+
+前六节把零件一个个讲清楚了，但“零件会用”不等于“整机会跑”。本节用一个带具体数字的场景，把整条数据流走一遍——这也是检验“是否真的连起来了”的试金石。
+
+\paragraph{场景设定（带数字，便于追踪）。}
+\emph{道路}：参考线前 $40\,\mathrm{m}$ 直、后段左转弯（半径 $R=25\,\mathrm{m}$，即 $\kappa=0.04\,\mathrm{m}^{-1}$），车道宽 $3.5\,\mathrm{m}$，横向偏移 $l$ 左正右负。\emph{自车}：起点 $s_0=0,l_0=0,v_0=8\,\mathrm{m/s},a_0=0$，限速 $v_{\max}=12$，$a\in[-3,2]$，$j_{\max}=4$，$a_{\mathrm{lat,max}}=2$。\emph{静态障碍}：左侧抛锚车，占 $l\in[1.0,2.0]$、$s\in[15,25]$。\emph{动态障碍}：同车道前车，$t=0$ 在 $s=30$、匀速 $6\,\mathrm{m/s}$。\pz{存疑：本场景全部数值为讲解构造、非真实求解输出，目的是让每步因果可见可量。}
+
+\paragraph{Step 0：参考线平滑。}
+地图给的车道中心线通常是带噪、曲率不连续的离散采样点。直接拿它当参考线，会让所有下游 Frenet 量（尤其 $l',\kappa$）抖动、把 QP 喂成病态（\cref{sec:fs-frenet} 思维陷阱）。所以管线第 0 步是参考线平滑——决策变量是每个参考点的微调量 $\delta_i$，代价为
+\begin{equation}
+  \min_{\{\delta\}}\ w_{\mathrm{ref}}\sum_i\|\delta_i\|^2+w_{\mathrm{smooth}}\sum_i\|\mathbf{p}_{i-1}-2\mathbf{p}_i+\mathbf{p}_{i+1}\|^2,
+  \label{eq:fs-refsmooth}
+\end{equation}
+第一项把点拉回原始位置（别改太多），第二项（二阶差分）压平曲率突变。这又是一个凸 QP，输出一条曲率连续的参考线。本场景平滑后 $\kappa(s)\approx0$（$s<38$）$\to$ 在 $s\in[38,42]$ 平滑过渡 $\to\kappa\approx0.04$（$s\ge42$）：平滑把“直道突变到弯道”抹成一段过渡，避免 $\kappa$ 阶跃。
+
+\begin{insight}
+本章一路走来你会发现：参考线平滑（\cref{eq:fs-refsmooth}）、SL 路径（\cref{eq:fs-path-cost}）、ST 速度（\cref{eq:fs-speed-cost}），本质都是同一类\textbf{“平方和代价 + 线性约束”的凸 QP}。这种“到处都是凸 QP”的体感，本身就是这条技术路线的特征——也正是 PVD 解耦带来的红利：把一个高维非凸问题，化成一串各自温顺的凸 QP。
+\end{insight}
+
+\paragraph{Step 1：Frenet 投影（\cref{sec:fs-frenet}）。}
+把自车与两障碍投影到 $(s,l)$：自车起点 $(0,0)$；抛锚车（静态）$s\in[15,25]$、$l\in[1.0,2.0]$，投到 SL 图当横向阻挡；前车（动态，$t{=}0$）$s\approx30$、$l\approx0$，随 $t$ 在 ST 图里上移。检查退化（\cref{thm:fs-degeneracy}）：弯道段 $\kappa l$ 在 $l$ 不超 $1\,\mathrm{m}$ 时约 $0.04$，远小于 $0.3$ 阈值 $\to$ Frenet 在本场景安全可用。
+
+\paragraph{Step 2：SL 图 + 路径 QP（\cref{sec:fs-sl}）。}
+抛锚车占左侧 $l\in[1.0,2.0]$，把 $s\in[15,25]$ 段的横向上界压低，路径 QP 在 box 约束 + 连续性等式 + 平滑代价下求 $l(s)$：自车从 $l=0$ 平滑右移、绕过抛锚车、再回中心线，整条 $l(s)$ 是一条满足曲率界 \cref{eq:fs-ddl-bound} 的小“右凸”。
+
+\paragraph{Step 3：ST 图 + DP（\cref{sec:fs-st}）。}
+路径定死后，前车预测投影成 ST 平面一条以 $6\,\mathrm{m/s}$ 向上平移的斜带。前向 DP 在 ST 网格上做 yield/overtake 决策：因前车较慢，DP 选 yield（贴斜带下沿），输出走廊 $[s_{\mathrm{lb}}(t),s_{\mathrm{ub}}(t)]$ 与一条粗速度 profile（warm start）。
+
+\paragraph{Step 4：speed QP（\cref{sec:fs-speedqp}）。}
+在 DP 走廊内精修：向心折减把弯道段速度上界压到 $v_{\mathrm{limit}}^{\mathrm{curve}}=\sqrt{2/0.04}\approx7.07\,\mathrm{m/s}$，前车 yield 把速度拉向 $6$；本例 $6<7.07\Rightarrow$ 跟车更紧，弯道里稳定约 $6\,\mathrm{m/s}$；jerk 项把 DP 的“$8\to6$ 阶跃”摊到若干 $\Delta t$ 上，得平滑刹车。
+
+\paragraph{Step 5：EM 迭代（\cref{sec:fs-em}）。}
+本场景抛锚车与前车几乎不牵制，属弱耦合：EM 两轮即近收敛，联合代价单调微降，取最后一轮即可。若把前车换成正切入自车道的 cut-in 车，路径与速度强耦合，EM 会震荡、需硬限轮数并触发“建议时空联合”。
+
+\begin{table}[H]\centering\small
+\caption{完整管线数据流（每步的输入、输出与所在小节）}
+\label{tab:fs-pipeline}
+\begin{tabular}{llll}
+\toprule
+步骤 & 输入 & 输出 & 小节 \\
+\midrule
+0 参考线平滑 & 地图离散点 & 曲率连续参考线 & \cref{eq:fs-refsmooth} \\
+1 Frenet 投影 & 自车 + 障碍笛卡尔位姿 & $(s,l)$ 与退化检查 & \cref{sec:fs-frenet} \\
+2 SL 路径 QP & 静态障碍横向边界 + 起点 & 几何路径 $l(s)$ & \cref{sec:fs-sl} \\
+3 ST DP & 固定路径 + 动态障碍预测 & yield/overtake 决策 + 走廊 & \cref{sec:fs-st} \\
+4 speed QP & ST 走廊 + 向心折减 $v_{\mathrm{limit}}$ & 平滑速度 $s(t)$ & \cref{sec:fs-speedqp} \\
+5 EM 外循环 & 路径块 + 速度块 & 准联合时空轨迹 & \cref{sec:fs-em} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\begin{enumerate}
+  \item \textbf{“解耦 = 两步各算一次、互不影响”}——“解耦”是建模假设而非物理事实；强耦合（cut-in）下顺序求解会落进次优/不可行（\cref{sec:fs-pvd} 误区、\cref{thm:fs-bcd}）。
+  \item \textbf{“降维 = 近似 = 一定更差”}——弱耦合时两个凸子问题各取全局最优、合起来优于卡在局部最优的非凸联合解（\cref{sec:fs-pvd}）。
+  \item \textbf{“Frenet 处处一一对应”}——仅在 $|\kappa_r l|<1$ 时成立；大曲率 + 大偏移退化、$\dot s$ 爆炸（\cref{thm:fs-degeneracy}）。
+  \item \textbf{“参考线随便给一条就行”}——参考线不光滑会让 $l',\kappa_r$ 抖动、把 QP 喂成病态；必须先平滑（\cref{eq:fs-refsmooth}）。
+  \item \textbf{“路径 QP 的 jerk = 乘客感受的 jerk”}——前者是 $\mathrm{d}^3l/\mathrm{d}s^3$（空间平滑），后者是 $\mathrm{d}^3s/\mathrm{d}t^3$（时间舒适，\cref{sec:fs-speedqp}）。
+  \item \textbf{“speed QP 里 $a^\kappa_{\max}$ 是加速度”}——名字带“acc”但量纲是曲率 $1/\mathrm{m}$（\cref{eq:fs-ddl-bound}）。
+  \item \textbf{“DP-ST 输出就是最终速度”}——DP 给的是离散决策 + 凸走廊，须经 QP 精修才平滑可执行（\cref{sec:fs-st}）。
+  \item \textbf{“yield/overtake 是连续的‘让多少’”}——是两个互不连通的同伦类、离散决策，非凸根源（\cref{sec:fs-st}）。
+  \item \textbf{“速度只受 $v_{\max}$ 限”}——弯道须满足向心折减 $v\le\sqrt{a_{\mathrm{lat,max}}/|\kappa|}$（\cref{thm:fs-centripetal}）。
+  \item \textbf{“Apollo 的 EM = 统计 EM”}——是借喻、本质是块坐标下降；该用坐标下降理论而非统计 EM 理论（\cref{sec:fs-em}）。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\label{tab:fs-symbols}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$s,\ l$ & 纵向弧长（station）/ 横向偏移（左正右负） & \cref{def:fs-frenet} \\
+$(\cdot)',\ (\dot{\cdot})$ & 对弧长 $s$ 求导 / 对时间 $t$ 求导 & \cref{eq:fs-lprime,eq:fs-sdot} \\
+$\theta_r,\ \kappa_r$ & 投影点处参考线切向朝向、曲率 & \cref{thm:fs-forward,eq:fs-sdot} \\
+$\theta,\ v$ & 车辆朝向、车速 & \cref{eq:fs-sdot} \\
+$\kappa_{\mathrm{path}}$ & 车辆实际路径曲率（$\approx\kappa_r+l''$） & \cref{eq:fs-kappa-path} \\
+$a,\ j$ & 纵向加速度、jerk（$\mathrm{d}^3s/\mathrm{d}t^3$） & \cref{eq:fs-speed-cost} \\
+$a_{\mathrm{lat,max}},\ v_{\mathrm{limit}}$ & 横向加速度上限、含向心折减的速度上界 & \cref{eq:fs-vlimit} \\
+$a^\kappa_{\max}$ & 车辆最大曲率（转向极限，量纲 $1/\mathrm{m}$） & \cref{eq:fs-ddl-bound} \\
+$s_{\mathrm{lb}}(t),\ s_{\mathrm{ub}}(t)$ & ST 走廊下/上界（来自 DP 决策） & \cref{eq:fs-dp-bellman} \\
+$\Delta s,\ \Delta t$ & 路径/速度问题的离散步长 & \cref{eq:fs-jerk-ddl,eq:fs-sp-a} \\
+$N,\ N_t,\ N_s$ & station 数 / ST 时间层数 / $s$ 方向格数 & \cref{thm:fs-dp-complexity} \\
+$w_\bullet$ & 各代价项权重（$w_l,w_{l''},w_j,\dots$） & \cref{eq:fs-path-cost} \\
+$\mathcal{O}_{\mathrm{static}},\ \mathcal{O}_{\mathrm{dynamic}}$ & 静态/动态障碍集合 & \cref{eq:fs-ppp,eq:fs-vpp} \\
+$\xi_i$ & 软约束的松弛变量 & \cref{eq:fs-slack} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{定理与公式速查表}
+\label{tab:fs-quickref}
+\begin{tabular}{lll}
+\toprule
+定理 / 公式 & 一句话说明 & 对应 \\
+\midrule
+PVD 拆解 \cref{eq:fs-ppp,eq:fs-vpp} & $5N$ 维非凸 $\to$ 两个低维凸子问题 & \cref{sec:fs-pvd} \\
+Frenet 正变换 \cref{eq:fs-forward} & 沿单位法向 $(-\sin\theta_r,\cos\theta_r)$ 偏移 $l$ & \cref{thm:fs-forward} \\
+纵向进度速率 \cref{eq:fs-sdot} & $\dot s=v\cos(\theta-\theta_r)/(1-\kappa_r l)$ & \cref{eq:fs-tangnorm} \\
+路径曲率近似 \cref{eq:fs-kappa-path} & $\kappa_{\mathrm{path}}\approx\kappa_r+l''$（小偏差） & \cref{thm:fs-kappa-path} \\
+坐标退化 \cref{eq:fs-usable} & $\kappa_r l\to1$ 时奇异；可用区 $|\kappa_r l|<1$ & \cref{thm:fs-degeneracy} \\
+路径 QP 代价 \cref{eq:fs-path-cost} & 平方和 $\Rightarrow$ 凸；稀疏带状（三对角 \cref{eq:fs-tridiag}） & \cref{sec:fs-sl} \\
+$l''$ 曲率界 \cref{eq:fs-ddl-bound} & 减去 $\kappa_r$：扣掉参考线自占曲率 & \cref{thm:fs-kappa-path} \\
+DP-ST 递推 \cref{eq:fs-dp-bellman} & Bellman 在 ST DAG 上前向递推 & \cref{thm:plan-bellman} \\
+向心折减 \cref{eq:fs-vlimit} & $v\le\sqrt{a_{\mathrm{lat,max}}/|\kappa|}$；path$\to$speed 单向耦合 & \cref{thm:fs-centripetal} \\
+软约束松弛 \cref{eq:fs-slack} & $\xi\ge0$ 重罚：不可行时也不哑火 & \cref{sec:fs-speedqp} \\
+EM 单调不增 \cref{eq:fs-monotone} & 块坐标下降；坐标驻点 $\ne$ 全局最优 & \cref{thm:fs-bcd} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\label{tab:fs-knowledge}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 路径-速度解耦（PVD） & 高维 $\times$ 非凸 $\to$ 两个低维凸；解耦是假设 & \(\bigstar\bigstar\) \\
+2 & Frenet 坐标与正逆变换 & 沿法向偏移 $l$；投影正交条件求 $s$ & \(\bigstar\bigstar\) \\
+3 & 纵向速率与退化 & $\dot s$ 的分母 $1-\kappa_r l$；$\kappa_r l\to1$ 奇异 & \(\bigstar\bigstar\bigstar\) \\
+4 & SL 图 + 路径 QP & piecewise-jerk、稀疏带状、$l''$ 界减 $\kappa_r$ & \(\bigstar\bigstar\bigstar\) \\
+5 & ST 图 + DP 搜索 & yield/overtake 是离散同伦决策；Bellman & \(\bigstar\bigstar\bigstar\) \\
+6 & speed QP 与向心折减 & $v\le\sqrt{a_{\mathrm{lat,max}}/|\kappa|}$；软约束松弛 & \(\bigstar\bigstar\bigstar\) \\
+7 & EM 迭代 & 块坐标下降；单调不增、不保证全局、会震荡 & \(\bigstar\bigstar\bigstar\) \\
+8 & 完整管线 & 参考线平滑$\to$Frenet$\to$SL$\to$ST$\to$speed$\to$EM & \(\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{PVD 奠基}：Kant \& Zucker《Toward Efficient Trajectory Planning: The Path-Velocity Decomposition》\cite{kant1986toward}——TPP$\Rightarrow$PPP+VPP 的原始构造，以及把速度规划放进 path-time 空间做图搜索（本章 ST 图的四十年源头）。
+  \item \textbf{Frenet 末端状态采样}：Werling 等《Optimal Trajectory Generation for Dynamic Street Scenarios in a Frenét Frame》\cite{werling2010frenet}——把 Frenet 标架系统用于自动驾驶轨迹生成的奠基工作；期刊扩展见 \cite{werling2012optimal}（注意与前者是两篇不同论文）。
+  \item \textbf{工业管线}：Fan 等《Baidu Apollo EM Motion Planner》\cite{fan2018baidu}——SL+ST 图、DP+QP 两阶段、E-step/M-step 迭代的工业落地（本章 \cref{sec:fs-sl,sec:fs-st,sec:fs-em} 的主要来源）。
+  \item \textbf{QP 求解器}：Stellato 等《OSQP: An Operator Splitting Solver for Quadratic Programs》\cite{stellato2020osqp}——本章所有凸 QP 的典型求解器（ADMM 一阶法、利用稀疏性、可嵌入式部署）。
+  \item \textbf{本书内承接}：构型空间与基本规划问题见 \cref{sec:plan-cspace}；动态规划与 Bellman 递推见 \cref{sec:plan-dp}（\cref{thm:plan-bellman}）；轨迹优化与 minimum-snap 等式约束 QP 见 \cref{sec:plan-traj,sec:plan-minsnap}——本章的 piecewise-jerk QP 与之同属多项式/分段光滑轨迹优化家族。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\label{tab:fs-relations}
+\begin{tabular}{lll}
+\toprule
+后续章节/方向 & 关系 & 本章铺垫 \\
+\midrule
+时空联合优化 & 强耦合场景的彻底方案 & PVD 反面基线、EM 的局限（\cref{thm:fs-bcd}）\\
+博弈式规划 & 障碍“追”自车、交互式 & PVD 前提一“障碍独立”的破裂 \\
+机械臂时间最优（TOPP） & 路径已定、只优化沿路径运动 & 速度子问题 \cref{eq:fs-vpp} 的相平面对应 \\
+模型预测控制（MPC） & 滚动求解带约束最优控制 & speed QP 即单步 MPC（\cref{sec:fs-speedqp} note）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：弯道/匝道上 $\dot s$ 或诸多 Frenet 量\emph{数值爆炸}。\textbf{原因}：$\kappa_r l\to1$，\cref{eq:fs-sdot} 分母 $\to0$（\cref{thm:fs-degeneracy}）。\textbf{对策}：运行时监控 $\kappa_r l$，超经验阈值（如 $0.3$）告警并切笛卡尔规划。
+  \item \textbf{症状}：投影函数吃掉热路径大半时间、规划频率上不去。\textbf{原因}：逆变换用全局线性扫描、每帧从头扫（\cref{sec:fs-frenet} 编程陷阱）。\textbf{对策}：缓存上一帧最近点、邻域局部搜索，或 KD-tree。
+  \item \textbf{症状}：弯道上路径 QP 算不出（可行域被错误收紧）或过保守贴不住车道。\textbf{原因}：$l''$ 上下界忘了减参考线曲率 $\kappa_r$（\cref{eq:fs-ddl-bound}）。\textbf{对策}：界设为 $\pm a^\kappa_{\max}-\kappa_r$。
+  \item \textbf{症状}：QP 结果数值不对、某些交叉项（如相邻 station 的 $w_{l'''}$ 耦合）像凭空消失。\textbf{原因}：把交叉项填进\emph{下三角}却交给只读上三角的 OSQP\cite{stellato2020osqp}——下三角元素被无声丢弃（Apollo 早期同坑）。\textbf{对策}：所有对称二次项按上三角约定填（$i\le j$ 处放一次完整系数）；用两点小 QP 核对。
+  \item \textbf{症状}：DP 选出“自车沿路径倒退”的荒谬解。\textbf{原因}：内层循环漏掉弧长单调性 $s_k\ge s_j$（\cref{sec:fs-st} 编程陷阱）。\textbf{对策}：内层 \verb@sk@ 从 \verb@sj@ 起。
+  \item \textbf{症状}：$s(t)$ 贴着阻挡边缘擦过、可视化没穿过去但实车剐蹭。\textbf{原因}：ST 碰撞只判质心、未按尺寸 + 裕度膨胀。\textbf{对策}：构建 \verb@STBoundary@ 时统一闵可夫斯基膨胀。
+  \item \textbf{症状}：speed QP 频繁报不可行、或精修后仍阶梯状。\textbf{原因}：把 DP 离散 $s$ 当硬等式（\cref{sec:fs-speedqp} 编程陷阱）。\textbf{对策}：用 $[s_{\mathrm{lb}},s_{\mathrm{ub}}]$ 区间 + warm start；安全约束软化（\cref{eq:fs-slack}）防哑火。
+  \item \textbf{症状}：自车以限速冲进急弯、横向加速度爆表/甩尾。\textbf{原因}：速度上界漏了向心折减（\cref{thm:fs-centripetal}）。\textbf{对策}：$v_{\mathrm{ub}}(s_i)=\min(v_{\max},\sqrt{a_{\mathrm{lat,max}}/|\kappa(s_i)|})$。
+  \item \textbf{症状}：EM 外循环超时/死循环、车失控。\textbf{原因}：不限轮数、等收敛再停，强耦合下震荡（\cref{thm:fs-bcd}）。\textbf{对策}：硬限 $2$--$3$ 轮 + 联合代价早停 + 取迄今最优解。
+  \item \textbf{症状}：规划器在某场景“诡异失败”、逐行看代码找不到 bug。\textbf{原因}：常是 PVD 三前提之一悄悄破裂（\cref{tab:fs-applicability}）。\textbf{对策}：先问“我还在 PVD 适用域里吗”，往往比读代码更快定位。
+\end{enumerate}

@@ -1,0 +1,443 @@
+\chapter{闭链约束下的双臂运动规划（约束流形采样）}\label{ch:arm-dualarm-planning}
+
+% ════════════════════════════════════════════════════════════════
+%  吸收 Tutorial D02（双臂协调规划）的理论与方法论：闭链约束 / 约束流形 /
+%  约束雅可比与切空间 / 投影法·CBiRRT·Atlas / TSR / 内力零空间 / 任务放松降维。
+%  纯工程（OMPL/Pinocchio/MoveIt2/Crocoddyl C++ 与 ROS2 配置）按规则跳过，只留方法论。
+%  记号归一：向量粗体小写、矩阵粗体大写；右扰动 R·Exp(deltaφ)；se(3) ξ=[rho;φ]；
+%  联合雅可比 V_ee=[J_b J_a]ν；相对雅可比承 ch:mr-multiarm 的 J_rel=J̄_R−J̄_L。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的对比表与小结；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 单臂 $7$ 自由度的运动规划在几维位形空间（C-space）里进行？把两条臂拼在一起、各自独立规划再合并，会破坏什么？
+  \item 两只手刚性夹持同一物体时，左右末端的相对位姿 $\mathbf{T}_{\text{rel}}$ 应当保持恒定。请把“相对位姿恒定”写成一个关于联合关节角 $\mathbf{q}$ 的等式约束 $\mathbf{h}(\mathbf{q})=\mathbf{0}$。
+  \item 在 $14$ 维空间里均匀采样，恰好命中一个 $8$ 维曲面的概率是多少？标准 RRT 为什么在这种约束下“几乎一定失败”？
+  \item 给定约束 $\mathbf{h}(\mathbf{q})=\mathbf{0}$ 与其雅可比 $\mathbf{J}_h=\partial\mathbf{h}/\partial\mathbf{q}$，如何把一个不满足约束的随机点“拉回”到约束曲面上？
+  \item 双臂共持时，哪些关节运动会把物体“撕开/挤压”（产生内力），哪些只是搬运物体？这两类运动在关节速度空间里如何区分？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}双臂刚性共持为何把可行位形从“整个 C-space”压缩到一个低维\emph{约束流形}，以及这给采样规划带来的根本困难；
+  \item \textbf{写出}闭链等式约束 $\mathbf{h}(\mathbf{q})=\mathbf{0}$、约束流形 $\mathcal{M}=\{\mathbf{q}\mid\mathbf{h}(\mathbf{q})=\mathbf{0}\}$ 及其维数，并用维数灾难解释“零测集采样”的失败；
+  \item \textbf{推导}约束雅可比 $\mathbf{J}_h$ 与相对雅可比 $\mathbf{J}_{\text{rel}}$ 的关系，理解切空间 $T_{\mathbf{q}}\mathcal{M}=\ker(\mathbf{J}_h)$；
+  \item \textbf{掌握}三类约束流形采样规划——投影法、切空间/Atlas 法、约束双向 RRT（CBiRRT）——的原理、开销与适用场景；
+  \item \textbf{运用}任务空间区域（TSR）声明式地描述末端约束，并把“双臂共持 $+$ 保持水平”写成 TSR 链；
+  \item \textbf{分辨}运动可行与内力可控两个独立要求，用抓取矩阵零空间说明规划为何要兼顾二者；
+  \item \textbf{运用}任务约束放松（允许绕对称轴的自由度）给约束流形升维，从而加速规划。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把刚性共持的物理约束，化为低维曲面上的几何搜索}”的主线。
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4.5mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (cons) {闭链约束\\ $\mathbf{h}(\mathbf{q})=\mathbf{0}$};
+\node[blk, right=of cons] (man) {约束流形\\ $\mathcal{M}$，维数 $n-k$};
+\node[blk, right=of man] (tan) {切空间\\ $T_{\mathbf{q}}\mathcal{M}=\ker\mathbf{J}_h$};
+\node[grp, below=8mm of cons] (proj) {投影法\\ Newton 拉回};
+\node[grp, right=of proj] (atlas) {切空间/Atlas\\ 在 $T_{\mathbf{q}}\mathcal{M}$ 采样};
+\node[grp, right=of atlas] (cbirrt) {CBiRRT\\ 双向 $+$ 投影};
+\node[blk, below=8mm of proj, fill=third!8, draw=third!60!black] (tsr) {TSR\\ 声明式约束};
+\node[blk, right=of tsr, fill=third!8, draw=third!60!black] (force) {内力零空间\\ 运动 $+$ 力可行};
+\node[blk, right=of force, fill=third!8, draw=third!60!black] (relax) {约束放松\\ 升维加速};
+\draw[ln] (cons)--(man); \draw[ln] (man)--(tan);
+\draw[ln] (man.south) -- ++(0,-4.5mm) -| (proj.north);
+\draw[ln] (tan.south) -- ++(0,-4.5mm) -| (atlas.north);
+\draw[ln] (proj)--(atlas); \draw[ln] (atlas)--(cbirrt);
+\draw[ln] (proj.south)-- (tsr.north);
+\draw[ln] (cbirrt.south)|- (force.east);
+\draw[ln] (tsr)--(force); \draw[ln] (force)--(relax);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：第 \ref{sec:dap-closedchain}--\ref{sec:dap-tangent} 节是任何读者的主干（约束—流形—切空间三角，是后面所有算法的几何地基）；第 \ref{sec:dap-sampling} 节是核心算法（投影/切空间/CBiRRT），写规划器时会反复回看；第 \ref{sec:dap-tsr} 节给约束一个工程友好的声明式外壳；第 \ref{sec:dap-internalforce} 节把“运动可行”与“内力可控”分开，接 \cref{ch:mr-coopforce} 的抓取静力学；第 \ref{sec:dap-relax} 节给出最实用的提速手段。
+
+\subsection*{前置知识桥接}
+本章站在三块地基上。其一，\cref{ch:arm-traj} 的采样规划：RRT 的核心循环“采样 $\to$ 最近邻 $\to$ 扩展 $\to$ 碰撞检查”、概率完备性、为何在 C-space 而非工作空间里规划——本章把它推广到\emph{带约束}的情形。其二，\cref{ch:mr-multiarm} 的协调运动学（\cref{sec:ma-coopkin}）：相对位姿 $\mathbf{T}_{\text{rel}}$、相对雅可比 $\mathbf{J}_{\text{rel}}=\bar{\mathbf{J}}_R-\bar{\mathbf{J}}_L$、其零空间是双臂冗余——本章把 $\mathbf{J}_{\text{rel}}$ 当作约束雅可比的局部线性化。其三，\cref{ch:lie} 的 $\SE(3)$ 对数映射：本章用 $\mathrm{Log}(\cdot)$ 把“相对位姿误差”量化成 $\se(3)$ 中的 $6$ 维向量。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 面对“双臂共持搬运”，你会本能地给两只手各设目标、各跑逆运动学再合并——得到的路径几乎处处违反闭链约束，物体在路径中段被“撕开”，执行时控制器要靠巨大内力补偿（\cref{ch:mr-multiarm} 已算出钢件 $1$\,mm 形变对应 $\sim10^4$\,N），夹爪打滑或物体被压碎。
+  \item 你会直接调用 \cref{ch:arm-traj} 的标准 RRT，却发现它在 $14$ 维空间里采样上百万次也命中不了 $8$ 维约束曲面，规划永远超时——而你不知道问题出在“在错误的空间里采样”。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导与练习） & 3--4 小时 & 首次系统学约束规划、要实现双臂管线 \\
+速读（抓核心算法对比） & 1 小时 & 有 RRT 基础、想了解约束扩展 \\
+速查（只看小结表与符号表） & 15 分钟 & 选方法或查约束定义时回来 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+联合关节位形 $\mathbf{q}\in\mathbb{R}^{n}$（双 $7$ 自由度臂 $n=14$，左臂在前、右臂在后）。约束函数 $\mathbf{h}:\mathbb{R}^{n}\to\mathbb{R}^{k}$，其雅可比 $\mathbf{J}_h=\partial\mathbf{h}/\partial\mathbf{q}\in\mathbb{R}^{k\times n}$。约束流形 $\mathcal{M}=\{\mathbf{q}\mid\mathbf{h}(\mathbf{q})=\mathbf{0}\}$，正则点处维数 $\dim\mathcal{M}=n-k$。左右末端位姿 $\mathbf{T}_L,\mathbf{T}_R\in\SE(3)$，相对位姿 $\mathbf{T}_{\text{rel}}=\mathbf{T}_L^{-1}\mathbf{T}_R$。$\SE(3)$ 对数记 $\mathrm{Log}(\cdot)\in\mathbb{R}^6$（$\se(3)$ 坐标，平移在前 $\boldsymbol{\xi}=[\boldsymbol{\rho};\boldsymbol{\phi}]$，与 \cref{ch:lie} 一致）。相对雅可比沿用 \cref{ch:mr-multiarm} 的 $\mathbf{J}_{\text{rel}}=\bar{\mathbf{J}}_R-\bar{\mathbf{J}}_L$（已用平移算子把两臂 twist 统一到公共参考点后做差）。本章关注\emph{位形空间规划}（在哪里运动），把协同力控/抓取静力学留给 \cref{ch:mr-coopforce}，二者互引去重。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{闭链约束与约束流形}
+\label{sec:dap-closedchain}
+
+\paragraph{动机：夹持同一刚体把两条臂焊成一个闭环。}
+两条独立的 $7$ 自由度臂，位形空间是 $14$ 维：左右各转各的，互不相干。可一旦两只手\emph{刚性夹持同一物体}，故事就变了——左手把物体往哪带，右手就必须跟到对应位置，否则物体被拉扯变形。几何上，左末端、物体、右末端串成一条从左基座出发、经物体、回到右基座的\emph{闭运动链}（kinematic loop）。闭环意味着两末端的相对位姿不再自由：
+
+\begin{definition}[双臂闭链约束]\label{def:dap-closedchain}
+设刚性共持时左右末端的标称相对位姿为常量 $\mathbf{T}_{\text{rel}}^{\star}\in\SE(3)$（由物体几何与抓取点决定）。则任一可行位形 $\mathbf{q}$ 必须使当前相对位姿与标称值重合，写成等式约束
+\begin{equation}
+  \mathbf{h}(\mathbf{q})=\mathrm{Log}\!\Big(\big(\mathbf{T}_{\text{rel}}^{\star}\big)^{-1}\,\mathbf{T}_L(\mathbf{q})^{-1}\,\mathbf{T}_R(\mathbf{q})\Big)\in\mathbb{R}^6,\qquad \mathbf{h}(\mathbf{q})=\mathbf{0}.
+  \label{eq:dap-h}
+\end{equation}
+其中 $\mathbf{T}_L(\mathbf{q}),\mathbf{T}_R(\mathbf{q})$ 由各臂正运动学给出。$\mathbf{h}=\mathbf{0}$ 当且仅当 $\mathbf{T}_L^{-1}\mathbf{T}_R=\mathbf{T}_{\text{rel}}^{\star}$，即“相对位姿锁定”。
+\end{definition}
+
+用 $\SE(3)$ 对数把“两个位姿相等”化为“一个 $6$ 维向量为零”，是因为 $\mathrm{Log}(\mathbf{X})=\mathbf{0}\iff\mathbf{X}=\mathbf{I}$，且 $\mathrm{Log}$ 在单位元附近是局部微分同胚（\cref{ch:lie}）。刚性共持时 $k=6$（位姿六个自由度全锁）。若抓取点允许绕某轴自由转动（如圆柱杆绕自身轴），则该方向不约束，$k$ 相应减小——这正是 \cref{sec:dap-relax} 要利用的。
+
+\begin{definition}[约束流形]\label{def:dap-manifold}
+满足 \cref{eq:dap-h} 的全体位形构成位形空间的子集
+\begin{equation}
+  \mathcal{M}=\{\mathbf{q}\in\mathbb{R}^{n}\mid \mathbf{h}(\mathbf{q})=\mathbf{0}\}.
+  \label{eq:dap-manifold}
+\end{equation}
+在 $\mathbf{J}_h$ 满行秩（$\operatorname{rank}\mathbf{J}_h=k$）的正则点处，由\emph{隐函数定理}，$\mathcal{M}$ 是一个光滑的 $(n-k)$ 维嵌入子流形。
+\end{definition}
+
+\begin{proposition}[双臂共持的约束流形维数]\label{prop:dap-dim}
+双 $7$ 自由度臂刚性共持（$n=14,\,k=6$）时，约束流形维数 $\dim\mathcal{M}=14-6=8$（这恰是 $\ker(\mathbf{J}_{\text{rel}})$ 的维数 $14-6=8$，即整个切空间）。这 $8$ 维由两部分组成：物体在 $\SE(3)$ 中的 $6$ 维整体运动（由两臂协同实现），加上 $14-12=2$ 维双臂内部冗余（在物体位姿不变下两臂仍可重构，对应 \cref{ch:mr-multiarm} 中堆叠绝对/相对雅可比 $\mathbf{J}_{\text{coop}}=[\mathbf{J}_{\text{abs}};\mathbf{J}_{\text{rel}}]\in\mathbb{R}^{12\times n}$ 的零空间 $\ker(\mathbf{J}_{\text{coop}})=\ker(\mathbf{J}_{\text{rel}})\cap\ker(\mathbf{J}_{\text{abs}})$）。双 $6$ 自由度臂（$n=12,\,k=6$）则 $\dim\mathcal{M}=6$，冗余为零——物体位姿一定，构型即唯一，碰撞回避无回旋余地。
+\end{proposition}
+
+\begin{proof}
+正则点处隐函数定理给出 $\dim\mathcal{M}=n-k=n-6$，即切空间 $\ker\mathbf{J}_h\approx\ker\mathbf{J}_{\text{rel}}$（\cref{sec:dap-tangent} 证 $\ker\mathbf{J}_h$ 与 $\ker\mathbf{J}_{\text{rel}}$ 局部同一）。把这 $n-6$ 维再分解：物体整体运动占满 $\SE(3)$ 的 $6$ 维；其余 $(n-6)-6=n-12$ 维是固定物体位姿下的自运动，即同时落在 $\ker\mathbf{J}_{\text{rel}}$ 与 $\ker\mathbf{J}_{\text{abs}}$ 中的 $\ker(\mathbf{J}_{\text{coop}})$。代入 $n=14$ 即得 $\dim\mathcal{M}=8$，其中自运动 $14-12=2$。\qed
+\end{proof}
+
+\paragraph{反面：在 $14$ 维里盲采样，命中 $8$ 维曲面的概率是零。}
+为什么不能直接套 \cref{ch:arm-traj} 的标准 RRT？因为约束流形是 $14$ 维空间里的一个 $8$ 维曲面——\emph{零测集}。在 $14$ 维超立方体里均匀采样，落在“厚度” $\epsilon$ 的约束带内的体积占比约 $(\epsilon/L)^{k}$（$L$ 为各维跨度，$k=6$ 为约束维数）。取 $\epsilon=10^{-3}$\,rad、$L\approx 2\pi$：
+
+\begin{equation}
+  \text{命中率}\ \approx\ \Big(\frac{10^{-3}}{2\pi}\Big)^{6}\ \approx\ 1.6\times10^{-23}.
+  \label{eq:dap-curse}
+\end{equation}
+
+即约 $6\times10^{22}$ 次采样才期望命中一次。哪怕每次采样（含一次投影与碰撞检查）只要 $0.1\,\mathrm{ms}$，也需约 $2\times10^{11}$ 年——比宇宙年龄（约 $1.4\times10^{10}$ 年）还长一个量级。这不是“调参能救”的低效，而是\emph{方法论错误}：在错误的空间（$14$ 维环境空间）里采样。出路只有两条——把盲采样的点\emph{投影}回流形（\cref{sec:dap-sampling} 投影法），或干脆\emph{在 $8$ 维切空间里采样}（Atlas/切空间法）。
+
+\begin{insight}[球面寻路：约束规划的几何图像]
+把约束流形想成嵌在三维空间里的地球表面（$2$ 维曲面）。从北京到纽约，你不能沿直线穿过地心——必须沿球面的“大圆弧”走。双臂约束规划同理：你不能沿 $\mathbb{R}^{14}$ 的直线连接两点（直线离开流形 $=$ 物体被撕开），必须沿约束流形的近似测地线走。投影法是“先随便迈一步，再把脚拉回球面”；切空间/Atlas 法是“在脚下铺一张切平面地图，在地图上走再贴回球面”。这张图贯穿全章。
+\end{insight}
+
+\begin{pitfall}[“两只手分别规划再拼起来”]
+最常见的错误直觉：左手从 $\mathbf{q}_{L,\text{start}}$ 规划到 $\mathbf{q}_{L,\text{goal}}$，右手同理，然后把两条路径拼在一起。\textbf{为何错}：独立规划完全无视闭链约束 $\mathbf{J}_{\text{rel}}\dot{\mathbf{q}}=\mathbf{0}$，拼接后中段的约束违反 $\|\mathbf{h}(\mathbf{q})\|$ 可达厘米级；对刚体这意味着巨大内力，物体被挤压或脱手。即便是“看似解耦”的任务，独立规划也漏掉了\emph{臂间碰撞}（左右臂相撞）。\textbf{正确做法}：在联合 $14$ 维 C-space 上做约束规划；事后修正约束违反的代价往往比直接约束规划还高。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{约束雅可比与切空间}
+\label{sec:dap-tangent}
+
+\paragraph{动机：要在曲面上移动，先得知道“切向哪里”。}
+所有约束流形采样规划都要回答两个微分层面的问题：(1) 怎么把偏离流形的点拉回去？(2) 沿什么方向迈步才\emph{不离开}流形？两者都由约束雅可比 $\mathbf{J}_h$ 决定。对 \cref{eq:dap-h} 两端关于 $\mathbf{q}$ 求导（用 \cref{ch:lie} 的 $\SE(3)$ 对数微分），在约束满足处（$\mathbf{h}=\mathbf{0}$，$\SE(3)$ 左雅可比退化为单位阵）有
+
+\begin{equation}
+  \mathbf{J}_h(\mathbf{q})\ \approx\ \mathbf{J}_{\text{rel}}(\mathbf{q})\ =\ \bar{\mathbf{J}}_R(\mathbf{q})-\bar{\mathbf{J}}_L(\mathbf{q})\ \in\ \mathbb{R}^{6\times n}.
+  \label{eq:dap-Jh}
+\end{equation}
+
+即约束雅可比的局部线性化就是 \cref{ch:mr-multiarm}（\cref{sec:ma-coopkin}）推过的\emph{相对雅可比}。这把本章与协作部精确焊接：那里把 $\mathbf{J}_{\text{rel}}$ 当作“相对运动通道”的雅可比，这里把它当作“约束的梯度”。
+
+\begin{pitfall}[相对雅可比的参考点陷阱]
+\cref{eq:dap-Jh} 里的 $\bar{\mathbf{J}}_i$ 是\emph{统一参考点后}的雅可比，不是直接拿两臂雅可比相减 $\mathbf{J}_R-\mathbf{J}_L$。\cref{ch:mr-multiarm} 已警示：刚体绕物体质心转动时两末端线速度本就不同，不先用平移算子 $\mathbf{X}(\mathbf{p}_c-\mathbf{p}_i)$ 把两臂 twist 移到同一参考点就做差，会把“正常的绕物体转动”误判成“相对运动”，从而在 Newton 投影里沿错误方向拉回，条件数与收敛性双双恶化。约束雅可比直接复用 $\mathbf{J}_{\text{rel}}$，但必须复用\emph{正确的}那一个。
+\end{pitfall}
+
+\begin{theorem}[约束流形的切空间]\label{thm:dap-tangent}
+在正则点 $\mathbf{q}\in\mathcal{M}$ 处，约束流形的切空间是约束雅可比的零空间
+\begin{equation}
+  T_{\mathbf{q}}\mathcal{M}=\ker\big(\mathbf{J}_h(\mathbf{q})\big)=\{\dot{\mathbf{q}}\in\mathbb{R}^n\mid \mathbf{J}_h(\mathbf{q})\,\dot{\mathbf{q}}=\mathbf{0}\},\qquad \dim T_{\mathbf{q}}\mathcal{M}=n-k.
+  \label{eq:dap-tangent}
+\end{equation}
+法空间（“离开流形最快”的方向）是 $\mathbf{J}_h^\top$ 的列空间，与切空间正交。
+\end{theorem}
+
+\begin{proof}
+设 $\mathbf{q}(t)$ 是流形上一条经过 $\mathbf{q}$ 的曲线，则 $\mathbf{h}(\mathbf{q}(t))\equiv\mathbf{0}$。对 $t$ 求导并在 $\mathbf{q}$ 处取值：$\mathbf{J}_h(\mathbf{q})\dot{\mathbf{q}}=\mathbf{0}$，故任一切向量在 $\ker\mathbf{J}_h$ 中。反之，$\mathbf{J}_h$ 满行秩时 $\dim\ker\mathbf{J}_h=n-k=\dim\mathcal{M}$（\cref{def:dap-manifold}），维数相等，二者重合。法空间为 $\ker\mathbf{J}_h$ 的正交补 $=\operatorname{row}\mathbf{J}_h=\operatorname{col}\mathbf{J}_h^\top$。\qed
+\end{proof}
+
+\begin{derivation}[切空间正交基：相对雅可比的 SVD]\label{der:dap-svd}
+工程上要的不是“切空间存在”，而是它的一组\emph{正交基}，以便在切空间里采样、迈步。对 $\mathbf{J}_h\in\mathbb{R}^{k\times n}$ 做奇异值分解 $\mathbf{J}_h=\mathbf{U}\boldsymbol{\Sigma}\mathbf{V}^\top$。设满行秩 $\operatorname{rank}\mathbf{J}_h=k$，则 $\mathbf{V}$ 的\emph{后 $n-k$ 列}对应零奇异值，张成 $\ker\mathbf{J}_h=T_{\mathbf{q}}\mathcal{M}$：
+\begin{equation}
+  \mathbf{V}=\big[\,\underbrace{\mathbf{v}_1\ \cdots\ \mathbf{v}_k}_{\text{法空间（行空间）}}\ \big|\ \underbrace{\mathbf{v}_{k+1}\ \cdots\ \mathbf{v}_n}_{\text{切空间基 }\boldsymbol{\Phi}}\,\big],\qquad \boldsymbol{\Phi}=\mathbf{V}[:,k{+}1{:}n]\in\mathbb{R}^{n\times(n-k)}.
+  \label{eq:dap-tanbasis}
+\end{equation}
+于是切空间里任一向量可参数化为 $\dot{\mathbf{q}}=\boldsymbol{\Phi}\,\Delta\mathbf{u}$，$\Delta\mathbf{u}\in\mathbb{R}^{n-k}$ 是\emph{低维}局部坐标——把 $14$ 维的迈步压缩到 $8$ 维。等价地，零空间投影算子 $\mathbf{P}=\mathbf{I}-\mathbf{J}_h^{+}\mathbf{J}_h=\boldsymbol{\Phi}\boldsymbol{\Phi}^\top$ 把任意关节速度投到切空间（与 \cref{ch:mr-multiarm} 的 $\mathbf{P}_{\text{rel}}$ 同物）。
+\end{derivation}
+
+\begin{note}
+\textbf{切空间维数即“规划自由度”.}\;由 \cref{prop:dap-dim}，双 $7$ 自由度臂切空间是 $8$ 维：$6$ 维让物体在 $\SE(3)$ 里走，$2$ 维是物体位姿不变下的自运动。后 $2$ 维是碰撞回避、操作度优化、关节限位回避的全部本钱（\cref{ch:arm-kin} 的 \cref{sec:ak-redundancy} 已系统讨论冗余的三大用途）。双 $6$ 自由度臂这 $2$ 维归零——这解释了为何同是“双臂共持”，$6+6$ 的规划反而比 $7+7$ 更易卡死：没有自运动余量绕开障碍。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{约束流形采样规划：投影、切空间与 CBiRRT}
+\label{sec:dap-sampling}
+
+\paragraph{统一问题。}
+给定起点 $\mathbf{q}_{\text{start}}\in\mathcal{M}$、终点 $\mathbf{q}_{\text{goal}}\in\mathcal{M}$、约束 $\mathbf{h}$ 与无碰撞判据 $\mathrm{CollisionFree}(\cdot)$，求一条路径 $\pi:[0,1]\to\mathcal{M}$，使 $\pi(0)=\mathbf{q}_{\text{start}}$、$\pi(1)=\mathbf{q}_{\text{goal}}$，且沿途 $\mathbf{h}(\pi(s))=\mathbf{0}$、$\mathrm{CollisionFree}(\pi(s))$。前提：起终点须精确在 $\mathcal{M}$ 上（否则先投影），且处于同一连通分支——否则无约束满足路径，需考虑\emph{重抓}（regrasp，松手换个构型再抓）。三类方法的全部差异，归结为一句话：\textbf{在什么空间里生成新采样点}。
+
+\subsection{投影法：在环境空间采样，Newton 拉回}
+\label{subsec:dap-projection}
+
+最直接的思路（也是一切方法的基线）：在 $\mathbb{R}^n$ 里自由采样 $\mathbf{q}_{\text{rand}}$，再用 Newton 迭代把它\emph{投影}到 $\mathcal{M}$。每步沿法方向走，使约束违反 $\|\mathbf{h}\|$ 减小：
+
+\begin{equation}
+  \mathbf{q}\ \leftarrow\ \mathbf{q}-\mathbf{J}_h^{+}(\mathbf{q})\,\mathbf{h}(\mathbf{q}),\qquad \mathbf{J}_h^{+}=\mathbf{J}_h^\top\big(\mathbf{J}_h\mathbf{J}_h^\top\big)^{-1},
+  \label{eq:dap-newton}
+\end{equation}
+
+迭代至 $\|\mathbf{h}\|<\epsilon$ 或超出最大步数（不收敛则丢弃该采样）。用伪逆 $\mathbf{J}_h^{+}$ 而非逆，是因为 $\mathbf{J}_h\in\mathbb{R}^{k\times n}$（$k<n$）非方阵；满行秩时 $\mathbf{J}_h^{+}$ 给出\emph{最小范数修正}——在拉回流形的前提下对 $\mathbf{q}$ 改动最小，几何上即沿法空间走。若 $\mathbf{J}_h$ 接近奇异（协调奇异、$\kappa(\mathbf{J}_h)$ 大），改用阻尼最小二乘伪逆（\cref{ch:arm-kin} 的 \cref{thm:ak-dls}）以换稳定。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, scale=1.0]
+  % manifold as a wavy curve
+  \draw[thick, main] plot[smooth, tension=0.9] coordinates {(-3,0.1) (-1.5,-0.25) (0,0.05) (1.5,-0.2) (3,0.15)};
+  \node[main] at (3.05,0.55) {$\mathcal{M}=\{\mathbf{h}=\mathbf{0}\}$};
+  % random point off-manifold
+  \coordinate (qr) at (0.4,1.45);
+  \fill[second] (qr) circle (1.4pt) node[right] {$\mathbf{q}_{\text{rand}}$};
+  % newton steps pulling down to manifold (normal direction)
+  \coordinate (q1) at (0.18,0.7);
+  \coordinate (q2) at (0.08,0.18);
+  \coordinate (qp) at (0.05,0.02);
+  \draw[->, third, thick] (qr)--(q1);
+  \draw[->, third, thick] (q1)--(q2);
+  \draw[->, third, thick] (q2)--(qp);
+  \fill (qp) circle (1.2pt) node[below right] {$\mathbf{q}_{\text{proj}}\in\mathcal{M}$};
+  \node[third] at (1.35,0.95) {$\mathbf{q}\!\leftarrow\!\mathbf{q}-\mathbf{J}_h^{+}\mathbf{h}$};
+  % tangent line at qp
+  \draw[dashed, gray!70!black] (-1.0,-0.05) -- (1.1,0.15) node[right]{$T_{\mathbf{q}}\mathcal{M}$};
+\end{tikzpicture}
+\caption{投影法：环境空间里的随机点 $\mathbf{q}_{\text{rand}}$ 经 Newton 迭代（\cref{eq:dap-newton}）沿法方向被“拉回”约束流形，$2$--$3$ 步通常收敛。切线即切空间 $T_{\mathbf{q}}\mathcal{M}$。}
+\label{fig:dap-projection}
+\end{figure}
+
+投影法概念最简、只需 $\mathbf{h}$ 与 $\mathbf{J}_h$ 两个接口，但效率瓶颈在\emph{投影成功率}：在 $14$ 维里采样、投影到 $8$ 维，大量点白白浪费；约束维数 $k=6$ 越大、流形曲率越高，成功率越低（双臂闭链典型成功率常在数成到约一半之间，高曲率区更低\pz{具体百分比依实现与场景而异：核到的定性结论是“闭合约束显著拉低投影成功率与效率”（如某双臂闭链对比中开启闭合约束后成功率由 $100\%$ 降至 $83\%$、运行时翻十余倍），但未查到“$30\%$--$60\%$/高曲率 $10\%$”这一具体区间的权威出处，故按定性陈述，数值随采样步长、伪逆阻尼、流形曲率而变}）。这正是 \cref{eq:dap-curse} 的微分版重演。
+
+\subsection{切空间法与 Atlas：在低维切空间采样}
+\label{subsec:dap-atlas}
+
+要根治“在高维空间浪费采样”，就别在 $14$ 维采样——直接在 $8$ 维\emph{切空间}采样。由 \cref{der:dap-svd}，在当前点 $\mathbf{q}_0\in\mathcal{M}$ 处取切空间基 $\boldsymbol{\Phi}$，生成低维随机向量 $\Delta\mathbf{u}\in\mathbb{R}^{n-k}$，映回环境空间 $\mathbf{q}=\mathbf{q}_0+\boldsymbol{\Phi}\Delta\mathbf{u}$，再做\emph{很少几步}（$1$--$2$ 步，因起点已贴近流形）Newton 修正。这就是 Atlas 法（Jaillet--Porta\cite{jaillet2013atlas}）的内核：在流形上维护一组局部坐标卡（chart），每张卡是一片切空间地图。
+
+\begin{algo}[切空间采样（Atlas 单卡扩展）]\label{alg:dap-atlas}
+输入当前卡中心 $\mathbf{q}_0\in\mathcal{M}$、切空间基 $\boldsymbol{\Phi}=\mathbf{V}[:,k{+}1{:}n]$。
+\begin{enumerate}
+  \item 采样低维偏移 $\Delta\mathbf{u}\in\mathbb{R}^{n-k}$（卡半径 $\rho$ 内）；
+  \item 映回环境空间 $\mathbf{q}\leftarrow\mathbf{q}_0+\boldsymbol{\Phi}\,\Delta\mathbf{u}$；
+  \item Newton 修正 $\mathbf{q}\leftarrow\mathbf{q}-\mathbf{J}_h^{+}\mathbf{h}(\mathbf{q})$（$1$--$2$ 步即收敛）；
+  \item 若 $\mathbf{q}$ 离卡中心过远 $\Rightarrow$ 在 $\mathbf{q}$ 处建新卡（重算 SVD 取新 $\boldsymbol{\Phi}$），并约束相邻卡法向夹角 $<\alpha_{\max}$（推荐 $\pi/6$，防跨越高曲率区跳错分支）。
+\end{enumerate}
+\end{algo}
+
+切空间法（tangent bundle）是 Atlas 的“惰性”版本：不维护全局卡集合，每次扩展临时算切空间、用完即弃——内存更省，但同一区域反复做 SVD，覆盖度量不如 Atlas 准。三者权衡见 \cref{tab:dap-methods}。其共性是\emph{覆盖速率}：投影法约 $O((\epsilon/L)^{k})$（随约束维数 $k$ 指数衰减），Atlas/切空间约 $O((\epsilon/\rho)^{n-k})$（随\emph{流形维数}衰减）——把指数从 $k=6$ 降到“流形维数”，正是数量级提速的根源。
+
+\begin{table}[H]\centering\small
+\caption{三类约束流形采样方法对比}
+\label{tab:dap-methods}
+\begin{tabular}{llll}
+\toprule
+维度 & 投影法 & Atlas 法 & 切空间法 \\
+\midrule
+采样空间 & 环境空间（$n$ 维） & 切空间（$n{-}k$ 维） & 切空间（$n{-}k$ 维） \\
+采样效率 & 低 & 高 & 中 \\
+每点 Newton 步 & $3$--$10$ & $1$--$2$ & $1$--$2$ \\
+实现复杂度 & 低 & 高 & 中 \\
+内存 & 低 & 高（存卡） & 低 \\
+高曲率流形 & 差 & 好（自适应卡） & 中 \\
+适用 & 入门/调试/低维 & 高维/高曲率 & 一般/折中 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[本质：差异不在“算法”，在“采样空间”]
+三类方法常被当成三种算法记忆，其实它们共享同一个约束接口（$\mathbf{h},\mathbf{J}_h$），唯一的区别是\emph{在哪个空间撒点}：投影法在高维环境空间撒点再投影（大海捞针），切空间/Atlas 在低维切空间撒点再贴回（在针所在的平面上找针）。理解了“采样空间维数决定效率”，方法优劣无需死记——它由 \cref{eq:dap-curse} 的指数 $k$ 是否被消去直接决定。
+\end{insight}
+
+\subsection{CBiRRT：把约束投影焊进双向 RRT}
+\label{subsec:dap-cbirrt}
+
+有了“怎么生成流形上的点”，还需一个搜索骨架把这些点连成路径。约束双向 RRT（CBiRRT，Berenson 等\cite{berenson2011tsr}）是事实标准：在 \cref{ch:arm-traj} 的双向 RRT（RRT-Connect\cite{kuffner2000rrtconnect}）每个扩展步后插入一次 Newton 投影，让树只在流形上生长。双向（从起终点同时长两棵树，会合即贯通）相对单向通常快一个数量级，对高维约束规划尤为关键。
+
+\begin{algo}[CBiRRT：约束双向 RRT]\label{alg:dap-cbirrt}
+输入 $\mathbf{q}_{\text{start}},\mathbf{q}_{\text{goal}}\in\mathcal{M}$、约束 $\mathbf{h}$、步长 $\delta$、碰撞判据。
+\begin{enumerate}
+  \item $\mathcal{T}_a\leftarrow\{\mathbf{q}_{\text{start}}\}$，$\mathcal{T}_b\leftarrow\{\mathbf{q}_{\text{goal}}\}$；
+  \item 重复至成功或超限：
+  \begin{enumerate}
+    \item $\mathbf{q}_{\text{rand}}\leftarrow$ 环境空间采样（以小概率 $p_{\text{goal}}$ 直取目标，做目标偏向）；
+    \item $\mathbf{q}_{\text{near}}\leftarrow\mathcal{T}_a$ 中最近邻；$\mathbf{q}_{\text{new}}\leftarrow\mathbf{q}_{\text{near}}+\delta\,\dfrac{\mathbf{q}_{\text{rand}}-\mathbf{q}_{\text{near}}}{\|\mathbf{q}_{\text{rand}}-\mathbf{q}_{\text{near}}\|}$（迈一步）；
+    \item $\mathbf{q}_{\text{new}}\leftarrow\textsc{Project}(\mathbf{q}_{\text{new}})$（\cref{eq:dap-newton}）；不收敛则跳过本轮；
+    \item 约束感知边检查 $\textsc{EdgeValid}(\mathbf{q}_{\text{near}},\mathbf{q}_{\text{new}})$ 失败则跳过；否则 $\mathcal{T}_a$ 加入 $\mathbf{q}_{\text{new}}$；
+    \item 从 $\mathcal{T}_b$ 向 $\mathbf{q}_{\text{new}}$ 反复 \textsc{Extend}$+$\textsc{Project}$+$\textsc{EdgeValid}，若到达 $\|\cdot\|<\epsilon$ 则两树会合，回溯输出路径；
+    \item 交换 $\mathcal{T}_a\leftrightarrow\mathcal{T}_b$（双向交替）。
+  \end{enumerate}
+\end{enumerate}
+\end{algo}
+
+\begin{derivation}[约束感知边检查为何不可省]\label{der:dap-edge}
+RRT 把两节点连成一条边时，要保证\emph{整条边}可行。自由空间里直线插值即可；约束流形上，两点之间的直线\emph{不在流形上}。\textsc{EdgeValid} 必须沿边逐点投影回流形再查碰撞：取 $N=\lceil\|\mathbf{q}_b-\mathbf{q}_a\|/\text{res}\rceil$ 个中间点，对每个 $\mathbf{q}(s)=(1-s)\mathbf{q}_a+s\mathbf{q}_b$ 做 $\mathbf{q}(s)\leftarrow\textsc{Project}(\mathbf{q}(s))$，任一投影失败或碰撞即判边非法。\textbf{若省略投影}：中间点偏离流形，对刚性共持意味着物体在路径中段被“撕开”——起终点合规、中段违规，路径物理不可行，执行时力矩饱和或物体脱落。步长 $\delta$ 过大或曲率过高时该插值也会失败（投影后的点跳到流形另一分支），工程上取 $\delta\le0.05$\,rad 以保插值质量。
+\end{derivation}
+
+需强调：CBiRRT 与所有 RRT 家族一样，只\emph{概率完备}（有解则给足时间必能找到），\emph{不保证最优}。路径常有多余弯绕，须在规划后做约束感知的短路径平滑（shortcutting）——随机取路径上两点，用 \textsc{EdgeValid} 尝试直连，成功则删去中段，通常缩短 $30\%$--$60\%$。
+
+\begin{pitfall}[只设约束、忘了碰撞检查]
+约束规划框架里，约束只保证 $\mathbf{h}(\mathbf{q})=\mathbf{0}$，\emph{碰撞检查是独立一环}。常见症状：规划“成功”，路径却穿障或两臂相撞。\textbf{根因}：约束投影甚至可能把一个无碰撞点投到碰撞区。\textbf{对策}：约束与碰撞两个判据都要设；且双臂碰撞比单臂多一类\emph{臂间碰撞}（左右臂相撞），最近段（如各臂第 $4$--$7$ 连杆之间）务必启用检查，别被自动生成的碰撞矩阵误关。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{任务空间区域：约束的声明式表达}
+\label{sec:dap-tsr}
+
+\paragraph{动机：别手写约束函数，声明“末端允许的位姿范围”。}
+\cref{sec:dap-closedchain} 把约束写成 $\mathbf{h}(\mathbf{q})=\mathbf{0}$，但工程中很少直接手写约束函数——更愿意声明“末端的哪些自由度被锁、各自允许多大偏差”。Berenson 等\cite{berenson2011tsr} 的任务空间区域（Task Space Region, TSR）用一个 $6$ 维边界盒做这件事，框架据此自动生成约束。
+
+\begin{definition}[任务空间区域 TSR]\label{def:dap-tsr}
+一个 TSR 是三元组 $(\mathbf{T}_{w0},\mathbf{T}_{we},\mathbf{B}_w)$：参考帧 $\mathbf{T}_{w0}\in\SE(3)$（TSR 帧相对世界系，原文记 $\mathbf{T}^w_0$）、末端偏置 $\mathbf{T}_{we}\in\SE(3)$（边界全零时末端相对 TSR 帧的标称偏置，原文记 $\mathbf{T}^e_w$）、边界盒 $\mathbf{B}_w\in\mathbb{R}^{6\times2}$（六行分别约束 $x,y,z$ 平移与 roll, pitch, yaw 旋转的下/上界）。给定末端位姿 $\mathbf{T}_{ee}$（世界系），按 Berenson 等的约定先算 TSR 帧下的相对位姿 $\mathbf{T}_{w}^{e\prime}=\mathbf{T}_{w0}^{-1}\,\mathbf{T}_{ee}\,\mathbf{T}_{we}^{-1}$（末端偏置之逆在\emph{右}乘，与采样合成 $\mathbf{T}_{ee}=\mathbf{T}_{w0}\,\mathrm{disp}(\boldsymbol{\delta})\,\mathbf{T}_{we}$ 互逆），再取其对数得偏差向量
+\begin{equation}
+  \boldsymbol{\delta}=\mathrm{Log}\!\big(\mathbf{T}_{w0}^{-1}\,\mathbf{T}_{ee}\,\mathbf{T}_{we}^{-1}\big)\in\mathbb{R}^6,
+  \label{eq:dap-tsr-delta}
+\end{equation}
+逐维取超出边界的部分作为约束违反：$h_i=\delta_i-B_{w,i}^{\text{lo}}$（若 $\delta_i<B_{w,i}^{\text{lo}}$）、$\delta_i-B_{w,i}^{\text{hi}}$（若 $\delta_i>B_{w,i}^{\text{hi}}$）、否则 $0$。约定 $[-\infty,+\infty]$ 表该维自由，$[0,0]$ 表严格锁定，$[-a,a]$ 表允许 $\pm a$ 偏差。
+\end{definition}
+
+TSR 的威力在于：被锁的维数才进入约束，自由维不计入 $k$。例如“双臂抬箱保持水平”：物体可在空间自由平移、自由转 yaw，但 roll/pitch 必须近零——边界盒前三行与第六行设 $[-\infty,+\infty]$，第四、五行设 $[-0.05,0.05]$（约 $\pm3^\circ$），约束维数只有 $2$。
+
+\begin{insight}[TSR 之于约束规划，如 SQL 之于数据库]
+你不必手写底层的数据检索算法，只需声明“我要什么”（约束的范围），框架自动生成执行计划。TSR 把工程师从“写约束函数”里解放出来，专注“描述任务需求”——把 $\mathbf{h},\mathbf{J}_h$ 的实现细节藏到框架背后。
+\end{insight}
+
+\paragraph{TSR 链：双臂闭链的声明式写法。}
+双臂共持的闭链约束可写成一条 TSR 链：左手相对物体的抓取（参考帧 $=$ 物体位姿，标称 $=$ 固定抓取变换，边界盒全零 $=$ 不许松手）$\to$ 两抓取点间由物体几何决定的固定变换 $\to$ 右手相对物体的抓取（边界盒全零）。三段串起来即等价于 \cref{eq:dap-h} 的闭链约束（局部线性化仍是 $\mathbf{J}_{\text{rel}}$）。更妙的是 TSR 链可\emph{叠加}额外任务约束——如再挂一个“物体 roll/pitch 保持水平”的 TSR，搬运途中物体就既被两手锁定、又保持水平。
+
+\begin{pitfall}[TSR 边界盒是相对参考帧、不是世界系；且旋转用欧拉角有万向锁]
+两个易错点。其一，$\mathbf{B}_w$ 的 $x,y,z$ 约束的是“末端相对参考帧 $\mathbf{T}_{w0}$ 的偏差”，不是世界系绝对位置；若 $\mathbf{T}_{w0}$ 取物体位姿，则物体一动，约束自动跟随物体——这正是“保持抓取”类约束天然成立的原因。其二，TSR 旋转边界用 roll-pitch-yaw 欧拉角，在 pitch $\approx\pm\pi/2$ 处有万向锁，约束在该姿态附近不连续、Newton 投影易发散；接近该区时应改用轴角或四元数表达。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{内力零空间：运动可行 \texorpdfstring{$\neq$}{!=} 力学可行}
+\label{sec:dap-internalforce}
+
+\paragraph{动机：路径在几何上能走，不等于物体不被压碎。}
+\cref{sec:dap-sampling} 找到的是\emph{几何}可行路径——满足 $\mathbf{h}=\mathbf{0}$ 且无碰撞。但双臂共持还有一个独立要求：沿途\emph{内力可控}。两只手对物体的接触力，一部分合成为驱动物体运动的净力（运动力），另一部分相互抵消、只在物体内部“较劲”（内力）。内力不动物体，却决定夹持是否稳、物体是否被压坏。规划必须意识到：约束流形上每一点不仅要运动可行，还要落在内力可调的区域。这把本章接到 \cref{ch:mr-coopforce} 的抓取静力学。
+
+\begin{definition}[抓取矩阵与内力零空间]\label{def:dap-grasp}
+设 $N$ 个接触点的接触力/力矩堆叠为 $\mathbf{f}_c\in\mathbb{R}^{6N}$（每接触 $6$ 维 wrench，刚性夹持能传力矩），抓取矩阵 $\mathbf{G}\in\mathbb{R}^{6\times6N}$ 把它们映到物体净 wrench $\mathbf{F}_{\text{load}}=\mathbf{G}\mathbf{f}_c$（详见 \cref{ch:mr-coopforce} 的 \cref{sec:cm-grasp}）。则接触力分解为
+\begin{equation}
+  \mathbf{f}_c=\underbrace{\mathbf{G}^{+}\mathbf{F}_{\text{load}}}_{\text{运动力（动物体）}}+\underbrace{(\mathbf{I}-\mathbf{G}^{+}\mathbf{G})\,\mathbf{f}_{\text{int}}}_{\text{内力 }\in\ker(\mathbf{G})},
+  \label{eq:dap-grasp}
+\end{equation}
+内力空间维数 $=6N-6$。双臂 $N=2$ 时 $\mathbf{G}\in\mathbb{R}^{6\times12}$，内力维数 $12-6=6$——恰对应两手间 $6$ 维相对位姿可被“较劲”。
+\end{definition}
+
+\begin{insight}[速度对偶力：相对雅可比零空间与抓取矩阵零空间的对偶]
+\cref{thm:dap-tangent} 说切空间是 $\ker(\mathbf{J}_h)\!\approx\!\ker(\mathbf{J}_{\text{rel}})$——\emph{不产生相对运动}（也就不激起内力）的关节速度方向；\cref{def:dap-grasp} 说内力住在 $\ker(\mathbf{G})$——\emph{不产生净运动}的接触力方向。两者由静力学对偶 $\boldsymbol{\tau}=\mathbf{J}^\top\mathbf{f}$（\cref{ch:mr-multiarm} 的 \cref{sec:ma-internalforce}）扣在一起，但配对的不是这两个零空间本身（维数不同：$\ker\mathbf{J}_{\text{rel}}$ 为 $8$、$\ker\mathbf{G}$ 为 $6$）：内力 $\ker(\mathbf{G})$ 的真正功共轭是\emph{相对运动通道}——即 $\mathbf{J}_{\text{rel}}$ 的行空间（切空间的正交补，$6$ 维），它正是内力做功的通道，与 $\ker(\mathbf{J}_{\text{rel}})$ 互补。刚性共持时令相对速度 $=\mathbf{0}$（停在切空间里），物体不被撕；同时把内力调到挤压区（如双手内夹），夹持才稳。规划在切空间里走，控制在内力空间里压，分工明确。
+\end{insight}
+
+故约束规划输出的路径若交给 \cref{ch:mr-coopforce} 的协同力控执行，需保证沿途构型既\emph{运动可行}（在 $\mathcal{M}$ 上、无碰撞、远离协调奇异以免 $\mathbf{J}_{\text{rel}}$ 退化），又\emph{内力可控}（$\mathbf{G}$ 满秩、夹持力在摩擦锥内）。靠近协调奇异时，$\mathbf{J}_{\text{rel}}$ 与 $\mathbf{G}$ 同时趋于病态，规划应主动用切空间里的 $2$ 维自运动余量绕开——这也是 \cref{sec:dap-tangent} 那条“切空间维数即规划本钱”的实战意义。本章只负责“规划到内力可控的区域”，内力如何分配、自适应调节属力控范畴，不在此展开。
+
+% ════════════════════════════════════════════════════════════════
+\section{任务约束放松：给流形升维以加速}
+\label{sec:dap-relax}
+
+\paragraph{动机：很多任务并不需要锁死全部六个自由度。}
+\cref{eq:dap-curse} 告诉我们：约束维数 $k$ 是采样难度的指数。那么最直接的提速，就是\emph{减小 $k$}——只锁任务真正在意的自由度，放开其余。许多共持任务天然有对称冗余：搬运一根圆柱杆，物体绕自身轴的转角无关紧要；端一杯水，只需杯口朝上（roll/pitch 受限），绕竖直轴的 yaw 完全自由。把这些“无所谓”的方向从约束里去掉，约束流形维数 $n-k$ 随之升高，采样命中率指数回升。
+
+\begin{proposition}[放松一维约束，流形升一维]\label{prop:dap-relax}
+设原约束 $k$ 维、流形维数 $n-k$。若任务允许末端绕某轴自由（该方向不约束），则约束维数降为 $k-1$，约束流形维数升为 $n-k+1$。由 \cref{eq:dap-curse}，投影法命中率从 $\sim(\epsilon/L)^{k}$ 升到 $\sim(\epsilon/L)^{k-1}$——提升约 $L/\epsilon$ 倍（取 $\epsilon=10^{-3},L=2\pi$ 即约 $6\times10^3$ 倍）。
+\end{proposition}
+
+在 TSR 框架里，放松一维只需把 $\mathbf{B}_w$ 对应行从 $[0,0]$ 改成 $[-\infty,+\infty]$（\cref{def:dap-tsr}）——声明式表达让“放松”变成改一行边界盒。例如双臂搬圆柱杆，把绕杆轴方向的旋转边界设为自由，约束从 $6$ 维降到 $5$ 维，规划随之提速。
+
+\begin{pitfall}[别把“放松”放成“放飞”]
+放松的前提是该自由度\emph{物理上确实无所谓}。若误把承重方向或夹持稳定相关的自由度放松，规划是快了，执行却可能让物体姿态漂移、内力失控甚至脱手。放松应基于任务语义（对称轴、允许的姿态窗口），而非单纯为提速而开。放松哪些维、放多宽，是任务设计而非纯算法问题——这与 \cref{sec:dap-internalforce} 的内力可控要求一并权衡：被放松的运动方向不应是内力做功的关键方向。
+\end{pitfall}
+
+\begin{note}
+\textbf{与不等式约束的联系.}\;严格等式 $\mathbf{h}=\mathbf{0}$ 把可行集压成零测流形；TSR 的 $[-a,a]$ 边界实为不等式约束 $\|\,\cdot\,\|\le a$，把“曲面”加厚成“薄壳”，可行集有了正体积，采样命中率进一步回升（柔性物体允许微小变形即属此类）。放松是降维、加厚是增容，二者常合用：先按任务砍掉无关维，再给保留维留出公差带。这与 \cref{ch:constrained-dynamics} 区分完整/非完整约束、\cref{ch:geometric-mechanics} 的 \cref{def:gm-constraint} 在约束几何上一脉相承——只是那里关心约束对\emph{动力学}的影响（可积性、Pfaffian 形式），本章关心约束对\emph{位形空间搜索}的影响。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+本章把“双臂刚性共持”这一物理约束，逐层化为“低维约束流形上的几何搜索”：闭链约束 $\mathbf{h}(\mathbf{q})=\mathbf{0}$（\cref{def:dap-closedchain}）定义约束流形 $\mathcal{M}$（\cref{def:dap-manifold}），其维数 $n-k$（双 $7$ 自由度臂为 $8$，\cref{prop:dap-dim}）；切空间 $T_{\mathbf{q}}\mathcal{M}=\ker\mathbf{J}_h\approx\ker\mathbf{J}_{\text{rel}}$（\cref{thm:dap-tangent}）给出迈步方向；三类采样规划（投影/切空间-Atlas/CBiRRT，\cref{tab:dap-methods}）的本质差异是“在哪个空间采样”；TSR（\cref{def:dap-tsr}）给约束一个声明式外壳；内力零空间（\cref{def:dap-grasp}）提醒“运动可行 $\neq$ 力学可行”；任务放松（\cref{prop:dap-relax}）通过降维指数级提速。
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 闭链约束 & $\mathbf{h}=\mathrm{Log}((\mathbf{T}_{\text{rel}}^{\star})^{-1}\mathbf{T}_L^{-1}\mathbf{T}_R)=\mathbf{0}$ & $\bigstar\bigstar$ \\
+2 & 约束流形 & $\mathcal{M}$ 是 $14$ 维里的 $8$ 维曲面（零测集） & $\bigstar\bigstar$ \\
+3 & 维数灾难 & 盲采样命中率 $\sim(\epsilon/L)^k$，方法论错误 & $\bigstar\bigstar$ \\
+4 & 约束雅可比 & $\mathbf{J}_h\approx\mathbf{J}_{\text{rel}}=\bar{\mathbf{J}}_R-\bar{\mathbf{J}}_L$ & $\bigstar\bigstar\bigstar$ \\
+5 & 切空间 & $T_{\mathbf{q}}\mathcal{M}=\ker\mathbf{J}_h$；SVD 取正交基 & $\bigstar\bigstar\bigstar$ \\
+6 & 投影法 & 环境空间采样 $+$ Newton 拉回，简单低效 & $\bigstar\bigstar$ \\
+7 & 切空间/Atlas & 低维切空间采样，指数提速 & $\bigstar\bigstar\bigstar$ \\
+8 & CBiRRT & 双向 RRT $+$ 投影；概率完备非最优 & $\bigstar\bigstar\bigstar$ \\
+9 & TSR & $6$ 维边界盒声明式约束；TSR 链 & $\bigstar\bigstar$ \\
+10 & 内力零空间 & $\ker(\mathbf{G})$ 与 $\ker(\mathbf{J}_{\text{rel}})$ 对偶 & $\bigstar\bigstar\bigstar$ \\
+11 & 约束放松 & 砍无关维 $\Rightarrow$ 升流形维 $\Rightarrow$ 提速 & $\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\mathbf{q}\in\mathbb{R}^{n}$ & 联合关节位形（双 $7$ 自由度 $n=14$） & \cref{def:dap-closedchain} \\
+$\mathbf{h}(\mathbf{q})\in\mathbb{R}^{k}$ & 约束函数，$\mathbf{h}=\mathbf{0}$ 定义闭链 & \cref{eq:dap-h} \\
+$\mathbf{T}_{\text{rel}}^{\star}$ & 刚性共持的标称相对位姿（常量） & \cref{def:dap-closedchain} \\
+$\mathcal{M}$ & 约束流形，维数 $n-k$ & \cref{eq:dap-manifold} \\
+$\mathbf{J}_h\in\mathbb{R}^{k\times n}$ & 约束雅可比 $\partial\mathbf{h}/\partial\mathbf{q}$ & \cref{eq:dap-Jh} \\
+$\mathbf{J}_{\text{rel}}$ & 相对雅可比 $\bar{\mathbf{J}}_R-\bar{\mathbf{J}}_L$ & \cref{eq:dap-Jh} \\
+$T_{\mathbf{q}}\mathcal{M}=\ker\mathbf{J}_h$ & 流形在 $\mathbf{q}$ 处的切空间 & \cref{thm:dap-tangent} \\
+$\boldsymbol{\Phi}$ & 切空间正交基（SVD 后 $n-k$ 列） & \cref{eq:dap-tanbasis} \\
+$\mathbf{J}_h^{+}$ & $\mathbf{J}_h$ 的 Moore--Penrose 伪逆 & \cref{eq:dap-newton} \\
+$\rho,\alpha_{\max}$ & Atlas 卡半径 / 相邻卡法向夹角阈值 & \cref{alg:dap-atlas} \\
+$\delta,\epsilon$ & RRT 步长 / 约束满足容差 & \cref{alg:dap-cbirrt} \\
+$(\mathbf{T}_{w0},\mathbf{T}_{we},\mathbf{B}_w)$ & TSR 参考帧/标称位姿/$6$ 维边界盒 & \cref{def:dap-tsr} \\
+$\mathbf{G}\in\mathbb{R}^{6\times6N}$ & 抓取矩阵；内力 $\in\ker(\mathbf{G})$ & \cref{def:dap-grasp} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：规划永远超时、找不到任何点。\textbf{排查}：是否在用标准 RRT 直接采样（\cref{eq:dap-curse} 命中率近零）？改投影法/切空间法；确认起终点 $\|\mathbf{h}\|<\epsilon$ 且在同一连通分支（否则需重抓）。
+  \item \textbf{症状}：Newton 投影发散或不收敛。\textbf{原因}：初始点离流形太远、$\mathbf{J}_h$ 接近协调奇异（$\kappa$ 大）。\textbf{对策}：减小步长 $\delta$、限制单步 $\|\Delta\mathbf{q}\|$、用阻尼伪逆（\cref{thm:ak-dls}）替代正规方程伪逆。
+  \item \textbf{症状}：路径起终点合规、中段约束违反。\textbf{原因}：边检查未做约束投影（\cref{der:dap-edge}）。\textbf{对策}：开启约束感知 \textsc{EdgeValid}，减小边检查分辨率，打印中间点 $\|\mathbf{h}\|$。
+  \item \textbf{症状}：规划成功但执行时两臂相撞。\textbf{原因}：只设了约束、漏设臂间碰撞检查。\textbf{对策}：启用左右各臂末端段（第 $4$--$7$ 连杆）之间的碰撞对，别被自动碰撞矩阵误关。
+  \item \textbf{症状}：物体绕某轴转动被误判成“相对运动”、误算出内力。\textbf{原因}：相对雅可比未统一参考点，直接 $\mathbf{J}_R-\mathbf{J}_L$。\textbf{对策}：先用平移算子把两臂 twist 移到公共参考点再做差（\cref{eq:dap-Jh} 的 $\bar{\mathbf{J}}_i$）。
+  \item \textbf{症状}：放松约束后物体姿态漂移/脱手。\textbf{原因}：误把承重或夹持相关自由度放松（\cref{prop:dap-relax} 陷阱）。\textbf{对策}：仅放松任务语义上无关的对称自由度，并核对其非内力关键方向。
+\end{enumerate}
+
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{约束规划综述}：Kingston、Moll、Kavraki\cite{kingston2018survey}——约束流形采样规划最权威综述，系统比较投影/Atlas/切空间等方法族，本章方法论主线的统一出处。
+  \item \textbf{TSR 与 CBiRRT 奠基}：Berenson、Srinivasa、Kuffner\cite{berenson2011tsr}——任务空间区域与约束双向 RRT 原始论文，工程化约束规划的起点。
+  \item \textbf{Atlas 图谱法}：Jaillet 与 Porta\cite{jaillet2013atlas}——切空间卡（chart）铺设流形的理论根基。
+  \item \textbf{协调运动学/力学衔接}：本书 \cref{ch:mr-multiarm}（相对/绝对雅可比、内力，\cref{sec:ma-coopkin}、\cref{sec:ma-internalforce}）与 \cref{ch:mr-coopforce}（抓取矩阵、协同力控，\cref{sec:cm-grasp}）——本章的运动学前置与力控下游。
+  \item \textbf{自由空间采样规划}：本书 \cref{ch:arm-traj}、LaValle\cite{lavalle2006planning}、Kuffner--LaValle\cite{kuffner2000rrtconnect}——RRT/RRT-Connect 与概率完备性，本章约束扩展的母体。
+\end{itemize}

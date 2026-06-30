@@ -1,0 +1,318 @@
+\chapter{工程实践：用 Docker+ROS+Gazebo 跑通 SLAM 仿真}
+\label{ch:engineering}
+
+本书前面几部把 SLAM 的数学与算法讲透了：李群与位姿（\cref{ch:lie}）、IMU 模型与预积分（\cref{ch:imu}）、点云处理（\cref{ch:pointcloud}）、激光与紧耦合里程计（\cref{ch:lidar_slam}）、视觉惯性里程计（\cref{ch:vio}）。但理论“看懂”与“跑通”之间还隔着一层工程：编译器版本、第三方库 ABI、ROS 发行版、GPU 驱动、可视化权限……任何一处不对都会让一个本该出图的算法默默失败。本章不重讲理论，只给一条\emph{可复现}的动手路线——在容器里搭好带 GPU 的 ROS+Gazebo 环境，造一台带 Mid360 激光雷达的仿真小车，把 FAST-LIO 真正跑起来。读者照做即可在自己机器上复现，并据此替换为真实数据集或真机。
+
+本章默认难度 $\bigstar$：不涉及推导，但需要一些 Linux/Docker/ROS 的基本操作经验。
+
+\section{为什么要一个容器化的仿真环境}
+
+SLAM 算法的依赖通常很“重”而且彼此挑剔：FAST-LIO 依赖特定版本的 Sophus、Eigen、PCL、ROS；多个算法装在同一台机器上时，库版本极易互相打架。直接在宿主系统上装，往往是“装好 A、再装 B 时把 A 弄坏”。容器化的好处正是针对这些痛点：
+
+\begin{itemize}
+  \item \textbf{依赖隔离}：每个算法栈一个镜像，宿主系统保持干净，版本冲突被关进容器内部。
+  \item \textbf{一键复现}：一份 \verb|Dockerfile| 把“从空白系统到能跑算法”的全过程固化成可执行脚本；换一台机器 \Verb[breaklines]|docker build| 即得同样环境，告别“在我电脑上是好的”。
+  \item \textbf{GPU 直通}：通过 NVIDIA Container Toolkit，容器可直接使用宿主显卡——Gazebo 仿真器与 RViz 的渲染、以及部分算法的 GPU 计算都依赖它。
+  \item \textbf{随用随弃}：用 \verb|--rm| 跑完即删，反复试错不留垃圾。
+\end{itemize}
+
+需要强调：容器只解决\emph{环境}问题，不改变\emph{算法}本身。下面凡涉及具体镜像，都用社区公开的官方基础镜像（如 \Verb[breaklines]|ros:noetic-perception-focal|）举例，读者可在其上自行编译所需算法，或换成自己维护的镜像。
+
+\section{Docker + GPU：搭一个能跑 Gazebo 的环境}
+
+\subsection{NVIDIA Container Toolkit}
+
+默认情况下 Docker 容器\emph{看不到}宿主 GPU。要让容器内的 Gazebo/RViz 走硬件渲染、让算法用上 CUDA，需先在宿主上安装并配置 NVIDIA Container Toolkit（前提：宿主已正确安装 NVIDIA 驱动，\verb|nvidia-smi| 能出卡信息）。
+
+\begin{codebox}[bash]{安装并配置 NVIDIA Container Toolkit（宿主侧，一次性）}
+# 1) 添加官方 GPG 密钥与 apt 源
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+# 2) 安装
+sudo apt-get update
+sudo apt-get install -y nvidia-container-toolkit
+
+# 3) 让 Docker 识别 nvidia 运行时（写入 /etc/docker/daemon.json）
+sudo nvidia-ctk runtime configure --runtime=docker
+
+# 4) 重启 Docker 生效
+sudo systemctl restart docker
+\end{codebox}
+
+关键一步是 \Verb[breaklines]|nvidia-ctk runtime configure|：它把 \verb|nvidia| 运行时注册进 Docker，之后 \Verb[breaklines]|docker run --gpus all| 才能把显卡透传进容器。验证：在任一带 CUDA 的镜像里跑 \verb|nvidia-smi|，能列出宿主显卡即配置成功。
+
+\subsection{运行 GUI/Gazebo 容器}
+
+Gazebo 与 RViz 是图形程序，要把窗口画到宿主屏幕上，需把宿主的 X11 socket 与认证文件挂进容器，并放行显示权限。一个可直接套用的运行模板如下：
+
+\begin{codebox}[bash]{运行一个带 GPU 与可视化的 ROS 容器}
+# 先在宿主终端放行本机 X 访问（容器的 GUI 才能显示出来）
+xhost +local:
+
+docker run -it --rm \
+    --gpus all \
+    -e "DISPLAY=$DISPLAY" \
+    -e "QT_X11_NO_MITSHM=1" \
+    -e "NVIDIA_DRIVER_CAPABILITIES=all" \
+    -v "/tmp/.X11-unix:/tmp/.X11-unix:rw" \
+    -v "$HOME/.Xauthority:/root/.Xauthority:rw" \
+    -v "$(pwd)/data:/root/data" \
+    --network=host \
+    ros:noetic-perception-focal
+\end{codebox}
+
+逐项说明（按用途分组，读者按需增删）：
+
+\begin{itemize}
+  \item \Verb[breaklines]|--gpus all|：把宿主全部 GPU 透传进容器（依赖上一节的 toolkit）。\textbf{虚拟机里务必去掉这一项}——虚拟机通常无法直通宿主显卡，带着它会直接报错。
+  \item \Verb[breaklines]|-e DISPLAY|、\Verb[breaklines]|-v /tmp/.X11-unix|、\Verb[breaklines]|-v ~/.Xauthority|、\Verb[breaklines]|-e QT_X11_NO_MITSHM=1|：四项配合实现 X11 可视化转发，缺一则 Gazebo/RViz 窗口起不来。
+  \item \Verb[breaklines]|-e NVIDIA_DRIVER_CAPABILITIES=all|：把计算（Compute）与图形（Graphics/Display）能力都映射进容器。\textbf{这一项对 RViz/Gazebo 走硬件渲染至关重要}，缺了它即便透传了 GPU，渲染仍会回退到软件路径而严重卡顿。
+  \item \Verb[breaklines]|-v $(pwd)/data:/root/data|：把宿主目录挂进容器，用来读 rosbag、写地图。冒号左边是宿主路径、右边是容器内路径。需要塞数据集进去（例如离线 \verb|.bag|）就靠这种挂载。
+  \item \Verb[breaklines]|--network=host|：与宿主共享网络栈，省去 ROS 多机/多终端通信的端口映射，调试期最省心。
+\end{itemize}
+
+\paragraph{无独显的退路。}Gazebo 物理+渲染对 GPU 敏感，没有 NVIDIA 显卡时仿真会明显卡顿，但仍可运行：去掉 \Verb[breaklines]|--gpus all| 与 \Verb[breaklines]|NVIDIA_DRIVER_CAPABILITIES|，Gazebo 会退回软件渲染（Mesa/llvmpipe）。能跑通流程，只是帧率低、世界一复杂就吃力——验证算法逻辑够用，跑大场景或实时性测试则建议配独显。
+
+\section{ROS 消息处理：从话题到可用数据}
+
+仿真也好真机也好，传感器数据都以 ROS 话题（topic）流动。SLAM 节点要做的第一件事就是把这些消息解析成算法能吃的内部表示。这里只点两类最常用的消息——IMU 与点云——它们分别对应 \cref{ch:imu} 与 \cref{ch:pointcloud} 的理论。
+
+\subsection{IMU：\texttt{sensor\_msgs/\allowbreak Imu}}
+
+ROS1 里 IMU 数据统一用 \Verb[breaklines]|sensor_msgs/Imu| 传递，它含四部分：
+
+\begin{itemize}
+  \item \Verb[breaklines]|std_msgs/Header header|：含时间戳 \verb|stamp|，用 \verb|toSec()| 转成秒后即可求相邻帧时间差 $\Delta t$——预积分（\cref{ch:vio}）与点云去畸变（\cref{ch:pointcloud}）都要用它。
+  \item \Verb[breaklines]|geometry_msgs/Quaternion orientation| 与 \Verb[breaklines]|float64[9] orientation_covariance|：姿态四元数及其协方差（许多裸 IMU 不直接给姿态，此字段可能为空）。
+  \item \Verb[breaklines]|geometry_msgs/Vector3 angular_velocity| 与对应协方差：陀螺仪角速度。
+  \item \Verb[breaklines]|geometry_msgs/Vector3 linear_acceleration| 与对应协方差：加速度计读数。
+\end{itemize}
+
+这里有一个最常被新手踩的坑，值得用一整段标注：\textbf{IMU 加速度字段是\emph{线加速度}（含重力），不是线速度}。字段名 \Verb[breaklines]|linear_acceleration| 已经写明，但概念上极易与“速度”混淆。正如 \cref{ch:imu} 所述，加速度计静止时读到的是反重力支撑力（约 $9.81\,\mathrm{m/s^2}$ 指向上方），运动时读到的是“比力”（specific force）；要得到位移必须对其\emph{两次}积分并扣除重力。把它误当速度做\emph{一次}积分，轨迹会立刻发散。
+
+\subsection{点云：\texttt{sensor\_msgs/\allowbreak PointCloud2} 与 PCL}
+
+点云由激光雷达产生，不同厂商、不同工作原理给出的原始格式各异，需由厂商驱动统一转成 ROS 标准的 \Verb[breaklines]|sensor_msgs/PointCloud2|。算法侧拿到这种消息后，常用 PCL（Point Cloud Library）把它转成 \Verb[breaklines]|pcl::PointCloud|，再做下采样与滤波——直接从雷达来的点动辄几十万，不降采样既费内存又拖慢配准（\cref{ch:pointcloud} 详述了体素滤波等方法）。
+
+\begin{codebox}[C++]{ROS PointCloud2 转 PCL 并做体素降采样}
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl_conversions/pcl_conversions.h>
+
+void cloudCallback(const sensor_msgs::PointCloud2ConstPtr& msg) {
+  // 1) ROS 消息 -> PCL 点云（带强度的 XYZI）
+  pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>);
+  pcl::fromROSMsg(*msg, *cloud);
+  std::cout << "raw points: " << cloud->points.size() << std::endl;
+
+  // 2) 体素栅格降采样:每个 0.2m 立方体内的点合并为一个质心点
+  //    叶子尺寸过大会丢细节、过小则降采样不充分（见 ch:pointcloud）
+  pcl::VoxelGrid<pcl::PointXYZI> voxel;
+  voxel.setInputCloud(cloud);
+  voxel.setLeafSize(0.2f, 0.2f, 0.2f);
+  pcl::PointCloud<pcl::PointXYZI>::Ptr filtered(
+      new pcl::PointCloud<pcl::PointXYZI>);
+  voxel.filter(*filtered);
+  std::cout << "after voxel: " << filtered->points.size() << std::endl;
+}
+\end{codebox}
+
+\Verb[breaklines]|pcl::fromROSMsg| 是 ROS 与 PCL 的桥；点的字段类型要与雷达实际发布的一致（多线雷达常用 \verb|PointXYZI|，带强度）。体素叶子尺寸是关键超参，需在“点数”与“细节保留”间权衡（\cref{ch:pointcloud}）。除体素滤波外，常配合统计离群点剔除等去噪步骤。
+
+\section{Gazebo 导航小车仿真：bcr\_bot}
+
+有了环境，下一步是造一个带传感器的移动机器人。这里选用社区开源的差速底盘仿真包 bcr\_bot（Black Coffee Robotics 维护，提供独立的 ROS1/ROS2 分支）\footnote{源码：\url{https://github.com/blackcoffeerobotics/bcr_bot}。}，本章用其 ROS1 Noetic 分支。
+
+\subsection{准备依赖与工作空间}
+
+刚进官方基础镜像时常缺 \verb|git|、\verb|wget| 等基础工具，需先补齐；随后把仿真包、Livox 仿真插件、FAST-LIO 等克隆进 catkin 工作空间。
+
+\begin{codebox}[bash]{在容器内准备工具与工作空间}
+# 基础镜像往往不带 git/wget，先装上
+apt update && apt install -y git wget
+
+# 建工作空间并拉取所需仓库
+mkdir -p ~/slam_ws/src && cd ~/slam_ws/src
+git clone https://github.com/blackcoffeerobotics/bcr_bot.git
+cd bcr_bot && git switch ros1 && cd ..               # 切到 ROS1 分支
+git clone https://github.com/Livox-SDK/livox_ros_driver.git
+git clone https://github.com/fratopa/Mid360_simulation_plugin.git   # Mid360 Gazebo 插件
+git clone https://github.com/zlwang7/S-FAST_LIO.git  # FAST-LIO（精简实现）
+\end{codebox}
+
+\paragraph{依赖编译的注意点。}FAST-LIO 一类算法依赖 Livox-SDK 与 Sophus。Sophus 的编译安装偶有“反复横跳”：明明 \Verb[breaklines]|make install| 成功，整工作空间 \verb|catkin_make| 时却报找不到 Sophus。稳妥做法是 \Verb[breaklines]|git checkout| 到算法 README 指定的提交，并准备两套等价的安装方式（CMake 三段式 \Verb[breaklines]|cmake -S . -B build| / 传统 \Verb[breaklines]|mkdir build && cd build && cmake ..|）以备切换；个别旧版本还需对源码做一处小修补才能在新编译器上通过。容器内网络不畅时，可在宿主克隆好再用挂载或 \Verb[breaklines]|docker cp| 送进容器。
+
+\subsection{launch 文件的三段结构}
+
+工作空间编译并 \Verb[breaklines]|source devel/setup.bash| 后，先跑官方启动文件验证环境是否正常：
+
+\begin{codebox}[bash]{先验证 Gazebo 能起来}
+roslaunch bcr_bot gazebo.launch
+\end{codebox}
+
+切到 ROS1 分支后，\verb|gazebo.launch| 就是仿真入口。深入看会发现它分三段，理解这个结构是后续改装的前提：
+
+\begin{enumerate}
+  \item \textbf{参数声明}：用一组 \verb|arg| 定义使能开关（是否开 2D 雷达、单目相机、是否发布轮式里程计等），见名知意。\textbf{为避免干扰后面要加的三维雷达，把这些干扰性传感器统一置 \texttt{false}}。
+  \item \textbf{仿真环境搭建}：加载世界（world）、起 Gazebo 服务端与客户端。
+  \item \textbf{创建机器人}：把机器人模型生成（spawn）到世界里。这一段在 \Verb[breaklines]|bcr_bot_spawn.launch| 中，它解析的目标是 \Verb[breaklines]|urdf/bcr_bot.xacro|——机器人主文件，传感器都在这里声明。改装机器人主要就改它。
+\end{enumerate}
+
+\section{给 Gazebo 加 Mid360（Livox）激光雷达}
+
+原生 Gazebo 没有 Livox 这类非重复扫描雷达的传感器模型，需借助社区插件。Mid360 是当前很主流的固态/混合固态雷达（也得益于 FAST-LIO 等算法的推广），这里用 \Verb[breaklines]|Mid360_simulation_plugin| 提供的 \Verb[breaklines]|liblivox_laser_simulation.so| 插件，它可用于 Noetic，前一节已克隆进工作空间。
+
+思路是：在机器人主文件 \verb|bcr_bot.xacro| 里，仿照已有传感器的声明方式，新增一个 Mid360 link、一个把它固定到 \verb|base_link| 的关节，再在该 link 上挂两个 Gazebo 传感器插件——一个激光、一个 IMU（Mid360 自带 IMU）。整段用一个 \verb|xacro:if| 开关包裹，便于一键开关。
+
+\begin{codebox}[text]{在 bcr\_bot.xacro 中声明 Mid360 雷达 + IMU（节选）}
+<!-- ============ MID-360 + IMU（用 xacro:if 统一开关）============ -->
+<xacro:if value="$(arg mid360_enabled)">
+
+  <!-- 1) 雷达 link:外形仅用于碰撞/可视化，尺寸可自改 -->
+  <link name="mid360">
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder length="0.06" radius="0.055"/></geometry>
+    </collision>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder length="0.06" radius="0.055"/></geometry>
+      <material name="aluminium"/>
+    </visual>
+    <inertial>
+      <mass value="0.1"/>
+      <xacro:cylinder_inertia m="0.1" r="0.055" h="0.06"/>
+    </inertial>
+  </link>
+
+  <!-- 2) 固定关节:把雷达装到车体上方（安装高度按车体改）-->
+  <joint name="mid360_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="mid360"/>
+    <origin xyz="0 0 0.2" rpy="0 0 0"/>
+  </joint>
+
+  <!-- 3) Gazebo 激光传感器 + Livox 插件 -->
+  <gazebo reference="mid360">
+    <sensor type="ray" name="laser_livox">
+      <always_on>true</always_on>
+      <update_rate>10</update_rate>
+      <plugin name="gazebo_ros_laser_controller"
+              filename="liblivox_laser_simulation.so">
+        <ray>
+          <scan>
+            <horizontal><samples>100</samples><resolution>1</resolution>
+              <min_angle>-3.1415926</min_angle><max_angle>3.1415926</max_angle>
+            </horizontal>
+            <vertical><samples>50</samples><resolution>1</resolution>
+              <min_angle>-3.1415926</min_angle><max_angle>3.1415926</max_angle>
+            </vertical>
+          </scan>
+          <range><min>0.1</min><max>40</max><resolution>1</resolution></range>
+          <noise><type>gaussian</type><mean>0.0</mean><stddev>0.03</stddev></noise>
+        </ray>
+        <samples>20000</samples>
+        <downsample>1</downsample>
+        <csv_file_name>mid360-real-centr.csv</csv_file_name>
+        <!-- 2: sensor_msgs/PointCloud2 | 3: livox_ros_driver/CustomMsg -->
+        <publish_pointcloud_type>2</publish_pointcloud_type>
+        <ros_topic>/livox/lidar</ros_topic>
+        <frameName>mid360</frameName>       <!-- 用雷达自身 frame -->
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <!-- 4) Gazebo IMU 传感器（Mid360 自带 IMU，200Hz）-->
+  <gazebo reference="mid360">
+    <sensor type="imu" name="mid360_imu">
+      <always_on>true</always_on>
+      <update_rate>200</update_rate>
+      <plugin name="mid360_imu_plugin" filename="libgazebo_ros_imu_sensor.so">
+        <robotNamespace></robotNamespace>  <!-- 空=根命名空间 / -->
+        <topicName>livox/imu</topicName>    <!-- 注意不要加前导 / -->
+        <frameName>mid360</frameName>       <!-- 必填，缺失即失败 -->
+        <gaussianNoise>0.0002</gaussianNoise>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+</xacro:if>
+\end{codebox}
+
+几点要点：
+
+\begin{itemize}
+  \item 这段在 \verb|base_link| 下定义了 \verb|mid360| 坐标系，用一个固定关节描述它在车上的安装位姿（这里抬高 $0.2\,\mathrm{m}$），再给一个圆柱碰撞/可视化外形。
+  \item \Verb[breaklines]|publish_pointcloud_type| 选 \verb|2| 时发布标准 \Verb[breaklines]|sensor_msgs/PointCloud2|（通用、RViz 可直接显示）；选 \verb|3| 时发布 Livox 自定义的 \verb|CustomMsg|（带逐点时间戳，FAST-LIO 等可用它做更精细的去畸变）。按下游算法的输入要求选择。
+  \item 雷达 frame（\verb|mid360|）与 IMU frame 在工程语义上是\emph{两个}坐标系，但点云通常会被变换到 IMU 系下处理，故此处统称雷达坐标系即可。
+  \item 顶部加一个开关 \verb|arg| 即可一键开启：\Verb[breaklines]|<xacro:arg name="mid360_enabled" default="true"/>|。
+\end{itemize}
+
+保存后重开仿真，就能在 Gazebo/RViz 里看到 \verb|/livox/lidar| 的点云与 \verb|/livox/imu| 的 IMU 流。
+
+\section{在仿真 Mid360 上跑 FAST-LIO}
+
+现在数据齐了：仿真雷达发 \verb|/livox/lidar|（点云）、仿真 IMU 发 \verb|/livox/imu|。把这两个话题接给 FAST-LIO 的配置（改其 launch/yaml 里的话题名与雷达类型为 Livox/Mid360），即可在仿真里跑紧耦合激光惯性里程计。FAST-LIO 用迭代误差状态卡尔曼把 IMU 预积分（\cref{ch:vio}）与点云配准（\cref{ch:pointcloud}）紧耦合，输出高频里程计与点云地图\cite{xu2021fastlio}；同族的 Point-LIO\cite{he2023pointlio} 与弹性的 CT-ICP\cite{dellenbach2022cticp} 在 \cref{ch:lidar_slam} 已有理论对比，仿真里把对应实现接上同样的两个话题即可横向比较。
+
+\paragraph{话题与坐标系对齐。}跑通的关键是“话题名”和“坐标系”两条线都接上：
+
+\begin{itemize}
+  \item \textbf{话题名}：确认 FAST-LIO 订阅的雷达/IMU 话题与插件发布的一致（这里是 \verb|/livox/lidar| 与 \verb|/livox/imu|），雷达类型选 Livox。
+  \item \textbf{坐标系（TF）}：原生 FAST-LIO 习惯输出 \Verb[breaklines]|camera_init -> body| 的变换。这里的 \verb|camera_init| 是系统初始化时刻建立的局部世界系（语义上接近 ROS 的 \verb|odom|：局部连续、可能漂移），\verb|body| 则是滤波器状态所在的机体系（常与 IMU 系一致）。而仿真 bcr\_bot 的 TF 是 \Verb[breaklines]|base_footprint -> base_link -> mid360|。两套 TF 若不打通，会出现“两棵互不连通的 TF 树”，ROS 不允许这种情况，后续导航也无法使用。
+\end{itemize}
+
+\paragraph{打通 TF 树的正确姿势。}直觉上想“把 \texttt{mid360} 和 \texttt{body} 改成同名”来连接两棵树，但这会让一个节点出现\emph{两个父节点}，TF 规定每个坐标系至多一个父节点，行不通。正确做法是用一个\emph{静态变换}把两棵树串起来：注意到雷达刚性固连于车，\Verb[breaklines]|base_footprint -> mid360| 是常量，只需测一次再求逆，得到 \Verb[breaklines]|body -> base_footprint|（\verb|body| 与 \verb|mid360| 本质同为雷达系），用静态发布节点发出，即给 \Verb[breaklines]|base_footprint| 补上 \verb|body| 这个父节点。具体三步：
+
+\begin{enumerate}
+  \item 运行仿真后用 \Verb[breaklines]|rosrun tf tf_echo base_footprint mid360| 读出平移 $t$ 与四元数 $q$；
+  \item 求逆变换（\cref{ch:lie}：刚体变换的逆为 $\mathbf{R}^\top,-\mathbf{R}^\top\mathbf{t}$），算出 \Verb[breaklines]|body -> base_footprint| 的 $(t',q')$；
+  \item 在 launch 里加一个 \Verb[breaklines]|static_transform_publisher| 发布它。
+\end{enumerate}
+
+\begin{codebox}[Python]{由 (t, q) 计算逆变换参数}
+import numpy as np
+tx, ty, tz = 0.0, 0.0, 0.25       # <- 改成 tf_echo 打印的 translation
+qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0  # <- 改成 tf_echo 打印的 quaternion
+
+# 单位四元数求逆 = 共轭
+qinv = np.array([-qx, -qy, -qz, qw])
+x, y, z, w = qinv
+R = np.array([
+    [1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w)],
+    [2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w)],
+    [2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)],
+])
+t = np.array([tx, ty, tz])
+tinv = -R.dot(t)                  # 平移逆变换
+print("t_inv:", *tinv)
+print("q_inv:", *qinv)
+\end{codebox}
+
+\begin{codebox}[text]{在 launch 中发布静态变换（串联两棵 TF 树）}
+<node pkg="tf2_ros" type="static_transform_publisher"
+      name="tf_body_to_base_footprint"
+      args="X Y Z QX QY QZ QW body base_footprint" />
+\end{codebox}
+
+\paragraph{（选读）从三维点云到二维栅格地图。}FAST-LIO 输出的是三维点云地图，地面机器人导航通常要二维栅格图。常见做法是用 OctoMap\cite{hornung2013octomap}（基于八叉树的概率占据地图）订阅 FAST-LIO 的稠密点云话题（如 \Verb[breaklines]|/cloud_registered|），它在内部把点云融成三维占据体素后，再沿 $Z$ 方向压扁、发布二维投影栅格 \Verb[breaklines]|/projected_map|（\Verb[breaklines]|nav_msgs/OccupancyGrid|）供导航使用。两个最常踩的坑：一是 \verb|frame_id| 必须设为\emph{绝对静止}的全局系（如 \verb|camera_init|），\verb|base_frame_id| 设为机器人基座系；二是高度裁剪范围（\Verb[breaklines]|occupancy_min_z|/\allowbreak\verb|max_z|）设得不合理会把点全过滤掉，导致八叉树为空、地图发不出来。若雷达安装有倾斜而 SLAM 未用重力对齐，投影出的栅格会是“斜”的——可再引入一个与 \verb|camera_init| 差一个固定变换的 \verb|odom| 全局系，在其下投影。
+
+\section{常见陷阱速查}
+
+把动手过程里反复出现的坑集中列出，照单排查通常能省下大量时间：
+
+\begin{itemize}
+  \item \textbf{Gazebo 卡成幻灯片}：多半是没走 GPU 渲染——检查 \Verb[breaklines]|--gpus all| 与 \Verb[breaklines]|NVIDIA_DRIVER_CAPABILITIES=all| 是否都给了，宿主 \verb|nvidia-smi| 是否正常。虚拟机内则去掉 \Verb[breaklines]|--gpus all| 用软件渲染、并降低世界复杂度。
+  \item \textbf{GUI 起不来}（如 \verb|gzclient| 退出码 134、RViz 报 X 错误）：宿主没放行 X 访问。在宿主终端执行 \Verb[breaklines]|xhost +local:|（或 \Verb[breaklines]|xhost +|），并确认 \Verb[breaklines]|-e DISPLAY|、\Verb[breaklines]|/tmp/.X11-unix|、\verb|~/.Xauthority| 三项挂载都在。
+  \item \textbf{插件 \texttt{.so} 加载失败}（\Verb[breaklines]|liblivox_laser_simulation.so| 找不到）：插件包没编译或没 source。确认它在工作空间编译通过、已 \Verb[breaklines]|source devel/setup.bash|；\verb|filename| 写的是\emph{库文件名}而非路径，依赖 \Verb[breaklines]|GAZEBO_PLUGIN_PATH| 能找到它。
+  \item \textbf{话题对不上}：仿真发的与算法订阅的话题名不一致是“没数据”的头号原因。用 \Verb[breaklines]|rostopic list|/\allowbreak\Verb[breaklines]|rostopic hz| 核对 \verb|/livox/lidar|、\verb|/livox/imu| 是否真在发、频率是否合理；IMU 插件的 \verb|topicName| 不要加前导 \verb|/|（插件会自行拼命名空间）。
+  \item \textbf{TF 树割裂或成环}：仿真与 FAST-LIO 各成一棵树（不连通），或乱接父节点导致环路，都会让导航/可视化失败。用 \Verb[breaklines]|rosrun rqt_tf_tree rqt_tf_tree| 查看 TF 树，按上一节的静态变换法连接，确保每个 frame 恰有一个父节点。
+  \item \textbf{点云类型/字段不匹配}：\Verb[breaklines]|publish_pointcloud_type| 选错（2 vs 3），或 \Verb[breaklines]|pcl::fromROSMsg| 的点类型与实际字段不符，会导致解析为空或崩溃。让插件输出与下游算法期望的消息类型一致。
+  \item \textbf{时间戳与同步}：Mid360 这类非重复扫描雷达逐点采样、运动中产生畸变（\cref{ch:pointcloud}），需要高频 IMU 做去畸变与时间对齐（\cref{ch:imu}、\cref{ch:vio}）。仿真里务必让雷达与 IMU 时间戳一致、IMU 频率够高（如 $200\,\mathrm{Hz}$），否则紧耦合里程计的精度与稳定性都会受损。
+\end{itemize}
+
+把上面这条链跑通后，仿真环境就成了算法的“数字风洞”：可以随意换世界、调噪声、改安装位姿，反复检验 \cref{ch:lidar_slam} 的里程计在各种条件下的表现，再平滑过渡到真机与公开数据集。

@@ -1,0 +1,885 @@
+\chapter{六轴力矩机械臂全栈运动控制实战}
+\label{ch:arm-prac}
+
+% ════════════════════════════════════════════════════════════════
+%  实践/capstone 章：定基六轴「力矩控制」串联臂 arm_dm 的全栈运动控制。
+%  定位：本部其余理论章（运动学/动力学/轨迹/控制）尚在补源期，故本章设计为
+%  「自包含实战」——把力矩控制范式、计算力矩 vs PD+g、操作空间控制 OSC vs
+%  运动学 resolved-rate、病态质量阵根因、CBF 反应避障、笛卡尔阻抗、力矩约束
+%  TOPP-RA、混合力位 一条线讲清，理论锚点凡本书已有更深处一律 \cref 回 P0/P3/P4，
+%  本部未来理论章则以「文字前向引用」点到（不打悬空 \cref）。下接 P8 ch:rlmc-manip。
+%  源：docs/Robot吸收_arm机械臂运控.md（用户亲手做的 arm_control 工程消化稿）。
+%  纪律：忠于源数值/公式、诚实框定（占位惯量/开环力），实践章 text:code 可放宽。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的工程地图表与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 一台机械臂的电机底层只接受\emph{力矩}指令，可你想让它的末端像一根\emph{弹簧}一样——被推就退让、撤手就弹回，且\emph{不装任何力/力矩传感器}。这件事在物理上为什么可能？需要哪些量（运动学、动力学）才能把“位置偏差”换算成“该出多大力矩”？
+  \item 同一条几何路径 $\mathbf{q}(s)$，你给它配两套时间律：一套只约束“关节加速度不超 $\pm 8$”，另一套约束“关节力矩不超 $\pm 26\,\mathrm{N\!\cdot\! m}$”。结果后者比前者\emph{快了 4.6 倍}、且把驱动力用满，前者却只用到了 16\% 的力矩裕度。为什么“限加速度”既可能\emph{不安全}又\emph{浪费}？要修它必须引入什么？
+  \item 你照搬冗余机械臂教科书的“操作空间控制（OSC）+ 动力学一致零空间投影”，想让末端\emph{锁死不动}、同时让手肘在零空间里自运动。可末端却漂了 $60$--$110\,\mathrm{mm}$ 收不住；而换一个\emph{不含质量矩阵逆}的运动学级公式，末端立刻锁到 $0.00\,\mathrm{mm}$。同一个机械臂、同一个零空间任务，为什么力矩级会败、速度级会成？根因藏在哪个矩阵的什么数值性质里？
+  \item 你对一段大范围轨迹做计算力矩跟踪，肩肘关节跟得很好，可手腕关节（真实惯量只有 $2\times10^{-4}$）却\emph{全幅发散}；你给手腕施加“原始 PD”，力矩在饱和前竟冲到 $888\,\mathrm{N\!\cdot\! m}$、即便钳到 $26$ 仍产生 $1.3\times 10^{5}\,\mathrm{rad/s^2}$ 的加速度。一个这么轻的关节为什么\emph{更难}控、而不是更好控？“自然时间常数”与“控制频率”的关系是什么？
+  \item “全栈”跑通，是不是把规划、避障、阻抗、计算力矩各演示一遍就算数？如果不是，“全栈”到底要证明什么？两个相邻的控制层（比如“计算力矩跟踪”交给“笛卡尔阻抗柔顺”）之间，交接干净意味着什么？
+  \item 你的实验报告写着“机械臂把末端\emph{钉}在了 $15\,\mathrm{N}$ 的恒力顶住墙面”。一位独立审稿人复核后发现：末端其实停在离墙 $5.6\,\mathrm{cm}$ 处、根本没碰到墙，那 $15\,\mathrm{N}$ 是\emph{开环}给的、没有任何力反馈。这个“过度陈述”说明了什么工程素养？你该怎么改写这句话？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}“纯力矩驱动臂 $\to$ 真阻抗”的范式——为什么力矩控制的臂\emph{无需} F/T 力传感器就能呈现可调柔顺，以及它需要哪些动力学量（\cref{sec:ap-overview,sec:ap-impedance}）；
+  \item \textbf{区分}路径与轨迹（$\mathbf{q}(s)$ 无时间 vs $\mathbf{q}(t)$ 含速度/加速度/jerk/力矩），辨析三种时间参数化（TOTG / TOPP-RA / Ruckig），并理解\emph{力矩约束 TOPP-RA 为何必须走逆动力学}、为何比加速度盒既更安全又更省（\cref{sec:ap-traj}）；
+  \item \textbf{实现}一个\emph{单约束闭式}的控制屏障函数（CBF）速度滤波器做反应式避障（无需 QP 求解器），并能破解“死锁”与“不可达”两种失败模式（\cref{sec:ap-cbf}）；
+  \item \textbf{推导并对比}笛卡尔阻抗 $\boldsymbol{\tau}=\mathbf{J}^\top(-\mathbf{K}_c\Delta\mathbf{x}-\mathbf{D}_c\dot{\mathbf{x}})+\mathbf{g}$ 与计算力矩 $\boldsymbol{\tau}=\mathrm{rnea}(\mathbf{q},\dot{\mathbf{q}},\mathbf{a}_{\mathrm{cmd}})$，复现“计算力矩比 PD+重力补偿紧 $26\times$”的对比、并看懂这个对比\emph{怎样隔离被测变量}（\cref{sec:ap-impedance,sec:ap-ctc}）；
+  \item \textbf{诊断}异质惯量臂（重肩肘 + 轻腕）的两类病：力矩级 OSC 零空间因\emph{质量阵病态}收不住末端、低惯量腕在控制频率下\emph{欠采样发散}；并据“第一性原理（条件数、自然时间常数）”做控制率选择（\cref{sec:ap-illcond}）；
+  \item \textbf{组织}一条“规划 $\to$ 计算力矩 $\to$ 阻抗”的连续力矩会话（M4 capstone），理解层间\emph{干净交接}与\emph{预防性设计}（锁腕、选轻重力起点）（\cref{sec:ap-capstone}）；
+  \item \textbf{运用}一套工程方法论：数据驱动诊断、隔离变量法、警惕 red herring、诚实框定实测边界（\cref{sec:ap-methodology}）；并知道本章经典控制如何\emph{支撑}下一部的强化学习操作（\cref{sec:ap-to-rl}）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把一台真力矩臂从清洗模型到柔顺接触跑通}”的实战主线。它\emph{不}系统重推运动学/动力学（那是本部其余理论章的事，本章遇到时给\emph{自包含的最小够用版}并锚定到工具），而是把“为什么这样设计、为什么那样会坏”讲透。结构如下：
+
+\begin{center}
+\begin{forest} navtreeLR
+[{六轴力矩臂\\全栈运动控制（实战 capstone）}
+  [{范式与本体\\力矩臂$\to$真阻抗}
+    [{异质惯量/三层架构}] ]
+  [{轨迹时间参数化\\path$\ne$trajectory}
+    [{力矩约束 TOPP-RA}] ]
+  [{反应式避障\\CBF 速度滤波}
+    [{死锁/不可达破解}] ]
+  [{力控四范式\\阻抗/计算力矩}
+    [{CT vs PD+g 26$\times$}] ]
+  [{病态根因\\条件数/低惯量腕}
+    [{OSC vs 运动学零空间}] ]
+  [{全栈 capstone\\+ 方法论}
+    [{层间交接/桥到 RL}] ]
+]
+\end{forest}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:ap-overview} 立住“力矩臂 $\to$ 真阻抗”范式与本体特性（异质惯量），是后面所有“病态/解耦”讨论的物理前提，必读；\cref{sec:ap-traj} 是轨迹层，看“限力矩 vs 限加速度”的实测分野；\cref{sec:ap-cbf} 是反应式避障的最小可教实现；\cref{sec:ap-impedance,sec:ap-ctc} 是力控核心（阻抗、计算力矩、混合力位），含两组高价值对比数据；\cref{sec:ap-illcond} 是\emph{全章最深}的一节——把“病态质量阵”作为第一性原理工具讲透，解释为何异质惯量臂的冗余正解是速度级、为何轻腕必须解耦；\cref{sec:ap-capstone,sec:ap-methodology} 是把前面串成连续会话的 capstone 与工程方法论；\cref{sec:ap-to-rl} 是通往下一部强化学习操作的桥。
+
+\subsection*{前置知识桥接}
+本章是一座\emph{实战桥}，把本书已建的数学/控制工具落到一台真臂上：
+\begin{itemize}
+  \item \cref{ch:rigid_body}（刚体运动）与 \cref{ch:lie}（李群）给出 $\SE(3)$ 位姿、齐次变换连乘、$\SO(3)$ 对数映射——本章末端位姿、姿态误差、雅可比的帧变换都建立在它们之上，正文不重述这些基础，只在用到处 交叉引用 回指；
+  \item \cref{sec:ctrl-robot-dyn}（机器人动力学方程 \cref{eq:ctrl-manip} 与结构性质 \cref{prop:ctrl-robot-props}）已给出 $\mathbf{M}\ddot{\mathbf{q}}+\mathbf{C}\dot{\mathbf{q}}+\mathbf{g}=\boldsymbol{\tau}$ 及 $\mathbf{M}\succ0$、$\dot{\mathbf{M}}-2\mathbf{C}$ 斜对称——本章直接\emph{用}它们，不重证；
+  \item \cref{sec:ctrl-robot-ctc}（计算力矩 \cref{thm:ctrl-ctc}）、\cref{sec:ctrl-robot-pd}（PD+重力补偿 \cref{thm:ctrl-pd-grav}）、\cref{sec:ctrl-robot-osc}（操作空间控制 \cref{eq:ctrl-osc}）、\cref{sec:ctrl-robot-impedance}（阻抗 \cref{def:ctrl-impedance,eq:ctrl-impedance}）已给出这四条控制律的\emph{定理与证明}；本章是它们在一台真力矩臂上的\emph{落地、整定与失败分析}，理论一律 交叉引用 回 P4、不重证；
+  \item \cref{sec:plan-chomp}（CHOMP）、\cref{ch:planning}（C-space、采样式规划）、\cref{sec:plan-minsnap}（min-snap 多项式）、\cref{sec:sm-cbf-game}（CBF 安全博弈）给出规划与安全滤波的理论框架；本章把它们落到“OMPL vs CHOMP 实证”“CBF 速度滤波”“min-jerk 参数优化”三个具体工程点。
+\end{itemize}
+
+\begin{note}[本部理论章与本章的关系（自包含说明）]\label{note:ap-selfcontained}
+本部其余理论章（机械臂\emph{运动学}、\emph{动力学}、\emph{轨迹生成与避障}、\emph{控制}）将系统重建 DH/旋量积、逆运动学、雅可比/奇异/冗余、Euler--Lagrange/RNEA/CRBA、操作空间动力学与各控制律的\emph{完整推导}。在它们就位前，本章被设计为\textbf{自包含的实战章}：凡需要的运动学/动力学结论，要么 交叉引用 回本书\emph{已有更深处}（P0 数学、P4 控制），要么就地给出\emph{最小够用}的形式并锚定到计算工具（Pinocchio 的 \texttt{rnea}/\allowbreak\texttt{crba}/\allowbreak\texttt{computeFrameJacobian}）。对“将由本部理论章系统展开”的内容，本章以\emph{文字}前向引用、\emph{不}打跨章交叉引用，以免悬空。
+\end{note}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部根因分析与方法论） & 3--4 小时 & 首次要把一台力矩臂的全栈控制跑通 \\
+速读（范式 + 力控四范式 + 病态根因） & 1.5 小时 & 已懂动力学/控制理论、想看真臂落地与坑 \\
+速查（只看工程地图表与故障排查） & 20 分钟 & 调试时回来查“哪种波形对应哪类根因” \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}[本章记号与约定]\label{note:ap-notation}
+关节角向量 $\mathbf{q}\in\mathbb{R}^6$、关节速度 $\dot{\mathbf{q}}$、关节力矩 $\boldsymbol{\tau}$；末端位姿 $\mathbf{T}\in\SE(3)$、末端位置 $\mathbf{x}\in\mathbb{R}^3$（必要时含姿态）。雅可比 $\mathbf{J}$（末端速度 $\dot{\mathbf{x}}=\mathbf{J}\dot{\mathbf{q}}$）；位置雅可比 $\mathbf{J}_p$（仅取位置三行）。质量阵 $\mathbf{M}(\mathbf{q})\succ0$、科氏阵 $\mathbf{C}(\mathbf{q},\dot{\mathbf{q}})$、重力力矩 $\mathbf{g}(\mathbf{q})$，沿用 \cref{eq:ctrl-manip} 的约定。操作空间惯量 $\boldsymbol{\Lambda}=(\mathbf{J}\mathbf{M}^{-1}\mathbf{J}^\top)^{-1}$，沿用 \cref{eq:ctrl-osc}。本臂六关节记 J1$\dots$J6（腰 J1z、肩 J2y、肘 J3y、球腕 J4x/J5y/J6x）。代码标识符、文件名、ROS/API 名用等宽体（如 \texttt{rnea}、\texttt{JointTorqueConstraint}），不进 math mode。\textbf{诚实框定约定}：凡实测数值，标注其\emph{边界}（“占位惯量下”“开环力”“受控 frame”），不用绝对语——这是本章一以贯之的工程素养（见 \cref{sec:ap-methodology}）。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{项目概览：力矩臂、真阻抗范式与三层架构}
+\label{sec:ap-overview}
+
+\paragraph{动机：理论闭环之外，还有一道“最后一公里”。}
+你已在本书 P0--P4 握有一条完整的纸面闭环：刚体位姿（\cref{ch:rigid_body}）$\to$ 李群速度运动学（\cref{ch:lie}）$\to$ 机器人动力学（\cref{eq:ctrl-manip}）$\to$ 计算力矩 / PD+g / OSC / 阻抗（\cref{sec:ctrl-robot}）。但当你真的要让一台\emph{自定义}六轴臂从“一个 CAD 模型”跑到“被推一把会柔顺退让”，中间横亘着一连串\emph{工程}与\emph{数值}问题：模型怎么清洗才能三方（ROS2 / 力矩接口 / 物理仿真）可用？同一条路径怎么配时间才不超力矩？为什么照搬教科书的 OSC 收不住末端？本章以一台真臂 \texttt{arm\_dm} 为载体，把这道最后一公里走完。
+
+\paragraph{本体：一台“重肩肘 + 轻腕”的异质惯量力矩臂。}
+\texttt{arm\_dm} 是 6R 串联臂，关节配置为腰 J1（绕 $z$）+ 肩 J2（绕 $y$）+ 肘 J3（绕 $y$）+ 球腕 J4/J5/J6（绕 $x$/$y$/$x$）。每关节由达妙（DM）电机驱动，设计为\emph{力矩控制}：额定力矩约 $26\,\mathrm{N\!\cdot\! m}$、额定速度约 $10\,\mathrm{rad/s}$。关节限位约为 J1 $\pm1.57$、J2 $-3.14\dots0$、J3 $0\dots2$、J4 $\pm3$、J5 $\pm1.28$、J6 $\pm1.57\,\mathrm{rad}$。
+
+\begin{insight}[决定全项目算法选择的物理事实：异质惯量]\label{ins:ap-heterogeneous}
+本臂有一个\emph{贯穿全章}的本体特性：\textbf{肩肘（J2/J3）惯量大、良态，球腕（J4/J5/J6）真实 CAD 惯量仅约 $2\times10^{-4}\,\mathrm{kg\!\cdot\! m^2}$}。这个三个数量级的惯量落差，是后续\emph{所有}“腕病态”问题的物理根源：它让质量阵 $\mathbf{M}(\mathbf{q})$ 固有病态（\cref{sec:ap-illcond}），让低惯量腕的自然动力学\emph{快于}控制频率而欠采样发散（\cref{ins:ap-lowinertia}）。\textbf{记住这一条，本章一半的“坑”都能从它推出来}——这正是“先理解本体、再选算法”的范例：不是算法不对，是算法与本体的惯量结构不匹配。
+\end{insight}
+
+\begin{insight}[核心范式：纯力矩驱动臂 $\to$ 真阻抗（无需 F/T）]\label{ins:ap-torque-impedance}
+本章的串联骨架是一句话：\textbf{一台电机底层只接受力矩指令的臂，天然适合做“真阻抗”——测位置/速度、出力矩，让末端呈现一个可调的“弹簧--阻尼”，而\emph{无需}任何力/力矩传感器}。原理见 \cref{def:ctrl-impedance}：与含惯性的环境交互时，机械手应表现为\emph{阻抗}（运动 $\to$ 力）、环境为\emph{导纳}。力矩臂恰好能直接实现阻抗：给定末端位置偏差 $\Delta\mathbf{x}$，由刚度 $\mathbf{K}_c$ 算出该出的笛卡尔力 $\mathbf{F}=-\mathbf{K}_c\Delta\mathbf{x}$，再经静力学对偶 $\boldsymbol{\tau}=\mathbf{J}^\top\mathbf{F}$ 折成关节力矩（\cref{sec:ap-impedance} 详述）。与之相对，\emph{位置控制}的臂要做柔顺得测力、走\emph{导纳}（\cref{def:ctrl-impedance}），接触时易不稳。\textbf{力矩臂 + 阻抗 = 不装力传感器也能安全接触}，是本臂选定的主路线。
+\end{insight}
+
+\paragraph{三层架构：where / when / how 的清晰分工。}
+全栈被组织成\emph{规划 $\to$ 轨迹 $\to$ 控制}三层，各管一件事，靠一个\emph{轨迹文件}解耦：
+
+\begin{table}[H]\centering\small
+\caption{\texttt{arm\_dm} 全栈三层架构（\cref{ins:ap-decouple}）}
+\begin{tabular}{p{0.13\textwidth} p{0.30\textwidth} p{0.30\textwidth} p{0.16\textwidth}}
+\toprule
+层 & 管什么 & 产出 / 工具 & 接口 \\
+\midrule
+规划 path & 无碰撞\emph{几何}路径（where 走）& 关节路点 $\mathbf{q}(s)$；MoveIt2（OMPL / CHOMP）& position / mock \\
+轨迹 time & 给路径\emph{配时间}（when 到）使 vel/accel/jerk/\emph{力矩}可行 & 时间律 $\mathbf{q}(t)$；TOPP-RA / Ruckig / 自写参数优化 & 轨迹文件 \texttt{.npz} \\
+控制 torque & 关节\emph{力矩}执行 + 力/阻抗（how 出力）& 力矩 $\boldsymbol{\tau}(t)$；\texttt{ros2\_control} + Pinocchio & effort \\
+\bottomrule
+\end{tabular}
+\label{tab:ap-arch}
+\end{table}
+
+\begin{insight}[规划/控制解耦：离线规划 $\to$ 在线执行]\label{ins:ap-decouple}
+三层架构的工程落点是\textbf{规划离线、控制在线、靠轨迹文件解耦}。规划侧（MoveIt \texttt{move\_group}，position/mock 接口）\emph{离线}产出关节路点 \texttt{.npz}；控制侧（力矩桥，effort 接口）\emph{在线}加载执行。两者\emph{不同进程、不同硬件接口}，唯一的耦合是那个轨迹文件——这正是工业界“MoveIt 规划 $\to$ \texttt{ros2\_control} 执行”范式。它的好处与四足部 \cref{ch:quad_prac} 的“控制器不该知道下游是仿真还是真机”一脉相承：\textbf{把慢、重、可离线的规划，与快、轻、须实时的控制彻底分开}，各自独立演进、独立调试。
+\end{insight}
+
+\paragraph{物理仿真桥：让 MuJoCo 假扮力矩硬件。}
+本项目用 MuJoCo\cite{todorov2012mujoco} 做接触物理与渲染，经 \texttt{mujoco\_ros2\_control} 的 effort 桥把 \texttt{ros2\_control} 的力矩命令施加到仿真物体。这与 \cref{ins:ap-decouple} 互补：仿真器\emph{假扮}一套力矩硬件，控制器代码对“下游是 MuJoCo 还是真机”无感（同 \cref{ch:quad_prac} 硬件抽象主线）。动力学量（雅可比、重力、质量阵、逆动力学）则由 Pinocchio 在线计算（\cref{sec:ap-pinocchio}）。
+
+\begin{table}[H]\centering\small
+\caption{里程碑路线图：从清洗模型到全栈柔顺（本章主线对应）}
+\begin{tabular}{p{0.10\textwidth} p{0.40\textwidth} p{0.40\textwidth}}
+\toprule
+里程碑 & 内容 & 本章落点 \\
+\midrule
+M0 地基 & 清洗 URDF $\to$ 仿真桥 + 规划$\to$执行 & \cref{sec:ap-model} \\
+M1 轨迹 & 时间参数化 + \emph{力矩约束 TOPP-RA} + 自写参数优化 + OMPL vs CHOMP & \cref{sec:ap-traj} \\
+M2 避障 & 规划期 PlanningScene + \emph{CBF 反应避障} + 运动学零空间冗余 & \cref{sec:ap-cbf,sec:ap-illcond} \\
+M3 力控 & 重力补偿 / 笛卡尔阻抗 / 扰动柔顺 / \emph{计算力矩} / 混合力位 & \cref{sec:ap-impedance,sec:ap-ctc} \\
+M4 capstone & 规划 $\to$ 计算力矩 $\to$ 阻抗 一条连续力矩会话 & \cref{sec:ap-capstone} \\
+\bottomrule
+\end{tabular}
+\label{tab:ap-milestones}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{模型清洗与仿真桥：让一个 CAD 模型三方可用}
+\label{sec:ap-model}
+
+\paragraph{动机：SolidWorks 导出的 URDF 有“力控硬伤”。}
+CAD（SolidWorks）导出的 ROS1 URDF 几何/惯量数字是对的，但对\emph{力控 + 物理仿真}有几处致命缺陷：末端连杆零惯量会让质量阵奇异、ROS1 的传动块与 \texttt{ros2\_control} 不兼容、无名材质会被仿真器静默丢弃。清洗的纪律是\textbf{逐字复制几何/惯量数字、只做针对性修}（避免手抄出错），这与四足部“别用 STL 网格当碰撞体”的工程取舍（\cref{ins:qp-collision}）属同类“建模即工程”问题。
+
+\begin{table}[H]\centering\small
+\caption{URDF 清洗清单：改了什么、为什么（\texttt{clean\_urdf.\allowbreak py}）}
+\begin{tabular}{p{0.42\textwidth} p{0.50\textwidth}}
+\toprule
+修改 & 原因 \\
+\midrule
+末端 link6 质量 $0.003\!\to\!0.15$，惯量 $0\!\to\!\mathrm{diag}(10^{-3})$ & 零惯量 $=$ \emph{质量阵奇异} $\to$ 仿真编译/计算力矩第一步即崩；$10^{-5}$ 又太小致数值爆（\cref{sec:ap-num-explode}）$\to$ 定 $10^{-3}$ 占位（真末端待精修，见 \cref{ins:ap-placeholder}）\\
+加 \texttt{world} link + fixed joint $\to$ \texttt{base\_link} & 把它变成\emph{定基}串联臂 \\
+删 6 个 \texttt{<transmission>}（ROS1 接口）+ 8 个 \texttt{<gazebo>} 块 & \texttt{ros2\_control}/effort/MuJoCo 不兼容这些 ROS1 残留 \\
+空 \texttt{<material name="">} $\to$ \texttt{mat\_<link>} & 仿真器\emph{静默丢弃}无名材质（与“无名材质穿地”同类坑）\\
+\emph{未动}：底座残留大质量（固定后无害）、合法 CAD 惯量 & 不乱改有效 CAD 数字 \\
+\bottomrule
+\end{tabular}
+\label{tab:ap-cleanurdf}
+\end{table}
+
+\begin{pitfall}[正定惯量的“反直觉合法例”：别过度标注]\label{pit:ap-inertia-pd}
+清洗时易犯的错是\emph{把合法 CAD 惯量误判为非法}。一个 $3\times3$ 惯量张量合法（物理可实现）的充要条件包括对称正定（各主子式 $>0$）与三角不等式类约束。但存在\emph{反直觉}的合法例：某连杆的惯量积 $I_{xz}$ 在数值上\emph{大于}主惯量 $I_{xx}$（如 $I_{xz}=0.00082>I_{xx}$），乍看像错，但只要主子式仍全正、且 $I_{xz}<\sqrt{I_{xx}I_{zz}}$，它就是\emph{正定合法}的。本项目曾因此过度标注、又撤回。\textbf{教训}：判惯量合法性要算\emph{主子式}，别凭“惯量积不该比主惯量大”的直觉。
+\end{pitfall}
+
+\paragraph{三套硬件接口：一份 xacro 参数化。}
+顶层 \texttt{arm\_dm.\allowbreak xacro} 带参数 \texttt{hardware=mock|mujoco|mujoco\_torque}，对应三套硬件接口（mock 通用系统 / MuJoCo position / MuJoCo effort），并声明\emph{双命令接口}（position + effort）。里程碑 M0--M2 走 position（关节轨迹控制器 JTC），M3--M4 走 effort（力矩桥）。这种“一份描述、多套接口”正是 \cref{ins:ap-decouple} 解耦思想在\emph{建模层}的体现。
+
+\begin{insight}[占位惯量是“条件数拐杖”，不是 bug]\label{ins:ap-placeholder}
+末端 link6 的 $\mathrm{diag}(10^{-3})$ 是一个\emph{虚构占位}：用真几何（约 $1$--$2\,\mathrm{cm}$ 小法兰，体积 $\sim3\times10^{-6}\,\mathrm{m^3}$）算出的惯量约 $5\times10^{-6}$，比占位\emph{小 200 倍}（若按占位质量 $0.15\,\mathrm{kg}$ 反推密度高达钢的 $6$ 倍——物理上不真实）。但这个“撑大”的占位惯量\emph{静默地}支撑了后续全部力控/动力学：它实为一根\textbf{条件数拐杖}——把质量阵的条件数从裸真几何的“爆表 $1.3\!\times\!10^4$--$5.6\!\times\!10^4$”压到“仍病态但可算的 $\sim 600$--$1600$”（\cref{sec:ap-illcond}）。\textbf{这是一处必须诚实记录的边界}（\cref{sec:ap-methodology}）：本章所有力控数据都是“在 $10^{-3}$ 占位惯量下”得到的，换真末端惯量会更病态。
+\end{insight}
+
+\subsection{数值稳定三要素：惯量量级 / 阻尼 / actuator 刚度}
+\label{sec:ap-num-explode}
+
+\paragraph{现象：物理一跑就发散。}
+仿真桥首次跑起来，物理\emph{发散}——末端关节 J6 从初值飞到 $122.77\,\mathrm{rad}$（命令仅 $0.2$），全关节飞出限位。
+
+\paragraph{根因：刚性不稳定系统 + 显式积分。}
+末端占位惯量取 $10^{-5}$ 太小 $+$ 位置 actuator 刚度 $k_p=150$（stiff）$+$ \emph{无关节阻尼}，合成一个\emph{刚性不稳定}系统。其自然角频率
+\begin{equation}
+  \omega_n=\sqrt{\frac{k_p}{I}}\approx\sqrt{\frac{150}{10^{-5}}}\approx 3873\,\mathrm{rad/s},
+  \label{eq:ap-omegan}
+\end{equation}
+而显式积分器在 $\omega_n\,\Delta t\gg 2$ 时\emph{必然发散}（与 \cref{ins:ap-lowinertia} 的“低惯量腕欠采样”同一机理，只是这里是仿真积分步长 $\Delta t$、那里是控制周期）。惯量最小的 J6 最先炸。
+
+\paragraph{解决：三者匹配。}
+末端惯量 $10^{-5}\!\to\!10^{-3}$、质量 $0.05\!\to\!0.15$，并注入全局关节阻尼 $1.0$ $\to$ 物理稳定（J6 守住 home）。
+
+\begin{insight}[仿真数值稳定的三要素必须匹配]\label{ins:ap-num3}
+力矩臂/小惯量末端做物理仿真，\textbf{惯量量级、关节阻尼、actuator 刚度三者要匹配}，否则显式积分发散。\cref{eq:ap-omegan} 是判据：$\omega_n\,\Delta t$ 要远小于 $2$。占位惯量\emph{不能太小}（否则 $\omega_n$ 爆）；阻尼提供数值耗散稳住高频。注意一个\emph{语境相关}的陷阱：为稳定位置 actuator 而加的阻尼 $1.0$，对\emph{力矩控制}却太大（它会遮蔽重力、对抗阻抗的阻尼项 $\mathbf{D}_c$），故力矩仿真里把它降到 $0.1$——\textbf{同一个阻尼值，对位置控制是“稳定剂”、对力矩控制是“干扰项”}。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{轨迹层：path 与 trajectory 之别、力矩约束时间参数化}
+\label{sec:ap-traj}
+
+\paragraph{动机：规划器给的是“形状”，不是“怎么走”。}
+运动规划器（OMPL/CHOMP）产出的是一条\emph{几何路径} $\mathbf{q}(s)$：只有形状、没有时间。可机器人执行需要的是\emph{轨迹} $\mathbf{q}(t)$：含速度、加速度、jerk、乃至力矩。把一条 path 乱配时间硬跑，会违反限速/限加速/限力矩，jerk 甚至无穷大（激振、齿轮冲击）。本节讲“给路径配时间”这一层。
+
+\begin{insight}[严格区分 path 与 trajectory]\label{ins:ap-path-traj}
+\textbf{path $\mathbf{q}(s)$}（路径，path parameter $s\in[0,1]$，无时间，规划器产）与 \textbf{trajectory $\mathbf{q}(t)$}（轨迹，含时间与各阶导数，时间参数化产）是\emph{两个不同的对象}。规划只回答“走哪条几何路线”，时间参数化才回答“沿这条路线\emph{何时}到哪、\emph{多快}走”。把二者混为一谈是新手最常见的错误——它会让你以为“规划完就能跑”，而实际上不配时间的路径要么超物理极限、要么 jerk 无穷激振电机。本书 P3 的轨迹优化总框架（\cref{sec:plan-traj}）正是在 $\mathbf{q}(t)$ 这一层做文章；min-snap 多项式（\cref{sec:plan-minsnap}）是其无人机版本，本节落到机械臂的关节空间。
+\end{insight}
+
+\subsection{时间参数化三件套：TOTG / TOPP-RA / Ruckig}
+\label{sec:ap-timeparam}
+
+\begin{table}[H]\centering\small
+\caption{三种时间参数化对比（区别是重点）}
+\begin{tabular}{p{0.14\textwidth} p{0.18\textwidth} p{0.26\textwidth} p{0.12\textwidth} p{0.12\textwidth}}
+\toprule
+算法 & 最优性 & 约束 & jerk & 在线？ \\
+\midrule
+TOTG\cite{kunz2012totg} & 时间最优 & vel $+$ accel & $\infty$（bang-bang）& 否（MoveIt 默认）\\
+TOPP-RA\cite{pham2018toppra} & 时间最优 & vel $+$ accel $+$ \emph{力矩/二阶} & $\infty$ & 否（凸、稳、快，\emph{可吃机器人动力学}）\\
+Ruckig\cite{berscheid2021ruckig} & 非路径时间最优但 \emph{jerk 有界} & vel $+$ accel $+$ \emph{jerk} & 有界（S 曲线）& \emph{是}（每周期重算）\\
+\bottomrule
+\end{tabular}
+\label{tab:ap-timeparam}
+\end{table}
+
+\begin{insight}[三件套的取舍：贴边最快 vs 护电机 vs 在线]\label{ins:ap-timeparam}
+三者各占一个生态位。\textbf{TOTG / TOPP-RA} 都是“在 vel/accel 盒子里贴边跑最快”——加速度像开关（bang-bang），最快但有冲击（jerk 无穷）。区别在 TOPP-RA \emph{可以把机器人动力学（力矩/二阶约束）吃进去}（\cref{sec:ap-torque-topp}），TOTG 只能 vel/accel。\textbf{Ruckig} 则\emph{限制 jerk 让加速度连续}（S 曲线），慢一点但护电机/减速器，且\emph{在线}（每控制周期重算），适合到点/避障重规划。一句话选型：\emph{离线追极限}用 TOPP-RA，\emph{在线护电机}用 Ruckig，\emph{要吃力矩约束}必用 TOPP-RA。
+\end{insight}
+
+\subsection{自写 min-jerk 参数优化：决策变量是段时长}
+\label{sec:ap-minjerk}
+
+\paragraph{“调库”之外，要会“吃透内核”。}
+除了调上述库，本项目自写了一套\emph{参数轨迹优化}，以证明吃透了“参数化 + 带约束优化”这个内核。表示用分段\emph{五次（quintic）多项式}（位置/速度/加速度边界可指定 + jerk 连续）；决策变量是各段时长 $T_s$（rest-to-rest）；目标是最小化 $\int\|\mathrm{jerk}\|^2$。对 min-jerk 五次段，该代价有\emph{闭式}：
+\begin{equation}
+  J_{\mathrm{jerk}}=\sum_s \frac{720\,\Delta_s^2}{T_s^{5}},
+  \label{eq:ap-jerk-cost}
+\end{equation}
+$\Delta_s$ 为该段位移。约束为 $\sum_s T_s=$ 预算 与 $T_s\ge T_s^{\min}$。其中各段时长下界 $T_s^{\min}$ 由 min-jerk 五次段的\emph{三个峰值闭式系数}反推后取最大：
+\begin{align}
+  \mathrm{peak}|\dot q| &= 1.875\,\frac{|\Delta|}{T}, \qquad
+  \mathrm{peak}|\ddot q| = 5.7735\,\frac{|\Delta|}{T^2}, \qquad
+  \mathrm{peak}|\dddot q| = 60\,\frac{|\Delta|}{T^3},
+  \label{eq:ap-peaks}\\
+  T_s^{\min} &= \max\!\Big(\tfrac{1.875\,\Delta}{V_{\max}},\ \sqrt{\tfrac{5.7735\,\Delta}{A_{\max}}},\ \sqrt[3]{\tfrac{60\,\Delta}{J_{\max}}}\Big).
+  \label{eq:ap-tmin}
+\end{align}
+
+\begin{insight}[闭式最优时间分配 $T_s\propto a_s^{1/6}$ 与数值解吻合]\label{ins:ap-tmin}
+\cref{eq:ap-peaks} 的三个系数（$1.875$、$5.7735$、$60$）是\emph{能落地复现}的关键定量：它们把抽象的“限速/限加速/限 jerk”翻成对段时长的硬下界。求解用 \texttt{scipy.\allowbreak optimize} 的 SLSQP；\textbf{关键验证}：数值解\emph{精确等于}闭式 Lagrangian 解 $T_s\propto a_s^{1/6}$（把时间多分给大位移段；jerk 代价从等分的 $8910$ 降到 $7805$，即 $-12.4\%$）。这个“数值 $=$ 闭式”的吻合，正是“吃透了参数化 + 带约束优化内核”的证据——它和本书 P3 的 min-snap（\cref{sec:plan-minsnap}）同源：决策变量是\emph{段时长}、代价是\emph{高阶导平方积分}、解有闭式结构。\textbf{会调库不稀奇，会从一阶最优性条件推出时间分配律、并用数值解反验，才算真懂。}
+\end{insight}
+
+\subsection{力矩约束 TOPP-RA：为何必须走逆动力学}
+\label{sec:ap-torque-topp}
+
+\paragraph{动机：固定加速度盒忽略了位形相关惯量。}
+给轨迹配时间时，最朴素的约束是“关节加速度不超某个盒子 $\pm a_{\max}$”。但这\emph{忽略了位形相关惯量} $\mathbf{M}(\mathbf{q})$：同一个加速度，在不同位形下需要的关节力矩\emph{天差地别}，因为
+\begin{equation}
+  \boldsymbol{\tau}=\mathbf{M}(\mathbf{q})\ddot{\mathbf{q}}+\mathbf{C}(\mathbf{q},\dot{\mathbf{q}})\dot{\mathbf{q}}+\mathbf{g}(\mathbf{q}).
+  \label{eq:ap-tau-invdyn}
+\end{equation}
+于是“限加速度”得到的时间律，可能在某些位形\emph{超过} $26\,\mathrm{N\!\cdot\! m}$（真机不可行），又在另一些位形\emph{浪费}驱动力。
+
+\paragraph{做法：把逆动力学塞进约束。}
+TOPP-RA 支持 \texttt{JointTorqueConstraint(inv\_dyn, $\pm 26$)}，其中 \texttt{inv\_dyn} 就是 Pinocchio 的 \texttt{rnea}（全逆动力学，按 \cref{eq:ap-tau-invdyn} 算 $\boldsymbol{\tau}$）。这样时间参数化\emph{直接}对“力矩不超 $\pm 26$”贴边，而不是对“加速度不超盒子”贴边。
+
+\begin{table}[H]\centering\small
+\caption{加速度盒 vs 力矩约束 TOPP-RA（实测，占位惯量下）}
+\begin{tabular}{p{0.30\textwidth} p{0.18\textwidth} p{0.18\textwidth} p{0.24\textwidth}}
+\toprule
+约束 & 总时间 $T$ & 峰值 $|\boldsymbol{\tau}|$ & 评注 \\
+\midrule
+加速度盒 $\pm 8$ & $3.496\,\mathrm{s}$ & 仅 $4.1\,\mathrm{N\!\cdot\! m}$ & \emph{浪费 84\% 的 $26\,\mathrm{N\!\cdot\! m}$ 驱动力} \\
+力矩约束 $\pm 26$ & $0.752\,\mathrm{s}$（\textbf{快 $4.6\times$}）& $26.0\,\mathrm{N\!\cdot\! m}$（精确贴满）& J1/J2 贴满 $26$ $=$ 力矩限下 bang-bang 时间最优 \\
+\bottomrule
+\end{tabular}
+\label{tab:ap-topp}
+\end{table}
+
+\begin{pitfall}[离散化守约束的隐蔽坑：稀疏栅格会“看似守约束实则越界”]\label{pit:ap-topp-disc}
+TOPP-RA 默认用配置点（collocation）$+$ 稀疏栅格做常加速度重构。但栅格点\emph{之间} $\mathbf{M}(\mathbf{q})$ 在变，于是重构出的峰值力矩\emph{超过} $\pm 26$ 达 $6\%$——\textbf{看似守约束、实则越界}（因为只在栅格点上检查、点间没查）。修法是改 \texttt{discretization\_scheme=Interpolation} $+$ 把栅格加密到 \textbf{401 点}，才把峰值修正回 $\le 26$。\textbf{对任何用 TOPP-RA 做力矩/二阶约束参数化的人，这是直接可迁移的坑}：二阶约束的“守约束”要看\emph{重构后逐点}是否越界，而非只看栅格点。
+\end{pitfall}
+
+\begin{insight}[力矩感知的时序必须走逆动力学]\label{ins:ap-torque-topp}
+\cref{tab:ap-topp} 给出一个高价值结论：\textbf{固定加速度盒既\emph{不安全}（某些位形可能超力矩）又\emph{浪费}（留过大余量）；力矩感知的轨迹时序必须走逆动力学 \cref{eq:ap-tau-invdyn}}。本质是 $\mathbf{M}(\mathbf{q})$ 的\emph{位形相关性}——加速度与力矩之间隔着一个随位形变化的矩阵，只有把 \texttt{rnea} 嵌进约束，时间律才真正贴“电机能出多大力矩”这个物理极限。这条把“动力学”和“轨迹规划”\emph{缝}在了一起：轨迹层若不知动力学，配出的时间要么冒险要么保守。本部的动力学理论章将系统给出 RNEA 的递推推导与 $O(n)$ 复杂度；本章先\emph{用}它（经 \texttt{rnea}）作为约束算子。
+\end{insight}
+
+\subsection{规划期避障：OMPL vs CHOMP 的实证分野}
+\label{sec:ap-planavoid}
+
+\paragraph{两层避障：规划期 global + 反应式 local。}
+避障分两层：\emph{规划期}（执行前搜整条无碰撞路径，OMPL/CHOMP）与\emph{反应式}（执行中每周期微调速度，CBF/零空间，见 \cref{sec:ap-cbf}）。实务是两层叠加：规划期出标称路径 + 反应式兜底动态/未建模障碍。本小节看规划期。
+
+\begin{insight}[OMPL（采样、概率完备）vs CHOMP（局部优化）]\label{ins:ap-ompl-chomp}
+规划期两类方法的分野，在\emph{有障碍}时才显现。\textbf{自由空间里 OMPL $\approx$ CHOMP}（同一条测地线，路径长度 $2.762$）。\emph{加障碍后分野}：OMPL（采样、概率完备）成功绕障（$2/3$ 成功，长度 $\to 3.184$ 即 $+15\%$、更曲），而 CHOMP（\cref{sec:plan-chomp} 的协变梯度优化）\emph{卡死}（$0/3$）——因为直线初值穿过障碍盒，障碍距离场的梯度\emph{推不出}这个局部最优，这是 CHOMP 的经典弱点（梯度法陷局部）。\textbf{失败是诚实结果、不是 bug}：缓解可用多迭代/随机重启/OMPL 暖启动，但本质是局部性。这正是“采样 vs 优化”规划范式对比的经典实证——\emph{障碍梯度的价值，要有障碍才显}。
+\end{insight}
+
+\begin{pitfall}[关节体是有体积的：点检查不够，要碰撞检查 API 驱动放置]\label{pit:ap-collision-volume}
+布置障碍盒做避障实验时，易踩“点检查不够”的坑：机械臂在小工作空间折叠，路径\emph{中点}的障碍盒总碰到目标构型的连杆\emph{网格}（连杆是有体积的，不是质点）。手调盒子尺寸两次失败后，正解是\textbf{用碰撞检查 API（\texttt{/\allowbreak check\_state\_validity}）驱动自动放置}：沿直线末端路径取候选中心，扫一组 $(s,\text{size})$ 组合，判据是“起点 $+$ 终点 valid 且\emph{中点 invalid} 的第一个”。一个可复用细节：同 id 的碰撞对象“ADD”即“REPLACE”，故扫描时反复 ADD 就是\emph{原位替换}。\textbf{教训}：多花一次验数据（碰撞 API）远胜盲调尺寸——这与四足部 \cref{ins:qp-collision} 的“碰撞体用简单几何体”同属“碰撞几何即工程”问题。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{反应式避障：CBF 速度滤波（单约束闭式，无需 QP）}
+\label{sec:ap-cbf}
+
+\paragraph{动机：执行中要兜底动态/未建模障碍。}
+规划期路径是\emph{标称}的；执行中若冒出动态或未建模障碍，需要一层\emph{反应式}安全滤波——在每个控制周期，把标称速度命令\emph{微调}到不撞障碍。控制屏障函数（CBF）正是干这个的形式化工具（其安全博弈框架见 \cref{sec:sm-cbf-game}）。
+
+\paragraph{标称控制：resolved-rate 冲向目标。}
+标称用 resolved-rate（速度级逆运动学）冲向障碍后方的目标：
+\begin{equation}
+  \dot{\mathbf{q}}_{\mathrm{nom}}=\mathbf{J}_p^{+}\,k\,(\mathbf{p}_{\mathrm{goal}}-\mathbf{p}_{\mathrm{ee}}),
+  \label{eq:ap-resolved-rate}
+\end{equation}
+$\mathbf{J}_p^{+}$ 为位置雅可比的（阻尼）伪逆，$k>0$ 为增益。
+
+\paragraph{CBF 安全集与单约束闭式投影。}
+取安全函数（末端到障碍中心的间隙）
+\begin{equation}
+  h(\mathbf{q})=\|\mathbf{p}_{\mathrm{ee}}-\mathbf{p}_{\mathrm{obs}}\|-(r+\mathrm{margin})\ge 0,
+  \label{eq:ap-cbf-h}
+\end{equation}
+安全集为 $\{\dot{\mathbf{q}}:\nabla h\cdot\dot{\mathbf{q}}\ge -\alpha\,h\}$（$\alpha>0$ 为 CBF 增益，$\nabla h$ 用 Pinocchio 位置雅可比算）。\emph{单约束}时\textbf{无需 QP 求解器}，闭式投影即可：若标称已满足约束（$\nabla h\cdot\dot{\mathbf{q}}_{\mathrm{nom}}\ge -\alpha h$）则不动；否则最小改动投影到约束边界
+\begin{equation}
+  \dot{\mathbf{q}}=\dot{\mathbf{q}}_{\mathrm{nom}}+\frac{-\alpha h-\nabla h\cdot\dot{\mathbf{q}}_{\mathrm{nom}}}{\|\nabla h\|^2}\,\nabla h^\top.
+  \label{eq:ap-cbf-proj}
+\end{equation}
+
+\begin{insight}[单约束 CBF 是一行投影，可叠在任意标称控制上]\label{ins:ap-cbf}
+\cref{eq:ap-cbf-proj} 是 CBF 最小可教的实现：\textbf{单个不等式约束的“最近点投影”有闭式解，根本不用调 QP 解器}。几何上，它把标称速度 $\dot{\mathbf{q}}_{\mathrm{nom}}$ 沿 $\nabla h$ 方向\emph{恰好}推到约束超平面上（分母 $\|\nabla h\|^2$ 是标准的投影归一化）。实测：标称控制让 $\min h=-0.046$（穿入障碍），CBF 滤波后 $\min h=+0.008$（安全、$h\ge0$）且仍到目标 $=$ 绕行。\textbf{这是“形式化安全”的威力——它可以叠在\emph{任意}标称控制器之上}，标称管“去哪”，CBF 管“别撞”。这与本书 P3 把 CBF 用作多机安全博弈（\cref{sec:sm-cbf-game}）同根，只是这里退化到“单臂单障碍”的最简形。
+\end{insight}
+
+\paragraph{陷阱：CBF 不是万能的——两种失败模式。}
+CBF 保证\emph{安全}（$h\ge0$），但\emph{不保证到达目标}：它可能死锁或不可达。两种失败模式及其破解（可复现的关键工程细节）：
+
+\begin{pitfall}[失败模式一：障碍正卡在起点$\leftrightarrow$目标直线上 $\to$ 死锁]\label{pit:ap-cbf-deadlock}
+若障碍\emph{正好}卡在起点到目标的直线上（“sphere squarely between start and goal”），末端会贴着障碍面\emph{停滞}——标称推它向前、CBF 把它推回，僵在原地。\textbf{破解}：把障碍中心沿\emph{垂直于路径}的方向偏置，$\mathbf{p}_{\mathrm{obs}}=\mathbf{p}_{\mathrm{start}}+0.13\,\mathbf{d}+0.04\,\mathbf{d}_\perp$（其中 $\mathbf{d}$ 为路径方向、$\mathbf{d}_\perp=\mathbf{d}\times\hat{\mathbf{z}}$），让末端能从\emph{一侧}（skirt）绕过去。注意这是\emph{改实验设置}让 CBF 有路可绕，不是改 CBF 本身——真实部署中，对应的是“需要规划期给出可绕的标称路径”。
+\end{pitfall}
+
+\begin{pitfall}[失败模式二：目标太远或落入障碍阴影 $\to$ 不可达]\label{pit:ap-cbf-unreach}
+若目标太远、或落入障碍的“阴影”（被障碍挡住的不可达区），末端永远到不了。\textbf{破解}：把目标放在\emph{障碍阴影之外且靠近}，$\mathbf{p}_{\mathrm{goal}}=\mathbf{p}_{\mathrm{start}}+0.25\,\mathbf{d}$（off the shadow, kept close）$=$ 可达且无奇异。\textbf{诊断要诀}：用\emph{标称}误差区分“是可达性问题还是 CBF 问题”——若连标称（无 CBF）都到不了目标，那是\emph{可达性/工作空间}问题，不是 CBF 在阻挠；若标称能到、加 CBF 后到不了，才是 CBF 死锁。“死锁/不可达\emph{怎么破}”比“死锁存在”更可迁移——这是反应式避障能真正落地的工程细节。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{力控（一）：重力补偿、笛卡尔阻抗与扰动柔顺}
+\label{sec:ap-impedance}
+
+本节起进入项目核心——力控。力矩臂的 effort 控制通路是：Python 力控节点订阅 \texttt{/\allowbreak joint\_states}、用 Pinocchio 算 $\mathbf{J},\mathbf{g},\mathbf{M}$（约 $200\,\mathrm{Hz}$）、发布关节力矩 $\boldsymbol{\tau}$ 到力矩控制器，经 \texttt{mujoco\_ros2\_control} 施加到 MuJoCo 的 \texttt{<motor>}。本节讲“柔顺”一脉（重力补偿 $\to$ 阻抗 $\to$ 扰动），\cref{sec:ap-ctc} 讲“精确跟踪”一脉（计算力矩 $\to$ 混合力位）。
+
+\subsection{重力补偿：验通 effort 通路}
+\label{sec:ap-gravcomp}
+
+\paragraph{最简力矩控制律 $\boldsymbol{\tau}=\mathbf{g}(\mathbf{q})$。}
+重力补偿只发\emph{重力力矩}：$\boldsymbol{\tau}=\mathbf{g}(\mathbf{q})$（Pinocchio \texttt{computeGeneralizedGravity}）。它让臂\emph{失重悬停}——理想下任何构型都不下垂。它既是 PD+重力补偿（\cref{sec:ctrl-robot-pd}）的“去掉 PD 项”特例，也是验通 effort 通路的最小实验（验证“力矩命令真的到了电机”）。
+
+\begin{pitfall}[“home 不下垂”可能不是 bug：先排除限位夹持]\label{pit:ap-gravcomp-limit}
+重力补偿调试中一个易误诊的“非 bug”：发现某关节在 home 处\emph{不下垂}，本能怀疑模型重力算错了。但本项目实测：仿真质量与 URDF \emph{完全一致}、Pinocchio 的 $\mathbf{g}(\mathbf{q})$ 正确，真因是\textbf{肩关节 J2 起始恰在上限 $0$，重力把它推向限位、被限位\emph{夹住}不动}（施 $-6\,\mathrm{N\!\cdot\! m}$ 推离限位后它就摆到 $-3.14$）。\textbf{诊断要诀}：用“零力矩自由落体 + 已知力矩权限 + 仿真$\leftrightarrow$模型质量对比”三管齐下定位，而非盲调增益。这是“先验证数据/物理边界，再怀疑算法”方法论的又一例（\cref{sec:ap-methodology}）。
+\end{pitfall}
+
+\subsection{笛卡尔阻抗：末端是一根可调弹簧}
+\label{sec:ap-cartimp}
+
+\paragraph{控制律。}
+笛卡尔阻抗让末端呈现“弹簧--阻尼”（\cref{ins:ap-torque-impedance} 的范式落地）。设末端位置偏差 $\Delta\mathbf{x}=\mathbf{x}-\mathbf{x}_d$，控制律
+\begin{equation}
+  \boxed{\boldsymbol{\tau}=\mathbf{J}^\top\big(-\mathbf{K}_c\,\Delta\mathbf{x}-\mathbf{D}_c\,\dot{\mathbf{x}}_{\mathrm{ee}}\big)+\mathbf{g}(\mathbf{q}),}
+  \label{eq:ap-cartimp}
+\end{equation}
+取笛卡尔刚度 $\mathbf{K}_c=250\,\mathrm{N/m}$、阻尼 $\mathbf{D}_c=2\sqrt{\mathbf{K}_c}$（\emph{临界阻尼}，无超调），力矩钳到 $\pm 26$。这正是 \cref{def:ctrl-impedance} 的免力传感特例（\cref{eq:ctrl-impedance-law} 取 $\mathbf{M}_d=\boldsymbol{\Lambda}$ 不整形惯性时的读法）：弹簧项 $-\mathbf{K}_c\Delta\mathbf{x}$ 由位置偏差出力，阻尼项 $-\mathbf{D}_c\dot{\mathbf{x}}$ 耗散震荡，重力项 $\mathbf{g}$ 抵消自重。
+
+\begin{insight}[临界阻尼 $\mathbf{D}=2\sqrt{\mathbf{K}}$：平衡处弹簧项归零 $=$ 纯重力补偿]\label{ins:ap-critdamp}
+\cref{eq:ap-cartimp} 有两个值得停留的点。其一，\textbf{临界阻尼} $\mathbf{D}_c=2\sqrt{\mathbf{K}_c}$ 来自二阶系统 $\ddot e+2\zeta\omega_n\dot e+\omega_n^2 e=0$ 取 $\zeta=1$——无超调、最快无振荡收敛（与计算力矩外环取 $k_d=2\sqrt{k_p}$ 同理，\cref{thm:ctrl-ctc}）。其二，\textbf{在平衡处（$\Delta\mathbf{x}=0$、$\dot{\mathbf{x}}=0$）弹簧/阻尼项全归零，控制律退化为纯重力补偿 $\boldsymbol{\tau}=\mathbf{g}(\mathbf{q})$}——这与 \cref{sec:ap-gravcomp} 自然衔接：阻抗控制器\emph{在目标点上就是}重力补偿器。实测 HOLD（保持）时 $\|\Delta\mathbf{x}\|=0.0\,\mathrm{mm}$（纯 $\mathbf{g}$）；WIGGLE（跟 $\pm 8\,\mathrm{cm}$ 振荡目标）时 $\|\Delta\mathbf{x}\|\approx 30$--$36\,\mathrm{mm}$ 滞后——这是\emph{有限刚度}的柔顺（刚度越软、跟踪越滞后，正是“软”的代价）。
+\end{insight}
+
+\subsection{扰动柔顺：线性弹簧律的教科书验证}
+\label{sec:ap-disturb}
+
+\paragraph{实测 $50\,\mathrm{N}\to0.2\,\mathrm{m}$ 精确吻合 $F/K$。}
+给末端施一个世界系外力（MuJoCo \texttt{external\_wrench} plugin），末端\emph{退让}，撤力\emph{弹回}。教科书结果出现了：\textbf{$50\,\mathrm{N}$ 推 $\to$ $\|\Delta\mathbf{x}\|=199.9\,\mathrm{mm}=F/K=50/250=0.20\,\mathrm{m}$ 精确吻合}；撤力弹回 $1.2\to0.1\,\mathrm{mm}$（线性弹簧律 $+$ 临界阻尼无振荡）。整个过程\emph{纯力矩、无 F/T 传感器}。
+
+\begin{insight}[$\Delta x=F/K$ 是阻抗刚度的物理体检]\label{ins:ap-FK}
+稳态下，阻抗末端就是一根线性弹簧：外力 $F$ 与位移 $\Delta x$ 满足 $F=K\,\Delta x$，故 $\Delta x=F/K$。实测 $50/250=0.20\,\mathrm{m}$ 与位移 $199.9\,\mathrm{mm}$ 吻合到亚毫米，是对“控制器真的实现了所设刚度 $K_c$”的\textbf{物理体检}——它验证了 \cref{eq:ap-cartimp} 的弹簧项确实以 $250\,\mathrm{N/m}$ 的斜率工作，而非某个被增益/单位/雅可比 bug 污染的值。\textbf{这是把一个理论刚度参数“称重”的最干净实验}：施已知力、量位移、比 $F/K$。注意诚实边界：此结论在“占位惯量、该外力幅度、临界阻尼”下成立（\cref{ins:ap-placeholder}）。
+\end{insight}
+
+\begin{pitfall}[第三方仿真 plugin 的加载/命名/字段约定要查文档，别猜]\label{pit:ap-plugin}
+扰动实验的 \texttt{external\_wrench} plugin 踩了\emph{三连坑}，都源于“第三方 \texttt{ros2\_control} plugin 的约定不透明”：(1) plugin \emph{只从参数字典}加载（非 MJCF 标签、非自动）$\to$ 须建注册文件挂到节点；(2) service 名是 \texttt{\textasciitilde/\allowbreak apply\_wrench}（解析为实例命名空间下的全名），\emph{不是}想当然的 \texttt{/\allowbreak apply\_external\_wrench}；(3) 请求字段里目标 body 名要放在 \emph{wrench 的} \texttt{header.\allowbreak frame\_id}，力是世界系——之前放反了。附带坑：\texttt{install/} 是\emph{拷贝非软链}，改了源要手动同步。\textbf{教训}：第三方 plugin 的加载机制/service 名/字段约定要查官方 srv/demo，不能猜——这与四足部 \cref{ch:quad_prac} 强调的“工程约定要查文档”同类。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{力控（二）：计算力矩跟踪与混合力位}
+\label{sec:ap-ctc}
+
+\subsection{计算力矩：一次 RNEA 算全逆动力学}
+\label{sec:ap-computed-torque}
+
+\paragraph{控制律：反馈线性化。}
+计算力矩是头牌动力学控制算法（理论与定理见 \cref{sec:ctrl-robot-ctc}、\cref{thm:ctrl-ctc}）。其落地形式利用“逆动力学 $=$ 一次 RNEA”：
+\begin{equation}
+  \boxed{\boldsymbol{\tau}=\mathbf{M}(\mathbf{q})\big(\ddot{\mathbf{q}}_d+\mathbf{K}_p\mathbf{e}+\mathbf{K}_d\dot{\mathbf{e}}\big)+\mathbf{C}(\mathbf{q},\dot{\mathbf{q}})\dot{\mathbf{q}}+\mathbf{g}(\mathbf{q})=\mathrm{rnea}\big(\mathbf{q},\dot{\mathbf{q}},\mathbf{a}_{\mathrm{cmd}}\big),}
+  \quad \mathbf{a}_{\mathrm{cmd}}=\ddot{\mathbf{q}}_d+\mathbf{K}_p\mathbf{e}+\mathbf{K}_d\dot{\mathbf{e}}.
+  \label{eq:ap-ctc}
+\end{equation}
+\cref{thm:ctrl-ctc} 已证：模型精确时闭环误差服从线性解耦 $\ddot{\mathbf{e}}+\mathbf{K}_d\dot{\mathbf{e}}+\mathbf{K}_p\mathbf{e}=\mathbf{0}$（任何可行轨迹都能跟）。工程要点：\textbf{Pinocchio \texttt{rnea} 一次就算出整个 $\mathbf{M}\,\mathbf{a}_{\mathrm{cmd}}+\mathbf{C}\dot{\mathbf{q}}+\mathbf{g}$}，不必分别组装三项——把“期望加速度 + PD 修正”当作 \texttt{rnea} 的加速度输入即可。时序用 \texttt{/\allowbreak joint\_states} 的 header 时间戳（仿真时间）算速度/加速度前馈，与回调率无关。
+
+\begin{insight}[公平对比的精巧设计：隔离被测变量、防无关 DOF 污染基线]\label{ins:ap-fair-compare}
+本项目复现了“计算力矩 vs PD+重力补偿”的经典对比，\textbf{实测 CT 的 RMS $=4.1\,\mathrm{mrad}$ vs PD+g 的 RMS $=107.4\,\mathrm{mrad}$ $\to$ CT 紧 $26\times$}（PD+g 的周期滞后 $50$--$200\,\mathrm{mrad}$ 正是 CT 前馈 $\mathbf{M}\ddot{\mathbf{q}}+\mathbf{C}\dot{\mathbf{q}}$ 项补上的）。但比数字更值得学的是\emph{对比怎么设计才公平}：
+\begin{enumerate}
+  \item \textbf{增益异质}：$\mathbf{K}_p=\mathrm{diag}([150,150,150,150,100,60])$——腕端 J5/J6 故意降低，匹配其小惯量（\cref{ins:ap-heterogeneous}），$\mathbf{D}=2\sqrt{\mathbf{K}_p}$；
+  \item \textbf{只摆高惯量关节}：只让良态的 J2/J3 摆动（\texttt{ACTIVE}），其余握住；
+  \item \textbf{被 hold 的关节两模式都用 CT 的 hold}：度量只在 commanded joints 上算——这样既\emph{隔离了“跟踪律”本身}，又\emph{避免}均匀增益的 PD 去摇晃 $2\times10^{-4}$ 惯量的腕（否则 PD+g 基线会因腕失稳而\emph{不公平地}变差）。
+\end{enumerate}
+\textbf{这是“如何设计一个公平的算法对比”的范例}：隔离被测变量、防无关自由度污染基线。一个被腕失稳拖垮的 PD+g 基线，会让 $26\times$ 变成假象——公平性来自实验设计，不只是来自算法。
+\end{insight}
+
+\subsection{混合力/位控：选择矩阵分方向}
+\label{sec:ap-hybrid}
+
+\paragraph{控制律：某方向控力、某方向控位。}
+打磨、插轴这类任务需要\emph{某些方向控力、另一些方向控位}。Raibert--Craig 选择矩阵 $\mathbf{S}$ 做这件事\cite{raibert1981hybrid}：法向控力、切向控位。本项目设法向 $x$ 为\emph{力控}（恒力 $F_d=15\,\mathrm{N}$ 顶墙，$\mathbf{J}^\top$ 开环力，无 F/T），切向 $y,z$ 为\emph{位控}（保持 + 横扫）。$\mathbf{S}=\mathrm{diag}(1,0,0)$ 取力轴、$\mathbf{I}-\mathbf{S}$ 取位轴：
+\begin{equation}
+  \mathbf{F}=\big[\,F_d,\ -k_p(y-y_d)-d\,\dot y,\ -k_p(z-z_0)-d\,\dot z\,\big]^\top,\qquad
+  \boldsymbol{\tau}=\mathbf{J}^\top\mathbf{F}+\mathbf{g}(\mathbf{q}).
+  \label{eq:ap-hybrid}
+\end{equation}
+实测：法向 $x$ 维持 $\approx 15\,\mathrm{N}$，切向 $y$ 跟 $\pm0.05$ 横扫（绕基座 yaw）。切向\emph{滞后约 $22\,\mathrm{mm}$ 来自接触摩擦}（$\mu\cdot 15\,\mathrm{N}$ vs $k_p\cdot 0.08$）$=$ 物理正确，正是打磨需力控之因（位控顶不过摩擦）。
+
+\begin{insight}[混合力位的三条诊断教训：用全雅可比、用关节 CT 展开、扫 reach-free DOF]\label{ins:ap-hybrid-lessons}
+混合力位控经历了\emph{五次}诊断迭代才跑通，沉淀出三条可迁移教训：
+\begin{enumerate}
+  \item \textbf{用全 $6$ 列雅可比做笛卡尔控制，而非按关节切分}：早期把关节切成“前几个管趋近、腕做别的”，结果在折叠位形撞\emph{子雅可比奇异}、乱飞；改用完整 $\mathbf{J}$（把冗余的腕\emph{安全地}纳入零空间）才稳。
+  \item \textbf{展开折叠臂用关节空间计算力矩，而非笛卡尔直线}：笛卡尔直线趋近会撞奇异，关节 CT 是可靠的展开方式。
+  \item \textbf{扫掠选 reach-free 的自由度}：把横扫方向选成\emph{横向 / 基座 yaw}（等半径、不受 reach 限），而非被工作空间边界\emph{钉死}的径向 / 竖向。
+\end{enumerate}
+这三条本质都是“\emph{尊重机械臂的几何与工作空间边界}”——折叠位形的奇异、边界的 reach 限制，是冗余/奇异理论（本部运动学章将系统展开）在接触任务里的真实后果。
+\end{insight}
+
+\begin{pitfall}[诚实框定：“钉墙”其实没碰墙、“恒力”其实是开环]\label{pit:ap-honest-wall}
+独立审稿揪出本实验 headline 的\emph{过度陈述}，值得照镜子：(1) 报告写“末端\emph{钉}在墙上”，实测末端停在 $0.144$、墙面在 $0.20$，\emph{差 $5.6\,\mathrm{cm}$、根本没碰墙}；更硬的证据是受控 frame 停在 $0.144$，但末端凸包前伸使几何最前端实际在 $0.116$（既 $\ne$ 墙面也 $\ne$ 接触相记录值）。(2) 那 $15\,\mathrm{N}$ 是\emph{开环}给的、无力反馈，$3\,\mathrm{mm}$ 的标准差是\emph{开环抖动}而非接触摩擦。\textbf{正确写法}：“在开环 $15\,\mathrm{N}$ 力命令下，末端\emph{趋近}墙面至约 $0.144$（受控 frame）”——删“钉墙”“恒力”等绝对语，标注“开环”“受控 frame”边界。\textbf{诚实记录局限是工程素养}（\cref{sec:ap-methodology}）。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{病态根因：条件数、低惯量腕与控制率选择（全章最深）}
+\label{sec:ap-illcond}
+
+本节是\emph{全章最深}的一节。它把“病态质量阵”当作\textbf{第一性原理工具}，回答两个问题：为什么照搬 OSC 零空间会收不住末端？为什么轻腕\emph{更难}控、必须解耦？两者根因都在质量阵 $\mathbf{M}(\mathbf{q})$ 的\emph{条件数}与低惯量关节的\emph{自然时间常数}里——都从 \cref{ins:ap-heterogeneous} 的“异质惯量”推得。
+
+\subsection{质量阵条件数：算法可行性的第一性原理}
+\label{sec:ap-conditioning}
+
+\paragraph{异质惯量臂的质量阵固有病态。}
+质量阵 $\mathbf{M}(\mathbf{q})\succ0$（\cref{prop:ctrl-robot-props}），其\emph{条件数} $\mathrm{cond}(\mathbf{M})=\lambda_{\max}/\lambda_{\min}$ 衡量它“多接近奇异”。本臂的肩肘惯量（大）与腕惯量（$2\times10^{-4}$，小）相差三个数量级，直接撑大 $\mathrm{cond}(\mathbf{M})$：占位惯量下实测 $\mathrm{cond}(\mathbf{M})\approx 527$--$1625$（随位形变），裸真几何下更\emph{爆到} $1.3\times10^4$--$5.6\times10^4$（\cref{ins:ap-placeholder}）。\textbf{这不是 bug，是本臂“重肩肘 + 轻腕”设计的固有属性}——$\mathbf{M}$ 的条件数由本体惯量结构决定。
+
+\begin{insight}[用条件数判算法可行性，而非在力矩层硬刚]\label{ins:ap-cond-firstprinciple}
+$\mathrm{cond}(\mathbf{M})$ 是一把\emph{第一性原理标尺}：凡控制律里出现 $\mathbf{M}^{-1}$ 或 $(\mathbf{J}\mathbf{M}^{-1}\mathbf{J}^\top)^{-1}$（如 OSC 的 $\boldsymbol{\Lambda}$、动力学一致零空间），其数值稳定性都被 $\mathrm{cond}(\mathbf{M})$ 卡着——条件数越大，求逆越放大误差。于是\textbf{在动手实现一个含 $\mathbf{M}^{-1}$ 的算法之前，先算 $\mathrm{cond}(\mathbf{M})$ 判它在本臂上可不可行}，远胜于“先实现、发散了再在力矩层硬调”。这条把“数值线性代数的条件数”和“控制算法选型”\emph{缝}在一起：算法可行性不只看公式对不对，还看本体让相关矩阵\emph{病不病态}。下面两小节是这把标尺的两个直接后果。
+\end{insight}
+
+\subsection{后果一：OSC 零空间在本臂收不住末端}
+\label{sec:ap-osc-fail}
+
+\paragraph{对照：运动学级锁 $0.00\,\mathrm{mm}$ vs 力矩级漂 $60$--$110\,\mathrm{mm}$。}
+本臂 $6$ DOF，若主任务是 $6$D 位姿则\emph{无}冗余；把主任务\emph{降维}到 $3$D 末端位置，就留 $6-3=3$ 维零空间做自运动（绕固定工具重构姿态）。两种实现方式形成\emph{全项目最深的对照}：
+
+\emph{运动学/速度级}（干净正解，无 $\mathbf{M}^{-1}$）：
+\begin{equation}
+  \dot{\mathbf{q}}=\mathbf{J}^{+}\big(\dot{\mathbf{x}}_{\mathrm{des}}+\mathbf{K}(\mathbf{x}_{\mathrm{des}}-\mathbf{x})\big)+\mathbf{N}\,\dot{\mathbf{q}}_{\mathrm{sec}},\qquad
+  \mathbf{N}=\mathbf{I}-\mathbf{J}^{+}\mathbf{J}.
+  \label{eq:ap-nullspace-kin}
+\end{equation}
+$\mathbf{J}^{+}$ 为阻尼右伪逆 $\mathbf{J}^\top(\mathbf{J}\mathbf{J}^\top+\lambda\mathbf{I})^{-1}$；$\dot{\mathbf{x}}_{\mathrm{des}}=0$ 时 $\mathbf{J}^{+}$ 项锁末端，$\mathbf{N}\dot{\mathbf{q}}_{\mathrm{sec}}$ 在零空间驱动姿态自运动。\textbf{实测：末端精确锁 $\|\Delta\mathbf{x}\|=0.00\,\mathrm{mm}$}（仅积分误差），自运动 J1 摆 $0.44\,\mathrm{rad}$（基座 yaw 摆约 $25^\circ$ 而工具不动）。
+
+\emph{力矩级 OSC}（Khatib 动力学一致投影，含 $\mathbf{M}^{-1}$）：
+\begin{equation}
+  \mathbf{N}_{\mathrm{dyn}}=\mathbf{I}-\mathbf{J}^\top\big(\mathbf{J}\mathbf{M}^{-1}\mathbf{J}^\top\big)^{-1}\mathbf{J}\mathbf{M}^{-1}.
+  \label{eq:ap-nullspace-dyn}
+\end{equation}
+自运动出现了（J2/J3 重构 $1.1$--$1.4\,\mathrm{rad}$），但\textbf{末端漂 $60$--$110\,\mathrm{mm}$ 而非 $<10\,\mathrm{mm}$}——收不住。
+
+\begin{insight}[病态如何破坏 OSC：正则化破坏投影性、特征值不再 $\{0,1\}$]\label{ins:ap-osc-breakdown}
+为什么力矩级 \cref{eq:ap-nullspace-dyn} 败、速度级 \cref{eq:ap-nullspace-kin} 成？根因是\textbf{质量阵病态}（\cref{sec:ap-conditioning}）。诊断历程：(1) 在力矩级用运动学投影 $\mathbf{I}-\mathbf{J}^{+}\mathbf{J}$ $\to$ 泄漏 $85\,\mathrm{mm}$；(2) 用精确动力学投影 \cref{eq:ap-nullspace-dyn} $\to$ \emph{爆炸} $\|\boldsymbol{\tau}_{\mathrm{null}}\|\to 18000$（腕 $2\times10^{-4}$ 惯量使 $\mathbf{M}^{-1}$ 巨大、奇异处 $(\mathbf{J}\mathbf{M}^{-1}\mathbf{J}^\top)^{-1}$ 爆）；(3) 加正则 $\mathbf{M}+\lambda\mathbf{I}$ 或阻尼逆 $\to$ 稳了但末端漂 $70\,\mathrm{mm}$；(4) 锁腕 $\to$ $107\,\mathrm{mm}$，均无改善。\textbf{真相}：一个理想投影矩阵 $\mathbf{N}$ 的特征值应是 $\{0,1\}$（投影到零空间/任务空间）；但为稳定数值而加的\emph{正则化破坏了投影性}——特征值不再 $\{0,1\}$，于是把零空间力矩 $\boldsymbol{\tau}_0$ 放大 $10$--$50\times$ 漏进任务空间 $\to$ 末端漂。\textbf{这是“为数值稳定而正则化，反而破坏算法的代数性质”的深刻一课}：正则化不是免费的，它换走了投影的精确性。
+\end{insight}
+
+\begin{insight}[冗余解析的层次选择：异质惯量臂正解是速度级]\label{ins:ap-redundancy-level}
+\cref{ins:ap-osc-breakdown} 的工程结论是一条\emph{选型律}：\textbf{异质惯量臂（病态 $\mathbf{M}$）的冗余解析正解是\emph{运动学/速度级} \cref{eq:ap-nullspace-kin}（无 $\mathbf{M}^{-1}$，末端锁 $0.00\,\mathrm{mm}$），力矩级 OSC \cref{eq:ap-nullspace-dyn} 只在\emph{良态}臂上可行}。即便换一个好条件数的真末端（如 $0.3\,\mathrm{kg}$ gripper 把 $\mathrm{cond}$ 砍半到 $300+$），实测 OSC 仍漂 $62\,\mathrm{mm}$ 且自运动塌缩（J2/J3 仅 $0.07/0.24\,\mathrm{rad}$）——“漏但动”换成“稳但几乎不动且仍偏 $60\,\mathrm{mm}$”，都不干净。而 link4/link5 的真 CAD 惯量 $2$--$3\times10^{-4}$ 是\emph{固有地板}、不根治。\textbf{别在力矩层硬刚一个本体注定病态的算法——换层（速度级）比换参数（正则化）更对}。本书 P4 的 OSC（\cref{sec:ctrl-robot-osc}）给的是\emph{良态}前提下的理想公式；本节是它在病态本体上的\emph{失效边界}，二者互补。
+\end{insight}
+
+\subsection{后果二：低惯量腕在控制率下欠采样发散}
+\label{sec:ap-lowinertia}
+
+\paragraph{现象：肩肘跟得好，腕全幅发散。}
+对一段大范围轨迹做计算力矩跟踪，首版全 $6$ 关节振、RMS $813\,\mathrm{mrad}$ 不跟。逐关节仪表化后发现：缓动相（慢）全关节 sub-mrad（CT 机理正确），但\emph{振荡相}里肩肘 J2/J3 完美、\textbf{腕 J4/5/6 全幅发散}（J6 期望 $0$ 却摆 $\pm1$）。
+
+\begin{insight}[低惯量 $=$ 高自然频率 $=$ 控制率欠采样发散]\label{ins:ap-lowinertia}
+为什么\emph{更轻}的腕\emph{更难}控？因为低惯量 $=$ 高自然角频率。腕惯量 $\sim2\times10^{-4}$，其自然时间常数
+\begin{equation}
+  \tau_{\mathrm{nat}}=\frac{I}{\text{damping}}\approx\frac{2\times10^{-4}}{0.1}=2\,\mathrm{ms}\ (1/\tau_{\mathrm{nat}}\approx 500\,\mathrm{rad/s}),
+  \label{eq:ap-taunat}
+\end{equation}\footnote{此处 $1/\tau_{\mathrm{nat}}=500\,\mathrm{s^{-1}}$ 是一阶极点的特征\emph{角速率}（rad/s），换算成赫兹为 $1/(2\pi\tau_{\mathrm{nat}})\approx 80\,\mathrm{Hz}$；它与下文 MuJoCo 物理步长 $1/(2\,\mathrm{ms})=500\,\mathrm{Hz}$ 的\emph{仿真步率}数值偶合但量纲不同，不应混为一谈。判稳的恰当比较是把该角速率（或二阶 $\omega_n\approx866\,\mathrm{rad/s}$）与控制角频率对照——更直接的发散证据见本盒末的原始 PD 实测。}
+\emph{快于}控制率（$\sim100$--$200\,\mathrm{Hz}$）$\to$ 闭环\textbf{欠采样发散}（控制器“看”得不够快，跟不上腕自己的动力学）。这与 \cref{eq:ap-omegan} 的仿真数值发散同一机理（采样/积分跟不上高频）。一个关键推论：\emph{腕的稳定靠的是物理层（MJCF $500\,\mathrm{Hz}$ 的关节阻尼）按住的，控制器\emph{不能}去补偿它}——试过加黏滞前馈 $\boldsymbol{\tau}\mathrel{+}=0.1\dot{\mathbf{q}}$（想让模型匹配 plant）反而\emph{更糟}（撤掉了稳定阻尼），RMS $795$，撤回。\textbf{触目惊心的实证}：对 $2\times10^{-4}$ 惯量腕施原始 PD，力矩在钳位前冲到 $\mathbf{888\,N\!\cdot\! m}$，即便钳到 $26$ 仍产生 $\mathbf{1.3\times10^{5}\,rad/s^2}$ 加速度发散——这是“小惯量末端在控制率下原始 PD 必炸、不可 PD 控”最有说服力的证据。
+\end{insight}
+
+\begin{insight}[计算力矩的 $\mathbf{M}(\mathbf{q})$ 加权天然给每关节正确力矩权限]\label{ins:ap-M-weighting}
+\cref{ins:ap-lowinertia} 引出“为何异质惯量臂宜用逆动力学控制”的第二理由。\emph{均匀增益}的 PD（所有关节同 $k_p$）会失稳：腕的 $\omega_n=\sqrt{150/2\times10^{-4}}\approx 866\,\mathrm{rad/s}\gg$ 控制率。而\textbf{计算力矩 \cref{eq:ap-ctc} 里的 $\mathbf{M}(\mathbf{q})$ 加权\emph{天然}给每个关节\emph{正确}的力矩权限}——重关节配大力矩、轻关节配小力矩，因为 $\boldsymbol{\tau}=\mathbf{M}\,\mathbf{a}_{\mathrm{cmd}}+\dots$ 已把惯量结构编码进去。这就是 \cref{ins:ap-fair-compare} 增益异质 $\mathbf{K}_p=\mathrm{diag}([150,150,150,150,100,60])$ 的物理依据：腕端降增益，匹配其小惯量。\textbf{逆动力学控制对异质惯量臂的优势，正是它“按惯量加权”这一点}。
+\end{insight}
+
+\begin{insight}[腕误差经质量阵耦合腐蚀主关节：必须解耦]\label{ins:ap-coupling}
+大范围跟踪还有第三个坑：\emph{腕治好后肩肘仍跟不上}，$\tau_2$ 该 $3.5$ 却跳到 $15$、手臂卡住。根因是\textbf{漂掉的腕误差经 $\mathbf{M}$ 的耦合项注入主关节}：$\mathbf{a}_{\mathrm{cmd}}=\mathbf{K}_p\mathbf{e}$ 对全 $6$ 关节反馈，腕误差 $e_{\mathrm{wrist}}$ 经 \texttt{rnea} 的质量阵耦合项 $M_{2,5}\cdot a_{\mathrm{cmd},5}$ 污染 $\tau_2/\tau_3$。\textbf{解决：解耦} $\mathbf{a}_{\mathrm{cmd}}[\text{腕}]=0$（腕确实近静止），\texttt{rnea} 算肩肘力矩时腕加速度按 $0$，耦合不再腐蚀；腕力矩另行温和保持（MJCF 隐式高阻尼 + 温和 $k_p=3$ 定心）。去耦合后 $\tau_2$ 回到 $\sim3.5$（与基线一致），精确跟踪。\textbf{这是“M3 只动高惯量关节、握住腕”在大范围重定位下的升级版}：从“握住腕”升级成“\emph{零腕的} $\mathbf{a}_{\mathrm{cmd}}$ + 阻尼兜底”。耦合通过 $\mathbf{M}$ 的非对角元传播，是异质惯量臂控制必须正视的物理。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{异质惯量臂的两类病及其控制率选择（\cref{sec:ap-illcond} 小结）}
+\begin{tabular}{p{0.24\textwidth} p{0.34\textwidth} p{0.34\textwidth}}
+\toprule
+病 & 机理 & 对策（控制率选择）\\
+\midrule
+OSC 零空间收不住末端 & 病态 $\mathbf{M}$ 使 $(\mathbf{J}\mathbf{M}^{-1}\mathbf{J}^\top)^{-1}$ 爆；正则化破坏投影性（\cref{ins:ap-osc-breakdown})& 冗余解析换到\emph{速度级} \cref{eq:ap-nullspace-kin}（无 $\mathbf{M}^{-1}$，末端锁 $0.00\,\mathrm{mm}$）\\
+低惯量腕发散 & 自然频率 $\approx500\,\mathrm{Hz}$ $>$ 控制率，欠采样（\cref{ins:ap-lowinertia})& 物理层阻尼按住腕；控制层\emph{解耦腕} $\mathbf{a}_{\mathrm{cmd}}[\text{腕}]=0$（\cref{ins:ap-coupling})\\
+均匀增益 PD 摇晃轻腕失稳 & 腕 $\omega_n=\sqrt{k_p/I}$ 巨大 & 用计算力矩（$\mathbf{M}$ 加权）或增益异质 $\mathbf{K}_p$（\cref{ins:ap-M-weighting})\\
+\bottomrule
+\end{tabular}
+\label{tab:ap-illcond}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{动力学计算工具：Pinocchio 速查}
+\label{sec:ap-pinocchio}
+
+本章所有力控/轨迹模块的动力学量都由 Pinocchio 在线算。下表是“用途 $\to$ API”映射（本部动力学理论章将系统给出 RNEA/CRBA 的递推推导与复杂度；本章只\emph{用}它们）：
+
+\begin{table}[H]\centering\small
+\caption{Pinocchio API 用途映射（本章动力学计算工具）}
+\begin{tabular}{p{0.30\textwidth} p{0.30\textwidth} p{0.32\textwidth}}
+\toprule
+要什么 & API & 本章用处 \\
+\midrule
+重力力矩 $\mathbf{g}(\mathbf{q})$ & \texttt{computeGeneralizedGravity} & 重力补偿、阻抗的 $\mathbf{g}$ 项（\cref{eq:ap-cartimp}）\\
+质量阵 $\mathbf{M}(\mathbf{q})$ & \texttt{crba}（复合刚体算法）& 条件数分析、OSC 的 $\boldsymbol{\Lambda}$（\cref{sec:ap-illcond}）\\
+逆动力学 $\boldsymbol{\tau}=\mathbf{M}\mathbf{a}+\mathbf{C}\dot{\mathbf{q}}+\mathbf{g}$ & \texttt{rnea}（牛顿--欧拉递推）& 计算力矩（\cref{eq:ap-ctc}）、力矩约束 TOPP-RA（\cref{eq:ap-tau-invdyn}）\\
+雅可比 $\mathbf{J}$ & \texttt{computeFrameJacobian} & 静力学 $\mathbf{J}^\top\mathbf{F}$、resolved-rate、CBF 的 $\nabla h$ \\
+\bottomrule
+\end{tabular}
+\label{tab:ap-pinocchio}
+\end{table}
+
+\begin{codebox}[Python]{力矩控制节点的核心循环（要点伪代码，约 200 Hz）}
+# 订阅 /joint_states (务必按 name 读, 见 pitfall: red herring)
+q, dq = read_joint_states_by_name(msg)        # 不要按下标裸读!
+
+# Pinocchio 在线算动力学量
+g = pin.computeGeneralizedGravity(model, data, q)        # 重力力矩
+M = pin.crba(model, data, q)                             # 质量阵 (CRBA)
+J = pin.computeFrameJacobian(model, data, q, ee_frame)   # 末端雅可比
+
+# --- 三选一控制律 ---
+# (a) 笛卡尔阻抗 (式 ap-cartimp):
+tau = J.T @ (-Kc @ dx - Dc @ dx_dot) + g
+# (b) 计算力矩 (式 ap-ctc): rnea 一次算全逆动力学
+a_cmd = ddq_d + Kp @ e + Kd @ de
+a_cmd[WRIST] = 0.0                            # 解耦腕 (见 insight: coupling)
+tau = pin.rnea(model, data, q, dq, a_cmd)
+# (c) 混合力位 (式 ap-hybrid): S 选力轴, I-S 选位轴
+F = build_hybrid_force(Fd, y, z, Kp, d)
+tau = J3xN.T @ F + g
+
+tau = np.clip(tau, -26.0, +26.0)             # 力矩钳位 (达妙电机额定)
+publish_effort(tau)                           # -> JointGroupEffortController -> MuJoCo <motor>
+\end{codebox}
+
+\begin{pitfall}[\texttt{/\allowbreak joint\_states} 按 name 读，别按下标裸读（red herring 警示）]\label{pit:ap-jointorder}
+一个浪费大量定位时间的 red herring：仿真桥的 \texttt{/\allowbreak joint\_states} 按\emph{仿真器内部注册序}发布（如 \texttt{[joint2,joint3,joint1,joint4,joint5,joint6]}），\emph{不是} joint1--6 的名序。若按下标裸读，会把腕/肩\emph{张冠李戴}，看似“joint 1/2/3 控制坏了”，实则索引错乱。\textbf{永远按 name 数组读 \texttt{/\allowbreak joint\_states}}（关节轨迹控制器按名映射、不受影响）。\textbf{教训}：“某几个关节坏了”常是数据通道问题——\emph{先验证数据通道，再怀疑算法}（\cref{sec:ap-methodology}）。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{全栈 capstone：一条连续力矩会话}
+\label{sec:ap-capstone}
+
+\paragraph{“全栈” $\ne$ 每个算法各跑一遍。}
+\begin{insight}[全栈要证明的是“层间交接干净、能组合接力”]\label{ins:ap-fullstack}
+M4 capstone 的要义：\textbf{“全栈”不是把规划、避障、阻抗、计算力矩\emph{各演示一遍}，而是证明\emph{层与层之间的交接（hand-off）干净、能组合接力}}。一条连续力矩会话里，“计算力矩跟踪”到位后\emph{无缝}切给“笛卡尔阻抗柔顺”，中间状态（位置/速度）连续、不抖、不跳——这才叫全栈跑通。这与四足部 \cref{ch:quad_prac} 的 capstone 精神一致：真正的集成考验是\emph{接口}（一层的输出恰好是下一层干净的输入），而非\emph{模块}各自能跑。
+\end{insight}
+
+\paragraph{三相连续会话。}
+M4 是一条“规划 $\to$ 计算力矩 $\to$ 阻抗”的连续力矩会话，分三相：
+
+\begin{table}[H]\centering\small
+\caption{M4 全栈 capstone 三相（规划离线、控制/力控在线）}
+\begin{tabular}{p{0.14\textwidth} p{0.12\textwidth} p{0.38\textwidth} p{0.26\textwidth}}
+\toprule
+相 & 层 & 做什么 & 算法 \\
+\midrule
+Phase 0（离线）& 规划 & MoveIt OMPL 规划 READY $\to$ precontact，\texttt{plan\_only}，存 \texttt{.npz} & OMPL \\
+Phase A（在线）& 控制 & 余弦缓动：仿真起姿 $\to$ 规划起点 & cosine ease \\
+Phase B（在线）& 控制 & \emph{计算力矩}跟踪规划路点 $\to$ 到 precontact & \texttt{rnea}（\cref{eq:ap-ctc}）\\
+Phase C（在线）& 力控 & \emph{笛卡尔阻抗}柔顺保持 + 摆动 & \cref{eq:ap-cartimp} \\
+\bottomrule
+\end{tabular}
+\label{tab:ap-capstone}
+\end{table}
+
+\begin{insight}[预防性设计：把前期教训用在规划起点与锁腕]\label{ins:ap-preventive}
+Phase 0 体现了两个\emph{预防性}设计决策——把前面踩的坑\emph{在源头}规避：
+\begin{enumerate}
+  \item \textbf{规划起点选轻重力的 READY（J2 $=-1.0$，重力矩 $\approx-0.2\,\mathrm{N\!\cdot\! m}$ 轻、已证可保持），而非重力重的 home（J2 $=-1.57$）}——后者会 under-track；
+  \item \textbf{路点全程锁腕 WRIST $=0$}，使规划路径\emph{永不}驱动 $2\times10^{-4}$ 惯量腕 $\to$ 从源头规避计算力矩腕不稳（\cref{ins:ap-lowinertia} 教训的预防性应用）。
+\end{enumerate}
+\textbf{最好的故障处理是让故障不发生}：与其在控制层和病态腕硬刚，不如在规划层就让路径避开它（锁腕）、让起点处在良态区（READY）。这是“理解本体 $\to$ 预防性设计”的闭环——\cref{ins:ap-heterogeneous} 的异质惯量认知，最终落成 Phase 0 的两个决策。
+\end{insight}
+
+\paragraph{结果。}
+规划 $\to$ 计算力矩精确到位（J2 $\to-1.00$、precontact 约 $[-0.01,-0.54,1.36]$、$\tau_{\max}\sim4$）$\to$ 阻抗柔顺接力（末端 $z$ 约 $10\,\mathrm{cm}$ 弹簧式摆动）。一条连续会话，\emph{纯力矩 + Pinocchio + MuJoCo，无 F/T}。
+
+\begin{pitfall}[大范围跟踪会撞上“被障碍/工作空间挡住”的非控制 bug]\label{pit:ap-wall-block}
+capstone 调试中遇到“$\tau$ 不饱和却不动”：手臂卡在 J2 $=-0.25$（远未到 READY 的 $-1.0$）。\emph{隔离变量法}定位：跑\textbf{无墙基线}（已验证的计算力矩）$\to$ J2 干净到 $-1.0$、$\tau=3.5$；\emph{有墙则卡} $\to$ 锁定是\emph{障碍盒挡住够臂运动}（不是控制坏了）。\textbf{双管解决}：(1) 把挡路的大墙缩成只挡末端前方的\emph{小面板}（不挡连杆凸包）；(2) capstone 重点是\emph{组合}非重证接触 $\to$ Phase C 改用鲁棒的阻抗柔顺摆动（自包含、无脆弱接触几何）。\textbf{教训}：“不动”未必是控制 bug，可能是几何/工作空间约束——用无障碍基线隔离出来（\cref{sec:ap-methodology}）。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{求解频率与跟踪精度：为何控制频率必须那么高}
+\label{sec:ap-tracking-accuracy}
+
+\paragraph{动机：给本章散落的“频率踩坑”补一个理论锚。}
+本章已多处撞上“频率不够”这堵墙：仿真显式积分在 $\omega_n\Delta t\gg2$ 时发散（\cref{eq:ap-omegan}）、低惯量腕的自然频率 $\sim500\,\mathrm{rad/s}$ 快于 $\sim100$--$200\,\mathrm{Hz}$ 控制率而欠采样发散（\cref{ins:ap-lowinertia}）。这些都在追问同一个问题：\textbf{“控制/求解频率”到底该取多高、取低了会差多少？}本节给这条工程经验补上一个\emph{定量}理论锚——Paul 在 1981 年就把\emph{求解频率}与\emph{跟踪误差}显式关联成一条二阶律\cite{paul1981robot}。它解释了“为什么需要那么高的控制频率”不是玄学，而是一个 $\Delta x\propto v^2/f^2$ 的硬约束；同时把频率的\emph{上界}（结构共振）也讲清，引出一个 trade-off。
+
+\subsection{Paul 的求解频率下界：$f_{\mathrm{solve}}>10\,f_{\mathrm{structural}}$}
+\label{sec:ap-fsolve-bound}
+
+\paragraph{把臂粗化为“一个共振频率”。}
+Paul 的出发点是一个\emph{极简模型}：一条串联臂结构无穷复杂、且依位形而变，但可粗化为“一个具有某结构共振频率 $f_{\mathrm{structural}}$ 与阻尼的结构”。设求解器以固定\emph{求解频率} $f_{\mathrm{solve}}$ 离散地解逆运动学得到关节设定点，两次求解\emph{之间}做\emph{线性插值}。线性插值意味着段内\emph{匀速}、而在每个求解时刻发生\emph{冲量式（impulsive）加速度}——速度被瞬间改向。要让这些周期性冲量\emph{不激起}结构共振，求解频率须远高于结构共振：
+\begin{equation}
+  f_{\mathrm{solve}} > 10\,f_{\mathrm{structural}}.
+  \label{eq:ap-fsolve}
+\end{equation}
+（Paul 给 Stanford 臂乐观估 $f_{\mathrm{structural}}\approx5\,\mathrm{Hz}$，故求解率取 $50\,\mathrm{Hz}$。）
+
+\begin{insight}[求解频率的\emph{下界}来自“别激起结构共振”]\label{ins:ap-fsolve-resonance}
+\cref{eq:ap-fsolve} 的物理是\textbf{把控制频率的下界钉在结构共振上}：分段线性插值在每个求解节点注入冲量加速度，其谐波若落在结构共振附近就会\emph{激振}（齿轮敲击、连杆颤动）。$10\times$ 是把激励主能量推到远离 $f_{\mathrm{structural}}$ 的经验安全裕度。这与本章 \cref{ins:ap-num3} 的仿真侧判据 $\omega_n\Delta t\ll2$ 是\emph{同一回事的两面}：那里是\emph{显式积分步率}要快于系统最高固有频率，这里是\emph{求解/插值率}要快于\emph{结构}固有频率——都在说“离散更新率必须远超被控对象的最快动力学，否则离散化本身成了激励源”。\cref{ins:ap-lowinertia} 的低惯量腕欠采样发散，正是这条律在“惯量小 $\Rightarrow$ 固有频率高 $\Rightarrow$ 所需频率更高”方向上的实测后果。
+\end{insight}
+
+\subsection{跟踪误差的二阶律：$\Delta x\propto v^2/f_{\mathrm{solve}}^2$}
+\label{sec:ap-deltax-law}
+
+\paragraph{弦高几何：插值偏离真实曲线多少。}
+定了 $f_{\mathrm{solve}}$，就能估\emph{跟踪误差}。考虑一个有代表性的场景：末端要跟一条\emph{匀速}经过的目标（如传送带上的工件），臂可近似为一根半径 $R$ 的连杆、工件在距其 $R/2$ 处沿 $y$ 向匀速掠过。两次求解之间末端走\emph{直线弦}、真实路径是\emph{圆弧}，最大偏离即\emph{弦高}，是相邻两解间距 $\Delta y$ 的函数：
+\begin{equation}
+  \Delta x = \frac{\Delta y^{2}}{8R}.
+  \label{eq:ap-deltax-chord}
+\end{equation}
+若目标以恒速 $v_c$ 移动，则一个求解周期内 $\Delta y=v_c/f_{\mathrm{solve}}$，代入得跟踪误差与求解频率的\textbf{二阶关系}：
+\begin{equation}
+  \boxed{\;\Delta x = \frac{v_c^{2}}{8R\,f_{\mathrm{solve}}^{2}}.\;}
+  \label{eq:ap-deltax-fsolve}
+\end{equation}
+
+\begin{insight}[$\Delta x\propto v^2/f^2$：误差对频率是\emph{二阶}衰减、对速度是\emph{二阶}增长]\label{ins:ap-deltax-law}
+\cref{eq:ap-deltax-fsolve} 是本节的核心定量结论，含两层\emph{二阶}标度（Paul eq.\ 5.100--5.102\cite{paul1981robot}）：
+\begin{itemize}
+  \item \textbf{对求解频率二阶衰减}：$f_{\mathrm{solve}}$ \emph{翻倍}，跟踪误差降到 $1/4$。这就是“为何要那么高的控制频率”的硬答案——不是线性回报，而是\emph{平方}回报，故把 $100\,\mathrm{Hz}$ 提到 $500\,\mathrm{Hz}$（$5\times$）能把这项几何误差砍到 $1/25$。
+  \item \textbf{对运动速度二阶增长}：$\Delta x\propto v_c^2$。\emph{走得越快、误差涨得越凶}——这是\cref{eq:ap-omegan,ins:ap-lowinertia} 的“频率不足”从\emph{执行端}看的同一枚硬币：快动作对采样率的需求按平方上升。
+\end{itemize}
+直觉上，误差源是“离散求解 $+$ 线性插值”把一条曲线用折线近似，弦高 $\propto(\text{步长})^2=(v_c/f)^2$。\textbf{这条律把“控制频率”从一个拍脑袋的工程参数，变成可\emph{算}的精度预算}：给定连杆几何 $R$、作业速度 $v_c$、容许误差 $\Delta x$，反解 $f_{\mathrm{solve}}\ge v_c/\sqrt{8R\,\Delta x}$ 即得频率下限。本臂的 \texttt{rnea}/逆运动学求解（\cref{sec:ap-pinocchio}）正坐在这个 $f_{\mathrm{solve}}$ 上。
+\end{insight}
+
+\paragraph{用 \texttt{arm\_dm} 实例看“100\,Hz vs 500\,Hz”。}
+把 \cref{eq:ap-deltax-fsolve} 套到本臂的一个有代表性工况：取连杆等效半径 $R\approx0.5\,\mathrm{m}$、末端线速 $v_c\approx1\,\mathrm{m/s}$（一段中等快速的笛卡尔移动）。两个候选求解频率的几何跟踪误差对比如下：
+
+\begin{table}[H]\centering\small
+\caption{求解频率对几何跟踪误差的影响（\cref{eq:ap-deltax-fsolve}，$R=0.5\,\mathrm{m}$、$v_c=1\,\mathrm{m/s}$）}
+\begin{tabular}{p{0.18\textwidth} p{0.20\textwidth} p{0.22\textwidth} p{0.30\textwidth}}
+\toprule
+$f_{\mathrm{solve}}$ & 步长 $\Delta y=v_c/f$ & 跟踪误差 $\Delta x$ & 评注 \\
+\midrule
+$100\,\mathrm{Hz}$ & $10\,\mathrm{mm}$ & $\dfrac{1^2}{8\cdot0.5\cdot100^2}=2.5\times10^{-5}\,\mathrm{m}=25\,\mu\mathrm{m}$ & 弦高已达数十微米 \\
+$500\,\mathrm{Hz}$ & $2\,\mathrm{mm}$ & $\dfrac{1^2}{8\cdot0.5\cdot500^2}=1.0\times10^{-6}\,\mathrm{m}=1\,\mu\mathrm{m}$ & \textbf{误差降到 $1/25$}（频率 $5\times$、二阶）\\
+\bottomrule
+\end{tabular}
+\label{tab:ap-fsolve-error}
+\end{table}
+
+\begin{insight}[“为何需要 $500\,\mathrm{Hz}$”：几何误差与\emph{动力学稳定}的双重逼迫]\label{ins:ap-why-highfreq}
+\cref{tab:ap-fsolve-error} 给出“为何控制频率不能只取 $100\,\mathrm{Hz}$”的\emph{两个独立}理由，叠加成本臂对高频的刚需：
+\begin{enumerate}
+  \item \textbf{几何精度}（本节）：误差 $\propto1/f^2$，$100\!\to\!500\,\mathrm{Hz}$ 把弦高从 $25\,\mu\mathrm{m}$ 砍到 $1\,\mu\mathrm{m}$——\emph{开环}插值精度的平方级提升。
+  \item \textbf{动力学稳定}（\cref{ins:ap-lowinertia}）：本臂低惯量腕自然频率 $\sim500\,\mathrm{rad/s}$（约 $80\,\mathrm{Hz}$ 量纲，二阶 $\omega_n\approx866\,\mathrm{rad/s}$），$100\,\mathrm{Hz}$ 已逼近\emph{欠采样发散}边界，$500\,\mathrm{Hz}$ 才有足够裕度让控制器“看得过来”腕的快动力学。
+\end{enumerate}
+\textbf{两条理由指向同一结论}：本臂的力控循环跑在 $\sim200\,\mathrm{Hz}$（\cref{sec:ap-impedance}）已是\emph{折中}——再低则腕失稳且笛卡尔跟踪起毛刺，理想上向 $500\,\mathrm{Hz}$ 靠拢。这就把“控制频率”从“越高越好的模糊偏好”落成“被几何误差预算 \cref{eq:ap-deltax-fsolve} 与动力学采样判据 \cref{ins:ap-lowinertia} 双向卡死的设计量”。
+\end{insight}
+
+\subsection{频率的上界：与结构共振的 trade-off 和算力天花板}
+\label{sec:ap-fsolve-tradeoff}
+
+\paragraph{服务频率还有更严的下界：$15\,f_{\mathrm{structural}}$。}
+\cref{eq:ap-fsolve} 是\emph{求解}（逆运动学设定点）频率的下界；底层\emph{关节伺服}的采样率要求更严——Paul 指出伺服环采样率应达 $\approx15\,f_{\mathrm{structural}}$，且环路内任何模拟环节（含功放）带宽也须超结构频率 $15\times$，否则引入额外相移破坏稳定\cite{paul1981robot}（Stanford 臂据此需 $300\,\mathrm{Hz}$ 伺服）。这与本章“求解率 $\ne$ 伺服率”的分层一致：可较慢地解逆运动学设定点、较快地伺服插值跟踪。
+
+\begin{insight}[求解频率被“共振下界”与“算力上界”夹在中间]\label{ins:ap-fsolve-tradeoff}
+把下界 \cref{eq:ap-fsolve} 和误差律 \cref{eq:ap-deltax-fsolve} 合看，$f_{\mathrm{solve}}$ 被夹在一条\emph{窄缝}里，构成本节的核心 trade-off：
+\begin{itemize}
+  \item \textbf{下逼}：$f_{\mathrm{solve}}$ 必须\emph{远高于}结构共振（$>10\,f_{\mathrm{structural}}$，伺服更要 $15\times$）——既为不激振（\cref{ins:ap-fsolve-resonance}），也为压低 $\propto1/f^2$ 的跟踪误差（\cref{ins:ap-deltax-law}）。
+  \item \textbf{上限}：$f_{\mathrm{solve}}$ 受\emph{算力}天花板压制——每个周期 $1/f_{\mathrm{solve}}$ 内要算完逆运动学/逆动力学（本臂是 Pinocchio 的 \texttt{rnea}/\allowbreak\texttt{crba}/雅可比，\cref{sec:ap-pinocchio}）。Paul 当年痛陈 Stanford 臂 $300\,\mathrm{Hz}$ 留给单关节伺服的 $3.3\,\mathrm{ms}$“几乎不够算、遑论六关节”；今天算力宽裕得多，但\emph{接触物理 $+$ 在线动力学 $+$ 求解}叠起来，单周期预算仍是真实约束。
+\end{itemize}
+\textbf{故 $f_{\mathrm{solve}}$ 不是“越高越好”、而是“在算得过来的前提下尽量高于共振并压低误差”}——这正解释了本臂力控为何停在 $\sim200\,\mathrm{Hz}$ 而非任意拉高：它是“共振下界 $+$ 误差预算”要它高、“单周期算完动力学”要它别太高，两者夹出的工程折中点。把结构共振的来龙去脉（连杆刚度、负载如何拉低 $f_{\mathrm{structural}}$、传动柔性）讲透是\cref{ch:drive-systems} 的事；本臂控制律的整定与稳定边界见 \cref{ch:arm-ctrl}。本节只把“频率—误差—共振”这条 Paul 的经典链补成本章已有频率踩坑的\emph{理论锚}。
+\end{insight}
+
+\begin{pitfall}[别把“求解率”“伺服率”“物理步率”混为一谈]\label{pit:ap-three-rates}
+本章出现了\emph{三个}容易混淆的“频率”，量纲/角色各异，调参时务必分清：(1) \textbf{求解率} $f_{\mathrm{solve}}$——解逆运动学/逆动力学得设定点的频率，决定 \cref{eq:ap-deltax-fsolve} 的几何跟踪误差；(2) \textbf{伺服率}——底层关节力矩环采样率，需 $\approx15\,f_{\mathrm{structural}}$；(3) \textbf{物理步率}——仿真器（MuJoCo $500\,\mathrm{Hz}$）的积分步率，关乎 \cref{eq:ap-omegan} 的显式积分稳定。三者数值可能\emph{偶合}（如都接近 $500$）但意义不同：\cref{ins:ap-lowinertia} 脚注已警示腕的一阶角速率 $500\,\mathrm{rad/s}$ 与物理步率 $500\,\mathrm{Hz}$ 量纲不同、不可混谈。\textbf{教训}：报“频率不够”时先问“哪一个频率、相对哪个对象的哪个固有频率”——否则诊断方向就错了（呼应 \cref{sec:ap-methodology} 的“先界定再调”）。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{工程方法论与元教训}
+\label{sec:ap-methodology}
+
+把前面散落的诊断历程提炼成可迁移的方法论。这些\emph{元教训}比任何单条公式都更耐用——它们是“怎么调一台真机器人”的工程素养。
+
+\begin{insight}[六条元教训]\label{ins:ap-metalessons}
+\begin{enumerate}
+  \item \textbf{数据驱动诊断，非盲调}：“多花一次验数据，省十次盲调”——重力补偿的限位夹持（\cref{pit:ap-gravcomp-limit}）、障碍放置的碰撞 API（\cref{pit:ap-collision-volume}）、关节序的 red herring（\cref{pit:ap-jointorder}），都是先\emph{验数据/物理边界}才定位对。
+  \item \textbf{异质惯量臂解耦低惯量腕}：腕的稳定靠物理层阻尼，控制层要解耦其 $\mathbf{a}_{\mathrm{cmd}}$（\cref{ins:ap-coupling}），别去补偿快于控制率的动力学。
+  \item \textbf{冗余解析的层次选择}：用第一性原理（条件数）判可行性，病态 $\mathbf{M}$ 下换到速度级（\cref{ins:ap-redundancy-level}），别在力矩层硬刚。
+  \item \textbf{力矩感知时序走逆动力学}：限加速度既不安全又浪费，力矩约束 TOPP-RA 才贴电机极限（\cref{ins:ap-torque-topp}）。
+  \item \textbf{“全栈” $=$ 证明层间交接，非各跑一遍}（\cref{ins:ap-fullstack}）。
+  \item \textbf{诚实记录局限是工程素养}：headline 改诚实框定（“占位惯量下”“开环力”“受控 frame”），删“钉墙”“干净矩阵”“全部验证”等绝对语（\cref{pit:ap-honest-wall}、\cref{ins:ap-placeholder}）。
+\end{enumerate}
+\end{insight}
+
+\begin{insight}[隔离变量法 / red herring / 进程生命周期]\label{ins:ap-techniques}
+三类常用调试技术：
+\begin{itemize}
+  \item \textbf{隔离变量法}：M4 用无墙基线锁定“大墙挡路”（\cref{pit:ap-wall-block}）、公平对比用各自全新 spawn 隔离起点（\cref{ins:ap-fair-compare}）——\emph{一次只变一个量}。
+  \item \textbf{警惕 red herring}：\texttt{/\allowbreak joint\_states} 名序错乱被误读成“算法坏了”（\cref{pit:ap-jointorder}）——\emph{先验证数据通道}。
+  \item \textbf{进程/线程生命周期坑}：回调内 \texttt{shutdown} 不停 \texttt{spin}（须硬退）；effort 控制器节点退出后\emph{保持最后力矩}（故公平对比必须各自全新 spawn、否则上一轮残留力矩污染起点）；\texttt{pkill} 的匹配串要精确到 \texttt{.py}/node 名（否则误杀含同名串的 wrapper 脚本、自杀）。
+\end{itemize}
+\end{insight}
+
+\begin{insight}[力矩跟踪故障的四种波形签名]\label{ins:ap-signatures}
+一套可复用的力矩调试诊断清单：把逐关节时间序列波形按\emph{四种典型签名}归类，看到哪种波形 $\to$ 对应哪类根因：
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.28\textwidth} p{0.62\textwidth}}
+\toprule
+波形签名 & 典型根因 \\
+\midrule
+stuck-at-home（卡在起点不动）& 限位夹持（\cref{pit:ap-gravcomp-limit}）/ 障碍挡路（\cref{pit:ap-wall-block}）/ 力矩权限不足 \\
+wrong-sign-runaway（反号飞走）& 符号错（雅可比/误差/重力方向）、帧约定反了 \\
+unstable（高频发散）& 低惯量关节欠采样（\cref{ins:ap-lowinertia}）、增益过高、$\omega_n\Delta t$ 太大 \\
+lagging（周期性滞后）& 缺前馈（PD+g 无 $\mathbf{M}\ddot{\mathbf{q}}+\mathbf{C}\dot{\mathbf{q}}$，对照 \cref{ins:ap-fair-compare}）\\
+\bottomrule
+\end{tabular}
+\label{tab:ap-signatures}
+\end{table}
+\textbf{这张表把“看波形”从玄学变成可查的对照清单}——是力矩控制调试最实用的产出之一。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{通往强化学习操作（桥）}
+\label{sec:ap-to-rl}
+
+\paragraph{经典控制是 RL 操作的地基。}
+本章（及本部其余理论章）建立的经典地基——FK/雅可比、动力学/质量阵/重力补偿、阻抗/Hogan、计算力矩、接触/力控——正是下一部\emph{强化学习操作}（\cref{ch:rlmc-manip}）常\emph{隐式假定已知}却不重建的内容。两者的边界值得点明：
+
+\begin{insight}[经典控制 vs RL 操作：边界与互补]\label{ins:ap-rl-boundary}
+\textbf{经典控制}（本章）：模型已知、可解释、可证稳（\cref{thm:ctrl-ctc}、\cref{thm:ctrl-pd-grav}）、易整定，但需精确建模、面对复杂接触/高维感知较吃力。\textbf{RL 操作}（\cref{ch:rlmc-manip}）：从数据学策略、适应复杂接触与未建模动力学、可端到端融合感知，但样本昂贵、可解释性弱、sim-to-real 有 gap。二者\emph{互补}而非替代：RL 操作里的 DiffIK（用阻尼最小二乘伪逆，正是本章 \cref{eq:ap-resolved-rate} 的 $\mathbf{J}^{+}$）、第三层动作的操作空间控制（OSC，本章 \cref{eq:ap-nullspace-dyn}）、阻抗（Hogan，本章 \cref{sec:ap-impedance}）——这些“配置语法”背后的\emph{原理}都在经典控制里。\textbf{懂了本章，再读 RL 操作就不是“调超参”，而是“知道每个动作空间/奖励项对应哪条控制律}”。本章为 \cref{ch:rlmc-manip} 补上这层经典地基。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+要做柔顺接触就得装 F/T 力传感器 & 力矩臂测位置出力矩 $=$ 真阻抗，无需 F/T（\cref{ins:ap-torque-impedance}）\\
+规划完路径就能直接执行 & path($\mathbf{q}(s)$)$\ne$trajectory($\mathbf{q}(t)$)，须时间参数化（\cref{ins:ap-path-traj}）\\
+限关节加速度就够安全了 & 加速度盒忽略 $\mathbf{M}(\mathbf{q})$，可能超力矩又浪费；须力矩约束 TOPP-RA（\cref{ins:ap-torque-topp}）\\
+反应式避障一定要解 QP & 单约束 CBF 有闭式投影，一行代码（\cref{ins:ap-cbf}）\\
+CBF 保证到达目标 & CBF 只保证安全，可能死锁/不可达，须破解（\cref{pit:ap-cbf-deadlock,pit:ap-cbf-unreach}）\\
+照搬 OSC 零空间就能锁末端 & 病态 $\mathbf{M}$ 下力矩级漂 $60$--$110\,\mathrm{mm}$；异质惯量臂正解是速度级（\cref{ins:ap-redundancy-level}）\\
+正则化 $\mathbf{M}+\lambda\mathbf{I}$ 是免费的数值技巧 & 它破坏投影性、特征值不再 $\{0,1\}$，漏力矩入任务空间（\cref{ins:ap-osc-breakdown}）\\
+惯量越小的关节越好控 & 低惯量 $=$ 高自然频率 $=$ 控制率欠采样发散（\cref{ins:ap-lowinertia}）\\
+均匀增益 PD 控所有关节 & 须按惯量加权（计算力矩天然加权 / 增益异质）（\cref{ins:ap-M-weighting}）\\
+“全栈”是各算法演示一遍 & 是证明层间交接干净、能组合接力（\cref{ins:ap-fullstack}）\\
+“某几个关节坏了” & 常是 \texttt{/\allowbreak joint\_states} 名序错乱，先验数据通道（\cref{pit:ap-jointorder}）\\
+实测“钉墙/恒力”就照写 & 诚实框定边界（开环力/受控 frame/占位惯量），删绝对语（\cref{pit:ap-honest-wall}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{本章公式 / 结论速查表}
+\begin{tabular}{p{0.30\textwidth} p{0.42\textwidth} p{0.18\textwidth}}
+\toprule
+公式 / 结论 & 一句话说明 & 对应 \\
+\midrule
+笛卡尔阻抗 \cref{eq:ap-cartimp} & $\boldsymbol{\tau}=\mathbf{J}^\top(-\mathbf{K}_c\Delta\mathbf{x}-\mathbf{D}_c\dot{\mathbf{x}})+\mathbf{g}$，临界阻尼 $\mathbf{D}=2\sqrt{\mathbf{K}}$ & \cref{ins:ap-critdamp} \\
+计算力矩 \cref{eq:ap-ctc} & $\boldsymbol{\tau}=\mathrm{rnea}(\mathbf{q},\dot{\mathbf{q}},\ddot{\mathbf{q}}_d+\mathbf{K}_p\mathbf{e}+\mathbf{K}_d\dot{\mathbf{e}})$；CT 比 PD+g 紧 $26\times$ & \cref{thm:ctrl-ctc} \\
+力矩约束 \cref{eq:ap-tau-invdyn} & $\boldsymbol{\tau}=\mathbf{M}\ddot{\mathbf{q}}+\mathbf{C}\dot{\mathbf{q}}+\mathbf{g}$ 入 TOPP-RA 约束，快 $4.6\times$ & \cref{ins:ap-torque-topp} \\
+CBF 闭式投影 \cref{eq:ap-cbf-proj} & 单约束最近点投影，无需 QP & \cref{ins:ap-cbf} \\
+运动学零空间 \cref{eq:ap-nullspace-kin} & $\dot{\mathbf{q}}=\mathbf{J}^{+}(\dot{\mathbf{x}}_d+\mathbf{K}\mathbf{e})+\mathbf{N}\dot{\mathbf{q}}_{\mathrm{sec}}$，末端锁 $0.00\,\mathrm{mm}$ & \cref{ins:ap-redundancy-level} \\
+条件数判据 & $\mathrm{cond}(\mathbf{M})$ 决定含 $\mathbf{M}^{-1}$ 算法可行性 & \cref{ins:ap-cond-firstprinciple} \\
+自然时间常数 \cref{eq:ap-taunat} & $\tau_{\mathrm{nat}}=I/\text{damp}$；快于控制率则发散 & \cref{ins:ap-lowinertia} \\
+混合力位 \cref{eq:ap-hybrid} & 选择矩阵 $\mathbf{S}$ 分力轴/位轴 & \cref{ins:ap-hybrid-lessons} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 力矩臂$\to$真阻抗 & 测位置出力矩、无需 F/T、可调柔顺 & \(\bigstar\bigstar\) \\
+2 & 异质惯量本体 & 重肩肘+轻腕($2\!\times\!10^{-4}$)是病态根源 & \(\bigstar\bigstar\) \\
+3 & 三层架构解耦 & 规划离线/控制在线/轨迹文件解耦 & \(\bigstar\) \\
+4 & 数值稳定三要素 & 惯量量级+阻尼+刚度匹配，$\omega_n\Delta t<2$ & \(\bigstar\bigstar\) \\
+5 & path$\ne$trajectory & 几何路径 vs 含时间/导数的轨迹 & \(\bigstar\) \\
+6 & 时间参数化三件套 & TOTG/TOPP-RA/Ruckig 取舍 & \(\bigstar\bigstar\) \\
+7 & 力矩约束 TOPP-RA & 走逆动力学，快 $4.6\times$、贴满力矩 & \(\bigstar\bigstar\bigstar\) \\
+8 & 自写 min-jerk 参优 & 段时长决策、$T_s\propto a_s^{1/6}$ 闭式 & \(\bigstar\bigstar\bigstar\) \\
+9 & OMPL vs CHOMP & 采样概率完备 vs 优化陷局部 & \(\bigstar\bigstar\) \\
+10 & CBF 速度滤波 & 单约束闭式投影、死锁/不可达破解 & \(\bigstar\bigstar\bigstar\) \\
+11 & 笛卡尔阻抗 & 弹簧--阻尼、$\Delta x=F/K$ 物理体检 & \(\bigstar\bigstar\) \\
+12 & 计算力矩 + 公平对比 & rnea 一次算、隔离被测变量 & \(\bigstar\bigstar\bigstar\) \\
+13 & 病态质量阵根因 & 条件数判可行、正则破坏投影性 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+14 & 低惯量腕欠采样 & 自然频率$>$控制率$\to$解耦腕 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+15 & 混合力位控 & 选择矩阵、全雅可比、reach-free DOF & \(\bigstar\bigstar\bigstar\) \\
+16 & 全栈 capstone & 层间交接干净 + 预防性设计 & \(\bigstar\bigstar\) \\
+17 & 工程方法论 & 数据驱动/隔离变量/诚实框定 & \(\bigstar\bigstar\) \\
+18 & 力矩故障四签名 & 波形$\to$根因对照清单 & \(\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{机械臂建模与控制经典}：Spong 等《Robot Modeling and Control》\cite{spong2006robot}、Lynch \& Park《Modern Robotics》\cite{lynch2017modern}——DH/旋量积、逆运动学、雅可比/奇异、动力学、混合力位的系统一手讲解，本部其余理论章的主参考。
+  \item \textbf{动力学算法}：Featherstone《Rigid Body Dynamics Algorithms》\cite{featherstone2008rbda}——RNEA/CRBA 的空间向量推导与 $O(n)$ 复杂度，本章 \texttt{rnea}/\allowbreak\texttt{crba} 的算法底座。
+  \item \textbf{操作空间与阻抗}：Khatib 操作空间公式\cite{khatib1987operational}（本章 OSC \cref{eq:ap-nullspace-dyn} 的来源）、Hogan 阻抗控制\cite{hogan1985impedance}（本章阻抗范式的奠基）、Takegaki--Arimoto PD+重力补偿\cite{takegaki1981feedback}；力位混合见 Raibert--Craig\cite{raibert1981hybrid}。
+  \item \textbf{时间参数化}：TOPP-RA\cite{pham2018toppra}（本章力矩约束时序的算法）、TOTG\cite{kunz2012totg}、Ruckig\cite{berscheid2021ruckig}——三件套原文。
+  \item \textbf{计算工具}：Pinocchio\cite{carpentier2019pinocchio}（本章全部动力学量）、MuJoCo\cite{todorov2012mujoco}（接触物理）、CHOMP\cite{zucker2013chomp}（规划期优化）。
+  \item \textbf{下接强化学习操作}：\cref{ch:rlmc-manip}——本章经典地基支撑的 RL 操作（DiffIK/OSC/阻抗的学习版），二者互补（\cref{ins:ap-rl-boundary}）。
+\end{itemize}
+
+\section*{本章与相关章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+相关章节 & 关系 & 本章接口 \\
+\midrule
+\cref{ch:rigid_body} 刚体运动 & 提供 $\SE(3)$ 位姿/变换连乘 & 末端位姿、雅可比帧变换 \\
+\cref{ch:lie} 李群 & 提供 $\SO(3)$ 对数映射/姿态误差 & 任务空间姿态误差 \\
+\cref{sec:ctrl-robot-dyn} 机器人动力学 & 提供方程 \cref{eq:ctrl-manip} + 结构性质 & 本章直接用、不重证 \\
+\cref{sec:ctrl-robot-ctc} 计算力矩 & 提供定理 \cref{thm:ctrl-ctc} & 本章落地+对比（\cref{eq:ap-ctc}）\\
+\cref{sec:ctrl-robot-pd} PD+重力补偿 & 提供 Lyapunov 证明 \cref{thm:ctrl-pd-grav} & 本章重力补偿+对比基线 \\
+\cref{sec:ctrl-robot-osc} 操作空间控制 & 提供 OSC 公式 \cref{eq:ctrl-osc} & 本章给\emph{病态失效边界}（\cref{eq:ap-nullspace-dyn}）\\
+\cref{sec:ctrl-robot-impedance} 阻抗 & 提供定义 \cref{def:ctrl-impedance} & 本章笛卡尔阻抗落地（\cref{eq:ap-cartimp}）\\
+\cref{ch:planning} 运动规划 & 提供 C-space/采样规划 & OMPL vs CHOMP 实证 \\
+\cref{sec:plan-chomp} CHOMP & 提供协变梯度优化 & CHOMP 局部最优实证 \\
+\cref{sec:plan-minsnap} min-snap & 提供高阶多项式轨迹 & 自写 min-jerk 参优同源 \\
+\cref{sec:sm-cbf-game} CBF 安全博弈 & 提供 CBF 框架 & 单臂单障碍 CBF 速度滤波 \\
+\cref{ch:quad_prac} 四足实践 & 同属“硬件抽象+全栈”范式 & 解耦/碰撞体/capstone 互参 \\
+\cref{ch:rlmc-manip} RL 操作 & 本章为其补经典地基 & 下接桥（\cref{sec:ap-to-rl}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：物理仿真一跑就\emph{发散}、关节飞出限位。\textbf{原因}：惯量量级/阻尼/actuator 刚度不匹配，$\omega_n\Delta t\gg2$（\cref{ins:ap-num3}）。\textbf{对策}：占位惯量别太小、注入关节阻尼、降 actuator 刚度（\cref{eq:ap-omegan}）。
+  \item \textbf{症状}：力矩级 OSC 零空间\emph{收不住末端}（漂 $60$--$110\,\mathrm{mm}$）。\textbf{原因}：质量阵病态、正则化破坏投影性（\cref{ins:ap-osc-breakdown}）。\textbf{对策}：换\emph{速度级}冗余解析 \cref{eq:ap-nullspace-kin}（无 $\mathbf{M}^{-1}$）。
+  \item \textbf{症状}：计算力矩跟踪时\emph{腕全幅发散}、肩肘正常。\textbf{原因}：低惯量腕自然频率 $>$ 控制率、欠采样（\cref{ins:ap-lowinertia}）。\textbf{对策}：物理层阻尼按住腕、控制层\emph{解耦腕} $\mathbf{a}_{\mathrm{cmd}}[\text{腕}]=0$（\cref{ins:ap-coupling}）。
+  \item \textbf{症状}：腕治好后\emph{肩肘仍跟不上}、$\tau_2$ 异常偏大。\textbf{原因}：腕误差经 $\mathbf{M}$ 耦合项 $M_{2,5}$ 腐蚀 $\tau_2$（\cref{ins:ap-coupling}）。\textbf{对策}：零腕 $\mathbf{a}_{\mathrm{cmd}}$ + 阻尼兜底。
+  \item \textbf{症状}：“某几个关节控制坏了”。\textbf{原因}：\texttt{/\allowbreak joint\_states} 名序错乱、按下标裸读张冠李戴（\cref{pit:ap-jointorder}）。\textbf{对策}：按 name 读、先验数据通道。
+  \item \textbf{症状}：CBF 避障\emph{卡死不到目标}。\textbf{原因}：障碍正卡在起点$\leftrightarrow$目标直线（\cref{pit:ap-cbf-deadlock}）或目标不可达（\cref{pit:ap-cbf-unreach}）。\textbf{对策}：障碍垂直路径偏置 / 目标放阴影外；用标称误差区分可达性 vs CBF 问题。
+  \item \textbf{症状}：力矩约束 TOPP-RA \emph{看似守约束实则超 $\pm26$}。\textbf{原因}：稀疏栅格点间 $\mathbf{M}(\mathbf{q})$ 变、重构越界（\cref{pit:ap-topp-disc}）。\textbf{对策}：\texttt{Interpolation} 方案 + $401$ 栅格。
+  \item \textbf{症状}：手臂“$\tau$ 不饱和却不动”。\textbf{原因}：障碍/工作空间挡路，非控制 bug（\cref{pit:ap-wall-block}）。\textbf{对策}：跑无障碍基线\emph{隔离变量}定位。
+\end{enumerate}

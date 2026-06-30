@@ -1,0 +1,1588 @@
+\chapter{稠密建图}
+\label{ch:dense}
+
+% ════════════════════════════════════════════════════════════════
+%  本章：全吸收 视觉SLAM十四讲 ch12「建图」+ REMODE/Vogiatzis 深度滤波器
+%  + Hirschmüller SGM + OctoMap(Hornung) + KinectFusion/Curless-Levoy TSDF
+%  + ElasticFusion/Keller surfel + Marching Cubes + Poisson 重建 + Handbook ch5。
+%  自包含、教材级、零外部 punt；右扰动主线、Hamilton 四元数；text:code >= 60:40。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下面几问。若已能流畅作答，可只速读本章的表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 一台普通相机能不能“直接”测出某个像素离它有多远？如果不能，为什么？
+  \item 给你一段相机轨迹（每帧位姿已知）和一串图像，如何估计第一帧里\emph{每一个}像素的深度？这与三角化估计\emph{一个}特征点有什么不同？
+  \item 占据栅格地图为什么要把“占据概率”存成对数几率（log-odds）而不是直接存 $[0,1]$ 的概率？
+  \item TSDF（截断符号距离函数）把多帧带噪深度“融合”成一张光滑表面，融合公式长什么样？它和八叉树的 clamping 在精神上有何共通之处？
+  \item 同样是稠密地图，点云、八叉树、TSDF、面元（surfel）各自适合\emph{导航避障}还是\emph{高精度重建}？凭什么取舍？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{区分}地图的几大用途（定位/导航/避障/重建/交互）与两套分类轴（度量/拓扑/语义；显式/隐式 $\times$ 表面/体积四象限），并据用例选表示；
+  \item \textbf{推导并实现}单目稠密重建的完整管线：极线搜索、块匹配（SAD/SSD/NCC/ZNCC）、三角化、几何深度不确定度、高斯深度滤波器；
+  \item \textbf{讲清}单目稠密的工程难点（纹理依赖、梯度与极线方向、逆深度、仿射 warp、并行化、外点）并给出对策（含贝叶斯均匀-高斯混合滤波器）；
+  \item \textbf{推导}占据栅格的二值贝叶斯滤波与 log-odds 加性更新、clamping 策略，并用 OctoMap 把点云转成可查询、可压缩的八叉树地图；
+  \item \textbf{推导}TSDF 的截断、投影式符号距离与加权运行平均融合（KinectFusion / Curless--Levoy），理解光线投射提面与 frame-to-model 跟踪；
+  \item \textbf{说明}面元（surfel）地图与 ElasticFusion 的“无位姿图、直接形变”思想，以及 Marching Cubes、泊松重建两条网格化路线；
+  \item \textbf{辨析}隐式曲面与显隐式互转、ESDF 与投影式 SDF 之别，并写出高斯过程地图/GPIS/Hilbert 这类连续概率表示的预测式；
+  \item \textbf{讲清}可微渲染地图（NeRF 体渲染、3D 高斯泼溅可微光栅化）的原理与其 SLAM 应用、局限，理解它如何从经典稠密表示自然演进而来；
+  \item \textbf{做出}稠密地图表示的工程选型。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{从只有角度的相机，造出能导航、能避障、能重建的稠密地图}”的主线。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  vol/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (cls) {地图用途\\与分类};
+\node[grp, right=of cls] (epi) {极线搜索\\+ 块匹配};
+\node[grp, right=of epi] (filt) {三角化\\+ 深度滤波};
+\node[blk, below=8mm of cls] (pc) {点云地图\\(RGB-D 拼接)};
+\node[vol, right=of pc] (oct) {八叉树\\OctoMap(log-odds)};
+\node[vol, right=of oct] (tsdf) {TSDF / surfel\\(加权融合)};
+\node[blk, below=8mm of pc, fill=second!6, draw=second!60!black] (mesh) {网格重建\\MC / 泊松};
+\node[vol, right=of mesh] (impl) {隐式/连续\\ESDF·GP·Hilbert};
+\node[blk, right=of impl, fill=second!6, draw=second!60!black] (eng) {工程权衡\\与选型};
+\node[vol, below=8mm of impl] (rad) {可微渲染地图\\NeRF / 3DGS};
+\draw[ln] (cls)--(epi); \draw[ln] (epi)--(filt);
+\draw[ln] (cls.south)--(pc.north);
+\draw[ln] (pc)--(oct); \draw[ln] (oct)--(tsdf);
+\draw[ln] (pc.south)--(mesh.north);
+\draw[ln] (mesh)--(impl); \draw[ln] (impl)--(eng);
+\draw[ln] (tsdf.south) -- ++(0,-4mm) -| (impl.north);
+\draw[ln] (impl.south)--(rad.north);
+\draw[ln] (filt.south) -- ++(0,-4mm) -| (tsdf.north);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:dense-intro}（用途与分类）是全章导航，给出贯穿全章的“显式/隐式 $\times$ 表面/体积”四象限骨架，任何读者都应先读；\cref{sec:dense-mono}（单目稠密）是本章理论最硬的部分，含极线搜索到深度滤波的完整推导与可运行代码；\cref{sec:dense-rgbd-pc,sec:dense-octomap,sec:dense-tsdf,sec:dense-surfel}（RGB-D：点云、八叉树、TSDF、surfel）是稠密地图表示的四大主力，可按需精读；\cref{sec:dense-mesh}（网格重建）与 \cref{sec:dense-implicit}（隐式曲面、ESDF 与连续函数地图）补齐四象限的隐式一列，\cref{sec:dense-engineering}（工程权衡）收束经典表示；\cref{sec:dense-radiance}（可微渲染地图：NeRF/3DGS）作为“经典稠密 $\to$ 可微渲染”的演进与前沿落点。带（选读）标记的贝叶斯混合滤波器、SGM、ElasticFusion 跟踪为进阶/选读。
+
+\subsection*{前置知识桥接}
+\cref{ch:camera} 已给出针孔模型、双目与 RGB-D 相机的成像与反投影；\cref{ch:vo} 已讲过对极几何与三角化（已知两视角同名点求空间点深度）；\cref{ch:pointcloud} 已介绍点云、KD-tree、ICP 与体素滤波。本章站在它们的肩上：前几章关心的是\emph{定位}——估计相机轨迹与少量路标；而本章要回答“\emph{建图}”这一 SLAM 的另一半——如何把每个像素、每块空间的几何状态都估出来，造出可供机器人\emph{用}的稠密地图。
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+旋转矩阵 $\mathbf{R}\in\SO(3)$、位姿 $\mathbf{T}\in\SE(3)$（下标语义如 $\mathbf{T}_{wc}$＝相机到世界），四元数取 Hamilton 约定（与 Eigen、十四讲\cite{gaoxiang2019slam14} 一致）。相机内参 $\mathbf{K}$，分量 $f_x,f_y,c_x,c_y$。像素坐标 $\mathbf{p}=(u,v)$，归一化方向（单位视线）$\mathbf{f}$。
+\textbf{深度记号陷阱}：单目滤波一节里的“深度” $d=\|O_1P\|$ 是\emph{沿光心射线的长度（range）}，与针孔模型里“深度 = 像素 $z$ 值”略有不同（\cref{ins:dense-depth-vs-z}）。
+\textbf{逆深度}记 $\rho_{\mathrm{inv}}=1/d$（绝不写裸 $\rho$，因 $\boldsymbol{\xi}=[\boldsymbol{\rho};\boldsymbol{\phi}]$ 的 $\boldsymbol{\rho}$ 已占用平移李代数）；\textbf{内点率}记 $\pi_{\mathrm{in}}$；\textbf{TSDF 截断距离}记 $\mu_{\mathrm{tr}}$（与高斯均值 $\mu$ 区分）；\textbf{SGM 视差}记 $d_{\mathrm{disp}}$（与深度 $d$ 区分）。占据概率 $p$，对数几率 $\ell$（log-odds）。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{地图的用途与分类}
+\label{sec:dense-intro}
+
+\paragraph{动机：建图为什么值得单独一章。}
+SLAM 是“同时定位与建图（Simultaneous Localization and Mapping）”，可前几章几乎都在谈定位——特征点定位、直接法、后端优化。这是否暗示建图不重要？\textbf{恰恰相反}。在经典 SLAM 模型里，所谓地图就是\emph{所有路标点的集合}，视觉里程计与 BA 事实上已经建模并优化了路标位置——从这个角度看，建图似乎已被“顺带”解决了\cite{gaoxiang2019slam14}。之所以仍要单独讲，是因为\textbf{人们对地图的需求各不相同}：SLAM 是底层技术，为上层应用供给信息；上层若是扫地机器人，要全局定位、还要在地图里规划一条能覆盖全屋的路径；上层若是增强现实（AR）设备，要把虚拟物体叠进现实，并正确处理它与真实物体的\emph{遮挡}。应用层对“定位”的需求大同小异（都要相机/载体的位姿），而对“地图”的需求五花八门。
+
+\paragraph{地图的五大用途。}
+顺着这个观察，我们把地图的用途逐条摊开\cite{gaoxiang2019slam14}：
+\begin{enumerate}
+  \item \textbf{定位}：地图最基本的功能。视觉里程计用局部地图定位，回环检测用全局描述子定位；我们还希望把地图\emph{保存}下来，让机器人下次开机仍能在其中定位——只建一次模，不必每次重做完整 SLAM。
+  \item \textbf{导航}：机器人要在地图里做\emph{路径规划}，在任意两点之间找路并控制运动。这至少要知道哪些地方\emph{可通过}、哪些\emph{不可通过}——超出了稀疏特征点地图的能力，\emph{必须是稠密地图}。
+  \item \textbf{避障}：与导航类似，但更重\emph{局部、动态}障碍物的处理。仅凭特征点无法判断某点是不是障碍物，因此需要稠密地图。
+  \item \textbf{重建}：用 SLAM 获得环境的重建效果，主要\emph{向人展示}（要美观），或用于通信（三维视频通话、网购）。这种地图亦稠密，且对外观有要求——可能不满足于稠密点云，更希望是\emph{带纹理的平面}（像电子游戏里的三维场景）。
+  \item \textbf{交互}：人与地图的互动。如 AR 中放置虚拟物体并与之互动（点击墙面虚拟浏览器看视频、向墙面投掷物体并希望有虚拟碰撞）；机器人收到命令“取桌子上的报纸”，除环境地图外还需知道哪块是“桌子”、什么叫“之上”、什么叫“报纸”——这要求对地图有更高层的\emph{认知}，即\textbf{语义地图}。
+\end{enumerate}
+五条用途里，后四条都直接或间接要求\textbf{稠密}。这就引出本章的核心问题：\emph{视觉 SLAM 能不能建立稠密地图？如果能，怎么建？}
+
+\paragraph{稀疏与稠密。}
+要回答它，先把“稀疏”和“稠密”讲清楚。这是地图最重要的一条分类轴。
+
+\begin{definition}[稀疏地图与稠密地图]\label{def:dense-sparse-dense}
+\textbf{稀疏地图（sparse map）}只建模\emph{感兴趣的部分}，即特征点（路标点）。对同一张桌子，稀疏地图可能只建模四个角。
+\textbf{稠密地图（dense map）}建模\emph{所有看到过的部分}：稠密地图会建模整个桌面。
+\end{definition}
+
+关键区别在于：虽然从定位角度，只有四个角的地图也足以对相机定位，但\emph{无法从四个角推断出这几个点之间的空间结构}，于是无法完成导航、避障这类\emph{需要稠密地图}才能做的工作\cite{gaoxiang2019slam14}。换句话说，稀疏地图把“建图”退化成了“定位的副产品”；稠密建图则是要把每个像素、每块空间的几何状态都估出来。
+
+\paragraph{更完整的分类：度量、拓扑、语义。}
+稀疏/稠密是按\emph{密度}分。如果按\emph{几何抽象层次}分，地图还有另一套三分法\cite{carlone2026handbook}。它们不是互斥的——一张地图可以既是“度量”又是“稠密”。
+
+\begin{table}[H]\centering\small
+\caption{地图按几何抽象层次的分类（综合十四讲\cite{gaoxiang2019slam14}与 Handbook\cite{carlone2026handbook}）}
+\label{tab:dense-maptypes}
+\begin{tabular}{p{0.20\textwidth} p{0.40\textwidth} p{0.30\textwidth}}
+\toprule
+类型 & 含义 & 典型代表 / 用途 \\
+\midrule
+度量地图（metric） & 精确编码几何位置（“在哪”），可再分稀疏/稠密 & 占据栅格、OctoMap、TSDF、surfel、点云；用于精确定位、避障、规划 \\
+拓扑地图（topological） & 用轻量\emph{图}描述连通性（“能不能到”），弱化精确度量；顶点＝自由空间中的区域/地点，边＝可达连接 & 地点图；用于大尺度全局路径、地点识别 \\
+度量-语义地图（metric-semantic） & 在几何之上叠加语义（“这是什么”：桌子/门/墙） & 稠密语义网格、物体级地图；用于任务级规划、人机交互 \\
+混合地图（hybrid） & 度量 $+$ 拓扑（$+$ 语义）分层组合：局部度量、全局拓扑 & 分层 SLAM；兼顾大尺度效率与局部精度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{贯穿全章的骨架：显式/隐式 $\times$ 表面/体积。}
+度量/拓扑/语义是按\emph{抽象层次}分；本章只在“度量-稠密”这一格内展开，因此还需要一条\emph{正交}的分类轴来统领后面各节，避免把地图表示讲成一份并列清单。这条轴问两个互相独立的问题\cite{carlone2026handbook}：
+
+\emph{要估什么量}？最常用的两种是\textbf{占据（occupancy）}与\textbf{距离（distance）}。占据区分自由/占据/未知，回答“某处空不空”；距离测查询点到最近表面的远近，给出更“以机器人为中心”的、可微的几何度量（梯度即朝最近障碍的方向），对避障与基于优化的规划尤其有用。
+
+\emph{用什么空间抽象去表示}？要么\textbf{显式}地直接描述物体边界或体积（点、面元、网格、占据/距离体素），要么\textbf{隐式}地用一个标量函数去刻画——以函数的\emph{零交叉}定义表面、用函数值的\emph{符号}判断内外。把“显式/隐式”与“目标是表面还是体积”交叉，所有稠密表示恰好落进四个象限（\cref{tab:dense-quadrant}）。这正是本章后续展开的骨架：每介绍一种表示，都先在四象限里给它定位。
+
+\begin{table}[H]\centering\small
+\caption{稠密地图表示的四象限：显式/隐式 $\times$ 表面/体积\cite{carlone2026handbook}}
+\label{tab:dense-quadrant}
+\begin{tabular}{p{0.13\textwidth} p{0.40\textwidth} p{0.37\textwidth}}
+\toprule
+ & 显式（直接描述边界/体积） & 隐式（用函数零交叉/符号刻画） \\
+\midrule
+表面 & 点云、面元 surfel、三角网格（\cref{sec:dense-rgbd-pc,sec:dense-surfel,sec:dense-mesh}） & SDF/TSDF、GP 隐式曲面（\cref{sec:dense-tsdf,sec:dense-implicit}） \\
+体积 & 占据栅格、距离体素（OctoMap，\cref{sec:dense-octomap}） & 高斯过程占据图、Hilbert 地图等连续函数（\cref{sec:dense-implicit}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}
+\textbf{表示应由用例决定。}运动估计与定位偏好\emph{稀疏}表示（少量 3D 点特征，省、够用）；场景重建追求\emph{稠密、高分辨}；路径规划需要\emph{稠密}的占据/最近碰撞距离信息\cite{carlone2026handbook}。本章的“稠密建图”主要落在“\emph{度量-稠密}”这一格，并简介语义。两条分类轴各管一面：度量/拓扑/语义管\emph{抽象层次}，显式/隐式 $\times$ 表面/体积（\cref{tab:dense-quadrant}）管\emph{空间表示}——下文每介绍一种表示都会在后一张表里给它定位，让“一堆地图类型”读起来是\emph{一个框架贯穿到底}。我们按传感器分两大支展开：\textbf{单目稠密}（\cref{sec:dense-mono}）与 \textbf{RGB-D / 深度稠密}（\cref{sec:dense-rgbd-pc} 起）。
+\end{insight}
+
+\begin{note}
+\textbf{显式与隐式可以互转，并不对立.}\;同一几何常在两种表示间来回切换：点/网格可经\emph{最近点查询}或\emph{快速行进（fast marching）}转成隐式距离场；隐式场可经 Marching Cubes（\cref{sec:dense-mesh}）提成网格；离散体素拟合出连续函数则要解一个优化问题。许多实用系统正是\emph{混合}的——例如 TSDF（隐式，便于融合带噪深度）配 Marching Cubes（显式网格，便于渲染碰撞）。后面 \cref{sec:dense-implicit} 会把这些互转讲清，本章的各节也据此前后呼应而非各自为政。
+\end{note}
+
+\paragraph{过渡。}
+分类的框架搭好了，先攻最难的一支：相机只能测角度，怎么用一台\emph{单目}相机把每个像素的距离也估出来。它产出的是按象限看最朴素的一种——\emph{显式表面}的稀疏深度样本，后面再逐步升级到隐式与连续表示。
+
+% ════════════════════════════════════════════════════════════════
+\section{单目稠密重建}
+\label{sec:dense-mono}
+
+\subsection{立体视觉：相机是“只有角度的传感器”}
+\label{sec:dense-stereo-entry}
+
+\paragraph{动机。}
+相机常被称作\emph{只有角度的传感器（bearing-only sensor）}：单幅图像里的一个像素，只能告诉你物体相对成像平面的\emph{角度}和采集到的\emph{亮度}，却给不出物体的\emph{距离（range）}\cite{gaoxiang2019slam14}。而稠密重建恰恰要知道每一个（或大部分）像素的距离。获取距离大致有三条路：
+\begin{enumerate}
+  \item \textbf{单目}相机：估计相机运动，再\emph{三角化}计算像素距离；
+  \item \textbf{双目}相机：用左右目\emph{视差}计算距离（多目同理）；
+  \item \textbf{RGB-D} 相机：直接获得像素距离。
+\end{enumerate}
+前两种称\textbf{立体视觉（stereo vision）}，其中移动单目相机的又称\textbf{移动视角立体视觉（Moving View Stereo, MVS）}。相比 RGB-D 直接测深度，单目/双目往往“费力不讨好”——计算量巨大，最后得到一些不怎么可靠的深度估计；但它们在 RGB-D 尚不能很好工作的\emph{室外、大场景}里仍能估深度\cite{gaoxiang2019slam14}。
+
+\paragraph{问题设定。}
+先把问题简化，暂不考虑完整 SLAM：假定有一段视频序列，已用某种办法（很可能是视觉里程计前端）得到了\emph{每一帧的轨迹}。\textbf{以第一帧为参考帧，计算参考帧中每个像素的深度。}对比特征点法的做法——提特征、按描述子匹配、跟踪某空间点、再三角化——稠密深度估计的不同之处在于：\emph{无法把每个像素都当特征点算描述子}。于是\textbf{匹配}成了关键一环：如何确定第一帧某像素出现在其他帧里的位置？这要用\emph{极线搜索与块匹配}。知道某像素在各帧的位置后，就能像特征点那样三角化定深度；\emph{不同的是}，这里要用\textbf{很多次}三角化让深度从非常不确定逐渐收敛到稳定值——这就是\emph{深度滤波器}\cite{gaoxiang2019slam14}。
+
+\begin{insight}
+单目稠密重建 = “\emph{像素级、概率化、序贯}的多视立体（MVS）”。与双目“一次性左右匹配”不同，单目用\emph{运动产生基线}、用\emph{滤波累积多帧}来弥补单帧无深度。下面三小节就按“极线搜索 $\to$ 块匹配 $\to$ 三角化与深度不确定度 $\to$ 深度滤波”的顺序，把这条链条一节一节打通。
+\end{insight}
+
+\subsection{极线搜索与块匹配}
+\label{sec:dense-epipolar}
+
+\paragraph{从一个像素到一条极线。}
+回顾在 \cref{ch:vo} 学过的对极几何。左相机观测到某像素 $p_1$，由于单目无从知其深度，只能假设深度落在某区间 $(d_{\min},+\infty)$ 内；于是该像素对应的空间点分布在一条\emph{射线}（或线段）上。从另一视角（右相机）看，这条线段在图像平面的投影构成一条线——\textbf{极线（epipolar line）}。知道两相机间运动时，这条极线就能确定。匹配问题随之变成：\emph{极线上哪一个点才是 $p_1$ 的对应点？}搜索范围从“整幅图像”缩小为“一条直线”，这是极线几何最大的收益。
+
+特征点法靠描述子直接找到对应点 $p_2$；现在没有描述子，只能沿极线\emph{逐个比较}哪个像素与 $p_1$ 长得最像。从“直接比较像素亮度”的角度看，这与直接法异曲同工。
+
+\paragraph{为什么要用块而不是单像素。}
+但单个像素的亮度并不稳定可靠：极线上可能有很多和 $p_1$ 一样亮的点，难以分辨。改进的想法很直接——\textbf{比较像素块}：在 $p_1$ 周围取一个 $w\times w$ 的小块 $\mathbf{A}\in\mathbb{R}^{w\times w}$，在极线上也取很多同样大小的小块 $\mathbf{B}_i$（$i=1,\dots,n$）逐一比较。代价是：假设从“像素灰度不变”加强为“\emph{图像块灰度不变}”——前提更强了一些。
+
+\paragraph{三种块间度量。}
+怎样衡量两个小块的相似度？常用三种\cite{gaoxiang2019slam14}。第一种是\textbf{绝对差之和（SAD, Sum of Absolute Differences）}，越小越像：
+\begin{equation}
+  S(\mathbf{A},\mathbf{B})_{\mathrm{SAD}}=\sum_{i,j}\bigl|\mathbf{A}(i,j)-\mathbf{B}(i,j)\bigr|.
+  \label{eq:dense-sad}
+\end{equation}
+第二种是\textbf{平方差之和（SSD, Sum of Squared Differences）}（注意不是固态硬盘），也是越小越像：
+\begin{equation}
+  S(\mathbf{A},\mathbf{B})_{\mathrm{SSD}}=\sum_{i,j}\bigl(\mathbf{A}(i,j)-\mathbf{B}(i,j)\bigr)^2.
+  \label{eq:dense-ssd}
+\end{equation}
+第三种是\textbf{归一化互相关（NCC, Normalized Cross-Correlation）}，计算两块的相关性：
+\begin{equation}
+  S(\mathbf{A},\mathbf{B})_{\mathrm{NCC}}=\frac{\displaystyle\sum_{i,j}\mathbf{A}(i,j)\,\mathbf{B}(i,j)}{\sqrt{\displaystyle\sum_{i,j}\mathbf{A}(i,j)^2\ \sum_{i,j}\mathbf{B}(i,j)^2}}.
+  \label{eq:dense-ncc}
+\end{equation}
+这里要特别留意\textbf{方向相反}的约定：NCC 用的是相关性，\emph{接近 1 表示相似、接近 0 表示不相似}；而 SAD/SSD \emph{接近 0 才表示相似、数值大表示不相似}。三者之间还有精度-效率的矛盾：精度好的方法计算复杂，简单快的效果差，工程里需要取舍。
+
+\paragraph{去均值版本。}
+NCC 还有一个常用变体：先把每个小块的均值减掉，得到\textbf{零均值归一化互相关（ZNCC）}。去均值之后，即使“小块 B 整体上比 A 亮一些但仍很相似”也能被正确识别——对线性光照变化（$\mathbf{B}=\alpha\mathbf{A}+\beta$）天然不变，因此更鲁棒。这正是后面演示代码 \texttt{NCC()} 真正使用的形式：
+\begin{equation}
+  \mathrm{NCC}_z(\mathbf{A},\mathbf{B})=\frac{\displaystyle\sum_{i,j}\bigl(\mathbf{A}(i,j)-\bar{\mathbf{A}}\bigr)\bigl(\mathbf{B}(i,j)-\bar{\mathbf{B}}\bigr)}{\sqrt{\displaystyle\sum_{i,j}\bigl(\mathbf{A}(i,j)-\bar{\mathbf{A}}\bigr)^2\ \sum_{i,j}\bigl(\mathbf{B}(i,j)-\bar{\mathbf{B}}\bigr)^2}},
+  \label{eq:dense-zncc}
+\end{equation}
+其中 $\bar{\mathbf{A}},\bar{\mathbf{B}}$ 是两块各自的标量均值。$\mathrm{NCC}_z\in[-1,1]$：$=1$ 完全相关、$=0$ 不相关、$=-1$ 反相关。
+
+\paragraph{沿极线的相似度分布。}
+对极线上每个 $\mathbf{B}_i$ 算一次与 $\mathbf{A}$ 的相似度（设用 NCC），就得到一条\emph{沿极线的相似度分布}，其形状取决于图像数据。当搜索距离较长时，这条分布通常是\textbf{非凸的}：有许多峰值，可真实对应点只有一个。既然单次匹配会有多个候选，自然倾向于用\emph{概率分布}来描述深度，而不是单一数值。问题随之转为：在不断对不同图像做极线搜索时，深度的概率分布将如何变化——这正是深度滤波器要回答的。
+
+\begin{pitfall}[思维陷阱：以为“纹理够多就一定匹配得准”]
+极线搜索 $+$ 块匹配\emph{只在有纹理处可靠}。即便小块有明显梯度，若梯度方向\emph{垂直于}极线，沿极线挪动小块时匹配得分几乎不变，依然找不到唯一峰值；只有梯度\emph{平行于}极线时才能精确定位（\cref{sec:dense-mono-pitfalls} 会定量展开这一点）。在无纹理、重复纹理、被遮挡区域，极线上会出现多模态峰值，匹配歧义大——这正是要用\emph{概率深度滤波}而非“一次匹配定深度”的根本原因。
+\end{pitfall}
+
+\subsection{三角化与几何深度不确定度}
+\label{sec:dense-triangulate-uncertainty}
+
+\paragraph{三角化求深度均值。}
+确定匹配点 $p_2$ 后，由两帧的归一化视线方向与相对位姿就能三角化求深度。设参考帧归一化视线 $\mathbf{f}_{\mathrm{ref}}$、当前帧视线经旋转到参考系后记 $\mathbf{f}_2=\mathbf{R}_{RC}\mathbf{f}_{\mathrm{curr}}$，参考帧与当前帧下的深度 $d_{\mathrm{ref}},d_{\mathrm{cur}}$ 满足
+\begin{equation}
+  d_{\mathrm{ref}}\,\mathbf{f}_{\mathrm{ref}} = d_{\mathrm{cur}}\,\mathbf{f}_2 + \mathbf{t},
+  \label{eq:dense-tri-eq}
+\end{equation}
+其中 $\mathbf{t}=\mathbf{t}_{RC}$ 为平移。两边分别左乘 $\mathbf{f}_{\mathrm{ref}}^\top$ 与 $\mathbf{f}_2^\top$，消成关于 $(d_{\mathrm{ref}},d_{\mathrm{cur}})$ 的 $2\times2$ 线性方程组：
+\begin{equation}
+  \begin{bmatrix} \mathbf{f}_{\mathrm{ref}}^\top\mathbf{f}_{\mathrm{ref}} & -\mathbf{f}_{\mathrm{ref}}^\top\mathbf{f}_2 \\[1mm] \mathbf{f}_2^\top\mathbf{f}_{\mathrm{ref}} & -\mathbf{f}_2^\top\mathbf{f}_2 \end{bmatrix}
+  \begin{bmatrix} d_{\mathrm{ref}}\\ d_{\mathrm{cur}}\end{bmatrix} =
+  \begin{bmatrix} \mathbf{f}_{\mathrm{ref}}^\top\mathbf{t} \\ \mathbf{f}_2^\top\mathbf{t} \end{bmatrix}.
+  \label{eq:dense-tri-linear}
+\end{equation}
+解出 $d_{\mathrm{ref}},d_{\mathrm{cur}}$ 后，参考侧点 $\mathbf{x}_m=d_{\mathrm{ref}}\mathbf{f}_{\mathrm{ref}}$、当前侧点 $\mathbf{x}_n=\mathbf{t}+d_{\mathrm{cur}}\mathbf{f}_2$ 一般不重合（噪声所致），取两者平均 $\mathbf{p}_{\mathrm{esti}}=(\mathbf{x}_m+\mathbf{x}_n)/2$ 作为空间点 $P$，本次观测的深度即 $\|\mathbf{p}_{\mathrm{esti}}\|$。这一步在 \cref{ch:vo} 已系统讲过，此处给出与代码对应的具体形式。
+
+\paragraph{从一像素误差到深度不确定度。}
+三角化给了深度的\emph{均值}，可它有多准？块匹配在极线上找到的 $p_2$ 总有误差，最常见的设定是“假设它有\emph{一个像素}的误差”，再问：这一像素误差会让深度变化多少？这就是本章单目部分\emph{最精彩的几何推导}。它在十四讲\cite{gaoxiang2019slam14}与 REMODE\cite{pizzoli2014remode} 中完全一致。
+
+设极线搜索找到 $p_1$ 对应的 $p_2$，认为 $p_1$ 对应三维点 $P$。在极平面（由两光心 $O_1,O_2$ 与 $P$ 张成）内画出三角形 $O_1O_2P$，记（\cref{fig:dense-uncertainty}）：
+\begin{itemize}
+  \item $\mathbf{p}=O_1P$：参考光心到 $P$，即待求深度方向向量；
+  \item $\mathbf{t}=O_1O_2$：相机的平移（基线）；
+  \item $\mathbf{a}=O_2P$：当前光心到 $P$，满足 $\mathbf{a}=\mathbf{p}-\mathbf{t}$。
+\end{itemize}
+三角形底边两角分别记 $\alpha$（在 $O_1$ 处）、$\beta$（在 $O_2$ 处），用归一化内积（夹角余弦）写出：
+\begin{equation}
+  \mathbf{a}=\mathbf{p}-\mathbf{t},\qquad
+  \alpha=\arccos\bigl\langle \mathbf{p}, \mathbf{t}\bigr\rangle,\qquad
+  \beta=\arccos\bigl\langle \mathbf{a}, -\mathbf{t}\bigr\rangle.
+  \label{eq:dense-unc-angles}
+\end{equation}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=1.0,>=Stealth]
+  \coordinate (O1) at (0,0);
+  \coordinate (O2) at (3.4,0);
+  \coordinate (P)  at (2.2,3.0);
+  \coordinate (Pp) at (2.55,2.55);
+  \fill (O1) circle (1.3pt) node[below left] {$O_1$};
+  \fill (O2) circle (1.3pt) node[below right] {$O_2$};
+  \fill (P)  circle (1.3pt) node[above] {$P$};
+  \fill[second] (Pp) circle (1.0pt) node[right] {$P'$};
+  \draw[thick, main] (O1)--(P) node[midway, left] {$\mathbf{p}$};
+  \draw[thick, third] (O2)--(P) node[midway, right] {$\mathbf{a}$};
+  \draw[thick, gray!60!black] (O1)--(O2) node[midway, below] {$\mathbf{t}$};
+  \draw[dashed, second] (O2)--(Pp) node[midway, below right] {$\mathbf{a}'$};
+  \draw[dashed, second] (O1)--(Pp);
+  \node at (0.55,0.30) {$\alpha$};
+  \node at (2.95,0.40) {$\beta$};
+  \node at (2.15,2.55) {$\gamma$};
+\end{tikzpicture}
+\caption{深度不确定度分析。极线上一个像素的误差使 $p_2\to p_2'$，从而 $\beta\to\beta'$、$P\to P'$；用正弦定理求 $\|\mathbf{p}'\|$，单像素误差引起的深度变化即不确定度。}
+\label{fig:dense-uncertainty}
+\end{figure}
+
+现在让 $p_2$ 沿极线方向偏移一个像素，得到 $p_2'$，于是 $\beta$ 变成 $\beta'$，三角形第三角（$P'$ 处）记 $\gamma$：
+\begin{equation}
+  \beta'=\arccos\bigl\langle \overrightarrow{O_2 p_2'},\, -\mathbf{t}\bigr\rangle,\qquad
+  \gamma=\pi-\alpha-\beta'.
+  \label{eq:dense-unc-betap}
+\end{equation}
+这里近似认为 $O_1$ 处的角 $\alpha$ 不变（因为参考帧 $p_1$ 没有被扰动），故三角形内角和给出 $\gamma=\pi-\alpha-\beta'$。
+
+\begin{derivation}[正弦定理求扰动后的深度 $\|\mathbf{p}'\|$]
+在扰动后的三角形 $O_1O_2P'$ 中：边 $O_1P'=\|\mathbf{p}'\|$ 所对的角是 $O_2$ 处的 $\beta'$；边 $O_1O_2=\|\mathbf{t}\|$ 所对的角是 $P'$ 处的 $\gamma$。由正弦定理
+\[
+  \frac{\|\mathbf{p}'\|}{\sin\beta'}=\frac{\|\mathbf{t}\|}{\sin\gamma}
+  \quad\Longrightarrow\quad
+  \|\mathbf{p}'\|=\|\mathbf{t}\|\,\frac{\sin\beta'}{\sin\gamma}.
+\]
+\end{derivation}
+
+\noindent{}于是得到本次观测的深度
+\begin{equation}
+  \|\mathbf{p}'\|=\|\mathbf{t}\|\,\frac{\sin\beta'}{\sin\gamma}.
+  \label{eq:dense-unc-pprime}
+\end{equation}
+若认为极线块匹配只有一个像素的误差，就把扰动前后深度之差当作\emph{标准差}：
+\begin{equation}
+  \sigma_{\mathrm{obs}}=\bigl\|\mathbf{p}\bigr\|-\bigl\|\mathbf{p}'\bigr\|.
+  \label{eq:dense-unc-sigma}
+\end{equation}
+（工程实现取其绝对值或平方作为方差 $\tau^2=\sigma_{\mathrm{obs}}^2$；若极线搜索不确定性大于一个像素，可按此比例放大。）
+
+\begin{insight}
+\textbf{为什么需要足够的平移基线。}由 \cref{eq:dense-unc-pprime}，$\sin\gamma$ 在分母——视差角越小（两条视线越接近平行），$\gamma$ 越小，$\sin\gamma$ 越小，深度不确定度被放得越大；基线趋零（纯旋转）时三角形退化，$\tau^2\to\infty$，\emph{根本无法测深}。这定量地解释了“纯旋转不能建图”。但反过来，基线越大，块匹配越易因遮挡、透视形变而失配——\emph{小基线匹配稳但深度糙、大基线深度准但匹配险}。多帧深度滤波正是为兼得两者。
+\end{insight}
+
+\subsection{高斯分布的深度滤波器}
+\label{sec:dense-depth-filter}
+
+\paragraph{滤波还是优化。}
+像素深度估计本身是一个状态估计问题，自然有\emph{滤波器}与\emph{非线性优化}两条路。非线性优化效果更好，但 SLAM 实时性要求强、前端已占去大量算力，建图通常采用\emph{计算量较少的滤波器}\cite{gaoxiang2019slam14}。最简单的假设是：深度服从高斯分布。这会得到一种“类卡尔曼”的方法——但严格说它只是\emph{两个高斯的归一化积}，下面就能看到。
+
+\paragraph{高斯深度融合。}
+设某像素深度 $d$ 服从先验
+\begin{equation}
+  P(d)=\mathcal{N}(\mu,\sigma^2).
+  \label{eq:dense-prior}
+\end{equation}
+每来一次新观测（由三角化得到），假设这次观测也是高斯：
+\begin{equation}
+  P(d_{\mathrm{obs}})=\mathcal{N}(\mu_{\mathrm{obs}},\sigma_{\mathrm{obs}}^2).
+  \label{eq:dense-obs}
+\end{equation}
+如何用观测更新 $d$ 的分布？这是一个信息融合问题。两个高斯的乘积仍是高斯，设融合后 $d\sim\mathcal{N}(\mu_{\mathrm{fuse}},\sigma_{\mathrm{fuse}}^2)$，则
+\begin{equation}
+  \mu_{\mathrm{fuse}}=\frac{\sigma_{\mathrm{obs}}^2\,\mu+\sigma^2\,\mu_{\mathrm{obs}}}{\sigma^2+\sigma_{\mathrm{obs}}^2},\qquad
+  \sigma_{\mathrm{fuse}}^2=\frac{\sigma^2\,\sigma_{\mathrm{obs}}^2}{\sigma^2+\sigma_{\mathrm{obs}}^2}.
+  \label{eq:dense-fuse}
+\end{equation}
+这条公式是后面代码的核心，值得把来历讲透。
+
+\begin{derivation}[高斯归一化积：\cref{eq:dense-fuse} 的推导]
+两个一维高斯密度相乘，指数相加：
+\[
+  -\frac{(d-\mu)^2}{2\sigma^2}-\frac{(d-\mu_{\mathrm{obs}})^2}{2\sigma_{\mathrm{obs}}^2}
+  =-\frac12\Bigl[\bigl(\tfrac{1}{\sigma^2}+\tfrac{1}{\sigma_{\mathrm{obs}}^2}\bigr)d^2
+   -2\bigl(\tfrac{\mu}{\sigma^2}+\tfrac{\mu_{\mathrm{obs}}}{\sigma_{\mathrm{obs}}^2}\bigr)d\Bigr]+\mathrm{const}.
+\]
+对 $d$ 配方。二次项系数给出融合方差的倒数（\emph{信息相加}）：
+\[
+  \frac{1}{\sigma_{\mathrm{fuse}}^2}=\frac{1}{\sigma^2}+\frac{1}{\sigma_{\mathrm{obs}}^2}
+  =\frac{\sigma^2+\sigma_{\mathrm{obs}}^2}{\sigma^2\sigma_{\mathrm{obs}}^2}
+  \ \Longrightarrow\ \sigma_{\mathrm{fuse}}^2=\frac{\sigma^2\sigma_{\mathrm{obs}}^2}{\sigma^2+\sigma_{\mathrm{obs}}^2}.
+\]
+一次项给出融合均值（\emph{按精度加权}）：
+\[
+  \frac{\mu_{\mathrm{fuse}}}{\sigma_{\mathrm{fuse}}^2}=\frac{\mu}{\sigma^2}+\frac{\mu_{\mathrm{obs}}}{\sigma_{\mathrm{obs}}^2}
+  \ \Longrightarrow\ \mu_{\mathrm{fuse}}=\sigma_{\mathrm{fuse}}^2\Bigl(\frac{\mu}{\sigma^2}+\frac{\mu_{\mathrm{obs}}}{\sigma_{\mathrm{obs}}^2}\Bigr)
+  =\frac{\sigma_{\mathrm{obs}}^2\mu+\sigma^2\mu_{\mathrm{obs}}}{\sigma^2+\sigma_{\mathrm{obs}}^2},
+\]
+与 \cref{eq:dense-fuse} 一致。这就是“两个高斯归一化积”的标准结论。
+\end{derivation}
+
+由于\emph{只有观测方程、没有运动方程}，深度只用到信息融合部分，无须像完整卡尔曼那样预测加更新（也可看成“运动方程为深度固定不动”的卡尔曼滤波器）。这里观测均值 $\mu_{\mathrm{obs}}$ 取本次三角化深度，观测方差 $\sigma_{\mathrm{obs}}^2=\tau^2$ 取上一节 \cref{eq:dense-unc-sigma} 算出的几何不确定度。\emph{当方差降到阈值以下就认为深度已收敛}，固定其值并写入深度图。
+
+\begin{algo}[高斯深度滤波器：估计稠密深度的完整流程]\label{alg:dense-gauss-filter}
+\begin{enumerate}
+  \item 假设参考帧所有像素的深度满足某个\emph{初始高斯分布}（如均值取场景中值、方差很大）；
+  \item 当新帧到来时，对每个待估像素，通过\emph{极线搜索 $+$ 块匹配}（\cref{sec:dense-epipolar}）确定它在新帧的投影点位置；
+  \item 根据几何关系，\emph{三角化}算出本次观测的深度均值与不确定度 $\tau^2$（\cref{eq:dense-tri-linear,eq:dense-unc-sigma}）；
+  \item 将当前观测\emph{融合}进上一次估计（\cref{eq:dense-fuse}）；若方差\emph{收敛}则停止该像素，否则回到第 2 步等下一帧。
+\end{enumerate}
+\end{algo}
+
+\begin{insight}[深度 $\neq$ 像素 $z$ 值]\label{ins:dense-depth-vs-z}
+本节反复出现的“深度” $d$ 指的是 $\|O_1P\|$，即\emph{沿光心射线的长度（range）}；而针孔模型里的“深度”通常指像素的 \emph{$z$ 值}（沿光轴）。二者只在视线与光轴重合时相等。把它们混为一谈会让不确定度与反投影都对不上号，这是单目稠密里最隐蔽的记号陷阱。
+\end{insight}
+
+\subsection{实践：单目稠密重建代码}
+\label{sec:dense-mono-code}
+
+\paragraph{数据集。}
+示例用 REMODE\cite{pizzoli2014remode} 测试数据集：一架无人机的单目俯视图像共 200 张，并附每张的真实位姿。位姿文件每行格式为“文件名 $t_x\ t_y\ t_z\ q_x\ q_y\ q_z\ q_w$”（平移在前，四元数 $xyz$ 在前、$w$ 在后）：
+
+\begin{codebox}[text]{REMODE 位姿文件格式（前三行）}
+scene_000.png 1.086410 4.766730 -1.449960 0.789455 0.051299 -0.000779 0.611661
+scene_001.png 1.086390 4.766370 -1.449530 0.789180 0.051881 -0.001131 0.611966
+scene_002.png 1.086120 4.765520 -1.449090 0.788982 0.052159 -0.000735 0.612198
+\end{codebox}
+
+\paragraph{参数与主循环。}
+程序为方便理解写成 C 风格放在单文件里\cite{gaoxiang2019slam14}。先看参数与 \texttt{main}：注意内参 \texttt{fy=-480.0} 取\emph{负}——这是合成数据集的约定（图像 $y$ 轴与相机系 $y$ 轴反向），\emph{并非笔误}，请勿删去负号。初始深度与方差均取 \texttt{3.0}；图像边缘 \texttt{boarder=20} 不处理。
+
+\begin{codebox}[C++]{dense\_mapping.cpp:参数与主循环}
+// ---- parameters ----
+const int    boarder = 20;        // image border, not processed
+const int    width   = 640;
+const int    height  = 480;
+const double fx = 481.2f, fy = -480.0f;  // fy is negative: dataset convention
+const double cx = 319.5f, cy = 239.5f;
+const int    ncc_window_size = 3;             // NCC half window
+const int    ncc_area = (2*3+1)*(2*3+1);      // 7x7 = 49
+const double min_cov = 0.1;       // converged if variance below this
+const double max_cov = 10;        // diverged  if variance above this
+
+int main(int argc, char **argv) {
+  vector<string> color_image_files;
+  vector<SE3d>   poses_TWC;        // T_world_camera for each frame
+  Mat ref_depth;
+  readDatasetFiles(argv[1], color_image_files, poses_TWC, ref_depth);
+
+  Mat ref = imread(color_image_files[0], 0);    // reference = first frame
+  SE3d pose_ref_TWC = poses_TWC[0];
+  double init_depth = 3.0, init_cov2 = 3.0;     // initial mean and variance
+  Mat depth     (height, width, CV_64F, init_depth);
+  Mat depth_cov2(height, width, CV_64F, init_cov2);
+
+  for (int index = 1; index < color_image_files.size(); index++) {
+    Mat curr = imread(color_image_files[index], 0);
+    if (curr.data == nullptr) continue;
+    SE3d pose_curr_TWC = poses_TWC[index];
+    // T_C_R = T_C_W * T_W_R = (T_W_C)^-1 * T_W_R : reference -> current
+    SE3d pose_T_C_R = pose_curr_TWC.inverse() * pose_ref_TWC;
+    update(ref, curr, pose_T_C_R, depth, depth_cov2);  // fuse this frame
+  }
+  imwrite("depth.png", depth);
+  return 0;
+}
+\end{codebox}
+
+\paragraph{遍历像素与收敛/发散跳过。}
+\texttt{update} 遍历参考帧每个像素：方差已小于 \texttt{min\_cov}（收敛）或大于 \texttt{max\_cov}（发散）的像素直接跳过；否则在极线上搜索匹配，成功就更新深度滤波器。注意传给极线搜索的是\emph{标准差} \texttt{sqrt(depth\_cov2)}。
+
+\begin{codebox}[C++]{dense\_mapping.cpp:update 遍历像素}
+bool update(const Mat &ref, const Mat &curr, const SE3d &T_C_R,
+            Mat &depth, Mat &depth_cov2) {
+  for (int x = boarder; x < width  - boarder; x++)
+  for (int y = boarder; y < height - boarder; y++) {
+    double cov2 = depth_cov2.ptr<double>(y)[x];
+    if (cov2 < min_cov || cov2 > max_cov) continue;   // converged or diverged
+    Vector2d pt_curr, epipolar_direction;
+    bool ret = epipolarSearch(ref, curr, T_C_R, Vector2d(x, y),
+                 depth.ptr<double>(y)[x], sqrt(cov2),  // pass std-dev
+                 pt_curr, epipolar_direction);
+    if (ret == false) continue;                        // match failed
+    updateDepthFilter(Vector2d(x, y), pt_curr, T_C_R,
+                      epipolar_direction, depth, depth_cov2);
+  }
+}
+\end{codebox}
+
+\paragraph{极线搜索。}
+以深度均值为中心，按 $\pm 3\sigma$ 的最小/最大深度投影到当前帧，得到一条极线段（$d_{\min}$ 钳到 0.1，极线半长上限 100 像素，“不希望搜索太多东西”）；沿极线以步长 $\sqrt{2}/2\approx 0.7$ 取点，算 ZNCC，取最大者；若最高分仍低于阈值 0.85，则判为失配。
+
+\begin{codebox}[C++]{dense\_mapping.cpp:epipolarSearch 极线搜索}
+bool epipolarSearch(const Mat &ref, const Mat &curr, const SE3d &T_C_R,
+    const Vector2d &pt_ref, const double &depth_mu, const double &depth_cov,
+    Vector2d &pt_curr, Vector2d &epipolar_direction) {
+  Vector3d f_ref = px2cam(pt_ref); f_ref.normalize();
+  Vector3d P_ref = f_ref * depth_mu;                  // P along the bearing ray
+  Vector2d px_mean_curr = cam2px(T_C_R * P_ref);      // project mean depth
+  double d_min = depth_mu - 3*depth_cov, d_max = depth_mu + 3*depth_cov;
+  if (d_min < 0.1) d_min = 0.1;
+  Vector2d px_min_curr = cam2px(T_C_R * (f_ref * d_min));
+  Vector2d px_max_curr = cam2px(T_C_R * (f_ref * d_max));
+  Vector2d epipolar_line = px_max_curr - px_min_curr; // epipolar segment
+  epipolar_direction = epipolar_line; epipolar_direction.normalize();
+  double half_length = 0.5 * epipolar_line.norm();
+  if (half_length > 100) half_length = 100;
+  double best_ncc = -1.0; Vector2d best_px_curr;
+  for (double l = -half_length; l <= half_length; l += 0.7) {  // step sqrt(2)/2
+    Vector2d px_curr = px_mean_curr + l * epipolar_direction;
+    if (!inside(px_curr)) continue;
+    double ncc = NCC(ref, curr, pt_ref, px_curr);
+    if (ncc > best_ncc) { best_ncc = ncc; best_px_curr = px_curr; }
+  }
+  if (best_ncc < 0.85f) return false;                 // trust only strong NCC
+  pt_curr = best_px_curr; return true;
+}
+\end{codebox}
+
+\paragraph{ZNCC 评分。}
+块匹配评分用零均值归一化互相关（\cref{eq:dense-zncc}）：参考帧用整数索引取灰度、当前帧用双线性插值取亚像素灰度；分母末尾加 \texttt{1e-10} 防止除零。
+
+\begin{codebox}[C++]{dense\_mapping.cpp:NCC 零均值归一化互相关}
+double NCC(const Mat &ref, const Mat &curr,
+           const Vector2d &pt_ref, const Vector2d &pt_curr) {
+  double mean_ref = 0, mean_curr = 0;
+  vector<double> values_ref, values_curr;
+  for (int x = -ncc_window_size; x <= ncc_window_size; x++)
+  for (int y = -ncc_window_size; y <= ncc_window_size; y++) {
+    double vr = double(ref.ptr<uchar>(int(y+pt_ref(1,0)))[int(x+pt_ref(0,0))])/255.0;
+    double vc = getBilinearInterpolatedValue(curr, pt_curr + Vector2d(x, y));
+    mean_ref += vr; mean_curr += vc;
+    values_ref.push_back(vr); values_curr.push_back(vc);
+  }
+  mean_ref /= ncc_area; mean_curr /= ncc_area;
+  double numerator = 0, denom1 = 0, denom2 = 0;     // zero-mean cross-corr
+  for (int i = 0; i < values_ref.size(); i++) {
+    double a = values_ref[i] - mean_ref, b = values_curr[i] - mean_curr;
+    numerator += a*b; denom1 += a*a; denom2 += b*b;
+  }
+  return numerator / sqrt(denom1 * denom2 + 1e-10); // avoid div-by-zero
+}
+\end{codebox}
+
+\paragraph{三角化、不确定度与高斯融合。}
+最后一段把前面三小节的数学全实现了：先解 \cref{eq:dense-tri-linear} 三角化得深度均值，再按 \cref{eq:dense-unc-angles,eq:dense-unc-betap,eq:dense-unc-pprime} 算几何不确定度 \texttt{d\_cov2}，最后按 \cref{eq:dense-fuse} 做高斯融合。
+
+\begin{codebox}[C++]{dense\_mapping.cpp:updateDepthFilter 三角化+不确定度+融合}
+bool updateDepthFilter(const Vector2d &pt_ref, const Vector2d &pt_curr,
+    const SE3d &T_C_R, const Vector2d &epipolar_direction,
+    Mat &depth, Mat &depth_cov2) {
+  SE3d T_R_C = T_C_R.inverse();
+  Vector3d f_ref  = px2cam(pt_ref);  f_ref.normalize();
+  Vector3d f_curr = px2cam(pt_curr); f_curr.normalize();
+  // solve d_ref*f_ref = d_cur*(R_RC*f_cur) + t_RC  for (d_ref, d_cur)
+  Vector3d t  = T_R_C.translation();
+  Vector3d f2 = T_R_C.so3() * f_curr;
+  Vector2d b(t.dot(f_ref), t.dot(f2));
+  Matrix2d A;
+  A(0,0) = f_ref.dot(f_ref); A(0,1) = -f_ref.dot(f2);
+  A(1,0) = -A(0,1);          A(1,1) = -f2.dot(f2);
+  Vector2d ans = A.inverse() * b;
+  Vector3d xm = ans[0] * f_ref;          // point from ref side
+  Vector3d xn = t + ans[1] * f2;         // point from cur side
+  Vector3d p_esti = (xm + xn) / 2.0;     // average the two
+  double depth_estimation = p_esti.norm();
+  // geometric uncertainty: one-pixel perturbation along epipolar line
+  Vector3d p = f_ref * depth_estimation, a = p - t;
+  double t_norm = t.norm(), a_norm = a.norm();
+  double alpha = acos( f_ref.dot(t) / t_norm);
+  double beta  = acos(-a.dot(t) / (a_norm * t_norm));
+  Vector3d f_curr_prime = px2cam(pt_curr + epipolar_direction);
+  f_curr_prime.normalize();
+  double beta_prime = acos(f_curr_prime.dot(-t) / t_norm);
+  double gamma   = M_PI - alpha - beta_prime;
+  double p_prime = t_norm * sin(beta_prime) / sin(gamma);  // eq sine rule
+  double d_cov   = p_prime - depth_estimation;
+  double d_cov2  = d_cov * d_cov;
+  // Gaussian fusion (eq: prior x observation)
+  double mu     = depth.ptr<double>(int(pt_ref(1,0)))[int(pt_ref(0,0))];
+  double sigma2 = depth_cov2.ptr<double>(int(pt_ref(1,0)))[int(pt_ref(0,0))];
+  double mu_fuse     = (d_cov2*mu + sigma2*depth_estimation) / (sigma2 + d_cov2);
+  double sigma_fuse2 = (sigma2 * d_cov2) / (sigma2 + d_cov2);
+  depth.ptr<double>(int(pt_ref(1,0)))[int(pt_ref(0,0))]      = mu_fuse;
+  depth_cov2.ptr<double>(int(pt_ref(1,0)))[int(pt_ref(0,0))] = sigma_fuse2;
+  return true;
+}
+\end{codebox}
+
+\paragraph{实验结果。}
+以数据集目录为参数运行，程序输出迭代次数、当前图像与深度图（深度值乘以 0.4 后显示——纯白点深约 2.5 米，越暗越近）。深度估计是\emph{动态收敛}的过程：迭代超过一定次数后深度图趋于稳定，大致能看出地板与桌子的区别，桌上物体深度接近桌面；但\emph{存在大量错误估计}（与周围不一致的过大/过小值），边缘处因被看到的次数少而没估准\cite{gaoxiang2019slam14}。这是个有意暴露问题的简单实现——简单的往往并不是最有效的。下一小节专门分析这些问题。
+
+\subsection{单目稠密的工程难点与对策}
+\label{sec:dense-mono-pitfalls}
+
+\paragraph{像素梯度与极线方向。}
+块匹配能否成功，取决于图像块有没有\emph{区分度}。一片纯白的打印机表面极易误匹配，出现明显不该有的条纹状深度——这是立体视觉对纹理的固有依赖。更细致地看，问题还和\emph{梯度相对极线的方向}有关：
+\begin{itemize}
+  \item 梯度\emph{垂直于}极线：即使小块梯度明显，沿极线挪动时匹配得分几乎处处相同，得不到有效匹配；
+  \item 梯度\emph{平行于}极线：能精确确定匹配峰值的位置；
+  \item 实际介于二者之间：夹角越大，极线匹配的不确定性越大。
+\end{itemize}
+演示程序把所有情况都当成“一个像素的误差”，其实不够精细——更好的做法是按梯度-极线夹角构造\emph{各向异性}的不确定度模型。这类问题\emph{很难只靠改代码解决}，是立体视觉的理论性困难。
+
+\begin{pitfall}[思维陷阱：以为把窗口开大就能消除误匹配]
+窗口大$\to$鲁棒但糊边、丢细节；窗口小$\to$保细节但易误匹配。窗口大小只是在两类错误间权衡，\emph{并不能}让无纹理区域“长出”可匹配的信息。白墙、玻璃、天空等亮度均匀处必然产生空洞或乱码——这是几何信息缺失，不是参数没调好。
+\end{pitfall}
+
+\paragraph{逆深度参数化。}
+把深度直接假设成高斯合适吗？相机看到某点时，其图像坐标 $u,v$ 比较确定、深度 $d$ 非常不确定。若用世界坐标 $x,y,z$ 描述，三者之间往往强相关（协方差非对角元非零）；若用 $(u,v,d)$ 描述，$u,v$ 与 $d$ 近似独立——协方差近似对角，更简洁。但正深度的高斯仍有两个问题：其一，真实深度分布\emph{不对称}（近处不小于焦距、远处尾巴很长、负数区为零），不像对称的高斯；其二，室外可能有非常远乃至无穷远的点，初始值难涵盖、数值上也难处理。于是\textbf{逆深度（inverse depth）} $\rho_{\mathrm{inv}}=1/d$ 应运而生：仿真发现假设逆深度为高斯更有效，实际中数值稳定性更好，已成为现代 SLAM 的标准做法\cite{gaoxiang2019slam14}。把演示代码从正深度改成逆深度并不复杂——把推导里的 $d$ 换成 $1/d$ 即可。
+
+\paragraph{图像间的仿射变换。}
+块匹配假设小块灰度不变，这在相机\emph{平移}时大致成立，但明显\emph{旋转}时会失效（一块上白下黑的块可能转成上黑下白，相关性直接变负）。对策是在块匹配前把两帧间的运动考虑进来。参考帧像素 $\mathbf{P}_R$ 与世界点 $\mathbf{P}_W$、当前帧像素 $\mathbf{P}_C$ 分别满足
+\begin{equation}
+  d_R\,\mathbf{P}_R=\mathbf{K}\bigl(\mathbf{R}_{RW}\mathbf{P}_W+\mathbf{t}_{RW}\bigr),\qquad
+  d_C\,\mathbf{P}_C=\mathbf{K}\bigl(\mathbf{R}_{CW}\mathbf{P}_W+\mathbf{t}_{CW}\bigr).
+  \label{eq:dense-affine-proj}
+\end{equation}
+由前式解出 $\mathbf{P}_W=\mathbf{R}_{RW}^\top(d_R\mathbf{K}^{-1}\mathbf{P}_R-\mathbf{t}_{RW})$ 代入后式，消去 $\mathbf{P}_W$，得两图像素的关系
+\begin{equation}
+  d_C\,\mathbf{P}_C=d_R\,\mathbf{K}\mathbf{R}_{CW}\mathbf{R}_{RW}^\top\mathbf{K}^{-1}\mathbf{P}_R
+   +\mathbf{K}\bigl(\mathbf{t}_{CW}-\mathbf{R}_{CW}\mathbf{R}_{RW}^\top\mathbf{t}_{RW}\bigr).
+  \label{eq:dense-affine-rel}
+\end{equation}
+知道 $d_R,\mathbf{P}_R$ 即可算出 $\mathbf{P}_C$；再给 $\mathbf{P}_R$ 的两个分量各加增量 $\mathrm{d}u,\mathrm{d}v$，求出 $\mathbf{P}_C$ 的增量，便得局部的\emph{仿射变换}
+\begin{equation}
+  \begin{bmatrix}\mathrm{d}u_c\\\mathrm{d}v_c\end{bmatrix}
+  =\begin{bmatrix}\dfrac{\partial u_c}{\partial u}&\dfrac{\partial u_c}{\partial v}\\[2mm]\dfrac{\partial v_c}{\partial u}&\dfrac{\partial v_c}{\partial v}\end{bmatrix}
+   \begin{bmatrix}\mathrm{d}u\\\mathrm{d}v\end{bmatrix},
+  \label{eq:dense-affine-mat}
+\end{equation}
+据此把当前帧（或参考帧）的块 warp 一下再匹配，对旋转更鲁棒。
+
+\begin{note}
+\cref{eq:dense-affine-rel} 末项里 $\mathbf{t}_{RW}$ 前\emph{没有}多余的 $\mathbf{K}$——这一形式可由 \cref{eq:dense-affine-proj} 联立重推得到，唯有如此量纲方能自洽（若误在 $\mathbf{t}_{RW}$ 前再乘一个 $\mathbf{K}$，括号内两项量纲不一致，是抄录时易犯的排版错误，请勿照搬）\cite{gaoxiang2019slam14}。
+\end{note}
+
+\paragraph{并行化。}
+稠密深度估计非常费时：要估的点从数百个特征点变成几十万个像素，主流 CPU 也无法实时。但有一条关键性质——\emph{这几十万个像素的深度估计彼此无关}！下一个像素无须等待上一个，可用多线程独立计算。理论上若有 30 万个线程，算全图与算一个像素一样快。GPU 的并行架构正好适合，单目/双目稠密重建常用 GPU 加速实现实时化（本书不涉及 GPU 编程，仅指出这条出路）。
+
+\paragraph{显式处理外点。}
+演示程序只要 NCC 超过阈值就认为匹配成功，\emph{没有显式处理外点}。但遮挡、光照、运动模糊使得不可能每个像素都匹配成功。下一小节给出能在概率层面甄别误匹配的工业级做法。
+
+\subsection{（选读）贝叶斯均匀-高斯混合深度滤波器}
+\label{sec:dense-bayes-filter}
+
+\paragraph{动机。}
+纯高斯版没有显式建模外点。Vogiatzis 与 Hernández\cite{vogiatzis2011video}、以及 SVO\cite{forster2017svo}、REMODE\cite{pizzoli2014remode} 用的“深度滤波器”，把一次测量建模为\emph{要么是内点（高斯）、要么是外点（均匀）}的混合，并用一个\emph{内点率}变量在线学习该像素的可信度。这是 SVO/REMODE/DSO 等系统真正使用的版本。
+
+\paragraph{测量模型与后验。}
+一次深度（或逆深度）测量 $x_k$ 以内点率 $\pi_{\mathrm{in}}\in[0,1]$ 加权——内点是绕真值 $Z$ 的高斯，外点是有效区间 $[Z_{\min},Z_{\max}]$ 上的均匀分布：
+\begin{equation}
+  p(x_k\mid Z,\pi_{\mathrm{in}})=\pi_{\mathrm{in}}\,\mathcal{N}\!\bigl(x_k\mid Z,\tau_k^2\bigr)
+   +(1-\pi_{\mathrm{in}})\,\mathcal{U}\!\bigl(x_k\mid Z_{\min},Z_{\max}\bigr),
+  \label{eq:dense-mix}
+\end{equation}
+其中 $\tau_k^2$ 即 \cref{sec:dense-triangulate-uncertainty} 的几何不确定度。完整后验是多模态的，存储不可行，于是用“\emph{深度高斯 $\times$ 内点率 Beta}”的参数化近似：
+\begin{equation}
+  q\!\bigl(Z,\pi_{\mathrm{in}}\mid a,b,\mu,\sigma^2\bigr)=\mathrm{Beta}\!\bigl(\pi_{\mathrm{in}}\mid a,b\bigr)\,\mathcal{N}\!\bigl(Z\mid\mu,\sigma^2\bigr).
+  \label{eq:dense-gaussbeta}
+\end{equation}
+$\mathbb{E}[\pi_{\mathrm{in}}]=a/(a+b)$ 可解读为“该像素至今为内点的比例”：$a$ 累计内点证据、$b$ 累计外点证据。
+
+\paragraph{逐帧矩匹配更新。}
+来一次新测量 $x$（方差 $\tau^2$），先算内点项 $C_1$ 与外点项 $C_2$ 并归一化（$C_1+C_2=1$）：
+\begin{equation}
+  C_1=\frac{a}{a+b}\,\mathcal{N}\!\bigl(x\mid\mu,\sigma^2+\tau^2\bigr),\qquad
+  C_2=\frac{b}{a+b}\,\mathcal{U}(x).
+  \label{eq:dense-mix-resp}
+\end{equation}
+内点假设下做高斯融合（信息相加，与 \cref{eq:dense-fuse} 同源）：
+\begin{equation}
+  \frac{1}{s^2}=\frac{1}{\sigma^2}+\frac{1}{\tau^2},\qquad
+  m=s^2\!\left(\frac{\mu}{\sigma^2}+\frac{x}{\tau^2}\right).
+  \label{eq:dense-mix-kalman}
+\end{equation}
+再对内/外两分支按 $C_1,C_2$ 做\emph{矩匹配}，更新深度均值与方差，以及 Beta 计数：
+\begin{align}
+  \mu' &= C_1\,m + C_2\,\mu, \label{eq:dense-mix-mu}\\
+  \sigma'^2 &= C_1\,(s^2+m^2) + C_2\,(\sigma^2+\mu^2) - \mu'^2, \label{eq:dense-mix-sig}\\
+  a' &= \frac{e-f}{\,f-e/f\,},\qquad b'=a'\,\frac{1-f}{f}, \label{eq:dense-mix-ab}
+\end{align}
+其中 $f,e$ 是内点率更新后的一、二阶矩（由 $C_1,C_2$ 与 $a,b$ 经 Beta 矩公式给出）。
+
+\begin{note}
+\cref{eq:dense-mix-resp}--\cref{eq:dense-mix-ab} 是 Vogiatzis--Hernández\cite{vogiatzis2011video} 与 SVO\cite{forster2017svo} 所用的标准形，与 SVO 开源实现 \texttt{DepthFilter::updateSeed} 逐项一致：内/外项 $C_1,C_2$ 归一化后，内点分支按信息相加做高斯融合得 $(s^2,m)$，再对深度与内点率分别矩匹配——其中 $f,e$ 即更新后内点率的一、二阶矩，回代到 Beta 反演式 $a'=(e-f)/(f-e/f)$、$b'=a'(1-f)/f$。逆深度版只需把 $Z$ 换成 $\rho_{\mathrm{inv}}=1/Z$、各方差按逆深度计，形式不变。
+\end{note}
+
+\paragraph{收敛与发散判据。}
+按内点率后验 $\mathbb{E}[\pi_{\mathrm{in}}]=a/(a+b)$ 与深度方差 $\sigma^2$ 给该像素 seed 三态判定\cite{pizzoli2014remode}：若 $\mathbb{E}[\pi_{\mathrm{in}}]>\eta_{\mathrm{in}}$（典型 0.6）且 $\sigma^2$ 足够小，则\emph{收敛}（升级为可信深度点）；若 $\mathbb{E}[\pi_{\mathrm{in}}]<\eta_{\mathrm{out}}$（典型 0.2），则\emph{发散}（判为外点删除）；否则继续。REMODE 还在逐像素估计之上加一层\emph{深度不确定度加权的总变分（Huber）正则}，使噪声大处更平滑、噪声小处保边，CUDA 实现可达 50 Hz。
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 推导高斯归一化积 \cref{eq:dense-fuse}（提示：对两高斯密度的指数配方）。
+  \item 把演示代码改成\emph{半稠密}：先筛出梯度明显的像素，只对它们估深度。这能缓解 \cref{sec:dense-mono-pitfalls} 的哪类问题？
+  \item 把演示代码从正深度改成逆深度并加入仿射 warp（\cref{eq:dense-affine-mat}），定性预测深度图在远处与旋转处的变化。
+  \item 说明 \cref{eq:dense-mix-kalman} 在 $\tau^2\gg\sigma^2$（测量很烂）与 $\tau^2\ll\sigma^2$（测量很准）两极限下分别退化成什么。
+\end{enumerate}
+\end{practice}
+
+\subsection{（选读）全局变分单目稠密重建：DTAM 与“优化”范式}
+\label{sec:dense-dtam}
+
+\paragraph{动机：被搁置的“优化”那条路。}
+\cref{sec:dense-depth-filter} 开篇就指出，逐像素深度估计本是个状态估计问题，原则上有\emph{滤波}与\emph{非线性优化}两条路；当时为实时计，我们选了计算量小的滤波器，把“优化”这条路暂搁。本节把它补回来。要紧的是先看清前面所有方法的共同短板：高斯深度滤波器（\cref{sec:dense-depth-filter}）与贝叶斯混合滤波器（\cref{sec:dense-bayes-filter}）都把每个像素的深度当作\emph{彼此独立}的状态\emph{各自}估计——像素 $(u,v)$ 的滤波器既不知道、也不利用邻居 $(u\!+\!1,v)$ 的深度。这正是 \cref{sec:dense-mono-code} 实验里深度图\emph{布满空洞与外点}的根因：无纹理处（白墙、天空）极线相似度曲线平坦、数据沉默，逐像素滤波\emph{无信息可融}，只能留下乱码或空洞（参见 \cref{sec:dense-mono-pitfalls} 的白墙陷阱）。
+
+\paragraph{反面：为什么“各管各”一定漏估。}
+设想参考帧中央有一大片纯白墙。墙上每个像素的极线搜索（\cref{sec:dense-epipolar}）都得到平坦的相似度曲线，三角化无从定深，滤波器方差迟迟不收敛。可\emph{人}一眼就能把这片墙补全——因为我们默认墙面\emph{光滑连续}，用四周已知深度“撑”过空白。逐像素滤波缺的正是这条\emph{空间先验}：它没有任何机制把有纹理邻域的深度\emph{传播}进无纹理区。要把“相邻像素深度应当接近”写进估计，就必须\emph{同时}优化全图所有像素的深度——于是从“逐像素滤波”跨到了“\emph{全局}变分优化”。
+
+\paragraph{历史。}
+用变分法从单目视频做实时稠密重建，是一条贯穿 2010 年前后的研究线（Stühmer 等 2010、Newcombe--Davison 2010 等）\cite{carlone2026handbook}。集大成者是 Newcombe、Lovegrove 与 Davison 的 \textbf{DTAM}（Dense Tracking and Mapping，2011）\cite{newcombe2011dtam}：它对参考帧的\emph{每个}像素估深度，把多帧光度一致性聚成一个\emph{代价体（cost volume）}，再用一个带总变分正则的全局能量求解，并借 GPU 的大规模并行做到\emph{手持相机现场实时稠密重建}。DTAM 还把这张稠密模型反过来用于\emph{直接法稠密跟踪}（用整幅深度图对齐新帧求位姿），故名“稠密跟踪与建图”。
+
+\paragraph{全局变分能量。}
+设参考帧（记为第 $0$ 帧）的图像域为 $\Omega\subset\mathbb{R}^2$，待求的\emph{稠密深度图}是一个函数 $h:\Omega\to\mathbb{R}$，给每个像素 $\mathbf{z}\in\Omega$ 赋一个深度 $h(\mathbf{z})$。变分稠密重建把全图深度一次性写成下面的能量最小化\cite{carlone2026handbook}：
+\begin{equation}
+  \min_{h:\,\Omega\to\mathbb{R}}\ \frac12\sum_{i\in\mathcal{I}}\int_{\Omega}\rho_i(\mathbf{z},h)\,\mathrm{d}\mathbf{z}
+  \;+\;\lambda\int_{\Omega}\bigl|\nabla h\bigr|\,\mathrm{d}^2\mathbf{z}.
+  \label{eq:dense-dtam-energy}
+\end{equation}
+第一项是\emph{数据项}：对参考帧视野内可见的一组邻帧 $\mathcal{I}$ 求和、并在整张图像域 $\Omega$ 上积分逐像素的光度残差 $\rho_i$（下式给出）。第二项是\textbf{总变分（total variation, TV）正则项}：深度图梯度的 $L_1$ 范数 $|\nabla h|$ 在图像域上的积分，权重 $\lambda>0$ 平衡两项。与逐像素滤波最本质的区别就藏在 $\nabla h$ 里——它把\emph{相邻}像素的深度耦合进了同一个目标，于是“各管各”变成了“牵一发动全身”。
+
+\paragraph{光度残差：跨帧 warp 一个世界点。}
+数据项里的 $\rho_i$ 度量“按当前深度假设，参考像素 $\mathbf{z}$ 投到第 $i$ 帧后亮度是否对得上”\cite{carlone2026handbook}：
+\begin{equation}
+  \rho_i(\mathbf{z},h)=\Bigl|\,I_i\!\bigl(\pi(\mathbf{R}_{iw}\,\mathbf{P}_W(\mathbf{z},h)+\mathbf{t}_{iw})\bigr)-I_0(\mathbf{z})\,\Bigr|.
+  \label{eq:dense-dtam-residual}
+\end{equation}
+（此处 $\rho_i$ 是\emph{光度残差}、下标为帧号 $i$，与本章逆深度记号 $\rho_{\mathrm{inv}}$ 无关，勿混。）读法是“\emph{反投影—变换—投影—比亮度}”四步：先把参考像素 $\mathbf{z}$ 按深度 $h(\mathbf{z})$ \emph{反投影}成世界点
+\begin{equation}
+  \mathbf{P}_W(\mathbf{z},h)=\mathbf{R}_{w0}\,\bigl(h(\mathbf{z})\,\mathbf{K}^{-1}\mathbf{z}\bigr)+\mathbf{t}_{w0}
+  \label{eq:dense-dtam-worldpoint}
+\end{equation}
+（$\mathbf{z}$ 取齐次像素，$\mathbf{T}_{w0}=(\mathbf{R}_{w0},\mathbf{t}_{w0})$ 是参考相机到世界的位姿）；再用世界到第 $i$ 帧的 $\mathbf{R}_{iw}\in\SO(3),\,\mathbf{t}_{iw}\in\mathbb{R}^3$ \emph{变换}到该帧相机系，经针孔投影 $\pi(\cdot)$（\cref{ch:camera}）\emph{投影}成像素，最后取它在 $I_i$ 上的亮度与参考亮度 $I_0(\mathbf{z})$ 之差的绝对值。把 \cref{eq:dense-dtam-worldpoint} 代入 \cref{eq:dense-dtam-residual} 并合并位姿 $\mathbf{T}_{iw}\mathbf{T}_{w0}=\mathbf{T}_{i0}$，得到的正是 \cref{eq:dense-affine-rel} 那条“参考帧像素 $\to$ 第 $i$ 帧像素”的双视 warp——只是这里把它当作\emph{以深度 $h$ 为自变量}的光度函数来优化。可见 \cref{eq:dense-dtam-residual} 与块匹配的\emph{灰度不变假设}（\cref{sec:dense-epipolar}）、直接法的\emph{光度误差}同根同源，差别只在：块匹配沿极线\emph{离散搜一个峰}，变分法把深度当\emph{连续变量}对全图\emph{联立优化}。
+
+\begin{insight}[肥皂膜：TV 正则如何“填洞”]\label{ins:dense-dtam-soapfilm}
+\cref{eq:dense-dtam-energy} 的填洞能力全在 TV 项。在无纹理或未被观测的区域，数据项 $\rho_i$ 对深度几乎不敏感（亮度怎么挪都差不多），能量便由 $\lambda\int|\nabla h|$ \emph{独占主导}；而四周有纹理处深度已被数据项“钉住”。于是 TV 项要做的，就是在这些\emph{钉住的边界}之间找一张\emph{总梯度最小}的深度曲面去跨越空白——这恰如一圈铁丝框上张起的\textbf{肥皂膜}：自动绷成一张光滑、紧致的极小曲面\cite{carlone2026handbook}。为什么用 TV（$L_1$ 型的 $|\nabla h|$）而非更顺手的 $L_2$（Tikhonov，$\int\|\nabla h\|^2$）？因为 $L_2$ 重罚大梯度，会把\emph{物体轮廓处真实的深度跳变}也抹平、糊成渐变；TV 只罚梯度总量、不额外惩罚个别大跳，故能\emph{保边}——让肥皂膜只在内部光滑，却允许沿物体边缘“断开”。这正是 TV 在图像去噪与深度填洞里胜过 $L_2$ 的原因。
+\end{insight}
+
+\paragraph{怎么解：代价体 + 凸优化 + GPU。}
+\cref{eq:dense-dtam-energy} 的数据项对 $h$ 是\emph{非凸}的（$I_i$ 经 warp 后随深度剧烈起伏、多峰），不能直接梯度下降。DTAM 的做法分两步\cite{newcombe2011dtam}。其一，对每个像素在一组深度假设 $\{d\}$（实现中以逆深度 $\rho_{\mathrm{inv}}=1/d$ 为轴，逆深度参数化见 \cref{sec:dense-mono-pitfalls}）上\emph{穷举}光度残差，预先算好离散的\textbf{代价体} $C(\mathbf{z},d)=\frac1{|\mathcal{I}|}\sum_{i\in\mathcal{I}}\rho_i(\mathbf{z},d)$——这是一次平面扫掠（plane-sweep），逐像素、逐假设彼此独立，天然适配 GPU。其二，把能量改写成“\emph{逐点}数据项 $C$ $+$ \emph{凸}的 TV 项”，引入辅助变量做\emph{二次解耦}，交替地对 TV 子问题做原始--对偶迭代、对数据子问题做\emph{逐点穷举}，二者都是像素级并行。DTAM 实际用的是\emph{边缘加权的 Huber--$L_1$}正则（TV 的光滑化变体，梯度大处自动放松以更好保边）。两步都铺在 GPU 上，于是手持单目相机即可实时输出稠密深度。
+
+\begin{pitfall}[变分稠密不是“免费的全局最优”]
+三点易误解。其一，\textbf{$\lambda$ 不是越大越好}：$\lambda$ 过大，肥皂膜绷得太紧，吞掉细杆、栏杆等薄结构；$\lambda$ 过小，正则压不住噪声，又退回布满外点的逐像素结果——$\lambda$ 是\emph{偏差--方差}的旋钮，需按场景调。其二，\textbf{解的是凸\emph{化}问题、非原问题全局最优}：数据项的非凸性被代价体 $+$ 解耦“绕开”，最终质量仍受代价体分辨率（逆深度假设数）与初始化影响，深度跳变剧烈处仍可能出错。其三，\textbf{光度一致假设照旧脆弱}：\cref{eq:dense-dtam-residual} 仍假定亮度不变，镜面反光、自动曝光、光照变化都会破坏它，与直接法、块匹配同病（\cref{sec:dense-mono-pitfalls}）；况且全局优化要求\emph{所有参与帧位姿已知}且需 GPU，并非比滤波“更省”。
+\end{pitfall}
+
+\paragraph{两范式对照：逐像素贝叶斯滤波 vs.\ 全局变分优化。}
+至此，单目稠密重建呈现出泾渭分明的\emph{两种范式}。\textbf{范式 A（逐像素贝叶斯滤波）}——高斯深度滤波器（\cref{sec:dense-depth-filter}）、贝叶斯混合滤波器（\cref{sec:dense-bayes-filter}）：把每个像素深度当独立状态\emph{序贯}地逐帧融合，显式携带每像素不确定度，轻量、增量、可判每点收敛/发散，但\emph{无空间耦合}，无纹理处留洞。\textbf{范式 B（全局变分优化）}——DTAM 一族：把全图深度写成一个带空间正则的能量\emph{批量}联立求解，靠 TV 肥皂膜填洞去噪、保空间一致，但需聚多帧成代价体、靠 GPU 凸优化，内存大、不确定度不显式。二者对照见 \cref{tab:dense-paradigm}。
+
+\begin{table}[H]\centering\small
+\caption{单目稠密两范式：逐像素贝叶斯滤波 vs.\ 全局变分优化}
+\label{tab:dense-paradigm}
+\begin{tabular}{p{0.20\textwidth} p{0.34\textwidth} p{0.34\textwidth}}
+\toprule
+ & 范式 A：逐像素贝叶斯滤波 & 范式 B：全局变分优化 \\
+\midrule
+代表 & 高斯滤波器、Vogiatzis 混合滤波、SVO 种子（\cref{sec:dense-depth-filter,sec:dense-bayes-filter}）& DTAM、Stühmer 等变分法（\cref{eq:dense-dtam-energy}）\\
+空间耦合 & 无——逐像素独立 & 有——TV 正则跨像素耦合 \\
+时间结构 & 序贯、增量（每帧递归融合）& 批量（多帧聚成代价体后一次性优化）\\
+无纹理区 & 留空洞 / 外点 & 肥皂膜填洞、保边光滑 \\
+不确定度 & 显式（每像素方差、内点率，可判收敛）& 隐式（藏于能量曲率，通常不输出）\\
+算力 / 内存 & 轻；每像素 $O(1)$ 状态；CPU 可跑 & 重；代价体 $O(\text{像素}\!\times\!\text{假设数})$；依赖 GPU \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[REMODE：两范式的杂交]
+\cref{sec:dense-bayes-filter} 的 \textbf{REMODE}\cite{pizzoli2014remode} 恰是范式 A 与 B 的\emph{杂交}，也是其名“Regularized Monocular Depth”的由来。它\emph{先}用范式 A 的逐像素贝叶斯\emph{混合}滤波（内点率 Beta $\times$ 深度高斯，\cref{eq:dense-gaussbeta}）为每个像素估出深度\emph{及其不确定度}；\emph{再}套范式 B 的一步——在这些深度上做一遍\emph{以逐像素不确定度加权}的总变分（Huber）平滑（即 \cref{sec:dense-bayes-filter} 末尾所述的那一步）。于是滤波器贡献\emph{鲁棒的逐像素似然与置信度}，变分项贡献\emph{空间正则与填洞}；又因按不确定度加权，噪声大处多平滑、噪声小处保边。一句话——\textbf{范式 A 出“点”的可信深度，范式 B 把这些点“缝”成空间一致的面}，REMODE 取两者之长。
+\end{insight}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 把 \cref{eq:dense-dtam-energy} 的 TV 正则换成 $L_2$（Tikhonov）$\lambda\int\|\nabla h\|^2$，定性说明深度图在物体轮廓处会怎样变化，并据此解释变分稠密重建为何偏爱 TV。
+  \item 写出 \cref{eq:dense-dtam-residual} 关于深度 $h(\mathbf{z})$ 的导数 $\partial\rho_i/\partial h$（提示：链式法则穿过 $\pi$ 与 warp），说明它为何\emph{非凸}，从而解释 DTAM 为何要先建代价体再凸化、而不能直接梯度下降。
+  \item 对照 \cref{tab:dense-paradigm}：机器人只有 CPU、要求增量建图且需知道每点深度是否可信，应选哪种范式？若有 GPU、要一张少洞的稠密模型供 AR 遮挡，又该选哪种？
+  \item 解释 REMODE 为何要\emph{以逐像素不确定度加权}做 TV 平滑，而非对所有像素一视同仁地平滑（提示：联系 \cref{eq:dense-mix-resp} 的内/外点率 $C_1,C_2$）。
+\end{enumerate}
+\end{practice}
+
+\subsection{（选读）双目立体匹配：SGM 简介}
+\label{sec:dense-sgm}
+
+\paragraph{动机。}
+单目要靠运动产生基线、靠多帧滤波收敛；\emph{双目}相机左右目之间有\emph{固定基线}，理论上单帧就能出稠密视差。已校正（行对齐）的双目，对每像素 $\mathbf{p}$ 求\textbf{视差} $d_{\mathrm{disp}}$（左右图同名点的横坐标差），深度由 $Z=fB/d_{\mathrm{disp}}$ 给出（$f$ 焦距、$B$ 基线）。工业界最常用的稠密视差算法是\textbf{半全局匹配（SGM, Semi-Global Matching）}\cite{hirschmuller2008sgm}。
+
+\paragraph{能量与平滑项。}
+理想的全局能量是数据项加平滑项：
+\begin{equation}
+  E(\mathbf{D})=\sum_{\mathbf{p}}C\!\bigl(\mathbf{p},d_{\mathbf{p}}\bigr)
+   +\sum_{\mathbf{p}}\sum_{\mathbf{q}\in N_{\mathbf{p}}}R\!\bigl(d_{\mathbf{p}},d_{\mathbf{q}}\bigr),
+  \label{eq:dense-sgm-energy}
+\end{equation}
+其中 $C(\mathbf{p},d)$ 是匹配代价（可取强度绝对差、Census 变换汉明距离或互信息），$R$ 是分级平滑惩罚：
+\begin{equation}
+  R(d_{\mathbf{p}},d_{\mathbf{q}})=\begin{cases}0,&d_{\mathbf{p}}=d_{\mathbf{q}},\\ P_1,&|d_{\mathbf{p}}-d_{\mathbf{q}}|=1,\\ P_2,&|d_{\mathbf{p}}-d_{\mathbf{q}}|>1,\end{cases}
+  \qquad P_1<P_2.
+  \label{eq:dense-sgm-smooth}
+\end{equation}
+$P_1$ 罚小变化（允许斜面平滑过渡），$P_2$ 罚大跳变（保深度不连续）；在图像梯度大处自适应减小 $P_2$，允许真实边界处视差跳变。
+
+\paragraph{路径代价递推。}
+直接精确优化二维全局能量是 NP 难。SGM 的核心是用\emph{多条一维路径}的动态规划聚合来近似它。沿方向 $\mathbf{r}$ 的递推
+\begin{equation}
+  L_{\mathbf{r}}(\mathbf{p},d)=C(\mathbf{p},d)+\min\!\Bigl\{
+   L_{\mathbf{r}}(\mathbf{p}-\mathbf{r},d),\,
+   L_{\mathbf{r}}(\mathbf{p}-\mathbf{r},d{\pm}1)+P_1,\,
+   \min_i L_{\mathbf{r}}(\mathbf{p}-\mathbf{r},i)+P_2\Bigr\}
+   -\min_k L_{\mathbf{r}}(\mathbf{p}-\mathbf{r},k),
+  \label{eq:dense-sgm-path}
+\end{equation}
+末项是与当前像素所有视差无关的常数，仅为防止 $L$ 沿路径无界增长，不改变 $\arg\min$。把所有方向（常用 8 或 16 条）的路径代价相加 $S(\mathbf{p},d)=\sum_{\mathbf{r}}L_{\mathbf{r}}(\mathbf{p},d)$，逐像素取 $d^*(\mathbf{p})=\arg\min_d S(\mathbf{p},d)$，再做亚像素抛物线拟合与左右一致性检查。复杂度 $O(W\cdot H\cdot D)$（$D$ 为视差范围）。
+
+\begin{insight}
+SGM 与单目稠密同样基于“匹配代价”，但用\emph{已校正双目 $+$ 多路径 DP}取代了单目的\emph{极线搜索 $+$ 多帧深度滤波}：SGM 单帧即出稠密视差、不需多帧收敛，代价是要双目硬件与精确标定。
+\end{insight}
+
+\paragraph{过渡。}
+至此，单目（与双目）这条“费力”的路已经走通——计算量大、依赖纹理。当手里有 RGB-D 相机时，深度由硬件直接测得，建图的重心就从“怎么估深度”转向“怎么把多帧带噪深度\emph{融合}成一致、紧凑、可查询的地图”。下面进入 RGB-D 稠密建图。
+
+% ════════════════════════════════════════════════════════════════
+\section{RGB-D 稠密建图：点云地图}
+\label{sec:dense-rgbd-pc}
+
+\paragraph{动机。}
+RGB-D 相机在适用范围内是更省力的选择：深度由传感器硬件直接测得，无须大量计算；结构光/飞时（ToF）原理还保证了\emph{深度对纹理无关}——即使纯色物体，只要能反射光就能测到深度，这正好补上了立体视觉的最大短板\cite{gaoxiang2019slam14}。RGB-D 建图的理论不多，重心在工程。最直观的地图形式是\textbf{点云地图}——按 \cref{tab:dense-quadrant} 它属\emph{显式表面}象限里最朴素的一种：直接把每个测点摆在它的位置上，不连边、不判内外，是各种高级地图的天然原料。
+
+\paragraph{反投影与拼接。}
+单像素 $(u,v)$、深度 $d$ 经针孔反投影得相机系点，再用位姿变到世界系：
+\begin{equation}
+  z=\frac{d}{\text{depthScale}},\quad x=\frac{(u-c_x)\,z}{f_x},\quad y=\frac{(v-c_y)\,z}{f_y},\qquad
+  \mathbf{P}_W=\mathbf{T}\,\mathbf{P}_{\mathrm{cam}}.
+  \label{eq:dense-rgbd-backproj}
+\end{equation}
+全图点云就是各帧反投影点的并集，可附 RGB 颜色。实际建图还要加两道滤波（\cref{ch:pointcloud} 已详述其原理）：\emph{统计离群点去除（SOR）}剔除孤立噪点，\emph{体素栅格滤波}做三维降采样控制密度。下面是完整代码。
+
+\begin{codebox}[C++]{pointcloud\_mapping.cpp:RGB-D 反投影拼接 + 双滤波}
+int main(int argc, char **argv) {
+  vector<cv::Mat> colorImgs, depthImgs;
+  vector<Eigen::Isometry3d> poses;
+  ifstream fin("./data/pose.txt");
+  for (int i = 0; i < 5; i++) {
+    boost::format fmt("./data/%s/%d.%s");
+    colorImgs.push_back(cv::imread((fmt % "color" % (i+1) % "png").str()));
+    depthImgs.push_back(cv::imread((fmt % "depth" % (i+1) % "png").str(), -1));
+    double data[7]; for (int k = 0; k < 7; k++) fin >> data[k];
+    Eigen::Quaterniond q(data[6], data[3], data[4], data[5]); // Hamilton (w,x,y,z)
+    Eigen::Isometry3d T(q); T.pretranslate(Eigen::Vector3d(data[0],data[1],data[2]));
+    poses.push_back(T);
+  }
+  double cx=319.5, cy=239.5, fx=481.2, fy=-480.0, depthScale=5000.0;
+  typedef pcl::PointXYZRGB PointT;
+  typedef pcl::PointCloud<PointT> PointCloud;
+  PointCloud::Ptr pointCloud(new PointCloud);
+  for (int i = 0; i < 5; i++) {
+    PointCloud::Ptr current(new PointCloud);
+    cv::Mat color = colorImgs[i], depth = depthImgs[i];
+    Eigen::Isometry3d T = poses[i];
+    for (int v = 0; v < color.rows; v++)
+    for (int u = 0; u < color.cols; u++) {
+      unsigned int d = depth.ptr<unsigned short>(v)[u];
+      if (d == 0) continue;                          // 0 = no measurement
+      Eigen::Vector3d point;
+      point[2] = double(d) / depthScale;
+      point[0] = (u - cx) * point[2] / fx;
+      point[1] = (v - cy) * point[2] / fy;
+      Eigen::Vector3d pw = T * point;                // to world frame
+      PointT p; p.x=pw[0]; p.y=pw[1]; p.z=pw[2];
+      p.b = color.data[v*color.step + u*color.channels()    ];
+      p.g = color.data[v*color.step + u*color.channels() + 1];
+      p.r = color.data[v*color.step + u*color.channels() + 2];
+      current->points.push_back(p);
+    }
+    PointCloud::Ptr tmp(new PointCloud);             // statistical outlier removal
+    pcl::StatisticalOutlierRemoval<PointT> sor;
+    sor.setMeanK(50); sor.setStddevMulThresh(1.0);
+    sor.setInputCloud(current); sor.filter(*tmp);
+    (*pointCloud) += *tmp;
+  }
+  pcl::VoxelGrid<PointT> voxel;                       // voxel grid downsample
+  double resolution = 0.03;
+  voxel.setLeafSize(resolution, resolution, resolution);
+  PointCloud::Ptr tmp(new PointCloud);
+  voxel.setInputCloud(pointCloud); voxel.filter(*tmp);
+  tmp->swap(*pointCloud);
+  pcl::io::savePCDFileBinary("map.pcd", *pointCloud);
+  return 0;
+}
+\end{codebox}
+
+\paragraph{数值。}
+用 ICL-NUIM 仿真数据集（无噪声深度），\texttt{data/} 下存 5 张图、深度与位姿。体素分辨率取 0.03 米——肉眼几乎看不出地图差异，但点数从约 130 万减到 3 万，\emph{只需 2\% 的存储}\cite{gaoxiang2019slam14}。
+
+\begin{pitfall}[思维陷阱：把点云地图直接当导航地图用]
+点云地图很直观、生成简单，但有三条硬伤：(1) 体量随轨迹\emph{无上限增长}（无压缩）；(2) \emph{无空间占据/自由语义}——只有“看到的表面点”，不知道两点之间是空的还是没探索过，\textbf{不能直接用于导航/避障}；(3) 多帧只是叠加、没真正融合，有噪声和重影。这三条正是接下来 OctoMap（占据 $+$ 压缩）、TSDF（融合去噪 $+$ 隐式表面）、surfel（带法线半径的面元融合）各自要解决的。
+\end{pitfall}
+
+\paragraph{点云能满足地图的哪些需求？}
+回到 \cref{sec:dense-intro} 列出的几大用途，逐条审视点云地图，便能看清它到底“初级”在哪、又强在哪。
+
+\emph{定位}（\cref{sec:dense-intro} 第一用途）能否在点云地图上完成，取决于前端视觉里程计的类型：
+\begin{itemize}
+  \item 若前端是\textbf{基于特征点}的 VO，则\emph{不能}直接用点云定位——点云里只存了离散的三维坐标，并\emph{没有保存特征点的描述子}，无从做特征匹配；
+  \item 若前端是\textbf{基于 ICP}（\cref{ch:pointcloud}）的 VO，则\emph{可以}把当前帧的\emph{局部点云}对\emph{全局点云}做配准来估位姿。但这要求全局点云本身\emph{精度足够好}；而上面的拼接流程只是把各帧反投影点叠加、并未对点云本身做联合优化（无去重影、无 BA），因此精度通常不够，直接拿来 ICP 定位是不可靠的。
+\end{itemize}
+\emph{导航与避障}（第二、三用途）则\emph{无法}由纯点云直接完成：点云表达不了“某空间点是否被占据”，更答不了“两点之间是空的、还是根本没探索过”这类查询，而这恰是规划与避障的基本前提（这正是上一条 pitfall 所强调的）。
+
+\emph{可视化与交互}（第四、五用途）上，点云具备\emph{基本}能力：以三维形式存储，可快速浏览场景各角落乃至在其中\emph{漫游}，生成又高效。但它\emph{不含物体表面信息}（无表面、无法线），不太合人的视觉直觉——从正面与背面看同一物体\emph{长得一样}，甚至能\emph{“透过物体看到背后”}，这些都与日常经验相悖。因此点云更多用于\emph{调试}与\emph{基础显示}，不便直接交付上层应用。
+
+\begin{insight}[点云是一切高级地图的出发点]
+说点云“初级”，是因为它最接近传感器读到的原始数据——也正因如此，它是构建各种高级地图的\emph{天然起点}。要导航，就从点云出发构建\emph{占据栅格}（\cref{sec:dense-octomap}）以查询可通过性；要漂亮的表面，就用\emph{泊松重建}（\cref{sec:dense-mesh}）从点云解出物体网格，或用\emph{面元}（\cref{sec:dense-surfel}）拼出带法线的可视化地图。多数“由点云转得的地图”PCL 库都已提供\cite{rusu2011pcl}。下面几节正是沿这条“从点云加工出更高级地图”的线索展开。
+\end{insight}
+
+\paragraph{过渡。}
+先解决“无占据语义、无压缩”这两条，自然引出八叉树占据地图。
+
+% ════════════════════════════════════════════════════════════════
+\section{八叉树占据地图：OctoMap}
+\label{sec:dense-octomap}
+
+\paragraph{动机。}
+点云的两大痛点——规模大、无法处理运动物体（只增不删）——促使我们换一种表示\cite{gaoxiang2019slam14}。OctoMap\cite{hornung2013octomap} 用\textbf{八叉树}多分辨率组织空间，每个叶节点存\emph{占据概率}（以 log-odds 存），用\emph{贝叶斯递归 $+$ clamping} 在线更新、用\emph{剪枝}压缩。按 \cref{tab:dense-quadrant} 它是典型的\emph{显式体积}表示——直接在整个体积里给每个体素估一个占据量，而非只描述表面。正因如此它显式区分占据/自由/未知三态，是导航避障的首选度量地图。
+
+\paragraph{八叉树结构与压缩性。}
+把三维空间建模为小方块（体素）：把一个方块的每个面都对半切，方块就变成 8 个同样大小的子方块；不断重复直到达到最高精度。“一分为八”即“从一个节点展开为 8 个子节点”，整个从最大空间细分到最小空间的过程就是一棵\emph{八叉树}：大方块是\emph{根节点}，最小块是\emph{叶子节点}，往上走一层体积扩大 8 倍。若叶子方块为 $1\,\mathrm{cm}^3$、限 10 层，则总建模体积约 $8^{10}\,\mathrm{cm}^3 = 1{,}073{,}741{,}824\,\mathrm{cm}^3\approx 1073\,\mathrm{m}^3$，足够建一间屋子；体积随深度呈\emph{指数}增长。
+
+八叉树为何比点云省空间？因为节点存的是“是否被占据”：\emph{当某方块的所有子节点全占据或全不占据时，无须展开这个节点}。空白地图只需一个根节点；实际场景里物体常连成片、空白也常连成片，所以大多数节点不必展开到叶子层——这就是八叉树的压缩本钱。
+
+\paragraph{占据概率的二值贝叶斯滤波。}
+怎样表达“占据”？用 0/1 太脆——噪声会让某点一会儿 0 一会儿 1，还没法表达“未知”。改用概率 $p\in[0,1]$：初值 0.5，观测到占据则增大、观测到空白则减小。叶节点 $n$ 在测量序列 $z_{1:t}$ 下被占据的后验，按标准的二值贝叶斯滤波递归\cite{hornung2013octomap}：
+\begin{equation}
+  P(n\mid z_{1:t})=\left[1+\frac{1-P(n\mid z_t)}{P(n\mid z_t)}\,\frac{1-P(n\mid z_{1:t-1})}{P(n\mid z_{1:t-1})}\,\frac{P(n)}{1-P(n)}\right]^{-1},
+  \label{eq:dense-octo-bayes}
+\end{equation}
+其中 $P(n\mid z_t)$ 是只看当前测量的\emph{逆传感器模型}，$P(n\mid z_{1:t-1})$ 是上一时刻后验，$P(n)$ 是先验（常取 0.5）。这条连分式更新起来既慢又容易跑出 $[0,1]$。
+
+\paragraph{log-odds 加性更新。}
+解药是改存\emph{对数几率（log-odds）}。设概率 $p$ 与对数几率 $\ell$ 由 logit 变换相联：
+\begin{equation}
+  \ell=\operatorname{logit}(p)=\log\!\frac{p}{1-p},\qquad
+  p=\operatorname{logit}^{-1}(\ell)=\frac{\exp(\ell)}{\exp(\ell)+1}=\sigma(\ell).
+  \label{eq:dense-octo-logit}
+\end{equation}
+$\ell$ 从 $-\infty$ 到 $+\infty$ 时 $p$ 从 0 到 1，$\ell=0$ 对应 $p=0.5$。在此变换下，\cref{eq:dense-octo-bayes} 的乘法变成\emph{加法}：
+\begin{equation}
+  L(n\mid z_{1:t})=L(n\mid z_{1:t-1})+L(n\mid z_t).
+  \label{eq:dense-octo-logodds}
+\end{equation}
+
+\begin{derivation}[从 \cref{eq:dense-octo-bayes} 到 \cref{eq:dense-octo-logodds}]
+取均匀先验 $P(n)=0.5$，则先验项 $\frac{P(n)}{1-P(n)}=1$。对 \cref{eq:dense-octo-bayes} 两边取“占据/非占据”之比（odds）的对数：
+\[
+  \log\frac{P(n\mid z_{1:t})}{1-P(n\mid z_{1:t})}
+  =\log\frac{P(n\mid z_t)}{1-P(n\mid z_t)}+\log\frac{P(n\mid z_{1:t-1})}{1-P(n\mid z_{1:t-1})},
+\]
+即 $L(n\mid z_{1:t})=L(n\mid z_t)+L(n\mid z_{1:t-1})$。乘法变加法，更新更快；若把传感器模型的 $L(n\mid z_t)$ 预先算好，更新时连对数都不必再算。于是\emph{每个体素只存一个 float（log-odds）}，查询概率时用 \cref{eq:dense-octo-logit} 的逆变换。
+\end{derivation}
+
+\begin{codebox}[C++]{OctoMap 源码:logodds 与 probability 互转（octomap\_utils.h）}
+inline float logodds(double probability) {
+  return (float) log(probability / (1 - probability));    // L = log(p/(1-p))
+}
+inline double probability(double logodds) {
+  return 1. - (1. / (1. + exp(logodds)));                 // p = sigmoid(L)
+}
+\end{codebox}
+
+\paragraph{逆传感器模型与 RGB-D 更新。}
+怎么把一帧 RGB-D 变成 log-odds 增量？观测到某像素带深度 $d$，意味着：深度对应的空间点上观测到一个\emph{占据}，且从相机光心到该点的整条线段上应\emph{没有物体}（否则会被遮挡）。于是从原点沿射线投射（3D Bresenham），端点体素记“占据”、沿途体素记“自由”：
+\begin{equation}
+  L(n\mid z_t)=\begin{cases} \ell_{\mathrm{occ}}, & \text{射线在体素内反射（端点）},\\ \ell_{\mathrm{free}}, & \text{射线穿过体素}.\end{cases}
+  \label{eq:dense-octo-sensor}
+\end{equation}
+正是这个“沿途标自由”让八叉树能\emph{处理运动物体}：障碍物移走后，穿过它的射线会把那些体素逐渐拉回自由。
+
+\paragraph{clamping 更新策略。}
+\cref{eq:dense-octo-logodds} 有个隐患：要\emph{翻转}一个已被观测 $k$ 次的体素，得再观测相反结果至少 $k$ 次——静态环境无妨，但动态环境适应太慢（置信度无界增长）。对策是给 log-odds 设上下界 $\ell_{\min},\ell_{\max}$：
+\begin{equation}
+  L(n\mid z_{1:t})=\max\!\Bigl(\min\!\bigl(L(n\mid z_{1:t-1})+L(n\mid z_t),\ \ell_{\max}\bigr),\ \ell_{\min}\Bigr).
+  \label{eq:dense-octo-clamp}
+\end{equation}
+好处有二：地图置信度\emph{有界}，能快速适应环境变化；配合剪枝可\emph{压缩}（剪枝率最多提升 44\%）。代价是靠近 0/1 的全概率信息丢失，属有损，但界内全保真。
+
+\begin{codebox}[C++]{OctoMap 源码:updateNodeLogOdds 的 clamping（OccupancyOcTreeBase.hxx）}
+void updateNodeLogOdds(NODE* node, const float& update) const {
+  node->addValue(update);                                 // L += update
+  if (node->getLogOdds() < this->clamping_thres_min) {
+    node->setLogOdds(this->clamping_thres_min); return;   // clamp to lower bound
+  }
+  if (node->getLogOdds() > this->clamping_thres_max) {
+    node->setLogOdds(this->clamping_thres_max);           // clamp to upper bound
+  }
+}
+\end{codebox}
+
+\paragraph{默认参数（两套，勿混）。}
+论文实验值（针对激光雷达）与库出厂默认值并不相同，引用时务必注明用的是哪一套\cite{hornung2013octomap}：
+
+\begin{table}[H]\centering\small
+\caption{OctoMap 占据更新的两套参数}
+\label{tab:dense-octo-params}
+\begin{tabular}{lll}
+\toprule
+参数 & 论文实验值（激光雷达） & 库默认值（\texttt{octomap::OcTree}） \\
+\midrule
+先验 $P(n)$ & 0.5 & 0.5 \\
+占据更新 $p_{\mathrm{hit}}$ & 0.7（$\ell_{\mathrm{occ}}=0.85$） & \texttt{setProbHit(0.7)} \\
+自由更新 $p_{\mathrm{miss}}$ & 0.4（$\ell_{\mathrm{free}}=-0.4$） & \texttt{setProbMiss(0.3)} \\
+clamping 下界 & 概率 0.12 & \texttt{setClampingThresMin(0.1)} \\
+clamping 上界 & 概率 0.97 & \texttt{setClampingThresMax(0.95)} \\
+占据判定阈 & 0.5 & \texttt{setOccupancyThres(0.5)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent{}默认参数下，约 5 次一致观测就足以让一个未知体素到达 clamping 界（变“稳定”）。
+
+\paragraph{内节点聚合与剪枝。}
+内节点的占据由 8 个子节点聚合，两种策略：\emph{平均}占据 $\bar\ell(n)=\frac18\sum_{i=1}^{8}L(n_i)$，或\emph{最大}占据 $\hat\ell(n)=\max_i L(n_i)$。导航用\emph{最大占据}更保守——只要任一子体素被测占据就视整体占据，从而规划出无碰路径。当某内节点的 8 个子节点都“稳定”且占据状态相同时，剪掉它们并入父节点（若后续测量矛盾再重新展开）。完整树还能序列化成紧凑位流（每节点 8 个子用 2 bit 标签：未知/占据/自由/内节点），极小。
+
+\paragraph{实践代码。}
+把 RGB-D 反投影成世界点放入 octomap 点云，再连同\emph{相机光心（原点）}一起交给八叉树——给定原点才能计算投射线、对沿途体素做自由更新。
+
+\begin{codebox}[C++]{octomap\_mapping.cpp:构建八叉树占据地图}
+octomap::OcTree tree(0.01);     // resolution 0.01 m
+for (int i = 0; i < 5; i++) {
+  cv::Mat color = colorImgs[i], depth = depthImgs[i];
+  Eigen::Isometry3d T = poses[i];
+  octomap::Pointcloud cloud;
+  for (int v = 0; v < color.rows; v++)
+  for (int u = 0; u < color.cols; u++) {
+    unsigned int d = depth.ptr<unsigned short>(v)[u];
+    if (d == 0) continue;
+    Eigen::Vector3d point;
+    point[2] = double(d) / depthScale;
+    point[0] = (u - cx) * point[2] / fx;
+    point[1] = (v - cy) * point[2] / fy;
+    Eigen::Vector3d pw = T * point;
+    cloud.push_back(pw[0], pw[1], pw[2]);
+  }
+  // origin = camera center, so ray-casting marks free space along the beams
+  tree.insertPointCloud(cloud, octomap::point3d(T(0,3), T(1,3), T(2,3)));
+}
+tree.updateInnerOccupancy();    // aggregate inner nodes
+tree.writeBinary("octomap.bt"); // compressed binary tree
+\end{codebox}
+
+\paragraph{数值对比。}
+默认深度 16 层即最高分辨率（边长 0.05 米），减一层边长翻倍（0.1 米），可随手调分辨率。文件大小最有说服力：同场景下点云地图磁盘约 6.9 MB，而八叉树地图只有 56 KB——\emph{不到点云的 1\%}\cite{gaoxiang2019slam14}，且可 $O(\text{树高})$ 查询任意点的占据概率以做导航。
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 证明 \cref{eq:dense-octo-bayes} 在 $P(n)=0.5$ 下取对数即得 \cref{eq:dense-octo-logodds}；若先验非 0.5，加性更新会多出哪一项？
+  \item 用 $\ell=\log\frac{p}{1-p}$ 算出 \cref{tab:dense-octo-params} 库默认值对应的 $\ell_{\min},\ell_{\max},\ell_{\mathrm{occ}},\ell_{\mathrm{free}}$。
+  \item 论证如何在八叉树里做路径规划：A*/RRT 如何用“占据概率查询”判断可通过性？为什么内节点聚合宜用最大占据？
+\end{enumerate}
+\end{practice}
+
+\paragraph{过渡。}
+OctoMap 解决了“能不能走”，但它只有占据语义、没有表面细节，不适合精细重建与渲染。要“长什么样”，就需要把多帧深度真正\emph{融合}成一张光滑表面——这正是 TSDF 的拿手好戏。
+
+% ════════════════════════════════════════════════════════════════
+\section{TSDF 与 KinectFusion}
+\label{sec:dense-tsdf}
+
+\paragraph{动机：鬼影问题。}
+之前的做法把地图当作定位的“后续加工”：两帧都看到同一把椅子时，只按各自位姿把两处点云叠加。位姿有误差，直接叠加不准——同一把椅子出现两个\emph{重影（鬼影）}\cite{gaoxiang2019slam14}。\textbf{实时三维重建}把范式倒过来，以\emph{建图}为主体：在每个体素里存它\emph{到最近表面的（截断）符号距离}，多帧加权融合天然去噪，表面就是符号距离为 0 的等值面。按 \cref{tab:dense-quadrant}，TSDF 从此跨过了显式/隐式的分界——它用一个\emph{标量距离函数}的零交叉来\emph{隐式}地定义表面，是\emph{隐式表面}象限的代表（与上一节 OctoMap 的“显式体积”恰成对照：同样满布整个体积，存的量却从“占据”换成了“到表面的符号距离”，几何因此变得光滑、可微）。代表作是 KinectFusion\cite{newcombe2011kinectfusion}，其融合公式源自 Curless 与 Levoy\cite{curless1996volumetric}。
+
+\paragraph{TSDF 的符号约定。}
+体素到最近表面的符号距离 $F$：体素在表面\emph{前方}（朝相机、自由空间）取\emph{正}值，在表面\emph{后方}（不可见侧、物体内部）取\emph{负}值，$F=0$ 即表面。物体表面通常很薄，只需在表面附近的\emph{截断带} $[-\mu_{\mathrm{tr}},\mu_{\mathrm{tr}}]$ 内表示距离，太远处截到 $\pm 1$。每个体素存两个量：当前截断符号距离 $F_k(\mathbf{p})$ 与累积权重 $W_k(\mathbf{p})$。截断算子
+\begin{equation}
+  \Psi(\eta)=\operatorname{clamp}\!\left(\frac{\eta}{\mu_{\mathrm{tr}}},-1,1\right)=
+  \begin{cases}-1,&\eta<-\mu_{\mathrm{tr}},\\ \eta/\mu_{\mathrm{tr}},&|\eta|\le\mu_{\mathrm{tr}},\\ +1,&\eta>\mu_{\mathrm{tr}},\end{cases}
+  \label{eq:dense-tsdf-trunc}
+\end{equation}
+（表面后方太远、不可见处记 null，不更新。）
+
+\paragraph{投影式符号距离。}
+算真欧氏 SDF 太慢，KinectFusion 用\emph{投影式}近似——沿相机射线，把“体素到相机中心的距离”折算成沿光轴的深度后，与该像素测得深度相减。对位姿 $\mathbf{T}_{g,k}$ 已知的原始深度图 $R_k$，体素 $\mathbf{p}$ 的投影 TSDF
+\begin{equation}
+  F_{R_k}(\mathbf{p})=\Psi\!\left(\lambda^{-1}\bigl\|\mathbf{t}_{g,k}-\mathbf{p}\bigr\|_2-R_k(\mathbf{x})\right),\qquad
+  \lambda=\bigl\|\mathbf{K}^{-1}\dot{\mathbf{x}}\bigr\|_2,\qquad
+  \mathbf{x}=\Bigl\lfloor \pi\!\bigl(\mathbf{K}\,\mathbf{T}_{g,k}^{-1}\,\mathbf{p}\bigr)\Bigr\rfloor,
+  \label{eq:dense-tsdf-proj}
+\end{equation}
+其中 $\mathbf{t}_{g,k}$ 是相机中心，$\mathbf{x}$ 是体素投影到第 $k$ 帧的像素（$\pi$ 去齐次、$\lfloor\cdot\rfloor$ 最近邻取整以免深度不连续处糊化），$\lambda^{-1}$ 把沿射线的距离折算成沿光轴的深度。括号内即“体素深度 $-$ 测得深度”$=\eta$，再过 $\Psi$ 截断。测量权重 $W_{R_k}(\mathbf{p})\propto\cos\theta/R_k(\mathbf{x})$（正对表面、近处权重大），但实践中直接令 $W_{R_k}=1$（简单平均）即效果良好。
+
+\paragraph{加权运行平均融合。}
+全局融合 = 各帧 TSDF 的\emph{加权平均}，等价于在 L2 范数下对多帧噪声 TSDF 去噪 $\min_{F}\sum_k\|W_{R_k}(F_{R_k}-F)\|^2$。该凸问题的全局解可\emph{增量}地用加权运行平均求得（对非 null 体素）：
+\begin{equation}
+  F_k(\mathbf{p})=\frac{W_{k-1}(\mathbf{p})\,F_{k-1}(\mathbf{p})+W_{R_k}(\mathbf{p})\,F_{R_k}(\mathbf{p})}{W_{k-1}(\mathbf{p})+W_{R_k}(\mathbf{p})},\qquad
+  W_k(\mathbf{p})=\min\!\bigl(W_{k-1}(\mathbf{p})+W_{R_k}(\mathbf{p}),\,W_\eta\bigr).
+  \label{eq:dense-tsdf-fuse}
+\end{equation}
+把累积权重封顶在 $W_\eta$，就把“全历史平均”变成“\emph{移动平均}”——旧观测随新观测淡出，从而支持动态场景。
+
+\begin{insight}
+\textbf{clamping 与 $W_\eta$ 是同一种智慧。}OctoMap 给 log-odds 封上下界（\cref{eq:dense-octo-clamp}），TSDF 给累积权重封上限（\cref{eq:dense-tsdf-fuse}）——\emph{都给“置信度”封顶}，用界内信息的微小损失换取对环境变化的快速适应。看似两套不同的地图，背后是同一条工程哲学。
+\end{insight}
+
+\paragraph{投影式 SDF 不是真距离场：ESDF。}
+\cref{eq:dense-tsdf-proj} 的 $\eta$ 是\emph{沿测量射线}量的距离（投影式符号距离），它\emph{系统性地高估}真欧氏距离——离表面同样 $0.1$ 米的两个体素，斜着被射线扫到的那个会被记成更大的值。零交叉（即表面位置）不受影响，所以做\emph{重建}无碍；但一旦要拿距离场去\emph{规划}，麻烦就来了：基于优化的运动规划要用“到最近障碍的真欧氏距离”及其\emph{梯度}（指向最近障碍的方向）把轨迹推离障碍，投影式距离给出的梯度方向是歪的。真正想要的是\textbf{欧氏符号距离场（ESDF, Euclidean Signed Distance Field）}：每个查询点存\emph{到最近表面的真欧氏距离}（幅值）与\emph{内外}（符号）。对\emph{已知}表面，ESDF 可用快速行进（fast marching）一次解出；对\emph{在线估计}，则常先按 \cref{eq:dense-tsdf-proj,eq:dense-tsdf-fuse} 融出 TSDF，再增量地刷出 ESDF——这正是 voxblox\cite{oleynikova2017voxblox} 的做法（TSDF $\to$ ESDF 用 brushfire 波前传播），FIESTA\cite{han2019fiesta} 则改从占据图增量建 ESDF。一句话：\emph{重建看零交叉，规划看 ESDF 梯度}；TSDF 给前者、ESDF 给后者，二者可由同一批深度增量地共建。
+
+\paragraph{光线投射提面与 frame-to-model 跟踪。}
+有了全局 SDF，逐像素\emph{光线投射}即可渲染零等值面：每像素射线从最小深度步进，当 $F$ 由正变负出现零交叉就找到可见表面，再线性插值求亚体素交点 $t^*=t-\Delta t\,F_t^+/(F_{t+\Delta t}^+-F_t^+)$；表面法线由 TSDF 数值梯度归一化 $\hat{\mathbf{N}}=\nabla F/\|\nabla F\|$ 给出。KinectFusion 的整条流水线是一个闭环：双边滤波得测量表面 $\to$ 与\emph{上一帧光投出的预测表面}做 point-to-plane ICP（\cref{ch:pointcloud}）求位姿 $\to$ 把当前深度按 \cref{eq:dense-tsdf-proj,eq:dense-tsdf-fuse} 融入全局 TSDF $\to$ 光投出新预测供下一帧。这种\emph{frame-to-model}（而非 frame-to-frame）跟踪显著抑制漂移；且因 TSDF 无颜色，\emph{只用深度图}就能估位姿，摆脱了对光照纹理的依赖。
+
+\begin{pitfall}[思维陷阱：以为 TSDF 内存够用、随便建大场景]
+稠密体素内存随\emph{体积立方}增长：$512^3$ 体素即上百 MB。原版 KinectFusion 因此只适合桌面/房间级，且预设固定体积、固定分辨率、无回环（长轨迹漂移累积）。大场景必须用\emph{体素哈希}（只存表面附近体素）或\emph{移动体积}（Kintinuous）。此外，薄物体从两侧观测时，正（观测）与负（幻觉）距离平均会让零交叉翻转甚至消失（“擦除几何”），TSDF 对薄物体召回率偏低。
+\end{pitfall}
+
+\paragraph{体素怎么存：从稠密数组到 VDB。}
+“体素内存随体积立方增长”逼出了一条与“估什么量”正交的工程维度——\emph{数据结构}。同一个 TSDF（或占据图）可以有几种存法，权衡都在“访问要快”与“内存要省”之间\cite{carlone2026handbook}：
+\begin{itemize}
+  \item \textbf{稠密数组}：给体素一个线性索引直接存。随机访问 $O(1)$、最简单，但空体素也占内存，且改变地图范围要整体搬迁。KinectFusion 原版即如此，故只宜固定小体积。
+  \item \textbf{哈希表（hash map）}：把空间切成分片（单体素或体素块），用哈希函数映射坐标到表项。保持 $O(1)$ 访问的同时\emph{按需分配}——只在有内容处建表项，地图可动态长大而无须整体重分配。要点在分片粒度、哈希函数的均匀性、以及碰撞处理。
+  \item \textbf{体素块哈希（voxel-block hashing）}：把体素分成定长小块（如 $8^3$），\emph{以块为单位}放进哈希表\cite{niessner2013voxelhashing}。块内仍是稠密小数组（对 GPU 友好），块只在表面附近分配——这是现代大场景 TSDF/占据建图（如 voxblox）的主力结构。
+  \item \textbf{树与混合结构}：八叉树（\cref{sec:dense-octomap} 的 OctoMap）天然支持多分辨率，但显式存父子指针有内存开销、查询耗时随树高线性增长。VDB\cite{museth2013vdb} 把\emph{块哈希}与\emph{树}合一——空间切成哈希块、块内存一棵定高树，于是既有哈希的常数时间访问、又有树的多分辨率，是当前兼顾两端的常用选择。
+\end{itemize}
+（点云的 KD-tree 已在 \cref{ch:pointcloud} 详述，此处不重复。）至于\emph{怎么把一帧深度写进体素}，也有两条路：\emph{光线投射式}整合器沿每条射线更新沿途体素，通用、只需知道传感器原点，但近处体素被多条射线重复命中、并行时有竞态；\emph{投影式}整合器反过来遍历体素、把每个体素投影到传感器去取对应射线，天然无竞态、访问规整，适合多线程与 GPU，代价是要知道完整位姿与投影模型、且不擅长处理无序点云。大场景里还可让\emph{分辨率随距离/信息量自适应}：远处射线稀、就用低分辨率更新（多分辨率光投/投影），wavemap\cite{reijgwart2023wavemap} 更进一步用小波编码做\emph{粗到细}更新、并跳过已收敛区域。
+
+\paragraph{Fusion 系列。}
+自 RGB-D 传感器出现，实时重建谱系不断壮大：KinectFusion 完成小场景基本重建，随后 DynamicFusion、ElasticFusion、Fusion4D、VolumeDeform 把它向\emph{大型、运动、变形}场景拓展。其中 ElasticFusion 走了一条与 TSDF 不同的路——用面元，下一节细讲。
+
+% ════════════════════════════════════════════════════════════════
+\section{面元地图与 ElasticFusion}
+\label{sec:dense-surfel}
+
+\paragraph{动机。}
+TSDF 在空体素上也要花内存；\textbf{面元（surfel, surface element）}只在\emph{表面}处分配元素，内存随表面积而非体积增长，且天然适配非刚性形变回环\cite{whelan2015elasticfusion}。一个面元就是一个带朝向与大小的“小圆盘”。按 \cref{tab:dense-quadrant} 它回到\emph{显式表面}象限——与点云同列，但比裸点多了法线、半径、颜色，是“带朝向的点”；下一节会看到，把这个小圆盘换成一个带不透明度的三维高斯椭球，就通向 \cref{sec:dense-radiance} 的可微渲染地图。
+
+\paragraph{面元的属性。}
+场景表示为一个\emph{无序面元列表} $\mathcal{M}$，每个面元 $\mathcal{M}^s$ 含位置 $\mathbf{p}\in\mathbb{R}^3$、法线 $\mathbf{n}\in\mathbb{R}^3$、颜色 $\mathbf{c}$、置信权重 $w$、半径 $r$、创建时刻 $t_0$、末次更新时刻 $t$\cite{whelan2015elasticfusion}。半径 $r$ 表示该点局部表面积，取得让圆盘拼起来无可见空洞；权重 $w$ 表示参数估计的置信度。面元与新测量的融合规则与 TSDF 同构——加权运行平均更新位置/法线/颜色并累加权重\cite{keller2013pointfusion}：
+\begin{equation}
+  \mathbf{p}\leftarrow\frac{w\,\mathbf{p}+w_{\mathrm{new}}\,\mathbf{p}_{\mathrm{new}}}{w+w_{\mathrm{new}}},\quad
+  \mathbf{n}\leftarrow\frac{w\,\mathbf{n}+w_{\mathrm{new}}\,\mathbf{n}_{\mathrm{new}}}{w+w_{\mathrm{new}}},\quad
+  w\leftarrow w+w_{\mathrm{new}}.
+  \label{eq:dense-surfel-fuse}
+\end{equation}
+新像素若无匹配面元则\emph{新建}，有匹配则\emph{融合}，长期低置信的面元被\emph{剔除}。
+
+\begin{note}
+面元的半径与置信权重有简洁闭式\cite{keller2013pointfusion}：半径 $r=\dfrac{\sqrt{2}\,d}{f\,|n_z|}$（$d$ 为深度、$f$ 为焦距、$n_z$ 为该点法线在相机系下的 $z$ 分量），使圆盘随深度增大、随掠射（$|n_z|$ 小）变大以无缝拼接；新测量的置信权重 $w_{\mathrm{new}}=\exp\!\bigl(-\gamma^2/2\sigma^2\bigr)$，其中 $\gamma$ 是该像素到图像中心的归一化径向距离、$\sigma$ 取约 $0.6$（视场中心权重高、边缘权重低）。不同实现的系数取值可能略有出入。
+\end{note}
+
+\paragraph{Active/Inactive 与无位姿图回环。}
+ElasticFusion 用时间窗把地图分为\emph{活跃（active）}与\emph{非活跃（inactive）}：只有 active 面元参与位姿估计与深度融合；超过时间阈未更新的面元转 inactive。回环时，把 active 模型渲染（surfel splatting）出的预测与其下方的 inactive 模型对齐——对齐成功就对\emph{整张面元地图做非刚性空间形变（deformation graph）}，并重新激活相关区域。这就是其副标题“\emph{Dense SLAM Without A Pose Graph}”的含义：不维护关键帧位姿图，而是直接形变稠密地图来反映回环。其相机跟踪联合几何（point-to-plane ICP）与光度（强度误差）两项代价，用高斯-牛顿在三层金字塔上由粗到精求解（位姿增量按 \cref{ch:lie} 的指数映射更新）。
+
+\begin{table}[H]\centering\small
+\caption{四种稠密度量地图表示对比}
+\label{tab:dense-repr-compare}
+\begin{tabular}{p{0.13\textwidth} p{0.16\textwidth} p{0.14\textwidth} p{0.16\textwidth} p{0.20\textwidth}}
+\toprule
+表示 & 内存随… & 占据/自由 & 表面/法线 & 主要用途 \\
+\midrule
+点云 & 观测数（无界） & 无 & 点级、无法线 & 可视化、配准输入 \\
+OctoMap & 占据体积（八叉树压缩） & 三态齐全 & 无 & 导航/避障/规划 \\
+TSDF & 体积立方（大场景需哈希） & 隐含（截断带） & 高（零交叉提网格） & 高精度桌面/房间重建、AR \\
+面元 surfel & 表面积 & 无 & 高（法线/半径/颜色） & 房间级 RGB-D SLAM $+$ 重建（带回环） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{过渡。}
+无论 TSDF 还是点云/面元，常需转成\emph{三角网格}以利渲染、碰撞、物理与传输。这就是网格重建。
+
+% ════════════════════════════════════════════════════════════════
+\section{网格重建简介}
+\label{sec:dense-mesh}
+
+\paragraph{动机。}
+稠密地图（体素 SDF、surfel、点云）要做碰撞、物理、传输，往往要先变成三角网格。两大经典路线：从\emph{标量场}提等值面的 \textbf{Marching Cubes}（与 TSDF 天作之合），从\emph{定向点云}解隐式场的\textbf{泊松重建}。
+
+\paragraph{Marching Cubes。}
+用途是从三维标量场（如 TSDF $F(\mathbf{p})$、占据场）提取等值面 $F=\text{iso}$ 的三角网格\cite{lorensen1987marchingcubes}。算法逐立方体处理：取 8 个相邻格点构成一个立方体单元，每个角点的标量值与 iso 比较，大于记 1、否则记 0，8 个角点构成 8 bit 索引（$0\sim255$）；查预计算的 256 项查找表，得该立方体内等值面穿过哪些边、如何连成三角形；对每条被穿过的边（两端点 $\mathbf{P}_1,\mathbf{P}_2$、标量 $v_1,v_2$），交点按线性插值精化：
+\begin{equation}
+  \mathbf{P}=\mathbf{P}_1+\frac{\text{iso}-v_1}{v_2-v_1}\,(\mathbf{P}_2-\mathbf{P}_1).
+  \label{eq:dense-mc-interp}
+\end{equation}
+$2^8=256$ 种配置利用旋转、反射对称与符号翻转可约简为 15 个基本情形。原版有面/内部歧义（可能产生空洞），Marching Cubes 33 用渐近判定器扩到 33 情形以保拓扑正确。优点是简单、查表、天然并行、与 TSDF 直接对接；缺点是分辨率受体素大小限、可能产生大量小三角形。
+
+\paragraph{泊松重建。}
+用途是从\emph{定向点云}（每点带位置 $+$ 法线）重建\emph{水密}三角网格\cite{kazhdan2006poisson}。核心观察是：要重建模型的\emph{指示函数} $\chi$（内部 1、外部 0），其梯度 $\nabla\chi$ 几乎处处为零，仅在表面附近非零、方向沿表面法线。于是把输入点的法线看作梯度的样本向量场 $\vec{V}$，求 $\chi$ 使 $\nabla\chi\approx\vec{V}$；两边取散度得\emph{泊松方程}
+\begin{equation}
+  \Delta\chi=\nabla\cdot\vec{V},
+  \label{eq:dense-poisson}
+\end{equation}
+$\Delta$ 为拉普拉斯算子。在自适应八叉树上用多重网格解出 $\chi$，再对它取等值面（用自适应 Marching Cubes）得网格。它是\emph{全局}解、对噪声鲁棒、产生光滑闭合面，但需可靠法线、计算较重、可能过度光滑（Screened Poisson 加点位插值约束缓解）。
+
+\paragraph{实践：从点云重建网格（MLS 估法线 $+$ GP3 三角化）。}
+泊松那条“先估法线、再解隐式场”的路线，工程上有一条更轻、可在 PCL 里几行跑通的近亲：先用\textbf{移动最小二乘（MLS, Moving Least Squares）}\cite{alexa2003pointset}给点云\emph{估法线并就地平滑重采样}，再用\textbf{贪婪投影三角化（GP3, Greedy Projection Triangulation）}\cite{marton2009fast}把带法线的点\emph{直接连成三角网格}。GP3 不解全局隐式场，而是从一个种子三角形出发、沿当前网格边界\emph{贪婪}地把邻近点投影到局部切平面并连接扩张，因此快、适合大而带噪的点云，但不保证水密。承接 \cref{sec:dense-rgbd-pc} 存出的 \texttt{map.pcd}，把它读进来就能重建出带法线、纹理的表面：
+
+\begin{codebox}[C++]{surfel\_mapping.cpp:点云 -> MLS 估法线 -> GP3 三角网格}
+typedef pcl::PointXYZRGB        PointT;        // input: colored points
+typedef pcl::PointXYZRGBNormal  SurfelT;       // output: points with normals
+typedef pcl::PointCloud<PointT>::Ptr   PointCloudPtr;
+typedef pcl::PointCloud<SurfelT>::Ptr  SurfelCloudPtr;
+
+// step 1: estimate normals + smooth/resample via Moving Least Squares
+SurfelCloudPtr reconstructSurface(const PointCloudPtr &input,
+                                  float radius, int polynomial_order) {
+  pcl::MovingLeastSquares<PointT, SurfelT> mls;
+  pcl::search::KdTree<PointT>::Ptr tree(new pcl::search::KdTree<PointT>);
+  mls.setSearchMethod(tree);
+  mls.setSearchRadius(radius);          // local fitting neighborhood radius
+  mls.setComputeNormals(true);          // also output a normal per point
+  mls.setSqrGaussParam(radius * radius);// distance weight: radius^2 works best
+  mls.setPolynomialOrder(polynomial_order);  // local surface poly degree (2)
+  mls.setInputCloud(input);
+  SurfelCloudPtr output(new pcl::PointCloud<SurfelT>);
+  mls.process(*output);
+  return output;
+}
+
+// step 2: greedy projection triangulation -> triangle mesh
+pcl::PolygonMeshPtr triangulateMesh(const SurfelCloudPtr &surfels) {
+  pcl::search::KdTree<SurfelT>::Ptr tree(new pcl::search::KdTree<SurfelT>);
+  tree->setInputCloud(surfels);
+  pcl::GreedyProjectionTriangulation<SurfelT> gp3;
+  pcl::PolygonMeshPtr triangles(new pcl::PolygonMesh);
+  gp3.setSearchRadius(0.05);            // caps the maximum triangle edge length
+  gp3.setMu(2.5);                       // search radius = mu * nn-distance (density-adaptive)
+  gp3.setMaximumNearestNeighbors(100);  // neighbor budget per point
+  gp3.setMaximumSurfaceAngle(M_PI / 4); // 45 deg: do not connect across sharp folds
+  gp3.setMinimumAngle(M_PI / 18);       // 10 deg : preferred min triangle angle
+  gp3.setMaximumAngle(2 * M_PI / 3);    // 120 deg: max triangle angle
+  gp3.setNormalConsistency(true);       // input normals are consistently oriented
+  gp3.setInputCloud(surfels);
+  gp3.setSearchMethod(tree);
+  gp3.reconstruct(*triangles);
+  return triangles;
+}
+
+int main(int argc, char **argv) {
+  PointCloudPtr cloud(new pcl::PointCloud<PointT>);
+  pcl::io::loadPCDFile(argv[1], *cloud);          // load map.pcd
+  double mls_radius = 0.05;                        // MLS neighborhood (meters)
+  int    polynomial_order = 2;                     // quadratic local fit
+  auto surfels = reconstructSurface(cloud, mls_radius, polynomial_order);
+  pcl::PolygonMeshPtr mesh = triangulateMesh(surfels);
+  pcl::visualization::PCLVisualizer vis;
+  vis.addPolygonMesh(*mesh, "mesh"); vis.spin();   // show the reconstructed mesh
+  return 0;
+}
+\end{codebox}
+
+\paragraph{参数怎么读。}
+两个算子的关键参数都直接对应几何含义。MLS 的 \texttt{setSearchRadius} 定局部拟合邻域：太小则法线受噪声干扰、太大则磨平细节；\texttt{setSqrGaussParam} 是距离加权的高斯尺度，经验上取\emph{搜索半径的平方}最稳（PCL 在 \texttt{setSearchRadius} 时即默认如此置位）；\texttt{setPolynomialOrder(2)} 用\emph{二次}局部曲面拟合（设 1 即退化为平面拟合）。GP3 的 \texttt{setSearchRadius} \emph{封顶三角形最大边长}（也就限定了可连接的最大点距）；\texttt{setMu} 把搜索半径设成“\emph{$\mu\times$ 最近邻距离}”，从而随\emph{局部点密度自适应}（稀疏处放大、稠密处收紧），典型取 2.5；\texttt{setMaximumSurfaceAngle($45^\circ$)} 拒绝法线偏差过大的邻点，避免\emph{跨越尖锐折边}误连；\texttt{setNormalConsistency} 声明输入法线朝向一致——这一步正依赖 MLS 已给出的法线。运行 \texttt{./\allowbreak surfel\_mapping map.\allowbreak pcd}，原本无表面的点云便重建出带法线与纹理的网格（局部细节明显优于纯点云）。
+
+\begin{insight}
+两条路线的输入不同决定了适用场景：\emph{Marching Cubes} 吃\textbf{体素标量场}（TSDF/占据），局部逐立方体，适合“已有体素场”（KinectFusion 直接 MC）；\emph{泊松}吃\textbf{定向点云}，全局解隐式场，适合“只有带法线点云”（激光/多视点云），水密抗噪但更重；而上面的 \emph{MLS $+$ GP3} 同样吃定向点云，但走\emph{局部贪婪}而非全局解——更快、可增量，代价是不保证水密。三者按“手里已有什么、要不要水密、能否承受全局求解”来选。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{隐式曲面、ESDF 与连续函数地图}
+\label{sec:dense-implicit}
+
+\paragraph{把象限的另一半补齐。}
+前面几节走的是 \cref{tab:dense-quadrant} 的\emph{显式}一列（点/面元/网格）与显式体积（OctoMap），以及一个隐式表面的代表（TSDF）。本节把\emph{隐式}这一列讲透：先收口“隐式曲面到底是什么、它与显式表示如何互转”，再补上前面只点了名的\emph{连续函数}地图家族——高斯过程地图、GP 隐式曲面、Hilbert 地图。它们与本书一贯的贝叶斯/概率精神同源：不再把空间切成固定分辨率的格子，而是\emph{拟合一个连续函数}，于是能在任意分辨率查询、能内插未观测区、还能给出\emph{不确定度}。最后用“神经隐式 SDF”一句话过渡到 \cref{sec:dense-radiance} 的可微渲染地图。
+
+\subsection{隐式曲面与显隐式互转}
+\label{sec:dense-implicit-surface}
+
+\paragraph{零交叉即表面。}
+\emph{显式}表面直接给出边界（点、网格顶点与面）；\emph{隐式}表面则换一种刻画——找一个标量函数 $\Phi(\mathbf{x})$，约定它在物体\emph{内部}取负、\emph{外部}取正，于是
+\begin{equation}
+  \{\mathbf{x}\in\mathbb{R}^3 \;:\; \Phi(\mathbf{x})=0\}
+  \label{eq:dense-implicit-def}
+\end{equation}
+这张\emph{零等值面}就是表面本身。隐式表示有两个显式表示给不了的好处：其一，没有固定分辨率，理论上能以任意精度表示任意形状；其二，判断空间一点在物体内还是外，\emph{只需看 $\Phi$ 的符号}，无须遍历几何。\cref{sec:dense-tsdf} 的 TSDF 正是 $\Phi$ 取（截断）符号距离的特例——它的零交叉就是重建出的表面。
+
+\paragraph{两列之间的桥。}
+四象限不是四个孤岛，显式与隐式常需互转（已在 \cref{sec:dense-intro} 预告，这里给出机制）：
+\begin{itemize}
+  \item \textbf{显式 $\to$ 隐式}：对点云或网格，可\emph{按需}做最近点查询，要哪点的符号距离就算哪点；也可在规则格上用快速行进（fast marching）一次性铺出整片距离场。
+  \item \textbf{隐式 $\to$ 显式}：对距离场/占据场用 Marching Cubes（\cref{eq:dense-mc-interp}）提零等值面，得三角网格——这是 \cref{sec:dense-mesh} 已讲的“第二条网格化路线”的上游。
+  \item \textbf{离散 $\to$ 连续}：把离散体素拟合成一个连续函数，本质是解一个\emph{极小化拟合误差}的优化问题——这正引出下面的连续函数地图。
+\end{itemize}
+
+\subsection{高斯过程地图与 GPIS}
+\label{sec:dense-implicit-gp}
+
+\paragraph{把建图当回归。}
+要彻底摆脱“先验给定分辨率”，最干净的办法是把建图\emph{当成回归}：以测点为训练数据，拟合一个连续函数，在任意查询点求值。若还想\emph{尽量少假设环境形状}，就用\emph{非参数}回归——\textbf{高斯过程（Gaussian Process, GP）}\cite{rasmussen2006gp} 是其代表。本书在连续时间轨迹估计（\cref{sec:est-steam}）已用过 GP；那里 GP 沿\emph{时间}插值轨迹，这里 GP 沿\emph{空间}插值地图量，是同一工具的另一面。
+
+\begin{note}
+\textbf{本小节记号（局部声明，避让全章约定）.}\;
+本小节 $f(\mathbf{x})$ 是待估\emph{标量地图量}（占据或符号距离），$\mathbf{x}\in\mathbb{R}^3$ 为空间位置（非状态向量）；核函数记 $\mathcal{K}(\mathbf{x},\mathbf{x}')$，由训练点两两求核得到的\emph{Gram 矩阵}记 $\mathbf{G}=[\mathcal{K}(\mathbf{x}_i,\mathbf{x}_j)]_{ij}$——\emph{特意不写 $\mathbf{K}$}，以免与相机内参 $\mathbf{K}$ 混淆。观测噪声方差 $\sigma_n^2$（下标 $n$ 区别于深度滤波的 $\sigma$）。
+\end{note}
+
+\paragraph{GP 预测式。}
+设地图量服从一个零均值（不失一般性）GP，$f(\mathbf{x})\sim\mathcal{GP}\!\bigl(0,\mathcal{K}(\mathbf{x},\mathbf{x}')\bigr)$。在 $J$ 个位置 $\mathsf{X}=\{\mathbf{x}_j\}$ 处拿到带噪观测 $\mathbf{y}$，$y_j=f(\mathbf{x}_j)+\epsilon_j$，$\epsilon_j\sim\mathcal{N}(0,\sigma_n^2)$。要在测试位置 $\mathsf{X}^\ast$ 处预测 $\mathbf{f}_\ast$，由观测与待估值的联合高斯条件化即得后验 $\mathbf{f}_\ast\mid\mathsf{X},\mathbf{y},\mathsf{X}^\ast\sim\mathcal{N}\!\bigl(\bar{\mathbf{f}}_\ast,\operatorname{cov}(\mathbf{f}_\ast)\bigr)$，其
+\begin{align}
+  \bar{\mathbf{f}}_\ast &= \mathbf{G}(\mathsf{X}^\ast,\mathsf{X})\,\bigl[\mathbf{G}(\mathsf{X},\mathsf{X})+\sigma_n^2\mathbf{I}\bigr]^{-1}\mathbf{y}, \label{eq:dense-gp-mean}\\
+  \operatorname{cov}(\mathbf{f}_\ast) &= \mathbf{G}(\mathsf{X}^\ast,\mathsf{X}^\ast)-\mathbf{G}(\mathsf{X}^\ast,\mathsf{X})\,\bigl[\mathbf{G}(\mathsf{X},\mathsf{X})+\sigma_n^2\mathbf{I}\bigr]^{-1}\mathbf{G}(\mathsf{X},\mathsf{X}^\ast). \label{eq:dense-gp-cov}
+\end{align}
+\cref{eq:dense-gp-mean} 给地图量的均值，\cref{eq:dense-gp-cov} 给逐点\emph{不确定度}——后者正是 GP 地图相对栅格/TSDF 的独到之处：它显式建模了\emph{格子之间的空间相关}，从而能对\emph{未观测}近邻区做有据的外推，并量化“这里我有多不确定”。
+
+\paragraph{GPOM 与 GPIS。}
+两种用法对应 \cref{tab:dense-quadrant} 的隐式一列：
+\begin{itemize}
+  \item \textbf{高斯过程占据图（GPOM）}\cite{omeadhra2019gpom}：把观测沿射线采样成“自由/占据”标签作训练数据，用 \cref{eq:dense-gp-mean,eq:dense-gp-cov} 回归，再把回归输出经一个二分类“压扁（squash）”函数映成 $[0,1]$ 的占据概率——这是\emph{隐式体积}的连续版占据图。
+  \item \textbf{GP 隐式曲面（GPIS）}\cite{williams2007gpis}：直接把\emph{符号距离场}建成 GP——这是\emph{隐式表面}的连续版。利用“微分是线性算子、对 GP 作线性运算仍得 GP”这一性质，可把距离 $d$ 与其梯度 $\nabla d$ 联合建模（表面处距离为零，故取零均值）：
+\begin{equation}
+  \begin{bmatrix} d \\ \nabla d \end{bmatrix}\sim\mathcal{GP}\!\bigl(\mathbf{0},\,\mathbf{G}(\mathsf{X},\mathsf{X}')\bigr).
+  \label{eq:dense-gpis}
+\end{equation}
+于是一举得到\emph{带不确定度的}连续隐式曲面\emph{与}表面法线（由梯度给出）。原始 GPIS 只在测点附近距离准、远处回落到零均值；要在远处也得到完整距离场，可对 GPIS 再叠一层非线性变换。
+\end{itemize}
+代价是 GP 的算力：朴素 GPOM 是批处理、复杂度约 $O(J^3)$（$J$ 为训练点数），增量化与稀疏化是后续工作的主线。
+
+\subsection{Hilbert 地图}
+\label{sec:dense-implicit-hilbert}
+
+\paragraph{用线性分类器换 GP 的算力。}
+GP 的瓶颈在那个要求逆的稠密 Gram 矩阵。\textbf{Hilbert 地图}\cite{ramos2016hilbert} 与 GPOM 同精神（连续、概率、不离散化、能内插缺失数据），但把建图\emph{重写成一个可在线训练的逻辑回归}，从而绕开求逆。做法是：先用一族放在空间规则格点上的\emph{特征}把低维坐标 $\mathbf{x}$ 投影到高维特征空间 $\boldsymbol{\Phi}(\mathbf{x})$（这一步扮演 GP 里核的角色，但只用近似），再在特征空间训练逻辑回归 $p_{\mathrm{occ}}(\mathbf{x})=\sigma\!\bigl(\mathbf{w}^\top\boldsymbol{\Phi}(\mathbf{x})\bigr)$（$\sigma$ 为 \cref{eq:dense-octo-logit} 的同一 logistic 函数），用\emph{小批量随机梯度下降}在线更新权 $\mathbf{w}$。训练样本与 GPOM 同源：沿射线采自由点、把回波端点作占据点。特征常用\emph{稀疏核}——它在某距离外恰好降到 $0$，把每个观测的影响限制在局部，既提收敛又省算力。Hilbert 地图于是能\emph{在线、连续}地吞大量数据，用一个简单分类器表示出相当精细的空间结构；其表达力的主要约束在所用核（如各向同性 RBF）能否拼出环境的细节，这又回到“核数目与长度尺度”的取舍。
+
+\begin{insight}
+\textbf{连续函数地图补足了体素的两处短板。}体素/八叉树把空间切成固定分辨率的格子，且默认\emph{格子间独立}——既无法内插未观测区，也丢掉了空间相关。GP / Hilbert 地图把建图当回归，于是（i）\emph{任意分辨率}查询、（ii）显式建模\emph{空间相关}并能\emph{外推}未观测区、（iii）给出\emph{不确定度}。它在\emph{深度稀疏或很噪}时尤其值——这与本书贯穿的“拿协方差/信息度量可信度”一脉相承（\cref{tab:dense-quadrant} 隐式一列的连续端）。代价是算力，故工程上常在“要不要不确定度、深度有多稀”与“算力预算”之间权衡。
+\end{insight}
+
+\paragraph{过渡：从手工隐式场到学习隐式场。}
+GPOM/GPIS/Hilbert 都是\emph{无学习}的连续函数——核与特征是人定的。一个自然的下一步是\emph{让数据学这个函数}：用一个神经网络（MLP）去逼近 SDF 或占据场，DeepSDF\cite{park2019deepsdf} 一类工作即直接由 3D 坐标回归符号距离，得到连续、紧凑、拓扑灵活的隐式曲面（仍可用 Marching Cubes 提网格）。\emph{然而} DeepSDF 这类方法\emph{靠 3D 真值监督}训练——而稠密、准确的三维标注\emph{昂贵且不可扩展}（非靠合成数据、即靠激光逐点扫描），这条\emph{可扩展性}瓶颈，正是把研究从“逐点标三维真值”推向“用更易获得的 2D 图像监督”的根本动因。顺此动因，把隐式场搬进 SLAM，便有了在线训练、边估位姿边建图的\emph{神经隐式 SDF}（如 iMAP\cite{sucar2021imap}）；其训练信号来自一个更强的范式——\emph{可微渲染}：让 2D 像素的梯度回流去优化 3D 表示。这恰是下一节的主题，也是本章“经典稠密表示 $\to$ 可微渲染地图”的收束。
+
+% ════════════════════════════════════════════════════════════════
+\section{工程权衡与选型}
+\label{sec:dense-engineering}
+
+\paragraph{选型的总图。}
+把散落各处的取舍集中起来，给出一张选型决策表。它把 \cref{tab:dense-repr-compare} 再扩一列“去噪/融合”“回环友好”“实时性”。
+
+\begin{table}[H]\centering\small
+\caption{稠密地图表示的工程选型总表}
+\label{tab:dense-engineering}
+\begin{tabular}{p{0.12\textwidth} p{0.13\textwidth} p{0.13\textwidth} p{0.13\textwidth} p{0.13\textwidth} p{0.14\textwidth}}
+\toprule
+表示 & 去噪/融合 & 回环友好 & 实时性 & 三态语义 & 典型系统 \\
+\midrule
+点云 & 无（仅叠加） & 差 & 高 & 无 & RGB-D 拼接 \\
+OctoMap & 概率（clamping） & 中 & 高 & 有 & OctoMap \\
+TSDF & 强（加权平均） & 差（需哈希/Kintinuous） & GPU 实时 & 隐含 & KinectFusion, Voxblox \\
+surfel & 强（加权平均） & 好（非刚性形变） & GPU 实时 & 无 & ElasticFusion, Keller \\
+Mesh & 取决于输入 & --- & 离线/准实时 & 无 & MC, Poisson \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{关键取舍。}
+\begin{enumerate}
+  \item \textbf{稀疏 vs 稠密}：定位用稀疏（省、够），避障/重建/交互用稠密（贵、必需）；很多系统\emph{双地图并存}（稀疏定位 $+$ 稠密建图）。
+  \item \textbf{度量 vs 拓扑}：局部精度用度量、大尺度全局用拓扑，混合分层最实用。
+  \item \textbf{OctoMap vs TSDF}：要“能不能走”（规划）选 OctoMap（三态 $+$ 压缩）；要“长什么样”（重建/渲染）选 TSDF/surfel。
+  \item \textbf{TSDF vs surfel}：固定小体积、要最高几何精度选 TSDF；大房间、要回环、内存敏感选 surfel。
+  \item \textbf{置信封顶}：静态环境不封（精度高），动态环境必封（适应快）——OctoMap 的 $\ell_{\min}/\ell_{\max}$ 与 TSDF 的 $W_\eta$ 同理。
+  \item \textbf{单目 vs RGB-D 稠密}：单目省硬件但需平移基线 $+$ 概率滤波（慢、无纹理处空洞）；RGB-D 直接给深度（快、稠密）但受量程与材质限制（玻璃/黑物/室外阳光失效）。
+  \item \textbf{经典 vs 可微渲染}：以上各表均为\emph{经典}稠密表示——先重建几何、再（可选）渲染。若首要目标是\emph{逼真的新视角渲染}、且愿意付出离线优化与 GPU 算力，可考虑 \cref{sec:dense-radiance} 的可微渲染地图（NeRF/3DGS）：它把流程倒过来，用渲染损失直接优化 3D 表示。但截至目前其\emph{跟踪精度与实时性}尚不及经典稀疏/稠密法，更适合重建/渲染而非在线避障。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section{可微渲染地图：NeRF 与 3D 高斯泼溅}
+\label{sec:dense-radiance}
+
+\paragraph{把范式倒过来：用渲染损失优化 3D 表示。}
+本章至此的所有稠密表示——点云、占据、TSDF、surfel、网格、GP/Hilbert——都遵循一条\emph{同向}的流水线：先从深度测量\emph{重建几何}，再（可选地）把几何\emph{渲染}成图给人看。\textbf{可微渲染（differentiable rendering）}把这条流水线\emph{倒过来}：先有一个带参数的 3D 表示，把它\emph{渲染}成 2D 图、与真实照片比，再让\emph{像素级误差的梯度回流}去更新 3D 参数（\cref{sec:dense-implicit} 末尾的神经隐式 SDF 就是它的先声）。（其\emph{根本动因}已在 \cref{sec:dense-implicit-hilbert} 末点明：让神经网络表示 3D 本需\emph{昂贵、难规模化}的 3D 真值监督，可微渲染改用\emph{易得的 2D 图像}监督、让像素梯度回流去雕 3D 表示，绕开对 3D 真值的依赖。）这一思路近年催生了两类高质量场景表示——\textbf{神经辐射场（NeRF）}\cite{mildenhall2020nerf} 与 \textbf{3D 高斯泼溅（3DGS）}\cite{kerbl2023gaussian}——并被引入 SLAM。本节按“可微渲染与 NeRF $\to$ 3DGS $\to$ 用于 SLAM”三段展开，落点仍是\emph{一种稠密地图表示}：它们与本章 \cref{sec:dense-tsdf,sec:dense-surfel} 的隐式曲面/面元同源，是“经典稠密表示”到“可微渲染地图”的自然演进，而非另起的新主题。
+
+\begin{note}
+\textbf{本节记号（局部声明，避让全章约定）.}\;本节文献与符号都较密，先把易撞的几个钉死：
+\begin{itemize}
+  \item \emph{体密度} $\sigma$、\emph{不透明度} $\alpha_i$、\emph{透射率} $T_i$——本节的 $\sigma$ 指体渲染的\emph{体密度}（非深度滤波的标准差 $\sigma$，那是 \cref{sec:dense-depth-filter} 的事）；$\alpha_i$ 指\emph{不透明度}（非 \cref{sec:dense-triangulate-uncertainty} 极平面三角形的角 $\alpha$）。两者都只在本节出现，按此理解。
+  \item \emph{视向} $\mathbf{d}_{\mathrm{view}}$——相机射线的单位方向。\emph{特意不写裸 $d$ 或 $(\theta,\phi)$}，以免与本章“深度 $d$”及李代数 $\boldsymbol{\xi}=[\boldsymbol{\rho};\boldsymbol{\phi}]$ 的分量混淆。
+  \item \emph{高斯协方差} $\boldsymbol{\Sigma}$、\emph{朝向} $\mathbf{R}\in\SO(3)$、\emph{缩放} $\mathbf{S}$——$\boldsymbol{\Sigma}$ 在此是一个 3D 高斯基元的\emph{几何协方差}（描述椭球形状），\emph{不是}观测噪声协方差；$\mathbf{R}$ 仍是旋转（与全书一致，描述该高斯的朝向），故无须改名。投影用的视变换矩阵记 $\mathbf{V}_{cw}$（\emph{不沿用源文献的 $\mathbf{W}$}，因 $W$ 已是本章 TSDF 的累积权重）。
+\end{itemize}
+\end{note}
+
+\subsection{可微渲染与神经辐射场（NeRF）}
+\label{sec:dense-radiance-nerf}
+
+\paragraph{两种渲染、两种几何。}
+图形流水线里 3D 模型有两种存法，对应两种渲染\cite{mildenhall2020nerf,kerbl2023gaussian}：\emph{表面数据}（显式多边形或隐式曲面）用\textbf{光栅化（rasterization）}渲染——把表面投到 2D 平面，吃硬件加速、快；\emph{体数据}（连续的密度/颜色场）用\textbf{光线行进（ray marching）}渲染——沿每条射线采样并合成，更通用但更费。可微渲染的关键转折在于：体渲染\emph{在尚未定出确切表面位置时}就能对整个 3D 空间给出梯度，因此特别利于基于梯度的优化，成了可微渲染的主力骨架。
+
+\paragraph{NeRF 的体渲染。}
+NeRF 把整个场景表示成一个 MLP
+\begin{equation}
+  f_{\Theta}(\mathbf{x},\mathbf{d}_{\mathrm{view}})\to(\mathbf{c},\sigma),
+  \label{eq:dense-nerf-mlp}
+\end{equation}
+输入空间点 $\mathbf{x}$ 与视向 $\mathbf{d}_{\mathrm{view}}$，输出该点的颜色 $\mathbf{c}=(r,g,b)$ 与体密度 $\sigma$（权重 $\Theta$）。要渲染某像素，沿其相机射线 $\mathbf{r}(t)=\mathbf{o}+t\,\mathbf{d}_{\mathrm{view}}$ 采样、查 MLP、做体渲染合成。射线的期望颜色是
+\begin{equation}
+  C(\mathbf{r})=\int_{t_n}^{t_f}T(t)\,\sigma\!\bigl(\mathbf{r}(t)\bigr)\,\mathbf{c}\!\bigl(\mathbf{r}(t),\mathbf{d}_{\mathrm{view}}\bigr)\,\mathrm{d}t,
+  \qquad
+  T(t)=\exp\!\Bigl(-\!\int_{t_n}^{t}\sigma\!\bigl(\mathbf{r}(s)\bigr)\,\mathrm{d}s\Bigr),
+  \label{eq:dense-nerf-integral}
+\end{equation}
+其中\emph{透射率} $T(t)$ 是“光走到 $t$ 处还没被挡住”的概率（沿途密度的累积衰减），$[t_n,t_f]$ 是近/远界。把射线分成 $N$ 个小段做求积离散，即得实际计算式
+\begin{equation}
+  \hat{C}(\mathbf{r})=\sum_{i=1}^{N}T_i\,\alpha_i\,\mathbf{c}_i,
+  \qquad
+  \alpha_i=1-\exp(-\sigma_i\delta_i),
+  \qquad
+  T_i=\exp\!\Bigl(-\!\sum_{j=1}^{i-1}\sigma_j\delta_j\Bigr)=\prod_{j=1}^{i-1}(1-\alpha_j),
+  \label{eq:dense-nerf-quad}
+\end{equation}
+$\delta_i$ 是相邻采样的间距，$\alpha_i$ 是第 $i$ 段由密度换算的\emph{不透明度}，$T_i$ 是其前所有段的透射率累乘——这就是从后往前的 \textbf{alpha 合成}。
+
+\begin{insight}
+\textbf{alpha 合成与 OctoMap 的对数几率同根。}\cref{eq:dense-nerf-quad} 的 $T_i=\prod_j(1-\alpha_j)$ 说“一束光要照到第 $i$ 个采样，得先\emph{穿过}前面每一段没被吸收”——把“占据”读成“吸收概率”，这正是 \cref{sec:dense-octomap} 逆传感器模型里“沿射线穿过即标自由、端点反射即标占据”的连续渲染版。NeRF 不过把那条“占据 vs 自由”的离散射线，换成了一条带连续密度 $\sigma$ 的射线，并要求整条积分\emph{可微}，好让像素误差的梯度回流到 $\Theta$。
+\end{insight}
+
+\paragraph{光度损失与加速。}
+训练就是最小化渲染图与真值图的光度误差
+\begin{equation}
+  \mathcal{L}=\sum_{\mathbf{r}\in\mathcal{R}}\bigl\|\hat{C}(\mathbf{r})-C_{\mathrm{gt}}(\mathbf{r})\bigr\|_2^2,
+  \label{eq:dense-nerf-loss}
+\end{equation}
+$\mathcal{R}$ 为一批射线。输入 $\mathbf{x}$ 先经\emph{位置编码}升频，以让 MLP 捕捉高频细节。原版 NeRF 的痛点是\emph{训练慢}（纯 MLP，每次查值要全网络前向）。后续工作把\emph{显式数据结构}塞进来加速：体素特征格（Plenoxel、DirectVoxGo）把辐射场编进可训练体素、查值只需索引 $+$ 三线性插值，把训练从数天压到约十分钟；Instant-NGP\cite{mueller2022instantngp} 用\emph{多分辨率哈希编码} $+$ 高度优化的 CUDA，把训练压到数秒。这些工作还点明了一个事实：高质量新视角合成的关键在\emph{可微体渲染本身}，未必非要 MLP——但逐像素 ray marching 仍是速度瓶颈，这正是下一小节 3DGS 要解决的。
+
+\paragraph{推广为神经场。}
+把 NeRF 的输出从“颜色 $+$ 密度”换成别的量，就得到更一般的\textbf{神经场（Neural Fields）}。最关乎本章的是\emph{表面}方向的推广：NeuS\cite{wang2021neus}、VolSDF 用神经网络表示\emph{符号距离场}、UNISURF 用\emph{占据场}——它们把 \cref{sec:dense-implicit} 的隐式曲面\emph{神经化}，既能体渲染训练、又能用 Marching Cubes（\cref{eq:dense-mc-interp}）提出几何精确的网格。换言之，NeRF 这条线最终与本书的隐式曲面/TSDF 叙事\emph{合流}：同是“零交叉即表面”，只是把手工的距离场换成了可微渲染学出来的场。\emph{语义}是另一支推广：给 MLP 添一个语义头，NeRF 便能输出\emph{多视一致}的语义标签 / 特征（Semantic-NeRF 一脉），再融合 CLIP / DINO 等基础模型特征，即可做开放词表分解与语言 / 点击式场景编辑。这条“神经场 $+$ 基础模型特征”的线属\emph{开放世界语义建图}的范畴，本书在 \cref{ch:openworld} 专门展开，本节只标指针、不重复。
+
+\subsection{3D 高斯泼溅（3DGS）}
+\label{sec:dense-radiance-gs}
+
+\paragraph{把面元换成可微的高斯椭球。}
+3DGS\cite{kerbl2023gaussian} 与 NeRF 目标相同（拟合辐射场、合成新视角），路线却不同：它\emph{不}沿射线行进，而像传统图形那样\emph{遍历图元}做\textbf{可微光栅化}，借此利用 3D 场景的\emph{天然稀疏性}，在保真度相当的前提下渲染快得多。它的图元是大量\emph{半透明三维高斯}——可以直接看作 \cref{sec:dense-surfel} 面元的“可微升级”：把那个带朝向的小圆盘换成一个带不透明度的高斯椭球。每个高斯由\emph{均值} $\boldsymbol{\mu}\in\mathbb{R}^3$、\emph{协方差} $\boldsymbol{\Sigma}\in\mathbb{R}^{3\times3}$、\emph{不透明度} $o$、以及用球谐（SH）表示的\emph{视向相关颜色} $\mathbf{c}$ 描述。为保证 $\boldsymbol{\Sigma}$ 在优化中始终半正定，把它\emph{因子化}成缩放 $\mathbf{S}$ 与朝向 $\mathbf{R}\in\SO(3)$：
+\begin{equation}
+  \boldsymbol{\Sigma}=\mathbf{R}\,\mathbf{S}\,\mathbf{S}^\top\mathbf{R}^\top.
+  \label{eq:dense-gs-cov}
+\end{equation}
+
+\paragraph{投影、合成与优化。}
+渲染时把每个 3D 高斯投到像平面：在视变换 $\mathbf{V}_{cw}$ 与投影的雅可比 $\mathbf{J}$ 作用下，2D 协方差为
+\begin{equation}
+  \boldsymbol{\Sigma}'=\mathbf{J}\,\mathbf{V}_{cw}\,\boldsymbol{\Sigma}\,\mathbf{V}_{cw}^\top\mathbf{J}^\top,
+  \label{eq:dense-gs-proj}
+\end{equation}
+取其左上 $2\times2$ 块作像平面上的 2D 高斯 $G_{2D}$。像素 $\mathbf{x}_{2D}$ 的颜色由\emph{深度排序后}的 alpha 合成给出（与 \cref{eq:dense-nerf-quad} 同一套合成律）：
+\begin{equation}
+  C=\sum_{i\in\mathcal{N}}\mathbf{c}_i\,\alpha_i\prod_{j=1}^{i-1}(1-\alpha_j),
+  \qquad
+  \alpha_i=o_i\,G_{2D}(\mathbf{x}_{2D}),
+  \label{eq:dense-gs-blend}
+\end{equation}
+$\mathcal{N}$ 为落在该像素射线上的高斯集合。优化最小化渲染图与真值图的 $L_1$ 与结构相似度（SSIM）混合损失 $\mathcal{L}=(1-\lambda)\mathcal{L}_1+\lambda\,\mathcal{L}_{\mathrm{SSIM}}$，并\emph{自适应稠密化/剪枝}（按梯度与不透明度动态增删高斯个数）。工程上靠\emph{分块（$16\times16$ tile）排序、GPU 基数排序、视锥剔除（frustum culling）}做到实时。
+
+\begin{insight}
+\textbf{“遍历图元”为何比“沿射线行进”快。}NeRF 对\emph{每个像素}都要沿射线采几十上百个点、各查一次 MLP，空区也照采不误；3DGS 反过来\emph{遍历高斯}、各自泼到它覆盖的像素上，\emph{天然跳过空白}。这正是 \cref{sec:dense-surfel} 面元“只在表面分配元素”那条省内存思路在\emph{渲染}维度的翻版——稀疏性既省内存又省渲染。代价是 3DGS 默认不保证几何精度（高斯只为好看而摆），故有 SuGaR/2D 高斯泼溅一类\emph{加表面正则}的变体，把高斯压扁、加法线与深度一致性损失，才提得出准网格。
+\end{insight}
+
+\paragraph{本节是速写，原理深讲在专章。}上面只把 3DGS \emph{作为一种地图表示}速写到“够用”——\cref{eq:dense-gs-cov,eq:dense-gs-proj,eq:dense-gs-blend} 给了结论却未展开来历。其\emph{原理级}全貌——高斯 PDF 从一维推到 $\boldsymbol{\Sigma}=\mathbf{A}\mathbf{A}^\top$、EWA 投影雅可比、tile 光栅化与“累积 $\alpha$ 反推”的反向传播、自适应密度控制（克隆 / 分裂 / 剪枝）、以及逐行源码落点——留待 P5 的专章 \cref{ch:3dgs} 循序渐进展开。本书凡涉及 3DGS \emph{机理}处，均以 \cref{ch:3dgs} 为准。
+
+\subsection{用于 SLAM}
+\label{sec:dense-radiance-slam}
+
+\paragraph{为何把它搬进 SLAM。}
+可微渲染地图本为\emph{已知位姿}的离线新视角合成而生；SLAM 要\emph{在线联合}估位姿与地图。把它搬进来有三点吸引力\cite{matsuki2024monogs}：其一，\emph{端到端可微}的渲染损失\emph{省去了手工融合步骤}——对比 \cref{sec:dense-tsdf} 的 TSDF-SLAM 要靠人设计的加权平均把多帧拼一致，这里 2D-到-3D 的融合直接由梯度完成；其二，能更灵活地建模复杂光场（透明、反射）；其三，视数据结构而定，还能\emph{补洞与压缩}（借表示自带的先验）。
+
+\paragraph{NeRF/神经场 SLAM。}
+iMAP\cite{sucar2021imap} 是首作——纯 MLP 地图，靠 MLP 的\emph{平滑先验}天然\emph{补洞与压缩}。\textbf{深度也能渲、也能监督}：与颜色 \cref{eq:dense-nerf-quad} 同理，对不透明度做 $\alpha$ 合成即得射线的\emph{期望深度} $\hat D(\mathbf{r})=\sum_i T_i\,\alpha_i\,t_i$（$t_i$ 为第 $i$ 个采样沿射线的深度），令它逼近传感器深度便构成一条\emph{深度损失}——这正是 RGB-D 神经场 SLAM（iMAP、NICE-SLAM 皆吃 RGB-D 流）赖以\emph{定尺度、稳跟踪}的核心几何监督；单靠光度 \cref{eq:dense-nerf-loss}，尺度与位姿都约束不住。随后经典与神经表示融合：NICE-SLAM\cite{zhu2022niceslam} 首次用\emph{多分辨率体素特征格 $+$ 小 MLP}的混合表示，NeRF-SLAM\cite{rosinol2023nerfslam} 借 DROID-SLAM 的深度加速重建。\emph{点式}图元也已用进 SLAM：\textbf{Point-NeRF} 一脉用\emph{带可训练特征的点云 $+$ 一个极小 MLP 解码器}建辐射场、仍走体渲染合成，因点能\emph{按需摆放、跳过空白区}，较规则体素格提速约 $3\times$（面元 surfel 亦可承载辐射场）——它正好给 \cref{tab:dense-neuralfield} 的\emph{点/面元}一列补上具名代表，与 MLP（iMAP）、体素/哈希（NICE-SLAM）凑齐三类数据结构。这里有一组关键\emph{取舍}（对地图表示的选择影响最大）：
+
+\begin{table}[H]\centering\small
+\caption{神经场 SLAM 的底层数据结构取舍\cite{sucar2021imap,zhu2022niceslam}}
+\label{tab:dense-neuralfield}
+\begin{tabular}{p{0.26\textwidth} p{0.18\textwidth} p{0.18\textwidth} p{0.20\textwidth}}
+\toprule
+性质 & MLP & 体素/哈希格 & 点/面元 \\
+\midrule
+压缩 & 好 & 中 & 中 \\
+推理速度 & 受限 & 好 & 中 \\
+补洞（场景补全） & 好 & 好 & 中 \\
+动态分配（回环重排） & 受限 & 受限 & 好 \\
+遗忘问题 & 受限 & 中 & 中 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent{}两条值得记住的线索：（i）凡含\emph{全局函数}（纯 MLP 或带 MLP 的混合表示），\emph{局部更新会牵动全局}，故必须把历史信息留在优化窗口里、维护一个\emph{关键帧库}反复回放——这就是\textbf{遗忘问题（forgetting problem）}；削弱或去掉全局 MLP 可缓解。（ii）\emph{回环}时位姿一改，体素/MLP 因边界与编码固定而难重排（要多张局部子图拼接），而\emph{点式}表示因图元离散、可较\emph{无缝}地重新分配——这也是 3DGS 的优势所在。
+
+\begin{insight}[表 \cref{tab:dense-neuralfield} 两格数字背后的机理]
+\textbf{压缩 vs 推理速度}（前两行）：纯 MLP 把整张辐射场\emph{揉进网络权重}，压缩极好，但权重无物理意义、难解释，且查任一点都要跑整张网；\emph{显式}体素 / 哈希格反过来——可解释、能\emph{局部}更新、访存快，代价是吃内存。这是一对典型的\emph{时间--空间复杂度}权衡。而 SLAM \emph{实时性至上}，故工程上往往\emph{偏显式}结构——这也预告了为何 3DGS（\cref{sec:dense-radiance-gs}）这类\emph{纯显式}表示后来居上。\textbf{为何补得了洞}（“场景补全”行）：MLP 与多分辨率格能\emph{补洞}，根因在位置编码 / 多分辨率格只在其\emph{频带 / 格分辨率内}对信号做平滑——未观测的小空洞被邻域的连续函数“顺”过去；\emph{点 / 面元}表示图元离散、无这种全局平滑，故补洞只算“中”。一句话：\emph{补洞能力来自表示自带的平滑先验，而非凭空生成几何}。
+\end{insight}
+
+\paragraph{3DGS SLAM。}
+3DGS 用作 SLAM 地图，除了上述\emph{快渲染}与\emph{离散可重排}两大优势，落地分几路：最直接的是\emph{RGB-D}——用 ToF 深度初始化并正则化高斯位置，跟踪精度与渲染质量都好；要\emph{纯单目}，MonoGS\cite{matsuki2024monogs} 证明仅靠彩色图也可行——随机初始化高斯、靠\emph{多视优化}逐步定位。回环上，LoopSplat\cite{zhu2024loopsplat} 把离散高斯当作可在不同时刻/视角间\emph{配准}的鲁棒特征。融合既有点云方法是另一条务实路线：3DGS 略去附加属性后\emph{本就是点云}，于是 Photo-SLAM 把 ORB-SLAM 的稀疏跟踪与 3DGS 拼接、GS-ICP 与 RTG-SLAM 用 ICP 跟踪（RTG-SLAM 还接 ORB 关键点后端），LiDAR$+$3DGS 也已出现——可见 3DGS 能跨多种传感器作\emph{统一地图表示}。
+
+\begin{pitfall}[思维陷阱：以为可微渲染地图已能取代经典稠密 SLAM]
+NeRF/3DGS 渲染漂亮，但用作\emph{在线} SLAM 仍有硬伤\cite{matsuki2024monogs}：（1）\textbf{实时性}——多数方法即便在 RTX 4090 上也难超 5\,fps，而经典 ElasticFusion 早在 2015 年的 GTX 780Ti 上就能实时跟踪 $+$ 建图 $+$ 渲染；（2）\textbf{跟踪精度}——依赖多帧光度一致，在合成数据上漂亮，真实世界一遇传感器噪声、卷帘快门就退化，常\emph{落后于经典稀疏法}；（3）多数仍假设\emph{静态}场景、局限于\emph{房间级}，4D/室外仍是难点。一条新方向是\emph{前馈预测}高斯——PixelSplat/MVSplat 由带位姿图像一次前向出高斯（免测试时优化），No-PoSplat\cite{charatan2024pixelsplat} 进一步做到\emph{免位姿}预测，但用于增量 SLAM 仍待探索。结论：当前它\emph{重在重建/渲染}，在线避障/精定位仍以经典法为骨架，二者互补而非替代。
+\end{pitfall}
+
+\paragraph{小结：一条单一的演进线。}
+回到 \cref{tab:dense-quadrant}：NeRF 把隐式表面/体积\emph{神经化、可微化}（SDF 场仍可 MC 提网格，接回 \cref{sec:dense-mesh}），3DGS 把显式表面的面元\emph{升级成可微高斯}（略去属性即退回点云，接回 \cref{sec:dense-rgbd-pc}）。它们没有跳出本章的四象限，而是给每个象限装上了“可微渲染”的引擎——这正是“经典稠密表示 $\to$ 可微渲染地图”的单一自然演进，也是稠密建图当前最活跃的前沿。
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+相机能直接测距离 & 相机只测角度（bearing-only），距离需三角化/视差/RGB-D \\
+单目深度三角化一次即可 & 需多帧序贯滤波收敛（\cref{alg:dense-gauss-filter}）\\
+纹理够多就一定匹配准 & 还要梯度\emph{平行于}极线；垂直极线时匹配无效 \\
+深度 $=$ 像素 $z$ 值 & 此处深度是沿射线长度 range（\cref{ins:dense-depth-vs-z}）\\
+正深度高斯总是合适 & 远处不对称、易数值困难，应用逆深度 $\rho_{\mathrm{inv}}$ \\
+点云可直接导航避障 & 点云无占据/自由语义，需转 OctoMap/TSDF \\
+log-odds 只是“好看” & 把贝叶斯乘法变加法、单 float 存储、避免越界（\cref{eq:dense-octo-logodds}）\\
+TSDF 内存够用 & 随体积立方增长，大场景需体素哈希/VDB（\cref{sec:dense-tsdf}）\\
+TSDF 值就是欧氏距离 & 投影式 SDF 高估欧氏距离；规划要 ESDF 的真距离与梯度（\cref{sec:dense-implicit-surface}）\\
+栅格地图格子彼此独立 & GP/Hilbert 地图建模空间相关、可外推未观测、给不确定度（\cref{sec:dense-implicit-gp}）\\
+ElasticFusion 靠位姿图回环 & 无位姿图，直接非刚性形变面元地图 \\
+NeRF/3DGS 已可取代经典稠密 SLAM & 实时性 $<5$\,fps、跟踪精度尚落后，重在重建/渲染（\cref{sec:dense-radiance-slam}）\\
+3DGS 与 NeRF 都靠 ray marching & 3DGS 用可微\emph{光栅化}遍历高斯，故快（\cref{eq:dense-gs-blend}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\mathbf{A},\mathbf{B}$ & 参考/候选图像块 & \cref{eq:dense-sad} \\
+$\mathbf{f},\mathbf{f}_{\mathrm{ref}},\mathbf{f}_2$ & 单位视线方向 & \cref{eq:dense-tri-eq} \\
+$d,\ \mu,\sigma^2$ & 深度（沿射线长度）及其高斯参数 & \cref{eq:dense-prior} \\
+$\tau^2,\sigma_{\mathrm{obs}}^2$ & 单次观测的几何不确定度 & \cref{eq:dense-unc-sigma} \\
+$\alpha,\beta,\beta',\gamma$ & 极平面三角形的角 & \cref{eq:dense-unc-angles} \\
+$\rho_{\mathrm{inv}}=1/d$ & 逆深度 & \cref{sec:dense-mono-pitfalls} \\
+$\pi_{\mathrm{in}},\ a,b$ & 内点率及其 Beta 计数 & \cref{eq:dense-mix} \\
+$d_{\mathrm{disp}}$ & 双目视差 & \cref{sec:dense-sgm} \\
+$p,\ \ell=\operatorname{logit}(p)$ & 占据概率/对数几率 & \cref{eq:dense-octo-logit} \\
+$\ell_{\mathrm{occ}},\ell_{\mathrm{free}},\ell_{\min/\max}$ & 占据/自由更新量、clamping 界 & \cref{eq:dense-octo-sensor,eq:dense-octo-clamp} \\
+$F,W,\ \mu_{\mathrm{tr}},\Psi$ & TSDF 值/权重、截断距离、截断算子 & \cref{eq:dense-tsdf-trunc} \\
+$\chi,\vec{V}$ & 指示函数、定向法向场 & \cref{eq:dense-poisson} \\
+$\Phi(\mathbf{x})$ & 隐式曲面标量函数（零交叉即表面） & \cref{eq:dense-implicit-def} \\
+$\mathcal{K},\mathbf{G},\sigma_n^2$ & GP 核、Gram 矩阵、观测噪声方差 & \cref{eq:dense-gp-mean} \\
+$\boldsymbol{\Phi}(\mathbf{x}),\mathbf{w}$ & Hilbert 地图特征映射、逻辑回归权 & \cref{sec:dense-implicit-hilbert} \\
+$\sigma,\ \alpha_i,\ T_i$ & 体密度、不透明度、透射率（本节限定义） & \cref{eq:dense-nerf-quad} \\
+$\mathbf{d}_{\mathrm{view}}$ & 相机射线单位视向（避让深度 $d$） & \cref{eq:dense-nerf-mlp} \\
+$\boldsymbol{\mu},\boldsymbol{\Sigma},\mathbf{S},o$ & 3D 高斯均值/协方差/缩放/不透明度 & \cref{eq:dense-gs-cov} \\
+$\mathbf{V}_{cw},\mathbf{J},\boldsymbol{\Sigma}'$ & 视变换、投影雅可比、投影 2D 协方差 & \cref{eq:dense-gs-proj} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{定理 / 公式速查表}
+\begin{tabular}{lll}
+\toprule
+公式 & 一句话说明 & 对应 \\
+\midrule
+ZNCC \cref{eq:dense-zncc} & 去均值归一化块匹配，抗线性光照变化 & \cref{sec:dense-epipolar} \\
+深度不确定度 \cref{eq:dense-unc-pprime} & 一像素误差经正弦定理放大成深度方差 & \cref{sec:dense-triangulate-uncertainty} \\
+高斯融合 \cref{eq:dense-fuse} & 信息相加、按精度加权（一维卡尔曼）& \cref{sec:dense-depth-filter} \\
+混合滤波 \cref{eq:dense-mix} & 高斯内点 $+$ 均匀外点，Beta 学内点率 & \cref{sec:dense-bayes-filter} \\
+log-odds 更新 \cref{eq:dense-octo-logodds} & 贝叶斯乘法变加法 & \cref{sec:dense-octomap} \\
+clamping \cref{eq:dense-octo-clamp} & 置信封顶，快速适应动态 & \cref{sec:dense-octomap} \\
+TSDF 融合 \cref{eq:dense-tsdf-fuse} & 加权运行平均去噪 & \cref{sec:dense-tsdf} \\
+MC 边插值 \cref{eq:dense-mc-interp} & 标量场零交叉的线性插值 & \cref{sec:dense-mesh} \\
+泊松方程 \cref{eq:dense-poisson} & 定向点云 $\to$ 隐式场 $\to$ 网格 & \cref{sec:dense-mesh} \\
+隐式曲面 \cref{eq:dense-implicit-def} & 标量函数零交叉定义表面、符号判内外 & \cref{sec:dense-implicit-surface} \\
+GP 预测 \cref{eq:dense-gp-mean,eq:dense-gp-cov} & 连续地图量 $+$ 逐点不确定度（非参回归） & \cref{sec:dense-implicit-gp} \\
+NeRF 体渲染 \cref{eq:dense-nerf-quad} & 沿射线 alpha 合成；$\alpha_i=1-e^{-\sigma_i\delta_i}$ & \cref{sec:dense-radiance-nerf} \\
+3DGS 协方差 \cref{eq:dense-gs-cov} & $\boldsymbol{\Sigma}=\mathbf{R}\mathbf{S}\mathbf{S}^\top\mathbf{R}^\top$，保半正定 & \cref{sec:dense-radiance-gs} \\
+3DGS 合成 \cref{eq:dense-gs-blend} & 投影 $+$ 深度排序 $+$ 光栅化 alpha 合成 & \cref{sec:dense-radiance-gs} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 地图用途与分类 & 度量/拓扑/语义、稀疏/稠密；显式/隐式 $\times$ 表面/体积四象限 & $\bigstar\bigstar$ \\
+2 & 极线搜索 + 块匹配 & 搜索降为一维；SAD/SSD/NCC/ZNCC & $\bigstar\bigstar$ \\
+3 & 深度不确定度 & 一像素误差经正弦定理放大；需基线 & $\bigstar\bigstar\bigstar$ \\
+4 & 高斯深度滤波 & 两高斯归一化积，信息相加 & $\bigstar\bigstar\bigstar$ \\
+5 & 混合滤波/逆深度 & 内点率 Beta、矩匹配；逆深度更稳 & $\bigstar\bigstar\bigstar\bigstar$ \\
+6 & OctoMap log-odds & 二值贝叶斯、加性更新、clamping & $\bigstar\bigstar\bigstar$ \\
+7 & TSDF/KinectFusion & 投影 SDF、加权平均、frame-to-model & $\bigstar\bigstar\bigstar\bigstar$ \\
+8 & surfel/网格重建 & 无位姿图形变；MC/泊松 & $\bigstar\bigstar\bigstar$ \\
+9 & ESDF 与数据结构 & 欧氏 vs 投影 SDF；哈希/体素块/VDB、整合器 & $\bigstar\bigstar\bigstar$ \\
+10 & 连续函数地图 & GP/GPIS/Hilbert：连续、概率、可外推 & $\bigstar\bigstar\bigstar\bigstar$ \\
+11 & NeRF 体渲染 & 可微体渲染、alpha 合成、光度损失 & $\bigstar\bigstar\bigstar\bigstar$ \\
+12 & 3DGS 与渲染 SLAM & 可微光栅化、高斯椭球；iMAP/MonoGS 与局限 & $\bigstar\bigstar\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{几何直觉与代码}：视觉 SLAM 十四讲\cite{gaoxiang2019slam14} 第 12 讲——单目稠密重建、点云/八叉树/TSDF 的完整实践（本章代码主源）。
+  \item \textbf{现代综述与选型}：SLAM Handbook\cite{carlone2026handbook} 第 5 章 Dense Map Representations——本章四象限、ESDF、连续函数表示、数据结构与选型准则的总源（正文已就地展开，此处为查证与延伸）。
+  \item \textbf{单目深度滤波}：Vogiatzis--Hernández\cite{vogiatzis2011video}（高斯×Beta 混合滤波器原型）、REMODE\cite{pizzoli2014remode}（概率单目稠密 $+$ TV 正则）、SVO\cite{forster2017svo}（逆深度深度滤波器）。
+  \item \textbf{占据与体积融合}：OctoMap\cite{hornung2013octomap}（八叉树占据 $+$ log-odds $+$ clamping）、Curless--Levoy\cite{curless1996volumetric} 与 KinectFusion\cite{newcombe2011kinectfusion}（TSDF 加权融合）、ElasticFusion\cite{whelan2015elasticfusion} 与 Keller\cite{keller2013pointfusion}（面元）；ESDF 与数据结构 voxblox\cite{oleynikova2017voxblox}、FIESTA\cite{han2019fiesta}、体素哈希\cite{niessner2013voxelhashing}、VDB\cite{museth2013vdb}、wavemap\cite{reijgwart2023wavemap}。
+  \item \textbf{连续函数地图}：高斯过程\cite{rasmussen2006gp}、GPOM\cite{omeadhra2019gpom}、GPIS\cite{williams2007gpis}、Hilbert 地图\cite{ramos2016hilbert}。
+  \item \textbf{网格化}：Marching Cubes\cite{lorensen1987marchingcubes}、泊松重建\cite{kazhdan2006poisson}；双目立体匹配 SGM\cite{hirschmuller2008sgm}。
+  \item \textbf{可微渲染地图}：SLAM Handbook\cite{carlone2026handbook} 第 14 章；NeRF\cite{mildenhall2020nerf}、Instant-NGP\cite{mueller2022instantngp}、NeuS\cite{wang2021neus}、DeepSDF\cite{park2019deepsdf}；3DGS\cite{kerbl2023gaussian}；神经场/3DGS SLAM：iMAP\cite{sucar2021imap}、NICE-SLAM\cite{zhu2022niceslam}、NeRF-SLAM\cite{rosinol2023nerfslam}、MonoGS\cite{matsuki2024monogs}、LoopSplat\cite{zhu2024loopsplat}、前馈预测\cite{charatan2024pixelsplat}。
+\end{itemize}
+
+\section*{本章与前后章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+相邻章节 & 关系 & 衔接点 \\
+\midrule
+\cref{ch:camera} 相机模型 & 提供针孔/双目/RGB-D 成像与反投影 & \cref{eq:dense-rgbd-backproj} \\
+\cref{ch:vo} 视觉里程计 & 提供对极几何与三角化、相机轨迹 & \cref{eq:dense-tri-linear} \\
+\cref{ch:pointcloud} 点云处理 & 提供 SOR/体素滤波、ICP & 点云地图、TSDF 跟踪 \\
+\cref{ch:lie} 李群 & 位姿增量的指数映射更新 & ElasticFusion 跟踪 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：单目深度图大片空洞/乱码。\textbf{原因}：无纹理或梯度垂直极线（\cref{sec:dense-mono-pitfalls}）。\textbf{对策}：改半稠密（只估高梯度像素）、加仿射 warp、用混合滤波显式弃外点。
+  \item \textbf{症状}：深度始终不收敛、方差不降。\textbf{排查}：基线太小（纯旋转）使 $\tau^2\to\infty$（\cref{eq:dense-unc-pprime}）；确认相机有平移、确认位姿方向 $\mathbf{T}_{C,R}$ 取对。
+  \item \textbf{症状}：远处深度数值不稳/溢出。\textbf{对策}：改用逆深度 $\rho_{\mathrm{inv}}=1/d$ 建高斯（\cref{sec:dense-mono-pitfalls}）。
+  \item \textbf{症状}：OctoMap 动态物体留拖影。\textbf{原因}：clamping 界设太宽、置信无界。\textbf{对策}：收紧 $\ell_{\min}/\ell_{\max}$（\cref{eq:dense-octo-clamp}），保证沿射线“标自由”生效（传入相机原点）。
+  \item \textbf{症状}：TSDF 表面有鬼影/薄物体消失。\textbf{原因}：位姿漂移、或薄物两侧观测的正负距离相消。\textbf{对策}：frame-to-model 跟踪、增大分辨率、缩小截断带 $\mu_{\mathrm{tr}}$；大场景改体素哈希以容更高分辨率。
+  \item \textbf{症状}：泊松重建网格过度膨胀/平滑。\textbf{原因}：法线方向不一致或原版偏光滑。\textbf{对策}：先统一法线朝向，改用 Screened Poisson 加点位插值约束。
+  \item \textbf{症状}：用 TSDF 做规划，轨迹被推离障碍的方向不对/碰撞检测不准。\textbf{原因}：投影式 SDF 高估欧氏距离、梯度方向歪（\cref{sec:dense-implicit-surface}）。\textbf{对策}：从 TSDF 增量建 ESDF（voxblox brushfire）或从占据图建 ESDF（FIESTA），用真欧氏距离场的梯度。
+  \item \textbf{症状}：NeRF/3DGS SLAM 跑不到实时、或跟踪漂移大。\textbf{原因}：逐像素 ray marching/高斯过多导致 $<5$\,fps；纯光度跟踪遇真实噪声/卷帘退化（\cref{sec:dense-radiance-slam}）。\textbf{对策}：用显式数据结构（哈希格/3DGS）加速、减少高斯数；跟踪以经典稀疏法（ORB/ICP）为骨架、3DGS 仅作稠密渲染（Photo-SLAM/RTG-SLAM 路线）。
+\end{enumerate}

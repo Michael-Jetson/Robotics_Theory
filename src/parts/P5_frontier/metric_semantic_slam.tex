@@ -1,0 +1,765 @@
+\chapter{度量-语义 SLAM}
+\label{ch:semantic}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「学习时代的 SLAM 与空间 AI」第三章（学习赋能 → 动态可变形 → 度量-语义 → 开放世界）。
+%  吸收 SLAM Handbook ch16《Metric-Semantic SLAM》(Asgharivaskasi, Doherty, Behley,
+%  Hughes, Chang, Leonard, Christensen, Carlone, Atanasov)：稀疏物体级（二次曲面/SDF）、
+%  离散-连续混合 MAP、多类贝叶斯 log-odds 体素、mesh+PGMO、分层 3D 场景图与 treewidth。
+%  最高准则：经典 SLAM 的「几何 → 语义」自然升维，读不出接缝。四块硬核都接回本书既有概念：
+%   - 物体级因子 = MAP 母方程 eq:intro-nls / thm:fg-map / tab:factors 的「路标→物体」推广；
+%   - 多类 log-odds = dense 章二值 log-odds eq:dense-octo-logodds 的多类推广（二值是 K=1 特例）；
+%   - 离散-连续 MAP 接 ch:nlopt 因子图/优化；3D 场景图接 sec:est-fg 的图论侧写。
+%  闭集 vs 开集：本章只讲闭集语义，开放词汇/开集递进交给 \cref{ch:openworld}，章末一句过渡。
+%  右扰动为主线；物体位姿 \mathbf{q} in SE(3)、相机 \mathbf{T}、尺度 lambda、形状码 \mathbf{s}^{sh}（避让 dense 章 \mathbf{f} 视线、s 尺度/视差）、
+%  语义类别 sigma、多类 log-odds \mathbf{h} in R^{K+1}、数据关联 \mathcal{D}、互信息 I(·;·)。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。它们勾勒了本章——把几何地图升维成\emph{语义}地图——要回答的核心疑问。若已能流畅作答，可只速读本章的框架图与速查表；若卡住，正是本章要为你打通的。
+\begin{enumerate}
+  \item 经典 SLAM 的路标是一个三维点 $\mathbf{y}_j\in\mathbb{R}^3$；现在我想把“路标”升级成“一把椅子、一辆车”。除了位置，这个物体路标还得带哪些量？它喂进后端的因子，会不会推翻 \cref{ch:nlopt} 的因子图框架？
+  \item 给定一帧 RGB 图像和它的物体检测框（bounding box），如何把“地图里那个三维物体投到像平面，应该长出怎样的框”写成一条残差，再交给 Gauss--Newton 去最小化？
+  \item \cref{ch:dense} 的占据栅格每个体素存一个标量——占据概率的对数几率（log-odds）。如果现在每个体素不止要回答“空不空”，还要回答“它是路面、还是车、还是植被”，那个标量该升级成什么？更新公式还能保持“乘法变加法”的优雅吗？
+  \item 语义类别（“椅子”“桌子”）是\emph{离散}的，物体的位姿与形状是\emph{连续}的。把它们\emph{一起}估计，目标函数会变成什么样的怪物？为什么说它比纯几何 SLAM“多了一维组合爆炸”？
+  \item 一个公寓里有上千个体素、几十个物体、几个房间、一层楼。把它们平铺成一张巨大的因子图去优化，慢得发指。若改成“体素 $\to$ 物体 $\to$ 房间 $\to$ 楼层”的\emph{分层}结构，凭什么能算得更快？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}度量-语义 SLAM 的统一立场——它\emph{不}另起炉灶，而是把经典 SLAM 的两端各升一维：稀疏端把\emph{点路标}推广为\emph{物体路标}（带类别/位姿/尺度/形状）、稠密端把\emph{二值占据}推广为\emph{多类占据}，二者仍喂同一条 MAP 母方程（\cref{eq:intro-nls}）；
+  \item \textbf{定义}物体路标 $\boldsymbol\ell=(\sigma,\mathbf{q},\lambda,\mathbf{s}^{\mathrm{sh}})$ 并写出四种形状表示（语义关键点、二次曲面/椭球、网格、隐式 SDF）各自的物体观测因子，理解它们都是重投影/几何残差的推广；
+  \item \textbf{推导}二次曲面物体因子：对偶二次曲面如何解析地投影成对偶圆锥、与检测框拟合的椭圆作差，并\emph{用本书右扰动}对相机位姿 $\mathbf{T}$ 与物体位姿 $\mathbf{q}$ 求导；
+  \item \textbf{建立}离散-连续混合 MAP（语义类别离散 $+$ 位姿/形状连续 $+$ 数据关联离散）的因子图分解，并掌握交替最小化（DC-SAM）、EM（软关联）、连续松弛三条求解策略；
+  \item \textbf{推导}多类贝叶斯体素建图：把本书二值 log-odds（\cref{eq:dense-octo-logodds}）推广为\emph{多类 log-odds 向量} $\mathbf{h}_{t,i}\in\mathbb{R}^{K+1}$ $+$ softmax，写出加性贝叶斯更新与分段常数观测模型，并把多类八叉树（OctoMap 的语义推广）讲清；
+  \item \textbf{讲清}网格语义与 PGMO（用嵌入形变图把回环形变化简为位姿图优化），理解它如何复用 \cref{ch:loop} 的 PGO；
+  \item \textbf{掌握}分层度量-语义地图与 3D 场景图：分层图定义、内存复杂度三级、treewidth 界与“小树宽 $\to$ 多项式时间推断”，以及场景图与因子图的联合优化；
+  \item \textbf{辨析}闭集语义的边界，理解为何开放词汇/开集（语言嵌入）要留到 \cref{ch:openworld}，并把本章看作“闭集 $\to$ 开集”递进的前一站。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是全书“几何 SLAM $\to$ 语义 SLAM”的一跃。它紧承 \cref{ch:dense}：那一章把地图分成度量/拓扑/度量-语义/混合四类（\cref{tab:dense-maptypes}），并说度量-语义 $=$ 几何 $+$“这是什么”；本章\emph{兑现}这句承诺——如何把语义\emph{织进}几何。我们沿“稀疏物体级 $\to$ 离散-连续求解 $\to$ 稠密语义 $\to$ 分层场景图”四级展开，恰好对应经典 SLAM 的“稀疏路标 $\to$ 后端优化 $\to$ 稠密建图 $\to$ 拓扑/混合地图”各自的语义升维。结构如下：
+
+\begin{center}
+\begin{forest} navtreeLR
+[{母方程\\$\min\sum\|\mathbf{e}_i\|^2_{\boldsymbol\Sigma_i^{-1}}$}
+  [{物体路标\\$\boldsymbol\ell=(\sigma,\mathbf{q},\lambda,\mathbf{s}^{\mathrm{sh}})$}
+    [{二次曲面因子\\对偶圆锥残差}
+      [{离散-连续 MAP\\DC-SAM·EM·松弛}
+        [{多类 log-odds\\$\mathbf{h}\in\mathbb{R}^{K+1}$}
+          [{多类八叉树\\$+$ PGMO 网格}] ]
+        [{3D 场景图\\分层 $+$ treewidth}
+          [{闭集 $\to$ 开集\\\cref{ch:openworld}}] ]
+      ] ] ]
+]
+\end{forest}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:semantic-frame}（统一立场，把语义框进母方程与 log-odds）是全章的“锚”，任何读者都应先读；\cref{sec:semantic-object}（稀疏物体级）含本章理论最完整的二次曲面物体因子推导，是稀疏端的语义升维；\cref{sec:semantic-hybrid}（离散-连续混合 MAP）解释“离散类别 $+$ 连续位姿”怎么联合优化，是后端的语义升维；\cref{sec:semantic-dense}（稠密语义与多类 log-odds）是\emph{教材最该补}的一节——本书二值占据的直接多类推广；\cref{sec:semantic-graph}（分层与 3D 场景图）把语义组织成可高效推断的层级。带（选读）标记的隐式 SDF 物体、mesh 可微渲染因子、permanent 软关联、treewidth 证明面向研究，可选深潜。
+
+\subsection*{前置知识桥接}
+本章把前几部的几何工具与“语义”视角缝在一起，请先激活以下前置：
+\begin{itemize}
+  \item \textbf{MAP 母方程与因子图}（\cref{eq:intro-nls}；\cref{thm:fg-map}、\cref{tab:factors}）：$\arg\min_{\mathbf{x}}\sum_i\|\mathbf{e}_i(\mathbf{x}_i)\|^2_{\boldsymbol\Sigma_i^{-1}}$ 是本章一切“物体因子”“语义因子”的接驳口——物体级 SLAM 只是把因子里的\emph{路标}从点换成物体，残差仍喂同一后端。
+  \item \textbf{重投影与 BA}（\cref{sec:vo-pnp-ba}、\cref{sec:nlopt-ba}）：本章的物体观测残差与重投影残差同构（都是“把三维结构按位姿投到像平面、比对观测”），只是观测从\emph{像素点}换成\emph{检测框/分割掩膜}。
+  \item \textbf{右扰动与流形求导}（\cref{ch:lie}、\cref{sec:nlopt-manifold}）：物体因子要对相机位姿 $\mathbf{T}$ 与物体位姿 $\mathbf{q}$ 求导，本章一律用右扰动 $\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol\xi)$、$\mathbf{q}\,\mathrm{Exp}(\delta\boldsymbol\phi)$，与全书一致。
+  \item \textbf{二值占据与 log-odds}（\cref{sec:dense-octomap}；\cref{eq:dense-octo-logit}、\cref{eq:dense-octo-logodds}、\cref{eq:dense-octo-clamp}）：\textbf{本章稠密一节的命脉前置}。多类语义建图是那条二值更新式的\emph{逐字推广}——本章会把它升成 $K{+}1$ 维向量、用 softmax 取代 sigmoid，并复用 clamping 与八叉树剪枝。
+  \item \textbf{回环与位姿图优化}（\cref{ch:loop}；\cref{sec:lidar-pgo}）：网格语义的 PGMO 把“回环触发的稠密形变”化简为一个 PGO；语义辅助回环与本书的词袋/ScanContext 交叉引用。
+  \item \textbf{变量消元 $=$ 稀疏分解}（\cref{sec:est-elimination}、\cref{thm:elimination}）：3D 场景图的“小树宽 $\to$ 多项式时间推断”是那条图论结论在分层语义图上的回响。
+  \item \textbf{学习赋能 SLAM}（\cref{ch:learning}）：本章的语义前端（检测/分割网络）正是那一章“网络出观测”的实例——网络负责从像素里榨出类别与掩膜，几何后端负责把它们一致地融成地图。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会以为“语义 SLAM”是与经典 SLAM\emph{无关}的另一套东西，从而既看不出物体因子其实仍在解 \cref{eq:intro-nls}，也看不出多类语义建图不过是 \cref{eq:dense-octo-logodds} 的多类版；
+  \item 在 \cref{ch:openworld}（开放世界）你会反复遇到“地图元素 $=$ 几何 $+$ 语义特征”“range-feature 观测”“分层场景图”的套路——它们都是本章\emph{闭集}框架的开集推广；跳过本章，开放世界一章的每个概念都要从头解释。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+本章在前几部记号上新增一层“语义层”符号，并\emph{严格避让}全书已占用者，登记如下。
+\textbf{语义类别}记 $\sigma\in\mathcal{K}:=\{0,1,\dots,K\}$（离散标签，$\sigma{=}0$ 约定为\emph{自由/空}类，作枢轴；$K$ 为前景类别数）；类别分布写 $\mathbf{p}=[p_0,\dots,p_K]^\top$（单纯形上的概率向量）。
+\textbf{物体路标}记 $\boldsymbol\ell=(\sigma,\mathbf{q},\lambda,\mathbf{s}^{\mathrm{sh}})$：类别 $\sigma$、位姿 $\mathbf{q}\in\SE(3)$、尺度 $\lambda\in\mathbb{R}_{>0}$、形状参数 $\mathbf{s}^{\mathrm{sh}}\in\mathbb{R}^{d}$（\textbf{上标 sh 区别于}本书已占用的尺度因子/视差 $s$，\cref{ch:dense}）。\textbf{注意本章 $\mathbf{q}$ 专指物体位姿 $\in\SE(3)$}，与全书 \nameref{ch:notation} 表中的单位四元数 $\mathbf{q}=[\,w,\mathbf{v}\,]$ 共用字母而异义；本章通篇不涉四元数（旋转一律以 $\SO(3)/\SE(3)$ 矩阵与右扰动表达），故不致歧义。\textbf{相机位姿}沿用 $\mathbf{T}\in\SE(3)$ 与\emph{本书帧下标} $\mathbf{T}_{wc}$（相机系到世界系；\textbf{Handbook 原文的上下标式 $\mathbf{T}_i^w$、$\mathbf{q}^{-1}\mathbf{T}$ 一律改写为本书下标式}，见 \nameref{ch:notation}）；带尺度的相似变换记 $\mathrm{Sim}(3)$。
+\textbf{扰动以右扰动为主线}：$\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol\xi)$、物体位姿 $\mathbf{q}\,\mathrm{Exp}(\delta\boldsymbol\phi)$（\cref{sec:nlopt-manifold}）。
+\textbf{二次曲面}记对称阵 $\mathbf{Q}_s\in\mathbb{R}^{4\times4}$、其对偶 $\mathbf{Q}_s^{*}$；图像\emph{圆锥}记 $\mathbf{C}\in\mathbb{R}^{3\times3}$、对偶圆锥 $\mathbf{C}^{*}$（\textbf{注意}与协方差 $\boldsymbol\Sigma$ 区分，圆锥用 $\mathbf{C}$、协方差一律 $\boldsymbol\Sigma$/信息 $\boldsymbol\Sigma^{-1}$、$\boldsymbol\Lambda$）。
+\textbf{多类 log-odds} 记 $\mathbf{h}_{t,i}\in\mathbb{R}^{K+1}$（第 $i$ 个体素、$t$ 时刻；以自由类 $\sigma{=}0$ 为枢轴），softmax 记 $\boldsymbol\varsigma$（与二值的 sigmoid $\sigma(\cdot)$ 同根，但本章 $\sigma$ 已留给类别，故 softmax 用 $\boldsymbol\varsigma$）；观测模型 log-odds 增量记 $\boldsymbol\ell_i(\mathbf{z})$（粗体，区别于二值标量 $\ell$）。
+\textbf{数据关联}记 $\mathcal{D}$（观测到路标的指派），网络/检测前端沿用 \cref{ch:learning} 的 $f_\theta$。\textbf{互信息}记 $I(\cdot;\cdot)$，与 \cref{sec:est-gauss} 一致。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{统一立场：把语义框进母方程与 log-odds}
+\label{sec:semantic-frame}
+
+\paragraph{动机：地图为什么要“认得东西”。}
+经典 SLAM 把环境抽象成两样东西：相机轨迹与几何地图（点、面、体素）。\cref{ch:intro} 早已点出，SLAM 的另一半使命是\emph{支撑上层任务}——可一旦任务带上语义（“导航到办公室里那台笔记本”“房间里有人就别进会议室”），纯几何就不够了\cite{carlone2026handbook}。导航代价也是如此：同样一块自由空间，是马路、人行道还是植被，可通行代价天差地别\cite{maturana2018semantic}。\textbf{语义不仅服务下游，还反哺 SLAM 本身}：语义上有意义的特征（一把椅子、一辆车）比像素级角点\emph{更独特、更视角不变}，能改善数据关联与回环\cite{bowman2017probabilistic,civera2011towards}；语义还能帮助识别动态实体（\cref{ch:dynamic}），把不利于运动估计的“会动的东西”择出来\cite{rosinol2021kimera}。
+
+\paragraph{把语义织进几何的三个层次。}
+怎么把语义放进地图？顺着 \cref{ch:dense} 的稀疏/稠密两支，语义有三种织法\cite{carlone2026handbook}：
+\begin{enumerate}
+  \item \textbf{稀疏（物体级）}：给\emph{路标}加语义——把经典的三维点路标推广成\emph{物体}，带类别、位姿、尺度、形状。观测模型也从“低层视觉角点”升级为“高层检测”：检测框\cite{nicholson2019quadricslam}、分割掩膜\cite{he2017maskrcnn}、物体部件关键点\cite{pavlakos2017semantickeypoints}。
+  \item \textbf{稠密（逐元素语义）}：给\emph{稠密表示}的每个元素（点、面元、网格面、体素）贴语义——把占据从\emph{二值}（自由/占据）推广为\emph{多类}（语义类别）。
+  \item \textbf{分层（区域级）}：给\emph{整片自由空间}赋语义（室内的房间、室外的停车场），并把物体、区域、楼层组织成\emph{分层}的 3D 场景图。
+\end{enumerate}
+
+\begin{insight}[本章的统一立场——一句话]
+\textbf{度量-语义 SLAM 不是另起炉灶，而是把经典 SLAM 的两端各\emph{升一维}：}稀疏端，\emph{点路标 $\mathbf{y}_j$} 升为\emph{物体路标 $\boldsymbol\ell=(\sigma,\mathbf{q},\lambda,\mathbf{s}^{\mathrm{sh}})$}，物体观测因子是重投影因子的推广，仍喂 \cref{eq:intro-nls} 的同一后端；稠密端，\emph{二值占据}升为\emph{多类占据}，多类贝叶斯更新是 \cref{eq:dense-octo-logodds} 二值更新的推广（二值是 $K{=}1$ 的特例）。几何骨架（因子图 $+$ log-odds）原样保留，只是变量与残差里多了一个\emph{语义维度}。本章四节正是按这条“升维”主线排列的。
+\end{insight}
+
+\paragraph{两条升维线，一张对照表。}
+\cref{tab:semantic-lift} 把本章四块硬核放进同一坐标：每一块都标明它\emph{升维自}本书的哪个经典构件、\emph{接回}哪条母方程。这张表就是本章的地图。
+
+\begin{table}[H]\centering\small
+\caption{度量-语义 SLAM 的“几何 $\to$ 语义”升维：每块硬核接回本书哪个经典构件}
+\label{tab:semantic-lift}
+\begin{tabular}{p{0.16\textwidth} p{0.26\textwidth} p{0.28\textwidth} p{0.16\textwidth}}
+\toprule
+本章硬核 & 升维自（本书经典构件） & 接回的母方程/更新式 & 本章 \\
+\midrule
+\textbf{物体级因子} & 点路标 $\mathbf{y}_j$（\cref{sec:vo-pnp-ba}） & 重投影残差 $\to$ 物体观测因子，仍是 \cref{eq:intro-nls}/\cref{thm:fg-map} & \cref{sec:semantic-object} \\
+\textbf{离散-连续 MAP} & 数据关联 $+$ BA（\cref{sec:est-fg}） & 因子图加\emph{离散}类别/关联变量，混合分解 & \cref{sec:semantic-hybrid} \\
+\textbf{多类 log-odds 体素} & 二值占据（\cref{eq:dense-octo-logodds}） & $\mathbf{h}\in\mathbb{R}^{K+1}$ $+$ softmax，加性更新（二值是特例） & \cref{sec:semantic-dense} \\
+\textbf{3D 场景图} & 拓扑/混合地图（\cref{tab:dense-maptypes}） & 分层图 $+$ treewidth；联合优化扩展 PGO & \cref{sec:semantic-graph} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{语义从哪来：前端的进化。}
+要建语义地图，前端就得吐出比角点更丰富的信息\cite{carlone2026handbook}。深度学习（\cref{ch:learning}）让这成为可能：\emph{物体检测}给出框、\emph{语义分割}给每个像素一个类别\cite{long2015fcn}、\emph{实例分割}把同类的不同个体分开\cite{he2017maskrcnn}、\emph{全景分割}把背景语义与前景实例\emph{合二为一}\cite{kirillov2019panoptic}；还有\emph{语义关键点}\cite{pavlakos2017semantickeypoints}（车的轮子、后视镜、车牌等中层部件）。本章把这些前端产物\emph{当作观测}——网络负责它擅长的（从像素榨语义），几何后端负责它擅长的（用刚体约束把语义一致地融成地图）。这正是 \cref{ch:learning} “把几何留在环里”立场在语义场景下的延续。
+
+\begin{note}
+\textbf{本章只讲闭集语义.}\;本章假定语义来自一个\emph{固定、有限}的词典（如 $100$–$1000$ 个类别：‘椅子’‘桌子’‘办公室’），称\emph{闭集（closed-set）语义}\cite{carlone2026handbook}。如何让地图回答\emph{任意}概念（开放词汇、语言嵌入）——即\emph{开集（open-set）}——留到 \cref{ch:openworld}。这不是回避：闭集是开集的基座，本章把闭集的几何骨架（物体因子、多类 log-odds、场景图）打牢，\cref{ch:openworld} 只需把“离散类别”换成“连续语言特征向量”、把“多类分布”换成“特征融合”，骨架一概沿用。读到本章末尾，我们会把这条“闭集 $\to$ 开集”的递进交接出去。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{稀疏度量-语义：物体级 SLAM}
+\label{sec:semantic-object}
+
+考虑一个路标即\emph{物体}的 SLAM 问题——地图由若干\emph{物体路标}组成，每个物体带位置、朝向、形状等\emph{度量}属性与类别等\emph{语义}属性。我们称之为\textbf{稀疏度量-语义 SLAM}\cite{carlone2026handbook}。它是经典稀疏 SLAM 最自然的语义升维。
+
+\subsection{从点路标到物体路标：母方程原封不动}
+\label{sec:semantic-object-def}
+
+\paragraph{把残差先摆出来。}
+回忆 \cref{ch:intro}：基于路标的 SLAM 是一个非线性最小二乘，每个路标观测在目标函数里贡献一个平方项 $r_i(\mathbf{x}_i)^2$，残差形如
+\begin{equation}
+  r_i(\mathbf{x}_i)=\big\|\,\mathbf{z}_i-\mathbf{h}_i(\mathbf{T}_i,\boldsymbol\ell_i)\,\big\|_{\boldsymbol\Sigma_i},
+  \qquad \mathbf{x}_i=(\mathbf{T}_i,\boldsymbol\ell_i),
+  \label{eq:semantic-obj-residual}
+\end{equation}
+其中 $\mathbf{z}_i$ 是观测、状态 $\mathbf{x}_i$ 含相机位姿 $\mathbf{T}_i$ 与路标 $\boldsymbol\ell_i$\cite{carlone2026handbook}。下标 $i$ 仍指因子图里由“观测 $\mathbf{z}_i$ $+$ 状态 $\mathbf{x}_i$”（已知数据关联）诱导的那个因子，与前几章\emph{完全一致}。在视觉 SLAM（\cref{ch:vo}）里，路标 $\boldsymbol\ell_i$ 是三维点、观测 $\mathbf{z}_i$ 是它投影到像平面的二维像素。\textbf{物体级 SLAM 唯一改的，是把 $\boldsymbol\ell_i$ 从点推广成物体、把 $\mathbf{z}_i$ 从像素推广成物体检测、把 $\mathbf{h}_i$ 从点投影推广成物体投影}——母方程 \cref{eq:semantic-obj-residual} 与 \cref{eq:intro-nls} 一字不差。
+
+\begin{insight}[一句话看穿物体级 SLAM]
+\cref{eq:semantic-obj-residual} 与 \cref{eq:intro-nls}、\cref{thm:fg-map} 的 \cref{eq:fg-ls} \emph{同形}。所以物体级 SLAM \emph{没有}新后端：它就是 \cref{tab:factors} 那张“因子清单”里多了一类\textbf{物体观测因子}——连接相机位姿与物体路标，残差是“物体按位姿投到像平面 $\textbf{vs}$ 检测到的物体”。你在 GTSAM/g2o 里搭好的因子图，照样能解。读本节四种形状表示时，每遇到一种，先问一句：\emph{它的 $\mathbf{z}_i$ 是什么（框/掩膜/关键点/距离）？$\mathbf{h}_i$ 怎么把物体投成 $\mathbf{z}_i$ 的同类量？}
+\end{insight}
+
+\begin{definition}[物体路标]\label{def:semantic-object}
+一个\emph{物体路标}是一个四元组 $\boldsymbol\ell=(\sigma,\mathbf{q},\lambda,\mathbf{s}^{\mathrm{sh}})$，含\emph{语义类别} $\sigma\in\mathcal{K}$（如“车”“椅子”“桌子”）、\emph{位姿} $\mathbf{q}\in\SE(3)$、\emph{尺度} $\lambda\in\mathbb{R}_{>0}$、\emph{形状} $\mathbf{s}^{\mathrm{sh}}\in\mathbb{R}^d$\cite{carlone2026handbook}。位姿 $\mathbf{q}$ 给出物体坐标系相对世界系的位置与朝向；尺度 $\lambda$ 之所以单列，是为容纳“同类同形但大小不同”的个体（真车 vs 玩具车）。形状 $\mathbf{s}^{\mathrm{sh}}$ 可用\emph{显式}模型（点、椭球、网格）或\emph{隐式}模型（占据函数、SDF 场）表示——这与 \cref{ch:dense} 稠密曲面建模的“显式/隐式”二分（\cref{tab:dense-quadrant}）\emph{完全同源}，只是这里描述\emph{单个物体}而非整个场景。
+\end{definition}
+
+\begin{note}
+\textbf{物体路标含 $\SE(3)$ 位姿——比点路标“多了三个旋转自由度”.}\;点路标只有三维位置；物体路标多了朝向 $\mathbf{R}\in\SO(3)$（藏在 $\mathbf{q}$ 里）。这意味着物体因子要对 $\mathbf{q}$ 求导——本章一律用\emph{右扰动} $\mathbf{q}\,\mathrm{Exp}(\delta\boldsymbol\phi)$，雅可比按 \cref{ch:lie} 的右雅可比组织，与相机位姿 $\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol\xi)$ 同一套约定。带尺度时则在相似群 $\mathrm{Sim}(3)$ 上做（\cref{ch:lie} 已给 $\mathrm{Sim}(3)$ 的右雅可比闭式），这是本章与全书扰动约定对齐的关键一笔。
+\end{note}
+
+\subsection{四种形状表示与各自的物体因子}
+\label{sec:semantic-object-shape}
+
+物体的“形状”怎么参数化，决定了观测因子 $\mathbf{h}_i$ 长什么样。我们按“从离散点到连续隐式”的顺序给出四种\cite{carlone2026handbook}。
+
+\paragraph{(一) 语义关键点：物体即一簇带名字的点。}
+最朴素的形状模型，是把物体表示成一簇稀疏三维点 $\{\mathbf{s}^{\mathrm{sh}}_j\}_j$，称\emph{语义关键点}——它们对应物体的显著部件（车的轮子、后视镜、车牌）。但若只当成无结构点云，后端无从把三维点关联到二维观测。于是用一个\emph{可变形（主动）形状模型}\cite{cootes1995active}把每个关键点参数化：
+\begin{equation}
+  \mathbf{s}^{\mathrm{sh}}_j=\mathbf{b}_{j,0}+\sum_k c_k\,\mathbf{b}_{j,k},
+  \label{eq:semantic-keypoint-shape}
+\end{equation}
+其中 $\mathbf{b}_{j,0}$ 是\emph{类别平均}形状的第 $j$ 个关键点，$\mathbf{b}_{j,k}$ 是由 PCA 得到的若干\emph{形变模态}，$c_k\in\mathbb{R}_{\ge0}$ 是形变系数\cite{pavlakos2017semantickeypoints}。例如“车”的平均形状由 $\mathbf{b}_{j,0}$ 给出，要容纳不同车型就沿主模态 $\mathbf{b}_{j,k}$ 形变。\cref{eq:semantic-keypoint-shape} 的妙处是：直接优化 $\{\mathbf{s}^{\mathrm{sh}}_j\}$ 会得到\emph{不像车的点堆}，而优化形变系数 $c_k$ 则\emph{强制}关键点描出\emph{合理}的物体形状（形状先验）。每个三维关键点 $\mathbf{s}^{\mathrm{sh}}_j$ 投到像平面得\emph{二维语义关键点} $\mathbf{z}_j$（卷积网络出的热力图峰值\cite{pavlakos2017semantickeypoints}）。残差就是透视投影下的重投影误差：
+\begin{equation}
+  r_i(\mathbf{x}_i)^2=\sum_j\big\|\,\mathbf{z}_{i,j}-\boldsymbol\pi\!\big(\mathbf{T}_{ci}\,\mathbf{q}_i,\ \lambda_i\,\mathbf{s}^{\mathrm{sh}}_{i,j}\big)\,\big\|_{\boldsymbol\Sigma_i}^2,
+  \label{eq:semantic-keypoint-residual}
+\end{equation}
+其中 $\boldsymbol\pi(\mathbf{T},\mathbf{s})$ 是把三维点 $\mathbf{s}$ 按位姿 $\mathbf{T}$ 投到像平面的透视投影（\cref{ch:camera}），$\mathbf{T}_{ci}\,\mathbf{q}_i$ 是“先把物体系点经物体位姿 $\mathbf{q}_i$ 抬到世界系、再用相机位姿的逆 $\mathbf{T}_{ci}=\mathbf{T}_{wc_i}^{-1}$ 变到相机系”的复合变换（本书下标式，对应 Handbook 原文的 $\mathbf{q}_i^{-1}\mathbf{T}_i$），关键点先按尺度 $\lambda_i$ 缩放。\textbf{这就是 \cref{sec:vo-pnp-ba} 的重投影 BA——只不过点带了语义标签、并受 \cref{eq:semantic-keypoint-shape} 的形状先验约束。}
+
+\paragraph{(二) 二次曲面/椭球：可解析投影的物体因子。}
+更紧凑的显式模型，是把物体形状建成一个\emph{椭球}\cite{nicholson2019quadricslam,rubino2018quadrics}。它最迷人之处在于：\emph{椭球到像平面的投影可解析求出，并能直接与检测框比较}——这使它成为本章\textbf{最适合作样板的物体因子推导}。详见 \cref{sec:semantic-object-quadric}。
+
+\paragraph{(三) 网格：可微渲染的物体因子（选读）。}
+更具表达力的是\emph{三角网格}，顶点 $\mathcal{V}=\{\mathbf{s}^{\mathrm{sh}}_j\}$、面 $\mathcal{F}$。要把它接进后端，需用\emph{可微渲染}\cite{kato2018neural,liu2019softras}把网格投影并光栅化到像平面，与\emph{分割掩膜} $\mathbf{z}_i$ 比对。一种常用残差取掩膜与渲染投影的\emph{交并比（IoU）的倒数}：
+\begin{equation}
+  r_i(\mathbf{x}_i)=\frac{\boldsymbol\rho\big(\{\boldsymbol\pi(\mathbf{T}_{ci}\mathbf{q}_i,\lambda_i\mathbf{s}^{\mathrm{sh}}_{i,j})\}_j,\,\mathcal{F}\big)\cup\mathbf{z}_i}{\boldsymbol\rho\big(\{\boldsymbol\pi(\mathbf{T}_{ci}\mathbf{q}_i,\lambda_i\mathbf{s}^{\mathrm{sh}}_{i,j})\}_j,\,\mathcal{F}\big)\cap\mathbf{z}_i},
+  \label{eq:semantic-mesh-residual}
+\end{equation}
+其中 $\boldsymbol\rho(\mathcal{V},\mathcal{F})$ 是\emph{可微光栅化}函数（把顶点投到像平面、每像素只画最前面的面）\cite{loper2014opendr}；也可用 $\ell_2$ 损失或二值交叉熵\cite{wang2020directshape}。顶点同样可直接优化或经形变系数（\cref{eq:semantic-keypoint-shape}）间接优化。这里的可微渲染与 \cref{ch:dense} 末尾“可微渲染地图（NeRF/3DGS）”是\emph{同一类思想}（让像素级误差的梯度回流去更新三维参数），只是这里渲染的是\emph{单个物体的掩膜}而非整个场景的颜色。
+
+\paragraph{(四) 隐式 SDF：神经解码器即形状先验（选读）。}
+最后是\emph{隐式}形状：用一个\emph{空间标量函数}的某个水平集表示物体表面（\cref{ch:dense} 的隐式曲面同理）。常用占据函数\cite{mescheder2019occupancy}、SDF\cite{park2019deepsdf}、NeRF\cite{mildenhall2020nerf}。以 SDF 为例：物体形状是一个集合 $\mathcal{S}\subset\mathbb{R}^3$，其 SDF $d_{\mathcal{S}}(\mathbf{x})$ 给出查询点 $\mathbf{x}$ 到表面 $\partial\mathcal{S}$ 的\emph{带符号}距离（内负外正、表面为零，与 \cref{sec:dense-tsdf} 的 TSDF 同义）。用一个神经网络解码器 $d_\theta(\mathbf{x},\mathbf{s}^{\mathrm{sh}})$ 逼近它——给定查询点 $\mathbf{x}$ 与\emph{形状码} $\mathbf{s}^{\mathrm{sh}}$，输出符号距离；变动 $\mathbf{s}^{\mathrm{sh}}$ 即可在同一解码器下表示同类物体的不同形状\cite{park2019deepsdf,wang2021ellipsdf}。给定深度/激光测量 $\{\mathbf{y}_{i,j},z_{i,j}\}_j$（$\mathbf{y}$ 为近表面点、$z$ 为到表面的距离），残差比对 SDF 预测与实测：
+\begin{equation}
+  r_i(\mathbf{x}_i)^2=\sum_j\Big|\,z_{i,j}-d_\theta\big(\lambda_i^{-1}\,\mathbf{q}_i^{-1}\,\mathbf{T}_{wc_i}\,\mathbf{y}_{i,j},\ \mathbf{s}^{\mathrm{sh}}_i\big)\Big|_{\sigma_i}^2,
+  \label{eq:semantic-sdf-residual}
+\end{equation}
+其中 $\lambda_i^{-1}\mathbf{q}_i^{-1}\mathbf{T}_{wc_i}\mathbf{y}_{i,j}$ 把测量点先从相机系变到世界系、再变到物体系、最后按 $\lambda_i^{-1}$ 缩放，得物体规范系下的查询点\cite{ortiz2022isdf}。\emph{训练}时（离线）假定位姿/尺度已知、对 $\theta$ 与形状码优化；\emph{测试}时（在线）解码器 $\theta$ 冻结，对状态 $\mathbf{x}_i=(\mathbf{T}_{wc_i},\mathbf{q}_i,\lambda_i,\mathbf{s}^{\mathrm{sh}}_i)$ 优化——即同时估出相机位姿与物体位姿/尺度/形状。常另加 Eikonal 正则（约束 $\|\nabla d_\theta\|{=}1$）等\cite{gropp2020implicit}。
+
+\begin{table}[H]\centering\small
+\caption{物体形状的四种表示与各自的物体观测因子（残差 $r_i$）}
+\label{tab:semantic-shape}
+\begin{tabular}{p{0.16\textwidth} p{0.13\textwidth} p{0.16\textwidth} p{0.16\textwidth} p{0.20\textwidth}}
+\toprule
+形状表示 & 显/隐式 & 观测 $\mathbf{z}_i$ & 投影 $\mathbf{h}_i$ & 升维自 \\
+\midrule
+语义关键点 & 显式·点 & 2D 关键点 & 透视投影（\cref{eq:semantic-keypoint-residual}） & 点重投影 BA \\
+二次曲面/椭球 & 显式·面 & 检测框 & 对偶圆锥（\cref{eq:semantic-quadric-residual}） & 重投影（解析） \\
+网格 & 显式·面 & 分割掩膜 & 可微渲染（\cref{eq:semantic-mesh-residual}） & 可微渲染地图 \\
+隐式 SDF & 隐式 & 距离测量 & 神经解码器（\cref{eq:semantic-sdf-residual}） & TSDF/隐式曲面 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{样板推导：二次曲面物体因子（右扰动）}
+\label{sec:semantic-object-quadric}
+
+椭球物体因子数学最完整，值得逐步推导，作为“语义因子”的样板。我们沿“椭球 $\to$ 对偶二次曲面 $\to$ 解析投影成对偶圆锥 $\to$ 与检测框比较 $\to$ 向量化 $\to$ 右扰动求导”一条链推到底。
+
+\paragraph{椭球与其对偶二次曲面。}
+半轴长 $\mathbf{s}^{\mathrm{sh}}=[s_1,s_2,s_3]^\top$ 的椭球 $\mathcal{E}_{\mathbf{s}}\subset\mathbb{R}^3$ 定义为 $\{\mathbf{x}:\mathbf{x}^\top\operatorname{diag}(\mathbf{s}^{\mathrm{sh}})^{-2}\mathbf{x}\le1\}$。在齐次坐标下，它由一个对称阵 $\mathbf{Q}_s\in\mathbb{R}^{4\times4}$ 刻画：
+\begin{equation}
+  \mathcal{E}_{\mathbf{s}}=\left\{\mathbf{x}\in\mathbb{R}^3:\begin{bmatrix}\mathbf{x}\\1\end{bmatrix}^\top
+  \underbrace{\begin{bmatrix}\operatorname{diag}(\mathbf{s}^{\mathrm{sh}})^{-2}&\mathbf{0}\\\mathbf{0}^\top&-1\end{bmatrix}}_{\mathbf{Q}_s}
+  \begin{bmatrix}\mathbf{x}\\1\end{bmatrix}\le0\right\}.
+  \label{eq:semantic-quadric-Qs}
+\end{equation}
+\emph{椭球到圆锥的投影没有简洁的显式形式，但它的\textbf{对偶}（切平面集合）有}\cite{rubino2018quadrics}。$\mathbf{Q}_s$ 的对偶 $\mathbf{Q}_s^{*}$ 是其伴随矩阵 $\operatorname{adj}(\mathbf{Q}_s)$；对椭球 $\mathbf{Q}_s$ 可逆，故（在“对偶定义对尺度不变”意义下）$\mathbf{Q}_s^{*}\propto\mathbf{Q}_s^{-1}$。对偶二次曲面是\emph{所有与椭球相切的超平面}的集合。
+
+\paragraph{把物体二次曲面摆到世界系。}
+带位姿 $\mathbf{q}$、尺度 $\lambda$ 的物体二次曲面，从物体规范系缩放并变换到世界系：
+\begin{equation}
+  \mathbf{Q}_\ell^{*}\propto\mathbf{q}\,\mathbf{S}_\lambda\,\mathbf{Q}_s^{*}\,\mathbf{S}_\lambda^\top\,\mathbf{q}^\top,
+  \qquad \mathbf{S}_\lambda=\begin{bmatrix}\lambda\mathbf{I}_3&\mathbf{0}\\\mathbf{0}^\top&1\end{bmatrix},
+  \label{eq:semantic-quadric-Ql}
+\end{equation}
+其中 $\mathbf{q}$ 在此用其 $4\times4$ 齐次矩阵表示\cite{rubino2018quadrics}。
+
+\paragraph{对偶二次曲面解析投影成对偶圆锥。}
+设相机位姿 $\mathbf{T}\in\SE(3)$（世界系到相机系记 $\mathbf{T}_{cw}=\mathbf{T}^{-1}$）。对偶二次曲面 $\mathbf{Q}_\ell^{*}$ 投影到像平面，得一个\emph{对偶圆锥} $\mathbf{C}^{*}_{\mathbf{x}}\in\mathbb{R}^{3\times3}$：
+\begin{equation}
+  \mathbf{C}^{*}_{\mathbf{x}}\propto\tfrac{1}{\beta}\,\mathbf{P}\,\mathbf{T}^{-1}\,\mathbf{Q}_\ell^{*}\,\mathbf{T}^{-\top}\,\mathbf{P}^\top,
+  \qquad \mathbf{P}=[\,\mathbf{I}_3\ \ \mathbf{0}\,]\in\mathbb{R}^{3\times4},
+  \label{eq:semantic-quadric-proj}
+\end{equation}
+$\mathbf{P}$ 丢掉齐次最后一维、$\beta$ 吸收深度尺度；下标 $\mathbf{x}=(\mathbf{T},\boldsymbol\ell)$ 强调它由相机位姿与物体一起决定\cite{rubino2018quadrics}。\textbf{这条解析投影是椭球因子的全部价值所在}——它把“三维物体投到像平面”一步算到底，无须采样、无须渲染。
+
+\paragraph{与检测框拟合的椭圆作差。}
+物体检测框 $\mathbf{z}=[u,v,w,h]^\top$（左下角归一化坐标 $+$ 宽高）。框内\emph{内切轴对齐椭圆}对应的对偶圆锥为
+\begin{equation}
+  \mathbf{C}^{*}_{\mathbf{z}}\propto
+  \begin{bmatrix}1&0&c_u\\0&1&c_v\\0&0&1\end{bmatrix}
+  \begin{bmatrix}(w/2)^2&0&0\\0&(h/2)^2&0\\0&0&-1\end{bmatrix}
+  \begin{bmatrix}1&0&c_u\\0&1&c_v\\0&0&1\end{bmatrix}^\top,
+  \label{eq:semantic-quadric-Cz}
+\end{equation}
+框中心 $(c_u,c_v)=(u{+}w/2,\,v{+}h/2)$。物体因子的残差，就是“物体投出的圆锥 $\mathbf{C}^{*}_{\mathbf{x}}$”与“检测框拟出的圆锥 $\mathbf{C}^{*}_{\mathbf{z}}$”之差：
+\begin{equation}
+  r_i(\mathbf{x}_i)=\big\|\,\mathbf{C}^{*}_{\mathbf{z}_i}-\mathbf{C}^{*}_{\mathbf{x}_i}\,\big\|_{\boldsymbol\Sigma_i}.
+  \label{eq:semantic-quadric-residual}
+\end{equation}
+
+\begin{derivation}[避免矩阵范数：半向量化把因子写成标准最小二乘]
+\cref{eq:semantic-quadric-residual} 里是\emph{矩阵}范数，不便接进按向量残差组织的后端。利用对偶圆锥是\emph{对称}阵，用\emph{半向量化} $\operatorname{vech}(\cdot)$（只取上三角的 $6$ 个独立元）把它压成向量。令 $\mathbf{b}_i=\operatorname{vech}(\mathbf{C}^{*}_{\mathbf{z}_i})$、$\mathbf{v}(\mathbf{T}_i,\boldsymbol\ell_i)=\operatorname{vech}(\mathbf{T}_i^{-1}\mathbf{Q}_{\ell_i}^{*}\mathbf{T}_i^{-\top})$。再引入两个常数选择阵：$\mathbf{D}\in\mathbb{R}^{6\times9}$（$\operatorname{vech}(\mathbf{Q})=\mathbf{D}\operatorname{vec}(\mathbf{Q})$）、$\mathbf{E}\in\mathbb{R}^{16\times10}$（$\operatorname{vec}(\mathbf{Q})=\mathbf{E}\operatorname{vech}(\mathbf{Q})$），令 $\mathbf{A}=\mathbf{D}(\mathbf{P}\otimes\mathbf{P})\mathbf{E}$（$\otimes$ 为 Kronecker 积）。利用 $\operatorname{vec}(\mathbf{P}\mathbf{X}\mathbf{P}^\top)=(\mathbf{P}\otimes\mathbf{P})\operatorname{vec}(\mathbf{X})$，\cref{eq:semantic-quadric-residual} 化为标准的向量加权最小二乘
+\[
+  r_i(\mathbf{x}_i)=\Big\|\,\mathbf{b}_i-\tfrac{1}{\beta_i}\mathbf{A}\,\mathbf{v}(\mathbf{T}_i,\boldsymbol\ell_i)\,\Big\|_{\boldsymbol\Sigma_i}.
+\]
+这下它就是 \cref{eq:semantic-obj-residual} 那种残差，可直接喂进 \cref{thm:fg-map} 的因子图\cite{nicholson2019quadricslam,rubino2018quadrics}。
+\end{derivation}
+
+\begin{derivation}[物体因子对相机位姿与物体位姿的右扰动雅可比]
+后端要 $r_i$ 对 $\mathbf{T}_i$、$\mathbf{q}_i$ 的雅可比。本书一律用\emph{右扰动}（\cref{sec:nlopt-manifold}）：令 $\mathbf{T}_i\leftarrow\mathbf{T}_i\,\mathrm{Exp}(\delta\boldsymbol\xi)$、$\mathbf{q}_i\leftarrow\mathbf{q}_i\,\mathrm{Exp}(\delta\boldsymbol\phi)$，对残差关于 $\delta\boldsymbol\xi,\delta\boldsymbol\phi$ 在零点取一阶项。链式法则分三段：
+\begin{enumerate}
+  \item \emph{投影段}：$r_i$ 经 $\mathbf{v}=\operatorname{vech}(\mathbf{T}_i^{-1}\mathbf{Q}_{\ell_i}^{*}\mathbf{T}_i^{-\top})$ 依赖位姿，$\partial r_i/\partial\mathbf{v}=-\tfrac1{\beta_i}\mathbf{A}$（白化后再左乘 $\boldsymbol\Sigma_i^{-1/2}$）；
+  \item \emph{位姿段（相机）}：注意 $\mathbf{T}_i^{-1}\!\big(\mathbf{T}_i\mathrm{Exp}(\delta\boldsymbol\xi)\big)=\mathrm{Exp}(\delta\boldsymbol\xi)$，故扰动经伴随作用在 $\mathbf{Q}_\ell^{*}$ 两侧：$\delta\big(\mathbf{T}^{-1}\mathbf{Q}_\ell^{*}\mathbf{T}^{-\top}\big)=-(\delta\boldsymbol\xi)^\wedge\big(\mathbf{T}^{-1}\mathbf{Q}_\ell^{*}\mathbf{T}^{-\top}\big)-\big(\mathbf{T}^{-1}\mathbf{Q}_\ell^{*}\mathbf{T}^{-\top}\big)(\delta\boldsymbol\xi)^{\wedge\top}$，再 $\operatorname{vech}$ 取线性项即得 $\partial\mathbf{v}/\partial\delta\boldsymbol\xi$；
+  \item \emph{位姿段（物体）}：对 \cref{eq:semantic-quadric-Ql}（$\mathbf{Q}_\ell^{*}\propto\mathbf{q}\,\mathbf{M}\,\mathbf{q}^\top$，其中 $\mathbf{M}=\mathbf{S}_\lambda\mathbf{Q}_s^{*}\mathbf{S}_\lambda^\top$ 与 $\mathbf{q}$ 无关）用 $\mathbf{q}\leftarrow\mathbf{q}\,\mathrm{Exp}(\delta\boldsymbol\phi)$ 展开。物体位姿 $\mathbf{q}$ 居于\emph{两侧外层}，故右扰动的生成元须被 $\mathbf{q}$ \emph{共轭}（即经伴随 $\mathrm{Ad}_{\mathbf{q}}$ 搬运）：
+  \[
+    \delta\mathbf{Q}_\ell^{*}=\big(\mathbf{q}(\delta\boldsymbol\phi)^\wedge\mathbf{q}^{-1}\big)\mathbf{Q}_\ell^{*}+\mathbf{Q}_\ell^{*}\big(\mathbf{q}(\delta\boldsymbol\phi)^\wedge\mathbf{q}^{-1}\big)^{\!\top},
+  \]
+  再 $\operatorname{vech}$ 取线性项得 $\partial\mathbf{v}/\partial\delta\boldsymbol\phi$。\textbf{切勿}漏掉这层共轭而写成 $(\delta\boldsymbol\phi)^\wedge\mathbf{Q}_\ell^{*}+\mathbf{Q}_\ell^{*}(\delta\boldsymbol\phi)^{\wedge\top}$——那其实是\emph{左}扰动 $\mathbf{q}\leftarrow\mathrm{Exp}(\delta\boldsymbol\phi)\,\mathbf{q}$ 的结果（数值上与真扰动差一个量级）。相机侧（上一条）之所以无此共轭，正因 $\mathbf{T}^{-1}\!\big(\mathbf{T}\mathrm{Exp}(\delta\boldsymbol\xi)\big)=\mathrm{Exp}(\delta\boldsymbol\xi)$ 把扰动留在了\emph{内层}；物体侧位姿在外层，扰动须经 $\mathrm{Ad}_{\mathbf{q}}$ 共轭穿出——这正是"统一右扰动"在物体因子上的精确落实。
+\end{enumerate}
+三段相乘即雅可比 $\mathbf{J}_{\boldsymbol\xi}=\partial r_i/\partial\delta\boldsymbol\xi$、$\mathbf{J}_{\boldsymbol\phi}=\partial r_i/\partial\delta\boldsymbol\phi$。\textbf{关键是两处扰动都\emph{右乘}}——这正是本书相对 Handbook 原文（未固定左/右扰动）所做的统一，确保物体因子与全书其他因子（重投影、IMU、激光）的雅可比同侧、可拼进同一个 $\mathbf{H}^\top\boldsymbol\Sigma^{-1}\mathbf{H}$。
+\end{derivation}
+
+\begin{pitfall}[椭球因子的“两病”：尺度退化与朝向不可观]
+椭球物体因子优雅，却有两个易踩的坑。\textbf{其一，单帧检测框定不出深度尺度。}一个框与无穷多个“大而远 / 小而近”的椭球一致（与单目尺度不确定性 \cref{thm:intro-scale} 同源）——\emph{必须多视约束}才能定出 $\mathbf{q},\lambda$，正如点路标三角化要基线。\textbf{其二，轴对称物体的朝向不可观。}一个旋转对称的椭球（如近似圆柱的瓶子）绕对称轴转动不改变任何检测框，$\mathbf{q}$ 的对应旋转自由度\emph{不可观}——后端会在该方向自由漂移。对策是固定（gauge）该自由度，或退而只估位置与尺度。这两病都是“几何 SLAM 可观测性”在物体级的回响，不是语义带来的新麻烦。
+\end{pitfall}
+
+\begin{example}[一个最小物体级 SLAM 因子图]\label{ex:semantic-objgraph}
+设相机三帧 $\mathbf{T}_{w1},\mathbf{T}_{w2},\mathbf{T}_{w3}$、两个物体路标 $\boldsymbol\ell_1$（椅子）、$\boldsymbol\ell_2$（桌子）。因子图（\cref{fig:semantic-objgraph}）含：相邻帧间\emph{里程计因子}（来自 VO/IMU，\cref{tab:factors}）、每次看到物体生一个\emph{物体观测因子}（\cref{eq:semantic-quadric-residual}，连接该帧位姿与该物体）、可选的\emph{物体类别先验}（“这更像椅子”）。把所有因子拢进 \cref{eq:fg-ls} 一起优化，即\emph{同时}估出轨迹与物体地图。与 \cref{fig:factor-graph} 的纯几何因子图\emph{结构同型}——只是路标圆圈里装的是物体、连边的因子是物体投影。
+\end{example}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, node distance=14mm,
+  pose/.style={circle, draw=main!70!black, fill=main!8, minimum size=8.5mm, font=\small, inner sep=0pt},
+  obj/.style={circle, draw=third!70!black, fill=third!12, minimum size=9mm, font=\small, inner sep=0pt},
+  fac/.style={rectangle, draw=second!60!black, fill=second!60!black, minimum size=2.1mm, inner sep=1.6pt},
+  pri/.style={rectangle, draw=main!60!black, fill=main!60!black, minimum size=2.1mm, inner sep=1.6pt},
+  ed/.style={gray!55!black}]
+  \node[pose] (p1) {$\mathbf{T}_{w1}$};
+  \node[pose, right=18mm of p1] (p2) {$\mathbf{T}_{w2}$};
+  \node[pose, right=18mm of p2] (p3) {$\mathbf{T}_{w3}$};
+  \node[obj, above=12mm of p1] (l1) {$\boldsymbol\ell_1$};
+  \node[obj, above=12mm of p3] (l2) {$\boldsymbol\ell_2$};
+  \node[fac] (o1) at ($(p1)!0.5!(p2)$) {}; \draw[ed] (p1)--(o1) (o1)--(p2);
+  \node[fac] (o2) at ($(p2)!0.5!(p3)$) {}; \draw[ed] (p2)--(o2) (o2)--(p3);
+  \node[fac] (m1) at ($(p1)!0.5!(l1)$) {}; \draw[ed] (p1)--(m1) (m1)--(l1);
+  \node[fac] (m2) at ($(p2)!0.45!(l1)$) {}; \draw[ed] (p2)--(m2) (m2)--(l1);
+  \node[fac] (m3) at ($(p3)!0.5!(l2)$) {}; \draw[ed] (p3)--(m3) (m3)--(l2);
+  \node[pri, above left=5mm and 1mm of l1] (c1) {}; \draw[ed] (c1)--(l1);
+  \node[pri, above right=5mm and 1mm of l2] (c2) {}; \draw[ed] (c2)--(l2);
+\end{tikzpicture}
+\caption{物体级 SLAM 因子图。圆为变量（相机位姿 $\mathbf{T}_{wi}$、物体路标 $\boldsymbol\ell_j$），蓝方块为里程计/物体观测因子，主色小方块为物体\emph{类别先验}。与 \cref{fig:factor-graph} 的几何因子图同型——升维只在“路标变物体、观测因子变物体投影（\cref{eq:semantic-quadric-residual}）”。物体类别 $\sigma$ 是\emph{离散}变量，引出 \cref{sec:semantic-hybrid} 的离散-连续混合 MAP。}
+\label{fig:semantic-objgraph}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{离散-连续混合 MAP 与求解}
+\label{sec:semantic-hybrid}
+
+物体级 SLAM 带来一个新东西：它把\emph{离散}信息（语义类别）与\emph{连续}信息（位姿、尺度、形状）耦在了一起\cite{carlone2026handbook}。本节把这种耦合形式化为\emph{离散-连续混合 MAP}，并给出三条求解策略——它们都建在 \cref{ch:nlopt} 的因子图/优化之上。
+
+\subsection{为什么离散变量让问题“多了一维”}
+\label{sec:semantic-hybrid-why}
+
+\paragraph{两类离散变量。}
+离散变量从两处进入物体级 SLAM\cite{carlone2026handbook}：\emph{其一，语义类别} $\sigma$ 本身离散，且类别能反哺形状（知道是“椅子”就约束了形状先验，反之亦然\cite{wang2021ellipsdf}），有时物体还带离散对称\cite{teng2021symmetry}、或前端给出\emph{多个}位姿假设要一并跟踪\cite{hsiao2019dynamicmh}；\emph{其二}，与纯几何 SLAM 一样，\textbf{数据关联} $\mathcal{D}$（\cref{ch:loop}）——“这次检测对应哪个物体”——本身就是离散的，而且物体级里它与类别天然耦合：知道物体类别能在杂乱中把它认出来。
+
+\paragraph{联合 MAP 与组合爆炸。}
+把“同时估计相机轨迹、物体（几何 $+$ 离散类别）、数据关联”写成 MAP 推断（\cref{ch:intro}）：
+\begin{equation}
+  \hat{X},\hat{L},\hat{\mathcal{D}}=\arg\max_{X,L,\mathcal{D}}\,p(X,L,\mathcal{D}\mid Z),
+  \label{eq:semantic-hybrid-map}
+\end{equation}
+$Z$ 是全部观测（含语义）、$X$ 相机位姿集、$L$ 物体路标集（几何 $+$ 离散类别）、$\mathcal{D}$ 观测到路标的关联集\cite{carlone2026handbook}。\textbf{关键洞见}：物体的离散类别可与“本就离散”的数据关联\emph{合二为一}——知道类别帮助消歧关联。但代价是：\cref{eq:semantic-hybrid-map} 在纯几何 SLAM 的非凸、高维之外，\emph{又多了组合优化}——离散状态空间随离散变量数\emph{指数}增长。
+
+\begin{insight}[“多了一维组合爆炸”，但骨架没变]
+纯几何 SLAM 是\emph{连续}非凸优化（\cref{ch:nlopt}）；物体级 SLAM 在其上叠了一层\emph{离散}搜索。直觉是：\emph{若离散变量已知}（知道每个物体的类别与关联），剩下的就是一个普通的连续 BA——“易”；\emph{若连续变量已知}（位姿/形状定死），剩下的是一个离散因子图，可用最大乘积变量消元求全局最优——但仍可能要遍历指数多个离散态。难就难在两者\emph{耦合}。好消息是：这层离散是\emph{加}在因子图上的，因子图与最小二乘的骨架（\cref{thm:fg-map}）原样保留，只是某些因子的定义域里多了离散坐标。所以下面三条求解策略，本质都是“想办法把离散那一维高效地消化掉，把连续那部分仍交给 \cref{ch:nlopt} 的 GN/iSAM2”。
+\end{insight}
+
+\subsection{混合因子图与条件独立分解}
+\label{sec:semantic-hybrid-decomp}
+
+把 \cref{eq:semantic-hybrid-map} 写成\emph{混合离散-连续因子图}的分解\cite{doherty2022discrete}。记连续变量集 $\Theta$、离散变量集 $\mathcal{D}$，后验分解为因子之积
+\begin{equation}
+  p(\Theta,\mathcal{D}\mid Z)\propto\prod_k\phi_k(\mathcal{V}_k),
+  \label{eq:semantic-hybrid-factor}
+\end{equation}
+每个因子 $\phi_k$ 对应一个测量似然或先验，$\mathcal{V}_k$ 是它涉及的变量。因子分三类：\emph{纯离散} $\phi_k(\mathcal{D}_k)$、\emph{纯连续} $\phi_k(\Theta_k)$、\emph{离散-连续} $\phi_k(\Theta_k,\mathcal{D}_k)$。取负对数（与 \cref{thm:fg-map} 同手法），MAP 化为
+\begin{equation}
+  \Theta^{*},\mathcal{D}^{*}=\arg\min_{\Theta,\mathcal{D}}\ \underbrace{\sum_k-\log\phi_k(\mathcal{V}_k)}_{\triangleq\,\mathcal{L}(\Theta,\mathcal{D})}.
+  \label{eq:semantic-hybrid-neglog}
+\end{equation}
+和纯几何一样，常把离散-连续因子写成可接入 \cref{ch:nlopt} 工具（如 iSAM2\cite{kaess2012isam2}）的非线性最小二乘形式 $-\log\phi_k(\Theta_k,\mathcal{D}_k)=\|r_k(\Theta_k,\mathcal{D}_k)\|_2^2$（$r_k$ 对 $\Theta$ 可微）\cite{doherty2022discrete}。
+
+\paragraph{条件独立 $\Rightarrow$ 分块。}
+高效求解的钥匙，是 \cref{sec:est-fg} 那条老规矩——\emph{局部性 $\Rightarrow$ 可分解}。把离散态切成互斥子集 $\mathcal{D}_j$，若它们在给定连续态下\emph{条件独立}：
+\begin{equation}
+  p(\mathcal{D}\mid\Theta,Z)\propto\prod_j p(\mathcal{D}_j\mid\Theta,Z),
+  \label{eq:semantic-hybrid-condind}
+\end{equation}
+则最大化拆成独立子问题 $\max_{\mathcal{D}}p(\mathcal{D}\mid\Theta,Z)\propto\prod_j[\max_{\mathcal{D}_j}p(\mathcal{D}_j\mid\Theta,Z)]$\cite{doherty2022discrete}。当每个 $\mathcal{D}_j$ 都\emph{小}（$|\mathcal{D}_j|\ll|\mathcal{D}|$）时，离散搜索就便宜了——“积的最大 $=$ 各最大之积”，正是 \cref{thm:elimination} 变量消元化指数为多项式的同一思想。点云配准（关联变量）、鲁棒 PGO（外点开关变量）、物体级 SLAM（关联 $+$ 类别）都吃这套“友好”分解\cite{carlone2026handbook}。
+
+\subsection{三条求解策略}
+\label{sec:semantic-hybrid-solve}
+
+\paragraph{(一) 交替最小化（DC-SAM）。}
+最直接的是\emph{块坐标下降}：固定连续态 $\Theta^{(t)}$ 解离散、再固定离散态解连续，交替到收敛\cite{doherty2022discrete}：
+\begin{equation}
+  \mathcal{D}^{(t+1)}=\arg\min_{\mathcal{D}}\mathcal{L}(\Theta^{(t)},\mathcal{D}),
+  \qquad
+  \Theta^{(t+1)}=\arg\min_{\Theta}\mathcal{L}(\Theta,\mathcal{D}^{(t+1)}).
+  \label{eq:semantic-hybrid-dcsam}
+\end{equation}
+连续子问题用 \cref{ch:nlopt} 的 GN/LM、离散子问题用变量消元——\emph{每个子问题都不必解到最优}，且可推广为更细的分块。这就是把“离散 $+$ 连续”拆成两个我们都会解的子问题轮流打。
+
+\paragraph{(二) EM 与软关联（permanent，选读）。}
+另一条是\emph{期望最大化（EM）}\cite{bowman2017probabilistic}：E 步固定位姿与路标、算\emph{数据关联概率}与类别（\emph{软}关联——不硬指派，按概率加权）；M 步固定这些概率、用按关联概率\emph{加权}的测量优化位姿与路标。如此渐近收敛到 \cref{eq:semantic-hybrid-map} 的局部最优。一个漂亮的结论：E 步那些软关联概率可由\emph{矩阵积和式（permanent）}\emph{精确}恢复，近似 permanent 即可高效近似它\cite{atanasov2016localization}。EM 的“软”比 DC-SAM 的“硬指派”更平滑，常更不易陷坏局部极小。
+
+\paragraph{(三) 多假设与连续松弛。}
+\emph{多假设}法\cite{hsiao2019dynamicmh}显式搜索若干离散指派、用启发式剪枝控制指数爆炸（如 MH-iSAM2）。\emph{连续松弛}则把离散优化\emph{化为连续}\cite{sunderhauf2016dual}：把 $K$ 类标签的概率放到 $(K{-}1)$ 维单纯形上当连续变量优化——与 \cref{ch:loop} 的鲁棒外点开关同思路，只是从二选一推广到多类。也有方法把所有离散态\emph{边缘化}掉、用非高斯求解器近似那个混合后验\cite{fourie2017nonparametric}。
+
+\begin{table}[H]\centering\small
+\caption{离散-连续混合 MAP 的三条求解策略}
+\label{tab:semantic-solve}
+\begin{tabular}{p{0.18\textwidth} p{0.34\textwidth} p{0.36\textwidth}}
+\toprule
+策略 & 怎么处理离散 & 接回本书 \\
+\midrule
+交替最小化（DC-SAM） & 硬指派，固定连续解离散、固定离散解连续 & 连续步用 \cref{ch:nlopt} GN/iSAM2 \\
+EM 软关联 & 按关联概率加权（permanent 精确恢复） & 加权最小二乘（\cref{sec:est-ls}） \\
+多假设 / 连续松弛 & 搜索剪枝 / 放到单纯形当连续变量 & 松弛与鲁棒外点开关同源（\cref{ch:loop}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{稠密度量-语义：多类贝叶斯建图}
+\label{sec:semantic-dense}
+
+转到稠密一支。本节把 \cref{ch:dense} 的稠密表示（点、面元、体素、网格）升维成\emph{带语义}的版本。核心是\textbf{把二值占据推广为多类占据}——这是本书 \cref{sec:dense-octomap} 二值 log-odds 的直接多类化，也是教材最该补的一节。
+
+\subsection{点与面元的语义融合：冲突即降信}
+\label{sec:semantic-dense-point}
+
+\paragraph{逐点语义与空间融合难题。}
+有了大规模标注数据，可直接在点云上学语义/全景分割\cite{milioto2019rangenet,behley2019semantickitti}，于是激光 SLAM 可\emph{逐点}带语义建图\cite{chen2019suma++}。语义不仅入图，还反哺：用语义辅助里程计的对应（只匹配\emph{语义相容}的特征）、用语义场景描述子辅助回环（\cref{ch:loop}）\cite{li2021saloam,kim2018scancontext}。但有个核心难题：\emph{每帧分割可能互相冲突}（同一面元这帧标“车”、下帧标“路”），如何把逐帧语义\emph{一致地}融成一张图？
+
+\paragraph{面元置信：冲突标签降信、低信滤除。}
+一种早期且有效的做法（SuMa++\cite{chen2019suma++}）：给每个\emph{面元}（\cref{sec:dense-surfel}）附\emph{语义类别 $+$ 置信分数}，用语义置信与测量不确定度一起更新面元置信，使\emph{冲突}的语义标签\emph{压低}该面元置信；置信过低的面元（要么测量不准、要么语义不准）被滤除\cite{chen2019suma++}。一个反直觉的发现：\emph{不要}单凭语义把所有“可能会动”的物体一律删掉——城市里车极多，把车全删会丢掉对 ICP 配准有用的结构；只删\emph{语义冲突}处更好\cite{chen2019suma++}。这与 \cref{sec:dense-surfel} 面元置信融合\emph{同一套机制}，只是把“几何置信”扩成“几何 $+$ 语义置信”。
+
+\subsection{多类 log-odds 体素：二值占据的直接推广}
+\label{sec:semantic-dense-voxel}
+
+这是本节的硬核。我们把 \cref{sec:dense-octomap} 的二值占据 log-odds（\cref{eq:dense-octo-logodds}）逐字推广到\emph{多类}。
+
+\paragraph{从二值占据到多类语义。}
+回忆 \cref{sec:dense-octomap}：体素地图把环境切成不重叠的小方块，每块存\emph{占据}（自由/占据二态）。多类语义建图把环境 $\mathcal{E}$ 切成不相交子集 $\mathcal{E}_k$（$k\in\mathcal{K}=\{0,\dots,K\}$，$\mathcal{E}_0$ 为自由空间、$k{>}0$ 为各物体类如建筑、车、地形）\cite{asgharivaskasi2023semantic}。传感器沿每条射线 $\boldsymbol\eta_b$ 给出\emph{距离 $+$ 类别}：把相机/激光测量喂语义分割（\cref{ch:learning}），得\emph{range-category 观测} $\mathcal{Z}_t=\{\mathbf{z}_{t,b}\}_b$，$\mathbf{z}=(r,y)\in\mathbb{R}_{>0}\times\mathcal{K}$（沿射线 $\mathbf{R}_t\boldsymbol\eta_b+\mathbf{p}_t$ 的距离 $r$ 与类别 $y$）\cite{asgharivaskasi2023semantic}。目标：增量地建一张\emph{多类}地图——每个体素 $i$ 标一个类别 $m_i\in\mathcal{K}$。这就是把二值占据的“占据/自由”换成“$K{+}1$ 类”。
+
+\paragraph{贝叶斯更新的形式与二值版完全同构。}
+设 $p_t(\mathbf{m})$ 是给定到 $t$ 时刻轨迹与观测的地图后验 PMF。来一帧新观测 $\mathcal{Z}_{t+1}$，贝叶斯更新与 \cref{eq:dense-octo-bayes} \emph{同型}：
+\begin{equation}
+  p_{t+1}(\mathbf{m})\propto p(\mathcal{Z}_{t+1}\mid\mathbf{m})\,p_t(\mathbf{m}).
+  \label{eq:semantic-bayes}
+\end{equation}
+为保证关于地图大小 $N$ 的\emph{线性}复杂度，仍如二值版假设体素间\emph{独立}，$p_t(\mathbf{m})=\prod_{i=1}^N p_t(m_i)$\cite{asgharivaskasi2023semantic}（这正是 \cref{sec:dense-octomap} “逐体素独立”假设的多类沿用）。
+
+\paragraph{多类 log-odds 向量：标量升成向量、sigmoid 升成 softmax。}
+二值版把单个体素的占据概率存成\emph{一个标量} log-odds $\ell=\log\frac{p}{1-p}$（\cref{eq:dense-octo-logit}）。多类版把它升成\emph{一个向量}——以\emph{自由类} $\sigma{=}0$ 为枢轴，存各类相对自由类的对数似然比：
+\begin{equation}
+  \mathbf{h}_{t,i}:=\Big[\,\log\tfrac{p_t(m_i=1)}{p_t(m_i=0)}\ \cdots\ \log\tfrac{p_t(m_i=K)}{p_t(m_i=0)}\,\Big]^\top\in\mathbb{R}^{K+1},
+  \label{eq:semantic-logodds-vec}
+\end{equation}
+（首元约定为 $\log\tfrac{p_t(m_i=0)}{p_t(m_i=0)}{=}0$，即自由类自身比值为 $1$、对数为 $0$\footnote{Handbook 源文此处有印刷笔误，首项印成 $\log\frac{p_t(m_i=0)}{p_t(m_i=0)}$ 之外又重复了一次 $m_i{=}0$；本书按多项式 logit 模型的标准定义改正：枢轴类自身对数比为 $0$，其余各类相对枢轴。}）。给定 $\mathbf{h}_{t,i}$，体素类别 PMF 由\emph{softmax} $\boldsymbol\varsigma:\mathbb{R}^{K+1}\to\mathbb{R}^{K+1}$ 恢复（二值版 sigmoid 的多类推广）：
+\begin{equation}
+  p_t(m_i=k)=\varsigma_{k+1}(\mathbf{h}_{t,i})=\frac{\exp(h_{t,i,k})}{\sum_{k'=0}^{K}\exp(h_{t,i,k'})}.
+  \label{eq:semantic-softmax}
+\end{equation}
+
+\begin{insight}[二值占据是 $K{=}1$ 的特例——一脉相承]
+取 $K{=}1$（只有“占据”一类 $+$ 自由类 $\sigma{=}0$），\cref{eq:semantic-logodds-vec} 退化成\emph{单}元向量 $\mathbf{h}_{t,i}=[\,0,\ \log\tfrac{p(\text{占据})}{p(\text{自由})}\,]$，第二元正是 \cref{eq:dense-octo-logit} 的二值 log-odds $\ell$；\cref{eq:semantic-softmax} 的 softmax 退化成 \cref{eq:dense-octo-logit} 的 sigmoid。\textbf{即 \cref{sec:dense-octomap} 的整套二值占据建图，是本节多类建图在 $K{=}1$ 时的特例。}这不是巧合——多项式 logit 之于二项 logit，正如多类占据之于二值占据。读这一节，就是把 \cref{sec:dense-octomap} 你已熟的那套“log-odds 加性更新 $+$ clamping $+$ 八叉树”，整体往“多类”方向平移一格。
+\end{insight}
+
+\paragraph{加性贝叶斯更新：乘法仍变加法。}
+二值版最优雅处是 log-odds 下“贝叶斯乘法变加法”（\cref{eq:dense-octo-logodds}）。多类版\emph{原样保持}——\cref{eq:semantic-bayes} 对 $\mathbf{h}_{t,i}$ 的更新是\emph{向量加法}：
+\begin{equation}
+  \boxed{\ \mathbf{h}_{t+1,i}=\mathbf{h}_{t,i}+\sum_{\mathbf{z}\in\mathcal{Z}_{t+1}}\boldsymbol\ell_i(\mathbf{z})\ }
+  \label{eq:semantic-logodds-update}
+\end{equation}
+其中观测模型 log-odds 增量 $\boldsymbol\ell_i(\mathbf{z})\in\mathbb{R}^{K+1}$（同样以自由类为枢轴）：
+\begin{equation}
+  \boldsymbol\ell_i(\mathbf{z}):=\Big[\,\log\tfrac{p(\mathbf{z}\mid m_i=1)}{p(\mathbf{z}\mid m_i=0)}\ \cdots\ \log\tfrac{p(\mathbf{z}\mid m_i=K)}{p(\mathbf{z}\mid m_i=0)}\,\Big]^\top,
+  \label{eq:semantic-logodds-obs}
+\end{equation}
+首元约定为 $0$\cite{asgharivaskasi2023semantic}。把 \cref{eq:semantic-logodds-update} 与 \cref{eq:dense-octo-logodds} 并排：二值是标量相加、多类是向量相加，更新规则\emph{一模一样}——预先算好每个观测的 $\boldsymbol\ell_i(\mathbf{z})$，更新时连对数都不必再算。\textbf{这就是把 \cref{eq:dense-octo-logodds} 从标量升成向量。}
+
+\begin{derivation}[\cref{eq:semantic-logodds-update} 由贝叶斯更新逐行得出（多项式 logit）]
+对 \cref{eq:semantic-bayes} 取“类 $k$ 比枢轴类 $0$”的对数比：
+\[
+  \log\frac{p_{t+1}(m_i{=}k)}{p_{t+1}(m_i{=}0)}
+  =\log\frac{p(\mathbf{z}\mid m_i{=}k)}{p(\mathbf{z}\mid m_i{=}0)}+\log\frac{p_t(m_i{=}k)}{p_t(m_i{=}0)},
+\]
+归一化常数在比值中\emph{消掉}（这正是取枢轴比的目的，与二值版消去 $p(\mathbf{z})$ 同理）。逐 $k$ 写成向量即 \cref{eq:semantic-logodds-update}，多个观测的 log-odds 增量再相加。这是 \cref{sec:dense-octomap} “从 \cref{eq:dense-octo-bayes} 到 \cref{eq:dense-octo-logodds}”那段二值推导的逐分量复制——把标量的“占据/自由”换成向量的“各类/枢轴”。
+\end{derivation}
+
+\paragraph{分段常数观测模型。}
+还需一个具体的观测模型 $\boldsymbol\ell_i(\mathbf{z})$。射线沿途的语义信息分三种情形（与 \cref{eq:dense-octo-sensor} 二值逆传感器模型同构）：射线\emph{终点}所在体素被观测为\emph{占据}且属类别 $y$；终点\emph{之前}沿途体素被观测为\emph{自由}；射线\emph{未穿过}的体素无信息。于是把 $\boldsymbol\ell_i(\mathbf{z})$ 参数化为沿射线的\emph{分段常数}\cite{asgharivaskasi2023semantic}：
+\begin{equation}
+  \boldsymbol\ell_i\big((r,y)\big):=
+  \begin{cases}
+    \boldsymbol\phi^{+}+\mathbf{E}_{y+1}\boldsymbol\psi^{+}, & r\ \text{指示}\ m_i\ \text{占据},\\
+    \boldsymbol\phi^{-}, & r\ \text{指示}\ m_i\ \text{自由},\\
+    \mathbf{0}, & \text{否则},
+  \end{cases}
+  \label{eq:semantic-obs-piecewise}
+\end{equation}
+$\mathbf{E}_k:=\mathbf{e}_k\mathbf{e}_k^\top$、参数向量 $\boldsymbol\psi^{+},\boldsymbol\phi^{-},\boldsymbol\phi^{+}\in\mathbb{R}^{K+1}$（首元置 $0$ 以保证 $\boldsymbol\ell_i$ 是合法语义 log-odds）；这些参数可手调或从数据学\cite{asgharivaskasi2023semantic,gan2020bayesian}。直观：终点体素既增“占据”证据（$\boldsymbol\phi^{+}$）又专门增\emph{观测到的那一类} $y$ 的证据（$\mathbf{E}_{y+1}\boldsymbol\psi^{+}$），沿途体素增“自由”证据（$\boldsymbol\phi^{-}$）。\cref{eq:semantic-obs-piecewise} 的三段，正是 \cref{eq:dense-octo-sensor} 二值“占据/自由”两态\emph{加上类别那一维}的推广。
+
+\subsection{多类八叉树与协同建图}
+\label{sec:semantic-dense-octree}
+
+\paragraph{多类 OctoMap：八叉树存语义 log-odds 向量。}
+规则栅格存储/计算开销大；\cref{sec:dense-octomap} 的 OctoMap\cite{hornung2013octomap} 用八叉树合并等占据体素来省内存。多类版把它推广为\emph{多类八叉树}\cite{asgharivaskasi2023semantic}：每个节点存一个语义 log-odds 向量 $\mathbf{h}_{t,i}$（而非二值标量）。更新一帧时同样\emph{光线投射}找被观测叶节点，对每个待更新叶节点递归展开到最小分辨率、用 \cref{eq:semantic-logodds-update} 更新其语义 log-odds。\emph{父节点聚合}两种策略（与 \cref{sec:dense-octomap} 的“平均 vs 最大”同理）：保守地取占据概率最高的子节点语义、或取子节点语义 log-odds 的\emph{平均}（等价于原概率空间的贝叶斯融合）。\emph{剪枝}：每帧更新后自底向上检查，若某内节点的 $8$ 个子全为叶且语义 log-odds\emph{相等}，则合并为一个叶——大片自由空间由此压成少数大叶，正如二值八叉树。
+
+\begin{pitfall}[多类八叉树两个工程坑：剪枝率随 $K$ 跌、信息封顶]
+\textbf{坑一：剪枝概率随类别数 $K$ \emph{指数}下降。}二值时两个体素同占据概率就能合并；多类时要 $K{+}1$ 维 log-odds\emph{全相等}才能合并——$K$ 越大越难凑齐，剪枝越稀，内存与计算\emph{线性}涨而剪枝机会\emph{指数}减\cite{asgharivaskasi2023semantic}。对策：只为\emph{最可能的 $\bar K$ 类}存 log-odds，其余归并进一个“others”维——大幅提剪枝、降复杂度。\textbf{坑二：log-odds 须封顶（clamping），与 \cref{eq:dense-octo-clamp} 同因。}传感器噪声使同类体素难达\emph{完全相同}的 log-odds，剪枝难触发；给 log-odds 各元设上下限，让体素到达\emph{稳定态}，更易凑相等而剪枝——这正是 \cref{eq:dense-octo-clamp} 的二值 clamping 在多类下的搬用，代价同样是靠近 $p{=}1$ 处的微小信息损失。
+\end{pitfall}
+
+\paragraph{协同多机器人语义建图（选读）。}
+多机器人可\emph{协同}建多类八叉树。一种做法（ROAM\cite{asgharivaskasi2023roam}）把它写成\emph{图上的优化}：节点变量是各机器人的局部八叉树，加一个\emph{共识约束}要求机器人对地图达成一致；基于分布式黎曼优化、只靠\emph{一跳}通信即可达成共识并有最优性保证。这与 \cref{ch:learning} 末尾、\cref{ch:openworld} 将讨论的多机协作是同一脉络——把单机的语义地图“拼”成全局一致的共享地图。
+
+\subsection{网格语义与 PGMO：把回环形变化简为 PGO}
+\label{sec:semantic-dense-mesh}
+
+\paragraph{为什么要网格。}
+体素图便于概率融合，却有两个短板\cite{rosinol2021kimera}：存储贵（八叉树仅部分缓解），且\emph{回环来时难形变}——回环会让轨迹与地图大幅变形，而体素图要\emph{反积分再重积分}旧观测，极贵。\emph{网格}（\cref{sec:dense-mesh}）的存储随场景复杂度而非体积增长，且\emph{易形变}：常先建局部体素图、随体素离开活动窗口增量转成网格\cite{rosinol2021kimera}。本节讲网格如何随回环形变——一种叫\emph{位姿图与网格联合优化（PGMO）}的方法\cite{rosinol2021kimera}。
+
+\paragraph{嵌入形变图。}
+PGMO 建在\emph{嵌入形变图（embedded deformation graph）}上\cite{sumner2007embedded}：把原网格降采样成一组\emph{控制节点}，每个节点附一个局部坐标系，整图通过一个\emph{强制图边局部刚性}的优化来形变；解出控制节点的形变后，再\emph{插值}回稠密网格。对稠密度量-语义 SLAM，形变图由\emph{机器人位姿图} $+$ \emph{降采样网格}共同构成：位姿顶点 $\mathbf{X}_i$（机器人位姿）按位姿图连边、网格顶点 $\mathbf{M}_k$ 按简化网格的边连边，若网格顶点 $k$ 对位姿 $i$ 的传感器可见则在二者间连边。
+
+\paragraph{回环触发的形变即一个 PGO。}
+一旦触发形变（检测到回环），优化形变图，代价含三项\cite{rosinol2021kimera}：
+\begin{equation}
+  \min_{\{\mathbf{X}_i\},\{\mathbf{M}_k\}\in\SE(3)}
+  \underbrace{\sum_{ij}\|\mathbf{X}_i\mathbf{Z}_{ij}-\mathbf{X}_j\|^2_{\boldsymbol\Omega_{ij}}}_{\text{(1) PGO}}
+  +\underbrace{\sum_{k}\sum_{l}\|\mathbf{R}_k^M(\mathbf{g}_l-\mathbf{g}_k)+\mathbf{t}_k^M-\mathbf{t}_l^M\|^2_{\boldsymbol\Omega_{kl}}}_{\text{(2) 网格-网格刚性}}
+  +\underbrace{\sum_{i}\sum_{l}\|\mathbf{R}_i^X\tilde{\mathbf{g}}_{il}+\mathbf{t}_i^X-\mathbf{t}_l^M\|^2_{\boldsymbol\Omega_{il}}}_{\text{(3) 位姿-网格刚性}},
+  \label{eq:semantic-pgmo}
+\end{equation}
+第一项就是普通\emph{位姿图优化}（\cref{sec:lidar-pgo}），第二项罚相邻网格顶点的相对形变（局部刚性）、第三项罚位姿顶点与其可见网格顶点的相对形变；$\mathbf{g}_k$ 是网格顶点初始位置、$\tilde{\mathbf{g}}_{il}$ 是顶点 $l$ 在位姿 $i$ 局部系下的初始位置\cite{rosinol2021kimera}。\textbf{关键结论}：把每条边的相对变换统一记 $\mathbf{E}_{ij}$、顶点记 $\mathbf{T}_i$，\cref{eq:semantic-pgmo} 可\emph{整体重写成一个经典 PGO}
+\begin{equation}
+  \min_{\{\mathbf{T}_i\}\in\SE(3)}\ \sum_{\mathbf{E}_{ij}}\|\mathbf{T}_i\mathbf{E}_{ij}-\mathbf{T}_j\|^2_{\boldsymbol\Omega_{ij}}.
+  \label{eq:semantic-pgmo-pgo}
+\end{equation}
+于是\emph{回环形变 $=$ 一次位姿图优化}——本书 \cref{sec:lidar-pgo} 那套 PGO 求解器原样可用！解完后，每个网格顶点由其最近 $m$ 个控制节点的形变\emph{加权插值}更新：$\tilde{\mathbf{v}}_i=\sum_{j}w_j(\mathbf{v}_i)[\mathbf{R}_j^M(\mathbf{v}_i-\mathbf{g}_j)+\mathbf{t}_j^M]$，权重按到控制节点的距离平方衰减\cite{rosinol2021kimera}。
+
+\begin{insight}[PGMO 的妙处：把“稠密形变”降维成“稀疏位姿图”]
+回环要形变\emph{整张}稠密网格（百万顶点），直接优化不可行。PGMO 的关键是：用少量控制节点（位姿 $+$ 降采样网格）撑起形变、把它写成 \cref{eq:semantic-pgmo-pgo} 的\emph{稀疏 PGO}（顶点数 $\ll$ 网格顶点数），解完再\emph{插值}回稠密网格。\textbf{这与本书一贯的“稀疏化”智慧同源}——\cref{sec:est-fg} 用稀疏因子图避开稠密大矩阵、\cref{ch:learning} 的 DROID 用 Schur 消元处理稠密深度，PGMO 则用控制节点把稠密形变压成稀疏位姿图。语义网格的回环修正，就这样\emph{完全落回}本书已有的 PGO 后端。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{分层度量-语义表示与 3D 场景图}
+\label{sec:semantic-graph}
+
+至此稀疏（\cref{sec:semantic-object}）与稠密（\cref{sec:semantic-dense}）各有所长：稀疏便于操纵物体，稠密擅长编码自由空间与可通行性。本节给出把二者\emph{统一}的\textbf{分层}表示——它把语义组织成多层级（稠密曲面 $\to$ 物体 $\to$ 区域 $\to$ 楼层），不仅省内存，还能高效推断。这是 \cref{tab:dense-maptypes} 那行“混合地图（度量 $+$ 拓扑 $+$ 语义分层）”的兑现。
+
+\subsection{符号落地与分层省内存}
+\label{sec:semantic-graph-mem}
+
+\paragraph{符号落地问题。}
+我们一直处理的闭集语义类别，是\emph{符号}（symbol）的\emph{落地（grounding）}——把对人有意义的概念（‘椅子’）关联到机器人传感数据\cite{harnad1990symbol}。人发的高层指令（“去把椅子搬来”）天然含符号；机器人要执行，就得把符号‘椅子’落地到它所在的物理位置。直接把符号落到\emph{原始传感数据}（每个像素贴标签）不可扩展——图像采样率高、存储贵。于是需要\emph{中间（子符号）}表示，把原始数据压成紧凑格式再落地符号。本章前几节的几何表示（点/面元/体素/网格），正是这些\emph{子符号}表示。
+
+\paragraph{分层把内存从“处处冗余”降到“按层组织”。}
+最朴素的符号落地，是\emph{每个体素}都存“是否含某符号”（$L$ 个关心的符号）。分辨率 $\delta$、体积 $V$ 的体素栅格内存为
+\begin{equation}
+  m=\mathcal{O}\!\big(L\cdot V/\delta^3\big).
+  \label{eq:semantic-mem-flat}
+\end{equation}
+但关心的符号常\emph{自带层次}（室内有物体、房间、楼层）。与其在每个体素冗余存，不如按层次\emph{重排}成一张\emph{图}：节点是物体/房间/楼层，边表\emph{包含}关系（楼的子节点是房间、房间的子节点是物体）\cite{hughes2022hydra}。内存降为
+\begin{equation}
+  m=\mathcal{O}\!\big(V/\delta^3+N_{\text{物体}}+N_{\text{房间}}+\dots+N_{\text{楼层}}\big),
+  \label{eq:semantic-mem-hier}
+\end{equation}
+且这是\emph{无损}压缩——原稠密体素栅格可从分层表示恢复\cite{hughes2022hydra}。若子符号本身用更省的表示（八叉树或自由空间聚类）替代稠密体素，内存进一步降为
+\begin{equation}
+  m=\mathcal{O}\!\big(N_{\text{子符号}}+N_{\text{物体}}+N_{\text{房间}}+\dots+N_{\text{楼层}}\big),
+  \label{eq:semantic-mem-lossy}
+\end{equation}
+$N_{\text{子符号}}\ll V/\delta^3$，但此时常为\emph{有损}\cite{hughes2022hydra}。
+
+\subsection{分层图、treewidth 与可高效推断}
+\label{sec:semantic-graph-tw}
+
+\paragraph{分层图的定义。}
+分层省的不只是内存，还有\emph{计算}。先把“分层”形式化\cite{hughes2022hydra}：
+
+\begin{definition}[分层图]\label{def:semantic-hier-graph}
+图 $\mathcal{G}=(\mathcal{V},\mathcal{E})$ 称\emph{分层}，若顶点 $\mathcal{V}$ 可划分为 $l$ 层（$\mathcal{V}=\bigcup_{i\in1:l}\mathcal{V}_i$，第 $1$ 层最低、第 $l$ 层最高），满足：
+\begin{enumerate}
+  \item \textbf{单亲}：子节点 $v\in\mathcal{V}_i$ 与父节点 $u\in\mathcal{V}_{i+1}$ 若有边，则 $v$ 不再与 $\mathcal{V}_{i+1}$ 中其它节点有边；
+  \item \textbf{局部性}：任意跨层边只在\emph{相邻}两层间（无 $(u,v)$ 满足 $u\in\mathcal{V}_i,v\in\mathcal{V}_j,|i-j|>1$）；
+  \item \textbf{子节点不相交}：同层任意两节点 $u,v\in\mathcal{V}_{i+1}$ 的子节点集 $\mathcal{C}(u),\mathcal{C}(v)$ 不相交（无边相连）。
+\end{enumerate}
+\end{definition}
+
+这三条意味着：任一节点 $v\in\mathcal{V}_i$ 的后代树，与同层任何其它节点的后代树\emph{不相交}\cite{hughes2022hydra}。
+
+\paragraph{treewidth 界：小树宽即可多项式时间推断。}
+\cref{def:semantic-hier-graph} 的结构允许存在一个\emph{分层树分解}，并给出分层图\emph{树宽（treewidth）}的界\cite{hughes2022hydra}：
+\begin{equation}
+  \operatorname{tw}[\mathcal{G}]\ \le\ \max_{v\in\mathcal{V}}\operatorname{tw}\big[\mathcal{G}[\mathcal{C}(v)]\big]+1,
+  \label{eq:semantic-treewidth}
+\end{equation}
+$\mathcal{G}[\mathcal{C}(v)]$ 是 $v$ 的子节点诱导的子图。树宽是图上推断\emph{计算复杂度}的关键度量\cite{koller2009pgm}：一般图上的推断 NP-难（\cref{sec:est-fg} 已见），\emph{但证明图的树宽小，就打开了多项式时间精确推断的大门}。\cref{eq:semantic-treewidth} 说：只要每个节点的\emph{子节点子图}树宽小，整张分层图的树宽就小——这对一大类称\emph{3D 场景图}的分层图在实践中成立\cite{hughes2022hydra}。
+
+\begin{insight}[treewidth 界 $=$ \cref{thm:elimination} 在分层语义图上的回响]
+\cref{sec:est-fg} 讲过：因子图的\emph{变量消元}等价于稀疏矩阵分解，而消元的代价由\emph{fill-in}（即树宽）决定，求最小 fill-in 排序 NP-难、靠 COLAMD 等启发式（\cref{sec:est-fg-linear}）。\cref{eq:semantic-treewidth} 是同一故事的语义版：分层结构\emph{天然}保证小树宽，于是\emph{不必}靠启发式去找好排序——层次本身就给了一个好的消元序。\textbf{这正是“几何 SLAM 的稀疏性洞见”在语义地图上的升维}：经典 SLAM 靠因子图局部性获得稀疏可解，分层语义地图靠层次结构获得小树宽可解，背后是同一条“结构 $\Rightarrow$ 高效推断”的主线。
+\end{insight}
+
+\subsection{3D 场景图：分层度量-语义地图}
+\label{sec:semantic-graph-scene}
+
+\paragraph{定义与谱系。}
+\emph{3D 场景图}是把场景的语义与空间信息组织成分层图的具体落地。本书把它定义为图 $\mathcal{G}=(\mathcal{V},\mathcal{E})$：每个节点 $v$ 带属性 $\mathbf{x}_v$（含\emph{位置}信息——场景图\emph{空间地}落地符号），每条边 $e$ 带属性 $\mathbf{x}_e$（空间关系，如\emph{包含}、\emph{之上}、\emph{邻近}）。通常按层划分 $\mathcal{V}=\bigcup_i\mathcal{V}_i$\cite{armeni2019scenegraph,rosinol2021kimera}。这一概念在不同社区略有差异：有的把它定义为物体及其关系的图\cite{wald2020scenegraph}、有的强调度量-语义分层（物体、房间、自由空间“地点”，乃至动态实体如人）\cite{rosinol2021kimera}；本书取\emph{在线、全分层、全局一致}的版本——第一个能在线产出含物体、地点、房间且可\emph{校正回环以保持全局一致}的分层场景图\cite{hughes2022hydra}（\cref{fig:semantic-scenegraph}）。场景图常\emph{从}稠密度量或度量-语义表示\emph{聚类/分割}得来（把稠密表示压成稀疏的物体符号落地），更省算。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, font=\small,
+  L/.style={draw, rounded corners, align=center, minimum height=6.5mm, inner sep=3pt},
+  l4/.style={L, fill=third!14, draw=third!60!black},
+  l3/.style={L, fill=second!12, draw=second!60!black},
+  l2/.style={L, fill=main!12, draw=main!60!black},
+  l1/.style={L, fill=gray!12, draw=gray!55!black},
+  ed/.style={->, gray!55!black, thick}]
+  \node[l4] (floor) {楼层 \;(\cref{def:semantic-hier-graph} 顶层)};
+  \node[l3, below=8mm of floor] (rooms) {房间 \;房间A\;\;房间B};
+  \node[l2, below=8mm of rooms] (obj) {物体 \;椅子\;\;桌子\;\;门};
+  \node[l1, below=8mm of obj] (places) {地点 / 自由空间拓扑 \;(可通行)};
+  \node[l1, below=7mm of places] (metric) {度量层：稠密网格 / 多类八叉树（\cref{sec:semantic-dense}）};
+  \draw[ed] (floor)--(rooms) node[midway,right,font=\scriptsize]{包含};
+  \draw[ed] (rooms)--(obj) node[midway,right,font=\scriptsize]{包含};
+  \draw[ed] (obj)--(places) node[midway,right,font=\scriptsize]{落地于};
+  \draw[ed] (places)--(metric) node[midway,right,font=\scriptsize]{聚类自};
+\end{tikzpicture}
+\caption{3D 场景图（分层度量-语义地图，仿 \cite{hughes2022hydra,rosinol2021kimera} 重绘）。自底向上：度量层（多类八叉树/网格，\cref{sec:semantic-dense}）$\to$ 自由空间地点（拓扑）$\to$ 物体（\cref{sec:semantic-object}）$\to$ 房间 $\to$ 楼层。层间边表\emph{包含}关系，满足 \cref{def:semantic-hier-graph} 的单亲/局部性/子节点不相交，故树宽小（\cref{eq:semantic-treewidth}）、可高效推断。它统一了本章的稀疏（物体）与稠密（体素/网格）两支。}
+\label{fig:semantic-scenegraph}
+\end{figure}
+
+\paragraph{层间边与关系。}
+层间边常编码\emph{空间包含}（房间-物体边表“物体在房间内”），由此构成分层图、可高效推断\cite{hughes2022hydra}。边也可编码\emph{之上}、\emph{邻近}等关系（常在物体间），可\emph{有向}（“书\emph{在}桌上”方向有别）\cite{wald2020scenegraph}。注意\emph{左/右、后方}这类\emph{视角相关}关系在 3D 场景图里意义不大（不像 2D 场景图）。
+
+\paragraph{因子图与场景图的联合优化。}
+和稠密图一样，场景图也要\emph{随回环高效校正}。一种做法\cite{hughes2022hydra}把场景图与底层稠密表示\emph{联合优化}：在 \cref{eq:semantic-pgmo} 的 PGMO（位姿 $+$ 网格控制点）里\emph{再加入“地点”层}一起优化，给出结构先验；解完用它\emph{插值精化}其余层（而非从头重建）。也有方法\cite{bavle2022situational}在场景图各层间加更多因子、一次性优化整张场景图来纠漂移——代价是不再能写成纯 PGO（\cref{eq:semantic-pgmo-pgo}）。\textbf{无论哪种，场景图的优化都坐落在本书因子图后端（\cref{sec:est-fg}）之上}——回环修正是 PGO 的扩展、推断高效靠小树宽，全是本书已建立的工具。
+
+\begin{pitfall}[3D 场景图不是“画好就完”的静态注释]
+易把场景图当成事后画的漂亮注释图。实则它是\emph{在线、随 SLAM 一起增量构建并随回环校正}的\emph{活}地图：层（房间、楼层）要在线\emph{分割}出来、回环要把整张分层图\emph{形变}回全局一致（\cref{eq:semantic-pgmo-pgo}）。难点恰在此：层定义在室外/非结构场景里难界定，层的划分常\emph{硬编码}而非自适应任务，且\emph{分层、混离散连续}变量的\emph{不确定性量化}（\cref{ch:eskf} 在纯几何 SLAM 已成熟）至今基本空白。这些是 3D 场景图的活跃前沿，也是它区别于“一张语义示意图”的本质。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{从闭集到开集：交接给开放世界}
+\label{sec:semantic-closing}
+
+\paragraph{本章止于闭集。}
+本章自始至终在\emph{闭集}语义下工作——类别来自一个固定有限的词典。在这一假设下，我们把经典 SLAM 的两端各升了一维：稀疏端的\emph{物体级因子}（\cref{sec:semantic-object}）是重投影 BA 的推广、稠密端的\emph{多类 log-odds}（\cref{sec:semantic-dense}）是二值占据的推广、离散类别经\emph{混合 MAP}（\cref{sec:semantic-hybrid}）接进因子图、分层\emph{3D 场景图}（\cref{sec:semantic-graph}）靠小树宽高效推断。几何骨架（因子图 $+$ log-odds $+$ PGO）一概沿用——语义是\emph{升维}，不是另起炉灶。
+
+\paragraph{闭集的天花板。}
+但固定词典是把双刃剑。机器人一旦遇到词典外的概念（一个没训过的物件、一句“把那个\emph{毛茸茸}的东西拿开”里的属性查询、一个\emph{功能性}查询“我能坐哪”），闭集系统就\emph{答不出}——它只认识训练时定义的那 $K$ 类。要让地图回答\emph{任意}概念，就得把“离散类别 $\sigma$”换成\emph{连续}的\emph{语言特征向量}：用视觉-语言模型（VLM）把图像区域编码成与\emph{文本}对齐的嵌入，落地到地图元素上，查询时比对文本嵌入与地图嵌入的相似度。这就是\emph{开集（open-set）}/开放词汇语义。
+
+\paragraph{交接：骨架沿用，离散变连续。}
+\cref{ch:openworld} 接续这条递进——而本章铺好的骨架\emph{原样可用}：那里的“地图元素 $=$ 几何 $+$ 语义特征”是 \cref{def:semantic-object} 物体路标的开集版（类别 $\sigma$ 换成特征向量）、“range-feature 观测”是 \cref{sec:semantic-dense-voxel} range-category 观测的开集版（类别 $y$ 换成特征）、“开放词汇场景图”是 \cref{sec:semantic-graph-scene} 3D 场景图的开集版。换言之，\textbf{把本章的“离散语义”整体换成“连续语言特征”，闭集 SLAM 就过渡到开放世界空间 AI}。这正是 \cref{ch:openworld} 的起点，也是本书“经典 $\to$ 学习 $\to$ 具身”弧线（\cref{sec:intro-frontier}）在语义维度上的下一站。
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+语义 SLAM 是与经典 SLAM 无关的另一套 & 它是经典 SLAM 两端的升维：物体级因子（\cref{eq:semantic-obj-residual}）= 重投影推广、多类 log-odds（\cref{eq:semantic-logodds-update}）= 二值占据推广 \\
+物体路标和点路标一样只有位置 & 物体多了朝向 $\SO(3)$、尺度 $\lambda$、形状 $\mathbf{s}^{\mathrm{sh}}$，因子要对 $\mathbf{q}$ 右扰动求导（\cref{def:semantic-object}）\\
+单帧检测框就能定出物体三维位姿与尺度 & 与单目尺度不确定性同源，须多视约束；轴对称物体朝向不可观（\cref{sec:semantic-object-quadric} 的两病）\\
+多类语义建图要全新的更新公式 & 它就是 \cref{eq:dense-octo-logodds} 二值 log-odds 的向量化；二值是 $K{=}1$ 特例（\cref{eq:semantic-softmax} 退化为 sigmoid）\\
+softmax/多类 log-odds 与占据栅格无关 & softmax 是 sigmoid 的多类推广、多类 log-odds 是标量 log-odds 升向量，加性更新规则一字不差 \\
+类别离散、位姿连续，必须分两个系统 & 写成离散-连续混合 MAP（\cref{eq:semantic-hybrid-map}），用 DC-SAM/EM/松弛在\emph{同一}因子图上联合解 \\
+回环要直接形变整张稠密网格 & PGMO 用控制节点把它降成稀疏 PGO（\cref{eq:semantic-pgmo-pgo}），复用本书 \cref{sec:lidar-pgo} 后端 \\
+3D 场景图只是事后画的注释图 & 它在线增量构建、随回环联合优化校正；靠分层小树宽（\cref{eq:semantic-treewidth}）才高效 \\
+分层省的只是内存 & 还省计算：分层结构天然小树宽，是 \cref{thm:elimination} 稀疏可解在语义图上的回响 \\
+本章能处理任意语言查询 & 本章只讲闭集（固定词典）；开放词汇/开集留给 \cref{ch:openworld}，把离散类别换成语言特征 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\sigma\in\mathcal{K}$ & 语义类别（$\sigma{=}0$ 为自由类，作枢轴） & \cref{def:semantic-object} \\
+$\boldsymbol\ell=(\sigma,\mathbf{q},\lambda,\mathbf{s}^{\mathrm{sh}})$ & 物体路标：类别/位姿/尺度/形状 & \cref{def:semantic-object} \\
+$\mathbf{q}\in\SE(3),\,\lambda,\,\mathbf{s}^{\mathrm{sh}}$ & 物体位姿（右扰动 $\mathbf{q}\mathrm{Exp}(\delta\boldsymbol\phi)$）/尺度/形状参数 & \cref{def:semantic-object} \\
+$\mathbf{Q}_s,\mathbf{Q}_s^{*},\mathbf{Q}_\ell^{*}$ & 二次曲面 / 其对偶 / 世界系物体对偶二次曲面 & \cref{eq:semantic-quadric-Qs,eq:semantic-quadric-Ql} \\
+$\mathbf{C}^{*}_{\mathbf{x}},\mathbf{C}^{*}_{\mathbf{z}}$ & 物体投影的对偶圆锥 / 检测框拟合的对偶圆锥 & \cref{eq:semantic-quadric-proj,eq:semantic-quadric-Cz} \\
+$\mathcal{D}$ & 数据关联（观测到路标的指派，离散） & \cref{eq:semantic-hybrid-map} \\
+$\Theta,\mathcal{D}$ & 混合因子图的连续 / 离散变量集 & \cref{eq:semantic-hybrid-factor} \\
+$\mathbf{h}_{t,i}\in\mathbb{R}^{K+1}$ & 多类 log-odds 向量（以自由类为枢轴） & \cref{eq:semantic-logodds-vec} \\
+$\boldsymbol\varsigma(\cdot)$ & softmax（二值 sigmoid 的多类推广） & \cref{eq:semantic-softmax} \\
+$\boldsymbol\ell_i(\mathbf{z})$ & 观测模型 log-odds 增量（分段常数） & \cref{eq:semantic-logodds-obs,eq:semantic-obs-piecewise} \\
+$\mathbf{X}_i,\mathbf{M}_k$ & PGMO 位姿顶点 / 网格控制顶点 & \cref{eq:semantic-pgmo} \\
+$\operatorname{tw}[\mathcal{G}]$ & 图的树宽（推断复杂度度量） & \cref{eq:semantic-treewidth} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{定理/公式速查表}
+\begin{tabular}{lll}
+\toprule
+公式 & 一句话说明 & 对应 \\
+\midrule
+物体观测残差 \cref{eq:semantic-obj-residual} & 与母方程 \cref{eq:intro-nls} 同形，路标换成物体 & \cref{sec:semantic-object-def} \\
+二次曲面投影 \cref{eq:semantic-quadric-proj} & 对偶二次曲面解析投成对偶圆锥 & \cref{sec:semantic-object-quadric} \\
+椭球因子残差 \cref{eq:semantic-quadric-residual} & 物体圆锥 vs 检测框圆锥之差（右扰动求导） & \cref{sec:semantic-object-quadric} \\
+混合 MAP \cref{eq:semantic-hybrid-map} & 轨迹 $+$ 物体（含离散类别）$+$ 关联联合估计 & \cref{sec:semantic-hybrid-why} \\
+条件独立分解 \cref{eq:semantic-hybrid-condind} & 离散态分块 $\Rightarrow$ 化指数为多项式 & \cref{sec:semantic-hybrid-decomp} \\
+多类 log-odds 更新 \cref{eq:semantic-logodds-update} & 二值 \cref{eq:dense-octo-logodds} 的向量化，乘法变加法 & \cref{sec:semantic-dense-voxel} \\
+softmax 恢复 \cref{eq:semantic-softmax} & 二值 sigmoid 的多类推广（$K{=}1$ 退化） & \cref{sec:semantic-dense-voxel} \\
+分段常数观测 \cref{eq:semantic-obs-piecewise} & 占据/自由/无信息三段 $+$ 类别维 & \cref{sec:semantic-dense-voxel} \\
+PGMO 化 PGO \cref{eq:semantic-pgmo-pgo} & 回环网格形变 = 一次位姿图优化 & \cref{sec:semantic-dense-mesh} \\
+treewidth 界 \cref{eq:semantic-treewidth} & 分层 $\Rightarrow$ 小树宽 $\Rightarrow$ 多项式时间推断 & \cref{sec:semantic-graph-tw} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 语义升维的统一立场 & 稀疏端点$\to$物体、稠密端二值$\to$多类，仍喂母方程 & $\bigstar\bigstar$ \\
+2 & 物体路标与四种形状因子 & 关键点/二次曲面/网格/SDF；皆重投影推广 & $\bigstar\bigstar\bigstar$ \\
+3 & 二次曲面物体因子 & 对偶圆锥解析投影、半向量化、右扰动雅可比 & $\bigstar\bigstar\bigstar\bigstar$ \\
+4 & 离散-连续混合 MAP & 类别/关联离散、位姿连续；混合因子图分解 & $\bigstar\bigstar\bigstar$ \\
+5 & 三条混合求解策略 & DC-SAM 交替 / EM 软关联 / 连续松弛 & $\bigstar\bigstar\bigstar$ \\
+6 & 多类贝叶斯 log-odds & $\mathbf{h}\in\mathbb{R}^{K+1}$ $+$ softmax；二值是 $K{=}1$ 特例 & $\bigstar\bigstar\bigstar$ \\
+7 & 多类八叉树 & 节点存语义向量；剪枝随 $K$ 跌、需 clamping & $\bigstar\bigstar$ \\
+8 & 网格语义与 PGMO & 嵌入形变图把回环形变化简为 PGO & $\bigstar\bigstar\bigstar$ \\
+9 & 分层图与 treewidth & 分层定义、内存三级、小树宽高效推断 & $\bigstar\bigstar\bigstar\bigstar$ \\
+10 & 3D 场景图 & 在线分层度量-语义地图；联合优化校正回环 & $\bigstar\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{系统综述}：SLAM Handbook\cite{carlone2026handbook} 第 16 章——度量-语义 SLAM 的稀疏物体级、稠密语义融合、分层 3D 场景图（本章框架与四块硬核的出处）。
+  \item \textbf{物体级 SLAM}：Bowman 等\cite{bowman2017probabilistic}（概率数据关联 + EM 软关联，物体级 SLAM 奠基）；二次曲面 QuadricSLAM\cite{nicholson2019quadricslam} 与 Rubino 等\cite{rubino2018quadrics}（对偶二次曲面解析投影）；语义关键点\cite{pavlakos2017semantickeypoints}；隐式 ELLIPSDF\cite{wang2021ellipsdf} 与 DeepSDF\cite{park2019deepsdf}。
+  \item \textbf{离散-连续推断}：Doherty 等\cite{doherty2022discrete}（DC-SAM，混合因子图）；矩阵积和式软关联\cite{atanasov2016localization}；连续松弛\cite{sunderhauf2016dual}。
+  \item \textbf{稠密语义融合}：多类贝叶斯八叉树\cite{asgharivaskasi2023semantic}（多类 log-odds，本章 \cref{sec:semantic-dense-voxel} 全部）；面元语义 SuMa++\cite{chen2019suma++}；语义 KITTI 数据集\cite{behley2019semantickitti}。
+  \item \textbf{网格与场景图}：Kimera\cite{rosinol2021kimera}（PGMO、度量-语义网格、首个含动态实体的 3D 场景图）；嵌入形变图\cite{sumner2007embedded}；3D 场景图谱系 Armeni 等\cite{armeni2019scenegraph}、Wald 等\cite{wald2020scenegraph}；Hydra\cite{hughes2022hydra}（首个在线全分层、全局一致场景图，treewidth 界出处）。
+  \item \textbf{多机协同}：分布式多机语义 SLAM Kimera-Multi\cite{tian2022kimeramulti}；分布式多类八叉树 ROAM\cite{asgharivaskasi2023roam}。
+  \item \textbf{递进到开集}：开放词汇/开集语义见 \cref{ch:openworld}；其几何骨架沿用本章。
+\end{itemize}
+
+\section*{本章与相邻章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+章节 & 关系 & 本章如何衔接 \\
+\midrule
+\cref{ch:intro} 母方程 & \cref{eq:intro-nls} 是物体因子的接驳口 & 物体观测残差 \cref{eq:semantic-obj-residual} 与之同形 \\
+\cref{ch:nlopt} 因子图/优化 & 混合 MAP 的连续步用其 GN/iSAM2 & 离散-连续因子图建其上（\cref{sec:semantic-hybrid}）\\
+\cref{ch:dense} 稠密建图 & 二值 log-odds、隐式曲面、网格 & 多类 log-odds 是二值推广；形状表示同源 \\
+\cref{ch:loop} 回环 & PGO 后端、语义辅助回环 & PGMO 化归 PGO（\cref{eq:semantic-pgmo-pgo}）\\
+\cref{ch:learning} 学习赋能 & 语义前端（检测/分割）= 网络出观测 & 网络榨语义、几何后端融地图 \\
+\cref{ch:dynamic} 动态可变形 & 语义助判动态实体 & 语义剔除/降权会动的物体 \\
+\cref{ch:openworld} 开放世界 & 闭集 $\to$ 开集递进 & 离散类别换连续语言特征（\cref{sec:semantic-closing}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\begin{practice}[本章习题]
+\begin{enumerate}
+  \item \textbf{（升维对照）}把 \cref{tab:factors} 的“观测/重投影因子”与本章 \cref{eq:semantic-obj-residual} 的物体观测因子并排，逐项说明：变量、观测 $\mathbf{z}_i$、残差函数 $\mathbf{h}_i$ 各自如何从“点路标”推广到“物体路标”。为什么说后端（\cref{thm:fg-map}）一行都不用改？
+  \item \textbf{（二次曲面因子）}从 \cref{eq:semantic-quadric-Qs} 出发，验证椭球的对偶 $\mathbf{Q}_s^{*}\propto\mathbf{Q}_s^{-1}$；再说明 \cref{eq:semantic-quadric-proj} 为何只能对\emph{对偶}二次曲面（而非二次曲面本身）写出简洁的解析投影。
+  \item \textbf{（右扰动雅可比）}沿 \cref{sec:semantic-object-quadric} 的推导，写出椭球因子残差 \cref{eq:semantic-quadric-residual} 对相机位姿 $\mathbf{T}$ 的右扰动雅可比 $\partial r_i/\partial\delta\boldsymbol\xi$ 的前两项；与 \cref{ch:vo} 重投影因子的位姿雅可比比较其结构相似处。
+  \item \textbf{（二值是特例）}在 \cref{eq:semantic-logodds-vec,eq:semantic-softmax,eq:semantic-logodds-update} 中令 $K{=}1$，逐式验证它们分别退化为 \cref{eq:dense-octo-logit}（logit）、sigmoid 与 \cref{eq:dense-octo-logodds}（二值加性更新）。这说明二值占据建图是多类的什么？
+  \item \textbf{（混合 MAP）}对 \cref{ex:semantic-objgraph} 的因子图，写出其离散-连续混合后验 \cref{eq:semantic-hybrid-factor} 的因子分解（标出哪些是纯连续、哪些是离散-连续因子）；再用 DC-SAM（\cref{eq:semantic-hybrid-dcsam}）给出一轮交替最小化的具体步骤。
+  \item \textbf{（剪枝随 $K$）}解释为何多类八叉树的剪枝概率随类别数 $K$ \emph{指数}下降；“只存最可能 $\bar K$ 类 $+$ others”为何能缓解，它牺牲了什么？（提示：联系 \cref{eq:semantic-logodds-vec} 与 \cref{eq:dense-octo-clamp} 的 clamping。）
+  \item \textbf{（PGMO 化 PGO）}说明 \cref{eq:semantic-pgmo} 三项中，为何第二、三项只优化平移就能把整体写成 \cref{eq:semantic-pgmo-pgo} 的经典 PGO；这与 \cref{sec:lidar-pgo} 的位姿图优化是否同一个求解器？
+  \item \textbf{（分层与树宽）}用 \cref{def:semantic-hier-graph} 验证 \cref{fig:semantic-scenegraph} 满足单亲/局部性/子节点不相交三条；再用 \cref{eq:semantic-treewidth} 论证：若每个房间内的物体子图是一棵树（树宽 $1$），整张场景图的树宽至多为多少？据此说明它为何可多项式时间推断（联系 \cref{thm:elimination}）。
+  \item \textbf{（闭集到开集）}本章只处理闭集语义。设想把 \cref{def:semantic-object} 的物体路标推广到\emph{开放词汇}：类别 $\sigma$ 该换成什么？\cref{sec:semantic-dense-voxel} 的 range-category 观测又该换成什么？（开放式思考，正式答案见 \cref{ch:openworld}。）
+\end{enumerate}
+\end{practice}

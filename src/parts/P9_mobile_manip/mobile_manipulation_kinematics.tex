@@ -1,0 +1,664 @@
+\chapter{移动操作：底盘+臂联合运动学、冗余 IK 与停车位姿}\label{ch:mm-kinematics}
+
+% ════════════════════════════════════════════════════════════════
+%  移动操作（mobile manipulation）入门核心章：
+%  把固定臂的微分运动学/冗余 IK 推广到「可移动且可能非完整」的浮动基座。
+%  记号沿全书：向量粗体小写、矩阵粗体大写；右扰动 R·Exp(deltaφ)；
+%  se(3) ξ=[rho;φ]；统一动力学 M v̇ + h = Sᵀtau + Σ Jᵀlambda + Jₑₑᵀf（\cref{eq:umm-core}）。
+%  本波 5 章：ch:mm-wheeled / ch:mm-kinematics / ch:mm-ocp /
+%  ch:mm-skill-interface / ch:arm-dualarm-planning。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。能流畅作答，可只速读本章表格与符号表；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 一台 $SE(2)$ 差速底盘，构型是 $3$ 维 $(x,y,\theta)$，可控输入却只有前进与偏航 $2$ 个量。它为什么\emph{最终}能停到平面上任意位姿、却\emph{瞬时}不能侧移？
+  \item 固定臂的几何雅可比 $\mathbf{J}(\mathbf{q})$ 把关节速度映为末端 twist。若把基座装到一台会动的小车上，末端速度还应当加上哪几项？
+  \item 给定期望末端 twist $\mathbf{V}_d$，为什么不能直接对“底盘 $3$ 速度 $+$ 臂 $n_a$ 速度”拼成的雅可比求伪逆、再把横向分量置零？
+  \item “冗余度”在固定臂里指 $n-6$；移动操作平台多了底盘，冗余度怎么数？多出来的自由度能拿去做什么？
+  \item 抓桌上一只杯子，底盘停太远够不到、停太近撞桌、朝向不对 IK 进奇异。有没有办法\emph{离线}把“底盘该停哪”预计算好，在线只查表？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{建立}底盘 $+$ 臂的联合构型空间 $\mathbf{q}=(\mathbf{q}_b;\mathbf{q}_a)\in\SE(2)\times\mathbb{R}^{n_a}$，并写出末端位姿 $\mathbf{T}_{we}=\mathbf{T}_{wb}\mathbf{T}_{be}$；
+  \item \textbf{推导}联合雅可比 $\mathbf{V}_{ee}=[\mathbf{J}_b\ \mathbf{J}_a]\boldsymbol{\nu}$，包括差速底盘的 $\mathbf{J}_b\in\mathbb{R}^{6\times2}$ 与全向底盘的 $\mathbf{J}_b\in\mathbb{R}^{6\times3}$；
+  \item \textbf{解释}约简雅可比 $\bar{\mathbf{J}}=\mathbf{J}_{\text{full}}\bar{\mathbf{S}}$ 如何把非完整约束\emph{吸收进变量定义}，而非事后裁剪；
+  \item \textbf{运用}阻尼伪逆与零空间投影，把“底盘少动 / 臂回中 / 朝向目标”等工程偏好写成数学项；
+  \item \textbf{构造}任务优先级与分层 IK（递归零空间投影、含不等式约束的 HQP）来组织多级目标；
+  \item \textbf{设计}停车位姿（base placement）与反向可达图 IRM，把在线 IK 搜索换成离线采样 $+$ 查表；
+  \item \textbf{判断}差速底盘的“朝向”为何会进入可操作性，从而成为停车决策的关键量。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把固定臂的微分运动学，搬到一个会跑、且可能不能横移的基座上}”的主线。五个知识块层层依赖：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=5mm and 9mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (cfg) {建模\\ $\mathbf{q}=(\mathbf{q}_b;\mathbf{q}_a)$\\ $\mathbf{T}_{we}=\mathbf{T}_{wb}\mathbf{T}_{be}$};
+\node[blk, right=of cfg] (jac) {联合雅可比\\ $[\mathbf{J}_b\ \mathbf{J}_a]$};
+\node[blk, right=of jac] (red) {约简雅可比\\ $\bar{\mathbf{J}}=\mathbf{J}_{\text{full}}\bar{\mathbf{S}}$};
+\node[grp, below=7mm of cfg] (ik) {冗余 IK\\ 阻尼伪逆 $+$ 零空间};
+\node[grp, right=of ik] (hqp) {任务优先级\\ 分层 IK / HQP};
+\node[blk, right=of hqp, fill=third!8, draw=third!60!black] (irm) {停车位姿\\ IRM / base placement};
+\draw[ln] (cfg)--(jac); \draw[ln] (jac)--(red);
+\draw[ln] (red.south) -- ++(0,-3.5mm) -| (ik.north);
+\draw[ln] (ik)--(hqp); \draw[ln] (hqp)--(irm);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:mmk-config,sec:mmk-jacobian,sec:mmk-reduced} 是任何读者的主干（建立“联合构型—联合雅可比—约简映射”三角）；\cref{sec:mmk-redundancy,sec:mmk-priority} 是\emph{求解所需}的核心工具（阻尼伪逆、零空间、分层），它们直接复用 \cref{thm:ak-dls} 的阻尼最小二乘与 \cref{sec:umm-nullspace} 的浮基零空间投影；\cref{sec:mmk-irm} 面向落地，把前面的可达性概念“烤”进离线表，引出 \cref{ch:mm-ocp} 的统一最优控制。
+
+\subsection*{前置知识桥接}
+本章站在四块前置内容之上。\cref{ch:mm-wheeled} 给了轮式底盘的运动学与\emph{准速度}（quasi-velocity）——本章把那里的差速/全向模型直接当作 $\mathbf{J}_b$ 的来源；\cref{ch:constrained-dynamics}（\cref{eq:cd-pfaffian} 的 Pfaffian 形式 $\mathbf{A}(\mathbf{q})\dot{\mathbf{q}}=0$ 与 \cref{thm:cd-frobenius} 的可积判据）给了非完整约束的判据，本章用它解释“约简”为何合法；\cref{ch:arm-kin}（几何雅可比、\cref{thm:ak-dls} 的 DLS 伪逆、\cref{sec:ak-singularity} 奇异、\cref{sec:ak-redundancy} 冗余）给了固定臂的全套微分运动学，本章把单臂的 $\mathbf{J}(\mathbf{q})$ 扩成 $[\mathbf{J}_b\ \mathbf{J}_a]$；\cref{ch:lie} 给了 $\SE(3)$、伴随与对数映射，本章在拼接 $\mathbf{T}_{we}$ 与定义末端误差时反复使用。本章要解决的\textbf{新问题}是：当“基座”不再固定、而是一个可移动且可能受非完整约束的 $SE(2)$ 物体时，如何统一描述、求解并落地“底盘 $+$ 臂共同完成末端任务”。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 进入 \cref{ch:mm-ocp} 的统一最优控制时，你会看不懂状态为什么写成 $(x_b,y_b,\theta_b,\mathbf{q}_a)$、末端代价里的雅可比从哪来——因为联合雅可比与约简映射正是本章建立的；
+  \item 部署真机移动抓取时，你会反复踩“导航到位却抓不到”“底盘 footprint 安全但臂撞货架”的坑，而这些坑的根都在本章的可达性、停车位姿与误差传播里。
+\end{itemize}
+
+\begin{note}[本章记号与约定]\label{note:mmk-notation}
+底盘位姿 $\mathbf{q}_b=(x_b,y_b,\theta_b)\in\SE(2)$，臂关节 $\mathbf{q}_a\in\mathbb{R}^{n_a}$，联合构型 $\mathbf{q}=(\mathbf{q}_b;\mathbf{q}_a)$。变换记号统一用\emph{下标对}：$\mathbf{T}_{ab}$ 表“把 $b$ 系中的点变换到 $a$ 系”，等价于“$\{b\}$ 在 $\{a\}$ 中的位姿”，故 $\mathbf{p}_a=\mathbf{T}_{ab}\mathbf{p}_b$，$\mathbf{T}_{bw}=\mathbf{T}_{wb}^{-1}$。末端 twist 记 $\mathbf{V}_{ee}=[\mathbf{v}_{ee};\boldsymbol{\omega}_{ee}]\in\mathbb{R}^6$（线速度在前、角速度在后，与本书 $\se(3)$ 排序 $\boldsymbol{\xi}=[\boldsymbol{\rho};\boldsymbol{\phi}]$ 一致）；$\mathbf{e}_x,\mathbf{e}_y,\mathbf{e}_z$ 为标准基，$\mathbf{p}^\wedge$ 为 $\mathbb{R}^3$ 的反对称化算子（\cref{ch:lie}），故 $\mathbf{a}\times\mathbf{b}=\mathbf{a}^\wedge\mathbf{b}$。粗体小写为向量、粗体大写为矩阵。\textbf{可控速度 $\boldsymbol{\nu}$}（准速度，见 \cref{ch:mm-wheeled}）不是位形导数 $\dot{\mathbf{q}}$：差速底盘 $\boldsymbol{\nu}=(v,\omega,\dot{\mathbf{q}}_a)\in\mathbb{R}^{2+n_a}$，全向底盘 $\boldsymbol{\nu}\in\mathbb{R}^{3+n_a}$。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{动机：会动的工作空间}
+\label{sec:mmk-motivation}
+
+\paragraph{固定臂的世界很清楚。}
+一台螺栓固定在工作台上的机械臂，基座位姿是常量，末端能到达的位姿集合——\emph{工作空间}（workspace）——也是一个固定的几何体。逆运动学（IK）问题因此干净利落：给定目标位姿 $\mathbf{T}_g$，要么它落在工作空间内、有解，要么落在外、无解；规划就是“在这个固定集合里找一条无碰路径”。
+
+\paragraph{反面：把臂装上小车，工作空间就开始“漂移”。}
+现在把同一台臂装到一台可移动底盘上（如 Stretch、Ridgeback+UR5、TIAGo、Mobile ALOHA、Go2-W$+$小臂）。底盘一动，整条臂的工作空间随之平移、旋转；反过来，臂伸出去又会改变底盘“停在哪儿合适”。一个看似省事的拆分是：用导航栈把底盘开到桌前，再用 IK/规划栈抓杯子。它工程上成熟，却有一串绕不开的失败模式：
+\begin{itemize}
+  \item 底盘停\emph{太远}，末端够不到目标；
+  \item 底盘停\emph{太近}，臂或负载与桌子碰撞；
+  \item 底盘\emph{朝向}不合适，IK 落进奇异位形（\cref{sec:ak-singularity}），关节速度爆炸；
+  \item 导航路径可行，但到位后的操作位姿不可达；
+  \item 操作路径可行，但底盘在执行中自己挡住了臂。
+\end{itemize}
+这些都不是“导航”或“抓取”单独的 bug，而是\emph{二者没有联合考虑}的必然结果。
+
+\begin{insight}[移动操作的本质洞察：工作空间从“集合”变成“集合的函数”]
+固定臂：末端任务 $=$“在一个固定工作空间 $\mathcal{W}$ 内找解”。移动操作：底盘位姿 $\mathbf{q}_b$ 把工作空间变成一个随 $\mathbf{q}_b$ 平移/旋转的族 $\mathcal{W}(\mathbf{q}_b)$。于是规划问题升级为两步耦合的问题——\emph{先把工作空间移动到合适位置，再在其中找解}。本章的全部技术，无非是把这句话翻译成可计算的雅可比、伪逆与查表。
+\end{insight}
+
+\paragraph{两条主线。}
+应对“会动的工作空间”，本章给两条互补的主线。其一是\emph{微分运动学}：把底盘速度与臂速度统一成一个联合雅可比，在速度级同时驱动两者完成末端任务（\cref{sec:mmk-jacobian,sec:mmk-reduced,sec:mmk-redundancy,sec:mmk-priority}）——这是“边到位边操作”的连续视角。其二是\emph{停车位姿}：在动手之前先回答“底盘该停哪儿”，用离线预计算把昂贵的在线搜索压成一次查表（\cref{sec:mmk-irm}）——这是“先到位再操作”的离散视角。两条线在 \cref{ch:mm-ocp} 的统一最优控制里合流。
+
+% ════════════════════════════════════════════════════════════════
+\section{联合构型空间与末端位姿}
+\label{sec:mmk-config}
+
+\paragraph{把底盘也算成“关节”。}
+要统一描述底盘与臂，第一步是把底盘位姿当成系统状态的一部分。底盘位姿 $\mathbf{q}_b=(x_b,y_b,\theta_b)\in\SE(2)$；臂关节 $\mathbf{q}_a\in\mathbb{R}^{n_a}$。二者拼成\emph{联合构型}
+
+\begin{definition}[移动操作的联合构型空间]\label{def:mmk-config}
+移动操作平台的联合构型为
+\begin{equation}
+  \mathbf{q}=\begin{bmatrix}\mathbf{q}_b\\\mathbf{q}_a\end{bmatrix}\in\SE(2)\times\mathbb{R}^{n_a},\qquad
+  \dim(\mathbf{q})=3+n_a.
+  \label{eq:mmk-config}
+\end{equation}
+末端执行器在世界系的位姿由两段变换\emph{串联}给出：
+\begin{equation}
+  \boxed{\;\mathbf{T}_{we}(\mathbf{q})=\mathbf{T}_{wb}(\mathbf{q}_b)\,\mathbf{T}_{be}(\mathbf{q}_a)\in\SE(3),\;}
+  \label{eq:mmk-fk}
+\end{equation}
+其中 $\mathbf{T}_{wb}$ 是底盘在世界系的位姿（由 $\mathbf{q}_b$ 嵌入 $\SE(3)$：平面平移 $+$ 绕 $z$ 偏航），$\mathbf{T}_{be}$ 是臂的正运动学（末端在底盘系的位姿，\cref{ch:arm-kin}）。
+\end{definition}
+
+以一台 $7$ 自由度臂为例，$\dim(\mathbf{q})=3+7=10$。固定臂只优化 $\mathbf{q}_a$；移动操作平台要\emph{同时}优化 $\mathbf{q}_b$ 与 $\mathbf{q}_a$——\cref{eq:mmk-fk} 里 $\mathbf{T}_{wb}$ 不再是常量，这正是后面一切复杂性的源头。
+
+\begin{pitfall}[概念误区：$\mathbf{T}_{wb}$ 与 $\mathbf{T}_{bw}$ 反着传]
+新手最常见的工程 bug 是“一会儿用 $\mathbf{T}_{wb}$、一会儿实际传进 $\mathbf{T}_{bw}$”。本章约定 $\mathbf{T}_{ab}$ 永远是“$\{b\}$ 在 $\{a\}$ 中的位姿”，于是 $\mathbf{p}_w=\mathbf{T}_{wb}\mathbf{p}_b=\mathbf{T}_{wb}\mathbf{T}_{be}\mathbf{p}_e$ 一路右乘、方向自洽。后面的联合雅可比与 $\SE(3)$ 误差全部沿用这个方向；写代码时核对一次下标对，能省下大量“末端位姿差一个逆”的调试。
+\end{pitfall}
+
+\paragraph{$SE(2)$ 底盘的速度变换。}
+底盘在\emph{车体系}的速度 $(v_x^B,v_y^B,\omega)$ 与\emph{世界系}的位形速度 $\dot{\mathbf{q}}_b$ 之间，差一个绕 $z$ 的平面旋转 $\mathbf{R}(\theta_b)\in\SO(2)$：
+\begin{equation}
+  \begin{bmatrix}\dot x_b\\\dot y_b\end{bmatrix}=\mathbf{R}(\theta_b)\begin{bmatrix}v_x^B\\v_y^B\end{bmatrix},\qquad
+  \mathbf{R}(\theta_b)=\begin{bmatrix}\cos\theta_b&-\sin\theta_b\\\sin\theta_b&\cos\theta_b\end{bmatrix},\qquad
+  \dot\theta_b=\omega.
+  \label{eq:mmk-se2vel}
+\end{equation}
+这是 $\SE(2)$ 上 body 与 world 速度互换的最简形式（完整推导见 \cref{ch:mm-wheeled}）。差速底盘还要再叠一层非完整约束（不能独立命令 $v_y^B$），下一节会看到它如何改变雅可比的列数。
+
+% ════════════════════════════════════════════════════════════════
+\section{联合雅可比}
+\label{sec:mmk-jacobian}
+
+\paragraph{末端速度 = 底盘的贡献 + 臂的贡献。}
+末端 twist $\mathbf{V}_{ee}\in\mathbb{R}^6$ 由底盘与臂\emph{共同}产生。臂关节速度的贡献正是固定臂的几何雅可比 $\mathbf{J}_a\dot{\mathbf{q}}_a$（\cref{ch:arm-kin}）；底盘运动的贡献记为 $\mathbf{J}_b\mathbf{u}_b$，其中 $\mathbf{u}_b$ 是底盘的可控输入。叠加并按可控速度 $\boldsymbol{\nu}=(\mathbf{u}_b;\dot{\mathbf{q}}_a)$ 合并：
+
+\begin{definition}[联合雅可比]\label{def:mmk-jac}
+\begin{equation}
+  \mathbf{V}_{ee}=\mathbf{J}_b(\mathbf{q})\,\mathbf{u}_b+\mathbf{J}_a(\mathbf{q})\,\dot{\mathbf{q}}_a
+  =\underbrace{\begin{bmatrix}\mathbf{J}_b(\mathbf{q})&\mathbf{J}_a(\mathbf{q})\end{bmatrix}}_{\mathbf{J}(\mathbf{q})}\,\boldsymbol{\nu},
+  \qquad \boldsymbol{\nu}=\begin{bmatrix}\mathbf{u}_b\\\dot{\mathbf{q}}_a\end{bmatrix}.
+  \label{eq:mmk-joint-jac}
+\end{equation}
+\end{definition}
+
+\noindent 关键在于 $\mathbf{J}_b$——它把底盘的平面运动“抬升”成末端的 $6$ 维 twist。下面分两类底盘显式推导。
+
+\subsection{差速底盘的 \texorpdfstring{$\mathbf{J}_b$}{Jb}}
+\label{sec:mmk-jac-diff}
+
+\paragraph{几何推导。}
+差速底盘的可控输入是 $\mathbf{u}_b=(v,\omega)$（前进线速度、偏航角速度）。设末端相对底盘的位置在世界系为 $\mathbf{p}_{be}^w=\mathbf{R}_{wb}\,\mathbf{p}_{be}^b$。逐项考察底盘运动对末端的速度贡献：
+
+\begin{derivation}[差速底盘对末端 twist 的贡献]
+\emph{前进 $v$ 的贡献.}\;底盘沿车体 $x$ 轴平移，世界系下该方向是 $\mathbf{R}_{wb}\mathbf{e}_x$。它是\emph{纯平移}，只贡献末端\textbf{线}速度 $\mathbf{R}_{wb}\mathbf{e}_x\,v$，不贡献角速度。
+
+\emph{偏航 $\omega$ 的贡献.}\;底盘绕过其旋转中心、轴向 $\mathbf{e}_z$ 的瞬时转动。对一个刚体绕过原点、角速度 $\boldsymbol{\omega}_b=\omega\mathbf{e}_z$ 的转动，位于 $\mathbf{p}_{be}^w$ 处的点线速度为 $\boldsymbol{\omega}_b\times\mathbf{p}_{be}^w=\omega\,(\mathbf{e}_z\times\mathbf{p}_{be}^w)$；同时末端整体随底盘转，角速度贡献为 $\omega\mathbf{e}_z$。
+
+\emph{合并.}\;把“线速度行 / 角速度行”按 $\mathbf{V}_{ee}=[\mathbf{v}_{ee};\boldsymbol{\omega}_{ee}]$ 排好，得
+\begin{equation}
+  \mathbf{V}_{ee}\big|_{\text{base}}=
+  \begin{bmatrix}\mathbf{R}_{wb}\mathbf{e}_x & \mathbf{e}_z\times\mathbf{p}_{be}^w\\[2pt]
+  \mathbf{0}_{3\times1} & \mathbf{e}_z\end{bmatrix}
+  \begin{bmatrix}v\\\omega\end{bmatrix}.
+  \label{eq:mmk-Jb-diff-deriv}
+\end{equation}
+\end{derivation}
+
+\begin{proposition}[差速底盘的 $\mathbf{J}_b$]\label{prop:mmk-Jb-diff}
+\begin{equation}
+  \boxed{\;\mathbf{J}_b^{\text{diff}}=
+  \begin{bmatrix}\mathbf{R}_{wb}\mathbf{e}_x & \mathbf{e}_z\times\mathbf{p}_{be}^w\\[2pt]
+  \mathbf{0}_{3\times1} & \mathbf{e}_z\end{bmatrix}\in\mathbb{R}^{6\times2}.\;}
+  \label{eq:mmk-Jb-diff}
+\end{equation}
+其中交叉积也可写成反对称矩阵形式 $\mathbf{e}_z\times\mathbf{p}_{be}^w=\mathbf{e}_z^\wedge\,\mathbf{p}_{be}^w=-(\mathbf{p}_{be}^w)^\wedge\mathbf{e}_z$；具体符号取决于 twist 约定，工程实现中必须与所用库（如 Pinocchio）的旋量排列严格统一。
+\end{proposition}
+
+\subsection{全向底盘的 \texorpdfstring{$\mathbf{J}_b$}{Jb}}
+\label{sec:mmk-jac-omni}
+
+\paragraph{多一个横向列。}
+全向底盘（麦克纳姆/全向轮）可独立命令车体横向速度 $v_y^B$，输入变为 $\mathbf{u}_b=(v_x^B,v_y^B,\omega)$。横向平移在世界系沿 $\mathbf{R}_{wb}\mathbf{e}_y$，同样只贡献线速度。于是 $\mathbf{J}_b$ 比差速多一列：
+
+\begin{proposition}[全向底盘的 $\mathbf{J}_b$]\label{prop:mmk-Jb-omni}
+\begin{equation}
+  \mathbf{J}_b^{\text{omni}}=
+  \begin{bmatrix}\mathbf{R}_{wb}\mathbf{e}_x & \mathbf{R}_{wb}\mathbf{e}_y & \mathbf{e}_z\times\mathbf{p}_{be}^w\\[2pt]
+  \mathbf{0} & \mathbf{0} & \mathbf{e}_z\end{bmatrix}\in\mathbb{R}^{6\times3}.
+  \label{eq:mmk-Jb-omni}
+\end{equation}
+\end{proposition}
+
+\noindent 这一列直接把冗余度提高 $1$（\cref{sec:mmk-redundancy}），也使全向底盘在“横向微调末端”上比差速底盘多一个\emph{直接}手段：差速底盘要横移末端 $5\,$cm，必须“转弯—前进—转回”几秒钟的折返，全向底盘则一步侧移到位。代价是机械复杂度与地面打滑——麦克纳姆轮在地毯、碎石上横向滑移严重，实际运动会偏离模型。Ackermann（阿克曼转向）底盘的运动学与停车约束更强，本章不展开建模，统一交给 \cref{ch:mm-wheeled}；它对 base placement 的影响在 \cref{sec:mmk-irm} 末尾点出。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, scale=1.0]
+  % world frame
+  \draw[->, gray!70] (-0.4,-0.4) -- (1.1,-0.4) node[right]{$x_w$};
+  \draw[->, gray!70] (-0.4,-0.4) -- (-0.4,1.0) node[above]{$y_w$};
+  % base body (a rounded chassis)
+  \begin{scope}[rotate around={25:(2.3,0.6)}]
+    \draw[thick, fill=main!8, draw=main!60!black, rounded corners=3pt]
+      (1.7,0.1) rectangle (2.9,1.1);
+    \node[font=\small] at (2.3,0.6) {底盘};
+    % base frame
+    \draw[->, second, thick] (2.3,0.6) -- (3.05,0.6) node[right]{$x_b\,(v)$};
+    \draw[->, second, thick] (2.3,0.6) -- (2.3,1.35);
+  \end{scope}
+  % yaw arrow
+  \draw[->, third, thick] (2.55,1.45) arc (60:120:0.55) node[midway, above]{$\omega$};
+  % arm: base -> ee
+  \draw[very thick, draw=black!70] (2.55,0.95) -- (3.6,1.7) -- (4.45,1.35);
+  \fill (4.45,1.35) circle (1.6pt) node[right]{$\{e\}$ 末端};
+  % p_be^w vector
+  \draw[->, red!70!black, thick, dashed] (2.45,0.75) -- (4.4,1.32);
+  \node[red!70!black, font=\small] at (3.35,0.75) {$\mathbf{p}_{be}^w$};
+\end{tikzpicture}
+\caption{差速底盘 $+$ 臂的速度学。底盘前进 $v$ 沿 $\mathbf{R}_{wb}\mathbf{e}_x$ 给末端纯线速度；偏航 $\omega$ 既给末端角速度 $\omega\mathbf{e}_z$，又通过力臂 $\mathbf{p}_{be}^w$ 给线速度 $\omega(\mathbf{e}_z\times\mathbf{p}_{be}^w)$。末端离底盘越远，偏航对末端线速度的杠杆越大（\cref{eq:mmk-Jb-diff}）。}
+\label{fig:mmk-base-arm}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{约简雅可比：把非完整约束吸收进变量}
+\label{sec:mmk-reduced}
+
+\paragraph{差速的 $\mathbf{J}_b$ 与全向的 $\mathbf{J}_b$ 不只是“少一列”。}
+\cref{eq:mmk-Jb-diff} 与 \cref{eq:mmk-Jb-omni} 看上去只差一列，容易让人忽略一个本质区别：\textbf{全向底盘的 $\mathbf{J}_b$ 是“把 $\dot{\mathbf{q}}_b$ 抬成末端 twist”，差速底盘的 $\mathbf{J}_b$ 已经把非完整约束\emph{吸收}进去了}。理解这一点，是把非完整底盘正确放进联合规划的关键，也是工程里最容易写错的地方。
+
+\subsection{动机：为什么不能对 \texorpdfstring{$\dot{\mathbf{q}}_b$}{qb-dot} 求伪逆再裁剪}
+\label{sec:mmk-naive}
+
+一个自然但错误的做法是：先写“全自由度”几何雅可比
+\begin{equation}
+  \mathbf{J}_{\text{full}}(\mathbf{q})=\begin{bmatrix}\mathbf{J}_{b,\text{full}}(\mathbf{q})&\mathbf{J}_a(\mathbf{q})\end{bmatrix}\in\mathbb{R}^{6\times(3+n_a)},
+  \label{eq:mmk-Jfull}
+\end{equation}
+把 $\dot{\mathbf{q}}_b=(\dot x_b,\dot y_b,\dot\theta_b)$ 三个分量都当可控量，再对 $\mathbf{J}_{\text{full}}$ 求伪逆得到 $\dot{\mathbf{q}}$。问题在于：差速底盘\emph{根本不能}独立命令车体横向速度 $v_y^B$。伪逆解一般含非零横向分量，丢给底盘执行时，要么被忽略（末端任务无法满足），要么用滑移近似（产生与模型不符的误差）。
+
+\begin{pitfall}[概念误区：把非完整约束当“事后裁剪”]
+新手想法：“先按全向求伪逆，再把横向速度分量置零就行。”实际上：把横向分量直接置零\textbf{不是}约束流形上的投影——置零后的 $\dot{\mathbf{q}}_b$ 配上原来的 $\dot{\mathbf{q}}_a$，乘回 $\mathbf{J}_{\text{full}}$ 已不再等于 $\mathbf{V}_d$，末端任务的满足度被破坏。正确做法：在“求解之前”就把可控速度限制在非完整约束允许的子空间内，即使用\textbf{约简雅可比}。这与 \cref{eq:cd-pfaffian} 把 Pfaffian 约束写进速度空间是同一思想。
+\end{pitfall}
+
+\subsection{准速度与约简映射}
+\label{sec:mmk-quasivel}
+
+回顾差速底盘运动学的矩阵形式（\cref{ch:mm-wheeled}）：
+\begin{equation}
+  \dot{\mathbf{q}}_b=\mathbf{S}(\mathbf{q}_b)\,\mathbf{u}_b,\qquad
+  \mathbf{S}(\mathbf{q}_b)=\begin{bmatrix}\cos\theta_b&0\\\sin\theta_b&0\\0&1\end{bmatrix}\in\mathbb{R}^{3\times2}.
+  \label{eq:mmk-S}
+\end{equation}
+$\mathbf{S}$ 的两列张成的，正是非完整约束 $\mathbf{A}(\mathbf{q}_b)\dot{\mathbf{q}}_b=0$ 的零空间——满足 $\mathbf{A}\mathbf{S}=\mathbf{0}$，其中 $\mathbf{A}=(\sin\theta_b,-\cos\theta_b,0)$ 即“不能瞬时侧移”（\cref{eq:cd-pfaffian} 的具体实例）。把 $\mathbf{u}_b=(v,\omega)$ 称为\textbf{准速度}（quasi-velocity）：它不是任何位形坐标的时间导数（由 \cref{thm:cd-frobenius}，分布对李括号不封闭，不可积，故不存在 $h$ 使 $v=\dot h$），却完整参数化了底盘所有可行的瞬时运动。这正是 \cref{ch:mm-wheeled} 强调“$\boldsymbol{\nu}$ 不是简单的 $\dot{\mathbf{q}}$”的数学根源。
+
+把 $\mathbf{S}$ 推广到全身，定义\textbf{约简选择矩阵}
+\begin{equation}
+  \bar{\mathbf{S}}(\mathbf{q})=\begin{bmatrix}\mathbf{S}(\mathbf{q}_b)&\mathbf{0}\\\mathbf{0}&\mathbf{I}_{n_a}\end{bmatrix}
+  \in\mathbb{R}^{(3+n_a)\times(2+n_a)},\qquad
+  \dot{\mathbf{q}}=\bar{\mathbf{S}}(\mathbf{q})\,\boldsymbol{\nu}.
+  \label{eq:mmk-Sbar}
+\end{equation}
+
+\subsection{约简雅可比}
+\label{sec:mmk-Jbar}
+
+\begin{theorem}[约简雅可比]\label{thm:mmk-Jbar}
+把 \cref{eq:mmk-Sbar} 代入“全自由度”几何雅可比，得\textbf{约简雅可比}
+\begin{equation}
+  \boxed{\;\bar{\mathbf{J}}(\mathbf{q})=\mathbf{J}_{\text{full}}(\mathbf{q})\,\bar{\mathbf{S}}(\mathbf{q})\in\mathbb{R}^{6\times(2+n_a)}.\;}
+  \label{eq:mmk-Jbar}
+\end{equation}
+它的底盘部分与 \cref{prop:mmk-Jb-diff} 直接推出的 $\mathbf{J}_b^{\text{diff}}$ \emph{完全一致}。
+\end{theorem}
+\begin{proof}
+只需验证底盘块 $\mathbf{J}_{b,\text{full}}\,\mathbf{S}=\mathbf{J}_b^{\text{diff}}$。取“底座 twist 到末端 twist”的伴随形式 $\mathbf{J}_{b,\text{full}}=\begin{bsmallmatrix}\mathbf{I}_3&-(\mathbf{p}_{be}^w)^\wedge\\\mathbf{0}&\mathbf{I}_3\end{bsmallmatrix}$，而 $\mathbf{S}$ 把 $(v,\omega)$ 嵌成底座 twist $(v\cos\theta_b,v\sin\theta_b,0,0,0,\omega)$，即线速度部分为 $\mathbf{R}_{wb}\mathbf{e}_x\,v$、角速度部分为 $\mathbf{e}_z\,\omega$。代入相乘：线速度行得 $\mathbf{R}_{wb}\mathbf{e}_x\,v-(\mathbf{p}_{be}^w)^\wedge\mathbf{e}_z\,\omega=\mathbf{R}_{wb}\mathbf{e}_x\,v+(\mathbf{e}_z\times\mathbf{p}_{be}^w)\,\omega$，角速度行得 $\mathbf{e}_z\,\omega$，恰为 \cref{eq:mmk-Jb-diff}。$\qed$
+\end{proof}
+
+\noindent 这说明 \cref{eq:mmk-Jb-diff} 那个看似“凑”出来的 $\mathbf{J}_b$，其实是 $\mathbf{J}_{\text{full}}\bar{\mathbf{S}}$ 的严格结果——非完整约束已经通过\emph{右乘 $\mathbf{S}$} 被结构性地吸收。
+
+\begin{insight}[约简的本质洞察：约束从“求解器负担”变成“变量定义”]
+一旦用 $\bar{\mathbf{J}}$ 替代 $\mathbf{J}_{\text{full}}$，后面所有伪逆、零空间、QP 公式都可\emph{原封不动}套用，而求出的 $\boldsymbol{\nu}$ 天然可行——不需要任何事后裁剪。代价是：求出 $\boldsymbol{\nu}$ 后若要还原 $\dot{\mathbf{q}}_b$，必须再左乘 $\mathbf{S}$；横向速度永远是耦合量 $v\sin\theta_b$，而非独立自由度。一句话：把“约束”从运行时的额外方程，前移成了变量怎么取。
+\end{insight}
+
+\subsection{非完整可操作性}
+\label{sec:mmk-wnh}
+
+把固定臂的 Yoshikawa 可操作度（\cref{sec:ak-singularity} 的 $w=\sqrt{\det(\mathbf{J}\mathbf{J}^\top)}$）推广到移动操作时，\emph{必须}用约简雅可比而非全自由度雅可比：
+\begin{equation}
+  w_{\text{nh}}(\mathbf{q})=\sqrt{\det\!\big(\bar{\mathbf{J}}\bar{\mathbf{J}}^\top\big)}.
+  \label{eq:mmk-wnh}
+\end{equation}
+正是这个“约简可操作性”——而非固定臂的 $w(\mathbf{q}_a)$——才正确刻画移动平台在当前位形下产生末端运动的能力。一个直接推论：\textbf{差速底盘的朝向 $\theta_b$ 会进入可操作性}（因为 $\bar{\mathbf{J}}$ 含 $\mathbf{R}_{wb}$），这是固定臂场景没有的现象，也是 \cref{sec:mmk-irm} 的停车位姿必须把 $\theta_b$ 当关键决策量的根本原因。
+
+\begin{proposition}[全向不劣于差速]\label{prop:mmk-omni-ge-diff}
+在\emph{同一臂构型}下，全向底盘的约简可操作性恒不低于差速底盘：
+\begin{equation}
+  w_{\text{nh}}^{\text{omni}}(\mathbf{q})\ \ge\ w_{\text{nh}}^{\text{diff}}(\mathbf{q}).
+  \label{eq:mmk-omni-ge}
+\end{equation}
+\end{proposition}
+\begin{proof}
+全向底盘的约简雅可比 $\bar{\mathbf{J}}_{\text{omni}}$ 比差速的 $\bar{\mathbf{J}}_{\text{diff}}$ 多一列（横向 $\mathbf{R}_{wb}\mathbf{e}_y$），即 $\bar{\mathbf{J}}_{\text{diff}}$ 的列空间是 $\bar{\mathbf{J}}_{\text{omni}}$ 列空间的子集。于是 $\bar{\mathbf{J}}_{\text{omni}}\bar{\mathbf{J}}_{\text{omni}}^\top=\bar{\mathbf{J}}_{\text{diff}}\bar{\mathbf{J}}_{\text{diff}}^\top+\mathbf{r}\mathbf{r}^\top$，其中 $\mathbf{r}$ 为新增列在末端空间的贡献，$\mathbf{r}\mathbf{r}^\top\succeq\mathbf{0}$。半正定矩阵叠加一个秩一半正定项，特征值逐个不减，故行列式不减，开方得 \cref{eq:mmk-omni-ge}。$\qed$
+\end{proof}
+
+\noindent 这把“全向底盘对操作更友好”从定性印象升格为可证不等式：全向的“友好”本质上是它在\emph{任意}位形下都拥有不小于差速的末端运动能力——前提仍是轮子不打滑。
+
+% ════════════════════════════════════════════════════════════════
+\section{冗余度与冗余 IK}
+\label{sec:mmk-redundancy}
+
+\paragraph{为什么冗余是移动操作的核心概念。}
+固定 $6$ 自由度臂给定末端位姿后只有有限解：常见的球腕（三轴交于一点、可位置/姿态解耦，Pieper 准则）臂最多 $8$ 组解（肘/肩/腕组合，见 \cref{ch:arm-kin}），一般 $6R$ 臂（任意几何）最多 $16$ 组解（Lee--Liang 的 $16$ 次多项式）；冗余的处理见 \cref{sec:ak-redundancy}。移动操作平台却有“多余”自由度——底盘 $+$ 臂加起来超过末端任务所需的 $6$ 维。这些多余自由度不是浪费，而是巨大的工程优势：它们让系统在完成末端任务的\emph{同时}，还能满足额外偏好与约束。
+
+\begin{definition}[移动操作的冗余度]\label{def:mmk-redundancy}
+设末端任务维度为 $m$（完整位姿任务 $m=6$），可控准速度维度为 $\dim(\boldsymbol{\nu})$。\textbf{冗余度}
+\begin{equation}
+  r=\dim(\boldsymbol{\nu})-m.
+  \label{eq:mmk-r}
+\end{equation}
+差速底盘 $+$ $7$ 轴臂、$6$ 维任务：$r=(2+7)-6=3$；全向底盘 $+$ $7$ 轴臂：$r=(3+7)-6=4$。
+\end{definition}
+
+\begin{note}[冗余计的是准速度，不是位形速度]\label{note:mmk-r-quasivel}
+\cref{eq:mmk-r} 用 $\dim(\boldsymbol{\nu})$ 而非 $\dim(\mathbf{q})$。差速底盘虽有 $3$ 个位形坐标，但只贡献 $2$ 个可控方向，故冗余“少 $1$”。这是\emph{速度级}现象，不影响它\emph{最终}能停到任意位姿（长期可达性，由 \cref{thm:cd-frobenius} 的李括号生成保证）——\cref{sec:mmk-irm} 的 base placement 之所以仍能枚举任意朝向 $\theta_b$，正依赖这种长期可达性。差速底盘在“纯横向”微调上比全向“少一个直接手段”，体现为它的约简雅可比在该方向上必须借道偏航 $\omega$ 与臂关节耦合实现。
+\end{note}
+
+\subsection{阻尼伪逆与零空间投影}
+\label{sec:mmk-dls}
+
+给定期望末端 twist $\mathbf{V}_d$，求联合准速度。最朴素的目标是最小二乘 $\min_{\boldsymbol{\nu}}\|\mathbf{J}\boldsymbol{\nu}-\mathbf{V}_d\|^2$，但在奇异附近 $\mathbf{J}\mathbf{J}^\top$ 病态、解会爆炸。沿用 \cref{thm:ak-dls} 的阻尼最小二乘（DLS），加入阻尼正则：
+\begin{equation}
+  \boldsymbol{\nu}^\star=\arg\min_{\boldsymbol{\nu}}\ \|\mathbf{J}\boldsymbol{\nu}-\mathbf{V}_d\|^2+\lambda^2\|\boldsymbol{\nu}\|^2
+  \;\Longrightarrow\;
+  \boldsymbol{\nu}^\star=\mathbf{J}^\top(\mathbf{J}\mathbf{J}^\top+\lambda^2\mathbf{I})^{-1}\mathbf{V}_d.
+  \label{eq:mmk-dls}
+\end{equation}
+这与浮基统一框架的阻尼伪逆 \cref{eq:umm-dls} 是同一表达式。冗余度 $r>0$ 时，解不唯一，可加一个\emph{零空间}项表达次级偏好：
+\begin{equation}
+  \boxed{\;\boldsymbol{\nu}^\star=\mathbf{J}^{+}\mathbf{V}_d+(\mathbf{I}-\mathbf{J}^{+}\mathbf{J})\,\boldsymbol{\nu}_0,\;}
+  \label{eq:mmk-nullspace}
+\end{equation}
+其中 $\boldsymbol{\nu}_0$ 是“期望速度”，投影 $(\mathbf{I}-\mathbf{J}^{+}\mathbf{J})$ 把它压进 $\mathbf{J}$ 的零空间——故 $\boldsymbol{\nu}_0$ 对末端任务\emph{一阶}无影响（与 \cref{sec:umm-nullspace} 的浮基零空间投影完全同构）。
+
+\begin{insight}[冗余的本质洞察：零空间是工程偏好的入口]
+移动操作的冗余不是“多余自由度”，而是把“我更希望谁动”写进数学问题的入口。同一个末端速度，可以由底盘动、臂动或两者共同完成；零空间项 $\boldsymbol{\nu}_0$ 就是在这些等价解里挑一个最合心意的。
+\end{insight}
+
+\paragraph{三个常用偏好。}
+把 $\boldsymbol{\nu}=(\mathbf{u}_b;\dot{\mathbf{q}}_a)$ 分块，三种典型偏好写法如下（$\mathrm{wrap}(\cdot)$ 表把角度差归一到 $(-\pi,\pi]$）：
+\begin{align}
+  \text{底盘少动：}&\quad\boldsymbol{\nu}_0=\big(-k_b\,\mathbf{u}_b;\ \mathbf{0}\big), \label{eq:mmk-pref-base}\\
+  \text{臂回到舒适位姿：}&\quad\boldsymbol{\nu}_0=\big(\mathbf{0};\ -k_a(\mathbf{q}_a-\mathbf{q}_a^{\text{nom}})\big), \label{eq:mmk-pref-arm}\\
+  \text{底盘朝向目标：}&\quad\boldsymbol{\nu}_0=\big(0,\ k_\theta\,\mathrm{wrap}(\theta_{\text{tgt}}-\theta_b);\ \mathbf{0}\big). \label{eq:mmk-pref-yaw}
+\end{align}
+直觉是：阻尼伪逆 \cref{eq:mmk-dls} 天然取\emph{最小范数}解——底盘一个小幅前进就能整体平移末端，臂关节则要多关节协调才能产生同样位移，故最小范数解倾向多用“效率最高”的底盘自由度。若希望反过来（如狭窄空间里底盘少动），就用 \cref{eq:mmk-pref-base} 把底盘速度往零拉，零空间投影会在\emph{不动末端}的前提下把任务重新分配给臂。
+
+\begin{pitfall}[概念误区：阻尼因子越小越好]
+$\lambda\to0$ 时 \cref{eq:mmk-dls} 退化为 Moore--Penrose 伪逆，在雅可比秩亏（奇异位形，\cref{sec:ak-singularity}）时速度发散到无穷。工程上 $\lambda$ 通常取 $10^{-3}$ 到 $10^{-1}$；更精细的做法让 $\lambda$ 随最小奇异值\emph{自适应}——奇异值越小、$\lambda$ 越大，避免过度放大（\cref{thm:ak-dls} 给出这一自适应的标准形式）。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{任务优先级与分层 IK}
+\label{sec:mmk-priority}
+
+\paragraph{两级不够用。}
+\cref{sec:mmk-dls} 的“主任务 $+$ 零空间次级目标”只有\emph{两级}：末端 twist 是硬的，其余偏好挤在零空间里软性叠加。真实移动操作往往需要\emph{多级严格优先级}，例如“末端位置 $\succ$ 末端姿态 $\succ$ 避关节限位 $\succ$ 底盘少动 $\succ$ 回中”。
+
+\subsection{加权和的根本缺陷}
+\label{sec:mmk-weighted}
+
+把 $k$ 个任务写成一个加权最小二乘 $\boldsymbol{\nu}^\star=\arg\min_{\boldsymbol{\nu}}\sum_{i=1}^k w_i\|\mathbf{J}_i\boldsymbol{\nu}-\dot{\mathbf{x}}_i^d\|^2$，当两个任务\emph{冲突}时，解落在由权重决定的折中点上。这有两个问题：(1) 折中比例对权重数值极敏感，标定困难；(2) 没有“硬优先级”——再小的低优先任务也会以 $O(w_i/w_1)$ 量级污染高优先任务。Siciliano 与 Slotine 的\textbf{任务优先级}框架用嵌套零空间投影替代加权，从结构上杜绝低优先级对高优先级的污染。
+
+\subsection{递归零空间投影（等式任务）}
+\label{sec:mmk-recursive}
+
+\begin{theorem}[任务优先级的递归零空间投影]\label{thm:mmk-recursive}
+设任务按优先级排序 $1\succ2\succ\cdots\succ k$，第 $i$ 个任务有雅可比 $\mathbf{J}_i$ 与期望速度 $\dot{\mathbf{x}}_i^d$。递归构造
+\begin{align}
+  \boldsymbol{\nu}_1&=\mathbf{J}_1^{+}\dot{\mathbf{x}}_1^d,\qquad \mathbf{N}_1=\mathbf{I}-\mathbf{J}_1^{+}\mathbf{J}_1, \label{eq:mmk-rec-init}\\
+  \boldsymbol{\nu}_i&=\boldsymbol{\nu}_{i-1}+\big(\mathbf{J}_i\mathbf{N}_{i-1}\big)^{+}\big(\dot{\mathbf{x}}_i^d-\mathbf{J}_i\boldsymbol{\nu}_{i-1}\big),\quad i=2,\dots,k, \label{eq:mmk-rec-step}\\
+  \mathbf{N}_i&=\mathbf{N}_{i-1}-\big(\mathbf{J}_i\mathbf{N}_{i-1}\big)^{+}\big(\mathbf{J}_i\mathbf{N}_{i-1}\big), \label{eq:mmk-rec-N}
+\end{align}
+其中 $\mathbf{N}_{i-1}$ 是“前 $i-1$ 个任务联合零空间”的投影矩阵。最终联合准速度为 $\boldsymbol{\nu}_k$。
+\end{theorem}
+
+\noindent 每一级只在“不破坏所有更高优先级任务”的子空间里求解自己的目标。当某级与高优先级\emph{完全冲突}时，$\mathbf{J}_i\mathbf{N}_{i-1}$ 秩亏，该级在可行子空间内做最小二乘近似，而高优先级\emph{严格不受影响}——这正是加权和做不到的。
+
+\begin{insight}[优先级 = 子空间包含关系]
+零空间投影把“优先级”编码成几何包含：第 $i$ 级的解永远活在前 $i-1$ 级的零空间里，故它对高优先级任务的一阶影响\emph{恒等于零}，与它自己的“权重”无关。加权和是“用数值大小排座次”，任务优先级是“用子空间维度排座次”——后者才是真正的硬优先级。
+\end{insight}
+
+\subsection{为什么移动操作更需要 HQP}
+\label{sec:mmk-hqp}
+
+\cref{thm:mmk-recursive} 只能处理\emph{等式任务}，无法直接表达“关节限位 $\mathbf{q}_{\min}\le\mathbf{q}\le\mathbf{q}_{\max}$”“底盘速度限幅”“避障距离 $\ge d_{\text{safe}}$”这类\emph{不等式}约束。而移动操作几乎每一级都带不等式。Escande、Mansard 与 Wieber 的\textbf{分层二次规划}（Hierarchical Quadratic Programming, HQP）把每一级写成一个带等式/不等式的 QP，按优先级\emph{逐级}求解，并把上一级的最优\emph{残差}作为下一级的硬约束传下去。第 $i$ 级的 QP（概念形式）：
+\begin{equation}
+\begin{aligned}
+  \min_{\boldsymbol{\nu},\,\mathbf{w}_i}\quad& \tfrac12\|\mathbf{w}_i\|^2\\
+  \text{s.t.}\quad& \mathbf{J}_i\boldsymbol{\nu}-\dot{\mathbf{x}}_i^d=\mathbf{w}_i &&\text{（本级松弛）}\\
+  & \mathbf{A}_i\boldsymbol{\nu}\le\mathbf{b}_i &&\text{（本级不等式）}\\
+  & \mathbf{J}_j\boldsymbol{\nu}-\dot{\mathbf{x}}_j^d=\mathbf{w}_j^\star,\ j<i &&\text{（锁定更高优先级的最优残差）}\\
+  & \mathbf{A}_j\boldsymbol{\nu}\le\mathbf{b}_j,\ j<i &&\text{（继承更高优先级不等式）}
+\end{aligned}
+\label{eq:mmk-hqp}
+\end{equation}
+求得本级最优松弛 $\mathbf{w}_i^\star$ 后冻结，进入下一级。它能在任意层级插入不等式，并在全身规模问题上以控制频率运行——这使它成为人形/移动操作整机控制的主流后端。其思想与足式 WBC（whole-body control）的分层求解一致，区别仅在那里是\emph{动力学级}（力/力矩，统一形式见 \cref{eq:umm-core}），这里是\emph{运动学级}（速度）。
+
+\subsection{典型任务栈}
+\label{sec:mmk-stack}
+
+把上述框架落到一台差速底盘 $+$ $7$ 轴臂上，一个常见的任务栈如下：
+
+\begin{table}[H]\centering\small
+\caption{移动操作的典型优先级任务栈（用约简雅可比 $\bar{\mathbf{J}}$，非完整约束已在变量层满足）。}
+\label{tab:mmk-stack}
+\begin{tabular}{cllc}
+\toprule
+优先级 & 任务 & 类型 & 雅可比 / 约束 \\
+\midrule
+P0 & 关节/底盘速度限幅、避障距离 & 不等式（最硬） & $\mathbf{A}\boldsymbol{\nu}\le\mathbf{b}$ \\
+P1 & 末端位置跟踪 & 等式 & $\bar{\mathbf{J}}_{\text{pos}}\boldsymbol{\nu}=\dot{\mathbf{p}}^d$ \\
+P2 & 末端姿态跟踪 & 等式 & $\bar{\mathbf{J}}_{\text{ori}}\boldsymbol{\nu}=\boldsymbol{\omega}^d$ \\
+P3 & 远离关节限位 / 提升可操作性 & 等式（梯度方向） & $\nabla_{\boldsymbol{\nu}}(\cdot)$ \\
+P4 & 底盘少动 / 臂回中 & 等式（最软） & $\boldsymbol{\nu}\to\boldsymbol{\nu}_0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 把避障与限幅放在最高优先级 P0，保证任何情况下安全约束都不会被末端任务“挤掉”——契合“宁可够不到，也不能撞”的工程直觉。
+
+\begin{pitfall}[思维陷阱：层数越多越好]
+新手想法：“每个偏好都给一层严格优先级，系统最讲道理。”实际上：层数越多，可行子空间逐级收缩越快，低优先级可能根本没有自由度可用（$\mathbf{N}_{i-1}$ 已退化为零维）；更糟的是\emph{优先级切换}（任务进出栈）会引起速度不连续，导致抖动。正确思维：移动操作通常 $3$--$4$ 级足够（安全 / 末端 / 限位 / 名义），其余偏好用同级加权或零空间软项处理。“多层”本身是有工程代价的。
+\end{pitfall}
+
+\subsection{可操作性梯度作为零空间目标}
+\label{sec:mmk-wgrad}
+
+\cref{sec:mmk-irm} 用可操作性做停车位姿的\emph{离线}打分；在\emph{在线}速度 IK 里，更常见的是把“提升可操作性、远离奇异”写成一个零空间速度，方向取 $w_{\text{nh}}$ 对位形的梯度：
+\begin{equation}
+  \boldsymbol{\nu}_0^{(w)}=k_w\,\nabla_{\mathbf{q}}\,w_{\text{nh}}(\mathbf{q}),\qquad
+  \frac{\partial w_{\text{nh}}}{\partial q_j}=\tfrac12\,w_{\text{nh}}\cdot\operatorname{tr}\!\Big(\big(\bar{\mathbf{J}}\bar{\mathbf{J}}^\top\big)^{-1}\frac{\partial(\bar{\mathbf{J}}\bar{\mathbf{J}}^\top)}{\partial q_j}\Big).
+  \label{eq:mmk-wgrad}
+\end{equation}
+（系数 $\tfrac12$ 来自 $w_{\text{nh}}=\sqrt{\det(\bar{\mathbf{J}}\bar{\mathbf{J}}^\top)}$ 对 $\sqrt{\cdot}$ 求导，再用 Jacobi 行列式公式 $\partial\det\mathbf{D}=\det\mathbf{D}\cdot\operatorname{tr}(\mathbf{D}^{-1}\partial\mathbf{D})$；等价地也可写成 $\partial w_{\text{nh}}/\partial q_j=w_{\text{nh}}\operatorname{tr}\big((\partial\bar{\mathbf{J}}/\partial q_j)\,\bar{\mathbf{J}}^{+}\big)$，此式中 $\tfrac12$ 已被吸收。）把 $\boldsymbol{\nu}_0^{(w)}$ 投进零空间 $(\mathbf{I}-\bar{\mathbf{J}}^{+}\bar{\mathbf{J}})\boldsymbol{\nu}_0^{(w)}$，系统会在完成末端任务的同时自动朝“更灵巧”的位形漂移、远离奇异。纯反应式（purely-reactive）控制器把这一项与避障、限位一起写成一个 QP，无需全局规划也能让移动平台持续保持高可操作性——这是把停车位姿的“离线选位”思想下沉为“在线连续调整”的代表性做法。
+
+\begin{pitfall}[概念误区：可操作性梯度需要手推解析二阶导]
+新手想法：“$\partial(\bar{\mathbf{J}}\bar{\mathbf{J}}^\top)/\partial q_j$ 要手推每个关节的雅可比导数，工程里没法用。”实际上：绝大多数实现用\emph{数值差分}或自动微分得到该梯度，根本不手推。在 $10$ 自由度移动操作上，一次梯度评估只是若干次正运动学，远低于一个控制周期的预算。手推解析式只在追求极致实时性时才必要。
+\end{pitfall}
+
+\paragraph{速度级 IK 算法。}
+把上述零件组装成一个最常用的“主任务 $+$ 软偏好”单级求解器（多级时换成 \cref{eq:mmk-hqp} 的逐级 QP）：
+
+\begin{algo}[移动操作速度级冗余 IK（单级 $+$ 软偏好）]\label{alg:mmk-velik}
+输入：约简雅可比 $\bar{\mathbf{J}}$、期望末端 twist $\mathbf{V}_d$、名义速度 $\boldsymbol{\nu}_0$、阻尼 $\lambda$、底盘/臂正则权重对角阵 $\mathbf{R}$；输出：联合准速度 $\boldsymbol{\nu}^\star$。
+\begin{enumerate}
+  \item 组装正规方程 $\mathbf{H}=\bar{\mathbf{J}}^\top\bar{\mathbf{J}}+\mathbf{R}+\lambda^2\mathbf{I}$，$\quad\mathbf{g}=\bar{\mathbf{J}}^\top\mathbf{V}_d+\mathbf{R}\,\boldsymbol{\nu}_0$；
+  \item 解对称正定系统 $\mathbf{H}\boldsymbol{\nu}^\star=\mathbf{g}$（Cholesky / LDLᵀ）；
+  \item （可选）若任一分量越速度限幅，则把违限分量钳到边界、固定为常量，回到第 1 步对剩余自由度重解（饱和处理）；
+  \item 还原底盘位形速度 $\dot{\mathbf{q}}_b=\mathbf{S}(\mathbf{q}_b)\mathbf{u}_b$，积分一步 $\mathbf{q}\leftarrow\mathbf{q}\oplus\boldsymbol{\nu}^\star\Delta t$。
+\end{enumerate}
+该算法对应优化问题 $\min_{\boldsymbol{\nu}}\tfrac12\|\bar{\mathbf{J}}\boldsymbol{\nu}-\mathbf{V}_d\|^2+\tfrac12(\boldsymbol{\nu}-\boldsymbol{\nu}_0)^\top\mathbf{R}(\boldsymbol{\nu}-\boldsymbol{\nu}_0)+\tfrac12\lambda^2\|\boldsymbol{\nu}\|^2$；$\mathbf{R}$ 的底盘对角项调大则求解器少用底盘速度、臂对角项调大则少用关节速度。它只解速度级任务，不含碰撞与关节限位的硬约束——后者须升级为 \cref{eq:mmk-hqp} 的 QP，或交给 \cref{ch:mm-ocp} 的带约束最优控制。
+\end{algo}
+
+% ════════════════════════════════════════════════════════════════
+\section{停车位姿与反向可达图}
+\label{sec:mmk-irm}
+
+\paragraph{底盘停在哪里，决定臂能不能抓。}
+前面几节是“边走边动”的连续视角；本节切到“先到位再操作”的离散视角。给定目标抓取位姿 $\mathbf{T}_g^w$，要找底盘位姿 $\mathbf{q}_b$，使存在臂构型 $\mathbf{q}_a$ 满足 $\mathbf{T}_{we}(\mathbf{q}_b,\mathbf{q}_a)=\mathbf{T}_g^w$，同时底盘/臂不碰撞、关节不超限、IK 远离奇异、视野不被遮挡、底盘可由导航到达。逐个候选解 IK 太慢——\textbf{反向可达图}（Inverse Reachability Map, IRM）把这件事压成离线采样 $+$ 在线查表。
+
+\subsection{从可达图到反向可达图}
+\label{sec:mmk-rm-irm}
+
+\begin{definition}[可达图 RM]\label{def:mmk-rm}
+把\emph{基座系}下的末端位姿空间离散成 $6$D 体素（voxel）：位置 $(x,y,z)$ 按分辨率 $\Delta_p$（典型 $5\,$cm）网格化，姿态按 $\SO(3)$ 上的均匀采样 $\Delta_R$ 离散。对每个体素 $V$，离线随机采样大量臂构型 $\mathbf{q}_a$、正运动学得 $\mathbf{T}_{be}(\mathbf{q}_a)$，落入哪个体素就为其累加一次命中。每个体素存\textbf{可达性质量}
+\begin{equation}
+  \rho(V)=\max_{\mathbf{q}_a:\,\mathbf{T}_{be}(\mathbf{q}_a)\in V}\ w(\mathbf{q}_a),\qquad
+  w(\mathbf{q}_a)=\sqrt{\det\!\big(\mathbf{J}_a\mathbf{J}_a^\top\big)},
+  \label{eq:mmk-rho}
+\end{equation}
+即落入该体素的所有构型中\emph{最高的 Yoshikawa 可操作度}（也可用命中率或最小到限位距离）。$\rho$ 高的体素表示“臂在这里既够得到、又灵巧、远离奇异”。
+\end{definition}
+
+RM 回答“给定底座，末端能到哪”；base placement 要的是反问题“给定末端目标，底座该在哪”。关键观察是这对变换\emph{互为逆}：若末端相对底座的位姿是 $\mathbf{T}_{be}$，则\textbf{底座相对末端}的位姿就是
+\begin{equation}
+  \mathbf{T}_{eb}=\mathbf{T}_{be}^{-1}.
+  \label{eq:mmk-Teb}
+\end{equation}
+
+\begin{definition}[反向可达图 IRM]\label{def:mmk-irm}
+把 RM 中每个体素 $\mathbf{T}_{be}$ 取逆、连同其质量 $\rho$ 一起存进“以末端为原点”的新体素表，即得 IRM。在线给定世界系目标 $\mathbf{T}_g^w$，候选底座世界位姿直接由
+\begin{equation}
+  \boxed{\;\mathbf{T}_b^w=\mathbf{T}_g^w\,\mathbf{T}_{eb}=\mathbf{T}_g^w\,\mathbf{T}_{be}^{-1}\;}
+  \label{eq:mmk-Tbw}
+\end{equation}
+枚举 IRM 中所有高质量 $\mathbf{T}_{eb}$ 得到——\emph{不需要在线解任何 IK}。再把 $\mathbf{T}_b^w$ 投影到 $\SE(2)$（取 $x,y$ 与绕 $z$ 偏航，忽略高度与滚转俯仰，因底盘只在平面运动）即候选 $\mathbf{q}_b$。
+\end{definition}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=6mm]
+  % RM box
+  \node[draw, rounded corners, fill=main!6, draw=main!60!black, align=center, font=\small, inner sep=4pt] (rm)
+    {可达图 RM\\“给定底座，末端能到哪”\\体素键 $=\mathbf{T}_{be}$，值 $=\rho$};
+  % inverse op
+  \node[draw, rounded corners, fill=third!8, draw=third!60!black, right=14mm of rm, align=center, font=\small, inner sep=4pt] (inv)
+    {逐体素取逆\\$\mathbf{T}_{eb}=\mathbf{T}_{be}^{-1}$};
+  % IRM box
+  \node[draw, rounded corners, fill=second!6, draw=second!60!black, right=14mm of inv, align=center, font=\small, inner sep=4pt] (irm)
+    {反向可达图 IRM\\“给定末端，底座该在哪”\\体素键 $=\mathbf{T}_{eb}$，值 $=\rho$};
+  \draw[->, thick, gray!60!black] (rm)--(inv);
+  \draw[->, thick, gray!60!black] (inv)--(irm);
+  % online query
+  \node[below=9mm of irm, align=center, font=\small] (q)
+    {在线：$\mathbf{T}_b^w=\mathbf{T}_g^w\,\mathbf{T}_{eb}$\\$\to$ 投影到 $\SE(2)$ 得候选 $\mathbf{q}_b$};
+  \draw[->, thick, second!60!black] (irm)--(q);
+\end{tikzpicture}
+\caption{从 RM 到 IRM 的取逆与在线查表。离线大量 FK 采样建 RM，逐体素取逆得 IRM；在线一次矩阵乘 $\mathbf{T}_g^w\mathbf{T}_{eb}$ 即枚举候选底座位姿，免在线 IK。}
+\label{fig:mmk-irm}
+\end{figure}
+
+\begin{insight}[IRM 的本质洞察：把在线 IK 搜索换成离线 FK 采样 $+$ 查表]
+正运动学是廉价的单向计算，逆运动学是昂贵的搜索。IRM 用大量离线 FK 采样把 IK 的答案“预烤”进表里，在线只剩一次矩阵求逆与查表。这与图形学里用预计算光照贴图替代实时光线追踪是同一种工程哲学：把贵的搜索搬到离线。
+\end{insight}
+
+\begin{pitfall}[概念误区：IRM 可以直接给出可执行停车点]
+新手想法：“从 IRM 查到高质量 $\mathbf{T}_{eb}$，转成 $\mathbf{q}_b$ 就能去停。”实际上：IRM 只编码了\emph{臂的运动学可达性}，它不知道现场障碍、底盘能否导航到该点、相机是否被遮挡。正确做法：IRM 给出的是\textbf{按可达质量排序的候选集}，必须再经 \cref{sec:mmk-baseplace} 的多项代价（costmap、IK 复核、视野）过滤——IRM 负责“快速缩小搜索范围”，不负责“最终拍板”。
+\end{pitfall}
+
+\subsection{离散化精度与内存的权衡}
+\label{sec:mmk-discretize}
+
+体素分辨率是精度与内存的权衡：$\Delta_p$ 太粗，候选停车点与真实最优偏差大、可能 IK 复核全失败；太细，$6$D 体素数量按 $O(\Delta_p^{-3}\Delta_R^{-3})$ 爆炸，离线构建与内存都吃不消。工程上常只对\emph{任务相关}的位姿子集（如桌面高度 $\pm10\,$cm、末端朝下的抓取姿态）建图，把 $6$D 退化成 $3$--$4$D，显著压缩规模。这也解释了为何通用 IRM 少见、而“面向某类抓取任务的定制 IRM”更实用。
+
+\subsection{停车位姿的多项代价}
+\label{sec:mmk-baseplace}
+
+IRM 给出候选集后，最终选点要综合多项代价。一个停车候选的代价可写为
+\begin{equation}
+  J(\mathbf{q}_b,\mathbf{q}_a)=
+  w_d\,d_{\text{nav}}(\mathbf{q}_b)
+  +w_c\,c_{\text{costmap}}(\mathbf{q}_b)
+  +w_i\,c_{\text{ik}}(\mathbf{q}_a)
+  +w_l\,c_{\text{limit}}(\mathbf{q}_a)
+  +w_v\,c_{\text{view}}(\mathbf{q}_b),
+  \label{eq:mmk-baseplace-cost}
+\end{equation}
+其中导航距离 $d_{\text{nav}}$、障碍代价 $c_{\text{costmap}}$、IK 残差/奇异 $c_{\text{ik}}$、关节接近限位 $c_{\text{limit}}$、相机视角/遮挡 $c_{\text{view}}$ 各占一项。奇异项用可操作度刻画：
+\begin{equation}
+  c_{\text{ik}}=\frac{1}{w(\mathbf{q}_a)+\epsilon},\qquad w(\mathbf{q}_a)=\sqrt{\det(\mathbf{J}_a\mathbf{J}_a^\top)}.
+  \label{eq:mmk-cik}
+\end{equation}
+按 \cref{eq:mmk-baseplace-cost} 对 IRM 候选打分排序、取最优即停车位姿。
+
+\begin{algo}[停车位姿求解：IRM 查表 $+$ 多代价过滤]\label{alg:mmk-baseplace}
+输入：目标抓取位姿 $\mathbf{T}_g^w$、离线 IRM、costmap、IK 求解器；输出：综合代价最低的停车位姿 $\mathbf{q}_b^\star$（及对应臂构型）。
+\begin{enumerate}
+  \item 从 IRM 取出可达质量 $\rho$ 高的若干 $\mathbf{T}_{eb}$ 候选；
+  \item 对每个候选算 $\mathbf{T}_b^w=\mathbf{T}_g^w\mathbf{T}_{eb}$（\cref{eq:mmk-Tbw}），投影到 $\SE(2)$ 得候选 $\mathbf{q}_b$；
+  \item 用 costmap 滤掉碰撞/不可导航的候选；
+  \item 对幸存候选解一次臂 IK，复核可达、无碰、远离奇异（更新 $c_{\text{ik}},c_{\text{limit}}$）；
+  \item 按 \cref{eq:mmk-baseplace-cost} 打分，返回代价最低者。
+\end{enumerate}
+\end{algo}
+
+\begin{note}[非完整底盘对 base placement 的影响]\label{note:mmk-nonholo-baseplace}
+\cref{def:mmk-irm} 把 $\mathbf{T}_b^w$ 投到 $\SE(2)$ 时枚举了任意朝向 $\theta_b$，这\emph{合法}——由 \cref{note:mmk-r-quasivel} 的长期可达性，差速底盘虽瞬时不能侧移，却能停到任意位姿。但 Ackermann（阿克曼）底盘停车约束更强（最小转弯半径、不能原地转向），可达的最终位姿受限，故其 base placement 更难，候选还需经一道“运动学可停性”过滤。这正是 \cref{sec:mmk-wnh} 强调“朝向 $\theta_b$ 进入可操作性”的下游后果：停车位姿不是只挑位置，朝向同样是一等决策量。
+\end{note}
+
+\paragraph{承上启下。}
+本章把“底盘 $+$ 臂”统一成了联合雅可比与约简映射，并给出冗余 IK、分层求解与停车位姿两条互补路线。它们都停在\emph{运动学/速度级}：要么逐时刻反应（速度 IK），要么静态选点（base placement）。当任务需要\emph{显式地、在一段时间窗内}权衡“底盘怎么走、臂怎么动、何时到位”，并把碰撞、限位、非完整约束作为硬约束统一处理时，就要把本章的联合运动学搬进一个带约束的最优控制问题——这正是 \cref{ch:mm-ocp} 的主题，本章的 $\bar{\mathbf{J}}$、零空间与 $\SE(3)$ 末端误差将在那里成为代价与约束的零件。
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+差速底盘“冗余少 $1$”意味着停不到某些位姿 & 那是\emph{速度级}现象；长期仍可达全 $SE(2)$（\cref{note:mmk-r-quasivel}）\\
+先按全向求伪逆、再把横向速度置零即可 & 置零非约束投影，破坏末端任务；须用约简雅可比（\cref{thm:mmk-Jbar}）\\
+$\boldsymbol{\nu}$ 就是位形导数 $\dot{\mathbf{q}}$ & $\boldsymbol{\nu}$ 是准速度，$\dot{\mathbf{q}}=\bar{\mathbf{S}}\boldsymbol{\nu}$；横向恒为耦合量 $v\sin\theta_b$ \\
+阻尼因子 $\lambda$ 越小越好 & $\lambda\to0$ 在奇异处速度发散；宜随奇异值自适应（\cref{thm:ak-dls}）\\
+多级优先级层数越多越讲道理 & 子空间逐级塌缩、切换抖动；$3$--$4$ 级足够（\cref{tab:mmk-stack}）\\
+固定臂可操作度 $w(\mathbf{q}_a)$ 足以刻画移动平台 & 须用约简版 $w_{\text{nh}}=\sqrt{\det(\bar{\mathbf{J}}\bar{\mathbf{J}}^\top)}$，含朝向 $\theta_b$（\cref{eq:mmk-wnh}）\\
+IRM 查到的高质量点就能直接去停 & 仅编码臂可达性；须再过 costmap/IK/视野（\cref{alg:mmk-baseplace}）\\
+$\mathbf{T}_{wb}$ 与 $\mathbf{T}_{bw}$ 可混用 & 方向相反；下标对 $\mathbf{T}_{ab}=\{b\}$ 在 $\{a\}$ 中的位姿，须一路右乘 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+本章把固定臂的微分运动学与冗余 IK 推广到“可移动、可能非完整”的浮动基座，建立了移动操作的运动学地基。主线是：联合构型 $\mathbf{q}=(\mathbf{q}_b;\mathbf{q}_a)\in\SE(2)\times\mathbb{R}^{n_a}$ 与末端 $\mathbf{T}_{we}=\mathbf{T}_{wb}\mathbf{T}_{be}$（\cref{def:mmk-config}）$\to$ 联合雅可比 $\mathbf{V}_{ee}=[\mathbf{J}_b\ \mathbf{J}_a]\boldsymbol{\nu}$，差速 $6\times2$、全向 $6\times3$（\cref{def:mmk-jac,prop:mmk-Jb-diff,prop:mmk-Jb-omni}）$\to$ 约简雅可比 $\bar{\mathbf{J}}=\mathbf{J}_{\text{full}}\bar{\mathbf{S}}$ 把非完整约束吸收进变量定义（\cref{thm:mmk-Jbar}）$\to$ 阻尼伪逆 $+$ 零空间表达工程偏好（\cref{eq:mmk-dls,eq:mmk-nullspace}）$\to$ 任务优先级与 HQP 组织多级目标（\cref{thm:mmk-recursive,eq:mmk-hqp}）$\to$ IRM 与 base placement 把在线 IK 换成离线查表（\cref{def:mmk-irm,alg:mmk-baseplace}）。两个反复出现的核心命题是：差速底盘的“朝向”会进入可操作性（\cref{eq:mmk-wnh}），全向不劣于差速（\cref{prop:mmk-omni-ge-diff}）。
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\mathbf{q}=(\mathbf{q}_b;\mathbf{q}_a)$ & 联合构型（底盘 $\SE(2)$ $+$ 臂 $\mathbb{R}^{n_a}$） & \cref{eq:mmk-config} \\
+$\mathbf{T}_{wb},\mathbf{T}_{be},\mathbf{T}_{we}$ & 底座/末端相对底座/末端在世界系的位姿 & \cref{eq:mmk-fk} \\
+$\mathbf{u}_b$ & 底盘可控输入（差速 $(v,\omega)$ / 全向 $(v_x^B,v_y^B,\omega)$） & \cref{eq:mmk-joint-jac} \\
+$\boldsymbol{\nu}=(\mathbf{u}_b;\dot{\mathbf{q}}_a)$ & 可控准速度（非位形导数） & \cref{eq:mmk-joint-jac} \\
+$\mathbf{V}_{ee}=[\mathbf{v}_{ee};\boldsymbol{\omega}_{ee}]$ & 末端 twist（线速度在前） & \cref{eq:mmk-joint-jac} \\
+$\mathbf{J}=[\mathbf{J}_b\ \mathbf{J}_a]$ & 联合雅可比 & \cref{eq:mmk-joint-jac} \\
+$\mathbf{p}_{be}^w$ & 末端相对底座的位置（世界系） & \cref{eq:mmk-Jb-diff} \\
+$\mathbf{S},\bar{\mathbf{S}}$ & 底盘 / 全身约简选择矩阵 & \cref{eq:mmk-S,eq:mmk-Sbar} \\
+$\bar{\mathbf{J}}=\mathbf{J}_{\text{full}}\bar{\mathbf{S}}$ & 约简雅可比 & \cref{eq:mmk-Jbar} \\
+$\mathbf{A}(\mathbf{q}_b)$ & 非完整 Pfaffian 约束行向量，$\mathbf{A}\mathbf{S}=\mathbf{0}$ & \cref{eq:mmk-S} \\
+$w_{\text{nh}}$ & 非完整可操作性 $\sqrt{\det(\bar{\mathbf{J}}\bar{\mathbf{J}}^\top)}$ & \cref{eq:mmk-wnh} \\
+$r$ & 冗余度 $\dim(\boldsymbol{\nu})-m$ & \cref{eq:mmk-r} \\
+$\lambda$ & 阻尼最小二乘阻尼因子 & \cref{eq:mmk-dls} \\
+$\boldsymbol{\nu}_0$ & 零空间名义/偏好速度 & \cref{eq:mmk-nullspace} \\
+$\mathbf{N}_i$ & 前 $i$ 个任务联合零空间投影 & \cref{eq:mmk-rec-N} \\
+$\mathbf{T}_{eb}=\mathbf{T}_{be}^{-1}$ & 底座相对末端的位姿（IRM 键） & \cref{eq:mmk-Teb} \\
+$\rho(V)$ & 体素可达性质量 & \cref{eq:mmk-rho} \\
+$\mathbf{T}_b^w=\mathbf{T}_g^w\mathbf{T}_{eb}$ & 由目标反查的候选底座世界位姿 & \cref{eq:mmk-Tbw} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 联合构型与 FK & $\SE(2)\times\mathbb{R}^{n_a}$；$\mathbf{T}_{we}=\mathbf{T}_{wb}\mathbf{T}_{be}$ & \(\bigstar\bigstar\) \\
+2 & 联合雅可比 & 差速 $6\times2$、全向 $6\times3$；偏航给 $\mathbf{e}_z\times\mathbf{p}$ & \(\bigstar\bigstar\bigstar\) \\
+3 & 约简雅可比 & $\bar{\mathbf{J}}=\mathbf{J}_{\text{full}}\bar{\mathbf{S}}$ 吸收非完整约束 & \(\bigstar\bigstar\bigstar\) \\
+4 & 非完整可操作性 & $w_{\text{nh}}$ 含朝向；全向不劣于差速 & \(\bigstar\bigstar\bigstar\) \\
+5 & 冗余 IK & 阻尼伪逆 $+$ 零空间偏好 & \(\bigstar\bigstar\bigstar\) \\
+6 & 任务优先级 / HQP & 递归零空间投影；不等式逐级 QP & \(\bigstar\bigstar\bigstar\bigstar\) \\
+7 & IRM / base placement & 取逆查表免在线 IK；多代价过滤 & \(\bigstar\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{冗余与零空间地基}：Khatib 的操作空间控制（operational space control）——末端任务、冗余度与零空间控制的奠基思想，对应本书 \cref{ch:operational-space}。
+  \item \textbf{移动操作协调控制}：Yamamoto 与 Yun 关于 mobile manipulator 的协调控制工作——底盘与臂如何共同贡献末端运动，是 \cref{sec:mmk-jacobian} 联合雅可比的经典出处。
+  \item \textbf{任务优先级与分层求解}：Siciliano--Slotine 的任务优先级框架，以及 Escande--Mansard--Wieber 的分层二次规划（HQP），对应 \cref{sec:mmk-priority}。
+  \item \textbf{反向可达图}：Vahrenkamp 等关于 reachability/inverse reachability map 的工作——\cref{sec:mmk-irm} 的体素化与取逆查表的来源。
+  \item \textbf{统一最优控制落点}：\cref{ch:mm-ocp} 把本章联合运动学放进带约束的统一 OCP；多臂/双臂协同的运动学耦合见 \cref{ch:arm-dualarm-planning} 与 \cref{sec:ma-coopkin}。
+\end{itemize}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：导航到位但 IK 失败 / IK 成功却路径碰撞。\textbf{排查}：base placement 是否\emph{只}检查了导航可达而漏查臂可达（\cref{alg:mmk-baseplace} 第 4 步）；停车容差是否宽于实际定位精度；目标物位姿是否在导航后更新。\textbf{对策}：用底盘\emph{实际}最终位姿重解 IK；收紧容差；停车后加视觉伺服微调。
+  \item \textbf{症状}：底盘 footprint 安全，臂或负载却撞货架。\textbf{原因}：$2$D footprint 不知道臂伸出。\textbf{对策}：导航阶段收臂、用 $2$D footprint；操作阶段底盘静止、用 $3$D 碰撞检查；连续移动操作用整机包络/距离场统一两套碰撞。
+  \item \textbf{症状}：末端速度 IK 在某位形突然发散。\textbf{原因}：$\bar{\mathbf{J}}$ 秩亏（奇异，\cref{sec:ak-singularity}）、$\lambda$ 太小。\textbf{对策}：用 DLS 并让 $\lambda$ 随最小奇异值自适应（\cref{eq:mmk-dls}）；在零空间加 $w_{\text{nh}}$ 梯度项主动远离奇异（\cref{eq:mmk-wgrad}）。
+  \item \textbf{症状}：差速底盘执行末端任务时横向“漂”或末端跟不上。\textbf{原因}：误把差速当全向、用 $\mathbf{J}_{\text{full}}$ 伪逆后把横向置零。\textbf{对策}：改用约简雅可比 $\bar{\mathbf{J}}$（\cref{thm:mmk-Jbar}），从变量层满足非完整约束。
+  \item \textbf{症状}：抓取前底盘反复小范围微调、任务时间过长。\textbf{原因}：base placement 代价对底盘路径过敏、目标检测抖动、容差小于定位精度。\textbf{对策}：对目标位姿时间滤波；停车位姿加滞回（新候选提升小则保持原候选）；停车后改用臂 $+$ 视觉伺服微调、不再频繁挪底盘。
+\end{enumerate}

@@ -1,0 +1,1269 @@
+\chapter{机器人资产全链路：URDF 到 MJCF/USD}\label{ch:rlmc-assets}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章。
+%  主线：算法/概念领路 —— 本章的「算法主线」不是某个 RL 算法，而是
+%  「一个可训练的机器人资产由哪些物理语义构成（运动学树 / 惯性 / 接触几何 /
+%  执行器 / 求解器），以及从 CAD 到仿真这条管线在每一步会丢失/补全哪些语义」。
+%  假定读者已有 RL 基础与前面实践章（仿真物理 prac_physics、观测动作 prac_obs_action、
+%  奖励 prac_reward、域随机化 prac_domain_rand）的铺垫。本章只讲「扩展+实战」。
+%  源稿 RL运控/Ch11_机器人资产全链路.md 已按本主线重构，并按三框架对比组织。
+%  关键 API/版本/论文归属经联网核对，纠正了源稿若干过时处：
+%    - Isaac Lab v2.x UrdfConverterCfg 已重写：joint_drive(JointDriveCfg -> gains:PDGainsCfg)、
+%      collider_type in {convex_hull,convex_decomposition}、link_density、make_instanceable 默认 True；
+%      源稿的 default_drive_type/default_drive_stiffness/collision_approximation 为旧式，已改正；
+%    - convert_urdf.py 现位于 scripts/tools/（旧路径 source/standalone/tools/）；
+%    - CoACD = Wei,Liu,Ling,Su, ACM TOG(SIGGRAPH) 2022, arXiv:2205.02961；
+%    - Wensing,Kim,Slotine, RA-L 2018, arXiv:1701.04395；
+%    - foam = CoMMA Lab, arXiv:2503.13704（球近似，非凸包）；obj2mjcf 现用 CoACD 而非 V-HACD；
+%    - MjSpec.attach() 签名用 frame=/site= + prefix/suffix，pos/quat 非直接参数，已标注。
+% ════════════════════════════════════════════════════════════════
+
+前面几章默认读者手里\emph{已经有}一台可训练的仿真机器人——\cref{ch:rlmc-obsact} 设计它的观测与动作，\cref{ch:rlmc-reward} 设计它的奖励，\cref{ch:rlmc-physics} 讨论它在 MuJoCo 与 PhysX 下的接触行为差异。本章回头补上这条因果链最前置的一环：\textbf{这台机器人是怎么来的}。从 CAD 设计图纸到一份能在 mjlab 与 Isaac Lab 里并行训练的资产，中间隔着一条容易被低估、却决定后续一切的工程管线。
+
+本章仍遵循全书「概念领路、实践兑现」的次序。这里的「概念主线」不是某个 RL 算法，而是一条\textbf{物理语义的守恒与补全链}：一个可训练资产在物理上由五类语义构成——\emph{运动学树}（link/joint）、\emph{惯性}（质量/质心/惯量）、\emph{接触几何}（碰撞体）、\emph{执行器}（驱动模型）、\emph{求解器设置}。CAD 文件只精确描述了几何外形；URDF 补上了运动学树与基本惯性，却\emph{丢弃}了接触、执行器、求解器；MJCF 与 USD 各自把这三类语义补回来，但补法不同。理解「每一步守恒了什么、丢失了什么、由谁补全」，是「能把模型加载进去」与「能把模型调到可训练」之间的分水岭。这正是本章的本质洞察，我们会在 \cref{sec:rlmc-assets-overview} 把它立起来，并贯穿全章。
+
+% ════════════════════════════════════════════════════════════════
+\section{环境配置指南}
+\label{sec:rlmc-assets-prep}
+
+资产管线的工具链横跨 CAD、网格处理、两个仿真器，版本错配的代价往往\emph{延迟到加载时}才暴露。下表给出三框架视角下本章用到的工具与最低要求（UniLab 走 MuJoCo/Motrix 原生路线，无 USD 工具链）。
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lLLL@{}}
+\toprule
+能力 & mjlab 侧 & Isaac Lab 侧 & UniLab \\
+\midrule
+URDF$\to$原生格式 & \texttt{mujoco.\allowbreak MjSpec.\allowbreak from\_file} 直读 & \texttt{convert\_urdf.\allowbreak py} / \texttt{UrdfConverter} & \texttt{unilab-import-robot} \\
+原生格式 & MJCF (\texttt{.xml}) & USD (\texttt{.usd}) & MJCF / Motrix XML（\textbf{不用 USD}） \\
+网格转换 & \texttt{obj2mjcf}（用 CoACD） & 转换器内置 collider & 同 mjlab 路径（mujoco 后端复用 OBJ 流） \\
+凸分解 & V-HACD / CoACD & \texttt{collider\_type} 选项 & V-HACD / CoACD（mesh 层，后端无关） \\
+Python & $\ge 3.10$ & $\ge 3.10$（2.x 主线） & $3.13$（本章基准） \\
+关键依赖 & \texttt{mujoco}$\ge$3.x, \texttt{trimesh}, \texttt{coacd} & Isaac Sim / Isaac Lab 2.x & \texttt{mujoco-uni}$=$3.8.0 或 \texttt{motrixsim-core}$=$0.8.2 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paragraph{版本敏感点。}本章三处最易踩版本坑，提前点名。第一，\textbf{Isaac Lab 的 \texttt{UrdfConverterCfg} 在 2.x 被重写}：旧教程里的 \Verb[breaklines]|default_drive_type| / \Verb[breaklines]|default_drive_stiffness| / \Verb[breaklines]|collision_approximation| 已不存在，取而代之的是结构化的 \verb|joint_drive|（内含 \verb|gains|）与 \verb|collider_type|（见 \cref{sec:rlmc-assets-usd}）。照旧 API 写会直接 \verb|TypeError|。第二，\textbf{命令行转换脚本路径变了}：现在是 \Verb[breaklines]|scripts/tools/convert_urdf.py|，旧版在 \Verb[breaklines]|source/standalone/tools/|。第三，\textbf{Isaac Sim 5.1 改了固定关节合并的默认行为}——带质量/惯量的 link 不再被自动合并；Isaac Lab 通过钉住旧版 URDF importer 扩展（约 2.4.31）保持向后兼容，遇到「link 数比预期多」时要查这一点\,\cite{isaaclab2024}。
+
+\paragraph{安装。}网格工具链是纯 Python，可装进任一框架的虚拟环境。\pzr{关键前提（本机实测踩过的坑）：\texttt{coacd}/\allowbreak\texttt{obj2mjcf}/\allowbreak\texttt{trimesh} \emph{都不}随 mjlab/UniLab 自带——在 autodl 上两个 \texttt{.venv} 里 \texttt{import coacd} 一律 \texttt{ModuleNotFoundError}。本节及后续所有 CoACD/obj2mjcf 代码块都\emph{先装}才能跑。}用 uv 管理的框架（mjlab/UniLab 都是）应装进\emph{对应那个} \texttt{.venv}，否则装到全局 Python 仍旧 import 不到：
+
+\begin{codebox}[bash]{网格处理工具链安装（装进框架自己的 .venv，并验证版本）}
+# 用 uv 的项目(mjlab/UniLab):在仓库根目录用 uv pip 装进该项目的 .venv
+uv pip install coacd trimesh obj2mjcf      # CoACD=碰撞感知凸分解;obj2mjcf 内部依赖它
+# 不用 uv 的纯环境:先 `source .venv/bin/activate` 再 `pip install coacd trimesh obj2mjcf`
+# 验证:必须用框架的解释器跑(uv run python / 激活后的 python)，并打印版本以确认装进了同一环境
+uv run python -c "import coacd, trimesh, mujoco; \
+print('coacd', coacd.__version__, '| trimesh', trimesh.__version__, '| mujoco', mujoco.__version__)"
+# 期望:三行版本号都打印出来;若仍 ModuleNotFoundError，多半装错了环境(全局 vs .venv)
+\end{codebox}
+
+排错口径：遇到 \texttt{ModuleNotFoundError: No module named 'coacd'} 不要急着重装——先 \texttt{uv run python -c "import sys; print(sys.\allowbreak executable)"} 看实际用的是哪个解释器，再 \texttt{uv pip show coacd} 看它装到了哪个 \texttt{site-packages}；两者路径对不上就是「装到全局、用 \texttt{.venv} 跑」这个经典错配。
+
+mjlab 侧不需要额外的「URDF 转换器」——MuJoCo 编译器本身就能直读 URDF（\cref{sec:rlmc-assets-mjcf}）。Isaac Lab 侧的转换器随框架安装（参见 \cref{ch:rlmc-setup} 的安装步骤）。UniLab 与 mjlab 同走 MuJoCo 路线（mujoco 后端经 \texttt{mujoco-uni}），所以网格工具链同样直接可用；不同的是它把「资产从哪来」做成两个 CLI 入口——\texttt{unilab-pull-assets} 从 Hugging Face 拉预置模型/网格（国内首跑须 \Verb[breaklines]|export HF_ENDPOINT=https://hf-mirror.com|），\texttt{unilab-import-robot} 从 URDF 导入新机器人。\pzr{注意：\texttt{unilab-pull-assets} 的 \texttt{--robot} 是\emph{受限枚举}，本机实测当前默认且唯一可选是 \texttt{x2}（并\emph{不}拉 Go2）；要拉哪台以 \texttt{unilab-pull-assets --help} 列出的 \texttt{--robot} 取值为准。下文 Quick Start 用的 \texttt{go2\_joystick\_flat} 任务能直接训，是因为 Go2 的 MJCF 已随包分发在 \texttt{src/\allowbreak unilab/\allowbreak assets/\allowbreak robots/\allowbreak go2/\allowbreak }，无需 pull。}它不依赖 Isaac Sim/USD 工具链，资产最终落成 MJCF（mujoco 后端）或 Motrix XML（motrix 后端），存于 \Verb[breaklines]|src/unilab/assets/robots/<robot>/|。
+
+% ════════════════════════════════════════════════════════════════
+\section{Quick Start：五分钟把一份 URDF 跑进两个仿真器}
+\label{sec:rlmc-assets-quickstart}
+
+不必从 CAD 起步。最快的上手路径是拿 MuJoCo Menagerie 里一台现成机器人的资产，分别在两个框架里加载一次、看一眼基本量纲对不对。下面两段代码可直接复制运行（前提：已 \Verb[breaklines]|git clone| Menagerie 到本地）。
+
+\begin{codebox}[Python]{mjlab 侧:MjSpec 直读并打印基本信息}
+import mujoco
+from pathlib import Path
+
+# Menagerie 模型本地路径（请改成你的克隆位置）
+menagerie = Path("mujoco_menagerie")
+spec = mujoco.MjSpec.from_file(str(menagerie / "unitree_go1" / "scene.xml"))
+model = spec.compile()            # MjSpec -> MjModel（CPU 端编译）
+data = mujoco.MjData(model)
+
+print(f"bodies={model.nbody} joints={model.njnt} "
+      f"nq={model.nq} nv={model.nv} actuators={model.nu}")
+print(f"total_mass={sum(model.body_mass):.2f} kg  dt={model.opt.timestep}")
+if model.nkey > 0:                # 有关键帧就摆到第一个（通常是 home 姿态）
+    data.qpos[:] = model.key_qpos[0]
+    mujoco.mj_forward(model, data)
+    print(f"root z @ home = {data.qpos[2]:.3f} m")
+\end{codebox}
+
+这段代码的关键在 \texttt{MjSpec.\allowbreak from\_file} 这一步：它既能读 MJCF 也能读 URDF，URDF 会被 MuJoCo 编译器\emph{即时转换}成内部模型（\cref{sec:rlmc-assets-mjcf} 详述）。打印出来的 \verb|total_mass| 是第一个该核对的量——如果它比真机重了一个数量级，几乎可以断定 CAD 里材料密度没设对（\cref{sec:rlmc-assets-inertia}）。
+
+\begin{note}[没 clone Menagerie 也能立刻跑：用框架自带的「裸资产」（含一个易困惑点的解释）]\label{note:rlmc-assets-bareasset}
+上面用的是 Menagerie 的 \texttt{unitree\_go1/\allowbreak scene.\allowbreak xml}——它是\emph{带场景}的完整资产（含执行器与 \texttt{home} 关键帧）。若你还没 \texttt{git clone} Menagerie，本机最小可跑路径是直接拿框架\emph{随包自带}的裸机器人 XML：mjlab 在 \Verb[breaklines]|src/mjlab/asset_zoo/robots/unitree_go1/xmls/go1.xml|、UniLab 在 \Verb[breaklines]|src/unilab/assets/robots/go2/go2.xml|，把上面 \texttt{from\_file} 的路径换成它即可先打通 \texttt{MjSpec$\to$compile$\to$MjData}。
+
+但这里有个\textbf{必然会让新手困惑的现象，值得讲穿}：把上面那段对 mjlab 自带的 \texttt{go1.xml} 跑一遍，本机实测得到 \Verb[breaklines]|bodies=14 njnt=13 nq=19 nv=18 total_mass=12.74kg dt=0.002|，而 \verb|actuators=0|、\verb|nkey=0|——\textbf{执行器和关键帧都是 0}。这不是资产坏了，而是 mjlab 的设计：随包的 \texttt{go1.xml} 是\emph{裸运动学/惯性资产}，执行器与初始关键帧\emph{不}写在 XML 里，而是在 \texttt{env} 侧（\texttt{EntityCfg}/任务配置）于编译期\emph{注入}（这正印证了本章 \cref{ins:rlmc-assets-compiled} 的「资产是编译出来的、执行器后补」）。所以：要看 \verb|actuators>0| 与 \verb|nkey>0|，要么用 Menagerie 的 \texttt{scene.xml}（执行器/关键帧已写在资产里），要么走完整的 \texttt{train} 流程（env 注入后才有）。\textbf{判据}：在裸 \texttt{go1.xml} 上看到 \verb|actuators=0| 是\emph{正常}的，不必当成 bug 去排查。
+\end{note}
+
+\begin{codebox}[Python]{Isaac Lab 侧:URDF 转 USD 再加载（v2.x API）}
+# 需在 Isaac Lab 的 Python 环境内运行（启动 app 后再 import）
+from isaaclab.sim.converters import UrdfConverter, UrdfConverterCfg
+
+cfg = UrdfConverterCfg(
+    asset_path="go1.urdf",
+    usd_dir="./usd_out",
+    usd_file_name="go1.usd",
+    fix_base=False,                 # locomotion 机器人:浮动基座
+    merge_fixed_joints=True,        # 合并固定关节，减少 link 数
+    make_instanceable=True,         # 多环境共享 mesh（默认即 True）
+    # v2.x:驱动参数走结构化的 joint_drive，而非旧的 default_drive_*
+    joint_drive=UrdfConverterCfg.JointDriveCfg(
+        target_type="position",
+        gains=UrdfConverterCfg.JointDriveCfg.PDGainsCfg(
+            stiffness=100.0, damping=10.0,
+        ),
+    ),
+)
+converter = UrdfConverter(cfg)
+print("USD written to:", converter.usd_path)
+\end{codebox}
+
+\pzr{注意：上面 \texttt{joint\_drive} 这段就是源教程最容易过时的地方。}旧资料里的 \Verb[breaklines]|default_drive_type="position"| / \Verb[breaklines]|default_drive_stiffness=100| 在 Isaac Lab 2.x 已被移除，必须改用 \Verb[breaklines]|joint_drive=JointDriveCfg(...)| 加嵌套的 \verb|gains|。我们会在 \cref{sec:rlmc-assets-usd} 把这套新 API 逐字段讲清。
+
+UniLab 的等价 Quick Start 路径与上面两者形成第三种对比：它\emph{不做} URDF 转 USD 这一步（无 USD），而是直接拉一份现成 MJCF 资产、跑一个极短的训练把整条「资产$\to$后端$\to$策略」管线打通。注意 env 数与迭代数走 Hydra 覆盖（不是命令行 flag）：
+
+\begin{codebox}[bash]{UniLab 侧:拉资产并跑一次最小冒烟（直接用 MJCF，不经 USD）}
+# 0) Go2 的 MJCF 本就随包分发(src/unilab/assets/robots/go2/)，此步可跳过;
+#    pull-assets 当前的 --robot 仅 x2 一项(--help 查清单)，并不拉 Go2
+export HF_ENDPOINT=https://hf-mirror.com   # 国内镜像;按需拉补充资产/预训练权重
+# unilab-pull-assets --robot x2            # 仅当你要那台被托管的资产时才需要
+# 1) 五分钟冒烟:把「随包 Go2 资产->CPU 后端->GPU 策略」打通(mujoco 后端，64 env，3 迭代)
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+# 切 motrix 后端只改 --sim motrix（同一任务、不同 CPU 物理后端;实测两端均能起训）
+\end{codebox}
+
+与两框架的根本差异：mjlab/Isaac Lab 的 Quick Start 重在「把资产\emph{编译/转换}成可仿真模型」，UniLab 的资产本就是 MJCF/Motrix XML，省去 URDF$\to$USD 一环，Quick Start 因而落在「冒烟跑通异构管线」而非「格式转换」上。本机实跑该冒烟约 4600--8900 env-steps/s（小规模）\,\cite{unilab2026}。
+
+\begin{note}[「跑起来后怎么判断成功」——一份跨框架的冒烟判据（含本机实测锚点）]\label{note:rlmc-assets-smoke}
+Quick Start 把命令并排给了，却容易漏掉最该教的一步：\emph{凭什么说它跑成功了}。给一组本机（autodl，RTX 4080 SUPER）实测的「该长这样」锚点，照着对号入座：
+\begin{itemize}
+  \item \textbf{能起训、无报错}是第一关——进程不崩、日志开始滚 iteration 即过。
+  \item \textbf{吞吐量级}：mjlab Go1 速度任务 64 env 约 \textbf{1050 steps/s}；UniLab go2 mujoco 后端 16 env 约 \textbf{415 steps/s}（motrix 后端约 415，几乎同量级）。两者差约一倍是\emph{正常}的——mjlab 走 GPU 的 MuJoCo-Warp、UniLab 走 CPU 物理后端，本就不是一个量级的硬件路径，别误判成「UniLab 装坏了」。\pzr{数值随显卡/规模浮动，看的是\emph{量级}（百到千 steps/s）而非具体数字。}
+  \item \textbf{loss 行为}：value loss 应在小量级（实测 mjlab 约 \verb|0.04->0.03| 两步内下降）且不发散；surrogate loss 在 \verb|1e-2| 量级。
+  \item \textbf{奖励项}：多个 reward 项\emph{非零}且 active（mjlab Go1 实测约 13 项 active）；若大批 reward 恒为 0，多半是观测/动作接线错。
+\end{itemize}
+\textbf{怎么自己量吞吐}（把「吞吐」从概念落成可跑命令）：对 mjlab 用 \Verb[breaklines]|train <TASK> --num-envs N| 改 \verb|N| 看 steps/s 随并行数扩展——这正是全章主线「GPU 大规模并行」的可量化入口，而 \cref{sec:rlmc-assets-collision} 里那条单 CPU/单环境的 fps 数（约 200--20000）只是\emph{碰撞复杂度}的相对示意，两者不是同一口径，别混用。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{前置自测}
+\addcontentsline{toc}{section}{前置自测}
+\label{sec:rlmc-assets-selftest}
+
+\begin{practice}[开课前请自检：答错 $\ge 3$ 题先回看对应章节]
+\begin{enumerate}
+  \item MjSpec、MjModel、MjData 三者各处于模型生命周期的哪个阶段？哪个阶段才能修改\emph{结构}（增删 body/joint）？（答错回看 \cref{ch:rlmc-physics} 与 \cref{ch:rlmc-setup}）
+  \item URDF 的 \texttt{<link>} 与 \texttt{<joint>} 各描述什么？一台 6-DOF 机械臂大致有几个 link、几个 active joint？
+  \item 为什么仿真碰撞检测一般\emph{不}直接用三角网格而用凸包？这与并行环境数有什么关系？（答错回看 \cref{ch:rlmc-physics}）
+  \item 刚体惯性张量 $\mathbf{I}\in\mathbb{R}^{3\times3}$ 要「物理合法」必须满足哪些约束？三角不等式说的是什么？
+  \item MuJoCo 的 \texttt{<position>} 与 \texttt{<motor>} 执行器有何区别？哪个更适合 RL 的位置式动作？（答错回看 \cref{ch:rlmc-obsact} 的动作空间讨论）
+  \item USD 与 URDF 的本质区别是什么？为什么 Isaac Lab 选 USD 而非直接吃 URDF？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章目标}
+\addcontentsline{toc}{section}{本章目标}
+\label{sec:rlmc-assets-goals}
+
+学完本章，你应当\textbf{能做到}（每条都可在终端或仿真器里验证）：
+
+\begin{enumerate}
+  \item 能\textbf{画出并解释} CAD$\to$URDF$\to$MJCF/USD$\to$训练的全链路数据流，并指出每一步守恒/丢失了哪类物理语义。
+  \item 能\textbf{导出并修复} sw2urdf 产出的 URDF（mesh 路径、惯性、关节限位），并用脚本自动定位常见错误。
+  \item 能\textbf{转换并手动调优} URDF 到 MJCF（default 块 / 执行器 / 碰撞排除 / 关键帧 / GPU 简化场景）到仿真可用。
+  \item 能\textbf{配置} Isaac Lab v2.x 的 \texttt{UrdfConverterCfg}（含 \texttt{joint\_drive}、\texttt{collider\_type}、\texttt{make\_instanceable}）并跑通 URDF$\to$USD。
+  \item 能\textbf{简化} collision mesh：用 V-HACD/CoACD 做凸分解，并定位「精度-吞吐」的合理工作点。
+  \item 能\textbf{验证} 惯性参数的物理一致性：实现三角不等式检查与 pseudo-inertia 正定性检查，并据此做物理一致的域随机化。
+  \item 能\textbf{定位} 同一份 URDF 在两框架行为不一致的根因，并判断哪些差异该交给域随机化吸收。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section*{知识导航}
+\addcontentsline{toc}{section}{知识导航}
+\label{sec:rlmc-assets-nav}
+
+前置桥接（两三行重述）：\cref{ch:rlmc-physics} 讲过 MuJoCo 的凸优化软接触与 PhysX 的 TGS 刚性接触在\emph{模型层}就不同；\cref{ch:rlmc-dr} 讲过域随机化（DR）如何吸收 sim-to-sim / sim-to-real 的物理差异，并提过惯性随机化要保物理一致。本章把这两点落到「资产」这一最前置的载体上。
+
+阅读时间三档：精读全章约 110 分钟（含动手转换一台四足）；速读主线 + 每节本质洞察约 35 分钟；查阅式只看 \cref{sec:rlmc-assets-usd} 的 API 字段表与章末故障排查约 10 分钟。
+
+\begin{forest}
+navtreeLR
+[{资产全链路（本章）}
+  [{全链路概览\\（语义守恒链）}]
+  [{SolidWorks$\to$URDF\\（sw2urdf+修复）}]
+  [{URDF$\to$MJCF\\（六步调优）}]
+  [{URDF$\to$USD\\（v2.x API）}]
+  [{碰撞简化\\（V-HACD/CoACD）}]
+  [{惯性验证\\（三角不等式/LMI）}]
+  [{模型库与组合\\（Menagerie/attach）}]
+  [{双框架对齐\\（参数/验证）}]
+]
+\end{forest}
+
+% ════════════════════════════════════════════════════════════════
+\section{全链路概览：一条物理语义的守恒链}
+\label{sec:rlmc-assets-overview}
+
+\textbf{模块功能与在管线中的位置。}本节不写任何转换代码，只立一个心智模型：从 CAD 到训练，数据流过四种格式，每一道箭头都在对「五类物理语义」做\emph{选择性保留}与\emph{补全}。把这条链记牢，后面每一节都只是它的局部展开。
+
+\paragraph{动机：为什么不能把 CAD 文件直接拖进仿真器。}SolidWorks 这类 CAD 描述的是\emph{精确几何}——每个零件的形状、材料、装配关系都有毫米级精度。但物理仿真器（MuJoCo、PhysX）要的不是精确几何，而是\emph{物理模型}：质量、惯量、关节约束、碰撞几何、执行器参数。从 CAD 到物理模型不是格式翻译，而是一次\textbf{信息的选择与重建}。一个贴切的类比：CAD 之于仿真模型，正如建筑设计图纸之于结构力学模型——图纸含门窗、装修、水电全部细节，但结构分析只关心承重的梁柱板。你不能拿设计图纸直接做结构分析，得先\emph{提取}力学相关信息、再\emph{补充}图纸里没有的力学参数。
+
+\paragraph{反面：跳过某一步会怎样。}下表把「省掉哪一步」与「在训练里以什么症状爆发」对应起来——这些症状大多\emph{延迟}出现，正是资产 bug 难查的原因。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+跳过的步骤 & 后果 & 训练时的症状 \\
+\midrule
+碰撞网格简化 & 碰撞检测极慢 & 训练吞吐崩到个位数 fps，几乎跑不动 \\
+惯性参数验证 & 不物理的惯量 & 机器人「抖动」或「飞走」，数值发散 \\
+坐标系/关节轴对齐 & 旋转方向错 & 运动与预期镜像/交叉，奖励难涨 \\
+执行器配置 & 无驱动力 & 机器人在重力下直接瘫倒 \\
+mesh 路径修复 & 加载失败 & \texttt{FileNotFoundError} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{操作：全链路数据流。}下图（文字版）给出从装配体到训练的主干，注意有\emph{两条平行支路}最终都汇入 RL 训练：
+
+\begin{codebox}{CAD 到双框架训练的数据流（文字示意）}
+SolidWorks 装配体 (.sldasm)
+    |
+    +-- sw2urdf --> URDF (.urdf) + STL 网格
+                        |
+        +---------------+----------------+
+        v                                v
+   MuJoCo 编译器直读                 Isaac Lab UrdfConverter
+   (+ 手动调优)                      (convert_urdf.py)
+        |                                |
+        v                                v
+   MJCF (.xml)                      USD (.usd)
+        |                                |
+        v                                v
+   mjlab (MuJoCo-Warp)             Isaac Lab (PhysX)
+        |                                |
+        +-----------> RL 训练 <----------+
+\end{codebox}
+
+\paragraph{本质：每道箭头守恒/丢失/补全了什么。}下表是本章的「主索引」——后续每节都在填这张表的某一行。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+转换步骤 & 丢失的语义 & 补全的语义 & 常见错误 \\
+\midrule
+SolidWorks$\to$URDF & 装饰细节、线缆 & joint 类型推断 & 关节轴方向错 \\
+URDF$\to$MJCF & URDF 的 \texttt{<gazebo>} 标签 & 执行器、default、接触 & 坐标系不对齐 \\
+URDF$\to$USD & URDF 特有标签 & PhysX 材质、articulation & collider 默认值 \\
+网格简化 & 几何细节 & 凸包/球近似 & 孔洞被填平 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[URDF 是「骨架」，MJCF/USD 是「骨架+肌肉+神经」]\label{ins:rlmc-assets-skeleton}
+URDF 只声明运动学结构（link/joint 树）与基本惯性（mass/inertia），它\emph{不}定义接触参数、执行器模型、求解器设置——这三类语义被仿真器各自用\emph{默认值}补全。因此「同一份 URDF 在两个仿真器里应当行为一致」是个思维陷阱：默认的接触刚度、阻尼、摩擦模型不同，行为自然不同。把 URDF 当「五类语义里只填了两类」的半成品来对待，是理解全章的钥匙。
+\end{insight}
+
+\begin{pitfall}[把 URDF 当「通用可移植格式」]
+\textbf{错误描述}：默认 URDF 跨仿真器行为一致，于是两边直接各跑各的内置模型做对比。\textbf{现象后果}：mjlab 调好的奖励权重搬到 Isaac Lab 完全不工作，误以为是算法问题。\textbf{根本原因}：URDF 只守恒了运动学与惯性，接触/执行器/求解器由两边默认值补全且不同。\textbf{正确做法}：要做双框架对比，以\emph{同一份 URDF} 为唯一真相源，分别转换并\emph{手动对齐}可对齐的参数（\cref{sec:rlmc-assets-align}），不可对齐的接触差异交给 DR（\cref{ch:rlmc-dr}）。
+\end{pitfall}
+
+\paragraph{运行验证。}本节没有代码可跑，验收标准是\emph{能复述}：给定任意一道箭头，说出它丢了哪类语义、补了哪类语义、典型错误是什么。做不到就回看本节两张表。
+
+\begin{practice}[全链路自测]
+\begin{enumerate}
+  \item 凭记忆画出从 SolidWorks 到 mjlab 训练的数据流，在每个箭头上标注「丢失/补全的语义 + 一个典型错误」。
+  \item 思考题：MuJoCo 为何要自造 MJCF 而不直接用 URDF？对照 \cref{ins:rlmc-assets-skeleton}，MJCF 相对 URDF 多补了哪三类语义？验收：能各举一个具体 XML 元素（如 \texttt{<actuator>}、\texttt{<default>}、\texttt{<option solver=...>}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{SolidWorks 到 URDF：sw2urdf 与产物修复}
+\label{sec:rlmc-assets-sw2urdf}
+
+\textbf{模块功能与位置。}这是全链路的\emph{第一步}，也是错误注入率最高的一步——因为它要从「装配关系」反推「关节语义」，反推就可能错。本节讲 sw2urdf 的装配体要求、关节轴定义，以及对产物做\emph{自动化体检}与\emph{路径修复}。
+
+\paragraph{动机与反面。}sw2urdf（\texttt{ros/\allowbreak solidworks\_urdf\_exporter}）是 ROS 生态里最广用的 CAD$\to$URDF 插件，它分析装配体中的配合关系（Mates）自动推断关节类型与旋转轴，输出标准 URDF + STL。反面是：手写 URDF 对 $<10$ link 的简单臂尚可，对 20--30 link 的人形几乎不可能——逐个 link 指定惯量、关节位置、mesh 路径的工作量巨大且极易错。所以 sw2urdf 把这事自动化了，但它的产物\textbf{通常需要手动修正}。
+
+\paragraph{配置详解：装配体结构与关节轴。}sw2urdf 的核心假设是\textbf{「URDF 的每个 link 对应 SolidWorks 中一个子装配体或零件」}。若一个 link 由多个零件组成（大腿 = 骨架 + 外壳 + 电机），这些零件必须放进同一个子装配体；零件散放会让 sw2urdf 无法判断归属。
+
+关节轴是第二个易错点。这里要纠正一个流传很广的误解：
+
+\begin{pitfall}[误以为 URDF 的 \texttt{<axis>} 默认是 Z 轴]
+\textbf{错误描述}：「URDF 关节轴默认沿 Z」，于是省略 \texttt{<axis>} 或随手写 Z。\textbf{现象后果}：关节绕错误方向旋转，运动镜像/交叉。\textbf{根本原因}：URDF 的 \texttt{<axis xyz>} 是 \emph{joint frame} 下的一个自由向量；若省略，规范默认是\emph{X 轴} \texttt{(1,0,0)}，并非 Z。\textbf{正确做法}：永远显式写 \texttt{<axis>}；在 SolidWorks 里用参考几何确认所选轴指向真实旋转方向（若你按惯例用坐标系 Z 作参考轴，就确认蓝色 Z 箭头朝向旋转方向）。下例选 Z 只是\emph{常见做法}，不是默认或强制。
+\end{pitfall}
+
+\begin{codebox}[text]{URDF 关节定义（axis 显式写出，勿依赖默认）}
+<joint name="hip_joint" type="revolute">
+  <parent link="base_link"/>
+  <child  link="hip_link"/>
+  <origin xyz="0.0 0.05 0.0" rpy="0 0 0"/>
+  <axis   xyz="0 0 1"/>   <!-- 旋转轴:此处选 Z，但务必显式写 -->
+  <limit lower="-1.57" upper="1.57" effort="100" velocity="10"/>
+</joint>
+\end{codebox}
+
+\paragraph{代码走读：URDF 产物体检脚本。}sw2urdf 的产物有四类高频问题：\texttt{package://} 路径、零质量、惯量违反三角不等式、关节限位异常。下面这段纯标准库脚本一次性扫出来。注意 \texttt{ElementTree} 的 \texttt{Element} \emph{没有} \texttt{getparent()}，所以要从 \texttt{link} 往下找 \texttt{inertial}，才能拿到 link 名定位问题（这是源稿里一个正确而易被改错的细节）。
+
+\begin{codebox}[Python]{check\_urdf.py:扫描 sw2urdf 产物的常见问题}
+import os
+import xml.etree.ElementTree as ET
+
+def check_urdf(urdf_path):
+    root = ET.parse(urdf_path).getroot()       # check_urdf.py:1 解析 URDF
+    issues = []
+    urdf_dir = os.path.dirname(urdf_path)
+
+    # (1) mesh 路径是否用了 ROS 的 package:// URI（MuJoCo 默认不解析）
+    for mesh in root.iter('mesh'):
+        fn = mesh.get('filename', '')
+        if fn.startswith('package://'):
+            issues.append(f"package:// 路径需改相对路径: {fn}")
+        elif fn and not os.path.exists(os.path.join(urdf_dir, fn)):
+            issues.append(f"mesh 文件不存在: {fn}")
+
+    # (2) 从 link 向下找 inertial，才能拿到 link 名（Element 无 getparent）
+    for link in root.findall('link'):
+        name = link.get('name', 'unknown')
+        inertial = link.find('inertial')
+        if inertial is None:
+            continue
+        m = inertial.find('mass')
+        if m is not None and float(m.get('value', '0')) < 1e-6:
+            issues.append(f"link '{name}' 质量近零")
+        I = inertial.find('inertia')
+        if I is not None:
+            ixx = float(I.get('ixx', '0'))
+            iyy = float(I.get('iyy', '0'))
+            izz = float(I.get('izz', '0'))
+            # 三角不等式（对主轴对齐的对角惯量是必要条件）
+            if ixx + iyy < izz or ixx + izz < iyy or iyy + izz < ixx:
+                issues.append(f"link '{name}' 惯量违反三角不等式")
+
+    # (3) 关节限位是否合理
+    for j in root.iter('joint'):
+        if j.get('type') == 'revolute':
+            lim = j.find('limit')
+            if lim is not None:
+                lo = float(lim.get('lower', '0'))
+                hi = float(lim.get('upper', '0'))
+                if lo >= hi:
+                    issues.append(f"joint '{j.get('name')}' 限位 lo>=hi")
+                if hi - lo > 6.2832:
+                    issues.append(f"joint '{j.get('name')}' 限位>2pi 可疑")
+
+    print(f"检查完成:{len(issues)} 个问题")
+    for i, s in enumerate(issues, 1):
+        print(f"  [{i}] {s}")
+    return not issues
+\end{codebox}
+
+为什么这段值得逐行读？因为它把 \cref{sec:rlmc-assets-overview} 里「SolidWorks$\to$URDF 丢失/补全」那一行落成了\emph{可执行的断言}：关节类型推断（补全）可能错$\to$查限位；惯性（守恒）可能没正确变换$\to$查三角不等式；mesh 引用（守恒）可能用了不可移植的 URI$\to$查 \texttt{package://}。
+
+\paragraph{操作：路径修复。}sw2urdf 默认用 ROS 的 \texttt{package://} URI。MuJoCo 通常不会开箱解析它；Isaac Sim 的 importer 可通过配置 ROS package 映射解析。为跨工具稳定，统一改相对路径最省心：
+
+\begin{codebox}[Python]{fix\_mesh\_paths.py:package:// 改相对路径}
+import re
+
+def fix_mesh_paths(urdf_path, out_path=None):
+    with open(urdf_path) as f:
+        content = f.read()
+    # package://<pkg>/.../meshes/foo.stl -> meshes/foo.stl
+    fixed = re.sub(r'package://[^/]+/(?:[^"]*/)?meshes/', 'meshes/', content)
+    out = out_path or urdf_path
+    with open(out, 'w') as f:
+        f.write(fixed)
+    print(f"已修复 mesh 路径 -> {out}")
+\end{codebox}
+
+\paragraph{三框架视角。}本步\emph{框架无关}——产出的是中立的 URDF。但下游分叉：mjlab 侧让 MuJoCo 编译器直读（下一节），Isaac Lab 侧走 \texttt{UrdfConverter}（\cref{sec:rlmc-assets-usd}）；STL 二进制对 MuJoCo 无碍，但 Isaac Lab 个别版本的 importer 对 STL/OBJ 更挑剔，统一转 OBJ 最稳。UniLab 侧用 \texttt{unilab-import-robot} 这个 CLI 把同一份 URDF 导入：因为它的 mujoco 后端就是 MuJoCo（经 \texttt{mujoco-uni}），导入路径与 mjlab 几乎同质——产物落成 MJCF 存进 \Verb[breaklines]|src/unilab/assets/robots/<robot>/|；故上面那套 \texttt{check\_urdf()} 体检脚本对 UniLab 同样适用（它消费的是中立 URDF，与下游用哪个框架无关）。\pz{import-robot 的精确旗标以你安装版本的 \texttt{unilab-import-robot --help} 为准。}
+
+\begin{pitfall}[sw2urdf 可能只导出 visual mesh 而漏掉 collision]
+\textbf{错误描述}：默认产物里只有视觉网格，无碰撞几何。\textbf{现象后果}：加载后机器人「穿地」或彼此穿透，碰撞检测形同虚设。\textbf{根本原因}：导出选项未勾选 collision，或 collision 复用了 visual 的高面数 mesh。\textbf{正确做法}：体检后\emph{主动}为每个 link 补碰撞几何，优先用 primitive 或凸分解结果（\cref{sec:rlmc-assets-collision}），而非直接拿 visual mesh 当 collision。
+\end{pitfall}
+
+\begin{practice}[动手：体检一份真实 URDF]
+\begin{enumerate}
+  \item 若无 SolidWorks，从 Menagerie 取 UR5e/UR10e 的 URDF（或厂商 ROS 包）作起点，跑 \texttt{check\_urdf()}，记录每类问题数量。验收：脚本输出 0 个 \texttt{package://} 问题且无三角不等式告警。
+  \item 分析题：sw2urdf 通过 Mates 推断关节类型（同轴$\to$revolute、平面$\to$prismatic）。若一个关节同时有「同轴 + 距离限制」两个配合，推断会怎样？给出你的判断与验证思路。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{URDF 到 MJCF：信息补全的六步调优}
+\label{sec:rlmc-assets-mjcf}
+
+\textbf{模块功能与位置。}URDF 是 ROS 标准格式，MuJoCo 原生格式是 MJCF。本节是 mjlab 支线的核心：从 URDF 到 MJCF，本质是\cref{ins:rlmc-assets-skeleton} 里「补全三类语义」的工程落地——而且是\emph{半自动}的，自动转换只给起点，手动调优才到终点。
+
+\paragraph{动机：MJCF 补了哪些 URDF 没有的。}下表把缺失语义与 MJCF 对应元素、以及「不写会怎样」一一对上：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+缺失语义 & MJCF 元素 & 不指定时的默认行为 \\
+\midrule
+接触参数 & \texttt{<default><geom condim friction .../\allowbreak >} & 用 MuJoCo 内部默认 \\
+执行器 & \texttt{<actuator><position .../\allowbreak >} & \textbf{无驱动力——机器人瘫倒} \\
+求解器 & \texttt{<option solver iterations/\allowbreak >} & 默认 \texttt{solver="Newton"} \\
+关节阻尼 & \texttt{<joint damping .../\allowbreak >} & 0（无阻尼） \\
+关键帧 & \texttt{<keyframe><key qpos .../\allowbreak >} & 无预设姿态 \\
+碰撞过滤 & \texttt{<contact><exclude .../\allowbreak >} & 所有 body 两两检测 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{操作：自动转换（Menagerie 工作流的骨架）。}MuJoCo Menagerie（\texttt{google-deepmind/\allowbreak mujoco\_menagerie}，50+ 模型）为这条转换确立了事实标准。骨架是：把 DAE/STL 网格转 OBJ $\to$ 用 \texttt{obj2mjcf} 按材质拆分并生成片段 $\to$ 在 URDF 里加 MuJoCo 提示标签 $\to$ MuJoCo 加载并存 XML。其中 \texttt{obj2mjcf} 现已\emph{改用 CoACD}（而非早期的 V-HACD）做可选的凸分解，这点常被旧资料写错。
+
+\begin{codebox}[bash]{URDF 转 MJCF:自动转换骨架（以 obj2mjcf 为枢纽）}
+# 1) 网格统一为 OBJ（MuJoCo 对 OBJ 加载最稳，且 OBJ 带材质）
+python -c "import trimesh; trimesh.load('meshes/shoulder.dae').export('meshes/shoulder.obj')"
+# 2) obj2mjcf:按材质拆分 + 生成 mesh/geom 片段（--coacd 触发凸分解）
+obj2mjcf --obj-dir meshes/ --save-mjcf --coacd
+# 3) 在 URDF 的 <robot> 内加提示，保留 visual mesh（否则 MuJoCo 默认丢弃）
+#    <mujoco><compiler discardvisual="false"/></mujoco>
+# 4) 让 MuJoCo 编译并落地 MJCF
+python -c "import mujoco; m=mujoco.MjModel.from_xml_path('robot.urdf'); \
+mujoco.mj_saveLastXML('robot.xml', m); print('MJCF saved')"
+\end{codebox}
+
+\begin{pitfall}[MuJoCo 加载 URDF 默认\emph{丢弃} visual mesh]
+\textbf{错误描述}：直接 \texttt{from\_xml\_path('robot.\allowbreak urdf')} 后在 viewer 里只看到简陋几何。\textbf{现象后果}：以为 mesh 没转好，反复折腾网格。\textbf{根本原因}：MuJoCo 编译 URDF 时默认 \texttt{discardvisual=true}，只留碰撞几何。\textbf{正确做法}：在 URDF 里加 \texttt{<mujoco><compiler discardvisual="false"/\allowbreak ></\allowbreak mujoco>} 再转。
+\end{pitfall}
+
+\paragraph{配置详解：手动调优六步（最重要的环节）。}自动产物只是起点。Menagerie 把调优标准化为六步，下表是速查，随后逐步展开；这张表对应「配置项四维」的精简版（默认值来源 / 修改影响 / 合理范围 / 耦合项）我们在关键步里展开。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{4.6cm}@{}}
+\toprule
+步骤 & 做什么 & 关键参数 / 注意 \\
+\midrule
+6a & 提取公共属性进 \texttt{<default>} & \texttt{condim, friction, solref}；按 class 分 visual/collision \\
+6b & 加执行器 & \texttt{kp, kv, forcerange}；RL 多用 \texttt{<position>} \\
+6c & 设碰撞排除 & \texttt{<exclude body1 body2>}；相邻 link 与祖孙对 \\
+6d & 加关键帧 & home/crouch 的 \texttt{qpos} \\
+6e & 出 GPU/Warp 简化场景 & primitive collision + \texttt{solver="Newton"} \\
+6f & 整体验证 & viewer 可视化 visual/collision/inertia/contact \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{6a default 块}用 class 把重复属性收敛，并把 visual 与 collision 分开（visual 用 \texttt{contype=0 conaffinity=0} 不参与碰撞）。\textbf{6b 执行器}是「机器人会不会瘫」的开关——URDF 不含执行器，必须在此补。RL 训练里最常用 \texttt{<position>}（策略输出目标角，PD 算力矩），这和 \cref{ch:rlmc-obsact} 的结论一致：position 动作比 torque 动作更稳、更好训。\texttt{<motor>}（力矩）、\texttt{<velocity>}（速度）、\texttt{<general>}（最灵活，可组合 \texttt{gaintype/\allowbreak biastype/\allowbreak dyntype} 拟合任意线性执行器）按需选用。\textbf{6c 碰撞排除}：MuJoCo 默认对\emph{同一 body 内} geom 与 \emph{parent-child} body 对禁用碰撞，但\emph{祖父-孙子或更远}的对需要手动 \texttt{<exclude>}，否则相邻 link 在任何姿态都「自碰」。\textbf{6d 关键帧}给 viewer 检查姿态、给 RL 提供 reset 初值、给观测定义 default pose 参考。
+
+下面给一段经过六步调优的四足 MJCF 关键片段，它把 default / 执行器 / 接触排除 / 关键帧串在一起：
+
+\begin{codebox}[text]{调优后的四足 MJCF 关键片段（节选）}
+<mujoco model="unitree_go1">
+  <compiler angle="radian" meshdir="assets/" autolimits="true"/>
+  <option timestep="0.002" iterations="4" solver="Newton" gravity="0 0 -9.81"/>
+
+  <default>
+    <default class="go1">
+      <joint damping="0.5" armature="0.01" frictionloss="0.1"/>
+      <geom condim="3" friction="0.8 0.02 0.01" solref="0.005 1"/>
+      <position kp="80" kv="4" forcerange="-23.7 23.7"/>
+    </default>
+    <default class="visual">
+      <geom type="mesh" contype="0" conaffinity="0" group="2"/>
+    </default>
+    <default class="collision">
+      <geom type="mesh" group="3"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <body name="trunk" pos="0 0 0.35">
+      <freejoint name="root"/>                 <!-- 6-DOF 浮动基座 -->
+      <geom type="mesh" mesh="trunk" class="visual"/>
+      <geom type="box" size="0.2 0.05 0.05" class="collision"/>
+      <body name="FR_hip" pos="0.1881 -0.04675 0">
+        <joint name="FR_hip_joint" axis="1 0 0" range="-0.86 0.86" class="go1"/>
+        <geom type="capsule" size="0.02" fromto="0 0 0 0 -0.08 0" class="collision"/>
+        <!-- ... FR_thigh / FR_calf / FR_foot 逐层嵌套 ... -->
+      </body>
+      <!-- ... FL / RL / RR 三腿结构同构 ... -->
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position name="FR_hip_act" joint="FR_hip_joint" class="go1"/>
+    <!-- ... 共 12 个位置执行器 ... -->
+  </actuator>
+
+  <contact>
+    <exclude body1="trunk" body2="FR_hip"/>     <!-- 躯干-髋 -->
+    <exclude body1="FR_hip" body2="FR_thigh"/>  <!-- 相邻 link -->
+    <!-- ... 其余腿同理 ... -->
+  </contact>
+
+  <keyframe>
+    <key name="home"   qpos="0 0 0.35 1 0 0 0  0 0.8 -1.6 ..."/>
+    <key name="crouch" qpos="0 0 0.25 1 0 0 0  0 1.2 -2.4 ..."/>
+  </keyframe>
+</mujoco>
+\end{codebox}
+
+这段里有几个值得理解的工程决策。\texttt{<freejoint>} 放在 trunk 上，让基座有 6-DOF（平移 3 + 旋转 3）；不加则基座焊死在世界系、机器人无法移动。\texttt{armature="0.01"} 给每个关节加\emph{虚拟转子惯量}——不是为物理精度，而是为\emph{数值稳定}：无 armature 时轻关节加速度可能极大，导致积分发散。\texttt{forcerange="-23.7 23.7"} 限制执行器最大力矩（Go1 的 GO-M8010-6 电机在髋/大腿关节瞬时力矩约 23.7 N·m，膝关节因减速比更大约 35.55 N·m——Menagerie 的 \texttt{go1.xml} 即按此分别设 \texttt{forcerange}）——RL 里很关键，否则策略会学到「瞬间用超大力矩硬掰」这种真机做不到的行为。collision 全用 capsule/sphere 而非 mesh，每 link 一个碰撞基元，让 GPU 碰撞检测极快。\texttt{condim="3"} 是法向 + 两切向滑动摩擦（标准摩擦）；\texttt{1} 为无摩擦、\texttt{4} 增扭转摩擦、\texttt{6} 再增滚动摩擦。
+
+\begin{insight}[声明式 URDF 与命令式 MJCF 的两视角]\label{ins:rlmc-assets-decl-imp}
+\textbf{视角 A（URDF=声明式）}：只声明「机器人有什么」，不声明「怎么运动」，后者交给仿真器内部模型。好处是通用——同一 URDF 跨 MuJoCo/PhysX/ODE 通用；坏处是失控——你无法在 URDF 里精确控制接触。\textbf{视角 B（MJCF=命令式）}：不仅声明结构，还\emph{命令}仿真器如何处理接触/求解器/执行器。好处是精确，坏处是只能在 MuJoCo 用。工程含义：目标是「两框架都快速能用」就以 URDF 出发；目标是「MuJoCo 里最佳仿真质量」就直接写或深调 MJCF。这正是 mjlab 与 Isaac Lab 分叉点的根源。
+\end{insight}
+
+\paragraph{代码走读：在 mjlab 里加载并程序化改 MJCF。}mjlab 用 \texttt{MjSpec} 加载（回顾 \cref{ch:rlmc-physics}），妙处在于 \texttt{MjSpec} 阶段可以\emph{程序化修改}模型——比如批量改执行器增益，无需手改 XML：
+
+\begin{codebox}[Python]{mjlab:MjSpec 阶段程序化修改执行器}
+import mujoco
+from pathlib import Path
+
+def spec_fn() -> mujoco.MjSpec:
+    spec = mujoco.MjSpec.from_file(
+        str(Path(__file__).parent / "assets" / "go1.xml"))
+    for act in spec.actuators:          # 在编译前批量调增益
+        if "hip" in act.name:
+            act.kp = 200.0              # 髋关节 PD 增益调高（RL 常需比 viewer 大）
+    return spec                          # 交给 mjlab 的 EntityCfg 去 compile
+\end{codebox}
+
+\paragraph{运行验证。}转换后\emph{一定}在 viewer 里逐项看：分别可视化 visual mesh、collision mesh、inertia 椭球、contact points。看什么：collision 是否过精细（影响吞吐）、inertia 椭球是否严重偏离几何中心（惯量/质心可疑）、相邻 link 是否在 home 姿态就「红」（碰撞排除没设全）。
+
+\begin{pitfall}[Menagerie 模型可直接拿来 RL 训练]
+\textbf{错误描述}：下载即用，不改执行器参数。\textbf{现象后果}：奖励不收敛或 episode 极短。\textbf{根本原因}：Menagerie 的 kp/kd 是为 viewer 手动拖滑块「看起来平滑」调的，不一定适配 RL——太大则动作有效分辨率低、抖动且 action\_rate 惩罚大；太小则 DR 摩擦变低时站不住。\textbf{正确做法}：按 \cref{ch:rlmc-obsact} 的动作空间原则重调，四足 locomotion 常把 hip kp 调到 200--400 区间再实验。
+\end{pitfall}
+
+\begin{practice}[动手：转换并体检一台四足]
+\begin{enumerate}
+  \item 从 Menagerie 下 Unitree Go1，在 viewer 里依次可视化 visual/collision/inertia/contact，记录三处你观察到的差异。验收：能指出 collision 用的是 capsule/sphere 而非 mesh。
+  \item 编码题：写脚本读 MJCF，打印每个 body 的名称、质量、惯性张量主轴（\texttt{model.\allowbreak body\_inertia}）。用 Go1 测。
+  \item 跨章综合：结合 \cref{ch:rlmc-obsact}——若 MJCF 关节名（\texttt{FR\_hip\_joint}）与你的观测项期望名（\texttt{front\_right\_hip}）不一致会怎样？给出两种修复（改 XML 名 / 在配置里做名称映射）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{URDF 到 USD：Isaac Lab 转换器（v2.x API）}
+\label{sec:rlmc-assets-usd}
+
+\textbf{模块功能与位置。}这是 Isaac Lab 支线的核心。USD（Universal Scene Description，Pixar 出品、被 NVIDIA 用作 Omniverse 基础格式）相对 URDF 的关键增益是\emph{可组合性 + instanceable}：4096 台同构机器人可\emph{共享}一份 mesh 数据，这对大规模并行 RL 至关重要。本节把 v2.x 的转换 API 逐字段讲清——这也是源教程\emph{最需要更新}的一节。
+
+\paragraph{操作：命令行与 Python 两条路。}命令行脚本现位于 \Verb[breaklines]|scripts/tools/convert_urdf.py|（旧版在 \Verb[breaklines]|source/standalone/tools/|，照旧路径会找不到文件）：
+
+\begin{codebox}[bash]{命令行转换（注意脚本新路径）}
+./isaaclab.sh -p scripts/tools/convert_urdf.py \
+    /path/to/my_robot.urdf \
+    /path/to/output/my_robot.usd \
+    --merge-joints \
+    --joint-stiffness 0.0 \
+    --joint-damping 0.0 \
+    --joint-target-type none \
+    --headless
+\end{codebox}
+
+\noindent{}注意 \texttt{convert\_urdf.\allowbreak py} 的 CLI 旗标只有 \Verb[breaklines]|--merge-joints| / \verb|--fix-base| / \Verb[breaklines]|--joint-stiffness|（默认 100）/ \Verb[breaklines]|--joint-damping|（默认 1）/ \Verb[breaklines]|--joint-target-type {position,velocity,none}|；\textbf{它\emph{不}暴露 \texttt{--make-instanceable}}（instanceable 由 \texttt{UrdfConverterCfg.\allowbreak make\_instanceable} 控、默认 True，CLI 不另开旗标；\texttt{convert\_mjcf.\allowbreak py} / \texttt{convert\_mesh.\allowbreak py} 才有 \Verb[breaklines]|--make-instanceable|）。locomotion 实践把转换期 \Verb[breaklines]|--joint-stiffness/--joint-damping| 设 0、真正的 PD 留到加载期执行器（见下文 rad$\to$deg 坑）。
+
+\begin{note}[转换前的 URDF「预处理」清单（官方 how-to + 一个源码级坑）]
+官方导入文档建议在转换\emph{前}对 URDF 做四件事，很多坑出在这一步：(1) 删 \texttt{<gazebo>} 与 \texttt{<transmission>} 标签（Isaac importer 不需要、反而可能干扰）；(2) 精简 collision body（CAD 网格太重，见 \cref{sec:rlmc-assets-collision}）；(3) \textbf{把 joint 的 damping/friction 设 0}，把真正的 PD 留到加载期执行器（呼应上文的 rad$\to$deg 坑）；(4) 对\emph{想保留}的 fixed joint 加 \texttt{<dont\_collapse>}——否则 \Verb[breaklines]|--merge-joints| / \texttt{merge\_fixed\_joints=True} 会把它连同坐标系一起合并掉，导致你想放传感器的那个 frame 消失。第 (4) 点是源码级才看得清的细节：合并是默认行为，\texttt{<dont\_collapse>} 是\emph{逐关节}的豁免开关。
+\end{note}
+
+\paragraph{配置详解：\texttt{UrdfConverterCfg} 的 v2.x 字段（四维要点）。}下表按「字段 / 默认值 / 取值与影响 / 耦合」组织，已对照官方 API 核对，纠正了旧式扁平驱动参数：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{6.0cm}@{}}
+\toprule
+字段 & 默认 & 取值与影响（及耦合） \\
+\midrule
+\texttt{fix\_base} & \texttt{MISSING}（必填） & True=焊死基座（机械臂）；False=浮动基座（locomotion）。无默认值，\emph{必须显式给}。与 \texttt{root\_link\_name} 配合定位根。 \\
+\texttt{root\_link\_name} & \texttt{None} & 显式指定根 link；多根/歧义时必填。 \\
+\texttt{merge\_fixed\_joints} & \texttt{True} & 合并固定关节连接的 link，减少 link 数。\pzr{Isaac Sim 5.1 起带质量/惯量的 link 不再被合并}，Isaac Lab 钉旧版 importer 兼容。耦合：会影响能否在被合并 link 上放传感器。 \\
+\texttt{make\_instanceable} & \texttt{True} & 把 mesh 分离到独立文件，多环境共享。耦合：只拷主 USD 而漏 \texttt{Props/} 会致 mesh 丢失。 \\
+\texttt{collider\_type} & \texttt{"convex\_hull"} & \texttt{convex\_hull}（快，填平凹面）/ \texttt{convex\_decomposition}（保凹面，manipulation 必用）。 \\
+\texttt{collision\_from\_visuals} & \texttt{False} & 用 visual mesh 生成碰撞（无 collision 时的兜底）。 \\
+\texttt{link\_density} & \texttt{0.0} & 缺 inertial 的 link 用此密度（kg/m³）补惯性。 \\
+\texttt{replace\_cylinders\_with\_capsules} & \texttt{False} & 圆柱换胶囊，碰撞更稳更快。 \\
+\texttt{convert\_mimic\_joints\_to\_normal\_joints} & \texttt{False} & mimic 关节转普通关节（部分 gripper 需要）。 \\
+\texttt{joint\_drive} & \texttt{JointDriveCfg()} & 结构化驱动配置，取代旧的 \texttt{default\_drive\_*}。详见下文。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[照旧式 \texttt{default\_drive\_type}/\allowbreak\texttt{default\_drive\_stiffness} 写转换配置]
+\textbf{错误描述}：沿用旧教程的 \texttt{UrdfConverterCfg(default\_drive\_type="position", default\_drive\_stiffness=100, collision\_approximation="convexHull")}。\textbf{现象后果}：直接 \texttt{TypeError: unexpected keyword argument}。\textbf{根本原因}：Isaac Lab 2.x 把驱动参数重构进 \texttt{joint\_drive=JointDriveCfg(...)}（内含 \texttt{gains}），碰撞近似改为 \texttt{collider\_type}（取值 \texttt{convex\_hull}/\allowbreak\texttt{convex\_decomposition}，注意是下划线风格而非旧的 \texttt{convexHull}）。\textbf{正确做法}：用下方新结构。
+\end{pitfall}
+
+\begin{codebox}[Python]{UrdfConverterCfg:v2.x 正确写法（joint\_drive + collider\_type）}
+from isaaclab.sim.converters import UrdfConverterCfg
+
+cfg = UrdfConverterCfg(
+    asset_path="robot.urdf",
+    usd_dir="./usd_out",
+    usd_file_name="robot.usd",
+    fix_base=False,                         # locomotion:浮动基座
+    merge_fixed_joints=True,
+    make_instanceable=True,                 # 默认即 True，显式写以示意
+    collider_type="convex_decomposition",   # manipulation 保凹面;locomotion 可用 convex_hull
+    replace_cylinders_with_capsules=True,
+    joint_drive=UrdfConverterCfg.JointDriveCfg(
+        drive_type="force",                 # "acceleration" 或 "force"（默认 force）
+        target_type="position",             # "none"/"position"/"velocity"
+        gains=UrdfConverterCfg.JointDriveCfg.PDGainsCfg(
+            stiffness=100.0,                # 对应旧 default_drive_stiffness
+            damping=10.0,                   # 对应旧 default_drive_damping
+        ),
+    ),
+)
+\end{codebox}
+
+\begin{note}[手里没装 Isaac 时，怎么\emph{离线}自检这些 API 名是否真存在]\label{note:rlmc-assets-offline-api}
+本节的 \texttt{UrdfConverterCfg}/\allowbreak\texttt{JointDriveCfg}/\allowbreak\texttt{collider\_type} 等都需要 Isaac Lab 才能 import；很多读者（含本书 autodl 验证机）手边只有 mjlab/UniLab、没装 Isaac，于是无法实跑这段。但「API 名对不对」不必真跑也能查——这是把「照抄报错」挡在上游的工程习惯：
+\begin{codebox}[bash]{不装 Isaac 也能验证:先确认装没装、再列模块真实属性}
+# 1) 这台到底装没装 Isaac Lab？装了哪个版本？(没装会直接报无此包)
+pip show isaaclab            # 或 isaaclab_assets;看 Version 字段对上 2.x
+# 2) 不真正初始化仿真，只问「converters 模块里到底导出了哪些名字」
+python -c "import isaaclab.sim.converters as c; \
+print([n for n in dir(c) if 'Urdf' in n or 'Cfg' in n])"
+# 期望看到 UrdfConverter / UrdfConverterCfg;看不到就是版本不符或包名变了
+# 3) 进一步问某个 Cfg 到底有哪些字段(验证 joint_drive/collider_type 真存在)
+python -c "import dataclasses, isaaclab.sim.converters as c; \
+print([f.name for f in dataclasses.fields(c.UrdfConverterCfg)])"
+\end{codebox}
+\textbf{要点}：\texttt{pip show} 判存在性、\texttt{dir()}/\allowbreak\texttt{dataclasses.\allowbreak fields()} 判字段名——这套「不跑仿真、只查符号表」的手法对\emph{任何}框架的 API 核对都通用（mjlab 一侧本章就是这么实证 \texttt{spec.\allowbreak actuators}/\allowbreak\texttt{add\_frame} 的）。没装 Isaac 的读者据此即可在抄命令前自检，而非等运行到一半 \texttt{TypeError} 才发现字段名过时。
+\end{note}
+
+\texttt{joint\_drive} 还支持另一种增益形式 \texttt{NaturalFrequencyGainsCfg(natural\_frequency, damping\_ratio)}，用自然频率与阻尼比指定，便于按目标带宽设计 PD——这与 \cref{ch:rlmc-physics} 讨论的执行器带宽思想一致。\texttt{stiffness}/\allowbreak\texttt{damping} 既可是标量（统一）也可是 \texttt{dict[str,float]}（按关节名正则分别设），与下文加载阶段的 \texttt{ImplicitActuatorCfg} 形成两道增益设置点，需保持一致。
+
+\begin{pitfall}[转换期写的 \texttt{stiffness} 对旋转关节不是「原值」进 USD（rad/deg 换算）]
+\textbf{错误描述}：以为转换期 \texttt{joint\_drive.\allowbreak gains.\allowbreak stiffness=100} 就是 USD drive 里的 100，并据此跨阶段对齐。\textbf{现象后果}：旋转关节的实际刚度差了一个 $\pi/180$ 因子，PD 行为与预期不符且难定位。\textbf{根本原因}：Isaac Lab 2.x 的 URDF 转换器（在 \texttt{urdf\_converter.\allowbreak py} 的 \texttt{UrdfConverter} 里，对非 prismatic 关节）会对 drive 强度做 \emph{rad$\to$deg} 内部换算（约 \texttt{set\_strength(pi/\allowbreak 180 * stiffness)}）——这是 USD 旋转 drive 以「度」为单位的历史包袱。\textbf{正确做法}：locomotion 实践里\emph{把转换期增益设 0、把真正的 PD 留到加载期的} \texttt{ImplicitActuatorCfg}（量纲清楚、可按关节名正则分组）——这正是 \cref{sec:rlmc-assets-zoo} 里库存 CFG 的 \texttt{spawn} 不写 drive、只在 \texttt{actuators=} 写 \texttt{stiffness} 的原因。把「转换期增益」当成结构占位、把「加载期执行器」当成唯一真增益，是最省心的对齐策略。
+\end{pitfall}
+
+\paragraph{代码走读：加载 USD 与 PhysX 专属参数。}转换得到 USD 后，在 \texttt{ArticulationCfg} 里加载，并配置一批\emph{MJCF 没有对应物}的 PhysX 参数：
+
+\begin{codebox}[Python]{Isaac Lab:加载 USD + PhysX 专属参数 + 执行器}
+from isaaclab.assets import ArticulationCfg
+from isaaclab.actuators import ImplicitActuatorCfg
+import isaaclab.sim as sim_utils
+
+MY_ROBOT_CFG = ArticulationCfg(
+    spawn=sim_utils.UsdFileCfg(
+        usd_path="./usd_out/robot.usd",
+        activate_contact_sensors=True,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            max_linear_velocity=1000.0,        # 防数值爆炸的速度上限
+            max_angular_velocity=1000.0,
+            max_depenetration_velocity=100.0,  # 穿透分离速度:太小则"粘连"，太大则"弹飞"
+        ),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=False,     # RL 常关，用奖励惩罚代替
+            solver_position_iteration_count=4, # 位置迭代
+            solver_velocity_iteration_count=0, # 速度迭代（0=只做位置修正）
+        ),
+    ),
+    init_state=ArticulationCfg.InitialStateCfg(
+        pos=(0.0, 0.0, 0.5), joint_pos={".*": 0.0},
+    ),
+    actuators={
+        "legs": ImplicitActuatorCfg(
+            joint_names_expr=[".*hip.*", ".*knee.*", ".*ankle.*"],
+            stiffness=80.0, damping=4.0,       # 注意与转换期 joint_drive 对齐
+        ),
+    },
+)
+\end{codebox}
+
+\begin{insight}[软接触 vs 刚性接触：显式参数对齐也消不掉的差异]\label{ins:rlmc-assets-contact-models}
+即使质量、摩擦系数等\emph{显式}参数两边完全一致，MuJoCo 与 PhysX 的接触行为仍会不同——因为接触\emph{模型}不同：MuJoCo 用基于凸优化/互补性的「软接触」（\texttt{solref}/\allowbreak\texttt{solimp} 控刚度阻尼），PhysX 用基于脉冲的「刚性接触」（迭代求解器处理穿透）。\cref{ch:rlmc-physics} 已从求解器层剖析过这点。结论是：自由运动（无接触）两边几乎一致，差异集中在接触；在 RL 里这类差异由 DR（\cref{ch:rlmc-dr}）吸收——DR 范围够宽，策略对接触模型差异是鲁棒的。
+\end{insight}
+
+\paragraph{运行验证 + 常见问题。}转换后在 Isaac Sim GUI 打开 USD，核对关节数、总质量、mesh 与 collision 是否合理。高频问题见下表：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{4.4cm}@{}}
+\toprule
+问题 & 症状 & 解决 \\
+\midrule
+关节轴告警 & articulation parse warning & 关节轴与 body 主轴完全平行，微扰 1e-6 \\
+collision 填平孔洞 & 夹具夹不住 & 改 \texttt{collider\_type="convex\_decomposition"} \\
+超 64 link 限制 & PhysX articulation 报错 & 开 \texttt{merge\_fixed\_joints} 或拆分 \\
+mesh 丢失（白模） & 无纹理白模型 & 用绝对路径或修正 USD 引用；查 \texttt{Props/} 是否漏拷 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[\texttt{make\_instanceable} 把 mesh 分离后只拷了主 USD]
+\textbf{错误描述}：迁移资产时只复制 \texttt{robot.usd}。\textbf{现象后果}：加载后模型变成无形状的「骨架」。\textbf{根本原因}：\texttt{make\_instanceable=True} 把 mesh 写进独立的 \texttt{Props/\allowbreak instanceable\_assets.\allowbreak usd}，主 USD 只是引用。\textbf{正确做法}：连同 \texttt{Props/} 目录整体迁移；或对小规模实验临时关掉 instanceable。
+\end{pitfall}
+
+\paragraph{三框架视角与 \texorpdfstring{MJCF$\to$USD}{MJCF-USD} 直转。}Isaac Lab 也支持 \texttt{convert\_mjcf.\allowbreak py} 直接把调优好的 MJCF 转 USD——当你 mjlab 侧已有精调模型时很省事；但 PhysX 执行器模型与 MuJoCo 不同，转换后仍需在 \texttt{ArticulationCfg} 里重配执行器。\textbf{UniLab 在这一节是「反例」：它整条支线不出现 USD}。UniLab 的物理后端是 CPU 上的 MuJoCo（\texttt{mujoco-uni}）或 MotrixSim，资产格式相应是 MJCF 或 Motrix XML；它\emph{没有} \texttt{convert\_urdf}/\allowbreak\texttt{convert\_mjcf} 这类 USD 转换器，URDF 经 \texttt{unilab-import-robot} 直接导成原生格式即可上训。因此本节 Isaac Lab 侧的「URDF$\to$USD 转换器字段」「instanceable」「PhysX 专属参数」对 UniLab \textbf{无对应}——这正是「USD 路线」与「MJCF 路线」的分水岭：USD 用 instanceable 让数千机器人共享一份 mesh，而 UniLab 走的是 CPU 多进程并行（每个 worker 各自持有 CPU 物理状态），并行性来自进程而非 GPU 实例化，故不需要 instanceable 这套机制。
+
+\begin{practice}[动手：v2.x 转换与对照]
+\begin{enumerate}
+  \item 用 \texttt{scripts/\allowbreak tools/\allowbreak convert\_urdf.\allowbreak py} 把 Menagerie 的 Go1 URDF 转 USD，在 Isaac Sim GUI 打开，对照 mjlab viewer 记视觉差异。验收：USD 关节数与 URDF 中 active joint 数一致。
+  \item 分析题：把转换期 \texttt{joint\_drive.\allowbreak gains.\allowbreak stiffness} 与加载期 \texttt{ImplicitActuatorCfg.\allowbreak stiffness} 设成不同值会怎样？哪个最终生效？给出验证方法。
+  \item 跨章综合：结合 \cref{ch:rlmc-dr}——若两框架对同一 URDF 的接触弹跳差 3 倍，DR 的哪些项最该放宽以覆盖（提示：摩擦、恢复系数、刚度）？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{碰撞网格简化：从凹网格到凸包集合}
+\label{sec:rlmc-assets-collision}
+
+\textbf{模块功能与位置。}CAD 网格常有数万面，对碰撞检测太重——尤其要在 GPU 上对数千环境同时算时。本节是「吞吐 vs 精度」权衡的核心，对应 \cref{sec:rlmc-assets-overview} 表里「网格简化」那一行。
+
+\paragraph{动机与本质。}碰撞检测分 broad phase（快速排除）与 narrow phase（精确算点/法向）。narrow phase 对凸包是 $O(n)$，对凹网格可达 $O(n^2)$ 或更高；上万面的凹 mesh 在 narrow phase 极慢。解法是把凹网格分解成若干凸包的并集——\emph{convex decomposition}。类比搭乐高：每块是简单凸体，组合可近似任意形状；凸包越多越精确，碰撞计算也越重。
+
+\paragraph{配置详解：V-HACD vs CoACD。}两者核心差异在对\emph{凹面}的处理：V-HACD 分解时倾向\emph{填平}凹面（凸包定义就「无凹」），CoACD 用多个小凸包\emph{围出}凹面形状而非填满。对夹具手柄、杯把等需被抓取的零件，CoACD 是唯一正确选择。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+工具 & 算法 & 优点 & 缺点 & 推荐场景 \\
+\midrule
+V-HACD & 体素层次化 & 快、稳 & 填平孔洞 & locomotion（不需抓取） \\
+CoACD & 碰撞感知分解 & 保凹面、精度高 & 较慢 & manipulation（抓取/插入） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{代码走读：CoACD 分解。}CoACD 由 Wei、Liu、Ling、Su 提出（ACM TOG / SIGGRAPH 2022，arXiv:2205.02961），核心是「碰撞感知凹度度量 + 树搜索」——一句话：用「形状与其凸包的距离」衡量凹度，决定在哪切分\,\cite{wei2022coacd}。
+
+\begin{codebox}[Python]{decompose\_coacd.py:把凹网格分解为凸包集合}
+import coacd
+import trimesh
+
+def decompose_mesh(in_path, out_dir, threshold=0.05, max_parts=16):
+    mesh = trimesh.load(in_path)                         # decompose_coacd.py:1
+    cmesh = coacd.Mesh(mesh.vertices.astype('float64'),
+                       mesh.faces.astype('int32'))
+    parts = coacd.run_coacd(                              # 返回 (verts, faces) 列表
+        cmesh,
+        threshold=threshold,        # 凹度阈值:越小越精确、凸包越多
+        max_convex_hull=max_parts,  # 凸包数上限
+        preprocess_mode="auto",
+    )
+    for i, (v, f) in enumerate(parts):
+        trimesh.Trimesh(vertices=v, faces=f).export(f"{out_dir}/part_{i:03d}.obj")
+    print(f"分解完成:{len(parts)} 个凸包")
+    return len(parts)
+\end{codebox}
+
+当前稳定版（已核 CoACD 官方 README）的入参形式即上方代码所示：先 \texttt{coacd.\allowbreak Mesh(vertices, faces)} 构造网格、再传给 \texttt{coacd.\allowbreak run\_coacd(mesh, ...)}，\texttt{threshold} 取值范围约 $0.01$--$1$（越小越精细、凸包越多；另有 \texttt{real\_metric=True} 让 threshold 以米为单位计）\,\cite{wei2022coacd}。\pz{个别早期版本曾允许直接把 (vertices, faces) 传入而非先建 Mesh 对象；若你装的是旧版遇到签名不符，以你安装版本的 README 为准。}为什么逐行读：\texttt{threshold} 与 \texttt{max\_convex\_hull} 是「精度-吞吐」的两个旋钮，它们直接决定下游碰撞检测的负载。
+
+\paragraph{操作：在两框架里用分解结果。}mjlab 侧把多个凸包当同一 body 的多个 collision geom 声明；Isaac Lab 侧则在转换期用 \texttt{collider\_type="convex\_decomposition"}（\cref{sec:rlmc-assets-usd}）。
+
+\begin{codebox}[text]{MJCF:用多个凸包作为一个 body 的碰撞几何}
+<body name="gripper_finger">
+  <geom type="mesh" mesh="finger_visual" class="visual"/>      <!-- 视觉，不碰撞 -->
+  <geom type="mesh" mesh="finger_col_000" class="collision"/>  <!-- 凸包 0 -->
+  <geom type="mesh" mesh="finger_col_001" class="collision"/>  <!-- 凸包 1 -->
+  <geom type="mesh" mesh="finger_col_002" class="collision"/>  <!-- 凸包 2 -->
+</body>
+\end{codebox}
+
+\paragraph{运行验证：精度-吞吐基准。}用自由落体跑固定步数、比 fps 与每步接触点数，能直观看到简化收益。典型量级（单 CPU、单环境，数量级示意而非保证）：原始 mesh（约 5 万面）约 200 fps；V-HACD 约 32 凸包约 2000 fps；约 8 凸包约 5000 fps；纯 primitive 约 2 万 fps。对 RL（数千并行环境），合理工作点通常落在「V-HACD/CoACD 8--16 凸包」或「primitive」——RL 要的是吞吐而非碰撞精度。
+
+\begin{insight}[对 RL，碰撞精度远不如吞吐重要]\label{ins:rlmc-assets-throughput}
+8 个凸包近似的 collision 在\emph{物理行为}上与原始 mesh 几乎无差，但仿真可快约一个数量级。这与 \cref{ch:rlmc-dr} 的逻辑互补：碰撞细节的小偏差落在 DR 能吸收的范围内，而吞吐直接决定你一天能跑多少 DR 实验。所以「collision 越精细越准」是概念误区——在 RL 语境下应反向优化。
+\end{insight}
+
+\paragraph{GPU 后端（MuJoCo-Warp）的额外要求。}mjlab 的 GPU 后端是 MuJoCo-Warp（\texttt{mjwarp}，非 JAX 的 MJX），它对 collision 复杂度更敏感，常需把 mesh collision 换成 primitive。Menagerie 为\emph{部分}模型提供 \texttt{scene\_mjx.\allowbreak xml}（GPU 简化场景；该文件名沿用 MJX 时代的命名，但其「primitive 碰撞 + 简化求解」的思路对 mjlab 的 Warp 后端同样适用），但\textbf{并非每个模型都有}——是否可用以具体模型目录为准（例如 \texttt{unitree\_go2/\allowbreak } 有 \texttt{scene\_mjx.\allowbreak xml}，而 \texttt{unitree\_go1/\allowbreak } 当前只有 \texttt{go1.xml} 与 \texttt{scene.xml}）\,\cite{menagerie2022}。
+
+\begin{pitfall}[V-HACD 默认凸包数过多 / Isaac Lab 默认 collider 填孔]
+\textbf{错误描述}：用 V-HACD 默认 \texttt{max\_convex\_hull=64}，或 Isaac Lab 用默认 \texttt{collider\_type="convex\_hull"} 处理带孔零件。\textbf{现象后果}：前者碰撞检测无谓变慢；后者孔洞被填平、夹具夹不住。\textbf{根本原因}：默认值偏向「通用安全」而非「你的具体任务」。\textbf{正确做法}：从 \texttt{max\_convex\_hull=8} 起步按需加；带孔/被抓取零件改 \texttt{convex\_decomposition}。
+\end{pitfall}
+
+\paragraph{前沿替代（2025）。}除 V-HACD/CoACD，近期出现新工具。\textbf{foam}（CoMMA Lab，arXiv:2503.13704）从 URDF 生成\emph{球}近似的碰撞几何（注意是球而非凸包，便于高效距离查询；其速度/精度收益以论文实验为准，不应表述为「凸包数减少」）\,\cite{foam2025}。\textbf{Empart}（arXiv:2509.22847）提供交互式分解界面，适合需要精细控制的场景\,\cite{empart2025}。目前 CoACD 仍是最成熟、支持最广的选择（\texttt{obj2mjcf} 即默认用它）。
+
+\begin{practice}[动手：分解与基准]
+\begin{enumerate}
+  \item 取一个复杂 mesh（如 Franka 的 link5），分别用 V-HACD 与 CoACD 分解，比较凸包数、视觉质量、是否保留凹面。验收：能指出 CoACD 在孔洞处的优势。
+  \item 实验题：对 Go1 跑四档碰撞精度（原始/32/8 凸包/primitive）的 fps 基准，画「fps vs 精度」trade-off 曲线，标出你会选哪一档及理由。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{惯性参数估计与物理一致性验证}
+\label{sec:rlmc-assets-inertia}
+
+\textbf{模块功能与位置。}惯性（质量/质心/惯量）是物理行为的根基，也是「机器人飞走/抖动」的首要嫌疑。本节给出从\emph{必要条件}（三角不等式）到\emph{充要条件}（pseudo-inertia 正定）的完整验证，并把它接到 \cref{ch:rlmc-dr} 的惯性随机化。
+
+\paragraph{动机与反面。}CAD 能从 3D 模型自动算惯性——\emph{前提是每个零件材料密度正确}。若 SolidWorks 里零件没设材料（默认密度常为 1000 kg/m³），导出惯性可能与真实差一个数量级。错误惯性不会在加载时报错，却在训练里以发散爆发。
+
+\paragraph{配置详解：惯性张量的物理约束。}一个合法对角惯量需满足：质量 $>0$；三个主惯量 $>0$；以及\emph{三角不等式} $I_x+I_y\ge I_z$（及其循环）——这来自「惯量是质量分布的二阶矩」这一事实。下面是必要条件级别的快速检查：
+
+\begin{codebox}[Python]{inertia\_check.py:三角不等式等必要条件}
+import numpy as np
+
+def check_inertia(ixx, ixy, ixz, iyy, iyz, izz, mass):
+    I = np.array([[ixx, ixy, ixz], [ixy, iyy, iyz], [ixz, iyz, izz]])
+    issues = []
+    if mass <= 0:
+        issues.append(f"质量非正: {mass}")
+    eig = np.linalg.eigvalsh(I)              # 主惯量
+    if np.any(eig <= 0):
+        issues.append(f"主惯量非正: {eig}")
+    Ix, Iy, Iz = sorted(eig)
+    if Ix + Iy < Iz:
+        issues.append(f"违反三角不等式: {Ix:.6f}+{Iy:.6f} < {Iz:.6f}")
+    # 等效半径启发式:均匀球 I=0.4 m r^2，反解 r 过大则可疑
+    if mass > 0:
+        r = np.sqrt(max(eig) / (0.4 * mass))
+        if r > 1.0:
+            issues.append(f"惯量/质量比可疑: 等效半径 {r:.2f} m")
+    print("不合法:" if issues else "合法:", issues or eig)
+    return not issues
+\end{codebox}
+
+\paragraph{运行验证：三个零成本测试。}\textbf{测试 1 自由落体}：从 1 m 落，理论落地时间 $t=\sqrt{2h/g}=\sqrt{2/9.81}\approx0.452$ s，偏差 $>10\%$ 查质量。\textbf{测试 2 静止平衡}：摆到 home、\emph{不加}执行器力跑千步，位置漂移 $>0.01$ m 说明 home 下重力矩不为零，常因质心错。\textbf{测试 3 质心可视化}：viewer 里开 inertia 椭球，椭球中心即质心、形状即惯量主轴，严重偏离几何中心则可疑。
+
+\begin{codebox}[Python]{free\_fall\_test.py:自由落体核对质量}
+import numpy as np, mujoco
+
+def free_fall_time(mjcf_path, h=1.0):
+    m = mujoco.MjModel.from_xml_path(mjcf_path)
+    d = mujoco.MjData(m)
+    d.qpos[2] = h
+    if m.nq >= 7:                      # 有 freejoint:置单位四元数
+        d.qpos[3] = 1.0
+    t = 0.0
+    while d.qpos[2] > 0.05 and t < 2.0:
+        mujoco.mj_step(m, d); t += m.opt.timestep
+    print(f"落地 {t:.3f}s（理论 {np.sqrt(2*h/9.81):.3f}s）")
+    return t
+\end{codebox}
+
+\paragraph{代码走读：pseudo-inertia 与物理一致性的充要条件。}三角不等式只是\emph{必要}条件。Wensing、Kim、Slotine（RA-L 2018，arXiv:1701.04395）给出\emph{充要}刻画：把 10 维惯性参数 $\boldsymbol\pi=(m,\,mc_x,\,mc_y,\,mc_z,\,I_{xx},\,I_{xy},\,I_{xz},\,I_{yy},\,I_{yz},\,I_{zz})$ 装成一个 $4\times4$ 的 pseudo-inertia 矩阵 $\mathbf{J}(\boldsymbol\pi)$，则\textbf{物理一致 $\iff \mathbf{J}(\boldsymbol\pi)\succ 0$（正定）}——它等价于「存在一个非负质量分布产生这组参数」，可写成线性矩阵不等式（LMI）\,\cite{wensing2018lmi}。这正是 \cref{ch:rlmc-dr} 做惯性随机化时该守的约束。
+
+\begin{codebox}[Python]{pseudo\_inertia.py:4x4 pseudo-inertia 正定性检查}
+import numpy as np
+
+def build_pseudo_inertia(m, com, I_com):
+    """com: (3,) 质心;I_com: (3,3) 质心处惯量."""
+    # 平行轴定理:惯量从质心搬到 link 系
+    I_link = I_com + m * (np.dot(com, com) * np.eye(3) - np.outer(com, com))
+    J = np.zeros((4, 4))
+    J[:3, :3] = 0.5 * np.trace(I_link) * np.eye(3) - I_link   # 二阶矩块
+    J[:3, 3] = m * com
+    J[3, :3] = m * com
+    J[3, 3] = m
+    return J
+
+def physically_consistent(m, com, I_com):
+    J = build_pseudo_inertia(m, com, I_com)
+    eig = np.linalg.eigvalsh(J)
+    ok = np.all(eig > 0)
+    print(("一致" if ok else "不一致"), f"min eig={eig.min():.6f}")
+    return ok
+\end{codebox}
+
+\paragraph{操作：物理一致的惯性随机化。}\cref{ch:rlmc-dr} 提过：\emph{独立}随机化 mass、com、惯量对角元可能破坏物理一致。正确做法是\textbf{等比缩放}——采一个密度因子 $\rho\sim\mathcal{U}(0.8,1.2)$，令 $m\!\to\!\rho m$、$\mathbf{I}\!\to\!\rho\mathbf{I}$（惯量正比于密度乘几何），可选再对 com 加小扰动，最后用上面的正定检查兜底。
+
+\begin{codebox}[Python]{randomize\_inertia.py:等比缩放保物理一致}
+import numpy as np
+
+def randomize_inertia(m0, I0, com0):
+    rho = np.random.uniform(0.8, 1.2)        # 单一密度因子
+    m, I = rho * m0, rho * I0                 # 等比缩放，天然保一致
+    com = com0 + np.random.uniform(-0.01, 0.01, 3)
+    assert physically_consistent(m, com, I)  # 兜底
+    return m, I, com
+\end{codebox}
+
+\paragraph{三框架视角：谁把「物理合法的惯量随机化」做进了框架。}上面的等比缩放是\emph{通用}保险，但更讲究的做法是直接在 pseudo-inertia 上扰动再重构。\textbf{mjlab} 把这件事做成了一等公民的 DR 项 \texttt{pseudo\_inertia}（在 \texttt{mjlab/\allowbreak envs/\allowbreak mdp/\allowbreak dr/\allowbreak } 的惯量模块里）：它在 $4\times4$ 伪惯量矩阵上扰动，再经 \emph{Cholesky 分解+重构}（约 \texttt{\_cholesky\_4x4} / \texttt{\_reconstruct\_pseudo\_inertia\_J}，含平行轴定理把 COM 惯量搬到 body 原点）保证扰动后惯量\emph{仍正定/物理可实现}——这正是把 \cite{wensing2018lmi} 的 LMI 约束\emph{落进采样}的工程实现，比「直接乘质量」高级，是 sim-to-real 惯量鲁棒性的正确做法。\textbf{Isaac Lab} 侧没有等价的 Cholesky 重构 DR 项，常用做法就是上面的等比缩放或在 \cref{ch:rlmc-dr} 的 event 里对质量/质心做\emph{受约束}扰动。\textbf{UniLab} 同样\textbf{无对应}：它的 reset DR 只到 \texttt{body\_inertia} / \texttt{body\_ipos} / \texttt{body\_iquat} 这一级（在 \texttt{dr/types.py} 的 reset 项里），\emph{不}保证扰动后惯量正定；要物理合法只能自己在采样侧加 pseudo-inertia 兜底（即把本节的 \texttt{physically\_consistent} 检查接到 DR 采样后）。一句话：mjlab 把「物理合法惯量 DR」内建了，另两框架要靠等比缩放或自实现的正定投影。
+
+\begin{note}[别只信这段结论：教你\emph{自己}去框架源码核实「内建了什么 DR」]\label{note:rlmc-assets-verify-claim}
+上一段的三框架对比（谁内建了 pseudo-inertia DR、UniLab 的 reset 粒度到哪一级）是\emph{可证伪}的工程 claim，而非该背下来的结论——本书也正是用下面这套「只查符号表、不跑仿真」的手法实证它的。授人以渔：换一个框架版本、换一个 DR 能力，你都该这样\emph{自己}查一遍，而不是等下游训练出锅才回头怀疑文档。
+\begin{codebox}[bash]{核实「框架内建了哪些 DR」:dir / inspect / grep 三连}
+# 1) mjlab:这台装的版本里，DR 子模块到底导出了哪些函数？(pseudo_inertia 在不在？)
+uv run python -c "import mjlab.envs.mdp.dr as dr; \
+print([n for n in dir(dr) if not n.startswith('__')])"
+# 期望:能看到 pseudo_inertia / body_mass / geom_friction / pd_gains ... 一长串
+# 2) 不跑仿真，只问 pseudo_inertia 的真实签名(确认 alpha_range 这个旋钮存在)
+uv run python -c "import inspect, mjlab.envs.mdp.dr as dr; \
+print(inspect.signature(dr.pseudo_inertia))"
+# 3) UniLab:reset DR 粒度只到 body_inertia/ipos/iquat —— 去源码 grep 求证
+grep -rn "RESET_TERM_BODY" $(uv run python -c "import unilab,os; \
+print(os.path.join(os.path.dirname(unilab.__file__),'envs/mdp/dr'))")
+# 期望:列出 RESET_TERM_BODY_INERTIA / _IPOS / _IQUAT —— 印证'只到这一级、无 pseudo-inertia'
+\end{codebox}
+\textbf{要点}：\texttt{dir()} 列能力清单、\texttt{inspect.\allowbreak signature} 验旋钮名、\texttt{grep} 源码定位常量——这套手法对\emph{任何}框架的 DR/API claim 都通用（与 \cref{note:rlmc-assets-offline-api} 用 \texttt{dataclasses.\allowbreak fields} 验 Isaac 字段是同一招）。查到的清单与本节叙述对不上，就以\emph{你装的版本}为准——版本漂移是常态。
+\end{note}
+
+\paragraph{从「知道有」到「会用」：在 cfg 里启用 mjlab 的 pseudo\_inertia DR。}既然 mjlab 已内建，落地只是在 DR 配置里挂一项（约定写法如下，与 \cref{ch:rlmc-dr} 的 event/DR 配置范式一致；精确字段名以上面 \texttt{inspect.\allowbreak signature} 查到的为准）：
+
+\begin{codebox}[Python]{mjlab:启用物理合法的 pseudo\_inertia 惯量 DR（startup 期）}
+import mjlab.envs.mdp.dr as dr
+# 在任务的 EventCfg / DR 配置里挂一项 startup 期惯量随机化:
+# 关键旋钮是 alpha_range —— 它是全局密度因子的对数尺度扰动(e^{2*alpha} 缩放惯量),
+# Cholesky 分解+重构在内部保证扰动后伪惯量仍正定,无需你再做 physically_consistent 兜底.
+pseudo_inertia_dr = dr.pseudo_inertia(
+    alpha_range=(-0.1, 0.1),     # 密度对数扰动幅度;越大惯量分布越宽
+    # body 选择 / operation 等其余参数同其它 dr.* 项，按 inspect.signature 填
+)
+\end{codebox}
+
+\noindent{}\pzr{注意：mjlab 源码里直接乘质量的 \texttt{body\_mass} DR 已标 \emph{deprecated}，官方推荐改用 \texttt{pseudo\_inertia}——因为前者只缩放质量、不动惯量与质心，物理上不自洽（质量变了惯量却没按比例变）；后者在伪惯量层扰动并经 Cholesky 重构，天然保证物理一致。所以\emph{新}代码做惯量 DR 一律走 \texttt{pseudo\_inertia}，把 \texttt{body\_mass} 当遗留接口看待。}
+
+\begin{pitfall}[PhysX「静默修正」非法惯量；独立随机化惯量破坏一致性]
+\textbf{错误描述}：依赖 PhysX 报错来发现非法惯量；或在 DR 里独立抖动 mass 与惯量。\textbf{现象后果}：Isaac Lab 端\emph{不报警}但行为不对；DR 偶发数值不稳定且难复现。\textbf{根本原因}：MuJoCo 加载时会拒绝违反三角不等式的惯量，PhysX 则\emph{自动修正后继续}；独立随机化会让 $\mathbf{J}(\boldsymbol\pi)$ 失去正定。\textbf{正确做法}：永远先在 MuJoCo 加载体检；DR 用等比缩放 + pseudo-inertia 正定兜底。
+\end{pitfall}
+
+\begin{practice}[动手：惯性体检与一致随机化]
+\begin{enumerate}
+  \item 对 Go1 每个 body 跑 \texttt{check\_inertia} 与 \texttt{physically\_consistent}，统计违反数。验收：能区分「仅违反三角不等式」与「pseudo-inertia 不正定」两类。
+  \item 编码题：构造一组\emph{独立}随机化的 (m, com, I)，证明它可能让 \texttt{physically\_consistent} 返回 False；再换等比缩放，验证恒为 True。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{模型库与机器人组合}
+\label{sec:rlmc-assets-zoo}
+
+\textbf{模块功能与位置。}多数项目不必从 CAD 起步——可直接用现成高质量模型，并把多台机器人\emph{组合}成复合系统（如四足挂机械臂）。本节给三框架视角下的模型库与两种组合范式。
+
+\paragraph{操作：三个主力模型库。}\textbf{MuJoCo Menagerie}（\texttt{google-deepmind/\allowbreak mujoco\_menagerie}）是最大开源 MuJoCo 模型集（50+），每个都手调过、且 README 详记了 URDF$\to$MJCF 的真实调优决策——这些 README 本身就是最好的实战教材\,\cite{menagerie2022}。\textbf{Isaac Lab 内置资产}在 \texttt{isaaclab\_assets} 里提供十余个已转 USD、配好执行器/碰撞的 CFG（v2.0+ 用 \texttt{isaaclab\_assets}，v1.x 用 \texttt{omni.\allowbreak isaac.\allowbreak lab\_assets}）。这里有个常被误解的源码事实值得点明：\texttt{isaaclab\_assets} 是\textbf{「配方库」而非「资产库」}——在 \texttt{isaaclab\_assets} 2.x 的 \texttt{robots/*.py}（如 \texttt{unitree.py}、\texttt{anymal.py}）里存的是一批 \texttt{ArticulationCfg} 实例（已配好 \texttt{usd\_path}、执行器、碰撞、初姿），\emph{不}存 USD/网格本身；真正的 USD 默认托管在 \textbf{Omniverse Nucleus 云资产服务器}上，\texttt{usd\_path} 形如 \Verb[breaklines]|f"{ISAACLAB_NUCLEUS_DIR}/Robots/Unitree/Go1/go1.usd"|（在 \texttt{utils/\allowbreak assets.\allowbreak py} 的 \texttt{ISAACLAB\_NUCLEUS\_DIR} 等常量解析云端前缀）。\texttt{check\_file\_path()} 返回 \texttt{0/1/2}（不存在/本地有/Nucleus 有），\texttt{retrieve\_file\_path()} 在「Nucleus 有」时\emph{首次按需下载}——这正解释了「为什么第一次跑某任务会卡在下载资产」；要离线就把资产镜像到本地、把 \texttt{usd\_path} 改成本地绝对路径。\textbf{awesome-loco-manipulation}（\texttt{aCodeDog/\allowbreak awesome-loco-manipulation}）整理了一批\emph{复合机器人} URDF（Go2+Arx、B1+Z1 等）。\textbf{UniLab 资产}随包分发在 \Verb[breaklines]|src/unilab/assets/robots/<robot>/|（MJCF），并经 \texttt{unilab-pull-assets} 从 Hugging Face 拉补充资产/预训练权重——它和 mjlab 一样\emph{随包/按需拉}本地文件，没有 Isaac Lab 那种云端 Nucleus 间接层。
+
+\begin{codebox}[Python]{mjlab:用 Menagerie 模型并打印信息卡}
+import mujoco
+from pathlib import Path
+
+menagerie = Path("mujoco_menagerie")
+spec = mujoco.MjSpec.from_file(str(menagerie / "unitree_go1" / "scene.xml"))
+model = spec.compile()
+print(f"bodies={model.nbody} joints={model.njnt} nu={model.nu} "
+      f"mass={sum(model.body_mass):.2f}kg dt={model.opt.timestep}")
+\end{codebox}
+
+\begin{codebox}[Python]{Isaac Lab:引用内置资产 CFG（名称以目标版本为准）}
+# 注意:CFG 名/导入路径随版本变化，下面以常见命名示意，须以你的 isaaclab_assets 为准
+from isaaclab_assets import UNITREE_GO1_CFG   # v1.x: from omni.isaac.lab_assets import ...
+
+robot_cfg = UNITREE_GO1_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+\end{codebox}
+
+\pz{\texttt{UNITREE\_GO1\_CFG} / \texttt{UNITREE\_GO2\_CFG} / \texttt{ANYMAL\_C\_CFG} 等符号在 \texttt{isaaclab\_assets} 中确实存在（已核官方文档；亦可从子模块导入，如 \texttt{from isaaclab\_assets.\allowbreak robots.\allowbreak anymal import ANYMAL\_C\_CFG}），但完整可用清单随 Isaac Lab 版本增删，且 2.x 起顶层包名由旧的 \texttt{omni.\allowbreak isaac.\allowbreak lab\_assets} 改为 \texttt{isaaclab\_assets}。使用前请在目标版本中确认导入成功，否则 NameError。}
+
+\begin{insight}[双框架的「同名」内置模型未必同参]\label{ins:rlmc-assets-zoo-mismatch}
+Menagerie 的 Go1 与 Isaac Lab Assets 的 \texttt{UNITREE\_GO1\_CFG} 是\emph{各自独立维护}的：执行器 kp/kd、collision 设置、solver 参数都可能在各自调优中产生偏差（例如 kp 一边 80、一边 100 这类常见出入）。\textbf{工程建议}：要做双框架对比（如论文比 MuJoCo 与 PhysX 的 sim-to-real），别分别用两边内置模型，而要以\emph{同一份 URDF} 为基准重新转换两端、再手动对齐参数（\cref{sec:rlmc-assets-align}）——否则你比较的是「两个不同模型」而非「两个仿真器」。
+\end{insight}
+
+\begin{insight}[资产是「编译」出来的，且三框架用三种「指针」指向资产]\label{ins:rlmc-assets-compiled}
+三框架引用资产的\emph{方式}本身就泄露了它们的设计哲学。\textbf{mjlab} 用一个\emph{可调用对象}指向资产——\texttt{EntityCfg.\allowbreak spec\_fn}（约定写法 \Verb[breaklines]|lambda: mujoco.MjSpec.from_file(XML)|），返回一个可\emph{编程修改}的 \texttt{MjSpec}，模型是 \texttt{spec.\allowbreak compile()$\to$MjModel} \emph{编译}出来的，编译前还能在 Python 里加灯光、改碰撞、换摩擦再 compile。\textbf{Isaac Lab} 用一个\emph{字符串路径} \texttt{UsdFileCfg.\allowbreak usd\_path} 指向 USD（可指云端 Nucleus），运行时把 USD 加载进 stage 再由 PhysX 解析成 articulation；执行器\emph{不}在 USD 内，加载后由 \texttt{ArticulationCfg.\allowbreak actuators} 补。\textbf{UniLab} 也用字符串路径 \texttt{SceneCfg.\allowbreak model\_file}（指向 MJCF/Motrix XML），由 CPU 后端编译。\textbf{共同的本质}：可训练模型从来不是「运行时读 XML/USD」，而是「资产源$\to$编译/加载$\to$内部模型」这条流水线的产物——理解这点，才知道为什么 mjlab 能在 \texttt{MjSpec} 阶段程序化批改增益（\cref{sec:rlmc-assets-mjcf} 的 \texttt{spec\_fn} 范式），而 USD 是「编译期就落盘的死文件」、改它要回到转换器或加载期 cfg。
+\end{insight}
+
+\paragraph{代码走读：mjlab 动态组合（\texttt{MjSpec.\allowbreak attach}）。}复合机器人 URDF 一般是把底盘与手臂两份 URDF 用一个 fixed joint 连起来。但 mjlab 侧有更灵活的路：MuJoCo 官方的模型编辑 API \texttt{MjSpec.\allowbreak attach} 可在\emph{运行时}把一份 spec 挂到另一份上，无需预先生成复合 URDF。
+
+\begin{codebox}[Python]{mjlab:MjSpec.attach 动态组合底盘+机械臂}
+import mujoco
+
+def compose_loco_manipulation():
+    chassis = mujoco.MjSpec.from_file("unitree_go2/go2.xml")
+    arm = mujoco.MjSpec.from_file("arx5/arx5.xml")
+    # 在底盘上新建一个带位姿的挂载 frame，再把 arm 挂到该 frame
+    mount = chassis.worldbody.add_frame(pos=[0.15, 0, 0.1], quat=[1, 0, 0, 0])
+    chassis.attach(arm, frame=mount, prefix="arm/")   # prefix 避免命名冲突
+    model = chassis.compile()
+    print(f"组合后 bodies={model.nbody} joints={model.njnt} nu={model.nu}")
+    return model
+\end{codebox}
+
+上面 attach 的签名已对照 MuJoCo 官方模型编辑文档与 \texttt{specs\_test.\allowbreak py} 核实：标准形式是 \texttt{parent.\allowbreak attach(child, frame=<父级 frame>, prefix=..., suffix=...)}，亦可用 \texttt{site=} 代替 \texttt{frame=}（二者互斥）；\texttt{pos}/\allowbreak\texttt{quat} \emph{不是} \texttt{attach} 的直接参数，挂载位姿由被挂的 frame/site 自身位姿决定（故此处先 \texttt{add\_frame(pos,quat)} 再 attach）。把 \texttt{pos}/\allowbreak\texttt{quat} 直接传给 \texttt{attach} 的写法是错的。\pz{该模型编辑 API 在 MuJoCo 3.x 期间逐步成型，旧版（\texttt{<3.2} 左右）可能尚无 \texttt{MjSpec} 或签名有别，以你安装版本为准。} \texttt{MjSpec.\allowbreak attach} 的工程优势：底盘与手臂各自独立维护调优（模块化）、同底盘可换不同手臂（可复用）、\texttt{prefix} 做命名空间隔离。对照之下，Isaac Lab 组合复合机器人通常在 USD 层做 reference，灵活度不及 \texttt{attach}：
+
+\begin{codebox}[Python]{Isaac Lab:复合机器人多执行器组（预转 USD）}
+from isaaclab.assets import ArticulationCfg
+from isaaclab.actuators import ImplicitActuatorCfg
+import isaaclab.sim as sim_utils
+
+COMPOSITE_CFG = ArticulationCfg(
+    spawn=sim_utils.UsdFileCfg(usd_path="go2_arx.usd"),  # 预先从复合 URDF 转换
+    actuators={
+        "legs": ImplicitActuatorCfg(
+            joint_names_expr=[".*hip.*", ".*thigh.*", ".*calf.*"],
+            stiffness=80.0, damping=4.0),
+        "arm": ImplicitActuatorCfg(
+            joint_names_expr=["arm_joint_.*"], stiffness=100.0, damping=10.0),
+    },
+)
+\end{codebox}
+
+UniLab 的组合机制走的是\textbf{冷路径片段拼装}而非运行时 \texttt{attach}：场景配置 \texttt{SceneCfg}（在 \verb|base/scene.py|）有 \verb|model_file|（机器人主 XML）加 \Verb[breaklines]|fragment_files|（一组在加载\emph{前}拼进主 XML 的片段，如把 loco-manipulation 任务的物体/挂载片段拼进底盘 XML），再加 \Verb[breaklines]|terrain.generator|（地形）。复合机器人（如 Go2 挂机械臂的 \texttt{Go2ArmManipLoco} 任务）因而是\emph{预先}组好 MJCF/在 \texttt{fragment\_files} 里声明，而不是像 mjlab 那样在 \texttt{MjSpec} 阶段动态 \texttt{attach}。
+
+\begin{codebox}[Python]{UniLab:经 SceneCfg.fragment\_files 冷路径拼装复合资产（底盘+任务片段）}
+from unilab.base.scene import SceneCfg
+
+scene = SceneCfg(
+    model_file="src/unilab/assets/robots/go2_arm/scene_flat.xml",  # 主资产（底盘+臂）
+    fragment_files=[                                               # 加载前拼入的片段
+        "src/unilab/assets/fragments/payload_box.xml",            # 如:挂载/物体片段
+    ],
+    # terrain=TerrainSceneCfg(generator=...)                       # 地形另由 generator 程序生成
+)
+# 注:UniLab 无运行时 MjSpec.attach 式「两机器人动态拼接」API;复合体由预组 XML / fragment 声明.
+\end{codebox}
+
+工程含义对照：mjlab 的 \texttt{MjSpec.\allowbreak attach} 灵活在「同底盘热插不同手臂」，UniLab 与 Isaac Lab 都偏向「预组资产 + 声明式拼装」（UniLab 用 \texttt{fragment\_files} 在 MJCF 层拼、Isaac Lab 在 USD 层 reference），代价是换手臂要改资产声明而非一行代码。\pz{UniLab（main，commit \texttt{99936e08}）无对应：未提供 \texttt{MjSpec.\allowbreak attach} 式运行时「两机器人动态拼接」API，复合体只能经预组 MJCF / \texttt{fragment\_files} 声明。}
+
+\begin{pitfall}[组合后忘了排除底盘-手臂的碰撞]
+\textbf{错误描述}：\texttt{attach}/reference 组合后直接训练。\textbf{现象后果}：安装座处底盘与手臂碰撞几何重叠，启动即「自碰」、力异常。\textbf{根本原因}：组合 API \emph{不会}自动为跨子模型的相邻体加碰撞排除。\textbf{正确做法}：手动在安装座附近加 \texttt{<exclude>}（mjlab）或调 \texttt{contype/\allowbreak conaffinity}；Isaac Lab 侧确认 \texttt{enabled\_self\_collisions} 与碰撞组设置。
+\end{pitfall}
+
+\begin{practice}[动手：模型库与组合]
+\begin{enumerate}
+  \item 从 Menagerie 下三类模型（四足/机械臂/夹具），各打印 body 数、joint 数、执行器类型与数量，做一张对照「信息卡」。
+  \item 编码题：用 \texttt{MjSpec.\allowbreak attach} 把一个夹具挂到机械臂末端，编译后打印新增关节名，确认 \texttt{prefix} 生效、无命名冲突。验收：组合模型可 \texttt{compile()} 通过且关节数 = 两者之和。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{双框架参数对齐与端到端验证}
+\label{sec:rlmc-assets-align}
+
+\textbf{模块功能与位置。}本节收口：当同一台机器人要在 mjlab 与 Isaac Lab 都用时，如何让两端物理参数尽量一致、并用一套验证套件确认「可以开训」。这是把全章串起来的「冒烟测试」。
+
+\paragraph{动机。}典型工作流是 mjlab/MuJoCo 端快速预览实验、Isaac Lab/PhysX 端大规模训练。若两端参数不一致，mjlab 调好的奖励权重与超参搬到 Isaac Lab 可能完全失效（呼应 \cref{ins:rlmc-assets-skeleton} 的陷阱）。
+
+\paragraph{配置详解：哪些必须对齐、哪些交给 DR。}URDF 只守恒运动学与惯性，以下由仿真器各自补全，需手动对齐：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+参数 & 对齐要求 & 两端位置 \\
+\midrule
+timestep & 必须完全一致 & \texttt{<option timestep>} vs \texttt{SimCfg(dt)} \\
+gravity & 方向与量一致 & \texttt{<option gravity>} vs \texttt{SimCfg(gravity)} \\
+执行器 kp & 必须一致 & \texttt{<position kp>} vs \texttt{ImplicitActuatorCfg(stiffness)} \\
+执行器 kd & 必须一致（注意叠加） & \texttt{kv}+\texttt{joint damping} vs \texttt{damping} \\
+力矩上限 & 一致 & \texttt{forcerange} vs \texttt{effort\_limit} \\
+mass/inertia & 一致（同 URDF） & 来自同一来源 \\
+摩擦系数 & 设相近值 & 残差交给 DR \\
+接触刚度/阻尼 & \emph{不}对齐 & 模型不同，交给 DR \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[MuJoCo 的 \texttt{kv} 与 joint \texttt{damping} 会\emph{叠加}]
+\textbf{错误描述}：把 Isaac Lab 的 \texttt{damping} 直接照搬 MJCF 的 \texttt{kv}。\textbf{现象后果}：两端关节响应阻尼不一致，对齐失败。\textbf{根本原因}：MJCF 里 \texttt{<position kv="4"/\allowbreak >} 与 \texttt{<joint damping="0.5"/\allowbreak >} \emph{同时生效}，总阻尼是两者之和；Isaac Lab 的 \texttt{ImplicitActuatorCfg(damping=...)} 对应的是\emph{总}阻尼。\textbf{正确做法}：若 MJCF 设了 kv=4 + joint\_damping=0.5，Isaac Lab 应设 damping=4.5。
+\end{pitfall}
+
+\paragraph{MuJoCo 专属、Isaac Lab 无直接对应的参数。}\texttt{solref}/\allowbreak\texttt{solimp}（软接触刚度/阻抗）、\texttt{armature}（虚拟转子惯量）、\texttt{frictionloss}（关节库仑摩擦）、\texttt{condim}（接触维度）这几项 PhysX 没有一一对应物。实践建议：别试图在接触层让两者完全一致（不可能），只对齐\emph{非接触}行为（timestep/gravity/kp/kd/质量），接触差异留给 DR（\cref{ins:rlmc-assets-contact-models}）。
+
+\paragraph{代码走读：端到端验证套件。}下面这段在 MuJoCo 侧跑一遍「基本信息 + 惯性 + 自由落体 + 执行器」的体检，是开训前的冒烟测试主体（PhysX 侧在 Isaac Lab 环境内对称地跑）：
+
+\begin{codebox}[Python]{validate\_model.py:MuJoCo 侧端到端体检（节选）}
+import numpy as np, mujoco
+
+def validate_model(mjcf_path):
+    m = mujoco.MjModel.from_xml_path(mjcf_path)
+    d = mujoco.MjData(m)
+    print(f"bodies={m.nbody} joints={m.njnt} nq={m.nq} nv={m.nv} nu={m.nu}")
+    print(f"mass={sum(m.body_mass):.3f}kg dt={m.opt.timestep} "
+          f"solver={['PGS','CG','Newton'][m.opt.solver]}")
+
+    # 惯性:三角不等式
+    bad = 0
+    for i in range(m.nbody):
+        if m.body_mass[i] > 1e-3:
+            Ix, Iy, Iz = sorted(m.body_inertia[i])
+            if Ix + Iy < Iz * 0.99:
+                nm = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, i)
+                print(f"  惯性告警 body={nm}"); bad += 1
+    print(f"惯性问题 {bad} 个")
+
+    # 自由落体（有 freejoint 才测）
+    if m.nq >= 7:
+        d.qpos[:] = 0; d.qvel[:] = 0; d.qpos[2] = 1.0; d.qpos[3] = 1.0
+        t = 0.0
+        while d.qpos[2] > 0.05 and t < 2.0:
+            mujoco.mj_step(m, d); t += m.opt.timestep
+        ref = np.sqrt(2 / 9.81)
+        print(f"落地 {t:.3f}s (理论 {ref:.3f}s, 误差 {abs(t-ref)/ref*100:.1f}%)")
+
+    # 执行器存在性（最常见致命缺陷）
+    if m.nu == 0:
+        print("  严重:无执行器，机器人会瘫倒")
+    return m
+\end{codebox}
+
+\paragraph{运行验证：差异分析与判据。}对照两端结果，下表是典型差异及「是否影响 RL」的判断——核心结论是\emph{非接触行为应高度一致、接触差异交给 DR}：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+测试项 & MuJoCo & PhysX & 差异来源 & 影响 RL？ \\
+\midrule
+自由落体时间 & 0.452s & 0.450s & 数值积分 & 否，忽略 \\
+接触弹跳高度 & 0.02m & 0.05m & 接触模型 & 是，DR 覆盖 \\
+关节摆动幅度 & $15^\circ$ & $12^\circ$ & 阻尼默认值 & 是，对齐参数 \\
+摩擦滑动距离 & 0.5cm & 2.0cm & 摩擦模型 & 是，DR 覆盖 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+验收判据（经验值）：自由落体时间差 $<5\%$、关节响应幅度差 $<20\%$，通常即可开训；更严格的接触一致性留给 DR 而非死磕。
+
+\begin{pitfall}[追求「两框架行为完全一致」才肯开训]
+\textbf{错误描述}：非要把接触弹跳、滑动也对齐到一致。\textbf{现象后果}：无限期卡在对齐，永远开不了训。\textbf{根本原因}：两者接触\emph{模型}不同，完全一致在数学上不可达（\cref{ins:rlmc-assets-contact-models}）。\textbf{正确做法}：目标是「非接触一致 + 接触差异可被 DR 覆盖」；达到上面的经验判据即开训，把剩余差异交给 \cref{ch:rlmc-dr} 的 DR。
+\end{pitfall}
+
+\begin{practice}[动手：对齐与验证]
+\begin{enumerate}
+  \item 对同一份 Go1 URDF 转出的 MJCF 与 USD，分别记录 timestep/kp/kd/friction，做对齐检查表，标出每项是否一致。验收：timestep 与 kp 完全一致。
+  \item 跨章综合：结合 \cref{ch:rlmc-training} 与 \cref{ch:rlmc-dr}——若验证发现两端接触弹跳差 3 倍，DR 应放宽哪些项、范围设到多大才足以覆盖？给出你的设置与依据。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\label{sec:rlmc-assets-misconceptions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.2cm}p{8.6cm}@{}}
+\toprule
+常见误解 & 纠正 \\
+\midrule
+URDF 是通用格式，两仿真器行为应一致 & URDF 只守恒运动学+惯性；接触/执行器/求解器由两边默认值补全且不同（\cref{ins:rlmc-assets-skeleton}）。 \\
+URDF 的 \texttt{<axis>} 默认是 Z 轴 & 规范默认是 X 轴 \texttt{(1,0,0)}；务必显式写 \texttt{<axis>}。 \\
+sw2urdf 产物可直接用 & 通常「基本正确但需手动修正」：路径/惯性/限位/补 collision。 \\
+Menagerie 模型可直接 RL 训练 & 其 kp/kd 为 viewer 演示调，RL 常需重调（四足 hip 常调到 200--400）。 \\
+collision 越精细越准 & 对 RL，吞吐远比碰撞精度重要；8 凸包近似行为几乎无差而快约一个数量级（\cref{ins:rlmc-assets-throughput}）。 \\
+惯性参数精确就好 & 物理\emph{一致性}比精确更要紧：违反三角不等式/pseudo-inertia 不正定会致发散，DR 无法救。 \\
+Isaac Lab 转换用 \texttt{default\_drive\_*} & v2.x 已重构为 \texttt{joint\_drive=JointDriveCfg(gains=...)}、\texttt{collider\_type}。 \\
+两框架同名内置模型参数一致 & 各自独立维护，参数可能有出入；双框架对比应以同一 URDF 重转（\cref{ins:rlmc-assets-zoo-mismatch}）。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\addcontentsline{toc}{section}{小结}
+\label{sec:rlmc-assets-summary}
+
+本章把「从 CAD 到可训练资产」这条最前置的工程管线，组织成一条\emph{物理语义守恒与补全}的主线（\cref{ins:rlmc-assets-skeleton}）：URDF 只填两类语义，MJCF 与 USD 各自补全接触/执行器/求解器，但补法不同（\cref{ins:rlmc-assets-decl-imp}），于是同一份 URDF 在两框架行为有别（\cref{ins:rlmc-assets-contact-models}），这些差异在 RL 里由域随机化吸收。沿这条主线，我们走完 SolidWorks$\to$URDF 的体检修复、URDF$\to$MJCF 的六步调优、URDF$\to$USD 的 v2.x 新 API、碰撞简化的吞吐-精度权衡（\cref{ins:rlmc-assets-throughput}）、惯性的物理一致性验证、模型库与组合（\cref{ins:rlmc-assets-zoo-mismatch}）、以及双框架对齐与端到端验证。
+
+\paragraph{术语速查。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 一句话 \\
+\midrule
+MJCF & MuJoCo 原生 XML 模型格式（补全接触/执行器/求解器）。 \\
+USD & Pixar/NVIDIA 场景格式，支持 instanceable，多环境共享 mesh。 \\
+凸分解 & 把凹网格拆成若干凸包之并以加速碰撞检测。 \\
+V-HACD / CoACD & 两种凸分解工具：前者填平凹面、后者保凹面。 \\
+pseudo-inertia & $4\times4$ 矩阵 $\mathbf{J}(\boldsymbol\pi)$，正定 $\iff$ 惯性物理一致。 \\
+三角不等式 & $I_x+I_y\ge I_z$（循环），合法惯量的必要条件。 \\
+instanceable & USD 把 mesh 分离共享的机制，存于 \texttt{Props/}。 \\
+\texttt{joint\_drive} & Isaac Lab v2.x 的结构化驱动配置（含 \texttt{gains}）。 \\
+\texttt{MjSpec.\allowbreak attach} & MuJoCo 运行时把子 spec 挂到父 spec 的组合 API。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 全链路 = 物理语义守恒/补全链 & \cref{sec:rlmc-assets-overview} & 2 \\
+2 & sw2urdf 装配体要求与 \texttt{<axis>} 不默认 Z & \cref{sec:rlmc-assets-sw2urdf} & 2 \\
+3 & URDF 产物体检与路径修复 & \cref{sec:rlmc-assets-sw2urdf} & 2 \\
+4 & URDF$\to$MJCF 六步调优 & \cref{sec:rlmc-assets-mjcf} & 3 \\
+5 & 声明式 vs 命令式模型定义 & \cref{sec:rlmc-assets-mjcf} & 2 \\
+6 & Isaac Lab v2.x \texttt{UrdfConverterCfg} 新 API & \cref{sec:rlmc-assets-usd} & 3 \\
+7 & PhysX 专属参数与 instanceable 陷阱 & \cref{sec:rlmc-assets-usd} & 3 \\
+8 & V-HACD vs CoACD 与吞吐-精度权衡 & \cref{sec:rlmc-assets-collision} & 3 \\
+9 & 惯性三角不等式（必要条件） & \cref{sec:rlmc-assets-inertia} & 2 \\
+10 & pseudo-inertia 正定（充要条件）与一致随机化 & \cref{sec:rlmc-assets-inertia} & 4 \\
+11 & 三模型库与同名不同参 & \cref{sec:rlmc-assets-zoo} & 2 \\
+12 & \texttt{MjSpec.\allowbreak attach} 动态组合 & \cref{sec:rlmc-assets-zoo} & 3 \\
+13 & 双框架对齐：对齐什么、什么交给 DR & \cref{sec:rlmc-assets-align} & 3 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+下一步（承接全书主线）：本章产出的「可训练资产」是后续训练章的地基。若资产有错（关节方向反、惯量不合法、collision 过精细），\cref{ch:rlmc-training} 的 PPO 训练、\cref{ch:rlmc-imitation} 的模仿学习都会被放大成「难收敛」。验证不是可选项，是开训前的必修。
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-assets-further}
+
+\begin{itemize}
+  \item \textbf{MuJoCo 建模文档}（mujoco.readthedocs.io）——MJCF 的权威参考，含全部元素与属性；教你 default/actuator/contact 的精确语义。
+  \item \textbf{MuJoCo Menagerie}（\texttt{google-deepmind/\allowbreak mujoco\_menagerie}）\,\cite{menagerie2022}——50+ 模型的转换 README 是最好的实战材料；教你真实的手动调优决策。
+  \item \textbf{Isaac Lab 资产导入文档}（isaac-sim.github.io/IsaacLab）——URDF/MJCF$\to$USD 的官方工作流与 v2.x 参数；教你 \texttt{UrdfConverterCfg} 的权威字段。
+  \item \textbf{CoACD}（Wei 等，SIGGRAPH 2022，arXiv:2205.02961）\,\cite{wei2022coacd}——碰撞感知凸分解；教你为何操作任务必用 CoACD 而非 V-HACD。
+  \item \textbf{Wensing 等 LMI 惯性辨识}（RA-L 2018，arXiv:1701.04395）\,\cite{wensing2018lmi}——pseudo-inertia 与物理一致性的数学基础；教你惯性 DR 该守的约束。
+  \item \textbf{foam}（CoMMA Lab，arXiv:2503.13704）\,\cite{foam2025}——URDF 几何的球近似工具；教你距离查询友好的碰撞表示。
+  \item \textbf{obj2mjcf}（\texttt{kevinzakka/\allowbreak obj2mjcf}）——复合 OBJ 处理与（基于 CoACD 的）凸分解；教你 Menagerie 式网格预处理。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-assets-troubleshoot}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{4.3cm}p{3.4cm}p{4.4cm}l@{}}
+\toprule
+症状 & 可能原因 & 排查/修复 & 相关节 \\
+\midrule
+MuJoCo 加载报 file not found & mesh 用 \texttt{package://} & 跑 \texttt{fix\_mesh\_paths}；查文件存在 & \cref{sec:rlmc-assets-sw2urdf} \\
+viewer 里一堆白方块 & \texttt{discardvisual} 未关 & URDF 加 \texttt{discardvisual="false"} 重转 & \cref{sec:rlmc-assets-mjcf} \\
+机器人在重力下瘫倒 & 无执行器 & 查 \texttt{<actuator>}；补 position 控制器 & \cref{sec:rlmc-assets-mjcf} \\
+关节旋转方向相反 & \texttt{<axis>} 方向错 & 查 SolidWorks 参考轴；改 \texttt{<axis xyz>} & \cref{sec:rlmc-assets-sw2urdf} \\
+仿真极慢（$<10$ fps） & collision 太精细 & V-HACD/CoACD 简化到 8--16 凸包或 primitive & \cref{sec:rlmc-assets-collision} \\
+MuJoCo 报 inertia too small & 惯量非法 & 跑 \texttt{check\_inertia}；修 CAD 密度；\texttt{inertiafromgeom} & \cref{sec:rlmc-assets-inertia} \\
+转换报 unexpected keyword & 用了旧 \texttt{default\_drive\_*} & 改 \texttt{joint\_drive=JointDriveCfg(...)} & \cref{sec:rlmc-assets-usd} \\
+找不到 convert\_urdf.py & 旧脚本路径 & 用 \texttt{scripts/\allowbreak tools/\allowbreak convert\_urdf.\allowbreak py} & \cref{sec:rlmc-assets-usd} \\
+Isaac Lab 转换后 mesh 丢失 & instanceable 文件没拷 & 连 \texttt{Props/} 一起迁移 & \cref{sec:rlmc-assets-usd} \\
+Isaac Lab 报 64 link 限制 & articulation 链太长 & 开 \texttt{merge\_fixed\_joints} 或简化末端 & \cref{sec:rlmc-assets-usd} \\
+合并 link 比预期多 & Isaac Sim 5.1 改了合并默认 & 钉旧版 importer 或显式处理带质量 link & \cref{sec:rlmc-assets-prep} \\
+两框架行为差异大 & 接触模型/默认参数不同 & 对齐 kp/kd/timestep；放宽 DR & \cref{sec:rlmc-assets-align} \\
+组合后碰撞异常 & 缺底盘-手臂碰撞排除 & 加 \texttt{<exclude>} 或调 contype/conaffinity & \cref{sec:rlmc-assets-zoo} \\
+惯性 DR 后 MuJoCo 报错 & 独立随机化破坏一致 & 改等比缩放；验 pseudo-inertia 正定 & \cref{sec:rlmc-assets-inertia} \\
+CoACD 凸包数过多 & threshold 太小 & 增大 threshold；减 \texttt{max\_convex\_hull} & \cref{sec:rlmc-assets-collision} \\
+夹具抓取空间被填平 & V-HACD/凸包填凹面 & 改 CoACD / \texttt{convex\_decomposition} & \cref{sec:rlmc-assets-collision} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-assets-versions}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}llL@{}}
+\toprule
+组件 & 本章基准 & 备注 \\
+\midrule
+Isaac Lab & 2.x 主线 & \texttt{UrdfConverterCfg} 用 \texttt{joint\_drive}/\allowbreak\texttt{collider\_type}；脚本在 \texttt{scripts/\allowbreak tools/\allowbreak } \\
+Isaac Sim & 4.5 / 5.x & 5.1 起改固定关节合并默认行为，Lab 钉旧 importer 兼容 \\
+MuJoCo & $\ge$ 3.x & \texttt{MjSpec} 模型编辑 API；\texttt{attach} 用 \texttt{frame=}/\allowbreak\texttt{site=}+\texttt{prefix} \\
+mjlab & 1.4.0 & 模型源自 Menagerie（asset\_zoo 内置 G1/Go1/YAM）；后端 MuJoCo-Warp + RSL-RL \\
+CoACD / obj2mjcf & 随 pip 最新 & obj2mjcf 现默认用 CoACD 做凸分解 \\
+UniLab & main（commit \texttt{99936e08}） & 后端 \texttt{mujoco-uni}=3.8.0 / \texttt{motrixsim-core}=0.8.2；资产 MJCF/Motrix XML，\textbf{不用 USD}；URDF 经 \texttt{unilab-import-robot} 导入 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{note}[本章与后续的连接]
+本章的执行器配置直接影响 \cref{ch:rlmc-obsact} 的动作空间映射；碰撞简化影响 \cref{ch:rlmc-dr} 的训练吞吐；pseudo-inertia 为 \cref{ch:rlmc-dr} 的惯性随机化提供正确方法；\texttt{MjSpec.\allowbreak attach} 是 loco-manipulation 复合系统的前置；双框架对齐的方法论将在 sim-to-real 场景再次用到。
+\end{note}

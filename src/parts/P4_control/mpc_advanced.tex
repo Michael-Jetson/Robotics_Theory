@@ -1,0 +1,803 @@
+\chapter{模型预测控制深化：稳定性、数值与鲁棒/随机 MPC}
+\label{ch:mpc-advanced}
+
+% ════════════════════════════════════════════════════════════════
+%  P4 控制部 · C1b 第 G 章「MPC 深化」
+%  源：Robotics_Tutorial 01_数学/40_控制理论/
+%      110_非线性MPC稳定性.md + 120_MPC数值求解与实时实现.md + 130_鲁棒与随机MPC.md
+%  定位（卷四《控制理论基础》，通用最优/鲁棒/安全控制，不限机器人形态）：
+%      导论 ch:control 的 sec:ctrl-mpc 已给 MPC 完整最小骨架（四条件 A0-A3 +
+%      主稳定性定理 thm:ctrl-mpc-main + 持久可行性 + condensing + Riccati）。
+%      本章绝不重证，只把三件导论完全没有的事讲透：
+%      (1) 稳定性深化（DARE 终端流水线 / Chen-Allgöwer / Grüne alpha_N / Economic / ISS）
+%      (2) 数值结构（转录条件数 / condensing↔Riccati 等价与病态继承 / RTI 收缩性）
+%      (3) 鲁棒随机（min-max / Pontryagin-mRPI / Tube 全族 / Scenario / Wasserstein DRO / DeePC-GP-PSF）
+%  勘误（已两轮联网核实，见设计稿§2 + 复审清单）：
+%      G1：Grüne alpha_N 闭式 = 1 - (γ_N-1)∏(γ_i-1) / [∏γ_i - ∏(γ_i-1)]（源式分子分母都错，用复审正确版）
+%      G2：Angeli 2012 EMPC DOI = 10.1109/TAC.2011.2179349（非源的 2176174）
+%      G3：RTI = SIAM JCO 2005（源对，勿被 H 误导，键 diehl2005realtime 勿撞 diehl2002rti）
+%      G4：Chen-Allgöwer 页码 1205-1217（复审实核：源正确，勿改 1218）
+% ════════════════════════════════════════════════════════════════
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{把抽象的四条件落成可计算设计}：从 DARE 解出 $P,K$，机械化地配出终端代价、终端椭球与解析的切约束半径 $\alpha^\star$，并把它推广到非线性的 Chen--Allgöwer 缩椭球；
+  \item \textbf{解释“无终端约束 MPC 为何 $N$ 大即稳”}：用代价可控性（cost controllability）给出 Grüne 的次优指数 $\alpha_N$ 与最小预测步数判据；
+  \item \textbf{处理经济型代价}：用严格耗散性与旋转代价把“目标不是跟踪”的 MPC 归约到标准稳定性理论，并理解它与 turnpike 的等价；
+  \item \textbf{看清 MPC 的数值结构}：单/多射击的条件数定理、condensing 与 Riccati 的等价与各自代价、以及实时迭代（RTI）的两阶段拆分与收缩性；
+  \item \textbf{量化标称 MPC 的固有鲁棒性}：用 ISS--MPC 的 Lyapunov 不等式说明“预测越远越怕扰动”；
+  \item \textbf{设计 Tube MPC}：从 Pontryagin 差与最小鲁棒不变集出发，给出刚性管道、约束收紧与递归可行性证明，并了解 Homothetic/Elastic/LPV/收缩管道全族；
+  \item \textbf{把概率约束变成可解问题}：机会约束的 SOCP 重构、Scenario 方法的样本复杂度、Wasserstein 分布鲁棒 MPC 的“鲁棒=正则化”视角；
+  \item \textbf{衔接数据驱动与安全}：DeePC 的鲁棒解读、GP--MPC 与预测安全滤波器，以及 MPC 与 CLF/CBF 的统一关系。
+\end{enumerate}
+
+\subsection*{承上：本章在控制理论主线中的位置}
+导论 \cref{ch:control} 的 \cref{sec:ctrl-mpc} 已经把模型预测控制（MPC）的“完整最小骨架”交代清楚：滚动时域最优控制问题（OCP）及其三要素（\cref{eq:ctrl-mpc-cost,eq:ctrl-mpc-constr}）、凝聚为二次规划（QP）的 condensing（\cref{eq:ctrl-condense-pred,eq:ctrl-mpc-qpform}）、持久可行性的控制不变集刻画（\cref{def:ctrl-invariant,lem:ctrl-pf1}）、以及最核心的\textbf{四条件框架与闭环渐近稳定性主定理}（\cref{def:ctrl-mpc-asm,thm:ctrl-mpc-main}，即 Mayne--Rawlings--Rao--Scokaert 2000 的全部）。这套骨架是本章的地基，\textbf{本章一律引用、绝不重证}。
+
+但导论刻意停在了“抽象层”：它告诉你“取 DARE 解作终端代价即可”（\cref{ex:ctrl-mpc-eq-lqr} 后的洞察），却没说怎么算终端椭球；它警告“$N$ 不是越大越好”（\cref{sec:ctrl-mpc-stability} 的 pitfall），却没给判据；它说 condensing 与 Riccati 是两条数值主线（\cref{sec:ctrl-mpc-numerical}），却没说二者为何等价、各自付出什么代价；它完全没碰真实世界的扰动、参数误差与分布不确定。本章正是要把名义 MPC 的稳定性\textbf{从抽象四条件落到可计算设计，再落到实时数值，最后落到鲁棒/随机的真实部署}——这是把 MPC“讲透”所缺的三块。
+
+\begin{note}
+\textbf{本章记号与约定}（与导论 \cref{sec:ctrl-mpc} 对齐）.\;
+状态 $x\in\mathbb R^{n_x}$、输入 $u\in\mathbb R^{n_u}$、动力学 $x^+=f(x,u)$；阶段代价 $\ell(x,u)$、终端代价 $V_f$、终端集 $\mathcal X_f$、终端律 $\kappa_f$，与 \cref{def:ctrl-mpc-asm} 同；预测时域 $N$ 步的最优值函数记 $V_N^\star(x)$（与导论 $V_N^0$ 同义，$\star$ 表“最优”）；滚动控制律 $\kappa_N$。
+
+\textbf{三处必须当心的记号冲突}（本章高频，先钉死）：
+\begin{itemize}
+  \item \textbf{六种 $\alpha$}：终端椭球切约束 $\alpha^\star$（\cref{sec:mpc-terminal}）；Chen--Allgöwer 非线性缩椭球 $\alpha_{\rm nl}$；最小鲁棒不变集的收缩率 $\bar\alpha\in[0,1)$（\cref{sec:mpc-mrpi}，满足 $A_K^s\mathcal W\subseteq\bar\alpha\mathcal W$）；Grüne 次优指数 $\alpha_N$（\cref{sec:mpc-noterminal}）；Homothetic 管道缩放因子 $\alpha_k$；以及 $\mathcal K_\infty$ 类比较函数 $\alpha_1,\alpha_2,\alpha_\ell(\cdot)$（永远带宗量）。下标/上标已区分，遇到时看清。
+  \item \textbf{$\sigma_{\mathcal B}(\cdot)$ 表支持函数}（$\sigma_{\mathcal B}(f)=\max_{b\in\mathcal B}f^\top b$，\cref{sec:mpc-mrpi}），\textbf{$h(x)$ 留给安全函数}（CBF，\cref{sec:mpc-clf-cbf}）——避免二者撞 $h$。
+  \item \textbf{集合记号}：扰动集 $\mathcal W$、参数集 $\Theta$、分布模糊集 $\mathcal P_{\rm amb}$、管道截面 $\mathcal Z$（不写 $\mathbb Z$，免与整数集混）；Minkowski 和 $\oplus$、Pontryagin 差 $\ominus$（此处是集合差，与李群右差不同）。
+\end{itemize}
+\textbf{分工声明}：四条件主证、condensing/Riccati 的“是什么”归导论 \cref{sec:ctrl-mpc}；Bellman 最优性原理归 \cref{ch:dp-hjb}、DARE 存在唯一性归 \cref{ch:lqr-lqg-riccati}、ISS/$\mathcal K_\infty$/$\mathcal{KL}$/收缩度量归 \cref{ch:lyapunov-stability}、CBF/HOCBF 主理论归 \cref{ch:clf-cbf}、Willems 引理与 DeePC$\leftrightarrow$MPC 等价归 \cref{ch:robust-hinf}；NMPC 的内层求解器（DDP/iLQR、约束 DDP）归 \cref{ch:ddp-ilqr}；采样型 MPC（MPPI）归 \cref{ch:mppi}。本章在各处交叉引用指向之，只补增量视角。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{从值函数到可行域：DP 递归与第四条件}
+\label{sec:mpc-dp-recursion}
+
+\paragraph{动机：把稳定性证明的“前提”补齐。}
+导论的主定理（\cref{thm:ctrl-mpc-main}）在“四条件成立”的假设下证出了闭环渐近稳定。但要真正使用它，还需两件导论一笔带过的事：其一，最优值函数本身是怎么递归生成的、可行域如何随时域嵌套；其二，四条件里“终端代价是某局部反馈下无限时域代价的上界”这条（记为 (A4)）的来由。本节补齐这两块，作为后续可计算设计的桥。
+
+\paragraph{动态规划递归与可行域嵌套。}
+记 $V_j^\star(x)$ 为预测时域 $j$、初始状态 $x$ 的最优值函数。由 Bellman 最优性原理（见 \cref{ch:dp-hjb} 的 \cref{eq:ctrl-bellman}，本章不重证），它满足后向递归
+\begin{equation}
+  V_j^\star(x)=\min_{u\in\mathbb U}\ \big\{\ell(x,u)+V_{j-1}^\star\big(f(x,u)\big)\big\},\qquad V_0^\star(x)=V_f(x),
+  \label{eq:mpc-dp-recursion}
+\end{equation}
+其中最小化受 $f(x,u)$ 落在第 $j-1$ 步可行域内的约束。记 $\mathcal X_j:=\{x:\text{时域 }j\text{ 的 OCP 可行}\}$，则有\textbf{可行域嵌套}
+\begin{equation}
+  \mathcal X_f\subseteq \mathcal X_1\subseteq \mathcal X_2\subseteq\cdots\subseteq \mathcal X_N\subseteq \mathcal X_\infty,
+  \label{eq:mpc-feasible-nest}
+\end{equation}
+直觉清晰：可用的步数越多，能在 $N$ 步内被驱入终端集 $\mathcal X_f$ 的初始状态集越大；当 $N\to\infty$ 时它收敛到最大可控不变集 $\mathcal X_\infty$。这条嵌套是“增大 $N$ 扩大吸引域”的精确含义——但它\emph{不}自动带来稳定性，后者仍要靠终端配料（\cref{thm:ctrl-mpc-main}）。
+
+\paragraph{第四条件：终端代价作无限时域代价上界。}
+导论的四条件（\cref{def:ctrl-mpc-asm}）以 (A0)--(A3) 给出。它们等价于一条更具操作性的陈述，本书记为 (A4)：
+
+\begin{proposition}[终端代价的无限时域上界刻画]
+\label{prop:mpc-a4}
+设存在局部终端律 $\kappa_f$ 与正不变终端集 $\mathcal X_f$，使 (A2) 的下降不等式 $V_f(f(x,\kappa_f(x)))-V_f(x)\le -\ell(x,\kappa_f(x))$ 对所有 $x\in\mathcal X_f$ 成立。则 $V_f$ 是 $\kappa_f$ 下闭环无限时域代价的上界：
+\begin{equation}
+  V_f(x)\ \ge\ \sum_{k=0}^{\infty}\ell\big(x_k,\kappa_f(x_k)\big)\ =:\ V_\infty^{\kappa_f}(x),\qquad \forall x\in\mathcal X_f,
+  \label{eq:mpc-a4}
+\end{equation}
+其中 $x_{k+1}=f(x_k,\kappa_f(x_k))$，$x_0=x$。
+\end{proposition}
+
+\begin{proof}
+对 (A2) 沿闭环轨迹自 $k=0$ 到 $T-1$ 做望远镜求和（telescoping）：
+\[
+  V_f(x_T)-V_f(x_0)\ \le\ -\sum_{k=0}^{T-1}\ell(x_k,\kappa_f(x_k)).
+\]
+$\mathcal X_f$ 正不变保证 $x_T\in\mathcal X_f$，$V_f\ge 0$，故 $\sum_{k=0}^{T-1}\ell\le V_f(x_0)-V_f(x_T)\le V_f(x_0)$。令 $T\to\infty$ 即得 \cref{eq:mpc-a4}。
+\end{proof}
+
+\begin{insight}
+(A4) 是理解全部 MPC 终端配料的一句话：\textbf{终端代价 $V_f$ 在“假装从 $x_N$ 起切换到局部律 $\kappa_f$ 一直跑到无穷”的代价之上}。于是 $N$ 步精确代价加上 $V_f$，就是对无限时域最优代价的一个上界——MPC 用“有限时域 + 一条无限尾巴”逼近了它本想求却无法求的无限时域最优控制。这正是\cref{ch:lqr-lqg-riccati} 里“短时域 LQR 最优却不稳、无限时域才稳”教训的 MPC 解法。
+\end{insight}
+
+\begin{remark}
+\textbf{去掉某条会怎样？}（导论 pitfall 的反事实化）去掉 (A1) 终端集正不变 $\Rightarrow$ 移位候选解不再可行，递归可行性断裂；去掉 (A2) 下降 $\Rightarrow$ $V_N^\star$ 不再是 Lyapunov 函数，可能漂移；去掉 (A0) 阶段代价正定 $\Rightarrow$ 只能保证收敛到 $\ell=0$ 的流形而非原点（对二次代价可松弛为 $(A,Q^{1/2})$ 可检测）；去掉终端配料而仅增大 $N$ $\Rightarrow$ 进入 \cref{sec:mpc-noterminal} 的无终端约束分析，需另立判据。
+\end{remark}
+
+% ════════════════════════════════════════════════════════════════
+\section{终端配料的可计算设计：DARE \texorpdfstring{$\to P\to K\to$}{ -> P -> K -> } 椭球}
+\label{sec:mpc-terminal}
+
+\paragraph{动机：把四条件变成代码。}
+\cref{prop:mpc-a4} 把终端配料的存在性讲清了，但工程师要的是\emph{构造}：给定线性系统 $(A,B,Q,R)$，如何机械地产出满足四条件的 $(V_f,\mathcal X_f,\kappa_f)$？答案是\textbf{LQR 终端设计流水线}，覆盖了 95\% 的线性或可线性化 MPC 应用。
+
+\paragraph{线性机械化五步。}
+设 $(A,B)$ 可镇定、$\ell(x,u)=x^\top Qx+u^\top Ru$，$Q\succeq0$ 且 $(A,Q^{1/2})$ 可检测、$R\succ0$。
+
+\textbf{第一步——解离散代数 Riccati 方程（DARE）}（\cref{ch:lqr-lqg-riccati} 已证存在唯一，本章只用解）：
+\begin{equation}
+  P=A^\top PA-A^\top PB(R+B^\top PB)^{-1}B^\top PA+Q,\qquad P\succ0.
+  \label{eq:mpc-dare}
+\end{equation}
+此 $P$ 即无限时域 LQR 的值函数 Hessian（与导论 \cref{eq:ctrl-dare} 同）。
+
+\textbf{第二步——LQR 增益}：$K=-(R+B^\top PB)^{-1}B^\top PA$，闭环 $A_K:=A+BK$ Schur 稳定（特征值在单位圆内）。
+
+\textbf{第三步——取 $V_f(x)=x^\top Px$、$\kappa_f(x)=Kx$}。此时 (A2) 不是\emph{近似}满足，而是\textbf{取等号}：把 DARE \cref{eq:mpc-dare} 与 $K$ 的定义代入可得 Lyapunov 等式
+\begin{equation}
+  A_K^\top PA_K-P=-(Q+K^\top RK),
+  \label{eq:mpc-dare-lyap}
+\end{equation}
+于是
+\begin{equation}
+  V_f(A_Kx)-V_f(x)=x^\top(A_K^\top PA_K-P)x=-x^\top(Q+K^\top RK)x=-\ell(x,Kx).
+  \label{eq:mpc-a2-equality}
+\end{equation}
+这正是导论“DARE 终端 = LQR 退化”那句洞察的完整证据：LQR 终端代价不仅满足 (A2)，而且是\emph{最紧}的满足方式。
+
+\textbf{第四步——终端椭球 $\mathcal X_f=\{x:x^\top Px\le\alpha\}$}。由 \cref{eq:mpc-a2-equality}，对任意 $\alpha>0$，$x^\top Px\le\alpha\Rightarrow (A_Kx)^\top P(A_Kx)=x^\top Px-\ell(x,Kx)\le\alpha$，故该椭球对 $A_K$\emph{无条件}正不变。约束来自第五步。
+
+\textbf{第五步——最大化 $\alpha$ 使 $Kx\in\mathbb U$ 且 $x\in\mathbb X$}。把输入/状态约束统一写成半空间 $c_\ell^\top x\le b_\ell$（$\ell=1,\dots,L$）。椭球内 $c_\ell^\top x$ 的最大值经支持函数计算（见下推导）为 $\sqrt{\alpha\,c_\ell^\top P^{-1}c_\ell}$，令其 $\le b_\ell$ 得解析切约束
+\begin{equation}
+  \boxed{\ \alpha^\star=\min_{\ell=1,\dots,L}\ \frac{b_\ell^2}{c_\ell^\top P^{-1}c_\ell}\ }.
+  \label{eq:mpc-alpha-star}
+\end{equation}
+
+\begin{derivation}[椭球切约束 $\alpha^\star$ 的 Lagrange 推导]
+求 $\max\{c^\top x:x^\top Px\le\alpha\}$。最优在边界，用 Lagrange：$\nabla(c^\top x)=\lambda\nabla(x^\top Px)$ 给 $c=2\lambda Px$，即 $x=\tfrac1{2\lambda}P^{-1}c$。代回 $x^\top Px=\alpha$ 得 $\tfrac1{4\lambda^2}c^\top P^{-1}c=\alpha$，故 $\lambda=\tfrac12\sqrt{c^\top P^{-1}c/\alpha}$，最大值 $c^\top x=\tfrac1{2\lambda}c^\top P^{-1}c=\sqrt{\alpha\,c^\top P^{-1}c}$。令 $\le b$ 得 $\alpha\le b^2/(c^\top P^{-1}c)$，对所有约束取最小即 \cref{eq:mpc-alpha-star}。
+\end{derivation}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, scale=1.0]
+  % constraint half-spaces (a box) and inscribed ellipse
+  \draw[thick, main!70!black] (-2.6,-1.7) rectangle (2.6,1.7);
+  \node[main!70!black, font=\small] at (2.05,1.45) {$\mathbb X\cap\{Kx\in\mathbb U\}$};
+  % the P-ellipse (tilted)
+  \begin{scope}[rotate=20]
+    \draw[thick, second!70!black, fill=second!12] (0,0) ellipse (2.05 and 1.15);
+  \end{scope}
+  \node[second!70!black, font=\small] at (-1.15,-0.95) {$\mathcal X_f=\{x^\top Px\le\alpha^\star\}$};
+  % tangent contact point
+  \fill[third!70!black] (2.6,0.78) circle (1.6pt);
+  \node[third!70!black, font=\scriptsize, right=1pt] at (2.6,0.78) {切点 $c_\ell^\top x=b_\ell$};
+  % flow arrows inside ellipse pointing to origin (A_K contraction)
+  \foreach \a in {30,120,210,300}{
+    \draw[->, gray!60!black] (\a:1.6) -- (\a:0.7);
+  }
+  \fill (0,0) circle (1.2pt); \node[font=\scriptsize, below right] at (0,0) {$0$};
+\end{tikzpicture}
+\caption{终端椭球设计：$P$（DARE 解）给定椭球形状与内部的 $A_K$ 收缩流（箭头指向原点），$\alpha^\star$ 由 \cref{eq:mpc-alpha-star} 取到椭球与约束多面体的最近切点。}
+\label{fig:mpc-terminal-ellipse}
+\end{figure}
+
+\paragraph{非线性推广：Chen--Allgöwer 拟无限时域。}
+对 $f\in C^1$、$f(0,0)=0$，在原点线性化得 $A=\partial_xf|_0,B=\partial_uf|_0$，照样解 DARE 得 $P,K$。\textbf{关键区别}：(A2) 在线性情形全局取等，但非线性的高阶余项 $r(x):=f(x,Kx)-A_Kx=O(\|x\|^2)$ 在远离原点处可能把 Lyapunov 下降翻成上升。Chen--Allgöwer 的对策是\textbf{缩小椭球}，使余项被线性下降“吃掉”。
+
+\begin{theorem}[Chen--Allgöwer 拟无限时域终端集\cite{chenallgower1998qih}]
+\label{thm:mpc-chen-allgower}
+存在 $\alpha_{\rm nl}>0$ 与 $\kappa\in(0,1)$，使在缩椭球 $\{x^\top Px\le\alpha_{\rm nl}\}$ 内
+\[
+  V_f(f(x,Kx))-V_f(x)\le-(1-\kappa)\,\ell(x,Kx),
+\]
+即 (A2) 以松弛因子 $(1-\kappa)$ 成立。终端集取 $\alpha_{\rm final}=\min(\alpha_{\rm nl},\alpha^\star)$。
+\end{theorem}
+
+\begin{proof}[证明骨架（四步估计）]
+设 $\|r(x)\|\le L_r\|x\|^2$（$L_r$ 由 $f$ 的二阶导界给出）。展开
+\[
+  V_f(f(x,Kx))-V_f(x)=\underbrace{x^\top(A_K^\top PA_K-P)x}_{=-x^\top(Q+K^\top RK)x}+2x^\top A_K^\top Pr(x)+r(x)^\top Pr(x).
+\]
+后两项界为 $2L_r\|A_K^\top P\|\,\|x\|^3$ 与 $\|P\|L_r^2\|x\|^4$。要使总和 $\le-(1-\kappa)\lambda_{\min}(Q+K^\top RK)\|x\|^2$，只需
+\[
+  2L_r\|A_K^\top P\|\,\|x\|+\|P\|L_r^2\|x\|^2\le\kappa\,\lambda_{\min}(Q+K^\top RK).
+\]
+这是关于 $\|x\|$ 的单调不等式；取椭球内最大半径 $\|x\|_{\max}=\sqrt{\alpha_{\rm nl}/\lambda_{\min}(P)}$ 解之即定出 $\alpha_{\rm nl}$。再与线性切约束取小者保证输入容许。
+\end{proof}
+
+\begin{remark}
+若想绕过“先解 DARE 再缩椭球”的两步、直接联合优化 $(P,\alpha)$，可写成半定规划：以 Schur 补把 $A_K^\top PA_K-P+Q+K^\top RK\preceq0$ 线性化，并经变量替换 $W=P^{-1},Y=KW$ 化为标准 LMI，目标 $\max\alpha$ 受 $\alpha b_\ell^2\ge c_\ell^\top P^{-1}c_\ell$。这交由 \cref{ch:nlopt} 的 SDP 求解器处理，本章只给数学形式。
+\end{remark}
+
+\begin{pitfall}
+\textbf{终端权重不能手调。}\;最常见的错误是把 $V_f=x^\top \tilde Px$ 的 $\tilde P$ 当成可调旋钮随意取正定矩阵——这几乎必然破坏 \cref{eq:mpc-a2-equality} 的等号，闭环漂移或发散。唯一安全做法是严格解 DARE 并验证 \cref{eq:mpc-dare-lyap}。非线性系统切忌直接套用线性 $\alpha^\star$（不缩椭球），高阶项会颠覆下降。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{无终端约束 MPC：N 足够大即稳}
+\label{sec:mpc-noterminal}
+
+\paragraph{动机：终端集是有代价的。}
+\cref{sec:mpc-terminal} 的流水线优雅，但终端约束 $x_N\in\mathcal X_f$ 会\emph{收缩可行域}（\cref{eq:mpc-feasible-nest} 中 $\mathcal X_f$ 最小）。强非线性或大扰动系统的终端椭球可能很小，逼得 MPC 只能从原点附近起步。工业实践里许多实现干脆设 $\mathcal X_f=\mathbb X$、$V_f=0$，只留阶段代价与约束——这就是\textbf{无终端约束 MPC}。导论的 pitfall 只警告“此时单纯增大 $N$ 不保证稳”，本节给出它\emph{何时}稳的定量判据。
+
+\paragraph{三大流派。}
+（i）\textbf{Jadbabaie--Hauser}（CLF 作终端代价\cite{jadbabaie2005receding}）：若 $V_f$ 是某个“足够好”的近似值函数（满足 $V_f(f(x,u))-V_f(x)\le-\ell(x,u)+\varepsilon(x)$，误差 $\varepsilon$ 随步数被阶段代价稀释），则存在 $N^\star$ 使 $N\ge N^\star$ 时闭环稳定。（ii）\textbf{Grüne 代价可控性}\cite{gruene2009analysis,gruenepannek2017nmpc}：给出 $N^\star$ 的\emph{显式}公式，最具操作性，是本节主线。（iii）\textbf{Limón 受约束版}\cite{limon2006stability}：在受约束线性系统上给出吸引域的显式刻画。
+
+\begin{definition}[指数代价可控性]
+\label{def:mpc-cost-controllability}
+存在 $C\ge1$、$\sigma\in(0,1)$，使对所有 $x$ 存在可行控制 $\mathbf u$ 满足
+\begin{equation}
+  \ell(x_k,u_k)\le C\sigma^k\,\ell^\star(x),\qquad k=0,1,\dots,\quad \ell^\star(x):=\min_u\ell(x,u).
+  \label{eq:mpc-cost-control}
+\end{equation}
+\end{definition}
+
+\noindent{}对线性 $(A,B)$ 在 LQR 反馈 $K$ 下这自然满足：$\|A_K^kx\|\le\rho^k\|x\|$（$\rho=\|A_K\|<1$）给 $\ell(x_k,Kx_k)\le c\rho^{2k}\ell^\star(x)$，即 $C=c$、$\sigma=\rho^2$。
+
+\begin{theorem}[Grüne 次优指数 $\alpha_N$\cite{gruene2009analysis,gruenepannek2017nmpc}]
+\label{thm:mpc-gruene}
+定义 $\gamma_N:=\sum_{k=0}^{N-1}C\sigma^k=C\dfrac{1-\sigma^N}{1-\sigma}$。则无终端约束 MPC（控制时域 $m=1$）的次优指数为
+\begin{equation}
+  \boxed{\ \alpha_N=1-\frac{(\gamma_N-1)\,\prod_{i=2}^{N}(\gamma_i-1)}{\prod_{i=2}^{N}\gamma_i-\prod_{i=2}^{N}(\gamma_i-1)}\ }.
+  \label{eq:mpc-alpha-N}
+\end{equation}
+若 $\alpha_N>0$，则闭环渐近稳定（$V_N^\star$ 为 Lyapunov 函数），且无限时域性能界
+\begin{equation}
+  V_\infty^{\kappa_N}(x)\le\alpha_N^{-1}\,V_\infty^{\star}(x).
+  \label{eq:mpc-perf-bound}
+\end{equation}
+\end{theorem}
+
+\begin{proof}[证明骨架（relaxed DP，三步）]
+\textbf{第一步（值函数上界）}：由 \cref{eq:mpc-cost-control}，最优不劣于代价可控序列，$V_N^\star(x)\le\sum_{k=0}^{N-1}C\sigma^k\ell^\star(x)=\gamma_N\ell^\star(x)$；又 $V_N^\star(x)\ge\ell^\star(x)$，故 $\ell^\star(x)\le V_N^\star(x)\le\gamma_N\ell^\star(x)$。
+\textbf{第二步（relaxed DP 不等式）}：无终端约束时标准下降 $V_N^\star(x^+)\le V_N^\star(x)-\ell(x,\kappa_N(x))$ 不再直接成立，但用上界可证存在 $\alpha\in(0,1]$ 使 $V_N^\star(x^+)\le V_N^\star(x)-\alpha\,\ell(x,\kappa_N(x))$；只要 $\alpha>0$ 它就是 Lyapunov 函数。
+\textbf{第三步（解出 $\alpha$）}：把 relaxed DP 不等式对 $N-1,N-2,\dots,2$ 步 OCP 递归展开，代数约简得 \cref{eq:mpc-alpha-N}（Grüne--Pannek 2017 定理 6.15 的 $m=1$ 退化）。$\gamma_N$ 越大（$N$ 越大或 $\sigma$ 越小），$\alpha_N\to1$，逼近精确 Lyapunov 下降；$\gamma_N$ 太小则 $\alpha_N<0$，不稳。
+\end{proof}
+
+\begin{note}
+\textbf{关于 \cref{eq:mpc-alpha-N} 的形式}（订正提示）.\;此处的闭式取自 Grüne--Pannek--Seehafer--Worthmann 一般控制时域结果（$m=1,\omega=1$ 退化）：分子带一个额外的 $(\gamma_N-1)$ 因子，分母为 $\prod_{i=2}^N\gamma_i-\prod_{i=2}^N(\gamma_i-1)$。若读者在某些教材里见到分母写作 $\prod(\gamma_k-1)$、或分子写作 $(\gamma_N-1)^N$，那是不完整/讹传的版本——\emph{结论方向相同}（$\gamma_N$ 大则 $\alpha_N\to1$），但用于反解 $N^\star$ 时须以 \cref{eq:mpc-alpha-N} 为准。
+\end{note}
+
+\paragraph{最小预测步数估算。}
+实操：（i）估 $C\approx\sigma_{\max}(P)/\lambda_{\min}(Q)$、$\sigma\approx\rho(A_K)^2$；（ii）从 $N=1$ 递增算 $\alpha_N$，取使 $\alpha_N>0$ 的最小 $N^\star$；（iii）实际取 $N\approx1.5N^\star$ 留余量。经验上 $N=10\sim30$ 在百 Hz 至千 Hz 回路里足以让四足/无人机 MPC 稳定。
+
+\begin{remark}
+\textbf{$\alpha_N<0$ 会怎样？}\;MPC 可能“一直能解却永远收敛不到目标”——状态在目标附近来回摆动，这是有限视野的“近视效应”：当前步选了局部最优但长期有害的动作（类似贪心陷阱）。\textbf{“去掉终端约束一定更好”也是误解}：它确实扩大可行域，但代价是需要更大的 $N$；嵌入式平台 $N$ 受限时，带终端约束的短 $N$ 反而更合适——这是\emph{可行域与算力}的权衡。
+\end{remark}
+
+% ════════════════════════════════════════════════════════════════
+\section{经济型 MPC：耗散性与旋转代价}
+\label{sec:mpc-economic}
+
+\paragraph{动机：当“最优”不是“跟踪”。}
+前几节默认阶段代价 $\ell$ 是正定的跟踪型（$\ell\ge\alpha_\ell(\|x\|)$）。但许多真实目标是\emph{经济指标}：最小化能耗 $\ell_e=P_{\rm motor}(u)$、最大化产率 $\ell_e=-\mathrm{yield}(x,u)$、时间最优 $\ell_e=1$、或随价格变化的调度 $\ell_e=\mathrm{price}(t)P(u)$。这些 $\ell_e$ \emph{不正定}，最优运行点未必是某个预设平衡，标准四条件理论失效。Economic MPC 处理的正是这一类——这是导论\emph{完全没有}的方向。
+
+\paragraph{最优稳态与严格耗散性。}
+先解静态优化定出最优稳态 $\min\ell_e(x,u)$ s.t.\ $x=f(x,u)$，得 $(x_s,u_s)$。
+
+\begin{definition}[严格耗散性\cite{angeli2012economic}]
+\label{def:mpc-dissipativity}
+系统关于代价 $\ell_e$ 在 $(x_s,u_s)$ 处\textbf{严格耗散}，若存在连续存储函数 $\lambda$（$\lambda(x_s)=0$）与 $\mathcal K_\infty$ 函数 $\rho$，使
+\begin{equation}
+  \lambda(f(x,u))-\lambda(x)\le\ell_e(x,u)-\ell_e(x_s,u_s)-\rho(\|x-x_s\|).
+  \label{eq:mpc-dissipativity}
+\end{equation}
+\end{definition}
+
+\begin{insight}
+\cref{eq:mpc-dissipativity} 是热力学耗散不等式的控制版本：$\lambda$ 是“内能”（存储），$\ell_e-\ell_e(x_s,u_s)$ 是“供给率”，$\rho$ 是“真正耗散掉的部分”。系统沿任何轨迹运行时存储的增加不超过供给减去耗散——意味着\emph{不可能永远偏离稳态而不付代价}。
+\end{insight}
+
+\paragraph{旋转代价：把经济问题变回跟踪问题。}
+定义\textbf{旋转代价}\cite{diehl2011lyapunov}
+\begin{equation}
+  \tilde\ell(x,u):=\ell_e(x,u)-\ell_e(x_s,u_s)+\lambda(x)-\lambda(f(x,u)).
+  \label{eq:mpc-rotated-cost}
+\end{equation}
+
+\begin{theorem}[旋转代价的等价与正定性]
+\label{thm:mpc-rotated}
+在严格耗散性下，旋转代价满足：(i) $\tilde\ell(x,u)\ge\rho(\|x-x_s\|)\ge0$（\textbf{正定}），$\tilde\ell(x_s,u_s)=0$；(ii) 用 $\tilde\ell$ 替换 $\ell_e$ 的 OCP 与原 OCP \textbf{有相同的最优控制序列}。因此 Economic MPC 的稳定性归约到标准四条件理论（\cref{thm:ctrl-mpc-main}）。
+\end{theorem}
+
+\begin{proof}
+(i) 直接由 \cref{eq:mpc-dissipativity} 代入 \cref{eq:mpc-rotated-cost}。
+(ii) 计算旋转后总代价，存储项望远镜相消：
+\[
+  \sum_{k=0}^{N-1}\tilde\ell(x_k,u_k)=\sum_{k=0}^{N-1}\ell_e(x_k,u_k)-N\ell_e(x_s,u_s)+\underbrace{\lambda(x_0)-\lambda(x_N)}_{\text{telescope}}.
+\]
+$-N\ell_e(x_s,u_s)+\lambda(x_0)$ 是不依赖控制序列的常数；终端约束 $x_N=x_s$（或带终端集的弱化）使 $\lambda(x_N)$ 亦为常数。故最优控制序列不变。再由 (i) 的正定性，旋转后 OCP 满足 (A0)，标准 Lyapunov 证明直接适用。
+\end{proof}
+
+\begin{insight}
+旋转代价的天才之处：\textbf{存储函数 $\lambda$ 扮演“坐标变换”}，把经济代价空间里非正定的 landscape 变成跟踪代价空间里正定的 landscape，而\emph{不改变最优轨迹}——如同物理中选合适坐标系简化运动方程，物理没变但数学好处理了。
+\end{insight}
+
+\begin{theorem}[Angeli--Amrit--Rawlings 主定理\cite{angeli2012economic}]
+\label{thm:mpc-angeli}
+在严格耗散性与终端约束 $x_N=x_s$（或弱化版）下：(i) 平均性能不劣于最优稳态，$\limsup_{T\to\infty}\tfrac1T\sum_{k=0}^{T-1}\ell_e(x_k,u_k)\le\ell_e(x_s,u_s)$；(ii) $(x_s,u_s)$ 是闭环渐近稳定平衡。
+\end{theorem}
+
+\paragraph{必要性与 turnpike 等价。}
+Müller--Angeli--Allgöwer 证明在温和条件下严格耗散性是 Economic MPC 渐近稳定的\emph{必要}条件；Grüne--Müller 进一步给出\textbf{严格耗散性 $\Longleftrightarrow$ turnpike 性质}。turnpike（收费公路）性质指：无论起点终点如何，最优轨迹的中段几乎全程紧贴最优稳态 $x_s$——“上高速、走主路、下高速”。这给了 Economic MPC 一个可视的诊断：跑一段长时域开环最优，若中段贴住 $x_s$，则耗散性很可能成立。
+
+\begin{remark}
+\textbf{工程诊断流程}：(1) 解静态优化定 $(x_s,u_s)$（若有多个稳态极小，可能出现极限环而非渐近稳定）；(2) 长时域开环最优看 turnpike；(3) 对线性+二次经济代价取 $\lambda(x)=(x-x_s)^\top\Lambda(x-x_s)+\lambda_0^\top(x-x_s)$，解 SDP 定 $\Lambda,\lambda_0$（非线性用 SOS 寻多项式 $\lambda$）；(4) 网格上验 \cref{eq:mpc-dissipativity}，若 $\rho$ 下界太小（如 $10^{-8}\|x-x_s\|^2$）则理论成立但实际余量不足，需改代价或约束。
+\end{remark}
+
+% ════════════════════════════════════════════════════════════════
+\section{MPC 的数值结构：转录、Condensing\texorpdfstring{$\leftrightarrow$}{<->}Riccati、RTI}
+\label{sec:mpc-numerical}
+
+\paragraph{动机：导论给了“是什么”，本节给“为什么”。}
+导论 \cref{sec:ctrl-mpc-numerical} 列了 condensing 与 Riccati 两条数值主线，但没说：单射击为何病态、多射击为何救场、condensing 与 Riccati 谁更快又各付什么代价、以及实时 MPC 凭什么能“每周期只迭代一次还稳”。本节补齐这条数值理论。NMPC 的内层求解器（DDP/iLQR、约束 DDP）见 \cref{ch:ddp-ilqr}，本节聚焦外层结构与实时迭代。
+
+\subsection{三大转录与条件数定理}
+\label{sec:mpc-transcription}
+把连续 OCP 离散为有限维非线性规划（NLP）有三法。\textbf{单射击}只留控制序列 $z=(u_0,\dots,u_{N-1})$，状态经积分器显式前向消去——变量最少、无等式约束，但有致命缺陷：
+
+\begin{theorem}[单/多射击条件数\cite{bockplitt1984multiple}]
+\label{thm:mpc-shooting-cond}
+对线性不稳定系统（$A$ 有特征值实部 $\lambda>0$，时域长 $T$）：单射击约化 Hessian 的条件数指数爆炸
+\begin{equation}
+  \mathrm{cond}(\tilde H_{\rm SS})\ge c_1e^{2\lambda T};
+  \label{eq:mpc-ss-cond}
+\end{equation}
+而\textbf{多射击}（节点状态与控制同为变量、动力学以等式约束 $x_{k+1}-\phi_k(x_k,u_k)=0$ 出现）把时域切成 $N$ 段，每段长 $T/N$，条件数降为
+\begin{equation}
+  \mathrm{cond}(H_{\rm MS})\le c_2e^{2\lambda T/N}.
+  \label{eq:mpc-ms-cond}
+\end{equation}
+\end{theorem}
+
+\begin{proof}[证明思路]
+解析解 $x(T)=e^{AT}x_0+\int_0^Te^{A(T-\tau)}Bu\,d\tau$，单射击目标 Hessian 含 $\int e^{A^\top(T-\tau_1)}Qe^{A(T-\tau_2)}d\tau$ 型项，其最大特征值沿不稳定方向 $\sim e^{2\lambda T}$、最小 $\sim1$，条件数指数增长。多射击每段积分长度仅 $T/N$，不稳定模式放大因子从 $e^{\lambda T}$ 降到 $e^{\lambda T/N}$——这是 Bock 的原始动机：\textbf{把一个不稳定的边值问题（BVP）切成多个稳定的初值问题（IVP）段}。
+\end{proof}
+
+\begin{insight}
+\cref{thm:mpc-shooting-cond} 是多射击的存在理由。对倒立摆（$\lambda\approx3$，$T=2$\,s），单射击条件数 $\sim e^{12}\approx1.6\times10^5$，逼近双精度极限；切成 $N=20$ 段后降到 $e^{0.6}\approx1.8$。代价是引入了 $N$ 个动力学等式约束、KKT 系统变大——但它具有 \textbf{块三对角}结构，正是下面 Riccati 能高效求解的根源。\textbf{直接配点}（状态/控制用分段多项式、配点处强制 defect 约束）是多射击的连续极限，Hermite--Simpson 达 4 阶、Radau IIA 为 L 稳定（适合刚性系统）、Legendre--Gauss--Radau 在\emph{真解解析}时谱（指数）收敛 $\|\hat x-x^\star\|_\infty\le C\sigma^{-N}$（$\sigma>1$；解仅 $C^k$ 时退化为代数收敛 $O(N^{-k})$）。
+\end{insight}
+
+\subsection{Condensing 与 Riccati：等价、代价与病态继承}
+\label{sec:mpc-condensing}
+\paragraph{Condensing 完整推导。}
+导论 \cref{eq:ctrl-condense-pred} 已给预测矩阵 $\boldsymbol\Gamma$，这里补 flop 与病态分析。动力学递推 $x_k=\boldsymbol\Phi_kx_0+\sum_j\boldsymbol\Gamma_{k,j}u_j+\hat x_k$ 堆叠为 $\mathbf x=\boldsymbol\Phi x_0+\boldsymbol\Gamma\mathbf u+\hat{\mathbf x}$，其中 $\boldsymbol\Gamma$ 是\emph{下三角块}（因果性）。代入二次代价并按 $\mathbf u$ 整理得稠密 QP，Hessian
+\begin{equation}
+  \tilde H=\boldsymbol\Gamma^\top\mathbf Q\boldsymbol\Gamma+\mathbf R,\qquad \mathbf Q=\mathrm{blkdiag}(Q_k),\ \mathbf R=\mathrm{blkdiag}(R_k).
+  \label{eq:mpc-condensed-H}
+\end{equation}
+构造 $\boldsymbol\Gamma$ 与 $\tilde H$ 的开销为 $O(N^2n_x^2n_u)+O(N^2n_xn_u^2)$，求解稠密 QP 为 $O((Nn_u)^3)$；决策变量只剩 $\mathbf u\in\mathbb R^{Nn_u}$，\emph{与状态数无关}（导论强调的收益）。
+
+\paragraph{Riccati 作 KKT 求解器。}
+保留所有 $x_k,u_k$ 则 KKT 是块三对角，可经 Riccati 后向递推求解：
+\begin{equation}
+  P_N=Q_N,\quad P_k=Q_k+A_k^\top P_{k+1}A_k-(S_k+B_k^\top P_{k+1}A_k)^\top(R_k+B_k^\top P_{k+1}B_k)^{-1}(S_k+B_k^\top P_{k+1}A_k).
+  \label{eq:mpc-riccati-kkt}
+\end{equation}
+
+\begin{theorem}[Riccati 的线性复杂度与 break-even]
+\label{thm:mpc-riccati}
+若各级 Hessian 严格正定，块三对角 KKT 经 \cref{eq:mpc-riccati-kkt} 求解的开销为 $O(N(n_x+n_u)^3)$、内存 $O(N(n_x+n_u)^2)$，比稠密 KKT 的 $O((N(n_x+n_u))^3)$ \textbf{快 $N^2$ 倍}。Condensing（$\sim N^3n_u^3$）与 Riccati（$\sim N(n_x+n_u)^3$）的 break-even 在
+\begin{equation}
+  N^\star\approx\frac{n_x+n_u}{n_u}\,c,\qquad c\in[1,3]\ (\text{硬件常数}),
+  \label{eq:mpc-breakeven}
+\end{equation}
+$N<N^\star$ 时 condensing 更快，否则 Riccati 更快。
+\end{theorem}
+
+\begin{insight}
+\textbf{Condensing 看起来多射击、算起来单射击。}\;一个深刻而易被忽视的事实：condensing 用 $\boldsymbol\Gamma$ 把状态消去，其约化 Hessian \cref{eq:mpc-condensed-H} \emph{继承了单射击的病态}——对不稳定系统同样有 $\mathrm{cond}(\tilde H)\ge ce^{2\lambda T}$。也就是说，它在\emph{建模}时享受了多射击的结构（节点状态、等式约束的稀疏 KKT），却在\emph{求解}时退回单射击的数值条件。这解释了为什么长时域、不稳定系统应优先保留稀疏结构走 Riccati，而非 condensing。介于二者之间的 \textbf{partial condensing}（Axehill）把时域分 $N_2$ 段、段内 condensing 段间稀疏，理论初值 $N_2\approx\lceil Nn_u/(n_x+n_u)\rceil$，实测再网格微调。Riccati 与 LQR 的关系恰如 FFT 与 DFT：都靠递归结构把 $O(N^3)$ 降到 $O(N)$（见 \cref{ch:lqr-lqg-riccati}）。
+\end{insight}
+
+\subsection{SQP、Gauss--Newton 与实时迭代}
+\label{sec:mpc-rti}
+\paragraph{Gauss--Newton Hessian。}
+对最小二乘型代价 $\Phi=\tfrac12\|F(z)\|^2$，序列二次规划（SQP）的精确 Hessian 含二阶项，而 \textbf{Gauss--Newton（GN）近似} $B_{\rm GN}=J^\top J$（$J=\partial F/\partial z$）\emph{自动半正定}、无需二阶导，且零残差时给 $q$-二次收敛。这正是 iLQR 在最优控制里的本质（iLQR = 高斯--牛顿步），完整证明见 \cref{ch:ddp-ilqr}，本章不重证。
+
+\paragraph{实时迭代（RTI）。}
+要在毫秒级回路里跟上系统，不能“解到收敛”才输出。Diehl--Bock--Schlöder 的 RTI 把每个采样周期拆成两阶段：
+
+\begin{itemize}
+  \item \textbf{准备阶段}（在上一周期末、新测量到达\emph{前}执行）：移位热启 $\tilde w^k=\mathrm{shift}(w^{k-1})$；沿 $\tilde w^k$ 前向积分得灵敏度 $F_x,F_u$；评估 GN Hessian 与梯度；做 condensing 或 Riccati 因子分解。
+  \item \textbf{反馈阶段}（新测量 $\hat x_0$ 到达后）：注入初始状态、解一个 QP 得 $\Delta w$、施加首步 $u_0^k=u_0^{\rm init}+\Delta u_0$。
+\end{itemize}
+关键在 $\Delta t_{\rm fb}/\Delta t_{\rm prep}\in[10^{-3},10^{-2}]$：反馈阶段比准备阶段快 $100\sim1000$ 倍，故“测量到控制输出”的延迟极小。
+
+\begin{theorem}[RTI 收缩性\cite{diehl2005realtime}]
+\label{thm:mpc-rti-contractivity}
+设参数族 $\{P(\hat x_0)\}$ 在解路径邻域满足 LICQ + 二阶充分条件（SSOSC）+ Lipschitz + 严格互补。则存在 $\kappa<1$、$\omega\ge0$ 与邻域 $\mathcal N$，使对 $w^k\in\mathcal N$
+\begin{equation}
+  \boxed{\ \|w^{k+1}-w^\star(\hat x_0^{k+1})\|\le\kappa\,\|w^k-w^\star(\hat x_0^k)\|+\omega\,\|\hat x_0^{k+1}-\hat x_0^k\|\ }.
+  \label{eq:mpc-rti-contractivity}
+\end{equation}
+\end{theorem}
+
+\begin{proof}[证明骨架（Robinson 强正则性，四步）]
+\textbf{第一步}：KKT 系统 $F(w,p)=0$ 在 LICQ+SSOSC+严格互补下，由 Robinson 强正则性（隐函数定理的强形式），解映射 $w^\star(p)$ 局部 Lipschitz，$\|w^\star(p_1)-w^\star(p_2)\|\le L_w\|p_1-p_2\|$，取 $\omega=L_w$。
+\textbf{第二步}：固定 $p$ 时全步 SQP 就是 KKT 系统的 Newton 法，在 $w^\star(p)$ 邻域内收缩，$\|w^{k+1}-w^\star(p)\|\le\kappa_N\|w^k-w^\star(p)\|+O(\|\cdot\|^2)$；对 GN Hessian，$\kappa_N$ 由残差大小控制（零残差 $\to$ 二次收敛）。
+\textbf{第三步}：时刻 $k,k+1$ 参数为 $p^k,p^{k+1}$，三角不等式
+\[
+  \|w^{k+1}-w^\star(p^{k+1})\|\le\underbrace{\|w^{k+1}-w^\star(p^k)\|}_{\le\kappa_N\|w^k-w^\star(p^k)\|}+\underbrace{\|w^\star(p^k)-w^\star(p^{k+1})\|}_{\le L_w\|p^k-p^{k+1}\|},
+\]
+取 $\kappa=\kappa_N$ 即得 \cref{eq:mpc-rti-contractivity}。
+\textbf{第四步（联合 ISS）}：RTI 的次优误差 $\delta^k=\|w^k-w^\star\|$ 相当于注入闭环的“额外扰动”，叠加到 \cref{sec:mpc-iss} 的 ISS--MPC 不等式上：$V_N^\star(x^+)-V_N^\star(x)\le-\alpha_\ell(\|x\|)+\sigma_w(\|w\|)+L_{\rm cost}\delta^k$；由收缩性 $\delta^k$ 有界且收敛，故\textbf{数值近似的 ISS + 模型 MPC 的 ISS = 联合闭环 ISS}。
+\end{proof}
+
+\begin{remark}
+\textbf{次优即可，无需最优。}\;RTI“一周期一迭代”的理论底气来自 Suboptimal MPC\cite{scokaert1999suboptimal}：只要移位热启给出的候选解\emph{可行}且满足 Lyapunov 下降，就保证稳定，\emph{不需要}全局最优。\textbf{RTI 何时失效}：大扰动（被踢一脚）使 $\|\Delta x_0\|$ 超出线性近似 $\to$ 多迭代 SQP；活动集突变（步态切换）使 LICQ/严格互补失效 $\to$ shift 时重识别相位；冷启动 $w^0$ 太差 $\to$ 用 MPPI（\cref{ch:mppi}）热启或回退安全策略；非光滑动力学（接触）使 $f$ 不 Lipschitz、$\omega$ 爆炸 $\to$ 预定义接触切换。
+\end{remark}
+
+% ════════════════════════════════════════════════════════════════
+\section{ISS-MPC：标称 MPC 的固有鲁棒性}
+\label{sec:mpc-iss}
+
+\paragraph{动机：不加任何鲁棒设计，MPC 自带多少抗扰？}
+Tube MPC（\cref{sec:mpc-tube}）需要精确知道扰动界 $\mathcal W$。但很多时候扰动是渐变的（如风速），或我们只想先分析“标称 MPC 对小扰动天然有多鲁棒”。输入到状态稳定性（ISS）回答这个问题。ISS、$\mathcal K_\infty$、$\mathcal{KL}$ 与 ISS--Lyapunov 函数的定义见 \cref{ch:lyapunov-stability}，本节只用其结论。
+
+\begin{theorem}[Limón 等：$V_N^\star$ 是 ISS--Lyapunov 函数\cite{limon2009iss}]
+\label{thm:mpc-iss}
+设 $f,\ell,V_f$ 在紧集上 Lipschitz（常数 $L_f,L_\ell,L_V$）、$\mathcal X_f$ 对 $(f,\kappa_f)$ 正不变、(A2) 成立、$\ell(x,u)\ge\alpha_\ell(\|x\|)$。则在扰动 $x^+=f(x,\kappa_N(x))+w$ 下，$V_N^\star$ 是区域 ISS--Lyapunov 函数：
+\begin{equation}
+  V_N^\star(x^+)-V_N^\star(x)\le-\alpha_\ell(\|x\|)+L_VL_f^{N-1}\|w\|.
+  \label{eq:mpc-iss}
+\end{equation}
+\end{theorem}
+
+\begin{proof}[证明骨架（候选序列误差传播）]
+对扰动后状态 $x^+$ 构造移位候选 $\tilde{\mathbf u}=(u_1^\star,\dots,u_{N-1}^\star,\kappa_f(x_N^\star))$，候选轨迹自 $x^+$ 出发，一步误差 $\delta_1=x^+-x_1^\star=w$。由动力学 Lipschitz，$\|\delta_{k+1}\|=\|f(\tilde x_k,u_k^\star)-f(x_k^\star,u_k^\star)\|\le L_f\|\delta_k\|$，故 $\|\delta_k\|\le L_f^{k-1}\|w\|$。候选代价与最优代价之差来自“去掉首步代价 $\ell(x,u_0^\star)$”与“轨迹偏离”两项，由 $\ell,V_f$ 的 Lipschitz 性界为
+\[
+  V_N^\star(x^+)\le V_N(x^+,\tilde{\mathbf u})\le V_N^\star(x)-\ell(x,u_0^\star)+\Big(L_\ell\!\!\sum_{k=0}^{N-2}L_f^k+L_VL_f^{N-1}\Big)\|w\|.
+\]
+$L_f>1$ 时主导项是 $L_VL_f^{N-1}\|w\|$，即 \cref{eq:mpc-iss} 的 ISS 增益。
+\end{proof}
+
+\begin{insight}
+\cref{eq:mpc-iss} 给出三条工程含义：（i）\textbf{$N$ 越大、扰动增益 $L_VL_f^{N-1}$ 越大}（若 $L_f>1$）——“预测越远越怕扰动”，解释了超长时域 NMPC 在有扰动时为何更抖（把四足 MPC 时域从 20 增到 50 后在 SLAM 噪声下反而抖）；（ii）\textbf{标称 MPC 天然有固有鲁棒性}（$L_f<1$ 时 $\sum L_f^k<1/(1-L_f)$ 收敛、增益不随 $N$ 增长），这是工业 MPC 不配 tube 也能跑的原因；（iii）Tube MPC 的价值在于把这个会随 $N$ 增长的 Lipschitz 增益替换成\emph{常数}截面 $\mathcal Z$。
+\end{insight}
+
+\begin{remark}
+\textbf{固有 vs 设计的鲁棒性}（与 \cref{sec:mpc-tube} 的统一视角）：ISS--MPC 是\emph{分析}工具，告诉你标称 MPC 本身有多鲁棒（inherent robustness），扰动处理\emph{隐式}、无需知道 $\mathcal W$、对小扰动给概率性保证；Tube MPC 是\emph{设计}工具，\emph{显式}用 $\mathcal W$ 做约束收紧、对 $w\in\mathcal W$ 给确定性保证。下表对照：
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+维度 & ISS--MPC & Tube MPC \\
+\midrule
+扰动处理 & 隐式（$V_N^\star$ 自带） & 显式（$\mathcal Z$ + 约束收紧） \\
+需知 $\mathcal W$ & 否（用 $L_f$ 分析） & 是（用 $\mathcal W$ 设计） \\
+约束保证 & 概率性（小扰动） & 确定性（$\forall w\in\mathcal W$） \\
+适用 & 扰动小且连续 & 扰动有界且可估 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{remark}
+
+% ════════════════════════════════════════════════════════════════
+\section{鲁棒 MPC I：min-max 与不变集地基}
+\label{sec:mpc-minmax-mrpi}
+
+\paragraph{动机：从“天然多鲁棒”到“保证多鲁棒”。}
+\cref{sec:mpc-iss} 只分析了固有鲁棒性。当扰动有界且必须\emph{确定性}保证约束满足时，需要主动设计。本节先给最直接（也最昂贵）的 min-max，再铺设 Tube MPC 的数学地基——不变集、Pontryagin 差与最小鲁棒不变集。
+
+\paragraph{三类不确定性。}
+真实世界的不确定性分三类：\textbf{加性扰动} $w\in\mathcal W$（外力、风、未建模动态）；\textbf{参数不确定} $\theta\in\Theta$（质量、惯量、摩擦系数）；\textbf{分布不确定} $\mathbb P\in\mathcal P_{\rm amb}$（噪声分布本身未知或会漂移）。映射到机器人：足端外力与地形是 $\mathcal W$；负载与连杆惯量是 $\Theta$；传感器噪声与 sim-to-real 间隙是 $\mathcal P_{\rm amb}$。三类分别由本节/\cref{sec:mpc-tube}、LPV Tube、\cref{sec:mpc-stochastic} 处理。
+
+\subsection{Min-max MPC}
+\label{sec:mpc-minmax}
+\textbf{开环} min-max $\min_{\mathbf u}\max_{\mathbf w}J$ 对整条序列取最坏扰动，过于保守；\textbf{闭环（反馈/recourse）} min-max $\min_{\pi_0}\max_{w_0}\min_{\pi_1}\cdots$ 允许后续控制看到已发生的扰动再决策，保守性大减。
+
+\begin{theorem}[反馈 min-max 的 ISS\cite{scokaertmayne1998minmax}]
+\label{thm:mpc-minmax}
+对受约束线性系统与有界扰动 $w\in\mathcal W$，反馈 min-max MPC 的最坏情形值函数是 ISS--Lyapunov 函数，闭环对 $\mathcal W$ 内所有扰动序列 ISS 稳定且恒满足约束。
+\end{theorem}
+
+\begin{remark}
+\textbf{为何 min-max 工程上几乎不直接用——三个原因。}\;（i）\textbf{维度爆炸}：反馈策略在 scenario tree 上的复杂度 $O(q^N)$（$q$ 为 $\mathcal W$ 顶点数），$N$ 稍大即不可解；好在 $J$ 对 $w$ 凸时最坏值在顶点取到，可只查顶点。（ii）\textbf{保守性悖论}：开环版为最坏情形预留过多，可行域急剧收缩。（iii）显式解（Bemporad--Borrelli--Morari 经多参数线性规划 mp-LP 得分段仿射 PWA 控制律）只在低维可行。故 min-max 多作\emph{理论上界}，实际部署让位于 Tube（\cref{sec:mpc-tube}）——后者用离线计算的固定截面达到几乎相同的鲁棒保证、在线只解一个 QP。
+\end{remark}
+
+\subsection{Pontryagin 差、支持函数与最小鲁棒不变集}
+\label{sec:mpc-mrpi}
+\paragraph{不变集：扰动下状态会落入哪里。}
+集合 $\Omega$ 对 $x^+=f(x,w),w\in\mathcal W$ 是\textbf{鲁棒正不变（RPI）}，当 $x\in\Omega\Rightarrow f(x,w)\in\Omega,\forall w\in\mathcal W$。它与 Lyapunov 理论是一枚硬币两面：若有 ISS--Lyapunov 函数，则足够大的水平集 $\{V\le c\}$（$c\ge\alpha_\ell^{-1}(\sigma(\|w\|_{\max}))$）都是 RPI。导论 \cref{def:ctrl-invariant} 只给了控制不变集，这里补\emph{鲁棒}不变集这一块。
+
+\begin{definition}[Pontryagin（Minkowski）差]
+\label{def:mpc-pontryagin}
+$\mathcal A\ominus\mathcal B:=\{x:x+\mathcal B\subseteq\mathcal A\}=\bigcap_{b\in\mathcal B}(\mathcal A-b)$。
+\end{definition}
+
+\noindent{}它的用途一目了然：若名义状态 $\bar x\in\mathcal A\ominus\mathcal B$ 而误差 $e\in\mathcal B$，则真实状态 $x=\bar x+e\in\mathcal A$——这正是\textbf{约束收紧}的数学本质。
+
+\begin{derivation}[H-表示下的 Pontryagin 差]
+设 $\mathcal A=\{x:Fx\le g\}$（H-多面体），$\mathcal B$ 紧凸。$x\in\mathcal A\ominus\mathcal B$ $\iff\forall b\in\mathcal B,F(x+b)\le g\iff Fx\le g-Fb,\forall b$。逐行取最坏：第 $i$ 行 $F_ix\le g_i-\max_{b\in\mathcal B}F_ib$。识别 $\max_{b\in\mathcal B}F_ib=\sigma_{\mathcal B}(F_i^\top)$（$\mathcal B$ 沿方向 $F_i^\top$ 的\textbf{支持函数}），故
+\begin{equation}
+  \mathcal A\ominus\mathcal B=\{x:Fx\le g-\sigma_{\mathcal B}(F^\top)\}.
+  \label{eq:mpc-pontryagin-H}
+\end{equation}
+几何上每个约束面向内平移 $\sigma_{\mathcal B}(F_i^\top)$——恰是 $\mathcal B$ 在该法向上的“厚度”；若 $\mathcal B$ 是半径 $r$ 的球则 $\sigma_{\mathcal B}(f)=r\|f\|$，所有面统一内缩 $r\|F_i\|$。
+\end{derivation}
+
+\noindent{}支持函数 $\sigma_{\mathcal B}(f)=\max_{b\in\mathcal B}f^\top b$ 的四条性质后文反复用：正齐次 $\sigma_{\mathcal B}(\lambda f)=\lambda\sigma_{\mathcal B}(f)$（$\lambda\ge0$）；次可加 $\sigma_{\mathcal B}(f_1+f_2)\le\sigma_{\mathcal B}(f_1)+\sigma_{\mathcal B}(f_2)$；Minkowski 和线性 $\sigma_{\mathcal A\oplus\mathcal B}=\sigma_{\mathcal A}+\sigma_{\mathcal B}$；线性变换 $\sigma_{M\mathcal B}(f)=\sigma_{\mathcal B}(M^\top f)$。
+
+\begin{insight}
+\textbf{若不用 Pontryagin 差会怎样？}\;你得在 MPC 里对每一步、每个扰动实现都检查约束满足——这退化为 min-max 的指数复杂度。Pontryagin 差把“对所有扰动可行”的无穷维约束\emph{离线压缩}成一次性的约束收紧，使在线问题规模不变。这是 Tube MPC 在线只解一个 QP 的根本原因。
+\end{insight}
+
+\paragraph{最小鲁棒不变集（mRPI）。}
+对误差动力学 $e_{k+1}=A_Ke_k+w_k$（$A_K$ Schur），从零初始误差出发的可达误差集为
+\begin{equation}
+  \mathcal Z_\infty=\bigoplus_{i=0}^{\infty}A_K^i\mathcal W.
+  \label{eq:mpc-mrpi}
+\end{equation}
+因 $A_K$ Schur，$\|A_K^i\|\to0$ 指数衰减，无穷 Minkowski 和收敛、有界。$\mathcal Z_\infty$ 是所有 RPI 集中最小的——任何 RPI 集 $\Omega$ 都满足 $\mathcal Z_\infty\subseteq\Omega$。但它是无穷和，无法精确算。
+
+\begin{theorem}[Raković 等 mRPI 的 $(s,\bar\alpha)$ 外近似\cite{rakovic2005invariant}]
+\label{thm:mpc-rakovic}
+设 $A_K$ Schur、$\mathcal W$ 含原点紧凸。若存在 $s\in\mathbb N_+$、$\bar\alpha\in[0,1)$ 使 $A_K^s\mathcal W\subseteq\bar\alpha\mathcal W$，则
+\begin{equation}
+  \mathcal Z_\infty\subseteq\mathcal Z(s,\bar\alpha):=\frac{1}{1-\bar\alpha}\bigoplus_{i=0}^{s-1}A_K^i\mathcal W,\qquad A_K\,\mathcal Z(s,\bar\alpha)\oplus\mathcal W\subseteq\mathcal Z(s,\bar\alpha),
+  \label{eq:mpc-rakovic}
+\end{equation}
+即 $\mathcal Z(s,\bar\alpha)$ 是可计算的 RPI 外近似。
+\end{theorem}
+
+\begin{proof}
+把 \cref{eq:mpc-mrpi} 拆成前 $s$ 项与尾部。由 $A_K^s\mathcal W\subseteq\bar\alpha\mathcal W$ 得 $A_K^{ks}\mathcal W\subseteq\bar\alpha^k\mathcal W$，故尾部 $\bigoplus_{i=s}^\infty A_K^i\mathcal W\subseteq\tfrac{\bar\alpha}{1-\bar\alpha}\bigoplus_{j=0}^{s-1}A_K^j\mathcal W$。合并前 $s$ 项：$\mathcal Z_\infty\subseteq(1+\tfrac{\bar\alpha}{1-\bar\alpha})\bigoplus_{i=0}^{s-1}A_K^i\mathcal W=\tfrac1{1-\bar\alpha}\bigoplus_{i=0}^{s-1}A_K^i\mathcal W$。RPI 性质 $A_K\mathcal Z\oplus\mathcal W\subseteq\mathcal Z$ 用支持函数线性性逐行验证。
+\end{proof}
+
+\begin{remark}
+\textbf{$1/(1-\bar\alpha)$ 的放大是必要代价}：若直接截断前 $s$ 项 $\bigoplus_{i=0}^{s-1}A_K^i\mathcal W$，它\emph{不是} RPI（$A_K(\cdot)\oplus\mathcal W\not\subseteq(\cdot)$），失去递归可行性保证。$K$ 的选取是权衡：$A_K$ 特征值越小（$K$ 越激进），$\mathcal Z$ 越小、$\mathcal X\ominus\mathcal Z$ 越大，但 $K\mathcal Z$ 越大、$\mathcal U\ominus K\mathcal Z$ 越紧——以 LQR 增益为起点迭代 $Q/R$。
+\end{remark}
+
+% ════════════════════════════════════════════════════════════════
+\section{鲁棒 MPC II：Tube 全族}
+\label{sec:mpc-tube}
+
+\paragraph{动机：把误差关进管道。}
+\cref{sec:mpc-mrpi} 备好了 mRPI。Tube MPC 的全部智慧是：先离线算出误差最终落入的最小区域 $\mathcal Z$，再在设计名义轨迹时预留这个区域（约束收紧），从而保证真实状态\emph{永远}不违反原始约束。这是机器人部署最多的鲁棒 MPC 架构。
+
+\subsection{刚性管道（Rigid Tube）}
+\label{sec:mpc-rigid-tube}
+\begin{definition}[Rigid Tube MPC\cite{mayneseronrakovic2005tube}]
+\label{def:mpc-rigid-tube}
+名义系统 $\bar x_{k+1}=A\bar x_k+B\bar u_k$，真实控制 $u_k=\bar u_k+K(x_k-\bar x_k)$，误差 $e_{k+1}=A_Ke_k+w_k\in\mathcal Z$（$\mathcal Z$ 为 mRPI 外近似）。在线 OCP：
+\begin{equation}
+\begin{aligned}
+  \min_{\bar x_0,\bar u_{0:N-1}}\ &\sum_{i=0}^{N-1}\ell(\bar x_i,\bar u_i)+V_f(\bar x_N)\\
+  \mathrm{s.t.}\ &\bar x_{i+1}=A\bar x_i+B\bar u_i,\quad \bar x_i\in\mathcal X\ominus\mathcal Z,\quad \bar u_i\in\mathcal U\ominus K\mathcal Z,\\
+  &\bar x_N\in\mathcal X_f\subseteq(\mathcal X\ominus\mathcal Z),\quad \boxed{x\in\{\bar x_0\}\oplus\mathcal Z}.
+\end{aligned}
+  \label{eq:mpc-rigid-tube-ocp}
+\end{equation}
+\end{definition}
+最后一条初始约束是该论文的\textbf{关键创新}：$\bar x_0$ 是\emph{决策变量}而非令 $\bar x_0=x$——只要真实 $x$ 落在名义初值的 $\mathcal Z$ 管道内即可，这给了优化器额外自由度去满足收紧约束。
+
+\begin{theorem}[Rigid Tube 鲁棒指数稳定\cite{mayneseronrakovic2005tube}]
+\label{thm:mpc-rigid-tube}
+若 $\mathcal X_f$ 是名义系统在局部律 $\bar u=K_f\bar x$ 下的正不变集、$V_f$ 是对应 Lyapunov 函数、$\mathcal Z$ 是 mRPI 外近似，则闭环使 $\{0\}\oplus\mathcal Z$ 鲁棒指数稳定，且对所有 $w\in\mathcal W^\infty$ 恒有 $x_k\in\mathcal X,u_k\in\mathcal U$。
+\end{theorem}
+
+\begin{proof}[证明骨架（三链）]
+\textbf{(i) 递归可行性}：取候选 $(\bar u_1^\star,\dots,\bar u_{N-1}^\star,K_f\bar x_N^\star)$ 与候选名义初值 $\bar x_0^+=\bar x_1^\star$；由 $e^+=A_Ke+w\in\mathcal Z$ 验证 $x^+\in\{\bar x_1^\star\}\oplus\mathcal Z$，初始约束满足，且收紧约束因 $\mathcal X_f\subseteq\mathcal X\ominus\mathcal Z$ 而保持。
+\textbf{(ii) 名义稳定性}：$V_N^\star(\bar x)$ 对名义系统是 Lyapunov 函数（套 \cref{thm:ctrl-mpc-main}），故 $\bar x_k\to0$。
+\textbf{(iii) 管道收缩}：误差恒在 $\mathcal Z$ 内，结合名义收敛给出 $x_k\to\{0\}\oplus\mathcal Z$ 指数收敛。
+\end{proof}
+
+\begin{insight}
+Tube 控制律不是 $u=\bar u_0^\star$，而是\textbf{名义前馈 $\bar u_0^\star$ + 误差反馈 $K(x-\bar x_0^\star)$} 的叠加：前馈“按计划行动”，反馈“把误差拉回管道”。在线只解一个与名义 MPC 同阶的 QP，$K,\mathcal Z$ 离线一次算好。这与强化学习里 teacher--student 架构异曲同工——teacher（名义 MPC）做规划，student（线性反馈 $K$）做跟踪。
+\end{insight}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, scale=1.0]
+  % nominal trajectory (smooth curve)
+  \draw[thick, second!70!black] (0,0) .. controls (1.6,1.1) and (3.2,1.0) .. (5.2,0.25)
+    node[pos=0.5, above=8pt, second!70!black, font=\small] {名义 $\bar x_k$};
+  % tube cross-sections Z along the nominal trajectory
+  \foreach \t/\cx/\cy in {0/0/0, 0.28/1.45/0.78, 0.55/2.9/0.92, 0.82/4.4/0.5}{
+    \draw[main!55!black, fill=main!10] (\cx,\cy) ellipse (0.42 and 0.27);
+  }
+  \node[main!60!black, font=\small] at (2.9,1.55) {管道 $\{\bar x_k\}\oplus\mathcal Z$};
+  % real trajectory: explicit zig-zag polyline inside the tube (no special decoration lib)
+  \draw[thick, third!70!black]
+    (0.05,0.05) -- (0.55,0.45) -- (1.0,0.35) -- (1.5,0.85) -- (2.0,0.7)
+    -- (2.5,1.05) -- (2.95,0.85) -- (3.5,0.95) -- (4.0,0.55) -- (4.35,0.42)
+    node[pos=0.55, below=8pt, third!70!black, font=\small] {真实 $x_k$};
+  \fill (0,0) circle (1.3pt);
+  \fill (5.2,0.25) circle (1.3pt); \node[font=\scriptsize, right] at (5.2,0.25) {$\to\{0\}\oplus\mathcal Z$};
+\end{tikzpicture}
+\caption{Rigid Tube MPC：名义轨迹 $\bar x_k$（光滑曲线）携带固定截面 $\mathcal Z$ 形成管道；真实轨迹 $x_k$ 在扰动下抖动但被反馈 $K(x-\bar x)$ 始终关在管道内，收紧约束 $\mathcal X\ominus\mathcal Z$ 保证管道整体不越界。}
+\label{fig:mpc-rigid-tube}
+\end{figure}
+
+\subsection{管道全族与收缩管道}
+\label{sec:mpc-tube-family}
+刚性管道用\emph{固定}截面，保守性来自“用最坏情形 tube 约束所有时步”。后续工作沿两个方向松绑：
+
+\begin{itemize}
+  \item \textbf{Homothetic Tube}\cite{rakovic2012homothetic}：截面形状固定但允许缩放因子 $\alpha_k$ 在线变化，$\alpha_{k+1}\ge\alpha^\star\alpha_k+\rho_{\mathcal W}$，比刚性管道少保守。\footnote{标量缩放管道的同位（homothetic）参数化与上述缩放递推出自 Rakovi\'c--Kouvaritakis--Findeisen--Cannon, \emph{Automatica} 48(8):1631--1638, 2012；其更一般的完全参数化（形状与反馈联合参数化）见 Rakovi\'c 等\cite{rakovic2012parameterized}（\emph{IEEE TAC} 57(11), 2012），后者把同位管道作为特例统一。}
+  \item \textbf{Elastic Tube}\cite{rakovic2016elastic}：截面\emph{形状}与反馈在线可变（参数化多面体的各面距离作决策变量），复杂度约 $O(N^2)$，保守性更低。
+  \item \textbf{Nonlinear Tube}：Mayne 等的双层法（外层名义 + 内层 tube）\cite{mayne2011nonlinear} 与 Köhler 等的单层法（用增量 Lyapunov/参考通用终端配料）\cite{koehler2020nonlinear}，把 tube 推广到非线性动力学。
+  \item \textbf{收缩管道（contraction-based）}：控制收缩度量（CCM）$\dot M+A^\top M+MA\preceq-2\lambda M$\cite{manchester2017ccm} 给出 tube 半径 $\sim w_{\max}/\lambda$，与线性 mRPI 的 $\|\mathcal Z_\infty\|\sim w_{\max}/(1-\rho(A_K))$ 完美类比（收缩率 $\lambda$ 对应谱半径间隙）。CCM 的几何细节见 \cref{ch:lyapunov-stability}。
+\end{itemize}
+
+\paragraph{LPV Tube。}
+把非线性系统嵌入线性变参（LPV）形式 $x^+=A(\rho)x+B(\rho)u$（调度变量 $\rho$ 取倾角、质心高度或关节角，接 \cref{ch:rigid_body} 的浮动基座动力学），在 $\rho$ 的顶点设计反馈、用重心坐标插值，并对调度变量的未来变化做 anticipation。这让 tube 覆盖工作点漂移引起的“参数 tube”。
+
+\begin{remark}
+\textbf{时变截面前沿与分布式扩展}：2024 年的时变截面 Tube（$x_k\in\{\bar x_k\}\oplus\mathcal Z_k$，$\mathcal Z_{k+1}\supseteq A_K\mathcal Z_k\oplus\mathcal W$）在保持递归可行性的同时严格缩小保守性。介于 min-max 与 tube 之间的 \textbf{multi-stage（scenario tree）}MPC 在 robust horizon $N_r$ 内展开 $s^{N_r}$ 条路径、之后冻结，配非预期性约束，是工程折中。多机协同下的\textbf{分布式 Tube MPC}（邻居 tube 叠加）见 \cref{ch:mr-dmpc}（\cref{alg:dmpc-admm-loop}），本章不展开。
+\end{remark}
+
+% ════════════════════════════════════════════════════════════════
+\section{随机 MPC：机会约束、Scenario 与分布鲁棒}
+\label{sec:mpc-stochastic}
+
+\paragraph{动机：扰动无界时怎么办。}
+Tube 要求扰动有界 $w\in\mathcal W$。但高斯传感器噪声无界，硬性 $\forall w$ 保证不可能。随机 MPC 用\textbf{机会约束} $\Pr[g(x,u,w)\le0]\ge1-\varepsilon$ 替代硬约束，允许稀有违反换取可行域扩张——对无界扰动这是唯一可行路径。三大范式：解析重构、Scenario、分布鲁棒。
+
+\subsection{机会约束的解析重构与方差传播}
+\label{sec:mpc-chance}
+\begin{theorem}[高斯机会约束的 SOCP 重构]
+\label{thm:mpc-chance-socp}
+设 $x\sim\mathcal N(\mu,\Sigma)$、约束线性 $g=a^\top x+b$。则 $\Pr[a^\top x+b\le0]\ge1-\varepsilon$ 等价于二阶锥约束
+\begin{equation}
+  a^\top\mu+b+\Phi^{-1}(1-\varepsilon)\,\|\Sigma^{1/2}a\|_2\le0,
+  \label{eq:mpc-chance-socp}
+\end{equation}
+其中 $\Phi^{-1}$ 是标准正态分位数。
+\end{theorem}
+
+\begin{proof}
+$a^\top x\sim\mathcal N(a^\top\mu,a^\top\Sigma a)$，标准化 $\Pr[a^\top x\le-b]=\Phi\!\big(\tfrac{-b-a^\top\mu}{\sqrt{a^\top\Sigma a}}\big)\ge1-\varepsilon\iff\tfrac{-b-a^\top\mu}{\sqrt{a^\top\Sigma a}}\ge\Phi^{-1}(1-\varepsilon)$，移项即 \cref{eq:mpc-chance-socp}（注意 $\sqrt{a^\top\Sigma a}=\|\Sigma^{1/2}a\|_2$）。
+\end{proof}
+
+\noindent{}物理含义：均值须离约束面至少 $\Phi^{-1}(1-\varepsilon)$ 个标准差（$\varepsilon=0.05$ 时 $1.645$、$\varepsilon=0.01$ 时 $2.326$）。\textbf{非高斯}时用分布无关的 Chebyshev--Cantelli 界，把 $\Phi^{-1}(1-\varepsilon)$ 换成 $\sqrt{(1-\varepsilon)/\varepsilon}$（显著更保守）。
+
+\paragraph{方差传播：闭环 vs 开环。}
+开环（$u_k=\bar u_k$）方差 $\Sigma_{k+1}=A\Sigma_kA^\top+\Sigma_w$ 单调增大、过保守。闭环用仿射反馈 $u_k=\bar u_k+K(x_k-\bar x_k)$：
+\begin{equation}
+  \Sigma_{k+1}=(A+BK)\Sigma_k(A+BK)^\top+\Sigma_w,
+  \label{eq:mpc-var-prop}
+\end{equation}
+$A+BK$ 稳定时 $\Sigma_k$ 有界——这是 Stochastic Tube MPC（Cannon 等）的标准技巧：在名义问题里用 $a^\top\bar x_k+\Phi^{-1}(1-\varepsilon)\|\bar\Sigma^{1/2}a\|_2\le g$ 约束。
+
+\begin{insight}
+\textbf{Tube 与 Stochastic 是同一权衡的两极}：Tube 对应 $\varepsilon=0$（绝对安全），Stochastic 对应 $0<\varepsilon<1$（概率安全）。工程师按\emph{违反后果}选：飞机防撞用 Tube（$\varepsilon=0$），HVAC 舒适度用 Stochastic（$\varepsilon=5\%$ 可接受）。多步约束切忌直接用联合概率——单步 $1-\varepsilon$ 不保证全程，用 Bonferroni $\varepsilon_k=\varepsilon/N$ 或条件方法。
+\end{insight}
+
+\subsection{Scenario MPC}
+\label{sec:mpc-scenario}
+\begin{theorem}[Scenario 样本复杂度\cite{calafiorecampi2006scenario,campigaratti2008exact}]
+\label{thm:mpc-scenario}
+对凸机会约束规划 $\min_{x\in\mathbb R^d}c^\top x$ s.t.\ $\Pr_\delta\{f(x,\delta)\le0\}\ge1-\varepsilon$（$f(\cdot,\delta)$ 对每个 $\delta$ 凸），取 $N$ 个独立样本求解 $\min c^\top x$ s.t.\ $f(x,\delta^{(i)})\le0,i=1,\dots,N$。若
+\begin{equation}
+  N\ge\left\lceil\frac{2}{\varepsilon}\Big(\ln\frac1\beta+d\Big)\right\rceil,
+  \label{eq:mpc-scenario-N}
+\end{equation}
+则解的违反概率 $\Pr^N\{V(x_N^\star)>\varepsilon\}\le\beta$。更紧的 Campi--Garatti 精确界为 $\Pr^N\{V(x_N^\star)>\varepsilon\}\le\sum_{i=0}^{d-1}\binom Ni\varepsilon^i(1-\varepsilon)^{N-i}$（全支撑问题取等），数值反解可比 \cref{eq:mpc-scenario-N} 少近一半样本。
+\end{theorem}
+
+\begin{proof}[证明骨架]
+Helly 定理给出 $d$ 维凸问题的支撑约束数 $\le d$，故 $x_N^\star$ 仅由最多 $d$ 个样本决定；删除任一非支撑样本不改最优解。组合论证得 $\Pr\{V>\varepsilon\}\le\binom Nd(1-\varepsilon)^{N-d}$，反解即 \cref{eq:mpc-scenario-N}。
+\end{proof}
+
+\begin{insight}
+\textbf{凸性是关键。}\;Calafiore--Campi 的天才发现：对\emph{凸}问题，所需样本只取决于决策维度 $d$ 与违反率 $\varepsilon$，\emph{与扰动分布无关}（distribution-free）！因为解的“复杂度”由支撑约束数 $\le d$ 控制，故 $N=O(d/\varepsilon)$ 而非非凸情形的 $O(2^d/\varepsilon)$。这对机器人 sim-to-real 极友好：从 domain randomization 仿真器直接抽 $N$ 条轨迹作 scenario 即可——\textbf{domain randomization 正是 scenario approach 的 RL 化身}（正式 RL 理论见强化学习部）。\textbf{Scenario 不是蒙特卡洛}：后者是后验\emph{评估} $\hat V=\tfrac1N\sum\mathbf 1\{f>0\}$（$O(1/\sqrt N)$ 收敛、典型 $N\sim10^4$），前者是把样本作硬约束\emph{合成}决策（典型 $N\sim10^2$--$10^3$）。缺点：在线 QP 规模 $\propto N$，$\varepsilon<1\%$ 时不实用。
+\end{insight}
+
+\subsection{Wasserstein 分布鲁棒 MPC}
+\label{sec:mpc-dro}
+\paragraph{当分布本身也不确定。}
+Scenario 假设能从\emph{真}分布采样，但 sim-to-real 间隙意味着真分布与样本分布有偏。分布鲁棒优化（DRO）对一个\textbf{模糊集} $\mathcal P_{\rm amb}$ 内所有分布取最坏：$\inf_{\mathbb Q\in\mathcal P_{\rm amb}}\Pr_{\mathbb Q}[g\le0]\ge1-\varepsilon$。以经验分布 $\hat{\mathbb P}_N$ 为中心、Wasserstein 距离 $W_p$ 为半径的球 $\mathbb B_\varepsilon(\hat{\mathbb P}_N)$ 是机器人首选模糊集。
+
+\begin{theorem}[Wasserstein DRO 的可解重构\cite{esfahanikuhn2018wasserstein}]
+\label{thm:mpc-dro}
+对 1-Wasserstein 模糊集，最坏情形期望经 Kantorovich 对偶可重构为有限维凸问题，且
+\begin{equation}
+  \sup_{\mathbb Q\in\mathbb B_\varepsilon(\hat{\mathbb P}_N)}\mathbb E_{\mathbb Q}[\ell(\xi)]=\underbrace{\frac1N\sum_{i=1}^N\ell(\hat\xi_i)}_{\text{样本均值}}+\varepsilon\cdot\mathrm{Lip}(\ell),
+  \label{eq:mpc-dro}
+\end{equation}
+（$\ell$ Lipschitz 时）。有限样本保证：半径 $\varepsilon_N=\big(\ln(c_1/\beta)/(c_2N)\big)^{1/\max\{m,2\}}$ 时真分布以概率 $1-\beta$ 落在球内。
+\end{theorem}
+
+\begin{insight}
+\cref{eq:mpc-dro} 给出\textbf{“鲁棒 = 正则化”}的双重解读：分布鲁棒的最坏情形期望 = 样本均值 + $\varepsilon\times$ Lipschitz 正则项。换言之，对分布扰动求最坏，\emph{等价}于在经验风险上加一个正则化惩罚——这把鲁棒性与正则化、过拟合控制连成一线。\textbf{Robust--DR--Scenario 是一条连续谱}：$\varepsilon\to\infty$ 趋于最坏情形 robust（最保守），$\varepsilon\to0$ 趋于确定性等价（最乐观），$\varepsilon_N$ 随样本量 $N$ 收缩。相较 KL 散度模糊集，Wasserstein 不要求两分布同支撑、能处理“真分布有样本里没见过的事件”，且给 out-of-sample 性能保证——这正是机器人偏好它的三个理由。
+\end{insight}
+
+\begin{remark}
+\textbf{选型速查}：知分布且高斯 $\to$ 解析 SOCP（\cref{thm:mpc-chance-socp}）；只知矩 $\to$ Chebyshev--Cantelli；能采样、分布无关 $\to$ Scenario（\cref{thm:mpc-scenario}）；分布会漂移/sim-to-real $\to$ Wasserstein DRO（\cref{thm:mpc-dro}）；扰动有界且要确定性保证 $\to$ Tube（\cref{sec:mpc-tube}）。\textbf{“Wasserstein $\varepsilon$ 越小越好”是误解}——$\varepsilon$ 太小则真分布可能逃出球、保证失效；应按 $\varepsilon_N$ 随样本量取。
+\end{remark}
+
+% ════════════════════════════════════════════════════════════════
+\section{数据驱动与学习型鲁棒 MPC}
+\label{sec:mpc-learning}
+
+\paragraph{动机：模型从哪来。}
+前面都假设有名义模型 $f$。但模型可能未知或不准。本节接两条数据驱动主线：用数据直接做预测控制（DeePC），以及用学习的不确定性量化驱动鲁棒/安全（GP--MPC、安全滤波器）。
+
+\paragraph{DeePC 的鲁棒视角。}
+Willems 基本引理（持续激励的输入输出数据，其分块 Hankel 矩阵列空间 = 系统行为集）与 DeePC（用 Hankel 矩阵替代状态空间模型做预测、确定性等价时 $\equiv$ MPC）的主理论见 \cref{ch:robust-hinf}，本章只补\emph{鲁棒}增量。DeePC 在优化里对组合系数 $g$ 加正则 $\lambda_g\|g\|_2^2$，其作用远不止数值稳定：
+
+\begin{theorem}[正则化即隐式分布鲁棒\cite{doerfler2023regularizers}]
+\label{thm:mpc-deepc-dro}
+DeePC 的 $\lambda_g\|g\|_2^2$（或 $\|g\|_1$）正则等价于在数据扰动的某个 Wasserstein 模糊集上做分布鲁棒优化；正则权重 $\lambda_g$ 对应模糊集半径，越大越保守。
+\end{theorem}
+
+\noindent{}这把 \cref{thm:mpc-dro} 的“鲁棒=正则化”原理落到数据驱动控制：DeePC 看似只是“用数据拟合”，实则隐式地对“数据没覆盖到的分布”做了鲁棒化。它\emph{不}是完全无模型——Hankel 矩阵承载的正是数据隐含的线性时不变模型。
+
+\paragraph{GP--MPC 与安全滤波器。}
+\begin{itemize}
+  \item \textbf{GP--MPC}\cite{koller2018gpmpc}：用高斯过程学残差动力学，后验方差 $\sigma_g(x)$ 驱动 tube 收紧 $h(x)+\beta_\delta\sigma_g(x)\le0$（$\beta_\delta$ 由 RKHS 置信界给出），即“学到的不确定性自动决定 tube 半径”——把 \cref{sec:mpc-tube} 的固定 $\mathcal Z$ 换成数据自适应截面。
+  \item \textbf{预测安全滤波器（PSF）}\cite{wabersich2021psf}：给任意（可能不安全的）学习控制器 $u_L$ 套一层 $\min\|u-u_L\|^2$ s.t.\ 存在满足约束的安全预测轨迹——RL 即插即用的安全层，只在必要时最小修正动作。
+  \item \textbf{LBMPC}\cite{aswani2013lbmpc}：学习只进入\emph{代价}（提性能）、不进入\emph{约束}（保安全），用名义模型保证鲁棒可行性、用学习模型提升性能。
+\end{itemize}
+
+\begin{insight}
+三者构成“学习如何安全地进入 MPC”的谱系：GP--MPC 把学习放进\emph{不确定性量化}（驱动 tube），PSF 把学习放在\emph{外层}（事后过滤），LBMPC 把学习限制在\emph{代价}（不碰约束）。共同原则——\textbf{安全保证来自名义/鲁棒约束，学习只用来提性能或缩保守性}——与强化学习部的安全 RL 一脉相承（PSF 即 safe-RL 的 shield，可微 MPC 经隐式微分 KKT 把整个 MPC 作可学习层嵌入策略，见强化学习部）。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{MPC 与 CLF/CBF 的统一}
+\label{sec:mpc-clf-cbf}
+
+\paragraph{动机：MPC 与安全控制是什么关系。}
+控制 Lyapunov 函数（CLF）与控制障碍函数（CBF）是安全控制的另一支主力，其完整理论（CBF 定义、CBF-QP、高阶 CBF）在 \cref{ch:clf-cbf}。本节只澄清\textbf{MPC 与它们的三条关系}，CBF 主证一律引用 \cref{ch:clf-cbf}，不重铺。
+
+\begin{itemize}
+  \item \textbf{$V_N^\star$ 即 CLF}：MPC 的最优值函数本身是一个控制 Lyapunov 函数（Sontag 意义下）——\cref{thm:ctrl-mpc-main} 的下降 \cref{eq:ctrl-mpc-descent} 正是 CLF 条件。于是“MPC 稳定性”与“存在 CLF”是同一件事的两种语言。
+  \item \textbf{离散时间 CBF 作 MPC 路径约束}：把安全集 $\mathcal C=\{h\ge0\}$ 的离散 CBF 条件 $h(x_{k+1})\ge(1-\gamma)h(x_k)$（$\gamma\in(0,1]$，见 \cref{ch:clf-cbf} 的 \cref{def:dcbf}）作为 MPC 每步的不等式约束，得 MPC--CBF：既有 MPC 的前瞻最优性，又有 CBF 的前向不变安全保证。递归可行性需配终端集，必要时对 CBF 约束加 slack 软化以保 QP 可解。
+  \item \textbf{$N=1$ 退化为 CBF-QP}：当预测时域取 $N=1$ 且只留安全约束，MPC--CBF 恰好退化为单步的 CBF-QP（\cref{ch:clf-cbf} 的 \cref{eq:clf-cbf-qp}）。换言之，CBF-QP 是 MPC--CBF 的最短时域特例，MPC 用更长的前瞻换取更少的保守性与更好的可行性。
+\end{itemize}
+
+\begin{insight}
+三条关系合起来给出一张统一图景：\textbf{Lyapunov/CLF 管稳定、Barrier/CBF 管安全、MPC 管前瞻最优}，而 MPC 的值函数与路径约束恰好把前两者吸收进来。短时域、强安全场景用 CBF-QP（快、单步）；长时域、要兼顾性能与约束用 MPC--CBF；二者之间是连续的设计谱。这也回收了本章开头“把 MPC 讲透”的承诺——从名义稳定（\cref{sec:mpc-terminal,sec:mpc-noterminal}）、数值实时（\cref{sec:mpc-numerical}）、鲁棒随机（\cref{sec:mpc-minmax-mrpi,sec:mpc-tube,sec:mpc-stochastic}）到数据安全（\cref{sec:mpc-learning}），MPC 始终是“滚动地解一个带约束最优控制问题”这一个想法在不同维度上的展开。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+本章以导论 \cref{sec:ctrl-mpc} 的四条件与主稳定性定理（\cref{thm:ctrl-mpc-main}）为地基，向三个纵深把 MPC 讲透：
+
+\textbf{稳定性深化}——\cref{prop:mpc-a4} 把终端代价解读为局部律下的无限时域代价上界；\cref{sec:mpc-terminal} 的 DARE 五步流水线把抽象四条件落成可计算设计，核心是 Lyapunov 等式 \cref{eq:mpc-dare-lyap} 使 (A2) 取等、解析切约束 \cref{eq:mpc-alpha-star} 定终端椭球、Chen--Allgöwer \cref{thm:mpc-chen-allgower} 缩椭球处理非线性；\cref{thm:mpc-gruene} 用代价可控性给出无终端约束 MPC 的次优指数 \cref{eq:mpc-alpha-N} 与 $N^\star$ 判据；\cref{sec:mpc-economic} 用严格耗散性与旋转代价 \cref{thm:mpc-rotated} 把经济型代价归约到标准理论。
+
+\textbf{数值结构}——\cref{thm:mpc-shooting-cond} 的条件数定理解释了多射击的存在理由；\cref{thm:mpc-riccati} 给出 Riccati 的线性复杂度与 break-even，并揭示 condensing“看起来多射击、算起来单射击”的病态继承；\cref{thm:mpc-rti-contractivity} 的 RTI 收缩性 + 联合闭环 ISS 是实时 MPC“一周期一迭代仍稳”的底气。\cref{thm:mpc-iss} 的 ISS--MPC 量化了标称 MPC 的固有鲁棒性。
+
+\textbf{鲁棒/随机/学习}——\cref{sec:mpc-mrpi} 的 Pontryagin 差 \cref{eq:mpc-pontryagin-H} 与 mRPI 外近似 \cref{thm:mpc-rakovic} 是 Tube 的地基；\cref{thm:mpc-rigid-tube} 给出刚性管道的鲁棒指数稳定，并延伸到 Homothetic/Elastic/LPV/收缩管道全族；\cref{thm:mpc-chance-socp} 的机会约束 SOCP、\cref{thm:mpc-scenario} 的 Scenario 样本复杂度、\cref{thm:mpc-dro} 的 Wasserstein DRO“鲁棒=正则化”覆盖了无界与分布不确定；\cref{sec:mpc-learning} 接 DeePC/GP--MPC/PSF，\cref{sec:mpc-clf-cbf} 统一 MPC 与 CLF/CBF。
+
+\begin{table}[H]\centering\small
+\caption{本章核心定理速查}
+\label{tab:mpc-summary}
+\begin{tabular}{lll}
+\toprule
+主题 & 关键结论 & 出处 \\
+\midrule
+终端椭球切约束 & $\alpha^\star=\min_\ell b_\ell^2/(c_\ell^\top P^{-1}c_\ell)$ & \cref{eq:mpc-alpha-star} \\
+DARE 使 (A2) 取等 & $A_K^\top PA_K-P=-(Q+K^\top RK)$ & \cref{eq:mpc-dare-lyap} \\
+Grüne 次优指数 & $\alpha_N>0\Rightarrow$ 无终端约束稳 & \cref{eq:mpc-alpha-N} \\
+旋转代价 & 严格耗散 $\Rightarrow$ 经济 MPC 归约标准理论 & \cref{thm:mpc-rotated} \\
+单/多射击条件数 & $e^{2\lambda T}$ vs $e^{2\lambda T/N}$ & \cref{thm:mpc-shooting-cond} \\
+Riccati 复杂度 & $O(N(n_x+n_u)^3)$，快 $N^2$ 倍 & \cref{thm:mpc-riccati} \\
+RTI 收缩性 & $\|w^{k+1}-w^\star\|\le\kappa\|\cdot\|+\omega\|\Delta\hat x_0\|$ & \cref{eq:mpc-rti-contractivity} \\
+ISS--MPC & 增益 $L_VL_f^{N-1}$ & \cref{eq:mpc-iss} \\
+mRPI 外近似 & $\mathcal Z=(1-\bar\alpha)^{-1}\bigoplus_{i=0}^{s-1}A_K^i\mathcal W$ & \cref{eq:mpc-rakovic} \\
+Rigid Tube & $u=\bar u+K(x-\bar x)$，收紧 $\mathcal X\ominus\mathcal Z$ & \cref{thm:mpc-rigid-tube} \\
+机会约束 SOCP & $a^\top\mu+b+\Phi^{-1}(1-\varepsilon)\|\Sigma^{1/2}a\|\le0$ & \cref{eq:mpc-chance-socp} \\
+Scenario 样本数 & $N\ge\lceil\tfrac2\varepsilon(\ln\tfrac1\beta+d)\rceil$ & \cref{eq:mpc-scenario-N} \\
+Wasserstein DRO & 最坏期望 = 均值 + $\varepsilon\cdot\mathrm{Lip}$ & \cref{eq:mpc-dro} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{常见误解}
+\addcontentsline{toc}{section}{常见误解}
+\begin{itemize}
+  \item \textbf{“$N$ 越大越稳/越好”}——稳定靠终端配料而非堆时域（\cref{thm:ctrl-mpc-main}）；无终端约束时需 $\alpha_N>0$（\cref{thm:mpc-gruene}）；不稳定系统 $N$ 大反而更怕扰动（\cref{eq:mpc-iss}）；$N$ 大还更慢。
+  \item \textbf{“OCP 求解成功 = 闭环稳定”}——求解成功只是单步可行，稳定性是另一回事，须验 Lyapunov 下降或递归可行性。
+  \item \textbf{“终端权重可手调”}——破坏 \cref{eq:mpc-dare-lyap} 等号必致漂移，须严格解 DARE。
+  \item \textbf{“去掉终端约束一定更好”}——扩可行域但需更大 $N$，嵌入式平台未必划算。
+  \item \textbf{“Scenario = 蒙特卡洛”}——前者合成决策（$N\sim10^2$），后者评估概率（$N\sim10^4$）。
+  \item \textbf{“Wasserstein $\varepsilon$ 越小越好”}——太小则真分布逃出模糊集、保证失效，应随样本量取 $\varepsilon_N$。
+  \item \textbf{“DeePC 完全无模型”}——Hankel 矩阵承载的正是数据隐含的 LTI 模型（\cref{ch:robust-hinf}）。
+\end{itemize}
+
+\begin{insight}
+\textbf{一句工程洞察}：真实机器人的鲁棒性约 80\% 来自\emph{高频反馈 + 准确状态估计}，仅约 20\% 来自显式的鲁棒 MPC 公式。Tube/Scenario/DRO 给的是“最后那 20\%”的可证保证与最坏情形兜底——别指望它替代高频率与好估计（状态估计见 \cref{ch:eskf,ch:isam2}）。
+\end{insight}
+
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\begin{itemize}
+  \item \textbf{权威专著}：Rawlings--Mayne--Diehl《Model Predictive Control: Theory, Computation, and Design》（四条件/Economic/Tube/Stochastic 的统一处理\cite{rawlings2020mpc}）；Borrelli--Bemporad--Morari《Predictive Control for Linear and Hybrid Systems》（持久可行性/min-max/Explicit\cite{borrelli2017predictive}）。
+  \item \textbf{稳定性深化}：Mayne--Rawlings--Rao--Scokaert 2000 四条件原文\cite{mayne2000constrained}；Grüne--Pannek《Nonlinear MPC》（无终端约束 $\alpha_N$\cite{gruenepannek2017nmpc}）；Diehl--Amrit--Rawlings 旋转代价\cite{diehl2011lyapunov}。
+  \item \textbf{数值与实时}：Bock--Plitt 多射击\cite{bockplitt1984multiple}；Diehl--Bock--Schlöder RTI\cite{diehl2005realtime}；NMPC 内层求解器见 \cref{ch:ddp-ilqr}。
+  \item \textbf{鲁棒/随机}：Raković 等 mRPI\cite{rakovic2005invariant}；Mayne--Seron--Raković Rigid Tube\cite{mayneseronrakovic2005tube}；Calafiore--Campi Scenario\cite{calafiorecampi2006scenario}；Esfahani--Kuhn Wasserstein DRO\cite{esfahanikuhn2018wasserstein}；学习型综述 Hewing 等\cite{hewing2020learning}。
+  \item \textbf{机器人落地}：Di Carlo 等 MIT Cheetah 凸 MPC\cite{dicarlo2018cheetah}（导论 \cref{eq:ctrl-cheetah-ss} 已展开）；浮动基座/接触动力学见 \cref{ch:rigid_body}；采样型 MPPI 见 \cref{ch:mppi}；时空轨迹优化见 \cref{ch:st-trajopt}。
+\end{itemize}
+
+\section*{本章与后续关系}
+\addcontentsline{toc}{section}{本章与后续关系}
+本章把名义 MPC 从抽象四条件推到了实时鲁棒部署，向后接续四条主线：其一，NMPC 的\emph{内层求解器}——\cref{ch:ddp-ilqr} 的 DDP/iLQR 与约束 DDP 给本章 RTI/SQP 的具体高效内核（iLQR = 高斯--牛顿，互引去重）；其二，\emph{采样与时空轨迹}——\cref{ch:mppi} 的 MPPI 是 iLQR 的无导数对偶（path-integral 采样近似），\cref{ch:st-trajopt} 的 CILQR/MPCC 是 MPC 的轨迹优化应用；其三，\emph{动力学与多机}——\cref{ch:rigid_body} 的浮动基座/单刚体模型给鲁棒 MPC 的被控对象（外力 $\tau_{\rm ext}$ 是典型加性扰动 $\mathcal W$、质量惯量误差接 LPV），\cref{ch:mr-dmpc} 给分布式 Tube；其四，\emph{数据与安全}——\cref{ch:robust-hinf} 的 Willems 引理/DeePC 与本章 DRO 视角互补，\cref{ch:clf-cbf} 的 CBF 主理论与本章 MPC--CBF 关系互补，预测安全滤波器/可微 MPC/domain randomization 则在强化学习部展开为安全 RL 与 sim-to-real 的桥梁。

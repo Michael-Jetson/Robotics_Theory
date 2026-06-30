@@ -1,0 +1,2279 @@
+\chapter{设计一个视觉 SLAM 系统}
+\label{ch:slam_system}
+
+% ════════════════════════════════════════════════════════════════
+%  综合实践 capstone：吸收 视觉SLAM十四讲 ch13 实践:设计SLAM系统
+%  + slambook2/ch13 官方源码全量补全 + ORB-SLAM2(T-RO 2017/2015) 架构对照
+%  + SLAM Handbook ch7 Visual SLAM。自包含、全吸收、右扰动为主。
+%  教学层遵循 v5.0 算法工程教学规范（前置自测→目标→导航→桥接
+%  →各节[动机→反面→理论→陷阱→练习]→常见误解→小结→延伸阅读→后续→故障排查）。
+%  text:code >= 60:40；代码注释纯 ASCII。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+本章是 SLAM 部分的综合实践。开始之前先自测：若都能流畅作答，可只速读各节代码骨架与小结速查表；若卡住，正是本章要为你打通的。
+\begin{enumerate}
+  \item 前面几章你已分别学过\emph{特征提取与匹配}、\emph{位姿估计}、\emph{三角化}、\emph{光束法平差（BA）}、\emph{回环检测}。把它们拼成一个能在数据集上跑起来的程序，还缺什么？
+  \item 一个 SLAM 程序为什么要把\emph{前端}和\emph{后端}分到两个线程？如果只用一个线程，会牺牲什么？
+  \item 后端的 BA 问题规模会随时间一直增长吗？如果不加控制，跑十分钟后会发生什么？怎么把它“关”在一个有界规模里？
+  \item 帧、特征、地图点这三种对象互相持有指针。如果都用 \texttt{std::shared\_ptr}，会出什么内存问题？
+  \item 选双目（而非单目）作为第一个能跑的系统，最大的好处是什么？（提示：和“初始化”有关。）
+  \item 你的精简 VO 和工业级的 ORB-SLAM2 差在哪几块？哪些是“锦上添花”，哪些是“没有就会漂”？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}一个视觉 SLAM 系统的整体架构——前端 / 后端 / 地图三大模块如何分工、如何通过一个共享地图在两个线程间传递数据；
+  \item \textbf{设计}帧（Frame）、特征（Feature）、地图点（MapPoint）、地图（Map）四种基本数据结构，并解释其中的线程锁、智能指针、工厂函数等工程决策的来由；
+  \item \textbf{实现}一个双目（或 RGB-D）前端的完整链路：带掩膜的特征提取、左右目与时序的光流匹配、单帧三角化初始化、仅优化位姿的 BA（pose-only BA）、关键帧选取；
+  \item \textbf{实现}一个基于“激活窗口”的滑窗后端：局部 BA、双目重投影边、Huber 鲁棒核、Schur 边缘化路标、自适应外点剔除；
+  \item \textbf{解释}“激活窗口 = 滑动窗口”的工程近似与严格滑窗边缘化的差异，理解删旧帧会丢掉哪些信息；
+  \item \textbf{驾驭}多线程并发的三件套（互斥锁 / 条件变量 / 原子布尔）与生产者—消费者模型，并写出可优雅退出的后端线程；
+  \item \textbf{对照} ORB-SLAM2 的三（+一）线程架构、共视图 / 本质图、关键帧选取与剔除、回环线程，说清精简 VO 缺了什么、为什么工业系统要补这些。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把前面各章的砖块，砌成一座能运行的房子}”的主线——它几乎不引入新的数学，而是回答“软件框架怎么搭、数据结构怎么设、多线程怎么组织、BA 规模怎么控”这些工程问题。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  cmp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (arch) {系统架构\\ 前端/后端/地图};
+\node[blk, right=of arch] (ds) {数据结构\\ Frame/Feature/\\MapPoint/Map};
+\node[grp, right=of ds] (fe) {双目前端\\ 光流+三角化\\+pose-only BA};
+\node[grp, below=8mm of arch] (be) {滑窗后端\\ 局部 BA\\+外点剔除};
+\node[grp, right=of be] (mt) {多线程并发\\ mutex/cv/atomic};
+\node[cmp, right=of mt] (orb) {ORB-SLAM2\\ 架构对照};
+\draw[ln] (arch)--(ds); \draw[ln] (ds)--(fe);
+\draw[ln] (fe.south) -- ++(0,-4mm) -| (be.north);
+\draw[ln] (be)--(mt); \draw[ln] (mt)--(orb);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:sys-arch}（架构）与 \cref{sec:sys-data}（数据结构）是骨架，任何读者必读；\cref{sec:sys-frontend}（前端）与 \cref{sec:sys-backend}（后端）是肉，含本章全部可运行代码；\cref{sec:sys-thread}（多线程）把前后端“接通”；\cref{sec:sys-orbslam}（ORB-SLAM2 对照）是“望向工业级”的窗口，建议精读。带回环的 \cref{sec:sys-loop} 是对精简 VO 的自然延伸，可在读完回环章后回看。
+
+\subsection*{前置知识桥接}
+本章是综合实践，几乎每一块都直接复用前面的章节，请把它当作一次“总复习 + 集成”：
+\begin{itemize}
+  \item \cref{ch:camera}（相机模型）给出针孔投影 $\pi(\cdot)$、内参 $K$、双目基线与反投影——本章的 \texttt{Camera} 类、三角化、重投影边全建立其上；
+  \item \cref{ch:lie}（李群与李代数）给出 $\SE(3)$ 上的扰动求导与右扰动约定——本章 g2o 顶点的更新、重投影误差的雅可比都是它的直接应用；
+  \item \cref{ch:vo}（视觉里程计）给出特征提取匹配、光流（LK）、三角化、PnP/BA 的位姿估计——本章前端是它的工程化封装；
+  \item \cref{ch:nlopt}（非线性优化）给出 BA 的最小二乘形式、Gauss--Newton/LM、$H$ 矩阵稀疏性与 Schur 边缘化、鲁棒核——本章后端的局部 BA 与“激活窗口 = 滑窗”都源于此；
+  \item \cref{ch:loop}（回环检测）给出词袋与位姿图——本章可选的回环线程（\cref{sec:sys-loop}）由它支撑；
+  \item \cref{ch:dense}（稠密建图）给出从位姿与深度重建地图的思路——本章的“地图”是稀疏路标地图，与稠密建图互补。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+你会停留在“每个模块都会、但拼不成一个系统”的状态：知道怎么三角化一对点，却不知道地图点该由谁持有、什么时候删；会写一次 BA，却不知道怎么让它一直跑而规模不爆炸；懂光流，却不知道前端和后端该怎么在两个线程里安全地共享同一张地图。本章正是把这些“砖块之间的水泥”讲清楚。
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（跟着代码逐函数读，并对照运行） & 6--8 小时 & 首次系统搭 SLAM、要动手写一个 VO \\
+速读（读架构 + 前后端骨架 + ORB 对照） & 2.5 小时 & 已会各模块、想看“怎么集成” \\
+速查（只看小结的符号表 + 速查表 + 对照表） & 20 分钟 & 写代码时回来查接口与参数 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+位姿 $\mathbf{T}\in\SE(3)$，代码类型 \texttt{SE3}（\texttt{Sophus::SE3d}）；\textbf{本章约定帧位姿存的是} $\mathbf{T}_{cw}$（world\,$\to$\,camera，把世界点变到相机系），相机到世界为 $\mathbf{T}_{wc}=\mathbf{T}_{cw}^{-1}$。旋转 $\mathbf{R}\in\SO(3)$；三维点 $\mathbf{p}_w\in\mathbb{R}^3$（世界系，代码 \texttt{Vec3 pos\_}）；像素观测 $\mathbf{z}\in\mathbb{R}^2$；内参 $K$（分量 $f_x,f_y,c_x,c_y$）；左右目外参 $\mathbf{T}_{\mathrm{ext}}$（\texttt{left\_ext}/\allowbreak\texttt{right\_ext}）；投影函数 $\pi(\cdot)$。重投影误差 $\mathbf{e}=\mathbf{z}-\pi(\cdot)$（观测减预测）；信息矩阵 $\boldsymbol\Omega=\boldsymbol\Sigma_v^{-1}=\mathbf{I}_{2\times2}$（各向同性单位权）。
+\textbf{扰动方向：全书以右扰动为主} $\mathbf{T}\leftarrow\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol\xi)$，$\boldsymbol\xi=[\boldsymbol\rho;\boldsymbol\phi]$（平移在前、旋转在后）；本章复用的十四讲原始代码用左扰动，会在出现处显式标出转换关系（\cref{sec:sys-jacobian}）。
+本章源代码骨架取自《视觉SLAM十四讲》\cite{gaoxiang2019slam14} 第 13 讲及其配套仓库 \texttt{slambook2/\allowbreak ch13}；架构对照取自 ORB-SLAM2\cite{murartal2017orbslam2}、ORB-SLAM\cite{murartal2015orbslam} 与 SLAM Handbook\cite{carlone2026handbook}。代码注释一律 ASCII。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么要单独讲“搭系统”}
+\label{sec:sys-why}
+
+\paragraph{动机：会砌砖，不等于会盖房。}
+到这里，你已经掌握了 SLAM 的几乎所有“砖块”：相机模型、特征匹配、三角化、位姿估计、BA、回环。但一个能用的 SLAM 程序不是这些砖块的简单堆叠。不妨借《我的世界》（Minecraft）打个比方\cite{gaoxiang2019slam14}：玩家手里只有性质极其简单的方块，理解一个方块毫不费力；可初学者往往只能搭出“火柴盒房屋”，而有经验、有创造力的玩家能用同样的方块盖出民居、园林、楼台亭榭乃至整座城市。差别不在于砖块，而在于\emph{怎么组织它们}。SLAM 也是如此——\textbf{工程实现与理解算法原理至少同等重要}，甚至更应强调如何写出真正可用的程序。
+
+\paragraph{反面：只懂原理会卡在哪。}
+如果只停留在“每个算法都会推”，你一旦动手就会被一连串\emph{原理书里不讲}的问题挡住：怎么管理地图点（谁创建、谁持有、什么时候删）？怎么处理误匹配（一条错边能把整段轨迹拽歪）？如何选关键帧（每帧都建图会爆炸，太少又会丢）？怎么让 BA 一直跑而规模不增长？这些问题没有唯一“最优解”，但几乎每个人实现 SLAM 时都会撞上。本章的目标，是让你对这些问题先建立起\emph{直观的感觉}——作者认为这种感觉非常重要。
+
+\paragraph{方法论：像堆雪人一样从简单堆起。}
+本章采用“由简到繁”的策略：先用最简单的数据结构搭一个能跑的视觉里程计，再慢慢把额外功能加进来。这样你能看清一个库是\emph{如何像雪人那样一点点堆起来}的，而不是一上来就面对一个庞大的工业级代码库无从下手。
+
+\paragraph{本章要造什么。}
+我们造一个\textbf{精简版的双目视觉里程计}，让它在 KITTI 数据集上实际运行。它由\emph{一个光流追踪的前端}和\emph{一个局部 BA 的后端}组成。代码组织对应官方仓库 \texttt{slambook2/\allowbreak ch13}。
+
+\begin{insight}
+\textbf{为什么第一个能跑的系统选双目，而不是单目？}
+两条理由。其一，双目\emph{只需单帧即可完成初始化}：左右目同时看到同一场景，一对图像就能三角化出带\textbf{真实尺度}的初始地图，彻底回避了单目“需要足够视差的两帧 + 单应/本质矩阵分解 + 尺度归一”这套脆弱的初始化流程。其二，双目天然存在 \textbf{3D 观测}（左右目三角化即得深度），约束更强，效果也比单目好。RGB-D 在这两点上与双目同理（深度图直接给 3D），所以本章的数据结构与流程对 RGB-D 几乎可以原样复用，差别仅在“右目光流匹配 + 三角化”换成“读一张深度图”。
+\end{insight}
+
+这条“选双目以换取单帧初始化”的折中，是理解后面所有设计的钥匙：因为有了可靠的单帧 3D 观测，前端才能用“2D--3D 对应”做 pose-only BA，后端才能用双目重投影边把基线信息喂进 BA。下面我们从最顶层的架构开始。
+
+% ════════════════════════════════════════════════════════════════
+\section{系统架构与模块划分}
+\label{sec:sys-arch}
+
+\paragraph{动机：先回答“程序 = 数据结构 + 算法”。}
+动手写代码之前，要先想清楚写什么。借用一句老观点——\emph{程序 = 数据结构 + 算法}——针对视觉里程计就该问三件事：它处理\textbf{怎样的数据}？涉及哪些关键\textbf{算法}？它们之间是怎样的\textbf{关系}？把这三问答清楚，架构就出来了。
+
+\paragraph{基本数据单元：从图像推到路标。}
+我们一步步推。处理的最基本单元是\emph{图像}；在双目里那是\emph{一对图像}，称为一\textbf{帧（Frame）}。我们会对帧提取\textbf{特征（Feature）}，这些特征是很多 2D 的点。然后在图像之间寻找特征的\emph{关联}：如果某个特征能被\emph{多次看到}，就能用\textbf{三角化}算出它的 3D 位置，即一个\textbf{路标（也叫路标点、地图点，MapPoint）}。于是\emph{帧、特征、路标}就是系统中最基本的三种结构。本章中“路标 / 路标点 / 地图点”三个词语义完全相同，都指三维空间中的一个点。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small,
+  fr/.style={draw, rounded corners, fill=main!8, draw=main!60!black, align=center, minimum width=22mm, minimum height=10mm},
+  ft/.style={circle, draw, fill=second!15, draw=second!60!black, inner sep=1.4pt},
+  mp/.style={draw, diamond, fill=third!15, draw=third!60!black, inner sep=2pt}]
+\node[fr] (f1) at (0,0) {Frame $k$\\ (left+right)};
+\node[fr] (f2) at (0,-2.2) {Frame $k{+}1$};
+\foreach \y/\n in {0.5/a, 0.0/b, -0.5/c} { \node[ft] (\n) at (2.4,\y) {}; }
+\foreach \y/\n in {-1.7/d, -2.2/e, -2.7/f} { \node[ft] (\n) at (2.4,\y) {}; }
+\node[mp] (m1) at (5.2,0.3) {$\mathbf{p}_1$};
+\node[mp] (m2) at (5.2,-1.0) {$\mathbf{p}_2$};
+\draw[->] (f1) -- (a); \draw[->] (f1) -- (b); \draw[->] (f1) -- (c);
+\draw[->] (f2) -- (d); \draw[->] (f2) -- (e); \draw[->] (f2) -- (f);
+\draw[->, gray!70!black] (a) -- (m1); \draw[->, gray!70!black] (d) -- (m1);
+\draw[->, gray!70!black] (b) -- (m2); \draw[->, gray!70!black] (e) -- (m2);
+\node[align=left, font=\footnotesize] at (2.4,1.3) {Feature\\(2D 像素)};
+\node[align=left, font=\footnotesize] at (5.2,1.2) {MapPoint\\(3D 点)};
+\end{tikzpicture}
+\caption{三种基本数据结构及其关系：一个 Frame 持有若干 Feature（2D 像素观测），每个 Feature 关联到一个 MapPoint（3D 路标），而一个 MapPoint 被多个 Feature（来自不同帧或左右目）观测。}
+\label{fig:sys-data-relation}
+\end{figure}
+
+\paragraph{算法划分：前端快、后端准。}
+SLAM 在算法上分为\textbf{前端}与\textbf{后端}。前端负责计算相邻图像的特征匹配，要\emph{快}，以保证实时性；后端负责优化整个问题，要\emph{准}，对关键帧做精细优化以保证好结果。在典型实现中，二者应有\emph{各自的线程}：前端在主线程飞快地处理每一帧，后端在另一个线程慢慢地优化关键帧。两个模块的职责可以这样概括：
+
+\begin{itemize}
+  \item \textbf{前端}：往里插入一帧图像 $\to$ 提取特征 $\to$ 与上一帧做光流追踪 $\to$ 由光流结果计算该帧定位 $\to$ 必要时补充新特征并三角化。\emph{前端的处理结果，作为后端优化的初始值}。
+  \item \textbf{后端}：一个较慢的线程，拿到处理好的关键帧和路标点 $\to$ 对它们做优化 $\to$ 返回结果。\emph{后端必须把优化问题的规模控制在一定范围内，不能随时间一直增长}。
+\end{itemize}
+
+\paragraph{中枢：在前后端之间放一个“地图”。}
+前端在自己的线程里产出数据，后端在自己的线程里消费数据，二者并不直接对话——中间隔着一个\textbf{地图（Map）}模块作为共享中枢。预想的数据流是：前端提取了关键帧后，往地图里\emph{添加新数据}；后端\emph{检测到地图更新}时，运行一次优化，然后把地图里“旧的”关键帧和地图点移出优化窗口，保持优化规模有界。\cref{fig:sys-pipeline} 把这条流水线画了出来。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=10mm,
+  m/.style={draw, rounded corners, align=center, minimum height=11mm, inner sep=4pt},
+  fe/.style={m, fill=second!10, draw=second!60!black},
+  bk/.style={m, fill=third!10, draw=third!60!black},
+  mp/.style={m, fill=main!10, draw=main!60!black},
+  vw/.style={m, fill=gray!10, draw=gray!60!black}]
+\node[vw] (ds) {Dataset\\（KITTI 拉帧）};
+\node[fe, right=14mm of ds] (front) {Frontend\\（Tracking 线程）};
+\node[mp, right=14mm of front] (map) {Map\\（共享，加锁）\\ active window};
+\node[bk, right=14mm of map] (back) {Backend\\（优化线程）};
+\node[vw, below=10mm of map] (view) {Viewer\\（可视化线程）};
+\draw[->] (ds) -- (front);
+\draw[->] (front) -- node[above, font=\footnotesize]{Insert} (map);
+\draw[->] ([yshift=-3mm]map.east) -- node[below, font=\footnotesize]{GetActive} ([yshift=-3mm]back.west);
+\draw[->] ([yshift=3mm]back.west) -- node[above, font=\footnotesize]{SetPose/SetPos} ([yshift=3mm]map.east);
+\draw[->, dashed] (front.south) .. controls +(0,-8mm) and +(0,8mm) .. node[left, font=\footnotesize]{UpdateMap (cv)} (back.north);
+\draw[->] (map) -- (view);
+\end{tikzpicture}
+\caption{系统流水线。前端在 Tracking 线程拉帧、追踪、向地图插入关键帧和地图点，并用条件变量 \texttt{UpdateMap} 唤醒后端；后端在优化线程取出地图的“激活窗口”做局部 BA，再把优化后的位姿与路标写回地图；可视化线程独立显示。}
+\label{fig:sys-pipeline}
+\end{figure}
+
+\paragraph{周边小模块：不算核心但不可或缺。}
+除前端 / 后端 / 地图三大核心外，还有四个周边模块：\textbf{相机类（Camera）}管理相机内外参与投影函数；\textbf{配置类（Config）}从配置文件读取可调参数；\textbf{数据集类（Dataset）}按 KITTI 的存储格式读图像；\textbf{可视化模块（Viewer）}显示系统运行状态，否则“你就只能对着一串串数值挠头”。这些模块不含核心算法，本章把它们当“工程脚手架”，在 \cref{sec:sys-thread} 末与附录处给出接口与关键实现。
+
+\paragraph{目录约定：按模块分文件夹。}
+大多数小型算法库都按模块分类存放文件，本工程沿用这一惯例（\cref{tab:sys-dirs}）。其中把头文件放进 \texttt{include/\allowbreak myslam/\allowbreak } 是一个值得说明的小技巧：包含目录设到 \texttt{include} 后，引用自己的头文件要写成 \Verb[breaklines]|#include "myslam/xxx.h"|，这样\emph{不容易和别的库的同名头文件混淆}。
+
+\begin{table}[H]\centering\small
+\caption{工程目录约定}
+\label{tab:sys-dirs}
+\begin{tabular}{ll}
+\toprule
+目录 & 存放内容 \\
+\midrule
+\texttt{bin/} & 编译好的二进制（可执行程序输出） \\
+\texttt{include/\allowbreak myslam/\allowbreak } & SLAM 模块头文件（\texttt{.h}），引用写 \texttt{myslam/\allowbreak xxx.\allowbreak h} 避免混淆 \\
+\texttt{src/} & 源代码文件（\texttt{.cpp}） \\
+\texttt{test/} & 测试文件（\texttt{.cpp}） \\
+\texttt{config/} & 配置文件（如 \texttt{config/\allowbreak default.\allowbreak yaml}） \\
+\texttt{cmake\_modules/\allowbreak } & 第三方库的 cmake 模块（如使用 g2o 时的 \texttt{FindG2O.\allowbreak cmake}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{从模块到可运行系统：依赖注入装配。}
+模块划分清楚之后，把它们“接成”一个能跑的系统靠的是一个总成类 \texttt{VisualOdometry}。它的 \texttt{Init()} 完成\emph{依赖注入}：建好前端、后端、地图、可视化、左右相机，然后互相 \texttt{Set} 指针；\texttt{Run()} 则是主循环——从数据集取下一帧，喂给前端，循环到没有帧为止。注意：真正的并行发生在后端构造时启动的优化线程和可视化线程里，主循环本身是单线程拉帧。
+
+\begin{codebox}[C++]{系统总成:VisualOdometry 的装配与主循环（slambook2/ch13）}
+bool VisualOdometry::Init() {
+    // read from config file
+    if (Config::SetParameterFile(config_file_path_) == false) return false;
+
+    dataset_ = Dataset::Ptr(new Dataset(Config::Get<std::string>("dataset_dir")));
+    CHECK_EQ(dataset_->Init(), true);
+
+    // create components and links (dependency injection)
+    frontend_ = Frontend::Ptr(new Frontend);
+    backend_  = Backend::Ptr(new Backend);     // ctor starts the backend thread
+    map_      = Map::Ptr(new Map);
+    viewer_   = Viewer::Ptr(new Viewer);
+
+    frontend_->SetBackend(backend_);
+    frontend_->SetMap(map_);
+    frontend_->SetViewer(viewer_);
+    frontend_->SetCameras(dataset_->GetCamera(0), dataset_->GetCamera(1)); // left,right
+
+    backend_->SetMap(map_);
+    backend_->SetCameras(dataset_->GetCamera(0), dataset_->GetCamera(1));
+
+    viewer_->SetMap(map_);                      // Map is the shared hub
+    return true;
+}
+
+void VisualOdometry::Run() {
+    while (1) { if (Step() == false) break; }   // pull-and-process main loop
+    backend_->Stop();                           // graceful shutdown
+    viewer_->Close();
+}
+
+bool VisualOdometry::Step() {
+    Frame::Ptr new_frame = dataset_->NextFrame();
+    if (new_frame == nullptr) return false;     // no more images -> end
+    auto t1 = std::chrono::steady_clock::now();
+    bool success = frontend_->AddFrame(new_frame);  // hand the frame to frontend
+    auto t2 = std::chrono::steady_clock::now();
+    auto time_used =
+        std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1);
+    LOG(INFO) << "VO cost time: " << time_used.count() << " seconds.";
+    return success;
+}
+\end{codebox}
+
+\noindent 这段装配代码里藏着两个之后会反复出现的设计要点：其一，\texttt{Backend} 的构造函数\emph{就启动了后端线程}（线程随即挂起等待唤醒，不空转 CPU），这是 \cref{sec:sys-thread} 多线程模型的入口；其二，\texttt{Map} 被注入到前端、后端、可视化三方，是唯一的共享中枢——这也意味着对它的访问\emph{必须加锁}。带着这两点，我们先把三种基本数据结构造出来。
+
+\begin{pitfall}[概念误区：以为“前后端分线程只是为了快”]
+分线程不只是为了并行加速，更是为了\textbf{解耦实时性与精度}两个互相冲突的目标。前端必须在每帧的时间预算内（KITTI 约 16\,ms/帧，见 \cref{sec:sys-experiment}）给出一个\emph{够用}的位姿，哪怕不是最优；后端可以慢悠悠地花几十毫秒把最近几个关键帧优化到\emph{最优}，再把结果悄悄写回地图供前端下次参考。若挤在一个线程里，后端的 BA 会卡住前端拉帧，实时性立刻崩掉。
+\end{pitfall}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 画出本系统的数据流向图，标出哪些箭头是“前端 $\to$ 地图”，哪些是“地图 $\to$ 后端”，哪些是“后端 $\to$ 地图”。对照 \cref{fig:sys-pipeline} 检查。
+  \item \texttt{VisualOdometry::Step()} 为什么要给 \texttt{AddFrame} 计时？这个时间反映的是前端还是后端的耗时？（提示：后端在另一个线程。）
+  \item 如果把 \texttt{Map} 的指针只注入给前端、不给后端，会发生什么？后端还能取到关键帧吗？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{基本数据结构}
+\label{sec:sys-data}
+
+\paragraph{动机：先把“名词”定义清楚。}
+\cref{sec:sys-arch} 已经从概念上确定了帧、特征、地图点、地图四个名词。本节把它们落成 C++ 类。一条贯穿始终的设计原则是：基本数据结构通常建议设成 \texttt{struct}，无须复杂的私有变量和接口——它们主要是“装数据的盒子”。但有一个例外必须警惕：\emph{这些数据会被前后端两个线程同时访问和修改}，所以在关键成员（位姿、路标位置、地图容器）上必须加\textbf{线程锁}。
+
+\subsection{Frame：一帧的容器}
+\label{sec:sys-frame}
+
+帧含有 id、位姿、左右图像，以及左右图像中提取到的特征。其中\emph{位姿会被前后端同时设置或访问}（前端写入预测位姿、后端写入优化后位姿、前端读取做光流初值），所以位姿不直接暴露成员，而是包装成加锁的 \texttt{Pose()} / \texttt{SetPose()}。另外，帧由一个\emph{静态工厂函数} \texttt{CreateFrame()} 构建，在其中自动分配自增 id——这样 id 的分配集中在一处、不会重复。
+
+\begin{codebox}[C++]{Frame:帧结构（include/myslam/frame.h）}
+struct Frame {
+   public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW;            // 16-byte aligned new for Eigen members
+    typedef std::shared_ptr<Frame> Ptr;
+
+    unsigned long id_ = 0;            // global frame id
+    unsigned long keyframe_id_ = 0;  // keyframe id (used as g2o vertex id in backend)
+    bool is_keyframe_ = false;
+    double time_stamp_;              // timestamp, unused for now
+    SE3 pose_;                       // Tcw : world -> camera
+    std::mutex pose_mutex_;          // lock guarding pose_
+    cv::Mat left_img_, right_img_;   // stereo images
+
+    std::vector<std::shared_ptr<Feature>> features_left_;   // features in left image
+    std::vector<std::shared_ptr<Feature>> features_right_;  // right; nullptr if no match
+
+    Frame() {}
+    Frame(long id, double time_stamp, const SE3 &pose, const Mat &left, const Mat &right);
+
+    SE3 Pose() {                                 // thread-safe get
+        std::unique_lock<std::mutex> lck(pose_mutex_);
+        return pose_;
+    }
+    void SetPose(const SE3 &pose) {              // thread-safe set
+        std::unique_lock<std::mutex> lck(pose_mutex_);
+        pose_ = pose;
+    }
+    void SetKeyFrame();                          // mark as keyframe and assign keyframe_id_
+    static std::shared_ptr<Frame> CreateFrame(); // factory: assign id_
+};
+\end{codebox}
+
+\noindent 几个值得记住的细节：（1）\texttt{id\_}（全局帧 id）与 \texttt{keyframe\_id\_}（关键帧 id）\emph{分开}——后端的 g2o 位姿顶点用 \texttt{keyframe\_id\_} 编号（见 \cref{sec:sys-backend}）。（2）\texttt{pose\_} 是 $\mathbf{T}_{cw}$，注释写明 “Tcw”。（3）左目特征与右目特征分开存，右目无对应时该位置置 \texttt{nullptr}（保持左右下标一一对应）。（4）\Verb[breaklines]|EIGEN_MAKE_ALIGNED_OPERATOR_NEW| 是因为结构含 Eigen 定长矩阵成员（\texttt{SE3} 内部），需要 16 字节对齐的 \texttt{new}——这是用 Eigen 时一个经典的“不写就偶发崩溃”的坑。
+
+\subsection{Feature：一个 2D 观测，与 weak\_ptr 的妙用}
+\label{sec:sys-feature}
+
+特征最主要的信息是它自身的 2D 像素位置；此外有两个标志位：\texttt{is\_outlier\_}（是否被判为异常点）、\texttt{is\_on\_left\_image\_}（提自左图还是右图）。一个特征还要能\emph{回指}持有它的帧、以及它对应的路标。问题来了：帧持有特征（\texttt{shared\_ptr}），特征又回指帧——如果回指也用 \texttt{shared\_ptr}，二者的引用计数会互相加一、永远归不了零，对象永远不析构，这就是\textbf{循环引用}导致的内存泄漏。
+
+\begin{codebox}[C++]{Feature:特征（include/myslam/feature.h）}
+struct Feature {
+   public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
+    typedef std::shared_ptr<Feature> Ptr;
+
+    std::weak_ptr<Frame> frame_;          // the holding frame (weak: break cycle)
+    cv::KeyPoint position_;               // 2D pixel position
+    std::weak_ptr<MapPoint> map_point_;   // associated landmark (weak: break cycle)
+
+    bool is_outlier_ = false;
+    bool is_on_left_image_ = true;        // false means right image
+
+    Feature() {}
+    Feature(std::shared_ptr<Frame> frame, const cv::KeyPoint &kp)
+        : frame_(frame), position_(kp) {}
+};
+\end{codebox}
+
+\begin{insight}
+\textbf{为什么这里非用 \texttt{weak\_ptr} 不可？}
+对象的\emph{实际持有权}归地图：地图持有帧（\texttt{shared\_ptr}），帧持有特征（\texttt{shared\_ptr}），地图持有路标（\texttt{shared\_ptr}），路标持有它的观测列表。而“反向”的链接——特征指回帧、特征指向路标——只是为了\emph{方便访问}，不该影响生命周期，所以一律用 \texttt{weak\_ptr}（不增加引用计数）。用的时候调 \texttt{.lock()} 临时提升为 \texttt{shared\_ptr}：若对象还活着就拿到它，若已被地图清理就得到 \texttt{nullptr}——\emph{这个 \texttt{nullptr} 正好用来判活}。这个模式在前端 \texttt{TrackLastFrame}（\Verb[breaklines]|kp->map_point_.lock()|）和后端 \texttt{Optimize}（\verb|obs.lock()|、\Verb[breaklines]|feat->frame_.lock()|）中反复出现，是本章最重要的 C++ 工程技巧。
+\end{insight}
+
+\subsection{MapPoint：一个 3D 路标}
+\label{sec:sys-mappoint}
+
+地图点最主要的信息是它的 3D 世界坐标 \texttt{pos\_}，同样要加锁（前端三角化写入、后端 BA 写入、前端光流读取并发访问）。它还用一个链表 \texttt{observations\_} 记录“自己被哪些特征观察到”——因为特征可能被判为外点而摘除观测，所以这个链表的改动也要加锁。\texttt{observed\_times\_} 计被观测次数，用于地图清理（观测数归零的点会被删）。
+
+\begin{codebox}[C++]{MapPoint:路标点（include/myslam/mappoint.h）}
+struct MapPoint {
+   public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
+    typedef std::shared_ptr<MapPoint> Ptr;
+    unsigned long id_ = 0;
+    bool is_outlier_ = false;
+    Vec3 pos_ = Vec3::Zero();          // position in world frame
+    std::mutex data_mutex_;
+    int observed_times_ = 0;           // number of times observed
+    std::list<std::weak_ptr<Feature>> observations_;  // who observes me
+
+    MapPoint() {}
+    MapPoint(long id, Vec3 position);
+
+    Vec3 Pos() {
+        std::unique_lock<std::mutex> lck(data_mutex_);
+        return pos_;
+    }
+    void SetPos(const Vec3 &pos) {
+        std::unique_lock<std::mutex> lck(data_mutex_);
+        pos_ = pos;
+    }
+    void AddObservation(std::shared_ptr<Feature> feature) {
+        std::unique_lock<std::mutex> lck(data_mutex_);
+        observations_.push_back(feature);
+        observed_times_++;
+    }
+    void RemoveObservation(std::shared_ptr<Feature> feat);  // erase + observed_times_--
+    std::list<std::weak_ptr<Feature>> GetObs() {
+        std::unique_lock<std::mutex> lck(data_mutex_);
+        return observations_;
+    }
+    static MapPoint::Ptr CreateNewMappoint();   // factory: assign id_
+};
+\end{codebox}
+
+\noindent \texttt{observations\_} 选用 \texttt{std::list} 而非 \texttt{std::vector}，是因为后端剔外点、删旧帧时要在链表\emph{中间}删元素，链表的中间删除是 $O(1)$。\texttt{RemoveObservation} 的实现要做三件事：从链表里 erase 掉指定特征、\texttt{observed\_times\_-{}-}、并把那条特征的 \texttt{map\_point\_} 重置——后端剔外点（\cref{sec:sys-backend}）与地图删旧帧（\cref{sec:sys-slidewindow}）都会调它。
+
+\subsection{Map：真正的持有者与“激活窗口”}
+\label{sec:sys-map}
+
+谁来\emph{实际持有}这些帧和地图点？答案是地图类 \texttt{Map}。它用\textbf{散列表}（\texttt{std::unordered\_map}，键为 id）记录所有的关键帧和所有的路标点——散列表的按 id 增 / 删 / 查平均都是 $O(1)$，这正是地图点频繁增删时选它而非 \texttt{vector} 的原因。但更关键的设计是：地图\emph{同时}维护一套“被激活”的关键帧和地图点。
+
+\begin{codebox}[C++]{Map:地图（include/myslam/map.h）}
+class Map {
+   public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
+    typedef std::shared_ptr<Map> Ptr;
+    typedef std::unordered_map<unsigned long, MapPoint::Ptr> LandmarksType;
+    typedef std::unordered_map<unsigned long, Frame::Ptr> KeyframesType;
+
+    Map() {}
+    void InsertKeyFrame(Frame::Ptr frame);
+    void InsertMapPoint(MapPoint::Ptr map_point);
+
+    LandmarksType GetAllMapPoints()    { std::unique_lock<std::mutex> l(data_mutex_); return landmarks_; }
+    KeyframesType GetAllKeyFrames()    { std::unique_lock<std::mutex> l(data_mutex_); return keyframes_; }
+    LandmarksType GetActiveMapPoints() { std::unique_lock<std::mutex> l(data_mutex_); return active_landmarks_; }
+    KeyframesType GetActiveKeyFrames() { std::unique_lock<std::mutex> l(data_mutex_); return active_keyframes_; }
+
+    void CleanMap();                    // remove active landmarks with 0 observations
+
+   private:
+    void RemoveOldKeyframe();           // slide the active window forward
+    std::mutex data_mutex_;
+    LandmarksType landmarks_;           // all landmarks (full history)
+    LandmarksType active_landmarks_;    // active landmarks (the window)
+    KeyframesType keyframes_;           // all key-frames (full history)
+    KeyframesType active_keyframes_;    // active key-frames (the window)
+    Frame::Ptr current_frame_ = nullptr;
+    int num_active_keyframes_ = 7;      // window size
+};
+\end{codebox}
+
+\paragraph{“激活”就是“窗口”。}
+地图里有\emph{两套}容器：\texttt{landmarks\_}/\allowbreak\texttt{keyframes\_} 是全部历史，\texttt{active\_landmarks\_}/\allowbreak\texttt{active\_keyframes\_} 是被激活的子集。这里“激活”的概念，就是我们在 \cref{ch:nlopt} 谈滑动窗口时所说的\textbf{窗口}——它随着时间往前推动。\emph{后端只从地图取出激活的关键帧、路标点来优化，忽略其余部分}，于是优化规模恒定（$\le 7$ 个关键帧 + 它们看到的路标），这就是“控制 BA 规模”落到实处的机制。激活策略由我们自己定义，最简单的就是\emph{保留时间上最新的若干个关键帧、移出最旧的}。本实现保留最新的 7 个（\texttt{num\_active\_keyframes\_ = 7}）。
+
+\begin{insight}
+把 \cref{fig:sys-pipeline} 里那个抽象的“Map 中枢”想象成一条传送带：前端不停地往传送带这头放新的关键帧；传送带只能容下 7 个；每放进一个新的，最旧的就从那头掉下去（移出激活集，但仍留在全量历史里）。后端永远只盯着传送带上的这 7 个做 BA。这就是“激活窗口”最朴素的图像，它的滑动逻辑（到底掉哪一个）我们留到 \cref{sec:sys-slidewindow} 细讲。
+\end{insight}
+
+\begin{pitfall}[编程陷阱：getter 返回的是拷贝还是引用？]
+注意上面四个 getter 都\emph{按值返回}容器的拷贝（在锁的保护下拷一份再返回），而不是返回引用。这是有意为之：后端在另一个线程里遍历这份拷贝时，前端可能正在往原容器里插新帧；若返回引用，后端遍历途中容器被改写（rehash、迭代器失效）就会崩。按值返回 + 加锁拷贝，用一点拷贝开销换来了线程安全。代价是：后端拿到的是“快照”，可能略微滞后于最新地图——对滑窗 BA 而言完全可以接受。
+\end{pitfall}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item Frame 的 \texttt{pose\_} 和 MapPoint 的 \texttt{pos\_} 都加了锁，但 Frame 的 \texttt{features\_left\_} 没加锁。想一想为什么前者必须加、后者在本实现里可以不加？（提示：谁会并发写 \texttt{features\_left\_}？）
+  \item 如果把 Feature 的 \texttt{map\_point\_} 从 \texttt{weak\_ptr} 改成 \texttt{shared\_ptr}，写一个最小例子说明会泄漏哪些对象。
+  \item \texttt{Map} 用 \texttt{unordered\_map} 而不用 \texttt{map}（红黑树）。在“按 id 频繁增删查、不关心遍历有序”的场景下，这个选择带来的复杂度差异是什么？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{双目前端}
+\label{sec:sys-frontend}
+
+\paragraph{动机：把“估计这一帧的位姿”做成一台状态机。}
+前端要解决的核心问题是：给定一帧双目图像，估计它的位姿，并在必要时往地图里补充新结构。\cref{ch:vo} 已经讲过它需要的每一种算法（提特征、光流、三角化、PnP/BA）；本节是把它们组织成一个\emph{有状态、能连续运行}的流水线。
+
+\paragraph{反面：前端的实现自由度很大，先把选择固定下来。}
+前端其实有很多种合理实现，常见的开放问题有：右目图像怎么用——每帧都和左右目各比一遍，还是只比其一？三角化用左右目（空间基线），还是用时间上的前后帧？事实上任意两张图像都能三角化（甚至前一帧左图配下一帧右图），所以每个人写出来都不一样。为简单起见，本实现把选择固定为下面这套确定的逻辑。
+
+\begin{algo}[前端处理逻辑]\label{alg:sys-frontend}
+前端有三种状态：\emph{初始化（INITING）}、\emph{正常追踪（TRACKING\_GOOD / TRACKING\_BAD）}、\emph{追踪丢失（LOST）}。
+\begin{enumerate}
+  \item \textbf{初始化}：用左右目之间的光流匹配，找可三角化的点，成功则建立带尺度的初始地图。
+  \item \textbf{追踪}：计算上一帧特征到当前帧的光流，据此算当前帧位姿。\emph{此步只用左目，不用右目}。
+  \item 若追踪到的内点\emph{较少}，判定当前帧为\textbf{关键帧}，对它做：提新特征 $\to$ 右图光流匹配 $\to$ 三角化建新路标 $\to$ 加入地图 $\to$ 触发一次后端优化。
+  \item 若追踪\textbf{丢失}，重置前端，重新初始化。
+\end{enumerate}
+\end{algo}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=16mm,
+  st/.style={draw, rounded corners, fill=second!8, draw=second!60!black, minimum width=24mm, minimum height=8mm, align=center}]
+\node[st] (init) {INITING};
+\node[st, right=of init] (good) {TRACKING\_GOOD};
+\node[st, below=10mm of good] (bad) {TRACKING\_BAD};
+\node[st, left=of bad] (lost) {LOST};
+\draw[->] (init) -- node[above,font=\footnotesize]{StereoInit 成功} (good);
+\draw[->] (good) edge[loop above] node[font=\footnotesize]{inliers $>50$} (good);
+\draw[->] (good) -- node[right,font=\footnotesize]{$20<$inliers$\le50$} (bad);
+\draw[->] (bad) -- node[below,font=\footnotesize]{inliers$\le20$} (lost);
+\draw[->] (bad.north) .. controls +(0,8mm) and +(0,-8mm) .. node[right,font=\footnotesize]{回升} (good.south);
+\draw[->] (lost) -- node[left,font=\footnotesize]{Reset} (init);
+\end{tikzpicture}
+\caption{前端状态机。初始化成功后进入追踪；追踪内点数把状态分为 GOOD（$>50$）、BAD（$20\sim50$）、LOST（$\le 20$）三档；丢失后重置回初始化。阈值见 \cref{tab:sys-frontend-params}。}
+\label{fig:sys-statemachine}
+\end{figure}
+
+\paragraph{前端类的成员与参数。}
+前端持有当前帧 / 上一帧、左右相机、地图 / 后端 / 可视化的指针，以及一组阈值参数。这些参数（\cref{tab:sys-frontend-params}）决定了“多少内点算追踪好、追踪到多少点以下要插关键帧”，是前端行为的旋钮。
+
+\begin{codebox}[C++]{前端类声明（include/myslam/frontend.h，节选）}
+enum class FrontendStatus { INITING, TRACKING_GOOD, TRACKING_BAD, LOST };
+
+class Frontend {
+   public:
+    typedef std::shared_ptr<Frontend> Ptr;
+    Frontend();
+    bool AddFrame(Frame::Ptr frame);            // external entry: add one frame
+    void SetMap(Map::Ptr map) { map_ = map; }
+    void SetBackend(std::shared_ptr<Backend> b) { backend_ = b; }
+    void SetViewer(std::shared_ptr<Viewer> v) { viewer_ = v; }
+    void SetCameras(Camera::Ptr left, Camera::Ptr right) {
+        camera_left_ = left; camera_right_ = right;
+    }
+   private:
+    bool Track();           bool Reset();
+    int  TrackLastFrame();  int  EstimateCurrentPose();
+    bool InsertKeyframe();  bool StereoInit();
+    int  DetectFeatures();  int  FindFeaturesInRight();
+    bool BuildInitMap();    int  TriangulateNewPoints();
+    void SetObservationsForKeyFrame();
+
+    FrontendStatus status_ = FrontendStatus::INITING;
+    Frame::Ptr current_frame_ = nullptr, last_frame_ = nullptr;
+    Camera::Ptr camera_left_ = nullptr, camera_right_ = nullptr;
+    Map::Ptr map_ = nullptr;
+    std::shared_ptr<Backend> backend_ = nullptr;
+    std::shared_ptr<Viewer>  viewer_  = nullptr;
+    SE3 relative_motion_;       // T between last and current frame (motion model)
+    int tracking_inliers_ = 0;  // inliers, used for keyframe decision
+
+    int num_features_ = 200;                    // GFTT max corners per frame
+    int num_features_init_ = 100;               // min stereo matches to initialize
+    int num_features_tracking_ = 50;            // > this -> TRACKING_GOOD
+    int num_features_tracking_bad_ = 20;        // > this -> TRACKING_BAD else LOST
+    int num_features_needed_for_keyframe_ = 80; // < this -> insert keyframe
+    cv::Ptr<cv::GFTTDetector> gftt_;            // feature detector
+};
+\end{codebox}
+
+\begin{table}[H]\centering\small
+\caption{前端关键参数（默认值）}
+\label{tab:sys-frontend-params}
+\begin{tabular}{lll}
+\toprule
+参数 & 默认 & 含义 \\
+\midrule
+\texttt{num\_features\_} & 200 & 每帧 GFTT 提取的角点数上限 \\
+\texttt{num\_features\_init\_} & 100 & 初始化时左右目最少匹配数（不足则初始化失败） \\
+\texttt{num\_features\_tracking\_} & 50 & 内点 $>$ 此 $\to$ TRACKING\_GOOD \\
+\texttt{num\_features\_tracking\_bad\_} & 20 & 内点 $>$ 此（且 $\le50$）$\to$ BAD；$\le20\to$ LOST \\
+\texttt{num\_features\_needed\_for\_keyframe\_} & 80 & 内点 $<$ 此 $\to$ 当前帧设为关键帧 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{入口与追踪主流程}
+\label{sec:sys-track}
+
+前端的对外入口 \texttt{AddFrame} 是一个\emph{状态分发器}：按当前状态调初始化、追踪或重置，处理完把当前帧存为上一帧供下次参考。构造函数从配置文件读取特征数并建好 GFTT 检测器。
+
+\begin{codebox}[C++]{前端构造与入口（src/frontend.cpp）}
+Frontend::Frontend() {
+    gftt_ = cv::GFTTDetector::create(Config::Get<int>("num_features"), 0.01, 20);
+    num_features_init_ = Config::Get<int>("num_features_init");
+    num_features_      = Config::Get<int>("num_features");
+}
+
+bool Frontend::AddFrame(myslam::Frame::Ptr frame) {
+    current_frame_ = frame;
+    switch (status_) {
+        case FrontendStatus::INITING:        StereoInit(); break;
+        case FrontendStatus::TRACKING_GOOD:
+        case FrontendStatus::TRACKING_BAD:   Track();      break;
+        case FrontendStatus::LOST:           Reset();      break;
+    }
+    last_frame_ = current_frame_;            // remember for next-frame optical flow
+    return true;
+}
+\end{codebox}
+
+\noindent 追踪主流程 \texttt{Track} 串起“预测初值 $\to$ 光流追踪 $\to$ 优化位姿 $\to$ 判状态 $\to$ 看要不要插关键帧 $\to$ 更新运动模型”这一整套。它体现了两个关键思想：用\emph{恒速运动模型}给位姿一个好初值，以及把“前端结果作为后端初值”的思路一路贯穿。
+
+\begin{codebox}[C++]{追踪主流程 Track（src/frontend.cpp）}
+bool Frontend::Track() {
+    if (last_frame_) {
+        // constant-velocity motion model: predict pose as init guess
+        current_frame_->SetPose(relative_motion_ * last_frame_->Pose());
+    }
+    int num_track_last = TrackLastFrame();        // LK flow: last->current (left)
+    tracking_inliers_  = EstimateCurrentPose();   // pose-only BA, returns inliers
+
+    if (tracking_inliers_ > num_features_tracking_)          status_ = FrontendStatus::TRACKING_GOOD;
+    else if (tracking_inliers_ > num_features_tracking_bad_) status_ = FrontendStatus::TRACKING_BAD;
+    else                                                     status_ = FrontendStatus::LOST;
+
+    InsertKeyframe();                              // insert keyframe if inliers too few
+    relative_motion_ = current_frame_->Pose() * last_frame_->Pose().inverse(); // update model
+    if (viewer_) viewer_->AddCurrentFrame(current_frame_);
+    return true;
+}
+\end{codebox}
+
+\begin{insight}
+\textbf{恒速运动模型为什么左乘？}
+帧位姿存的是 $\mathbf{T}_{cw}$。相邻帧的相对运动定义为 $\Delta\mathbf{T}=\mathbf{T}_{cw}^{(k)}\big(\mathbf{T}_{cw}^{(k-1)}\big)^{-1}$（这正是 \texttt{Track} 末尾对 \texttt{relative\_motion\_} 的更新式）。假设“这一帧相对上一帧的运动 $\approx$ 上一帧相对上上帧的运动”，就能用 $\Delta\mathbf{T}$ 把上一帧位姿外推为本帧初值：$\mathbf{T}_{cw}^{(k)}\approx\Delta\mathbf{T}\cdot\mathbf{T}_{cw}^{(k-1)}$——对应代码里的 \Verb[breaklines]|relative_motion_ * last_frame_->Pose()|（左乘）。一个好初值能让后面的光流和 pose-only BA 收敛得又快又稳，这就是“运动先验”的价值。
+\end{insight}
+
+\subsection{时序光流：把上一帧追到当前帧}
+\label{sec:sys-trackflow}
+
+\texttt{TrackLastFrame} 用金字塔 LK 光流把上一帧的左目特征追踪到当前帧左目。这里有一个把“运动先验注入像素级”的关键技巧：如果某个特征已经关联了地图点，就先把这个 3D 点按\emph{当前帧的预测位姿}投影到像素，作为光流的初始猜测；配合 \Verb[breaklines]|OPTFLOW_USE_INITIAL_FLOW| 标志，光流就从这个更接近真值的位置出发，大位移下也能稳稳收敛。
+
+\begin{codebox}[C++]{时序光流 TrackLastFrame（src/frontend.cpp）}
+int Frontend::TrackLastFrame() {
+    std::vector<cv::Point2f> kps_last, kps_current;
+    for (auto &kp : last_frame_->features_left_) {
+        if (kp->map_point_.lock()) {              // has a 3D landmark -> project as guess
+            auto mp = kp->map_point_.lock();
+            auto px = camera_left_->world2pixel(mp->pos_, current_frame_->Pose());
+            kps_last.push_back(kp->position_.pt);
+            kps_current.push_back(cv::Point2f(px[0], px[1]));
+        } else {                                  // no landmark -> start from same pixel
+            kps_last.push_back(kp->position_.pt);
+            kps_current.push_back(kp->position_.pt);
+        }
+    }
+    std::vector<uchar> status;
+    Mat error;
+    cv::calcOpticalFlowPyrLK(
+        last_frame_->left_img_, current_frame_->left_img_, kps_last, kps_current,
+        status, error, cv::Size(11, 11), 3,
+        cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
+        cv::OPTFLOW_USE_INITIAL_FLOW);            // use the projected guess
+
+    int num_good_pts = 0;
+    for (size_t i = 0; i < status.size(); ++i) {
+        if (status[i]) {
+            cv::KeyPoint kp(kps_current[i], 7);
+            Feature::Ptr feature(new Feature(current_frame_, kp));
+            feature->map_point_ = last_frame_->features_left_[i]->map_point_; // inherit
+            current_frame_->features_left_.push_back(feature);
+            num_good_pts++;
+        }
+    }
+    LOG(INFO) << "Find " << num_good_pts << " in the last image.";
+    return num_good_pts;
+}
+\end{codebox}
+
+\noindent 追踪成功的点（\texttt{status[i]} 为真）会在当前帧建一个新 \texttt{Feature}，并\emph{继承}上一帧对应特征的地图点关联——这样“2D--3D 对应”就随光流自动传递到了新帧，紧接着的 \texttt{EstimateCurrentPose} 就能用它们优化位姿。LK 光流本身的灰度不变假设、最小二乘解、金字塔由粗到精等推导见 \cref{ch:vo}，此处只用其接口。
+
+\subsection{仅优化位姿的 BA（pose-only BA）}
+\label{sec:sys-poseonly}
+
+\paragraph{动机：固定地图点，只调这一帧的位姿。}
+有了一批“当前帧 2D 像素 $\leftrightarrow$ 已知 3D 地图点”的对应，估计当前帧位姿就是一个 PnP 问题；这里用它的非线性优化形式——只有一个位姿顶点、若干条重投影边的 g2o 问题，地图点固定不动。这就是 motion-only BA / pose-only BA。
+
+\begin{codebox}[C++]{pose-only BA:EstimateCurrentPose（src/frontend.cpp）}
+int Frontend::EstimateCurrentPose() {
+    typedef g2o::BlockSolver_6_3 BlockSolverType;
+    typedef g2o::LinearSolverDense<BlockSolverType::PoseMatrixType> LinearSolverType;
+    auto solver = new g2o::OptimizationAlgorithmLevenberg(
+        g2o::make_unique<BlockSolverType>(g2o::make_unique<LinearSolverType>()));
+    g2o::SparseOptimizer optimizer;
+    optimizer.setAlgorithm(solver);
+
+    VertexPose *vertex_pose = new VertexPose();   // the only vertex: current pose
+    vertex_pose->setId(0);
+    vertex_pose->setEstimate(current_frame_->Pose());
+    optimizer.addVertex(vertex_pose);
+
+    Mat33 K = camera_left_->K();
+    int index = 1;
+    std::vector<EdgeProjectionPoseOnly *> edges;
+    std::vector<Feature::Ptr> features;
+    for (size_t i = 0; i < current_frame_->features_left_.size(); ++i) {
+        auto mp = current_frame_->features_left_[i]->map_point_.lock();
+        if (mp) {
+            features.push_back(current_frame_->features_left_[i]);
+            EdgeProjectionPoseOnly *edge = new EdgeProjectionPoseOnly(mp->pos_, K);
+            edge->setId(index);
+            edge->setVertex(0, vertex_pose);
+            edge->setMeasurement(toVec2(current_frame_->features_left_[i]->position_.pt));
+            edge->setInformation(Eigen::Matrix2d::Identity());
+            edge->setRobustKernel(new g2o::RobustKernelHuber);
+            edges.push_back(edge);
+            optimizer.addEdge(edge);
+            index++;
+        }
+    }
+
+    const double chi2_th = 5.991;                 // chi-square, dof=2, alpha=0.05
+    int cnt_outlier = 0;
+    for (int iteration = 0; iteration < 4; ++iteration) {
+        vertex_pose->setEstimate(current_frame_->Pose());  // reset to same init each round
+        optimizer.initializeOptimization();
+        optimizer.optimize(10);
+        cnt_outlier = 0;
+        for (size_t i = 0; i < edges.size(); ++i) {        // count and flag outliers
+            auto e = edges[i];
+            if (features[i]->is_outlier_) e->computeError();
+            if (e->chi2() > chi2_th) {
+                features[i]->is_outlier_ = true;  e->setLevel(1); cnt_outlier++;
+            } else {
+                features[i]->is_outlier_ = false; e->setLevel(0);
+            }
+            if (iteration == 2) e->setRobustKernel(nullptr); // drop kernel for final refine
+        }
+    }
+    current_frame_->SetPose(vertex_pose->estimate());
+    for (auto &feat : features) {                  // detach outlier landmark links
+        if (feat->is_outlier_) {
+            feat->map_point_.reset();
+            feat->is_outlier_ = false;             // maybe usable again later
+        }
+    }
+    return features.size() - cnt_outlier;          // = tracking_inliers_
+}
+\end{codebox}
+
+\paragraph{数学：这条边在算什么。}
+对单个观测，重投影误差与目标函数为
+\begin{align}
+  \mathbf{e}_i &= \mathbf{z}_i-\pi\!\big(K\,(\mathbf{T}\,\mathbf{p}_i)\big),\qquad
+  \pi([X,Y,Z]^\top)=\Big[f_x\tfrac{X}{Z}+c_x,\ f_y\tfrac{Y}{Z}+c_y\Big]^\top,
+  \label{eq:sys-reproj}\\
+  \mathbf{T}^\star &= \arg\min_{\mathbf{T}}\ \tfrac12\sum_i \rho\!\Big(\big\|\mathbf{e}_i\big\|^2_{\boldsymbol\Sigma_v^{-1}}\Big),
+  \qquad \boldsymbol\Sigma_v=\mathbf{I}_{2\times2},\ \rho=\text{Huber},
+  \label{eq:sys-poseonly}
+\end{align}
+其中 $\mathbf{T}=\mathbf{T}_{cw}$ 是待优化位姿、$\mathbf{p}_i$ 是固定的地图点世界坐标。雅可比 $\partial\mathbf{e}/\partial\delta\boldsymbol\xi$ 的解析式见 \cref{sec:sys-jacobian}。
+
+\begin{insight}
+\textbf{“先用 Huber 抗外点、后期去核精修”的两段式。}
+这段代码迭代 4 轮，每轮先 \texttt{optimize(10)} 再按 $\chi^2>5.991$ 标外点（\verb|setLevel(1)| 使其下轮不参与）。前两轮挂着 Huber 鲁棒核压制误匹配；\emph{第三轮（\texttt{iteration==2}）关掉鲁棒核}做精确优化——因为这时大部分外点已被踢出，剩下的内点用纯二次代价收敛得更准。另外每轮都把顶点估计\emph{重置回}同一个初值再优化，让外点判定基于一致的起点、更稳定。这套“先稳后准”的外点处理范式，在工业级 SLAM 里随处可见。
+\end{insight}
+
+\begin{pitfall}[思维陷阱：把“外点”当成永久判决]
+注意结尾：被判外点的特征只是 \Verb[breaklines]|map_point_.reset()| 断开它当前的错误地图点关联，却把 \texttt{is\_outlier\_} 复位为 \texttt{false}——理由是“将来也许还能用”。这提醒我们：在 SLAM 里外点判定往往是\emph{这一次优化}的局部结论，不该一棒子打死。一个点这帧匹配错了，下几帧视角变了可能又对了。轻易永久删点，会让地图越跑越空。
+\end{pitfall}
+
+\subsection{初始化：单帧双目建图}
+\label{sec:sys-init}
+
+\paragraph{动机：开局时没有任何地图点，怎么起步？}
+追踪需要“2D--3D 对应”，可系统刚启动时一张地图点都没有。双目的妙处在于：第一帧的左右目就能三角化出一批带尺度的地图点，从而\emph{单帧完成初始化}。\texttt{StereoInit} 把这一过程串起来：左目提特征 $\to$ 右目光流匹配 $\to$ 匹配数够多则三角化建初始地图。
+
+\begin{codebox}[C++]{初始化总流程（src/frontend.cpp）}
+bool Frontend::StereoInit() {
+    int num_features_left = DetectFeatures();        // detect in left image
+    int num_coor_features = FindFeaturesInRight();   // match to right image
+    if (num_coor_features < num_features_init_) return false;   // not enough -> retry
+    bool build_map_success = BuildInitMap();
+    if (build_map_success) {
+        status_ = FrontendStatus::TRACKING_GOOD;
+        if (viewer_) { viewer_->AddCurrentFrame(current_frame_); viewer_->UpdateMap(); }
+        return true;
+    }
+    return false;
+}
+\end{codebox}
+
+\paragraph{带掩膜的特征提取：别让角点扎堆。}
+\texttt{DetectFeatures} 用 GFTT 提角点，但先建一张掩膜：把\emph{已有特征}周围 $10\times10$ 的区域涂黑，GFTT 只在空白处提新点。这避免了特征全挤在纹理丰富的一小块、其它区域却没有约束的问题。注意：初始化提特征与关键帧补提特征\emph{复用同一个函数}，这正是“把功能拆成短小可复用函数”的好处。
+
+\begin{codebox}[C++]{带掩膜的特征提取 DetectFeatures（src/frontend.cpp）}
+int Frontend::DetectFeatures() {
+    cv::Mat mask(current_frame_->left_img_.size(), CV_8UC1, 255);
+    for (auto &feat : current_frame_->features_left_) {      // mask out existing features
+        cv::rectangle(mask, feat->position_.pt - cv::Point2f(10, 10),
+                      feat->position_.pt + cv::Point2f(10, 10), 0, CV_FILLED);
+    }
+    std::vector<cv::KeyPoint> keypoints;
+    gftt_->detect(current_frame_->left_img_, keypoints, mask);  // only in blank regions
+    int cnt_detected = 0;
+    for (auto &kp : keypoints) {
+        current_frame_->features_left_.push_back(
+            Feature::Ptr(new Feature(current_frame_, kp)));
+        cnt_detected++;
+    }
+    LOG(INFO) << "Detect " << cnt_detected << " new features";
+    return cnt_detected;
+}
+\end{codebox}
+
+\paragraph{左右目光流匹配：用光流代替极线搜索。}
+传统双目用“沿极线一维搜索”找左右对应，本实现图省事，直接用 LK 光流把左目特征追到右图（有地图点的用右目投影作初值，否则用左目同像素）。匹配成功的在右图建 \texttt{Feature} 并标 \Verb[breaklines]|is_on_left_image_=false|；\emph{失败的在 \texttt{features\_right\_} 对应位置填 \texttt{nullptr}}，以保持左右下标严格一一对应——这是后面三角化能直接用 \texttt{[i]} 配对的前提。
+
+\begin{codebox}[C++]{左右目光流匹配 FindFeaturesInRight（src/frontend.cpp）}
+int Frontend::FindFeaturesInRight() {
+    std::vector<cv::Point2f> kps_left, kps_right;
+    for (auto &kp : current_frame_->features_left_) {
+        kps_left.push_back(kp->position_.pt);
+        auto mp = kp->map_point_.lock();
+        if (mp) {                                  // project to right as init guess
+            auto px = camera_right_->world2pixel(mp->pos_, current_frame_->Pose());
+            kps_right.push_back(cv::Point2f(px[0], px[1]));
+        } else {
+            kps_right.push_back(kp->position_.pt); // same pixel as in left
+        }
+    }
+    std::vector<uchar> status; Mat error;
+    cv::calcOpticalFlowPyrLK(
+        current_frame_->left_img_, current_frame_->right_img_, kps_left, kps_right,
+        status, error, cv::Size(11, 11), 3,
+        cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
+        cv::OPTFLOW_USE_INITIAL_FLOW);
+
+    int num_good_pts = 0;
+    for (size_t i = 0; i < status.size(); ++i) {
+        if (status[i]) {
+            cv::KeyPoint kp(kps_right[i], 7);
+            Feature::Ptr feat(new Feature(current_frame_, kp));
+            feat->is_on_left_image_ = false;
+            current_frame_->features_right_.push_back(feat);
+            num_good_pts++;
+        } else {
+            current_frame_->features_right_.push_back(nullptr); // keep index alignment
+        }
+    }
+    LOG(INFO) << "Find " << num_good_pts << " in the right image.";
+    return num_good_pts;
+}
+\end{codebox}
+
+\paragraph{三角化建初始地图。}
+\texttt{BuildInitMap} 用左右目相机外参作两个视角，把每对左右匹配像素反投影到归一化平面后做三角化（要求深度为正才接受），为每个有效点建一个 \texttt{MapPoint}、加上左右两个观测、关联回左右 \texttt{Feature}、插入地图；最后把当前帧设为\emph{第一个关键帧}、插入地图并触发后端。
+
+\begin{codebox}[C++]{三角化建初始地图 BuildInitMap（src/frontend.cpp）}
+bool Frontend::BuildInitMap() {
+    std::vector<SE3> poses{camera_left_->pose(), camera_right_->pose()};  // two views
+    size_t cnt_init_landmarks = 0;
+    for (size_t i = 0; i < current_frame_->features_left_.size(); ++i) {
+        if (current_frame_->features_right_[i] == nullptr) continue;      // no right match
+        std::vector<Vec3> points{
+            camera_left_->pixel2camera(
+                Vec2(current_frame_->features_left_[i]->position_.pt.x,
+                     current_frame_->features_left_[i]->position_.pt.y)),
+            camera_right_->pixel2camera(
+                Vec2(current_frame_->features_right_[i]->position_.pt.x,
+                     current_frame_->features_right_[i]->position_.pt.y))};
+        Vec3 pworld = Vec3::Zero();
+        if (triangulation(poses, points, pworld) && pworld[2] > 0) {      // accept if depth>0
+            auto new_map_point = MapPoint::CreateNewMappoint();
+            new_map_point->SetPos(pworld);
+            new_map_point->AddObservation(current_frame_->features_left_[i]);
+            new_map_point->AddObservation(current_frame_->features_right_[i]);
+            current_frame_->features_left_[i]->map_point_  = new_map_point;
+            current_frame_->features_right_[i]->map_point_ = new_map_point;
+            cnt_init_landmarks++;
+            map_->InsertMapPoint(new_map_point);
+        }
+    }
+    current_frame_->SetKeyFrame();
+    map_->InsertKeyFrame(current_frame_);
+    backend_->UpdateMap();                          // wake up backend
+    LOG(INFO) << "Initial map created with " << cnt_init_landmarks << " map points";
+    return true;
+}
+\end{codebox}
+
+\paragraph{三角化的实现：线性 DLT + SVD。}
+\texttt{triangulation} 用经典的线性三角化（DLT）。设第 $i$ 个视角投影矩阵 $P_i=[\mathbf{T}_i]_{3\times4}$、归一化平面观测 $\mathbf{x}_i=[x_i,y_i,1]^\top$，投影关系 $s_i\mathbf{x}_i=P_i\mathbf{X}$（$\mathbf{X}$ 为齐次 3D 点）。两边叉乘 $\mathbf{x}_i$ 消去尺度 $s_i$，每个视角给出两条线性方程
+\begin{equation}
+  x_i\,(\mathbf{p}_i^{(3)})^\top\mathbf{X}-(\mathbf{p}_i^{(1)})^\top\mathbf{X}=0,\qquad
+  y_i\,(\mathbf{p}_i^{(3)})^\top\mathbf{X}-(\mathbf{p}_i^{(2)})^\top\mathbf{X}=0,
+  \label{eq:sys-triang}
+\end{equation}
+其中 $\mathbf{p}_i^{(k)}$ 是 $P_i$ 的第 $k$ 行。堆叠所有视角得 $A\mathbf{X}=\mathbf{0}$，对 $A$ 做 SVD，解取 $V$ 的最后一列再齐次归一化。
+
+\begin{codebox}[C++]{线性三角化 triangulation（include/myslam/algorithm.h）}
+inline bool triangulation(const std::vector<SE3> &poses,
+                          const std::vector<Vec3> points, Vec3 &pt_world) {
+    MatXX A(2 * poses.size(), 4);
+    VecX b(2 * poses.size());  b.setZero();
+    for (size_t i = 0; i < poses.size(); ++i) {
+        Mat34 m = poses[i].matrix3x4();
+        A.block<1, 4>(2 * i, 0)     = points[i][0] * m.row(2) - m.row(0);
+        A.block<1, 4>(2 * i + 1, 0) = points[i][1] * m.row(2) - m.row(1);
+    }
+    auto svd = A.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV);
+    pt_world = (svd.matrixV().col(3) / svd.matrixV()(3, 3)).head<3>();
+    // quality check: smallest vs second-smallest singular value
+    if (svd.singularValues()[3] / svd.singularValues()[2] < 1e-2)
+        return true;        // (see pitfall below: this returns reversed semantics)
+    return false;
+}
+\end{codebox}
+
+\begin{pitfall}[编程陷阱：官方仓库里一个真实存在的返回值反向 bug]
+上面 \texttt{triangulation} 的返回逻辑与注释/调用方语义\emph{相反}：当奇异值比 $<10^{-2}$（“解质量不好、视差不足”）时却 \Verb[breaklines]|return true|，质量好时反而 \Verb[breaklines]|return false|。而调用方写的是 \Verb[breaklines]|if (triangulation(...) && pworld[2]>0)|，即“返回 true 才接受”。这是 \texttt{slambook2} 仓库里一个长期存在的 bug（多个 issue/fork 指出）。\textbf{正确逻辑应当是：质量好 \texttt{return true}、质量差 \texttt{return false}}（把两个 \texttt{return} 对调）。此函数仅见于配套源码、教材正文未印，书面因而不会暴露这个坑——这恰恰说明：\emph{读懂一个系统，光看书里印出的片段不够，必须去读完整源码并亲自跑}。
+\end{pitfall}
+
+\subsection{关键帧选取与关键帧的专属工作}
+\label{sec:sys-keyframe}
+
+\paragraph{准则：追踪内点掉到阈值以下，就插关键帧。}
+本章的关键帧准则极简：\texttt{tracking\_inliers\_ < 80} 就把当前帧设为关键帧。直觉是——\emph{当追踪到的内点数掉下来，说明视野变化大、现有地图点不够用了，该补结构了}。一旦判为关键帧，就做四件\emph{只对关键帧做}的事：登记观测、提新特征、右目匹配、三角化新点，最后触发后端。
+
+\begin{codebox}[C++]{关键帧插入与三角化新点（src/frontend.cpp）}
+bool Frontend::InsertKeyframe() {
+    if (tracking_inliers_ >= num_features_needed_for_keyframe_)
+        return false;                              // still enough -> not a keyframe
+    current_frame_->SetKeyFrame();
+    map_->InsertKeyFrame(current_frame_);
+    SetObservationsForKeyFrame();                  // register obs for tracked landmarks
+    DetectFeatures();                              // detect new features (masked)
+    FindFeaturesInRight();                         // match new ones to right image
+    TriangulateNewPoints();                        // triangulate new landmarks
+    backend_->UpdateMap();                         // trigger backend
+    if (viewer_) viewer_->UpdateMap();
+    return true;
+}
+
+void Frontend::SetObservationsForKeyFrame() {
+    for (auto &feat : current_frame_->features_left_) {
+        auto mp = feat->map_point_.lock();
+        if (mp) mp->AddObservation(feat);          // only keyframes add observations
+    }
+}
+
+int Frontend::TriangulateNewPoints() {
+    std::vector<SE3> poses{camera_left_->pose(), camera_right_->pose()};
+    SE3 current_pose_Twc = current_frame_->Pose().inverse();   // camera -> world
+    int cnt_triangulated_pts = 0;
+    for (size_t i = 0; i < current_frame_->features_left_.size(); ++i) {
+        if (current_frame_->features_left_[i]->map_point_.expired() &&
+            current_frame_->features_right_[i] != nullptr) {   // no landmark yet & has right
+            std::vector<Vec3> points{
+                camera_left_->pixel2camera(
+                    Vec2(current_frame_->features_left_[i]->position_.pt.x,
+                         current_frame_->features_left_[i]->position_.pt.y)),
+                camera_right_->pixel2camera(
+                    Vec2(current_frame_->features_right_[i]->position_.pt.x,
+                         current_frame_->features_right_[i]->position_.pt.y))};
+            Vec3 pworld = Vec3::Zero();
+            if (triangulation(poses, points, pworld) && pworld[2] > 0) {
+                auto new_map_point = MapPoint::CreateNewMappoint();
+                pworld = current_pose_Twc * pworld;            // camera frame -> world
+                new_map_point->SetPos(pworld);
+                new_map_point->AddObservation(current_frame_->features_left_[i]);
+                new_map_point->AddObservation(current_frame_->features_right_[i]);
+                current_frame_->features_left_[i]->map_point_  = new_map_point;
+                current_frame_->features_right_[i]->map_point_ = new_map_point;
+                map_->InsertMapPoint(new_map_point);
+                cnt_triangulated_pts++;
+            }
+        }
+    }
+    LOG(INFO) << "new landmarks: " << cnt_triangulated_pts;
+    return cnt_triangulated_pts;
+}
+\end{codebox}
+
+\begin{pitfall}[概念误区：以为 \texttt{TriangulateNewPoints} 和 \texttt{BuildInitMap} 是重复代码]
+两者看着像，关键差别在\emph{坐标系}：初始化时当前帧位姿是单位阵（世界系即首帧相机系），三角化结果\emph{直接}就是世界坐标；而追踪阶段当前帧位姿 $\mathbf{T}_{cw}\ne\mathbf{I}$，三角化得到的是\emph{相机系}坐标，必须 \Verb[breaklines]|pworld = current_pose_Twc * pworld| 左乘 $\mathbf{T}_{wc}$ 转到世界系。漏掉这一步，新建的地图点会全错位。另一个细节：\texttt{SetObservationsForKeyFrame} 只在关键帧时给地图点\emph{登记观测}——这意味着 \texttt{observed\_times\_} 的语义是“被\emph{关键帧}观测的次数”，普通追踪帧不计入，这让地图清理的判据更稳定。
+\end{pitfall}
+
+\paragraph{追踪丢失：本实现只是重置。}
+按 \cref{alg:sys-frontend}，追踪丢失应重置前端并重新初始化。但官方仓库的 \texttt{Reset} 其实是\emph{空实现}（只打日志）：
+
+\begin{codebox}[C++]{Reset（src/frontend.cpp）}
+bool Frontend::Reset() {
+    LOG(INFO) << "Reset is not implemented. ";     // a known simplification
+    return true;
+}
+\end{codebox}
+
+\noindent 这是精简 VO 的一处未完成。工业系统在 LOST 时不会简单重置，而是触发\textbf{重定位}（relocalization）——在全局关键帧库里用词袋找候选、再用 PnP + RANSAC 恢复位姿（见 \cref{sec:sys-orbslam}）。这也提示：一个“能跑通顺利场景”的 demo 和一个“能从失败中恢复”的系统之间，还隔着重定位、回环这些硬骨头。
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 把关键帧准则从“内点 $<80$”改成“距上次关键帧已过 $N$ 帧”，会有什么利弊？（提示：相机静止时会怎样？）
+  \item 实现 \cref{ch:vo} 习题里的“一维极线搜索”替代 \texttt{FindFeaturesInRight} 的二维光流。KITTI 已做立体校正、视差只沿水平方向，这能省多少计算？
+  \item 修复 \texttt{triangulation} 的返回值 bug，并验证修复前后初始地图点数的变化。
+  \item 给 \texttt{Reset} 写一个最朴素的实现：清空当前帧特征、状态置回 INITING。它和真正的重定位差在哪？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{g2o 顶点与边：误差和雅可比的落地}
+\label{sec:sys-jacobian}
+
+\paragraph{动机：前后端都靠这几个 g2o 类型。}
+前端的 pose-only BA 用了 \texttt{VertexPose} 与 \texttt{EdgeProjectionPoseOnly}，后端的局部 BA 还要用 \texttt{VertexXYZ} 与二元边 \texttt{EdgeProjection}。它们定义了“位姿怎么更新、误差怎么算、雅可比是什么”——是把 \cref{eq:sys-reproj} 的数学落成代码的地方。本节先把它们摆出来，后端就能直接调用。
+
+\paragraph{位姿顶点：估计量是 $\SE(3)$，增量是 6 维李代数。}
+位姿顶点的更新 \texttt{oplusImpl} 把 6 维增量 $\delta\boldsymbol\xi$ 经指数映射作用到当前估计。本章复用的配套代码用\emph{左乘}（左扰动）$\mathbf{T}\leftarrow\exp(\delta\boldsymbol\xi^\wedge)\mathbf{T}$\cite{gaoxiang2019slam14}；按本书右扰动主约定应写成\emph{右乘} $\mathbf{T}\leftarrow\mathbf{T}\exp(\delta\boldsymbol\xi^\wedge)$。两者对应的雅可比“旋转 3 列”差一个伴随项（见下），择一约定后全章须一致。路标顶点 \texttt{VertexXYZ} 则是普通三维向量加法（路标在 $\mathbb{R}^3$，无流形约束）。
+
+\begin{codebox}[C++]{g2o 顶点（include/myslam/g2o\_types.h）}
+class VertexPose : public g2o::BaseVertex<6, SE3> {
+   public:
+    virtual void setToOriginImpl() override { _estimate = SE3(); }
+    virtual void oplusImpl(const double *update) override {
+        Vec6 dx;
+        dx << update[0], update[1], update[2], update[3], update[4], update[5];
+        _estimate = SE3::exp(dx) * _estimate;     // left perturbation (slambook2 original)
+        // book convention (right perturbation): _estimate = _estimate * SE3::exp(dx);
+    }
+    virtual bool read(std::istream &in) override  { return true; }
+    virtual bool write(std::ostream &out) const override { return true; }
+};
+
+class VertexXYZ : public g2o::BaseVertex<3, Vec3> {
+   public:
+    virtual void setToOriginImpl() override { _estimate = Vec3::Zero(); }
+    virtual void oplusImpl(const double *update) override {
+        _estimate[0] += update[0]; _estimate[1] += update[1]; _estimate[2] += update[2];
+    }
+    virtual bool read(std::istream &in) override  { return true; }
+    virtual bool write(std::ostream &out) const override { return true; }
+};
+\end{codebox}
+
+\paragraph{两类重投影边。}
+一元边 \texttt{EdgeProjectionPoseOnly} 只连位姿顶点（地图点固定，用于前端 pose-only BA）；二元边 \texttt{EdgeProjection} 连位姿与路标两个顶点（用于后端局部 BA），并在构造时传入该目的外参 \texttt{cam\_ext}——这样同一个位姿顶点经左目外参、右目外参分别投影，双目基线信息就自然进了 BA。
+
+\begin{codebox}[C++]{g2o 边与雅可比（include/myslam/g2o\_types.h）}
+class EdgeProjectionPoseOnly : public g2o::BaseUnaryEdge<2, Vec2, VertexPose> {
+   public:
+    EdgeProjectionPoseOnly(const Vec3 &pos, const Mat33 &K) : _pos3d(pos), _K(K) {}
+    virtual void computeError() override {
+        const VertexPose *v = static_cast<VertexPose *>(_vertices[0]);
+        SE3 T = v->estimate();
+        Vec3 pos_pixel = _K * (T * _pos3d);
+        pos_pixel /= pos_pixel[2];
+        _error = _measurement - pos_pixel.head<2>();    // e = z - pi(...)
+    }
+    virtual void linearizeOplus() override {
+        const VertexPose *v = static_cast<VertexPose *>(_vertices[0]);
+        SE3 T = v->estimate();
+        Vec3 pos_cam = T * _pos3d;
+        double fx = _K(0, 0), fy = _K(1, 1);
+        double X = pos_cam[0], Y = pos_cam[1], Z = pos_cam[2];
+        double Zinv = 1.0 / (Z + 1e-18), Zinv2 = Zinv * Zinv;
+        _jacobianOplusXi << -fx * Zinv, 0, fx * X * Zinv2, fx * X * Y * Zinv2,
+            -fx - fx * X * X * Zinv2, fx * Y * Zinv, 0, -fy * Zinv,
+            fy * Y * Zinv2, fy + fy * Y * Y * Zinv2, -fy * X * Y * Zinv2, -fy * X * Zinv;
+    }
+    virtual bool read(std::istream &in) override  { return true; }
+    virtual bool write(std::ostream &out) const override { return true; }
+   private:
+    Vec3 _pos3d; Mat33 _K;
+};
+
+class EdgeProjection : public g2o::BaseBinaryEdge<2, Vec2, VertexPose, VertexXYZ> {
+   public:
+    EdgeProjection(const Mat33 &K, const SE3 &cam_ext) : _K(K) { _cam_ext = cam_ext; }
+    virtual void computeError() override {
+        const VertexPose *v0 = static_cast<VertexPose *>(_vertices[0]);
+        const VertexXYZ  *v1 = static_cast<VertexXYZ  *>(_vertices[1]);
+        SE3 T = v0->estimate();
+        Vec3 pos_pixel = _K * (_cam_ext * (T * v1->estimate()));   // ext then K
+        pos_pixel /= pos_pixel[2];
+        _error = _measurement - pos_pixel.head<2>();
+    }
+    virtual void linearizeOplus() override {
+        const VertexPose *v0 = static_cast<VertexPose *>(_vertices[0]);
+        const VertexXYZ  *v1 = static_cast<VertexXYZ  *>(_vertices[1]);
+        SE3 T = v0->estimate(); Vec3 pw = v1->estimate();
+        Vec3 pos_cam = _cam_ext * T * pw;
+        double fx = _K(0, 0), fy = _K(1, 1);
+        double X = pos_cam[0], Y = pos_cam[1], Z = pos_cam[2];
+        double Zinv = 1.0 / (Z + 1e-18), Zinv2 = Zinv * Zinv;
+        _jacobianOplusXi << -fx * Zinv, 0, fx * X * Zinv2, fx * X * Y * Zinv2,
+            -fx - fx * X * X * Zinv2, fx * Y * Zinv, 0, -fy * Zinv,
+            fy * Y * Zinv2, fy + fy * Y * Y * Zinv2, -fy * X * Y * Zinv2, -fy * X * Zinv;
+        _jacobianOplusXj = _jacobianOplusXi.block<2, 3>(0, 0) *
+                           _cam_ext.rotationMatrix() * T.rotationMatrix();
+    }
+    virtual bool read(std::istream &in) override  { return true; }
+    virtual bool write(std::ostream &out) const override { return true; }
+   private:
+    Mat33 _K; SE3 _cam_ext;
+};
+
+inline Vec2 toVec2(const cv::Point2f &p) { return Vec2(p.x, p.y); }
+\end{codebox}
+
+\paragraph{误差对位姿的雅可比（$2\times6$）。}
+记相机系点 $\mathbf{p}_c=[X,Y,Z]^\top$。误差 $\mathbf{e}=\mathbf{z}-\pi(K\mathbf{p}_c)$ 对位姿增量的雅可比（左扰动版，$\boldsymbol\xi=[\boldsymbol\rho;\boldsymbol\phi]$ 排序）为
+\begin{equation}
+\frac{\partial \mathbf{e}}{\partial \delta\boldsymbol\xi}=
+-\begin{bmatrix}
+\dfrac{f_x}{Z} & 0 & -\dfrac{f_x X}{Z^2} & -\dfrac{f_x XY}{Z^2} & f_x+\dfrac{f_x X^2}{Z^2} & -\dfrac{f_x Y}{Z}\\[2.0ex]
+0 & \dfrac{f_y}{Z} & -\dfrac{f_y Y}{Z^2} & -f_y-\dfrac{f_y Y^2}{Z^2} & \dfrac{f_y XY}{Z^2} & \dfrac{f_y X}{Z}
+\end{bmatrix}.
+\label{eq:sys-jac-pose}
+\end{equation}
+它由链式法则得到：$\dfrac{\partial\mathbf{e}}{\partial\delta\boldsymbol\xi}=-\dfrac{\partial\pi}{\partial\mathbf{p}_c}\dfrac{\partial(\mathbf{T}\mathbf{p})}{\partial\delta\boldsymbol\xi}$，其中投影对相机点的雅可比与位姿扰动对相机点的雅可比分别为
+\begin{equation}
+\frac{\partial\pi}{\partial\mathbf{p}_c}=\begin{bmatrix}f_x/Z&0&-f_xX/Z^2\\0&f_y/Z&-f_yY/Z^2\end{bmatrix},\qquad
+\frac{\partial(\mathbf{T}\mathbf{p})}{\partial\delta\boldsymbol\xi}=[\,\mathbf{I}\ \ -\mathbf{p}_c^\wedge\,]\ (\text{左扰动}).
+\label{eq:sys-jac-chain}
+\end{equation}
+代码 \texttt{\_jacobianOplusXi} 已把外层负号并入数值。完整的扰动求导（含右扰动版本与二者的伴随关系）见 \cref{ch:lie}；这里强调一点：\textbf{雅可比的扰动侧必须与顶点更新的乘法侧一致}（都左侧或都右侧），否则 BA 不收敛。
+
+\paragraph{误差对路标的雅可比（$2\times3$）。}
+二元边还要对路标求导。链式：$\mathbf{p}_c=\mathbf{R}_{\mathrm{ext}}(\mathbf{R}\mathbf{p}_w+\mathbf{t})+\mathbf{t}_{\mathrm{ext}}\Rightarrow\partial\mathbf{p}_c/\partial\mathbf{p}_w=\mathbf{R}_{\mathrm{ext}}\mathbf{R}$，于是
+\begin{equation}
+\frac{\partial \mathbf{e}}{\partial \mathbf{p}_w}
+=\underbrace{-\begin{bmatrix}f_x/Z&0&-f_xX/Z^2\\0&f_y/Z&-f_yY/Z^2\end{bmatrix}}_{\text{= Xi 的前 3 列}}\;\mathbf{R}_{\mathrm{ext}}\;\mathbf{R},
+\label{eq:sys-jac-point}
+\end{equation}
+对应代码里 \Verb[breaklines]|_jacobianOplusXj = _jacobianOplusXi.block<2,3>(0,0) * _cam_ext.rotationMatrix() * T.rotationMatrix()|。
+
+% ════════════════════════════════════════════════════════════════
+\section{后端：局部 BA 与滑窗优化}
+\label{sec:sys-backend}
+
+\paragraph{动机：在另一个线程里，把激活窗口优化到最好。}
+后端的任务清晰：每当地图更新，就取出\emph{激活窗口}内的关键帧与路标，做一次联合 BA，再把结果写回地图。它比前端逻辑更简单（不到 200 行），但藏着多线程同步、Schur 边缘化、自适应外点剔除三个值得细品的点。
+
+\paragraph{后端类：多线程同步三件套。}
+后端独占一个线程，靠互斥锁 + 条件变量 + 原子布尔协调。条件变量 \texttt{map\_update\_} 让后端在没有更新时\emph{挂起不空转}；原子布尔 \texttt{backend\_running\_} 控制循环的运行/停止。
+
+\begin{codebox}[C++]{后端类声明（include/myslam/backend.h，节选）}
+class Backend {
+   public:
+    typedef std::shared_ptr<Backend> Ptr;
+    Backend();                                   // ctor: start thread, then suspend
+    void SetCameras(Camera::Ptr left, Camera::Ptr right) { cam_left_ = left; cam_right_ = right; }
+    void SetMap(std::shared_ptr<Map> map) { map_ = map; }
+    void UpdateMap();                            // notify backend to optimize
+    void Stop();                                 // stop the backend thread
+   private:
+    void BackendLoop();                          // the backend thread function
+    void Optimize(Map::KeyframesType &keyframes, Map::LandmarksType &landmarks);
+    std::shared_ptr<Map> map_;
+    std::thread backend_thread_;
+    std::mutex data_mutex_;
+    std::condition_variable map_update_;         // frontend wakes backend through this
+    std::atomic<bool> backend_running_;          // run/stop flag
+    Camera::Ptr cam_left_ = nullptr, cam_right_ = nullptr;
+};
+\end{codebox}
+
+\paragraph{后端线程：生产者—消费者。}
+构造函数启动线程并随即在条件变量上挂起；前端每插一个关键帧就 \texttt{UpdateMap()} 唤醒它；醒来后只取激活集做一次 BA。\texttt{Stop()} 置标志为假再唤醒，让循环条件失败、线程优雅退出（\texttt{join}）。
+
+\begin{codebox}[C++]{后端线程:构造/触发/停止/主循环（src/backend.cpp）}
+Backend::Backend() {
+    backend_running_.store(true);
+    backend_thread_ = std::thread(std::bind(&Backend::BackendLoop, this));
+}
+void Backend::UpdateMap() {                      // producer side
+    std::unique_lock<std::mutex> lock(data_mutex_);
+    map_update_.notify_one();
+}
+void Backend::Stop() {                           // graceful shutdown
+    backend_running_.store(false);
+    map_update_.notify_one();
+    backend_thread_.join();
+}
+void Backend::BackendLoop() {                    // consumer side
+    while (backend_running_.load()) {
+        std::unique_lock<std::mutex> lock(data_mutex_);
+        map_update_.wait(lock);                  // sleep until notified
+        Map::KeyframesType active_kfs       = map_->GetActiveKeyFrames();
+        Map::LandmarksType active_landmarks = map_->GetActiveMapPoints();
+        Optimize(active_kfs, active_landmarks); // only optimize the active window
+    }
+}
+\end{codebox}
+
+\paragraph{局部 BA：本章后端的核心。}
+\texttt{Optimize} 对激活窗口内\emph{所有关键帧位姿 + 它们观测到的路标}做联合重投影优化。要点：每个关键帧建一个 \texttt{VertexPose}（id = \texttt{keyframe\_id\_}）；每个被观测的路标\emph{惰性}建一个 \texttt{VertexXYZ}（id 偏移 \Verb[breaklines]|landmark_id + max_kf_id + 1| 以免和位姿 id 撞），并 \Verb[breaklines]|setMarginalized(true)| 让 g2o 用 Schur 补先消路标；按 \texttt{is\_on\_left\_image\_} 选左/右目外参建边；最后做两段式自适应外点剔除并写回。
+
+\begin{codebox}[C++]{局部 BA:Optimize（src/backend.cpp）}
+void Backend::Optimize(Map::KeyframesType &keyframes, Map::LandmarksType &landmarks) {
+    typedef g2o::BlockSolver_6_3 BlockSolverType;
+    typedef g2o::LinearSolverCSparse<BlockSolverType::PoseMatrixType> LinearSolverType;
+    auto solver = new g2o::OptimizationAlgorithmLevenberg(
+        g2o::make_unique<BlockSolverType>(g2o::make_unique<LinearSolverType>()));
+    g2o::SparseOptimizer optimizer;
+    optimizer.setAlgorithm(solver);
+
+    std::map<unsigned long, VertexPose *> vertices;       // pose vertices by keyframe_id
+    unsigned long max_kf_id = 0;
+    for (auto &keyframe : keyframes) {
+        auto kf = keyframe.second;
+        VertexPose *vertex_pose = new VertexPose();
+        vertex_pose->setId(kf->keyframe_id_);
+        vertex_pose->setEstimate(kf->Pose());
+        optimizer.addVertex(vertex_pose);
+        if (kf->keyframe_id_ > max_kf_id) max_kf_id = kf->keyframe_id_;
+        vertices.insert({kf->keyframe_id_, vertex_pose});
+    }
+
+    std::map<unsigned long, VertexXYZ *> vertices_landmarks;  // lazily created
+    Mat33 K = cam_left_->K();
+    SE3 left_ext = cam_left_->pose();
+    SE3 right_ext = cam_right_->pose();
+
+    int index = 1;
+    double chi2_th = 5.991;                        // robust kernel / outlier threshold
+    std::map<EdgeProjection *, Feature::Ptr> edges_and_features;
+
+    for (auto &landmark : landmarks) {
+        if (landmark.second->is_outlier_) continue;
+        unsigned long landmark_id = landmark.second->id_;
+        auto observations = landmark.second->GetObs();
+        for (auto &obs : observations) {
+            if (obs.lock() == nullptr) continue;            // feature destroyed
+            auto feat = obs.lock();
+            if (feat->is_outlier_ || feat->frame_.lock() == nullptr) continue;
+            auto frame = feat->frame_.lock();
+            EdgeProjection *edge = feat->is_on_left_image_
+                ? new EdgeProjection(K, left_ext)
+                : new EdgeProjection(K, right_ext);
+            if (vertices_landmarks.find(landmark_id) == vertices_landmarks.end()) {
+                VertexXYZ *v = new VertexXYZ;
+                v->setEstimate(landmark.second->Pos());
+                v->setId(landmark_id + max_kf_id + 1);      // offset to avoid id clash
+                v->setMarginalized(true);                   // Schur-marginalize this block
+                vertices_landmarks.insert({landmark_id, v});
+                optimizer.addVertex(v);
+            }
+            if (vertices.find(frame->keyframe_id_) != vertices.end() &&
+                vertices_landmarks.find(landmark_id) != vertices_landmarks.end()) {
+                edge->setId(index);
+                edge->setVertex(0, vertices.at(frame->keyframe_id_));      // pose
+                edge->setVertex(1, vertices_landmarks.at(landmark_id));    // landmark
+                edge->setMeasurement(toVec2(feat->position_.pt));
+                edge->setInformation(Mat22::Identity());
+                auto rk = new g2o::RobustKernelHuber();
+                rk->setDelta(chi2_th);
+                edge->setRobustKernel(rk);
+                edges_and_features.insert({edge, feat});
+                optimizer.addEdge(edge);
+                index++;
+            } else {
+                delete edge;                                // dangling edge guard
+            }
+        }
+    }
+
+    optimizer.initializeOptimization();
+    optimizer.optimize(10);
+
+    // adaptive outlier threshold: relax chi2_th until inlier ratio > 0.5
+    int cnt_outlier = 0, cnt_inlier = 0, iteration = 0;
+    while (iteration < 5) {
+        cnt_outlier = 0; cnt_inlier = 0;
+        for (auto &ef : edges_and_features) {
+            if (ef.first->chi2() > chi2_th) cnt_outlier++; else cnt_inlier++;
+        }
+        double inlier_ratio = cnt_inlier / double(cnt_inlier + cnt_outlier);
+        if (inlier_ratio > 0.5) break;
+        else { chi2_th *= 2; iteration++; }
+    }
+
+    for (auto &ef : edges_and_features) {          // flag outliers, detach observations
+        if (ef.first->chi2() > chi2_th) {
+            ef.second->is_outlier_ = true;
+            ef.second->map_point_.lock()->RemoveObservation(ef.second);
+        } else {
+            ef.second->is_outlier_ = false;
+        }
+    }
+    LOG(INFO) << "Outlier/Inlier in optimization: " << cnt_outlier << "/" << cnt_inlier;
+
+    for (auto &v : vertices)            keyframes.at(v.first)->SetPose(v.second->estimate());
+    for (auto &v : vertices_landmarks)  landmarks.at(v.first)->SetPos(v.second->estimate());
+}
+\end{codebox}
+
+\paragraph{数学：局部 BA 的目标函数。}
+后端解的是激活窗口内的联合重投影最小二乘：
+\begin{equation}
+\{\mathbf{T}_k^\star,\mathbf{p}_j^\star\}=\arg\min_{\mathbf{T}_k,\mathbf{p}_j}\ \frac12\sum_{(k,j)\in\mathcal{O}}\rho\Big(\big\|\mathbf{z}_{kj}-\pi(K\,\mathbf{T}_{\mathrm{ext}}\,\mathbf{T}_k\,\mathbf{p}_j)\big\|_{\boldsymbol\Sigma_v^{-1}}^2\Big),
+\label{eq:sys-localba}
+\end{equation}
+$\mathcal{O}$ 是激活窗口内所有 (关键帧, 路标) 的观测对，$\mathbf{T}_{\mathrm{ext}}\in\{\texttt{left\_ext},\texttt{right\_ext}\}$，$\boldsymbol\Sigma_v=\mathbf{I}$，$\rho$ 为 Huber 核。同一路标在左右目各贡献一条边，于是\emph{双目基线约束自然进入 BA}。
+
+\begin{insight}
+\textbf{\texttt{setMarginalized(true)} 背后是 Schur 补。}
+BA 每次迭代要解
+\begin{equation*}
+\begin{bmatrix}\mathbf{H}_{cc}&\mathbf{H}_{cp}\\ \mathbf{H}_{cp}^\top&\mathbf{H}_{pp}\end{bmatrix}\!\begin{bmatrix}\mathbf{d}_c\\ \mathbf{d}_p\end{bmatrix}=\begin{bmatrix}\mathbf{b}_c\\ \mathbf{b}_p\end{bmatrix},
+\end{equation*}
+其中 $c$ 是相机（位姿）块、$p$ 是路标块。$\mathbf{H}_{pp}$ 是\emph{块对角}的（不同路标互不直接耦合），求逆便宜。于是先消路标得约化相机系统
+\begin{equation}
+\mathbf{H}_{cc}^{\text{red}}=\mathbf{H}_{cc}-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{H}_{cp}^\top,\quad
+\mathbf{H}_{cc}^{\text{red}}\mathbf{d}_c=\mathbf{b}_c-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{b}_p,\quad
+\mathbf{H}_{pp}\mathbf{d}_p=\mathbf{b}_p-\mathbf{H}_{cp}^\top\mathbf{d}_c.
+\label{eq:sys-schur}
+\end{equation}
+这就是 \cref{ch:nlopt} 讲过的 Schur 补 / 边缘化。\Verb[breaklines]|setMarginalized(true)| 就是告诉 g2o：把这些路标块按 \cref{eq:sys-schur} 先消元。注意 g2o 要求你\emph{手动}标记，不标会报错。
+\end{insight}
+
+\paragraph{鲁棒核与阈值 5.991 的来历。}
+Huber 核
+\begin{equation}
+\rho_{\text{Huber}}(s)=\begin{cases}\tfrac12 s^2,& |s|\le\delta,\\[0.4ex] \delta\big(|s|-\tfrac12\delta\big),& |s|>\delta,\end{cases}
+\label{eq:sys-huber}
+\end{equation}
+让残差超过 $\delta$ 后由二次增长变为一次增长，从而限制单条大残差（误匹配）对总目标的支配，且处处光滑可导。这里 $\delta=$ \texttt{chi2\_th} $=5.991$，并非随手取的——单个像素重投影误差在高斯噪声 $\boldsymbol\Sigma_v$ 下，其马氏距离平方 $\mathbf{e}^\top\boldsymbol\Sigma_v^{-1}\mathbf{e}$ 服从\emph{自由度 2}（像素误差是 2 维）的卡方分布 $\chi^2_2$。取显著性水平 $\alpha=0.05$，临界值 $\chi^2_{2,0.05}=5.991$——意思是“一个真正的内点其 $\chi^2$ 超过 5.991 的概率只有 5\%”。所以它既当 Huber 的 $\delta$，又当外点门限。
+
+\begin{insight}
+\textbf{自适应外点阈值：外点太多时别一刀切。}
+\texttt{Optimize} 末尾先 \texttt{optimize(10)}，再在一个最多 5 次的循环里统计当前阈值下的内点率：若内点率 $>0.5$ 就停，否则把 \texttt{chi2\_th} \emph{翻倍}放宽再统计。为什么要放宽？因为某次优化若初值偏差大，会让大量\emph{本是内点}的边的 $\chi^2$ 也暂时偏高；这时若死守 5.991，会把过半观测误杀成外点、地图被掏空。翻倍放宽是一种“软”判定：先保住足够内点撑住优化，下一轮地图收敛后再收紧。
+\end{insight}
+
+\begin{pitfall}[编程陷阱：weak\_ptr 不 lock 判空就用，等着段错误]
+\texttt{Optimize} 遍历观测时层层判空：\Verb[breaklines]|obs.lock()==nullptr| 跳过（特征已析构）、\Verb[breaklines]|feat->is_outlier_| 跳过、\Verb[breaklines]|feat->frame_.lock()==nullptr| 跳过（帧已析构）。这些不是冗余——后端在另一个线程跑，地图随时可能因删旧帧（\cref{sec:sys-slidewindow}）清理掉某些对象。\emph{任何 \texttt{weak\_ptr} 必须 \texttt{lock()} 后判空再用}，否则就是访问悬空对象。仓库后来还给“加边”包了一层“pose 顶点和 landmark 顶点都在图中才加边、否则 \texttt{delete edge}”的健壮性补丁，防止悬挂边。
+\end{pitfall}
+
+\subsection{激活窗口怎么滑：删最近还是删最远}
+\label{sec:sys-slidewindow}
+
+\paragraph{动机：传送带满了，该让谁下车？}
+\cref{sec:sys-map} 说过激活集满 7 个就要移出一个，但\emph{移哪一个}是有讲究的。\texttt{RemoveOldKeyframe} 按李代数距离衡量各激活帧离当前帧多远，然后用一条启发式决定删谁。
+
+\begin{codebox}[C++]{滑窗:InsertKeyFrame / RemoveOldKeyframe / CleanMap（src/map.cpp）}
+void Map::InsertKeyFrame(Frame::Ptr frame) {
+    current_frame_ = frame;
+    keyframes_[frame->keyframe_id_] = frame;
+    active_keyframes_[frame->keyframe_id_] = frame;
+    if (active_keyframes_.size() > num_active_keyframes_) RemoveOldKeyframe();
+}
+void Map::InsertMapPoint(MapPoint::Ptr map_point) {
+    landmarks_[map_point->id_] = map_point;
+    active_landmarks_[map_point->id_] = map_point;
+}
+void Map::RemoveOldKeyframe() {
+    if (current_frame_ == nullptr) return;
+    double max_dis = 0, min_dis = 9999, max_kf_id = 0, min_kf_id = 0;
+    auto Twc = current_frame_->Pose().inverse();
+    for (auto &kf : active_keyframes_) {            // find nearest & farthest to current
+        if (kf.second == current_frame_) continue;
+        auto dis = (kf.second->Pose() * Twc).log().norm();  // se(3) distance
+        if (dis > max_dis) { max_dis = dis; max_kf_id = kf.first; }
+        if (dis < min_dis) { min_dis = dis; min_kf_id = kf.first; }
+    }
+    const double min_dis_th = 0.2;                  // nearest threshold
+    Frame::Ptr frame_to_remove = (min_dis < min_dis_th)
+        ? keyframes_.at(min_kf_id)   // a very close (redundant) frame -> remove it
+        : keyframes_.at(max_kf_id);  // otherwise remove the farthest
+    active_keyframes_.erase(frame_to_remove->keyframe_id_);
+    for (auto feat : frame_to_remove->features_left_) {
+        auto mp = feat->map_point_.lock();  if (mp) mp->RemoveObservation(feat);
+    }
+    for (auto feat : frame_to_remove->features_right_) {
+        if (feat == nullptr) continue;
+        auto mp = feat->map_point_.lock();  if (mp) mp->RemoveObservation(feat);
+    }
+    CleanMap();
+}
+void Map::CleanMap() {
+    int cnt = 0;
+    for (auto iter = active_landmarks_.begin(); iter != active_landmarks_.end();) {
+        if (iter->second->observed_times_ == 0) { iter = active_landmarks_.erase(iter); cnt++; }
+        else ++iter;
+    }
+    LOG(INFO) << "Removed " << cnt << " active landmarks";
+}
+\end{codebox}
+
+\noindent 启发式的逻辑是：先找出激活帧中离当前帧\emph{最近}和\emph{最远}的两个（距离用相对位姿的 $\mathfrak{se}(3)$ 模长 $\|\ln(\mathbf{T}_{kf,w}\mathbf{T}_{wc})^\vee\|$ 衡量）。若最近距离 $<0.2$，说明有一帧和当前帧几乎重合（相机近乎静止/慢动），就\emph{优先删这个冗余的最近帧}，避免窗口缩成一团而退化；否则删最远的，让窗口聚焦在当前位置附近。删帧时把它左右目特征对应地图点的观测都断开，再 \texttt{CleanMap} 删掉观测归零的孤儿点。
+
+\begin{pitfall}[思维陷阱：把“激活窗口”当成严格的滑窗边缘化]
+这里有一个常被忽视的近似。\cref{ch:nlopt} 讲的\emph{严格}滑动窗口，在删一个旧关键帧时会把它携带的信息\textbf{边缘化}成剩余变量之间的先验（一个稠密的信息块），从而“记住”被删帧的约束。而本章的 \texttt{RemoveOldKeyframe} 是\emph{直接丢弃}——把帧移出激活集、断开观测，被删帧的约束信息连同先验一起\emph{扔掉}了。这换来了实现简单，代价是精度不如严格滑窗。
+\end{pitfall}
+
+\paragraph{为什么严格边缘化更麻烦：fill-in。}
+顺着上一个陷阱再深一层。回顾 \cref{ch:nlopt}：边缘化\emph{路标}时，Schur 消元产生的 fill-in 落在位姿块上（BA 不要求位姿块对角，稀疏求解照样进行）；但边缘化一个\emph{关键帧}会破坏\emph{路标块}的对角结构——设旧帧看到路标 $y_1\sim y_4$，消去它会把这些路标两两耦合起来，右下角不再块对角，稀疏 BA 就做不下去了。早期 EKF 后端正因维持稠密信息矩阵而无法处理大滑窗。严格滑窗的补救是：边缘化旧关键帧时\emph{连同它观测的路标一起}边缘化（把信息转成剩余关键帧之间的共视约束），以保持稀疏；OKVIS 等系统还会判断这些路标是否在最新帧仍可见，不可见就边缘化、可见就干脆丢弃该旧帧对它的观测。本章不做这些，是有意为之的简化。
+
+\begin{insight}
+\textbf{边缘化的概率直观。}
+把一个变量边缘化，等价于“固定它的当前估计，求其余变量\emph{以它为条件}的条件分布，然后舍去它本身”。被边缘化的关键帧会给它看到的路标留下“这些点该在哪”的先验；再边缘化这些路标，又给观测它们的其它关键帧留下先验。整个窗口的联合分布
+\begin{equation}
+p(x_1,\dots,x_N,\text{landmarks})=p(x_1\mid\cdots)\,p(\text{其余}\mid\cdots)
+\label{eq:sys-marg}
+\end{equation}
+就被拆成“被边缘化部分”乘“其余部分”，丢掉前者、保留后者携带的先验。\textbf{变量一旦被边缘化，工程中就不该再改它}——这正是滑窗法适合 VO（只关心局部、可遗忘历史）、不适合大规模一致建图的原因。当年 g2o/Ceres 尚未直接支持滑窗边缘化操作，所以这类系统多用本章这种“激活窗口 + 直接丢弃”的工程近似。
+\end{insight}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 把 \texttt{num\_active\_keyframes\_} 从 7 改成 3 和 15，观察轨迹精度与单次后端耗时的变化，解释这个权衡。
+  \item \texttt{RemoveOldKeyframe} 的 \texttt{min\_dis\_th=0.2} 是相对位姿的 $\mathfrak{se}(3)$ 模长阈值。相机静止不动时，这条“优先删最近帧”的分支起了什么保护作用？
+  \item 推导：若一个旧关键帧观测了 5 个路标，严格边缘化它会在路标块产生多少个非零耦合块（fill-in）？
+  \item 阅读 \cref{eq:sys-schur}，说明为什么“局部 BA 的约化相机系统几乎稠密、全局 BA 的却稀疏”。（提示：共视关系的密度。）
+\end{enumerate}
+\end{practice}
+
+% ----------------------------------------------------------------
+\subsection{进阶：欠约束局部 BA 与位姿插值降维}
+\label{sec:sys-interp-ba}
+
+\paragraph{动机：窗口“约束不够”时，局部 BA 会直接解不出来。}
+\cref{sec:sys-backend} 默认激活窗口里的观测足以唯一确定窗口内所有位姿与路标。但有几种常见情形会打破这一前提：相机近乎静止（视差不足）、\textbf{卷帘快门}（rolling-shutter，一帧内不同像素行的曝光时刻不同，等于一帧对应一小段连续运动）、\textbf{边扫边动}的激光/雷达（scanning-while-moving）。此时“两帧之间”其实藏着\emph{一整段}中间位姿而观测又太少，法方程 $\mathbf{A}\,\delta\mathbf{x}=\mathbf{b}$ 的 $\mathbf{A}$ 会\textbf{奇异不可逆}，\cref{eq:sys-schur} 的 Schur 求解当场失效。本节借 Barfoot\cite{barfoot2024state} §10.1.5 的一个小例子讲清这个困境与一种漂亮解法：\textbf{用运动假设把多余的位姿“插值”掉}——既降自由度、又恰好\emph{保住箭头稀疏}。它也是连续时间估计（\cref{sec:est-steam}）落到 BA 上的最小入口。
+
+\paragraph{一个解不出来的玩具 BA。}
+看 \cref{fig:sys-interp-ba}：三个\emph{不共线}路标 $\mathbf{p}_1,\mathbf{p}_2,\mathbf{p}_3$，两个\emph{自由}位姿 $\mathbf{T}_1,\mathbf{T}_2$，再把 $\mathbf{T}_0$ 固定以锚定问题。测量是\emph{三维}的（立体相机或距离-方位-俯仰传感器各给一个 3D 观测）：$\mathbf{p}_1$ 被 $\mathbf{T}_0,\mathbf{T}_1$ 看到、$\mathbf{p}_2$ 被 $\mathbf{T}_1,\mathbf{T}_2$ 看到、$\mathbf{p}_3$ 被 $\mathbf{T}_0,\mathbf{T}_2$ 看到——共 $6$ 个 3D 观测（图中 $6$ 个黑点因子）。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small,
+  ps/.style={draw, rounded corners, fill=main!10, draw=main!60!black, minimum size=8mm},
+  psf/.style={draw, rounded corners, fill=gray!25, draw=gray!55!black, minimum size=8mm},
+  lm/.style={draw, diamond, fill=third!15, draw=third!60!black, inner sep=2pt},
+  fac/.style={circle, fill=black, inner sep=1.5pt}]
+\node[psf] (T0) at (0,0) {$\mathbf{T}_0$};
+\node[ps]  (T1) at (2.6,0) {$\mathbf{T}_1$};
+\node[ps]  (T2) at (5.2,0) {$\mathbf{T}_2$};
+\node[lm] (p1) at (1.3,1.7) {$\mathbf{p}_1$};
+\node[lm] (p2) at (3.9,1.7) {$\mathbf{p}_2$};
+\node[lm] (p3) at (2.6,-1.7) {$\mathbf{p}_3$};
+\node[fac] (f01) at (0.65,0.85) {}; \draw (T0)--(f01)--(p1);
+\node[fac] (f11) at (1.95,0.85) {}; \draw (T1)--(f11)--(p1);
+\node[fac] (f12) at (3.25,0.85) {}; \draw (T1)--(f12)--(p2);
+\node[fac] (f22) at (4.55,0.85) {}; \draw (T2)--(f22)--(p2);
+\node[fac] (f03) at (1.3,-0.85) {}; \draw (T0)--(f03)--(p3);
+\node[fac] (f23) at (3.9,-0.85) {}; \draw (T2)--(f23)--(p3);
+\node[font=\footnotesize, gray!50!black, align=left] at (6.7,0) {$\mathbf{T}_0$\\ 固定};
+\end{tikzpicture}
+\caption{欠约束 BA 的因子图（仿 Barfoot 图 10.3）。两个自由位姿 $\mathbf{T}_1,\mathbf{T}_2$、三个不共线路标 $\mathbf{p}_1,\mathbf{p}_2,\mathbf{p}_3$，$\mathbf{T}_0$ 固定。$6$ 个黑点是因子（3D 观测）：$\mathbf{p}_1$ 被 $\mathbf{T}_0,\mathbf{T}_1$ 看到、$\mathbf{p}_2$ 被 $\mathbf{T}_1,\mathbf{T}_2$、$\mathbf{p}_3$ 被 $\mathbf{T}_0,\mathbf{T}_2$。$6\times3=18$ 个标量约束不足以定 $21$ 个自由未知量，故法方程奇异。}
+\label{fig:sys-interp-ba}
+\end{figure}
+
+待估状态及其扰动堆叠为（沿用 \cref{ch:lie} 的扰动求导，$\boldsymbol\epsilon_k\in\mathbb{R}^6$ 是位姿 $\mathbf{T}_k$ 的扰动、$\boldsymbol\zeta_j\in\mathbb{R}^3$ 是路标 $\mathbf{p}_j$ 的扰动）
+\begin{equation}
+\mathbf{x}=\{\mathbf{T}_1,\mathbf{T}_2,\mathbf{p}_1,\mathbf{p}_2,\mathbf{p}_3\},\qquad
+\delta\mathbf{x}=[\,\boldsymbol\epsilon_1;\ \boldsymbol\epsilon_2;\ \boldsymbol\zeta_1;\ \boldsymbol\zeta_2;\ \boldsymbol\zeta_3\,].
+\label{eq:sys-interp-state}
+\end{equation}
+每次迭代解 $\mathbf{A}\,\delta\mathbf{x}^\star=\mathbf{b}$。按 $[\boldsymbol\epsilon_1,\boldsymbol\epsilon_2\mid\boldsymbol\zeta_1,\boldsymbol\zeta_2,\boldsymbol\zeta_3]$ 分块，$\mathbf{A}$ 是一个\textbf{箭头矩阵}（左上是位姿块、右下是\emph{块对角}的路标块、跨块项来自“某位姿看到某路标”的观测）：
+\begin{equation}
+\mathbf{A}=
+\begin{bmatrix}
+\mathbf{A}_{11} & & \mathbf{A}_{13} & \mathbf{A}_{14} & \\
+ & \mathbf{A}_{22} & & \mathbf{A}_{24} & \mathbf{A}_{25}\\
+\mathbf{A}_{13}^\top & & \mathbf{A}_{33} & & \\
+\mathbf{A}_{14}^\top & \mathbf{A}_{24}^\top & & \mathbf{A}_{44} & \\
+ & \mathbf{A}_{25}^\top & & & \mathbf{A}_{55}
+\end{bmatrix}.
+\label{eq:sys-interp-A}
+\end{equation}
+
+\paragraph{为什么它必然奇异：数一数自由度。}
+测量给出 $6\times3=18$ 个标量约束，而自由未知量有 $2\times6+3\times3=21$ 个。由于 $\mathbf{A}=\mathbf{J}^\top\boldsymbol\Sigma^{-1}\mathbf{J}$，其秩 $\le\mathrm{rank}\,\mathbf{J}\le 18<21$，$\mathbf{A}$（$21\times21$）\textbf{必然奇异}——至少 $3$ 个自由度无法被这 $6$ 个观测约束。直观说：三个路标太少，撑不住两个自由位姿。这正是卷帘快门、边扫边动里反复出现的欠约束。
+
+\paragraph{两条出路：惩罚项 vs.\ 约束。}
+没有更多路标可用，唯一办法是对轨迹\emph{额外假设}些什么。Barfoot 指出两条路：
+\begin{enumerate}
+  \item \textbf{惩罚项（MAP）}：给轨迹加一个先验密度，往代价函数里塞一个鼓励“合理轨迹”的惩罚项。这等价于引入\emph{运动先验}，正是 SLAM 与连续时间估计（\cref{sec:est-steam} 的 WNOA/GP 先验）的做法。
+  \item \textbf{约束（ML）}：仍走最大似然，但把轨迹\emph{约束}成某种形式。这里假设车体在位姿 $0$ 与 $2$ 之间\emph{匀速}（常六维速度），于是 $\mathbf{T}_1$ 可由 $\mathbf{T}_2$ 插值得到，自由位姿从 $2$ 个降到 $1$ 个，问题唯一可解。
+\end{enumerate}
+下面走第二条（约束/插值）路。
+
+\paragraph{位姿插值：把 $\mathbf{T}_1$ 表示成 $\mathbf{T}_2$ 的幂。}
+记三个位姿的时刻为 $t_0,t_1,t_2$，定义插值比并写出匀速插值（以固定的 $\mathbf{T}_0$ 为基准）
+\begin{equation}
+\alpha=\frac{t_1-t_0}{t_2-t_0}\in(0,1),\qquad
+\mathbf{T}_1=\mathbf{T}^{\alpha}=\exp\!\big(\alpha\ln\mathbf{T}\big),\quad \mathbf{T}\equiv\mathbf{T}_2,
+\label{eq:sys-interp-alpha}
+\end{equation}
+其中 $\mathbf{T}^\alpha$ 是 $\SE(3)$ 上的匀速位姿插值（\cref{ch:lie} 的矩阵指数/对数）。对插值位姿做扰动会引出一个\textbf{插值雅可比} $\boldsymbol{\mathcal{A}}(\alpha,\boldsymbol\xi_{\mathrm{op}})$（$\boldsymbol\xi_{\mathrm{op}}=\ln(\mathbf{T}_{\mathrm{op}})^\vee$）：$\mathbf{T}_1$ 的扰动满足 $\boldsymbol\epsilon_1=\boldsymbol{\mathcal{A}}(\alpha,\boldsymbol\xi_{\mathrm{op}})\,\boldsymbol\epsilon$，而 $\boldsymbol\epsilon_2=\boldsymbol\epsilon$（因 $\mathbf{T}=\mathbf{T}_2$）。
+
+\begin{note}
+Barfoot 原文用左扰动 $\mathbf{T}=\exp(\boldsymbol\epsilon^\wedge)\mathbf{T}_{\mathrm{op}}$ 导出 $\boldsymbol{\mathcal{A}}$；本书右扰动下 $\boldsymbol{\mathcal{A}}$ 的具体表达式不同，但下面“插值矩阵折进法方程”的\emph{降维机理与稀疏保持}对两种约定完全一致——因为它本质只是把旧扰动通过一个线性映射 $\delta\mathbf{x}=\boldsymbol{\mathcal{I}}\,\delta\mathbf{x}'$ 换成新扰动的链式法则，与扰动方向无关。
+\end{note}
+
+\paragraph{插值矩阵：把旧扰动写成新扰动的线性映射。}
+新的待估状态去掉了 $\mathbf{T}_1$：$\mathbf{x}'=\{\mathbf{T},\mathbf{p}_1,\mathbf{p}_2,\mathbf{p}_3\}$，扰动 $\delta\mathbf{x}'=[\,\boldsymbol\epsilon;\ \boldsymbol\zeta_1;\ \boldsymbol\zeta_2;\ \boldsymbol\zeta_3\,]\in\mathbb{R}^{15}$。旧扰动 $\delta\mathbf{x}\in\mathbb{R}^{21}$ 与之的关系由\textbf{插值矩阵} $\boldsymbol{\mathcal{I}}$ 给出：
+\begin{equation}
+\underbrace{\begin{bmatrix}\boldsymbol\epsilon_1\\ \boldsymbol\epsilon_2\\ \boldsymbol\zeta_1\\ \boldsymbol\zeta_2\\ \boldsymbol\zeta_3\end{bmatrix}}_{\delta\mathbf{x}}
+=\underbrace{\begin{bmatrix}
+\boldsymbol{\mathcal{A}}(\alpha,\boldsymbol\xi_{\mathrm{op}}) & & & \\
+\mathbf{I}_6 & & & \\
+ & \mathbf{I}_3 & & \\
+ & & \mathbf{I}_3 & \\
+ & & & \mathbf{I}_3
+\end{bmatrix}}_{\boldsymbol{\mathcal{I}}\ (21\times15)}
+\underbrace{\begin{bmatrix}\boldsymbol\epsilon\\ \boldsymbol\zeta_1\\ \boldsymbol\zeta_2\\ \boldsymbol\zeta_3\end{bmatrix}}_{\delta\mathbf{x}'}.
+\label{eq:sys-interp-Imat}
+\end{equation}
+注意 $\boldsymbol{\mathcal{I}}$ 的\emph{下面三行是单位阵}（路标扰动原样保留），只有上面两行（两个位姿）共同从单一的 $\boldsymbol\epsilon$ 映射而来——这个结构是下面稀疏得以保持的关键。
+
+\paragraph{折进法方程：$\mathbf{A}'=\boldsymbol{\mathcal{I}}^\top\mathbf{A}\,\boldsymbol{\mathcal{I}}$。}
+把 \cref{eq:sys-interp-Imat} 的 $\delta\mathbf{x}=\boldsymbol{\mathcal{I}}\,\delta\mathbf{x}'$ 代入二次型 $J\approx J_{\mathrm{op}}-\mathbf{b}^\top\delta\mathbf{x}+\tfrac12\delta\mathbf{x}^\top\mathbf{A}\,\delta\mathbf{x}$，立得降维后的法方程
+\begin{equation}
+\mathbf{A}'\,\delta\mathbf{x}'^\star=\mathbf{b}',\qquad
+\mathbf{A}'=\boldsymbol{\mathcal{I}}^\top\mathbf{A}\,\boldsymbol{\mathcal{I}},\quad
+\mathbf{b}'=\boldsymbol{\mathcal{I}}^\top\mathbf{b}.
+\label{eq:sys-interp-reduced}
+\end{equation}
+解出 $\delta\mathbf{x}'^\star$ 后照 \cref{ch:lie} 的右扰动更新 $\mathbf{T}_{\mathrm{op}}\leftarrow\mathbf{T}_{\mathrm{op}}\,\mathrm{Exp}(\boldsymbol\epsilon^\star)$、$\mathbf{p}_{\mathrm{op},j}\leftarrow\mathbf{p}_{\mathrm{op},j}+\boldsymbol\zeta_j^\star$，迭代至收敛。
+
+\paragraph{关键：稀疏没被破坏，$\mathbf{A}'$ 仍是箭头矩阵。}
+会不会 $\boldsymbol{\mathcal{I}}^\top\mathbf{A}\,\boldsymbol{\mathcal{I}}$ 把路标块搅成稠密、毁掉 Schur？不会。逐块算 \cref{eq:sys-interp-reduced}：因 $\boldsymbol{\mathcal{I}}$ 在路标行是单位阵，\emph{路标-路标块原样不动}，仍是块对角 $\mathrm{diag}(\mathbf{A}_{33},\mathbf{A}_{44},\mathbf{A}_{55})$；只有两个位姿列被 $\boldsymbol{\mathcal{A}}$ 合并成一个位姿列：
+\begin{equation}
+\mathbf{A}'=
+\begin{bmatrix}
+\boldsymbol{\mathcal{A}}^\top\mathbf{A}_{11}\boldsymbol{\mathcal{A}}+\mathbf{A}_{22}
+ & \boldsymbol{\mathcal{A}}^\top\mathbf{A}_{13} & \boldsymbol{\mathcal{A}}^\top\mathbf{A}_{14}+\mathbf{A}_{24} & \mathbf{A}_{25}\\
+\ast & \mathbf{A}_{33} & & \\
+\ast & & \mathbf{A}_{44} & \\
+\ast & & & \mathbf{A}_{55}
+\end{bmatrix}.
+\label{eq:sys-interp-Aprime}
+\end{equation}
+右下仍块对角 $\Rightarrow$ $\mathbf{A}'$ 仍是\textbf{箭头矩阵}，\cref{eq:sys-schur} 的 Schur 边缘化照样能用——“插值降维”与“稀疏 BA”可以兼得。
+
+\paragraph{回到玩具数值：插值后唯一可解。}
+插值把自由未知量从 $21$ 降到 $1\times6+3\times3=15$，而约束仍是 $18$ 个；$15<18$，$\mathbf{A}'$ 可满秩 $15$、可逆，$\delta\mathbf{x}'^\star$ 唯一确定——\textbf{原本欠约束（$21>18$）的 BA，经一次匀速插值就变成可唯一求解（$15<18$）}。这就是“位姿插值降维”的全部要义。Barfoot 进一步指出：更复杂的 BA 也能照此办理——决定哪些位姿留在状态里、哪些用插值表示，再相应堆出插值矩阵 $\boldsymbol{\mathcal{I}}$ 即可。
+
+\begin{insight}
+\textbf{约束式插值与惩罚式先验，是同一枚硬币的两面。}
+本节“匀速约束 + 插值”把中间位姿\emph{硬绑}在两端之间（一个等式约束）；\cref{sec:est-steam} 的连续时间 SLAM 则给轨迹一个 GP/WNOA \emph{先验惩罚}，软性鼓励平滑。前者把自由度直接\emph{消掉}（降维、$\mathbf{A}'$ 变小），后者把自由度\emph{留着}但加惩罚块（$\mathbf{A}$ 变大但更满秩）。卷帘快门去畸变、激光运动补偿、IMU 预积分之间的稠密插值，本质都在这两条路之间权衡：要省自由度就约束，要更灵活就惩罚。
+\end{insight}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 在 \cref{fig:sys-interp-ba} 里若再加一个被 $\mathbf{T}_1,\mathbf{T}_2$ 共同观测的路标 $\mathbf{p}_4$，自由度账目变成多少？$\mathbf{A}$ 还奇异吗？据此说明“插值”与“多加观测”是解欠约束的两种互补手段。
+  \item 验证 \cref{eq:sys-interp-Aprime}：手算 $\boldsymbol{\mathcal{I}}^\top\mathbf{A}\,\boldsymbol{\mathcal{I}}$ 的路标-路标块，确认它等于原 $\mathrm{diag}(\mathbf{A}_{33},\mathbf{A}_{44},\mathbf{A}_{55})$，即插值不产生路标间 fill-in。
+  \item 若改用三个位姿 $\mathbf{T}_1,\mathbf{T}_2,\mathbf{T}_3$ 且只保留 $\mathbf{T}_3$、其余两个都插值，写出此时 $\boldsymbol{\mathcal{I}}$ 的分块形状（提示：两个位姿行各放一个插值雅可比）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{多线程并发与周边模块}
+\label{sec:sys-thread}
+
+\paragraph{动机：把前后端真正“接通”。}
+前面前端在主线程跑、后端在自己的线程跑，二者通过共享地图交互。本节把这套并发模型集中讲清，再补齐相机、数据集等周边脚手架——它们不含核心算法，但少了就跑不起来。
+
+\paragraph{并发模型：三件同步原语，各司其职。}
+本系统的并发用到 C++ 标准库的三件套：互斥锁 \texttt{std::mutex} 保护共享数据（Frame 的 \texttt{pose\_}、MapPoint 的 \texttt{pos\_}、Map 的容器三处）；条件变量 \texttt{std::condition\_variable} 实现“前端通知、后端等待”的生产者—消费者；原子布尔 \texttt{std::atomic<bool>} 作后端运行标志。线程生命周期是“构造即启动并挂起、\texttt{Stop()} 优雅退出 \texttt{join}”。\cref{tab:sys-concurrency} 汇总了这些原语的落点。
+
+\begin{table}[H]\centering\small
+\caption{并发原语与落点}
+\label{tab:sys-concurrency}
+\begin{tabularx}{\linewidth}{lLL}
+\toprule
+原语 & 落点 & 作用 \\
+\midrule
+\texttt{std::mutex} & \texttt{Frame::pose\_mutex\_}、\texttt{MapPoint::data\_mutex\_}、\texttt{Map::data\_mutex\_} & 保护并发读写 \\
+\texttt{std::condition\_variable} & \texttt{Backend::map\_update\_} & 前端 \texttt{UpdateMap} 唤醒后端 \\
+\texttt{std::atomic<bool>} & \texttt{Backend::backend\_running\_} & 控制后端循环运行/停止 \\
+\texttt{std::thread} & \texttt{Backend::backend\_thread\_}、Viewer 线程 & 后端优化、可视化各自独立 \\
+\texttt{std::weak\_ptr} & Feature$\to$Frame/MapPoint、MapPoint 的观测 & 断循环引用、判活 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{pitfall}[编程陷阱：条件变量的“虚假唤醒”与丢失唤醒]
+本实现 \Verb[breaklines]|map_update_.wait(lock)| 是\emph{无谓词}等待。严格地说，条件变量可能\emph{虚假唤醒}（spurious wakeup），生产规范里应配一个谓词 \verb@wait(lock, [&]{return updated || !running;})@ 来防。本系统因为“多醒几次顶多多做一次 BA、没醒到顶多下次再优化”而容忍了这一点；但你若把它用到“漏一次唤醒就死锁”的场景，务必加谓词。这也是读教学代码时要带的批判眼光：能跑的简化，未必是生产安全的写法。
+\end{pitfall}
+
+\paragraph{相机类：双目外参的处理是点睛之笔。}
+\texttt{Camera} 管内参 $K$、外参 \texttt{pose\_}（“从双目参考系到该单目”的变换 $\mathbf{T}_{\mathrm{ext}}$）、基线，并提供针孔投影/反投影族。左目的 \texttt{pose\_} 通常是单位阵（参考系即左目），右目的含一段沿基线的平移。
+
+\begin{codebox}[C++]{相机类与坐标变换（include/myslam/camera.h + camera.cpp）}
+class Camera {
+   public:
+    typedef std::shared_ptr<Camera> Ptr;
+    double fx_=0, fy_=0, cx_=0, cy_=0, baseline_=0;   // intrinsics
+    SE3 pose_;        // extrinsic: stereo-reference -> this single camera (T_ext)
+    SE3 pose_inv_;    // inverse of pose_
+    Camera(double fx,double fy,double cx,double cy,double baseline,const SE3&pose)
+        : fx_(fx),fy_(fy),cx_(cx),cy_(cy),baseline_(baseline),pose_(pose) { pose_inv_=pose_.inverse(); }
+    SE3 pose() const { return pose_; }
+    Mat33 K() const { Mat33 k; k << fx_,0,cx_, 0,fy_,cy_, 0,0,1; return k; }
+    // world->camera: first frame pose Tcw, then this camera's extrinsic
+    Vec3 world2camera(const Vec3 &p_w, const SE3 &T_c_w) { return pose_ * T_c_w * p_w; }
+    Vec3 camera2world(const Vec3 &p_c, const SE3 &T_c_w) { return T_c_w.inverse()*pose_inv_*p_c; }
+    Vec2 camera2pixel(const Vec3 &p_c) {
+        return Vec2(fx_*p_c(0,0)/p_c(2,0)+cx_, fy_*p_c(1,0)/p_c(2,0)+cy_);
+    }
+    Vec3 pixel2camera(const Vec2 &p_p, double depth=1) {
+        return Vec3((p_p(0,0)-cx_)*depth/fx_, (p_p(1,0)-cy_)*depth/fy_, depth);
+    }
+    Vec2 world2pixel(const Vec3 &p_w, const SE3 &T_c_w) { return camera2pixel(world2camera(p_w,T_c_w)); }
+};
+\end{codebox}
+
+\noindent 关键在 \texttt{world2camera = pose\_ * T\_c\_w * p\_w}：先用帧位姿 $\mathbf{T}_{cw}$ 把世界点变到“双目参考系”，再用 \texttt{pose\_}（$\mathbf{T}_{\mathrm{ext}}$）变到具体单目系。这就是为什么后端 \texttt{EdgeProjection} 要传 \texttt{left\_ext}/\allowbreak\texttt{right\_ext}——同一个位姿顶点经不同外参分别投到左右图，双目两个视角约束同一 3D 点。
+
+\paragraph{数据集类：KITTI 标定与外参恢复。}
+KITTI 的 \texttt{calib.txt} 每行是 $3\times4$ 投影矩阵 $P=K[\,\mathbf{I}\,|\,\mathbf{t}'\,]$（已立体校正，$\mathbf{t}'=K\mathbf{t}$）。代码读 12 个数填 $K$ 与 $\mathbf{t}'$，再用 \Verb[breaklines]|t = K.inverse()*t| 还原真实外参平移，基线取 \verb|t.norm()|。还有一个易错点：图像 \texttt{resize} 0.5 提速时，内参必须\emph{同步}乘 0.5。
+
+\begin{codebox}[C++]{KITTI 数据集读取（src/dataset.cpp，节选）}
+bool Dataset::Init() {
+    ifstream fin(dataset_path_ + "/calib.txt");
+    for (int i = 0; i < 4; ++i) {                  // KITTI has 4 cameras
+        char camera_name[3];
+        for (int k = 0; k < 3; ++k) fin >> camera_name[k];
+        double projection_data[12];
+        for (int k = 0; k < 12; ++k) fin >> projection_data[k];
+        Mat33 K;
+        K << projection_data[0], projection_data[1], projection_data[2],
+             projection_data[4], projection_data[5], projection_data[6],
+             projection_data[8], projection_data[9], projection_data[10];
+        Vec3 t;
+        t << projection_data[3], projection_data[7], projection_data[11];
+        t = K.inverse() * t;                       // recover real extrinsic translation
+        K = K * 0.5;                               // images are resized by 0.5
+        Camera::Ptr new_camera(new Camera(K(0,0),K(1,1),K(0,2),K(1,2),
+                                          t.norm(), SE3(SO3(), t)));
+        cameras_.push_back(new_camera);
+    }
+    current_image_index_ = 0;
+    return true;
+}
+Frame::Ptr Dataset::NextFrame() {
+    boost::format fmt("%s/image_%d/%06d.png");
+    cv::Mat image_left  = cv::imread((fmt % dataset_path_ % 0 % current_image_index_).str(),
+                                     cv::IMREAD_GRAYSCALE);
+    cv::Mat image_right = cv::imread((fmt % dataset_path_ % 1 % current_image_index_).str(),
+                                     cv::IMREAD_GRAYSCALE);
+    if (image_left.data == nullptr || image_right.data == nullptr) return nullptr;
+    cv::Mat l, r;
+    cv::resize(image_left,  l, cv::Size(), 0.5, 0.5, cv::INTER_NEAREST);
+    cv::resize(image_right, r, cv::Size(), 0.5, 0.5, cv::INTER_NEAREST);
+    auto new_frame = Frame::CreateFrame();
+    new_frame->left_img_ = l; new_frame->right_img_ = r;
+    current_image_index_++;
+    return new_frame;
+}
+\end{codebox}
+
+\paragraph{配置类与可视化类：脚手架一笔带过。}
+\texttt{Config} 用\emph{单例模式}（全局唯一配置对象）封装 \texttt{cv::FileStorage}，\Verb[breaklines]|Config::Get<T>("key")| 从 \texttt{default.\allowbreak yaml} 读参数（如 \texttt{num\_features}、\texttt{dataset\_dir}）。\texttt{Viewer} 在独立线程用 Pangolin 画当前帧位姿、激活关键帧轨迹、激活地图点云；\texttt{AddCurrentFrame}/\allowbreak\texttt{UpdateMap} 由前端调用，\texttt{Close()} 在退出时调用。这两个模块不含核心算法，理解其职责即可。
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 给 \Verb[breaklines]|map_update_.wait| 加上谓词，使后端不受虚假唤醒影响、且 \texttt{Stop} 时能立刻退出。
+  \item 若忘了在 \texttt{Dataset::Init} 里把 $K$ 乘 0.5，但图像照样 resize 0.5，重投影会偏多少？（用 $f_x$ 估算。）
+  \item 把 \texttt{Config} 改成 RGB-D 输入：哪些读取逻辑要改？哪些前端函数要换（提示：\texttt{FindFeaturesInRight} 与三角化）？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{实验：在 KITTI 上跑起来}
+\label{sec:sys-experiment}
+
+\paragraph{运行步骤。}
+下载 KITTI odometry 数据集（\texttt{http:/\allowbreak /\allowbreak www.\allowbreak cvlibs.\allowbreak net/\allowbreak datasets/\allowbreak kitti/\allowbreak eval\_odometry.\allowbreak php}，约 22\,GB），解压得到若干视频段，以第 0 段为例。编译后在 \texttt{config/\allowbreak default.\allowbreak yaml} 填上数据路径，如 \Verb[breaklines]|dataset_dir: .../dataset/sequences/00|，终端运行 \texttt{bin/\allowbreak run\_kitti\_stereo} 即可看到定位输出。运行期间程序会显示\emph{激活的关键帧和地图}，它们随镜头运动\textbf{不断增长和消失}——这正是激活窗口滑动的直观可视化。
+
+\paragraph{性能观察。}
+\begin{itemize}
+  \item 处理\emph{非关键帧}时，单帧耗时约 16\,ms（约 60+ FPS 的前端实时性）。
+  \item 处理\emph{关键帧}时，因新增了提特征、右图匹配、三角化、触发后端等步骤，耗时\emph{适当增多}。
+  \item \textbf{内存增长问题}：地图目前会存储\emph{所有}关键帧和地图点（全量 \texttt{keyframes\_}/\allowbreak\texttt{landmarks\_}），跑久了内存会线性增长。若不需要全部地图，可只保留激活的部分。
+\end{itemize}
+
+\begin{pitfall}[思维陷阱：把 16\,ms 当成“系统总耗时”]
+16\,ms 只是\emph{前端处理一个非关键帧}的耗时，量自 \texttt{VisualOdometry::Step} 里对 \texttt{AddFrame} 的计时。后端 BA 在\emph{另一个线程}异步进行，不计入这 16\,ms；关键帧帧因要触发后端等也更慢。所以“前端实时”不等于“整个系统的每个动作都在 16\,ms 内完成”——这正是分线程的意义：把慢的后端从前端的关键路径上摘出去。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{与 ORB-SLAM2 架构对照}
+\label{sec:sys-orbslam}
+\label{sec:sys-loop}
+
+\paragraph{动机：望向工业级，看精简 VO 缺了什么。}
+我们的精简 VO 是 ORB-SLAM2 的“骨架简化版”——前端追踪 + 局部 BA 后端 + 滑窗地图三要素齐备，但砍掉了回环、重定位、共视图/本质图、冗余剔除。本节把这些缺失的工业级要素逐条补上，让你既会“能跑的最小系统”，又知道“完整系统该长什么样”。其中最关键的缺失项就是\emph{回环}。
+
+\paragraph{三（+一）线程架构。}
+ORB-SLAM2\cite{murartal2017orbslam2} 由三个并行线程加一个可选线程组成：
+\begin{enumerate}
+  \item \textbf{Tracking（跟踪，帧率 10--50\,Hz）}：把双目/RGB-D 输入抽象成统一关键点；与上一帧/局部地图做 ORB 描述子匹配；用 motion-only BA 定位（\emph{不更新地图点}）；决定是否生成关键帧。其 motion-only BA 目标与本章 pose-only BA（\cref{eq:sys-poseonly}）同形：
+  \begin{equation}
+  \mathbf{T}_w^{i\star}=\arg\min_{\mathbf{T}_w^i}\sum_{j\in\mathsf{P}}\rho\Big(\big\|\mathbf{z}_{ij}-\pi(\mathbf{R}_w^i\mathbf{x}_j^w+\mathbf{t}_w^i)\big\|_{\boldsymbol\Sigma_{ij}}\Big).
+  \label{eq:sys-orb-motiononly}
+  \end{equation}
+  \item \textbf{Local Mapping（局部建图，关键帧率 0.5--5\,Hz）}：维护并优化局部地图，做 local BA；插新关键帧、剔冗余关键帧、剔/建地图点。
+  \item \textbf{Loop Closing（回环，每个关键帧尝试一次）}：用 DBoW2 词袋检测回环候选；算 Sim(3)（单目）/SE(3)（双目-RGBD）相对变换；回环融合 + 本质图位姿图优化纠正累积漂移。
+  \item \textbf{Full BA（可选第四线程）}：回环后对全部关键帧与地图点做全局 BA，可被新回环中断。
+\end{enumerate}
+我们的精简 VO 只对应其中的 Tracking（前端）+ Local Mapping（后端局部 BA），没有 Loop Closing、Full BA、重定位。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=8mm,
+  t/.style={draw, rounded corners, align=center, minimum height=10mm, inner sep=4pt, fill=second!8, draw=second!60!black},
+  m/.style={draw, rounded corners, align=center, minimum height=10mm, inner sep=4pt, fill=third!8, draw=third!60!black},
+  l/.style={draw, rounded corners, align=center, minimum height=10mm, inner sep=4pt, fill=main!8, draw=main!60!black},
+  g/.style={draw, rounded corners, align=center, minimum height=10mm, inner sep=4pt, fill=gray!10, draw=gray!60!black}]
+\node[t] (tr) {Tracking\\ ORB 匹配\\ motion-only BA};
+\node[m, right=14mm of tr] (lm) {Local Mapping\\ local BA\\ 关键帧/点剔除};
+\node[l, right=14mm of lm] (lc) {Loop Closing\\ DBoW2 + Sim3\\ 本质图 PGO};
+\node[g, below=8mm of lc] (fb) {Full BA\\（可选）};
+\node[g, below=8mm of lm] (map) {Map + 共视图\\ 本质图 + 生成树};
+\draw[->] (tr) -- node[above,font=\footnotesize]{新关键帧} (lm);
+\draw[->] (lm) -- node[above,font=\footnotesize]{关键帧} (lc);
+\draw[->] (lc) -- (fb);
+\draw[->] (lm) -- (map); \draw[->] (lc.south) -- (fb.north);
+\draw[->] (map.west) .. controls +(-6mm,0) and +(-6mm,0) .. (tr.south west);
+\end{tikzpicture}
+\caption{ORB-SLAM2 三（+一）线程架构。Tracking 定位并产出关键帧，Local Mapping 维护局部地图并做 local BA，Loop Closing 检测并纠正回环，Full BA 在回环后全局精修；共视图/本质图/生成树是支撑这些线程的地图结构。}
+\label{fig:sys-orb-arch}
+\end{figure}
+
+\paragraph{双目/RGB-D 关键点：三坐标统一表示。}
+ORB-SLAM2 把双目关键点表示成三坐标 $\mathbf{x}_s=(u_L,v_L,u_R)$：左图坐标 $(u_L,v_L)$ 加右图横坐标 $u_R$（已行对齐，右图只差横坐标）。RGB-D 则把深度 $d$ 合成一个\emph{虚拟右坐标}
+\begin{equation}
+u_R=u_L-\frac{f_x\,b}{d},
+\label{eq:sys-rgbd-ur}
+\end{equation}
+于是 RGB-D 与双目在后端用\emph{同一套}三坐标关键点处理——这是统一两种传感器的关键设计。它还区分\textbf{近点}（深度 $<40b$，可单帧立体三角化、深度可靠）与\textbf{远点}（深度 $\ge40b$，视差太小、需多视角三角化后才升级），近点提供完整双目约束，远点先只当方向约束。
+
+\paragraph{地图结构：共视图 / 生成树 / 本质图。}
+\begin{itemize}
+  \item \textbf{共视图（Covisibility Graph）}\cite{murartal2015orbslam}：节点是关键帧，两帧共同观测 $\ge\theta$ 个地图点就连边（权重 = 共视点数）。local BA 的局部窗口就由它选取（例 $\theta=15$）。
+  \item \textbf{生成树（Spanning Tree）}：共视图的连通生成树，每帧只连一条到“共视最强父帧”的边，保证全图连通、边数最少。
+  \item \textbf{本质图（Essential Graph）}：更稀疏 = 生成树 + 强共视边（$\theta=100$）+ 回环边，用于回环时的位姿图优化。
+\end{itemize}
+对照之下，本章的“窗口”是\emph{纯时序最近 7 帧 + 删最近/最远启发式}，没有共视图这种按“谁和谁真正看到同一批点”动态组织的结构。
+
+\paragraph{关键帧选取与剔除：宽进严出。}
+ORB-SLAM2 插关键帧需\emph{同时}满足四条件（与本章“内点 $<80$”单条件形成对比）：距上次全局重定位 $>20$ 帧；局部建图空闲或距上次插帧 $>20$ 帧；当前帧跟踪到的地图点 $\ge50$；当前帧与参考关键帧的共视点比例 $<90\%$（含足够新信息）。双目/RGB-D 还有“近点不足且能新建足够近点”的额外条件。这是“宽进”——尽量快插以提升鲁棒性；再由局部建图线程做\textbf{关键帧剔除}（“严出”）：若某关键帧 $\ge90\%$ 的地图点能被其它至少 3 个关键帧在相同或更精细尺度观测到，就删掉它。我们的系统只按时序删最旧/最近，不按信息冗余删。
+
+\paragraph{局部 BA：K1 优化 / K2 固定。}
+ORB-SLAM2 的 local BA 区分两组关键帧：$\mathsf{K}_1$（当前帧及其共视邻居，\emph{被优化}）与 $\mathsf{K}_2$（也观测到 $\mathsf{P}_1$ 中某些点、但\emph{位姿固定}的帧，提供“锚”防漂移），目标为
+\begin{equation}
+\big\{\mathbf{T}_w^{k\star},\mathbf{x}_j^{w\star}\mid k\in\mathsf{K}_1, j\in\mathsf{P}_1\big\}
+=\arg\min\frac12\!\!\sum_{\substack{i\in\mathsf{K}_1\cup\mathsf{K}_2\\ j\in\mathsf{P}_1}}\!\!
+\rho\Big(\big\|\mathbf{z}_{ij}-\pi(\mathbf{R}_w^i\mathbf{x}_j^w+\mathbf{t}_w^i)\big\|_{\boldsymbol\Sigma_{ij}}\Big).
+\label{eq:sys-orb-localba}
+\end{equation}
+\textbf{这是与本章精简 VO 后端的核心差异}：本章后端激活窗口内的 7 帧\emph{全部被优化、无固定帧}，窗口边缘缺少锚定，更易整体漂移；ORB-SLAM2 有 $\mathsf{K}_2$ 固定帧锚定、且按共视而非纯时序选窗口。
+
+\paragraph{回环线程：完整系统的最后一环。}
+ORB-SLAM2 的回环分四步：（1）\emph{候选检测}——DBoW2 词袋在数据库检索相似且不在当前共视图内的关键帧，要求连续 3 个共视帧一致（时间一致性）；（2）\emph{算 Sim(3)/SE(3)}——ORB 匹配 + RANSAC 求相似变换（单目，含尺度以纠正尺度漂移）或刚体变换（双目-RGBD）；（3）\emph{回环融合}——用算出的变换对齐当前侧位姿与地图点、融合重复点、在共视图插回环边；（4）\emph{本质图位姿图优化}——在本质图上做 PGO，把回环误差沿全图分摊。其位姿图优化的数学（本书右扰动版可参 \cref{ch:loop}）以相对位姿观测为边，误差
+\begin{equation}
+\mathbf{e}_{ij}=\ln\!\big(\mathbf{T}_{ij}^{-1}\mathbf{T}_i^{-1}\mathbf{T}_j\big)^\vee,\qquad
+\min\ \frac12\sum_{(i,j)\in\mathcal{E}}\mathbf{e}_{ij}^\top\boldsymbol\Sigma_{ij}^{-1}\mathbf{e}_{ij},
+\label{eq:sys-pgo}
+\end{equation}
+完整推导（伴随、雅可比、右雅可比逆近似）见回环检测章 \cref{ch:loop}。把这一线程加到我们的系统上，就是从“会漂的 VO”走向“全局一致的 SLAM”的最后一步。
+
+% ----------------------------------------------------------------
+\subsection{位姿图怎么初始化、为何能线性时间：生成树与链式稀疏}
+\label{sec:sys-pgo-init}
+
+\paragraph{动机：\cref{eq:sys-pgo} 是非凸的，初值从哪来？}
+位姿图优化（PGO，\cref{eq:sys-pgo}）是\emph{非凸}最小二乘，强烈依赖初值（同 \cref{ch:nlopt} 对非线性优化的告诫）。回环检测章关心“边从哪来”（哪些帧该连相对位姿约束），这里补齐另一半工程：拿到一张位姿图后，\textbf{怎么给各顶点一个好初值}，以及它\textbf{为什么常能在线性时间内解出}。这两件事 ORB-SLAM2 的本质图（\cref{sec:sys-orbslam} 上文的生成树）用得正多，但其数学骨架值得单列\cite{barfoot2024state}。
+
+\paragraph{生成树初始化（spanning-tree initialization）。}
+位姿图有绝对\emph{规范自由度}（gauge）：整体平移/旋转不改变任何\emph{相对}位姿测量，故须固定一个参考顶点（记 $0$ 号，令 $\mathbf{T}_0=\mathbf{I}$）。固定它之后，初值的标准做法是：
+\begin{enumerate}
+  \item 从位姿图的边里抽取一棵\textbf{生成树}（spanning tree，连通所有顶点、无环的最少边集）；
+  \item 从根 $0$ 出发，沿树枝\emph{复合}相对位姿测量得每个顶点初值——若 $j$ 的父节点是 $i$、边测量为 $\bar{\mathbf{T}}_{ij}$，则
+  \begin{equation}
+    \mathbf{T}_j^{(0)}=\bar{\mathbf{T}}_{ij}\,\mathbf{T}_i^{(0)}
+    \qquad(\text{沿树自根向叶递推})。
+    \label{eq:sys-pgo-spantree}
+  \end{equation}
+\end{enumerate}
+\textbf{关键原则：浅树优于深树}。叶顶点的初值是沿树路径\emph{复合若干条带噪测量}得到的，复合次数 $=$ 它在树中的\emph{深度}；不确定度随深度累积（每复合一条边，协方差按伴随传播叠加一次，\cref{ch:lie}）。所以应选\emph{尽量浅}的生成树（如广度优先树，或按测量信息量加权的最小生成树），让大多数顶点离根近、初值漂移小。这正是 \cref{ch:loop} 里“里程计链越长、累积漂移越大”那个\emph{问题}的\emph{解侧}对应：里程计本身就是一棵\emph{退化成单链}的生成树（深度 $=$ 帧序号），所以漂得最狠；回环边一旦闭合，就能改用更浅的树重切初值。
+
+\begin{insight}
+生成树初始化和后续的 PGO 是“先粗后精”的两步：生成树用\emph{一部分}边（树枝）快速给一个无环、可复合的初值，剩下的边（\emph{弦}，chord，含全部回环边）此刻还没被满足——它们正是把误差“摊开”的约束。PGO 再用\emph{全部}边迭代，把弦边的闭合误差沿全图分摊。没有生成树初值，PGO 很可能从一个糟糕的起点陷入局部极小（\cref{eq:sys-pgo} 非凸）；有了它，第一次迭代就已接近真解。
+\end{insight}
+
+\paragraph{链式稀疏：为什么 PGO 在“链/树”上是线性时间。}
+PGO 的高斯--牛顿正规方程 $\mathbf{A}\,\delta\mathbf{x}=\mathbf{b}$（$\mathbf{A}=\mathbf{H}^\top\mathbf{W}^{-1}\mathbf{H}$）的稀疏结构\emph{完全由图拓扑决定}：相对位姿残差 $\mathbf{e}_{ij}$（\cref{eq:sys-pgo}）只耦合顶点 $i,j$，故 $\mathbf{A}$ 在 $(i,j)$ 处才有非零块。把顶点按边数分两类：\textbf{枢纽点}（junction，$\ge3$ 条边，多在回环交汇处）与\textbf{链点}（chain，仅 $1$--$2$ 条边，构成枢纽之间的“走廊段”）。链又分两种：
+\begin{itemize}
+  \item \textbf{约束链}（constrained chain）：两端都接枢纽，链上测量会影响全图；
+  \item \textbf{悬臂链}（cantilevered chain）：仅一端接枢纽（另一端悬空），链上测量\emph{不影响}图其余部分。
+\end{itemize}
+对一条 $n$ 个顶点的约束链，把链内顶点连续编号，$\mathbf{A}$ 是\textbf{块三对角}的：
+\begin{equation}
+  \mathbf{A}=\begin{bmatrix}
+  \mathbf{A}_{11} & \mathbf{A}_{12} & & \\
+  \mathbf{A}_{12}^\top & \mathbf{A}_{22} & \mathbf{A}_{23} & \\
+  & \mathbf{A}_{23}^\top & \mathbf{A}_{33} & \ddots\\
+  & & \ddots & \ddots
+  \end{bmatrix},\quad
+  \begin{aligned}
+  \mathbf{A}_{kk}&=\boldsymbol{\Lambda}_{(k-1)k}'+\boldsymbol{\mathcal{T}}_{(k+1)k}^\top\boldsymbol{\Lambda}_{(k+1)k}'\boldsymbol{\mathcal{T}}_{(k+1)k},\\
+  \mathbf{A}_{k(k+1)}&=-\boldsymbol{\mathcal{T}}_{(k+1)k}^\top\boldsymbol{\Lambda}_{(k+1)k}',
+  \end{aligned}
+  \label{eq:sys-pgo-tridiag}
+\end{equation}
+其中 $\boldsymbol{\Lambda}_{k\ell}'=\boldsymbol{\mathcal{J}}_{k\ell}^{-\top}\boldsymbol{\Sigma}_{k\ell}^{-1}\boldsymbol{\mathcal{J}}_{k\ell}^{-1}$ 是把边测量信息经左雅可比逆 $\boldsymbol{\mathcal{J}}_{k\ell}=\boldsymbol{\mathcal{J}}(-\mathbf{e}_{k\ell})$ 搬到切空间后的信息块，$\boldsymbol{\mathcal{T}}_{k\ell}=\mathrm{Ad}(\mathbf{T}_k)\mathrm{Ad}(\mathbf{T}_\ell)^{-1}$ 为伴随传播（\cref{ch:lie}）。块三对角的 Cholesky $\mathbf{A}=\mathbf{U}\mathbf{U}^\top$ 只有\emph{主对角块 $\mathbf{U}_{kk}$ 与上对角块 $\mathbf{U}_{k(k+1)}$ 非零}，用一遍后向消元（解各 $\mathbf{U}$ 块）+ 前向/后向回代解 $\delta\mathbf{x}$，代价随链长\textbf{线性} $O(n)$（每个 $6\times6$ 块常数代价），而非朴素稠密求解的 $O(n^3)$。
+
+\paragraph{先压缩、再回填的求解流程。}于是大位姿图的高效解法是：
+\begin{enumerate}
+  \item 把每条约束链\emph{压缩}成一条等效相对测量（连接它两端枢纽），悬臂链直接搁置；
+  \item 在\emph{仅枢纽点}的缩小位姿图上跑 PGO（图小得多）；
+  \item 枢纽解出后固定两端，对每条约束链解 \cref{eq:sys-pgo-tridiag} 的块三对角系统\emph{回填}链内顶点（线性时间）；悬臂链则从其唯一枢纽端\emph{前向复合}（\cref{eq:sys-pgo-spantree}，无须迭代）。
+\end{enumerate}
+
+\begin{note}
+\textbf{与通用稀疏求解器的关系.}\;现代 PGO 库（g2o/GTSAM/Ceres）用通用稀疏 Cholesky（带变量重排序，如 AMD/COLAMD）会\emph{自动}吃掉这种链/树稀疏，无须手工分类链与枢纽——Barfoot\cite{barfoot2024state} 本人也这么说。本节给出\cref{eq:sys-pgo-tridiag} 这个\emph{显式}的链式分解，价值在\emph{解释}：它让“位姿图为什么能近线性时间”不再是黑箱，并与 \cref{sec:pc-track-ekf} 的批量块三对角、\cref{ch:nlopt} 的 BA 箭头稀疏共享同一条主线——\emph{稀疏来自拓扑（谁和谁有边），求解成本由稀疏决定}。
+\end{note}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 给一个 $6$ 顶点（$0$--$5$）的单链位姿图（边 $\bar{\mathbf{T}}_{01},\dots,\bar{\mathbf{T}}_{45}$），固定 $0$ 与 $5$，写出 \cref{eq:sys-pgo-tridiag} 的 $4\times4$ 块三对角 $\mathbf{A}$，并说明块 Cholesky 为何每个 $\mathbf{U}$ 块只需常数次 $6\times6$ 运算。
+  \item 同一张图分别用“深生成树”（沿 $0\!\to\!1\!\to\!\cdots\!\to\!5$ 单链）与“浅生成树”（从中间顶点向两侧）给初值，定性比较两端顶点初值的累积不确定度。
+  \item 解释为什么悬臂链可以“不迭代、直接前向复合”给解，而约束链必须解块三对角系统。（提示：悬臂链的链内测量不进入其余顶点的法方程。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+%  ORB-SLAM2 方法精读节群（吸收 程小六《视觉惯性SLAM》第二部分 Ch9/11/12/14）
+%  原则：上文 \paragraph 段已点到的（共视图/本质图/生成树/剔除/三级跟踪），
+%  这里以「展开 = 几何 + 算法 + 为什么」深化，并 \cref 回指不复述。
+%  不搬逐行源码（程小六 60% 篇幅是 .cc 注释贴码），点睛伪码 ≤5 行。
+% ════════════════════════════════════════════════════════════════
+\subsection{图结构精读：共视图、本质图与生成树}
+\label{sec:sys-graph}
+
+\paragraph{动机：把“谁和谁看到同一批点”做成一张可计算的图。}
+\cref{sec:sys-orbslam} 上文那段“地图结构”只给了三种图的\emph{定义}；本节回答更要紧的\emph{工程问题}：这三种图的边\textbf{怎么算、怎么随地图更新动态维护、各自喂给哪个优化}。它们是 ORB-SLAM2 区别于本章“纯时序 7 帧窗口”的核心——把地图从一串时间序列升级成一张\textbf{按共视关系组织的图}，于是“局部窗口怎么选、回环误差怎么摊、删一帧后谁来接管它的连接”都有了统一的依据。三种图层层加码：共视图最稠密、本质图取其骨干、生成树最稀疏（\cref{fig:sys-graph-three}）。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\footnotesize, node distance=6mm,
+  kf/.style={circle, draw, fill=second!18, draw=second!60!black, inner sep=1.6pt, minimum size=4mm},
+  cur/.style={circle, draw, fill=main!25, draw=main!70!black, inner sep=1.6pt, minimum size=4.4mm, very thick},
+  cov/.style={second!55!black, thin},
+  ess/.style={third!65!black, thick},
+  tre/.style={main!70!black, very thick},
+  lp/.style={red!70!black, thick, dashed}]
+% --- three panels share a 6-keyframe skeleton, different edge subsets ---
+% panel (a) covisibility: many edges
+\begin{scope}[shift={(0,0)}]
+  \node[cur] (a0) at (0.0,0.0) {};
+  \node[kf]  (a1) at (1.0,0.5) {};
+  \node[kf]  (a2) at (1.8,-0.2){};
+  \node[kf]  (a3) at (1.1,-1.0){};
+  \node[kf]  (a4) at (0.0,-1.2){};
+  \node[kf]  (a5) at (-0.8,-0.3){};
+  \draw[cov] (a0)--(a1) (a0)--(a2) (a0)--(a3) (a0)--(a4) (a0)--(a5)
+             (a1)--(a2) (a2)--(a3) (a3)--(a4) (a4)--(a5) (a1)--(a3) (a2)--(a4);
+  \node[align=center, font=\scriptsize] at (0.5,-2.0) {(a) 共视图\\ $\ge 15$ 共视点连边};
+\end{scope}
+% panel (b) essential: spanning tree + strong covis (>=100) + loop
+\begin{scope}[shift={(4.2,0)}]
+  \node[cur] (b0) at (0.0,0.0) {};
+  \node[kf]  (b1) at (1.0,0.5) {};
+  \node[kf]  (b2) at (1.8,-0.2){};
+  \node[kf]  (b3) at (1.1,-1.0){};
+  \node[kf]  (b4) at (0.0,-1.2){};
+  \node[kf]  (b5) at (-0.8,-0.3){};
+  \draw[tre] (b0)--(b1) (b1)--(b2) (b2)--(b3) (b3)--(b4) (b4)--(b5);
+  \draw[ess] (b0)--(b3);          % strong covis edge (>=100)
+  \draw[lp]  (b5)--(b2);          % loop edge
+  \node[align=center, font=\scriptsize] at (0.5,-2.0) {(b) 本质图\\ 树枝+强共视+闭环};
+\end{scope}
+% panel (c) spanning tree only
+\begin{scope}[shift={(8.4,0)}]
+  \node[cur] (c0) at (0.0,0.0) {};
+  \node[kf]  (c1) at (1.0,0.5) {};
+  \node[kf]  (c2) at (1.8,-0.2){};
+  \node[kf]  (c3) at (1.1,-1.0){};
+  \node[kf]  (c4) at (0.0,-1.2){};
+  \node[kf]  (c5) at (-0.8,-0.3){};
+  \draw[tre,->] (c0)--(c1) (c1)--(c2) (c2)--(c3) (c3)--(c4) (c4)--(c5);
+  \node[align=center, font=\scriptsize] at (0.5,-2.0) {(c) 生成树\\ 每帧一条父边};
+\end{scope}
+\end{tikzpicture}
+\caption{ORB-SLAM2 的三层地图图结构（同一组 $6$ 个关键帧、不同边子集）。共视图（a）按“共视地图点数 $\ge\theta$”稠密连边；本质图（b）= 生成树枝 + 强共视边（$\theta=100$）+ 回环边，去掉弱边以加速位姿图优化；生成树（c）每个关键帧只保留一条指向“共视最强父帧”的有向边，连通且边数最少。三者边数依次递减：稠密供局部 BA 选窗，稀疏供回环 PGO，最稀疏供初值复合（\cref{sec:sys-pgo-init}）。绘制依据程小六《视觉惯性 SLAM》图 9-8/9-9/9-10。}
+\label{fig:sys-graph-three}
+\end{figure}
+
+\paragraph{共视图：边权怎么算、怎么维护。}
+共视图\cite{murartal2015orbslam} 的节点是关键帧，两帧的边权 $w_{ij}=\#\{$被 $i,j$ 同时观测到的地图点$\}$；只有 $w_{ij}\ge\theta$ 才连边（局部建图取 $\theta=15$）。关键不在定义而在\emph{增量维护}：每插入一个关键帧或新建/融合一批地图点，都要为受影响的关键帧重算共视计数——遍历本帧每个地图点的观测列表 \texttt{observations\_}（\cref{sec:sys-mappoint} 里那个 \texttt{std::list}），给每个共同观测者的计数加一，再把 $\ge\theta$ 的连成边、并\emph{按权降序}缓存一份邻居表（供“取共视最强的前 $N$ 帧”这种高频查询 $O(1)$ 命中）。
+\begin{codebox}[text]{共视图增量维护（点睛伪码，对应 UpdateConnections）}
+for mp in this_keyframe.map_points:          # walk my landmarks
+    for (kf, _) in mp.observations:          # who else sees mp
+        counter[kf] += 1                     # accumulate covisibility
+for kf, w in counter:
+    if w >= theta: add_edge(this_kf, kf, w)  # connect if strong enough
+sort_neighbors_by_weight_desc()              # cache for top-N queries
+\end{codebox}
+
+\begin{insight}
+\textbf{为什么本章的“7 帧窗口”是共视图的退化特例。}
+把共视图的边权阈值想成一个旋钮：本章后端（\cref{sec:sys-backend}）相当于\emph{不看共视、只看时间}，把“最近 7 个关键帧”无条件两两当作一组优化——等价于一张“按时序全连接的小完全图”。共视图则按\emph{真实几何关联}动态连边：转弯、回头、原地旋转时，时序相邻的两帧未必共视，而几十帧前的老帧反而可能重新看到同一片区域。于是共视图能把“真正约束彼此的帧”聚到一起优化，这正是 ORB-SLAM2 局部 BA 比本章纯时序窗口更抗漂移的根因（呼应 \cref{eq:sys-orb-localba} 的 $\mathsf{K}_1/\mathsf{K}_2$ 取法）。
+\end{insight}
+
+\paragraph{本质图：为“位姿图优化提速”而生的稀疏骨架。}
+共视图太稠密——回环后若在\emph{全部}共视边上跑位姿图优化（PGO），边数随地图规模爆炸、迭代奇慢。本质图（Essential Graph）的设计目标，就是\emph{在保精度的前提下砍掉大量弱边}：它保留\textbf{全部顶点（关键帧）}，但只留三类边——\emph{生成树枝}、\emph{回环边}（及闭环后地图点变动新增的连接）、\emph{强共视边}（共视点 $\ge 100$）。砍掉弱边后图变稀疏，PGO 的法方程 $\mathbf{A}\,\delta\mathbf{x}=\mathbf{b}$ 跟着稀疏（\cref{sec:sys-pgo-init} 已说明“稀疏来自拓扑”），求解从近 $O(n^3)$ 降到近线性。代价是丢掉弱约束——但弱共视边本就只贡献微弱信息，舍之精度损失可忽略。这与 \cref{ch:loop} 的位姿图后端是同一件事：回环误差\emph{沿本质图}分摊，而非沿稠密共视图。
+
+\paragraph{生成树：连通性的“最小骨架”，兼作删帧时的接管结构。}
+生成树（Spanning Tree）是共视图的一棵连通生成树：每个新关键帧只连\emph{一条}边到它的“共视最强父帧”，于是全图连通而边数最少（$n$ 帧仅 $n-1$ 条边）。它有两个不可替代的用途：其一，给 PGO 提供\textbf{深度浅的初值复合路径}（\cref{eq:sys-pgo-spantree}，浅树优于深树已在 \cref{sec:sys-pgo-init} 论证）；其二，\emph{关键帧被剔除时}（下一节），它的孩子会沿生成树\textbf{改认新父帧}（re-parent），使删帧不破坏全图连通。这就是为什么 ORB-SLAM2 删一个冗余关键帧不会“撕裂地图”，而本章按时序删帧时\emph{根本没有这层结构去接管连接}——好在本章删的总是窗口端点、且不维护图，故不需要。
+
+\begin{pitfall}[概念误区：以为三种图是三份独立数据]
+三种图\emph{共享同一批关键帧顶点}，区别只在“保留哪些边”：本质图 $\subset$ 共视图（取强边 + 树枝 + 回环边），生成树 $\subset$ 本质图（每帧仅一条父边）。实现上也不存三份邻接表，而是在关键帧对象上挂\emph{一份}带权共视邻居表，按需用阈值（$15$ / $100$）或“父指针”过滤出对应的图。把它们当三份拷贝去同步，既浪费内存又会埋下不一致的 bug。
+\end{pitfall}
+
+% ----------------------------------------------------------------
+\subsection{地图点的三个派生量：代表描述子、观测尺度区间与平均观测方向}
+\label{sec:sys-mappoint-derived}
+
+\paragraph{动机：地图点不只是一个坐标，还带三件“随身档案”。}
+本章的 \texttt{MapPoint}（\cref{sec:sys-mappoint}）只存了 3D 坐标 \texttt{pos\_} 与观测列表。ORB-SLAM2 的地图点则在每次观测更新时（源码的 \texttt{UpdateNormalAndDepth} / \texttt{ComputeDistinctiveDescriptors}）额外维护\textbf{三个派生量}，它们正是 \cref{sec:sys-culling} 的剔除判据里“可见性 / 被找到率”得以计算、以及 \cref{sec:sys-tracking-orb} 前端\emph{投影引导匹配}得以聚焦的前提（程小六《视觉惯性 SLAM》§9.1）。三者都从“同一个点被哪些关键帧、在什么尺度、从什么方向看到”这批观测里\emph{统计}而来。
+
+\paragraph{其一，代表描述子：观测描述子的“中位代表”。}
+一个地图点被 $m$ 个关键帧观测，每次给出一枚 $256$ 位 ORB 描述子；但投影匹配时只能用\emph{一枚}描述子去比对。ORB-SLAM2 取与其余描述子\textbf{汉明距离中位数最小}的那一枚作代表：
+\begin{equation}
+\mathbf{d}^\star=\arg\min_{\mathbf{d}_i}\ \operatorname*{median}_{\,j\ne i}\ d_H(\mathbf{d}_i,\mathbf{d}_j),\qquad i,j\in\{1,\dots,m\},
+\label{eq:sys-mp-descriptor}
+\end{equation}
+其中 $d_H$ 是两描述子的汉明距离。\emph{为什么取中位数而非均值或随便某一帧}：中位数对少数离群观测（误匹配、遮挡边缘）鲁棒——代表描述子应落在“描述子云”的中心，离群者拉不动它。这枚 $\mathbf{d}^\star$ 此后\emph{独自}代表该点参与一切匹配，省去“逐帧描述子都比一遍”的开销。
+
+\paragraph{其二，观测尺度区间与金字塔尺度预测。}
+ORB 在图像金字塔多层上提特征，\emph{同一个点近看落在精细层、远看落在粗糙层}。地图点以其\textbf{参考关键帧}（首次创建它的帧）的观测距离 $d_{\mathrm{ref}}$ 与该观测所在金字塔层级 $l_{\mathrm{ref}}$，定出一段\emph{可观测距离区间}（层间尺度因子 $s\approx1.2$、共 $L$ 层，默认 $L{=}8$）：
+\begin{equation}
+d_{\max}=d_{\mathrm{ref}}\,s^{\,l_{\mathrm{ref}}},\qquad
+d_{\min}=\frac{d_{\max}}{s^{\,L-1}} .
+\label{eq:sys-mp-scale-range}
+\end{equation}
+投影到新帧时，由当前观测距离 $d=\lVert\mathbf{p}_w-\mathbf{O}\rVert$（$\mathbf{O}$ 为光心）\emph{预测}该到哪一层去找它：令 $d_{\max}/d=s^{\,l}$ 两边取对数，
+\begin{equation}
+l=\Big\lceil\,\log_s\frac{d_{\max}}{d}\,\Big\rceil=\Big\lceil\,\frac{\ln(d_{\max}/d)}{\ln s}\,\Big\rceil ,
+\label{eq:sys-mp-scale}
+\end{equation}
+再截断到 $[0,L-1]$。\emph{动机}：只在预测层（及相邻层）做描述子搜索，既省时又保证\textbf{尺度一致}——拿粗糙层特征去比精细层描述子注定匹配不上。
+
+\paragraph{其三，平均观测方向：可见性的“朝向档案”。}
+地图点被多个关键帧从不同角度看到，每帧给一条\emph{观测射线}（光心 $\mathbf{O}_i$ 指向点 $\mathbf{p}_w$）。取各射线单位向量的均值作\textbf{平均观测方向}：
+\begin{equation}
+\bar{\mathbf{n}}=\frac{1}{m}\sum_{i=1}^{m}\frac{\mathbf{p}_w-\mathbf{O}_i}{\lVert\mathbf{p}_w-\mathbf{O}_i\rVert}.
+\label{eq:sys-mp-normal}
+\end{equation}
+\emph{动机}：投影一个点到新帧时，若新观测射线与 $\bar{\mathbf{n}}$ 的夹角过大（ORB-SLAM2 取 $>60^\circ$，即余弦 $<0.5$），说明此刻是从\emph{侧后方}掠看，描述子多半已失配、该点判“不可见”。这正是 \cref{sec:sys-culling} 那个“被找到率”的分母——\emph{预测可见帧数}——能算得有意义的依据：只有尺度落在 $[d_{\min},d_{\max}]$、且视角与 $\bar{\mathbf{n}}$ 相符的帧，才计入“本该看见”。
+
+\begin{insight}
+\textbf{为什么本章精简 VO 能省掉这三件档案。}
+本章前端用 LK 光流\emph{直接}在像素上追踪（\cref{sec:sys-trackflow}），不靠描述子投影匹配，故无须代表描述子；窗口恒为 $7$ 帧、不做“先预测可见再投影搜索”，故无须尺度区间与平均观测方向。一旦换成 ORB-SLAM2 那种“描述子 + 投影引导匹配 + 长期地图复用”，这三件档案就从“可省”变“必备”：它们把一个裸坐标升级成一个\emph{可被高效且正确地重新找到}的地图点。
+\end{insight}
+
+% ----------------------------------------------------------------
+\subsection{关键帧与地图点的剔除准则：宽进严出的“严出”一侧}
+\label{sec:sys-culling}
+
+\paragraph{动机：补上本章“启发式删点”缺的判据。}
+\cref{sec:sys-orbslam} 上文用一句“宽进严出”概括了 ORB-SLAM2 的关键帧策略，\cref{sec:sys-slidewindow} 则坦承本章只会“按时序删最旧 / 最近”。本节把“严出”一侧的\textbf{量化判据}讲透——它回答“一帧 / 一个点\emph{冗余到什么程度}才该删”，正是本章 \cref{sec:sys-keyframe}（关键帧专属工作）与 \cref{sec:sys-map}（零观测删点）所缺的那把尺子。剔除是为了\emph{把地图规模控制住而又不丢信息}：删掉的必须是“别人已经替它把活干了”的冗余对象。
+
+\paragraph{关键帧剔除：90\%-冗余判据。}
+局部建图线程对每个新进来的关键帧做冗余检查：\textbf{若该关键帧观测到的地图点中，有 $\ge 90\%$ 能被其它至少 $3$ 个关键帧在\emph{相同或更精细的尺度}上观测到，就判它冗余、删除}。三层含义缺一不可——“$\ge 3$ 个其它帧”保证删后这些点仍被充分约束（不至于变成零观测点）；“相同或更精细尺度”保证替代观测的\emph{分辨率不更差}（金字塔层级 $\le$ 本帧，避免用远处粗糙观测顶替近处精细观测）；“$\ge 90\%$”是冗余比例阈值。删除时沿生成树给孩子\emph{改认新父帧}（\cref{sec:sys-graph}），并从共视图、本质图摘除其边。
+\begin{codebox}[text]{关键帧冗余判据（点睛伪码，对应 KeyFrameCulling）}
+redundant = 0
+for mp in kf.map_points:                      # mp seen by this keyframe
+    n = count_obs_at_finer_or_equal_scale(mp, exclude=kf)
+    if n >= 3: redundant += 1                  # 3 others cover it well enough
+if redundant >= 0.90 * kf.num_map_points:      # 90% redundant
+    kf.set_bad(); reparent_children_in_tree()  # delete + re-link spanning tree
+\end{codebox}
+
+\paragraph{地图点剔除：创建后“试用期”三关。}
+新三角化出的地图点未必可靠（可能是误匹配的产物），ORB-SLAM2 让它先过一段\textbf{试用期}，满足下列任一条即删（程小六《视觉惯性 SLAM》§12.2）：
+\begin{enumerate}
+  \item \textbf{被找到率过低}：实际匹配上它的帧数与\emph{预测可见它的帧数}之比 $<0.25$——即“本该看见却没匹配上”，多半是虚假点；
+  \item \textbf{观测帧数不达标}：自创建起已过 $\ge 2$ 个关键帧，但观测到它的相机数仍 $<$ 阈值（双目 / RGB-D 为 $3$、单目为 $2$）——立不住脚；
+  \item \textbf{毕业}：若创建后熬过 $3$ 个关键帧仍未被剔除，则移出待检列表、此后\emph{永久保留}（视为可靠点）。
+\end{enumerate}
+这里的“可见 / 可观测帧数”依赖 \cref{sec:sys-mappoint-derived} 那三个派生量：投影时只有\emph{距离落在 $[d_{\min},d_{\max}]$（尺度匹配）、且视角与平均观测方向 $\bar{\mathbf{n}}$ 相符}才算“可见”——这让“被找到率”这个比值有意义，而非把所有掠过视野的帧都算成“本该看见”。
+
+\begin{insight}
+\textbf{为什么剔除比“留着不管”更好。}
+直觉上多留点 / 多留帧似乎更稳，实则相反。多余的关键帧让局部 BA 的 $\mathsf{K}_1$ 集变大、每次优化更慢却不增信息（它看到的点别人也看到）；虚假地图点则像\emph{往最小二乘里掺错边}——一条系统性误匹配能把整段轨迹拽歪（呼应 \cref{sec:sys-poseonly} 的外点剔除）。所以工业系统宁可“宽进”多插关键帧保鲁棒，再用本节的严判据“严出”，把规模和质量\emph{同时}守住。本章因为只跑短程 VO、窗口恒为 $7$，才能省掉这套机制；一旦要长时间运行，剔除准则就是\emph{必需而非可选}。
+\end{insight}
+
+% ----------------------------------------------------------------
+\subsection{三段式跟踪与重定位（含 EPnP）}
+\label{sec:sys-tracking-orb}
+
+\paragraph{动机：把“跟得上”和“跟得准”分成两段、三招。}
+\cref{eq:sys-orb-motiononly} 处只说 ORB-SLAM2 前端有“恒速 / 参考帧 / 重定位三级”。本节展开这\textbf{三招的触发条件与回退链}，以及丢失后\emph{重定位}赖以恢复位姿的 \textbf{EPnP}——后者是本章 \cref{sec:sys-track}（恒速模型 + pose-only BA）所没有、却是“从失败中找回”不可或缺的一块。ORB-SLAM2 的跟踪分\emph{两段}：第一段先用三招之一求一个粗位姿（保证“跟得上”），第二段再\emph{跟踪局部地图}把更多地图点投影进来做一次优化（保证“跟得准”）。
+
+\paragraph{第一段：三招与回退链。}
+三招按“初值由强到弱”排序，前一招失败就退到后一招（\cref{fig:sys-track-fallback}）：
+\begin{enumerate}
+  \item \textbf{恒速模型跟踪}（首选）：与本章 \cref{sec:sys-track} 同思路——用上一帧的运动外推本帧位姿初值（\cref{ch:vo} 的运动先验），把上一帧地图点按此初值投影、在小窗口内做描述子匹配，再 pose-only BA。运动连续时最快。
+  \item \textbf{参考关键帧跟踪}（恒速失败时）：当运动模型失效（如刚启动、急停、抖动），改与\emph{参考关键帧}用\textbf{词袋（BoW）}加速匹配——同一词袋节点下的描述子才两两比对，避免暴力匹配，再 pose-only BA。
+  \item \textbf{重定位跟踪}（前两招都丢时）：彻底跟丢，进入\emph{全局重定位}——在所有关键帧里用词袋检索候选，对每个候选用 \textbf{EPnP + RANSAC} 求位姿、内点足够即成功（详见下文）。
+\end{enumerate}
+注意这是\emph{前端内部}的回退，与 \cref{sec:sys-orbslam} 那个“GOOD/BAD/LOST”系统级状态机不同层次：三招是“这一帧用哪种方式定位”，状态机是“整个跟踪健康到什么程度”。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=12mm,
+  st/.style={draw, rounded corners, fill=second!8, draw=second!60!black, minimum width=30mm, minimum height=8mm, align=center},
+  ok/.style={draw, rounded corners, fill=main!10, draw=main!60!black, minimum width=26mm, minimum height=8mm, align=center}]
+\node[st] (cv) {恒速模型跟踪\\（运动外推初值）};
+\node[st, below=of cv] (rk) {参考关键帧跟踪\\（词袋匹配）};
+\node[st, below=of rk] (re) {重定位跟踪\\（词袋检索 + EPnP/RANSAC）};
+\node[ok, right=18mm of rk] (lm) {跟踪局部地图\\（投影更多点 + 优化）};
+\draw[->] (cv) -- node[right,font=\footnotesize]{失败} (rk);
+\draw[->] (rk) -- node[right,font=\footnotesize]{失败} (re);
+\draw[->] (cv.east) .. controls +(10mm,0) and +(0,8mm) .. node[above,font=\footnotesize]{成功} (lm.north);
+\draw[->] (rk.east) -- node[above,font=\footnotesize]{成功} (lm.west);
+\draw[->] (re.east) .. controls +(10mm,0) and +(0,-8mm) .. node[below,font=\footnotesize]{成功} (lm.south);
+\end{tikzpicture}
+\caption{ORB-SLAM2 第一段跟踪的三招回退链：恒速模型（最快、需运动连续）$\to$ 参考关键帧（词袋匹配、抗运动突变）$\to$ 重定位（全局检索 + EPnP/RANSAC、从丢失中恢复）。任一招求得粗位姿后，第二段统一“跟踪局部地图”投影更多地图点再优化，把位姿做准。}
+\label{fig:sys-track-fallback}
+\end{figure}
+
+\paragraph{词袋为何能加速候选检索：倒排索引。}
+词袋（DBoW2\cite{galvez2012bags}，\cref{ch:loop} 已详述）除了把图像编码成向量，还维护一张\textbf{倒排索引}（inverted index）：记录\emph{每个视觉单词出现在哪些关键帧里}。重定位时不必和全库逐帧比，只需取出当前帧含有的单词、经倒排索引\emph{直接命中}与之共享足够单词的少数关键帧作候选——把“全库扫描”降成“按单词取桶”。这正是参考关键帧跟踪和重定位都能快速找匹配 / 候选的底层机制。
+
+\begin{insight}
+\textbf{EPnP 的妙处：用 $4$ 个控制点把 $n$ 个点的 PnP 线性化。}
+重定位拿到“当前帧 2D 点 — 候选关键帧地图点 3D”的一批对应后，要解 PnP 求位姿。迭代 PnP（如 \cref{sec:sys-poseonly} 的 pose-only BA）需要初值、可能陷局部极小；而\textbf{EPnP}\footnote{EPnP（Efficient PnP）由 Lepetit、Moreno-Noguer、Fua 提出（\emph{Int.\ J.\ Comput.\ Vis.}\ 81(2):155--166, 2009），是 ORB-SLAM 系统重定位时\emph{所采用}的求解器而非其首创；ORB-SLAM2\cite{murartal2017orbslam2} 在 RANSAC 内调用它作位姿候选求解。}给出一个\emph{无须初值、复杂度随点数线性}的闭式解，恰好适合“刚丢失、手里没有任何位姿先验”的重定位场景。它的核心是一招坐标技巧（下文）。
+\end{insight}
+
+\paragraph{EPnP 原理：控制点 + 重心坐标的不变性。}
+EPnP（Efficient PnP）的关键洞察是：把每个 3D 参考点 $\mathbf{p}_i$ 写成 \textbf{$4$ 个虚拟控制点} $\{\mathbf{c}_j\}_{j=1}^4$ 的\emph{重心坐标}组合，权重 $\alpha_{ij}$ 满足归一化约束
+\begin{equation}
+\mathbf{p}_i^{w}=\sum_{j=1}^{4}\alpha_{ij}\,\mathbf{c}_j^{w},\qquad
+\sum_{j=1}^{4}\alpha_{ij}=1 .
+\label{eq:sys-epnp-bary}
+\end{equation}
+\textbf{重心坐标在刚体变换下不变}：同一个点在相机系下，相对\emph{相机系的控制点}用的是\emph{同一组} $\alpha_{ij}$。证明只需对 \cref{eq:sys-epnp-bary} 两边左乘 $\mathbf{T}=[\mathbf{R}\ \mathbf{t}]$ 并用 $\sum_j\alpha_{ij}=1$ 吸收平移项：
+\begin{equation}
+\mathbf{p}_i^{c}=\mathbf{R}\,\mathbf{p}_i^{w}+\mathbf{t}
+=\sum_{j=1}^{4}\alpha_{ij}\big(\mathbf{R}\,\mathbf{c}_j^{w}+\mathbf{t}\big)
+=\sum_{j=1}^{4}\alpha_{ij}\,\mathbf{c}_j^{c}
+\quad(\text{用到 }\textstyle\sum_j\alpha_{ij}=1).
+\label{eq:sys-epnp-invariant}
+\end{equation}
+于是\textbf{未知量从“每个点的深度 / 整个位姿”收缩为“$4$ 个控制点在相机系下的坐标”——总共只有 $12$ 个未知数，与点数 $n$ 无关}。再把 \cref{eq:sys-epnp-invariant} 代入针孔投影（设投影尺度 $w_i$、内参 $f_u,f_v,u_c,v_c$，控制点相机系坐标 $\mathbf{c}_j^c=[x_j^c,y_j^c,z_j^c]^\top$）：
+\begin{equation}
+w_i\begin{bmatrix}u_i\\ v_i\\ 1\end{bmatrix}
+=\mathbf{K}\sum_{j=1}^{4}\alpha_{ij}\,\mathbf{c}_j^{c}
+=\begin{bmatrix}f_u&0&u_c\\ 0&f_v&v_c\\ 0&0&1\end{bmatrix}
+\sum_{j=1}^{4}\alpha_{ij}\begin{bmatrix}x_j^c\\ y_j^c\\ z_j^c\end{bmatrix}.
+\label{eq:sys-epnp-proj}
+\end{equation}
+取第三行得尺度 $w_i=\sum_{j}\alpha_{ij}z_j^c$，回代消掉 $w_i$，每个点对给出\emph{两条关于控制点坐标的线性方程}：
+\begin{equation}
+\sum_{j=1}^{4}\!\big[\alpha_{ij}f_u\,x_j^c+\alpha_{ij}(u_c-u_i)z_j^c\big]=0,\qquad
+\sum_{j=1}^{4}\!\big[\alpha_{ij}f_v\,y_j^c+\alpha_{ij}(v_c-v_i)z_j^c\big]=0 .
+\label{eq:sys-epnp-linear}
+\end{equation}
+把 $n\ge 4$ 个点对的两条方程（\cref{eq:sys-epnp-linear}）按行堆叠，得齐次线性系统
+\begin{equation}
+\mathbf{M}\,\mathbf{x}=\mathbf{0},\qquad
+\mathbf{x}=\big[\,\mathbf{c}_1^{c\top},\,\mathbf{c}_2^{c\top},\,\mathbf{c}_3^{c\top},\,\mathbf{c}_4^{c\top}\,\big]^\top\in\mathbb{R}^{12},\quad \mathbf{M}\in\mathbb{R}^{2n\times12},
+\label{eq:sys-epnp-Mx}
+\end{equation}
+未知量是\emph{$4$ 个控制点的相机系坐标}（$12$ 维，与点数 $n$ 无关）。下面两步——\emph{零空间求解}与 \emph{$\beta$ 恢复}——才是 EPnP 真正的精华，也是本章 \cref{sec:sys-poseonly} 迭代 BA 所没有的“无初值”本领；它们恰是程小六《视觉惯性 SLAM》§11.3.4 用整节（式 11-23$\sim$11-40、含图 11-7）讲的内容，下面逐步复现。
+
+\paragraph{第一步：解出零空间，但解只定到一组待定尺度。}
+$\mathbf{M}\mathbf{x}=\mathbf{0}$ 的解集是 $\mathbf{M}$ 的\textbf{零空间}。设其维数为 $N$，则
+\begin{equation}
+\mathbf{x}=\sum_{k=1}^{N}\beta_k\,\mathbf{v}_k,
+\label{eq:sys-epnp-null}
+\end{equation}
+其中 $\mathbf{v}_k\in\mathbb{R}^{12}$ 是 $\mathbf{M}^\top\mathbf{M}$ 零特征值对应的特征向量（$\mathbf{M}^\top\mathbf{M}$ 恒为 $12\times12$，故\emph{特征分解代价与点数无关}，$O(n)$ 只来自累加 $\mathbf{M}^\top\mathbf{M}$），$\beta_k$ 是\emph{待定}系数。零空间维数 $N$ 取决于相机构型：每个点对给 $2$ 个方程，$6$ 个点对即可定 $12$ 个未知，故\emph{一般 $N=1$}；但当焦距增大、相机趋近\emph{正交（仿射）投影}时，$\mathbf{M}^\top\mathbf{M}$ 的近零特征值增多，$N$ 升到 $2,3,4$（程小六图 11-7：$f{=}100$ 时仅末 $1$ 个特征值近零，$f{=}10^4$ 时末 $4$ 个都近零）。ORB-SLAM2 的做法是 $N=1,2,3,4$ \emph{各解一遍，取重投影误差最小的那组解}。
+
+\paragraph{第二步：用刚体结构不变性钉死 $\beta_k$。}
+\cref{eq:sys-epnp-null} 只给了控制点的\emph{方向}，尺度系数 $\beta_k$ 要靠一个已知量钉死：\textbf{控制点两两之间的距离在世界系与相机系下相等}（欧氏刚体变换保距），而世界系控制点 $\mathbf{c}_j^w$ 在 \cref{eq:sys-epnp-bary} 那步已知，
+\begin{equation}
+\big\lVert \mathbf{c}_i^{c}-\mathbf{c}_j^{c}\big\rVert^2=\big\lVert \mathbf{c}_i^{w}-\mathbf{c}_j^{w}\big\rVert^2,\qquad \{i,j\}\subset\{1,2,3,4\}\ \big(\text{共 }\tbinom{4}{2}=6\text{ 对}\big).
+\label{eq:sys-epnp-rigid}
+\end{equation}
+
+\noindent\emph{$N=1$（闭式解，最常用）.}\; 此时 $\mathbf{x}=\beta\mathbf{v}$，记 $\mathbf{v}^{[j]}\in\mathbb{R}^3$ 为 $\mathbf{v}$ 中对应第 $j$ 个控制点的子向量，则 $\mathbf{c}_j^c=\beta\mathbf{v}^{[j]}$，代入 \cref{eq:sys-epnp-rigid} 得 $\beta\lVert\mathbf{v}^{[i]}-\mathbf{v}^{[j]}\rVert=\lVert\mathbf{c}_i^w-\mathbf{c}_j^w\rVert$；对 $6$ 对距离取最小二乘，得\textbf{闭式解}
+\begin{equation}
+\beta=\frac{\displaystyle\sum_{\{i,j\}}\big\lVert\mathbf{v}^{[i]}-\mathbf{v}^{[j]}\big\rVert\cdot\big\lVert\mathbf{c}_i^{w}-\mathbf{c}_j^{w}\big\rVert}
+{\displaystyle\sum_{\{i,j\}}\big\lVert\mathbf{v}^{[i]}-\mathbf{v}^{[j]}\big\rVert^2}.
+\label{eq:sys-epnp-beta1}
+\end{equation}
+
+\noindent\emph{$N\ge2$（线性化为 $\mathbf{L}\boldsymbol\beta=\boldsymbol\rho$）.}\; 距离约束 \cref{eq:sys-epnp-rigid} 对 $\beta_k$ 是\emph{二次}的，但对“二次单项” $\beta_{kl}\equiv\beta_k\beta_l$ 是\emph{线性}的。以 $N=2$ 为例，令 $\boldsymbol\beta=[\beta_{11},\beta_{12},\beta_{22}]^\top$（$\beta_{11}=\beta_1^2,\ \beta_{22}=\beta_2^2,\ \beta_{12}=\beta_1\beta_2$），$6$ 对距离约束堆成
+\begin{equation}
+\mathbf{L}\,\boldsymbol\beta=\boldsymbol\rho,\qquad \mathbf{L}\in\mathbb{R}^{6\times3},\quad \boldsymbol\rho\in\mathbb{R}^{6}\ (\text{$6$ 个已知的世界系距离平方}),
+\label{eq:sys-epnp-Lbeta}
+\end{equation}
+线性解出 $\boldsymbol\beta$ 再开方得 $\beta_1,\beta_2$，并用“控制点须在相机前方（$z_j^c>0$）”消去符号歧义（$N=3$ 时 $\boldsymbol\beta$ 为 $6$ 维、$\mathbf{L}$ 为 $6\times6$，同理）。
+
+\paragraph{第三步：高斯-牛顿精化，再由控制点恢复位姿。}
+以上 $\beta_k$ 作初值，对距离残差 $\lVert\mathbf{c}_i^c-\mathbf{c}_j^c\rVert^2-\lVert\mathbf{c}_i^w-\mathbf{c}_j^w\rVert^2$ 跑几步\textbf{高斯-牛顿}精化 $\{\beta_k\}$；得相机系控制点 $\mathbf{c}_j^c$ 后，由 $\mathbf{p}_i^c=\sum_j\alpha_{ij}\mathbf{c}_j^c$ 算出全部参考点的相机系坐标，最后把世界系点集 $\{\mathbf{p}_i^w\}$ 与相机系点集 $\{\mathbf{p}_i^c\}$ 做一次 \textbf{3D--3D 配准}（ICP/Horn 闭式，\cref{sec:vo-icp}）即得 $\mathbf{R},\mathbf{t}$。\textbf{全程线性 + 一次小规模 GN、无须位姿初值、代价 $O(n)$}——这就是它适合“刚丢失、零先验”重定位的根由。
+
+\begin{pitfall}[陷阱：EPnP 不是“更准”，而是“更省 + 不要初值”]
+EPnP 给的是一个\emph{快速、无初值}的\textbf{初解}，精度未必高于带好初值的迭代 BA。ORB-SLAM2 的用法是：EPnP（包在 RANSAC 里抗误匹配）先求出粗位姿、定出内点集，\emph{再}用 pose-only BA（\cref{eq:sys-poseonly}）精修。把 EPnP 当终解、跳过后续优化，会损失精度；反过来在已有好初值时硬上 EPnP，则白费它“线性化 $n$ 个点”的力气。两者分工：EPnP 负责“从无到有”，BA 负责“从有到精”。
+\end{pitfall}
+
+% ----------------------------------------------------------------
+\subsection{局部建图流水线与四线程优化全景}
+\label{sec:sys-localmapping-orb}
+
+\paragraph{动机：把后端从“一次局部 BA”升级成“一条维护流水线”。}
+本章后端（\cref{sec:sys-backend}）拿到激活窗口就做一次局部 BA、删旧帧了事。ORB-SLAM2 的局部建图线程则是一条\textbf{五步流水线}，BA 只是其中一步，其余四步都在\emph{维护地图的质量与规模}——这正是“工业系统为什么不漂、规模又不爆”的工程答案。最后用一张表把\emph{四个线程各自跑哪种优化}收口，让你一眼看清“跟踪 / 局部建图 / 闭环 / 全局”的分工（这是本章前面分散讲过、但从未汇总的全景）。
+
+\paragraph{局部建图五步。}
+每当跟踪线程送来一个新关键帧，局部建图线程依次做（程小六《视觉惯性 SLAM》Ch12）：
+\begin{enumerate}
+  \item \textbf{处理新关键帧}：计算其词袋向量、更新它在共视图 / 生成树中的连接（\cref{sec:sys-graph} 的 \texttt{UpdateConnections}），把它看到的地图点登记观测；
+  \item \textbf{剔除近期地图点}：对最近新建的地图点跑 \cref{sec:sys-culling} 的“试用期三关”，删掉立不住的虚假点；
+  \item \textbf{三角化生成新点}：与共视图里的相邻关键帧两两三角化，补充新地图点——\emph{基线越长、场景越近，三角化越可靠}（\cref{fig:sys-localmap-tri}），故优先选基线足够、视差合适的邻居；
+  \item \textbf{相邻融合}：把当前帧及其共视邻居的地图点相互投影，\emph{重复观测同一空间点的多个地图点合并为一个}（减少冗余、增强约束）；
+  \item \textbf{剔除冗余关键帧}：对共视邻居跑 \cref{sec:sys-culling} 的 $90\%$-冗余判据，删掉信息重复的关键帧。
+\end{enumerate}
+第 $1,3,4,5$ 步都在和\emph{共视图}打交道，第 $2,5$ 步落实\emph{剔除准则}——可见前两节的图结构与剔除判据，正是这条流水线的两块基石。其间穿插\emph{局部 BA}（\cref{eq:sys-orb-localba} 的 $\mathsf{K}_1$ 优化 / $\mathsf{K}_2$ 固定），在第 $4$ 步之后、第 $5$ 步之前对局部地图精修。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\footnotesize,
+  cam/.style={draw, fill=second!12, draw=second!60!black, minimum width=10mm, minimum height=6mm, align=center},
+  mp/.style={draw, diamond, fill=third!18, draw=third!60!black, inner sep=2pt}]
+\node[cam] (k1) at (0,0) {KF1};
+\node[cam] (k2) at (3.4,0) {邻居 KF};
+\node[mp] (p) at (1.7,1.7) {$\mathbf{p}$};
+\draw[->] (k1) -- (p); \draw[->] (k2) -- (p);
+\draw[<->, thick, main!60!black] (k1.east) -- node[below, font=\scriptsize]{基线 (越长越准)} (k2.west);
+\draw[dashed, gray] (1.7,0) -- node[right, font=\scriptsize]{场景深度} (p);
+\node[align=left, font=\scriptsize] at (1.7,2.4) {三角化新点};
+\end{tikzpicture}
+\caption{局部建图第 $3$ 步“三角化生成新点”的几何（依程小六图 12-2/12-3）：当前关键帧与共视邻居观测同一像素，由两条视线交会出新地图点 $\mathbf{p}$。基线（两关键帧光心间距）相对场景深度越大、视差越好，三角化越稳；故优先挑基线足够的共视邻居，太小则视差不足、深度不可靠（与 \cref{sec:sys-init} 单帧双目“天然有基线”互参）。}
+\label{fig:sys-localmap-tri}
+\end{figure}
+
+\paragraph{四线程优化全景。}
+把全书散落各处的“谁优化什么”汇成一表（\cref{tab:sys-four-opt}）：四个线程跑\emph{四种不同}的优化，变量范围与目的各异，但都建立在本书已讲透的最小二乘 / 位姿图框架（\cref{ch:nlopt}、\cref{ch:loop}）之上。一句话记忆：\textbf{跟踪只动位姿、局部建图动局部、闭环动全局位姿、全局 BA 动一切}——变量范围逐级放大，频率逐级降低。
+
+\begin{table}[H]\centering\small
+\caption{ORB-SLAM2 四线程优化全景（“谁优化什么、目的为何”）}
+\label{tab:sys-four-opt}
+\begin{tabular}{p{0.16\linewidth}p{0.24\linewidth}p{0.20\linewidth}p{0.26\linewidth}}
+\toprule
+线程 & 优化类型 & 优化变量 & 目的 / 本书对应 \\
+\midrule
+跟踪 & motion-only BA（仅位姿 BA） & 当前帧位姿 & 每帧快速定位，地图点固定不动；同本章 pose-only BA（\cref{eq:sys-poseonly}） \\
+局部建图 & local BA（局部 BA） & $\mathsf{K}_1$ 关键帧位姿 + 局部地图点（$\mathsf{K}_2$ 固定） & 局部一致；同本章后端但有 $\mathsf{K}_2$ 锚（\cref{eq:sys-orb-localba}） \\
+闭环 & Sim(3) 位姿优化 + 本质图 PGO & 闭环两侧相对 Sim(3)；本质图全部关键帧位姿 & 求闭环变换、把回环误差沿本质图分摊（\cref{sec:loop-sim3}、\cref{eq:sys-pgo}） \\
+全局 & full BA（全局 BA） & 全部关键帧位姿 + 全部地图点 & 闭环后全局精修，可被新闭环中断（\cref{ch:nlopt} 的大规模稀疏 BA） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}
+\textbf{为什么不“一个全局 BA 包打天下”。}
+理论上全局 BA 精度最高，但它\emph{慢且不实时}——把它放进跟踪线程会立刻拖垮帧率（呼应 \cref{sec:sys-arch} 那个“前后端分线程是为解耦实时性与精度”的陷阱）。所以 ORB-SLAM2 按\emph{时间尺度}把优化\textbf{分层}：跟踪在毫秒级只动位姿、局部建图在关键帧级动局部、全局 BA 只在\emph{回环这种稀有事件}后才全量跑一次，且可被打断。这种“高频小范围、低频大范围”的分层，正是把\emph{实时性}与\emph{全局一致性}这对矛盾拆解到不同线程 / 不同频率上的总策略——也是本章精简 VO（只有前两层）与完整 SLAM 的根本分界。
+\end{insight}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 共视图边权 $w_{ij}$ 与本质图阈值（$15$ vs $100$）：解释为什么\emph{选局部窗口}用低阈值（$15$）、\emph{做位姿图优化}用高阈值（$100$）。（提示：一个要“多拉约束”，一个要“砍边提速”。）
+  \item 用 \cref{eq:sys-epnp-invariant} 说明：若去掉归一化约束 $\sum_j\alpha_{ij}=1$，重心坐标在含平移的刚体变换下还成立吗？这会怎样破坏 EPnP？
+  \item 局部建图第 $5$ 步“剔除冗余关键帧”用 $90\%$ 判据。若把阈值降到 $50\%$，地图会更稀还是更密？对回环时的本质图规模有何影响？
+  \item 对照 \cref{tab:sys-four-opt}：本章精简 VO 实现了其中哪两行？缺的两行（闭环 Sim(3)/本质图 PGO、全局 BA）分别对应 \cref{sec:sys-loop} 的哪些缺失项？
+\end{enumerate}
+\end{practice}
+
+\begin{table}[H]\centering\small
+\caption{本章精简 VO 与 ORB-SLAM2 对照}
+\label{tab:sys-orb-compare}
+\begin{tabular}{lll}
+\toprule
+维度 & 本章精简双目 VO & ORB-SLAM2 \\
+\midrule
+线程数 & 2（前端 + 后端）+ Viewer & 3 + 1（Track / LocalMap / Loop + Full BA） \\
+前端特征 & GFTT 角点 + LK 光流 & ORB 描述子匹配（可词袋加速） \\
+前端定位 & pose-only BA（恒速初值） & motion-only BA（恒速/参考帧/重定位三级） \\
+初始化 & 单帧双目三角化（带尺度） & 双目/RGBD 单帧；单目两帧自动 \\
+地图窗口 & 纯时序最近 7 帧 + 启发式 & 共视图窗口（$\mathsf{K}_1$ 优化 / $\mathsf{K}_2$ 固定） \\
+关键帧准则 & 内点 $<80$ 单条件 & 显式四条件 + 近点条件 \\
+后端 & 激活窗口局部 BA（全帧优化） & 局部 BA（K1/K2）+ 全局 BA \\
+关键帧管理 & 删最旧/最近（控 7 帧） & 90\% 冗余剔除 \\
+外点处理 & 自适应 $\chi^2$ + RemoveObservation & $\chi^2$ 剔除 + 关键帧/点剔除 \\
+回环 & 无（本章未实现） & DBoW2 + Sim3/SE3 + 本质图 PGO + Full BA \\
+重定位 & 无（Reset 空实现） & 词袋全局重定位 + PnP RANSAC \\
+适用 & 教学 / 局部 VO（会漂） & 工业级完整 SLAM（全局一致） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}
+看懂这张表，你就抓住了“VO 与完整 SLAM 的分界”：精简 VO 的三件套（前端追踪、局部 BA、滑窗地图）解决的是\emph{局部一致}——短时间内轨迹平滑准确；而回环 + 重定位 + 本质图解决的是\emph{全局一致}——绕一大圈回到起点时能闭合、丢失后能找回。前者“没有就跑不动”，后者“没有就一定漂”。先把前者做扎实，再加后者，正是“堆雪人”的顺序。
+\end{insight}
+
+\begin{practice}[练习]
+\begin{enumerate}
+  \item 用 \cref{eq:sys-rgbd-ur} 把一张 RGB-D 深度图转成虚拟右坐标，说明为什么这样后端就能复用双目重投影边。
+  \item 给本章系统设计一个最小回环线程：在哪一步插入词袋检测？检测到回环后调哪个优化（局部 BA 还是位姿图）？为什么。
+  \item ORB-SLAM2 的 local BA 为什么需要 $\mathsf{K}_2$ 固定帧？把本章后端改成“固定窗口里最旧那一帧的位姿”，预期会带来什么改善？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\begin{enumerate}
+  \item \textbf{“前后端分线程只是为了并行加速。”}\ 更本质的目的是解耦实时性（前端必须每帧出结果）与精度（后端可慢慢优化到最优），见 \cref{sec:sys-arch} 陷阱。
+  \item \textbf{“激活窗口就是严格的滑动窗口边缘化。”}\ 本章是\emph{直接丢弃}旧帧（连先验一起扔），不是边缘化；精度因此不如严格滑窗，见 \cref{sec:sys-slidewindow}。
+  \item \textbf{“地图点判成外点就该永久删除。”}\ 外点往往是\emph{这次}优化的局部结论；本实现只断开错误关联、复位 \texttt{is\_outlier\_}，留待将来，见 \cref{sec:sys-poseonly} 陷阱。
+  \item \textbf{“\texttt{TriangulateNewPoints} 和 \texttt{BuildInitMap} 是重复代码。”}\ 差别在坐标系：初始化结果直接是世界系，追踪阶段要左乘 $\mathbf{T}_{wc}$ 转世界系，见 \cref{sec:sys-keyframe} 陷阱。
+  \item \textbf{“16\,ms 是系统每个动作的耗时。”}\ 它只是前端处理非关键帧的耗时；后端 BA 在另一个线程异步进行，见 \cref{sec:sys-experiment} 陷阱。
+  \item \textbf{“能跑的教学代码就是生产安全的。”}\ 例如无谓词的条件变量等待容忍虚假唤醒、\texttt{triangulation} 有返回值反向 bug、\texttt{Reset} 是空实现——读源码要带批判眼光，见各处 pitfall。
+  \item \textbf{“雅可比的扰动方向无所谓。”}\ 雅可比的扰动侧必须与顶点更新的乘法侧一致（都左或都右），否则 BA 不收敛，见 \cref{sec:sys-jacobian}。
+\end{enumerate}
+
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+本章把前面各章的模块整合成一个能在 KITTI 上运行的精简双目 VO：用前端 / 后端 / 地图三大模块分工，四种基本数据结构（Frame/Feature/MapPoint/Map）承载数据，前端做光流追踪 + pose-only BA + 单帧三角化初始化 + 关键帧选取，后端做激活窗口局部 BA + Schur 边缘化路标 + 自适应外点剔除，并通过条件变量在两个线程间安全协作；最后对照 ORB-SLAM2，看清了回环、重定位、共视图等工业级要素的位置。
+
+\begin{table}[H]\centering\small
+\caption{符号与关键类型表}
+\begin{tabular}{lll}
+\toprule
+符号 / 类型 & 含义 & 首次出现 \\
+\midrule
+$\mathbf{T}_{cw},\mathbf{T}_{wc}$ & 帧位姿（world$\to$camera）及其逆 & \cref{sec:sys-data} \\
+$\mathbf{p}_w$ / \texttt{MapPoint::pos\_} & 路标世界坐标 & \cref{sec:sys-mappoint} \\
+$\mathbf{z}$ / \texttt{Feature::position\_} & 像素观测（2D） & \cref{sec:sys-feature} \\
+$K,\mathbf{T}_{\mathrm{ext}}$ & 内参 / 左右目外参 & \cref{sec:sys-jacobian} \\
+$\boldsymbol\Omega=\boldsymbol\Sigma_v^{-1}=\mathbf{I}$ & 重投影边信息矩阵 & \cref{eq:sys-localba} \\
+$\chi^2_{2,0.05}=5.991$ & Huber $\delta$ / 外点门限 & \cref{eq:sys-huber} \\
+\texttt{shared\_ptr /\allowbreak  weak\_ptr} & 持有权 / 弱引用（断循环引用） & \cref{sec:sys-feature} \\
+\texttt{active\_keyframes\_} & 激活窗口（最新 7 关键帧） & \cref{sec:sys-map} \\
+\texttt{relative\_motion\_} & 恒速运动模型相对位姿 & \cref{sec:sys-track} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{关键流程速查表}
+\begin{tabular}{lll}
+\toprule
+模块 / 函数 & 一句话说明 & 对应 \\
+\midrule
+\texttt{AddFrame} & 前端状态机分发（init/track/reset） & \cref{sec:sys-track} \\
+\texttt{TrackLastFrame} & LK 光流 + 重投影初值追上一帧 & \cref{sec:sys-trackflow} \\
+\texttt{EstimateCurrentPose} & pose-only BA + 两段式外点剔除 & \cref{eq:sys-poseonly} \\
+\texttt{StereoInit/\allowbreak BuildInitMap} & 单帧左右目三角化建初始地图 & \cref{sec:sys-init} \\
+\texttt{InsertKeyframe} & 内点 $<80$ 设关键帧 + 提点 + 三角化 & \cref{sec:sys-keyframe} \\
+\texttt{Optimize} & 激活窗口局部 BA（\cref{eq:sys-localba}）+ Schur & \cref{sec:sys-backend} \\
+\texttt{RemoveOldKeyframe} & 滑窗：删最近（冗余）或最远帧 & \cref{sec:sys-slidewindow} \\
+\texttt{BackendLoop} & 条件变量唤醒的生产者—消费者 & \cref{sec:sys-thread} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 系统架构 & 前端快 / 后端准 / 地图中枢，分线程解耦 & $\bigstar\bigstar$ \\
+2 & 数据结构 & 四类 + 线程锁 + weak\_ptr 断循环引用 & $\bigstar\bigstar\bigstar$ \\
+3 & 双目前端 & 光流 + 单帧三角化 + pose-only BA + 关键帧 & $\bigstar\bigstar\bigstar$ \\
+4 & 重投影雅可比 & $2\times6$/$2\times3$，扰动侧须与更新侧一致 & $\bigstar\bigstar\bigstar\bigstar$ \\
+5 & 滑窗局部 BA & 激活窗口 + Schur 边缘化 + Huber + 自适应外点 & $\bigstar\bigstar\bigstar\bigstar$ \\
+6 & 激活窗口 vs 严格滑窗 & 直接丢弃 vs 边缘化；fill-in & $\bigstar\bigstar\bigstar\bigstar$ \\
+7 & 多线程并发 & mutex / cv / atomic；生产者—消费者 & $\bigstar\bigstar\bigstar$ \\
+8 & ORB-SLAM2 对照 & 三+一线程 / 共视图本质图 / 回环 PGO & $\bigstar\bigstar\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\begin{itemize}
+  \item \textbf{直觉与代码原型}：视觉 SLAM 十四讲\cite{gaoxiang2019slam14} 第 13 讲及配套仓库 \texttt{slambook2/\allowbreak ch13}——本章前后端代码骨架的直接来源。
+  \item \textbf{工业级完整系统}：Mur-Artal \& Tardós, ORB-SLAM2\cite{murartal2017orbslam2}（三线程、双目/RGB-D 关键点、回环）；Mur-Artal 等, ORB-SLAM\cite{murartal2015orbslam}（共视图 / 本质图 / 关键帧与地图点剔除的原始定义）。
+  \item \textbf{现代视角与公式}：SLAM Handbook\cite{carlone2026handbook} 第 7 章 Visual SLAM——并行 tracking+mapping、局部 BA、Schur、共视-本质图的统一叙述。
+  \item \textbf{后端理论}：本书 \cref{ch:nlopt}（BA 稀疏性、Schur 边缘化、滑窗、鲁棒核）、\cref{ch:loop}（词袋、位姿图优化）——本章后端与回环的理论根基。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+相关章节 & 关系 & 本章承接 \\
+\midrule
+\cref{ch:vo} 视觉里程计 & 提供前端各算法 & 本章是其工程化集成 \\
+\cref{ch:nlopt} 非线性优化 & 提供 BA / Schur / 滑窗 / 鲁棒核 & 本章后端的理论根基 \\
+\cref{ch:camera} 相机模型 & 提供投影 / 内外参 / 三角化 & 本章 Camera 类与重投影边 \\
+\cref{ch:lie} 李群李代数 & 提供 $\SE(3)$ 扰动求导 & 本章 g2o 顶点更新与雅可比 \\
+\cref{ch:loop} 回环检测 & 提供词袋 / 位姿图 & 本章可选回环线程（\cref{eq:sys-pgo}） \\
+\cref{ch:dense} 稠密建图 & 从位姿 + 深度重建稠密地图 & 与本章稀疏路标地图互补 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：BA / pose-only BA 不收敛或发散。\textbf{排查}：检查重投影雅可比的扰动侧是否与 \texttt{VertexPose::oplusImpl} 的乘法侧一致（都左或都右，\cref{sec:sys-jacobian}）；信息矩阵是否设了（\Verb[breaklines]|setInformation|）。
+  \item \textbf{症状}：g2o 报“marginalized vertex”相关错误。\textbf{原因}：路标顶点忘了 \Verb[breaklines]|setMarginalized(true)|，Schur 求解器无法工作（\cref{sec:sys-backend}）。
+  \item \textbf{症状}：偶发段错误，回溯指向 \texttt{frame\_} 或 \texttt{map\_point\_}。\textbf{原因}：\texttt{weak\_ptr} 未 \texttt{lock()} 判空就用，访问了被另一线程清理的对象（\cref{sec:sys-backend} 陷阱）。
+  \item \textbf{症状}：新建地图点位置全错、轨迹乱飞。\textbf{原因}：追踪阶段三角化后漏了 \Verb[breaklines]|pworld = current_pose_Twc * pworld|（相机系未转世界系，\cref{sec:sys-keyframe}）。
+  \item \textbf{症状}：初始化总失败（匹配数不足）。\textbf{排查}：\texttt{triangulation} 返回值反向 bug（\cref{sec:sys-init} 陷阱）；或 \texttt{num\_features\_init\_} 设得过高、左右目曝光/校正不一致。
+  \item \textbf{症状}：重投影误差整体偏大、像差一个固定比例。\textbf{原因}：图像 resize 0.5 而内参没同步乘 0.5（\cref{sec:sys-thread}）。
+  \item \textbf{症状}：跑久了内存持续增长。\textbf{原因}：全量 \texttt{keyframes\_}/\allowbreak\texttt{landmarks\_} 不释放（\cref{sec:sys-experiment}）；只需局部地图时可改为只留激活集。
+  \item \textbf{症状}：相机静止时窗口退化、轨迹抖动。\textbf{排查}：\texttt{RemoveOldKeyframe} 的 \texttt{min\_dis\_th} 优先删冗余近帧的分支是否生效（\cref{sec:sys-slidewindow}）；考虑关键帧准则加“最小运动量”。
+\end{enumerate}

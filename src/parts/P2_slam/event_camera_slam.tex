@@ -1,0 +1,599 @@
+\chapter{事件相机 SLAM}
+\label{ch:event}
+
+% ════════════════════════════════════════════════════════════════
+%  本章：吸收 SLAM Handbook ch10（Event-based SLAM：传感原理/事件生成模型/
+%    事件表示/前端分类/对比度最大化 CMax/后端/系统综述/数据集）。
+%  自包含独立记录，右扰动为主；事件生成模型与 CMax 推导逐步展开。
+%  与帧相机视觉里程计（ch:vo / ch:camera）对照引出，连续时间本质挂到
+%    STEAM（sec:est-steam）与 GP 连续预积分（sec:imu-advanced）。
+%  本章属 P2 末尾“新型传感器与平台里程计”章群，兄弟章：雷达 SLAM（ch:radar）、
+%    腿式里程计（ch:leg）。教学层遵循 v5.0 算法工程教学规范。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章对照表与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 普通相机以固定帧率（如 $30$\,Hz）输出整幅灰度图。相邻两帧之间相机若高速转动，会发生什么？这段“两帧之间”的时间里相机在做什么？
+  \item \cref{ch:vo} 的直接法最小化\emph{光度误差} $\mathbf I_1(\mathbf p_1)-\mathbf I_2(\mathbf p_2)$，要求“同一空间点在两帧灰度不变”。若一个像素\emph{只}上报“此处变亮了”或“此处变暗了”，而不报具体灰度，你还能用光度误差吗？该改用什么量来对齐？
+  \item \cref{sec:est-steam} 把轨迹写成时间的连续函数 $\mathbf T(t)$、需要哪个时刻就查询哪个。什么样的传感器会让“离散状态 $\{\mathbf x_k\}$”这一表述彻底失效，从而\emph{必须}用连续时间轨迹？
+  \item 一个像素在 $1$ 秒内触发了一百万次“亮度变化”，相邻两次触发间隔可低至微秒。这串数据和一帧 $640\times480$ 的图像，在“时间”与“稀疏性”两个维度上有何本质不同？
+  \item 若把相机的运动“倒着抵消掉”，那些由同一条运动边缘触发的事件会落到图像平面的同一处、堆成一条锐利的边；运动估计错了则糊成一片。如何把“堆得锐不锐”写成一个可优化的标量目标？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}事件相机相对帧相机的工作原理差异（异步、像素独立、对数亮度变化触发），并推导\textbf{事件生成模型} $\Delta L=p\,C$，理解其“数据驱动、运动依赖”的本质；
+  \item \textbf{列举并比较}事件的几种表示（事件帧、时间面 SAE、体素网格、运动补偿事件图 IWE），说清每种表示牺牲了事件流的哪条原生特性；
+  \item \textbf{把事件 SLAM 方法归类}：逐事件 vs 批处理、模型 vs 学习、间接（特征）vs 直接（全事件）、几何 vs 光度目标，并说清每条轴的取舍；
+  \item \textbf{独立推导对比度最大化}（Contrast Maximization, CMax）：事件按候选运动\emph{弯曲}（warp）到参考时刻、累成事件图像 IWE、以 IWE 的方差为对齐度量，写出目标函数与其对运动参数的雅可比结构，并说明它与\cref{ch:vo} 直接法光度对齐的同源与差异；
+  \item \textbf{把事件流的连续时间本质对接到本书既有理论}：解释为何事件相机是 \cref{sec:est-steam} STEAM 连续时间轨迹与 \cref{sec:imu-advanced} GP 连续预积分的“杀手级应用”，并据此组织事件-惯性里程计；
+  \item \textbf{综述}代表性事件 VO/SLAM 系统（EVO、ESVO、Ultimate-SLAM、EDS、CMax-SLAM）与数据集/模拟器的版图，按运动维度、传感器配置、有无后端读懂选型。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{从异步亮度变化里把相机怎么动了、边缘在哪里恢复出来}”的主线。它与 \cref{ch:vo}（视觉里程计）严格平行，只是把“同步整帧灰度”换成“异步像素级亮度变化”，从而被迫\emph{重写}前端的几何与目标，但复用后端的因子图与连续时间轨迹估计。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  drc/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (sensor) {事件相机\\ $\Delta L=pC$ 异步};
+\node[blk, right=of sensor] (repr) {事件表示\\ 帧/SAE/体素/IWE};
+\node[grp, right=of repr] (indir) {间接法\\ 事件角点/线};
+\node[grp, below=8mm of sensor] (direct) {直接法\\ 全事件对齐};
+\node[grp, right=of direct] (cmax) {对比度最大化\\ CMax / IWE 方差};
+\node[drc, right=of cmax] (ct) {连续时间后端\\ STEAM / GP / 因子图};
+\node[blk, below=8mm of direct] (sys) {系统\\ EVO/ESVO/USLAM};
+\node[blk, right=of sys] (fuse) {事件-惯性\\ 异步查询};
+\draw[ln] (sensor)--(repr); \draw[ln] (repr)--(indir);
+\draw[ln] (repr.south) -- ++(0,-4mm) -| (direct.north);
+\draw[ln] (direct)--(cmax); \draw[ln] (cmax)--(ct);
+\draw[ln] (indir.south) to[out=-90,in=90] (ct.north);
+\draw[ln] (direct.south) -- (sys.north);
+\draw[ln] (sys)--(fuse);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径（骨干优先）}：第 \ref{sec:event-why}--\ref{sec:event-repr} 节是任何读者的主干（为何不同 $\to$ 生成模型 $\to$ 表示）。第 \ref{sec:event-cmax} 节（对比度最大化）是事件直接法的标志性内核，本章的理论重心。第 \ref{sec:event-backend} 节把连续时间本质接回 \cref{sec:est-steam} 与 \cref{sec:imu-advanced}，是“事件融进本书既有理论线”的关键。第 \ref{sec:event-systems} 节（系统与数据集）面向研究选型，可选深潜。本章相对短，因为它\emph{大量复用}前面章节的几何（\cref{ch:camera} 投影、\cref{ch:vo} 直接法）与估计骨架（\cref{ch:slam_est} 因子图、\cref{sec:est-steam} 连续时间）。
+
+\subsection*{前置知识桥接}
+本章是 \cref{ch:vo} 的“异步孪生”，请先激活以下前置：
+\begin{itemize}
+  \item \textbf{相机投影模型}（\cref{ch:camera}）：针孔投影 $\mathbf z=\pi(\mathbf x^c)$（\cref{eq:abstract-pi}）、内参 $\mathbf K$、归一化平面坐标——事件也是某像素 $\mathbf x=(x,y)$ 上的观测，弯曲事件、把 3D 边缘投到像平面都用同一套投影。
+  \item \textbf{视觉里程计的直接法}（\cref{sec:vo-direct}）：光度误差 $e=\mathbf I_1(\mathbf p_1)-\mathbf I_2(\mathbf p_2)$、其链式雅可比 $\partial e/\partial\delta\boldsymbol\xi$（\cref{eq:vo-direct-J}）、“运动小才不陷局部极小”。本章的对比度最大化与之同源——都是\emph{不靠显式特征匹配、靠把数据按运动对齐}来估运动；差别只在对齐的“底料”：直接法对齐\emph{灰度}，CMax 对齐\emph{事件}。
+  \item \textbf{连续时间轨迹估计与 STEAM}（\cref{sec:est-steam}）：把状态当时间的连续函数 $\mathbf T(t)$、用线性 SDE 作 GP 先验、任意时刻 $O(1)$ 查询位姿/速度/协方差（\cref{eq:steam-Tquery,eq:steam-interp}）、“测量时刻 $\ne$ 估计时刻 $\ne$ 查询时刻”三套时间戳解耦。事件相机正是这一思想最迫切的应用场景。
+  \item \textbf{李群与右扰动}（\cref{ch:lie}）：$\mathbf R\,\mathrm{Exp}(\delta\boldsymbol\phi)$ 右扰动、$\SE(3)$ 上 $\boldsymbol\xi=[\boldsymbol\rho;\boldsymbol\phi]$、右雅可比 $\mathbf J_r$。CMax 的运动参数（角速度、位姿）都活在李群/李代数上，求导沿用右扰动。
+  \item \textbf{IMU 预积分与连续/高阶预积分}（\cref{sec:imu-preint,sec:imu-advanced}）：预积分把高频测量压成相对增量进因子图；连续/GP 预积分允许\emph{异步查询}（\cref{ins:beyond-euler} 已点名“与事件相机融合时增益显著”）——本章把这条伏笔兑现。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 面对 HDR、高速、强运动模糊的场景（无人机竞速、自动驾驶逆光出隧道），你只会用帧相机，却不知\emph{为什么}它在帧间“失明”、为什么事件相机能补这一短；
+  \item 看到 ESVO、Ultimate-SLAM、CMax-SLAM 这些系统名却不知其前端在对齐\emph{什么}、后端为何多用滑窗或连续时间，只能把它们当黑盒；
+  \item 在 \cref{sec:est-steam} 与 \cref{sec:imu-advanced} 学过的“连续时间是为异步传感器准备的”会停留在抽象——本章给它一个最鲜活、最非用不可的实例。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\label{tab:event-reading}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含 CMax 推导与连续时间对接） & 3--4 小时 & 首次接触事件相机、要做事件 VO/VIO \\
+速读（跳过系统综述与数据集表） & 1 小时 & 有 VO/连续时间基础、想对齐本书记号 \\
+速查（只看小结速查表 + 对照表） & 15 分钟 & 写代码、调参时回来查模型与目标 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+事件 $e_k\doteq(\mathbf x_k,t_k,p_k)$：像素位置 $\mathbf x_k=(x_k,y_k)^\top$、时间戳 $t_k$、极性 $p_k\in\{+1,-1\}$（亮度增/减）。
+对数亮度 $L(\mathbf x,t)\doteq\log I(\mathbf x,t)$；对比度阈值 $C>0$（正负阈值不等时记 $C^+,C^-$）。
+相机投影 $\pi$、内参 $\mathbf K$、位姿 $\mathbf T\in\SE(3)$、机体系角速度/广义速度 $\boldsymbol\omega,\boldsymbol\varpi$（沿用 \cref{thm:se3-kinematics,sec:est-steam}）。
+\textbf{扰动以右扰动为主} $\mathbf T\,\mathrm{Exp}(\delta\boldsymbol\xi)$，$\delta\boldsymbol\xi=[\delta\boldsymbol\rho;\delta\boldsymbol\phi]$（平移在前）。运动补偿事件图（IWE）记 $H(\cdot)$，弯曲映射 $\mathbf W$，运动参数 $\boldsymbol\theta$。
+图像/亮度用 $I,L$，\textbf{$\mathbf R$ 专留旋转}，事件计数图与亮度互不混用字母。
+本章不少结论源自 Gallego 等的事件相机综述\cite{gallego2022eventsurvey} 与对比度最大化系列\cite{gallego2018cmax}，工程对照取 EVO\cite{rebecq2017evo}、ESVO\cite{zhou2021esvo} 与 Ultimate-SLAM\cite{vidal2018ultimate}。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么需要事件相机：帧相机在帧间失明}
+\label{sec:event-why}
+
+\paragraph{动机：从“同步整帧”到“异步像素”。}
+\cref{ch:vo} 的视觉里程计建立在一个未曾言明的前提上：相机以\emph{固定帧率}（由外部时钟决定，如 $30$\,Hz）输出\emph{整幅}灰度图，一帧内所有像素\emph{共享同一个曝光时刻、同一个相机位姿}——这正是 \cref{ch:camera} 多视图几何赖以成立的范式\cite{gallego2022eventsurvey}。但这个范式有三处与“运动”格格不入：(1) 帧率与场景动态\emph{无关}，相机在两帧之间是“失明”的，高速运动时帧间位移大、数据关联崩坏；(2) 全局（或逐行）曝光需要时间，带来\emph{延迟}与\emph{运动模糊}；(3) 即便场景什么都没动，相机仍按帧率吐出大量\emph{冗余}数据。
+
+\paragraph{反面：把帧率一味调高能解决吗？}
+直觉上，把帧率提到 $1000$\,Hz 似乎就能跟上快速运动。但这只会把三处毛病同时放大：数据量随帧率线性暴涨（绝大多数像素帧间没变化，纯属冗余），曝光时间被压短导致暗处信噪比骤降，而\emph{动态范围}（一帧里同时容纳极亮与极暗）这一短板丝毫未改善。问题的根子不在帧率高低，而在“\emph{同步、整帧、固定节拍}”这一采样范式本身。
+
+\paragraph{事件相机：让每个像素自己决定何时说话。}
+\textbf{事件相机}（event camera，又称动态视觉传感器 DVS、硅视网膜）受生物视网膜启发，\emph{放弃了帧的概念}\cite{gallego2022eventsurvey}：每个像素\emph{独立、异步}地工作，仅在自己感受到的\emph{亮度变化}达到阈值时才“发声”，上报一个\textbf{事件}（event）。亮度变化来自场景光照变化或\emph{相机与场景的相对运动}。于是输出不再是一串图像，而是一串时空中稀疏分布的“亮度变化”——运动越快、纹理越多，事件越密；场景静止则几乎无输出。这套机理带来几条帧相机难以企及的特性\cite{gallego2022eventsurvey}：
+
+\begin{itemize}
+  \item \textbf{高时间分辨率}：事件以微秒级时间戳标定，能捕捉极快运动而\emph{无运动模糊}，且几乎连续，没有“帧间失明”；
+  \item \textbf{低延迟}：像素不等全局曝光，亮度一变就上报，亚毫秒延迟；
+  \item \textbf{高动态范围}（HDR）：每个像素独立、且在\emph{对数}域工作，动态范围 $>120$\,dB（帧相机约 $60$\,dB），可同时看清月光与日光下的区域，不会过曝/欠曝；
+  \item \textbf{低功耗、低带宽}：只传非冗余的时间变化，芯片级功耗常 $<10$\,mW。
+\end{itemize}
+
+\begin{insight}[事件相机不是“更快的相机”，而是“另一种采样”]
+把事件相机当成“高帧率灰度相机”是最常见的认知偏差。二者的差别是\emph{范式级}的：帧相机在\emph{时间轴上等间隔}采样\emph{整幅}空间；事件相机在\emph{空间上稀疏}、\emph{时间上由信号自身触发}地采样\emph{亮度变化}。一个采的是“此刻整幅画面长什么样”（绝对亮度、稠密、同步），一个采的是“哪个像素、何时、变亮还是变暗”（相对变化、稀疏、异步）。正因如此，\cref{ch:vo} 为“同步整帧”设计的整套前端（特征点法、灰度光度误差）\emph{不能直接搬用}——这驱动了本章要重写的所有内容。
+\end{insight}
+
+\paragraph{选型：当前器件谱系与演进趋势。}
+“做事件 SLAM 该买/用哪款相机？”——进入这一新兴领域者常问此问，各款器件的参数也常以对照表横比\cite{gallego2022eventsurvey}。要点先摆明：事件传感器设计虽多，\emph{多数仍停在实验室原型}，真正商品化、足以支撑事件 SLAM 这类新老问题探索的只是少数，主要出自 SONY、Samsung、iniVation/SynSense、Prophesee、Omnivision 等厂商\cite{carlone2026handbook}。几条值得留意的演进趋势：
+\begin{itemize}
+  \item \textbf{像素间距（pixel pitch）持续缩小}：追随传统相机的“百万像素竞赛”与工业需求，像素间距从 DVS128 的 $40\,\mu\mathrm m$ 一路降到 $<5\,\mu\mathrm m$。但 DVS 像素要做调制、比较等\emph{比传统像素更多}的操作，需更多晶体管、更难在同等面积内塞下；为最大化\emph{填充因子}（像素受光面积占比）、缩小感光部分之间的间隙，普遍转向\emph{堆叠式工艺}（stacked technology）与\emph{背照式}（backside illumination）。
+  \item \textbf{HD 机型砍掉灰度输出}：早期 DAVIS、ATIS 同时输出灰度图（对\emph{静止}相机的应用有用，但这并非 SLAM 的常态）；新一代 HD（百万像素）事件相机为给事件输出腾出面积、顺应百万像素竞赛，\emph{放弃了}并发的灰度输出。
+  \item \textbf{彩色与惯性是可选项}：颜色对许多运动相关任务并非必需，仅少数机型加 RGB 滤光以分通道感知变化；另有部分相机在同一器件内集成 IMU——惯性是与视觉互补的本体感受传感器，直接支撑事件-惯性里程计（VIO）与 SLAM，较单传感器系统更鲁棒、更准。
+\end{itemize}
+
+\begin{insight}[高分辨率 $\ne$ 更适合 SLAM：HD 的实时瓶颈与 QVGA 偏好]
+“空间分辨率越高越好”是事件相机选型最常见的误区。捕捉精细空间细节固然重要，但\emph{噪声}与\emph{带宽}在具体任务需求里同样举足轻重。SLAM 场景中事件相机常\emph{快速运动}、面对\emph{高纹理}，此时 HD（百万像素）相机每秒可吐出\emph{数亿}事件，足以\emph{饱和}相机的输出传输总线、压垮处理端——\emph{当前没有任何算法-硬件组合能实时处理}这种事件率（除非退而求其次做阵列式转换或下/降采样）\cite{carlone2026handbook}。正在研制的新型混合传感器（事件分辨率低于强度输出）与\emph{中央凹}（foveated）传感器，正试图按生物视觉之道压低带宽。因此在 SLAM 中，\emph{较低像素分辨率（如 QVGA）反更受青睐}：便于算法原型、也利于算力受限机器人上的实时运行；而\emph{视场（光学）}的选择，往往与像素数同等重要。
+\end{insight}
+
+\paragraph{本章在“新型传感器与平台里程计”章群中的定位。}
+前面几章以相机（\cref{ch:vo}）、激光（\cref{ch:lidar_slam}）、IMU（\cref{ch:imu}）为主线，建立了 SLAM 的完整骨架：观测模型、预积分、因子图、连续时间轨迹。本章与雷达 SLAM（\cref{ch:radar}）、腿式里程计（\cref{ch:leg}）一道，把\emph{同一套数学}迁移到新兴传感与平台上。事件相机是其中“与帧相机最像、与帧相机数学最不同”的一个：它复用 \cref{ch:camera} 的投影几何与 \cref{sec:est-steam} 的连续时间轨迹，却必须为“异步、稀疏、运动依赖”的事件流重新设计前端目标。读时不妨与 \cref{ch:radar} 的多普勒里程计对照——雷达靠“频移免费给的径向速度”自成一套，事件相机靠“异步免费给的微秒时间戳”自成一套，二者都是“某个被帧相机/激光当作锦上添花的维度，在新传感器里成了主心骨”。事件因子也照 \cref{ins:radar-factor-recipe} 的“三问入图”构造——约束哪些状态、残差怎么写（测量$-$预测）、信息矩阵 $\boldsymbol\Lambda$ 多大——故与 IMU/视觉因子在优化器眼里一视同仁。
+
+% ════════════════════════════════════════════════════════════════
+\section{事件生成模型}
+\label{sec:event-model}
+
+\paragraph{动机：一个事件到底编码了什么？}
+要为事件流设计估计方法，先得把“像素何时、为何触发”写成数学。这一节给出事件相机的\emph{物理生成模型}，它是后面一切前端目标（尤其是 \cref{sec:event-cmax} 的对比度最大化）的基石——正如 \cref{ch:camera} 的针孔投影是整个视觉里程计的基石。
+
+\begin{derivation}[事件生成模型：对数亮度的阈值触发]
+\label{def:event-gen}
+设像素 $\mathbf x$ 处的\emph{对数亮度}（log intensity）为 $L(\mathbf x,t)\doteq\log I(\mathbf x,t)$。每个像素\emph{记住}它上次触发事件时的对数亮度，并连续监视当前值相对该记忆值的变化。设第 $k$ 个事件在像素 $\mathbf x_k$、时刻 $t_k$ 触发，距上次同像素事件经过 $\Delta t_k$。\textbf{触发条件}是对数亮度变化达到阈值 $C$：
+\begin{equation}
+  \Delta L\doteq L(\mathbf x_k,t_k)-L(\mathbf x_k,t_k-\Delta t_k)=p_k\,C,
+  \label{eq:event-gen}
+\end{equation}
+其中 $C>0$ 是\emph{对比度阈值}，$p_k\in\{+1,-1\}$ 是\textbf{极性}：亮度增（$\Delta L>0$）记 $p_k=+1$，亮度减记 $p_k=-1$。相机随即发出事件
+\begin{equation}
+  e_k\doteq(\mathbf x_k,t_k,p_k),
+  \label{eq:event-tuple}
+\end{equation}
+即“位置、时间、极性”的四元组（$\mathbf x_k$ 含 $x,y$ 两数）。\emph{每个}像素独立地、异步地执行 \cref{eq:event-gen}：哪个像素先攒够 $C$，哪个就先发声。
+\end{derivation}
+
+\paragraph{把生成模型与运动挂钩：事件是“运动的边缘”。}
+\cref{eq:event-gen} 看似只关亮度，但在常光照假设下它\emph{直接连到运动}。对数亮度沿时间的变化由\emph{亮度恒定假设}（\cref{sec:vo-flow} 光流那条 $\nabla\mathbf I^\top\mathbf v+\partial_t\mathbf I=0$ 的对数版）给出：场景点的亮度随相机/场景相对运动而在像平面上“流动”，故
+\begin{equation}
+  \frac{\partial L}{\partial t}\approx-\nabla L^\top\,\mathbf v(\mathbf x),
+  \label{eq:event-brightness}
+\end{equation}
+$\mathbf v(\mathbf x)$ 是该像素处的\emph{光流}（image velocity）。把 \cref{eq:event-brightness} 在小区间积分并代入 \cref{eq:event-gen}：当且仅当 $-\nabla L^\top\mathbf v\cdot\Delta t$ 攒够 $\pm C$ 才触发。两点立现：(1) 梯度 $\nabla L=\mathbf 0$（平坦区）处\emph{永不}触发——\textbf{事件只出现在边缘}；(2) 触发率正比于\emph{运动沿梯度方向的分量}。于是\emph{一台运动的事件相机就是一个异步边缘检测器}\cite{gallego2022eventsurvey}：它上报的恰是“正在移动的场景轮廓”。这与 \cref{ch:vo} 的角点/边缘特征哲学一脉相承（最信息丰富的是梯度大处），但事件相机把它做到了\emph{硬件级、异步、连续}。
+
+\begin{insight}[“运动依赖”是事件的天赋也是诅咒]
+\cref{eq:event-brightness} 揭示了事件与图像的根本不同：图像像素值\emph{只}取决于场景纹理（你拍一面有花纹的墙，不动也能看清花纹）；而事件\emph{同时}取决于纹理与运动——同一面墙，相机不动则一个事件都没有，动起来才“显影”，且运动方向不同、显影的边缘也不同（沿边缘方向移动几乎不触发，垂直边缘移动触发最密，这正是光流的\emph{孔径问题}在事件域的体现）。这意味着：你不能脱离运动谈“事件长什么样”。好处是事件天然滤掉了静止冗余、聚焦于运动；代价是数据关联更难——同一条边缘在不同运动下产生的事件模式不同（\cref{sec:event-repr,sec:event-cmax} 要处理的核心困难）。
+\end{insight}
+
+\begin{pitfall}[概念误区：把极性 $p$ 当成“亮度值”]
+\textbf{错误想法}：既然事件报告亮度变化，那把所有 $+1$ 事件当“亮像素”、$-1$ 当“暗像素”叠起来就能重建图像。\textbf{现象}：得到的“图像”只是一堆杂乱的正负边缘响应，看不出场景外观，更无法当灰度图喂给 \cref{ch:vo} 的特征点法。\textbf{根本原因}：$p\in\{+1,-1\}$ 编码的是\emph{对数亮度变化的符号}（增/减各攒够一个 $C$），\emph{不是}亮度本身；要从事件恢复绝对亮度 $L$，须对 \cref{eq:event-gen} 沿时间\emph{积分}（每个事件给 $L$ 加 $\pm C$），即对“边缘强度场”做\emph{泊松积分}式的重建（\cref{sec:event-systems} 提及的图像重建任务）——这本身是个非平凡的反问题。\textbf{正确做法}：把单个事件理解为“此像素此刻对数亮度跨过了一个 $\pm C$ 台阶”这一\emph{增量、局部、稀疏}的信息，据此设计估计，而非奢望它直接给绝对亮度。
+\end{pitfall}
+
+\begin{note}[器件与噪声：$C$ 并非常数]
+真实事件相机（DVS128、DAVIS、ATIS、Prophesee 等器件\cite{gallego2022eventsurvey}）的对比度阈值 $C$ 受电路噪声、入射光强、温度影响而\emph{抖动}。模拟器常把 $C$ 建模为高斯 $\mathcal N(C,\sigma_C^2)$，并允许正负阈值不等 $C^+\ne C^-$\cite{rebecq2018esim}。此外有热噪声、漏电事件（leak events）、有限带宽等非理想效应。本章推导用理想模型 \cref{eq:event-gen}，把噪声当作后续估计中以鲁棒核或概率权重处理的对象——正如 \cref{ch:vo} 先用理想针孔再谈畸变与外点。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{事件表示与方法分类}
+\label{sec:event-repr}
+
+\paragraph{动机：异步稀疏的事件，怎么喂给“为图像设计的”算法？}
+事件流是时空中一串稀疏点 $\{e_k\}$，而 \cref{ch:vo,ch:slam_est} 的成熟工具（卷积、特征检测、最小二乘）多为\emph{稠密、同步}的图像/向量设计。一条务实路线是先把一小段（一“批”）事件\emph{转成某种类图像的表示}，再接既有方法。但任何这种转换都要付出代价——丢掉事件流的某条原生特性。下表是常见表示的“得失账”。
+
+\begin{table}[H]\centering\small
+\caption{事件的几种表示及其得失（牺牲了哪条原生特性）}
+\label{tab:event-repr}
+\begin{tabular}{p{0.20\linewidth}p{0.40\linewidth}p{0.30\linewidth}}
+\toprule
+表示 & 构造方式 & 牺牲/代价 \\
+\midrule
+事件帧（event frame）& 一段时间窗内事件按像素\emph{计数}或\emph{累加极性}成一幅 2D 图 & 丢时间细节（窗内同像素多次触发被压扁）、丢稀疏性 \\
+时间面 SAE & 每像素记录\emph{最近一次}事件的时间戳，构成 $t=\mathrm{SAE}(\mathbf x)$ 曲面（surface of active events）& 只保留最新事件、旧事件被覆盖；对噪声敏感 \\
+体素网格（voxel grid）& 把 $(x,y,t)$ 离散成 3D 网格、按极性插值累加 & 时间被量化分层；零填充破坏稀疏 \\
+运动补偿事件图 IWE & 按候选运动把事件\emph{弯曲}到同一时刻再累加（\cref{sec:event-cmax}）& 需先有运动假设；是\emph{估计的中间量}而非纯表示 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 其中\textbf{运动补偿事件图}（Image of Warped Events, IWE）特殊：它不是“先转表示再估计”，而是\emph{把运动估计嵌进表示构造本身}——这正是 \cref{sec:event-cmax} 对比度最大化的载体，本章理论重心所在。理想的事件方法应尽量\emph{少转换}、保住高速与稀疏，但这仍是开放课题\cite{gallego2022eventsurvey}。
+
+\paragraph{方法分类：四条正交的轴。}
+事件 SLAM 方法可沿四条轴归类（\cref{tab:event-taxonomy}），它们大体平行于 \cref{ch:vo} 对帧相机方法的划分，只是多了“异步/同步处理”这条事件特有的轴。
+
+\begin{table}[H]\centering\small
+\caption{事件 SLAM 方法分类（四条正交轴）}
+\label{tab:event-taxonomy}
+\begin{tabular}{p{0.20\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+轴 & 两端 & 取舍 \\
+\midrule
+处理粒度 & 逐事件（每来一个事件就可更新状态，极低延迟）vs 批处理（攒一包事件再处理，有延迟）& 逐事件延迟最低但每事件信息少；批处理稳但选包大小是设计难点 \\
+建模方式 & 模型法（手工设计，基于 \cref{eq:event-gen} 物理）vs 学习法（ANN/SNN）& 模型法可解释、无需数据；学习法处理噪声/复杂表示强但需大数据、有域偏移 \\
+信息利用 & 间接/特征法（先提事件角点、线、法向光流，再走经典几何）vs 直接法（用全部事件，不显式提特征）& 间接法复用成熟几何但事件特征不如帧特征稳；直接法用满信息但目标非凸 \\
+目标函数 & 几何目标（如重投影误差）vs 光度/事件目标（极性、事件率、对齐度）& 对应间接 vs 直接；见 \cref{sec:event-cmax} 与 \cref{sec:event-backend} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[与帧相机方法的严格对应]
+把 \cref{tab:event-taxonomy} 与 \cref{ch:vo} 并排看：间接法 $\leftrightarrow$ 特征点法（ORB+重投影误差），直接法 $\leftrightarrow$ 直接法（光度误差，\cref{sec:vo-direct}）。差别只在\emph{底料}：帧相机直接法对齐\emph{灰度}（\cref{eq:vo-photo-err} 的 $\mathbf I_1-\mathbf I_2$），而事件直接法对齐\emph{事件}——因为事件不给灰度，只给“变化”。这一句话点破了为什么事件 SLAM 既能借鉴 \cref{ch:vo} 的框架（同样是“按运动对齐数据、最小化失配”），又必须发明新目标（\cref{sec:event-cmax} 的对比度）。事件相机新增的“逐事件 vs 批处理”轴，则源于它\emph{没有帧}这一事实：帧相机天然以帧为处理单元，事件相机要自己决定“多少个事件算一个处理单元”。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{对比度最大化：事件直接法的内核}
+\label{sec:event-cmax}
+
+\paragraph{动机：没有灰度，靠什么对齐？}
+\cref{sec:vo-direct} 的直接法估运动，是“调整位姿使两帧\emph{灰度}对齐、光度误差最小”。事件相机没有灰度，但有一个更妙的对齐线索：\emph{由同一条场景边缘触发的事件，若按正确的运动把它们的位置“倒推”回同一时刻，会精确地落到该边缘当前的像平面位置上，堆成一条\textbf{锐利}的边；若运动估计错了，它们就散开、糊成一片}。于是“运动对不对”可以量化成“堆得锐不锐”。这就是\textbf{对比度最大化}（Contrast Maximization, CMax），又称\emph{聚焦}（focus）或\emph{运动补偿}（motion compensation）框架\cite{gallego2018cmax}——事件直接法中精度最高的一类。
+
+\paragraph{第一步：把事件按候选运动弯曲（warp）。}
+给定一段事件 $\{e_k=(\mathbf x_k,t_k,p_k)\}_{k=1}^{N_e}$ 与候选运动参数 $\boldsymbol\theta$，选一个参考时刻 $t_{\mathrm{ref}}$（常取该段起点或中点）。把每个事件的位置\emph{沿候选运动}弯曲到 $t_{\mathrm{ref}}$：
+\begin{equation}
+  \mathbf x_k'=\mathbf W(\mathbf x_k,t_k;\boldsymbol\theta),
+  \label{eq:cmax-warp}
+\end{equation}
+$\mathbf W$ 是\emph{弯曲映射}（warp），其具体形式取决于要估什么运动（下文给两个常见特例）。直觉：$\mathbf W$ 把“事件在自己触发时刻 $t_k$ 的位置”换算成“假如把相机/边缘的运动倒带回 $t_{\mathrm{ref}}$，这个事件该出现在哪里”。
+
+\paragraph{第二步：累成运动补偿事件图 IWE。}
+把弯曲后的事件在像平面上累加，得\textbf{运动补偿事件图}（IWE）——本质是一幅“弯曲后事件的直方图”：
+\begin{equation}
+  H(\mathbf p;\boldsymbol\theta)=\sum_{k=1}^{N_e} b_k\,\delta(\mathbf p-\mathbf x_k'(\boldsymbol\theta)),
+  \label{eq:cmax-iwe}
+\end{equation}
+$\mathbf p$ 遍历像素，$\delta$ 为（离散实现中用双线性插值核近似的）冲激，权重 $b_k$ 可取 $1$（计数）或 $p_k$（按极性累加）。运动正确时，同一边缘的事件 $\mathbf x_k'$ 高度重合，$H$ 在该处出现\emph{高而尖}的峰；运动错误时事件散开，$H$ 平坦模糊。\cref{fig:cmax} 示意这一“对齐则锐、错则糊”。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=0.95,>=Stealth,font=\small]
+  % left: misaligned (blurred)
+  \begin{scope}[xshift=0cm]
+    \draw[gray!50] (0,0) rectangle (3,2.4);
+    \node[font=\scriptsize, anchor=south] at (1.5,2.45) {运动估计\emph{错}：事件散开（糊）};
+    \foreach \x/\y in {0.6/0.5,0.9/0.7,1.2/0.55,0.75/0.9,1.05/0.4,1.35/0.8,0.5/0.65,1.5/0.6,1.15/0.95,0.85/0.45,1.45/0.95,0.65/1.05}{
+      \fill[third!70] (\x,\y) circle (1.1pt);}
+    \foreach \x/\y in {1.7/1.3,2.0/1.5,2.3/1.25,1.85/1.7,2.15/1.15,1.55/1.45,2.45/1.4,1.95/1.05,2.3/1.75,2.1/1.95}{
+      \fill[second!70] (\x,\y) circle (1.1pt);}
+  \end{scope}
+  % arrow
+  \node at (3.6,1.2) {$\xrightarrow{\ \boldsymbol\theta^\star\ }$};
+  % right: aligned (sharp)
+  \begin{scope}[xshift=4.3cm]
+    \draw[gray!50] (0,0) rectangle (3,2.4);
+    \node[font=\scriptsize, anchor=south] at (1.5,2.45) {运动估计\emph{对}：事件聚成锐边（尖）};
+    % sharp diagonal edge
+    \foreach \t in {0,...,12}{
+      \pgfmathsetmacro\x{0.5+0.18*\t}
+      \pgfmathsetmacro\y{0.45+0.12*\t}
+      \fill[third!80] (\x,\y) circle (1.4pt);}
+    \foreach \t in {0,...,9}{
+      \pgfmathsetmacro\x{1.6+0.09*\t}
+      \pgfmathsetmacro\y{1.2+0.085*\t}
+      \fill[second!80] (\x,\y) circle (1.4pt);}
+  \end{scope}
+  \node[font=\scriptsize] at (5.8,-0.35) {方差 $\mathrm{Var}(H)$ \emph{大}};
+  \node[font=\scriptsize] at (1.5,-0.35) {方差 $\mathrm{Var}(H)$ \emph{小}};
+\end{tikzpicture}
+\caption{对比度最大化（CMax）的几何直觉：按候选运动 $\boldsymbol\theta$ 把事件弯曲到参考时刻累成 IWE。运动错时事件散开、IWE 平坦（对比度/方差小）；运动对时同边缘事件重合、IWE 出现锐利边（对比度/方差大）。CMax 即求使 IWE 对比度最大的 $\boldsymbol\theta^\star$。（仿\cite{gallego2018cmax} 重绘）}
+\label{fig:cmax}
+\end{figure}
+
+\paragraph{第三步：用“对比度”度量锐利程度，并最大化。}
+“锐利、尖峰”在统计上对应 IWE 像素值的\emph{离散程度大}。最常用的对比度度量是 IWE 的\textbf{方差}\cite{gallego2018cmax}：
+\begin{equation}
+  f(\boldsymbol\theta)=\mathrm{Var}\big(H(\cdot;\boldsymbol\theta)\big)
+  =\frac{1}{|\Omega|}\sum_{\mathbf p\in\Omega}\big(H(\mathbf p;\boldsymbol\theta)-\mu_H\big)^2,
+  \qquad \mu_H=\frac{1}{|\Omega|}\sum_{\mathbf p\in\Omega}H(\mathbf p;\boldsymbol\theta),
+  \label{eq:cmax-var}
+\end{equation}
+$\Omega$ 为像平面（$|\Omega|$ 像素数）。运动对齐使少数像素堆积大量事件、其余为空 $\Rightarrow$ 方差大；散开则各像素值相近 $\Rightarrow$ 方差小。CMax 即\emph{最大化对比度}估运动：
+\begin{equation}
+  \boxed{\ \boldsymbol\theta^\star=\arg\max_{\boldsymbol\theta}\ f(\boldsymbol\theta)=\arg\max_{\boldsymbol\theta}\ \mathrm{Var}\big(H(\cdot;\boldsymbol\theta)\big).\ }
+  \label{eq:cmax-obj}
+\end{equation}
+方差并非唯一选择：梯度幅值平方和、事件数的负熵、图像锐度等同类“聚焦度量”均可，统称\emph{聚焦/对比度}目标\cite{gallego2018cmax}。求解用梯度上升或高斯牛顿（下文雅可比），多在金字塔/粗到细策略下进行以扩大收敛域。
+
+\begin{derivation}[CMax 的弯曲特例与雅可比结构（右扰动主线）]
+\label{thm:cmax-jac}
+\textbf{特例 A：纯旋转（全景/旋转 SLAM）。}\;相机只转不平移时，弯曲只需把事件方向按旋转倒带。设 $t_k$ 到 $t_{\mathrm{ref}}$ 的相对旋转为 $\mathbf R(t_k;\boldsymbol\omega)$（小区间内由角速度 $\boldsymbol\omega$ 经 $\mathrm{Exp}$ 给出，$\boldsymbol\theta=\boldsymbol\omega$），事件反投影为单位射线 $\mathbf f_k=\pi^{-1}(\mathbf x_k)/\|\cdot\|$，弯曲为
+\begin{equation}
+  \mathbf x_k'=\pi\big(\mathbf R(t_k;\boldsymbol\omega)^\top\,\mathbf f_k\big),\qquad
+  \mathbf R(t_k;\boldsymbol\omega)=\mathrm{Exp}\big((t_k-t_{\mathrm{ref}})\,\boldsymbol\omega\big).
+  \label{eq:cmax-rot-warp}
+\end{equation}
+\textbf{特例 B：平面光流（局部恒定速度）。}\;一小片事件近似共享一个像速度 $\mathbf v\in\mathbb R^2$（$\boldsymbol\theta=\mathbf v$），弯曲退化为线性平移
+\begin{equation}
+  \mathbf x_k'=\mathbf x_k-(t_k-t_{\mathrm{ref}})\,\mathbf v.
+  \label{eq:cmax-flow-warp}
+\end{equation}
+\textbf{雅可比（梯度上升所需）。}\;\cref{eq:cmax-var} 对 $\boldsymbol\theta$ 求导，链式经 IWE：
+\begin{equation}
+  \frac{\partial f}{\partial\boldsymbol\theta}
+  =\frac{2}{|\Omega|}\sum_{\mathbf p\in\Omega}\big(H(\mathbf p)-\mu_H\big)\,
+  \frac{\partial H(\mathbf p)}{\partial\boldsymbol\theta},\qquad
+  \frac{\partial H(\mathbf p)}{\partial\boldsymbol\theta}
+  =-\sum_{k} b_k\,\nabla_{\!\mathbf p}\delta(\mathbf p-\mathbf x_k')^\top\,
+  \frac{\partial\mathbf x_k'}{\partial\boldsymbol\theta}.
+  \label{eq:cmax-grad}
+\end{equation}
+关键项 $\partial\mathbf x_k'/\partial\boldsymbol\theta$ 是“弯曲后位置对运动参数”的导数，与 \cref{sec:vo-direct} 直接法雅可比 \cref{eq:vo-direct-J} \emph{结构同源}（都是“像素位置对运动求导”$\times$“某场对像素位置求导”）：
+\begin{itemize}
+  \item 平面光流（特例 B）：$\partial\mathbf x_k'/\partial\mathbf v=-(t_k-t_{\mathrm{ref}})\mathbf I_2$，简洁线性；
+  \item 纯旋转（特例 A）：$\partial\mathbf x_k'/\partial\boldsymbol\omega=\frac{\partial\pi}{\partial\mathbf f}\big(\mathbf R^\top\mathbf f_k\big)^\wedge(t_k-t_{\mathrm{ref}})$（用右扰动 $\mathbf R\,\mathrm{Exp}(\delta\boldsymbol\phi)$ 对 $\boldsymbol\omega$ 求导，$\frac{\partial\pi}{\partial\mathbf f}$ 为 \cref{ch:camera} 投影雅可比）。
+\end{itemize}
+离散实现中 $\delta$ 用双线性插值核替代，$\nabla_{\!\mathbf p}\delta$ 即该核的空间梯度，整套可解析微分、交给 GN/LM。\hfill$\square$
+\end{derivation}
+
+\begin{insight}[CMax 与直接法：同一思想的两副面孔]
+\cref{thm:cmax-jac} 的雅可比与 \cref{sec:vo-direct} 直接法的链式雅可比\emph{形同神似}，这不是巧合。二者都属“\emph{对齐式}运动估计”：不显式找对应（不匹配特征），而是\emph{假设一个运动、把数据按它对齐、用失配度反推运动}。差别有三：(1) \textbf{对齐的量}——直接法对齐灰度场 $\mathbf I$，CMax 对齐事件直方图 $H$；(2) \textbf{失配的度量}——直接法\emph{最小化}光度误差（要小），CMax \emph{最大化}对比度（要大），方向相反但都是“对齐得越好目标越优”；(3) \textbf{时间模型}——直接法假设两帧各有一个位姿，CMax 内蕴\emph{连续}运动（$t_k$ 进了弯曲映射 \cref{eq:cmax-warp}），天然带时间——这正是下一节把它接到连续时间轨迹的接口。把 CMax 看成“为没有灰度、只有微秒级事件的相机量身定做的直接法”，就抓住了它的本质。
+\end{insight}
+
+\begin{pitfall}[陷阱：事件被弯曲到一条线/一点的“崩塌”全局最优]
+\textbf{错误现象}：CMax 优化收敛到一个让\emph{所有}事件挤到一条线甚至一个点的运动——此时 IWE 方差极大，目标值“最优”，但运动估计完全错误。\textbf{根本原因}：\cref{eq:cmax-obj} 的方差目标在“事件被弯曲折叠成低维结构”时会出现\emph{虚假全局最优}\cite{gallego2018cmax}：把整片事件压成一条线或一团，方差当然爆表，但这对应的是病态运动而非真实运动。这是直接法“图像强非凸、易陷错误极值”问题（\cref{eq:vo-direct-J} 后那条警示）在事件域的特有变体。\textbf{正确做法}：(1) 改用对“折叠”不敏感的对比度度量（如基于事件\emph{数}而非幅值的度量、或带惩罚项的目标）；(2) 限制弯曲的自由度或加运动先验（连续时间 GP 先验，\cref{sec:event-backend}）；(3) 粗到细 + 合理的参考时刻，避免一步跨进崩塌盆地。\textbf{自检}：监控 IWE 中\emph{非空像素数}——若优化过程中非空像素骤减，多半在往崩塌解跑。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{后端：把事件接回因子图与连续时间轨迹}
+\label{sec:event-backend}
+
+\paragraph{动机：前端给了对齐，后端给一致。}
+\cref{sec:event-cmax} 的 CMax（或间接法的事件特征跟踪）是\emph{前端}：从一小段事件估出局部运动与边缘结构。但与 \cref{ch:vo,ch:lidar_slam} 一样，前端会漂移，需要\emph{后端}refinement——把多段的位姿与地图放进一个联合优化，提高全局一致性\cite{gallego2022eventsurvey}。事件 SLAM 的后端按前端类型分两支，与 \cref{ch:vo} 完全平行：
+
+\begin{itemize}
+  \item \textbf{间接后端}：在事件流（或事件帧）上提角点/线，最小化\emph{重投影误差}（\cref{ch:vo} 的 $\mathbf z-\pi(\mathbf T,\boldsymbol\rho)$），复用成熟的束调整 BA。优点是直接接 \cref{ch:slam_est} 的因子图机器；缺点是事件角点不如帧角点稳，丢弃了大量事件信息。
+  \item \textbf{直接后端}：在\emph{事件本身}上定目标，最小化光度误差（借助同址灰度帧时）或\emph{最大化事件对齐}（把 CMax 推广到滑窗、联合精化运动与边缘地图）。更贴合事件特性，但高维、易陷局部极小，是当前活跃前沿。
+\end{itemize}
+现状是：多数事件 SLAM 系统\emph{尚无}独立后端，采用 \cref{ch:vo} 提过的\emph{并行跟踪与建图}（PTAM 式，跟踪与建图两模块互喂\cite{rebecq2017evo,zhou2021esvo}）；少数近期系统才引入滑窗 BA\cite{vidal2018ultimate} 或全事件的连续时间 BA\cite{guo2024cmaxslam}。
+
+\subsection{事件相机：连续时间轨迹估计的“杀手级应用”}
+\label{sec:event-ct}
+
+\paragraph{为何离散状态在事件流前彻底失效。}
+\cref{sec:est-steam} 开篇就指出：滚动快门、激光逐点、多传感器异步，使“一串离散状态 $\{\mathbf x_k\}$、每个对应一个测量时刻”的表述露怯。事件相机把这一困境推到\emph{极致}\cite{gallego2022eventsurvey}：每个事件都有自己的微秒级时间戳、对应\emph{不同}的相机位姿（\cref{eq:cmax-warp} 的弯曲正是承认了这一点——它给每个 $t_k$ 算了一个相对运动）。一段事件动辄百万计，绝无可能为每个事件设一个离散状态。于是\emph{必须}把轨迹写成时间的连续函数 $\mathbf T(t)$——这正是 \cref{sec:est-steam} 的 STEAM 与 \cref{sec:imu-advanced} 的连续/GP 预积分所提供的。事件相机不是“连续时间的又一应用”，而是\emph{把连续时间从锦上添花变成非用不可}的那个传感器。
+
+\begin{insight}[STEAM 三套时间戳，正好量身适配事件]
+\cref{sec:est-steam} 的核心洞见（\cref{ins:beyond-euler} 之外那条）是“\emph{测量时刻 $\ne$ 估计时刻 $\ne$ 查询时刻}”可以解耦：测量很多、主解状态可少、查询任意。把它对到事件相机上严丝合缝：
+\begin{itemize}
+  \item \textbf{测量时刻}：每个事件的 $t_k$（百万计，超密）；
+  \item \textbf{估计时刻}：连续时间轨迹的少数控制点 $\{t_0,\dots,t_K\}$（主 MAP 实际求解，可稀疏）；
+  \item \textbf{查询时刻}：弯曲事件、做 CMax、或与帧/IMU 对齐时\emph{任意需要的}时刻。
+\end{itemize}
+具体地，弯曲映射 \cref{eq:cmax-warp} 里“$t_k$ 时刻的相对运动”不再由简单的 $\mathrm{Exp}((t_k-t_{\mathrm{ref}})\boldsymbol\omega)$ 给出，而是\emph{从连续时间轨迹 $\mathbf T(t)$ 在 $t_k$ 处 GP 插值查询}（\cref{eq:steam-Tquery} 的 $\hat{\mathbf T}(\tau)$，单次 $O(1)$）。这样 CMax 不再只估一个全局角速度/速度，而是\emph{精化整条连续轨迹的控制点}——CMax-SLAM 式的全事件连续时间 BA\cite{guo2024cmaxslam} 正是这一思路。\cref{sec:est-steam} 那句“STEAM 把连续时间查询的能力\emph{免费}加到离散 SLAM 上”，在这里兑现为“让百万事件挂到少数控制点上、主解规模可控”。
+\end{insight}
+
+\paragraph{常速度先验与事件的天然契合。}
+\cref{sec:est-steam} 的 WNOA（白噪声加速度 / 常速度）先验 \cref{eq:steam-local-sde} 对事件相机尤其合适：事件多在\emph{短时窗}内成批处理（毫秒级），窗内“相机近似匀速”是极好的近似，正是 WNOA 鼓励的轨迹形状。于是把 CMax 的事件对齐当\emph{观测因子}、把 WNOA 当\emph{运动先验因子}，二者拼进 \cref{eq:steam-A} 那个箭头矩阵的批量 MAP——事件 SLAM 的连续时间后端便与 STEAM 共享同一套稀疏求解（Schur 消元 / 稀疏 Cholesky）与协方差查询（选择性稀疏逆）。运动更剧烈时换 WNOJ（常加速度，\cref{eq:steam-Phi-Q} 后的高阶推广）即可，框架不变。
+
+\subsection{事件-惯性里程计：兑现 GP 连续预积分的伏笔}
+\label{sec:event-vio}
+
+\paragraph{为什么事件几乎总要配 IMU。}
+单靠事件估 6 自由度运动有两个软肋：(1) 单目事件相机和单目帧相机一样\emph{尺度不可观}（\cref{thm:intro-scale}）；(2) 弱纹理或运动方向不利时事件稀少、约束不足。补法与 \cref{ch:vio} 如出一辙——\emph{融 IMU}：IMU 提供尺度与高频运动，事件提供 HDR、无模糊的视觉约束。代表系统 Ultimate-SLAM\cite{vidal2018ultimate} 即“事件 + 帧 + IMU”三者紧耦合，在高速、HDR 场景显著超越纯帧 VIO。
+
+\paragraph{接口：IMU 预积分遇上异步事件，正是 GP 连续预积分的用武之地。}
+\cref{ch:imu} 的标准预积分（\cref{sec:imu-preint}）把两\emph{关键帧}间的 IMU 测量压成相对增量。但事件相机\emph{没有帧}，“关键帧”的时刻可以是连续时间轨迹上\emph{任意}选的控制点，且事件对齐要求在\emph{任意 $t_k$} 查询位姿。标准欧拉预积分按固定关键帧离散，难以异步查询；而 \cref{sec:imu-advanced} 的\emph{连续/GP 预积分}恰好支持\emph{异步查询预积分测量}——\cref{ins:beyond-euler} 早已点名“只有与异步传感器（事件相机）融合时，连续/GP 预积分的精度增益才显著”。本章把这条伏笔兑现：
+
+\begin{itemize}
+  \item 把 IMU 用 \cref{sec:imu-advanced} 的连续加速度 / 连续旋转 GP 预积分表示，可在任意事件时刻 $t_k$ 查询预积分增量及其协方差；
+  \item 把事件 CMax 对齐因子、IMU（连续）预积分因子、（若有同址灰度帧的）重投影/光度因子，一并挂到同一条连续时间轨迹 $\mathbf T(t)$ 的控制点上；
+  \item 用 \cref{eq:steam-A} 的箭头矩阵批量 MAP 联合求解——这与 \cref{ch:vio} 的紧耦合 VIO \emph{结构完全一致}，只是视觉因子从“整帧重投影”换成了“事件对齐 + 异步查询”。
+\end{itemize}
+
+\begin{insight}[事件-惯性融合是本书三条线的汇流]
+事件-惯性里程计漂亮地把本书三条独立发展的线拧成一股：(1) \cref{ch:vo} 的\emph{直接法对齐}（在事件域变为 CMax）；(2) \cref{ch:imu} 的\emph{预积分}（在异步场景变为 \cref{sec:imu-advanced} 的 GP 连续预积分）；(3) \cref{sec:est-steam} 的\emph{连续时间轨迹}（把百万事件与 IMU 测量挂到少数控制点）。读者若已读通这三章，事件-惯性里程计几乎\emph{不需要新数学}——它就是这三套工具在“异步、稀疏、HDR”这一新传感器上的组合。这正印证了本章群引子的论断：新型传感器换的是\emph{观测的物理}，复用的是\emph{估计的骨架}。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{代表系统、数据集与选型}
+\label{sec:event-systems}
+
+\paragraph{系统版图（综述笔法）。}
+事件 SLAM 仍处\emph{探索期}：方法沿“运动维度（旋转 $\to$ 平面 $\to$ 6-DoF）、场景复杂度、辅助传感器”逐步加难，至今以\emph{模型法}为主、学习法尚未全面接管\cite{gallego2022eventsurvey}。本书把代表系统概括为几条脉络（\cref{tab:event-systems}），点名而不逐一展开：
+
+\begin{table}[H]\centering\small
+\caption{代表性事件 VO/SLAM 系统（按思路归纳，非穷举）}
+\label{tab:event-systems}
+\begin{tabular}{p{0.16\linewidth}p{0.20\linewidth}p{0.18\linewidth}p{0.34\linewidth}}
+\toprule
+系统 & 直接/间接 & 输入 & 一句话定位 \\
+\midrule
+EVO\cite{rebecq2017evo} & 直接（事件对齐）& 单目事件 & 6-DoF 事件 VO：边缘地图 + 事件-事件几何对齐，并行跟踪建图 \\
+ESVO\cite{zhou2021esvo} & 直接（时间面）& 双目事件 & 在时间面上做立体匹配 + 跟踪，首个完整双目事件 VO \\
+Ultimate-SLAM\cite{vidal2018ultimate} & 间接 + 滑窗 & 事件+帧+IMU & 三模态紧耦合、滑窗后端；高速/HDR 显著超纯帧 VIO \\
+CMax-SLAM\cite{guo2024cmaxslam} & 直接（CMax）& 单目事件 & 把对比度最大化推广为连续时间后端，精化整条旋转轨迹 \\
+学习法（DEVO 等）\cite{gallego2022eventsurvey} & 间接/端到端 & 事件（体素）& 用 ANN 替换前端或整管线，需大数据、有域偏移 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 演进遵循与帧相机相似的“先单目后双目、先纯事件后加 IMU、先窄运动后 6-DoF”的剥削式路线\cite{gallego2022eventsurvey}。事件 SLAM 还与\emph{图像重建}（从事件泊松积分恢复灰度）、\emph{光流}、\emph{运动分割}（独立运动物体 IMO）等任务深度交织，常彼此促进。
+
+\paragraph{模拟器：从 ESIM 到驾驶级与对抗式生成。}
+学习与基准都吃高质量数据，而真实事件数据因传感器新、采集难而\emph{稀缺}，故\emph{模拟器}（把常规视频/渲染图转成合成事件）至关重要。这一脉的奠基是 \textbf{ESIM}\cite{rebecq2018esim}：早期做法仅对相邻两帧\emph{阈值化}差分得到类边缘图来“假装”事件，而 ESIM \emph{紧耦合}渲染引擎与事件生成器，能依视觉信号的动态\emph{自适应}地渲染中间帧，再按事件生成模型 \cref{eq:event-gen} 的噪声化阈值（阈值 $C\sim\mathcal N(C,\sigma_C^2)$、允许正负阈值 $C^+\!\ne\! C^-$）产生事件\cite{carlone2026handbook}。其后衍生出一族各有侧重的工具（\cref{tab:event-sims}）：\textbf{CARLA} 的事件相机模块把 ESIM 扩展到\emph{自动驾驶}的多样、丰富、复杂场景（取仿真器渲染图、逐像素算亮度变化，原理同 ESIM），服务于“从事件学单目深度”等任务；\textbf{Vid2E} 把任意常规视频经自适应插帧（Super-SloMo）再过 ESIM，化解“真实事件稀缺”，但只建模\emph{理想}事件相机；\textbf{V2E} 进一步按 DVS 电路建模\emph{真实噪声}，是首个含时间噪声、漏电事件（leak events）、有限且依光强的带宽的模拟器；\textbf{EventGAN} 改走\emph{对抗式}深度学习路线——用 U-Net 编解码网络从\emph{一对}时序图像生成\emph{每极性一张}的 3D 时空体素网格（而非一串离散事件），以判别器对抗损失加循环一致损失训练，体素网格正是喂给 ANN 的常用表示；\textbf{VISTA 2.0} 把 RGB、激光、事件多种传感器同纳一个仿真器、面向自动驾驶的\emph{感知-控制}策略学习与 sim-to-real（其事件模块仿 ESIM 自适应采样，双向光流由 ANN 估计）；\textbf{V2CE} 则专攻\emph{时间戳真实性}——前述工具多在\emph{离散}时刻吐事件，与真实的连续事件存在域偏移，V2CE 用两段式（3D U-Net 先出双极性体素，再反解出每个体素内事件的精确相对时间戳）逼近连续时间戳，并能在饱和光区与理想生成模型失效的边缘处仍生成事件\cite{carlone2026handbook,gallego2022eventsurvey}。
+
+\begin{table}[H]\centering\small
+\caption{事件相机模拟器一脉（按思路归纳，非穷举）}
+\label{tab:event-sims}
+\begin{tabular}{p{0.13\linewidth}p{0.52\linewidth}p{0.22\linewidth}}
+\toprule
+模拟器 & 核心思路 & 定位/特点 \\
+\midrule
+ESIM & 渲染引擎与事件生成紧耦合、按信号动态自适应渲染；$C\sim\mathcal N(C,\sigma_C^2)$、$C^+\!\ne\! C^-$ 噪声 & 奠基，多数后续工具的内核 \\
+CARLA & 把 ESIM 扩到自动驾驶的多样复杂场景；取渲染图逐像素算亮度变化 & 驾驶级合成事件 \\
+Vid2E & 任意视频经自适应插帧（Super-SloMo）$+$ ESIM；仅理想光照模型 & 解决真实事件稀缺 \\
+V2E & 按 DVS 电路建模真实噪声：时间噪声、漏电事件、有限带宽 & 缩小 sim-to-real 间隙 \\
+EventGAN & 对抗式 U-Net 从一对图像生成每极性 3D 体素；判别器 $+$ 循环一致损失 & 学习式、输出体素表示 \\
+VISTA 2.0 & RGB/激光/事件多传感器一体；事件模块仿 ESIM，双向光流由 ANN 估 & 自动驾驶策略学习、sim-to-real \\
+V2CE & 两段式（双极性体素 $\to$ 反解时间戳）逼近\emph{连续}时间戳 & 攻时间戳真实性、降域偏移 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{数据集：从 ECDS 到多平台多模态。}
+数据集一脉以 \textbf{ECDS}\cite{mueggler2017ecds}（首个含同步事件 $+$ IMU $+$ 6-DoF 真值的数据集，位姿真值由动捕给出）为事实起点，此前的数据多限于纯旋转（3-DoF）或低自由度、真值靠 IMU 或编码器/轮速（易漂）。其后 MVSEC（首个跨平台含深度真值）、UZH-FPV（无人机竞速）、DSEC（驾驶级、Prophesee VGA 双目 $+$ 激光 $+$ RTK-GPS）、TUM-VIE（百万像素双目 $+$ 200\,Hz IMU）、EDS（分束器使 RGB 与事件\emph{共光轴}）、VECtor、EV-IMO（独立运动物体分割）、M3ED 等相继出现，覆盖手持/无人机/车/四足、单双目、室内外、低光/HDR 等场景\cite{gallego2022eventsurvey,carlone2026handbook}。
+
+\paragraph{评估度量：定位与建图误差交织。}
+理想上 SLAM 应\emph{分别}刻画定位与建图模块的质量；但实践中二者\emph{交织}——深度误差牵动位姿误差、反之亦然，且 6-DoF 定位真值远比稠密深度真值\emph{紧凑、易获取}，故\emph{深度误差常被并入轨迹误差}一并评估\cite{carlone2026handbook}。既然事件 SLAM 同样输出相机轨迹，它便\emph{继承}经典 SLAM 的评估协议（沿用 \cref{ch:vo}），核心度量见 \cref{tab:event-metrics}。
+
+\begin{table}[H]\centering\small
+\caption{事件 SLAM 评估度量（继承经典 SLAM，辅以速度/深度度量）}
+\label{tab:event-metrics}
+\begin{tabular}{p{0.22\linewidth}p{0.46\linewidth}p{0.20\linewidth}}
+\toprule
+度量 & 定义 / 计算 & 侧重 \\
+\midrule
+ATE（平移）& 对齐到固定世界系后，估计与真值\emph{位置}的欧氏距离（绝对轨迹误差）& 长期 / 全局精度 \\
+ATE（旋转）& 估计与真值\emph{姿态}在 $\SO(3)$ 上的\emph{测地距离} & 长期 / 全局精度 \\
+RPE & 相邻（邻近）时刻\emph{相对}位姿之差，分平移与旋转两部分 & 局部一致性 \\
+尺度归一化 & 位置误差再除以\emph{均场景深度}或\emph{总行程}，使其对场景/轨迹尺度不变 & 跨尺度可比 \\
+ARPE / AEE & 两\emph{平移向量}间的位置差（平均相对位姿误差 / 平均端点误差）& 平移估计 \\
+ARRE & 两\emph{旋转矩阵}间的 $\SO(3)$ 测地距离（平均相对旋转误差）& 旋转估计 \\
+线 / 角速度误差 & 平均线速度、角速度误差（位姿是速度对时间的积分）& 快速运动尤宜 \\
+深度 RMSE-to-surface & 估计 3D 点到真值地图\emph{最近表面}的欧氏距离 RMSE & 建图（首选）\\
+REL / completion & 相对深度误差 / 恢复点数（完成度）& 建图（补充）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent ATE 对齐到固定世界系、量\emph{长期/全局}漂移，RPE 量\emph{邻近}时刻的局部一致；二者平移部分取欧氏距离、旋转部分取 $\SO(3)$ 测地距离。\emph{速度误差}对事件相机尤有意义——它擅长估\emph{快速、剧烈}运动，而位姿正是线/角速度对时间的积分；社区已提供多种轨迹评估工具箱以利复现\cite{carlone2026handbook}。\emph{深度度量}仅在\emph{单独}评估建图、且数据集含深度真值时使用（含真值深度的事件数据集本就不多）：常用按若干深度截断求平均深度误差以跨尺度比较，首选\emph{估计点到真值表面最近距离}的 RMSE，辅以相对误差 REL 与恢复点数 completion。
+
+\begin{note}[前沿与开放问题]
+事件相机的终极愿景是\emph{神经形态}（neuromorphic）系统：异步事件传感器配异步（脉冲）处理器，模仿动物“永远在线”的高效感知\cite{gallego2022eventsurvey}。当前绝大多数事件 SLAM 仍跑在串行（冯·诺依曼）处理器上，未释放异步潜力。其他开放问题：高分辨率（百万像素）事件相机的海量事件率（每秒数亿）尚无算法-硬件组合能实时处理；事件直接 BA 在自然场景、6-DoF 下的高效化；以及与帧/激光/雷达等的多模态融合（\cref{ch:radar} 的全天候雷达与事件相机的高速 HDR 恰好互补）。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+
+\begin{table}[H]\centering\small
+\caption{本章常见误解与正确理解}
+\begin{tabular}{p{0.46\linewidth}p{0.46\linewidth}}
+\toprule
+误解 & 正确理解 \\
+\midrule
+事件相机就是“高帧率灰度相机” & 范式不同：异步、稀疏、采\emph{对数亮度变化}而非绝对亮度（\cref{eq:event-gen}）\\
+极性 $p$ 是像素亮度值 & $p\in\{+1,-1\}$ 是变化\emph{符号}；恢复绝对亮度须沿时间积分（边缘场重建）\\
+事件长什么样只由场景纹理决定 & 同时由纹理\emph{与运动}决定；相机不动则无事件（\cref{eq:event-brightness}）\\
+\cref{ch:vo} 的特征点法/光度误差可直接搬用 & 不能；事件无灰度，须改用事件对齐目标（CMax，\cref{eq:cmax-obj}）\\
+CMax 是某种新滤波器 & 是\emph{运动补偿}：按候选运动弯曲事件、最大化 IWE 锐利度（对比度）\\
+对比度越大运动一定越准 & 不一定；事件被折叠成线/点也使方差爆表（虚假全局最优陷阱）\\
+事件 SLAM 用离散关键帧状态即可 & 微秒级异步事件\emph{逼着}用连续时间轨迹 $\mathbf T(t)$（\cref{sec:est-steam}）\\
+事件相机配 IMU 与帧相机配 IMU 没区别 & 异步事件须\emph{异步查询}预积分，正是 GP 连续预积分（\cref{sec:imu-advanced}）的用场 \\
+单目事件相机能估绝对尺度 & 不能（\cref{thm:intro-scale}）；须靠 IMU 或双目/深度补尺度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\paragraph{符号表。}
+\begin{table}[H]\centering\small
+\caption{本章符号表}
+\begin{tabular}{ll}
+\toprule
+符号 & 含义 \\
+\midrule
+$e_k=(\mathbf x_k,t_k,p_k)$ & 事件：像素位置、时间戳、极性 \\
+$L(\mathbf x,t)=\log I$ & 对数亮度 \\
+$C$（$C^+,C^-$）& 对比度阈值（正/负） \\
+$p_k\in\{+1,-1\}$ & 极性（亮度增/减） \\
+$\mathbf W(\mathbf x_k,t_k;\boldsymbol\theta)$ & 弯曲映射（按运动把事件搬到参考时刻） \\
+$H(\mathbf p;\boldsymbol\theta)$ & 运动补偿事件图 IWE \\
+$\boldsymbol\theta$ & 运动参数（角速度 $\boldsymbol\omega$ / 像速度 $\mathbf v$ / 轨迹控制点） \\
+$f(\boldsymbol\theta)=\mathrm{Var}(H)$ & 对比度/聚焦目标 \\
+$\mathbf T(t),\boldsymbol\varpi$ & 连续时间位姿 / 广义速度（接 \cref{sec:est-steam}） \\
+$\pi,\mathbf K$ & 相机投影 / 内参（接 \cref{ch:camera}） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{公式速查表。}
+\begin{table}[H]\centering\small
+\caption{本章核心公式速查}
+\begin{tabular}{ll}
+\toprule
+名称 & 公式 \\
+\midrule
+事件生成模型 & \cref{eq:event-gen}（$\Delta L=p\,C$）\\
+事件四元组 & \cref{eq:event-tuple} \\
+亮度恒定 $\to$ 事件即运动边缘 & \cref{eq:event-brightness} \\
+弯曲映射 & \cref{eq:cmax-warp}（旋转 \cref{eq:cmax-rot-warp}、光流 \cref{eq:cmax-flow-warp}）\\
+运动补偿事件图 IWE & \cref{eq:cmax-iwe} \\
+对比度（方差）目标 & \cref{eq:cmax-var} \\
+对比度最大化 & \cref{eq:cmax-obj} \\
+CMax 雅可比结构 & \cref{eq:cmax-grad} \\
+连续时间查询接口 & \cref{eq:steam-Tquery}（接 STEAM）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{知识点总表。}
+\begin{table}[H]\centering\small
+\caption{本章知识点总表}
+\begin{tabularx}{\linewidth}{p{0.04\linewidth}LLcc}
+\toprule
+\# & 知识点 & 核心要点 & 难度 & 脉络层 \\
+\midrule
+1 & 事件相机 vs 帧相机 & 异步/稀疏/HDR/低延迟；帧间失明 & $\bigstar$ & 骨干 \\
+2 & 事件生成模型 & $\Delta L=p\,C$；运动依赖、即边缘 & $\bigstar\bigstar$ & 骨干 \\
+3 & 事件表示 & 帧/SAE/体素/IWE 的得失 & $\bigstar\bigstar$ & 骨干 \\
+4 & 方法四轴分类 & 逐事件/批、模型/学习、间接/直接、几何/光度 & $\bigstar\bigstar$ & 次优 \\
+5 & 对比度最大化 CMax & 弯曲 + IWE + 方差最大；雅可比同直接法 & $\bigstar\bigstar\bigstar$ & 骨干 \\
+6 & CMax 崩塌陷阱 & 折叠成线/点的虚假全局最优 & $\bigstar\bigstar\bigstar$ & 次优 \\
+7 & 接连续时间轨迹 & 事件是 STEAM 杀手级应用；三套时间戳 & $\bigstar\bigstar\bigstar$ & 前沿 \\
+8 & 事件-惯性融合 & GP 连续预积分异步查询；三线汇流 & $\bigstar\bigstar\bigstar\bigstar$ & 前沿 \\
+9 & 系统与数据集 & EVO/ESVO/USLAM/CMax-SLAM；ESIM/ECDS & $\bigstar$ & 选读 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{Gallego 等，Event-based Vision: A Survey}（TPAMI 2022）\cite{gallego2022eventsurvey}——事件相机原理、表示、任务与系统的权威综述；本章综述部分的主要对照。
+  \item \textbf{Gallego 等，Contrast Maximization 统一框架}（CVPR 2018）\cite{gallego2018cmax}——对比度最大化的奠基与统一表述（运动补偿、聚焦度量族）；本章 \cref{sec:event-cmax} 的理论主线。
+  \item \textbf{SLAM Handbook 第 10 章}（Event-based SLAM）\cite{carlone2026handbook}——事件 SLAM 的现代综述：前端/后端分类、系统与数据集版图。
+  \item \textbf{EVO}\cite{rebecq2017evo} / \textbf{ESVO}\cite{zhou2021esvo} / \textbf{Ultimate-SLAM}\cite{vidal2018ultimate}——单目直接、双目直接、事件-帧-惯性紧耦合三个代表系统。
+  \item \textbf{CMax-SLAM}\cite{guo2024cmaxslam}——把对比度最大化做成连续时间后端的代表，直接呼应 \cref{sec:event-backend} 与 \cref{sec:est-steam}。
+  \item \textbf{ESIM 模拟器}\cite{rebecq2018esim} / \textbf{ECDS 数据集}\cite{mueggler2017ecds}——事件数据生成与基准的事实起点。
+\end{itemize}
+
+\section*{与前后章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+章节 & 与本章的关系 & 关键接口 \\
+\midrule
+\cref{ch:vo}（视觉里程计）& 本章是其“异步孪生”：CMax $\leftrightarrow$ 直接法 & 光度误差 \cref{eq:vo-direct-J} $\leftrightarrow$ 对比度 \cref{eq:cmax-obj} \\
+\cref{sec:est-steam}（STEAM 连续时间）& 事件流逼着用连续时间轨迹 & 任意时刻查询 \cref{eq:steam-Tquery}；三套时间戳解耦 \\
+\cref{sec:imu-advanced}（GP 连续预积分）& 事件-惯性须异步查询预积分 & \cref{ins:beyond-euler} 伏笔在本章兑现 \\
+\cref{ch:radar}（雷达 SLAM）& 同属新型传感器章群、特性互补 & 雷达全天候 $+$ 事件高速 HDR；多模态融合 \\
+\cref{ch:leg}（腿式里程计）& 同属新型传感器章群、共享估计骨架 & 复用因子图与（连续）预积分 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{习题}
+\begin{practice}
+\begin{enumerate}
+  \item （概念）从事件生成模型 \cref{eq:event-gen} 出发，解释为什么一台对着\emph{静止}高纹理场景\emph{完全不动}的事件相机几乎不输出事件；再解释若它\emph{原地纯旋转}，哪些边缘触发最密、哪些几乎不触发（用 \cref{eq:event-brightness} 的孔径效应作答）。
+  \item （推导）写出平面光流特例（\cref{eq:cmax-flow-warp}）下 CMax 目标 \cref{eq:cmax-var} 对像速度 $\mathbf v$ 的完整梯度 \cref{eq:cmax-grad}，指出其中哪一项与 \cref{sec:vo-direct} 直接法雅可比 \cref{eq:vo-direct-J} 结构对应。
+  \item （推导，连接 \cref{ch:lie}）对纯旋转特例 \cref{eq:cmax-rot-warp}，用右扰动 $\mathbf R\,\mathrm{Exp}(\delta\boldsymbol\phi)$ 推出 $\partial\mathbf x_k'/\partial\boldsymbol\omega$，核对 \cref{thm:cmax-jac} 给出的形式（提示：先对 $\mathbf R^\top\mathbf f_k$ 用右扰动求导，再串投影雅可比 $\partial\pi/\partial\mathbf f$）。
+  \item （陷阱）设计一个能触发“崩塌全局最优”的玩具场景（几条平行边缘 + 某个病态运动），说明为何 \cref{eq:cmax-var} 的方差在此达到虚假极大；提出至少两种缓解策略并说明各自原理。
+  \item （跨章综合）把事件 CMax 对齐因子与 \cref{eq:steam-error} 的 WNOA 运动先验因子拼进 \cref{eq:steam-A} 的批量 MAP：写出待估状态、说明事件因子如何通过 \cref{eq:steam-interp} 的插值“挂”到相邻控制点上，并解释为何主解规模可远小于事件数。
+  \item （跨章综合）对照 \cref{ch:vio} 的紧耦合 VIO 与本章的事件-惯性里程计：列出二者的因子种类，指出唯一实质差别（视觉因子的形式），并说明为何 IMU 侧要用 \cref{sec:imu-advanced} 的连续/GP 预积分而非标准欧拉预积分。
+  \item （选读，连接 \cref{ch:radar}）事件相机与毫米波雷达都“把某个被帧相机/激光当作锦上添花的维度变成主心骨”。各自是哪个维度？两者在恶劣条件（逆光出隧道、雨雪烟雾、高速运动）下如何互补？设想一个事件-雷达多模态里程计的因子图骨架。
+\end{enumerate}
+\end{practice}

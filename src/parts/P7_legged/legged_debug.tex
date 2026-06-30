@@ -1,0 +1,565 @@
+\chapter{足式运动控制的工程调试方法论}
+\label{ch:legged-debug}
+
+% ════════════════════════════════════════════════════════════════
+%  Ch C（横切资产·调试方法论）：把两份源「用户最看重、最可迁移」的失败史
+%  蒸馏为可复用方法论。完整论证唯一落本章；前两章（感知 ch:legged-perc /
+%  双足 ch:legged-biped）只「点名预告 + \cref 回本章」，正文不复述失败叙事。
+%  铁律：理论重叠处 \cref 回更深章（WBC=ch:quad_wbc、质心/角动量=sec:srbd、
+%  接触估计=sec:qe-contact、ESKF=ch:eskf 等），本章只讲「方法论」——
+%  怎么诊断、怎么证伪、怎么避免归因谬误、怎么算统计功效。
+%  注意：兄弟章 label 用连字符（ch:legged-perc / ch:legged-biped），勿写下划线。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。它们正是本章要解决的——若已能流畅作答，可只速读方法论速查卡；若卡住，本章为你逐条建立。
+\begin{enumerate}
+  \item 你的全身控制（WBC）二次规划（QP）\emph{每一拍}都报告“求解成功”，模型预测控制（MPC）的可行性指标也一切正常，机器人却在几秒内缓慢倒下。三层标量指标都不报警，你还能靠什么把故障抓出来？
+  \item 一个反馈增益被默认设成 $0$，导致点足双足始终站不住。为什么有人花了上百轮调试、却始终把瓶颈归到“落脚点/步时/接触力可行性”这些\emph{上游}模块，而非这个执行层的零增益？这种系统性误判有名字吗？
+  \item 你怀疑“躯干转动惯量太大”导致机器人横滚翻倒，于是把惯量加倍做对照实验——结果翻得\emph{更狠}。这个实验证伪了什么、又没有证伪什么？“放大器（amplifier）”和“闸门（gate）”有何区别？
+  \item 你用 $N=4$ 次试验，得到“配置 A 通过率 $1/4$、配置 B 通过率 $0/4$”，于是宣布 B 更差。这个结论在统计上有意义吗？要区分 $30\%$ 与 $10\%$ 的通过率，到底需要多少次试验？
+  \item 你在 MPC 里注册了一条硬不等式约束 $F_z\ge 50\,\mathrm{N}$，求解器报告“收敛”。这是否等于“闭环里这条约束被满足了”？求解器的哪个字段才是唯一可信的证据？
+  \item “力矩饱和”是不是就意味着“电机力矩不够”？如果实际只需 $14\,\mathrm{N\,m}$、限幅却有 $40\,\mathrm{N\,m}$，为什么还会撞满限幅？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{执行}\emph{三层可行性诊断}——当前拍 WBC QP 是否解出、MPC 解本身是否可行、预测窗口是否“计划里就要摔”——并识别三层标量都不报警的\emph{最隐蔽失败模式}（\cref{sec:ld-three-layer}）；
+  \item \textbf{诊断并避免}\emph{层级归因谬误}：把根因在执行层的故障误判为规划层瓶颈，并掌握“规划 vs 执行”二分这一\emph{最强单一定位杠杆}（\cref{sec:ld-attribution}）；
+  \item \textbf{复盘}一条教科书级的\emph{证伪链}（感知侧 over-launch 弹射根因侦破），理解“错误的转弯比正确的结论更有教学价值”，并避开“升权重是错方向”这类归一化代价的调参陷阱（\cref{sec:ld-overlaunch}）；
+  \item \textbf{应用}\emph{统计功效铁律}：知道小样本（$N\le 4$）为何无法区分相近通过率，并区分 \emph{setup}（实验设置）与 \emph{result}（实验结论）（\cref{sec:ld-power}）；
+  \item \textbf{内化}一套\emph{证伪驱动方法论}的横切教训（三振出局、代理量不等于真值、共模假收敛、区间夹逼、悬崖判别等），把“纪律即生产力”落到日常调试（\cref{sec:ld-falsify}）；
+  \item \textbf{排查}一批\emph{静默坑与工程基建陷阱}（摩擦系数安全余量、自动微分缓存陈旧、通信协议不匹配、僵尸进程压低通过率、状态估计的平地假设等），它们既不报错、又系统性污染结论（\cref{sec:ld-silent}）；
+  \item \textbf{使用}本章末的方法论速查卡，对任意 MPC/WBC/优化控制场景做一次 bring-up 体检（\cref{sec:ld-checklist}）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章\emph{不引入新控制理论}，而是把前面感知章（\cref{ch:legged-perc}）与双足点足章（\cref{ch:legged-biped}）里\emph{点名预告}过的失败根因，在此做\emph{唯一的完整展开}，并蒸馏成可迁移到任何优化控制栈的调试方法论。串联骨架是一句反复出现的论断：\textbf{标量指标“一切正常”不等于系统健康；要靠多维证据 + 重复方差 + 主动证伪才能定位真根因}。结构如下：
+
+\begin{center}
+\begin{forest} navtreeLR
+[{足式控制调试方法论\\（证伪驱动的根因复盘）}
+  [{三层可行性诊断\\WBC/MPC/预测窗口}
+    [{最隐蔽失败模式}] ]
+  [{归因谬误\\规划 vs 执行二分}
+    [{最强定位杠杆}] ]
+  [{证伪链案例\\over-launch 弹射}
+    [{升权重=错方向}] ]
+  [{统计功效\\setup!=result}
+    [{$N{\le}4$ 无效}] ]
+  [{方法论全集\\+ 静默坑}
+    [{纪律即生产力}] ]
+]
+\end{forest}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:ld-three-layer,sec:ld-attribution} 是本章方法论的两根支柱（怎么看可行性、怎么不被假象误导），任何读者必看；\cref{sec:ld-overlaunch} 是一个完整证伪链的案例研究，读它学“如何把貌似合理的假设逐个证伪”；\cref{sec:ld-power} 给出统计学根源，解释“为什么反复翻车”；\cref{sec:ld-falsify,sec:ld-silent} 是横切教训与静默坑合集，调试时回查；\cref{sec:ld-checklist} 是速查卡，bring-up 时对照。
+
+\subsection*{前置知识桥接}
+本章把前两章\emph{有意只点名}的失败根因当作素材，对其做诊断学剖析，故强烈建议先读完它们：
+\begin{itemize}
+  \item \cref{ch:legged-biped}（从四足到双足点足）给出了点足“无静稳、横向平衡只能靠落脚”的物理底座、拆分 base 任务的正确形式、以及那条“base 反馈增益被置零”根因的\emph{现象}；本章 \cref{sec:ld-attribution} 给出它\emph{为何上百轮难以定位}的诊断学解释；
+  \item \cref{ch:legged-perc}（感知四足运动控制）给出了 over-launch 弹射、关节阻尼、$\mathrm{d}z^2$ 选区等缺陷的\emph{机理}；本章 \cref{sec:ld-overlaunch} 给出它们\emph{被逐个证伪}的完整调研弧；
+  \item \cref{ch:quad_wbc}（全身控制 WBC）的浮动基子任务、零空间投影与松弛 QP（\cref{sec:qw-floating,sec:qw-relax}）是“三层诊断”里第一层的对象；本章不复述其推导，只把它当\emph{诊断目标}；
+  \item \cref{ch:quad_mpc}（单刚体凸 MPC）的最优控制问题化与凸化（\cref{sec:qp,sec:srbd,sec:convexify}）是第二、三层诊断的对象；
+  \item \cref{ch:quad_est}（足式状态估计）的接触检测与卡尔曼滤波（\cref{sec:qe-contact,sec:qe-kf}）是 \cref{sec:ld-silent} 中“gait-clock 接触”“平地假设 base-z”两条静默坑的理论入口。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全证伪链与统计推导） & 3--4 小时 & 正陷在“反复翻车、找不到根因”的调试泥潭 \\
+速读（只读三层诊断 + 规划/执行二分） & 1 小时 & 想要一套可立即上手的诊断流程 \\
+速查（只看速查卡与避坑清单） & 15 分钟 & bring-up 新机器人/新栈时回来对照 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+本章\emph{不引入新数学符号}：少量出现的物理量沿用其所属章约定——倒立摆自然频率 $\omega_0=\sqrt{g/h}$（\cref{ch:legged-biped}）、质心角动量 $\boldsymbol H_G$ 及其变化率 $\dot{\boldsymbol H}_G$（质心动力学见 \cref{sec:srbd}）、摩擦系数 $\mu$、接触数 $N$。
+代码标识符、配置字段名、类名、话题名一律用等宽体（如 \texttt{inequalityConstraintsSSE}、\texttt{frictionCoefficient}），不进 math mode。
+本章谈“失败”时严格区分两个词：\emph{现象}（symptom，外在可观测的异常）与\emph{根因}（root cause，去掉它故障即消失的那一项）——全章的核心就是教你不要把前者当后者。
+源项目里以 \texttt{phase}/\allowbreak\texttt{P3-NNN} 标号的过程编号在此一律省略，只保留可迁移的结论。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{三层可行性诊断：故障到底出在哪一层}
+\label{sec:ld-three-layer}
+
+足式控制是一条级联栈：MPC（质心动力学，预测约 $1\,\mathrm{s}$，低频）在上，WBC（全刚体，把质心级最优轨迹翻译成关节力矩，高频）在下，再下是电机的混合控制 PD（\cref{ch:quad_prac} 的 \cref{eq:qp-hybrid}）。当机器人摔倒，第一个、也是最容易答错的问题是：\textbf{故障到底出在哪一层？} 本节给出一套\emph{分层、分对象}的可行性诊断流程，它把“摔了”这个笼统现象，拆成三个互不重叠、各有客观标量证据的检查点。
+
+\subsection{为什么需要分层诊断：可行集不是一个集合}
+\label{subsec:ld-why-layer}
+
+朴素的想法是“看求解器报不报错”。但级联栈里至少有\emph{两个不同的优化器}（MPC 的 SQP、WBC 的 QP），它们\emph{各有各的可行集}，而且\emph{度量还不一致}——这是新手最容易栽的概念坑。
+
+\begin{insight}[金字塔 vs 圆锥：两层 friction-cone 的可行集不是同一个集合]\label{ins:ld-pyramid-cone}
+摩擦约束在 MPC 与 WBC 两层用了\emph{不同的几何近似}：MPC 侧通常是\emph{圆锥}软约束（如松弛障碍 $\mu(F_z+F_{\mathrm{grip}})-\sqrt{F_x^2+F_y^2+\epsilon}\ge 0$），WBC 侧是\emph{线性金字塔}（每脚若干条线性不等式）。\textbf{这两个集合并不相等}（金字塔内接于圆锥）。后果是：用圆锥公式去\emph{度量}金字塔约束的残差，会算出一个根本不存在的“违反量”——而 WBC 其实严格满足了自己的金字塔约束（精确金字塔残差恒 $\approx 0$）。诊断铁律：\textbf{MPC 侧用圆锥度量、WBC 侧用金字塔残差，两层分开看，绝不混用}。摩擦锥的凸化与金字塔近似见 \cref{sec:convexify}。
+\end{insight}
+
+\begin{insight}[“收敛”不含不等式：唯一可信的硬约束证据]\label{ins:ld-gmax}
+更隐蔽的是 SQP 的“收敛”判据本身。许多实现的 \texttt{totalConstraintViolation} 只统计 $\sqrt{\texttt{dynamicsSSE}+\texttt{equalitySSE}}$，\textbf{不含不等式那一项}。于是 \texttt{sqp.g\_max} 达标、求解器宣布“收敛”，\emph{并不等于}你注册的那条硬不等式（如 $F_z\ge F_{\mathrm{floor}}$）被当前策略满足。判断硬不等式是否真被满足，\textbf{唯一}的求解器级证据是 \texttt{inequalityConstraintsSSE}（不等式残差平方和）。这条直接回答了前置自测第 5 题：注册了约束、求解器“收敛”，仍可能被违反——必须去查那个专门的不等式残差字段。这也是“注册硬约束 $\ne$ 闭环满足”的根。
+\end{insight}
+
+\subsection{三层诊断流程}
+\label{subsec:ld-flow}
+
+把上面的教训系统化，得到一套\emph{自下而上}、逐层加证据的诊断流程。它不止针对“力可行性”，而是对\emph{任何}级联 MPC+WBC 故障都适用。
+
+\begin{insight}[三层可行性诊断（本章方法论支柱）]\label{ins:ld-three-layer}
+按下列三层、各取\emph{专属}的客观标量，逐层定位：
+\begin{description}
+  \item[第一层 — 此刻解出来了吗（WBC QP）] 查当前拍 WBC QP 的 \texttt{lastSolveSucceeded()}/返回码。它回答“给定 MPC 此刻给的参考，全身 QP 能不能解出一组合法的关节力矩”。失败 $\Rightarrow$ 故障在 WBC 当前拍（约束冲突/不可行/数值崩）。
+  \item[第二层 — MPC 自己的解可行吗] 查 MPC 的 \texttt{getPerformanceIndices()} 各字段：\texttt{cost}、\texttt{merit}、\texttt{dynamicsViolationSSE}、\texttt{equalityConstraintsSSE}、\texttt{inequalityConstraintsSSE}、\texttt{equalityLagrangian}、\texttt{inequalityLagrangian}（另有 \texttt{dualFeasibilitiesSSE}）。它回答“MPC 给出的这条最优轨迹，在它自己的模型里自洽吗”。配合保留“恶化前一拍”（\texttt{*\_pre\_failure}）的快照，可定位\emph{恶化起点}。
+  \item[第三层 — 计划里就要摔吗（预测窗口）] 用 \texttt{evaluatePolicy(}$t+0.3$, $t+0.6$\texttt{)} 把当前策略向未来\emph{外推}，看 pitch/height 等是否\emph{单调发散}。它回答“即便此刻每拍都解成功，这条计划本身是不是在预测窗口内就把自己带翻了”。
+\end{description}
+三层的关键差别在于\emph{对象}和\emph{时间}：第一层看“当前拍的执行器”，第二层看“当前解的自洽性”，第三层看“未来的计划走向”。
+\end{insight}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=4mm and 12mm,
+  lay/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, minimum height=1.05cm, text width=3.0cm},
+  q/.style={font=\scriptsize, gray!60!black, align=center, text width=3.2cm},
+  ln/.style={->, thick, gray!55!black}]
+  \node[lay, fill=second!10, draw=second!60!black] (l1) {\textbf{第一层}\\WBC QP\\\texttt{lastSolveSucceeded}};
+  \node[lay, right=of l1, fill=main!10, draw=main!60!black] (l2) {\textbf{第二层}\\MPC 解\\六字段 PerformanceIndex};
+  \node[lay, right=of l2, fill=third!10, draw=third!60!black] (l3) {\textbf{第三层}\\预测窗口\\\texttt{evaluatePolicy}$(t{+}0.3)$};
+  \node[q, below=2mm of l1] {此刻解出来了吗\\（执行器）};
+  \node[q, below=2mm of l2] {这条解自洽吗\\（当前解）};
+  \node[q, below=2mm of l3] {计划里就要摔吗\\（未来走向）};
+  \draw[ln] (l1)--(l2);
+  \draw[ln] (l2)--(l3);
+\end{tikzpicture}
+\caption{三层可行性诊断（\cref{ins:ld-three-layer}）：自下而上、对象与时间各异的三个检查点。三层标量\emph{全部正常}却仍缓慢倒下，正是最隐蔽的失败模式（\cref{ins:ld-stealth}）。}
+\label{fig:ld-three-layer}
+\end{figure}
+
+\subsection{最隐蔽的失败模式：三层都不报警}
+\label{subsec:ld-stealth}
+
+三层诊断的真正价值，不在于抓“某层报错”的显性故障，而在于让你\emph{意识到还有一类故障三层都抓不到}。
+
+\begin{insight}[最隐蔽失败模式——标量不报警的缓慢发散]\label{ins:ld-stealth}
+设想这样一条链：WBC \emph{每一拍}都解成功（第一层过）；MPC 用\emph{质心模型}，它\emph{根本不知道}下游 WBC 把姿态反馈增益悄悄调弱了，于是 MPC 的 PerformanceIndex 也不爆（第二层过）；而 base 姿态反馈不足导致系统\emph{缓慢}倒下——三层标量指标\emph{可能全部正常}。此时\textbf{唯一}能抓住它的，是\emph{多维}时间序列指标（roll/pitch 的缓慢漂移）\emph{加上}重复试验的方差。这正是“某个反馈增益被悄悄置零、为何要上百轮才定位”的诊断学解释：不是没人看指标，而是它\emph{设计上}就不进任何单一标量的报警阈值。\textbf{推论}：调试一个\emph{级联}系统时，永远不要只信“求解成功/收敛”这类布尔/标量信号；把关键物理量（姿态、高度、接触力）作为\emph{多维时序}持续记录，并用 $\ge 2$ 次重复看方差。
+\end{insight}
+
+\begin{pitfall}[把“求解器不报错”当“系统健康”]
+“QP 每拍都 solved、MPC 也收敛，所以控制没问题”——这是级联栈调试里最贵的错觉。求解器只保证“在它\emph{看见}的那个问题里，解是可行/最优的”；它\emph{看不见}的东西（下游被调弱的增益、模型未建的关节摩擦、参考与现实的偏移）一概不会让它报错。布尔/标量绿灯只是\emph{必要}条件，远非\emph{充分}。把多维时序与重复方差补上，才能覆盖 \cref{ins:ld-stealth} 这类隐蔽模式。
+\end{pitfall}
+
+\begin{table}[H]\centering\small
+\caption{三层可行性诊断速查（\cref{ins:ld-three-layer}）}
+\begin{tabular}{p{0.16\textwidth} p{0.24\textwidth} p{0.26\textwidth} p{0.22\textwidth}}
+\toprule
+层 & 问题 & 客观证据 & 报警含义 \\
+\midrule
+(1) WBC QP & 此刻解出来了吗 & \texttt{lastSolveSucceeded()}/返回码 & 当前拍执行层不可行 \\
+(2) MPC 解 & 这条解自洽吗 & \texttt{getPerformanceIndices()} 各字段（尤其 \texttt{inequalityConstraintsSSE}）& 最优解本身违约/恶化 \\
+(3) 预测窗口 & 计划里就要摔吗 & \texttt{evaluatePolicy($t{+}\Delta$)} 看单调发散 & 规划本身把自己带翻 \\
+\midrule
+\multicolumn{4}{l}{\textbf{三层全过仍倒} $\Rightarrow$ 最隐蔽模式：多维时序（roll/pitch 漂移）$+$ 重复方差才抓得到（\cref{ins:ld-stealth}）}\\
+\bottomrule
+\end{tabular}
+\label{tab:ld-three-layer}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section{层级归因谬误与“规划 vs 执行”二分}
+\label{sec:ld-attribution}
+
+\cref{sec:ld-three-layer} 给了“看哪些指标”，本节回答一个更难的问题：\textbf{当指标不足以直接定位时，人的注意力会系统性地飘向错误的层}。这不是技术问题，而是认知问题；但它对调试效率的影响，远超任何单个算法。本节以“点足双足 base 反馈增益被置零”这一根因（其现象与正解见 \cref{ch:legged-biped}）为完整案例，剖析为何它\emph{上百轮}难以定位，并给出最强的破解杠杆。
+
+\subsection{病根与四种归因谬误}
+\label{subsec:ld-fallacy}
+
+\begin{insight}[层级归因谬误：根因在执行层、注意力却锁在规划层]\label{ins:ld-attribution}
+该案例的病根，是一句可一句话说清的事实：根因在 WBC \emph{执行层}（base 姿态/高度反馈增益恒为 $0$），调试者却\emph{上百轮}坚信瓶颈在 OCS2 \emph{规划层}（落脚点/步时/接触力可行性）。四足靠四脚静稳的支撑多边形“接得住”，纯前馈 base 任务也能站；点足是主动不稳的倒立摆，把同一份“零增益”原样移植过去，等于掐断了它\emph{唯一}的姿态反馈通道（点足无静稳的物理见 \cref{ch:legged-biped} 与 \cref{ins:qa-floating-base}）。围绕这一根因，注意力被四种相互强化的谬误持续带偏：
+\begin{description}
+  \item[层级归因谬误] 把战场长期压在规划层（落脚/步时/力可行性），而真凶在执行层。这是总病根。
+  \item[四足直觉误导] “base 反馈可选”这一判断对四足成立（多边形兜底）、对点足致命——把一个\emph{条件成立}的经验当成\emph{普适}真理。
+  \item[症状掩盖] 横滚失稳、$40\,\mathrm{N\,m}$ 力矩饱和、期望接触力不可行被当成\emph{三个独立问题}逐个调，真相是\emph{同一根因}的三种表象；更隐蔽的是“踏步的横滚摔”掩盖了“静立的俯仰振荡”，必须隔离静立才暴露。
+  \item[创可贴陷阱] 在不稳的地基上越精雕落脚补偿层，越远离根因——每一轮都在“坏掉的 base 任务”之上优化落脚，注定“单次偶尔接近基线、重复必不复现”。
+\end{description}
+\end{insight}
+
+\begin{insight}[质疑一切被默认置零的反馈与约束]\label{ins:ld-zero-suspect}
+从 \cref{ins:ld-attribution} 可提炼一条\emph{先验怀疑}规则，对任何移植/bring-up 都适用：\texttt{kp=kd=0}、\texttt{enabled=false}、\texttt{weight}$\approx 0$ \textbf{不是中性默认，而是高优先级嫌疑}。逐一追问“它为什么是 $0$？我面对的这个对象（点足倒立摆）\emph{承受得起}它为 $0$ 吗？”尤其要警惕：那些零不仅可能是“缺失”，还可能\emph{藏着错误}——本案中单独打开角反馈反而让站立\emph{更糟}（那是个独立的坐标系 bug，见 \cref{ch:legged-biped} 的拆分 base 任务），结果被误读成“反馈有害”，反而把“保持零”钉得更死。\textbf{零增益的‘默认’往往是被人写死的根因，不是无害的初值}。
+\end{insight}
+
+\subsection{最强单一定位杠杆：规划 vs 执行二分}
+\label{subsec:ld-lever}
+
+如果只能给调试者\emph{一个}动作来省下那上百轮，是下面这个。
+
+\begin{insight}[规划 vs 执行二分——最强单一定位杠杆]\label{ins:ld-plan-exec}
+\textbf{每一拍，同时打印“控制器实测量”与“MPC 对未来的预测量”，并把两者对照}。一旦做了这个对照，本案立刻真相大白：MPC 的规划\emph{全程是对的}——它给出完美的站立解（约 $48\,\mathrm{N}$/脚）、预测 pitch$\to 0$；而\emph{实测}却在 $50\,\mathrm{ms}$ 内 pitch 从 $0.004$ 冲到 $-0.25$。\textbf{MPC 预测收敛、实测发散}这一刀，立刻把战场从规划层切到执行层：问题 $100\%$ 在 WBC，不必再碰上游任何一个参数。其逻辑是：MPC 看不见执行层的缺陷（它只在质心模型里规划），所以“MPC 自认为会发生的”与“实际发生的”之间的\emph{背离}，恰好\emph{定位}了缺陷所在的层——背离从哪里开始，缺陷就在哪里。这是把“规划”和“执行”做\emph{二分搜索}的思想。
+\end{insight}
+
+\begin{insight}[可复算基线：用倒立摆自然频率量化“主动推反”]\label{ins:ld-baseline-omega}
+“实测发散”还能被\emph{量化}成铁证。倒立摆（线性化，LIP）的自然频率 $\omega_0=\sqrt{g/h}$；点足质心高 $h\approx 0.427\,\mathrm{m}$ 时 $\omega_0\approx 4.67\text{--}4.8\,\mathrm{rad/s}$，对应“自然倒下”的时间尺度约 $0.9\,\mathrm{s}$（LIP 推导见 \cref{ch:legged-biped}）。而实测在 $50\,\mathrm{ms}$ 内 pitch $0.004\to -0.25$，比自然发散\emph{快约 $17$ 倍}。这个倍数是定性判断之外的\emph{硬数字}：它说明系统\emph{不是}“没接住、自然下倒”，而是控制器在\emph{主动把它往反方向推}——只有执行层算错符号/缺反馈才可能比无控自由发散还快。\textbf{方法论}：先算出对象“无控自然失稳”的时间尺度作基线，再拿实测发散速度去比；快于基线 $\Rightarrow$ 控制器在主动作恶，而非被动失守。
+\end{insight}
+
+\begin{pitfall}[“力矩饱和”不等于“力矩不足”]\label{pit:ld-saturation}
+所有失败试验都撞 $40\,\mathrm{N\,m}$ 力矩饱和，极易误判成“电机力矩权限不够、欠驱动”。但外部审计算出：单支撑横向实际只需约 $14\,\mathrm{N\,m}$，而限幅 $40\,\mathrm{N\,m}$ 是 $2.8\times$ 余量（总质量约 $9.8\,\mathrm{kg}$）。力矩物理上\emph{绰绰有余}。所以饱和不是“力矩不够”，而是被失控倒立摆\emph{逼到}饱和的\emph{后果}——是症状不是根因（回答前置自测第 6 题）。这个 $2.8\times$ 数字，正是把“根因纯在反馈缺失、与力无关”这一判断砸实的证据。诊断律：\textbf{看到执行器饱和，先问“它是被谁逼到饱和的”，再决定是不是真的需要更大权限}。
+\end{pitfall}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=6mm and 16mm,
+  b/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, minimum height=1.0cm, text width=3.0cm},
+  d/.style={draw, diamond, aspect=2, align=center, font=\scriptsize, inner sep=2pt, fill=main!8, draw=main!60!black, text width=2.6cm},
+  ln/.style={->, thick, gray!55!black, font=\scriptsize}]
+  \node[d] (cmp) {每拍对照\\预测 vs 实测};
+  \node[b, above right=of cmp, fill=third!10, draw=third!60!black] (plan) {MPC 预测也发散\\$\Rightarrow$ 规划层\\（落脚/步时/力）};
+  \node[b, below right=of cmp, fill=second!10, draw=second!60!black] (exec) {预测收敛、实测发散\\$\Rightarrow$ 执行层\\（WBC 增益/符号）};
+  \draw[ln] (cmp.east) to[out=30,in=180] node[above]{两者皆发散} (plan.west);
+  \draw[ln] (cmp.east) to[out=-30,in=180] node[below]{背离} (exec.west);
+\end{tikzpicture}
+\caption{规划 vs 执行二分（\cref{ins:ld-plan-exec}）：用“预测量与实测量是否背离”一刀把故障层定死。背离从哪开始，缺陷就在哪——比盲扫上游参数省上百轮。}
+\label{fig:ld-plan-exec}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{证伪链案例研究：over-launch 弹射根因侦破}
+\label{sec:ld-overlaunch}
+
+本节是一个\emph{完整}的证伪链案例——感知四足在台阶处“弹射（over-launch）”的根因侦破。它的教学价值不在最终结论，而在\emph{过程}：一长串貌似合理的假设被逐个提出、又被实验逐个证伪。正如源项目所言，“错误的转弯比正确的结论更有教学价值”。该现象的机理与感知栈背景见 \cref{ch:legged-perc}；本节只讲“怎么证伪”。
+
+\subsection{现象与关键线索}
+\label{subsec:ld-ol-symptom}
+
+现象：感知四足在跨 $0.16\,\mathrm{m}$ 台阶时，机体从 $0.30\,\mathrm{m}$ \emph{竖直冲}到 $z=0.48\text{--}0.68\,\mathrm{m}$，并前冲、随机方向、翻横滚 $\pm 180^\circ$。两条关键线索：\textbf{QP 干净}（物理自洽，弹射是 MPC \emph{主动}给的力，不是求解崩）；\textbf{方向随机}（对称的前进指令却随机爆向不同方向——这个“随机性”是后面区分“闸门”与“放大器”的钥匙）。
+
+\subsection{逐个证伪：十三行假设表}
+\label{subsec:ld-ol-table}
+
+下表把被提出又被证伪的假设逐条列出。读它的正确方式不是记结论，而是体会\emph{每一条是如何被一个具体实验杀死的}。
+
+\begin{table}[H]\centering\small
+\caption{over-launch 证伪表（逐个提出又被实验证伪；$\times$=证伪，$\triangle$=部分/有条件，源见 \cref{ch:legged-perc}）}
+\begin{tabular}{p{0.02\textwidth} p{0.30\textwidth} p{0.30\textwidth} p{0.20\textwidth}}
+\toprule
+\# & 假设 & 怎么测 & 结果 \\
+\midrule
+1 & 感知覆盖/落脚点冻结/TF & 时序探针 & $\times$（崩/冻是翻的下游）\\
+2 & 摆动高度/速度激进 & 查配置/扫参 & $\times$（已与 a1 同参）\\
+3 & $2.27\times$ 躯干横滚惯量 & 换 a1 惯量 / 极端减质量 & $\times\times$ \textbf{更轻翻更狠}=放大器非闸门 \\
+4 & 静态质心高/支撑窄 & FK 第一性原理复算 & $\times$（裕度反而 $2\times$ a1）\\
+5 & 关节阻尼/摩擦失配 & 置零对齐 a1 & $\triangle$ 对台阶仍翻、对平地是真修 \\
+6 & 自动微分缓存陈旧 & 删缓存重编 & $\triangle$ 真坑但非弹射根因（红鲱鱼）\\
+7 & WBC 用 gait-clock 非实测接触 & 加实测接触门 & $\triangle$ 缺失属实但补丁非唯一触发 \\
+8 & MPC 力权 $Q$ 扫描 & 扫权重 & $\times$（更大仍翻）\\
+9 & base-z/vcom-z 参考不一致 & 速度半边全变体 & $\triangle$ 移动悬崖但封顶 \\
+10 & base 姿态软任务（飞行中）& 扫姿态权重 & $\times$ \textbf{升 roll 权重是错方向}（见下）\\
+11 & $p_{\text{base},z}$ 力权软化 & 多档软化 & $\triangle$ 改翻/恢复平衡、不杀峰高 \\
+12 & 非飞行步态（静走/缓步）& 切步态 & $\times$（弹射是力驱动非步态调度）\\
+13 & 速度/动量调度 & 扫速度 + 地形守卫 & $\times$（提速火上浇油；归零仍弹）\\
+\bottomrule
+\end{tabular}
+\label{tab:ld-overlaunch}
+\end{table}
+
+\begin{insight}[闸门 vs 放大器：惯量假设为何被“更轻翻更狠”证伪]\label{ins:ld-gate-amp}
+表行 3 是整张表的认识论核心。直觉怀疑“$2.27\times$ 横滚惯量太大导致翻”，于是做\emph{区间夹逼}实验：把质量推到极端轻（如 $1.5\,\mathrm{kg}$）。结果\emph{更轻翻得更狠（弹更高）}——这就\emph{证伪}了“惯量是闸门”。原因：$F=ma$，同样的 MPC 竖直力作用在更小质量上，弹得更高。所以惯量是\emph{放大器}（amplifier，影响翻得多快/多高，$\boldsymbol H=\boldsymbol I\boldsymbol\omega$）而非\emph{闸门}（gate，决定翻不翻）。\textbf{闸门}是“去掉它故障就消失”的那一项；\textbf{放大器}只改变故障的剧烈程度。把放大器误当闸门去调，永远修不好——这正是“方向随机”这条线索的意义：随机性指向一个\emph{对称的、力驱动的}触发，而非某个特定惯量轴。\textbf{$\Rightarrow$ 不要再去改惯量/质量分布}。
+\end{insight}
+
+\begin{insight}[升权重是错方向：归一化代价下的“双重计数”陷阱]\label{ins:ld-weight-wrong}
+表行 10 是最可迁移、也最反直觉的调参教训。直觉会“加大横滚姿态权重”帮重机器人刹住横滚——\textbf{方向恰恰反了}。许多质心 MPC 的代价是\emph{质量与惯量归一化}的，形如 $Q_{(3,3)}\,(I_{xx}\omega_x/m)^2$（状态是归一化质心角动量 $L=I\omega$）。$2.27\times$ 的横滚惯量进了 $(I_{xx}\omega/m)^2$，已让\emph{同一个} $Q_{(3,3)}$ 对横滚校正自动放大 $2.27\times$（罚 $L^2$ 已是轻机的约 $5\times$）。要把阻尼\emph{匹配}回轻机水平，$Q_{(3,3)}$ 应\emph{降到约 $0.44\times$ 而非升 $4\times$}；硬升等于\emph{双重计数}（代价已归一化，再手动放大）$\to$ 高增益极限环 $\to$ 失稳。交叉佐证：横滚惯量更大的机型反而\emph{不动}横滚权重、靠“慢步态 + 较高质心 + 较小摩擦系数”一整套获得裕度。\textbf{可迁移律}：代价已惯量归一化时，重机器人的“同权重”其实\emph{已等效更强阻尼}，本能加权 = 双重计数 = 失稳。调权重前，先确认代价是否已对惯量/质量归一化。
+\end{insight}
+
+\subsection{文献交叉验证：把证伪结论与物理限制互相印证}
+\label{subsec:ld-ol-lit}
+
+源项目的一条纪律是：纯靠读源码/调实验得到的结论，要去\emph{独立}文献里找几何/理论下界来交叉验证，而不是只信自己的实验。over-launch 的结论可由一组关于质心角动量率与摩擦锥的结果\emph{在物理层面}相互印证\footnote{需说明：下文给出的\emph{定性}结论（摩擦锥限制可达质心角动量率、飞行相姿态守恒只能在支撑相纠正、多脚接触放宽该限制）有坚实的一般动力学基础与经典文献支撑（飞行相角动量守恒即 Raibert 的核心观察）；但其中若干\emph{具体数值}（临界加速度的闭式、$N{=}2{\to}N{\ge}3$ 的确切倍数）来自项目自身的几何复算，未在公开同行评审文献中独立查证到同一形式，故下文按“物理论证 + 项目内复算”而非“已发表定理”来呈现，引用仅作\emph{方向性}佐证。}。
+
+\begin{insight}[摩擦锥从几何上限制可达质心角动量率——“调权重修不了”是结构性的]\label{ins:ld-angmom-bound}
+对 $N=2$ 支撑（对角小跑），\emph{所有}接触力须落在两条摩擦锥内、合力又只能从两个固定足点施加——这从几何上\emph{限制了}质心角动量率 $\|\dot{\boldsymbol H}_G\|/m$ 在“两脚连线方向”上的可达范围，而这层限制\emph{与代价权重如何整定无关}（权重只在可行集\emph{内部}挑解，挪不动可行集本身）。这与表中“十余轮调权重修不了”互为印证：瓶颈是\emph{结构性}的，而非没调对。两条配套的方向性结论：其一，存在一个\emph{临界水平加速度}，超过它摩擦锥连所需的角动量率都够不到——按项目的几何复算其量级随 $\mu g$ 增、随足距/质心高这类几何量减，写作 $a_x^\star=\mu g/(1+2\mu\kappa)$（$\kappa$ 仅由足几何定），定性后果是\emph{更重的机器人阈值更低、更易超}；其二，$N\ge 3$（满秩接触）时该几何障碍\emph{大幅放宽乃至消失}，项目复算显示 $\|\dot{\boldsymbol H}_G\|/m$ 的可达裕度相对 $N=2$ 高出约两个数量级。\textbf{$\Rightarrow$ 真正的杠杆是“爬升时多脚同时接触（$N\ge 3$）”}，但它只在“没被弹离、还留着支撑”时才兑现——这解释了“切静走仍失败”：静走只动了调节层、没动\emph{触发层}的 base-z 抬升，触发层不治则脚先被弹离，$N\ge 3$ 兑不了现。质心动量/角动量的物理见 \cref{sec:srbd}。
+\end{insight}
+
+\begin{insight}[注入角动量参考是徒劳的——砍掉一整条分支]\label{ins:ld-angmom-futile}
+由同一几何论证还可推出一条关键\emph{负}结论：给 WBC 加“注入角动量/动量参考”是\emph{徒劳}（futile）——参考量只能在可行集\emph{内部}重新分配解，让它沿任务参考滑离摆式流形，却\emph{并不能逃出}摩擦锥所划定的可达范围。这从原理上\emph{砍掉}了“注入 $\dot{\boldsymbol H}_G$ 参考”这条曾被设想的 over-launch 修复分支。而 over-launch 在物理上可归类为\emph{飞行相质心角动量（CAM）问题}：飞行相姿态守恒，姿态只能在支撑相改，飞起来就只能等落地——这正是 Raibert 关于跳跃机器人“flight 守恒、attitude 只 stance 可控”这一经典观察在四足上的体现\cite{raibert1986legged}。\textbf{方法论}：一个负结论（“某条修法原理上不可能奏效”）和一个正结论同样宝贵——它让你\emph{不去}浪费时间在注定失败的方向上。
+\end{insight}
+
+\subsection{诚实定论：方法的墙不是物理的墙}
+\label{subsec:ld-ol-honest}
+
+\begin{insight}[“内禀属性”要校准为“在这套方法约束下内禀”]\label{ins:ld-method-wall}
+最终诚实定论：峰高呈\emph{双峰}（卡住/弹起，永远没有干净渐爬），说明重躯干在这套步态/速度下\emph{只能靠“弹”上台阶}，是\emph{内禀动力学属性}，非某个权重调错。但\textbf{“内禀”不等于“物理不可能”}——这是\emph{方法的墙不是物理的墙}。正面存在性证据：重型液压四足（约 $80\,\mathrm{kg}$）能爬 $24\,\mathrm{cm}$（约 $30\%$ 腿长）的台阶，靠的是\emph{质心动力学（角动量 + 质心调度）而非位置跟踪参考}。所以这道墙是“\emph{位置跟踪式 base 参考}这套方法的墙”，换成全质心/角动量调度理论上可破。\textbf{$\Rightarrow$ 把“内禀属性”严格读作“在本实现这套强 base-z 位置参考的方法约束下内禀”}，避免误判成“重机器人物理上爬不了”。这条约束也呼应文献里“倾向于隐藏 base 参考”的设计哲学：移除/隐藏 base 位姿跟踪、靠落脚点 + 摆动反射爬台阶\cite{corberes2023stairs,jenelten2023dtc}，正是绕开这道方法墙的路线。
+\end{insight}
+
+\begin{insight}[“涌现多模不稳、无单根”本身是真硬问题的诚实标志]\label{ins:ld-emergent}
+还有一种诚实，是承认\emph{没有单一根因}。over-launch 的前沿失败是“竖直弹射（力峰）+ 侧向漂移 + 感知闪烁”\emph{交织}的涌现多模不稳，约十余轮单杠杆全证伪——这本身不是“没找到”，而是\emph{真硬问题}的标志。同时要诚实标注\emph{唯一真正未试}的杠杆（对接触力高频内容做频率惩罚的 input loopshaping，本实现缺失），\emph{不要}误以为“假设真的一个不剩”。\textbf{方法论}：当所有单杠杆都被证伪，先怀疑“这是多因耦合的涌现现象”，并\emph{明确记下哪些杠杆从未真正试过}，而不是宣布“无解”。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{统计功效铁律与 setup \texorpdfstring{$\ne$}{!=} result}
+\label{sec:ld-power}
+
+前两节的方法论，若建立在\emph{统计上无效}的实验之上，会整体崩塌。本节给出“反复翻车”的统计学根源：在\emph{随机失败}的系统里，小样本根本无法区分相近的通过率，于是“自信宣布根因 $\to$ 下一轮被证伪”成了必然循环。
+
+\subsection{统计功效铁律}
+\label{subsec:ld-power-law}
+
+\begin{insight}[统计功效铁律——$N\le 4$ 区分不了 $30\%$ 与 $10\%$]\label{ins:ld-power}
+要可靠区分两个相近的通过率（如 $30\%$ 与 $10\%$），所需试验次数是\emph{几十}量级——约 $40\text{--}85$ 次。这意味着 $N=4$ 的功效是\emph{个位数百分比}：用它得到的“配置 A $1/4$、配置 B $0/4$”之类结论，\textbf{统计上全部无效}（回答前置自测第 4 题）。这正是“反复翻车循环”的真正根源：本项目几乎所有 $N\le 8$ 的判决（某摩擦系数“$1/4$ 首过”、各种“$0/4$ 证伪”）都建立在\emph{无功效}的样本上，于是“这一轮的根因”被下一轮的噪声推翻，循环不止。\textbf{可迁移律}：在随机失败系统里下任何“A 优于 B”结论前，先做\emph{功效估算}（要区分多大的通过率差、需要多少 trial）；样本不够，就\emph{不要下结论}，而不是下一个无效结论。
+\end{insight}
+
+\begin{insight}[把噪声 harness 变确定性，让小样本重新可信]\label{ins:ld-determinize}
+$N$ 不够时，除了“加样本”，更高效的是\emph{消除随机源}让 harness 变确定性——叠满后试验结果的抖动可从米级塌到厘米级（$N=2$ 即可分辨配置）。常见随机源与对策：关掉非确定的平面拟合精化（如 RANSAC 精化，往往是最大抖动源）；MPC 单线程（多线程浮点归约顺序变会引入微非确定）；解耦墙钟（仿真步进与实时率脱钩、避免丢步）；\emph{前进运动按机体位置触发而非按墙钟}（每次以同一步态相位撞台阶边，可复现——这是\emph{最大}的结果决定子）；用\emph{分级}指标（记 $\max|\mathrm{roll}|$、$\min(z)$、终点横偏，而非二值 pass/fail，$N=2\text{--}3$ 即可分辨）。\textbf{$\Rightarrow$ 先把实验\emph{确定化}，再谈样本量}；一个确定性的 $N=2$ 胜过一个随机的 $N=8$。
+\end{insight}
+
+\subsection{setup \texorpdfstring{$\ne$}{!=} result 与单次优势的破产}
+\label{subsec:ld-setup-result}
+
+统计无效之外，还有两个\emph{记录与解读}层面的陷阱，会让人把“噪声”当“信号”。
+
+\begin{insight}[setup $\ne$ result：记忆里的“铁证”必须回溯原始结果字段]\label{ins:ld-setup-result}
+最隐蔽的自我误判源于混淆\emph{实验设置}（setup）与\emph{实验结论}（result）。记忆/总结里的“铁证”，必须\emph{回溯原始日志的 result 字段}核对——本项目两次自我误判都源于此：一次把某条记录的 setup（“换惯量\emph{测试}”）误读成 result（实为“已证伪”），差点给出“改质量分布”的错误建议；一次把\emph{单次}爬升当成“突破”。\textbf{可迁移律}：引用任何历史结论前，区分“我们\emph{打算}测什么（setup）”与“我们\emph{实际}测到了什么（result）”，并以原始结构化日志的 result 字段为准，不以记忆/摘要为准。
+\end{insight}
+
+\begin{insight}[单次优势必须 $\ge 3$ 次重复才能成为默认]\label{ins:ld-repeat}
+在随机失败系统里，\emph{单次}“长 run”往往是\emph{初始状态方差}而非控制收益：身体倒下的初始 roll/pitch 是随机主导项，任何落脚启发式的单次领先都可能纯属早期状态运气。本项目反复上演同一剧情：某候选单次均值领先（含一两次特别好的 run）$\to$ 各跑 $3\text{--}4$ 次重复 $\to$ 被基线反超。\textbf{铁律}：单次优势必须经 $\ge 3$ 次重复 A/B 才能成为默认配置；否则你只是在追逐 early-state 方差。这与 \cref{ins:ld-power} 的功效铁律互为表里——前者管“多少样本才有功效”，后者管“单次领先不算数”。
+\end{insight}
+
+\begin{pitfall}[对单次随机成功过度解读]
+“删了缓存/改了某参数后，这一次爬上去了，所以这就是根因”——这是把\emph{噪声}当\emph{信号}的典型。在通过率本就只有约 $1/6$ 的随机系统里，一次成功完全可能是 rare lucky variance。本项目正栽在这上：一次成功被当“缓存陈旧=弹射根因”，$N=6$ 复测 $0/6$ 才知那次是噪声（缓存确是真坑，但\emph{不是}弹射根因，是红鲱鱼）。对策：任何“这次成功了”都先钉确定性 harness（\cref{ins:ld-determinize}）+ $N\ge 3$ 重复（\cref{ins:ld-repeat}）再下结论。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{证伪驱动方法论全集：可迁移的横切教训}
+\label{sec:ld-falsify}
+
+把前四节的具体案例抽象出来，得到一套\emph{证伪驱动}的调研方法论。它独立于足式控制，可迁移到任何“现象复杂、随机失败、多层耦合”的工程调试。本节以清单形式给出，每条配一句源项目的实证锚点。
+
+\subsection{十二条核心教训}
+\label{subsec:ld-twelve}
+
+\begin{enumerate}
+  \item \textbf{别死磕调参（三振出局）}：同一旋钮连调 $\ge 3$ 次无效，几乎一定是\emph{算法/模型/结构}问题，停手转去研究结构。死磕摆动/力矩/速度旋钮是整个项目最大的弯路，“三振出局”规则由此诞生——\emph{多花一次验证数据，省十次盲调}。
+  \item \textbf{代理量不等于真值（proxy $\ne$ truth）}：碰撞盒不等于真几何（用网格积分）；干净地图不等于真感知（用真实 demo）；崩溃不等于主因（看完整故障链）；配置里的质心高不等于整体质心（用 FK 独算）；关节角不等于落脚点（跨模型约定不同，要 FK 到世界足位）；规划接触不等于实测接触；峰高不等于弹射；编译“成功”不等于二进制真更新。
+  \item \textbf{查 $N$ 路是否真独立（共模假收敛）}：“多路印证”必须各路\emph{不共用}同一假设/代理量，否则等于\emph{同一错误重复 $N$ 次}（只算一票）。信任收敛前先问：这些源是\emph{独立}到达，还是\emph{共享一个前提}？再找能\emph{证伪}它的最便宜实验。
+  \item \textbf{证伪优先}：任何“X 是根因/物理上不可能/已确认”结论，\textbf{必须先说出能证伪 X 的最便宜实验、先跑它、再写‘已确认’}。本项目单会话砍掉六个貌似合理假设全靠此。
+  \item \textbf{直接测量胜过推断}：能直接测的，绝不靠推。直接订阅仿真器的真实接触流，一锤定音证伪“足端撞台阶”（实测翻倒时与台阶接触为零）。
+  \item \textbf{区间夹逼（EXTREME-BRACKET）}：怀疑某变量是主因，就把它推到\emph{物理极端}；极端仍失败 $\Rightarrow$ 该变量被夹逼证伪（不只“某水平不行”，而是“从正常到极端全不行”）。比单点测试强得多（\cref{ins:ld-gate-amp} 的“极端减质量”即此法）。
+  \item \textbf{悬崖判别（CLIFF-DISCRIMINATOR）}：\emph{别在饱和失败区测}（什么配置都 $0$ 通过，无法区分“修好闸门”和“削弱放大器”）。要在\emph{临界悬崖}测：杠杆能\emph{移动悬崖} $\Rightarrow$ 它是闸门；悬崖不动 $\Rightarrow$ 顶多是放大器；只把“翻倒”变“卡住” $\Rightarrow$ 放大器被削弱、闸门未解。
+  \item \textbf{多试次按通过率（$N\ge 10$，$N\le 5$ 太吵）}：随机失败下单次结论无效；定量必用确定性 harness（\cref{ins:ld-determinize}）+ 钉核 worker（见 \cref{sec:ld-silent}）。
+  \item \textbf{基线先行 + 实测不等于标称}：存疑机型先验参照机型同场景（两次靠 a1 对照防止误诊：参照机自己也过不了 $\Rightarrow$ 重定目标）；系统\emph{标称}的接触/状态未必是\emph{实测}的（gait-clock 接触、平地假设 base-z 都是“标称代替实测”坑，见 \cref{sec:ld-silent}）。
+  \item \textbf{广度先于深度}：目标是“地形覆盖广度”，却在单级台阶高度一个点上钻了九成精力 = 赢战役输战争。广度扫描往往\emph{翻转叙事}。
+  \item \textbf{纯源码 Agent 研究必须交叉验证项目失败史}：联网研究强于机制/文献，但\emph{项目内失败史}只在调试日志/记忆里，是 Agent 盲区——两次抓错都因 Agent 推荐了“已实现且已失败”的修法。\emph{动手前必先 grep 调试日志}。
+  \item \textbf{setup $\ne$ result（见 \cref{ins:ld-setup-result}）}：引用历史结论必回溯原始 result 字段。
+\end{enumerate}
+
+\begin{insight}[纪律即生产力：方法论不是口号，是单会话三连救场]\label{ins:ld-discipline}
+上面的纪律不是空话。在\emph{同一个会话}里，它们各抓了一次真错：交叉验证失败史，抓住了一个“已实现且已失败”的误推荐；setup $\ne$ result，抓住了把“换惯量\emph{测试}”误读成“已证伪结论”的自我误判；$N=5$ 通过率，抓住了把“一次爬上”过度解读成“突破”（钉核 $N=5$ 揭示仍 $0/4+$，那次是约 $1/6$ 的运气）。\textbf{$\Rightarrow$ 纪律的回报是\emph{即时}的}：每条规则都在你最容易自欺的那一刻拦住你。这就是“纪律即生产力”的字面含义。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{静默坑与工程基建：不报错却系统性污染结论}
+\label{sec:ld-silent}
+
+最难查的故障，是\emph{既不报错、又系统性影响结果}的那一类。本节集中这类“静默坑”与工程基建陷阱——它们和算法无关，但任何一个没排掉，前面所有诊断与统计都会被悄悄污染。
+
+\subsection{模型与现实失配：最重要的一族}
+\label{subsec:ld-silent-mismatch}
+
+\begin{insight}[摩擦系数安全余量律——controller $\mu$ 取仿真/真实 $\mu$ 的一半]\label{ins:ld-mu-margin}
+这是本族里最简洁深刻、也最可迁移的一条。现象：某机型在台阶处出现高频翻号 chatter、随机方向、横滚发散，而 QP \emph{干净}（非求解崩）、参照机同代码能过。根因：仿真地面 $\mu=0.6$（所有机型相同），参照机的 MPC \emph{故意}用 $\mathrm{frictionCoefficient}=0.3$（仿真值的一半，$2\times$ 安全余量），而该机型被误设成 $0.6$（=仿真值，\emph{零余量}）——MPC 按 $\mu=0.6$ 规划到摩擦锥边缘，台阶顶大剪切力时脚\emph{实际}触到 $0.6$ 滑限 $\to$ 打滑 $\to$ 丢接触 $\to$ 翻。它完美解释了每条线索（QP 干净 / 有效命令发散 / chatter / 机型特有 / 方向随机）。\textbf{可迁移律}：移植新机器人到这类框架，\emph{必查} controller 的 $\mu$ 与仿真/真实接触 $\mu$ 的\emph{比值}，保持上游安全余量（通常 $\tfrac12$）。这是“为何 MPC 摩擦系数要比真实小”的标准范例，与 sim-to-real 的余量哲学一脉相承（\cref{ch:quad_prac}）；摩擦锥本身见 \cref{sec:convexify}。
+\end{insight}
+
+\begin{insight}[未建模的关节阻尼/摩擦——静默侵蚀控制裕度]\label{ins:ld-joint-damping}
+同一族的另一面：质心动力学 MPC \emph{不建模}关节摩擦，若仿真里把关节阻尼/摩擦设成参照机的几十倍（如阻尼 $200\times$、摩擦 $5\times$），则 MPC 按“无摩擦”算力矩、仿真却有巨大阻尼力矩 $\to$ 实际运动滞后指令 $\to$ 控制裕度被\emph{均匀侵蚀} $\to$ 平地小跑几米就翻。降回参照机值即修。这条与摩擦系数失配（\cref{ins:ld-mu-margin}）是\emph{同一族}“MPC 模型 vs 仿真现实失配 $\to$ 静默裕度侵蚀”。但要注意它的\emph{双面性}：同一个旋钮，对\emph{平地基础失稳}是真修，对\emph{台阶 over-launch}却被证伪（\cref{tab:ld-overlaunch} 行 5）——这正是“先在症状（台阶）死磕、真根却有一截在基础运动（平地）”这条元教训的具体载体。\textbf{$\Rightarrow$ 凡 MPC 模型里\emph{没有}、而仿真/真机里\emph{有}的物理项（关节摩擦、阻尼），都是静默裕度侵蚀的嫌疑；逐项核对。}
+\end{insight}
+
+\subsection{缓存、通信与“跑的不是最新代码”}
+\label{subsec:ld-silent-build}
+
+\begin{insight}[自动微分缓存陈旧——“生成的二进制比源码活得久”]\label{ins:ld-cppad-cache}
+经典静默坑：自动微分（CppAD）把动力学/约束的导数代码生成成 \texttt{.so} 缓存，按\emph{模型名字符串}定名。若实现只用“文件\emph{存在}”判断缓存可用（\texttt{isLibraryAvailable} 不校验内容/时间戳/hash），那么改了 URDF 但模型名/路径不变 $\to$ 同路径 $\to$ \emph{静默加载旧 .so} $\to$ MPC 用\emph{旧}动力学规划，行为不变却毫无报错。\textbf{规范}：任何修改 URDF/xacro 中\emph{影响动力学}的量（质量/惯量/质心/连杆几何/关节轴）后，\emph{必须} \texttt{rm -rf} 缓存目录强制重编，或按内容/版本 hash 命名缓存目录。注意：纯仿真参数（关节阻尼/摩擦）\emph{不进} CppAD，改它们无需重编；只改 cost 权重/参考也无需删缓存——\emph{只有改 URDF 才必删}。这是“生成的二进制比源码活得久”这类缓存失效问题的通用范例。
+\end{insight}
+
+\begin{insight}[通信协议不匹配——静默失败，最难查]\label{ins:ld-transport}
+现象：所有测试机器人早期都漂到某处后\emph{卡死}、永不前进，被误判为“稳定但 stall”（多轮误诊）。根因：步态接收节点用一种传输协议（如 UDP）订阅，而自写的发布脚本用另一种（如默认 TCP）$\to$ 消息\emph{永远到不了}订阅者（静默失败、无任何报错）$\to$ 步态从不切换 $\to$ 机器人全程站立（那点位移是起身前冲，不是走路）。\textbf{教训}：通信协议（TCP/UDP）不匹配 = 静默失败、最难查；任何“卡死/爬不上”结论之前，\emph{先探} 观测话题的 \texttt{mode} 字段，确认机器人\emph{确实在执行}目标步态，一眼看穿“步态根本没下达”。早记录此坑却没查记忆就重造脚本 = 重复踩坑（呼应 \cref{ins:ld-discipline} 的“交叉验证失败史”）。
+\end{insight}
+
+\begin{insight}[“跑的是最新代码”要内容核查、不要时间核查]\label{ins:ld-stale-binary}
+分布式/容器化栈里，“我改了代码”与“运行的是改后代码”之间隔着许多静默失效点：\texttt{devel/\allowbreak lib/\allowbreak *.\allowbreak so} 常是\emph{符号链接}（看链接本身显示的是旧时间，要看链接\emph{目标}的 mtime）；编译“succeeded”不等于 \texttt{.so} 真更新（空编译几秒、零符号；真编译十几到几十秒）；改了类成员 = ABI 变 $\to$ 须重编全链。\textbf{规范}：\emph{内容核查胜过时间核查}——用 \texttt{strings .\allowbreak so | grep ENV\_FLAG}（搜环境标志串）、\texttt{nm -C .\allowbreak so | grep <symbol>}（搜符号）、跨机 \texttt{md5sum} 一致性来确认“跑的真是最新”，而非信文件时间戳。
+\end{insight}
+
+\subsection{接触与状态估计的“标称代替实测”}
+\label{subsec:ld-silent-contact}
+
+这一族静默坑，是把“调度/模型\emph{以为}的”当成“\emph{实际}的”，其理论入口在 \cref{ch:quad_est}。
+
+\begin{insight}[gait-clock 接触 vs 实测接触——质心模型假设了不存在的 GRF]\label{ins:ld-gaitclock}
+WBC/调度常用\emph{gait-clock}（步态时钟）接触\emph{而非实测}接触（实现里 \texttt{contactDetection} 往往是空的）。台阶处前脚\emph{晚}着地、调度却已置“支撑” $\to$ 质心模型假设了一个\emph{不存在}的地面反力（GRF）$\to$ base 力旋量算错 $\to$ 横滚。这是“标称代替实测”在 MPC/调度侧的体现。它对应 \cref{ch:quad_est} 已讲的边界：\emph{平整地面够用、复杂地形必须做实测检测}（\cref{ins:qe-prob-boundary}）——平地落足时刻可预测、调度与真实几乎重合，野外则必然偏移。修法即上实测接触检测（广义动量观测器见 \cref{subsec:qe-gm}，事件式触地见 \cite{bledt2018contact}）。\textbf{$\Rightarrow$ 任何用“步态相位推断接触”的环节，在非平地上都要质疑：这一拍\emph{真的}踩上了吗？}
+\end{insight}
+
+\begin{insight}[卡尔曼滤波 base-z 的平地假设——抬高地形上欠读机体高度]\label{ins:ld-kf-terrain}
+本族里最干净的一个真修：腿式状态估计的卡尔曼滤波常把支撑脚高度\emph{初始化并锚定为 $z=0$}（平地假设，见 \cref{sec:qe-state,sec:qe-kf}）。机器人 spawn 在抬高平台（高 $H$）时，脚在 $H$、滤波却\emph{欠读} base-z 约 $H$ $\to$ WBC 以为机体太低 $\to$ 推高机体 $\to$ 站太高 $\to$ 起步即冲出平台边。量化铁证：平地时估计与真值差约 $0.001\,\mathrm{m}$（滤波正确），爬上 $0.08\,\mathrm{m}$ 后差约 $0.081\,\mathrm{m}$——\emph{欠读量恰好等于地形高度}。修法是 terrain-aware 滤波：把支撑脚高度锚到脚下\emph{地形真高}而非恒 $0$。\textbf{关键工程细节}：必须用\emph{触地锁存}（touchdown-latch）——只在“摆动$\to$支撑”首次接触时锁一次、支撑期间保持，\emph{而非每拍连续更新}（连续更新会把时变地图噪声注入、平地剧烈跳动反而摔，是“修反成元凶”）。这与“触地锁存打破机体-地图正反馈环”的设计相通（呼应感知章 \cref{ch:legged-perc} 的同类闭环）。
+\end{insight}
+
+\subsection{仿真基建：悄悄压低通过率的陷阱}
+\label{subsec:ld-silent-infra}
+
+最后一族不影响\emph{单次}正确性，却会\emph{系统性地}污染\emph{定量}结论——尤其危险，因为它让你的统计（\cref{sec:ld-power}）建立在被污染的数据上。
+
+\begin{insight}[僵尸进程墙——不只卡死，是主动压低通过率制造假摔]\label{ins:ld-zombie}
+批量实验里每个 trial 若泄漏未回收的子进程（仿真器/通信主节点等 defunct），累积数百个后会让通信主节点“连接被拒”、静默卡死。但比“卡死”更\emph{隐蔽}的危害是：它会\emph{主动压低通过率制造假摔}——约几十个 trial 后，对照组会被\emph{假摔}到“$3/10$”，而其真值约“$9/10$”，于是\emph{污染了定量对照结论}。对策：每约 $40$ 个 trial \texttt{docker restart} 一次回收（文件系统/缓存/真模型持久）；teardown 按\emph{进程名}杀进程树而非杀进程组（子节点常不在启动进程的进程组里，组杀只杀父）。\textbf{$\Rightarrow$ timing 敏感的定量实验，把“进程卫生”当一等公民；否则你以为在比较配置，其实在测量泄漏程度}。
+\end{insight}
+
+\begin{insight}[漂核 vs 钉核——抢核致策略陈旧的边缘弹射假象]\label{ins:ld-cpu-pin}
+容器若不绑定 CPU（漂核），会与 worker 抢核 $\to$ MPC 计时偶尔超预算 $\to$ 策略\emph{陈旧}（stale）$\to$ 边缘场景出现\emph{弹射假象}（同配置同地形，漂核自跑 $2/2$ 摔、钉核 worker $3/3$ 干净）。\textbf{规范}：所有定量结论与 demo 一律用“全新重启 + 钉核 worker”。注意 HPIPM 这类 QP 是\emph{串行}的 Riccati 递归，多线程只并行 LQ 近似、\emph{不加速} QP 本身，但需保证\emph{满求解率}。\textbf{$\Rightarrow$ 边缘失稳结论之前，先排除“是不是计算资源没跟上导致策略陈旧”这个纯工程假象}。
+\end{insight}
+
+\begin{insight}[干预必须真正作用到对象——“控制器根本没在控”]\label{ins:ld-intervention}
+还有一类污染来自“干预\emph{以为}生效、实则没生效”：例如把启动开关误设成“不发命令”，控制器根本不下发，仿真退回自身默认 PD 把关节拽向零位、机器人\emph{与控制器无关地}缓慢塌陷——造成诡异的“某固定秒数不变性”，浪费多轮并污染结论。\textbf{规范}：站立/行走实验前，先确认控制器\emph{确实在控}（命令在下发、增益非零）；任何“干预后没变化”结论，先排除“干预根本没作用到对象”。这与 \cref{ins:ld-zero-suspect}（质疑被置零的反馈）、\cref{ins:ld-transport}（命令没送达）同源——都是“你以为它在起作用，其实没有”。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{本章小结：方法论速查卡}
+\label{sec:ld-checklist}
+
+本章把两份源里“用户最看重、最可迁移”的失败史，蒸馏成一套与具体算法无关的调试方法论。它的内核，是用\emph{多维证据 + 重复方差 + 主动证伪}去对抗“标量绿灯 + 单次成功 + 归因惯性”这三种最常见的自欺。下面给出可操作的速查卡。
+
+\begin{table}[H]\centering\small
+\caption{足式控制调试方法论速查（本章核心结论一览）}
+\begin{tabular}{p{0.30\textwidth} p{0.62\textwidth}}
+\toprule
+方法/铁律 & 一句话 \\
+\midrule
+三层可行性诊断 & WBC QP 解了吗 / MPC 解自洽吗 / 计划里就要摔吗（\cref{ins:ld-three-layer}）\\
+最隐蔽失败模式 & 三层标量全过仍倒：多维时序 + 重复方差才抓得到（\cref{ins:ld-stealth}）\\
+金字塔 vs 圆锥 & 两层 friction-cone 度量不同，分开看不混用（\cref{ins:ld-pyramid-cone}）\\
+收敛不含不等式 & 硬约束是否满足，只信 \texttt{inequalityConstraintsSSE}（\cref{ins:ld-gmax}）\\
+层级归因谬误 & 根因在执行层、注意力却锁规划层（\cref{ins:ld-attribution}）\\
+规划 vs 执行二分 & 每拍对照预测量与实测量，背离即定位故障层（\cref{ins:ld-plan-exec}）\\
+自然频率基线 & 实测发散快于 $\omega_0=\sqrt{g/h}$ 自然失稳 $\Rightarrow$ 主动推反（\cref{ins:ld-baseline-omega}）\\
+饱和不等于不足 & $2.8\times$ 余量仍饱和 = 被失控逼到的后果（\cref{pit:ld-saturation}）\\
+闸门 vs 放大器 & 去掉它故障消失=闸门；只改剧烈程度=放大器（\cref{ins:ld-gate-amp}）\\
+升权重是错方向 & 代价已惯量归一化时，加权=双重计数=失稳（\cref{ins:ld-weight-wrong}）\\
+$\dot{\boldsymbol H}_G$ 几何限制 & 摩擦锥对可达角动量率的限制与权重无关；注入角动量徒劳（\cref{ins:ld-angmom-bound,ins:ld-angmom-futile}）\\
+方法墙非物理墙 & “内禀”读作“在这套方法约束下内禀”（\cref{ins:ld-method-wall}）\\
+统计功效铁律 & $N\le 4$ 区分不了 $30\%{\leftrightarrow}10\%$（需 $40$--$85$ trial）（\cref{ins:ld-power}）\\
+确定化优先 & 先消随机源再谈样本量，确定性 $N{=}2$ 胜随机 $N{=}8$（\cref{ins:ld-determinize}）\\
+setup $\ne$ result & 历史“铁证”必回溯原始 result 字段（\cref{ins:ld-setup-result}）\\
+$\ge 3$ 重复成默认 & 单次优势多是 early-state 方差（\cref{ins:ld-repeat}）\\
+证伪优先 & 先说能证伪它的最便宜实验、先跑、再写“已确认”（清单 4）\\
+$\mu$ 安全余量 & controller $\mu=\tfrac12$ 仿真 $\mu$，保上游余量（\cref{ins:ld-mu-margin}）\\
+缓存陈旧 & 改 URDF 必删自动微分缓存，否则跑旧动力学（\cref{ins:ld-cppad-cache}）\\
+标称不等于实测 & gait-clock 接触 / 平地假设 base-z 都要实测核（\cref{ins:ld-gaitclock,ins:ld-kf-terrain}）\\
+进程/钉核卫生 & 僵尸进程压低通过率、漂核致策略陈旧假象（\cref{ins:ld-zombie,ins:ld-cpu-pin}）\\
+\bottomrule
+\end{tabular}
+\label{tab:ld-cheatsheet}
+\end{table}
+
+\begin{practice}[移植/bring-up 通用体检清单]
+把一套优化控制栈移植到新机器人、或一个新栈第一次跑不通时，按下列顺序自检（每条对应本章一节）：
+\begin{enumerate}
+  \item \textbf{先确定化再下结论}：关随机源（\cref{ins:ld-determinize}）、钉核（\cref{ins:ld-cpu-pin}）、清进程（\cref{ins:ld-zombie}）；确认控制器确实在控（\cref{ins:ld-intervention}）。
+  \item \textbf{基线先行}：参照机/参照配置同场景先跑一遍，确认目标可达（清单 9）。
+  \item \textbf{三层诊断定层}：WBC QP / MPC PerformanceIndex / 预测窗口（\cref{ins:ld-three-layer}），再叠多维时序防隐蔽模式（\cref{ins:ld-stealth}）。
+  \item \textbf{规划 vs 执行二分}：每拍对照预测量与实测量，把故障锁到一层（\cref{ins:ld-plan-exec}）。
+  \item \textbf{查被置零的反馈/约束}：\texttt{kp=kd=0}/\allowbreak\texttt{enabled=false} 视为高优先嫌疑（\cref{ins:ld-zero-suspect}）。
+  \item \textbf{核失配}：controller $\mu$ 比值（\cref{ins:ld-mu-margin}）、未建模关节摩擦（\cref{ins:ld-joint-damping}）、自动微分缓存（\cref{ins:ld-cppad-cache}）、跑的是否最新代码（\cref{ins:ld-stale-binary}）。
+  \item \textbf{核“标称代替实测”}：接触是 gait-clock 还是实测（\cref{ins:ld-gaitclock}）、base-z 是否平地假设（\cref{ins:ld-kf-terrain}）。
+  \item \textbf{下结论守功效}：$N\ge 10$（或确定化后 $N\ge 2$--$3$）+ $\ge 3$ 重复（\cref{ins:ld-power,ins:ld-repeat}）；引用历史结论守 setup $\ne$ result（\cref{ins:ld-setup-result}）。
+\end{enumerate}
+\end{practice}
+
+\begin{table}[H]\centering\small
+\caption{本章常见误解汇总}
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+QP 每拍 solved、MPC 收敛就没问题 & 标量绿灯只是必要条件；隐蔽模式靠多维时序+方差（\cref{ins:ld-stealth}）\\
+求解器“收敛”=硬约束被满足 & 收敛常不含不等式，只信 \texttt{inequalitySSE}（\cref{ins:ld-gmax}）\\
+站不住一定是上游（落脚/步时/力）问题 & 可能是执行层零增益；用规划 vs 执行二分（\cref{ins:ld-plan-exec}）\\
+力矩饱和=力矩不够 & 可能是被失控逼到饱和（$2.8\times$ 余量仍饱和）（\cref{pit:ld-saturation}）\\
+惯量太大就加大对应权重去刹 & 代价已归一化时加权=双重计数=失稳（\cref{ins:ld-weight-wrong}）\\
+惯量大是翻倒根因 & 更轻翻更狠 $\Rightarrow$ 惯量是放大器非闸门（\cref{ins:ld-gate-amp}）\\
+$N=4$ 的“A 优于 B”能下结论 & 区分相近通过率需 $40$--$85$ trial（\cref{ins:ld-power}）\\
+这次成功了就是找到根因 & 随机系统单次成功多是运气，须 $\ge 3$ 重复（\cref{ins:ld-repeat}）\\
+记忆里的“铁证”可直接引用 & 必回溯原始 result 字段，setup $\ne$ result（\cref{ins:ld-setup-result}）\\
+改了代码跑的就是新代码 & 内容核查胜时间核查（符号链接/空编译）（\cref{ins:ld-stale-binary}）\\
+改 URDF 后行为不变是参数没生效 & 可能加载了旧自动微分缓存，须删重编（\cref{ins:ld-cppad-cache}）\\
+调度说支撑就是真踩上了 & 非平地上 gait-clock 接触会假设不存在的 GRF（\cref{ins:ld-gaitclock}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{知识点总表}
+\begin{table}[H]\centering\small
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 三层可行性诊断 & WBC QP / MPC 解 / 预测窗口，对象与时间各异 & \(\bigstar\bigstar\) \\
+2 & 最隐蔽失败模式 & 三层标量全过仍倒，靠多维时序+重复方差 & \(\bigstar\bigstar\bigstar\) \\
+3 & 金字塔 vs 圆锥 & 两层可行集不同、度量不混用 & \(\bigstar\bigstar\) \\
+4 & 收敛不含不等式 & 硬约束只信 \texttt{inequalitySSE} & \(\bigstar\bigstar\) \\
+5 & 层级归因谬误 & 根因执行层、注意力锁规划层 & \(\bigstar\bigstar\bigstar\) \\
+6 & 规划 vs 执行二分 & 预测量 vs 实测量背离即定位故障层 & \(\bigstar\bigstar\bigstar\) \\
+7 & 自然频率基线 & 快于 $\sqrt{g/h}$ 自然失稳=主动推反 & \(\bigstar\bigstar\) \\
+8 & 饱和不等于不足 & 余量仍饱和=被逼到的后果 & \(\bigstar\bigstar\) \\
+9 & 闸门 vs 放大器 & 去掉故障消失=闸门 & \(\bigstar\bigstar\bigstar\) \\
+10 & 升权重是错方向 & 归一化代价下加权=双重计数 & \(\bigstar\bigstar\bigstar\) \\
+11 & 角动量率几何限制 & 摩擦锥限制可达角动量率、与权重无关；注入徒劳 & \(\bigstar\bigstar\bigstar\) \\
+12 & 方法墙非物理墙 & “内禀”=在这套方法约束下内禀 & \(\bigstar\bigstar\) \\
+13 & 统计功效铁律 & $N\le 4$ 区分不了 $30\%{\leftrightarrow}10\%$ & \(\bigstar\bigstar\bigstar\) \\
+14 & setup $\ne$ result & 回溯原始 result 字段 & \(\bigstar\bigstar\) \\
+15 & 证伪驱动十二条 & 三振/代理量/共模/区间夹逼/悬崖判别 & \(\bigstar\bigstar\bigstar\) \\
+16 & $\mu$ 安全余量 & controller $\mu=\tfrac12$ 仿真 $\mu$ & \(\bigstar\bigstar\) \\
+17 & 自动微分缓存陈旧 & 改 URDF 必删缓存 & \(\bigstar\bigstar\) \\
+18 & 标称代替实测 & gait-clock 接触 / 平地 base-z & \(\bigstar\bigstar\) \\
+19 & 仿真基建卫生 & 僵尸进程/漂核致定量污染 & \(\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{摩擦锥对角动量率的几何限制与飞行相 CAM}：四足质心角动量率受摩擦锥几何限制（$N{=}2$ 与权重整定无关，存在临界水平加速度、$N\ge 3$ 显著放宽、注入角动量参考徒劳；具体闭式与倍数为项目几何复算，量级佐证见 \cref{ins:ld-angmom-bound}）；over-launch 在物理上属飞行相质心角动量问题，根在 Raibert“flight 守恒、attitude 仅 stance 可控”\cite{raibert1986legged}。本章 \cref{sec:ld-overlaunch} 的证伪结论与它们\emph{物理一致}。质心动力学本身见 \cref{sec:srbd}、\cite{orin2013centroidal}。
+  \item \textbf{隐藏/移除 base 参考的地形运动}：靠落脚点 + 摆动反射爬台阶、对控制器隐藏 base 位姿参考以降低对地图误差的敏感\cite{corberes2023stairs,jenelten2023dtc}——这是绕开本章 \cref{ins:ld-method-wall} “位置跟踪式 base 参考方法墙”的路线，呼应感知章 \cref{ch:legged-perc}。
+  \item \textbf{全身 MPC 与有限差分的数值陷阱}：用有限差分求导的全身 MPC\cite{howell2023wholebodympc}，与本章 \cref{ins:ld-cppad-cache}（缓存）、双足章拆分 base 任务的“有限差分噪声放大”互为对照。
+  \item \textbf{优化型足式控制综述}：动态足式机器人优化控制的总览\cite{wensing2024legged}，给出 MPC/WBC 全景，是把本章方法论放回算法语境的入口。
+  \item \textbf{两章失败根因的机理出处}：本章只讲“怎么诊断/证伪”，失败现象与正解的\emph{机理}分别在 \cref{ch:legged-biped}（点足 base 反馈/无静稳）与 \cref{ch:legged-perc}（over-launch/$\mathrm{d}z^2$/关节阻尼）。
+\end{itemize}
+
+\section*{本章与相关章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+相关章节 & 关系 & 本章接口 \\
+\midrule
+\cref{ch:legged-biped} 双足点足 & 提供 base 反馈根因的现象与正解 & \cref{sec:ld-attribution}（完整诊断）\\
+\cref{ch:legged-perc} 感知运控 & 提供 over-launch/阻尼/选区缺陷的机理 & \cref{sec:ld-overlaunch}（完整证伪链）\\
+\cref{ch:quad_wbc} 全身控制 & 三层诊断第一层的对象（QP/零空间/松弛）& \cref{sec:ld-three-layer}（\cref{sec:qw-floating,sec:qw-relax}）\\
+\cref{ch:quad_mpc} 凸 MPC & 二/三层诊断的对象（OCP/凸化）& \cref{sec:ld-three-layer}（\cref{sec:qp,sec:srbd,sec:convexify}）\\
+\cref{ch:quad_est} 状态估计 & “标称代替实测”两坑的理论入口 & \cref{sec:ld-silent}（\cref{sec:qe-contact,sec:qe-kf}）\\
+\cref{ch:quad_prac} 实践 & sim-to-real 余量哲学的语境 & \cref{ins:ld-mu-margin}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：QP 每拍 solved、MPC 收敛，机器人却\emph{缓慢}倒下。\textbf{排查}：这是最隐蔽模式（\cref{ins:ld-stealth}）——记录 roll/pitch 多维时序看缓慢漂移、$\ge 2$ 次重复看方差；查是否有被置零的姿态反馈增益（\cref{ins:ld-zero-suspect}）。
+  \item \textbf{症状}：注册了硬不等式约束、求解器报\emph{收敛}，约束却被违反。\textbf{原因}：收敛判据常不含不等式（\cref{ins:ld-gmax}）。\textbf{对策}：查 \texttt{inequalityConstraintsSSE}，它才是唯一证据。
+  \item \textbf{症状}：上百轮调落脚/步时/力可行性都救不活。\textbf{原因}：层级归因谬误，根因在执行层（\cref{ins:ld-attribution}）。\textbf{对策}：每拍对照预测量 vs 实测量，背离即把战场切到执行层（\cref{ins:ld-plan-exec}）。
+  \item \textbf{症状}：执行器撞力矩饱和。\textbf{排查}：先算实际\emph{需要}多大力矩，若限幅远大于需求（如 $2.8\times$），则饱和是被失控逼到的\emph{后果}而非力矩不够（\cref{pit:ld-saturation}）。
+  \item \textbf{症状}：怀疑某物理量是翻倒根因。\textbf{排查}：区间夹逼推到极端（\cref{ins:ld-gate-amp}）；极端\emph{更糟} $\Rightarrow$ 它是放大器非闸门，别再调它。
+  \item \textbf{症状}：“配置 A 比 B 好”反复被下一轮推翻。\textbf{原因}：小样本无功效（\cref{ins:ld-power}）。\textbf{对策}：先确定化 harness（\cref{ins:ld-determinize}）+ $\ge 3$ 重复（\cref{ins:ld-repeat}）再下结论。
+  \item \textbf{症状}：QP 干净、却在台阶处随机方向翻、机型特有。\textbf{原因}：摩擦系数零余量（\cref{ins:ld-mu-margin}）。\textbf{对策}：controller $\mu$ 降到仿真 $\mu$ 的一半。
+  \item \textbf{症状}：改了 URDF 行为却不变。\textbf{原因}：加载了旧自动微分缓存（\cref{ins:ld-cppad-cache}）。\textbf{对策}：\texttt{rm -rf} 缓存目录重编；并内容核查 \texttt{.so} 真更新（\cref{ins:ld-stale-binary}）。
+  \item \textbf{症状}：机器人卡死不前、被判“stall”。\textbf{排查}：先探观测话题 \texttt{mode} 字段确认步态是否真下达（\cref{ins:ld-transport}）；排除通信协议不匹配的静默失败。
+  \item \textbf{症状}：定量对照里对照组通过率异常低。\textbf{原因}：僵尸进程压低通过率、或漂核致策略陈旧（\cref{ins:ld-zombie,ins:ld-cpu-pin}）。\textbf{对策}：每约 $40$ trial 重启回收、钉核 worker、全新重启出结论。
+\end{enumerate}

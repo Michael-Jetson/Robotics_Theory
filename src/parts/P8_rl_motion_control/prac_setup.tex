@@ -1,0 +1,910 @@
+\chapter{三框架环境搭建与第一次运行}\label{ch:rlmc-setup}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章之二。
+%  主线：算法/概念领路 —— 先立「一次 RL 运控实验在概念上由哪些环节构成
+%  （仿真步进、观测、动作、奖励、并行采样、策略更新），以及它们之间的因果链」，
+%  再把每个环节落到 mjlab / Isaac Lab / UniLab 三框架的工程接线与命令上。
+%  假定读者已有 RL 基础（理论部已讲 MDP/策略梯度/AC/PPO），本章只讲「扩展+实战」。
+%  源稿 RL运控/Ch02_环境搭建.md（实践偏重）已按本主线重构。
+%  关键 API/版本/命令/论文归属经联网核对（Isaac Lab 官方文档、mjlab README/arXiv:2601.22074）：
+%    - mjlab 默认 RL 后端 = RSL-RL(on-policy/PPO)，可视化 = Viser(web，默认端口 8080)，已核；
+%    - 已核任务名 Mjlab-Velocity-Flat-Unitree-G1；Go2 在 mjlab 1.4.0 不存在(只有 G1/Go1)，标 \rebuilt；
+%    - 复核(2)：list-envs/export-scene 经 mjlab 1.4.0 实跑确认为已注册 console_scripts，\rebuilt 已撤；
+%    - 复核(2)修正：Viser 默认端口 7860->8080(7860 是 Gradio 默认)；Isaac Lab 随机动作有官方 random_agent.py(非自写 wrapper)；
+%    - Isaac Lab 3.0 Beta 的 kit-less/Newton(isaaclab_physx/isaaclab_newton)/四元数 wxyz->xyzw 经 v3.0.0-beta 发布说明已核；
+%    - Isaac Lab 线速度部署告警 = locomotion 通识(真机线速度不可直接测)。
+% ════════════════════════════════════════════════════════════════
+
+\cref{ch:rlmc-ecosystem} 已把 mjlab、Isaac Lab、UniLab 三框架的生态位与设计取向摆开。但框架摆在那儿不会自己跑起来。本章解决更前置、更工程的一步：把一台仿真机器人\textbf{从零跑通到第一条上涨的奖励曲线}，并在三个框架上建立对等的操作直觉。至于观测与动作的\emph{契约}（策略能看见什么、能改变什么）如何精细设计，留待 \cref{ch:rlmc-obsact} 展开——本章只需先让最小闭环转起来。
+
+本章仍遵循全书「概念领路、实践兑现」的次序，但这里的「概念」不再是奖励或观测，而是一条更底层的因果链：\textbf{一次强化学习运控实验，本质上是把「GPU 并行仿真」「环境步进 \texttt{env.step}」「策略采样 / 更新」三个角色接成一个闭环}。理解这条链上每个角色的位置，是「装好环境」与「装好且会调试」之间的分水岭。我们不把安装当成一次性杂务，而当成一套\emph{可分层验证}的工程方法——这正是本章的本质洞察。
+
+% ════════════════════════════════════════════════════════════════
+\section{环境配置指南}
+\label{sec:rlmc-setup-prep}
+
+在敲第一条命令前，先对齐版本与系统要求。机器人 RL 的环境之所以脆弱，根因是它串起了\textbf{四层版本约束}：GPU 驱动 $\to$ CUDA $\to$ PyTorch $\to$ 仿真后端（MuJoCo Warp / PhysX / Newton）。任何一层错位都会在\emph{运行时}（而非安装时）以晦涩的 CUDA 报错暴露。下表给出三个框架的最低要求与互斥点。\textbf{UniLab 在这张表上是个异类}：它把物理留在 CPU、只把策略学习放 GPU（异构架构\,\cite{unilab2026}），因而\emph{不绑定 NVIDIA 驱动栈}——这条差异会贯穿本章。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{1.7cm}p{3.1cm}p{3.3cm}p{4.3cm}@{}}
+\toprule
+要求项 & mjlab & Isaac Lab & UniLab \\
+\midrule
+操作系统 & Linux / macOS / Windows & 主推 Linux（Ubuntu 20.04/22.04） & Linux（CUDA/ROCm/XPU）/ macOS（Apple Silicon）多套路径 \\
+Python & $\ge 3.10$ & $\ge 3.10$（2.x 主线） & $\ge 3.10$（实测 3.13 跑通） \\
+GPU & NVIDIA（CUDA）& NVIDIA RTX（Omniverse 要求） & 任一加速后端皆可：CUDA / MPS / ROCm / XPU（仅策略学习用，物理在 CPU） \\
+物理后端 & MuJoCo Warp（JIT 编译） & PhysX（默认）& CPU 多线程 MuJoCoUni / MotrixSim（非 GPU-sim） \\
+RL 后端 & RSL-RL（PPO） & RSL-RL / RL-Games / SKRL / SB3 & PPO / APPO / SAC / TD3 / FlashSAC（on+off-policy 并重） \\
+安装量级 & 单条命令，分钟级 & 依赖链长，十分钟级 & \Verb[breaklines]|uv sync --extra <后端>|，分钟级 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[UniLab 的「异构」改写了版本约束的形状]\label{ins:rlmc-unilab-heterogeneous}
+\cref{ins:rlmc-zero-copy} 讲过 GPU-sim 把物理也搬上 GPU、与策略共享显存。UniLab 反其道而行：物理在 CPU（MuJoCoUni / MotrixSim 多线程批量步进），策略学习在 GPU，二者经\emph{共享内存 IPC} 解耦——collector 子进程在 CPU 产经验、learner 父进程在 GPU 更新，actor 权重经 \Verb[breaklines]|SharedWeightSync| 版本化回传\,\cite{unilab2026}。对\emph{安装}的直接后果是：本节顶部「四层版本约束」对 UniLab\textbf{只剩两层半}——它不依赖 Isaac Sim（不像 Isaac Lab），也不依赖 MuJoCo Warp/CUDA-graph（不像 mjlab），任何能跑 MuJoCo/Motrix 的机器加一块支持的加速卡（甚至 Apple Silicon 的 MPS）即可。这不是「装得更简单」的营销话术，而是\emph{架构选择}决定的：把物理钉在 CPU，就卸掉了整条 GPU 物理后端的版本枷锁。代价见 \cref{sec:rlmc-setup-unilab}——CPU$\to$GPU 的数据搬运成了新的工程面，以及一个 GPU-sim 框架根本没有的失败模式：\verb|/dev/shm| 共享内存预算。
+\end{insight}
+
+\paragraph{版本兼容核心法则。}只需记住一条：\textbf{PyTorch 编译时的 CUDA 版本 $\le$ 驱动支持的 CUDA 版本}。\verb|nvidia-smi| 右上角显示的是\emph{驱动}支持的上限，\Verb[breaklines]|python -c "import torch; print(torch.version.cuda)"| 显示的是 PyTorch 的编译版本。前者 $\ge$ 后者即可（驱动向后兼容）。下表是常见组合：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\verb|nvidia-smi| CUDA & 兼容的 PyTorch CUDA & 说明 \\
+\midrule
+12.4 & 12.1 / 12.4 & 驱动向后兼容旧 wheel \\
+12.1 & 11.8 / 12.1 & 不能装 cu124 的 PyTorch \\
+11.8 & 11.8 & 须精确匹配 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[\texttt{cuda.\allowbreak is\_available()==True} 不等于 kernel 兼容]
+最隐蔽的版本坑：\Verb[breaklines]|torch.cuda.is_available()| 返回 \verb|True|，但一执行真实 kernel 就报 \Verb[breaklines]|CUDA error: no kernel image is available for execution on the device|。\textbf{错误描述}：可用性检查通过，运算却崩。\textbf{现象后果}：你在框架代码里找 bug 找两小时，实际问题在 PyTorch 层。\textbf{根本原因}：PyTorch wheel 的预编译 kernel 不含你 GPU 的算力架构（如 RTX 30 系的 \texttt{sm\_86} 在某些 cu124 wheel 中缺失）。\textbf{正确做法}：版本自测不止 \Verb[breaklines]|is_available()|，还要实跑一次 \Verb[breaklines]|torch.randn(10).cuda()|；遇到此错，换一个含该 \texttt{sm} 的 wheel（如 cu121）。
+\end{pitfall}
+
+\subsection*{分 OS / 分框架的安装步骤}
+
+\textbf{mjlab（Linux/macOS/Windows，分钟级）。}mjlab 的设计目标是「一条命令到可跑」。官方推荐用 \verb|uv|（Astral 出品的 Rust 包管理器，比 pip 快一个量级，自带虚拟环境与 \verb|uv.lock| 锁定）。从源码起步：
+
+\begin{codebox}[bash]{mjlab 安装（uv，经核对:官方 README 的源码路径）}
+# 1. 安装 uv（已装可跳过）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# 2. 克隆并进入仓库
+git clone https://github.com/mujocolab/mjlab.git
+cd mjlab
+# 3. uv 自动建 .venv 并按 pyproject/uv.lock 装好全部依赖（含 mjlab 本体, editable）
+uv sync
+# 4. 一行验证（官方 README 即用 demo 作为冒烟入口）
+uv run demo
+\end{codebox}
+
+若只想\emph{一次性试用}而不改源码，官方提供免安装入口 \Verb[breaklines]|uvx --from mjlab --refresh demo|（\verb|uvx| 之于 \verb|uv| 如 \verb|npx| 之于 \verb|npm|，从 PyPI 临时拉取运行）。但\textbf{本章所有动手实验都用 \texttt{uv run}，不用 \texttt{uvx}}——因为你会改 config、加自定义项、调奖励，而 \verb|uvx| 跑的是 PyPI 已发布版，\emph{不反映你对本地源码的任何修改}，会让「是我改错了还是没跑到我的改动」变成无法排查的混淆。
+
+\begin{note}[一句话记忆]
+做实验用 \Verb[breaklines]|uv run|（当前项目 \texttt{.venv}，反映本地改动）；快速看 demo 用 \verb|uvx|（拉 PyPI 已发布版）。
+\end{note}
+
+\textbf{Isaac Lab（主推 Linux，十分钟级）。}Isaac Lab 不是「装不好」，而是它承载了更多东西（RTX 渲染、Omniverse 生态、多物理后端），依赖链天然更长。2.x 主线推荐 \verb|conda| 建环境 + \verb|pip| 装包：
+
+\begin{codebox}[bash]{Isaac Lab 2.x 安装（conda + pip）}
+# 1. 独立 conda 环境（务必独立，勿与 mjlab 混用）
+conda create -n isaaclab python=3.10 -y
+conda activate isaaclab
+# 2. 先用 pip 装 PyTorch（指定 CUDA 版本，切勿用 conda 装 torch）
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# 3. 克隆并安装 Isaac Lab（其安装脚本会拉取 Isaac Sim 依赖与 RL 后端）
+git clone https://github.com/isaac-sim/IsaacLab.git
+cd IsaacLab
+./isaaclab.sh --install
+# 4. 验证
+python -c "import isaaclab; print(isaaclab.__version__)"
+\end{codebox}
+
+\begin{pitfall}[永远不要 \texttt{conda install pytorch}]
+\textbf{错误描述}：用 \Verb[breaklines]|conda install pytorch|（不指定 CUDA）装 PyTorch。\textbf{现象后果}：\Verb[breaklines]|import torch| 成功但 \Verb[breaklines]|cuda.is_available()| 返回 \verb|False|，你以为是驱动坏了，重装驱动一整天。\textbf{根本原因}：conda channel 优先级可能解析到\emph{CPU 版} PyTorch。\textbf{正确做法}：只用 \Verb[breaklines]|pip install torch --index-url .../whl/cu121| 显式指定 CUDA wheel——这正是 Isaac Lab 官方安装指南反复强调「用 pip 装 PyTorch、不要用 conda」的原因。
+\end{pitfall}
+
+\textbf{Isaac Lab 3.0 Beta 的 kit-less 模式（经核对，前瞻）。}Isaac Lab 3.0 引入了\emph{多后端}架构：\Verb[breaklines]|isaaclab_physx|（PhysX，默认）与 \Verb[breaklines]|isaaclab_newton|（基于 MuJoCo-Warp 的 Newton 后端），后者支持\emph{无 Isaac Sim} 的 kit-less 安装，安装体验向 mjlab 看齐\,\cite{isaaclab2024}。但 3.0 Beta 仍在 develop 分支、示例有限（仅部分经典 RL 与平地 locomotion），且带来若干破坏性变更：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+变更项 & 2.x 主线 & 3.0 Beta \\
+\midrule
+四元数顺序 & \texttt{wxyz} & \texttt{xyzw}（对齐 Warp/PhysX/Newton） \\
+数据管线 & \texttt{.data.*} 直出 torch & Warp-native（需 \texttt{wp.\allowbreak to\_torch} 包装） \\
+安装 & conda + Isaac Sim & 可 kit-less（不依赖 Isaac Sim） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+四元数从 \verb|wxyz| 改为 \verb|xyzw| 是最易出错的一项：所有\emph{硬编码}的四元数都要更新（官方提供 quaternion finder 工具定位）\,\cite{isaaclab2024}。\pzr{本书全书统一采用 Hamilton 四元数约定，记号上不依赖 Isaac Lab 的内部存储顺序——但当你直接读写 Isaac Lab 张量时，务必确认所用版本的存储顺序。}
+
+\begin{note}[工程建议]
+若已有 2.x 上可工作的代码，不必急于迁移 3.0 Beta；等其 GA 后再迁。全新起步、且不需要 PhysX 专属特性（可变形体、表面夹爪、材质随机化）者，可尝试 3.0 kit-less，安装体验接近 mjlab。\rebuilt{截至 2026 年中，Isaac Lab 3.0 仍处 Beta（develop 分支，官方注明可能继续有破坏性改动），尚无公布的 GA 日期；确切时间表以官方发布为准。}
+\end{note}
+
+\textbf{UniLab（异构 CPU-sim + GPU-policy，分钟级）。}UniLab 也走 \verb|uv| 工作流（Conda/pip 用户同样建议用 \verb|uv|，以吃到 \verb|uv.lock| 锁定）。与 mjlab 单一物理后端不同，UniLab 在安装时\emph{选物理后端}：\Verb[breaklines]|--extra mujoco| 装 MuJoCoUni 后端，\Verb[breaklines]|--extra motrix| 装 MotrixSim 后端，二者可共存（同一任务常双后端注册，见 \cref{sec:rlmc-setup-unilab}）。
+
+\begin{codebox}[bash]{UniLab 安装（uv，选物理后端）}
+# 1. 克隆并进入仓库
+git clone https://github.com/unilabsim/UniLab && cd UniLab
+# 2. 选后端装（二选一或都装;后端决定 CPU 物理引擎）
+uv sync --extra mujoco          # MuJoCoUni 后端（mujoco-uni 3.8.0;普通 mujoco 3.8.0 亦可跑通）
+uv sync --extra motrix          # 或 MotrixSim 后端（motrixsim-core 0.8.2）
+# 3. 国内首跑要从 HuggingFace 拉资产/预训练权重，先设镜像
+export HF_ENDPOINT=https://hf-mirror.com
+# 4. 冒烟验证（env 数/迭代数走 Hydra 覆盖, 不是 flag —— 见下方陷阱框）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+\end{codebox}
+
+\begin{pitfall}[UniLab：env 数与迭代数是 Hydra 覆盖，不是命令行 flag]
+\textbf{错误描述}：照搬 mjlab 的 \Verb[breaklines]|--num-envs 64| 或 Isaac Lab 的 \Verb[breaklines]|--num_envs 64| 写法去传 UniLab。\textbf{现象后果}：argparse 报未知参数，或更隐蔽地被 Hydra 当成无效 override 而 \verb|SystemExit|。\textbf{根本原因}：UniLab 的 CLI 是 argparse 薄壳 + Hydra 配置组合——只有 \verb|--algo|/\allowbreak\verb|--task|/\allowbreak\verb|--sim| 等\emph{路由键}走 flag（这几个是 \texttt{RESERVED}，反而\emph{不能}用 Hydra 透传），而 \verb|num_envs|/\allowbreak\Verb[breaklines]|max_iterations|/\allowbreak\verb|sim_dt|/\allowbreak\Verb[breaklines]|reward.scales.*| 一律走 Hydra 点路径覆盖。\textbf{正确做法}：写成 \Verb[breaklines]|algo.num_envs=64 algo.max_iterations=3|（位置在所有 flag 之后），这与 mjlab 的 \Verb[breaklines]|--env.scene.num-envs| 是\emph{两套不同的 CLI 哲学}，切框架时务必切心智模型。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{Quick Start：五分钟最小可跑}
+\label{sec:rlmc-setup-quickstart}
+
+下面给出装好之后\emph{立即能复制粘贴}的最小路径。目标不是训练出好策略，而是证明「从 CLI 入口一路到物理仿真到训练循环」整条链是通的。
+
+\begin{codebox}[bash]{mjlab 最小可跑（命令经核对:官方示例用 G1 速度跟踪任务）}
+# 看到机器人站在场景里（零动作）——验证仿真+可视化
+uv run play Mjlab-Velocity-Flat-Unitree-G1 --agent zero
+# 16 环境跑几十步训练——验证训练循环（数量小、求快）
+uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+    --env.scene.num-envs 16 --agent.max-iterations 50
+\end{codebox}
+
+\begin{codebox}[bash]{Isaac Lab 最小可跑（远程务必 --headless）}
+# 零动作 agent（官方脚本），4 环境，无头模式
+python scripts/environments/zero_agent.py \
+    --task Isaac-Velocity-Flat-Anymal-C-v0 --headless --num_envs 4
+# 16 环境最小训练（RSL-RL）
+python scripts/reinforcement_learning/rsl_rl/train.py \
+    --task Isaac-Velocity-Flat-Anymal-C-v0 \
+    --num_envs 16 --max_iterations 50 --headless
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab 最小可跑（env 数/迭代数走 Hydra 覆盖）}
+# 短训冒烟:64 环境跑 3 迭代, no_play 跳过回放（验证 CPU 仿真 -> GPU 学习整条链）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+# 换 CPU 物理后端只改一个 flag（mujoco <-> motrix），其余不动
+uv run train --algo ppo --task go2_joystick_flat --sim motrix \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+# 回放官方预训练 demo（首跑从 HF 拉权重;headless 服务器加 --render-mode none）
+uv run demo locomani         # 其他:teaser / dance / wallflip / boxtracking / inhandgrasp
+\end{codebox}
+
+\begin{note}[UniLab 的「最小可跑」与双框架有一处本质不同]
+mjlab/Isaac Lab 的「零动作可视化」用一个独立的 \verb|zero| agent 入口；UniLab \emph{没有}直接的零动作播放命令，其最小可跑路径是\textbf{极短训练}（\Verb[breaklines]|algo.max_iterations=3 training.no_play=true|）。原因在 \cref{ins:rlmc-unilab-heterogeneous} 的架构：UniLab 的「跑起来」天然是 collector(CPU)$\to$learner(GPU) 这条 IPC 链，冒烟测试要同时点亮两端，故用短训而非零动作。这也是为什么它的冒烟命令里 \verb|--sim| 切换（mujoco$\leftrightarrow$motrix）几乎零成本——后端只换 CPU 侧的物理引擎，IPC 与学习器侧不变。
+\end{note}
+
+\begin{note}[两条最常踩的 Quick Start 坑]
+其一，mjlab 的默认\emph{分命令}：\verb|train| 默认\emph{无头}（headless），要看可视化得显式加 \verb|--viewer|；而 \verb|play| 默认\emph{就起 Viser}（实测 \Verb[breaklines]|play <T> --agent zero| 即打印 \Verb[breaklines]|viser (listening *:8080)|，无需加 flag）——所以「mjlab 默认无头」这句只对 \verb|train| 准确。Viser 默认在 \Verb[breaklines]|localhost:8080|，远程需 \Verb[breaklines]|ssh -L 8080:localhost:8080|。其二，Isaac Lab 默认\emph{开 GUI}，远程服务器上不加 \verb|--headless| 会卡死。\textbf{mjlab train 默认无头、Isaac Lab 默认 GUI 恰好相反}，这是双框架切换时最高频的低级错误。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{前置自测}
+\label{sec:rlmc-setup-pretest}
+
+\begin{practice}[前置自测：答错 $\ge 2$ 题，建议先回 \cref{ch:rlmc-obsact} 与 RL 理论部]
+\begin{enumerate}
+  \item \verb|sim.step()| 与 \verb|env.step()| 有何区别？（提示：前者只推进物理，后者还算观测、奖励、终止、重置——见 \cref{sec:rlmc-setup-loop}）
+  \item GPU 并行仿真相对 CPU 单环境的核心优势是什么？为什么它能让「分钟级训练」成为可能？
+  \item 为什么环境验证要\emph{分层}进行，而不是直接跑一个 4096 环境的大训练？
+  \item \Verb[breaklines]|uv run| 与裸 \verb|python| 跑脚本的区别是什么？从环境隔离角度回答。
+  \item 同一个观测在策略里既要求前进又要求后退，会发生什么？这与命令（command）是否进观测有何关系？（回看 \cref{sec:rlmc-markov}）
+  \item 「奖励曲线在涨」是否等于「策略行为正确」？请给一个反例。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{本章目标}
+\label{sec:rlmc-setup-goals}
+
+学完本章，你应当能够（每条均可\emph{客观验证}）：
+
+\begin{enumerate}
+  \item \textbf{独立配置} mjlab、Isaac Lab、UniLab 三套环境，并完成 GPU 可用性的\emph{实跑}验证（不止 \Verb[breaklines]|is_available()|）；
+  \item \textbf{执行}一套分层验证流程 L0--L6，并在任一层失败时\emph{定位}问题属于哪一层；
+  \item \textbf{调通}三个框架的 CLI，分别完成训练、评估、可视化三类操作；
+  \item \textbf{解释} \verb|sim.step| / \verb|env.step| / 策略更新三者在并行仿真闭环中的位置与数据流向；
+  \item \textbf{配置}一次 16 环境最小训练与一次 4096 环境完整训练，并\emph{读懂}终端日志的核心字段（按\emph{语义}：平均奖励 / episode 长度 / 各项 loss / 吞吐 \Verb[breaklines]|Steps per second| / 采集与学习耗时；并知道各框架字面名不同、KL 不在 mjlab 终端而在日志后端）；
+  \item \textbf{定位}「奖励涨但行为错」一类问题，用可视化而非只看曲线来验收策略；
+  \item \textbf{对照}三框架（mjlab / Isaac Lab / UniLab）在物理后端、安装链、CLI、可视化上的工程差异，并\emph{解释} UniLab「CPU 仿真 + GPU 策略」异构范式相对 GPU-sim 主导范式的取舍与独有失败面（\verb|/dev/shm| 预算）。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section{知识导航与阅读时间}
+\label{sec:rlmc-setup-nav}
+
+\begin{center}
+\begin{forest} navtreeLR
+[{三框架环境搭建与第一次运行}
+  [{并行仿真闭环\\(概念主线)}
+    [{三角色:sim/env/policy}]
+    [{分层验证 L0--L6}]
+  ]
+  [三框架对比实战
+    [{mjlab\\(MuJoCo Warp+RSL-RL)}]
+    [{Isaac Lab\\(PhysX+多后端)}]
+    [{UniLab\\(CPU-sim+GPU-policy)}]
+  ]
+  [运行与验收
+    [{CLI:训练/评估/可视化}]
+    [{读日志+指标}]
+    [{奖励涨 $\ne$ 行为对}]
+  ]
+]
+\end{forest}
+\end{center}
+
+\paragraph{前置桥接（三行重述）。}\cref{ch:rlmc-obsact} 已把观测/动作定义为「训练系统与部署系统之间的契约」，并给出四族观测与动作的四种抽象层次。RL 理论部已讲清 MDP、策略梯度、演员-评论家与 PPO 的更新规则。\textbf{本章假定这两块已掌握}，只补「如何把它们在真实框架里接起来、跑起来、并逐层验证可用性」。
+
+\paragraph{阅读时间。}精读（含动手装三套环境并跑通 L0--L6）：约 3--4 小时；速读（只读概念主线 + 命令速查 + 陷阱）：约 35 分钟；查阅（按需跳到某框架某层）：5 分钟。
+
+% ════════════════════════════════════════════════════════════════
+\section{概念主线：一次 RL 运控实验由哪三个角色构成}
+\label{sec:rlmc-setup-loop}
+
+在装任何东西之前，先把「我们到底要让什么东西跑起来」想清楚。一次强化学习运控实验，无论用哪个框架，本质上都是把三个角色接成一个闭环。这一节是全章的\emph{算法/概念锚点}——后面所有安装与命令，都是为了让这三个角色各就各位。
+
+\subsection{三角色与数据流向}
+
+\begin{enumerate}
+  \item \textbf{物理仿真器（simulator）}：负责 \verb|sim.step()|——给定当前状态与施加的力/力矩，按物理积分推进一个物理子步。mjlab 用 MuJoCo Warp，Isaac Lab 用 PhysX（3.0 可选 Newton）。它\emph{只}管物理，不知道什么是观测、什么是奖励。
+  \item \textbf{环境（environment）}：负责 \Verb[breaklines]|env.step(action)|——它在物理步之上包了一层 MDP 语义：把策略动作变成施加到关节的目标（经缩放/PD），调用若干次 \verb|sim.step()|，然后\emph{计算观测、计算奖励、判定终止、必要时重置}。\cref{ch:rlmc-obsact} 讲的 ObservationManager / 动作变换链，就活在这一层。
+  \item \textbf{策略与学习器（policy + learner）}：负责\emph{采样}（用当前策略对所有并行环境出动作）与\emph{更新}（用收集到的经验按 PPO 等算法更新网络参数）。mjlab 与 Isaac Lab 默认都用 RSL-RL 的 PPO\,\cite{schwarke2025rslrl}。
+\end{enumerate}
+
+数据流向是一个环：策略读\emph{一批}观测 $\to$ 出\emph{一批}动作 $\to$ \verb|env.step| 推进物理并算出新观测/奖励 $\to$ 经验入 buffer $\to$ 学习器更新策略 $\to$ 回到第一步。\textbf{关键在「一批」二字}：所有并行环境同步走这一步。
+
+\begin{insight}[GPU 并行仿真的本质优势：数据零搬运]\label{ins:rlmc-zero-copy}
+经典 CPU RL 的瓶颈不在算法，而在\emph{数据搬运}：仿真在 CPU、策略网络在 GPU，每一步都要把观测从 CPU 拷到 GPU、再把动作拷回 CPU。GPU 并行仿真（MuJoCo Warp / PhysX-GPU）把\emph{仿真本身}也搬上 GPU——成千上万个环境的状态、观测、动作、奖励\textbf{全程驻留显存}，与策略网络共享同一块内存，省掉了 CPU$\leftrightarrow$GPU 的往返。这就是 Rudin 等「分钟级学会走路」\,\cite{rudin2021minutes} 的工程根基：不是算法变快了，而是\emph{每秒能产生的经验}多了一两个数量级。理解这一点，你才明白为什么 \verb|num_envs| 是最重要的吞吐旋钮，以及为什么显存（而非算力）常常是并行数的上限。
+\end{insight}
+
+\subsection{从概念到「为什么要分层验证」}
+
+把三角色的闭环画清楚后，分层验证的逻辑就不证自明了：闭环上的每一环都可能独立出错，且互相\emph{遮掩}。一个跨领域类比——\textbf{分层验证之于机器人 RL，正如 CI/CD 之于软件工程}：你不会只检查「编译器存在」就宣布开发环境就绪，你还要跑单元测试、跑示例程序。同样，\Verb[breaklines]|pip install| 成功远不等于能训练。
+
+这个类比有边界：CI/CD 通常给出确定的 pass/fail，而机器人 RL 的故障常表现为运行时异常、模糊的 CUDA 报错、甚至\emph{沉默的行为差异}（不报错但学歪了）。正因为反馈更模糊，分层验证比标准软件\emph{更}重要。
+
+\begin{insight}[安装验证的目标不是「没报错」，而是「每一层都被独立触达过」]\label{ins:rlmc-fault-isolation}
+新手把「装好」理解为「跑 \texttt{pip install} 不报红」。但真正的可用性证明是：从 CLI 入口、到框架导入、到任务注册、到场景构建、到物理步进、到动作管线、到训练循环——\textbf{每一层都被一条小命令单独验证过一次}。这背后是通用工程原则\emph{故障隔离}（fault isolation）：预先在每层之间打好「断点」，某层通过即可确信该层及以下正常，问题必在更上层。分层验证的价值与系统层数成正比——RL 运控有 7 层（GPU $\to$ 框架 $\to$ 注册 $\to$ 场景 $\to$ 物理 $\to$ 观测/奖励 $\to$ 训练），所以它的价值远高于只有两三层的简单软件。
+\end{insight}
+
+下表把分层验证流程定义出来，三框架并列。这张表是本章后半所有实战的总纲。
+
+\begin{center}
+\scriptsize
+\begin{tabular}{@{}p{0.5cm}p{1.7cm}p{3.0cm}p{3.0cm}p{3.6cm}@{}}
+\toprule
+层级 & 验证内容 & mjlab & Isaac Lab & UniLab \\
+\midrule
+L0 & Python + GPU & \Verb[breaklines]|torch.cuda.is_available()| + \Verb[breaklines]|randn(10).cuda()| & 同左 & 同左（GPU 仅供策略；物理在 CPU） \\
+L1 & 框架导入 & \Verb[breaklines]|import mjlab| & \Verb[breaklines]|import isaaclab| & \Verb[breaklines]|import unilab| \\
+L2 & 任务注册 & \Verb[breaklines]|uv run list-envs| & \verb|list_envs.py| & \Verb[breaklines]|registry.ensure_registries()| 后 \Verb[breaklines]|list_registered_envs()|（实测 26 个） \\
+L3 & 场景构建 & \Verb[breaklines]|uv run export-scene <T>| & （内置于 Sim） & 后端编译 MJCF/Motrix XML（建 env 时）；\Verb[breaklines]|unilab-export-scene| \\
+L4 & 零动作可视化 & \Verb[breaklines]|uv run play <T> --agent zero| & \Verb[breaklines]|zero_agent.py --task <T>| & 无零动作入口，用极短训练代替（见右下注） \\
+L5 & 随机动作 & \Verb[breaklines]|uv run play <T> --agent random| & \Verb[breaklines]|random_agent.py --task <T>| & 同样无随机 agent 入口 \\
+L6 & 最小训练 & \Verb[breaklines]|uv run train <T> --env.scene.num-envs 16| & \Verb[breaklines]|rsl_rl/train.py --num_envs 16| & \Verb[breaklines]|uv run train --algo ppo --task <slug> --sim mujoco algo.num_envs=64 algo.max_iterations=3| \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[UniLab 的 L2--L5 与双框架不对称，原因是架构而非缺功能]
+L2：UniLab 不用 gym registry，而是自有装饰器注册表——\Verb[breaklines]|registry.ensure_registries()| 触发 \Verb[breaklines]|unilab.envs.{locomotion,manipulation,motion_tracking}| 的导入式注册，再 \Verb[breaklines]|list_registered_envs()| 枚举（实测 26 个任务）。L3：场景在\emph{建 env 时}由后端（MuJoCoUni/Motrix）编译 MJCF/Motrix XML，无独立导出步骤（另有 \Verb[breaklines]|unilab-export-scene| 命令可单独导）。L4/L5：UniLab \emph{没有} zero/random agent 播放入口，其最小可用性证明就是 L6 的极短训练（\Verb[breaklines]|algo.max_iterations=3 training.no_play=true|）——这呼应 \cref{ins:rlmc-unilab-heterogeneous}：要点亮 collector(CPU)$\to$learner(GPU) 整条 IPC 链，零动作播放点不亮 learner 侧。
+\end{note}
+
+\begin{note}[\texttt{list-envs} 与 \texttt{export-scene} 的可用性]
+这两个子命令在 mjlab 1.4.0 中是已注册的 console\_scripts（与 \verb|train|/\allowbreak\verb|play|/\allowbreak\verb|demo|/\allowbreak\verb|viz-nan| 并列，已在该版本实跑确认）：源码安装后经 \Verb[breaklines]|uv run list-envs| / \Verb[breaklines]|uv run export-scene <T>| 调用，本机直装则可省去 \Verb[breaklines]|uv run| 前缀直跑。命令名以你安装版本 \Verb[breaklines]|uv run --help| 的实际输出为准；若版本差异导致不存在，任务清单可改用 Python 侧的注册表查询。
+\end{note}
+
+\begin{pitfall}[跳过分层、直接跑大训练]
+\textbf{错误描述}：拿到新机器第一条命令就是 \Verb[breaklines]|uv run train ... --env.scene.num-envs 4096|。\textbf{现象后果}：报错日志极长，CUDA 不可用、Warp 与驱动不兼容、任务名拼错、WandB 未登录、viewer 在无显示机上卡死、asset 路径错——\emph{多个问题同时存在}，修一个冒一个。\textbf{根本原因}：没有断点，无法定位故障层。\textbf{正确做法}：严格按 L0$\to$L6 推进，每层通过再进下一层；L6 报错时若 L0--L5 已过，问题必在训练配置而非环境。
+\end{pitfall}
+
+\begin{practice}[概念主线自检]
+\begin{enumerate}
+  \item 用自己的话说清 \verb|sim.step()| 与 \verb|env.step()| 各做什么、谁调用谁。\emph{验收}：能指出「观测/奖励/终止」属于 \verb|env.step| 而非 \verb|sim.step|。
+  \item 解释为什么「L4 零动作」比「L6 训练」更适合做\emph{第一个}可用性证明。\emph{验收}：答到 L4 用时短（秒级）、且能同时验证物理与可视化两件事。
+  \item 若你在 L2（任务注册）就失败，而 L0/L1 已过，这排除了哪些错误来源？\emph{验收}：能答出「GPU 与框架本体正常，问题在任务注册/asset」。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{框架一：mjlab 的安装、依赖链与分层验证}
+\label{sec:rlmc-setup-mjlab}
+
+\subsection{模块功能与在管线中的位置}
+
+mjlab 在三角色里同时提供\emph{环境层}与\emph{学习器接线}：它把 Isaac Lab 的 manager-based API 移植过来，配上 MuJoCo Warp 作 GPU 物理后端，并默认用 RSL-RL 做 PPO 训练，用 Viser 做 web 可视化\,\cite{mjlab2026}。它的定位是「轻量、快、可复现」——单命令安装、秒级启动。理解它的\textbf{依赖链}是排障的前提：
+
+\begin{codebox}[text]{mjlab 依赖链（自上而下，每层都可能成为故障点）}
+mjlab
+  |-- mujoco-warp (MuJoCo 的 GPU 加速版, 依赖 NVIDIA Warp)
+  |     +-- warp-lang (NVIDIA Warp, 需要 CUDA toolkit)
+  |-- torch (PyTorch, 须与 CUDA 驱动版本匹配)
+  |-- rsl_rl (RL 算法库, 本章只用其 PPO)
+  +-- (可选) 实验日志后端
+\end{codebox}
+
+\begin{insight}[JIT 编译：为什么 \texttt{pip install} 成功仍可能跑不起来]\label{ins:rlmc-jit}
+mjlab 的 GPU kernel 不在\emph{安装时}编译，而由 NVIDIA Warp 在\emph{首次运行时}即时编译（JIT）。后果有三：(1) \Verb[breaklines]|pip install| / \Verb[breaklines]|uv sync| \textbf{不会}触发 kernel 编译，即使 CUDA 版本不对也\emph{不报错}；(2) \textbf{首次} \Verb[breaklines]|uv run play| 会触发编译，耗时数十秒（后续走缓存）；(3) CUDA toolkit 不匹配的报错出现在\emph{运行时}而非安装时。这正是「装好的虚假安全感」之源——也是为什么 L0--L1 不能只检查 import，而要\emph{实跑一次}来逼出编译。
+\end{insight}
+
+\subsection{配置详解：关键安装项的四维表}
+
+下表用「默认值来源 / 修改影响 / 合理范围 / 与其他配置耦合」四维拆解 mjlab 上手时最该关心的几个旋钮。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.4cm}p{2.4cm}p{3.0cm}p{2.6cm}p{2.6cm}@{}}
+\toprule
+配置项 & 默认值来源 & 修改影响 & 合理范围 & 与其他配置耦合 \\
+\midrule
+\verb|num-envs| & 任务默认（千级） & 大$\to$吞吐高、显存涨；小$\to$学得慢 & 256\,$\sim$\,8192（看显存） & 与显存、batch 划分耦合 \\
+\Verb[breaklines]|max-iterations| & agent 默认 & 决定训练步数/时长 & 验证 50；正式千级 & 与 \verb|num-envs| 共定经验总量 \\
+\Verb[breaklines]|...learning-rate| & 算法默认 0.001 & 过大则 KL 飙、训练崩 & adaptive 下为初值 & 与 \verb|schedule| 耦合 \\
+\verb|...schedule| & \verb|adaptive| & 改 \verb|fixed| 则 LR 不随 KL 自调 & 调参期可固定排查 & 与 \verb|desired-kl| 耦合 \\
+PyTorch CUDA wheel & 你的安装命令 & 不匹配则运行时崩 & $\le$ 驱动 CUDA & 与 GPU 架构(\texttt{sm})耦合 \\
+\verb|--viewer| & 关（默认无头） & 开则起 Viser，拖慢训练 & 仅调试时开 & 与端口转发耦合(8080) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[mjlab 超参也走命令行：\texttt{-{}-agent.algorithm.*}（与 UniLab Hydra 点路径正好两种范式对照）]
+表里 \Verb[breaklines]|...learning-rate|/\allowbreak\verb|...schedule| 的全称是 \Verb[breaklines]|--agent.algorithm.learning-rate|/\allowbreak\Verb[breaklines]|--agent.algorithm.schedule|——mjlab 经 tyro 把\emph{整棵} agent 配置树暴露成 CLI flag，故 PPO 超参不必改源码、直接命令行覆盖（已实跑确认还有 \Verb[breaklines]|--agent.algorithm.entropy-coef| 等）。例如临时把学习率固定下来排查：
+\begin{codebox}[bash]{mjlab 命令行覆盖 PPO 超参（无需改 config）}
+uv run train Mjlab-Velocity-Flat-Unitree-G1 --env.scene.num-envs 16 \
+    --agent.max-iterations 50 \
+    --agent.algorithm.schedule fixed --agent.algorithm.learning-rate 5e-4
+\end{codebox}
+这与 UniLab 的 \Verb[breaklines]|algo.learning_rate=5e-4|（Hydra 点路径，见 \cref{sec:rlmc-setup-unilab}）是\emph{同一目的、两套语法}：mjlab 用 \verb|--| 前缀 + 短横线（tyro 把下划线渲染成短横线），UniLab 用无前缀 + 下划线 + 等号（Hydra）。切框架时这是除任务名外第二个要切的心智模型。
+\end{note}
+
+\subsection{代码走读：L0--L6 逐层命令}
+
+下面按分层流程逐条给命令，每条都标注「看什么」。关键命令已联网核对（见脚注式批注）。
+
+\begin{codebox}[bash]{mjlab L0--L2}
+# L0 GPU:不止 is_available，还要实跑 kernel
+python -c "import torch; print('avail:', torch.cuda.is_available()); \
+           print('kernel:', torch.randn(10).cuda().sum().item())"
+# L1 框架导入（实跑一次以逼出 JIT 编译, 见 ins:rlmc-jit）
+uv run python -c "import mjlab; print('mjlab ok')"
+uv run python -c "import mujoco; print('mujoco', mujoco.__version__)"
+# L2 任务注册（list-envs 为 mjlab 1.4.0 已注册命令;以本地 --help 为准）
+uv run list-envs
+\end{codebox}
+\pzr{L0 的第二行（\texttt{torch.\allowbreak randn(10).\allowbreak cuda()}）是关键——它把「kernel 不兼容」从 L6 提前暴露到 L0。}
+
+\begin{codebox}[bash]{mjlab L4--L6（核心任务名 G1 已核对）}
+# L4 零动作:机器人应静立于地面（验证物理+可视化）
+uv run play Mjlab-Velocity-Flat-Unitree-G1 --agent zero --viewer
+# L5 随机动作:有动但不爆飞（验证动作管线/缩放）
+uv run play Mjlab-Velocity-Flat-Unitree-G1 --agent random --viewer
+# L6 最小训练:16 环境跑 50 迭代，reward 有变化即通过
+uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+    --env.scene.num-envs 16 --agent.max-iterations 50
+\end{codebox}
+部分源教程把冒烟目标写成 \texttt{Mjlab-Velocity-Flat-Unitree-Go2}，但 mjlab 并\emph{不}注册任何 Go2 velocity 任务：官方 README 的 velocity 示例用的是 \texttt{Mjlab-Velocity-Flat-Unitree-G1}（人形），四足参考则是 Go1（\texttt{...-Unitree-Go1}，含 Flat/Rough 两档）。完整清单以你所装版本的 \texttt{list-envs} 输出为准。
+
+\begin{pitfall}[\texttt{play} 与 \texttt{train} 的 CLI option 集不同：别把 \texttt{-{}-env.scene.num-envs} 搬进 play]
+\textbf{错误描述}：在 L4/L5 想改并行数，照搬 L6 \verb|train| 的 \Verb[breaklines]|--env.scene.num-envs N| 写到 \verb|play| 命令里。\textbf{现象后果}：\verb|play| 实测报 \Verb[breaklines]|Unrecognized options|（它不认这个 flag）。\textbf{根本原因}：\verb|play| 与 \verb|train| 是两个独立 console\_script，option 集不同——\verb|play| 关心的是回放（\Verb[breaklines]|--agent {zero,random,trained}|/\allowbreak\Verb[breaklines]|--checkpoint-file|/\allowbreak\verb|--viewer|/\allowbreak\verb|--video|），\Verb[breaklines]|--env.scene.num-envs| 只属于 \verb|train|。\textbf{正确做法}：改 \verb|play| 的并行数用它自身的 flag（以 \Verb[breaklines]|uv run play <T> --help| 实际输出为准），别跨命令套用；\Verb[breaklines]|--env.scene.num-envs| 留给 \verb|train|（如下方动手任务 3）。一条通则：\textbf{换子命令就 \texttt{-{}-help} 一次}，别假设 flag 通用。
+\end{pitfall}
+
+\subsection{运行验证：每层「看什么」}
+
+L4 零动作不是「随便看一眼」，而要对照下表逐项核：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+检查项 & 正常 & 异常（及可能原因） \\
+\midrule
+机器人位置 & 立于地面 & 悬浮/下陷（初始高度或地面错） \\
+关节角 & 自然站姿 & 扭曲（\Verb[breaklines]|default_joint_pos| 配错） \\
+碰撞体 & 无穿透 & 足端穿地（碰撞 mesh / 地面高度） \\
+物理行为 & 重力下沉到稳态 & 弹跳/振荡（接触参数 \verb|solref/solimp|） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+L6 训练通过的判据很低：\emph{reward 曲线不是平的、且不出现 NaN}。50 迭代远不足收敛，能看到上升\emph{趋势}即证明训练循环正确。
+
+\begin{insight}[反事实推理：跳过 L4 的隐性代价]\label{ins:rlmc-skip-l4}
+设想跳过 L4 直接 L6，而恰好 \Verb[breaklines]|default_joint_pos| 配错（如四腿完全伸直）。训练\emph{可能}「成功」——但策略学到的是「从一个错误初始姿态恢复」，而非你想要的步态。曲线在涨，结果却是错的。L4 的 30 秒投入，换来的是排除「整段训练建立在错误初始条件上」这一最难察觉的失败。这与 \cref{ins:rlmc-fault-isolation} 同源：越上游的错误越廉价、越该先验证。
+\end{insight}
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[mjlab 三连坑：忘 uv run / 忘端口转发 / 误判 JIT]
+\textbf{坑一}：不加 \Verb[breaklines]|uv run| 直接 \verb|python|/\allowbreak\verb|train|，可能用到系统 Python 里的旧版 mjlab，调一小时「诡异 API 变更」实为 import 错版本。\textbf{坑二}：远程跑 \verb|--viewer| 却没做 \Verb[breaklines]|ssh -L 8080:localhost:8080|，浏览器打不开 Viser。\textbf{坑三}：把 JIT 首次编译的数十秒卡顿误判为「卡死」而 Ctrl-C——其实再等十几秒就好。三者的共性：\emph{都不是 bug，而是对工具行为的误解}。
+\end{pitfall}
+
+\begin{practice}[mjlab 动手任务]
+\begin{enumerate}
+  \item 完整跑 L0--L6 并记录每层输出。\emph{验收}：六层全过；任一层失败能说出它排除/锁定了哪些层。
+  \item 分别用 \Verb[breaklines]|--agent zero| 与 \Verb[breaklines]|--agent random| 可视化同一机器人，描述两者画面差异。\emph{验收}：能指出零动作静立、随机动作有运动但不应爆飞。
+  \item 在 \verb|train| 命令里把 \Verb[breaklines]|--env.scene.num-envs| 从 16 调到 256（注意：该 flag 只属于 \verb|train|，不可搬进 \verb|play|），用另一个终端 \Verb[breaklines]|watch -n 1 nvidia-smi| 观察显存变化。\emph{验收}：能报出两档显存占用，并解释为何更多环境吃更多显存（呼应 \cref{ins:rlmc-zero-copy}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{框架二：Isaac Lab 的安装架构与分层验证}
+\label{sec:rlmc-setup-isaaclab}
+
+\begin{note}[实跑覆盖声明：本节 Isaac Lab 命令\emph{未}在本书撰写所用配置上实跑]
+本章 mjlab 与 UniLab 的命令、任务名、CLI flag 均在 RTX 4080 SUPER 上逐条实跑核对；但 Isaac Lab 需要 Isaac Sim/Omniverse 环境，撰写配置不具备，故本节脚本路径（\verb|zero_agent.py|/\allowbreak\Verb[breaklines]|random_agent.py|/\allowbreak\verb|list_envs.py|/\allowbreak\Verb[breaklines]|rsl_rl/train.py|）与版本性陈述\emph{以官方仓库与发布说明为准}，未经同等实跑证实。\textbf{若你也只有非 Isaac 环境}：本节可跳过，用 mjlab/UniLab 做等价的分层验证练习即可，三框架的\emph{方法论}（L0--L6、分层故障隔离）完全通用；不必因 Isaac 命令跑不通而怀疑自己装错。具体以你所装版本的 \verb|--help| 输出为最终依据。
+\end{note}
+
+\subsection{模块功能与在管线中的位置}
+
+Isaac Lab 在管线里同样横跨环境层与学习器接线，但它把环境层架在 NVIDIA Omniverse / Isaac Sim 之上，因而\emph{额外}背着 RTX 渲染、USD 资产、多物理后端等重型能力\,\cite{isaaclab2024}。它的学习器侧更「博」：默认 RSL-RL，另可切 RL-Games / SKRL / Stable-Baselines3。代价就是依赖链比 mjlab 长一层：
+
+\begin{codebox}[text]{Isaac Lab 依赖链（比 mjlab 多出 Isaac Sim 一层）}
+CUDA Driver (nvidia-smi)
+  +-- CUDA Toolkit
+        +-- PyTorch
+              +-- Isaac Sim (Omniverse 应用; 3.0 kit-less 可省)
+                    +-- Isaac Lab (RL 框架)
+                          |-- rsl_rl (默认后端)
+                          |-- rl_games / skrl / sb3 (可选)
+\end{codebox}
+
+\begin{insight}[安装复杂度差异是「设计目标」之差，非「技术水平」之差]\label{ins:rlmc-tradeoff}
+若 Isaac Lab 也像 mjlab 一样只需 \Verb[breaklines]|pip install|，本节的坑就都不存在。但 Isaac Lab 选了更长的依赖链，是为了换取更宽的能力面（RTX 渲染需 Omniverse、多 RL 后端需可选依赖管理）。这是「功能丰富」与「安装简单」之间\emph{没有免费午餐}的权衡。把它想成「快速验证想法的工具」（mjlab，秒级启动）与「构建完整研究平台的工具」（Isaac Lab，生态全）之分，你就不会在「哪个更好」上浪费时间，而会在\emph{正确场景选正确工具}。
+\end{insight}
+
+\subsection{配置详解：安装模式与版本约束四维表}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.4cm}p{2.4cm}p{3.0cm}p{2.6cm}p{2.6cm}@{}}
+\toprule
+配置项 & 默认值来源 & 修改影响 & 合理范围 & 与其他配置耦合 \\
+\midrule
+安装模式 & 完整(含 Isaac Sim) & kit-less 省 GUI、装得快 & 纯 locomotion 选 kit-less & 与是否需 RTX/视觉耦合 \\
+\verb|--headless| & 关（默认 GUI） & 远程必须开，否则卡死 & 远程恒开 & 与 \Verb[breaklines]|--enable_cameras| 耦合 \\
+\verb|--num_envs| & 任务默认 & 同 mjlab & 256\,$\sim$\,8192 & 与显存耦合 \\
+RL 后端 & rsl\_rl & 切后端=换 train 脚本 & 看算法需求 & 与 config schema 耦合 \\
+Isaac Sim 版本 & 随安装 & 与 Isaac Lab 版本须配套 & 见 README 对照表 & 与 Isaac Lab 版本强耦合 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{两种安装模式怎么选。}完整安装含 Omniverse 渲染器与 GUI，适合需要 RTX 可视化、视觉策略训练的场景；kit-less 只装物理与核心库、无 GUI，适合纯 locomotion 训练与远程服务器。\textbf{拿不准就先装 kit-less}（本部多数内容够用），日后可平滑升级为完整安装。
+
+\subsection{代码走读：L0--L6 逐层命令}
+
+\begin{codebox}[bash]{Isaac Lab L0--L2}
+# L0 GPU（同 mjlab，同样建议实跑 kernel）
+python -c "import torch; print(torch.cuda.is_available(), torch.randn(4).cuda().sum().item())"
+# L1 框架导入 + 关键类导入（验证到环境基类这一层）
+python -c "import isaaclab; print(isaaclab.__version__)"
+python -c "from isaaclab.envs import ManagerBasedRLEnv; print('env class ok')"
+# L2 任务注册（官方脚本）
+python scripts/environments/list_envs.py
+\end{codebox}
+模块前缀自 Isaac Lab \textbf{2.0}（2025-01，配套 Isaac Sim 4.5）起已从 \texttt{omni.\allowbreak isaac.\allowbreak lab.*} 改为 \texttt{isaaclab.*}，故 2.0 及以后用 \texttt{from isaaclab.\allowbreak envs import ManagerBasedRLEnv}；若你装的是 1.x 旧版，则仍是 \texttt{omni.\allowbreak isaac.\allowbreak lab.*}。\rebuilt{\texttt{isaaclab.\_\_version\_\_} 的具体取值与各子模块可用性仍随版本而变，以你所装版本为准。}
+
+\begin{codebox}[bash]{Isaac Lab L4--L6（远程恒加 --headless）}
+# L4 零动作（官方脚本），4 环境，无头
+python scripts/environments/zero_agent.py \
+    --task Isaac-Velocity-Flat-Anymal-C-v0 --headless --num_envs 4
+# L6 最小训练（RSL-RL）
+python scripts/reinforcement_learning/rsl_rl/train.py \
+    --task Isaac-Velocity-Flat-Anymal-C-v0 \
+    --num_envs 16 --max_iterations 50 --headless
+\end{codebox}
+
+\subsection{运行验证：启动延迟是正常现象}
+
+Isaac Lab \emph{首次}启动常需 15--30 秒（Isaac Sim 初始化 + USD 资产加载），这是正常的，不是卡死；后续启动因缓存会快些。相比之下 mjlab 启动约 2 秒。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+框架 & 首次启动 & 后续启动 & 原因 \\
+\midrule
+mjlab & $\sim$2 秒 & $\sim$2 秒 & Warp kernel JIT（首次稍慢，后缓存） \\
+Isaac Lab & 15--30 秒 & 5--15 秒 & Isaac Sim 初始化 + USD 加载 \\
+UniLab & 秒级 & 秒级 & 后端编译 MJCF/Motrix + spawn collector 子进程；无 Warp JIT/无 Isaac Sim \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{finenote}
+UniLab 启动\emph{没有}双框架那两类延迟源（既无 mjlab 的 Warp kernel JIT，也无 Isaac Lab 的 Isaac Sim/USD 初始化），故首次与后续启动都在秒级。它的「启动开销」换了一种形态：用 \texttt{multiprocessing} 的 \emph{spawn} 上下文起 collector 子进程（spawn 是干净解释器、要重新 import + 重建注册表，故比 fork 略慢但避开 CUDA 句柄被 fork 复制的段错误）。这是异构多进程架构的固有取舍，不是 bug。
+\end{finenote}
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[Isaac Lab 三连坑：版本错配 / 忘 headless / conda 污染]
+\textbf{坑一（最高频）}：Isaac Lab 版本号与 Isaac Sim 版本号\emph{不是同一套系统}。装了 Isaac Lab 3.0 Beta 却用旧版 Isaac Sim，会在建环境时报一堆 \Verb[breaklines]|AttributeError: module 'isaacsim' has no attribute ...|；务必查 README 的版本对照表。\textbf{坑二}：远程忘加 \verb|--headless|，默认 GUI 卡死。\textbf{坑三}：conda 与 pip 混装 PyTorch，conda 的 CPU 版覆盖了 pip 的 CUDA 版，导致 \Verb[breaklines]|cuda.is_available()| 变 \verb|False|。三者根因都是「版本/来源一致性」失守。
+\end{pitfall}
+
+\begin{practice}[Isaac Lab 动手任务]
+\begin{enumerate}
+  \item 完成 Isaac Lab 的 L0--L6。\emph{验收}：六层全过；记录安装中遇到的每个错误与解法（这本身是宝贵工程经验）。
+  \item 故意\emph{不加} \verb|--headless| 在远程跑一次，观察报错是否清楚指出问题。\emph{验收}：能复述错误信息并解释为何远程须无头。
+  \item 用 \verb|list_envs.py| 数一数四大类（classic / locomotion / manipulation / dexterous）各有多少任务。\emph{验收}：给出各类计数，并挑出与自己研究最相关的起点任务。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{框架三：UniLab 的异构架构、安装与分层验证}
+\label{sec:rlmc-setup-unilab}
+
+\subsection{模块功能与在管线中的位置}
+
+把 UniLab 放回 \cref{sec:rlmc-setup-loop} 的三角色闭环，它最特别之处在于\textbf{把三角色拆到两类进程、两种设备上}：物理仿真器（simulator）与环境（environment）在 \emph{CPU} 的 collector 子进程里（MuJoCoUni / MotrixSim 多线程批量 \verb|step|），策略与学习器（policy + learner）在 \emph{GPU} 的父进程里（PPO/APPO/SAC/TD3/FlashSAC）；二者经\emph{共享内存 IPC} 单向通信——transition 从 collector 流向 learner、actor 权重从 learner 流回 collector\,\cite{unilab2026}。这与 mjlab/Isaac Lab「物理与策略同进程、同在 GPU」是正交的范式。理解这条\textbf{异构依赖链}是排障前提：
+
+\begin{codebox}[text]{UniLab 依赖链（横跨 CPU 与 GPU 两侧，IPC 居中）}
+UniLab
+  |-- CPU 侧 (collector 子进程, spawn)
+  |     |-- mujoco-uni / motrixsim  (CPU 物理后端, 多线程批量 step)
+  |     +-- numpy                   (NpEnv 的 CPU 环境核)
+  |-- 共享内存 IPC (/dev/shm)
+  |     |-- RolloutRingBuffer / ReplayBuffer  (transition 缓冲)
+  |     +-- SharedWeightSync                  (版本化 actor 权重)
+  +-- GPU 侧 (learner 父进程)
+        |-- torch (策略网络; CUDA / MPS / ROCm / XPU 任一)
+        +-- rsl_rl (PPO 复用其 OnPolicyRunner)
+\end{codebox}
+
+\begin{insight}[共享内存边界：UniLab 独有的「装好仍可能跑不起来」]\label{ins:rlmc-unilab-shm}
+mjlab 的虚假安全感来自 JIT（\cref{ins:rlmc-jit}）；UniLab 的来自\textbf{共享内存预算}。CPU 仿真产生的 transition 要经 \verb|/dev/shm| 传给 GPU learner，replay buffer/ring buffer 直接吃 \verb|/dev/shm| 容量。\Verb[breaklines]|uv sync| 当然不会暴露这一点；只有真正起训练、分配缓冲时，UniLab 的内存预算守卫才会算账——\verb|/dev/shm| 超 80\% 直接抛 \verb|MemoryError|（提示「减小 \texttt{algo.\allowbreak num\_envs} 或 \texttt{algo.\allowbreak replay\_buffer\_n}，或加大 \texttt{/dev/shm}」）。这是 GPU-sim 框架\emph{根本没有}的失败面（它们的数据在显存，受显存约束而非 \texttt{/dev/shm}）。所以 UniLab 的 L0 除了 GPU 自测，还该顺手 \Verb[breaklines]|df -h /dev/shm| 看一眼可用量——尤其在共享内存默认偏小的容器/服务器上。
+\end{insight}
+
+\subsection{配置详解：安装与运行的关键旋钮四维表}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.4cm}p{2.4cm}p{3.0cm}p{2.6cm}p{2.6cm}@{}}
+\toprule
+配置项 & 默认值来源 & 修改影响 & 合理范围 & 与其他配置耦合 \\
+\midrule
+\verb|--sim| 后端 & 任务 owner YAML & mujoco/motrix 换 CPU 物理引擎 & 看 DR/接触需求 & 与 sim2sim 契约、DR 能力耦合 \\
+\verb|algo.num_envs| & 算法配置（千级） & 大$\to$吞吐高、\verb|/dev/shm| 涨 & 32\,$\sim$\,4096（看 CPU 核与 shm） & 与 \verb|/dev/shm| 预算强耦合 \\
+\Verb[breaklines]|algo.max_iterations| & 算法配置 & 决定训练步数/时长 & 冒烟 3；正式数百 & 与 \verb|num_envs| 共定经验量 \\
+\verb|--device| & 自动探测 & 选 CUDA/MPS/ROCm/XPU & 有哪个用哪个 & 与策略网络驻留设备耦合 \\
+\verb|--render-mode| & \verb|auto| & \verb|none| 纯 headless、\verb|interactive| 起 Viser & 远程用 none/record & 与是否有显示器耦合 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{后端怎么选。}MuJoCoUni 后端 DR 能力更全（实测支持 11 项 reset 随机化）、接触求解在 CPU 全精度，是 locomotion 训练的默认；MotrixSim 后端 DR 能力按特性门控（基线仅 4 项），且在动作跟踪类任务上常\emph{仅用于 sim2sim 评估/回放}。\textbf{拿不准就用 \texttt{mujoco}}（本章及本部多数内容够用），需要 Motrix 专属特性时再切。
+
+\subsection{代码走读：L0--L6 逐层命令}
+
+\begin{codebox}[bash]{UniLab L0--L3}
+# L0 GPU（仅供策略学习）+ 顺手查共享内存（UniLab 特供, 见 ins:rlmc-unilab-shm）
+python -c "import torch; print(torch.cuda.is_available(), torch.randn(4).cuda().sum().item())"
+df -h /dev/shm                                  # 看可用量, 容器里常偏小
+# L1 框架导入
+uv run python -c "import unilab; print('unilab ok')"
+# L2 任务注册（自有注册表, 非 gym; 实测 26 个任务）
+uv run python -c "from unilab.base import registry; \
+    registry.ensure_registries(); print(len(registry.list_registered_envs()))"
+# L3 场景构建:在建 env 时由后端编译 MJCF/Motrix XML（无独立步骤）
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab L6（无 L4/L5 零动作/随机入口，直接极短训练冒烟）}
+# L6 最小训练:64 环境跑 3 迭代, no_play 跳过回放; reward 各项有数即通过
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+# 换后端只改一个 flag（验证后端无关性）
+uv run train --algo ppo --task go2_joystick_flat --sim motrix \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+\end{codebox}
+\pzr{L0 的 \texttt{df -h /\allowbreak dev/\allowbreak shm} 不是多余——UniLab 把 transition 放共享内存，shm 不足会在分配缓冲时直接 \texttt{MemoryError}，这是双框架没有的失败面。}
+
+\paragraph{任务字符串是怎么变成 env 的（与双框架对照）。}\cref{ch:rlmc-obsact} 之后我们一直在用任务名跑命令，但三框架\emph{解析}任务名的机制根本不同，这正是搭建/起新任务时必须看清的一层。\textbf{Isaac Lab} 用裸 \verb|gym.register|：任务 id 的 \verb|kwargs| 里存的是\emph{字符串路径}（如 \Verb[breaklines]|"...rough_env_cfg:G1RoughEnvCfg"|），训练时经 \verb|importlib| + \verb|getattr| 取到 cfg 类再实例化。\textbf{mjlab} 用自定义 \Verb[breaklines]|register_mjlab_task|：注册表里直接存\emph{已实例化的 cfg 对象}，取用时 \verb|deepcopy| 防污染。\textbf{UniLab} 用装饰器双注册——\Verb[breaklines]|@registry.envcfg("Go2JoystickFlat")| 标 cfg 类、\Verb[breaklines]|@registry.env("Go2JoystickFlat", sim_backend="mujoco")| 标 env 类（同名任务可对多后端各标一次，这就是「同任务双后端」的实现）；\Verb[breaklines]|registry.make(name, sim_backend, ...)| 建实例，CLI 的点路径覆盖经 \Verb[breaklines]|apply_cfg_overrides| 深合并进 cfg。
+
+\begin{pitfall}[UniLab：注册名是 CamelCase，但 \texttt{-{}-task} 接 snake\_case]
+\textbf{错误描述}：先用 L2 的 \Verb[breaklines]|list_registered_envs()| 拿到任务名（实测打印的是 \Verb[breaklines]|Go2JoystickFlat| 这种 \emph{CamelCase}），再原样把 \Verb[breaklines]|--task Go2JoystickFlat| 传给 \verb|train|。\textbf{现象后果}：可能匹配不上或行为困惑——读者不知道「我明明从注册表抄的名字怎么不对」。\textbf{根本原因}：UniLab 的注册键是 CamelCase（\Verb[breaklines]|@registry.env("Go2JoystickFlat", ...)|），而 CLI 的 \verb|--task| 走 \emph{snake\_case slug}（\Verb[breaklines]|go2_joystick_flat|），二者经内部规范化映射。\textbf{正确做法}：CLI 一律用小写下划线 slug（\Verb[breaklines]|--task go2_joystick_flat|，实测被接受并映射到 \Verb[breaklines]|Go2JoystickFlat|）；想确认有哪些 slug，看 \Verb[breaklines]|conf/ppo/task/| 目录名或 \Verb[breaklines]|train --help|。这与 mjlab 任务名 \emph{大小写敏感、原样传}（\Verb[breaklines]|Mjlab-Velocity-Flat-Unitree-G1| 一字不改）又是一处跨框架差异。
+\end{pitfall}
+
+\begin{insight}[三种任务注册机制，对应三种工程取向]\label{ins:rlmc-three-registries}
+同一件事（字符串 $\to$ 跑起来的 env）三框架给了三种答案，而答案形状暴露了各自取向。Isaac Lab 借\emph{已有的} gym 生态（字符串 entry\_point、递归 walk 包触发注册），融入 Gymnasium 世界但解析链最长（字符串$\to$import$\to$getattr$\to$实例化）。mjlab 自建轻量注册表、存活对象，换来最短解析（一次 \verb|deepcopy|）和对 gym 的零依赖。UniLab 的装饰器\emph{把后端维度编进了注册键}（\verb|sim_backend=| 参数），因为它天生要支持「同一任务在 MuJoCo/Motrix 上各跑一份」——这是异构多后端框架的结构性需求，gym 的单 entry\_point 模型不便表达。读懂这一层，你就知道为什么 UniLab 的任务列表要走 \Verb[breaklines]|registry.list_registered_envs()| 而非 \Verb[breaklines]|gym.envs.registry|。
+\end{insight}
+
+\subsection{运行验证：看什么}
+
+UniLab 没有零动作画面可看，L6 短训的「看什么」因而落在\emph{终端日志}与\emph{后端无关性}两点：
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lLL@{}}
+\toprule
+检查项 & 正常 & 异常（及可能原因） \\
+\midrule
+reward 分项日志 & 出现 \Verb[breaklines]|reward/tracking_lin_vel| 等多项 & 全缺/全零（reward.scales 配错或 obs 全零） \\
+迭代是否跑满 & 跑满 \Verb[breaklines]|max_iterations| 且 EXIT=0 & 中途 collector 静默死亡（见下文陷阱） \\
+吞吐 & 数千 env-steps/s（32--64 CPU envs \emph{热稳态}） & 远低：先排除冷启/小并行（良性，见 \cref{ins:rlmc-throughput-sanity}），再查 CPU 核不足 / shm 抖动 \\
+后端无关性 & mujoco 与 motrix 都能起训 & 仅一个能起（后端依赖未装或 DR 能力差异） \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+go2 joystick 任务的吞吐\textbf{强依赖并行规模与冷热状态}，给死一个数字会误导。两组实测对照：在\textbf{热稳态、大并行}（RTX 4090 + 多核 CPU）下约数千 env-steps/s（32 CPU 环境 $\sim$4600、64 CPU 环境 $\sim$8900；APPO 异步路径更高）；但若你跑\textbf{小并行冷启}冒烟（RTX 4080 SUPER，16 CPU 环境、JIT 未热、首迭代），mujoco 后端实测只有 $\sim$68 env-steps/s、motrix 后端 $\sim$425——\emph{比稳态低一两个数量级是正常的，不是故障}。9 项 reward（\Verb[breaklines]|tracking_lin_vel|/\allowbreak\verb|swing_feet_z|/\dots）正常更新即证明 CPU 仿真$\to$IPC$\to$GPU 学习整条链通；吞吐数字此时\emph{不该}作为通过判据。
+
+\begin{insight}[吞吐的「正常性」要自己估，不是背一个绝对数]\label{ins:rlmc-throughput-sanity}
+读者最常问「我这台机跑出来的 sps 算不算正常」。给绝对数没用（换机即过期），给\emph{估算心法}才教得会自查。一阶估算：\[\text{env-steps/s}\;\approx\;N_{\text{env}}\times f_{\text{ctrl}}\times \eta_{\text{parallel}},\]其中 $N_{\text{env}}$ 是并行环境数、$f_{\text{ctrl}}$ 是控制频率（locomotion 常 $50\,$Hz）、$\eta_{\text{parallel}}\in(0,1]$ 是并行效率（受 CPU 核数、\verb|sim_substeps|、IPC 抖动拖累）。三条推论：(1) sps \emph{应当随} $N_{\text{env}}$ 近线性增长——若把环境数翻倍 sps 几乎不动，说明 CPU 核或 shm 带宽已饱和；(2) \textbf{小并行 + 冷启（JIT/编译未热、首迭代）会远低于稳态}，这是最常见的\emph{良性}低 sps 原因（\cref{ins:rlmc-jit} 的 JIT 编译、UniLab 的 spawn 子进程都在首迭代摊销），等几迭代热起来再判断；(3) 排除冷启与小并行后仍远低于估算，才该怀疑 \cref{sec:rlmc-setup-troubleshoot} 里那些故障原因（误开 viewer、CPU 核不足、\verb|/dev/shm| 抖动）。\textbf{有了这把尺，你不再需要一张「标准 sps 表」，换任何机器都能自判。}
+\end{insight}
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[UniLab 三连坑：collector 静默死亡 / 误用 flag 传 num\_envs / shm 撑爆]
+\textbf{坑一（异构特有）}：训练「卡住」或父进程报一段陌生 traceback，实为 \emph{collector 子进程崩了}。UniLab 仿 PyTorch DataLoader 把子进程异常经管道回传父进程，并把负 exitcode 翻成信号语义（\verb|SIGBUS|$\to$「native mmap/共享内存/CUDA pinned」、\verb|SIGKILL|$\to$「OOM killer，查 \texttt{dmesg}」、\verb|SIGSEGV|$\to$「C++/CUDA 段错误」）——\emph{读这段死亡报告}比盲调快得多。\textbf{坑二}：照搬双框架的 \verb|--num_envs| flag（UniLab 该走 \Verb[breaklines]|algo.num_envs=| Hydra 覆盖，见前文 pitfall）。\textbf{坑三}：\verb|algo.num_envs| 调太大把 \verb|/dev/shm| 撑爆，触发内存预算守卫的 \verb|MemoryError|（\cref{ins:rlmc-unilab-shm}）——减小 \verb|num_envs|/\allowbreak\Verb[breaklines]|replay_buffer_n| 或加大 shm。
+\end{pitfall}
+
+\begin{practice}[UniLab 动手任务]
+\begin{enumerate}
+  \item 完成 UniLab 的 L0--L3 + L6（mujoco 后端）。\emph{验收}：L2 数出 26 个注册任务；L6 跑满 3 迭代且出现 \Verb[breaklines]|reward/tracking_lin_vel| 日志。
+  \item 同一任务分别用 \Verb[breaklines]|--sim mujoco| 与 \Verb[breaklines]|--sim motrix| 各跑一次短训，对比是否都能起训、reward 项是否一致。\emph{验收}：能指出两后端 DR 能力差异（mujoco 更全），并解释为何同一策略跨后端迁移要过 sim2sim 契约。
+  \item 故意把 \verb|algo.num_envs| 调到一个会撑爆 \verb|/dev/shm| 的大值，观察是否触发内存预算守卫的报错。\emph{验收}：能复述报错提示，并说出这是 GPU-sim 框架没有的失败面（呼应 \cref{ins:rlmc-unilab-shm}）。
+\end{enumerate}
+\end{practice}
+
+\begin{note}[结构对齐]
+本节与前两节（mjlab、Isaac Lab）严格对齐五步结构，本章开头的三框架对比表（系统要求、启动延迟、L0--L6）也已补齐 UniLab 列。后续 CLI/可视化对比见 \cref{sec:rlmc-setup-compare}。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{跨框架对比：CLI、可视化与第一次完整训练}
+\label{sec:rlmc-setup-compare}
+
+三个框架各自跑通后，本节把它们\emph{并排}起来——这正是本部「三框架对比实战」主线的兑现。对比的不是「谁好」，而是「同一个概念动作（训练/评估/可视化）在各框架里长什么样、设计取舍是什么」。
+
+\subsection{核心 CLI 对比}
+
+\begin{center}
+\scriptsize
+\begin{tabular}{@{}p{1.4cm}p{3.7cm}p{3.7cm}p{4.0cm}@{}}
+\toprule
+操作 & mjlab & Isaac Lab & UniLab \\
+\midrule
+训练 & \Verb[breaklines]|uv run train <T> --env.scene.num-envs N| & \Verb[breaklines]|rsl_rl/train.py --task <T> --num_envs N --headless| & \Verb[breaklines]|uv run train --algo ppo --task <slug> --sim mujoco algo.num_envs=N| \\
+评估 & \Verb[breaklines]|uv run play <T> ...| & \Verb[breaklines]|rsl_rl/play.py --task <T> --checkpoint <P>| & \Verb[breaklines]|uv run eval --algo ppo --task <slug> --sim mujoco --load-run -1| \\
+零动作 & \Verb[breaklines]|uv run play <T> --agent zero| & \Verb[breaklines]|zero_agent.py --task <T>| & 无（用极短训练 \Verb[breaklines]|max_iterations=3 no_play=true| 代替） \\
+随机动作 & \Verb[breaklines]|uv run play <T> --agent random| & \Verb[breaklines]|random_agent.py --task <T>| & 无对应入口 \\
+任务列表 & \Verb[breaklines]|uv run list-envs| & \verb|list_envs.py| & \Verb[breaklines]|registry.ensure_registries()| + \Verb[breaklines]|list_registered_envs()| \\
+默认模式 & 无头（\verb|--viewer| 开） & GUI（\verb|--headless| 关） & 由 \verb|--render-mode| 控（\Verb[breaklines]|auto/interactive/record/none|） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[UniLab CLI 的第三种取舍：路由 flag + Hydra 覆盖的二分]
+\cref{ins:rlmc-cli-philosophy} 对比了 mjlab（约定优于配置）与 Isaac Lab（显式优于隐式）。UniLab 走\emph{第三条路}：把命令行参数硬分成两类——\textbf{路由键}（\verb|--algo|/\allowbreak\verb|--task|/\allowbreak\verb|--sim|，决定走哪个训练脚本与哪份 owner YAML，这几个反而\emph{禁止} Hydra 透传）与\textbf{配置覆盖}（\Verb[breaklines]|algo.num_envs=|/\allowbreak\Verb[breaklines]|reward.scales.*=| 等点路径，全经 Hydra 深合并）。好处是「换算法/任务/后端」与「调超参」在心智上彻底分离；代价是初学者最易把两类搞混（见前文那条 pitfall）。三框架放一起，正好是 CLI 设计「位置参数 / 命名 flag / flag+Hydra 二分」三种范式的活样本。
+\end{note}
+
+\begin{insight}[两种解读：用户体验 vs.\ 工程哲学]\label{ins:rlmc-cli-philosophy}
+CLI 差异可从两层读。\textbf{用户体验层}：mjlab 优化「远程服务器快速迭代」——默认无头、\Verb[breaklines]|uv run| 免激活、任务名走位置参数（最常指定者最简洁）；Isaac Lab 优化「本地工作站交互调试」——默认 GUI、\verb|--task| 命名参数、选项显式。\textbf{工程哲学层}：mjlab 偏\emph{约定优于配置}（convention over configuration，少指定），Isaac Lab 偏\emph{显式优于隐式}（explicit is better than implicit，全可配）。理解这组取舍，你第一次用就能避开「远程不加 headless、本地不开 viewer」这对镜像错误。
+\end{insight}
+
+\subsection{可视化方案对比}
+
+可视化是 RL 调试\emph{最重要}的工具——没有之一。奖励曲线只告诉你「数值是否改善」，唯有可视化能告诉你「机器人实际在做什么」。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+方案 & 渲染质量 & 远程友好度 & 适合场景 \\
+\midrule
+Viser（mjlab 默认） & 中 & 高（web，浏览器访问） & 日常调试、远程训练 \\
+Isaac Sim Viewer & 高（RTX） & 低（需显示器/VNC） & 视觉策略、论文截图 \\
+Rerun（跨框架） & 中 & 中 & 时序数据回放、行为细查 \\
+Viser（UniLab \verb|interactive|） & 中 & 高（web） & 远程调试 + 直接读 \verb|NpEnvState| \\
+NaN dump + \verb|viz-nan|（UniLab） & 离线复现 & 高 & 抓 NaN 后逐帧回放 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Viser（web-based，支持暂停/继续/接触可视化\,\cite{mjlab2026}）的最大优点是远程友好——渲染在服务器端、浏览器访问，只需 \Verb[breaklines]|ssh -L 8080:localhost:8080|。\textbf{UniLab 也用 Viser}（\Verb[breaklines]|--render-mode interactive| 起 web 3D），并因 CPU 环境核可直接 \verb|NpEnvState| 读取，调试时拿状态比经 GPU 张量回拷更直接；纯 headless 用 \Verb[breaklines]|--render-mode none|、录视频用 \verb|record|。Isaac Sim Viewer 走 Omniverse RTX 光追，质量更高但需本地显示或 VNC。Rerun 不主打实时 3D，而是\emph{录制并回放任意数据流}（在同一时间轴看 3D 姿态、关节角、接触力、奖励分项），适合回答「第 137 步到底发生了什么」这类时序问题。
+
+\begin{insight}[mjlab 的热切换 checkpoint：边训边看新模型]\label{ins:rlmc-viser-hotswap}
+Viser 远程可视化还有一个\emph{容易被忽略}的工程便利——mjlab 的 \Verb[breaklines]|ViserPlayViewer| 内置 \Verb[breaklines]|CheckpointManager|，可在\textbf{不重启进程}的前提下热切换/对比不同 checkpoint（\Verb[breaklines]|play <T> --viewer viser|；\verb|demo| 命令默认就是 \Verb[breaklines]|viewer="viser", num_envs=8|）。配合 \cref{ins:rlmc-viz-breakpoint}「定期可视化」的纪律，这让你能在一条浏览器会话里对比第 300 / 600 / 900 迭代的策略行为，而不必每次重开。UniLab 这边对应的远程调试一等公民则是\emph{离线 NaN 复现}（见下文完整训练的诊断小节）——两框架在「远程怎么看策略」上各有侧重，但都把 web 可视化做成了默认而非附加项。
+\end{insight}
+
+\begin{insight}[可视化是 breakpoint，奖励曲线是 print]\label{ins:rlmc-viz-breakpoint}
+把可视化类比成软件调试：奖励曲线相当于 \verb|print|（告诉你数值），可视化相当于 breakpoint（让你看到完整状态）。只看 \verb|print| 不下断点，你能知道「值不对」却不知道「为什么不对」。这就是为什么训练中途要\emph{定期}可视化（每数百迭代一次），而不是等训练结束——reward hacking（如靠卡在地面缝隙刷存活奖励）只有眼睛能抓到。
+\end{insight}
+
+\subsection{第一次完整训练与读日志}
+
+最小训练（16 环境）只证明「管线能跑」；要建立对训练过程的\emph{体感}，需做一次正式训练（数千环境）。三框架命令：
+
+\begin{codebox}[bash]{完整训练（数值规模仅示意，按你的 GPU 调）}
+# mjlab:4096 环境
+uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+    --env.scene.num-envs 4096 --agent.max-iterations 1500
+# Isaac Lab:4096 环境，无头
+python scripts/reinforcement_learning/rsl_rl/train.py \
+    --task Isaac-Velocity-Flat-Anymal-C-v0 \
+    --num_envs 4096 --max_iterations 1500 --headless
+# UniLab:env 数/迭代数走 Hydra 覆盖;CPU 物理（num_envs 受 /dev/shm 约束, 非显存）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=300 --render-mode none
+\end{codebox}
+
+\begin{note}[UniLab 完整训练的两点异构特性]
+其一，\verb|algo.num_envs| 在 UniLab 受 \verb|/dev/shm| 而非显存约束（\cref{ins:rlmc-unilab-shm}），所以「调大并行数」的上限逻辑与双框架不同——CPU 核数与共享内存才是天花板。其二，UniLab 自带\emph{NaN 守卫}（默认开），训练中命中 NaN 会自动 dump 出事前若干帧的物理快照，事后 \Verb[breaklines]|unilab-viz-nan <dump>| 用 MuJoCo viewer 离线回放复现——这把「reward 突然变 NaN」从「看不见的玄学」变成「可逐帧回放的现场」，是异构框架对 \cref{ins:rlmc-read-log} 那类诊断的一等公民支持。需要异步吞吐时还可换 \Verb[breaklines]|--algo appo|（collector 不等 learner，最能体现 CPU-GPU 解耦）。
+\end{note}
+
+训练时终端逐迭代打印摘要。\textbf{务必先认清一件事：字段名因框架而异，能跨框架迁移的是\emph{语义}而非\emph{字面}。}下表第一列给\textbf{通用语义}（你日后\emph{所有}训练的诊断基准），第二列给 mjlab/RSL-RL 终端\emph{实际}打印的字面名（已实跑核对），Isaac Lab/UniLab 字面再有出入——读日志的功夫是认语义、而非记某一串字符串：
+
+\begin{center}
+\scriptsize
+\begin{tabular}{@{}p{2.0cm}p{2.9cm}p{2.5cm}p{3.4cm}@{}}
+\toprule
+通用语义 & mjlab/RSL-RL 实际字面 & 健康范围 & 异常时怎么想 \\
+\midrule
+平均奖励 & \Verb[breaklines]|Mean reward| & 逐步上升后趋稳 & 不涨$\to$查观测/奖励配置 \\
+平均 episode 步数 & \Verb[breaklines]|Mean episode length| & 逐步增至上限 & 不增$\to$终止条件太严 \\
+策略损失 & \Verb[breaklines]|Mean surrogate loss| & 接近 0（可正可负） & 持续正增$\to$策略崩溃 \\
+价值损失 & \Verb[breaklines]|Mean value loss| & 逐步下降 & 不降$\to$critic 没学到信息 \\
+熵损失 & \Verb[breaklines]|Mean entropy loss| & 缓慢变化 & 骤变$\to$探索过早坍缩 \\
+吞吐 & \Verb[breaklines]|Steps per second| & 接近 GPU 峰值 & 远低$\to$查 viewer/sensor \\
+采集/学习耗时 & \Verb[breaklines]|Collection time| / \Verb[breaklines]|Learning time| & 二者比例稳定 & 失衡$\to$定位瓶颈层 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}[mjlab 终端摘要\emph{不打印} \texttt{kl}，照表找 \texttt{kl} 字段会扑空]
+\textbf{错误描述}：照网上或旧教程的「字段表」去 mjlab 终端找 \verb|kl| / \verb|entropy| / \verb|fps| 这几个字面。\textbf{现象后果}：找不到 \verb|kl| 这一行，怀疑训练没正常跑、或版本不对，浪费时间。\textbf{根本原因}：mjlab 走 RSL-RL 的 PPO，KL 散度\emph{确实在算}——\Verb[breaklines]|--agent.algorithm.schedule=adaptive|（默认）正是\emph{用} \verb|desired_kl| 来自适应调学习率（实测 KL 偏大就降 LR、偏小就升 LR）——但这个 KL \textbf{不写进每迭代的终端摘要}，只在 WandB/TensorBoard 的标量曲线里。\textbf{正确做法}：要看 KL（健康范围约 $0.005\sim0.02$，$>0.05$ 多半学习率过大），开日志后端去看曲线：\Verb[breaklines]|--agent.logger wandb|（默认）或 \Verb[breaklines]|--agent.logger tensorboard|，再 \Verb[breaklines]|tensorboard --logdir logs/|；终端只认上表那几个 \Verb[breaklines]|Mean *| 字段。\Verb[breaklines]|Steps per second| 这一字面在终端有；\verb|fps| 这个缩写没有。
+\end{pitfall}
+
+\begin{insight}[只看曲线会漏掉吞吐与采集时间，从而误判「为什么慢」]\label{ins:rlmc-read-log}
+WandB/TensorBoard 的图通常聚焦 reward/KL/loss，但终端日志里的 \Verb[breaklines]|Steps per second|（连同 \Verb[breaklines]|Collection time| 与 \Verb[breaklines]|Learning time| 的拆分）才回答「训练慢是因为\emph{物理仿真慢}还是\emph{PPO 更新慢}」。\Verb[breaklines]|Collection time| 大 $\to$ 采集瓶颈，要减环境复杂度或查 viewer；\Verb[breaklines]|Learning time| 大 $\to$ 更新瓶颈，要看网络规模与 mini-batch。\textbf{把「慢」拆成「采集慢」与「更新慢」两类，是性能调优的第一刀}——而这一刀恰恰只能靠终端那两个时间字段切，WandB 默认曲线里常没有它们。
+\end{insight}
+
+\begin{insight}[奖励涨 $\ne$ 行为对：第一次训练真正要建立的直觉]\label{ins:rlmc-reward-not-behavior}
+一个反复出现的陷阱：reward 从 0 涨到 15 并稳定，看似成功，可视化后却发现机器人靠「膝盖着地滑行」骗取前进奖励。两个最终 reward 相同的策略，行为可以天差地别（一个优雅行走，一个 reward hacking）。\textbf{第一次完整训练的目的不是调出最优策略，而是建立「曲线形状 + 收敛时长量级 + 行为随迭代演化」的体感}——后续奖励设计、域随机化、超参调优的所有讨论，都以这个体感为直觉地基。没有它，那些讨论都是纸上谈兵。所以训练完\emph{必须}用可视化验收，而非只看曲线。
+\end{insight}
+
+\begin{pitfall}[训练阶段三连坑：跨框架比 reward / 训练慢就加迭代 / 只看终值]
+\textbf{坑一}：拿 mjlab 的 reward 数值与 Isaac Lab 直接比大小——无意义，因两者奖励函数（权重、sigma、项数）不同；有意义的跨框架比较是\emph{行为质量}（看可视化）与\emph{吞吐} \verb|fps|。\textbf{坑二}：reward 完全平（不是涨得慢，是\emph{平}）就加迭代——问题不在迭代数，而在接口配置（观测全零？奖励权重？动作缩放过大？）。\textbf{坑三}：只看最终 reward 不看中间过程与可视化，放过了 reward hacking。
+\end{pitfall}
+
+\begin{practice}[跨框架对比动手任务]
+\begin{enumerate}
+  \item 在 mjlab 与 Isaac Lab 各跑一次 50 迭代训练，记录\emph{启动时间}与 \verb|fps|。\emph{验收}：能报出两组数，并解释启动时间差异来自 Isaac Sim 初始化（\cref{ins:rlmc-tradeoff}）。
+  \item 同一任务用两个随机种子各训一次，对比最终 reward 差多少。\emph{验收}：能据此说出「单次训练结果的可靠度」——为何论文要报多种子均值方差。
+  \item 完整训练后用可视化验收行为，对照\,\cref{ins:rlmc-reward-not-behavior}\,找出是否存在 reward hacking 迹象（拖脚、抽搐、不对称、滑行）。\emph{验收}：给出一段文字描述策略行为，并判断「曲线好」是否=「行为好」。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{常见误解汇总表}
+\label{sec:rlmc-setup-misconceptions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.2cm}p{8.0cm}@{}}
+\toprule
+常见误解 & 纠正 \\
+\midrule
+「\texttt{pip install} 成功就能训练」 & 仅装了 Python 包；GPU kernel（mjlab）JIT 在首次运行才编译，CUDA 不匹配运行时才崩（\cref{ins:rlmc-jit}）。 \\
+「\texttt{cuda.\allowbreak is\_available()==True} 就万事大吉」 & 还需实跑 \texttt{torch.\allowbreak randn(10).\allowbreak cuda()}，否则可能 \texttt{no kernel image} 报错。 \\
+「装好=没报错」 & 装好=每层（L0--L6）都被独立验证触达（\cref{ins:rlmc-fault-isolation}）。 \\
+「奖励曲线在涨就成功了」 & 曲线涨 $\ne$ 行为对；必须可视化验收（\cref{ins:rlmc-reward-not-behavior}）。 \\
+「Isaac Lab 装得慢是没做好」 & 是「功能丰富」对「安装简单」的工程权衡，非技术优劣（\cref{ins:rlmc-tradeoff}）。 \\
+「两框架默认行为一样」 & 恰相反：mjlab 默认无头，Isaac Lab 默认 GUI；远程/本地各踩一坑。 \\
+「跨框架 reward 数值可比大小」 & 不可比；只比行为质量与 \texttt{fps} 吞吐。 \\
+「Isaac Lab 版本号=Isaac Sim 版本号」 & 两套独立编号，须按 README 对照表配套。 \\
+「UniLab 也靠 GPU 仿真，所以也吃显存」 & 反了：UniLab 物理在 CPU，并行数受 \texttt{/dev/shm} 而非显存约束；GPU 只放策略（\cref{ins:rlmc-unilab-shm}）。 \\
+「UniLab 的 \texttt{num\_envs} 用 \texttt{-{}-num\_envs} flag 传」 & 不是；UniLab 只 \texttt{-{}-algo/-{}-task/-{}-sim} 走 flag，\texttt{num\_envs} 走 \texttt{algo.\allowbreak num\_envs=} Hydra 覆盖。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{小结}
+\label{sec:rlmc-setup-summary}
+
+本章把「装好三框架并跑通第一次训练」从一次性杂务，提升为一套以\textbf{三角色闭环}为概念锚、以\textbf{分层验证}为方法论的工程实践，并在 mjlab / Isaac Lab / UniLab 三框架上做了对等接线。其中 UniLab 用「CPU 仿真 + GPU 策略」的异构范式（\cref{ins:rlmc-unilab-heterogeneous}）与前两家的「GPU-sim 主导」正交，连带把版本约束、启动延迟、并行数上限（\verb|/dev/shm| 而非显存）、乃至任务注册机制（\cref{ins:rlmc-three-registries}）都换了一种形状。核心立场是两条洞察：装好不是「没报错」而是「每层被独立触达」（\cref{ins:rlmc-fault-isolation}）；训练成功不是「曲线涨」而是「行为对」（\cref{ins:rlmc-reward-not-behavior}）。
+
+\paragraph{术语速查表。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 一句话 \\
+\midrule
+\verb|sim.step| / \verb|env.step| & 前者只推物理；后者在其上算观测/奖励/终止/重置 \\
+分层验证 L0--L6 & GPU$\to$导入$\to$注册$\to$场景$\to$零动作$\to$随机$\to$最小训练 \\
+JIT 编译 & Warp kernel 首次运行才编译，故装好不等于能跑 \\
+kit-less & Isaac Lab 3.0 不依赖 Isaac Sim 的安装模式（Newton 后端） \\
+RSL-RL & 两框架默认的 on-policy（PPO）训练库；UniLab 也复用它跑 PPO \\
+Viser & mjlab/UniLab 的 web 可视化（远程友好；UniLab 经 \texttt{-{}-render-mode interactive}） \\
+reward hacking & 策略钻奖励漏洞获分，行为却错（须可视化抓） \\
+异构架构（UniLab）& 物理在 CPU、策略在 GPU，经共享内存 IPC 解耦（\cref{ins:rlmc-unilab-heterogeneous}） \\
+\verb|/dev/shm| 预算 & UniLab 独有失败面：共享内存超 80\% 抛 \texttt{MemoryError}（\cref{ins:rlmc-unilab-shm}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+编号 & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 三角色闭环（sim/env/policy）与数据零搬运 & \cref{sec:rlmc-setup-loop} & 中 \\
+2 & 分层验证 = 故障隔离，价值随层数增长 & \cref{sec:rlmc-setup-loop} & 中 \\
+3 & 四层版本约束与「kernel 兼容 $\ne$ available」 & \cref{sec:rlmc-setup-prep} & 中 \\
+4 & mjlab 依赖链与 JIT 编译陷阱 & \cref{sec:rlmc-setup-mjlab} & 中 \\
+5 & \texttt{uv run} vs \texttt{uvx} 的语义与适用 & \cref{sec:rlmc-setup-prep} & 低 \\
+6 & Isaac Lab 依赖链长一层的取舍 & \cref{sec:rlmc-setup-isaaclab} & 中 \\
+7 & 两模式（完整 / kit-less）与 3.0 破坏性变更 & \cref{sec:rlmc-setup-isaaclab} & 中 \\
+8 & CLI 默认相反：无头 vs GUI & \cref{sec:rlmc-setup-compare} & 低 \\
+9 & 可视化=breakpoint，定期看防 reward hacking & \cref{sec:rlmc-setup-compare} & 中 \\
+10 & 读日志：把「慢」拆成采集慢/更新慢 & \cref{sec:rlmc-setup-compare} & 中 \\
+11 & 奖励涨 $\ne$ 行为对（第一次训练的体感） & \cref{sec:rlmc-setup-compare} & 高 \\
+12 & UniLab 异构（CPU-sim+GPU-policy）与 \texttt{/dev/shm} 失败面 & \cref{sec:rlmc-setup-unilab} & 中 \\
+13 & 三种任务注册机制（gym / register\_mjlab\_task / 装饰器双注册） & \cref{sec:rlmc-setup-unilab} & 中 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{延伸阅读}
+\label{sec:rlmc-setup-further}
+
+\begin{itemize}
+  \item \textbf{Rudin 等，「分钟级学会走路」}（arXiv:2109.11978）\,\cite{rudin2021minutes}——教你为什么\emph{大规模并行}是 RL 运控的吞吐根基，以及配套的 game-inspired 课程。本章 \cref{ins:rlmc-zero-copy} 的工程动机即源于此。
+  \item \textbf{RSL-RL 库}（arXiv:2509.10771）\,\cite{schwarke2025rslrl}——两框架默认 PPO 后端的设计文档，教你训练循环与算法实现如何解耦。
+  \item \textbf{mjlab}（arXiv:2601.22074）\,\cite{mjlab2026}——教你「Isaac Lab API + MuJoCo Warp」的轻量化路线：单命令安装、Viser 可视化、秒级启动。
+  \item \textbf{Isaac Lab 官方文档与 3.0 Beta 说明}\,\cite{isaaclab2024}——教你多后端架构（PhysX/Newton）、kit-less 安装与四元数 \texttt{wxyz}$\to$\texttt{xyzw} 迁移；遇版本问题以官方对照表为准。
+  \item \textbf{UniLab}（arXiv:2605.30313）\,\cite{unilab2026}——教你「CPU 异构仿真 + GPU 策略」如何绕开 GPU-sim 主导范式：共享内存 IPC 解耦 collector/learner、版本化权重同步、CPU$\to$GPU 的显式 H2D 管线，以及它特有的 \verb|/dev/shm| 预算守卫。本章 \cref{ins:rlmc-unilab-heterogeneous} 与 \cref{ins:rlmc-three-registries} 的对照即据此。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section{故障排查手册}
+\label{sec:rlmc-setup-troubleshoot}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{4.0cm}p{3.2cm}p{3.4cm}p{2.0cm}@{}}
+\toprule
+症状 & 可能原因 & 排查 & 相关节 \\
+\midrule
+\Verb[breaklines]|no kernel image| & PyTorch wheel 缺你 GPU 的 \texttt{sm} & 实跑 \Verb[breaklines]|randn(10).cuda()|；换匹配 wheel & \cref{sec:rlmc-setup-prep} \\
+\Verb[breaklines]|cuda.is_available()==False| & conda 装了 CPU 版 torch & 改用 pip + \Verb[breaklines]|--index-url .../cu121| & \cref{sec:rlmc-setup-isaaclab} \\
+首次运行卡数十秒 & Warp JIT 首次编译 & 等待，勿 Ctrl-C；后续走缓存 & \cref{ins:rlmc-jit} \\
+Viser 打不开 & 远程未端口转发 & \Verb[breaklines]|ssh -L 8080:localhost:8080| & \cref{sec:rlmc-setup-mjlab} \\
+Isaac Lab 启动即卡死 & 远程未加 \verb|--headless| & 加 \verb|--headless| & \cref{sec:rlmc-setup-isaaclab} \\
+\Verb[breaklines]|AttributeError: isaacsim ...| & Sim 与 Lab 版本不配套 & 查 README 版本对照表 & \cref{sec:rlmc-setup-isaaclab} \\
+L2 列任务报错 & 任务注册/asset 缺失 & 先确认 L0/L1 已过，再查 asset 路径 & \cref{sec:rlmc-setup-loop} \\
+reward 恒为 0 或 NaN & 观测全零 / 奖励除零 / 物理爆 & 打印观测与奖励分项；查动作缩放 & \cref{sec:rlmc-setup-compare} \\
+\verb|fps| 远低于预期 & 误开 viewer / sensor 太重 & 关 \verb|--viewer|；查相机/传感器 & \cref{ins:rlmc-read-log} \\
+（UniLab）\verb|MemoryError| 分配缓冲时 & \verb|/dev/shm| 超 80\%（\verb|num_envs| 太大） & 减小 \verb|algo.num_envs|/\allowbreak\Verb[breaklines]|replay_buffer_n| 或加大 shm & \cref{ins:rlmc-unilab-shm} \\
+（UniLab）训练卡住/陌生 traceback & collector 子进程静默死亡 & 读死亡报告的信号语义（SIGBUS/SIGKILL/SIGSEGV）& \cref{sec:rlmc-setup-unilab} \\
+（UniLab）\verb|num_envs| 不生效 & 误用 \verb|--num_envs| flag & 改 \Verb[breaklines]|algo.num_envs=| Hydra 覆盖 & \cref{sec:rlmc-setup-prep} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{版本信息速查}
+\label{sec:rlmc-setup-versions}
+
+\begin{finenote}
+本章命令与版本性陈述基于撰写时（2026 年中）的公开资料。已联网核对：mjlab 默认 RL 后端为 RSL-RL（on-policy/PPO）、默认可视化为 Viser（web，默认端口 8080）、官方示例任务含 \texttt{Mjlab-Velocity-Flat-Unitree-G1}（论文 arXiv:2601.22074）；mjlab 1.4.0 的 console\_scripts（\texttt{train}/\allowbreak\texttt{play}/\allowbreak\texttt{demo}/\allowbreak\texttt{list-envs}/\allowbreak\texttt{export-scene}/\allowbreak\texttt{viz-nan}）经实跑确认。Isaac Lab 3.0 Beta 的多后端（\texttt{isaaclab\_physx} 默认 / \texttt{isaaclab\_newton}）、kit-less 安装、四元数 \texttt{wxyz}$\to$\texttt{xyzw} 迁移（附 quaternion finder 工具）均见 v3.0.0-beta 发布说明；「真实 IMU 无法直接测线速度」的部署告警是 locomotion 通识（线速度观测在真机不可直接得）。Isaac Lab 的 \texttt{zero\_agent.\allowbreak py}/\allowbreak\texttt{random\_agent.\allowbreak py}/\allowbreak\texttt{list\_envs.\allowbreak py}/\allowbreak\texttt{rsl\_rl/\allowbreak train.\allowbreak py} 脚本路径经官方仓库核对。UniLab 部分基于对其源码的直接阅读与实跑（论文 arXiv:2605.30313）：异构 CPU-sim + GPU-policy 架构、共享内存 IPC（\texttt{SharedWeightSync}/\allowbreak\texttt{RolloutRingBuffer}/\allowbreak\texttt{ReplayBuffer}）、CLI 路由键 vs Hydra 覆盖二分、双后端（mujoco-uni 3.8.0 / motrixsim-core 0.8.2）、实测 26 个注册任务、\texttt{/dev/shm} 预算守卫、NaN 守卫 + \texttt{unilab-viz-nan} 离线复现，均经实测确认；具体命令与任务 slug 以你安装版本的 \texttt{--help} / 注册表实际输出为准。标 \texttt{\textbackslash rebuilt} 处（\texttt{Mjlab-...-Go2} 任务名——mjlab 1.4.0 只有 G1/Go1 速度任务、无 Go2）未在官方文档确认，请以你安装版本的 \texttt{--help} / 任务注册表实际输出为准。版本与命令以官方仓库与文档的最新版本为最终依据。
+\end{finenote}

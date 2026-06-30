@@ -1,0 +1,1795 @@
+\chapter{激光SLAM}
+\label{ch:lidar_slam}
+
+% ════════════════════════════════════════════════════════════════
+%  本章：吸收 SLAM Handbook ch8（系统框架/扫描配准/位置识别/位姿图）
+%  + LOAM(RSS2014)/LeGO-LOAM(IROS2018)/LIO-SAM(IROS2020)/FAST-LIO(RA-L2021)/FAST-LIO2(T-RO2022)
+%  + Forster 预积分(T-RO2016) + Bogoslavskyi-Stachniss range image 分割(IROS2016)。
+%  自包含独立记录，右扰动为主；FAST-LIO 迭代 ESKF 完整推导逐行展开。
+%  教学层遵循 v5.0 算法工程教学规范。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的对照表与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 一台 $10$\,Hz 的旋转激光雷达，在车辆以 $10$\,m/s 行驶时采集一帧点云。这一帧里第一个点和最后一个点，是在“同一个”传感器位姿下测到的吗？若不是，差多远？这会带来什么后果？
+  \item ICP（迭代最近点）每次迭代都做哪两件事？为什么必须\emph{迭代}，一次解不出来吗？
+  \item “点到点”“点到线”“点到面”三种 ICP 残差，哪个在走廊、隧道这类结构化环境里更准、更鲁棒？为什么？
+  \item 把 IMU 和激光雷达融合，“松耦合”和“紧耦合”差在哪里？为什么紧耦合通常更准？
+  \item 一帧激光含上千个特征点，标准卡尔曼滤波更新要对一个“测量维 $\times$ 测量维”的矩阵求逆。这个矩阵有多大？能不能把求逆的规模降到只和\emph{状态维}（$18$）有关？
+  \item 激光里程计每千米只漂一米，为什么还需要“回环检测 + 位姿图优化”？没有它会怎样？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{推导}激光里程计的扫描配准（scan registration）问题：写出 ICP 的目标函数、三种距离度量与对应关系搜索，并说清 scan-to-scan 与 scan-to-map 的精度差异来源；
+  \item \textbf{实现} LOAM 式的边/面特征提取（曲率判据）、点到线/点到面距离闭式，以及基于 Levenberg–Marquardt 的运动估计；
+  \item \textbf{解释}点云运动畸变的成因，并\textbf{掌握}四类去畸变方法（匀速插值、连续时间、IMU 预积分、逐点更新）的原理与适用边界；
+  \item \textbf{区分}松耦合与紧耦合 LIO，并\textbf{独立完成} LIO-SAM 因子图四类因子（IMU 预积分 / 激光里程计 / GPS / 回环）的残差写法；
+  \item \textbf{逐行推导} FAST-LIO 的紧耦合迭代 ESKF：$\boxplus/\boxminus$ 流形封装、前向/反向传播、误差状态动力学、MAP 表述、迭代卡尔曼更新，以及\textbf{证明}状态维增益公式与标准增益公式等价；
+  \item \textbf{设计}回环检测 + 位姿图优化（PGO）后端，说清位姿图的因子构成、鲁棒 PGO 与地图更新；
+  \item \textbf{选型}：面对具体平台（地面车 / 无人机 / 嵌入式 / 大场景），从 LOAM 家族中挑出合适方案并讲清取舍。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{从一帧点云到全局一致地图}”的主线：先把当前帧\textbf{对齐}到参考（扫描配准 = 里程计前端），再用\textbf{惯性}抑制畸变与退化（LIO），最后用\textbf{回环 + 位姿图}消除累积漂移（SLAM 后端）。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  bk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (rae) {观测模型\\ RAE 球坐标};
+\node[blk, right=of rae] (reg) {扫描配准\\ ICP / 特征 / NDT};
+\node[blk, right=of reg] (odo) {激光里程计\\ scan-to-scan/map};
+\node[blk, right=of odo] (deskew) {运动去畸变\\ IMU 预积分};
+\node[grp, below=8mm of rae] (loose) {松耦合 LIO\\（LOAM+IMU）};
+\node[grp, right=of loose] (tight) {紧耦合 LIO\\（因子图 / 滤波）};
+\node[grp, right=of tight] (fastlio) {FAST-LIO\\ 迭代 ESKF};
+\node[bk, below=8mm of loose] (loop) {位置识别\\ 回环检测};
+\node[bk, right=of loop] (pgo) {位姿图优化\\ PGO / iSAM2};
+\node[bk, right=of pgo] (map) {地图更新\\ 全局一致};
+\draw[ln] (rae)--(reg); \draw[ln] (reg)--(odo); \draw[ln] (odo)--(deskew);
+\draw[ln] (deskew.south) -- ++(0,-4.5mm) -| (loose.north);
+\draw[ln] (loose)--(tight); \draw[ln] (tight)--(fastlio);
+\draw[ln] (tight.south) -- (loop.north);
+\draw[ln] (loop)--(pgo); \draw[ln] (pgo)--(map);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径（骨干 only 速通）}：第 \ref{sec:lidar-rae} 节（RAE 观测模型，激光读数如何成为状态估计的观测）$\to$ 第 \ref{sec:lidar-scan-reg} 节（扫描配准与 ICP）$\to$ 第 \ref{sec:lidar-loam} 节（LOAM 特征里程计）$\to$ 第 \ref{sec:lidar-deskew} 节（去畸变）$\to$ 第 \ref{sec:lidar-fastlio} 节（FAST-LIO 迭代 ESKF）$\to$ 第 \ref{sec:lidar-loop} 节（回环 + 位姿图），约需精读 $6$–$8$ 小时即可建立完整骨架。第 \ref{sec:lidar-lego}、\ref{sec:lidar-liosam} 节（LeGO-LOAM、LIO-SAM）是工程加固，次优够用；第 \ref{sec:lidar-place} 节（位置识别方法学）面向研究，可选深潜。
+
+\subsection*{前置知识桥接}
+本章把前几章的工具直接“拼装”成一个真实系统，请先激活以下前置：
+\begin{itemize}
+  \item \textbf{观测建模与主轴旋转}（\cref{ch:rigid_body}）：绕坐标轴的基本旋转 $\mathbf{C}_2(\cdot),\mathbf{C}_3(\cdot)$ 与球坐标——第 \ref{sec:lidar-rae} 节的 RAE（距离-方位-俯仰）观测模型用它们把“一束激光的一距 + 两角”读数映到笛卡尔点，是激光接入 EKF-SLAM 等滤波估计器的观测函数来源。
+  \item \textbf{点云与近邻搜索}（\cref{ch:pointcloud}）：点云 $P=\{\mathbf{p}_i\in\mathbb{R}^3\}$、KD-tree 的 $k$ 近邻查询、体素降采样、法向/曲率估计、NDT 的分布化表示——本章的扫描配准、特征提取、地图组织全部建在这些之上。
+  \item \textbf{误差状态卡尔曼滤波}（\cref{ch:eskf}）：名义状态 + 误差状态的分离、误差状态线性动力学 $\delta\dot{\mathbf{x}}=\mathbf{F}\delta\mathbf{x}+\mathbf{G}\mathbf{w}$、预测/更新两步、注入与重置——FAST-LIO 的迭代 ESKF 是它在 $\SO(3)$ 流形上的迭代版。
+  \item \textbf{李群与右扰动}（\cref{ch:lie}）：$\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\phi})$ 右扰动、右雅可比 $\mathbf{J}_r$ 及其逆、$\boxplus/\boxminus$ 流形封装算子。本章 FAST-LIO 整套滤波都建在 $\boxplus/\boxminus$ 上，去畸变用到 $\SE(3)$ 复合，预积分用到右雅可比。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 在工程里上手 LOAM / FAST-LIO 这类开源系统时，你会看到“去畸变”“两步 LM”“迭代 EKF 的新增益公式”等模块却不知其所以然，只能照抄参数、无法在退化场景（长走廊、雪雾、快速旋转）里调试；
+  \item 在 \cref{ch:vio}（VIO）里会复用本章的 IMU 预积分与紧耦合思想，跳过本章则会发现“激光紧耦合”和“视觉紧耦合”其实是同一套数学的两个实例，却无法迁移。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\label{tab:lidar-reading}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含 FAST-LIO 全推导与练习） & 6--8 小时 & 首次系统学激光 SLAM、要做 LIO 后端 \\
+速读（跳过附录证明与实验数值） & 2.5 小时 & 有滤波基础、想对齐本书记号与右扰动约定 \\
+速查（只看小结的符号表 + 对照表 + 速查卡） & 20 分钟 & 写代码、调参时回来查公式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+旋转矩阵 $\mathbf{R}\in\SO(3)$（Handbook\cite{carlone2026handbook}、LOAM 家族多直接用 $\mathbf{R}$，与本书一致）；位姿 $\mathbf{T}=\big[\begin{smallmatrix}\mathbf{R}&\mathbf{t}\\\mathbf{0}^\top&1\end{smallmatrix}\big]\in\SE(3)$。
+点云 $P=\{\mathbf{p}_i\in\mathbb{R}^3\}$，源点云 $P$（当前帧）配准到目标点云 $Q$（参考帧或地图）。
+\textbf{扰动以右扰动为主} $\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\phi})$（局部坐标），$\boxplus/\boxminus$ 取右乘约定 $\mathbf{R}\boxplus\mathbf{r}=\mathbf{R}\,\mathrm{Exp}(\mathbf{r})$、$\mathbf{R}_1\boxminus\mathbf{R}_2=\mathrm{Log}(\mathbf{R}_2^\top\mathbf{R}_1)$。
+\textbf{噪声协方差}：过程 $\boldsymbol{\Sigma}_{\mathbf{w}}$（FAST-LIO 原文记 $\mathbf{Q}$）、观测 $\boldsymbol{\Sigma}_{\mathbf{v}}$（原文记 $\mathbf{R}_j$——\textbf{注意它与旋转 $\mathbf{R}$ 同字母，本章一律用 $\boldsymbol{\Sigma}_{\mathbf{v}}$ 避歧义}）；误差状态协方差 $\mathbf{P}$。
+\textbf{先验/后验}：传播预测 $\hat{\mathbf{x}}$、更新后 $\bar{\mathbf{x}}$、反向传播相对量 $\check{\mathbf{x}}$、误差 $\tilde{\mathbf{x}}$（沿用 FAST-LIO 的 check/hat/bar 体系）。
+反对称算子 $(\cdot)^\wedge$（即叉积矩阵，$\mathbf{a}^\wedge\mathbf{b}=\mathbf{a}\times\mathbf{b}$；FAST-LIO 原文记 $\lfloor\cdot\rfloor_\wedge$，本章统一 $(\cdot)^\wedge$）。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么需要激光 SLAM：从测距到一致地图}
+\label{sec:lidar-why}
+
+\paragraph{动机：激光雷达直接给出度量结构。}
+激光雷达（LiDAR）是一种\emph{主动}传感器：它发射激光脉冲，测量脉冲被表面反射回探测器的\textbf{飞行时间}（Time-of-Flight, TOF），由 $d=\tfrac12 c\,\Delta t$（$c$ 为光速）直接换算出距离\cite{carlone2026handbook}。把每束激光的角度与距离配对，就得到环境的三维点云。与相机相比，激光雷达有两个根本优势：(1) 测量是\emph{度量}的、误差与距离基本无关，不像单目相机有尺度不确定性；(2) 它\emph{主动}发光，对环境光照与纹理不敏感，黑暗、无纹理墙面照样工作。代价是点云\emph{稀疏}（远处尤其稀）、且单帧只是结构而非外观，这给后面的位置识别带来独特困难（\cref{sec:lidar-place}）。
+
+\paragraph{历史：从固定测绘到实时机器人。}
+$1960$–$70$ 年代激光测距系统笨重昂贵，用于大气研究、地形测绘、军事\cite{carlone2026handbook}；$80$ 年代变紧凑但仍以固定式为主；$90$ 年代激光雷达与 GPS、IMU 集成，催生车载/机载移动测绘；$2000$ 年代初二维激光雷达推动了概率建图与 SLAM 的发展——其中 Lu 与 Milios 首创\emph{全局一致}的二维扫描配准，提出用一张\textbf{位姿网络}（network of poses）联合约束各帧位姿，这一思想正是现代\emph{位姿图}（pose-graph，\cref{sec:lidar-loop}）的直接前身，为贯穿全章后端的“图优化”埋下伏笔；其后一批工作把扫描配准纳入\emph{概率}框架，Olson 更以\emph{相关法}（correlation）实现实时配准\cite{carlone2026handbook}。三维激光里程计的方法多由这些二维技术\emph{扩展}而来——靠主动旋转/扫掠或被动平台运动\emph{累积}出稠密点云，再把二维配准的思路抬到三维。$2004$ 年 DARPA Grand Challenge、$2007$ 年 Urban Challenge 把三维激光雷达推上自动驾驶舞台，催生了开创性的 Velodyne HDL-64E。$2014$ 年 LOAM\cite{zhang2014loam} 首次实现\emph{实时}三维扫描配准与建图，成为此后整个激光 SLAM 体系的基础。
+
+\paragraph{核心问题：里程计漂移 vs 全局一致。}
+一个完整的激光 SLAM 系统要回答两个层次的问题（\cref{fig:lidar-pipeline}）：
+\begin{enumerate}
+  \item \textbf{激光里程计（局部一致）}：给定一帧扫描和过去的观测，\emph{实时}估计传感器的增量自运动。优秀的三维激光里程计可达\textbf{约每行进 $1000$\,m 漂移 $1$\,m}（$0.1\%$ 量级）\cite{carlone2026handbook}，但漂移仍随路程\emph{无界累积}。
+  \item \textbf{激光 SLAM（全局一致）}：当传感器回到曾经到过的地方（\emph{回环}），系统据此校正\emph{整条}轨迹与地图，使全局保持一致。
+\end{enumerate}
+本章主线即沿这两层展开：第 \ref{sec:lidar-scan-reg}–\ref{sec:lidar-fastlio} 节是里程计前端（含 LIO），第 \ref{sec:lidar-place}–\ref{sec:lidar-loop} 节是 SLAM 后端（位置识别 + 位姿图）。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=6mm,
+  box/.style={draw, rounded corners, align=center, minimum height=8mm, inner sep=3pt},
+  o/.style={box, fill=main!8, draw=main!60!black},
+  b/.style={box, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!55!black}]
+  \node[o] (scan) {LiDAR\\ 扫描};
+  \node[o, right=of scan] (mc) {运动\\ 补偿};
+  \node[o, right=of mc] (corr) {对应\\ 关系};
+  \node[o, right=of corr] (pose) {相对\\ 位姿};
+  \node[b, right=10mm of pose] (lc) {回环\\ 检测};
+  \node[b, right=of lc] (pg) {位姿图\\ 优化};
+  \node[b, right=of pg] (mu) {地图\\ 更新};
+  \draw[ln] (scan)--(mc); \draw[ln] (mc)--(corr); \draw[ln] (corr)--(pose);
+  \draw[ln] (pose)--(lc); \draw[ln] (lc)--(pg); \draw[ln] (pg)--(mu);
+  \draw[ln, dashed] (pose) to[out=-40,in=-140] node[midway,below,font=\scriptsize]{迭代精化对应} (corr);
+  \node[font=\scriptsize, main!50!black, above=1mm of mc] {里程计前端（$\sim$10\,Hz）};
+  \node[font=\scriptsize, third!50!black, above=1mm of pg] {SLAM 后端（$\sim$1\,Hz）};
+\end{tikzpicture}
+\caption{激光 SLAM 系统的概念结构：里程计前端（运动补偿 $\to$ 对应关系 $\to$ 相对位姿，迭代）维护局部一致估计；后端（回环检测 $\to$ 位姿图优化 $\to$ 地图更新）维护全局一致。（仿 \cite{carlone2026handbook} 图 8.4/8.7 重绘）}
+\label{fig:lidar-pipeline}
+\end{figure}
+
+\paragraph{传感器分类（选型背景）。}
+按传感机理，激光雷达分为：机械式（旋转组件引导激光，最常见，受机械磨损限制）、扫描式固态（MEMS 镜\cite{carlone2026handbook} 或光学相控阵 OPA 偏转光束、机械部件少、寿命长）、闪光式（flash，可提供类相机的环境通道）、宏观扫描 Risley 棱镜（螺旋扫描、随时间累积稠密点云、当前 FoV 受限）\cite{carlone2026handbook}。本章重点是二维/三维机械式与宏观扫描两类。
+
+\paragraph{三种测距物理：ToF、AMCW、FMCW。}\label{par:lidar-ranging}
+本章默认的测距机制是\textbf{飞行时间}（TOF，$d=\tfrac12 c\Delta t$）——直接测脉冲往返时间，分辨率高，但对环境光敏感（信噪比被压低，进而限制精度与频率）\cite{carlone2026handbook}。另两种机制借自雷达：\textbf{调幅连续波}（AMCW）连续发光、用回波幅度调制的相位差换算距离；\textbf{调频连续波}（FMCW）连续投射\emph{变频}光，由收发频移直接读出距离，且\emph{额外免费给出一维径向速度}（多普勒），对动态场景剔除动目标有用，代价是更复杂昂贵。值得点出的是：FMCW 这条“频移读速度”的物理，在激光里只是锦上添花（点云本就稠密、结构信息已足），到了\emph{毫米波雷达}那里却反客为主、成了里程计的主心骨——同一套调频测距/测速原理的完整推导与“多普勒里程计”见 \cref{ch:radar}，本章不再展开，只点明激光侧的差别在于激光给的是稠密各向同性的几何、雷达给的是稀疏含噪但全天候且自带速度的观测。
+
+\begin{pitfall}[概念误区：把“扫描（scan）”当成某一瞬间的静态快照]
+一帧 scan 是传感器一次完整旋转/扫掠采集的点集，历时一个扫描周期（$10$\,Hz 即 $0.1$\,s）。若传感器在这 $0.1$\,s 内运动，\textbf{帧内各点是在不同时刻、不同位姿测到的}——这正是“运动畸变”的根源（\cref{sec:lidar-deskew}）。把 scan 当作单一时刻的快照，是激光 SLAM 初学者最常见、后果最严重的误解：它会让你漏掉运动去畸变这一步，从而在高速/快速旋转下得到“歪掉”的点云和发散的配准。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{激光的观测模型：从 RAE 球坐标到点云}
+\label{sec:lidar-rae}
+
+\paragraph{动机：一束激光“原生”测到的不是 $(x,y,z)$，而是距离与两个角。}
+\cref{sec:lidar-why} 说“把每束激光的角度与距离配对，就得到点云”——这一步看似平凡，却正是把激光雷达接入状态估计的\emph{观测模型}。一台旋转/扫描式激光雷达的物理读数是三元组：脉冲飞行时间换算的\textbf{距离}（range）$r$，以及偏转激光束的两面镜子（或扫描机构）的角度——\textbf{方位角}（azimuth）$\alpha$ 与\textbf{俯仰角}（elevation）$\epsilon$。也就是说，传感器\emph{原生}地在\textbf{球坐标}下观测空间一点 $P$，这类模型称\textbf{距离-方位-俯仰}（range–azimuth–elevation, RAE）模型\cite{barfoot2024state}。它不止用于激光：声呐、雷达、转台测距等“一束 + 两角”的传感器都共享同一套观测几何，是与相机透视模型并列的另一大主力观测模型。本节把 RAE 的正/逆映射与雅可比补全，再退化出移动机器人滤波 SLAM 最常用的\emph{平面距离-方位}模型——后续 ICP/LOAM/LIO 把点云当作笛卡尔坐标处理（\cref{sec:lidar-scan-reg} 起），其每个点的“出身”正是这里的一次 RAE 观测。
+
+\paragraph{正向映射：球坐标 $\to$ 笛卡尔。}
+设点 $P$ 在传感器系 $\mathcal F_s$ 中的坐标为
+\begin{equation}
+  \boldsymbol\rho=\mathbf r_s^{ps}=\begin{bmatrix}x\\y\\z\end{bmatrix}\in\mathbb R^3,
+  \label{eq:lidar-rae-rho}
+\end{equation}
+约定 $x$ 轴指向激光“零位”朝前、$z$ 轴朝上（\cref{fig:lidar-rae}）。一束以方位 $\alpha$、俯仰 $\epsilon$、距离 $r$ 测得的点，可由\emph{先绕 $z$ 转 $\alpha$、再绕 $y$ 抬 $\epsilon$} 把一个沿 $x$ 轴、长度 $r$ 的向量旋到 $P$ 处。用 \cref{ch:rigid_body} 的主轴旋转矩阵 $\mathbf C_2(\cdot),\mathbf C_3(\cdot)$（绕 $2$ 轴、$3$ 轴的基本旋转），写成
+\begin{equation}
+  \boldsymbol\rho=\mathbf C_3^\top(\alpha)\,\mathbf C_2^\top(-\epsilon)\begin{bmatrix}r\\0\\0\end{bmatrix},
+  \label{eq:lidar-rae-fwd-rot}
+\end{equation}
+其中俯仰按右手定则取负号（抬头为正、绕 $y$ 轴的右手转动方向向下）。代入主轴旋转的显式形式并乘开：
+\begin{equation}
+  \begin{bmatrix}x\\y\\z\end{bmatrix}
+  =\begin{bmatrix}
+   r\cos\alpha\cos\epsilon\\
+   r\sin\alpha\cos\epsilon\\
+   r\sin\epsilon
+  \end{bmatrix},
+  \label{eq:lidar-rae-fwd}
+\end{equation}
+即标准球坐标公式。可立即验证 $x^2+y^2+z^2=r^2$、$z/r=\sin\epsilon$、$y/x=\tan\alpha$，与下面的逆映射自洽。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, scale=1.5]
+  % axes
+  \draw[->, thick] (0,0,0) -- (1.3,0,0) node[right]{$x$};
+  \draw[->, thick] (0,0,0) -- (0,1.2,0) node[above]{$z$};
+  \draw[->, thick] (0,0,0) -- (0,0,1.5) node[below left]{$y$};
+  \node[below left] at (0,0,0) {$\mathcal F_s$};
+  % point P
+  \coordinate (P) at (0.95,0.6,0.9);
+  \fill[main!70!black] (P) circle (1.3pt) node[above right]{$P$};
+  % range vector r
+  \draw[->, very thick, main!70!black] (0,0,0) -- (P) node[midway, above left, font=\scriptsize]{$r$};
+  % projection onto xy(ground) plane
+  \coordinate (Pg) at (0.95,0,0.9);
+  \draw[dashed, gray] (P) -- (Pg);
+  \draw[dashed, gray] (0,0,0) -- (Pg);
+  \draw[dashed, gray] (Pg) -- (0.95,0,0);
+  \draw[dashed, gray] (Pg) -- (0,0,0.9);
+  % azimuth angle (in horizontal plane, from x axis toward ground projection)
+  \draw[->, second!60!black] (0.45,0,0) to[bend left=10] (0.34,0,0.32);
+  \node[second!60!black, font=\scriptsize] at (0.58,0,0.18) {$\alpha$};
+  % elevation angle (from ground projection up to r)
+  \draw[->, third!60!black] (0.48,0,0.455) to[bend left=12] (0.46,0.29,0.435);
+  \node[third!60!black, font=\scriptsize] at (0.70,0.26,0.52) {$\epsilon$};
+\end{tikzpicture}
+\caption{RAE（距离-方位-俯仰）观测几何：激光雷达在球坐标下观测点 $P$——距离 $r$（沿测量射线）、方位 $\alpha$（水平面内绕 $z$ 轴）、俯仰 $\epsilon$（射线与水平面的夹角）。这正是把一束激光的“一距 + 两角”读数对应到笛卡尔点 $\boldsymbol\rho=[x,y,z]^\top$ 的几何。（仿 \cite{barfoot2024state} 图 7.13 重绘）}
+\label{fig:lidar-rae}
+\end{figure}
+
+\paragraph{逆向映射：这才是我们要的观测模型 $\mathbf s(\boldsymbol\rho)$。}
+\cref{eq:lidar-rae-fwd} 是“已知 $(r,\alpha,\epsilon)$ 求 $\boldsymbol\rho$”，但状态估计需要的是反过来——给定路标在传感器系的坐标 $\boldsymbol\rho$，预测传感器\emph{将读到}什么 $(r,\alpha,\epsilon)$。反解 \cref{eq:lidar-rae-fwd} 得 \textbf{RAE 观测模型}：
+\begin{equation}
+  \mathbf z=\begin{bmatrix}r\\\alpha\\\epsilon\end{bmatrix}
+  =\mathbf s(\boldsymbol\rho)
+  =\begin{bmatrix}
+   \sqrt{x^2+y^2+z^2}\\[2pt]
+   \arctan\!\big(y/x\big)\\[2pt]
+   \arcsin\!\big(z/\sqrt{x^2+y^2+z^2}\big)
+  \end{bmatrix}.
+  \label{eq:lidar-rae-model}
+\end{equation}
+实现时 $\alpha$ 用四象限反正切 $\operatorname{atan2}(y,x)$ 以覆盖 $(-\pi,\pi]$。这就是激光/声呐/雷达接入 EKF-SLAM、FastSLAM 等滤波估计器的标准观测函数：把路标点经位姿变换到传感器系得 $\boldsymbol\rho$，再过 $\mathbf s(\cdot)$ 得预测读数，与实测 $(r,\alpha,\epsilon)$ 作差即新息。
+
+\paragraph{对状态的雅可比。}
+非线性滤波（EKF/UKF，见 \cref{ch:eskf} 及估计部分）需要观测模型对状态的雅可比。设路标在世界系坐标 $\mathbf p^w$，传感器位姿把它映到传感器系 $\boldsymbol\rho=\mathbf R_{sw}(\mathbf p^w-\mathbf t)$，则由链式法则 $\partial\mathbf z/\partial(\cdot)=\mathbf H_{\boldsymbol\rho}\cdot\partial\boldsymbol\rho/\partial(\cdot)$，其中核心是观测对传感器系坐标的雅可比 $\mathbf H_{\boldsymbol\rho}\doteq\partial\mathbf s/\partial\boldsymbol\rho$。逐行对 \cref{eq:lidar-rae-model} 求偏导，记 $r=\sqrt{x^2+y^2+z^2}$、$\rho_{xy}\doteq\sqrt{x^2+y^2}$：
+\begin{equation}
+  \mathbf H_{\boldsymbol\rho}=\frac{\partial\mathbf s}{\partial\boldsymbol\rho}
+  =\begin{bmatrix}
+   \dfrac{x}{r} & \dfrac{y}{r} & \dfrac{z}{r}\\[10pt]
+   -\dfrac{y}{x^2+y^2} & \dfrac{x}{x^2+y^2} & 0\\[10pt]
+   -\dfrac{xz}{r^2\,\rho_{xy}} & -\dfrac{yz}{r^2\,\rho_{xy}} & \dfrac{\rho_{xy}}{r^2}
+  \end{bmatrix}.
+  \label{eq:lidar-rae-jac}
+\end{equation}
+三行的来历：第一行 $\partial r/\partial\boldsymbol\rho=\boldsymbol\rho^\top/r$（距离对坐标的单位径向方向）；第二行由 $\partial\arctan(y/x)=\big(x\,dy-y\,dx\big)/(x^2+y^2)$ 得；第三行对 $\epsilon=\arcsin(z/r)$ 求导，用 $\tfrac{d}{du}\arcsin u=1/\sqrt{1-u^2}$ 且 $1-(z/r)^2=\rho_{xy}^2/r^2$，再分别对 $x,y,z$ 链式展开（$\partial r/\partial x=x/r$ 等）即得。最后乘上 $\partial\boldsymbol\rho/\partial(\cdot)$：对路标位置 $\partial\boldsymbol\rho/\partial\mathbf p^w=\mathbf R_{sw}$；对传感器位姿，用 \cref{ch:lie} 的右扰动求导 $\partial(\mathbf R_{sw}(\mathbf p^w-\mathbf t))/\partial\boldsymbol\varphi$ 与 $\partial/\partial\mathbf t$，即把 RAE 观测挂到位姿与路标上。
+
+\paragraph{平面退化：移动机器人的距离-方位模型。}
+当运动与观测约束在水平面（地面移动机器人 + 二维激光雷达）时，$z=0$ 故 $\epsilon=0$，RAE 模型 \cref{eq:lidar-rae-model} 退化为只剩距离与方位的\textbf{距离-方位}（range–bearing）模型：
+\begin{equation}
+  \mathbf z=\begin{bmatrix}r\\\alpha\end{bmatrix}
+  =\mathbf s(\boldsymbol\rho)
+  =\begin{bmatrix}\sqrt{x^2+y^2}\\\arctan(y/x)\end{bmatrix},
+  \qquad
+  \mathbf H_{\boldsymbol\rho}=\begin{bmatrix}\dfrac{x}{r}&\dfrac{y}{r}\\[8pt]-\dfrac{y}{r^2}&\dfrac{x}{r^2}\end{bmatrix}
+  \;(r=\rho_{xy}).
+  \label{eq:lidar-rangebearing}
+\end{equation}
+这是经典滤波 SLAM 文献里最常见的观测模型——EKF-SLAM 把它对“机器人位姿 + 路标坐标”联合线性化，每观测一个路标就用 \cref{eq:lidar-rangebearing} 的雅可比更新协方差。它也是 \cref{ch:slam_est}/估计部分讲数据关联与一致性时的标准 worked example。
+
+\begin{insight}[为什么观测要建在“原生”测量上，而非笛卡尔点上]\label{ins:lidar-rae-noise}
+直接把激光读数转成 $(x,y,z)$ 再当作“笛卡尔观测”看似方便，却把噪声结构搞错了：激光的原生噪声是\emph{距离方向}与\emph{角度方向}近似独立的（$r$ 的标准差由测距精度定、$\alpha,\epsilon$ 由角分辨率定），在球坐标下协方差近似对角 $\operatorname{diag}(\sigma_r^2,\sigma_\alpha^2,\sigma_\epsilon^2)$。一旦经 \cref{eq:lidar-rae-fwd} 非线性映射到笛卡尔，等距离误差 $\sigma_r$ 与等角误差 $r\sigma_\alpha$ 会把噪声“拉”成一个\emph{随距离拉长、随方向倾斜}的椭球——远处点沿切向被角误差放大成长条。所以严格的滤波 SLAM 在 RAE 空间定义观测噪声、用 \cref{eq:lidar-rae-jac} 把协方差传到笛卡尔（或反之），而不是假设笛卡尔点各向同性。这也解释了为什么 ICP（\cref{sec:lidar-scan-reg}）默认点云各向同性只是\emph{工程近似}，高精度配准会按距离对点加权。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）从 \cref{eq:lidar-rae-fwd-rot} 出发，代入 \cref{ch:rigid_body} 的 $\mathbf C_2(\cdot),\mathbf C_3(\cdot)$ 显式形式，乘开验证 \cref{eq:lidar-rae-fwd}；并由它反解出 \cref{eq:lidar-rae-model}。
+  \item （雅可比）逐行推导 \cref{eq:lidar-rae-jac} 的三行，重点核对俯仰行用到的 $1-(z/r)^2=\rho_{xy}^2/r^2$。再验证令 $z=0$ 时它退化为 \cref{eq:lidar-rangebearing} 的 $2\times2$ 块。
+  \item （综合，仿 \cite{barfoot2024state} 习题 7.10）一台二维激光雷达的移动机器人沿走廊停走若干次，已知相邻位姿的相对变换 $\mathbf T_{k,k+1}\in\SE(2)$。用 \cref{eq:lidar-rangebearing} 的读数 + 位姿链把各次扫描拼到同一世界系画出地图；并讨论：仅凭\emph{单次}距离-方位扫描，能否唯一确定机器人在已知地图中的位姿？给出能/不能的几何条件。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{扫描配准与 ICP：里程计的数学内核}
+\label{sec:lidar-scan-reg}
+
+\paragraph{动机：相对位姿 = 把当前帧对齐到参考。}
+激光里程计的核心动作是\textbf{扫描配准}（scan registration / scan matching）：精细对齐一对点云，估计它们之间的相对刚体变换 $(\mathbf{R},\mathbf{t})$。一旦能算出“当前帧相对上一帧（或相对局部地图）”的变换，把这些增量串起来就是里程计轨迹。所以扫描配准是整个激光 SLAM 的数学内核——LOAM、LIO-SAM、FAST-LIO 的前端配准，本质都是 ICP 的变体。
+
+\paragraph{反面：没有对应关系的闭式法不实用。}
+历史上 Horn 方法\cite{horn1987closed} 给出了点云配准的\emph{闭式解}（用四元数或 SVD 一步求出最优 $\mathbf{R},\mathbf{t}$），但它要求\textbf{对应关系预先已知}——即已经知道源点云的哪个点对应目标点云的哪个点。真实激光数据里两帧点根本不是一一对应的（采样位置不同、有遮挡、有噪声），对应关系未知，闭式法直接失效。这正是 ICP（Iterative Closest Point）\cite{besl1992icp} 的切入点：它\emph{不需要}先验对应，而是“猜对应 $\to$ 求变换 $\to$ 用新变换重新猜对应”地迭代，因此成为最基础、最流行的配准技术。
+
+\paragraph{ICP 的目标函数。}
+记源点云 $P$（source，常为当前帧）、目标点云 $Q$（target，常为上一帧或局部地图）。ICP 在第 $k$ 次迭代求变换 $(\mathbf{R}^k,\mathbf{t}^k)$ 最小化由距离度量 $d(\cdot)$ 衡量的总配准误差\cite{carlone2026handbook}：
+\begin{equation}
+  (\mathbf{R}^k,\mathbf{t}^k)=\arg\min_{\mathbf{R},\mathbf{t}}\ \sum_{(\mathbf{p},\mathbf{q})\in\mathsf{C}} d\big(\mathbf{p},\ \mathbf{R}\mathbf{q}+\mathbf{t}\big),
+  \label{eq:lidar-icp-obj}
+\end{equation}
+其中对应关系集合 $\mathsf{C}$ 由当前变换下的最近邻给出：
+\begin{equation}
+  \mathsf{C}=\Big\{(\mathbf{p},\mathbf{q})\ \Big|\ \mathbf{p}\in P,\ \mathbf{q}=\arg\min_{\mathbf{q}'\in Q}\big\|\mathbf{p}-(\mathbf{R}^{k-1}\mathbf{q}'+\mathbf{t}^{k-1})\big\|_2\Big\}.
+  \label{eq:lidar-icp-corr}
+\end{equation}
+\cref{eq:lidar-icp-obj}、\cref{eq:lidar-icp-corr} 一起定义了 ICP 的两步迭代：用上一次的变换 $(\mathbf{R}^{k-1},\mathbf{t}^{k-1})$ 重新搜对应（\cref{eq:lidar-icp-corr}），再固定对应求新变换（\cref{eq:lidar-icp-obj}），交替到收敛。
+
+\begin{note}
+\textbf{配准方向的约定提醒.}\;
+Handbook 把变换写成作用在 target 点 $\mathbf{q}$ 上（$\mathbf{R}\mathbf{q}+\mathbf{t}$），而许多教科书把变换作用在 source 点上（$\|\mathbf{q}-(\mathbf{R}\mathbf{p}+\mathbf{t})\|$）。两者只是“把谁对齐到谁”的记法差异，物理意义都是\emph{把当前帧配准到参考帧/局部地图}。实现时务必\textbf{自始至终固定一个方向}，否则会把 $\mathbf{R}$ 用成 $\mathbf{R}^\top$、平移符号反向。本章统一为“把当前帧（source）对齐到参考（target/地图）”。
+\end{note}
+
+\subsection{三种距离度量：点-点、点-线、点-面}
+\label{sec:lidar-dist}
+
+要最小化 \cref{eq:lidar-icp-obj}，必须先确定用什么几何关系定义距离 $d(\cdot)$。\textbf{点、线、面}是最常用的三类几何元素\cite{carlone2026handbook}（\cref{fig:lidar-dist}）：
+
+\begin{itemize}
+  \item \textbf{点到点（point-to-point）}：$d=\|\mathbf{p}-(\mathbf{R}\mathbf{q}+\mathbf{t})\|^2$，最基础。Besl–McKay\cite{besl1992icp}、Zhang\cite{zhang1994iterative} 的开创性工作把形状（曲线、曲面）匹配表述为点集匹配。代价直接，但对噪声、外点、点稀疏\emph{敏感}：两帧采样位置不同，几乎不会采到同一个物理点，强行点对点会引入系统偏差。
+  \item \textbf{点到线（point-to-line）}：度量一个点到另一帧中“由若干点重建出的直线”的最短距离。在带线性结构（墙角、杆、栏杆）的环境中更准。
+  \item \textbf{点到面（point-to-plane）}：度量一个点到另一帧局部平面的距离。它\emph{允许点沿平面切向滑动}（切向移动不产生残差），因此对“两帧采样位置不同”天然鲁棒、收敛更快，在带平面（地面、墙、桌面）的环境中精度最高。这是现代激光里程计（LOAM、FAST-LIO）的主力残差。
+\end{itemize}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, scale=1.0]
+  % point-to-point
+  \begin{scope}
+    \fill[main!70!black] (0,0) circle (1.6pt) node[above]{$\mathbf{p}$};
+    \fill[second!70!black] (1.2,0.5) circle (1.6pt) node[above]{$\mathbf{q}$};
+    \draw[->, very thick, red] (0,0)--(1.2,0.5) node[midway,below]{$d$};
+    \node[font=\scriptsize] at (0.6,-0.9) {(a) 点到点};
+  \end{scope}
+  % point-to-line
+  \begin{scope}[xshift=3.6cm]
+    \draw[second!70!black, thick] (0.1,-0.3)--(2.0,0.7);
+    \fill[second!70!black] (0.4,-0.16) circle (1.4pt); \fill[second!70!black] (1.7,0.55) circle (1.4pt);
+    \fill[main!70!black] (0.9,0.9) circle (1.6pt) node[above]{$\mathbf{p}$};
+    \draw[->, very thick, red] (0.9,0.9)--(1.18,0.39) node[midway,right]{$d$};
+    \node[font=\scriptsize] at (1.0,-0.9) {(b) 点到线};
+  \end{scope}
+  % point-to-plane
+  \begin{scope}[xshift=7.2cm]
+    \draw[second!50!black, fill=second!10] (0.1,-0.3)--(2.0,-0.1)--(2.3,0.5)--(0.4,0.3)--cycle;
+    \fill[main!70!black] (1.1,1.0) circle (1.6pt) node[above]{$\mathbf{p}$};
+    \draw[->, very thick, red] (1.1,1.0)--(1.18,0.12) node[midway,right]{$d$};
+    \node[font=\scriptsize] at (1.1,-0.9) {(c) 点到面};
+  \end{scope}
+\end{tikzpicture}
+\caption{ICP 的三种典型距离度量。点到线、点到面把残差算到“用 target 邻域重建出的高层几何”上；点到面允许点沿平面切向自由滑动，故对采样位置差异最鲁棒。（仿 \cite{carlone2026handbook} 图 8.3 重绘）}
+\label{fig:lidar-dist}
+\end{figure}
+
+\paragraph{基于分布的配准：NDT。}
+除几何距离外，还有一类\emph{分布对分布}的配准。正态分布变换（Normal Distributions Transform, NDT）\cite{biber2003ndt} 把点云划分成体素，对每个体素内的点拟合一个正态分布 $\mathcal{N}(\boldsymbol{\mu}_c,\boldsymbol{\Sigma}_c)$，配准时不付出“逐点找最近邻”的代价，而是让源点落在 target 体素分布的高概率区。它给出更平滑、更鲁棒的代价曲面，在复杂环境中尤其有利（详细的体素分布化表示见 \cref{ch:pointcloud}）。还有方法\cite{magnusson2009ndt} 直接比较两点云局部邻域\emph{概率分布}之差，而非欧氏距离。
+
+\subsection{对应关系搜索与实时加速}
+\label{sec:lidar-corr}
+
+ICP 的第二个核心设计是\textbf{数据关联}（data association）：为每个源点在 target 中找对应。最朴素的做法是 \cref{eq:lidar-icp-corr} 的精确最近邻搜索，但在含数千点的大点云上每次迭代都做一遍极昂贵。为让里程计实时运行，有两类加速策略\cite{carlone2026handbook}：
+\begin{enumerate}
+  \item \textbf{缩减候选集}：只保留满足几何准则的点——确定位于\emph{边/面}上的点\cite{zhang2014loam}、\emph{移除描述性弱的地平面点}\cite{shan2018legoloam}、对 target 做\emph{降采样}\cite{vizzo2023kissicp}。代价是可能移除真正的对应。
+  \item \textbf{改用近似搜索结构}：在\emph{距离图像}（range image）上做投影式邻居搜索\cite{behley2018efficient}、用\emph{体素网格}做近似邻居搜索\cite{zhang2014loam}。即便不总给出精确最近邻，也大幅提速。
+\end{enumerate}
+此外，对应也可在\emph{特征空间}里找\cite{shan2018legoloam}，而非纯几何空间。这两类策略共同把 ICP 从“离线精配准”推向“实时里程计”。
+
+\begin{insight}
+点到面残差的本质是\textbf{把约束只施加在“几何上可观测”的方向上}。两帧激光采样位置不同，沿平面切向的点对点差异其实是\emph{伪误差}（采样抖动），不该惩罚；点到面残差用法向投影 $\mathbf{u}^\top(\cdot)$ 把切向分量\emph{投影掉}，只留下沿法向（真正可观测）的距离。这就是为什么点到面比点到点收敛快、对稀疏点鲁棒——它不去“拟合采样噪声”。同样的思想会在 FAST-LIO 的测量模型（\cref{eq:lidar-fl-residual}）里再次出现。
+\end{insight}
+
+\begin{pitfall}[思维陷阱：以为 ICP 一定收敛到全局最优]
+ICP 是\emph{局部}优化：\cref{eq:lidar-icp-obj} 在固定对应下是最小二乘，但对应本身依赖当前位姿，整体是非凸的。初值差时 ICP 会陷入\textbf{错误的局部极小}（典型现象：把走廊配“错一格”、把对称结构配反）。后果是里程计突然跳变、地图“双重墙”。正确做法：(1) 用 IMU 预积分或匀速模型给出好初值（\cref{sec:lidar-deskew}）；(2) 用点到面而非点到点（吸引域更宽）；(3) 在低重叠/无初值时改用全局配准方法\cite{yang2020teaser} 取初值再 ICP 精化。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 写出点到面残差 $d=\mathbf{u}^\top(\mathbf{R}\mathbf{q}+\mathbf{t}-\mathbf{q}_0)$（$\mathbf{u}$ 为单位法向、$\mathbf{q}_0$ 为面上一点）对右扰动 $\delta\boldsymbol{\phi}$（即 $\mathbf{R}\leftarrow\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\phi})$）与对 $\mathbf{t}$ 的雅可比。提示：用 \cref{ch:lie} 的 $\partial(\mathbf{R}\mathbf{q})/\partial\boldsymbol{\varphi}=-\mathbf{R}\mathbf{q}^\wedge$。
+  \item （概念）解释为什么点到点 ICP 在“两帧采样密度相差很大”时会系统性偏向稠密一侧，而点到面不会。
+  \item （实现题）给定两帧点云，用 KD-tree 实现一次 ICP 迭代（点到点）：建树、查最近邻、用 SVD 求 $\mathbf{R},\mathbf{t}$。再把残差换成点到面，比较收敛迭代数。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{LOAM：特征法激光里程计与建图}
+\label{sec:lidar-loam}
+
+\paragraph{动机：把“估运动”和“精建图”解耦。}
+三维激光里程计有个固有矛盾：要\emph{实时}就得算得快，要\emph{精确}就得用很多点、迭代很多次。LOAM\cite{zhang2014loam} 的关键洞见是把这对矛盾\textbf{分解为两个并行算法}：一个\emph{高频低保真}的里程计（odometry，约 $10$\,Hz，估速度、去畸变），一个\emph{低一个数量级频率高保真}的建图（mapping，约 $1$\,Hz，精配准建图）。里程计在高频跑、给建图喂去畸变点云和初值；建图在低频跑、有充裕时间用大量点、足够迭代收敛。两者的位姿变换整合成约 $10$\,Hz 的输出。这个“双算法”结构是 LOAM 实时性的根本来源，也是后续整个家族的骨架。
+
+\paragraph{先问一句：实时激光里程计该提“什么”特征？四条工程判据。}
+特征法的头号问题不是“怎么配准”，而是“\emph{提什么}”。点云特征本有许多种（PFH、FPFH 乃至各类深度学习描述子），但\emph{实时} SLAM 对特征另有一套\emph{工程}取舍，高翔\cite{gao2023slamad} 把它凝成四条判据：
+\begin{enumerate}
+  \item \textbf{反映点云的物理特点}：自动驾驶点云由多线激光雷达扫描而成，不像 RGB-D 那样稠密，而带明显的\emph{线束}（scan-line）结构——每个点都属于某一条扫描线。故不必对整片点云提特征，而可\emph{逐线束}在单条扫描线内做（这正是 \cref{eq:lidar-loam-c} 只取同线邻点的由来）。
+  \item \textbf{便于配准}：提出的特征应能直接喂给前面的 ICP / NDT，而非另起一套复杂匹配。
+  \item \textbf{省算力、不挑硬件}：特征提取不应吃掉过多 CPU/GPU，更不应依赖特殊硬件。
+  \item \textbf{全系统同构}：最好整个里程计/SLAM 系统用\emph{同一种}计算结构，避免一部分跑 CPU、一部分跑 GPU 而徒增数据搬运与资源占用。
+\end{enumerate}
+正因这四条偏向“简单、可移植”，工业界的激光里程计普遍只用\emph{线束 + 曲率}这类朴素特征，而非繁复的统计/神经描述子。
+
+\begin{insight}[一句认识论提醒：特征提取多是工程经验，缺严格理论]\label{ins:lidar-feat-criteria}
+要坦白的是：\textbf{大多数激光特征提取方法并没有明确的理论依据，更多是靠工程实践摸索出来的}\cite{gao2023slamad}。曲率阈值、子区域个数、每区域取几个边/面点，这些数字都来自经验调试而非某条定理；读者大可灵活增删流程。这与本章后面 FAST-LIO 那种“逐行可证”的滤波推导形成鲜明对照——\emph{前端特征是工程艺术，后端融合是数学}。把两者的“可证性”边界看清，调不出好特征时就不会误以为是自己数学没学好。
+\end{insight}
+
+\subsection{特征提取：用曲率分边点与面点}
+\label{sec:lidar-loam-feat}
+
+激光雷达点云不均匀（同一扫描线内分辨率高、线间分辨率低），LOAM 只用\emph{单条扫描线内}的共面几何关系提特征。设点 $i$，$\mathcal{S}$ 为同一扫描线内 $i$ 两侧的连续邻点集合，定义局部曲面\textbf{光滑度}（曲率）\cite{zhang2014loam}：
+\begin{equation}
+  c=\frac{1}{|\mathcal{S}|\cdot\|\mathbf{X}^L_{(k,i)}\|}\bigg\|\sum_{j\in\mathcal{S},\,j\neq i}\big(\mathbf{X}^L_{(k,i)}-\mathbf{X}^L_{(k,j)}\big)\bigg\|,
+  \label{eq:lidar-loam-c}
+\end{equation}
+其中 $\mathbf{X}^L_{(k,i)}$ 是点 $i$ 在激光系 $\{L\}$ 中的坐标。$c$ 大表示局部弯曲剧烈（\textbf{边点 edge}），$c$ 小表示局部平坦（\textbf{面点 planar}）。把扫描线分成四个等长子区域，每子区域最多取 $2$ 个边点、$4$ 个面点，以\emph{均匀}分布特征。
+
+\paragraph{坏特征的剔除。}
+两类点要避免\cite{zhang2014loam}（\cref{fig:lidar-loam-feat}）：(1) 位于与激光束\emph{大致平行}的局部平面上的点——这类点的距离测量不可靠；(2) 位于\emph{遮挡边界}上的点——某物体边缘连着的曲面被另一物体挡住，换个视角遮挡区可能变可见，故这类“边”不稳定。判据：点 $i$ 可被选中，当且仅当 $\mathcal{S}$ 不构成与激光束近似平行的面片，且 $\mathcal{S}$ 中没有点在束方向上因间隙与 $i$ 断开、同时比 $i$ 更靠近雷达。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, scale=1.0]
+  % (a) near-parallel surface
+  \begin{scope}
+    \fill (0,0) circle (1pt) node[left, font=\scriptsize]{LiDAR};
+    \draw[gray, ->] (0,0)--(2.6,0.5);
+    \draw[gray, ->] (0,0)--(2.6,0.15);
+    \draw[second!60!black, very thick] (1.6,0.0)--(2.6,0.55);
+    \fill[red] (2.1,0.27) circle (1.6pt) node[above left, font=\scriptsize]{B};
+    \node[font=\scriptsize] at (1.3,-0.6) {(a) 近平行面：B 不可靠};
+  \end{scope}
+  % (b) occlusion boundary
+  \begin{scope}[xshift=4.8cm]
+    \fill (0,0) circle (1pt) node[left, font=\scriptsize]{LiDAR};
+    \draw[second!60!black, very thick] (1.4,0.8)--(2.4,0.8);
+    \draw[second!60!black, very thick, dashed] (2.4,0.2)--(3.0,0.2);
+    \draw[gray,->] (0,0)--(2.45,0.82);
+    \draw[gray,->] (0,0)--(2.7,0.18);
+    \fill[red] (2.4,0.8) circle (1.6pt) node[above, font=\scriptsize]{A};
+    \fill[main!70!black] (2.6,0.2) circle (1.4pt) node[below, font=\scriptsize]{B};
+    \node[font=\scriptsize] at (1.5,-0.6) {(b) 遮挡边界：A 是假边};
+  \end{scope}
+\end{tikzpicture}
+\caption{LOAM 剔除的两类坏特征：(a) 位于与激光束近似平行面片上的点 B（测距不可靠）；(b) 遮挡边界上的点 A（虚线段被前景挡住，换视角即变，是不稳定的“假边”）。（仿 \cite{zhang2014loam} 图 4 重绘）}
+\label{fig:lidar-loam-feat}
+\end{figure}
+
+\subsection{点到线、点到面距离的闭式}
+\label{sec:lidar-loam-dist}
+
+LOAM 把当前 sweep 的特征重投影到 sweep 起点，对每个特征点在上一 sweep 的去畸变点云 $\bar{\mathcal{P}}_k$（存于 KD-tree）中找对应几何元素\cite{zhang2014loam}。
+
+\paragraph{边点 $\to$ 边线。}
+设边点 $i$，在 $\bar{\mathcal{P}}_k$ 中找最近邻 $j$，再在 $j$ 所在扫描线的\emph{相邻两条}扫描线上找最近邻 $l$（要求 $j,l$ \textbf{来自不同扫描线}，否则两点可能在同一直线上无法定线）。$(j,l)$ 确定一条边线，点到线距离为
+\begin{equation}
+  d_{\mathcal{E}}=\frac{\big\|(\tilde{\mathbf{X}}^L_{(k+1,i)}-\bar{\mathbf{X}}^L_{(k,j)})\times(\tilde{\mathbf{X}}^L_{(k+1,i)}-\bar{\mathbf{X}}^L_{(k,l)})\big\|}{\big\|\bar{\mathbf{X}}^L_{(k,j)}-\bar{\mathbf{X}}^L_{(k,l)}\big\|}.
+  \label{eq:lidar-loam-de}
+\end{equation}
+\emph{几何意义}：分子是以 $i$ 与 $j,l$ 为顶点的平行四边形面积（$=$ 底 $\|j-l\|\times$ 高），故商恰是 $i$ 到过 $j,l$ 直线的垂距。
+
+\paragraph{面点 $\to$ 平面片。}
+设面点 $i$，找最近邻 $j$，再找两点 $l,m$（一个在 $j$ 同扫描线、一个在相邻扫描线，保证三点不共线）。$(j,l,m)$ 确定一个平面片，点到面距离为
+\begin{equation}
+  d_{\mathcal{H}}=\frac{\big|(\tilde{\mathbf{X}}^L_{(k+1,i)}-\bar{\mathbf{X}}^L_{(k,j)})\cdot\big((\bar{\mathbf{X}}^L_{(k,j)}-\bar{\mathbf{X}}^L_{(k,l)})\times(\bar{\mathbf{X}}^L_{(k,j)}-\bar{\mathbf{X}}^L_{(k,m)})\big)\big|}{\big\|(\bar{\mathbf{X}}^L_{(k,j)}-\bar{\mathbf{X}}^L_{(k,l)})\times(\bar{\mathbf{X}}^L_{(k,j)}-\bar{\mathbf{X}}^L_{(k,m)})\big\|}.
+  \label{eq:lidar-loam-dh}
+\end{equation}
+\emph{几何意义}：分母是 $\triangle jlm$ 张成平面的法向量模（$=$ 平行四边形面积），分子是 $(i-j)$ 在该法向上的投影 $\times$ 面积，商即 $i$ 到过 $j,l,m$ 平面的垂距。这两式与第 \ref{sec:lidar-dist} 节的点到线/点到面在形式上一致，是 LOAM 的两种基本残差。
+
+\subsection{运动估计：匀速插值 + Levenberg–Marquardt}
+\label{sec:lidar-loam-motion}
+
+\paragraph{匀速模型与线性插值。}
+LOAM 把 sweep 内运动建模为\textbf{常角速度、常线速度}，于是不同时刻收到的点可\emph{线性插值}其位姿\cite{zhang2014loam}。设 sweep $k+1$ 起始时刻 $t_{k+1}$、当前时刻 $t$，sweep 内位姿变换 $\mathbf{T}^L_{k+1}=[t_x,t_y,t_z,\theta_x,\theta_y,\theta_z]^\top$（$6$ 自由度，平移在前、旋转在后，与本书 $\boldsymbol{\xi}=[\boldsymbol{\rho};\boldsymbol{\phi}]$ 排序一致）。对时间戳 $t_i$ 的点 $i$，其位姿变换由线性插值给出：
+\begin{equation}
+  \mathbf{T}^L_{(k+1,i)}=\frac{t_i-t_{k+1}}{t-t_{k+1}}\,\mathbf{T}^L_{k+1}.
+  \label{eq:lidar-loam-interp}
+\end{equation}
+旋转部分由 Rodrigues 公式（\cref{ch:lie}）从轴角 $\mathbf{T}^L_{(k+1,i)}(4{:}6)$ 还原：$\mathbf{R}=\mathbf{I}+\boldsymbol{\omega}^\wedge\sin\theta+(\boldsymbol{\omega}^\wedge)^2(1-\cos\theta)$，$\theta=\|\mathbf{T}^L_{(k+1,i)}(4{:}6)\|$、$\boldsymbol{\omega}=\mathbf{T}^L_{(k+1,i)}(4{:}6)/\theta$。把当前点变换到 sweep 起点：$\mathbf{X}^L_{(k+1,i)}=\mathbf{R}\,\tilde{\mathbf{X}}^L_{(k+1,i)}+\mathbf{T}^L_{(k+1,i)}(1{:}3)$。
+
+\paragraph{堆叠残差与 LM 迭代。}
+把每个边点的 \cref{eq:lidar-loam-de} 与每个面点的 \cref{eq:lidar-loam-dh} 经 \cref{eq:lidar-loam-interp} 表达成关于 $\mathbf{T}^L_{k+1}$ 的几何关系 $f_{\mathcal{E}}=d_{\mathcal{E}}$、$f_{\mathcal{H}}=d_{\mathcal{H}}$，对所有特征点堆叠成非线性方程 $\mathbf{f}(\mathbf{T}^L_{k+1})=\mathbf{d}$。计算雅可比 $\mathbf{J}=\partial\mathbf{f}/\partial\mathbf{T}^L_{k+1}$，用 Levenberg–Marquardt 迭代使 $\mathbf{d}\to\mathbf{0}$（LM 的信赖域/阻尼推导见 \cref{ch:nlopt}）：
+\begin{equation}
+  \mathbf{T}^L_{k+1}\leftarrow\mathbf{T}^L_{k+1}-\big(\mathbf{J}^\top\mathbf{J}+\lambda\,\mathrm{diag}(\mathbf{J}^\top\mathbf{J})\big)^{-1}\mathbf{J}^\top\mathbf{d}.
+  \label{eq:lidar-loam-lm}
+\end{equation}
+每行还乘一个\textbf{bisquare 权重}（鲁棒拟合）：对应距离越大权越小、超阈值视为外点赋零权（鲁棒核的 IRLS 视角见 \cref{ch:nlopt}）。
+
+\begin{algo}[LOAM 激光里程计（一次 sweep）]\label{alg:lidar-loam-odom}
+\begin{enumerate}
+  \item sweep 开始时置 $\mathbf{T}^L_{k+1}\leftarrow\mathbf{0}$；
+  \item 在 $\mathcal{P}_{k+1}$ 中按 \cref{eq:lidar-loam-c} 提边点集 $\mathcal{E}_{k+1}$、面点集 $\mathcal{H}_{k+1}$；
+  \item \textbf{重复}若干次：
+  \begin{enumerate}
+    \item 对每个边点找对应边线、按 \cref{eq:lidar-loam-de} 算 $d_{\mathcal{E}}$，堆叠进 $\mathbf{f}=\mathbf{d}$；
+    \item 对每个面点找对应平面片、按 \cref{eq:lidar-loam-dh} 算 $d_{\mathcal{H}}$，堆叠进 $\mathbf{f}=\mathbf{d}$；
+    \item 为每行算 bisquare 权重；按 \cref{eq:lidar-loam-lm} 做一次 LM 更新 $\mathbf{T}^L_{k+1}$；
+    \item 收敛则跳出；
+  \end{enumerate}
+  \item sweep 末：把 $\mathcal{P}_{k+1}$ 用估计运动重投影到 $t_{k+2}$ 得去畸变点云 $\bar{\mathcal{P}}_{k+1}$，返回 $\mathbf{T}^L_{k+1}$ 与 $\bar{\mathcal{P}}_{k+1}$。
+\end{enumerate}
+\end{algo}
+
+\paragraph{建图（scan-to-map）。}
+建图每 sweep 调一次：把里程计输出的去畸变点云 $\bar{\mathcal{P}}_{k+1}$ 配准到\emph{累积地图} $\mathcal{Q}_k$\cite{zhang2014loam}。与里程计的差异：(1) 用约 $10$ 倍的特征点；(2) 地图按 $10$\,m 立方区组织，取相交立方体内的点建 KD-tree；(3) \textbf{对地图中特征点的局部邻域 $\mathcal{S}'$ 算协方差矩阵 $\mathbf{M}$ 的特征值/特征向量}来确定几何——若 $\mathbf{M}$ 有\emph{一个}显著大的特征值，邻域分布在边线上（最大特征向量为线方向）；若有\emph{两个}大特征值、第三个小，分布在平面上（最小特征向量为面法向）。在线/面上取点使距离能套用 \cref{eq:lidar-loam-de}、\cref{eq:lidar-loam-dh}，再用 LM + 鲁棒拟合精配准，地图用 $5$\,cm 体素滤波降采样。
+
+\begin{insight}
+LOAM 用了\textbf{两套尺度的几何拟合}：里程计在\emph{单条扫描线内}用 \cref{eq:lidar-loam-c} 的一维曲率快速分边/面（图快但粗）；建图在\emph{三维局部邻域}用协方差矩阵的特征值分解（PCA）精确判断“一个大特征值$\to$边、两个大特征值$\to$面”（准但慢）。这正是“高频低保真 + 低频高保真”解耦在\emph{特征}层面的体现。同样的 PCA 判别也用于点云法向估计（\cref{ch:pointcloud}）。
+\end{insight}
+
+\begin{pitfall}[编程陷阱：匀速插值在快速旋转时失效]
+\cref{eq:lidar-loam-interp} 的线性插值假设 sweep 内\emph{匀速}。当机器人剧烈加减速或快速旋转（角速度 $>100^\circ$/s）时，匀速假设破裂，去畸变残留误差，配准变差甚至发散。\textbf{现象}：高速转弯处地图“拖尾”、轨迹突跳。\textbf{根因}：sweep 周期内（$0.1$\,s）速度已显著变化，一阶插值不够。\textbf{对策}：引入 IMU 的高频测量做去畸变（\cref{sec:lidar-deskew}），或用连续时间样条/高斯过程轨迹。LOAM 原文在 §VII-B 即用 IMU 朝向预对齐来缓解，但那仍是松耦合预处理。
+\end{pitfall}
+
+\paragraph{LOAM 数值表现（基准）。}
+LOAM 在自制双轴激光雷达上室内相对精度约 $1\%$、室外约 $2.5\%$\cite{zhang2014loam}；加 Xsens IMU 辅助后误差进一步降低（走廊从 $2.1\%$ 降到 $0.9\%$，果园从 $3.7\%$ 降到 $2.1\%$）。在 KITTI 里程计基准上，LOAM 平均位置误差 $0.88\%$，曾排名第一（不论传感模态，含立体视觉里程计）。
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）由平行四边形面积公式证明 \cref{eq:lidar-loam-de} 的分子分母比恰为点到直线垂距；类似地验证 \cref{eq:lidar-loam-dh}。
+  \item （实现题）实现 \cref{eq:lidar-loam-c} 的曲率计算与边/面点选取（含四子区域均匀化、坏特征剔除），在一帧 Velodyne 点云上可视化边点/面点。
+  \item （设计扩展题）把 \cref{eq:lidar-loam-interp} 的匀速线性插值改成“用 IMU 角速度积分得逐点旋转、加速度积分得逐点平移”的去畸变，对比快速旋转段的配准误差。
+\end{enumerate}
+\end{practice}
+
+\subsection{超越低层几何：语义 / 面元 / 强度高层特征}
+\label{sec:lidar-highfeat}
+
+LOAM 的边/面是\textbf{低层}几何特征（只看局部曲率或主成分）。在它之上，激光里程计还可借\textbf{高层特征}进一步提精度、增鲁棒——它们比低层特征携带更丰富的环境信息，利于场景理解与更准的建图\cite{carlone2026handbook}。三类最常用：
+\begin{itemize}
+  \item \textbf{语义特征}：用机器学习/深度学习把点云逐点\emph{分类}为车辆、行人、建筑、植被等类别，\emph{典型用途是区分动/静}——把动态物体（行人、行驶车辆）剔出配准、只用\emph{稳定地标}（建筑、杆状物），里程计的可靠性由此显著提升（代表如语义辅助的 SuMa++\cite{chen2019suma++}）。
+  \item \textbf{面元（surfel）特征}：用一个小圆盘（surfel）拟合点云的局部曲面——对邻域点的协方差矩阵做特征分解，椭球盘的主半轴长由特征值定（与 \cref{ch:pointcloud} 的法向/曲率估计同源）。配准时它天然给出\emph{点到面}距离，是稠密/户外激光 SLAM 的常用表示（如 SuMa\cite{behley2018efficient}）。
+  \item \textbf{强度特征}：激光回波的\emph{反射率/强度}值，携带材质与表面信息。它给特征匹配多加一维信息，在\emph{无结构}（空旷、几何退化）环境里尤能救场——纯几何配不上时，强度纹理还能提供约束\cite{carlone2026handbook}。
+\end{itemize}
+这三类与本章前面只把 surfel/强度当作“点云\emph{表示}”（\cref{ch:pointcloud}）不同：此处它们是\emph{增强里程计}的手段。一句话——低层几何决定“配得\emph{上}”，高层语义/强度决定“配得\emph{对}、不被动态物体带偏”。
+
+% ════════════════════════════════════════════════════════════════
+\section{点云运动去畸变}
+\label{sec:lidar-deskew}
+
+\paragraph{动机：一帧 scan 不是一个时刻拍的。}
+如前所强调，激光雷达用少量激光发射/接收对\emph{顺序}采样，一帧 scan 内的点在不同时刻、不同位姿测得。设 $10$\,Hz scan、车辆 $10$\,m/s，则帧首与帧尾相隔 $0.1$\,s、位置差约 $1$\,m——若把这些点当作“同一位姿下的快照”直接拼起来，点云就会\textbf{歪掉}（畸变），严重降低配准质量\cite{carlone2026handbook}。这与相机的\emph{卷帘快门效应}（rolling shutter）同源。去畸变（undistorting / motion compensation）就是把每个点用其\emph{采样瞬间}的真实位姿校正到\emph{统一参考时刻}（通常取 scan 末尾）。
+
+\paragraph{四类去畸变方法（系统分类）。}
+\cref{tab:lidar-deskew} 按“需不需要额外传感器 / 能否逐点 / 计算代价”穷举四类方法\cite{carlone2026handbook}：
+
+\begin{table}[H]\centering\small
+\caption{四类点云运动去畸变方法对比}
+\label{tab:lidar-deskew}
+\begin{tabular}{p{0.20\textwidth}p{0.40\textwidth}p{0.30\textwidth}}
+\toprule
+方法 & 原理 & 适用 / 局限 \\
+\midrule
+匀速模型 & 假设与上一步相同的常平移/旋转速度，对帧内点线性插值位姿（即 \cref{eq:lidar-loam-interp}） & 不需额外传感器；运动含高频成分时不准 \\
+连续时间轨迹 & 用样条或高斯过程拟合连续轨迹，可在\emph{任意时刻}查询位姿、逐点去畸变 & 精度高、可逐点；常规实现耗时，多离线 \\
+IMU 预积分 & 用高频 IMU（如 $200$\,Hz）陀螺/加速度预积分出帧内 LiDAR 位姿，再校正逐点畸变 & 对急剧运动高度有效，已成事实标准；受 IMU 噪声/偏置/时钟同步影响 \\
+逐点更新 & 状态在每个点\emph{被接收时}就更新，不累积整帧（Point-LIO） & 根本不受帧内畸变影响；逐点更新计算密集 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, x=1cm, y=1cm]
+  \def\T{10}
+  \draw[thick,->] (0,0) -- (\T+0.6,0) node[right] {$t$};
+  \draw[thick] (0,-0.12) -- (0,0.12) node[above=2pt] {$t_{k-1}$};
+  \draw[thick] (\T,-0.12) -- (\T,0.12) node[above=2pt] {$t_k$};
+  \foreach \x in {0.5,1.0,...,9.5}{ \draw[gray] (\x,-0.07) -- (\x,0.07); }
+  \node[gray, below=9pt, font=\scriptsize] at (2.2,-0.02) {IMU @200\,Hz（密）};
+  \foreach \x/\i in {1.2/1, 3.0/2, 4.8/3, 6.6/4, 8.4/5, 9.6/6}{
+    \filldraw[red] (\x,0) circle (1.5pt); \coordinate (p\i) at (\x,0); }
+  \node[red, above=20pt, align=center, font=\scriptsize] at (5.0,0) {LiDAR 特征点 $\rho_j$\\（逐点时间戳）};
+  \draw[blue, thick, ->] (0,0.85) -- (\T,0.85) node[midway, above, font=\scriptsize] {前向传播（IMU 积分）};
+  \foreach \i in {1,...,6}{
+    \draw[red!70!black, ->, dashed] (p\i) .. controls +(0,-0.65) and +(0,-0.65) .. (\T,0); }
+  \node[red!70!black, below=24pt, font=\scriptsize] at (8.0,-0.35) {反向传播到 scan 末 $t_k$};
+  \draw[decorate, decoration={brace, amplitude=5pt, raise=2pt}]
+       (\T,1.2) -- (0,1.2) node[midway, above=7pt, font=\scriptsize] {一个 LiDAR scan 周期};
+\end{tikzpicture}
+\caption{IMU 辅助去畸变（FAST-LIO 风格）：前向传播沿 IMU 测量积分整段轨迹，反向传播把每个特征点从其采样时刻 $\rho_j$ 拉到 scan 末尾 $t_k$ 的统一参考系。（仿 \cite{xu2021fastlio} 与 \cite{carlone2026handbook} 图 8.5 重绘）}
+\label{fig:lidar-deskew}
+\end{figure}
+
+\begin{pitfall}[概念误区：以为去畸变只是“锦上添花”]
+在低速、小 FoV、慢扫描场景下不去畸变也许只损失一点精度，于是有人略过它。但在无人机、手持快速扫描、车载高速等场景，帧内运动可达数十厘米到一米，\textbf{不去畸变会让配准直接发散}。去畸变不是可选优化，而是\emph{正确性}前提。判据：若 $v\cdot T_{\text{scan}}$（速度 $\times$ 扫描周期）已可与地图体素分辨率（如 $0.2$\,m）相比，就必须去畸变。
+\end{pitfall}
+
+\paragraph{两条现代支线：连续时间配准与逐点流式里程计。}\label{par:lidar-ct-pointwise}
+\cref{tab:lidar-deskew} 的后两类——“连续时间轨迹”与“逐点更新”——近年各自长成一条独立的里程计范式，值得在此点名定位（推导属广度，留给所引文献）。\textbf{连续时间配准}把“先去畸变、再配准”两步\emph{合一}：直接把整段轨迹建为时间的连续函数（样条或高斯过程），配准残差按每个点的采样时刻 $\rho_j$ 在轨迹上取位姿，于是去畸变与位姿估计在同一目标里联合求解。CT-ICP\cite{dellenbach2022cticp} 即在每帧用“帧始 + 帧末”两个位姿插值出帧内连续运动并联合优化，把这一思想做进实时 ICP。这正是 \cref{sec:est-steam} 那条连续时间状态估计主线（STEAM 的 GP 轨迹、$O(1)$ 查询任意时刻位姿）落到激光去畸变上的实例——也是 \cref{sec:imu-advanced} 强调“连续时间表示对非同步、高频传感器尤有用”的又一佐证。\textbf{逐点流式里程计}则更激进：Point-LIO\cite{he2023pointlio} 不再累积成帧，而是\emph{每收到一个激光点就更新一次状态}，从而\textbf{根本不存在帧内畸变}（无需任何去畸变步骤），代价是逐点更新计算密集、且把里程计输出频率提到点率级（可达数 kHz，对剧烈机动尤为受益）。这两条支线与本章 LOAM$\to$FAST-LIO 这条“成帧 + 去畸变 + 紧耦合”主线并行，共同构成现代激光里程计的版图（\cref{sec:lidar-family} 再作选型对照）。
+
+\begin{practice}
+\begin{enumerate}
+  \item 估算：$10$\,Hz scan、无人机以 $5$\,m/s 平飞 + $200^\circ$/s 偏航，帧首尾的平移差、旋转差各是多少？讨论该用哪类去畸变。
+  \item （概念）连续时间轨迹去畸变相比匀速插值的精度优势来自哪里？为什么常被放到离线？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{直接法 NDT 激光里程计与松耦合 LIO 装机}
+\label{sec:lidar-direct-lio}
+
+\paragraph{动机：里程计有“两条路”，本节走另一条并把零件拼成整机。}
+\cref{sec:lidar-loam} 的 LOAM 走的是\emph{特征法}：先把点云抽成边/面特征再配准。但 \cref{sec:lidar-scan-reg} 已指出，配准的内核只是“把当前帧对齐到参考”，参考既可以是上一帧、也可以是\emph{把过去一段点云拼成的局部地图}；而配准既可以用 ICP，也可以用 \cref{sec:pc-ndt} 的 NDT。把“NDT + scan-to-(局部地图)”直接组装成一个里程计，\emph{不提取任何特征}，就得到\textbf{直接法激光里程计}（direct LiDAR odometry）\cite{gao2023slamad}。它与特征法是同一配准内核的两种装配，但工程上更省心：免去手工调特征阈值、天然适配不同线数的激光雷达（这与 FAST-LIO2 的免特征直接配准 \cref{sec:lidar-fastlio2} 同源）。本节先把 NDT \emph{算法}（已在 \cref{ch:pointcloud} 讲透）升级为 NDT \emph{里程计/建图系统}，再引入\textbf{增量 NDT}（在线维护体素地图、免重建 KD-tree），最后把它与 \cref{ch:eskf} 的 ESKF、\cref{sec:lidar-deskew} 的去畸变\emph{拼成一台可运行的松耦合 LIO}——本书前面已备齐全部零件（ESKF、NDT、IMU 预积分、四类去畸变），独缺这条\emph{装配主线}。
+
+\subsection{直接法 NDT 里程计：scan-to-局部地图}
+\label{sec:lidar-direct-ndt}
+
+\paragraph{两种实现思路。}
+有了 NDT 配准，构建里程计有两条思路\cite{gao2023slamad}（\cref{fig:lidar-direct-ndt}）：
+\begin{enumerate}
+  \item \textbf{拼点云思路}：每隔一定距离/角度抽一个关键帧，把最近 $N$ 个关键帧（如 $N{=}30$）的点云\emph{拼成}一个局部地图 $\mathcal{M}_{\text{local}}$，对它整体重建一次 NDT（划体素、逐体素拟合 $\mathcal N(\boldsymbol\mu_c,\boldsymbol\Sigma_c)$，见 \cref{eq:pc-ndt-musigma}）作配准目标。配准当前帧时，用最近两帧的相对运动外推一个位姿初值 $\check{\mathbf{T}}_k=\mathbf{T}_{k-1}(\mathbf{T}_{k-2}^{-1}\mathbf{T}_{k-1})$，再以 \cref{sec:pc-ndt} 的 NDT 迭代解出 $\mathbf{T}_k$。简单直接，但关键帧滑窗每变动一次（pop 旧帧、push 新帧）就要\emph{把局部地图整体拼起来、重划体素、重建 KD-tree}，是主要的算力开销。
+  \item \textbf{更新体素思路（增量 NDT）}：不重拼点云，而是把配准好的当前帧\emph{点级地更新}进 NDT 的每个体素——增量地修正受影响体素内的高斯分布，免去重建 NDT 内部状态与 KD-tree。这是更快的实现，见 \cref{sec:lidar-inc-ndt}。
+\end{enumerate}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=5mm and 9mm,
+  box/.style={draw, rounded corners, align=center, minimum height=7mm, inner sep=3pt},
+  o/.style={box, fill=main!8, draw=main!60!black},
+  b/.style={box, fill=second!8, draw=second!60!black},
+  ln/.style={->, thick, gray!55!black}]
+  % thought 1: stitch clouds
+  \node[o] (s1) {当前帧};
+  \node[o, right=of s1] (p1) {当前位姿};
+  \node[o, right=of p1] (out1) {输出};
+  \node[b, above=6mm of p1] (hist1) {历史地图\\（拼点云）};
+  \node[b, left=8mm of hist1] (kf) {关键帧\\队列};
+  \draw[ln] (s1)--(p1); \draw[ln] (p1)--(out1);
+  \draw[ln] (hist1)--(p1) node[midway,right,font=\scriptsize]{配准};
+  \draw[ln] (kf)--(hist1);
+  \node[font=\scriptsize] at (1.3,-0.7) {(a) 拼点云：每抽帧重建 NDT + KD-tree};
+  % thought 2: update voxels
+  \begin{scope}[xshift=7.6cm]
+    \node[o] (s2) {当前帧};
+    \node[o, right=of s2] (p2) {当前位姿};
+    \node[o, right=of p2] (out2) {输出};
+    \node[b, above=6mm of p2] (hist2) {历史地图\\（NDT 体素）};
+    \draw[ln] (s2)--(p2); \draw[ln] (p2)--(out2);
+    \draw[ln] (hist2)--(p2) node[midway,left,font=\scriptsize]{配准};
+    \draw[ln] (p2.north) to[bend right=18] node[midway,right,font=\scriptsize]{更新体素} (hist2.south east);
+    \node[font=\scriptsize] at (1.3,-0.7) {(b) 增量 NDT：在线合并高斯、免重建};
+  \end{scope}
+\end{tikzpicture}
+\caption{两种实现直接法 NDT 激光里程计的思路：(a) 拼点云——抽关键帧、拼局部地图、重建 NDT；(b) 增量 NDT——把配准好的点直接更新进体素的高斯分布，免重建 KD-tree。（仿 \cite{gao2023slamad} 图 7-7 重绘）}
+\label{fig:lidar-direct-ndt}
+\end{figure}
+
+\paragraph{为什么 scan-to-map 比 scan-to-scan 准。}
+注意这里用的是“当前帧对\emph{局部地图}”，而非“当前帧对\emph{上一帧}”。\cref{sec:lidar-scan-reg} 的动机段已埋下这个差异：scan-to-scan 只看相邻两帧、误差逐帧独立累积；scan-to-map 把当前帧对齐到一个\emph{融合了多帧}的稳定参考，单帧噪声被平均掉、约束更强，故漂移更小（代价是要维护局部地图）。这正是 LOAM 把里程计（scan-to-scan 式高频）与建图（scan-to-map 式精修）分两层的原因（\cref{sec:lidar-loam}），也是本节直接法里程计默认采用 scan-to-map 的原因。实测中，这类免特征的直接法 NDT 里程计（拼点云版 scan-to-map）每帧约 $15$\,ms（$6$ 近邻约 $18$\,ms；PCL 内置 NDT 约 $85$\,ms），精度却不逊于特征法；而下文的\emph{增量}版（\cref{sec:lidar-inc-ndt}）借在线高斯合并免去重建，可再快一个量级（每帧约 $6$\,ms、PCL 内置 NDT 接近 $100$\,ms）\cite{gao2023slamad}。
+
+\subsection{把特征法接入该框架：LoamLikeOdom}
+\label{sec:lidar-loamlike}
+
+\paragraph{动机：同一套 scan-to-局部地图骨架，只换“源点”。}
+上面的直接法 NDT 用\emph{原始点}对体素高斯。但 \cref{sec:lidar-scan-reg} 早已点明：scan-to-局部地图这套骨架（拼局部图 + 关键帧滑窗 + 恒速外推初值）与“配准残差用什么几何”是\emph{正交}的两件事。于是只要把“源”从原始点换成 \cref{sec:lidar-loam} 的\textbf{边/面特征}、把残差换成点到线 \cref{eq:lidar-loam-de} 与点到面 \cref{eq:lidar-loam-dh}，就得到一个\emph{特征法}的 scan-to-局部地图里程计——高翔称之为 \texttt{LoamLikeOdom}\cite{gao2023slamad}。它是“原始 LOAM（scan-to-scan，\cref{sec:lidar-loam}）”与“NDT 直接法（scan-to-局部地图 + 关键帧，本节）”的\textbf{合流}：既留 LOAM 的边/面残差、又套上直接法更稳的局部地图框架，是把前两节零件\emph{拼成第三个系统}的范例。
+
+\paragraph{装配：双 KD 树 + 关键帧滑窗 + 同一外推式。}
+与 LOAM 原版（\cref{alg:lidar-loam-odom}）相比的三点差异，恰好都来自“借”了直接法的框架：
+\begin{enumerate}
+  \item \textbf{边/面各建一棵 KD 树}：局部地图里边特征、面特征\emph{分两棵} KD 树（\texttt{kdtree\_edge\_}、\texttt{kdtree\_surf\_}）；配准时边点只在边树找对应线、面点只在面树找对应面。
+  \item \textbf{两类残差合进同一次 GN}：对每个边点取其在边树的近邻拟合直线、算点到线残差（\cref{eq:lidar-loam-de}），对每个面点取近邻拟合平面、算点到面残差（\cref{eq:lidar-loam-dh}），把\emph{所有}边/面残差堆进\emph{同一个}高斯--牛顿问题求当前位姿，迭代数次（实现取 $\le 5$）。
+  \item \textbf{关键帧滑窗 + 局部图体素重建}：当位姿相对上一关键帧的平移/转角超阈值（如 $1$\,m / $15^\circ$）即记关键帧，把其边/面点变到世界系压入两个\emph{定长队列}（保留最近 $30$ 个关键帧，超出即 \texttt{pop\_front}）；队列一变就把队内边/面点各自拼起、体素降采样、\emph{重建}两棵 KD 树作下一帧的配准目标。
+\end{enumerate}
+而\textbf{配准初值用的恰是本节那条恒速外推式}——记最近两帧估计位姿 $\mathbf{T}_1,\mathbf{T}_2$（$\mathbf{T}_1$ 最新），下一帧初值
+\begin{equation}
+  \check{\mathbf{T}}=\mathbf{T}_1\,(\mathbf{T}_2^{-1}\mathbf{T}_1),
+  \label{eq:lidar-loamlike-extrap}
+\end{equation}
+与直接法 NDT 的 $\check{\mathbf{T}}_k=\mathbf{T}_{k-1}(\mathbf{T}_{k-2}^{-1}\mathbf{T}_{k-1})$（\cref{sec:lidar-direct-ndt}）\emph{同一式}：都把“上一段相对运动”当作“这一段”的猜测。可见特征法与直接法在\emph{框架层面}完全可互换，差别只在残差几何。
+
+\begin{codebox}[C++]{特征法 scan-to-局部地图装配（仿高翔 \texttt{LoamLikeOdom}）}
+class LoamLikeOdom {
+  struct Options {
+    int    min_edge_pts_ = 20;          // 最小边缘点数
+    int    min_surf_pts_ = 20;          // 最小平面点数
+    double kf_distance_ = 1.0;          // 关键帧距离阈值（米）
+    double kf_angle_deg_ = 15;          // 关键帧旋转角度阈值（度）
+    int    num_kfs_in_local_map_ = 30;  // 局部地图保留的关键帧数
+    int    max_iteration_ = 5;          // ICP 最大迭代次数
+    double max_plane_distance_ = 0.05;  // 面点最近邻距离阈值
+    double max_line_distance_ = 0.5;    // 边点最近邻距离阈值
+    int    min_effective_pts_ = 10;     // 有效近邻点数阈值
+  };
+
+  void ProcessPointCloud(FullCloudPtr cloud) {
+    // 1) 提特征:边/面分两类（同 LOAM 的曲率判据）
+    CloudPtr current_edge(new PointCloudType), current_surf(new PointCloudType);
+    feature_extraction_->Extract(cloud, current_edge, current_surf);
+
+    if (local_map_edge_ == nullptr || local_map_surf_ == nullptr) {   // 首帧特殊处理
+      kdtree_edge_.BuildTree(current_edge);
+      kdtree_surf_.BuildTree(current_surf);
+      edges_.emplace_back(current_edge); surfs_.emplace_back(current_surf);
+      return;
+    }
+    // 2) 与局部地图配准:边/面残差合进同一个 GN
+    SE3 pose = AlignWithLocalMap(current_edge, current_surf);
+    if (IsKeyframe(pose)) {                                            // 3) 抽关键帧、重建局部图
+      edges_.emplace_back(edge_world); surfs_.emplace_back(surf_world);     // 已变到世界系
+      if (edges_.size() > options_.num_kfs_in_local_map_) edges_.pop_front();
+      if (surfs_.size() > options_.num_kfs_in_local_map_) surfs_.pop_front();
+      local_map_edge_.reset(new PointCloudType); local_map_surf_.reset(new PointCloudType);
+      for (auto& s : edges_) *local_map_edge_ += *s;                   // 拼局部图
+      for (auto& s : surfs_) *local_map_surf_ += *s;
+      local_map_edge_ = VoxelCloud(local_map_edge_, 1.0);             // 体素降采样
+      local_map_surf_ = VoxelCloud(local_map_surf_, 1.0);
+      kdtree_edge_.BuildTree(local_map_edge_);                        // 重建配准目标
+      kdtree_surf_.BuildTree(local_map_surf_);
+    }
+  }
+
+  SE3 AlignWithLocalMap(CloudPtr edge, CloudPtr surf) {
+    SE3 pose;
+    if (estimated_poses_.size() >= 2) {            // 恒速外推作初值
+      SE3 T1 = estimated_poses_[estimated_poses_.size() - 1];
+      SE3 T2 = estimated_poses_[estimated_poses_.size() - 2];
+      pose = T1 * (T2.inverse() * T1);             // pose = T1 * (inv(T2) * T1)
+    }
+    // 迭代 max_iteration_ 次:
+    //   边点 -> 边树最近邻拟合直线 -> 点到线残差与雅可比
+    //   面点 -> 面树最近邻拟合平面 -> 点到面残差与雅可比
+    //   所有残差堆进同一个高斯-牛顿，解 pose
+    return pose;
+  }
+
+  std::deque<CloudPtr> edges_, surfs_;             // 关键帧滑窗（定长）
+  KdTree kdtree_edge_, kdtree_surf_;               // 边/面各一棵 KD 树
+};
+\end{codebox}
+
+\begin{insight}[特征法 vs 直接法：框架可换，残差是唯一变量]\label{ins:lidar-loamlike}
+\texttt{LoamLikeOdom} 把一件事演示得最透：scan-to-局部地图 + 关键帧滑窗 + 恒速外推这套\emph{骨架}，对“边/面残差”还是“体素高斯残差”一视同仁。于是工程上选特征法还是直接法，本质只剩一个问题——你的场景里“边/面特征稳不稳”：结构化室内/城区，特征法省点又稳；非结构自然环境（树丛、灌木、枝叶），边/面特征不可靠，直接法（逐点/体素）反而更好（\cref{sec:lidar-direct-ndt} 的动机段）。\emph{框架不必改，换“源”即可}——这正是把扫描配准内核抽象出来（\cref{sec:lidar-scan-reg}）带来的复用红利。
+\end{insight}
+
+\subsection{增量 NDT：在线高斯合并与 LRU 体素缓存}
+\label{sec:lidar-inc-ndt}
+
+增量 NDT 要解决两个问题\cite{gao2023slamad}：(i) 单个体素内已有一个高斯分布，又新增了一批点，\emph{合并后}的均值/协方差怎么算（免得把体素内所有历史点都存下来重算）；(ii) 车辆持续行驶，体素数无界增长，如何\emph{有界}地维护一张滚动地图。
+
+\paragraph{(i) 单体素高斯的增量合并。}
+设某体素原有 $m$ 个历史点，其均值/协方差为 $\boldsymbol\mu_H,\boldsymbol\Sigma_H$；现新增 $n$ 个点，其均值/协方差为 $\boldsymbol\mu_A,\boldsymbol\Sigma_A$。合并后 $m{+}n$ 个点的均值 $\boldsymbol\mu$、协方差 $\boldsymbol\Sigma$ 可\emph{只用 $(\boldsymbol\mu_H,\boldsymbol\Sigma_H,m)$ 与 $(\boldsymbol\mu_A,\boldsymbol\Sigma_A,n)$ 闭式算出}，无需保留原始点。均值由定义即得加权平均：
+\begin{equation}
+  \boldsymbol\mu=\frac{m\,\boldsymbol\mu_H+n\,\boldsymbol\mu_A}{m+n}.
+  \label{eq:lidar-inc-mu}
+\end{equation}
+协方差需要一点推导。记历史点 $\mathbf{x}_1,\dots,\mathbf{x}_m$、新增点 $\mathbf{y}_1,\dots,\mathbf{y}_n$，按（忽略贝塞尔修正的）方差定义
+\begin{equation}
+  \boldsymbol\Sigma=\frac{1}{m+n}\Big(\sum_{i=1}^m(\mathbf{x}_i-\boldsymbol\mu)(\mathbf{x}_i-\boldsymbol\mu)^\top+\sum_{j=1}^n(\mathbf{y}_j-\boldsymbol\mu)(\mathbf{y}_j-\boldsymbol\mu)^\top\Big).
+  \label{eq:lidar-inc-sigma-def}
+\end{equation}
+对左侧第一项插入 $\pm\boldsymbol\mu_H$ 并展开（$\mathbf{x}_i-\boldsymbol\mu=(\mathbf{x}_i-\boldsymbol\mu_H)+(\boldsymbol\mu_H-\boldsymbol\mu)$）：
+\begin{equation}
+  \sum_{i=1}^m(\mathbf{x}_i-\boldsymbol\mu)(\mathbf{x}_i-\boldsymbol\mu)^\top
+  =\underbrace{\sum_{i=1}^m(\mathbf{x}_i-\boldsymbol\mu_H)(\mathbf{x}_i-\boldsymbol\mu_H)^\top}_{=\,m\boldsymbol\Sigma_H}
+  +\sum_{i=1}^m(\mathbf{x}_i-\boldsymbol\mu_H)(\boldsymbol\mu_H-\boldsymbol\mu)^\top
+  +\sum_{i=1}^m(\boldsymbol\mu_H-\boldsymbol\mu)(\mathbf{x}_i-\boldsymbol\mu_H)^\top
+  +m(\boldsymbol\mu_H-\boldsymbol\mu)(\boldsymbol\mu_H-\boldsymbol\mu)^\top.
+  \label{eq:lidar-inc-expand}
+\end{equation}
+中间两项含 $\sum_i(\mathbf{x}_i-\boldsymbol\mu_H)=\mathbf{0}$（$\boldsymbol\mu_H$ 是历史点的均值），故\emph{为零}；于是
+\begin{equation}
+  \sum_{i=1}^m(\mathbf{x}_i-\boldsymbol\mu)(\mathbf{x}_i-\boldsymbol\mu)^\top=m\big(\boldsymbol\Sigma_H+(\boldsymbol\mu_H-\boldsymbol\mu)(\boldsymbol\mu_H-\boldsymbol\mu)^\top\big).
+  \label{eq:lidar-inc-left}
+\end{equation}
+对新增点那项同理。代回 \cref{eq:lidar-inc-sigma-def} 得\textbf{协方差合并公式}：
+\begin{equation}
+  \boldsymbol\Sigma=\frac{m\big(\boldsymbol\Sigma_H+(\boldsymbol\mu_H-\boldsymbol\mu)(\boldsymbol\mu_H-\boldsymbol\mu)^\top\big)+n\big(\boldsymbol\Sigma_A+(\boldsymbol\mu_A-\boldsymbol\mu)(\boldsymbol\mu_A-\boldsymbol\mu)^\top\big)}{m+n}.
+  \label{eq:lidar-inc-sigma}
+\end{equation}
+\emph{物理含义}：合并方差 = 两组各自方差按点数加权，\emph{再加}上两组均值相对合并均值的“离心”修正 $(\boldsymbol\mu_\bullet-\boldsymbol\mu)(\boldsymbol\mu_\bullet-\boldsymbol\mu)^\top$（平行轴定理在协方差上的体现）。这正是“流式统计量”：每个体素只需存 $(\boldsymbol\mu,\boldsymbol\Sigma,\text{点数})$，新点来了用 \cref{eq:lidar-inc-mu}、\cref{eq:lidar-inc-sigma} $O(1)$ 更新，配准用的信息矩阵 $\boldsymbol\Sigma^{-1}$ 仅在点数足够时才重估。
+
+\paragraph{(ii) 体素的有界维护（LRU 缓存）。}
+车辆从某点出发一路行驶，体素数随里程线性增长。为把地图规模控制在（如）十万体素量级，对体素施一个\textbf{最近最少使用}（Least Recently Used, LRU）缓存\cite{gao2023slamad}：维护一个队列，每当某体素被访问/更新就把它移到队首；当队列超过预设容量，从队尾删除\emph{最久未用}的体素。其效果是地图\emph{自动跟随车辆滑动}：身后远处久未触及的体素被淘汰，身周新体素不断补入。这与 LIO-SAM 的“滑窗 sub-keyframe + 边缘化旧 scan”（\cref{sec:lidar-liosam}）、FAST-LIO2 的“ikd-Tree 盒删远点”（\cref{sec:lidar-fastlio2}）是\emph{同一目标的三种实现}：让地图“增、删、查”有界且不卡实时线程。
+
+\paragraph{近邻体素策略。}
+NDT 配准时，一个源点落入某体素后，残差不只对该体素的高斯算，还可对其\emph{邻接体素}一并算（增大吸引域、平滑代价面）。常用两档：\texttt{CENTER}（只用源点所在体素）与 \texttt{NEARBY6}（再加上、下、左、右、前、后六个面邻体素）\cite{gao2023slamad}。近邻档位影响单点配准的鲁棒性，但因增量 NDT\emph{直接用体素查近邻、免建 KD-tree}，多查几个邻体素对总耗时占比不大——这正是增量 NDT 比 PCL 内置 NDT 快的来源之一（见下）。
+
+\begin{insight}[为什么增量 NDT 比“PCL 内置 NDT + 拼点云”快]\label{ins:lidar-inc-ndt}
+两点\cite{gao2023slamad}：(1) \textbf{免重建 KD-tree}——PCL 的 NDT 虽基于体素，但其 scan-to-map 配准仍要为局部地图建 KD-tree 查最近邻；每抽一个关键帧就重拼地图、重建树，这个开销随地图增大不可忽略。增量 NDT \emph{直接用体素哈希索引查近邻}（$O(1)$ 定位 + 常数个邻体素），并用 \cref{eq:lidar-inc-sigma} 在线合并高斯、根本不重建。(2) \textbf{残差可并发}——每个点的残差与雅可比相互独立，增量 NDT 实现把它们\emph{并行}计算（如 \texttt{std::execution::par\_unseq}），而串行的 NDT 慢得多。归根结底：增量 NDT 把“地图维护”从“每帧重建静态结构”改成“点级增量更新 + 并行查询”，这与 ikd-Tree（\cref{sec:lidar-fastlio2}）解决的是同一类工程痛点。
+\end{insight}
+
+\subsection{松耦合 LIO 装机：ESKF 预测 + 增量 NDT 观测}
+\label{sec:lidar-loose-lio}
+
+\paragraph{从零件到整机。}
+\cref{sec:lidar-why} 区分过松/紧耦合，\cref{sec:lidar-liosam} 的告诫也点出二者取舍。本节把已有零件拼成一台\textbf{松耦合 LIO}\cite{gao2023slamad}：用 \cref{ch:eskf} 的 ESKF 维护车体状态（IMU 给惯性/速度观测源），把激光里程计算出的\emph{位姿}当作对状态的另一路观测灌进滤波器。\textbf{“松”的含义}：进滤波器的不是点云残差（点线/点面/NDT 残差），而是配准\emph{输出的位姿}——点云配准与滤波相对\emph{解耦}（对比紧耦合把点云残差直接写进观测方程，见 \cref{sec:lidar-fastlio} 的 FAST-LIO）。这种装配实现简单、适合教学，且配准模块可任意换（增量 NDT / ICP / 特征法），与滤波器互不纠缠。
+
+\paragraph{坐标系与外参 ${}^I\mathbf{T}_L$。}
+引入 IMU 后有三个系：世界系 $\mathsf{W}$、IMU 系 $\mathsf{I}$、雷达系 $\mathsf{L}$。IMU 系与雷达系\emph{不重合}，差一个外参 ${}^I\mathbf{T}_L=({}^I\mathbf{R}_L,{}^I\mathbf{t}_L)$（雷达相对 IMU 的安装位姿，各数据集不同、由配置文件给定）\cite{gao2023slamad}。因 IMU 运动模型在 IMU 系下推导，约定\emph{把雷达点经外参转到 IMU 系}、整个系统以 IMU 为中心运行——雷达系一点 ${}^L\mathbf{p}$ 在 IMU 系下为
+\begin{equation}
+  {}^I\mathbf{p}={}^I\mathbf{T}_L\,{}^L\mathbf{p}={}^I\mathbf{R}_L\,{}^L\mathbf{p}+{}^I\mathbf{t}_L.
+  \label{eq:lidar-loose-extrin}
+\end{equation}
+这样观测模型里不会冒出额外的外参变量（其雅可比会变复杂）；局部地图也建在 IMU 系下。
+
+\paragraph{把“激光里程计位姿”写成对状态的观测。}
+松耦合 LIO 运行在 IMU 系，状态运动方程与 \cref{ch:eskf} 的 ESKF \emph{完全一致}（IMU 高频预测，此处不复述）。关键是把激光里程计输出的位姿 $\mathbf{T}_{\text{LO}}=(\mathbf{R}_{\text{LO}},\mathbf{p}_{\text{LO}})$ 视作对状态变量 $(\mathbf{R},\mathbf{p})$ 的\emph{直接观测}——这与 \cref{ch:gins} 把 RTK 位姿当作 GNSS 观测是\emph{同一套观测函数}\cite{gao2023slamad}。平移部分平凡：
+\begin{equation}
+  \mathbf{p}_{\text{LO}}=\mathbf{p}.
+  \label{eq:lidar-loose-pobs}
+\end{equation}
+旋转部分为便于求导，用本书右扰动（\cref{ch:lie}）把姿态误差写成对数映射：
+\begin{equation}
+  \delta\boldsymbol\theta=\mathrm{Log}(\mathbf{R}^\top\mathbf{R}_{\text{LO}}),\qquad
+  \mathbf{r}_{\mathbf{R}}=-\mathrm{Log}(\mathbf{R}^\top\mathbf{R}_{\text{LO}}).
+  \label{eq:lidar-loose-robs}
+\end{equation}
+在右扰动约定下，该旋转观测对误差状态 $\delta\boldsymbol\theta$ 的\textbf{观测雅可比恰为单位阵 $\mathbf{I}$}（这正是 \cref{ch:lie} 右扰动“让位姿观测雅可比最简”的好处，与 \cref{ch:gins} 的 RTK 姿态观测一致）。于是激光里程计因子在 ESKF 里就是一次标准的位姿观测更新，调用与 GNSS 相同的观测函数即可。
+
+\paragraph{装配主线（四步）。}
+把上述零件按数据流拼起来（\cref{fig:lidar-loose-lio}），主循环每收到一组“同步好的一帧雷达 + 其间若干 IMU”就跑四步\cite{gao2023slamad}：
+\begin{enumerate}
+  \item \textbf{时间同步}：雷达约 $10$\,Hz、IMU 约 $100$\,Hz，一个消息同步器（\texttt{MessageSync}）把两帧雷达\emph{之间}的那约 $10$ 个 IMU 读数与该帧雷达打包成一个 \texttt{MeasureGroup}，交给后续处理——下游只管处理打包好的组，不必操心同步细节。
+  \item \textbf{IMU 预测}：把组内每个 IMU 喂给 ESKF 做状态预测（\cref{ch:eskf} 的预测步），\emph{逐一记录}预测出的名义状态序列 $\{{}^W\mathbf{T}_I(\tau_i)\}$——这串高频位姿正是下一步去畸变的逐点位姿来源。
+  \item \textbf{去畸变}：用 ESKF 预测的两扫描间相对位姿，把每个雷达点从其\emph{采样时刻}校正到\emph{扫描结束时刻} $t_s$（\cref{sec:lidar-deskew} 的 IMU 预积分类去畸变之“滤波器预测”变体）。设点 $\mathbf{p}_t$ 采样于 $t$、扫描末为 $t_s$，去畸变变换为
+  \begin{equation}
+    \mathbf{p}'={}^I\mathbf{T}_L^{-1}\,\big({}^W\mathbf{T}_I(t_s)\big)^{-1}\,{}^W\mathbf{T}_I(t)\,{}^I\mathbf{T}_L\,\mathbf{p}_t,
+    \label{eq:lidar-loose-undistort}
+  \end{equation}
+  其中 ${}^W\mathbf{T}_I(t)$ 由预测序列按 $t$ \emph{插值}得到（\cref{ch:lie} 的 $\SE(3)$ 插值/位姿内插）。链式解读与 \cref{eq:lidar-fl-project} 同构：去外参 $\to$ 把点从 $t$ 时位姿搬到 $t_s$ 时位姿 $\to$ 回外参。
+  \item \textbf{配准 + 回灌}：把去畸变点云经外参 \cref{eq:lidar-loose-extrin} 转到 IMU 系、体素降采样（如 $0.5$\,m），用 ESKF 的预测位姿作初值，调增量 NDT（\cref{sec:lidar-inc-ndt}）与局部地图配准得 $\mathbf{T}_{\text{LO}}$；再把 $\mathbf{T}_{\text{LO}}$ 经 \cref{eq:lidar-loose-pobs}、\cref{eq:lidar-loose-robs} 作为位姿观测\emph{回灌}（\texttt{ObserveSE3}）滤波器，完成一次更新。配准成功后把点云并入增量 NDT 地图。
+\end{enumerate}
+首帧特殊处理：无历史地图，直接把首帧加入增量 NDT 作为地图起点、不做观测更新。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, node distance=4mm and 7mm,
+  box/.style={draw, rounded corners, align=center, minimum height=7mm, inner sep=3pt},
+  e/.style={box, fill=main!8, draw=main!60!black},
+  n/.style={box, fill=second!8, draw=second!60!black},
+  ln/.style={->, thick, gray!55!black}]
+  \node[box, fill=third!8, draw=third!60!black] (sync) {\texttt{MessageSync}\\一帧雷达+其间 IMU};
+  \node[e, right=of sync] (pred) {ESKF 预测\\记录 $\{{}^W\mathbf{T}_I(\tau_i)\}$};
+  \node[e, right=of pred] (deskew) {去畸变\\\cref{eq:lidar-loose-undistort}};
+  \node[n, right=of deskew] (reg) {增量 NDT 配准\\得 $\mathbf{T}_{\text{LO}}$};
+  \node[e, below=8mm of reg] (obs) {\texttt{ObserveSE3} 回灌\\\cref{eq:lidar-loose-pobs},\cref{eq:lidar-loose-robs}};
+  \node[n, left=of obs] (map) {并入增量\\NDT 地图};
+  \draw[ln] (sync)--(pred); \draw[ln] (pred)--(deskew); \draw[ln] (deskew)--(reg);
+  \draw[ln] (reg)--(obs); \draw[ln] (reg)--(map);
+  \draw[ln] (obs.west) -- ++(-0.3,0) |- (pred.south) node[pos=0.25,below,font=\scriptsize]{更新后状态};
+  \draw[ln, dashed] (pred.north) to[out=60,in=120] node[midway,above,font=\scriptsize]{预测位姿作配准初值} (reg.north);
+\end{tikzpicture}
+\caption{松耦合 LIO 装配主线：同步 $\to$ ESKF 预测（兼供去畸变逐点位姿与配准初值）$\to$ 去畸变 $\to$ 增量 NDT 配准 $\to$ 配准位姿经 \texttt{ObserveSE3} 回灌滤波器。点云残差不进滤波器，故曰“松”。（仿 \cite{gao2023slamad} 第 7.5 节装机流程重绘）}
+\label{fig:lidar-loose-lio}
+\end{figure}
+
+\begin{codebox}[C++]{松耦合 LIO 主处理:同步组 $\to$ 预测 $\to$ 去畸变 $\to$ 配准回灌（仿 Gao 7.5）}
+// 每收到一个同步好的 MeasureGroup（一帧雷达 + 其间 IMU）就调用一次
+void LooselyLIO::ProcessMeasurements(const MeasureGroup &meas) {
+  measures_ = meas;
+  if (imu_need_init_) { TryInitIMU(); return; }  // 静止初始化估零偏（见 ch:eskf）
+  Predict();      // 1) 用组内每个 IMU 推 ESKF，记录 imu_states_（高频名义位姿序列）
+  Undistort();    // 2) 用预测位姿把每点搬到扫描末 t_s（去畸变变换见正文）
+  Align();        // 3) 增量 NDT 配准 + ObserveSE3 回灌
+}
+
+void LooselyLIO::Align() {
+  // 去畸变点云经外参转到 IMU 系 + 体素降采样（略）
+  if (flg_first_scan_) {            // 首帧:无地图，直接作为地图起点
+    inc_ndt_lo_->AddCloud(scan, SE3());  flg_first_scan_ = false;  return;
+  }
+  SE3 pose_predict = eskf_.GetNominalSE3();       // 取 ESKF 预测位姿作配准初值
+  inc_ndt_lo_->AddCloud(scan, pose_predict, /*use_guess=*/true);   // 增量 NDT 配准
+  pose_of_lo_ = pose_predict;                     // 配准解出的 T_LO
+  eskf_.ObserveSE3(pose_of_lo_, 1e-2, 1e-2);      // 把 T_LO 当位姿观测回灌（松耦合关键一步）
+}
+\end{codebox}
+
+\begin{insight}[松耦合 LIO 是“紧耦合 LIO”的脚手架与对照系]\label{ins:lidar-loose-vs-tight}
+把本节的松耦合 LIO 与 \cref{sec:lidar-fastlio} 的 FAST-LIO 并排看，恰好凸显紧/松的分野。\emph{松}：先用增量 NDT \textbf{独立}把点云配出一个位姿 $\mathbf{T}_{\text{LO}}$，再把它当一次普通位姿观测喂 ESKF——点云配准是滤波器的“黑盒输入”，二者解耦。\emph{紧}：FAST-LIO 不先配出位姿，而是把每个点的点到面残差 \cref{eq:lidar-fl-residual} \textbf{直接}写进 ESKF 的观测方程，在\emph{同一次}迭代卡尔曼更新里联合解算——IMU 预测与点云配准融为一体。两者的精度差来源（\cref{sec:lidar-liosam} 的 pitfall）：松耦合在“先配准”那步\emph{丢弃了}速度等状态与新扫描位姿的相关性，紧耦合保留了它。但松耦合实现简单、配准模块可热插拔、对标定/同步不那么敏感，是工程上稳住系统、再逐步紧耦合的好脚手架——也是理解“紧耦合 LIO 到底紧在哪”的最佳对照。下一步把这条松耦合主线\emph{紧}起来，就通向 \cref{sec:lidar-fastlio} 与 \cref{sec:lidar-fl-gain} 揭示的“紧耦合 LIO = 带 IMU 预测的高维 NDT”。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）补全 \cref{eq:lidar-inc-sigma} 中新增点那一项 $\sum_j(\mathbf{y}_j-\boldsymbol\mu)(\mathbf{y}_j-\boldsymbol\mu)^\top=n(\boldsymbol\Sigma_A+(\boldsymbol\mu_A-\boldsymbol\mu)(\boldsymbol\mu_A-\boldsymbol\mu)^\top)$，并验证：当 $\boldsymbol\mu_H=\boldsymbol\mu_A$ 时 \cref{eq:lidar-inc-sigma} 退化为按点数加权的纯方差平均。
+  \item （概念）解释 LRU 缓存如何让 NDT 地图“跟随车辆滑动”；它与 LIO-SAM 滑窗子图（\cref{sec:lidar-liosam}）、ikd-Tree 盒删（\cref{sec:lidar-fastlio2}）在“有界维护地图”上各自的取舍是什么。
+  \item （推导，结合 \cref{ch:lie}）证明在右扰动 $\mathbf{R}\leftarrow\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol\phi)$ 下，旋转观测残差 \cref{eq:lidar-loose-robs} 对 $\delta\boldsymbol\theta$ 的雅可比在零扰动处为 $\mathbf{I}$（提示：$\mathrm{Log}$ 与 $\mathrm{Exp}$ 在原点附近互逆、一阶为恒等）。
+  \item （实现题）把松耦合 LIO 的配准模块从增量 NDT 换成点到面 ICP（\cref{sec:lidar-dist}）或特征法（\cref{sec:lidar-loam}），保持 ESKF 与 \texttt{ObserveSE3} 不变，比较三者在同一数据集上的漂移——体会“松耦合让配准模块可热插拔”。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{LeGO-LOAM：轻量化与地面优化}
+\label{sec:lidar-lego}
+
+\paragraph{动机：地面车 + 嵌入式的两大痛点。}
+LOAM 在地面无人车（UGV）+ 弱算力嵌入式平台上有两个问题\cite{shan2018legoloam}：(1) 对稠密点云每点算曲率太慢，嵌入式上特征提取跟不上传感器；(2) 雷达常装得离地面近，地面噪声（草地的乱反射）和树叶会产生高曲率的\emph{不可靠}边特征——同一片草叶不会在两帧间重现，配准时引入误差。LeGO-LOAM（Lightweight and Ground-Optimized LOAM）针对性地给出两大改进：\textbf{点云分割}（去地面 + 聚类 + 滤小簇）与\textbf{两步 LM 优化}，并集成\emph{回环 + 位姿图}。
+
+\subsection{距离图像分割：去地面 + 角度聚类}
+\label{sec:lidar-lego-seg}
+
+把单帧点云 $\mathcal{P}_t$ 投影到\textbf{距离图像}（range image，VLP-16 为 $1800\times16$），每个有效点 $\mathbf{p}_i$ 占一像素、记距离值 $r_i$\cite{shan2018legoloam}。先\emph{逐列}评估提取地面点（不假设地面平坦，因坡地常见）、不参与后续分割；再对距离图像做\emph{基于角度的连通域聚类}\cite{bogoslavskyi2016fast}，把同物体的点合为一簇，\textbf{省略点数少于 $30$ 的簇}（树叶等不可靠琐碎特征）。
+
+\paragraph{角度判据 $\beta$（聚类的核心）。}
+Bogoslavskyi–Stachniss 分割\cite{bogoslavskyi2016fast} 的核心是一个角度判据：设相邻两激光束端点 $A,B$，距离测量 $d_1=\max(\cdot),d_2=\min(\cdot)$，$\alpha$ 为两束已知夹角（来自传感器规格），定义 $\beta$ 为激光束与连接 $A,B$ 线段的夹角：
+\begin{equation}
+  \beta=\arctan\frac{d_2\sin\alpha}{d_1-d_2\cos\alpha}.
+  \label{eq:lidar-bogo-beta}
+\end{equation}
+判据：$\beta$ 对同一物体上的相邻点\emph{较大}，仅当相邻点深度差远大于其图像位移时才小。取阈值 $\theta$，若 $\beta>\theta$ 则两点同物体（合并）、否则分簇。其物理意义：$\beta$ 大表示两点连线接近“横切”激光束（同一连续表面），$\beta$ 小表示连线接近“沿束方向”（深度突变，是物体边界）。该算法对距离图像做 BFS 连通域标记，复杂度 $O(N)$（$N$ 为像素数，每像素最多访问两次），单参数 $\theta$ 物理意义明确。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, scale=1.2]
+  \fill (0,0) circle (1pt) node[left, font=\scriptsize]{O (LiDAR)};
+  \draw[gray,->] (0,0)--(2.6,1.5);
+  \draw[gray,->] (0,0)--(2.9,0.85);
+  \coordinate (A) at (2.3,1.33); \coordinate (B) at (2.55,0.75);
+  \fill[main!70!black] (A) circle (1.6pt) node[above]{$A$ ($d_1$)};
+  \fill[second!70!black] (B) circle (1.6pt) node[right]{$B$ ($d_2$)};
+  \draw[very thick, red] (A)--(B);
+  % foot H: projection of B onto OA
+  \coordinate (H) at (2.55,1.47);
+  \draw[dashed, gray] (B)--(H);
+  \node[font=\scriptsize] at (1.3,0.95) {$\alpha$};
+  \draw (0.55,0.32) arc (30:18:0.6);
+  \node[red, font=\scriptsize] at (2.15,1.0) {$\beta$};
+\end{tikzpicture}
+\caption{角度判据 $\beta$（\cref{eq:lidar-bogo-beta}）：$\beta$ 大表示 $A,B$ 在同一连续表面上，$\beta$ 小表示深度突变（物体边界）。据此在距离图像上做连通域聚类。（仿 \cite{bogoslavskyi2016fast} 重绘）}
+\label{fig:lidar-bogo}
+\end{figure}
+
+\paragraph{两级特征集。}
+分割后从\emph{地面点和分割点}（而非原始点）提特征，曲率用距离值 $r$ 而非三维坐标计算（基于距离图像的简化）：$c=\frac{1}{|\mathcal{S}|\cdot\|r_i\|}\big\|\sum_{j\in\mathcal{S},j\neq i}(r_j-r_i)\big\|$。距离图像水平分 $6$ 个子图（每个 $300\times16$），每行用阈值 $c_{th}$ 分边/面，并取\textbf{两级}特征\cite{shan2018legoloam}：里程计用的（多、粗）边/面集 $\mathbb{F}_e,\mathbb{F}_p$ 与建图用的（少、精）子集 $F_e\subset\mathbb{F}_e,F_p\subset\mathbb{F}_p$，每行选取的特征数分别为 $\mathbb{F}_e{=}40,\mathbb{F}_p{=}80,F_e{=}2,F_p{=}4$。
+
+\subsection{两步 LM 优化}
+\label{sec:lidar-lego-twostep}
+
+LOAM 把边/面距离编进\emph{单一}向量、一次 LM 求全 $6$ 自由度。LeGO-LOAM 改为\textbf{两步}\cite{shan2018legoloam}：
+\begin{enumerate}
+  \item \textbf{第一步}：用\emph{地面平面}特征（面点）求 $[t_z,\theta_{\text{roll}},\theta_{\text{pitch}}]$——地面约束了垂直平移与翻滚/俯仰；
+  \item \textbf{第二步}：用\emph{边缘}特征、以第一步结果为约束，求剩余 $[t_x,t_y,\theta_{\text{yaw}}]$。
+\end{enumerate}
+此外用\textbf{标签匹配}（label matching）：每特征带分割标签，只在同标签间找对应（平面特征只在地面点中找面、边特征只在分割簇中找线），提高匹配精度、缩小候选。两步法精度与单步相当，但因第一步只需 $\sim 2$ 次迭代、第二步处理特征更少，里程计运行时间减约 $34\%$–$48\%$；特征提取与里程计的运行时间相比 LOAM 减少\emph{一个数量级}（在 Jetson TX2 上 LOAM 两模块 $>100$\,ms 导致跳帧，LeGO-LOAM 分别 $\sim 9$\,ms、$\sim 19$\,ms）。
+
+\paragraph{回环 + 位姿图建图。}
+LeGO-LOAM 不存单一点云地图，而\emph{保存每帧的特征集} $\{F^t_e,F^t_p\}$ 并关联其位姿\cite{shan2018legoloam}。周围地图 $Q^{t-1}$ 可由近期一组特征集构成（短期无漂移假设），并把每帧位姿建为\textbf{位姿图节点}、相邻帧加空间约束。\textbf{回环}：若当前特征集与某历史特征集用 ICP 匹配成功，加新约束，送 iSAM2\cite{kaess2012isam2} 优化更新全部位姿与地图。这正是 LOAM 留下的“未来工作（开发回环修正漂移）”的实现，把 LeGO-LOAM 从纯里程计升级为完整 SLAM。
+
+\begin{insight}
+两步 LM 的本质是\textbf{利用结构先验解耦自由度}。地面是一个强先验：它几乎不动地约束了 $z$、roll、pitch 三个自由度，且这三个自由度的可观测性来自\emph{大面积平面}（信息量大、噪声小）；剩下的 $x,y$、yaw 才依赖边特征（信息量小、噪声大）。分两步先解“好解的”再解“难解的”，避免难自由度的噪声污染好自由度——这与 LeGO-LOAM 的“地面优化”命名相呼应，也是“用领域结构降维”的通用工程思想。
+\end{insight}
+
+\begin{pitfall}[概念误区：把两步优化当成纯粹的提速技巧]
+两步 LM 不仅省时间，更\emph{提精度}：单步把所有残差混在一起，地面这种强约束会被大量噪声边特征“稀释”。但两步法也有\textbf{适用边界}——它\emph{假设存在可见地面}。在地面缺失（楼梯井、悬空飞行、地下管道）时第一步无解，必须退回单步或其它方案。LINS 等系统正因依赖地面平面而不适用于空中应用。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）由 \cref{eq:lidar-bogo-beta} 说明：当 $A,B$ 在垂直于激光束的平面上时 $\beta\to 90^\circ$；当沿束方向有深度跳变时 $\beta\to 0$。据此解释阈值 $\theta$ 如何控制聚类粒度。
+  \item （设计扩展题）在 LeGO-LOAM 框架里，若把地面提取从“逐列评估”换成 RANSAC 平面拟合，讨论在强坡地上的优劣。
+  \item （跨章综合题，结合 \cref{ch:pointcloud}）用 \cref{ch:pointcloud} 的体素降采样 + 法向估计，复现 LeGO-LOAM 的“分割 $\to$ 两级特征”流水线，统计分割前后特征点数的下降比例。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{LIO-SAM：紧耦合因子图 LIO}
+\label{sec:lidar-liosam}
+
+\paragraph{动机：从“IMU 仅预处理”到“IMU 进因子图”。}
+LOAM/LeGO-LOAM 里 IMU 至多做去畸变预处理（\emph{松耦合}）。LIO-SAM\cite{shan2020liosam} 把激光-惯性融合建到\textbf{因子图}上做\emph{紧耦合}平滑：用原始 IMU 测量做去畸变并给配准初值，激光里程计反过来估 IMU 偏置，全部变量在一张图里联合优化。它还自然纳入 GPS、回环等绝对/相对约束。批判 LOAM 的三点：全局体素地图难做回环、难纳 GPS；地图变稠后在线优化效率降；scan-matching 法在大规模有漂移。
+
+\subsection{状态、MAP 与四类因子}
+\label{sec:lidar-liosam-factors}
+
+机器人状态（在世界系 $\mathsf{W}$、体系 $\mathsf{B}$ 与 IMU 系重合）\cite{shan2020liosam}：
+\begin{equation}
+  \mathbf{x}=[\mathbf{R}^\top,\ \mathbf{p}^\top,\ \mathbf{v}^\top,\ \mathbf{b}^\top]^\top,\quad \mathbf{R}\in\SO(3),\ \mathbf{p},\mathbf{v}\in\mathbb{R}^3,\ \mathbf{b}=[\mathbf{b}^\omega;\mathbf{b}^a],
+  \label{eq:lidar-liosam-state}
+\end{equation}
+位姿 $\mathbf{T}=[\mathbf{R}\mid\mathbf{p}]\in\SE(3)$。状态估计表述为\textbf{最大后验（MAP）}，用因子图建模；在高斯噪声假设下 MAP 等价于非线性最小二乘（\cref{ch:slam_est}、\cref{ch:nlopt}）。\cref{fig:lidar-factor} 给出图结构：变量是各时刻机器人状态（节点），四类因子是\textbf{IMU 预积分因子、激光里程计因子、GPS 因子、回环因子}。当位姿变化超阈值时加新节点，每次插入用 iSAM2\cite{kaess2012isam2} 增量优化。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[x=2.0cm, y=1.7cm, every node/.style={font=\small}]
+  \node[latent] (x1) {$\mathbf{x}_1$};
+  \node[latent, right=of x1] (x2) {$\mathbf{x}_2$};
+  \node[latent, right=of x2] (x3) {$\mathbf{x}_3$};
+  \node[latent, right=of x3] (x4) {$\mathbf{x}_4$};
+  % prior
+  \factor[left=4mm of x1] {fp} {left:prior} {} {x1};
+  % IMU preintegration + lidar odom between consecutive states
+  \factor[above=5mm of x1, xshift=1.0cm] {fi1} {above:$\mathcal{I}_{12}$} {} {};
+  \factor[above=5mm of x2, xshift=1.0cm] {fi2} {above:$\mathcal{I}_{23}$} {} {};
+  \factor[above=5mm of x3, xshift=1.0cm] {fi3} {above:$\mathcal{I}_{34}$} {} {};
+  \factoredge {x1} {fi1} {x2};
+  \factoredge {x2} {fi2} {x3};
+  \factoredge {x3} {fi3} {x4};
+  % lidar odometry below
+  \factor[below=5mm of x1, xshift=1.0cm] {fl1} {below:$\mathcal{L}_{12}$} {} {};
+  \factor[below=5mm of x2, xshift=1.0cm] {fl2} {below:$\mathcal{L}_{23}$} {} {};
+  \factoredge {x1} {fl1} {x2};
+  \factoredge {x2} {fl2} {x3};
+  % GPS factor
+  \factor[above=8mm of x3] {fg} {right:GPS} {} {x3};
+  % loop closure
+  \draw[-, thick, magenta] (x1) to[out=-50,in=-130] node[midway,below,font=\scriptsize,magenta]{回环 $\mathcal{L}_{14}$} (x4);
+\end{tikzpicture}
+\caption{LIO-SAM 因子图：节点为机器人状态 $\mathbf{x}_i$；上方 IMU 预积分因子 $\mathcal{I}$、下方激光里程计因子 $\mathcal{L}$、GPS 单元因子、品红回环因子。先验因子固定原点。（仿 \cite{shan2020liosam} 图 1 与 \cite{carlone2026handbook} 图 8.8 重绘）}
+\label{fig:lidar-factor}
+\end{figure}
+
+\paragraph{(a) IMU 预积分因子。}
+IMU 测量模型（含偏置 $\mathbf{b}$、白噪声 $\mathbf{n}$）\cite{shan2020liosam}：
+\begin{align}
+  \hat{\boldsymbol{\omega}}_t&=\boldsymbol{\omega}_t+\mathbf{b}^\omega_t+\mathbf{n}^\omega_t, &
+  \hat{\mathbf{a}}_t&=\mathbf{R}^{BW}_t(\mathbf{a}_t-\mathbf{g})+\mathbf{b}^a_t+\mathbf{n}^a_t.
+  \label{eq:lidar-imu-meas}
+\end{align}
+由此推机器人运动（$\mathbf{R}_t=\mathbf{R}^{WB}_t$）：
+\begin{align}
+  \mathbf{v}_{t+\Delta t}&=\mathbf{v}_t+\mathbf{g}\Delta t+\mathbf{R}_t(\hat{\mathbf{a}}_t-\mathbf{b}^a_t-\mathbf{n}^a_t)\Delta t, \label{eq:lidar-imu-v}\\
+  \mathbf{p}_{t+\Delta t}&=\mathbf{p}_t+\mathbf{v}_t\Delta t+\tfrac12\mathbf{g}\Delta t^2+\tfrac12\mathbf{R}_t(\hat{\mathbf{a}}_t-\mathbf{b}^a_t-\mathbf{n}^a_t)\Delta t^2, \label{eq:lidar-imu-p}\\
+  \mathbf{R}_{t+\Delta t}&=\mathbf{R}_t\,\mathrm{Exp}\big((\hat{\boldsymbol{\omega}}_t-\mathbf{b}^\omega_t-\mathbf{n}^\omega_t)\Delta t\big). \label{eq:lidar-imu-R}
+\end{align}
+两关键帧 $i,j$ 间的\textbf{预积分测量}\cite{forster2017preintegration} 把 $i$ 时刻状态与重力\emph{分离}出去（这正是“预积分”省去重复积分的关键）：
+\begin{align}
+  \Delta\mathbf{v}_{ij}&=\mathbf{R}_i^\top(\mathbf{v}_j-\mathbf{v}_i-\mathbf{g}\Delta t_{ij}), \label{eq:lidar-preint-v}\\
+  \Delta\mathbf{p}_{ij}&=\mathbf{R}_i^\top(\mathbf{p}_j-\mathbf{p}_i-\mathbf{v}_i\Delta t_{ij}-\tfrac12\mathbf{g}\Delta t_{ij}^2), \label{eq:lidar-preint-p}\\
+  \Delta\mathbf{R}_{ij}&=\mathbf{R}_i^\top\mathbf{R}_j. \label{eq:lidar-preint-R}
+\end{align}
+预积分测量直接给出 IMU 预积分因子；IMU 偏置与激光里程计因子在图中\emph{联合}优化。预积分的完整噪声传播、偏置一阶修正与残差见第 \ref{sec:lidar-preint} 节（本章自包含展开）。
+
+\paragraph{(b) 激光里程计因子。}
+特征提取同 LOAM/LeGO-LOAM（边/面）。用\textbf{关键帧 + 滑窗 sub-keyframe}\cite{shan2020liosam}：位姿变化超阈值（位置 $1$\,m、旋转 $10^\circ$）才选关键帧、关联新节点，帧间帧丢弃，保持稀疏因子图。取最近 $n$ 个关键帧（sub-keyframes，本文 $n{=}25$）变换到 $\mathsf{W}$ 合成体素地图 $\mathbb{M}_i=\{\mathbb{M}^e_i,\mathbb{M}^p_i\}$（边/面子图，降采样分辨率 $0.2$/$0.4$\,m）。把新帧 $\mathbb{F}_{i+1}$ 用 IMU 预测 $\tilde{\mathbf{T}}_{i+1}$ 预对齐后，对每个特征在 $\mathbb{M}_i$ 找边/面对应，距离公式与 \cref{eq:lidar-loam-de}、\cref{eq:lidar-loam-dh} 同形：
+\begin{align}
+  d_{e_k}&=\frac{\big\|(\mathbf{p}^e_{i+1,k}-\mathbf{p}^e_{i,u})\times(\mathbf{p}^e_{i+1,k}-\mathbf{p}^e_{i,v})\big\|}{\|\mathbf{p}^e_{i,u}-\mathbf{p}^e_{i,v}\|}, \label{eq:lidar-liosam-de}\\
+  d_{p_k}&=\frac{\big|(\mathbf{p}^p_{i+1,k}-\mathbf{p}^p_{i,u})\cdot\big((\mathbf{p}^p_{i,u}-\mathbf{p}^p_{i,v})\times(\mathbf{p}^p_{i,u}-\mathbf{p}^p_{i,w})\big)\big|}{\big\|(\mathbf{p}^p_{i,u}-\mathbf{p}^p_{i,v})\times(\mathbf{p}^p_{i,u}-\mathbf{p}^p_{i,w})\big\|}. \label{eq:lidar-liosam-dp}
+\end{align}
+用 Gauss–Newton 求最优变换 $\min_{\mathbf{T}_{i+1}}\{\sum d_{e_k}+\sum d_{p_k}\}$，得相对变换即激光里程计因子 $\Delta\mathbf{T}_{i,i+1}=\mathbf{T}_i^\top\mathbf{T}_{i+1}$。\textbf{关键工程优化}：scan-matching 是对\emph{固定大小局部滑窗}而非全局地图，且边缘化旧 scan——这是 LIO-SAM 实时性的来源。
+
+\paragraph{(c) GPS 因子。}
+长时导航仍漂移，引入绝对测量（GPS/高度计/罗盘）消漂\cite{shan2020liosam}。GPS 测量先转本地笛卡尔系，加节点时关联 GPS 因子；GPS 与激光帧不同步时按时间戳线性插值。\textbf{只在估计位置协方差大于 GPS 协方差时才加 GPS 因子}（里程计漂移慢，无需常加）。
+
+\paragraph{(d) 回环因子。}
+因用因子图，回环可无缝纳入。LIO-SAM 用简单有效的\emph{欧氏距离}回环：新状态 $\mathbf{x}_{i+1}$ 入图时，在图中搜欧氏空间靠近它的历史状态（搜索半径 $15$\,m），把 $\mathbb{F}_{i+1}$ 与历史 sub-keyframes（$m{=}12$）scan-matching，得相对变换 $\Delta\mathbf{T}$ 加为回环因子。\textbf{实践发现}：当 GPS 是唯一绝对传感器时，回环对修正\emph{高度漂移}尤其有用（GPS 高程很不准，无回环时高度误差可近 $100$\,m）。
+
+\subsection{极简变体：两关键帧滑窗的预积分图 LIO}
+\label{sec:lidar-preint-graph}
+
+\paragraph{动机：把紧耦合图优化砍到“最小可用”。}
+LIO-SAM 是\emph{完整}的因子图 LIO（多关键帧、GPS、回环）。若只想体会“预积分 + 图优化”如何替代滤波，可把它砍到\textbf{最小}：每次只优化\emph{相邻两个}关键帧\cite{gao2023slamad}。高翔在松耦合 LIO（\cref{sec:lidar-loose-lio}）的框架上，仅把“EKF 预测 + 观测”换成“预积分预测 + 图优化观测”——前端去畸变、消息同步原样不动，只改融合内核——即得一个两关键帧滑窗的预积分图 LIO。其因子图（\cref{fig:lidar-preint-graph}）含四类因子：
+\begin{itemize}
+  \item \textbf{先验因子}：加在\emph{上一个}关键帧上（来自上一轮边缘化，见下）；
+  \item \textbf{预积分因子}：连接两关键帧的位姿/速度/零偏（\cref{eq:lidar-preint-v}--\cref{eq:lidar-preint-R}）；
+  \item \textbf{零偏随机游走因子}：约束相邻两帧的陀螺/加计零偏缓变；
+  \item \textbf{NDT 观测因子}：把当前帧与局部地图配准得到的位姿，加在\emph{下一个}关键帧上作位姿观测。
+\end{itemize}
+本轮优化完，对\emph{下一个}关键帧位姿做\textbf{边缘化}求其协方差，作为\emph{下一轮}的先验因子——如此把信息从一对关键帧“传”到下一对，是滑窗滤波的图优化对偶（\cref{ch:nlopt} 的边缘化先验）。一个工程提醒：预积分因子关联两帧的高维状态（典型 $15$ 维），转成图优化时把位姿/速度/零偏各设一个顶点（顶点种类多但每条边维度低），比写成一个含大量零块的高维顶点更利于稀疏求解。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small,
+  var/.style={draw, circle, minimum size=8.5mm, inner sep=0pt, fill=main!7, draw=main!60!black},
+  fac/.style={draw, rectangle, minimum size=3.4mm, inner sep=0pt},
+  pr/.style={fac, fill=yellow!45, draw=yellow!60!black},
+  pi/.style={fac, fill=red!75, draw=red!60!black},
+  rw/.style={fac, fill=blue!55, draw=blue!60!black},
+  ob/.style={fac, fill=magenta!70, draw=magenta!60!black},
+  ln/.style={-, semithick, gray!60!black}]
+  \node[var] (Ri) at (0,3) {$\mathbf{R}_i,\mathbf{p}_i$};
+  \node[var] (vi) at (0,2) {$\mathbf{v}_i$};
+  \node[var] (bgi) at (0,1) {$\mathbf{b}^\omega_i$};
+  \node[var] (bai) at (0,0) {$\mathbf{b}^a_i$};
+  \node[var] (Rj) at (4,3) {$\mathbf{R}_j,\mathbf{p}_j$};
+  \node[var] (vj) at (4,2) {$\mathbf{v}_j$};
+  \node[var] (bgj) at (4,1) {$\mathbf{b}^\omega_j$};
+  \node[var] (baj) at (4,0) {$\mathbf{b}^a_j$};
+  % prior on keyframe i (all states)
+  \node[pr] (pr) at (-1.5,3) {};
+  \node[font=\scriptsize, above=0pt] at (-1.5,3.18) {先验};
+  \draw[ln] (pr)--(Ri); \draw[ln] (pr) to[bend right=12] (vi);
+  \draw[ln] (pr) to[bend right=16] (bgi); \draw[ln] (pr) to[bend right=20] (bai);
+  % preintegration factor (couples pose/vel/bias of both keyframes)
+  \node[pi] (pi) at (2,2.5) {};
+  \node[font=\scriptsize, above=0pt] at (2,2.72) {预积分因子};
+  \draw[ln] (pi)--(Ri); \draw[ln] (pi)--(vi); \draw[ln] (pi)--(bgi);
+  \draw[ln] (pi)--(Rj); \draw[ln] (pi)--(vj);
+  % bias random-walk factors
+  \node[rw] (rwg) at (2,1) {}; \draw[ln] (rwg)--(bgi); \draw[ln] (rwg)--(bgj);
+  \node[rw] (rwa) at (2,0) {}; \draw[ln] (rwa)--(bai); \draw[ln] (rwa)--(baj);
+  \node[font=\scriptsize, below=0pt] at (2,-0.28) {零偏随机游走};
+  % NDT observation on keyframe j pose
+  \node[ob] (ob) at (5.5,3) {};
+  \node[font=\scriptsize, above=0pt] at (5.5,3.18) {NDT 位姿观测};
+  \draw[ln] (ob)--(Rj);
+  \node[font=\scriptsize, main!50!black] at (0,3.75) {上一个关键帧 $i$};
+  \node[font=\scriptsize, main!50!black] at (4,3.75) {下一个关键帧 $j$};
+\end{tikzpicture}
+\caption{预积分图 LIO 的极简模型（两关键帧滑窗）：黄色先验因子钉住上一帧 $i$ 的绝对量，红色预积分因子耦合两帧的位姿/速度/零偏，蓝色零偏随机游走约束零偏缓变，品红 NDT 因子把激光-地图配准位姿作下一帧 $j$ 的观测。本轮解完边缘化 $j$ 得其协方差，作下一轮先验。（仿 \cite{gao2023slamad} 图 8-3 重绘）}
+\label{fig:lidar-preint-graph}
+\end{figure}
+
+\begin{insight}[为什么“上一个关键帧”必须有先验：预积分只观测状态之差]\label{ins:lidar-preint-zerospace}
+预积分因子观测的是两关键帧状态的\emph{差值}而非绝对量\cite{gao2023slamad}：如速度预积分量 $\Delta\mathbf{v}_{ij}$ 量的是 $\mathbf{v}_j-\mathbf{v}_i$（在 $i$ 系，\cref{eq:lidar-preint-v}）。于是若给两帧速度\emph{同时}加一个常量，速度项残差\emph{不变}；再在位移项配上相应调整，位移观测也保持不变——整个状态便能在一个\textbf{零空间}里自由漂移而不增代价。补救正是给\emph{前一个}关键帧加\textbf{先验约束}（钉住绝对量）、给后一个加观测约束，把优化问题锁在有限范围内。这与可观测性分析里“纯相对测量留下规范自由度”是同一回事（\cref{ch:slam_est} 的 gauge freedom）：相对约束定不了绝对基准，必须另有一处绝对信息（先验或绝对观测）来钉。
+\end{insight}
+
+\begin{insight}[为什么图 LIO 比 GINS 更难调：观测依赖预测]\label{ins:lidar-preint-debug}
+这张图与 \cref{ch:gins} 的 GINS（IMU + RTK 图优化）结构\emph{几乎一样}，却有一处\textbf{本质区别}\cite{gao2023slamad}：GINS 的 RTK 是\emph{绝对}观测，信号好时精度固定、与状态预测无关；而这里的“NDT 观测位姿”是把当前帧\emph{以预测位姿为初值}配到地图得来的——\textbf{观测本身依赖预测}。若某帧预测偏差大，NDT 很可能从差初值配出一个\emph{错误}位姿，这个坏观测再灌回图里就可能让整个 LIO 发散。正因观测与预测\emph{耦合}（而非 RTK 那样彼此独立），基于图优化的 LIO 调试难度明显高于 GINS。实践建议：\emph{先用现成滤波系统把状态跑稳，再上后端图优化}，而非一上来就调两关键帧大图——“从现有系统出发、再做后端优化”是更稳的路径。
+\end{insight}
+
+\subsection{LIO-SAM 数值表现}
+端到端平移误差（米）\cite{shan2020liosam}：Park 序列 LOAM $121.74$、LIO-SAM $0.04$；Campus 序列 LOAM $192.43$、LIO-SAM $0.12$；Amsterdam（$19$\,km）LOAM 失败、LIO-SAM $0.17$。Rotation 测试最大旋转 $133.7^\circ$/s，LIO-SAM 仍能在 $\SO(3)$ 精确注册每帧；LOAM 在快速旋转处发散。
+
+\begin{insight}
+LIO-SAM 与 FAST-LIO 是紧耦合 LIO 的\textbf{两条技术路线}：LIO-SAM 走\emph{优化/平滑}（因子图 + iSAM2 增量平滑，天然能加 GPS/回环/任意约束、易做全局一致），FAST-LIO 走\emph{滤波}（迭代 ESKF，递归、极轻量、适合算力受限的无人机）。优化路线擅长“多源融合 + 全局一致”，滤波路线擅长“极致实时 + 单源里程计”。理解这条分野，就能按平台选型：要回环/GPS/多传感器 $\to$ LIO-SAM 系；要在微型无人机上跑 $100$\,Hz $\to$ FAST-LIO 系。
+\end{insight}
+
+\begin{pitfall}[思维陷阱：以为紧耦合一定优于松耦合]
+紧耦合通常更准（联合优化了状态间相关性，松耦合则\emph{丢弃了速度等状态与新扫描位姿的相关性}），但它\textbf{对标定和同步更敏感}：紧耦合直接融合原始测量，外参不准、时间戳不同步会直接污染状态。缺乏准确标定、未精确同步时，长时间使用完整紧耦合反而困难\cite{carlone2026handbook}。判据：标定/同步可靠 $\to$ 紧耦合；否则先用松耦合稳住，再逐步紧耦合。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）由 \cref{eq:lidar-imu-v}–\cref{eq:lidar-imu-R} 推出预积分量 \cref{eq:lidar-preint-v}–\cref{eq:lidar-preint-R}，并指出右端为何独立于 $i$ 时刻状态与重力。
+  \item （概念）为什么 LIO-SAM 对 GPS 因子设“仅当估计协方差 $>$ GPS 协方差才加”的门限？不设会怎样？
+  \item （跨章综合题，结合 \cref{ch:nlopt}、\cref{ch:slam_est}）说明 LIO-SAM 的 MAP 如何化为因子图最小二乘，iSAM2/Bayes 树相对每次重解整图的优势在哪。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{FAST-LIO：紧耦合迭代 ESKF 完整推导}
+\label{sec:lidar-fastlio}
+
+\paragraph{动机：海量激光点 + 微型平台。}
+固态激光雷达便宜轻量、适合小型无人机，但带来三个挑战\cite{xu2021fastlio}：(1) 特征是几何结构（边/面），杂乱/小 FoV 环境易退化；(2) 一帧含数千特征点，把它们紧耦合融合到 IMU 需要无人机板载承受不起的算力；(3) 顺序采样导致运动畸变，螺旋桨振动给 IMU 引入噪声。FAST-LIO 用\textbf{紧耦合迭代扩展卡尔曼滤波}（iterated EKF/ESKF）融合激光特征与 IMU，两大贡献：(i) 形式化的\emph{前向 + 反向传播}预测状态并补偿帧内畸变；(ii) \emph{新卡尔曼增益公式}，使复杂度只依赖\textbf{状态维}（$18$）而非\textbf{测量维}（$>1000$），并证明与标准公式等价。下面把整套迭代 ESKF 逐行推导。
+
+\subsection{流形封装与连续/离散模型}
+\label{sec:lidar-fl-model}
+
+\paragraph{$\boxplus/\boxminus$ 算子（接 \cref{ch:lie}）。}
+对 $n$ 维流形 $\mathcal{M}$，封装算子\cite{hertzberg2013integrating} 建立局部邻域到切空间 $\mathbb{R}^n$ 的双射 $\boxplus:\mathcal{M}\times\mathbb{R}^n\to\mathcal{M}$、$\boxminus:\mathcal{M}\times\mathcal{M}\to\mathbb{R}^n$。本书取\emph{右乘}约定：
+\begin{equation}
+  \mathcal{M}=\SO(3):\ \mathbf{R}\boxplus\mathbf{r}=\mathbf{R}\,\mathrm{Exp}(\mathbf{r}),\quad \mathbf{R}_1\boxminus\mathbf{R}_2=\mathrm{Log}(\mathbf{R}_2^\top\mathbf{R}_1);\qquad \mathcal{M}=\mathbb{R}^n:\ \mathbf{a}\boxplus\mathbf{b}=\mathbf{a}+\mathbf{b}.
+  \label{eq:lidar-fl-boxplus}
+\end{equation}
+满足互逆 $(\mathbf{x}\boxplus\mathbf{u})\boxminus\mathbf{x}=\mathbf{u}$、$\mathbf{x}\boxplus(\mathbf{y}\boxminus\mathbf{x})=\mathbf{y}$。复合流形按分量定义。注意 $\mathbf{R}\boxplus\mathbf{r}=\mathbf{R}\,\mathrm{Exp}(\mathbf{r})$ 正是本书\textbf{右扰动}约定，故 FAST-LIO 的姿态误差 $\delta\boldsymbol{\theta}=\mathrm{Log}({}^G\bar{\mathbf{R}}_I^\top\,{}^G\mathbf{R}_I)$（即 ${}^G\mathbf{R}_I={}^G\bar{\mathbf{R}}_I\,\mathrm{Exp}(\delta\boldsymbol{\theta})$）与本书右扰动 $\delta\boldsymbol{\phi}$ \emph{一致}，无需翻转扰动侧，仅符号字母由 $\delta\boldsymbol{\theta}$ 改为本书的 $\delta\boldsymbol{\phi}$。
+
+\paragraph{连续时间运动学。}
+IMU 刚连激光雷达，已知外参 ${}^I\mathbf{T}_L=({}^I\mathbf{R}_L,{}^I\mathbf{p}_L)$，取 IMU 系 $I$ 为体参考系，运动学模型\cite{xu2021fastlio}：
+\begin{equation}
+\begin{aligned}
+{}^G\dot{\mathbf{p}}_I&={}^G\mathbf{v}_I, &
+{}^G\dot{\mathbf{v}}_I&={}^G\mathbf{R}_I(\mathbf{a}_m-\mathbf{b}_a-\mathbf{n}_a)+{}^G\mathbf{g}, &
+{}^G\dot{\mathbf{g}}&=\mathbf{0},\\
+{}^G\dot{\mathbf{R}}_I&={}^G\mathbf{R}_I\,(\boldsymbol{\omega}_m-\mathbf{b}_\omega-\mathbf{n}_\omega)^\wedge, &
+\dot{\mathbf{b}}_\omega&=\mathbf{n}_{b\omega}, &
+\dot{\mathbf{b}}_a&=\mathbf{n}_{ba},
+\end{aligned}
+\label{eq:lidar-fl-cont}
+\end{equation}
+其中 ${}^G\mathbf{p}_I,{}^G\mathbf{R}_I$ 是 IMU 在全局系 $G$（第一个 IMU 帧）中的位置/姿态，${}^G\mathbf{g}$ 是\emph{未知重力}（建为待估状态、$\dot{}^G\mathbf{g}=\mathbf{0}$，避免对初始姿态对齐重力的强假设），$\mathbf{a}_m,\boldsymbol{\omega}_m$ 是 IMU 测量，$\mathbf{n}_a,\mathbf{n}_\omega$ 是白噪声，$\mathbf{b}_a,\mathbf{b}_\omega$ 是受高斯噪声 $\mathbf{n}_{ba},\mathbf{n}_{b\omega}$ 驱动的随机游走偏置。
+
+\paragraph{离散模型（$18$ 维状态）。}
+用零阶保持以 IMU 周期 $\Delta t$ 离散：$\mathbf{x}_{i+1}=\mathbf{x}_i\boxplus(\Delta t\,\mathbf{f}(\mathbf{x}_i,\mathbf{u}_i,\mathbf{w}_i))$，其中流形 $\mathcal{M}=\SO(3)\times\mathbb{R}^{15}$（$\dim=18$）、
+\begin{equation}
+\mathbf{x}=\begin{bmatrix}{}^G\mathbf{R}_I^\top & {}^G\mathbf{p}_I^\top & {}^G\mathbf{v}_I^\top & \mathbf{b}_\omega^\top & \mathbf{b}_a^\top & {}^G\mathbf{g}^\top\end{bmatrix}^\top,\quad
+\mathbf{u}=\begin{bmatrix}\boldsymbol{\omega}_m^\top & \mathbf{a}_m^\top\end{bmatrix}^\top,\quad
+\mathbf{w}=\begin{bmatrix}\mathbf{n}_\omega^\top & \mathbf{n}_a^\top & \mathbf{n}_{b\omega}^\top & \mathbf{n}_{ba}^\top\end{bmatrix}^\top,
+\label{eq:lidar-fl-state}
+\end{equation}
+\begin{equation}
+\mathbf{f}(\mathbf{x}_i,\mathbf{u}_i,\mathbf{w}_i)=\begin{bmatrix}
+\boldsymbol{\omega}_{m_i}-\mathbf{b}_{\omega_i}-\mathbf{n}_{\omega_i}\\
+{}^G\mathbf{v}_{I_i}\\
+{}^G\mathbf{R}_{I_i}(\mathbf{a}_{m_i}-\mathbf{b}_{a_i}-\mathbf{n}_{a_i})+{}^G\mathbf{g}_i\\
+\mathbf{n}_{b\omega_i}\\
+\mathbf{n}_{ba_i}\\
+\mathbf{0}_{3\times1}
+\end{bmatrix}.
+\label{eq:lidar-fl-f}
+\end{equation}
+$\mathbf{f}$ 的六块依次是状态六块的“切空间增量率”：第一块经 $\boxplus$ 的 $\mathrm{Exp}$ 作用于旋转，第六块为零表示重力按常量传播。
+
+\paragraph{测量预处理。}
+激光点采样率极高（如 $200$\,kHz），累积一段（FAST-LIO 最小 $20$\,ms $\to$ 最高 $50$\,Hz）成一个 scan，处理时刻记 $t_k$。提平面点（高光滑度）与边点（低光滑度），设特征点数 $m$，第 $j$ 个采样于 $\rho_j\in(t_{k-1},t_k]$、记 ${}^{L_j}\mathbf{p}_{f_j}$。一个 scan 内也有多个 IMU 测量，第 $i$ 个在 $\tau_i\in[t_{k-1},t_k]$。
+
+\subsection{前向传播：状态与协方差}
+\label{sec:lidar-fl-fwd}
+
+收到 IMU 输入即前向传播，过程噪声置零\cite{xu2021fastlio}：
+\begin{equation}
+  \hat{\mathbf{x}}_{i+1}=\hat{\mathbf{x}}_i\boxplus\big(\Delta t\,\mathbf{f}(\hat{\mathbf{x}}_i,\mathbf{u}_i,\mathbf{0})\big),\qquad \hat{\mathbf{x}}_0=\bar{\mathbf{x}}_{k-1}.
+  \label{eq:lidar-fl-fwdstate}
+\end{equation}
+传播协方差需\textbf{误差状态动力学}。定义误差 $\tilde{\mathbf{x}}_i=\mathbf{x}_i\boxminus\hat{\mathbf{x}}_i$，对 \cref{eq:lidar-fl-fwdstate} 在 $\hat{\mathbf{x}}_i$ 处线性化：
+\begin{equation}
+  \tilde{\mathbf{x}}_{i+1}=\big(\mathbf{x}_i\boxplus\Delta t\,\mathbf{f}(\mathbf{x}_i,\mathbf{u}_i,\mathbf{w}_i)\big)\boxminus\big(\hat{\mathbf{x}}_i\boxplus\Delta t\,\mathbf{f}(\hat{\mathbf{x}}_i,\mathbf{u}_i,\mathbf{0})\big)\simeq\mathbf{F}_{\tilde{\mathbf{x}}}\,\tilde{\mathbf{x}}_i+\mathbf{F}_{\mathbf{w}}\,\mathbf{w}_i.
+  \label{eq:lidar-fl-errdyn}
+\end{equation}
+其中（$\hat{\boldsymbol{\omega}}_i=\boldsymbol{\omega}_{m_i}-\hat{\mathbf{b}}_\omega$、$\hat{\mathbf{a}}_i=\mathbf{a}_{m_i}-\hat{\mathbf{b}}_a$；行/列序对应 $[\delta\boldsymbol{\phi},{}^G\tilde{\mathbf{p}}_I,{}^G\tilde{\mathbf{v}}_I,\tilde{\mathbf{b}}_\omega,\tilde{\mathbf{b}}_a,{}^G\tilde{\mathbf{g}}]$）：
+\begin{equation}
+\mathbf{F}_{\tilde{\mathbf{x}}}=\begin{bmatrix}
+\mathrm{Exp}(-\hat{\boldsymbol{\omega}}_i\Delta t) & \mathbf{0} & \mathbf{0} & -\mathbf{A}(\hat{\boldsymbol{\omega}}_i\Delta t)^\top\Delta t & \mathbf{0} & \mathbf{0}\\
+\mathbf{0} & \mathbf{I} & \mathbf{I}\Delta t & \mathbf{0} & \mathbf{0} & \mathbf{0}\\
+-{}^G\hat{\mathbf{R}}_{I_i}\hat{\mathbf{a}}_i^\wedge\Delta t & \mathbf{0} & \mathbf{I} & \mathbf{0} & -{}^G\hat{\mathbf{R}}_{I_i}\Delta t & \mathbf{I}\Delta t\\
+\mathbf{0} & \mathbf{0} & \mathbf{0} & \mathbf{I} & \mathbf{0} & \mathbf{0}\\
+\mathbf{0} & \mathbf{0} & \mathbf{0} & \mathbf{0} & \mathbf{I} & \mathbf{0}\\
+\mathbf{0} & \mathbf{0} & \mathbf{0} & \mathbf{0} & \mathbf{0} & \mathbf{I}
+\end{bmatrix},\quad
+\mathbf{F}_{\mathbf{w}}=\begin{bmatrix}
+-\mathbf{A}(\hat{\boldsymbol{\omega}}_i\Delta t)^\top\Delta t & \mathbf{0} & \mathbf{0} & \mathbf{0}\\
+\mathbf{0} & \mathbf{0} & \mathbf{0} & \mathbf{0}\\
+\mathbf{0} & -{}^G\hat{\mathbf{R}}_{I_i}\Delta t & \mathbf{0} & \mathbf{0}\\
+\mathbf{0} & \mathbf{0} & \mathbf{I}\Delta t & \mathbf{0}\\
+\mathbf{0} & \mathbf{0} & \mathbf{0} & \mathbf{I}\Delta t\\
+\mathbf{0} & \mathbf{0} & \mathbf{0} & \mathbf{0}
+\end{bmatrix},
+\label{eq:lidar-fl-FxFw}
+\end{equation}
+$\mathbf{A}(\mathbf{u})^{-1}$ 是 $\SO(3)$ 右雅可比的逆 $\mathbf{J}_r(\mathbf{u})^{-1}$ 的闭式\cite{bullo1995proportional}：
+\begin{equation}
+  \mathbf{A}(\mathbf{u})^{-1}=\mathbf{I}-\tfrac12\mathbf{u}^\wedge+\big(1-\alpha(\|\mathbf{u}\|)\big)\frac{(\mathbf{u}^\wedge)^2}{\|\mathbf{u}\|^2},\qquad \alpha(m)=\frac{m}{2}\cot\frac{m}{2}.
+  \label{eq:lidar-fl-A}
+\end{equation}
+对比 \cref{ch:lie} 的右雅可比逆 $\mathbf{J}_r^{-1}=\tfrac{\theta}{2}\cot\tfrac{\theta}{2}\mathbf{I}+(1-\tfrac{\theta}{2}\cot\tfrac{\theta}{2})\mathbf{a}\mathbf{a}^\top+\tfrac{\theta}{2}\mathbf{a}^\wedge$，可验证二者一致（这正是“误差状态线性化时右扰动雅可比现身”的体现）。记过程噪声协方差 $\boldsymbol{\Sigma}_{\mathbf{w}}$（FAST-LIO 原文 $\mathbf{Q}$），协方差迭代为
+\begin{equation}
+  \hat{\mathbf{P}}_{i+1}=\mathbf{F}_{\tilde{\mathbf{x}}}\,\hat{\mathbf{P}}_i\,\mathbf{F}_{\tilde{\mathbf{x}}}^\top+\mathbf{F}_{\mathbf{w}}\,\boldsymbol{\Sigma}_{\mathbf{w}}\,\mathbf{F}_{\mathbf{w}}^\top,\qquad \hat{\mathbf{P}}_0=\bar{\mathbf{P}}_{k-1}.
+  \label{eq:lidar-fl-Pprop}
+\end{equation}
+传播到 scan 末 $t_k$ 得 $\hat{\mathbf{x}}_k,\hat{\mathbf{P}}_k$；$\hat{\mathbf{P}}_k$ 表示 $\mathbf{x}_k\boxminus\hat{\mathbf{x}}_k$ 的协方差。\cref{eq:lidar-fl-FxFw} 的逐块导出见第 \ref{sec:lidar-appendix} 节附录。
+
+\begin{insight}
+\cref{eq:lidar-fl-FxFw} 的每个非零块都有清晰物理含义：旋转-旋转块 $\mathrm{Exp}(-\hat{\boldsymbol{\omega}}_i\Delta t)$（姿态误差的旋转传播）、旋转-陀螺偏置块 $-\mathbf{A}^\top\Delta t$（偏置经右雅可比影响姿态）、位置-速度块 $\mathbf{I}\Delta t$、速度-旋转块 $-{}^G\hat{\mathbf{R}}_{I_i}\hat{\mathbf{a}}_i^\wedge\Delta t$（姿态误差经比力转成速度误差）、速度-加计偏置块、速度-重力块。这与 \cref{ch:eskf} 的 ESKF 误差动力学是\emph{同一张表}，只是这里把 $\SO(3)$ 块用右雅可比写成闭式——理解了 ESKF，FAST-LIO 的传播就是“老朋友穿了流形的外套”。
+\end{insight}
+
+\subsection{反向传播与逐点运动补偿}
+\label{sec:lidar-fl-bwd}
+
+新 scan 在 $t_k$，但特征点在各自 $\rho_j\le t_k$ 测得，体参考系不匹配。为补偿 $\rho_j$ 与 $t_k$ 间相对运动，把模型\textbf{反向传播}\cite{xu2021fastlio}：$\check{\mathbf{x}}_{j-1}=\check{\mathbf{x}}_j\boxplus(-\Delta t\,\mathbf{f}(\check{\mathbf{x}}_j,\mathbf{u}_j,\mathbf{0}))$，从\emph{零位姿}、其余状态取自 $\hat{\mathbf{x}}_k$ 开始，按特征点频率进行。注意 $\mathbf{f}$ 后三块为零，反向传播简化为（“s.f.”= starting from，始于）：
+\begin{equation}
+\begin{aligned}
+{}^{I_k}\check{\mathbf{p}}_{I_{j-1}}&={}^{I_k}\check{\mathbf{p}}_{I_j}-{}^{I_k}\check{\mathbf{v}}_{I_j}\Delta t, &&\text{s.f. }{}^{I_k}\check{\mathbf{p}}_{I_m}=\mathbf{0};\\
+{}^{I_k}\check{\mathbf{v}}_{I_{j-1}}&={}^{I_k}\check{\mathbf{v}}_{I_j}-{}^{I_k}\check{\mathbf{R}}_{I_j}(\mathbf{a}_{m_{i-1}}-\hat{\mathbf{b}}_{a_k})\Delta t-{}^{I_k}\hat{\mathbf{g}}_k\Delta t, &&\text{s.f. }{}^{I_k}\check{\mathbf{v}}_{I_m}={}^G\hat{\mathbf{R}}_{I_k}^\top\,{}^G\hat{\mathbf{v}}_{I_k};\\
+{}^{I_k}\check{\mathbf{R}}_{I_{j-1}}&={}^{I_k}\check{\mathbf{R}}_{I_j}\,\mathrm{Exp}\big((\hat{\mathbf{b}}_{\omega_k}-\boldsymbol{\omega}_{m_{i-1}})\Delta t\big), &&\text{s.f. }{}^{I_k}\check{\mathbf{R}}_{I_m}=\mathbf{I}.
+\end{aligned}
+\label{eq:lidar-fl-bwd}
+\end{equation}
+反向传播给出 $\rho_j$ 与 $t_k$ 间相对位姿 ${}^{I_k}\check{\mathbf{T}}_{I_j}=({}^{I_k}\check{\mathbf{R}}_{I_j},{}^{I_k}\check{\mathbf{p}}_{I_j})$，用它把局部测量投影到 scan 末：
+\begin{equation}
+  {}^{L_k}\mathbf{p}_{f_j}={}^I\mathbf{T}_L^{-1}\,{}^{I_k}\check{\mathbf{T}}_{I_j}\,{}^I\mathbf{T}_L\,{}^{L_j}\mathbf{p}_{f_j}.
+  \label{eq:lidar-fl-project}
+\end{equation}
+\emph{链式解读}：${}^{L_j}\mathbf{p}_{f_j}$（$L_j$ 系）$\xrightarrow{{}^I\mathbf{T}_L}$ IMU 系 $I_j$ $\xrightarrow{{}^{I_k}\check{\mathbf{T}}_{I_j}}$ IMU 系 $I_k$ $\xrightarrow{{}^I\mathbf{T}_L^{-1}}$ $L_k$ 系，即“去外参 $\to$ 相对位姿补偿 $\to$ 回外参”。这是 FAST-LIO 的\emph{逐点精确}运动补偿，区别于 LOAM 的整帧线性插值（\cref{eq:lidar-loam-interp}）。
+
+\subsection{残差与测量模型}
+\label{sec:lidar-fl-meas}
+
+经 \cref{eq:lidar-fl-project} 补偿后，所有特征点可视作同在 $t_k$ 采样。设当前迭代 $\kappa$、状态估计 $\hat{\mathbf{x}}^\kappa_k$（$\kappa=0$ 时 $=\hat{\mathbf{x}}_k$）。把特征点变换到全局系 ${}^G\hat{\mathbf{p}}^\kappa_{f_j}={}^G\hat{\mathbf{T}}^\kappa_{I_k}\,{}^I\mathbf{T}_L\,{}^{L_k}\mathbf{p}_{f_j}$，残差定义为该点到地图中最近平面（或边）的距离\cite{xu2021fastlio}：
+\begin{equation}
+  \mathbf{z}^\kappa_j=\mathbf{G}_j\big({}^G\hat{\mathbf{p}}^\kappa_{f_j}-{}^G\mathbf{q}_j\big),\qquad
+  \mathbf{G}_j=\begin{cases}\mathbf{u}_j^\top, & \text{平面特征（$\mathbf{u}_j$ 为法向）},\\ \mathbf{u}_j^\wedge, & \text{边特征（$\mathbf{u}_j$ 为边方向）},\end{cases}
+  \label{eq:lidar-fl-residual}
+\end{equation}
+${}^G\mathbf{q}_j$ 是对应面/边上一点，$\mathbf{u}_j$ 与近邻搜索由地图点 KD-tree 实现。只取范数低于阈值（如 $0.5$\,m）的残差。
+
+\paragraph{真测量方程与一阶近似。}
+测量噪声来自激光测距/束指向噪声 ${}^{L_j}\mathbf{n}_{f_j}$，去噪得真点 ${}^{L_j}\mathbf{p}^{gt}_{f_j}={}^{L_j}\mathbf{p}_{f_j}-{}^{L_j}\mathbf{n}_{f_j}$。真点经真值状态 $\mathbf{x}_k$ 投影到全局系应\emph{恰落在地图面/边上}：$\mathbf{0}=\mathbf{h}_j(\mathbf{x}_k,{}^{L_j}\mathbf{n}_{f_j})$。在 $\hat{\mathbf{x}}^\kappa_k$ 处一阶近似：
+\begin{equation}
+  \mathbf{0}=\mathbf{h}_j(\mathbf{x}_k,{}^{L_j}\mathbf{n}_{f_j})\simeq\mathbf{h}_j(\hat{\mathbf{x}}^\kappa_k,\mathbf{0})+\mathbf{H}^\kappa_j\,\tilde{\mathbf{x}}^\kappa_k+\mathbf{v}_j=\mathbf{z}^\kappa_j+\mathbf{H}^\kappa_j\,\tilde{\mathbf{x}}^\kappa_k+\mathbf{v}_j,
+  \label{eq:lidar-fl-linmeas}
+\end{equation}
+$\tilde{\mathbf{x}}^\kappa_k=\mathbf{x}_k\boxminus\hat{\mathbf{x}}^\kappa_k$，$\mathbf{H}^\kappa_j$ 是 $\mathbf{h}_j$ 对 $\tilde{\mathbf{x}}^\kappa_k$ 在零处的雅可比，$\mathbf{v}_j\sim\mathcal{N}(\mathbf{0},\boldsymbol{\Sigma}_{\mathbf{v},j})$ 来自原始测量噪声。
+
+\subsection{迭代状态更新与 MAP}
+\label{sec:lidar-fl-update}
+
+\paragraph{先验搬运（迭代 ESKF 的关键修正）。}
+前向传播给的先验是对 $\mathbf{x}_k\boxminus\hat{\mathbf{x}}_k$ 而言，但当前迭代点是 $\hat{\mathbf{x}}^\kappa_k$，须把先验搬到 $\hat{\mathbf{x}}^\kappa_k$ 的切空间\cite{xu2021fastlio}：
+\begin{equation}
+  \mathbf{x}_k\boxminus\hat{\mathbf{x}}_k=(\hat{\mathbf{x}}^\kappa_k\boxplus\tilde{\mathbf{x}}^\kappa_k)\boxminus\hat{\mathbf{x}}_k=\hat{\mathbf{x}}^\kappa_k\boxminus\hat{\mathbf{x}}_k+\mathbf{J}^\kappa\,\tilde{\mathbf{x}}^\kappa_k,
+  \label{eq:lidar-fl-prior}
+\end{equation}
+其中 $\mathbf{J}^\kappa$ 是 $(\hat{\mathbf{x}}^\kappa_k\boxplus\tilde{\mathbf{x}}^\kappa_k)\boxminus\hat{\mathbf{x}}_k$ 对 $\tilde{\mathbf{x}}^\kappa_k$ 在零处的偏导（只有旋转块非平凡，$\mathbb{R}^n$ 部分为单位）：
+\begin{equation}
+  \mathbf{J}^\kappa=\begin{bmatrix}\mathbf{A}\big({}^G\hat{\mathbf{R}}^\kappa_{I_k}\boxminus{}^G\hat{\mathbf{R}}_{I_k}\big)^{-\top} & \mathbf{0}_{3\times15}\\ \mathbf{0}_{15\times3} & \mathbf{I}_{15}\end{bmatrix}.
+  \label{eq:lidar-fl-J}
+\end{equation}
+\textbf{第一次迭代（普通 EKF 情形）}：$\hat{\mathbf{x}}^\kappa_k=\hat{\mathbf{x}}_k$，故 $\mathbf{J}^\kappa=\mathbf{I}$。这一项是 on-manifold 迭代 ESKF 区别于普通 IEKF 的关键修正：它把先验协方差从原始预测点的切空间搬运到当前迭代点的切空间。
+
+\paragraph{MAP 表述。}
+结合 \cref{eq:lidar-fl-prior} 的先验与 \cref{eq:lidar-fl-linmeas} 的后验，得最大后验估计（$\|\mathbf{x}\|^2_{\mathbf{M}}=\mathbf{x}^\top\mathbf{M}\mathbf{x}$）：
+\begin{equation}
+  \min_{\tilde{\mathbf{x}}^\kappa_k}\bigg(\big\|\mathbf{x}_k\boxminus\hat{\mathbf{x}}_k\big\|^2_{\hat{\mathbf{P}}_k^{-1}}+\sum_{j=1}^m\big\|\mathbf{z}^\kappa_j+\mathbf{H}^\kappa_j\tilde{\mathbf{x}}^\kappa_k\big\|^2_{\boldsymbol{\Sigma}_{\mathbf{v},j}^{-1}}\bigg).
+  \label{eq:lidar-fl-map}
+\end{equation}
+把 \cref{eq:lidar-fl-prior} 代入并对二次代价求极小，得\textbf{迭代卡尔曼更新}（记 $\mathbf{H}=[\mathbf{H}^{\kappa\top}_1,\dots,\mathbf{H}^{\kappa\top}_m]^\top$、$\boldsymbol{\Sigma}_{\mathbf{v}}=\mathrm{diag}(\boldsymbol{\Sigma}_{\mathbf{v},1},\dots)$、$\mathbf{P}=(\mathbf{J}^\kappa)^{-1}\hat{\mathbf{P}}_k(\mathbf{J}^\kappa)^{-\top}$、$\mathbf{z}^\kappa=[\mathbf{z}^{\kappa\top}_1,\dots]^\top$）：
+\begin{align}
+  \mathbf{K}&=\mathbf{P}\mathbf{H}^\top(\mathbf{H}\mathbf{P}\mathbf{H}^\top+\boldsymbol{\Sigma}_{\mathbf{v}})^{-1}, \label{eq:lidar-fl-gain-old}\\
+  \hat{\mathbf{x}}^{\kappa+1}_k&=\hat{\mathbf{x}}^\kappa_k\boxplus\Big(-\mathbf{K}\mathbf{z}^\kappa-(\mathbf{I}-\mathbf{K}\mathbf{H})(\mathbf{J}^\kappa)^{-1}(\hat{\mathbf{x}}^\kappa_k\boxminus\hat{\mathbf{x}}_k)\Big). \label{eq:lidar-fl-xupdate}
+\end{align}
+迭代到收敛 $\|\hat{\mathbf{x}}^{\kappa+1}_k\boxminus\hat{\mathbf{x}}^\kappa_k\|<\epsilon$，最优估计与协方差：
+\begin{equation}
+  \bar{\mathbf{x}}_k=\hat{\mathbf{x}}^{\kappa+1}_k,\qquad \bar{\mathbf{P}}_k=(\mathbf{I}-\mathbf{K}\mathbf{H})\mathbf{P}.
+  \label{eq:lidar-fl-final}
+\end{equation}
+
+\subsection{新增益公式：把求逆从测量维降到状态维}
+\label{sec:lidar-fl-gain}
+
+\paragraph{问题。}
+\cref{eq:lidar-fl-gain-old} 要对 $\mathbf{H}\mathbf{P}\mathbf{H}^\top+\boldsymbol{\Sigma}_{\mathbf{v}}$ 求逆，其维度是\textbf{测量维}（一帧 $>1000$ 个特征点）。这正是早期工作只能用少量测量的原因。FAST-LIO 的核心贡献\cite{xu2021fastlio}：因 \cref{eq:lidar-fl-map} 的代价是\emph{对状态}的，解的复杂度应只依赖\textbf{状态维}。直接解 \cref{eq:lidar-fl-map} 得同解、但增益为
+\begin{equation}
+  \boxed{\ \mathbf{K}=(\mathbf{H}^\top\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}\mathbf{H}+\mathbf{P}^{-1})^{-1}\mathbf{H}^\top\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}.\ }
+  \label{eq:lidar-fl-gain-new}
+\end{equation}
+因激光测量独立、$\boldsymbol{\Sigma}_{\mathbf{v}}$ 块对角（$\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}$ 易求），\cref{eq:lidar-fl-gain-new} 只需求逆\emph{状态维}（$18$）矩阵 $\mathbf{H}^\top\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}\mathbf{H}+\mathbf{P}^{-1}$，远小于测量维。实测两公式运行时间（\cref{tab:lidar-gain}）：
+
+\begin{table}[H]\centering\small
+\caption{两种卡尔曼增益公式运行时间对比（ms）\cite{xu2021fastlio}}
+\label{tab:lidar-gain}
+\begin{tabular}{lcccccc}
+\toprule
+特征点数 & 307 & 717 & 998 & 1243 & 1453 & 1802 \\
+\midrule
+旧公式 \cref{eq:lidar-fl-gain-old} & 7.1 & 23.4 & 109.3 & 251 & 1219 & 1621 \\
+新公式 \cref{eq:lidar-fl-gain-new} & 0.07 & 0.11 & 0.25 & 0.37 & 0.59 & 1.16 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{theorem}[两种卡尔曼增益公式等价]\label{thm:lidar-gain-equiv}
+\cref{eq:lidar-fl-gain-new} 与标准卡尔曼增益 \cref{eq:lidar-fl-gain-old} 恒等。
+\end{theorem}
+\begin{proof}
+基于矩阵求逆引理（Woodbury 恒等式）$(\mathbf{P}^{-1}+\mathbf{H}^\top\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}\mathbf{H})^{-1}=\mathbf{P}-\mathbf{P}\mathbf{H}^\top(\mathbf{H}\mathbf{P}\mathbf{H}^\top+\boldsymbol{\Sigma}_{\mathbf{v}})^{-1}\mathbf{H}\mathbf{P}$。代入 \cref{eq:lidar-fl-gain-new}：
+\begin{align*}
+\mathbf{K}&=\big(\mathbf{H}^\top\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}\mathbf{H}+\mathbf{P}^{-1}\big)^{-1}\mathbf{H}^\top\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}
+ =\Big(\mathbf{P}-\mathbf{P}\mathbf{H}^\top(\mathbf{H}\mathbf{P}\mathbf{H}^\top+\boldsymbol{\Sigma}_{\mathbf{v}})^{-1}\mathbf{H}\mathbf{P}\Big)\mathbf{H}^\top\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}\\
+&=\mathbf{P}\mathbf{H}^\top\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}-\mathbf{P}\mathbf{H}^\top(\mathbf{H}\mathbf{P}\mathbf{H}^\top+\boldsymbol{\Sigma}_{\mathbf{v}})^{-1}\mathbf{H}\mathbf{P}\mathbf{H}^\top\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}.
+\end{align*}
+注意恒等式 $\mathbf{H}\mathbf{P}\mathbf{H}^\top\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}=(\mathbf{H}\mathbf{P}\mathbf{H}^\top+\boldsymbol{\Sigma}_{\mathbf{v}})\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}-\mathbf{I}$，代入上式中括号：
+\begin{align*}
+\mathbf{K}&=\mathbf{P}\mathbf{H}^\top\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}-\mathbf{P}\mathbf{H}^\top(\mathbf{H}\mathbf{P}\mathbf{H}^\top+\boldsymbol{\Sigma}_{\mathbf{v}})^{-1}\Big[(\mathbf{H}\mathbf{P}\mathbf{H}^\top+\boldsymbol{\Sigma}_{\mathbf{v}})\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}-\mathbf{I}\Big]\\
+&=\mathbf{P}\mathbf{H}^\top\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}-\Big[\mathbf{P}\mathbf{H}^\top\boldsymbol{\Sigma}_{\mathbf{v}}^{-1}-\mathbf{P}\mathbf{H}^\top(\mathbf{H}\mathbf{P}\mathbf{H}^\top+\boldsymbol{\Sigma}_{\mathbf{v}})^{-1}\Big]
+=\mathbf{P}\mathbf{H}^\top(\mathbf{H}\mathbf{P}\mathbf{H}^\top+\boldsymbol{\Sigma}_{\mathbf{v}})^{-1},
+\end{align*}
+即标准增益 \cref{eq:lidar-fl-gain-old}。证毕。
+\end{proof}
+
+\paragraph{SMW 视角：紧耦合 LIO 就是“带 IMU 预测的高维 NDT”。}
+\cref{thm:lidar-gain-equiv} 用的矩阵求逆引理，正是数值线代里的 \textbf{Sherman–Morrison–Woodbury（SMW）恒等式}。换一个角度读这条等价\cite{gao2023slamad}，能把 FAST-LIO 的迭代 ESKF 与本章前半的 ICP/NDT 串成一句话。\cref{eq:lidar-fl-map} 的 MAP 代价有两块：先验块 $\|\mathbf{x}_k\boxminus\hat{\mathbf{x}}_k\|^2_{\hat{\mathbf{P}}_k^{-1}}$ 来自 IMU 前向传播（\cref{sec:lidar-fl-fwd}），观测块 $\sum_j\|\mathbf{z}^\kappa_j+\mathbf{H}^\kappa_j\tilde{\mathbf{x}}\|^2_{\boldsymbol\Sigma_{\mathbf{v},j}^{-1}}$ 是\emph{一帧上千个点到面/点到边残差}的堆叠——而点到面残差 \cref{eq:lidar-fl-residual} 与 \cref{sec:lidar-dist} 的 ICP、\cref{sec:pc-ndt} 的 NDify 是\emph{同一类几何约束}。\textbf{去掉先验块、只留观测块}，\cref{eq:lidar-fl-map} 就退化成一次纯激光的 scan-to-map 配准（高斯-牛顿的法方程 $\mathbf{H}^\top\boldsymbol\Sigma_{\mathbf{v}}^{-1}\mathbf{H}\,\tilde{\mathbf{x}}=-\mathbf{H}^\top\boldsymbol\Sigma_{\mathbf{v}}^{-1}\mathbf{z}$，恰是 \cref{sec:lidar-loose-lio} 松耦合里那步独立配准）；\textbf{加回先验块}，$\mathbf{P}^{-1}=\hat{\mathbf{P}}_k^{-1}$（经 $\mathbf{J}^\kappa$ 搬运）就以信息形式叠加到法方程的左端 Hessian：
+\begin{equation}
+  \underbrace{\big(\mathbf{H}^\top\boldsymbol\Sigma_{\mathbf{v}}^{-1}\mathbf{H}}_{\text{激光配准信息}}+\underbrace{\mathbf{P}^{-1}}_{\text{IMU 预测信息}}\big)\,\tilde{\mathbf{x}}=-\mathbf{H}^\top\boldsymbol\Sigma_{\mathbf{v}}^{-1}\mathbf{z}^\kappa-\mathbf{P}^{-1}\big(\hat{\mathbf{x}}^\kappa_k\boxminus\hat{\mathbf{x}}_k\big),
+  \label{eq:lidar-fl-info}
+\end{equation}
+其解的增益正是新公式 \cref{eq:lidar-fl-gain-new}。\textbf{这就是紧耦合的几何意义}：紧耦合 LIO = 一次\emph{被 IMU 先验正则化}的高维点云配准——IMU 预测不再像松耦合那样只贡献一个“初值 + 事后位姿观测”，而是作为先验信息 $\mathbf{P}^{-1}$ \emph{并肩进入}同一个法方程，与上千个点的配准信息一起决定解。把它和 \cref{sec:lidar-loose-lio} 对照：松耦合先解纯激光配准（只有 \cref{eq:lidar-fl-info} 左端第一项）、再把结果当观测喂 ESKF；紧耦合把“配准”与“IMU 先验”合进一次更新，故保留了二者的相关性、也更准（\cref{sec:lidar-liosam} 的 pitfall）。
+
+\paragraph{SMW 在“求逆维度”上的作用。}
+\cref{eq:lidar-fl-info} 的左端 Hessian 是 $18\times18$（状态维），直接解它就只需求逆\emph{状态维}矩阵——这正是新增益 \cref{eq:lidar-fl-gain-new} 的算法形态。而标准增益 \cref{eq:lidar-fl-gain-old} 要求逆的 $\mathbf{H}\mathbf{P}\mathbf{H}^\top+\boldsymbol\Sigma_{\mathbf{v}}$ 是\emph{测量维}（$>1000$）。SMW 恒等式（\cref{thm:lidar-gain-equiv} 的证明）正是在这两种等价写法之间架桥：它允许把“对一个高维矩阵（测量维）求逆”换成“对一个低维矩阵（状态维）求逆 + 几个易算的乘法”，前提是高维那块（这里 $\boldsymbol\Sigma_{\mathbf{v}}$）\emph{块对角、其逆易求}——激光点测量相互独立恰好满足。于是 FAST-LIO 能“一帧用上千个点”而求逆代价只随 $18$ 走（\cref{tab:lidar-gain} 的数量级差距）。\emph{一句话}：SMW 把高维观测的求逆\textbf{等效搬到}状态维，从而让“紧耦合 = 高维 NDT/ICP + IMU 先验”在算力受限平台上实时可行。
+
+\begin{insight}[同一恒等式的两副面孔：滤波 vs 优化]\label{ins:lidar-smw}
+\cref{eq:lidar-fl-info} 揭示了一个贯穿全书的统一：\textbf{“信息形式的法方程”与“卡尔曼增益”是同一更新的两种代数书写}，桥就是 SMW。优化派（如 \cref{ch:nlopt}、\cref{sec:lidar-liosam} 的因子图）天然写成 $(\mathbf{H}^\top\boldsymbol\Sigma^{-1}\mathbf{H}+\mathbf{P}^{-1})\tilde{\mathbf{x}}=\cdots$，求逆维度 = 状态/变量维，故适合“状态维 $\ll$ 测量维”的稠密观测（一帧上千点）；滤波派（\cref{ch:eskf} 的卡尔曼增益）写成 $\mathbf{K}=\mathbf{P}\mathbf{H}^\top(\mathbf{H}\mathbf{P}\mathbf{H}^\top+\boldsymbol\Sigma)^{-1}$，求逆维度 = 测量维，适合“测量维 $\ll$ 状态维”的少量观测。FAST-LIO 的“新增益公式”本质是\emph{在滤波框架里借 SMW 切换到优化派的求逆维度}，从而吃下高维激光观测。理解这一点，\cref{sec:lidar-liosam} 的 LIO-SAM（优化/平滑）与本节的 FAST-LIO（滤波）就不再是两套割裂的数学，而是同一信息融合在不同求逆维度下的两副面孔。
+\end{insight}
+
+\begin{algo}[FAST-LIO 状态估计（一个 scan）]\label{alg:lidar-fastlio}
+\textbf{输入}：上一最优 $\bar{\mathbf{x}}_{k-1},\bar{\mathbf{P}}_{k-1}$；当前 scan 的 IMU 输入与激光特征点。
+\begin{enumerate}
+  \item 前向传播经 \cref{eq:lidar-fl-fwdstate} 得 $\hat{\mathbf{x}}_k$、经 \cref{eq:lidar-fl-Pprop} 得 $\hat{\mathbf{P}}_k$；
+  \item 反向传播经 \cref{eq:lidar-fl-bwd}、\cref{eq:lidar-fl-project} 做逐点运动补偿得 ${}^{L_k}\mathbf{p}_{f_j}$；
+  \item $\kappa\leftarrow-1$，$\hat{\mathbf{x}}^{0}_k\leftarrow\hat{\mathbf{x}}_k$；
+  \item \textbf{重复}：
+  \begin{enumerate}
+    \item $\kappa\leftarrow\kappa+1$；经 \cref{eq:lidar-fl-J} 算 $\mathbf{J}^\kappa$，$\mathbf{P}=(\mathbf{J}^\kappa)^{-1}\hat{\mathbf{P}}_k(\mathbf{J}^\kappa)^{-\top}$；
+    \item 经 \cref{eq:lidar-fl-residual} 算残差 $\mathbf{z}^\kappa_j$、经 \cref{eq:lidar-fl-linmeas} 算雅可比 $\mathbf{H}^\kappa_j$；
+    \item 用 \cref{eq:lidar-fl-gain-new} 的增益 $\mathbf{K}$，经 \cref{eq:lidar-fl-xupdate} 算 $\hat{\mathbf{x}}^{\kappa+1}_k$；
+  \end{enumerate}
+  \textbf{直到} $\|\hat{\mathbf{x}}^{\kappa+1}_k\boxminus\hat{\mathbf{x}}^\kappa_k\|<\epsilon$；
+  \item 经 \cref{eq:lidar-fl-final} 得 $\bar{\mathbf{x}}_k,\bar{\mathbf{P}}_k$。\textbf{输出} $\bar{\mathbf{x}}_k,\bar{\mathbf{P}}_k$。
+\end{enumerate}
+\end{algo}
+
+\paragraph{建图与初始化。}
+有了 $\bar{\mathbf{x}}_k$（即 ${}^G\bar{\mathbf{T}}_{I_k}$），每个补偿后的特征点变换到全局系 ${}^G\bar{\mathbf{p}}_{f_j}={}^G\bar{\mathbf{T}}_{I_k}\,{}^I\mathbf{T}_L\,{}^{L_k}\mathbf{p}_{f_j}$ 追加到地图。初始化：保持激光雷达静止数秒（FAST-LIO 取 $2$\,s），用静止数据估 IMU 偏置与重力向量。
+
+\subsection{FAST-LIO2：直接配准与增量 KD-tree}
+\label{sec:lidar-fastlio2}
+
+FAST-LIO2\cite{xu2022fastlio2} 在 FAST-LIO 基础上两大新意，迭代 ESKF 框架不变（状态扩展到 $24$ 维，含 LiDAR-IMU 外参在线标定，$\mathcal{M}=\SO(3)\times\mathbb{R}^{15}\times\SO(3)\times\mathbb{R}^3$，故 \cref{eq:lidar-fl-J} 的 $\mathbf{J}^\kappa$ 有\emph{两个}非平凡 $\mathbf{A}(\cdot)^{-\top}$ 块——IMU 姿态 + 旋转外参）：
+
+\begin{enumerate}
+  \item \textbf{直接配准原始点（免特征提取）}：不提取边/面特征，直接把\emph{原始点}配准到地图——取地图中最近 $5$ 个点拟合局部小平面（法向 ${}^G\mathbf{u}_j$、质心 ${}^G\mathbf{q}_j$），残差仍是点到面 ${}^G\mathbf{u}_j^\top(\cdot)$。这类似视觉 SLAM 的直接法，免去手工特征调参、天然适配不同激光雷达。位置积分还加了二阶项 $\tfrac12({}^G\mathbf{R}_I(\mathbf{a}_m-\mathbf{b}_a)+{}^G\mathbf{g})\Delta t$（比 \cref{eq:lidar-fl-f} 的位置块更精确）。
+  \item \textbf{增量 KD-tree（ikd-Tree）}：标准 KD-tree 插入/删除点会破坏平衡、需重建。ikd-Tree\cite{cai2021ikdtree}（基于 scapegoat 树）在内部与叶节点都存点，支持\emph{点级插入 + 树上降采样}（对落在同一分辨率立方体的点只保留离立方体中心最近者）、\emph{盒删}（按轴对齐立方体批量删点，配合维护的范围信息与 lazy 标签——删点不立即移除、只置 \texttt{deleted} 标志，重建时才真删）、以及\emph{并行重建}（局部子树失衡时在后台线程重建，主线程不卡顿）。地图只维护激光雷达周围边长 $L$ 的大局部区，越界的远点盒删。借此 FAST-LIO2 可在算力受限平台跑 \textbf{$100$\,Hz} 里程计与建图。
+\end{enumerate}
+
+\begin{insight}
+ikd-Tree 的三招（树上降采样、lazy 盒删、并行重建）共同解决一个工程痛点：\textbf{地图必须能高效“增、删、查”且不卡实时线程}。标准 KD-tree 是\emph{静态}结构（一次建好、只查），每帧新增点就得重建整树——地图越大越卡，这正是 FAST-LIO 只能在数百米范围工作的原因。ikd-Tree 把“数据结构的平衡维护”从主线程剥离到后台并增量化，从而把 scan-to-map 直接配准推广到\emph{大场景 + 高频}。这与 LIO-SAM 用“滑窗 sub-keyframe + 边缘化旧 scan”控制规模是\emph{两种思路}：FAST-LIO2 用更聪明的数据结构维护全局地图，LIO-SAM 用滑窗只看局部。
+\end{insight}
+
+\begin{pitfall}[编程陷阱：迭代 ESKF 漏掉先验搬运项 $\mathbf{J}^\kappa$]
+迭代 ESKF 与普通 ESKF 的唯一形式差异，就是 \cref{eq:lidar-fl-prior}–\cref{eq:lidar-fl-J} 的先验搬运 $\mathbf{J}^\kappa$ 和 \cref{eq:lidar-fl-xupdate} 末项 $-(\mathbf{I}-\mathbf{K}\mathbf{H})(\mathbf{J}^\kappa)^{-1}(\hat{\mathbf{x}}^\kappa_k\boxminus\hat{\mathbf{x}}_k)$。新手常把它当普通 EKF（每次迭代 $\mathbf{J}^\kappa=\mathbf{I}$），\textbf{现象}：迭代不收敛或收敛到带偏估计，姿态尤甚。\textbf{根因}：先验协方差定义在原始预测点 $\hat{\mathbf{x}}_k$ 的切空间，迭代后工作点 $\hat{\mathbf{x}}^\kappa_k$ 已偏离，不搬运就用错了切空间。\textbf{对策}：第一次迭代 $\mathbf{J}^\kappa=\mathbf{I}$（与普通 EKF 一致），第二次起必须按 \cref{eq:lidar-fl-J} 计算并代入。\textbf{自检}：单帧只迭代一次时结果应与普通 ESKF 完全一致。
+\end{pitfall}
+
+\begin{pitfall}[概念误区：以为新增益公式“更准”]
+\cref{thm:lidar-gain-equiv} 证明了新增益 \cref{eq:lidar-fl-gain-new} 与标准增益 \cref{eq:lidar-fl-gain-old} \emph{数学完全相等}——估计结果\textbf{一字不差}。新公式唯一的好处是\emph{算得快}（求逆从测量维降到状态维），不是“更准”。把它当成精度改进会误解 FAST-LIO 的贡献：它是\emph{计算效率}的等价重排，让“一帧用上千个点”变得可行（而旧公式下只能用少量点，那才会损失精度）。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）补全 \cref{eq:lidar-fl-residual} 平面特征残差 $\mathbf{z}_j=\mathbf{u}_j^\top({}^G\hat{\mathbf{p}}_{f_j}-{}^G\mathbf{q}_j)$ 对误差状态 $\tilde{\mathbf{x}}^\kappa_k$（含 $\delta\boldsymbol{\phi}$ 与 ${}^G\tilde{\mathbf{p}}_I$）的雅可比 $\mathbf{H}^\kappa_j$，用右扰动 $\partial(\mathbf{R}\mathbf{q})/\partial\boldsymbol{\varphi}=-\mathbf{R}\mathbf{q}^\wedge$。
+  \item （证明）独立写出 \cref{thm:lidar-gain-equiv} 的证明，标出每一步用到的恒等式。
+  \item （概念）解释为什么 \cref{eq:lidar-fl-J} 只有旋转块非平凡而 $\mathbb{R}^{15}$ 块是单位阵；FAST-LIO2 为什么变成两个非平凡块。
+  \item （跨章综合题，结合 \cref{ch:eskf}、\cref{ch:lie}）把 FAST-LIO 的迭代 ESKF 与 \cref{ch:eskf} 的标准 ESKF 逐步对照：列出“多了哪些项、为什么”（提示：迭代 + 流形 $\boxplus/\boxminus$ + 先验搬运）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{IMU 预积分（使 LIO 自包含）}
+\label{sec:lidar-preint}
+
+\paragraph{动机：避免每次优化都重积分 IMU。}
+LIO-SAM 的 IMU 预积分因子（\cref{eq:lidar-preint-v}–\cref{eq:lidar-preint-R}）直接引用 Forster 等的流形预积分\cite{forster2017preintegration}。预积分要解决的问题是：因子图优化时位姿 $\mathbf{R}_i,\mathbf{p}_i,\mathbf{v}_i$ 在每次迭代都变，若每次都把 $i,j$ 间的 IMU 测量\emph{重新积分}一遍代价极高。Forster 的洞见是把“相对运动”写成\textbf{独立于 $i$ 时刻状态与重力}的量，从而只需积分一次、之后随状态变化只做一阶修正。Forster 全程用右雅可比 $\mathbf{J}_r$ 与 $\SO(3)$ 上 $\mathrm{Exp/Log}$，与本书右扰动主线一致——这正是本书“右扰动为主、对接因子图”决策的直接来源。
+
+\paragraph{IMU 模型与预积分测量。}
+带白噪声 $\boldsymbol{\eta}$ 与缓变偏置 $\mathbf{b}$ 的陀螺/加速度测量\cite{forster2017preintegration}：
+\begin{equation}
+  \tilde{\boldsymbol{\omega}}(t)=\boldsymbol{\omega}(t)+\mathbf{b}^g(t)+\boldsymbol{\eta}^g(t),\qquad
+  \tilde{\mathbf{a}}(t)=\mathbf{R}_{WB}^\top(t)\big({}_W\mathbf{a}(t)-{}_W\mathbf{g}\big)+\mathbf{b}^a(t)+\boldsymbol{\eta}^a(t).
+  \label{eq:lidar-forster-imu}
+\end{equation}
+两关键帧 $i,j$ 间的预积分测量（真值定义；把噪声移到末端的一阶近似过程已并入下文噪声传播）：
+\begin{align}
+  \Delta\tilde{\mathbf{R}}_{ij}&=\prod_{k=i}^{j-1}\mathrm{Exp}\big((\tilde{\boldsymbol{\omega}}_k-\mathbf{b}^g_i)\Delta t\big), \label{eq:lidar-forster-dR}\\
+  \Delta\tilde{\mathbf{v}}_{ij}&=\sum_{k=i}^{j-1}\Delta\tilde{\mathbf{R}}_{ik}(\tilde{\mathbf{a}}_k-\mathbf{b}^a_i)\Delta t, \label{eq:lidar-forster-dv}\\
+  \Delta\tilde{\mathbf{p}}_{ij}&=\sum_{k=i}^{j-1}\Big[\Delta\tilde{\mathbf{v}}_{ik}\Delta t+\tfrac12\Delta\tilde{\mathbf{R}}_{ik}(\tilde{\mathbf{a}}_k-\mathbf{b}^a_i)\Delta t^2\Big]. \label{eq:lidar-forster-dp}
+\end{align}
+关键洞察：\cref{eq:lidar-forster-dR}–\cref{eq:lidar-forster-dp} 的右端只依赖 $i,j$ 间的惯性测量与偏置，\emph{不依赖} $i$ 时刻的绝对状态与重力——这正是“预积分省去重复积分”的核心。
+
+\paragraph{噪声传播与偏置修正。}
+预积分噪声 $\boldsymbol{\eta}^\Delta_{ij}=[\delta\boldsymbol{\phi}_{ij}^\top,\delta\mathbf{v}_{ij}^\top,\delta\mathbf{p}_{ij}^\top]^\top\sim\mathcal{N}(\mathbf{0},\boldsymbol{\Sigma}_{ij})$，其旋转部分（一阶）
+\begin{equation}
+  \delta\boldsymbol{\phi}_{ij}\simeq\sum_{k=i}^{j-1}\Delta\tilde{\mathbf{R}}_{k+1\,j}^\top\,\mathbf{J}_r^k\,\boldsymbol{\eta}^{gd}_k\Delta t,
+  \label{eq:lidar-forster-noise}
+\end{equation}
+$\mathbf{J}_r^k=\mathbf{J}_r((\tilde{\boldsymbol{\omega}}_k-\mathbf{b}^g_i)\Delta t)$ 是右雅可比（\cref{ch:lie}）。速度/位置噪声同理是 IMU 白噪声的线性组合，故 $\boldsymbol{\Sigma}_{ij}$ 可\emph{迭代}传播（新 IMU 到达只更新 $\boldsymbol{\Sigma}_{ij}$ 而非重算）。偏置由 $\mathbf{b}\leftarrow\bar{\mathbf{b}}+\delta\mathbf{b}$ 更新时用一阶展开修正预积分量（避免重积分），如
+\begin{equation}
+  \Delta\tilde{\mathbf{R}}_{ij}(\mathbf{b}^g_i)\simeq\Delta\tilde{\mathbf{R}}_{ij}(\bar{\mathbf{b}}^g_i)\,\mathrm{Exp}\Big(\tfrac{\partial\Delta\bar{\mathbf{R}}_{ij}}{\partial\mathbf{b}^g}\delta\mathbf{b}^g\Big),
+  \label{eq:lidar-forster-bias}
+\end{equation}
+Jacobian $\partial\Delta\bar{\mathbf{R}}_{ij}/\partial\mathbf{b}^g$ 等在预积分时预计算、保持常数。
+
+\paragraph{预积分残差（IMU 因子）。}
+残差 $\mathbf{r}_{\mathcal{I}_{ij}}=[\mathbf{r}_{\Delta\mathbf{R}_{ij}}^\top,\mathbf{r}_{\Delta\mathbf{v}_{ij}}^\top,\mathbf{r}_{\Delta\mathbf{p}_{ij}}^\top]^\top\in\mathbb{R}^9$\cite{forster2017preintegration}：
+\begin{align}
+  \mathbf{r}_{\Delta\mathbf{R}_{ij}}&=\mathrm{Log}\Big(\big(\Delta\tilde{\mathbf{R}}_{ij}(\bar{\mathbf{b}}^g_i)\,\mathrm{Exp}(\tfrac{\partial\Delta\bar{\mathbf{R}}_{ij}}{\partial\mathbf{b}^g}\delta\mathbf{b}^g)\big)^\top\mathbf{R}_i^\top\mathbf{R}_j\Big), \label{eq:lidar-forster-rR}\\
+  \mathbf{r}_{\Delta\mathbf{v}_{ij}}&=\mathbf{R}_i^\top(\mathbf{v}_j-\mathbf{v}_i-\mathbf{g}\Delta t_{ij})-\Big[\Delta\tilde{\mathbf{v}}_{ij}+\tfrac{\partial\Delta\bar{\mathbf{v}}_{ij}}{\partial\mathbf{b}^g}\delta\mathbf{b}^g+\tfrac{\partial\Delta\bar{\mathbf{v}}_{ij}}{\partial\mathbf{b}^a}\delta\mathbf{b}^a\Big], \label{eq:lidar-forster-rv}\\
+  \mathbf{r}_{\Delta\mathbf{p}_{ij}}&=\mathbf{R}_i^\top(\mathbf{p}_j-\mathbf{p}_i-\mathbf{v}_i\Delta t_{ij}-\tfrac12\mathbf{g}\Delta t_{ij}^2)-\Big[\Delta\tilde{\mathbf{p}}_{ij}+\tfrac{\partial\Delta\bar{\mathbf{p}}_{ij}}{\partial\mathbf{b}^g}\delta\mathbf{b}^g+\tfrac{\partial\Delta\bar{\mathbf{p}}_{ij}}{\partial\mathbf{b}^a}\delta\mathbf{b}^a\Big]. \label{eq:lidar-forster-rp}
+\end{align}
+偏置建为布朗运动 $\mathbf{b}^g_j=\mathbf{b}^g_i+\boldsymbol{\eta}^{bgd}$、$\mathbf{b}^a_j=\mathbf{b}^a_i+\boldsymbol{\eta}^{bad}$。在零均值高斯噪声下，因子图的负对数后验 $=$ 残差平方和 $\sum(\|\mathbf{r}_0\|^2+\|\mathbf{r}_{\mathcal{I}_{ij}}\|^2_{\boldsymbol{\Sigma}_{ij}}+\|\mathbf{r}_{\mathcal{L}}\|^2)$，即 MAP（\cref{ch:slam_est}）。这套预积分同样是 VIO（\cref{ch:vio}）的核心。
+
+\begin{pitfall}[概念误区：把预积分量当成绝对位姿]
+$\Delta\tilde{\mathbf{R}}_{ij},\Delta\tilde{\mathbf{v}}_{ij},\Delta\tilde{\mathbf{p}}_{ij}$ 是\emph{相对}量（$i$ 到 $j$ 的相对运动），\textbf{不是} $j$ 时刻的绝对位姿/速度。它们的价值恰在于“独立于 $i$ 时刻绝对状态”，从而能作为图中两节点间的\emph{约束}复用。把它们当绝对量代入会得到完全错误的轨迹。\textbf{自检}：预积分量在 $i=j$ 时应为 $\Delta\mathbf{R}=\mathbf{I},\Delta\mathbf{v}=\Delta\mathbf{p}=\mathbf{0}$。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{激光位置识别（回环候选检测）}
+\label{sec:lidar-place}
+
+\paragraph{动机：里程计漂移必须靠“重识旧地”消除。}
+激光里程计每千米漂一米，看似很小，但长距离仍\emph{无界}累积。位置识别（place recognition）旨在识别传感器\emph{先前到过}的地点，从而触发回环、校正全局轨迹\cite{carlone2026handbook}。它也使多会话 SLAM、先验地图中的全局定位成为可能。问题定义：给定一个查询 scan，从数据库（历史地点描述子）中检索相似条目，即\textbf{回环候选检测}。
+
+\paragraph{激光位置识别的两大独特挑战。}
+与视觉不同，激光数据稀疏、且只有结构无外观\cite{carlone2026handbook}：
+\begin{enumerate}
+  \item \textbf{稀疏数据}：点的间距与密度随传感器类型、距离剧烈变化，分辨率远低于相机。故激光位置识别通常\emph{不依赖局部关键点描述子}，而是识别语义点云段或计算\emph{全局描述}。
+  \item \textbf{结构混淆（structural aliasing）}：人造环境结构重复（长走廊、高速公路），不同地点在激光 scan 里结构相似（\cref{fig:lidar-aliasing}）。全局描述子（如 ScanContext\cite{kim2018scancontext}）在此常失败；对象级方法（如 SegMap\cite{dube2017segmap}）用更高层语义反而更稳。
+\end{enumerate}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\small, scale=0.9]
+  \foreach \x in {0,1}{
+    \begin{scope}[xshift=\x*5cm]
+      \fill (0,0) circle (1.2pt);
+      \draw[second!60!black, thick] (-1.5,1.2)--(1.5,1.2);
+      \draw[second!60!black, thick] (-1.5,-1.2)--(1.5,-1.2);
+      \draw[gray, ->] (0,0)--(1.4,1.1); \draw[gray, ->] (0,0)--(-1.4,-1.1);
+      \draw[gray, ->] (0,0)--(-1.4,1.1); \draw[gray, ->] (0,0)--(1.4,-1.1);
+    \end{scope}}
+  \node[font=\scriptsize] at (0,-1.8) {Place A（走廊 1 层）};
+  \node[font=\scriptsize] at (5,-1.8) {Place B（走廊 5 层）};
+  \node[red, font=\scriptsize] at (2.5,1.9) {两处 scan 结构几乎相同};
+\end{tikzpicture}
+\caption{结构感知混淆：尽管 Place A 与 B 是不同楼层（视觉差异大），它们的激光 scan 因共享走廊拓扑而结构相似，使基于结构的位置识别难以区分。（仿 \cite{carlone2026handbook} 图 8.6 重绘）}
+\label{fig:lidar-aliasing}
+\end{figure}
+
+\paragraph{不变性 vs 觉察性。}
+一个方法若能正确识别候选但\emph{不能}估位姿差异，称有\textbf{不变性}（invariance）；若还能\emph{估计}位姿差异，称对重访位姿变化有\textbf{觉察性}（awareness）\cite{carlone2026handbook}。研究者偏好觉察性，因为：(1) 它为后续精配准提供好初值（建立精确 SE(2)/SE(3) 回环约束所必需）；(2) 朝觉察性努力能自然增强不变性。
+
+\paragraph{描述子方法（系统分类）。}
+\begin{itemize}
+  \item \textbf{局部描述子}：早期对应视觉的 SIFT/ORB，对 3D 激光计算局部关键点描述子\cite{carlone2026handbook}，但因激光稀疏、非结构化，描述性差；改用局部关键点统计直方图缓解。
+  \item \textbf{全局描述子}：用整帧 scan 的高层模式。两类粗表示：\emph{鸟瞰图（BEV）}——ScanContext++\cite{kim2018scancontext} 用极坐标表示 + 偏航对齐匹配实现朝向不变，RING++\cite{lu2023ringpp} 用 Radon 变换\emph{理论上}证明不变性与觉察性；\emph{距离图像}——可直接借用 CNN/ViT 提特征，OverlapNet\cite{chen2020overlapnet} 用重叠损失实现偏航不变，更近的 FRAME\cite{carlone2026handbook} 则用距离图像在\emph{矿井}等几何退化、GPS 不可用的地下环境实现激光位置识别。
+  \item \textbf{高层/组合描述子}：分割法（SegMap\cite{dube2017segmap}）用对象段增唯一性、抗结构混淆；BTC 同时用局部 + 全局描述子；直接 3D 数据驱动法用三元组损失学判别 + 可微相对位姿估计\cite{carlone2026handbook}。
+\end{itemize}
+激光与视觉位置识别\emph{互补}：激光失败处视觉常成功，反之亦然，实践中常同时用。
+
+\begin{practice}
+\begin{enumerate}
+  \item （概念）为什么激光位置识别更依赖\emph{全局}描述子而视觉更用局部关键点？从稀疏性与结构-外观差异解释。
+  \item （设计扩展题）面对长走廊的结构混淆，设计一个“全局描述子初筛 + 几何验证（ICP 置信度 + 行进距离启发式）”的两级回环检测，说明如何避免错误回环。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{回环与位姿图优化：SLAM 后端}
+\label{sec:lidar-loop}
+
+\paragraph{动机：把回环约束“摊”到整条轨迹。}
+里程计维护\emph{局部一致}估计但累积漂移；回环检测发现重访后，系统据此校正\emph{整条}轨迹与地图，达成\emph{全局一致}\cite{carlone2026handbook}。承载这一校正的就是\textbf{位姿图优化}（pose-graph optimization, PGO）：把每个关键帧位姿建为节点，里程计与回环建为边（约束），求一组位姿使其同时尊重里程计约束与回环约束。
+
+\subsection{位姿图的结构与求解}
+\label{sec:lidar-pgo}
+
+激光 SLAM 系统通常分四模块（\cref{fig:lidar-pipeline}）\cite{carlone2026handbook}：里程计（帧到地图，约 $10$\,Hz）、回环检测（约 $1$\,Hz）、PGO、地图更新。位姿图是一种只含\emph{相对位姿约束}的因子图（\cref{ch:slam_est}、\cref{ch:nlopt}）：节点是位姿，边来自里程计（相邻节点）与回环（远隔节点），一个先验因子固定原点，可选的姿态因子（有惯性时）约束俯仰/横滚（\cref{fig:lidar-posegraph}）。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[x=1.6cm, y=1.3cm, every node/.style={font=\small}]
+  \foreach \i in {1,...,5}{ \node[latent] (x\i) at (\i,0) {$\mathbf{x}_{\i}$}; }
+  \node[latent] (x6) at (5,1) {$\mathbf{x}_{6}$};
+  \node[latent] (x7) at (4,1.6) {$\mathbf{x}_{7}$};
+  \factor[left=4mm of x1] {fp} {left:prior} {} {x1};
+  \foreach \i/\j in {1/2,2/3,3/4,4/5}{
+    \factor[above=2mm of x\i, xshift=0.8cm] {fo\i} {} {} {};
+    \draw[-, thick, orange!80!black] (x\i)--(x\j);}
+  \draw[-, thick, orange!80!black] (x5)--(x6); \draw[-, thick, orange!80!black] (x6)--(x7);
+  % loop closure (magenta)
+  \draw[-, very thick, magenta] (x7) to[out=170,in=110] node[midway,above,font=\scriptsize,magenta]{回环} (x1);
+  \node[font=\scriptsize, orange!70!black] at (3,-0.55) {橙：里程计约束};
+\end{tikzpicture}
+\caption{位姿图：节点为位姿、橙色边为里程计约束、品红边为回环约束、先验因子固定原点。回环把漂移“摊”回整条轨迹，PGO 求一致解。（仿 \cite{carlone2026handbook} 图 8.8 重绘）}
+\label{fig:lidar-posegraph}
+\end{figure}
+
+\paragraph{PGO 的最小二乘形式。}
+设位姿节点 $\{\mathbf{T}_i\}$，每条边给出相对测量 $\tilde{\mathbf{T}}_{ij}$ 及信息矩阵 $\boldsymbol{\Lambda}_{ij}=\boldsymbol{\Sigma}_{ij}^{-1}$。残差是“测量相对位姿”与“当前估计相对位姿”之差（在 $\SE(3)$ 切空间用 $\boxminus$）：$\mathbf{e}_{ij}=\mathrm{Log}\big(\tilde{\mathbf{T}}_{ij}^{-1}(\mathbf{T}_i^{-1}\mathbf{T}_j)\big)$。PGO 求
+\begin{equation}
+  \{\mathbf{T}_i^*\}=\arg\min_{\{\mathbf{T}_i\}}\ \sum_{(i,j)\in\mathcal{E}}\mathbf{e}_{ij}^\top\boldsymbol{\Lambda}_{ij}\mathbf{e}_{ij},
+  \label{eq:lidar-pgo}
+\end{equation}
+用 Gauss–Newton/LM 在 $\SE(3)$ 流形上迭代（右扰动更新 $\mathbf{T}_i\leftarrow\mathbf{T}_i\,\mathrm{Exp}(\delta\boldsymbol{\xi}_i)$，雅可比含右雅可比逆，见 \cref{ch:lie}、\cref{ch:nlopt}）。约束集\emph{稀疏}（互连边少），故用\textbf{稀疏矩阵分解}（重排序 + 重线性化）可让 $>1000$ 节点的图在零点几秒内更新\cite{carlone2026handbook}；通用求解器有 g2o、GTSAM\cite{dellaert2017factor}，增量求解用 iSAM2\cite{kaess2012isam2}（Bayes 树，只重解受影响的子图，见 \cref{ch:nlopt} 的 $\sqrt{}$SAM/边缘化），大图上还可用\textbf{层次化}位姿图优化（HOG-Man\cite{carlone2026handbook}：把图按尺度分层、先在粗层求解再逐层细化，进一步压低大规模在线优化的耗时）。
+
+\paragraph{可扩展性。}
+$1000$ 节点已是大图，进一步可扩展\cite{carlone2026handbook}：(1) \emph{稀疏地}加里程计约束（每行进若干米才加，而非每帧）；(2) 把环境细分为固定尺寸\emph{子图}（如每 $30$\,m 一个，各对应一个图节点，假设子图内里程计局部准确），让 PGO 可扩展到城市级。
+
+\subsection{鲁棒 PGO 与地图更新}
+\label{sec:lidar-robust-pgo}
+
+\paragraph{鲁棒 PGO。}
+后端须同时建模里程计误差与回环误差\cite{carlone2026handbook}：可估\emph{数据驱动的协方差}（漂移率高处给边更高协方差）。更关键的是\textbf{错误回环}（perceptual aliasing 引起）会让地图退化甚至发散，故有一批\emph{鲁棒位姿图优化}方法（如 Switchable Constraints\cite{sunderhauf2012switchable}、Graduated Non-Convexity\cite{yang2020gnc}）可\emph{下调权重、禁用或忽略}坏约束（鲁棒核的 IRLS 视角见 \cref{ch:nlopt}）。
+
+\paragraph{地图更新与多会话。}
+PGO 后轨迹全局一致，地图也须随之更新\cite{carlone2026handbook}：最简单是用历史观测\emph{重建}地图（需无限期存储观测，大场景不可行），替代做法是\emph{形变}地图表示或把地图元素（surfel/子图）\emph{直接链接到位姿}以便随位姿形变。多会话/多机器人 SLAM 把多次建图融到公共参考系：可用\textbf{锚节点（anchor node）}\cite{kim2010multiple} 解释各任务不同的地图坐标，实现便捷全局对齐；多会话\emph{完全依赖位置识别}建立首个任务间约束（无几何先验可用）。集中式（数据传基站）vs 去中心式（各机器人建图、基站合并）各有取舍；通信带宽是瓶颈，CSIRO 的 WildCat 用\emph{压缩 surfel} 把地图压到每机器人 $21.5$\,MB。
+
+\subsection{多机器人与跨模态、长期识别}
+\label{sec:lidar-multirobot}
+
+\paragraph{从二维到三维：MAGIC 与 DARPA SubT。}
+多机器人激光 SLAM 的演进可由两场国际挑战赛勾勒\cite{carlone2026handbook}。$2010$ 年的 MAGIC（Multi Autonomous Ground-robotic International Challenge）中，密歇根团队用 $14$ 台装\emph{二维}激光雷达的小车，各自跑二维激光里程计、把位姿图约束传回基站，由基站拼出一张全局二维地图\cite{olson2012magic}。十年后的 $2021$ 年 DARPA 地下挑战赛（SubT）把同样的“多机协同探索”推进到带楼梯、坡道、岔道的复杂\emph{三维}地下环境：各队普遍以三维多波束激光为主，并叠加视觉、轮式/腿式乃至热成像里程计，以渡过激光易退化的窄通道\cite{tranzatto2022cerberus,ebadi2022present}。其架构多为\emph{半去中心式}——每台机器人板载建自己的位姿图 SLAM，基站再融成多机地图；核心工程瓶颈是地图\emph{压缩与通信}（须维持动态无线 mesh 把约束传回），这正是上文 WildCat 压缩 surfel 的用武之处。完全分布式（每台机器人都维护整张联合地图）最难，关键在如何在通信与算力约束下逐步共享约束与子图、并保持一致性\cite{carlone2026handbook}。
+
+\paragraph{跨模态与长期识别。}
+回到位置识别（\cref{sec:lidar-place}），随系统走向终身、多平台运行，又生出两类挑战\cite{carlone2026handbook}。其一是\textbf{异构/跨模态识别}：查询与数据库可能来自不同型号激光雷达（线数、稀疏度不同），需检索方法跨传感器类型泛化；更进一步，可把激光描述子与\emph{雷达}\cite{cattaneo2022lcdnet} 乃至\emph{OpenStreetMap}\cite{cho2022osmloc} 等异源地图对齐，实现跨模态地点识别——这与 \cref{ch:radar} 把激光描述子“雷达化”是一体两面（雷达侧的 ScanContext 以 RCS/强度代高度，见 \cref{sec:radar-place}）。其二是\textbf{长期识别与变化检测}：跨多次建图会话识别同一地点，并据多会话比对推断环境的\emph{长期变化}（终身地图管理），服务安防、监测等应用。本书把这一脉络概括为：单机单会话 SLAM 成熟后，前沿向“多机实时协同 $\to$ 跨模态泛化 $\to$ 终身演化”三个方向延伸，而支撑它们的后端语言始终是位姿图 + 鲁棒约束 + 位置识别。
+
+\begin{insight}
+回环 + PGO 的本质是\textbf{把一个长链式约束问题，加上少数“跨越式”约束后重新平衡}。里程计只给相邻节点约束（链），误差沿链单调累积；一条回环边把链\emph{首尾相连}成环，于是优化器能把累积误差\emph{均摊}回整个环（而非堆在末端）。这就是为什么一条好回环能瞬间“拉直”整条漂移轨迹——它不是局部修补，而是全局重分配。理解这点，就懂了为什么后端要在因子图上做（能表达任意拓扑约束），而非简单滤波。
+\end{insight}
+
+\begin{pitfall}[思维陷阱：以为加的回环越多越好]
+回环是\emph{双刃剑}：一条\textbf{错误}回环（把两个不同地点当成同一处）会把图“拧坏”，让全局地图发散——比没有回环更糟。\textbf{现象}：地图突然“对折”、轨迹自相矛盾。\textbf{根因}：结构混淆（\cref{fig:lidar-aliasing}）导致误匹配，PGO 又默认所有约束可信。\textbf{对策}：(1) 回环前做\emph{几何验证}（ICP 内点率、行进距离/时间差启发式、RANSAC 置信度）；(2) 后端用\emph{鲁棒 PGO}（可关闭坏约束）。宁可漏一些真回环，也别加一条假回环。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （推导）写出 PGO 残差 $\mathbf{e}_{ij}=\mathrm{Log}(\tilde{\mathbf{T}}_{ij}^{-1}\mathbf{T}_i^{-1}\mathbf{T}_j)$ 对 $\mathbf{T}_i,\mathbf{T}_j$ 右扰动的雅可比（含 $\SE(3)$ 右雅可比逆 $\boldsymbol{\mathcal{J}}_r^{-1}$，见 \cref{ch:lie}）。
+  \item （概念）解释“子图法”为何能把 PGO 扩展到城市级：它在什么假设下成立、何时失效？
+  \item （跨章综合题，结合 \cref{ch:nlopt}、\cref{ch:slam_est}）说明 PGO 的稀疏 Hessian 结构与 BA 的箭头矩阵的异同，以及 iSAM2 为何能增量重解。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{家族演进与选型}
+\label{sec:lidar-family}
+
+把本章四个代表系统按一条主线串起来（\cref{tab:lidar-family}）：LOAM 奠基（双算法、特征里程计）$\to$ LeGO-LOAM 轻量化 + 地面优化 + 回环 $\to$ LIO-SAM 紧耦合因子图 + 多源融合 $\to$ FAST-LIO 紧耦合迭代 ESKF + 极致实时。这条线的驱动力是：\emph{更准}（紧耦合）、\emph{更鲁棒}（去畸变、地面/分割）、\emph{更快}（两步 LM、新增益公式、ikd-Tree）、\emph{更全}（回环、GPS、多会话）。
+
+\begin{table}[H]\centering\small
+\caption{LOAM 家族对照（按演进）}
+\label{tab:lidar-family}
+\begin{tabular}{lllll}
+\toprule
+维度 & LOAM(2014) & LeGO-LOAM(2018) & LIO-SAM(2020) & FAST-LIO(2021) \\
+\midrule
+IMU 耦合 & 松（仅预处理） & 松 & \textbf{紧}（因子图） & \textbf{紧}（迭代 ESKF） \\
+后端 & 双 LM & 双 LM + 位姿图 & iSAM2 因子图 & 迭代 EKF \\
+去畸变 & 匀速插值 & 同 LOAM & IMU 预积分 & 前向+反向传播 \\
+扫描匹配 & scan-to-scan/map & +标签+两步 & scan-to-滑窗子图 & scan-to-map（迭代） \\
+回环 & 无 & ICP + iSAM2 & 欧氏 + 因子图 & 无（纯里程计） \\
+绝对测量 & 无 & 无 & GPS 因子 & 无 \\
+特征 & 边/面（3D 曲率） & 边/面（range+分割） & 边/面 & 边/面（FAST-LIO2 免特征） \\
+目标平台 & 通用 & 地面车/嵌入式 & 多源/大场景 & 微型无人机/高频 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{选型决策。}
+\begin{itemize}
+  \item 地面车 + 弱算力嵌入式、有可见地面 $\to$ \textbf{LeGO-LOAM}（分割降负载、两步 LM、地面优化）。
+  \item 需要 GPS/回环/多传感器融合、追求全局一致大场景 $\to$ \textbf{LIO-SAM}（因子图天然纳入任意约束）。
+  \item 微型无人机、快速运动、算力极受限、要 $50$–$100$\,Hz 纯里程计 $\to$ \textbf{FAST-LIO/FAST-LIO2}（迭代 ESKF + ikd-Tree）。
+  \item 结构化、低速、不需 IMU $\to$ \textbf{LOAM} 本体或 KISS-ICP\cite{vizzo2023kissicp}（极简点到点、自适应阈值、强调可移植）。
+\end{itemize}
+
+\paragraph{LOAM 家族之外的两条支线（接 \cref{par:lidar-ct-pointwise}）。}
+上表沿“特征 + 滤波/平滑”这条主脉络串起 LOAM 家族，但现代激光里程计还有两条不走特征的支线，宜并列点出以免遗漏：(1) \textbf{连续时间配准}——CT-ICP\cite{dellenbach2022cticp} 把帧内运动建为连续轨迹、去畸变与配准联合求解（理论根在 \cref{sec:est-steam} 的 STEAM）；(2) \textbf{逐点流式}——Point-LIO\cite{he2023pointlio} 每点即更新、无帧内畸变、输出频率达点率级。此外，免特征直接法这一路除 FAST-LIO2 外，KISS-ICP\cite{vizzo2023kissicp} 以“自适应阈值的点到点 + 恒速去畸变、无特征无 IMU”证明了\emph{极简也能在多平台稳健泛化}，是工程上“少即是多”的代表。
+
+\paragraph{第三类范式：学习式激光里程计（与其泛化之忧）。}
+除“特征 / 直接”这两类\emph{几何}里程计外，还有一条\textbf{学习式}支线——直接用神经网络从激光测量\emph{回归}自运动\cite{carlone2026handbook}。早期工作用\emph{监督}学习、以真值位姿为标签训练；其后扩展到\emph{无监督}方法（用几何/光度一致性等自监督信号，免真值标注）。这类深度激光里程计在基准上表现可观，但有一个公认隐忧：\textbf{泛化能力存疑}——换一座城市、一种雷达线数、一类天气，模型未必还准。这与 \cref{ch:imu}（惯性里程计）那条“学习式 IO”线\emph{呼应}：学习方法擅长在\emph{见过}的分布里榨取精度，却难担保\emph{没见过}的场景不崩；故当前实战里程计仍以几何法为主、学习法为辅或仅作先验。
+
+\begin{insight}[选型不只看精度：SWaP、延迟与标定]
+家族对照表易让人只盯精度/漂移，但部署到真实平台还须权衡三件常被忽略的事\cite{carlone2026handbook}：(1) \textbf{SWaP}（Size, Weight, Power，体积-重量-功耗）——森林穿梭的微型无人机、手持扫描仪、自动驾驶车对算力预算天差地别，最准最重的系统未必可用；(2) \textbf{延迟}——自动驾驶要对突发碰撞尽快反应，端到端\emph{计算延迟}本身就是安全指标，有时宁可用稍逊但更快的方案；(3) \textbf{标定与同步}——紧耦合直接融合原始测量，外参不准、时间戳不同步会直接污染状态（\cref{sec:lidar-liosam} 的告诫），而多数激光里程计依赖 ICP，却\emph{不}天然给出标定良好的位姿不确定度（协方差常被固定为经验值，见 \cref{sec:lidar-pgo} 的数据驱动协方差），这给下游的概率多传感器融合留下隐患。换言之：\emph{选型 = 在精度、鲁棒、算力、延迟、可标定不确定度之间，按平台与任务取折中}，而非一味追求基准榜单上的最低漂移。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{本章推导附录}
+\label{sec:lidar-appendix}
+
+本章主要推导（ICP 目标、点到线/面闭式、FAST-LIO 前向/反向传播、迭代更新、增益等价证明）均已在正文相应处给出。此处仅收录 FAST-LIO 误差状态转移矩阵的链式法则框架（极冗长的逐块代数）。
+
+\begin{derivation}[FAST-LIO 的 $\mathbf{F}_{\tilde{\mathbf{x}}}$、$\mathbf{F}_{\mathbf{w}}$ 链式法则（\cref{eq:lidar-fl-FxFw} 的来由）]
+记 $\mathbf{x}_i=\hat{\mathbf{x}}_i\boxplus\tilde{\mathbf{x}}_i$，定义 $\mathbf{g}(\tilde{\mathbf{x}}_i,\mathbf{w}_i)=\mathbf{f}(\hat{\mathbf{x}}_i\boxplus\tilde{\mathbf{x}}_i,\mathbf{u}_i,\mathbf{w}_i)\Delta t$。则 \cref{eq:lidar-fl-errdyn} 重写为
+\[
+  \tilde{\mathbf{x}}_{i+1}=\underbrace{\big((\hat{\mathbf{x}}_i\boxplus\tilde{\mathbf{x}}_i)\boxplus\mathbf{g}(\tilde{\mathbf{x}}_i,\mathbf{w}_i)\big)\boxminus\big(\hat{\mathbf{x}}_i\boxplus\mathbf{g}(\mathbf{0},\mathbf{0})\big)}_{\mathbf{G}(\tilde{\mathbf{x}}_i,\mathbf{g}(\tilde{\mathbf{x}}_i,\mathbf{w}_i))}.
+\]
+按偏微分链式法则，
+\begin{align*}
+\mathbf{F}_{\tilde{\mathbf{x}}}&=\Big(\frac{\partial\mathbf{G}(\tilde{\mathbf{x}}_i,\mathbf{g}(\mathbf{0},\mathbf{0}))}{\partial\tilde{\mathbf{x}}_i}+\frac{\partial\mathbf{G}(\mathbf{0},\mathbf{g}(\tilde{\mathbf{x}}_i,\mathbf{0}))}{\partial\mathbf{g}(\tilde{\mathbf{x}}_i,\mathbf{0})}\frac{\partial\mathbf{g}(\tilde{\mathbf{x}}_i,\mathbf{0})}{\partial\tilde{\mathbf{x}}_i}\Big)\Big|_{\tilde{\mathbf{x}}_i=\mathbf{0}},\\
+\mathbf{F}_{\mathbf{w}}&=\Big(\frac{\partial\mathbf{G}(\mathbf{0},\mathbf{g}(\mathbf{0},\mathbf{w}_i))}{\partial\mathbf{g}(\mathbf{0},\mathbf{w}_i)}\frac{\partial\mathbf{g}(\mathbf{0},\mathbf{w}_i)}{\partial\mathbf{w}_i}\Big)\Big|_{\mathbf{w}_i=\mathbf{0}}.
+\end{align*}
+逐块代入 \cref{eq:lidar-fl-f} 的 $\mathbf{f}$ 与 $\boxplus/\boxminus$ 定义：旋转块的导数引入 $\SO(3)$ 上 $\boxminus$ 的右雅可比逆 $\mathbf{A}(\cdot)^{-\top}$（\cref{eq:lidar-fl-A}），$\mathrm{Exp}(-\hat{\boldsymbol{\omega}}_i\Delta t)$ 来自旋转随陀螺测量的传播，$-{}^G\hat{\mathbf{R}}_{I_i}\hat{\mathbf{a}}_i^\wedge\Delta t$ 来自比力对速度误差的耦合，即得 \cref{eq:lidar-fl-FxFw} 的全部闭式块。$24$ 维的 FAST-LIO2 版只需在此基础上对外参两块加单位对角块（外参常量传播、无耦合）。
+\end{derivation}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+激光读数转成 $(x,y,z)$ 后噪声各向同性 & 原生噪声在 RAE 球坐标对角，转笛卡尔后被拉成随距离/方向倾斜的椭球（\cref{ins:lidar-rae-noise}）\\
+一帧 scan 是某一时刻的静态快照 & scan 历时一个周期，帧内各点不同时刻/位姿测得（畸变源）\\
+ICP 一定收敛到全局最优 & 局部优化，初值差会陷错误极小（\cref{eq:lidar-icp-obj}）\\
+点到点 ICP 最准 & 点到面允许切向滑动、对采样差异最鲁棒（\cref{sec:lidar-dist}）\\
+去畸变是锦上添花 & 高速/快速旋转下不去畸变会发散（\cref{tab:lidar-deskew}）\\
+匀速插值总够用 & 快速旋转时匀速假设破裂，须 IMU 去畸变\\
+两步 LM 只是提速 & 还提精度（解耦自由度），但需可见地面（\cref{sec:lidar-lego-twostep}）\\
+紧耦合一定优于松耦合 & 紧耦合对标定/同步更敏感（\cite{carlone2026handbook} 的告诫）\\
+FAST-LIO 新增益公式更准 & 与标准增益数学相等，只是更快（\cref{thm:lidar-gain-equiv}）\\
+迭代 ESKF 等同普通 EKF 多迭代几次 & 必须含先验搬运 $\mathbf{J}^\kappa$（\cref{eq:lidar-fl-J}），否则带偏\\
+预积分量是绝对位姿 & 是独立于 $i$ 时刻状态的相对量（\cref{eq:lidar-forster-dR}）\\
+回环越多越好 & 一条假回环会拧坏整图，须几何验证 + 鲁棒 PGO\\
+里程计够准就不用后端 & 漂移无界累积，必须回环 + PGO 才全局一致\\
+激光里程计只能“成帧 + 去畸变” & 还有逐点流式（Point-LIO，无帧内畸变）与连续时间配准（CT-ICP）两条支线（\cref{par:lidar-ct-pointwise}）\\
+选型只看基准榜单最低漂移 & 还须权衡 SWaP / 延迟 / 可标定不确定度（\cref{sec:lidar-family} 的 insight）\\
+提取的激光特征都有严格理论支撑 & 多数特征提取是工程经验、无明确理论依据（\cref{ins:lidar-feat-criteria}）\\
+图优化 LIO 与 GINS 一样好调 & 雷达里程计观测\emph{依赖预测}、不同于 RTK 绝对观测，图 LIO 更易发散难调（\cref{ins:lidar-preint-debug}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$r,\alpha,\epsilon$ & RAE 观测：距离 / 方位角 / 俯仰角 & \cref{eq:lidar-rae-model} \\
+$\boldsymbol{\rho}=[x,y,z]^\top$ & 路标在传感器系的笛卡尔坐标 & \cref{eq:lidar-rae-rho} \\
+$\mathbf{s}(\boldsymbol{\rho}),\mathbf{H}_{\boldsymbol{\rho}}$ & RAE 观测模型 / 其 $3\times3$ 雅可比；$\rho_{xy}=\sqrt{x^2+y^2}$ & \cref{eq:lidar-rae-model,eq:lidar-rae-jac} \\
+$P,Q$ & 源/目标点云（当前帧 / 参考帧或地图） & \cref{eq:lidar-icp-obj} \\
+$\mathsf{C}$ & 对应关系集合 & \cref{eq:lidar-icp-corr} \\
+$d_{\mathcal{E}},d_{\mathcal{H}}$ & 点到线 / 点到面距离 & \cref{eq:lidar-loam-de,eq:lidar-loam-dh} \\
+$c$ & 局部光滑度（曲率） & \cref{eq:lidar-loam-c} \\
+$\boxplus,\boxminus$ & 流形封装算子（右乘约定） & \cref{eq:lidar-fl-boxplus} \\
+$\mathbf{x},\hat{\mathbf{x}},\bar{\mathbf{x}},\check{\mathbf{x}},\tilde{\mathbf{x}}$ & 真值/前向传播/更新后/反向传播/误差 & \cref{eq:lidar-fl-state} \\
+$\mathbf{F}_{\tilde{\mathbf{x}}},\mathbf{F}_{\mathbf{w}}$ & 误差状态转移 / 噪声雅可比 & \cref{eq:lidar-fl-FxFw} \\
+$\mathbf{A}(\mathbf{u})^{-1}$ & $\SO(3)$ 右雅可比逆 $\mathbf{J}_r^{-1}$ 闭式 & \cref{eq:lidar-fl-A} \\
+$\mathbf{P},\boldsymbol{\Sigma}_{\mathbf{w}},\boldsymbol{\Sigma}_{\mathbf{v}}$ & 误差协方差 / 过程噪声 / 观测噪声 & \cref{eq:lidar-fl-Pprop,eq:lidar-fl-residual} \\
+$\mathbf{H}^\kappa_j,\mathbf{K}$ & 测量雅可比 / 卡尔曼增益 & \cref{eq:lidar-fl-linmeas,eq:lidar-fl-gain-old} \\
+$\mathbf{J}^\kappa$ & 迭代先验搬运矩阵 & \cref{eq:lidar-fl-J} \\
+$\Delta\tilde{\mathbf{R}}_{ij},\Delta\tilde{\mathbf{v}}_{ij},\Delta\tilde{\mathbf{p}}_{ij}$ & IMU 预积分测量 & \cref{eq:lidar-forster-dR} \\
+$\mathbf{e}_{ij},\boldsymbol{\Lambda}_{ij}$ & PGO 残差 / 信息矩阵 & \cref{eq:lidar-pgo} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{定理/公式速查表}
+\begin{tabular}{lll}
+\toprule
+公式 & 一句话说明 & 对应 \\
+\midrule
+RAE 观测模型 \cref{eq:lidar-rae-model} & 球坐标 $(r,\alpha,\epsilon)$ 即激光的原生观测函数 & \cref{sec:lidar-rae} \\
+RAE 雅可比 \cref{eq:lidar-rae-jac} & 观测对传感器系坐标的 $3\times3$ 偏导 & \cref{sec:lidar-rae} \\
+距离-方位退化 \cref{eq:lidar-rangebearing} & $z=0$ 时退化为 $2\times2$ range-bearing & \cref{sec:lidar-rae} \\
+ICP 目标 \cref{eq:lidar-icp-obj} & 猜对应 + 求变换交替迭代 & \cref{sec:lidar-scan-reg} \\
+LOAM 曲率 \cref{eq:lidar-loam-c} & 大曲率为边、小曲率为面 & \cref{sec:lidar-loam-feat} \\
+点到线/面 \cref{eq:lidar-loam-de,eq:lidar-loam-dh} & 叉积/混合积给垂距闭式 & \cref{sec:lidar-loam-dist} \\
+$\boxplus/\boxminus$ \cref{eq:lidar-fl-boxplus} & 右乘流形封装 = 右扰动 & \cref{sec:lidar-fl-model} \\
+误差动力学 \cref{eq:lidar-fl-FxFw} & ESKF 转移矩阵闭式（含 $\mathbf{J}_r^{-1}$） & \cref{sec:lidar-fl-fwd} \\
+逐点补偿 \cref{eq:lidar-fl-project} & 去外参 $\to$ 相对位姿 $\to$ 回外参 & \cref{sec:lidar-fl-bwd} \\
+迭代更新 \cref{eq:lidar-fl-xupdate} & 含先验搬运的 $\boxplus$ 更新 & \cref{sec:lidar-fl-update} \\
+新增益 \cref{eq:lidar-fl-gain-new} & 求逆从测量维降到状态维 & \cref{thm:lidar-gain-equiv} \\
+预积分残差 \cref{eq:lidar-forster-rR} & 独立于 $i$ 状态的相对约束 & \cref{sec:lidar-preint} \\
+PGO \cref{eq:lidar-pgo} & 回环约束均摊回整条轨迹 & \cref{sec:lidar-pgo} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & RAE 观测模型与雅可比 & 正/逆映射、$3\times3$ 雅可比、range-bearing 退化 & $\bigstar\bigstar\bigstar$ \\
+2 & 扫描配准 / ICP & 猜对应 + 求变换；点到面最鲁棒 & $\bigstar\bigstar$ \\
+3 & LOAM 特征里程计 & 曲率分边/面、双算法、LM & $\bigstar\bigstar$ \\
+4 & 运动去畸变 & 四类方法；IMU 预积分为事实标准 & $\bigstar\bigstar$ \\
+5 & LeGO-LOAM & 分割 + 两步 LM + 回环 & $\bigstar\bigstar$ \\
+6 & LIO-SAM & 因子图四类因子、滑窗子图 & $\bigstar\bigstar\bigstar$ \\
+7 & FAST-LIO 迭代 ESKF & 前向/反向传播 + 新增益 + 等价证明 & $\bigstar\bigstar\bigstar\bigstar$ \\
+8 & IMU 预积分 & 相对量、噪声传播、偏置一阶修正 & $\bigstar\bigstar\bigstar$ \\
+9 & 位置识别 & 稀疏 + 结构混淆；全局描述子 & $\bigstar\bigstar\bigstar$ \\
+10 & 回环 + PGO & 均摊漂移；鲁棒 PGO 抗假回环 & $\bigstar\bigstar\bigstar$ \\
+11 & 连续时间 / 逐点支线 & CT-ICP 联合去畸变-配准（根在 STEAM）、Point-LIO 逐点流式无帧内畸变 & $\bigstar\bigstar$ \\
+12 & 多机器人与跨模态识别 & MAGIC$\to$SubT、集中/去中心、异构(激光-雷达-OSM)与长期识别 & $\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{系统综述}：SLAM Handbook\cite{carlone2026handbook} 第 8 章——激光 SLAM 的系统级框架、扫描配准基础、位置识别、位姿图、多机器人（本章框架与分类的出处）。
+  \item \textbf{特征里程计奠基}：LOAM\cite{zhang2014loam}（RSS 2014）——双算法、曲率特征、点到线/面（本章 \cref{sec:lidar-loam} 全部）。
+  \item \textbf{轻量化}：LeGO-LOAM\cite{shan2018legoloam}（IROS 2018）；其分割模块出处 Bogoslavskyi–Stachniss\cite{bogoslavskyi2016fast}（IROS 2016，角度 $\beta$ 判据）。
+  \item \textbf{紧耦合因子图}：LIO-SAM\cite{shan2020liosam}（IROS 2020）；预积分理论 Forster 等\cite{forster2017preintegration}（T-RO 2016）。
+  \item \textbf{紧耦合滤波}：FAST-LIO\cite{xu2021fastlio}（RA-L 2021，迭代 ESKF + 新增益）；FAST-LIO2\cite{xu2022fastlio2}（T-RO 2022，直接配准 + ikd-Tree\cite{cai2021ikdtree}）；流形封装 Hertzberg 等\cite{hertzberg2013integrating}。
+  \item \textbf{极简可移植}：KISS-ICP\cite{vizzo2023kissicp}（RA-L 2023）——“少即是多”的点到点 ICP，自适应阈值、无特征无 IMU。
+  \item \textbf{连续时间 / 逐点支线}：CT-ICP\cite{dellenbach2022cticp}（ICRA 2022，帧内连续轨迹、去畸变-配准联合，连续时间状态估计见 \cref{sec:est-steam}）；Point-LIO\cite{he2023pointlio}（AIS 2023，逐点更新、无帧内畸变）。
+  \item \textbf{位置识别}：ScanContext\cite{kim2018scancontext}、OverlapNet\cite{chen2020overlapnet}、SegMap\cite{dube2017segmap}、RING++\cite{lu2023ringpp}；跨模态 LCDNet\cite{cattaneo2022lcdnet}（激光-雷达）、OSM 定位\cite{cho2022osmloc}。
+  \item \textbf{多机器人 / 现场系统}：MAGIC 2010 综述\cite{olson2012magic}；DARPA SubT 的 CERBERUS\cite{tranzatto2022cerberus} 与多队对比\cite{ebadi2022present}（激光退化下的多传感冗余）。
+  \item \textbf{鲁棒后端}：Switchable Constraints\cite{sunderhauf2012switchable}、GNC\cite{yang2020gnc}、全局配准 TEASER\cite{yang2020teaser}。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+章节 & 关系 & 本章铺垫 \\
+\midrule
+\cref{ch:pointcloud} 点云处理 & 提供 KD-tree/降采样/NDT/法向 & 被本章配准、特征、地图复用 \\
+\cref{ch:eskf} ESKF & FAST-LIO 是其流形迭代版 & 误差动力学、预测/更新 \\
+\cref{ch:lie} 李群 & $\boxplus/\boxminus$、右雅可比 & 整套滤波与去畸变的代数基础 \\
+\cref{ch:nlopt} 非线性优化 & PGO/iSAM2/鲁棒核 & 后端最小二乘、稀疏分解 \\
+\cref{ch:vio} VIO & 同套预积分 + 紧耦合 & IMU 预积分、紧耦合思想可迁移 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.22\textwidth} p{0.30\textwidth} p{0.38\textwidth}}
+\toprule
+症状 & 可能原因 & 排查步骤 \\
+\midrule
+高速/转弯处地图“拖尾” & 未去畸变或匀速插值失效 & 1.确认开启 IMU 去畸变；2.检查时间戳逐点对齐；3.估 $v\cdot T_{\text{scan}}$ 是否超体素分辨率（\cref{sec:lidar-deskew}）\\
+里程计突然跳变 & ICP 陷错误局部极小 & 1.检查初值（IMU 预测）；2.改点到面残差；3.低重叠时用全局配准取初值（\cref{sec:lidar-scan-reg}）\\
+长走廊/隧道里发散 & 几何退化、约束方向不足 & 1.检查特征是否单一方向；2.加 IMU 紧耦合；3.退化检测降权该方向 \\
+FAST-LIO 不收敛/带偏 & 漏先验搬运 $\mathbf{J}^\kappa$ 或扰动侧不一致 & 1.核对 \cref{eq:lidar-fl-J} 第二次起 $\mathbf{J}^\kappa\neq\mathbf{I}$；2.确认雅可比/更新同为右扰动；3.单次迭代应等同普通 ESKF（\cref{sec:lidar-fl-update}）\\
+回环后地图“对折”/发散 & 假回环（结构混淆） & 1.加几何验证（ICP 内点率/行进距离）；2.用鲁棒 PGO 关坏约束；3.提高回环检测阈值（\cref{sec:lidar-loop}）\\
+紧耦合精度反而差 & 外参不准 / 时间未同步 & 1.重标 LiDAR-IMU 外参；2.检查时间戳同步；3.先退松耦合稳住（\cref{sec:lidar-liosam}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{API 速查表}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.30\textwidth} p{0.62\textwidth}}
+\toprule
+功能 & 接口 / 要点（一句话） \\
+\midrule
+点云配准 & PCL \texttt{pcl::IterativeClosestPoint}（点到点）、\texttt{GeneralizedIterativeClosestPoint}（GICP，点到面式） \\
+近邻搜索 & PCL \texttt{KdTreeFLANN::nearestKSearch}；FAST-LIO2 用 ikd-Tree 增量版 \\
+NDT 配准 & PCL \texttt{NormalDistributionsTransform}（分布对分布） \\
+李群 / 右扰动 & Sophus \texttt{SO3d::exp/\allowbreak log}、\texttt{SE3d}；更新一律右乘 \texttt{X * Exp(delta)} \\
+因子图 / iSAM2 & GTSAM \texttt{ISAM2}、\texttt{BetweenFactor<Pose3>}（里程计/回环）、\texttt{ImuFactor}（预积分） \\
+位姿图优化 & g2o \texttt{SparseOptimizer} + \texttt{EdgeSE3}；或 GTSAM \texttt{LevenbergMarquardtOptimizer} \\
+开源系统 & A-LOAM/LeGO-LOAM/LIO-SAM（ROS）、FAST\_LIO/FAST-LIO2（含 ikd-Tree）、KISS-ICP \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{研究实践建议}
+\begin{itemize}
+  \item \textbf{初学者}：先在 KITTI 序列上跑通 A-LOAM，可视化边/面特征与轨迹；再手推 \cref{eq:lidar-loam-de}、\cref{eq:lidar-loam-dh}。
+  \item \textbf{进阶}：复现 FAST-LIO 的迭代 ESKF 单帧更新，逐项核对 \cref{eq:lidar-fl-FxFw} 与 \cref{eq:lidar-fl-xupdate}；用 \cref{tab:lidar-gain} 验证新旧增益的时间差与数值一致。
+  \item \textbf{有余力}：在退化场景（长走廊）上做可观测性分析，给 PGO 加鲁棒核 + 几何验证，比较有无回环的全局一致性。
+\end{itemize}

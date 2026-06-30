@@ -1,0 +1,1328 @@
+\chapter{大模型任务规划}
+\label{ch:llm-task-planning}
+
+% ════════════════════════════════════════════════════════════════
+%  全吸收章：重渲染 Tutorial 笔记
+%   04_移动机器人规控/60_任务运动规划/80_大模型任务规划.md（SayCan/ReAct/Inner Monologue/
+%   Code-as-Policies/VoxPoser/LLM+P/Guan 世界模型/Silver 泛化规划/Valmeekam PlanBench；
+%   LLM-as-Planner vs LLM-as-Modeler 两范式；三层可行性校验；与 T1-T5 经典系统的数据流）
+%  记号归一：R in SO(3)、T in SE(3)（preamble 宏 \SO \SE）；规划/LLM 自然记号保留。
+%  跳过纯工程：LLM 厂商 SDK、ROS、仿真部署、80 行原型的逐行工程实现（保留其设计骨架）。
+%  跨章去重：MARL 基础重叠 → \cref{ch:plan-safemarl}；共识/ADMM → \cref{ch:mr-consensus}。
+%  源由 AI 撰写，论文归属/年份/会议/实验数值存疑处就地 \pz / \rebuilt，并入 claims 台账。
+%  教学层遵循 v5.0 理论教学规范。
+% ════════════════════════════════════════════════════════════════
+
+\rebuilt{本章重渲染自一份 Tutorial 笔记（任务运动规划线“大模型任务规划”），其源稿由 AI 撰写，论文归属、年份、会议与实验数值（如 PlanBench 的 $\approx 3\%$、Guan 的 $40$ 余动作 / $48$ 任务）仍可能有误。逐处 \texttt{\textbackslash cite} 标源；正文存疑处已就地 \texttt{\textbackslash pz}/\allowbreak\texttt{\textbackslash rebuilt} 标注，待联网核对后二次校验。}
+
+\begin{practice}[前置自测]
+开始本章之前，先试答下列五题。它们检验本章依赖的三块基础——\textbf{符号规划}（PDDL 与经典规划器）、\textbf{符号-几何鸿沟}（TAMP 的核心难题）、以及 \textbf{LLM 的工作方式}（自回归续写、上下文学习）。若三题以上答不出，先回相应前置章节，否则本章 \cref{sec:llm-modeler}（LLM 生成 PDDL）、\cref{sec:llm-verify}（可行性校验）会读得很费力。
+\begin{enumerate}
+  \item 一个 PDDL 的 \texttt{domain} 文件与 \texttt{problem} 文件各描述什么？一个动作的 \texttt{:precondition} 与 \texttt{:effect} 各是什么意思？
+  \item TAMP 的“符号-几何鸿沟”指什么？为什么纯符号规划器判断不了“机械臂够不够得到架子”？
+  \item 给定一份合法的 PDDL \texttt{domain}+\texttt{problem}，经典符号规划器（FF、Fast Downward）能保证什么（完备性 / 最优性 / 解的合法性）？
+  \item LLM 是怎么生成文本的？“它在续写下一个最可能的 token”与“它在执行逻辑推理”，哪个更接近底层机制？
+  \item 下面三件事，哪些是经典符号规划器\emph{做不到}、需要别的东西补的？(a) 把“帮我把厨房收拾干净”翻译成形式化目标；(b) 在合法 PDDL 上搜出满足约束的动作序列；(c) 判断“杯子在书后面、先得移书”这类需要常识的隐含前提。
+\end{enumerate}
+\noindent\emph{答案线索}：1,3 见经典规划部；2 见 TAMP 导论的符号-几何鸿沟；4 见 \cref{sec:llm-why}（续写非推理）；5 见 \cref{sec:llm-position}（两范式分工）。
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{解释} LLM 在任务层的准确定位——“有常识但不严谨的前端”，并说清“\emph{增强而非取代}经典规划”这条边界在技术上具体意味着什么、为何不能让 LLM 独自把关可行性；
+  \item \textbf{区分} LLM 任务规划的两大范式——\textbf{LLM-as-Planner}（让 LLM 直接输出动作序列/程序）与 \textbf{LLM-as-Modeler}（让 LLM 生成 PDDL，再交经典规划器求解），说出各自的信息流、强弱项与适用边界；
+  \item \textbf{推导} SayCan 的语言-可行性联合打分 $\ell^\ast=\arg\max_\ell\,p_{\text{LLM}}(\ell\mid i,h)\cdot p_{\text{afford}}(c_\ell\mid s)$，论证“为何必须相乘而非相加”，并把它放进 Grounded Decoding、SayCanPay 的同一谱系；
+  \item \textbf{描述}开环与闭环规划的区别，讲清 ReAct（推理-行动交替）与 Inner Monologue（三类环境反馈）如何用执行反馈实现自纠错；
+  \item \textbf{对比} Code-as-Policies（计划即程序）与符号计划（计划即动作序列）两种输出形态，理解程序形态如何天然表达循环、条件与反馈，以及它为何牺牲可验证性；
+  \item \textbf{刻画} LLM-as-Modeler 的三个层次（翻译 goal / 生成 domain / 泛化程序）与其灵魂——\emph{生成-校验-修复}自纠错闭环；
+  \item \textbf{诊断} LLM 任务规划的四类幻觉（幻觉动作、违反前提、忽略几何、目标走样），并说清\textbf{三层可行性校验}（语法 / 语义 / 几何）各拦住哪一类；
+  \item \textbf{判断}一个真实任务该用 as-Planner、as-Modeler、还是不用 LLM，并把 LLM 前端正确接入符号规划、几何 TAMP、执行层组成的完整系统。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章只回答一个问题，但回答得很完整：\textbf{怎么让大语言模型在机器人任务规划里既出得上力、又不闯祸？} 全章围绕一条主线——\textbf{LLM 补语言与常识，经典方法守可行与最优，两者拼成完整的大脑}：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=5mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  adv/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (root) {根问题\\ LLM 既出力又不闯祸};
+\node[grp, below left=11mm and 2mm of root] (pos) {为什么/定位\\ \cref{sec:llm-why} 缺口与续写非推理\\ \cref{sec:llm-position} 两范式};
+\node[grp, below=11mm of root] (plan) {as-Planner 怎么做\\ \cref{sec:saycan} SayCan\\ \cref{sec:closed-loop} ReAct/IM\\ \cref{sec:cap} Code-as-Policies\\ \cref{sec:grounding} VLM 接地};
+\node[grp, below right=11mm and 2mm of root] (model) {as-Modeler 怎么做\\ \cref{sec:llm-modeler} 生成 PDDL\\ \cref{sec:prompt} 提示工程};
+\node[blk, below=30mm of root, fill=main!8, draw=main!60!black] (close) {怎么不闯祸 / 怎么接\\ \cref{sec:llm-verify} 幻觉与三层校验\\ \cref{sec:llm-dataflow} 完整数据流\\ \cref{sec:llm-map} 研究地图与选型};
+\draw[ln] (root)--(pos); \draw[ln] (root)--(plan); \draw[ln] (root)--(model);
+\draw[ln] (pos.south) |- (close.west);
+\draw[ln] (plan)--(close);
+\draw[ln] (model.south) |- (close.east);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：第一遍务必拿下 \cref{sec:llm-position}（定位与两范式）、\cref{sec:saycan}（SayCan 公式）、\cref{sec:llm-modeler}（LLM-as-Modeler）、\cref{sec:llm-verify}（校验闭环）、\cref{sec:llm-dataflow}（怎么接进系统）。\cref{sec:closed-loop,sec:cap,sec:grounding}（闭环、程序、VLM 接地）是三条并列的 as-Planner 技术，可按兴趣选读。其中 \cref{sec:llm-modeler}（生成 PDDL）与 \cref{sec:llm-verify}（可行性校验）是本章的硬核——它们恰是“增强而非取代”这条边界在技术上的落点。
+
+\subsection*{前置知识桥接}
+本章站在两块基石上，各用几行重新激活，重叠处一律 \cref{ch:plan-safemarl} / \cref{ch:mr-consensus} 指过去、不重复。
+
+\begin{itemize}
+  \item \textbf{PDDL 与经典规划器}（经典规划部）：PDDL 用 \texttt{domain}（动作模型）+ \texttt{problem}（初末状态）描述规划问题；FF / Fast Downward 这类规划器在合法 PDDL 上能\emph{完备}地搜出满足约束的计划、可配置求\emph{最优}。本章的 LLM-as-Modeler（\cref{sec:llm-modeler}）正是把 LLM 当作“PDDL 的写手”，把搜索与验证仍交给这些经典规划器——\textbf{不懂 PDDL，连 LLM 生成的 PDDL 对不对都判断不了}。
+  \item \textbf{符号-几何鸿沟}（TAMP 导论）：任务层用\emph{离散命题}描述世界，运动层用\emph{连续向量}描述世界；纯符号规划器看不到几何（知道“架子是空的”，不知道“架子高 $1.2\,$m、臂展 $0.8\,$m”）。本章的 LLM \emph{也不解决}这道鸿沟——它只补语言/常识，几何可行性仍要交给几何 TAMP（采样/优化）。
+  \item \textbf{LLM 的工作方式}：给定上文，LLM 输出下一个 token 的条件概率分布，再采样/取最大，循环往复（自回归续写）。它没有显式状态表示、真值表、约束传播或回溯搜索——这是本章理解“为什么会幻觉”的物理起点（\cref{sec:llm-why}）。
+  \item \textbf{多智能体与分布式优化}：本章只讲\emph{单台}机器人的 LLM 任务规划。多机协同的 MARL 基础（CTDE / 非平稳 / 信用分配）见 \cref{ch:plan-safemarl}，共识 / ADMM 见 \cref{ch:mr-consensus}；把一句“三台机器人收拾仓库”交给分配层分工属后续章节。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+旋转矩阵记 $\mathbf{R}\in\SO(3)$、位姿 $\mathbf{T}\in\SE(3)$（preamble 宏 $\SO,\SE$，与全书一致，\nameref{ch:notation}）；本章主体是符号/语言层，几何记号仅在“几何校验”处偶现。
+\textbf{字母隔离声明}：本章 $\ell$ 指一个\emph{技能}（skill，自然语言描述的低层策略，非长度）、$i$ 指用户\emph{指令}（instruction，非虚数单位或索引）、$h$ 指动作\emph{历史}（history）、$s$ 指世界\emph{状态}、$c_\ell$ 指“技能 $\ell$ 执行成功”这一事件、$p_{\text{LLM}}$ 与 $p_{\text{afford}}$ 分别指语言可能性与可供性概率，均仅本章局部生效。
+\textbf{术语}：PDDL（Planning Domain Definition Language，规划领域定义语言）、LLM（large language model，大语言模型）、VLM（vision-language model，视觉语言模型）、affordance（可供性）、本章一律用英文缩写或括注中文。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么需要 LLM：语言缺口、常识缺口与“续写非推理”}
+\label{sec:llm-why}
+
+\paragraph{动机：会后空翻的机器人收拾不了厨房。}
+经典 TAMP 补的是“收拾厨房”里\emph{算法}那一半——怎么排动作顺序、怎么缝合几何、怎么稳健执行。但还有一半一直被搁置：\textbf{人是怎么把“收拾厨房”这四个字交给机器人的？} 本节讲清这半块缺口的形状，以及为什么偏偏是 LLM 来补——同时讲透一个更易被忽视的事实：LLM 本质不是规划器。
+
+\subsection{经典规划的两个软肋：语言缺口与常识缺口}
+\label{sec:llm-gaps}
+
+要让经典规划器干活，得先写一份 \texttt{domain}（动作模型）与一份 \texttt{problem}（初始状态 + 目标），都是\emph{形式化的 PDDL}、由人手写。这暴露了经典符号规划的两个软肋。
+
+\paragraph{软肋一：语言缺口（the language gap）。}
+经典规划器只吃 PDDL、不吃自然语言。用户说“帮我把厨房收拾干净”，规划器看不懂——必须有人先把这句话翻译成形式化的 \texttt{:goal}，例如
+\[
+\texttt{(:goal (and (on cup shelf) (on book bookshelf) (clean table)}\ \texttt{(forall (?x - clutter) (stored ?x))))}.
+\]
+这个翻译过去全靠人；每来一个新指令，工程师就得重写 goal。对“听用户指挥”的真实机器人，这是致命瓶颈——\textbf{机器人听不懂话}。
+
+\paragraph{软肋二：常识缺口（the commonsense gap）。}
+即便目标写好，经典 domain 也只知道你\emph{显式写进去}的规则。“把杯子放到架子上”——若杯子被一本书挡在角落，人都知道“得先把书挪开”，但 PDDL domain 里若没人手写“被遮挡的物体不可直接抓取、需先移开遮挡物”这条规则，规划器就推不出来。真实世界里这类\emph{隐含常识前提}多如牛毛（热锅要用隔热垫、易碎的杯子要轻放、倒水时杯口朝上），全部手写进 domain 工程量爆炸、且永远写不全。
+
+\begin{insight}[两个软肋同根：封闭模型撞上开放世界]
+经典符号规划的两个软肋，本质是同一个根源——\textbf{它的全部知识都来自人手工编码的形式化模型}。模型写多详细，它就懂多少；模型没写的，它一概不知。它的严谨性（完备、最优、可验证）正建立在“世界被一个有限、封闭的形式化模型完整描述”这个假设上。可现实世界既开放（指令五花八门）又充满常识（规则写不尽），这个封闭假设在真实部署里频频破裂。语言缺口和常识缺口，就是封闭模型撞上开放世界时裂开的两道缝。
+\end{insight}
+
+\subsection{LLM 恰好补这两道缝}
+\label{sec:llm-fill}
+
+为什么是大语言模型来补？因为 LLM 的本事恰好长在经典规划的短板上。
+
+\begin{itemize}
+  \item \textbf{补语言缺口}：LLM 在海量自然语言上训练，\emph{把自然语言映射到结构化输出}正是它最擅长的事之一。“把厨房收拾干净”$\to$一串子目标、或一段 PDDL goal、或一段机器人 API 代码——这种“翻译”对 LLM 近乎本能。
+  \item \textbf{补常识缺口}：LLM 把互联网级文本里的常识压进了参数。“杯子被书挡住要先移书”“热锅要用隔热垫”——这些没人专门教它、但它从语料里统计性地学到了。
+\end{itemize}
+
+\noindent Huang 等人 2022 年的开创性工作发现：只要预训练语言模型足够大、提示得当，它们就能把“做早餐”这类高层任务\emph{零样本}地分解成“打开冰箱”这样的一串低层步骤，无需任何额外训练\cite{huang2022zeroshot}——这正是常识缺口被填上的第一个信号。注意这个限定——LLM 补的是“语言 $+$ 常识”，\emph{不是}“严谨推理与可行性保证”，后者依旧是经典方法的地盘。这个限定，就是下一节“增强而非取代”的伏笔。
+
+\subsection{但 LLM 不是规划器：续写不等于推理}
+\label{sec:llm-not-planner}
+
+补缺口是真的，但有个同样真实、更易被忽视的事实：\textbf{LLM 本质上不是一个规划器，它是一个语言模型。} 这是本章一切边界论证的物理基础。
+
+LLM 的底层机制是\emph{自回归续写}——给定上文 $x_{1:t}$，它输出下一个 token 的条件概率分布 $p_\theta(x_{t+1}\mid x_{1:t})$，再采样或取最大，循环往复。它\emph{没有}显式状态表示、真值表，不做约束传播、不回溯搜索。它“看起来会规划”，是因为训练语料里有大量计划、推理链、步骤分解，被它统计性地学会并模仿了出来。这带来一个关键后果：LLM 生成的计划，是“\textbf{在语料分布下最像一个好计划的 token 串}”，而非“经过验证、保证合法可行的动作序列”。两者经常一致，但\emph{没有任何机制保证它们一致}。于是：
+
+\begin{itemize}
+  \item 它可能生成机器人\emph{根本没有}的动作（“用微波炉解冻”——但这台机器人没有微波炉技能）；这叫\textbf{幻觉动作}。
+  \item 它可能违反\emph{前提约束}（手里已拿着书，又去“抓”杯子——但 \texttt{pick} 要求 \texttt{handempty}）；它不查前提。
+  \item 它可能忽略\emph{几何可行性}（让臂展 $0.8\,$m 去够 $1.2\,$m 高的架子）；它看不到几何，且比符号规划器更危险——符号规划器至少不会无中生有，LLM 会。
+\end{itemize}
+
+\noindent 这些不是“模型不够大”能根治的偶发 bug，而是“续写而非推理”这个本质带来的\emph{系统性风险}。Valmeekam 等人 2023 年在 NeurIPS 用一个专门的规划基准（PlanBench）做了批判性测量：在常识规划任务上，GPT 系列模型\emph{自主}生成可执行计划的成功率极低，平均只有约 $3\%$\cite{valmeekam2023planbench}。$3\%$ 这个数字，是对“LLM 是个好规划器”这一幻觉最直接的证伪。
+
+\begin{insight}[能力曲线几乎正交：长于生成 vs 长于求解]
+把 LLM 当规划器用，错在混淆了“\emph{生成一个像样的候选}”与“\emph{保证一个正确的解}”。LLM 在前者上极强（它生成的计划常识上很合理），在后者上无能为力（它不验证）。经典规划器恰好相反——它不会无中生有地“创造”计划（要靠搜索），但只要给它合法的模型，它找到的解一定合法、可行、可最优。\textbf{两者的能力曲线几乎正交：一个长于开放生成，一个长于严谨求解。} 看清这条正交性，就自然得出本章的核心结论——不是二选一，而是让 LLM 生成、让经典方法把关。
+\end{insight}
+
+\subsection{哪些任务最需要 LLM、哪些根本不需要}
+\label{sec:llm-when}
+
+讲清了“LLM 补什么缝”，自然要问：是不是所有机器人任务都该上 LLM？答案是否定的——LLM 不是默认选项，它的价值取决于任务有没有“语言/常识缺口”。把任务按“对 LLM 的需求强度”排成一条谱（\cref{tab:llm-demand}）。
+
+\begin{table}[H]\centering\small
+\caption{任务对 LLM 的需求强度谱}
+\label{tab:llm-demand}
+\begin{tabular}{p{2.0cm}p{4.2cm}p{3.6cm}p{3.2cm}}
+\toprule
+需求强度 & 任务特征 & 例子 & 该不该用 LLM \\
+\midrule
+几乎不需要 & 目标已形式化、领域固定、无自然语言、无开放常识 & 固定流水线抓放、给定 PDDL 的仓库调度 & 不用——纯经典规划更稳、更快、可验证 \\
+弱需求 & 目标基本固定，偶有少量参数化指令 & “把 3 号货架的货搬到 5 号” & 可用可不用——模板/规则也能凑合 \\
+中需求 & 指令是自然语言但领域封闭、常识需求有限 & “把红色的零件挑出来放左边” & 推荐用——LLM 翻译指令，as-Modeler 更稳 \\
+强需求 & 开放自然语言 $+$ 大量隐含常识 $+$ 多变场景 & “帮我把厨房收拾干净” & 必须用——LLM 不可替代的甜区 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[判据：看任务缺不缺，而非看 LLM 强不强]
+决定要不要用 LLM，\textbf{不看“LLM 强不强”，而看“任务缺不缺 LLM 能补的那两样东西（语言、常识）”}。这是一个常被颠倒的判断逻辑——新手容易从“LLM 很强大”出发想“哪里都能用它”，正确的逻辑应从“任务缺什么”出发想“该不该用它”。一个目标已是 PDDL、领域固定的任务，它\emph{不缺}语言理解、\emph{不缺}常识，引入 LLM 纯属增加幻觉风险、推理延迟与不可验证性。\textbf{LLM 是补“语言/常识缺口”的特效药，不是包治百病的万能药。}
+\end{insight}
+
+\begin{pitfall}[本节常见陷阱]
+\begin{itemize}
+  \item \textbf{以为“模型够大就能直接规划”。} 最普遍的误区。$3\%$ 的实证\cite{valmeekam2023planbench}说明自主规划的失败是\emph{机制性}的（续写不等于推理），不是规模能根治的。后续模型会让数字涨一些，但“不验证、会幻觉”的本质不变。
+  \item \textbf{以为 LLM 看得到几何。} LLM 和符号规划器一样看不到连续几何，且比符号规划器更危险——它会\emph{自信地}生成几何上不可行的步骤而不自知。几何可行性必须交给几何 TAMP。
+  \item \textbf{把“语言缺口”和“常识缺口”混为一谈。} 语言缺口是“听不懂指令”（输入侧），常识缺口是“不懂隐含规则”（知识侧）。有的方法侧重前者（目标翻译，\cref{sec:llm-modeler}）、有的侧重后者（动作分解 $+$ 常识，\cref{sec:saycan,sec:closed-loop}）。
+\end{itemize}
+\end{pitfall}
+
+\begin{exercise}
+\begin{enumerate}
+  \item 举三个“常识隐含前提”的例子（除“杯子被书挡住”外），说明若不写进 PDDL domain，经典规划器会犯什么错，而 LLM 为何大概率能补上。
+  \item “LLM 自主规划成功率只有约 $3\%$”——这个数字在什么任务上测的？能否推广到“LLM 在所有规划任务上都只有 $3\%$”？为什么不能（提示：as-Modeler 与 as-Planner 的区别）？
+  \item 用自己的话解释“续写 $\neq$ 推理”，并据此预测：给 LLM 一个它训练语料里\emph{罕见}、需要多步严谨推理的规划问题，它的表现会偏好还是偏坏？
+\end{enumerate}
+\end{exercise}
+
+% ════════════════════════════════════════════════════════════════
+\section{LLM 在任务层的定位：增强而非取代，及两大范式}
+\label{sec:llm-position}
+
+\cref{sec:llm-why} 已把结论轮廓画出：LLM 补语言与常识，经典方法守可行与最优。本节把轮廓\emph{精确化}——给出 LLM 在任务层的准确定位，并引出全章组织骨架：两大范式 LLM-as-Planner 与 LLM-as-Modeler。这是本章最重要的概念节。
+
+\subsection{准确定位：一个“有常识但不严谨的前端”}
+\label{sec:llm-position-def}
+
+\begin{definition}[LLM 在任务层的定位]
+\label{def:llm-position}
+LLM 在任务层的定位 $=$ 一个把“开放自然语言 $+$ 海量常识”转成“结构化候选”的\textbf{前端}；它负责\emph{生成}，不负责\emph{把关}。
+\end{definition}
+
+\noindent 每个词都有讲究：\textbf{前端（front-end）}——它站在任务层流水线的最前面、紧贴用户那一侧（接住“收拾厨房”这句话），下游是经典规划器、几何采样器、执行器；\textbf{生成（generation）}——它的职责是产出\emph{候选}（候选动作序列 / PDDL / 目标 / 代码），候选意味着“待验证”，不是“已保证”；\textbf{不负责把关（not the verifier）}——可行性、合法性、最优性的把关交给下游的经典方法。让 LLM 自己给自己把关，等于让续写者审查续写（\cref{sec:llm-verify} 展示这条路为何靠不住）。这个定位直接否定了两种极端：“LLM 全包”（从指令直接输出最终可执行计划、不经任何验证，幻觉漏到执行）与“LLM 无用”（坚持纯经典方法、机器人听不懂话）。
+
+\begin{insight}[把“规划”拆成两步：提出候选 + 验证求解]
+理解 LLM 的定位，关键在于把“规划”这个动作\textbf{拆成两步}——“提出候选”和“验证/求解”。新手容易把这两步当成一件事（“规划 $=$ 输出一个计划”），于是要么指望 LLM 一步到位（全包）、要么否定 LLM（无用）。一旦拆开，定位就清晰了：\textbf{LLM 强在第一步、弱在第二步；经典方法恰好相反。} 让各自做各自强的那一步，就是“增强而非取代”在操作层面的全部含义。本章后面所有方法，本质都是这条“LLM 提出 $+$ 经典把关”原则的不同实现。
+\end{insight}
+
+\subsection{两大范式：LLM-as-Planner vs LLM-as-Modeler}
+\label{sec:two-paradigms}
+
+“LLM 提出候选”具体提什么？这里分出两大范式，区别在于：\textbf{LLM 的输出，是计划本身，还是规划问题的模型？}
+
+\textbf{范式一：LLM-as-Planner（大模型即规划器）。} 让 LLM \emph{直接输出计划}——动作序列、或下一个动作、或一段策略代码。LLM 既“读懂任务”又“产出计划”，经典方法主要在事后或循环中\emph{校验/接地/执行}。代表（\cref{sec:saycan,sec:closed-loop,sec:cap,sec:grounding}）：SayCan（可行性加权选技能）、ReAct / Inner Monologue（闭环自纠错）、Code-as-Policies（计划写成程序）、VoxPoser（VLM 接地的值图）。共同点：\textbf{计划是 LLM 直接生成的}，可行性靠 affordance 打分、执行反馈、API 约束来兜。
+
+\textbf{范式二：LLM-as-Modeler（大模型即建模器）。} 让 LLM \emph{输出规划问题的形式化模型}——PDDL domain、PDDL goal、或状态描述——再把模型\emph{交给经典规划器去搜索求解}。LLM 只做“翻译/建模”，\emph{规划本身交还给经典规划器}。代表（\cref{sec:llm-modeler}）：LLM+P（生成 PDDL problem）、Guan 等人的世界模型（生成 domain $+$ 验证器闭环）、Xie 等人的目标翻译、Silver 等人的泛化规划。共同点：\textbf{LLM 不直接给计划，只给模型；计划由经典规划器搜出，天然继承其完备性与最优性保证}。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, node distance=6mm and 10mm,
+  llm/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=second!10, draw=second!60!black},
+  cls/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=main!8, draw=main!60!black},
+  outb/.style={draw, rounded corners, align=center, font=\footnotesize, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!55!black}]
+% as-Planner row
+\node[font=\small\bfseries] (lab1) at (0,0) {as-Planner};
+\node[llm, right=8mm of lab1] (l1) {LLM};
+\node[outb, right=of l1] (o1) {动作序列 / 下一动作\\ / 策略代码};
+\node[cls, right=of o1] (e1) {可行性接地\\ $+$ 执行（闭环）};
+\draw[ln] (l1)--(o1); \draw[ln] (o1)--(e1);
+\draw[ln] (e1.south) -- ++(0,-5mm) -| node[pos=0.25,below,font=\scriptsize]{执行反馈} (l1.south);
+% as-Modeler row
+\node[font=\small\bfseries, below=18mm of lab1] (lab2) {as-Modeler};
+\node[llm, right=8mm of lab2] (l2) {LLM};
+\node[outb, right=of l2] (o2) {PDDL\\ domain / goal};
+\node[cls, right=of o2] (e2) {经典规划器\\ 完备/最优搜索};
+\node[outb, right=of e2] (o3) {合法可行\\ 计划};
+\draw[ln] (l2)--(o2); \draw[ln] (o2)--(e2); \draw[ln] (e2)--(o3);
+\draw[ln] (e2.south) -- ++(0,-5mm) -| node[pos=0.25,below,font=\scriptsize]{校验失败把报错喂回} (l2.south);
+\end{tikzpicture}
+\caption{两大范式的信息流：as-Planner 让 LLM 直接出计划、靠执行闭环兜底；as-Modeler 让 LLM 退后一步只出模型、由经典规划器求解并保证。}
+\label{fig:two-paradigms}
+\end{figure}
+
+\subsection{两范式对比：一张决定性的表}
+\label{sec:paradigm-compare}
+
+\begin{table}[H]\centering\small
+\caption{LLM-as-Planner 与 LLM-as-Modeler 的对比}
+\label{tab:paradigm-compare}
+\begin{tabular}{p{3.2cm}p{4.6cm}p{4.6cm}}
+\toprule
+维度 & LLM-as-Planner & LLM-as-Modeler \\
+\midrule
+LLM 输出什么 & 计划本身（动作序列/下一动作/代码） & 规划问题的模型（PDDL domain/goal/状态） \\
+谁来搜索/求解 & LLM（事后接地/执行校验） & 经典规划器（FF / Fast Downward） \\
+可行性保证 & 弱——靠 affordance、反馈、API 兜底 & 强——经典规划器保证解满足 PDDL 约束 \\
+最优性 & 一般无 & 可配置（取决于规划器） \\
+对领域形式化的依赖 & 低——可零样本，不必有 PDDL domain & 高——需要（或需 LLM 生成）PDDL domain \\
+长程任务表现 & 易在长链上累积错误、漂移 & 经典搜索处理长程更稳健 \\
+开放/常识任务 & 强——直接用 LLM 的语言与常识 & 中——常识需先编码进 domain/goal \\
+可解释/可调试 & 弱——计划是黑箱生成 & 强——PDDL 可读、可被验证器逐条查 \\
+典型代表 & SayCan, ReAct, Code-as-Policies, VoxPoser & LLM+P, Guan, Xie, Silver \\
+本章对应 & \cref{sec:saycan,sec:closed-loop,sec:cap,sec:grounding} & \cref{sec:llm-modeler} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 一句话读法：\textbf{as-Planner 灵活但不严谨，as-Modeler 严谨但要形式化。} 前者适合“领域开放、没有现成 PDDL、容忍偶尔出错并靠闭环纠正”的场景；后者适合“领域相对固定、要可验证保证、长程组合复杂”的场景。
+
+\begin{insight}[把 LLM 的不可靠性堵在哪一层]
+两大范式的分野，本质是\textbf{“把 LLM 的不可靠性堵在哪一层”}。as-Planner 把 LLM 放在计划生成的位置，不可靠性会渗到计划里，必须靠下游的 affordance 加权、执行反馈、API 约束\emph{层层兜底}——这是“事后纠错”的哲学。as-Modeler 把 LLM 退后一步、只让它写模型，不可靠性被堵在“模型对不对”这一层，一旦模型经验证器确认无误，后面的搜索就完全由可信的经典规划器接管、计划必然合法——这是“前端设防”的哲学。\textbf{as-Planner 信任执行闭环来纠错，as-Modeler 信任经典规划器来保证。}
+\end{insight}
+
+\subsection{两范式不是单选：按子任务的性质选}
+\label{sec:paradigm-mix}
+
+两范式\emph{不互斥、常叠加}。设想一个家用机器人处理“帮我把厨房收拾一下，顺便看看冰箱里有没有过期的东西扔掉”这样的复合指令，一个成熟系统会这样组合：
+
+\begin{itemize}
+  \item \textbf{as-Modeler 那一半}：领域（厨房整理）相对固定、可形式化——LLM 翻译出 PDDL goal \texttt{(and (clean counter) (forall ?x (stored ?x)))}，交经典规划器搜出“收拾厨房”的合法、有序计划。
+  \item \textbf{as-Planner 那一半}：“看看有没有过期的”是开放、依赖逐个判断的子任务，难以预先形式化——用 Code-as-Policies 写程序“对冰箱里每件物品，若过期则丢弃”（含循环 $+$ 条件 $+$ 逐个感知判断，靠 API 白名单兜底）。
+  \item \textbf{两半都接同一套校验与执行}：三层校验（\cref{sec:llm-verify}）$+$ 执行层闭环（\cref{sec:closed-loop}）统一兜底。
+\end{itemize}
+
+\begin{insight}[范式按“子任务的性质”选，不按“整个系统”选]
+这个混合例子点破一个新手常有的误解——\textbf{范式是按“子任务的性质”选的，不是按“整个系统”选的}。一个真实系统里，不同子任务可以、也常常走不同范式：能形式化、要保证的走 as-Modeler，开放灵活、靠闭环兜的走 as-Planner。\cref{tab:paradigm-compare} 不是让你给系统贴一个“门派标签”，而是给你一把尺子，去\emph{逐个子任务}地量“这一块该走哪条路”。
+\end{insight}
+
+\begin{pitfall}[本节常见陷阱]
+\begin{itemize}
+  \item \textbf{把两范式当成互斥的二选一。} 它们不互斥、常叠加：可以用 as-Modeler 让 LLM 写 PDDL goal，同时用 as-Planner 的闭环（ReAct）在执行中纠错。范式是“思路”不是“门派”。
+  \item \textbf{以为 as-Modeler 就没有 LLM 风险了。} as-Modeler 把风险堵在“模型对不对”这一层，但 LLM 写的 PDDL 同样可能有错（语法错、语义错、漏前提）。优势不是“没风险”，而是“风险被堵在一个\emph{可被验证器逐条检查}的位置”。
+  \item \textbf{以为“前端”就是无关紧要的外壳。} 前端恰恰决定系统“能不能用”——再强的经典规划器，没有前端就听不懂用户的话。“前端”指它在数据流里的\emph{位置}（最前），不指它的\emph{重要性}（次要）。
+\end{itemize}
+\end{pitfall}
+
+\begin{exercise}
+\begin{enumerate}
+  \item 用 \cref{tab:paradigm-compare} 判断三个任务走 as-Planner 还是 as-Modeler 并说明理由：(a) 家用机器人“帮我准备一下喝咖啡的东西”（开放、容忍纠错）；(b) 自动化仓库每天调度数百个补货任务（领域固定、要可验证、长程）；(c) 一次性探索任务“看看这个陌生房间里有什么能整理的”。
+  \item “as-Planner 信任执行闭环来纠错，as-Modeler 信任经典规划器来保证”——分别说明：若\emph{去掉}各自信任的那个组件，会退化成什么？为什么危险？
+  \item 用一句话回答：“LLM 会取代经典规划吗”为什么是个被“扩大范围 vs 保持可验证性”这条历史钟摆证伪的问题？正确的提问应该是什么？
+\end{enumerate}
+\end{exercise}
+
+% ════════════════════════════════════════════════════════════════
+\section{SayCan：语言可行性加权的开山之作}
+\label{sec:saycan}
+
+从这里进入 LLM-as-Planner 范式的具体方法。第一站是 SayCan（Ahn 等，CoRL 2022）——把 LLM 接进真实机器人的里程碑，也是“增强而非取代”这条边界\emph{第一次被写成数学公式}的工作。理解了 SayCan 的那一个乘法，就理解了 LLM-as-Planner 全部方法的灵魂。
+
+\subsection{问题：LLM 说得对，机器人做不到}
+\label{sec:saycan-problem}
+
+回到“续写非推理”的幻觉，SayCan 关注最尖锐的一种：\textbf{LLM 提议的动作，机器人当前根本执行不了}。论文里的经典例子：用户说“我把饮料洒了，能帮我吗？”，一个纯 LLM 被问“下一步该做什么”，可能给出非常合理的常识回答——“用吸尘器把它吸干”。这句话作为常识完全正确，可这台机器人\emph{没有吸尘器技能}，它只会“拿海绵”“找抹布”等有限几个动作。这正是语言缺口与幻觉的合流：\textbf{LLM 有语言和常识（知道洒了要清理），但不知道“这具身体”能做什么}（embodiment grounding 缺失）。SayCan 的原标题精辟地概括了解法——“Do As I Can, Not As I Say”（按我\emph{能做的}做，而非按我\emph{嘴上说的}做）\cite{ahn2022saycan}。
+
+\subsection{核心思想：语言可能性乘以物理可行性}
+\label{sec:saycan-core}
+
+机器人有一个\emph{预定义技能库} $\{\ell_1,\ell_2,\dots,\ell_K\}$（每个 $\ell$ 是一个用自然语言描述、已训练好的低层技能，如“拿起海绵”“走到桌子旁”）。每一步要从库里\emph{选一个最该执行的技能}。SayCan 用两个分数的\textbf{乘积}来选：
+\begin{equation}
+  \ell^{\ast}
+  \;=\;
+  \arg\max_{\ell \in \{\ell_1,\dots,\ell_K\}}
+  \;
+  \underbrace{p_{\text{LLM}}(\ell \mid i,\, h)}_{\text{语言可能性 (Say)}}
+  \;\cdot\;
+  \underbrace{p_{\text{afford}}(c_{\ell} \mid s)}_{\text{物理可行性 (Can)}}.
+  \label{eq:saycan}
+\end{equation}
+逐项拆解：
+\begin{itemize}
+  \item $i$ 是用户指令，$h$ 是已执行的动作历史（提供上下文）。
+  \item $p_{\text{LLM}}(\ell \mid i, h)$ 是 \textbf{“Say” 分数}：语言模型认为“在指令 $i$ 和历史 $h$ 下，技能 $\ell$ 是个合理的下一步”的可能性。技术上，让 LLM 给每个候选技能的自然语言描述\emph{打分}（即计算该描述在 LLM 下的对数似然）得到。它编码\textbf{“语言上该做什么”}。
+  \item $p_{\text{afford}}(c_{\ell} \mid s)$ 是 \textbf{“Can” 分数}：在当前世界状态 $s$ 下技能 $\ell$ \emph{当前能成功执行}的概率（$c_\ell$ 表示“$\ell$ 执行成功”这一事件）。它由一个\emph{可供性函数（affordance function）} 给出——在 SayCan 里用 TD 训练的强化学习\emph{价值函数} $V_\ell(s)$，天然估计“从状态 $s$ 出发执行 $\ell$ 的预期成功率”。它编码\textbf{“物理上能做什么”}。
+\end{itemize}
+
+\noindent 两者相乘，含义直观：\textbf{一个技能只有“语言上该做”且“物理上能做”，乘积才高、才会被选中。} “用吸尘器”的 Say 分很高（常识合理）但 Can 分趋零（没这技能，价值函数估成功率 $\approx 0$），乘积被压垮；“拿海绵”的 Say 分不错、Can 分也高，乘积胜出。
+
+\subsection{为什么必须是“乘法”，而不是“加法”或“只用一个”}
+\label{sec:saycan-why-mult}
+
+这是 SayCan 最值得玩味、也最容易被轻视的设计。为什么用乘积 $p_{\text{LLM}}\cdot p_{\text{afford}}$，而不是加权和 $\alpha\, p_{\text{LLM}} + \beta\, p_{\text{afford}}$，更不是只用其中一个？用反事实逐一排除：
+
+\begin{itemize}
+  \item \textbf{反事实一：只用 Say（纯 LLM）。} 退化成 \cref{sec:saycan-problem} 的灾难——LLM 提议“用吸尘器”，机器人傻眼。\emph{忽略了物理可行性。}
+  \item \textbf{反事实二：只用 Can（纯价值函数）。} 机器人会选“当前最容易成功的技能”，却完全不管它\emph{该不该做}——可能反复执行“原地待命”（成功率 $100\%$），因为没有任务语义指引。\emph{忽略了任务意图。}
+  \item \textbf{反事实三：用加法 $\alpha\, p_{\text{LLM}} + \beta\, p_{\text{afford}}$。} 加法的毛病是\emph{一个高分能补偿另一个的低分}。“用吸尘器”Say 分极高，即便 Can 分 $\approx 0$，加权和仍可能超过“拿海绵”——机器人还是会去够那个不存在的吸尘器。加法允许“语言一厢情愿地压倒物理现实”。
+  \item \textbf{反事实四（正解）：用乘法。} 乘法的关键性质是\textbf{“一票否决”}——任一因子接近 $0$，乘积就接近 $0$，\emph{无法被另一因子补偿}。Can 分 $\approx 0$（做不到）时，无论 Say 分多高（多想做），乘积都 $\approx 0$，该技能出局。这恰好编码了我们想要的语义：\textbf{“做不到”是硬约束，不能被“很想做”覆盖}。
+\end{itemize}
+
+\begin{insight}[一个乘号钉死“把关对生成的否决权”]
+SayCan 的乘法，是“增强而非取代”在数学上最干净的一次表达。$p_{\text{LLM}}$ 是 LLM 出的“该做什么”的候选打分（生成/增强那一半），$p_{\text{afford}}$ 是经典/学习方法守的“能不能做”的可行性闸门（把关那一半）。\textbf{乘法让“把关”对“生成”拥有一票否决权}：LLM 再想做的事，物理上做不到就一律出局。这与加法的“互相补偿”形成鲜明对比——加法里语言能压过物理，乘法里物理能否决语言。后面所有 LLM-as-Planner 方法（Grounded Decoding 的 token 级、SayCanPay 的三因子）都是这个乘法的变奏，但灵魂没变：\textbf{让可行性对语言有否决权。}
+\end{insight}
+
+\subsection{完整循环与“接地”来源}
+\label{sec:saycan-loop}
+
+把单步选择串成完整任务，SayCan 是一个\emph{贪心的、逐技能的闭环}：对技能库每个 $\ell$ 算 Say 分（LLM 给 $\ell$ 的描述打分）与 Can 分（价值函数 $V_\ell(s)$ 估成功率），选 $\ell^\ast=\arg\max(\text{Say}\times\text{Can})$，执行 $\ell^\ast$、观察新状态 $s'$、把 $\ell^\ast$ 追加进历史 $h$，直到选出“done”或目标达成。三个要点：
+
+\begin{enumerate}
+  \item \textbf{它是 LLM-as-Planner}：计划（技能序列）是 LLM 一步步选出来的，不是经典规划器搜出来的；可行性靠 Can 分兜，不靠 PDDL 验证。
+  \item \textbf{它是贪心的}：每步只选当前最优、不做前瞻搜索——简单高效，但长程任务上贪心容易走进死胡同（SayCanPay 来补，\cref{sec:saycan-family}）。
+  \item \textbf{技能库是预定义的}：SayCan 不发明新动作、只在已有技能里选。这其实是个\emph{安全特性}——它把 LLM 的输出空间\emph{限制在机器人确实会做的动作上}，从源头消除“幻觉出不存在的动作”。
+\end{enumerate}
+
+\noindent “Can” 分的来源——可供性函数——是 SayCan 把语言\emph{接到物理世界}的接口。每个技能 $\ell$ 配一个用 TD-backup 的 actor-critic 训出的价值函数 $V_\ell(s)$：当 $s$ 下 $\ell$ 容易成功（海绵就在手边），$V_\ell$ 高；难以成功（海绵在看不见的柜子里），$V_\ell$ 低。把 $V_\ell(s)$ 归一化当作 $p_{\text{afford}}(c_\ell\mid s)$ 即得 Can 分。
+
+\begin{insight}[Say 来自语言世界、Can 来自物理世界，乘积处缝合两个世界]
+这里有个深刻的对称性：\textbf{Say 来自语言模型（语言世界），Can 来自价值函数（物理世界），SayCan 在它们的乘积处缝合了两个世界}。这与“符号 vs 几何鸿沟”、与几何 TAMP“让采样器把可行性流回符号层”是同一母题的不同变奏——都是\emph{让物理可行性的信息，流回到高层决策}。只不过几何 TAMP 用几何采样器、SayCan 用 RL 价值函数；前者服务符号搜索、后者服务 LLM 打分。母题相同：高层不能瞎决策，必须让底层的可行性说话。
+\end{insight}
+
+\subsection{SayCan 的谱系：Grounded Decoding 与 SayCanPay}
+\label{sec:saycan-family}
+
+SayCan 之后，“语言乘以可行性”这条思路沿两个方向推进，构成一个清晰的谱系。
+
+\paragraph{纵向加细——Grounded Decoding：从“技能级”到“token 级”。}
+SayCan 在\emph{整条技能描述}的粒度上打分（要求技能库预先枚举）。Grounded Decoding（Huang 等，NeurIPS 2023）把同样的乘法思想\emph{下沉到 token 级}：在 LLM 逐 token 生成动作描述时，每个 token 的选择都同时考虑“LLM 下该 token 的概率”和“grounded 模型（可供性、安全、用户偏好）下该 token 的可行性”，两者相乘来引导解码——它通过把 LLM 的 token 似然与可供性函数、安全函数等多种 grounded 模型给出的可行性相乘来引导文本生成，从而在机器人设置下解决复杂的长时域具身任务\cite{huang2023grounded}。好处是不必预先枚举技能库——它能\emph{生成}库外的、组合性的动作描述，同时仍受可行性约束。一句话：\textbf{SayCan 是“在给定选项里挑可行的”，Grounded Decoding 是“在生成时就只生成可行的”。}
+
+\paragraph{横向加项——SayCanPay：从“两因子”到“三因子 $+$ 搜索”。}
+SayCan 是贪心的，长程任务上容易选出“每步都可行、但整体绕远或走死”的序列。SayCanPay（Hazra 等，AAAI 2024）加了第三个因子 \textbf{“Pay”}（payoff，长期收益/计划代价的估计），并把贪心选择换成\emph{启发式搜索}：
+\begin{equation}
+  \operatorname{score}(\ell)
+  \;\propto\;
+  \underbrace{p_{\text{LLM}}(\ell\mid i,h)}_{\text{Say}}
+  \;\cdot\;
+  \underbrace{p_{\text{afford}}(c_\ell\mid s)}_{\text{Can}}
+  \;\cdot\;
+  \underbrace{\hat{R}(\ell)}_{\text{Pay}},
+  \label{eq:saycanpay}
+\end{equation}
+其中 $\hat{R}(\ell)$ 是一个可学习的、估计“选 $\ell$ 对达成最终目标的长期价值/代价有效性”的模型，被当作启发式搜索（类似 A$^\ast$ 的启发函数 $h$）的指引。SayCanPay 用 LLM 生成动作（Say）、用可学习的领域知识评估动作可行性（Can）与长期收益（Pay），再用启发式搜索选出最佳动作序列，从而得到既可行又低代价的计划\cite{hazra2024saycanpay}。把它放回历史钟摆：SayCan 用 Can 把“物理可行”拉回来，SayCanPay 再用 Pay $+$ 搜索把“全局最优性”也往回拉一些——它在 as-Planner 范式内，朝经典规划的“最优搜索”靠近了一步。
+
+\begin{table}[H]\centering\small
+\caption{SayCan 谱系：打分粒度、因子与选择方式}
+\label{tab:saycan-family}
+\begin{tabular}{p{3.2cm}p{1.6cm}p{2.6cm}p{2.0cm}p{3.4cm}}
+\toprule
+方法 & 打分粒度 & 因子 & 选择方式 & 补了什么 \\
+\midrule
+SayCan (CoRL 2022) & 技能级 & Say $\times$ Can & 贪心 & 物理可行性（embodiment grounding） \\
+Grounded Decoding (NeurIPS 2023) & token 级 & LLM token $\times$ grounded & 引导解码 & 摆脱技能库枚举、可生成组合动作 \\
+SayCanPay (AAAI 2024) & 技能级 & Say $\times$ Can $\times$ Pay & 启发式搜索 & 长期收益 $+$ 全局性（治贪心短视） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[谱系的演进逻辑：不断给“纯生成”加把关]
+这个谱系揭示了 LLM-as-Planner 的演进逻辑——\textbf{不断给“纯 LLM 生成”加约束、加把关，把钟摆一点点往“可验证/最优”拉}。SayCan 加可行性闸门，Grounded Decoding 把闸门下沉到生成过程，SayCanPay 加最优性搜索。每一步都在回答同一个问题：“光让 LLM 生成不够，还缺哪一道把关？”看懂这条逻辑，就能预判方向的下一步：继续往里加经典规划的要素（前瞻、回溯、约束传播），直到它在某些维度上逼近 LLM-as-Modeler——而后者干脆把搜索完全交还给经典规划器。两条范式，殊途同归地在“拉回可验证性”。
+\end{insight}
+
+\begin{pitfall}[本节常见陷阱]
+\begin{itemize}
+  \item \textbf{把 Say 分当成“LLM 生成一句话”。} Say 分不是让 LLM 自由生成，而是让 LLM 给\emph{每个候选技能描述打分}（算对数似然）。这个区别很重要：打分把输出空间\emph{限制在技能库内}，从根上避免幻觉出库外动作。SayCan 用 LLM 的“评分能力”而非“生成能力”。
+  \item \textbf{以为乘法只是“加权的一种”。} 加法允许补偿，乘法实现一票否决——质的区别。把乘法误当加权和，就丢掉了“可行性否决语言”这个灵魂。
+  \item \textbf{以为 affordance 一定要用 RL 价值函数。} $p_{\text{afford}}$ 是个\emph{接口}，价值函数只是一种实现。它也可以来自几何可达性检查、碰撞检测、成功率统计、甚至 VLM 的判断。关键是“它估计当前状态下技能能否成功”，实现可换。
+  \item \textbf{以为 SayCan 解决了长程规划。} SayCan 是\emph{贪心}的，长程任务上会短视走死。这正是 SayCanPay 加 Pay $+$ 搜索要补的。
+\end{itemize}
+\end{pitfall}
+
+\begin{exercise}
+\begin{enumerate}
+  \item 写出 \cref{eq:saycan}，并用“我把饮料洒了”的例子，给“用吸尘器/拿海绵/原地待命”三个候选各估一个定性的 Say 分与 Can 分（高/中/低），算出乘积排序，说明为什么“拿海绵”胜出。
+  \item 用反事实论证“为什么必须乘法不能加法”：构造一组具体的 Say/Can 分数，使加权和会选出一个物理上做不到的动作，而乘法不会。
+  \item SayCan、Grounded Decoding、SayCanPay 三者，哪个最适合“技能可自由组合、无法预先枚举”的场景？哪个最适合“长程、要避免走死胡同”的场景？
+  \item SayCan 的“让价值函数把可行性流回 LLM 打分”，与几何 TAMP“让采样器把可行性流回符号搜索”，思想上有何共性？两者各缝合的是哪两个世界？
+\end{enumerate}
+\end{exercise}
+
+% ════════════════════════════════════════════════════════════════
+\section{闭环推理：ReAct 与 Inner Monologue}
+\label{sec:closed-loop}
+
+SayCan 用 affordance 在\emph{决策时}把可行性拉回来，但它对一个问题无能为力：\textbf{执行出意外了怎么办？} 机器人去拿海绵、海绵却滑掉了；规划好的动作执行失败了；环境里突然出现没料到的东西。SayCan 的贪心循环会继续往下走、浑然不觉刚才那步没成。本节讲 LLM-as-Planner 的另一条主线——\textbf{闭环（closed-loop）}：让执行反馈回流到 LLM，使它能边做边纠错。
+
+\subsection{开环 vs 闭环：一次性规划的脆弱}
+\label{sec:openvsclosed}
+
+\begin{itemize}
+  \item \textbf{开环规划（open-loop）}：LLM 一次性把整个计划生成出来，然后不管不顾地逐条执行，过程中\emph{不接收任何反馈}。像闭着眼睛背完一套动作再做。
+  \item \textbf{闭环规划（closed-loop）}：执行每一步后，把\emph{环境反馈}（成功了吗？看到了什么？）喂回 LLM，让它据此决定下一步——必要时\emph{重新规划、纠正、重试}。像睁着眼睛边看边做。
+\end{itemize}
+
+\noindent 开环为什么脆弱？因为它默认了一个几乎必然破裂的假设：\textbf{计划生成时的世界状态，会一直保持到执行完成、且每步都成功}。可现实里抓取会滑脱、柜门会卡住、物体位置和预想不符、还可能有人动了东西。开环计划的第 3 步一旦失败，后面第 4、5、6 步全部建立在一个\emph{错误的世界假设}上，越走越偏、无人察觉。
+
+\begin{insight}[闭环是“现实反过来纠正幻觉”的机会]
+开环与闭环的差距，本质是\textbf{“是否承认世界会偏离计划”}。开环假设世界顺从计划，闭环假设世界会捣乱、于是持续校对。对 LLM 规划而言闭环尤其关键，因为 LLM 本就容易幻觉——开环让幻觉无法被纠正、一错到底；闭环则给了“现实反过来纠正幻觉”的机会。\textbf{闭环是 LLM 规划从“实验室玩具”走向“真实可用”的必经之路。}
+\end{insight}
+
+\subsection{ReAct：推理与行动交替}
+\label{sec:react}
+
+ReAct（Yao 等，ICLR 2023）给闭环提供了一个极简而通用的范式，名字是 \textbf{Rea}soning $+$ \textbf{Act}ing 的合写，核心是让 LLM 在生成时\emph{交替产出三种东西}：\textbf{Thought（推理）}——一段自然语言的思考（分析现状、回顾目标、决定策略、处理异常）；\textbf{Action（行动）}——一个具体动作（调用技能、查询信息、与环境交互）；执行 Action 后环境返回 \textbf{Observation（观察）}，再喂回 LLM、进入下一轮 Thought。一个典型轨迹片段如下（用 \verb@->@ 表示一步推进）：
+
+\begin{codebox}[text]{ReAct 轨迹片段（整理桌面，含一次失败后据反馈纠错）}
+Thought 2: 杯子和书都要归位。先抓杯子。
+Action  2: pick(cup)
+Observation 2: 抓取失败——杯子太滑，没夹住。     <- 执行反馈回流
+Thought 3: 抓取失败了。可能夹得太松。换更大夹持力再试。  <- LLM 据反馈纠错
+Action  3: pick(cup, force=high)
+Observation 3: 抓取成功，现在握着杯子。
+\end{codebox}
+
+\noindent 关键在 Thought 3：Observation 2 报告了失败，LLM 在 Thought 3 里“想”了一下原因并调整策略。这就是闭环纠错——反馈进来、推理消化、行动调整。ReAct 论文证明了这种交替的威力：通过让 LLM 交替生成推理轨迹和任务相关动作，推理轨迹帮助模型归纳、追踪和更新行动计划并处理异常，动作则让它从外部环境获取额外信息；在 ALFWorld 和 WebShop 两个交互式决策基准上，ReAct 仅用一两个示例就显著超过模仿学习与强化学习方法\cite{yao2023react}。为什么 Thought 有用？因为它给 LLM 一个\emph{显式的“想”的空间}——先用语言把“为什么失败、该怎么改”推演一遍再行动。\textbf{Reasoning 让 Acting 变得可纠错。}
+
+\subsection{Inner Monologue：把反馈分成三类}
+\label{sec:innermono}
+
+ReAct 给了“交替”的框架，但没细分“反馈具体有哪些种”。Inner Monologue（Huang 等，CoRL 2022）把\emph{环境反馈}系统地拆成三类，让闭环的信息来源更完整。它的核心主张是：通过利用环境反馈，LLM 能够在机器人控制场景中形成一种“内心独白”（inner monologue），从而更丰富地处理信息并做出规划，而无需额外训练\cite{huang2022innermonologue}。三类反馈见 \cref{tab:innermono}。
+
+\begin{table}[H]\centering\small
+\caption{Inner Monologue 的三类环境反馈}
+\label{tab:innermono}
+\begin{tabular}{p{3.4cm}p{3.2cm}p{3.4cm}p{3.0cm}}
+\toprule
+反馈类型 & 回答什么问题 & 来源 & 例子 \\
+\midrule
+成功检测（success detection） & 上一个动作做成了吗？ & 技能自带的成功分类器 / 力觉 & “抓取成功” / “抓取失败” \\
+被动场景描述（passive scene description） & 现在环境是什么样？ & 物体检测器 / VLM，\emph{持续}报告 & “桌上有杯子、书；杯子在书右边” \\
+主动场景查询（active scene query） & 针对某疑问，环境的回答是？ & LLM \emph{主动}提问、感知/人回答 & LLM 问“杯子什么颜色？”$\to$“蓝色” \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 这三类构成了一个“内心独白”：机器人一边行动、一边在“脑子里”自言自语——“我刚才抓成功了吗（成功检测）？现在桌上还有什么（被动描述）？这个我不确定的得问一下（主动查询）？”。ReAct 提供“交替”的骨架，Inner Monologue 填充“反馈有哪三类”的血肉，两者高度互补、常被一起使用。
+
+\begin{insight}[给 LLM 补上“感知”那一环的语言化接口]
+Inner Monologue 的三类反馈，本质是给 LLM 补上\textbf{感知-行动闭环里“感知”那一环的语言化接口}。LLM 活在纯文本世界里，本身既看不见也摸不着——必须有人把“成功了吗”“现在啥样”“那个东西是什么”翻译成文字喂给它。三类反馈正是这套翻译的分类：一类报动作结果、一类报环境全貌、一类应主动询问。\textbf{没有这套语言化的反馈接口，LLM 就是个“闭着眼睛下指令”的开环系统；有了它，LLM 才睁开了眼睛。} 而“睁眼”恰是治幻觉的良药——现实的反馈会不断把 LLM 一厢情愿的想象拉回地面。
+\end{insight}
+
+\subsection{闭环的边界与代价：能纠什么、闭多紧}
+\label{sec:closedloop-cost}
+
+闭环很强大，但要避免神化。它能纠正的，是\emph{“执行层面、能被反馈观测到”的偏差}（抓取滑脱、物体不在预想位置、需要补充信息）。它纠不了的有几类更深的问题：\textbf{反馈本身错了}（成功检测误报，闭环会越纠越错）；\textbf{根本不可行的目标}（“把月亮摘下来”，再多闭环也纠不出可行计划——可行性的根本判断不是闭环能替代的）；\textbf{需要全局重排的失败}（发现门锁了、整条路线作废，需要的是\emph{重新规划}而非局部重试，这时该触发上游符号规划器重新搜索）。
+
+闭环也不是免费的。每“闭”一次环——把环境反馈喂回 LLM、等它生成下一步——都要付出\emph{一次 LLM 推理的延迟}（当代大模型一次推理动辄几百毫秒到数秒）。这引出一个工程权衡：\textbf{闭多紧的环？}（\cref{tab:closedloop-freq}）
+
+\begin{table}[H]\centering\small
+\caption{闭环频率的权衡}
+\label{tab:closedloop-freq}
+\begin{tabular}{p{2.8cm}p{2.6cm}p{2.6cm}p{4.0cm}}
+\toprule
+闭环粒度 & 优点 & 代价 & 适合 \\
+\midrule
+每个低层控制步（毫秒级） & 反应最快 & LLM 延迟跟不上控制频率（$1\,$kHz） & 几乎不可行——LLM 太慢 \\
+每个技能/动作后（秒级） & 能及时发现动作失败 & 每步一次 LLM 推理，长任务累积延迟 & ReAct / Inner Monologue 的典型粒度 \\
+仅在异常时（稀疏） & 省推理、正常时全速跑 & 异常检测器漏报则错误持续 & 成熟系统的常见折中 \\
+完全开环（从不） & 零额外延迟 & 一错到底 & 仅受控 demo \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[分层闭环：底层闭紧、LLM 层闭松]
+闭环频率的选择，本质是\textbf{“反应性”与“实时性/成本”之间的权衡}——闭得越紧越能及时纠错，但每次闭环的 LLM 延迟越拖累节奏、烧越多推理成本。这解释了真实系统的常见架构：\emph{不是让 LLM 参与每一个控制步（它太慢），而是把“快速反应”交给底层（行为树/控制器高频运行、自己处理可预期的局部失败如重试），只在“底层兜不住的异常”时才上升到 LLM 这一层重新决策}。这是一种\textbf{分层闭环}——底层闭紧环（高频、便宜、处理常规），LLM 层闭松环（低频、昂贵、处理意外）。\textbf{LLM 适合做“慢思考”的纠错决策，不适合做“快反应”的实时控制。}
+\end{insight}
+
+\begin{pitfall}[本节常见陷阱]
+\begin{itemize}
+  \item \textbf{以为闭环 $=$ 不会失败。} 闭环只是给了\emph{纠错的机会}，不保证纠错成功。反馈错、目标不可行、需全局重排时都可能无能为力。闭环降低失败率，不消除失败。
+  \item \textbf{把 ReAct 的 Thought 当成可有可无的注释。} Thought 是 LLM“消化反馈、决定纠错策略”的工作空间。去掉它直接生成 Action，纠错能力会显著下降。
+  \item \textbf{混淆“局部纠错”与“重新规划”。} 闭环擅长局部纠错（重试、微调）；方向性失败需要重新规划（回到符号规划器搜一条新计划）。混为一谈会让系统在“该重规划时还在原地反复重试”上死循环。
+  \item \textbf{以为有了闭环就不需要执行层。} ReAct / Inner Monologue 给的是闭环的\emph{思路}，工业级的执行监控、异常恢复、实时响应要靠行为树落地（\cref{sec:llm-dataflow} 详述）。
+\end{itemize}
+\end{pitfall}
+
+\begin{exercise}
+\begin{enumerate}
+  \item 用一个具体任务（如“把洒在地上的牛奶清理掉”）写一段 ReAct 风格的 Thought/Action/Observation 轨迹，至少含一次“执行失败 $\to$ LLM 据反馈纠错重试”。
+  \item Inner Monologue 三类反馈各举一个新例子（不用正文的），并说明若\emph{缺失}该类反馈，机器人会在什么情况下犯错。
+  \item 给出一个\emph{闭环纠不了}的失败例子，说明它需要的不是闭环重试而是别的机制（哪个？）。
+  \item “局部纠错”与“重新规划”的分工，在行为树里分别对应什么节点/机制（提示：Fallback、重规划触发）？
+\end{enumerate}
+\end{exercise}
+
+% ════════════════════════════════════════════════════════════════
+\section{Code-as-Policies：把计划写成程序}
+\label{sec:cap}
+
+SayCan 让计划是“技能序列”，ReAct 让计划是“Thought/Action 交替”。Code-as-Policies（Liang 等，ICRA 2023）给出第三种、别具一格的输出形态：\textbf{让 LLM 把计划直接写成可执行的程序代码}。
+
+\subsection{核心思想：计划即程序}
+\label{sec:cap-core}
+
+当代 LLM 不仅会写自然语言，还\emph{很会写代码}（它们在 GitHub 级代码上训练过）。Code-as-Policies 抓住这一点：\textbf{与其让 LLM 输出一串动作描述，不如让它输出一段调用机器人 API 的 Python 程序——这段程序本身就是策略（policy）。} 例如用户说“把所有积木按颜色分别堆起来”，LLM 生成的不是“拿红积木 1、放到红堆、拿红积木 2……”这样的序列，而是一段含循环、条件、函数调用的程序：对每种颜色，取出同色积木列表，把它们依次堆到一个基座上。这段程序里藏着自然语言计划表达不了、或表达起来极笨拙的东西：
+
+\begin{itemize}
+  \item \textbf{循环}：“对每一个/每一种”这种量化逻辑，程序用 \verb@for@ 天然表达；动作序列则要把循环\emph{展开}成具体步数（物体数量运行时才知道，没法预先展开）。
+  \item \textbf{条件}：按条件分支（\verb@if@），程序原生支持。
+  \item \textbf{组合与抽象}：可调用/复用函数（如 \verb@pick_and_place@、\verb@on_top_of@），把复杂行为封装。
+  \item \textbf{感知-动作交织}：感知 API（如 \verb@detect_objects@）的结果直接喂给后续逻辑——感知与决策在同一段代码里流动。
+\end{itemize}
+
+\subsection{LMP 与层级分解}
+\label{sec:cap-lmp}
+
+Code-as-Policies 把这类“LLM 生成的、调用 API 的程序”称作 \textbf{LMP（Language Model Programs，语言模型程序）}。论文的关键贡献是\emph{层级化的 LMP 生成}：Code as Policies 提出一种以机器人为中心的语言模型生成程序（LMP）的范式，能表达反应式策略（如阻抗控制器）以及基于路点的策略（如视觉伺服的抓放、基于轨迹的控制），并在多个真实机器人平台上验证\cite{liang2023codeaspolicies}。“层级”指：当 LLM 写主程序时遇到一个尚未定义的函数（写了 \verb@on_top_of(base)@ 但它还不存在），可以\emph{递归地再生成那个函数的代码}——一层套一层，让 LMP 能处理相当复杂的任务，而不必把所有逻辑塞进一个扁平的主程序。它属于 \textbf{LLM-as-Planner}（计划是 LLM 直接生成的，只是形态是代码）。可行性靠两点兜：一是\emph{API 的设计}（机器人只暴露它确实会做的 API，类似 SayCan 限制技能库），二是程序里可写\emph{反馈循环和条件检查}（如“抓不住就重试”），把闭环思想直接编码进代码。
+
+\subsection{程序形态 vs 符号序列}
+\label{sec:cap-compare}
+
+\begin{table}[H]\centering\small
+\caption{程序形态与符号动作序列的对比}
+\label{tab:cap-compare}
+\begin{tabular}{p{3.0cm}p{4.4cm}p{4.6cm}}
+\toprule
+维度 & 符号动作序列（PDDL 计划） & 程序（LMP, Code-as-Policies） \\
+\midrule
+计划长什么样 & 扁平序列 \texttt{[pick(c1), place(c1,r), ...]} & 含循环/条件/函数调用的代码 \\
+表达“对每个物体” & 必须展开成具体步（需预知数量） & \verb@for x in objects@ 一行搞定 \\
+表达条件分支 & 规划时就要枚举所有分支 & \verb@if/else@ 运行时分支 \\
+表达反馈循环 & 本身不含（要靠外层执行器） & \verb@while not done@ 内建 \\
+可行性保证 & 经典规划器保证满足前提（强） & 靠 API 设计 $+$ 运行时检查（弱） \\
+可验证性 & 高（PDDL 可被验证器逐条查） & 低（要靠运行/测试，难静态验证） \\
+适合的任务 & 离散、组合、要可验证保证 & 反应式、含循环条件、感知交织 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[程序把“控制流”这个维度还给了计划]
+程序形态的真正威力，在于它把\textbf{控制流（control flow）}这个维度还给了计划。符号动作序列是“线性的、展开的、静态的”——无法表达“重复直到某条件”“按情况分支”“失败就重试”这类\emph{控制结构}，只能把一切预先展开成一条直线。而程序天生就是控制流的语言：循环、条件、递归、异常处理。这让 Code-as-Policies 特别擅长\emph{反应式、参数化、含运行时不确定性}的任务。代价是\textbf{可验证性的丧失}——一段含循环和条件的程序，远比一条扁平序列难以静态验证其正确性与安全性（停机问题在那儿摆着）。\textbf{表达力与可验证性此消彼长}：程序形态把表达力推到很高，于是把可验证性压到很低——用它时，安全保障就更依赖 API 的精心设计和运行时的检查。
+\end{insight}
+
+\subsection{安全执行：沙箱与 API 白名单}
+\label{sec:cap-safety}
+
+“让 LLM 写代码、然后执行它”比“让 LLM 写动作序列”多了一重风险——\emph{执行的是 LLM 生成的、未经验证的代码}。这段代码可能调用不存在的函数（幻觉的代码版）、写出死循环、甚至执行危险操作。直接 \verb@exec()@ 把整个 Python 运行时（文件系统、网络、任意库）都暴露给了 LLM 的输出——一个幻觉出的 \verb@import os; os.system(...)@、一个 \verb@while True@ 死循环，都能让系统失控。正确做法：\textbf{用 API 白名单 $+$ 受限沙箱把执行空间圈起来}——把 LLM 能调用的东西严格限制在一组安全、参数受约束的机器人 API 上，在只含白名单的受限命名空间里执行、带超时杀掉死循环；调了白名单外的函数当场拦下（即幻觉的代码版）。每一道防线都对应本章一条原则：白名单 $=$ 限制输出空间防幻觉、受限命名空间 $=$ 不让 LLM 碰危险操作、超时 $=$ 防死循环、未授权调用拦截 $=$ 语法/白名单校验在代码形态下的体现。
+
+\begin{insight}[安全不来自“相信 LLM 写得对”，而来自“事先圈死可用操作”]
+Code-as-Policies 的安全性，\textbf{不来自“相信 LLM 写得对”，而来自“把 LLM 能做的事先圈死在一个安全集合里”}。API 白名单本质上是一道\emph{加载期的关卡}：LLM 的代码无论怎么写，它能触达的操作集合是被你（而非 LLM）预先决定的。这把“程序形态丢失了可验证性”的风险，从“事后验证整段程序”（难，停机问题）转化为“事前限制可用操作”（易，白名单是有限集）。\textbf{好的 API 设计因此成了 Code-as-Policies 安全的命门}——API 的粒度、参数约束、副作用边界，直接决定了“再坏的 LLM 代码最多能造成多大破坏”。
+\end{insight}
+
+\begin{pitfall}[本节常见陷阱]
+\begin{itemize}
+  \item \textbf{以为程序形态比符号序列“更高级、总该用”。} 程序换来表达力、赔上可验证性。安全攸关或要可验证保证的任务，扁平的、可被验证器逐条检查的符号计划反而更可取。
+  \item \textbf{以为 LLM 写的代码一定能跑。} LLM 写的程序同样会有 bug（调用不存在的 API、逻辑错、死循环），和幻觉是同一回事、只是换了载体。必须有沙箱执行、异常捕获、API 白名单来兜。
+  \item \textbf{把 API 设计当成小事。} Code-as-Policies 的可行性兜底\emph{主要靠 API}。API 设计得好不好，直接决定系统安全不安全。
+  \item \textbf{以为它能取代符号规划的搜索。} 程序里的循环/条件是\emph{预先写死的控制流}，不是\emph{搜索}。需要“在巨大组合空间里找一条满足约束的序列”时，那是经典规划器的能力，程序的控制流替代不了。
+\end{itemize}
+\end{pitfall}
+
+\begin{exercise}
+\begin{enumerate}
+  \item 用 Code-as-Policies 风格，为“把桌上比手机大的物体都放进抽屉”写一段 LMP 伪代码，标出循环、条件、API 调用各在哪。
+  \item 同一任务若用 PDDL 动作序列表达会遇到什么困难（提示：物体数量、“比手机大”何时能判断）？
+  \item 举一个\emph{不该}用 Code-as-Policies、而该用符号规划/as-Modeler 的任务，从“可验证性”或“最优性”角度说明理由。
+  \item Code-as-Policies 怎么把闭环思想编进代码？写一小段含“抓取失败就重试”的 LMP 片段。
+\end{enumerate}
+\end{exercise}
+
+% ════════════════════════════════════════════════════════════════
+\section{LLM-as-Modeler：让大模型生成 PDDL}
+\label{sec:llm-modeler}
+
+前几节都是 LLM-as-Planner——让 LLM 直接出计划、可行性靠 affordance/反馈/API 层层兜。本节转向另一大范式 \textbf{LLM-as-Modeler}，它走了一条哲学上截然不同的路：\textbf{让 LLM 退后一步，不出计划，只出“规划问题的形式化模型”（PDDL），再把模型交给经典规划器去完备地搜索求解。} 这是本章的硬核，也是“增强而非取代”\emph{贯彻得最彻底}的范式——计划完全由可信的经典规划器产出，LLM 的不可靠性被严格堵在“模型对不对”这一道可验证的关卡前。
+
+\subsection{核心思想：LLM 写模型，规划器来求解}
+\label{sec:modeler-core}
+
+LLM-as-Modeler 把规划拆成“建模”和“求解”两步，让 LLM 只干第一步：LLM 根据自然语言指令 $+$ 领域背景，生成 PDDL domain（动作模型）和/或 problem；再交 Fast Downward / FF 在合法 PDDL 上搜索。这条路的巨大好处源自前置自测 Q3：\textbf{经典规划器在合法 PDDL 上是完备、可验证、可最优的。} 一旦 LLM 写出的 PDDL 经检验确认无误，剩下的搜索就由可信的经典规划器全权接管——它找到的计划\emph{必然合法}（满足所有前提）、可配置\emph{最优}，绝不会幻觉出不存在的动作。LLM 的“不严谨”被彻底隔离在“建模”之外、碰不到最终计划。
+
+LLM+P（Liu 等，2023）是这条路的开创性框架：LLM+P 接收一个规划问题的自然语言描述，先把它转成 PDDL，再用经典规划器快速求解，最后把解翻译回自然语言；实验显示 LLM+P 能为大多数问题给出最优解，而 LLM 自己对多数问题连可行解都给不出\cite{liu2023llmp}。注意最后半句——这正是那个 $3\%$ 的另一面：\textbf{同一个 LLM，让它直接规划近乎失败，让它只翻译成 PDDL 再交规划器，却能给出最优解。}
+
+\begin{insight}[LLM+P 是对核心边界最有力的量化背书]
+LLM+P 的实验结果，是对本章核心边界最有力的一次量化背书。同一个 LLM、同一批问题，区别只在于\textbf{让它干哪一步}——直接规划（弱项，$\approx 3\%$）还是翻译建模（强项，接近最优）。这把“增强而非取代”从一句口号变成可复现的实验事实：\textbf{LLM 的价值不在于替规划器做搜索，而在于替人做那件繁琐的“把自然语言翻译成形式化模型”的活儿。} 它把人类规划专家从“手写 PDDL”里解放出来，同时一丝不让地保住了经典规划器的所有理论保证——这就是钟摆被拉回的极致。
+\end{insight}
+
+\subsection{三个层次：翻译 goal、生成 domain、泛化 program}
+\label{sec:modeler-levels}
+
+“让 LLM 写模型”具体写什么？按 LLM 承担的形式化任务由轻到重，分三个层次。
+
+\paragraph{层次一：只翻译目标（LLM 写 \texttt{:goal}）。}
+最轻量——domain 由人预先写好（领域动作模型相对稳定），LLM 只把用户指令翻译成 PDDL 的 \texttt{:goal}。Xie 等人（2023）系统研究了这一层：他们实证研究了 LLM（尤其 GPT-3.5）把自然语言目标翻译成 PDDL 的效果，发现 LLM 在翻译任务上远比在规划任务上在行，能生成与自然语言指令一致、且符合给定 PDDL domain/problem 规范的可达成目标\cite{xie2023translating}。这一层风险最小（domain 可信），特别适合“领域固定、只是指令多变”的场景。
+
+\paragraph{层次二：生成领域模型（LLM 写 \texttt{:action} 的前提与效果）。}
+更重——让 LLM 生成整个 domain（有哪些动作、每个动作的前提和效果）。这难得多，因为 domain 是“物理规律”，写错一条前提/效果，后面所有计划都会出问题。Guan 等人（NeurIPS 2023）是这一层的代表，关键在它\emph{不指望 LLM 一次写对}：他们构建一个用 PDDL 表达的显式世界（领域）模型，再用可靠的领域无关规划器求解；由于 LLM 未必一次生成完全可用的 PDDL，他们让 LLM 充当 PDDL 与纠正性反馈源（PDDL 校验器、人类）之间的接口，用 GPT-4 为 $40$ 多个动作产出高质量 PDDL 模型，修正后的模型成功解决了 $48$ 个有挑战的规划任务\cite{guan2023worldmodel}。这里的“校验器 $+$ 反馈”闭环是这一层的灵魂（\cref{sec:modeler-loop} 详述）。
+
+\paragraph{层次三：生成泛化规划程序（LLM 写一个能解整类问题的 program）。}
+最重——不只解一个问题，而是为整个 PDDL \emph{领域}生成一段“通用解题程序”（给定该领域的任意新问题，这段程序都能高效产出计划）。Silver 等人（AAAI 2024）研究了这一层：他们考察 LLM 能否作为泛化规划器——给定一个 domain 和若干训练任务，生成一个能为该领域其他任务高效产出计划的程序；用 GPT-4 合成 Python 程序，配合“自动调试”（程序在训练任务上验证、出错则带四类反馈重新提示）与思维链摘要，发现 GPT-4 是出人意料地强大的泛化规划器，而自动调试至关重要\cite{silver2024generalized}。这一层把 LLM 的代码能力和经典规划的泛化思想结合，是 as-Modeler 里最前沿、也最接近“自动化规划工程”的方向。
+
+\begin{table}[H]\centering\small
+\caption{LLM-as-Modeler 的三个层次}
+\label{tab:modeler-levels}
+\begin{tabular}{p{1.6cm}p{2.6cm}p{1.0cm}p{2.8cm}p{2.0cm}p{2.6cm}}
+\toprule
+层次 & LLM 写什么 & 难度 & 风险 & 代表 & 适合场景 \\
+\midrule
+一：翻译目标 & PDDL \texttt{:goal} & 低 & 低（domain 人写、可信） & Xie et al. 2023 & 领域固定、指令多变 \\
+二：生成 domain & \texttt{:action} 前提/效果 & 高 & 高（写错规律全盘错） & Guan et al. 2023 & 领域需快速建模、有校验闭环 \\
+三：泛化程序 & 解整类问题的 program & 最高 & 中（程序可在训练集验证） & Silver et al. 2024 & 自动化规划工程、需泛化 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[出力边界由“配套的把关能力”决定]
+这三个层次，是按“\textbf{把多少形式化负担转给 LLM}”递增排列的——层次一只让它碰目标（最小负担、最小风险），层次三让它写整个解题器（最大负担、最大收益）。一条清晰的工程权衡：\textbf{LLM 承担的形式化越多，省的人力越多，但出错的影响面也越大、越需要强力的校验闭环兜底}。层次一几乎不需要校验（domain 可信），层次二必须有校验器闭环（Guan 的灵魂），层次三靠在训练集上自动调试（Silver 的灵魂）。\textbf{LLM 出力的边界，由“配套的把关能力”决定。}
+\end{insight}
+
+\subsection{灵魂所在：校验器反馈闭环（generate-validate-repair）}
+\label{sec:modeler-loop}
+
+层次二、三的成功，都不靠“LLM 一次写对”，而靠一个\emph{自纠错闭环}。这是 LLM-as-Modeler 区别于“天真地让 LLM 写 PDDL”的关键。它的结构是 \textbf{生成-校验-修复（generate $\to$ validate $\to$ repair）}（\cref{fig:gvr-loop}）。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, node distance=7mm and 12mm,
+  step/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=main!8, draw=main!60!black},
+  chk/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=second!10, draw=second!60!black},
+  ok/.style={draw, rounded corners, align=center, font=\footnotesize, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!55!black}]
+\node[step] (gen) {1. 生成\\ LLM 写 PDDL\\ (domain/goal)};
+\node[chk, right=of gen] (val) {2. 校验（确定性、可信）\\ 语法：解析器\\ 语义：VAL 计划验证器\\ （可选）训练任务试解};
+\node[ok, above right=4mm and 12mm of val] (pass) {3a. 通过 $\to$ 交经典规划器\\ 求解 $\to$ 合法可行计划};
+\node[chk, below right=4mm and 12mm of val] (fail) {3b. 失败 $\to$ 把\emph{具体报错}喂回\\ “第 N 行谓词未定义”\\ “动作前提引用未定义类型”};
+\draw[ln] (gen)--(val);
+\draw[ln] (val.east) -- (pass.west);
+\draw[ln] (val.east) -- (fail.west);
+\draw[ln] (fail.south) -- ++(0,-5mm) -| node[pos=0.25,below,font=\scriptsize]{回到步骤 1 重写} (gen.south);
+\end{tikzpicture}
+\caption{生成-校验-修复闭环：校验器是确定性工具（PDDL 解析器、VAL），反馈是可定位的精确报错。}
+\label{fig:gvr-loop}
+\end{figure}
+
+\noindent 这个闭环的精髓在两点：
+
+\begin{enumerate}
+  \item \textbf{校验器是确定性的、可信的——不是另一个 LLM。} PDDL 解析器、VAL 计划验证器都是经典的、形式化的工具，判断\emph{确定无误}。用它们检查 LLM 的输出，等于用“可信的尺子”量“不可信的产物”。
+  \item \textbf{反馈是具体的、可定位的。} 喂回去的不是泛泛的“你错了”，而是校验器吐出的\emph{精确报错}（“第 N 行谓词 \texttt{on} 未声明”“动作 \texttt{pick} 的前提引用了未定义类型”）。LLM 拿到精确报错，修复命中率远高于盲目重写——这正是 Guan 工作里“LLM 作为 PDDL 与纠正反馈之间的接口”的含义。
+\end{enumerate}
+
+\noindent 把它和执行层闭环（\cref{sec:closed-loop}）对照：ReAct/Inner Monologue 是\emph{执行层}的闭环（用环境反馈纠执行偏差），这里是\emph{建模层}的闭环（用校验器反馈纠模型错误）。两者同构——都是“产出 $\to$ 反馈 $\to$ 纠错”，只是反馈源不同（一个是物理环境，一个是形式化校验器）。\textbf{自纠错闭环是贯穿本章的核心模式。}
+
+\subsection{为什么 as-Modeler 把可验证性钟摆拉得最回}
+\label{sec:modeler-pendulum}
+
+LLM-as-Modeler 之所以“把钟摆拉得最回”，因为它在数据流的设计上把 LLM 的不可靠性\emph{完全挡在了最终计划之外}：LLM 只碰\emph{模型}（PDDL）、碰不到\emph{计划}（计划是经典规划器搜出来的）；模型在交给规划器前要过\emph{确定性校验器}（语法、语义、可解性逐层把关）；校验通过的模型，规划器对它的求解是\emph{完备、可验证、可最优}的。于是最终计划继承了经典规划的\emph{全部理论保证}，而 LLM 的贡献被限定在“把自然语言翻译成（待校验的）形式化模型”——它的不严谨即便发作（写错 PDDL），也会被校验器拦下、退回重写，\emph{不会漏到最终计划里}。
+
+\begin{insight}[终极区别：信任谁来产出最终计划]
+as-Modeler 和 as-Planner 的终极区别，是\textbf{“信任谁来产出最终计划”}。as-Planner 信任 LLM 产出计划、再用一堆下游机制（affordance、反馈、API）去补救它的不可靠；as-Modeler 干脆不信任 LLM 产出计划，只信任它做翻译，把产出计划这件大事\emph{完全交给可信的经典规划器}。前者是“用了不可靠的东西、努力补救”，后者是“把不可靠的东西挡在关键路径外”。但 as-Modeler 有个前提：\textbf{得有 PDDL domain（人写或 LLM 生成 $+$ 校验）}。当领域开放到连 domain 都难以形式化时，as-Modeler 就力不从心，那时才轮到 as-Planner 的开放性登场。\textbf{两范式的适用边界，最终由“领域能否被形式化”划定。}
+\end{insight}
+
+\begin{pitfall}[本节常见陷阱]
+\begin{itemize}
+  \item \textbf{让 LLM 既写 PDDL 又自己求解。} 这就把 as-Modeler 退化回 as-Planner 了，丢掉了交经典规划器求解的全部保证。as-Modeler 的关键是\emph{求解必须交给经典规划器}，LLM 只负责到“写出合法 PDDL”为止。
+  \item \textbf{用另一个 LLM 当校验器。} 校验必须用\emph{确定性的形式化工具}（PDDL 解析器、VAL）。用 LLM 校验 LLM，等于让续写者审续写——它可能“幻觉”地认为错误的 PDDL 是对的。
+  \item \textbf{以为 LLM 一次就能写对 domain。} 层次二、三几乎不可能一次写对。Guan 和 Silver 的成功\emph{关键都在自纠错闭环}，不在“模型够强一次到位”。
+  \item \textbf{选错层次。} 领域固定就别让 LLM 去生成 domain（层次二，高风险），只让它翻译 goal（层次一，低风险）就够。
+  \item \textbf{以为有了 as-Modeler 就不需要懂 PDDL。} 恰恰相反——你必须懂 PDDL 才能判断 LLM 写的对不对、才能设计校验、才能看懂报错来修。as-Modeler 是“PDDL 的自动写手 $+$ 人工/工具审核”，不是“PDDL 的替代品”。
+\end{itemize}
+\end{pitfall}
+
+\begin{exercise}
+\begin{enumerate}
+  \item 用自己的话解释 LLM+P 的实验“同一个 LLM 直接规划近乎失败、翻译成 PDDL 再交规划器却接近最优”，并说明它为何是“增强而非取代”的有力证据。
+  \item 画出 generate-validate-repair 闭环，标出“校验”这一步具体查哪三类问题（语法/语义/可解性），并说明为什么校验器\emph{绝不能}用另一个 LLM。
+  \item 给定三个任务，判断各该用哪个层次：(a) 领域已有成熟 PDDL domain、只是指令多变；(b) 全新领域、还没有任何 PDDL、要快速建模；(c) 一个领域要反复解大量同类新问题、希望一次生成通用解题器。
+  \item 建模层的 generate-validate-repair 闭环，与执行层的 ReAct/Inner Monologue 闭环，结构上有何共性？反馈源各是什么？
+  \item 假设 LLM 把 \texttt{:goal} 里漏写了 \texttt{(stored ?x)} 那一条（忘了“杂物要收纳”），校验器能发现吗？为什么这类“语义不完整”比“拼写错误”更难被自动校验抓住？
+\end{enumerate}
+\end{exercise}
+
+% ════════════════════════════════════════════════════════════════
+\section{VLM 接地：把语言连到像素与三维}
+\label{sec:grounding}
+
+LLM 活在纯文本世界——可机器人面对的是像素、点云、三维空间。LLM 写出 \verb@pick(cup)@，但“哪个像素团是 cup”“它的三维位姿是什么”，LLM 自己根本不知道。\textbf{怎么把语言里的符号，连到物理世界的感知？} 这就是\emph{符号接地问题（symbol grounding problem）}，本节讲它在 LLM 任务规划里的解法——视觉语言模型（VLM）接地。
+
+\subsection{符号接地问题：language gap 的几何版}
+\label{sec:grounding-problem}
+
+回顾 \cref{sec:llm-gaps} 的两道缝。语言缺口由 LLM 的语言能力补；但还有一道更底层的缝：\textbf{LLM 输出的符号（\texttt{cup}、\texttt{shelf}、\texttt{on}）和物理世界的感知（像素、坐标）之间，没有天然的对应}。一个 LLM 生成的计划 \verb@pick(cup)@ 要真正执行，需要回答三件事：
+
+\begin{enumerate}
+  \item \textbf{指代接地（referential grounding）}：场景里哪个物体是 \texttt{cup}？（把符号连到具体视觉实例）
+  \item \textbf{空间接地（spatial grounding）}：这个 \texttt{cup} 在哪？三维位姿、抓取点是什么？（把符号连到几何坐标）
+  \item \textbf{关系接地（relational grounding）}：\verb@(on cup table)@ 这个关系，在当前感知里成立吗？（把符号关系连到感知判断）
+\end{enumerate}
+
+\noindent 这三件事纯 LLM 都做不到——它没有眼睛。这正是“符号 vs 几何鸿沟”在 LLM 语境下的再现。而 VLM（能同时处理图像和文本的模型，如 CLIP、开放词汇检测器、多模态大模型）恰好是这座桥——它把“语言描述”和“视觉内容”对齐在同一个表示空间里。
+
+\begin{insight}[第三道、也是最底层的一道缝]
+符号接地问题是“两道缝”故事的第三道、也是最底层的一道缝。语言缺口是“听不懂人话”，常识缺口是“不懂隐含规则”，接地缺口是“不知道话里的词指物理世界的哪个东西”。前两道缝 LLM 自己能补，第三道缝 LLM 补不了——因为它没有感知。\textbf{必须引入一个“看得见”的模型（VLM）来把符号连到像素与坐标。} 把 VLM 接地理解为“给 LLM 装上眼睛”，就抓住了本节的全部。
+\end{insight}
+
+\subsection{接地的三种粒度}
+\label{sec:grounding-granularity}
+
+\begin{table}[H]\centering\small
+\caption{VLM 接地的三种粒度}
+\label{tab:grounding-granularity}
+\begin{tabular}{p{2.4cm}p{3.4cm}p{4.0cm}p{3.0cm}}
+\toprule
+粒度 & 接地到什么 & 典型工具 & 服务于 \\
+\midrule
+物体级 & 符号 $\to$ 图像里的物体框/掩码 & 开放词汇检测（OWL-ViT、Grounding DINO）、分割（SAM） & “cup 是哪个” $\to$ 给抓取目标 \\
+关系级 & 符号关系 $\to$ 感知判断（真/假） & VLM 问答（“cup 在 table 上吗？”） & 验证前提、闭环成功检测 \\
+稠密空间级 & 语言 $\to$ 三维空间的稠密值场 & VoxPoser 式的 3D value map & 直接指引运动规划/轨迹合成 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent \textbf{物体级}最常用——开放词汇检测器接收一个文本词（“cup”，哪怕训练时没见过这个类别），在图像里框出对应物体，给 \verb@pick(cup)@ 提供“抓哪儿”的目标。“开放词汇”是关键：传统检测器只认固定类别，开放词汇检测器认任意文本描述，正好配 LLM 输出的任意符号。\textbf{关系级}服务于闭环——要判断“抓取成功了吗”“cup 还在 table 上吗”，可让 VLM 看着图像回答。\textbf{稠密空间级}最精细，下面单讲。
+
+\subsection{VoxPoser：把语言变成三维值图}
+\label{sec:voxposer}
+
+VoxPoser（Huang 等，CoRL 2023）是稠密空间接地的代表，它的做法很有想象力：\textbf{让 LLM 写代码去调用 VLM，合成一个覆盖三维工作空间的“值图”，直接指引机器人运动。} 具体地：VoxPoser 观察到 LLM 擅长从自由形式语言指令推断可供性（affordance）与约束（constraint），于是利用其写代码的能力去与视觉语言模型交互，组合出 3D value map，把知识接地到智能体的观测空间；这些值图被用在一个基于模型的规划框架里，零样本地合成对动态扰动鲁棒的闭环机器人轨迹\cite{huang2023voxposer}。拆解这个机制（它把本章好几条线索缝在了一起）：对指令“打开最上面的抽屉，小心那个花瓶”，LLM（Code-as-Policies 式）写代码把指令拆成“可供性”（在“最上抽屉把手”处赋高值）与“约束”（在“花瓶”周围赋高代价），代码里调用 VLM/检测器定位三维位置；两者合成一个 3D value map（每个体素一个分数：想去/想避），再由基于模型的运动规划在值图上做轨迹优化、产出对扰动鲁棒的闭环轨迹。
+
+\begin{insight}[通用配方：LLM 定义/塑造问题，经典数值方法求解问题]
+VoxPoser 揭示了一种深刻可能——\textbf{LLM 不必直接输出动作，它可以输出“塑造下游优化问题的东西”}。SayCan 让 LLM 选技能、LLM+P 让 LLM 写 PDDL、VoxPoser 让 LLM 塑造一个值场再交给运动优化。它们的共性是：\textbf{LLM 在最擅长的“高层语义”层面发力（这里该高值、那里该避开），把“在连续空间里求一条最优轨迹”这件 LLM 干不了的事，交给经典的运动规划/优化。} 这条配方贯穿 SayCan（塑造选择）、LLM+P（塑造符号问题）、VoxPoser（塑造优化问题）：\textbf{让 LLM 定义/塑造问题（它懂语义），让经典数值方法求解问题（它保证质量）。}
+\end{insight}
+
+\subsection{两种接地的信息流向：感知喂给 LLM vs LLM 驱动感知}
+\label{sec:grounding-flow}
+
+接地很关键，但它也是新的出错点（检测错、指代歧义、关系误判），且这个错 LLM 自己发现不了——接地结果同样要校验、要兜底（多视角确认、置信度阈值、歧义时主动询问、关键操作前用力觉二次确认）。接地在系统里还有两种截然不同的接法（\cref{tab:grounding-flow}），区别在于\emph{谁主动、信息往哪流}。
+
+\begin{table}[H]\centering\small
+\caption{两种接地的信息流向}
+\label{tab:grounding-flow}
+\begin{tabular}{p{2.4cm}p{4.2cm}p{4.6cm}}
+\toprule
+ & 方式一 被动接地 & 方式二 主动接地 \\
+\midrule
+谁主动 & 感知先行，LLM 被动收 & LLM 先行，主动调感知 \\
+LLM 看到的 & 预先文字化的场景全貌 & 自己按需查询的结果 \\
+优点 & 简单、LLM 不必“会调感知” & 灵活、只查需要的、省感知开销 \\
+缺点 & 可能喂了一堆无关信息 & LLM 要会写正确的感知调用 \\
+代表 & SayCan、Inner Monologue 被动描述 & Code-as-Policies、VoxPoser \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[哪些感知信息该预先喂、哪些该让 LLM 按需取]
+这两种接地方式，对应两范式的一个微妙投影——\textbf{被动接地更像“把世界端给 LLM”，主动接地更像“让 LLM 自己去探世界”}。被动接地把“看什么”的决定权交给系统设计者，主动接地把这个决定权交给 LLM。真实系统常\emph{两者混用}：用被动接地喂一个粗粒度的场景概览（让 LLM 有全局感），再让 LLM 在需要细节时用主动接地去查。\textbf{喂太多则冗余、喂太少则 LLM 瞎猜，这条平衡正是接地工程的核心拿捏。}
+\end{insight}
+
+\begin{pitfall}[本节常见陷阱]
+\begin{itemize}
+  \item \textbf{以为 LLM 自己能“看到”场景。} LLM 是纯文本模型，没有视觉。所有“看”的能力来自外接的 VLM/检测器。场景必须先由感知翻译成文字/坐标才能喂给 LLM。
+  \item \textbf{把开放词汇检测当成万能。} 它仍会错（小物体、遮挡、罕见物、歧义描述）。接地结果要带置信度、要能消歧、要可兜底，不能当 ground truth。
+  \item \textbf{混淆三种接地粒度的用途。} 物体级给抓取目标、关系级做前提/成功验证、稠密空间级指引运动优化——用途不同，用错粒度会南辕北辙。
+  \item \textbf{以为 VoxPoser 取代了运动规划。} VoxPoser 用 LLM \emph{塑造}值图，但求轨迹仍靠基于模型的运动规划/优化。它是“LLM 定义问题 $+$ 经典方法求解”，不是“取代运动规划”。
+\end{itemize}
+\end{pitfall}
+
+\begin{exercise}
+\begin{enumerate}
+  \item 给 \verb@place(cup, on=plate)@ 这个动作，列出它执行前需要的三种接地（指代/空间/关系）各要回答什么问题、分别用什么工具。
+  \item “开放词汇检测”为什么特别适合给 LLM 任务规划做接地（对比传统固定类别检测器，考虑 LLM 输出符号的开放性）？
+  \item VoxPoser 同时用到本章哪三条线索？用一句话说明它把“接地”做到了什么粒度、产出什么形态的“计划”。
+  \item 举一个“接地错了但 LLM 浑然不觉”的例子，说明该用什么对策。
+\end{enumerate}
+\end{exercise}
+
+% ════════════════════════════════════════════════════════════════
+\section{提示工程与结构化输出}
+\label{sec:prompt}
+
+前面几节讲了“用 LLM 做什么”，本节讲一个贯穿所有方法的工程基础：\textbf{怎么问，LLM 才答得好、答得能用？} 即提示工程（prompt engineering）与结构化输出（structured output）。它不深奥，但极其实用——前面所有方法能否落地，很大程度上取决于提示设计得好不好。
+
+\subsection{为什么提示如此关键：输出由上下文塑造}
+\label{sec:prompt-why}
+
+回到“LLM 是条件概率下的续写”这个本质——$p_\theta(\text{输出}\mid \text{上下文})$，\textbf{输出完全由上下文（提示）塑造}。同一个 LLM，提示设计的好坏，能让“生成合法 PDDL”的成功率从几乎为零到相当高。这不是玄学，是机制使然：你给的上下文，决定了它续写时落在哪片概率分布上。所以提示工程的核心目标只有一个：\textbf{把上下文构造得让“我想要的那种输出”成为高概率续写}。具体到任务规划，有四类关键技术。
+
+\subsection{四类关键技术}
+\label{sec:prompt-techniques}
+
+\paragraph{技术一：少样本示例（few-shot）。}
+最有效的手段——在提示里\emph{给几个“输入 $\to$ 输出”的范例}，LLM 据此模仿格式与风格。这利用了 LLM 的\emph{上下文学习（in-context learning）}能力：不改参数，仅靠提示里的例子就学会任务模式。示例把“输出该长什么样”（PDDL 语法、用哪些谓词、什么风格）\emph{锚定}在上下文里，让符合该格式的续写概率飙升。
+
+\paragraph{技术二：思维链（Chain-of-Thought, CoT）。}
+让 LLM \emph{“先想再答”}——在给出最终答案前，先用自然语言把推理过程写出来。这就是思维链（Wei 等，NeurIPS 2022）：通过在提示里提供少量“思维链”示范（把推理过程一步步写出来），能在算术、常识与符号推理等一系列任务上显著提升大模型的表现，且这种推理能力随模型规模增大而自然涌现\cite{wei2022cot}。在任务规划里，CoT 让 LLM 先分析“任务要分几步、有什么依赖、要注意什么前提”，再输出计划——例如“把被书挡住的杯子放到架子上”，不用 CoT 会直接输出 \verb@pick(cup)->place(cup,shelf)@（漏了“先移书”），用 CoT 会先想“杯子被书挡住、得先移书”再补上 \verb@move_aside(book)@。CoT 给了 LLM 一段\emph{显式的“推演空间”}——每一步都成为后续步骤的条件，降低“一步跳到错误结论”的概率。它与 ReAct 的 Thought 同源（Thought 就是 CoT 在闭环里的形态），是把 LLM 的“续写”往“像推理”那一侧推的最简单有效的手段——虽然它仍不是真推理。
+
+\paragraph{技术三：结构化输出与约束解码。}
+LLM 默认输出自由文本，但下游（规划器、API、执行器）要的是\emph{严格结构化}的东西。怎么让输出\emph{保证}符合结构？三个层次的手段，强制力递增（\cref{tab:structured-output}）。
+
+\begin{table}[H]\centering\small
+\caption{结构化输出的三个层次}
+\label{tab:structured-output}
+\begin{tabular}{p{3.0cm}p{5.0cm}p{2.4cm}p{1.8cm}}
+\toprule
+手段 & 怎么做 & 强制力 & 代价 \\
+\midrule
+格式指令 $+$ 示例 & 提示里要求“只输出 JSON”并给 JSON 示例 & 弱（靠模仿，可能跑偏） & 低 \\
+输出后解析校验 & 拿到输出后用解析器检查，不合格就重试/纠错 & 中（事后兜底） & 中（要重试） \\
+约束解码（constrained decoding） & 生成时\emph{限制}每步只能选符合语法的 token & 强（生成时即保证合法） & 高（要改解码、接文法） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 约束解码最彻底——它把“输出必须合法”\emph{编码进采样过程}，从源头杜绝不合法输出（类比 Grounded Decoding 把可行性编进 token 选择）。它和可行性校验（\cref{sec:llm-verify}）是“防”与“治”的两手：约束解码在生成时\emph{防}住非法输出，校验闭环在生成后\emph{治}住漏网的错误。
+
+\paragraph{技术四：上下文构造——喂什么进去。}
+一个任务规划的提示通常要拼装：\emph{角色与任务说明}、\emph{能力边界}（可用谓词/技能/API 列表——显式告诉 LLM 它能用什么，从源头防幻觉）、\emph{当前世界状态}（由感知/VLM 接地翻译成文字）、\emph{少样本示例 $+$ CoT 示范}、\emph{输出格式要求}。其中“能力边界”和“世界状态”最易被忽视却最关键：\textbf{不告诉 LLM 机器人有哪些技能，它就会幻觉出没有的动作；不告诉它当前世界状态，它就会基于想象规划。}
+
+\begin{insight}[提示工程的真谛：替 LLM 把确定的部分定死]
+好提示和坏提示的差距，本质是\textbf{“你替 LLM 把多少不确定性消除掉了”}——坏提示把“用什么动作、世界什么样、要什么格式、要不要想”全部留给 LLM 去猜，猜错就是幻觉；好提示把这些\emph{能确定的都先确定下来}（白名单、状态、格式都是你已知的），只把“翻译”这一件 LLM 真正擅长的事留给它。这四类技术不是在堆话术，而是\emph{在系统性地堵每一类幻觉}：能力边界堵幻觉动作、世界状态堵“凭空想象”、CoT 让它列全子目标从而减少遗漏、格式要求让输出可被语法层校验直接吃。\textbf{提示工程的真谛不是“怎么哄 LLM”，而是“怎么把任务中确定的部分替它定死，只留它擅长的那一点让它发挥”。}
+\end{insight}
+
+\begin{pitfall}[本节常见陷阱]
+\begin{itemize}
+  \item \textbf{以为提示工程是“调话术的玄学”。} 它有明确机制（输出由上下文的条件概率塑造）。每一招都对应可解释的原理，不是碰运气。
+  \item \textbf{不告诉 LLM 能力边界就让它规划。} 不给技能库/API/谓词列表，LLM 必然幻觉出机器人没有的动作。能力边界是防幻觉的第一道闸。
+  \item \textbf{把 CoT 的“想”当成可靠推理。} CoT 改善多步任务，但 LLM 仍是续写，CoT 里的推理也可能错。它降低出错率，不保证正确——最终仍要校验。
+  \item \textbf{用格式指令代替约束解码却指望强保证。} “请只输出 JSON”是软约束、可能跑偏。要\emph{保证}结构合法，得靠约束解码或解析校验闭环。
+  \item \textbf{上下文塞太多无关信息。} 上下文窗口有限且信噪比影响输出——把无关细节、冗长历史全塞进去会稀释关键信息（能力边界、当前状态），反而降低输出质量。要喂准、喂精。
+\end{itemize}
+\end{pitfall}
+
+\begin{exercise}
+\begin{enumerate}
+  \item 为“把指令翻译成机器人 API 调用序列”设计一个 few-shot 提示模板，含：角色说明、API 白名单、两个示例、当前状态占位、输出格式要求。标出哪部分在防幻觉。
+  \item 给一个“不用 CoT 会漏掉隐含步骤”的任务例子（不用正文的），分别写出不用 CoT 的错误输出和用 CoT 的正确推演。
+  \item 解释结构化输出三层手段“把约束施加在生成流程哪个位置”，并说明各自的强制力与代价。
+  \item 提示里“能力边界”和“当前世界状态”分别防住哪一类幻觉？把它们和四类幻觉（幻觉动作/违反前提/忽略几何）对应起来。
+\end{enumerate}
+\end{exercise}
+
+% ════════════════════════════════════════════════════════════════
+\section{幻觉与可行性校验：把好严谨这道关}
+\label{sec:llm-verify}
+
+前面每一节都在不同地方提到“要校验、要兜底、不能让 LLM 独裁”。本节把这条贯穿全章的原则\emph{收拢成一个系统的方法论}：LLM 会犯哪些错（幻觉的分类），以及怎么用分层校验把它们逐一拦住。这是本章的第二个硬核，也是“增强而非取代”从理念落到工程的\textbf{总抓手}。
+
+\subsection{幻觉的四种形态}
+\label{sec:hallucination-types}
+
+\begin{table}[H]\centering\small
+\caption{任务规划里幻觉的四种形态}
+\label{tab:hallucination-types}
+\begin{tabular}{p{2.4cm}p{3.6cm}p{2.8cm}p{3.6cm}}
+\toprule
+幻觉形态 & 表现 & 根源 & 例子 \\
+\midrule
+幻觉动作 & 用了机器人不存在的技能/API & LLM 不知道能力边界 & “用微波炉解冻”——没这技能 \\
+违反前提 & 动作的前提不满足却照用 & LLM 不做前提检查 & 手里拿着书又去 \texttt{pick(cup)}——\texttt{handempty} 不满足 \\
+忽略几何 & 物理上不可行却当可行 & LLM 看不到几何 & 让臂展 $0.8\,$m 去够 $1.2\,$m 高的架子 \\
+目标走样 & 翻译的目标偏离用户意图 & 语言歧义/LLM 理解偏差 & “收拾干净”漏译了“杂物要收纳” \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[盲区-关卡的一一对应]
+四种幻觉形态，本质对应 LLM 的四个“盲区”——不知道\emph{自己（机器人）能做什么}（幻觉动作）、不检查\emph{逻辑前提}（违反前提）、看不见\emph{物理几何}（忽略几何）、可能误解\emph{人的意图}（目标走样）。这四个盲区，恰恰是经典方法（符号规划、几何采样、形式验证）的四个强项区。\textbf{于是“校验”的本质，就是用经典方法的强项，去补 LLM 的盲区——一个盲区配一道关卡。} 这是“增强而非取代”最具体的操作图景：不是笼统地“让经典方法把关”，而是针对 LLM 每一类具体的不可靠，配一道专门的、来自经典方法的关卡。
+\end{insight}
+
+\subsection{三层可行性校验}
+\label{sec:three-layer-check}
+
+把“盲区-关卡”对应组织成一套\emph{分层校验}——从浅到深三层，每层拦不同的错（\cref{fig:three-layer}）。这是本节的核心方法论。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, node distance=5mm,
+  lyr/.style={draw, rounded corners, align=left, font=\small, inner sep=4pt, text width=9.4cm},
+  l1/.style={lyr, fill=main!8, draw=main!60!black},
+  l2/.style={lyr, fill=second!10, draw=second!60!black},
+  l3/.style={lyr, fill=third!10, draw=third!60!black},
+  ln/.style={->, thick, gray!55!black}]
+\node[font=\small] (in) {LLM 生成的候选（计划 / PDDL / 代码）};
+\node[l1, below=of in] (layer1) {\textbf{第一层 语法校验（Syntactic）}\\ 查：格式合法吗？谓词/类型/API 声明了吗？\\ 工具：PDDL 解析器 / JSON schema / API 白名单\\ 拦住：\emph{幻觉动作}（调了不存在的 API）、格式错};
+\node[l2, below=of layer1] (layer2) {\textbf{第二层 语义校验（Semantic）}\\ 查：逻辑自洽吗？前提满足吗？目标可达吗？\\ 工具：VAL 计划验证器 / 经典规划器试解 / 状态机\\ 拦住：\emph{违反前提}、逻辑矛盾、目标不可达};
+\node[l3, below=of layer2] (layer3) {\textbf{第三层 几何/物理校验（Geometric）}\\ 查：够得到吗？无碰撞吗？IK 有解吗？抓得稳吗？\\ 工具：IK 求解器 / 碰撞检测 / 运动规划 / 优化\\ 拦住：\emph{忽略几何}（够不到、要碰撞、抓不稳）};
+\node[font=\small, below=of layer3] (out) {可执行的、三层都验过的计划 $\to$ 交执行层};
+\draw[ln] (in)--(layer1); \draw[ln] (layer1)--node[right,font=\scriptsize]{通过} (layer2);
+\draw[ln] (layer2)--node[right,font=\scriptsize]{通过} (layer3); \draw[ln] (layer3)--(out);
+\end{tikzpicture}
+\caption{三层可行性校验：从便宜到昂贵排列，前层不过不做后层（早停）。}
+\label{fig:three-layer}
+\end{figure}
+
+\noindent 逐层说明它们的分工与不可替代性：
+
+\begin{itemize}
+  \item \textbf{第一层 语法校验}：最浅、最快、最便宜。用解析器/白名单查“格式对不对、用的东西存不存在”，专拦\emph{幻觉动作}和格式错。它拦不住“语法对但逻辑错”（\verb@pick(cup)@ 语法没问题，但此刻手不空），那是第二层的事。
+  \item \textbf{第二层 语义校验}：中等深度。用 VAL（PDDL 计划验证器）或让经典规划器试解，查“前提满不满足、目标可不可达、逻辑自不自洽”，专拦\emph{违反前提}和逻辑矛盾——这正是经典符号方法的主场。它拦不住“逻辑对但几何不可行”（符号上 \verb@place(cup, shelf)@ 前提都满足，但架子物理上够不到），那是第三层的事。
+  \item \textbf{第三层 几何/物理校验}：最深、最贵。用 IK 求解、碰撞检测、运动规划或轨迹优化，查“够不够得到、会不会碰、抓不抓得稳”，专拦\emph{忽略几何}——这是 LLM 和符号规划器\emph{共同的盲区}，必须靠运动层补。
+\end{itemize}
+
+\noindent 注意三层的\emph{顺序与早停}：从便宜到昂贵排列，前层不过就不必做后层（语法都错了，不必费力做几何检查）。这是工程效率的考量——把最贵的几何校验留到最后，只对“语法语义都过关”的候选才做。
+
+\begin{insight}[三层对应三种“可行”，重现符号-几何鸿沟]
+三层校验为什么必须\emph{分层}、而不能合成一个“大校验”？因为三层对应\textbf{三种不同的“可行”}——语法可行（格式合法）、语义可行（逻辑自洽、前提满足）、几何可行（物理够得到、走得通）。这三种“可行”用\emph{完全不同的工具}判定（解析器 vs 逻辑验证器 vs 几何引擎），且有\emph{严格的依赖顺序}（语法不对谈不上语义，语义不通谈不上几何）。这恰好重现了“符号 vs 几何鸿沟”——第一、二层在符号侧（离散、逻辑），第三层在几何侧（连续、物理）。\textbf{所以这套三层校验，本质是把 TAMP 全线的能力（符号规划验证 $+$ 几何可行性检查）组织成一道针对 LLM 输出的“质检流水线”。} 这就是为什么说“不学经典就用不好 LLM”：三层校验里有两层（语义、几何）直接就是经典 TAMP 的内容。
+\end{insight}
+
+\subsection{自纠错闭环与一条红线}
+\label{sec:verify-redline}
+
+校验拦下一个错误，不是终点——好的系统会把错误\emph{反馈给 LLM 让它自己改}，形成自纠错闭环。这是 generate-validate-repair 闭环（\cref{sec:modeler-loop}）的一般化，适用于全章所有 LLM 输出。两个工程要点：\textbf{反馈要具体可定位}（喂回“第 3 步 \verb@pick(cup)@ 前提 \verb@handempty@ 不满足，因为手里有 \verb@book@”，远胜于“计划有错”——校验器天然能产出这种精确诊断）；\textbf{要有重试上限}（LLM 可能反复改不对，必须设最多 N 轮，超了就\emph{降级}——回退保守策略、求助人类、或报告无解；无上限会死循环）。本章出现了三个层次的自纠错闭环，结构同构（生成 $\to$ 反馈 $\to$ 纠错），反馈源不同（\cref{tab:three-loops}）。
+
+\begin{table}[H]\centering\small
+\caption{本章三个结构同构的自纠错闭环}
+\label{tab:three-loops}
+\begin{tabular}{p{2.4cm}p{2.0cm}p{3.6cm}p{3.6cm}}
+\toprule
+闭环 & 在哪一层 & 反馈源 & 纠什么 \\
+\midrule
+执行闭环 & 执行时 & 物理环境（成功检测/场景） & 执行偏差（滑脱、位置不符） \\
+建模闭环 & 建模时 & 形式化校验器（VAL/解析器） & 模型错误（PDDL 写错） \\
+校验闭环 & 计划生成后 & 三层校验器 & 计划的幻觉（动作/前提/几何） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 本章反复出现一句话，这里立成一条不可逾越的红线：
+
+\begin{insight}[红线：别让 LLM 给自己把关]
+\textbf{可行性的最终把关，必须由确定性的、可信的工具完成，不能由 LLM（哪怕是另一个 LLM）完成。} 因为 LLM 的不可靠是\emph{系统性}的（续写而非推理）。用一个不可靠的东西去校验另一个不可靠的东西，错误不会被消除，只会被\emph{叠加或掩盖}：让同一个 LLM“检查自己的计划对不对”——它可能用同样的盲区“确认”自己的错误；让另一个 LLM 当裁判——它有自己的幻觉，可能“幻觉地”通过一个错误计划。LLM 可以做\emph{初筛、辅助、生成测试用例}，但\emph{最终的、决定“能不能执行”的那道关，必须是确定性工具}（PDDL 解析器、VAL、IK/碰撞检测）。\textbf{LLM 可以提议、可以生成、可以辅助、可以初筛，但“这个计划到底能不能执行”的最终裁决权，永远握在确定性工具手里。}
+\end{insight}
+
+\noindent 这条红线还能用最近的实证支撑。Mendez-Mendez 等人（2025）系统研究了“用 LLM 替代 TAMP 求解器组件”的效果（针对 PDDLStream）：他们用 $4950$ 个问题系统评测了 LLM 替代 PDDLStream 各组件的能力，结论是目前 LLM 替代仍明显更差，印证了“LLM 辅助而非替代”经典求解器内核\cite{mendezmendez2025llmtamp}。把它推广到校验：\textbf{LLM 替代经典求解器的内核尚且更差，让它替代校验器、给自己的输出最终把关，同样不可靠。}
+
+\subsection{一张总图：防-治-兜三道设防}
+\label{sec:verify-defense}
+
+把全章的防幻觉手段汇成三道（\cref{fig:defense}），对应“生成时-生成后-执行时”三个时机。一个工业级 LLM 规划系统，这三道通常都要有——防得越早越省力，但防不住的要治，治不住的（动态环境的运行时意外）还要靠执行层兜。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, node distance=5mm,
+  box/.style={draw, rounded corners, align=left, font=\footnotesize, inner sep=4pt, text width=10.4cm},
+  d1/.style={box, fill=main!8, draw=main!60!black},
+  d2/.style={box, fill=second!10, draw=second!60!black},
+  d3/.style={box, fill=third!10, draw=third!60!black},
+  ln/.style={->, thick, gray!55!black}]
+\node[d1] (defend) {\textbf{防}（生成时就限制，减少错误产生）\\ 技能库/API 白名单限输出空间；能力边界写进提示；约束解码按文法限制 token；LLM 只写模型不写计划（as-Modeler）};
+\node[d2, below=of defend] (cure) {\textbf{治}（生成后校验，拦住漏网错误）\\ 三层校验：语法 $\to$ 语义 $\to$ 几何；自纠错闭环把精确报错喂回迭代修复；红线：最终把关用确定性工具，不用 LLM};
+\node[d3, below=of cure] (catch) {\textbf{兜}（执行时再闭环，应对动态意外）\\ 执行监控 $+$ 成功检测；失败局部重试 / 全局重规划（交行为树）};
+\draw[ln] (defend)--node[right,font=\scriptsize]{残余错误漏过来} (cure);
+\draw[ln] (cure)--node[right,font=\scriptsize]{三层都过} (catch);
+\end{tikzpicture}
+\caption{防-治-兜三道设防：这套设防就是“增强而非取代”在系统工程上的完整落地。}
+\label{fig:defense}
+\end{figure}
+
+\begin{pitfall}[本节常见陷阱]
+\begin{itemize}
+  \item \textbf{用一道“大校验”代替分层。} 三层用不同工具、有依赖顺序，必须分层。合成一道会导致“该用解析器的地方用了几何引擎”“语法没过就去做昂贵几何检查”等错配与浪费。
+  \item \textbf{让 LLM 给自己把关（破红线）。} 最危险的错误。最终可行性判断必须用确定性工具。LLM 自检/LLM 当裁判都不可靠（错误叠加/掩盖）。这条红线没有例外。
+  \item \textbf{反馈太笼统，自纠错低效。} 喂回“有错”远不如喂回“第 3 步前提 \verb@handempty@ 不满足”。具体可定位的报错让修复有的放矢。
+  \item \textbf{自纠错不设上限。} LLM 可能反复改不对，无上限会死循环。必须设 N 轮上限 $+$ 超限降级。
+  \item \textbf{以为“防”做好了就不用“治”和“兜”。} 三道时机不同、缺一不可，尤其执行时的意外是任何事前手段都防不住的。
+  \item \textbf{把“目标走样”当成校验能全拦的。} 语法/语义校验能查“目标是否合法、可达”，但查不出“目标是否完整、正确地表达了用户意图”。目标走样部分要靠与用户确认（主动查询），而非纯自动校验——这是验证（verification）与确认（validation）的区别。
+\end{itemize}
+\end{pitfall}
+
+\begin{exercise}
+\begin{enumerate}
+  \item 把四种幻觉形态各对应到三层校验的哪一层能拦（或拦不住），制成一张“幻觉-关卡”对应表。哪一种幻觉三层校验都难完全拦住？为什么？
+  \item 解释三层校验为什么必须“从便宜到昂贵、前层不过不做后层”。给一个“语法就错了却先做了几何检查”的反例，说明它浪费在哪。
+  \item 用自己的话陈述红线，并解释为什么“让另一个 LLM 当裁判”也违反这条红线。
+  \item 把本章三个自纠错闭环列出来，指出它们的共同结构和各自的反馈源。为什么反馈源必须是确定性的？
+  \item 为一个“LLM 驱动的家庭整理机器人”设计“防-治-兜”三道设防各包含哪些具体措施（至少各两条），说明每道措施拦/兜哪类错误。
+\end{enumerate}
+\end{exercise}
+
+% ════════════════════════════════════════════════════════════════
+\section{与符号规划的前端关系：完整数据流}
+\label{sec:llm-dataflow}
+
+前面九节，每一节都在反复说同一句话的不同侧面——“LLM 补语言常识，经典方法守可行最优”。本节把这句话\emph{收口}：画出一条从“一句人话”到“机器人动起来”的\textbf{完整数据流}，让你看清 LLM 前端到底接在经典系统的哪个位置、和每一块怎么交接、反馈怎么回流。
+
+\subsection{一张总图：LLM 前端如何接入经典系统}
+\label{sec:dataflow-fig}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, node distance=6mm,
+  stg/.style={draw, rounded corners, align=left, font=\footnotesize, inner sep=4pt, text width=10.6cm},
+  llm/.style={stg, fill=second!10, draw=second!60!black},
+  sym/.style={stg, fill=main!8, draw=main!60!black},
+  geo/.style={stg, fill=third!8, draw=third!60!black},
+  exe/.style={stg, fill=main!12, draw=main!60!black},
+  ln/.style={->, thick, gray!55!black},
+  fb/.style={->, thick, red!55!black, dashed}]
+\node[font=\small] (in) {人：“帮我把厨房收拾干净”};
+\node[llm, below=of in] (front) {\textbf{LLM 前端}（本章）——补语言与常识，产出“待验证的候选”\\ ① 意图理解 $+$ 常识补全；② 感知接地（VLM）；\\ ③ 二选一范式产出候选（as-Planner / as-Modeler）；④ 三层校验，失败则自纠错};
+\node[sym, below=of front] (symbolic) {\textbf{经典符号规划}——守逻辑可行与最优\\ as-Modeler 路：在合法 PDDL 上完备搜索 $\to$ 保证合法/最优计划\\ as-Planner 路：验证 LLM 给的序列逻辑可行（VAL），不行则重排};
+\node[geo, below=of symbolic] (geom) {\textbf{几何 TAMP}（PDDLStream / LGP）——跨符号-几何鸿沟\\ 为每个动作求几何可行参数与轨迹；这正是第三层“几何校验”的承担者\\ 够不到 $\to$ 可行性回流上面重排};
+\node[exe, below=of geom] (exec) {\textbf{执行层}（行为树）——守运行时稳健\\ 编译成行为树稳健执行；抓滑了重试；方向性失败 $\to$ 重规划};
+\node[font=\footnotesize, below=of exec] (low) {运动层 $\to$ 控制层 $\to$ 硬件};
+\draw[ln] (in)--(front); \draw[ln] (front)--(symbolic);
+\draw[ln] (symbolic)--(geom); \draw[ln] (geom)--(exec); \draw[ln] (exec)--(low);
+\draw[fb] (geom.west) -- ++(-4mm,0) |- node[pos=0.25,left,font=\scriptsize]{几何不可行回流} (symbolic.west);
+\draw[fb] (exec.east) -- ++(5mm,0) |- node[pos=0.25,right,font=\scriptsize]{方向性失败回流} (symbolic.east);
+\end{tikzpicture}
+\caption{LLM 前端如何接入经典系统：每往下一层都有一道经典/确定性的关把守，反馈回路（红色虚线）是鲁棒的关键。}
+\label{fig:dataflow}
+\end{figure}
+
+\noindent 这张图把本章每一节都安放到系统里的精确位置：\cref{sec:llm-why} 在“意图理解”、\cref{sec:grounding} 在“感知接地”、\cref{sec:saycan,sec:closed-loop,sec:cap,sec:llm-modeler} 在“产出候选”、\cref{sec:llm-verify} 在“校验”与“几何承担者”、\cref{sec:closed-loop} 在“执行层闭环”。\textbf{全章不是十几个孤立的话题，而是这一条数据流上的不同工位。}
+
+\subsection{三个关键交接面}
+\label{sec:interfaces}
+
+数据流里最容易出问题的是\emph{交接面}（interface）。LLM 前端和经典系统之间有三个关键交接，逐一讲清“交什么、谁验、出错怎么回流”：
+
+\begin{itemize}
+  \item \textbf{交接面 A：LLM 前端 $\to$ 符号规划。} 交什么：as-Modeler 交 PDDL（domain/goal）、as-Planner 交动作序列。谁验：语法层（PDDL 解析器）$+$ 语义层（VAL）——\emph{在交接面上设关}。出错回流：校验失败 $\to$ 报错喂回 LLM 自纠错。这是 LLM 不可靠性被堵住的\emph{第一道}关键交接。
+  \item \textbf{交接面 B：符号规划 $\to$ 几何 TAMP。} 交什么：带先后的符号动作序列，每个动作的几何参数（抓取位姿、放置点）待定。谁验：几何层——采样器/优化确定“够不够得到、无碰撞否”。出错回流：几何不可行 $\to$ \emph{可行性信息流回符号层}触发重排（这正是几何 TAMP 的核心机制）。这是符号-几何鸿沟的搭桥处。
+  \item \textbf{交接面 C：几何计划 $\to$ 执行层。} 交什么：几何可行的参数化计划（动作 $+$ 轨迹）。谁验：执行期监控——行为树持续 tick，检查每步是否如预期。出错回流：抓滑/卡住等\emph{局部}失败 $\to$ 行为树 Fallback 局部纠错（重试、换力度）；门锁了/路线作废等\emph{方向性}失败 $\to$ 触发\emph{重规划}信号，回流到符号规划层（甚至 LLM 前端）重来。
+\end{itemize}
+
+\begin{insight}[校验沿数据流分布在每一个交接面]
+这三个交接面，本质是把三层校验\textbf{展开到了系统的三个不同层级}——交接面 A 承担语法 $+$ 语义校验（符号层把关）、交接面 B 承担几何校验（几何层把关）、交接面 C 承担执行期校验（运行时把关）。\textbf{校验不是集中在一个地方做完的，而是沿着数据流分布在每一个交接面上}——每往下走一层、信息变得更“实”一分，就用一道相应的关把住一类此前拦不住的错。这种“分布式、分层把关”的设计，确保 LLM 的不可靠性无论以哪类幻觉发作，都会在某个交接面被对应的确定性组件拦下，而不会一路漏到不可逆的物理执行。\textbf{“增强而非取代”不是一句态度，而是一套贯穿整个系统、层层设防的工程架构。}
+\end{insight}
+
+\begin{pitfall}[本节常见陷阱]
+\begin{itemize}
+  \item \textbf{把 LLM 前端和经典系统拼成“接缝漏风”的管道。} 若交接面上不设校验，LLM 的幻觉会直接漏到下游——拼错的 PDDL 让规划器崩、够不到的计划让执行出事。每个交接面\emph{必须有对应的关}。
+  \item \textbf{以为反馈是单向下行的。} 数据流的箭头不全向下——几何不可行要回流符号层重排、执行方向性失败要回流触发重规划。\emph{反馈回路才是系统鲁棒的关键}。
+  \item \textbf{把“几何校验”留在 LLM 前端做。} LLM 看不到几何，几何校验必须交给几何 TAMP 的几何引擎（交接面 B）。试图让 LLM 自己判断“够不够得到”，等于让瞎子量距离。
+  \item \textbf{以为有了 LLM 前端就不需要经典后端了。} 恰恰相反——LLM 前端的价值\emph{正建立在}可信后端之上。前端越强，越需要可靠的后端兜底。
+\end{itemize}
+\end{pitfall}
+
+\begin{exercise}
+\begin{enumerate}
+  \item 默画 \cref{fig:dataflow} 的总数据流，标出本章每一节各落在图的哪个工位。
+  \item 三个交接面（A/B/C）各“交什么、谁验、出错怎么回流”？说明它们如何把三层校验展开到系统的三个层级。
+  \item 假设执行到 \verb@wipe(table)@ 时发现抹布不在预想位置。判断这是“局部失败”还是“方向性失败”，该走交接面 C 的哪条回流？为什么？
+  \item 用本章 LLM 前端 $+$ 符号规划 $+$ 几何 TAMP $+$ 行为树，描述“把一句自然语言指令变成机器人稳健执行”的完整链路，并指出每段链路守的是哪一类可行性（逻辑/几何/运行时）。
+\end{enumerate}
+\end{exercise}
+
+% ════════════════════════════════════════════════════════════════
+\section{研究地图与选型}
+\label{sec:llm-map}
+
+学完前面的方法，本节给一张“地图 $+$ 指南针”：把 2022--2025 的关键工作按时间线和方法象限排好，给一棵落地选型决策树，再点出前沿与边界。本节不引入新方法，只帮你把全章建立的认知\emph{结构化、可检索化}。
+
+\subsection{时间线与方法象限}
+\label{sec:map-quadrant}
+
+把 2022--2025 的关键脉络读成三个阶段：\textbf{2022 是“接进来”}（SayCan / Inner Monologue 证明 LLM 能驱动真实机器人）；\textbf{2023 是“分两路 $+$ 被证伪”}（as-Planner 与 as-Modeler 各自成形，PlanBench 戳破“纯 LLM 会规划”的乐观，逼大家走混合路线——ReAct、Code-as-Policies、LLM+P、Guan、VoxPoser、Grounded Decoding、Xie 都在这一年）；\textbf{2024--2025 是“拉回可验证性 $+$ 工程化”}（Silver 的泛化规划、SayCanPay 的搜索、接口标准化）。这正是“扩大范围 vs 保持可验证性”这条历史钟摆在五年尺度上的微观重演。
+
+把本章所有方法放进一个二维象限——横轴“LLM 输出什么”（计划 $\leftrightarrow$ 模型），纵轴“可行性怎么保证”（事后兜底 $\leftrightarrow$ 经典求解保证）（\cref{fig:quadrant}）。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[>=Stealth, font=\footnotesize]
+\draw[->, thick, gray!60!black] (-4.2,0) -- (4.2,0) node[right, font=\scriptsize, align=center] {LLM 输出\\“计划”};
+\draw[->, thick, gray!60!black] (0,-2.8) -- (0,2.8) node[above, font=\scriptsize, align=center] {经典求解\\保证可行性};
+\node[font=\scriptsize, align=center] at (-3.4,-0.35) {LLM 输出\\“模型”};
+\node[font=\scriptsize, align=center] at (0,-2.55) {事后兜底\\保证可行性};
+\node[draw, rounded corners, fill=main!8, draw=main!60!black, align=center, inner sep=3pt, text width=3.4cm] at (-2.2,1.5)
+  {\textbf{LLM-as-Modeler}\\ LLM+P, Guan, Silver, Xie\\ 写 PDDL，交规划器\\ 可验证性最强，需领域可形式化};
+\node[draw, rounded corners, fill=second!10, draw=second!60!black, align=center, inner sep=3pt, text width=3.6cm] at (2.2,-1.5)
+  {\textbf{LLM-as-Planner}\\ SayCan, ReAct, Inner Monologue,\\ Code-as-Policies, VoxPoser\\ 直接出计划，靠 affordance/反馈/API 兜\\ 开放灵活，可验证性弱};
+\node[font=\scriptsize, text=red!60!black, align=center] at (2.2,1.5) {（空缺）\\ 无方法在此};
+\end{tikzpicture}
+\caption{方法象限的“对角线结构”：方法要么落左上（as-Modeler）、要么落右下（as-Planner），右上角空缺。}
+\label{fig:quadrant}
+\end{figure}
+
+\begin{insight}[对角线结构：原理性的权衡，非工程没做好]
+这张象限图的“对角线结构”——方法要么落左上、要么落右下，左上右下不可兼得——揭示了 LLM 任务规划最深的一条权衡：\textbf{LLM 越往“直接出计划”走（右），就越远离“经典求解的可验证保证”（下）；越想要可验证保证（上），就越得让 LLM 退回“只写模型”（左）。} 这不是工程没做好，而是原理性的——因为可验证保证来自“经典规划器在合法模型上的搜索”，而一旦让 LLM 把计划直接出了，就没有“在模型上搜索”这一步可供保证了。\textbf{做选型时先问“我能不能把领域形式化成 PDDL”——能，就往左上走（as-Modeler）；不能，就往右下走（as-Planner）。} 这比记住任何具体方法都重要。
+\end{insight}
+
+\subsection{落地选型决策树}
+\label{sec:map-decision}
+
+把象限的洞察做成一棵可操作的决策树，供工程师面对“已确定需要 LLM 前端”的真实任务走一遍：
+
+\begin{itemize}
+  \item \textbf{Q1：这个领域能形式化成 PDDL 吗？} 能且领域相对固定 $\to$ 走 LLM-as-Modeler（可验证性最强）：domain 已有/好写 $\to$ LLM 只翻译 goal（层次一）；domain 要新建 $\to$ LLM 生成 domain $+$ 校验闭环（层次二）；要反复解同类问题 $\to$ LLM 生成泛化程序（层次三）。无论哪层，求解都交经典规划器、几何交几何 TAMP。不能（领域太开放）$\to$ 走 LLM-as-Planner，进 Q2。
+  \item \textbf{Q2：任务的“计划”主要是什么形态？} 离散技能序列（固定技能库选）$\to$ SayCan 式（长程/怕走死再加 SayCanPay 的搜索）；含循环/条件/参数化 $\to$ Code-as-Policies；需稠密空间指引 $\to$ VoxPoser 式值图。
+  \item \textbf{Q3：执行中世界会变吗、会出意外吗？} 会（几乎所有真实任务）$\to$ 必加闭环（ReAct/Inner Monologue）$+$ 工业级执行监控（行为树）。不会（受控 demo）$\to$ 可省闭环（但不建议）。
+  \item \textbf{Q4（贯穿，无论选什么都必做）：} 接地（符号 $\to$ 感知，VLM）、三层校验（语法/语义/几何）、几何校验接几何 TAMP、意图攸关时留人确认（校验拦不住翻译走样）。
+\end{itemize}
+
+\noindent 三条使用须知：\textbf{须知一}——先问“能否形式化”（Q1），它是分水岭；别一上来就选具体方法。\textbf{须知二}——Q4 那四条是“无论如何都要做”的公共底座，漏掉任何一条系统就会在对应的地方栽。\textbf{须知三}——范式可叠加：一个系统完全可以 as-Modeler $+$ 闭环纠错 $+$ VLM 接地同时用。
+
+\subsection{研究前沿与边界}
+\label{sec:map-frontier}
+
+\textbf{前沿（值得投入的方向）}：\emph{意图对齐}（让 LLM 翻译的形式化目标忠实于用户真实意图，是三层校验解决不了的开放难题）；\emph{长程可靠性}（LLM 在长链任务上误差累积，如何在几十上百步保持可靠）；\emph{接口标准化与自动化规划工程}（让“LLM 写 PDDL $+$ 校验 $+$ 求解”工程化，逼近“自动化的规划工程师”，Silver 的泛化程序是雏形）；\emph{与底层策略的联合}（把 LLM 的高层规划与底层学习策略联合训练/推理，本章边界正在移动）。
+
+\textbf{边界（要清醒的地方）}：别信“纯 LLM 端到端、无任何校验”的方案（安全攸关部署必然出事，PlanBench 的 $\approx 3\%$ 是警钟）；别把本章方法和端到端 VLA 混为一谈（本章是符号/语言层的任务规划，VLA 是端到端动作生成）；别迷信 benchmark（很多“LLM 会规划”的乐观结论来自评测宽松或任务泄漏）；别忘了地基（这个方向跑得越快，越要经典 TAMP 的功底兜底）。
+
+\begin{pitfall}[本节常见陷阱]
+\begin{itemize}
+  \item \textbf{用“最新 $=$ 最好”选方法。} SayCan（2022）在“固定技能库选技能”上仍是最合适的，未必比 2024 的方法差。选方法按\emph{任务结构}（决策树），不按发表年份。
+  \item \textbf{以为象限有“右上角”的银弹方法。} “LLM 直接出计划”且“经典求解保证”是矛盾的。追求“既灵活又可验证的单一方法”是缘木求鱼——要么选边，要么靠两范式叠加。
+  \item \textbf{被“LLM 取代经典规划”的叙事带偏。} 全章反复证伪了它。前沿是“如何更好结合”，不是“取代”。被这个叙事带偏，会让你忽视地基、错判方向。
+\end{itemize}
+\end{pitfall}
+
+\begin{exercise}
+\begin{enumerate}
+  \item 把本章八个代表方法（SayCan/Inner Monologue/ReAct/Code-as-Policies/VoxPoser/LLM+P/Guan/Silver）各自填进 \cref{fig:quadrant}，并解释为什么没有方法落在右上角。
+  \item 走一遍选型决策树，为下面三个任务各选一条落地路线并说明 Q1--Q4 怎么答的：(a) 固定家庭场景、指令多变的整理机器人；(b) 全新实验室环境、要快速搭一个“听指令做操作”的 demo；(c) 仓库每天调度数百个补货任务、要可验证最优。
+  \item 论证“2023 年 PlanBench 的批判如何把整个领域从 as-Planner 独大推向 LLM $+$ 经典混合”。这体现了“扩大范围 vs 保持可验证性”钟摆的什么规律？
+  \item （开放）选一篇 2024--2025 的 LLM 机器人规划新论文，用本章框架分析：它属于哪个范式？落在象限哪个位置？它的可行性怎么保证、校验在哪几个交接面？
+\end{enumerate}
+\end{exercise}
+
+% ════════════════════════════════════════════════════════════════
+\section{本章常见误解汇总}
+\label{sec:llm-misconceptions}
+
+\begin{table}[H]\centering\small
+\caption{本章常见误解与正确理解}
+\label{tab:misconceptions}
+\begin{tabular}{p{4.0cm}p{8.2cm}}
+\toprule
+误解 & 正确理解 \\
+\midrule
+“LLM 这么强，迟早取代经典规划器” & 不会。LLM 不可验证是其概率续写本质决定的\emph{结构性属性}，不是“还不够强”。可验证性来自显式搜索，不能靠“更聪明”获得。两者互补、缺一不可。 \\
+“LLM 会幻觉，但提示词调好就能消除” & 提示工程能\emph{降低}幻觉频率，但不能从原理上\emph{消除}——幻觉和正常输出来自同一机制。必须靠外部确定性校验拦截。 \\
+“经典规划器过时了，学它只为应付本章” & 恰相反，经典规划器是 LLM 规划的\emph{安全网与验证后端}。as-Modeler 下游就是它；不懂 PDDL 连 LLM 写的对不对都判断不了。 \\
+“as-Planner 和 as-Modeler 是二选一的门派” & 不互斥、常叠加。可以 as-Modeler 让 LLM 写 PDDL goal，同时 as-Planner 的闭环在执行中纠错。范式是思路不是门派。 \\
+“as-Modeler 用了 LLM 写 PDDL 就没 LLM 风险了” & 风险没消失，只是被\emph{堵在“模型对不对”这一可被校验器逐条检查的位置}。LLM 写的 PDDL 同样可能错，靠校验器拦下。 \\
+“SayCan 的乘法只是加权的一种” & 乘法实现\emph{一票否决}（任一因子 $\approx 0$ 则乘积 $\approx 0$），加法允许\emph{互相补偿}。这是质的区别，乘法才编码了“做不到否决很想做”。 \\
+“有了闭环（ReAct）就不会失败了” & 闭环只给\emph{纠错机会}，不保证成功。反馈错、目标不可行、需全局重排时也无能为力。它降低失败率，不消除失败。 \\
+“程序形态比符号序列更高级，总该用” & 程序换来表达力、赔上可验证性。安全攸关、要可验证保证的任务，扁平可验证的符号计划反而更可取。 \\
+“LLM 自己能看到场景” & LLM 是纯文本模型，没有视觉。所有“看”的能力来自外接 VLM/检测器。场景必须先翻译成文字/坐标才能喂给 LLM。 \\
+“三层校验全过就万无一失” & 目标走样能骗过全部三层——它语法语义几何都合法，唯独偏离用户意图。校验做的是 verification，意图对齐需要 validation（人确认）。 \\
+“校验可以让另一个 LLM 来做” & 绝对不行。校验器和被校验者机制相同就\emph{共享盲区}、会自信地确认错误、不可复现。必须用确定性工具。 \\
+“LLM 很强大，所有机器人任务都该用它” & 不是。LLM 只补“语言/常识缺口”。目标已形式化、领域固定的任务不缺这两样，硬塞 LLM 只增风险与延迟。 \\
+“闭环就该闭得越紧越好、每步都回 LLM” & 不对。每次闭环都付出 LLM 推理延迟。真实系统是分层闭环——底层高频处理常规失败，只在异常时才上升到慢而贵的 LLM 层。 \\
+“让 LLM 写代码，直接 exec 就行” & 危险。直接 exec 把整个运行时暴露给 LLM 的幻觉。必须 API 白名单 $+$ 受限沙箱 $+$ 超时，把可执行空间事前圈死。 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\label{sec:llm-summary}
+\addcontentsline{toc}{section}{本章小结}
+
+本章只回答一个问题，但回答得很完整：\textbf{怎么让大语言模型在机器人任务规划里既出得上力、又不闯祸？} 答案链：
+
+\begin{itemize}
+  \item \textbf{为什么需要 LLM}（\cref{sec:llm-why}）：经典规划器有两个软肋——听不懂自然语言、缺常识；这正是 LLM 的两个强项。但 LLM 本质是\emph{续写引擎而非推理引擎}——它生成“统计上最像好计划的文字”，不保证可行、合法、最优（PlanBench 测得 $\approx 3\%$）。这道“像 vs 是”的鸿沟，是全章一切设计的起点。
+  \item \textbf{定位与两范式}（\cref{sec:llm-position}）：LLM 是“有常识但不严谨的前端”——\emph{负责生成，不负责把关}。两大范式：as-Planner（直接出计划，靠 affordance/反馈/API 兜底）与 as-Modeler（出 PDDL，交经典规划器求解，继承其完备/最优保证）。区别本质是“把 LLM 的不可靠性堵在哪一层”。
+  \item \textbf{SayCan}（\cref{sec:saycan}）：把“增强而非取代”第一次写成公式 \cref{eq:saycan}——\emph{乘法}让物理可行性对语言拥有一票否决权。谱系：Grounded Decoding（token 级）、SayCanPay（加 Pay $+$ 搜索）。
+  \item \textbf{闭环}（\cref{sec:closed-loop}）：开环假设世界顺从计划、脆弱；闭环承认世界会捣乱、持续校对。ReAct 让 Reasoning 使 Acting 可纠错；Inner Monologue 把环境反馈分成三类。
+  \item \textbf{Code-as-Policies}（\cref{sec:cap}）：计划即程序，把\emph{控制流}还给计划——表达力强，但可验证性弱（此消彼长）。
+  \item \textbf{LLM-as-Modeler}（\cref{sec:llm-modeler}）：让 LLM 退后一步只写模型、交经典规划器求解，把可验证性钟摆\emph{拉得最回}。三层次按形式化负担递增，灵魂是 generate-validate-repair 自纠错闭环，校验器必须确定性。
+  \item \textbf{VLM 接地}（\cref{sec:grounding}）：补符号接地这第三道缝——LLM 没有眼睛，靠 VLM 把符号连到像素与三维。VoxPoser 揭示通用配方“LLM 定义/塑造问题，经典数值方法求解问题”。
+  \item \textbf{提示工程}（\cref{sec:prompt}）：输出由上下文塑造。few-shot 锚定格式、CoT 提供推演空间、约束解码保证合法、上下文要喂准能力边界与世界状态。
+  \item \textbf{幻觉与三层校验}（\cref{sec:llm-verify}，硬核）：幻觉分四类，对应 LLM 四个盲区。三层校验（语法/语义/几何）沿“形式 $\to$ 逻辑 $\to$ 物理”层层过滤、廉价的关在前。红线：\emph{校验必须用确定性工具，绝不让 LLM 自查}。目标走样拦不住，需人确认（verification $\neq$ validation）。
+  \item \textbf{完整数据流}（\cref{sec:llm-dataflow}）：LLM 前端接在经典系统之上，三个交接面把三层校验展开到系统三个层级。反馈回路是鲁棒的关键。
+  \item \textbf{研究地图}（\cref{sec:llm-map}）：2022--2025 时间线、两范式象限（对角线结构、右上角空缺）、选型决策、前沿与边界。
+\end{itemize}
+
+\noindent \textbf{全章一句话}：\textbf{LLM 补语言与常识（前端、生成），经典方法守可行与最优（后端、把关），用三层校验 $+$ 自纠错闭环把两者焊在一起——这就是“增强而非取代”从理念到工程的完整落地。}
+
+\subsection*{术语速查表}
+
+\begin{table}[H]\centering\small
+\caption{核心术语速查}
+\label{tab:llm-glossary}
+\begin{tabular}{p{3.0cm}p{3.6cm}p{6.0cm}}
+\toprule
+术语 & 英文 & 一句话定义 \\
+\midrule
+自回归语言模型 & autoregressive LM & 给定上文、逐 token 续写下一个最可能词的模型；LLM 的本质 \\
+幻觉 & hallucination & LLM 生成看似合理但实则错误/虚构的内容；任务规划里分四类 \\
+LLM-as-Planner & — & 让 LLM 直接输出计划（序列/程序），可行性靠下游兜底的范式 \\
+LLM-as-Modeler & — & 让 LLM 只输出 PDDL 模型、交经典规划器求解的范式 \\
+可供性 & affordance & “当前状态下某技能能成功执行”的概率；SayCan 的 Can 分 \\
+SayCan 乘法 & — & $p_{\text{LLM}}\cdot p_{\text{afford}}$，让物理可行性对语言一票否决 \\
+开环 / 闭环 & open/closed-loop & 一次性规划不接反馈 / 每步接环境反馈并纠错 \\
+推理-行动交替 & ReAct & LLM 交替生成 Thought（推理）与 Action（行动）的范式 \\
+内心独白 & Inner Monologue & 用三类环境反馈（成功检测/被动描述/主动查询）支撑闭环 \\
+语言模型程序 & LMP & LLM 生成的、调用机器人 API 的程序，即策略本身 \\
+符号接地问题 & symbol grounding & 语言符号与物理感知（像素/坐标）之间无天然对应的问题 \\
+开放词汇检测 & open-vocab detection & 能按任意文本描述（含未训练类别）检测物体 \\
+三维值图 & 3D value map & VoxPoser 中 LLM 塑造的、指引运动优化的稠密值场 \\
+少样本 / 思维链 & few-shot / CoT & 提示里给示例锚定格式 / 让 LLM“想一步再答” \\
+约束解码 & constrained decoding & 生成时限制 token 选择，保证输出结构合法 \\
+三层可行性校验 & 3-layer feasibility check & 语法/语义/几何，沿“形式 $\to$ 逻辑 $\to$ 物理”层层过滤 \\
+计划验证器 & plan validator (VAL) & 确定性地逐步推演、检查计划是否满足前提的工具 \\
+自纠错闭环 & generate-validate-repair & 生成 $\to$ 校验 $\to$ 把精确报错喂回修复的迭代闭环 \\
+验证 vs 确认 & verification vs validation & 造得对不对（可自动）vs 造的是不是该造的（需人） \\
+交接面 & interface & LLM 前端与经典系统对接处，每处设一道相应校验关 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{知识点总表}
+
+\begin{table}[H]\centering\small
+\caption{本章知识点总表（含难度）}
+\label{tab:llm-knowledge}
+\begin{tabular}{clp{6.4cm}c}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 语言/常识缺口 & 经典规划器两软肋，LLM 两强项，互补 & $\star\star$ \\
+2 & 续写非推理 & LLM 是概率续写，“像计划”不等于“是计划”，幻觉之源 & $\star\star\star$ \\
+3 & LLM 定位 & 有常识不严谨的前端，负责生成不负责把关 & $\star\star\star$ \\
+4 & 两大范式 & as-Planner（直接出计划）vs as-Modeler（出 PDDL） & $\star\star\star$ \\
+5 & 钟摆回拉 & 既要 LLM 开放性、又要经典可验证性 & $\star\star$ \\
+6 & SayCan 乘法 & Say $\times$ Can，物理可行性一票否决语言 & $\star\star\star$ \\
+7 & SayCan 谱系 & Grounded Decoding（token 级）、SayCanPay（加搜索） & $\star\star\star$ \\
+8 & 开环 vs 闭环 & 闭环承认世界会偏离计划、持续校对 & $\star\star\star$ \\
+9 & ReAct / Inner Monologue & 推理-行动交替 / 三类环境反馈 & $\star\star\star$ \\
+10 & 计划即程序 & 控制流还给计划，表达力升、可验证性降 & $\star\star\star$ \\
+11 & LLM 写 PDDL & 三层次（goal/domain/program），交规划器求解 & $\star\star\star\star$ \\
+12 & 校验器反馈闭环 & generate-validate-repair，校验器须确定性 & $\star\star\star\star$ \\
+13 & 符号接地 & LLM 没眼睛，VLM 把符号连到像素/三维 & $\star\star\star$ \\
+14 & 提示工程 & few-shot/CoT/约束解码/喂准能力边界 & $\star\star\star$ \\
+15 & 幻觉四分类 & 幻觉动作/违反前提/忽略几何/目标走样 & $\star\star\star\star$ \\
+16 & 三层可行性校验 & 语法/语义/几何，廉价在前、层层过滤 & $\star\star\star\star$ \\
+17 & 校验红线 & 必须确定性工具，绝不让 LLM 自查 & $\star\star\star\star$ \\
+18 & verification vs validation & 目标走样拦不住，意图对齐需人确认 & $\star\star\star$ \\
+19 & 完整数据流 & LLM 前端接经典系统，三交接面分层把关 & $\star\star\star$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{本章与后续章节的关系}
+\label{sec:llm-relations}
+\addcontentsline{toc}{section}{本章与后续章节的关系}
+
+\begin{itemize}
+  \item \textbf{经典符号规划}（硬前置）：PDDL 与经典规划器，是本章 \cref{sec:llm-modeler}（LLM 写 PDDL）、\cref{sec:llm-verify}（语义校验）、\cref{sec:llm-dataflow}（符号规划后端）的地基。\emph{不懂它读不懂本章硬核。}
+  \item \textbf{几何 TAMP（PDDLStream / LGP）}（协同后端）：本章 \cref{sec:three-layer-check} 第三层“几何校验”、\cref{sec:interfaces} 交接面 B 的承担者。LLM 前端产出符号计划，几何 TAMP 为每个动作求几何可行参数、把可行性回流。VoxPoser“塑造优化问题”的思想与 LGP 的优化范式相通。
+  \item \textbf{行为树与执行监控}（协同执行层）：本章 \cref{sec:closed-loop}（闭环纠错思想）、\cref{sec:interfaces} 交接面 C 的工业级落地。LLM 的“大脑层纠错”由行为树在“执行层稳健机制”上实现（局部纠错 vs 重规划的分工）。
+  \item \textbf{多智能体协同}（\cref{ch:plan-safemarl}、\cref{ch:mr-consensus}）：本章只讲单台机器人。把一句“三台机器人收拾仓库”交给分配层分工、再各自走本章学的规划链路，属多机扩展——MARL 基础见 \cref{ch:plan-safemarl}，共识/分布式优化见 \cref{ch:mr-consensus}。
+  \item \textbf{端到端 VLA（具身智能线）}（边界划清）：本章只讲 LLM 作\emph{任务规划器}（符号/语言层）；端到端动作模型（VLA）归具身智能线。两者边界在 \cref{sec:llm-position-def}、\cref{sec:map-frontier} 反复澄清，且这条边界正在快速移动。
+\end{itemize}
+
+\section*{故障排查手册}
+\label{sec:llm-troubleshoot}
+\addcontentsline{toc}{section}{故障排查手册}
+
+LLM 任务规划的故障，大多源于“该校验的没校验、该接地的没接地、该回流的没回流”。\cref{tab:llm-troubleshoot} 按“症状 $\to$ 可能原因 $\to$ 排查步骤”组织。
+
+\begin{table}[H]\centering\small
+\caption{LLM 任务规划故障排查}
+\label{tab:llm-troubleshoot}
+\begin{tabular}{p{3.4cm}p{3.4cm}p{5.2cm}}
+\toprule
+症状 & 可能原因 & 排查步骤 \\
+\midrule
+计划里有机器人不存在的动作（如 \texttt{vacuum(floor)}） & 提示没给能力边界；没做语法层白名单校验 & 1. 检查提示是否显式列出技能/API/谓词白名单；2. 输出后加白名单匹配（语法层校验）；3. 仍漏则用约束解码限制输出空间 \\
+逻辑看着对、执行到某步发现前提不满足（如手没空就去抓） & 没做语义层校验；LLM 不做约束传播 & 1. 用 VAL 逐步推演状态（第二层）；2. 报错喂回 LLM 自纠错；3. 根治：改用 as-Modeler、交经典规划器搜索 \\
+逻辑对、真机一执行就够不到/碰撞 & 缺第三层几何校验；让 LLM 自己判断几何 & 1. 确认有没有接几何 TAMP 做几何校验（第三层、交接面 B）；2. 几何不可行要回流符号层重排，而非硬执行；3. 别让 LLM 判“够不够得到” \\
+LLM 写的 PDDL 反复语法报错、自纠错改了又错 & 反馈不具体；无重试上限；提示缺规范/示例 & 1. 把校验器\emph{精确报错}（哪行哪个谓词）喂回；2. 设重试上限 N、超限升级；3. 提示里加 few-shot PDDL 示例锚定格式 \\
+全部校验通过，但做出来不是用户想要的（如漏擦桌子） & 目标翻译走样；三层校验拦不住意图偏差 & 1. 用反向翻译让用户确认理解；2. 让 LLM 显式列出隐含假设；3. 关键目标人在环确认（validation，非 verification） \\
+出意外（抓滑/卡住），系统在原地反复重试、不换策略 & 混淆“局部纠错”与“重规划”；执行层闭环缺失 & 1. 区分局部失败（重试）与方向性失败（重规划信号回流上游）；2. 用行为树 Fallback $+$ 重规划触发实现分工；3. 设重试上限 \\
+反应迟钝、每个动作前卡顿几秒 & 闭环闭得太紧——每个低层步都回 LLM & 1. 常规局部失败下放底层高频处理；2. 改成分层闭环（底层快、LLM 层慢且只在异常时介入）；3. 评估是否真需要每步 LLM 反馈 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{排查总则.}\;遇到 LLM 规划出问题，先问三句话——“该校验的校验了吗？”（三层校验）“该接地的接地了吗？”（VLM 接地）“该回流的回流了吗？”（三个交接面）。本章绝大多数故障，都能定位到这三问之一。若三问都到位、问题仍在，那大概率是目标走样（意图偏差）——它需要的不是更强的校验，而是人的确认。
+\end{note}
+
+\section*{延伸阅读}
+\label{sec:llm-further}
+\addcontentsline{toc}{section}{延伸阅读}
+
+\begin{itemize}
+  \item \textbf{LLM-as-Planner 范式}：Ahn 等\cite{ahn2022saycan}（SayCan，“语言 $\times$ 可行性”乘法的开山之作）；Huang 等\cite{huang2022innermonologue}（Inner Monologue，三类环境反馈）；Yao 等\cite{yao2023react}（ReAct，推理-行动交替，通用 agent 基石）；Liang 等\cite{liang2023codeaspolicies}（Code as Policies，计划即程序）；Huang 等\cite{huang2023voxposer}（VoxPoser，稠密空间接地）。
+  \item \textbf{LLM-as-Modeler 范式}：Liu 等\cite{liu2023llmp}（LLM+P，“翻译成 PDDL 再交规划器”，核心边界的量化背书）；Guan 等\cite{guan2023worldmodel}（生成 domain $+$ 校验器反馈闭环）；Silver 等\cite{silver2024generalized}（泛化程序 $+$ 自动调试）；Xie 等\cite{xie2023translating}（自然语言 goal $\to$ PDDL）。
+  \item \textbf{批判与边界}：Valmeekam 等\cite{valmeekam2023planbench}（PlanBench，用严格基准戳破“LLM 会规划”的乐观，本章 $\approx 3\%$ 的来源）；Mendez-Mendez 等\cite{mendezmendez2025llmtamp}（LLM 替代 TAMP 求解器组件仍更差）。
+  \item \textbf{SayCan 谱系}：Huang 等\cite{huang2023grounded}（Grounded Decoding，把“语言 $\times$ 可行性”下沉到 token 级）；Hazra 等\cite{hazra2024saycanpay}（SayCanPay，加 Pay 因子 $+$ 启发式搜索）。
+  \item \textbf{提示工程基础}：Huang 等\cite{huang2022zeroshot}（语言模型零样本规划器）；Wei 等\cite{wei2022cot}（思维链）。
+  \item \textbf{多机协同}：RoCo\cite{mandi2024roco}（用 LLM 做多机器人辩证式协作，把本章单机前端推广到多机对话与协调）——与本章边界相接，可结合 \cref{ch:plan-safemarl} 阅读。
+  \item \textbf{前置必读}：经典任务与运动规划基础、PDDLStream——本章硬地基，不懂 PDDL 与符号-几何鸿沟，\cref{sec:llm-modeler,sec:llm-verify,sec:llm-dataflow} 几乎无法读懂。
+\end{itemize}

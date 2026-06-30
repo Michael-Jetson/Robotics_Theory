@@ -1,0 +1,1308 @@
+\chapter{全身控制 WBC}
+\label{ch:quad_wbc}
+
+% \cnum（字体无关带圈数字）已上提到 common/preamble.tex，全书统一，勿在此重定义。
+
+% ════════════════════════════════════════════════════════════════
+%  四足机器人运动控制部 —— 全身控制 WBC。
+%  与 ch:quad_mpc 形成 "MPC 算力 → WBC 转矩" 控制链闭环。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 一个 $7$ 自由度机械臂去完成一个 $6$ 维的抓取任务，关节速度 $\dot{\boldsymbol{q}}$ 给定时末端速度 $\dot{\boldsymbol{x}}$ 是否唯一？反过来，末端速度 $\dot{\boldsymbol{x}}$ 给定时关节速度 $\dot{\boldsymbol{q}}$ 是否唯一？这“不唯一”的那一维自由度叫什么，它在物理上对应什么运动？
+  \item 求解 $\boldsymbol{J}\dot{\boldsymbol{q}}=\dot{\boldsymbol{x}}$ 时，满足约束的 $\dot{\boldsymbol{q}}$ 有无穷多个。我们偏偏选了“关节速度模长最小”的那个，得到伪逆解 $\dot{\boldsymbol{q}}=\boldsymbol{J}^+\dot{\boldsymbol{x}}$。为什么这个特解恰好落在 $\boldsymbol{J}$ 的\emph{行空间}里？它与零空间是什么几何关系？
+  \item 机械臂端着望远镜观星，机身平移了几十米对成像\emph{几乎}无影响，但镜筒转了 $1^\circ$ 视野就天差地别。这件事告诉我们：当一个关节要同时服务“控姿态”与“控位置”两个任务、而自由度不够分时，应该\emph{优先}保证哪个？“优先级”这个概念是怎么从这里冒出来的？
+  \item 四足只有 $12$ 个关节，可机器人在世界里是一个有 $6$ 个自由度的浮动刚体。仅靠 $12$ 个关节角，能不能反解出机身在世界系的位姿？若不能，缺的自由度从哪来、怎么补？
+  \item \cref{ch:quad_mpc} 的 MPC 已经算出了最优足端力 $\boldsymbol{f}^{\mathrm{MPC}}$，电机却只能接收关节力矩 $\boldsymbol{\tau}$ 指令。这两者之间靠什么方程连接？为什么不能把 MPC 的力和某个独立算出来的关节加速度\emph{直接}一起代进动力学方程——会出什么问题？
+  \item 同样是“按优先级协调多个任务”，零空间投影（解析、快）、加权 QP（软优先级、能加不等式约束）、层级 QP（严格优先级 + 不等式、但慢）三者各有什么取舍？四足实时控制器会怎么折中？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}全身控制（WBC）要解决的问题——“一个关节服务多任务、一个任务用多关节”如何\emph{逼出}一个统筹全身自由度、按优先级协调多任务的框架，以及它在 MPC + WBC 控制链中的位置（\cref{sec:qw-motivation}）；
+  \item \textbf{辨析}两种 WBC 的“史前形态”——虚拟模型控制 VMC（直觉、免逆运动学、但无优先级无约束）与零力矩点 ZMP（动态稳定\emph{判据}而非控制器），并说清它们的边界（\cref{sec:qw-vmc-zmp}）；
+  \item \textbf{推导}WBC 的数学地基——冗余与零空间、Moore--Penrose 伪逆为\emph{最小范数解}的拉格朗日乘子法完整证明、阻尼最小二乘、零空间投影作为\emph{正交投影}的几何意义（\cref{sec:qw-nullspace}，地基引 \cref{ch:quad_kin}）；
+  \item \textbf{构造}带优先级的任务分层 WBC——双任务化简、多任务递推链、位置级/速度级/加速度级三种映射（\cref{sec:qw-priority}）；
+  \item \textbf{建立}浮动基座 WBC——$6$ 自由度虚拟关节与 $18$ 维广义坐标、浮动基座动力学标准方程、四子任务划分与各子任务雅可比、加速度级递推伪代码（\cref{sec:qw-floating}，引 \cref{ch:quad_kin}）；
+  \item \textbf{闭合}MPC$\to$WBC$\to$转矩控制链——理解 MPC 足端力与 WBC 加速度“口径不一致”的根源，用松弛变量构造带约束优化、化为标准 QP、反解关节力矩并加前馈 + PD（\cref{sec:qw-relax}，闭环 \cref{ch:quad_mpc}）；
+  \item \textbf{定位}NSP / WQP / HQP 三种方法谱系，理解本章方案（NSP 递推 + 末端松弛 QP）的取舍（\cref{sec:qw-history}），并掌握奇异点、优先级用尽、欧拉角误差变基等数值实务（\cref{sec:qw-practice}）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把 MPC 算出的质心层虚拟力，翻译成 $12$ 个关节此刻可执行的力矩}”的主线，核心数学工具是零空间投影。结构如下：
+
+\begin{center}
+\begin{forest} navtreeLR
+[{全身控制 WBC\\（四足运动控制）}
+  [{动机\\一关节多任务}
+    [{VMC/ZMP 史前形态}] ]
+  [{数学地基\\冗余/零空间/伪逆}
+    [{伪逆=最小范数解}] ]
+  [{任务分层\\双/多任务递推}
+    [{位置/速度/加速度级}] ]
+  [{浮动基座\\18 维+虚拟关节}
+    [{四子任务优先级}] ]
+  [{松弛 QP\\协调 MPC 与 WBC}
+    [{反解 $\boldsymbol{\tau}_j$}] ]
+]
+\end{forest}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:qw-motivation,sec:qw-vmc-zmp} 建立“为什么要 WBC、它比朴素方法强在哪”的立论；\cref{sec:qw-nullspace} 是全章数学心脏（零空间、伪逆、正交投影），写任何 WBC 代码前必须吃透；\cref{sec:qw-priority} 把单任务地基堆成带优先级的递推；\cref{sec:qw-floating} 把它落到四足浮动基座的具体任务划分；\cref{sec:qw-relax} 用松弛 QP 把 WBC 与上游 MPC 粘合、闭合整条控制链；\cref{sec:qw-history,sec:qw-practice} 是方法谱系与数值实务，可在跑通仿真后回看。
+
+\subsection*{前置知识桥接}
+本章把前几部与本部前几章的工具直接用作地基：
+\begin{itemize}
+  \item \cref{ch:quad_kin}（浮动基座建模与运动学）给出本章反复使用的\emph{雅可比矩阵} $\boldsymbol{J}(\boldsymbol{q})$、足端运动学映射、奇异性的几何含义。本章的零空间、伪逆都建在这条 $\dot{\boldsymbol{x}}=\boldsymbol{J}\dot{\boldsymbol{q}}$ 映射上；
+  \item \cref{ch:matderiv}（矩阵求导/雅可比）给出向量对向量求导、二次型梯度——伪逆最小范数证明里的 $\nabla_{\dot{\boldsymbol{q}}}(\tfrac12\dot{\boldsymbol{q}}^\top\dot{\boldsymbol{q}})=\dot{\boldsymbol{q}}$ 等结论直接复用；
+  \item \cref{ch:nlopt}（非线性优化/QP）给出带等式/不等式约束的二次规划标准形与求解理论。本章 \cref{sec:qw-relax} 的松弛优化只是这套理论在“协调 MPC 与 WBC”上的具体落地；
+  \item \cref{ch:quad_mpc}（单刚体 MPC）是本章的\emph{上游}：它在质心层给出最优足端力 $\boldsymbol{f}^{\mathrm{MPC}}$ 与机身指令。本章是\emph{下游}：把这些质心层指令翻译成关节力矩。二者构成 MPC + WBC 双层控制链；
+  \item \cref{ch:lie}（李群与李代数）给出旋转矩阵微分 $\dot{\mathbf{R}}=\boldsymbol{\omega}^\wedge\mathbf{R}$ 与反对称算子 $(\cdot)^\wedge$，本章姿态误差的“变基”与机身转动任务雅可比用到。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会停在“MPC 算出了力，机器人就能动”的错觉里，而\emph{无法}解释一个具体而关键的鸿沟：MPC 给的是\emph{质心层}的 $12$ 维足端力，电机要的是\emph{关节层}的力矩，而且摆动腿、机身姿态、机身高度这些 MPC 不直接管的任务还都得有人协调——这正是 WBC 存在的理由；
+  \item 在读 MIT WBIC、宇树 \texttt{unitree\_guide} 等开源代码时，你会看到一段反复出现的“零空间投影递推 + 末端一个小 QP + 逆动力学反解力矩”的流程，却不知每一块从哪条数学/物理来、优先级为什么这么排——只能照抄而不会调参、不会排错。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导与练习） & 5--7 小时 & 首次系统学习、要做四足 WBC \\
+速读（跳过冗长递推推导） & 2 小时 & 有冗余机器人基础、想对齐 WBC 记号 \\
+速查（只看小结的符号表 + 公式速查表） & 15 分钟 & 写控制器代码时回来查公式/维度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+雅可比记 $\boldsymbol{J}(\boldsymbol{q})\in\mathbb{R}^{M\times N_j}$（行 $=$ 工作空间维 $M$，列 $=$ 关节数 $N_j$，\cref{ch:quad_kin}）；其右伪逆记 $\boldsymbol{J}^+$，零空间投影矩阵记 $\boldsymbol{N}$。
+关节变量 $\boldsymbol{q}$、工作空间位姿 $\boldsymbol{x}=f(\boldsymbol{q})$。
+\textbf{记号统一}：单位阵记 $\mathbf{I}$、关节数记 $N_j$（浮动基段恒为 $18$）。零空间投影矩阵记 $\boldsymbol{N}$（与单位阵 $\mathbf{I}$ 字形不同，不会混淆）。
+\textbf{浮动基广义坐标} $\boldsymbol{q}=[\boldsymbol{q}_b^\top,\ \boldsymbol{q}_j^\top]^\top$，$\boldsymbol{q}_b=[\boldsymbol{\Theta}^\top,\ \boldsymbol{p}_{com}^\top]^\top$（机身欧拉角 $+$ 质心位置），$\boldsymbol{q}_j\in\mathbb{R}^{12}$ 为 $12$ 个实体关节。
+\textbf{广义速度/加速度 $\dot{\boldsymbol{q}},\ddot{\boldsymbol{q}}$ 是\emph{重定义}}（角速度 $+$ 本体平动速度 $+$ 关节速度），\emph{并非} $\boldsymbol{q}$ 的逐元素时间微分——这是浮动基 WBC 第一大陷阱，见 \cref{note:qw-gen-vel}。
+\textbf{接触力} ${}^{\mathcal{O}}\boldsymbol{f}_c$（世界系），与 \cref{ch:quad_mpc} 的足端力 $\boldsymbol{f}_i$ 同物。
+世界（惯性）系 $\mathcal{O}$、本体系 $\mathcal{B}$；旋转矩阵 ${}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}$。
+本章理论主线见\cite{yu2021quadruped}，零空间化简见 Maciejewski 与 Klein\cite{maciejewski1985obstacle}，控制链对侧见 \cref{ch:quad_mpc} 与 Di Carlo 等\cite{dicarlo2018cheetah}。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{动机：为什么需要全身控制}
+\label{sec:qw-motivation}
+
+\paragraph{两个“多对多”逼出全身协调。}
+四足机器人是一个高度耦合的系统：一条腿三个关节、四条腿共 $12$ 个关节，再加上一个在世界里自由漂浮的躯干（$6$ 个自由度）。控制它时面对两个“多对多”的事实——
+\begin{itemize}
+  \item \textbf{一个任务用多关节}：要让机身保持水平，单靠某一条腿是不够的，需要四条腿（实为支撑腿）协同发力。
+  \item \textbf{一个关节服务多任务}：同一个髋关节电机，既要参与“维持机身姿态”，又要参与“维持机身高度”，还可能要参与“摆动腿轨迹跟随”。
+\end{itemize}
+当任务数量、维度与可用自由度不再一一对应时，朴素的“一个误差配一个 PD”就失效了：到底让哪个关节优先服务哪个任务？冲突时谁让步？这正是\textbf{全身控制}（Whole-Body Control, WBC）要回答的——它把整个机器人的全部自由度（含浮动基）统一放进一个框架，按\emph{优先级}协调多个任务，让高优先级任务被严格满足、低优先级任务在“不破坏高优先级”的前提下尽力完成\cite{yu2021quadruped}。
+
+\paragraph{控制链定位：MPC 算质心力，WBC 转关节力矩。}
+\cref{ch:quad_mpc} 已经建立了上层：单刚体 MPC 在\emph{较长的未来时域}上、用\emph{简化的质心模型}求出最优的足端反力序列 $\boldsymbol{f}^{\mathrm{MPC}}$（侧重“未来一段时间怎么走”）。但 MPC 这一层有三件事\emph{管不了}：(i) 它把整机当一个刚体，不管每条腿的三个关节如何分配这力；(ii) 它不管摆动腿（腾空足）该走什么轨迹；(iii) 它把所有跟踪目标揉进一个加权代价里，不保证严格的任务优先级。于是需要\emph{下层} WBC：用\emph{完整的多刚体模型}，在每个高频控制周期把“质心层指令”翻译成 $12$ 个关节\emph{此刻可执行}的力矩（侧重“此刻这一拍各关节该出多少力”）。
+
+\begin{insight}[WBC 的一句话定义——全章主线锚点]\label{ins:qw-wbc-def}
+把全章浓缩成一句话：\textbf{在尽可能保证工作空间任务 $\dot{\boldsymbol{x}}$ 完成的前提下，关节还可以按一个任意向量 $\dot{\boldsymbol{q}}_{\forall}$ 运动，以实现其他额外任务（如关节避障、次要姿态）。}这种“充分利用关节冗余、同时兼顾多任务”的方法就是 WBC。本章一切公式都是这句话的展开：主任务用伪逆解（特解），剩余冗余用零空间投影“免费搭车”地塞进次要任务（齐次解）。请把这句话记在心里，后面每一个递推都是它的复用。
+\end{insight}
+
+\begin{insight}[MPC 与 WBC 的分工——预测层 vs 瞬时层]\label{ins:qw-mpc-wbc}
+\cref{ch:quad_mpc} 的 \cref{ins:wbc-no-predict} 从 MPC 一侧说过“WBC 无预测性”；从 WBC 一侧补上对偶的一句：\textbf{WBC 无预测、但它\emph{完整}——它用整机多刚体动力学，在当下这一拍把多个任务按优先级精确分配到每个关节}。MPC 看得远但模型粗（单刚体），WBC 看得准但只看当下（瞬时）。二者恰好互补：MPC 负责“战略”（未来的力分配），WBC 负责“战术”（此刻的关节执行）。本章 \cref{sec:qw-relax} 的松弛 QP 正是这两层的“粘合剂”。
+\end{insight}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=6mm,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, minimum height=1.1cm, minimum width=2.6cm}]
+  \node[blk, fill=second!8, draw=second!60!black] (est) {状态估计器\\\scriptsize $\boldsymbol{x}(0)$（\cref{ch:quad_est}）};
+  \node[blk, right=of est, fill=main!10, draw=main!60!black] (mpc) {上层 MPC\\\scriptsize 单刚体、长时域\\\scriptsize 出 $\boldsymbol{f}^{\mathrm{MPC}}$};
+  \node[blk, right=of mpc, fill=third!10, draw=third!60!black] (wbc) {下层 WBC\\\scriptsize 多刚体、瞬时\\\scriptsize 出 $\ddot{\boldsymbol{q}}^{cmd}$};
+  \node[blk, right=of wbc, fill=main!8, draw=main!60!black] (qp) {松弛 QP\\\scriptsize 协调 $\boldsymbol{f}^{\mathrm{MPC}}\!/\ddot{\boldsymbol{q}}^{cmd}$};
+  \node[blk, below=8mm of qp, fill=gray!10] (tau) {逆动力学\\\scriptsize 反解 $\boldsymbol{\tau}_j$ + PD};
+  \node[blk, left=of tau, fill=gray!10] (motor) {电机\\\scriptsize $\boldsymbol{\tau}^{cmd}$};
+  \draw[->, thick] (est)--(mpc);
+  \draw[->, thick] (mpc)--node[above,font=\scriptsize]{$\boldsymbol{f}^{\mathrm{MPC}}$}(wbc);
+  \draw[->, thick] (wbc)--(qp);
+  \draw[->, thick] (qp)--(tau);
+  \draw[->, thick] (tau)--node[above,font=\scriptsize]{$\boldsymbol{\tau}_j,\boldsymbol{f}_c$}(motor);
+  \draw[->, thick, dashed, gray] (motor.south) to[out=-90,in=-90] node[midway,below,font=\scriptsize]{机器人运动反馈} (est.south);
+\end{tikzpicture}
+\caption{MPC + WBC 双层控制链。上层 MPC（\cref{ch:quad_mpc}）用单刚体模型、在长时域上算出足端虚拟力 $\boldsymbol{f}^{\mathrm{MPC}}$；下层 WBC（本章）用多刚体模型、在瞬时按优先级算出广义加速度指令 $\ddot{\boldsymbol{q}}^{cmd}$；末端松弛 QP 协调两者，逆动力学反解关节力矩 $\boldsymbol{\tau}_j$，加 PD 成最终指令 $\boldsymbol{\tau}^{cmd}$ 发给电机。本章主线即虚线右半部分。}
+\label{fig:qw-control-chain}
+\end{figure}
+
+\begin{practice}
+\begin{enumerate}
+  \item 列举三个“一个关节服务多任务”的具体例子（在四足小跑时），并指出当它们冲突时你直觉上会让谁优先。
+  \item 用 \cref{ins:qw-mpc-wbc} 的语言解释：为什么不能“只要 MPC、不要 WBC”，也不能“只要 WBC、不要 MPC”？各自缺了什么？
+  \item （概念）\cref{fig:qw-control-chain} 中状态估计器把机器人运动反馈回 MPC 与 WBC。若估计器有偏（机身位姿估偏），这条链会怎样恶化？（提示：见 \cref{sec:qw-practice}。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{反面教材：VMC 与 ZMP —— WBC 的史前形态}
+\label{sec:qw-vmc-zmp}
+
+在进入 WBC 的严格数学之前，先看两种更朴素、历史更早的方案。它们直观、实用，但各自有明确的边界——正是这些边界把 WBC“逼”了出来。
+
+\subsection{虚拟模型控制 VMC：用想象的机械元件设计控制律}
+\label{subsec:qw-vmc}
+
+\paragraph{核心思想。}
+虚拟模型控制（Virtual Model Control, VMC）是一种\textbf{直觉控制方法}：在机器人内部作用点之间、或作用点与环境之间，挂上想象中的\emph{虚拟机械元件}（弹簧、阻尼器、轴承等），由这些元件产生\emph{虚拟力}来驱动机器人运动\cite{yu2021quadruped}。虚拟力不是真实的执行力，需要通过雅可比矩阵映射到执行机构，得到期望关节力矩。
+
+\begin{insight}[VMC 为何直观——把控制律设计降维成“想象一组机械元件”]\label{ins:qw-vmc-intuit}
+VMC 流行的根本原因在于：\textbf{用户可以直观地设计虚拟力，而不需要深入处理底层动态方程。}举个“敲门”的例子——“敲门”这个任务很难用一组干净的微分方程描述，但用 VMC 只需在手上附加一个虚拟弹簧 $+$ 阻尼 $+$ 给定动能的虚拟质量：手在这组虚拟元件的作用下自然地移动、撞击门板、回弹。设计者操心的是“挂什么元件、给多大刚度”，而不是“写出什么方程”。这正是 VMC 在早期腿式机器人（如 MIT Leg Lab）流行的原因，也是 WBC“把任务表达成\emph{期望力/期望加速度}”这一思想的直觉前身。换言之：\textbf{VMC 是 WBC 的史前形态}——它已经有了“任务即期望力”的胚胎，只是还没有优先级、没有约束、没有冗余协调。
+\end{insight}
+
+\paragraph{虚拟力到关节力矩的映射。}
+设由正运动学（\cref{ch:quad_kin}）建立的空间映射为
+\begin{equation}
+  \boldsymbol{x}=f(\boldsymbol{q}),\qquad
+  \boldsymbol{x}=[x_1,\dots,x_m]^\top,\quad
+  \boldsymbol{q}=[q_1,\dots,q_n]^\top,
+  \label{eq:qw-vmc-fk}
+\end{equation}
+其中 $\boldsymbol{x}$ 是机器人某作用点相对地面系的 $m$ 维位姿，$\boldsymbol{q}$ 为 $n$ 个关节变量。对 \cref{eq:qw-vmc-fk} 求时间导数得一阶微分运动学（即雅可比，\cref{ch:quad_kin}）$\dot{\boldsymbol{x}}=\boldsymbol{J}(\boldsymbol{q})\dot{\boldsymbol{q}}$。由\emph{虚功原理}的静力学对偶（关节力矩做的虚功 $=$ 末端力做的虚功），虚拟力 $\boldsymbol{F}_{\mathrm{virtual}}$ 经雅可比转置映射为期望关节力矩\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{\tau}=\boldsymbol{J}^\top(\boldsymbol{q})\,\boldsymbol{F}_{\mathrm{virtual}}.
+  \label{eq:qw-vmc-jt}
+\end{equation}
+
+\begin{insight}[VMC 应用的两个关键——构造元件 + 选对雅可比]\label{ins:qw-vmc-keys}
+VMC 落地有两个要点：\textbf{一是}在每个需控制的自由度上构造\emph{恰当的}虚拟构件，产生合适的虚拟力（这是“调参”所在）；\textbf{二是}在不同相位状态下使用\emph{相应的}雅可比来计算期望关节力矩。这里要特别强调：\textbf{雅可比 $\boldsymbol{J}(\boldsymbol{q})$ 随关节角度变化，不是定值}——支撑相与摆动相的雅可比不同、同一相位内不同构型的雅可比也不同。把 $\boldsymbol{J}$ 当常数是初学者常犯的错（\cref{ch:quad_kin}）。
+\end{insight}
+
+\begin{example}[二自由度单腿 VMC 数值例]\label{exam:qw-vmc-2dof}
+考虑一条平面二连杆腿（\cref{fig:qw-2dof-leg}）：髋关节 $A$、膝关节 $B$ 为两个转动副，连杆长 $L_1,L_2$，关节角 $q_1,q_2$（自竖直向下量起）。足端 $C$ 在腿基坐标系下的位置为
+\[
+  \boldsymbol{x}_C=\begin{bmatrix}x_C\\ z_C\end{bmatrix}
+  =\begin{bmatrix} L_1\sin q_1+L_2\sin(q_1+q_2)\\ -L_1\cos q_1-L_2\cos(q_1+q_2)\end{bmatrix}.
+\]
+对 $\boldsymbol{q}=[q_1,q_2]^\top$ 求偏导得雅可比
+\[
+  \boldsymbol{J}=\begin{bmatrix}
+  L_1\cos q_1+L_2\cos(q_1+q_2) & L_2\cos(q_1+q_2)\\
+  L_1\sin q_1+L_2\sin(q_1+q_2) & L_2\sin(q_1+q_2)
+  \end{bmatrix}.
+\]
+设想给足端挂一个虚拟弹簧把它拉向期望落点 $\boldsymbol{x}_C^d$、刚度 $k$、阻尼 $b$，则虚拟力
+\[
+  \boldsymbol{F}_{\mathrm{virtual}}=k(\boldsymbol{x}_C^d-\boldsymbol{x}_C)-b\,\dot{\boldsymbol{x}}_C.
+\]
+取数值 $L_1=L_2=0.2\,\mathrm{m}$、$q_1=30^\circ,q_2=30^\circ$（故 $q_1+q_2=60^\circ$）、$k=300\,\mathrm{N/m}$、足端误差 $\boldsymbol{x}_C^d-\boldsymbol{x}_C=[0.01,\,0.02]^\top\,\mathrm{m}$、初速为零，则 $\boldsymbol{F}_{\mathrm{virtual}}=[3,\,6]^\top\,\mathrm{N}$。代入数值雅可比（$L_1\cos30^\circ=0.173$、$L_2\cos60^\circ=0.1$、$L_1\sin30^\circ=0.1$、$L_2\sin60^\circ=0.173$）
+\[
+  \boldsymbol{J}=\begin{bmatrix}0.173+0.1 & 0.1\\ 0.1+0.173 & 0.173\end{bmatrix}
+  =\begin{bmatrix}0.273 & 0.1\\ 0.273 & 0.173\end{bmatrix},
+\]
+由 \cref{eq:qw-vmc-jt} 得关节力矩
+\[
+  \boldsymbol{\tau}=\boldsymbol{J}^\top\boldsymbol{F}_{\mathrm{virtual}}
+  =\begin{bmatrix}0.273 & 0.273\\ 0.1 & 0.173\end{bmatrix}\begin{bmatrix}3\\6\end{bmatrix}
+  =\begin{bmatrix}2.46\\ 1.34\end{bmatrix}\,\mathrm{N\cdot m}.
+\]
+这就是 VMC 的全部：先想象一个把足端拉向目标的弹簧，再用 $\boldsymbol{J}^\top$ 把虚拟力翻成两关节力矩。直观、免逆运动学；但注意它\emph{没有}处理“若两个虚拟力冲突谁优先”“关节力矩是否超限”这类问题。
+\end{example}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=2.0,>=Stealth]
+  \coordinate (A) at (0,0);
+  \coordinate (B) at (0.173,-0.1);  % q1=30 from vertical-down, L1=0.2 -> (0.1,-0.173)? use schematic
+  \coordinate (C) at (0.30,-0.20);
+  \draw[gray] (-0.25,0)--(0.45,0);
+  \foreach \x in {-0.2,-0.1,...,0.4} \draw[gray] (\x,0)--(\x-0.04,-0.04);
+  \draw[main!60!black, very thick] (A)--(B);
+  \draw[main!60!black, very thick] (B)--(C);
+  \fill (A) circle (1.2pt) node[above left]{\scriptsize $A$（髋 $q_1$）};
+  \fill (B) circle (1.2pt) node[right]{\scriptsize $B$（膝 $q_2$）};
+  \fill (C) circle (1.2pt) node[below right]{\scriptsize $C$（足端）};
+  \node[main!60!black] at (0.04,-0.06) {\scriptsize $L_1$};
+  \node[main!60!black] at (0.27,-0.13) {\scriptsize $L_2$};
+  % virtual spring
+  \draw[third, decorate, decoration={coil, segment length=2pt, amplitude=1.5pt}] (C)--(0.36,-0.13);
+  \draw[third,->] (C)--(0.345,-0.145) node[right]{\scriptsize $\boldsymbol{F}_{\mathrm{virtual}}$};
+  \fill[third] (0.37,-0.12) circle (0.8pt) node[right]{\scriptsize $\boldsymbol{x}_C^d$};
+\end{tikzpicture}
+\caption{二自由度单腿 VMC（\cref{exam:qw-vmc-2dof}）：足端 $C$ 挂一个拉向期望落点 $\boldsymbol{x}_C^d$ 的虚拟弹簧—阻尼，产生虚拟力 $\boldsymbol{F}_{\mathrm{virtual}}$，再由 $\boldsymbol{\tau}=\boldsymbol{J}^\top\boldsymbol{F}_{\mathrm{virtual}}$ 映射成髋、膝两关节力矩。}
+\label{fig:qw-2dof-leg}
+\end{figure}
+
+\subsection{零力矩点 ZMP：动态稳定性判据}
+\label{subsec:qw-zmp}
+
+\paragraph{定义。}
+零力矩点（Zero Moment Point, ZMP）是地面上的一点：在该点处，机器人重力与惯性力所产生的合力矩的\emph{水平分量为零}\cite{yu2021quadruped}。判据是：若机器人运动过程中 ZMP 始终落在\textbf{支撑多边形}（所有足底与地面接触点构成的凸多边形）内部，则可保证运动过程动态稳定；ZMP 一旦越界，机器人将绕支撑多边形边界倾倒。
+
+\begin{insight}[ZMP 相对 CoG 静态判据的进步]\label{ins:qw-zmp}
+ZMP 的历史意义在于：传统的静态稳定判据（重心投影法 / CoG 判据）只要求\emph{重心}在支撑多边形内——这只在准静态（慢速）运动下有效。ZMP 则\textbf{充分考虑了机器人重力\emph{与惯性力}合力的影响}：运动越快、加速度越大，惯性力越显著，ZMP 与重心投影的偏离也越大。因此 ZMP 是面向\emph{动态}运动的判据，是从“站得稳”走向“走得稳”的关键一步。但要强调：\textbf{ZMP 是一个稳定性\emph{判据}，不是一个控制\emph{器}}——它告诉你“当前状态稳不稳”，却不告诉你“该给每个关节多少力矩去维持稳定”。
+\end{insight}
+
+\begin{pitfall}[误区：把 VMC/ZMP 当成可以替代 WBC 的完整方案]
+VMC 与 ZMP 都是优秀的早期工具，但都有 WBC 才能弥补的缺口：
+\begin{itemize}
+  \item \textbf{VMC 无优先级、无约束、无冗余协调}：多个虚拟力冲突时它只是简单叠加（$\boldsymbol{\tau}=\sum_k\boldsymbol{J}_k^\top\boldsymbol{F}_k$），不保证哪个任务被优先满足；也不能直接施加摩擦锥、力矩上限这类不等式约束。
+  \item \textbf{ZMP 是判据不是控制器}：它只回答“稳不稳”，不解算关节力矩；且其经典形式建在 LIPM 等简化假设上，对带显著姿态变化的高动态步态保守。
+\end{itemize}
+正确定位：把 VMC 看作“任务即期望力”思想的雏形、把 ZMP 看作“动态稳定性度量”的雏形——它们的\emph{局限}（无优先级、无约束优化）恰恰是下文 WBC 要系统解决的。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{数学地基：冗余、零空间与伪逆}
+\label{sec:qw-nullspace}
+
+WBC 的全部数学都建在一件事上：当机器人\emph{冗余}时，满足主任务的关节运动有无穷多个，它们差在零空间里——而我们可以用这“多出来”的自由度去做次要任务。本节从冗余讲起，给出伪逆的完整证明与几何意义。本节是全章心脏。
+
+\subsection{正/逆速度映射与冗余}
+\label{subsec:qw-redundancy}
+
+由正运动学 $\boldsymbol{x}=f(\boldsymbol{q})$ 求导得速度级映射\cite{yu2021quadruped}：
+\begin{equation}
+  \dot{\boldsymbol{x}}=\boldsymbol{J}(\boldsymbol{q})\,\dot{\boldsymbol{q}},\qquad
+  \boldsymbol{J}(\boldsymbol{q})\in\mathbb{R}^{M\times N_j},
+  \label{eq:qw-jacobian}
+\end{equation}
+其中 $M$ 为工作空间任务维、$N_j$ 为关节数，$\boldsymbol{J}$ 是 $\boldsymbol{q}$ 的函数（\cref{ins:qw-vmc-keys}）。
+
+\begin{insight}[正向唯一、逆向不唯一——冗余的起点]\label{ins:qw-fwd-inv}
+冗余的本质起点是：\textbf{从关节到工作空间的正向速度映射很简单且唯一}——明确的 $\dot{\boldsymbol{q}}$ 必然对应明确且唯一的 $\dot{\boldsymbol{x}}=\boldsymbol{J}\dot{\boldsymbol{q}}$。\textbf{但反过来不一定}：给定 $\dot{\boldsymbol{x}}$，满足 \cref{eq:qw-jacobian} 的 $\dot{\boldsymbol{q}}$ 可能有无穷多个。记 $R(\boldsymbol{J})$ 为可达工作空间速度集合（$\mathbb{R}^M$ 的子空间）。当机器人\emph{冗余}——自由度 $N_j>$ 任务维 $M$（典型如 $7$ 自由度臂做 $6$ 维抓取，或四足 $18$ 维浮动基做 $3$ 维足端任务）——就出现“逆向不唯一”。\textbf{正是这“不唯一”给了我们在不破坏主任务的前提下做次要任务的空间}，这是 WBC 一切的物理起点。
+\end{insight}
+
+具体地，对平面四自由度机器人（三个转动关节 $q_1,q_2,q_3$ 加一个移动关节 $q_4$）可构造一组非零关节速度 $\dot{\boldsymbol{q}}\neq\mathbf{0}$，使末端速度 $\dot{\boldsymbol{x}}=\mathbf{0}$——关节在动而末端不动，这正是一个具体的\emph{零空间运动}（下节将给出其代数刻画）。下面把这个“关节动、末端静”的条件\emph{算出来}。
+
+\begin{example}[平面四自由度机器人的一条零空间运动]\label{exam:qw-4dof-null}
+取一条平面臂（\cref{fig:qw-4dof}）：从基座起依次为转动关节 $q_1$、转动关节 $q_2$、转动关节 $q_3$、末端一个沿最后连杆方向的移动关节 $q_4$；前两段连杆长均为 $l$，移动关节当前伸出量记为 $l$（与连杆同量级，便于对照源\cite{yu2021quadruped}）。设末端点 $P$ 的平面位置 $\boldsymbol{x}=[x,z]^\top$。本例只关心一个\emph{特殊构型族}：令 $q_1=q_3$（第一、三连杆指向相同）。此时整条臂可看成“两段等长杆 $+$ 一段可伸缩末段”围成的平面四连杆环路，$P$ 点位置只依赖 $q_2$（中间夹角）与 $q_4$（末段长度）两个变量。
+
+\textbf{第一步：写出 $P$ 点位置对 $q_2,q_4$ 的依赖.}\;在 $q_1=q_3$ 约束下，几何上 $P$ 到基座的连线长度 $d$ 由“等腰三角形 $+$ 末段”给出
+\[
+  d(q_2,q_4)=2l\cos\!\frac{\pi-q_2}{2}+l_4(q_4),
+\]
+其中 $2l\cos\frac{\pi-q_2}{2}$ 是两段等长杆在夹角 $q_2$ 下张成的弦长（$\pi-q_2$ 为杆间补角），$l_4$ 为末段伸出长度。
+
+\textbf{第二步：令末端速度为零.}\;末端\emph{静止}要求 $d$ 不随时间变化，即 $\dot d=\partial_{q_2}d\cdot\dot q_2+\partial_{q_4}d\cdot\dot q_4=0$。两个偏导
+\[
+  \frac{\partial d}{\partial q_2}=2l\cdot\tfrac12\sin\!\frac{\pi-q_2}{2}=l\sin\!\frac{\pi-q_2}{2},
+  \qquad
+  \frac{\partial d}{\partial q_4}=\frac{\mathrm{d}l_4}{\mathrm{d}q_4}=1
+\]
+（移动关节 $l_4=q_4$，故后者为 $1$）。代入 $\dot d=0$：
+\begin{equation}
+  l\,\sin\!\frac{\pi-q_2}{2}\,\dot q_2+\dot q_4=0
+  \;\;\Longrightarrow\;\;
+  \boxed{\;\sin\!\frac{\pi-q_2}{2}=-\frac{\dot q_4}{l\,\dot q_2}\;}.
+  \label{eq:qw-null-4dof}
+\end{equation}
+
+\textbf{物理含义.}\;\cref{eq:qw-null-4dof} 说：只要 $q_2$ 与 $q_4$ 的\emph{速度}满足这个比例关系（一个张开夹角、一个伸缩末段，二者“此消彼长”地抵消），末端点 $P$ 就\emph{原地不动}，而关节 $q_2,q_4$（连带 $q_1=q_3$ 的随动）都在\emph{运动}。这正是 $\mathcal{N}(\boldsymbol{J})$ 中一条非零向量 $\dot{\boldsymbol{q}}_0\neq\mathbf{0}$ 满足 $\boldsymbol{J}\dot{\boldsymbol{q}}_0=\mathbf{0}$ 的\emph{具体}写照——\cref{ins:qw-internal-motion} 那幅“关节动而末端静”的图像，在这里被落成一个可手算的代数条件。它与源\cite{yu2021quadruped} 给出的零空间条件同形（记号与伸缩量取法略有差异，物理一致）。把这条自由度交给次要任务（如避障），主任务（$P$ 点位置）丝毫不受影响。
+\end{example}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=1.0,>=Stealth]
+  \coordinate (O) at (0,0);
+  \coordinate (A) at (1.4,0.9);
+  \coordinate (B) at (2.9,0.5);
+  \coordinate (P) at (4.2,0.95);
+  \draw[gray] (-0.3,0)--(0.3,0); \fill (O) circle (1.2pt) node[below left]{\scriptsize 基座 $q_1$};
+  \draw[main!60!black, very thick] (O)--(A) node[midway,above left]{\scriptsize $l$};
+  \draw[main!60!black, very thick] (A)--(B) node[midway,above right]{\scriptsize $l$};
+  \draw[third!70!black, very thick, dashed] (B)--(P) node[midway,below]{\scriptsize $q_4$（伸缩）};
+  \fill (A) circle (1.2pt) node[above]{\scriptsize $q_2$};
+  \fill (B) circle (1.2pt) node[below]{\scriptsize $q_3{=}q_1$};
+  \fill[third] (P) circle (1.4pt) node[right]{\scriptsize $P$（末端，需静止）};
+  \draw[->,third] (A) ++(0.35,0.0) arc (0:38:0.35); \node[third] at (1.95,1.05){\scriptsize $\dot q_2$};
+\end{tikzpicture}
+\caption{平面四自由度机器人（\cref{exam:qw-4dof-null}）：两段等长转动连杆 $+$ 末端伸缩关节 $q_4$。在 $q_1{=}q_3$ 的构型族里，张开夹角 $q_2$ 与伸缩末段 $q_4$ 按 \cref{eq:qw-null-4dof} 的速度比反向配合，可使末端 $P$ 原地静止——一条非零的零空间运动 $\dot{\boldsymbol{q}}_0\in\mathcal{N}(\boldsymbol{J})$。}
+\label{fig:qw-4dof}
+\end{figure}
+
+\subsection{零空间定义与通解结构}
+\label{subsec:qw-nullspace-def}
+
+定义雅可比 $\boldsymbol{J}$ 的\textbf{零空间投影矩阵} $\boldsymbol{N}$，使任何经它投影的向量被映回零空间\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{J}\,\boldsymbol{N}=\mathbf{0}.
+  \label{eq:qw-JN-zero}
+\end{equation}
+矩阵 $\boldsymbol{A}$ 的零空间（核）的标准定义为
+\begin{equation}
+  \mathcal{N}(\boldsymbol{A})=\{\,\boldsymbol{w}\in\mathbb{R}^{N_j}\mid \boldsymbol{A}\boldsymbol{w}=\mathbf{0}\,\},
+  \label{eq:qw-nullspace-set}
+\end{equation}
+其维数（零度）等于机器人的冗余程度。线性方程组的通解结构是线性代数的标准结论：若 $\boldsymbol{A}\boldsymbol{w}=\boldsymbol{b}$ 有某个特解 $\boldsymbol{w}_p$，则其\emph{全部}解为
+\begin{equation}
+  \boldsymbol{w}_{\mathrm{general}}=\boldsymbol{w}_p+\boldsymbol{w}_0,\qquad \boldsymbol{w}_0\in\mathcal{N}(\boldsymbol{A}).
+  \label{eq:qw-general-sol}
+\end{equation}
+对应到 \cref{eq:qw-jacobian}：$\dot{\boldsymbol{q}}_{\mathrm{general}}=\dot{\boldsymbol{q}}_p+\dot{\boldsymbol{q}}_0$，其中 $\dot{\boldsymbol{q}}_0\in\mathcal{N}(\boldsymbol{J})$。
+
+\begin{insight}[零空间运动的物理意义——关节动而末端静]\label{ins:qw-internal-motion}
+零空间运动有一幅鲜活的物理图像：$\dot{\boldsymbol{q}}_0\in\mathcal{N}(\boldsymbol{J})$ 是一种\textbf{内部运动}——各个关节\emph{在动}，但末端在工作空间里\emph{完全静止}（$\boldsymbol{J}\dot{\boldsymbol{q}}_0=\mathbf{0}$）。想象一个 $7$ 自由度臂握着一支笔尖不动，手肘却能上下绕圈：笔尖（主任务）纹丝不动，手肘（次要自由度）自由活动。\textbf{这就是 WBC 让低优先级任务“免费搭车”的物理基础}——次要任务只动用零空间，绝不打扰主任务。
+\end{insight}
+
+\subsection{Moore--Penrose 伪逆与零空间投影矩阵}
+\label{subsec:qw-pinv}
+
+冗余情形下 $\boldsymbol{J}$ 行满秩（$M<N_j$），定义其 $N_j\times M$ 的\textbf{右伪逆} $\boldsymbol{J}^+$，满足 $\boldsymbol{J}\boldsymbol{J}^+=\mathbf{I}_M$。从 $\mathbf{0}=\boldsymbol{J}-\mathbf{I}\boldsymbol{J}=\boldsymbol{J}-\boldsymbol{J}\boldsymbol{J}^+\boldsymbol{J}$ 出发\cite{yu2021quadruped}：
+\begin{equation}
+  \mathbf{0}=\boldsymbol{J}-\boldsymbol{J}\boldsymbol{J}^+\boldsymbol{J}=\boldsymbol{J}\,(\mathbf{I}-\boldsymbol{J}^+\boldsymbol{J}),
+  \label{eq:qw-pinv-zero}
+\end{equation}
+对照 \cref{eq:qw-JN-zero} 立得\textbf{零空间投影矩阵}的显式表达，与右伪逆的闭式（行满秩）：
+\begin{equation}
+  \boldsymbol{N}=\mathbf{I}-\boldsymbol{J}^+\boldsymbol{J},
+  \qquad
+  \boldsymbol{J}^+=\boldsymbol{J}^\top(\boldsymbol{J}\boldsymbol{J}^\top)^{-1}.
+  \label{eq:qw-N-and-pinv}
+\end{equation}
+于是 \cref{eq:qw-jacobian} 的通解写为伪逆特解 $+$ 零空间齐次解\cite{yu2021quadruped}：
+\begin{equation}
+  \boxed{\;\dot{\boldsymbol{q}}=\boldsymbol{J}^+\dot{\boldsymbol{x}}+\boldsymbol{N}\dot{\boldsymbol{q}}_{\forall}\;},
+  \qquad \dot{\boldsymbol{q}}_{\forall}\in\mathbb{R}^{N_j}\ \text{任意}.
+  \label{eq:qw-general-q}
+\end{equation}
+验证它确实满足主任务：左乘 $\boldsymbol{J}$，由 $\boldsymbol{J}\boldsymbol{J}^+=\mathbf{I}$、$\boldsymbol{J}\boldsymbol{N}=\mathbf{0}$，
+\begin{equation}
+  \boldsymbol{J}\dot{\boldsymbol{q}}=\boldsymbol{J}\boldsymbol{J}^+\dot{\boldsymbol{x}}+\boldsymbol{J}\boldsymbol{N}\dot{\boldsymbol{q}}_{\forall}=\dot{\boldsymbol{x}}+\mathbf{0}=\dot{\boldsymbol{x}}.\quad\checkmark
+  \label{eq:qw-verify}
+\end{equation}
+\cref{eq:qw-general-q} 正是 \cref{ins:qw-wbc-def} 那句话的代数化：$\boldsymbol{J}^+\dot{\boldsymbol{x}}$ 保证主任务，$\boldsymbol{N}\dot{\boldsymbol{q}}_{\forall}$ 是“任意运动 $\dot{\boldsymbol{q}}_{\forall}$ 中不干扰主任务的那部分”，留给次要任务。
+
+\begin{note}[左伪逆 vs 右伪逆，别用反了]\label{note:qw-left-right}
+\cref{eq:qw-N-and-pinv} 的 $\boldsymbol{J}^+=\boldsymbol{J}^\top(\boldsymbol{J}\boldsymbol{J}^\top)^{-1}$ 是\textbf{右}伪逆，适用于\emph{行满秩}的\emph{冗余}情形（$N_j>M$，$\boldsymbol{J}\boldsymbol{J}^\top$ 可逆），满足 $\boldsymbol{J}\boldsymbol{J}^+=\mathbf{I}_M$，给出\emph{最小范数}解。与之相对的\textbf{左}伪逆 $\boldsymbol{J}^+=(\boldsymbol{J}^\top\boldsymbol{J})^{-1}\boldsymbol{J}^\top$ 适用于\emph{列满秩}的\emph{欠定}情形（$N_j<M$，$\boldsymbol{J}^\top\boldsymbol{J}$ 可逆），满足 $\boldsymbol{J}^+\boldsymbol{J}=\mathbf{I}_{N_j}$，给出\emph{最小二乘}解。本章 WBC 处理冗余机器人，一律用右伪逆。两者用反会导致维度不匹配或求逆奇异，是常见 bug 源。
+\end{note}
+
+\subsection{伪逆为最小范数解的完整证明（拉格朗日乘子法）}
+\label{subsec:qw-pinv-proof}
+
+右伪逆并非随便一个右逆——满足 $\boldsymbol{J}\boldsymbol{G}=\mathbf{I}$ 的矩阵 $\boldsymbol{G}$ 有无穷多个，$\boldsymbol{J}^+$ 是其中\emph{能量最优}（关节速度模长最小）的那一个。这一性质极其重要，下面给出完整证明。
+
+\begin{derivation}[伪逆 $=$ 最小范数解]\label{deriv:qw-minnorm}
+\textbf{优化问题.}\;在所有满足主任务约束 $\boldsymbol{J}\dot{\boldsymbol{q}}=\dot{\boldsymbol{x}}$ 的关节速度里，找模长最小者：
+\[
+  \min_{\dot{\boldsymbol{q}}}\ \tfrac12\|\dot{\boldsymbol{q}}\|^2=\tfrac12\dot{\boldsymbol{q}}^\top\dot{\boldsymbol{q}},
+  \qquad\text{s.t.}\quad \boldsymbol{J}\dot{\boldsymbol{q}}-\dot{\boldsymbol{x}}=\mathbf{0}.
+\]
+\textbf{拉格朗日函数.}\;引入 $M\times1$ 乘子 $\boldsymbol{\lambda}$：
+\[
+  \mathcal{L}(\dot{\boldsymbol{q}},\boldsymbol{\lambda})=\tfrac12\dot{\boldsymbol{q}}^\top\dot{\boldsymbol{q}}-\boldsymbol{\lambda}^\top(\boldsymbol{J}\dot{\boldsymbol{q}}-\dot{\boldsymbol{x}}).
+\]
+\textbf{平稳点条件.}\;分别对 $\dot{\boldsymbol{q}}$ 与 $\boldsymbol{\lambda}$ 求梯度并令为零（梯度公式见 \cref{ch:matderiv}）：
+\[
+  \mathbf{0}=\nabla_{\dot{\boldsymbol{q}}}\mathcal{L}=\dot{\boldsymbol{q}}-\boldsymbol{J}^\top\boldsymbol{\lambda}
+  \;\Longrightarrow\;\dot{\boldsymbol{q}}=\boldsymbol{J}^\top\boldsymbol{\lambda},
+\]
+\[
+  \mathbf{0}=\nabla_{\boldsymbol{\lambda}}\mathcal{L}=-(\boldsymbol{J}\dot{\boldsymbol{q}}-\dot{\boldsymbol{x}})
+  \;\Longrightarrow\;\boldsymbol{J}\dot{\boldsymbol{q}}=\dot{\boldsymbol{x}}.
+\]
+\textbf{求解乘子.}\;把第一式 $\dot{\boldsymbol{q}}=\boldsymbol{J}^\top\boldsymbol{\lambda}$ 代入第二式（行满秩 $\Rightarrow\boldsymbol{J}\boldsymbol{J}^\top$ 可逆）：
+\[
+  \boldsymbol{J}(\boldsymbol{J}^\top\boldsymbol{\lambda})=\dot{\boldsymbol{x}}
+  \;\Longrightarrow\;(\boldsymbol{J}\boldsymbol{J}^\top)\boldsymbol{\lambda}=\dot{\boldsymbol{x}}
+  \;\Longrightarrow\;\boldsymbol{\lambda}=(\boldsymbol{J}\boldsymbol{J}^\top)^{-1}\dot{\boldsymbol{x}}.
+\]
+\textbf{回代.}\;代回 $\dot{\boldsymbol{q}}=\boldsymbol{J}^\top\boldsymbol{\lambda}$：
+\[
+  \dot{\boldsymbol{q}}=\boldsymbol{J}^\top(\boldsymbol{J}\boldsymbol{J}^\top)^{-1}\dot{\boldsymbol{x}}=\boldsymbol{J}^+\dot{\boldsymbol{x}},
+  \qquad \boldsymbol{J}^+=\boldsymbol{J}^\top(\boldsymbol{J}\boldsymbol{J}^\top)^{-1}.
+\]
+这与 \cref{eq:qw-N-and-pinv} 的闭式完全一致：右伪逆解就是最小范数解。$\blacksquare$
+\end{derivation}
+
+\begin{insight}[伪逆的深层几何——特解在行空间、与零空间正交]\label{ins:qw-rowspace}
+\cref{deriv:qw-minnorm} 的关键中间式 $\dot{\boldsymbol{q}}=\boldsymbol{J}^\top\boldsymbol{\lambda}$ 藏着全章\emph{最深刻}的几何：\textbf{伪逆解 $\boldsymbol{J}^+\dot{\boldsymbol{x}}$ 位于 $\boldsymbol{J}$ 的\emph{行空间}}（即 $\boldsymbol{J}^\top$ 的列空间），而行空间与零空间在 $\mathbb{R}^{N_j}$ 中\emph{正交互补}。于是 \cref{eq:qw-general-q} 的通解 $\dot{\boldsymbol{q}}=\underbrace{\boldsymbol{J}^+\dot{\boldsymbol{x}}}_{\text{行空间}}+\underbrace{\boldsymbol{N}\dot{\boldsymbol{q}}_{\forall}}_{\text{零空间}}$ 是一个\emph{正交分解}：主任务的解和次要任务的补偿天然落在两个互相垂直的子空间里、互不干扰。\textbf{这是零空间投影、多任务递推、整个全身控制能够成立的真正基石}——不是巧合，而是“最小范数”这一选择的几何必然。后面所有递推之所以“高优先级不被低优先级污染”，根子都在这条正交性上。
+\end{insight}
+
+\subsection{阻尼最小二乘：奇异点附近的数值稳定}
+\label{subsec:qw-dls}
+
+\begin{insight}[奇异点附近 $\boldsymbol{J}\boldsymbol{J}^\top$ 病态——用阻尼最小二乘救场]\label{ins:qw-dls}
+这里有一个工程必坑：非奇异构型下 $\boldsymbol{J}$ 行满秩、$\boldsymbol{J}\boldsymbol{J}^\top$ 可逆，伪逆良定；但\textbf{接近奇异点}时 $\det(\boldsymbol{J}\boldsymbol{J}^\top)\to0$，$\boldsymbol{J}\boldsymbol{J}^\top$ 变成病态矩阵，求逆数值溢出、关节速度指令爆炸。补救办法是\textbf{阻尼最小二乘}（Damped Least Squares, DLS）：
+\begin{equation}
+  \boldsymbol{J}^+=\boldsymbol{J}^\top(\boldsymbol{J}\boldsymbol{J}^\top+\lambda^2\mathbf{I})^{-1},
+  \label{eq:qw-dls}
+\end{equation}
+加一个微小阻尼项 $\lambda^2\mathbf{I}$（$\lambda>0$ 小）保证括号内\emph{恒}正定可逆——即便在奇异点。代价是引入了一点跟踪误差（在奇异方向上“软化”了响应）。$\lambda$ 是“数值稳定 vs 跟踪精度”的旋钮：奇异点附近临时增大 $\lambda$、远离时减小。这等价于在最小范数目标里加了 $\lambda^2\|\dot{\boldsymbol{q}}\|^2$ 的正则（Levenberg--Marquardt 思想）。
+\end{insight}
+
+\subsection{零空间投影作为正交投影；秩—零度定理}
+\label{subsec:qw-ortho-proj}
+
+\paragraph{秩—零度定理。}
+线性代数的秩—零度定理在机器人学里读作：\emph{关节空间维} $=$ \emph{值域维（工作空间可达维）} $+$ \emph{零空间维}。非奇异冗余机器人的零空间维 $>0$，故必存在非零内部运动 $\dot{\boldsymbol{q}}_0$ 使 $\boldsymbol{J}\dot{\boldsymbol{q}}_0=\mathbf{0}$（\cref{ins:qw-internal-motion}）。
+
+\paragraph{投影矩阵就是正交投影。}
+次要任务想执行某个任意意图 $\dot{\boldsymbol{q}}_{\forall}$，但直接执行会破坏主任务。$\boldsymbol{N}$ 就是把意图“过滤”到零空间的算子：$\dot{\boldsymbol{q}}_0=\boldsymbol{N}\dot{\boldsymbol{q}}_{\forall}$。注意 $\boldsymbol{N}=\mathbf{I}-\boldsymbol{J}^+\boldsymbol{J}$ 是\emph{对称幂等}的（$\boldsymbol{N}=\boldsymbol{N}^\top$、$\boldsymbol{N}^2=\boldsymbol{N}$，由 \cref{eq:qw-N-and-pinv} 直接验证），因此它是一个\textbf{正交投影}：它把 $\dot{\boldsymbol{q}}_{\forall}$ 投到零空间里\emph{欧氏距离最近}的那个向量上。
+
+\begin{insight}[优先级控制的本质——“在完美执行主任务的前提下尽力近似次要任务”]\label{ins:qw-priority-essence}
+一句话点破零空间投影的灵魂：\textbf{零空间投影矩阵的意义\emph{不是}完美执行次要任务，而是\emph{在完美执行主任务的前提下，尽最大努力近似次要任务}。}作为正交投影，$\boldsymbol{N}$ 在零空间 $\mathcal{N}(\boldsymbol{J})$ 中找出与原始意图 $\dot{\boldsymbol{q}}_{\forall}$ 欧氏距离最小的向量——其残差 $\dot{\boldsymbol{q}}_{\forall}-\boldsymbol{N}\dot{\boldsymbol{q}}_{\forall}$ 恰与零空间正交。反过来，由 $\boldsymbol{J}\boldsymbol{N}\dot{\boldsymbol{q}}_{\forall}=\mathbf{0}$ 对\emph{任意} $\dot{\boldsymbol{q}}_{\forall}$ 成立，必有 $\boldsymbol{J}\boldsymbol{N}=\mathbf{0}$，故 $\boldsymbol{N}$ 必是 $\boldsymbol{J}$ 的零空间矩阵、且为\emph{唯一}的正交投影矩阵。\textbf{把“硬优先级”翻译成“正交投影”，几何上一目了然}——这是后文 NSP（零空间投影）方法的灵魂：高优先级被严格满足，低优先级只在剩下的零空间里“能做多少做多少”。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 \cref{eq:qw-N-and-pinv} 直接验证 $\boldsymbol{J}\boldsymbol{N}=\mathbf{0}$、$\boldsymbol{N}^2=\boldsymbol{N}$、$\boldsymbol{N}^\top=\boldsymbol{N}$（提示：$\boldsymbol{J}\boldsymbol{J}^+=\mathbf{I}$；对称性需用 $\boldsymbol{J}^+=\boldsymbol{J}^\top(\boldsymbol{J}\boldsymbol{J}^\top)^{-1}$）。
+  \item 仿 \cref{deriv:qw-minnorm}，把目标改为\emph{带权}最小范数 $\min\tfrac12\dot{\boldsymbol{q}}^\top\boldsymbol{W}\dot{\boldsymbol{q}}$（$\boldsymbol{W}\succ0$），推出加权伪逆 $\boldsymbol{J}^{+}_{W}=\boldsymbol{W}^{-1}\boldsymbol{J}^\top(\boldsymbol{J}\boldsymbol{W}^{-1}\boldsymbol{J}^\top)^{-1}$。
+  \item （概念）用 \cref{ins:qw-rowspace} 的正交分解解释：为什么“先用伪逆解主任务，再把次要任务投到零空间”不会反过来损害主任务？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{带优先级的任务分层 WBC}
+\label{sec:qw-priority}
+
+有了零空间投影这把钥匙，现在把多个任务按优先级“叠”起来。先看双任务，再推一般多任务的递推链，最后给出位置/速度/加速度三种映射。
+
+\subsection{任务分解的动机：望远镜观星}
+\label{subsec:qw-telescope}
+
+\begin{insight}[望远镜观星例——“为什么需要优先级”的最佳直觉]\label{ins:qw-telescope}
+综合控制任务可按物理意义\emph{分解}为子任务：同等重要的可加权平均，不同重要的应分优先级（且低优先级\emph{不应}影响高优先级）。一个最贴切的直觉例是\textbf{机械臂端着望远镜观星}。望远镜在空间里平移几十米，对“看到哪颗星”几乎没有影响（星在无穷远）；可镜筒的指向只要偏了\emph{不到 $1^\circ$}，视野就天差地别。结论：\textbf{姿态任务的优先级应高于位置任务}。当自由度不够同时满足两者时，宁可牺牲位置精度也要保住姿态精度。这就是“优先级”概念的来处——不同任务对“误差”的敏感度截然不同，必须分层对待，而不是一锅端进一个加权和里。
+\end{insight}
+
+\subsection{双任务全身控制}
+\label{subsec:qw-two-task}
+
+设两个任务 $\dot{\boldsymbol{x}}_1,\dot{\boldsymbol{x}}_2$，雅可比 $\boldsymbol{J}_1,\boldsymbol{J}_2$，零空间投影 $\boldsymbol{N}_1=\mathbf{I}-\boldsymbol{J}_1^+\boldsymbol{J}_1$，任务 $1$ 优先级高。由通解 \cref{eq:qw-general-q}，先写出满足任务 $1$ 的所有关节速度\cite{yu2021quadruped}：
+\begin{equation}
+  \dot{\boldsymbol{q}}=\underbrace{\boldsymbol{J}_1^+\dot{\boldsymbol{x}}_1}_{\text{特解：完成任务 1}}
+  +\underbrace{\boldsymbol{N}_1\dot{\boldsymbol{q}}_{\forall}}_{\text{齐次解：不影响任务 1}}.
+  \label{eq:qw-two-task-q}
+\end{equation}
+把它代入任务 $2$ 的约束 $\dot{\boldsymbol{x}}_2=\boldsymbol{J}_2\dot{\boldsymbol{q}}$：
+\begin{equation}
+  \dot{\boldsymbol{x}}_2=\boldsymbol{J}_2\big(\boldsymbol{J}_1^+\dot{\boldsymbol{x}}_1+\boldsymbol{N}_1\dot{\boldsymbol{q}}_{\forall}\big)
+  =\underbrace{\boldsymbol{J}_2\boldsymbol{J}_1^+\dot{\boldsymbol{x}}_1}_{\text{A. 任务 1 的副作用}}
+  +\underbrace{\boldsymbol{J}_2\boldsymbol{N}_1\dot{\boldsymbol{q}}_{\forall}}_{\text{B. 可控部分}}.
+  \label{eq:qw-two-task-x2}
+\end{equation}
+
+\begin{insight}[“副作用 / 补偿”语义——理解递推的钥匙]\label{ins:qw-side-effect}
+\cref{eq:qw-two-task-x2} 的两项各有清晰的物理语义：\textbf{A 项 $\boldsymbol{J}_2\boldsymbol{J}_1^+\dot{\boldsymbol{x}}_1$ 是“任务 1 给任务 2 带来的副作用”}——为了完成任务 1 而动的那些关节，顺带在任务 2 的工作空间里也造成了一个速度；\textbf{B 项 $\boldsymbol{J}_2\boldsymbol{N}_1\dot{\boldsymbol{q}}_{\forall}$ 是“我们仍能自由控制的部分”}（零空间里的运动在任务 2 空间的投影）。于是策略一目了然：\textbf{用 B 去补偿 A，使两者之和恰好等于期望 $\dot{\boldsymbol{x}}_2$}。这个“副作用—补偿”的视角，是看懂下文一切递推公式的钥匙。
+\end{insight}
+
+由 \cref{eq:qw-two-task-x2} 解出自由变量 $\dot{\boldsymbol{q}}_{\forall}$（让 B 补偿 A 并凑出 $\dot{\boldsymbol{x}}_2$，对 $\boldsymbol{J}_2\boldsymbol{N}_1$ 取伪逆）\cite{yu2021quadruped}：
+\begin{equation}
+  \dot{\boldsymbol{q}}_{\forall}=(\boldsymbol{J}_2\boldsymbol{N}_1)^+\big(\dot{\boldsymbol{x}}_2-\boldsymbol{J}_2\boldsymbol{J}_1^+\dot{\boldsymbol{x}}_1\big).
+  \label{eq:qw-two-task-qfree}
+\end{equation}
+代回 \cref{eq:qw-two-task-q} 得双任务解：
+\begin{equation}
+  \dot{\boldsymbol{q}}=\boldsymbol{J}_1^+\dot{\boldsymbol{x}}_1+\boldsymbol{N}_1(\boldsymbol{J}_2\boldsymbol{N}_1)^+\big(\dot{\boldsymbol{x}}_2-\boldsymbol{J}_2\boldsymbol{J}_1^+\dot{\boldsymbol{x}}_1\big).
+  \label{eq:qw-two-task-full}
+\end{equation}
+利用 Maciejewski 与 Klein 的恒等式 $\boldsymbol{N}_1(\boldsymbol{J}_2\boldsymbol{N}_1)^+=(\boldsymbol{J}_2\boldsymbol{N}_1)^+$（成立的条件是 $\boldsymbol{N}_1$ 为正交投影、且 $\boldsymbol{J}_2\boldsymbol{N}_1$ 的伪逆作用在其值域上，证明见 \cite{maciejewski1985obstacle}），\cref{eq:qw-two-task-full} 化简为常用形式\cite{yu2021quadruped,maciejewski1985obstacle}：
+\begin{equation}
+  \boxed{\;\dot{\boldsymbol{q}}=\boldsymbol{J}_1^+\dot{\boldsymbol{x}}_1+(\boldsymbol{J}_2\boldsymbol{N}_1)^+\big(\dot{\boldsymbol{x}}_2-\boldsymbol{J}_2\boldsymbol{J}_1^+\dot{\boldsymbol{x}}_1\big)\;}.
+  \label{eq:qw-two-task-simp}
+\end{equation}
+
+\subsection{多任务递推}
+\label{subsec:qw-multi-task}
+
+把双任务推广到 $n$ 个任务（$i$ 越小优先级越高）。把前 $i-1$ 个任务\emph{堆叠}成一个“大任务” $\mathrm{A}_{i-1}$\cite{yu2021quadruped}：
+\begin{equation}
+  \dot{\boldsymbol{x}}_{i-1}^{A}=\begin{bmatrix}\dot{\boldsymbol{x}}_1\\\vdots\\\dot{\boldsymbol{x}}_{i-1}\end{bmatrix},\quad
+  \boldsymbol{J}_{i-1}^{A}=\begin{bmatrix}\boldsymbol{J}_1\\\vdots\\\boldsymbol{J}_{i-1}\end{bmatrix},\quad
+  \dot{\boldsymbol{x}}_{i-1}^{A}=\boldsymbol{J}_{i-1}^{A}\dot{\boldsymbol{q}}_{i-1},
+  \label{eq:qw-stack}
+\end{equation}
+其零空间投影
+\begin{equation}
+  \boldsymbol{N}_{i-1}^{A}=\mathbf{I}-(\boldsymbol{J}_{i-1}^{A})^+\boldsymbol{J}_{i-1}^{A}.
+  \label{eq:qw-stack-N}
+\end{equation}
+设满足前 $i-1$ 个任务的解 $\dot{\boldsymbol{q}}_{i-1}$ 已知，则在不破坏它们的前提下加入任务 $i$：
+\begin{equation}
+  \dot{\boldsymbol{q}}_i=\dot{\boldsymbol{q}}_{i-1}+\boldsymbol{N}_{i-1}^{A}\dot{\boldsymbol{q}}_{\forall}.
+  \label{eq:qw-recur-form}
+\end{equation}
+代入 $\dot{\boldsymbol{x}}_i=\boldsymbol{J}_i\dot{\boldsymbol{q}}_i$ 并解出 $\dot{\boldsymbol{q}}_{\forall}$（与双任务同理）：
+\begin{equation}
+  \dot{\boldsymbol{q}}_{\forall}=(\boldsymbol{J}_i\boldsymbol{N}_{i-1}^{A})^+\big(\dot{\boldsymbol{x}}_i-\boldsymbol{J}_i\dot{\boldsymbol{q}}_{i-1}\big),
+  \label{eq:qw-recur-qfree}
+\end{equation}
+回代（同样用 Maciejewski 化简）得\textbf{多任务递推公式}\cite{yu2021quadruped,maciejewski1985obstacle}：
+\begin{equation}
+  \boxed{\;\dot{\boldsymbol{q}}_i=\dot{\boldsymbol{q}}_{i-1}+(\boldsymbol{J}_i\boldsymbol{N}_{i-1}^{A})^+\big(\dot{\boldsymbol{x}}_i-\boldsymbol{J}_i\dot{\boldsymbol{q}}_{i-1}\big)\;},
+  \label{eq:qw-recur}
+\end{equation}
+起始条件 $\dot{\boldsymbol{q}}_1=\boldsymbol{J}_1^+\dot{\boldsymbol{x}}_1$，迭代累加直到 $\dot{\boldsymbol{q}}_n$。
+
+\begin{insight}[递推链的最终输出 $=$ 发给机器人的总指令]\label{ins:qw-final-output}
+有一个易被淹没的事实须强调：\textbf{$\dot{\boldsymbol{q}}_n$ 才是递推链的最终输出}——它是把全部 $n$ 个任务按优先级逐层叠加后、真正要发送给机器人的那个“总的”关节速度指令。每一步 $\dot{\boldsymbol{q}}_i$ 都包含了前面所有高优先级任务的解，新任务只在前面所有任务的\emph{联合零空间} $\boldsymbol{N}_{i-1}^A$ 里活动，故\emph{绝不}破坏任何更高优先级的任务。这就是“硬优先级”在代数上的实现。
+\end{insight}
+
+\subsection{位置级、速度级与加速度级}
+\label{subsec:qw-levels}
+
+\cref{eq:qw-recur} 是\emph{速度级}的。WBC 通常要同时给出关节的位置、速度、加速度指令，故需位置级与加速度级的对应形式。
+
+\paragraph{位置级。}
+定义工作空间误差 $\boldsymbol{e}_i=\boldsymbol{x}_i^d-\boldsymbol{x}_i$、关节增量 $\Delta\boldsymbol{q}_i=\boldsymbol{q}_i^d-\boldsymbol{q}_i$。在一个小时间窗 $T$ 内，用 $\boldsymbol{e}_i/T$、$\Delta\boldsymbol{q}_i/T$ 近似速度代入 \cref{eq:qw-recur}，两边乘 $T$（$T$ 约掉）得位置级递推\cite{yu2021quadruped}：
+\begin{equation}
+  \Delta\boldsymbol{q}_i=\Delta\boldsymbol{q}_{i-1}+(\boldsymbol{J}_i\boldsymbol{N}_{i-1}^{A})^+\big(\boldsymbol{e}_i-\boldsymbol{J}_i\Delta\boldsymbol{q}_{i-1}\big).
+  \label{eq:qw-pos-level}
+\end{equation}
+
+\paragraph{加速度级。}
+对 \cref{eq:qw-jacobian} 再求一次时间导数得加速度映射：
+\begin{equation}
+  \ddot{\boldsymbol{x}}=\dot{\boldsymbol{J}}\dot{\boldsymbol{q}}+\boldsymbol{J}\ddot{\boldsymbol{q}}.
+  \label{eq:qw-acc-map}
+\end{equation}
+多任务情形 $\ddot{\boldsymbol{x}}_i=\dot{\boldsymbol{J}}_i\dot{\boldsymbol{q}}+\boldsymbol{J}_i\ddot{\boldsymbol{q}}_i$（其中 $\dot{\boldsymbol{q}}$ 从传感器读取，视为已知）。同样的“副作用—补偿”推导给出加速度级递推\cite{yu2021quadruped}：
+\begin{equation}
+  \boxed{\;\ddot{\boldsymbol{q}}_i=\ddot{\boldsymbol{q}}_{i-1}+(\boldsymbol{J}_i\boldsymbol{N}_{i-1}^{A})^+\big(\ddot{\boldsymbol{x}}_i-\dot{\boldsymbol{J}}_i\dot{\boldsymbol{q}}-\boldsymbol{J}_i\ddot{\boldsymbol{q}}_{i-1}\big)\;},
+  \label{eq:qw-acc-level}
+\end{equation}
+起始条件
+\begin{equation}
+  \ddot{\boldsymbol{q}}_1=\boldsymbol{J}_1^+\big(\ddot{\boldsymbol{x}}_1-\dot{\boldsymbol{J}}_1\dot{\boldsymbol{q}}\big).
+  \label{eq:qw-acc-start}
+\end{equation}
+
+\begin{pitfall}[误区：优先级用尽时低优先级仍能被满足]
+NSP 递推有一个隐蔽的失效模式：当高优先级任务\emph{用尽}了全部自由度（前 $i-1$ 个任务堆叠后 $\boldsymbol{J}_{i-1}^A$ 行满秩占满 $N_j$ 维），其联合零空间 $\boldsymbol{N}_{i-1}^A=\mathbf{0}$，于是 \cref{eq:qw-recur} 的修正项整体为零——\textbf{任务 $i$ 及之后的所有低优先级任务被\emph{完全}放弃}，没有任何“折中”余地。这是硬优先级的代价：它不妥协。若希望低优先级任务在高优先级“略微让步”下也能改善（如望远镜位置在不大幅牺牲姿态下尽量靠近），就需要\emph{软}优先级——这正是 \cref{sec:qw-history} 的 WQP 与 \cref{sec:qw-relax} 的松弛 QP 要补的。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:qw-recur-form,eq:qw-recur-qfree} 出发，补全到 \cref{eq:qw-recur} 的代回与 Maciejewski 化简（指明用了 $\boldsymbol{N}_{i-1}^A(\boldsymbol{J}_i\boldsymbol{N}_{i-1}^A)^+=(\boldsymbol{J}_i\boldsymbol{N}_{i-1}^A)^+$ 这一步）。
+  \item 取 $n=2$，验证多任务递推 \cref{eq:qw-recur} 退化为双任务 \cref{eq:qw-two-task-simp}。
+  \item （概念）位置级 \cref{eq:qw-pos-level} 里时间窗 $T$ 为什么会被约掉？这说明位置级与速度级在“同一拍”里其实共用同一套零空间结构吗？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{浮动基座 WBC 与四足应用}
+\label{sec:qw-floating}
+
+前面的地基对一般冗余机械臂都成立。把它落到四足，关键是处理\emph{浮动基座}：四足的躯干在世界里自由漂浮，仅靠 $12$ 个关节角无法确定其世界位姿。
+
+\subsection{浮动基座与 6 自由度虚拟关节}
+\label{subsec:qw-virtual-joint}
+
+\begin{insight}[为何要 6 自由度虚拟关节]\label{ins:qw-virtual}
+浮动基的困难与解法如下：四足可等效为“躯干上连了 $4$ 个 $3$-DOF 的腿（小臂）”，但\textbf{躯干本身是世界系下一个 $6$-DOF 的自由刚体}——它的位姿不由任何电机直接驱动，而是被各腿与地面的接触力\emph{间接}决定。问题是：仅有 $12$ 个关节参数，\emph{无法}反解出躯干在世界系的 $6$ 维位姿。解法是在世界系与本体系之间插入一个\textbf{无实体的 $6$-DOF 虚拟关节}（$3$ 转动 $+$ $3$ 平动），把机器人的广义坐标扩成 $13$ 个关节、$18$ 维：前 $6$ 维描述浮动基位姿（不可驱动、无电机），后 $12$ 维是真实可驱关节。这样运动学/动力学就能在一个统一的广义坐标系里写出来。
+\end{insight}
+
+于是浮动基广义坐标
+\begin{equation}
+  \boldsymbol{q}=\begin{bmatrix}\boldsymbol{q}_b\\\boldsymbol{q}_j\end{bmatrix},\qquad
+  \boldsymbol{q}_b=\begin{bmatrix}\boldsymbol{\Theta}\\\boldsymbol{p}_{com}\end{bmatrix}\in\mathbb{R}^6,\quad
+  \boldsymbol{q}_j\in\mathbb{R}^{12},
+  \label{eq:qw-gen-coord}
+\end{equation}
+其中 $\boldsymbol{\Theta}$ 为机身欧拉角、$\boldsymbol{p}_{com}$ 为质心位置（与 \cref{ch:quad_mpc} 记号一致），$\boldsymbol{q}_j$ 为 $12$ 实体关节角。广义速度/加速度则\emph{重新定义}为\cite{yu2021quadruped}：
+\begin{equation}
+  \dot{\boldsymbol{q}}=\begin{bmatrix}{}^{\mathcal{B}}\boldsymbol{\omega}_{\mathcal{OB}}\\{}^{\mathcal{B}}\dot{\boldsymbol{p}}_{com}\\\dot{\boldsymbol{q}}_j\end{bmatrix},
+  \qquad
+  \ddot{\boldsymbol{q}}=\begin{bmatrix}{}^{\mathcal{B}}\dot{\boldsymbol{\omega}}_{\mathcal{OB}}\\{}^{\mathcal{B}}\ddot{\boldsymbol{p}}_{com}\\\ddot{\boldsymbol{q}}_j\end{bmatrix}.
+  \label{eq:qw-gen-vel}
+\end{equation}
+
+\begin{note}[关键陷阱：$\dot{\boldsymbol{q}},\ddot{\boldsymbol{q}}$ 不是 $\boldsymbol{q}$ 的逐元素微分]\label{note:qw-gen-vel}
+\cref{eq:qw-gen-vel} 的 $\dot{\boldsymbol{q}},\ddot{\boldsymbol{q}}$ 是\textbf{重新定义的符号}，\emph{并非} \cref{eq:qw-gen-coord} 中 $\boldsymbol{q}$ 的逐元素一阶/二阶时间微分。两处不一致：(i) 前 $3$ 维（角量）用的是\emph{角速度} ${}^{\mathcal{B}}\boldsymbol{\omega}_{\mathcal{OB}}$，而非欧拉角率 $\dot{\boldsymbol{\Theta}}$（二者差一个依赖姿态的映射矩阵，见 \cref{ch:quad_mpc} 的角速度$\to$欧拉角率映射）；(ii) 中 $3$ 维（线量）用的是\emph{本体系}平动速度 ${}^{\mathcal{B}}\dot{\boldsymbol{p}}_{com}$，而 $\boldsymbol{q}_b$ 里的 $\boldsymbol{p}_{com}$ 是\emph{世界系}位置。这是浮动基 WBC 最大的记号陷阱：读公式时务必区分“坐标 $\boldsymbol{q}$”与“广义速度 $\dot{\boldsymbol{q}}$”，它们不是简单的导数关系。这样定义是为了让动力学方程的惯量阵、偏置力写得简洁（物理量取在最自然的基下）。
+\end{note}
+
+\subsection{浮动基座动力学标准方程}
+\label{subsec:qw-floating-dyn}
+
+浮动基机器人的全身动力学标准方程为\cite{yu2021quadruped}：
+\begin{equation}
+  \boxed{\;\boldsymbol{M}(\boldsymbol{q})\ddot{\boldsymbol{q}}+\boldsymbol{C}(\boldsymbol{q},\dot{\boldsymbol{q}})=\boldsymbol{S}_j\boldsymbol{\tau}+\boldsymbol{J}_c^\top\,{}^{\mathcal{O}}\boldsymbol{f}_c\;},
+  \label{eq:qw-floating-dyn}
+\end{equation}
+其中 $\boldsymbol{M}(\boldsymbol{q})\in\mathbb{R}^{18\times18}$ 为关节空间质量矩阵；$\boldsymbol{C}(\boldsymbol{q},\dot{\boldsymbol{q}})$ 为偏置力（含重力、科氏力、离心力等与加速度无关的项）；$\boldsymbol{J}_c$ 为接触雅可比、${}^{\mathcal{O}}\boldsymbol{f}_c$ 为接触力（即 MPC 的足端力）。等式右端是“系统受力”（关节驱动力 $+$ 外部接触力），左端是“当前状态与受力下的运动”。虚拟 $6$-DOF 关节\emph{不能产生力矩}（无电机），故用\textbf{选择矩阵} $\boldsymbol{S}_j$ 把前 $6$ 个广义力滤掉\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{S}_j=\begin{bmatrix}\mathbf{0}_{6\times6}&\mathbf{0}_{6\times12}\\\mathbf{0}_{12\times6}&\mathbf{I}_{12}\end{bmatrix}\in\mathbb{R}^{18\times18}.
+  \label{eq:qw-Sj}
+\end{equation}
+
+\begin{insight}[WBC 的下限——“至少实现浮动基逆动力学”]\label{ins:qw-wbc-min-id}
+WBC 有一个工程化的\emph{下限}定义：\textbf{广义地说，“为实现一组任务、使所有驱动关节都拿到控制信号”的控制系统都可叫全身控制；但四足的 WBC 至少要实现\emph{浮动基逆动力学}}——即由期望的广义加速度 $\ddot{\boldsymbol{q}}$ 与外部接触力 ${}^{\mathcal{O}}\boldsymbol{f}_c$，经动力学方程 \cref{eq:qw-floating-dyn} 反解出关节力矩 $\boldsymbol{\tau}$。这正是本章 \cref{eq:qw-inv-dyn} 那一步。换言之，零空间递推（\cref{sec:qw-priority}）只产出“关节该怎么动”（运动学层 $\ddot{\boldsymbol{q}}^{cmd}$），而把它落成“关节该出多大力”（力矩层 $\boldsymbol{\tau}_j$）必须靠 \cref{eq:qw-floating-dyn} 的 $\boldsymbol{M},\boldsymbol{C}$。所以\textbf{$\boldsymbol{M}(\boldsymbol{q})$ 与 $\boldsymbol{C}(\boldsymbol{q},\dot{\boldsymbol{q}})$ 不是可有可无的黑箱，而是 WBC 的硬性最低要求}。下面就把这两个量从 \cref{ch:quad_kin} 的空间向量地基上算出来，补上整章唯一一处“被当成已知”的接口。
+\end{insight}
+
+\subsection{质量矩阵 \texorpdfstring{$\boldsymbol{M}$}{M}：组合刚体法 CRBA}
+\label{subsec:qw-crba}
+
+\cref{eq:qw-floating-dyn} 把 $\boldsymbol{M}(\boldsymbol{q})\in\mathbb{R}^{18\times18}$、$\boldsymbol{C}(\boldsymbol{q},\dot{\boldsymbol{q}})\in\mathbb{R}^{18}$ 当作已知；\cref{ch:quad_kin} 在 Plücker 空间向量一节（\cref{note:qk-spatial-props} 性质 3、8）已埋下伏笔，明确把求 $\boldsymbol{M}$ 的\textbf{组合刚体法}（Composite Rigid Body Algorithm, CRBA）、求 $\boldsymbol{C}$ 的\textbf{递推牛顿—欧拉法}（Recursive Newton--Euler Algorithm, RNEA）留到本章。二者均为 Featherstone 空间向量框架下的 $O(N)$ 标准算法\cite{featherstone2008rigid}。这里把这两条接口逐步补全，所用的刚体雅可比 ${}_{b}\boldsymbol{J}_i$、空间惯量 $\hat{\mathbf{I}}_i$、空间叉乘 $\times$/$\times^{*}$、运动方程均直接引 \cref{ch:quad_kin}，不重推。
+
+\paragraph{从动能出发的 $\boldsymbol{M}$ 定义。}
+质量矩阵的物理定义是“系统总动能写成广义速度二次型时的核”。由 \cref{ch:quad_kin} 性质 8，单刚体 $k$ 的动能为 $\tfrac12\boldsymbol{v}_k^\top\hat{\mathbf{I}}_k\boldsymbol{v}_k$（$\hat{\mathbf{I}}_k$ 为刚体 $k$ 在其自身系下的空间惯量），而刚体空间速度由刚体雅可比 \cref{ch:quad_kin}（${}_{b}\boldsymbol{J}_k$，$6\times18$）给出 $\boldsymbol{v}_k={}_{b}\boldsymbol{J}_k\dot{\boldsymbol{q}}$。系统总动能对 $13$ 个刚体求和：
+\begin{equation}
+  \mathcal{T}=\sum_{k=1}^{13}\tfrac12\boldsymbol{v}_k^\top\hat{\mathbf{I}}_k\boldsymbol{v}_k
+  =\sum_{k=1}^{13}\tfrac12\dot{\boldsymbol{q}}^\top{}_{b}\boldsymbol{J}_k^\top\hat{\mathbf{I}}_k\,{}_{b}\boldsymbol{J}_k\dot{\boldsymbol{q}}
+  =\tfrac12\dot{\boldsymbol{q}}^\top\Big(\underbrace{\sum_{k=1}^{13}{}_{b}\boldsymbol{J}_k^\top\hat{\mathbf{I}}_k\,{}_{b}\boldsymbol{J}_k}_{\boldsymbol{M}(\boldsymbol{q})}\Big)\dot{\boldsymbol{q}}.
+  \label{eq:qw-M-energy}
+\end{equation}
+逐刚体的二次型在求和中合并，方括号内即得质量矩阵的\emph{显式}表达式：
+\begin{equation}
+  \boxed{\;\boldsymbol{M}(\boldsymbol{q})=\sum_{k=1}^{13}{}_{b}\boldsymbol{J}_k^\top\,\hat{\mathbf{I}}_k\,{}_{b}\boldsymbol{J}_k\;}.
+  \label{eq:qw-M-sum}
+\end{equation}
+$\boldsymbol{M}$ 由此自动对称正定：每项 ${}_{b}\boldsymbol{J}_k^\top\hat{\mathbf{I}}_k\,{}_{b}\boldsymbol{J}_k$ 是对称半正定的（$\hat{\mathbf{I}}_k$ 对称正定），求和保持对称正定。
+
+\paragraph{CRBA：把求和重排成 $O(N)$ 递推。}
+直接按 \cref{eq:qw-M-sum} 对 $13$ 个刚体逐一算 ${}_{b}\boldsymbol{J}_k^\top\hat{\mathbf{I}}_k\,{}_{b}\boldsymbol{J}_k$ 复杂度高且重复。CRBA 的关键观察是利用 \cref{ch:quad_kin} 性质 3（\emph{空间惯量可加，且与相对位置无关}）：把“以刚体 $i$ 为根的整个子树 $\nu(i)$（\cref{ch:quad_kin} 的子树节点集）”刚化为一体，其\textbf{组合空间惯量}为子树各刚体惯量之和（统一表到刚体 $i$ 系下）：
+\begin{equation}
+  \hat{\mathbf{I}}_i^{C}=\sum_{k\in\nu(i)}{}^{i}\mathbf{X}_k^{*}\,\hat{\mathbf{I}}_k\,{}^{i}\mathbf{X}_k,
+  \qquad
+  \hat{\mathbf{I}}_i^{C}=\hat{\mathbf{I}}_i+\sum_{c\in\mu(i)}{}^{i}\mathbf{X}_c^{*}\,\hat{\mathbf{I}}_c^{C}\,{}^{i}\mathbf{X}_c,
+  \label{eq:qw-crba-Ic}
+\end{equation}
+右式是其\emph{从叶向根}的递推形式（$\mu(i)$ 为 $i$ 的直接子节点集，\cref{ch:quad_kin}；$\mathbf{X}^{*}$ 为力向量坐标变换、$\mathbf{X}$ 为运动向量坐标变换，\cref{ch:quad_kin}）：刚体 $i$ 的组合惯量 $=$ 自身惯量 $+$ 各子树组合惯量变换到 $i$ 系后相加。由此，质量矩阵的 $(i,j)$ 元素（$j\in\kappa(i)$，即 $j$ 在根到 $i$ 的路径上）为\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{M}_{ij}=\mathbf{S}_i^\top\,\hat{\mathbf{I}}_i^{C}\,{}^{i}\mathbf{X}_j\,\mathbf{S}_j
+  \quad(j\in\kappa(i)),
+  \qquad \boldsymbol{M}_{ij}=\mathbf{0}\ (\text{$i,j$ 不在同一支链上}).
+  \label{eq:qw-crba-Mij}
+\end{equation}
+其中 $\mathbf{S}_i$ 为关节 $i$ 的运动子空间（\cref{ch:quad_kin}，浮动基 $\mathbf{S}_1=\mathbf{I}_6$、单自由度腿关节为单位运动基）。整理成算法：
+
+\begin{algo}[组合刚体法 CRBA 求质量矩阵 $\boldsymbol{M}$]\label{algo:qw-crba}
+\textbf{初始化}：对所有刚体置 $\hat{\mathbf{I}}_i^{C}=\hat{\mathbf{I}}_i$。\\
+\textbf{对} $i=N\ \textbf{downto}\ 1$（\emph{从叶向根}，子先于父）执行：
+\begin{enumerate}
+  \item 若 $\lambda(i)\neq0$：把子树组合惯量并入父节点 $\hat{\mathbf{I}}_{\lambda(i)}^{C}\mathrel{+}={}^{\lambda(i)}\mathbf{X}_i^{*}\,\hat{\mathbf{I}}_i^{C}\,{}^{i}\mathbf{X}_{\lambda(i)}$；
+  \item 力向量 $\boldsymbol{F}=\hat{\mathbf{I}}_i^{C}\,\mathbf{S}_i$；对角块 $\boldsymbol{M}_{ii}=\mathbf{S}_i^\top\boldsymbol{F}$；
+  \item 沿 $\kappa(i)$ 向根回溯 $j=\lambda(i),\lambda(\lambda(i)),\dots$：每跨一段父子边都把 $\boldsymbol{F}$ 自当前系变换到其父系 $\boldsymbol{F}\leftarrow{}^{\lambda(j)}\mathbf{X}_{j}^{*}\boldsymbol{F}$（力向量坐标变换，\cref{ch:quad_kin}），使 $\boldsymbol{F}$ 表到 $j$ 系后填 $\boldsymbol{M}_{ij}=\boldsymbol{F}^\top\mathbf{S}_j$、$\boldsymbol{M}_{ji}=\boldsymbol{M}_{ij}^\top$。
+\end{enumerate}
+\end{algo}
+
+\noindent{}对浮动基座（$i=1$，$\mathbf{S}_1=\mathbf{I}_6$）这一行直接给出 $\boldsymbol{M}$ 的左上 $6\times6$ 块——它就是\emph{整机}（全部 $13$ 刚体组合）在机身系下的复合空间惯量，与 \cref{ch:quad_mpc} 单刚体 MPC 用的整机惯量同源，区别仅在 MPC 把它\emph{近似为常值}、CRBA 则随构型精确重算。
+
+\begin{note}[CRBA 中 $\hat{\mathbf{I}}^{C}$ 与单刚体 $\hat{\mathbf{I}}$ 的区别]\label{note:qw-crba-Ic}
+易混点：\cref{eq:qw-M-sum} 的 $\hat{\mathbf{I}}_k$ 是\emph{单个}刚体 $k$ 的空间惯量；\cref{eq:qw-crba-Ic} 的 $\hat{\mathbf{I}}_i^{C}$ 是“以 $i$ 为根的整\emph{子树}刚化为一体”的\emph{组合}惯量。二者用途不同：前者进能量求和的定义式，后者进 $O(N)$ 递推。CRBA 之所以高效，正是因为性质 3 保证组合惯量\emph{与子树内部相对位姿无关}、可一次累加复用，避免了 \cref{eq:qw-M-sum} 中对每个 $(i,j)$ 重复求路径乘积。
+\end{note}
+
+\subsection{偏置力 \texorpdfstring{$\boldsymbol{C}$}{C}：递推牛顿—欧拉法 RNEA}
+\label{subsec:qw-rnea}
+
+偏置力 $\boldsymbol{C}(\boldsymbol{q},\dot{\boldsymbol{q}})$ 收集动力学方程里\emph{与关节加速度 $\ddot{\boldsymbol{q}}$ 无关}的项：重力、科氏力、离心力。求它的标准工具是 RNEA\cite{featherstone2008rigid}。
+
+\paragraph{令 $\ddot{\boldsymbol{q}}=\mathbf{0}$ 跑一遍逆动力学即得 $\boldsymbol{C}$。}
+逆动力学问“给定 $\boldsymbol{q},\dot{\boldsymbol{q}},\ddot{\boldsymbol{q}}$，要多大广义力”。把动力学 \cref{eq:qw-floating-dyn} 的无外力形式记为广义力函数 $\boldsymbol{\tau}^{\mathrm{ID}}(\boldsymbol{q},\dot{\boldsymbol{q}},\ddot{\boldsymbol{q}})=\boldsymbol{M}(\boldsymbol{q})\ddot{\boldsymbol{q}}+\boldsymbol{C}(\boldsymbol{q},\dot{\boldsymbol{q}})$。\textbf{令 $\ddot{\boldsymbol{q}}=\mathbf{0}$}，$\boldsymbol{M}\ddot{\boldsymbol{q}}$ 项消失，逆动力学的输出就\emph{恰好}是偏置力\cite{yu2021quadruped}：
+\begin{equation}
+  \boxed{\;\boldsymbol{C}(\boldsymbol{q},\dot{\boldsymbol{q}})=\boldsymbol{\tau}^{\mathrm{ID}}(\boldsymbol{q},\dot{\boldsymbol{q}},\ddot{\boldsymbol{q}}=\mathbf{0})\;}.
+  \label{eq:qw-C-rnea}
+\end{equation}
+于是求 $\boldsymbol{C}$ 不必显式拆科氏 / 离心 / 重力，只需把 RNEA 跑一遍、加速度输入清零即可。RNEA 本身是 \cref{ch:quad_kin} 递推 FK（\cref{ch:quad_kin} 的速度 / 加速度递推）与空间运动方程（\cref{ch:quad_kin} 的 $\hat{\boldsymbol{f}}=\hat{\mathbf{I}}\boldsymbol{a}+\boldsymbol{v}\times^{*}\hat{\mathbf{I}}\boldsymbol{v}$）的两趟拼接：
+
+\begin{algo}[递推牛顿—欧拉法 RNEA 求偏置力 $\boldsymbol{C}$]\label{algo:qw-rnea}
+\textbf{输入}：$\boldsymbol{q},\dot{\boldsymbol{q}}$，置 $\ddot{\boldsymbol{q}}=\mathbf{0}$。重力以基座加速度 $\boldsymbol{a}_0=-\hat{\boldsymbol{g}}$ 注入（让“惯性系有 $-\boldsymbol{g}$ 的虚拟加速度”，等效地把重力算进每个刚体，免去逐刚体加重力项）。\\
+\textbf{第一趟（根$\to$叶，算运动与受力）} 对 $i=1,\dots,N$：
+\begin{enumerate}
+  \item 速度 $\boldsymbol{v}_i={}^{i}\mathbf{X}_{\lambda(i)}\boldsymbol{v}_{\lambda(i)}+\mathbf{S}_i\dot{\boldsymbol{q}}_i$（\cref{ch:quad_kin} 速度递推）；
+  \item 加速度 $\boldsymbol{a}_i={}^{i}\mathbf{X}_{\lambda(i)}\boldsymbol{a}_{\lambda(i)}+\underbrace{\mathbf{S}_i\ddot{\boldsymbol{q}}_i}_{=\,\mathbf{0}}+\boldsymbol{v}_i\times\mathbf{S}_i\dot{\boldsymbol{q}}_i$（\cref{ch:quad_kin} 加速度递推，$\ddot{\boldsymbol{q}}_i=\mathbf{0}$ 故中项为零，只剩科氏 / 离心耦合项 $\boldsymbol{v}_i\times\mathbf{S}_i\dot{\boldsymbol{q}}_i$）；
+  \item 刚体净空间力 $\hat{\boldsymbol{f}}_i=\hat{\mathbf{I}}_i\boldsymbol{a}_i+\boldsymbol{v}_i\times^{*}\hat{\mathbf{I}}_i\boldsymbol{v}_i$（\cref{ch:quad_kin} 空间运动方程；末项即陀螺 / 离心力）。
+\end{enumerate}
+\textbf{第二趟（叶$\to$根，把力向根累加并投影）} 对 $i=N\ \textbf{downto}\ 1$：
+\begin{enumerate}
+  \item 广义力分量 $\boldsymbol{C}_i=\mathbf{S}_i^\top\hat{\boldsymbol{f}}_i$（关节力 $=$ 空间力在关节子空间上的投影，\cref{ch:quad_kin} 静力学对偶）；
+  \item 把子刚体反作用力并入父刚体 $\hat{\boldsymbol{f}}_{\lambda(i)}\mathrel{+}={}^{\lambda(i)}\mathbf{X}_i^{*}\hat{\boldsymbol{f}}_i$（\cref{ch:quad_kin} 性质 5 作用 / 反作用）。
+\end{enumerate}
+\textbf{输出}：$\boldsymbol{C}=[\boldsymbol{C}_1^\top,\dots,\boldsymbol{C}_N^\top]^\top\in\mathbb{R}^{18}$。
+\end{algo}
+
+\begin{insight}[“清零加速度”这一招的妙处——一个算法两用]\label{ins:qw-rnea-trick}
+RNEA 本是求\emph{完整}逆动力学 $\boldsymbol{\tau}^{\mathrm{ID}}=\boldsymbol{M}\ddot{\boldsymbol{q}}+\boldsymbol{C}$ 的 $O(N)$ 算法；\cref{eq:qw-C-rnea} 的技巧——\textbf{把加速度输入 $\ddot{\boldsymbol{q}}$ 清零、单独保留 $\dot{\boldsymbol{q}}$ 与重力}——让\emph{同一个}算法直接吐出偏置力 $\boldsymbol{C}$，无需为科氏 / 离心 / 重力各写一段代码。这与 CRBA（\cref{algo:qw-crba}）配合，恰好凑齐 \cref{eq:qw-floating-dyn} 所需的 $\boldsymbol{M}$ 与 $\boldsymbol{C}$ 两块——前者算“惯性项的核”、后者算“与加速度无关的偏置”。\cref{eq:qw-inv-dyn} 的逆动力学反解（求 $\boldsymbol{\tau}_j$），本质上就是用这套 $\boldsymbol{M},\boldsymbol{C}$ 加上协调后的 $\ddot{\boldsymbol{q}}$ 与接触力 ${}^{\mathcal{O}}\boldsymbol{f}_c$ 再跑一次完整 RNEA。至此，\cref{ch:quad_kin} 在 \cref{note:qk-spatial-props} 性质 3/5 与那条“留给 \cref{ch:quad_wbc}”的接口承诺被全部兑现。
+\end{insight}
+
+\begin{note}[重力以基座加速度注入的等效原理]\label{note:qw-gravity-inject}
+\cref{algo:qw-rnea} 把重力写成“给固定基座一个 $\boldsymbol{a}_0=-\hat{\boldsymbol{g}}$ 的虚拟空间加速度”（$\hat{\boldsymbol{g}}$ 为重力的空间向量形式），而不是逐刚体加 $m_k\boldsymbol{g}$ 的重力项。原理：递推 \cref{ch:quad_kin} 加速度式会把 $\boldsymbol{a}_0$ 沿树传到每个刚体，于是每个 $\hat{\mathbf{I}}_i\boldsymbol{a}_i$ 自动含一份 $-\hat{\mathbf{I}}_i\hat{\boldsymbol{g}}$，正是该刚体所受重力的空间力——这是达朗贝尔“惯性力 $=$ 等效外力”思想在空间向量框架下的标准技巧，省去单独的重力遍历。若取 $\boldsymbol{a}_0=\mathbf{0}$ 则得\emph{不含}重力的纯科氏 / 离心偏置（视上层是否已在别处补重力而定）。
+\end{note}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由 \cref{eq:qw-M-energy} 的能量求和推出 \cref{eq:qw-M-sum}：说明为何方括号内的 $\sum_k{}_{b}\boldsymbol{J}_k^\top\hat{\mathbf{I}}_k\,{}_{b}\boldsymbol{J}_k$ 必对称正定（提示：$\hat{\mathbf{I}}_k$ 对称正定 $+$ 合同变换保正定性）。
+  \item 在 \cref{algo:qw-rnea} 第一趟令 $\dot{\boldsymbol{q}}=\mathbf{0}$（机器人静止）、$\ddot{\boldsymbol{q}}=\mathbf{0}$，说明此时 $\boldsymbol{C}$ 退化为纯\emph{重力项} $\boldsymbol{G}(\boldsymbol{q})$（科氏 / 离心随 $\dot{\boldsymbol{q}}\to\mathbf{0}$ 消失）。这给了一个标定 $\boldsymbol{G}(\boldsymbol{q})$ 的简单办法。
+  \item （概念）为什么 CRBA 求 $\boldsymbol{M}$ 用\emph{从叶向根}累加组合惯量，而 RNEA 求 $\boldsymbol{C}$ 要\emph{根$\to$叶}算运动、再\emph{叶$\to$根}累加力？（提示：运动学量沿树\emph{向下}传播，力 / 惯量沿树\emph{向上}累加。）
+\end{enumerate}
+\end{practice}
+
+\subsection{四子任务划分与优先级}
+\label{subsec:qw-subtasks}
+
+四足 WBC 通常划分为四个子任务，优先级从高到低如 \cref{tab:qw-subtasks}。
+
+\begin{table}[H]\centering\small
+\caption{四足 WBC 的四子任务划分与优先级\cite{yu2021quadruped}}
+\begin{tabular}{clp{0.5\textwidth}}
+\toprule
+优先级 & 子任务 & 内容 \\
+\midrule
+1（最高）& 支撑腿轨迹跟随 & 已踩地的足底在世界系\textbf{绝对静止}（$\dot{\boldsymbol{x}}_{\mathrm{sup}}=\mathbf{0}$）；失败即打滑/摔倒 \\
+2 & 机身转动控制 & 控制浮动基姿态（roll/pitch/yaw）保持水平或跟随期望 \\
+3 & 机身平动控制 & 控制浮动基位置 $(x,y,z)$，最常见是控身高 \\
+4（最低）& 摆动腿轨迹跟随 & 控制空中摆动足跟随规划轨迹（抬起 / 前伸 / 落下）\\
+\bottomrule
+\end{tabular}
+\label{tab:qw-subtasks}
+\end{table}
+
+\begin{insight}[优先级排序 $=$ 物理因果链（接触$\to$机身$\to$摆动）]\label{ins:qw-priority-chain}
+这一排序背后的逻辑是：\textbf{四足靠支撑腿与地面的稳定接触实现一切运动，因此对支撑腿的良好控制是其他一切算法的前提}——支撑腿稍有滑动，机身控制、摆动腿控制都无从谈起，故支撑腿\emph{最高优先级}；机身平稳是行走质量的核心，故机身转动、平动排第 $2$、$3$（转动比平动更影响稳定，故转动在前）；而机器人与外界的力交互主要靠支撑腿，摆动腿只是“空中划过去”、轨迹精度不那么关键，故\emph{最低}。一句话：\textbf{优先级就是物理因果链——接触决定机身、机身决定摆动}。理解这条因果链，就不会把优先级表当成需要死记的约定，而是能自己推出来。
+\end{insight}
+
+\subsection{各子任务的雅可比与误差}
+\label{subsec:qw-subtask-jac}
+
+\paragraph{任务 1（支撑腿）。}
+支撑腿即接触腿，其雅可比 $\boldsymbol{J}_1=\boldsymbol{J}_c$。支撑足在世界系绝对静止，无轨迹规划，故期望速度、期望加速度均取零：$\dot{\boldsymbol{x}}_1^d=\mathbf{0}$、$\ddot{\boldsymbol{x}}_1^d=\mathbf{0}$，无 PD 控制器项\cite{yu2021quadruped}。这是优先级 $1$ 的“硬约束”：支撑足不许动。
+
+\paragraph{任务 2（机身转动，误差需变基）。}
+机身姿态用欧拉角 $\boldsymbol{\Theta}$ 表达，但欧拉角的“基”随姿态变化，不能直接把欧拉角误差 $\boldsymbol{\Theta}_d-\boldsymbol{\Theta}$ 当作角速度误差用。须把欧拉角误差通过欧拉角率$\to$角速度映射 $\boldsymbol{T}(\boldsymbol{\Theta})$（与 \cref{ch:quad_mpc} 的角速度映射同源）变到角速度的基下\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{e}_2=\begin{bmatrix}c_\theta c_\psi & -s_\psi & 0\\ c_\theta s_\psi & c_\psi & 0\\ -s_\theta & 0 & 1\end{bmatrix}(\boldsymbol{\Theta}_d-\boldsymbol{\Theta}),
+  \label{eq:qw-e2}
+\end{equation}
+其中 $c_\bullet=\cos\bullet,s_\bullet=\sin\bullet$。任务 $2$ 的工作空间是机身姿态（世界系），而广义速度的角速度分量在本体系、位于 $\dot{\boldsymbol{q}}$ 的前 $3$ 维（即第 $1$--$3$ 维，角量块），故任务 $2$ 雅可比把本体角速度映到世界系\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{J}_2=\begin{bmatrix}{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}} & \mathbf{0}_{3\times15}\end{bmatrix}.
+  \label{eq:qw-J2}
+\end{equation}
+
+\paragraph{任务 3（机身平动）。}
+工作空间为质心世界系位置 ${}^{\mathcal{O}}\boldsymbol{p}_{com}$、速度 ${}^{\mathcal{O}}\boldsymbol{v}_{com}$。本体系平动速度位于 $\dot{\boldsymbol{q}}$ 的中 $3$ 维（即第 $4$--$6$ 维，线量块），雅可比把它映到世界系\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{J}_3=\begin{bmatrix}\mathbf{0}_{3\times3} & {}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}} & \mathbf{0}_{3\times12}\end{bmatrix}.
+  \label{eq:qw-J3}
+\end{equation}
+
+\paragraph{任务 4（摆动腿）。}
+工作空间为各摆动足的世界系位置 / 期望位置 / 速度 / 期望速度，取自状态估计器（\cref{ch:quad_est}）与足底轨迹规划器（\cref{ch:quad_gait}）；雅可比 $\boldsymbol{J}_4$ 即摆动腿的足端雅可比。
+
+\cref{eq:qw-e2} 是 ZYX 欧拉角率$\to$角速度映射矩阵 $\boldsymbol{T}(\boldsymbol{\Theta})$ 的标准形式，与 \cref{ch:quad_mpc} 推出的角速度映射逐元素一致（注意本体系与世界系的转置约定）。
+
+\subsection{加速度级递推 WBC 伪代码}
+\label{subsec:qw-pseudocode}
+
+把四子任务代入加速度级递推 \cref{eq:qw-acc-level}，并同时维护位置级、速度级，得四足 WBC 的完整递推（一拍内执行）\cite{yu2021quadruped}：
+\begin{equation}
+\begin{aligned}
+&\Delta\boldsymbol{q}_1^{cmd}=\mathbf{0},\quad \dot{\boldsymbol{q}}_1^{cmd}=\mathbf{0},\quad \ddot{\boldsymbol{q}}_1^{cmd}=\boldsymbol{J}_1^+\big(-\dot{\boldsymbol{J}}_1\dot{\boldsymbol{q}}\big);\\
+&\textbf{for } i=2\ \textbf{to}\ 4\ \textbf{do}\\
+&\quad \boldsymbol{e}_i=\boldsymbol{x}_i^d-\boldsymbol{x}_i;\\
+&\quad \ddot{\boldsymbol{x}}_i^{cmd}=\ddot{\boldsymbol{x}}_i^d+\boldsymbol{K}_p^i(\boldsymbol{x}_i^d-\boldsymbol{x}_i)+\boldsymbol{K}_d^i(\dot{\boldsymbol{x}}_i^d-\dot{\boldsymbol{x}}_i);\\
+&\quad \boldsymbol{J}_{i-1}^{A}=[\boldsymbol{J}_1^\top\ \cdots\ \boldsymbol{J}_{i-1}^\top]^\top,\quad \boldsymbol{N}_{i-1}^{A}=\mathbf{I}-(\boldsymbol{J}_{i-1}^{A})^+\boldsymbol{J}_{i-1}^{A};\\
+&\quad \Delta\boldsymbol{q}_i^{cmd}=\Delta\boldsymbol{q}_{i-1}^{cmd}+(\boldsymbol{J}_i\boldsymbol{N}_{i-1}^{A})^+\big(\boldsymbol{e}_i-\boldsymbol{J}_i\Delta\boldsymbol{q}_{i-1}^{cmd}\big);\\
+&\quad \dot{\boldsymbol{q}}_i^{cmd}=\dot{\boldsymbol{q}}_{i-1}^{cmd}+(\boldsymbol{J}_i\boldsymbol{N}_{i-1}^{A})^+\big(\dot{\boldsymbol{x}}_i^d-\boldsymbol{J}_i\dot{\boldsymbol{q}}_{i-1}^{cmd}\big);\\
+&\quad \ddot{\boldsymbol{q}}_i^{cmd}=\ddot{\boldsymbol{q}}_{i-1}^{cmd}+(\boldsymbol{J}_i\boldsymbol{N}_{i-1}^{A})^+\big(\ddot{\boldsymbol{x}}_i^{cmd}-\dot{\boldsymbol{J}}_i\dot{\boldsymbol{q}}-\boldsymbol{J}_i\ddot{\boldsymbol{q}}_{i-1}^{cmd}\big);\\
+&\textbf{end for}\\
+&\boldsymbol{q}^{cmd}=\boldsymbol{q}+\Delta\boldsymbol{q}_4^{cmd},\quad \dot{\boldsymbol{q}}^{cmd}=\dot{\boldsymbol{q}}_4^{cmd},\quad \ddot{\boldsymbol{q}}^{cmd}=\ddot{\boldsymbol{q}}_4^{cmd}.
+\end{aligned}
+\label{eq:qw-pseudocode}
+\end{equation}
+
+\cref{eq:qw-pseudocode} 首行的加速度级\emph{起始}式 $\ddot{\boldsymbol{q}}_1^{cmd}=\boldsymbol{J}_1^+(-\dot{\boldsymbol{J}}_1\dot{\boldsymbol{q}})$ 由加速度映射 \cref{eq:qw-acc-map} 与支撑腿 $\ddot{\boldsymbol{x}}_1=\mathbf{0}$ 推得，须含 $\dot{\boldsymbol{J}}_1$（一阶导）一项。
+
+本递推一拍内尚需备齐：任务 $1$、$4$ 的雅可比 $\boldsymbol{J}_1,\boldsymbol{J}_4$，各任务的 $\dot{\boldsymbol{J}}_i\dot{\boldsymbol{q}}$ 项，以及 \cref{eq:qw-floating-dyn} 中的接触力 ${}^{\mathcal{O}}\boldsymbol{f}_c$。其中接触力正是上游 MPC（\cref{ch:quad_mpc}）提供的 $\boldsymbol{f}^{\mathrm{MPC}}$——下一节的松弛 QP 就要协调它与本节算出的 $\ddot{\boldsymbol{q}}^{cmd}$。
+
+\begin{practice}
+\begin{enumerate}
+  \item 数一数：$\boldsymbol{J}_2$（\cref{eq:qw-J2}）的列数应为 $18$；验证 $3+15=18$、$3+3+12=18$（\cref{eq:qw-J3}）。说明为何列数恒为 $18$（提示：广义速度维数）。
+  \item 由 \cref{eq:qw-acc-map} 与支撑腿 $\ddot{\boldsymbol{x}}_1=\mathbf{0}$ 推出 \cref{eq:qw-pseudocode} 首行的起始式 $\ddot{\boldsymbol{q}}_1^{cmd}=\boldsymbol{J}_1^+(-\dot{\boldsymbol{J}}_1\dot{\boldsymbol{q}})$。
+  \item （概念）\cref{note:qw-gen-vel} 说 $\dot{\boldsymbol{q}}$ 非 $\boldsymbol{q}$ 的逐元素微分。这对 \cref{eq:qw-pseudocode} 末行 $\boldsymbol{q}^{cmd}=\boldsymbol{q}+\Delta\boldsymbol{q}_4^{cmd}$ 中“前 $6$ 维如何更新机身位姿”有何影响？（提示：欧拉角增量 vs 角速度积分。）
+\end{enumerate}
+\end{practice}
+
+\subsection{机身加速度任务：四足纯前馈 vs 双足必须反馈}
+\label{subsec:qw-base-feedforward}
+
+上面把 WBC 写成“NSP 递推产出 $\ddot{\boldsymbol{q}}^{cmd}$、末端松弛 QP 协调 MPC 力”的形态（\cref{eq:qw-pseudocode}、下一节 \cref{eq:qw-qp-standard}）。把这套框架落到一个真实工业级开源栈（\texttt{legged\_control} 的 OCS2 NMPC+WBC，\cref{ch:quad_mpc} 已用作 NMPC 一侧的工业实例）上时，机身（浮动基）这一任务的写法藏着一个\emph{quadruped 与 biped 的核心区别}，本书前文虽反复用“机身转动/平动任务”（\cref{tab:qw-subtasks} 的任务 $2,3$）却从未点破：\textbf{对四足，机身加速度任务可以\emph{纯前馈}（无任何位姿反馈增益）；对双足（尤其点足），它\emph{必须}加反馈，否则发散}。
+
+\paragraph{四足的机身加速度任务是纯前馈。}
+在 \cref{tab:qw-subtasks} 的优先级里，任务 $2$（机身转动）、任务 $3$（机身平动）合起来就是“控制浮动基 $6$ 维位姿”。\cref{eq:qw-pseudocode} 给的递推里它们各带一个 PD 项 $\boldsymbol{K}_p^i(\boldsymbol{x}_i^d-\boldsymbol{x}_i)+\boldsymbol{K}_d^i(\dot{\boldsymbol{x}}_i^d-\dot{\boldsymbol{x}}_i)$——这是\emph{有反馈}的写法。但在 \texttt{legged\_control} 这类“NMPC 在上、WBC 在下”的双层栈里，机身任务被合并成一个\textbf{机身加速度等式任务}，其期望加速度直接由上游 NMPC 的\emph{质心动量率}给出，\emph{不含任何 $\boldsymbol{K}_p,\boldsymbol{K}_d$}。具体地，记 $\boldsymbol{A}(\boldsymbol{q})$ 为质心动量矩阵（把广义速度映到质心动量 $\boldsymbol{h}=\boldsymbol{A}\dot{\boldsymbol{q}}$，与 \cref{ch:quad_mpc} 质心动力学的动量定义同源），按基/关节分块 $\boldsymbol{A}=[\boldsymbol{A}_b\ \boldsymbol{A}_j]$（$\boldsymbol{A}_b$ 为前 $6$ 列、$\boldsymbol{A}_j$ 为后 $12$ 列），则机身段广义加速度的期望值为
+\begin{equation}
+  \ddot{\boldsymbol{q}}_b^{des}=\boldsymbol{A}_b^{-1}\Big(\underbrace{\dot{\boldsymbol{h}}^{\mathrm{MPC}}}_{\text{MPC 给的动量率}}-\dot{\boldsymbol{A}}\dot{\boldsymbol{q}}-\boldsymbol{A}_j\ddot{\boldsymbol{q}}_j\Big),
+  \label{eq:qw-base-accel}
+\end{equation}
+其中 $\dot{\boldsymbol{h}}^{\mathrm{MPC}}$ 是 NMPC 优化输出的质心动量变化率（即“机身该获得的合力/合力矩”），$\dot{\boldsymbol{A}}\dot{\boldsymbol{q}}$ 是动量矩阵随构型变化的偏置项，$\boldsymbol{A}_j\ddot{\boldsymbol{q}}_j$ 扣除关节加速度对质心动量的贡献。\textbf{\cref{eq:qw-base-accel} 全无 $\boldsymbol{K}_p(\boldsymbol{p}_b^d-\boldsymbol{p}_b)$、$\boldsymbol{K}_d(\boldsymbol{v}_b^d-\boldsymbol{v}_b)$ 这类机身位姿/高度/姿态反馈——期望动量率纯来自 MPC、是纯前馈。}它再作为一条软等式任务（\cref{tab:qw-subtasks} 优先级介于支撑腿与摆动腿之间）进 WBC 求解。
+
+\begin{insight}[四足机身任务可纯前馈、双足必须反馈——一个 quadruped$\leftrightarrow$biped 的分水岭]\label{ins:qw-base-feedforward}
+为什么\emph{同一段}机身加速度任务，四足能省掉反馈、双足却不能？关键在\textbf{机身在不接触输入下的开环稳定性}：
+\begin{itemize}
+  \item \textbf{四足：纯前馈够用。}四足站立/小跑时至少两足（常四足或对角两足）支撑，支撑多边形有面积，机身被多点接触力“架”住——这是一个开环近似\emph{稳定}的刚体；加之上游 NMPC 在长时域上已把机身位姿误差吸收进它的最优足端力里（\emph{隐式}稳基，\cref{ins:qw-mpc-wbc}），WBC 这一层只需\emph{忠实复现}MPC 想要的动量率即可，再叠一层位姿 PD 反而与 MPC 的预测层“抢方向盘”。故 \cref{eq:qw-base-accel} 纯前馈对四足\emph{正确}。
+  \item \textbf{双足（点足）：必须反馈。}双足支撑域窄（线接触甚至点接触），机身本质是一个\emph{倒立摆}——开环\emph{不稳定}，一点扰动就指数发散。若 WBC 机身任务也用纯前馈（反馈增益 $=0$），等于把一个倒立摆交给“没有镇定项”的控制器，必然倒。故双足分支必须把机身任务拆出独立的反馈通道：把 \cref{eq:qw-base-accel} 替换为带增益的 \emph{机身高度} $\boldsymbol{K}_p^z,\boldsymbol{K}_d^z$ + \emph{机身姿态} $\boldsymbol{K}_p^\Theta,\boldsymbol{K}_d^\Theta$ 反馈（机身水平 $XY$ 平动仍可前馈）。
+\end{itemize}
+\textbf{一句话：四足靠“多足支撑 + MPC 隐式稳基”使浮动基开环近稳、机身任务可纯前馈；双足是倒立摆、开环不稳，机身任务必须自带镇定反馈。}这正是 \texttt{legged\_control}（四足）→ 其双足衍生分支这条谱系上，机身任务从“纯前馈”改成“高度反馈 + 姿态反馈 + $XY$ 前馈”的根本原因。
+\end{insight}
+
+\begin{pitfall}[反面教训：双足误用四足的纯前馈机身任务$\Rightarrow$点足倒立摆必发散]
+这条分水岭有一个真实的“踩坑”案例。某点足双足项目（四足栈 \texttt{legged\_control} 的双足衍生）起步时\emph{直接照搬}了四足版的机身加速度任务——即 \cref{eq:qw-base-accel} 那个\emph{反馈增益为零}的纯前馈式。后果：点足双足是一个标准倒立摆，开环不稳，纯前馈机身任务给不出镇定力矩，机器人\textbf{必然发散倒下}；而且因为别处一切看起来都“对”（维度对、约束对、MPC 也在出合理的力），这个 bug 极难定位，耗了约 $120$ 个步态周期的反复调试才追到“机身任务漏了反馈增益”这一处。对照之下，四足项目直接沿用同一份纯前馈机身任务\emph{从不出问题}——因为四足开环近稳。\textbf{教训}：移植/改写 WBC 机身任务时，先问“这台机器人的浮动基开环稳不稳”——四足（多足支撑）可纯前馈，双足/点足（倒立摆）必加反馈；把适用于稳基系统的“纯前馈机身任务”搬到不稳基系统上，是 quadruped→biped 移植的头号陷阱。
+\end{pitfall}
+
+\begin{pitfall}[机身动力学方程里的偏置力别重复加重力]\label{pit:qw-nle-gravity}
+落地 \cref{eq:qw-floating-dyn} 时还有一个高频小错。把浮动基动力学写成 WBC 的等式约束时（下文 \cref{eq:qw-trunk-dyn} 的躯干段、以及完整 $18$ 维 EoM），偏置力 $\boldsymbol{C}(\boldsymbol{q},\dot{\boldsymbol{q}})$ 在主流刚体动力学库（如 Pinocchio 的 \texttt{data.nle}，对应本章 \cref{algo:qw-rnea} 令 $\ddot{\boldsymbol{q}}=\mathbf{0}$ 跑一遍 RNEA 的输出）里\textbf{已经同时包含了重力项、科氏力与离心力}（正是 \cref{note:qw-gravity-inject} 把重力以基座加速度 $\boldsymbol{a}_0=-\hat{\boldsymbol{g}}$ 注入后 RNEA 自带的那份）。因此 EoM 任务里\emph{不要再额外补一项 $\boldsymbol{G}(\boldsymbol{q})$ 重力}——重复加重力会让机身在每拍多承受一份 $m\boldsymbol{g}$ 的虚假外力，表现为机身被“多压一截”或力分配整体偏置。这条在实际开源 WBC 实现里确有人踩过（把 $\boldsymbol{C}$ 当成只含科氏/离心、又手动加了一遍重力）。\textbf{记法约定}：本章 $\boldsymbol{C}(\boldsymbol{q},\dot{\boldsymbol{q}})$（\cref{eq:qw-floating-dyn}）含重力（见其定义“含重力、科氏力、离心力”），故凡用到 $\boldsymbol{C}$ 的等式都\emph{已}含重力，勿叠加。
+\end{pitfall}
+
+\subsection{把松弛 QP 放回完整的 42 维 WBC QP}
+\label{subsec:qw-42dof}
+
+本章下一节（\cref{sec:qw-relax}）为了把推导讲清楚，用的是一个\emph{瘦}松弛形：决策变量只取 $\boldsymbol{\mathcal{X}}=[\boldsymbol{\delta}_{\ddot{q}}(6);\,\boldsymbol{\delta}_f]$（\cref{eq:qw-X}），即“在 NSP 递推已定死 $\ddot{\boldsymbol{q}}^{cmd}$、MPC 已定死 $\boldsymbol{f}^{\mathrm{MPC}}$ 的基础上，只优化两个小松弛量”。工业级实现里常见的是另一种\emph{胖}写法：把广义加速度、接触力、关节力矩\emph{一起}当决策变量，整个 WBC 就是一个统一的 QP。两者并非取代关系——瘦松弛形是胖 QP 在“先用 NSP 把运动学优先级定死、只留松弛”视角下的一个化简切片；理解胖形能看清各任务在 QP 里的精确数学位置。
+
+\begin{insight}[完整 WBC QP 的精确决策变量——$42=\ddot{\boldsymbol{q}}(18)+\boldsymbol{F}(12)+\boldsymbol{\tau}(12)$]\label{ins:qw-42dof}
+以 \texttt{legged\_control} 的四足 WBC 为例，单个 QP 的决策变量是
+\begin{equation}
+  \boldsymbol{x}_{\mathrm{wbc}}=\begin{bmatrix}\ddot{\boldsymbol{q}}\\\boldsymbol{F}\\\boldsymbol{\tau}\end{bmatrix}
+  \in\mathbb{R}^{42},\qquad
+  42=\underbrace{18}_{\ddot{\boldsymbol{q}}:\,\text{base }6+\text{关节 }12}+\underbrace{12}_{\boldsymbol{F}:\,4\text{ 足}\times3}+\underbrace{12}_{\boldsymbol{\tau}:\,12\text{ 关节}}.
+  \label{eq:qw-42dof}
+\end{equation}
+其中三块依次是：全 $18$ 维广义加速度 $\ddot{\boldsymbol{q}}$（\cref{eq:qw-gen-vel} 那个重定义的广义加速度，含\emph{机身} $6$ 维与\emph{关节} $12$ 维）、$4$ 足各 $3$ 维的接触力 $\boldsymbol{F}\in\mathbb{R}^{12}$、$12$ 个关节力矩 $\boldsymbol{\tau}\in\mathbb{R}^{12}$。
+\textbf{一个核心易错点（特意点出）：$\ddot{\boldsymbol{q}}$ 是\emph{全} $18$ 维广义加速度，不是只取机身 $6$ 维}。这一点容易看错——本章瘦松弛形 \cref{eq:qw-X} 里只松弛机身 $6$ 维（关节加速度已被 NSP 递推定死），极易让人误以为完整 QP 的加速度变量也只有 $6$ 维（于是把 $42$ 误算成 $30$）。把胖 QP 的加速度变量看成 $18$ 维、还是 $6$ 维，是“关节加速度到底进不进 QP 自由变量”的分水岭：瘦松弛形里不进（已定死），胖 QP 里进（与力矩、接触力一起被 EoM 耦合求解）。\textbf{方法论诫语}：维度这种东西必须回源码/原始定义核对——“$42$”正是“$\text{广义坐标数 }18+3\times\text{三自由度接触点数 }(=12)+\text{驱动自由度数 }12$”逐项相加，凭直觉记很容易写成 $30$ 或 $\text{base}6$ 的错值（\cref{ins:qw-base-feedforward} 旁那条“先问开环稳不稳”同理：核心量靠回源核对，不靠直觉）。
+\end{insight}
+
+\paragraph{各任务在 42 维 QP 里的精确数学。}
+把 \cref{tab:qw-subtasks} 的四子任务、加上 EoM、力矩限与摩擦约束，统一写成对决策变量 $\boldsymbol{x}_{\mathrm{wbc}}$（\cref{eq:qw-42dof}）的线性等式 $\boldsymbol{a}\,\boldsymbol{x}_{\mathrm{wbc}}=\boldsymbol{b}$ 或不等式 $\boldsymbol{d}\,\boldsymbol{x}_{\mathrm{wbc}}\le\boldsymbol{f}$，如 \cref{tab:qw-42tasks}。它们都是本章已推导对象在 $42$ 维变量上的“装配版”：浮动基 EoM 就是 \cref{eq:qw-floating-dyn} 移项（把 $\boldsymbol{M}\ddot{\boldsymbol{q}}-\boldsymbol{J}_c^\top\boldsymbol{F}-\boldsymbol{S}_j^\top\boldsymbol{\tau}=-\boldsymbol{C}$ 一字排开）；支撑足不动是 $\boldsymbol{J}_c\dot{\boldsymbol{q}}=\mathbf{0}$ 对时间求导（\cref{tab:qw-subtasks} 任务 $1$ 的加速度级）；摆动腿是 \cref{eq:qw-pseudocode} 摆动段的加速度级 PD；接触力任务则把 MPC 的 $\boldsymbol{f}^{\mathrm{MPC}}$ 作软等式钉给 $\boldsymbol{F}$。
+
+\begin{table}[H]\centering\small
+\caption{完整 $42$ 维 WBC QP 的各任务（决策变量 $\boldsymbol{x}_{\mathrm{wbc}}=[\ddot{\boldsymbol{q}}(18),\boldsymbol{F}(12),\boldsymbol{\tau}(12)]$，\cref{eq:qw-42dof}）}
+\begin{tabular}{p{0.20\textwidth} p{0.10\textwidth} p{0.58\textwidth}}
+\toprule
+任务 & 类型 & 数学（对 $\boldsymbol{x}_{\mathrm{wbc}}$ 的等式/不等式） \\
+\midrule
+浮动基 EoM & 等式（硬）& $[\boldsymbol{M}\ \ -\boldsymbol{J}_c^\top\ \ -\boldsymbol{S}_j^\top]\,\boldsymbol{x}_{\mathrm{wbc}}=-\boldsymbol{C}$，共 $18$ 行（即 \cref{eq:qw-floating-dyn}；$\boldsymbol{C}$ 已含重力，\cref{pit:qw-nle-gravity}）\\
+力矩上限 & 不等式（硬）& $-\boldsymbol{\tau}_{\lim}\le\boldsymbol{\tau}\le\boldsymbol{\tau}_{\lim}$ \\
+摩擦（金字塔）& 不等式（硬）& 每支撑足 $5$ 行线性化摩擦锥（$\mu\!\approx\!0.3$）；摆动足 $\boldsymbol{F}_i=\mathbf{0}$ \\
+支撑足不动 & 等式（硬）& $\boldsymbol{J}_c\ddot{\boldsymbol{q}}=-\dot{\boldsymbol{J}}_c\dot{\boldsymbol{q}}$（\cref{tab:qw-subtasks} 任务 $1$ 的加速度级）\\
+机身加速度 & 等式（软）& 四足\emph{纯前馈} \cref{eq:qw-base-accel}（无位姿反馈，\cref{ins:qw-base-feedforward}）\\
+摆动腿 & 等式（软）& $\boldsymbol{J}_{sw}\ddot{\boldsymbol{q}}=\boldsymbol{K}_p(\boldsymbol{p}^d-\boldsymbol{p})+\boldsymbol{K}_d(\boldsymbol{v}^d-\boldsymbol{v})-\dot{\boldsymbol{J}}_{sw}\dot{\boldsymbol{q}}$（高增益，量级 $\boldsymbol{K}_p\!\sim\!350$）\\
+接触力 & 等式（软）& $\boldsymbol{F}=\boldsymbol{f}^{\mathrm{MPC}}$（钉给上游 MPC 的足端力，\cref{ch:quad_mpc}）\\
+\bottomrule
+\end{tabular}
+\label{tab:qw-42tasks}
+\end{table}
+
+\begin{insight}[加权 WBC 与层级 WBC 落到代码——本章 WQP/HQP 谱系的工业实例]\label{ins:qw-weighted-vs-hierarchical}
+\cref{tab:qw-42tasks} 列了“硬约束 + 软任务”，但\emph{软任务之间如何排座次}还有两条工程路线，恰好就是本章 \cref{sec:qw-history} 谱系（\cref{tab:qw-spectrum}）里 WQP 与 HQP 的代码落地：
+\begin{itemize}
+  \item \textbf{加权 WBC（WeightedWbc，对应 WQP）}：把硬约束（EoM + 力矩限 + 摩擦 + 支撑足不动）作\emph{真·约束}，把软任务（摆动腿、机身加速度、接触力）按权重\emph{堆进同一个二次代价}凑成\emph{单个} QP，交给一个 QP 求解器（如 \texttt{qpOASES}）一次解出。一组典型权重是“摆动腿 $\times100$、机身加速度 $\times1$、接触力 $\times0.01$”——\textbf{摆动腿权重最高}（脚要准确落点），\textbf{接触力权重最低}（已被 EoM 与摩擦硬约束兜住，只需轻轻拉向 MPC 值）。这正是 \cref{eq:qw-wqp} 式 WQP 的工业写法：软优先级、单 QP、快，但不保证严格优先级（\cref{ins:qw-spectrum} 的“软优先级污染”风险在此存在）。
+  \item \textbf{层级 WBC（HierarchicalWbc + HoQp，对应 HQP）}：按 \cref{tab:qw-subtasks} 的严格优先级级联求解，第 $i$ 级只在前 $i-1$ 级的零空间里优化（零空间投影，理论即 \cref{sec:qw-priority} 的递推 + 不等式处理，文献 Bellicoso 等\cite{bellicoso2016whole}）。\textbf{严格优先级 + 不等式约束}，但需连续解多个 QP、慢。
+\end{itemize}
+\textbf{对照}：同一台四足、同一组 \cref{tab:qw-42tasks} 任务，WeightedWbc 用“一个大 QP + 软权重”、HierarchicalWbc 用“多个小 QP + 硬优先级”——这就是 \cref{tab:qw-spectrum} 那张“WQP vs HQP”谱系表落到真实代码的样子，也补全了 \cref{ins:qw-unitree-balance} 从“第 $0$ 档（力级、单刚体）”到“完整 WBC”阶梯上、加权/层级两档的实物对照。实时四足控制器多数选 WeightedWbc（速度优先），把严格优先级让位给“权重拉开足够量级 + 高优先级任务维度可控”。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{松弛优化：闭合 MPC\texorpdfstring{$\to$}{->}WBC\texorpdfstring{$\to$}{->}转矩控制链}
+\label{sec:qw-relax}
+
+至此，MPC 给了足端力 $\boldsymbol{f}^{\mathrm{MPC}}$，WBC 给了广义加速度 $\ddot{\boldsymbol{q}}^{cmd}$。最后一步是把它们\emph{协调一致}，反解出关节力矩。本节是整条控制链的闭环。
+
+\subsection{问题：MPC 足端力与 WBC 加速度不一致}
+\label{subsec:qw-inconsistency}
+
+只取浮动基座动力学 \cref{eq:qw-floating-dyn} 的\emph{前 $6$ 行}（对应浮动基体本身，这 $6$ 维不可驱动、$\boldsymbol{S}_j$ 把关节力矩滤掉了）。定义浮动基选择矩阵\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{S}_f=\begin{bmatrix}\mathbf{I}_{6\times6}&\mathbf{0}\\\mathbf{0}&\mathbf{0}\end{bmatrix}\in\mathbb{R}^{18\times18},
+  \label{eq:qw-Sf}
+\end{equation}
+左乘 \cref{eq:qw-floating-dyn}（注意 $\boldsymbol{S}_f\boldsymbol{S}_j=\mathbf{0}$，关节力矩项消失）得\textbf{躯干动力学}\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{S}_f\boldsymbol{M}\ddot{\boldsymbol{q}}+\boldsymbol{S}_f\boldsymbol{C}=\boldsymbol{S}_f\boldsymbol{J}_c^\top\,{}^{\mathcal{O}}\boldsymbol{f}_c.
+  \label{eq:qw-trunk-dyn}
+\end{equation}
+
+\begin{insight}[MPC 与 WBC 口径不一致——松弛 QP 的动机]\label{ins:qw-inconsistency}
+松弛优化的根本动机在于：MPC 已给足端力 ${}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}$，WBC 已给广义加速度 $\ddot{\boldsymbol{q}}^{cmd}$，但\textbf{把二者直接代入躯干动力学 \cref{eq:qw-trunk-dyn}，左右一般\emph{不}相等}。原因在于两者的“口径”不同：$\boldsymbol{f}^{\mathrm{MPC}}$ 侧重\emph{未来一段时间}的最优（预测层、长时域），$\ddot{\boldsymbol{q}}^{cmd}$ 侧重\emph{此刻}的任务优先级（瞬时层）。一个看未来、一个看当下，强行同时满足同一个动力学等式会过约束、无解。这正是 \cref{ins:qw-mpc-wbc} 所说“两层目标互补但不一致”的代数体现。\textbf{松弛 QP 就是这两层之间的“粘合剂”}：给两者各加一个尽量小的松弛量，让动力学等式能被满足，同时让对 MPC 力和 WBC 加速度的偏离都最小。
+\end{insight}
+
+\subsection{松弛变量与带约束优化}
+\label{subsec:qw-slack}
+
+给 WBC 加速度与 MPC 足端力各加一个松弛量\cite{yu2021quadruped}：
+\begin{equation}
+  \ddot{\boldsymbol{q}}=\ddot{\boldsymbol{q}}^{cmd}+\begin{bmatrix}\boldsymbol{\delta}_{\ddot{q}}\\\mathbf{0}_{12}\end{bmatrix},
+  \qquad
+  {}^{\mathcal{O}}\boldsymbol{f}_c={}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}+\boldsymbol{\delta}_f,
+  \label{eq:qw-slack}
+\end{equation}
+其中加速度松弛 $\boldsymbol{\delta}_{\ddot{q}}\in\mathbb{R}^6$ 只作用于\emph{浮动基}前 $6$ 维（关节加速度由递推链定死，不松弛），$\boldsymbol{\delta}_f$ 是足端力松弛。松弛越小越好，构造带约束优化\cite{yu2021quadruped}：
+\begin{equation}
+\begin{aligned}
+\min_{\boldsymbol{\delta}_{\ddot{q}},\boldsymbol{\delta}_f}\ & J=\boldsymbol{\delta}_{\ddot{q}}^\top\boldsymbol{Q}_1\boldsymbol{\delta}_{\ddot{q}}+\boldsymbol{\delta}_f^\top\boldsymbol{Q}_2\boldsymbol{\delta}_f\\
+\text{s.t.}\ & \boldsymbol{S}_f\boldsymbol{M}\ddot{\boldsymbol{q}}+\boldsymbol{S}_f\boldsymbol{C}=\boldsymbol{S}_f\boldsymbol{J}_c^\top\,{}^{\mathcal{O}}\boldsymbol{f}_c,\\
+& \ddot{\boldsymbol{q}}=\ddot{\boldsymbol{q}}^{cmd}+[\boldsymbol{\delta}_{\ddot{q}};\,\mathbf{0}],\\
+& {}^{\mathcal{O}}\boldsymbol{f}_c={}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}+\boldsymbol{\delta}_f,\\
+& \underline{\boldsymbol{c}}_A^i\le\boldsymbol{C}_A^i\,{}^{\mathcal{O}}\boldsymbol{f}_c^i\le\overline{\boldsymbol{c}}_A^i.
+\end{aligned}
+\label{eq:qw-slack-opt}
+\end{equation}
+最后一行是第 $i$ 支撑腿的摩擦锥 / 幅值线性约束，约束矩阵 $\boldsymbol{C}_A^i$（块对角约束 $\boldsymbol{C}_A$ 的第 $i$ 个对角块）复用 \cref{ch:quad_mpc} 的摩擦金字塔。
+
+二次型 $\boldsymbol{\delta}^\top\boldsymbol{Q}_1\boldsymbol{\delta}$ 中的松弛量须为\emph{同一}变量；物理上松弛的是\emph{加速度}（\cref{eq:qw-slack} 第一式），故全章统一记加速度松弛为 $\boldsymbol{\delta}_{\ddot{q}}$（二阶导记号）、力松弛为 $\boldsymbol{\delta}_f$。
+
+\begin{insight}[$\boldsymbol{Q}_1,\boldsymbol{Q}_2$ 的含义——“信任 WBC 还是信任 MPC”]\label{ins:qw-Q1Q2}
+权重矩阵有清晰的直觉：\textbf{$\boldsymbol{Q}_1,\boldsymbol{Q}_2$ 编码“控制系统更信任 WBC 一点还是更信任 MPC 一点”}。$\boldsymbol{Q}_1$ 惩罚加速度松弛 $\boldsymbol{\delta}_{\ddot{q}}$（偏离 WBC 指令的代价），$\boldsymbol{Q}_2$ 惩罚力松弛 $\boldsymbol{\delta}_f$（偏离 MPC 力的代价）。一组典型取值为 $\boldsymbol{Q}_1=\mathbf{I}$、$\boldsymbol{Q}_2=0.005\,\mathbf{I}$：$\boldsymbol{Q}_2$ 比 $\boldsymbol{Q}_1$ 小两个量级，意味着\textbf{更信任 MPC 的足端力、允许 WBC 加速度多让步}——一旦两者冲突，宁可让躯干加速度偏离 WBC 一点，也尽量守住 MPC 算出的力（因为 MPC 那套力是经过未来时域优化、保证动态稳定的）。调这两个数，就是在“瞬时任务跟踪”与“长时域最优力”之间挪重心。
+\end{insight}
+
+\subsection{化为标准 QP}
+\label{subsec:qw-standard-qp}
+
+把松弛优化整理成求解器（如 QuadProg++）接受的标准二次规划。优化变量堆叠\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{\mathcal{X}}=\begin{bmatrix}\boldsymbol{\delta}_{\ddot{q}}\\\boldsymbol{\delta}_f\end{bmatrix}.
+  \label{eq:qw-X}
+\end{equation}
+\textbf{目标函数}写成二次型（$\boldsymbol{G}$ 为 $2$ 倍块对角权重）：
+\begin{equation}
+  J=\boldsymbol{\mathcal{X}}^\top\begin{bmatrix}\boldsymbol{Q}_1&\mathbf{0}\\\mathbf{0}&\boldsymbol{Q}_2\end{bmatrix}\boldsymbol{\mathcal{X}}
+  =\tfrac12\,\boldsymbol{\mathcal{X}}^\top\boldsymbol{G}\boldsymbol{\mathcal{X}},
+  \qquad
+  \boldsymbol{G}=2\begin{bmatrix}\boldsymbol{Q}_1&\mathbf{0}\\\mathbf{0}&\boldsymbol{Q}_2\end{bmatrix}.
+  \label{eq:qw-qp-obj}
+\end{equation}
+
+\paragraph{等式约束（躯干动力学）。}
+把 \cref{eq:qw-slack} 代入躯干动力学 \cref{eq:qw-trunk-dyn}，取前 $6$ 行（记 $\boldsymbol{M}_f,\boldsymbol{C}_f,\boldsymbol{J}_{cf}^\top,\ddot{\boldsymbol{q}}_f^{cmd}$ 为相应量的前 $6$ 行）\cite{yu2021quadruped}：
+\begin{equation}
+  \boldsymbol{M}_f(\ddot{\boldsymbol{q}}_f^{cmd}+\boldsymbol{\delta}_{\ddot{q}})+\boldsymbol{C}_f=\boldsymbol{J}_{cf}^\top({}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}+\boldsymbol{\delta}_f).
+  \label{eq:qw-eq-raw}
+\end{equation}
+把含未知松弛的项移到左、其余移到右，整理成 $\boldsymbol{C}_E^\top\boldsymbol{\mathcal{X}}+\boldsymbol{c}_e=\mathbf{0}$\cite{yu2021quadruped}：
+\begin{equation}
+  \underbrace{[\boldsymbol{M}_f\quad-\boldsymbol{J}_{cf}^\top]}_{\boldsymbol{C}_E^\top}
+  \underbrace{\begin{bmatrix}\boldsymbol{\delta}_{\ddot{q}}\\\boldsymbol{\delta}_f\end{bmatrix}}_{\boldsymbol{\mathcal{X}}}
+  +\underbrace{\big(-\boldsymbol{J}_{cf}^\top\,{}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}+\boldsymbol{C}_f+\boldsymbol{M}_f\ddot{\boldsymbol{q}}_f^{cmd}\big)}_{\boldsymbol{c}_e}=\mathbf{0}.
+  \label{eq:qw-eq-std}
+\end{equation}
+
+\paragraph{不等式约束（摩擦锥）。}
+设 $n_c$ 条支撑腿，接触力 ${}^{\mathcal{O}}\boldsymbol{f}_c=[{}^{\mathcal{O}}\boldsymbol{f}_c^1;\cdots;{}^{\mathcal{O}}\boldsymbol{f}_c^{n_c}]\in\mathbb{R}^{3n_c}$，块对角约束 $\underline{\boldsymbol{c}}_A\le\boldsymbol{C}_A\,{}^{\mathcal{O}}\boldsymbol{f}_c\le\overline{\boldsymbol{c}}_A$。代入 ${}^{\mathcal{O}}\boldsymbol{f}_c={}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}+\boldsymbol{\delta}_f$ 并拆成上、下两个单边不等式，整理成 $\boldsymbol{C}_I^\top\boldsymbol{\mathcal{X}}+\boldsymbol{c}_i\ge\mathbf{0}$\cite{yu2021quadruped}：
+\begin{equation}
+  \underbrace{\begin{bmatrix}\mathbf{0}&-\boldsymbol{C}_A\\\mathbf{0}&\boldsymbol{C}_A\end{bmatrix}}_{\boldsymbol{C}_I^\top}\boldsymbol{\mathcal{X}}
+  +\underbrace{\begin{bmatrix}\overline{\boldsymbol{c}}_A-\boldsymbol{C}_A\,{}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}\\\boldsymbol{C}_A\,{}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}-\underline{\boldsymbol{c}}_A\end{bmatrix}}_{\boldsymbol{c}_i}\ge\mathbf{0}.
+  \label{eq:qw-ineq-std}
+\end{equation}
+（注意不等式只约束力松弛 $\boldsymbol{\delta}_f$，故 $\boldsymbol{C}_I^\top$ 对应 $\boldsymbol{\delta}_{\ddot{q}}$ 的块为 $\mathbf{0}$。）于是得\textbf{标准 QP}\cite{yu2021quadruped}：
+\begin{equation}
+  \boxed{\;\min_{\boldsymbol{\mathcal{X}}}\ \tfrac12\,\boldsymbol{\mathcal{X}}^\top\boldsymbol{G}\boldsymbol{\mathcal{X}}
+  \quad\text{s.t.}\quad
+  \boldsymbol{C}_E^\top\boldsymbol{\mathcal{X}}+\boldsymbol{c}_e=\mathbf{0},\quad
+  \boldsymbol{C}_I^\top\boldsymbol{\mathcal{X}}+\boldsymbol{c}_i\ge\mathbf{0}\;}.
+  \label{eq:qw-qp-standard}
+\end{equation}
+
+\begin{practice}[QuadProg++ 选型]
+本松弛 QP 的优化变量仅 $\boldsymbol{\delta}_{\ddot{q}}\in\mathbb{R}^6$ 与 $\boldsymbol{\delta}_f\in\mathbb{R}^{3n_c}$（$n_c\le4$），\emph{规模很小}（最多约 $18$ 维），适合用 \texttt{QuadProg++}（一个轻量 C++ 二次型库，接口正好是 \cref{eq:qw-qp-standard} 的 $\boldsymbol{G},\boldsymbol{C}_E,\boldsymbol{c}_e,\boldsymbol{C}_I,\boldsymbol{c}_i$ 形式）。这与 \cref{ch:quad_mpc} 的 MPC 用 \texttt{qpOASES}/\allowbreak\texttt{OSQP}（大规模、含热启动）形成对照：\emph{小问题用小库}，避免大求解器的初始化开销。QP 的求解原理（活动集 / 内点法）见 \cref{ch:nlopt}，此处不展开。
+\end{practice}
+
+\subsection{反解关节力矩，闭合控制链}
+\label{subsec:qw-torque}
+
+QP 解出 $\boldsymbol{\delta}_{\ddot{q}},\boldsymbol{\delta}_f$ 后，代回 \cref{eq:qw-slack} 得协调后的 $\ddot{\boldsymbol{q}}$ 与 ${}^{\mathcal{O}}\boldsymbol{f}_c$。把它们代入完整浮动基动力学 \cref{eq:qw-floating-dyn} 并变形（虚拟关节力矩 $\boldsymbol{\tau}_f=\mathbf{0}$，故前 $6$ 行为零）\cite{yu2021quadruped}：
+\begin{equation}
+  \begin{bmatrix}\mathbf{0}_{6\times1}\\\boldsymbol{\tau}_j\end{bmatrix}
+  =\boldsymbol{M}(\boldsymbol{q})\ddot{\boldsymbol{q}}+\boldsymbol{C}(\boldsymbol{q},\dot{\boldsymbol{q}})-\boldsymbol{J}_c^\top\,{}^{\mathcal{O}}\boldsymbol{f}_c,
+  \label{eq:qw-inv-dyn}
+\end{equation}
+取其\emph{后 $12$ 行}即得关节前馈力矩 $\boldsymbol{\tau}_j$。其中 $\boldsymbol{M}(\boldsymbol{q})$ 由 CRBA（\cref{algo:qw-crba}）、$\boldsymbol{C}(\boldsymbol{q},\dot{\boldsymbol{q}})$ 由 RNEA（\cref{algo:qw-rnea}）算出——\cref{eq:qw-inv-dyn} 正是 \cref{ins:qw-wbc-min-id} 所说“浮动基逆动力学”的最终落地，也是把 \cref{ins:qw-rnea-trick} 那套 $\boldsymbol{M},\boldsymbol{C}$ 接口真正用起来的地方。最终电机力矩指令 $=$ 前馈 $+$ 关节级 PD\cite{yu2021quadruped}：
+\begin{equation}
+  \boxed{\;\boldsymbol{\tau}^{cmd}=\boldsymbol{\tau}_j+\boldsymbol{k}_p(\boldsymbol{q}_j^{cmd}-\boldsymbol{q}_j)+\boldsymbol{k}_d(\dot{\boldsymbol{q}}_j^{cmd}-\dot{\boldsymbol{q}}_j)\;},
+  \label{eq:qw-tau-cmd}
+\end{equation}
+其中 $\boldsymbol{q}_j^{cmd},\dot{\boldsymbol{q}}_j^{cmd}$ 是从 WBC 递推输出 $\boldsymbol{q}^{cmd},\dot{\boldsymbol{q}}^{cmd}$（\cref{eq:qw-pseudocode} 末行）剔除前 $6$ 行（浮动基）后的关节量。
+
+\begin{insight}[松弛 QP $+$ 逆动力学闭合“MPC$\to$WBC$\to$转矩”全链]\label{ins:qw-close-loop}
+这一步\textbf{闭合了整条控制链}，把全章串成一句话：
+\[
+  \underbrace{\boldsymbol{f}^{\mathrm{MPC}}}_{\text{MPC（\cref{ch:quad_mpc}）}}
+  \;\to\;
+  \underbrace{\ddot{\boldsymbol{q}}^{cmd},\boldsymbol{q}^{cmd}}_{\text{WBC 递推（\cref{eq:qw-pseudocode}）}}
+  \;\to\;
+  \underbrace{\text{松弛 QP（\cref{eq:qw-qp-standard}）}}_{\text{协调口径}}
+  \;\to\;
+  \underbrace{\boldsymbol{\tau}_j\ (\cref{eq:qw-inv-dyn})}_{\text{逆动力学反解}}
+  \;\to\;
+  \underbrace{\boldsymbol{\tau}^{cmd}\ (\cref{eq:qw-tau-cmd})}_{\text{前馈 + PD 发电机}}.
+\]
+MPC 在质心层算出“该用多大力”，WBC 在关节层算出“各关节该怎么动”，松弛 QP 把两者的口径差异吸收掉，逆动力学把协调后的力与加速度翻译成关节力矩，最后加 PD 抗扰动。\cref{ch:quad_mpc} 那条“MPC 算虚拟力、下游转关节力矩”的伏笔，到这里才真正落地：本章 \cref{eq:qw-inv-dyn,eq:qw-tau-cmd} 就是那个“下游”。\textbf{至此，从感知（\cref{ch:quad_est}）到控制（MPC + WBC）到执行（电机力矩）的整条四足运动控制栈完整闭合。}
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 由完整动力学 \cref{eq:qw-floating-dyn} 与 $\boldsymbol{S}_j$（\cref{eq:qw-Sj}）推出 \cref{eq:qw-inv-dyn}：说明为何前 $6$ 行恒为零、后 $12$ 行即 $\boldsymbol{\tau}_j$。
+  \item 设 $n_c=2$（小跑两支撑腿），写出 \cref{eq:qw-X} 中 $\boldsymbol{\mathcal{X}}$ 的维数、\cref{eq:qw-qp-standard} 中 $\boldsymbol{G},\boldsymbol{C}_E,\boldsymbol{C}_I$ 的尺寸。
+  \item （概念）若把 $\boldsymbol{Q}_2$ 取得和 $\boldsymbol{Q}_1$ 一样大（不再偏信 MPC），\cref{ins:qw-Q1Q2} 预期机器人行为会有什么变化？（提示：力松弛被同等惩罚，足端力可能偏离动态最优。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{方法谱系：NSP / WQP / HQP}
+\label{sec:qw-history}
+
+本章前面用的是\emph{零空间投影}（NSP）递推 $+$ 末端一个松弛 QP。把它放进更大的方法谱系里，能看清取舍。
+
+\paragraph{NSP（零空间投影 / 任务分层）。}
+即 \cref{sec:qw-priority} 的递推。\emph{优点}：解析、有闭式、计算快。\emph{缺点}：过于依赖预定义的优先级，不同优先级任务\emph{不会互相妥协}；高优先级用尽自由度时低优先级\emph{完全}失败（\cref{sec:qw-priority} 的 pitfall）；\textbf{无法处理不等式约束}（摩擦锥、力矩上限等）。
+
+\paragraph{WQP（加权二次规划，软优先级）。}
+把 $n$ 个任务误差 $\boldsymbol{e}_i=\boldsymbol{A}_i\boldsymbol{x}-\boldsymbol{b}_i$ 组合成一个加权最小二乘：
+\begin{equation}
+  \min_{\boldsymbol{x}}\ \sum_{i=1}^{n} w_i\,\|\boldsymbol{A}_i\boldsymbol{x}-\boldsymbol{b}_i\|^2.
+  \label{eq:qw-wqp}
+\end{equation}
+\emph{优点}：调权重 $w_i$ 让任务\emph{相互协调}（高优先级让出一点小偏差，换低优先级一大块改善）；可加不等式约束。\emph{缺点}：软优先级\textbf{不保证严格优先级}——低权重任务若其雅可比范数大或瞬时误差大，仍可能“污染”高优先级任务。
+
+\paragraph{HQP（层级二次规划，集大成）。}
+级联 QP，按优先级\emph{依次}求解：第 $i$ 级 QP 在其目标里附带“严格保持前 $i-1$ 级最优解”的等式约束（即只在前面所有级的\emph{零空间}里优化）。\emph{优点}：严格优先级 $+$ 不等式约束，集 NSP 与 WQP 之长。\emph{缺点}：需\emph{连续}求解多个 QP，实现复杂、耗时高。
+
+\begin{insight}[NSP / WQP / HQP 的统一视角与本章方案定位]\label{ins:qw-spectrum}
+方法谱系有一个统一图景：\textbf{NSP 是几何（零空间）、WQP 是软优化、HQP 是“NSP 的严格优先级 $+$ QP 的不等式处理”的统一}。三者沿“严格性 vs 计算量”谱排开：NSP 最快但最硬、最弱（无不等式）；HQP 最强但最慢；WQP 居中（软）。\textbf{本章采用的实际方案恰是一个折中}：用 NSP 递推（\cref{eq:qw-pseudocode}）快速、严格地分配优先级（拿到 $\ddot{\boldsymbol{q}}^{cmd}$），再在\emph{末端}补一个\emph{单个}松弛 QP（\cref{eq:qw-qp-standard}）来引入不等式约束（摩擦锥）并协调上游 MPC——既保住了 NSP 的速度与硬优先级，又借一个小 QP 补上了“不等式约束”这块 NSP 的短板。它不是纯 NSP、不是纯 WQP、也不是完整 HQP，而是\emph{“NSP 递推 $+$ 末端松弛 QP”}的实用混血。
+\end{insight}
+
+\begin{insight}[谱系的“第 0 档”——宇树平衡控制器是力级、无优先级的退化 WBC]\label{ins:qw-unitree-balance}
+NSP/WQP/HQP 都在\emph{运动学层}（关节速度 / 加速度）分配优先级。还有一类更朴素、工业上极常见的“力分配”方案，恰好可作为这条谱系的“第 $0$ 档”——\textbf{宇树平衡控制器}（见 \cref{ch:quad_mpc} 的瞬时 QP 平衡控制器 \cref{eq:srbd-matrix-unitree,eq:unitree-qp-cost}）。把它放进 WBC 视角，能看清三件事：
+
+\textbf{（一）它是“力空间”而非“加速度空间”的 WBC。}前文的 NSP 递推在\emph{广义加速度} $\ddot{\boldsymbol{q}}$ 上做文章（按任务优先级分配关节如何运动），最后才经逆动力学 \cref{eq:qw-inv-dyn} 落成力矩；宇树平衡控制器\emph{跳过}了加速度层的优先级递推，\emph{直接}在\emph{足端力}上求解——机身位姿 PD 反馈给出期望机身线 / 角加速度 $\dot{\boldsymbol{v}}_s,\dot{\boldsymbol{\omega}}_s$，再用单刚体动力学把它们映成一个\emph{欠定}（$6$ 方程、$12$ 未知力）的力分配方程，用一个\emph{瞬时} QP 选出满足摩擦锥的最优足端力，最后用单腿静力学 $\boldsymbol{\tau}_i=-\boldsymbol{J}_i^\top\,({}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}})^\top\,{}^{\mathcal{O}}\boldsymbol{f}_i$ 反解力矩（推导全在 \cref{ch:quad_mpc}，此处不重复）。
+
+\textbf{（二）为什么它是 WBC 的“最低配”。}对照本章 \cref{ins:qw-wbc-min-id} 给的下限——“至少实现浮动基逆动力学”——宇树平衡控制器只做到了\emph{单刚体}的力分配 $+$ \emph{单腿静力学}的近似逆动力学：它\emph{没有}多刚体质量矩阵 $\boldsymbol{M}$、\emph{没有}偏置力 $\boldsymbol{C}$（\cref{eq:qw-floating-dyn} 被退化成单刚体 $6$ 行）、\emph{没有}摆动腿 / 机身的任务优先级（所有目标揉进一个加权 QP 代价，本质是 \cref{eq:qw-wqp} 式 WQP 的“软优先级”）。因此它在谱系里比 NSP 还“低一档”：连运动学优先级都没有，只有力的加权折中。它的优点是实现极简、计算极快（一个 $\le12$ 维 QP），代价是高动态、有显著腿惯性时不准（单腿静力学忽略了腿的惯性与重力）。
+
+\textbf{（三）升级路径正是本章。}宇树平衡控制器 $\to$ 本章完整 WBC，差的就是“多刚体逆动力学（$\boldsymbol{M},\boldsymbol{C}$，\cref{algo:qw-crba,algo:qw-rnea}）$+$ 运动学任务优先级（NSP 递推 \cref{eq:qw-pseudocode}）”；同一台机器人沿\emph{时间}维升级（瞬时 $\to$ 预测）则得到 \cref{ch:quad_mpc} 的凸 MPC。两条升级线交汇处，就是本章 \cref{sec:qw-relax} 的“MPC 力 $+$ WBC 加速度 $+$ 松弛 QP”。一句话：\textbf{宇树平衡控制器是“力级、单刚体、软优先级”的退化 WBC，本章是“力矩级、多刚体、硬优先级”的完整 WBC，二者首尾相接}。
+\end{insight}
+
+\begin{table}[H]\centering\small
+\caption{三种 WBC 方法谱系对照}
+\begin{tabular}{p{0.13\textwidth} p{0.25\textwidth} p{0.25\textwidth} p{0.25\textwidth}}
+\toprule
+维度 & NSP（零空间投影）& WQP（加权 QP）& HQP（层级 QP）\\
+\midrule
+优先级 & 严格（硬）& 软（权重）& 严格（级联）\\
+不等式约束 & 不支持 & 支持 & 支持 \\
+计算 & 最快（闭式）& 快（单 QP）& 慢（多 QP）\\
+妥协能力 & 无（用尽即失败）& 有（权重协调）& 有（零空间内）\\
+本章用法 & \textbf{主体递推} & 思想借鉴 & 思想借鉴 \\
+\bottomrule
+\end{tabular}
+\label{tab:qw-spectrum}
+\end{table}
+
+\noindent\cref{tab:qw-spectrum} 三档之外还有一个“第 $0$ 档”：宇树平衡控制器那样\emph{力级、单刚体、软优先级}的瞬时 QP 力分配（\cref{ins:qw-unitree-balance}）——它连运动学优先级都不做，只在足端力上加权折中，是工业上最常见的“最低配 WBC”，完整推导见 \cref{ch:quad_mpc}。
+
+% ════════════════════════════════════════════════════════════════
+\section{数值实务与陷阱}
+\label{sec:qw-practice}
+
+本节凝练 WBC 落地时的数值与工程要点（细节与代码归 \cref{ch:quad_prac}）。
+
+\begin{pitfall}[奇异点：伪逆病态]
+WBC 每拍都要算多个伪逆（$\boldsymbol{J}_1^+$、$(\boldsymbol{J}_i\boldsymbol{N}_{i-1}^A)^+$ 等）。当机器人接近运动学奇异（如腿伸直、$\boldsymbol{J}$ 行不满秩）时，$\boldsymbol{J}\boldsymbol{J}^\top$ 病态、伪逆爆炸（\cref{ins:qw-dls}）。\textbf{对策}：一律用阻尼最小二乘 \cref{eq:qw-dls} 代替纯伪逆；$\lambda$ 在奇异附近自适应增大。投影矩阵 $\boldsymbol{N}_{i-1}^A$ 也建议用 SVD 截断小奇异值以稳定。
+\end{pitfall}
+
+\begin{pitfall}[优先级用尽 / 低优先级被放弃]
+NSP 递推中若高优先级任务的堆叠雅可比 $\boldsymbol{J}_{i-1}^A$ 占满 $18$ 维，$\boldsymbol{N}_{i-1}^A\to\mathbf{0}$，后续任务被完全放弃（\cref{sec:qw-priority} pitfall）。\textbf{对策}：(i) 控制任务总维数不超过自由度；(ii) 把“可让步”的目标（如机身位置）下放到末端松弛 QP 的软项里，而非塞进硬递推；(iii) 监控 $\mathrm{rank}(\boldsymbol{J}_{i-1}^A)$ 报警。
+\end{pitfall}
+
+\begin{pitfall}[WQP 权重污染]
+若改用加权 QP（\cref{eq:qw-wqp}），低权重任务在其雅可比范数大或瞬时误差大时会“顶”动高权重任务（软优先级不严格）。\textbf{对策}：权重跨任务拉开足够量级（如本章 $\boldsymbol{Q}_2/\boldsymbol{Q}_1\sim0.005$），或对各任务误差先归一化再加权。
+\end{pitfall}
+
+\begin{pitfall}[欧拉角误差不变基 / 广义速度非逐元素微分]
+两个常见记号坑：(i) 机身姿态误差必须经 \cref{eq:qw-e2} 变到角速度的基下，直接用 $\boldsymbol{\Theta}_d-\boldsymbol{\Theta}$ 当角速度误差会在大姿态角下出错；(ii) 浮动基广义速度 $\dot{\boldsymbol{q}}$ \emph{不是} $\boldsymbol{q}$ 的逐元素微分（\cref{note:qw-gen-vel}），更新机身姿态时角量那 $3$ 维（$\dot{\boldsymbol{q}}$ 的第 $1$--$3$ 维）要按角速度积分（用指数映射 / 李群更新，\cref{ch:lie}），不能简单 $\boldsymbol{\Theta}\!+\!=\!\dot{\boldsymbol{q}}_{1:3}\Delta t$。
+\end{pitfall}
+
+\begin{pitfall}[接触切换时 $\boldsymbol{J}_c$ 维度突变]
+步态相位切换瞬间，支撑腿数 $n_c$ 改变（小跑在 $2$ 与瞬时 $0$/$4$ 间跳变），接触雅可比 $\boldsymbol{J}_c$、约束矩阵 $\boldsymbol{C}_A$、松弛 QP 的变量维数都\emph{突变}。\textbf{对策}：按当前相位重新装配矩阵尺寸；在落地/抬腿瞬间对接触力做平滑过渡（force ramp），避免力指令阶跃引起抖振。
+\end{pitfall}
+
+\begin{pitfall}[力矩上界写在哪：WBC 读控制器配置、不读 URDF 的 effort]\label{pit:qw-torque-task-vs-urdf}
+\cref{tab:qw-42tasks} 的“力矩上限”约束 $-\boldsymbol{\tau}_{\lim}\le\boldsymbol{\tau}\le\boldsymbol{\tau}_{\lim}$ 看似平凡，移植时却有一个隐蔽的“两份配置只改一份”陷阱。一台机器人的力矩上界往往在\emph{两处}各写了一遍：(i) URDF 里每个关节的 \texttt{effort} 上限（描述机器人本体、给 Gazebo/可视化等用）；(ii) 控制器侧的配置文件（如 OCS2 栈的 \texttt{task.info} 里 \texttt{torqueLimitsTask} 一段，专给 WBC 那条不等式约束用）。\textbf{关键事实：WBC 的力矩上界读的是\emph{控制器配置}里那份 $\boldsymbol{\tau}_{\lim}$，\emph{不}读 URDF 的 \texttt{effort}。}于是“改了 URDF 的 effort、忘了改 task.info”会让 WBC 仍用\emph{旧}的、可能过小的力矩上界——而且不报任何错（维度对、约束可行、机器人也站得起来）。
+
+一个真实失败样本：某关节（髋外展 HAA）的 URDF effort 已改到 $90\,\mathrm{N\cdot m}$，但 \texttt{task.info} 的 \texttt{torqueLimitsTask} 仍停在旧的 $20\,\mathrm{N\cdot m}$。后果是 WBC 把 HAA 力矩硬卡在 $20$，在 $0.16\,\mathrm{m}$ 台阶顶上\emph{产生不出足够的髋外展力矩去遏制侧向 roll}，于是\textbf{侧翻}——表面像“控制律不稳/裕度不够”，根因却只是力矩上界写错了地方。\textbf{对策}：把“力矩上界”当成\emph{两份配置必须同步}的量，改电机规格时 URDF \texttt{effort} 与控制器 \texttt{task.info} 一起改；排查 WBC“某关节力矩怎么也上不去/某方向恢复力矩不足”时，第一步核对 WBC 实际用的 $\boldsymbol{\tau}_{\lim}$（控制器配置那份）而非 URDF。这条“URDF 与控制器 config 各管一摊”的不一致是移植期典型陷阱，更系统的“两份 config 只改一份”案例见 \cref{ch:quad_prac}。
+\end{pitfall}
+
+\begin{practice}[工程整定要点（细节见 \cref{ch:quad_prac}）]
+\begin{itemize}
+  \item \textbf{松弛权重}：$\boldsymbol{Q}_1=\mathbf{I},\boldsymbol{Q}_2=0.005\,\mathbf{I}$ 起步（更信 MPC 力，\cref{ins:qw-Q1Q2}）；若足端力抖振增大 $\boldsymbol{Q}_2$，若机身跟踪差减小 $\boldsymbol{Q}_2$。
+  \item \textbf{关节级 PD}：\cref{eq:qw-tau-cmd} 的 $\boldsymbol{k}_p,\boldsymbol{k}_d$ 先小后大；前馈 $\boldsymbol{\tau}_j$ 做主、PD 抗扰为辅，PD 过大会与 MPC/WBC 的力前馈“打架”。
+  \item \textbf{求解器}：松弛 QP 规模小，\texttt{QuadProg++} 足矣（\cref{sec:qw-relax} practice）；与 MPC 的 \texttt{qpOASES} 分开。
+  \item \textbf{阻尼} $\lambda$：奇异附近增大保数值稳定（\cref{ins:qw-dls}），代价是跟踪略损。
+\end{itemize}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+VMC/ZMP 可替代 WBC & VMC 无优先级无约束、ZMP 是判据非控制器（\cref{subsec:qw-zmp}）\\
+雅可比是常数 & $\boldsymbol{J}(\boldsymbol{q})$ 随构型变，分相位算（\cref{ins:qw-vmc-keys}）\\
+正逆速度映射都唯一 & 正向唯一、逆向（冗余时）不唯一，差零空间（\cref{ins:qw-fwd-inv}）\\
+右逆只有一个 & 有无穷多个，伪逆是\emph{最小范数}那个（\cref{deriv:qw-minnorm}）\\
+左/右伪逆通用 & 冗余用右逆 $\boldsymbol{J}^\top(\boldsymbol{J}\boldsymbol{J}^\top)^{-1}$，别用反（\cref{note:qw-left-right}）\\
+零空间投影完美执行次要任务 & 在守住主任务前提下\emph{尽力近似}（正交投影，\cref{ins:qw-priority-essence}）\\
+奇异点直接求伪逆 & 须阻尼最小二乘防病态（\cref{ins:qw-dls}）\\
+$12$ 关节可定机身世界位姿 & 不能，须加 $6$-DOF 虚拟关节成 $18$ 维（\cref{ins:qw-virtual}）\\
+$\dot{\boldsymbol{q}}$ 是 $\boldsymbol{q}$ 的逐元素微分 & 是重定义（角速度+本体速度），非逐元素导（\cref{note:qw-gen-vel}）\\
+优先级是随意约定 & 物理因果链：接触$\to$机身$\to$摆动（\cref{ins:qw-priority-chain}）\\
+MPC 力可直接代进动力学 & 与 WBC 加速度口径不一致，须松弛协调（\cref{ins:qw-inconsistency}）\\
+$\boldsymbol{Q}_1,\boldsymbol{Q}_2$ 随便取 & 编码“信 WBC 还是信 MPC”，$\boldsymbol{Q}_2{=}0.005\mathbf{I}$ 偏信 MPC（\cref{ins:qw-Q1Q2}）\\
+NSP 能处理不等式约束 & 不能，靠末端松弛 QP 补摩擦锥（\cref{ins:qw-spectrum}）\\
+WBC 直接输出关节力矩 & 经逆动力学反解 $\boldsymbol{\tau}_j$ 再加 PD（\cref{ins:qw-close-loop}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\boldsymbol{J}(\boldsymbol{q})\in\mathbb{R}^{M\times N_j}$ & 雅可比（工作空间维 $\times$ 关节数）& \cref{eq:qw-jacobian} \\
+$\boldsymbol{J}^+$ & 右伪逆 $\boldsymbol{J}^\top(\boldsymbol{J}\boldsymbol{J}^\top)^{-1}$ & \cref{eq:qw-N-and-pinv} \\
+$\boldsymbol{N}=\mathbf{I}-\boldsymbol{J}^+\boldsymbol{J}$ & 零空间投影矩阵（正交投影）& \cref{eq:qw-N-and-pinv} \\
+$\dot{\boldsymbol{q}}_{\forall}$ & 任意冗余意图向量 & \cref{eq:qw-general-q} \\
+$\dot{\boldsymbol{q}}_0$ & 零空间内部运动（关节动末端静）& \cref{ins:qw-internal-motion} \\
+$\lambda$ & 阻尼最小二乘阻尼系数 & \cref{eq:qw-dls} \\
+$\boldsymbol{e}_i,\Delta\boldsymbol{q}_i$ & 工作空间误差 / 关节增量 & \cref{eq:qw-pos-level} \\
+$\boldsymbol{J}_{i-1}^A,\boldsymbol{N}_{i-1}^A$ & 前 $i{-}1$ 任务堆叠雅可比 / 联合零空间 & \cref{eq:qw-stack,eq:qw-stack-N} \\
+$\boldsymbol{q}=[\boldsymbol{q}_b;\boldsymbol{q}_j]$ & 浮动基广义坐标（$18$ 维）& \cref{eq:qw-gen-coord} \\
+$\dot{\boldsymbol{q}},\ddot{\boldsymbol{q}}$ & 广义速度/加速度（重定义，非逐元素微分）& \cref{eq:qw-gen-vel} \\
+$\boldsymbol{M},\boldsymbol{C}$ & 质量矩阵 / 偏置力（CRBA / RNEA 求）& \cref{eq:qw-floating-dyn} \\
+${}_{b}\boldsymbol{J}_k,\hat{\mathbf{I}}_k,\hat{\mathbf{I}}_i^{C}$ & 刚体雅可比 / 空间惯量 / 组合惯量 & \cref{eq:qw-M-sum,eq:qw-crba-Ic} \\
+$\boldsymbol{S}_j,\boldsymbol{S}_f$ & 关节 / 浮动基选择矩阵 & \cref{eq:qw-Sj,eq:qw-Sf} \\
+$\boldsymbol{J}_c,{}^{\mathcal{O}}\boldsymbol{f}_c$ & 接触雅可比 / 接触力 & \cref{eq:qw-floating-dyn} \\
+${}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}$ & MPC 给出的足端力（上游）& \cref{eq:qw-slack} \\
+$\boldsymbol{\delta}_{\ddot{q}},\boldsymbol{\delta}_f$ & 加速度松弛($\in\mathbb{R}^6$) / 力松弛 & \cref{eq:qw-slack} \\
+$\boldsymbol{Q}_1,\boldsymbol{Q}_2$ & 松弛权重（信 WBC / 信 MPC）& \cref{eq:qw-slack-opt} \\
+$\boldsymbol{\mathcal{X}},\boldsymbol{G}$ & QP 优化变量 / 海森 & \cref{eq:qw-X,eq:qw-qp-obj} \\
+$\boldsymbol{C}_E,\boldsymbol{c}_e,\boldsymbol{C}_I,\boldsymbol{c}_i$ & QP 等式 / 不等式系数 & \cref{eq:qw-eq-std,eq:qw-ineq-std} \\
+$\boldsymbol{\tau}_j,\boldsymbol{\tau}^{cmd}$ & 关节前馈力矩 / 最终力矩指令 & \cref{eq:qw-inv-dyn,eq:qw-tau-cmd} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{公式速查表}
+\begin{tabular}{lll}
+\toprule
+公式 / 结论 & 一句话说明 & 对应 \\
+\midrule
+雅可比映射 \cref{eq:qw-jacobian} & $\dot{\boldsymbol{x}}=\boldsymbol{J}\dot{\boldsymbol{q}}$，正向唯一逆向不唯一 & \cref{ins:qw-fwd-inv} \\
+伪逆与零空间 \cref{eq:qw-N-and-pinv} & $\boldsymbol{J}^+=\boldsymbol{J}^\top(\boldsymbol{J}\boldsymbol{J}^\top)^{-1}$，$\boldsymbol{N}=\mathbf{I}-\boldsymbol{J}^+\boldsymbol{J}$ & 行满秩 \\
+通解 \cref{eq:qw-general-q} & $\dot{\boldsymbol{q}}=\boldsymbol{J}^+\dot{\boldsymbol{x}}+\boldsymbol{N}\dot{\boldsymbol{q}}_{\forall}$ & \cref{ins:qw-wbc-def} \\
+最小范数证明 \cref{deriv:qw-minnorm} & 拉格朗日 $\Rightarrow\dot{\boldsymbol{q}}=\boldsymbol{J}^\top\boldsymbol{\lambda}$ 在行空间 & \cref{ins:qw-rowspace} \\
+阻尼最小二乘 \cref{eq:qw-dls} & $+\lambda^2\mathbf{I}$ 防奇异病态 & \cref{ins:qw-dls} \\
+双任务 \cref{eq:qw-two-task-simp} & 副作用 $\boldsymbol{J}_2\boldsymbol{J}_1^+\dot{\boldsymbol{x}}_1$ 被补偿 & \cref{ins:qw-side-effect} \\
+多任务递推 \cref{eq:qw-recur} & $\dot{\boldsymbol{q}}_i=\dot{\boldsymbol{q}}_{i-1}+(\boldsymbol{J}_i\boldsymbol{N}_{i-1}^A)^+(\cdots)$ & \cref{ins:qw-final-output} \\
+加速度级 \cref{eq:qw-acc-level} & 含 $\dot{\boldsymbol{J}}_i\dot{\boldsymbol{q}}$ 项 & \cref{eq:qw-acc-map} \\
+浮动基动力学 \cref{eq:qw-floating-dyn} & $\boldsymbol{M}\ddot{\boldsymbol{q}}+\boldsymbol{C}=\boldsymbol{S}_j\boldsymbol{\tau}+\boldsymbol{J}_c^\top\boldsymbol{f}_c$ & $18$ 维 \\
+$\boldsymbol{M}$ 求法 \cref{eq:qw-M-sum} & CRBA：$\sum_k{}_{b}\boldsymbol{J}_k^\top\hat{\mathbf{I}}_k\,{}_{b}\boldsymbol{J}_k$ & \cref{algo:qw-crba} \\
+$\boldsymbol{C}$ 求法 \cref{eq:qw-C-rnea} & RNEA：令 $\ddot{\boldsymbol{q}}{=}\mathbf{0}$ 跑逆动力学 & \cref{algo:qw-rnea} \\
+四子任务雅可比 \cref{eq:qw-J2,eq:qw-J3} & 含 ${}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}$ 把本体映世界 & \cref{tab:qw-subtasks} \\
+松弛 QP \cref{eq:qw-qp-standard} & $\min\tfrac12\boldsymbol{\mathcal{X}}^\top\boldsymbol{G}\boldsymbol{\mathcal{X}}$ s.t. 等式/不等式 & \cref{ins:qw-inconsistency} \\
+逆动力学 \cref{eq:qw-inv-dyn} & 后 $12$ 行即 $\boldsymbol{\tau}_j$ & \cref{ins:qw-close-loop} \\
+力矩指令 \cref{eq:qw-tau-cmd} & $\boldsymbol{\tau}_j$ 前馈 + 关节 PD & 闭环 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & WBC 动机与定位 & 一关节多任务、MPC 算力 WBC 转矩 & \(\bigstar\bigstar\) \\
+2 & VMC/ZMP 史前形态 & 直觉控制 / 动态判据，无优先级无约束 & \(\bigstar\bigstar\) \\
+3 & 冗余与零空间 & 正向唯一逆向不唯一，内部运动 & \(\bigstar\bigstar\bigstar\) \\
+4 & 伪逆 = 最小范数解 & 拉格朗日证明，解在行空间 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+5 & 阻尼最小二乘 & 奇异点防病态，精度换稳定 & \(\bigstar\bigstar\bigstar\) \\
+6 & 正交投影与优先级 & 守主任务、尽力近似次任务 & \(\bigstar\bigstar\bigstar\) \\
+7 & 双/多任务递推 & 副作用—补偿，联合零空间 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+8 & 位置/速度/加速度级 & 三级映射，加速度级含 $\dot{\boldsymbol{J}}\dot{\boldsymbol{q}}$ & \(\bigstar\bigstar\bigstar\) \\
+9 & 浮动基 18 维 & 6-DOF 虚拟关节，广义速度重定义 & \(\bigstar\bigstar\bigstar\) \\
+9b & $\boldsymbol{M},\boldsymbol{C}$ 求法 & CRBA 求 $\boldsymbol{M}$、RNEA 求 $\boldsymbol{C}$，引空间向量 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+10 & 四子任务划分 & 优先级 = 物理因果链 & \(\bigstar\bigstar\bigstar\) \\
+11 & 子任务雅可比与误差变基 & 欧拉角误差变到角速度基 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+12 & 松弛优化 & MPC/WBC 口径不一致，松弛粘合 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+13 & 标准 QP 化与反解力矩 & 等式/不等式整理，逆动力学 + PD & \(\bigstar\bigstar\bigstar\bigstar\) \\
+14 & NSP/WQP/HQP 谱系 & 严格性 vs 计算量折中 & \(\bigstar\bigstar\bigstar\) \\
+15 & 数值实务 & 奇异、优先级用尽、接触切换 & \(\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{一手详尽推导}：于宪元《基于稳定性的仿生四足机器人控制系统设计》\cite{yu2021quadruped}（北航硕论，2021）——含带优先级 WBC（双/多任务/位置/加速度级，§4.1）、浮动基座动力学与子任务雅可比（§4.2）、松弛 QP 与扭矩反解（§4.3）的逐式推导，本章理论主线据此展开。
+  \item \textbf{零空间投影的几何与化简}：Maciejewski 与 Klein\cite{maciejewski1985obstacle}（IJRR 1985）——冗余机械臂避障的零空间投影奠基工作，本章双/多任务递推化简的恒等式 $\boldsymbol{N}(\boldsymbol{J}\boldsymbol{N})^+=(\boldsymbol{J}\boldsymbol{N})^+$ 出处。
+  \item \textbf{上游 MPC 与控制链}：Di Carlo 等\cite{dicarlo2018cheetah}（IROS 2018）与本书 \cref{ch:quad_mpc}——单刚体凸 MPC，给出本章 WBC 的足端力输入 $\boldsymbol{f}^{\mathrm{MPC}}$。
+  \item \textbf{力级退化 WBC（谱系第 0 档）}：宇树《四足机器人控制算法》第 $8$ 章平衡控制器\cite{unitree2023quadruped}——机身位姿 PD 反馈 $+$ 瞬时足端力 QP 分配 $+$ 摩擦四棱锥 $+$ 单腿静力学反解，是“力级、单刚体、软优先级”的最简 WBC（\cref{ins:qw-unitree-balance}）；其逐式推导已在 \cref{ch:quad_mpc} 的瞬时 QP 一节给出（与本章“力矩级、多刚体、硬优先级”完整 WBC 首尾相接），故本章只引其定位、不重推。
+  \item \textbf{工业级分层架构}：Kim 等\cite{kim2019wbic}——MPC $+$ 全身脉冲控制（WBIC），把单刚体 MPC 跑上高动态硬件（Mini-Cheetah）的工程化 WBC 架构，与本章方案同源。
+  \item \textbf{多刚体动力学算法源头}：Featherstone\cite{featherstone2008rigid}——空间向量代数与 CRBA / RNEA 递推算法（\cref{algo:qw-crba,algo:qw-rnea}）的奠基专著，本章浮动基逆动力学 $\boldsymbol{M},\boldsymbol{C}$ 的求法据此，与 \cref{ch:quad_kin} 的 Plücker 一节同源。
+  \item \textbf{工程落地}：本书 \cref{ch:quad_prac}（实践：宇树框架）——WBC 在 \texttt{unitree\_guide} 等开源框架中的实现、求解器选型、增益整定的工程细节。
+\end{itemize}
+
+\section*{本章与相关章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+相关章节 & 关系 & 本章接口 \\
+\midrule
+\cref{ch:quad_kin} 浮动基运动学 & 提供雅可比 $\boldsymbol{J}(\boldsymbol{q})$、奇异性、Plücker 空间向量（喂 CRBA/RNEA）& \cref{eq:qw-jacobian,eq:qw-M-sum} \\
+\cref{ch:matderiv} 矩阵求导 & 提供二次型梯度 & \cref{deriv:qw-minnorm} \\
+\cref{ch:nlopt} 非线性优化/QP & 提供 QP 标准形与求解 & \cref{eq:qw-qp-standard} \\
+\cref{ch:quad_mpc} 单刚体 MPC & 上游：给足端力 $\boldsymbol{f}^{\mathrm{MPC}}$；并载“力级退化 WBC”宇树平衡控制器 & \cref{eq:qw-slack}；\cref{ins:qw-unitree-balance} \\
+\cref{ch:lie} 李群与李代数 & 提供 $\dot{\mathbf{R}}=\boldsymbol{\omega}^\wedge\mathbf{R}$、机身位姿更新 & \cref{eq:qw-e2} \\
+\cref{ch:quad_est} 足式状态估计 & 提供任务量当前值 $\boldsymbol{x}_i$ & \cref{eq:qw-pseudocode} \\
+\cref{ch:quad_prac} 实践：宇树框架 & 下游：WBC 工程实现 & \cref{sec:qw-practice} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：关节速度/力矩\emph{指令突然爆炸}。\textbf{原因}：接近运动学奇异，伪逆病态（\cref{ins:qw-dls}）。\textbf{对策}：用阻尼最小二乘 \cref{eq:qw-dls}，奇异附近增大 $\lambda$；对 $\boldsymbol{N}_{i-1}^A$ 做 SVD 截断。
+  \item \textbf{症状}：低优先级任务（如机身高度）\emph{完全不跟随}。\textbf{原因}：高优先级用尽自由度，$\boldsymbol{N}_{i-1}^A\to\mathbf{0}$（\cref{sec:qw-priority} pitfall）。\textbf{对策}：减少高优先级任务维数，或把可让步目标下放到松弛 QP 软项。
+  \item \textbf{症状}：机身姿态\emph{大角度时跟踪发散}。\textbf{原因}：欧拉角误差未变基或机身位姿用逐元素更新（\cref{note:qw-gen-vel}）。\textbf{对策}：用 \cref{eq:qw-e2} 变基；机身姿态用角速度积分 / 李群更新。
+  \item \textbf{症状}：松弛 QP \emph{无解 / infeasible}。\textbf{原因}：摩擦锥与“撑住体重”冲突（$\mu$ 或 $f_{\max}$ 太小），或接触切换时矩阵维度未更新。\textbf{对策}：检查摩擦约束、按当前 $n_c$ 重装矩阵尺寸。
+  \item \textbf{症状}：足端力\emph{抖振 / 相位切换处冲击}。\textbf{原因}：$\boldsymbol{Q}_2$ 太小或接触力阶跃（\cref{sec:qw-practice}）。\textbf{对策}：增大 $\boldsymbol{Q}_2$、对接触力做平滑过渡（ramp）。
+  \item \textbf{症状}：仿真好、\emph{真机机身漂}。\textbf{原因}：状态估计漂移毒化任务当前值 $\boldsymbol{x}_i$ 与 MPC 输入。\textbf{对策}：见 \cref{ch:quad_est}；降低绝对位置在任务里的权重，跟踪速度。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section{本章推导附录}
+\label{sec:qw-appendix}
+
+\begin{derivation}[双任务化简恒等式 $\boldsymbol{N}_1(\boldsymbol{J}_2\boldsymbol{N}_1)^+=(\boldsymbol{J}_2\boldsymbol{N}_1)^+$ 的来由]\label{deriv:qw-maciejewski}
+\cref{eq:qw-two-task-full} 到 \cref{eq:qw-two-task-simp} 的化简依赖 $\boldsymbol{N}_1(\boldsymbol{J}_2\boldsymbol{N}_1)^+=(\boldsymbol{J}_2\boldsymbol{N}_1)^+$。记 $\boldsymbol{P}=\boldsymbol{N}_1$（对称幂等正交投影，$\boldsymbol{P}=\boldsymbol{P}^\top=\boldsymbol{P}^2$，由 \cref{eq:qw-N-and-pinv} 验证）、$\boldsymbol{B}=\boldsymbol{J}_2\boldsymbol{P}$。任意向量 $\boldsymbol{y}$ 经 $\boldsymbol{B}^+$ 映回的 $\boldsymbol{B}^+\boldsymbol{y}$ 落在 $\boldsymbol{B}^\top=\boldsymbol{P}^\top\boldsymbol{J}_2^\top=\boldsymbol{P}\boldsymbol{J}_2^\top$ 的列空间（行空间性质，\cref{ins:qw-rowspace}），即存在 $\boldsymbol{z}$ 使 $\boldsymbol{B}^+\boldsymbol{y}=\boldsymbol{P}\boldsymbol{J}_2^\top\boldsymbol{z}$。于是
+\[
+  \boldsymbol{P}\boldsymbol{B}^+\boldsymbol{y}=\boldsymbol{P}(\boldsymbol{P}\boldsymbol{J}_2^\top\boldsymbol{z})=\boldsymbol{P}^2\boldsymbol{J}_2^\top\boldsymbol{z}=\boldsymbol{P}\boldsymbol{J}_2^\top\boldsymbol{z}=\boldsymbol{B}^+\boldsymbol{y},
+\]
+对任意 $\boldsymbol{y}$ 成立，故 $\boldsymbol{P}\boldsymbol{B}^+=\boldsymbol{B}^+$，即 $\boldsymbol{N}_1(\boldsymbol{J}_2\boldsymbol{N}_1)^+=(\boldsymbol{J}_2\boldsymbol{N}_1)^+$。多任务情形（\cref{eq:qw-recur}）把 $\boldsymbol{N}_1$ 换成联合投影 $\boldsymbol{N}_{i-1}^A$（同样对称幂等）即得。这正是 Maciejewski 与 Klein\cite{maciejewski1985obstacle} 化简的核心，根子在投影矩阵的幂等性与伪逆解的行空间性质。$\blacksquare$
+\end{derivation}
+
+\begin{derivation}[加速度级递推 \cref{eq:qw-acc-level} 的“副作用—补偿”推导]\label{deriv:qw-acc-recur}
+由加速度映射 \cref{eq:qw-acc-map}，第 $i$ 任务 $\ddot{\boldsymbol{x}}_i=\dot{\boldsymbol{J}}_i\dot{\boldsymbol{q}}+\boldsymbol{J}_i\ddot{\boldsymbol{q}}_i$。设满足前 $i-1$ 任务的 $\ddot{\boldsymbol{q}}_{i-1}$ 已知，在其联合零空间内追加 $\ddot{\boldsymbol{q}}_i=\ddot{\boldsymbol{q}}_{i-1}+\boldsymbol{N}_{i-1}^A\ddot{\boldsymbol{q}}_{\forall}$。代入：
+\[
+  \ddot{\boldsymbol{x}}_i=\dot{\boldsymbol{J}}_i\dot{\boldsymbol{q}}+\boldsymbol{J}_i\ddot{\boldsymbol{q}}_{i-1}+\boldsymbol{J}_i\boldsymbol{N}_{i-1}^A\ddot{\boldsymbol{q}}_{\forall}.
+\]
+其中 $\dot{\boldsymbol{J}}_i\dot{\boldsymbol{q}}+\boldsymbol{J}_i\ddot{\boldsymbol{q}}_{i-1}$ 是“前序任务在任务 $i$ 空间的副作用”（含 $\dot{\boldsymbol{J}}\dot{\boldsymbol{q}}$ 这一加速度级特有项），$\boldsymbol{J}_i\boldsymbol{N}_{i-1}^A\ddot{\boldsymbol{q}}_{\forall}$ 是可控补偿。解出 $\ddot{\boldsymbol{q}}_{\forall}=(\boldsymbol{J}_i\boldsymbol{N}_{i-1}^A)^+(\ddot{\boldsymbol{x}}_i-\dot{\boldsymbol{J}}_i\dot{\boldsymbol{q}}-\boldsymbol{J}_i\ddot{\boldsymbol{q}}_{i-1})$，回代并用 \cref{deriv:qw-maciejewski} 化简得 \cref{eq:qw-acc-level}。令 $i=1$、$\ddot{\boldsymbol{q}}_0=\mathbf{0}$、$\boldsymbol{N}_0^A=\mathbf{I}$ 得起始式 \cref{eq:qw-acc-start}；支撑腿 $\ddot{\boldsymbol{x}}_1=\mathbf{0}$ 时即 $\ddot{\boldsymbol{q}}_1=\boldsymbol{J}_1^+(-\dot{\boldsymbol{J}}_1\dot{\boldsymbol{q}})$（\cref{eq:qw-pseudocode} 首行）。$\blacksquare$
+\end{derivation}
+
+\begin{derivation}[松弛 QP 等式约束 \cref{eq:qw-eq-std} 的逐项整理]\label{deriv:qw-eq-derive}
+从 \cref{eq:qw-eq-raw} 出发，展开左端 $\boldsymbol{M}_f\ddot{\boldsymbol{q}}_f^{cmd}+\boldsymbol{M}_f\boldsymbol{\delta}_{\ddot{q}}+\boldsymbol{C}_f$、右端 $\boldsymbol{J}_{cf}^\top\,{}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}+\boldsymbol{J}_{cf}^\top\boldsymbol{\delta}_f$。把含未知松弛 $\boldsymbol{\delta}_{\ddot{q}},\boldsymbol{\delta}_f$ 的项归到一侧：
+\[
+  \boldsymbol{M}_f\boldsymbol{\delta}_{\ddot{q}}-\boldsymbol{J}_{cf}^\top\boldsymbol{\delta}_f
+  =\boldsymbol{J}_{cf}^\top\,{}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}-\boldsymbol{C}_f-\boldsymbol{M}_f\ddot{\boldsymbol{q}}_f^{cmd}.
+\]
+左端写成 $[\boldsymbol{M}_f\ \ -\boldsymbol{J}_{cf}^\top]\,[\boldsymbol{\delta}_{\ddot{q}};\boldsymbol{\delta}_f]=\boldsymbol{C}_E^\top\boldsymbol{\mathcal{X}}$，把右端移到左端记为 $\boldsymbol{c}_e=-\boldsymbol{J}_{cf}^\top\,{}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}+\boldsymbol{C}_f+\boldsymbol{M}_f\ddot{\boldsymbol{q}}_f^{cmd}$，即得 $\boldsymbol{C}_E^\top\boldsymbol{\mathcal{X}}+\boldsymbol{c}_e=\mathbf{0}$（\cref{eq:qw-eq-std}）。不等式 \cref{eq:qw-ineq-std} 同理：把 $\underline{\boldsymbol{c}}_A\le\boldsymbol{C}_A({}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}+\boldsymbol{\delta}_f)\le\overline{\boldsymbol{c}}_A$ 拆成 $\boldsymbol{C}_A\boldsymbol{\delta}_f\le\overline{\boldsymbol{c}}_A-\boldsymbol{C}_A{}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}$ 与 $-\boldsymbol{C}_A\boldsymbol{\delta}_f\le\boldsymbol{C}_A{}^{\mathcal{O}}\boldsymbol{f}^{\mathrm{MPC}}-\underline{\boldsymbol{c}}_A$，整理成 $\ge\mathbf{0}$ 形式即可。$\blacksquare$
+\end{derivation}

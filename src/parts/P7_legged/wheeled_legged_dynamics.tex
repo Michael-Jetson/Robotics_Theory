@@ -1,0 +1,502 @@
+\chapter{轮足混合系统的统一动力学与切换最优控制}\label{ch:wl-dynamics}
+
+% ════════════════════════════════════════════════════════════════
+%  吸收 Tutorial「轮足混合 MPC」之理论主线（动机/统一动力学/Pfaffian 三模式/
+%  centroidal-SRBD 轮足扩展/分段二次代价/切换 OCP 的 QP 堆叠/RTI 与降级），
+%  记号归一到本书浮基复合动力学 (eq:umm-core) 与 Pfaffian (eq:cd-pfaffian)。
+%  纯工程（OCS2 容器/HPIPM/CppAD/ROS2）按规范跳过，只留理论与方法论。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 纯四足把每条腿建模为\emph{二值}接触（摆动/支撑），\cref{ch:quad_mpc} 据此把步态视为切换系统。轮足把每条腿扩为\emph{三值}（swing/foot/wheel）后，模式组合数从 $2^4$ 变成多少？为什么这个增长本身还不是最难的部分？
+  \item foot 支撑的接触约束是 $\mathbf{J}_c\mathbf{v}=\mathbf{0}$（接触点速度全为零），它是\emph{完整}还是\emph{非完整}约束？轮支撑时“可以沿滚动方向走、但不能侧滑、不能穿地”这三条速度约束又属于哪类（回顾 \cref{eq:cd-pfaffian} 与 \cref{ch:mm-wheeled}）？
+  \item 同一个统一动力学方程 $\mathbf{M}(\mathbf{q})\dot{\mathbf{v}}+\mathbf{h}=\mathbf{S}^\top\boldsymbol\tau+\sum\mathbf{J}_c^\top\boldsymbol\lambda$（\cref{eq:umm-core}），在轮足里 foot 与 wheel 两类接触力\emph{进入方程的方式相同}，区别只在哪里？
+  \item 轮模式比 foot 模式多了一个本不存在的决策变量。它是什么？它为什么不能简单地用“目标速度 $\div$ 轮半径”前馈算出来？
+  \item 一条摆动腿以非零竖直速度落地、瞬间被 $\mathbf{J}_c\mathbf{v}=\mathbf{0}$ 约束“钉住”，速度会发生跳变。这个跳变由哪一个矩阵刻画？它和 WBC 里的接触零空间投影是不是同一个东西？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}轮足为何比纯足\emph{更}需要预测式最优控制：模式从二值扩为三值、组合 $16\!\to\!81$、约束类型在同一时刻\emph{混合}、wheel 模式引入轮速参考这一新决策变量；
+  \item \textbf{承接}浮基复合统一动力学 \cref{eq:umm-core}，把 foot 接触力（标准摩擦锥 + 完整约束）与 wheel 接触力（各向异性摩擦锥 + Pfaffian 非完整约束）统一进同一方程，并把轮角速度积分 $\dot\omega_w=\tau_w/I_w$ 并入状态；
+  \item \textbf{构造}三模式统一 Pfaffian 约束：把每条腿按模式 $\sigma_i\in\{\mathrm{swing},\mathrm{foot},\mathrm{wheel}\}$ 取不同的接触约束矩阵 $\mathbf{A}_i^{\sigma_i}(\mathbf{q})$，并在地形切平面局部坐标系 $(\mathbf{e}_\parallel,\mathbf{e}_\perp,\mathbf{n})$ 下垂直堆叠为 $\mathbf{A}_{\mathrm{uni}}(\mathbf{q},\sigma)$；
+  \item \textbf{扩展}centroidal/SRBD 简化模型（\cref{sec:rm-srbd-centroidal}）到轮足：状态补 $\boldsymbol\theta_w$、输入补 $\boldsymbol\omega_{\mathrm{ref}}$，并写出 Go2+wheels 的 $16$ 维算例；
+  \item \textbf{设计}模式相关的分段二次代价 $\ell_\sigma$：wheel 重轮速匹配、foot 重足端保持、swing 重摆动跟踪，权重 $\mathbf{Q}_\sigma,\mathbf{R}_\sigma$ 随模式切换，并对各向异性力做不对称正则；
+  \item \textbf{推导}切换系统 OCP 离散化后的 QP 堆叠：线性化 $\mathbf{A}_k,\mathbf{B}_k$、Pfaffian 滚动等式约束的线性化、foot 多面体锥 / wheel 椭圆锥的不等式，并说明带状 KKT 把求解复杂度从立方降到线性（承 \cref{ch:quad_mpc} 的凸 MPC）；
+  \item \textbf{落地}热启动 / 实时迭代 / 安全降级，并与 \cref{ch:unified-multimodal-mpc} 的多模态 MPC 去重，明确二者的分工边界。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把同一末端在三种接触模式间切换的混合系统，压成可实时滚动求解的切换 QP}”的主线。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4.5mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[grp] (mot) {动机\\ 二值$\to$三值};
+\node[blk, right=of mot] (dyn) {统一动力学\\ \cref{eq:umm-core} + 轮速积分};
+\node[blk, right=of dyn] (pf) {三模式 Pfaffian\\ $\mathbf{A}_{\mathrm{uni}}(\mathbf{q},\sigma)$};
+\node[blk, below=7mm of mot] (srbd) {SRBD 轮足扩展\\ $+\boldsymbol\theta_w,+\boldsymbol\omega_{\mathrm{ref}}$};
+\node[grp, right=of srbd] (cost) {分段二次代价\\ $\mathbf{Q}_\sigma,\mathbf{R}_\sigma$};
+\node[blk, right=of cost] (qp) {切换 OCP $\to$ QP\\ 带状 KKT};
+\node[grp, below=7mm of cost, fill=third!8, draw=third!60!black] (rti) {RTI / 热启动\\ 安全降级};
+\draw[ln] (mot)--(dyn); \draw[ln] (dyn)--(pf);
+\draw[ln] (mot.south) -- (srbd.north);
+\draw[ln] (pf.south) -- ++(0,-4mm) -| (cost.north);
+\draw[ln] (srbd)--(cost); \draw[ln] (cost)--(qp);
+\draw[ln] (qp.south) -- ++(0,-4mm) -| (rti.east);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：第 \ref{sec:wl-motiv} 节先立“为什么轮足非用 MPC 不可”的动机（任何读者主干）；第 \ref{sec:wl-dyn}--\ref{sec:wl-pfaffian} 节是把三模式动力学与约束\emph{统一成一个方程 + 一个堆叠矩阵}的核心建模步骤，写代码前必须吃透；第 \ref{sec:wl-srbd} 节给出可实时滚动的低维模型与具体维度；第 \ref{sec:wl-cost}--\ref{sec:wl-qp} 节把模型沿时间堆叠成切换 QP，是 MPC 之所以为 MPC 的地方；第 \ref{sec:wl-rti} 节是工程落地（实时迭代 + 降级），可在跑通仿真后回看。落地瞬间的冲击动力学（reset 映射）单列于 \cref{ch:wl-modeswitch}，本章只在 \cref{sec:wl-pfaffian} 末尾埋下接口。
+
+\subsection*{前置知识桥接}
+本章把前几部的三块地基直接拿来用，\emph{不重复}其一般理论：
+\begin{itemize}
+  \item \cref{ch:unified-multimodal-mpc} 的浮基复合统一动力学 \cref{eq:umm-core}——本章把其中的“臂末端力旋量”一项替换为“轮接触力”，方程结构原封不动；
+  \item \cref{ch:constrained-dynamics} 的 Pfaffian 形式 \cref{eq:cd-pfaffian} 与 Frobenius 可积判据 \cref{thm:cd-frobenius}，以及 \cref{ch:mm-wheeled} 把轮纯滚动落成具体 $\mathbf{A}(\mathbf{q})$ 的方法——本章把它从“单个轮式底盘”升级为“四条腿各自带轮、且模式逐腿可变”；
+  \item \cref{ch:quad_mpc}（单刚体凸 MPC）与 \cref{sec:rm-srbd-centroidal}（SRBD/质心简化）——本章在其状态/输入向量上做轮足增广，凸化与离散化的机械步骤照搬。
+\end{itemize}
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会以为“轮足控制 = 四足 MPC + 一层轮运动学映射”，于是直接把 \cref{ch:quad_mpc} 代码里的 $\mathbf{J}_c\mathbf{v}=\mathbf{0}$ 换成滚动约束、其余不动——结果 KKT 残差不收敛或轨迹不可行，因为漏掉了新决策变量（轮速参考）、新代价项（轮速匹配）与各向异性锥；
+  \item 在 \cref{ch:wl-modeswitch}（模式切换的冲击与调度）里，你会无法解释为什么落地瞬间速度会跳变、为什么 foot$\leftrightarrow$wheel 切换\emph{可以}做到无冲量——这些都建在本章统一动力学与接触投影之上。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+向量粗体小写、矩阵粗体大写。广义坐标 $\mathbf{q}$、广义速度 $\mathbf{v}$；浮基复合统一动力学沿用 \cref{eq:umm-core}：$\mathbf{M}(\mathbf{q})\dot{\mathbf{v}}+\mathbf{h}=\mathbf{S}^\top\boldsymbol\tau+\sum_{i}\mathbf{J}_{c,i}^\top\boldsymbol\lambda_i$，驱动选择矩阵 $\mathbf{S}=[\,\mathbf{0}\ \ \mathbf{I}\,]$（浮基 $6$ 维不可直接驱动）。关节力矩与足端力的对偶关系 $\boldsymbol\tau=\mathbf{J}^\top\mathbf{f}$。
+接触零空间投影记 $\mathbf{P}_M=\mathbf{I}-\mathbf{M}^{-1}\mathbf{J}_c^\top(\mathbf{J}_c\mathbf{M}^{-1}\mathbf{J}_c^\top)^{-1}\mathbf{J}_c$，落地速度重置 $\mathbf{v}^+=\mathbf{P}_M\mathbf{v}^-$。
+轮足模式向量 $\sigma=(\sigma_1,\dots,\sigma_4)$，每腿 $\sigma_i\in\{\mathrm{swing},\mathrm{foot},\mathrm{wheel}\}$。
+轮角速度记 $\omega_w$、其 MPC 参考记 $\omega_{\mathrm{ref}}$。地形切平面局部坐标系记 $(\mathbf{e}_\parallel,\mathbf{e}_\perp,\mathbf{n})$（滚动方向 / 横向 / 法向，均单位化）。
+混杂系统四元组记 $H=\{\mathcal{M},f_m,\mathcal{G}_{m\to n},\mathbf{R}_{m\to n}\}$（模式集 / 流 / 切换面 / 重置映射），其离散事件部分在 \cref{ch:wl-modeswitch} 详述。Tutorial 源若用别的符号，本章已统一转换并在邻近 note 注明。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{动机：轮足为何比纯足更需要预测式最优控制}
+\label{sec:wl-motiv}
+
+\paragraph{直觉：从“两态棋子”到“三态棋子”。}
+\cref{ch:quad_mpc} 把四足动态步态建模为\emph{间歇欠驱}系统，并据此立论：欠驱方向需提前准备，故必须用预测式 MPC。那里每条腿只有两种模式——摆动（swing）与支撑（stance/foot），接触约束是干净的 $\mathbf{J}_c\mathbf{v}=\mathbf{0}$。轮足机器人在每条腿末端装了主动轮，于是每条腿的接触状态从二值扩为\emph{三值}：摆动、足支撑（轮锁死当普通足用）、轮支撑（轮主动滚动）。这一步看似只是“多一种选择”，却把控制问题的难度抬上了一个本质更高的台阶。
+
+\paragraph{反面：把它当“足式 MPC 外挂轮运动学”会卡在哪。}
+一个极常见的错误起手式是：保留 \cref{ch:quad_mpc} 的全部框架，仅把支撑腿的接触约束由 $\mathbf{J}_c\mathbf{v}=\mathbf{0}$ 替换为轮的滚动约束，其余（状态、输入、代价、摩擦锥）原封不动。这样做几乎必然失败，原因在于轮模式同时改动了优化问题的\emph{四}个部件——约束类型、决策变量、代价项、可行力域。只换其一，得到的是一个自相矛盾的 OCP。把这四处改动讲清楚，正是本章的任务。
+
+\begin{insight}[难点在最优控制层，不在运动学层]
+轮足之难，\textbf{不是}运动学层面的（“轮怎么走”是纯正/逆运动学问题，\cref{ch:mm-wheeled} 已解决），\textbf{而是}最优控制层面的：模式逐腿、逐时刻可变，使 OCP 从“固定结构的凸 QP”变成“结构随离散模式跳变的切换系统优化”。运动学只回答“能不能走”，MPC 还要回答“怎么走最优”——含最优的模式序列、最优的切换时机、最优的力/速度分配。把这两层混为一谈，是初学轮足控制最深的坑。
+\end{insight}
+
+\paragraph{三重数学困难。}
+把“三值模式”带来的代价拆解为三条，可逐一对应到后续小节的解法。
+
+\emph{困难一：模式组合放大。}\;纯足四腿各二态，组合数 $2^4=16$；轮足四腿各三态，组合数 $3^4=81$。$N$ 步预测时域上的模式序列空间更是 $81^N$——$N=20$ 时约 $10^{38}$，完全不可枚举。这逼出一个分层：上层（启发式 / 采样 / 学习）给定\emph{一条}模式序列，下层 MPC 在该固定序列下优化连续变量。本章只管下层；上层调度与切换冲击留给 \cref{ch:wl-modeswitch}。
+
+\emph{困难二：约束类型在同一时刻混合。}\;纯足 MPC 里所有支撑约束同型（都是 $\mathbf{J}_c\mathbf{v}=\mathbf{0}$）。轮足里不同腿可同时处于不同模式：有的腿是\emph{完整}约束（foot），有的是\emph{非完整}约束（wheel），有的\emph{无}约束（swing）。优化器必须在一个 QP 里同时容纳这三类约束行——这是第 \ref{sec:wl-pfaffian} 节统一 Pfaffian 堆叠要解决的。
+
+\emph{困难三：wheel 模式引入新决策变量。}\;foot 模式的接触力是 $3$D 向量 $\boldsymbol\lambda_i$。wheel 模式除接触力外，还须决定\emph{轮速参考} $\omega_{\mathrm{ref},i}$——这是 foot 模式根本不存在的变量。它既进运动学约束（决定纯滚动条件右端），又经摩擦锥间接影响可用切向力。
+
+\begin{pitfall}[轮速参考不能用“速度命令 $\div$ 轮半径”前馈定死]
+新手常想：目标速度 $1\,\mathrm{m/s}$、轮半径 $0.05\,\mathrm{m}$，那轮速参考就是 $1/0.05=20\,\mathrm{rad/s}$。这忽略了\emph{转弯差速}（内外侧轮目标速度不同），更错失了 MPC 的核心价值——让优化器\emph{自主决定}最优轮速。$\omega_{\mathrm{ref}}$ 应作为\textbf{决策变量}由 MPC 优化；前馈值至多作为热启动初值，绝不能当硬约束钉死。
+\end{pitfall}
+
+\paragraph{为什么不预设一堆控制器了事。}
+反事实地问：若不上 MPC，而为每种模式组合预先设计独立控制器（四轮、四足、二轮二足……）会怎样？$81$ 种组合即便只取物理合理的 $10$–$20$ 种，也要设计、整定 $10$–$20$ 个控制器，且控制器间切换还需额外过渡逻辑。最致命的是：预设控制器无法优化\emph{切换时机}——何时从 wheel 切到 foot 由地形在线决定。MPC 的根本优势，正是把模式选择与运动优化\emph{统一}进一个框架。能耗实验也佐证这一点：在平地用轮滚动（能效远高于足行走）、在崎岖地形用足行走，由优化器自动发现这种最优切换，可使运输能耗显著下降——Bjelonic 等（ETH，ANYmal 轮足全身 MPC 与在线步态生成）报告：相对纯足小跑步态，运输代价（cost of transport）最高可降低约 $85\%$（在 $2\,\mathrm{m/s}$ 平地巡航量级降幅约 $83\%$）。该量级依平台、轮径与地形而异，不应外推为普适常数。
+
+% ════════════════════════════════════════════════════════════════
+\section{轮足统一动力学：一个方程容纳 foot 与 wheel 两类接触}
+\label{sec:wl-dyn}
+
+\subsection{承接浮基复合统一动力学}
+
+MPC 的核心组件是动力学模型——它告诉优化器“给定当前状态与输入，下一时刻状态是什么”。轮足的全维动力学不必另起炉灶：它就是 \cref{eq:umm-core} 在“末端为轮”这一特例下的实例。回顾该方程
+\begin{equation}
+  \mathbf{M}(\mathbf{q})\dot{\mathbf{v}}+\mathbf{h}(\mathbf{q},\mathbf{v})
+  =\mathbf{S}^\top\boldsymbol\tau+\sum_{i\in\mathcal{C}}\mathbf{J}_{c,i}^\top\boldsymbol\lambda_i,
+  \label{eq:wl-fulldyn}
+\end{equation}
+其中 $\mathbf{M}$ 为广义质量矩阵、$\mathbf{h}=\mathbf{C}\mathbf{v}+\mathbf{g}$ 含科氏/离心与重力、$\mathbf{S}=[\,\mathbf{0}\ \mathbf{I}\,]$ 挑出可驱动自由度、$\mathcal{C}$ 为当前激活接触集合。在 \cref{ch:unified-multimodal-mpc} 里第三类力是“臂末端力旋量 $\mathbf{J}_{\mathrm{ee}}^\top\mathbf{f}_{\mathrm{ee}}$”；轮足把“臂”换成“轮”，于是把接触集拆成足接触与轮接触两簇：
+\begin{equation}
+  \mathbf{M}(\mathbf{q})\dot{\mathbf{v}}+\mathbf{h}
+  =\mathbf{S}^\top\boldsymbol\tau
+  +\sum_{i\in\mathcal{C}_{\mathrm{foot}}}\mathbf{J}_{c,i}^\top\boldsymbol\lambda_i^{\mathrm{foot}}
+  +\sum_{j\in\mathcal{C}_{\mathrm{wheel}}}\mathbf{J}_{c,j}^\top\boldsymbol\lambda_j^{\mathrm{wheel}}.
+  \label{eq:wl-twoclass}
+\end{equation}
+
+\begin{insight}[两类接触力进入方程的方式完全相同，区别只在约束]
+\cref{eq:wl-twoclass} 里 $\boldsymbol\lambda^{\mathrm{foot}}$ 与 $\boldsymbol\lambda^{\mathrm{wheel}}$ 都经接触雅可比转置 $\mathbf{J}_c^\top$ 进入广义力——\textbf{动力学层面二者无差别}，都是地面对接触点施加的 $3$D 反力。真正把它们区分开的是各自受到的\emph{约束}：foot 力受标准（各向同性）摩擦锥、其接触点受完整约束 $\mathbf{J}_c\mathbf{v}=\mathbf{0}$；wheel 力受各向异性（椭圆）摩擦锥、其接触点受 Pfaffian 非完整约束。这把建模的重心从“写不同的动力学”转移到“写不同的约束”——后者正是第 \ref{sec:wl-pfaffian} 节的统一堆叠。
+\end{insight}
+
+\subsection{轮角速度作为新状态：一阶积分动力学}
+
+wheel 模式引入的轮速参考 $\omega_{\mathrm{ref}}$ 是输入侧的新变量；与之配对，状态侧须补入\emph{轮角速度} $\omega_w$，否则 MPC 无法预测未来轮速、无法规划平滑的轮速轨迹。轮的转动是一条最简单的一阶积分：
+\begin{equation}
+  \dot{\omega}_{w,i}=\frac{\tau_{w,i}}{I_{w,i}},
+  \label{eq:wl-wheelint}
+\end{equation}
+其中 $\tau_{w,i}$ 是第 $i$ 轮电机力矩、$I_{w,i}$ 是轮转动惯量。
+
+\begin{pitfall}[别把轮当质点令 $I_w=0$，也别把轮速踢出状态]
+两个对偶的错误：其一，假设 $I_w=0$，则 \cref{eq:wl-wheelint} 给出 $\dot\omega_w=\tau_w/0=\infty$，轮速瞬间到位，数值积分发散，MPC 产生不切实际的轮速轨迹。轮转动惯量虽小（典型 $I_w\sim10^{-3}\!\sim\!10^{-2}\,\mathrm{kg\cdot m^2}$）但非零，须如实给出。其二，干脆不把 $\omega_w$ 纳入状态，则轮速沦为每步独立的“瞬时决策”，失去时间平滑性——实测表现为轮速命令剧烈抖动、电机跟不上、打滑且能耗升高。把 $\omega_w$ 纳入状态后，MPC 才能规划平滑轮速并经代价惩罚其变化率。
+\end{pitfall}
+
+\begin{note}
+\textbf{为何 centroidal 简化对轮足依然成立.}\;直觉上会担心“腿端带轮，整机不能再当单刚体”。但 centroidal/SRBD 近似（\cref{sec:rm-srbd-centroidal}）的有效性只取决于\emph{腿部惯量是否可忽略}，与末端是足还是轮无关：只要腿质量远小于基座（Go2 量级腿质量约占总质量 $20\%$），SRBD 仍合理。轮的存在改变的是\emph{接触约束}，不是\emph{质心动力学}。下一节的低维模型据此成立。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{足 + 轮统一 Pfaffian：三模式接触约束的垂直堆叠}
+\label{sec:wl-pfaffian}
+
+\subsection{地形切平面局部坐标系：先投影再写约束}
+
+轮的纯滚动条件天然写在“沿滚动方向 / 横向 / 法向”这组随地形姿态而变的方向上，而非世界系三轴。故先在接触点建立地形切平面局部正交标架
+\begin{equation}
+  (\mathbf{e}_\parallel,\ \mathbf{e}_\perp,\ \mathbf{n}),\qquad
+  \mathbf{e}_\parallel\perp\mathbf{e}_\perp\perp\mathbf{n},\quad\|\mathbf{e}_\parallel\|=\|\mathbf{e}_\perp\|=\|\mathbf{n}\|=1,
+  \label{eq:wl-frame}
+\end{equation}
+其中 $\mathbf{n}$ 为地形法向（由感知或触觉估计）、$\mathbf{e}_\parallel$ 为轮滚动方向在切平面内的投影后归一、$\mathbf{e}_\perp=\mathbf{n}\times\mathbf{e}_\parallel$ 补全右手系。把接触点速度 $\mathbf{v}_{c,i}=\mathbf{J}_{c,i}\mathbf{v}$ 向这三个方向投影，就得到“纵向滚动量 / 横向滑移量 / 法向穿透量”三个标量，约束正是对这三个标量分别施加。
+
+\subsection{逐腿的模式相关约束矩阵}
+
+按模式 $\sigma_i$，第 $i$ 条腿的接触约束矩阵 $\mathbf{A}_i^{\sigma_i}(\mathbf{q})$（作用在 $\mathbf{v}$ 上）取三种形态：
+
+\begin{description}
+  \item[\;swing（摆动）] 不接触、无地面反力，接触约束为空：$\mathbf{A}_i^{\mathrm{swing}}=\varnothing$（零行）。此时 $\boldsymbol\lambda_i=\mathbf{0}$，腿运动由摆动轨迹跟踪代价驱动。
+  \item[\;foot（足支撑）] 接触点完全静止，三个方向速度全为零，这是\emph{完整}约束：
+  \begin{equation}
+    \mathbf{A}_i^{\mathrm{foot}}=\mathbf{J}_{c,i}\in\mathbb{R}^{3\times n_v},\qquad \mathbf{A}_i^{\mathrm{foot}}\mathbf{v}=\mathbf{J}_{c,i}\mathbf{v}=\mathbf{0}.
+    \label{eq:wl-Afoot}
+  \end{equation}
+  \item[\;wheel（轮支撑）] 沿滚动方向\emph{可动但须匹配轮线速度}、横向不滑、法向不穿，仍是三行，但其中纵向那行变为非齐次（右端含轮速），整体是\emph{非完整}的 Pfaffian 约束：
+  \begin{equation}
+    \mathbf{A}_i^{\mathrm{wheel}}=
+    \begin{bmatrix} \mathbf{e}_{\parallel,i}^\top\mathbf{J}_{c,i}\\[1pt] \mathbf{e}_{\perp,i}^\top\mathbf{J}_{c,i}\\[1pt] \mathbf{n}_i^\top\mathbf{J}_{c,i}\end{bmatrix}\in\mathbb{R}^{3\times n_v},\qquad
+    \mathbf{A}_i^{\mathrm{wheel}}\mathbf{v}=
+    \begin{bmatrix} r_i\,\omega_{\mathrm{ref},i}\\ 0\\ 0\end{bmatrix}.
+    \label{eq:wl-Awheel}
+  \end{equation}
+\end{description}
+
+第一行 $\mathbf{e}_{\parallel,i}^\top\mathbf{J}_{c,i}\mathbf{v}=r_i\omega_{\mathrm{ref},i}$ 即“接触点纵向速度 $=$ 轮线速度”的纯滚动条件；第二行 $\mathbf{e}_{\perp,i}^\top\mathbf{J}_{c,i}\mathbf{v}=0$ 是“不侧滑”；第三行 $\mathbf{n}_i^\top\mathbf{J}_{c,i}\mathbf{v}=0$ 是“不穿地”。
+
+\begin{note}
+\textbf{与 \cref{ch:mm-wheeled} 的衔接.}\;\cref{ch:mm-wheeled} 在 $\SE(2)$ 平面底盘上把“纯滚动 + 不横滑”落成具体 $\mathbf{A}(\mathbf{q})\dot{\mathbf{q}}=\mathbf{0}$（\cref{eq:cd-pfaffian} 的定常齐次特例）。本章的 \cref{eq:wl-Awheel} 是它在\emph{三维、浮基、且右端含主动轮速}下的推广：多了一条法向不穿透行，纵向行的右端从 $0$ 变成 $r\omega_{\mathrm{ref}}$（轮被主动驱动而非被动滚动）。可积性判据（\cref{thm:cd-frobenius}）依旧适用——纵向那行因右端依赖独立的 $\omega_{\mathrm{ref}}$ 而不可积，故 wheel 约束确为非完整。
+\end{note}
+
+\subsection{统一堆叠}
+
+把四条腿各自的 $\mathbf{A}_i^{\sigma_i}$ 按当前模式向量 $\sigma$ 垂直堆叠，得到\emph{统一接触约束}
+\begin{equation}
+  \mathbf{A}_{\mathrm{uni}}(\mathbf{q},\sigma)\,\mathbf{v}=\mathbf{b}_{\mathrm{uni}}(\sigma,\boldsymbol\omega_{\mathrm{ref}}),
+  \qquad
+  \mathbf{A}_{\mathrm{uni}}=\begin{bmatrix}\mathbf{A}_1^{\sigma_1}\\ \vdots\\ \mathbf{A}_4^{\sigma_4}\end{bmatrix},
+  \label{eq:wl-Auni}
+\end{equation}
+其行数随模式而变（swing 腿贡献 $0$ 行、foot/wheel 腿各贡献 $3$ 行），右端 $\mathbf{b}_{\mathrm{uni}}$ 仅在 wheel 腿的纵向位置非零。这一个矩阵就把“同一时刻三类约束混合”这一困难二收编进单一线性等式——优化器只需面对一个 $\mathbf{A}_{\mathrm{uni}}\mathbf{v}=\mathbf{b}_{\mathrm{uni}}$，模式的差异已被吸收进矩阵的行结构与右端。
+
+\begin{proposition}[统一约束的行数、瞬时自由度与支撑可行性]\label{prop:wl-rank}
+设模式 $\sigma$ 含 $n_f$ 条 foot 腿、$n_w$ 条 wheel 腿、$n_s$ 条 swing 腿（$n_f+n_w+n_s=4$）。则 $\mathbf{A}_{\mathrm{uni}}$ 满行时行数为 $3(n_f+n_w)$；接触子系统的瞬时可动自由度为 $n_v-\mathrm{rank}\,\mathbf{A}_{\mathrm{uni}}$。若 $n_f+n_w=0$（全 swing），约束为空、机器人腾空，\cref{eq:wl-centroidal} 退化为 $\dot{\mathbf{l}}_G=m\mathbf{g}$（自由落体）——这正是物理上不可作为持续支撑模式的根源。
+\end{proposition}
+
+\begin{proof}[要点]
+每条 foot 腿贡献 $\mathbf{A}_i^{\mathrm{foot}}=\mathbf{J}_{c,i}$（$3$ 行），每条 wheel 腿贡献 \cref{eq:wl-Awheel}（$3$ 行），swing 腿贡献 $0$ 行，垂直堆叠故满行行数 $3(n_f+n_w)$。约束把速度限制在 $\ker\mathbf{A}_{\mathrm{uni}}$（$\dot{\mathbf{v}}$ 层则在仿射子空间），其维数 $n_v-\mathrm{rank}\,\mathbf{A}_{\mathrm{uni}}$ 即瞬时可动自由度。全 swing 时 $\mathbf{A}_{\mathrm{uni}}$ 无行、$\boldsymbol\lambda\equiv\mathbf{0}$，\cref{eq:wl-centroidal} 线动量行只剩重力项，得自由落体；无地面反力即无法持续支撑。$\square$
+\end{proof}
+
+\begin{note}
+\textbf{秩亏边界要当心.}\;$\mathrm{rank}\,\mathbf{A}_{\mathrm{uni}}$ 未必等于满行 $3(n_f+n_w)$：当多个接触点共线或地形标架退化（如 $\mathbf{e}_\parallel$ 与轮轴趋于平行使纵向行病态）时会秩亏，等式约束相容性变差，QP 的等式约束雅可比 $\mathbf{C}_{\mathrm{eq}}$ 出现近零奇异值，KKT 求解病态。这与 \cref{ch:quad_mpc} 中“对角小跑两支撑足连成支撑线、绕该线方向欠驱”是同一类退化在轮足里的体现——只是这里退化既可能来自几何（接触点排布），也可能来自地形标架估计。工程上以阻尼最小二乘（在 $\mathbf{J}_c\mathbf{M}^{-1}\mathbf{J}_c^\top$ 加 $\epsilon\mathbf{I}$）或显式监控该矩阵条件数来兜底。
+\end{note}
+
+\begin{derivation}[加速度层约束：交给 WBC/QP 的实际形态]
+MPC 的低维模型在速度层用 \cref{eq:wl-Auni} 即可；但下游 WBC 的决策变量是广义加速度 $\dot{\mathbf{v}}$，需把速度层约束对时间求导一次。对 wheel 腿纵向行 $\mathbf{e}_\parallel^\top\mathbf{J}_c\mathbf{v}=r\omega_{\mathrm{ref}}$ 求导（近似将 $\mathbf{e}_\parallel,\mathbf{n}$ 视为慢变）：
+\begin{equation}
+  \mathbf{e}_{\parallel,i}^\top\big(\mathbf{J}_{c,i}\dot{\mathbf{v}}+\dot{\mathbf{J}}_{c,i}\mathbf{v}\big)=r_i\,\dot{\omega}_{\mathrm{ref},i}.
+  \label{eq:wl-acclevel}
+\end{equation}
+对比 foot 腿的加速度层约束 $\mathbf{J}_c\dot{\mathbf{v}}=-\dot{\mathbf{J}}_c\mathbf{v}$（接触点加速度为零，承 \cref{ch:quad_wbc}），二者\emph{数学结构相同、只差右端}：foot 右端为零（足端不动），wheel 纵向右端为 $r\dot\omega_{\mathrm{ref}}$（接触点随轮加速而滚）。这一行右端的差别，正是从足式 WBC 扩到轮足 WBC 唯一的核心改动点。\qed
+\end{derivation}
+
+\paragraph{埋下切换接口。}
+\cref{eq:wl-Auni} 描述的是\emph{某一模式段内}的连续约束。当 swing 腿落地（约束行从 $0$ 增到 $3$）或 foot/wheel 互切（纵向行右端从 $0$ 变 $r\omega_{\mathrm{ref}}$）时，约束\emph{集合本身}发生离散跳变，可能伴随速度跳变与冲量。该“切换瞬间”由混杂系统的重置映射 $\mathbf{R}_{m\to n}$ 刻画，其速度投影正是本章 note 里的 $\mathbf{v}^+=\mathbf{P}_M\mathbf{v}^-$；完整的 guard/reset 推导、能量损失与无冲量切换条件，集中在 \cref{ch:wl-modeswitch}。本章自此只处理模式段\emph{内}的优化。
+
+% ════════════════════════════════════════════════════════════════
+\section{centroidal / SRBD 的轮足扩展与维度算例}
+\label{sec:wl-srbd}
+
+\subsection{质心动力学不变，可行力域随模式变}
+
+直接用全维 \cref{eq:wl-twoclass}（$n_v\sim24$）做 MPC 计算量过大。与纯足 MPC 一致，轮足 MPC 用 centroidal 动力学：以质心动量 $\mathbf{h}_G=[\mathbf{k}_G;\mathbf{l}_G]$（角动量 $3$ + 线动量 $3$）为核心，
+\begin{equation}
+  \dot{\mathbf{h}}_G=\begin{bmatrix}\dot{\mathbf{k}}_G\\ \dot{\mathbf{l}}_G\end{bmatrix}
+  =\begin{bmatrix}\sum_i(\mathbf{p}_{c,i}-\mathbf{p}_G)\times\boldsymbol\lambda_i\\[2pt] m\mathbf{g}+\sum_i\boldsymbol\lambda_i\end{bmatrix},
+  \label{eq:wl-centroidal}
+\end{equation}
+把动力学从 $n_v$ 维降到 $6$ 维，且无需求关节加速度。\cref{eq:wl-centroidal} 的\emph{形式}不随模式变（质心力矩平衡恒成立），变的是接触力 $\boldsymbol\lambda_i$ 的\emph{可行域}：foot 受标准摩擦锥，wheel 纵向分量受轮驱动力矩上限、横向受横向摩擦，swing 则 $\boldsymbol\lambda_i=\mathbf{0}$。
+
+进一步取 SRBD（把整机当一块砖，\cref{eq:rm-srbd-trans}--\cref{eq:rm-srbd-rot}），平动与转动两方程为
+\begin{align}
+  m\ddot{\mathbf{p}}_G&=m\mathbf{g}+\sum_i\boldsymbol\lambda_i,\\
+  \mathbf{I}_G\dot{\boldsymbol\omega}+\boldsymbol\omega\times(\mathbf{I}_G\boldsymbol\omega)&=\sum_i(\mathbf{p}_{c,i}-\mathbf{p}_G)\times\boldsymbol\lambda_i.
+  \label{eq:wl-srbd}
+\end{align}
+轮足扩展只需在输入里添 $\boldsymbol\omega_{\mathrm{ref}}$、在状态里添轮角速度 $\boldsymbol\theta_w$（其动力学即 \cref{eq:wl-wheelint}）。
+
+\subsection{Go2+wheels 的 16 维 SRBD 算例}
+
+以四足 Go2 各腿末端加一主动轮为例，SRBD 轮足模型的状态与输入维度如下。
+
+\begin{table}[H]\centering\small
+\caption{纯足 SRBD 与轮足 SRBD 的状态/输入对照（Go2+wheels，单刚体级）。}
+\label{tab:wl-srbd-dim}
+\begin{tabular}{lll}
+\toprule
+量 & 纯足 SRBD & 轮足 SRBD \\
+\midrule
+状态 $\mathbf{x}$ & $(\mathbf{p}_G,\dot{\mathbf{p}}_G,\mathbf{R}_b,\boldsymbol\omega)$，$12$D & 上述 $12$D $+$ 轮角速度 $\boldsymbol\theta_w$（$4$）$=16$D \\
+输入 $\mathbf{u}$ & 接触力 $\boldsymbol\lambda_{1:4}$，$12$D & 接触力 $12$ $+$ 轮速参考 $\boldsymbol\omega_{\mathrm{ref}}$（$4$）$=16$D \\
+动力学维度 & $12$（质心） & $12$（质心）$+4$（轮速积分）$=16$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{两套维度别混用.}\;若采用更完整的 centroidal $+$ 全身运动学状态表示 $\mathbf{x}=[\mathbf{h}_G;\mathbf{q}]$（动量 $6$ $+$ 基座位姿 $7$ $+$ 腿关节 $12$ $+$ 轮转角 $4$），则 $n_x=29$、$n_u=28$（接触力 $12$ $+$ 轮速参考 $4$ $+$ 关节力矩 $12$），比纯足各多 $4$ 维。\cref{tab:wl-srbd-dim} 用的是更瘦的 SRBD 级表示（$16/16$）。两套表示对应不同抽象层级，QP 组装时务必前后一致——绝大多数“矩阵维度不匹配”的崩溃，根因都是把含轮状态的维度误用成纯足维度。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{模式相关的分段二次代价}
+\label{sec:wl-cost}
+
+\paragraph{一个随模式切换的二次型。}
+轮足 MPC 的代价不是固定二次型，而是\emph{模式相关的分段二次型}：每个模式段内是二次型，但权重 $\mathbf{Q}_\sigma,\mathbf{R}_\sigma$ 随模式 $\sigma$ 跳变。总代价由若干控制目标叠加：
+\begin{equation}
+  \ell_\sigma(\mathbf{x},\mathbf{u})=
+  \underbrace{\ell_{\mathrm{com}}}_{\text{质心跟踪}}
+  +\underbrace{\ell_{\mathrm{vel}}}_{\text{基座速度跟踪}}
+  +\underbrace{\ell_{\omega}}_{\text{轮速匹配}}
+  +\underbrace{\ell_{\mathrm{force}}}_{\text{力正则}}
+  +\underbrace{\ell_{\mathrm{swing}}}_{\text{摆动跟踪}}.
+  \label{eq:wl-cost}
+\end{equation}
+其中轮速匹配项只在 wheel 腿激活：
+\begin{equation}
+  \ell_{\omega}=\sum_{i\in\mathcal{C}_{\mathrm{wheel}}}w_\omega\,\big\|\omega_{w,i}-\omega_{\mathrm{ref},i}\big\|^2,
+  \label{eq:wl-ellomega}
+\end{equation}
+而 $\ell_{\mathrm{force}}=\sum_i\|\boldsymbol\lambda_i\|_{\mathbf{R}_\lambda}^2$ 防止接触力过大、鼓励均匀分配。
+
+\paragraph{权重随模式切换。}
+关键设计决策是让各代价项权重随模式开关，使同一优化器在不同模式下追求不同目标。
+
+\begin{table}[H]\centering\small
+\caption{模式相关代价权重（示意量级，非定值）：每模式只“点亮”与其物理目标相关的项。}
+\label{tab:wl-modeweights}
+\begin{tabular}{lccc}
+\toprule
+代价项 & swing & foot & wheel \\
+\midrule
+接触力正则 $w_\lambda$ & $0$（无力） & $1$ & $1$（各向异性） \\
+轮速匹配 $w_\omega$ & $0$ & $0$ & $10$（重要） \\
+摆动轨迹跟踪 $w_{\mathrm{swing}}$ & $100$（重要） & $0$ & $0$ \\
+足端位置保持 $w_{\mathrm{foot}}$ & $0$ & $50$ & $0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[权重的物理含义是“偏差的危险程度”]
+权重 $w_i$ 表示“该量偏差一个单位所产生的代价”。若所有 $Q$ 取同值，则高度偏差 $0.1\,\mathrm{m}$（很危险）与轮转角偏差 $0.1\,\mathrm{rad}$（完全无害）产生相同代价，MPC 可能为减小轮转角偏差而牺牲高度——本末倒置。故必须分层：安全关键量（质心高度、横滚/俯仰角）权重最高，跟踪量（水平位置/速度）居中，辅助量（轮转角本身不重要，轮\emph{速}才重要）最低。轮转角权重可低至 $\sim0.1$ 量级。
+\end{insight}
+
+\begin{pitfall}[wheel 模式力正则须各向异性]
+对 wheel 模式沿用 foot 的各向同性力权重，会导致接触力分配不合理：纵向力过大打滑、或横向力过大侧翻。物理上，wheel 纵向力受轮驱动能力限（$|F_\parallel|\le\tau_{w,\max}/r$），横向力受横向摩擦限——两方向“代价”本就不同。正确做法是给 wheel 设\emph{不对称}的力正则：纵向权重低（鼓励用驱动力），横向权重高（惩罚侧向力、抑制侧滑）。这与下一节的椭圆锥约束相互呼应——一个塑形代价、一个限定可行域。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{切换系统 OCP 的 QP 堆叠}
+\label{sec:wl-qp}
+
+\paragraph{切换 OCP 的形态。}
+把模式信号 $\sigma(t)$ 视为\emph{给定}（由上层调度，见 \cref{ch:wl-modeswitch}），轮足 MPC 是一个切换系统最优控制问题：
+\begin{equation}
+  \min_{\mathbf{u}(\cdot)}\ \Phi(\mathbf{x}_T)+\int_0^T\ell_{\sigma(t)}\big(\mathbf{x}(t),\mathbf{u}(t)\big)\,\mathrm dt,
+  \quad\text{s.t.}\ \ \dot{\mathbf{x}}=f_{\sigma(t)}(\mathbf{x},\mathbf{u}),\ \ g_{\sigma(t)}(\mathbf{x},\mathbf{u})\lessgtr 0,
+  \label{eq:wl-ocp}
+\end{equation}
+其与 \cref{ch:quad_mpc} 的凸 MPC 的唯一结构差别，是动力学 $f$、约束 $g$、代价 $\ell$ 三者都\emph{随离散模式 $\sigma$ 分段}。下面把它离散、线性化、堆叠成可交给结构化 QP 求解器的标准形——步骤与 \cref{ch:quad_mpc} 同构，只在“随模式取不同块”处分叉。
+
+\paragraph{Step 1：离散化与线性化。}
+前向欧拉离散 $\mathbf{x}_{k+1}=\mathbf{x}_k+\Delta t\,f_{\sigma_k}(\mathbf{x}_k,\mathbf{u}_k)$，在工作点 $(\bar{\mathbf{x}}_k,\bar{\mathbf{u}}_k)$ 线性化：
+\begin{equation}
+  \mathbf{x}_{k+1}\approx\mathbf{A}_k\mathbf{x}_k+\mathbf{B}_k\mathbf{u}_k+\mathbf{d}_k,\quad
+  \mathbf{A}_k=\mathbf{I}+\Delta t\,\frac{\partial f}{\partial\mathbf{x}}\Big|_{\bar{\mathbf{x}}_k,\bar{\mathbf{u}}_k},\ \
+  \mathbf{B}_k=\Delta t\,\frac{\partial f}{\partial\mathbf{u}}\Big|_{\bar{\mathbf{x}}_k,\bar{\mathbf{u}}_k}.
+  \label{eq:wl-lin}
+\end{equation}
+
+\paragraph{Step 2：决策向量与二次代价。}
+堆叠全时步状态与输入 $\mathbf{z}=(\mathbf{x}_0,\mathbf{u}_0,\dots,\mathbf{u}_{N-1},\mathbf{x}_N)$，代价展为 $J\approx\tfrac12\mathbf{z}^\top\mathbf{H}\mathbf{z}+\mathbf{c}^\top\mathbf{z}$，$\mathbf{H}=\mathrm{blkdiag}(\mathbf{Q}_0,\mathbf{R}_0,\dots,\mathbf{Q}_N)$。这里 $\mathbf{Q}_k,\mathbf{R}_k$ 随模式 $\sigma_k$ 取 \cref{tab:wl-modeweights} 对应的权重——这正是轮足与纯足 QP 的关键区别：Hessian 的对角块\emph{逐段换值}。
+
+\paragraph{Step 3：等式约束（动力学 $+$ 滚动）。}
+等式约束含两类：动力学约束（每步一组，来自 \cref{eq:wl-lin}）$\mathbf{A}_k\mathbf{x}_k+\mathbf{B}_k\mathbf{u}_k-\mathbf{x}_{k+1}+\mathbf{d}_k=\mathbf{0}$；以及 wheel 腿的 Pfaffian 滚动等式（每步每 wheel 腿 $3$ 条，来自 \cref{eq:wl-Auni}）。后者随状态/输入非线性（$\mathbf{e}_\parallel,\mathbf{J}_c$ 依赖 $\mathbf{q}$），同样在工作点线性化为 $\mathbf{C}_k^{\mathrm{roll}}\mathbf{x}_k+\mathbf{D}_k^{\mathrm{roll}}\mathbf{u}_k+\mathbf{e}_k^{\mathrm{roll}}=\mathbf{0}$，整体堆叠为 $\mathbf{C}_{\mathrm{eq}}\mathbf{z}=\mathbf{d}_{\mathrm{eq}}$。
+
+\paragraph{Step 4：不等式约束（两类摩擦锥 $+$ 限幅）。}
+foot 与 wheel 的摩擦锥都是二阶锥（非线性，不利于 QP），须线性化为多面体。foot 用标准摩擦金字塔——把切向力围进内接 $k$ 棱锥（承 \cref{eq:friction-cone} 与 \cref{ch:quad_mpc} 的金字塔内接化）。$\theta_j=2\pi j/k$ 取为各棱面外法线方向；为使多面体真正\emph{内接}于真实摩擦圆（顶点落在圆上、整体被圆包住），右端须乘内接因子 $\cos(\pi/k)$（棱面到圆心的距离 $=\cos(\pi/k)\cdot\mu F_n$）：
+\begin{equation}
+  \cos\theta_j\,F_x+\sin\theta_j\,F_y\le\mu\cos\!\tfrac{\pi}{k}\,F_n,\quad \theta_j=\tfrac{2\pi j}{k},\ j=0,\dots,k-1.
+  \label{eq:wl-conefoot}
+\end{equation}
+（若省去 $\cos(\pi/k)$，棱面恰与圆相切，得到的是\emph{外切}多面体——顶点凸出圆外、可行域反而\emph{大于}真实锥，与下文“内接、绝不冒进”相悖；故内接因子不可省。注：\cref{ch:quad_mpc} 的 \cref{eq:friction-cone} 处用 $k\!=\!4$ 轴对齐方箱 $|f^{x}|\le\mu f^{z},\,|f^{y}|\le\mu f^{z}$ 落地，未显式写出该因子——那是工程上常见的“切线方箱”写法，严格说是外切而非内接；若要真正保守，应同样乘 $\cos(\pi/4)\!=\!0.707$。本章为与“绝不冒进”的安全论证自洽，保留内接因子。）
+wheel 用\emph{各向异性椭圆锥}：纵向半轴 $a=\tau_{w,\max}/r$（轮驱动限）、横向半轴 $b=\mu_{\mathrm{lat}}F_n$（横向摩擦限），椭圆 $(F_\parallel/a)^2+(F_\perp/b)^2\le1$ 经“缩放回单位圆再取切线”线性化（同样乘内接因子 $\cos(\pi/k)$ 以保持内接保守性）：
+\begin{equation}
+  \frac{\cos\theta_j}{a}\,F_{\parallel}+\frac{\sin\theta_j}{b}\,F_{\perp}\le \cos\!\tfrac{\pi}{k},\quad j=0,\dots,k-1.
+  \label{eq:wl-conewheel}
+\end{equation}
+连同关节力矩限幅 $-\boldsymbol\tau_{\max}\le\boldsymbol\tau_\ell\le\boldsymbol\tau_{\max}$，堆叠为 $\mathbf{C}_{\mathrm{ineq}}\mathbf{z}\le\mathbf{d}_{\mathrm{ineq}}$。最终标准形
+\begin{equation}
+  \min_{\mathbf{z}}\ \tfrac12\mathbf{z}^\top\mathbf{H}\mathbf{z}+\mathbf{c}^\top\mathbf{z}\quad\text{s.t.}\quad \mathbf{C}_{\mathrm{eq}}\mathbf{z}=\mathbf{d}_{\mathrm{eq}},\ \mathbf{C}_{\mathrm{ineq}}\mathbf{z}\le\mathbf{d}_{\mathrm{ineq}}.
+  \label{eq:wl-qp}
+\end{equation}
+
+\begin{insight}[内接多面体的安全保守性 + 各向异性的必要性]
+两点物理：其一，摩擦锥用\emph{内接}（而非外切）多面体，可行域略小于真实锥——MPC 绝不会请求真实摩擦不允许的力（绝不冒进），代价是偶尔放弃本可行的力（略保守）。安全关键系统宁保守勿冒进，故几乎所有实现都用内接。其二，wheel\emph{必须}用各向异性椭圆锥：若误用各向同性圆锥，会同时\emph{高估横向}（把横向上限错误放大）与\emph{低估纵向}（把强驱动力压低），导致转弯侧滑 $+$ 加速无力。各向异性不是锦上添花，而是 wheel 力分配正确性的必要条件。
+\end{insight}
+
+\begin{note}
+\textbf{$k$ 取多大.}\;内接 $k$ 棱锥的棱面内径 $=\cos(\pi/k)\cdot\mu F_n$，相对真实圆锥\emph{欠估}（保守）量为 $1-\cos(\pi/k)$：$k=4$ 约 $29\%$、$k=6$ 约 $13\%$、$k=8$ 约 $7.6\%$、$k=16$ 约 $1.9\%$。工程常用 $k=8$。$k$ 增大则约束行数线性增长、QP 变慢；而摩擦系数 $\mu$ 本身估计误差常达 $10\%\!\sim\!20\%$，盲目取 $k=16$ 是用确定的计算开销去换一个被 $\mu$ 不确定性淹没的精度提升。$k$ 应匹配 $\mu$ 的估计精度。
+\end{note}
+
+\paragraph{为何必须用带状结构求解器。}
+取上面更完整表示 $n_x=29,n_u=28,N=20$，决策向量维度约 $1169$。若用稠密 QP，分解复杂度 $O(1169^3)\approx1.6\times10^9$ 次浮点运算；而结构化求解器利用 $\mathbf{H}$ 的块对角与 $\mathbf{C}_{\mathrm{eq}}$ 的带状结构（每步状态只与相邻步耦合），复杂度降为 $O\!\big(N(n_x+n_u)^3\big)\approx20\times57^3\approx3.7\times10^6$——快约两个数量级。这正是\emph{把立方复杂度降到对 $N$ 线性}的来源，也是实时 MPC 必须用带状 KKT 求解器（而非通用稠密 QP）的根本原因。轮足相比纯足约多 $30\%$ 维度，单步 QP 时间约增 $(1.3)^3\approx2.2$ 倍，仍在实时范围内。
+
+\begin{algo}[滚动约束残差与各向异性椭圆锥（概念实现）]
+下列伪代码给出 wheel 腿在某工作点处“滚动等式残差 $+$ 椭圆锥不等式系数”的装配逻辑（仅示意数据流，工程实现的自动微分/求解器后端按规范从略）。
+\begin{codebox}[Python]{wheel 约束装配（概念）}
+import numpy as np
+
+def rolling_residual(Jc, v, e_par, e_perp, n, r, omega_ref):
+    """wheel 模式三维滚动约束残差:纵向匹配 / 横向不滑 / 法向不穿."""
+    v_c = Jc @ v                      # 接触点速度（3 维）
+    return np.array([
+        e_par  @ v_c - r * omega_ref, # 纵向:等于轮线速度
+        e_perp @ v_c,                 # 横向:不侧滑
+        n      @ v_c,                 # 法向:不穿地
+    ])
+
+def ellipse_cone_rows(tau_w_max, r, mu_lat, Fn, k=8):
+    """各向异性椭圆锥 (F_par/a)^2+(F_perp/b)^2<=1 的 k 棱内接线性化."""
+    a = tau_w_max / r                 # 纵向半轴:轮驱动能力
+    b = mu_lat * Fn                   # 横向半轴:横向摩擦能力
+    rows = [[np.cos(2*np.pi*j/k)/a, np.sin(2*np.pi*j/k)/b] for j in range(k)]
+    return np.array(rows)             # rows @ [F_par, F_perp] <= 1
+\end{codebox}
+半轴 $a,b$ 随状态变（$a$ 依轮速参考与电机限幅、$b$ 依法向力），故椭圆锥系数\emph{每步重算}，不像标准摩擦锥系数固定——这是 wheel 约束装配比 foot 更耗时之处。
+\end{algo}
+
+% ════════════════════════════════════════════════════════════════
+\section{热启动、实时迭代与安全降级}
+\label{sec:wl-rti}
+
+\paragraph{实时迭代（RTI）。}
+\cref{eq:wl-qp} 是带切换的非线性优化，须在数毫秒内解出。实时迭代策略（与凸 MPC 的滚动求解一脉相承）的核心是：\emph{不等 SQP 收敛，每个控制周期只做一次 SQP 迭代}——线性化、解一次 QP 子问题、取其首步作为当前控制输入。它之所以可行，靠两条性质：其一，\emph{时间连续性}——相邻控制周期的最优轨迹相近，热启动使一次迭代即得足够好的近似；其二，\emph{反馈效应}——MPC 本就是反馈控制，单步不完美，下一步会用新状态重新优化、在线纠正。
+
+\paragraph{热启动随模式切换分情况。}
+热启动是实时性的“氧气”：用上一解平移一步作初值，可把所需迭代从 $5\!\sim\!20$ 次降到 $1$ 次。但模式切换会破坏热启动的有效性，须分情况处理：无切换时直接平移上一解；预期内切换时用新模式约束\emph{重新投影}上一解；意外切换时丢弃上一解、从启发式初值重启。模式切换瞬间往往需要临时多做几次迭代或暂降控制频率。
+
+\begin{note}
+\textbf{滚动约束导数的步长别取仿真步长.}\;若用数值差分求 \cref{eq:wl-lin} 与滚动约束的雅可比，最优差分步长由“截断误差 vs 浮点抵消误差”折中决定，量级取决于差分格式：\emph{前向}差分（截断 $O(h)$）最优 $h^\ast\!\sim\!\sqrt{\epsilon_{\mathrm{machine}}}\!\approx\!1.5\times10^{-8}$；\emph{中心}差分（截断 $O(h^2)$，更准）最优 $h^\ast\!\sim\!\epsilon_{\mathrm{machine}}^{1/3}\!\approx\!6\times10^{-6}$。两者都与仿真步长 $\Delta t\sim10^{-3}$ \emph{无关}。误取 $h=\Delta t$ 会使截断误差显著、线性化不准、SQP 收敛慢甚至不收敛。工程上先用 $h\sim10^{-6}$ 的中心差分实现并验证数值正确性，确认收敛后再为热点路径迁移到自动微分以提速。
+\end{note}
+
+\paragraph{安全降级是核心组件，不是事后补丁。}
+实时系统里求解器可能超时、不收敛或给出不可行解，故 MPC 必须配完整降级阶梯，原则是\emph{宁可不动也不乱动}。
+
+\begin{table}[H]\centering\small
+\caption{轮足 MPC 的安全降级阶梯（示意阈值，平台相关）。}
+\label{tab:wl-degrade}
+\begin{tabular}{lll}
+\toprule
+触发条件 & 降级动作 & 时间尺度 \\
+\midrule
+单次超时 & 用上一有效解，衰减系数 $\alpha\approx0.95$ & $<1$ 控制周期 \\
+连续超时 $3$ 次 & 全腿切 foot 模式、降低速度命令 & $\sim50\!\sim\!100\,\mathrm{ms}$ \\
+连续超时 $10$ 次 & 进站立锁定、锁关节 & $\sim200\,\mathrm{ms}$ \\
+KKT 残差超阈 & 临时增 SQP 迭代（$1\!\to\!3$ 次） & 一次求解周期 \\
+约束不可行 & 软化等式约束为惩罚项、置警告 & 立刻 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[轮足尤需降级]
+一个没有降级策略的 MPC，像一辆没有安全气囊的车——多数时间正常，关键时刻酿祸。轮足尤甚：模式切换本身就抬高了求解器失败的概率（约束结构在收敛前就可能变化）。降级阶梯的设计与真机验证，应与求解器本身同等对待。
+\end{insight}
+
+\paragraph{与多模态 MPC 的分工边界。}
+\cref{ch:unified-multimodal-mpc} 的“多模态”指 MPC 须同时驾驭\emph{三类性质迥异的力}——关节力矩（直接决策）、足端接触力（经步态间接塑形）、末端力旋量（力控目标或扰动）。本章的“多模式”指\emph{接触状态}逐腿三值切换。二者正交而互补：前者是\emph{力的可控性}维度，后者是\emph{接触的离散结构}维度。一个完整的轮足复合系统同时具备两者——既有臂/末端力的可控性分级，又有腿/轮接触的模式切换。读者可据 \cref{ch:unified-multimodal-mpc} 的力分级搭建代价/约束的“力”侧，据本章的统一 Pfaffian 与分段二次代价搭建“接触模式”侧，二者在同一 QP \cref{eq:wl-qp} 中汇合而不重复。模式如何\emph{切换}（调度、滞回、冲击）则交给 \cref{ch:wl-modeswitch}。
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+本章把“同一末端在 swing/foot/wheel 三模式间切换”的轮足系统，收束为可实时滚动求解的切换 QP。主线四步：(1) 动机——三值模式带来组合放大、约束混合、轮速参考新变量三重困难，逼出预测式最优控制；(2) 统一动力学——承 \cref{eq:umm-core}，foot 与 wheel 接触力以相同方式经 $\mathbf{J}_c^\top$ 入方程、区别只在约束，轮角速度经 $\dot\omega_w=\tau_w/I_w$ 入状态；(3) 统一 Pfaffian——逐腿按模式取 $\mathbf{A}_i^{\sigma_i}$（swing 空 / foot 完整 / wheel 非完整三行）、在地形切平面标架下垂直堆叠为 $\mathbf{A}_{\mathrm{uni}}(\mathbf{q},\sigma)$；(4) 切换 OCP $\to$ QP——离散线性化、Hessian 块逐段换值、foot 多面体锥与 wheel 椭圆锥、带状 KKT 把复杂度降到对 $N$ 线性，外加 RTI/热启动/降级。切换\emph{瞬间}的冲击与调度承接到 \cref{ch:wl-modeswitch}；与 \cref{ch:unified-multimodal-mpc} 多模态 MPC 的分工是“力可控性维度 vs 接触模式维度”，正交互补。
+
+\begin{practice}[本章自测]
+\begin{enumerate}
+  \item 枚举四轮轮足的 $81$ 种模式组合，据 \cref{prop:wl-rank} 标出物理可行（至少一腿 foot 或 wheel 提供支撑）与不可行（全 swing）者；可行组合有多少种？
+  \item 写出 \cref{eq:wl-Awheel} 三行各自的物理含义，并说明为何只有纵向那行使整组约束成为非完整（提示：右端 $r\omega_{\mathrm{ref}}$ 含独立决策变量，用 \cref{thm:cd-frobenius} 论证不可积）。
+  \item 把 \cref{eq:wl-Auni} 的速度层约束对时间求导，写出 wheel 腿与 foot 腿的加速度层约束（\cref{eq:wl-acclevel}），指出二者唯一的差别，并说明这对应从足式 WBC 扩到轮足 WBC 的哪一处改动。
+  \item 取 $\tau_{w,\max}=8\,\mathrm{N\cdot m}$、$r=0.05\,\mathrm{m}$、$\mu_{\mathrm{lat}}=0.7$、$F_n=50\,\mathrm{N}$，算出 wheel 椭圆锥纵向半轴 $a$ 与横向半轴 $b$（\cref{eq:wl-conewheel}），判断高速转弯时纵向与横向哪个方向的力先耗尽。
+  \item 对 $n_x=29,n_u=28,N=20$，分别估计稠密 QP 与带状 KKT 求解器的分解复杂度量级，给出二者之比，解释“立方降到对 $N$ 线性”的含义。
+\end{enumerate}
+\end{practice}
+
+\begin{table}[H]\centering\small
+\caption{符号表（维度按 Go2+wheels：$4$ 腿、各 $1$ 轮）。}
+\label{tab:wl-symbols}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\mathbf{M}(\mathbf{q}),\mathbf{h},\mathbf{S}$ & 广义质量阵 / 科氏离心+重力 / 驱动选择阵 $[\,\mathbf{0}\ \mathbf{I}\,]$ & \cref{eq:wl-fulldyn} \\
+$\boldsymbol\lambda_i^{\mathrm{foot}},\boldsymbol\lambda_j^{\mathrm{wheel}}$ & 足 / 轮接触力（各 $3$D，进方程方式相同） & \cref{eq:wl-twoclass} \\
+$\omega_w,\omega_{\mathrm{ref}},I_w$ & 轮角速度 / 其 MPC 参考 / 轮转动惯量 & \cref{eq:wl-wheelint} \\
+$(\mathbf{e}_\parallel,\mathbf{e}_\perp,\mathbf{n})$ & 地形切平面标架：滚动 / 横向 / 法向 & \cref{eq:wl-frame} \\
+$\mathbf{A}_i^{\sigma_i},\mathbf{A}_{\mathrm{uni}}$ & 逐腿 / 统一接触约束矩阵 & \cref{eq:wl-Afoot,eq:wl-Auni} \\
+$\sigma=(\sigma_1,\dots,\sigma_4)$ & 模式向量，每腿 $\in\{\mathrm{swing},\mathrm{foot},\mathrm{wheel}\}$ & \cref{eq:wl-Auni} \\
+$\mathbf{h}_G=[\mathbf{k}_G;\mathbf{l}_G]$ & 质心动量（角 $3$ + 线 $3$） & \cref{eq:wl-centroidal} \\
+$\boldsymbol\theta_w$ & 轮转角（纯足无此项） & \cref{tab:wl-srbd-dim} \\
+$\mathbf{Q}_\sigma,\mathbf{R}_\sigma$ & 模式相关状态/输入权重 & \cref{eq:wl-cost} \\
+$a,b$ & wheel 椭圆锥纵向 / 横向半轴 $\tau_{w,\max}/r,\ \mu_{\mathrm{lat}}F_n$ & \cref{eq:wl-conewheel} \\
+$\mathbf{P}_M$ & 接触零空间投影 $\mathbf{I}-\mathbf{M}^{-1}\mathbf{J}_c^\top(\mathbf{J}_c\mathbf{M}^{-1}\mathbf{J}_c^\top)^{-1}\mathbf{J}_c$ & 章首 note \\
+$k$ & 摩擦锥多面体近似面数（常用 $8$） & \cref{eq:wl-conefoot} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表。}
+\label{tab:wl-points}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 三值模式与组合放大 & $2^4\!\to\!3^4=81$；序列空间 $81^N$ 不可枚举，须分层 & \(\bigstar\bigstar\) \\
+2 & 三重数学困难 & 组合放大 + 约束混合 + 轮速参考新变量 & \(\bigstar\bigstar\) \\
+3 & 轮足统一动力学 & 承 \cref{eq:umm-core}；foot/wheel 力同入方程、约束不同 & \(\bigstar\bigstar\bigstar\) \\
+4 & 轮速积分入状态 & $\dot\omega_w=\tau_w/I_w$；$I_w\!\neq\!0$，轮速须纳入状态 & \(\bigstar\bigstar\bigstar\) \\
+5 & 三模式约束矩阵 & swing 空 / foot 完整 / wheel 非完整三行 & \(\bigstar\bigstar\bigstar\) \\
+6 & 统一 Pfaffian 堆叠 & $\mathbf{A}_{\mathrm{uni}}(\mathbf{q},\sigma)$ 行数随模式变、右端仅 wheel 纵向非零 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+7 & SRBD 轮足扩展 & 状态加 $\boldsymbol\theta_w$、输入加 $\boldsymbol\omega_{\mathrm{ref}}$；$16/16$ 算例 & \(\bigstar\bigstar\bigstar\) \\
+8 & 分段二次代价 & $\mathbf{Q}_\sigma,\mathbf{R}_\sigma$ 逐段换；各向异性力正则 & \(\bigstar\bigstar\bigstar\) \\
+9 & 切换 OCP $\to$ QP & 离散线性化、两类锥、$\mathbf{C}_{\mathrm{eq}}/\mathbf{C}_{\mathrm{ineq}}$ 堆叠 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+10 & 带状 KKT 复杂度 & 立方 $\to$ 对 $N$ 线性；实时须用结构化求解器 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+11 & RTI / 热启动 / 降级 & 单次迭代 + 平移热启动 + 降级阶梯 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}

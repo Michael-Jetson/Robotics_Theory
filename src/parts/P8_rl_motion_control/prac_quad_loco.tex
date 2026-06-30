@@ -1,0 +1,1857 @@
+\chapter{四足 Locomotion：速度跟踪与粗糙地形}\label{ch:rlmc-quadloco}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章——单形态实战之首。
+%  主线：算法/概念领路 —— 先立「速度跟踪任务在概念上有哪些观测/奖励/技巧 + 原理」，
+%  再把每个概念落到 mjlab / Isaac Lab / UniLab 三框架的工程接线。
+%  假定读者已有 RL 基础（理论部 P6_rl 已讲 MDP/策略梯度/AC/PPO；前面实践章已讲
+%  观测·动作·奖励·Manager·DR·特权学习），本章只讲「扩展 + 实战」，不重教基础。
+%  源稿 RL运控/Ch13_四足Locomotion_速度跟踪与粗糙地形.md（实践偏重）按本主线重构。
+%  关键 API/版本/命令/论文归属经联网核对（mjlab arXiv:2601.22074、Isaac Lab 官方文档、
+%  unitree_rl_mjlab README、RSL-RL arXiv:2509.10771、Rudin arXiv:2109.11978）：
+%    - mjlab core 内置 Go1+G1+YAM；velocity task 覆盖 G1/Go1；CLI=uv run train/play，
+%      后端 RSL-RL，可视化 Viser/MuJoCo viewer；任务名格式 Mjlab-Velocity-Flat-Unitree-G1（已核）。
+%    - [!] 源稿把 unitree_rl_mjlab 说成支持 Go1——经核 unitree_rl_mjlab 仅支持
+%      Go2/A2/As2/G1/R1/H1_2/H2（无 Go1），且 CLI 为 python scripts/train.py <Task>。已改正。
+%    - Isaac Lab：Isaac-Velocity-Rough-Unitree-Go2-v0（obs 235/action 12，已核）、
+%      Isaac-Velocity-Rough-Anymal-C-v0（已核）。
+%    - 凡未在官方文档逐字确认的具体字符串/默认值，包 \rebuilt{} 或 \pz{待核实：}。
+% ════════════════════════════════════════════════════════════════
+
+前面几章把强化学习运控的\emph{零件}逐一打磨好了：观测与动作的契约（\cref{ch:rlmc-obsact}）、奖励的四层结构与课程（\cref{ch:rlmc-reward}）、Manager-Based 架构（\cref{ch:rlmc-manager}）、从零跑通到第一条奖励曲线（\cref{ch:rlmc-setup}）、训练管线与 PPO 调参（\cref{ch:rlmc-training}）、域随机化（\cref{ch:rlmc-dr}）、特权学习（\cref{ch:rlmc-privileged}）。本章是\textbf{单形态实战的第一站}——把这些零件\emph{全部组合}到一个完整任务上：四足机器人的速度跟踪。
+
+为什么把四足速度跟踪放在实战部的开头？因为它是足式 RL 的“Hello World”，却同时涵盖了几乎全部核心工程挑战：浮动基座动力学、周期性接触切换、高维动作空间、多目标奖励、地形适应、sim-to-real。它\emph{够标准}——三大框架（mjlab、Isaac Lab、UniLab）都把它作为内置/示范任务；又\emph{够完整}——你能在它身上验证“从配置文件到策略行为”的完整因果链。掌握了它，后续扩展到人形、操作、运动模仿，形式变了，但工程模式不变。
+
+本章仍遵循全书「概念领路、实践兑现」的次序。每一节先立\textbf{算法/概念主线}（这个环节有哪些观测、哪些奖励、哪些技巧，以及背后的原理与反面教训），再在其下排布\textbf{三框架对比实战}：mjlab 与 Isaac Lab 给出声明式（Manager-Based）的工程接线，UniLab 给出命令式（异构 CPU 仿真 + GPU 策略、共享内存 IPC 解耦）的对照实现——三者落到同一概念，呈现各自的承载层差异。本质洞察先行一步：\textbf{四足速度跟踪的“难”不在算法，而在“接线”——同一套 PPO，配错一个传感器名或漏掉 command 观测，策略就永远学不会走路，而 loss 却还在下降。}
+
+% ════════════════════════════════════════════════════════════════
+\section{环境配置与版本兼容}
+\label{sec:rlmc-ql-setup}
+
+本章假定你已按 \cref{ch:rlmc-setup} 装好至少一个框架。这里只补充\textbf{运行四足速度跟踪任务额外需要核对的版本点}，不重复通用安装流程。
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lLLL@{}}
+\toprule
+要求项 & mjlab & Isaac Lab & UniLab \\
+\midrule
+四足模型来源 & MuJoCo Menagerie（MJCF） & USD（由 URDF 转换） & MJCF / Motrix XML（不用 USD） \\
+内置四足 & Unitree Go1（core 自带） & ANYmal-C / Unitree Go2 & Go2/Go1/Go2W（轮足）+ 直立/带臂 \\
+RL 后端 & RSL-RL（唯一） & RSL-RL / RL-Games / SKRL & PPO(rsl-rl)/APPO/SAC/TD3/FlashSAC \\
+可视化 & Viser（web）/ MuJoCo viewer & Isaac Sim Viewer & Viser（web）/ MuJoCo viewer \\
+raycast 高程扫描 & MuJoCo Warp GPU raycast（默认进 actor） & PhysX/Warp GPU raycast（默认进 actor） & CPU 后端 height scan（内置，默认只进 critic） \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{note}[mjlab core 与 unitree\_rl\_mjlab 不是一回事]
+本章会反复用到两类 mjlab 任务来源，务必分清：\textbf{mjlab core}（\Verb[breaklines]|github.com/mujocolab/mjlab|，arXiv:2601.22074）自带 Unitree Go1 + G1 + YAM 三个模型，velocity 任务覆盖 G1/Go1，CLI 是 \Verb[breaklines]|uv run train| / \Verb[breaklines]|uv run play|；\textbf{unitree\_rl\_mjlab}（Unitree 官方生态项目）支持 Go2/A2/As2/G1/R1/H1\_2/H2——\textbf{不含 Go1}——且 CLI 是 \Verb[breaklines]|python scripts/train.py <Task>|。本章四足主线在 mjlab 侧用 core 的 Go1，跨机器人精读（\cref{sec:rlmc-ql-multirobot}）才转到 unitree\_rl\_mjlab 的 Go2。（源稿曾把 unitree\_rl\_mjlab 写成支持 Go1，经核其官方 README 的机型清单为 Go2/A2/As2/G1/R1/H1\_2/H2、确不含 Go1，本章已改正。）
+\end{note}
+
+四足任务相对人形\emph{更省资源}：观测维度小（flat 约 48 维）、动作 12 维、训练通常 1--2 小时收敛。但 rough 地形会因 raycast 高程扫描显著拖慢吞吐（见 \cref{sec:rlmc-ql-terrain}）。Isaac Lab 侧还有一个\emph{已知性能坑}（Isaac Lab issue \#2318 报告并经官方确认）：Go2 的腿部含圆柱碰撞几何，在 Isaac Sim 4.5 引入的 wheeled-collision 特性（圆柱/圆锥与三角网格的平滑接触）下，Go2 rough 的环境吞吐会从约 160k（H1）骤降到约 40k（4090 上）。这不是你的配置问题，而是物理引擎特性——选 ANYmal-C 做 Isaac Lab 侧 baseline 可规避；或加 \Verb[breaklines]|--kit_args="--/physics/collisionApproximateCylinders=true"| 用凸网格近似圆柱换回吞吐。
+
+% ════════════════════════════════════════════════════════════════
+\section{Quick Start：五分钟跑通一个速度跟踪}
+\label{sec:rlmc-ql-quickstart}
+
+先建立“它能跑”的肌肉记忆，再讲原理。下面三段命令分别在三个框架启动一次最小可跑——\textbf{都用最少的环境数、可视化打开}，目的是看到机器人以默认姿态站住、随机扭动、或按命令行走，而不是训练出好策略。
+
+\begin{codebox}[bash]{mjlab:zero agent 看默认姿态（5 分钟）}
+# mjlab core 自带 Go1 velocity（flat）.zero agent = 策略恒输出 0.
+# 若 use_default_offset=True 配置正确，zero action 对应默认关节姿态，机器人应站住.
+uv run play Mjlab-Velocity-Flat-Unitree-Go1 --agent zero --num-envs 4 --viewer viser
+\end{codebox}
+
+\begin{codebox}[bash]{Isaac Lab:训练一个 ANYmal-C flat（短跑冒烟）}
+# Isaac Lab 用 gymnasium 注册的 task id;play.py 用空 checkpoint 即 zero/随机策略.
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0 --num_envs 256 --max_iterations 50 --headless
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab:五分钟最小可跑（CPU 仿真 + GPU 学习）}
+# UniLab 用 CLI flag 选 算法/任务/后端，env 数与迭代数走 Hydra 覆盖（不是 flag）.
+# 注意:UniLab 当前不提供「zero agent」入口;用极短训练 + no_play 做「能跑起来」的冒烟.
+# 短跑冒烟（64 env、3 iter、不回放）——验证物理 CPU 仿真 + GPU PPO 接线打通:
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num-envs=64 algo.max-iterations=3 training.no-play=true
+# 回放一个预训练 Go2 loco-manipulation 策略（首跑从 HF 拉权重;国内加 HF_ENDPOINT 镜像）:
+HF_ENDPOINT=https://hf-mirror.com uv run demo locomani
+\end{codebox}
+
+\begin{note}[UniLab 的“跑通”与 mjlab/Isaac 的肌肉记忆不同]
+mjlab/Isaac 的 zero/random agent 让你\emph{先看到机器人站住/乱动}再训练；UniLab 当前任务集\textbf{没有 zero agent CLI}（README 的 26 个任务都是直接训练入口），所以“最小可跑”改用「极短训练 + \texttt{training.\allowbreak no\_play=true}」证明 CPU 物理仿真子进程与 GPU 学习进程经共享内存接通。这一差异源于 UniLab 的\textbf{异构进程模型}（CPU 仿真子进程 + GPU 学习父进程，经共享内存 IPC 解耦），而非单进程 GPU 仿真——其工程后果会贯穿本章每个 UniLab 列。\rebuilt{Hydra 覆盖键的连字符写法随 UniLab 版本而异（实测安装版用下划线 \texttt{algo.\allowbreak num\_envs}；部分版本经 CLI 层暴露为 \texttt{algo.\allowbreak num-envs}），以 \texttt{train --help} 与 \texttt{conf/} 实际字段为准。}
+\end{note}
+
+\begin{pitfall}[\texttt{Mjlab-Velocity-Flat-Unitree-Go1} 这串字符串本身可能因版本而异]
+\textbf{错误描述}：照抄上面的 task id 却报 \Verb[breaklines]|task not found|。\textbf{现象后果}：以为没装好，重装一遍。\textbf{根本原因}：mjlab core 文档正文给的样例是 \Verb[breaklines]|Mjlab-Velocity-Flat-Unitree-G1|（人形）；Go1（四足）的 task id 经实测 \verb|list-envs|（mjlab 1.4.0）确为 \Verb[breaklines]|Mjlab-Velocity-Flat-Unitree-Go1| 与 \Verb[breaklines]|Mjlab-Velocity-Rough-Unitree-Go1|（无 \texttt{-v0} 后缀），但不同版本仍可能微调拼写。\textbf{正确做法}：先 \Verb[breaklines]|uv run train --help| 或 \verb|list-envs| 列出当前版本的全部 task id，再照列表里的拼写跑。\rebuilt{上述 Go1 task id 字符串以你所装版本的 \texttt{list-envs}/\allowbreak\texttt{--help} 输出为准。}
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{前置自测}
+\label{sec:rlmc-ql-pretest}
+
+本章是单形态实战的起点，依赖前面实践章与理论部的全部基础。下面五题覆盖最关键的前置概念，\textbf{答不出 $\ge 3$ 题，先回对应章节复习再继续}。
+
+\begin{practice}[开课前自测]
+\begin{enumerate}
+\item （观测）\cref{ch:rlmc-obsact}：\Verb[breaklines]|ObservationManager| 如何区分 actor 与 critic 两组？\Verb[breaklines]|enable_corruption=True| 的物理语义是什么？为什么 critic 组通常\emph{不}加 corruption？（答错回看 \cref{sec:rlmc-asymmetric}）
+\item （奖励）\cref{ch:rlmc-reward}：\verb|RewardManager| 如何把多个 reward term 聚合成标量？若某个 term 的权重符号写反（本应负惩罚写成正奖励），训练会出现什么现象？（答错回看 \cref{sec:rlmc-rew-fourlayers}）
+\item （训练）\cref{ch:rlmc-training}：PPO 中 \verb|terminated| 与 \verb|truncated| 分别如何传给 value bootstrap？若把 timeout 当作 terminal 处理，价值函数会产生什么偏差？（答错回看 \cref{sec:rlmc-train-wrapper}）
+\item （DR）\cref{ch:rlmc-dr}：EventManager 的 startup / reset / interval 三模式差异何在？为什么 \verb|foot_friction| 随机化通常用 startup 而非 step？（答错回看 \cref{sec:rlmc-dr-mode}）
+\item （MuJoCo）四足 \verb|freejoint| 的 \verb|qpos| 有 19 维（7 浮基 + 12 关节），\verb|qvel| 却只有 18 维。为什么二者不相等？（答错回看本章 \cref{sec:rlmc-ql-mdp}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{本章目标}
+\label{sec:rlmc-ql-goals}
+
+学完本章，你应该\textbf{能够}（每条都可当场验收）：
+
+\begin{enumerate}
+\item \textbf{沿 task registry $\to$ env cfg $\to$ manager term $\to$ RL cfg 的链路追溯}任意 velocity task 的数据流，并定位 wiring 错误；
+\item \textbf{独立复现} Go1/Go2 的 flat 与 rough 速度跟踪，按 zero / random / small / large 四阶段验证；
+\item \textbf{说清 flat 与 rough 的传感器 / 奖励 / 终止 / 课程差异}，并解释“flat 为什么是 rough 的减法版本”；
+\item \textbf{配置并解读 height scan 传感器}，算清 grid pattern、ray alignment 与观测维度三者的关系；
+\item \textbf{在 mjlab 与 Isaac Lab 双框架执行对比实验}，用同一机器人（Go2）比较训练曲线与策略行为，并归因差异来源；
+\item \textbf{用奖励四层框架（Tracking/Regularization/Style/Contact）系统地分析与调整权重}，执行 reward ablation 并解读结果。
+\end{enumerate}
+
+\paragraph{知识导航。}本章在全书中的位置如下。
+
+\begin{center}
+\begin{forest}
+navtreeLR,
+[{本章：四足速度跟踪}
+  [{自由度 + MDP}
+    [{18 DoF / qpos 19}]
+    [{command 必入 actor obs}]]
+  [{算法概念主线}
+    [{观测：本体 + 命令 + 高程}]
+    [{动作：关节位置偏移}]
+    [{奖励：四层框架}]
+    [{非对称 AC / 状态估计}]]
+  [{三框架接线}
+    [{mjlab：链路阅读法}]
+    [{Isaac Lab：命名差异}]
+    [{UniLab：异构命令式}]]
+  [{地形与感知}
+    [{height scan}]
+    [{terrain curriculum}]]
+  [{实验方法}
+    [{四阶段验证}]
+    [{reward ablation}]
+    [{双框架对比}]]
+]
+\end{forest}
+\end{center}
+
+\paragraph{前置桥接（2--3 行重述）。}\cref{ch:rlmc-obsact} 立了观测/动作契约，\cref{ch:rlmc-reward} 立了奖励四层框架，\cref{ch:rlmc-privileged} 立了非对称 actor-critic 与 teacher-student。本章把这三件事\emph{同时}用到一个真实四足任务上：你会看到“四层框架”落地成具体的 \verb|RewardTermCfg| 字典，“非对称 AC”落地成 actor/critic 两组观测的差异。
+
+\paragraph{阅读时间。}精读（含动手跑通四阶段）约 6--8 小时；速读（只读概念主线 + 每节首段 + 小结）约 70 分钟；查阅（按 \cref{sec:rlmc-ql-trouble} 故障表 + \cref{sec:rlmc-ql-summary} 速查表定位）按需。
+
+% ════════════════════════════════════════════════════════════════
+\section{自由度模型与速度跟踪的 MDP 结构}
+\label{sec:rlmc-ql-mdp}
+
+\textbf{本节解决什么问题}：建立四足机器人的自由度心智模型，把速度跟踪写成一个明确的 MDP——这是后面所有“接线”的契约。
+
+\subsection{浮动基座 + 四条腿：18 个自由度}
+\label{sec:rlmc-ql-dof}
+
+四足机器人（以 Unitree Go1 为例）的自由度由两部分组成。\textbf{浮动基座}有 6 个自由度（3 平移 + 3 旋转），在 MuJoCo 中用 \verb|freejoint| 表示。\textbf{四条腿}每条 3 个关节（hip abduction/adduction、hip flexion/extension、knee flexion），共 12 个驱动关节。总自由度 $6 + 12 = 18$。
+
+但 \verb|freejoint| 的位置与速度维度\emph{不相等}，这是 MuJoCo 新手最常踩的一处。位置用 7 个数（3 平移 + 4 四元数），速度用 6 个数（3 线速度 + 3 角速度）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lccl@{}}
+\toprule
+组件 & \texttt{qpos} 维度 & \texttt{qvel} 维度 & 说明 \\
+\midrule
+浮动基座位置 & 3 & 3 & 世界系 $xyz$ \\
+浮动基座旋转 & 4（四元数） & 3（角速度） & 四元数比角速度多 1 维 \\
+12 个关节 & 12 & 12 & hinge joints \\
+\midrule
+\textbf{总计} & \textbf{19} & \textbf{18} & \texttt{qpos} > \texttt{qvel} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+差 1 维的根源与计算机图形里“欧拉角 vs 四元数”同源：旋转的最小表示（3 参数）存在万向节锁奇异，四元数用 4 参数消奇异但引入 1 个冗余约束（单位范数）。MuJoCo 的设计选择是 \verb|qpos| 用四元数（无奇异、适合积分），\verb|qvel| 用角速度（3 维、更自然地参与动力学方程）。本书全程采用 \textbf{Hamilton 四元数}约定（见全书记号约定），与 MuJoCo 的 \verb|wxyz| 存储顺序一致；但 Isaac Lab 3.0 Beta 改用 \verb|xyzw|（见 \cref{sec:rlmc-setup-isaaclab}），直接读写张量时务必确认版本。
+
+\begin{insight}[策略隐式地同时做运动学与动力学控制]\label{ins:rlmc-ql-kindyn}
+理解四足有两个互补视角。\textbf{运动学链视角}把每条腿看成 3R 串联臂——给定关节角 $\mathbf{q}_{\text{leg}}$，正运动学算出足端位置 $\mathbf{p}_{\text{foot}}(\mathbf{q}_{\text{leg}})$，适合分析单步几何约束（脚能伸多远、工作空间边界）。\textbf{质心动力学视角}把整机看成集中质量——关注质心轨迹、角动量、支撑多边形，适合分析整体稳定。RL 策略\emph{隐式地同时}学了这两层：你不需要像 MPC 那样显式分离它们，但\textbf{必须在观测与奖励里提供足够信号让策略“看到”两层}。joint position/velocity 提供运动学信号，projected gravity 与 base velocity 提供动力学信号。这条洞察直接决定了下一小节观测该放什么。
+\end{insight}
+
+\subsection{速度跟踪的 MDP：command 必须在 actor 观测里}
+\label{sec:rlmc-ql-mdp-def}
+
+速度跟踪任务的目标看似简单：接收平面速度命令 $\mathbf{c}=(v_x^{\text{cmd}}, v_y^{\text{cmd}}, \omega_z^{\text{cmd}})$，让机器人按命令行走。其完整 MDP 如下（维度以 Go1 为例）：
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lLl@{}}
+\toprule
+MDP 组件 & 具体内容 & 维度 \\
+\midrule
+状态 $s$ & 全部物理状态（\texttt{qpos}+\texttt{qvel}+contacts） & 远大于 obs \\
+Actor 观测 $o^a$ & base\_ang\_vel + projected\_gravity + joint\_pos + joint\_vel + last\_action + command（+ base\_lin\_vel/height\_scan 视配置） & 48(flat)\,/\,235(rough) \\
+Critic 观测 $o^c$ & actor obs + foot\_height + foot\_air\_time + foot\_contact + contact\_forces & 更大 \\
+动作 $a$ & joint position offsets & 12 \\
+命令 $\mathbf{c}$ & $(v_x^{\text{cmd}}, v_y^{\text{cmd}}, \omega_z^{\text{cmd}})$ & 3 \\
+奖励 $r$ & tracking + style + regularization + contact & 标量 \\
+终止 & fell\_over / illegal\_contact / time\_out / out\_of\_bounds & bool \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+这里有一个\textbf{至关重要的设计决策}：command 必须在 actor 观测中。command 是外部目标——同一物理状态下，不同 command 要求不同 action。若 actor 看不到 command，MDP 对它就是\emph{不完整}的。这就像给出租车司机 GPS 定位却不告诉目的地：他知道在哪，却不知道该往哪开。
+
+\begin{insight}[反事实：actor 看不到 command 会怎样]\label{ins:rlmc-ql-nocmd}
+若把 command 漏出 actor 观测，策略只能学一个“平均”行为——对所有可能 command 的折中。由于训练中前进 command 概率最高，策略可能学到缓慢前进；tracking reward 偶尔碰巧匹配某方向给出正信号，但策略\emph{永远无法根据 command 切换行为}。你在 TensorBoard 上会看到 tracking reward 很低、其他 reward 正常，极易误判为“tracking 权重不够”而去乱调权重。这是“策略不走”最隐蔽的一类病因，排查第一步永远是确认 actor 观测里有 command（见 \cref{sec:rlmc-ql-train-diag}）。
+\end{insight}
+
+235 这个数字不是随手写的——Isaac Lab 的 \Verb[breaklines]|Isaac-Velocity-Rough-Unitree-Go2-v0| 官方文档明确给出状态/动作空间为 $\mathbb{R}^{235\times 12}$\,\cite{mittal2025isaaclab}，其中 235 $\approx$ 本体观测（约 48）+ 高程扫描（约 187，见 \cref{sec:rlmc-ql-terrain}）。flat 任务去掉高程扫描即回到约 48 维。
+
+\subsection{步态的物理本质：策略会自发涌现 trot}
+\label{sec:rlmc-ql-gait}
+
+四足行走在物理上是周期性接触切换：每条腿在支撑相（stance）与摆动相（swing）间交替，不同步态的区别在四条腿的相位关系。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+步态 & Duty Factor & 相位 (FR/FL/HR/HL) & 典型速度 (m/s) \\
+\midrule
+Walk & 0.6--0.8 & 0 / 0.5 / 0.75 / 0.25 & $<0.5$ \\
+\textbf{Trot} & $\sim$0.5 & 0 / 0.5 / 0.5 / 0（对角） & 0.5--2.0 \\
+Pace & $\sim$0.5 & 0 / 0.5 / 0 / 0.5（同侧） & 中速 \\
+Bound & $\sim$0.4 & 0 / 0 / 0.5 / 0.5（前后） & 2.0--3.0 \\
+Gallop & 0.3--0.4 & 0 / 0.1 / 0.5 / 0.6 & $>3.0$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Duty Factor 是单腿触地时间占整个步态周期的比例，越小意味着飞行相越长、动态性越强。在 velocity tracking 任务中，命令速度通常 0--1.5 m/s，这个范围下 trot 是能量效率与稳定性的最优平衡点——始终有两条对角腿支撑——所以\textbf{你几乎总是看到策略自发涌现出 trot}。你不需要显式定义步态；但需要通过奖励提供足够信号引导合理的步态特征：抬脚高度、触地柔度、关节位姿回归（见 \cref{sec:rlmc-ql-reward}）。
+
+\begin{insight}[步态涌现 = 优化器在损失面上落入吸引域]\label{ins:rlmc-ql-attractor}
+RL 策略发现步态的过程，类似优化器在损失面上发现极小值。步态模式是“吸引域”——一旦策略进入某步态的邻域，reward 梯度就把它拉向该步态中心。不同步态对应不同极小值，\textbf{奖励设计决定哪个极小值被选中}。若 tracking 速度主要在 0.5--1.5 m/s，trot 是最稳的极小值；若要求 3+ m/s，策略会过渡到 bound/gallop。这解释了一个常见困惑：“我没写步态奖励，它怎么自己 trot 了？”——因为在你给的速度范围与正则约束下，trot 恰好是 return 最高的吸引域。Walk These Ways（MoB，CoRL 2022）\,\cite{margolis2022walk} 则反其道而行，把步态参数（频率、duty factor、相位、步幅、步高）作为\emph{额外 command 输入}，让一个策略支持多种步态——本章的 velocity 任务不用 MoB，只有三维速度 command，步态完全自发。
+\end{insight}
+
+\subsection{四足谱系：本章处在哪}
+\label{sec:rlmc-ql-history}
+
+在深入接线前，先看四足 RL 运控的学术演进，理解本章任务的坐标。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllp{4.3cm}@{}}
+\toprule
+阶段 & 代表工作 & 平台 & 关键贡献 \\
+\midrule
+盲控制 & Hwangbo et al.\ 2019 (\textit{Sci.\ Robotics}) & ANYmal & actuator network + sim-to-real，首证 RL 真机 agile locomotion \\
+盲控制 & Lee et al.\ 2020 (\textit{Sci.\ Robotics})\,\cite{lee2020quadruped} & ANYmal & 纯本体感知 zero-shot 到自然地形；teacher-student 奠基 \\
+在线适应 & RMA (Kumar et al.\ RSS 2021)\,\cite{kumar2021rma} & Unitree A1 & base policy + adaptation module，实时在线适应 \\
+命令条件化 & Walk These Ways (CoRL 2022)\,\cite{margolis2022walk} & Unitree Go1 & MoB，单策略多步态参数化 \\
+大规模并行 & Rudin et al.\ CoRL 2021 (legged\_gym)\,\cite{rudin2021minutes} & ANYmal & GPU 并行 + terrain curriculum，分钟级训练 \\
+感知控制 & Miki et al.\ 2022 (\textit{Sci.\ Robotics})\,\cite{miki2022perceptive} & ANYmal & 高程图 + 特权学习；DARPA SubT 1700 m 零跌倒 \\
+高动态跑酷 & Extreme Parkour (ICRA 2024)\,\cite{cheng2024parkour} & Unitree A1 & 视觉端到端穿越极端地形 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+每一阶段都继承前一阶段的训练基础设施（特权教师、DR、课程），在感知与动态性上递进。\textbf{本章处于“盲控制 + 大规模并行”阶段}——不需要视觉（那是后续视觉控制章），不需要 motion imitation（那是 \cref{ch:rlmc-motimit}），但需要 terrain curriculum + teacher-student + DR 的完整链条。Rudin 的 game-inspired curriculum\,\cite{rudin2021minutes} 是本章 \cref{sec:rlmc-ql-terrain} 的直接来源，其原始设计用 $10\times 20$ 的 terrain grid、地形比例 $[0.1, 0.1, 0.35, 0.25, 0.2]$ 分配给 smooth slope / rough slope / stairs up / stairs down / discrete obstacles。
+
+\paragraph{常见陷阱（自由度与 MDP）。}
+
+\begin{pitfall}[把 12 维动作空间当成“很小、好搜”]
+\textbf{错误描述}：因为动作只有 12 维，就以为探索容易、随便初始化都行。\textbf{现象后果}：不给 default pose offset 时，初始策略输出接近零的\emph{原始}目标角度，机器人以扭曲姿态开始探索，长时间学不会站立。\textbf{根本原因}：12 维连续空间的体积随维度指数增长；维度小不代表搜索易，关键是好的初始化与 reward shaping 把搜索引向合理区域。\textbf{正确做法}：\Verb[breaklines]|use_default_offset=True|，让 zero action 对应默认站姿（见 \cref{sec:rlmc-ql-action}）。
+\end{pitfall}
+
+\begin{pitfall}[误以为 \texttt{qpos} 与 \texttt{qvel} 维度应相等]
+\textbf{错误描述}：手写观测拼接时假设浮基位置与速度同维，导致索引错位。\textbf{现象后果}：观测里混入错误分量，策略行为诡异但不报错。\textbf{根本原因}：\verb|freejoint| 的 \verb|qpos|（7）含四元数，\verb|qvel|（6）含角速度，差 1 维。\textbf{正确做法}：永远用框架提供的 \verb|joint_pos|/\allowbreak\verb|base_ang_vel| 等命名观测函数，不要手算 \verb|qpos[7:]| 之类的硬索引。
+\end{pitfall}
+
+\begin{practice}[自由度与 MDP]
+\begin{enumerate}
+\item （计算）Go2 有 12 个驱动关节。算出 Go2 的 \verb|qpos|/\allowbreak\verb|qvel| 总维度。若 actor 观测 = base\_lin\_vel(3)+base\_ang\_vel(3)+projected\_gravity(3)+joint\_pos(12)+joint\_vel(12)+last\_action(12)+command(3)，flat 任务的 actor obs 总维度是多少？（验收：写出 19/18 与 48）
+\item （分析）对比 joint position target 与 joint velocity target 两种动作空间，各列 2 优 2 缺，并说明 sim-to-real 下为何 position target 更常用。
+\item （设计）若机器人有弹性脚掌（compliant foot），除标准本体感知外你还需要什么额外传感信号？为什么？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{动作设计：关节位置目标与 PD 链路}
+\label{sec:rlmc-ql-action}
+
+\textbf{模块功能与在管线中的位置}：ActionManager 把策略输出映射为施加到仿真的力矩。它是“策略意图”到“物理执行”的唯一通道，位于 \verb|env.step| 的 decimation 循环里（见 \cref{sec:rlmc-mgr-step}）。
+
+\subsection{为什么用关节位置目标而非力矩}
+\label{sec:rlmc-ql-action-why}
+
+当前主流 velocity task 都用 \Verb[breaklines]|JointPositionAction|：策略输出无量纲数值，经 \verb|scale| 缩放后叠加到默认关节姿态。关键参数 \Verb[breaklines]|use_default_offset=True| 让 zero action 对应默认姿态附近——这对 zero agent 冒烟测试至关重要。
+
+为什么不用 torque action？力矩控制给策略更大自由度，但探索空间也更大——初始随机力矩可能让机器人瞬间飞出场景。位置目标通过底层 PD 控制器提供\emph{隐含的稳定性}。这类似自动驾驶里“输出方向盘角度”vs“输出轮胎力矩”：前者有助力转向兜底，后者要策略自己学会力控。sim-to-real 中位置目标的 gap 也更小，因为实物关节伺服本身就是 position/velocity 控制模式。
+
+\begin{codebox}[Python]{动作配置（mjlab 风格，字段名以版本为准）}
+JointPositionActionCfg(
+    entity_name="robot",
+    actuator_names=(".*",),        # 正则匹配全部 12 个关节
+    scale=GO1_ACTION_SCALE,         # rad 量级的位置偏移
+    use_default_offset=True,        # q_target = q_default + output * scale
+)
+\end{codebox}
+
+\begin{codebox}[Python]{Isaac Lab 对应（注意字段命名差异）}
+# Isaac Lab:joint_names 用列表、asset_name 对应 mjlab 的 entity_name
+JointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=0.25)
+\end{codebox}
+
+\textbf{逐行解读}：两个框架语义相同，但 mjlab 用 \Verb[breaklines]|actuator_names| 元组、\verb|entity_name|；Isaac Lab 用 \verb|joint_names| 列表、\verb|asset_name|。跨框架移植时这类“同义不同名”的字段是首要核对项。\verb|scale| 都取 0.25 rad（Go1 各关节范围相近，可用统一 scale）。
+
+\subsection{动作链路的完整数据流}
+\label{sec:rlmc-ql-action-trace}
+
+策略输出到关节运动的完整链路如下（这条链是后面排查“机器人不动/被弹飞”的地图）：
+
+\begin{codebox}{动作 $\to$ 力矩 $\to$ 物理步的数据流}
+策略输出 a in [-1,1]^12
+  -> x scale (0.25 rad)        位置偏移 dq = a * 0.25
+  -> + default pose            目标位置 q_target = q_default + dq
+  -> PD 控制器                  tau = kp*(q_target - q) + kd*(0 - qdot)
+  -> 力矩限制 clamp             tau = clamp(tau, -tau_max, tau_max)
+  -> MuJoCo/PhysX physics step  关节运动 q(t+dt)
+\end{codebox}
+
+\textbf{PD 增益}的来源与影响（数值因机器人而异）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+参数 & Go1 典型值 & 来源 & 影响 \\
+\midrule
+$k_p$（位置增益） & 25--50 & MJCF actuator & 越大跟踪越紧，过大振荡 \\
+$k_d$（速度增益） & 0.5--1.0 & MJCF actuator & 阻尼，抑制振荡 \\
+$\tau_{\max}$（力矩限） & 23.7 N$\cdot$m（Go1 髋/大腿）/35.55（膝） & MJCF actuator & 物理限制 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[MuJoCo position actuator 的阻尼属性叫 \texttt{kv} 不是 \texttt{kd}]
+MJCF 里 position actuator 写 \Verb[breaklines]|<position kp="40" kv="1"/>|——阻尼是 \verb|kv|（对应控制理论的 $k_d$）。\verb|kd| 不是 position actuator 的合法属性，写成 \verb|kd| 会被当成未知属性\emph{静默忽略}，导致阻尼为零、关节振荡。记号上本章用 $k_p/k_d$，但写 MJCF 时务必用 \verb|kp/kv|。
+\end{note}
+
+\subsection{action scale 的取法}
+\label{sec:rlmc-ql-action-scale}
+
+\verb|scale| 决定 $[-1,1]$ 的动作覆盖多大的关节偏移区间。经验法则：覆盖关节限位范围的 30\%--50\%。可用下面的脚本对任意 MJCF 自动估算：
+
+\begin{codebox}[Python]{从 MJCF 自动估算合理 action scale}
+import mujoco
+m = mujoco.MjModel.from_xml_path("go1.xml")
+for i in range(m.nu):
+    name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+    joint_id = m.actuator_trnid[i, 0]
+    if m.jnt_limited[joint_id]:
+        lo, hi = m.jnt_range[joint_id]
+        full = hi - lo
+        suggested = full * 0.35              # 取范围的 35%
+        print(f"{name}: range=[{lo:.2f},{hi:.2f}] full={full:.2f} scale~{suggested:.2f}")
+\end{codebox}
+
+Go1 的 12 个关节范围较一致（多为 $\pm 1$ 到 $\pm 2$ rad），可用统一 scale=0.25。但人形 G1（\cref{ch:rlmc-humanoidloco} 会再遇到）的关节范围差异极大（ankle $\pm 0.3$ rad vs hip $\pm 2.5$ rad），必须用 per-joint scale——这是从四足迁移到人形最关键的配置变化之一。
+
+\begin{insight}[反事实：scale 取 1.0 vs 0.01]\label{ins:rlmc-ql-scale}
+若 scale 太大（如 1.0），策略初始随机探索（动作近 $\mathcal{N}(0,1)$）会产生 $\pm 1.0$ rad 的偏移，可能直接打到限位，PD 在限位处给最大力矩，机器人被弹飞——你会看到 random agent 阶段机器人“爆炸”。若太小（如 0.01），即使输出最大值也只偏移 0.01 rad，机器人站着不动。0.25 是经验 sweet spot：覆盖关节范围约 15\%--25\%，足以走路又不打限位。\textbf{这条反事实给了 random agent 测试一个明确判据}：机器人剧烈扭动但不飞出场景 = scale 合理（见 \cref{sec:rlmc-ql-train}）。
+\end{insight}
+
+\paragraph{常见陷阱（动作）。}
+
+\begin{pitfall}[照搬其他机器人的 action scale]
+\textbf{错误描述}：把 Go1 的 scale 直接用到 Go2 或 G1。\textbf{现象后果}：Go2 膝关节打限位、G1 直接倒地。\textbf{根本原因}：不同机器人关节限位范围不同。\textbf{正确做法}：用上面的脚本对目标机器人重新估算，使 $[-1,1]$ 覆盖限位范围的 30\%--50\%。
+\end{pitfall}
+
+\begin{practice}[动作链路]
+\begin{enumerate}
+\item （动手）对你手头的四足 MJCF 跑上面的 scale 估算脚本，记录每个关节的建议 scale，判断能否用统一 scale。（验收：打印 12 行 range/scale）
+\item （分析）若把 \Verb[breaklines]|use_default_offset| 改成 \verb|False|，zero agent 会发生什么？为什么这会破坏部署端 FSM 的 \Verb[breaklines]|State_FixStand|（见 \cref{sec:rlmc-ql-multirobot}）？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{观测设计：非对称 actor-critic 与状态估计}
+\label{sec:rlmc-ql-obs}
+
+\textbf{模块功能}：ObservationManager 决定 actor 与 critic 各自“能看见什么”。velocity task 的核心设计是\textbf{非对称}——actor 看可部署的带噪信号，critic 看更多更干净的特权信号。
+
+\subsection{为什么 base\_lin\_vel 是特权信号}
+\label{sec:rlmc-ql-obs-priv}
+
+一个重要的物理事实：\textbf{基座线速度在真机上无法直接测量}。没有传感器能直接输出全局系线速度——GPS 精度不够（约 1 m），光流/VIO 在腿足振动下误差大，轮式里程计不适用。标准估计管线是：
+
+\begin{codebox}{base\_lin\_vel 的估计管线（真机）}
+IMU（加速度计 + 陀螺仪）
+  -> 积分得速度估计（drift 严重）
+  -> + 腿部正运动学（假设接触脚不滑移）
+  -> + EKF 融合（接触状态作为门控信号）
+  -> base_lin_vel 估计值
+\end{codebox}
+
+Go1/Go2 的特殊性：不像 ANYmal 有足端六维力传感器，它们只能从关节力矩反推接触状态，估计更嘈杂。所以 actor 观测中常用 base\_ang\_vel（陀螺仪直测，噪声低，约 0.01 rad/s 量级）+ projected\_gravity（加速度计推算，中等噪声）替代 base\_lin\_vel。RMA\,\cite{kumar2021rma} 给出另一条优雅路线：用 proprioceptive history（过去若干步的关节位置/速度/动作序列）通过 adaptation module 隐式估计环境参数（含速度），base policy 跑 100 Hz、adaptation module 跑 10 Hz，无需显式状态估计器——但要求训练时 DR 覆盖足够宽的参数范围。
+
+\begin{note}[工程建议：flat 与 rough 对 base\_lin\_vel 的不同处理]
+flat 任务可把 base\_lin\_vel 放入 actor 观测（带噪），平地估计精度尚可；rough 任务建议把 base\_lin\_vel 只放 critic，actor 用 proprioceptive history 替代——为 sim-to-real 部署铺路。
+\end{note}
+
+\subsection{非对称 actor-critic 的两种解读}
+\label{sec:rlmc-ql-obs-asym}
+
+velocity task 采用非对称 actor-critic\,\cite{pinto2018asymmetric}：actor 看带噪的可部署信号，critic 额外看 foot height（精确足端高度）、foot air time、foot contact forces 等特权信号——它们在真机上要么不可用、要么噪声大。这一设计在足式 RL 中几乎是标准配置。原因：locomotion 的奖励函数需要接触信息（脚是否着地、接触力多大、滑移多少），这些在仿真中可精确获取，真机上只能近似；若 actor 在训练时就依赖精确接触信息，部署时切到噪声信号会性能骤降。
+
+\begin{insight}[非对称 AC 的双重解读]\label{ins:rlmc-ql-asym}
+从 \textbf{RL 角度}：critic 是辅助训练的工具，部署时不需要，所以给它更多信息只帮训练不增部署负担。从 \textbf{teacher-student 角度}（\cref{ch:rlmc-privileged}）：critic 充当隐式“教师”——它用特权信息评估状态价值，通过 advantage 信号引导 actor（“学生”）的更新方向。两者结合解释了为何非对称 AC 在 sim-to-real 中如此有效：它在训练时就建立了 actor 的“信息贫乏抵抗力”。这也给出一条调试判据：critic 的特权信息应当且仅当\emph{与奖励函数直接相关}——你 reward 什么，critic 就该看到什么；加入无关信号（如遥远目标物位置）只会增加拟合难度。
+\end{insight}
+
+\subsection{三框架观测接线对比}
+\label{sec:rlmc-ql-obs-config}
+
+下面是\emph{同一份非对称观测}在三框架的落地。先看 mjlab（actor 组）：
+
+\begin{codebox}[Python]{mjlab:actor 观测组（flat，维度逐行标注;mjlab 真名 ObservationTermCfg，无 ObsTerm 别名）}
+cfg.observations.actor = ObservationGroupCfg(
+    enable_corruption=True,    # 加噪声模拟真机传感器
+    concatenate_terms=True,    # 所有 term 拼成一维向量
+    terms={
+        # 注:mjlab core 的 velocity 任务实配用 Unoise（UniformNoiseCfg）;
+        #     这里用 GaussianNoiseCfg(mean,std) 只为示范高斯选项——两类噪声 mjlab 都有.
+        "base_lin_vel":      ObservationTermCfg(func=base_lin_vel,
+                                     noise=GaussianNoiseCfg(mean=0.0, std=0.1)),   # 3 (flat 才放 actor)
+        "base_ang_vel":      ObservationTermCfg(func=base_ang_vel,
+                                     noise=GaussianNoiseCfg(mean=0.0, std=0.2)),   # 3
+        "projected_gravity": ObservationTermCfg(func=projected_gravity,
+                                     noise=GaussianNoiseCfg(mean=0.0, std=0.05)),  # 3
+        "command":           ObservationTermCfg(func=generated_commands,
+                                     params={"command_name": "twist"}),            # 3
+        "joint_pos":         ObservationTermCfg(func=joint_pos_rel,
+                                     noise=GaussianNoiseCfg(mean=0.0, std=0.01)),  # 12
+        "joint_vel":         ObservationTermCfg(func=joint_vel_rel,
+                                     noise=GaussianNoiseCfg(mean=0.0, std=1.5)),   # 12
+        "last_action":       ObservationTermCfg(func=last_action),                 # 12
+    },
+)   # actor obs 总维度 = 3+3+3+3+12+12+12 = 48
+\end{codebox}
+
+\begin{codebox}[Python]{mjlab:critic 组 = actor 全部 term（去噪）+ 特权 term}
+cfg.observations.critic = ObservationGroupCfg(
+    enable_corruption=False,   # critic 看干净数据
+    concatenate_terms=True,
+    terms={
+        **cfg.observations.actor.terms,                  # 复制 actor 全部 term
+        "foot_height":         ObservationTermCfg(func=foot_height,
+                                       params={"sensor_name": "foot_height_scan"}),    # 4 脚足端高度
+        "foot_contact_forces": ObservationTermCfg(func=foot_contact_forces,
+                                       params={"sensor_name": "feet_contact"}),        # 4x3=12
+    },
+)   # critic obs 总维度 = 48 + 特权维（rough 时更大）
+\end{codebox}
+
+Isaac Lab 的观测语义几乎一致，但有两处典型差异：观测组名习惯叫 \verb|policy|（不是 mjlab 的 \verb|actor|），且 locomotion 实配用 \verb|Unoise|（均匀噪声）。\textbf{注意：高斯与均匀两类噪声两框架其实都提供}（mjlab 的 \Verb[breaklines]|GaussianNoiseCfg|/\allowbreak\Verb[breaklines]|UniformNoiseCfg|、Isaac 的 \Verb[breaklines]|GaussianNoiseCfg|/\allowbreak\Verb[breaklines]|UniformNoiseCfg|(别名 \verb|Unoise|)）；差别只在\emph{各自 velocity 任务的默认选择}——mjlab core 与 Isaac Lab 的速度任务都默认用均匀噪声。Isaac 的导入别名块还把 \Verb[breaklines]|ObservationTermCfg| 重命名成 \verb|ObsTerm|（mjlab 无此别名，只用全名）：
+
+\begin{codebox}[Python]{Isaac Lab:policy 观测组（注意组名与噪声类型）}
+policy = ObservationGroupCfg(
+    enable_corruption=True, concatenate_terms=True,
+    terms={
+        "base_lin_vel":      ObsTerm(func=base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1)),
+        "base_ang_vel":      ObsTerm(func=base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2)),
+        "projected_gravity": ObsTerm(func=projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05)),
+        "velocity_commands": ObsTerm(func=generated_commands, params={"command_name": "base_velocity"}),
+        "joint_pos":         ObsTerm(func=joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01)),
+        "joint_vel":         ObsTerm(func=joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5)),
+        "actions":           ObsTerm(func=last_action),
+        # rough 任务再加 height_scan，见 \cref{sec:rlmc-ql-terrain}
+    },
+)
+\end{codebox}
+
+UniLab 的非对称由\textbf{两个固定组名}承载：env 侧 \Verb[breaklines]|obs_groups_spec| 返回 \Verb[breaklines]|{"obs": ..., "critic": ...}|，\verb|obs| 喂 actor、\verb|critic| 喂 critic（在 \verb|np_env| 的 \Verb[breaklines]|base/observations.py| 的 \Verb[breaklines]|split_obs_dict| 中分流，UniLab 版本）。组名既不叫 mjlab 的 \verb|actor|、也不叫 Isaac Lab 的 \verb|policy|，而是固定 \verb|obs|/\allowbreak\verb|critic|——这是迁移时第三个要核对的命名约定。观测的拼接、加噪、特权信号在 env 子类的 \verb|_compute_obs| 里手写（不是声明式 \verb|ObsTerm| 字典）：
+
+\begin{codebox}[Python]{UniLab:actor/critic 两组观测（go2\_joystick，维度逐行标注）}
+# env 侧固定声明两组维度（critic 比 obs 多出的就是特权维）
+@property
+def obs_groups_spec(self) -> dict[str, int]:
+    return {"obs": 49, "critic": 52}          # critic 多 3 维 = 特权 base linvel
+
+def _compute_obs(self, info, linvel, gyro, gravity, dof_pos, dof_vel, feet_phase):
+    nc = self._cfg.noise_config
+    diff = dof_pos - self.default_angles
+    obs = np.concatenate([                     # actor:只含真机可得量 + 噪声
+        self._obs_noise(gyro, nc.scale_gyro),          # base_ang_vel  3
+        -self._obs_noise(gravity, nc.scale_gravity),   # projected_gravity 3
+        self._obs_noise(diff, nc.scale_joint_angle),   # joint_pos(rel) 12
+        self._obs_noise(dof_vel, nc.scale_joint_vel),  # joint_vel     12
+        info.get("current_actions", np.zeros_like(diff)),  # last_action 12
+        info["commands"],                              # command       3
+        feet_phase,                                    # 步态相位       4
+    ], axis=1)                                          # actor obs = 49
+    critic = np.concatenate([                  # critic:去噪 + 追加特权 base linvel
+        gyro, -gravity, diff, dof_vel, info["current_actions"],
+        info["commands"], feet_phase, linvel], axis=1)  # +linvel 3 -> 52
+    return {"obs": obs, "critic": critic}
+# 噪声仅 actor 加:_obs_noise(data, scale)，level<=0 关，幅度 = level*scale*U(-1,1);
+# critic 不调 _obs_noise（等价 mjlab enable_corruption=False）.
+\end{codebox}
+
+\textbf{逐行解读}：与 mjlab/Isaac 的\emph{声明式}观测组不同，UniLab 是\emph{命令式}拼接——但三者语义同构：actor 看带噪本体感知 + command，critic 去噪并追加特权 \Verb[breaklines]|base linvel|。UniLab 把噪声做成 actor 专用的 \verb|_obs_noise| 调用（mjlab/Isaac 都用声明式 noise cfg——\Verb[breaklines]|UniformNoiseCfg|/\allowbreak\Verb[breaklines]|GaussianNoiseCfg|，velocity 任务默认均匀），把“是否加噪”这件事从配置项变成“调不调那个函数”。RL 库（rsl-rl）侧的路由由 Hydra 的 \Verb[breaklines]|algo.obs_groups={actor:[actor],critic:[critic]}| 完成，把 env 内部的 \verb|obs|/\allowbreak\verb|critic| 组对齐到 runner 的 obs-group 键——两层命名经 wrapper 桥接（与 mjlab \verb|obs_groups| 同思想）。维度自检入口：\Verb[breaklines]|env.obs_groups_spec| 应为 \Verb[breaklines]|{"obs":49,"critic":52}|，\Verb[breaklines]|observation_space| 是两组之和的 Box。
+
+\begin{note}[flat 与 rough 的 actor 维度\emph{不同}——别用一个数字套两个任务，且维度可一眼自验]
+上面的 \Verb[breaklines]|{"obs":49,"critic":52}| 是 go2 \textbf{flat} 的实测值，其 actor 49 维里含 4 维\textbf{步态相位 \texttt{feet\_phase}}。切到 go2 \textbf{rough}，结构会变：实测 \Verb[breaklines]|obs_groups_spec={"obs":45,"critic":48+scan}|——actor 反而\emph{少}了 feet\_phase（45 维、盲式），而 height scan 进了 critic（见 \cref{sec:rlmc-ql-terrain}）。\textbf{所以 flat$\to$rough 不是“actor 加地形维”，而是“actor 换了一组本体特征 + scan 只补给 critic”}，这正是非对称设计在两个 variant 间的不同切法。\textbf{怎么不靠背数字就核对维度}：UniLab go2 PPO 起训时日志会打印网络结构，\verb|Critic| 的 \verb|in_features| 直接等于 critic obs 维（flat 实测 \Verb[breaklines]|in_features=52|，rough 则是 \verb|48+scan|）；mjlab 侧同理看启动打印的 \verb|Observation| term 表与各 term 的 shape（rough 实测 \Verb[breaklines]|height_scan (187,)|）。\textbf{维度对不上时第一步永远是读这张启动表，而不是去 cfg 里数 term}。
+\end{note}
+
+\textbf{配置项四维表}（actor 噪声幅度——这是“反映真实传感器特性”的核心配置，务必逐项理解）：
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}LlLp{4.6cm}@{}}
+\toprule
+term（噪声 std） & 默认值来源 & 合理范围 / 修改影响 & 与其他配置的耦合 \\
+\midrule
+base\_ang\_vel ($\pm$0.2 rad/s) & IMU 陀螺仪实测放大 & 真机约 0.01；有意加大增强鲁棒 & 太小则部署不鲁棒，太大则训练难收敛 \\
+projected\_gravity ($\pm$0.05) & IMU 加速度计 & 0.02--0.08 & 与 upright 奖励配合 \\
+joint\_pos ($\pm$0.01 rad) & 关节编码器 & 编码器 $<0.1^\circ$，但 DR 零位偏移更大 & 与 encoder\_bias DR 耦合 \\
+joint\_vel ($\pm$1.5 rad/s) & 编码器差分 & 真机约 0.5；放大防过拟合 & 差分噪声随 control\_dt 变 \\
+height\_scan ($\pm$0.1 m) & elevation map 精度 & 0.05--0.15 & 仅 rough；与 raycast 分辨率耦合 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paragraph{常见陷阱（观测）。}
+
+\begin{pitfall}[从 mjlab 复制 obs\_groups 到 Isaac Lab 忘记改名]
+\textbf{错误描述}：mjlab 用 \verb|"actor"|，Isaac Lab 用 \verb|"policy"|，复制时没改。\textbf{现象后果}：RSL-RL wrapper 按名字查找观测组，名字不匹配——有时 \verb|KeyError|，有时\emph{静默}用了错误观测，训练表现异常却不报错。\textbf{根本原因}：两框架观测组命名约定不同。\textbf{正确做法}：迁移时把 \verb|obs_groups| 的键从 \Verb[breaklines]|{"actor":...,"critic":...}| 改成 \Verb[breaklines]|{"policy":...,"critic":...}|，并打印确认。
+\end{pitfall}
+
+\begin{pitfall}[把 contact forces 放进 actor 观测]
+\textbf{错误描述}：图省事把 foot\_contact\_forces 直接加到 actor 组。\textbf{现象后果}：仿真里 tracking 漂亮，真机一上就崩。\textbf{根本原因}：真机无精确足端力，actor 训练时学会了依赖它，部署时该信号缺失。\textbf{正确做法}：特权信号一律只进 critic；actor 只看可部署的本体感知。
+\end{pitfall}
+
+\begin{practice}[观测设计]
+\begin{enumerate}
+\item （配置）列出 actor 与 critic 的全部 term 及维度，算出两组维度差，并说明差值来自哪些特权 term。（验收：48 vs 64，差 16 = foot\_height 4 + foot\_contact\_forces 12，与上方 critic 组 codebox 一致）
+\item （跨章综合，\cref{ch:rlmc-obsact}+\cref{ch:rlmc-privileged}）critic 含 height\_scan + contact\_forces + 无噪 base\_lin\_vel，actor 只含本体感知 + command。解释：(a) 为何 critic 能帮 actor 学到更好策略，即使 actor 看不到地形？(b) 把 height\_scan 从 critic 移到 actor，对训练与部署各有何影响？(c) RMA 的 adaptation module 在此扮演什么角色？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{奖励设计：四层框架的落地}
+\label{sec:rlmc-ql-reward}
+
+\textbf{模块功能}：RewardManager 把多个 \verb|RewardTermCfg| 加权求和成标量。\cref{ch:rlmc-reward} 讲了四层框架的原理，本节把它落到 velocity task 的十余个 term（mjlab Go1 base 配置实测 13 个，下文按四层简化展示），并给出三框架接线。
+
+\subsection{四层框架回顾与 velocity 落地}
+\label{sec:rlmc-ql-reward-layers}
+
+奖励四层（Tracking / Regularization / Style / Contact-Safety）被 extreme-parkour\,\cite{cheng2024parkour}、walk-these-ways\,\cite{margolis2022walk}、mjlab velocity task 共同验证，是足式 RL 奖励设计的标准组织方式：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllp{3.5cm}@{}}
+\toprule
+层级 & 目的 & 典型 term & 调参策略 \\
+\midrule
+\textbf{Tracking} & 跟踪命令 & lin\_vel\_xy, ang\_vel\_yaw & 固定不动，作 baseline \\
+\textbf{Regularization} & 平滑动作 & action\_rate, dof\_accel, torque, dof\_pos\_limits & 从小值起，看动作质量再调大 \\
+\textbf{Style} & 步态美学 & feet\_air\_time, upright, pose & 决定步态风格，主观性最强 \\
+\textbf{Contact/Safety} & 避免伤害 & foot\_slip, undesired\_contacts, clearance & 定义行为红线 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+设计哲学：Tracking 是你\emph{要}策略做什么（目标），Regularization 是你\emph{不要}策略做什么（约束），Style 是你\emph{希望}策略怎么做（偏好），Contact/Safety 是策略\emph{绝对不能}做什么（红线）。调参时四层独立扰动——tracking 好但步态丑，只调 Style；策略抖动，只调 Regularization。
+
+\subsection{tracking 奖励为什么用 exponential kernel}
+\label{sec:rlmc-ql-reward-track}
+
+tracking 奖励的数学形式（线速度）：
+\begin{equation}
+r_{\text{track}} = \exp\!\left(-\frac{\lVert \mathbf{v}_{xy} - \mathbf{v}^{\text{cmd}}_{xy} \rVert^2}{\sigma^2}\right),
+\label{eq:rlmc-ql-track}
+\end{equation}
+角速度同形。为什么用 exponential 而非简单的 $-\lVert \mathbf{v}-\mathbf{v}^{\text{cmd}}\rVert^2$？
+
+\begin{insight}[exp kernel 给的是“没有奖励”，L2 给的是“被惩罚”]\label{ins:rlmc-ql-expkernel}
+L2 距离在远离目标时给出很大负值，策略可能选择“不动”来回避大惩罚——这是“站着不走”的又一类病因。\eqref{eq:rlmc-ql-track} 的值域是 $[0,1]$，远离目标时快速衰减到零但\emph{不产生大负值}——策略得到的信号是“没有奖励”而非“被惩罚”，这在 PPO 的 advantage 计算中有本质区别（advantage 不会因回避而变正）。$\sigma$ 控制精度容忍度：$\sigma$ 小则只有非常接近目标才有显著奖励；$\sigma$ 大则更宽容。velocity task 常用 $\sigma=0.25$（允许约 $\pm 0.25$ m/s 误差仍有较高 reward）。$\sigma$ 过小（$<0.1$）会让信号过于稀疏，策略学不到初始粗略跟踪。
+\end{insight}
+
+\subsection{mjlab 的 RewardsCfg（实测 13 term，按四层简化展示）}
+\label{sec:rlmc-ql-reward-cfg}
+
+这段代码是后续人形/操作章修改奖励的基础，务必读懂结构而非记数值：
+
+\begin{codebox}[Python]{mjlab Go1 velocity 奖励注册（简化，按四层分组;函数名取自 mjlab 1.4.0 实测）}
+cfg.rewards = {
+    # --- Tracking 层（mjlab tracking 的精度参数叫 std，不是 sigma）---
+    "track_linear_velocity":  RewardTermCfg(func=track_linear_velocity,  weight=+2.0,
+                                  params={"command_name": "twist", "std": 0.25}),
+    "track_angular_velocity": RewardTermCfg(func=track_angular_velocity, weight=+2.0,
+                                  params={"command_name": "twist", "std": 0.25}),
+    # --- Style 层 ---
+    "upright":          RewardTermCfg(func=upright,           weight=+1.0),
+    "pose":             RewardTermCfg(func=variable_posture,  weight=+1.0),
+    "air_time":         RewardTermCfg(func=feet_air_time,     weight=+0.5,
+                            params={"sensor_name": "feet_contact"}),
+    # --- Regularization 层 ---
+    "action_rate_l2":   RewardTermCfg(func=action_rate_l2,            weight=-0.1),
+    "joint_torques":    RewardTermCfg(func=joint_torques_l2,          weight=-0.0001),
+    "dof_pos_limits":   RewardTermCfg(func=joint_pos_limits,          weight=-1.0),
+    "body_ang_vel":     RewardTermCfg(func=body_angular_velocity_penalty, weight=-0.05),
+    "angular_momentum": RewardTermCfg(func=angular_momentum_penalty,  weight=-0.001),
+    # --- Contact/Safety 层（dict 键沿用 mjlab Go1 配置里的 foot_*，函数真名是 feet_*）---
+    "foot_clearance": RewardTermCfg(func=feet_clearance, weight=-2.0,
+                          params={"target_height": 0.03, "height_sensor_name": "foot_height_scan"}),
+    "foot_slip":      RewardTermCfg(func=feet_slip, weight=-0.1,
+                          params={"sensor_name": "feet_contact", "command_name": "twist"}),
+}
+\end{codebox}
+
+\textbf{代码解读要点（逐条对应排查路径）}：
+
+\begin{enumerate}
+\item 每个 \verb|RewardTermCfg| 三件套：\verb|func|（计算函数）、\verb|weight|（权重）、\verb|params|（额外参数）。改奖励只改这三项，不动底层 RewardManager。
+\item \verb|std=0.25| 在 tracking 的 params 里——就是 \eqref{eq:rlmc-ql-track} 的 $\sigma$（mjlab 实现里这个精度参数叫 \verb|std|，Isaac Lab 同理用 \Verb[breaklines]|std=math.sqrt(0.25)|，本书记号统一写 $\sigma$）。跟踪不够精就减小（如 0.15）；初期太稀疏就增大（如 0.4）。
+\item \verb|weight=-2.0| 的 \Verb[breaklines]|foot_clearance| 是所有惩罚里绝对值最大的——强迫策略抬脚而非拖行。拖脚在仿真里可能“工作”（利用接触弹性滑行），真机上会磨损脚底。
+\item \textbf{从这段代码到“策略不走”的排查}：第一步看 \verb|track_*| 的 weight 是否 $>0$（确认是正奖励非惩罚）；第二步看 \verb|params| 的 \verb|command_name| 是否与观测里的 command 组名一致（mjlab 这里是 \verb|"twist"|，Isaac Lab 是 \Verb[breaklines]|"base_velocity"|）。这两个错误分别对应“策略没跟踪目标”和“策略看不到目标”。
+\item \textbf{别把上面这份 codebox 当“真值表”，要去日志里读实装的 term 集}：上面是\emph{按四层简化}的示意；mjlab 1.4.0 实跑 Go1 flat 的 \Verb[breaklines]|Episode_Reward/*| 里实际还出现更细分的着地/摆腿项（如 \Verb[breaklines]|foot_swing_height|、\verb|soft_landing|），而示意里列的 \verb|joint_torques| 因权重极小、当步可能不显（值近 0 不打印）。\textbf{要拿到“当前任务真正注册了哪些 reward”，最快的不是读 cfg 源码，而是看训练启动后的日志}——跑一次 \Verb[breaklines]|uv run train Mjlab-Velocity-Flat-Unitree-Go1 --env.scene.num-envs 64 --agent.max-iterations 2 --agent.logger tensorboard|（首跑加 \Verb[breaklines]|WANDB_MODE=disabled| 免登录），第一屏起 \Verb[breaklines]|Episode_Reward/<term>| 每行就是一个真实 reward term。这条“以日志为准核 term 名”的习惯，正是下面 ablation 改权重前必做的防呆（改错 term 键 mjlab 会直接 \verb|tyro| 报错，但你得先知道真键名）。
+\end{enumerate}
+
+\subsection{Isaac Lab 与 UniLab 对照}
+\label{sec:rlmc-ql-reward-isaac}
+
+Isaac Lab 用 \verb|RewTerm| 注册（mjlab 用 \verb|RewardTermCfg|），且 ANYmal-C 任务相比 mjlab Go1 多了 base\_height 惩罚（ANYmal 体型大、高度偏差更危险）。下表对照两框架与其差异原因：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+奖励类别 & mjlab Go1 & Isaac Lab ANYmal-C & 差异原因 \\
+\midrule
+tracking 形式 & exponential & exponential & 相同思路 \\
+base height & 通常不加 & 有（惩罚偏离标称高度） & ANYmal 体型更大 \\
+feet air time & 可作 reward & 可作 reward & 设计哲学接近 \\
+注册类名 & \verb|RewardTermCfg| & \verb|RewTerm| & API 命名差异 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+UniLab 走的是\textbf{第三种范式}：奖励既不是 mjlab 的类式 \Verb[breaklines]|RewardTermCfg(func=...)|、也不是 Isaac Lab 的 \verb|RewTerm|，而是\textbf{一个 scale 标量字典 + 一张派发表}。四层框架仍然成立，只是“注册一个 term”退化成“在 YAML 的 \verb|reward.scales| 里加一行 + 在 env 的 \verb|_reward_fns| 里挂一个函数”。$\sigma$ 不写进 term 的 params，而是单独的 \Verb[breaklines]|reward.tracking_sigma|（默认 0.25，与 mjlab/Isaac 一致）：
+
+\begin{codebox}[Python]{UniLab:奖励四层落地（标量字典 + 派发表，go2 flat）}
+# (1) YAML 侧:reward.scales 标量字典（四层按符号区分），sigma 单列
+# reward:
+#   scales: {tracking_lin_vel: 1.0, tracking_ang_vel: 0.2,   # Tracking 层（正）
+#            lin_vel_z: -5.0, ang_vel_xy: -0.1,              # Regularization 层（负）
+#            action_rate: -0.005, similar_to_default: -0.1,
+#            swing_feet_z: 4.0, base_height: -100.0,         # Style 层
+#            contact: 0.24}                                  # Contact 层（相位-接触一致）
+#   tracking_sigma: 0.25
+#   base_height_target: 0.3
+# (2) env 侧:把 scale 名映射到共享 reward 函数（common/rewards.py，UniLab 版本）
+def _init_reward_functions(self):
+    self._reward_fns = {
+        "tracking_lin_vel":    rewards.tracking_lin_vel,      # exp(-||cmd-v||^2/sigma^2)
+        "tracking_ang_vel":    rewards.tracking_ang_vel,
+        "lin_vel_z":           rewards.lin_vel_z,
+        "ang_vel_xy":          rewards.ang_vel_xy,
+        "action_rate":         rewards.action_rate,
+        "similar_to_default":  rewards.similar_to_default,    # = mjlab joint_deviation
+        "base_height":         rewards.base_height,
+        "swing_feet_z":        self._reward_swing_feet_z,      # robot 方法（足端摆动高度）
+        "contact":             self._reward_contact,          # 相位-接触一致
+    }
+# (3) 每步派发 + dt 缩放（run_reward_dispatch，rewards.py 的 run_reward_dispatch，UniLab 版本）
+reward = rewards.run_reward_dispatch(scales=cfg.scales, fns=self._reward_fns,
+                                     ctx=ctx, info=info, enable_log=True,
+                                     ctrl_dt=self._cfg.ctrl_dt)
+#   reward = sum_name scales[name]*fns[name](ctx)，跳过 scale==0 或表中无此名的项;
+#   每 4 步把 reward/<name> 均值写进 info["log"];返回 reward*ctrl_dt（按控制周期缩放）.
+\end{codebox}
+
+\textbf{代码解读要点（对应排查路径）}：(1) 改奖励权重在 UniLab 里是改 YAML 的一个标量，甚至命令行 \Verb[breaklines]|reward.scales.tracking_lin_vel=2.0| 直接 Hydra 覆盖——比改 mjlab 的 \verb|RewardTermCfg| 字段更轻；(2) \Verb[breaklines]|run_reward_dispatch| 的 \Verb[breaklines]|reward*ctrl_dt| 等价于 mjlab/Isaac 的 \verb|scale_by_dt|，但 UniLab 乘的是 \verb|ctrl_dt|（控制周期本身），\textbf{跨框架对比 return 前要核对 \texttt{ctrl\_dt} 与 mjlab 的 \texttt{decimation}$\times$\texttt{physics\_dt} 是否相等}；(3) “策略不走”的第一步排查在 UniLab 里同样是看 \verb|reward.scales| 里 \verb|tracking_*| 是否为正、\Verb[breaklines]|info["commands"]| 是否非全零（命令式拼接更易直接打印确认）。UniLab 的 \Verb[breaklines]|tracking_lin_vel| 形式与 \eqref{eq:rlmc-ql-track} 完全一致（即 $\exp(-\lVert\mathbf{c}_{xy}-\mathbf{v}_{xy}\rVert^2/\sigma^2)$），印证了 \cref{ins:rlmc-ql-rewname} 的“看实现而非看名字”——这里三框架函数名各不同（Isaac \Verb[breaklines]|track_lin_vel_xy_exp| / mjlab \Verb[breaklines]|track_linear_velocity| / UniLab \Verb[breaklines]|tracking_lin_vel|）但数学同形。
+
+\begin{insight}[多视角：同名奖励在两框架未必同义]\label{ins:rlmc-ql-rewname}
+一个常见误区是认为 \Verb[breaklines]|track_linear_velocity| 在两框架里行为相同。实际上 exponential kernel 的 $\sigma$、坐标系处理（base frame vs world frame）、是否乘 \verb|dt| 都可能不同。\textbf{迁移奖励时必须查源码确认数学形式}，不能只看函数名。这与 \cref{ins:rlmc-ql-asym} 形成对照：观测看“组名”，奖励看“实现”——两类跨框架坑的定位入口不同。
+\end{insight}
+
+\paragraph{常见陷阱（奖励）。}
+
+\begin{pitfall}[把所有奖励权重设为 1.0]
+\textbf{错误描述}：图省事让所有 term 权重都是 1.0。\textbf{现象后果}：某个数值量级大的惩罚项（如 foot\_clearance 在某些步态下）主导优化，策略学会“不动”来最小化惩罚。\textbf{根本原因}：不同 term 数值量级差异极大（tracking 约 $[0,1]$，惩罚项可能更大）。\textbf{正确做法}：先单独跑每个 term 几个 iteration，观察数值范围，再设权重；tracking 固定作 baseline，其余相对它调。
+\end{pitfall}
+
+\begin{pitfall}[忘记 step\_dt scaling 导致跨 control\_dt 不可比]
+\textbf{错误描述}：换了 \verb|control_dt| 后直接对比两次训练的 return。\textbf{现象后果}：return 数值不可比，误判某配置更好。\textbf{根本原因}：奖励应乘 \verb|dt|，使不同 \verb|control_dt| 下 return 可比。\textbf{正确做法}：确认 reward manager 做了 dt scaling（mjlab 与 Isaac Lab 默认会做），跨框架对比前核对 \Verb[breaklines]|control_dt = decimation x physics_dt| 一致。
+\end{pitfall}
+
+\begin{practice}[奖励设计]
+\begin{enumerate}
+\item （动手）把 \Verb[breaklines]|track_linear_velocity| 的 \verb|std|（即 \eqref{eq:rlmc-ql-track} 的 $\sigma$）从 0.25 改到 0.15 和 0.4，各训练 1000 iteration，记录 tracking error 与步态变化。（验收：三条曲线 + 一句结论）
+\item （ablation）关闭 \verb|foot_slip| / \Verb[breaklines]|action_rate_l2| / \verb|pose| 各一组（加 baseline 共 4 次），各 3000 iteration，用表格记录最终 tracking reward、平均 episode length、肉眼步态差异。
+\item （分析）ablation 显示关闭某 penalty 后 tracking reward 反而上升，能否据此删掉该 penalty？为什么？（提示：reward hacking 与真机可行性）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{终止设计与 flat/rough 的减法关系}
+\label{sec:rlmc-ql-termination}
+
+\textbf{模块功能}：TerminationManager 决定何时结束 episode，并区分 terminal（真失败，不 bootstrap）与 truncation（截断，需 bootstrap）。velocity task 的终止条件\emph{随地形而变}，这是 flat 与 rough 差异的关键一环。
+
+\begin{center}
+\small
+\begin{tabular}{@{}llllcc@{}}
+\toprule
+条件 & 类型 & 含义 & 阈值 & flat & rough \\
+\midrule
+\verb|time_out| & truncation & episode 超时 & --- & 是 & 是 \\
+\verb|fell_over| & terminal & 倾斜超限 & $70^\circ$ & 是 & 否 \\
+\Verb[breaklines]|illegal_contact| & terminal & 非法接触 & 膝/大腿触地 & 否 & 是 \\
+\Verb[breaklines]|out_of_terrain_bounds| & truncation & 走出地形 & --- & 否 & 是 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+为什么 rough 删 \verb|fell_over| 而用 \Verb[breaklines]|illegal_contact|？在粗糙地形上，机器人在斜坡上的倾斜角可能远超平地的合理范围——一个 $30^\circ$ 斜坡上的合理姿态在平地判据下会被误判为“摔倒”。\Verb[breaklines]|illegal_contact| 更精确：只有当大腿或小腿\emph{碰到地面}才判失败，这才是真正的失败信号。
+
+\begin{insight}[本质：task variant 不只是改 terrain type]\label{ins:rlmc-ql-subtraction}
+Go1 flat cfg 不是从零构建，而是从 rough cfg 做\textbf{减法}。这个“减法”同步触及 observation、reward、termination、curriculum 四个 manager——任何不一致都会让训练信号与物理环境脱节：flat 保留 terrain\_scan 会白算 raycast 拖慢 10\%--20\% 训练；rough 保留 fell\_over 会在合理坡度下频繁 reset。\textbf{记住这条洞察，你就不会犯“只改了 terrain\_type 就以为切到了 rough”的错。}
+\end{insight}
+
+\begin{codebox}[Python]{flat = rough - (地形扫描 + 课程 + 非法接触) + fell\_over}
+def unitree_go1_flat_env_cfg():
+    cfg = unitree_go1_rough_env_cfg()        # 从 rough 起步
+    # --- 减法操作 ---
+    cfg.scene.terrain.terrain_type = "plane"
+    cfg.scene.terrain.terrain_generator = None
+    del cfg.scene.sensors["terrain_scan"]
+    del cfg.observations.actor.terms["height_scan"]
+    del cfg.observations.critic.terms["height_scan"]
+    del cfg.curriculum["terrain_levels"]
+    del cfg.terminations["illegal_contact"]
+    # mjlab 没有 FellOverTerminationCfg 这个类——"fell_over" 只是 term 键，底层用 bad_orientation:
+    cfg.terminations["fell_over"] = TerminationTermCfg(
+        func=mdp.bad_orientation, params={"limit_angle": 1.22})   # ~70 deg
+    return cfg
+\end{codebox}
+
+UniLab \textbf{没有独立的 \texttt{TerminationTermCfg} 类}——\verb|terminated| 不是注册出来的 term，而是在 env 子类的 \verb|update_state| 里\emph{直接算}（go2 用投影重力 z 分量判倒：\Verb[breaklines]|gravity[:,2] <= 0.5|）；超时 \verb|truncated| 由基类 \Verb[breaklines]|_compute_truncated| 按 \Verb[breaklines]|max_episode_steps| 自动算；二者经 \verb@done = terminated | truncated@ 合并，PPO 自举用 \Verb[breaklines]|TransitionBootstrapContract|（区分超时与失败，等价 mjlab/Isaac 的 \verb|time_out| 标记）。flat/rough 的“减法”因此\textbf{不是删 termination 项，而是切换 owner YAML}（rough owner 带 \Verb[breaklines]|terrain.generator| + \Verb[breaklines]|terrain_curriculum| + 更全 DR + 更多 reward；flat owner 砍掉地形与部分 reward）：
+
+\begin{codebox}[Python]{UniLab:终止在 update\_state 里直接算（rough 起步、flat 换 owner）}
+# terminated 直接算（无 DoneTerm 注册）——go2，UniLab 的 update_state
+def update_state(self, state):
+    gravity = self._backend.get_sensor_data("upvector")
+    terminated = gravity[:, 2] <= 0.5          # 投影重力倒置即摔倒（替代 fell_over）
+    # ... 算 obs / reward ...
+    return state.replace(obs=obs, reward=reward, terminated=terminated)
+# truncated 由基类自动算:_compute_truncated 按 max_episode_steps（= max_episode_seconds/ctrl_dt）
+# flat vs rough = 换 owner YAML（不是删项）:
+#   conf/ppo/task/go2_joystick_rough/mujoco.yaml  -> 带 terrain.generator + terrain_curriculum + 更多 reward
+#     （注意:rough owner 自带 terrain_curriculum 键，但实测默认 enabled=false / generator.curriculum=false，
+#       即「带配置」!=「默认开课程」，要开须 Hydra 同时打开两处，见 §terrain-curriculum 的 pitfall）
+#   conf/ppo/task/go2_joystick_flat/mujoco.yaml   -> 无 terrain.generator、reward 项更少
+\end{codebox}
+
+\textbf{对照解读}：mjlab 的 flat 用 Python 函数对 rough cfg 做 \Verb[breaklines]|del cfg.terminations[...]| 的\emph{显式减法}（\cref{ins:rlmc-ql-subtraction} 那段代码）；UniLab 把同一“减法”分散到两份 owner YAML 的差异里——观测/奖励/终止/课程四处的“flat vs rough”都体现为 YAML 字段的有无，而非运行时 \verb|del|。两条路殊途同归，但调试入口不同：mjlab 看那个 \Verb[breaklines]|*_flat_env_cfg()| 工厂函数，UniLab 直接 diff 两份 owner YAML。UniLab 没有 \Verb[breaklines]|illegal_contact| 这种独立终止项；rough 上的“非法接触/出界”若需要，得在 \verb|update_state| 里自行并入 \verb|terminated| 表达式（UniLab 无对应内置项）。
+
+\paragraph{常见陷阱（终止）。}
+
+\begin{pitfall}[rough 漏删 fell\_over 导致 episode 极短]
+\textbf{错误描述}：从 flat 改 rough 时只换了 terrain，没删 \verb|fell_over|。\textbf{现象后果}：rough episode 极短，reward 上不去。\textbf{根本原因}：斜坡上的合理倾斜被 $70^\circ$ 判据误判为摔倒。\textbf{正确做法}：rough 删 \verb|fell_over|，加 \Verb[breaklines]|illegal_contact| + \Verb[breaklines]|out_of_terrain_bounds|。
+\end{pitfall}
+
+\begin{pitfall}[把 timeout 当 terminal 处理]
+\textbf{错误描述}：wrapper 没把 \verb|time_out| 标成 truncation。\textbf{现象后果}：价值函数在 episode 末端下偏，策略学到“快结束时不好好走”。\textbf{根本原因}：timeout 的 done 需要 bootstrap（episode 本可继续），terminal 不需要。\textbf{正确做法}：确认 wrapper 设了 \Verb[breaklines]|extras["time_outs"] = truncated & ~terminated|（见 \cref{sec:rlmc-train-wrapper}）。
+\end{pitfall}
+
+\begin{practice}[终止设计]
+\begin{enumerate}
+\item （动手）把一个 flat cfg 手动改成 rough：列出你必须增/删的全部 termination 项，并解释每一项的物理理由。
+\item （分析）若 rough 任务里 episode 平均长度极短，按什么顺序排查 termination 配置？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{链路阅读法：从 task id 到每个 manager term}
+\label{sec:rlmc-ql-readpath}
+
+\textbf{本节解决什么问题}：给出读懂任意 velocity task 配置的系统方法——不是从某个 reward 函数开始，而是沿数据流从入口追到出口。
+
+\subsection{完整链路与核心源码地图}
+\label{sec:rlmc-ql-readpath-map}
+
+精读一个 task 的最有效方法是沿链路追踪数据的完整生命周期：
+
+\begin{codebox}{velocity task 的数据流链路}
+Task Registry -> Entity -> Scene -> Sensors -> Managers -> RL cfg -> CLI -> Logs -> Play
+\end{codebox}
+
+这类似 C++ 项目从 \verb|main| 追到接口实现——你不是在读某个函数，而是在追踪数据的完整流向。只读 reward 函数会漏掉 sensor wiring；只读 train.py 会漏掉 robot-specific overrides。mjlab velocity task 的核心源码地图：
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+文件路径（mjlab core，路径以版本为准） & 角色 \\
+\midrule
+\Verb[breaklines]|tasks/velocity/config/go1/__init__.py| & task 注册入口 \\
+\Verb[breaklines]|tasks/velocity/config/go1/env_cfgs.py| & Go1 rough/flat env cfg \\
+\Verb[breaklines]|tasks/velocity/config/go1/rl_cfg.py| & Go1 PPO runner cfg \\
+\Verb[breaklines]|tasks/velocity/velocity_env_cfg.py| & robot-agnostic base cfg \\
+\Verb[breaklines]|tasks/velocity/mdp/rewards.py| & velocity reward 函数 \\
+\Verb[breaklines]|tasks/velocity/mdp/terminations.py| & termination 条件 \\
+\Verb[breaklines]|tasks/velocity/mdp/velocity_command.py| & command sampler \\
+\Verb[breaklines]|tasks/velocity/mdp/curriculums.py| & curriculum \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{从 task id 到 env cfg：注册绑定五要素}
+\label{sec:rlmc-ql-readpath-reg}
+
+mjlab 的 \Verb[breaklines]|register_mjlab_task()| 绑定五个要素。\textbf{play cfg 与 train cfg 分离}是关键设计——play 时关闭观测 corruption、移除随机 push、rough play 用固定 terrain 而非 curriculum terrain：
+
+\begin{codebox}[Python]{task 注册（mjlab）}
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Rough-Unitree-Go1",
+    env_cfg=unitree_go1_rough_env_cfg,        # 训练 env cfg 工厂
+    play_env_cfg=unitree_go1_rough_play_cfg,  # 播放 cfg（关 noise/push）
+    rl_cfg=unitree_go1_rl_cfg,                # RSL-RL runner cfg
+    runner_cls=VelocityOnPolicyRunner,         # 可选自定义 runner
+)
+\end{codebox}
+
+\begin{note}[base cfg 的模板方法模式]
+Go1 rough cfg 第一行调用 \Verb[breaklines]|make_velocity_env_cfg()| 创建 robot-agnostic 的 base cfg——定义所有 manager 的骨架但把 robot-specific 名字留空；Go1 cfg 随后填入 entity wiring、sensor frame names、reward site names、action scale。这与 C++ 的\emph{模板方法设计模式}完全对应：base class 定义算法骨架，derived class 填 hook，只是这里用 Python dataclass + dict 实现。同一 base cfg 能适配 Go1/Go2/ANYmal，只换 robot-specific 部分。
+\end{note}
+
+Isaac Lab 用 \Verb[breaklines]|gymnasium.register()| 注册，CLI 用 \Verb[breaklines]|--task <id>|。对照表见 \cref{sec:rlmc-ql-dualframework}。
+
+\subsection{5 分钟读懂陌生配置}
+\label{sec:rlmc-ql-readpath-5min}
+
+拿到一个第三方 velocity 配置，按下面五步在 5 分钟内建立心智模型：
+
+\begin{codebox}{5 分钟读懂 velocity task 配置}
+分钟 1:找 task registration（register_mjlab_task / gymnasium.register）
+        -> 记下 env_cfg 与 rl_cfg 的引用路径
+分钟 2:打开 env_cfg，直奔 scene entity
+        -> 找 MJCF/USD 路径与 default pose，确认 entity key（通常 "robot"）
+分钟 3:检查 actor/policy observation terms
+        -> 列出每个 term 名字与维度;确认有 command（没有=策略不知目标）
+        -> 若 rough，确认有 height_scan
+分钟 4:检查 reward terms
+        -> 按四层分类标注;记下权重分布（tracking 通常最大正权重）
+        -> 找 exponential kernel 的 sigma
+分钟 5:检查 termination + DR
+        -> flat 应有 fell_over，rough 应有 illegal_contact
+        -> DR events 有哪些？startup/reset/interval 各是什么？
+\end{codebox}
+
+\begin{practice}[链路阅读]
+\begin{enumerate}
+\item （追踪）在一个 rough env cfg 中找到足端接触 sensor，搜索它在哪些 reward term 和 observation term 中被引用，画出依赖图。
+\item （配置）列出 actor 与 critic 观测的全部 term 及维度，计算差值并定位来自哪些特权 term。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{地形系统与 Height Scan 传感器}
+\label{sec:rlmc-ql-terrain}
+
+\textbf{本节解决什么问题}：理解地形生成、height scan 配置与观测维度三者的关系——这是从 flat 升级到 rough 最关键的新增组件。
+
+\subsection{从 flat 到 rough 的信息缺口}
+\label{sec:rlmc-ql-terrain-gap}
+
+平地任务只需本体感知——策略不需要“看路”，因为地面永远是平的。粗糙地形打破这个假设：台阶、斜坡、碎石引入外部几何约束，策略必须\emph{提前}知道“下一步踩哪里、高度多少”。height scan 就是这个“提前看路”的传感器：从机器人基座发射一组射线，测量与地形的交点距离，返回一个低维高度向量。这类似黑暗中用手电筒照前方——不需要完整视觉图像，只需脚前方的高度轮廓。
+
+为什么不直接用深度相机？四个工程困难：高维输入需 CNN 编码器（训练更慢）、头部相机看不到脚下正下方（盲区）、深度相机的 sim-to-real gap 显著（噪声、伪影）、渲染成本远高于 raycast。
+
+\begin{insight}[height scan 不是把地形“拍成图”]\label{ins:rlmc-ql-heightscan}
+height scan 是在控制周期内抽取一组\emph{和落脚决策直接相关}的可学习几何特征。好的 height scan 不是最像地图的输入，而是\textbf{能让策略提前改变步态的最小信息集}。实践路线：先用 raycast height scan 建立策略地形感知能力的上限，再通过 teacher-student distillation（\cref{ch:rlmc-privileged}）把这种能力迁移到以深度相机或 proprioception history 为输入的可部署策略。Miki et al.\,\cite{miki2022perceptive} 在 DARPA SubT 实现 1700 m 零跌倒，其训练阶段仍以 height scan 作为 teacher 输入——与本章建立的特权 height scan teacher 是同一个起点。
+\end{insight}
+
+\subsection{Grid Pattern 与 ray 数计算}
+\label{sec:rlmc-ql-terrain-grid}
+
+mjlab 用 \Verb[breaklines]|GridPatternCfg| 生成均匀采样的射线网格：
+
+\begin{codebox}[Python]{mjlab raycast 高程扫描配置（字段取自 mjlab 1.4.0 实测）}
+RayCastSensorCfg(
+    name="terrain_scan",
+    frame=ObjRef(type="body", name="trunk", entity="robot"),  # 挂在哪个 body（mjlab 用 frame，非 entity_cfg）
+    pattern=GridPatternCfg(size=(1.6, 1.0), resolution=0.1),  # mjlab 字段是 pattern，非 pattern_cfg
+    ray_alignment="yaw",            # 只随 yaw 旋转，见下文
+    max_distance=5.0,
+    include_geom_groups=(0,),        # 只查 group 0 的地形 geom
+    exclude_parent_body=True,        # 排除机器人自身
+)
+\end{codebox}
+
+ray 数公式：
+\begin{equation}
+N_x = \left\lfloor \frac{\text{size}_x}{\text{res}} \right\rfloor + 1,\quad
+N_y = \left\lfloor \frac{\text{size}_y}{\text{res}} \right\rfloor + 1,\quad
+N_{\text{ray}} = N_x \times N_y.
+\label{eq:rlmc-ql-rays}
+\end{equation}
+\Verb[breaklines]|size=(1.6,1.0)| 与 \Verb[breaklines]|resolution=0.1| 得 $N_x=17, N_y=11, N_{\text{ray}}=187$。这个值直接决定 height scan 在观测中的维度——也正是 Isaac Lab Go2 rough 的 235 维里那 $\approx 187$ 的来源。
+
+\textbf{分辨率-范围-成本权衡}（ray 数随分辨率倒数平方增长）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+配置 & ray/frame & 每步总 ray (4096 envs) & 相对成本 \\
+\midrule
+(1.6,1.0) @ 0.10 m & 187 & 765\,952 & $1\times$ \\
+(1.6,1.0) @ 0.05 m & 693 & 2\,838\,528 & $3.7\times$ \\
+(2.0,1.5) @ 0.10 m & 336 & 1\,376\,256 & $1.8\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+分辨率从 0.10 m 降到 0.05 m，ray 数增约 3.7 倍，训练速度可能降 20\%--40\%，但策略在细粒度地形上的改善往往有限——机器人脚掌本身就有几厘米尺寸，比脚掌小的地形特征对落脚决策影响有限。
+
+\subsection{Ray Alignment 的物理意义}
+\label{sec:rlmc-ql-terrain-align}
+
+\verb|ray_alignment| 控制射线网格如何跟随机器人姿态：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+对齐方式 & 旋转 & 效果 \\
+\midrule
+\verb|"yaw"| & 只保留 yaw & ray 跟随转向，不随俯仰/侧倾 \\
+\verb|"base"| & 完整基座旋转 & ray 跟随所有旋转 \\
+\verb|"world"| & 单位矩阵 & ray 始终向下 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[反事实：用 "base" 而非 "yaw" 会引入只在坡地暴露的 bug]\label{ins:rlmc-ql-align}
+当机器人上坡 pitch 前倾 $10^\circ$ 时，若用 \verb|"base"|，ray 也前倾 $10^\circ$，原本垂直向下的射线斜向前方射出——前方地面被高估、后方被低估。height scan 的均值随步态周期性波动（pitch 随步态变），策略把这种波动误解为地形变化。\textbf{这个 bug 在平地上完全看不出}，只有引入粗糙地形后才暴露。它是“在平地训练正常、一上坡就乱”的典型病因，排查时直接核对 \verb|ray_alignment| 是否为 \verb|"yaw"|。
+\end{insight}
+
+Isaac Lab 用 \verb|RayCasterCfg|，对应字段是 \Verb[breaklines]|attach_yaw_only=True|（= mjlab 的 \Verb[breaklines]|ray_alignment="yaw"|），目标 mesh 用 \Verb[breaklines]|mesh_prim_paths| 指定（mjlab 用 \Verb[breaklines]|include_geom_groups|）：
+
+\begin{codebox}[Python]{Isaac Lab RayCaster 配置（对照 mjlab）}
+scene.height_scanner = RayCasterCfg(
+    prim_path="{ENV_REGEX_NS}/Robot/base",
+    offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),  # 从高处向下发射
+    attach_yaw_only=True,                                  # = mjlab ray_alignment="yaw"
+    pattern_cfg=GridPatternCfg(resolution=0.1, size=(1.6, 1.0)),
+    mesh_prim_paths=["/World/ground"],                     # 只检测地面
+)
+\end{codebox}
+
+UniLab 这里的差异\textbf{不在“有没有 height scan”，而在“它喂给谁”}：它既有完整的\emph{地形生成}（\Verb[breaklines]|TerrainSceneCfg.generator| 是 \Verb[breaklines]|TerrainGeneratorCfg|，带 \verb|hfield_name|/\allowbreak\verb|geom_name|，含地形等级 curriculum），\textbf{也内置了 raycast 风格的 height scan 传感器}（\Verb[breaklines]|common/height_scan.py| 的 \Verb[breaklines]|init_height_scan_sensor| + \Verb[breaklines]|height_scan_obs|，\Verb[breaklines]|HeightScanConfig.enabled| 默认 \verb|True|）——只是 go1/go2/go2w rough 都把这条 scan \textbf{只拼进 critic（特权），actor 保持盲式}。这正是非对称 actor-critic（\cref{ins:rlmc-ql-asym}）在地形感知上的又一落地：critic 拿到 height scan 当“看得见路的教师”，actor 只靠本体感知 + 步态相位适应地形。因此 \eqref{eq:rlmc-ql-rays} 的 ray 数$\to$obs 维公式在 UniLab \textbf{同样适用}（\Verb[breaklines]|HeightScanConfig| 的 \Verb[breaklines]|measured_points_x|/\allowbreak\Verb[breaklines]|measured_points_y| 网格直接定 \Verb[breaklines]|_height_scan_dim = Nx*Ny|），区别只是它进 critic 而非 actor：
+
+\begin{codebox}[Python]{UniLab:内置 height scan，但只喂 critic（go2 rough，实测）}
+# (1) 传感器内置在 common/height_scan.py（HeightScanConfig.enabled 默认 True）:
+#     measured_points_x / measured_points_y 定义网格 -> _height_scan_dim = Nx * Ny
+#     init_height_scan_sensor(...) 建 ray 网格;height_scan_obs(...) 返回高度向量
+# (2) go2/rough.py 的 obs 装配——scan 只进 critic:
+@property
+def obs_groups_spec(self) -> dict[str, int]:
+    return {"obs": 45, "critic": 48 + self._height_scan_dim}   # actor 盲式 45，critic 含 scan
+
+def _compute_obs(self, info, ...):
+    actor  = np.concatenate([gyro, gravity, info["commands"],
+                             diff, dof_vel, last_action], axis=1)   # 无 scan（盲式 rough，45）
+    scan   = height_scan_obs(self._backend, self._height_scan_cfg)  # raycast 高度向量
+    critic = np.concatenate([critic_base, scan], axis=1)            # scan 仅追加进 critic
+    return {"obs": actor, "critic": critic}
+\end{codebox}
+
+\textbf{三框架对照（同语义、不同承载层 + 不同消费者）}：mjlab 的 \Verb[breaklines]|RayCastSensorCfg| 与 Isaac 的 \verb|RayCasterCfg| 默认把 \eqref{eq:rlmc-ql-rays} 算出的 ray 网格送进 \emph{actor} 观测（Go2 rough 的 235 维里那 $\approx 187$ 就在 actor 里）；UniLab 同样有内置 raycast height scan，但默认\textbf{只送 critic}——这反而是个更“干净”的非对称 teacher 范例（特权地形信息只在训练侧用，部署侧 actor 盲式，sim-to-real 负担更小）。所以本节 \eqref{eq:rlmc-ql-rays} 在三框架\textbf{都适用}，唯一要核对的是“它进 actor 还是 critic”：mjlab/Isaac 默认进 actor（也可改成只进 critic 走 teacher-student），UniLab 默认进 critic。
+
+\begin{insight}[“缺页”往往是没去 grep 出来的幻觉——一条可复用的实证链]\label{ins:rlmc-ql-grepchain}
+本书早先一版曾断言“UniLab 没有内置 height scan、需自行实现”——这是\textbf{凭印象下结论}的典型错误：没在装好的包里跑过一条验证命令。正确的工程习惯是\textbf{用三步实证链证伪“缺页”假设}，这套链路对任何“某框架到底有没有 X 能力”都通用：
+
+\begin{codebox}[bash]{三步实证链:确认 UniLab 到底有没有 height scan}
+# 第1步 grep 关键词（不要只搜一个名字，地形扫描可能叫 height/scan/raycast/elevation）:
+grep -rniE "height_scan|terrain_scan|raycast|elevation" $(python -c "import unilab,os;print(os.path.dirname(unilab.__file__))")
+#   -> 命中 common/height_scan.py（HeightScanConfig / init_height_scan_sensor / height_scan_obs）
+# 第2步 import 实物，确认不是死代码（能实例化 + 看默认值）:
+python -c "from unilab... import HeightScanConfig; c=HeightScanConfig(); print(c.enabled, c.measured_points_x)"
+#   -> True [...]  说明默认就开、网格已定义
+# 第3步 读真正的 obs 装配，确认它进 actor 还是 critic（关键！能力存在!=喂给 actor）:
+grep -n "height_scan_obs\|obs_groups_spec\|_height_scan_dim" .../envs/locomotion/go2/rough.py
+#   -> 见 critic = concatenate([..., scan])，obs(actor) 不含 -> 结论:内置但只喂 critic
+\end{codebox}
+
+\textbf{这条链给出的不只是一个事实修正，而是一种纪律}：判断“框架有没有某能力”永远先 \verb|grep| 源码 + \verb|import| 实例化 + 读 obs/reward 装配，而不是凭记忆或旧文档。下文 \cref{sec:rlmc-ql-train-diag} 的 wiring 排查、\cref{sec:rlmc-ql-versions} 的版本核对，用的都是同一套“去装好的库里自己核实”的手段。
+\end{insight}
+
+\subsection{Terrain Curriculum：game-inspired 自动难度}
+\label{sec:rlmc-ql-terrain-curriculum}
+
+地形排成 grid：row 对应 difficulty level，column 对应 terrain type。curriculum 控制环境在 difficulty 轴上的移动——\textbf{不需要手动设切换条件}：
+
+\begin{codebox}[Python]{terrain generator 配置（mjlab 风格）}
+terrain_generator = TerrainGeneratorCfg(
+    size=(8.0, 8.0), border_width=5.0,
+    num_rows=10,                     # 10 个 difficulty levels
+    num_cols=5,                      # 5 种 terrain type
+    curriculum=True,
+    max_init_terrain_level=3,        # 初始最高 level（不从 0 开始可加速）
+    sub_terrains={
+        "flat":   FlatTerrainCfg(proportion=0.2),
+        "rough":  RoughTerrainCfg(proportion=0.3, noise_range=(0.01, 0.06)),
+        "slope":  SlopeTerrainCfg(proportion=0.2, slope_range=(0.0, 0.3)),    # 0~17 deg
+        "stairs": StairsTerrainCfg(proportion=0.2, step_height_range=(0.05, 0.15)),
+        "random": RandomUniformTerrainCfg(proportion=0.1, min_height=-0.05, max_height=0.05),
+    },
+)
+\end{codebox}
+
+curriculum 的工作机制：每个环境 $i$ 有 terrain level $l_i \in \{0,\dots,L-1\}$；episode 结束时算 performance metric（通常是位移距离或平均 tracking reward）；超阈值则 $l_i{+}{+}$（移到更难地形），低于阈值则 $l_i{-}{-}$（退回更简单）。其巧妙之处：不同环境处于不同 level——表现好的提供挑战性样本，表现差的提供基础经验，PPO 在一个 batch 中同时看到不同难度，value function 学会估计不同地形条件下的 expected return。
+
+\begin{insight}[反事实：不用 curriculum 直接在最难地形训练]\label{ins:rlmc-ql-curriculum}
+初始策略完全随机，在高难度地形上 episode 极短（几步就摔或出界），PPO rollout 几乎全是失败经验，reward 信号极稀疏，策略可能长时间突破不了“学会站立”阶段。curriculum 从简单地形起步，给足正信号学会基本步态，再逐步加难。这套 game-inspired terrain curriculum 由 Rudin et al.\ 提出\,\cite{rudin2021minutes}（CoRL 2021，arXiv:2109.11978），原始 $10\times 20$ grid、地形比例 $[0.1,0.1,0.35,0.25,0.2]$；它也是 legged\_gym 的来源——mjlab 与 Isaac Lab 的 terrain curriculum 都可追溯到此。
+\end{insight}
+
+\textbf{真实源码落点}（按 源码引用规范，给文件 + 函数 + 版本，便于精读）：mjlab 的地形等级课程不在 cfg 里而是一个 curriculum 函数——在 \Verb[breaklines]|tasks/velocity/mdp/curriculums.py| 的 \Verb[breaklines]|terrain_levels_vel()|（mjlab core，arXiv:2601.22074 对应版本）按跟踪表现升/降每个 env 的地形难度，配合 \Verb[breaklines]|TerrainGenerator| 的 \Verb[breaklines]|max_init_terrain_level|；指令课程则是同文件的 \Verb[breaklines]|commands_vel()|（含 \verb|VelocityStage| 这一 TypedDict 做分阶段放宽速度范围）。运行日志里 \Verb[breaklines]|Curriculum/command_vel/lin_vel_x_max| 这条曲线就是它在动——\textbf{看这条曲线是否随训练上升，是判断“指令课程有没有真正放宽”的最直接信号}（停滞说明阶段切换阈值没被触发）。Isaac Lab 对应函数是 \Verb[breaklines]|terrain_levels_vel|（\Verb[breaklines]|isaaclab_tasks| 的 velocity mdp，Isaac Lab 2.x），语义相同、命名近似。
+
+\textbf{Isaac Lab 地形类型更多}：除 flat/rough/slope/stairs/random 外，还内置 wave、gap、discrete\_obstacles、stepping\_stones 等。若任务需要 gap 或 stepping stones 等精确脚放置的地形，Isaac Lab 目前是更好选择；mjlab 侧可通过自定义 heightfield 生成器实现，但无内置支持。\verb|proportion| 控制每种地形占的列数比例，总和须为 1.0；\textbf{不要把某种地形的 proportion 设为 0}——训练时完全没见过的地形，部署时遇到会失败。UniLab 侧地形等级由 \Verb[breaklines]|TerrainCurriculumCfg| / \Verb[breaklines]|TerrainSpawnManager|（UniLab \verb|terrains/|）承担，但\textbf{无逐步放宽指令速度的内置课程函数}（\verb|commands_vel| 无对应）；UniLab 的 \Verb[breaklines]|PenaltyCurriculum| 走的是另一条路——按 episode 长度自适应缩放\emph{负权重} reward，而非放宽 command。要在 UniLab 复刻指令课程，需自定义回调分阶段改 \verb|cfg.commands| 的范围。
+
+\begin{pitfall}[UniLab go2 rough 的地形课程默认\emph{关}着——一个真实可教的排查案例]
+\textbf{错误描述}：照本节“game-inspired 自动难度”的预期跑 \Verb[breaklines]|go2_joystick_rough|，等着看 \verb|terrain/level| 随训练上升。\textbf{现象后果}：训练几千 iter，地形难度始终不动，误以为 curriculum 坏了或阈值写错。\textbf{根本原因}：实测 \Verb[breaklines]|conf/ppo/task/go2_joystick_rough/mujoco.yaml| 里 \Verb[breaklines]|terrain_curriculum| 键\emph{虽在}，但 \Verb[breaklines]|enabled: false|，且 \Verb[breaklines]|scene.terrain.generator.curriculum: false|——\textbf{rough owner 自带 curriculum 配置 $\ne$ 默认开启}。\textbf{正确做法}：先 \Verb[breaklines]|grep -n "curriculum" conf/ppo/task/go2_joystick_rough/mujoco.yaml| 确认两个开关的真实取值；要开课程就 Hydra 同时覆盖两处：
+\begin{codebox}[bash]{开启 UniLab 地形课程（两个开关都要打开）}
+uv run train --algo ppo --task go2_joystick_rough --sim mujoco \
+  env.scene.terrain.generator.curriculum=true \
+  env.domain_rand.terrain_curriculum.enabled=true \
+  algo.num_envs=4096 algo.max_iterations=5000
+\end{codebox}
+\textbf{举一反三}：任何“配置项存在但行为没发生”的困惑，第一步都是 \verb|grep| 出该项的\emph{实际默认值}（而非假定 owner 带了就等于开），这与 \cref{ins:rlmc-ql-grepchain} 的“去装好的库里自己核实”是同一纪律。
+\end{pitfall}
+
+\paragraph{常见陷阱（地形与扫描）。}
+
+\begin{pitfall}[ray 打到机器人自身]
+\textbf{错误描述}：\Verb[breaklines]|include_geom_groups| 包含了机器人 body 的 geom group。\textbf{现象后果}：ray 命中腿部，返回异常低的高度值，策略“看到”脚下凭空有障碍。\textbf{根本原因}：raycast 没排除自身几何。\textbf{正确做法}：确认只含 terrain geom 的 group，并启用 \Verb[breaklines]|exclude_parent_body=True|；若机器人碰撞 geom 也在 group 0，要把地形与机器人分到不同 group。
+\end{pitfall}
+
+\begin{pitfall}[改 resolution 后忘记观测维度跟着变]
+\textbf{错误描述}：把 resolution 从 0.1 改成 0.05 却没更新网络输入维度。\textbf{现象后果}：训练报 shape mismatch，或（若维度动态推断）checkpoint 无法加载。\textbf{根本原因}：ray 数随 \eqref{eq:rlmc-ql-rays} 改变直接改观测张量形状。\textbf{正确做法}：改 grid 参数后用 \eqref{eq:rlmc-ql-rays} 重算 ray 数，确认网络输入维度同步。
+\end{pitfall}
+
+\begin{practice}[地形与扫描]
+\begin{enumerate}
+\item （计算）把 grid 的 size 改为 (2.0,1.5)、resolution 保持 0.1 m，用 \eqref{eq:rlmc-ql-rays} 算新 ray 数与观测维度增量。（验收：$21\times 16=336$，比 187 多 149）
+\item （设计）机器人要在宽 30 cm 的窄桥上行走，标准 1.0 m 的 $y$ 范围大部分 ray 落在桥外。你会如何改 scan 配置？
+\item （跨章综合，\cref{ch:rlmc-dr}）设计一种对 height scan 的随机化方案使策略对 scan 噪声鲁棒。你会在什么阶段引入？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{接触传感与足端状态观测}
+\label{sec:rlmc-ql-contact}
+
+\textbf{模块功能}：height scan 提供前馈（proactive）信息“前方地形长什么样”；contact sensor 提供反馈（reactive）信息“脚现在在哪、踩到什么、用了多大力”。两者在 rough task 中互补。
+
+足端状态量\textbf{放在 critic 而非 actor}（理由同 \cref{ins:rlmc-ql-asym}：真机难精确获取足端力，仿真可直接读）：
+
+\begin{codebox}[Python]{critic 额外足端观测（mjlab rough velocity 典型;函数真名取自 mjlab 实测）}
+"foot_height":         ObservationTermCfg(func=foot_height,           # 4 脚足端高度
+                               params={"sensor_name": "foot_height_scan"}),
+"foot_contact_forces": ObservationTermCfg(func=foot_contact_forces,
+                               params={"sensor_name": "feet_contact"}),
+"foot_air_time":       ObservationTermCfg(func=foot_air_time,
+                               params={"sensor_name": "feet_contact"}),
+\end{codebox}
+
+\begin{codebox}[Python]{contact sensor 配置（mjlab vs Isaac Lab——字段名差异大，均取自各自实测）}
+# mjlab:ContactSensorCfg 用 primary/secondary 指定接触对（脚 geom vs 地形 geom），
+#   而非 Isaac 的 prim_path;内置 track_air_time.字段:name/primary/secondary/track_air_time/...
+scene.contact_sensor = ContactSensorCfg(
+    name="feet_contact", primary=("FR","FL","RR","RL"), secondary=("terrain",),
+    track_air_time=True, history_length=0)
+
+# Isaac Lab:ContactSensorCfg 用 prim_path 正则 + track_air_time（自动算每脚空中时间）
+scene.contact_forces = ContactSensorCfg(
+    prim_path="{ENV_REGEX_NS}/Robot/.*",
+    history_length=3, track_air_time=True, update_period=0.0)
+\end{codebox}
+
+UniLab 的接触/足端状态\textbf{不经独立的 \texttt{ContactSensorCfg} 配置类}，而是把传感器写在 MJCF/Motrix 场景里（keyframe \verb|home| + \verb|local_linvel|/\allowbreak\verb|gyro|/\allowbreak\verb|upvector| + 足端接触/位置 sensor），运行时用后端的 \Verb[breaklines]|get_sensor_data(name)| 直接读，再在 \verb|_compute_obs| 里把足端量\emph{只拼进 critic 组}：
+
+\begin{codebox}[Python]{UniLab:足端状态读取 + 只进 critic（go2，UniLab）}
+# 传感器在场景 XML 里声明（src/unilab/assets/robots/go2/scene_flat.xml），运行时后端读:
+linvel  = self.get_local_linvel()                  # 机体系线速度（特权，真机难直测）
+gyro    = self.get_gyro()                           # base_ang_vel（真机可得）
+gravity = self._backend.get_sensor_data("upvector")# projected gravity
+feet_contact = self._backend.get_sensor_data("feet_contact")   # 足端接触（场景 sensor）
+# critic 组追加特权足端/速度量;actor 组不含（对照 ins:rlmc-ql-asym 同一原则）
+critic = np.concatenate([gyro, -gravity, diff, dof_vel,
+                         info["current_actions"], info["commands"],
+                         feet_phase, linvel], axis=1)   # linvel 等特权只进 critic
+\end{codebox}
+
+\textbf{对照解读}：mjlab/Isaac 都用 \Verb[breaklines]|ContactSensorCfg| 做\emph{声明式}接触传感，但限定接触对的字段不同——mjlab 用 \verb|primary|/\allowbreak\verb|secondary| 指定两侧 geom（脚 vs 地形），Isaac 用 \verb|prim_path| 正则（配 \Verb[breaklines]|filter_prim_paths| 限定接触对）；两者都内置 \Verb[breaklines]|track_air_time|。UniLab 则把传感器\textbf{下沉到场景 XML}，Python 侧只 \Verb[breaklines]|get_sensor_data(name)| 取值，接触对过滤由 MJCF 里 sensor 的定义本身承担。足端量“只进 critic 不进 actor”的非对称原则三框架一致（理由同 \cref{ins:rlmc-ql-asym}：真机无精确足端力）。\verb|foot_air_time| 在 UniLab 里由 env 自维护 \Verb[breaklines]|info["feet_air_time"]|（不像 Isaac 的 \Verb[breaklines]|track_air_time=True| 由 sensor 内置自动算），相应的 \Verb[breaklines]|feet_air_time_positive_biped| 等 reward 函数从 \verb|RewardContext| 取该量——又一处“同语义、不同承载层”的差异。
+
+\verb|foot_air_time| 奖励的物理语义：鼓励合理空中时间（通常 0.3--0.5 s）。空中时间为零说明脚一直拖地（能量浪费、易绊倒）；过长（$>0.8$ s）说明步态过夸张（不稳、base 上下摆动大）。它本质是把步态频率限制在合理范围的软约束。
+
+\begin{insight}[反事实：critic 也看不到 foot contact 会怎样]\label{ins:rlmc-ql-nocontact}
+critic 必须仅从本体感知推断足端接触（物理上可能——关节力矩突变通常意味着接触），但信号不如直接读 contact force 清晰，导致 value 估计在 terrain transition 区域（平地到台阶的边缘）不准，PPO 的 advantage 噪声增大。简单地形差异不大，复杂地形上你可能需要 2--3 倍训练 iteration 才能达到相同策略质量。\textbf{这给“rough 比 flat 难训”一个可量化的解释}：不只是地形难，更是 critic 失去了关键的价值评估信号。
+\end{insight}
+
+\paragraph{常见陷阱（接触）。}
+
+\begin{pitfall}[sensor name / geom regex 匹配空集不报错]
+\textbf{错误描述}：\Verb[breaklines]|site_names=("FR","FL","RR","RL")| 但 asset 实际命名为 \verb|FR_foot| 等。\textbf{现象后果}：regex 不匹配，ids 为空列表，sensor/reward 函数收到空 ids 返回\emph{全零张量}，训练继续但该项完全失效。\textbf{根本原因}：命名不精确且空集静默通过。\textbf{正确做法}：zero agent 阶段打印 \verb|entity.data| 确认所有命名；打印 sensor ids 确认非空。
+\end{pitfall}
+
+\begin{practice}[接触传感]
+\begin{enumerate}
+\item （动手）在 zero agent 下打印足端 contact force 张量，确认四只脚着地时数值非零、抬起时为零。（验收：贴一段打印）
+\item （设计）若要在 Isaac Lab 中实现 mjlab 的 \Verb[breaklines]|foot_clearance| 奖励，需要引用什么 sensor？对应配置怎么写？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{RL 配置与 RSL-RL 后端}
+\label{sec:rlmc-ql-rlcfg}
+
+\textbf{模块功能}：rl\_cfg 定义网络结构与 PPO 超参，交给 RSL-RL runner。这里只讲 velocity task 特有的取值理由，PPO 原理见 \cref{ch:rlmc-training}。
+
+\begin{codebox}[Python]{Go1 PPO 配置关键参数与设计意图}
+# 网络（actor/critic 逐层递减）
+actor_hidden_dims  = (512, 256, 128)
+critic_hidden_dims = (512, 256, 128)
+activation   = "elu"      # 比 ReLU 更适合 RL（负区间非零梯度，避免 dead neuron）
+init_noise_std = 1.0      # 初始探索噪声
+# PPO 超参
+clip_param = 0.2          # surrogate clipping
+entropy_coef = 0.01       # 防过早收敛
+num_learning_epochs = 5   # 每 rollout 更新 5 次
+num_mini_batches = 4
+learning_rate = 1e-3
+schedule = "adaptive"     # 基于 KL 自适应
+desired_kl = 0.01
+gamma = 0.99; lam = 0.95  # 折扣 + GAE lambda
+# Runner
+num_steps_per_env = 24    # 每环境收集 24 步
+max_iterations = 10000
+\end{codebox}
+
+\textbf{逐项理由}：(1) ELU 在负区间有非零梯度 $\alpha(e^x-1)$，避免初始策略让大量 neuron“卡死”；(2) \Verb[breaklines]|num_steps_per_env=24| $\times$ 0.02 s/step $\approx$ 0.48 s 的 rollout，覆盖约 1--2 个步态周期——太短则 GAE bootstrap 主导，太长则增内存且跨多个 command 切换周期；(3) adaptive LR：KL 超 \verb|desired_kl| 的 2 倍则 LR 减半，低于 0.5 倍则加倍，保证更新幅度不过大（不稳）也不过小（太慢）。
+
+\begin{insight}[从 legged\_gym 单体类到 Manager-Based 的工程演进]\label{ins:rlmc-ql-evolution}
+上面分离的 env cfg / rl cfg / reward functions 结构不是天然的。\textbf{legged\_gym 时代}（2021--2023，\cite{rudin2021minutes}）把 obs/reward/event 全写在单个 \verb|LeggedRobot| 类里，\Verb[breaklines]|compute_reward()| 调一串内联函数；每加一个机器人就 fork 整个类，改一个权重要在数百行 hardcoded 逻辑里翻找，三个月后不同 fork 严重分叉、bug fix 无法传播。\textbf{Manager-Based 架构}（2024-，Isaac Lab 引入、mjlab 继承）把每个组件拆成独立 \verb|TermCfg|，通过配置组合——如同从“God Class”迁到“Strategy + Factory Pattern”。新增机器人只需写一个 cfg 覆盖 robot-specific 名字，不 fork 任何逻辑。\textbf{工程含义}：读 2021--2023 的论文代码（legged\_gym、walk-these-ways）时不要被 inline reward 吓到——它们的数学公式和 mjlab 的 reward term 完全一样，只是组织方式不同。
+\end{insight}
+
+\begin{note}[新版 RSL-RL 的关键更新（两框架绑定的版本号不同）]
+mjlab 与 Isaac Lab 都用 RSL-RL（PyPI 包名 \verb|rsl-rl-lib|）作 PPO 后端，但\textbf{绑定的版本不同}：Isaac Lab 2.x 在 \Verb[breaklines]|rsl_rl/train.py| 钉 \Verb[breaklines]|RSL_RL_VERSION="3.0.1"|（较新分支为 3.1.2），mjlab 1.4.0 实测装的是 \Verb[breaklines]|rsl-rl-lib 5.4.0|（更激进；本环境 \verb|uv.lock| 实测值，随锁文件可能再漂移）。新版 RSL-RL\,\cite{schwarke2025rslrl}（Schwarke, Mittal, Rudin, Hoeller, Hutter，arXiv:2509.10771）引入：统一的 \verb|MLP|/\allowbreak\verb|CNN|/\allowbreak\verb|RNN| 网络模块（\Verb[breaklines]|rsl_rl.modules|，取代旧的 \verb|ActorCritic| 单体类）、actor/critic 可独立配置（critic 可更大）、内置 student-teacher distillation（\Verb[breaklines]|rsl_rl.algorithms.Distillation|，\cref{ch:rlmc-privileged} 可直接用）、symmetry 数据增强（四足左右对称 swap）与 RND 探索奖励。mjlab 侧把网络配置包成 \Verb[breaklines]|RslRlModelCfg(hidden_dims=(512,256,128), activation="elu")|（actor/critic 各一份）；上面分离写的 \Verb[breaklines]|actor_hidden_dims/critic_hidden_dims| 是其字段的扁平示意。源稿曾把这套新抽象统称为“RSL-RL 4.0”，本书不沿用该标签：经核两框架实际钉的都不是 4.x（Isaac Lab 钉 3.0.1、mjlab 1.4.0 装 5.4.0；PyPI \texttt{rsl-rl-lib} 虽确有 4.0.0/4.0.1 版，但这套统一网络模块 + 蒸馏 + Symmetry + RND 跨多个 4.x/5.x 版本演进，并非某个“4.0”独有），故按论文 \cite{schwarke2025rslrl} 描述功能、按实装版本号给版本。\rebuilt{上述模块的确切字段名（如 \texttt{RslRlModelCfg} 各字段）随版本演进，以你所装 \texttt{rsl-rl-lib} 版本为准。}
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{域随机化在 velocity task 中的落地}
+\label{sec:rlmc-ql-dr}
+
+\cref{ch:rlmc-dr} 讲了 DR 的鲁棒优化视角与四种事件模式；本节只给 velocity task 的\emph{具体}配置与两个高级陷阱。velocity task 的典型 DR：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+Event & 触发模式 & 随机化参数 & 范围 & 目的 \\
+\midrule
+\verb|foot_friction| & startup & 脚底摩擦系数 & [0.5, 1.5] & 鲁棒于地面材质 \\
+\verb|base_com| & startup & 质心偏移 & $[-0.05,0.05]$ m & 鲁棒于负载变化 \\
+\Verb[breaklines]|motor_strength| & startup & $k_p/k_d$ 缩放 & [0.8, 1.2] & 电机个体差异/老化 \\
+\verb|added_mass| & startup & base 质量偏移（scale） & [0.8, 1.2] & 携带不同负载 \\
+\verb|random_push| & interval & 外力扰动 & $[-5,5]$ N & 鲁棒于外部冲击 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[startup DR 像数据增强，interval DR 像对抗训练]\label{ins:rlmc-ql-dr}
+\verb|startup| 事件在 env 创建时执行一次、之后不变——模拟“不同真机的个体差异”（你的 Go1 和别人的 Go1 摩擦不同，但一个 episode 内不突变），类似机器学习的数据增强。\verb|interval| 事件每隔 N 步执行——模拟“运行中的随机扰动”，类似对抗训练。两者鲁棒性目标不同：startup 针对静态参数不确定性，interval 针对动态扰动。
+\end{insight}
+
+\begin{pitfall}[独立随机化 mass 与 inertia 产生非物理惯性]
+\textbf{错误描述}：用 additive 方式独立扰动 link mass 和对角 inertia。\textbf{现象后果}：同一 DR 配置在 Isaac Lab 能跑、在 mjlab 崩——看似框架 bug，实为 DR 参数 bug。\textbf{根本原因}：三个 principal moment 须满足三角不等式 $I_{xx}+I_{yy}\ge I_{zz}$（及循环排列）；独立扰动可能违反。PhysX \emph{silently accept} 非物理惯性（结果不可预测），MuJoCo 则\emph{拒绝加载}或警告。\textbf{正确做法}：用 \verb|scale| 模式而非 \verb|add|——scale 保持惯性矩阵比例关系，不违反三角不等式。Rucker \& Wensing\,\cite{rucker2022pseudoinertia} 的 $4\times 4$ pseudo-inertia 矩阵 + log-Cholesky 参数化可\emph{天然}保证物理一致（详见 \cref{sec:rlmc-dr-inertia}），但 velocity task 用 scale 已足够。
+\end{pitfall}
+
+\begin{codebox}[Python]{安全的 mass 随机化:用 scale 而非 add（Isaac Lab;mjlab 见下文对照）}
+# Isaac Lab:事件项类是 EventTermCfg（常别名 EventTerm），DR 函数 randomize_rigid_body_mass
+add_base_mass = EventTermCfg(
+    func=mdp.randomize_rigid_body_mass, mode="startup",
+    params={"asset_cfg": SceneEntityCfg("robot", body_names="base"),
+            "mass_distribution_params": (0.8, 1.2), "operation": "scale"})  # 不要 "add" 配大范围
+# mjlab 对照:DR 在 mdp/dr/ 包，函数名精简（质量 = dr.body_mass，不是 Isaac 的 randomize_rigid_body_mass），
+#   事件项类是 EventTermCfg(mode=..., func=dr.body_mass, params={"operation":"scale", "ranges":...})
+\end{codebox}
+
+UniLab 的 DR = 任务级 \Verb[breaklines]|DomainRandConfig|（dataclass）+ \Verb[breaklines]|DomainRandomizationManager| + \textbf{后端能力声明}三段。它把 mjlab 的 startup/reset/interval 三模式映射为 init/reset/interval；个体差异（质量/质心/PD 增益）用 reset 项，动态扰动（push）用 interval 项，且\textbf{用乘性 \texttt{*\_multiplier\_range} 保物理一致}（等价 mjlab 的 \Verb[breaklines]|operation="scale"|）：
+
+\begin{codebox}[Python]{UniLab:DR（reset 个体差异 + interval 推扰 + 乘性保物理一致，go2 rough）}
+# 任务级 DomainRandConfig（经 Hydra 注入），UniLab
+# env:
+#   domain_rand:
+#     randomize_base_mass: true       # reset:基座质量偏移（个体差异，~=startup 语义）
+#     added_mass_range: [-1.0, 3.0]
+#     random_com: true                # reset:质心 x 偏移
+#     randomize_kp: true              # reset:PD kp 乘 U(范围)（= motor_strength）
+#     kp_multiplier_range: [0.5, 2.0] # 乘性 -> 不破坏物理一致（对照 mass 用 scale 而非 add）
+#     randomize_kd: true
+#     kd_multiplier_range: [0.5, 2.0]
+#     push_robots: true               # interval:每 push_interval 步施加速度扰动
+#     push_interval: 625
+#     max_force: [1.0, 1.0, 0.5]
+# 机制（dr/manager.py，UniLab）:reset 时 provider.build_reset_plan -> backend.set_state(randomization=);
+#   interval 时 apply_interval_randomization_if_due(step) -> backend.apply_interval_randomization.
+\end{codebox}
+
+\textbf{异构特有的两点（mjlab/Isaac 没有的失败面）}：(1) UniLab 的 DR 受\textbf{后端能力门控}——每个后端经 \Verb[breaklines]|get_dr_capabilities()| 声明支持哪些 reset 项，\Verb[breaklines]|DomainRandomizationManager| 用 \Verb[breaklines]|filter_reset_payload| 自动剔除不支持的项（打 warning 跳过，不报错）。MuJoCo 后端支持 11 项（含 \verb|body_inertia|/\allowbreak\verb|dof_armature|），Motrix 后端基线只 4 项、按能力追加——\textbf{这解释了 go2 flat 的 \texttt{motrix.yaml} 为何显式 \texttt{randomize\_kp/\allowbreak kd: false}}（Motrix 那一版不支持位置执行器增益覆写时会被过滤）。(2) 与本节 \cref{ins:rlmc-ql-dr} 的 startup-vs-interval 二分一致：UniLab 的 reset 项 = startup 式个体差异，interval 项 = 对抗式动态扰动。
+
+\begin{note}[UniLab 无 mjlab 的正定惯量随机化]
+本节陷阱里提到 mjlab 用 Rucker \& Wensing 的 pseudo-inertia + log-Cholesky 参数化\emph{天然}保证物理合法的惯量 DR。\textbf{UniLab 无对应}：其 reset DR 只到 \verb|body_inertia|/\allowbreak\verb|body_ipos|/\allowbreak\verb|body_iquat| 级，\emph{不保证}扰动后惯量正定。所以在 UniLab 上随机化惯量时，仍须自己用乘性缩放回避非物理惯性（或干脆只随机化质量/质心，velocity task 用 scale 模式的 mass DR 已足够）。
+\end{note}
+
+\begin{note}[PhysX 材料桶上限]
+Isaac Lab 的 DR 在随机化 friction/restitution 时可能产生大量 unique materials；PhysX 对每 scene 的 unique materials 有 64\,000 上限。4096 envs $\times$ 多 body $\times$ 不同摩擦值易超限。解法：设 \Verb[breaklines]|num_buckets=250|（或更小），把连续摩擦值离散到 250 个桶共享 material 对象。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{三框架对照：mjlab / Isaac Lab / UniLab}
+\label{sec:rlmc-ql-dualframework}
+
+\textbf{本节解决什么问题}：把前面散落的三框架差异汇总成一张对照表 + 一组对比实验方法，建立“哪些是框架特定实现、哪些是足式 RL 通用模式”的抽象理解。
+
+\subsection{双框架 API 对照表}
+\label{sec:rlmc-ql-dualframework-api}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+概念 & mjlab & Isaac Lab \\
+\midrule
+环境 cfg 基类 & \Verb[breaklines]|ManagerBasedRlEnvCfg| & \Verb[breaklines]|ManagerBasedRLEnvCfg| \\
+机器人定义 & \verb|EntityCfg| + asset zoo & \Verb[breaklines]|ArticulationCfg| + USD asset \\
+场景 & \verb|SceneCfg| & \Verb[breaklines]|InteractiveSceneCfg| \\
+观测组命名 & \verb|actor| / \verb|critic| & \verb|policy| / \verb|critic| \\
+奖励项 & \verb|RewardTermCfg| & \verb|RewTerm| \\
+地形 & \Verb[breaklines]|TerrainEntityCfg| + generator & \Verb[breaklines]|TerrainImporterCfg| + generator \\
+Raycast & \Verb[breaklines]|RayCastSensorCfg| & \verb|RayCasterCfg| \\
+command 名 & \verb|"twist"| & \Verb[breaklines]|"base_velocity"| \\
+注册方式 & \Verb[breaklines]|register_mjlab_task()| & \Verb[breaklines]|gymnasium.register()| \\
+RL 后端 & RSL-RL（唯一） & RSL-RL / RL-Games / SKRL \\
+训练命令 & \Verb[breaklines]|uv run train <id>| & \Verb[breaklines]|.../rsl_rl/train.py --task <id>| \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[同一故事的两个译本]\label{ins:rlmc-ql-translation}
+mjlab 与 Isaac Lab 的 velocity task，关系如同一部小说的两个翻译版本——故事情节（MDP 结构）相同，但措辞（API 命名）与细节（默认参数）不同。\textbf{理解故事（通用设计模式）比记忆措辞（特定 API）更重要}。跨框架迁移不是逐 API 替换，而是理解“这个 reward 奖励什么物理行为”后在新框架重新表达。直接复制 mjlab 的 reward 函数到 Isaac Lab 不会工作，因为 tensor 布局、sensor 接口、归一化约定可能不同；但若理解了语义，重新实现就很直接。
+\end{insight}
+
+\subsection{env.step 执行顺序与 RSL-RL wrapper}
+\label{sec:rlmc-ql-dualframework-step}
+
+理解 \verb|env.step| 内部顺序是跨框架调试的关键。mjlab 的关键顺序：termination 与 reward 在 reset \emph{之前}算（用当前 step 状态）；reset 之后 \verb|sim.forward()| 刷新派生量；sensor 更新（含 raycast）在 observation 计算\emph{之前}；command 更新也在 observation 之前（因 obs 含 command）。Isaac Lab 大致相同但 event 触发时机等细节有别——若同样配置在一个框架正常、另一个异常，step 顺序差异可能是原因。
+
+两框架都通过 wrapper 把 Manager-Based env 转成 RSL-RL 接口，核心是 terminated/truncated 到 dones/time\_outs 的转换：
+
+\begin{codebox}[Python]{RSL-RL wrapper 的核心转换（两框架同理）}
+dones = terminated | truncated
+extras["time_outs"] = truncated & ~terminated   # 仅 timeout 需 bootstrap
+\end{codebox}
+
+\verb|time_outs| 的语义至关重要：它告诉 RSL-RL 哪些 done 是 timeout（episode 本可继续、需 bootstrap），哪些是真终止（不 bootstrap）。若把 timeout 当 terminal，value function 在 episode 末端下偏（见 \cref{sec:rlmc-train-wrapper}）。wrapper 还负责把多个观测组拼成连续 tensor——\textbf{若 observation term 顺序在两次训练间改变（如插入新 term），拼接后的 tensor 布局会变，已有 checkpoint 无法加载}，这是常见但易忽略的 breaking change。
+
+\subsection{双框架对比实验设计}
+\label{sec:rlmc-ql-dualframework-exp}
+
+双框架对比的目标\textbf{不是判定“哪个更好”，而是理解差异来源}。公平对比需控制变量（同一 Go2、相同 velocity 目标、都用 RSL-RL PPO、对齐超参、都 4096 envs、各跑 3 seed），并接受以下\emph{框架固有}差异：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+差异源 & mjlab & Isaac Lab & 对训练的影响 \\
+\midrule
+物理引擎 & MuJoCo Warp（凸优化接触） & PhysX（TGS 迭代） & 接触响应/穿透不同 \\
+接触模型 & soft contact + cone & rigid + pyramid 近似 & 摩擦力计算有别 \\
+模型格式 & MJCF（原生） & USD（URDF 转换） & 惯性/阻尼可能有舍入差 \\
+physics\_dt 默认 & 约 0.005 s & 可能不同 & 影响 control\_dt 与奖励值 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{codebox}[bash]{对比实验:Go2 flat 各跑 3 seed（mjlab 侧用 unitree\_rl\_mjlab，因 core 无 Go2）}
+# mjlab core 只内置 Go1/G1（无 Go2，见前文 note）;要在 mjlab 侧拿 Go2 做对比，
+# 走 Unitree 官方生态项目 unitree_rl_mjlab（CLI 是 python scripts/train.py，非 uv run train）:
+for seed in 42 123 456; do
+  python scripts/train.py Unitree-Go2-Flat \
+    --env.scene.num-envs 4096 --agent.max-iterations 5000 \
+    --agent.seed ${seed} --agent.run-name go2_flat_mjlab_seed${seed}
+done
+\end{codebox}
+
+\begin{codebox}[bash]{对比实验:Go2 flat 各跑 3 seed（Isaac Lab）}
+for seed in 42 123 456; do
+  ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+    --task Isaac-Velocity-Flat-Unitree-Go2-v0 \
+    --num_envs 4096 --max_iterations 5000 --headless \
+    --seed ${seed} --run_name go2_flat_isaaclab_seed${seed}
+done
+\end{codebox}
+
+\begin{insight}[本质：跨框架 gap 与 sim-to-real gap 是同一类问题]\label{ins:rlmc-ql-crossgap}
+双框架对比的价值不在证明“A 比 B 好”，而在建立对“物理差异如何传导到策略行为”的直觉。\textbf{若两框架在同一任务上训出行为差异明显的策略，差异来源几乎一定是物理引擎的接触模型}，而非 RL 算法或 reward 设计。这种直觉对 sim-to-real 至关重要：sim-to-real gap 的根源和跨框架 gap 是同一类问题。一种更深入的方法是 sim-to-sim 交叉验证——在框架 A 训练、导出 ONNX、在框架 B play；若 A 好 B 崩，说明策略过拟合了 A 的物理特性，真机大概率也不行。humanoid-gym（Gu et al.\ RSS 2024）把 Isaac Gym$\to$MuJoCo 的 sim-to-sim 验证作为公开工程流程推广；DR（\cref{ch:rlmc-dr}）的目的之一就是降低这种过拟合。
+\end{insight}
+
+UniLab 加入对比时\textbf{多了一条正交轴}：它把物理仿真放在 \textbf{CPU}（MuJoCoUni / MotrixSim 多线程批量步进），策略学习放在 \textbf{GPU}（独立进程），二者经\textbf{共享内存 IPC} 解耦——与 mjlab/Isaac 的“GPU 仿真主导”范式不在同一坐标。所以三框架对比不只是“同一 MDP 的三个译本”，还多出“仿真在 CPU 还是 GPU”这一维：
+
+\begin{codebox}[bash]{对比实验:Go2 flat 各跑 3 seed（UniLab，CPU 仿真 + GPU 学习）}
+for seed in 42 123 456; do
+  uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num-envs=4096 algo.max-iterations=5000 \
+    algo.seed=${seed} training.run-name=go2_flat_unilab_seed${seed}
+done
+# UniLab 还可换 motrix 后端做第二条物理基线（同任务 --sim motrix），
+# 或用 --algo appo 看异步 collector-learner 的吞吐（CPU 核越多优势越明显）.
+\end{codebox}
+
+\textbf{三框架物理/运行时差异（在 \cref{sec:rlmc-ql-dualframework-exp} 两引擎对照表上再加 UniLab 列）}：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{4.0cm}p{4.0cm}@{}}
+\toprule
+差异源 & mjlab / Isaac Lab & UniLab \\
+\midrule
+仿真位置 & GPU（同进程） & CPU 多线程（独立 collector 进程） \\
+物理后端 & MuJoCo Warp / PhysX & MuJoCoUni / MotrixSim（CPU 全精度接触） \\
+解耦方式 & 同进程、无 IPC & spawn 多进程 + 共享内存 IPC \\
+加速核心 & CUDA-graph capture & 多进程并行 + CPU$\to$GPU H2D 流水线重叠 \\
+新增失败面 & 显存 OOM & \verb|/dev/shm| 共享内存预算（超 80\% 直接 \verb|MemoryError|） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[第三框架把“跨框架 gap”从两维扩成三维]\label{ins:rlmc-ql-cputhird}
+\cref{ins:rlmc-ql-crossgap} 说“两框架行为差异几乎一定来自接触模型”。引入 UniLab 后多了一层：UniLab 的接触求解在 \textbf{CPU 全精度}（不做 GPU 并行近似），其 MuJoCoUni 与 mjlab 的 MuJoCo Warp\emph{同源不同执行}（CPU vs GPU 内核），Motrix 又是另一套接触求解。所以 UniLab$\leftrightarrow$mjlab 的 gap 里，既有“CPU vs GPU 数值路径”也有“求解器实现”两重；而 UniLab 内部 MuJoCo$\leftrightarrow$Motrix 的 gap 正是 UniLab 内建 \textbf{sim2sim 契约校验}（迁移策略到另一后端前强制比对决定行为的字段，不一致即报错）要管的问题——这恰好把 \cref{ins:rlmc-ql-crossgap} 的“sim-to-sim 交叉验证”做成了框架一等公民。三框架对比的真正价值，是让你在\emph{三种不同的物理执行路径}上看同一策略，从而对“哪些行为是物理偶然、哪些是任务必然”建立更强的直觉。
+\end{insight}
+
+\paragraph{常见陷阱（对比）。}
+
+\begin{pitfall}[只用 1 个 seed 对比]
+\textbf{错误描述}：单 seed 比较两框架最终 reward。\textbf{现象后果}：被随机噪声淹没，结论不可靠（同配置不同 seed 的 tracking reward 可差 20\%）。\textbf{根本原因}：RL 训练随机性大。\textbf{正确做法}：至少 3 seed，报告 mean $\pm$ std；必要时算 Cohen's d 判断效应量（$d<0.2$ 差异微小，$d>0.8$ 差异大）。
+\end{pitfall}
+
+\begin{pitfall}[Go2 的 MJCF 与 USD 物理参数不一致]
+\textbf{错误描述}：直接对比 MuJoCo Menagerie 的 MJCF 与 URDF 转的 USD。\textbf{现象后果}：惯性/阻尼/碰撞几何有微妙差异，对比不公平。\textbf{根本原因}：两种模型来源不同。\textbf{正确做法}：对比前先核对关键物理参数（质量、惯性、关节阻尼、碰撞几何）一致。
+\end{pitfall}
+
+\begin{practice}[三框架对比]
+\begin{enumerate}
+\item （实验设计）设计 Go2 flat 的双框架对比：用同一组 command 序列评估两策略的 tracking error。需控制哪些变量？如何保证评估公平？
+\item （分析）若两策略在平地行为相似、在 stairs 上差异明显，最可能的原因是什么？从物理引擎角度分析。
+\item （跨章综合，\cref{ch:rlmc-physics}+\cref{ch:rlmc-dr}）为什么 DR 能在一定程度上弥补两引擎的差异？若 DR 范围覆盖了两引擎的行为差异区间，训出的策略能否同时在两引擎表现良好？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{完整训练流程与分阶段验证}
+\label{sec:rlmc-ql-train}
+
+\textbf{本节解决什么问题}：给出从 zero agent 到 large train 的分阶段验证方法——四足 velocity 最隐蔽的失败不是算法 bug，而是 task wiring 错误。
+
+\subsection{为什么分阶段}
+\label{sec:rlmc-ql-train-why}
+
+wiring 错误（sensor name 拼错、observation term 缺失、reward 权重符号错）的共同特点是：局部看都合理，环境能启动，PPO 能训练，loss 在下降，但策略\emph{永远学不会走}。分阶段验证能在 5 分钟内暴露 90\% 的 wiring 错误，避免浪费数小时 GPU。这与软件工程的测试金字塔同构：先单元测试（zero agent），再集成测试（small train），最后端到端（large train）。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+阶段 & 时间 & 目的 & 不应期待 & 通过标准 \\
+\midrule
+zero & 约 10 s & 验证 wiring & 会走 & 不 crash、无 NaN、能站 \\
+random & 约 10 s & 验证动作范围 & 稳定 & reset 正常、不飞出 \\
+small train & 约 2 min & 验证接口 & reward 上升 & 日志完整、无 shape error \\
+large train & 约 1 h & 验证策略 & 立刻收敛 & 视频与指标一致 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{codebox}[bash]{四阶段命令（mjlab，flat 为例）}
+# 阶段0:确认 task id 存在
+uv run train --help          # 列出全部 task id（务必以此为准）
+# 阶段1:zero agent —— 机器人应以默认姿态站住几秒
+uv run play Mjlab-Velocity-Flat-Unitree-Go1 --agent zero --num-envs 4 --viewer viser
+# 阶段2:random agent —— 剧烈乱动但不飞出场景
+uv run play Mjlab-Velocity-Flat-Unitree-Go1 --agent random --num-envs 4 --viewer viser
+# 阶段3:small train（50 iter，256 envs）—— 只验证接口
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+  --env.scene.num-envs 256 --agent.max-iterations 50 --agent.logger tensorboard
+# 阶段4:large train（4096 envs）—— flat 约 1000-2000 iter 后 tracking 明显上升
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 \
+  --env.scene.num-envs 4096 --agent.max-iterations 5000 --agent.run-name go1_flat_baseline
+\end{codebox}
+
+\begin{codebox}[bash]{四阶段命令（Isaac Lab，注意参数名差异）}
+# zero/random:play.py 加空 checkpoint
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0 --num_envs 4
+# small train
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0 --num_envs 256 --max_iterations 50 --headless
+\end{codebox}
+
+UniLab 的四阶段\textbf{结构相同、入口不同}：它\emph{没有} zero/random agent CLI，所以 zero/random 两阶段用“极短训练 + \verb|no_play|”代偿，small/large 与前两框架对齐（env 数与迭代数走 Hydra 覆盖）：
+
+\begin{codebox}[bash]{四阶段命令（UniLab，注意无 zero/random agent）}
+# 阶段0:列出可用任务/字段（以 --help 与 conf/ 为准）
+uv run train --help
+# 阶段1+2:UniLab 无 zero/random agent —— 用极短训练 + no_play 代偿
+#   通过标准:跑满若干 iter、EXIT=0、reward/* 日志正常、无 NaN（NanGuard 默认开）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+  algo.num-envs=64 algo.max-iterations=3 training.no-play=true
+# 阶段3:small train（256 env、50 iter）—— 只验证接口（日志完整、无 shape error）
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+  algo.num-envs=256 algo.max-iterations=50
+# 阶段4:large train（4096 env）—— flat 约数千 iter 后 tracking 明显上升
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+  algo.num-envs=4096 algo.max-iterations=5000 training.run-name=go2_flat_unilab
+# 回放/导出 ONNX 在 eval 阶段（PPO 的 ONNX 在 play/eval 才导，no_play 时不导）:
+uv run eval --algo ppo --task go2_joystick_flat --sim mujoco --load-run -1 --render-mode record
+\end{codebox}
+
+\textbf{对照解读}：mjlab/Isaac 的 zero agent 直接给“机器人站住”的物理 sanity check；UniLab 缺这一入口，于是“能站不能站”要等 large train 出策略后用 \verb|eval| 回放看（或自己加一段 zero-action 脚本）。但 UniLab 多给一道\textbf{异构特有的体检}：NaN 守卫（\verb|NanGuard|，默认开）会在动作/观测/奖励出现非有限值时 \verb|dump| 出事前若干帧，事后 \Verb[breaklines]|unilab-viz-nan <dump>| 离线复现——这是 CPU 仿真子进程“静默死亡”最实用的排查手段，mjlab/Isaac 单进程 GPU 仿真没有等价机制。\rebuilt{Hydra 覆盖键 \texttt{algo.\allowbreak num\_envs}/\allowbreak\texttt{algo.\allowbreak num-envs}、\texttt{training.\allowbreak no\_play}/\allowbreak\texttt{training.\allowbreak no-play} 的连字符写法随版本（实测安装版走下划线），以实际 \texttt{conf/} 字段为准。}
+
+\begin{pitfall}[train 与 play 的 num\_envs 参数位置不同]
+\textbf{错误描述}：mjlab train 用 \Verb[breaklines]|--env.scene.num-envs|，play 用 \verb|--num-envs|，混用。\textbf{现象后果}：CLI 解析失败或静默用默认值（如 4096 把内存撑爆）。\textbf{根本原因}：两个子命令的参数命名空间不同。\textbf{正确做法}：train 用 \Verb[breaklines]|--env.scene.num-envs|，play 用 \verb|--num-envs|；Isaac Lab 统一 \verb|--num_envs|。
+\end{pitfall}
+
+\begin{pitfall}[small train reward 不升就以为是 bug]
+\textbf{错误描述}：50 iter $\times$ 256 envs $\times$ 24 steps $\approx$ 30.7 万 steps 后看 reward 没涨，判定有 bug。\textbf{现象后果}：浪费时间查不存在的 bug。\textbf{根本原因}：四足策略通常需数千万 steps 才开始学会基本步态；small train 只验证接口不验证效果。\textbf{正确做法}：small train 只看“日志完整、无 shape error”，效果留给 large train。
+\end{pitfall}
+
+\subsection{“策略不走”的系统排查}
+\label{sec:rlmc-ql-train-diag}
+
+四足 RL 最常见的问题：训了 5000 iter，reward 缓慢上升但策略只会站着抖。按下面顺序排查（80\% 的问题在 Step 1--2 定位）：
+
+\begin{codebox}{“策略不走”系统排查流程}
+Step 1:确认 command obs 存在
+  -> 打印 actor obs group，确认有 command term;打印 command 值非全零
+Step 2:确认 tracking reward 有信号
+  -> 看 tensorboard:mjlab 实测字段是 Episode_Reward/track_linear_velocity
+     （非泛化的 reward/track_*），跟踪误差则在 Metrics/twist/error_vel_xy;为零 -> command source 与 tracking 不匹配
+Step 3:确认 action 有效
+  -> play 时打印 action 的均值/标准差;std 近零 -> entropy 坍塌;mean 非零但不动 -> scale 太小或 kp 太低
+Step 4:确认 reward balance
+  -> 打印所有 reward term 初值;某惩罚量级远大于 tracking -> 策略“不动”避罚
+  -> 临时关全部惩罚，确认只有 tracking 时能走
+Step 5:确认物理
+  -> zero agent 看默认姿态是否稳定;random agent 看 action 范围是否合理
+\end{codebox}
+
+\textbf{训练日志阅读}（large train 关注的关键指标）：
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+指标 & 健康范围 & 异常信号 \\
+\midrule
+\verb|reward/total| & 持续上升 & 平坦/下降 $\to$ 查 reward 配置 \\
+\Verb[breaklines]|reward/track_linear_velocity| & 占总 reward 主要比例 & 接近零 $\to$ command obs 缺失 \\
+\verb|policy/kl| & 0.005--0.02 & $>0.05$ $\to$ 降 LR \\
+\Verb[breaklines]|policy/entropy| & 缓慢下降 & 快速坍塌 $\to$ 增大 entropy\_coef \\
+\Verb[breaklines]|episode/length| & 逐渐增长 & 极短 $\to$ termination 过严 \\
+\verb|terrain/level| & 逐渐上升 & 停滞 $\to$ curriculum 阈值过高 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{note}[上表是\emph{语义}名，去对真实日志要换成各框架的实际字段名]
+\textbf{各框架的 TensorBoard/WandB 字段名不统一}，上表用的是跨框架通用语义；拿它去找真实输出前，先对上号，否则会“照表找字段却扑空”。mjlab 1.4.0 实测 Go1 的真实字段是：总回报 \Verb[breaklines]|Episode_Reward/<term 之和>|（\verb|reward/total| 对应处）、线速度跟踪 \Verb[breaklines]|Episode_Reward/track_linear_velocity|（不是 \Verb[breaklines]|reward/track_linear_velocity|）、跟踪误差 \Verb[breaklines]|Metrics/twist/error_vel_xy|、指令课程 \Verb[breaklines]|Curriculum/command_vel/lin_vel_x_max|（看这条是否上升 = 指令课程有没有真放宽）、地形课程 \Verb[breaklines]|Curriculum/terrain_levels/{mean,max}|（对应 \verb|terrain/level|）、终止分布 \Verb[breaklines]|Episode_Termination/{time_out,fell_over}|（对应 \Verb[breaklines]|episode/length| 极短的归因）。\textbf{特别注意 KL}：mjlab 每迭代的\emph{终端摘要里根本不打印} \verb|kl|（adaptive LR 在内部按 \verb|desired_kl| 调 LR，但不外显），要看 KL 必须开 WandB/TensorBoard——所以 \verb|policy/kl| 这一行别在终端里找。\textbf{自己核字段名的通法}：训练起来后直接看第一屏打印的 term 表，或 \Verb[breaklines]|tensorboard --logdir logs/| 展开 scalar 树，照真实树里的名字对号入座，而不是背本表。
+\end{note}
+
+\subsection{超越 total reward 的评估}
+\label{sec:rlmc-ql-train-eval}
+
+total reward 是优化目标，但不是策略质量的唯一衡量——一个 total reward 高的策略可能 reward hacking（真机不可用），一个中等的可能更鲁棒。评估 velocity 策略应看完整指标体系：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+指标 & 计算 & 合格范围（Go1 flat） & 测量对象 \\
+\midrule
+Tracking error & $\lVert \mathbf{v}-\mathbf{v}^{\text{cmd}}\rVert$ 的 episode 均值 & $<0.15$ m/s & 任务完成度 \\
+Angular tracking error & $\lvert \omega-\omega^{\text{cmd}}\rvert$ 均值 & $<0.2$ rad/s & 转弯精度 \\
+Fall rate & 非 timeout 终止比例 & $<5\%$ (flat), $<15\%$ (rough) & 安全性 \\
+Episode length & 平均持续步数 & $>800$ (flat), $>500$ (rough) & 存活能力 \\
+CoT & Energy / (mass $\times$ g $\times$ distance) & $<2.0$ & 归一化效率 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+CoT（Cost of Transport）衡量行走效率：人类步行约 0.2，传统控制四足 1.5--5.0，最优 RL 四足（ANYmal）约 0.43。CoT 通常不直接作 reward（需积分），但是好的评估指标——若 CoT $>5.0$ 说明动作效率极低，通常意味着 action rate 或 torque 惩罚不够。
+
+\begin{pitfall}[只看 tensorboard 曲线不看视频]
+\textbf{错误描述}：reward 上升就认为训练正确。\textbf{现象后果}：策略学到 hack（利用 simulator 接触 bug 刷 reward），视频里步态怪异。\textbf{根本原因}：PPO loss 下降只说明在\emph{当前}reward 信号下改善了；若信号本身错（某 term 因 sensor 名拼错为零），策略只是在最小化其他项。\textbf{正确做法}：每隔约 1000 iter 看一次 play 视频做 sanity check。
+\end{pitfall}
+
+\subsection{reward ablation 方法}
+\label{sec:rlmc-ql-train-ablation}
+
+理解各 reward 项实际作用最可靠的方法是 ablation——每次关一个 term，观察行为变化：
+
+\begin{codebox}[bash]{reward ablation（mjlab，关一个 term）}
+# baseline
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 --env.scene.num-envs 4096 \
+  --agent.max-iterations 3000 --agent.run-name go1_flat_baseline
+# 关闭 foot_slip
+uv run train Mjlab-Velocity-Flat-Unitree-Go1 --env.scene.num-envs 4096 \
+  --agent.max-iterations 3000 --env.rewards.foot_slip.weight 0.0 \
+  --agent.run-name go1_flat_no_slip
+\end{codebox}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+关闭的 term & 典型行为变化 & 解释 \\
+\midrule
+foot\_slip & 更激进，脚在地上打滑 & 无滑动惩罚，用更大力推进 \\
+foot\_clearance & 拖脚步态 & 不被惩罚抬脚不够高 \\
+pose & 关节扭曲但 tracking 可能更好 & 更大自由度有时利于速度跟踪 \\
+action\_rate\_l2 & 高频抖动 & 无平滑约束，用高频振荡增益 \\
+upright & 基座倾斜但不一定摔 & 倾斜可降风阻（物理正确但不美观） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{insight}[关闭 penalty 后 tracking 反升，不代表该 penalty 有害]\label{ins:rlmc-ql-ablation}
+ablation 可能显示关掉某 penalty 后 tracking reward 反而上升——但这\emph{不}意味着该 penalty 该删。策略可能通过“打滑前进”获得更高 tracking 分，但这种行为在真机上不可行。\textbf{reward 设计的目标不是最大化 tracking accuracy，而是在 tracking 与 behavior quality 间取平衡}。所以 ablation 必须看多维指标（tracking / length / jerk / 视觉），不能只看总 reward。这与药物临床试验的对照组同理：光看整体效果不够，要看多维终点。每组至少 3 seed——同配置不同 seed 的最终 reward 可差 20\%，3 seed 的 mean$\pm$std 才能可靠判断“关掉某 term 是否真有影响”。
+\end{insight}
+
+\subsection{command curriculum 与零速处理}
+\label{sec:rlmc-ql-train-cmdcurr}
+
+command curriculum 随训练逐步扩大命令范围（\cref{ch:rlmc-reward} 讲了 curriculum 的通用原理）。注意 \verb|lin_vel_x| 上限增长比下限快——前进比后退更重要也更易学。一个易忽略的细节是\textbf{零速命令的特殊处理}：当采样到的 command 三个分量绝对值都很小时置零：
+
+\begin{codebox}[Python]{零速命令置零（概念性）}
+cmd = sample_uniform(cmd_ranges)
+if abs(cmd[0]) < 0.1 and abs(cmd[1]) < 0.1 and abs(cmd[2]) < 0.2:
+    cmd = [0.0, 0.0, 0.0]      # 机器人无法精确跟踪 0.05 m/s，且该区域 reward 对噪声极敏感
+\end{codebox}
+
+置零后策略学到明确的“站立不动”行为，比学一个“几乎不动”的模糊行为更有实际价值。\Verb[breaklines]|resampling_time_range=(3.0, 8.0)| 表示每 3--8 秒重采样一次 command——太频繁（$<1$ s）让策略学不稳步态，太慢（$>15$ s）降低 command 多样性。
+
+\paragraph{调参优先级。}调参应从任务级开始、RL 超参最后调：(1) 检查 wiring（zero/random）；(2) 调 terrain difficulty 与 command range；(3) 调 reward 权重与 penalty 强度；(4) 调 episode length 与 termination；(5) 最后调 PPO 超参（lr/clip/epochs/entropy）。逻辑是：MDP 定义决定学习问题的\emph{结构}，PPO 超参只决定优化\emph{效率}；若 MDP 有问题，调 PPO 永远修不好。
+
+\begin{practice}[训练流程]
+\begin{enumerate}
+\item （实践）依次执行 zero $\to$ random $\to$ small train（flat 与 rough 各一次），记录每步是否通过；遇报错按 \cref{sec:rlmc-ql-train-diag} 排查。
+\item （ablation）选 flat task，关闭 foot\_slip / action\_rate\_l2 / pose 各一组（加 baseline 共 4 次）各 3000 iter，用表格记录最终 tracking reward、平均 episode length、肉眼步态差异。
+\item （跨章综合，\cref{ch:rlmc-training}+\cref{ch:rlmc-dr}）GAE 的 $\lambda$ 与 $\gamma$ 如何影响 velocity 训练？把 $\gamma$ 从 0.99 降到 0.95，策略更关注短期还是长期 reward？若同时降 $\gamma$ 并加大 DR，两者交互效应是什么？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{跨机器人配置与部署闭环}
+\label{sec:rlmc-ql-multirobot}
+
+\textbf{本节解决什么问题}：通过精读两个生态项目，学习“同一 env cfg 适配多款机器人”的工程模式，并理解训练到真机的完整路径。
+
+\subsection{unitree\_rl\_mjlab：共享 base cfg + robot override}
+\label{sec:rlmc-ql-multirobot-unitree}
+
+unitree\_rl\_mjlab（\Verb[breaklines]|github.com/unitreerobotics/unitree_rl_mjlab|）是 Unitree 官方维护的 mjlab 生态项目，展示如何为旗下多款机器人配置统一管线。\textbf{经核：它支持 Go2/A2/As2/G1/R1/H1\_2/H2——不含 Go1}（与本章 mjlab 主线用的 core Go1 不同），且 CLI 是 \Verb[breaklines]|python scripts/train.py <Task>|（task 名如 \Verb[breaklines]|Unitree-Go2-Flat|），不是 \Verb[breaklines]|uv run train|：
+
+\begin{codebox}[bash]{unitree\_rl\_mjlab 训练命令（注意与 mjlab core 不同）}
+# 四足 velocity（Go2，非 Go1）
+python scripts/train.py Unitree-Go2-Flat --env.scene.num-envs 4096
+# 人形 velocity
+python scripts/train.py Unitree-G1-Flat --env.scene.num-envs 4096
+\end{codebox}
+
+其核心设计——共享 base cfg + robot-specific override：
+
+\begin{codebox}{共享 env cfg 的目录结构}
+velocity_env_cfg.py        # robot-agnostic base cfg（共享:全部 manager 骨架）
+|-- go2/env_cfgs.py        # Go2 specific override
+|-- a2/env_cfgs.py         # A2 specific override
+|-- g1/env_cfgs.py         # G1 specific override
++-- ...
+\end{codebox}
+
+robot-specific cfg 只做三件事：(1) 指定 Entity（MJCF、default pose、action scale）；(2) 填入 site/body/geom 名字（base body、foot sites、contact geoms）；(3) 调 robot-specific 参数（episode length、command range、reward weights）。好处是新增机器人只需约 100 行 override，不复制整个 env cfg；代价是要理解 base cfg 的所有“空槽”。
+
+\begin{insight}[反事实：不用共享 base cfg，每个机器人复制完整 cfg]\label{ins:rlmc-ql-sharecfg}
+假设你修了 Go1 cfg 的一个 reward bug。若 Go2/A2/G1 各有独立完整 cfg，你得在每个文件做相同修改——容易漏改，一个月后不同机器人的 cfg 开始分叉。\textbf{共享 base cfg 确保 bug fix 和改进传播到所有机器人}——这正是 \cref{ins:rlmc-ql-evolution} 中“从单体类到 Manager-Based”演进的同一动机在“多机器人”维度的体现。
+\end{insight}
+
+\subsection{从 Go1 到 Go2：至少 6 类参数要改}
+\label{sec:rlmc-ql-multirobot-migrate}
+
+“换机器人只需改 asset 路径”是最危险的误区。Go1$\to$Go2 至少 6 类参数要逐一确认：
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+参数 & Go1 & Go2 & 迁移影响 \\
+\midrule
+总质量 & 约 12 kg & 约 15 kg & reward 中力/力矩量级变 \\
+腿长 & 约 0.2 m & 约 0.23 m & 默认站高、clearance 阈值需调 \\
+hip 关节范围 & 约 $[-0.86,0.86]$ & 约 $[-1.05,1.05]$ & action scale 需重算 \\
+base body 名 & \verb|trunk| & \verb|base_link| & terrain scan / gravity frame \\
+foot site 前缀 & \verb|FR|/\allowbreak\verb|FL|/\allowbreak\verb|RR|/\allowbreak\verb|RL| & 可能 \verb|FR_foot| 等 & 所有引用 foot site 的 obs/reward \\
+$k_p/k_d$ & 40 / 1 & 依模型 & 直接影响 PD 响应 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+（整机质量已对官方规格：Go1 约 12\,kg、Go2 约 15\,kg（含电池）。）\rebuilt{上述 Go1/Go2 的腿长、关节范围为典型量级，精确值以具体 MJCF/USD 为准。}添加新机器人前，务必用 \cref{sec:rlmc-ql-action-scale} 的脚本提取关节限位，并用类似代码遍历 body/site/geom 名字。
+
+\subsection{basic-locomotion-isaaclab 对照}
+\label{sec:rlmc-ql-multirobot-basic}
+
+Isaac Lab 生态中，basic-locomotion-isaaclab（\Verb[breaklines]|github.com/iit-DLSLab/basic-locomotion-isaaclab|，IIT DLS Lab）展示类似多机器人模式，但功能更丰富：支持 Go2/B2/Aliengo/ANYmal-C，区分 electric vs hydraulic actuator；提供 25+ reward terms（含独立的 \verb|ground_impact| 着地冲击、区分 \verb|feet_slip| 与 \verb|feet_slide|）；内置 DAgger 蒸馏脚本（teacher 用特权 height scan、student 用 proprioceptive history，对应 \cref{ch:rlmc-privileged}）；集成 Quadruped-PyMPC 做 RL vs MPC 对比；集成 muse state estimator 提供部署时的 base velocity 估计（对应 \cref{sec:rlmc-ql-obs-priv} 的“base\_lin\_vel 为何特权”）。
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & unitree\_rl\_mjlab & basic-locomotion-isaaclab \\
+\midrule
+框架 & mjlab & Isaac Lab \\
+共享 base cfg 方式 & Python 函数 + override dict & Python class 继承 \\
+Reward 数量 & 约 10 terms & 25+ terms \\
+部署支持 & ONNX + C++ FSM & ONNX + ROS2 \\
+蒸馏 & 无（需手动） & DAgger script 内置 \\
+MPC 对比 & 无 & Quadruped-PyMPC 集成 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{选型建议}：想快速跑通并理解配置，unitree\_rl\_mjlab 更轻量；要做系统性 reward 研究、teacher-student 蒸馏、或 RL vs MPC 对比，basic-locomotion-isaaclab 工具链更全。两者可互补：mjlab 快速迭代配置，Isaac Lab 做精细评估。
+
+\subsection{部署闭环（预告）}
+\label{sec:rlmc-ql-multirobot-deploy}
+
+虽然 sim-to-real 细节在后续部署章，但精读代码时理解完整路径有助于把握每个模块的最终目的：
+
+\begin{codebox}{训练到真机的闭环（unitree\_rl\_mjlab）}
+mjlab 训练 (GPU, 4096 envs, ~2h)
+  -> 自动 ONNX 导出 (policy.onnx + policy.onnx.data，仅 actor 网络)
+  -> C++ onnxruntime 推理 (50 Hz, Jetson Orin NX)
+  -> Unitree SDK2 (DDS over Ethernet, 500 Hz)
+  -> 真机 PD 控制器 (joint position target -> motor torque)
+\end{codebox}
+
+部署端用有限状态机管理启动序列：\Verb[breaklines]|State_Passive -> State_FixStand -> State_RLBase|。\Verb[breaklines]|State_FixStand| 用纯 PD 把关节从当前位置平滑过渡到 default pose（训练时 \Verb[breaklines]|use_default_offset=True| 对应的姿态），约 2--3 秒；若跳过它直接进 \verb|State_RLBase|，RL 策略收到的观测可能完全 out-of-distribution（机器人躺着或歪斜），瞬间输出极端 action。\textbf{这解释了为何 \cref{sec:rlmc-ql-action} 强调 \texttt{use\_default\_offset=True} 如此重要}——它不只让 zero action 好看，更确保部署 FSM 过渡有明确目标姿态。
+
+UniLab 的“共享 base cfg + robot override”靠\textbf{类继承 + 装饰器双注册 + Hydra 深合并覆盖}实现：locomotion 各机器人继承 \Verb[breaklines]|LocomotionBaseEnv|/\allowbreak\Verb[breaklines]|LocomotionBaseCfg|，用 \Verb[breaklines]|@registry.envcfg("Name")| 标 cfg、\Verb[breaklines]|@registry.env("Name", sim_backend=...)| 标 env（多后端多标几次），robot-specific 差异落在子类字段与 owner YAML；部署侧 \Verb[breaklines]|scripts/deploy/| 提供比 mjlab 更完整的导出工具链：
+
+\begin{codebox}[bash]{UniLab:跨机器人配置 + 训练到部署闭环}
+# (1) 共享 base + robot override:继承 LocomotionBaseEnv，装饰器双注册（UniLab registry）
+#   @registry.envcfg("Go2JoystickFlat")  标 cfg（CamelCase = training.task_name）
+#   @registry.env("Go2JoystickFlat", sim_backend="mujoco")  标 env（+motrix 再标一次）
+#   robot 差异 = SceneCfg.model_file（机器人 XML）+ fragment_files（拼任务/地形片段）
+#               + default_angles（keyframe home）+ control_config.{Kp,Kd,action_scale}
+#   换机器人/调参经 Hydra 深合并覆盖:env.control_config.Kp=40 env.scene.terrain.generator.num_rows=4
+# (2) 训练 -> ONNX -> 部署校验闭环（scripts/deploy/，UniLab）
+uv run eval --algo ppo --task go2_joystick_flat --sim mujoco --load-run -1  # play/eval 阶段导 policy.onnx + onnxruntime 自验
+#   export_deploy_config.py  -> deploy_config.yaml（obs_layout/obs_dim/default_angles/action scale）
+#   sim_prototype.py         -> 用 ONNX 在 MuJoCo 跑，逐段校验 obs 装配 == 训练侧（写 C++ FSM 前的验证）
+\end{codebox}
+
+\textbf{对照解读}：三者“同一 base cfg 适配多机器人”的动机一致（\cref{ins:rlmc-ql-sharecfg}），承载层不同——mjlab 用 Python 函数 + override dict，basic-locomotion-isaaclab 用 class 继承，UniLab 也用 class 继承但额外靠\textbf{装饰器把“同名任务的多后端 env”注册到同一 CamelCase 名}（\verb|sim_backend| 维度是 UniLab 独有的 override 轴）。部署上有两点值得记：(1) UniLab 确实导出可部署 ONNX 并用 \verb|onnxruntime| 自验，但 PPO 的导出在 \verb|play/eval| 阶段（故 \Verb[breaklines]|training.no_play=true| 时不导），与 mjlab“训练后自动导”\textbf{时机不同}；(2) UniLab 的 \Verb[breaklines]|sim_prototype.py| 把“ONNX 策略在 MuJoCo 逐段校验观测装配 == 训练侧”做成显式步骤，正对应本节强调的 \Verb[breaklines]|use_default_offset|/默认姿态一致性——\Verb[breaklines]|deploy_config.yaml| 显式记录 joint ordering 与 obs layout，避免部署端观测拼装与训练错位（与本节 \cref{sec:rlmc-ql-multirobot-deploy} 的 FSM \Verb[breaklines]|State_FixStand| 过渡到 default pose 是同一类“别让策略收到 OOD 观测”的工程纪律）。
+
+\begin{note}[UniLab 缺通用 DAgger，但有 HORA 式适应蒸馏]
+跨机器人/部署常配套 teacher-student 蒸馏。UniLab \textbf{无通用 DAgger 在线交替 / camera-conditioned student}（这点与 basic-locomotion-isaaclab 的内置 DAgger 脚本不同），但有原生 \textbf{HORA} 蒸馏：stage-1 特权 teacher（PPO）$\to$ stage-2 只训一个名字含 \verb|adapt_tconv| 的时序自适应编码器（RMA 范式，teacher 主干冻结）。四足 velocity 本章用不到蒸馏（盲控制 + 课程足矣），但迁到需要特权$\to$本体感知蒸馏时，UniLab 走 HORA 路线而非通用 teacher-student。
+\end{note}
+
+\begin{pitfall}[迁移新机器人时 site names 不匹配]
+\textbf{错误描述}：不同 MJCF 的 foot site 命名不统一（Go1 用 \verb|FR| 等，Go2 可能用 \verb|FR_foot| 等），未逐一核对。\textbf{现象后果}：regex 匹配空集，contact/clearance 奖励静默失效，策略拖脚。\textbf{根本原因}：命名 robot-specific。\textbf{正确做法}：打开 MJCF 或用代码遍历确认精确命名后再填 cfg。
+\end{pitfall}
+
+\begin{practice}[跨机器人]
+\begin{enumerate}
+\item （源码分析）克隆 unitree\_rl\_mjlab，找到两款机器人的 env\_cfgs.py，列出所有差异行，按“entity / reward / training”分类。
+\item （部署分析）部署 FSM 为 \Verb[breaklines]|State_Passive -> State_FixStand -> State_RLBase|。解释：(a) 为何 \Verb[breaklines]|State_FixStand| 必须在 RL 接管前执行？(b) 若训练时 \Verb[breaklines]|use_default_offset=False|，部署端要做什么调整？(c) ONNX 推理 50 Hz 与 SDK2 通信 500 Hz 的 10$\times$ 差距如何处理？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{常见误解汇总}
+\label{sec:rlmc-ql-myths}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.2cm}p{8.5cm}@{}}
+\toprule
+误解 & 纠正 \\
+\midrule
+12 维动作空间“很小、好搜” & 维度小不等于搜索易；体积随维度指数增长，关键是 default offset 初始化与 reward shaping（\cref{sec:rlmc-ql-action}）。 \\
+critic 信息越多越好 & critic 特权信息应\emph{仅}与奖励直接相关；加无关信号只增拟合难度（\cref{ins:rlmc-ql-asym}）。 \\
+loss 下降就是训练正确 & PPO loss 下降只说明在当前 reward 下改善了；若信号本身错（sensor 名拼错为零），只是在最小化其他项。看视频 + zero agent 验证（\cref{sec:rlmc-ql-train-diag}）。 \\
+flat 与 rough 只差一个 terrain type & 还要同步改 observation/reward/termination/curriculum 四个 manager（\cref{ins:rlmc-ql-subtraction}）。 \\
+分辨率越高越好 & ray 数随分辨率倒数平方增长，训练显著变慢而策略改善有限（\cref{sec:rlmc-ql-terrain-grid}）。 \\
+两框架同名 reward 行为相同 & exp kernel 的 $\sigma$、坐标系、是否乘 dt 都可能不同，必须查源码（\cref{ins:rlmc-ql-rewname}）。 \\
+Isaac Lab stars 多所以一定更好 & stars 反映社区规模非技术优劣；选型应基于任务需求（\cref{ch:rlmc-ecosystem}）。 \\
+换机器人只需改 asset 路径 & action scale、default pose、关节/body 命名都是 robot-specific，至少 6 类参数要改（\cref{sec:rlmc-ql-multirobot-migrate}）。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{故障排查手册}
+\label{sec:rlmc-ql-trouble}
+
+\begin{center}
+\small
+\begin{tabular}{@{}cp{3.2cm}p{3.4cm}p{4.2cm}c@{}}
+\toprule
+\# & 症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+1 & 策略不响应 command & actor obs 缺 command term & 打印 actor obs keys；确认 command\_name（mjlab \verb|"twist"|/Isaac \Verb[breaklines]|"base_velocity"|） & \cref{sec:rlmc-ql-mdp},\cref{sec:rlmc-ql-train-diag} \\
+2 & foot contact reward 全零 & sensor/geom regex 匹配空集 & 打印 sensor ids；核 MJCF 精确命名；zero agent 打印 sensor data & \cref{sec:rlmc-ql-contact} \\
+3 & rough episode 极短 & 保留了 flat 的 fell\_over & 打印 termination 计数；确认 rough 删 fell\_over、用 illegal\_contact & \cref{sec:rlmc-ql-termination} \\
+4 & flat 启动 crash "sensor not found" & flat 留 height\_scan obs 但删了 sensor & 检查 flat obs terms；删 actor 与 critic 的 height\_scan & \cref{sec:rlmc-ql-termination},\cref{sec:rlmc-ql-terrain} \\
+5 & 粗糙地形步态不稳 & ray\_alignment 设成 "base" & 检查 ray\_alignment；坡地可视化 scan；改 "yaw" 重训 & \cref{sec:rlmc-ql-terrain-align} \\
+6 & steps/s 突降 20\%+ & 高分辨率 scan / 额外 sensor & 记录前后 steps/s；用 \eqref{eq:rlmc-ql-rays} 算 ray 数变化；降分辨率 & \cref{sec:rlmc-ql-terrain-grid} \\
+7 & 跨框架迁移后 obs shape mismatch & obs group 名不匹配 & 检查 obs\_groups；mjlab actor / Isaac policy；统一命名 & \cref{sec:rlmc-ql-dualframework} \\
+8 & Go2 迁移后 reward 不涨 & robot-specific 名未更新 & 比对两 MJCF naming；zero agent 打印 entity data & \cref{sec:rlmc-ql-multirobot} \\
+9 & PhysX material limit exceeded & DR 材料数超 64000 & 设 num\_buckets=250；核 envs$\times$bodies$\times$variants & \cref{sec:rlmc-ql-dr} \\
+10 & MuJoCo 拒绝模型 "inertia not valid" & DR 产生非物理惯性 & 用 scale 模式；确保三角不等式 & \cref{sec:rlmc-ql-dr} \\
+11 & 双框架结果差异大 & 接触模型差异 + 超参未对齐 & 确认 PPO 超参一致；核 control\_dt；接受引擎差异 & \cref{sec:rlmc-ql-dualframework-exp} \\
+12 & ONNX 推理与 PyTorch 不同 & obs 归一化参数未导出 & 确认 ONNX 含 normalization；C++ 端加载 mean/var & \cref{sec:rlmc-ql-multirobot-deploy} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section{小结}
+\label{sec:rlmc-ql-summary}
+
+本章把前面所有零件组合到四足速度跟踪这一标准任务上，建立了“从配置到行为”的完整因果链。核心是一条贯穿始终的本质洞察：\textbf{四足速度跟踪的难点不在算法，而在接线}——同一套 PPO，配错一个传感器名、漏掉 command 观测、或 reward 权重符号写反，策略就永远学不会走，而 loss 还在下降；分阶段验证（zero/random/small/large）是对抗这类隐蔽错误的唯一可靠手段。
+
+\paragraph{术语速查。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 一句话 \\
+\midrule
+非对称 actor-critic & actor 看带噪可部署信号，critic 看干净特权信号（\cref{ins:rlmc-ql-asym}） \\
+exponential kernel & 跟踪奖励用 $\exp(-\lVert\cdot\rVert^2/\sigma^2)$，给“无奖励”而非“被罚”（\cref{ins:rlmc-ql-expkernel}） \\
+height scan & raycast 抽取的最小地形特征集，不是把地形拍成图（\cref{ins:rlmc-ql-heightscan}） \\
+ray alignment & "yaw" 只随转向，"base" 随全姿态（坡地会埋 bug）（\cref{ins:rlmc-ql-align}） \\
+terrain curriculum & game-inspired 自动难度，per-env level 升降（\cref{ins:rlmc-ql-curriculum}） \\
+四层奖励框架 & Tracking/Regularization/Style/Contact，独立调参（\cref{sec:rlmc-ql-reward-layers}） \\
+减法关系 & flat = rough 减去（地形扫描+课程+非法接触）加 fell\_over（\cref{ins:rlmc-ql-subtraction}） \\
+链路阅读法 & Registry$\to$Entity$\to$Scene$\to$Sensors$\to$Managers$\to$RL cfg（\cref{sec:rlmc-ql-readpath}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+
+\begin{center}
+\small
+\begin{tabular}{@{}clcl@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 18 DoF；qpos 19 因四元数 & \cref{sec:rlmc-ql-dof} & 中 \\
+2 & command 必入 actor obs & \cref{sec:rlmc-ql-mdp-def} & 中 \\
+3 & 策略自发涌现 trot & \cref{sec:rlmc-ql-gait} & 中 \\
+4 & 动作=default+offset$\times$scale；PD 链路 & \cref{sec:rlmc-ql-action} & 中 \\
+5 & base\_lin\_vel 真机不可直测，故特权 & \cref{sec:rlmc-ql-obs-priv} & 难 \\
+6 & 非对称 AC 的两种解读 & \cref{sec:rlmc-ql-obs-asym} & 中 \\
+7 & 奖励四层框架落地十余 term & \cref{sec:rlmc-ql-reward} & 难 \\
+8 & exp kernel vs L2 & \cref{sec:rlmc-ql-reward-track} & 中 \\
+9 & flat 是 rough 的减法版本 & \cref{sec:rlmc-ql-termination} & 中 \\
+10 & 链路阅读法 + 5 分钟读配置 & \cref{sec:rlmc-ql-readpath} & 中 \\
+11 & height scan grid/ray 数/对齐 & \cref{sec:rlmc-ql-terrain} & 难 \\
+12 & terrain curriculum 自动难度 & \cref{sec:rlmc-ql-terrain-curriculum} & 中 \\
+13 & 接触传感进 critic & \cref{sec:rlmc-ql-contact} & 中 \\
+14 & 分阶段验证四阶段 & \cref{sec:rlmc-ql-train} & 中 \\
+15 & “策略不走”系统排查 & \cref{sec:rlmc-ql-train-diag} & 难 \\
+16 & reward ablation 多维指标 & \cref{sec:rlmc-ql-train-ablation} & 难 \\
+17 & 共享 base cfg + robot override & \cref{sec:rlmc-ql-multirobot} & 中 \\
+18 & 双框架对比，差异源是接触模型 & \cref{sec:rlmc-ql-dualframework} & 难 \\
+19 & 部署闭环 ONNX$\to$C++$\to$SDK2$\to$PD & \cref{sec:rlmc-ql-multirobot-deploy} & 难 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{关键数字速查。}Go1：12 驱动关节、18 DoF、qpos 19/qvel 18、flat actor obs 48、reward 约 13 term、$\sigma=0.25$（mjlab/Isaac 参数名 \texttt{std}）、action scale 0.25 rad、Go1 $\tau_{\max}$ 髋/大腿 $23.7$、膝 $35.55$ N$\cdot$m；Isaac Lab Go2 rough：obs 235 / action 12；height scan (1.6,1.0)@0.1 m $\to$ 187 ray；标准 num\_envs 4096；PhysX 材料上限 64\,000。\rebuilt{上述数值多取自官方文档与实测（task id/obs 维/质量/膝-髋力矩已坐实）；少数（如 Go1 各关节 $k_p/k_d$ 区间、腿长）为典型量级，精确值以模型文件为准。}
+
+\paragraph{本章与其他章节的关系。}非对称 AC 与状态估计承接 \cref{ch:rlmc-privileged}，后续视觉控制章把 height scan 换成深度相机；terrain curriculum 承接 \cref{ch:rlmc-reward} 的 curriculum 原理；奖励四层框架承接 \cref{ch:rlmc-reward}，人形章会加入角动量层；DR 配置承接 \cref{ch:rlmc-dr}；链路阅读法是后续所有实战章源码阅读的入口。从下一阶段开始，你将把本章的方法论迁移到人形、操作与视觉控制——形式变了，但工程模式不变：掌握了模式，新任务的工作量从“从零设计”变成“调参 + 验证”。
+
+% ════════════════════════════════════════════════════════════════
+\section{延伸阅读}
+\label{sec:rlmc-ql-further}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{6.4cm}p{7.2cm}@{}}
+\toprule
+资料（简称 + 出处） & 一句话教什么 \\
+\midrule
+Lee et al.\ 2020, \textit{Sci.\ Robotics}（arXiv:2010.11251）\,\cite{lee2020quadruped} & 纯本体感知 zero-shot 到自然地形；teacher-student pipeline 的奠基。 \\
+Kumar et al.\ RMA, RSS 2021\,\cite{kumar2021rma} & base policy + adaptation module 实现实时在线适应（速度/地形/负载）。 \\
+Rudin et al.\ CoRL 2021（arXiv:2109.11978）\,\cite{rudin2021minutes} & legged\_gym + game-inspired terrain curriculum；GPU 并行分钟级训练（本章 curriculum 来源）。 \\
+Margolis \& Agrawal, Walk These Ways, CoRL 2022（arXiv:2212.03238）\,\cite{margolis2022walk} & MoB 步态参数化，单策略多步态风格。 \\
+Miki et al.\ 2022, \textit{Sci.\ Robotics}\,\cite{miki2022perceptive} & 高程图 + 特权学习；DARPA SubT 1700 m 零跌倒。 \\
+Pinto et al.\ RSS 2018\,\cite{pinto2018asymmetric} & 非对称 actor-critic 原始论文：actor 看图像、critic 看完整状态。 \\
+Cheng et al.\ Extreme Parkour, ICRA 2024\,\cite{cheng2024parkour} & 视觉端到端四足跑酷，三阶段训练（盲控制$\to$深度蒸馏$\to$部署）。 \\
+Schwarke et al.\ RSL-RL（arXiv:2509.10771）\,\cite{schwarke2025rslrl} & PPO + 蒸馏 + Symmetry + RND 的统一库（本章 RL 后端）。 \\
+mjlab（arXiv:2601.22074）\,\cite{mjlab2026} & 把 Isaac Lab 的 manager-based API 接到 MuJoCo Warp 的轻量框架。 \\
+Isaac Lab\,\cite{mittal2025isaaclab} & 多物理后端、Manager-Based 的机器人学习平台（velocity task 出处）。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{阅读路线建议。}\textbf{最小路线}（只做 flat）：Rudin 2021 $\to$ 本章 \cref{sec:rlmc-ql-mdp}--\cref{sec:rlmc-ql-readpath} $\to$ \cref{sec:rlmc-ql-train}；\textbf{标准路线}（flat+rough）：上述 + Lee 2020 $\to$ \cref{sec:rlmc-ql-terrain}--\cref{sec:rlmc-ql-multirobot}；\textbf{研究路线}（准备发论文）：上述 + RMA + Walk These Ways + Pinto 2018 $\to$ 设计自己的 reward/DR 方案。
+
+% ════════════════════════════════════════════════════════════════
+\section{版本信息速查}
+\label{sec:rlmc-ql-versions}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}lLL@{}}
+\toprule
+组件 & 本章基于 & 备注 \\
+\midrule
+mjlab core & arXiv:2601.22074 对应版本 & 内置 Go1+G1+YAM；CLI \Verb[breaklines]|uv run train/play| \\
+unitree\_rl\_mjlab & 主分支（2026 时点） & 支持 Go2/A2/As2/G1/R1/H1\_2/H2（无 Go1） \\
+Isaac Lab & 2.x 主线 & Go2 rough obs 235；3.0 Beta 四元数改 xyzw（\cref{sec:rlmc-setup-isaaclab}） \\
+RSL-RL（\texttt{rsl-rl-lib}） & Isaac Lab 钉 3.0.1，mjlab 1.4.0 装 5.4.0（实测，随 uv.lock 漂移） & 论文 arXiv:2509.10771；PPO+蒸馏+Symmetry+RND \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\rebuilt{凡 task id 确切字符串、各框架字段名与默认值，均以你所装版本的 \texttt{--help} 与官方文档为准；本章在文中已对未逐字确认处加注。}

@@ -1,0 +1,700 @@
+\chapter{轮足模式切换：混杂系统、过渡控制与工程有限状态机}\label{ch:wl-modeswitch}
+
+% ════════════════════════════════════════════════════════════════
+%  吸收 Tutorial 05_运动控制/30_复合: 100_模式切换(主干) + 70_轮足混合MPC(冲击 reset)
+%  + 30_多模态MPC(混合系统骨架)。记号归一到本书统一动力学/混杂系统约定。
+%  上承 \cref{ch:wl-dynamics}（同波动力学章）；与 \cref{ch:unified-multimodal-mpc} 多模态 MPC 骨架互引。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。它们都是“把会滚、会走的轮足机器人，推进到\emph{知道何时滚、何时走、何时混合}”时真实踩过的坑。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 一个轮足末端既可滚动、又可当脚支撑。当它从“滚动”切到“支撑”时，控制问题\emph{本身}变了哪些？只是“轮子转不转”这一个开关吗？
+  \item 一条以非零接触点速度落地的腿，接触约束要求落地后接触点速度为零。这个“瞬间归零”在动力学上意味着什么？为什么会有冲击？
+  \item 在台阶高度 $s$ 的单阈值规则 “$s>0.10\,$m 则走、否则滚” 下，若 $s$ 在 $0.095$–$0.105\,$m 间抖动，机器人会怎样？这种现象有名字吗？
+  \item 从轮模式切到足模式，相当于把当前广义速度从一个仿射子空间投到另一个。若当前速度不在新子空间里，过渡控制器第一件该做的事是什么？
+  \item 若把“当前处于哪个模式”这一信息\emph{不}告诉状态估计器，轮模式下它会怎样误读接触点的滚动速度？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{用混杂系统语言}把轮足模式切换形式化为 $\mathcal H=\{\mathcal M,f_m,\mathcal G_{m\to n},R_{m\to n}\}$，并说清这套语言为何是描述“连续动力学 + 离散模式 + 事件触发”的自然框架；
+  \item \textbf{说清}为什么轮足机器人必须\emph{显式}处理模式切换——同一末端可滚可撑，约束集、力锥、命令类型、安全边界必须\emph{同步}切换；
+  \item \textbf{推导}落地冲击的 reset map $\mathbf v^+=\mathbf P_M\mathbf v^-$，认出投影矩阵 $\mathbf P_M$ 与 WBC 接触零空间投影\emph{同形}，并由能量损失 $\Delta T\ge0$ 读出软着陆的工程指导；
+  \item \textbf{推导}过渡控制器的可行速度投影 $\dot{\mathbf q}^+=\dot{\mathbf q}^--\mathbf W^{-1}\mathbf A_n^\top\mathbf S^{-1}(\mathbf A_n\dot{\mathbf q}^--\mathbf b_n)$，处理 $\mathbf S$ 秩亏（伪逆/阻尼逆）与接触力斜坡；
+  \item \textbf{设计}一个可部署的工程 FSM——滞回阈值（施密特触发器）、方向相关驻留时间、地形特征、模式评分、安全裁决；
+  \item \textbf{说明}模式切换为何必须\emph{同时}贯穿到 MPC 的 mode schedule、WBC 任务栈与状态估计观测模型，而不能只停在行为树的节点名上；
+  \item \textbf{诊断}模式抖动、切换冲击两类典型故障，并给出从根因到对策的处理路径。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把‘何时滚、何时走’这个看似离散的决策，焊接进连续的动力学与优化}”的主线。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (hy) {混杂系统骨架\\ $\mathcal H=\{\mathcal M,f_m,\mathcal G,R\}$};
+\node[blk, right=of hy] (motiv) {动机\\同一末端可滚可撑};
+\node[grp, below=8mm of hy] (reset) {落地 reset\\ $\mathbf v^+=\mathbf P_M\mathbf v^-$};
+\node[grp, right=of reset] (proj) {过渡控制\\可行速度投影};
+\node[blk, below=8mm of reset, fill=third!8, draw=third!60!black] (fsm) {工程 FSM\\滞回·驻留·裁决};
+\node[blk, right=of fsm, fill=third!8, draw=third!60!black] (down) {下贯三层\\ MPC·WBC·估计};
+\draw[ln] (hy)--(motiv);
+\draw[ln] (hy.south) -- ++(0,-4mm) -| (reset.north);
+\draw[ln] (reset)--(proj);
+\draw[ln] (reset.south) -- ++(0,-4mm) -| (fsm.north);
+\draw[ln] (fsm)--(down);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:wlm-hybrid,sec:wlm-motivation} 是任何读者的主干（建立“混杂系统 = 轮足切换的母语言”这一观念）；\cref{sec:wlm-reset,sec:wlm-transition} 是\emph{冲击与过渡所需}的核心推导（reset map 与可行速度投影），二者共享同一个零空间投影矩阵，与 \cref{ch:quad_wbc} 的 WBC 接触投影一脉相承；\cref{sec:wlm-fsm} 把前面的连续量“翻译”成可部署的离散逻辑——滞回、驻留、评分、裁决；\cref{sec:wlm-downstream} 说明模式信息如何同步下贯到 MPC/WBC/估计三层；\cref{sec:wlm-debug} 是故障排查。整章与多模态 MPC 的混合系统骨架（\cref{ch:unified-multimodal-mpc}）互为表里：那里讲“固定模式序列下的统一优化”，这里讲“模式序列\emph{本身}如何被决定与切换”。
+
+\subsection*{前置知识桥接}
+\cref{ch:wl-dynamics} 已建立轮足机器人的\emph{统一动力学}——浮基广义坐标、轮接触的各向异性摩擦锥、纯滚动与横向无滑移的 Pfaffian 约束。本章接手上一章\emph{回避}的问题：那套动力学在不同模式下\emph{激活不同的约束子集}，而模式之间的\textbf{切换瞬间}（落地冲击）与\textbf{切换决策}（何时切）都需要新的数学对象。换言之，从“给定模式下机器人怎么动”进到“\emph{模式本身如何选择与迁移}”。所需的接触零空间投影来自 \cref{ch:quad_wbc}（WBC），约束的 Pfaffian 形式来自 \cref{ch:constrained-dynamics} 与 \cref{ch:mm-wheeled}，单刚体 MPC 的代价/约束结构来自 \cref{ch:quad_mpc}。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会写出一个“地形平就滚、有台阶就走”的单阈值选择器，它在实验室平地上看似有效，一上真实地面就在两种模式间高频抖动（\cref{sec:wlm-fsm}）——而你不知道这叫\emph{模式抖动}，更不知道它会让 MPC 的约束集每周期都变、求解时间飙升；
+  \item 你会让上层 FSM 进入足模式，却忘了同步切 WBC 的横向滚动约束与轮电机的命令接口，于是“上层说走、下层还在滚”，控制器自相打架（\cref{sec:wlm-downstream}）；
+  \item 你会规划一条高速触地的摆动轨迹，因为没有把落地 reset map 的能量损失 $\Delta T$（\cref{sec:wlm-reset}）纳入考量，真机在每次落地时冲击、弹跳甚至失稳。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含冲击/过渡推导与 FSM 设计） & 4--6 小时 & 首次做轮足切换、要写状态机与过渡控制 \\
+速读（跳过推导细节，看结论与表） & 1.5 小时 & 有混杂系统基础、想对齐本书记号与下贯结构 \\
+速查（只看小结的符号表 + 速查表） & 15 分钟 & 写控制器代码时回来查公式与阈值套路 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+沿用本书浮基/复合统一动力学（\cref{ch:wl-dynamics}、\cref{eq:umm-core}）：
+\begin{equation}
+  \mathbf M(\mathbf q)\dot{\mathbf v}+\mathbf h(\mathbf q,\mathbf v)=\mathbf S^\top\boldsymbol\tau+\sum_{i\in\mathcal C}\mathbf J_{c,i}^\top\boldsymbol\lambda_i,
+  \qquad \mathbf S=[\,\mathbf 0\;\;\mathbf I\,],
+  \label{eq:wlm-dyn}
+\end{equation}
+向量粗体小写、矩阵粗体大写；$\mathbf q$ 含浮基位姿，$\mathbf v$ 为广义速度，$\mathbf S$ 选出驱动关节，$\boldsymbol\lambda_i$ 为接触力（端点力与广义力经 $\boldsymbol\tau=\mathbf J^\top\mathbf f$ 互换）。
+\textbf{轮足模式向量} $\boldsymbol\sigma\in\{\mathrm{swing},\mathrm{foot},\mathrm{wheel}\}^{n_e}$（$n_e$ 个末端，每端三态）；离散\emph{运动模态}集合 $\mathcal M=\{\mathrm{WHEEL},\mathrm{LEG},\mathrm{HYBRID},\mathrm{TRANSITION}\}$ 是整机层面的粗粒度模式（与逐端 $\boldsymbol\sigma$ 互补：FSM 在 $\mathcal M$ 上决策，下贯时展开成 $\boldsymbol\sigma$）。
+混杂系统四元组 $\mathcal H=\{\mathcal M,f_m,\mathcal G_{m\to n},R_{m\to n}\}$（连续流、切换面、重置映射，\cref{sec:wlm-hybrid}）。
+\textbf{wheel 模式}的轮角速度记 $\omega_w$、参考记 $\omega_{\mathrm{ref}}$，接触点纵向/横向/法向局部基记 $\{\mathbf e_\parallel,\mathbf e_\perp,\mathbf n\}$，轮半径 $r$。
+\textbf{源转换说明}：Tutorial 三源以 $x,u$ 记状态/输入、以 $J_c v=0$ 记接触约束，本章统一为 $\mathbf v,\boldsymbol\tau$ 与 \cref{eq:wlm-dyn}；其“模式”一词在 $\mathcal M$ 与 $\boldsymbol\sigma$ 两个粒度间游移处，本章按上述区分明确标注。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{多模态 MPC 的混杂系统骨架}
+\label{sec:wlm-hybrid}
+
+\paragraph{动机：模式不是工程细节，而是“问题定义”本身。}
+轮足控制的第一个观念关口是：把“切换”当成行为树里换个节点名，还是当成\emph{优化问题本身的改变}。后者才对。一旦从轮切到足，系统的可行动作集合、激活的约束、有意义的输入量、安全边界全都变了。若控制器把这些物理假设\emph{混}在一起——既写纯滚动约束、又写足端零速度约束——优化器要么收敛到一个谁都不满足的折中，要么干脆不收敛。
+
+\begin{insight}[模式切换改变的是控制问题，不是偏好]\label{ins:wlm-problem-change}
+模式切换不是任务层的“偏好选择”，而是\textbf{控制问题定义}的改变：每个模式对应不同的约束子集、不同的输入语义、不同的代价权重与不同的安全边界。因此模式信息必须进入 MPC/WBC/硬件接口与状态估计，而\emph{不能}只停在上层逻辑的标签里（去重指向 \cref{sec:wlm-downstream} 的“下贯三层”）。识别出这一点，本章后面所有“约束随模式切换”的设计都顺理成章。
+\end{insight}
+
+\paragraph{混杂系统：连续流 + 离散模式 + 事件触发的统一语言。}
+描述“在不同离散模式下遵循不同连续动力学、由事件触发模式迁移”的系统，数学上称为\emph{混杂系统}（hybrid system）。这套语言并非机器人专属：一个 TCP 连接的状态机（LISTEN $\to$ SYN\_SENT $\to$ ESTABLISHED $\to$ CLOSED）就是混杂系统——连续状态是序列号与窗口大小，离散模式是连接状态，保护条件是收到特定数据包，重置映射是状态变量的重新初始化。轮足模式切换与之同构。
+
+\begin{definition}[轮足混杂系统]\label{def:wlm-hybrid}
+轮足机器人建模为混杂系统 $\mathcal H=\{\mathcal M,f_m,\mathcal G_{m\to n},R_{m\to n}\}$，由四个对象完整刻画：
+\begin{itemize}
+  \item \textbf{离散模式} $\mathcal M=\{\mathrm{WHEEL},\mathrm{LEG},\mathrm{HYBRID},\mathrm{TRANSITION}\}$；
+  \item \textbf{连续流} $\dot{\mathbf x}=f_m(\mathbf x,\mathbf u,t),\ m\in\mathcal M$——模式 $m$ 内的连续演化（由 \cref{eq:wlm-dyn} 在该模式激活的约束子集下导出）；
+  \item \textbf{切换面（保护条件）} $\mathcal G_{m\to n}=\{(\mathbf x,\mathbf z):g_{m\to n}(\mathbf x,\mathbf z)\ge0\}$——触发从 $m$ 到 $n$ 迁移的状态/感知集合，$\mathbf z$ 是外部感知特征（坡度、粗糙度、台阶高、置信度、语义类别）；
+  \item \textbf{重置映射} $\mathbf x^+=R_{m\to n}(\mathbf x^-)$——切换瞬间的状态跳变（\cref{sec:wlm-reset}）。
+\end{itemize}
+连续状态 $\mathbf x$ 含浮基位姿与速度、腿关节位置与速度、轮角与轮速；输入 $\mathbf u$ 含腿关节力矩、轮力矩、轮速命令与接触力参考，\textbf{其语义随模式变化}（轮模式以轮速命令为主输入，足模式以关节力矩与接触力分配为主输入）。
+\end{definition}
+
+\begin{note}[$\mathcal G$ 的两类触发：内生事件 vs 外生感知]\label{note:wlm-guard-two}
+切换面 $\mathcal G_{m\to n}$ 的触发条件分两类，混在一个 $g\ge0$ 里容易写乱：\textbf{内生事件}由状态本身决定，如“足端高度 $h_{\mathrm{foot}}(\mathbf x)=0$ 且 $\dot h_{\mathrm{foot}}<0$”（落地，swing$\to$foot），它在零时间内必然触发且伴随冲击；\textbf{外生感知}由 $\mathbf z$ 决定，如“前方台阶高 $s>0.10\,$m”（WHEEL$\to$LEG），它是\emph{决策}而非\emph{事件}，何时真正切由 FSM 的滞回与驻留时间裁夺（\cref{sec:wlm-fsm}）。本章把前者归到 \cref{sec:wlm-reset}（冲击 reset），后者归到 \cref{sec:wlm-fsm}（工程 FSM）。
+\end{note}
+
+\paragraph{离散模式与连续优化的分工。}
+为什么不把模式选择直接塞进一个优化器、让它自动找最优模式序列？因为那会让最优控制问题（OCP）退化为\emph{混合整数}最优控制——离散模式变量与连续轨迹变量同时优化。组合规模随时域爆炸：
+
+\begin{theorem}[模式序列的组合爆炸]\label{thm:wlm-combinatorial}
+设每个预测阶段有 $K$ 个候选模式、预测步数为 $N$，则候选模式序列数为 $K^N$。对轮足整机三模态（$K=3$）、典型 $N=20$：
+\begin{equation}
+  K^N=3^{20}\approx3.5\times10^9.
+  \label{eq:wlm-combinatorial}
+\end{equation}
+在 $100\,$Hz 控制频率下、每周期仅有约十毫秒预算时，全阶混合整数 OCP 即便不暴力枚举，其组合复杂度也使实时求解不现实。
+\end{theorem}
+
+\noindent 工程上的标准答案是\textbf{分层}（与 \cref{ch:unified-multimodal-mpc} 的多模态 MPC 骨架一致）：上层（FSM 或学习策略）给出未来 $1$–$3\,$s 的\emph{模式序列}，下层在\emph{固定}该序列后求解连续 OCP（OCS2 风格的切换系统 OCP，事件时刻分割时间线），高频 WBC 跟踪输出，下一周期重新滚动。
+
+\begin{equation}
+  \underbrace{\min_{\mathbf x(\cdot),\mathbf u(\cdot),\,m(\cdot)}\int_0^T\ell_{m(t)}(\mathbf x,\mathbf u,t)\,\mathrm dt+\Phi(\mathbf x_T)}_{\text{混合整数 OCP（理想、不可实时）}}
+  \;\xrightarrow{\;m(\cdot)\text{ 由上层固定}\;}\;
+  \underbrace{\min_{\mathbf x(\cdot),\mathbf u(\cdot)}\int_0^T\ell_{m(t)}\,\mathrm dt+\Phi(\mathbf x_T)}_{\text{固定序列 OCP（可实时）}}.
+  \label{eq:wlm-layered}
+\end{equation}
+
+\begin{insight}[mode schedule 不是工程细节，它决定“在解哪个问题”]\label{ins:wlm-schedule}
+模式序列（mode schedule）表面上像一张“何时切”的时间表，本质上它\emph{逐段决定了哪些约束、哪些控制量、哪个代价被激活}。一旦这张表与真实地形\emph{错位}（例如该进足模式的台阶段仍排成轮模式），下层 OCP 会在固定的错误约束集下\emph{忠实地}收敛——收敛到一个错误的问题。这就是为什么轮足的 \texttt{ModeScheduleManager} 不能假设周期性步态：四足步态的切换时间可由步态周期预测，轮足的切换却由地形感知触发、非周期。
+\end{insight}
+
+\begin{pitfall}[思维陷阱：追求“全局最优模式序列”]\label{pf:wlm-global}
+新手常想“MPC 应该搜索全局最优的模式序列”。但由 \cref{thm:wlm-combinatorial}，$N=20$ 时序列空间已达 $10^9$ 量级，更大时域、更细粒度（逐端 $\boldsymbol\sigma\in\{0,1,2\}^4$ 则单阶段就 $81$ 种）更不可枚举。正确思维是\emph{分层}：上层用启发式/采样/学习给出模式序列，下层在固定序列下优化连续轨迹。对真机而言，\textbf{晚来的最优解不如准时的可行解}——求解超时会让机器人错过真实地形变化。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{动机：轮足为何必须显式处理模式切换}
+\label{sec:wlm-motivation}
+
+\paragraph{纯足式已有切换，轮足的切换高一个量级。}
+模式切换并非轮足独有：纯四足的每条腿已在\emph{触地}（stance）与\emph{摆动}（swing）间切换，这是个二值选择，由步态时序（\cref{ch:quad_gait}）周期性给出。OCS2 的接触约束据此按时序激活或关闭。轮足的困难高一层：同一个末端\emph{既可滚动、又可当脚支撑}，切换的维度从“触地/离地”扩展到“触地以后\emph{如何}运动”——静止支撑、纯滚动、允许小滑移、主动抬腿。
+
+\begin{table}[H]\centering\small
+\caption{轮足四类运动模态的物理假设与同步切换量（重述自 Tutorial 100，记号归一）}
+\label{tab:wlm-modes}
+\begin{tabular}{lllll}
+\toprule
+模态 & 主要约束 & 主要输入 & 优点 & 代价 \\
+\midrule
+WHEEL & 横向无滑移、纯滚动 & 轮速 $\omega_w$ + 腿姿态 & 快、省电 & 越障差 \\
+LEG & 足端零速度 $\mathbf J_c\mathbf v=0$、冲击管理 & 腿关节力矩 $\boldsymbol\tau$ & 越障强、静态安全 & 能耗高 \\
+HYBRID & 部分轮滚、部分脚撑 & 轮速 + 接触力 & 适应坡道/碎石、留退路 & 调参复杂 \\
+TRANSITION & 约束逐渐改变 & 增益/接触力/轮速插值 & 降低冲击 & 需额外时序 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\cref{tab:wlm-modes} 的关键不在四行内容，而在它们\emph{必须同步}：一旦模态改变，约束集、力锥、命令类型、安全边界四者要\textbf{一起}切。这正是 \cref{ins:wlm-problem-change} 的具体化——表面上是“轮子转不转”的开关，本质上是动力学约束、接触力锥、执行器命令类型、安全边界的同步切换。
+
+\paragraph{反面案例：一个没有滞回的模式选择器。}
+最朴素的写法是单阈值规则：
+\begin{equation}
+  m=\begin{cases}\mathrm{LEG}, & s>0.10\,\mathrm m,\\[2pt]\mathrm{WHEEL}, & \text{否则},\end{cases}
+  \qquad s=\text{台阶高度估计}.
+  \label{eq:wlm-naive}
+\end{equation}
+它在实验室平地上看似有效，到真实地面迅速失败：深度相机有噪声、高程图有空洞、车身俯仰改变局部坡度估计、轮子接触软地面会下陷、同一台阶在不同距离处估计高度跳变。当 $s$ 在 $0.095$–$0.105\,$m 间抖动，控制器在 WHEEL 与 LEG 间来回切——这就是\emph{模式抖动}。其后果远不止“状态机看起来乱”：MPC 的约束集每次切换都变、WBC 任务优先级改变、轮电机从速度控制切到制动/力矩补偿、腿端接触目标从“移动接触点”变成“静止支撑点”；若 $100\,$ms 内来回切两次，系统根本没有时间完成过渡。
+
+\begin{pitfall}[反事实推理：只调高阈值能解决抖动吗？]\label{pf:wlm-threshold}
+若只调高 \cref{eq:wlm-naive} 的阈值而不加滞回与驻留时间：阈值调高减少误入足模式，但让机器人\emph{更晚}识别台阶；阈值调低提前识别危险，但增加误触发。两难说明\textbf{单阈值不是稳定切换的根本解}——根本解是给“进入”和“离开”设\emph{不同}阈值（滞回），并加最小驻留时间（\cref{sec:wlm-fsm}）。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{落地冲击 reset map：从冲量-动量到零空间投影}
+\label{sec:wlm-reset}
+
+\paragraph{为何连续动力学不足以描述切换。}
+\cref{sec:wlm-hybrid} 的连续流 $f_m$ 描述了\emph{每个模式段内}的演化，它\emph{隐含假设切换瞬间状态连续}：$\mathbf x(t^-)=\mathbf x(t^+)$。对 swing$\to$foot 这类切换，该假设不成立。考虑一条以接触点速度 $\mathbf v_c^-\ne\mathbf0$ 落地的摆动腿，落地后进入 foot 模式、约束要求 $\mathbf v_c=0$，于是接触点速度必须从 $\mathbf v_c^-$ 瞬间变为 $\mathbf0$——一个\emph{速度跳变}。零时间内的速度跳变需无穷大的力作用无穷小的时间，其积分（冲量）有限：
+\begin{equation}
+  \boldsymbol\Lambda_i=\int_{t^-}^{t^+}\boldsymbol\lambda_i(\tau)\,\mathrm d\tau.
+  \label{eq:wlm-impulse}
+\end{equation}
+这正是纯连续动力学不足以描述切换的根由——切换瞬间是\emph{离散事件}，需单独的数学对象（reset map）刻画。
+
+\begin{pitfall}[概念误区：把所有切换都当作有冲击的碰撞]\label{pf:wlm-not-all-impact}
+新手以为“既然 swing$\to$foot 有冲击，所有模式切换都要算冲量”。实际上，\emph{只有当切换激活新的速度约束、且当前速度不满足该约束时}才有冲量。foot$\to$swing（释放约束）没有冲量——约束消失不产生冲击力。foot$\leftrightarrow$wheel 若提前匹配轮速也没有冲量（见下文）。正确判据：先问“切换后的约束当前满足吗？”——满足则 reset 是恒等映射（无冲击），不满足则需投影（有冲击）。
+\end{pitfall}
+
+\paragraph{reset map 的推导：投影到约束流形。}
+设落地前广义速度为 $\mathbf v^-$、落地后为 $\mathbf v^+$，两个条件决定 $\mathbf v^+$。
+
+\begin{derivation}[落地 reset map $\mathbf v^+=\mathbf P_M\mathbf v^-$]
+\textbf{条件一（冲量-动量定理）}：冲量只通过接触雅可比作用于系统：
+\begin{equation}
+  \mathbf M(\mathbf q)(\mathbf v^+-\mathbf v^-)=\mathbf J_c^\top\boldsymbol\Lambda.
+  \label{eq:wlm-reset-c1}
+\end{equation}
+\textbf{条件二（完全非弹性碰撞）}：落地后接触点速度为零：
+\begin{equation}
+  \mathbf J_c\mathbf v^+=\mathbf0.
+  \label{eq:wlm-reset-c2}
+\end{equation}
+这是两个未知量 $(\mathbf v^+,\boldsymbol\Lambda)$ 的线性方程组。由 \cref{eq:wlm-reset-c1} 解出 $\mathbf v^+=\mathbf v^-+\mathbf M^{-1}\mathbf J_c^\top\boldsymbol\Lambda$，代入 \cref{eq:wlm-reset-c2}：
+\begin{equation}
+  \mathbf J_c\mathbf v^-+\mathbf J_c\mathbf M^{-1}\mathbf J_c^\top\boldsymbol\Lambda=\mathbf0
+  \;\Longrightarrow\;
+  \boldsymbol\Lambda=-(\mathbf J_c\mathbf M^{-1}\mathbf J_c^\top)^{-1}\mathbf J_c\mathbf v^-.
+\end{equation}
+回代得 reset map 的显式形式：
+\begin{equation}
+  \mathbf v^+=\underbrace{\big[\mathbf I-\mathbf M^{-1}\mathbf J_c^\top(\mathbf J_c\mathbf M^{-1}\mathbf J_c^\top)^{-1}\mathbf J_c\big]}_{\text{接触零空间投影 }\mathbf P_M}\mathbf v^-=\mathbf P_M\mathbf v^-.
+  \label{eq:wlm-reset}
+\end{equation}
+位置不变（$\mathbf q^+=\mathbf q^-$，冲量作用时间趋零、位置积分趋零），只有速度跳变。\qed
+\end{derivation}
+
+\noindent 矩阵 $\mathbf P_M=\mathbf I-\mathbf M^{-1}\mathbf J_c^\top(\mathbf J_c\mathbf M^{-1}\mathbf J_c^\top)^{-1}\mathbf J_c$ 是关于度量 $\mathbf M$ 的正交投影——把速度投到接触约束的零空间 $\{\mathbf v:\mathbf J_c\mathbf v=\mathbf0\}$。
+
+\begin{insight}[落地 reset 的投影 $=$ WBC 接触零空间投影]\label{ins:wlm-PM-wbc}
+\cref{eq:wlm-reset} 的投影矩阵 $\mathbf P_M$ 与 \cref{ch:quad_wbc}、\cref{eq:wlm-dyn} 框架下 WBC 的接触零空间投影\textbf{形式完全相同}（去重指向 \cref{sec:umm-nullspace} 的零空间投影统一处理）。这不是巧合——落地碰撞与 WBC 接触约束本质上都是“把运动限制到接触流形上”。区别仅在层级与时长：碰撞在\emph{速度层}（$\mathbf v$）做投影且发生在零时间内，WBC 在\emph{加速度层}（$\dot{\mathbf v}$）做投影且持续作用。掌握零空间投影这一个工具，就同时理解了碰撞动力学与约束控制两件事。
+\end{insight}
+
+\paragraph{切换的能量损失与软着陆指导。}
+完全非弹性碰撞损失动能。落地前 $T^-=\tfrac12(\mathbf v^-)^\top\mathbf M\mathbf v^-$、落地后 $T^+=\tfrac12(\mathbf v^+)^\top\mathbf M\mathbf v^+$，损失量为
+\begin{equation}
+  \Delta T=T^--T^+=\tfrac12(\mathbf J_c\mathbf v^-)^\top(\mathbf J_c\mathbf M^{-1}\mathbf J_c^\top)^{-1}(\mathbf J_c\mathbf v^-)\ge0.
+  \label{eq:wlm-energy-loss}
+\end{equation}
+损失正比于落地前接触点速度 $\mathbf J_c\mathbf v^-$ 的平方。这给出直接的工程指导：\textbf{落地前接触点速度越小，能量损失越小，冲击越柔和}——这正是摆动轨迹规划要求“足端在触地前竖直速度趋近于零”的根本原因，也承接了 \cref{sec:cd-contact} 在冲量层对接触的处理。\cref{eq:wlm-energy-loss} 中 $\Delta T\ge0$ 由 $(\mathbf J_c\mathbf M^{-1}\mathbf J_c^\top)^{-1}$ 正定保证。
+
+\begin{pitfall}[概念误区：reset map 会“撞动”机器人位置]\label{pf:wlm-pos}
+新手想“碰撞那一瞬间机器人被撞得移动了一下”。实际上 reset map 只改变\emph{速度}、不改变\emph{位置}（$\mathbf q^+=\mathbf q^-$）。这是冲量假设的直接结论——作用时间趋零，位置积分 $\int\mathbf v\,\mathrm dt\to0$。位置在碰撞瞬间连续，只有速度不连续。要把“碰撞导致位置变化”（错）与“碰撞后速度变化导致\emph{后续}位置变化”（对）分开。
+\end{pitfall}
+
+\paragraph{轮足的特殊切换：foot$\leftrightarrow$wheel 可无冲量。}
+swing$\to$foot 是经典足式问题。轮足新增的是 foot$\leftrightarrow$wheel 切换，它与足式切换有本质区别：切换时接触点\emph{已在}地面（位置不变），切的是\textbf{约束类型}。从“接触点完全静止”（$\mathbf J_c\mathbf v=\mathbf0$，$3$ 个约束）放松为“接触点只在横向、法向静止，纵向可滚动”——仍是 $3$ 个约束，但纵向那行从 $\mathbf e_\parallel^\top\mathbf J_c\mathbf v=0$ 变为
+\begin{equation}
+  \mathbf e_\parallel^\top\mathbf J_c\mathbf v=r\,\omega_w,
+  \label{eq:wlm-rolling}
+\end{equation}
+即纯滚动约束（横向 $\mathbf e_\perp^\top\mathbf J_c\mathbf v=0$、法向 $\mathbf n^\top\mathbf J_c\mathbf v=0$ 不变）。
+
+\begin{table}[H]\centering\small
+\caption{三类切换的保护条件、reset map 与冲量（重述自 Tutorial 70）}
+\label{tab:wlm-switch-types}
+\begin{tabular}{llll}
+\toprule
+切换类型 & 保护条件 $\mathcal G$ & reset map & 冲量 \\
+\midrule
+swing $\to$ foot & 足端触地 $h=0$ 且 $\dot h<0$ & 投影到 $\mathbf J_c\mathbf v=\mathbf0$ & 有（落地冲击） \\
+foot $\to$ wheel & 控制决策触发 & 投影到 Pfaffian 流形 & 通常很小 \\
+wheel $\to$ foot & 滑移/地形触发 & 投影到 $\mathbf e_\parallel^\top\mathbf J_c\mathbf v=0$ & 取决于轮速 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[foot$\leftrightarrow$wheel 平滑切换 $=$ 让 reset map 成为恒等映射]\label{ins:wlm-identity-reset}
+关键观察：若切换瞬间令轮速参考 $\omega_w$ 满足 $r\,\omega_w=\mathbf e_\parallel^\top\mathbf J_c\mathbf v^-$（轮的线速度匹配当前接触点纵向速度），则新约束 \cref{eq:wlm-rolling} 在 $\mathbf v^-$ 处\emph{已被满足}，reset map 退化为\textbf{恒等映射}——没有速度跳变、没有冲量。这就是“速度连续性过渡窗口”的数学本质：\emph{平滑切换不是“约束的渐变”}（约束方程是离散切换的，不存在中间形态），\emph{而是“让切换瞬间的 reset map 成为恒等映射”}。我们无法让约束本身连续变化，但可以通过选择切换时机与轮速参考，使该时机下状态恰好已满足新约束，从而让跳变幅度为零。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 对一个 $2$ 自由度平面单腿（质量 $m$ 集中于足端、$\mathbf J_c=\mathbf I_2$），手算落地前 $\mathbf v^-=(1.0,-0.5)^\top\,$m/s 时的 reset 输出 $\mathbf v^+$ 与能量损失 $\Delta T$（落地后约束 $\mathbf v^+=\mathbf0$）。
+  \item 证明 $\mathbf P_M$ 是关于度量 $\mathbf M$ 的投影：$\mathbf P_M^2=\mathbf P_M$，且在内积 $\langle\mathbf a,\mathbf b\rangle_{\mathbf M}=\mathbf a^\top\mathbf M\mathbf b$ 下自伴随。与 \cref{ins:wlm-PM-wbc} 指出的 WBC 零空间投影性质对照。
+  \item 设计 foot$\to$wheel 的无冲击切换：给定切换前接触点纵向速度 $v_\parallel^-$ 与轮半径 $r$，应如何设切换瞬间的 $\omega_w$？若轮速电机无法瞬间达到该值，过渡窗口的最短时间由什么决定？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{过渡控制器：可行速度投影与接触力斜坡}
+\label{sec:wlm-transition}
+
+\paragraph{从约束子空间看切换：冲量从何而来。}
+把每个模式的可行速度集合记为仿射子空间
+\begin{equation}
+  \mathcal V_m(\mathbf q)=\{\mathbf v:\mathbf A_m(\mathbf q)\mathbf v=\mathbf b_m(\mathbf q,\mathbf u)\},
+  \label{eq:wlm-feasible}
+\end{equation}
+轮模式 $\mathbf A_{\mathrm{wheel}}\mathbf v=\mathbf b_{\mathrm{wheel}}(\omega_w)$（纵向耦合轮速）、足模式 $\mathbf A_{\mathrm{leg}}\mathbf v=\mathbf0$、混合模式 $\mathbf A_{\mathrm{hybrid}}\mathbf v=\mathbf b_{\mathrm{hybrid}}$。直接从轮切到足，相当于从一个仿射子空间跳到另一个。若切换时当前速度 $\mathbf v^-$ 不在新子空间中，约束要求瞬时速度变化——即冲量，在真实硬件上表现为轮胎打滑、减速器冲击或基座俯仰。因此过渡控制器的\emph{第一}任务是\textbf{速度投影}：求最接近新约束集合的速度。
+
+\begin{derivation}[可行速度投影：拉格朗日推导]
+给定当前速度 $\mathbf v^-$，在度量 $\mathbf W$（正定，典型取惯量 $\mathbf M$ 或单位阵）下求最接近的、满足新约束 $\mathbf A_n\mathbf v=\mathbf b_n$ 的速度：
+\begin{equation}
+  \mathbf v^+=\arg\min_{\mathbf v}\tfrac12\|\mathbf v-\mathbf v^-\|_{\mathbf W}^2
+  \quad\text{s.t.}\quad\mathbf A_n(\mathbf q)\mathbf v=\mathbf b_n.
+  \label{eq:wlm-proj-problem}
+\end{equation}
+拉格朗日函数 $\mathcal L=\tfrac12(\mathbf v-\mathbf v^-)^\top\mathbf W(\mathbf v-\mathbf v^-)+\boldsymbol\mu^\top(\mathbf A_n\mathbf v-\mathbf b_n)$。对 $\mathbf v$ 求导置零：
+\begin{equation}
+  \mathbf W(\mathbf v-\mathbf v^-)+\mathbf A_n^\top\boldsymbol\mu=\mathbf0
+  \;\Longrightarrow\;
+  \mathbf v=\mathbf v^--\mathbf W^{-1}\mathbf A_n^\top\boldsymbol\mu.
+\end{equation}
+代入约束 $\mathbf A_n\mathbf v=\mathbf b_n$：
+\begin{equation}
+  \mathbf A_n\mathbf v^--\mathbf A_n\mathbf W^{-1}\mathbf A_n^\top\boldsymbol\mu=\mathbf b_n.
+\end{equation}
+记 $\mathbf S=\mathbf A_n\mathbf W^{-1}\mathbf A_n^\top$（约束空间的“度量”）。当 $\mathbf A_n$ 满行秩时 $\mathbf S$ 可逆，$\boldsymbol\mu=\mathbf S^{-1}(\mathbf A_n\mathbf v^--\mathbf b_n)$，回代得
+\begin{equation}
+  \boxed{\;\mathbf v^+=\mathbf v^--\mathbf W^{-1}\mathbf A_n^\top\mathbf S^{-1}(\mathbf A_n\mathbf v^--\mathbf b_n)\;},\qquad\mathbf S=\mathbf A_n\mathbf W^{-1}\mathbf A_n^\top.
+  \label{eq:wlm-proj}
+\end{equation}
+\qed
+\end{derivation}
+
+\begin{note}[\cref{eq:wlm-proj} 与落地 reset \cref{eq:wlm-reset} 的关系]\label{note:wlm-proj-vs-reset}
+两式同源。取 $\mathbf W=\mathbf M$、$\mathbf b_n=\mathbf0$、$\mathbf A_n=\mathbf J_c$，则 $\mathbf S=\mathbf J_c\mathbf M^{-1}\mathbf J_c^\top$，\cref{eq:wlm-proj} 退化为 $\mathbf v^+=[\mathbf I-\mathbf M^{-1}\mathbf J_c^\top\mathbf S^{-1}\mathbf J_c]\mathbf v^-=\mathbf P_M\mathbf v^-$，正是落地 reset。区别在用途：reset 是\emph{物理}发生的速度跳变（瞬时、被动），过渡投影是\emph{控制器主动}计算的目标速度（用于生成过渡轨迹），二者数学同形而语义不同。
+\end{note}
+
+\paragraph{$\mathbf S$ 秩亏：伪逆与阻尼逆。}
+\cref{eq:wlm-proj} 的前提是 $\mathbf S$ 可逆，真实轮足系统经常破坏它。例如四个轮足同时接触地面时，左右轮的横向无滑移约束可能在速度层高度相关；又如足端接触点共面、法向估计相近、轮胎侧偏模型近似重复时，$\mathbf A_n$ 的行近似线性相关。此时 $\mathbf S$ 半正定，直接写 $\mathbf S^{-1}$ 会把很小的奇异值放大成很大的修正速度。工程实现用\emph{伪逆}
+\begin{equation}
+  \boldsymbol\mu=\mathbf S^\dagger(\mathbf A_n\mathbf v^--\mathbf b_n),\qquad
+  \mathbf v^+=\mathbf v^--\mathbf W^{-1}\mathbf A_n^\top\mathbf S^\dagger(\mathbf A_n\mathbf v^--\mathbf b_n),
+  \label{eq:wlm-proj-pinv}
+\end{equation}
+现场噪声较大时用\emph{阻尼逆}（阻尼最小二乘，与 \cref{eq:umm-dls} 同款思想）
+\begin{equation}
+  \mathbf S_\epsilon^{-1}=(\mathbf S+\epsilon^2\mathbf I)^{-1},\qquad
+  \mathbf v^+=\mathbf v^--\mathbf W^{-1}\mathbf A_n^\top\mathbf S_\epsilon^{-1}(\mathbf A_n\mathbf v^--\mathbf b_n).
+  \label{eq:wlm-proj-damped}
+\end{equation}
+
+\begin{insight}[过渡控制器不是“柔化装饰”，而是可行速度投影]\label{ins:wlm-transition-essence}
+过渡控制器的核心\emph{不是}“让动作更柔和”的装饰，\emph{而是}在新旧约束集合之间做可行速度投影（\cref{eq:wlm-proj}）。没有这一步，切换就会把\emph{不可行}速度强行交给硬件。阻尼逆（\cref{eq:wlm-proj-damped}）牺牲一点约束精确性，换来有界的速度修正——这正适合切换瞬间的工程需求：宁可让约束误差在几十毫秒内由 WBC 与低层控制慢慢消掉，也不要因一个秩亏矩阵产生不现实的冲量命令。
+\end{insight}
+
+\paragraph{过渡控制器的三件事。}
+过渡控制器必须\emph{同时}做三件事：速度匹配、接触力平滑、控制接口切换。速度匹配即上文的投影。\textbf{接触力平滑}用斜坡函数把旧接触力 $\boldsymbol\lambda_{\mathrm{old}}$ 平滑过渡到新接触力 $\boldsymbol\lambda_{\mathrm{new}}$：
+\begin{equation}
+  \boldsymbol\lambda(t)=\varsigma(t)\,\boldsymbol\lambda_{\mathrm{new}}+(1-\varsigma(t))\,\boldsymbol\lambda_{\mathrm{old}},\qquad
+  \varsigma(t)=3s^2-2s^3,\quad s=\mathrm{clip}\!\Big(\frac{t-t_0}{T_{\mathrm{tr}}},0,1\Big),
+  \label{eq:wlm-force-ramp}
+\end{equation}
+其中 $T_{\mathrm{tr}}$ 是过渡时长。三次插值 $\varsigma(t)=3s^2-2s^3$ 在起点与终点导数为零（$\varsigma'(0)=\varsigma'(1)=0$），故比线性插值更不易激发机械振动。
+
+\begin{center}
+\small
+\begin{tikzpicture}[>=Stealth,scale=1.0]
+  \draw[->,gray!60!black] (0,0)--(4.4,0) node[right,font=\small]{$s$};
+  \draw[->,gray!60!black] (0,0)--(0,2.6) node[above,font=\small]{$\varsigma$};
+  \foreach \x/\l in {0/0,4/1} \draw (\x,0.04)--(\x,-0.04) node[below,font=\scriptsize]{$\l$};
+  \draw (-0.04,2)--(0.04,2) node[left,font=\scriptsize]{$1$};
+  % cubic smoothstep 3s^2-2s^3, x in [0,4] mapped, y scaled to 2
+  \draw[third!70!black,very thick,domain=0:1,samples=40,smooth,variable=\s]
+    plot ({\s*4},{(3*\s*\s-2*\s*\s*\s)*2});
+  % linear reference
+  \draw[gray!55,thick,dashed] (0,0)--(4,2);
+  \node[third!70!black,font=\small] at (3.0,1.05) {$\varsigma=3s^2-2s^3$};
+  \node[gray!55!black,font=\scriptsize] at (1.15,1.05) {线性};
+  \node[font=\scriptsize,align=center] at (2.2,-0.7) {两端导数为零 $\Rightarrow$ 接触力起停平滑、不激振};
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{控制接口切换}是第三件事，也最易被忽略：轮速控制器限斜率、腿部力矩控制器保持输出连续、关节 PD 增益从滚动姿态增益切到支撑增益、WBC 约束从滚动约束切到静止支撑约束、并记录切换原因与传感器特征。这三件事缺一不可——只投影速度而不平滑接触力，力会从零跳到支撑力；只切上层名称而不切硬件接口，轮端会在支撑点处打滑。
+
+\begin{practice}
+\begin{enumerate}
+  \item 验证 $\varsigma(t)=3s^2-2s^3$ 满足 $\varsigma(0)=0,\varsigma(1)=1,\varsigma'(0)=\varsigma'(1)=0$；并说明为何这四个条件唯一确定了三次多项式。
+  \item 设四轮足同时着地、左右横向无滑移约束完全重复（$\mathbf A_n$ 有两行相同），定性说明 $\mathbf S$ 的奇异值结构，并解释为何 \cref{eq:wlm-proj-damped} 的阻尼项能避免修正速度爆炸。
+  \item 给定轮速电机的最大角加速度 $\dot\omega_{\max}$ 与切换前后接触点纵向速度差，估计无冲击 foot$\to$wheel 过渡窗口 $T_{\mathrm{tr}}$ 的下界（结合 \cref{ins:wlm-identity-reset}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{工程有限状态机：滞回、驻留、评分与裁决}
+\label{sec:wlm-fsm}
+
+\paragraph{为什么要过渡态：切换有时长。}
+一个可部署的 FSM 至少需要状态集 $\{$BOOT, STAND, WHEEL, LEG, HYBRID, 过渡态$\times6$, FAULT, RECOVERY$\}$。为什么不只用三个状态（WHEEL/LEG/HYBRID）？因为切换\emph{本身有时长}：若不显式建模过渡态，就无法给 MPC 插入过渡约束（\cref{sec:wlm-transition}），也无法在硬件层正确切换轮控制器与腿控制器。BOOT 负责传感器/执行器初始化；STAND 是安全中间态；WHEEL 高速巡航、LEG 越障爬阶、HYBRID 不确定地形或坡道；带方向箭头的是过渡态；FAULT 表示已触发硬件/估计故障；RECOVERY 从可恢复故障回到站立。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  node distance=7mm and 12mm, >=Stealth,
+  st/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, minimum width=15mm, fill=main!7, draw=main!60!black},
+  tr/.style={draw, rounded corners, align=center, font=\scriptsize, inner sep=2pt, fill=third!8, draw=third!55!black},
+  sf/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=red!6, draw=red!55!black},
+  ed/.style={->, thick, gray!55!black, font=\scriptsize}]
+\node[st] (boot) {BOOT};
+\node[st, below=of boot] (stand) {STAND};
+\node[st, below left=10mm and 4mm of stand] (wheel) {WHEEL};
+\node[st, below=20mm of stand] (hybrid) {HYBRID};
+\node[st, below right=10mm and 4mm of stand] (leg) {LEG};
+\node[sf, right=22mm of stand] (fault) {FAULT};
+\node[sf, right=22mm of hybrid] (recov) {RECOVERY};
+\draw[ed] (boot) -- node[right]{init ok} (stand);
+\draw[ed] (stand) -- node[above left,align=center]{stable\\start} (wheel);
+\draw[ed] (stand) -- node[above right,align=center]{stable\\start} (leg);
+\draw[ed] (wheel.south) to[bend right=12] node[below left]{过渡} (hybrid.west);
+\draw[ed] (leg.south) to[bend left=12] node[below right]{过渡} (hybrid.east);
+\draw[ed] (wheel.east) to[bend left=10] node[above]{过渡} (leg.west);
+\draw[ed] (hybrid) -- node[below]{回退} (stand);
+\draw[ed] (wheel.north east) to[bend left=8] node[above]{fault} (fault.west);
+\draw[ed,red!55!black] (fault.north) to[bend right=18] node[above]{} (stand.east);
+\draw[ed] (recov.north) -- node[right]{cleared} (fault.south);
+\end{tikzpicture}
+\caption{轮足工程 FSM 的状态图（仿 Tikz 重绘 Tutorial 100 的 ASCII 状态机）。BOOT 只能进入 STAND（安全链）；所有高能动作都可退回 STAND 或 FAULT；WHEEL 到 LEG 不直接跳、须经过渡态；HYBRID 是可持续控制模式而非仅过渡态。}
+\label{fig:wlm-fsm}
+\end{figure}
+
+\noindent\cref{fig:wlm-fsm} 不是为了好看，它表达四个工程约束：\cnum{1} BOOT 只能进 STAND，不能据地形直接跳到 WHEEL/LEG/HYBRID——因为 BOOT 只证明了通信/传感器/电机使能成功，\emph{未}证明机器人已稳定承重；STAND 阶段才完成姿态收敛、接触力建立、零速命令确认与安全裁剪激活。\cnum{2} 所有高能动作都可退回 STAND 或 FAULT。\cnum{3} WHEEL 到 LEG 经过渡态（接触语义变化需时序）。\cnum{4} HYBRID 是可持续模式。
+
+\paragraph{滞回阈值：施密特触发器。}
+单阈值（\cref{eq:wlm-naive}）会抖动；滞回用\emph{进入}与\emph{退出}两个阈值。以台阶高度进入足模式为例：
+\begin{equation}
+  s_{\mathrm{enter}}^{\mathrm{leg}}=0.10\,\mathrm m,\qquad s_{\mathrm{exit}}^{\mathrm{leg}}=0.06\,\mathrm m.
+  \label{eq:wlm-hysteresis}
+\end{equation}
+当前\emph{不是}足模式时，只有 $s>0.10\,$m 才进入足模式；当前\emph{已是}足模式时，只有 $s<0.06\,$m 才允许离开。中间区间 $[0.06,0.10]\,$m \textbf{保持原模式}。
+
+\begin{insight}[模式切换滞回 $=$ 施密特触发器]\label{ins:wlm-schmitt}
+切换滞回与电子学的\textbf{施密特触发器}同构（去重指向 \cref{ins:lidar-loc-hysteresis} 对滞回/迟滞的统一论述）：输入电压从低到高时输出在 $V_H$ 翻转、从高到低时在 $V_L<V_H$ 翻转；若无滞回，输入在阈值附近波动会让输出剧烈抖动。这里地形特征对应输入电压、模式选择对应输出电平、阈值差 $s_{\mathrm{enter}}-s_{\mathrm{exit}}$ 对应滞回带宽。识别出“这是迟滞”，就能把单阈值的边界抖动一眼看穿为\emph{缺了死区}，补一个略宽的反向阈值即可——而不必把切换逻辑写得很复杂。\textbf{滞回不是延迟}：目标不是让系统反应慢，而是让\emph{离散决策对小噪声不敏感}；真正危险的事件（跌倒、过流、通信丢失）应\emph{绕过}普通滞回，直接进 FAULT。
+\end{insight}
+
+\begin{center}
+\small
+\begin{tikzpicture}[>=Stealth,scale=1.0]
+  \draw[->,gray!60!black] (0,0)--(5.0,0) node[right,font=\small]{$s$（台阶高度）};
+  \draw[->,gray!60!black] (0,0)--(0,2.2) node[above,font=\small]{模式};
+  \draw (1.6,0.04)--(1.6,-0.04) node[below,font=\scriptsize]{$s_{\mathrm{exit}}$};
+  \draw (3.2,0.04)--(3.2,-0.04) node[below,font=\scriptsize]{$s_{\mathrm{enter}}$};
+  \draw (-0.05,0.4)--(0.05,0.4) node[left,font=\scriptsize]{WHEEL};
+  \draw (-0.05,1.6)--(0.05,1.6) node[left,font=\scriptsize]{LEG};
+  % lower branch WHEEL until s_enter then jump up
+  \draw[main!70!black,very thick] (0,0.4)--(3.2,0.4);
+  \draw[main!70!black,very thick,->] (3.2,0.4)--(3.2,1.6);
+  \draw[main!70!black,very thick] (3.2,1.6)--(4.6,1.6);
+  % upper branch LEG until s_exit then jump down
+  \draw[second!70!black,very thick] (4.6,1.6)--(1.6,1.6);
+  \draw[second!70!black,very thick,->] (1.6,1.6)--(1.6,0.4);
+  \draw[second!70!black,very thick] (1.6,0.4)--(0,0.4);
+  \node[font=\scriptsize,fill=white,inner sep=1pt] at (2.4,1.0) {死区（保持原模式）};
+  \draw[<->,gray!60!black] (1.6,0.18)--(3.2,0.18);
+\end{tikzpicture}
+\end{center}
+
+\paragraph{方向相关驻留时间。}
+滞回之外，还需\emph{最小驻留时间} $t_{\mathrm{dwell}}\ge t_{\min}$，且\textbf{方向相关}——不同切换方向所需准备时间不同。
+
+\begin{table}[H]\centering\small
+\caption{方向相关最小驻留时间（工程经验值，重述自 Tutorial 100）}
+\label{tab:wlm-dwell}
+\begin{tabular}{lll}
+\toprule
+切换 & 最小驻留时间 & 原因 \\
+\midrule
+WHEEL $\to$ LEG & $0.5$–$1.0\,$s & 需降速并调整腿姿态 \\
+LEG $\to$ WHEEL & $1.0$–$2.0\,$s & 需确认平地连续存在 \\
+WHEEL $\to$ HYBRID & $0.3$–$0.8\,$s & 坡道/碎石变化较快 \\
+HYBRID $\to$ WHEEL & $1.0\,$s & 避免出碎石后立即加速 \\
+任何模式 $\to$ FAULT & $0\,$s & 安全优先 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{地形特征：从高程图到切换依据。}
+切换依据不是单个高度，而是规划窗口 $\Omega$ 内的一组局部统计量。设高程图为 $h(x,y)$，最小二乘拟合平面 $h\approx ax+by+c$，则
+\begin{align}
+  \text{坡度角}\quad&\alpha=\arctan\sqrt{a^2+b^2},\label{eq:wlm-slope}\\
+  \text{粗糙度（残差 RMS）}\quad&\rho=\sqrt{\frac1{|\Omega|}\sum_{(x,y)\in\Omega}\big(h(x,y)-ax-by-c\big)^2},\label{eq:wlm-rough}\\
+  \text{台阶高（分位差）}\quad&s=h_{95\%}-h_{5\%}.\label{eq:wlm-step}
+\end{align}
+此外地形置信度 $c_{\mathrm{terrain}}$（来自点云密度、深度有效像素比、时间一致性或语义置信度）与摩擦估计 $\mu_{\mathrm{est}}$。切换决策\emph{不应只看平均坡度}：$12^\circ$ 平整坡道适合 HYBRID 或 WHEEL，$6^\circ$ 但布满碎石的区域更适合 LEG 或 HYBRID，高程图缺失严重的区域不应贸然高速滚动。
+
+\begin{table}[H]\centering\small
+\caption{地形特征对模式的影响}
+\label{tab:wlm-terrain}
+\begin{tabular}{llll}
+\toprule
+特征 & 低值含义 & 高值含义 & 对模式的影响 \\
+\midrule
+$\alpha$（坡度） & 平地 & 坡道 & 高值倾向 HYBRID/LEG \\
+$\rho$（粗糙度） & 平整 & 粗糙 & 高值降低 WHEEL 置信 \\
+$s$（台阶高） & 无台阶 & 有台阶 & 高值倾向 LEG \\
+$c_{\mathrm{terrain}}$（置信度） & 感知不可靠 & 感知可靠 & 低值限速或 HYBRID \\
+$\mu_{\mathrm{est}}$（摩擦） & 摩擦小 & 摩擦大 & 低值限制轮加速度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{模式评分与安全裁决。}
+FSM 可用规则写死，也可先算每个模式的\emph{评分}再选最优。评分函数（特征须先归一化，因坡度/粗糙度/置信度单位不同）：
+\begin{equation}
+  S_m=\sum_k w_k^m\,\phi_k,\qquad
+  m^\star=\arg\min_{m}S_m,
+  \label{eq:wlm-score}
+\end{equation}
+其中 $\phi_k\in\{\bar\alpha,\bar\rho,\bar s,1-\mu_{\mathrm{est}},1-c_{\mathrm{terrain}}\}$ 为归一化特征（如 $\bar\alpha=\mathrm{clip}(\alpha/\alpha_{\max},0,1)$），$w_k^m$ 为可写入参数文件的权重。评分法的优点是\emph{可解释}——每个权重都能解释“为什么切换”、写进日志；缺点是权重耦合，故必须先归一化。
+
+评分给出\emph{偏好}，但偏好之上必须有\textbf{安全裁决}给出\emph{禁用集合}。例如：轮电机温度过高 $\Rightarrow$ 禁用长时间轮模式；轮速编码器丢包 $\Rightarrow$ 禁用高速轮模式；高程图置信度低 $\Rightarrow$ 禁止超过安全速度；IMU 俯仰角过大 $\Rightarrow$ 禁止继续加速。形式化为
+\begin{equation}
+  \mathcal M_{\mathrm{allowed}}=\mathcal M\setminus\mathcal M_{\mathrm{blocked}},\qquad
+  m^\star=\arg\min_{m\in\mathcal M_{\mathrm{allowed}}}S_m,
+  \label{eq:wlm-veto}
+\end{equation}
+若 $\mathcal M_{\mathrm{allowed}}=\varnothing$ 则进 FAULT 或 STAND。
+
+\begin{insight}[学习策略可建议，安全裁决必须有最终否决权]\label{ins:wlm-veto}
+无论模式由显式 FSM 规则、模式评分（\cref{eq:wlm-score}），还是强化学习门控 $\pi(a_m\mid o_t)$ 给出，安全裁决层（\cref{eq:wlm-veto}）都必须有\textbf{最终否决权}。这不是保守主义，而是硬件部署的基本结构：从系统视角看，显式 FSM 与学习门控都是“观测 $\to$ 离散模式”的映射，区别只在规则由工程师写还是由数据/奖励塑造；二者\emph{都}需要安全边界、驻留时间、对不确定感知的处理。推荐结构是“感知/估计 $\to$ 候选模式评分或策略网络 $\to$ 安全裁决 $\to$ 带滞回 FSM $\to$ 下贯 MPC/WBC/硬件”。
+\end{insight}
+
+\paragraph{模式相关速度包络。}
+不同模式应使用不同的最大速度，且\emph{随地形置信度连续变化}而非简单限幅：
+\begin{equation}
+  v_{\max}=v_{\min}+c_{\mathrm{terrain}}\,(v_{\max}^{\mathrm{nom}}-v_{\min}).
+  \label{eq:wlm-envelope}
+\end{equation}
+感知可靠（$c_{\mathrm{terrain}}\to1$）时允许接近标称速度 $v_{\max}^{\mathrm{nom}}$；感知不可靠（$c_{\mathrm{terrain}}\to0$）时回到保守速度 $v_{\min}$。典型标称值：WHEEL $2.5\,$m/s、HYBRID $1.0\,$m/s、LEG $0.5\,$m/s、TRANSITION $0.3\,$m/s。高层速度命令须经此包络裁剪，否则会在低置信地形高速滚动而打滑。
+
+\begin{practice}
+\begin{enumerate}
+  \item 给定 \cref{eq:wlm-hysteresis} 的双阈值与 \cref{tab:wlm-dwell} 的驻留时间，画出台阶高度 $s(t)$ 在 $0.05\to0.12\to0.07\,$m 缓变时模式随时间的轨迹，标出每次切换时刻。
+  \item 设计一组 $w_k^{\mathrm{LEG}},w_k^{\mathrm{WHEEL}},w_k^{\mathrm{HYBRID}}$，使“$6^\circ$ 但 $\rho$ 大的碎石”评分选 HYBRID、“$12^\circ$ 平整坡”选 WHEEL；并说明归一化为何是前提。
+  \item 解释为何“任何模式 $\to$ FAULT”的驻留时间设为 $0\,$s（\cref{tab:wlm-dwell}），与 \cref{ins:wlm-schmitt} 中“危险事件绕过滞回”如何一致。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{模式信息下贯：MPC、WBC 与状态估计}
+\label{sec:wlm-downstream}
+
+\paragraph{下贯 MPC：mode schedule 与约束激活。}
+FSM 给出的整机模态 $\mathcal M$ 须展开为逐端模式向量 $\boldsymbol\sigma$，再编码为 OCP 的 mode schedule（事件时刻 + 模式序列）。下层 OCP 在固定序列下求解（\cref{eq:wlm-layered}），各约束类按“当前时刻处于哪个模式”激活或关闭——这正是 \cref{ins:wlm-schedule} 所述：约束激活逻辑\emph{不关心模式整数的语义}，只需查询当前模式并据此激活对应约束。轮的纯滚动约束（\cref{eq:wlm-rolling}）只在 WHEEL/HYBRID 激活；足端零速度约束只在 LEG 与某些 HYBRID 子模式激活；过渡模式激活软化约束。这与 \cref{ch:quad_mpc} 单刚体 MPC 的代价/约束接口一脉相承，区别仅在“模式从二值（swing/stance）扩展为三值（swing/foot/wheel）”。
+
+\paragraph{下贯 WBC：任务栈随模式重排。}
+WBC 的任务优先级栈（\cref{ch:quad_wbc}）随模式改变。\cref{tab:wlm-wbc-stack} 列出四模式的任务栈：动力学一致性始终居首（硬约束），其后的接触/滑移/跟踪任务按模式重排。
+
+\begin{table}[H]\centering\small
+\caption{WBC 任务栈随模式重排（从高到低；重述自 Tutorial 100，记号归一）}
+\label{tab:wlm-wbc-stack}
+\begin{tabularx}{\linewidth}{p{0.07\linewidth}LLLL}
+\toprule
+优先级 & WHEEL & LEG & HYBRID & TRANSITION \\
+\midrule
+1 & 动力学一致性 & 动力学一致性 & 动力学一致性 & 动力学一致性 \\
+2 & 轮接触法向不穿透 & 支撑足零速度 & 接触一致性 & 速度投影约束 \\
+3 & 横向无滑移 & 摩擦锥 & 摩擦锥 & 接触力限斜率 \\
+4 & 基座姿态 & 基座姿态 & 横向滑移抑制 & 基座姿态 \\
+5 & 轮速跟踪 & 摆腿轨迹 & 基座姿态 & 轮速限斜率 \\
+6 & 腿部姿态正则 & 关节姿态正则 & 轮速或足端轨迹 & 关节姿态插值 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{pitfall}[陷阱：只切换上层模式名称]\label{pf:wlm-name-only}
+最隐蔽的错误是\emph{只切上层模式名、不切下层}。若上层进入 LEG 模式，但 WBC 仍在用 WHEEL 的横向滚动约束，控制器会互相打架；若 WBC 切到 LEG，但硬件仍给轮电机速度命令，轮端会在支撑点处打滑。\textbf{模式切换必须同时更新 OCP、WBC 与硬件接口}（以及下文的状态估计）。这就是为什么过渡态必须显式建模（\cref{sec:wlm-fsm}）——它给三层一个共同的、可对齐的“正在切换”信号。
+\end{pitfall}
+
+\paragraph{下贯状态估计：模式决定观测模型。}
+若状态估计器\emph{不知道}当前模式，它会用错误的观测模型。轮模式下，轮速里程计很有用；足模式下，足端静止接触约束很有用；混合模式下两者都可能部分失效。错配的后果具体而严重：轮模式下把接触点当静止足端，会把真实滚动速度误读为滑移；足模式下把轮速积分当里程计，会把轮子微小空转误读为底盘位移。因此模式必须传给估计器，观测模型 $\mathbf y=h_m(\mathbf x)+\mathbf v$ 随模式切换：
+\begin{equation}
+  \mathbf y_{\mathrm{wheel}}=r\,\omega_w-v_\parallel+\boldsymbol\epsilon,\qquad
+  \mathbf y_{\mathrm{foot}}=\mathbf J_c(\mathbf q)\mathbf v+\boldsymbol\epsilon,\qquad
+  \mathbf y_{\mathrm{hybrid}}=\begin{bmatrix}w_r(r\,\omega_w-v_\parallel)\\ w_f\,\mathbf J_c(\mathbf q)\mathbf v\end{bmatrix}+\boldsymbol\epsilon,
+  \label{eq:wlm-obs}
+\end{equation}
+其中 $v_\parallel=\mathbf e_\parallel^\top\mathbf J_c\mathbf v$ 为接触点纵向速度，混合模式权重 $w_r,w_f$ 随地形置信度变化。
+
+\begin{insight}[一个模式信号，三处同步消费]\label{ins:wlm-one-signal}
+本节的统一观念：FSM 输出的模式（与过渡信号）是\emph{一个}信号，但被\emph{三处}同步消费——MPC 据此激活约束与代价（\cref{eq:wlm-layered}）、WBC 据此重排任务栈（\cref{tab:wlm-wbc-stack}）、估计器据此切换观测模型（\cref{eq:wlm-obs}）。任一处漏切，系统就会在“上层以为在做 A、下层在做 B”的不一致中失稳。这把 \cref{ins:wlm-problem-change} 的抽象论断落到了三个具体接口上。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{故障排查}
+\label{sec:wlm-debug}
+
+\paragraph{故障一：模式抖动。}
+\textbf{现象}：模式在 WHEEL 与 HYBRID（或 WHEEL 与 LEG）间频繁跳，日志每秒出现多次切换，基座速度出现周期性掉速，MPC 求解时间变长。\textbf{根因}：MPC 的约束集每次切换都变（\cref{ins:wlm-schedule}），优化器被迫反复在不同问题间重新收敛。常见诱因——单阈值无滞回、高程图噪声未滤波、驻留时间过短、地形窗口太小、语义置信度被当成硬标签。\textbf{处理路径}：
+
+\begin{enumerate}
+  \item 绘制 $s,\rho,\alpha$ 随时间曲线，标出每次切换时刻，检查特征是否在阈值附近来回穿越；
+  \item 增大进入/退出阈值差（\cref{eq:wlm-hysteresis}）、增大最小驻留时间（\cref{tab:wlm-dwell}）；
+  \item 对高程特征做时间中值滤波；
+  \item 将低置信度地形\emph{统一}切到 HYBRID（\cref{eq:wlm-envelope} 同时限速），而非在 WHEEL 与 LEG 之间摇摆。
+\end{enumerate}
+
+\paragraph{故障二：切换瞬间冲击。}
+\textbf{现象}：轮到足切换时机身点头，轮胎发出摩擦声，足端力峰值明显，关节力矩出现尖峰。\textbf{根因}：切换瞬间当前速度不在新约束子空间内（\cref{eq:wlm-feasible}），未做可行速度投影，或接触力/PD 增益突变。\textbf{处理路径}：
+
+\begin{enumerate}
+  \item 检查切换前基座速度，确认是否已落入该方向的速度包络（\cref{eq:wlm-envelope}）；
+  \item 检查轮速限斜率是否生效、接触力曲线是否连续（\cref{eq:wlm-force-ramp}）；
+  \item 检查 WBC 约束激活是否与硬件命令\emph{同步}（\cref{pf:wlm-name-only}）；
+  \item 将过渡曲线从线性改为三次光滑 $\varsigma=3s^2-2s^3$；\emph{在 MPC 中}加入过渡模式（而非只在 WBC 里切），让预测轨迹本身就考虑过渡；
+  \item 对 foot$\leftrightarrow$wheel，按 \cref{ins:wlm-identity-reset} 预匹配轮速使 reset 退化为恒等；必要时降低切换前速度上限。
+\end{enumerate}
+
+\begin{table}[H]\centering\small
+\caption{两类典型故障的现象$\to$根因$\to$对策速查}
+\label{tab:wlm-debug}
+\begin{tabular}{p{0.16\linewidth}p{0.30\linewidth}p{0.42\linewidth}}
+\toprule
+故障 & 根因 & 首要对策 \\
+\midrule
+模式抖动 & 约束集每周期变、特征在阈值附近穿越 & 加大滞回带 + 驻留时间 + 中值滤波；低置信统一切 HYBRID \\
+切换冲击 & 速度不在新子空间、力/增益突变 & 可行速度投影 + 三次力斜坡 + 三层同步 + 预匹配轮速 \\
+选择过保守 & 置信度阈值过高、退出阈值过低 & 用分位数而非经验猜设阈值；限定高程窗口于前进方向 \\
+选择过激进 & 只看坡度不看粗糙度、无摩擦估计 & 粗糙度高优先 HYBRID；命令经速度包络裁剪 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+本章把轮足机器人“何时滚、何时走、何时混合”这一看似离散的决策，焊接进连续的动力学与优化框架：
+
+\begin{itemize}
+  \item \textbf{混杂系统骨架}（\cref{sec:wlm-hybrid}）：轮足切换的母语言是 $\mathcal H=\{\mathcal M,f_m,\mathcal G_{m\to n},R_{m\to n}\}$。mode schedule 决定每段激活哪些约束/控制量/代价，错位则下层 OCP 忠实地收敛到错误问题；混合整数 OCP 因 $K^N$ 爆炸（$3^{20}\approx3.5\times10^9$）不可实时，故\emph{分层}：上层定模式序列、下层固定序列求 OCP。
+  \item \textbf{落地冲击 reset}（\cref{sec:wlm-reset}）：由冲量-动量 + 完全非弹性碰撞得 $\mathbf v^+=\mathbf P_M\mathbf v^-$，投影矩阵 $\mathbf P_M$ 与 WBC 接触零空间投影同形；能量损失 $\Delta T\propto\|\mathbf J_c\mathbf v^-\|^2\ge0$ 给出“软着陆”指导。foot$\leftrightarrow$wheel 切换通过预匹配轮速 $r\omega_w=\mathbf e_\parallel^\top\mathbf J_c\mathbf v^-$ 使 reset 退化为恒等、无冲量。
+  \item \textbf{过渡控制器}（\cref{sec:wlm-transition}）：可行速度投影 $\mathbf v^+=\mathbf v^--\mathbf W^{-1}\mathbf A_n^\top\mathbf S^{-1}(\mathbf A_n\mathbf v^--\mathbf b_n)$，$\mathbf S$ 秩亏时用伪逆/阻尼逆；三件事——速度匹配、接触力三次斜坡、控制接口切换。
+  \item \textbf{工程 FSM}（\cref{sec:wlm-fsm}）：滞回（施密特触发器）+ 方向相关驻留时间 + 地形特征（坡度/粗糙度/台阶高/置信度）+ 模式评分 + 安全裁决 $\mathcal M_{\mathrm{allowed}}=\mathcal M\setminus\mathcal M_{\mathrm{blocked}}$；过渡态必须显式建模。
+  \item \textbf{下贯三层}（\cref{sec:wlm-downstream}）：一个模式信号被 MPC（约束激活）、WBC（任务栈重排）、估计器（观测模型）同步消费，漏切则失稳。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{公式速查表}
+\label{tab:wlm-cheatsheet}
+\begin{tabular}{p{0.30\linewidth}p{0.40\linewidth}p{0.22\linewidth}}
+\toprule
+名称 & 表达式 & 出处 \\
+\midrule
+混杂系统四元组 & $\mathcal H=\{\mathcal M,f_m,\mathcal G_{m\to n},R_{m\to n}\}$ & \cref{def:wlm-hybrid} \\
+组合爆炸 & $K^N=3^{20}\approx3.5\times10^9$ & \cref{eq:wlm-combinatorial} \\
+落地 reset & $\mathbf v^+=\mathbf P_M\mathbf v^-$ & \cref{eq:wlm-reset} \\
+接触投影 & $\mathbf P_M=\mathbf I-\mathbf M^{-1}\mathbf J_c^\top(\mathbf J_c\mathbf M^{-1}\mathbf J_c^\top)^{-1}\mathbf J_c$ & \cref{eq:wlm-reset} \\
+切换能量损失 & $\Delta T=\tfrac12(\mathbf J_c\mathbf v^-)^\top(\mathbf J_c\mathbf M^{-1}\mathbf J_c^\top)^{-1}(\mathbf J_c\mathbf v^-)$ & \cref{eq:wlm-energy-loss} \\
+纯滚动约束 & $\mathbf e_\parallel^\top\mathbf J_c\mathbf v=r\,\omega_w$ & \cref{eq:wlm-rolling} \\
+可行速度投影 & $\mathbf v^+=\mathbf v^--\mathbf W^{-1}\mathbf A_n^\top\mathbf S^{-1}(\mathbf A_n\mathbf v^--\mathbf b_n)$ & \cref{eq:wlm-proj} \\
+接触力三次斜坡 & $\varsigma=3s^2-2s^3$ & \cref{eq:wlm-force-ramp} \\
+滞回双阈值 & $s_{\mathrm{enter}}>s_{\mathrm{exit}}$（中间保持） & \cref{eq:wlm-hysteresis} \\
+模式评分/裁决 & $m^\star=\arg\min_{m\in\mathcal M_{\mathrm{allowed}}}S_m$ & \cref{eq:wlm-veto} \\
+速度包络 & $v_{\max}=v_{\min}+c_{\mathrm{terrain}}(v_{\max}^{\mathrm{nom}}-v_{\min})$ & \cref{eq:wlm-envelope} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{本章符号表}
+\label{tab:wlm-symbols}
+\begin{tabular}{ll}
+\toprule
+符号 & 含义 \\
+\midrule
+$\mathcal M$ & 整机运动模态集 $\{\mathrm{WHEEL},\mathrm{LEG},\mathrm{HYBRID},\mathrm{TRANSITION}\}$ \\
+$\boldsymbol\sigma$ & 逐端模式向量，$\sigma_i\in\{\mathrm{swing},\mathrm{foot},\mathrm{wheel}\}$ \\
+$\mathcal H$ & 混杂系统四元组 $\{\mathcal M,f_m,\mathcal G_{m\to n},R_{m\to n}\}$ \\
+$f_m,\;\mathcal G_{m\to n},\;R_{m\to n}$ & 连续流、切换面（保护条件）、重置映射 \\
+$\mathbf v^-,\mathbf v^+$ & 切换前/后广义速度 \\
+$\boldsymbol\Lambda$ & 接触冲量 $\int_{t^-}^{t^+}\boldsymbol\lambda\,\mathrm dt$ \\
+$\mathbf P_M$ & 接触零空间投影矩阵（关于度量 $\mathbf M$） \\
+$\mathbf J_c$ & 接触雅可比；$\mathbf e_\parallel,\mathbf e_\perp,\mathbf n$ 为接触点纵/横/法向基 \\
+$\omega_w,\omega_{\mathrm{ref}},r$ & 轮角速度、轮速参考、轮半径 \\
+$\mathbf A_n,\mathbf b_n,\mathbf W,\mathbf S$ & 新约束矩阵/右端、投影度量、约束度量 $\mathbf A_n\mathbf W^{-1}\mathbf A_n^\top$ \\
+$\varsigma(t),T_{\mathrm{tr}}$ & 三次过渡插值、过渡时长 \\
+$s_{\mathrm{enter}},s_{\mathrm{exit}},t_{\mathrm{dwell}}$ & 滞回进入/退出阈值、驻留时间 \\
+$\alpha,\rho,s,c_{\mathrm{terrain}},\mu_{\mathrm{est}}$ & 坡度、粗糙度、台阶高、地形置信度、摩擦估计 \\
+$S_m,\;\mathcal M_{\mathrm{allowed}}$ & 模式评分、安全裁决后的允许模式集 \\
+$v_{\max}^{\mathrm{nom}},v_{\min}$ & 模式速度包络的标称/保守上限 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{本章与相关章节的关系}
+\label{tab:wlm-relations}
+\begin{tabular}{p{0.26\linewidth}p{0.66\linewidth}}
+\toprule
+章节 & 关系 \\
+\midrule
+\cref{ch:wl-dynamics}（承上） & 提供轮足统一动力学、各向异性摩擦锥、Pfaffian 约束；本章接手其“模式切换瞬间与决策” \\
+\cref{ch:unified-multimodal-mpc} & 多模态 MPC 混合系统骨架与零空间投影（\cref{sec:umm-nullspace,eq:umm-dls}），与本章互为表里 \\
+\cref{ch:constrained-dynamics} & Pfaffian 约束与 Frobenius 可积判据（\cref{sec:cd-contact} 冲量层） \\
+\cref{ch:quad_mpc} & 单刚体 MPC 的代价/约束接口（\cref{sec:srbd,eq:friction-cone,eq:mpc-problem}），模式从二值扩为三值 \\
+\cref{ch:quad_wbc} & WBC 任务栈与接触零空间投影，随模式重排（\cref{tab:wlm-wbc-stack}） \\
+\cref{ch:mm-wheeled} & 轮式 Pfaffian 与 $\SE(2)$，纯滚动/横向无滑移约束的源头 \\
+\cref{ins:lidar-loc-hysteresis} & 滞回/迟滞的统一论述（施密特触发器去重锚） \\
+\bottomrule
+\end{tabular}
+\end{table}

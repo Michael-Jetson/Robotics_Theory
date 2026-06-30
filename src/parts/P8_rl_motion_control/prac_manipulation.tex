@@ -1,0 +1,1431 @@
+\chapter{机械臂与灵巧手操作}\label{ch:rlmc-manip}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章。
+%  主线 = 算法/概念领路：先立「操作 MDP 与 locomotion 的结构性差异、有哪些观测/
+%  奖励/动作抽象/接触参数」，再把每个概念落到 mjlab / Isaac Lab / UniLab 三框架
+%  的工程接线上做对比。假定读者已有 RL 基础（理论部已讲 MDP/策略梯度/AC/PPO/GAE）；
+%  本章只讲扩展+实战，不重教基础。
+%  源稿 RL运控/Ch17_机械臂与灵巧手操作.md（mjlab YAM + Isaac Lab DexSuite）按本主线重构。
+%  UniLab 一列已据 docs/RL运控融合_UniLab参考.md §4.9 实装填充（in-hand 灵巧手旋转
+%  AllegroInhandRotation/SharpaInhandRotation + HORA 蒸馏 + sim2sim 契约）；UniLab 真欠缺的
+%  特性（视觉操作变体、腱驱/位点力动作）按 §6 如实标注「无对应/未确认」，不再留占位。
+%  关键 API/版本/论文归属经联网核（截至 2026-06）：
+%    - mjlab = Zakka 等, arXiv:2601.22074(2026)，已核；论文正文只文档化单一「Cube Lifting」
+%      任务且明言「High-fidelity RGB rendering is out of scope」、tiled renderer 为 upcoming。
+%      故 RGB/Depth/multi-cube 四变体 task ID、DiffIK §3.3 细节、视觉 CNN 配置均来自源稿对
+%      仓库的阅读，非论文确证 -> 包 \pz{待核实} 并入 claimsToVerify。
+%    - 「YAM 从 32x32 RGB <5min 解 lift cube」=Kevin Zakka 公开发布(X, 2025-12)已核，属预览特性。
+%    - DexPBT = Petrenko, Allshire, State, Handa, Makoviychuk, RSS 2023, arXiv:2305.12127，已核。
+%    - Isaac Lab 2.3 DexSuite(Kuka+Allegro)引入 dict obs / ADR / PBT，PBT 例任务
+%      Isaac-Dexsuite-Kuka-Allegro-Lift-v0「inspired by DexPBT」，已核(NVIDIA dev blog + IsaacLab docs)。
+%    - SpatialSoftmax 源 = Finn 等「Deep Spatial Autoencoders」ICRA2016, arXiv:1509.06113，已核。
+%    - DeXtreme = Handa 等 ICRA2023, arXiv:2210.13702；ADR 原始工程 = OpenAI「Solving Rubik's Cube」
+%      Akkaya 等 2019, arXiv:1910.07113，已核。
+%    - Diffusion Policy = Chi 等 RSS2023/IJRR2024, arXiv:2303.04137，已核。
+%    - CoACD = Wei,Liu,Ling,Su, SIGGRAPH2022, arXiv:2205.02961；robosuite = Zhu 等 2020, arXiv:2009.12293；
+%      OSC = Khatib 1987，已核。
+%    - Isaac Lab OSC action cfg 用 controller_cfg（不是 controller）、target_types 必填，已据源稿标注。
+% ════════════════════════════════════════════════════════════════
+
+前面几章把强化学习运动控制的零件逐一打磨好了：观测与动作的契约（\cref{ch:rlmc-obsact}）、奖励与课程（\cref{ch:rlmc-reward}）、Manager 架构（\cref{ch:rlmc-manager}）、物理引擎（\cref{ch:rlmc-physics}）、特权学习（\cref{ch:rlmc-privileged}）、域随机化（\cref{ch:rlmc-dr}），并在四足速度跟踪（\cref{ch:rlmc-quadloco}）与模仿学习（\cref{ch:rlmc-imitation}）两章里把它们组合成完整任务。但这些任务有一个共同点：机器人是\emph{浮动基座}，目标是「持续运动」。本章切到一个结构上完全不同的任务族——\textbf{固定基座操作}：机械臂与灵巧手要去\emph{改变外部世界的状态}（把方块抬到目标、把方块在掌中转到目标姿态）。
+
+本章仍遵循全书「算法领路、实践兑现」的次序。这里的「算法/概念主线」是\textbf{操作任务的 MDP 与 locomotion 的结构性差异}——成功定义从「不摔倒」变成「物体到位」、奖励从连续密集变成阶段性、接触从宽容变成二元敏感——以及由此衍生的工程对策：staged reward 的乘法门控、三层动作抽象（关节/运动学/动力学）、接触参数调优、视觉操作的渐进管线。理解这条主线后，每个概念都落到 mjlab、Isaac Lab、UniLab 三框架的工程接线上做对比。源材料覆盖 mjlab 的 YAM lift cube 与 Isaac Lab 的 DexSuite；UniLab 一列以其灵巧手 in-hand 旋转任务（\Verb[breaklines]|AllegroInhandRotation|/\allowbreak\Verb[breaklines]|SharpaInhandRotation| + HORA 蒸馏 + sim2sim 契约）给出真实接线，仅在 UniLab 确实欠缺的特性（视觉操作变体、腱驱/位点力动作）处如实标注「无对应/未确认」。
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-manip-setup}
+
+本章实战横跨两套框架，安装层级与\cref{ch:rlmc-setup} 的双框架基础完全一致——操作任务\emph{不需要}额外的依赖链（不像模仿学习那条动作数据管线）。真正的新约束来自\textbf{接触物理}：操作对摩擦、刚度、求解器迭代次数远比 locomotion 敏感，所以「装好」之外还要确认仿真器版本的接触求解行为。\cref{tab:rlmc-manip-req} 给出三框架的环境要求与版本兼容点。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{操作任务三框架的环境要求与版本兼容（UniLab 入口为灵巧手 in-hand，无平行夹爪 lift）}
+\label{tab:rlmc-manip-req}
+\begin{tabularx}{\linewidth}{@{}lLLL@{}}
+\toprule
+要求项 & mjlab（YAM lift cube） & Isaac Lab（DexSuite / Franka） & UniLab \\
+\midrule
+本体框架 & mjlab（\cref{ch:rlmc-setup}） & Isaac Lab $\ge 2.3$ & UniLab（\texttt{uv sync --extra mujoco}） \\
+Python & $\ge 3.10$ & $\ge 3.10$ & $\ge 3.13$ \\
+物理后端 & MuJoCo Warp（软约束接触） & PhysX（TGS 迭代接触） & MuJoCoUni / MotrixSim（CPU 全精度接触） \\
+RL 后端 & RSL-RL（PPO） & rl\_games / RSL-RL / SKRL & PPO/APPO/SAC/TD3（GPU 学习器） \\
+灵巧手任务 & 无（平行夹爪为主） & DexSuite（Kuka+Allegro，2.3 新增） & in-hand 旋转（Allegro / Sharpa） \\
+视觉支持 & depth 已支持；RGB 为预览 & RTX 渲染 + TiledCamera & 无视觉任务（本体感知，见 \S\ref*{sec:rlmc-manip-vision}） \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{为什么版本号在操作任务里更要紧。}locomotion 里换一个 MuJoCo/PhysX 小版本，策略大体还能跑通；操作任务不行——接触求解器的默认参数（\verb|solref|、\Verb[breaklines]|solver_iteration_count|）在不同版本间偶有变化，而抓取稳定性对这些参数高度敏感。Isaac Lab 的 DexSuite（Kuka+Allegro 灵巧手任务）以及 ADR/PBT 的 first-class 支持是 \textbf{2.3} 才引入的\,\cite{nvidia2025isaaclab23}，低于此版本则没有这些内置任务。mjlab 的 RGB 渲染在本书撰写时尚属\emph{预览}（论文明言高保真 RGB 渲染暂不在范围内，tiled renderer 待 MuJoCo Warp 退出 beta 后随 v1.1 发布）\,\cite{zakka2026mjlab}，因此本章 depth 路线可直接落地，RGB 路线需以你所装版本为准。
+
+\begin{pitfall}[接触参数「装好」之后才咬人]
+\textbf{错误描述}：装好 mjlab/Isaac Lab 后直接照搬 locomotion 的接触/求解器配置去跑抓取。\textbf{现象后果}：环境跑得起来、zero/random play 看着正常，但训练时方块总从夹爪里「滑落」或被「弹飞」，奖励永远上不去。\textbf{根本原因}：locomotion 的地面接触宽容（大面积、持续），其默认 \verb|solref|/\allowbreak\verb|friction|/\allowbreak\Verb[breaklines]|solver_iteration| 对夹爪的小面积瞬时接触根本不够；PhysX 默认 4 次位置迭代对灵巧手会让手指「穿过」物体。\textbf{正确做法}：见 \cref{sec:rlmc-manip-contact} 的接触三步调优——先用 zero/random play 验证物理，再调 \verb|solref|/\allowbreak\verb|condim|/\allowbreak\verb|impratio|（MuJoCo）或 \Verb[breaklines]|solver_position_iteration_count|/\allowbreak\Verb[breaklines]|contact_offset|（PhysX），而非只看 \verb|import| 不报错就开训。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：五分钟在 mjlab 上看见抓取}
+\addcontentsline{toc}{section}{Quick Start：五分钟在 mjlab 上看见抓取}
+\label{sec:rlmc-manip-quickstart}
+
+下面给出装好之后\emph{立即可复制粘贴}的最小路径。目标不是训练出能抓取的策略，而是证明「从 MJCF 资产到操作训练循环」整条链是通的。mjlab 自带 YAM 机械臂的 lift cube 任务，是验证整条链最快的入口。
+
+\begin{codebox}[bash]{mjlab YAM lift cube 最小可跑（state 版）}
+# 1. 列出已注册任务，确认 YAM 系列存在
+uv run list-envs | grep -i yam
+# 2. 用零动作 agent 回放 —— 验证资产加载 + 可视化（机械臂/方块/目标点）
+uv run play Mjlab-Lift-Cube-Yam --agent zero --num-envs 4 \
+    --viewer viser --no-terminations
+# 3. 128 环境跑十步 smoke train —— 验证 actor/critic 与训练循环接线
+uv run train Mjlab-Lift-Cube-Yam \
+    --env.scene.num-envs 128 --agent.max-iterations 10
+\end{codebox}
+
+UniLab 的操作入口是 in-hand（掌中操作）而非平行夹爪 lift——它原生提供 Allegro/Sharpa 灵巧手的在手旋转任务，最快的验证入口如下。
+
+\begin{codebox}[bash]{UniLab in-hand 操作最小可跑（state 版，灵巧手旋转）}
+# 1. 回放预训练 in-hand grasp 策略（首跑从 HF 拉权重;国内先 export HF_ENDPOINT=https://hf-mirror.com）
+uv run demo inhandgrasp
+# 2. 短训冒烟 —— 验证 NpEnv(CPU) + GPU 学习器接线（env 数/迭代走 Hydra 覆盖，非 flag）
+uv run train --algo ppo --task sharpa_inhand --sim mujoco \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+# 3. 正式起训
+uv run train --algo ppo --task sharpa_inhand --sim mujoco
+\end{codebox}
+
+\begin{note}[mjlab/Isaac Lab 是 lift，UniLab 入口是 in-hand]
+三框架的操作\emph{入门任务族不同}：mjlab YAM 与 Isaac Lab Franka 是\textbf{平行夹爪 lift cube}（有 reach$\to$grasp$\to$bring 阶段），UniLab 当前注册的操作任务是\textbf{灵巧手 in-hand 旋转}（\verb|sharpa_inhand|、\Verb[breaklines]|allegro_inhand|，物体始终在手中、无「接近」阶段）。因此 UniLab 一列在「staged reward / 平行夹爪」概念处会标注「无对应任务族」，而在「灵巧手 / 接触 / 特权学习」概念处给出真实接线——这正是本章三框架对比的诚实之处。注意 UniLab 的 \verb|--task| 用小写 slug、env 数走 Hydra 覆盖（\Verb[breaklines]|algo.num_envs=...|），与 mjlab 的 \Verb[breaklines]|--env.scene.num-envs| 风格不同。
+\end{note}
+
+\begin{note}[最常踩的 Quick Start 坑]
+mjlab 默认\emph{无头}，看可视化要显式加 \Verb[breaklines]|--viewer viser|（与 Isaac Lab 默认开 GUI 相反，见 \cref{ch:rlmc-setup}）。zero play 时若方块持续加速下落而不是落到桌面静止，多半是 MJCF 里没有桌面碰撞体或 \verb|grasp_site| 位置不对——这\emph{不是} bug，但先排查掉它能省下后面数小时的奖励调试。\pzr{10 个 iteration 绝不代表学会了抓取}——操作任务通常要数百到数千 iteration 才看得到阶段性进步，smoke train 只验证管线入口正确。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{前置自测}
+\addcontentsline{toc}{section}{前置自测}
+\label{sec:rlmc-manip-pretest}
+
+\begin{practice}[前置自测：答错 $\ge 3$ 题，建议先回相应章节]
+\begin{enumerate}
+  \item \Verb[breaklines]|ObservationManager| 如何把多个 observation term 拼成一个 tensor？actor 与 critic 的 observation group 为什么可以不同？（回看 \cref{ch:rlmc-obsact} 的非对称结构）
+  \item 指数型奖励 $r=\exp(-\|e\|^2/\sigma^2)$ 中 $\sigma$ 起什么作用？$\sigma$ 太小、太大分别有什么问题？（回看 \cref{ch:rlmc-reward}）
+  \item RSL-RL 的 PPO 里 \Verb[breaklines]|num_steps_per_env| 与 \verb|num_envs| 如何共同决定 batch size？（回看 \cref{ch:rlmc-training}）
+  \item 库仑摩擦 $f_t \le \mu f_n$ 中，当法向力 $f_n \to 0$ 时切向摩擦上限会怎样？这对夹爪抓取为何关键？（回看 \cref{ch:rlmc-physics}）
+  \item 域随机化的四种事件模式（startup / reset / interval / step）分别在什么时机触发？物体位姿随机化该用哪种？（回看 \cref{ch:rlmc-dr}）
+  \item teacher-student 蒸馏里 teacher 看到了 student 看不到的什么信息？操作任务中这种信息不对称为何比 locomotion 更严重？（回看 \cref{ch:rlmc-privileged}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章目标}
+\addcontentsline{toc}{section}{本章目标}
+\label{sec:rlmc-manip-goals}
+
+学完本章后，你应当能够：
+
+\begin{enumerate}
+  \item \textbf{定位} mjlab YAM lift cube 的 staged reward 源码实现，并\textbf{解释}乘法门控为何优于等权加和。
+  \item \textbf{配置} YAM state 版的 observation group，\textbf{计算}其总维度并在训练前打印核对。
+  \item \textbf{区分} \Verb[breaklines]|JointPositionActionCfg| / \Verb[breaklines]|DifferentialIKActionCfg| / OSC 三种动作抽象的工程特性，按任务需求选型。
+  \item \textbf{调通} YAM 四种变体（state / RGB / Depth / multi-cube）的注册验证、zero/random play 与 smoke train。
+  \item \textbf{配置}操作接触参数（\verb|condim|、\verb|friction|、\verb|solref|、\verb|impratio| 或 PhysX 的迭代次数），并用三步流程验证抓取稳定性。
+  \item \textbf{诊断}操作训练的阶段性失败模式（卡 reaching、夹爪震荡、reward hacking、视觉 privileged 泄漏）。
+  \item \textbf{实现}从 state 到 depth 的视觉操作管线，用静态检查 + 遮蔽测试 + 梯度检查三层防线杜绝 privileged 泄漏。
+  \item \textbf{对比} mjlab YAM 与 Isaac Lab DexSuite 在场景、奖励、动作空间、域随机化上的设计差异，并完成跨框架配置映射。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section*{知识导航与阅读时间}
+\addcontentsline{toc}{section}{知识导航与阅读时间}
+\label{sec:rlmc-manip-nav}
+
+本章承接 \cref{ch:rlmc-obsact}（观测/动作）、\cref{ch:rlmc-reward}（奖励工程）、\cref{ch:rlmc-physics}（接触物理）与 \cref{ch:rlmc-privileged}（特权学习）：操作任务把这些零件重新组织——观测里多了物体状态、奖励变成阶段门控、接触从宽容变敏感、特权信息（接触力/物体速度）只给 critic。本章结构如下树。建议精读 4--6 小时（含动手实验，视觉部分需 GPU）；有 locomotion 实战经验者速读 1.5--2 小时（重点看 \cref{sec:rlmc-manip-diff} 的六维差异表、\cref{sec:rlmc-manip-mjlab} 的 staged reward、\cref{sec:rlmc-manip-action} 的动作选型）；遇到具体问题速查 45 分钟（直接跳故障排查手册）。
+
+\begin{figure}[ht]
+\centering
+\begin{forest}
+navtreeLR
+[机械臂与灵巧手操作
+  [跨域结构差异 (\S\ref*{sec:rlmc-manip-diff})
+    [六维 MDP 差异]
+    [接触二元性]
+    [四阶段因果]
+  ]
+  [mjlab YAM lift cube (\S\ref*{sec:rlmc-manip-mjlab})
+    [MJCF {/} obs {/} command]
+    [staged reward 门控]
+    [$\sigma$ 标定]
+  ]
+  [Isaac Lab DexSuite (\S\ref*{sec:rlmc-manip-dex})
+    [灵巧手 vs 夹爪]
+    [UniLab in-hand {/} HORA]
+    [DexPBT {/} ADR]
+  ]
+  [接触建模 (\S\ref*{sec:rlmc-manip-contact})
+    [MuJoCo solref {/} condim {/} impratio]
+    [PhysX 迭代 {/} offset]
+    [CoACD 碰撞几何]
+  ]
+  [动作空间三层 (\S\ref*{sec:rlmc-manip-action})
+    [JointPos]
+    [DiffIK {+} DLS]
+    [OSC]
+  ]
+  [最小实验 {+} 诊断 (\S\ref*{sec:rlmc-manip-run})
+    [smoke test]
+    [八种失败模式]
+    [reward hacking]
+  ]
+  [跨框架映射 (\S\ref*{sec:rlmc-manip-bridge})]
+  [视觉操作 (\S\ref*{sec:rlmc-manip-vision})
+    [State {to} Depth {to} RGB]
+    [SpatialSoftmax]
+    [privileged 泄漏检测]
+  ]
+]
+\end{forest}
+\caption{本章知识导航树。}
+\label{fig:rlmc-manip-navtree}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{算法主线：从 Locomotion 到 Manipulation 的结构性差异}
+\label{sec:rlmc-manip-diff}
+
+\paragraph{模块功能与在管线中的位置。}本节不写任何配置，它建立一个\emph{认知前提}：操作不是「简化版 locomotion」。双框架的 manager-based 架构（\Verb[breaklines]|ManagerBasedRlEnv| / \Verb[breaklines]|ManagerBasedRLEnv|）对两类任务通用——同样有 ObservationManager、ActionManager、RewardManager、TerminationManager、EventManager，配置骨架同样是 scene $\to$ actions $\to$ observations $\to$ rewards $\to$ terminations $\to$ events。但「框架相同」只对了一半；MDP 的内在结构在两类任务间有深刻差异，不是换几个参数就能桥接的。把这层认知建立起来，后面所有节的配置决策才有据可依。
+
+\subsection{六维设计差异}
+\label{sec:rlmc-manip-sixdim}
+
+\cref{tab:rlmc-manip-sixdim} 把差异压缩成六个维度。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Locomotion 与 Manipulation 的六维 MDP 设计差异}
+\label{tab:rlmc-manip-sixdim}
+\begin{tabular}{@{}lll@{}}
+\toprule
+设计维度 & Locomotion（四足/人形） & Manipulation（机械臂/灵巧手） \\
+\midrule
+成功定义 & 持续运动（无终点） & 状态改变（物体到达目标） \\
+奖励信号 & 连续密集（每步有速度误差） & 阶段性（接触前弱、接触后突变） \\
+关键物理 & 地面接触（大面积、持续、宽容） & 夹爪接触（小面积、瞬时、敏感） \\
+观测核心 & 自身状态（base vel、joint） & 物体状态（object pose、相对位置） \\
+动作空间 & 全身协调（12--25 DOF，容错高） & 末端精确（6--7 DOF，容错极低） \\
+episode 结构 & 摔倒才终止，通常很长 & 成功/超时终止，通常较短 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+这六个差异不是独立的——它们构成一条因果链：因为成功定义是「改变世界状态」，所以策略必须先接触物体；因为接触是瞬时敏感的，所以奖励信号在接触前后存在不连续跳变；因为跳变存在，所以需要 staged reward 而非简单加权；因为 staged reward 编码了阶段顺序，所以训练超参数（学习率、batch size、clip）需要适配更尖锐的 reward landscape。
+
+\begin{insight}[共享框架，不共享设计直觉]\label{ins:rlmc-manip-shared}
+manager-based 架构是一个\emph{通用骨架}，真正定义任务特性的是挂在骨架上的 observation/reward/action/event terms。跨域迁移的关键不是「换一个 robot asset」，而是\textbf{重新思考 MDP 的每一个组件}。一个跨领域类比：locomotion 的 RL 像学骑自行车——只要车在动就有连续的平衡反馈；manipulation 像学投飞镖——命中靶心之前几乎得不到有用反馈。但类比在一点上不成立：操作通常可分解为有序阶段（接近、接触、夹持、搬运），每个阶段都能提供密集信号——这正是 staged reward 的设计动机（\cref{sec:rlmc-manip-staged}）。
+\end{insight}
+
+\paragraph{算法点：直接搬用 locomotion 经验的三个反面。}动机是「框架一样，配置应该也能复用」；下面三个反例说明为什么不能。
+\begin{itemize}
+  \item \textbf{反例 A：复制 PPO 超参。} locomotion 常用 lr$=10^{-3}$、\verb|num_envs|$=4096$、\Verb[breaklines]|num_steps_per_env|$=24$，reward landscape 平滑，大 batch + 大 lr 利于快速收敛。直接用于操作，现象是前 100--200 iteration reward 不涨、然后跳到错误局部极值（末端移到方块旁但不抓）。根因是操作的 reward landscape 在「接近 $\to$ 夹取」边界有尖锐跳变，大 lr 容易跳过这条窄通道。正确做法：更小的 lr（$3\times10^{-4}\sim5\times10^{-4}$）+ 更多 iteration。
+  \item \textbf{反例 B：放大 action scale 加速探索。} locomotion 里增大 action scale 能加速探索（更大步幅）；操作里抓取窗口是毫米级精度，放大 action scale 会让末端在窗口附近剧烈震荡，成功率可能掉一个数量级。
+  \item \textbf{反例 C：把所有 observation 都放进 actor。} locomotion 里 actor 与 critic 的差异主要是 privileged terrain；操作里 state 版 actor 直接看 \verb|ee_to_cube|，视觉版 actor 只能看图像。若视觉版 actor 仍保留 \verb|ee_to_cube|（privileged 泄漏），CNN 会被完全忽略——这在操作里是\emph{致命}的（\cref{sec:rlmc-manip-leak}）。
+\end{itemize}
+
+\subsection{接触的二元性：操作的核心物理困难}
+\label{sec:rlmc-manip-binary}
+
+locomotion 的地面接触是持续、大面积、力学宽容的；脚的位置偏差几厘米通常不致灾难。操作的夹爪接触截然不同：瞬时、小面积、对位姿高度敏感。考虑夹爪闭合抓方块：碰到之前接触力为零、方块不动（无论多接近）；碰到的\emph{瞬间}接触力从零跳到非零——物理状态发生不连续变化。这给值函数估计造成困难：critic 必须在接触边界两侧给出截然不同的价值，而这个边界在状态空间里是一个低维流形（「薄壳」而非「区域」）。
+
+\begin{insight}[难点不在底座不动，而在几何窗口的狭窄]\label{ins:rlmc-manip-window}
+固定基座操作的难点不是自由度少（6--7 DOF 反而比 18 DOF 四足维度低），而是\textbf{所有成功都发生在一个极窄的几何窗口里}：末端位置必须到位（毫米级）、夹爪必须在正确时刻闭合（时序敏感）、摩擦必须足够大（物理约束）、目标必须可达（运动学约束）。四个条件任一不满足，整个抓取就失败。这与 locomotion「只要不摔倒就有 reward」的宽容性形成鲜明对比——也解释了「自由度少 = 更简单」是个常见误解。
+\end{insight}
+
+\cref{tab:rlmc-manip-binary} 把接触二元性对各组件的影响列清，它直接预告了后面几节的工程对策。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{接触二元性对 RL 各组件的影响与工程后果}
+\label{tab:rlmc-manip-binary}
+\begin{tabular}{@{}llll@{}}
+\toprule
+组件 & Locomotion 中 & Manipulation 中 & 工程后果 \\
+\midrule
+值函数 & 平滑（接触持续） & 不连续（接触/不接触边界） & 更小 lr、更大 mini-batch \\
+策略梯度 & 稳定 & 尖锐（微小动作差 $\to$ 接触/不接触） & 更保守的 clip ratio \\
+探索 & 安全（随机动作少致命） & 危险（随机夹爪可能弹飞物体） & 结构化分阶段 reward \\
+域随机化 & 对接触参数不敏感 & 对摩擦/刚度高度敏感 & 更保守的 DR 范围 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{多视角：从力/位置混合控制到 RL 的隐式学习。}接触二元性不是 RL 时代才发现的——经典机器人学早有应对。Raibert 与 Craig（1981）的力/位置混合控制在接触方向用力控制、自由方向用位置控制，\emph{手动}把二元性分解为两个子问题；Hogan（1985）的阻抗控制用虚拟弹簧-阻尼器把接触的不连续「软化」为连续阻抗行为。RL 的路子完全不同：它不显式建模接触，而让策略通过 staged reward 的梯度\emph{隐式}学会何时接触、如何控制接触力。代价是需要大量样本（数千并行环境 $\times$ 数千 iteration），优势是不需要精确接触模型——策略自动适应仿真器的接触特性。这条「显式建模 $\to$ 隐式学习」的演进，正是 \cref{sec:rlmc-manip-action} 三层动作抽象（OSC 显式力控 vs JointPos 隐式）的历史背景。
+
+\subsection{操作任务的四阶段因果结构}
+\label{sec:rlmc-manip-fourstage}
+
+成功的操作通常遵循固定阶段序列，每个阶段是下一阶段的因果前提（\cref{tab:rlmc-manip-stages}）。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{操作任务的四阶段因果结构}
+\label{tab:rlmc-manip-stages}
+\begin{tabular}{@{}llll@{}}
+\toprule
+阶段 & 物理过程 & RL 学习难点 & 奖励设计要点 \\
+\midrule
+接近 Reaching & 末端移向目标物体 & 位置随机化后搜索空间大 & 末端到物体距离的密集信号 \\
+预抓取 Pre-grasp & 末端调整到抓取姿态 & 腕部姿态梯度弱但影响大 & 姿态对齐奖励（可选） \\
+夹持 Grasping & 夹爪闭合建立稳定接触 & 接触力从零到非零的跳变 & 夹爪闭合信号/接触力反馈 \\
+搬运 Bringing & 持握物体移向目标 & 同时维持抓取力与移动精度 & 物体到目标距离 + 抬升高度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+若把四阶段奖励简单相加，优化器会在早期\emph{完全忽略}搬运项（物体还没被抓住时搬运误差恒定），只关注接近项——数学上等价于策略被吸引到「站在方块旁但不抓」的局部极值。这正是 \cref{sec:rlmc-manip-staged} 用乘法门控替代加和的根本理由。
+
+\paragraph{运行验证。}本节没有可跑命令，但有一个\emph{思想验证}：拿你已有的 locomotion 配置，逐项问「这个 term 在操作里还成立吗」——base velocity（不成立，基座不动）、terrain heights（不成立，无地形）、\emph{摔倒}终止（不成立，固定基座不会摔倒）。能把这三项识别出来，就证明你已建立操作 MDP 的认知前提。\textbf{但要纠正一个常见误解}：「固定基座 $\Rightarrow$ 只有成功/超时两种终止」是不准确的——YAM 1.4.0 实测除 \verb|time_out| 外，还有 \Verb[breaklines]|ee_ground_collision| 终止（末端撞桌面、非法接触力 $>10$\,N 即提前结束 episode）。即固定基座虽不「摔倒」，但「末端怼到桌面」同样是失败终止条件。读者若按「永不提前终止」去设计，会漏掉这条保护——它既防止策略学出「砸桌面」的危险行为，也避免无效样本。自查：\Verb[breaklines]|grep -n illegal_contact| 你装的 \verb|env_cfgs.py| 看终止 term 全集。
+
+\begin{pitfall}[只看总 reward 不看分项]
+\textbf{错误描述}：训练时只盯总 reward，见它在涨就以为在进步。\textbf{现象后果}：staged reward 里 reaching 项快速上升（0 涨到 0.9）会掩盖 bringing 项的停滞（始终为 0），总 reward $0.9\times(1+0)=0.9$ 看着不错，但策略只学会接近、没学会搬运。\textbf{根本原因}：阶段性奖励的失败模式也是阶段性的，总量掩盖了分项。\textbf{正确做法}：把 reach、grasp、bring 三项指标\emph{分开记录}到 TensorBoard（\cref{sec:rlmc-manip-diag}），并独立记录 task success rate。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[估算题]} 6-DOF 臂关节空间 $\mathbb{R}^6$，每关节有效范围约 4 rad；设抓取窗口在关节空间约 $0.1^6\,\mathrm{rad}^6$。随机探索一次命中窗口的概率约多少？这解释了为什么稀疏奖励下操作探索如此困难。
+  \item \textbf{[设计题]} 若要把 locomotion 的 velocity tracking 与 manipulation 的 lift cube 合并为 loco-manipulation 任务，列出至少 4 个需要重新设计的 MDP 组件，并说明为什么不能直接拼接。验收标准：每个组件给出「locomotion 写法 $\to$ 冲突点 $\to$ 操作下的新写法」。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{mjlab 机械臂操作：YAM Lift Cube 全流程}
+\label{sec:rlmc-manip-mjlab}
+
+\paragraph{模块功能与在管线中的位置。}本节以 mjlab 的 YAM（Yet Another Manipulator）lift cube 为主线，从 MJCF 资产走到 staged reward，打通固定基座操作的完整工程闭环。它在管线中处于「单形态实战」位置：把前面所有零件（观测/动作/奖励/接触/DR）组合成一个能训练的操作任务。
+
+\pzr{重要范围声明}：四变体 task ID（\Verb[breaklines]|Mjlab-Lift-Cube-Yam|、\verb|-Rgb|、\verb|-Depth|、\Verb[breaklines]|Mjlab-Multi-Cube-Seg-Yam|）、各变体携带的 observation、DiffIK 的 null-space 字段、视觉 CNN 通道数，均已据所装 mjlab（1.4.0）的 \verb|list-envs| 与源码 introspection 逐项核实。但要留意 mjlab \emph{论文正文}只文档化了\emph{单一}「Cube Lifting」任务，并明言「high-fidelity RGB rendering is out of scope」、tiled renderer 为 upcoming\,\cite{zakka2026mjlab}——即这些视觉变体属\emph{仓库已实现但论文未文档化}的预览特性。框架迭代较快，落地时仍请以你所装版本的源码为准。
+
+\subsection{为什么选 YAM 作为入门}
+\label{sec:rlmc-manip-yam}
+
+mjlab 的 manipulation 入口提供四种变体（\cref{tab:rlmc-manip-variants}），共享同一 MJCF 资产与 staged reward 框架，差异只在 observation group 与视觉输入。这种「一个任务四个切面」的设计是理解操作 MDP 的理想起点——可以在固定其他变量下单独观察输入模态的影响。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{YAM lift cube 的四种变体（task ID 以所装 mjlab 源码为准，见范围声明）}
+\label{tab:rlmc-manip-variants}
+\begin{tabular}{@{}llll@{}}
+\toprule
+变体 & Task ID & Actor 输入 & 特点 \\
+\midrule
+State & \Verb[breaklines]|Mjlab-Lift-Cube-Yam| & 关节状态 + 物体位姿 + 目标位姿 & 最基础，纯 MLP \\
+RGB & \Verb[breaklines]|Mjlab-Lift-Cube-Yam-Rgb| & 关节状态 + RGB 图像 & CNN 视觉（预览） \\
+Depth & \Verb[breaklines]|Mjlab-Lift-Cube-Yam-Depth| & 关节状态 + 深度图 & CNN 视觉 \\
+Multi-Cube & \Verb[breaklines]|Mjlab-Multi-Cube-Seg-Yam| & 关节状态 + 深度图 + 分割掩码 & 多目标选择 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{YAM MJCF 资产解析}
+\label{sec:rlmc-manip-mjcf}
+
+YAM 是 7-DOF 机械臂（6 臂关节 + 1 主动夹爪关节）。MJCF 中几个元素与操作直接相关，理解它们是后续一切配置的物理基础：
+
+\begin{itemize}
+  \item \textbf{\texttt{grasp\_site}：末端抓取参考点。} 这是一个 MuJoCo \verb|site|（不产生碰撞和惯性的虚拟标记），定义「末端在哪」。所有 reaching reward 和 DiffIK 计算都以它为参考。若 \verb|grasp_site| 不在夹爪物理抓取中心，reaching reward 会给出错误的梯度方向——策略把 \verb|grasp_site| 移到方块处，但夹爪其实没对准。
+  \item \textbf{\texttt{joint equality}：夹爪耦合约束。} YAM 夹爪有两指但只有一个主动驱动器，第二指通过 MuJoCo \Verb[breaklines]|equality/joint| 约束与第一指反向耦合（YAM xml 实测 \Verb[breaklines]|<joint joint1="left_finger" joint2="right_finger" polycoef="0 -1 0 0 0"/>|，一次多项式系数 $-1$ 即等量反向），实现「一个 action 控双指同步开合」，把\emph{动作}维度（\verb|nu|）从 8 降到 7。\textbf{注意一个区分}：这只降\emph{驱动器/动作}维度，不降\emph{广义坐标}维度——\verb|right_finger| 仍是一个真实关节、仍计入 \verb|nq=8|，所以它照样进 \verb|joint_pos_rel|/\allowbreak\verb|joint_vel_rel|（这正是下面 obs 维度算成 29 而非 27 的根因）。补充机构细节：YAM 实际是 \textbf{crank gripper}（DM4310 电机经曲柄把转动转成手指线性开合，\Verb[breaklines]|yam_constants.py| 实测），不是简单的直驱平行指——但从 RL 配置看，曲柄运动学被 MuJoCo 约束吸收，策略仍只面对「一个夹爪动作维」。
+  \item \textbf{\texttt{freejoint} 方块：可自由运动的操作对象。} 方块用 \verb|freejoint| 挂在 \verb|worldbody| 下，有 7 个自由度（3 平移 + 4 四元数）。这与 locomotion 中所有 body 同处一个 kinematic tree 不同——方块是独立的动力学实体，只通过接触力与机械臂交互。
+  \item \textbf{碰撞几何与视觉几何分离。} 同一 body 可有简单 box 的碰撞几何（\verb|contype|/\allowbreak\verb|conaffinity|，快速碰撞检测）和精细 mesh 的视觉几何（\verb|rgba|，不参与物理）。常见错误是改了视觉几何没同步碰撞几何——可视化里夹爪对准了，碰撞 box 其实没碰到方块。自检：在 viser 切到碰撞几何可视化，确认碰撞体与视觉体一致。
+\end{itemize}
+
+\begin{note}[MJCF 之于操作任务的类比]
+MJCF 就像舞台布景：\verb|articulation|（机械臂）是演员，\verb|freejoint|（方块）是道具，\verb|site|（\verb|grasp_site|、target）是灯光标记。布景的物理位置决定演员的表演空间——\verb|grasp_site| 偏了，「演员」再努力也碰不到「道具」。所以\textbf{资产验证必须在训练之前完成}。
+\end{note}
+
+\paragraph{运行验证：MJCF 资产的三步检查（共 5 分钟，省下数小时调试）。}
+(1) \textbf{确认 \texttt{grasp\_site} 位置}——viser 加载、移到默认姿态，确认标记小球在两夹爪指尖之间，偏移 $>1$\,cm 则 reaching 梯度方向错。
+(2) \textbf{确认夹爪耦合}——手动只发夹爪关节（第 7 维）action，确认两指同步；不同步则查 \Verb[breaklines]|equality/joint|。
+(3) \textbf{确认方块物理}——把方块放桌面上方 10\,cm 释放，应自由落体后弹跳静止；自由落体 10\,cm 约耗 $\sqrt{2\times 0.1/9.81}\approx 0.14$\,s，明显偏离则查 \verb|timestep| 与方块质量。
+
+\subsection{Observation 设计：状态版 MDP 定义}
+\label{sec:rlmc-manip-obs}
+
+YAM state 版 actor observation group 实际只有\emph{五个 term}（经 mjlab 1.4.0 \Verb[breaklines]|lift_cube_env_cfg.py| 源码核实），核心是\textbf{两个 base 系相对向量}而非一堆世界系绝对位姿——这正是操作观测设计的精髓。
+
+\begin{codebox}[Python]{YAM state 版 actor observation group（mjlab 1.4.0 实测）}
+# 真实 actor_terms（lift_cube_env_cfg.py），critic_terms = {**actor_terms}（默认对称）
+joint_pos    # [N, 8]  关节位置（joint_pos_rel，相对默认姿态;按 nq 计，含双指）
+joint_vel    # [N, 8]  关节速度（joint_vel_rel，同样 nq=8）
+ee_to_cube   # [N, 3]  末端到方块向量（ee_to_object_distance，base 系，关键）
+cube_to_goal # [N, 3]  方块到目标向量（object_to_goal_distance，base 系，关键）
+actions      # [N, 7]  上一步动作（last_action，按 nu=7 即驱动器数）
+# 注意:mjlab 没把 ee_pos_w/cube_pos_w/cube_quat_w 单列进 actor obs——
+# 物体/末端的绝对位姿信息已隐含在两个相对向量里（base 系投影）.
+# 关键陷阱:joint_pos/joint_vel 维度是 8（nq）不是 7（nu）——YAM 夹爪两指
+# (left_finger/right_finger) 都是真实关节，right_finger 虽被 equality 约束
+# 耦合成被动指，仍计入 nq，故进了 joint_pos_rel/joint_vel_rel.详见下方维度计算.
+\end{codebox}
+
+对比 locomotion 的 actor observation（核心是 \verb|base_lin_vel|、\verb|base_ang_vel|、\Verb[breaklines]|projected_gravity|、\verb|joint_pos/vel|、\verb|commands|，见 \cref{ch:rlmc-obsact}），操作的观测有三处关键差异：(1) \textbf{无 base velocity}——固定基座不动，基座姿态是常量不进观测；(2) \textbf{有物体相对信息}——策略必须感知「末端与物体、物体与目标的相对关系」，这类信息在 locomotion 里不存在；(3) \textbf{相对向量是核心}——\verb|ee_to_cube| 范数小说明 reaching 完成，\verb|cube_to_goal| 范数小说明 bringing 完成，这两个 term 直接编码阶段信息。两个相对向量都在\textbf{机器人 base 系}下表达（\Verb[breaklines]|ee_to_object_distance|/\allowbreak\Verb[breaklines]|object_to_goal_distance| 内部用 \Verb[breaklines]|quat_inv(base_quat_w)| 把世界系向量旋到 base 系）。
+
+\begin{insight}[相对向量是 MLP 的归纳偏置补丁]\label{ins:rlmc-manip-relvec}
+若不给 \verb|ee_to_cube|，策略需从末端与方块的绝对位姿\emph{自己}算这个减法，但 MLP 需要额外容量学这个线性减法——\emph{MLP 不天然擅长精确向量减法}。mjlab 干脆只喂相对向量、连绝对位姿都不单列——把「末端在哪、方块在哪」直接编码成「末端\emph{相对}方块在哪」，是用一个 observation 设计换实打实的训练效率。源稿经验：缺相对向量会把 reaching 收敛时间拉长 2--3 倍。
+\end{insight}
+
+\paragraph{配置详解：observation 的四维属性。}\cref{tab:rlmc-manip-obscfg} 用「默认值来源/修改影响/合理范围/与其他配置耦合」四维拆解几个关键观测配置项。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{YAM observation 关键配置项的四维属性}
+\label{tab:rlmc-manip-obscfg}
+\begin{tabular}{@{}p{2.4cm}p{2.6cm}p{2.8cm}p{3.2cm}@{}}
+\toprule
+配置项 & 默认值来源 & 修改影响 / 合理范围 & 与其他配置耦合 \\
+\midrule
+actor obs 维度 & 上表各 term 之和 $=29$（关节项按 \texttt{nq=8} 非 \texttt{nu=7}） & 改 term 即改网络输入维；须与网络首层一致 & 与 rl\_cfg 的网络结构强耦合 \\
+归一化 & RSL-RL \Verb[breaklines]|obs_normalization|（actor/critic 各一开关） & 开则收敛快 20--50\%；deploy 须导出 mean/std & mean/std 被 bake 进 ONNX，与部署强耦合 \\
+critic privileged & 默认 \texttt{critic\_terms = \{**actor\_terms\}}（对称） & 要非对称须显式给 critic 加真值 term；actor 绝不能含 & 与非对称 AC（\cref{ch:rlmc-privileged}）耦合 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Actor observation 维度计算（工程验证第一步，含一个真实踩过的坑）。}逐 term 累加：$8+8+3+3+7=29$（不是 $7+7+\dots=27$！）。\textbf{这里藏着操作任务最隐蔽的维度陷阱}：直觉会把 \verb|joint_pos|/\allowbreak\verb|joint_vel| 当成 7 维（YAM 是「7-DOF 机械臂」），但 \verb|joint_pos_rel|/\allowbreak\verb|joint_vel_rel| 是按 \textbf{\texttt{nq}（广义坐标数）} 取的，不是按 \textbf{\texttt{nu}（驱动器数）}。YAM 的 \verb|nq=8|（6 臂关节 + \verb|left_finger| + \verb|right_finger| 两个真实指关节），\verb|nu=7|（夹爪只有一个驱动器，\verb|right_finger| 被 \verb|equality| 约束成被动指）——但被动指仍是一个关节、仍计入 \verb|nq|、仍进 \verb|joint_pos_rel|。所以两个关节项各是 8 维而非 7 维，而 \verb|actions|（\verb|last_action|）按 \verb|nu=7|。
+
+\textbf{别手算，去问框架}：与其按「7 DOF」心算，不如让真值自己说话。两条命令立即落地：
+\begin{codebox}[bash]{自查 obs 维度:先编译 MJCF 看 nq/nu，再跑一次训练看网络首层}
+# 法一:直接编译 YAM 的 MJCF，打印 nq（广义坐标）/nu（驱动器）/njnt/neq
+uv run python -c "import mujoco, mjlab; \
+  m=mujoco.MjModel.from_xml_path('<YAM xml 路径>'); \
+  print('nq',m.nq,'nu',m.nu,'njnt',m.njnt,'neq',m.neq)"
+#   预期: nq 8 nu 7 njnt 8 neq 1   <- joint_pos/joint_vel 用 8 不是 7
+# 法二（更省事）:起一次 1 迭代训练，框架会打印 Actor/Critic 网络结构，
+#   读 Linear 首层 in_features 即真实 obs 维度
+WANDB_MODE=disabled uv run train Mjlab-Lift-Cube-Yam \
+    --env.scene.num-envs 64 --agent.max-iterations 1
+#   预期日志里 Actor MLP 首层 in_features=29、输出维=7（=nu）
+\end{codebox}
+若你手算得 27 却看到 in\_features 是 29，差值正是「被动/耦合关节进了 \verb|joint_pos_rel|」——这是操作任务比 locomotion 更隐蔽的坑（四足关节通常 \verb|nq==nu|，不犯这个错）。\textbf{方法论比数字重要}：本书所有维度数字都可能随你装的版本漂移，正确习惯是「打印网络 in\_features，和手算对不上就去查 \texttt{nq} vs \texttt{nu} / 有无被动关节」，而不是把书里的 29 也当死数背。
+
+\paragraph{Critic 的 privileged 信息。}\textbf{注意 YAM lift cube 的\emph{默认}配置是对称的}——源码里 \Verb[breaklines]|critic_terms = {**actor_terms}|，critic 与 actor 看同样的观测，并未默认加任何特权 term。要做非对称 actor-critic（\cref{ch:rlmc-privileged}），需在 \verb|critic| group 里\emph{显式}追加真值 term。操作任务里值得加进 critic 的典型特权观测见 \cref{tab:rlmc-manip-priv}（这些是\emph{设计建议}而非 YAM 默认配置）——它们对值函数估计的帮助比 locomotion 的 terrain heights 更大，但 actor 绝不能碰，否则真机部署必失效。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{操作任务中 critic 的 privileged 观测（设计建议；actor 不可用，非 YAM 默认配置）}
+\label{tab:rlmc-manip-priv}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Privileged term & 维度 & 来源 & actor 为何不能用 \\
+\midrule
+\verb|contact_force| & 6 & 接触力传感器（仿真器） & 真实夹爪可能无力传感器 \\
+\Verb[breaklines]|object_velocity| & 6 & 仿真器状态 & 真实场景难以实时估计 \\
+\verb|true_friction| & 1 & DR 参数 & 未知物体摩擦不可测 \\
+\verb|true_mass| & 1 & DR 参数 & 未知物体质量不可测 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{命令系统与默认姿态}
+\label{sec:rlmc-manip-cmd}
+
+locomotion 的命令是 velocity（$v_x,v_y,\dot\psi$），策略跟踪速度；操作的命令是 goal position（目标抬升高度或位姿），策略把物体移到指定位置。mjlab 的 \Verb[breaklines]|LiftingCommandCfg| 关键参数如下。
+
+\begin{codebox}[Python]{LiftingCommandCfg 关键参数（字段名与下列数值经 mjlab 1.4.0 YAM 注册任务源码核实）}
+# 目标位置范围用嵌套 TargetPositionRangeCfg（不是 dict），世界系
+target_position_range = LiftingCommandCfg.TargetPositionRangeCfg(
+    x=(0.3, 0.5), y=(-0.2, 0.2), z=(0.2, 0.4))   # z 即抬升高度范围
+# 物体初始位姿范围（YAM 实测含整圈 yaw 随机，迫使策略学方向无关抓取）
+object_pose_range = LiftingCommandCfg.ObjectPoseRangeCfg(
+    x=(0.2, 0.4), y=(-0.2, 0.2),                  # 实测范围比直觉宽
+    yaw=(-3.14, 3.14))                            # 整圈 yaw:抓取需朝向鲁棒
+resampling_time_range = (4.0, 4.0)   # YAM 实测 4 秒（非 5）;重采样间隔区间（秒）
+success_threshold = 0.05             # 物体距目标 < 5cm 判成功
+\end{codebox}
+
+\Verb[breaklines]|resampling_time_range| 太短（如 $(1,1)$\,s）策略来不及完成一次 reach-grasp-bring 就被换目标，干扰学习；太长（如 $(20,20)$\,s）episode 内只有一个目标，泛化不足；YAM 实测取 $(4,4)$\,s（$(4,4)\sim(5,5)$ 都是常见平衡值）。与 locomotion 的关键差异：locomotion 命令是\emph{持续}的（速度目标一直在），操作命令是\emph{目标性}的（达到后可终止或重采样），这直接影响 termination 设计——操作通常有「成功终止」（物体距目标小于 \Verb[breaklines]|success_threshold| 阈值），locomotion 没有。
+
+\begin{insight}[Command--Reward--Termination 三角契约]\label{ins:rlmc-manip-contract}
+在 manager-based 架构里，这三个组件必须\emph{语义一致}：\Verb[breaklines]|LiftingCommand| 采样 goal\_pos $\to$ Reward 计算 \Verb[breaklines]|cube_to_goal = cube_pos - goal_pos| $\to$ Termination 检查 $\|\verb|cube_to_goal|\| < $ 阈值。若 Command 在世界系采样而 Reward 在环境局部系计算，三者的「目标」就不是同一点。这个 bug 在单环境里\emph{不暴露}（世界系与局部系相同），多环境里却导致「某些 env 成功、某些 env 失败」的诡异行为——这是操作任务里最隐蔽的坐标系坑之一。
+\end{insight}
+
+\paragraph{默认关节姿态。}\Verb[breaklines]|JointPositionAction| 的 offset 用 MJCF 的 \verb|keyframe| 作默认关节位姿，应是「悬空准备姿态」——末端在工作空间中心、夹爪张开、关节远离极限。若默认姿态让机械臂「瘫」在桌面上，策略第一步就要先「站起来」，浪费大量样本。好的默认姿态让策略从一开始就在合理工作区间探索。
+
+\subsection{Action 设计与正则项}
+\label{sec:rlmc-manip-act}
+
+YAM 默认用 \Verb[breaklines]|JointPositionActionCfg|，action 维度 7（6 臂关节 + 1 夹爪）。策略输出 $a\in[-1,1]^7$，经 scale 与 offset 映射到关节目标，再由 PD 控制器跟踪。处理流程见下。
+
+\begin{codebox}[text]{JointPositionAction 处理流程}
+策略输出 a in [-1,1]^7
+    -> x action_scale (YAM 为逐关节 dict，= 0.25 * effort_limit/stiffness)
+关节增量 dq in R^7
+    -> + default_joint_pos
+关节目标 q_target in R^7
+    -> PD 控制器: tau = Kp(q_target - q) + Kd(0 - dq_current)
+    -> 物理仿真更新
+\end{codebox}
+
+YAM 的 \verb|action_scale| 不是一个标量，而是\emph{逐关节字典}（\Verb[breaklines]|YAM_ACTION_SCALE|，按 \Verb[breaklines]|0.25 * effort_limit/stiffness| 物理推导，源码核实），让每个关节的满量程动作幅度与其驱动能力匹配——这比一刀切的标量更合理。整体效果仍是\emph{保守的小步长}：操作的末端定位精度要求高，大幅关节运动会让末端轨迹不稳。\textbf{夹爪 action 的特殊性}：第 7 维控制「开/合」（接近 $-1$ 闭合、$+1$ 张开，方向取决于关节定义），离散决策被连续动作「软化」，但成功抓取通常需要完全闭合，策略最终会学到第 7 维输出接近 $\pm1$。
+
+\paragraph{正则化 reward terms（以 YAM 1.4.0 实测权重为准）。}除 staged reward 外，操作还需几个正则项防不合理行为（\cref{tab:rlmc-manip-reg}）。它们的\emph{形式}与 locomotion 同源（\cref{ch:rlmc-reward}），是可复用组件，但 YAM 的实测配置有两个值得点名的工程细节：(1) \Verb[breaklines]|joint_pos_limits| 权重是 \textbf{$-10$ 量级}（不是 locomotion 常见的 $0.1$）——操作任务对越界极敏感（末端定位精度依赖关节不饱和），所以惩罚强得多；(2) YAM 没有 \verb|joint_acc_l2|，而是用 \Verb[breaklines]|joint_vel_hinge|（关节速度软门限惩罚），且其权重\textbf{随训练课程渐增}（\Verb[breaklines]|reward_curriculum| 从 $-0.01$ 升到 $-1.0$）——开训时放松、收敛后收紧，是「先让策略动起来、再压平滑性」的实用技巧（见下方 insight）。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{YAM lift cube 实测正则化 reward terms（权重经 1.4.0 \texttt{config/\allowbreak yam/\allowbreak env\_cfgs.\allowbreak py} 核实）}
+\label{tab:rlmc-manip-reg}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Term & 数学形式 & YAM 实测权重 & 作用 \\
+\midrule
+\Verb[breaklines]|action_rate_l2| & $-\|a_t-a_{t-1}\|^2$ & $-0.01$ & 防动作震荡 \\
+\Verb[breaklines]|joint_pos_limits| & $-\sum\max(0,q-q_{\max})^2$ & $-10$（远强于 loco 的 $0.1$） & 重罚接近关节极限 \\
+\Verb[breaklines]|joint_vel_hinge| & $-\sum\max(0,|\dot q|-v_{\text{soft}})$ & $-0.01\to-1.0$（课程渐增） & 软门限压关节速度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[惩罚项的课程式渐增：先动起来，再压平滑]\label{ins:rlmc-manip-rewcurr}
+YAM 对 \Verb[breaklines]|joint_vel_hinge| 用 \Verb[breaklines]|reward_curriculum|（权重从 $-0.01$ 线性升到 $-1.0$）而非固定权重，背后是个通用调参直觉：\textbf{训练早期若正则惩罚太重，策略会「不敢动」——平滑性项把探索压死，reaching 都学不起来}。所以开训时正则极弱（$-0.01$，几乎只让策略自由探索），等阶段性 reward 已经在涨、策略学会基本抓取后，再把平滑惩罚逐步收紧到 $-1.0$ 去掉抖动。这比一上来就用大权重稳得多。落地提示：若你发现策略前 200 iteration 卡死不动、reaching 不涨，先把所有正则权重砍到 $1/10$ 试一次——区分「探索被惩罚压死」与「奖励本身设计错」。这条 curriculum 思路与 \cref{ch:rlmc-reward} 的奖励课程一脉相承。
+\end{insight}
+
+\subsection{Staged Reward：数学形式与源码精读}
+\label{sec:rlmc-manip-staged}
+
+回顾 \cref{sec:rlmc-manip-fourstage}：操作不能用简单加权。mjlab 的 \Verb[breaklines]|staged_position_reward| 用\textbf{乘法门控}解决这个问题。设 $p_{\text{ee}}$ 为 \verb|grasp_site| 位置、$p_{\text{obj}}$ 为方块质心、$p_{\text{goal}}$ 为目标位置，$\sigma_{\text{reach}},\sigma_{\text{bring}}$ 为高斯核标准差：
+\begin{equation}
+r_{\text{reach}} = \exp\!\left(-\frac{\|p_{\text{ee}}-p_{\text{obj}}\|^2}{\sigma_{\text{reach}}^2}\right),\qquad
+r_{\text{bring}} = \exp\!\left(-\frac{\|p_{\text{goal}}-p_{\text{obj}}\|^2}{\sigma_{\text{bring}}^2}\right),
+\label{eq:rlmc-manip-reachbring}
+\end{equation}
+\begin{equation}
+r_{\text{staged}} = r_{\text{reach}}\,\bigl(1+r_{\text{bring}}\bigr).
+\label{eq:rlmc-manip-staged}
+\end{equation}
+
+\cref{tab:rlmc-manip-stagereward} 分析门控在不同阶段的行为。关键机制在第二行：当 $r_{\text{reach}}\approx 1$ 时总 reward 变为 $1+r_{\text{bring}}$，bringing 梯度被完整传递；而在第一行，即便 $r_{\text{bring}}$ 有微弱梯度，也被接近零的 $r_{\text{reach}}$ 乘法\emph{抑制}——策略只关注接近。这就是门控核心：\textbf{先满足前序条件，后续阶段的信号才「开门」}。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{staged reward 在不同阶段的行为（式~\eqref{eq:rlmc-manip-staged}）}
+\label{tab:rlmc-manip-stagereward}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+阶段 & $r_{\text{reach}}$ & $r_{\text{bring}}$ & $r_{\text{staged}}$ & 梯度方向 \\
+\midrule
+末端远离方块 & $\approx 0$ & $\approx 0$ & $\approx 0$ & 减小 $\|p_{\text{ee}}-p_{\text{obj}}\|$ \\
+末端靠近方块 & $\approx 1$ & $\approx 0$ & $\approx 1$ & 减小 $\|p_{\text{goal}}-p_{\text{obj}}\|$ \\
+方块接近目标 & $\approx 1$ & $\approx 1$ & $\approx 2$ & 维持两者 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{对比：门控 vs 等权加和。}同一个「末端靠近方块但不抓」的状态，加和 reward 约 $0.8+0.2=1.0$，抓起搬运约 $1.0+0.9=1.9$；看似有差异，但实训中 reaching 梯度远强于 bringing（reaching 误差变化快），策略会卡在「接近但不抓」。用门控，同一状态只有 $0.8\times(1+0.2)=0.96$，抓起搬运为 $1.0\times(1+0.9)=1.9$——乘法放大了两种策略的 reward 差距，打破局部极值。
+
+\paragraph{代码走读：核心逻辑。}下面是 \Verb[breaklines]|staged_position_reward| 的核心实现（关键行已标注）。
+
+\begin{codebox}[Python]{staged\_position\_reward 核心逻辑（manipulation\_rewards.py）}
+# 末端到物体的平方距离 + 高斯核（注意:是平方距离，不是 L1）
+reach_error  = torch.sum(torch.square(ee_pos - obj_pos), dim=-1)
+reach_reward = torch.exp(-reach_error / reaching_std**2)   # 关键行:reach 门
+# 物体到目标的平方距离 + 高斯核
+bring_error  = torch.sum(torch.square(goal_pos - obj_pos), dim=-1)
+bring_reward = torch.exp(-bring_error / bringing_std**2)
+# 乘法门控组合（式 staged）
+reward = reach_reward * (1.0 + bring_reward)              # 关键行:开门
+\end{codebox}
+
+注意 mjlab 当前用的是\emph{平方距离}高斯核 \Verb[breaklines]|exp(-sum(square(d)) / std**2)|，不是 L1 版本。高斯核的梯度性质：误差大时 reward 与梯度都接近 0，误差趋零时 reward 趋 1、梯度同样趋零（零误差处梯度消失）——「最后一公分」的精修主要靠 \verb|std| 控制，\verb|std| 越小核越尖、近距离梯度越强。
+
+\begin{insight}[生产配置常是「粗门控 + 精定位」两项叠加，而非一个函数包办]\label{ins:rlmc-manip-twostage}
+上面的 \Verb[breaklines]|staged_position_reward|（大 \verb|std|，软门控）只是 YAM 实际奖励的\emph{一半}。读源码会发现 YAM 1.4.0 把「搬到位」拆成\textbf{两个独立 reward term}：一个是上面这个粗门控（\Verb[breaklines]|reaching_std=0.2|/\allowbreak\Verb[breaklines]|bringing_std=0.3|，负责「从远处把物体大致带向目标」，软半径宽、远处有梯度），另一个是 \Verb[breaklines]|bring_object_reward| 类的\textbf{精定位项（\texttt{std} 小到约 $0.05$）}——专门在物体已接近目标时提供「最后几厘米」的尖锐梯度。\textbf{为什么拆两项而非调一个 \texttt{std}}：单核两难——\verb|std| 大则远处有梯度但近处「软趴趴」（最后一公分推不动），\verb|std| 小则精修强但远处梯度消失（够不着）。两项叠加用一个宽核保证「能到达」、一个窄核保证「能精确到位」，各管一段距离，是比单核更稳的工程做法。读者照本章单函数走读会以为「一个 staged 搞定」，真实工程里粗+精分项才是常态——这正是「读懂源码的 reward 组合」与「看懂一个 reward 函数」的差距。落地：\Verb[breaklines]|grep -n "_reward"| 你装的 \verb|env_cfgs.py| 数一数 lift 相关到底挂了几项。
+\end{insight}
+
+\begin{insight}[为什么是指数核而非线性/二次]\label{ins:rlmc-manip-kernel}
+三种距离$\to$reward 映射各有梯度特性：线性 $\max(0,1-d/d_{\max})$ 在 $d>d_{\max}$ 外\emph{没有梯度}（策略「看不到」目标）；二次 $1-(d/d_{\max})^2$ 远处梯度大但 reward 可能为负（违反直觉）；指数 $\exp(-d/\sigma)$ 在\emph{任意}距离都有非零梯度——策略无论从多远开始都有信号。这是操作任务普遍选指数核的根本原因。代价是零误差处梯度消失，实践中由 bringing 项接管；若发现策略在方块正上方「犹豫不动」，先怀疑这个零梯度。
+\end{insight}
+
+\paragraph{$\sigma$ 参数的标定方法论（可测流程）。}$\sigma$ 应与任务空间尺度匹配，而非随手设：
+(1) 确定特征距离 $d_{\text{char}}$——reaching 取末端到方块的典型初始距离，bringing 取目标到方块初始位置的典型距离；
+(2) 设 $\sigma$ 使 $\exp(-d_{\text{char}}/\sigma)\approx 0.3\sim 0.5$，即 $\sigma\approx d_{\text{char}}/\ln 2$（达 $0.5$）到 $d_{\text{char}}/\ln(3.3)$（达 $0.3$）；
+(3) 示例：YAM 初始末端-方块距离约 $0.15$\,m，由四步法可推出 $\sigma_{\text{reach}}$ 落在 $0.15\sim0.2$ 区间。\textbf{对照真值}：YAM 1.4.0 源码（\Verb[breaklines]|config/yam/env_cfgs.py|）实测取 \Verb[breaklines]|reaching_std=0.2|、\Verb[breaklines]|bringing_std=0.3|——比按「特征距离/$\ln 2$」算出的稍大，因为生产配置偏向「软半径宽一点、远处梯度更平缓」。读者对照源码时若发现书里 $0.15$ 与实测 $0.2$ 对不上，不是错——四步法给的是\emph{量级}起点，最终值要按训练曲线调（见第 4 步）；
+(4) 验证：训练 500 iteration 后看 reaching reward 均值，$<0.1$（太弱）则增大、$>0.9$（饱和无分辨力）则减小。
+
+\paragraph{运行验证。}训练期看什么：reaching reward 应在前 200 iteration 快速上升；若 500 iteration 后仍不动，按 \cref{sec:rlmc-manip-diag} 诊断——先查 \verb|ee_to_cube| 是否进了 actor obs，再查 $\sigma_{\text{reach}}$。
+
+\begin{pitfall}[$\sigma$ 设置不当]
+\textbf{错误描述}：$\sigma_{\text{reach}}$ 太小（如 0.01）或太大（如 1.0）。\textbf{现象后果}：太小则 reaching reward 在离方块 1\,cm 外就衰减到零，策略得不到远距离梯度；太大则在离方块 10\,cm 处就接近 1，策略「觉得差不多了」就停。\textbf{根本原因}：$\sigma$ 即高斯核的「软半径」，与工作空间尺度不匹配。\textbf{正确做法}：按上面四步标定，典型值 $0.05\sim 0.2$。
+\end{pitfall}
+
+\begin{pitfall}[把 DiffIK 当成 YAM 的默认动作空间]
+\textbf{错误描述}：见仓库有 \Verb[breaklines]|DifferentialIKActionCfg| 就以为 YAM lift cube 默认用它。\textbf{现象后果}：把 DiffIK 的超参修改应用到默认任务上，毫无效果。\textbf{根本原因}：当前默认是 \Verb[breaklines]|JointPositionActionCfg|。\textbf{正确做法}：先读 \Verb[breaklines]|lift_cube_env_cfg.py| 里 action cfg 的类型再动手（\cref{sec:rlmc-manip-action} 讲 DiffIK 切换）。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[源码阅读题]} 在 \Verb[breaklines]|lift_cube_env_cfg.py| 找到 \Verb[breaklines]|staged_position_reward| 的调用，列出它用的三个 state 数据源（提示：\verb|grasp_site|、方块质心、目标），画出从 MJCF 资产到 reward 计算的数据流向图。验收：图中标出每个量的 observation/state 来源。
+  \item \textbf{[设计题]} 给 staged reward 增一个「夹爪对齐」奖励（夹爪法向量与方块表面法向量的对齐度），它该放哪个阶段？乘法还是加法组合？给出数学公式与理由。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Isaac Lab 灵巧手操作：DexSuite 与 DexPBT}
+\label{sec:rlmc-manip-dex}
+
+\paragraph{模块功能与在管线中的位置。}本节从平行夹爪扩展到多指灵巧手，讲高 DOF 末端的特殊工程挑战，以及 Isaac Lab 的 DexSuite 如何用 ADR 和 PBT 解决灵巧操作的训练稳定性。它在管线中是「同一概念（操作）在另一框架、另一难度等级的对照实现」。
+
+\subsection{为什么灵巧手比平行夹爪难得多}
+\label{sec:rlmc-manip-dexhard}
+
+平行夹爪的 action 维度是 1（开/合），抓取本质是二元决策「移到位然后闭合」；灵巧手（如 Allegro Hand，16 关节）的 action 维度是 16，抓取是连续协调过程——每个手指要在正确时间到正确位置、施正确方向与大小的力。\cref{tab:rlmc-manip-dexchallenge} 列出三个平行夹爪不存在的挑战。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{灵巧手相对平行夹爪新增的工程挑战}
+\label{tab:rlmc-manip-dexchallenge}
+\begin{tabular}{@{}lll@{}}
+\toprule
+挑战 & 平行夹爪 & 灵巧手 \\
+\midrule
+接触点数量 & 2（两指尖） & 10--20（每指节都可能接触） \\
+接触建模精度 & 中等（确保夹持力即可） & 极高（滑动/滚动/枢转都需精确建模） \\
+动作协调维度 & 1（张合同步） & 16+（每关节独立但须协调） \\
+训练不稳定来源 & 主要是 reaching 精度 & 接触力震荡 + 多指协调 + 物体旋转失控 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{DexSuite 架构与设计哲学}
+\label{sec:rlmc-manip-dexsuite}
+
+Isaac Lab 的 DexSuite 提供多个灵巧手任务，核心基于 Kuka 机械臂 + Allegro Hand（\cref{tab:rlmc-manip-dextasks}）。\rebuilt{注：Dexsuite 的 Lift/Reorient 环境与 ADR/PBT/dictionary-obs 支持为 Isaac Lab 2.3 引入，已据 NVIDIA 开发者博客与 Isaac Lab 文档核实\,\cite{nvidia2025isaaclab23}；具体 task ID 字符串以你所装版本的 \texttt{list-envs} 输出为准。}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{Isaac Lab 操作任务（task ID 以所装版本为准）}
+\label{tab:rlmc-manip-dextasks}
+\begin{tabularx}{\linewidth}{@{}lLl@{}}
+\toprule
+Task ID & 目标 & 动作维度 \\
+\midrule
+\Verb[breaklines]|Isaac-Repose-Cube-Allegro-Direct-v0| & 灵巧手掌中旋转方块到目标姿态（无臂、手固定） & 16 (Allegro hand) \\
+\Verb[breaklines]|Isaac-Lift-Cube-Franka-v0| & Franka 平行夹爪抬方块（manager-based） & 7 arm + 1 binary gripper \\
+\Verb[breaklines]|Isaac-Lift-Cube-Franka-IK-Abs-v0| & Franka 绝对 DiffIK 抬方块 & 6+1 \\
+\Verb[breaklines]|Isaac-Lift-Cube-Franka-IK-Rel-v0| & Franka 相对 DiffIK 抬方块 & 6+1 \\
+\Verb[breaklines]|Isaac-Dexsuite-Kuka-Allegro-Lift-v0| & Kuka+Allegro 灵巧手抬取（2.3 新增） & 23 \\
+\Verb[breaklines]|Isaac-Dexsuite-Kuka-Allegro-Reorient-v0| & Kuka+Allegro 在手旋转（2.3 新增） & 23 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Franka Lift 系列提供三种动作空间变体（JointPos \verb|-v0| / IK-Abs / IK-Rel），与 \cref{sec:rlmc-manip-action} 的动作选型直接对应——可在同一 lift cube 任务上对比三种动作空间，是非常有教育价值的消融实验。（OSC 动作空间在官方环境表里对应的是 Franka \textbf{Reach} 任务而非 Lift。）入门建议：先跑通 \Verb[breaklines]|Isaac-Lift-Cube-Franka-v0|（与 mjlab YAM 复杂度相当），确认管线正常后再试 \Verb[breaklines]|Isaac-Repose-Cube-Allegro-Direct-v0|——前者默认配置通常能收敛，后者几乎必须调参。
+
+\cref{tab:rlmc-manip-frameworks} 系统对比 mjlab YAM、Isaac Lab DexSuite 与 UniLab in-hand 的设计差异——这是本章「三框架对比」主线在操作任务上的核心呈现。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{三框架操作任务设计对比（mjlab YAM lift / Isaac Lab DexSuite / UniLab in-hand）}
+\label{tab:rlmc-manip-frameworks}
+\begin{tabularx}{\linewidth}{@{}lLLL@{}}
+\toprule
+设计维度 & mjlab YAM Lift Cube & Isaac Lab DexSuite & UniLab \\
+\midrule
+物理后端 & MuJoCo Warp（凸优化软接触） & PhysX（TGS 迭代接触） & MuJoCoUni / MotrixSim（CPU 多线程） \\
+末端类型 & 平行夹爪（1 DOF） & Allegro 灵巧手（16 DOF） & Allegro / Sharpa 灵巧手（in-hand） \\
+action 维度 & 7 & 23 & 灵巧手关节位置目标（残差到默认姿态） \\
+reward 结构 & staged（乘法门控） & 旋转距离（直接指数衰减） & rotate + obj\_linvel + pose\_diff + drop（标量字典） \\
+DR 策略 & 手动设定范围 & ADR（自动扩展） & 手动范围（DomainRandConfig，无 ADR，见 \S\ref*{sec:rlmc-manip-adr}） \\
+超参调优 & 手动 / grid search & PBT（种群训练） & 手动 / Hydra 覆盖（无内置 PBT） \\
+视觉支持 & depth 已支持，RGB 预览 & RTX 渲染 + TiledCamera & 无视觉任务（本体感知 + 特权） \\
+入门难度 & 适合操作入门 & 需更多调参经验 & 入门即灵巧手（无平行夹爪 lift） \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+三处关键差异值得展开：(1) \textbf{物理后端}——PhysX 的 TGS（Temporal Gauss-Seidel）迭代求解器处理大量接触点时与 MuJoCo 凸优化求解器特性不同，PhysX 接触稳定性更依赖迭代次数（不够则手指穿过物体），MuJoCo Warp 凸优化对小物体抓取通常更稳但灵巧手的大量接触点会增加求解时间；(2) \textbf{动作空间}——Allegro 默认用关节目标（类似 mjlab \Verb[breaklines]|JointPositionAction|），但 16(Allegro)+7(Kuka)$=$23 维，是 YAM 的三倍多；(3) \textbf{奖励}——灵巧手的 repose（掌中旋转）\emph{不用} staged reward，因为物体始终在手中、无「接近」阶段，奖励直接基于物体当前姿态与目标姿态的旋转距离 $r=\exp(-\alpha\,d_{\text{rot}})$，$d_{\text{rot}}$ 是四元数距离。
+
+\subsection{UniLab 的灵巧手 in-hand 操作}
+\label{sec:rlmc-manip-unilabinhand}
+
+UniLab 在操作上的入口与前两者\emph{重叠在灵巧手}而非平行夹爪——它注册的操作任务全是 in-hand 在手旋转：\Verb[breaklines]|AllegroInhandRotation|（含 \verb|+Grasp| 变体）与 \Verb[breaklines]|SharpaInhandRotation|，恰好对应 Isaac Lab 的 \Verb[breaklines]|Repose-Cube-Allegro| 这一难度等级。这让 UniLab 一列在「灵巧手」概念上能给出真实接线（而非占位）。下面的命令与字段来自对 UniLab 源码（\Verb[breaklines]|envs/manipulation/|，branch main）的阅读与实跑。
+
+\begin{codebox}[bash]{UniLab:in-hand 灵巧手操作（对照 Isaac Lab Repose-Cube-Allegro）}
+# 任务（实测注册）:AllegroInhandRotation(+Grasp)、SharpaInhandRotation(+Grasp)
+uv run train --algo ppo --task sharpa_inhand --sim mujoco
+uv run demo inhandgrasp            # Sharpa in-hand 预训练回放（首跑从 HF 拉权重）
+# 配置位置:conf/ppo/task/{allegro,sharpa}_inhand/{mujoco,motrix}.yaml
+\end{codebox}
+
+UniLab 的 in-hand 奖励同样\emph{不用} staged 门控（与 Isaac Lab repose 一致、与 mjlab YAM lift 相反）——物体始终在手中，没有「接近」阶段。Allegro 任务的奖励函数集是 \verb|rotate|（朝目标姿态旋转）、\verb|obj_linvel|（惩罚物体平移速度，鼓励「原地转」）、\verb|pose_diff|（姿态差）、\verb|torque| 与 \verb|work|（能量正则）、\verb|drop|（掉落惩罚）。这印证了 \cref{ins:rlmc-manip-shared}：in-hand 任务在三框架里都收敛到同一组奖励语义，差别只在\emph{配置范式}——mjlab 用 \Verb[breaklines]|RewardTermCfg(func=...)| 类树、Isaac Lab 用函数式 \verb|@configclass|、UniLab 用 \verb|reward.scales| 标量字典 + \verb|_reward_fns| 派发表（同一思想，三种皮）。
+
+\paragraph{物体位姿观测与特权 critic（in-hand 版的非对称结构）。}UniLab in-hand 的 actor 观测含物体状态——Sharpa 的 actor「policy frame」拼接 \verb|object_pos| + \verb|object_quat| + \Verb[breaklines]|object_pos_anchor|（并跟踪 \Verb[breaklines]|prev_object_pos/quat| 算物体角速度）；critic 在此基础上追加特权 \verb|priv_info|（\Verb[breaklines]|friction_scale|、\Verb[breaklines]|gravity_direction|、\Verb[breaklines]|object_pos_delta|）。维度契约 \Verb[breaklines]|obs_groups_spec = {"obs": policy_dim, "critic": policy_dim + critic_info_dim}|（Allegro 则是单组 \Verb[breaklines]|{"obs": NUM_OBS_PER_STEP * NUM_LAG_STEPS}|，用观测历史堆叠代替显式特权）。这与本章 \cref{sec:rlmc-manip-obs} 的「actor 看可得量、critic 看真值」一脉相承：in-hand 里 \Verb[breaklines]|friction_scale|/\allowbreak\Verb[breaklines]|gravity_direction| 正是真机不可测、只能给 critic 的典型特权量。
+
+\begin{note}[UniLab 的 in-hand 蒸馏：HORA（RMA 式时序自适应）]
+本章把特权学习交给了 \cref{ch:rlmc-privileged}，但 UniLab 在\emph{操作}上恰好把它做成了一等公民，值得在此对照。UniLab 为 in-hand 提供 \textbf{HORA} 课程蒸馏（\Verb[breaklines]|conf/hora_distill/|，算法在 \Verb[breaklines]|algos/torch/hora/distill.py|）：stage-1 用特权 \verb|priv_info|（摩擦/重力方向等）训一个 PPO teacher，stage-2 让 student 从\emph{本体感知历史}学一个时序卷积适应编码器去「猜」这些特权量——这正是 Rapid Motor Adaptation（RMA）范式。工程关键在 \Verb[breaklines]|HoraDistillationTrainer| 的 \Verb[breaklines]|_trainable_parameters|：蒸馏阶段\textbf{只对名字含 \texttt{adapt\_tconv} 的参数置 \texttt{requires\_grad=True}}，teacher 主干与 \Verb[breaklines]|obs_normalizer| 全部冻结（\verb|eval()|）。运行方式：先 \Verb[breaklines]|uv run train --algo ppo --task sharpa_inhand --sim mujoco --profile hora| 训 teacher，再 \Verb[breaklines]|python scripts/train_hora_distill.py task=sharpa_inhand/mujoco| 蒸馏 student。注意这是「特权$\to$适应模块」蒸馏，\emph{不是}通用 DAgger 在线交替，也\emph{不含} camera-conditioned student（UniLab 当前无视觉任务，那条路径需自实现）。
+\end{note}
+
+\begin{insight}[同一灵巧手任务，三框架在异构 vs 同构上分道]\label{ins:rlmc-manip-heterogeneous}
+Isaac Lab 与 mjlab 把灵巧手的\emph{物理与策略都钉在 GPU}（靠 CUDA-graph / tiled rendering 压并行开销）；UniLab 反其道——灵巧手的\textbf{接触求解留在 CPU（MuJoCoUni/MotrixSim 多线程）、策略学习在 GPU 独立进程}，二者经共享内存 IPC 解耦。对灵巧手这点尤其有意思：灵巧手的 20+ 接触点在 GPU 凸/迭代求解里是吞吐瓶颈，而 CPU 全精度接触对「滑动/枢转」建模可能更稳——UniLab 把这条路径做成了一等公民（\Verb[breaklines]|SharedWeightSync| 版本化权重 + pinned-host 双缓冲 H2D 管线）。代价是多了一道 CPU$\to$GPU 数据搬运（靠 H2D 流水线重叠缓解），以及共享内存预算成为新失败面。这不是「哪个更好」，而是「灵巧手 RL 在算力拓扑上的第三种解」——CPU 核多或无强 GPU-sim 后端时，UniLab 路线值得一试。
+\end{insight}
+
+\subsection{DexPBT：种群训练的工程实现}
+\label{sec:rlmc-manip-pbt}
+
+\begin{paper}[DexPBT：用种群训练放大灵巧操作的探索]\label{paper:rlmc-manip-dexpbt}
+\textbf{简称与出处}：DexPBT（arXiv:2305.12127，Petrenko、Allshire、State、Handa、Makoviychuk，RSS 2023）\,\cite{petrenko2023dexpbt}。
+\textbf{问题}：灵巧手任务（reorientation、regrasping、grasp-and-throw）的 reward 景观尖锐、超参空间大（20+ 维），端到端 PPO 探索能力不足。
+\textbf{核心思想}：在 Isaac Gym 的 GPU 并行仿真上引入\emph{去中心化}的 Population-Based Training——同时训练一个「种群」的策略，性能差的继承性能好的网络权重（exploit）再小幅扰动超参（explore），使超参搜索与策略训练\emph{同步}进行。
+\textbf{关键结果}：显著超过常规端到端学习，在单/双臂 Kuka+Allegro 上发现鲁棒控制策略。
+\textbf{与本书关系}：其方法论已被 Isaac Lab 2.3 的 DexSuite 集成；PBT 例任务 \Verb[breaklines]|Isaac-Dexsuite-Kuka-Allegro-Lift-v0| 的文档明言「inspired by DexPBT」\,\cite{nvidia2025isaaclab23}。
+\textbf{局限}：需要大规模并行算力；exploit 时 optimizer 状态处理（见下）是工程细节难点。
+\end{paper}
+
+\textbf{为什么灵巧手需要 PBT？}传统超参搜索（grid/random）每组超参都要从头训到收敛，wall-clock 极长；灵巧手超参空间大且参数间有强交互（单独调一个看不到效果）。PBT 的核心机制（\cref{alg:rlmc-manip-pbt}）让搜索与训练同步：每隔 $K$ iteration，排名后段的策略 exploit 前段权重、再 explore 超参。
+
+\begin{algo}[Population-Based Training 主循环]\label{alg:rlmc-manip-pbt}
+\textbf{初始化}：$N$ 个策略，各持随机超参；性能数组置零。
+
+每 $K$ iterations：
+
+\quad 所有策略各训练 $K$ iteration；
+
+\quad 评估所有策略性能并排名；
+
+\quad 对排名后 25\% 的每个策略：从前 25\% 随机选一个，复制其网络权重（exploit），再对超参做小幅随机扰动（explore）；
+
+\quad 全体继续训练 $K$ iteration，重复至收敛。
+\end{algo}
+
+\paragraph{exploit 的 optimizer 状态难点。}exploit 不只是「复制权重」——还要处理 optimizer 状态（Adam 的 momentum 与 variance）。若只复制 policy 权重而不管 optimizer，Adam 的 momentum 仍「记得」旧参数的梯度方向，可能与新权重不兼容，导致 exploit 后性能骤降再恢复。两种处理：(1) exploit 后\emph{重置} optimizer（简单但丢动量），(2) 同时复制 optimizer 状态（一致但复杂）。\pz{经核 DexPBT 论文（arXiv:2305.12127）Algorithm 1：exploit 步只写 $\theta\leftarrow\theta^*$（"Replace weights"）与 $p\leftarrow\textsc{Mutate}(p^*)$，全文未提及 optimizer 状态（Adam momentum/variance）如何处理；故下文「用方式 (1)」为常见工程做法的推断而非论文确证，建议以你所用 PBT 实现的 exploit 代码为准}——一种常见做法是用方式 (1)，因为灵巧手 reward 景观变化快、旧动量参考价值有限。
+
+\rebuilt{Isaac Lab 文档列出 PBT 实际\emph{变异}的超参为 \texttt{learning\_rate}、\texttt{grad\_norm}、\texttt{entropy\_coef}、\texttt{critic\_coef}、\texttt{bounds\_loss\_coef}、\texttt{kl\_threshold}、\texttt{gamma}、\texttt{tau}（各带 mutate\_float / mutate\_discount 函数与变异概率）；已据 Isaac Lab PBT 文档核实\,\cite{nvidia2025isaaclab23}。注意 PBT 只调数值超参，不改 observation/reward 的结构。}
+
+\subsection{Automatic Domain Randomization (ADR)}
+\label{sec:rlmc-manip-adr}
+
+DexSuite 的另一关键技术是 ADR。回顾 \cref{ch:rlmc-dr}：标准 DR 的随机化范围是手动设的（如物体质量 $\pm20\%$）；ADR 让范围\emph{自动扩展}——策略在当前范围达到一定成功率时自动扩大，成功率掉下来则停止。它解决了经典 DR 困境：范围太小 sim-to-real gap 大，范围太大训练不收敛。
+
+\begin{paper}[ADR 的工程起源：OpenAI Rubik's Cube]\label{paper:rlmc-manip-adr}
+\textbf{简称与出处}：Solving Rubik's Cube with a Robot Hand（arXiv:1910.07113，Akkaya 等，OpenAI 2019）\,\cite{akkaya2019rubik}。
+\textbf{核心思想}：ADR 从单一非随机化环境起步，自动生成难度递增的环境分布，覆盖物体质量、摩擦、惯性、观测噪声、动作延迟等数十个参数。
+\textbf{关键结果}：Shadow Hand 解魔方；带记忆的策略（LSTM）在隐藏状态里展现出 \emph{emergent meta-learning}——隐式系统辨识让策略在不同物理参数环境中自动调整行为。
+\textbf{与本书关系}：DexSuite 的 ADR 是这套思想的工程简化版。
+\textbf{局限}：emergent meta-learning 需要 LSTM/GRU + 极大规模训练，MLP 策略\emph{不具备}此能力，且该效应在原始工作之外尚未被独立复现——读者应将其作为「理解 ADR 价值」的直觉，而非 ADR 的必然结果。
+\end{paper}
+
+灵巧手 sim-to-real 的另一代表是 DeXtreme（arXiv:2210.13702，Handa 等，ICRA 2023）\,\cite{handa2023dextreme}，它在 Isaac Gym 上做了向量化 ADR 并用大规模视觉随机化训练物体旋转策略——是 ADR 从 OpenAI 到 GPU 并行框架的工程落地参考。\cref{tab:rlmc-manip-adr} 给出灵巧手任务常见的 ADR 参数与扩展范围。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{灵巧手任务的典型 ADR 参数（数值为源稿经验，落地以实测为准）}
+\label{tab:rlmc-manip-adr}
+\begin{tabular}{@{}llll@{}}
+\toprule
+参数 & 初始范围 & ADR 可能扩展到 & 对策略的影响 \\
+\midrule
+物体质量 & $\pm10\%$ & $\pm50\%$ & 力控制鲁棒性 \\
+物体摩擦 & $\pm10\%$ & $\pm40\%$ & 滑动检测与补偿 \\
+手指 PD gain & $\pm5\%$ & $\pm20\%$ & 关节刚度适应 \\
+物体尺寸 & $\pm5\%$ & $\pm15\%$ & 抓取姿态泛化 \\
+观测噪声 & $0$--$0.01$ & $0$--$0.05$ & 感知鲁棒性 \\
+动作延迟 & $0$--$1$ step & $0$--$5$ step & 通信延迟适应 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{运行验证。}DexSuite 任务的健康信号：zero agent 播放时物体在手中保持稳定不穿透；启用 PBT 后 TensorBoard 能看到种群里不同策略的性能分化（而非全部同步）；启用 ADR 后随成功率上升能看到随机化范围逐步扩大的日志。
+
+\paragraph{UniLab 在 ADR/PBT 上的诚实对照（无对应，但有手动 DR）。}UniLab \textbf{无内置 ADR}（无「按成功率自动扩展范围」机制），也\textbf{无内置 PBT}（无种群训练入口）——灵巧手 in-hand 任务用\emph{手动设定范围}的标准 DR，超参靠 Hydra 覆盖手调。但 UniLab 的手动 DR 范式本身值得对照：DR 配在任务 \Verb[breaklines]|DomainRandConfig|（dataclass），经 \Verb[breaklines]|DomainRandomizationManager| 在 reset/interval 时分发，物体相关随机化用\emph{乘性}范围（如 \verb|geom_friction| 的 \Verb[breaklines]|*_multiplier_range|，类似 mjlab 的 \Verb[breaklines]|operation="scale"|）以保物理一致；关键是\textbf{后端能力门控}——每个后端经 \Verb[breaklines]|get_dr_capabilities()| 声明支持哪些 DR 项（MuJoCoUni 后端静态全集 11 项含 \verb|geom_friction|/\allowbreak\verb|kp|/\allowbreak\verb|kd|，MotrixSim 后端动态门控、基线仅 4 项），不支持的项被 \Verb[breaklines]|filter_reset_payload| 自动跳过（打 warning、不报错，优雅降级）。所以若要在 UniLab 复现 ADR，须自写「成功率统计 $\to$ 扩范围 $\to$ 改 \Verb[breaklines]|DomainRandConfig|」的回调，没有现成开关。
+
+\begin{pitfall}[PhysX solver iteration 不足导致接触穿透]
+\textbf{错误描述}：\Verb[breaklines]|solver_position_iteration_count| 用默认的 4 去跑灵巧手。\textbf{现象后果}：手指穿过物体，抓取无从建立。\textbf{根本原因}：PhysX TGS 求解器靠迭代求解接触约束，4 次对 locomotion 够用、对灵巧手的大量接触点不够。\textbf{正确做法}：灵巧手通常需 16--32 次迭代；自检——zero agent 播放确认物体在手中稳定不穿透（\cref{sec:rlmc-manip-contact} 给标定流程）。
+\end{pitfall}
+
+\begin{pitfall}[认为 PBT 只是「自动调参」]
+\textbf{错误描述}：把 PBT 等同于 grid/random search 的自动版。\textbf{现象后果}：低估其价值，或误以为可用普通调参替代。\textbf{根本原因}：PBT 的 exploit 让不同超参配置\emph{共享训练进度}——一个因 reward weight 不合适而慢的策略可继承好参数策略的网络再继续训。\textbf{正确做法}：理解 exploit（权重共享）是 PBT 区别于纯调参的本质；DexPBT 报告 PBT 在多个灵巧操作场景中是\emph{使能因素}——论文明言「PBT 在所有场景都显著改善训练，其中三个场景里 PBT 是让算法达到非平凡性能的关键」（如单臂 reorientation 中不开 PBT 的八次单 GPU 训练\emph{无一}达到目标容差，开 PBT 才收敛）\,\cite{petrenko2023dexpbt}。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[对比题]} 比较 mjlab YAM（7 DOF）与 Isaac Lab Kuka+Allegro（23 DOF）在 action 维度、observation 维度、reward 结构、典型训练 iteration 数上的差异。为什么 action 维度增 3 倍但训练时间可能增 10 倍以上？
+  \item \textbf{[设计题]} 若要在 mjlab 里实现一个类 ADR 机制，应在 EventManager 的哪个位置（startup/reset/interval/step）插入逻辑？画出数据流：成功率统计 $\to$ 范围更新 $\to$ EventManager 参数修改。验收：指出用 interval 模式的理由。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{手指接触建模的特殊挑战}
+\label{sec:rlmc-manip-contact}
+
+\paragraph{模块功能与在管线中的位置。}接触力的精度直接决定抓取策略能否在仿真中学到有效力控——本节讲操作接触为何比 locomotion 更难、更敏感，以及在 MuJoCo Warp 与 PhysX 中如何配置接触参数获得稳定抓取。它是 \cref{ch:rlmc-physics}（物理引擎）在操作任务上的专门化。
+
+\subsection{为什么接触在操作中更关键}
+\label{sec:rlmc-manip-whycontact}
+
+locomotion 的地面接触面积大（几十平方厘米）、力方向近似法向、摩擦要求不苛刻；接触模型差 10\% 摩擦通常不致灾难。操作的手指接触面积小（几平方毫米）、力含切向分量（摩擦维持抓取）、摩擦要求极苛刻——接触模型的小误差可能让仿真里学会的抓取在真机上完全失效。一个类比：locomotion 像穿运动鞋走路（鞋底大、摩擦好、偶尔滑也不摔），操作像用筷子夹花生（接触面积小、力学平衡精微，夹紧夹松都不行）。
+
+\subsection{MuJoCo Warp 接触参数调优}
+\label{sec:rlmc-manip-mujococontact}
+
+mjlab 用 MuJoCo Warp 作物理后端。\cref{tab:rlmc-manip-mjcfcontact} 用四维属性拆解几个关键接触参数。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{MuJoCo 接触参数的四维属性}
+\label{tab:rlmc-manip-mjcfcontact}
+\begin{tabular}{@{}p{1.9cm}p{2.6cm}p{3.2cm}p{3.0cm}@{}}
+\toprule
+参数 & 默认值来源 & 修改影响 / 合理范围 & 与其他配置耦合 \\
+\midrule
+\verb|condim| & MJCF geom 属性 & 1 无摩擦/3 点接触摩擦/6 面接触；操作至少 3，灵巧手或需 6 & 与 \verb|friction| 维度一致 \\
+\verb|friction| & geom，取两面较大值 & 操作 0.5--1.0；太低物体滑落、太高策略变粗暴 & 与 \verb|impratio| 共同决定抗滑 \\
+\verb|solref| & $[0.02,1.0]$ & $[t_c,\zeta]$；$t_c$ 小则接触硬、穿透小但数值不稳；实际取 $\max(t_c,2\,\Delta t)$ & 与 \verb|timestep| 耦合 \\
+\verb|impratio| & $1.0$ & 抗滑；物体缓慢滑落时增到 5--10 & 比直接增 \verb|friction| 更温和 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{MuJoCo 的软约束哲学（理解 solref 的前提）。}MuJoCo 文档明确：所有接触都是「软」的——物体总有微小穿透，接触力与穿透深度成正比（类似弹簧），所以「越用力压约束、加速度越大，逆动力学可唯一定义」。这与 PhysX、Bullet 的硬约束求解器在哲学上不同。好处是软约束避免硬约束在接触切换时的不连续力跳变，仿真更稳、梯度更平滑；坏处是参数不当则物体可见穿透（夹爪「嵌入」方块）。具体地，\verb|solref|$=[t_c,\zeta]$ 控制接触处虚拟弹簧-阻尼器：$t_c$（默认 0.02\,s）越小弹簧越硬、穿透越小但越不稳，MuJoCo 内部用 $\max(t_c,2\,\Delta t)$ 防过硬；$\zeta$（默认 1.0）= 1 是临界阻尼（不震荡最快恢复），$<1$ 欠阻尼（弹跳），$>1$ 过阻尼。操作一般用默认 $\zeta=1$，模拟弹性球才降到 0.1--0.5。
+
+\paragraph{\texttt{impratio} 的妙用。}这是个易被忽略但对抓取稳定性影响显著的全局参数。\verb|impratio|$>1$ 使摩擦力比法向力「更硬」——MuJoCo 文档：「大于 1 的设置让摩擦力比法向力『更硬』，普遍效果是防止滑移、而不增加实际摩擦系数」。若物体在手中缓慢滑落（但摩擦系数已合理），增 \verb|impratio| 到 5--10 比直接增摩擦系数更温和——后者太大（$>2.0$）会让接触切换时产生不合理大力，把方块「弹射」而非平稳推动。
+
+\begin{note}[YAM 真实的接触 DR：摩擦要按 slide/spin/roll 三向分开随机]
+前面（\cref{sec:rlmc-manip-binary}）说「操作对接触参数 DR 比 locomotion 更敏感」是个原则，YAM 1.4.0 把它落成了一个值得照抄的具体做法：它的指尖摩擦域随机化\textbf{不是}笼统地「摩擦 $\pm x\%$」，而是把 MuJoCo 的三向摩擦系数 \textbf{slide（滑动）/ spin（自旋）/ roll（滚动）分别独立随机}，用 \verb|startup| 模式（每个 env 起始固定一次，整个 episode 不变）、\verb|abs| 操作 + \verb|log_uniform| 分布采样（如 spin 取 $(10^{-4},\,2\times10^{-2})$ 这种跨数量级范围）。\textbf{为什么分三向}：抓取稳定性主要靠 slide 摩擦（抗切向滑落），但物体在指尖「转」或「滚」走是另一回事，spin/roll 摩擦失真会让仿真里稳的抓取在真机上「转脱手」——把三向锁成同一个值会丢掉这层物理。\textbf{为什么 startup 而非 interval}：物体-指尖摩擦是材料属性，一个 episode 内不该突变（interval 模式适合外力扰动类 DR，见 \cref{ch:rlmc-dr}）。这是操作接触 DR 比 locomotion 精细之处，落地时可 \Verb[breaklines]|grep -n friction| 你装的 \verb|env_cfgs.py| 看三向范围。
+\end{note}
+
+\subsection{碰撞几何简化：CoACD vs V-HACD}
+\label{sec:rlmc-manip-coacd}
+
+操作物体的碰撞几何需是凸的（或凸组合），因为凸碰撞检测（GJK/EPA）比通用三角网格快几个数量级。把复杂 mesh 分解为凸包集合有两种主流方法：\textbf{V-HACD}（体素化，倾向「填充」凹腔，对 locomotion 机体没问题但对操作物体可能产生物理错误）和 \textbf{CoACD}（碰撞感知，用树搜索保留对接触重要的凹腔）。
+
+\begin{paper}[CoACD：碰撞感知的凸分解]\label{paper:rlmc-manip-coacd}
+\textbf{简称与出处}：CoACD（arXiv:2205.02961，Wei、Liu、Ling、Su，SIGGRAPH 2022）\,\cite{wei2022coacd}。
+\textbf{核心思想}：用「碰撞感知凹度」指标（考察形状与其凸包的距离）+ 树搜索，在更少分量下\emph{保留}对接触重要的凹腔。
+\textbf{关键结果}：相比 V-HACD 等更好地保留输入形状的碰撞条件（论文原文：用更少分量更好地保留碰撞条件）。
+\textbf{与本书关系}：操作物体（杯、碗、盒、工具、机构）常有功能性凹腔——V-HACD 会把杯子内部填实致夹爪无法伸入，CoACD 保留凹腔。
+\textbf{局限}：比 V-HACD 慢；对本来就接近凸的形状（如腿）无优势。
+\end{paper}
+
+\textbf{工程建议}：locomotion 机体碰撞用 V-HACD（快、精度够），操作物体碰撞用 CoACD（慢但保留物理关键凹腔）。
+
+\subsection{PhysX 接触配置（Isaac Lab）与三步调优}
+\label{sec:rlmc-manip-physxcontact}
+
+Isaac Lab 的 PhysX 后端关键参数：\Verb[breaklines]|solver_position_iteration_count|（TGS 迭代次数，灵巧手需 16--32，默认 4 对 locomotion 够用）；\Verb[breaklines]|contact_offset| 与 \verb|rest_offset|（PhysX 在实际接触前就开始算接触力以提前稳定，灵巧手建议 \Verb[breaklines]|contact_offset|$=0.005$--$0.01$\,m，比 locomotion 默认 0.02 小，因手指几何尺度更小——过大会「隔空操作」）；GPU 接触缓冲区（接触点超缓冲会 crash，需按最大可能接触点设 \Verb[breaklines]|gpu_max_rigid_contact_count| 等。注意 \Verb[breaklines]|max_depenetration_velocity| 是限制消除穿透的最大修正速度，与缓冲区容量无关，别混用）。
+
+\paragraph{运行验证：接触稳定性三步调优。}面对新操作任务，按此三步定接触参数：
+(1) \textbf{验证无接触物理}——zero agent 播放，确认方块在重力下自由落体正常（符合 $g=9.81$）、不弹跳不穿透；
+(2) \textbf{验证接触稳定}——手动把方块设在夹爪之间，确认闭合时被稳定夹持不穿透；穿透则增 solver 精度（更小 \verb|solref[0]| 或更多 PhysX 迭代）；
+(3) \textbf{验证动态接触}——random agent 播放，确认方块被随机碰撞时被推动而非穿透、被弹开而非粘住；表现「粘性」则查 \verb|friction| 过高或 \verb|solimp| 的 width 过大。
+
+\begin{insight}[与其追求完美接触，不如合理建模 + DR]\label{ins:rlmc-manip-dr}
+无论接触模型多精确，仿真接触永远是真实接触的近似。与其花 90\% 精力做精细接触建模，不如用约 70\% 精力做合理建模 + 30\% 做域随机化——DR 让策略对摩擦和刚度变化产生鲁棒性，可\emph{部分补偿}接触模型误差。这也呼应 \cref{ch:rlmc-dr}：操作任务的接触敏感性正是 DR 在操作里比在 locomotion 里更重要的根因。
+\end{insight}
+
+\begin{pitfall}[物体质量太小导致被「弹飞」]
+\textbf{错误描述}：方块质量设得极小（如 0.001\,kg）。\textbf{现象后果}：有限的手指力矩产生极大加速度，方块在一个 timestep 内飞出画面，observation 出 NaN。\textbf{根本原因}：$a=F/m$，$m\to 0$ 则 $a\to\infty$。\textbf{正确做法}：zero agent 播放时方块应在重力下缓慢下落、不高速弹射；用物理合理的质量（如方块 0.05--0.2\,kg）。
+\end{pitfall}
+
+\begin{pitfall}[认为「更多接触点 = 更好的仿真」]
+\textbf{错误描述}：尽量加密碰撞几何以求「真实」。\textbf{现象后果}：求解器计算负担骤增，且多接触点间力分配可能震荡（数值不稳）。\textbf{根本原因}：接触点数量与稳定性非单调正相关。\textbf{正确做法}：用\emph{最少}接触点获得足够稳定——平行夹爪 2--4 点通常够，灵巧手 10--15 点为合理范围。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[实验题]} 在 YAM lift cube 中分别测 \verb|friction| $=0.3/0.7/1.5$ 三种配置，用 trained agent 评估抓取成功率并记录。解释为什么中间值可能最优（提示：太低滑落、太高策略变粗暴）。
+  \item \textbf{[分析题]} 若灵巧手在仿真训练的策略在真机上「抓不住物体」，列出三个可能原因（接触几何/摩擦/求解器精度），为每个给出排查方法与验收标准。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{动作空间三层抽象：JointPos / DiffIK / OSC}
+\label{sec:rlmc-manip-action}
+
+\paragraph{模块功能与在管线中的位置。}本节讲三种动作抽象的工程原理与选型——这是 ActionManager（\cref{ch:rlmc-obsact}）在操作任务上最重要的设计决策。三层抽象对应三个控制层次（\cref{tab:rlmc-manip-actionlevels}）。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{三种动作空间 = 三个控制层次}
+\label{tab:rlmc-manip-actionlevels}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+层次 & 动作空间 & 控制量 & 计算复杂度 & 适用场景 \\
+\midrule
+关节层 & \Verb[breaklines]|JointPositionAction| & 关节角度 (rad) & 低（直接 PD） & 大多数任务的默认 \\
+运动学层 & \verb|DiffIKAction| & 末端位姿增量 (m, rad) & 中（Jacobian 伪逆） & 需要精确末端轨迹 \\
+动力学层 & \verb|OSCAction| & 末端力/力矩 (N, N$\cdot$m) & 高（质量矩阵 + Jacobian） & 需要精确力控制 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{为什么需要任务空间动作}
+\label{sec:rlmc-manip-whytask}
+
+\Verb[breaklines]|JointPositionAction| 让策略在关节空间输出目标，需\emph{隐式}学逆运动学；对 lift cube 这种简单任务，MLP 能学会。但对精确任务（轨迹跟踪、装配），关节空间学习效率低：想让末端沿直线移 5\,cm，在关节空间是一条复杂非线性关节轨迹（策略要学这个非线性映射），在笛卡尔空间只是 $\Delta x=0.05$。DiffIK 的价值就是把逆运动学从「策略要学的东西」变成「框架自动处理的东西」。
+
+\subsection{DiffIK 原理与 DLS 伪逆}
+\label{sec:rlmc-diffik-manip}
+
+Differential IK 用 Jacobian 把笛卡尔期望速度映射为关节速度：$\dot q = J^\dagger(q)\,v_{\text{desired}}$，$v_{\text{desired}}=[\Delta x,\Delta y,\Delta z,\Delta\mathrm{roll},\Delta\mathrm{pitch},\Delta\mathrm{yaw}]$。标准伪逆 $J^\dagger=J^{\mathsf T}(JJ^{\mathsf T})^{-1}$ 在 $J$ 接近奇异时（$JJ^{\mathsf T}$ 几乎不可逆）产生极大关节速度——物理上即「为微小末端移动、某关节疯狂转动」。DLS（Damped Least Squares）在分母加正则项缓解：
+\begin{equation}
+J^\dagger_{\text{DLS}} = J^{\mathsf T}\bigl(JJ^{\mathsf T} + \lambda^2 I\bigr)^{-1}.
+\label{eq:rlmc-manip-dls}
+\end{equation}
+$\lambda$ 是阻尼：越大越保守（关节速度更小但末端跟踪精度降），越小越激进（精确但奇异点附近不稳）。典型值 $\lambda=0.01$（Isaac Lab 默认）到 $0.05$（保守场景）。
+
+\paragraph{代码走读：DiffIK 单步（理解原理，非可直接运行）。}下面实现式~\eqref{eq:rlmc-manip-dls} 的批量版本，关键行已标注。
+
+\begin{codebox}[Python]{DiffIK 单步:笛卡尔位姿增量 -> 关节角度增量}
+def diff_ik_step(jacobian, delta_pose, lambda_dls=0.01, q_current=None):
+    # jacobian: [B,6,n]  delta_pose: [B,6]（策略输出 x action_scale 后的位姿增量）
+    B, m, n = jacobian.shape                       # m=6, n=关节数
+    JJT = torch.bmm(jacobian, jacobian.transpose(1, 2))          # [B,6,6]
+    damping = lambda_dls**2 * torch.eye(m, device=jacobian.device)
+    JJT_inv = torch.linalg.inv(JJT + damping.unsqueeze(0))       # 关键行:DLS 阻尼求逆
+    J_pinv = torch.bmm(jacobian.transpose(1, 2), JJT_inv)        # [B,n,6]
+    delta_q = torch.bmm(J_pinv, delta_pose.unsqueeze(-1)).squeeze(-1)
+    return q_current + delta_q   # 位姿增量版本:直接相加，不再乘 dt
+\end{codebox}
+
+\begin{note}[manipulability 作为奖励项]
+操作性指标 $w=\sqrt{\det(JJ^{\mathsf T})}$ 衡量当前配置下末端运动的「灵活性」，$w\to 0$ 即接近奇异。可加 \Verb[breaklines]|manipulability_reward| $=w/w_{\max}$（权重 $\sim 0.1$）鼓励策略保持高 $w$ 配置，自动避开奇异、减少 DiffIK 数值问题。
+\end{note}
+
+\subsection{选型决策与双框架配置}
+\label{sec:rlmc-manip-actionchoose}
+
+\cref{tab:rlmc-manip-actionchoose} 给出基于任务特征的选型。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{关节空间 vs 笛卡尔空间的选型}
+\label{tab:rlmc-manip-actionchoose}
+\begin{tabular}{@{}lll@{}}
+\toprule
+任务特征 & 推荐动作空间 & 工程原因 \\
+\midrule
+简单抓取（lift cube） & 关节空间 & 不需精确末端轨迹，MLP 足够 \\
+精确轨迹跟踪（画直线） & 笛卡尔空间 & 直线在笛卡尔空间是线性的 \\
+需要冗余自由度利用 & 关节空间 & DiffIK 最小范数解不利用冗余 \\
+高 DOF 灵巧手 & 关节空间 & Jacobian 计算量大，手指无简单笛卡尔描述 \\
+多阶段操作（pick-place） & 笛卡尔空间 & 阶段过渡在笛卡尔空间更直观 \\
+需要力控制（装配/打磨） & OSC & 唯一直接控制接触力的选项 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[动作空间像编程语言：抽象层次而非先进程度]\label{ins:rlmc-manip-abstraction}
+关节空间像「汇编」（灵活但要手动管理底层映射），笛卡尔空间像「高级语言」（表达力强但抽象有代价），OSC 再上一层（直接管力）。选择取决于任务对底层控制的需求，\emph{不是}「越高级越好」。YAM lift cube 选 JointPos：不需精确轨迹、不需力控、不需冗余利用——工程最简单。
+\end{insight}
+
+\paragraph{配置详解：双框架 DiffIK。}在 mjlab 切到 DiffIK 要替换 action cfg。与 Isaac Lab 不同，mjlab 的 \Verb[breaklines]|DifferentialIKActionCfg| 把 DLS 求解参数（\verb|damping|、\Verb[breaklines]|position_weight| 等）\emph{直接}作为 action cfg 字段，而非嵌套 \Verb[breaklines]|controller=...|（字段经 mjlab 1.4.0 源码 introspection 核实：\verb|entity_name|、\Verb[breaklines]|actuator_names|、\verb|frame_type|（默认 \texttt{"body"}）、\verb|frame_name|、\Verb[breaklines]|use_relative_mode|、\Verb[breaklines]|delta_pos_scale|、\Verb[breaklines]|delta_ori_scale|、\verb|damping|、\verb|max_dq|、\Verb[breaklines]|position_weight|、\Verb[breaklines]|orientation_weight|、\Verb[breaklines]|joint_limit_weight|、\Verb[breaklines]|posture_weight|、\Verb[breaklines]|posture_target|）。
+
+\begin{codebox}[Python]{mjlab:从关节位置动作切换到 DiffIK（字段经 1.4.0 源码核实）}
+# 修改前（关节位置动作）
+actions = JointPositionActionCfg(
+    entity_name="robot", actuator_names=("arm_.*", "gripper_.*"), scale=0.1)
+# 修改后（DiffIK:直接吃笛卡尔位姿增量）
+actions = DifferentialIKActionCfg(
+    entity_name="robot",
+    actuator_names=("arm_.*",),   # 只含 arm，不含 gripper
+    frame_type="site", frame_name="grasp_site",
+    use_relative_mode=True,       # 动作是相对当前位姿的增量
+    delta_pos_scale=0.05, delta_ori_scale=0.05,  # 默认各 1.0
+    damping=0.05,                 # DLS 阻尼 lambda（默认 0.05）
+    max_dq=0.5,                   # 单步关节增量上限
+    posture_weight=0.0,           # null-space posture 正则（>0 启用）
+    joint_limit_weight=0.0,       # soft joint-limit avoidance（>0 启用）
+)
+\end{codebox}
+
+三个关键点：(1) DiffIK 只作用于 arm actuators，gripper 仍需单独的关节动作 term（IK 控末端姿态，不控夹爪开合）；(2) \verb|frame_name| 指定 IK 参考 frame，\textbf{必须与 observation 里算 ee 位姿用的 frame 一致}，否则策略的空间认知与实际 IK 控制不匹配；(3) Isaac Lab 的写法略不同（见下），它把 DLS 嵌在 \verb|controller| 里。
+
+\begin{codebox}[Python]{Isaac Lab:DiffIK 配置}
+actions = DifferentialInverseKinematicsActionCfg(
+    asset_name="robot", joint_names=["panda_joint.*"], body_name="panda_hand",
+    controller=DifferentialIKControllerCfg(
+        command_type="pose", use_relative_mode=True,
+        ik_method="dls", ik_params={"lambda_val": 0.01}))
+\end{codebox}
+
+\paragraph{第三层：OSC。}Isaac Lab 还提供 \Verb[breaklines]|OperationalSpaceControllerActionCfg|，基于 Khatib（1987）的操作空间控制\,\cite{khatib1987operational}。核心计算 $\tau = J^{\mathsf T}(q)\,F_{\text{desired}} + N(q)\,\tau_{\text{null}}$，$F_{\text{desired}}$ 是任务空间期望力（含位置保持力与接触力），$N(q)$ 是零空间投影，所需动力学量（质量矩阵 $M(q)$、科氏力、重力补偿）由 PhysX/MuJoCo Warp 实时算。\textbf{为何需要 OSC}：DiffIK 控末端位置（运动学）但不直接控接触力——装配（销钉插孔）中销钉碰孔壁时位置控制会产生极大接触力（DiffIK 试图让末端到达「穿过孔壁」的目标），OSC 可在接触方向切力控（如保持 5\,N 法向力）、自由方向保位控，正是力/位置混合控制在 RL 框架里的工程实现。
+
+\begin{codebox}[Python]{Isaac Lab:OSC 配置（注意是 controller\_cfg 不是 controller）}
+actions = OperationalSpaceControllerActionCfg(
+    asset_name="robot", joint_names=["panda_joint.*"], body_name="panda_hand",
+    controller_cfg=OperationalSpaceControllerCfg(
+        target_types=["pose_abs"],      # 必填:任务空间目标类型
+        impedance_mode="fixed",         # "fixed" 或 "variable"（策略可调刚度）
+        motion_stiffness_task=300.0, motion_damping_ratio_task=1.0,
+        contact_wrench_stiffness_task=None,  # None = 开环力控
+        nullspace_control="position"))
+\end{codebox}
+
+mjlab 截至本书撰写（1.4.0）\emph{尚未}内置完整 OSC ActionTerm（OSC 所需动力学量在 MuJoCo Warp 的 GPU 批量计算尚未完全优化），但其 \Verb[breaklines]|DifferentialIKActionCfg| 内置了 null-space posture regularization（\Verb[breaklines]|posture_weight|/\allowbreak\Verb[breaklines]|posture_target| 字段）与 soft joint-limit avoidance（\Verb[breaklines]|joint_limit_weight| 字段）——这两项已经 1.4.0 源码 introspection 核实存在。若需 OSC，Isaac Lab + PhysX 是当前更成熟选择。
+
+\paragraph{第四类动作：腱驱（欠驱动灵巧手）。}前三层都假定「每关节一个驱动器」，但肌腱驱动的灵巧手是\emph{欠驱动}的——多关节共用一根腱、由腱长/腱力间接控制。mjlab 1.4.0 为此提供专门的动作 cfg：\Verb[breaklines]|TendonLengthActionCfg| / \Verb[breaklines]|TendonVelocityActionCfg| / \Verb[breaklines]|TendonEffortActionCfg|（腱长/腱速/腱力）以及位点力 \Verb[breaklines]|SiteEffortActionCfg|。这是欠驱动肌腱手（如 Shadow Hand 的腱驱变体）的标准建模方式，本章前面的 \Verb[breaklines]|JointPositionActionCfg| 对它们不适用。三框架对照：Isaac Lab 对腱驱的支持依赖 USD 中的 tendon 定义；经核 UniLab 源码，其动作统一为关节位置目标，未提供腱驱/位点力动作的等价 cfg 类，故腱驱灵巧手在 UniLab 上需自实现或退回关节近似（以你所装版本为准）。
+
+\paragraph{运行验证。}切到 DiffIK 后 play 观察：机械臂是否在某些姿态突然剧烈抖动（接近奇异、$\lambda$ 太小）；打印 IK 目标位置与 obs 中 ee\_pos，确认两者追踪同一物理点。
+
+\begin{pitfall}[DiffIK 的 body\_name 与 observation 参考 body 不一致]
+\textbf{错误描述}：DiffIK 的 \verb|body_name|/\allowbreak\verb|frame_name| 与 observation 里算 \verb|ee_pos_w| 用的 body 不同。\textbf{现象后果}：策略学到正确的笛卡尔增量方向，但末端实际移动量有系统性偏差。\textbf{根本原因}：策略认为末端在位置 A（基于 obs 的 body），IK 把目标映射到位置 B（基于 DiffIK 的 body），两者在不同坐标系操作。\textbf{正确做法}：play 中打印 IK 目标位置与 obs 的 ee\_pos，确认追踪同一物理点。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[计算题]} 设 YAM 的 Jacobian 为 $6\times6$，DLS $\lambda=0.01$。计算 $J^\dagger_{\text{DLS}}=J^{\mathsf T}(JJ^{\mathsf T}+\lambda^2 I)^{-1}$ 在 $J=I$ 时的结果；$\lambda$ 增大对结果有何影响？
+  \item \textbf{[实验题]} 在 mjlab 把 YAM lift cube 从 \Verb[breaklines]|JointPositionActionCfg| 切到 \Verb[breaklines]|DifferentialIKActionCfg|，比较两者 2000 iteration 后的 reaching reward。验收：给出差异（若有）的解释。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{最小实验、跨框架映射与训练诊断}
+\label{sec:rlmc-manip-run}
+
+\paragraph{模块功能与在管线中的位置。}本节是「落地」节：从 \verb|list-envs| 到 smoke train 走通 YAM 四变体，给出 mjlab$\leftrightarrow$Isaac Lab 的配置映射，并系统化操作训练的诊断方法。它把前面所有概念兑现成「能跑的命令 + 出问题时的排查路径」。
+
+\subsection{最小 \texttt{uv run} 实验}
+\label{sec:rlmc-manip-smoke}
+
+\begin{codebox}[bash]{YAM 四变体 smoke test（task ID 以源码为准）}
+# 注册验证:应出现 4 个 task id
+uv run list-envs | grep -i yam
+# State zero play:机械臂/方块/目标可视化正确，zero 输出机械臂不动
+uv run play Mjlab-Lift-Cube-Yam --agent zero --num-envs 4 \
+    --viewer viser --no-terminations
+# State random play:机械臂剧烈动但不"爆炸"，方块不以极速飞出（验证 action scale 合理）
+uv run play Mjlab-Lift-Cube-Yam --agent random --num-envs 4 \
+    --viewer viser --no-terminations
+# State smoke train:actor/critic 创建成功，rollout 不因 shape 崩
+uv run train Mjlab-Lift-Cube-Yam \
+    --env.scene.num-envs 128 --agent.max-iterations 10
+\end{codebox}
+
+视觉变体（depth/multi-cube）的 smoke train 把 \verb|num-envs| 降到 64、确认 camera obs group 与 CNN model 创建成功、target\_mask 同进 camera group 不报错（任务名见范围声明）。\textbf{完整训练参考}：state 版 \Verb[breaklines]|--env.scene.num-envs 4096 --agent.max-iterations 5000|。\cref{tab:rlmc-manip-ppohp} 给操作任务推荐的 PPO 超参（对照 locomotion 默认）。
+
+\begin{note}[smoke train 的真实吞吐：别被「64 env 很慢」吓到]
+RTX 4090 上实测 \Verb[breaklines]|Mjlab-Lift-Cube-Yam --env.scene.num-envs 64 --agent.max-iterations 2|：吞吐从首迭代约 \textbf{1800 steps/s 爬到 4300 steps/s}（第 1 迭代含 JIT/CUDA-graph 编译预热，明显偏慢，属正常）。\textbf{这个数字和 Quick Start 那条「$<5$ 分钟解 cube lifting」不矛盾}：后者用的是\emph{数千}并行环境（\Verb[breaklines]|num-envs 4096|）的满吞吐（$\sim10^5$ steps/s 量级），而 smoke train 故意只用 64 env 验证管线接线，吞吐自然低两个数量级。判读要点：(1) 看到第 1 迭代慢、之后明显加速 = 编译预热正常，不是卡死；(2) 真实训练吞吐 ~= \verb|num-envs| 成比例放大（GPU 未饱和前），所以\emph{别}用 64 env 的体感去推「这框架太慢」；(3) 健康信号还有 value loss（YAM 实测 $\approx0.02$）有限、entropy（实测 $\approx9.9$）非 NaN。\textbf{首跑盯三行}：\verb|steps/s|（升上去）、\Verb[breaklines]|value loss|（有限不爆）、\verb|reward/*|（非 NaN）——这三行任一异常即出问题，是操作任务最快的「跑通自检清单」。
+\end{note}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{操作任务 PPO 超参推荐值 vs locomotion 默认}
+\label{tab:rlmc-manip-ppohp}
+\begin{tabular}{@{}llll@{}}
+\toprule
+超参 & Locomotion 默认 & 操作推荐 & 修改原因 \\
+\midrule
+\verb|learning_rate| & $10^{-3}$ & $3$--$5\times10^{-4}$ & reward 景观更尖锐，需更小步长 \\
+\verb|num_epochs| & 5 & 8 & 每条轨迹更有信息价值，多扫几遍 \\
+\verb|clip_param| & 0.2 & 0.1--0.2 & 更保守更新避免跳过接触边界 \\
+\verb|entropy_coef| & 0.01 & 0.005--0.01 & 操作探索不需太多随机性 \\
+\Verb[breaklines]|value_loss_coef| & 1.0 & 0.5--1.0 & value function 在操作中更难学 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{运行验证：训练期望与 TensorBoard 读法。}阶段性进步通常是：前 200 iteration reaching reward 快速上升；200--1000 grasping 阶段 reward 增长放缓；1000--3000 bringing reward 上升；3000+ 精度与稳定性优化。\textbf{必看指标}：\verb|reward/reach| 与 \verb|reward/bring| 分开看、\Verb[breaklines]|episode/success_rate|（比总 reward 更能反映实际能力）；\textbf{报警指标}：value loss 持续上升、KL 周期性 spike、entropy 在 500 iteration 内降到接近零（过早坍缩）。与 locomotion 的关键区别：操作 reward 可能出现「平台期」（reaching 收敛后策略需时间「发现」夹爪闭合与 bringing 的因果），不要误以为卡住而过早终止。
+
+\begin{insight}[操作 RL 从不可行到分钟级：算力而非算法]\label{ins:rlmc-manip-gpu}
+PPO 从 2017 到现在几乎没变，操作 RL 的进步主要来自\emph{算力}：物理引擎 GPU 并行化（MuJoCo Warp、PhysX GPU）+ 框架工程优化（mjlab 的 zero-copy、Isaac Lab 的 tiled rendering）。mjlab 作者公开报告 YAM 可「从 32$\times$32 RGB 帧在约 $<5$ 分钟 wall-clock 内解 cube lifting」\,\cite{zakka2026mjlab}——一杯咖啡的时间。这\emph{不是}渐进改善，而是使操作 RL 从学术实验变为工程可行的根本转折；理解这点才能解释为什么本章强调「快速迭代 reward 设计」是现实可行的。
+\end{insight}
+
+\subsection{跨框架配置映射}
+\label{sec:rlmc-manip-bridge}
+
+\cref{tab:rlmc-manip-mapping} 给出 mjlab、Isaac Lab 与 UniLab 操作任务配置的精确映射——语义等价但语法不同。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{操作任务配置映射（三框架；UniLab 列对应 in-hand 旋转任务）}
+\label{tab:rlmc-manip-mapping}
+\begin{tabularx}{\linewidth}{@{}lLLL@{}}
+\toprule
+配置组件 & mjlab（YAM） & Isaac Lab（DexSuite/Franka） & UniLab \\
+\midrule
+场景定义 & \verb|SceneCfg| + MJCF & \Verb[breaklines]|InteractiveSceneCfg| + USD & \Verb[breaklines]|SceneCfg.model_file| + MJCF（无 USD） \\
+机器人资产 & \verb|yam.xml| & \Verb[breaklines]|franka_panda.usd|/\allowbreak\verb|allegro.usd| & \verb|allegro|/\allowbreak\verb|sharpa| MJCF（\Verb[breaklines]|unilab-import-robot| 导 URDF） \\
+物体资产 & \verb|cube.xml|（freejoint） & \verb|cuboid.usd|（RigidObject） & 物体并入场景 MJCF（无独立 RigidObject 类） \\
+动作配置 & \Verb[breaklines]|JointPositionActionCfg| & \Verb[breaklines]|JointPositionActionCfg| & 无 Cfg 类；\verb|apply_action| 关节位置残差 \\
+观测管理 & \Verb[breaklines]|ObservationManager|+\verb|obs_groups| & \Verb[breaklines]|ObservationGroupCfg| & \Verb[breaklines]|obs_groups_spec|（固定 obs/critic 两组） \\
+命令 & \Verb[breaklines]|LiftingCommandCfg| & goal via \Verb[breaklines]|CommandTermCfg| & in-hand 目标姿态在 \verb|update_state| 内采样 \\
+RL 后端 & RSL-RL（PPO） & rl\_games/RSL-RL/SKRL & rsl-rl PPO / APPO / SAC（GPU 学习器） \\
+可视化 & viser（web） & Isaac Sim Viewer/USD & Viser（web，\Verb[breaklines]|--render-mode interactive|） \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{insight}[跨框架迁移的核心困难在物理，不在语法]\label{ins:rlmc-manip-bridge}
+任何有经验的工程师都能查文档改配置名——真正的困难在物理引擎行为差异：同一个 reward function 在 MuJoCo 与 PhysX 中可能诱导出不同策略，因为两引擎对同一接触力的求解结果不同。因此迁移后\textbf{必须重新训练而非加载 checkpoint，重新调参而非照搬 $\sigma$ 值}。迁移的是「设计思路」不是「具体数值」。一个实际陷阱：mjlab 的 MJCF 关节按 XML 出现顺序排列，Isaac Lab 的 USD 关节默认按字母序——顺序不同则 \verb|action_scale| 向量的元素对应到不同关节（夹爪 kp 被用到臂上）。自检：两框架都打印关节名列表确认顺序一致。
+\end{insight}
+
+\paragraph{UniLab 把「迁移即物理风险」前置成编译期检查。}上面这条洞察在 UniLab 里有一个一等公民的工程对应物：\textbf{内建跨后端 sim2sim 契约校验}（\Verb[breaklines]|training/sim2sim.py|）。UniLab 的同一策略可在 MuJoCoUni 与 MotrixSim 两后端间迁移回放，但两后端的 DR 能力与接触模型不同（见 \cref{sec:rlmc-manip-unilabinhand}），策略行为可能漂移。\Verb[breaklines]|resolve_sim2sim_config| 在加载前读源 run 的 \Verb[breaklines]|contract_snapshot|，逐字段比对「决定策略行为的字段」；落在 \verb|DENYLIST|/\allowbreak\Verb[breaklines]|ENV_STRUCTURAL_DENYLIST| 的字段若不一致，\Verb[breaklines]|training.sim2sim_strict=true|（默认）直接抛 \Verb[breaklines]|CrossBackendIncompatibleError|。这把「迁移后行为不一致」从训练时的诡异 bug\emph{前移}成加载时的硬错误——正是本洞察「迁移的核心困难在物理」的工具化体现。mjlab/Isaac Lab 间无此自动关卡，需手动核对（关节顺序、接触参数）。
+
+\subsection{操作任务的训练诊断}
+\label{sec:rlmc-manip-diag}
+
+回顾 \cref{ch:rlmc-training} 的三层诊断（物理层$\to$MDP 层$\to$优化层），操作在每层都有特殊失败模式。\cref{tab:rlmc-manip-fail} 列出八种高频失败模式与对策。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{操作任务的八种高频失败模式}
+\label{tab:rlmc-manip-fail}
+\begin{tabular}{@{}p{3.0cm}p{4.2cm}p{4.6cm}@{}}
+\toprule
+症状 & 根本原因 & 修复方案 \\
+\midrule
+卡 reaching（reach$\approx$1，bring$\approx$0） & 夹爪 action 无效/$\sigma$ 太大/物体太重/lr 太大 & 查 action 第 7 维映射；减 $\sigma_{\text{reach}}$；调质量摩擦；降 lr \\
+夹爪持续震荡 & action smoothness penalty 不足 & 增 \Verb[breaklines]|action_rate_l2| 权重（0.01--0.05） \\
+方块在手中旋转失控（灵巧手） & 多指切向力不平衡产生净力矩 & 加旋转惩罚；增摩擦；减 action scale \\
+视觉版 actor 不用图像 & actor obs 含 privileged state & 移除 \verb|ee_to_cube| 等，只留 proprio+图像 \\
+reset 后物体嵌入桌面 & z 下限未含 margin & z 下限 $\ge$ table+cube\_half+margin \\
+value loss 极大不收敛 & 初期 return 全零，critic 初值偏离 & 加小 alive reward；critic warm-up；降 value lr \\
+学会「推」而非「抓」（reward hacking） & bring reward 不区分推/抬 & 加 grasping reward；目标 z 高于桌面；加 is\_grasped 前置 \\
+多 env return 方差极大 & object pose 随机化超出工作空间 & 缩 xy 范围；reset 加可达性检查重采样 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[黄金诊断原则：Reward Up, Task Metric Flat = Reward Hacking]\label{ins:rlmc-manip-hacking}
+\textbf{永远独立记录 task metric（grasp success rate、lift height）和 reward。}若 reward 在涨但 task metric 持平或下降，几乎可断定 reward hacking——策略找到了「获取 reward 但不完成任务」的捷径。这在操作里特别常见，因为 staged reward 有多个分项，策略可能最大化某分项而忽略其他（如 reaching 已高但从不闭合夹爪，因为闭合有 action cost、不闭合也不被 reaching 惩罚）。每当「reward 曲线正常但 play 行为不对」，第一个怀疑对象就是 reward hacking。
+\end{insight}
+
+\begin{codebox}[Python]{独立记录 task metric（不参与 reward 计算）}
+def _compute_success(self):
+    """Success = 物体距目标 < 5cm 且 高于桌面."""
+    dist = torch.norm(self.cube_pos - self.goal_pos, dim=-1)
+    above_table = self.cube_pos[:, 2] > self.table_height + 0.05
+    return (dist < 0.05) & above_table   # 经 extras["success_rate"] 传给 logger
+\end{codebox}
+
+\paragraph{一次真实排错的命令序列：「reach 高、bring 卡零」怎么自己查（而非只看症状表）。}\cref{tab:rlmc-manip-fail} 第一行给了「症状$\to$原因$\to$方案」，但工程上你需要的是\emph{一串能照打的命令}把可疑项逐个排除。下面是面对「\verb|reward/reach|$\approx0.95$、\verb|reward/bring|$\approx0$」时的真实排查顺序（每步都给「跑什么 + 看什么 + 据此判什么」）：
+\begin{codebox}[bash]{排错命令序列:从「能跑」到「定位失效阶段」}
+# 步骤 1:分项 reward 真的分开记了吗？训练时 mjlab 按 Episode_Reward/<term> 逐项打印，
+#         先确认 bring 那项确实存在且确实是 0（而不是没记/记错名）
+WANDB_MODE=disabled uv run train Mjlab-Lift-Cube-Yam \
+    --env.scene.num-envs 64 --agent.max-iterations 50 2>&1 | grep -i "reward/"
+#   看: Episode_Reward/* 里 reach 在涨、bring 恒 0 -> 确认卡在 grasp/bring 阶段
+# 步骤 2:夹爪 action 真的有效吗？用 zero/random play 直接看夹爪动不动
+uv run play Mjlab-Lift-Cube-Yam --agent random --num-envs 4 \
+    --viewer viser --no-terminations
+#   看: 夹爪是否随机开合 + 方块被碰是否被推动(非穿透/非弹飞) -> 排除动作/接触失效
+# 步骤 3:物体根本抬得起来吗？(物理可行性，与策略无关)
+#   手动把方块塞进夹爪之间、发闭合动作，看能否夹住抬起 -> 排除质量/摩擦/求解器
+# 步骤 4:ee_to_cube 真的进了 actor obs 吗？(若进 critic 没进 actor，策略瞎学)
+#   用 mjlab.tasks.registry.load_env_cfg 取该任务 cfg，再 dir()/打印 observations
+#   字段名按你装的版本会变，先 print(cfg.observations) 看结构再取 actor 组
+uv run python -c "from mjlab.tasks.registry import load_env_cfg; \
+  cfg=load_env_cfg('Mjlab-Lift-Cube-Yam'); print(cfg.observations)"
+#   看: actor 组里有没有 ee_to_cube / cube_to_goal -> 缺则策略看不到阶段信号
+#   (更直接: 训练首迭代日志的 Actor MLP in_features 若比含 ee_to_cube 时小 6，即漏了)
+\end{codebox}
+这套序列的价值不在具体命令，而在\textbf{排查顺序的逻辑}：先确认「症状真实」（步骤 1，别排查一个不存在的问题）$\to$ 再分「策略问题还是物理问题」（步骤 2--3，物理不可行时再怎么调 reward 都没用）$\to$ 最后查「策略有没有拿到必要信息」（步骤 4）。这条「从外到内、先排物理再排策略」的次序，对操作任务几乎所有失败都适用——比背症状表更能教会你举一反三。注意命令里的 \Verb[breaklines]|grep -i "reward/"|、\verb|load_env_cfg| 这些都是\emph{你自己}能立刻复现的查法，不依赖书里的结论。
+
+\begin{pitfall}[object pose 的坐标系不一致]
+\textbf{错误描述}：\verb|cube_pos_w| 给全局位置，\verb|goal_pos| 给相对 env origin 的位置。\textbf{现象后果}：\verb|cube_to_goal| 系统性偏差；单 env 不暴露（origin 为零），多 env 里不同 env 的 origin 不同导致部分 env 永远失败。\textbf{根本原因}：两个量在不同坐标系。\textbf{正确做法}：统一坐标系；多 env 下打印 \verb|cube_to_goal| 分布核对（呼应 \cref{ins:rlmc-manip-contract} 的三角契约）。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[诊断题]} YAM lift cube 训练 1000 iteration 后 reaching$=0.95$ 但 bringing$=0.02$。列出至少 3 步排查，每步说明查什么、可能的发现与修复（提示：对照 \cref{tab:rlmc-manip-fail} 第一行）。
+  \item \textbf{[跨章综合题]} 结合 \cref{ch:rlmc-obsact}（观测）、\cref{ch:rlmc-reward}（奖励）：你的 YAM depth 版 reward 很高，但 play 时遮住相机（全黑图像）策略仍能抓取。写出从现象到根因的诊断链（至少 3 步 + 源码锚点）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{视觉操作变体：从 State 到 RGB/Depth}
+\label{sec:rlmc-manip-vision}
+
+\paragraph{模块功能与在管线中的位置。}本节讲操作从 state 输入切到视觉输入的工程变化，以及如何避免视觉版常见的 privileged 信息泄漏。视觉不是操作的「进阶选项」——它是 sim-to-real 的\emph{必经之路}：真实部署中物体位置必须从相机提取，不能用 privileged 的 \verb|cube_pos_w|。
+
+\subsection{State to Depth to RGB 的渐进管线}
+\label{sec:rlmc-manip-progressive}
+
+操作视觉开发应渐进而非一步到位（\cref{tab:rlmc-manip-stages-vision}）。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{视觉操作的渐进开发管线}
+\label{tab:rlmc-manip-stages-vision}
+\begin{tabular}{@{}llll@{}}
+\toprule
+阶段 & 输入 & 目标 & 工程重点 \\
+\midrule
+Stage 0 & 无（zero/random play） & 验证物理资产正确 & 碰撞几何、接触参数、自由落体 \\
+Stage 1 & State (privileged) & 验证 MDP 设计正确 & reward/action/termination 正确性 \\
+Stage 2 & Depth & 验证 CNN 能从深度图提取物体信息 & CNN 架构、预处理、obs group \\
+Stage 3 & RGB & 处理材质/光照/颜色变化 & 纹理/光照随机化、颜色 augmentation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+为什么不直接从 RGB 开始？因为 RGB 引入大量视觉无关的变化源（光照、材质、背景），若 MDP 本身有问题，你无法区分失败来自视觉还是 MDP。先 state 验证 MDP，再 depth 验证空间感知，最后 RGB 处理外观变化——与软件工程「先正确再优化性能」一致。
+
+\subsection{视觉版 Observation Group 与 privileged 泄漏检测}
+\label{sec:rlmc-manip-leak}
+
+\begin{codebox}[Python]{视觉版 obs\_groups 配置（关键差异）}
+obs_groups = {
+    "actor":  ("actor", "camera"),   # actor 看 state(无物体真值) + 图像
+    "critic": ("critic", "camera"),  # critic 看 privileged state + 图像
+}
+\end{codebox}
+
+\verb|"actor"| group 中\textbf{不应}含 \verb|ee_to_cube|、\verb|cube_pos_w|、\verb|cube_quat_w|、\verb|cube_to_goal| 等物体/目标状态——它们只能在 \verb|"critic"| group 出现。一个易错点：RSL-RL 的 \verb|obs_groups| 名字必须在 env cfg 与 rl\_cfg 中\emph{完全一致}（大小写敏感），否则报不直观的 shape 错误。
+
+\begin{insight}[privileged 泄漏的三层防线]\label{ins:rlmc-manip-leak3}
+视觉操作最隐蔽的 bug 是「策略看起来学会了，实际完全不用视觉」。三层检测应成习惯：(1) \textbf{静态检查}（最简单最有效）——逐项核查 actor obs group 无任何物体/目标状态；(2) \textbf{梯度检查}（训练初期）——CNN 第一层权重梯度范数应 $>0$，接近零说明 CNN 没被有效训练，比遮蔽测试更早发现；(3) \textbf{遮蔽测试}（训练后）——把 camera 图像换成全零 tensor，正确的视觉策略应\emph{完全失效}；若仍能成功抓取，必有 privileged 泄漏。
+\end{insight}
+
+\subsection{CNN 架构与 SpatialSoftmax}
+\label{sec:rlmc-manip-cnn}
+
+视觉版用 CNN 处理图像。mjlab YAM 视觉 PPO 的默认 CNN 配置经 1.4.0 源码核实（\Verb[breaklines]|tasks/manipulation/config/yam/rl_cfg.py| 的 \Verb[breaklines]|_VISION_CNN_CFG|）是「两层 + SpatialSoftmax」：\Verb[breaklines]|output_channels=[16,32]|、\Verb[breaklines]|kernel_size=[5,3]|、\verb|stride=[2,2]|、\Verb[breaklines]|spatial_softmax=True|（\Verb[breaklines]|spatial_softmax_temperature=1.0|），模型类 \Verb[breaklines]|mjlab.rl.spatial_softmax:SpatialSoftmaxCNNModel|。下面给一个\emph{三层教学示例}（通道更大，演示更深的编码器，\emph{非} mjlab 默认）。
+
+\begin{codebox}[Python]{操作视觉的 SpatialSoftmax 池化层}
+class SpatialSoftmax(nn.Module):
+    """对每个 feature map 计算"注意力中心"(x,y)，保留空间位置信息."""
+    def __init__(self, num_channels, temperature=1.0):
+        super().__init__(); self.temperature = temperature
+    def forward(self, fm):                      # fm: [B,C,H,W]
+        B, C, H, W = fm.shape
+        xs = torch.linspace(0, 1, W, device=fm.device)
+        ys = torch.linspace(0, 1, H, device=fm.device)
+        w = F.softmax(fm.reshape(B, C, -1) / self.temperature, dim=-1).reshape(B, C, H, W)
+        ex = (w.sum(dim=2) * xs).sum(dim=-1)    # [B,C] 期望 x
+        ey = (w.sum(dim=3) * ys).sum(dim=-1)    # [B,C] 期望 y
+        return torch.cat([ex, ey], dim=-1)      # [B,2C]
+\end{codebox}
+
+\begin{paper}[SpatialSoftmax 的由来：Deep Spatial Autoencoders]\label{paper:rlmc-manip-ssm}
+\textbf{简称与出处}：Deep Spatial Autoencoders for Visuomotor Learning（arXiv:1509.06113，Finn、Tan、Duan、Darrell、Levine、Abbeel，ICRA 2016）\,\cite{finn2016dsae}。
+\textbf{核心思想}：与 average pooling 不同，spatial-softmax 聚焦特征图中最高激活的 2D 空间位置，把图像信息压缩到「特征点」表示，从而直接定位图像中的物体。
+\textbf{关键结果}：学到的特征点自动挑出任务相关物体（采集中会移动的物体）、忽略背景。
+\textbf{与本书关系}：操作策略需要的核心信息正是「物体在图像哪个位置」，SpatialSoftmax 的输出（每通道一个 $(x,y)$）天然契合，比 global average pooling 保留更多空间信息。
+\textbf{局限}：对需要纹理/外观细节而非位置的任务不一定优于全局池化。
+\end{paper}
+
+\paragraph{为什么 SpatialSoftmax 优于 Global Pooling。}global pooling 丢弃空间位置、只保留「有没有特定 pattern」，对分类够用（图中有没有猫），对操作不够（方块在哪直接决定 reaching 方向）。源稿经验：SpatialSoftmax 在 manipulation 上通常比 global pooling 收敛快 2--5 倍。
+
+\subsection{视觉版相机配置与工程注意}
+\label{sec:rlmc-manip-camcfg}
+
+\begin{codebox}[Python]{mjlab:YAM 视觉任务相机配置（字段经 1.4.0 源码核实）}
+from mjlab.sensor.camera_sensor import CameraSensorCfg  # 注意路径在 mjlab.sensor
+cam_cfg = CameraSensorCfg(
+    name="camera_d405", camera_name="robot/camera_d405",  # MJCF 中相机全名
+    height=32, width=32,            # 默认 160x120;小分辨率以提吞吐
+    data_types=("depth",),          # 默认 ("rgb",);也可 ("rgb","depth")
+    enabled_geom_groups=(0, 1, 2))  # 参与渲染的 geom group
+# 真实字段还有 pos/quat/fovy/use_textures/use_shadows/orthographic 等;
+# 无 cutoff_distance/CameraObsCfg/normalize/clip_range 字段（depth 截断在 obs 预处理里做）.
+\end{codebox}
+
+\begin{codebox}[Python]{Isaac Lab:操作任务 TiledCamera 配置}
+from isaaclab.sensors import TiledCameraCfg
+wrist_camera = TiledCameraCfg(
+    prim_path="{ENV_REGEX_NS}/Robot/wrist_link/wrist_camera",
+    data_types=["distance_to_image_plane"], width=64, height=64,
+    spawn=PinholeCameraCfg(focal_length=24.0, clipping_range=(0.01, 2.0)))
+\end{codebox}
+
+UniLab 无对应（经核源码与实跑）：当前 26 个注册任务全是本体感知，无 RGB/depth 观测任务，操作上只有 in-hand 旋转用物体位姿 state，无视觉操作变体；MotrixSim 虽有渲染后端，但用于回放可视化（如 demo teaser），不是训练时的相机观测。因此本章视觉操作的三框架对比在此退化为 mjlab + Isaac Lab 两家。UniLab 的 depth/RGB obs 与相机 DR 接口尚待官方提供（落地时以你所装版本的注册表为准）。
+
+四个工程注意点决定视觉版训练效率：(1) \textbf{渲染开销与环境数权衡}——视觉版每环境每步要渲染，并行数通常降到 512--1024，须相应调 mini-batch；(2) \textbf{图像归一化}——MuJoCo Warp 的 depth 是以米为单位的浮点数，用线性归一化 $d_{\text{norm}}=(d-d_{\min})/(d_{\max}-d_{\min})$（用近/远裁剪面），\emph{不要}用均值方差标准化（值域会随场景变）；(3) \textbf{CNN lr 缩放}——给 CNN 分支独立的、更小的学习率（通常 MLP 的 0.1--0.5 倍），防视觉特征不稳定或学不到东西；(4) \textbf{HWC/CHW 格式}——MuJoCo Warp 输出 HWC，PyTorch Conv2d 要 CHW，忘记 \Verb[breaklines]|permute(0,3,1,2)| 会把空间维当通道维、输出全是噪声。
+
+\begin{insight}[视觉是测量系统，不是「更大的 obs 向量」]\label{ins:rlmc-manip-measure}
+把相机测量写成 $I_t=\mathrm{Render}(x_t,g,K,T_{\text{cam}},\text{lighting},\text{material})$：$x_t$ 是物体位姿、$K$ 内参、$T_{\text{cam}}$ 外参。若视觉只是「更多数字」，加大 MLP 即可；但因为它是有投影、遮挡、光照的\emph{测量系统}，我们必须关心测量过程本身——相机放哪、看到/看不到什么、外观在什么条件下变。Visual DR 的本质是在 $\mathrm{Render}$ 的参数空间随机化（改 lighting/material 但不改 $x_t$），迫使 CNN 学到对测量条件鲁棒的特征。与遥感的 domain adaptation 同理，但视觉控制是\emph{闭环}的（动作改变场景进而改变下一帧），分布漂移更严重。
+\end{insight}
+
+\paragraph{视觉版的前沿替代：Diffusion Policy。}本章策略都是 MLP + PPO。Diffusion Policy（arXiv:2303.04137，Chi 等，RSS 2023 / IJRR 2024）\,\cite{chi2023diffusion} 用扩散模型表示策略——通过迭代去噪从噪声「生成」动作序列，适合\emph{多模态}动作分布（如装配中螺丝可从左/右拧，MLP 的单高斯输出会「折中」两种策略导致失败）。对 lift cube 这种单模态任务，MLP 与 Diffusion Policy 差异不大，且后者推理慢（DDPM 100 步约 50\,ms，对 50\,Hz 控制偏慢）——本章教学目的下 MLP + PPO 是更合适的起点。Diffusion Policy 在 \cref{ch:rlmc-imitation}（模仿学习）中作为主要方法之一深入讨论。
+
+\paragraph{运行验证：视觉版必看指标。}\verb|cnn_grad_norm|（$>0$ 且稳定 = CNN 在学；$\approx0$ = 未连接 obs 或 privileged 泄漏）；\Verb[breaklines]|visual_feature_std|（逐步增大到 0.1--1.0 正常；始终 $\approx0$ = CNN 输出全零）；reaching reward 应达 state 版的 60\%--80\%；遮蔽测试图像全零时策略应失效。
+
+\begin{pitfall}[把视觉策略的失败归因于 CNN 架构]
+\textbf{错误描述}：视觉版训练失效就先改 CNN 层数/通道。\textbf{现象后果}：在错误方向上反复试错。\textbf{根本原因}：视觉版失败 90\% 在输入层面——\verb|camera_name| 错、\verb|obs_groups| 大小写不匹配、图像未归一化到 $[0,1]$、HWC/CHW 没转、privileged 泄漏。\textbf{正确做法}：先保存一帧 tensor 可视化确认 shape 与值域，确认输入完全正确后再考虑改 CNN。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[实验题]} 在 mjlab 分别训练 YAM state 版与 depth 版 2000 iteration，比较 reaching reward 收敛速度。若 depth 版慢 3 倍以上，检查 CNN 输入是否正确（shape、值域、归一化）。验收：给出两条曲线 + 差异解释。
+  \item \textbf{[设计题]} 设计实验验证 SpatialSoftmax 对 depth 版的贡献：用相同超参与种子训练 SpatialSoftmax vs Global Average Pooling 两版，比较 2000 iteration 后的 reach+bring reward。预测哪个更好并解释（提示：\cref{paper:rlmc-manip-ssm}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\label{sec:rlmc-manip-misconcept}
+
+\begin{pitfall}[本章常见误解一览]
+\begin{itemize}
+  \item \textbf{「固定基座只有 6--7 DOF，比 18 DOF 四足简单」}——错。难度不取决于 DOF 数量而取决于 reward landscape 形状与成功集体积。6-DOF 臂在 5\,mm 精度下抓 2\,cm 方块，成功集体积远小于 18-DOF 四足在 5\,cm 精度下踩粗糙地面（\cref{ins:rlmc-manip-window}）。
+  \item \textbf{「reward 分项都在涨就没问题」}——错。策略可能学会「推」而非「抓」来骗 bring reward，推/搬在数值上相近但真机可靠性天差地别。必须 play 可视化 + 独立记录 success rate（\cref{ins:rlmc-manip-hacking}）。
+  \item \textbf{「方块初始位置固定会更容易」}——单配置收敛是更快，但策略会过拟合到该位置，一旦变化完全失效。操作里 object pose randomization 是\emph{基本要求}而非锦上添花。
+  \item \textbf{「MuJoCo 接触更好所以灵巧手一定用 MuJoCo」}——错。MuJoCo 凸优化对小物体精细抓取有优势，但 PhysX 在大量接触点（灵巧手 20+ 点）场景下 GPU 并行效率更高。选型是「哪个在你的任务规模与精度下更合适」。
+  \item \textbf{「DiffIK 是关节空间的升级版」}——错。它是\emph{不同抽象层次}，有自己的优势与代价（丧失冗余自由度利用）。选择取决于任务需求不是先进程度（\cref{ins:rlmc-manip-abstraction}）。
+  \item \textbf{「分辨率越高视觉越好」}——错。CNN 计算量随分辨率平方增长；lift cube 只需知道「方块在哪」，32$\times$32 或 64$\times$64 已够。先从低分辨率验证管线再按需增加。
+\end{itemize}
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\addcontentsline{toc}{section}{小结}
+\label{sec:rlmc-manip-summary}
+
+本章把强化学习\emph{理论}里的「序贯决策 + 接触」落到一台机械臂/灵巧手上，主线始终是\textbf{算法领路、实践兑现}：先立操作与 locomotion 的六维 MDP 差异及其因果链（\cref{ins:rlmc-manip-shared}、\cref{ins:rlmc-manip-window}），再依次把每个概念落成三框架的工程接线——staged reward 用乘法门控打破「接近但不抓」的局部极值（式~\eqref{eq:rlmc-manip-staged}、\cref{ins:rlmc-manip-kernel}）、接触参数（\verb|solref|/\allowbreak\verb|condim|/\allowbreak\verb|impratio| 或 PhysX 迭代）决定抓取稳定性（\cref{ins:rlmc-manip-dr}）、三层动作抽象按任务精度/力控需求选型（\cref{ins:rlmc-manip-abstraction}）、视觉操作走 State$\to$Depth$\to$RGB 渐进管线并用三层防线杜绝 privileged 泄漏（\cref{ins:rlmc-manip-leak3}、\cref{ins:rlmc-manip-measure}）。mjlab YAM 与 Isaac Lab DexSuite 共享 manager-based 骨架但物理后端、末端复杂度、DR/调优策略各异——跨框架迁移的核心困难在物理而非语法（\cref{ins:rlmc-manip-bridge}）。
+
+\paragraph{术语速查。}
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 含义 \\
+\midrule
+staged reward & 阶段性奖励，用乘法门控编码因果顺序（式~\eqref{eq:rlmc-manip-staged}） \\
+乘法门控 & $r_1(1+r_2)$，前序为零时屏蔽后续信号（\cref{ins:rlmc-manip-kernel}） \\
+接触二元性 & 接触/不接触的离散跳变，致 value 景观尖锐（\cref{sec:rlmc-manip-binary}） \\
+\verb|grasp_site| & 末端抓取参考 site，reaching/DiffIK 的参考点 \\
+joint equality & MuJoCo 关节耦合约束，单 action 控双指同步开合 \\
+freejoint & 7-DOF 自由物体，独立动力学实体（仅靠接触力交互） \\
+DiffIK & 差分逆运动学，$\dot q=J^\dagger v$，DLS 阻尼防奇异（式~\eqref{eq:rlmc-manip-dls}） \\
+DLS & damped least squares，$J^{\mathsf T}(JJ^{\mathsf T}+\lambda^2 I)^{-1}$ \\
+OSC & 操作空间控制，直接控末端力/力矩（Khatib 1987） \\
+\verb|condim|/\allowbreak\verb|impratio| & 接触维度 / 摩擦-法向阻抗比（抗滑） \\
+ADR & 自动域随机化，按成功率自动扩展范围（\cref{paper:rlmc-manip-adr}） \\
+PBT & 种群训练，exploit 权重 + explore 超参（\cref{alg:rlmc-manip-pbt}） \\
+SpatialSoftmax & 输出每特征图的注意力中心 $(x,y)$（\cref{paper:rlmc-manip-ssm}） \\
+privileged 泄漏 & 物体真值进了 actor obs，致视觉被忽略（\cref{ins:rlmc-manip-leak3}） \\
+reward hacking & reward 涨但 task metric 平（\cref{ins:rlmc-manip-hacking}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{知识点总表。}
+\begin{center}
+\small
+\begin{tabular}{@{}cllc@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 操作 vs locomotion 的六维 MDP 差异 & \cref{sec:rlmc-manip-sixdim} & 2 \\
+2 & 接触二元性与几何窗口的狭窄性 & \cref{sec:rlmc-manip-binary} & 3 \\
+3 & 四阶段因果结构 & \cref{sec:rlmc-manip-fourstage} & 2 \\
+4 & YAM MJCF 关键元素（site/equality/freejoint） & \cref{sec:rlmc-manip-mjcf} & 2 \\
+5 & state 版 observation 设计与维度计算 & \cref{sec:rlmc-manip-obs} & 2 \\
+6 & Command--Reward--Termination 三角契约 & \cref{sec:rlmc-manip-cmd} & 3 \\
+7 & staged reward 乘法门控与源码 & \cref{sec:rlmc-manip-staged} & 3 \\
+8 & $\sigma$ 标定方法论 & \cref{sec:rlmc-manip-staged} & 3 \\
+9 & 灵巧手 vs 平行夹爪的工程差异 & \cref{sec:rlmc-manip-dexhard} & 2 \\
+10 & DexPBT 种群训练与 exploit 难点 & \cref{sec:rlmc-manip-pbt} & 4 \\
+11 & ADR 自动扩展与 emergent meta-learning & \cref{sec:rlmc-manip-adr} & 3 \\
+12 & MuJoCo solref/condim/impratio 调优 & \cref{sec:rlmc-manip-mujococontact} & 3 \\
+13 & CoACD vs V-HACD 碰撞几何 & \cref{sec:rlmc-manip-coacd} & 2 \\
+14 & PhysX 迭代/offset 与三步调优 & \cref{sec:rlmc-manip-physxcontact} & 3 \\
+15 & 三层动作抽象与 DLS 伪逆 & \cref{sec:rlmc-manip-action} & 3 \\
+16 & smoke test 与 PPO 超参对照 & \cref{sec:rlmc-manip-smoke} & 1 \\
+17 & 跨框架配置映射 & \cref{sec:rlmc-manip-bridge} & 2 \\
+18 & 八种失败模式与 reward hacking & \cref{sec:rlmc-manip-diag} & 3 \\
+19 & State$\to$Depth$\to$RGB 渐进管线 & \cref{sec:rlmc-manip-progressive} & 2 \\
+20 & privileged 泄漏三层防线 & \cref{sec:rlmc-manip-leak} & 3 \\
+21 & SpatialSoftmax 原理与由来 & \cref{sec:rlmc-manip-cnn} & 3 \\
+22 & 视觉是测量系统的视角 & \cref{sec:rlmc-manip-camcfg} & 2 \\
+23 & UniLab in-hand 操作与异构 CPU-sim 范式 & \cref{sec:rlmc-manip-unilabinhand} & 3 \\
+24 & UniLab HORA 蒸馏与 sim2sim 契约 & \cref{sec:rlmc-manip-unilabinhand}, \cref{sec:rlmc-manip-bridge} & 4 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{后续关系。}本章聚焦固定基座操作，是「强化学习运动控制」部里通向\emph{移动操作}与\emph{人形全身操作}的桥梁。staged reward 的乘法门控将扩展为 navigation$\to$reaching$\to$grasping 的多阶段融合，DiffIK 动作空间将成为分层 loco-manipulation 中低层策略的核心组件，本章建立的 SpatialSoftmax、视觉 DR、privileged 泄漏检测三大视觉技术将在视觉地形感知中被直接复用。一条总结性经验法则：\textbf{操作任务的 80\% 工作量不在「训练策略」上，而在「确保物理资产和 MDP 正确」上}——物理正确的环境用默认 PPO + 最简单 staged reward 就能在 2000 iteration 内收敛，物理有问题的环境怎么调 reward 都不工作。开训前务必完成 zero/random play 的物理健康检查（\cref{sec:rlmc-manip-mjcf}、\cref{sec:rlmc-manip-physxcontact}）。
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-manip-reading}
+
+\begin{itemize}
+  \item \textbf{DexPBT}（Petrenko 等，RSS 2023，arXiv:2305.12127）\,\cite{petrenko2023dexpbt}——PBT 在灵巧手操作中的完整方法论；重点读 PBT 工程实现与 ablation（哪些组件贡献最大）。
+  \item \textbf{robosuite}（Zhu 等，2020，arXiv:2009.12293）\,\cite{zhu2020robosuite}——操作任务的标准 benchmark 与 MDP 设计传统。
+  \item \textbf{Diffusion Policy}（Chi 等，RSS 2023 / IJRR 2024，arXiv:2303.04137）\,\cite{chi2023diffusion}——扩散策略在操作中的应用，与 MLP/GMM 策略的多模态对比。
+  \item \textbf{DeXtreme}（Handa 等，ICRA 2023，arXiv:2210.13702）\,\cite{handa2023dextreme}——灵巧手 sim-to-real 完整工程链，向量化 ADR 的实际应用。
+  \item \textbf{Solving Rubik's Cube}（Akkaya 等，OpenAI 2019，arXiv:1910.07113）\,\cite{akkaya2019rubik}——ADR 的工程起源与 emergent meta-learning。
+  \item \textbf{CoACD}（Wei 等，SIGGRAPH 2022，arXiv:2205.02961）\,\cite{wei2022coacd}——操作物体碰撞几何简化的最佳实践。
+  \item \textbf{Khatib (1987)}「A Unified Approach for Motion and Force Control」\,\cite{khatib1987operational}——OSC 原始论文，理解操作空间控制的理论基础（仅约 10 页）。
+  \item \textbf{Deep Spatial Autoencoders}（Finn 等，ICRA 2016，arXiv:1509.06113）\,\cite{finn2016dsae}——SpatialSoftmax 的由来。
+  \item 框架文档：\textbf{mjlab}（Zakka 等，arXiv:2601.22074）\,\cite{zakka2026mjlab} 的 \Verb[breaklines]|src/mjlab/tasks/manipulation/| 源码；\textbf{Isaac Lab 2.3} DexSuite 与 PBT 文档\,\cite{nvidia2025isaaclab23}。
+\end{itemize}
+
+\textbf{阅读顺序}：先 robosuite（操作任务标准 MDP 设计）$\to$ DexPBT（灵巧手挑战与 PBT 解法）$\to$ 按需选读 Diffusion Policy（扩散策略）或 DeXtreme（sim-to-real）。需要 OSC 的读者 Khatib 1987 必读；mjlab 源码与 Isaac Lab 文档作持续参考——论文里一句「we use staged reward」在源码里对应数十行具体实现，这些细节对复现至关重要。
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-manip-troubleshoot}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.2cm}p{3.0cm}p{4.4cm}l@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+reaching reward 不上升 & \verb|ee_to_cube| 未进 actor obs / $\sigma$ 不当 & 打印 actor obs 维度；查 $\sigma_{\text{reach}}$；确认 \verb|grasp_site| 位置 & \cref{sec:rlmc-manip-mjlab} \\
+bringing reward 始终为零 & 夹爪 action 无效 / 物体太重 / 摩擦太低 & 查 action 第 7 维映射；zero agent 测抬起可行性；调质量/摩擦 & \cref{sec:rlmc-manip-mjlab}, \cref{sec:rlmc-manip-contact} \\
+夹爪持续震荡 & \verb|action_rate| penalty 不足 / scale 过大 & 增 \Verb[breaklines]|action_rate_l2| 权重；减 action scale；可视化 action 时序 & \cref{sec:rlmc-manip-diag} \\
+方块被弹飞 & 质量太小 / 接触刚度过高 / timestep 太大 & 查方块质量；调 \verb|solref|；减 timestep & \cref{sec:rlmc-manip-contact} \\
+视觉版不用图像 & actor obs 含 privileged state & 列出 actor obs 全部 term；移除物体/目标状态；重训 & \cref{sec:rlmc-manip-leak} \\
+DiffIK 在特定姿态抖动 & 接近奇异配置 & 记录抖动时关节角；查 Jacobian 条件数；增 $\lambda_{\text{dls}}$ & \cref{sec:rlmc-manip-action} \\
+PhysX 手指穿透物体 & solver iteration 不足 & 增 \Verb[breaklines]|solver_position_iteration_count| 到 16--32；减 timestep & \cref{sec:rlmc-manip-dex} \\
+smoke train 报 obs shape 错 & camera group 配置不匹配 & 对比 env cfg 与 rl\_cfg 的 \verb|obs_groups|；确认 \verb|camera_name| & \cref{sec:rlmc-manip-smoke} \\
+多 env 下 object pose 算错 & 未减 env origin & 单 env 测正确性；查 \verb|cube_pos| 是否减 env\_origins & \cref{sec:rlmc-manip-diag} \\
+策略学会推而非抓 & reward 不区分推/抓 & play 可视化确认行为；加 grasping reward；目标 z 高于桌面 & \cref{sec:rlmc-manip-diag} \\
+value loss 爆炸 & 初期 return 全零 & 加小 alive reward；减 value lr；critic warm-up & \cref{sec:rlmc-manip-diag} \\
+depth 版收敛极慢 & 图像归一化错 / CNN lr 不当 & 可视化一帧 depth 确认值域；查归一化；降 CNN lr & \cref{sec:rlmc-manip-vision} \\
+训练出现 NaN & 物体嵌入桌面 / action scale 过大 & 查 reset 时物体 z 下限；减 action scale；加 grad clip & \cref{sec:rlmc-manip-diag} \\
+PBT exploit 后性能骤降 & optimizer 状态未重置 & exploit 后重置 optimizer；warm-up lr；减 explore 扰动 & \cref{sec:rlmc-manip-pbt} \\
+跨框架训练结果不一致 & 物理引擎行为差异 & 对比两框架 zero agent 物理；查关节顺序；重调参非照搬 & \cref{sec:rlmc-manip-bridge} \\
+碰撞几何不匹配视觉几何 & MJCF 碰撞体与视觉体分离 & viser 切碰撞几何可视化；确认包围一致；用 CoACD 生成 & \cref{sec:rlmc-manip-mjcf}, \cref{sec:rlmc-manip-coacd} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-manip-versions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+组件 & 本章基准（截至 2026-06） & 备注 \\
+\midrule
+mjlab & RSL-RL(PPO) 后端，YAM lift cube & 论文文档化单一 Cube Lifting；RGB/Depth/multi 变体见源码 \\
+mjlab 视觉 & depth 已支持，RGB 为预览 & 论文明言高保真 RGB out of scope；tiled renderer 待 Warp 出 beta \\
+Isaac Lab & $\ge 2.3$（DexSuite + ADR + PBT） & 低于 2.3 无 Kuka+Allegro Lift/Reorient \\
+DexPBT & arXiv:2305.12127（RSS 2023） & PBT 例任务 \Verb[breaklines]|Isaac-Dexsuite-Kuka-Allegro-Lift-v0| \\
+PhysX 求解器 & TGS 迭代；灵巧手需 16--32 iter & 默认 4 对 locomotion 够用、对操作不够 \\
+MuJoCo 接触 & 软约束（穿透 $\propto$ 力）；\verb|solref|/\allowbreak\verb|impratio| & 与 PhysX 硬约束哲学不同 \\
+动作空间 & JointPos（默认）/ DiffIK / OSC & OSC 当前在 Isaac Lab 更成熟 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{finenote}
+本章的可复制命令与 API（mjlab \Verb[breaklines]|Mjlab-Lift-Cube-Yam| 四变体、staged reward、\Verb[breaklines]|LiftingCommandCfg|、\Verb[breaklines]|DifferentialIKActionCfg| 字段、\Verb[breaklines]|CameraSensorCfg| 字段、视觉 CNN 配置；Isaac Lab \Verb[breaklines]|Isaac-Dexsuite-Kuka-Allegro-Lift-v0|、OSC/DiffIK cfg、PBT 变异超参等）均已据截至 2026-06 的官方文档与 mjlab 1.4.0 源码 introspection 逐项核对。唯一仍属推断的项是 DexPBT exploit 时的 optimizer 状态处理（其论文只描述复制网络权重、未涉及 optimizer 状态），已在正文据论文核查后注明。框架迭代较快，落地时请以你所装版本的官方文档与 \verb|list-envs|／源码为最终依据。
+\end{finenote}

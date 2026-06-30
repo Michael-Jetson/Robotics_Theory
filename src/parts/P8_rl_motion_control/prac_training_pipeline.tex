@@ -1,0 +1,1813 @@
+\chapter{训练管线与超参调优}\label{ch:rlmc-training}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章。
+%  主线：算法/原理领路 —— 先讲「PPO 如何消费环境数据、为何 on-policy 需要大规模
+%  并行、timeout bootstrap 在数学上意味着什么」，再落到三大框架
+%  (mjlab / Isaac Lab / UniLab) 的对比工程实践。理论引导，工程是其兑现。
+%  源稿 RL运控/Ch07_训练管线与超参调优.md (实践偏重) 已按本主线重构，
+%  并对 RSL-RL 5.x / Isaac Lab / mjlab 的关键 API、版本、论文归属做了联网核对
+%  (见各 \rebuilt / \pz 标注与本章末「待核实」清单)。
+%  UniLab 槽位：源稿仅含 mjlab + Isaac Lab；UniLab 侧已据服务器实跑（go2_joystick_flat
+%  PPO 双后端各 3 iter PASS）实装，正文各节均以"异构 CPU 仿真 + GPU 策略"框定补齐对比。
+% ════════════════════════════════════════════════════════════════
+
+前两章把强化学习运动控制的接口契约写完了：\cref{ch:rlmc-obsact} 用 POMDP 视角定义了\emph{观测}与\emph{动作}（智能体能看见什么、能改变什么），随后的奖励/终止/课程章定义了\emph{价值函数的形状}（智能体该追求什么）。这两件事都属于\textbf{环境侧}的定义——但环境不会自己训练出策略，真正驱动学习的是 RL 训练器。本章的主线不是推导 PPO 公式（强化学习理论部已经给出了演员-评论家与策略梯度的完整数学，见 \cref{ch:rl-ac}），而是讲清\textbf{环境与 RL 训练器之间的接口边界}：观测如何路由到 actor 与 critic、timeout 信息如何影响价值自举（value bootstrap）、超参数如何决定训练稳定性、checkpoint 如何保存与恢复、ONNX 导出的边界在哪里。
+
+这些接口细节看似琐碎，却有一个共同的危险特征：它们中的任何一个出错，往往\textbf{不会报错}，而是产生"能跑通但结果错"的隐蔽 bug——训练曲线一路上扬，部署到真机却完全失效。本章因此遵循全书「先动机、先原理，后工程」的次序：每一节先立算法/概念主线（这个机制要解决什么问题、删掉它会怎样），再在 mjlab、Isaac Lab、UniLab 三个框架上排布对比实践。\textbf{原理领路，工程兑现}。
+
+\begin{note}
+本章假定读者已经掌握 PPO 的数学：clipped surrogate objective、广义优势估计（GAE）、策略梯度与优势函数。这些内容由强化学习理论部负责（\cref{ch:rl-ac} 讲了演员-评论家如何从策略梯度推广而来）。若不熟悉，建议先回看理论部，或并读 PPO 原论文 \cite{schulman2017ppo} 与 GAE 原论文 \cite{schulman2015gae}。本章只讲\textbf{公式里的每个参数如何在代码中配置}、以及\textbf{代码里的实现细节如何反过来影响训练效果}。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-train-setup}
+
+训练管线把环境配置章（\cref{ch:rlmc-obsact} 所在部）搭好的仿真器、加上一个 RL 训练库。三大框架的版本组合如下表。最关键的一行是 RSL-RL：mjlab 与 Isaac Lab \textbf{共用同一个} RSL-RL 训练后端，因此本章绝大多数 PPO 概念在两个框架间是\emph{逐字节对齐}的；它们的差异只在 wrapper 命名与少数配置入口。
+
+\begin{table}[H]
+\centering
+\caption{三大框架的训练栈版本兼容矩阵（联网核对，截至 2026-06；具体版本号以你所装版本为准）}
+\label{tab:rlmc-train-versions}
+\begin{tabularx}{\linewidth}{lLLL}
+\hline
+组件 & mjlab & Isaac Lab & UniLab \\
+\hline
+物理后端 & MuJoCo Warp (GPU) & PhysX (GPU) & MuJoCoUni / MotrixSim (\textbf{CPU} 多线程) \\
+RL 训练库 & RSL-RL 5.x & RSL-RL 5.x / 旧版 & 自带 PPO/APPO/SAC/TD3（PPO 复用 RSL-RL） \\
+Python & $\ge 3.10$（实测 $3.12$） & $3.11$（随 Isaac Sim 5.1，实测 $3.11.13$） & $3.13$（实测） \\
+深度学习框架 & PyTorch $\ge 2.x$ & PyTorch（随 Isaac Sim） & PyTorch $2.7$（CUDA/MPS/ROCm/XPU） \\
+包管理 & \verb|uv| & \verb|pip| / Isaac Sim 内置 & \verb|uv| \\
+日志后端 & TensorBoard / W\&B & TensorBoard / W\&B & TensorBoard（PPO 走 RSL-RL）+ 自带 trace \\
+导出格式 & ONNX & ONNX & ONNX（+ TorchScript；时机随算法，见 \cref{sec:rlmc-train-onnx}） \\
+\hline
+\end{tabularx}
+\end{table}
+
+\begin{pitfall}[RSL-RL 4.x 与 5.x 不是 drop-in 兼容]
+RSL-RL 在 4.0.0 与 5.0.0 各做了一次破坏性 API 变更：4.0.0 把统一的 \verb|policy| 配置拆成独立的 \verb|actor| 与 \verb|critic| 配置，并要求 runner 配置中出现 \verb|obs_groups| 键；5.0.0 进一步把模型分布抽成独立配置（核心库里是带 \verb|class_name| 的 \Verb[breaklines]|distribution_cfg| dict，字段 \verb|init_std| 取代旧 \Verb[breaklines]|init_noise_std|；Isaac Lab 再封装成嵌套类 \Verb[breaklines]|RslRlMLPModelCfg.GaussianDistributionCfg|）。\textbf{现象后果}：用 5.x 的库去加载 3.x/4.x 训练的旧 checkpoint 会因键名不匹配（如 \Verb[breaklines]|actor.0.weight| 与 \verb|mlp.0.weight|）而报 \verb|KeyError|；或 \Verb[breaklines]|OnPolicyRunner| 初始化时因缺 \verb|obs_groups| 而挂起。\textbf{根本原因}：模型结构命名随版本演进。\textbf{正确做法}：在教材/项目里\textbf{固定 RSL-RL 版本}（如 \Verb[breaklines]|rsl-rl-lib>=5.2.0,<6.0.0| 起步，本章实测环境为 \verb|5.4.0|；同一 \verb|5.x| 小版本间 API 行为一致，但\emph{源码文件归属可能迁移}，见 \cref{sec:rlmc-train-dataflow} GAE 走读处的导航提示），并优先用框架提供的 runner 子类（如 mjlab 的扩展 runner）而非直接继承基类——它通常内置了旧 checkpoint 的键名迁移逻辑。以上版本节点经 RSL-RL 官方 release 记录核对 \cite{schwarke2025rslrl}。
+\end{pitfall}
+
+\paragraph{分操作系统步骤（最小要点）。}三个框架在依赖隔离上的取向不同：mjlab 用 \verb|uv| 管理虚拟环境、对 Linux/macOS 较友好；Isaac Lab 绑定 Isaac Sim，强依赖 NVIDIA 驱动与特定 CUDA，推荐 Ubuntu 22.04；UniLab 也用 \verb|uv|，但走\textbf{异构}路线——物理仿真在 CPU、策略学习在 GPU，因此\emph{不绑定} Isaac Sim、也\emph{不依赖} GPU 物理后端（任何能跑 MuJoCo/Motrix 的机器都行），安装即 \Verb[breaklines]|uv sync --extra mujoco|（或 \Verb[breaklines]|--extra motrix|），GPU 仅需 CUDA/MPS/ROCm/XPU 之一供学习器使用。本章的 PPO 概念与诊断方法\emph{不依赖}具体 OS，故以下正文不再分 OS 重复。
+
+\begin{pitfall}[真要"从零"在无显示器服务器上落地：四个首次必踩的环境坑]
+后文的 Quick Start 假定环境\emph{已}装好；若你是在一台\textbf{裸的远程 GPU 服务器}（无显示器、SSH 进去）上从零起步，下面四条几乎一定会先把你卡住，逐一说清\emph{现象$\to$为什么$\to$怎么自己查}：
+
+\textbf{(1) 无显示器渲染（headless）：MuJoCo 默认要 GL 上下文。}现象：\verb|train|/\allowbreak\verb|play| 起手即报 \verb|GLFWError|/\allowbreak\Verb[breaklines]|Failed to create GL context|/\allowbreak\Verb[breaklines]|cannot open display|。为什么：MuJoCo 默认走需要窗口系统的 GLFW，而 SSH 服务器没有 X。做法：导出 \Verb[breaklines]|export MUJOCO_GL=egl|（用无窗口的 EGL 离屏渲染；纯软件回退用 \verb|osmesa|）；纯训练（不回放）可完全不渲染。自查：\Verb[breaklines]|echo $MUJOCO_GL| 是否为 \verb|egl|；EGL 是否可用看 \Verb[breaklines]|ls /usr/lib/x86_64-linux-gnu/libEGL*|。
+
+\textbf{(2) \texttt{uv run} 每次想联网同步依赖。}现象：每条 \Verb[breaklines]|uv run ...| 卡在解析/下载，或离线机直接失败。为什么：\Verb[breaklines]|uv run| 默认会先\emph{同步} lockfile。做法：环境已装好时加 \verb|--no-sync| 跳过（\Verb[breaklines]|uv run --no-sync train ...|），或先一次性 \Verb[breaklines]|uv sync| 装全、之后都 \verb|--no-sync|。自查：\Verb[breaklines]|uv run --no-sync python -c "import mjlab"| 能否秒进。
+
+\textbf{(3) WandB 默认开，无 key 会卡住。}现象：训练起手停在 \Verb[breaklines]|wandb: Logging into wandb.ai|（mjlab \Verb[breaklines]|--agent.logger| 默认就是 \verb|wandb|）。为什么：默认日志后端是 WandB，没登录会等交互输入 API key。做法：冒烟/离线一律 \Verb[breaklines]|export WANDB_MODE=disabled|（或 \verb|offline|），mjlab 也可显式 \Verb[breaklines]|--agent.logger tensorboard|；UniLab 同理离线设此环境变量。自查：起训第一屏不应再出现 \Verb[breaklines]|wandb: (1) Create| 的登录提问。
+
+\textbf{(4) GPU 可用性先验证再训。}先 \Verb[breaklines]|python -c "import torch; print(torch.cuda.is_available())"| 必须 \verb|True|；驱动 CUDA 比 \Verb[breaklines]|torch.version.cuda| 新可向后兼容（无需精确等号）。把这条放最前，能把"训练起不来"快速二分成"环境/驱动问题"还是"任务/配置问题"。
+
+记法：\textbf{这四条按"渲染$\to$包$\to$日志$\to$算力"排，正好是从零起训最常见的失败顺序}；把它们写进你自己的 \verb|activate| 脚本一次设好，后面所有命令就不再被环境噪声干扰。
+\end{pitfall}
+
+\begin{insight}[UniLab 与"GPU-sim 主导"正交：物理留 CPU，跨边界搬到 GPU 学习]\label{ins:rlmc-unilab-heterogeneous-train}
+mjlab/Isaac Lab 把\emph{物理和策略都钉在 GPU}，靠 CUDA-graph capture 消除 per-step kernel launch 开销；UniLab 反其道——\textbf{CPU 多线程跑物理}（MuJoCoUni/MotrixSim）、\textbf{GPU 跑策略}，二者经\textbf{共享内存 IPC} 解耦（collector 子进程产 transition、learner 父进程消费并更新）。这把本章"PPO 数据流"里隐含的"数据本就在 GPU"假设打破了：在 UniLab 里，"采集$\to$优化"之间多了一道\emph{显式、可计量、可预取}的 CPU$\to$GPU 数据搬运（pinned-host $+$ 双缓冲）。读本章时，凡 mjlab/Isaac 是"同进程同设备"的地方，UniLab 往往要回答"这个量在哪个进程、哪个设备、何时跨边界"。这是理解 UniLab 三框架对照的总纲（论文 arXiv:2605.30313）。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：五分钟跑通一次训练}
+\addcontentsline{toc}{section}{Quick Start：五分钟跑通一次训练}
+\label{sec:rlmc-train-quickstart}
+
+下面给出 mjlab、Isaac Lab 与 UniLab 各自"从零到看见 reward 上涨"的最小命令序列（UniLab 走异构 CPU 物理 $+$ GPU 策略，命令在最后一段）。先跑\textbf{平地（flat）}小迭代验证管线通畅，再上崎岖地形（rough）。
+
+\begin{codebox}[bash]{mjlab:最小可跑（先 flat 验证管线）}
+# 1) 列出可用任务（确认任务 id 拼写）
+uv run list-envs
+
+# 2) flat 任务、4096 并行、300 iter、TensorBoard 日志、固定 seed
+uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+  --env.scene.num-envs 4096 \
+  --agent.max-iterations 300 \
+  --agent.logger tensorboard \
+  --agent.seed 42
+
+# 3) 看曲线
+tensorboard --logdir /tmp/mjlab/logs/
+
+# 4) 回放验证行为
+uv run play Mjlab-Velocity-Flat-Unitree-G1 \
+  --agent.load-run <run_name> --num-envs 4
+\end{codebox}
+
+\begin{codebox}[bash]{Isaac Lab:等价最小可跑}
+# flat 任务、4096 并行、300 iter
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0 \
+  --num_envs 4096 --max_iterations 300 --seed 42
+
+# TensorBoard
+tensorboard --logdir logs/rsl_rl/
+
+# 回放
+python scripts/reinforcement_learning/rsl_rl/play.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0
+\end{codebox}
+
+\begin{note}
+实测 mjlab 1.4.0 的 \verb|list-envs| 共列出 \textbf{12 个任务}（含 Cartpole、Lift-Cube、Tracking 等），其中 4 个是 Unitree 速度任务：\Verb[breaklines]|Mjlab-Velocity-{Flat,Rough}-Unitree-{G1,Go1}|（即 \textbf{G1 人形与 Go1 四足都有}；\textbf{无 Go2}——若沿用其他框架的 Go2 命名会找不到任务）。本章正文以 Go1 为例讲数值，与上面命令一致。\verb|list-envs| 是已安装的 console script，可直接 \verb|list-envs| 调用（\Verb[breaklines]|uv run| 仅在未把入口装进当前环境时才需要）。
+\end{note}
+
+\begin{codebox}[bash]{UniLab:等价最小可跑（CPU 物理 + GPU 策略）}
+# 1) flat 任务、PPO、mujoco 后端;env 数/迭代数走 Hydra 覆盖(不是 flag)
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=300
+
+# 1') 几秒冒烟:小 env + 极短迭代 + 不回放(no_play 跳过 ONNX 导出)
+uv run train --algo ppo --task go2_joystick_flat --sim motrix \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+
+# 2) 看曲线(PPO 走 RSL-RL,字段与 mjlab/Isaac 一致)
+tensorboard --logdir <log_root>/
+
+# 3) 回放并导出 ONNX(eval/play 阶段才导,见 ONNX 节)
+uv run eval --algo ppo --task go2_joystick_flat --sim mujoco \
+    --load-run -1 --render-mode record
+\end{codebox}
+
+\begin{note}
+UniLab 的两条命令\textbf{关键差异}（与 mjlab/Isaac 对照记牢）：(1) 算法、任务、后端用 \verb|--algo|/\allowbreak\verb|--task|/\allowbreak\verb|--sim| \emph{flag}（这四个键含 \Verb[breaklines]|training.sim_backend| 是 RESERVED，\textbf{不能}走 Hydra 透传，否则 \verb|SystemExit|）；(2) 而 \verb|num_envs|、\Verb[breaklines]|max_iterations| 等\emph{走 Hydra 覆盖}（\Verb[breaklines]|algo.num_envs=...|），与 mjlab 的 \Verb[breaklines]|--env.scene.num-envs| flag 风格相反。\verb|--task| 用小写 slug（\Verb[breaklines]|go2_joystick_flat|），对应注册名是 CamelCase 的 \Verb[breaklines]|Go2JoystickFlat|。
+\end{note}
+
+\begin{note}[steps/s 怎么算正常：先有估算心法，再看实测锚点（别拿冒烟数当稳态数）]
+新手跑完一条小命令最容易问"我这 steps/s 是不是太低、是不是装坏了"。先记一条\textbf{估算心法}：稳态 \verb|steps/s| $\approx$ \verb|num_envs| $\times$ 控制频率 $\times$ 并行效率。它\emph{强依赖并行规模}——大并行 $+$ JIT 热身后才达峰值，\textbf{小 env 冷启（JIT/图未热、并行不足）见到几十到几百 sps 是正常的良性现象，不是故障}。本章正文反复用的 $4096$ 并行 $+$ \Verb[breaklines]|RTX 4090| 上 UniLab 约 $8900$ env-steps/s，是\emph{大并行热稳态}数字；下表是另一台机的小批冒烟实测锚点，用来校准"小 env 本就慢"这个直觉：
+\begin{table}[H]
+\centering
+\caption{冒烟实测吞吐锚点（RTX 4080 SUPER；\textbf{小 env 冷启，非稳态}，仅用于判断"低 sps 是否正常"）}
+\label{tab:rlmc-train-sps-anchor}
+\begin{tabular}{llll}
+\hline
+框架 / 后端 & \verb|num_envs| & 实测 steps/s & 说明 \\
+\hline
+mjlab（MuJoCo Warp） & $64$ & $\sim1067$ & GPU 物理，JIT 热身后 \\
+UniLab / \verb|mujoco| & $16$ & $\sim381$ & CPU 物理，冷启 \\
+UniLab / \verb|motrix| & $16$ & $\sim361$ & CPU 物理，冷启 \\
+\hline
+\end{tabular}
+\end{table}
+判读规则：把 \verb|num_envs| 从 $16$ 加到 $4096$，steps/s 应\emph{近似随并行线性上升}并在热身后趋稳；若加大并行 steps/s 不升反降、或始终卡在个位数，才该怀疑真故障（CPU 核不足、\verb|/dev/shm| 抖动、误开了 viewer/sensor）。\textbf{结论}：拿小冒烟的几十~几百 sps 去对正文那条 $8900$，是"冷启 vs 稳态、小并行 vs 大并行"的错配，不是性能回归。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{前置自测}
+\addcontentsline{toc}{section}{前置自测}
+\label{sec:rlmc-train-pretest}
+
+\begin{practice}[前置自测：答错 $\ge 2$ 题，先回对应章节复习]
+\begin{enumerate}
+  \item actor 与 critic 可以看到\emph{不同}的观测吗？为何要这样设计？（答错回看 \cref{ch:rlmc-obsact} 的 actor/critic 非对称设计）
+  \item PPO 的 batch size 由哪些量决定？\verb|num_envs|、\Verb[breaklines]|num_steps_per_env|、\Verb[breaklines]|num_mini_batches| 三者是什么关系？（答错回看本章 \cref{sec:rlmc-train-dataflow}）
+  \item ONNX 导出是否包含 action 的缩放与偏置？部署端需要额外做什么？（答错回看 \cref{ch:rlmc-obsact} 的部署边界）
+  \item 策略高斯分布的 \verb|init_std| 与奖励核（reward kernel）里的 \verb|std| 是同一个东西吗？（答错回看 \cref{ch:rlmc-obsact} 与奖励章）
+  \item 为什么 on-policy 算法收完一批数据、做完更新后，旧数据就"过期"了？（答错回看 \cref{ch:rl-ac} 的 on-policy/off-policy 区分）
+  \item 标记为 \verb|time_out=True| 的回合结束，对 PPO 的 value bootstrap 有什么影响？（答错回看奖励/终止章的 truncation 与本章 \cref{sec:rlmc-train-wrapper}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章目标}
+\addcontentsline{toc}{section}{本章目标}
+\label{sec:rlmc-train-goals}
+
+学完本章，你应当能够：
+
+\begin{enumerate}
+  \item \textbf{实现}并解释 RL 环境-训练器 wrapper 的四个核心职责（观测路由、动作裁剪、done 合并、timeout 自举），并能在 mjlab/Isaac Lab 中定位其代码。
+  \item \textbf{计算}给定 \verb|num_envs| / \Verb[breaklines]|num_steps_per_env| / \Verb[breaklines]|num_mini_batches| / \Verb[breaklines]|num_learning_epochs| 下的 batch size、mini-batch size 与每迭代更新次数。
+  \item \textbf{配置}一个 velocity 任务的完整训练流程——从 CLI 启动、到 TensorBoard/W\&B 日志、到 checkpoint 恢复。
+  \item \textbf{定位}问题：用"超参数$\leftrightarrow$行为"映射表，从训练日志症状反推该调哪个参数。
+  \item \textbf{配置}并区分 MLP / RNN / CNN 三类网络，说明每类对观测接口与部署的不同影响。
+  \item \textbf{导出} ONNX 并\textbf{调通}一致性验证，分清哪些逻辑在 ONNX 内、哪些必须由部署端复现。
+  \item \textbf{判断} PPO 与 SAC 的适用边界，把算法选择与并行规模、数据复用需求对应起来。
+\end{enumerate}
+
+注意目标全部用"能实现/配置/调通/定位/判断"这类\emph{可测}动词描述，而非"理解/掌握/熟悉"。本章难度为中上（核心在接口边界而非公式）。
+
+% ════════════════════════════════════════════════════════════════
+\section*{知识导航}
+\addcontentsline{toc}{section}{知识导航}
+\label{sec:rlmc-train-nav}
+
+\begin{forest} navtreeLR
+[{训练管线与超参调优}
+  [{PPO 数据流}
+    [{on-policy 本质}]
+    [{一次 iteration 三段}]
+    [{GAE 与 timeout 自举}] ]
+  [{接口边界}
+    [{wrapper 四职责}]
+    [{OnPolicyRunner 循环}]
+    [{框架差异}] ]
+  [{调参}
+    [{超参数全解析}]
+    [{自适应 KL 学习率}]
+    [{日志症状$\to$参数}] ]
+  [{网络与归一化}
+    [{MLP / RNN / CNN}]
+    [{obs normalization}] ]
+  [{流程与部署}
+    [{CLI$\to$checkpoint}]
+    [{训练诊断}]
+    [{PPO vs SAC}]
+    [{ONNX 导出边界}] ]
+]
+\end{forest}
+
+\paragraph{前置桥接（两三行重述）。}\cref{ch:rlmc-obsact} 已确定 actor/critic 各看哪些观测（\verb|obs_groups| 的来源）与 raw$\to$processed 的动作变换链；奖励/终止章已确定每个奖励项的尺度、以及 \verb|time_out| 与真实终止的区别。本章把这两套定义\emph{接到}训练器上：观测进网络、终止信号进 GAE、奖励尺度影响价值损失与学习率的合理范围。
+
+\paragraph{阅读时间。}精读约 150--180 分钟（含动手）；速读主线约 50 分钟（读每节开头的"这一节解决什么问题"与本质洞察）；查阅式使用建议直接跳 \cref{sec:rlmc-train-hyperparam} 的超参数映射表与章末故障排查手册。
+
+% ════════════════════════════════════════════════════════════════
+\section{PPO 的数据流与核心直觉}
+\label{sec:rlmc-train-dataflow}
+
+\emph{这一节解决什么问题}：PPO 怎样消费环境产生的数据？一次训练 iteration 包含哪些步骤？这些步骤如何映射到具体的配置项？
+
+\subsection{模块功能与在管线中的位置}
+
+在整条管线里，PPO 训练器位于"环境"与"策略产物（checkpoint/ONNX）"之间。它的唯一职责是：反复地\emph{采集}一批经验、用这批经验\emph{优化}策略与价值网络、再\emph{记录与存盘}。理解这三段循环，是理解后面所有配置项的前提——因为几乎每个超参数都对应这三段中的某一处。
+
+\subsection{on-policy 的本质约束}
+
+PPO 是 on-policy 算法。它先用当前策略 $\pi_{\text{old}}$ 收集一批 rollout 数据，再用这批数据做若干轮优化；优化完后旧数据就\emph{过期}——因为更新后的 $\pi_{\text{new}}\neq\pi_{\text{old}}$，旧数据是在 $\pi_{\text{old}}$ 的行为分布下采集的，不再代表 $\pi_{\text{new}}$。这与 off-policy 算法（如 SAC）形成鲜明对比：SAC 可以通过 replay buffer 复用历史数据，PPO 每次 update 后必须\textbf{丢弃旧数据、重新收集}。理论部对 on-policy/off-policy 的区分（\cref{ch:rl-ac}）在这里转化为一个非常具体的工程后果。
+
+\textbf{先看反面}：这个"用几次就扔"的约束看起来像浪费。但它换来一个重要好处——训练全程不需要维护庞大的 replay buffer，且每次更新的方向始终基于当前策略的\emph{真实}行为分布。对四足 locomotion 这种接触丰富、状态连续、需要大规模并行的任务，"on-policy + 大规模并行"是极其有效的范式：用数千个并行环境的\emph{短} rollout 来弥补"单批数据被丢弃"的浪费。
+
+\begin{insight}[on-policy 像 JIT 生产，off-policy 像仓储式批量生产]\label{ins:rlmc-onpolicy-jit}
+这恰如制造业里"批量生产 vs 按需定制"的权衡：off-policy 像仓储式批量生产（历史数据可复用，但要管理库存）；on-policy 像 JIT（Just-In-Time）——每次按需采集、不留库存，但要求产线足够快。\textbf{大规模并行环境就是 PPO 的"高速产线"}。一旦产线不够快（并行度低），JIT 的劣势立刻暴露——这正是后面 PPO vs SAC 选型（\cref{sec:rlmc-train-ppo-sac}）的核心判据。
+\end{insight}
+
+\subsection{一次训练 iteration 的三段数据流}
+
+一个 training iteration 可拆成三段。下面以一组 locomotion 常用数值（4096 并行环境、每环境 24 步 rollout）贯穿讲解。
+
+\textbf{第一段：Rollout Collection（采集）。}runner 对每个 env 收集 \Verb[breaklines]|num_steps_per_env| 步。若 \verb|num_envs=4096|、\Verb[breaklines]|num_steps_per_env=24|，一次采集得到 $4096\times24=98304$ 个 transition。每步内，runner 调用 wrapper 的 \verb|step(actions)|，拿到 obs、reward、done、extras，写入 rollout storage。
+
+\textbf{第二段：PPO Learning（优化）。}计算回报（折扣累积 reward）、优势（GAE 估计）、策略损失（clipped surrogate）、价值损失（critic 预测误差）与熵奖励。设 \Verb[breaklines]|num_mini_batches=4|，每个 mini-batch 约 $24576$ 个 transition；设 \Verb[breaklines]|num_learning_epochs=5|，则这批数据被重复优化 5 轮。
+
+\textbf{第三段：Logging \& Checkpoint（记录与存盘）。}写训练指标到 TensorBoard/W\&B，并按 \verb|save_interval| 保存 checkpoint。
+
+\begin{codebox}{一次 iteration 的数据流（文字示意）}
+[ Collection ]      ->   [ Learning ]        ->   [ Log/Checkpoint ]
+ 4096 env x 24 步         PPO update                TensorBoard
+ = 98304 transitions     5 epochs x 4 minibatch    W&B / .pt
+                         = 20 次参数更新
+\end{codebox}
+
+三个核心公式把上面的数值串起来：
+\begin{align}
+\text{batch\_size} &= \text{num\_envs}\times\text{num\_steps\_per\_env}, \label{eq:rlmc-batch}\\
+\text{mini\_batch\_size} &= \frac{\text{batch\_size}}{\text{num\_mini\_batches}}, \label{eq:rlmc-minibatch}\\
+\text{updates\_per\_iter} &= \text{num\_learning\_epochs}\times\text{num\_mini\_batches}. \label{eq:rlmc-updates}
+\end{align}
+代入上面的数：$\text{batch\_size}=98304$；$\text{mini\_batch\_size}=98304/4=24576$；$\text{updates\_per\_iter}=5\times4=20$。这三个数会在后面的显存分析、调参、诊断里反复出现，务必先在脑中跑通这条算术。
+
+\begin{insight}[clip 不是"保守更新"，而是"允许数据复用"的工程手段]\label{ins:rlmc-clip-reuse}
+PPO 的 clip 常被误解为"让更新更保守"。更准确的说法是：clip 是在\textbf{允许同一批数据做多轮 epoch 更新}（\Verb[breaklines]|num_learning_epochs|>1）的同时、维持 on-policy 近似有效的手段。若 \Verb[breaklines]|num_learning_epochs=1| 且 \Verb[breaklines]|num_mini_batches=1|，clip 几乎不起作用——因为只更新一次，新旧策略还没拉开。clip 的全部价值，在于让你用一批数据多榨几轮而不崩。这一洞察直接解释了 \cref{sec:rlmc-train-hyperparam} 里"为何 epochs 调太大反而危险"。
+\end{insight}
+
+\subsection{clipped objective 与 GAE 的工程含义}
+
+PPO 的核心损失（理论部已推导，这里只点工程含义）：
+\begin{equation}
+L^{\text{CLIP}}=\mathbb{E}\!\left[\min\!\Big(r_t(\theta)\hat A_t,\ \operatorname{clip}\big(r_t(\theta),1-\epsilon,1+\epsilon\big)\hat A_t\Big)\right],
+\label{eq:rlmc-ppo-clip}
+\end{equation}
+其中 $r_t(\theta)=\pi_\theta(a_t|s_t)/\pi_{\text{old}}(a_t|s_t)$ 是新旧策略概率比，$\hat A_t$ 是 GAE 优势，$\epsilon$ 即配置项 \verb|clip_param|（典型值 $0.2$）。用一个工程类比：clip 像汽车的电子限速器——它不阻止你踩油门，而是在接近安全边界时限制加速。$r_t=1$ 表示新旧策略对该动作概率相同，$r_t=1.5$ 表示新策略概率高出 $50\%$；当 $\epsilon=0.2$，clip 把 $r_t$ 约束进 $[0.8,1.2]$，防止单次更新把策略推离采样分布太远。
+
+GAE（广义优势估计）则用两个参数把"看多远/信谁多一点"量化：
+\begin{equation}
+\hat A_t^{\mathrm{GAE}(\gamma,\lambda)}=\sum_{l=0}^{T-t}(\gamma\lambda)^l\,\delta_{t+l},\qquad \delta_t=r_t+\gamma V(s_{t+1})-V(s_t).
+\label{eq:rlmc-gae}
+\end{equation}
+$\gamma$（折扣因子）控制"看多远"：$\gamma=0.99$ 时 $100$ 步后的 reward 衰减为 $0.99^{100}\approx0.37$，即策略关心约 $100$ 步以内的未来；若 policy dt $=0.02\,$s，$100$ 步约 $2\,$s——对四足 locomotion 是合理的规划视野。$\lambda$（GAE lambda）控制偏差-方差权衡：$\lambda=1$ 时退化为蒙特卡罗回报（无偏但高方差），$\lambda=0$ 时退化为单步 TD（低方差但有偏）；$\lambda=0.95$ 是经典折中。
+
+\begin{derivation}[反事实推理：动一动 $\gamma$ 与 $\lambda$ 会怎样]
+若 $\gamma=0.9$（而非 $0.99$）：有效视野仅约 $10$ 步（$0.9^{10}\approx0.35$），策略只关心约 $0.2\,$s 内的 reward，易学出贪婪短视的行为。若 $\gamma=0.999$：视野扩到约 $1000$ 步（$20\,$s），对 $20\,$s 的回合几乎是全局最优，但价值函数更难学（要准确估计千步后的累积 reward），训练初期 critic 误差会被放大。$\lambda$ 同理：训练初期 critic 不准，更大的 $\lambda$（更靠 MC）能减少对坏 critic 的依赖，但方差更高。这解释了为什么 $\gamma{=}0.99,\lambda{=}0.95$ 几乎是 locomotion 的默认起点。
+\end{derivation}
+
+\subsection{GAE 的代码走读与 timeout bootstrap（关键）}
+
+下面是 RSL-RL 计算 GAE 的核心逻辑（简化以突出主干），它把 \cref{eq:rlmc-gae} 从后向前递推实现，并处理了一个极易出错的细节——\textbf{timeout 自举}。
+
+\begin{codebox}[Python]{GAE 计算与 timeout 自举（RSL-RL 同义简化;真实文件归属随版本，见下方导航）}
+def compute_returns(self, last_values, gamma, lam):
+    """从后向前计算 GAE advantage."""
+    advantage = 0
+    for step in reversed(range(self.num_steps)):
+        if step == self.num_steps - 1:
+            next_values = last_values
+        else:
+            next_values = self.values[step + 1]
+
+        # 是否是"真正的"终止？真实终止 -> 不自举（value 清零）
+        next_is_not_terminal = 1.0 - self.dones[step]
+
+        # 关键行:timeout(截断)不是失败，需要自举
+        if "time_outs" in self.extras:                       # 来自奖励/终止章
+            next_is_not_terminal += self.extras["time_outs"][step]
+            # 效果:timeout 的回合，next_values 不被清零
+
+        delta = (self.rewards[step]
+                 + gamma * next_values * next_is_not_terminal
+                 - self.values[step])
+        advantage = delta + gamma * lam * next_is_not_terminal * advantage
+        self.returns[step] = advantage + self.values[step]
+
+    self.advantages = self.returns - self.values
+\end{codebox}
+
+逐行看那一行 \Verb[breaklines]|next_is_not_terminal += self.extras["time_outs"][step]|（关键行）：它确保了"时间到的正常截断"（truncation，奖励/终止章里 \verb|time_out=True|）\textbf{不会}清零 value。\textbf{先讲动机}：locomotion 的 velocity 任务通常是无限时域的，$20\,$s 到点只是回合\emph{被截断}，不是机器人\emph{失败}。
+
+\begin{derivation}[反事实推理：删掉这一行会发生什么]
+若删去 timeout 自举，则所有 \verb|done=True|（含正常时间截断）的 state 的 value target 都被当作 $0$。在 $20\,$s timeout 的 velocity 任务里，策略会学到"回合尾部 value $\approx0$"——可尾部往往是\emph{非常好}的稳定行走状态，真实 value 很高。这个系统性低估会经由 GAE 反向传播，最终让策略"不愿进入回合后半段"。这是一个典型的"不报错但结果错"的 bug：训练能跑、曲线甚至好看，行为却被悄悄带偏。这正是奖励/终止章反复强调"truncation 与 termination 必须分开"的工程兑现。
+\end{derivation}
+
+\begin{note}[别背文件名，要会自己定位：上面的代码块归在哪个文件随版本漂]
+上面的 \Verb[breaklines]|compute_returns| 是\emph{同义简化}，用来讲清\emph{逻辑}；它在真实 RSL-RL 里落在哪个文件\textbf{随小版本迁移}。本章实测的 \Verb[breaklines]|rsl-rl-lib 5.4.0| 里，\Verb[breaklines]|compute_returns| 已\textbf{不在} \Verb[breaklines]|storage/rollout_storage.py|（该文件此版只剩 \Verb[breaklines]|add_transition|/\allowbreak\verb|generator|/\allowbreak\Verb[breaklines]|mini_batch_generator|），而是移到了 \Verb[breaklines]|algorithms/ppo.py|（签名变为 \Verb[breaklines]|compute_returns(self, obs)|）与 \Verb[breaklines]|runners/on_policy_runner.py|；timeout 自举的\emph{实现}也从"改 terminal mask"改写成等价的"在记录 transition 时 \Verb[breaklines]|rewards += gamma * values * time_outs|"（数学等价、效果相同）。\textbf{所以正确姿势不是记死文件名，而是在你自己装的库里反查}——这是本章反复要教的"举一反三"：
+\begin{codebox}[bash]{在已装库里自己定位真实实现（适用于任何 rsl-rl 小版本）}
+# 1) 找到库根目录,再 grep 关键字(time_outs / compute_returns)落在哪个文件
+RSLDIR=$(python -c "import rsl_rl, os; print(os.path.dirname(rsl_rl.__file__))")
+grep -rn "time_outs" "$RSLDIR"          # 看 timeout 自举到底在 storage 还是 algorithm
+grep -rln "def compute_returns" "$RSLDIR"
+
+# 2) 直接把 Python 对象的真实源码与文件名打出来(比读文档可靠)
+python - <<'PY'
+import inspect
+from rsl_rl.algorithms import PPO
+print(inspect.getsourcefile(PPO.compute_returns))   # 真实文件路径
+print(inspect.getsource(PPO.compute_returns))        # 真实源码
+PY
+\end{codebox}
+把\textbf{读代码}升级成\textbf{核代码}：凡本章给的"同义简化"块（GAE、PPO update、归一化、ONNX 导出），都可用上面这套 \verb|inspect|+\verb|grep| 在你的环境里复核真实签名与归属，而不是盲信书里的文件名——书会过期，反查方法不会。
+\end{note}
+
+\subsection{Rollout storage 与显存}
+
+\begin{codebox}[Python]{RolloutStorage 的核心数据与显存估算（简化）}
+class RolloutStorage:
+    def __init__(self, num_envs, num_steps, obs_dim, action_dim):
+        self.observations = torch.zeros(num_steps, num_envs, obs_dim)
+        self.critic_obs   = torch.zeros(num_steps, num_envs, critic_obs_dim)
+        self.actions      = torch.zeros(num_steps, num_envs, action_dim)
+        self.rewards      = torch.zeros(num_steps, num_envs)
+        self.dones        = torch.zeros(num_steps, num_envs)
+        self.values       = torch.zeros(num_steps, num_envs)
+        self.log_probs    = torch.zeros(num_steps, num_envs)
+        self.returns      = torch.zeros(num_steps, num_envs)
+        self.advantages   = torch.zeros(num_steps, num_envs)
+        # 显存估算(Go1 velocity, float32):
+        # obs:        24*4096*48*4 B ~ 18 MB
+        # critic_obs: 24*4096*72*4 B ~ 27 MB
+        # 其余标量场 合计 ~60 MB  ->  总计 ~105 MB(对现代 GPU 不是瓶颈)
+
+    def mini_batch_generator(self, num_mini_batches):
+        batch_size = self.num_envs * self.num_steps
+        mini_batch_size = batch_size // num_mini_batches
+        indices = torch.randperm(batch_size)        # 随机打乱,打破时间相关性
+        for start in range(0, batch_size, mini_batch_size):
+            idx = indices[start:start + mini_batch_size]
+            yield {"obs": self.observations.view(-1, obs_dim)[idx], ...}
+\end{codebox}
+
+\textbf{运行验证看什么}：rollout storage 对 Go1 velocity 约 $105\,$MB，远小于模型与物理仿真显存。因此若遇到 OOM，优先把 \verb|num_envs| 减半（直接减半物理仿真显存），而不是动 \Verb[breaklines]|num_steps_per_env|（它对 GAE 质量更敏感）。注意 \Verb[breaklines]|mini_batch_generator| 对 MLP \emph{随机打乱}所有 transition——这对 RNN 不成立（见 \cref{sec:rlmc-train-network}）。
+
+\subsection{配置详解（四维表）}
+
+\begin{table}[H]
+\centering
+\caption{数据流相关配置项的四维解读}
+\label{tab:rlmc-dataflow-cfg}
+\begin{tabular}{p{2.9cm}p{2.4cm}p{3.0cm}p{3.4cm}}
+\hline
+配置项 & 默认值来源 & 修改影响 & 合理范围 / 与其他配置耦合 \\
+\hline
+\verb|num_envs| & legged\_gym 经验 \cite{rudin2022legged} & 调大：batch 变大、更稳但更吃显存 & $1024$--$8192$；与显存、\verb|num_steps| 共同决定 batch \\
+\Verb[breaklines]|num_steps_per_env| & 同上（典型 $24$） & 调大：rollout 更长、GAE 更准；调小：更新更频但偏差大 & $\ge16$；与 $\gamma,\lambda$ 共同决定优势质量 \\
+\Verb[breaklines]|num_mini_batches| & 同上（典型 $4$） & 调大：mini-batch 更小、更新更多、梯度更噪 & $4$--$8$；与 \verb|num_envs| 共定 mini-batch size \\
+\Verb[breaklines]|num_learning_epochs| & 同上（典型 $5$） & 调大：更充分用数据，但偏离 on-policy、KL 增大 & $3$--$8$（$\le10$）；与 \verb|clip_param| 强耦合（见 \cref{ins:rlmc-clip-reuse}） \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{三框架对比实践}
+
+\begin{table}[H]
+\centering
+\caption{数据流配置在三框架的对照}
+\label{tab:rlmc-dataflow-3fw}
+\begin{tabularx}{\linewidth}{lLLL}
+\hline
+维度 & mjlab & Isaac Lab & UniLab \\
+\hline
+runner 配置类 & \Verb[breaklines]|RslRlOnPolicyRunnerCfg| & \Verb[breaklines]|RslRlOnPolicyRunnerCfg| & \verb|PPOConfig|（typed dataclass） \\
+rollout/PPO 后端 & RSL-RL 5.x & RSL-RL（共用） & RSL-RL \Verb[breaklines]|OnPolicyRunner| $+$ \Verb[breaklines]|FinalObservationAwarePPO| \\
+\verb|num_envs| 入口 & \Verb[breaklines]|--env.scene.num-envs| & \verb|--num_envs| & \verb|algo.num_envs|（Hydra 覆盖） \\
+\Verb[breaklines]|num_steps_per_env| & runner cfg & runner cfg & \Verb[breaklines]|algo.num_steps_per_env|（默认 $24$） \\
+\hline
+\end{tabularx}
+\end{table}
+
+mjlab 与 Isaac Lab 共用 RSL-RL，因此 \Verb[breaklines]|num_steps_per_env|、\Verb[breaklines]|num_mini_batches|、\Verb[breaklines]|num_learning_epochs| 三项在两框架\emph{语义完全一致}，仅 CLI 入口与默认任务不同。\textbf{UniLab 的 PPO 同样复用 RSL-RL}（\verb|PPOConfig| 在 \Verb[breaklines]|structured_configs.py|，UniLab；其 \Verb[breaklines]|policy.actor/critic_hidden_dims=[512,256,128]|、\Verb[breaklines]|num_steps_per_env=24| 与上面两框架\emph{逐字对齐}），故\cref{eq:rlmc-batch,eq:rlmc-minibatch,eq:rlmc-updates} 三个公式在三框架\emph{完全通用}——区别只在 CLI 入口（UniLab 走 Hydra \Verb[breaklines]|algo.num_envs=...|）。但有一个\textbf{本质不同}：UniLab 的 $98304$ 个 transition 是 CPU collector 写进\emph{共享内存} ring buffer、再由 GPU learner 整 slot 搬过去的（\cref{ins:rlmc-unilab-heterogeneous-train}），而非像 mjlab/Isaac 那样本就驻留 GPU。UniLab 还提供异步变体 APPO（\verb|APPOConfig|，\verb|num_envs=2048|），collector 不等 learner、被覆盖的旧 rollout 用 V-trace（\Verb[breaklines]|vtrace_clip_rho/c=1.0|）做 off-policy 校正——这是"on-policy 用完即弃"约束在异步架构下的放松（详见 \cref{sec:rlmc-train-ppo-sac}）。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[\texttt{num\_steps\_per\_env} 过小导致优势估计噪声化]
+\textbf{错误描述}：把 \Verb[breaklines]|num_steps_per_env| 设成 $4$（只有 4 步 rollout）。\textbf{现象后果}：GAE 只能用 4 步实际 reward 加 critic 自举来估计优势，严重依赖 critic 准确性；训练初期 critic 很差，优势几乎是噪声，策略迟迟不收敛。\textbf{根本原因}：rollout 太短时 \cref{eq:rlmc-gae} 的有效求和项太少。\textbf{正确做法}：至少 $16$--$32$ 步。
+\end{pitfall}
+
+\begin{pitfall}[误以为"batch 越大越好"]
+\textbf{错误描述}：无脑把 \verb|num_envs| 拉到极大以求"更稳"。\textbf{现象后果}：每次更新的信息增量变小（梯度方差低、但步长也小），收敛反而变慢、还吃显存。\textbf{根本原因}：稳定性边际收益递减。\textbf{正确做法}：locomotion 的经典 batch 约 $10^5$ 量级（$4096\times24$）已足够稳定，先固定它再调别处。
+\end{pitfall}
+
+\subsection{练习}
+
+\begin{practice}[数据流计算与分析]
+\begin{enumerate}
+  \item \textbf{[计算]} \verb|num_envs=2048|、\Verb[breaklines]|num_steps_per_env=32|、\Verb[breaklines]|num_mini_batches=8|、\Verb[breaklines]|num_learning_epochs=5|。用 \cref{eq:rlmc-batch,eq:rlmc-minibatch,eq:rlmc-updates} 算出 batch size、mini-batch size、每 iteration 总更新次数。\emph{验收}：得到 $65536$、$8192$、$40$。
+  \item \textbf{[分析]} 把 \Verb[breaklines]|num_learning_epochs| 从 5 改成 20 会出现什么问题？PPO 的 clip 能否完全防住？\emph{验收}：能说出"数据被过度复用、偏离 on-policy、KL 在后期 epoch 显著增大；clip 只能缓解不能根治（见 \cref{ins:rlmc-clip-reuse}）"。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{环境-训练器 wrapper 与训练主循环}
+\label{sec:rlmc-train-wrapper}
+
+\emph{这一节解决什么问题}：环境与 RSL-RL runner 之间的接口边界到底是什么？wrapper 做了哪些关键转换、哪一处最容易埋 bug？
+
+\subsection{模块功能与在管线中的位置}
+
+PPO 训练器\emph{不直接}与 env 交互——中间隔着一个 wrapper 层（在 RSL-RL 生态中通称 \Verb[breaklines]|RslRlVecEnvWrapper|）。它是 env 与 runner 之间\textbf{唯一的桥}，负责把 env 的输出翻译成 runner 期望的格式。这一层看似只是"格式转换"，却是整条管线最容易出隐蔽 bug 的地方——因为它同时承担了一项\emph{数学}职责（timeout 自举信号），搞错不会报错，只会让 critic 学到错误的 label。
+
+\subsection{wrapper 的四个核心职责}
+
+\textbf{职责一：观测路由。}env 返回形如 \Verb[breaklines]|{"actor": tensor, "critic": tensor}|（mjlab）或 \Verb[breaklines]|{"policy": tensor, "critic": tensor}|（Isaac Lab）的观测字典。wrapper 依 runner 配置里的 \verb|obs_groups| 映射，把这些 group 组装成 runner 期望的张量结构。\verb|obs_groups| 的来源正是 \cref{ch:rlmc-obsact} 设计的 actor/critic 分组。
+
+\textbf{职责二：动作裁剪。}wrapper 可在 action 送入 env 前先 clip，防止网络输出越界。这与 env 内部 ActionManager 的 clip 是\emph{两道}防线——wrapper clip 限制 raw action，ActionManager clip 限制 processed action（变换链见 \cref{ch:rlmc-obsact}）。
+
+\textbf{职责三：done 合并。}env 分别返回 \verb|terminated| 与 \verb|truncated|（bool 张量）。wrapper 合并成 RSL-RL 期望的 \verb|dones|：\verb@dones = (terminated | truncated)@。
+
+\textbf{职责四：timeout 自举信号。}对无限时域任务（\Verb[breaklines]|is_finite_horizon=False|），wrapper 把"被截断但未真实终止"的信息放进 \Verb[breaklines]|extras["time_outs"]|。GAE（\cref{sec:rlmc-train-dataflow} 的代码）看到 \Verb[breaklines]|time_outs=True| 就\emph{不}清零 value，而是用 critic 估计自举。这正是奖励/终止章 truncation-vs-termination 的工程落地。
+
+\begin{codebox}[Python]{wrapper.step() 的核心转换（两框架语义一致）}
+def step(self, actions):
+    obs_dict, reward, terminated, truncated, extras = self.env.step(actions)
+
+    # 职责三:合并 dones(此处的按位或写作 terminated 或 truncated)
+    dones = (terminated | truncated).to(torch.long)
+
+    # 职责四:timeout 信号(仅无限时域任务)
+    if not self.unwrapped.cfg.is_finite_horizon:
+        extras["time_outs"] = truncated.to(torch.long)
+
+    return obs_dict, reward, dones, extras
+\end{codebox}
+
+\subsection{训练主循环（OnPolicyRunner）}
+
+runner 的 \verb|learn()| 把 \cref{sec:rlmc-train-dataflow} 的三段串成主循环：
+
+\begin{codebox}[Python]{OnPolicyRunner.learn() 主循环（简化）}
+def learn(self, num_iterations):
+    for iteration in range(num_iterations):
+        # 第一段:Collection
+        with torch.inference_mode():
+            for step in range(self.num_steps_per_env):
+                actions = self.actor(obs["actor"])      # actor 前向
+                values  = self.critic(obs["critic"])    # critic 前向
+                obs, rewards, dones, extras = self.wrapper.step(actions)
+                self.storage.add(obs, actions, rewards, dones, values, log_probs)
+
+        # 第二段:Learning
+        self.storage.compute_returns(self.critic, gamma, lam)   # GAE
+        for epoch in range(self.num_learning_epochs):
+            for batch in self.storage.mini_batch_generator(self.num_mini_batches):
+                self.ppo.update(batch)
+
+        # 第三段:Logging
+        self.log_metrics(iteration)
+        if iteration % self.save_interval == 0:
+            self.save_checkpoint()
+\end{codebox}
+
+\subsection{框架对 runner 的扩展（mjlab 为例）}
+
+mjlab 继承 RSL-RL 的 \Verb[breaklines]|OnPolicyRunner| 做了三类务实扩展，每一类都对应一个真实痛点：
+
+\textbf{(1) 清理 \texttt{None} 型可选配置。}RSL-RL 5.x 的某些可选字段默认 \verb|None|，但模型 \verb|__init__| 不接受 \verb|None|；mjlab 在建模型前自动清理。
+
+\textbf{(2) 把 \texttt{common\_step\_counter} 存进 checkpoint。}课程（curriculum）恢复依赖它——若 checkpoint 不存，从断点恢复后 curriculum 会从 \verb|step=0| 重来，任务难度骤降、策略可能"退化"。
+
+\textbf{(3) 迁移旧 checkpoint 键名。}RSL-RL 4.x$\to$5.x 的 API 变化导致键名变化（如 \Verb[breaklines]|actor.0.weight| 与 \verb|mlp.0.weight|）；mjlab runner 自动检测并迁移。
+
+\begin{codebox}[Python]{mjlab 的 checkpoint 扩展（保存 curriculum 计数）}
+def save(self, path):
+    super().save(path)                       # 标准 RSL-RL 保存
+    torch.save({                             # 额外保存 curriculum 依赖的计数
+        "common_step_counter": self.env.common_step_counter,
+    }, path + "_extras.pt")
+\end{codebox}
+
+\subsection{三框架对比实践}
+
+\begin{table}[H]
+\centering
+\caption{wrapper 与 runner 的三框架差异（mjlab/Isaac Lab 经文档核对）}
+\label{tab:rlmc-wrapper-3fw}
+\begin{tabularx}{\linewidth}{lLLL}
+\hline
+维度 & mjlab & Isaac Lab & UniLab \\
+\hline
+obs group 命名 & \verb|actor| / \verb|critic| & \verb|policy| / \verb|critic| & env 侧 \verb|obs| / \verb|critic|（固定） \\
+wrapper 类 & \Verb[breaklines]|RslRlVecEnvWrapper| & \Verb[breaklines]|RslRlVecEnvWrapper| & 无（\verb|NpEnv| $+$ \Verb[breaklines]|split_obs_dict|） \\
+\verb|obs_groups| 形如 & \Verb[breaklines]|{"actor":("actor",),...}|（tuple 值） & \Verb[breaklines]|{"actor":["policy"],...}|（list 值） & Hydra \Verb[breaklines]|{actor:[actor],critic:[critic]}| \\
+curriculum 恢复 & extras 存 \Verb[breaklines]|common_step_counter| & resume 仅恢复网络权重，\Verb[breaklines]|common_step_counter| 不持久化（curriculum 进度重置） & \Verb[breaklines]|PenaltyCurriculum|（episode 长度驱动） \\
+ONNX 导出 & 共用 RSL-RL 导出 & 共用 RSL-RL 导出 & 支持（PPO 在 play/eval 阶段导） \\
+\hline
+\end{tabularx}
+\end{table}
+
+\begin{note}
+Isaac Lab 自 RSL-RL $\ge4.0.0$ 起，\Verb[breaklines]|OnPolicyRunner| 初始化\textbf{必须}提供 \verb|obs_groups|（典型形如 \Verb[breaklines]|{"actor":["policy"], "critic":["policy"]}|），否则会卡死/报错——这是官方 issue 中的高频坑，已联网核对 \cite{schwarke2025rslrl}。两框架命名差一个词（\verb|actor| vs \verb|policy|），迁移配置时极易写错。
+\end{note}
+
+\textbf{UniLab 的接口边界形态不同}：它\emph{没有} \Verb[breaklines]|RslRlVecEnvWrapper| 这种"翻译层"——因为它不是 Manager-Based 架构，env 的四职责直接落在 \verb|NpEnv.step()| 模板与契约类里（\verb|np_env.py|，UniLab）。逐职责对照如下。\textbf{职责一（观测路由）}：\verb|NpEnv| 的 \Verb[breaklines]|obs_groups_spec| 直接声明 \Verb[breaklines]|{"obs": <actor 维>, "critic": <critic 维>}|（如 go2 joystick 的 \Verb[breaklines]|{"obs":49,"critic":52}|，多出的 $3$ 维即特权 base linvel）；\Verb[breaklines]|base/observations.py| 的 \Verb[breaklines]|split_obs_dict| 把 \verb|obs["obs"]| 喂 actor、\verb|obs["critic"]| 喂 critic（无 critic 则复用 obs）；env 内固定用 \verb|obs|/\allowbreak\verb|critic| 两个组名，而给 RL runner 的路由键经 Hydra \Verb[breaklines]|algo.obs_groups={actor:[actor],critic:[critic]}| 对齐——\emph{两层组名}（env 侧 \verb|obs|/\allowbreak\verb|critic| 与 runner 侧 \verb|actor|/\allowbreak\verb|critic|）是 UniLab 特有的、最易写混的地方。\textbf{职责三、四（done 合并 \& timeout 自举）}：UniLab 把这件事做成了\emph{显式数据契约} \Verb[breaklines]|TransitionBootstrapContract|（\Verb[breaklines]|base/final_observation.py|，UniLab），其中 \verb@done = terminated | truncated@，并用 \Verb[breaklines]|timeout_terminal_mask| 与失败终止区分（等价 mjlab/Isaac 的 \verb|time_outs| 标记，但 UniLab 升格为带字段的契约对象）；终止帧的 \verb|next_obs| 还会被 \Verb[breaklines]|_patch_terminal_next_observations| 打补丁成真终止观测，保证 autoreset 后的 bootstrap 用的是出事那一帧而非新回合首帧。换言之，\cref{sec:rlmc-train-dataflow} 反事实推理里"删掉 timeout 自举的灾难"，三框架都靠各自机制规避，只是 UniLab 把它做成了\emph{编译期可检查的契约}而非一个布尔标记。
+
+\begin{note}[把 UniLab"最易写混的两层组名"做成一段自检，而非只停在告诫]
+上面说 UniLab 有\emph{两层}组名（env 侧固定 \verb|obs|/\allowbreak\verb|critic|，runner 侧 \verb|actor|/\allowbreak\verb|critic|，靠 Hydra \Verb[breaklines]|algo.obs_groups| 对齐），是最容易写错的地方。与其只记"小心"，不如训练前\textbf{把两层映射打出来当场对账}——和 \cref{sec:rlmc-train-wrapper} 练习里 mjlab 侧打印 obs 维度对称：
+\begin{codebox}[Python]{UniLab:打印 env 侧组名维度 + runner 侧路由,当场核对两层是否对齐}
+# 思路与框架无关:1) 看 env 实际产出哪些组及其维度 2) 看喂给 RL runner 的路由键
+# 3) 确认 runner 的 actor/critic 各自指向 env 的哪个组、维度对得上(critic 应 >= actor)
+obs = env.reset()                                  # NpEnv 返回 obs dict
+for g, t in obs.items():                            # env 侧:期望 {"obs":49, "critic":52}
+    print(f"[env 组] {g:8s} dim={t.shape[-1]}")
+# runner 侧路由(Hydra algo.obs_groups,形如 {actor:[obs], critic:[critic]}):
+for role, groups in cfg.algo.obs_groups.items():
+    dim = sum(obs[g].shape[-1] for g in groups)
+    print(f"[runner] {role:8s} <- {groups}  -> dim={dim}")
+# 红旗:actor 维 == critic 维 且你本想用特权观测 -> 多半把 critic 也指到了 obs;
+#       或 runner 的 actor 误指到 env 的 'critic' 组(把特权观测喂给了部署可见的 actor)
+\end{codebox}
+关键不是这段代码本身，而是\textbf{养成"训练前先把接口映射打印出来对账"的习惯}：UniLab 的坑在"两层组名 $+$ 大小写/下划线 slug"，但"先打印再训"这条工程纪律对三框架通用。
+\end{note}
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[\texttt{obs\_groups} 映射写错，导致 critic 丢失特权信息]
+\textbf{错误描述}：写成 \Verb[breaklines]|{"actor":("actor",), "critic":("actor",)}|——critic 与 actor 看到\emph{相同}观测。\textbf{现象后果}：\cref{ch:rlmc-obsact} 精心设计的特权信息（privileged）完全浪费，价值估计变差、但不报错。\textbf{根本原因}：把两个 key 都指到了同一 group。\textbf{正确做法}：训练启动时打印 actor 与 critic 的 obs 维度，若相同就极可能配错（除非你确实不用特权信息）。
+\end{pitfall}
+
+\begin{pitfall}[把 wrapper 当成"纯格式转换"]
+\textbf{错误描述}：以为 wrapper 只是改 tensor 形状。\textbf{现象后果}：忽视 \verb|time_outs| 传递，给 critic 喂错 value target（见 \cref{sec:rlmc-train-dataflow} 的反事实推理）。\textbf{根本原因}：timeout 自举是\emph{数学}职责不是格式职责。\textbf{正确做法}：把职责四当作和奖励函数同等重要的对象来对待。
+\end{pitfall}
+
+\subsection{练习}
+
+\begin{practice}[wrapper 源码与维度自检]
+\begin{enumerate}
+  \item \textbf{[源码]} 在你用的框架里找到 \Verb[breaklines]|RslRlVecEnvWrapper.step()|，确认 \Verb[breaklines]|extras["time_outs"]| 的设置逻辑。若 \Verb[breaklines]|is_finite_horizon=True|，\verb|time_outs| 还会被设置吗？\emph{验收}：能指出"有限时域任务不设 time\_outs，因为到点即真实终止"。
+  \item \textbf{[实验]} 训练前打印 actor 与 critic 的 obs 维度。\emph{验收}：写出一段 $\le15$ 行脚本，遍历 \verb|env.reset()| 返回的 obs 字典并打印每个 group 的 \verb|shape|；若两者相同则告警。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{PPO 超参数全解析}
+\label{sec:rlmc-train-hyperparam}
+
+\emph{这一节解决什么问题}：locomotion 的那组"经典 PPO 配置"为什么是这些值？每个参数控制什么？怎样从日志症状\emph{反推}该调哪个？
+
+\subsection{模块功能与在管线中的位置}
+
+超参数是你对 PPO 优化过程的\emph{全部}可调旋钮。但本节最重要的认知是：在 locomotion 里，\textbf{PPO 超参数几乎不是训练失败的根因}——经典参数已被数千个项目验证。本节给出参数表、配置代码，以及本章最有用的工具：症状$\to$参数的反查表。
+
+\subsection{参数总览与默认值对比}
+
+\begin{table}[H]
+\centering
+\caption{三组配置的 PPO 超参数对比（legged\_gym 为历史基准 \cite{rudin2022legged}；数值经源稿与官方默认核对）}
+\label{tab:rlmc-ppo-params}
+\begin{tabular}{lcccl}
+\hline
+参数 & legged\_gym & Isaac Lab(ANYmal) & mjlab(Go1) & 控制什么 \\
+\hline
+\verb|clip_param| & 0.2 & 0.2 & 0.2 & ratio clip 范围 \\
+\verb|entropy_coef| & \textbf{0.01} & \textbf{0.005} & 0.01 & 熵奖励系数 \\
+\Verb[breaklines]|num_learning_epochs| & 5 & 5 & 5 & 数据复用次数 \\
+\Verb[breaklines]|num_mini_batches| & 4 & 4 & 4 & mini-batch 数 \\
+\verb|learning_rate| & 1e-3 & 1e-3 & 1e-3 & 初始学习率 \\
+\verb|schedule| & adaptive & adaptive & adaptive & LR 调度方式 \\
+\verb|desired_kl| & 0.01 & 0.01 & 0.01 & 自适应目标 KL \\
+\verb|gamma| & 0.99 & 0.99 & 0.99 & 折扣因子 \\
+\verb|lam| & 0.95 & 0.95 & 0.95 & GAE lambda \\
+\verb|max_grad_norm| & 1.0 & 1.0 & 1.0 & 梯度裁剪阈值 \\
+\Verb[breaklines]|value_loss_coef| & 1.0 & 1.0 & 1.0 & 价值损失权重 \\
+\Verb[breaklines]|num_steps_per_env| & 24 & 24 & 24 & rollout 长度 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{insight}[一张几乎"全等"的表，本身就是结论]\label{ins:rlmc-params-allequal}
+除了 \verb|entropy_coef|（$0.01$ vs $0.005$），其余参数在三个项目里\emph{完全一致}。这不是巧合：legged\_gym 的超参数 \cite{rudin2022legged} 经过广泛验证，后续项目都以它为起点。\verb|entropy_coef| 的差异是独立调优的结果——$0.01$ 鼓励更多探索，$0.005$ 更快收敛到确定性策略。\textbf{实践含义}：拿到新任务，先\emph{原样照搬}这组值，把精力投到环境与奖励上；只有在明确诊断指向某个参数时才动它。
+\end{insight}
+
+\subsection{三框架配置代码}
+
+\begin{codebox}[Python]{mjlab PPO 配置（实测 1.4.0:分离 actor/critic，模型类是 RslRlModelCfg）}
+# 实测 mjlab 1.4.0 的真实导入与字段(go1 velocity rl_cfg.py / mjlab/rl/config.py):
+#   模型配置类是 RslRlModelCfg(不是 RslRlMLPModelCfg);模型种类由其 class_name
+#   字段选("MLPModel"/"CNNModel"/"RNNModel");分布是一个 dict(不是某个 Cfg 类).
+from mjlab.rl import (
+    RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg, RslRlModelCfg,
+)
+
+agent_cfg = RslRlOnPolicyRunnerCfg(
+    num_steps_per_env=24,
+    max_iterations=10_000,         # mjlab 按任务定(go1=10000);flat 冒烟可 300
+    save_interval=50,
+    experiment_name="go1_velocity",
+    logger="tensorboard",          # 或 "wandb"
+    obs_groups={"actor": ("actor",), "critic": ("critic",)},  # 值为 tuple
+    algorithm=RslRlPpoAlgorithmCfg(
+        clip_param=0.2, desired_kl=0.01, learning_rate=1e-3,
+        gamma=0.99, lam=0.95, entropy_coef=0.01,   # go1 任务设 0.01(基类默认 0.005)
+        num_learning_epochs=5, num_mini_batches=4,
+        value_loss_coef=1.0, use_clipped_value_loss=True, max_grad_norm=1.0,
+    ),
+    actor=RslRlModelCfg(
+        hidden_dims=(512, 256, 128), activation="elu",
+        obs_normalization=False,
+        distribution_cfg={                       # dict,非 Cfg 类
+            "class_name": "GaussianDistribution",
+            "init_std": 1.0, "std_type": "scalar",
+        },
+    ),
+    critic=RslRlModelCfg(              # critic 可与 actor 不同维度
+        hidden_dims=(512, 256, 128), activation="elu",
+        obs_normalization=False,        # critic 无 distribution_cfg(确定性输出)
+    ),
+)
+\end{codebox}
+
+\begin{codebox}[Python]{Isaac Lab PPO 配置（注意 entropy\_coef 与可能的旧版统一 API）}
+from isaaclab_rl.rsl_rl import (
+    RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg, RslRlPpoActorCriticCfg,
+)
+
+@configclass
+class AnymalBRoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    num_steps_per_env = 24
+    max_iterations = 1500
+    save_interval = 50
+    experiment_name = "anymal_b_rough"
+    algorithm = RslRlPpoAlgorithmCfg(
+        clip_param=0.2, desired_kl=0.01, learning_rate=1e-3,
+        gamma=0.99, lam=0.95, entropy_coef=0.005,   # 注意:0.005
+        num_learning_epochs=5, num_mini_batches=4,
+        value_loss_coef=1.0, use_clipped_value_loss=True, max_grad_norm=1.0,
+    )
+    policy = RslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
+        activation="elu",
+    )
+\end{codebox}
+
+\begin{note}
+两框架的\textbf{关键 API 差异（已实测核对，勿混淆）}：分离 actor/critic 是\emph{两框架共有}的（都基于 RSL-RL 5.x），但\emph{模型配置类的名字不同}——mjlab 用自带的 \verb|RslRlModelCfg|（分布是\textbf{普通 dict}：\Verb[breaklines]|{"class_name":"GaussianDistribution","init_std":1.0,...}|，实测 mjlab 1.4.0 + rsl-rl-lib 5.4.0）；Isaac Lab 用 \Verb[breaklines]|isaaclab_rl.rsl_rl| 提供的\textbf{带类型的} \Verb[breaklines]|RslRlMLPModelCfg|（其分布是\emph{嵌套类} \Verb[breaklines]|RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0)|）。\textbf{注意}：\Verb[breaklines]|RslRlMLPModelCfg|/\allowbreak\Verb[breaklines]|GaussianDistributionCfg| 是 \emph{Isaac Lab} 的封装，\textbf{不是} mjlab 的、也\textbf{不是}裸 \Verb[breaklines]|rsl_rl.modules| 的导出（实测裸库 \Verb[breaklines]|from rsl_rl.modules import RslRlMLPModelCfg| 会 \verb|ImportError|）。Isaac Lab 另\emph{同时}保留旧版\emph{统一}的 \Verb[breaklines]|RslRlPpoActorCriticCfg|（带 \Verb[breaklines]|init_noise_std|，实测仍未弃用），故上面 Isaac Lab 代码用统一式也能跑。actor/critic 分离始于 RSL-RL 4.0.0，分布 cfg（dict / 嵌套类）始于 5.0.0（\Verb[breaklines]|init_noise_std| 被 \verb|init_std| 取代）——经官方 release 与文档核对 \cite{schwarke2025rslrl}。
+\end{note}
+
+\begin{codebox}[Python]{UniLab PPO 配置（typed dataclass，structured\_configs.py;复用 RSL-RL）}
+# UniLab 用 typed dataclass(替代 ml_collections),经 Hydra/OmegaConf 组合.
+# 字段值与 mjlab/Isaac 的 RSL-RL 配置逐字对齐——因为 PPO 后端就是 RSL-RL.
+from unilab.structured_configs import PPOConfig   # 路径以你的版本为准
+
+cfg = PPOConfig(
+    num_envs=4096,                 # 经 Hydra algo.num_envs 覆盖
+    num_steps_per_env=24,
+    max_iterations=300,            # flat;rough 调大
+    policy=dict(                   # actor/critic 同构 MLP(注意:统一式,非分离 cfg)
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
+        activation="elu",
+    ),
+    algorithm=dict(
+        clip_param=0.2, desired_kl=0.01, learning_rate=1e-3,
+        gamma=0.99, lam=0.95, entropy_coef=0.01,
+        num_learning_epochs=5, num_mini_batches=4, schedule="adaptive",
+        # 关键:UniLab 自定义算法类,处理终止观测 bootstrap(呼应契约)
+        class_name="unilab.algos.torch.rsl_rl_ppo:FinalObservationAwarePPO",
+    ),
+)
+\end{codebox}
+
+\begin{note}
+\textbf{三框架 PPO 配置对照的结论}：超参数的\emph{数值}在 mjlab/Isaac/UniLab 三者一致（都源自 legged\_gym \cite{rudin2022legged} 经 RSL-RL 沉淀）；差异只在\emph{配置范式}——mjlab 用\emph{分离}的 \verb|RslRlModelCfg|$\times2$（分布是 dict），Isaac Lab 用\emph{分离}的 \Verb[breaklines]|RslRlMLPModelCfg|$\times2$（分布是嵌套类）\emph{或}旧版\emph{统一}的 \Verb[breaklines]|RslRlPpoActorCriticCfg|，UniLab 是\emph{统一}的 \Verb[breaklines]|policy=dict(actor_hidden_dims, critic_hidden_dims)| 且整体走 Hydra 覆盖。三者的算法核（clip/GAE/adaptive KL）是\textbf{同一份 RSL-RL 代码}，UniLab 仅外包一层 \Verb[breaklines]|FinalObservationAwarePPO| 来正确处理 autoreset 后的终止观测自举（\cref{sec:rlmc-train-wrapper} 的 \Verb[breaklines]|TransitionBootstrapContract|）。这印证了 \cref{ins:rlmc-params-allequal}：那张"几乎全等"的参数表，到了 UniLab 这第三个框架\emph{依旧}成立。
+\end{note}
+
+\subsection{超参数\texorpdfstring{$\leftrightarrow$}{<->}行为映射表（本章核心工具）}
+
+\begin{table}[H]
+\centering
+\caption{超参数调大/调小的效果与诊断信号}
+\label{tab:rlmc-param-behavior}
+\begin{tabular}{p{2.6cm}p{3.0cm}p{3.0cm}p{2.6cm}}
+\hline
+超参数 & 调大的效果 & 调小的效果 & 诊断信号 \\
+\hline
+\verb|clip_param| & 允许更大策略变化 & 更保守的更新 & KL divergence \\
+\verb|desired_kl| & 容忍更大分布偏移 & 更频繁降 LR & 自适应 LR 变化 \\
+\verb|learning_rate| & 更快但可能不稳 & 更慢但更稳 & KL、value loss \\
+\verb|gamma| & 更看重长期回报 & 更看重短期 & reward 平台期 \\
+\verb|lam| & 接近 MC（高方差低偏差） & 更靠 critic（低方差高偏差） & 优势方差 \\
+\verb|entropy_coef| & 更多探索 & 更快收敛 & entropy / action std \\
+\Verb[breaklines]|num_learning_epochs| & 更充分用数据 & 更接近单次更新 & 后期 epoch 的 KL \\
+\Verb[breaklines]|num_mini_batches| & 更小 mini-batch、更多更新 & 更大 mini-batch、更稳 & 梯度噪声 \\
+\Verb[breaklines]|num_steps_per_env| & rollout 更长、GAE 更准 & 更新更频 & 优势质量 \\
+\verb|max_grad_norm| & 更少裁剪 & 更频繁裁剪 & 梯度裁剪触发率 \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{这张表的正确用法是\emph{反向}的}：先看日志症状，再查该调哪个参数。
+
+\begin{table}[H]
+\centering
+\caption{从日志症状反查参数（先查第一列，再查第二列）}
+\label{tab:rlmc-symptom-param}
+\begin{tabular}{p{4.0cm}p{3.4cm}p{3.4cm}}
+\hline
+日志症状 & 首先检查 & 第二检查 \\
+\hline
+KL 持续偏高（$>0.05$） & \verb|learning_rate| 降 & \verb|desired_kl| 减小 \\
+KL 持续为零 & 策略未更新 $\to$ 查 reward scale & \verb|learning_rate| 增大 \\
+entropy 过早塌缩 & \verb|entropy_coef| 增大 & action\_rate 惩罚是否过强 \\
+value loss 长期很高 & critic 是否缺特权观测 & reward 尺度是否合理 \\
+reward 升但策略抖 & action scale（\cref{ch:rlmc-obsact}） & action\_rate 权重（奖励章） \\
+reward 不上升 & reward 设计（奖励章） & \Verb[breaklines]|num_steps_per_env| 太短？ \\
+训练初期 NaN & obs/reward 含 NaN & \verb|max_grad_norm| 减小 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{调参优先级}
+
+从高到低：(1) \textbf{环境难度}（curriculum/command/terrain）——最易修；(2) \textbf{reward 设计}（项/权重/$\sigma$）——影响最大；(3) \textbf{PPO 参数}（LR/entropy/batch）——通常不是根因；(4) \textbf{网络架构}——最后才动。原因是越靠后越难归因：若同时改了 reward 和 LR，你无法知道是哪个修好了问题。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[只盯 reward 曲线改 LR]
+\textbf{错误描述}：reward 不涨就手动降 LR。\textbf{现象后果}：KL 经常已超 \verb|desired_kl|、自适应调度\emph{正在}降 LR，你再手动降会过度，训练停滞。\textbf{根本原因}：忽略了 adaptive schedule 的存在。\textbf{正确做法}：先看 KL 再决定动不动 LR（见 \cref{sec:rlmc-train-adaptkl}）。
+\end{pitfall}
+
+\begin{pitfall}[以为 \texttt{clip\_param} 直接限制参数变化幅度]
+\textbf{错误描述}：把 \verb|clip_param| 当作"权重更新步长上限"。\textbf{现象后果}：调它却没得到预期效果。\textbf{根本原因}：\verb|clip_param| 限制的是 policy ratio 在\emph{损失}里的贡献范围（\cref{eq:rlmc-ppo-clip}），不是直接限制网络参数。\textbf{正确做法}：想限制更新幅度用 \verb|max_grad_norm| 或 LR。
+\end{pitfall}
+
+\subsection{练习}
+
+\begin{practice}[超参诊断]
+\begin{enumerate}
+  \item \textbf{[计算]} 若 \verb|num_envs=8192|（其余不变），batch size 变为多少？对训练有何影响？\emph{验收}：$8192\times24=196608$；梯度方差更低但每次更新步长偏小，可能需更长训练。
+  \item \textbf{[分析]} KL 持续为零说明什么？策略在学吗？可能原因？\emph{验收}：能指出"新旧策略几乎不变$\to$策略基本没更新$\to$查 reward scale 过小或 LR 过小"。
+  \item \textbf{[实验]} 把 \Verb[breaklines]|num_learning_epochs| 从 5 调到 20，跑 $\sim200$ iter 观察 KL。\emph{验收}：记录到后期 epoch 的 KL 明显增大，并能用 \cref{ins:rlmc-clip-reuse} 解释。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{自适应 KL 学习率调度}
+\label{sec:rlmc-train-adaptkl}
+
+\emph{这一节解决什么问题}：adaptive schedule 怎么工作？为什么它是 locomotion 训练\emph{最重要的单个}稳定器？
+
+\subsection{模块功能与在管线中的位置}
+
+它位于"每次 PPO update 之后"：根据本次更新造成的新旧策略 KL，自动调下一步的 learning rate。它不改变损失函数，只调旋钮——却是训练能否稳住的关键安全网。
+
+\subsection{机制详解}
+
+每次 update 后计算 KL：
+\begin{equation}
+\mathrm{KL}=\mathbb{E}\!\left[\log\frac{\pi_{\text{new}}(a|s)}{\pi_{\text{old}}(a|s)}\right],
+\label{eq:rlmc-kl}
+\end{equation}
+再据它与 \verb|desired_kl| 的关系调 LR：
+
+\begin{codebox}[Python]{adaptive KL 调度核心逻辑（rsl\_rl/algorithms/ppo.py 同义简化）}
+def update_lr(self, mean_kl):
+    if mean_kl > self.desired_kl * 2.0:
+        self.learning_rate = max(self.learning_rate / 1.5, 1e-5)   # 太快->降速
+    elif mean_kl < self.desired_kl / 2.0:
+        self.learning_rate = min(self.learning_rate * 1.5, 1e-2)   # 太慢->加速
+    for g in self.optimizer.param_groups:
+        g['lr'] = self.learning_rate
+\end{codebox}
+
+\textbf{规则解读}：KL $>2\times$\verb|desired_kl| $\to$ 变化太快 $\to$ LR 除以 $1.5$；KL $<$ \verb|desired_kl|$/2$ $\to$ 变化太慢 $\to$ LR 乘 $1.5$；落在 $[\text{desired\_kl}/2,\,2\times\text{desired\_kl}]$ 之间则不动。于是训练自动适配不同阶段：早期策略变化快（KL 大）$\to$ 自动降 LR 避免崩溃；后期接近收敛（KL 小）$\to$ 自动升 LR 不浪费算力。
+
+\begin{insight}[adaptive KL 像自适应巡航（ACC）]\label{ins:rlmc-acc}
+这与汽车的自适应巡航控制高度相似：前车近（KL 大）$\to$ 自动减速（降 LR）；前方空旷（KL 小）$\to$ 自动加速（升 LR）。目标不是固定速度，而是维持"安全但高效"的跟车距离——PPO 维持的是"安全但高效"的\emph{策略更新幅度}。\textbf{若关掉它}（用固定 LR），你得非常小心地选 LR：太大初期 KL 爆炸，太小后期收敛太慢。adaptive schedule 自动解决了这个两难。
+\end{insight}
+
+\textbf{与课程（curriculum）的交互}：当奖励课程在某步收紧 $\sigma$，reward landscape 突变，下一次 rollout 的优势分布大幅偏移 $\to$ KL 尖峰；adaptive schedule 此时自动降 LR 来吸收冲击。这也是为什么推荐 curriculum 的 stage 间隔要够大——给调度足够时间恢复。
+
+\subsection{运行验证：TensorBoard 看什么}
+
+\begin{codebox}{adaptive schedule 的关键字段与正常/异常模式}
+Loss/learning_rate   # 当前实际 LR
+Loss/mean_kl         # 平均 KL
+
+# 正常:初期 LR 下降(变化快),中期稳,后期可能回升;KL 在 desired_kl 附近波动
+# 异常:LR 一路降到下限 1e-5  -> 策略剧烈振荡,查 reward/obs
+#      LR 一路升到上限 1e-2  -> 策略变化太小,查 reward gradient
+#      KL 尖峰              -> 环境参数突变(curriculum 切换或 DR 太强)
+\end{codebox}
+
+\subsection{三框架对比实践}
+
+adaptive KL 调度是 RSL-RL 算法内的逻辑，mjlab 与 Isaac Lab 因共用 RSL-RL 而\emph{完全一致}（同一份 \verb|update_lr|），仅 \verb|desired_kl| 默认值随任务可能不同。\textbf{UniLab 的 PPO 也内置同款调度}——它的 \Verb[breaklines]|PPOConfig.algorithm| 默认 \Verb[breaklines]|schedule="adaptive", desired_kl=0.01|（\Verb[breaklines]|structured_configs.py|，UniLab），且因复用 RSL-RL 的 \Verb[breaklines]|OnPolicyRunner|，走的就是\emph{同一份} \verb|update_lr| 逻辑（\cref{ins:rlmc-acc} 的 ACC 类比对三框架等同成立）。一个 UniLab 特有的提醒：它的异步变体 APPO 不靠 adaptive KL 单独稳住——collector 与 learner 解耦后，被覆盖的旧 rollout 还要叠加 V-trace（\Verb[breaklines]|vtrace_clip_rho/c|）来约束 off-policy 偏移，相当于在 KL 调度之外多了一道"重要性比裁剪"的安全网。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[手动设 \texttt{schedule="fixed"} 却没仔细选 LR]
+\textbf{错误描述}：图省事关掉自适应、随手填个 LR。\textbf{现象后果}：fixed 模式要你自己平衡初期与后期，比 adaptive 难得多——初期易爆 KL，后期易停滞。\textbf{根本原因}：丢掉了 \cref{ins:rlmc-acc} 的自动平衡。\textbf{正确做法}：除非有特殊理由，始终 \Verb[breaklines]|schedule="adaptive"|。
+\end{pitfall}
+
+\subsection{练习}
+
+\begin{practice}[KL 调度行为]
+\begin{enumerate}
+  \item \textbf{[分析]} 若 \Verb[breaklines]|desired_kl=0.001|（而非 $0.01$），调度会怎样？策略更新速度如何变？\emph{验收}：目标 KL 更小 $\to$ 更频繁触发降 LR $\to$ 策略更新更慢更保守。
+  \item \textbf{[实验]} 跑 $\sim200$ iter，在 TensorBoard 记录 \Verb[breaklines]|Loss/learning_rate| 与 \verb|Loss/mean_kl| 的对应关系，标注 LR 调整发生时对应的 KL 值。\emph{验收}：能指出每次 LR 下降都伴随 KL 超过 $2\times$\verb|desired_kl|。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{网络架构配置：MLP / RNN / CNN}
+\label{sec:rlmc-train-network}
+
+\emph{这一节解决什么问题}：MLP 的层数宽度怎么选？何时需要 RNN 或 CNN？每种选择对观测接口与\emph{部署}意味着什么？
+
+\subsection{模块功能与在管线中的位置}
+
+网络架构决定了"从观测到动作/价值"的函数族。它是调参优先级里\emph{最后}才动的一环——但选错网络类型（尤其引入 RNN/CNN）会显著改变部署复杂度，故必须早做\emph{类型}决策。
+
+\subsection{MLP：locomotion 的默认选择}
+
+标准 actor/critic 是三层 MLP \Verb[breaklines]|[512, 256, 128]| 加 ELU 激活。它不是唯一正确，却经过最广泛验证。
+
+\begin{codebox}[Python]{Isaac Lab 的 MLP 与高斯分布配置（RSL-RL 5.x，分布是嵌套类）}
+# RslRlMLPModelCfg 是 Isaac Lab 的封装(isaaclab_rl.rsl_rl);GaussianDistributionCfg
+# 是它的嵌套类.mjlab 等价物是 RslRlModelCfg + dict 形式的 distribution_cfg(见上).
+from isaaclab_rl.rsl_rl import RslRlMLPModelCfg
+actor = RslRlMLPModelCfg(
+    hidden_dims=[512, 256, 128],   # 三层递减
+    activation="elu",               # ELU 在 locomotion 比 ReLU 更稳
+    actor_obs_normalization=False,
+    distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0),
+)
+\end{codebox}
+
+\textbf{层数}：两层通常不够（四足的非线性需至少三层）；四层通常多余（增参不增表达力）。任务明显更复杂时（如人形全身控制、obs 维度 $>100$）可加到 \Verb[breaklines]|[1024, 512, 256, 128]|。\textbf{宽度}：递减是常见模式，物理直觉是"逐级压缩信息"，类似信号处理的多级滤波；等宽（\verb|[256,256,256]|）差异通常很小。\textbf{激活}：ELU 在负区有非零梯度（$\mathrm{ELU}(x)=\alpha(e^x-1),\ x<0$），比 ReLU 的"死神经元"少。
+
+\textbf{\texttt{init\_std} 的物理含义}：高斯分布的 \verb|init_std=1.0|（mjlab 写在 \Verb[breaklines]|distribution_cfg| dict 里、Isaac Lab 写在 \Verb[breaklines]|RslRlMLPModelCfg.GaussianDistributionCfg| 里）设策略输出高斯的初始标准差。$=1.0$ 意味着训练开始时 raw action 的约 $68\%$（$1\sigma$）落在 $[-1,1]$——合理的探索幅度。太小（如 $0.01$）几乎不探索、易卡初始行为；太大（如 $10$）初始噪声过猛、机器人剧烈抖动甚至 NaN。训练中 action std 会从 \Verb[breaklines]|Loss/mean_noise_std| 看到逐渐下降，反映"探索$\to$利用"的过渡。（旧版统一 API \Verb[breaklines]|RslRlPpoActorCriticCfg| 里同一字段叫 \Verb[breaklines]|init_noise_std|，自 RSL-RL 5.0 起由 \verb|init_std| 取代。）
+
+\subsection{RNN：部分可观测场景}
+
+当 actor 观测不满足马尔可夫性（如缺机体线速度、需从历史推断地面属性），可用 RNN（LSTM/GRU）替代 MLP。
+
+\begin{table}[H]
+\centering
+\caption{RNN(LSTM) vs History-MLP 的工程权衡}
+\label{tab:rlmc-rnn-vs-histmlp}
+\begin{tabular}{lcc}
+\hline
+维度 & RNN(LSTM) & History-MLP \\
+\hline
+理论表达力 & 无限历史 & 固定窗口 \\
+部署复杂度 & 高（维护 hidden state） & 低（无状态） \\
+ONNX 导出 & 复杂（额外 I/O） & 简单 \\
+训练稳定性 & 较差（BPTT 梯度问题） & 较好 \\
+实际效果 & 理论更强 & 实践差异不大 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{insight}[多数 locomotion 任务，History-MLP 优于 RNN]\label{ins:rlmc-histmlp}
+对绝大多数 locomotion 任务，\textbf{推荐用 History-MLP}（\cref{ch:rlmc-obsact} 的 \Verb[breaklines]|history_length| 配置，展平最近 $3$--$5$ 帧）而非 RNN：固定窗口在实践中足以提供时间信息，且\emph{无需部署端维护状态}。只有确需长期记忆（如导航中的路径记忆）才上 RNN。本质区别在部署：MLP 推理是纯函数（obs$\to$action），RNN 推理\emph{有状态}（obs $+$ hidden $\to$ action $+$ new\_hidden）。
+\end{insight}
+
+若必须用 RNN，注意两条工程细节：(1) \textbf{rollout 顺序}——MLP 的 mini-batch 可随机打乱所有 transition，RNN \emph{不能}打乱，必须保持每个 env 内的时间顺序（RSL-RL 在 RNN 模式按 env 切 mini-batch）；(2) \textbf{回合边界}——\verb|done=True| 时 hidden state 要 reset，训练时 storage 自动清零，部署时需在检测到回合重启（如摔倒）时手动 \Verb[breaklines]|reset_hidden()|。
+
+\begin{codebox}[Python]{RNN 部署端的回合边界处理（伪代码）}
+class RNNDeployController:
+    def __init__(self, onnx_path, hidden_size):
+        self.session = ort.InferenceSession(onnx_path)
+        self.hidden_size = hidden_size
+        self.reset_hidden()
+    def reset_hidden(self):
+        self.h = np.zeros((1, 1, self.hidden_size), dtype=np.float32)
+        self.c = np.zeros((1, 1, self.hidden_size), dtype=np.float32)
+    def step(self, obs):
+        out = self.session.run(None,
+            {"obs": obs.reshape(1, -1), "h_in": self.h, "c_in": self.c})
+        self.h, self.c = out[1], out[2]      # 更新 hidden/cell
+        return out[0]
+    def on_fall_detected(self):
+        self.reset_hidden()                  # 摔倒后清零
+\end{codebox}
+
+\subsection{CNN：视觉输入}
+
+当观测含图像（如 depth camera），需 CNN encoder 把图像压成 latent，再与本体感知拼接进 MLP。
+
+\begin{codebox}[text]{视觉策略的数据流与典型 CNN encoder}
+depth_image [64x64] -> CNN encoder -> latent [64D] -> concat 本体感知 -> MLP -> action
+
+# 典型 encoder
+Conv2d(1,32,3,stride=2) -> ELU
+Conv2d(32,64,3,stride=2) -> ELU
+Conv2d(64,64,3,stride=2) -> ELU
+Flatten -> Linear(64*6*6, 64) -> ELU
+\end{codebox}
+
+\subsection{架构选型决策树}
+
+\begin{center}
+\small\textbf{从观测特性到网络类型}\\[3pt]
+\begin{forest} dtree
+[{观测包含图像吗？}
+  [{是 → CNN encoder + MLP\\（部署需 camera pipeline\\+ 含 CNN 的 ONNX）}]
+  [{否 → 观测满足马尔可夫性吗？}
+    [{是 → MLP [512,256,128]\\（默认）:velocity 跟踪 + 接触力}]
+    [{否 → 有 history\_length 配置吗？}
+      [{是 → 展平 history 的 MLP（首选），\\history=3$\sim$5 常够用}]
+      [{否 → RNN（LSTM），\\需部署端维护 hidden state}]
+    ]
+  ]
+]
+\end{forest}
+\end{center}
+
+\subsection{三框架对比实践}
+
+模型配置类随 RSL-RL 版本演进：mjlab/Isaac Lab 同处 RSL-RL 5.x 但\emph{封装类名不同}（mjlab \verb|RslRlModelCfg| / Isaac Lab \Verb[breaklines]|RslRlMLPModelCfg|，见 \cref{sec:rlmc-train-hyperparam} 的实测对照），旧版 Isaac Lab 可能仍是统一 \Verb[breaklines]|RslRlPpoActorCriticCfg|。两框架的 \Verb[breaklines]|RslRl*ModelCfg| 都已带 RNN/CNN 旋钮：mjlab 经 \verb|RslRlModelCfg| 的 \verb|rnn_type|（\verb|"lstm"/"gru"|）、\verb|cnn_cfg| 与 \verb|class_name|（\Verb[breaklines]|"RNNModel"/"CNNModel"|）切换（实测字段）；Isaac Lab 经 \Verb[breaklines]|RslRlMLPModelCfg| 的同名旋钮与 \Verb[breaklines]|RslRlCNNModelCfg|。两框架共用的 RSL-RL ONNX 导出器对\textbf{循环策略}的 hidden-state I/O 是完备的：LSTM 暴露 \verb|h_in|/\allowbreak\verb|c_in|\,$\to$\,\verb|h_out|/\allowbreak\verb|c_out|、GRU 暴露 \verb|h_in|\,$\to$\,\verb|h_out|（导出器按 \verb|rnn_type| 自动决定是否注册 cell-state buffer）。\pz{待核实：非 LSTM/GRU 的循环变体与 CNN/视觉策略的 ONNX 导出完备度仍随版本（Isaac Lab 曾有"导出非 LSTM RNN"的 open issue），以本地版本为准。}\textbf{UniLab 的 PPO 网络}经 \Verb[breaklines]|PPOConfig.policy| 配（\Verb[breaklines]|actor_hidden_dims=[512,256,128], critic_hidden_dims=[512,256,128], activation="elu"|），默认 MLP 与三框架一致；高斯探索 std 由 RSL-RL 模型管理。值得注意的是 UniLab 的\emph{off-policy} 算法另有不同模型旋钮：SAC 默认 \Verb[breaklines]|use_layer_norm=True| 且用\textbf{分布式 critic}（\verb|num_atoms=101|），FlashSAC 用 \Verb[breaklines]|actor_num_blocks=2| 的块状 actor——这些是 PPO/RSL-RL 模型族没有的（PPO 用普通 MLP $+$ 标量价值头）。至于 RNN/CNN：UniLab 当前 $26$ 个注册任务\textbf{全是本体感知 MLP}（无视觉/相机任务），其 RNN/历史接口与 mjlab/Isaac 一样可经 history 展平实现，但没有官方 CNN 视觉策略样例可直接照搬（视觉运动控制在 UniLab 当前任务集中欠缺，见本章无需展开）。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[把网络改大来"修复"训练]
+\textbf{错误描述}：\verb|[512,256,128]| 不收敛就换 \Verb[breaklines]|[1024,512,256,128]|。\textbf{现象后果}：通常仍不收敛，还更慢。\textbf{根本原因}：根因几乎不在网络容量，而在 reward/obs（见调参优先级）。\textbf{正确做法}：先回查环境与奖励，网络放最后。
+\end{pitfall}
+
+\begin{pitfall}[给 actor 上 RNN 却忘了部署端状态管理]
+\textbf{错误描述}：训练用 LSTM，部署沿用 MLP 那套无状态推理。\textbf{现象后果}：部署行为与仿真不符（hidden state 从未更新/从未 reset）。\textbf{根本原因}：RNN 推理有状态（\cref{ins:rlmc-histmlp}）。\textbf{正确做法}：部署端每步维护并在回合重启时 reset hidden/cell。
+\end{pitfall}
+
+\subsection{练习}
+
+\begin{practice}[架构决策与对比]
+\begin{enumerate}
+  \item \textbf{[决策]} 观测含关节角（12D）、机体速度（3D）、重力投影（3D）、命令（3D）、depth（$64\times64$）。用什么架构？depth 怎么处理？\emph{验收}：CNN encoder 压 depth 成 latent，与 $21$D 本体感知拼接进 MLP。
+  \item \textbf{[实验]} 只把 critic 的 \Verb[breaklines]|obs_normalization| 改 \verb|True|（actor 保持 \verb|False|），跑 $\sim200$ iter 比较 value loss。\emph{验收}：能确认这不影响部署用的 actor（actor 输入仍是原始尺度）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{观测归一化}
+\label{sec:rlmc-train-obsnorm}
+
+\emph{这一节解决什么问题}：什么是 running mean/std 归一化？何时需要？它对 ONNX 导出有何影响？
+
+\subsection{模块功能与在管线中的位置}
+
+归一化位于"观测进网络之前"。开启 \Verb[breaklines]|obs_normalization=True| 后，模型内部维护观测的滑动均值与方差，对输入做标准化。它能平衡量纲差异巨大的观测，但会给部署引入"归一化器同步"的负担。
+
+\subsection{running mean/std 机制}
+
+\begin{codebox}[Python]{在线归一化（Welford 算法;RSL-RL 模型内部使用，不参与梯度）}
+class EmpiricalNormalization:
+    def __init__(self, obs_dim, epsilon=1e-8):
+        self.running_mean = torch.zeros(obs_dim)
+        self.running_var  = torch.ones(obs_dim)
+        self.count = torch.tensor(epsilon)            # 防除零
+    def update(self, obs_batch):
+        batch_mean = obs_batch.mean(dim=0)
+        batch_var  = obs_batch.var(dim=0)
+        batch_count = obs_batch.shape[0]
+        delta = batch_mean - self.running_mean
+        total = self.count + batch_count
+        self.running_mean += delta * batch_count / total
+        m_a = self.running_var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.count * batch_count / total
+        self.running_var = M2 / total
+        self.count = total
+    def normalize(self, obs):
+        return (obs - self.running_mean) / (self.running_var.sqrt() + 1e-8)
+\end{codebox}
+
+\textbf{收敛特性}：训练初期 \verb|count| 小，均值/方差不准，前几百 iter 的归一化输出可能不稳定——这也是有些项目初期关闭归一化（或用预收集统计量）的原因。（RSL-RL 内部归一化类名实测确为 \Verb[breaklines]|EmpiricalNormalization|，在 \Verb[breaklines]|rsl_rl.modules| 与 \Verb[breaklines]|rsl_rl.models.mlp_model| 均可见，rsl-rl-lib 5.4.0。）
+
+\begin{table}[H]
+\centering
+\caption{何时用/不用观测归一化}
+\label{tab:rlmc-obsnorm-when}
+\begin{tabular}{p{4.6cm}cp{4.4cm}}
+\hline
+场景 & obs\_normalization & 理由 \\
+\hline
+velocity baseline（已按项缩放） & False & 避免双重归一化、简化部署 \\
+量纲差异巨大（力+角度+height scan） & True & 自动平衡不同量纲 \\
+只给 critic 开 & critic=True, actor=False & 改善价值估计、不影响部署 \\
+部署简单优先 & False & 避免归一化器同步问题 \\
+视觉特征 & True（仅视觉维度） & 像素分布与物理量差异大 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{insight}[只给 critic 开归一化：被低估的技巧]\label{ins:rlmc-critic-norm}
+它\emph{不}影响 actor 的 ONNX 导出（actor 输入保持原始尺度，部署不变），却能让 critic 更好地估计 value——因为 critic 观测常混入量纲差异很大的特权信息（如接触力与角度）。这是"既要价值估得准、又要部署简单"的两全做法（配置见下）。
+\end{insight}
+
+\begin{codebox}[Python]{mjlab:只给 critic 开归一化（用 RslRlModelCfg + dict 分布）}
+actor = RslRlModelCfg(
+    hidden_dims=(512, 256, 128), activation="elu",
+    obs_normalization=False,         # actor 不归一化 -> 部署简单
+    distribution_cfg={"class_name": "GaussianDistribution",
+                      "init_std": 1.0, "std_type": "scalar"},
+)
+critic = RslRlModelCfg(
+    hidden_dims=(512, 256, 128), activation="elu",
+    obs_normalization=True,          # critic 归一化 -> value 估计更准
+)
+\end{codebox}
+
+\subsection{对 ONNX 导出的影响}
+
+若 \Verb[breaklines]|obs_normalization=True| 且作用在 \textbf{actor} 上，归一化层必须随 actor 一起进 ONNX，否则部署端拿到的是"未归一化输入$\to$归一化网络"的错配。
+
+\begin{codebox}[Python]{检查 ONNX 是否含归一化层（Sub/Div 节点）}
+import onnx
+def check_onnx_normalizer(onnx_path):
+    model = onnx.load(onnx_path)
+    has_sub = any("Sub" in n.op_type for n in model.graph.node)
+    has_div = any("Div" in n.op_type for n in model.graph.node)
+    if has_sub and has_div:
+        print("ONNX 内含归一化(Sub+Div) -> 部署端不要再归一化")
+    else:
+        print("ONNX 内可能不含归一化:若 actor 开了 normalization,这是 bug")
+\end{codebox}
+
+\subsection{三框架对比实践}
+
+归一化由 RSL-RL 模型实现，mjlab/Isaac Lab 共用同一机制（\Verb[breaklines]|obs_normalization| 字段）。导出时是否把归一化层写入 ONNX，两框架行为一致（共用 RSL-RL 导出）。\textbf{UniLab 的 PPO 走同一条 RSL-RL 归一化路径}：开 \Verb[breaklines]|empirical_normalization=true| 时归一化层随策略写进 ONNX（与 mjlab 一致，部署端\emph{不}再归一化）。但 UniLab 的异构架构给归一化加了一道独有难题——\textbf{归一化统计量在 CPU collector 与 GPU learner 两个进程里}，必须同步：它为此专门做了 \Verb[breaklines]|SharedObsNormStats|（\Verb[breaklines]|ipc/shared_obs_stats.py|，UniLab），用一个 \verb|Queue| 把 \Verb[breaklines]|(mean, std)| 在进程间传递。这正是 \cref{ins:rlmc-unilab-heterogeneous-train} "凡是跨进程跨设备的量都要显式同步"的又一处体现：mjlab/Isaac 的归一化器只在单进程 GPU 上、无须同步，UniLab 则把它做成了一个 IPC 对象。off-policy（SAC）默认 \Verb[breaklines]|obs_normalization=True| 且叠加 \Verb[breaklines]|use_layer_norm=True|。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[双重归一化]
+\textbf{错误描述}：部署端自己做了一层归一化，而 ONNX 内部也含归一化器。\textbf{现象后果}：输入被归一化两次、行为错乱，但不报错。\textbf{根本原因}：没分清归一化在 ONNX 内还是外。\textbf{正确做法}：用相同输入对比 PyTorch 与 ONNX 输出，并用上面的 \Verb[breaklines]|check_onnx_normalizer| 确认归一化的归属。
+\end{pitfall}
+
+\subsection{练习}
+
+\begin{practice}[归一化归属判断]
+\begin{enumerate}
+  \item \textbf{[实验]} 对一个 \Verb[breaklines]|obs_normalization=True| 的 actor 导出 ONNX，运行 \Verb[breaklines]|check_onnx_normalizer|。\emph{验收}：确认图中存在 Sub/Div；若不存在则定位为导出 bug。
+  \item \textbf{[分析]} 为什么"只给 critic 开归一化"不会破坏部署？\emph{验收}：能用 \cref{ins:rlmc-critic-norm} 说清 actor 输入尺度不变、critic 不参与部署。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{完整训练流程：从 CLI 到 checkpoint}
+\label{sec:rlmc-train-flow}
+
+\emph{这一节解决什么问题}：把前面所有概念串成一条可复现的工程流水线——启动、看日志、回放、恢复、存盘格式。
+
+\subsection{模块功能与在管线中的位置}
+
+这一节是"操作手册"层：给出三框架的端到端命令（含 UniLab 的异构训练 $+$ 多 GPU 命令），以及 \verb|train.py| 内部从 CLI 到 \Verb[breaklines]|runner.learn()| 的执行流。
+
+\subsection{启动、回放与恢复（mjlab）}
+
+\begin{codebox}[bash]{mjlab 端到端:list $\to$ flat $\to$ 日志 $\to$ 回放 $\to$ 恢复 $\to$ rough}
+uv run list-envs                                   # 1) 列任务
+
+uv run train Mjlab-Velocity-Flat-Unitree-G1 \      # 2) flat 训练
+  --env.scene.num-envs 4096 --agent.max-iterations 300 \
+  --agent.logger tensorboard --agent.seed 42
+
+tensorboard --logdir /tmp/mjlab/logs/              # 3) 看日志
+
+uv run play Mjlab-Velocity-Flat-Unitree-G1 \       # 4) 回放
+  --agent.load-run <run_name> --num-envs 4
+
+uv run train Mjlab-Velocity-Flat-Unitree-G1 \      # 5) 从 checkpoint 恢复
+  --env.scene.num-envs 4096 --agent.max-iterations 600 \
+  --agent.resume True --agent.load-run <run_name> \
+  --agent.load-checkpoint model_300.pt
+
+uv run train Mjlab-Velocity-Rough-Unitree-G1 \     # 6) rough 训练
+  --env.scene.num-envs 4096 --agent.max-iterations 1500 \
+  --agent.logger tensorboard
+\end{codebox}
+
+\subsection{启动与恢复（Isaac Lab）}
+
+\begin{codebox}[bash]{Isaac Lab 端到端}
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0 --num_envs 4096 \
+  --max_iterations 300 --seed 42
+
+tensorboard --logdir logs/rsl_rl/
+
+python scripts/reinforcement_learning/rsl_rl/play.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0
+
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Flat-Anymal-C-v0 --num_envs 4096 \
+  --max_iterations 600 --resume --load_run <run_name>
+\end{codebox}
+
+\begin{codebox}[bash]{UniLab 端到端:train $\to$ 日志 $\to$ eval(导 ONNX) $\to$ 恢复 $\to$ 多 GPU}
+# 1) flat 训练(PPO + mujoco 后端);env/迭代走 Hydra 覆盖
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=300
+
+# 2) 看日志(PPO 走 RSL-RL,TensorBoard 字段与 mjlab/Isaac 同名)
+tensorboard --logdir <log_root>/
+
+# 3) 回放 + 导 ONNX(--load-run -1 取最新 run;eval/play 阶段才导)
+uv run eval --algo ppo --task go2_joystick_flat --sim mujoco \
+    --load-run -1 --render-mode record
+
+# 4) 从 checkpoint 恢复(指定 run 目录名续训)
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=4096 algo.max_iterations=600 \
+    --load-run <run_dir_name>
+
+# 5) 异步 APPO(最能体现 CPU collector / GPU learner 解耦)
+uv run train --algo appo --task go2_joystick_flat --sim mujoco \
+    algo.num_envs=2048
+
+# 6) off-policy 多 GPU(每 rank 独立 H2D 管线,不经 rank0 漏斗)
+uv run train --algo sac --task g1_walk_flat --sim mujoco \
+    training.num_gpus=4 training.multi_gpu_sync_mode=local_sgd
+\end{codebox}
+
+\subsection{train.py 内部执行流}
+
+\begin{codebox}[text]{从 CLI 到 runner.learn() 的调用链}
+1. CLI 解析 -> 从 registry 读 env_cfg/agent_cfg -> CLI override 应用到 dataclass
+2. 准备 log 目录 -> 设 CUDA_VISIBLE_DEVICES -> 落盘 params/env.yaml, agent.yaml
+3. 构造 env -> 构造 RslRlVecEnvWrapper(env) -> 取 runner 类(框架特定)
+   -> 构造 runner(wrapper, agent_cfg) -> (resume 则加载 checkpoint)
+   -> runner.learn(max_iterations):  Collection -> Learning -> Logging,
+      并按 save_interval 存 checkpoint
+\end{codebox}
+
+\subsection{checkpoint 格式与恢复验证}
+
+\begin{codebox}[Python]{checkpoint 内容与 mjlab 额外项}
+checkpoint = {
+    "model_state_dict": actor_critic.state_dict(),
+    "optimizer_state_dict": optimizer.state_dict(),   # 恢复训练需要
+    "iter": current_iteration,
+    "obs_norm_mean": obs_normalizer.running_mean,      # 若开了归一化
+    "obs_norm_var":  obs_normalizer.running_var,
+    "obs_norm_count": obs_normalizer.count,
+}
+extras = {"common_step_counter": env.common_step_counter}   # mjlab:curriculum 恢复依赖
+\end{codebox}
+
+\textbf{运行验证看什么}：恢复后应核对三处——iteration 计数对得上、\Verb[breaklines]|common_step_counter| 非零（否则 curriculum 回退）、LR 恢复到之前的值（adaptive 调度的状态延续）。
+
+\subsection{实验管理：seed、W\&B、多 GPU}
+
+\textbf{seed}：RL 对随机 seed 敏感，正确做法是\emph{多 seed 取平均}（至少 3 个、推荐 5 个，报告 mean$\pm$std）。注意 RSL-RL 的 seed 通常只管网络初始化、mini-batch 打乱、动作噪声；\emph{不}管环境内部随机化（terrain 生成、域随机化、命令采样），后者由 env 的 seed 控制——两者都要固定。
+
+\textbf{W\&B}：相比 TensorBoard，W\&B 自动记录超参配置（便于 ablation）、支持 sweep（自动化超参搜索）、便于多机集中式日志。
+
+\begin{codebox}[bash]{mjlab 用 W\&B + 多 GPU（torchrunx）}
+uv run train Mjlab-Velocity-Flat-Unitree-G1 \
+  --agent.logger wandb --agent.wandb-project "go1_velocity"
+
+uv run train Mjlab-Velocity-Rough-Unitree-G1 \
+  --env.scene.num-envs 4096 --agent.max-iterations 1500 \
+  --distributed True --num-gpus 2
+\end{codebox}
+
+\begin{note}
+\textbf{多 GPU 的线性缩放规则}：batch size 翻倍时 LR 原则上也应翻倍。但在 PPO 里 adaptive KL 调度会自动调 LR，\emph{不}需要手动翻倍——让调度自己适应即可。加速效率非线性 $2\times$（实测约 $1.6$--$1.8\times$/2 GPU），原因是 all-reduce 通信开销与"更大 mini-batch 后梯度方差更小"。Isaac Lab 用 \Verb[breaklines]|torchrun --nproc_per_node=N| 启动等价多 GPU 训练。
+\end{note}
+
+\subsection{UniLab 的异构特供：内存预算、NaN 离线复现、流水线 profiling}
+
+UniLab 因把物理留在 CPU、跨进程共享内存，多出三类\textbf{两框架没有}的工程设施，恰好都落在"大规模训练与诊断"这条线上——值得作为本章 UniLab 侧的进阶补充。
+
+\textbf{(1) 共享内存预算守卫（独有失败面）。}GPU-sim 框架的并行度受\emph{显存}限制；UniLab 的并行度还受 \verb|/dev/shm| 限制——大 replay buffer / ring buffer 直接占共享内存。它在分配前用 \Verb[breaklines]|estimate_offpolicy_bytes| / \Verb[breaklines]|estimate_appo_bytes|（\Verb[breaklines]|ipc/memory_budget.py|，UniLab）估字节数，超 \verb|/dev/shm| 的 $80\%$ 直接抛 \verb|MemoryError| 并提示"减小 \verb|algo.num_envs| 或 \Verb[breaklines]|algo.replay_buffer_n|，或加大 \verb|/dev/shm|"（\Verb[breaklines]|UNILAB_SKIP_MEMORY_CHECK=1| 可关）。这是 \cref{sec:rlmc-train-dataflow} 里"OOM 优先减半 \verb|num_envs|"那条经验在 UniLab 的对应物，只是瓶颈从 GPU 显存换成了 CPU 共享内存。
+
+\textbf{(2) NaN 守卫 $+$ 离线复现。}本章 \cref{sec:rlmc-train-diag} 给的 \Verb[breaklines]|diagnose_nan_chain| 是手搓 \verb|torch.isnan| 逐步检测；UniLab（与 mjlab 一样）把它做成了\emph{内建工具链}：\verb|NpEnv| 内嵌 \verb|NanGuard|（\Verb[breaklines]|utils/nan_guard.py|，UniLab），\verb|step()| 里 \verb|check_ctrl| 查动作 NaN、\verb|check| 查 obs/reward NaN，并\emph{环缓存最近若干帧物理快照}；命中即 \verb|dump| 成 \verb|.npz|（含快照 $+$ 复制的 \verb|model_file|），事后 \Verb[breaklines]|unilab-viz-nan <dump>| 用 \verb|mujoco.viewer| \textbf{回放出事前那几帧}来复现。默认开（\Verb[breaklines]|training.nan_guard.enabled=true|）。这把"loss 变 NaN 但难定位"从在线打印升级为可\emph{离线重演}的事故现场。
+
+\begin{codebox}[bash]{UniLab:NaN 守卫 dump + 离线复现（对照本章手搓诊断脚本）}
+uv run train --algo ppo --task go2_joystick_flat --sim mujoco \
+    training.nan_guard.enabled=true training.nan_guard.output_dir=/tmp/nan
+unilab-viz-nan /tmp/nan/<dump>     # 用 mujoco.viewer 回放出事前几帧,复现 NaN
+\end{codebox}
+
+\textbf{(3) 流水线 profiling。}由于 collector/learner/H2D 三段在不同进程/设备并发，UniLab 提供 chrome-trace 风格的时间片记录（\Verb[breaklines]|training.trace_enabled=true|，off-policy 路径；\verb|TraceRecorder| 在 \Verb[breaklines]|logging/trace_event.py|，UniLab），产 \Verb[breaklines]|perfetto_*.json| 可视化 \verb|weight_sync/*|、\verb|replay/*|、\Verb[breaklines]|replay_pipeline/*| 的重叠——回答"训练慢是 GPU 算得慢，还是 CPU 喂不上/H2D 拖后腿"。这是 \cref{ins:rlmc-unilab-heterogeneous-train} 那条"多了一道显式数据搬运"必然带来的诊断需求：mjlab/Isaac 无此边界、故无此 profiling 维度。
+
+\begin{insight}[异构架构把"训练健康"从一维扩成两维]\label{ins:rlmc-unilab-two-axes}
+在 mjlab/Isaac 上，训练健康基本是\emph{一维}的——看 \verb|Loss/*| 与回放即可（数据在 GPU、无流水线）。在 UniLab 上它是\emph{两维}的：除了"策略学得好不好"（\verb|Loss/*|、KL、entropy），还要看"流水线堵不堵"（\Verb[breaklines]|Weight Sync| / \Verb[breaklines]|H2D Copy| / 共享内存预算 / collector 是否静默死亡）。后者是 GPU-sim 范式根本不存在的失败面。理解这一点，才算真正读懂了"异构 CPU-sim$\leftrightarrow$GPU-policy"这条第三范式的工程代价与收益。
+\end{insight}
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[恢复训练时忘了恢复 curriculum 状态]
+\textbf{错误描述}：自定义 runner 存 checkpoint 时漏掉 \Verb[breaklines]|common_step_counter|。\textbf{现象后果}：恢复后 step-driven curriculum 从 stage 0 重来，难度骤降、策略"退化"。\textbf{根本原因}：curriculum 进度未持久化。\textbf{正确做法}：用框架提供的 runner 子类（已处理），或手动保存该计数（见上面 extras）。
+\end{pitfall}
+
+\subsection{练习}
+
+\begin{practice}[端到端流程]
+\begin{enumerate}
+  \item \textbf{[实验]} 在你的框架里完整跑通 list$\to$train(flat,300 iter)$\to$tensorboard$\to$play$\to$resume。\emph{验收}：记录 wall-clock、最终 tracking reward、steps/s；恢复后 iteration 与 \Verb[breaklines]|common_step_counter| 正确。
+  \item \textbf{[编程]} 写脚本：训练后从最新 checkpoint 导出 ONNX 并跑一致性验证（复用 \cref{sec:rlmc-train-onnx} 的 \Verb[breaklines]|export_and_verify|）。\emph{验收}：打印 max diff $<10^{-5}$。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{训练诊断与 TensorBoard 解读}
+\label{sec:rlmc-train-diag}
+
+\emph{这一节解决什么问题}：怎样从日志判断训练是否健康？常见失败模式如何诊断？
+
+\subsection{模块功能与在管线中的位置}
+
+诊断贯穿整个训练过程。核心方法论是\textbf{多指标联合阅读}——单看一条曲线会被骗。
+
+\subsection{TensorBoard 字段速查}
+
+\begin{codebox}[text]{PPO 核心指标与环境指标}
+# PPO 核心
+Loss/mean_reward          # 平均 episode reward
+Loss/mean_surrogate_loss  # actor loss(稳定下降或小幅波动)
+Loss/mean_value_loss      # critic loss(应稳定下降)
+Loss/mean_entropy         # 策略熵(缓降,不应骤降)
+Loss/mean_kl              # KL(在 desired_kl 附近波动)
+Loss/learning_rate        # 当前 LR(adaptive 输出)
+Loss/mean_noise_std       # action 高斯 std(从 init_std 缓降)
+# 环境(来自 Reward/Termination/Curriculum manager)
+Episode_Reward/*  Episode_Termination/*  Curriculum/*  Metrics/*
+\end{codebox}
+
+\begin{note}[第一屏长什么样、哪些数算正常：从零判断"起没起来"]
+新手跑完 Quick Start 第一条命令，最该先回答的不是"reward 多高"，而是"它\emph{起来}了吗"。RSL-RL 每迭代会在\textbf{终端}打印一段摘要（与上面 TensorBoard 的 \verb|Loss/*| 是\emph{同一批量}、但终端是\emph{人读字段名}，二者字面不同——别拿 TensorBoard 的 \verb|mean_kl| 去终端找）。本章实测 mjlab \Verb[breaklines]|train Go1 ... --agent.max-iterations 2| 第一屏的关键行与判读：
+\begin{codebox}[text]{mjlab 终端首屏摘要（实测字段名）与逐行判读}
+Mean reward:          -0.63      # 起步常为负(惩罚先到);只要后续迭代在动就正常
+Mean value loss:      <数>        # critic 损失,应随迭代下降
+Mean surrogate loss:  <数>        # actor(clipped)损失,小幅波动正常
+Mean entropy loss:    <数>        # 熵项;对应探索,前期高后期缓降
+Mean action std:      1.00        # 高斯探索 std=init_std(mjlab/Isaac 默认 1.0)
+Steps per second:     ~1067       # 吞吐(64 env 冷启;判读见 Quick Start 锚点表)
+Collection time / Learning time:  # 采集 vs 学习耗时占比(诊断瓶颈用)
+Episode_Reward/* Curriculum/* Metrics/* Episode_Termination/{time_out,fell_over}
+\end{codebox}
+\textbf{"起来了"的最小判据}：上述字段\emph{齐全}、数值\emph{每迭代在变}、且\textbf{无 \texttt{NaN}}——即代表环境/网络/数据流贯通，可以放心拉大 \verb|num_envs| 和迭代数。\textbf{两点关于 KL 的提醒}（最容易扑空）：(1) mjlab 的\textbf{终端每迭代摘要里\emph{不打印} \texttt{kl}/\allowbreak\texttt{entropy} 数值}，要看 KL 须开 TensorBoard/WandB 读 \verb|Loss/mean_kl|；自适应调度仍在内部按 \verb|desired_kl| 调 LR（\cref{sec:rlmc-train-adaptkl}），只是不在终端露出。(2) 框架间\textbf{终端字段名不一定字面相同}（如 UniLab 实测首屏 \Verb[breaklines]|Mean action std=0.50|——它的默认探索 std 比 mjlab/Isaac 的 \verb|1.0| 小、起步更偏利用），所以\textbf{认\emph{语义}而非记\emph{字面}}：采集时间/学习时间/各 loss/reward/std 各对应什么，比记住某个框架的拼写更重要。
+\end{note}
+
+\subsection{指标联合阅读法（本质方法）}
+
+\begin{insight}[一条 reward 曲线上升，不代表策略变好]\label{ins:rlmc-joint-read}
+最常见的自欺是"reward 涨了就以为成功"。但策略可能学会了\emph{站着不动}：回合变长 $\to$ reward 累积增加，可运动能力\emph{没有}提升。正确诊断必须同时看 reward $+$ KL $+$ entropy $+$ value\_loss $+$ termination $+$ 回放视频。\cref{tab:rlmc-joint-read} 给出常见组合的正常与异常模式。
+\end{insight}
+
+\begin{table}[H]
+\centering
+\caption{指标组合的正常模式与异常信号}
+\label{tab:rlmc-joint-read}
+\begin{tabular}{p{3.4cm}p{2.8cm}p{2.8cm}p{2.4cm}}
+\hline
+指标组合 & 正常模式 & 异常信号 & 可能原因 \\
+\hline
+reward$\uparrow$ + ep\_len$\uparrow$ & 学会避免摔倒 & ep\_len$\uparrow$ 但 tracking$\downarrow$ & 学会站着不动 \\
+reward$\uparrow$ + KL 平稳 & 更新可控 & KL 尖峰后 reward$\downarrow$ & 单次更新过猛 \\
+entropy 缓降 + reward$\uparrow$ & 探索$\to$利用 & entropy 骤降 + reward 平台 & 过早收敛 \\
+value\_loss$\downarrow$ + reward$\uparrow$ & critic 渐准 & value\_loss$\uparrow$ + reward$\uparrow$ & critic 跟不上 \\
+action\_rate 平稳 + tracking$\uparrow$ & 平滑且准 & action\_rate 低但 tracking 差 & action scale 太小 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{常见失败模式与诊断脚本}
+
+\textbf{失败模式一：收敛到站立不动。}症状：total reward 升但 tracking reward 近零；根因：penalty 总量压过 tracking，或 action scale 太小；修复：增大 tracking 权重或减小 penalty 权重（奖励章）。
+
+\begin{codebox}[Python]{诊断站立不动（测平均机体速度）}
+def diagnose_standing_still(env, runner, num_steps=200):
+    policy = runner.get_inference_policy()
+    obs = env.reset()["actor"]
+    speeds = []
+    for _ in range(num_steps):
+        with torch.no_grad():
+            actions = policy(obs)
+        obs_dict, *_ = env.step(actions)
+        obs = obs_dict["actor"]
+        v = env.scene.robot.data.root_lin_vel_b[:, :2]
+        speeds.append(v.norm(dim=1).mean().item())
+    avg = sum(speeds) / len(speeds)
+    print(f"平均机体速度: {avg:.3f} m/s")
+    if avg < 0.1:
+        print("策略疑似站立不动:查 tracking 权重/penalty 总量/action scale/command 是否在 obs")
+\end{codebox}
+
+\textbf{失败模式二：KL 爆炸后崩溃。}症状：\verb|mean_kl| 长期 $>0.1$、LR 降到下限；根因：reward 尺度突变（curriculum 切换）、obs 含 NaN、初始 LR 太高；修复：延后 curriculum stage 或减小初始 LR。
+
+\textbf{失败模式三：NaN 传播链。}症状：loss 变 NaN；诊断链：obs NaN $\to$ 网络输出 NaN $\to$ loss NaN。
+
+\begin{codebox}[Python]{NaN 传播链定位（逐步检测）}
+def diagnose_nan_chain(env, runner, max_steps=1000):
+    policy = runner.get_inference_policy()
+    obs = env.reset()["actor"]
+    for step in range(max_steps):
+        if torch.isnan(obs).any():
+            print(f"step {step}: obs 出现 NaN"); return "obs_nan", step
+        with torch.no_grad():
+            actions = policy(obs)
+        if torch.isnan(actions).any():
+            print(f"step {step}: action(网络输出) NaN"); return "action_nan", step
+        obs_dict, rewards, *_ = env.step(actions)
+        obs = obs_dict["actor"]
+        if torch.isnan(rewards).any():
+            print(f"step {step}: reward NaN"); return "reward_nan", step
+    print("未检测到 NaN"); return None, max_steps
+\end{codebox}
+
+\textbf{失败模式四：critic 持续高 loss。}多因 critic 缺特权观测——打印 actor/critic 维度差即可定位（与 \cref{sec:rlmc-train-wrapper} 的 \verb|obs_groups| 陷阱同源）。\textbf{失败模式五：初期 reward 剧烈震荡。}根因通常不在 PPO 参数，而在 reward 设计（如 tracking 与 penalty 量级太近、交替主导优势方向）。
+
+\subsection{三框架对比实践}
+
+TensorBoard 字段名由 RSL-RL 写入，mjlab/Isaac Lab \emph{一致}（\verb|Loss/*|、\Verb[breaklines]|Episode_Reward/*| 等）。环境侧指标（\verb|Metrics/*|、\verb|Curriculum/*|）取决于各框架 manager 的实现，命名可能略有差异。\textbf{UniLab 的 PPO 日志因复用 RSL-RL，} \verb|Loss/*| \textbf{等核心字段同名}；reward 分项由其派发表写成 \verb|reward/<name>|（如 \Verb[breaklines]|reward/tracking_lin_vel|，每若干步聚合一次，实测出现）。UniLab 独有的是\textbf{异构架构的运行仪表盘}：APPO/off-policy 训练时控制台会打印 \Verb[breaklines]|Weight Sync|、\Verb[breaklines]|H2D Copy|、\Verb[breaklines]|Rollouts Read|、\Verb[breaklines]|Staging Pool|、\Verb[breaklines]|Vtrace/Rho Clip Fraction| 等面板（实测），分别对应 \cref{ins:rlmc-unilab-heterogeneous-train} 里的权重同步、CPU$\to$GPU 拷贝、ring buffer 读、双缓冲暂存与 V-trace 裁剪比例——这些是"数据本就在 GPU"的 mjlab/Isaac \emph{没有}的诊断维度。换言之，UniLab 比两框架多一类要监控的健康信号：不仅看策略学得好不好（\verb|Loss/*|），还要看\emph{流水线有没有堵}（collector 跟不上 learner？H2D 拖慢？）。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[把"reward 曲线高"等同于"行为好"]
+\textbf{错误描述}：只凭 reward 曲线下结论。\textbf{现象后果}：放过了 reward hacking（奖励章）——PPO 会忠实利用 reward 函数的任何漏洞。\textbf{根本原因}：reward 是\emph{代理}目标，不是真目标。\textbf{正确做法}：reward 高时务必看回放视频与 tracking/termination 分项。
+\end{pitfall}
+
+\subsection{练习}
+
+\begin{practice}[诊断与监控]
+\begin{enumerate}
+  \item \textbf{[诊断]} 训练 500 iter 后 total reward 高（$38.0$），但回放里机器人\emph{跳跃}前进而非正常走；\Verb[breaklines]|Episode_Reward/track_linear_velocity|$=0.85$（高），\Verb[breaklines]|undesired_contact|$=-0.01$（低）。问题在哪、该调什么？\emph{验收}：识别为"跳跃也能拿高 tracking 而几乎不触发接触惩罚"$\to$ 加大步态/接触相关惩罚或 action\_rate（奖励章），属 reward 设计而非 PPO 参数。
+  \item \textbf{[编程]} 写一个每 50 iter 自动检查 (a) KL 是否超 $3\times$\verb|desired_kl| (b) reward 是否 NaN (c) actor 与 critic obs 维度的训练 callback，打印告警。\emph{验收}：callback 能在异常时打印对应提示。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{算法选型：PPO vs SAC 及其他}
+\label{sec:rlmc-train-ppo-sac}
+
+\emph{这一节解决什么问题}：什么时候 PPO 是对的？什么时候该考虑 SAC、PPO-Lagrangian 或 Diffusion Policy？
+
+\subsection{模块功能与在管线中的位置}
+
+算法选择决定了整条训练管线的"产线形态"。本节把选择标准落到\emph{任务特征}上，而非"哪个更先进"。
+
+\subsection{PPO vs SAC 决策框架}
+
+\begin{table}[H]
+\centering
+\caption{PPO 与 SAC 的工程取向对比}
+\label{tab:rlmc-ppo-sac}
+\begin{tabular}{lcc}
+\hline
+维度 & PPO & SAC \\
+\hline
+算法类型 & on-policy & off-policy \\
+数据复用 & 差（用完即弃） & 好（replay buffer） \\
+GPU 并行利用 & 极好（$4096+$ envs） & 中等（replay 采样瓶颈） \\
+调参难度 & 低（经典参数通用） & 中（alpha、buffer size） \\
+典型训练时间 & $10$--$60$ min（大并行+GPU） & 数小时（受 buffer 限） \\
+适合场景 & locomotion、大规模并行 & manipulation、有限并行 \\
+社区支持 & 极好（RSL-RL 生态） & 好（SB3、RL Games） \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{核心工程差异}：PPO 靠大量并行环境弥补数据浪费（$4096+$ envs 是 locomotion 标准），SAC 靠大容量 replay buffer 存历史（常 $10^6$ 量级）。在 GPU 并行仿真下，PPO 的"高速产线+JIT"（\cref{ins:rlmc-onpolicy-jit}）通常比 SAC 的"仓储+按需取用"更高效。SAC 的理论与最大熵框架见原论文 \cite{haarnoja2018sac}。
+
+\begin{insight}[选算法不是选"更好"，是选"假设最匹配任务"]\label{ins:rlmc-algo-match}
+PPO 假设\emph{可以大量并行采样}；SAC 假设\emph{可以高效复用历史数据}；Diffusion Policy 假设\emph{动作分布是多模态的}。选错算法不是"不能用"，而是"需要更多调参来弥补假设不匹配"。这把"算法选择"从玄学变成了对任务特征的判断题。
+\end{insight}
+
+\subsection{何时考虑 SAC，及接入要点}
+
+何时考虑 SAC：(1) \textbf{有限并行}（$<100$ envs，如高保真仿真或真机 fine-tuning），PPO 的 batch 太小；(2) \textbf{manipulation}，接触动力学需更精细探索，SAC 的熵正则天然鼓励多模态探索；(3) \textbf{连续学习}（如 sim-to-real fine-tuning），replay buffer 可保留旧经验。
+
+\begin{codebox}[Python]{把 mjlab env 适配为 SAC 兼容接口的要点（伪代码）}
+class SACCompatWrapper:
+    def __init__(self, mjlab_env):
+        self.env = mjlab_env
+        # SAC 不区分 actor/critic obs,通常用 actor obs(部署可得信号)
+        self.observation_space = gym.spaces.Box(-np.inf, np.inf, (actor_obs_dim,))
+        self.action_space = gym.spaces.Box(-1.0, 1.0, (action_dim,))
+        # replay buffer 吃显存:仅 obs 约 1e6 * 48 * 4B ~ 192 MB,整 buffer 常数百 MB~数 GB
+    def step(self, action):
+        obs_dict, reward, terminated, truncated, extras = self.env.step(action)
+        done = terminated                # 关键:只有真实终止才是 done
+        info = {"TimeLimit.truncated": truncated.cpu().numpy()}
+        return obs_dict["actor"].cpu().numpy(), reward.cpu().numpy(), \
+               done.cpu().numpy(), truncated.cpu().numpy(), info
+\end{codebox}
+
+\begin{pitfall}[切换到 SAC 时搞错 done 语义]
+\textbf{错误描述}：沿用 PPO 的 \verb@dones=(terminated | truncated)@。\textbf{现象后果}：SAC 的 Q-target 把"时间截断"也当真实终止 $\to$ 系统性低估长时域价值。\textbf{根本原因}：Q-learning 的 target 需精确区分 terminal/non-terminal；SAC 只在\emph{真实终止}设 \verb|done=True|，truncation 走 info dict。\textbf{正确做法}：见上面 wrapper——这是切换算法时最易出错处。
+\end{pitfall}
+
+\subsection{其他算法简述}
+
+\textbf{PPO-Lagrangian / 约束 RL}：任务有硬安全约束（如关节力矩、底盘倾角上限）时，标准 PPO 只能用 penalty reward 间接处理；PPO-Lagrangian 引入拉格朗日乘子直接优化约束，乘子自动调节 penalty 权重，省去手动调。\textbf{Diffusion Policy}：manipulation 的动作分布常多模态（"从左抓"与"从右抓"都有效），高斯策略（PPO/SAC）只能单模态，Diffusion Policy 经去噪过程生成动作、天然多模态——但推理需多步去噪，延迟是部署瓶颈，对需 $50\,$Hz 实时控制的 locomotion 通常不可接受。
+
+\subsection{三框架对比实践}
+
+mjlab/Isaac Lab 的一等公民都是 PPO（RSL-RL）；接 SAC 通常要外接 SB3 或 RL Games 并自写 \cref{tab:rlmc-ppo-sac} 所述适配层。\textbf{UniLab 在这一点上与两框架根本不同}：on-policy 与 off-policy 算法\emph{并列}都是一等公民，经 \verb|--algo| 一键切换——\verb|ppo|/\allowbreak\verb|appo|（异步 PPO）/\verb|sac|/\allowbreak\verb|td3|/\allowbreak\verb|flashsac|（外加 macOS 的 \verb|mlx_ppo| 与脚本级 HORA、HIM-PPO）。这正是 \cref{ins:rlmc-onpolicy-jit} "JIT vs 仓储"权衡在 UniLab 里被\emph{架构层面}支持的体现：它的共享内存 IPC 对 on-policy 用 \Verb[breaklines]|RolloutRingBuffer|、对 off-policy 用 \verb|ReplayBuffer|$+$\Verb[breaklines]|ReplayPipeline|，两套缓冲都是原生设施，所以"PPO 不够就换 SAC"在 UniLab 是改一个 flag、而非外接一个库。\cref{tab:rlmc-ppo-sac} 里 SAC 的"replay 采样瓶颈"在 UniLab 被 pinned-host 双缓冲 H2D 流水线缓解（\cref{ins:rlmc-unilab-heterogeneous-train}），其 SAC 默认 \Verb[breaklines]|num_envs=4096, replay_buffer_n=512, updates_per_step=4, gamma=0.97|（注意 SAC 的 $\gamma$ 比 PPO 的 $0.99$ 略小）。对应到本节的选型逻辑：在 UniLab 上，"有限并行$\to$SAC、大并行$\to$PPO"的判据依旧成立，只是切换成本被压到了最低。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[把"样本效率高"等同于"训练更快"]
+\textbf{错误描述}：因 SAC 样本效率高就断言它更快。\textbf{现象后果}：在 GPU 并行场景下结论反了。\textbf{根本原因}：样本效率衡量"用了多少样本"，wall-clock 衡量"花了多少时间"；PPO 样本效率低但每秒产样极多，总时间可能更短。\textbf{正确做法}：以 wall-clock 或等量 env transitions 作公平基准。
+\end{pitfall}
+
+\subsection{练习}
+
+\begin{practice}[选型分析]
+\begin{enumerate}
+  \item \textbf{[计算]} GPU 每秒产 $2\times10^6$ transitions。PPO 每次更新用 $98304$（耗时 $0.1\,$s），SAC 每次更新用 $256$（更新 $0.01\,$s，buffer 更新另 $0.05\,$s）。一小时各做多少次更新？\emph{验收}：能给出量级估计并说明"更新次数多$\ne$训练更快"。
+  \item \textbf{[设计]} 把 SAC 接入 velocity 任务，wrapper 需改哪些（replay 接口、dones 语义、obs 路由）？\emph{验收}：覆盖三点，尤其 dones 语义。
+  \item \textbf{[分析]} PPO-Lagrangian 与"在 reward 里直接加 penalty"有何区别？何时 Lagrangian 更好？\emph{验收}：能说出"乘子自动调 vs 手动调 penalty 权重"。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{ONNX 导出与部署接口}
+\label{sec:rlmc-train-onnx}
+
+\emph{这一节解决什么问题}：ONNX 导出包含什么、不包含什么？部署端必须额外复现哪些逻辑？
+
+\subsection{模块功能与在管线中的位置}
+
+ONNX 导出是训练与真机部署之间的"交接口"。理解它的\emph{边界}（哪些在图内、哪些在图外）是避免"仿真完美、真机失效"的关键。
+
+\subsection{导出流程与一致性验证}
+
+\begin{codebox}[Python]{导出 ONNX 并验证一致性（核心脚本）}
+import torch, onnx, onnxruntime as ort, numpy as np, os
+def export_and_verify(runner, obs_dim, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    actor = runner.alg.actor; actor.eval()                 # 必须 eval()
+    onnx_path = os.path.join(output_dir, "policy.onnx")
+    dummy = torch.randn(1, obs_dim, device=next(actor.parameters()).device)
+    torch.onnx.export(actor, dummy, onnx_path, opset_version=11,
+        input_names=["obs"], output_names=["actions"],
+        dynamic_axes={"obs": {0: "batch"}, "actions": {0: "batch"}})
+    session = ort.InferenceSession(onnx_path)
+    name = session.get_inputs()[0].name
+    max_diff = 0.0
+    for _ in range(20):
+        t = torch.randn(1, obs_dim, device=dummy.device)
+        with torch.no_grad():
+            pt = actor(t).cpu().numpy()
+        on = session.run(None, {name: t.cpu().numpy()})[0]
+        max_diff = max(max_diff, float(np.abs(pt - on).max()))
+    print(f"ONNX 一致性 max diff = {max_diff:.2e} -> {'PASS' if max_diff < 1e-5 else 'FAIL'}")
+    return max_diff < 1e-5
+\end{codebox}
+
+\subsection{ONNX 的边界（核心表）}
+
+\begin{table}[H]
+\centering
+\caption{部署逻辑在 ONNX 内部还是外部}
+\label{tab:rlmc-onnx-boundary}
+\begin{tabular}{lcc}
+\hline
+组件 & 在 ONNX 内 & 在 ONNX 外（部署端复现） \\
+\hline
+Actor MLP 权重 & 是 & \\
+观测归一化器（若开） & 是 & \\
+action scale / offset & & 是 \\
+action clip（关节限位） & & 是 \\
+观测拼接顺序 & & 是 \\
+观测噪声 & & 不适用（部署不加噪声） \\
+critic 网络 & & 不适用（部署不需要） \\
+RNN hidden state & 是（若用 RNN） & 是（部署端维护） \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{部署端必须复现的四件事}：(1) 按正确顺序拼接观测（\cref{ch:rlmc-obsact} 的部署边界）——顺序错不报错但行为全错；(2) raw action 乘 scale 加 offset（\Verb[breaklines]|raw*scale + default_joint_pos|）；(3) 对 processed action 做关节限位 clip；(4) 按正确控制频率调用（policy dt $=$ physics\_dt $\times$ decimation；训练 $50\,$Hz 则部署也 $50\,$Hz）。
+
+\begin{codebox}[Python]{部署端推理循环（伪代码,展示 ONNX 外的四步后处理)}
+class DeploymentController:
+    def get_observation(self, st):
+        # 严格按 ch:rlmc-obsact 的顺序拼接!不含 base_lin_vel(部署不可得)
+        return np.concatenate([
+            st.imu_angular_velocity, st.projected_gravity,
+            st.joint_positions - self.default_joint_pos, st.joint_velocities,
+            self.last_action, self.current_command,
+        ]).reshape(1, -1).astype(np.float32)
+    def step(self, st):
+        obs = self.get_observation(st)
+        raw = self.session.run(None, {self.input_name: obs})[0][0]   # ONNX 内
+        proc = raw * self.action_scale + self.default_joint_pos        # ONNX 外:scale/offset
+        proc = np.clip(proc, self.joint_lower, self.joint_upper)       # ONNX 外:clip
+        self.last_action = raw                                          # 维护 last_action
+        return proc
+\end{codebox}
+
+\subsection{推理延迟参考}
+
+\begin{table}[H]
+\centering
+\caption{典型推理延迟（\rebuilt{数量级参考，随硬件/驱动/运行时（ONNX Runtime vs TensorRT）波动；请以本地基准为准}）}
+\label{tab:rlmc-onnx-latency}
+\begin{tabular}{lccc}
+\hline
+模型 & obs\_dim & 硬件 & 推理延迟 \\
+\hline
+MLP [512,256,128] & 48 & Jetson Orin NX & $\sim0.2$ ms \\
+MLP [512,256,128] & 48 & RTX 4090 & $\sim0.05$ ms \\
+LSTM + MLP & 48+hidden & Jetson Orin NX & $\sim0.5$ ms \\
+CNN + MLP & 48+$64{\times}64$ & Jetson Orin NX & $\sim2.0$ ms \\
+\hline
+\end{tabular}
+\end{table}
+
+$50\,$Hz 控制要求每步推理 $<20\,$ms——MLP 与 LSTM 都远在安全范围内；CNN 在低端硬件可能成瓶颈，需 TensorRT 量化等优化。
+
+\subsection{三框架对比实践}
+
+mjlab 与 Isaac Lab \emph{共用} RSL-RL 的 ONNX 导出，因此导出行为与"归一化是否进图"一致；差异主要在部署侧的 SDK 与 joint ordering（见 \cref{sec:rlmc-train-deploy}）。\textbf{UniLab 同样导出可部署 ONNX，并内置 \texttt{onnxruntime} 自验}（各算法都导 \verb|policy.onnx|：PPO 经 \Verb[breaklines]|export_policy_to_onnx|、APPO 用 \Verb[breaklines]|_DeterministicAPPOActor| 包住 actor 后 \Verb[breaklines]|torch.onnx.export| 再起 \Verb[breaklines]|InferenceSession| 比对 max/mean diff 并打印 "ONNX export verified OK"、off-policy 经 \Verb[breaklines]|actor.as_export_module()|），归一化层在 \Verb[breaklines]|empirical_normalization=true| 时随策略写进图——这些与 \cref{sec:rlmc-train-onnx} 的 \Verb[breaklines]|export_and_verify| 思路完全一致。\textbf{一个必须记住的时机差异}：与 mjlab"训练后自动导"不同，UniLab 的 PPO 在 \emph{play/eval 阶段}才导（故 \Verb[breaklines]|training.no_play=true| 的冒烟跑\textbf{不会}产 ONNX，实测证实），off-policy 则由 \Verb[breaklines]|training.export_onnx|（默认开）在训练流程内导。反过来，UniLab 的\emph{部署工具链比 mjlab 更完整}：\Verb[breaklines]|scripts/deploy/| 下有 \Verb[breaklines]|export_deploy_config.py|（导 \Verb[breaklines]|deploy_config.yaml|，显式记录 obs 装配顺序/\verb|action_scale|/\allowbreak\Verb[breaklines]|default_angles|/joint ordering）、\Verb[breaklines]|sim_prototype.py|（用 ONNX 策略在 MuJoCo 逐段校验"部署侧 obs 装配 $==$ 训练侧"——这正是 \cref{tab:rlmc-onnx-boundary} 强调的"观测拼接顺序在图外、必须部署端复现"的自动化关卡）、以及动作跟踪用的 \Verb[breaklines]|export_motion_bin.py|。也就是说，本章反复强调的"ONNX 外四件事"（拼接顺序、scale/offset、关节限位、控制频率），UniLab 把其中最易错的"拼接顺序"做成了可机器校验的 \Verb[breaklines]|deploy_config.yaml| $+$ \verb|sim_prototype| 闭环。
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[导出时网络处于 training mode]
+\textbf{错误描述}：忘了 \verb|model.eval()| 就 \Verb[breaklines]|torch.onnx.export|。\textbf{现象后果}：含 BatchNorm/Dropout 的网络在 train/eval 行为不同，ONNX 与 PyTorch 输出不一致。\textbf{根本原因}：模式影响这些层。\textbf{正确做法}：导出前必 \verb|eval()|；框架的导出函数通常已处理，自定义导出要自己加。
+\end{pitfall}
+
+\subsection{练习}
+
+\begin{practice}[导出与边界]
+\begin{enumerate}
+  \item \textbf{[实验]} 训练 flat 到 $300$ iter，导出 ONNX 并跑一致性验证，记录 max diff。\emph{验收}：max diff $<10^{-5}$。
+  \item \textbf{[设计]} 若 actor 用 LSTM，ONNX 的输入/输出该含什么？部署端如何处理 hidden state？\emph{验收}：输入含 obs+h+c、输出含 action+h'+c'；部署端每步更新、回合重启时 reset。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{跨框架部署与源码阅读路线}
+\label{sec:rlmc-train-deploy}
+
+\emph{这一节解决什么问题}：同一机器人在两框架间的配置对齐、部署时的头号陷阱（joint ordering），以及深入源码的路线。
+
+\subsection{两框架部署管线几乎相同}
+
+以 Unitree 的两个参考仓库为例（\Verb[breaklines]|unitree_rl_lab| 走 Isaac Lab，\Verb[breaklines]|unitree_rl_mjlab| 走 mjlab），二者部署管线几乎完全一致：ONNX 推理 $+$ Unitree SDK2 $+$ FSM（有限状态机）。差异主要在\emph{训练阶段}的 env 配置与 reward 调优——因为物理引擎不同（PhysX vs MuJoCo Warp），foot\_slip、contact 相关项的最优权重、以及 action scale 可能需要分别微调；terrain 的离散化精度也不同。
+
+\begin{pitfall}[joint ordering mismatch：跨框架部署头号陷阱]
+\textbf{错误描述}：从一个框架训练的 ONNX 直接拿到另一个框架/真机部署，未核对关节顺序。\textbf{现象后果}：训练时 \verb|action[0]| 对应 FL\_hip，部署时若对应 FR\_hip，则\emph{所有}关节目标错位，机器人乱动——但程序不报错。\textbf{根本原因}：MJCF 与 USD 的关节解析顺序可能不同。\textbf{正确做法}：打印两侧 \Verb[breaklines]|action[i] -> joint_name| 映射逐一比对；Go1 标准 $12$ 关节顺序为 FL/FR/RL/RR 各 (hip, thigh, calf)。
+\end{pitfall}
+
+\begin{codebox}[Python]{打印并核对 joint ordering}
+GO1_JOINT_ORDER = [
+    "FL_hip_joint","FL_thigh_joint","FL_calf_joint",
+    "FR_hip_joint","FR_thigh_joint","FR_calf_joint",
+    "RL_hip_joint","RL_thigh_joint","RL_calf_joint",
+    "RR_hip_joint","RR_thigh_joint","RR_calf_joint",
+]
+def verify_joint_ordering(env):
+    am = env.action_manager
+    for term_name, term in am.active_terms.items():
+        print(f"Term {term_name}: dim={term.action_dim}")
+        names = getattr(term, "_joint_names", None)
+        if names:
+            for i, n in enumerate(names):
+                print(f"  action[{i}] -> {n}")
+\end{codebox}
+
+\begin{note}
+\textbf{部署侧的版本兼容}：Unitree SDK2 的 Python 接口 \Verb[breaklines]|unitree_sdk2_python| 在 \verb|setup.py| 里把 CycloneDDS \textbf{钉死为 \texttt{cyclonedds==0.10.2}}（C++ SDK 同样建议用 \Verb[breaklines]|releases/0.10.x| 分支自编译）；系统若装了更新版（如 $0.11.x$）会导致 SDK 发现不到机器人——用 \Verb[breaklines]|pip show cyclonedds| 检查、必要时降级到 $0.10.2$，并在编译时设好 \Verb[breaklines]|CYCLONEDDS_HOME|。
+\end{note}
+
+\subsection{部署前一键自检}
+
+\begin{codebox}[Python]{部署前验证清单（自动+人工）}
+def run_all_checks(onnx_path, env, runner):
+    import os, onnxruntime as ort, torch, numpy as np
+    # 自动:1)ONNX 存在 2)一致性 3)actor obs dim 与 ONNX 输入匹配
+    session = ort.InferenceSession(onnx_path)
+    obs_dim = session.get_inputs()[0].shape[1]
+    actor = runner.alg.actor; actor.eval()
+    t = torch.randn(1, obs_dim)
+    with torch.no_grad():
+        pt = actor(t).cpu().numpy()
+    on = session.run(None, {session.get_inputs()[0].name: t.numpy()})[0]
+    print("一致性:", "PASS" if np.abs(pt-on).max() < 1e-5 else "FAIL")
+    env_dim = env.reset().get("actor", env.reset().get("policy")).shape[1]
+    print("obs dim 匹配:", env_dim == obs_dim)
+    # 人工:4)joint ordering 5)action scale/offset 6)控制频率 7)回放视频
+    print("人工核对:joint ordering / action scale / 控制频率 / 回放视频")
+\end{codebox}
+
+\subsection{源码阅读路线}
+
+\textbf{路线 A（mjlab 训练主链）}：\Verb[breaklines]|scripts/train.py|（CLI 入口）$\to$ 框架 runner（三处扩展）$\to$ wrapper（四职责）$\to$ 配置类 $\to$ RSL-RL 的 \Verb[breaklines]|on_policy_runner.py| 的 \verb|learn()|。\textbf{路线 B（Isaac Lab 对等）}：\Verb[breaklines]|scripts/reinforcement_learning/rsl_rl/train.py| $\to$ \Verb[breaklines]|isaaclab_rl/rsl_rl/| 的 wrapper/runner $\to$ 重点对比 \verb|obs_groups| 命名差异（\verb|policy| vs \verb|actor|）。\textbf{路线 C（RSL-RL 内部）}：\Verb[breaklines]|algorithms/ppo.py|（clipped objective、GAE \Verb[breaklines]|compute_returns|、adaptive KL；\textbf{实测 5.4.0 里 \texttt{compute\_returns} 与 timeout 自举就在此处}，不在 \Verb[breaklines]|rollout_storage.py|）$\to$ \Verb[breaklines]|runners/on_policy_runner.py|（\verb|learn()| 主循环）$\to$ \verb|modules/|（MLP、高斯分布、\Verb[breaklines]|EmpiricalNormalization|）$\to$ \Verb[breaklines]|storage/rollout_storage.py|（此版只剩存储与 mini-batch 切分）。\textbf{别记死文件名}：版本一变就漂，按 \cref{sec:rlmc-train-dataflow} 的 \texttt{inspect+grep} 法在你的环境实测定位（这正是本次发现该迁移的方法）。
+
+\begin{paper}[RSL-RL：面向机器人研究的学习库]\label{paper:rlmc-rslrl}
+\textbf{问题}：机器人 RL 需要一个紧凑、易改、且为大规模 GPU 并行优化的训练库。\textbf{核心思想}：聚焦机器人领域最常用的算法（PPO 为主）与若干机器人特有的辅助技术，刻意保持代码精简易于扩展，并面向 GPU-only 训练做高吞吐优化。\textbf{关键结果}：成为 Isaac Lab、mjlab 等多个框架共用的 RL 后端；本章绝大多数 PPO 概念因此在两框架间逐字节对齐。\textbf{与本书关系}：本章的 wrapper 四职责、GAE timeout 自举、adaptive KL 调度、分离 actor/critic 配置等，均直接对应该库的实现与版本演进。\textbf{局限}：算法面较窄（以 on-policy/PPO 为主），off-policy/约束/扩散类算法需外接其他库。简称 RSL-RL（arXiv:2509.10771）\cite{schwarke2025rslrl}：教你"机器人 RL 训练库该如何为大规模并行而精简地设计"。
+\end{paper}
+
+RSL-RL 的 PPO 实现整合了 "37 个实现细节" \cite{huang2022ppo37} 中的多项优化：优势归一化（每个 mini-batch 内标准化优势）、价值函数裁剪、以及正确的 timeout 处理（不对截断回合自举清零）。
+
+\begin{codebox}[Python]{PPO update 的核心路径（rsl\_rl/algorithms/ppo.py 同义简化）}
+def update(self, batch):
+    new_log_probs = self.actor.evaluate(batch["obs"], batch["actions"])
+    entropy = self.actor.get_entropy()
+    ratio = torch.exp(new_log_probs - batch["old_log_probs"])
+    adv = batch["advantages"]
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)         # 优势归一化(细节#)
+    surr1 = ratio * adv
+    surr2 = torch.clamp(ratio, 1-self.clip_param, 1+self.clip_param) * adv
+    policy_loss = -torch.min(surr1, surr2).mean()         # clipped surrogate
+    new_values = self.critic(batch["critic_obs"])
+    if self.use_clipped_value_loss:
+        v_clip = batch["values"] + torch.clamp(
+            new_values - batch["values"], -self.clip_param, self.clip_param)
+        value_loss = torch.max((new_values - batch["returns"])**2,
+                               (v_clip - batch["returns"])**2).mean()
+    else:
+        value_loss = ((new_values - batch["returns"])**2).mean()
+    loss = (policy_loss + self.value_loss_coef * value_loss
+            - self.entropy_coef * entropy.mean())
+    self.optimizer.zero_grad(); loss.backward()
+    torch.nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
+    self.optimizer.step()
+    with torch.no_grad():
+        kl = (batch["old_log_probs"] - new_log_probs).mean()
+    return {"surrogate_loss": policy_loss.item(), "value_loss": value_loss.item(),
+            "entropy": entropy.mean().item(), "kl": kl.item()}
+\end{codebox}
+
+\subsection{常见陷阱}
+
+\begin{pitfall}[跨框架迁移 ONNX 忘了核对 joint ordering 与 action scale]
+\textbf{错误描述}：把 Isaac Lab 训的 ONNX 直接放 mjlab 部署（或反之）。\textbf{现象后果}：关节错位、或 PD 实现差异导致同一 action scale 产生不同幅度运动。\textbf{根本原因}：URDF/MJCF 解析顺序与 PD 实现细节差异。\textbf{正确做法}：先核对 \Verb[breaklines]|action[i]->joint_name| 完全一致，再用 random agent 检查 processed action 幅度。
+\end{pitfall}
+
+\subsection{练习}
+
+\begin{practice}[部署核对与源码]
+\begin{enumerate}
+  \item \textbf{[编程]} 写 \Verb[breaklines]|verify_joint_ordering| 的完整版，对比环境真实关节顺序与 \Verb[breaklines]|GO1_JOINT_ORDER|，逐一报告不一致项。\emph{验收}：能打印每个 \verb|action[i]| 的 joint 名并标出错位。
+  \item \textbf{[源码]} 按路线 C 在 \verb|ppo.py| 找到优势归一化、价值裁剪、KL 计算三处，对照 \cref{paper:rlmc-rslrl} 与 \cite{huang2022ppo37}。\emph{验收}：能各指出对应代码行的作用。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\label{sec:rlmc-train-misconceptions}
+
+\begin{table}[H]
+\centering
+\caption{本章常见误解与正解}
+\label{tab:rlmc-train-misc}
+\begin{tabular}{p{6.0cm}p{7.0cm}}
+\hline
+误解 & 正解 \\
+\hline
+PPO 参数不对是训练失败主因 & $\sim90\%$ 根因在 reward 设计或 obs/action 配置；经典 PPO 参数已广泛验证（\cref{ins:rlmc-params-allequal}） \\
+clip 是为了"保守更新" & clip 是为了允许数据多轮复用而不崩（\cref{ins:rlmc-clip-reuse}） \\
+clip\_param 直接限制参数变化幅度 & 它限制 ratio 在损失里的贡献范围，不是网络参数（\cref{eq:rlmc-ppo-clip}） \\
+wrapper 只是格式转换 & timeout 自举是数学职责，搞错给 critic 错误 label \\
+reward 曲线高 $=$ 行为好 & 可能是站立不动或 reward hacking（\cref{ins:rlmc-joint-read}） \\
+batch 越大越好 & 边际收益递减，还吃显存；$\sim10^5$ 已够 \\
+样本效率高 $=$ 训练更快 & GPU 并行下 PPO 样本效率低但 wall-clock 可能更短 \\
+网络改大能修训练 & 根因几乎不在容量，先查 reward/obs \\
+\hline
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\addcontentsline{toc}{section}{小结}
+\label{sec:rlmc-train-summary}
+
+本章把强化学习运动控制的"工程核心三角"补齐了最后一条边：\cref{ch:rlmc-obsact} 定义状态/动作空间的结构，奖励/终止章定义价值函数的形状，本章定义\emph{如何在这个形状上做优化}。三个认知转变值得记牢：从"调 PPO 参数修训练"转向"先查环境再查算法"；从"单曲线判断质量"转向"多指标联合诊断"；从"训练完即部署"转向"逐个验证接口边界"。一句话收束：\textbf{PPO 超参数几乎不是训练失败的根因——经典参数已被数千项目验证，需要大改时先回查观测与奖励}。
+
+\paragraph{术语速查。}
+\begin{itemize}
+  \item \textbf{on-policy / off-policy}：用当前策略数据更新（PPO）/ 可复用历史数据（SAC）。
+  \item \textbf{rollout / transition}：一段采集轨迹 / 单个 $(s,a,r,s')$ 样本。
+  \item \textbf{GAE}：广义优势估计，用 $\gamma,\lambda$ 权衡偏差-方差（\cref{eq:rlmc-gae}）。
+  \item \textbf{timeout bootstrap}：对"时间截断"用 critic 自举而非清零 value。
+  \item \textbf{adaptive KL schedule}：按 KL 自动调 LR 的稳定器（\cref{eq:rlmc-kl}）。
+  \item \textbf{obs\_groups}：把 env 观测 group 路由到 actor/critic 的映射。
+  \item \textbf{privileged observation}：仅 critic 可见的训练特权信号。
+  \item \textbf{ONNX 边界}：MLP/归一化在图内，scale/offset/clip 在图外。
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{本章知识点总表}
+\label{tab:rlmc-train-knowledge}
+\begin{tabular}{clcc}
+\hline
+编号 & 要点 & 对应节 & 难度 \\
+\hline
+1 & on-policy 本质：用完即弃，靠大并行弥补 & \cref{sec:rlmc-train-dataflow} & 中 \\
+2 & batch/mini-batch/更新次数三公式 & \cref{sec:rlmc-train-dataflow} & 中 \\
+3 & GAE 与 timeout 自举（删一行的后果） & \cref{sec:rlmc-train-dataflow} & 高 \\
+4 & wrapper 四职责 & \cref{sec:rlmc-train-wrapper} & 高 \\
+5 & 超参数$\leftrightarrow$行为 \& 症状反查表 & \cref{sec:rlmc-train-hyperparam} & 高 \\
+6 & 调参优先级：环境$\to$reward$\to$PPO$\to$网络 & \cref{sec:rlmc-train-hyperparam} & 中 \\
+7 & adaptive KL：最重要的单个稳定器 & \cref{sec:rlmc-train-adaptkl} & 高 \\
+8 & MLP/RNN/CNN 选型与部署影响 & \cref{sec:rlmc-train-network} & 中 \\
+9 & 观测归一化与"只给 critic 开"技巧 & \cref{sec:rlmc-train-obsnorm} & 中 \\
+10 & CLI$\to$checkpoint 全流程与恢复验证 & \cref{sec:rlmc-train-flow} & 中 \\
+11 & 多指标联合诊断与失败模式 & \cref{sec:rlmc-train-diag} & 高 \\
+12 & PPO vs SAC：按任务假设选 & \cref{sec:rlmc-train-ppo-sac} & 中 \\
+13 & ONNX 边界与部署四件事 & \cref{sec:rlmc-train-onnx} & 高 \\
+14 & joint ordering：跨框架部署头号陷阱 & \cref{sec:rlmc-train-deploy} & 高 \\
+\hline
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-train-further}
+
+\begin{itemize}
+  \item PPO 原论文，Schulman 等（arXiv:1707.06347）\cite{schulman2017ppo}：教你 clipped surrogate objective 为何能"多 epoch 更新而不崩"。
+  \item GAE 原论文，Schulman 等（arXiv:1506.02438）\cite{schulman2015gae}：教你用 $\gamma,\lambda$ 在偏差与方差之间连续调节优势估计。
+  \item "PPO 的 37 个实现细节"，Huang 等，ICLR Blog 2022 \cite{huang2022ppo37}：教你课堂公式与能跑的代码之间那些"沉默的"工程差距。
+  \item Soft Actor-Critic，Haarnoja 等（arXiv:1801.01290）\cite{haarnoja2018sac}：教你最大熵框架下的 off-policy 学习与自动温度调节。
+  \item "数分钟学会行走"，Rudin 等，CoRL 2022（arXiv:2109.11978）\cite{rudin2022legged}：教你大规模 GPU 并行如何把 locomotion 训练压到分钟级，本章经典超参数的源头。
+  \item RSL-RL 库论文，Schwarke 等（arXiv:2509.10771）\cite{schwarke2025rslrl}：教你一个为机器人 RL 而精简的训练库该如何设计与演进。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-train-troubleshoot}
+
+\begin{table}[H]
+\centering
+\caption{训练管线故障排查（症状 $\to$ 原因 $\to$ 排查 $\to$ 相关节）}
+\label{tab:rlmc-train-trouble}
+\begin{tabular}{p{3.0cm}p{3.0cm}p{4.2cm}p{2.2cm}}
+\hline
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\hline
+reward 不上升 & reward/obs 配置错 & 跑 random agent 看 reward 分项；查 command 是否在 obs & \cref{sec:rlmc-train-diag} \\
+KL 尖峰后崩溃 & LR 过大或 curriculum 突变 & 对齐 curriculum 切换时间点；降初始 LR；延后 stage & \cref{sec:rlmc-train-adaptkl} \\
+loss 变 NaN & obs/reward NaN 传播 & 在 \Verb[breaklines]|wrapper.step()| 后检测 NaN（用诊断脚本） & \cref{sec:rlmc-train-diag} \\
+value loss 不降 & critic 缺特权观测 & 打印 actor/critic obs 维度；查 \verb|obs_groups| & \cref{sec:rlmc-train-wrapper} \\
+entropy 过早塌缩 & entropy\_coef 太小或 action\_rate 太强 & 增大 entropy\_coef；查 action\_rate 权重 & \cref{sec:rlmc-train-hyperparam} \\
+恢复后 curriculum 回退 & checkpoint 缺 \Verb[breaklines]|common_step_counter| & 用框架 runner 子类或手动存该计数 & \cref{sec:rlmc-train-flow} \\
+ONNX 输出不一致 & 未 \verb|eval()| 或归一化遗漏 & 跑一致性脚本；查图中是否含归一化 & \cref{sec:rlmc-train-onnx} \\
+跨框架部署失败 & joint ordering mismatch & 打印两侧 joint 名逐一比对 & \cref{sec:rlmc-train-deploy} \\
+多 GPU 比单 GPU 慢 & 通信开销或 batch 太小 & 确认 per-GPU \verb|num_envs|$\ge2048$；查 NCCL & \cref{sec:rlmc-train-flow} \\
+checkpoint 加载 KeyError & RSL-RL 版本不匹配 & 检查版本；用自动迁移的 runner 子类 & \nameref{sec:rlmc-train-setup} \\
+\hline
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-train-versioninfo}
+
+\begin{table}[H]
+\centering
+\caption{关键组件版本与状态（截至 2026-06；版本号为实测值，以你所装版本为准）}
+\label{tab:rlmc-train-versioninfo-tab}
+\begin{tabularx}{\linewidth}{lLL}
+\hline
+组件 & 版本/状态 & 备注 \\
+\hline
+RSL-RL & 5.x（实测 \Verb[breaklines]|rsl-rl-lib 5.4.0|） & actor/critic 分离始于 4.0.0；分布配置（\Verb[breaklines]|distribution_cfg|，\verb|init_std|）始于 5.0.0；\Verb[breaklines]|compute_returns| 等在 5.x 内随小版本在 \Verb[breaklines]|rollout_storage.py| 与 \verb|ppo.py|/\allowbreak\Verb[breaklines]|on_policy_runner.py| 间迁移，定位用 \cref{sec:rlmc-train-dataflow} 的 \texttt{inspect+grep} 法 \cite{schwarke2025rslrl} \\
+mjlab & 实测 \verb|1.4.0| & MuJoCo Warp 后端；速度任务示例 Unitree G1/Go1（\textbf{无 Go2}） \\
+Isaac Lab & repo \verb|2.3.2|（内部包号 \verb|0.54.2|，随 Isaac Sim \verb|5.1|） & PhysX 后端；\verb|obs_groups| 自 RSL-RL 4.0.0 起必填 \\
+UniLab & main 分支（实测 commit \texttt{99936e08}） & 异构 CPU-sim$+$GPU-policy；PPO 复用 RSL-RL；后端 mujoco-uni $3.8.0$ / motrixsim-core $0.8.2$ \\
+PyTorch & $\ge 2.x$ & ONNX 导出 \Verb[breaklines]|opset_version=11| 起步 \\
+\hline
+\end{tabularx}
+\end{table}

@@ -1,0 +1,888 @@
+% ════════════════════════════════════════════════════════════════
+%  本章：吸收 高翔《自动驾驶与机器人中的 SLAM 技术》Ch3 §3.3-3.5 + Ch4 §4.2
+%  —— GNSS/RTK 原理、WGS84/UTM 世界坐标系、双天线外参、
+%     ESKF 版组合导航(GINS) 与 预积分+图优化 版 GINS 两条应用主线。
+%  纪律：只写「应用层」。ESKF 数学回引 \cref{ch:eskf}(P1)、预积分回引 \cref{ch:imu}、
+%       李群右扰动回引 \cref{ch:lie}、图优化/PGO 回引 \cref{ch:nlopt}/\cref{ch:isam2}——一律不复述。
+%  右扰动为主；与全书记号一致。
+% ════════════════════════════════════════════════════════════════
+\chapter{组合导航：GINS 与 RTK-GNSS}
+\label{ch:gins}
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章的对照表与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 一台消费级 IMU 静止放在桌上，只对其加速度计、陀螺仪读数做积分推位姿。$1$ 秒后位置误差大概多大？$10$ 秒后呢？为什么误差是“越积越大”而不是“维持在某个常数”？
+  \item RTK 能给出厘米级的绝对位置，频率却只有 $1$–$10$\,Hz、还“看天吃饭”；IMU 频率上百赫兹、短时极准却无界漂移。把两者“组合”，到底是谁修正谁？修正的是位置、还是连零偏、重力一起修？
+  \item RTK 直接输出的是经纬度（度）。可状态估计要在一个“米制、局部、近似平直”的坐标系里做。经纬度怎么变成米？为什么不能直接拿“纬度差 $\times$ 常数”当 $y$、“经度差 $\times$ 常数”当 $x$？
+  \item 车顶装两个 RTK 蘑菇头能测出航向（heading）。可若某一时刻只有一个天线有效，航向失效——这时观测还能用吗？该把它当成几自由度的观测喂给滤波器？
+  \item 同一套 IMU + RTK 数据，既能用 ESKF（滤波）做组合导航，也能用预积分 + 因子图（优化）做。两者算出来的轨迹几乎一样，凭什么？它们的本质区别在哪一步？
+  \item 组合导航里若连续十几秒没有 RTK（进隧道），ESKF 的位置会怎样？速度会怎样？为什么补一路“轮速观测”就能显著压住发散？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{解释}组合导航（GINS = GNSS-INS）的互补性原理：IMU 高频、短时准、无界漂移 vs.\ GNSS 低频、绝对、不漂但“看天吃饭”，并说清松耦合数据流；
+  \item \textbf{掌握} GNSS/RTK 的工作原理（伪距 vs.\ 载波相位差分、基准站、固定解/浮点解）与单/双天线方案，知道 RTK 给出的到底是几自由度的量；
+  \item \textbf{推导并实现}经纬度 $\to$ UTM 横轴墨卡托投影、以及把 UTM 读数经双天线外参 $\mathbf{T}_{GB}$ 转成车体位姿 $\mathbf{T}_{WB}$ 的完整链路，理解 WGS84/UTM/ENU/局部系的关系；
+  \item \textbf{组装}一套 ESKF 版 GINS：以 \cref{ch:eskf} 的误差状态卡尔曼滤波为引擎，写出 IMU 高频预测 + RTK 六自由度位姿观测 + 轮速观测的应用层接口与静止初始化流程（ESKF 推导本身回引、不复述）；
+  \item \textbf{构图}一套预积分 + 图优化版 GINS：以 \cref{ch:imu} 的 IMU 预积分因子 + RTK 绝对位姿因子 + 零偏随机游走因子 + 上一时刻先验因子，搭出滑动窗口的因子图（\cref{ch:nlopt}）；
+  \item \textbf{对照}滤波（ESKF）与优化（图）两条 GINS 路线的精度、复杂度、可观测性差异，并为后续“离线高精地图建图（RTK 作绝对约束）”“实时点云融合定位（RTK 作初始化引导）”埋好接口。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把已有的零件组装成一台可运行的定位机}”的主线。前面几章我们已经分别打磨好了三个零件：误差状态卡尔曼滤波（\cref{ch:eskf}）、IMU 测量模型与预积分（\cref{ch:imu}）、李群右扰动与右雅可比（\cref{ch:lie}）。本章不再重造这些轮子，而是回答两个工程问题：(1) GNSS/RTK 究竟给了车辆什么信息、以什么坐标系给出、怎样转成滤波器/优化器能吃的“观测”；(2) 把 IMU 与 RTK（外加轮速）拼起来，分别用\emph{滤波}和\emph{优化}两条路线做组合导航。结构如下：
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4mm and 8mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  bk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (imu) {IMU 高频\\ $\sim 100$\,Hz};
+\node[blk, below=8mm of imu] (gnss) {RTK/GNSS\\ $1$--$10$\,Hz};
+\node[grp, right=14mm of imu] (utm) {坐标系\\ 经纬度$\to$UTM\\ 双天线外参};
+\node[grp, right=of utm] (eskf) {ESKF-GINS\\ 预测+RTK观测\\（滤波·\cref{ch:eskf}）};
+\node[grp, below=8mm of eskf] (graph) {预积分-GINS\\ 因子图\\（优化·\cref{ch:imu}）};
+\node[bk, right=of eskf] (out) {高频位姿\\ 速度/零偏};
+\draw[ln] (imu) -- (eskf);
+\draw[ln] (imu.east) -- ++(4mm,0) |- (graph.west);
+\draw[ln] (gnss) -- (utm);
+\draw[ln] (utm) -- (eskf);
+\draw[ln] (utm.south) -- ++(0,-4mm) |- (graph.west);
+\draw[ln] (eskf) -- (out);
+\draw[ln] (graph.east) -- ++(4mm,0) |- (out.west);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径（骨干 only 速通）}：第 \ref{sec:gins-why} 节（为什么要组合导航：互补性）$\to$ 第 \ref{sec:gins-gnss} 节（GNSS/RTK 与世界坐标系，至少读懂经纬度$\to$UTM 与双天线外参）$\to$ 第 \ref{sec:gins-eskf} 节（ESKF 版 GINS 应用层）$\to$ 第 \ref{sec:gins-preint} 节（预积分版 GINS）$\to$ 第 \ref{sec:gins-compare} 节（两条路线对比与接口）。约需精读 $3$–$4$ 小时即可建立完整骨架。坐标系投影的代数细节（第 \ref{sec:gins-gnss} 节）与可观测性讨论（第 \ref{sec:gins-compare} 节）面向工程实现与研究，可选深潜。
+
+\subsection*{前置知识桥接}
+本章把前几章的工具直接“拼装”成一个真实系统，请先激活以下前置：
+\begin{itemize}
+  \item \textbf{误差状态卡尔曼滤波}（\cref{ch:eskf}）：名义状态/误差状态分离、误差态线性动力学、预测/更新两步、注入与重置——\textbf{本章第 \ref{sec:gins-eskf} 节的 GINS 把它当现成引擎调用，所有 ESKF 公式回引该章、不复述}。
+  \item \textbf{IMU 测量模型与预积分}（\cref{ch:imu}）：测量方程 $\tilde{\mathbf{a}}=\mathbf{R}^\top(\mathbf{a}-\mathbf{g})+\mathbf{b}_a+\boldsymbol{\eta}_a$、$\tilde{\boldsymbol{\omega}}=\boldsymbol{\omega}+\mathbf{b}_g+\boldsymbol{\eta}_g$、预积分相对量 $\Delta\mathbf{R},\Delta\mathbf{v},\Delta\mathbf{p}$ 及其偏置一阶修正与噪声传播——第 \ref{sec:gins-preint} 节的图优化边直接用它。
+  \item \textbf{李群与右扰动}（\cref{ch:lie}）：$\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\phi})$ 右扰动、右雅可比 $\mathbf{J}_r$ 及其逆、$\mathrm{Exp}/\mathrm{Log}$、伴随性质 $\boldsymbol{\phi}^\wedge\mathbf{R}=\mathbf{R}(\mathbf{R}^\top\boldsymbol{\phi})^\wedge$。本章把 RTK 的旋转观测写成对误差状态 $\delta\boldsymbol{\theta}$ 的直接观测时要用到。
+  \item \textbf{刚体运动与坐标系}（\cref{ch:rigid_body}）：$\SE(3)$ 位姿 $\mathbf{T}=[\mathbf{R}\,\mathbf{t};\mathbf{0}^\top\,1]$、复合 $\mathbf{T}_{WB}=\mathbf{T}_{WG}\mathbf{T}_{GB}$——本章把 RTK 在世界系的读数经外参“搬”到车体系全靠它。
+  \item \textbf{非线性优化与位姿图}（\cref{ch:nlopt}、\cref{ch:isam2}）：高斯-牛顿/LM、因子图、鲁棒核、稀疏求解——第 \ref{sec:gins-preint} 节的滑窗 GINS 是它的一个小型实例。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+坐标系上标/下标沿用 $\mathbf{T}_{AB}$ 读作“把 $B$ 系坐标变到 $A$ 系”、亦即 $B$ 系在 $A$ 系下的位姿。
+世界系 $W$（本章特指由 RTK/UTM 定义的\emph{局部世界系}，原点取在首个有效 RTK 处，详见 \cref{sec:gins-utm}）、车体系 $B$（IMU/车辆本体，前-左-上）、GNSS 接收器系 $G$。
+旋转 $\mathbf{R}\in\SO(3)$，位姿 $\mathbf{T}\in\SE(3)$。扰动\textbf{以右扰动为主} $\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\theta})$。
+名义/误差/真值状态记号一律沿用 \cref{ch:eskf}：名义态 $\mathbf{x}=[\mathbf{p},\mathbf{v},\mathbf{R},\mathbf{b}_g,\mathbf{b}_a,\mathbf{g}]^\top$（$18$ 维误差态 $\delta\mathbf{x}=[\delta\mathbf{p},\delta\mathbf{v},\delta\boldsymbol{\theta},\delta\mathbf{b}_g,\delta\mathbf{b}_a,\delta\mathbf{g}]^\top$）。
+本章不重复 ESKF/预积分的推导，凡涉及一律 \cref{ch:eskf}、\cref{ch:imu} 回引。
+代码沿用高翔开源工程 \texttt{slam\_in\_autonomous\_driving}\cite{gao2023slamad} 的命名（如 \texttt{ObserveGps}、\texttt{ObserveSE3}），只取其\emph{应用层}骨架。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么需要组合导航：漂移与绝对量的互补}
+\label{sec:gins-why}
+
+\paragraph{动机：单独一种传感器都不够。}
+\cref{ch:imu} 已经讲透 IMU 的测量模型。把 IMU 单独拿来做航迹推算（dead reckoning）——对陀螺仪积分得姿态、对去重力后的加速度二次积分得位置——能在\emph{极短}时间内给出非常平滑、非常高频的运动估计。但它有一个致命缺陷：\textbf{误差无界累积}。加速度计的零偏 $\mathbf{b}_a$ 与噪声经过\emph{两次}积分，位置误差随时间近似按 $t^2$ 增长；陀螺仪零偏 $\mathbf{b}_g$ 经一次积分后又喂给加速度的重力补偿，进一步污染位置。一只消费级 MEMS IMU 静止不动，纯积分的位置误差往往\emph{秒级}就到米、\emph{十秒级}就到几十米，根本无法独立支撑定位。
+
+GNSS（卫星导航）恰好互补：它直接给出车辆在\textbf{地球固连坐标系}下的\emph{绝对}位置，误差\emph{不随时间累积}（今天的误差和一小时后的误差是同一量级）。代价是：(1) 频率低，通常 $1$–$10$\,Hz；(2) 输出离散、不平滑，无法直接用于高频控制；(3) “看天吃饭”——隧道、高楼峡谷、浓密树冠下信号会丢失或跳变\cite{gao2023slamad}。
+
+\begin{note}
+\textbf{一句话抓住互补性.}\;
+\emph{IMU 管“短时、连续、平滑、高频”，GNSS 管“长时、绝对、不漂、低频”。}组合导航就是让 IMU 在 GNSS 的两次更新之间“接力”推算，又让 GNSS 周期性地把 IMU 累积的漂移“拽回”到绝对真值上——并且不仅拽回位置，还顺带把不可直接观测的零偏、重力方向也估出来。这种把惯性系统（INS）与全球卫星导航系统（GNSS）融合的系统，业界称为 \textbf{GINS}（GNSS-INS）\cite{gao2023slamad}。
+\end{note}
+
+\paragraph{松耦合数据流：本章采用的范式。}
+组合导航有“松耦合”与“紧耦合”之分（这一区分与激光-惯性的松/紧耦合同源，见 \cref{ch:lidar_slam} 的讨论）。\textbf{松耦合}指：GNSS 接收机内部已自行解算出\emph{位置}（甚至航向）这一“成品”定位结果，组合导航只把这个成品当作一次\emph{位姿观测}融进滤波器/优化器；\textbf{紧耦合}则深入到卫星伪距/载波相位的\emph{原始}观测量层面联合解算。后者属卫星定位专业范畴，本书\textbf{只讨论松耦合}——它已能覆盖自动驾驶绝大多数场景，且与本书“把 RTK 成品位姿当作 $\SE(3)$ 观测”的框架天然吻合\cite{gao2023slamad}。松耦合 GINS 的数据流如 \cref{fig:gins-flow}：IMU 流以上百赫兹喂“预测”，RTK 流以个位数赫兹喂“更新/绝对约束”，可选的轮速流补“速度观测”。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  node distance=5mm and 12mm, >=Stealth,
+  src/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!8, draw=main!60!black, minimum width=20mm},
+  eng/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=second!10, draw=second!60!black, minimum width=34mm, minimum height=16mm},
+  outb/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!10, draw=third!60!black},
+  ln/.style={->, thick, gray!55!black}]
+\node[src] (imu) {IMU $\sim 100$\,Hz\\ $\tilde{\mathbf{a}},\tilde{\boldsymbol{\omega}}$};
+\node[src, below=of imu] (rtk) {RTK $1$--$10$\,Hz\\ 经纬高(+航向)};
+\node[src, below=of rtk] (odo) {轮速(可选)\\ 编码器脉冲};
+\node[eng, right=of rtk] (engine) {\textbf{GINS 引擎}\\[2pt] ESKF（\cref{sec:gins-eskf}）\\ 或 因子图（\cref{sec:gins-preint}）};
+\node[outb, right=of engine] (state) {名义状态\\ $\mathbf{p},\mathbf{v},\mathbf{R},\mathbf{b}_g,\mathbf{b}_a,\mathbf{g}$\\（高频输出）};
+\draw[ln] (imu.east) -- node[above, font=\scriptsize]{预测} (engine.west|-imu.east);
+\draw[ln] (rtk.east) -- node[above, font=\scriptsize]{$\SE(3)$ 观测} (engine.west);
+\draw[ln] (odo.east) -- node[below, font=\scriptsize]{速度观测} (engine.west|-odo.east);
+\draw[ln] (engine) -- (state);
+\node[font=\scriptsize, below=1mm of odo, align=center] {经纬度$\to$UTM\\ + 双天线外参 (\cref{sec:gins-gnss})};
+\end{tikzpicture}
+\caption{松耦合 GINS 数据流。IMU 高频驱动预测；RTK 把成品位姿（经坐标转换）当 $\SE(3)$ 观测周期性校正；轮速作为车体 $X$ 向速度观测补足无 RTK 时段。引擎可换成 ESKF（滤波）或因子图（优化）两种实现，输出接口一致。}
+\label{fig:gins-flow}
+\end{figure}
+
+\paragraph{与自动驾驶定位栈的关系。}
+在 L4 自动驾驶里，GINS 很少作为\emph{唯一}定位手段，而是整套定位栈的“惯性/卫星地基”\cite{gao2023slamad}：它提供一个全局一致、高频、平滑的位姿先验，供下游的\emph{激光-地图匹配}定位（在先验高精地图上做点云配准，见本书后续“实时点云融合定位”一章）做初值引导与失效兜底。反过来，本章的 RTK 绝对位姿也正是\emph{离线高精地图建图}（见本书后续“离线高精地图构建”一章）里位姿图的\textbf{绝对约束}来源——没有它，纯激光里程计建出的地图会整体漂移、无法对齐到真实世界坐标。因此本章既是“惯性 + 卫星”这条独立定位链的终点，又是后面“激光 + 地图”这条链的\emph{起点接口}。这两个接口将在 \cref{sec:gins-compare} 显式给出。
+
+% ════════════════════════════════════════════════════════════════
+\section{卫星导航与世界坐标系}
+\label{sec:gins-gnss}
+
+要把 RTK 的成品结果喂进滤波器，必须先回答两个问题：RTK 输出的是\emph{什么物理量}、用\emph{什么坐标系}表达。本节先讲 GNSS/RTK 原理（理解“为什么 RTK 准、为什么会丢”），再讲世界坐标系（理解“经纬度怎么变成米”），最后讲双天线外参（理解“天线读数怎么变成车体位姿”）——这三步合起来，就是把一条 RTK 记录转成一次 $\SE(3)$ 观测的完整链路。本节内容对齐高翔书 §3.3\cite{gao2023slamad}。
+
+\subsection{GNSS/RTK 原理：从伪距到载波相位差分}
+\label{sec:gins-rtk}
+
+\paragraph{GNSS 的本质：高精度授时 + 测距交会。}
+全球卫星导航系统（Global Navigation Satellite System, GNSS）是室外定位的另一主要信息源。目前全球可接收的卫星信号主要来自四大系统：美国 GPS、中国北斗（BDS）、俄罗斯 GLONASS、欧盟 Galileo，每个系统在轨约 $20$–$30$ 颗卫星\cite{gao2023slamad}。其原理可以用一句话概括：\textbf{卫星不停广播“我是几号星、现在是几点、我在哪”，接收机比对“信号发出时间”与“收到时间”，乘光速得到与该星的距离，再用多颗星的距离做空间交会，解出自身位置。}所以\emph{GNSS 本质上是一个高精度的授时系统}——测距精度完全取决于时间测量精度。直接利用卫星信号定位的接收机称为\textbf{单点 GNSS 定位}，精度米级，足够手机“路级”导航，但区分不了“主路还是辅路、左车道还是右车道”，达不到自动驾驶要的\textbf{车道级}\cite{gao2023slamad}。
+
+\paragraph{差分与 RTK：把“共模误差”消掉。}
+卫星信号从发射、穿越电离层/对流层、到接收，每一环都引入误差（卫星钟差、星历误差、大气延迟）。这些误差对\emph{邻近}的两台接收机几乎相同（“共模”）。\textbf{差分定位}就利用这一点：在一个\emph{已知精确坐标}的固定点架设\textbf{基准站}，基准站把“我实测的卫星信号 vs.\ 我已知的真实位置”之差算出来，通过 4G/5G 网络实时播发给车辆（流动站），车辆据此扣掉共模误差\cite{gao2023slamad}。其中精度最高的是基于\textbf{载波相位}的差分——\textbf{RTK}（Real-Time Kinematic，实时动态差分）。
+\begin{itemize}
+  \item \textbf{伪距差分}用的是“码”到达的时间，分辨率受码元宽度限制，米级到亚米级；
+  \item \textbf{载波相位差分（RTK）}用的是载波（波长仅约 $19$\,cm）的相位，配合“整周模糊度”求解，可达\textbf{厘米级}。当整周模糊度被唯一确定时称\textbf{固定解}（fixed，最准，固定解状态可达约 $2$\,cm 精度\cite{gao2023slamad}）；尚未确定时为\textbf{浮点解}（float，精度差很多）。工程上要时刻关注 RTK 当前是固定解还是浮点解。
+\end{itemize}
+$2023$ 年起，国内 RTK 服务商已能大范围架站、把实时可用精度从米级提升到厘米级并面向大众普及\cite{gao2023slamad}。但 RTK 仍“看天吃饭”：进隧道、钻高楼峡谷、树冠遮挡时，可见卫星数骤降，解从固定退化为浮点甚至失锁。\textbf{这正是组合导航存在的根本理由}——用 IMU 在 RTK 失效的几秒到几十秒里“顶住”。
+
+\paragraph{单天线与双天线：能不能测航向。}
+RTK 接收机通常装在车顶、呈圆盘状（俗称“蘑菇头”）\cite{gao2023slamad}。
+\begin{itemize}
+  \item \textbf{单天线}：一个蘑菇头只能给出\emph{位置}（经纬高），\textbf{测不出航向}。车辆是个刚体，光知道一个点的位置不知道它朝哪。
+  \item \textbf{双天线}：装两个蘑菇头（一主一副），用两天线的\emph{位置矢量差}解算出车辆\textbf{航向}（heading，主要是偏航角 yaw）。两天线连线就是 RTK 的\textbf{基线}（baseline）；基线越长，同样的位置噪声对角度的影响越小，测角越准\cite{gao2023slamad}。
+\end{itemize}
+双天线在车上的安装方式有左右、前后、对角等（\cref{fig:gins-antenna}）。主副天线的指定纯属人为约定（左右安装常以左为主、前后安装常以后为主），反过来定也行\cite{gao2023slamad}。作为一种传感器，RTK 在车上的安装位置就是它相对车体的\textbf{外参}：由于两天线一般在同一水平面内，其旋转外参只需一个角度描述，称\textbf{安装偏角}（antenna angle）；平移外参称\textbf{安装偏移}（antenna position）。这两个量在结构设计时即确定，下一小节会用它把天线读数“搬”到车体。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, scale=0.9,
+  ax/.style={->, thick}, ant/.style={circle, draw, fill=second!30, minimum size=4mm, inner sep=0pt}]
+% (a) 左右
+\begin{scope}[shift={(0,0)}]
+  \draw[ax] (0,0)--(0,1.4) node[above]{\scriptsize $x_B$};
+  \draw[ax] (0,0)--(-1.4,0) node[left]{\scriptsize $y_B$};
+  \node[ant] at (0.7,0) {}; \node[ant] at (-0.7,0) {};
+  \draw[dashed, gray] (0.7,0)--(-0.7,0);
+  \node[font=\scriptsize] at (0,-0.7) {(a) 左右安装};
+\end{scope}
+% (b) 前后
+\begin{scope}[shift={(4.2,0)}]
+  \draw[ax] (0,0)--(0,1.4) node[above]{\scriptsize $x_B$};
+  \draw[ax] (0,0)--(-1.4,0) node[left]{\scriptsize $y_B$};
+  \node[ant] at (0,0.7) {}; \node[ant] at (0,-0.5) {};
+  \draw[dashed, gray] (0,0.7)--(0,-0.5);
+  \node[font=\scriptsize] at (0,-1.1) {(b) 前后安装};
+\end{scope}
+% (c) 对角
+\begin{scope}[shift={(8.4,0)}]
+  \draw[ax] (0,0)--(0,1.4) node[above]{\scriptsize $x_B$};
+  \draw[ax] (0,0)--(-1.4,0) node[left]{\scriptsize $y_B$};
+  \node[ant] at (0,0) {}; \node[ant] at (-0.7,0.7) {};
+  \draw[dashed, gray] (0,0)--(-0.7,0.7);
+  \node[font=\scriptsize, anchor=west] at (-0.3,0.95) {\scriptsize $a_\theta$};
+  \node[font=\scriptsize] at (0,-0.7) {(c) 对角安装};
+\end{scope}
+\end{tikzpicture}
+\caption{RTK 双天线的几种安装方式（车体系 $B$ 取前-左：$x_B$ 向前、$y_B$ 向左）。两天线连线即基线；其相对 $x_B$ 的转角即安装偏角 $a_\theta$。主副天线的指定是人为约定。}
+\label{fig:gins-antenna}
+\end{figure}
+
+\subsection{常见的世界坐标系：从经纬度到 UTM}
+\label{sec:gins-utm}
+
+RTK 默认输出\textbf{经纬度}。但状态估计要在一个“米制、局部、近似平直”的坐标系里做。本小节梳理这条转换链，并讲清\emph{为什么不能图省事直接用经纬度}。
+
+\paragraph{地理坐标系（经纬度）：全球但非米制。}
+地球上最常见的坐标系是\textbf{经纬度}（latitude-longitude）坐标系，也称\textbf{地理坐标系}，再加高度就是经纬高（LLA）\cite{gao2023slamad}。经度从本初子午线向东西各 $180^\circ$，纬度从赤道向南北各 $90^\circ$，高度取海拔或地心高度。经纬度的好处是\emph{覆盖整个地球}、直观通用，许多地图系统默认用它。但它有两个对状态估计致命的问题\cite{gao2023slamad}：
+\begin{enumerate}
+  \item \textbf{有效数字爆炸}：自动驾驶通常只覆盖市级或更小范围，建筑物级精度要求经纬度精确到小数点后 $8$–$9$ 位，读写都费劲、且逼近浮点有效位极限，易触发数值计算的“大数吃小数”。
+  \item \textbf{与米制非线性}：一度经度对应的地面距离\emph{随纬度剧烈变化}——在赤道约上百千米，在两极趋于 $0$\,m。所以\textbf{不能}简单地“经度差 $\times$ 常数 $= x$、纬度差 $\times$ 常数 $= y$”，那在中高纬度会引入显著的尺度畸变。
+\end{enumerate}
+
+\paragraph{UTM 坐标系：投影到平面、化为米制。}
+\textbf{UTM}（Universal Transverse Mercator，通用横轴墨卡托投影）坐标系把地球视为一个椭球体（WGS84 椭球），\emph{投影到横躺的圆柱面上}再展开，并切分成带（zone）\cite{gao2023slamad}。其规则为：
+\begin{itemize}
+  \item 经度方向分 $60$ 个带（数字编号），纬度方向分 $20$ 个带（字母编号）；除个别地方外大体沿经纬度\emph{均匀}切分（注意是沿经纬度均匀，因地球是球面，米制单位上并不均匀）。
+  \item 在每个带内，UTM 用正东、正北的米制坐标表达水平位置。地球半径约 $6\,378$\,km，可算得 UTM 一带东西向最宽约 $66.7$\,万米。为避免负坐标，把该带的中央经线设为 $x=500\,000$，再向东取偏移量：点落在中央经线以西则 $x<500\,000$，以东则 $x>500\,000$；正北方向以赤道投影距离为原点。
+  \item 两极区域铺平后畸变大，故 UTM 纬度有效范围限定在南纬 $80^\circ$ 至北纬 $84^\circ$ 之间\cite{gao2023slamad}\footnote{UTM 的纬度上下界并不对称：南界 $80^\circ\mathrm{S}$、北界 $84^\circ\mathrm{N}$（北端的 X 带比常规 $8^\circ$ 多 $4^\circ$），此为通行制图标准；两极以外区域改用通用极球面投影（UPS）。}。
+\end{itemize}
+轴向约定上：北半球把正东视为 $X$ 轴、正北视为 $Y$ 轴、按右手系 $Z$ 指向天空，即\textbf{东北天（ENU）}坐标系；也可把正北视为 $X$、正东视为 $Y$、$Z$ 指向地面，即\textbf{北东地（NED）}坐标系。两者实际中都在用，\textbf{$Z$ 轴指向相反、角度定义有别，跨系务必转换}\cite{gao2023slamad}。
+
+\begin{note}
+\textbf{UTM 的两个工程坑.}\;
+(1) 由于投影畸变，实际 UTM 坐标与真实米制之间还有一个约 $0.9996$ 的\emph{尺度因子}，高精度场合需扣除\cite{gao2023slamad}。(2) 跨带边界（一个带跳到相邻带）时坐标会跳变，需额外处理。本章样例工作在单带内、且对绝对精度要求不苛刻，故把这两点略去，但工程落地时必须正视。
+\end{note}
+
+\paragraph{局部世界系：再减去一个原点。}
+即便转成了 UTM，其数值仍很大（动辄六七位米数）。直接拿这么大的数去绘图、做协方差传播，又会撞上“有效数字过多 $\to$ 数值病态”的老问题\cite{gao2023slamad}。工程惯例是：取\textbf{第一个有效的 RTK 位置}作为\emph{局部世界系原点}，此后所有 RTK 位置都减去这个原点。这样滤波器和可视化都工作在“原点附近、数值很小”的局部世界系里——本章后文所说的世界系 $W$ 即指这个减去原点后的局部 ENU 系。这一步不改变任何相对几何，只是平移了坐标零点。下面的代码给出经纬度$\to$UTM 的封装（底层调用开源投影库，因投影算法本身繁琐、非本书重点）。
+
+\begin{codebox}[C++]{经纬度转 UTM 的封装（src/ch3/utm\_convert.cc）}
+// 入:latlon = (纬度, 经度)，单位“度”;出:utm_coor（含 zone、是否北半球）
+bool LatLon2UTM(const Vec2d& latlon, UTMCoordinate& utm_coor) {
+  long zone = 0; char char_north = 0;
+  // 调用开源投影库:度 -> 弧度 -> UTM (x 东向, y 北向)，并返回所在带号
+  long ret = Convert_Geodetic_To_UTM(latlon[0] * math::kDEG2RAD,
+                                     latlon[1] * math::kDEG2RAD, &zone, &char_north,
+                                     &utm_coor.xy_[0], &utm_coor.xy_[1]);
+  utm_coor.zone_  = (int)zone;
+  utm_coor.north_ = (char_north == 'N');
+  return ret == 0;
+}
+\end{codebox}
+
+\subsection{RTK 读数转车体位姿：双天线外参}
+\label{sec:gins-extrinsic}
+
+经纬度转成 UTM、减去原点后，我们得到的是 \emph{GNSS 接收器} 在世界系下的位置——记其位姿为 $\mathbf{T}_{WG}$（$W$ 世界系，$G$ 接收器系）\cite{gao2023slamad}。但状态估计要的是\emph{车体}的位姿 $\mathbf{T}_{WB}$（$B$ 车体系）。两者差一个固定的安装外参 $\mathbf{T}_{GB}$（或其逆 $\mathbf{T}_{BG}$）。把 \cref{ch:rigid_body} 的位姿复合用上：
+\begin{equation}
+\label{eq:gins-twb}
+\mathbf{T}_{WB} = \mathbf{T}_{WG}\,\mathbf{T}_{GB},
+\qquad\Longleftrightarrow\qquad
+\mathbf{R}_{WB}=\mathbf{R}_{WG}\mathbf{R}_{GB},\quad
+\mathbf{t}_{WB}=\mathbf{R}_{WG}\mathbf{t}_{GB}+\mathbf{t}_{WG}.
+\end{equation}
+其中外参的旋转只是绕 $z$ 轴转一个安装偏角 $a_\theta$、平移是安装偏移 $\mathbf{a}_t$（在 $B$ 系中量取，指 $O_B$ 指向 $O_G$ 的矢量）\cite{gao2023slamad}：
+\begin{equation}
+\label{eq:gins-tbg}
+\mathbf{T}_{BG} =
+\begin{bmatrix}\mathbf{R}_z(a_\theta) & \mathbf{a}_t \\[2pt] \mathbf{0}^\top & 1\end{bmatrix},
+\qquad \mathbf{T}_{GB}=\mathbf{T}_{BG}^{-1}.
+\end{equation}
+
+\begin{note}
+\textbf{为什么外参按“现实操作”而非“数学定义”来量.}\;
+安装偏角/偏移定义成 $\mathbf{T}_{BG}$ 而不是更“数学顺手”的 $\mathbf{T}_{GB}$，是因为现场标定人员更容易量取“$O_B$ 指向 $O_G$ 的矢量”“$B$ 系 $x$ 轴到 $G$ 系 $x$ 轴的夹角”——给出两点连线或两线夹角是直观操作；反过来让他量 $\mathbf{R}_{GB}$ 或 $\mathbf{t}_{BG}$ 则难以下手。\emph{让数学符号迁就现实操作，而非反之}\cite{gao2023slamad}。
+\end{note}
+
+\paragraph{航向角的坐标系换算。}
+双天线给出的航向（heading）通常是\emph{北东地}约定下的“从正北顺时针量到车头”的角度。要把它用到\emph{东北天}世界系里，需做一次换算：$\text{yaw}_{\text{ENU}} = (90^\circ - \text{heading})\cdot\frac{\pi}{180}$（北东地转东北天）\cite{gao2023slamad}。这一步极易出错——角度差一个 $90^\circ$ 或符号，轨迹就整体转歪。下面的代码把上述“经纬度$\to$UTM$\to$扣原点$\to$航向换算$\to$乘外参$\to$得 $\mathbf{T}_{WB}$”串成一个函数（记作 \texttt{ConvertGps2UTM}）。注意它对\textbf{单天线（无航向）}的处理：只能组装出\emph{仅含平移}的 $\SE(3)$，旋转置单位——因为安装偏移存在时，缺了航向\emph{无法}唯一推出车体姿态。
+
+\begin{codebox}[C++]{RTK 读数组装为车体位姿（src/ch3/utm\_convert.cc）}
+// gps_msg: 含经纬高 lat_lon_alt_、航向 heading_、航向是否有效 heading_valid_
+// antenna_pos / antenna_angle: 安装偏移与安装偏角（外参）; map_origin: 局部世界系原点
+bool ConvertGps2UTM(GNSS& gps_msg, const Vec2d& antenna_pos, const double& antenna_angle,
+                    const Vec3d& map_origin) {
+  /// 1) 经纬高 -> UTM
+  UTMCoordinate utm_rtk;
+  if (!LatLon2UTM(gps_msg.lat_lon_alt_.head<2>(), utm_rtk)) return false;
+  utm_rtk.z_ = gps_msg.lat_lon_alt_[2];
+
+  /// 2) 航向:北东地(度) -> 东北天(弧度)
+  double heading = 0;
+  if (gps_msg.heading_valid_) heading = (90 - gps_msg.heading_) * math::kDEG2RAD;
+
+  /// 3) 外参 T_BG（绕 z 转 a_theta，平移 a_t），取逆得 T_GB
+  SE3 TBG(SO3::rotZ(antenna_angle * math::kDEG2RAD), Vec3d(antenna_pos[0], antenna_pos[1], 0));
+  SE3 TGB = TBG.inverse();
+
+  /// 4) 扣掉局部世界系原点，组装 T_WG，再 T_WB = T_WG * T_GB
+  double x = utm_rtk.xy_[0] - map_origin[0];
+  double y = utm_rtk.xy_[1] - map_origin[1];
+  double z = utm_rtk.z_     - map_origin[2];
+  SE3 TWG(SO3::rotZ(heading), Vec3d(x, y, z));
+  SE3 TWB = TWG * TGB;
+
+  gps_msg.utm_.xy_[0] = TWB.translation().x();
+  gps_msg.utm_.xy_[1] = TWB.translation().y();
+  gps_msg.utm_.z_     = TWB.translation().z();
+
+  if (gps_msg.heading_valid_) {
+    gps_msg.utm_pose_ = TWB;                           // 双天线:带旋转的 6 自由度位姿
+  } else {
+    // 单天线:仅平移;安装偏移存在时无法推出车体姿态，故旋转置单位
+    gps_msg.utm_pose_ = SE3(SO3(), TWB.translation());
+  }
+  return true;
+}
+\end{codebox}
+
+\noindent{}至此，一条原始 RTK 记录已被转成了世界系下的车体位姿 $\mathbf{T}_{WB}$（双天线时六自由度、单天线时仅三自由度平移）——这正是后两节滤波器/优化器要吃的“观测”。\cref{fig:gins-frames} 总结了从地球到车体的坐标系链。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, node distance=6mm and 14mm,
+  cs/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, minimum width=26mm},
+  ln/.style={->, thick, gray!55!black, font=\scriptsize}]
+\node[cs, fill=main!8, draw=main!60!black] (lla) {经纬高 LLA\\ (WGS84 椭球)};
+\node[cs, fill=main!8, draw=main!60!black, right=of lla] (utm) {UTM 带内\\ (东北天 ENU)};
+\node[cs, fill=second!10, draw=second!60!black, right=of utm] (world) {局部世界系 $W$\\ (扣首个 RTK 原点)};
+\node[cs, fill=third!10, draw=third!60!black, below=10mm of world] (body) {车体系 $B$\\ $\mathbf{T}_{WB}$};
+\node[cs, fill=third!10, draw=third!60!black, left=of body] (gnss) {接收器系 $G$\\ $\mathbf{T}_{WG}$};
+\draw[ln] (lla) -- node[above]{投影} (utm);
+\draw[ln] (utm) -- node[above]{$-$原点} (world);
+\draw[ln] (world.south) -- node[right]{$=\mathbf{T}_{WG}$} (gnss.north);
+\draw[ln] (gnss) -- node[below]{$\times\,\mathbf{T}_{GB}$ (外参)} (body);
+\end{tikzpicture}
+\caption{从地球到车体的坐标系链：经纬高 $\xrightarrow{\text{投影}}$ UTM $\xrightarrow{-\text{原点}}$ 局部世界系 $W$（得接收器位姿 $\mathbf{T}_{WG}$）$\xrightarrow{\times\mathbf{T}_{GB}}$ 车体位姿 $\mathbf{T}_{WB}$。}
+\label{fig:gins-frames}
+\end{figure}
+
+% ════════════════════════════════════════════════════════════════
+\section{ESKF 版组合导航}
+\label{sec:gins-eskf}
+
+本节把 \cref{ch:eskf} 的误差状态卡尔曼滤波\emph{当作现成引擎}，组装成第一条 GINS。\textbf{ESKF 本身的全部数学（真态/名义态/误差态分离、连续与离散误差动力学、预测协方差传播、卡尔曼更新、注入与重置、重置雅可比 $\mathbf{J}_k$）已在 \cref{ch:eskf} 系统推导，本节一律回引、不复述}，只聚焦三件\emph{应用层}的事：(1) 用 IMU 做高频预测；(2) 把 RTK 位姿写成 ESKF 能吃的观测、并推导其对误差状态的雅可比；(3) 系统怎么冷启动（静止初始化 + 首个 RTK 定位姿）。本节对齐高翔书 §3.4–3.5\cite{gao2023slamad}。
+
+\begin{note}
+\textbf{为什么组合导航偏爱 ESKF 而非朴素 EKF.}\;
+\cref{ch:eskf} 已论证：把平移这类\emph{大数}量直接放进 EKF 的状态、再对旋转矩阵求“相对扰动的导数”，既有奇异性、又会因数值过大触发“大数吃小数”\cite{gao2023slamad}。ESKF 把状态拆成“名义态（含大数、走确定性递推）+ 误差态（恒为小量、走线性高斯）”，旋转用三维 $\delta\boldsymbol{\theta}$ 表达、雅可比在小量下极简、且每次更新后误差态被\emph{重置}回原点附近，从根上回避了这些病态。这正是组合导航选 ESKF 的理由。\textbf{这些结论的推导见 \cref{ch:eskf}，此处只用其结论。}
+\end{note}
+
+\subsection{应用层一：IMU 高频预测}
+\label{sec:gins-predict}
+
+预测过程就是 \cref{ch:imu} 的 IMU 名义状态递推 + \cref{ch:eskf} 的误差态协方差传播，二者本章都不重推。应用层只需记住三点：
+\begin{enumerate}
+  \item \textbf{名义态递推}（离散）：用当前 IMU 读数 $\tilde{\mathbf{a}},\tilde{\boldsymbol{\omega}}$ 推进位置、速度、姿态——
+  \begin{align}
+  \label{eq:gins-nominal}
+  \mathbf{p}(t{+}\Delta t)&=\mathbf{p}+\mathbf{v}\Delta t+\tfrac12\big(\mathbf{R}(\tilde{\mathbf{a}}-\mathbf{b}_a)+\mathbf{g}\big)\Delta t^2,\nonumber\\
+  \mathbf{v}(t{+}\Delta t)&=\mathbf{v}+\big(\mathbf{R}(\tilde{\mathbf{a}}-\mathbf{b}_a)+\mathbf{g}\big)\Delta t,\\
+  \mathbf{R}(t{+}\Delta t)&=\mathbf{R}\,\mathrm{Exp}\big((\tilde{\boldsymbol{\omega}}-\mathbf{b}_g)\Delta t\big),\nonumber
+  \end{align}
+  零偏与重力在预测步保持不变。这与 \cref{ch:imu} 的递推完全一致，只是显式带上了零偏与重力项。
+  \item \textbf{协方差传播}：$\mathbf{P}\leftarrow\mathbf{F}\mathbf{P}\mathbf{F}^\top+\mathbf{Q}$，其中 $18\times 18$ 的运动雅可比 $\mathbf{F}$ 与过程噪声 $\mathbf{Q}$ 的具体分块见 \cref{ch:eskf}（旋转分块用右扰动、含 $\mathrm{Exp}(-(\tilde{\boldsymbol{\omega}}-\mathbf{b}_g)\Delta t)$ 项）。
+  \item \textbf{误差态均值不更新}：因为每次观测更新后误差态都被重置为 $\delta\mathbf{x}=\mathbf{0}$，预测步只需传播\emph{协方差}、误差态\emph{均值}部分恒零、可略\cite{gao2023slamad}。
+\end{enumerate}
+预测由 IMU 触发，可被高频调用，从而输出高频的预测位姿——这正是 GINS 相对裸 RTK 的频率优势所在。下面的 \texttt{Predict} 函数给出预测的应用层骨架（$\mathbf{F}$ 的分块与协方差传播细节见 \cref{ch:eskf}）。
+
+\begin{codebox}[C++]{ESKF 预测:IMU 名义态递推 + 协方差传播（src/ch3/eskf.hpp）}
+template <typename S>
+bool ESKF<S>::Predict(const IMU& imu) {
+  double dt = imu.timestamp_ - current_time_;
+  if (dt > 5 * options_.imu_dt_ || dt < 0) {  // 时间间隔异常:丢弃（可能首帧无历史）
+    current_time_ = imu.timestamp_;
+    return false;
+  }
+  // —— 名义态递推（即正文 IMU 名义态离散递推式）——
+  VecT new_p = p_ + v_ * dt + 0.5 * (R_ * (imu.acce_ - ba_)) * dt * dt + 0.5 * g_ * dt * dt;
+  VecT new_v = v_ + R_ * (imu.acce_ - ba_) * dt + g_ * dt;
+  SO3  new_R = R_ * SO3::exp((imu.gyro_ - bg_) * dt);
+  R_ = new_R; v_ = new_v; p_ = new_p;   // 零偏、重力维度不变
+
+  // —— 误差态协方差传播:F 的完整分块见 ESKF 章，此处只列旋转/速度耦合分块 ——
+  Mat18T F = Mat18T::Identity();
+  F.template block<3,3>(0,3)  = Mat3T::Identity() * dt;                       // p 对 v
+  F.template block<3,3>(3,6)  = -R_.matrix() * SO3::hat(imu.acce_ - ba_) * dt;// v 对 theta
+  F.template block<3,3>(3,12) = -R_.matrix() * dt;                            // v 对 ba
+  F.template block<3,3>(3,15) =  Mat3T::Identity() * dt;                      // v 对 g
+  F.template block<3,3>(6,6)  =  SO3::exp(-(imu.gyro_ - bg_) * dt).matrix();  // theta 对 theta
+  F.template block<3,3>(6,9)  = -Mat3T::Identity() * dt;                      // theta 对 bg
+  cov_ = F * cov_.eval() * F.transpose() + Q_;   // 误差态均值可略（重置后恒零）
+  current_time_ = imu.timestamp_;
+  return true;
+}
+\end{codebox}
+
+\subsection{应用层二：RTK 位姿观测与其雅可比}
+\label{sec:gins-rtk-update}
+
+把 \cref{sec:gins-gnss} 转好的 $\mathbf{T}_{WB}=(\mathbf{R}_{\text{gnss}},\mathbf{p}_{\text{gnss}})$ 当作对当前状态的观测。这里有三个应用层要点\cite{gao2023slamad}：
+\begin{enumerate}
+  \item \textbf{双天线给六自由度、单天线给三自由度}：双天线时位置与航向都有效，可写成对 $(\mathbf{R},\mathbf{p})$ 的 $\SE(3)$ 观测；某时刻若只有一个天线有效，则位置有效、航向失效，退化为仅平移的三自由度观测。
+  \item \textbf{直接观测误差态、跳过链式法则}：GNSS 对 $\mathbf{R}$ 的观测可\emph{直接}写成对误差态 $\delta\boldsymbol{\theta}$ 的观测，从而省去“名义态$\to$误差态”的链式求导，简化整条线性化。
+  \item \textbf{扣原点}：UTM 数值大，处理时去掉局部世界系原点（\cref{sec:gins-utm}），让有效数字落在零附近。
+\end{enumerate}
+
+\paragraph{旋转观测方程与雅可比（要点 2 的展开）。}
+先看旋转。设该时刻名义态为 $\mathbf{R}$、误差态为 $\delta\boldsymbol{\theta}$，则真态 $\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\theta})$。把 GNSS 的旋转读数 $\mathbf{R}_{\text{gnss}}$ 视为对真态的观测：
+\begin{equation}
+\label{eq:gins-Robs}
+\mathbf{R}_{\text{gnss}} = \mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\theta}).
+\end{equation}
+在观测发生这一刻名义态 $\mathbf{R}$ 是\emph{确定}的，于是可把 $\mathbf{R}_{\text{gnss}}$ 看作对 $\delta\boldsymbol{\theta}$ 的观测，对 \cref{eq:gins-Robs} 作变换：
+\begin{equation}
+\label{eq:gins-ztheta}
+\mathbf{z}_{\delta\boldsymbol{\theta}} = \mathrm{Log}\big(\mathbf{R}^\top\mathbf{R}_{\text{gnss}}\big),
+\qquad\Longrightarrow\qquad
+\frac{\partial\mathbf{z}_{\delta\boldsymbol{\theta}}}{\partial\delta\boldsymbol{\theta}} = \mathbf{I}.
+\end{equation}
+即\textbf{旋转观测对误差态的雅可比是单位阵}——这正是“直接观测误差态”的好处：免去了再从名义态到误差态的转换。平移部分更平凡，$\mathbf{p}_{\text{gnss}}=\mathbf{p}+\delta\mathbf{p}$，雅可比也是单位阵：$\partial\mathbf{p}_{\text{gnss}}/\partial\delta\mathbf{p}=\mathbf{I}_{3\times3}$。把二者拼起来，$\SE(3)$ 观测对 $18$ 维误差态的雅可比 $\mathbf{H}$ 只有平移块（列 $0$–$2$）与旋转块（列 $6$–$8$）为单位阵、其余为零：
+\begin{equation}
+\label{eq:gins-H}
+\mathbf{H}=\frac{\partial\mathbf{h}}{\partial\delta\mathbf{x}}\in\mathbb{R}^{6\times18},\qquad
+\mathbf{H}_{[0:3,\,0:3]}=\mathbf{I}_3,\quad \mathbf{H}_{[3:6,\,6:9]}=\mathbf{I}_3.
+\end{equation}
+对应的\emph{更新量}（innovation）应写成流形上的形式\cite{gao2023slamad}：
+\begin{equation}
+\label{eq:gins-innov}
+\mathbf{z}-\mathbf{h}(\mathbf{x}) =
+\Big[\,\mathbf{p}_{\text{gnss}}-\mathbf{p}\;;\;\;\mathrm{Log}\big(\mathbf{R}^\top\mathbf{R}_{\text{gnss}}\big)\,\Big]\in\mathbb{R}^6.
+\end{equation}
+有了 $\mathbf{H}$、$\mathbf{z}-\mathbf{h}(\mathbf{x})$ 与观测噪声协方差 $\mathbf{V}$，剩下的\textbf{卡尔曼增益、误差态更新、注入名义态、重置}全部照搬 \cref{ch:eskf} 的标准式——本节不再写。下面的 \texttt{ObserveGps}/\allowbreak\texttt{ObserveSE3} 给出 RTK 观测的应用层骨架：双天线走六自由度 \texttt{ObserveSE3}，首帧用来定姿，单天线则退化处理。
+
+\begin{codebox}[C++]{RTK 六自由度位姿观测（src/ch3/eskf.hpp）}
+template <typename S>
+bool ESKF<S>::ObserveGps(const GNSS& gnss) {
+  if (first_gnss_) {                          // 首个有效 RTK:用来初始化名义态的位姿
+    R_ = gnss.utm_pose_.so3();
+    p_ = gnss.utm_pose_.translation();
+    first_gnss_ = false; current_time_ = gnss.unix_time_;
+    return true;
+  }
+  assert(gnss.heading_valid_);                // 本接口要求双天线（航向有效）
+  ObserveSE3(gnss.utm_pose_, options_.gnss_pos_noise_, options_.gnss_ang_noise_);
+  current_time_ = gnss.unix_time_;
+  return true;
+}
+
+template <typename S>
+bool ESKF<S>::ObserveSE3(const SE3& pose, double trans_noise, double ang_noise) {
+  // 观测雅可比 H:6x18，仅 p 块(列0)与 R 块(列6)为单位阵（见正文 H 的结构式）
+  Eigen::Matrix<S,6,18> H = Eigen::Matrix<S,6,18>::Zero();
+  H.template block<3,3>(0,0) = Mat3T::Identity();   // 平移块
+  H.template block<3,3>(3,6) = Mat3T::Identity();   // 旋转块（直接对 delta-theta）
+  // 观测噪声 V、卡尔曼增益 K（标准式，推导见 ESKF 章）
+  Vec6d noise_vec; noise_vec << trans_noise,trans_noise,trans_noise, ang_noise,ang_noise,ang_noise;
+  Mat6d V = noise_vec.asDiagonal();
+  Eigen::Matrix<S,18,6> K = cov_ * H.transpose() * (H * cov_ * H.transpose() + V).inverse();
+  // 更新量（见正文 innovation 式）:平移直接相减，旋转取 Log(R^T R_gnss)
+  Vec6d innov = Vec6d::Zero();
+  innov.template head<3>() = (pose.translation() - p_);
+  innov.template tail<3>() = (R_.inverse() * pose.so3()).log();
+  dx_  = K * innov;
+  cov_ = (Mat18T::Identity() - K * H) * cov_;
+  UpdateAndReset();      // 注入名义态 + 重置误差态（标准式见 ESKF 章）
+  return true;
+}
+\end{codebox}
+
+\begin{note}
+\textbf{注入与重置仅一句话.}\;
+更新得到的误差态 $\delta\mathbf{x}$ 要\emph{注入}名义态：$\mathbf{p}\!\mathrel{+}=\!\delta\mathbf{p}$、$\mathbf{v}\!\mathrel{+}=\!\delta\mathbf{v}$、$\mathbf{R}\!\leftarrow\!\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\theta})$、零偏与重力加上各自增量；随后误差态\emph{重置}为零、协方差按重置雅可比 $\mathbf{J}_k=\mathrm{diag}(\mathbf{I},\mathbf{I},\mathbf{J}_\theta,\mathbf{I},\mathbf{I},\mathbf{I})$ 做 $\mathbf{P}\!\leftarrow\!\mathbf{J}_k\mathbf{P}\mathbf{J}_k^\top$（其中 $\mathbf{J}_\theta=\mathbf{I}-\tfrac12\delta\boldsymbol{\theta}^\wedge$）。\textbf{重置雅可比的来历、为何 ESKF 只在重置时变换一次切空间（而 IEKF 要在迭代中多次变换）——全部见 \cref{ch:eskf}}\cite{gao2023slamad}。多数实现因 $\delta\boldsymbol{\theta}$ 极小而把 $\mathbf{J}_\theta$ 近似为 $\mathbf{I}$ 直接略去这一步。
+\end{note}
+
+\subsection{应用层三：静止初始化与系统冷启动}
+\label{sec:gins-init}
+
+ESKF 跑起来前要确定一批初始条件：IMU 初始零偏、重力初始方向、初始名义态。最常用的是\textbf{静止初始化}\cite{gao2023slamad}：把车静止放置一段时间（程序里设 $10$\,s），静止期间陀螺仪只测到零偏、加速度计测到“零偏 $+$ 重力”，据此分离出两者。流程如下：
+\begin{enumerate}
+  \item 静止一段给定时间，由轮速判定车辆是否静止（无轮速则直接认为静止）；
+  \item 统计静止段内陀螺仪/加速度计读数均值 $\bar{\mathbf{d}}_{\text{gyr}},\bar{\mathbf{d}}_{\text{acc}}$；
+  \item 车辆未转动 $\Rightarrow$ 陀螺零偏 $\mathbf{b}_g=\bar{\mathbf{d}}_{\text{gyr}}$；
+  \item 加速度计测量方程 $\tilde{\mathbf{a}}=\mathbf{R}^\top(\mathbf{a}-\mathbf{g})+\mathbf{b}_a+\boldsymbol{\eta}_a$，静止（$\mathbf{a}=\mathbf{0}$）、初始姿态视作 $\mathbf{R}=\mathbf{I}$ 时，加速度计测到 $\mathbf{b}_a-\mathbf{g}$；取重力方向为 $-\bar{\mathbf{d}}_{\text{acc}}$、大小 $9.81$，定下重力矢量；
+  \item 把加速度读数扣掉重力、重算均值得 $\mathbf{b}_a=\bar{\mathbf{d}}_{\text{acc}}'$；
+  \item 估计陀螺仪/加速度计的测量\emph{方差}，作为 ESKF 的过程噪声参数。
+\end{enumerate}
+
+\begin{note}
+\textbf{“估重力方向”而非“假定重力竖直”的取舍.}\;
+本系统把重力 $\mathbf{g}$ 作为待估状态、用静止段加速度估其\emph{方向}，因此初始车姿可视作 $\mathbf{R}=\mathbf{I}$、重力不一定恰好指 $-Z$\cite{gao2023slamad}。另一些实现把重力固定为 $[0,0,-9.81]$、转而要求事先精确标定初始 IMU 朝向——两种都可行，前者把“重力没对准竖直”的部分吸收进 $\mathbf{g}$ 的估计、初始姿态表达更省事且增加了一点线性性。
+\end{note}
+
+\paragraph{系统级冷启动逻辑。}
+把上述零件接成一个跑得起来的系统，主循环要处理两层等待\cite{gao2023slamad}：(1) \textbf{先等 IMU 静止初始化成功}——这段时间不让 ESKF 处理任何 RTK；初始化成功后把初始零偏、噪声参数传给 ESKF。(2) \textbf{再等首个有效 RTK 来定原点与定姿}——因为初始车辆的世界位置/姿态不一定在原点；若 IMU 已初始化而首个 RTK 还没来，ESKF 也\emph{暂不}处理 IMU 读数。两层都就绪后，进入“IMU 预测 $\to$ RTK 观测 $\to$ 输出”的稳态循环。下面的代码是主循环骨架（三个传感器回调）。
+
+\begin{codebox}[C++]{ESKF-GINS 主循环（src/ch4/run\_eskf\_gins.cc）}
+bool first_gnss_set = false; Vec3d origin = Vec3d::Zero();
+// —— IMU 回调:先喂静止初始化，初始化成功后才驱动 ESKF 预测 ——
+io.SetIMUProcessFunc([&](const sad::IMU& imu) {
+    if (!imu_init.InitSuccess()) { imu_init.AddIMU(imu); return; }   // 阶段一:等静止初始化
+    if (!imu_inited) {                                               // 用初始化结果配置 ESKF
+      sad::ESKFD::Options options;
+      options.gyro_var_ = sqrt(imu_init.GetCovGyro()[0]);
+      options.acce_var_ = sqrt(imu_init.GetCovAcce()[0]);
+      eskf.SetInitialConditions(options, imu_init.GetInitBg(), imu_init.GetInitBa(),
+                                imu_init.GetGravity());
+      imu_inited = true; return;
+    }
+    if (!gnss_inited) return;        // 阶段二:等首个有效 RTK 之前，IMU 也不递推
+    eskf.Predict(imu);               // 稳态:高频预测
+    ui->UpdateNavState(eskf.GetNominalState());
+  })
+// —— GNSS 回调:转 UTM、扣原点、要求航向有效后喂 ESKF 观测 ——
+  .SetGNSSProcessFunc([&](const sad::GNSS& gnss) {
+    if (!imu_inited) return;
+    sad::GNSS gnss_convert = gnss;
+    if (!sad::ConvertGps2UTM(gnss_convert, antenna_pos, FLAGS_antenna_angle) ||
+        !gnss_convert.heading_valid_) return;
+    if (!first_gnss_set) {           // 用首个有效 RTK 定局部世界系原点
+      origin = gnss_convert.utm_pose_.translation(); first_gnss_set = true;
+    }
+    gnss_convert.utm_pose_.translation() -= origin;
+    eskf.ObserveGps(gnss_convert);   // 六自由度观测（要求 heading 有效）
+    gnss_inited = true;
+  })
+// —— ODOM 回调:本章只用于静止初始化的轮速判定 ——
+  .SetOdomProcessFunc([&](const sad::Odom& odom) { imu_init.AddOdom(odom); })
+  .Go();
+\end{codebox}
+
+\subsection{应用层四：轮速观测（压住无 RTK 时段的发散）}
+\label{sec:gins-wheel}
+
+GINS 里若长时间缺 RTK，ESKF 退化为纯 IMU 积分、位移很快发散——发散的主因是\textbf{缺少速度观测}\cite{gao2023slamad}。最便宜的补救是融入车辆\textbf{轮速}（来自电机转速或轮式编码器）。把轮速建模为车体系 $X$ 方向（车头朝向）的速度观测。取前-左-上车体系，矢量形式的轮速观测为
+\begin{equation}
+\label{eq:gins-wheel}
+\mathbf{v}_{\text{wheel}}=[v_{\text{wheel}},0,0]^\top,\qquad\text{观测模型}\quad \mathbf{v}_{\text{wheel}}=\mathbf{R}^\top\mathbf{v}.
+\end{equation}
+其中 $\mathbf{R},\mathbf{v}$ 是车辆当前状态。实践中轮速并未对 $\mathbf{R}$ 做物理观测，故更常用的做法是先用当前估计的 $\mathbf{R}$ 把 $\mathbf{v}_{\text{wheel}}$ 转到世界系，直接视作对 $\mathbf{v}$ 的观测\cite{gao2023slamad}：
+\begin{equation}
+\label{eq:gins-wheel-world}
+\mathbf{R}\,\mathbf{v}_{\text{wheel}}=\mathbf{v},\qquad
+\frac{\partial\mathbf{h}}{\partial\delta\mathbf{x}}=[\,\mathbf{0}_{3\times3},\ \mathbf{I}_{3\times3},\ \mathbf{0}_{3\times12}\,].
+\end{equation}
+雅可比表明轮速只观测 $\mathbf{v}$、不直接约束其余状态（严格说还应认为它只在车体 $X$ 向有速度、$Y/Z$ 无）。但因 $\mathbf{v}$ 被观测、再叠加 IMU 测量，递推出的位姿就不会快速发散。下面的 \texttt{ObserveWheelSpeed} 给出轮速观测函数（含从左右轮脉冲算线速度）。
+
+\begin{codebox}[C++]{轮速观测（src/ch3/eskf.hpp）}
+template <typename S>
+bool ESKF<S>::ObserveWheelSpeed(const Odom& odom) {
+  // 观测雅可比 H:3x18，仅速度块（列 3）为单位阵（见正文轮速观测式）
+  Eigen::Matrix<S,3,18> H = Eigen::Matrix<S,3,18>::Zero();
+  H.template block<3,3>(0,3) = Mat3T::Identity();
+  Eigen::Matrix<S,18,3> K = cov_ * H.transpose() * (H * cov_ * H.transpose() + odom_noise_).inverse();
+  // 左右轮脉冲 -> 线速度，取均值作车体 X 向速度，再转世界系
+  double velo_l = options_.wheel_radius_ * odom.left_pulse_  / options_.circle_pulse_ * 2*M_PI / options_.odom_span_;
+  double velo_r = options_.wheel_radius_ * odom.right_pulse_ / options_.circle_pulse_ * 2*M_PI / options_.odom_span_;
+  double average_vel = 0.5 * (velo_l + velo_r);
+  VecT vel_odom(average_vel, 0.0, 0.0);
+  VecT vel_world = R_ * vel_odom;            // 转世界系，作为对 v 的观测
+  dx_  = K * (vel_world - v_);
+  cov_ = (Mat18T::Identity() - K * H) * cov_;
+  UpdateAndReset();
+  return true;
+}
+\end{codebox}
+
+\subsection{运行与现象解读}
+\label{sec:gins-run}
+在高翔工程的 \texttt{run\_eskf\_gins} 上跑一段真实数据，可观察到几个能验证“互补性”的现象\cite{gao2023slamad}：
+\begin{enumerate}
+  \item \textbf{轨迹平滑}：因每次预测、观测都带先验，RTK 与 IMU 都良好时轨迹很顺，放大可见密集的高频数据点（IMU 频率），而非 RTK 那样的稀疏跳点。
+  \item \textbf{车体系速度以 $X$ 向为主}：车体系下速度主要在 $X$（车头）方向，与“车沿车头方向前进”相符；而世界系速度则 $X,Y$ 分量都有（车在世界系里斜着走）。
+  \item \textbf{无 RTK 时位移发散、RTK 恢复后被拽回}：一段 RTK 不良时位移快速发散，RTK 恢复后位移被收敛回 RTK 轨迹上——这正是组合导航“IMU 顶住、RTK 拽回”的可视化。
+  \item \textbf{RTK 抖动会传染}：本程序在 RTK 航向有效时\emph{无条件}信任 RTK；但 RTK 本身也会抖（多路径、半遮挡），这会让 ESKF 输出也抖。\textbf{要区分“RTK 异常”还是“滤波异常”}，需在更新前检查“更新量大小”或“预测位置与观测位置之距”——这是工程鲁棒化的关键，也是滤波相对优化的一处短板（见 \cref{sec:gins-compare}）。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section{预积分版组合导航}
+\label{sec:gins-preint}
+
+第二条 GINS 走\emph{优化}路线：用 \cref{ch:imu} 的 IMU 预积分因子，把 IMU 信息攒成相邻两关键帧间的相对约束；再配 RTK 绝对位姿因子、零偏随机游走因子、上一时刻先验因子，组成一张\textbf{滑动窗口因子图}，用 \cref{ch:nlopt} 的高斯-牛顿/LM 求解。\textbf{预积分的全部数学（相对量 $\Delta\mathbf{R},\Delta\mathbf{v},\Delta\mathbf{p}$、噪声传播 $\boldsymbol{\Sigma}\!\leftarrow\!\mathbf{A}\boldsymbol{\Sigma}\mathbf{A}^\top+\mathbf{B}\boldsymbol{\Sigma}_\eta\mathbf{B}^\top$、偏置一阶修正、$9$ 维残差与雅可比）已在 \cref{ch:imu} 系统推导，本节一律回引、不复述}，只讲“怎么把它和 RTK 拼成 GINS 的因子图”。本节对齐高翔书 §4.2.4\cite{gao2023slamad}。
+
+\subsection{因子图的结构：两关键帧滑窗}
+\label{sec:gins-graph}
+
+GINS 的优化模型与 ESKF 版逻辑大体相同（一样要静止初始化定零偏与重力、一样要首个带姿态的 RTK 定初始位姿），区别在于它把信息组织成\emph{图}\cite{gao2023slamad}。其逻辑为：
+\begin{itemize}
+  \item \textbf{IMU 到达}：用预积分器累积 IMU 信息（攒相对量）；
+  \item \textbf{ODOM 到达}：记为最近时刻的速度观测并保留读数；
+  \item \textbf{GNSS 到达}：构建\emph{上一时刻} GNSS 与\emph{当前时刻} GNSS 之间的优化问题——这是窗口滑动的触发点。
+\end{itemize}
+每次窗口含\textbf{两个关键帧（前一时刻 $i$、当前时刻 $j$）}，每个关键帧的状态是 $(\mathbf{p},\mathbf{v},\mathbf{b}_g,\mathbf{b}_a)$（位姿合为一个 $\SE(3)$ 顶点），故\textbf{共 $8$ 个顶点}（两帧各：位姿、速度、陀螺零偏、加速度零偏）。连接它们的\textbf{共 $7$ 条边}\cite{gao2023slamad}：
+\begin{enumerate}
+  \item \textbf{$1$ 条预积分边}（EdgeInertial，连 $i$ 帧的位姿/速度/两零偏 + $j$ 帧的位姿/速度，共 $6$ 顶点）：施加 IMU 相对约束，残差与雅可比来自 \cref{ch:imu}；
+  \item \textbf{$2$ 条 GNSS 边}（EdgeGNSS，各连一帧位姿的一元边）：把该帧位姿\emph{绝对}约束到 RTK 读到的 $\mathbf{T}_{WB}$；
+  \item \textbf{$2$ 条零偏随机游走边}（EdgeGyroRW、EdgeAccRW，各连两帧的同类零偏）：约束零偏的\emph{变化量}（随机游走），但不约束零偏绝对值；
+  \item \textbf{$1$ 条速度观测边}（EdgeEncoder3D，连 $j$ 帧速度，可选）：轮速对世界系速度的约束；
+  \item \textbf{$1$ 条先验边}（EdgePriorPoseNavState，连 $i$ 帧的位姿/速度/两零偏）：把窗口\emph{滑出}的历史信息边缘化成对 $i$ 帧的先验。
+\end{enumerate}
+\cref{fig:gins-factorgraph} 画出这张图。\textbf{先验因子是滤波与优化“殊途同归”的关键}：它把上一窗口的后验当作本窗口的先验，正是 ESKF 在每步把历史观测\emph{边缘化}成均值 $\mathbf{x}$ 与协方差 $\mathbf{P}$ 的优化对应物——这一点 \cref{sec:gins-compare} 详谈。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, scale=1.0,
+  var/.style={circle, draw, fill=second!18, draw=second!60!black, minimum size=8mm, inner sep=0pt, font=\scriptsize},
+  fac/.style={rectangle, draw, fill=main!20, draw=main!70!black, minimum size=4mm, inner sep=1pt, font=\scriptsize},
+  obs/.style={rectangle, draw, fill=third!22, draw=third!70!black, minimum size=4mm, inner sep=1pt, font=\scriptsize},
+  pri/.style={rectangle, draw, fill=gray!25, draw=gray!70!black, minimum size=4mm, inner sep=1pt, font=\scriptsize},
+  e/.style={thick, gray!55!black}]
+% i-frame (left) and j-frame (right) variables
+\node[var] (Ri) at (0,2) {$\mathbf{R}_i,\mathbf{p}_i$};
+\node[var] (vi) at (0,1) {$\mathbf{v}_i$};
+\node[var] (bgi) at (0,0) {$\mathbf{b}_{g,i}$};
+\node[var] (bai) at (0,-1) {$\mathbf{b}_{a,i}$};
+\node[var] (Rj) at (5,2) {$\mathbf{R}_j,\mathbf{p}_j$};
+\node[var] (vj) at (5,1) {$\mathbf{v}_j$};
+\node[var] (bgj) at (5,0) {$\mathbf{b}_{g,j}$};
+\node[var] (baj) at (5,-1) {$\mathbf{b}_{a,j}$};
+% IMU preintegration factor (center)
+\node[fac] (imu) at (2.5,1) {IMU};
+\draw[e] (imu)--(Ri); \draw[e] (imu)--(vi); \draw[e] (imu)--(bgi); \draw[e] (imu)--(bai);
+\draw[e] (imu)--(Rj); \draw[e] (imu)--(vj);
+% bias random walk
+\node[fac] (rwg) at (2.5,0) {Bias};
+\draw[e] (rwg)--(bgi); \draw[e] (rwg)--(bgj);
+\node[fac] (rwa) at (2.5,-1) {Bias};
+\draw[e] (rwa)--(bai); \draw[e] (rwa)--(baj);
+% GNSS one-edges
+\node[obs] (gi) at (-1.6,2) {GNSS}; \draw[e] (gi)--(Ri);
+\node[obs] (gj) at (6.6,2) {GNSS}; \draw[e] (gj)--(Rj);
+% ODOM on j
+\node[obs] (odo) at (6.6,1) {ODOM}; \draw[e] (odo)--(vj);
+% prior on i
+\node[pri] (pr) at (-1.6,0.5) {Prior};
+\draw[e] (pr)--(Ri); \draw[e] (pr)--(vi); \draw[e] (pr)--(bgi); \draw[e] (pr)--(bai);
+\node[font=\scriptsize] at (0,-1.9) {前一时刻 $i$};
+\node[font=\scriptsize] at (5,-1.9) {当前时刻 $j$};
+\end{tikzpicture}
+\caption{预积分版 GINS 的两帧滑窗因子图（$8$ 顶点、$7$ 边）：圆为状态顶点，方为因子。IMU 预积分边连 $6$ 个顶点；两条 GNSS 一元边把各帧位姿绝对锚定到 RTK；两条 Bias 边约束零偏随机游走；ODOM 边约束 $j$ 帧速度；Prior 边把滑出窗口的历史边缘化为对 $i$ 帧的先验。每次 GNSS 到达即滑窗一次。}
+\label{fig:gins-factorgraph}
+\end{figure}
+
+\subsection{GNSS 一元边的残差与雅可比}
+\label{sec:gins-gnss-edge}
+
+RTK 绝对位姿因子是一条\textbf{一元边}（只连一个位姿顶点）：把该顶点的当前估计 $\mathbf{T}=(\mathbf{R},\mathbf{p})$ 与 RTK 测得的 $\mathbf{T}_{\text{meas}}=(\mathbf{R}_m,\mathbf{p}_m)$ 之差作残差。残差取“旋转 $\mathrm{Log}$ + 平移相减”的 $\SE(3)$ 形式（与 \cref{eq:gins-innov} 同构）：
+\begin{equation}
+\label{eq:gins-edgegnss}
+\mathbf{e} =
+\begin{bmatrix}\mathrm{Log}\big(\mathbf{R}_m^\top\mathbf{R}\big)\\[3pt] \mathbf{p}-\mathbf{p}_m\end{bmatrix}\in\mathbb{R}^6,
+\qquad
+\frac{\partial\mathbf{e}_{\text{rot}}}{\partial\delta\boldsymbol{\theta}}=\mathbf{J}_r^{-1}\big(\mathrm{Log}(\mathbf{R}_m^\top\mathbf{R})\big),\quad
+\frac{\partial\mathbf{e}_{\text{trans}}}{\partial\delta\mathbf{p}}=\mathbf{I}_3.
+\end{equation}
+其中右雅可比逆 $\mathbf{J}_r^{-1}$ 的定义见 \cref{ch:lie}。注意它与 ESKF 版 \cref{eq:gins-ztheta} 的细微差别：ESKF 把 GNSS 看作对\emph{误差态} $\delta\boldsymbol{\theta}$ 的直接观测，雅可比正好是 $\mathbf{I}$；而图优化里残差是对\emph{顶点扰动}求导，旋转部分带一个右雅可比逆 $\mathbf{J}_r^{-1}$。这不是矛盾——两者只是在不同的“点”上线性化、且 ESKF 的更新量已经过了一次 $\mathrm{Log}$，二者在小量下一致。下面的 \texttt{EdgeGNSS} 是这条一元边的实现。
+
+\begin{codebox}[C++]{RTK 绝对位姿一元边（src/ch4/gins\_pre\_integ.cc）}
+class EdgeGNSS : public g2o::BaseUnaryEdge<6, SE3, VertexPose> {
+public:
+  void computeError() override {
+    VertexPose* v = (VertexPose*)_vertices[0];
+    _error.head<3>() = (_measurement.so3().inverse() * v->estimate().so3()).log();   // 旋转残差
+    _error.tail<3>() = v->estimate().translation() - _measurement.translation();     // 平移残差
+  }
+  void linearizeOplus() override {
+    VertexPose* v = (VertexPose*)_vertices[0];      // 6x6 雅可比（见正文 EdgeGNSS 残差式）
+    _jacobianOplusXi.setZero();
+    _jacobianOplusXi.block<3,3>(0,0) = (_measurement.so3().inverse()*v->estimate().so3()).jr_inv();
+    _jacobianOplusXi.block<3,3>(3,3) = Mat3d::Identity();
+  }
+};
+\end{codebox}
+
+\subsection{优化主循环与重置}
+\label{sec:gins-optimize}
+
+把上述顶点/边在每次 GNSS 到达时塞进 g2o 求解器、优化、再把窗口前移。其逻辑\cite{gao2023slamad}：首个 GNSS（必须带航向）用来定初始位姿与原点；此后每来一个 GNSS，就以\emph{当前预积分的预测值}作优化初值（也可用 GNSS 观测值作初值，本例结果相近），构图、用 LM 优化 $20$ 次、取出当前帧后验、把它作为下一窗口的“前一帧”、并\textbf{用本帧后验的零偏重置预积分器}（因预积分依赖零偏，零偏一变就要重新积分）。下面的 \texttt{Optimize} 是建图与求解的核心骨架。
+
+\begin{codebox}[C++]{预积分 GINS 建图与优化（src/ch4/gins\_pre\_integ.cc）}
+void GinsPreInteg::Optimize() {
+  if (pre_integ_->dt_ < 1e-3) return;            // 未攒到积分，跳过
+  g2o::SparseOptimizer optimizer;
+  // ... 设 LM 算法、稀疏求解器 ...
+
+  // —— 8 个顶点:前一帧(i) 与 当前帧(j) 各 位姿/速度/陀螺零偏/加速度零偏 ——
+  auto v0_pose = new VertexPose();     v0_pose->setEstimate(last_frame_->GetSE3());
+  auto v0_vel  = new VertexVelocity(); v0_vel ->setEstimate(last_frame_->v_);
+  auto v0_bg   = new VertexGyroBias(); v0_bg  ->setEstimate(last_frame_->bg_);
+  auto v0_ba   = new VertexAccBias();  v0_ba  ->setEstimate(last_frame_->ba_);
+  auto v1_pose = new VertexPose();     v1_pose->setEstimate(this_frame_->GetSE3());
+  auto v1_vel  = new VertexVelocity(); v1_vel ->setEstimate(this_frame_->v_);
+  auto v1_bg   = new VertexGyroBias(); v1_bg  ->setEstimate(this_frame_->bg_);
+  auto v1_ba   = new VertexAccBias();  v1_ba  ->setEstimate(this_frame_->ba_);
+  // optimizer.addVertex(...) x8 ...
+
+  // —— 7 条边 ——
+  auto e_imu = new EdgeInertial(pre_integ_, options_.gravity_);   // 预积分边（连 6 顶点，残差见预积分章）
+  e_imu->setVertex(0,v0_pose); e_imu->setVertex(1,v0_vel); e_imu->setVertex(2,v0_bg);
+  e_imu->setVertex(3,v0_ba);   e_imu->setVertex(4,v1_pose); e_imu->setVertex(5,v1_vel);
+  e_imu->setRobustKernel(new g2o::RobustKernelHuber());          // 鲁棒核
+  auto e_grw = new EdgeGyroRW(); e_grw->setVertex(0,v0_bg); e_grw->setVertex(1,v1_bg); // 零偏随机游走
+  auto e_arw = new EdgeAccRW();  e_arw->setVertex(0,v0_ba); e_arw->setVertex(1,v1_ba);
+  auto e_pri = new EdgePriorPoseNavState(*last_frame_, prior_info_);                   // 上一时刻先验（边缘化）
+  auto e_g0  = new EdgeGNSS(v0_pose, last_gnss_.utm_pose_);       // 两条 GNSS 一元边
+  auto e_g1  = new EdgeGNSS(v1_pose, this_gnss_.utm_pose_);
+  // EdgeEncoder3D（轮速）若 last_odom_set_ 则加上 ...
+  // optimizer.addEdge(...) ...
+
+  optimizer.initializeOptimization(); optimizer.optimize(20);    // LM 迭代 20 次
+
+  // —— 滑窗:本帧后验成为下一窗口的“前一帧”，并用其零偏重置预积分器 ——
+  options_.preinteg_options_.init_bg_ = this_frame_->bg_;
+  options_.preinteg_options_.init_ba_ = this_frame_->ba_;
+  pre_integ_ = std::make_shared<IMUPreintegration>(options_.preinteg_options_);
+}
+\end{codebox}
+
+\begin{note}
+\textbf{先验因子的协方差与边缘化.}\;
+严格地说，先验因子的信息矩阵应由\emph{边缘化}（marginalization）滑出窗口的历史状态得到——这与紧耦合 LIO 里手动维护先验的做法同源（见 \cref{ch:lidar_slam} 的 LIO-SAM/边缘化讨论、以及 \cref{ch:imu} 的预积分边缘化）。高翔本章为简化实现，把先验因子的信息矩阵设成一个\emph{固定}大值；去掉这条先验因子会让轨迹估计变“硬”（少了历史平滑），读者可亲手关掉它观察影响\cite{gao2023slamad}。本书不在此重述边缘化推导，详见 \cref{ch:imu}、\cref{ch:isam2}。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{两条路线的对比与对外接口}
+\label{sec:gins-compare}
+
+\subsection{滤波 vs.\ 优化：殊途同归与本质区别}
+\label{sec:gins-filter-vs-opt}
+
+同一套 IMU + RTK 数据，ESKF 版与预积分版算出的轨迹\emph{整体相似}、速度状态也在预期之内\cite{gao2023slamad}。这并非巧合：二者优化的都是同一个最大后验（MAP）问题，只是\emph{解法}不同。\cref{ch:eskf} 已揭示这一“滤波-优化谱”的两端，本节只点出 GINS 语境下的几条具体差异（\cref{tab:gins-compare}）：
+
+\begin{enumerate}
+  \item \textbf{迭代次数}：图优化每次可迭代多次（本例 LM $\times 20$），而 ESKF 默认\emph{单次}迭代、且预测只基于单个时刻的 IMU 读数\cite{gao2023slamad}。这是优化在强非线性下更准的来源（IEKF 把多次迭代加回 ESKF，见 \cref{ch:eskf}）。
+  \item \textbf{先验的处理}：ESKF 的更新过程\emph{本质上就是边缘化}——它把历史观测边缘化成对当前时刻的均值 $\mathbf{x}$ 与协方差 $\mathbf{P}$，即下一步的先验\cite{gao2023slamad}。图优化默认\emph{没有}对整个状态的先验，得靠显式的先验因子（\cref{sec:gins-graph}）补回——\textbf{如何处理这个先验，正是滤波与优化的分水岭}。
+  \item \textbf{灵活性}：图优化能给每个因子挂\emph{鲁棒核}，回看各因子占的误差大小，从而判断“RTK 是否给出了异常位姿”——异常时该 GNSS 因子残差会偏大，鲁棒核自动降权\cite{gao2023slamad}。而 ESKF 的“预测-更新”模式一旦把异常 RTK 融进去就容易“带歪”整个滤波器、难以判别“RTK 异常”还是“滤波异常”（\cref{sec:gins-run} 第 4 点）。这是优化相对滤波的鲁棒性优势。
+  \item \textbf{算力}：图优化引入更多计算（多顶点多边、多次迭代），耗时明显高于滤波\cite{gao2023slamad}；但随智能汽车算力提升，图优化在实时计算里也已可用。
+  \item \textbf{可观测性}：两条路线都\emph{需要持续的 RTK 观测}才能收敛。若长时间无 RTK，速度与零偏会被“固定”、位移逐渐发散——这是 IMU+RTK 系统的能观性问题：GNSS 观测使这些状态\emph{能观}（observable）\cite{gao2023slamad}。轮速观测（\cref{sec:gins-wheel}）正是为缓解无 RTK 时段的能观性缺失。
+\end{enumerate}
+
+\begin{table}[H]\centering\small
+\caption{ESKF 版与预积分版 GINS 对比}
+\label{tab:gins-compare}
+\begin{tabular}{p{0.20\textwidth} p{0.34\textwidth} p{0.34\textwidth}}
+\toprule
+维度 & ESKF 版（滤波） & 预积分 + 图优化版 \\
+\midrule
+引擎 & \cref{ch:eskf} ESKF & \cref{ch:imu} 预积分 + \cref{ch:nlopt} 因子图 \\
+IMU 使用 & 单时刻读数驱动预测 & 攒成相邻帧相对量（预积分边） \\
+迭代 & 默认单次 & 每窗口多次（LM $\times 20$） \\
+先验 & 更新即边缘化（隐式） & 显式先验因子（需边缘化得信息阵） \\
+异常 RTK 处理 & 易“带歪”、难区分异常源 & 鲁棒核降权、可回看残差占比 \\
+精度 & 高（实时友好） & 略高（强非线性下） \\
+算力 & 低 & 高（多顶点多迭代） \\
+共性 & \multicolumn{2}{l}{同一 MAP 问题的两种解法；都需持续 RTK 保能观；轨迹整体相近} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{为后续激光定位建图埋的两个接口}
+\label{sec:gins-interface}
+
+本章 GINS 不仅是一条独立定位链的终点，更是后面“激光 + 高精地图”链的起点。它向后续两章输出两个明确接口：
+\begin{itemize}
+  \item \textbf{接口一（给离线建图）：RTK 作绝对位姿约束。}\;
+  纯激光里程计（\cref{ch:lidar_slam}）建出的地图会整体漂移、且无世界坐标。把关键帧赋上本章 RTK 的 $\mathbf{T}_{WB}$（双天线时六自由度、单天线时仅平移），作为位姿图（\cref{ch:isam2}）里的\textbf{绝对位姿因子}（即 \cref{sec:gins-gnss-edge} 的 EdgeGNSS），就能把激光轨迹\emph{锚定}到真实世界坐标、消除整体漂移。这正是本书后续“离线高精地图构建”一章里第一轮位姿图优化的 RTK 因子来源。
+  \item \textbf{接口二（给实时定位）：RTK 作初始化引导。}\;
+  在先验点云地图上做实时定位（本书后续“实时点云融合定位”一章），点云配准（NDT/ICP）需要一个\emph{初值}才能收敛——不像 RTK 那样直接给坐标。本章 RTK 的位姿正好充当这个\textbf{冷启动初值}：用首个有效 RTK 框定搜索范围；RTK 无航向时再在 $360^\circ$ 内扫朝向取配准最高分。
+\end{itemize}
+\textbf{这两个接口把本章（惯性 + 卫星）与后两章（激光 + 地图）缝合成一条完整的自动驾驶定位栈：GINS 给“全局一致的绝对参考”，激光给“局部精细的几何约束”。}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+本章把前几章打磨好的零件——ESKF（\cref{ch:eskf}）、IMU 预积分（\cref{ch:imu}）、李群右扰动（\cref{ch:lie}）、因子图（\cref{ch:nlopt}）——\emph{组装}成两条可运行的 GNSS-惯性组合导航（GINS）主线，并填平了本书在 RTK/GNSS/世界坐标系上的空白。核心收获：
+
+\begin{itemize}
+  \item \textbf{互补性是组合导航的全部动机}：IMU 高频、短时准、无界漂移；GNSS 低频、绝对、不漂但看天吃饭。组合即“IMU 顶住 RTK 间隙、RTK 周期拽回绝对真值，并顺带估出零偏与重力”。本章只做\emph{松耦合}（把 RTK 成品位姿当 $\SE(3)$ 观测）。
+  \item \textbf{坐标系链是把 RTK 喂进估计器的前提}：经纬高 $\xrightarrow{\text{投影}}$ UTM（横轴墨卡托、$60$ 带、米制、$0.9996$ 尺度）$\xrightarrow{-\text{首个RTK原点}}$ 局部世界系 $\xrightarrow{\times\mathbf{T}_{GB}\text{(双天线外参)}}$ 车体位姿 $\mathbf{T}_{WB}$。双天线给六自由度、单天线仅给三自由度平移。
+  \item \textbf{ESKF 版 GINS（应用层）}：IMU 高频预测（\cref{eq:gins-nominal}）+ RTK 六自由度位姿观测（旋转直接观测误差态、雅可比为 $\mathbf{I}$，\cref{eq:gins-H,eq:gins-innov}）+ 轮速速度观测（\cref{eq:gins-wheel-world}）+ 静止初始化 + 两层冷启动等待。ESKF 数学全部回引 \cref{ch:eskf}。
+  \item \textbf{预积分版 GINS（应用层）}：两帧滑窗、$8$ 顶点 $7$ 边的因子图（\cref{fig:gins-factorgraph}）——预积分边 + 两 RTK 一元边 + 两零偏随机游走边 + 轮速边 + 先验边。预积分数学全部回引 \cref{ch:imu}。
+  \item \textbf{滤波 vs.\ 优化殊途同归}：同一 MAP 问题的两种解法，轨迹相近；本质区别在“先验如何处理”（ESKF 更新即隐式边缘化、优化需显式先验因子），优化更易加鲁棒核抗 RTK 异常，滤波更省算力。
+  \item \textbf{两个对外接口}：RTK 作离线建图位姿图的绝对约束、作实时定位的冷启动初值——把惯性/卫星链与激光/地图链缝成完整定位栈。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\label{tab:gins-summary}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 组合导航互补性 & IMU 漂移 vs GNSS 绝对；松耦合数据流 & $\bigstar$ \\
+2 & GNSS/RTK 原理 & 授时测距交会；载波相位差分；固定/浮点解 & $\bigstar\bigstar$ \\
+3 & 单/双天线 & 单天线只测位置；双天线基线测航向 & $\bigstar$ \\
+4 & 经纬度$\to$UTM & 横轴墨卡托、$60$ 带、米制、$0.9996$ 尺度 & $\bigstar\bigstar$ \\
+5 & 双天线外参 & $\mathbf{T}_{WB}=\mathbf{T}_{WG}\mathbf{T}_{GB}$；安装偏角/偏移；航向坐标换算 & $\bigstar\bigstar$ \\
+6 & ESKF 预测 & IMU 名义态递推 + 协方差传播（数学引 \cref{ch:eskf}） & $\bigstar\bigstar$ \\
+7 & RTK 位姿观测 & 旋转直接观测误差态、雅可比 $\mathbf{I}$；六/三自由度 & $\bigstar\bigstar\bigstar$ \\
+8 & 静止初始化 & 静止分离零偏与重力方向；两层冷启动 & $\bigstar\bigstar$ \\
+9 & 轮速观测 & 车体 $X$ 向速度；压无 RTK 时段发散 & $\bigstar\bigstar$ \\
+10 & 预积分 GINS 因子图 & $8$ 顶点 $7$ 边滑窗；先验因子 & $\bigstar\bigstar\bigstar$ \\
+11 & GNSS 一元边 & $\SE(3)$ 残差、旋转雅可比 $\mathbf{J}_r^{-1}$ & $\bigstar\bigstar\bigstar$ \\
+12 & 滤波 vs 优化 & 同 MAP 两解法；先验处理是分水岭；可观测性 & $\bigstar\bigstar\bigstar$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\begin{itemize}
+  \item \textbf{本章主线出处}：高翔《自动驾驶与机器人中的 SLAM 技术：从理论到实践》\cite{gao2023slamad} 第 3 章（卫星导航、世界坐标系、ESKF 组合导航）与第 4 章 §4.2（预积分 + 图优化 GINS）；配套开源工程 \texttt{slam\_in\_autonomous\_driving}。
+  \item \textbf{ESKF 数学（回引）}：本书 \cref{ch:eskf}——真态/名义态/误差态、误差动力学、预测/更新、注入与重置、重置雅可比；四元数视角下的等价推导可参 Solà 的四元数运动学笔记\cite{sola2017quaternion}。
+  \item \textbf{IMU 预积分（回引）}：本书 \cref{ch:imu}（Forster 等 T-RO 2016\cite{forster2017preintegration} 与 VINS 双主线）——相对量、噪声传播、偏置一阶修正、$9$ 维残差与雅可比。
+  \item \textbf{李群右扰动（回引）}：本书 \cref{ch:lie}（微李群理论可参 Solà 等\cite{sola2018micro}）——右雅可比 $\mathbf{J}_r$ 及其逆、$\mathrm{Exp}/\mathrm{Log}$、伴随。
+  \item \textbf{后续应用}：RTK 作绝对约束的离线高精地图建图、RTK 作初始化的实时点云融合定位（见本书后续两章），数据集常用 NCLT、UTBM、UrbanLoco（高翔工程主用）。
+  \item \textbf{自动驾驶定位栈背景}：高翔书第 1 章（L4 业务、定位与地图、高精地图生产）。
+\end{itemize}
+
+\section*{本章与后续章节的关系}
+\addcontentsline{toc}{section}{本章与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+章节 & 关系 & 本章用法 \\
+\midrule
+\cref{ch:eskf} ESKF & 提供滤波引擎全部数学 & 第 \ref{sec:gins-eskf} 节 GINS 直接调用、不复述 \\
+\cref{ch:imu} IMU/预积分 & 提供测量模型与预积分因子 & 预测步与第 \ref{sec:gins-preint} 节预积分边 \\
+\cref{ch:lie} 李群 & 右扰动/右雅可比/$\mathrm{Exp}\,\mathrm{Log}$ & RTK 旋转观测与一元边雅可比 \\
+\cref{ch:rigid_body} 刚体运动 & $\SE(3)$ 复合 & 双天线外参 $\mathbf{T}_{WB}=\mathbf{T}_{WG}\mathbf{T}_{GB}$ \\
+\cref{ch:nlopt} 非线性优化 & 因子图/LM/鲁棒核 & 预积分版 GINS 的求解器 \\
+\cref{ch:isam2} 位姿图/iSAM2 & PGO、边缘化 & 先验因子；接口一给离线建图 \\
+\cref{ch:lidar_slam} 激光 SLAM & LIO 前端/松紧耦合 & 接口一/二的下游（地图与定位） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.24\textwidth} p{0.30\textwidth} p{0.36\textwidth}}
+\toprule
+症状 & 可能原因 & 排查步骤 \\
+\midrule
+轨迹整体转了 $90^\circ$ 或镜像 & 航向坐标系换算错（北东地 vs 东北天） & 1.核对 $\text{yaw}=(90^\circ-\text{heading})$（\cref{sec:gins-extrinsic}）；2.确认 ENU/NED 一致；3.查 UTM 轴向约定 \\
+轨迹整体偏移一大段 & 未扣局部世界系原点 / 原点取错 & 1.确认减去首个有效 RTK 原点；2.检查 UTM 带号是否跨带；3.查 $0.9996$ 尺度 \\
+位置在隧道里飞走 & 无 RTK 时纯 IMU 积分、缺速度观测 & 1.确认进出隧道的 RTK 失锁段；2.加轮速观测（\cref{sec:gins-wheel}）；3.检查零偏估计是否合理 \\
+启动后立刻发散 & 静止初始化失败 / 首个 RTK 无航向 & 1.确认静止段够长且真静止；2.首个 RTK 必须 heading 有效；3.查陀螺/加速度方差是否超阈 \\
+轨迹随 RTK 一起抖 & 无条件信任了抖动的 RTK & 1.检查 RTK 是否固定解；2.更新前做更新量/距离门限；3.改用图优化加鲁棒核（\cref{sec:gins-compare}） \\
+ESKF 与优化结果差很多 & 噪声参数/外参不一致 & 1.两实现用同一组噪声与外参；2.核对单/双天线观测维度；3.查先验因子信息阵设置 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{API 速查表}
+\addcontentsline{toc}{section}{API 速查表}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.30\textwidth} p{0.62\textwidth}}
+\toprule
+功能 & 接口 / 要点（一句话） \\
+\midrule
+经纬度$\to$UTM & \texttt{LatLon2UTM}（底层开源投影库 \texttt{Convert\_Geodetic\_To\_UTM}） \\
+RTK 读数$\to$车体位姿 & \texttt{ConvertGps2UTM}（投影 + 扣原点 + 航向换算 + 乘外参 $\mathbf{T}_{GB}$） \\
+ESKF 预测 & \texttt{ESKF::Predict}（IMU 名义态递推 + 协方差传播） \\
+RTK 六自由度观测 & \texttt{ESKF::ObserveGps} $\to$ \texttt{ObserveSE3}（$\mathbf{H}$ 仅 $\mathbf{p}/\mathbf{R}$ 块为 $\mathbf{I}$） \\
+轮速观测 & \texttt{ESKF::ObserveWheelSpeed}（仅观测 $\mathbf{v}$） \\
+李群 / 右扰动 & Sophus \texttt{SO3d::exp/\allowbreak log}、\texttt{SE3d}；更新一律右乘 \texttt{R * Exp(delta)} \\
+预积分 GINS 因子图 & g2o \texttt{SparseOptimizer} + \texttt{EdgeInertial}/\allowbreak\texttt{EdgeGNSS}/\allowbreak\texttt{EdgeGyroRW}/\allowbreak\texttt{EdgeAccRW}/\allowbreak\texttt{EdgePriorPoseNavState} \\
+RTK 一元边 & \texttt{EdgeGNSS}: \texttt{BaseUnaryEdge<6,SE3,VertexPose>}，旋转雅可比 \texttt{jr\_inv} \\
+开源工程 & 高翔 \texttt{slam\_in\_autonomous\_driving}：\texttt{run\_eskf\_gins} / \texttt{run\_gins\_pre\_integ} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{研究实践建议}
+\addcontentsline{toc}{section}{研究实践建议}
+\begin{itemize}
+  \item \textbf{初学者}：在高翔工程的 \texttt{run\_eskf\_gins} 上跑 \texttt{data/ch3} 数据，可视化轨迹、车体系/世界系速度与实时零偏；亲手把 \texttt{ConvertGps2UTM} 里的航向换算改错一个符号，观察轨迹怎样转歪——理解坐标系换算的脆弱性。
+  \item \textbf{进阶}：分别跑 \texttt{run\_eskf\_gins} 与 \texttt{run\_gins\_pre\_integ}，叠加两条轨迹对比；在预积分版里\emph{关掉先验因子}（\cref{sec:gins-optimize} 的 \texttt{EdgePriorPoseNavState}），观察估计变“硬”、平滑性下降——亲历“先验处理是滤波-优化分水岭”这一论断。
+  \item \textbf{有余力}：人为屏蔽一段 RTK（模拟隧道），对比有无轮速观测时位移的发散速度；给图优化版的 GNSS 因子加鲁棒核、注入若干 RTK 异常值，验证鲁棒核能否把异常残差降权——量化优化相对滤波的抗异常优势。再做一次能观性分析，理解“无 RTK 时速度/零偏被固定”的机理（\cref{sec:gins-compare}）。
+\end{itemize}
+
+\begin{exercise}
+\label{ex:gins-utm}
+\textbf{（经纬度到米制）}\;为什么不能简单地用“经度差 $\times$ 常数 $= x$、纬度差 $\times$ 常数 $= y$”把经纬度转成局部米制坐标？请从“一度经度对应的地面距离随纬度变化”说明误差来源，并解释 UTM 为何能回避这一问题。再说明为何转成 UTM 后还要减去一个局部原点。
+\end{exercise}
+
+\begin{exercise}
+\label{ex:gins-antenna}
+\textbf{（单天线观测维度）}\;某时刻 RTK 只有一个天线有效（航向失效）。(1) 此时该把 RTK 观测当成几自由度喂给 ESKF？(2) 在 \texttt{ConvertGps2UTM}（\cref{sec:gins-extrinsic} 的代码）中，单天线分支为何把 \texttt{utm\_pose\_} 的旋转置为单位、只保留平移？(3) 若强行用一个“瞎猜”的航向去组装六自由度观测，会对滤波器造成什么后果？
+\end{exercise}
+
+\begin{exercise}
+\label{ex:gins-jacobian}
+\textbf{（RTK 旋转雅可比）}\;ESKF 版把 GNSS 旋转观测写成对误差态 $\delta\boldsymbol{\theta}$ 的直接观测，雅可比恰为 $\mathbf{I}$（\cref{eq:gins-ztheta}）；而图优化版的 GNSS 一元边旋转残差雅可比却是 $\mathbf{J}_r^{-1}(\mathrm{Log}(\mathbf{R}_m^\top\mathbf{R}))$（\cref{eq:gins-edgegnss}）。这两者矛盾吗？请说明它们各自在哪个“点”上对什么变量线性化，并论证在小扰动下二者一致。（提示：回顾 \cref{ch:lie} 的右雅可比定义与 $\mathrm{Log}$ 的扰动展开。）
+\end{exercise}
+
+\begin{exercise}
+\label{ex:gins-graph}
+\textbf{（因子图计数）}\;预积分版 GINS 的两帧滑窗为何恰好是 $8$ 个顶点、$7$ 条边？请列出每个顶点的物理含义、每条边连接哪些顶点、各约束什么。特别地：(1) 为什么零偏要用\emph{两条}随机游走边而非把零偏并进预积分边？(2) 先验边连哪几个顶点、它替代了什么？(3) 若某窗口没有轮速数据，边数变成几条？
+\end{exercise}
+
+\begin{exercise}
+\label{ex:gins-observability}
+\textbf{（可观测性与发散）}\;在连续无 RTK 的时段，GINS 的位置、速度、零偏、重力分别会怎样演化？(1) 解释为什么“没有 GNSS 观测时速度与零偏会被固定”。(2) 轮速观测补的是哪一个状态的能观性？它能否完全替代 RTK？为什么？(3) 从滤波（ESKF）与优化（图）两个视角，分别说明无 RTK 时“先验”如何防止解的瞬间崩塌。
+\end{exercise}

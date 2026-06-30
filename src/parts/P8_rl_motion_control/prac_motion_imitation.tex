@@ -1,0 +1,1278 @@
+\chapter{Motion Imitation 实战：大规模动作跟踪}\label{ch:rlmc-motimit}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实践章。
+%  本章是 prac_imitation（\cref{ch:rlmc-imitation}，模仿学习三技术线总论）的「深水区」
+%  续章：聚焦显式跟踪这条线的工程兑现 + 规模化 + 两个代表性系统精读（PHC / KungfuBot）。
+%  主线 = 算法/概念领路：先立「motion tracking 的 MDP 与 velocity tracking 差在哪 → 观测/奖励/
+%  采样/终止如何随之改 → 规模化的瓶颈与对策 → progressive networks 治遗忘 → 从视频学动作的
+%  物理过滤与自适应容差」，每个概念再落到 mjlab / Isaac Lab(ProtoMotions) / UniLab 三框架对比。
+%  假定读者已有 RL 基础（理论部 P6 已讲 MDP/策略梯度/AC/PPO/GAE）与 prac_imitation 的 AMP/RSI/
+%  anchor/csv_to_npz 基础——本章不重教，只引用并深化。
+%  源稿 RL运控/Ch15_Motion_Imitation实战_大规模动作跟踪.md（mjlab BeyondMimic + ProtoMotions）。
+%  关键 API/版本/论文归属经联网核（截至 2026-06）：
+%    - BeyondMimic = Liao, Truong, Huang, Gao, Tevet, Sreenath, C. Karen Liu, arXiv:2508.08241(2025)，已核；
+%      官方复现仓库 HybridRobotics/whole_body_tracking，任务名 Tracking-Flat-G1-v0（mjlab 侧沿用
+%      Mjlab-Tracking-Flat-Unitree-G1，与 prac_setup/prac_imitation 一致）；
+%    - csv_to_npz 命令逐字核 README：scripts/csv_to_npz.py --input_file X.csv --input_fps 30
+%      --output_name X --headless（源稿 --input-csv/--output-npz/--output-fps/--render 全错，已改）；
+%      产物自动上传 WandB Registry（collection 名 Motions）；
+%    - PHC = Luo, Cao, Winkler, Kitani, Xu, ICCV 2023, arXiv:2305.06456；PMCP=progressive
+%      multiplicative control policy，scale 到 ~10K motion clips，已核；PHC+ 的「100% AMASS」是后续
+%      扩展声明，本章按 \rebuilt 处理；
+%    - KungfuBot/PBHC = Xie 等, NeurIPS 2025, arXiv:2506.12851, TeleHuman/PBHC；两阶段（视频→物理
+%      过滤+contact mask+diff-IK retarget；自适应 tracking factor），已核；
+%    - ProtoMotions(当前 ProtoMotions3) Apache-2.0，dataclass CLI: train_agent.py --experiment-path
+%      examples/experiments/.../*.py --robot-name --simulator --motion-file *.pt（非旧 Hydra +exp=，已改）；
+%      AMASS 全集(40+h) 12h on 4×A100（README 逐字核）；simulators: isaacgym/isaaclab/mujoco/newton/genesis；
+%    - AMASS = Mahmood ICCV2019；DeepMimic Peng SIGGRAPH2018；AMP Peng SIGGRAPH2021；
+%      ASE Peng SIGGRAPH2022；CALM Tessler SIGGRAPH2023；MaskedMimic Tessler SIGGRAPH Asia2024。
+%  源稿中已修正的硬错误：csv_to_npz flag 名；ProtoMotions 用 dataclass 而非 Hydra；
+%    AMASS(40+h,4×A100,12h) 与 BONES-SEED(~142K,24×A100) 两个基准在源稿小结表里被混淆，已拆开。
+% ════════════════════════════════════════════════════════════════
+
+\cref{ch:rlmc-imitation} 把模仿学习的\emph{三条技术线}（显式跟踪 / 对抗风格 / 行为克隆蒸馏）讲清楚了，并在每条线上给了 mjlab 与 ProtoMotions 的最小接线。本章是其中\textbf{显式跟踪}这条线的「深水区」续章——该章回答「有哪几条路、各自看什么观测/给什么监督」，本章回答「当你真的要在 G1 上跟一条高动态动作、再扩到上万条动作库时，工程上会撞到哪些墙、怎么翻过去」。
+
+这是一次从 \cref{ch:rlmc-quadloco}、\cref{ch:rlmc-humanoidloco} 的\emph{速度跟踪}到\emph{动作跟踪}的跨越。速度跟踪给策略一个三维 twist 命令 $(v_x, v_y, \omega_z)$，策略自己决定\emph{怎么走}；动作跟踪给策略一条完整的参考运动——每一帧每个关节的目标——策略必须\emph{忠实复现}。约束更强，但学习信号也更丰富。本章仍遵循全书「概念领路、实践兑现」的次序：每节先立算法主线（MDP 怎么变、观测/奖励/采样怎么改、规模化瓶颈在哪），再把它落到 mjlab（BeyondMimic 管线）、Isaac Lab（ProtoMotions 统一框架）、UniLab（异构 CPU-sim 的 \texttt{G1MotionTracking} 任务族）三套工具上做对比。
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置指南}
+\addcontentsline{toc}{section}{环境配置指南}
+\label{sec:rlmc-mi-setup}
+
+本章的工具链与 \cref{ch:rlmc-imitation} 完全共用——同一套 mjlab tracking、同一套 ProtoMotions、同一条「驱动 $\to$ CUDA $\to$ PyTorch $\to$ 仿真后端 $\to$ 动作数据工具」的依赖。差别只在\emph{规模}：本章后半要跑多 GPU 与上万条动作，对显存与磁盘 I/O 的要求更高。\cref{tab:rlmc-mi-req} 只列出相对 \cref{ch:rlmc-imitation}\emph{新增}的约束，基础安装请回 \cref{sec:rlmc-imit-setup}。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{大规模动作跟踪相对 \cref{ch:rlmc-imitation} 的新增环境约束（三框架对比）}
+\label{tab:rlmc-mi-req}
+\begin{tabularx}{\linewidth}{@{}lLLL@{}}
+\toprule
+要求项 & mjlab tracking & ProtoMotions / Isaac Lab & UniLab \\
+\midrule
+单条跟踪最低显存 & $\sim$12\,GB（4090 可） & $\sim$12\,GB & GPU 只放策略（仿真在 CPU），策略侧 $\lesssim$8\,GB \\
+大规模训练 & 单卡为主 & 多卡 DDP（\verb|torchrun|） & 多卡 \Verb[breaklines]|training.num_gpus=N|（off-policy 原生） \\
+分布式 & 需自行扩展 & 内置（4$\times$A100 跑 AMASS 全集） & 内置（rank-local H2D 管线，无 rank0 漏斗） \\
+动作库存储 & WandB Registry（\verb|.npz|） & MotionLib 打包（\verb|.pt|） & \verb|.npz| 参考运动（\verb|MotionLoader|） \\
+视频$\to$动作（可选） & 外部 retarget & 外部（GVHMR/PBHC 管线） & 外部（无内置视频管线，见 \cref{sec:rlmc-mi-kungfu}） \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{note}[版本与命令的「真相来源」]
+本章正文出现的所有命令行 flag 均以官方仓库 README 为准（截至 2026-06 复核）：mjlab 侧以 BeyondMimic 复现仓库 \texttt{HybridRobotics/\allowbreak whole\_body\_tracking} 为准，ProtoMotions 侧以 \texttt{NVlabs/\allowbreak ProtoMotions} 为准。\textbf{源稿中若干 flag 名与现行仓库不符，本章已改正}（最典型的是 \verb|csv_to_npz| 的参数名，详见 \cref{sec:rlmc-mi-mjlab}）。框架版本演进很快，落地前请再以你本地安装版本的 \verb|--help| 为准。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：五分钟看见「跟踪」与「速度跟踪」的差别}
+\addcontentsline{toc}{section}{Quick Start：五分钟看见跟踪}
+\label{sec:rlmc-mi-quickstart}
+
+下面给出装好之后\emph{立即可复制粘贴}的最小路径，目标不是训练出好策略，而是用\textbf{零动作回放}亲眼看见「参考动作 ghost + 机器人当前姿态」这套 tracking 特有的可视化——这是本章后面所有调试的起点。
+
+\begin{codebox}[bash]{mjlab 动作跟踪最小可跑（注意:tracking 任务\textbf{必须}带 motion，否则不启动）}
+# 0. 前提:先有一条 motion——要么 csv_to_npz.py 产出本地 NPZ（见 \S\ref{sec:rlmc-mi-mjlab-data}），
+#    要么从 WandB Registry 拉一条;下面用本地 NPZ 路径为例（注册名走 --registry-name <org>/motions/<name>）
+# 1. 零动作 agent 回放参考动作:看 ghost(透明参考) 是否正常、与机器人初始是否对齐
+uv run play Mjlab-Tracking-Flat-Unitree-G1 --agent zero --num-envs 1 --viewer viser \
+    --env.commands.motion.motion-file /path/to/g1_walking.npz
+# 2. 16 环境跑几十步跟踪训练:验证 reward 接线与训练循环（非收敛）
+uv run train Mjlab-Tracking-Flat-Unitree-G1 \
+    --env.commands.motion.motion-file /path/to/g1_walking.npz \
+    --env.scene.num-envs 16 --agent.max-iterations 50
+\end{codebox}
+
+\begin{pitfall}[tracking 任务无 motion 直接 \texttt{ValueError}——这是与 velocity 任务的关键差异]
+\textbf{错误描述}：照速度跟踪的习惯写 \Verb[breaklines]|uv run play Mjlab-Tracking-Flat-Unitree-G1 --agent zero --num-envs 1|（不带 motion）。\textbf{现象后果}：实跑\emph{直接拒绝启动}，报 \Verb[breaklines]|ValueError: For tracking tasks, provide --registry-name or| \Verb[breaklines]|--env.commands.motion.motion-file|——\textbf{连第一步「看 ghost」都跑不起来}；且仓库\emph{不附带}任何 bundled \verb|.npz|（盘上 glob 全空），不存在「装好就有一条默认动作」。\textbf{根本原因}：velocity 任务的命令是程序生成的随机 twist（无需外部数据），tracking 任务的命令\emph{是}一条参考运动文件，缺它整个 command manager 无法初始化。\textbf{正确做法}：先按 \cref{sec:rlmc-mi-mjlab-data} 用 \verb|csv_to_npz.py| 产出一条 NPZ（或从 WandB 拉），再用 \Verb[breaklines]|--env.commands.motion.motion-file <path>| 或 \Verb[breaklines]|--registry-name <org>/motions/<name>| 显式带上——\cref{sec:rlmc-mi-mjlab-run} 的「从零搭起」给了完整起步链。\end{pitfall}
+
+UniLab 侧动作跟踪的最小路径有一处与 mjlab\emph{真实不同}：UniLab 的 CLI \textbf{不支持} \Verb[breaklines]|--agent zero| 式零动作回放（已核实的欠缺，见 \cref{ch:rlmc-imitation}）。因此「看见跟踪」最快的两条路是\emph{回放官方预训练 demo}（首跑从 HuggingFace 拉权重）或\emph{跑极短训练做冒烟}——env 数与迭代数走 Hydra 覆盖、而非 flag。任务族是 \Verb[breaklines]|motion_tracking|（CLI slug \Verb[breaklines]|g1_motion_tracking|，注册名 \Verb[breaklines]|G1MotionTracking|，源码 \Verb[breaklines]|envs/motion_tracking/g1|）。
+
+\begin{codebox}[bash]{UniLab 动作跟踪最小可跑（无 zero-play，用 demo 回放 + 短训冒烟）}
+# 1. 回放官方预训练动作跟踪 demo（首跑拉 HF 权重;国内先 export HF_ENDPOINT=https://hf-mirror.com）
+uv run demo dance          # G1 动作跟踪预训练回放;特技/交互:boxtracking / wallflip
+# 2. 极短训练冒烟:只验证 reward 接线与训练循环（非收敛），env/iter 走 Hydra 覆盖
+uv run train --algo ppo --task g1_motion_tracking --sim mujoco \
+    algo.num_envs=64 algo.max_iterations=3 training.no_play=true
+\end{codebox}
+
+\begin{note}[与速度跟踪 Quick Start 的关键差别]
+对比 \cref{ch:rlmc-quadloco} 的速度跟踪 Quick Start：那里零动作回放\emph{无需任何外部数据}、只会看到机器人「站着抽搐」；这里\textbf{必须先带一条 motion 文件}（上面命令的 \Verb[breaklines]|--env.commands.motion.motion-file|），跑起来才会多出一个\textbf{半透明 ghost} 沿参考轨迹运动——这正是上一段 pitfall 强调的「tracking 任务无 motion 直接 ValueError」。motion 带上后，如果 ghost 不显示、或面朝错误方向，几乎一定是\emph{数据契约}问题（四元数约定 / body 顺序 / 帧率），而非训练问题——先回 \cref{sec:rlmc-imit-data} 过数据契约检查，别急着调 reward。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{前置自测}
+\addcontentsline{toc}{section}{前置自测}
+\label{sec:rlmc-mi-pretest}
+
+\begin{practice}[前置自测：答错 $\ge 3$ 题，建议先回相应章节]
+\begin{enumerate}
+  \item 指数型奖励 $r=\exp(-\lVert e\rVert^2/\sigma^2)$ 中 $\sigma$ 的物理含义是什么？$\sigma$ 过小、过大分别会怎样？（回看 \cref{ch:rlmc-reward}；本章 \cref{sec:rlmc-mi-kungfu} 会把 $\sigma$ 做成自适应）
+  \item 参考状态初始化（RSI）解决什么问题？为什么不能总从第 0 帧开始？（回看 \cref{sec:rlmc-imit-track-rsi}）
+  \item anchor 机制相对「逐帧精确跟踪」给了策略什么「呼吸空间」？（回看 \cref{sec:rlmc-imit-track-anchor}）
+  \item AMP 用判别器替代手工 reward，它学的是「逐帧对齐」还是「动作分布」？判别器输出接不接 sigmoid？（回看 \cref{sec:rlmc-imit-amp}）
+  \item 给定一条参考运动（关节角随时间变化），如何判断它在目标机器人上\emph{物理可行}？至少要检查哪三个量？（动力学常识；本章 \cref{sec:rlmc-mi-kungfu} 会系统化）
+  \item 非对称 actor-critic 里 actor 与 critic 看到的观测有何不同？（回看 \cref{sec:rlmc-asymmetric}）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章目标}
+\addcontentsline{toc}{section}{本章目标}
+\label{sec:rlmc-mi-goals}
+
+学完本章后，你应当能够：
+
+\begin{enumerate}
+  \item \textbf{跑通} mjlab BeyondMimic 管线在 G1 上的一条 motion tracking 任务：从动作数据（CSV $\to$ NPZ）、WandB 注册、reward 配置到训练与评估全流程打通。
+  \item \textbf{配置}动作跟踪特有的观测、奖励与终止：在 base frame 下计算 body 位置跟踪、按动作长度设 time-out、用 \Verb[breaklines]|tracking_error| 课程化终止阈值。
+  \item \textbf{在 ProtoMotions 中切换} Mimic / AMP / ASE / CALM，并说清楚切换只需改实验配置的哪几处（dataclass 入口，非 Hydra）。
+  \item \textbf{实现}大规模训练的两个核心工程件：per-GPU motion 分片与 inter-motion adaptive sampling，并\textbf{定位}「双峰成功率分布不收敛」这类规模化失败。
+  \item \textbf{解释} PHC 的 PMCP 如何用「冻结旧网络 + 乘法门控新增 primitive」避免灾难性遗忘，并\textbf{画出}其前向计算图。
+  \item \textbf{复述} KungfuBot 从视频到真机的两阶段管线：physics filter（CoM/CoP + contact mask）筛选 + 自适应 tracking factor（$\sigma$）跟踪。
+  \item \textbf{定位} tracking 失败的常见根因（body\_names 静默失效、root 漂移、$\sigma$ 过小、四元数约定不一致），并对照故障排查手册给出对策。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section*{知识导航与阅读时间}
+\addcontentsline{toc}{section}{知识导航与阅读时间}
+\label{sec:rlmc-mi-nav}
+
+本章承接 \cref{ch:rlmc-imitation}（模仿学习三技术线，尤其显式跟踪一节）、\cref{ch:rlmc-reward}（指数核奖励）与 \cref{ch:rlmc-humanoidloco}（G1 速度跟踪的 per-joint action scale / variable posture / 角动量正则——本章 tracking 任务直接复用其动作空间与正则项）。建议精读 4--5 小时（含练习）；有 RL 训练经验且已读过 \cref{ch:rlmc-imitation} 者速读 2--3 小时（重点看 \cref{sec:rlmc-mi-scale} 规模化、\cref{sec:rlmc-mi-phc} PMCP、\cref{sec:rlmc-mi-kungfu} KungfuBot 与各节的三框架对比表）；遇到具体问题速查 30 分钟（直接跳「\nameref{sec:rlmc-mi-troubleshoot}」）。
+
+\begin{forest}
+navtreeLR,
+[Motion Imitation 大规模动作跟踪
+  [mjlab BeyondMimic 跑通 (\S\ref{sec:rlmc-mi-mjlab})
+    [{数据管线 CSV $\to$ NPZ $\to$ WandB}]
+    [{观测/奖励/终止}]
+    [{base frame \& anchor}]
+  ]
+  [ProtoMotions 算法切换 (\S\ref{sec:rlmc-mi-proto})
+    [{Mimic / AMP / ASE / CALM}]
+    [{dataclass 入口}]
+  ]
+  [大规模训练工程 (\S\ref{sec:rlmc-mi-scale})
+    [{per-GPU 分片}]
+    [{adaptive sampling}]
+    [{quality filter}]
+  ]
+  [PHC PMCP 治遗忘 (\S\ref{sec:rlmc-mi-phc})
+    [{progressive networks}]
+    [{乘法门控}]
+  ]
+  [KungfuBot 视频$\to$真机 (\S\ref{sec:rlmc-mi-kungfu})
+    [{physics filter}]
+    [{自适应 $\sigma$ (BLO)}]
+  ]
+  [三框架对比 (\S\ref{sec:rlmc-mi-compare})]
+]
+\end{forest}
+
+% ════════════════════════════════════════════════════════════════
+\section{在 mjlab 中跑通 G1 动作跟踪}
+\label{sec:rlmc-mi-mjlab}
+
+\textbf{这一节解决什么问题}：用 mjlab 的 BeyondMimic 管线从零完成一条 G1 motion tracking 任务——数据准备、训练、评估。它是整个 motion imitation 领域\emph{最小可运行}的完整闭环，理解了它，后面的规模化与算法切换都是自然扩展。
+
+% ----------------------------------------------------------------
+\subsection{模块功能与在管线中的位置}
+\label{sec:rlmc-mi-mjlab-pos}
+
+\cref{ch:rlmc-imitation} 已经指出：显式跟踪这条线从 DeepMimic\,\cite{peng2018deepmimic} 经 PHC\,\cite{luo2023phc} 到 BeyondMimic\,\cite{liao2025beyondmimic}，mjlab 的 motion imitation 任务正是这条线在 MuJoCo 侧的「expert 训练」环节。本节聚焦它的工程兑现。先把动作跟踪与速度跟踪在 MDP 层面的差别摆清楚——这是理解后面所有配置改动的总纲。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{速度跟踪（\cref{ch:rlmc-humanoidloco}）与动作跟踪在 MDP 上的本质区别}
+\label{tab:rlmc-mi-mdp}
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & 速度跟踪 & 动作跟踪 \\
+\midrule
+命令 & $(v_x,v_y,\omega_z)$ 三维 twist & 参考运动序列（全身关节角 + root 位姿） \\
+命令维度 & 3 & $\sim$100+（随跟踪 body 数与维度） \\
+奖励核心 & $\exp(-\lVert v_{\text{cmd}}-v\rVert^2/\sigma^2)$ & $\exp\!\big(-\tfrac1N\sum_i\lVert p_i^{\text{ref}}-p_i^{\text{sim}}\rVert^2/\sigma^2\big)$ \\
+时间对齐 & 无 & 有（正确时间做正确动作） \\
+数据需求 & 仅命令范围 & 参考运动文件（动捕/retarget/视频） \\
+自由度 & 高（策略自定步态） & 低（必须跟参考） \\
+典型用途 & 导航、速度控制 & 技能学习、动作复现、风格控制 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[跟踪与速度跟踪的根本差别在观测，不在奖励]\label{ins:rlmc-mi-obs}
+直觉上会以为「动作跟踪 = 换了个奖励函数」。但真正的分水岭在\textbf{观测}：速度跟踪的观测里没有任何关于「怎么走」的信息（只有命令告诉「走多快」），策略必须自己\emph{发明}步态；动作跟踪的观测里嵌入了\emph{参考姿态目标}（当帧参考关节目标 $+$ 目标躯干位姿相对机器人的 anchor 差），策略只需学会「跟上参考」。这解释了为什么 G1 跟踪策略的观测\emph{比速度跟踪更高维}——多出来的那部分全是参考运动信息（具体 term 与维度见 \cref{sec:rlmc-mi-mjlab-obs}；注意 BeyondMimic 用紧凑的 anchor 相对量而非逐 body 铺开，故增量是\emph{有限的几维 anchor $+$ 参考目标}，而非上百维）。奖励只是把这个差别「兑现」成可优化的标量。
+\end{insight}
+
+\paragraph{跨领域类比。}速度跟踪像告诉司机「以 60\,km/h 开」——怎么打方向盘他自己定；动作跟踪像给司机一条精确轨迹——「第 3 秒转向 30 度、第 5 秒刹车到 50\%」。后者更难学（必须精确跟踪），但学会后能执行更精细的操作。
+
+% ----------------------------------------------------------------
+\subsection{数据管线：从原始动作到训练数据}
+\label{sec:rlmc-mi-mjlab-data}
+
+BeyondMimic 的数据流是一条「多源汇聚、统一落地」的管线：动捕（\verb|.bvh|/\allowbreak\verb|.c3d|）、AMASS（\verb|.npz|，SMPL）、视频（经 4DHumans/WHAM/GVHMR 估计 SMPL）都先 retarget 成 CSV，再统一过 \verb|csv_to_npz.py| 变成 mjlab 可读的 NPZ，最后（可选）注册进 WandB Registry 做版本管理与团队共享。retarget 与四元数/帧率契约的细节已在 \cref{sec:rlmc-imit-data} 讲透，这里只补 mjlab 落地这一步的精确命令。
+
+\begin{pitfall}[csv\_to\_npz 的参数名：源稿与现行仓库不符，务必以 README 为准]
+\textbf{错误描述}：照搬旧教程写 \Verb[breaklines]|--input-csv X.csv --output-npz X.npz --output-fps 50 --render|。\textbf{现象后果}：命令直接报「unrecognized arguments」，或更糟——某些 flag 被静默忽略，产出帧率不对的 NPZ。\textbf{根本原因}：BeyondMimic 官方复现仓库的实际接口是\emph{下划线}风格，且只有\emph{输入}帧率、没有 \verb|--output-fps|（目标帧率由任务的控制频率决定，转换脚本按时间戳重采样）。\textbf{正确做法}：以 \texttt{HybridRobotics/\allowbreak whole\_body\_tracking} README 为准，用下面的命令；产物会\emph{自动}上传到 WandB Registry 的 \texttt{Motions} collection。
+\end{pitfall}
+
+\begin{codebox}[bash]{csv\_to\_npz:经官方 README 逐字核对（2026-06）}
+# 把一条 CSV 参考动作转成 NPZ 并自动注册到 WandB
+# --input_file 输入 CSV;--input_fps 源帧率;--output_name 产物名（= WandB artifact 名）
+# --headless 无头运行（不弹可视化窗口）
+python scripts/csv_to_npz.py \
+    --input_file g1_walking.csv \
+    --input_fps 30 \
+    --output_name g1_walking \
+    --headless
+\end{codebox}
+
+\paragraph{为什么必须对齐帧率。}mjlab 的 tracking 任务以 50\,Hz 运行（\verb|physics_dt|$\times$\verb|decimation|$=0.002\times10=0.02$\,s）。若参考动作是 30\,Hz 而直接逐帧消费，策略在第 100 步看到的参考帧本该对应 $t=2.0$\,s，但 30\,Hz 数据的第 100 帧对应 $t=3.33$\,s——动作被快放到 $50/30\approx1.67$ 倍速。\verb|csv_to_npz.py| 按源帧率/时间戳把 30\,Hz 重采样到控制频率，确保帧号与仿真时间一致。这一点 \cref{sec:rlmc-imit-data} 的「帧率契约」陷阱已强调，这里再次落到具体命令。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{动作数据管线四维表（mjlab 侧关键配置项）}
+\label{tab:rlmc-mi-datacfg}
+\begin{tabular}{@{}p{2.4cm}p{2.6cm}p{3.2cm}p{3.4cm}@{}}
+\toprule
+配置项 & 默认值来源 & 修改影响 & 与其他配置耦合 \\
+\midrule
+\verb|--input_fps| & 源动作真实帧率 & 设错则重采样比例错、动作变速 & 必须等于 CSV 实际帧率 \\
+控制频率 50\,Hz & \verb|physics_dt|$\times$\verb|decimation| & 改它则所有时间对齐重算 & 与 \verb|action_rate| 正则耦合 \\
+WandB \texttt{Motions} & 复现仓库约定 & 不注册则只能传本地路径 & 与 \Verb[breaklines]|--registry-name| 耦合 \\
+CSV 列序 & root\_pos(3)+root\_quat(4)+joints(29) & 列错位则全身扭曲 & 与机器人 DoF 数耦合 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{安全起止过渡（safe pose）。}参考动作的第一帧可能是极端姿态（如旋踢的空中阶段）。若 episode 从这个姿态开始，接近随机的初始策略完全无法维持平衡，episode 在一两步内就终止，reward 信号极稀疏。常见做法是在动作前后各加约 0.5\,s 的静止站立过渡，让策略从稳定站姿开始、再逐步过渡到动态阶段。这与 \cref{sec:rlmc-imit-track-rsi} 的 RSI 是\emph{互补}的两件事：safe pose 解决「从极端姿态开始」，RSI 解决「从动作哪一帧开始」。
+
+\paragraph{UniLab 侧的数据落地：不走 WandB，直读 NPZ。}与 mjlab 的「CSV $\to$ \texttt{csv\_to\_npz} $\to$ WandB Registry」三段式不同，UniLab 把参考运动直接以 \verb|.npz| 存盘、由 \Verb[breaklines]|g1/motion_loader.py| 的 \verb|MotionLoader| 加载成一个 \verb|MotionData| dataclass（UniLab，\Verb[breaklines]|envs/motion_tracking/g1|），无 WandB 这一层。关键差别在\emph{存什么}：UniLab 的 NPZ 直接存 maximal-coordinate 量——\verb|fps|、\verb|joint_pos|、\verb|joint_vel|、\verb|body_pos_w|、\verb|body_quat_w|、\Verb[breaklines]|body_lin_vel_w|、\Verb[breaklines]|body_ang_vel_w|（即每个 body 的全局位姿与速度，而非只存关节角后靠 FK 补全）；reset 时 \verb|MotionSampler| 采帧、\Verb[breaklines]|_build_motion_reference_state| 据此建参考态。这把 mjlab「帧率契约」这道坎前移到了\emph{打包阶段}：\Verb[breaklines]|MotionData.fps| 字段就是这条动作的真实帧率，env 按它与 \verb|ctrl_dt| 对齐重采样——逐字段的 NPZ 结构已在 \cref{ch:rlmc-imitation} 的数据小节给出，这里只点明它在大规模流程里替代了 WandB 注册这一步（团队共享改由 \Verb[breaklines]|unilab-pull-assets| 从 HuggingFace 拉、而非 WandB collection）。
+
+% ----------------------------------------------------------------
+\subsection{动作跟踪的奖励设计}
+\label{sec:rlmc-mi-mjlab-reward}
+
+跟踪奖励与速度跟踪（\cref{ch:rlmc-humanoidloco}）有本质区别——不再跟 twist 命令，而是跟全身参考姿态。核心是一组指数核 tracking 项 + 复用自速度跟踪的正则与安全项。\cref{ch:rlmc-imitation} 给过 mjlab 的 \Verb[breaklines]|global_anchor_pos|/\allowbreak\Verb[breaklines]|global_anchor_ori| 等 root 级 anchor 误差项；这里补全 body 级与 joint 级的跟踪项，构成完整的奖励簇。
+
+\begin{codebox}[Python]{动作跟踪奖励配置（概念示意;真实键名/默认值见下方说明）}
+cfg.rewards = {
+    # === 核心跟踪项（mjlab 指数核宽度参数真名为 std，非 sigma）===
+    "body_position_tracking":  RewardTermCfg(   # 关键 body 的 3D 位置（base/anchor frame）
+        func=body_pos_tracking_exp, weight=1.0,
+        params={"body_names": TRACKING_BODY_NAMES, "std": 0.3}),     # 真实键 motion_body_pos
+    "body_orientation_tracking": RewardTermCfg( # body 朝向
+        func=body_ori_tracking_exp, weight=1.0,
+        params={"body_names": ["pelvis", "torso_link"], "std": 0.4}),
+    "root_position_tracking":  RewardTermCfg(   # root(anchor) 位置
+        func=root_pos_tracking_exp, weight=0.5, params={"std": 0.3}),
+    "root_velocity_tracking":  RewardTermCfg(   # body 线速度 + 角速度
+        func=root_vel_tracking_exp, weight=1.0, params={"std": 1.0}),
+    # === 正则 / 安全 ===
+    # 真实 tracking 任务的正则/安全项是 action_rate_l2 / joint_limit / self_collisions;
+    # 下面的 angular_momentum 是「正则随任务重标定」的示意（见下文讨论），真实任务默认无此项
+    "action_rate_l2":   RewardTermCfg(func=action_rate_l2, weight=-0.1),
+    "joint_limit":      RewardTermCfg(func=joint_pos_limits, weight=-10.0),
+    "self_collisions":  RewardTermCfg(func=self_collision_cost, weight=-10.0,
+        params={"sensor_name": "self_collision", "force_threshold": 10.0}),
+    "angular_momentum": RewardTermCfg(func=angular_momentum_penalty, weight=-0.01),  # 示意
+}
+\end{codebox}
+
+\begin{note}[本 codebox 的真实键名以官方仓库为准]
+上面的函数名（\texttt{body\_pos\_tracking\_exp} 等）与键名为便于讲解的示意。实跑核对 mjlab \Verb[breaklines]|tasks/tracking|（2026-06）：真实 reward 键为 \Verb[breaklines]|motion_body_pos|（func \Verb[breaklines]|motion_relative_body_position_error_exp|，weight 1.0、std 0.3）、\Verb[breaklines]|motion_body_ori|（std 0.4）、\Verb[breaklines]|motion_body_lin_vel|（std 1.0）、\Verb[breaklines]|motion_body_ang_vel|（std 3.14）、\Verb[breaklines]|motion_global_root_pos|（std 0.3）、\Verb[breaklines]|motion_global_root_ori|（std 0.4），加正则/安全 \Verb[breaklines]|action_rate_l2|（$-0.1$）、\verb|joint_limit|（\Verb[breaklines]|joint_pos_limits|，$-10$）、\Verb[breaklines]|self_collisions|（\Verb[breaklines]|self_collision_cost|，$-10$）。所有指数核宽度参数都叫 \verb|std|。这套键名与权重与后文 UniLab 的 \verb|reward.scales| 逐项一致（同源于 BeyondMimic）。
+\end{note}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{动作跟踪 vs.\ 速度跟踪的奖励差异（与 \cref{ch:rlmc-humanoidloco} 对照）}
+\label{tab:rlmc-mi-rewdiff}
+\begin{tabular}{@{}lll@{}}
+\toprule
+对比项 & 速度跟踪 & 动作跟踪 \\
+\midrule
+核心项 & \verb|track_lin_vel| + \verb|track_ang_vel| & \Verb[breaklines]|motion_body_pos| + \Verb[breaklines]|motion_global_root_pos| \\
+需要参考数据 & 否 & \textbf{是}（每帧参考姿态） \\
+\Verb[breaklines]|variable_posture| & 是（约束上肢） & \textbf{否}（参考动作本身约束姿态） \\
+角动量正则 & \Verb[breaklines]|angular_momentum| ($-0.02$) & 真实 tracking 默认\textbf{不含}（改用 \Verb[breaklines]|self_collisions|/\allowbreak\verb|joint_limit|） \\
+body 跟踪 & 无 & \textbf{有}（pelvis/foot/hand 等关键点） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{为什么角动量正则要随任务重标定（一个示意）。}速度跟踪里大角动量通常意味着「乱晃」，要重罚（如 \Verb[breaklines]|angular_momentum| $=-0.02$）；但旋踢、翻滚这类参考动作\emph{本身}就有很大的合理角动量，沿用重罚会逼策略「不敢做大动作」、反而跟不上参考——若仍要保留这类正则，应把权重调小（如 $-0.01$）甚至去掉。事实上 mjlab BeyondMimic 的 tracking 任务\emph{默认就不含}角动量正则项：它把「不乱晃」交给跟踪项本身 $+$ \Verb[breaklines]|self_collisions|/\allowbreak\verb|joint_limit| 安全项，而非显式罚角动量。这恰恰是「正则项要随任务语义重新标定」最干脆的体现——重标定的极端就是\emph{移除}那条对新任务有害的正则。
+
+\paragraph{body\_names 的选择是成败手。}若 body\_names 只含 pelvis 与双脚，策略会学到「root 与脚对了就行」，手臂和 torso 可能完全跑偏；若含全部 29 个关节对应的 body，计算量大且过度约束（某些关节误差不影响整体观感）。标准做法是选 \textbf{8--12 个关键 body}，覆盖 root、末端（手脚）与躯干。不同动作的推荐集见 \cref{tab:rlmc-mi-bodysel}。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{不同动作类型的 tracking body\_names 推荐（覆盖 root/末端/中间）}
+\label{tab:rlmc-mi-bodysel}
+\begin{tabular}{@{}lll@{}}
+\toprule
+配置 & body 集（示意） & 适用动作 \\
+\midrule
+基本（6 body） & pelvis, 双 foot, torso\_link, 双 hand\_link & 行走、慢动作 \\
+增强（10 body） & 基本 + 双 shoulder\_link + 双 elbow\_link & 上肢丰富（摆臂、太极） \\
+高精度（13 body） & 增强 + head\_link + 双 knee\_link & 舞蹈、功夫等精细动作 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{UniLab 的同款跟踪奖励：连键名权重都与 mjlab 一致，只是配置语法不同。}UniLab 的 \Verb[breaklines]|G1MotionTracking| 跟踪奖励与 mjlab BeyondMimic \emph{几乎逐项同名同权重}——这正印证两者同源（UniLab 复现 BeyondMimic）。差别只在\emph{落地范式}：mjlab 用 \Verb[breaklines]|RewardTermCfg(func=...)| 类式、Isaac Lab 用函数式 \verb|@configclass|，而 UniLab 用 \textbf{\texttt{reward.\allowbreak scales} 标量字典 $+$ env 内 \texttt{\_reward\_fns} 派发表}（UniLab，派发器 \Verb[breaklines]|run_reward_dispatch| 在 \Verb[breaklines]|envs/locomotion/common/rewards.py|）。同一组「root 位置 $/$ root 朝向 $/$ body 位姿/朝向 $/$ body 线速/角速 $/$ 关节角/速度」误差，在三框架里是\emph{同一批物理量、三套配置语法}。前文 mjlab 奖励 codebox 用的 \texttt{body\_position\_tracking} 等是\emph{概念示意名}；mjlab tracking 实际的 reward 键名与下面这张 UniLab 表\textbf{逐项相同}（\texttt{motion\_global\_root\_pos}/\allowbreak\texttt{motion\_global\_root\_ori}/\allowbreak\texttt{motion\_body\_pos}/\allowbreak\texttt{motion\_body\_ori}/\allowbreak\texttt{motion\_body\_lin\_vel}/\allowbreak\texttt{motion\_body\_ang\_vel}，默认权重 0.5/0.5/1/1/1/1），指数核宽度参数都叫 \texttt{std}。UniLab 还\emph{预置}（但默认\textbf{关}）几个 mjlab 无显式权重的项：关节角/速度 \Verb[breaklines]|motion_joint_pos|/\allowbreak\Verb[breaklines]|motion_joint_vel| 与末端\emph{抬脚高度} \Verb[breaklines]|motion_ee_body_pos_z|（约束脚的离地高度、抑制拖地，对应 mjlab 侧 \verb|ee_body_pos| 终止项语义）——这三者的 reward \emph{函数}确在 \verb|tracking.py| 注册，但默认 yaml 给的 \verb|scale| 都是 \textbf{0.0}（未启用），并非开箱即生效；下文 codebox 据实标 0.0，要用时自己改非零并设对应 std。
+
+\begin{codebox}[Python]{UniLab G1MotionTracking 的 reward.scales（mjlab tracking 同名同权重）}
+# Hydra YAML（owner:conf/ppo/task/g1_motion_tracking/mujoco.yaml）
+reward:
+  scales:
+    motion_global_root_pos: 0.5     # root 位置（mjlab 同名键，default std=0.3）
+    motion_global_root_ori: 0.5     # root 朝向（mjlab 同名键，default std=0.4）
+    motion_body_pos: 1.0            # 各 body 位置（mjlab 同名键 motion_body_pos）
+    motion_body_ori: 1.0            # 各 body 朝向（mjlab 同名键 motion_body_ori）
+    motion_body_lin_vel: 1.0        # body 线速度（mjlab 同名键 motion_body_lin_vel）
+    motion_body_ang_vel: 1.0        # body 角速度（mjlab 同名键 motion_body_ang_vel）
+    motion_joint_pos: 0.0           # 关节角项:函数已注册，但默认 scale=0.0（关）;需用时改非零
+    motion_joint_vel: 0.0           # 关节速度项:同上，默认 0.0
+    motion_ee_body_pos_z: 0.0       # 末端抬脚高度:函数 _reward_motion_ee_body_pos_z 已在 tracking.py
+                                    # 注册（ee_body_pos_z_threshold=0.25），但默认 yaml 不写、scale=0.0
+  # 指数核宽度:UniLab 默认就是「逐项 std」（与 mjlab 同），没有全局 tracking_sigma！
+  std_root_pos:  0.3               # 对应 mjlab motion_global_root_pos
+  std_root_ori:  0.4               # 对应 mjlab motion_global_root_ori
+  std_body_pos:  0.3               # 对应 mjlab motion_body_pos
+  std_body_ori:  0.4               # 对应 mjlab motion_body_ori
+  std_body_lin_vel: 1.0            # 对应 mjlab motion_body_lin_vel
+  std_body_ang_vel: 3.14           # 对应 mjlab motion_body_ang_vel（与 mjlab 同为 3.14）
+# 范式差异:scales 是标量字典而非 RewardTermCfg 类;env 的 _reward_fns 把名字映射到函数，
+# run_reward_dispatch 算 Σ scales[name]*fns[name](ctx) 并按控制周期 *ctrl_dt 缩放.
+\end{codebox}
+
+\begin{pitfall}[UniLab 跟踪奖励\textbf{无}全局 \texttt{tracking\_sigma}——是 8 个逐项 \texttt{std\_*}（与 mjlab 一致）]
+\textbf{错误描述}：以为 UniLab 跟踪用一个全局 \Verb[breaklines]|tracking_sigma=0.25|（沿用 velocity 任务的写法），想做 KungfuBot 式 $\sigma$ 收紧时去改这\emph{一个}字段。\textbf{现象后果}：三份 \Verb[breaklines]|g1_motion_tracking| yaml（mujoco/motrix）里\emph{根本没有} \Verb[breaklines]|tracking_sigma| 这个键，改它不起作用；真正控制各项核宽度的是 8 个独立的 \verb|std_root_pos|/\allowbreak\verb|std_body_pos|/\dots 字段（默认 0.3/0.4/0.3/0.4/1.0/3.14，与 mjlab 逐项 \verb|std| 一一对应）。\textbf{根本原因}：跟踪奖励的不同物理量\emph{量纲不同}（位置 m、朝向 rad、速度 m/s、角速度 rad/s），共用一个 $\sigma$ 无意义——所以 mjlab 与 UniLab 都\emph{默认}逐项 std，\textbf{逐项 sigma 本就是默认、无需自定义}。\textbf{正确做法}：要复刻 KungfuBot 的 tracking factor，改的是这 8 个 \verb|std_*| 字段（分阶段在 owner yaml 调，或写回调原地改），而非某个全局 \Verb[breaklines]|tracking_sigma|；详见 \cref{sec:rlmc-mi-kungfu-blo}。\end{pitfall}
+
+% ----------------------------------------------------------------
+\subsection{base frame 与 anchor：root 漂移的处理}
+\label{sec:rlmc-mi-mjlab-baseframe}
+
+\Verb[breaklines]|body_position_tracking| 的实现有一个\emph{必须}做对的细节：误差要在 \textbf{base frame}（相对 pelvis）下算，而不是世界坐标系。下面的代码走读把这一点标出来。
+
+\begin{codebox}[Python]{body\_pos\_tracking\_exp:关键行已标注}
+def body_pos_tracking_exp(env, body_names, std):                    # mjlab 真实参数名是 std（非 sigma）
+    # 当前帧参考 body 位置（来自 motion 命令），shape (N, B, 3)
+    ref_body_pos = env.command_manager.get_command("motion").body_positions
+    body_ids, _ = env.scene["robot"].find_bodies(body_names)         # 名字->id（mjlab Entity.find_bodies，见陷阱）
+    sim_body_pos = env.data.body_pos_w[:, body_ids, :]               # 仿真实际位置 (N,B,3)
+    base_pos  = env.data.root_pos_w[:, :3]                           # (N,3)
+    base_quat = env.data.root_quat_w                                 # (N,4)
+    # [*] 关键:转换到 base frame，剥离 root 漂移的影响
+    ref_local = quat_rotate_inverse(base_quat, ref_body_pos - base_pos.unsqueeze(1))
+    sim_local = quat_rotate_inverse(base_quat, sim_body_pos - base_pos.unsqueeze(1))
+    error = torch.sum((ref_local - sim_local) ** 2, dim=-1)         # per-body L2, (N,B)
+    return torch.exp(-torch.mean(error, dim=-1) / (std ** 2))       # 指数核, (N,)
+\end{codebox}
+
+\begin{note}[本走读对应的真实 mjlab 实现]
+上面的函数名为概念示意。mjlab \Verb[breaklines]|tasks/tracking| 里真实的 body 位置跟踪项是 \Verb[breaklines]|motion_relative_body_position_error_exp(env, command_name, std, ...)|（reward 键 \Verb[breaklines]|motion_body_pos|，默认 \verb|std=0.3|、\verb|weight=1.0|），同样在 anchor/相对坐标下算误差后过 \Verb[breaklines]|exp(-error/std**2)|；root 级则是 \Verb[breaklines]|motion_global_anchor_position_error_exp|/\allowbreak\Verb[breaklines]|motion_global_anchor_orientation_error_exp|（键 \Verb[breaklines]|motion_global_root_pos|/\allowbreak\Verb[breaklines]|motion_global_root_ori|）。指数核宽度参数在 mjlab 里一律叫 \verb|std|（不是 \verb|sigma|）。
+\end{note}
+
+\paragraph{为什么要转到 base frame。}若用世界坐标系的绝对位置，root 漂移（pelvis 在世界中的位置偏移）会\emph{同时}放大所有 body 的误差——即使关节跟踪完美、只是 root 偏了一点，所有 body 的误差都会变大，策略收不到「关节其实对了」的信号。转到 base frame 后，body 跟踪只关注\emph{相对 root 的关节配置}，root 的位置误差交给 \Verb[breaklines]|root_velocity_tracking| 单独处理。这正是 \cref{ch:rlmc-imitation} 的 anchor 思想在 body 级的体现：BeyondMimic 用 anchor 把参考的第一帧对齐到仿真实际位置，后续参考位置 $=$ anchor $+$ 参考的相对偏移，从而把「全局漂移」与「相对姿态」解耦。
+
+\begin{pitfall}[body\_names 拼错会静默失效——reward 在涨但约束缺失]
+\textbf{错误描述}：写成 \Verb[breaklines]|body_names=["torso", "left_foot", ...]|，但 MJCF 里实际叫 \verb|torso_link|（mjlab G1 默认跟踪集用 \Verb[breaklines]|left_ankle_roll_link|/\allowbreak\Verb[breaklines]|left_wrist_yaw_link| 等，全部带 \verb|_link| 后缀）。\textbf{现象后果}：名字正则匹配不到任何 body，\verb|find_bodies| 返回空（或正则误匹配到非预期 body），该 body 不进入误差项；reward 看似在涨（其余 body 撑着），但 torso 完全不跟参考。\textbf{根本原因}：名字到 id 的解析失败被静默处理。\textbf{正确做法}：训练前用 \cref{sec:rlmc-mi-mjlab-run} 的 zero play 打印所有 body\_names 对应的 id，逐一确认非空；这与 \cref{sec:rlmc-imit-track-anchor} 「anchor/body 顺序不匹配」的陷阱同源。
+\end{pitfall}
+
+\begin{pitfall}[RSI 初始化到关节越界帧导致「弹飞」]
+\textbf{错误描述}：uniform RSI 从参考动作随机帧初始化，但某些帧关节角超出 G1 限位（retarget 不可达）。\textbf{现象后果}：reset 后几步内机器人被「弹飞」或数值发散，并刷出大量限位惩罚。\textbf{根本原因}：MuJoCo 把关节限位当\emph{约束}处理（非简单 clip），越界初始态会产生很强的修正力矩。\textbf{正确做法}：RSI 候选集里剔除越界帧（用 \cref{sec:rlmc-mi-kungfu} 的 physics filter 预筛），或 reset 时把关节角投影到限位内再 \verb|mj_forward| 校验。此坑与 \cref{sec:rlmc-imit-track-rsi} 同源，此处强调它在\emph{大规模、低质量 retarget} 时尤其高发。
+\end{pitfall}
+
+% ----------------------------------------------------------------
+\subsection{动作跟踪的观测配置}
+\label{sec:rlmc-mi-mjlab-obs}
+
+呼应 \cref{ins:rlmc-mi-obs}：tracking 观测 $=$ 本体感知（与速度跟踪相同）$+$ 参考运动信息（tracking 特有）。注意它\emph{没有} twist 命令项，也\emph{没有} \verb|base_lin_vel|（真机不可直测，理由同 \cref{ch:rlmc-humanoidloco}），速度信息由\emph{参考}的 root 速度间接提供。
+
+\begin{codebox}[Python]{动作跟踪 actor 观测（概念示意;真实 term 名见下方说明）}
+# 真名为 ObservationTermCfg（mjlab 全名;ObsTerm 是 Isaac Lab 的 import 重命名，mjlab 无）
+cfg.observations.actor = ObservationGroupCfg(enable_corruption=True, terms={
+    # 本体感知（与速度跟踪同）
+    "base_ang_vel":      ObservationTermCfg(func=base_ang_vel),       # 3
+    "projected_gravity": ObservationTermCfg(func=projected_gravity),  # 3
+    "joint_pos":         ObservationTermCfg(func=joint_pos_rel),      # 29
+    "joint_vel":         ObservationTermCfg(func=joint_vel_rel),      # 29
+    "last_action":       ObservationTermCfg(func=last_action),        # 29
+    # 参考运动信息（tracking 特有）——下方说明指出 mjlab 真实用 anchor 相对量
+    "motion_anchor_pos_b": ObservationTermCfg(func=motion_anchor_pos_b,
+                                              params={"command_name": "motion"}),  # 3
+    "motion_anchor_ori_b": ObservationTermCfg(func=motion_anchor_ori_b,
+                                              params={"command_name": "motion"}),  # 6
+    "command":             ObservationTermCfg(func=generated_commands,
+                                              params={"command_name": "motion"}),  # 参考目标
+})
+\end{codebox}
+
+\begin{note}[mjlab tracking 真实观测以 anchor 相对量为主，非逐 body 铺开]
+经实跑核对 \texttt{HybridRobotics/\allowbreak whole\_body\_tracking}（mjlab \Verb[breaklines]|tasks/tracking|，2026-06）：BeyondMimic tracking 的 \textbf{actor} 观测并\emph{不}逐 body 铺开参考位置，而是用一组紧凑的 \textbf{anchor 相对量}——\Verb[breaklines]|motion_anchor_pos_b|（参考躯干位置相对机器人，body frame，3 维）$+$ \Verb[breaklines]|motion_anchor_ori_b|（朝向差，6D 旋转表示）$+$ \Verb[breaklines]|generated_commands(command_name="motion")|（参考目标）$+$ 本体感知（\verb|base_lin_vel|/\allowbreak\verb|base_ang_vel|/\allowbreak\verb|joint_pos_rel|/\allowbreak\verb|joint_vel_rel|/\allowbreak\verb|last_action|）。逐 body 的参考量（\Verb[breaklines]|robot_body_pos_b|/\allowbreak\Verb[breaklines]|robot_body_ori_b|）只放在\emph{非对称的 critic 组}里。anchor body 默认是 \verb|torso_link|。因此「跟踪观测维度约为速度跟踪 1.6 倍」是一个\emph{量级直觉}而非该任务的精确数字；上面的 codebox 为示意，确切维度以你本地任务的 \verb|--help|/打印为准。
+\end{note}
+
+\paragraph{UniLab 的跟踪观测：与 mjlab 同款 anchor 相对量 + 6D 旋转。}UniLab 的 \Verb[breaklines]|G1MotionTracking| actor 观测与 mjlab BeyondMimic \emph{几乎逐字段一致}——本体感知 $+$ 同一组紧凑的 \textbf{motion anchor}（「目标躯干位姿\emph{相对机器人当前}的差」），由 \Verb[breaklines]|_write_motion_anchor_transform| 写入（UniLab，\Verb[breaklines]|envs/motion_tracking/g1|）：躯干级相对位姿差 \Verb[breaklines]|motion_anchor_pos_b|（3）$+$ \Verb[breaklines]|motion_anchor_ori_b|（6），再叠上当帧 \verb|command|（参考关节目标）。\textbf{这正是 BeyondMimic 的设计}——前文已核，mjlab tracking 的 actor 同样用 \Verb[breaklines]|motion_anchor_pos_b|/\allowbreak\Verb[breaklines]|motion_anchor_ori_b|（两框架字段名都一样），逐 body 的参考量都放在非对称的 critic 组里。可以说 UniLab 的跟踪观测是对 BeyondMimic 这套 anchor 方案的忠实复现，而非另一种范式。
+
+\begin{codebox}[Python]{UniLab G1MotionTracking 的跟踪观测（actor 组，相对量）}
+# env._compute_obs（envs/motion_tracking/g1）:actor 组 = 本体感知 + motion anchor
+obs = np.concatenate([
+    gyro, -gravity, joint_pos_rel, joint_vel, last_action,  # 本体感知（同速度跟踪）
+    command,                 # (2n) 当帧参考目标（关节级）
+    motion_anchor_pos_b,     # (3)  目标躯干位置相对机器人（body frame）
+    motion_anchor_ori_b,     # (6)  目标躯干朝向相对机器人（6D 旋转表示）
+], axis=1)
+# 部署变体 G1WBTObs:砍掉真机不可得通道（base_lin_vel / motion_anchor_pos_b），改加本体感知历史
+\end{codebox}
+
+两点值得对照：(1) 朝向差用 \textbf{6D 旋转表示}（占 6 维）是\emph{两框架共同}的选择——mjlab 的 \Verb[breaklines]|motion_anchor_ori_b| 取旋转矩阵前两列（\Verb[breaklines]|matrix_from_quat(ori)[..., :2]|）即 6D 表示，UniLab 同理。6D 表示在神经网络回归旋转时无 double cover、无万向锁，是「喂给策略的旋转目标」的常见稳健选择（这与 reward 内部仍用四元数距离不矛盾：观测求平滑可学，reward 求几何正确）。(2) UniLab 专门给了部署导向变体 \verb|G1WBTObs|：它\emph{砍掉}真机拿不到的 \verb|base_lin_vel| 与 \Verb[breaklines]|motion_anchor_pos_b| 通道、改用本体感知历史——这正是 \cref{ins:rlmc-mi-obs} 所说「观测是分水岭」在部署侧的具体抓手，也是把 tracker 蒸馏到可部署策略时要跨越的信息边界。
+
+% ----------------------------------------------------------------
+\subsection{终止、监控与评估}
+\label{sec:rlmc-mi-mjlab-term}
+
+跟踪任务的终止比速度跟踪多一条 tracking 特有的提前终止；监控也要多看几个 panel。\cref{tab:rlmc-mi-term} 给终止配置，\cref{tab:rlmc-mi-eval} 给评估指标。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{动作跟踪的终止配置}
+\label{tab:rlmc-mi-term}
+\begin{tabular}{@{}llll@{}}
+\toprule
+条件 & 类型 & 阈值 & 说明 \\
+\midrule
+\verb|time_out| & truncation & $=$ 参考动作长度 & 跟完整段 $=$ episode 结束 \\
+\verb|anchor_pos| & terminal & anchor 竖直偏移 $> 0.25$\,m & root(anchor) 离参考太远即止 \\
+\verb|anchor_ori| & terminal & anchor 朝向误差 $> 0.8$ & 朝向偏太多即止 \\
+\verb|ee_body_pos| & terminal & 末端 body 竖直偏移 $> 0.25$\,m & 手/脚离参考太远即止 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{为何用 anchor/末端的「偏离即止」终止（而非笼统的 MPJPE 阈值）。}动机是：策略一旦完全偏离参考，继续 rollout 只会喂给 PPO 大量分布外（OOD）样本、浪费算力。实跑核对 mjlab \Verb[breaklines]|tasks/tracking|（2026-06）：BeyondMimic 用三条 tracking 特有终止——\verb|anchor_pos|（\Verb[breaklines]|bad_anchor_pos_z_only|，阈值 0.25\,m）、\verb|anchor_ori|（\Verb[breaklines]|bad_anchor_ori|，阈值 0.8）、\verb|ee_body_pos|（\Verb[breaklines]|bad_motion_body_pos_z_only|，对末端 body 阈值 0.25\,m），\emph{没有}笼统的 MPJPE$>0.5$ 终止、也没有沿用速度跟踪的 \verb|fell_over|/\allowbreak\Verb[breaklines]|base_height_too_low|（跟踪偏离本身已涵盖摔倒）。概念上你也可以\emph{自加}一条「总 tracking error 过大即止」并对其阈值做课程（初始宽松 $\to$ 逐步收紧），但要清楚这是\emph{额外}设计，不是官方 tracking 任务的默认。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{动作跟踪评估指标与合格区（G1 行走基准）}
+\label{tab:rlmc-mi-eval}
+\begin{tabular}{@{}llll@{}}
+\toprule
+指标 & 计算方式 & 合格区 & 说明 \\
+\midrule
+MPJPE (mm) & 所选跟踪 body 平均欧氏距离 & $<50$ & Mean Per-Joint Position Error \\
+MPBPE (mm) & 所有 body 平均欧氏距离 & $<80$ & Mean Per-Body Position Error \\
+Episode Length Ratio & 实际长度 / 参考长度 & $>0.9$ & 能否跟到动作结束 \\
+Root Tracking Error (m) & root 位置 L2 误差 & $<0.15$ & root 漂移程度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}[MPJPE 是平均欧氏距离，不是均方]
+MPJPE/MPBPE 取的是\emph{逐点欧氏距离的均值}（单位 mm），不是均方误差；而奖励里用的是\emph{均方}误差（喂进指数核）。两者口径不同，别把 reward 数值直接当 MPJPE 读。\cref{ch:rlmc-imitation} 评估协议一节也强调过：只看 reward 会被「MPJPE 低但脚底打滑、动作抖」骗过——几何指标看「像不像」，接触与平滑度看「能不能真机执行」。
+\end{note}
+
+\paragraph{训练曲线的典型五阶段。}G1 跟踪的健康曲线与速度跟踪显著不同：I.\ 站立期（0--1k，在 safe pose 阶段站稳）；II.\ 初始跟踪（1k--3k，root 跟踪快速上升）；III.\ \textbf{全身对齐}（3k--8k，body 跟踪\emph{跳跃式}上升）；IV.\ 精修（8k--15k，MPJPE 缓降）；V.\ 极限（15k+，受物理引擎精度限制收敛）。其中 Stage III 是最关键的相变——策略从「只跟 root 但关节乱」跨到「理解全身参考姿态」。若训练\emph{停滞在 Stage II}（root 对了但 body 不涨），按优先级查：(1) body 跟踪是否在 base frame 下算（否则 root 漂移污染所有 body）；(2) body\_names 是否含足够关键 body（至少 pelvis + 双脚 + 双手）；(3) $\sigma$ 是否过小导致初始信号太弱。
+
+% ----------------------------------------------------------------
+\subsection{运行验证与三框架接线}
+\label{sec:rlmc-mi-mjlab-run}
+
+把上面拼成可跑的五步流程。每步都给「看什么」的验收点——这是「运行验证」一步的核心，不是「跑完就行」。
+
+\begin{codebox}[bash]{mjlab 动作跟踪完整流程（含每步验收点;MOTION 一旦缺失，Step 2 起全报 ValueError）}
+# Step 1 数据准备（~5 min）:见 \S\ref{sec:rlmc-mi-mjlab-data} 的 csv_to_npz，产出本地 NPZ
+python scripts/csv_to_npz.py --input_file g1_walking.csv --input_fps 30 \
+    --output_name g1_walking --headless     # 同时自动注册到 WandB Motions collection
+MOTION=/path/to/g1_walking.npz              # 或改用 --registry-name <org>/motions/g1_walking
+# Step 2 Zero play 验证（~3 min）:看 ghost 是否正常、初始是否对齐、body 是否都存在
+uv run play Mjlab-Tracking-Flat-Unitree-G1 --agent zero --num-envs 2 \
+    --env.commands.motion.motion-file $MOTION --viewer viser --no-terminations
+# Step 3 Small train（~5 min）:只验证无 shape error、reward 在动
+uv run train Mjlab-Tracking-Flat-Unitree-G1 \
+    --env.commands.motion.motion-file $MOTION \
+    --env.scene.num-envs 256 --agent.max-iterations 50
+# Step 4 Large train（1-3 h，视动作复杂度）
+uv run train Mjlab-Tracking-Flat-Unitree-G1 \
+    --env.commands.motion.motion-file $MOTION \
+    --env.scene.num-envs 4096 --agent.max-iterations 20000 \
+    --agent.run-name g1_walking_tracking
+# Step 5 评估:看 MPJPE / ELR / 视频是否完整执行
+uv run play Mjlab-Tracking-Flat-Unitree-G1 \
+    --checkpoint-file logs/.../g1_walking_tracking/model_20000.pt \
+    --env.commands.motion.motion-file $MOTION --num-envs 4 --viewer viser
+\end{codebox}
+
+\begin{practice}[从零搭起：第一次跑通一条 tracking 任务的最小步骤序列]
+新手最常卡在「看不见 ghost」——根因几乎都是\emph{还没有一条 motion 文件}。按下面顺序走，每步都给「跑完该看到什么」，这就是「从零搭一个任务」的最小闭环：
+
+\begin{enumerate}
+\item \textbf{拿到一条 motion}（二选一）。本地路：把一条 retarget 好的 CSV 过 \verb|csv_to_npz.py|（\cref{sec:rlmc-mi-mjlab-data}），\emph{看到}终端打印产物名与 WandB 上传成功、本地 \verb|.npz| 落盘。Registry 路：若团队已注册，直接记下 \Verb[breaklines]|<org>/motions/<name>| 备用。\emph{此步不做，后面一步都跑不动}。
+\item \textbf{zero play 看 ghost}：\Verb[breaklines]|uv run play ... --agent zero --env.commands.motion.motion-file <path>|。\emph{看到}半透明参考 ghost 沿轨迹运动、与机器人初始位姿基本重合。若仍报 \verb|ValueError| $\Rightarrow$ 路径/注册名拼错；若 ghost 不显示或朝向错 $\Rightarrow$ 回 \cref{sec:rlmc-imit-data} 过四元数/帧率契约（\emph{不是}训练问题）。
+\item \textbf{不跑训练先核配置}（强烈推荐的自检——本章 std/阈值/body\_names 等真值正是这样\emph{静态读出来}的，比「跑起来再看 reward」更早暴露 body\_names 拼错）。\textbf{思路}：tracking 任务配置是纯 Python dataclass，不启动仿真也能 import 并打印。先用 \texttt{grep} 在源里定位本地版本的 cfg 类名（不同版本类名可能不同，\emph{不要}记死），再 import 它打印 reward 的 \verb|std|、终止阈值、\Verb[breaklines]|anchor_body_name| 与跟踪 body 集：
+\begin{codebox}[bash]{训练前静态自检:先 grep 定位 cfg 类，再打印 std/threshold/body\_names（不启动训练）}
+# (a) 先定位本地版本的 tracking 配置文件与 cfg 类名（举一反三:不记死类名，自己查）
+PKG=$(uv run --no-sync python -c "import mjlab,os;print(os.path.dirname(mjlab.__file__))")
+grep -rn "class.*EnvCfg" $PKG/tasks/tracking/      # 找到形如 G1...TrackingEnvCfg 的类名
+grep -rn "std\|threshold\|anchor_body_name\|body_names" $PKG/tasks/tracking/  # 看真值落点
+# (b) import 该 cfg 类、遍历打印（把下面 <CfgClass> 换成上一步 grep 到的真实类名）
+uv run --no-sync python - <<'PY'
+import importlib, mjlab.tasks.tracking as T
+cfg_mod = importlib.import_module(T.__name__ + ".tracking_env_cfg")
+Cfg = next(getattr(cfg_mod, n) for n in dir(cfg_mod) if n.endswith("TrackingEnvCfg"))
+cfg = Cfg()                                        # 纯 dataclass，无需仿真
+# 遍历 reward 项打印 weight/std——body_names 拼错（如 torso 而非 torso_link）在此即现形
+for name, term in vars(cfg.rewards).items():
+    p = getattr(term, "params", {}) or {}
+    print(f"{name:30s} weight={getattr(term,'weight',None)} std={p.get('std')} "
+          f"bodies={p.get('body_names', p.get('body_name'))}")
+PY
+# 期望看到 motion_body_pos std=0.3 / motion_body_ori std=0.4 / motion_body_ang_vel std=3.14 …
+\end{codebox}
+（若你本地 cfg 的字段组织与此略有出入，关键不在脚本逐字照跑，而在掌握「配置是可静态 import 的 dataclass，训练前先把 std/阈值/body\_names 打出来核一遍」这一招。）
+\item \textbf{Step 3 small train 冒烟}：256 env、50 iter，\emph{看到} reward 在动、无 shape error 即接线正确（\emph{非}收敛）。
+\item \textbf{Step 4 正式训练 + Step 5 评估}：看 MPJPE/ELR 与回放视频是否完整执行（合格区见 \cref{tab:rlmc-mi-eval}）。
+\end{enumerate}
+\end{practice}
+
+\paragraph{部署时的额外负担。}与速度跟踪的 ONNX 不同，跟踪策略的 ONNX 输入除本体感知外还需\emph{参考运动当前帧}——部署时必须有一个 motion player 在后台按控制频率步进参考动作，把当前帧的 body 位置/关节角/root 速度喂给 ONNX。BeyondMimic 官方把这条 sim-to-sim / sim-to-real 部署链单独放在 \Verb[breaklines]|HybridRobotics/motion_tracking_controller| 仓库（whole\_body\_tracking README 明确指向它）；ProtoMotions 更进一步——导出的 ONNX 内置观测计算，部署框架只需喂原始传感器。\textbf{UniLab 在这一步反而最工程化}：它把「参考运动随策略一起部署」做成了一条独立工具链（UniLab，\Verb[breaklines]|scripts/deploy/|）——\Verb[breaklines]|export_motion_bin.py| 把参考运动导成 \verb|.bin|、\Verb[breaklines]|export_deploy_config.py| 导出 \Verb[breaklines]|deploy_config.yaml|（记 \verb|obs_layout|/\allowbreak\verb|obs_dim|/\allowbreak\Verb[breaklines]|default_angles|/action scale）、\Verb[breaklines]|sim_prototype.py| 再用 ONNX 策略在 MuJoCo 逐段\emph{校验 obs 装配 == 训练侧}（写 C++ 部署状态机前的验证），并配套 \Verb[breaklines]|prepend_warmup.py|/\allowbreak\Verb[breaklines]|append_cooldown.py| 给部署轨迹加起止过渡（对应 \cref{sec:rlmc-mi-mjlab-data} 的 safe pose）；前述 \verb|G1WBTObs| 任务正是为这条部署链而设（去掉真机不可得通道）。各算法都导可部署 \verb|policy.onnx| 并用 onnxruntime 自验，差异只在时机：PPO 在 play/eval 阶段导（故 \Verb[breaklines]|training.no_play=true| 时不导），off-policy 由 \verb|export_onnx| flag 控、训练流程内导。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{动作跟踪——「跑通一条动作」的三框架接线对比}
+\label{tab:rlmc-mi-run3}
+\begin{tabularx}{\linewidth}{@{}lLLL@{}}
+\toprule
+环节 & mjlab (BeyondMimic) & Isaac Lab (ProtoMotions) & UniLab \\
+\midrule
+任务/入口 & \Verb[breaklines]|Mjlab-Tracking-Flat-Unitree-G1| & \Verb[breaklines]|train_agent.py| \Verb[breaklines]|--experiment-path .../mimic/mlp.py| & \Verb[breaklines]|train --algo ppo --task g1_motion_tracking --sim mujoco| \\
+数据格式 & NPZ（\verb|csv_to_npz.py|） & MotionLib \verb|.pt| & NPZ（\verb|MotionLoader|$\to$\verb|MotionData|） \\
+数据管理 & WandB Registry & 本地 + manifest & 本地 \verb|.npz| + \Verb[breaklines]|unilab-pull-assets|（HF） \\
+可视化回放 & \Verb[breaklines]|play --agent zero| \verb|--motion-file|（必带） & \verb|eval_agent.py| & \Verb[breaklines]|demo dance| / \Verb[breaklines]|eval --load-run| \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+UniLab 这一列已据实测注册任务填出（注册名 \Verb[breaklines]|G1MotionTracking|，CLI slug \Verb[breaklines]|g1_motion_tracking|，源码 \Verb[breaklines]|envs/motion_tracking/g1|）；唯一与 mjlab/Isaac Lab 不同的「坑」是\textbf{回放}：UniLab 无 \Verb[breaklines]|--agent zero| 零动作回放，最小可视化走 \Verb[breaklines]|uv run demo dance|（预训练）或 \Verb[breaklines]|uv run eval ... --load-run -1 --render-mode record|（自己训出的 checkpoint）。off-policy 变体 \Verb[breaklines]|G1MotionTrackingSAC| 与特技/交互任务 \Verb[breaklines]|G1FlipTracking| / \verb|G1BoxTracking| / \Verb[breaklines]|G1ClimbTracking| 同族注册。
+
+\begin{note}[一条 UniLab 跟踪冒烟的实测基准（RTX 4080S）：steps/s 与非对称观测维度]
+实跑 \Verb[breaklines]|train --algo ppo --task g1_motion_tracking --sim mujoco algo.num_envs=16| \Verb[breaklines]|algo.max_iterations=1 training.no_play=true|（CPU MuJoCo 后端、16 env 冷启）：\textbf{约 343 steps/s}，reward 日志键与上面 codebox 逐项一致。一个值得记住的细节是观测维度——\textbf{actor 29 维、critic 286 维}，差出近 10 倍，正是 \cref{ins:rlmc-mi-obs} 与 \cref{sec:rlmc-mi-mjlab-obs} 所说「非对称 actor-critic：逐 body 的参考量只喂 critic」的实测印证（actor 只看本体感知 $+$ 紧凑 anchor，critic 额外吃逐 body 参考量）。注意 16 env 是\emph{小并行冷启}值，CPU-sim 大并行热稳态会高出一个量级；判断自己机器 steps/s 是否正常的心法见 \cref{ch:rlmc-imitation}（$\text{sps}\approx N_{\text{env}}\times f_{\text{ctrl}}\times \eta_{\text{并行}}$，小并行/JIT 冷启偏低属良性）。另：\verb|--algo| 实测支持 \Verb[breaklines]|ppo/mlx_ppo/appo/sac/td3/flashsac| 六种——除正文强调的 PPO/APPO/SAC 外，\verb|td3|/\allowbreak\verb|flashsac| 亦可作 off-policy 备选（off-policy 走 \Verb[breaklines]|training.num_gpus=N| 多卡原生，见 \cref{sec:rlmc-mi-scale-shard}）。\end{note}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[实验]} 选一条高动态参考动作（如侧踢/旋身/冲刺，BeyondMimic 动作源含 KungfuBot sidekick、LAFAN1、ASAP 等）从动作数据跑到训练，记录 (a) 20000 iter 后的 MPJPE、(b) ELR、(c) 视频观察动作是否完整。验收：能给出三项数值并判断是否进入 Stage III。
+  \item \textbf{[分析]} 对比动作跟踪与速度跟踪的 actor 观测项：哪些共有、哪些 tracking 特有、特有项来自 sensor 还是 command？验收：能指出特有项全部来自 motion 命令而非 sensor。
+  \item \textbf{[设计]} 若要让 G1 跟一段\emph{跑步}，body\_names 相对行走该增什么？为什么？验收：能论证为何要加入与摆臂/腾空相关的 body（如 elbow/foot 的腾空判定权重）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{ProtoMotions：在统一框架里切换 Mimic/AMP/ASE/CALM}
+\label{sec:rlmc-mi-proto}
+
+\textbf{这一节解决什么问题}：\cref{sec:rlmc-mi-mjlab} 的直接跟踪要求每帧精确对齐参考。当任务变得多样（导航、避障、交互）时，这种强约束限制了灵活性。ProtoMotions 把直接跟踪（Mimic）与对抗风格（AMP/ASE/CALM）统一在一个代码库里，用配置切换。本节聚焦\emph{切换的工程接缝}——AMP 的判别器原理已在 \cref{sec:rlmc-imit-amp} 讲透，这里不重复，只讲「在 ProtoMotions 里怎么切、切换改了哪几处」。
+
+% ----------------------------------------------------------------
+\subsection{为什么需要 AMP/ASE——直接跟踪的边界}
+\label{sec:rlmc-mi-proto-why}
+
+\cref{tab:rlmc-mi-prior} 把四种方法在「约束方式 / 灵活性 / 精确度」上排开。一句话：约束越软（从逐帧 MSE 到判别器分布匹配，再到加 latent、加文本条件），灵活性越高、精确度越低。选哪个取决于你要「精确复现一条动作」还是「像人一样自由动」。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{从直接跟踪到对抗风格：约束-灵活-精确的三角权衡}
+\label{tab:rlmc-mi-prior}
+\begin{tabular}{@{}llll@{}}
+\toprule
+方法 & 约束方式 & 灵活性 & 精确度 \\
+\midrule
+直接跟踪 (BeyondMimic/Mimic) & 逐帧 MSE/指数核 & 低（必须按参考走） & 高（MPJPE $<50$\,mm） \\
+AMP\,\cite{peng2021amp} & 判别器区分真/假动作 & 中（可自由组合多动作） & 中（风格对但不精确） \\
+ASE\,\cite{peng2022ase} & AMP + latent skill 编码 & 高（高层策略选/混技能） & 中 \\
+CALM\,\cite{tessler2023calm} & ASE + 文本条件 & 最高（文本控风格） & 低（条件越抽象越不准） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{paper}[ProtoMotions：把一族动作学习算法统一进一个代码库]\label{paper:rlmc-mi-proto}
+\textbf{问题}：AMP/ASE/CALM/MaskedMimic 与直接跟踪各有独立实现，难以公平对比、难以复用。\textbf{核心思想}：所有 agent 共享 PPO 训练循环，差异只在 loss 组成——AMP 在 PPO loss 上加判别器 loss，ASE 在 AMP 上加 encoder loss，CALM 再把判别器/encoder 变成文本条件版。类继承大致为 \verb|BaseAgent|$\to$\verb|PPO|$\to$\verb|AMP|$\to$\verb|ASE|，\verb|Mimic| 扩展自 PPO/AMP，MaskedMimic 走 BC 蒸馏。\textbf{关键结果}：README 称可在 4$\times$A100 上 12 小时内学完整个公开 AMASS（40+ 小时）数据集的动作技能；支持 IsaacGym/Isaac Lab/MuJoCo/Newton/Genesis 多后端\,\cite{protomotions2024}。\textbf{与本书关系}：本节的算法切换、\cref{sec:rlmc-mi-scale} 的分布式与 adaptive sampling 都建立在它之上。\textbf{局限}：MuJoCo 后端仅 CPU、单环境，只用于调试；训练须用 GPU 后端。Apache-2.0 许可。
+\end{paper}
+
+% ----------------------------------------------------------------
+\subsection{切换的工程接缝：dataclass 入口与三处改动}
+\label{sec:rlmc-mi-proto-switch}
+
+\begin{pitfall}[ProtoMotions 已是 dataclass 入口，不要再用旧 Hydra \texttt{+exp=}]
+\textbf{错误描述}：照旧教程写 \Verb[breaklines]|train_agent.py +exp=amp_mlp +robot=g1 +simulator=isaacgym motion_file=...|。\textbf{现象后果}：当前 ProtoMotions（ProtoMotions3）不再用 Hydra 的 \verb|+key=val| 覆盖语法，命令解析失败或行为不符预期。\textbf{根本原因}：入口已改为\emph{dataclass} 风格的显式 flag。\textbf{正确做法}：用 \Verb[breaklines]|--experiment-path| 指向实验配置 \verb|.py|、\verb|--robot-name|、\verb|--simulator|、\Verb[breaklines]|--motion-file *.pt|（与 \cref{sec:rlmc-imit-amp} 一致）。下面命令以 \texttt{NVlabs/\allowbreak ProtoMotions} README 为准。
+\end{pitfall}
+
+\begin{codebox}[bash]{ProtoMotions:直接跟踪(Mimic) 与对抗(AMP) 的入口对比}
+# 直接跟踪（类似 BeyondMimic 的 expert）
+python protomotions/train_agent.py \
+    --experiment-path examples/experiments/mimic/mlp.py \
+    --robot-name g1 --simulator isaacgym \
+    --motion-file data/motions/walking.pt --num-envs 4096
+# 切到 AMP:只换 --experiment-path 指向的实验文件，其余不变
+python protomotions/train_agent.py \
+    --experiment-path examples/experiments/amp/mlp.py \
+    --robot-name g1 --simulator isaacgym \
+    --motion-file data/motions/walking.pt --num-envs 4096
+\end{codebox}
+
+\paragraph{从 AMP 到 ASE 到 CALM，配置上多了什么。}三者的实验配置呈\emph{层层叠加}关系，理解「每层新增了什么组件」就够了，不必读全部实现：
+
+\begin{itemize}
+  \item \textbf{AMP $\to$ ASE}：新增一个 latent skill encoder（潜空间维度如 \verb|latent_dim=64|）与对应的 encoder loss 权重。判别器不变。
+  \item \textbf{ASE $\to$ CALM}：把判别器与 encoder 换成\emph{条件版}（加 \Verb[breaklines]|condition_dim=512| 的文本嵌入），并新增一个 CLIP 文本编码器（如 ViT-B/32）。
+\end{itemize}
+
+\begin{insight}[「切算法 = 改实验文件指针」背后的统一抽象]\label{ins:rlmc-mi-switch}
+源稿把「AMP$\to$CALM 约 30 行配置差异」当卖点。更深一层看：之所以能这样切，是因为 ProtoMotions 把「算法」抽象成「在共享 PPO 循环上挂哪几个额外 loss 模块」。AMP $=$ PPO $+$ 判别器；ASE $=$ AMP $+$ encoder；CALM $=$ ASE $+$ 文本条件。你不是在「换算法」，而是在「往同一根训练循环上插拔模块」。这与 \cref{ch:rlmc-manager} 的 Manager 架构是同一种工程哲学——用可组合的 term/module 取代单体实现。\rebuilt{「约 30 行」是源稿对历史 Hydra 配置的估计；现行 dataclass 实验文件的确切行数请以你本地仓库为准。}
+\end{insight}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{ProtoMotions 算法切换的三框架视角（mjlab 不内置对抗算法）}
+\label{tab:rlmc-mi-switch3}
+\begin{tabularx}{\linewidth}{@{}lLLL@{}}
+\toprule
+能力 & mjlab & Isaac Lab (ProtoMotions) & UniLab \\
+\midrule
+直接跟踪 & \textbf{原生}（BeyondMimic） & Mimic & \textbf{原生}（\Verb[breaklines]|G1MotionTracking|，PPO/APPO/SAC） \\
+AMP/ASE/CALM & 无（需自接） & \textbf{内置，改 \texttt{--experiment-path} 即切} & 无（判别器需自实现，见下） \\
+文本条件 & 无 & CALM（CLIP 文本编码器） & 无（CALM/MaskedMimic 需自实现） \\
+后端 & MuJoCo Warp & IsaacGym/Lab/Newton/Genesis & CPU MuJoCoUni / MotrixSim \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{UniLab：给了显式跟踪的完整解，对抗式风格是「能自己搭、无现成开关」。}这是必须\emph{诚实标注}的一处框架欠缺——UniLab 的运动技能主线是\textbf{显式动作跟踪 $+$ RL}（\Verb[breaklines]|G1MotionTracking| 系列，含 PPO/APPO/SAC 三种算法变体），\emph{没有}把 AMP 判别器做成一等公民的 reward。好在它的 reward 范式留了口子：判别器 style reward 可以写成一个普通函数放进 \verb|_reward_fns| 派发表、在 \verb|reward.scales| 里给权重即参与 \Verb[breaklines]|run_reward_dispatch| 求和；但判别器网络的训练循环、replay buffer、参考 $(s,s')$ 数据加载都得自己接——且 UniLab 还要额外考虑判别器更新跑在 GPU learner 进程、$(s,s')$ 采集在 CPU collector 进程，跨进程数据流要自己挂到它的共享内存 IPC 上（这点与「Isaac Lab 原生 AMP」处境相同，但多一层异构边界）。同理 ASE 的 latent skill、CALM 的文本条件、MaskedMimic 的 inpainting 在 UniLab 中也\textbf{均无对应、需自实现}。换句话说：要精确复现一条动作，UniLab 与 mjlab 一样开箱即用；要「像人一样自由组合风格」，UniLab 目前只能自己搭判别器。
+
+\begin{pitfall}[ProtoMotions 的 MuJoCo 后端只能 num\_envs=1]
+\textbf{错误描述}：用 \Verb[breaklines]|--simulator mujoco --num-envs 4096| 想加速训练。\textbf{现象后果}：要么报错、要么极慢。\textbf{根本原因}：ProtoMotions 的 MuJoCo 后端是 CPU-only、单环境，仅供调试/可视化。\textbf{正确做法}：训练用 GPU 后端（IsaacGym/Isaac Lab/Newton/Genesis）；MuJoCo 后端只用来做 sim-to-sim 校验或看单条 rollout。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[实验]} 在 ProtoMotions 里用 Mimic 与 AMP 训同一条行走，5000 iter 后对比 (a) 动作自然度（视频）、(b) MPJPE、(c) 收到不同命令时的灵活性。验收：能解释「为何 AMP 视觉更自然但 MPJPE 更高」。
+  \item \textbf{[配置]} 写出从 AMP 切到 ASE 需改的具体项；解释 \verb|latent_dim=64| 的含义，若改 8 或 256 各有何影响。验收：能从「技能潜空间表达力 vs.\ 过拟合」两端论证。
+  \item \textbf{[综合，跨章]} AMP 判别器与 \cref{sec:rlmc-priv-distill} 的 teacher-student 蒸馏都「用一个额外网络指导策略」。列 3 个相同点、3 个不同点。验收：能指出关键差异——判别器提供\emph{对抗}信号（分布匹配），teacher 提供\emph{监督}信号（动作/特征回归）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{大规模训练工程}
+\label{sec:rlmc-mi-scale}
+
+\textbf{这一节解决什么问题}：单条动作只需一卡几小时。但要建\emph{通用运动技能库}（走/跑/跳/踢/转身），需从数千乃至数十万条动作训练。本节讲规模化的三个核心工程件：per-GPU 分片、inter-motion adaptive sampling、motion quality filtering。
+
+% ----------------------------------------------------------------
+\subsection{规模与硬件：两个基准不要混淆}
+\label{sec:rlmc-mi-scale-budget}
+
+\begin{pitfall}[AMASS 全集与 BONES-SEED 是两个不同基准，硬件/时间别张冠李戴]
+\textbf{错误描述}：把「142K motions」与「4$\times$A100、12 小时」绑在一起当成同一行。\textbf{现象后果}：低估超大规模训练的资源需求。\textbf{根本原因}：源稿小结表把两个基准并排，易被误读。\textbf{正确做法}：分清两者——(1) \textbf{AMASS 全集（40+ 小时，约上万条）}：ProtoMotions README 明言可在 \textbf{4$\times$A100 上约 12 小时}训完；(2) \textbf{BONES-SEED（约 142K motions，约 288 小时、522 名受试者）}：是更大的数据集，ProtoMotions 在其上训练单一 General Tracking Policy 并零样本迁移到 Unitree G1——官方 README 明确记录该规模训练用了 \textbf{24$\times$A100}（每卡分到约 13K motions，即按 GPU 分片 MotionLib）；具体 wall-clock 耗时官方未公布，以你的官方日志为准。
+\end{pitfall}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{动作库规模与资源（量级参考，非精确承诺）}
+\label{tab:rlmc-mi-scaletab}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+规模 & 动作数 & GPU & 训练时间 & 典型用途 \\
+\midrule
+单条 & 1 & 1$\times$4090 & 1--3\,h & 特定技能（旋踢/舞蹈） \\
+小规模 & 10--50 & 1$\times$4090 & 6--12\,h & 基本运动库 \\
+中规模 & 100--1000 & 1--2$\times$A100 & 1--3\,天 & 丰富运动库 \\
+AMASS 全集 & 40+\,h（约上万条） & 4$\times$A100 & $\sim$12\,h & 通用 tracker \\
+BONES-SEED & $\sim$142K & 24$\times$A100 & \rebuilt{官方未公布} & G1 通用 tracker \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ----------------------------------------------------------------
+\subsection{per-GPU motion 分片}
+\label{sec:rlmc-mi-scale-shard}
+
+当动作集太大（如 142K 条）无法整体放入单卡内存，做 per-GPU 分片：每卡只加载自己那片动作、但所有卡共享同一策略网络（通过分布式 PPO 的 gradient allreduce 同步）。
+
+\begin{codebox}[Python]{分布式 motion 分片（核心逻辑，关键行已注）}
+class DistributedMotionLoader:
+    def __init__(self, manifest_path, num_envs_per_gpu=4096):
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
+        all_motions = self._load_manifest(manifest_path)  # 各卡都读完整列表保证一致
+        random.seed(42)              # [*] 所有卡同种子 -> 同一打乱顺序 -> 分片不重叠不遗漏
+        random.shuffle(all_motions)  # [*] 随机打乱再切，确保每片动作类型均匀
+        per_gpu = len(all_motions) // self.world_size
+        start = self.rank * per_gpu
+        end = start + per_gpu if self.rank < self.world_size - 1 else len(all_motions)
+        self.my_motions = all_motions[start:end]          # 本卡分片
+\end{codebox}
+
+\begin{pitfall}[分片必须随机，不能按动作类型切]
+\textbf{错误描述}：图省事把「走路给 GPU0、跳跃给 GPU3」。\textbf{现象后果}：各卡看到的数据分布不同，allreduce 出来的梯度方向相互打架，训练不稳或收敛差。\textbf{根本原因}：DDP 假设各卡是同分布的无偏样本。\textbf{正确做法}：先\emph{固定同种子打乱}再切片（见上代码标 [*] 的行），让每片都是全集的均匀子样本。另外，advantage normalization 的 mean/std 也要在 normalize \emph{前}用 \verb|all_reduce| 跨卡同步，否则各卡归一化口径不一致。
+\end{pitfall}
+
+\paragraph{UniLab 的分布式：异构 CPU-sim 让多卡走「rank-local H2D」而非 GPU 漏斗。}前面的 per-GPU 分片假设的是 mjlab/Isaac 那种「物理与策略都在 GPU、靠 \verb|torchrun| 起 DDP」的同构范式。UniLab 是\emph{异构}的——物理仿真在 CPU（MuJoCoUni/MotrixSim 多线程），策略在 GPU——所以它的多卡机制也不同：off-policy（SAC/TD3）原生支持 \Verb[breaklines]|training.num_gpus=N|，每个 rank 有\emph{独立}的 host slot 与 H2D stream（UniLab，\Verb[breaklines]|MultiGPUCPUPinnedReplayPipeline|），CPU 采的 transition 直接 pinned-host$\to$对应 GPU 异步搬运，\textbf{不经 rank0 漏斗}。这把本节「分片要均匀」的关注点，换成了「CPU$\to$GPU 这条边界要可计量、可预取」——而异构设计也带来一个 GPU-sim 框架没有的失败面：共享内存（\verb|/dev/shm|）可能被大 replay buffer 撑爆，UniLab 在分配前算预算、超 \verb|/dev/shm| 80\% 直接 \verb|MemoryError| 并提示「减小 \verb|algo.num_envs| 或 \Verb[breaklines]|algo.replay_buffer_n|」（\Verb[breaklines]|ipc/memory_budget.py|；\Verb[breaklines]|UNILAB_SKIP_MEMORY_CHECK=1| 可关）。对大规模\emph{动作}表本身：动作数据原生在 CPU 共享内存里，瓶颈通常不在动作表（\cref{tab:rlmc-mi-scaletab} 的练习已估算其量级），而在并行环境状态与 H2D 吞吐。
+
+% ----------------------------------------------------------------
+\subsection{inter-motion adaptive sampling}
+\label{sec:rlmc-mi-scale-adaptive}
+
+均匀采样所有动作不是最优：简单动作（站、慢走）很快学会，难动作（旋踢）正样本不足、可能永远学不会。adaptive sampling 按策略在每条动作上的表现动态调整采样概率——\emph{失败的动作获得更多采样}。
+
+\begin{codebox}[Python]{inter-motion AdaptiveMotionSampler（按失败率加权）}
+class AdaptiveMotionSampler:
+    def __init__(self, motions, alpha=0.01, min_weight=0.1):
+        self.success_rates = {i: 0.5 for i in range(len(motions))}  # 成功率 EMA，初始 0.5
+        self.alpha, self.min_weight = alpha, min_weight
+    def update(self, motion_ids, ep_len, max_len):       # 用 episode 长度比当成功率代理
+        for i in range(len(motion_ids)):
+            mid = motion_ids[i].item()
+            s = ep_len[i].item() / max(max_len[i].item(), 1)
+            self.success_rates[mid] = (1-self.alpha)*self.success_rates[mid] + self.alpha*s
+    def sample(self, batch):
+        w = torch.tensor([ (1.0-self.success_rates[i]) + self.min_weight   # 失败率 + 地板
+                           for i in range(len(self.success_rates)) ])
+        return torch.multinomial(w / w.sum(), batch, replacement=True)     # 按权重多项式采样
+\end{codebox}
+
+\begin{note}[两层 adaptive，别混为一谈]
+\cref{sec:rlmc-imit-track-rsi} 也提过 adaptive——那是\textbf{单条动作内}的帧采样（从哪一帧开始 episode，intra-motion）。本节是\textbf{多条动作间}的采样（选哪条动作来训，inter-motion）。两者\emph{互补}、可同时用：先用 inter-motion adaptive 选一条难动作，再用 intra-motion adaptive 选该动作里的难片段。\cref{sec:rlmc-imit-track-protocol} 还提醒：阶段 3 还没基本收敛就开 adaptive，会把采样集中到「随机失败」而非「真正难点」。
+\end{note}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{adaptive sampling 与地形课程（\cref{ch:rlmc-quadloco}）都是「按表现调训练分布」}
+\label{tab:rlmc-mi-curr}
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & 地形课程 (\cref{ch:rlmc-quadloco}) & adaptive sampling \\
+\midrule
+调整对象 & 地形难度 level & motion 采样概率 \\
+调整粒度 & per-env & per-motion \\
+反馈信号 & episode return & episode 长度比 \\
+调整方向 & 表现好的 env 去更难地形 & 表现差的 motion 获更多采样 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{大规模训练的健康信号：成功率分布从双峰到单峰。}监控每条动作成功率的\emph{直方图}。规模化训练初期常呈\textbf{双峰}——一批简单动作快速收敛（峰在 0.7+），一批高动态完全不会（峰在 0--0.3）。随训练推进，双峰应逐渐\emph{合并为单峰}（大部分动作都会了）。若双峰长期不合并，强烈提示那批难动作\emph{物理不可行}——该上 quality filter（\cref{sec:rlmc-mi-scale-filter}）。
+
+% ----------------------------------------------------------------
+\subsection{motion quality filtering}
+\label{sec:rlmc-mi-scale-filter}
+
+并非所有参考动作都适合训练。从 AMASS 或视频提取的动作可能含物理不可行片段——脚在空中却无对应接触、质心超出支撑多边形却不摔。直接拿来训会让策略学到「物理上不可能但数据里存在」的行为。\cref{sec:rlmc-mi-kungfu} 的 KungfuBot physics filter 是目前最系统的方案；这里先给最基本的三项检查。
+
+\begin{codebox}[Python]{基本质量检查:限位 / root 高度 / 速度上限}
+def check_motion_quality(motion, robot):
+    issues = []
+    for t in range(len(motion)):
+        for j in range(robot.nq):                          # 1) 关节角在限位内
+            if not (robot.joint_range[j,0] <= motion.joint_pos[t,j] <= robot.joint_range[j,1]):
+                issues.append((t, j, "joint out of limit"))
+        if motion.root_pos[t,2] < 0.1:                     # 2) root 不在地下
+            issues.append((t, "root too low"))
+        if t > 0:                                          # 3) 相邻帧速度不超物理上限
+            v = (motion.root_pos[t]-motion.root_pos[t-1]) * motion.fps
+            if torch.norm(v) > 5.0:                        # 5 m/s 经验上限
+                issues.append((t, "root vel too high"))
+    return issues
+\end{codebox}
+
+\begin{insight}[质量优先于数量]\label{ins:rlmc-mi-quality}
+「更多 motion $=$ 更好策略」是规模化最常见的误区。若低质量动作占比过大，策略会学到\emph{平均化}行为——每条都能跟一点、但没一条做得好。先用 quality filter 清洗、再谈规模。这与 \cref{ch:rlmc-imitation} 「retarget 不可达」的告诫一脉相承：动作跟踪的上限由\emph{参考数据的物理可行性}决定，不是由动作\emph{数量}决定。
+\end{insight}
+
+\begin{pitfall}[motion 长度差异导致 PPO 的 batch padding 问题]
+\textbf{错误描述}：episode 长度直接等于 motion 长度，而库里动作从 3\,s 到 30\,s 不等。\textbf{现象后果}：一个 batch 里 episode 长度差异巨大，PPO 的优势计算需要固定长度 trajectory，对不齐。\textbf{根本原因}：变长 rollout 与定长 advantage 估计的张力。\textbf{正确做法}：(a) 把长 motion 切成固定长度片段，或 (b) 变长 rollout + padding 并在 GAE 里正确 mask 掉 padding 部分。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[设计]} 把 adaptive sampling 改成用「最近成功率」（滑窗）而非「累积成功率」。为何最近成功率可能更好？什么情况下累积更好？验收：能从「策略在进步、旧成功率过时」论证滑窗的优势。
+  \item \textbf{[计算]} 142K motions，平均每条 3\,s$\times$50\,Hz$=$150 帧，每帧 36 列（root 7 + joints 29）$\times$ float32 $=$ 144\,B。整库约多少 GB？能否放进一张 40\,GB A100？验收：算出约 $142000\times150\times144\,\text{B}\approx 2.9\times10^{9}$\,B $\approx 2.9$\,GB，结论「原始动作数据本身可放下，瓶颈在并行环境状态而非动作表」。
+  \item \textbf{[综合，跨章]} adaptive sampling 与 \cref{ch:rlmc-quadloco} 地形课程的共同点？对比调整对象、频率、反馈信号（见 \cref{tab:rlmc-mi-curr}）。验收：能归纳两者都是 curriculum learning 在不同维度的实例。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{PHC 的 Progressive Networks：治灾难性遗忘}
+\label{sec:rlmc-mi-phc}
+
+\textbf{这一节解决什么问题}：理解为什么\emph{单个 MLP} 无法扩展到数千条动作，以及 PHC 的 PMCP 如何用 progressive networks 避免灾难性遗忘。
+
+% ----------------------------------------------------------------
+\subsection{问题：大规模动作的灾难性遗忘}
+\label{sec:rlmc-mi-phc-problem}
+
+用单个 MLP 同时跟踪 1000+ 条动作会遇到\textbf{灾难性遗忘}（catastrophic forgetting）：学新动作时覆盖旧动作的参数。先学走路（学会）$\to$ 再学跑步（学会，走路变差）$\to$ 再学旋踢（学会，走路和跑步严重退化）。
+
+\paragraph{跨领域类比。}像用同一张白纸先后写三份文件——每写新文件都会部分擦除旧文件。纸的面积（网络容量）有限，新旧知识争夺同一参数空间。
+
+% ----------------------------------------------------------------
+\subsection{PMCP：冻结旧网络 + 乘法门控新增 primitive}
+\label{sec:rlmc-mi-phc-pmcp}
+
+\begin{paper}[PHC：用 progressive networks 把动作跟踪扩到上万条]\label{paper:rlmc-mi-phc}
+\textbf{问题}：如何让一个物理仿真人形\emph{不靠外力}跟踪 AMASS 这种大规模动作库，还能从跌倒中恢复、不灾难遗忘。\textbf{核心思想}：Progressive Multiplicative Control Policy（PMCP）——不在同一网络上反复训练，而是为「越来越难的动作序列」\emph{动态分配新的网络容量}：每组新动作训一个新 primitive，训完冻结，新旧 primitive 用\emph{乘法门控 + 加法残差}组合。\textbf{关键结果}：可扩展到约 10\,000 条动作片段，并支持失败恢复\,\cite{luo2023phc}。\textbf{与本书关系}：它是 \cref{ch:rlmc-imitation} 显式跟踪线上「规模化不遗忘」的代表性解法，与 \cref{sec:rlmc-mi-scale} 的 adaptive sampling 互补（一个治容量、一个治采样）。\textbf{局限}：原始代码基于 IsaacGym Preview 4（非 Manager-Based），不能直接用于 mjlab/Isaac Lab；MuJoCo 版在 \texttt{ZhengyiLuo/\allowbreak PHC\_MJX}。PHC 为 Luo, Cao, Winkler, Kitani, Xu，ICCV 2023（arXiv:2305.06456）。
+\end{paper}
+
+PMCP 的前向计算是「逐 primitive 叠加」的。设第 0 个 primitive 输出基础动作，之后每个新 primitive 通过 gate $g_i\in[0,1]$（Sigmoid）与残差 $a_i$ 组合：
+\begin{equation}
+\mathbf{a} = \big(\cdots(\mathbf{a}_0\odot \mathbf{g}_1 + \mathbf{a}_1)\odot \mathbf{g}_2 + \mathbf{a}_2\big)\cdots,
+\label{eq:rlmc-mi-pmcp}
+\end{equation}
+其中 $\odot$ 是逐元素乘。训练时只更新当前 primitive，旧 primitive 与其 gate 全部冻结。
+
+\begin{codebox}[Python]{PMCP 前向与「新增/冻结」操作（概念实现）}
+class PMCP(nn.Module):
+    def forward(self, obs):
+        action = self.primitives[0](obs)                  # primitive 0:基础动作
+        for i in range(1, len(self.primitives)):
+            gate = self.gates[i-1](obs)                    # (N, A)，Sigmoid in [0,1]
+            residual = self.primitives[i](obs)
+            action = action * gate + residual             # 式(\ref{eq:rlmc-mi-pmcp}):乘法门控+加法残差
+        return action
+    def freeze_primitive(self, idx):                       # 训完即冻结，旧技能不再被改写
+        for p in self.primitives[idx].parameters(): p.requires_grad = False
+        if idx > 0:
+            for p in self.gates[idx-1].parameters(): p.requires_grad = False
+\end{codebox}
+
+\begin{insight}[PMCP 把「学新技能」和「保旧技能」两个目标解耦]\label{ins:rlmc-mi-pmcp}
+PMCP 的真正创新不是「用更大的网络」，而是把两个本质冲突的目标解耦：传统方法在同一参数空间里同时求「学会新动作」与「别忘旧动作」（必然打架）；PMCP 给每个新技能\emph{独立}的参数空间（冻结旧参数 + 新增 primitive），推理时用 gate 动态选择。像一个人学了钢琴再学吉他——不是拿练钢琴的手指肌肉去弹吉他（会毁掉钢琴技巧），而是发展新的肌肉记忆、同时保留旧的。
+\end{insight}
+
+\paragraph{反面：若用加法而非乘法门控会怎样。}纯加法 $\mathbf{a}=\mathbf{a}_0+\mathbf{a}_1+\mathbf{a}_2$ 把新 primitive 的输出\emph{直接}叠到旧的上——若新 primitive 对旧动作产生了错误残差，旧技能立刻被破坏。乘法门控 $\mathbf{a}=\mathbf{a}_0\odot\mathbf{g}_1+\mathbf{a}_1$ 让 gate 可以\emph{选择性关闭}新 primitive 的影响（$\mathbf{g}_1=1,\mathbf{a}_1=0$ 时完全保留旧行为），对旧行为的保护更强。
+
+% ----------------------------------------------------------------
+\subsection{progressive mining 与训练循环}
+\label{sec:rlmc-mi-phc-mining}
+
+PMCP 配套一套 progressive mining：每轮训完，评估全集、挑出当前策略\emph{跟不动}的动作（hard set）作为下一个 primitive 的训练集。每轮 hard set 越来越小（全集 $\to\sim$40\% 失败 $\to\sim$15\% 失败 $\to\cdots$），最后只剩最极端的动作（快速旋转、极限弯曲）。
+
+\begin{algo}[PHC progressive 训练循环]\label{alg:rlmc-mi-phc}
+\textbf{输入}：动作全集 $\mathcal{M}$，轮数 $R$，成功率阈值 $\tau$（建议 0.7，别设太高）。\\
+\textbf{初始化}：单 primitive 策略 $\pi$。\\
+\textbf{for} $r=0,1,\dots,R-1$ \textbf{do}\\
+\quad \textbf{if} $r=0$：在全集 $\mathcal{M}$ 上训 primitive 0；\\
+\quad \textbf{else}：$\mathcal{H}\leftarrow\{m\in\mathcal{M}: \text{eval\_success}(\pi,m)<\tau\}$（mining）；若 $\mathcal{H}=\varnothing$ 则\textbf{停}；给 $\pi$ \Verb[breaklines]|add_primitive()|，在 $\mathcal{H}$ 上训新 primitive；\\
+\quad \Verb[breaklines]|freeze_primitive(r)|；在全集上评估 \Verb[breaklines]|eval_success_rate| 与 MPJPE。\\
+\textbf{输出}：多 primitive 策略 $\pi$。
+\end{algo}
+
+\begin{note}[评估必须用 eval\_success\_rate，不是 per-episode success]
+\Verb[breaklines]|eval_success_rate| 是在完整评估集上、每条动作跑 10+ episodes 的统计；per-episode success 是单次采样，噪声大。监控与 mining 都应以前者为准。PHC+（PULSE 论文 arXiv:2310.04582 中给出的改进版 imitator）在 AMASS-Train 上达到 \textbf{100\%} 的成功率——其原文明确「仅用三个 primitive 学 fail-state recovery 即达 100\%」（原版 PHC 为 98.9\%，靠剔除穿模/不连续序列与架构改进补到 100\%）；\rebuilt{PHC+ 达此结果所需的具体 mining 轮数论文未逐字给出，复现以官方仓库为准。}
+\end{note}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{PMCP vs.\ 其他治遗忘方案（motion tracking 视角）}
+\label{tab:rlmc-mi-forget}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+方案 & 机制 & 旧技能保持 & 代价 & 代表 \\
+\midrule
+PMCP & 冻结旧网 + 新增 primitive & \textbf{硬保证}（冻结） & 推理时间线性增长 & PHC/PHC+ \\
+AMP 替代 & 判别器学分布而非逐动作 & 天然支持多动作 & 精确度不如直跟 & ProtoMotions AMP \\
+EWC & 正则约束重要参数 & 尽量不降（无硬保证） & 大规模时约束冲突 & Kirkpatrick 2017 \\
+Multi-Head & 每动作一个输出头 & 简单 & 头数$=$动作数，不可扩展 & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{为何 PHC 选 PMCP。}两个独特优势：(1) \textbf{硬保证}——冻结参数意味着旧动作跟踪质量\emph{不可能}下降（EWC/Replay 只能「尽量」）；(2) \textbf{渐进扩展}——progressive mining 自然把问题分解为「先解决简单的、再解决难的」，每轮只盯当前剩余失败动作。代价是推理时间随 primitive 数线性增长，但对 50\,Hz 人形控制，5 个小 MLP（各约 1.5M 参数）总推理 $<1$\,ms，远在实时内。
+
+\begin{pitfall}[更多 primitive 一定更好？——会退化成记忆]
+\textbf{错误描述}：盲目加 primitive 求覆盖率。\textbf{现象后果}：每个 primitive 只处理极少动作，相当于\emph{记忆}而非泛化；推理变慢、训练复杂。\textbf{根本原因}：primitive 数过多让容量分配过细。\textbf{正确做法}：通常 3--5 个 primitive 即可覆盖 AMASS 全部；mining 阈值别设太高（$>0.9$ 会把太多动作标为 hard、训练不聚焦）。
+\end{pitfall}
+
+\paragraph{在 mjlab 里复刻 PMCP 的路径。}PHC 原始代码非 Manager-Based，不能直接用于 mjlab；但 PMCP 思想可移植：先用标准 RSL-RL 训 primitive 0，写评估脚本挑 hard set，再实现 PMCP actor 注册进 RSL-RL（非平凡工程）。\textbf{工程建议}：动作库 $<100$ 条时，直接用 BeyondMimic + adaptive sampling（\cref{sec:rlmc-mi-scale}）通常够；PMCP 的价值在 1000+ 条时才显现。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{PMCP 的三框架可用性}
+\label{tab:rlmc-mi-pmcp3}
+\begin{tabular}{@{}llll@{}}
+\toprule
+能力 & mjlab & Isaac Lab / IsaacGym & UniLab \\
+\midrule
+PMCP 原生 & 无（需自实现） & \textbf{PHC 原生}（IsaacGym Preview 4） & 无（无 progressive 多策略接口） \\
+MuJoCo 版 & 可移植 PHC\_MJX 思想 & \Verb[breaklines]|ZhengyiLuo/PHC_MJX| & 可移植 PHC\_MJX 思想 \\
+替代方案 & adaptive sampling / AMP & adaptive sampling / AMP & 单策略 PPO/APPO/SAC + 自接采样 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+UniLab \emph{不提供} progressive networks / 多 primitive 组合接口（无 PMCP 等价物）：它的 \Verb[breaklines]|G1MotionTracking| 是\textbf{单策略}跟踪（可选 PPO/APPO/SAC）。要在 UniLab 上做规模化不遗忘，路径与「mjlab 里复刻 PMCP」相同——自己实现 PMCP actor 注册进它的 rsl-rl 训练循环（非平凡工程），或退而用单策略 $+$ 自接的 inter-motion 采样（\cref{sec:rlmc-mi-scale}）。它的内置课程只有 \Verb[breaklines]|PenaltyCurriculum|（按 episode 长度缩放负权重）与地形等级课程，没有「按表现挑 hard set 再扩容量」这类 progressive mining 的现成件。
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[架构]} 画出 3-primitive PMCP 的前向计算图，标注每个 gate 与 residual 的连接（对照式~\eqref{eq:rlmc-mi-pmcp}）。验收：图中乘法门控与加法残差位置正确。
+  \item \textbf{[设计]} 已有 2-primitive 策略，要加「后空翻」。列完整步骤：(a) mining、(b) 新增 primitive、(c) 训练、(d) 评估。验收：步骤与 \cref{alg:rlmc-mi-phc} 一致且强调「训完冻结」。
+  \item \textbf{[综合，跨章]} PMCP 的 progressive mining 与 \cref{sec:rlmc-priv-distill} 的 teacher-student 蒸馏都涉及「策略到策略的知识传递」。对比：(a) 传什么知识、(b) 旧策略是否保留、(c) 新策略训练数据从哪来。验收：能指出 PMCP 保留旧策略（冻结）、蒸馏通常不保留 teacher。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{精读：KungfuBot 高动态全身控制}
+\label{sec:rlmc-mi-kungfu}
+
+\textbf{这一节解决什么问题}：通过精读 KungfuBot 的 physics filter + 自适应跟踪，理解如何\emph{从视频}筛选物理可行动作并自适应调整跟踪难度。这是把 \cref{sec:rlmc-mi-scale-filter} 的「基本质量检查」升级为系统方案，并把 \cref{ch:rlmc-reward} 的固定 $\sigma$ 升级为在线自适应。
+
+% ----------------------------------------------------------------
+\subsection{两阶段管线：从视频到真机}
+\label{sec:rlmc-mi-kungfu-pipeline}
+
+\begin{paper}[KungfuBot/PBHC：从互联网视频学高动态全身动作并上 G1]\label{paper:rlmc-mi-kungfu}
+\textbf{问题}：从互联网视频学功夫、跑酷、舞蹈等\emph{高动态}全身动作并部署到真机 G1。与 BeyondMimic（假设参考已是高质量动捕）不同，视频估计天然含噪声与物理不一致。\textbf{核心思想}：两阶段——(1) \textbf{motion processing}：从视频提取动作，用\emph{物理度量}过滤超出物理极限的动作，计算 contact mask，做动作修正，再用差分逆运动学 retarget 到机器人；(2) \textbf{motion imitation}：提出\emph{自适应}跟踪机制，通过一个 tracking factor 调整跟踪奖励。\textbf{关键结果}：跟踪误差显著低于既有方法，在 Unitree G1 上稳定复现多种高动态动作\,\cite{xie2025kungfubot}。\textbf{与本书关系}：它把本章「数据物理可行性」（\cref{ins:rlmc-mi-quality}）与「指数核 $\sigma$ 标定」（\cref{ch:rlmc-reward}）两个痛点系统化。\textbf{局限}：管线长、依赖视频估计质量；估计差则大量动作被滤掉、训练数据不足。KungfuBot 为 Xie 等，NeurIPS 2025（arXiv:2506.12851，仓库 \texttt{TeleHuman/\allowbreak PBHC}）。
+\end{paper}
+
+\begin{codebox}[text]{KungfuBot 两阶段数据/训练流（概念）}
+Stage 1 Motion Processing（离线）
+  视频 -> 人体网格估计(SMPL) -> retarget(diff-IK) 到 G1
+      -> Physics Filter (CoM/CoP 邻近度 + contact mask 一致性)
+      -> 接受/拒绝 -> 接受者入训练集
+Stage 2 Adaptive Tracking（在线训练）
+  训练集 -> PPO + 自适应 tracking factor(sigma) + 非对称 actor-critic
+      -> 输出 tracking policy
+\end{codebox}
+
+\paragraph{从视频到训练数据的关键步骤。}(1) \textbf{视频人体估计}：常用 GVHMR 等单目方法，输入视频、输出每帧 SMPL 参数；GVHMR 相对早期方法的优势是更好的重力对齐（输出 root 朝向与地面法向更准），这对后续物理可行性检查很关键。(2) \textbf{SMPL$\to$G1 retarget}：SMPL 前向运动学得关节 3D 位置 $\to$ 骨长映射（SMPL 与 G1 肢长不同）$\to$ 差分 IK 求 G1 关节角（带限位约束）$\to$ root 高度按身高比调整。retarget 的常见坑：手腕 DoF 不匹配、脚底穿地、IK 逐帧独立导致轨迹不连续（需低通滤波平滑）——这些与 \cref{sec:rlmc-imit-data-retarget} 的 retarget 契约同源。
+
+% ----------------------------------------------------------------
+\subsection{physics filter：两个检查}
+\label{sec:rlmc-mi-kungfu-filter}
+
+physics filter 的动机：视频估计的动作可能含「人在空中悬浮」「重心超出支撑区却不摔」等物理不可行片段。KungfuBot 用两个检查过滤。
+
+\textbf{检查 1：CoM--CoP 邻近度}——质心（CoM）的水平投影应在接触点构成的压力中心（CoP）附近；空中阶段（无接触）跳过（跳跃是允许的）。超过约 20\% 帧不合格则\emph{拒绝}整条动作。
+
+\textbf{检查 2：contact mask 一致性}——脚在地面附近时其水平速度不应过大（脚贴地却高速移动 $=$ 不物理的滑动）。超过约 15\% 帧不合格则拒绝。
+
+\begin{codebox}[Python]{physics filter:CoM-CoP 检查（核心逻辑）}
+def check_com_cop(motion, robot, thr=0.3, bad_ratio=0.2):
+    bad = 0; total = 0
+    for t in range(len(motion.root_pos)):
+        contacts = get_contact_points(motion, t)
+        if len(contacts) == 0:                       # 空中阶段跳过（允许腾空）
+            continue
+        total += 1
+        com = compute_com(motion.joint_pos[t], motion.root_pos[t], robot)[:2]  # 水平投影
+        cop = np.mean(contacts, axis=0)[:2]
+        if np.linalg.norm(com - cop) > thr:          # 质心投影离支撑区太远
+            bad += 1
+    return (bad / max(total,1)) < bad_ratio          # 不合格帧占比 < 20% 才接受
+\end{codebox}
+
+\begin{insight}[两个检查互补：一个管「站不站得住」，一个管「滑不滑」]\label{ins:rlmc-mi-filter}
+只用 CoM--CoP 会漏掉「平衡看似 OK 但脚在地面高速滑行」的动作（视频估计的常见 artifact）；只用 contact mask 会漏掉「脚接触正常但整体重心早已倾覆」的动作。两者覆盖\emph{静态平衡可行性}与\emph{接触运动学一致性}两个正交维度，缺一不可。这与 \cref{ins:rlmc-mi-quality}（质量优先于数量）呼应——physics filter 就是「质量」的可操作定义。
+\end{insight}
+
+% ----------------------------------------------------------------
+\subsection{自适应 tracking factor：把 \texorpdfstring{$\sigma$}{sigma} 交给优化}
+\label{sec:rlmc-mi-kungfu-blo}
+
+\cref{ch:rlmc-reward} 与 \cref{sec:rlmc-mi-mjlab-reward} 都用固定 $\sigma$ 的指数核 $r=\exp(-\lVert e\rVert^2/\sigma^2)$：$\sigma$ 太大 reward 不灵敏，太小信号稀疏。KungfuBot 的核心创新是\emph{自动调 $\sigma$}（其论文称 tracking factor）——不手调，而是在训练中按\emph{当前跟踪误差}在线收紧：误差大时 $\sigma$ 大（让策略先拿到信号），随误差下降 $\sigma$ 单调收紧（逼更精确）。下面先给一个便于理解的工程版（用成功率代理），随后在注记里对齐论文原版的误差驱动形式。
+
+\begin{codebox}[Python]{自适应 tracking factor（外层调 sigma，内层 PPO 优化）}
+class AdaptiveTrackingReward:
+    def __init__(self, sigma=0.3, lr=0.001, lo=0.05, hi=1.0, target=0.7):
+        self.sigma, self.lr, self.lo, self.hi, self.target = sigma, lr, lo, hi, target
+    def compute_reward(self, err):                      # 外层:用当前 sigma 算 reward
+        return torch.exp(-err**2 / (self.sigma**2))
+    def update_sigma(self, ep_len, max_len):            # 内层反馈:按成功率调 sigma
+        succ = (ep_len / max_len).mean().item()
+        if succ < self.target:  self.sigma *= (1 + self.lr)        # 太难 -> 放宽
+        else:                   self.sigma *= (1 - self.lr * 0.5)  # 可更严 -> 收紧（更慢）
+        self.sigma = max(self.lo, min(self.hi, self.sigma))        # 夹紧
+\end{codebox}
+
+\begin{note}[「bi-level」的含义：嵌套，不是复杂二阶优化]
+KungfuBot 把这套机制叫 bi-level optimization，且\emph{确有}显式的上层目标。澄清外/内层约定（前后保持一致）：\textbf{外层}选 $\sigma$（tracking factor），目标是 $\max_{\sigma>0} J^{\mathrm{ex}}=\sum_i(-x_i^\ast)$，即最小化各 body 跟踪误差 $x_i$ 之和；\textbf{内层}是给定 $\sigma$ 下的策略优化（PPO）。论文给出外层的闭式最优解 $\sigma^\ast=\tfrac1N\sum_i x_i^\ast$（即\emph{当前平均跟踪误差}），实现上用其在线代理 $\sigma\leftarrow\min(\sigma,\hat{x})$——以误差的指数滑动均值 $\hat{x}$ 更新、且\emph{单调不增}（从一个较大的 $\sigma^{\text{init}}$ 起逐步收紧）。两层交替：PPO 在固定 $\sigma$ 下优化若干 iteration，然后 $\sigma$ 按当前误差更新。它不是复杂二阶优化，只是「在线估计 $\hat x$ + 收紧 $\sigma$」的循环。\pz{注意：上面代码是便于理解的\emph{工程近似}——用 episode 长度比当成功率代理、$\sigma$ 可升可降；而论文原版直接以\emph{跟踪误差}驱动、$\sigma$ 单调不增。两者动机一致（误差大则放宽、误差小则收紧），但落地时建议照论文用误差驱动的非增更新。}
+\end{note}
+
+\paragraph{$\sigma$ 自适应的工程含义。}训练初期策略误差大，$\sigma$ 自动增大让 reward 不那么苛刻（策略能拿到信号开始学）；后期误差小，$\sigma$ 自动缩小逼更精确的跟踪。这省去了手调 $\sigma$ 的繁琐。跨领域类比：$\sigma$ 像考试评分标准——大 $\sigma$ 是「选择题」（差不多就给分，易拿分但区分度低），小 $\sigma$ 是「精确填空」（必须完全对，难但能逼出精确答案）；自适应就是「考生水平低时出选择题、水平上来后换填空题」。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{不同 reward term 的推荐 $\sigma$（经验范围）}
+\label{tab:rlmc-mi-sigma}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Term & $\sigma$ 单位 & 推荐范围 & 默认 \\
+\midrule
+\Verb[breaklines]|body_position_tracking| & m & 0.05--0.3 & 0.1 \\
+\Verb[breaklines]|body_orientation_tracking| & rad & 0.1--0.5 & 0.2 \\
+\Verb[breaklines]|joint_position_tracking| & rad & 0.1--0.5 & 0.3 \\
+\Verb[breaklines]|root_velocity_tracking| & m/s & 0.2--1.0 & 0.5 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[ht]
+\centering
+\small
+\caption{KungfuBot vs.\ BeyondMimic（同为显式跟踪线，定位不同）}
+\label{tab:rlmc-mi-kvb}
+\begin{tabular}{@{}lll@{}}
+\toprule
+维度 & BeyondMimic & KungfuBot \\
+\midrule
+数据来源 & 动捕（高质量） & 视频（需过滤） \\
+physics filter & 无（假设可靠） & CoM/CoP + contact mask \\
+$\sigma$ 调整 & 手动固定 & 自适应（tracking factor） \\
+目标动作 & 通用（走/跑/跳） & 高动态（功夫/跑酷） \\
+真机 & G1 & G1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{两者可以组合。}把 KungfuBot 的 physics filter 接到 BeyondMimic 管线完全可行——即便动捕质量高，极端动作也可能有物理不一致，先 filter 再用 BeyondMimic 直接跟踪，往往比单用任一方更稳。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{视频$\to$动作管线的三框架可用性}
+\label{tab:rlmc-mi-kungfu3}
+\begin{tabularx}{\linewidth}{@{}lLLL@{}}
+\toprule
+环节 & mjlab & Isaac Lab / PBHC & UniLab \\
+\midrule
+physics filter & 可移植 PBHC 思想 & \textbf{PBHC 原生} & 无内置（需自接，思想可移植） \\
+自适应 $\sigma$ & 自接奖励项 & PBHC 内置 & 无 $\sigma$ 课程（手动分阶段，见下） \\
+视频估计/retarget & 外部（GVHMR 等） & 外部（GVHMR 等） & 外部（无内置） \\
+真机部署 & ONNX + \Verb[breaklines]|motion_tracking_controller| & ONNX + SDK & ONNX + \Verb[breaklines]|scripts/deploy/|（\Verb[breaklines]|export_motion_bin|） \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+UniLab 这条线\emph{一半有、一半无}：它在跟踪与部署两端很扎实——\Verb[breaklines]|G1MotionTracking| 原生支持高动态跟踪（含 \Verb[breaklines]|G1FlipTracking|/\allowbreak\Verb[breaklines]|G1WallFlipTracking| 等特技任务，正对应 KungfuBot 的高动态目标），部署侧有完整的 \Verb[breaklines]|scripts/deploy/| 工具链（\Verb[breaklines]|export_motion_bin.py| 导参考运动、\Verb[breaklines]|sim_prototype.py| 用 ONNX 在 MuJoCo 逐段校验）；但上游的\textbf{视频估计 $\to$ physics filter（CoM/CoP $+$ contact mask）这条数据管线 UniLab 无内置}，需照本节思想自接（estimate$\to$retarget$\to$filter$\to$打包 NPZ）。\textbf{自适应 $\sigma$ 也无现成件}：UniLab 的跟踪核宽度是\textbf{逐项 std}（\verb|std_root_pos|/\allowbreak\verb|std_body_pos|/\dots 共 8 个，\emph{无}全局 \Verb[breaklines]|tracking_sigma|，见 \cref{sec:rlmc-mi-mjlab-reward} 的 pitfall），且没有「按步收紧 reward std」的课程函数——要复刻 KungfuBot 的 tracking factor，真实抓手是\textbf{这 8 个 \texttt{std\_*} 字段}：在 owner YAML 分阶段手调，或写自定义回调原地改各 \verb|std_*|（它现成的课程只有 \Verb[breaklines]|PenaltyCurriculum| 按 episode 长度缩放负权重，与 $\sigma$ 收紧不是一回事）。
+
+\begin{pitfall}[GVHMR 估计质量影响全局]
+\textbf{错误描述}：直接喂低质量视频（遮挡、低分辨率）。\textbf{现象后果}：人体估计不准 $\to$ physics filter 拒绝大量动作 $\to$ 训练数据不足。\textbf{根本原因}：管线最上游的估计误差会被下游放大。\textbf{正确做法}：用清晰、少遮挡、相机相对稳定的视频源；必要时人工筛选估计结果。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[分析]} physics filter 两个检查若只用其一，各会漏掉什么类型的不可行动作？验收：对照 \cref{ins:rlmc-mi-filter}，指出「只 CoM/CoP 漏滑动、只 contact 漏倾覆」。
+  \item \textbf{[设计]} 从功夫电影视频提取 G1 可用训练数据，列从视频到 mjlab NPZ 的完整管线，每步给出工具。验收：覆盖估计$\to$retarget$\to$filter$\to$csv\_to\_npz 四段。
+  \item \textbf{[实验]} 同一参考动作，分别用 $\sigma=0.05,0.1,0.3,1.0$ 各训 3000 iter，画 tracking reward 与 MPJPE 曲线，判断哪个 $\sigma$ 最终 MPJPE 最低。验收：能解释「过小 $\sigma$ 可能根本不收敛、过大 $\sigma$ 精度封顶」。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{三框架对比：mjlab Tracking / ProtoMotions / UniLab}
+\label{sec:rlmc-mi-compare}
+
+\textbf{这一节解决什么问题}：用同一条参考动作跨框架训练（以 mjlab $\leftrightarrow$ ProtoMotions 为主例、并把 UniLab 作为第三个独立引擎纳入），建立跨框架的动作跟踪理解。目的\emph{不是}评出「哪个框架更好」，而是理解不同物理引擎的差异——哪些行为是物理引擎共有的（物理真实），哪些是特定引擎的 artifact（可能在真机上不成立）。
+
+\begin{table}[ht]
+\centering
+\small
+\caption{动作跟踪——mjlab / ProtoMotions / UniLab 的配置差异总表}
+\label{tab:rlmc-mi-cfgdiff}
+\begin{tabular}{@{}p{1.9cm}p{3.0cm}p{4.0cm}p{3.6cm}@{}}
+\toprule
+维度 & mjlab (BeyondMimic) & ProtoMotions (Mimic/AMP) & UniLab (G1MotionTracking) \\
+\midrule
+物理引擎 & MuJoCo Warp（GPU） & PhysX/Newton/Genesis（GPU） & MuJoCoUni/Motrix（CPU） \\
+模型格式 & MJCF & URDF($\to$USD) & MJCF / Motrix XML（无 USD） \\
+motion 格式 & NPZ（\verb|csv_to_npz.py|） & MotionLib \verb|.pt| & NPZ（\verb|MotionLoader|） \\
+配置系统 & Python dataclass & dataclass 实验文件 & Hydra dataclass（标量字典 reward） \\
+算法 & 直接跟踪 & PPO/AMP/ASE/CALM/MaskedMimic & 直接跟踪（PPO/APPO/SAC） \\
+判别器 & 无 & 有（AMP/ASE/CALM） & 无（需自实现） \\
+部署 & ONNX + \Verb[breaklines]|motion_tracking_controller| & ONNX + ProtoMotions SDK & ONNX + \Verb[breaklines]|scripts/deploy/| \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{对齐超参后预期的差异。}跨框架用不同物理引擎（MuJoCo 凸优化软接触 vs.\ PhysX TGS，详见 \cref{ch:rlmc-physics}），接触模型、积分方法、数值精度都不同，跨框架\emph{有差异是正常的}。典型量级：MPJPE 差 $<20$\,mm、ELR 差 $<0.1$ 都属可接受。若差异超出预期，按序排查：(1) 观测维度与 term 顺序是否对齐；(2) reward 权重是否一致；(3) action scale 与 default pose 是否一致；(4) \verb|physics_dt|$\times$\verb|decimation| 是否一致；(5) 参考动作坐标系约定是否一致。
+
+\begin{pitfall}[四元数约定是跨框架最高发的 bug]
+\textbf{错误描述}：把 mjlab 的 NPZ 直接转给 ProtoMotions 而不转四元数顺序。\textbf{现象后果}：root 朝向完全错误——策略看到的参考是「扭曲」的，reward 永远上不去（但不报错）。\textbf{根本原因}：MuJoCo 用 $(w,x,y,z)$，PhysX/IsaacGym 用 $(x,y,z,w)$。\textbf{正确做法}：转换脚本里显式 \Verb[breaklines]|convert_wxyz_to_xyzw|/反向，并按 \cref{sec:rlmc-imit-data-contract} 的数据契约用 heading/up 向量核对。此坑与 \cref{ch:rlmc-imitation} 开篇「四元数约定在装好之后才咬人」是同一个，跨\emph{框架}时尤甚。
+\end{pitfall}
+
+\begin{insight}[跨框架对比的真正目的是分辨「物理真实」与「引擎 artifact」]\label{ins:rlmc-mi-cross}
+一个框架结果更好\emph{不}等于它更优——motion tracking 效果高度依赖配置（reward 权重、body\_names、$\sigma$），未对齐配置前谈优劣没有意义。跨框架对比真正的价值是：两个独立物理引擎都复现的行为，大概率是\emph{物理真实}的（真机上也会发生）；只在某一个引擎出现的，很可能是该引擎的\emph{数值 artifact}（真机上未必成立）。这把「双框架」从「选型纠结」升华为「sim-to-real 的廉价交叉验证」——与 \cref{ch:rlmc-physics} 的 sim2sim 思路一致。加入 UniLab 还能把交叉验证扩到\emph{第三}个独立引擎：UniLab 的 CPU MuJoCoUni 与 Motrix 是两套不同的接触求解器，三引擎一致的行为可信度更高。更妙的是 UniLab 把这种跨引擎一致性做成了\emph{框架内置}关卡——\Verb[breaklines]|training/sim2sim.py| 的 sim2sim 契约校验会在把一个后端训出的策略拿到另一后端回放前，逐字段比对「决定策略行为的字段」是否一致，不兼容直接抛 \Verb[breaklines]|CrossBackendIncompatibleError|，把本节那张「五步排查」清单的一部分前置成了编译期错误（实跑核对 UniLab：\verb|sim2sim.py| 与 \Verb[breaklines]|CrossBackendIncompatibleError| 确在仓库；但并\emph{不存在}一个名为 \Verb[breaklines]|training.sim2sim_strict| 的开关——该校验是 sim2sim 流程内置的硬行为，无需也无此 flag 开启）。
+\end{insight}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[实验]} 用同一条行走在 mjlab 与 ProtoMotions 训练，对比 MPJPE/ELR/训练速度。差异是否在预期内（MPJPE $<20$\,mm、ELR $<0.1$）？若否，按本节五步排查。验收：能定位到具体某一步的不对齐。
+  \item \textbf{[分析]} 列出 mjlab NPZ $\to$ ProtoMotions \verb|.pt| 需要的具体转换步骤，写出脚本并验证四元数约定正确。验收：脚本含显式四元数顺序转换与一次可视化核对。
+  \item \textbf{[设计]} 设计一个「跨框架 tracking benchmark」：10 条不同类型动作、统一指标、统一报告格式。验收：动作覆盖低/中/高动态，指标含几何 + 接触 + 平滑度三类。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\label{sec:rlmc-mi-misconceptions}
+
+\begin{table}[H]
+\centering
+\small
+\caption{动作跟踪常见误解与澄清}
+\label{tab:rlmc-mi-misc}
+\begin{tabular}{@{}p{4.6cm}p{8.4cm}@{}}
+\toprule
+误解 & 澄清 \\
+\midrule
+动作跟踪 $=$ 换个奖励函数 & 分水岭在\emph{观测}是否含参考运动信息，奖励只是兑现（\cref{ins:rlmc-mi-obs}）。 \\
+tracking reward 越高动作越像 & 指数核 $\sigma$ 决定「多接近算好」：$\sigma$ 太大 reward 饱和（5\,cm 与 1\,cm 几乎同分），太小信号稀疏。reward 高未必 MPJPE 低。 \\
+velocity reward 与 tracking reward 可同时用 & 实践会冲突——若参考速度与速度命令不一致，两 reward 互相矛盾。应二选一，或用 mask 机制（如 HOVER，\cref{sec:rlmc-hl-hover}）分离模态。 \\
+更多 motion $=$ 更好策略 & 低质量动作占比过大会让策略\emph{平均化}；质量优先于数量（\cref{ins:rlmc-mi-quality}）。 \\
+AMP 不需要好数据 & AMP 不要求逐帧对齐，但参考数据质量仍关键——retarget 差则判别器学到「不自然也正常」。 \\
+ASE 的 latent 自动对应人类直觉技能 & latent 是数据驱动分解，可能是「左脚先迈 vs 右脚先迈」这类无语义划分。 \\
+PMCP 彻底解决遗忘 & 冻结避免了\emph{参数级}遗忘，但 gate 可能在某些观测下错误抑制旧 primitive，是更隐蔽的「功能性遗忘」。 \\
+BLO 是复杂二阶优化 & 它是「外层调 $\sigma$、内层 PPO」的嵌套在线调整，非复杂二阶优化。 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{小结}
+\addcontentsline{toc}{section}{小结}
+\label{sec:rlmc-mi-summary}
+
+本章把 \cref{ch:rlmc-imitation} 的显式跟踪线落到了「能在 G1 上跟一条高动态动作、再扩到上万条动作库」的工程深度。主线一以贯之：动作跟踪与速度跟踪的分水岭在\emph{观测}（\cref{ins:rlmc-mi-obs}）；规模化的瓶颈在\emph{容量}（PMCP）与\emph{采样}（adaptive sampling）；数据的上限在\emph{物理可行性}（physics filter）；调参的痛点在 $\sigma$（自适应 tracking factor）。每个概念都给了 mjlab / Isaac Lab / UniLab 三框架对比。
+
+\begin{table}[H]
+\centering
+\small
+\caption{术语速查}
+\label{tab:rlmc-mi-glossary}
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 含义 \\
+\midrule
+Motion Tracking & 跟踪一条参考运动（每帧每关节目标），区别于速度跟踪 \\
+RSI & 参考状态初始化，从参考动作随机帧 reset（\cref{sec:rlmc-imit-track-rsi}） \\
+anchor & root 对齐机制，解耦全局漂移与相对姿态（\cref{sec:rlmc-imit-track-anchor}） \\
+MPJPE/MPBPE & 关键 body / 所有 body 的平均欧氏位置误差（mm） \\
+ELR & Episode Length Ratio，实际/参考长度 \\
+adaptive sampling & 按失败率加权选动作（inter-motion） \\
+PMCP & Progressive Multiplicative Control Policy，冻结旧网+乘法门控新 primitive \\
+progressive mining & 每轮挑当前跟不动的动作作为下一 primitive 训练集 \\
+physics filter & CoM/CoP + contact mask 过滤物理不可行动作 \\
+tracking factor & KungfuBot 的自适应指数核 $\sigma$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\caption{知识点总表}
+\label{tab:rlmc-mi-points}
+\begin{tabularx}{\linewidth}{@{}cLcc@{}}
+\toprule
+\# & 要点 & 对应节 & 难度 \\
+\midrule
+1 & 动作跟踪 MDP：命令从 3D twist 变 $\sim$100D 参考姿态、需时间对齐 & \cref{sec:rlmc-mi-mjlab-pos} & $\star\star$ \\
+2 & BeyondMimic 管线：csv\_to\_npz（下划线 flag）$\to$WandB$\to$训练 & \cref{sec:rlmc-mi-mjlab-data} & $\star\star\star$ \\
+3 & body 跟踪必须在 base frame 算，anchor 解耦 root 漂移 & \cref{sec:rlmc-mi-mjlab-baseframe} & $\star\star\star$ \\
+4 & tracking 观测含参考运动项（BeyondMimic 用紧凑 anchor 相对量 \Verb[breaklines]|motion_anchor_pos_b|/\allowbreak\Verb[breaklines]|motion_anchor_ori_b|） & \cref{sec:rlmc-mi-mjlab-obs} & $\star\star$ \\
+5 & ProtoMotions dataclass 入口，切算法改 \texttt{--experiment-path} & \cref{sec:rlmc-mi-proto-switch} & $\star\star$ \\
+6 & per-GPU 分片须随机；adaptive sampling 按失败率加权 & \cref{sec:rlmc-mi-scale} & $\star\star$ \\
+7 & PMCP：冻结旧网 + 乘法门控，硬保证不遗忘 & \cref{sec:rlmc-mi-phc-pmcp} & $\star\star\star$ \\
+8 & KungfuBot：physics filter（CoM/CoP+contact）+ 自适应 $\sigma$ & \cref{sec:rlmc-mi-kungfu} & $\star\star\star$ \\
+9 & 跨框架对比是 sim-to-real 的廉价交叉验证 & \cref{sec:rlmc-mi-compare} & $\star\star$ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\addcontentsline{toc}{section}{延伸阅读}
+\label{sec:rlmc-mi-further}
+
+\begin{itemize}
+  \item \textbf{DeepMimic}（Peng 等，SIGGRAPH 2018）\,\cite{peng2018deepmimic}：物理角色动作模仿的奠基工作，确立了指数核 tracking reward + RSI + early termination 三件套——本章所有显式跟踪的范式起点。
+  \item \textbf{AMP}（Peng 等，SIGGRAPH 2021）\,\cite{peng2021amp}：用 LSGAN 判别器替代手工 reward，学动作\emph{分布}而非逐帧对齐——\cref{sec:rlmc-mi-proto} 的核心方法（原理详见 \cref{sec:rlmc-imit-amp}）。
+  \item \textbf{ASE}（Peng 等，SIGGRAPH 2022）\,\cite{peng2022ase}：AMP + 可复用 latent skill 嵌入，让高层策略选/混技能。
+  \item \textbf{CALM}（Tessler 等，SIGGRAPH 2023）\,\cite{tessler2023calm}：ASE + 文本条件，用自然语言控制动作风格。
+  \item \textbf{MaskedMimic}（Tessler 等，SIGGRAPH Asia 2024）\,\cite{tessler2024maskedmimic}：把多种控制统一为「带掩码的动作补全」，ProtoMotions 最新统一控制器。
+  \item \textbf{PHC}（Luo 等，ICCV 2023）\,\cite{luo2023phc}：PMCP progressive networks，把跟踪扩到约万条、并支持失败恢复——\cref{sec:rlmc-mi-phc} 主角。
+  \item \textbf{KungfuBot/PBHC}（Xie 等，NeurIPS 2025，arXiv:2506.12851）\,\cite{xie2025kungfubot}：physics filter + 自适应跟踪，从视频到真机的完整高动态管线——\cref{sec:rlmc-mi-kungfu} 主角。
+  \item \textbf{BeyondMimic}（Liao 等，2025，arXiv:2508.08241）\,\cite{liao2025beyondmimic}：直接跟踪 + 引导扩散，mjlab tracking 管线之源。
+  \item \textbf{AMASS}（Mahmood 等，ICCV 2019）\,\cite{mahmood2019amass}：统一 40+ 小时 SMPL 动捕，大规模训练的数据基础；SMPL 体模型见 \cite{loper2015smpl}。
+  \item \textbf{ProtoMotions}（NVIDIA，Apache-2.0）\,\cite{protomotions2024}：统一 AMP/ASE/CALM/MaskedMimic、多后端的 motion learning 框架；行为基础模型方向可延伸看 SONIC\,\cite{luo2025sonic}。
+  \item \textbf{HOVER}（He 等，2025）\,\cite{he2025hover}：mask 条件的全身控制，把多模态（导航/操作/遥操作）统一——本章 tracking 可作其底层 tracker（见 \cref{sec:rlmc-hl-hover}）。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\addcontentsline{toc}{section}{故障排查手册}
+\label{sec:rlmc-mi-troubleshoot}
+
+\begin{table}[H]
+\centering
+\small
+\caption{动作跟踪故障排查：症状$\to$原因$\to$排查$\to$相关节}
+\label{tab:rlmc-mi-trouble}
+\begin{tabular}{@{}p{3.4cm}p{3.0cm}p{4.2cm}p{2.0cm}@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+play/train 报 \texttt{ValueError} 拒绝启动 & tracking 任务未带 motion & 加 \Verb[breaklines]|--env.commands.motion.motion-file <path>| 或 \Verb[breaklines]|--registry-name|；仓库无 bundled npz & \cref{sec:rlmc-mi-quickstart} \\
+tracking reward 恒为零 & body\_names 有无效名 & 跑「从零搭起」Step 3 静态自检脚本打印 std/body\_names；或 zero play 看 body 可视化 & \cref{sec:rlmc-mi-mjlab-baseframe} \\
+episode 极短（$<10$ 步） & 参考首帧极端姿态 & 加 safe pose 过渡；查 CSV 首行 & \cref{sec:rlmc-mi-mjlab-data} \\
+root 漂移严重 & anchor 与 motion root 不一致 & 查 anchor\_body\_name；zero play 对比 root 对齐 & \cref{sec:rlmc-mi-mjlab-baseframe} \\
+停滞在 Stage II（root 对 body 不涨） & body 跟踪未在 base frame 算 & 确认 base frame；查 body\_names 与 $\sigma$ & \cref{sec:rlmc-mi-mjlab-term} \\
+AMP reward 不涨 & 判别器过度自信 & 加大 gradient penalty（详见 \cref{sec:rlmc-imit-amp}） & \cref{sec:rlmc-mi-proto} \\
+ProtoMotions MuJoCo 只能 1 env & 后端 CPU-only & 正常，用 GPU 后端训练 & \cref{sec:rlmc-mi-proto-switch} \\
+大规模训练 OOM & motion 数据太大 & per-GPU 分片；减 num\_envs & \cref{sec:rlmc-mi-scale-shard} \\
+成功率双峰长期不合并 & 难动作物理不可行 & 上 physics filter 清洗 & \cref{sec:rlmc-mi-scale-filter} \\
+多动作训练后旧动作退化 & 灾难性遗忘 & 用 PMCP 或改 AMP & \cref{sec:rlmc-mi-phc} \\
+视频提取动作跟踪失败 & 参考物理不可行 & 跑 physics filter；查 CoM-CoP & \cref{sec:rlmc-mi-kungfu} \\
+$\sigma$ 过小 reward 稀疏 & 初始误差远大于 $\sigma$ & 增大 $\sigma$ 或用自适应；打印初始误差 & \cref{sec:rlmc-mi-kungfu-blo} \\
+跨框架 MPJPE 差异大 & 四元数约定/body 对应不同 & 对齐约定与 body\_names & \cref{sec:rlmc-mi-compare} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\addcontentsline{toc}{section}{版本信息速查}
+\label{sec:rlmc-mi-versions}
+
+\begin{table}[H]
+\centering
+\small
+\caption{本章工具/论文版本速查（截至 2026-06；易变项以官方仓库为准）}
+\label{tab:rlmc-mi-ver}
+\begin{tabularx}{\linewidth}{@{}lLL@{}}
+\toprule
+项目 & 版本/标识 & 备注 \\
+\midrule
+BeyondMimic & arXiv:2508.08241 (2025) & 复现仓库 HybridRobotics/whole\_body\_tracking \\
+mjlab tracking 任务 & \Verb[breaklines]|Mjlab-Tracking-Flat-Unitree-G1| & 官方任务名 \Verb[breaklines]|Tracking-Flat-G1-v0| \\
+csv\_to\_npz 接口 & \Verb[breaklines]|--input_file/--input_fps/--output_name/--headless| & 下划线 flag，自动传 WandB \\
+ProtoMotions & ProtoMotions3，Apache-2.0 & dataclass 入口；后端 isaacgym/lab/mujoco/newton/genesis \\
+ProtoMotions 基准 & AMASS 40+\,h，4$\times$A100，$\sim$12\,h & README 逐字 \\
+PHC & ICCV 2023，arXiv:2305.06456 & PMCP；MuJoCo 版 ZhengyiLuo/PHC\_MJX \\
+KungfuBot/PBHC & NeurIPS 2025，arXiv:2506.12851 & 仓库 TeleHuman/PBHC \\
+AMASS & ICCV 2019 & 40+\,h SMPL 动捕 \\
+\bottomrule
+\end{tabularx}
+\end{table}

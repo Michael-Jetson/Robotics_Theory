@@ -1,0 +1,1261 @@
+\chapter{相机模型}
+\label{ch:camera}
+
+% ════════════════════════════════════════════════════════════════
+%  P2 首章（全吸收重建）：
+%  吸收 十四讲5（针孔/内参/畸变/外参/坐标链/双目/RGB-D + OpenCV/去畸变/双目/RGB-D 代码与数值例）
+%  + Barfoot §7.4/§8.3.7/§10.1（归一化坐标、本质/基础矩阵 + 证明、单应 + 完整推导、
+%       双目中点/左/视差模型与 M 矩阵、投影雅可比 S=ds/dz 与 Hessian、相机=复合 g=s∘z、
+%       BA 投影雅可比 G=S(Tp)^⊙、Schur/Cholesky、不确定度一/二/四阶 + sigmapoint + 相机数值实验）
+%       注：Barfoot §7.4.3 的 RAE/距离-方位观测模型已落于 lidar_slam.tex §激光的观测模型，不在本章。
+%  + Handbook7（抽象 pi/pi⁻¹、rad-tan/BC/KB/双球 完整谱系、重投影误差 + MLE 推导、
+%       full/pose-only/local BA、Schur 补、直接法 warping、RGB-D TSDF/直接跟踪、历史脉络、卷帘）。
+%  范围：相机成像几何与坐标链 + 现代相机类型 + 相机作为可微观测模型（接 BA）。
+%  边界：标定方法→ch:calib；对极/PnP/三角化/BA/特征求解→ch:vo；稠密建图→点云章。
+%  教学层遵循 v5.0 算法工程教学规范；右扰动为主。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 相机把三维世界（单位米）变成图像（单位像素），这中间经过了哪几个坐标系、哪几步变换？
+  \item 内参 $f_x,f_y,c_x,c_y$ 分别从哪来？为什么 $f_x$ 可以不等于 $f_y$？
+  \item 一张照片里的直线为什么会变弯？径向畸变与切向畸变各因何而起？为什么去畸变一般没有解析解？
+  \item 单目相机为什么测不出深度？双目靠什么补上，深度公式是什么？RGB-D 又靠什么？
+  \item 针孔模型对鱼眼/全向镜头还成立吗？现代 SLAM 如何处理超广角相机？
+  \item 把相机写成观测函数 $\mathbf{z}=\mathbf{g}(\mathbf{T},\mathbf{p})$ 后，它对相机位姿、对路标点的雅可比长什么样？这跟束调整（BA）有什么关系？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{推导}针孔相机模型，从相似三角形得到投影方程 $X'=fX/Z$，并把它纳入“正面投影模型”的现代叙述；
+  \item \textbf{写出}内参矩阵 $\mathbf{K}$，解释 $f_x,f_y,c_x,c_y$ 的来历与单位，完成“米$\to$像素”的像素化；
+  \item \textbf{掌握}径向/切向（Brown--Conrady）畸变模型，知道畸变作用在归一化平面、内参在畸变之后，并理解去畸变为何无解析解、要用 Newton 迭代；
+  \item \textbf{串起}世界$\to$相机$\to$归一化$\to$像素的四坐标链，写出 $Z[u,v,1]^\top=\mathbf{K}(\mathbf{R}\mathbf{P}_w+\mathbf{t})$；
+  \item \textbf{推导}双目深度 $z=fb/d$ 与双目矩阵模型 $\mathbf{M}$，理解视差、基线、深度量程的关系，并写出反投影；
+  \item \textbf{说清} RGB-D（结构光/ToF）如何直接测深、其反投影与局限，以及它与双目“视差$\leftrightarrow$深度”的等价；
+  \item \textbf{推导}本质矩阵、基础矩阵、单应矩阵（含完整证明），理解对极约束如何把匹配限制到一条线上；
+  \item \textbf{认识}现代相机模型谱系（针孔/rad-tan/Brown--Conrady/鱼眼 Kannala--Brandt/双球），按视场角选模型；
+  \item \textbf{把相机写成观测模型} $\mathbf{g}=\mathbf{s}\circ\mathbf{z}$，推出投影雅可比 $\mathbf{S}=\partial\mathbf{s}/\partial\mathbf{z}$ 与 BA 用的 $\mathbf{G}=\mathbf{S}(\mathbf{T}\mathbf{p})^\odot$，并经 Schur 补理解 BA 的稀疏求解。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章主线：\emph{相机如何把三维点变成像素，又如何把这一过程写成可微观测模型供后端优化}——针孔$\to$内参$\to$畸变$\to$坐标链，再到双目/RGB-D 测深、多视图几何（本质/基础/单应）、现代镜头谱系，最后把相机封装成 $\mathbf{g}=\mathbf{s}\circ\mathbf{z}$、给出投影雅可比并对接 BA。
+
+\begin{center}
+\small
+\begin{tikzpicture}[node distance=5mm and 6mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  thr/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=third!8, draw=third!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (pin) {针孔投影\\{\scriptsize $X'=fX/Z$}};
+\node[blk, right=of pin] (intr) {内参 $\mathbf{K}$\\{\scriptsize 米$\to$像素}};
+\node[blk, right=of intr] (dist) {畸变\\{\scriptsize 径向/切向}};
+\node[blk, right=of dist] (chain) {坐标系链\\{\scriptsize 四坐标}};
+\node[grp, below=of pin] (stereo) {双目\\{\scriptsize $z=fb/d$}};
+\node[grp, right=of stereo] (rgbd) {RGB-D\\{\scriptsize 直接测深}};
+\node[grp, right=of rgbd] (epi) {多视图几何\\{\scriptsize 本质/基础/单应}};
+\node[grp, right=of epi] (modern) {现代谱系\\{\scriptsize 鱼眼/全向}};
+\node[thr, below=of stereo] (obs) {相机$=$观测模型\\{\scriptsize $\mathbf{g}=\mathbf{s}\circ\mathbf{z}$}};
+\node[thr, right=of obs] (jac) {投影雅可比\\{\scriptsize $\mathbf{S}=\partial\mathbf{s}/\partial\mathbf{z}$}};
+\node[thr, right=of jac] (ba) {对接 BA\\{\scriptsize $\mathbf{G},$ Schur}};
+\draw[ln] (pin)--(intr); \draw[ln] (intr)--(dist); \draw[ln] (dist)--(chain);
+\draw[ln] (pin.south)--(stereo.north);
+\draw[ln] (stereo)--(rgbd); \draw[ln] (rgbd)--(epi); \draw[ln] (epi)--(modern);
+\draw[ln] (stereo.south)--(obs.north);
+\draw[ln] (obs)--(jac); \draw[ln] (jac)--(ba);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：第 \ref{sec:cam-pinhole}--\ref{sec:cam-chain} 节是\emph{所有视觉 SLAM}的地基（针孔、内参、畸变、坐标链），后续 \cref{ch:vo}、\cref{ch:calib}、\cref{ch:vio} 反复引用，必读；第 \ref{sec:cam-stereo}--\ref{sec:cam-rgbd} 节给双目与 RGB-D 的测深原理与反投影；第 \ref{sec:cam-epipolar} 节是多视图几何（本质/基础/单应），是 \cref{ch:vo} 对极几何的前置；第 \ref{sec:cam-modern} 节是现代镜头谱系（鱼眼/全向），按视场角选模型；第 \ref{sec:cam-obs} 节把相机封装成可微观测模型、推出投影雅可比并对接 BA，是 \cref{ch:vo} 的束调整与 \cref{ch:eskf} 的视觉更新的直接前置。\textbf{标定}（如何\emph{求}内参与畸变系数）是本书首个深入方向，专门留给 \cref{ch:calib}；本章把内参视为已知。
+
+\subsection*{前置知识桥接}
+\cref{ch:rigid_body} 给了刚体变换 $\mathbf{T}\in\SE(3)$、齐次坐标、反对称算子 $(\cdot)^\wedge$ 与坐标系记号；本章的外参 $\mathbf{R},\mathbf{t}$ 就是“世界系$\to$相机系”的那个 $\mathbf{T}$，本质矩阵推导也要用到 $\mathbf{u}^\top\mathbf{u}^\wedge=\mathbf{0}$ 这类反对称恒等式。\cref{ch:lie} 的右扰动 $\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol\xi)$ 与齐次点的 $\odot$ 算子用于第 \ref{sec:cam-obs} 节推投影雅可比。本章主体是\emph{正向成像}，前六节只需线性代数；最后一节用到李群求导。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item \cref{ch:vo} 的重投影误差 $\mathbf{z}-\pi(\mathbf{T}\mathbf{p})$ 里那个 $\pi$ 就是本章的投影模型，不懂它无法写 BA，也读不懂特征点法/直接法的代价函数；
+  \item \cref{ch:calib} 标定的正是本章的 $\mathbf{K}$ 与畸变系数；
+  \item \cref{ch:vio} 的视觉因子、\cref{ch:eskf} 的视觉更新都建立在本章末的“相机$=$可微观测模型 $\mathbf{g}=\mathbf{s}\circ\mathbf{z}$、雅可比 $\mathbf{G}$”之上；
+  \item 用错相机模型（如拿针孔套鱼眼）会在图像边缘引入\emph{系统性}偏差，显著降低 SLAM 精度与鲁棒性\cite{carlone2026handbook}。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导、代码与数值例） & 4--5 小时 & 首次系统学习、要做 VO/标定/BA \\
+速读（跳过多视图几何与现代谱系、代码） & 1.5 小时 & 已懂针孔、想对齐本书记号与坐标链 \\
+速查（只看坐标链图 $+$ 速查表） & 10 分钟 & 写代码时回来查投影/反投影公式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{预计阅读时间}
+精读约 4--5 小时；速读约 1.5 小时；速查约 10 分钟。
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+世界点 $\mathbf{P}_w=[X_w,Y_w,Z_w]^\top$；相机点 $\mathbf{P}_c=[X,Y,Z]^\top$（Barfoot\cite{barfoot2024state} 记 $\boldsymbol\rho=\mathbf{r}_s^{ps}=[x,y,z]^\top$、Handbook\cite{carlone2026handbook} 记 $\mathbf{x}^c=[x,y,z]^\top$）；\emph{归一化坐标} $[x,y,1]^\top=[X/Z,Y/Z,1]^\top$（小写 $x,y$，在 $z=1$ 平面上）；像素 $[u,v]^\top$。内参 $\mathbf{K}$（$f_x,f_y,c_x,c_y$；Barfoot 记 $f_u,f_v,c_u,c_v$ 并把整套像素化$+$投影矩阵合记为 $\mathbf{M}$）；外参 $\mathbf{R}\in\SO(3),\mathbf{t}$，$\mathbf{T}=\big[\begin{smallmatrix}\mathbf{R}&\mathbf{t}\\\mathbf{0}^\top&1\end{smallmatrix}\big]\in\SE(3)$；畸变 $k_1,k_2,k_3$（径向）、$p_1,p_2$（切向）；基线 $b$、视差 $d$、焦距 $f$。抽象投影算子 $\pi(\cdot)$、反投影 $\pi^{-1}(\cdot)$。齐次点 $\mathbf{p}=[\,\mathbf{P}_w^\top,1\,]^\top$、膨胀矩阵 $\mathbf{D}=[\mathbf{I}_3;\mathbf{0}^\top]$、$\odot$ 算子见 \cref{ch:lie}。
+
+\textbf{跨书差异}：Barfoot\cite{barfoot2024state} 旋转记 $\mathbf{C}$（本书 $\mathbf{R}$）、相机系点记 $\boldsymbol\rho$、把相机写成复合 $\mathbf{g}=\mathbf{s}\circ\mathbf{z}$、内参$+$投影合记 $\mathbf{M}$、\textbf{扰动用左扰动}（本书右扰动为主，转换见 \cref{sec:cam-obs}）；Handbook\cite{carlone2026handbook} 用抽象算子 $\pi(\mathbf{x}^c,\boldsymbol\xi)$，其内参向量 $\boldsymbol\xi$ 与本书李代数 $\boldsymbol{\xi}$ 撞符号——\textbf{本章内参一律记 $\mathbf{K}$ 或写明系数、绝不记 $\boldsymbol\xi$}，避免与 $\se(3)$ 增量混淆；Handbook 位姿记 $\mathbf{T}_w^i$（world$\to$camera，即本书 $\mathbf{T}_{cw}$），与本书 $\mathbf{T}_{wc}$ 互逆，引用时显式转换。\textbf{归一化坐标的记法在不同文献中并不统一}：部分文献（如\cite{gaoxiang2019slam14}）在“成像总结”里把归一化坐标也记作 $\mathbf{P}_c$，与相机坐标共用一个符号；本书\textbf{严格区分}相机坐标 $\mathbf{P}_c=[X,Y,Z]^\top$（量纲为米）与归一化坐标 $[x,y,1]^\top$（$z=1$ 平面上、无量纲），二者只差一次透视除法。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{针孔相机模型}
+\label{sec:cam-pinhole}
+
+\paragraph{动机：把“观测外部世界”写成方程。}
+\cref{ch:rigid_body}、\cref{ch:lie} 讲的是机器人\emph{如何表示自身位姿}（SLAM 经典模型里的运动方程部分）；本章要补上另一半——机器人\emph{如何观测外部世界}\cite{gaoxiang2019slam14}，即\emph{观测方程}。在以相机为主的视觉 SLAM 里，观测就是成像：三维世界中物体反射或发出的光线，穿过相机光心后投影到成像平面，感光器件把光强量化成像素，得到一张照片。要把这个物理过程写成可计算、可求导的方程，第一步就是给“三维点$\to$像素”建立一个几何模型。
+
+\paragraph{反面：没有相机模型寸步难行。}
+若不显式建立投影模型，重投影误差 $\mathbf{z}-\pi(\mathbf{T}\mathbf{p})$ 里的 $\pi$ 就无从写起，BA 与特征点法都失去代价函数；标定也无从谈起（标定就是反求模型参数）；甚至简单的“给定像素求射线”也做不到。相机模型是连接“米制的三维世界”与“像素的二维图像”的唯一桥梁。
+
+\paragraph{历史：从摄影术到针孔模型。}
+现代摄影由 Niépce 于 1822 年发明；摄影测量（photogrammetry）约 1851 年由法国军官 Laussedat 开创，用地面照片做地形测绘\cite{carlone2026handbook}。20 世纪初 von Gruber 形式化了\emph{束调整}（bundle adjustment, BA）的数学框架：从多幅图像观测到的对应点重建结构与运动。所有这些重建方法都建立在\emph{相机模型}之上，而最基础、最常用的就是\textbf{针孔相机模型}（pinhole / perspective / rectilinear model）——它用射影几何刻画 2D 像点与 3D 世界坐标的关系，至今仍是窄角无畸变镜头的首选\cite{carlone2026handbook}。
+
+\paragraph{直觉：小孔成像。}
+针孔模型来自一个老实验\cite{gaoxiang2019slam14}：点燃的蜡烛透过暗箱上的一个小孔，在箱后平面成一个\emph{倒立}的像。三维世界中的光线穿过光心（针孔），把场景投到二维成像平面。
+
+\paragraph{几何与坐标约定。}
+设相机坐标系 $O\text{-}x\text{-}y\text{-}z$：$z$ 轴指向相机\emph{前方}（光轴，Barfoot 记 $s_3$ 轴\cite{barfoot2024state}）、$x$ 向右、$y$ 向下，原点 $O$ 为光心（针孔）。现实空间点 $P=[X,Y,Z]^\top$ 经光心投到\emph{物理成像平面} $O'\text{-}x'\text{-}y'$ 上的成像点 $P'=[X',Y',Z']^\top$，平面到光心距离为 $f$（焦距）。
+
+\begin{theorem}[针孔投影方程]\label{thm:pinhole}
+设光心 $O$ 在原点、空间点 $P=[X,Y,Z]^\top$、成像点 $P'=[X',Y',f]^\top$ 在 $z=f$ 平面上。物理上小孔成像为倒立像，三角形相似给出
+\begin{equation}
+  \frac{Z}{f}=-\frac{X}{X'}=-\frac{Y}{Y'}\quad(\text{负号 = 倒像}),
+  \label{eq:pinhole-neg}
+\end{equation}
+把成像平面对称地放到相机\emph{前方}（消去倒像负号），则
+\begin{equation}
+  \frac{Z}{f}=\frac{X}{X'}=\frac{Y}{Y'}
+  \quad\Longrightarrow\quad
+  X'=f\frac{X}{Z},\qquad Y'=f\frac{Y}{Z}.
+  \label{eq:pinhole}
+\end{equation}
+\end{theorem}
+\begin{proof}
+光心 $O=\mathbf{0}$、空间点 $P=[X,Y,Z]^\top$、其像 $P'=[X',Y',f]^\top$ 三点\emph{共线}（同一条过光心的光线），即存在 $\lambda$ 使 $P'=\lambda P$。由 $P'$ 第三维 $=f$ 得 $\lambda Z=f$，即 $\lambda=f/Z$，故 $X'=\lambda X=fX/Z$、$Y'=\lambda Y=fY/Z$，即 \cref{eq:pinhole}。物理上小孔成像是倒立的（$P'$ 在 $z=-f$ 平面上，$Z/f=-X/X'$，给出 \cref{eq:pinhole-neg} 的负号）；但相机软件会翻转输出正像，等价于把成像平面对称放到前方、去掉负号。
+\end{proof}
+
+\begin{note}
+\textbf{为什么可以随意把成像平面挪到前方？}\;这只是处理“真实世界$\to$相机投影”的数学手段\cite{gaoxiang2019slam14}。大多数相机输出的图像并不是倒像——相机内部软件会帮你翻转，所以实际得到的是正像，即对称成像平面上的像。Barfoot\cite{barfoot2024state} 称这一约定为\emph{正面投影模型}（frontal projection model）：把像平面画在针孔\emph{之前}，专为避免处理翻转图像。从物理原理看小孔成像应是倒像，但因图像已做预处理，理解成“对称平面上的正像”无害；不引起歧义时，也把去掉负号的式 \eqref{eq:pinhole} 直接称为针孔模型。
+\end{note}
+
+\noindent \cref{eq:pinhole} 各量单位都是\emph{米}（例如焦距 $0.2$ 米，则 $X'$ 可能是 $0.14$ 米）。它只描述“米$\to$米”的投影；要变成像素，还差内参（\cref{sec:cam-intrinsics}）。
+
+\begin{pitfall}[概念误区：焦距 $f$ 是“一个长度”还是“一个像素数”]
+此处 \cref{thm:pinhole} 的 $f$ 是\emph{物理焦距}，单位米——它出现在“米$\to$米”的投影里。但工程中你在标定文件里读到的 $f_x,f_y$（如 $458.654$）是\emph{像素}单位，是 $f$ 乘以像元密度后的合并量（\cref{sec:cam-intrinsics}）。\textbf{错误描述}：把标定得到的 $f_x=458$ 当成“焦距 458 米/毫米”。\textbf{现象}：单位换算全乱，重投影偏差巨大。\textbf{根本原因}：混淆了物理焦距（米）与像素焦距（像素 $=$ 米$\times$像素/米）。\textbf{正确做法}：记住 $f_x=\alpha f$，$\alpha$ 单位像素/米，故 $f_x$ 单位像素；物理焦距 $f$ 一般不单独出现在像素方程里。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 取 $f=0.05$ m，点 $P=[0.3,0.2,3]^\top$ m，手算其物理成像坐标 $[X',Y']$。
+  \item 证明：针孔模型下，三维空间中的一条直线投影到成像平面后仍是直线（提示：直线上的点 $P=P_0+t\mathbf{d}$ 代入 \cref{eq:pinhole}，说明 $[X',Y']$ 关于 $t$ 仍满足一条直线方程的参数族；这也是 Barfoot 习题 7.6\cite{barfoot2024state} 与“相机是仿射变换”这一论断的内核）。
+  \item 若相机软件\emph{不}翻转图像，你写代码时投影方程要怎么改？画出像素坐标会发生什么。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{内参矩阵与像素化}
+\label{sec:cam-intrinsics}
+
+\paragraph{动机：相机吐出的是像素，不是米。}
+\cref{eq:pinhole} 把点投到了成像平面，但单位是米。相机感光器件做的是\emph{采样和量化}——把连续的成像平面切成一个个像素格子，输出整数像素坐标\cite{gaoxiang2019slam14}。所以还差一步“米$\to$像素”的转换，这一步的参数就是相机\emph{内参}。
+
+\paragraph{从米到像素：缩放 $+$ 平移。}
+像素坐标系 $o\text{-}u\text{-}v$：原点 $o'$ 在图像\emph{左上角}，$u$ 向右与 $x$ 平行、$v$ 向下与 $y$ 平行。它与成像平面相差一个缩放（$u$ 向 $\alpha$、$v$ 向 $\beta$，单位 像素/米）与一个原点平移 $[c_x,c_y]^\top$：
+\begin{equation}
+  u=\alpha X'+c_x,\qquad v=\beta Y'+c_y.
+  \label{eq:pixelize}
+\end{equation}
+代入 \cref{eq:pinhole}，并令 $f_x=\alpha f$、$f_y=\beta f$：
+\begin{equation}
+  u=f_x\frac{X}{Z}+c_x,\qquad v=f_y\frac{Y}{Z}+c_y.
+  \label{eq:intrinsic-scalar}
+\end{equation}
+\textbf{单位}：$f$ 为米，$\alpha,\beta$ 为像素/米，故 $f_x,f_y,c_x,c_y$ 都是\emph{像素}。$f_x\ne f_y$ 是因为像元在 $u,v$ 两方向的密度（$\alpha,\beta$）可以不同（很多成像传感器像素非正方形，Barfoot 脚注 7\cite{barfoot2024state} 即指此；正方形像素时期望 $f_x\approx f_y$\cite{carlone2026handbook}）；$c_x,c_y$ 是主点（光轴与像平面交点）相对左上角的像素平移。
+
+\begin{definition}[内参矩阵]\label{def:K}
+把 \cref{eq:intrinsic-scalar} 写成矩阵形式（$\mathbf{P}_c=[X,Y,Z]^\top$；左侧用齐次坐标、右侧用非齐次坐标）：
+\begin{equation}
+  \begin{bmatrix}u\\v\\1\end{bmatrix}
+  =\frac{1}{Z}\begin{bmatrix}f_x&0&c_x\\0&f_y&c_y\\0&0&1\end{bmatrix}
+  \begin{bmatrix}X\\Y\\Z\end{bmatrix}
+  =\frac{1}{Z}\mathbf{K}\mathbf{P}_c
+  \quad\Longleftrightarrow\quad
+  Z\begin{bmatrix}u\\v\\1\end{bmatrix}=\mathbf{K}\mathbf{P}_c,
+  \label{eq:K}
+\end{equation}
+其中
+\begin{equation}
+  \mathbf{K}=\begin{bmatrix}f_x&0&c_x\\0&f_y&c_y\\0&0&1\end{bmatrix}
+  \label{eq:K-matrix}
+\end{equation}
+称\emph{相机内参矩阵}（camera intrinsics）。
+\end{definition}
+
+\begin{note}
+\textbf{三书的内参写法对照.}\;十四讲\cite{gaoxiang2019slam14} 写成上式 $\mathbf{K}$（记号 $f_x,f_y,c_x,c_y$）。Barfoot\cite{barfoot2024state} 把“像素化”单独写成 $[u,v,1]^\top=\mathbf{K}[x_n,y_n,1]^\top$，其中 $\mathbf{K}=\big[\begin{smallmatrix}f_u&0&c_u\\0&f_v&c_v\\0&0&1\end{smallmatrix}\big]$ 作用在\emph{归一化坐标} $(x_n,y_n)$ 上（$x_n=x/z,\,y_n=y/z$），再把整套“透视除法$+$内参”合记为 $\mathbf{M}$ 与投影矩阵 $\mathbf{P}=[\mathbf{I}_2\;\mathbf{0}]$（见 \cref{eq:complete-perspective}）。Handbook\cite{carlone2026handbook} 干脆不写 $\mathbf{K}$，只给内参向量 $\boldsymbol\xi_p=[f_u,f_v,u_0,v_0]^\top$ 与标量投影式 $\pi_p(\mathbf{x}^c)=[f_u\,x/z+u_0,\ f_v\,y/z+v_0]^\top$（无 skew 项）——三者数学等价。本书统一用 \cref{eq:K-matrix} 的 $\mathbf{K}$ 且\textbf{不含 skew}（现代传感器像素轴正交，skew$\approx 0$）。
+\end{note}
+
+\noindent 内参在相机\emph{出厂后固定}，使用中不变。厂商有时给出，否则需\emph{标定}——著名的张正友棋盘格法等留 \cref{ch:calib}（本书首个深入方向）。本章 $\mathbf{K}$ 视为已知。
+
+\begin{example}[一组真实内参]\label{ex:cam-intr}
+EuRoC 数据集所用相机的标定值\cite{gaoxiang2019slam14}：$f_x=458.654,\ f_y=457.296,\ c_x=367.215,\ c_y=248.375$（单位像素），畸变 $k_1=-0.28340811,\ k_2=0.07395907,\ p_1=0.00019359,\ p_2=1.76187114\times10^{-5}$（$k_3$ 未用）。注意 $f_x\ne f_y$（差约 $1.4$ 像素，像元微小非方），主点 $(c_x,c_y)$ 接近但不等于图像中心。本章后续去畸变代码即用这组数。
+\end{example}
+
+\begin{pitfall}[编程陷阱：分辨率改变时内参如何变]
+\textbf{错误描述}：把相机分辨率放大 $2$ 倍（如 $640\times480\to1280\times960$），却沿用旧内参。\textbf{现象}：投影点全部错位约一半图像。\textbf{根本原因}：$f_x=\alpha f$、$c_x$ 都正比于\emph{像素密度}；分辨率翻倍意味着同样的成像平面被切成两倍多的像素，$\alpha\to2\alpha$，故 $f_x,f_y,c_x,c_y$ 都要\emph{乘以 2}（物理焦距 $f$ 不变）。\textbf{正确做法}：缩放因子 $s$ 下，$f_x'=sf_x,\ f_y'=sf_y,\ c_x'=sc_x,\ c_y'=sc_y$（这正是十四讲习题 5.2 的答案\cite{gaoxiang2019slam14}）。裁剪（crop）则只改 $c_x,c_y$（减去裁掉的偏移），不改 $f_x,f_y$。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 \cref{ex:cam-intr} 的内参，把相机点 $\mathbf{P}_c=[1,0.5,5]^\top$ 投影到像素，手算 $[u,v]$。
+  \item （概念）叙述相机内参的物理意义。若分辨率变为原来的两倍而其他不变，内参如何变化？给出推导。
+  \item 给定像素 $(u,v)$，写出它在归一化平面上的坐标 $[x,y,1]^\top$（即 $\mathbf{K}^{-1}[u,v,1]^\top$），并说明为什么这只确定了一条射线、定不了深度。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{畸变模型}
+\label{sec:cam-distortion}
+
+\paragraph{动机：真实镜头不是理想针孔。}
+为获得明亮、清晰的成像，相机前方要加\emph{透镜}\cite{gaoxiang2019slam14}。透镜的引入让光线传播偏离理想针孔：针孔模型里“直线投影还是直线”不再严格成立，照片里的直线会\emph{变弯}，越靠边缘越明显。要在像素级别精确成像，必须给这种偏离建模。
+
+\paragraph{反面：忽略畸变的代价。}
+若直接拿针孔模型处理有畸变的图像，边缘特征的重投影会有系统性偏差，三角化、PnP、BA 的精度都被拉低；标定时若不估计畸变，棋盘格角点的拟合残差会顽固地下不去。一言以蔽之：用不合适的相机模型会引入\emph{系统性}（而非随机）偏差，显著降低 SLAM 精度与鲁棒性\cite{carlone2026handbook}。
+
+\paragraph{两类成因。}
+透镜对成像的影响分两类\cite{gaoxiang2019slam14}：
+\begin{itemize}
+  \item \textbf{径向畸变}（radial）：由透镜\emph{形状}使光线偏折，越靠图像边缘越明显，因透镜中心对称而\emph{径向对称}。分\emph{桶形}（barrel，放大率随离光轴距离增加而\emph{减小}）与\emph{枕形}（pincushion，相反）。两种畸变中，\emph{穿过图像中心且过光轴的直线仍保持形状不变}。
+  \item \textbf{切向畸变}（tangential）：相机组装时透镜与成像面\emph{不可能严格平行}，使光线穿过透镜投到像面时位置发生横向偏移。
+\end{itemize}
+
+\paragraph{数学模型：作用在归一化平面上。}
+考虑\emph{归一化平面}上一点 $[x,y]^\top$（也可写极坐标 $[r,\theta]^\top$，$r$ 是到原点距离、$\theta$ 是与水平轴夹角），$r^2=x^2+y^2$\cite{gaoxiang2019slam14}。径向畸变让点沿\emph{长度方向}变化、切向畸变让点沿\emph{切线方向}变化，通常假设它们呈\emph{多项式关系}。径向（系数 $k_1,k_2,k_3$）：
+\begin{equation}
+  x_{\text{rad}}=x(1+k_1r^2+k_2r^4+k_3r^6),\qquad
+  y_{\text{rad}}=y(1+k_1r^2+k_2r^4+k_3r^6),
+  \label{eq:distortion-radial}
+\end{equation}
+切向（系数 $p_1,p_2$）：
+\begin{equation}
+  x_{\text{tan}}=x+2p_1xy+p_2(r^2+2x^2),\qquad
+  y_{\text{tan}}=y+p_1(r^2+2y^2)+2p_2xy.
+  \label{eq:distortion-tangential}
+\end{equation}
+合并 \cref{eq:distortion-radial,eq:distortion-tangential}，对归一化平面上的点 $[x,y]^\top$ 用 $5$ 个畸变系数得畸变后坐标：
+\begin{equation}
+  \begin{aligned}
+  x_{\text{dist}}&=x(1+k_1r^2+k_2r^4+k_3r^6)+2p_1xy+p_2(r^2+2x^2),\\
+  y_{\text{dist}}&=y(1+k_1r^2+k_2r^4+k_3r^6)+p_1(r^2+2y^2)+2p_2xy.
+  \end{aligned}
+  \label{eq:distortion}
+\end{equation}
+再经内参投到像素：
+\begin{equation}
+  u=f_x\,x_{\text{dist}}+c_x,\qquad v=f_y\,y_{\text{dist}}+c_y.
+  \label{eq:distortion-pixel}
+\end{equation}
+这正是 Handbook 的\emph{径向-切向}（radial-tangential）模型\cite{carlone2026handbook}（其内参向量为 $\boldsymbol\xi_{RT}=[f_u,f_v,u_0,v_0,k_1,k_2,p_1,p_2]^\top$，与本书 \cref{eq:distortion} 仅记号不同、只取到 $k_2$）。
+
+\paragraph{成像完整流程（含畸变）。}
+对相机坐标系中一点 $P$，找它在像素平面上的正确位置走三步\cite{gaoxiang2019slam14}：
+
+\begin{algo}[含畸变的成像三步]\label{alg:cam-distort}
+\textbf{步骤 1.}\;把三维点投影到归一化平面，得 $[x,y]^\top=[X/Z,\,Y/Z]^\top$。\\
+\textbf{步骤 2.}\;对归一化点计算径向$+$切向畸变（\cref{eq:distortion}），得 $[x_{\text{dist}},y_{\text{dist}}]^\top$。\\
+\textbf{步骤 3.}\;把畸变后的点经内参投到像素（\cref{eq:distortion-pixel}），得正确像素 $[u,v]^\top$。
+\end{algo}
+
+\noindent 实际应用可灵活取舍系数，比如只用 $k_1,k_2,p_1,p_2$（省 $k_3$），甚至只用 $k_1,p_1,p_2$\cite{gaoxiang2019slam14}。视觉 SLAM 一般用普通摄像头，针孔$+$径向$+$切向已足够；此外还有仿射、透视等其它模型，本书不展开（窄角无畸变直接针孔，广角/鱼眼用 \cref{sec:cam-modern} 的谱系）。
+
+\begin{pitfall}[畸变的作用顺序]
+畸变作用在\emph{归一化平面}（去掉 $\mathbf{K}$ 之后），\emph{再}左乘 $\mathbf{K}$ 到像素——即\textbf{内参在畸变之后}（\cref{alg:cam-distort} 的步骤 2 在步骤 3 之前）。\textbf{错误描述}：先 $\mathbf{K}$ 把点投到像素、再在像素上套畸变多项式。\textbf{现象}：去畸变后图像仍弯，或边缘越校正越歪。\textbf{根本原因}：畸变系数 $k_i,p_i$ 是相对\emph{归一化半径} $r$ 定义的，套到像素半径上量纲全错。\textbf{正确做法}：严格按“归一化$\to$畸变$\to$内参”的顺序，调试时打印中间量 $r,x_{\text{dist}}$。
+\end{pitfall}
+
+\paragraph{去畸变（undistort）：两种方向与无解析解。}
+有两种做法\cite{gaoxiang2019slam14}：(i) 先把整张图像去畸变、得无畸变图，之后\emph{直接用针孔模型}；(ii) 对畸变图上某点按畸变方程反算其无畸变位置。SLAM 中\emph{前者更常见}。但这里藏着一个关键难点：
+
+\begin{insight}[径向-切向模型的去畸变没有解析解]
+正向畸变 \cref{eq:distortion} 把无畸变 $[x,y]$ 映到畸变 $[x_{\text{dist}},y_{\text{dist}}]$；去畸变要做\emph{反方向}的 $[x_{\text{dist}},y_{\text{dist}}]\to[x,y]$。但 \cref{eq:distortion} 是 $[x,y]$ 的高次多项式（含 $r^6$ 与交叉项），\textbf{无法把 $[x,y]$ 解析地表成 $[x_{\text{dist}},y_{\text{dist}}]$ 的函数}\cite{carlone2026handbook}。即使去掉切向项的 Brown--Conrady 模型，去畸变\emph{仍无解析解}。工程上有两条路：(1) 对“无畸变图每个像素”按正向公式反查畸变图坐标（见 \cref{sec:cam-practice} 代码，避开了反解）；(2) 用 Newton--Raphson 迭代解非线性方程。这也是后文\emph{双球模型}因\emph{闭式可逆}而受青睐的根本原因（\cref{sec:cam-modern}）。
+\end{insight}
+
+\textbf{本书约定}：去畸变后，成像主方程就是无畸变的针孔式 $Z[u,v,1]^\top=\mathbf{K}(\mathbf{R}\mathbf{P}_w+\mathbf{t})$（\cref{sec:cam-chain}），后续章默认图像已去畸变（这与 Barfoot 的处理一致：他在正文里\emph{假定去畸变已完成}，故归一化方程严格成立\cite{barfoot2024state}）。
+
+\begin{pitfall}[概念误区：以为“去畸变”和“正向畸变”是同一个公式]
+\textbf{错误描述}：拿 \cref{eq:distortion} 当去畸变公式，把畸变像素直接代进去当无畸变结果。\textbf{现象}：图像越校正越弯（畸变被加了两次）。\textbf{根本原因}：\cref{eq:distortion} 是\emph{加畸变}（无畸变$\to$畸变），去畸变是它的\emph{逆}（畸变$\to$无畸变），二者方向相反、且逆无解析解。\textbf{正确做法}：去畸变要么对无畸变图反查（\cref{sec:cam-practice}），要么 Newton 迭代解逆，绝不能把正向公式当逆用。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 \cref{ex:cam-intr} 的畸变系数，对图像四角附近的归一化点（如 $[0.6,0.4]$）算 $x_{\text{dist}},y_{\text{dist}}$，与中心点 $[0.01,0.01]$ 比较，观察边缘畸变最大。
+  \item 写出一步 Newton 迭代去畸变的更新式：已知畸变点 $\mathbf{x}_d$，求无畸变 $\mathbf{x}$ 使 $\text{dist}(\mathbf{x})=\mathbf{x}_d$，给出残差与雅可比（$2\times2$）。
+  \item （调试）一段去畸变代码输出的图像边缘更弯了，列出至少三种可能原因（顺序错、方向用反、系数符号错）并各给排查办法。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{外参与坐标系链}
+\label{sec:cam-chain}
+
+\paragraph{动机：点在世界系，相机在动。}
+\cref{eq:K} 用的是\emph{相机系}坐标 $\mathbf{P}_c$。但点的世界坐标 $\mathbf{P}_w$ 是固定的，相机在运动，所以要先用相机当前\emph{位姿}把世界点变到相机系\cite{gaoxiang2019slam14}：$\mathbf{P}_c=\mathbf{R}\mathbf{P}_w+\mathbf{t}$。代入 \cref{eq:K} 得完整成像方程。
+
+\begin{theorem}[完整成像方程]\label{thm:full-projection}
+设相机位姿外参为 $\mathbf{R}\in\SO(3),\mathbf{t}$，$\mathbf{T}=\big[\begin{smallmatrix}\mathbf{R}&\mathbf{t}\\\mathbf{0}^\top&1\end{smallmatrix}\big]$。世界点 $\mathbf{P}_w$ 投到像素满足
+\begin{equation}
+  \boxed{\ Z\begin{bmatrix}u\\v\\1\end{bmatrix}=\mathbf{K}(\mathbf{R}\mathbf{P}_w+\mathbf{t})=\mathbf{K}\mathbf{T}\mathbf{P}_w\ }
+  \label{eq:full-projection}
+\end{equation}
+（末式 $\mathbf{K}\mathbf{T}\mathbf{P}_w$ 隐含一次齐次$\to$非齐次降维，见 \cref{thm:full-projection} 的证明）。
+\end{theorem}
+\begin{proof}
+记齐次世界点 $\tilde{\mathbf{P}}_w=[\mathbf{P}_w^\top,1]^\top\in\mathbb{R}^4$。$\mathbf{T}\tilde{\mathbf{P}}_w=[(\mathbf{R}\mathbf{P}_w+\mathbf{t})^\top,1]^\top\in\mathbb{R}^4$ 是齐次相机点；取其前三维（丢弃恒为 $1$ 的第四维）得非齐次相机点 $\mathbf{P}_c=\mathbf{R}\mathbf{P}_w+\mathbf{t}\in\mathbb{R}^3$，再左乘 $\mathbf{K}\in\mathbb{R}^{3\times3}$ 即得 $Z[u,v,1]^\top=\mathbf{K}\mathbf{P}_c$。记号 $\mathbf{K}\mathbf{T}\mathbf{P}_w$ 默认了这次降维。
+\end{proof}
+
+\noindent $\mathbf{R},\mathbf{t}$ 称\emph{外参}（extrinsics），随相机运动而变，正是 SLAM 要\emph{估计}的轨迹（区别于固定的内参）\cite{gaoxiang2019slam14}。Barfoot\cite{barfoot2024state} 把这一链拆得更细：惯性/世界系 $\mathcal{F}_i$ $\to$ 车体系 $\mathcal{F}_v$（位姿 $\mathbf{T}_{vi}$）$\to$ 传感器/相机系 $\mathcal{F}_s$（\emph{外参} $\mathbf{T}_{sv}$，通常由单独标定确定或并入状态估计），点在相机系坐标 $[\boldsymbol\rho;1]=\mathbf{T}_{sv}\mathbf{T}_{vi}[\mathbf{P}_w;1]$。本书统一写 $\mathbf{T}_{wc}$（camera$\to$world）时，投影前用其\emph{逆} $\mathbf{T}_{cw}=\mathbf{T}_{wc}^{-1}$ 把世界点搬到相机系（Handbook 的 $\mathbf{T}_w^i$ 正是这个 $\mathbf{T}_{cw}$\cite{carlone2026handbook}）。
+
+\begin{pitfall}[$\mathbf{K}\mathbf{T}\mathbf{P}_w$ 里藏着一次降维]
+\cref{eq:full-projection} 中 $\mathbf{K}(\mathbf{R}\mathbf{P}_w+\mathbf{t})=\mathbf{K}\mathbf{T}\mathbf{P}_w$ 两侧维度并不直接相等：$\mathbf{T}\in\SE(3)$ 作用于 $4\times1$ \emph{齐次}世界点 $[\mathbf{P}_w;1]$ 得 $4\times1$ 齐次相机点，而 $\mathbf{K}$ 是 $3\times3$、作用于 $3\times1$ \emph{非齐次}相机点。\textbf{现象}：照搬 $\mathbf{K}\mathbf{T}\mathbf{P}_w$ 会出现 $3\times3$ 乘 $4\times1$ 的维度错误。\textbf{根本原因}：$\mathbf{T}\mathbf{P}_w$ 之后、左乘 $\mathbf{K}$ 之前，要\emph{丢掉齐次坐标第 4 维（恒为 1）}做一次“齐次$\to$非齐次”降维。\textbf{正确做法}：代码里显式取前三维（如 Eigen 的 \texttt{.head<3>()}）。这处降维隐藏得很深，是初学者写投影代码时极易忽略的一环\cite{gaoxiang2019slam14}。
+\end{pitfall}
+
+\paragraph{四坐标链。}
+整个成像把一个点依次经过\emph{四种坐标}\cite{gaoxiang2019slam14}：世界、相机、归一化、像素。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth, node distance=4mm,
+  c/.style={draw, rounded corners, align=center, font=\small, inner sep=4pt, fill=main!5, draw=main!55!black},
+  ln/.style={->, thick, gray!55!black}]
+\node[c] (w) {世界坐标\\$\mathbf{P}_w$\,(米)};
+\node[c, right=14mm of w] (cam) {相机坐标\\$\mathbf{P}_c=[X,Y,Z]$};
+\node[c, right=14mm of cam] (norm) {归一化坐标\\$[X/Z,Y/Z,1]$};
+\node[c, right=14mm of norm] (pix) {像素\\$[u,v]$};
+\draw[ln] (w)--(cam) node[midway,above,font=\scriptsize]{外参 $\mathbf{R},\mathbf{t}$};
+\draw[ln] (cam)--(norm) node[midway,above,font=\scriptsize]{投影 $\div Z$};
+\draw[ln] (norm)--(pix) node[midway,above,font=\scriptsize]{〔畸变〕$+\mathbf{K}$};
+\end{tikzpicture}
+\caption{相机成像的四坐标链：世界$\to$相机（外参）$\to$归一化平面（除以深度）$\to$（畸变）$\to$像素（内参）。完整流程：$\mathbf{P}_w\xrightarrow{\mathbf{T}=(\mathbf{R},\mathbf{t})}\mathbf{P}_c=[X,Y,Z]^\top\xrightarrow{\div Z}[X/Z,Y/Z,1]^\top\xrightarrow{k_i,p_i}[x_{\text{dist}},y_{\text{dist}}]^\top\xrightarrow{\mathbf{K}}[u,v]^\top$。}
+\label{fig:coord-chain}
+\end{figure}
+
+\paragraph{归一化平面与深度丢失。}
+投影过程还可从另一角度看\cite{gaoxiang2019slam14}：把相机点 $[X,Y,Z]^\top$ \emph{除掉最后一维 $Z$}（即点到成像平面的深度），得归一化坐标
+\begin{equation}
+  [X,Y,Z]^\top\ \longrightarrow\ [X/Z,\,Y/Z,\,1]^\top.
+  \label{eq:normalized}
+\end{equation}
+它是相机前方 $z=1$ 处\emph{归一化平面}上的一点；归一化坐标再左乘内参就得像素，所以像素 $[u,v]^\top$ 可看成对归一化平面上点的\emph{量化测量}。
+
+\begin{insight}[深度在投影中丢失 = 单目测不出深度]
+若把 $\mathbf{P}_c$ 同乘任意非零常数，归一化坐标 \cref{eq:normalized} \emph{不变}——\textbf{深度在投影中被丢掉了}。这就是\emph{单目相机测不出深度}的根源：光心到归一化平面连线上的所有点投到\emph{同一}像素\cite{gaoxiang2019slam14}。从维度角度看也是同一回事：完整透视模型 $\mathbf{s}(\boldsymbol\rho)=\mathbf{P}\mathbf{K}\tfrac1z\boldsymbol\rho$（\cref{eq:complete-perspective}）是 $3\to2$ 的映射，丢了一个自由度（深度），故单相机无法确定深度\cite{barfoot2024state}。双目（\cref{sec:cam-stereo}）、RGB-D（\cref{sec:cam-rgbd}）、以及多视图三角化正是为补上深度而生；推而广之，单目状态\emph{从单帧不可观}，初始化因此尤为关键\cite{carlone2026handbook}。
+\end{insight}
+
+\paragraph{完整透视模型（Barfoot 的合记法）。}
+Barfoot\cite{barfoot2024state} 把“透视除法$+$内参$+$去齐次”合并成一个紧凑算子。设相机系点 $\boldsymbol\rho=[x,y,z]^\top$，则
+\begin{equation}
+  \begin{bmatrix}u\\v\end{bmatrix}=\mathbf{s}(\boldsymbol\rho)=\mathbf{P}\,\mathbf{K}\,\frac1z\,\boldsymbol\rho,\qquad
+  \mathbf{P}=\begin{bmatrix}1&0&0\\0&1&0\end{bmatrix},\quad
+  \mathbf{K}=\begin{bmatrix}f_u&0&c_u\\0&f_v&c_v\\0&0&1\end{bmatrix},
+  \label{eq:complete-perspective}
+\end{equation}
+其中 $\mathbf{P}$ 只是“去掉齐次第三行”的投影矩阵。这一记法在 \cref{sec:cam-stereo}（双目 $\mathbf{M}$）与 \cref{sec:cam-obs}（投影雅可比）里都会复用。
+
+\paragraph{把四步连成一句话：单目成像全流程。}
+讲到这里，针孔、内参、畸变、外参四块拼图已经齐了。下面把整个单目成像\emph{串成一条流程}走一遍，作为前四节的收束\cite{gaoxiang2019slam14}——读完这一段，你应当能闭着眼睛说出“一个三维点是怎么一步步变成像素的”。
+
+\begin{algo}[单目相机成像全流程]\label{alg:cam-pipeline}
+给定世界系一固定点 $P$（世界坐标 $\mathbf{P}_w$）、相机位姿 $\mathbf{T}\in\SE(3)$、内参 $\mathbf{K}$ 与畸变系数：
+\begin{enumerate}
+  \item \textbf{外参（世界$\to$相机）}：相机在运动，其位姿由 $\mathbf{R},\mathbf{t}$（即 $\mathbf{T}$）描述，把世界点搬到相机系 $\tilde{\mathbf{P}}_c=\mathbf{R}\mathbf{P}_w+\mathbf{t}$（\cref{thm:full-projection}）。
+  \item \textbf{投影（相机$\to$归一化）}：$\tilde{\mathbf{P}}_c$ 的分量为 $X,Y,Z$，除以深度 $Z$ 投到 $z=1$ 归一化平面，得归一化坐标 $[X/Z,Y/Z,1]^\top$（\cref{eq:normalized}）。
+  \item \textbf{畸变（归一化平面内）}：有畸变时，按 $k_i,p_i$ 把归一化点变为 $[x_{\text{dist}},y_{\text{dist}}]^\top$（\cref{eq:distortion}）；图像已去畸变则跳过此步。
+  \item \textbf{内参（归一化$\to$像素）}：归一化（或畸变后）点左乘 $\mathbf{K}$，落到像素坐标 $\mathbf{P}_{uv}=[u,v]^\top$（\cref{eq:K}）。
+\end{enumerate}
+\end{algo}
+
+\noindent 把这四步与 \cref{fig:coord-chain} 的四坐标对照：每一步恰好跨过一种坐标系。\emph{务必厘清这四种坐标的关系}\cite{gaoxiang2019slam14}——它就是整个成像过程的骨架，后续 \cref{ch:vo} 写重投影误差、\cref{ch:calib} 做标定，无非是在这条链上正向走（投影）或反向求（标定/三角化）。至此正向成像的几何已经完整；但别忘了第 2 步那个“除以 $Z$”——它丢掉了深度，这正是下一节双目要补的窟窿。
+
+\begin{practice}
+\begin{enumerate}
+  \item 给定 \cref{ex:cam-intr} 的 $\mathbf{K}$、世界点 $\mathbf{P}_w=[2,1,8]^\top$、位姿 $\mathbf{R}=\mathbf{I}$、$\mathbf{t}=[0,0,1]^\top$，手算其像素坐标（走一遍四坐标链）。
+  \item 证明 \cref{eq:complete-perspective} 的标量展开就是 \cref{eq:intrinsic-scalar}。
+  \item 若已知 $\mathbf{T}_{wc}$（camera$\to$world），写出把世界点投影到像素的完整式子（提示：先 $\mathbf{T}_{wc}^{-1}$）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{双目相机}
+\label{sec:cam-stereo}
+
+\paragraph{动机与原理：用视差补深度。}
+单目丢了深度（\cref{sec:cam-chain}）。像人眼用左右眼的景物差异（视差）判断远近，双目相机\emph{同步}采左右图、算视差、估每个像素的深度\cite{gaoxiang2019slam14}。双目由两个水平放置、刚性连接、相对变换已知的针孔相机组成，两光心都在 $x$ 轴上，间距称\emph{基线} $b$。同一空间点 $P$ 在左右图的横坐标 $u_L,u_R$（按图中约定 $u_R<0$）。与单相机不同，双目观测\emph{可确定深度}\cite{barfoot2024state}。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth,scale=1.0]
+  \coordinate (OL) at (0,0);
+  \coordinate (OR) at (3,0);
+  \coordinate (P)  at (1.5,3.2);
+  \fill (OL) circle (1.2pt) node[below]{$O_L$};
+  \fill (OR) circle (1.2pt) node[below]{$O_R$};
+  \fill (P)  circle (1.2pt) node[above]{$P=[x,y,z]$};
+  \draw[gray!60!black] (OL)--(OR) node[midway,below=2pt,font=\scriptsize]{基线 $b$};
+  \draw[thick,main] (-0.6,1)--(1.0,1);
+  \draw[thick,main] (2.0,1)--(3.6,1);
+  \node[font=\scriptsize] at (1.0,1.18) {左像面};
+  \node[font=\scriptsize] at (3.6,1.18) {右像面};
+  \draw[dashed,gray] (OL)--(P);
+  \draw[dashed,gray] (OR)--(P);
+  \fill (0.47,1) circle (0.8pt) node[below=1pt,font=\scriptsize]{$u_L$};
+  \fill (2.94,1) circle (0.8pt) node[below=1pt,font=\scriptsize]{$u_R$};
+  \draw[<->,gray!55!black] (OL)++(0,0.05)--+(0,0.9) node[midway,left,font=\scriptsize]{$f$};
+\end{tikzpicture}
+\caption{双目相机成像几何：$O_L,O_R$ 为左右光心，基线 $b$，焦距 $f$，同一点 $P$ 在左右像面横坐标 $u_L,u_R$，视差 $d=u_L-u_R$。}
+\label{fig:cam-stereo}
+\end{figure}
+
+\begin{theorem}[双目深度]\label{thm:stereo}
+左右相机水平放置、基线 $b$、焦距 $f$，点 $P$ 深度 $z$，其左右像横坐标 $u_L,u_R$，则
+\begin{equation}
+  z=\frac{fb}{d},\qquad d:=u_L-u_R\ (\text{视差,\ disparity}).
+  \label{eq:stereo}
+\end{equation}
+\end{theorem}
+\begin{proof}
+由相似三角形 $\triangle PP_LP_R\sim\triangle PO_LO_R$（前者顶点 $P$、底为两像点间距，后者顶点 $P$、底为基线 $b$），对应高分别为 $z-f$ 与 $z$、对应底分别为 $b-(u_L-u_R)$ 与 $b$：
+\[
+  \frac{z-f}{z}=\frac{b-(u_L-u_R)}{b}.
+\]
+两边同乘 $b$：$b-\tfrac{bf}{z}=b-(u_L-u_R)$；两边减 $b$：$-\tfrac{bf}{z}=-(u_L-u_R)=-d$；故 $\tfrac{bf}{z}=d$，即 $z=fb/d$。
+\end{proof}
+
+\paragraph{视差的性质与深度量程。}
+$d$ 越大、距离越近（成反比）\cite{gaoxiang2019slam14}；视差\emph{最小为一个像素}，故双目深度有理论上限 $z_{\max}=fb$（$d=1$ 时），\textbf{基线越长可测越远}——人眼看远处飞机难判距离即此理。工程上难点在\emph{视差计算}：需在右图找左图某像素的对应位置（“人类觉得容易、计算机觉得难”），且只在纹理丰富处可算，逐像素计算量大，常需 GPU/FPGA。\emph{立体匹配算法}（如 SGBM, Semi-Global Block Matching）本身留 \cref{ch:vo} / 稠密重建。
+
+\paragraph{双目的矩阵模型（Barfoot 中点/左目/视差三式）。}
+Barfoot\cite{barfoot2024state} 把双目写成统一的矩阵模型，便于后续求雅可比。设传感器系取在两相机\emph{中点}，点 $\boldsymbol\rho=[x,y,z]^\top$。左、右相机各自的针孔模型（两相机内参相同）为
+\begin{equation}
+  \begin{bmatrix}u_\ell\\v_\ell\end{bmatrix}=\mathbf{P}\mathbf{K}\frac1z\begin{bmatrix}x+\tfrac b2\\y\\z\end{bmatrix},\qquad
+  \begin{bmatrix}u_r\\v_r\end{bmatrix}=\mathbf{P}\mathbf{K}\frac1z\begin{bmatrix}x-\tfrac b2\\y\\z\end{bmatrix}.
+  \label{eq:stereo-lr}
+\end{equation}
+把两观测堆叠，得\emph{中点双目模型}
+\begin{equation}
+  \begin{bmatrix}u_\ell\\v_\ell\\u_r\\v_r\end{bmatrix}=\mathbf{s}(\boldsymbol\rho)
+  =\underbrace{\begin{bmatrix}f_u&0&c_u&f_u\tfrac b2\\0&f_v&c_v&0\\f_u&0&c_u&-f_u\tfrac b2\\0&f_v&c_v&0\end{bmatrix}}_{\textstyle\mathbf{M}}
+  \frac1z\begin{bmatrix}x\\y\\z\\1\end{bmatrix},
+  \label{eq:stereo-M}
+\end{equation}
+$\mathbf{M}$ 是双目装置的组合参数矩阵。
+
+\begin{proposition}[$\mathbf{M}$ 不可逆，垂直坐标恒相等]\label{prop:stereo-M}
+\cref{eq:stereo-M} 的 $\mathbf{M}$ 不可逆（第 $2$、$4$ 行相同），故双目观测的\emph{垂直坐标恒相等} $v_r=v_\ell$。
+\end{proposition}
+\begin{proof}
+$\mathbf{M}$ 的第 $2$ 行与第 $4$ 行都是 $[0,f_v,c_v,0]$，故 $\mathbf{M}$ 行不满秩、不可逆，且这两行作用得 $v_\ell=v_r$。这对应于该配置下\emph{对极线是水平的}：左图某点在右图的对应观测，可沿\emph{相同垂直像素坐标}的水平线搜索。用基础矩阵约束（\cref{thm:fundamental}）也能验证：此双目设置 $\mathbf{C}_{r\ell}=\mathbf{I}$、$\mathbf{r}_r^{\ell r}=[-b,0,0]^\top$，对极约束
+\[
+  \begin{bmatrix}u_\ell&v_\ell&1\end{bmatrix}
+  \underbrace{\begin{bmatrix}f_u&0&0\\0&f_v&0\\c_u&c_v&1\end{bmatrix}}_{\mathbf{K}_\ell^\top}
+  \underbrace{\begin{bmatrix}0&0&0\\0&0&b\\0&-b&0\end{bmatrix}}_{\mathbf{E}_{\ell r}}
+  \underbrace{\begin{bmatrix}f_u&0&c_u\\0&f_v&c_v\\0&0&1\end{bmatrix}}_{\mathbf{K}_r}
+  \begin{bmatrix}u_r\\v_r\\1\end{bmatrix}=0
+\]
+乘开后化简正是 $v_r=v_\ell$。
+\end{proof}
+
+\noindent 也可把传感器系取在\emph{左相机}。此时模型为
+\begin{equation}
+  \begin{bmatrix}u_\ell\\v_\ell\\u_r\\v_r\end{bmatrix}
+  =\begin{bmatrix}f_u&0&c_u&0\\0&f_v&c_v&0\\f_u&0&c_u&-f_u b\\0&f_v&c_v&0\end{bmatrix}
+  \frac1z\begin{bmatrix}x\\y\\z\\1\end{bmatrix}.
+  \label{eq:stereo-left}
+\end{equation}
+通常丢弃冗余的 $v_r$ 方程，把 $u_r$ 方程换成\emph{视差} $d$ 方程：
+\begin{equation}
+  d=u_\ell-u_r=\frac1z f_u b,
+  \label{eq:stereo-disparity}
+\end{equation}
+（这正是 \cref{eq:stereo} 在 $f=f_u$ 下的形式）于是得\emph{视差双目模型}
+\begin{equation}
+  \begin{bmatrix}u_\ell\\v_\ell\\d\end{bmatrix}=\mathbf{s}(\boldsymbol\rho)
+  =\begin{bmatrix}f_u&0&c_u&0\\0&f_v&c_v&0\\0&0&0&f_u b\end{bmatrix}
+  \frac1z\begin{bmatrix}x\\y\\z\\1\end{bmatrix}.
+  \label{eq:stereo-disparity-M}
+\end{equation}
+该形式从 $3$ 个点参数 $(x,y,z)$ 映到 $3$ 个观测 $(u_\ell,v_\ell,d)$——\emph{一一对应、可逆、可反投影}（与单目 $3\to2$ 的信息损失对照）。
+
+\begin{theorem}[双目反投影]\label{thm:stereo-backproj}
+以\emph{左相机系}为例，由 \cref{eq:stereo-disparity,eq:stereo-left} 反解，给定 $(u_\ell,v_\ell,d)$（或等价地视差 $d$、深度 $z$）：
+\begin{equation}
+  z=\frac{f_u b}{d},\qquad
+  x=\frac{(u_\ell-c_u)\,z}{f_u},\qquad
+  y=\frac{(v_\ell-c_v)\,z}{f_v}.
+  \label{eq:stereo-backproj}
+\end{equation}
+\end{theorem}
+\begin{proof}
+由 \cref{eq:stereo-disparity} 得 $z=f_u b/d$。\cref{eq:stereo-left} 的第一行 $u_\ell=f_u\,x/z+c_u$ 反解 $x=(u_\ell-c_u)z/f_u$；第二行 $v_\ell=f_v\,y/z+c_v$ 反解 $y=(v_\ell-c_v)z/f_v$。由 \cref{prop:stereo-M} 知 $v_r$ 冗余，三方程足以唯一定 $(x,y,z)$（即 \cref{eq:stereo-disparity-M} 的 $\mathbf{s}$ 是 $3\to3$ 可逆映射），故反投影存在且唯一。
+\end{proof}
+
+\noindent 这一“归一化坐标 $\times$ 深度”的反投影，与 \cref{sec:cam-rgbd} 的 RGB-D 反投影完全同构——本质都是“像素$+$深度$\to$ 3D”。\cref{sec:cam-practice} 的双目点云代码即直接落地 \cref{eq:stereo-backproj}。
+
+\begin{example}[双目数值例]\label{ex:cam-stereo}
+KITTI 类内参\cite{gaoxiang2019slam14}：$f_x=f_y=718.856,\ c_x=607.1928,\ c_y=185.2157$（像素），基线 $b=0.573$ m。SGBM 计算视差后除以 $16$（SGBM 输出放大了 $16$ 倍）得真实视差，取有效范围 $d\in(10,96)$。对像素 $(u,v)$ 与视差 $d$：$x=(u-c_x)/f_x$，$y=(v-c_y)/f_y$，$\text{depth}=f_x b/d$，相机系点 $[x\cdot\text{depth},\,y\cdot\text{depth},\,\text{depth}]^\top$。例如 $d=48$ 时深度 $\approx 718.856\times0.573/48\approx8.58$ m。
+\end{example}
+
+\begin{pitfall}[概念误区：双目深度处处可测]
+\textbf{错误描述}：以为双目能给\emph{每个}像素深度。\textbf{现象}：弱纹理区（白墙、天空）深度图大片空洞或跳变。\textbf{根本原因}：深度依赖视差，而视差靠左右图\emph{匹配}得到；无纹理处无法可靠匹配，视差算不出（\cref{ex:cam-stereo} 才要设有效范围过滤）。\textbf{正确做法}：弱纹理处接受空洞，或改用主动测深的 RGB-D（\cref{sec:cam-rgbd}），或投射结构光增强纹理。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 \cref{ex:cam-stereo} 的参数，给定像素 $(700,200)$、视差 $d=32$，算其相机系 3D 坐标。
+  \item 证明 \cref{eq:stereo-M} 的 $\mathbf{M}$ 第一行展开后等于 \cref{eq:stereo-lr} 左相机的 $u_\ell$。
+  \item 推导传感器系取在\emph{右}相机时的双目模型（仿 \cref{eq:stereo-left}；这是 Barfoot 习题 7.8\cite{barfoot2024state}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{RGB-D 相机}
+\label{sec:cam-rgbd}
+
+\paragraph{动机：主动测深，不靠匹配。}
+双目\emph{被动}算视差，弱纹理处失效。RGB-D 相机改为\emph{主动}测每个像素的深度\cite{gaoxiang2019slam14}，绕开了立体匹配。它在概念上\emph{介于普通相机与激光雷达之间}\cite{carlone2026handbook}：像相机一样给出致密的 2D 像素阵列，又像激光一样直接给距离。
+
+\paragraph{两类测深原理。}
+\begin{itemize}
+  \item \textbf{结构光}（structured light）：发射红外图案，按返回图案的\emph{变形}算距离（Kinect 一代、Project Tango 一代、Intel RealSense 等）。
+  \item \textbf{飞行时间}（Time-of-Flight, ToF）：发射脉冲光，按发送到返回的\emph{飞行时间}算距离（Kinect 二代等）。
+\end{itemize}
+ToF 与激光类似，但激光\emph{逐点}扫描、ToF 相机\emph{一次}得整幅深度图\cite{carlone2026handbook,gaoxiang2019slam14}。把 RGB-D 相机拆开，除普通摄像头外至少有一个发射器与一个接收器。RGB-D 通常出厂即把深度图与彩色图\emph{对齐}（按生产时各相机摆位完成配对），同一像素可同时读色彩与距离，从而计算 3D 相机坐标、生成\emph{点云}（point cloud）。
+
+\paragraph{逆投影：像素 $+$ 深度 $\to$ 3D。}
+深度 $Z$ 已知时，由 \cref{eq:intrinsic-scalar} 反解相机坐标（闭式）：
+
+\begin{theorem}[RGB-D 反投影]\label{thm:rgbd-backproj}
+深度 $Z=\text{depth}$ 已知、内参 $\mathbf{K}$ 已知，像素 $(u,v)$ 的相机系坐标为
+\begin{equation}
+  X=\frac{(u-c_x)\,Z}{f_x},\qquad Y=\frac{(v-c_y)\,Z}{f_y},\qquad Z=\text{depth}.
+  \label{eq:rgbd-backproj}
+\end{equation}
+\end{theorem}
+\begin{proof}
+\cref{eq:intrinsic-scalar} 给 $u=f_x X/Z+c_x$、$v=f_y Y/Z+c_y$。$Z$ 已知，反解第一式得 $X=(u-c_x)Z/f_x$，反解第二式得 $Y=(v-c_y)Z/f_y$。深度直接由传感器读出，故无歧义、闭式可逆——这与双目反投影 \cref{eq:stereo-backproj} 同构（RGB-D 直接给 $Z$，双目给视差 $d=f_u b/Z$ 等价）。
+\end{proof}
+
+\noindent 再经外参 $\mathbf{T}_{wc}$ 把相机系点转到世界系即得世界点云：$\mathbf{P}_w=\mathbf{T}_{wc}[X,Y,Z]^\top$。\cref{sec:cam-practice} 的 RGB-D 拼图代码即落地 \cref{eq:rgbd-backproj} $+$ 外参。
+
+\begin{insight}[RGB-D 与双目“视差—深度”是一回事]
+RGB-D 没有“视差”，但它直接给深度 $Z$；双目没有“直接深度”，但它给视差 $d$，由 $z=f_ub/d$ 换算成深度。两者最终都进入同一个“像素 $+$ 深度 $\to$ 3D”的反投影框架（\cref{thm:rgbd-backproj} 与 \cref{thm:stereo-backproj}）\cite{barfoot2024state}。所以在 SLAM 代码里，双目和 RGB-D 的点云生成几乎可以共用同一段反投影逻辑，只差“深度从哪来”。
+\end{insight}
+
+\paragraph{局限。}
+RGB-D 用发射-接收测距，使用范围受限\cite{gaoxiang2019slam14}：红外测深易受\emph{日光}或其他传感器红外光干扰，\emph{基本只能室内}；同时使用多台无调制 RGB-D 会相互干扰；对\emph{透明/透射}材质收不到反射光、无法测距；量程有限（典型 $\le5$ m\cite{carlone2026handbook}），且在成本、功耗上有劣势。
+
+\begin{example}[RGB-D 数值例]\label{ex:cam-rgbd}
+本例 RGB-D 内参（取自\cite{gaoxiang2019slam14} 的点云拼接数据集）：$c_x=325.5,\ c_y=253.5,\ f_x=518.0,\ f_y=519.0$（像素），深度图以\emph{毫米}存为 16 位 \texttt{unsigned short}，故除以 \texttt{depthScale}$=1000$ 转米。位姿以 $\mathbf{T}_{wc}$ 给出，存储为“平移 $+$ 旋转四元数”$[x,y,z,q_x,q_y,q_z,q_w]$（实部 $q_w$ 在\emph{末位}），如第一帧 $[-0.228993,0.00645704,0.0287837,-0.0004327,-0.113131,-0.0326832,0.993042]$。构造时用 \texttt{Quaterniond(data[6],data[3],data[4],data[5])} 即 \texttt{Quaterniond(w,x,y,z)}，这是 Hamilton/Eigen 约定（与本书一致），仅需注意“文件里实部在末、Eigen 构造时实部在首”。
+\end{example}
+
+\begin{pitfall}[编程陷阱：深度单位与零深度]
+\textbf{错误描述}：直接拿 16 位深度原始值当米用，或不判零深度。\textbf{现象}：点云尺度差 $1000$ 倍，或出现一堆贴在光心的“伪点”。\textbf{根本原因}：深度图常以毫米存（\cref{ex:cam-rgbd}），要除 \texttt{depthScale}；深度 $=0$ 表示“没测到”（无效），不是“距离为 0”。\textbf{正确做法}：先 \texttt{Z = d /\allowbreak  depthScale}，再 \texttt{if (d==0) continue;} 跳过无效像素，最后才反投影。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 \cref{ex:cam-rgbd} 的内参，给定像素 $(400,300)$、深度原始值 $2500$（毫米），算其相机系与（设 $\mathbf{T}_{wc}=\mathbf{I}$）世界系坐标。
+  \item 写出 \cref{eq:rgbd-backproj} 的推导（由 \cref{eq:intrinsic-scalar} 反解），并说明为何 RGB-D 不再有“深度丢失”问题。
+  \item 调研：以 Kinect 为例，RGB-D 标定需要标哪些参数（彩色内参、深度内参、彩色-深度外参）？这是十四讲习题 5.5\cite{gaoxiang2019slam14}。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{多视图几何：本质、基础与单应矩阵}
+\label{sec:cam-epipolar}
+
+\paragraph{动机：两张图之间的约束。}
+前几节讲“一个点$\to$一张图”。但 SLAM/SfM 的核心是\emph{多视图}：同一点被多个相机观测。两次观测（同一相机移动后、或两个相机）的像点之间存在\emph{代数约束}\cite{barfoot2024state}——这些约束（本质矩阵、基础矩阵、单应矩阵）既能把特征匹配限制到一条线上、大幅加速搜索，又是相机标定与位姿恢复的工具。本节给出它们的定义与\emph{完整证明}，为 \cref{ch:vo} 的对极几何、PnP、三角化打底。
+
+\begin{theorem}[本质矩阵与对极约束]\label{thm:essential}
+点 $P$ 被相机在位姿 $a$、$b$ 两次观测，归一化图像坐标分别为 $\mathbf{p}_a,\mathbf{p}_b$（齐次，$z=1$ 平面）。设位姿变化 $\mathbf{T}_{ba}=\big[\begin{smallmatrix}\mathbf{R}_{ba}&\mathbf{r}_b^{ab}\\\mathbf{0}^\top&1\end{smallmatrix}\big]$（旋转 $\mathbf{R}_{ba}$、平移 $\mathbf{r}_b^{ab}$），则
+\begin{equation}
+  \mathbf{p}_a^\top\,\mathbf{E}_{ab}\,\mathbf{p}_b=0,\qquad
+  \mathbf{E}_{ab}=\mathbf{R}_{ba}^\top\,(\mathbf{r}_b^{ab})^\wedge,
+  \label{eq:essential}
+\end{equation}
+$\mathbf{E}_{ab}$ 称\emph{本质矩阵}（essential matrix）。
+\end{theorem}
+\begin{proof}
+（保 Barfoot 全步骤，旋转 $\mathbf{C}\to\mathbf{R}$\cite{barfoot2024state}）令 $\mathbf{p}_j=\tfrac1{z_j}\boldsymbol\rho_j$，$\boldsymbol\rho_j=[x_j,y_j,z_j]^\top$（$j=a,b$）。相机移动使同一点的坐标按 $\boldsymbol\rho_a=\mathbf{R}_{ba}^\top(\boldsymbol\rho_b-\mathbf{r}_b^{ab})$ 变换。代入约束式左端：
+\[
+  \mathbf{p}_a^\top\mathbf{E}_{ab}\mathbf{p}_b
+  =\frac1{z_az_b}\boldsymbol\rho_a^\top\mathbf{E}_{ab}\boldsymbol\rho_b
+  =\frac1{z_az_b}(\boldsymbol\rho_b-\mathbf{r}_b^{ab})^\top
+  \underbrace{\mathbf{R}_{ba}\mathbf{R}_{ba}^\top}_{\mathbf{I}}(\mathbf{r}_b^{ab})^\wedge\boldsymbol\rho_b
+\]
+\[
+  =\frac1{z_az_b}\Big(\underbrace{\boldsymbol\rho_b^\top(\mathbf{r}_b^{ab})^\wedge\boldsymbol\rho_b}_{=0}
+  -\underbrace{(\mathbf{r}_b^{ab})^\top(\mathbf{r}_b^{ab})^\wedge}_{=\mathbf{0}^\top}\boldsymbol\rho_b\Big)=0,
+\]
+末步用了反对称恒等式 $\mathbf{u}^\top\mathbf{u}^\wedge=\mathbf{0}^\top$（任意 $\mathbf{u}$，因 $\mathbf{u}^\wedge\mathbf{u}=\mathbf{u}\times\mathbf{u}=\mathbf{0}$，转置得 $\mathbf{u}^\top(\mathbf{u}^\wedge)^\top=-\mathbf{u}^\top\mathbf{u}^\wedge=\mathbf{0}$），以及 $\boldsymbol\rho_b^\top(\mathbf{r}_b^{ab})^\wedge\boldsymbol\rho_b$ 为反对称型恒为零。
+\end{proof}
+
+\noindent 本质矩阵约束 \cref{eq:essential} 很优美，但它作用在\emph{归一化坐标} $\mathbf{p}$ 上——而我们手里通常只有\emph{像素坐标}（归一化坐标要先用内参 $\mathbf{K}^{-1}$ 反算）。能不能把约束直接写到像素上？只要把 $\mathbf{p}=\mathbf{K}^{-1}\mathbf{q}$ 代进去，本质矩阵两侧各吸收一个内参，就得到一个直接吃像素的版本——这就是基础矩阵。
+
+\begin{theorem}[基础矩阵与对极线]\label{thm:fundamental}
+设两次观测的\emph{齐次像素}坐标 $\mathbf{q}_i=\mathbf{K}_i\mathbf{p}_i$（$i=a,b$，可有不同内参），则
+\begin{equation}
+  \mathbf{q}_a^\top\,\mathbf{F}_{ab}\,\mathbf{q}_b=0,\qquad
+  \mathbf{F}_{ab}=\mathbf{K}_a^{-\top}\,\mathbf{E}_{ab}\,\mathbf{K}_b^{-1},
+  \label{eq:fundamental}
+\end{equation}
+$\mathbf{F}_{ab}$ 称\emph{基础矩阵}（fundamental matrix），该约束即\emph{对极约束}（epipolar constraint）。
+\end{theorem}
+\begin{proof}
+直接代入并用 \cref{thm:essential}\cite{barfoot2024state}：
+\[
+  \mathbf{q}_a^\top\mathbf{F}_{ab}\mathbf{q}_b
+  =\mathbf{p}_a^\top\underbrace{\mathbf{K}_a^\top\mathbf{K}_a^{-\top}}_{\mathbf{I}}\mathbf{E}_{ab}
+  \underbrace{\mathbf{K}_b^{-1}\mathbf{K}_b}_{\mathbf{I}}\mathbf{p}_b
+  =\mathbf{p}_a^\top\mathbf{E}_{ab}\mathbf{p}_b=0,
+\]
+最后一步即本质矩阵约束 \cref{eq:essential}。
+\end{proof}
+
+\begin{insight}[对极约束把匹配搜索从二维降到一维]
+若点在相机 $a$ 中观测为 $\mathbf{q}_a$、已知基础矩阵 $\mathbf{F}_{ab}$，则 \cref{eq:fundamental} 说 $\mathbf{q}_b$ 必落在一条直线（\emph{对极线}, epipolar line）$\boldsymbol\ell_b=\mathbf{F}_{ab}^\top\mathbf{q}_a$ 上\cite{barfoot2024state}。这把“在整张右图找匹配”从\emph{二维搜索}降到\emph{沿一条线的一维搜索}——对极几何之所以能加速立体匹配与特征匹配，根子就在这里。之所以是一条\emph{直线}（而非曲线），是因为针孔相机是\emph{仿射变换}：欧氏空间的直线投影到图像空间仍是直线（\cref{sec:cam-pinhole} 练习 2）。\cref{prop:stereo-M} 里“双目对极线水平”正是这一约束在 $\mathbf{R}_{r\ell}=\mathbf{I}$、平移沿 $x$ 时的特例。
+\end{insight}
+
+\paragraph{单应矩阵：共面点的双视图映射。}
+单相机测不出深度，但若假设观测的点位于一个\emph{几何已知的平面}上，就能算出深度，进而算它在另一相机里如何成像。这就引出单应矩阵\cite{barfoot2024state}。
+
+\begin{theorem}[单应矩阵]\label{thm:homography}
+两相机的齐次像素观测 $\mathbf{q}_i=\mathbf{K}_i\tfrac1{z_i}\boldsymbol\rho_i$（$i=a,b$）。设点 $P$ 位于一平面，该平面在相机 $i$ 系中参数化为 $\{\mathbf{n}_i,d_i\}$（法向 $\mathbf{n}_i$、距离 $d_i$），满足 $\mathbf{n}_i^\top\boldsymbol\rho_i+d_i=0$。已知位姿变化 $\mathbf{T}_{ba}$，则两视图像素满足
+\begin{equation}
+  \mathbf{q}_b=\mathbf{K}_b\,\mathbf{H}_{ba}\,\mathbf{K}_a^{-1}\mathbf{q}_a,\qquad
+  \mathbf{H}_{ba}=\frac{z_a}{z_b}\mathbf{R}_{ba}\Big(\mathbf{I}+\frac1{d_a}\mathbf{r}_a^{ba}\mathbf{n}_a^\top\Big),
+  \label{eq:homography}
+\end{equation}
+$\mathbf{H}_{ba}$ 称\emph{单应矩阵}（homography matrix）。
+\end{theorem}
+\begin{proof}
+（保 Barfoot 全步骤\cite{barfoot2024state}）由 $\mathbf{q}_i=\mathbf{K}_i\tfrac1{z_i}\boldsymbol\rho_i$ 解出 $\boldsymbol\rho_i=z_i\mathbf{K}_i^{-1}\mathbf{q}_i$，代入平面方程 $\mathbf{n}_i^\top\boldsymbol\rho_i+d_i=0$：
+\[
+  z_i\,\mathbf{n}_i^\top\mathbf{K}_i^{-1}\mathbf{q}_i+d_i=0
+  \quad\Longrightarrow\quad
+  z_i=-\frac{d_i}{\mathbf{n}_i^\top\mathbf{K}_i^{-1}\mathbf{q}_i},
+\]
+即点在各相机中的\emph{深度}（这同时给出共面点的反投影 $\boldsymbol\rho_i=-\tfrac{d_i}{\mathbf{n}_i^\top\mathbf{K}_i^{-1}\mathbf{q}_i}\mathbf{K}_i^{-1}\mathbf{q}_i$）。由位姿变化 $\boldsymbol\rho_b=\mathbf{R}_{ba}\boldsymbol\rho_a+\mathbf{r}_b^{ab}$，两边用 $\boldsymbol\rho_i=z_i\mathbf{K}_i^{-1}\mathbf{q}_i$ 代入：
+\[
+  z_b\mathbf{K}_b^{-1}\mathbf{q}_b=z_a\mathbf{R}_{ba}\mathbf{K}_a^{-1}\mathbf{q}_a+\mathbf{r}_b^{ab}.
+\]
+隔离 $\mathbf{q}_b$：$\mathbf{q}_b=\tfrac{z_a}{z_b}\mathbf{K}_b\mathbf{R}_{ba}\mathbf{K}_a^{-1}\mathbf{q}_a+\tfrac1{z_b}\mathbf{K}_b\mathbf{r}_b^{ab}$。把 $\mathbf{r}_b^{ab}=-\mathbf{R}_{ba}\mathbf{r}_a^{ba}$ 与 $z_b$ 的表达式代入、合并，得
+\[
+  \mathbf{q}_b=\frac{z_a}{z_b}\mathbf{K}_b\mathbf{R}_{ba}\Big(\mathbf{I}+\frac1{d_a}\mathbf{r}_a^{ba}\mathbf{n}_a^\top\Big)\mathbf{K}_a^{-1}\mathbf{q}_a,
+\]
+即 \cref{eq:homography}。因子 $z_a/z_b$ 只是给齐次 $\mathbf{q}_b$ 整体缩放，实践中可丢弃（真像素坐标总可由齐次坐标除以第三分量恢复）；丢弃后 $\mathbf{H}_{ba}$ 只是位姿与平面参数的函数。
+\end{proof}
+
+\begin{corollary}[纯旋转特例与单应的逆]\label{cor:homography}
+纯旋转时 $\mathbf{r}_a^{ba}=\mathbf{0}$，单应退化为 $\mathbf{H}_{ba}=\mathbf{R}_{ba}$（丢弃缩放因子后）。单应可逆，其逆 $\mathbf{H}_{ba}^{-1}=\mathbf{H}_{ab}=\tfrac{z_b}{z_a}\mathbf{R}_{ab}\big(\mathbf{I}+\tfrac1{d_b}\mathbf{r}_b^{ab}\mathbf{n}_b^\top\big)$，可用于反方向变换观测（Barfoot 习题 7.7\cite{barfoot2024state}）。
+\end{corollary}
+
+\begin{pitfall}[概念误区：本质矩阵与基础矩阵混用]
+\textbf{错误描述}：把本质矩阵 $\mathbf{E}$ 直接用在像素坐标上，或把基础矩阵 $\mathbf{F}$ 用在归一化坐标上。\textbf{现象}：对极约束算出来不为零，匹配筛选全错。\textbf{根本原因}：$\mathbf{E}$ 作用于\emph{归一化坐标} $\mathbf{p}$（\cref{eq:essential}），$\mathbf{F}$ 作用于\emph{齐次像素坐标} $\mathbf{q}$（\cref{eq:fundamental}），二者差内参 $\mathbf{F}=\mathbf{K}_a^{-\top}\mathbf{E}\mathbf{K}_b^{-1}$。\textbf{正确做法}：先想清楚手里的点是像素还是归一化，再选对应矩阵；内参未知时只能用 $\mathbf{F}$，内参已知时用 $\mathbf{E}$ 更紧（少 4 个自由度）。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用反对称恒等式证明 $\boldsymbol\rho^\top(\mathbf{r})^\wedge\boldsymbol\rho=0$ 对任意 $\boldsymbol\rho,\mathbf{r}$ 成立（\cref{thm:essential} 用到）。
+  \item 推导对极线 $\boldsymbol\ell_b=\mathbf{F}_{ab}^\top\mathbf{q}_a$ 的来历：把 $\mathbf{q}_a^\top\mathbf{F}_{ab}\mathbf{q}_b=0$ 看成关于 $\mathbf{q}_b$ 的直线方程。
+  \item 直接验证 \cref{cor:homography} 的单应逆公式 $\mathbf{H}_{ba}\mathbf{H}_{ab}=\mathbf{I}$（Barfoot 习题 7.7）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{现代相机模型谱系}
+\label{sec:cam-modern}
+
+\paragraph{动机：针孔只是众多镜头之一。}
+针孔/rad-tan 适合窄角、轻畸变镜头。但 SLAM 越来越多用\emph{广角与鱼眼}镜头（更宽视场 = 更多可跟踪特征、更鲁棒）\cite{carlone2026handbook}。镜头越广角，针孔“除以 $z$”越失效——一条入射角接近 $90^\circ$ 的光线，针孔会把它投到无穷远。现代视觉 SLAM 先给一个\emph{与镜头无关}的抽象投影算子，再把各类镜头当作它的实例。
+
+\paragraph{抽象投影 / 反投影算子。}
+要统一处理形形色色的镜头，宜把成像拆成两个分量\cite{carlone2026handbook}：\emph{几何分量}（投影函数 $\pi$，3D 点$\to$像素）与\emph{光度分量}（辐照度$\to$像素值，仅直接法/稠密法需要，见 \cref{eq:photometric}）。本节只关心几何分量；其投影与反投影通用记为
+\begin{equation}
+  \mathbf{z}=\pi(\mathbf{x}^c),\qquad
+  \mathbf{x}^c=\pi^{-1}(\mathbf{z})\ \text{(仅在尺度意义下确定，重建一条射线)},
+  \label{eq:abstract-pi}
+\end{equation}
+$\mathbf{x}^c\in\mathbb{R}^3$ 为相机系点、$\mathbf{z}\in\mathbb{R}^2$ 为像素。针孔只是 $\pi$ 的一个特例
+\begin{equation}
+  \pi_p(\mathbf{x}^c)=\Big[f_u\tfrac{x}{z}+u_0,\ \ f_v\tfrac{y}{z}+v_0\Big]^\top,\qquad
+  \pi_p^{-1}(\mathbf{z})\sim\Big[\tfrac{u-u_0}{f_u},\ \tfrac{v-v_0}{f_v}\Big]^\top,
+  \label{eq:pi-pinhole}
+\end{equation}
+反投影结果补第三维 $1$ 即归一化平面坐标。
+
+\paragraph{按视场角（FOV）选模型。}
+有了抽象算子 $\pi$，各类镜头就只是给 $\pi$ 换一个具体形式。该选哪个？决定因素是\emph{视场角}（FOV）：视场越宽，针孔“除以 $z$”的失真越大，越要换更复杂的模型。据此可把常用镜头模型排成一条按畸变/视场角递进的谱系\cite{carlone2026handbook}，从最简单的针孔一路走到能容纳超 $180^\circ$ 的鱼眼——下面逐一登场，读时不妨对照 \cref{tab:lens} 看“参数多了几个、为换来什么能力”：
+
+\begin{itemize}
+  \item \textbf{径向-切向}（rad-tan）：即 \cref{eq:distortion}，内参 $[f_u,f_v,u_0,v_0,k_1,k_2,p_1,p_2]$（$8$ 参），计入一定镜头畸变；去畸变\emph{无解析解}，须 Newton--Raphson 迭代。
+  \item \textbf{Brown--Conrady}（BC）：rad-tan \emph{去掉切向系数}，内参 $[f_u,f_v,u_0,v_0,k_1,k_2]$（$6$ 参），适合 FOV $\le180^\circ$ 的广角；\emph{仍无解析去畸变}。
+  \item \textbf{Kannala--Brandt}（KB）：用\emph{入射角}参数化射线，适合 FOV $>180^\circ$ 的鱼眼（如 ORB-SLAM3 所用）。设入射角 $\theta=\arctan\big(\sqrt{x^2+y^2}/z\big)$、方位角 $\psi=\arctan(y/x)$，畸变由 $4$ 个系数 $\mathbf{k}_{KB}=[k_1,k_2,k_3,k_4]^\top$ 给出（奇次多项式）：
+  \begin{equation}
+    r(\theta)=\theta+\sum_{n=1}^{4}k_n\,\theta^{2n+1}
+    =\theta+k_1\theta^3+k_2\theta^5+k_3\theta^7+k_4\theta^9,
+    \label{eq:kb}
+  \end{equation}
+  \begin{equation}
+    \pi_{KB}(\mathbf{x}^c)=\big[f_u\,r(\theta)\cos\psi+u_0,\ \ f_v\,r(\theta)\sin\psi+v_0\big]^\top.
+    \label{eq:kb-proj}
+  \end{equation}
+  这与针孔“除以 $z$”\emph{本质不同}：KB 把\emph{角度} $\theta$ 映成像半径 $r(\theta)$，故能容纳超 $180^\circ$ 的入射光。
+  \item \textbf{双球}（Double Sphere, DS）：兼顾精度与速度的鱼眼/广角模型。机理是把点\emph{先后投到两个单位球}（球心相隔 $\gamma$），再用偏移 $\tfrac{\alpha}{1-\alpha}$ 的针孔投到像平面：
+  \begin{equation}
+    \pi_{DS}(\mathbf{x}^c)=\left[
+    \frac{f_u\,x}{\alpha d_2+(1-\alpha)(\gamma d_1+z)}+c_u,\ \
+    \frac{f_v\,y}{\alpha d_2+(1-\alpha)(\gamma d_1+z)}+c_v
+    \right]^\top,
+    \label{eq:ds}
+  \end{equation}
+  其中 $d_1=\sqrt{x^2+y^2+z^2}$、$d_2=\sqrt{x^2+y^2+(\gamma d_1+z)^2}$，内参 $\{f_u,f_v,c_u,c_v,\gamma,\alpha\}$（$6$ 参）。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{现代相机模型谱系（按视场角选型）}
+\label{tab:lens}
+\begin{tabular}{lllll}
+\toprule
+镜头/视场 & 模型 & 内参（含针孔 $4$ 参外） & 参数数 & 反投影 \\
+\midrule
+窄角无畸变 & 针孔（perspective/rectilinear） & $f_u,f_v,u_0,v_0$ & $4$ & 闭式（射线，尺度内） \\
+含畸变 & 径向-切向 & $+k_1,k_2,p_1,p_2$ & $8$ & 迭代（无解析） \\
+$\le180^\circ$ 广角 & Brown--Conrady & $+k_1,k_2$ & $6$ & 迭代（无解析） \\
+$>180^\circ$ 鱼眼 & Kannala--Brandt（角度参数化） & $+k_1{\dots}k_4$ & $8$ & 迭代 \\
+鱼眼折中 & 双球 Double Sphere & $+c_u,c_v,\gamma,\alpha$ & $6$ & \textbf{闭式} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[现代实现为何偏爱双球]
+$6$ 参\emph{双球}模型与 $8$ 参 Kannala--Brandt 在重投影精度上\emph{相当}，但投影计算约快 $5\times$，且\emph{反投影有闭式解}\cite{carlone2026handbook}。回顾 \cref{sec:cam-distortion} 与本节：rad-tan/BC/KB 的去畸变都\emph{无解析解}（要 Newton 迭代，慢且可能不收敛），而 DS 闭式可逆——在每帧要做成千上万次反投影的稠密/直接法里，这个差别是决定性的。这正是 Basalt 等现代 VIO 系统青睐双球的原因。选模型本质是“精度 vs 计算 vs 可逆性”的工程权衡。
+\end{insight}
+
+\paragraph{时间相关效应：卷帘快门。}
+多数消费级相机用\emph{卷帘快门}（rolling shutter），\emph{逐行}按时间顺序曝光\cite{carlone2026handbook}；机器感知常用的\emph{全局快门}（global shutter）则\emph{同时}曝光所有行。相机拍摄时几乎总在运动，卷帘会带来几何畸变。严格处理须\emph{为每一图像行设不同的相机位姿}；在视觉-惯性系统里，IMU 实际测量了曝光窗内的局部运动，可大幅简化卷帘建模（留 \cref{ch:vio}）。
+
+\paragraph{光度模型（直接法用）。}
+直接法/稠密法还需\emph{光度标定}\cite{carlone2026handbook}：把辐照度 $E$ 映到像素值 $I$
+\begin{equation}
+  I=f(E,T),
+  \label{eq:photometric}
+\end{equation}
+其中 $T$ 含曝光时间、模拟/数字增益、gamma 校正、去 Bayer、镜头暗角等。该标定通常\emph{只在尺度意义下}重要，且仅对依赖跨图像光度一致性的方法（\cref{ch:vo} 的直接法）才需要。
+
+\begin{pitfall}[用错相机模型 $=$ 系统性偏差]
+\textbf{错误描述}：拿针孔模型套鱼眼/广角图像。\textbf{现象}：图像中心拟合不错，越往边缘重投影偏差越大、轨迹漂移。\textbf{根本原因}：针孔“除以 $z$”无法表达超广角射线，会在边缘引入\emph{系统性}（非随机）重投影偏差，显著拉低 SLAM 精度与鲁棒性\cite{carlone2026handbook}。\textbf{正确做法}：rectilinear 镜头用线性基模型（针孔/rad-tan），鱼眼用球面模型（KB/DS）；按 \cref{tab:lens} 的 FOV 选型。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item 写出 \cref{eq:kb} 在小角 $\theta\to0$ 时的一阶近似，说明此时 KB 退化为针孔（$r(\theta)\approx\theta\approx\sqrt{x^2+y^2}/z$）。
+  \item （概念）解释“$6$ 参双球为何能比 $8$ 参鱼眼又快又可逆”，联系 \cref{tab:lens} 与去畸变无解析解。
+  \item 调研：全局快门与卷帘快门相机在 SLAM 中各有什么优缺点（十四讲习题 5.4\cite{gaoxiang2019slam14}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{相机作为可微观测模型与投影雅可比}
+\label{sec:cam-obs}
+
+\paragraph{动机：成像是“正向”，优化要“求导”。}
+前八节把“点$\to$像素”的正向成像讲透了。但 SLAM 的后端（BA、滤波）要\emph{反过来}：从像素观测\emph{估计}位姿与路标。这需要把相机写成一个\emph{观测函数} $\mathbf{z}=\mathbf{g}(\mathbf{T},\mathbf{p})$，并求它对位姿、对路标的\emph{雅可比}\cite{barfoot2024state,carlone2026handbook}。本节确立这个接口，推出投影雅可比，并对接 BA——它是 \cref{ch:vo} 束调整与 \cref{ch:vio} 视觉因子的直接前置。
+
+\paragraph{相机 = 两段非线性的复合。}
+Barfoot\cite{barfoot2024state} 把相机观测模型看成两个非线性映射的复合：先把世界路标 $\mathbf{p}$（齐次）变到相机系 $\mathbf{z}_c=\mathbf{T}\mathbf{p}$，再由相机系点经透视除法$+$内参生成观测 $\mathbf{z}=\mathbf{s}(\mathbf{z}_c)$：
+\begin{equation}
+  \mathbf{z}=\mathbf{g}(\mathbf{T},\mathbf{p})=\mathbf{s}\big(\mathbf{z}_c\big),\qquad
+  \mathbf{z}_c=\mathbf{T}\mathbf{p}\ (\text{点入相机系}),\quad
+  \mathbf{s}(\mathbf{z}_c)=\mathbf{M}\frac{1}{z_3}\mathbf{z}_c,
+  \label{eq:obs-composition}
+\end{equation}
+即 $\mathbf{g}=\mathbf{s}\circ\mathbf{z}_c$（单目时 $\mathbf{M}=\mathbf{P}\mathbf{K}$ 取前两行如 \cref{eq:complete-perspective}，双目时 $\mathbf{M}$ 如 \cref{eq:stereo-M}，$z_3$ 是相机系点深度）。Handbook\cite{carlone2026handbook} 写法等价：$\pi(\mathbf{R}_w^i\mathbf{x}_j^w+\mathbf{t}_w^i)$，即先用 $\mathbf{T}_w^i$（$=\mathbf{T}_{cw}$）把世界点搬到相机系再投影。
+
+\paragraph{相机模型本身的雅可比 $\mathbf{S}=\partial\mathbf{s}/\partial\mathbf{z}_c$。}
+先对“相机系点$\to$观测”这一段 $\mathbf{s}$ 求导。透视除法 $\tfrac1{z_3}\mathbf{z}_c$ 是非线性的根源。Barfoot 对中点双目模型给出闭式\cite{barfoot2024state}（记 $\mathbf{z}=[z_1,z_2,z_3,z_4]^\top=[\boldsymbol\rho;1]$）：
+\begin{equation}
+  \frac{\partial\mathbf{s}}{\partial\mathbf{z}}=\mathbf{M}\,\frac1{z_3}
+  \begin{bmatrix}1&0&-\tfrac{z_1}{z_3}&0\\0&1&-\tfrac{z_2}{z_3}&0\\0&0&0&0\\0&0&-\tfrac{z_4}{z_3}&1\end{bmatrix}.
+  \label{eq:jac-S}
+\end{equation}
+其中那个 $-z_i/z_3$ 项正是透视除法 $\partial(z_i/z_3)/\partial z_3=-z_i/z_3^2$ 的产物。
+
+\begin{theorem}[单目投影雅可比]\label{thm:mono-jac}
+单目透视模型 \cref{eq:complete-perspective} 对相机系点 $\boldsymbol\rho=[x,y,z]^\top$ 的雅可比为
+\begin{equation}
+  \frac{\partial[u,v]^\top}{\partial[x,y,z]^\top}
+  =\begin{bmatrix}\dfrac{f_u}{z}&0&-\dfrac{f_u x}{z^2}\\[2mm]0&\dfrac{f_v}{z}&-\dfrac{f_v y}{z^2}\end{bmatrix}
+  =\frac1z\begin{bmatrix}f_u&0&-f_u\tfrac{x}{z}\\0&f_v&-f_v\tfrac{y}{z}\end{bmatrix}.
+  \label{eq:mono-jac}
+\end{equation}
+\end{theorem}
+\begin{proof}
+单目 $u=f_u x/z+c_u$、$v=f_v y/z+c_v$（\cref{eq:complete-perspective} 的标量展开）。逐项求偏导：$\partial u/\partial x=f_u/z$，$\partial u/\partial y=0$，$\partial u/\partial z=f_u\cdot\partial(x/z)/\partial z=-f_u x/z^2$；$v$ 行同理。整理即得 \cref{eq:mono-jac}。它正是 Barfoot 双目雅可比 \cref{eq:jac-S} 在“取左相机两行、$b=0$”下的特例\cite{barfoot2024state}。
+\end{proof}
+
+\begin{insight}[透视除法是唯一的非线性来源]
+观测模型 $\mathbf{g}=\mathbf{s}\circ\mathbf{z}_c$ 里，$\mathbf{z}_c=\mathbf{T}\mathbf{p}$ 是\emph{线性}的（刚体变换），内参 $\mathbf{M}$ 是\emph{线性}的，唯一的非线性来自 $\mathbf{s}$ 里那个“除以深度 $z_3$”。\cref{eq:mono-jac,eq:jac-S} 里所有的 $-z_i/z_3$ 项都从它来。所以相机观测模型\emph{处处可微}（仅 $z_3=0$ 即光心处奇异），雅可比有闭式——这保证了 BA、滤波能用 Gauss--Newton/LM 等基于梯度的方法求解。
+\end{insight}
+
+\paragraph{对位姿、对路标的雅可比（接 BA）。}
+现在对整个 $\mathbf{g}=\mathbf{s}(\mathbf{T}\mathbf{p})$ 关于\emph{位姿扰动}与\emph{路标扰动}求导。Barfoot 用\emph{左扰动} $\mathbf{T}=\exp(\boldsymbol\epsilon^\wedge)\bar{\mathbf{T}}$ 与齐次点的膨胀扰动 $\mathbf{p}=\bar{\mathbf{p}}+\mathbf{D}\boldsymbol\zeta$（$\mathbf{D}=[\mathbf{I}_3;\mathbf{0}^\top]$）\cite{barfoot2024state}。先看 $\mathbf{z}_c=\mathbf{T}\mathbf{p}$ 的一阶展开：
+\begin{equation}
+  \mathbf{z}_c\approx\bar{\mathbf{z}}_c+\mathbf{Z}\,\boldsymbol\theta,\quad
+  \bar{\mathbf{z}}_c=\bar{\mathbf{T}}\bar{\mathbf{p}},\quad
+  \mathbf{Z}=\big[\,(\bar{\mathbf{T}}\bar{\mathbf{p}})^{\odot}\quad \bar{\mathbf{T}}\mathbf{D}\,\big],\quad
+  \boldsymbol\theta=\begin{bmatrix}\boldsymbol\epsilon\\\boldsymbol\zeta\end{bmatrix},
+  \label{eq:z-expand}
+\end{equation}
+其中 $\odot$ 算子（\cref{ch:lie}）满足 $\boldsymbol\xi^\wedge\mathbf{p}\equiv\mathbf{p}^\odot\boldsymbol\xi$，把“位姿左扰动 $\boldsymbol\epsilon$”线性作用到被变换点上。再链式法则套上相机模型 $\mathbf{s}$：
+
+\begin{theorem}[BA 投影雅可比]\label{thm:ba-jac}
+相机观测模型 \cref{eq:obs-composition} 对“位姿$+$路标”联合扰动 $\boldsymbol\theta=[\boldsymbol\epsilon;\boldsymbol\zeta]$ 的一阶（线性化）雅可比为
+\begin{equation}
+  \mathbf{g}(\mathbf{T},\mathbf{p})\approx\bar{\mathbf{g}}+\mathbf{G}\,\boldsymbol\theta,\qquad
+  \mathbf{G}=\mathbf{S}\,\mathbf{Z}
+  =\big[\;\underbrace{\mathbf{S}(\bar{\mathbf{T}}\bar{\mathbf{p}})^{\odot}}_{\mathbf{G}_1\ (\text{对位姿},\,m\times6)}
+  \quad \underbrace{\mathbf{S}\,\bar{\mathbf{T}}\mathbf{D}}_{\mathbf{G}_2\ (\text{对路标},\,m\times3)}\;\big],
+  \label{eq:ba-jac}
+\end{equation}
+其中 $\mathbf{S}=\partial\mathbf{s}/\partial\mathbf{z}_c|_{\bar{\mathbf{z}}_c}$（\cref{eq:jac-S} 或 \cref{eq:mono-jac}），$m$ 为观测维度（单目 $2$、中点双目 $4$、左目$+$视差 $3$）。
+\end{theorem}
+\begin{proof}
+$\bar{\mathbf{g}}=\mathbf{s}(\bar{\mathbf{z}}_c)$。对 $\mathbf{g}=\mathbf{s}(\mathbf{z}_c)$ 用链式法则、并代入 $\mathbf{z}_c$ 的一阶展开 \cref{eq:z-expand}：$\mathbf{g}\approx\mathbf{s}(\bar{\mathbf{z}}_c)+\tfrac{\partial\mathbf{s}}{\partial\mathbf{z}_c}\big|_{\bar{\mathbf{z}}_c}(\mathbf{z}_c-\bar{\mathbf{z}}_c)=\bar{\mathbf{g}}+\mathbf{S}\mathbf{Z}\boldsymbol\theta$，故 $\mathbf{G}=\mathbf{S}\mathbf{Z}$。按 $\mathbf{Z}$ 的分块（\cref{eq:z-expand}），$\mathbf{G}$ 前 $6$ 列 $\mathbf{S}(\bar{\mathbf{T}}\bar{\mathbf{p}})^\odot$ 对位姿扰动 $\boldsymbol\epsilon$、后 $3$ 列 $\mathbf{S}\bar{\mathbf{T}}\mathbf{D}$ 对路标扰动 $\boldsymbol\zeta$\cite{barfoot2024state}。
+\end{proof}
+
+\begin{note}
+\textbf{左扰动 $\to$ 本书右扰动的转换.}\;
+\cref{thm:ba-jac} 用的是 Barfoot 的\emph{左扰动}。本书以\emph{右扰动}为主（\cref{ch:lie}）。对最简单的“车体系直接观测点”模型 $\mathbf{y}=\mathbf{D}^\top\mathbf{T}\mathbf{p}$（即 $\mathbf{s}=\mathbf{D}^\top$、无针孔），Barfoot 给出\cite{barfoot2024state}：左扰动雅可比 $\mathbf{G}_\ell=\mathbf{D}^\top(\bar{\mathbf{T}}_{vi}\mathbf{p})^\odot$，右扰动雅可比 $\mathbf{G}_r=-\mathbf{D}^\top(\bar{\mathbf{T}}_{iv}^{-1}\mathbf{p})^\odot$，且因 $\boldsymbol\epsilon_r=-\boldsymbol\epsilon_\ell$ 有简洁关系
+\begin{equation}
+  \mathbf{G}_r=-\mathbf{G}_\ell.
+  \label{eq:left-right-jac}
+\end{equation}
+推广到相机：相机投影雅可比 \cref{thm:ba-jac} 是上式的 $\mathbf{s}=\mathbf{D}^\top$ 推广为一般针孔 $\mathbf{s}$ 的版本（多乘一个 $\mathbf{S}$）。换右扰动时，位姿块 $\mathbf{G}_1$ 按 \cref{eq:left-right-jac} 翻符号、并注意 $\mathbf{T}_{iv}$ vs $\mathbf{T}_{vi}$（即 $\mathbf{T}_{wc}$ vs $\mathbf{T}_{cw}$）的取逆；路标块 $\mathbf{G}_2$ 不涉及位姿扰动方向，不变。\cref{ch:vo} 的 BA 一章会用右扰动从头给出全套重投影误差雅可比。
+\end{note}
+
+\begin{insight}[最简点观测 = 相机观测的“去针孔”特例]
+\cref{thm:ba-jac} 的 $\mathbf{G}_1=\mathbf{S}(\bar{\mathbf{T}}\bar{\mathbf{p}})^\odot$ 与“车体系直接观测点”的 $\mathbf{G}=\mathbf{D}^\top(\bar{\mathbf{T}}\mathbf{p})^\odot$ \emph{同构}——后者就是前者在 $\mathbf{S}=\mathbf{D}^\top$（投影 $\mathbf{s}$ 取“去齐次的恒等”、即没有透视除法）下的特例\cite{barfoot2024state}。这层同构把“直接观测三维点”（点云对齐、点云跟踪）与“相机观测”（BA）统一在同一套李群求导框架下：唯一的差别是中间多了个相机模型雅可比 $\mathbf{S}$。
+\end{insight}
+
+\paragraph{重投影误差与 BA 目标。}
+有了观测模型，就能写\emph{重投影误差}\cite{carlone2026handbook}：观测像点 $\mathbf{z}_j$ 与重投影点 $\pi(\mathbf{x}_j^c)$ 之差
+\begin{equation}
+  \mathbf{e}_{\text{reproj}}=\mathbf{z}_j-\pi(\mathbf{x}_j^c).
+  \label{eq:reproj-error}
+\end{equation}
+设像点受高斯噪声 $\mathbf{z}_j\sim\mathcal{N}(\pi(\mathbf{x}_j^c),\boldsymbol\Sigma_j)$，则\emph{最大似然}等价于\emph{最小化负对数似然}：
+
+\begin{derivation}[从最大似然到加权重投影误差（\cref{eq:reproj-error}）]
+观测似然 $p(\mathbf{z}_j\mid\mathbf{x}_j^c)\sim\mathcal{N}(\pi(\mathbf{x}_j^c),\boldsymbol\Sigma_j)$，负对数似然
+\[
+  \mathcal{L}=-\sum_j\log p(\mathbf{z}_j\mid\mathbf{x}_j^c)
+  =\frac12\sum_j\big\|\mathbf{z}_j-\pi(\mathbf{x}_j^c)\big\|_{\boldsymbol\Sigma_j}^2+\text{const},
+\]
+其中马氏范数 $\|\mathbf{e}\|_{\boldsymbol\Sigma}^2:=\mathbf{e}^\top\boldsymbol\Sigma^{-1}\mathbf{e}$（即用信息矩阵 $\boldsymbol\Lambda=\boldsymbol\Sigma^{-1}$ 加权，\cref{ch:slam_est}）。丢掉常数得一幅图所观测点集的\emph{加权平方重投影误差}\cite{carlone2026handbook}：
+\begin{equation}
+  E_{\text{reproj}}=\frac12\sum_j\big\|\mathbf{z}_j-\pi(\mathbf{x}_j^c)\big\|_{\boldsymbol\Sigma_j}^2.
+  \label{eq:reproj-cost}
+\end{equation}
+为抗外点（误匹配），用鲁棒核 $\rho(\cdot)$（Huber/Tukey，见 \cref{ch:nlopt}）包裹残差：$E_{\text{robust}}=\tfrac12\sum_j\rho\big(\|\mathbf{z}_j-\pi(\mathbf{x}_j^c)\|_{\boldsymbol\Sigma_j}\big)$。\hfill$\square$
+\end{derivation}
+
+\noindent 把它应用到\emph{所有}点与位姿，就是\emph{完整束调整}（full BA）\cite{carlone2026handbook}：
+\begin{equation}
+  \{\mathbf{T}_w^{i*},\mathbf{x}_j^{w*}\}=\arg\min_{\mathbf{T}_w^i,\mathbf{x}_j^w}
+  \frac12\sum_{i,j}\rho\Big(\big\|\mathbf{z}_{ij}-\pi(\mathbf{R}_w^i\mathbf{x}_j^w+\mathbf{t}_w^i)\big\|_{\boldsymbol\Sigma_{ij}}\Big).
+  \label{eq:full-ba}
+\end{equation}
+其中 $\mathbf{x}_j^c=\mathbf{R}_w^i\mathbf{x}_j^w+\mathbf{t}_w^i$ 即“世界系点$\to$相机系点”，雅可比由 \cref{thm:ba-jac} 给出。实时 SLAM 还衍生出\emph{仅位姿 BA}（pose-only，只优化当前位姿、地图固定，用于跟踪线程）与\emph{局部 BA}（只优化共视窗口内的关键帧与点）\cite{carlone2026handbook}——这些求解策略与因子图表述留 \cref{ch:vo}。
+
+\paragraph{BA 的稀疏求解：Schur 补。}
+BA 的法方程 $\mathbf{A}\,\delta\mathbf{x}=\mathbf{b}$ 中，$\mathbf{A}=\mathbf{G}^\top\mathbf{R}^{-1}\mathbf{G}$ 有极强的稀疏结构\cite{barfoot2024state,carlone2026handbook}：每个观测 $\mathbf{z}_{ij}$ \emph{只依赖相机 $i$ 与点 $j$}（这正是 \cref{thm:ba-jac} 的 $\mathbf{G}_{jk}=[\mathbf{G}_1\;\mathbf{G}_2]$ 只占两块的体现）。按“位姿块 $c$ $+$ 点块 $p$”分块：
+
+\begin{theorem}[BA 法方程的 Schur 补求解]\label{thm:ba-schur}
+设 BA 每步法方程
+\begin{equation}
+  \begin{bmatrix}\mathbf{H}_{cc}&\mathbf{H}_{cp}\\\mathbf{H}_{cp}^\top&\mathbf{H}_{pp}\end{bmatrix}
+  \begin{bmatrix}\mathbf{d}_c\\\mathbf{d}_p\end{bmatrix}
+  =\begin{bmatrix}\mathbf{b}_c\\\mathbf{b}_p\end{bmatrix},
+  \label{eq:ba-normal}
+\end{equation}
+$\mathbf{H}_{pp}$ 块对角（每点独立）。则可三步求解：
+\begin{align}
+  \mathbf{H}_{cc}^{\text{red}}&=\mathbf{H}_{cc}-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{H}_{cp}^\top,
+  &&(\text{约化相机系统})\label{eq:schur-1}\\
+  \mathbf{H}_{cc}^{\text{red}}\,\mathbf{d}_c&=\mathbf{b}_c-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{b}_p,
+  &&(\text{先解相机})\label{eq:schur-2}\\
+  \mathbf{H}_{pp}\,\mathbf{d}_p&=\mathbf{b}_p-\mathbf{H}_{cp}^\top\mathbf{d}_c.
+  &&(\text{回代解点})\label{eq:schur-3}
+\end{align}
+\end{theorem}
+\begin{proof}
+对 \cref{eq:ba-normal} 左乘 $\big[\begin{smallmatrix}\mathbf{I}&-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\\\mathbf{0}&\mathbf{I}\end{smallmatrix}\big]$，上块的点列被消去\cite{carlone2026handbook}：
+\[
+  \begin{bmatrix}\mathbf{H}_{cc}-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{H}_{cp}^\top&\mathbf{0}\\\mathbf{H}_{cp}^\top&\mathbf{H}_{pp}\end{bmatrix}
+  \begin{bmatrix}\mathbf{d}_c\\\mathbf{d}_p\end{bmatrix}
+  =\begin{bmatrix}\mathbf{b}_c-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{b}_p\\\mathbf{b}_p\end{bmatrix},
+\]
+与 \cref{eq:ba-normal} 同解。上块即 \cref{eq:schur-1,eq:schur-2}（先解 $\mathbf{d}_c$），下块回代得 \cref{eq:schur-3}。因 $\mathbf{H}_{pp}$ 块对角，$\mathbf{H}_{pp}^{-1}$ 与 Schur 补可\emph{逐点}高效完成；复杂度从无稀疏的 $O((K+M)^3)$ 降到 $O(K^3+K^2M)$（$K$ 位姿数、$M$ 点数），$K\ll M$ 时最有利\cite{barfoot2024state}。
+\end{proof}
+
+\begin{insight}[“箭头矩阵”与“先消点再解相机”]
+BA 的 $\mathbf{A}$ 因“每观测只涉一位姿一点”而呈\emph{箭头矩阵}（arrowhead）结构\cite{barfoot2024state}：位姿块 $\mathbf{H}_{cc}$、点块 $\mathbf{H}_{pp}$ 都是块对角，只有位姿-点交叉块 $\mathbf{H}_{cp}$ 把它们连起来。由于\emph{点数通常比相机数大几个数量级}，最优策略是\emph{先消去点、再解相机}（\cref{eq:schur-1}）。约化相机系统 $\mathbf{H}_{cc}^{\text{red}}$ 把“看到共同点的相机对”连起来——local BA 里它几乎稠密（可用稠密求解器），full BA 里关键帧多但共视少，故仍稀疏（用稀疏求解器）。Schur 补不直接给 $\mathbf{A}^{-1}$（即 $\delta\mathbf{x}$ 的协方差）；要协方差用 Cholesky 分解更合适\cite{barfoot2024state}（\cref{ch:nlopt}、\cref{ch:vo} 展开）。
+\end{insight}
+
+\begin{pitfall}[编程陷阱：左右扰动混用导致雅可比与更新不一致]
+\textbf{错误描述}：照抄 Barfoot 的左扰动投影雅可比 \cref{thm:ba-jac}，却用本书右扰动 $\mathbf{T}\leftarrow\mathbf{T}\,\mathrm{Exp}(\delta\boldsymbol\xi)$ 更新。\textbf{现象}：BA 不收敛或越优化误差越大。\textbf{根本原因}：雅可比的扰动方向必须与更新方向一致——左扰动雅可比配左乘更新、右扰动雅可比配右乘更新；二者差一个符号/伴随（\cref{eq:left-right-jac}）。\textbf{正确做法}：全程统一扰动约定（本书右扰动），雅可比与更新成对使用；用 Ceres/GTSAM 时，把 local parameterization/manifold 设成与雅可比一致的那种。
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item （实现）写一个函数，输入相机系点 $\boldsymbol\rho$ 与内参，输出单目投影雅可比 \cref{eq:mono-jac}（$2\times3$），并用数值差分验证。
+  \item 由 \cref{eq:jac-S} 取“左相机两行、$b=0$”，验证它退化为 \cref{eq:mono-jac}。
+  \item （跨章综合）结合 \cref{ch:lie} 的右扰动与 $\odot$ 算子、本章 \cref{thm:ba-jac} 与 \cref{thm:mono-jac}，写出单目重投影误差 $\mathbf{e}=\mathbf{z}-\pi(\mathbf{T}\mathbf{p})$ 对位姿\emph{右扰动}的 $2\times6$ 雅可比（提示：链式 $\mathbf{S}\cdot\partial(\mathbf{T}\mathbf{p})/\partial\delta\boldsymbol\xi$，符号按 \cref{eq:left-right-jac}）。这是 \cref{ch:vo} BA 的核心，先自己推一遍。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{实践：图像表示、去畸变与点云}
+\label{sec:cam-practice}
+
+\paragraph{桥接：从“成像几何”到“图像数据”。}
+前九节讲的是\emph{光学几何}——三维点如何落到像素位置。但相机吐出的照片最终要存进计算机、供程序处理，所以还得弄清\emph{一张图像在内存里到底长什么样}\cite{gaoxiang2019slam14}。这一步看似琐碎，却是新手 bug 的重灾区（行列顺序、通道顺序、深度单位），也是 \cref{sec:cam-practice} 一切代码的前提。下面先把图像的数据表示讲清，再落地去畸变与点云。
+
+\paragraph{图像作为函数与矩阵。}
+从数学上看，一张灰度图就是一个二元函数\cite{gaoxiang2019slam14}
+\begin{equation}
+  I(x,y):\ \mathbb{R}^2\mapsto\mathbb{R},
+  \label{eq:image-function}
+\end{equation}
+$(x,y)$ 是像素坐标、函数值是该处灰度。但计算机无法表达实数，要对\emph{下标}与\emph{读数}都做量化：$x,y$ 取从 $0$ 起的整数，灰度用 $0\text{–}255$ 的整数（即一个 \texttt{unsigned char}，1 字节）。于是一张宽 $640$、高 $480$ 的灰度图，在程序里就是一个二维数组 \texttt{unsigned char image[480][640]}。
+
+\paragraph{为什么是 $480\times640$ 而不是 $640\times480$？}
+这里藏着一个关键约定\cite{gaoxiang2019slam14}：图像以二维数组存储，\emph{第一个下标是行、第二个下标是列}；而行数对应图像\emph{高度}、列数对应\emph{宽度}。所以高 $480$、宽 $640$ 的图写成 \texttt{image[480][640]}（行在前）。访问位于 $(x,y)$ 的像素时，正确写法是 \texttt{image[y][x]}（先行 $y$ 后列 $x$），它对应灰度读数 $I(x,y)$。调换 $x,y$ 顺序是\emph{隐蔽}的常见 bug：编译器不会报错，只会在运行时给你一个越界，或一张转置错乱的图\cite{gaoxiang2019slam14}。这与像素坐标系的右手约定一致：$X$ 轴向右（列）、$Y$ 轴向下（行），若补第三轴 $Z$ 则按右手法则指向前方，恰与相机坐标系同向。
+
+\paragraph{从灰度到深度与彩色：字节不够用时。}
+一字节（$0\text{–}255$）只够灰度。信息更多时就要更宽的类型\cite{gaoxiang2019slam14}：RGB-D 的\emph{深度图}以毫米记距离，而量程常达十几米、超过 $255$，故用 16 位 \texttt{unsigned short}（$0\text{–}65535$，换算约 $65$ m，够 RGB-D 用）。\emph{彩色图}则引入\emph{通道}（channel）概念：用红、绿、蓝三色组合表达任意颜色，每像素记 R、G、B 三个 8 位值，共占 24 位。通道的数量与顺序可自由定义——但要当心：OpenCV 彩色图默认通道序是 \texttt{BGR}（蓝在前）而非 RGB；若再要透明度则用 RGBA 四通道。
+
+\begin{note}
+\textbf{为什么 \texttt{cv::Mat} 既存图像又存位姿.}\;由于图像在内存里就是一个连续的数值矩阵，程序无须区分它处理的是“有意义的图像”还是“一般的数值矩阵”\cite{gaoxiang2019slam14}。这也是 OpenCV 的 \texttt{cv::Mat} 既能装图像、又能装位姿等矩阵数据的原因。不过一般认为，对\emph{固定大小}的小矩阵（如 $3\times3$ 旋转、$4\times4$ 变换），Eigen 比 \texttt{cv::Mat} 效率更高——本书几何运算用 Eigen/Sophus，图像 I/O 与处理用 OpenCV，各取所长。
+\end{note}
+
+\begin{pitfall}[编程陷阱：$x,y$ 与行列顺序混淆]
+\textbf{错误描述}：访问 $(x,y)$ 处像素写成 \texttt{image[x][y]}。\textbf{现象}：图像看起来转置/错乱，或运行时越界。\textbf{根本原因}：数组下标是 \texttt{image[行=y][列=x]}（先高后宽），与数学习惯的 $(x,y)$ 顺序相反；调换 $x,y$ 编译器不报错，只在运行时越界\cite{gaoxiang2019slam14}。\textbf{正确做法}：访问 $(x,y)$ 写 \texttt{image[y][x]} 或 OpenCV 的 \texttt{image.\allowbreak at<T>(v,u)}（注意 OpenCV 是 \texttt{(row=v, col=u)}）；遍历时外层 $y$（行）、内层 $x$（列）。
+\end{pitfall}
+
+\paragraph{遍历图像并测速（OpenCV）。}
+理解了图像的内存布局，就能上手 OpenCV。下面这段例程（数据/思路参考\cite{gaoxiang2019slam14} 的 \texttt{imageBasics}）演示三件最常用、也最容易踩坑的事：\emph{读图与判空}、\emph{按行指针遍历}、\emph{深浅拷贝}。读图后第一件事永远是判断 \texttt{image.data} 是否为空（文件不存在/路径错时 \texttt{imread} 不抛异常，只返回空 \texttt{Mat}）；遍历时务必\emph{外层行、内层列}，并优先用行指针 \texttt{ptr<T>(y)} 而非逐像素 \texttt{at}（后者每次都要重算偏移）。需要说明：例程的遍历方式是为\emph{便于理解结构}，并非最快；OpenCV 还提供迭代器、以及 \texttt{Mat::data} 裸指针手算偏移等更高效方式。
+
+\begin{codebox}[C++]{OpenCV 图像读取、遍历与深拷贝（思路参考 imageBasics）}
+cv::Mat image = cv::imread(argv[1]);              // 读图; image.data==nullptr 表示读取失败
+// 基本信息: 宽=image.cols, 高=image.rows, 通道=image.channels()
+for (size_t y = 0; y < (size_t)image.rows; y++) { // 外层遍历行 (高度 y)
+  unsigned char *row_ptr = image.ptr<unsigned char>(y);  // 第 y 行的头指针
+  for (size_t x = 0; x < (size_t)image.cols; x++) {       // 内层遍历列 (宽度 x)
+    unsigned char *data_ptr = &row_ptr[x * image.channels()]; // 指向像素 (x,y)
+    for (int c = 0; c != image.channels(); c++) {
+      unsigned char data = data_ptr[c];           // I(x,y) 第 c 通道 (BGR 序)
+      (void)data;
+    }
+  }
+}
+// 深拷贝陷阱: 直接赋值不拷贝数据, 改 b 会改 a
+cv::Mat b = image;            // 浅拷贝: 共享数据
+b(cv::Rect(0,0,100,100)).setTo(0);   // 同时改了 image 的左上角!
+cv::Mat c = image.clone();    // 深拷贝: 独立数据, 改 c 不影响 image
+\end{codebox}
+
+\noindent 注意 \texttt{cv::Mat b = image} 是\emph{浅拷贝}（共享数据），改 \texttt{b} 会改 \texttt{image}；要独立副本必须 \texttt{image.\allowbreak clone()}。Debug 模式遍历约 $12.7$ ms，Release 模式快很多\cite{gaoxiang2019slam14}。
+
+\begin{note}
+\textbf{OpenCV 的安装.}\;运行本章代码需先装好 OpenCV：既可从包管理器取预编译库（如 Ubuntu 的 \texttt{apt}，最省事），也可从源码编译安装（可自选版本、开启 GPU 等编译选项）。这属一次性工具配置、与成像理论无关，具体步骤随平台与版本而异，以 OpenCV 官方文档为准，本书不展开。
+\end{note}
+
+\paragraph{去畸变：对无畸变图反查畸变图。}
+\cref{sec:cam-distortion} 说去畸变\emph{无解析解}；工程上巧妙地绕过反解——对\emph{目标（无畸变）图}的每个像素 $(u,v)$，按\emph{正向}畸变公式算它在\emph{源（畸变）图}里的位置，再取值。这样只用到正向公式 \cref{eq:distortion}：
+
+\begin{codebox}[C++]{去畸变（落地式 distortion）与双目/RGB-D 反投影（落地式 stereo-backproj / rgbd-backproj）}
+// 内参与畸变 (EuRoC, 见正文数值例)
+double fx=458.654, fy=457.296, cx=367.215, cy=248.375;
+double k1=-0.28340811, k2=0.07395907, p1=0.00019359, p2=1.76187114e-5;
+
+// —— 去畸变: 对目标(无畸变)图每像素 (u,v), 反查源(畸变)图坐标 (u_d,v_d) ——
+for (int v = 0; v < rows; v++)
+  for (int u = 0; u < cols; u++) {
+    double x = (u - cx) / fx, y = (v - cy) / fy;   // 像素 -> 归一化平面
+    double r2 = x*x + y*y;
+    double xd = x*(1 + k1*r2 + k2*r2*r2) + 2*p1*x*y + p2*(r2 + 2*x*x);
+    double yd = y*(1 + k1*r2 + k2*r2*r2) + p1*(r2 + 2*y*y) + 2*p2*x*y;
+    double u_d = fx*xd + cx, v_d = fy*yd + cy;      // 归一化(畸变) -> 像素
+    // 最近邻插值: image_undistort(v,u) = image(round(v_d), round(u_d)), 越界置 0
+    (void)u_d; (void)v_d;
+  }
+
+// —— 双目反投影: 像素 (u,v) + 视差 d -> 相机系 3D (左相机系, b 为基线) ——
+//   z = fx*b / d;  X = (u-cx)*z/fx;  Y = (v-cy)*z/fy;
+
+// —— RGB-D 反投影: 像素 (u,v) + 深度 -> 相机系 3D, 再外参 T_wc -> 世界系 ——
+//   double Z = depth_raw / depthScale;     // 深度图(毫米) -> 米
+//   if (depth_raw == 0) continue;          // 0 表示无效测量, 跳过
+//   double X = (u-cx)*Z/fx;  double Y = (v-cy)*Z/fy;
+//   P_world = T_wc * [X, Y, Z]^T;          // Sophus::SE3d 作用于 3 维点
+\end{codebox}
+
+\begin{note}
+\textbf{去畸变为何要“反查”而不是“正算”.}\;若对源图每像素正向算它在目标图的位置，目标图会出现\emph{空洞}（多个源像素映到同一目标格、又有目标格无源像素映入）。改成“对目标图每像素反查源图”，每个目标像素都有值、无空洞——代价是要对源图做插值（最近邻或双线性）。这是图像 warping 的通用技巧，也是 \cref{ch:vo} 直接法图像对齐的基础。
+\end{note}
+
+\paragraph{双目与 RGB-D 点云。}
+双目用 SGBM 算视差图，再按 \cref{eq:stereo-backproj} 逐像素反投影成点云（参数见 \cref{ex:cam-stereo}，视差需除 $16$、过滤无效范围）。RGB-D 直接读深度，按 \cref{eq:rgbd-backproj} 反投影、再经外参 $\mathbf{T}_{wc}$ 拼成世界点云（参数与四元数存储见 \cref{ex:cam-rgbd}）：多帧点云叠加即得点云地图。颜色按 OpenCV \texttt{BGR} 顺序读取（蓝在前）。
+
+\begin{practice}
+\begin{enumerate}
+  \item （实现）补全上面去畸变代码的最近邻插值与越界处理，对一张畸变图运行，观察直线是否变直。
+  \item （实现）用 \cref{ex:cam-stereo} 参数，对一张视差图生成点云（注意视差除 $16$、过滤 $d\in(10,96)$）。
+  \item （调试）把 RGB-D 代码里的 \texttt{depthScale} 写成 $1.0$（漏除毫米），预测点云会变成什么样、为什么。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{补充：把相机不确定度传到观测}
+\label{sec:cam-uncertainty}
+
+\paragraph{动机：位姿与路标都带噪声。}
+前面把 $\mathbf{T},\mathbf{p}$ 当确定量投影。但在 SLAM 里它们是\emph{估计值、带协方差}的。要预测“观测的不确定度”，须把位姿与路标的高斯不确定度经非线性相机模型\emph{传播}到观测端\cite{barfoot2024state}——这是滤波（\cref{ch:eskf}）预测观测协方差、以及 BA 评估信息量的基础。
+
+\paragraph{一阶（线性化）传播。}
+设位姿与路标的联合扰动 $\boldsymbol\theta=[\boldsymbol\epsilon;\boldsymbol\zeta]\sim\mathcal{N}(\mathbf{0},\boldsymbol\Xi)$（$\boldsymbol\Xi$ 为 $9\times9$ 联合协方差，位姿 $6$ $+$ 路标 $3$）。用 \cref{thm:ba-jac} 的一阶模型 $\mathbf{y}_{1\text{st}}=\bar{\mathbf{g}}+\mathbf{G}\boldsymbol\theta$，则均值 $\bar{\mathbf{y}}=\bar{\mathbf{g}}$、协方差
+\begin{equation}
+  \mathbf{R}_{2\text{nd}}=\mathbf{G}\,\boldsymbol\Xi\,\mathbf{G}^\top.
+  \label{eq:unc-first}
+\end{equation}
+这是最常用的一阶传播：投影雅可比 $\mathbf{G}$ 夹住输入协方差。
+
+\paragraph{二阶修正（非线性较强时）。}
+当 $\boldsymbol\Xi$ 较大、相机非线性显著，一阶均值会偏。Barfoot\cite{barfoot2024state} 给出保二阶的均值修正：用相机模型的 Hessian $\boldsymbol{\mathcal{G}}_j$（来自透视除法的二阶导，如双目 Hessian \cref{eq:jac-S} 之上一层），
+\begin{equation}
+  \bar{\mathbf{y}}_{2\text{nd}}=\bar{\mathbf{g}}+\frac12\sum_j\operatorname{tr}(\boldsymbol{\mathcal{G}}_j\boldsymbol\Xi)\,\mathbf{1}_j,
+  \label{eq:unc-second}
+\end{equation}
+比一阶多出的项随输入协方差 $\boldsymbol\Xi$ 增大而增大；\emph{线性}相机模型（$\boldsymbol{\mathcal{G}}_j=\mathbf{0}$）时二阶与一阶均值相同。协方差也可展到（近似）四阶，含 Isserlis 定理项，一阶/三阶项因高斯对称恒为零\cite{barfoot2024state}。
+
+\paragraph{Sigmapoint（无导数）传播。}
+另一条路是\emph{sigmapoint}：按 SE(3) 扰动定制采样点，过非线性相机模型再组合\cite{barfoot2024state}。先 Cholesky $\mathbf{L}\mathbf{L}^\top=\boldsymbol\Xi$，取 $\boldsymbol\theta_0=\mathbf{0}$、$\boldsymbol\theta_\ell=\pm\sqrt{L+\kappa}\,\operatorname{col}_\ell\mathbf{L}$（$L=9$，$\kappa$ 用户常数），每个 $\boldsymbol\theta_\ell=[\boldsymbol\epsilon_\ell;\boldsymbol\zeta_\ell]$ 生成 $\mathbf{T}_\ell=\exp(\boldsymbol\epsilon_\ell^\wedge)\bar{\mathbf{T}}$、$\mathbf{p}_\ell=\bar{\mathbf{p}}+\mathbf{D}\boldsymbol\zeta_\ell$，过模型 $\mathbf{y}_\ell=\mathbf{s}(\mathbf{T}_\ell\mathbf{p}_\ell)$，加权组合得均值 $\bar{\mathbf{y}}_{sp}$ 与协方差 $\mathbf{R}_{sp}$。它无须求导，适合强非线性。
+
+\begin{example}[相机不确定度传播实验]\label{ex:cam-unc}
+Barfoot 的数值实验\cite{barfoot2024state}：中点双目相机 $b=0.25$ m、$f_u=f_v=200$ 像素、$c_u=c_v=0$，位姿 $\mathbf{T}=\mathbf{I}$，路标 $\mathbf{p}=[10,10,1]^\top$；联合输入协方差 $\boldsymbol\Xi=\alpha\cdot\operatorname{diag}\{\tfrac1{10},\tfrac1{10},\tfrac1{10},\tfrac1{100},\tfrac1{100},\tfrac1{100},1,1,1\}$（$\alpha\in[0,1]$ 缩放噪声幅值）。把四种方法（Monte Carlo $M=10^6$ 作基准、一/二阶、二/四阶、sigmapoint）按均值误差 $\varepsilon_{\text{mean}}$ 与协方差误差 $\varepsilon_{\text{cov}}$（Frobenius 范数）比较：结论是\textbf{sigmapoint 在均值与协方差上都最好}；二阶法均值不错但其对应四阶协方差较差（因无法算完全四阶精确协方差）。
+\end{example}
+
+\begin{insight}[为什么 SLAM 默认只用一阶传播]
+虽然 sigmapoint 与二阶法更准（\cref{ex:cam-unc}），但实践中 BA/EKF 多用一阶 \cref{eq:unc-first}：当工作点接近真值、输入协方差 $\boldsymbol\Xi$ 不大时，一阶足够准，且 $\mathbf{G}\boldsymbol\Xi\mathbf{G}^\top$ 计算最省、与 Gauss--Newton 的信息矩阵装配天然一致。只有在初始化粗、不确定度大、相机强非线性（广角）时，二阶/sigmapoint 才值得。这是“够准 vs 够快”的典型工程取舍。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 \cref{thm:mono-jac} 的 $\mathbf{G}$（取单目、设 $\boldsymbol\Xi=\sigma^2\mathbf{I}_3$ 只含路标）算 \cref{eq:unc-first} 的观测协方差，分析深度 $z$ 越大协方差如何变化。
+  \item 说明 \cref{eq:unc-second} 中 $\boldsymbol{\mathcal{G}}_j=\mathbf{0}$（线性模型）时为何二阶不修正均值。
+  \item （概念）解释为什么 sigmapoint 不需要求相机模型的导数，却仍能捕获非线性。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\addcontentsline{toc}{section}{常见误解汇总}
+\begin{table}[H]\centering\small
+\caption{本章常见误解与正确理解}
+\begin{tabular}{p{0.46\linewidth}p{0.46\linewidth}}
+\toprule
+误解 & 正确理解 \\
+\midrule
+“焦距就是 $f_x=f_y$。” & $f_x=\alpha f,f_y=\beta f$，像元两方向密度不同则不等（\cref{sec:cam-intrinsics}）。 \\
+“先用内参再去畸变。” & 畸变在\emph{归一化平面}、内参在其后（\cref{alg:cam-distort}）。 \\
+“去畸变就是把畸变公式正向算一遍。” & 去畸变是畸变的\emph{逆}，且无解析解，要反查或 Newton 迭代（\cref{sec:cam-distortion}）。 \\
+“$\mathbf{K}\mathbf{T}\mathbf{P}_w$ 维度天然对齐。” & 中间有一次齐次$\to$非齐次降维（\cref{thm:full-projection}）。 \\
+“单目也能测深度。” & 投影丢掉深度，单目仅 up-to-scale；靠双目/RGB-D/多视图补（\cref{sec:cam-chain}）。 \\
+“双目处处能测深度。” & 仅纹理丰富处可算视差；弱纹理空洞（\cref{sec:cam-stereo}）。 \\
+“本质矩阵与基础矩阵可混用。” & $\mathbf{E}$ 用归一化坐标、$\mathbf{F}$ 用像素坐标，差内参（\cref{sec:cam-epipolar}）。 \\
+“针孔模型放之四海皆准。” & 广角/鱼眼须用 BC/KB/双球，用错引系统偏差（\cref{sec:cam-modern}）。 \\
+“左扰动雅可比能直接配右扰动更新。” & 二者差符号/伴随，须成对使用（\cref{eq:left-right-jac}）。 \\
+“OpenCV 彩色图是 RGB。” & 默认 \texttt{BGR}（\cref{sec:cam-practice}）。 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 备注 \\
+\midrule
+$\mathbf{P}_w,\mathbf{P}_c$ & 世界 / 相机坐标 & 米；Barfoot $\boldsymbol\rho$、Handbook $\mathbf{x}^c$ \\
+$[x,y,1]^\top$ & 归一化坐标 & $z=1$ 平面，无量纲 \\
+$[u,v]^\top$ & 像素坐标 & 像素 \\
+$\mathbf{K}$ & 内参矩阵 & $f_x,f_y,c_x,c_y$（像素），无 skew \\
+$\mathbf{R},\mathbf{t}$ & 外参 & $\mathbf{T}\in\SE(3)$，待估 \\
+$k_1,k_2,k_3;p_1,p_2$ & 径向 / 切向畸变 & 作用于归一化平面 \\
+$b,d,f$ & 基线 / 视差 / 焦距 & 双目 $z=fb/d$ \\
+$\mathbf{M}$ & 双目组合参数矩阵 & 见 \cref{eq:stereo-M} \\
+$\mathbf{E},\mathbf{F},\mathbf{H}$ & 本质 / 基础 / 单应矩阵 & 多视图约束 \\
+$\pi(\cdot),\pi^{-1}(\cdot)$ & 抽象投影 / 反投影算子 & 针孔为其特例 \\
+$\mathbf{g}=\mathbf{s}\circ\mathbf{z}_c$ & 相机观测模型 & 接 VO/滤波 \\
+$\mathbf{S},\mathbf{G}$ & 相机模型雅可比 / BA 投影雅可比 & $\mathbf{S}=\partial\mathbf{s}/\partial\mathbf{z}_c$，$\mathbf{G}=\mathbf{S}\mathbf{Z}$ \\
+$\odot,\mathbf{D}$ & 齐次点算子 / 膨胀矩阵 & \cref{ch:lie} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{公式速查表}
+\begin{tabular}{lll}
+\toprule
+名称 & 公式 & 出处 \\
+\midrule
+针孔投影 & $X'=fX/Z$ & \cref{eq:pinhole} \\
+内参 & $Z[u,v,1]^\top=\mathbf{K}\mathbf{P}_c$ & \cref{eq:K} \\
+畸变 & 归一化平面径向$+$切向 & \cref{eq:distortion} \\
+完整成像 & $Z[u,v,1]^\top=\mathbf{K}(\mathbf{R}\mathbf{P}_w+\mathbf{t})$ & \cref{eq:full-projection} \\
+双目深度 & $z=fb/d$ & \cref{eq:stereo} \\
+双目矩阵模型 & $[u_\ell,v_\ell,u_r,v_r]^\top=\mathbf{M}\tfrac1z[x,y,z,1]^\top$ & \cref{eq:stereo-M} \\
+双目反投影 & $z=f_ub/d,\,x=(u_\ell-c_u)z/f_u$ & \cref{eq:stereo-backproj} \\
+RGB-D 反投影 & $X=(u-c_x)Z/f_x$ & \cref{eq:rgbd-backproj} \\
+本质矩阵 & $\mathbf{p}_a^\top\mathbf{E}\mathbf{p}_b=0$ & \cref{eq:essential} \\
+基础矩阵 & $\mathbf{q}_a^\top\mathbf{F}\mathbf{q}_b=0$ & \cref{eq:fundamental} \\
+单应矩阵 & $\mathbf{q}_b=\mathbf{K}_b\mathbf{H}_{ba}\mathbf{K}_a^{-1}\mathbf{q}_a$ & \cref{eq:homography} \\
+KB 鱼眼 & $r(\theta)=\theta+\sum k_n\theta^{2n+1}$ & \cref{eq:kb} \\
+观测模型 & $\mathbf{g}=\mathbf{s}(\mathbf{T}\mathbf{p})$ & \cref{eq:obs-composition} \\
+单目投影雅可比 & $\tfrac1z[f_u,0,-f_ux/z;\,0,f_v,-f_vy/z]$ & \cref{eq:mono-jac} \\
+BA 投影雅可比 & $\mathbf{G}=[\mathbf{S}(\bar{\mathbf{T}}\bar{\mathbf{p}})^\odot,\,\mathbf{S}\bar{\mathbf{T}}\mathbf{D}]$ & \cref{eq:ba-jac} \\
+重投影误差 & $E=\tfrac12\sum\|\mathbf{z}_j-\pi(\mathbf{x}_j^c)\|_{\boldsymbol\Sigma_j}^2$ & \cref{eq:reproj-cost} \\
+Schur 补 & $\mathbf{H}_{cc}^{\text{red}}=\mathbf{H}_{cc}-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{H}_{cp}^\top$ & \cref{eq:schur-1} \\
+不确定度一阶 & $\mathbf{R}=\mathbf{G}\boldsymbol\Xi\mathbf{G}^\top$ & \cref{eq:unc-first} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表（本章 $\to$ 后续）}
+\begin{tabular}{llll}
+\toprule
+知识点 & 难度 & 本章地位 & 在哪里展开 \\
+\midrule
+针孔 / 内参 / 畸变 & $\bigstar$ & 成像地基 & \cref{ch:vo},\cref{ch:vio} \\
+内参与畸变系数 & $\bigstar\bigstar$ & 视为已知 & \cref{ch:calib}（如何标定） \\
+坐标系链 & $\bigstar$ & 正向成像 & 重投影误差 \cref{ch:vo} \\
+双目 / RGB-D 测深 $+$ 反投影 & $\bigstar\bigstar$ & 深度来源 & \cref{ch:vo}、点云/建图 \\
+本质/基础/单应矩阵 & $\bigstar\bigstar\bigstar$ & 多视图约束 & \cref{ch:vo} 对极几何/PnP \\
+现代镜头谱系 & $\bigstar\bigstar$ & 选型 & 广角/全向 SLAM \\
+相机$=$观测模型 $\mathbf{g}$、投影雅可比 & $\bigstar\bigstar\bigstar$ & 接口 & \cref{ch:eskf},\cref{ch:vo} BA \\
+Schur 补稀疏求解 & $\bigstar\bigstar\bigstar$ & BA 求解 & \cref{ch:nlopt},\cref{ch:vo} \\
+不确定度传播 & $\bigstar\bigstar\bigstar\bigstar$ & 协方差预测 & \cref{ch:eskf} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{延伸阅读。}
+\begin{itemize}
+  \item 视觉 SLAM 十四讲\cite{gaoxiang2019slam14} 第 5 章（$\bigstar$）：针孔/畸变/双目/RGB-D 的系统讲解与 OpenCV 实践，本章直觉与代码的主要来源。
+  \item Barfoot\cite{barfoot2024state} §7.4、§8.3.7、§10.1（$\bigstar\bigstar\bigstar$）：相机作为复合观测模型 $\mathbf{g}=\mathbf{s}\circ\mathbf{z}$、立体内参 $\mathbf{M}$、本质/基础/单应矩阵证明、投影雅可比与 Hessian、不确定度一/二/四阶传播与 sigmapoint、BA 的 Schur/Cholesky——本章严谨主线的来源。
+  \item SLAM Handbook\cite{carlone2026handbook} 第 7 章（$\bigstar\bigstar$）：抽象 $\pi/\pi^{-1}$、按 FOV 的镜头谱系（rad-tan/Brown--Conrady/Kannala--Brandt/双球）、重投影误差与 BA、直接法 warping、RGB-D TSDF、卷帘快门、视觉 SLAM 前沿——本章广度与现代视角的来源。
+  \item Solà micro-Lie\cite{sola2018micro}（$\bigstar\bigstar\bigstar$）：李群求导工具，配合本章末投影雅可比的右扰动推导（\cref{ch:lie} 已吸收）。
+\end{itemize}
+
+\paragraph{累积项目：本章新增模块。}
+为后续 VO/VIO 累积项目新增“相机模块”：实现 \texttt{Camera} 类，封装 (i) 投影 $\pi$（针孔$+$畸变）、(ii) 反投影 $\pi^{-1}$（含双目/RGB-D 深度）、(iii) 投影雅可比 \cref{eq:mono-jac}、(iv) 世界$\leftrightarrow$相机坐标变换。它将作为 \cref{ch:vo} 重投影误差因子、\cref{ch:vio} 视觉因子的底层接口。
+
+\section*{与后续章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+后续章节 & 关系 & 本章为其铺垫 \\
+\midrule
+\cref{ch:calib} 相机标定 & 反求本章参数 & $\mathbf{K}$、畸变系数、完整成像方程 \\
+\cref{ch:vo} 视觉里程计 & 直接复用 & 投影 $\pi$、重投影误差、投影雅可比、对极几何、Schur \\
+\cref{ch:vio} VIO & 视觉因子基础 & 相机观测模型、卷帘快门 \\
+\cref{ch:eskf} 误差状态滤波 & 视觉更新 & 观测模型 $\mathbf{g}$、雅可比、不确定度传播 \\
+点云/建图 & 深度来源 & 双目/RGB-D 反投影点云 \\
+\bottomrule
+\end{tabular}
+\end{table}
+\noindent 下一章转入\emph{相机标定}——如何\emph{求出}本章假设已知的 $\mathbf{K}$ 与畸变系数。
+
+\begin{table}[H]\centering\small
+\caption{故障排查手册}
+\begin{tabularx}{\linewidth}{lLL}
+\toprule
+症状 & 可能原因 & 对策（相关节） \\
+\midrule
+重投影边缘系统性偏 & 用错相机模型（针孔套鱼眼） & 改 BC/KB/双球（\cref{sec:cam-modern}） \\
+去畸变后图像仍弯/更弯 & 畸变/内参顺序错、方向用反、系数符号错 & 畸变在归一化平面、$\mathbf{K}$ 在后；勿把正向当逆（\cref{sec:cam-distortion}） \\
+点云 $X,Y$ 反了/偏移 & $u,v$ 与行列顺序混 & \texttt{image[y][x]}；核对 $c_x,c_y$（\cref{sec:cam-practice}） \\
+双目深度跳变/空洞 & 纹理弱、视差算不出 & 仅纹理处可测；换 RGB-D（\cref{sec:cam-stereo}） \\
+点云尺度差 $1000$ 倍 & 漏除 \texttt{depthScale}（毫米$\to$米） & \texttt{Z=d/1000}（\cref{ex:cam-rgbd}） \\
+RGB-D 室外失效 & 红外被日光淹没 & RGB-D 限室内；室外用双目/激光（\cref{sec:cam-rgbd}） \\
+颜色发蓝/发红 & 当成 RGB 实为 BGR & 按 \texttt{BGR} 读或转换（\cref{sec:cam-practice}） \\
+BA 不收敛/越优越差 & 左右扰动雅可比与更新不一致 & 雅可比与更新成对（\cref{eq:left-right-jac}） \\
+分辨率改变后投影全错 & 内参未随分辨率缩放 & $f,c$ 乘缩放因子（\cref{sec:cam-intrinsics}） \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{API 速查表（OpenCV / Eigen / Sophus）。}
+\begin{itemize}
+  \item \texttt{cv::imread(path)} / \texttt{cv::imread(path, -1)}：读图 / 读 16 位原始深度图（不转换）。
+  \item \texttt{image.\allowbreak at<T>(v,u)} / \texttt{image.\allowbreak ptr<T>(v)}：访问第 $v$ 行第 $u$ 列像素 / 第 $v$ 行头指针（注意 \texttt{(row=v, col=u)}）。
+  \item \texttt{image.\allowbreak clone()}：深拷贝（直接赋值是浅拷贝，共享数据）。
+  \item \texttt{cv::StereoSGBM::create(...)} $+$ \texttt{->compute(left,right,disp)}：半全局立体匹配算视差（输出需除 $16$）。
+  \item \texttt{Eigen::Quaterniond(w,x,y,z)}：构造 Hamilton 四元数（实部 $w$ 在首）。
+  \item \texttt{Sophus::SE3d(q, t)} $+$ \texttt{T * point}：位姿作用于 3 维点（世界$\leftrightarrow$相机）。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{附录：本章推导补遗}
+\label{sec:cam-appendix}
+\addcontentsline{toc}{section}{附录：本章推导补遗}
+
+\begin{derivation}[针孔投影的共线推导（\cref{thm:pinhole}）]
+光心 $O=\mathbf{0}$、空间点 $P=[X,Y,Z]^\top$、其像 $P'$ 在 $z=f$ 平面上，三点共线（同一光线）。共线即存在 $\lambda$ 使 $P'=\lambda P$；由 $P'$ 的第三维 $=f$ 得 $\lambda Z=f$，即 $\lambda=f/Z$。故 $X'=\lambda X=fX/Z$、$Y'=fY/Z$。倒像情形 $P'$ 在 $z=-f$ 平面，得负号；相机软件翻转输出正像，等价于对称放置成像平面到前方。\hfill$\square$
+\end{derivation}
+
+\begin{derivation}[双目深度 $z=fb/d$（\cref{thm:stereo}）]
+左右光心 $O_L,O_R$ 在 $x$ 轴、间距 $b$。点 $P$ 深度 $z$，其左右像横坐标 $u_L,u_R$。三角形 $\triangle PP_LP_R$（顶点 $P$、底为两像点）与 $\triangle PO_LO_R$（底为基线 $b$）相似，对应高分别为 $z-f$ 与 $z$，对应底为 $b-(u_L-u_R)$ 与 $b$：
+\[
+  \frac{z-f}{z}=\frac{b-(u_L-u_R)}{b}.
+\]
+两边同乘 $b$ 得 $b-\tfrac{bf}{z}=b-(u_L-u_R)$；两边减 $b$ 得 $-\tfrac{bf}{z}=-(u_L-u_R)=-d$，故 $\tfrac{f}{z}=\tfrac{d}{b}$，即 $z=fb/d$。视差 $d$ 最小为 $1$ 像素 $\Rightarrow$ 深度上限 $z_{\max}=fb$。\hfill$\square$
+\end{derivation}
+
+\begin{derivation}[完整成像中的齐次降维（\cref{eq:full-projection}）]
+记齐次世界点 $\tilde{\mathbf{P}}_w=[\mathbf{P}_w;1]\in\mathbb{R}^4$。$\mathbf{T}\tilde{\mathbf{P}}_w=[\mathbf{R}\mathbf{P}_w+\mathbf{t};1]\in\mathbb{R}^4$ 是齐次相机点；取其前三维（丢弃恒为 $1$ 的第四维）得非齐次相机点 $\mathbf{P}_c=\mathbf{R}\mathbf{P}_w+\mathbf{t}\in\mathbb{R}^3$，再左乘 $\mathbf{K}\in\mathbb{R}^{3\times3}$：$Z[u,v,1]^\top=\mathbf{K}\mathbf{P}_c$。记号 $\mathbf{K}\mathbf{T}\mathbf{P}_w$ 即默认了这一次降维。\hfill$\square$
+\end{derivation}
+
+\begin{derivation}[相机系点$\to$观测的雅可比 $\mathbf{S}$（\cref{eq:jac-S,eq:mono-jac}）]
+相机模型 $\mathbf{s}(\mathbf{z})=\mathbf{M}\tfrac1{z_3}\mathbf{z}$（$\mathbf{z}=[z_1,z_2,z_3,z_4]^\top$）。对单目，写出标量 $u=f_u z_1/z_3+c_u$、$v=f_v z_2/z_3+c_v$。透视除法的关键导数 $\partial(z_i/z_3)/\partial z_3=-z_i/z_3^2$。逐元素求偏导：$\partial u/\partial z_1=f_u/z_3$、$\partial u/\partial z_3=-f_u z_1/z_3^2$，$v$ 同理，得 \cref{eq:mono-jac}。双目情形把四个观测分量都做同样的链式（内参 $\mathbf{M}$ 在外、透视除法在内），整理出矩阵形式 \cref{eq:jac-S}，其中第三行（深度行）对应 $z_3$ 列恒含 $-z_i/z_3$。\hfill$\square$
+\end{derivation}
+
+\begin{derivation}[BA 法方程 Schur 补的左乘消元（\cref{thm:ba-schur}）]
+对 \cref{eq:ba-normal} 左乘 $\big[\begin{smallmatrix}\mathbf{I}&-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\\\mathbf{0}&\mathbf{I}\end{smallmatrix}\big]$，系数矩阵上块第二列变为 $\mathbf{H}_{cp}-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{H}_{pp}=\mathbf{0}$，上块第一列变为 $\mathbf{H}_{cc}-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{H}_{cp}^\top=\mathbf{H}_{cc}^{\text{red}}$，右端上块变为 $\mathbf{b}_c-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{b}_p$；下块不变。于是上块独立给出 $\mathbf{H}_{cc}^{\text{red}}\mathbf{d}_c=\mathbf{b}_c-\mathbf{H}_{cp}\mathbf{H}_{pp}^{-1}\mathbf{b}_p$（先解位姿），下块 $\mathbf{H}_{cp}^\top\mathbf{d}_c+\mathbf{H}_{pp}\mathbf{d}_p=\mathbf{b}_p$ 回代得 $\mathbf{d}_p$。因 $\mathbf{H}_{pp}$ 块对角，$\mathbf{H}_{pp}^{-1}$ 与 Schur 补逐点完成。\hfill$\square$
+\end{derivation}

@@ -1,0 +1,528 @@
+\chapter{运动映射与遥操作主从耦合}
+\label{ch:teleop-mapping}
+
+% ════════════════════════════════════════════════════════════════
+%  吸收 Tutorial D08（运动映射/Retargeting/ALOHA/GELLO/clutching）的理论与方法论，
+%  剔除工程实现（C++/ROS2/HDF5/数据采集脚本），重述为教材正文。
+%  记号归一：向量粗体小写、矩阵粗体大写；右扰动 R·Exp(deltaφ) 主线；
+%  能量端口 P=fᵀv 承 \cref{eq:os-port-power}；力学对偶 tau=Jᵀf。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章公式与符号表；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 一台手术机械臂希望“医生手动 $3\,$cm、器械动 $1\,$cm”。把主端位置 $\mathbf{x}_m$ 乘以一个标量 $\lambda_p$ 送给从端，够了吗？还差什么量才能让从端\emph{当前}位置对齐？
+  \item 若位置缩小 $5$ 倍而力\emph{不}缩放，操作者捏一个硬物时会发生什么？这与无源性（\cref{eq:os-port-power} 的功率端口）有何关系？
+  \item 姿态也要缩放时，能不能把四元数 $\mathbf{q}_m$ 的四个分量同乘 $\lambda_R$？结果还是合法旋转吗？
+  \item 主端工作空间只有 $12\,$cm、从端却有 $85\,$cm，纯靠放大倍率能覆盖吗？“离合”是怎么解决的？离合释放的一瞬间，从端会不会跳？
+  \item 人手 $20$ 多个自由度，灵巧手只有 $16$ 个、指节长度还不同——“关节角直接抄过去”为什么会让捏取动作失败？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{建立}主从位置/速度/力缩放的数学模型，写清参考点（origin）对“当前对齐”的作用，并解释速度缩放因子为何\emph{必然}等于位置缩放因子；
+  \item \textbf{推导}缩放的能量一致条件：在本书端口约定 $\mathbf{f}=$ effort、$\mathbf{v}=$ flow 下，缩放是一个\emph{功率变换器}，无源要求 $\lambda_f=\lambda_p$；并把“动作缩小、触觉放大”这一主动需求与 $\lambda_f$ 严格分账；
+  \item \textbf{在}$\SO(3)$ 切空间上正确缩放姿态（复用 \cref{ch:lie} 的 $\mathrm{Exp}/\mathrm{Log}$ 与右扰动），说明四元数线性缩放为何错；
+  \item \textbf{选型}关节空间映射（同构）与笛卡尔空间映射（异构 $+$ IK），处理 IK 初值连续性与奇异（复用 \cref{thm:ak-dls}、\cref{sec:ak-singularity}）；
+  \item \textbf{设计}人手到灵巧手的重定向（指尖位置 / 向量 / DexPilot 捏取先验），理解“平移不变 $+$ 尺度”与迟滞触发的工程动机；
+  \item \textbf{分析}离合（clutching）与索引（indexing）的工作空间机制及其能量记账，并把释放阶跃的能量 $E_{\text{step}}$ 接入能量罐 / TDPA（\cref{thm:os-energytank}、\cref{ch:teleop-tdpa}）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{把人的手部运动，安全、忠实地搬到远端机器人}”的主线：先解决\emph{尺度不匹配}（缩放与能量），再解决\emph{结构不匹配}（关节/笛卡尔映射、人手到机器手的重定向），最后解决\emph{工作空间不匹配}（离合与能量记账）。
+
+\begin{center}
+\small
+\begin{tikzpicture}[
+  node distance=4.5mm and 7mm, >=Stealth,
+  blk/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!6, draw=main!60!black},
+  grp/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=second!6, draw=second!60!black},
+  ln/.style={->, thick, gray!60!black}]
+\node[blk] (scale) {运动缩放\\ $\lambda_p,\lambda_f$};
+\node[blk, right=of scale] (energy) {能量一致\\ $\lambda_f{=}\lambda_p$};
+\node[blk, right=of energy] (att) {姿态缩放\\ $\SO(3)$ 切空间};
+\node[grp, below=8mm of scale] (map) {关节 vs 笛卡尔\\ 映射选型};
+\node[grp, right=of map] (retarget) {手部重定向\\ 指尖/向量/pinch};
+\node[grp, right=of retarget] (clutch) {离合 / 索引\\ $+$ 能量记账};
+\draw[ln] (scale)--(energy); \draw[ln] (energy)--(att);
+\draw[ln] (scale.south) -- ++(0,-4mm) -| (map.north);
+\draw[ln] (map)--(retarget); \draw[ln] (retarget)--(clutch);
+\draw[ln] (att.south) -- ++(0,-4mm) -| (clutch.north);
+\end{tikzpicture}
+\end{center}
+
+\noindent\textbf{推荐路径}：第 1--2 节是任何遥操作系统的地基（缩放数学 $+$ 能量守恒），与 \cref{ch:teleop-twoport} 的二端口、\cref{ch:teleop-stability} 的稳定性直接咬合；第 3 节把缩放推广到旋转，是 \cref{ch:lie} 的一个干净应用；第 4--5 节回答“映射在哪个空间、如何重定向”，对接 \cref{ch:arm-kin} 的 IK 与奇异；第 6 节的离合与能量记账把本章焊到 \cref{ch:teleop-tdpa} 的能量管理上。
+
+\subsection*{前置知识桥接}
+本章站在三块地基上。其一，\cref{ch:lie} 给出 $\SO(3)$ 上的 $\mathrm{Exp}/\mathrm{Log}$ 与右扰动——姿态缩放（\cref{sec:tm-attitude}）只是“把切空间向量乘一个标量”。其二，\cref{ch:arm-kin} 给出逆运动学、奇异分类（\cref{sec:ak-singularity}）与阻尼最小二乘（\cref{thm:ak-dls}）——笛卡尔映射的每一步都要它。其三，\cref{ch:operational-space} 把交互建模为能量端口、功率 $P=\mathbf{f}^\top\mathbf{v}$（\cref{eq:os-port-power}）——本章把缩放也纳入这套能量记账，与 \cref{ch:teleop-twoport,ch:teleop-stability,ch:teleop-wave,ch:teleop-tdpa} 的无源遥操作连成一气。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你能让从端\emph{动起来}，却会犯“缩放即坐标变换”的错误——忘了更新参考点，离合释放时从端\textbf{猛跳}；或独立选 $\lambda_p,\lambda_f$，在硬接触下\textbf{自激振荡}（\cref{ch:teleop-stability} 的 Llewellyn 风险）。
+  \item 面对异构主从（VR$\to$七轴臂、人手$\to$灵巧手），你会发现“关节角抄过去”根本不工作，却说不清该用笛卡尔映射还是重定向、IK 为何跳变。
+\end{itemize}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+主端（master，操作者侧）量加下标 $m$，从端（slave/follower，机器人侧）量加下标 $s$；末端位置 $\mathbf{x}\in\mathbb{R}^3$、位姿 $\mathbf{T}\in\SE(3)$、姿态 $\mathbf{R}\in\SO(3)$、关节角 $\mathbf{q}\in\mathbb{R}^n$。
+缩放因子：位置 $\lambda_p$、速度（与之绑定）、力 $\lambda_f$、姿态 $\lambda_R$（均为正标量）。
+端口变量沿用 \cref{eq:os-port-power}：势变量（effort）取力 $\mathbf{f}$、流变量（flow）取速度 $\mathbf{v}=\dot{\mathbf{x}}$，功率 $P=\mathbf{f}^\top\mathbf{v}$。
+力学对偶 $\boldsymbol{\tau}=\mathbf{J}^\top\mathbf{f}$（关节力矩 $=$ 雅可比转置乘末端力）贯穿全书。
+\textbf{源约定转换}：部分遥操作文献用机械优势式 $\lambda_f=1/\lambda_p$、或反向端口 $[\mathbf{f}_h;-\mathbf{v}_s]=\mathbf{H}[\mathbf{v}_m;\mathbf{f}_e]$；本书统一“从端力 $\mathbf{f}_s$ 映射到主端反馈力 $\mathbf{f}_m$”这一端口方向，结论为 $\lambda_f=\lambda_p$，见 \cref{thm:tm-power}，遇相反写法处会注明转换。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{运动缩放：为什么人手空间 \texorpdfstring{$\neq$}{!=} 机器人空间}
+\label{sec:tm-scaling}
+
+\paragraph{动机：两个极端场景。}
+设想外科医生操作手术机器人。人手腕到指尖的自然活动范围约 $\pm 15\,$cm，但眼科手术的操作区可能只有 $1\,$cm$\times 1\,$cm。若 $1{:}1$ 映射，医生要把动作控制到 $0.1\,$mm 级——远超人手约 $1\,$mm 的运动分辨率，且人手 $\sim\!1\,$mm 的生理性抖动会原样传到器械，在视网膜旁足以致害。反过来，控制室里遥操一台 $5\,$m 臂展的拆除液压臂，若 $1{:}1$ 映射，操作者要在控制台上走 $5\,$m——不现实。两个场景指向同一矛盾：\textbf{人体工作空间与机器人工作空间根本不匹配}。运动缩放（motion scaling）就是化解它的核心手段。
+
+\begin{insight}[缩放比不是“越小越精”]\label{ins:tm-scale-snr}
+直觉上“缩小 $10$ 倍比缩小 $2$ 倍更精”，其实不然。传感器分辨率与量化噪声会\emph{一同}被缩放：主端编码器分辨率 $0.01\,$mm，$\lambda_p=0.1$ 时从端名义分辨率 $0.001\,$mm，但噪声也缩到 $0.001\,$mm 量级，\textbf{信噪比不变}。$\lambda_p$ 的真正权衡在“精度增益 $\leftrightarrow$ 操作者感觉阈值 $\leftrightarrow$（若叠加主动触觉）稳定裕度”之间，而非一味取小。
+\end{insight}
+
+\subsection{位置、速度与力缩放}
+\label{sec:tm-pvf}
+
+\begin{definition}[主从运动缩放]\label{def:tm-scaling}
+设主端末端位置 $\mathbf{x}_m\in\mathbb{R}^3$、从端期望位置 $\mathbf{x}_s^{\text{des}}\in\mathbb{R}^3$，参考点（标定/离合时确定的原点）$\mathbf{x}_m^{\text{ref}},\mathbf{x}_s^{\text{ref}}$。\textbf{位置缩放}定义为
+\begin{equation}
+  \mathbf{x}_s^{\text{des}}=\lambda_p\,(\mathbf{x}_m-\mathbf{x}_m^{\text{ref}})+\mathbf{x}_s^{\text{ref}},
+  \label{eq:tm-pos-scale}
+\end{equation}
+其中 $\lambda_p>0$ 为位置缩放因子：$\lambda_p<1$ 缩小（微操作，如手术 $\lambda_p\in[0.2,0.4]$）、$\lambda_p=1$ 等比、$\lambda_p>1$ 放大（宏操作，如核退役 $\lambda_p\in[2,5]$）。\textbf{力缩放}把从端接触力 $\mathbf{f}_s$ 反馈到主端：
+\begin{equation}
+  \mathbf{f}_m=\lambda_f\,\mathbf{f}_s,
+  \label{eq:tm-force-scale}
+\end{equation}
+$\lambda_f$ 为\emph{无源缩放器内部}的力缩放因子。
+\end{definition}
+
+\begin{proposition}[速度缩放因子被位置缩放锁定]\label{prop:tm-vel}
+对 \cref{eq:tm-pos-scale} 求时间导数，参考点为常量，故
+\begin{equation}
+  \dot{\mathbf{x}}_s^{\text{des}}=\lambda_p\,\dot{\mathbf{x}}_m.
+  \label{eq:tm-vel-scale}
+\end{equation}
+即\emph{速度缩放因子恒等于位置缩放因子}——这不是设计选择，而是微分的必然。
+\end{proposition}
+
+\begin{pitfall}[陷阱：参考点不随离合更新 $\Rightarrow$ 从端跳变]
+\cref{eq:tm-pos-scale} 里的 $\mathbf{x}_m^{\text{ref}},\mathbf{x}_s^{\text{ref}}$ \textbf{必须}在每次离合（clutch）切换时同步刷新为切换瞬间的当前值：$\mathbf{x}_m^{\text{ref}}\!\leftarrow\!\mathbf{x}_m^{\text{cur}}$、$\mathbf{x}_s^{\text{ref}}\!\leftarrow\!\mathbf{x}_s^{\text{cur}}$。否则离合释放瞬间 $\mathbf{x}_m-\mathbf{x}_m^{\text{ref}}$ 出现一个大偏差，从端\textbf{瞬时跳到错误位置}。这是遥操作最常见、也最危险的实现错误（其能量后果见 \cref{sec:tm-clutch}）。
+\end{pitfall}
+
+\subsection{历史脉络}
+\label{sec:tm-history}
+运动缩放最早见于 Goertz（$1952$，美国阿贡国家实验室）的核废料主从机械臂——当时纯机械连杆传动，缩放比由\emph{齿轮比物理实现}。Goertz 的力反射位置伺服机构（“A force reflecting positional servo mechanism”, \emph{Nucleonics} 10(11), 1952）奠定了双边力反射遥操作的基础；其更早的主从机械手专利（U.S. 2,632,574）申请于 $1949$ 年。$1980$ 年代电动伺服普及后，电子缩放使缩放比\emph{可编程}，为 $1999$ 年 Intuitive Surgical 的 da Vinci 系统铺路；da Vinci 内置运动缩放（常引基准 $3{:}1$，即手动 $3\,$cm $\to$ 器械 $1\,$cm，实际可在约 $1.5{:}1$ 至 $5{:}1$ 间选择，依机型/设置而异）。\pz{存疑：曾见“MIT/Stanford 的 Salisbury 于 1985 年首次将电动伺服与电子缩放结合”之说，源讲义如此叙述。联网核实：Salisbury 与 JPL 的 Bejczy 在 1970 年代末—1980 年合作研制力反射主手，1985 年的工作是 Stanford/JPL 灵巧\emph{机器手}（非缩放遥操作系统），未见权威文献支持“1985 首次结合电动伺服与电子缩放”这一具体首创归属，故此处不采该断言、仅记缩放可编程化大体发生于 1980 年代电伺服时代。}
+
+% ════════════════════════════════════════════════════════════════
+\section{能量一致性：缩放是一个功率变换器}
+\label{sec:tm-energy}
+
+\paragraph{动机：$\lambda_p$ 与 $\lambda_f$ 能独立选吗？}
+位置缩放看似纯几何，力缩放看似纯标定，二者似乎互不相干。但只要系统\emph{同时}传位置与力（双边遥操作），它们就被能量绑死了。
+
+\begin{theorem}[缩放的能量一致条件]\label{thm:tm-power}
+在 \cref{def:tm-scaling} 的端口约定下（势变量取力、流变量取速度，功率 $P=\mathbf{f}^\top\mathbf{v}$，承 \cref{eq:os-port-power}），主端输入功率与从端输出功率分别为
+\begin{equation}
+  P_m=\mathbf{f}_m^\top\dot{\mathbf{x}}_m=(\lambda_f\mathbf{f}_s)^\top\dot{\mathbf{x}}_m,\qquad
+  P_s=\mathbf{f}_s^\top\dot{\mathbf{x}}_s=\mathbf{f}_s^\top(\lambda_p\dot{\mathbf{x}}_m).
+  \label{eq:tm-powers}
+\end{equation}
+缩放器无源（不产能、不耗能，仅做功率变换）当且仅当 $P_m=P_s$，即
+\begin{equation}
+  \frac{P_m}{P_s}=\frac{\lambda_f}{\lambda_p}=1
+  \quad\Longleftrightarrow\quad
+  \boxed{\;\lambda_f=\lambda_p\;}.
+  \label{eq:tm-energy-cond}
+\end{equation}
+\end{theorem}
+\begin{proof}
+由 \cref{eq:tm-powers}，$P_m/P_s=\lambda_f\mathbf{f}_s^\top\dot{\mathbf{x}}_m\big/\big(\lambda_p\mathbf{f}_s^\top\dot{\mathbf{x}}_m\big)=\lambda_f/\lambda_p$（对一切使 $\mathbf{f}_s^\top\dot{\mathbf{x}}_m\neq 0$ 的运动成立）。理想无源功率变换器储能不增、且无内部耗散时 $P_m=P_s$，故 $\lambda_f/\lambda_p=1$。若 $\lambda_f/\lambda_p>1$ 则 $P_m>P_s$，缩放环节\emph{净向主端注入}功率——等价于在系统里插入了一个能量源，违反无源（\cref{ch:teleop-stability} 的散逸不等式 $\dot V\le \mathbf{y}^\top\mathbf{u}$）；$\lambda_f/\lambda_p<1$ 则净耗能，透明度下降。
+\end{proof}
+
+\begin{insight}[缩放不是坐标变换，是功率变换器]\label{ins:tm-transformer}
+\cref{thm:tm-power} 的本质：运动缩放在能量上等价于一个\textbf{理想变换器}（transformer）——一侧“电压”放大、同侧“电流”相应缩小，端口功率守恒。$\lambda_f=\lambda_p$ 正是这个变换器\emph{不自带电池}的条件。明白这点，就不会把“缩小动作”与“放大触觉”混为一谈：前者是无损变换，后者是主动注能（见下）。
+\end{insight}
+
+\begin{note}[源约定差异：$\lambda_f=1/\lambda_p$ 从何而来]
+遥操作文献里也常见 $\lambda_f=1/\lambda_p$。它对应的是\emph{另一组端口定义}——通常是把力沿\emph{相反方向}映射、或采用“机械优势”式倒数关系（杠杆：位移放大则力缩小）。这与本书“从端力 $\mathbf{f}_s\to$ 主端反馈力 $\mathbf{f}_m$、同向端口”的定义不同。若项目确需机械优势式倒数关系，须先重定义端口方向与功率符号，再沿 \cref{eq:tm-powers} 重推，切勿直接套用 $\lambda_f=\lambda_p$。
+\end{note}
+
+\subsection{主动触觉放大：单独记账}
+\label{sec:tm-active}
+很多系统的真实需求是“动作缩小、但触觉更明显”。这\emph{无法}靠无损缩放器实现，必须显式引入主动触觉增益 $g_h$：
+\begin{equation}
+  \mathbf{f}_m=g_h\,\lambda_p\,\mathbf{f}_s,\qquad g_h>1,
+  \label{eq:tm-active-gain}
+\end{equation}
+其中 $\lambda_p$ 保证缩放环节功率守恒，$g_h$ 是\emph{额外}的放大。$g_h$ 不是免费的机械优势，而是主动系统\textbf{向操作者端注入能量}：把 \cref{eq:tm-active-gain} 代回 \cref{eq:tm-powers} 得 $P_m=g_h\,P_s>P_s$，净注入功率 $(g_h-1)P_s$ 必须被显式管理——配合力饱和、能量罐（\cref{thm:os-energytank}）、TDPA（\cref{ch:teleop-tdpa}）或严格的人机交互稳定性分析。没有力反馈的系统（如 ALOHA、UMI 常见配置）则根本没有 $\lambda_f$，只有运动映射与视觉反馈。
+
+\begin{pitfall}[陷阱：把“能量一致”当成“稳定”的充分条件]
+$\lambda_f=\lambda_p$ 只是无源的\emph{必要}条件之一。通信延迟、采样周期、控制器非理想性都会\emph{额外}注入能量；硬接触 $+$ 高增益主端控制下，即便缩放守恒也可能失稳。能量一致、能量在线监管（TDPA，\cref{ch:teleop-tdpa}）、合理的控制器设计，三者缺一不可。
+\end{pitfall}
+
+\begin{derivation}[反事实：$\lambda_f\neq\lambda_p$ 为何引发正反馈振荡]
+取 $\lambda_p=0.2$（缩小 $5$ 倍）却令 $\lambda_f=1$（力不缩放）。则 $\lambda_f/\lambda_p=5\neq 1$：从端每输出功率 $P_s$，缩放环节向主端反馈 $5P_s$。操作者感到的力 $\mathbf{f}_m=\mathbf{f}_s$（未缩小），而从端运动缩到 $1/5$。硬接触下，从端接触力被“放大”地反馈给主端 $\to$ 主端被推动 $\to$ 又驱动从端继续挤压 $\to$ 接触力更大——闭环增益 $>1$ 时形成\textbf{正反馈振荡}。这正是 \cref{ch:teleop-stability} 中 Llewellyn 绝对稳定判据所警示的：二端口的散射/混合参数一旦越界，回路自激。结论：要“缩小动作 $+$ 放大触觉”，须用 \cref{eq:tm-active-gain} 的 $g_h$ 显式注能并配能量罐/TDPA 把多余能量耗散，而非偷偷令 $\lambda_f\neq\lambda_p$。
+\end{derivation}
+
+\begin{table}[H]\centering\small
+\caption{典型系统的缩放参数（理论取值；剔除工程细节）}
+\label{tab:tm-systems}
+\begin{tabular}{lllll}
+\toprule
+系统 & 场景 & $\lambda_p$ & 无源 $\lambda_f$ & 主动增益 $g_h$ \\
+\midrule
+da Vinci / dVRK & 腹腔镜手术 & $0.2$--$0.4$ & 同 $\lambda_p$（若做被动力反馈） & 另行设计 / 常无直接力反馈 \\
+显微手术原型 & 眼科/耳科 & $0.01$--$0.1$ & $0.01$--$0.1$ & 可能 $>1$，需能量安全层 \\
+ALOHA & 桌面操作 & $1.0$ & 无力反馈 & 无 \\
+空间遥操作 & ISS$\to$地面 & $1.0$ & $1.0$ & 由能量罐约束 \\
+核退役 & 放射性拆除 & $2$--$5$ & $2$--$5$（本书端口定义） & 通常限幅而非放大 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[手推]} 设主从均为 $1$-DOF 线性阻抗 $Z_m(s)=M_m s+B_m+K_m/s$、环境 $Z_e(s)=M_e s+B_e+K_e/s$。加入缩放 $x_s=\lambda_p x_m,\ f_m=\lambda_f f_s$ 后，求从主端看到的等效环境阻抗 $Z_e'(s)$；再令 $\lambda_f=\lambda_p$，验证端口功率守恒。
+  \item \textbf{[思考]} 显微手术常希望 $\lambda_p=0.05$（缩小 $20$ 倍）但触觉不按 $0.05$ 缩、甚至放大。这偏离了无损缩放条件。试在“力可感知性 $\leftrightarrow$ 操作者最大承受力 $\leftrightarrow$ 无源性”三者间给一套折中方案（提示：力饱和 $+$ 能量罐 $+$ TDPA）。
+  \item \textbf{[判别]} 给定一段双边遥操作日志（$\mathbf{f}_m,\mathbf{f}_s,\dot{\mathbf{x}}_m,\dot{\mathbf{x}}_s$ 时间序列），如何\emph{在线}估计缩放环节的累积注入能量 $\int(P_m-P_s)\,dt$，并据此判断系统是否正在被缩放破坏无源？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{姿态缩放：在 \texorpdfstring{$\SO(3)$}{SO(3)} 切空间上做线性运算}
+\label{sec:tm-attitude}
+
+\paragraph{动机：位置可线性缩放，姿态不能。}
+位置在 $\mathbb{R}^3$ 里，乘标量天经地义。但旋转活在\emph{曲}的 $\SO(3)$ 上，没有“加法”“数乘”。这正是 \cref{ch:lie} 反复强调的：旋转构成群而非向量空间。
+
+\begin{pitfall}[陷阱：四元数分量线性缩放]
+有人想把单位四元数 $\mathbf{q}_m=[w,\mathbf{v}^\top]^\top$（实部在前，Hamilton 约定，见 \cref{ch:lie}）直接乘 $\lambda_R$ 得 $\mathbf{q}_s=\lambda_R\mathbf{q}_m$。这\textbf{错}：$\|\lambda_R\mathbf{q}_m\|=\lambda_R\neq 1$，结果\emph{不再是单位四元数}，归一化后也不对应“转角缩放 $\lambda_R$ 倍”。逐元素缩放在旋转矩阵上同样会破坏正交性。
+\end{pitfall}
+
+\begin{definition}[$\SO(3)$ 上的姿态缩放]\label{def:tm-att-scale}
+设主端姿态 $\mathbf{R}_m\in\SO(3)$、参考姿态 $\mathbf{R}_m^{\text{ref}},\mathbf{R}_s^{\text{ref}}$，姿态缩放因子 $\lambda_R>0$。正确的姿态缩放在切空间（李代数 $\so(3)$）中进行：
+\begin{equation}
+  \mathbf{R}_s=\mathbf{R}_s^{\text{ref}}\,\mathrm{Exp}\!\Big(\lambda_R\,\mathrm{Log}\big((\mathbf{R}_m^{\text{ref}})^{-1}\mathbf{R}_m\big)\Big),
+  \label{eq:tm-att-scale}
+\end{equation}
+其中 $\mathrm{Log}:\SO(3)\to\so(3)$、$\mathrm{Exp}:\so(3)\to\SO(3)$ 是 \cref{ch:lie} 定义的对数/指数映射。
+\end{definition}
+
+\begin{derivation}[\cref{eq:tm-att-scale} 为何正确]
+分三步读。第一步，$(\mathbf{R}_m^{\text{ref}})^{-1}\mathbf{R}_m$ 是主端\emph{相对参考姿态}的\textbf{相对旋转}——这与 \cref{ch:lie} 的右扰动 $\mathbf{R}=\mathbf{R}^{\text{ref}}\mathrm{Exp}(\delta\boldsymbol{\varphi})$ 同构：$\delta\boldsymbol{\varphi}=\mathrm{Log}((\mathbf{R}_m^{\text{ref}})^{-1}\mathbf{R}_m)$ 是表达在参考系局部的扰动向量。第二步，$\mathrm{Log}$ 把这个相对旋转送进切空间，得轴角向量 $\boldsymbol{\varphi}\in\mathbb{R}^3$，其中\emph{方向是转轴、模长是转角}。在切空间里乘标量 $\lambda_R$ 是合法的线性运算——几何上即“沿同一轴、转角缩放 $\lambda_R$ 倍”。第三步，$\mathrm{Exp}$ 把缩放后的切向量映回 $\SO(3)$，再左乘从端参考姿态 $\mathbf{R}_s^{\text{ref}}$ 完成对齐。因 $\mathrm{Exp}$ 的像恒在 $\SO(3)$ 内、$\mathbf{R}_s^{\text{ref}}\in\SO(3)$，故 $\mathbf{R}_s$ \textbf{必为}合法旋转（$\det\mathbf{R}_s=1,\ \mathbf{R}_s^\top\mathbf{R}_s=\mathbf{I}$）。这正是“在弯曲空间里做线性运算”的标准范式：$\mathrm{Log}\to$ 线性运算 $\to\mathrm{Exp}$。
+\end{derivation}
+
+\begin{note}[典型取值]
+da Vinci 手术中姿态通常\emph{不}缩放（$\lambda_R=1$），因为医生需要直观的手腕转动映射；显微手术中细微抖动会被放大，取 $\lambda_R=0.5$（手转 $60^\circ\to$ 器械转 $30^\circ$）可增强稳定性。位置与姿态可用\emph{不同}缩放因子（$\lambda_p\neq\lambda_R$），二者各自独立。
+\end{note}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[验证]} 任取 $\mathbf{R}_m,\mathbf{R}_m^{\text{ref}},\mathbf{R}_s^{\text{ref}}\in\SO(3)$ 与 $\lambda_R=0.5$，按 \cref{eq:tm-att-scale} 算 $\mathbf{R}_s$，验证 $\det\mathbf{R}_s=1$ 且 $\mathbf{R}_s^\top\mathbf{R}_s=\mathbf{I}$。再令 $\lambda_R=1$，验证退化为 $\mathbf{R}_s=\mathbf{R}_s^{\text{ref}}(\mathbf{R}_m^{\text{ref}})^{-1}\mathbf{R}_m$。
+  \item \textbf{[陷阱复现]} 对一个绕 $z$ 轴转 $90^\circ$ 的旋转，用四元数分量线性缩放 $\lambda_R=0.5$ 后归一化，与 \cref{eq:tm-att-scale} 的正确结果对比转角偏差，定量说明前者为何不是“转 $45^\circ$”。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{关节映射 vs 笛卡尔映射：复杂性在硬件与软件间的分配}
+\label{sec:tm-jointcart}
+
+\paragraph{动机：映射发生在哪个空间？}
+主端传感器给的可能是\emph{关节角}（如同构 leader 臂的编码器）或\emph{末端位姿}（如 VR 手柄的 $6$-DOF 追踪）；从端接受的可能是\emph{关节位置}指令或\emph{笛卡尔位姿}（需 IK）。映射在关节空间还是笛卡尔空间，不只是工程便利，而是两种设计哲学。
+
+\begin{definition}[关节空间映射]\label{def:tm-jointmap}
+当主从运动学相同或高度相似（\emph{同构}臂），直接做关节镜像
+\begin{equation}
+  \mathbf{q}_s(t)=\mathbf{q}_m(t)+\mathbf{q}_{\text{offset}},
+  \label{eq:tm-jointmap}
+\end{equation}
+$\mathbf{q}_{\text{offset}}$ 为标定时确定的固定偏置，补偿主从零位差。
+\end{definition}
+
+\begin{definition}[笛卡尔空间映射]\label{def:tm-cartmap}
+当主从运动学不同（\emph{异构}）或需缩放，先得主端末端位姿 $\mathbf{T}_m\in\SE(3)$（由正运动学或 VR 追踪），经坐标变换与缩放得从端期望位姿，再以逆运动学求关节角：
+\begin{equation}
+  \mathbf{T}_s^{\text{des}}=\mathbf{T}_{\text{offset}}\,\mathbf{T}_m\,\mathbf{T}_{\text{calib}}^{-1},
+  \qquad \mathbf{q}_s=\mathrm{IK}(\mathbf{T}_s^{\text{des}}),
+  \label{eq:tm-cartmap}
+\end{equation}
+$\mathbf{T}_{\text{offset}}$ 为主从坐标系变换、$\mathbf{T}_{\text{calib}}$ 为标定偏置。位置/姿态缩放（\cref{eq:tm-pos-scale,eq:tm-att-scale}）在此步插入。
+\end{definition}
+
+\begin{insight}[关节 vs 笛卡尔：把复杂性推给硬件，还是软件]\label{ins:tm-tradeoff}
+两者不是“好坏”，而是\textbf{复杂性的分配}。关节映射把复杂性推给\emph{硬件}（要求同构设计），换来软件极简、零 IK 误差、无奇异、延迟极低（映射几乎 $0\,$ms）；笛卡尔映射接受硬件异构，但把复杂性（IK、奇异、多解选择）留给\emph{软件}。同构 leader-follower 系统选前者——其深刻之处在于“\textbf{与其在软件里解决映射，不如在硬件上消除映射需求}”；手术机器人因主从天然异构、且需缩放，选后者。
+\end{insight}
+
+\begin{pitfall}[陷阱：对异构系统强行关节映射]
+设 $6$-DOF 主端操控 $7$-DOF 从端。强行 $\mathbf{q}_s=\mathbf{q}_m+\mathbf{q}_{\text{offset}}$ 会同时崩在两处：\textbf{自由度不匹配}（第 $7$ 关节无定义，固定或随机都不对）；\textbf{运动学不同构}（同一 $q_{m,3}$ 在两臂上对应完全不同的几何构型，因 DH 参数不同）。结果是操作者做“伸手去拿”，从端却扭出毫不相关的姿态——直觉操控性尽失。异构\emph{必须}走笛卡尔映射。
+\end{pitfall}
+
+\begin{pitfall}[陷阱：笛卡尔映射的 IK 初值不连续]
+数值 IK 是\emph{局部}搜索，初值决定收敛到哪个解分支。若每帧都用固定初值（如零构型）调用 IK，相邻两帧的解可能跳到不同分支（肘 up vs 肘 down），从端剧烈抖动。\textbf{正解}：用上一帧解 $\mathbf{q}_{\text{prev}}$ 作下一帧初值（连续性 warm-start）。自检：连续帧间最大关节角变化应 $<0.1\,$rad/frame。
+\end{pitfall}
+
+\paragraph{奇异与 IK 失败。}
+笛卡尔映射的最大风险是 IK 求解失败：目标位姿出界、接近奇异、或多解切换不一致。奇异分类（腕/肘/肩奇异）见 \cref{sec:ak-singularity}；奇异附近反解关节速度时，雅可比伪逆爆炸，应改用阻尼最小二乘（\cref{thm:ak-dls} 的 $\dot{\mathbf{q}}=\mathbf{J}^\top(\mathbf{J}\mathbf{J}^\top+\lambda^2\mathbf{I})^{-1}\dot{\mathbf{x}}$）以少量精度换数值稳定。冗余从端（$n>6$）还可把多余自由度送入零空间避奇异/避限位（\cref{sec:ak-redundancy}）。在遥操作里，IK 失败表现为从端“卡住”——主端动而从端不跟，体验极差，故连续性与稳健化缺一不可。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  >=Stealth, node distance=5mm,
+  dec/.style={draw, diamond, aspect=2.2, align=center, font=\small, inner sep=1pt, fill=second!8, draw=second!60!black},
+  box/.style={draw, rounded corners, align=center, font=\small, inner sep=3pt, fill=main!8, draw=main!60!black},
+  ln/.style={->, thick, gray!55!black}]
+\node[dec] (iso) {主从运动学\\同构？};
+\node[box, below left=10mm and 6mm of iso] (joint) {关节映射\\（推荐，极简）};
+\node[dec, below right=10mm and 6mm of iso] (scale) {需要\\运动缩放？};
+\node[box, below left=10mm and -2mm of scale] (cart2) {笛卡尔映射\\$+$ 缩放};
+\node[box, below right=10mm and -2mm of scale] (cart1) {笛卡尔映射\\（基础）};
+\draw[ln] (iso) -| node[above left, font=\scriptsize]{是} (joint);
+\draw[ln] (iso) -| node[above right, font=\scriptsize]{否} (scale);
+\draw[ln] (scale) -| node[above left, font=\scriptsize]{是} (cart2);
+\draw[ln] (scale) -| node[above right, font=\scriptsize]{否} (cart1);
+\end{tikzpicture}
+\caption{运动映射的选型决策树：同构走关节映射；异构按是否需缩放走两类笛卡尔映射。}
+\label{fig:tm-decision}
+\end{figure}
+
+\begin{table}[H]\centering\small
+\caption{关节映射的优势与局限}
+\label{tab:tm-joint}
+\begin{tabular}{ll}
+\toprule
+优势 & 局限 \\
+\midrule
+无 IK 计算、映射延迟极低 & 要求主从同构 \\
+不经笛卡尔空间，无雅可比奇异 & 不能缩放（恒 $1{:}1$） \\
+关节限位自然对应 & 操作者须在“关节空间”里思考，主从朝向不同则直觉性降 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}[关节映射并非“无需标定”]
+即便同构，两台臂的零位也不完全相同（伺服出厂零位偏差可达数度），故 \cref{eq:tm-jointmap} 的 $\mathbf{q}_{\text{offset}}$ 必须标定：把两臂摆到同一已知构型，记 $\mathbf{q}_{\text{offset}}=\mathbf{q}_m^{\text{calib}}-\mathbf{q}_s^{\text{calib}}$。$3$D 打印的 leader 因加工公差，还需逐关节单独标定。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{手部重定向：人手到机器手的跨结构映射}
+\label{sec:tm-retarget}
+
+\paragraph{动机：人手与机器手的鸿沟。}
+人手有 $20{+}$ 自由度、$27$ 块骨骼、约 $27$ 个关节（解剖学常引数；逐指为 MCP/PIP/DIP 三关节、拇指两关节，加腕/腕掌关节）；灵巧手自由度从 $1$（简单夹爪）到 $24$（Shadow Hand，其中 $20$ 个驱动、$4$ 个欠驱动）不等，运动学结构与人手差异巨大。戴手部追踪设备（如输出 $25$ 个关键点）去控制一只 $16$-DOF 灵巧手，如何由人手关键点算出机器手的关节角？这就是\textbf{重定向}（retargeting）：在自由度数目与运动学结构都不同时，尽量保持\emph{操控意图}。
+
+\begin{pitfall}[陷阱：人手关节角直接抄给机器手]
+人手食指 $4$ 个关节、灵巧手食指也 $4$ 个，看似可 $1{:}1$ 抄？不行：关节范围数值不完全对齐，更关键的是\emph{指节长度比例}不同。结果是人做“捏取”（拇指食指指尖接触），机器手指尖却差 $1$--$2\,$cm 接触不上——关节角对了，指尖位置却错了。精密操作不可接受。
+\end{pitfall}
+
+\subsection{三种重定向目标}
+\label{sec:tm-retarget3}
+
+\begin{definition}[指尖位置映射]\label{def:tm-tipmap}
+只对齐指尖位置，忽略中间关节构型：
+\begin{equation}
+  \mathbf{q}^\star=\arg\min_{\mathbf{q}}\sum_{i=1}^{N} w_i\,\big\|\mathbf{p}_i^{\text{robot}}(\mathbf{q})-\mathbf{p}_i^{\text{human}}\big\|^2,
+  \label{eq:tm-tip}
+\end{equation}
+$\mathbf{p}_i^{\text{robot}}(\mathbf{q})$ 为机器手第 $i$ 指尖的正运动学位置、$\mathbf{p}_i^{\text{human}}$ 为人手第 $i$ 指尖检测位置、$w_i$ 为权重、$N$ 为指尖数（通常 $5$）。最简单，但对\emph{手掌大小}敏感（同样“捏取”，大手小手指尖距不同），且不约束手指姿态。
+\end{definition}
+
+\begin{definition}[向量映射]\label{def:tm-vecmap}
+不对齐绝对位置，只对齐关键点\emph{之间}的相对向量（带全局尺度）：
+\begin{equation}
+  \mathbf{q}^\star=\arg\min_{\mathbf{q}}\sum_{(i,j)} w_{ij}\,\big\|\mathbf{v}_{ij}^{\text{robot}}(\mathbf{q})-s\,\mathbf{v}_{ij}^{\text{human}}\big\|^2,
+  \qquad \mathbf{v}_{ij}=\mathbf{p}_j-\mathbf{p}_i,
+  \label{eq:tm-vec}
+\end{equation}
+$s$ 为全局缩放因子（补偿手掌大小）。
+\end{definition}
+
+\begin{insight}[向量映射为何优于位置映射]\label{ins:tm-vec}
+两条原因。其一，\textbf{平移不变}：$\mathbf{v}_{ij}=\mathbf{p}_j-\mathbf{p}_i$ 与人手在空间中的绝对位置无关，只要手指\emph{相对构型}相同，结果就相同——操作者不必把手停在某个“正确”的绝对位置。其二，\textbf{尺度自适应}：$s$ 自动补偿不同操作者的手掌大小差异。位置映射两者皆无，故对手大小敏感、易因平移漂移而不一致。
+\end{insight}
+
+\begin{definition}[DexPilot 捏取先验]\label{def:tm-dexpilot}
+在向量映射基础上加\emph{捏取先验}（pinch prior）：当检测到人手两指尖距离 $d_{\text{human}}$ 小于阈值（如 $2\,$cm），强制机器手对应指尖接触：
+\begin{equation}
+  \mathbf{q}^\star=
+  \begin{cases}
+    \displaystyle\arg\min_{\mathbf{q}}\|\mathbf{q}-\mathbf{q}_{\text{pinch}}\|^2 \ \ \text{s.t. 指尖距}\approx 0, & d_{\text{human}}<2\,\text{cm},\\[4pt]
+    \text{向量映射 \cref{eq:tm-vec}}, & \text{否则}.
+  \end{cases}
+  \label{eq:tm-dexpilot}
+\end{equation}
+\end{definition}
+
+\begin{insight}[捏取先验 $=$ 迟滞 $=$ 施密特触发器]\label{ins:tm-pinch}
+手部关键点检测精度约 $5$--$10\,$mm。捏取时两指尖检测距离常在 $0$--$15\,$mm 间\emph{抖动}，直接映射会让机器手指尖在“接触/不接触”间高频振荡——物体在指尖间反复打滑。捏取先验通过\textbf{二值化接触状态}消除振荡：一旦“疑似在捏”就强制完全闭合。其工程内核与电子学的\textbf{施密特触发器}同构——用上下双阈值（如进入 $<1.5\,$cm、退出 $>2.5\,$cm）实现\emph{迟滞}，避免噪声引发的反复切换；这与力控接触/脱离切换用迟滞防抖完全同思想。
+\end{insight}
+
+\begin{pitfall}[两个数值陷阱]
+其一，\textbf{重定向优化必须加关节限位约束}：无界优化可能收敛到物理不可达的 $\mathbf{q}$，下发后触发硬件保护停机——务必设 $\mathbf{q}_{\min}\le\mathbf{q}\le\mathbf{q}_{\max}$。其二，\textbf{精度不必高于输入噪声}：输入精度仅 $5$--$10\,$mm，把优化残差压到 $10^{-6}$ 是\emph{过拟合噪声}且徒增迭代延迟；设较少迭代（如 $50$ 步）、残差阈值 $\sim\!10^{-3}$ 即可。在遥操作里\textbf{速度比精度重要}。
+\end{pitfall}
+
+\begin{table}[H]\centering\small
+\caption{三种重定向方法对比}
+\label{tab:tm-retarget}
+\begin{tabular}{llll}
+\toprule
+方面 & 位置映射 & 向量映射 & DexPilot \\
+\midrule
+手掌大小鲁棒性 & 敏感 & 尺度不变 & 尺度不变 \\
+捏取精度 & 噪声敏感 & 噪声敏感 & 二值化稳定 \\
+实现复杂度 & 最低 & 中 & 较高 \\
+适用 & 粗操作 & 通用 & 精密捏取 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[手推]} 推导向量映射的梯度。设 $f(\mathbf{q})=\sum_{(i,j)}\|\mathbf{v}_{ij}(\mathbf{q})-s\,\mathbf{v}_{ij}^{h}\|^2$，$\mathbf{v}_{ij}(\mathbf{q})=\mathbf{p}_j(\mathbf{q})-\mathbf{p}_i(\mathbf{q})$。求 $\partial f/\partial\mathbf{q}$，表达式应出现指尖雅可比 $\mathbf{J}_i=\partial\mathbf{p}_i/\partial\mathbf{q}$。
+  \item \textbf{[跨章综合]} 把重定向看作\emph{多末端} IK（$5$ 个指尖同时跟踪 $5$ 个目标）。与单末端 IK（\cref{ch:arm-kin}）相比，多末端在奇异处理、冗余解选择上有何新困难？堆叠各指尖雅可比后，整体雅可比的零空间该如何利用？
+  \item \textbf{[设计]} 给 \cref{eq:tm-dexpilot} 的单阈值版本补上下双阈值，写出带状态变量的迟滞切换逻辑，并论证它消除了单阈值在临界距离处的抖动。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{离合与索引：有限工作空间下的能量记账}
+\label{sec:tm-clutch}
+
+\paragraph{动机：有限主端覆盖不了大从端。}
+任何主端设备的工作空间都有限。设主端是直径 $120\,$mm 的球形工作区、从端有效范围 $855\,$mm：$1{:}1$ 笛卡尔映射下操作者最多让从端动 $120\,$mm（不到 $14\%$）；即便 $\lambda_p=3$ 也只覆盖 $360\,$mm。更普遍地，\textbf{任何有限主端都无法靠纯缩放覆盖任意大的从端工作空间}。
+
+\begin{definition}[离合机制]\label{def:tm-clutch}
+离合（clutching）借鉴打字机“回车归位”：到行末推回滑架再续打。遥操作中，操作者按下离合键（脚踏/按钮/手势），从端\emph{冻结}于 $\mathbf{T}_s^{\text{frozen}}=\mathbf{T}_s^{\text{cur}}$，操作者把主端移回工作区中心（不影响从端），释放离合时\emph{更新参考偏置}，使
+\begin{equation}
+  \mathbf{x}_s^{\text{des}}(t)=\mathbf{x}_s^{\text{frozen}}+\lambda_p\big(\mathbf{x}_m(t)-\mathbf{x}_m^{\text{new\_center}}\big).
+  \label{eq:tm-clutch}
+\end{equation}
+对旋转的同类机制称\emph{索引}（indexing）：把 \cref{eq:tm-clutch} 换成 \cref{eq:tm-att-scale} 形式 $\mathbf{R}_s^{\text{des}}=\mathbf{R}_s^{\text{frozen}}\,\mathrm{Exp}\!\big(\lambda_R\,\mathrm{Log}((\mathbf{R}_m^{\text{new\_center}})^{-1}\mathbf{R}_m)\big)$。
+\end{definition}
+
+\begin{insight}[汽车离合器的类比：软切换]\label{ins:tm-softswitch}
+遥操作离合与汽车离合器同理：换挡时离合器\emph{逐渐}接合（半联动）而非瞬间切换，否则传动系统受冲击。遥操作离合释放也应“软切换”——用一段线性 ramp（如 $200\,$ms）从冻结过渡到跟踪，而非瞬间跳变。这既改善体感，也是下面能量记账的物理出口。
+\end{insight}
+
+\subsection{离合切换的能量问题}
+\label{sec:tm-clutch-energy}
+离合在能量层引入两个问题。\textbf{问题一：释放瞬间的位移阶跃。}释放时操作者未必精确回到中心，主端位置 $\mathbf{x}_m$ 与新参考 $\mathbf{x}_m^{\text{new\_center}}$ 间有偏差 $\Delta\mathbf{x}$。位置控制下，这个偏差被瞬时当作从端位置目标的阶跃——含\emph{无穷大瞬时功率}（离散系统里表现为一个采样周期内的大位移）。\textbf{问题二：离合期间力反馈断裂。}离合按下后从端冻结但能量观测器仍在跑，若期间主端运动产生力（重力补偿/回中力），这些力被记入能量预算，使释放后能量账面虚高，导致无源控制器（PC）该介入时不介入。
+
+\begin{theorem}[释放阶跃的储能与能量预算]\label{thm:tm-step-energy}
+设从端等效刚度 $K_p$，离合释放阶跃 $\Delta\mathbf{x}$。该阶跃在从端弹性元件中储存的能量为
+\begin{equation}
+  E_{\text{step}}=\tfrac12 K_p\,\|\Delta\mathbf{x}\|^2.
+  \label{eq:tm-estep}
+\end{equation}
+此能量必须计入 TDPA/能量罐的能量预算（\cref{thm:os-energytank}、\cref{ch:teleop-tdpa}）。
+\end{theorem}
+\begin{proof}
+线性弹性元件位移 $\mathbf{u}$ 的势能 $E(\mathbf{u})=\int_0^{\mathbf{u}}K_p\boldsymbol{\xi}\cdot d\boldsymbol{\xi}=\tfrac12 K_p\|\mathbf{u}\|^2$。阶跃使位移突变 $\Delta\mathbf{x}$，对应储能增量即 \cref{eq:tm-estep}。这部分能量在一个采样周期内被注入闭环，若超出能量观测器余额则破坏无源。
+\end{proof}
+
+\begin{note}[一次离合可能吃掉大半能量预算]
+取 $K_p=500\,$N/m、$\Delta\mathbf{x}=5\,$mm，则 $E_{\text{step}}=\tfrac12\times 500\times(0.005)^2=6.25\times10^{-3}\,$J。设 TDPA 的可用能量裕度为 $0.01\,$J\pz{此 $0.01\,$J 仅为说明用的示意数量级，非通用常数：TDPA/能量罐的能量阈值由采样周期、初始注能、控制器实现决定，依平台而异，文献未给统一典型值。}，则\textbf{一次离合切换就消耗约 $63\%$ 的预算}，连续两次快速切换即触发无源控制器介入。这定量地说明了“离合不更新参考点会跳、且会破坏无源”。
+\end{note}
+
+\begin{algo}[被动集位修正（PSPM）]\label{algo:tm-pspm}
+Lee 与 Huang（$2010$）的被动集位修正（passive set-position modulation）在离合释放瞬间执行（对接 \cref{ch:teleop-tdpa} 的能量观测器 $E_{\text{obs}}$）：
+\begin{enumerate}
+  \item 计算偏置跳变能量 $E_{\text{step}}=\tfrac12 K_p\|\Delta\mathbf{x}\|^2$（\cref{eq:tm-estep}）；
+  \item 检查能量预算是否充足：$E_{\text{obs}}>E_{\text{step}}$？
+  \item 若充足：\emph{直接}应用阶跃，并扣账 $E_{\text{obs}}\leftarrow E_{\text{obs}}-E_{\text{step}}$；
+  \item 若不足：用线性 ramp 替代阶跃，$\mathbf{x}_s^{\text{des}}(t)=\mathbf{x}_s^{\text{frozen}}+\frac{t-t_{\text{release}}}{T_{\text{ramp}}}\,\Delta\mathbf{x}$，取 $T_{\text{ramp}}=\max\!\big(0.1\,\text{s},\,E_{\text{step}}/P_{\max}\big)$ 使 ramp 期间最大功率不超预算（$P_{\max}=E_{\text{obs}}/T_{\min}$，$T_{\min}\approx0.1\,$s 为人体可接受的最短过渡）。
+\end{enumerate}
+本质：把“可能违反无源的阶跃”改造为“在能量预算内的渐变”，从而\emph{在离合切换全程保持无源}——这是 \cref{thm:os-energytank} 能量罐思想在切换场景的直接落地。
+\end{algo}
+
+\begin{pitfall}[陷阱：把离合只当“工作空间小的妥协”]
+即便主端工作空间足够大，离合仍有一个独立的重要用途——\textbf{暂停操作}。手术中医生需休息、讨论、查影像，离合提供安全的“暂停键”：从端静止，操作者可离开控制台。同构 leader-follower 系统靠主从物理断开实现这一点，双边遥操作则必须靠离合。\pz{存疑：“每分钟离合次数不超过 4 次”这一具体设计指南的来源（源讲义引 MacKenzie 2001 论频繁离合降效）。联网核实：I.\ Scott MacKenzie 确有 2001 年关于指点设备评估/控制—显示增益的工作（且 1994 年 \emph{Behaviour \& Information Technology} 有 control–display gain 一文），但其属人机交互指点设备领域，未见权威来源给出“每分钟 $\le 4$ 次离合”这一具体数值阈值、亦未见直接套用于遥操作离合；故保留存疑，该阈值宜视为经验性、依任务/设备而异。}
+\end{pitfall}
+
+\begin{practice}
+\begin{enumerate}
+  \item \textbf{[编程]} 在一个 $1$-DOF 主从仿真里实现离合：主端从左极限按下离合、移动、释放、再到右极限，验证从端可由 $x=0$ 走到 $x=1\,$m。对比有无离合的可达空间。
+  \item \textbf{[能量]} 沿 \cref{thm:tm-step-energy}，给定 $K_p$ 与一串离合释放偏差 $\{\Delta\mathbf{x}_k\}$，计算总注入能量并判断何时触发 PSPM 的 ramp 分支。
+  \item \textbf{[思考]} 手持式遥操作（操作者直接手持夹爪，不需离合，工作空间 $=$ 手臂可达约 $1.5\,$m 球）。若任务要求 $2\,$m$\times 2\,$m 桌面，操作者需\emph{走动}。从操作效率、数据质量、操作者疲劳三维度，对比“走动”与传统离合谁更优。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+本章把“人手运动 $\to$ 远端机器人”拆成三层不匹配并逐层解决。\textbf{尺度}：位置缩放 \cref{eq:tm-pos-scale} 带参考点对齐、速度缩放被 \cref{eq:tm-vel-scale} 锁定为同因子、力缩放 \cref{eq:tm-force-scale} 受能量一致条件 \cref{eq:tm-energy-cond} 约束（$\lambda_f=\lambda_p$，缩放即功率变换器）；“动作缩小 $+$ 触觉放大”须用主动增益 $g_h$ \cref{eq:tm-active-gain} 单独注能并配能量罐/TDPA。\textbf{结构}：姿态缩放在 $\SO(3)$ 切空间做（\cref{eq:tm-att-scale}，复用 \cref{ch:lie}）；映射在关节空间（同构，\cref{eq:tm-jointmap}）还是笛卡尔空间（异构 $+$ IK，\cref{eq:tm-cartmap}），是复杂性在硬件与软件间的分配，IK 须 warm-start 保连续、奇异处用 \cref{thm:ak-dls} 稳健化；人手到机器手用重定向（指尖/向量/DexPilot，\cref{eq:tm-tip,eq:tm-vec,eq:tm-dexpilot}），向量映射因平移不变 $+$ 尺度自适应而通用、捏取先验以迟滞防抖。\textbf{工作空间}：离合/索引（\cref{eq:tm-clutch}）扩展可达空间，释放阶跃储能 \cref{eq:tm-estep} 必须计入能量预算，PSPM（\cref{algo:tm-pspm}）把阶跃改造为预算内的渐变以保无源。
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\label{tab:tm-symbols}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\mathbf{x}_m,\mathbf{x}_s$ & 主端/从端末端位置 & \cref{eq:tm-pos-scale} \\
+$\mathbf{x}_m^{\text{ref}},\mathbf{x}_s^{\text{ref}}$ & 主端/从端参考点（origin） & \cref{eq:tm-pos-scale} \\
+$\lambda_p$ & 位置（$=$ 速度）缩放因子 & \cref{eq:tm-pos-scale} \\
+$\mathbf{f}_m,\mathbf{f}_s,\lambda_f$ & 主/从端力与力缩放因子 & \cref{eq:tm-force-scale} \\
+$P=\mathbf{f}^\top\mathbf{v}$ & 能量端口功率（承 \cref{eq:os-port-power}） & \cref{eq:tm-powers} \\
+$g_h$ & 主动触觉放大增益（$>1$，注能） & \cref{eq:tm-active-gain} \\
+$\lambda_R$ & 姿态缩放因子 & \cref{eq:tm-att-scale} \\
+$\mathbf{R}_m,\mathbf{R}_s$；$\mathrm{Exp},\mathrm{Log}$ & 主/从端姿态；$\so(3)\!\leftrightarrow\!\SO(3)$ 映射 & \cref{eq:tm-att-scale} \\
+$\mathbf{q}_s,\mathbf{q}_m,\mathbf{q}_{\text{offset}}$ & 从/主端关节角与零位偏置 & \cref{eq:tm-jointmap} \\
+$\mathbf{T}_s^{\text{des}},\mathbf{T}_{\text{offset}},\mathbf{T}_{\text{calib}}$ & 从端期望位姿/坐标变换/标定偏置 & \cref{eq:tm-cartmap} \\
+$\mathbf{p}_i^{\text{robot}},\mathbf{p}_i^{\text{human}}$ & 机器手/人手第 $i$ 指尖位置 & \cref{eq:tm-tip} \\
+$\mathbf{v}_{ij},s$ & 关键点间相对向量与全局尺度 & \cref{eq:tm-vec} \\
+$d_{\text{human}}$ & 人手两指尖检测距离 & \cref{eq:tm-dexpilot} \\
+$\Delta\mathbf{x},E_{\text{step}},K_p$ & 离合释放偏差/储能/从端刚度 & \cref{eq:tm-estep} \\
+$E_{\text{obs}},T_{\text{ramp}}$ & 能量观测器余额/软切换时长 & \cref{algo:tm-pspm} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\label{tab:tm-overview}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 运动缩放 & 位置缩放带参考点；速度缩放被锁定 & \(\bigstar\bigstar\) \\
+2 & 能量一致 & 缩放 $=$ 功率变换器，$\lambda_f=\lambda_p$ & \(\bigstar\bigstar\bigstar\) \\
+3 & 主动触觉 $g_h$ & “缩小 $+$ 放大”须单独注能，配能量罐/TDPA & \(\bigstar\bigstar\bigstar\) \\
+4 & 姿态缩放 & $\SO(3)$ 切空间 $\mathrm{Log}\!\to\!\times\lambda_R\!\to\!\mathrm{Exp}$ & \(\bigstar\bigstar\bigstar\) \\
+5 & 关节 vs 笛卡尔映射 & 复杂性在硬件/软件间分配；IK 连续性 & \(\bigstar\bigstar\bigstar\) \\
+6 & 手部重定向 & 指尖/向量/DexPilot；平移不变 $+$ 迟滞 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+7 & 离合/索引 $+$ 能量 & 扩展工作空间；$E_{\text{step}}$ 记账；PSPM & \(\bigstar\bigstar\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{本章与相邻章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+章节 & 关系 & 衔接点 \\
+\midrule
+\cref{ch:lie} 李群李代数 & 姿态缩放的数学地基 & $\mathrm{Exp}/\mathrm{Log}$、右扰动、Hamilton 四元数 \\
+\cref{ch:arm-kin} 机械臂运动学 & 笛卡尔映射的 IK 与奇异 & \cref{thm:ak-dls}、\cref{sec:ak-singularity,sec:ak-redundancy} \\
+\cref{ch:operational-space} 操作空间 & 能量端口与能量罐 & \cref{eq:os-port-power}、\cref{thm:os-energytank} \\
+\cref{ch:teleop-twoport} 二端口遥操作 & 缩放接入端口/混合参数 & 透明度、端口变量 \\
+\cref{ch:teleop-stability} 遥操作稳定性 & $\lambda_f\neq\lambda_p$ 的失稳 & Llewellyn 绝对稳定 \\
+\cref{ch:teleop-tdpa} TDPA & 离合能量记账、PSPM 落地 & 能量观测器/控制器 \\
+\cref{ch:arm-collision-safety} 碰撞与安全 & 异构映射下的从端安全 & 力限幅、可达性 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：离合释放后从端\emph{猛跳}。\textbf{排查}：参考点 $\mathbf{x}_m^{\text{ref}}/\mathbf{x}_s^{\text{ref}}$ 未随离合刷新（\cref{sec:tm-pvf} 陷阱）；改为释放瞬间 $\mathbf{x}_m^{\text{ref}}\!\leftarrow\!\mathbf{x}_m^{\text{cur}},\mathbf{x}_s^{\text{ref}}\!\leftarrow\!\mathbf{x}_s^{\text{frozen}}$，并按 \cref{algo:tm-pspm} 做软切换。
+  \item \textbf{症状}：硬接触时主从\emph{自激振荡}。\textbf{原因}：独立设了 $\lambda_f\neq\lambda_p$（\cref{thm:tm-power}）。\textbf{对策}：令 $\lambda_f=\lambda_p$；若确需放大触觉，用 $g_h$ 并配能量罐/TDPA（\cref{ch:teleop-tdpa}）。
+  \item \textbf{症状}：笛卡尔映射下从端\emph{帧间抖动/解跳分支}。\textbf{原因}：IK 初值不连续。\textbf{对策}：warm-start 用 $\mathbf{q}_{\text{prev}}$；自检帧间最大关节角变化 $<0.1\,$rad。
+  \item \textbf{症状}：从端在奇异附近\emph{速度爆炸/卡住}。\textbf{对策}：用阻尼最小二乘 \cref{thm:ak-dls} 替代纯伪逆；冗余从端把多余自由度送零空间（\cref{sec:ak-redundancy}）。
+  \item \textbf{症状}：姿态缩放后\emph{不是合法旋转}。\textbf{原因}：对四元数/旋转矩阵做了逐元素线性缩放。\textbf{对策}：改用切空间缩放 \cref{eq:tm-att-scale}（$\mathrm{Log}\to\times\lambda_R\to\mathrm{Exp}$）。
+  \item \textbf{症状}：捏取时机器手指尖\emph{反复打滑}。\textbf{原因}：检测噪声使指尖距在阈值附近抖动。\textbf{对策}：用 DexPilot 捏取先验 \cref{eq:tm-dexpilot} 二值化接触，并加上下双阈值迟滞（\cref{ins:tm-pinch}）。
+\end{enumerate}

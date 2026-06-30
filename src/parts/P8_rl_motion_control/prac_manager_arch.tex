@@ -1,0 +1,1392 @@
+\chapter{Manager-Based 架构精读：从 PPO 到 env.step}\label{ch:rlmc-manager}
+
+% ════════════════════════════════════════════════════════════════
+%  新部「强化学习运动控制」(P8_rl_motion_control) 的实战章。
+%  主线：算法/概念领路 —— 先讲「PPO 训练循环里 env.step() 在哪、它生产什么」，
+%  再把每个 MDP 组件落到三大框架的 Manager 实现上做对比实战。
+%  假定读者已修「强化学习理论部」(P6_rl)，不重教 PPO/GAE/AC 基础，聚焦扩展+hands-on。
+%  源稿 RL运控/Ch04_从PPO到env.step_Manager-Based架构精读.md，
+%  对 Isaac Lab / mjlab 关键 API、版本号、论文归属做了联网核对（见各 \rebuilt / \pz / \cite）。
+%  UniLab 对比槽位已据 commit 99936e08 实跑+读源补全（异构 CPU-sim + GPU-policy，
+%  关键洞察：UniLab 不是 Manager-Based，故其槽位写「第三种非 Manager-Based 架构」的真实对应，
+%  而非套用 ObservationManager/RewardManager 等类名）。
+% ════════════════════════════════════════════════════════════════
+
+强化学习理论部（见 \cref{ch:rl-ac}）把演员-评论家、策略梯度、广义优势估计讲成了一组\emph{数学对象}：策略 $\pi_\theta(a\mid s)$、价值函数 $V_w(s)$、优势 $\hat A_t$、目标函数 $J(\theta)$。本章要回答一个工程问题：当这些对象被真正放到一台仿真机器人上训练时，\textbf{算法循环每转一圈，究竟有谁、在什么时候、读了什么、写了什么}？这条「算法$\to$代码」的接缝，集中体现在一行调用上——\Verb[breaklines]|env.step(action)|。理解它内部发生了什么，就理解了整个 Manager-Based 架构的运行机制；理解不了它，你写的奖励项会莫名其妙地恒为零、你加的域随机化会悄悄不生效，而编译器和运行时\emph{都不会报错}。
+
+本章遵循全书「算法领路、实践兑现」的次序。每一节先立\emph{算法/概念主线}（这个 MDP 组件\emph{是什么}、它在 PPO 数据流里扮演什么角色、有哪些观测/奖励/事件），再在这条主线下排布\textbf{三大框架的对比实战}：mjlab（MuJoCo Warp 后端，Isaac Lab API 的轻量复刻\,\cite{mjlab2026}）、Isaac Lab（PhysX 后端，Manager-Based 架构的原型\,\cite{isaaclab2024}）、以及 UniLab（异构 CPU 仿真 + GPU 策略，\emph{非} Manager-Based 的第三种架构\,\cite{unilab2026}）。\textbf{算法是脊柱，三框架是肋骨}——本章的特别之处在于 UniLab 与前两者\emph{范式不同}，它把每个 MDP 组件的「Manager 化」与否本身变成了一个可讨论的设计变量（\cref{ins:rlmc-mgr-unilab}）。
+
+% ════════════════════════════════════════════════════════════════
+\section*{环境配置与版本兼容}
+\label{sec:rlmc-mgr-env}
+\addcontentsline{toc}{section}{环境配置与版本兼容}
+
+本章是\emph{源码精读+对比}章，不要求你立刻跑通完整训练，但所有时序、API、默认值都锚定到具体版本——版本不同，类名和默认参数会漂移。\cref{tab:rlmc-mgr-versions} 是本章的版本锚点；除非特别说明，正文一律以此为准。
+
+\begin{table}[ht]
+\centering
+\caption{本章版本锚点（API/时序/默认值的解释基准）}
+\label{tab:rlmc-mgr-versions}
+\small
+\begin{tabularx}{\linewidth}{@{}Llp{0.42\linewidth}@{}}
+\toprule
+组件 & 锚定版本 & 本章涉及内容 \\
+\midrule
+mjlab & 1.4.0（实测锚点；项目仍在快速迭代） & \Verb[breaklines]|ManagerBasedRlEnv|、九大 Manager、\verb|env.step()| 时序 \\
+Isaac Lab & 2.x（教学锚点；3.0 处于迁移期） & \Verb[breaklines]|ManagerBasedRLEnv|、对应 Manager API \\
+Isaac Lab 3.0 & Beta（差异以批注标注） & 数据管线返回类型变化、四元数约定变化（见 \cref{sec:rlmc-mgr-entity}） \\
+UniLab & commit \texttt{99936e08}（实跑锚点） & \textbf{非} Manager-Based：\texttt{NpEnv} 异构 CPU-sim 核、\texttt{update\_state} 一处算、Hydra 标量 reward、后端 \texttt{mujoco-uni}\,3.8.0 / \texttt{motrixsim-core}\,0.8.2 \\
+RSL-RL（包名 \texttt{rsl-rl-lib}，导入名 \texttt{rsl\_rl}） & $\ge 4.0$（教学锚点） & 分离 actor/critic 配置、自适应学习率、PPO 实现、VecEnv Wrapper \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{为什么版本号写得这么细。}mjlab 与 Isaac Lab 都把 MDP 组件的命名、默认值、甚至 \verb|env.step()| 的内部顺序当作\emph{实现细节}而非稳定 API——它们会随版本变。\rebuilt{本章给出的具体版本号为教学锚定值；落地时请以你机器上 \texttt{pip show} / 仓库 CHANGELOG 实测为准。}本章的价值不在「记住某个版本的某个数字」，而在「学会一套读源码、对时序、查默认值的方法」，使你换版本后能自行核对。
+
+\paragraph{分系统安装路线（概览）。}三套框架的安装路径差异极大，详尽步骤属于各自的「快速上手」章，此处只给最小骨架：
+
+\begin{itemize}
+  \item \textbf{mjlab}（Linux / macOS，纯 Python + Warp，最轻）：依赖 \verb|mujoco-warp| 与一块支持 CUDA 的 GPU；官方推荐用 \verb|uv| 管理虚拟环境，安装后以 \Verb[breaklines]|uv run train <TASK>| 启动\,\cite{mjlab2026}。
+  \item \textbf{Isaac Lab}（Linux 为主，Windows 部分支持）：依赖 NVIDIA Isaac Sim（Omniverse 平台），体量大、对驱动版本敏感；训练入口形如 \Verb[breaklines]|python scripts/reinforcement_learning/rsl_rl/train.py --task <TASK>|\,\cite{isaaclab2024}。
+  \item \textbf{UniLab}（异构：CPU 物理 + GPU 策略，Linux CUDA/ROCm/XPU 或 Apple Silicon 多套路径）：\textbf{不}依赖 Isaac Sim、也\textbf{不}依赖 GPU 仿真后端（这与前两者根本不同），物理跑 CPU（核越多越好）、策略学习需一块 GPU/MPS。官方推荐 \verb|uv| 工作流：\Verb[breaklines]|git clone .../UniLab && cd UniLab|，再 \Verb[breaklines]|uv sync --extra mujoco|（MuJoCoUni 后端）或 \Verb[breaklines]|uv sync --extra motrix|（MotrixSim 后端）；训练入口形如 \Verb[breaklines]|uv run train --algo ppo --task <TASK> --sim mujoco|。首跑会从 HuggingFace 拉取资产，国内网络需先 \texttt{export HF\_ENDPOINT=https:/\allowbreak /\allowbreak hf-mirror.\allowbreak com} 走镜像。
+\end{itemize}
+
+\begin{note}[本章不需要 GPU 也能学]
+即便你暂时没有可跑训练的 GPU，本章的\emph{源码精读}部分（\verb|env.step()| 18 步时序、Manager 加载顺序、各 Manager 的 \verb|compute()| 逻辑）完全可以离线阅读。建议你 \Verb[breaklines]|git clone| 三套框架的源码（哪怕不安装），对照本章逐处跳转——\textbf{读源码本身就是本章最重要的练习}。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{Quick Start：5 分钟看清一次 env.step}
+\label{sec:rlmc-mgr-quickstart}
+\addcontentsline{toc}{section}{Quick Start：5 分钟看清一次 env.step}
+
+在深入之前，先用一段最小代码建立直觉：PPO 的训练循环本质上就是「反复调用 \verb|env.step()| 收数据、再用数据更新网络」。下面这段伪代码可直接对照任意 RSL-RL 训练日志理解（它不是某个框架的可运行脚本，而是\emph{所有} Manager-Based + RSL-RL 训练共有的骨架）：
+
+\begin{codebox}[Python]{PPO 训练循环骨架:env.step() 是数据生产者}
+# 这是 RSL-RL OnPolicyRunner.learn() 的概念骨架（非逐行源码）
+for iteration in range(max_iterations):
+    # ===== 阶段一 Rollout:每步调用一次 env.step()，收集 transition =====
+    for step in range(num_steps_per_env):
+        actions = actor.act(obs)                      # 策略前向:obs -> action
+        obs, reward, terminated, truncated, info = env.step(actions)
+        storage.add(obs, actions, reward, terminated, truncated)
+
+    # ===== 阶段二 Update:不调用 env.step()，只算梯度 =====
+    advantages = compute_gae(storage, gamma, lam)     # 广义优势估计
+    for epoch in range(num_epochs):
+        for mb in storage.iterate(num_mini_batches):
+            loss = ppo_clip_loss(mb, advantages, clip_range)
+            optimizer.step(loss)
+\end{codebox}
+
+读完这段，你应当能立刻回答三个问题：(1) \verb|env.step()| 只在 rollout 阶段被调用，update 阶段不调用；(2) 一次训练里它被调用 $\text{max\_iterations}\times\text{num\_steps\_per\_env}$ 次；(3) 它的输出 \Verb[breaklines]|(obs, reward, terminated, truncated)| 正是 PPO 的全部「原料」。\textbf{本章其余部分，都是在放大} \verb|env.step()| \textbf{这一行内部的世界}。
+
+\begin{note}[GAE 与 PPO clip 不在本章重述]
+本章假定你已在理论部（\cref{ch:rl-ac}）掌握 GAE、PPO clip 目标、自适应学习率的\emph{数学原理}。这里只关心它们如何与 \verb|env.step()| 的输出对接（如 \verb|terminated| / \verb|truncated| 如何影响 GAE 的 bootstrap）。需要复习公式请回 \cref{ch:rl-ac} 与该部的策略梯度章。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section*{前置自测}
+\label{sec:rlmc-mgr-selftest}
+\addcontentsline{toc}{section}{前置自测}
+
+\begin{practice}[前置自测：答错 $\ge 2$ 题，先回对应章节再读本章]
+\begin{enumerate}
+  \item PPO 的训练循环分哪两个阶段？每个阶段对 \verb|env.step()| 的调用模式有何不同？（答错回\cref{ch:rl-ac} 与策略梯度章）
+  \item \verb|env.step()| 返回的 \verb|terminated| 与 \verb|truncated| 有何本质区别？为什么 PPO 必须区分二者？（答错回 \cref{ch:rl-ac} 价值自举部分与本章 \cref{sec:rlmc-mgr-ppo}）
+  \item actor 观测与 critic 观测为什么\emph{可以}不同？这不破坏部署吗？（答错回 \cref{ch:rlmc-obsact} 非对称演员-评论家一节）
+  \item 一个 MDP 由哪几个组件构成（状态/动作/转移/奖励/折扣）？（答错回理论部 MDP 章）
+  \item 「策略频率」与「物理频率」为什么要解耦？（答错回 \cref{sec:rlmc-mgr-step} decimation 一节，本章会讲）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章目标}
+\label{sec:rlmc-mgr-goals}
+\addcontentsline{toc}{section}{本章目标}
+
+学完本章，你应当能够（每条都可\emph{客观检验}）：
+
+\begin{enumerate}
+  \item \textbf{画出} PPO 训练循环的完整数据流，并准确\textbf{标注} \verb|env.step()| 在循环中的位置（rollout 内、每步一次）；
+  \item \textbf{复述} mjlab \verb|env.step()| 的内部时序（含 decimation 子循环、termination/reward/reset/observation 的相对顺序），并解释每个相对顺序背后的\emph{工程理由}；
+  \item \textbf{对比} legged\_gym 单体架构与 Manager-Based 架构在「加一条奖励项」「换一台机器人」上的具体差异；
+  \item \textbf{翻译} mjlab 与 Isaac Lab 的 Manager API（如终止项全名 \Verb[breaklines]|TerminationTermCfg| 与 Isaac Lab 常用别名 \verb|DoneTerm| 的对应、obs 组名 \verb|actor| $\leftrightarrow$ \verb|policy|），在两个框架间无障碍切换；
+  \item \textbf{配置}并\textbf{调通}一个自定义 \verb|ObsTerm| 或 \verb|RewTerm|，加入现有 velocity 任务，并验证其在训练日志中出现且数值非零；
+  \item \textbf{定位} Manager 加载顺序或 sensor 接线（wiring）错误导致的「能跑但不学习」问题。
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════
+\section*{知识导航与前置桥接}
+\label{sec:rlmc-mgr-nav}
+\addcontentsline{toc}{section}{知识导航与前置桥接}
+
+\begin{figure}[ht]
+\centering
+\begin{forest} navtreeLR
+[{Manager-Based 架构精读\\（算法领路，三框架对比）}
+  [{PPO 与 env.step 接口\\rollout/update 两阶段}
+    [{terminated vs truncated}] ]
+  [{env.step 内部时序\\decimation 子循环}
+    [{六个时序洞察}] ]
+  [{Manager 模式动机\\单体 vs 解耦}
+    [{加载序 $\ne$ 运行序}] ]
+  [{各 Manager 对比实战\\Obs/Reward/Action}
+    [{Term/Event/Command}] ]
+  [{Entity 数据源\\Entity vs Articulation}
+    [{机体系 vs 世界系}] ]
+  [{接线诊断\\能跑但不学习}
+    [{regex 静默失效}] ]
+]
+\end{forest}
+\caption{本章知识导航：以 PPO–env.step 接口为根，逐层展开到每个 Manager 的对比实战。}
+\label{fig:rlmc-mgr-navtree}
+\end{figure}
+
+\paragraph{前置桥接（两段重述前章）。}本章紧接 \cref{ch:rlmc-obsact}（观测与动作空间设计）。在那一章你已经知道：观测分四族（本体感知 / 外部感知 / 命令 / 特权），actor 只看部署可得信号、critic 可看特权信号；动作有关节位置 / 速度 / 力矩 / 微分逆运动学四种抽象层次。本章把视角从「观测/动作\emph{是什么}」抬高到「\emph{所有} MDP 组件如何被一个统一的 Manager 体系编排、并在 \verb|env.step()| 里按精确时序执行」——\Verb[breaklines]|ObservationManager| 与 \verb|ActionManager| 只是九大 Manager 中的两个。
+
+同时本章是后续每个「单组件深挖」章的\textbf{骨架}：奖励塑形章会深入 \verb|RewardManager|，域随机化章会深入 \verb|EventManager|，训练管线章会深入 RSL-RL 的 PPO 调参。你在那些章里若问「这个修改该放在哪个 Manager」，答案都来自本章的加载顺序表（\cref{tab:rlmc-mgr-loadorder}）与时序表（\cref{tab:rlmc-mgr-step18}）。
+
+\paragraph{阅读时间。}精读（含源码跳转与练习）约 5--6 小时；速读（已有 Isaac Lab 经验，重点看 mjlab 差异）约 2--3 小时；速查（只看时序表与 API 对照表）约 45 分钟。
+
+% ════════════════════════════════════════════════════════════════
+\section{算法主线：PPO 训练循环与 env.step 的接口}
+\label{sec:rlmc-mgr-ppo}
+
+\subsection{模块功能与在管线中的位置}
+
+PPO（proximal policy optimization\,\cite{schulman2017ppo}）几乎是腿足 locomotion 的默认算法。本节\emph{不}推导 PPO——理论部已讲——只确立一个工程事实：在 Manager-Based + RSL-RL 的实现里，\verb|env.step()| 是训练循环的\textbf{数据生产者}，PPO 算法是\textbf{数据消费者}。这条生产者-消费者关系是理解后续一切 Manager 时序的前提。
+
+PPO 训练循环交替执行两个阶段（已在 Quick Start 的骨架中给出）：
+
+\begin{itemize}
+  \item \textbf{Rollout（数据收集）}：循环 \Verb[breaklines]|num_steps_per_env| 步，每步「策略前向 $\to$ \verb|env.step()| $\to$ 存 transition」。env 的\emph{所有} Manager 在每步 rollout 时被执行一次。
+  \item \textbf{Update（梯度更新）}：用收集到的数据计算 GAE，再做若干 epoch 的 mini-batch 梯度更新。此阶段\emph{不}调用 \verb|env.step()|，env 状态冻结。
+\end{itemize}
+
+\begin{insight}[env.step 是数据工厂，PPO 是消费者]\label{ins:rlmc-mgr-producer}
+把握这个分工，后续许多设计取舍就顺理成章了。env.step() 在 GPU 上\emph{并行}生产 $\text{num\_envs}$ 条 $(o,a,r,\text{done})$ 记录（如 4096 个环境同时步进），PPO 从这批记录里提取梯度信号。两者频率截然不同：env.step() 以策略频率（如 50\,Hz）被调用，而 PPO 的 update 大约以 $1/\text{num\_steps\_per\_env}$ 的频率发生——远低于 env.step()。所以\emph{优化 env.step() 的吞吐与正确性}，比优化 PPO 内核更影响整体训练效率。
+\end{insight}
+
+\subsection{为什么 locomotion 几乎总用 PPO（动机与反面）}
+
+\paragraph{动机。}PPO 在腿足任务上的统治地位有三个工程原因。其一，\textbf{on-policy 稳定性}：locomotion 的奖励分布在训练中剧烈漂移（从「倒地」到「站立」到「行走」），off-policy 算法（如 SAC）的回放缓冲里塞满旧策略数据，这些「过时样本」会让 $Q$ 函数学到错误估值；PPO 每次只用最新策略的数据，规避了这个问题。其二，\textbf{GPU 并行友好}：rollout 只需策略网络前向，能在 GPU 上高效批处理，数据收集与梯度更新完全分离。其三，\textbf{超参少而直观}：核心超参约五个（\verb|learning_rate|、\verb|gamma|、\verb|lam|、\verb|clip_param|、\verb|desired_kl|），都有明确物理含义。
+
+\paragraph{反面（反事实推理）。}如果 locomotion 的奖励分布是\emph{稳定}的（如经典控制的 CartPole），off-policy 的样本复用优势会更明显——每条 transition 可被反复使用。但 locomotion 的奖励变化太快：上一分钟的「好数据」（站立）在下一分钟可能是「坏数据」（因为此刻该学走路了）。近期已有为腿足 locomotion 适配的高性能 SAC 实现：RSL-RL 的 SAC 扩展（RSL-RL-SAC）经策略初始化、超时感知的 critic target、多步回报估计三处针对性改造，在多平台多任务上\emph{完全追平}了 PPO\,\cite{sabatini2026sac}——这表明「locomotion 必用 PPO」并非铁律（本书后续算法选型章会展开）。在操作（manipulation）任务里，SAC 或扩散策略常更合适——这也是 Isaac Lab 支持多种 RL 后端的原因。
+
+\subsection{配置详解：RSL-RL 的 PPO 超参（四维表）}
+
+\cref{tab:rlmc-mgr-ppohyper} 列出 RSL-RL 中 PPO 的主要可调超参。每个超参从「默认值来源 / 修改影响 / 合理范围 / 与其他配置的耦合」四个维度理解，而非死记数字。
+
+\begin{table}[ht]
+\centering
+\caption{RSL-RL PPO 主要超参（四维解读，锚定 \texttt{rsl\_rl} $\ge 4.0$）}
+\label{tab:rlmc-mgr-ppohyper}
+\footnotesize
+\begin{tabular}{@{}lp{0.12\linewidth}p{0.24\linewidth}p{0.16\linewidth}p{0.2\linewidth}@{}}
+\toprule
+超参 & 典型默认 & 修改影响 & 合理范围 & 耦合 \\
+\midrule
+\verb|learning_rate| & $10^{-3}$ & 太大策略震荡，太小收敛慢 & $10^{-4}\!\sim\!10^{-3}$ & 被 \verb|desired_kl| 自适应调整 \\
+\verb|gamma| & 0.99 & 减小更关注短期奖励 & $0.97\!\sim\!0.995$ & 与 episode 长度、控制频率 \\
+\verb|lam| & 0.95 & 减小偏 TD(0)，增大偏 MC & $0.9\!\sim\!0.97$ & 与 \verb|gamma| 共同定 GAE 偏差-方差 \\
+\verb|clip_param| & 0.2 & 限制单步策略更新幅度 & $0.1\!\sim\!0.3$ & 与 lr、\verb|desired_kl| \\
+\verb|desired_kl| & 0.01 & 自适应 lr 的目标 KL & $0.005\!\sim\!0.02$ & 直接驱动 lr 调整 \\
+\Verb[breaklines]|num_steps_per_env| & 24 & 太短 GAE 不准，太长占显存 & $16\!\sim\!64$ & 与 \verb|num_envs|、\Verb[breaklines]|num_mini_batches| \\
+\Verb[breaklines]|num_mini_batches| & 4 & 切分 rollout 数据 & 2$\sim$8 & 须整除 $\text{num\_envs}\!\times\!\text{steps}$ \\
+\Verb[breaklines]|num_learning_epochs| & 5 & 太多过拟合旧数据 & 3$\sim$8 & 与 \verb|clip_param| \\
+\verb|entropy_coef| & 0.01 & 大则鼓励探索 & $0\!\sim\!0.02$ & 与 \Verb[breaklines]|init_noise_std| \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{$\gamma$ 与有效视野。}$\gamma=0.99$ 的「有效视野」约 $1/(1-\gamma)=100$ 步——在 50\,Hz 控制频率下约 2 秒。对四足行走，2 秒内的奖励信号足以学会稳定步态。若用 $\gamma=0.999$（有效视野 1000 步 $=20$ 秒），策略要考虑更长远的回报，但 locomotion 的奖励短时间就能给出充分反馈，过长视野只增加方差、拖慢训练。\textbf{这就是为什么 locomotion 用 0.99 而非 0.999}。
+
+\paragraph{自适应学习率机制。}RSL-RL 的一个关键工程特性：根据每次 update 实测的 KL 散度自动调 lr。其逻辑形如「KL 超过目标的某倍则调小 lr，KL 低于目标的某分数则调大 lr」，使你可以用一个偏大的初始 lr 让库自行收敛。
+
+\begin{codebox}[Python]{RSL-RL 自适应学习率（概念示意，具体倍率以所用版本源码为准）}
+# 不同版本的倍率/夹断阈值会变;以 rsl_rl 的 algorithms/ppo.py 实测为准
+if kl > 2.0 * desired_kl:
+    learning_rate = max(1e-5, learning_rate / 1.5)   # KL 太大 -> 收紧步长
+elif kl < 0.5 * desired_kl and kl > 0.0:
+    learning_rate = min(1e-2, learning_rate * 1.5)   # KL 太小 -> 放宽步长
+\end{codebox}
+
+\rebuilt{上面 2.0 / 0.5 / 1.5 等倍率与 $[10^{-5},10^{-2}]$ 夹断区间为源稿给出的示意值，跨版本可能不同；务必对照你所用 \texttt{rsl\_rl} 版本的 \texttt{ppo.py} 核实。}
+
+\subsection{\texorpdfstring{代码走读：actor/critic 分离配置（rsl\_rl $\ge 4.0$）}{代码走读：actor/critic 分离配置（rsl\_rl >= 4.0）}}
+
+\verb|rsl_rl| 从 4.0 起把 actor 与 critic 的网络配置\textbf{拆分}为独立的 model config。这允许 actor 用 MLP、critic 用 CNN（即非对称演员-评论家，见 \cref{ch:rlmc-obsact} 与 \cref{ins:rlmc-mgr-asym}），是视觉策略与教师-学生蒸馏的工程基础。
+
+\begin{codebox}[Python]{mjlab velocity 任务的 RSL-RL 配置（结构示意;类名以版本为准）}
+def unitree_go1_rl_cfg():                        # mjlab 有 G1/Go1，无 Go2
+    return RslRlOnPolicyRunnerCfg(
+        max_iterations=10_000,                  # 按任务定（mjlab 1.4.0 Go1 实测 10_000;并非固定 1500）
+        num_steps_per_env=24,                   # rollout 长度
+        # rsl_rl >= 4.0 / mjlab:actor / critic 各自独立的网络配置（RslRlModelCfg）
+        actor=RslRlModelCfg(hidden_dims=[512, 256, 128], activation="elu",
+                            obs_normalization=True),
+        critic=RslRlModelCfg(hidden_dims=[512, 256, 128], activation="elu",
+                             obs_normalization=True),
+        algorithm=RslRlPpoAlgorithmCfg(
+            learning_rate=1e-3, gamma=0.99, lam=0.95, desired_kl=0.01,
+            clip_param=0.2, entropy_coef=0.01,
+            num_mini_batches=4, num_learning_epochs=5,
+            value_loss_coef=1.0, max_grad_norm=1.0, init_noise_std=1.0,
+        ),
+        experiment_name="go1_velocity", logger="wandb",
+    )
+\end{codebox}
+
+\textbf{已据 mjlab 1.4.0 实测核实}（G1/Go1 velocity \texttt{rl\_cfg.py}）：网络配置类为 \texttt{RslRlModelCfg}（actor/critic 分开）、算法配置类为 \texttt{RslRlPpoAlgorithmCfg}、runner 配置为 \texttt{RslRlOnPolicyRunnerCfg}（mjlab 自带 runner 类 \texttt{MjlabOnPolicyRunner}）；上面超参（\texttt{hidden\_dims}/\allowbreak\texttt{activation}/\allowbreak\texttt{clip\_param}/\allowbreak\texttt{entropy\_coef}/\allowbreak\texttt{num\_learning\_epochs}/\allowbreak\texttt{num\_mini\_batches}/\allowbreak\texttt{lr}/\allowbreak\texttt{desired\_kl}/\allowbreak\texttt{num\_steps\_per\_env}）均与实测一致，且字段名确为 \texttt{num\_learning\_epochs}/\allowbreak\texttt{clip\_param}（不是 \texttt{num\_epochs}/\allowbreak\texttt{clip\_range}），仅 \texttt{max\_iterations} 按任务定（mjlab 1.4.0 的 Go1 实测为 \texttt{10\_000}）。actor/critic 配置拆分这一形态自 \texttt{rsl-rl-lib} 4.0.0 起引入（此前用统一的 \texttt{RslRlPpoActorCriticCfg}）。\pz{Isaac Lab 侧的确切配置类与 import 路径随其捆绑的 rsl-rl 版本而变，以你所装版本为准。}
+
+\begin{insight}[\texttt{max\_iterations} 这种「实测锚点」务必自己复核——别把书里的数字当真理]\label{ins:rlmc-mgr-recheck}
+本书把 \texttt{max\_iterations=10\_000} 标成「实测值」，但它\emph{每个版本、每个任务都会漂移}（早期 mjlab 文档里曾是别的数）。\textbf{与其背这个数，不如学会一行自查}——打开你这台机器上对应任务的 \texttt{rl\_cfg.py}（mjlab 在 \texttt{src/\allowbreak mjlab/\allowbreak tasks/\allowbreak velocity/\allowbreak config/\allowbreak go1/\allowbreak rl\_cfg.\allowbreak py}），直接读 \texttt{max\_iterations=}；或不开源码，用一行命令把当前生效值打出来：
+\begin{codebox}[bash]{自查任意 mjlab 任务的 max\_iterations（不靠记忆、不翻源码）}
+# mjlab 装好后即有 train/play 控制台脚本，--help 会把所有可覆盖项连默认值列出
+mjlab train Mjlab-Velocity-Flat-Unitree-Go1 --help | grep -i max-iterations
+# 预期形如: --agent.max-iterations INT  (default: 10000)
+\end{codebox}
+\noindent 把这套「书给方向、机器给真值」的习惯用在本章\emph{每一个}带具体数字的断言上（默认超参、obs 维度、版本号），你就不会被某一版的过时数字误导。
+\end{insight}
+
+\paragraph{三框架对比：PPO 后端从哪来。}
+\begin{itemize}
+  \item \textbf{mjlab}：直接使用 RSL-RL 作为 PPO 后端，配置以函数工厂返回 \Verb[breaklines]|RslRlOnPolicyRunnerCfg| 实例\,\cite{mjlab2026,schwarke2025rslrl}。
+  \item \textbf{Isaac Lab}：同样以 RSL-RL 为主力后端（也支持 SKRL、rl\_games 等），配置以 \verb|@configclass| 类组织\,\cite{isaaclab2024}。
+  \item \textbf{UniLab}：PPO \textbf{同样复用 RSL-RL} 的 \Verb[breaklines]|OnPolicyRunner|，但用自定义的 \Verb[breaklines]|FinalObservationAwarePPO|（在 \texttt{algos/\allowbreak torch/\allowbreak rsl\_rl\_ppo.\allowbreak py} 的同名类，UniLab commit \texttt{99936e08}）以正确处理终止帧的 bootstrap 观测；配置不是 \verb|@configclass| 而是 typed dataclass \verb|PPOConfig|（在 \texttt{structured\_configs.\allowbreak py}），经 Hydra/OmegaConf 组合；CLI 入口 \Verb[breaklines]|train --algo ppo|，超参走 Hydra 覆盖（如 \Verb[breaklines]|algo.num_envs=4096 algo.max_iterations=300|）。除 PPO 外 UniLab 还把 \textbf{APPO（异步 PPO）/ SAC / TD3 / FlashSAC 列为一等公民}（off-policy 经共享内存 \verb|ReplayBuffer|），这是其异构 collector-learner 架构的直接产物。
+\end{itemize}
+
+\subsection{RSL-RL VecEnv Wrapper：terminated/truncated 的关键处理}
+\label{sec:rlmc-mgr-wrapper}
+
+\verb|env.step()| 返回的是 Manager-Based 环境的\emph{原始}输出：观测字典、奖励张量、\verb|terminated| 张量、\verb|truncated| 张量、extras 字典。RSL-RL 需要的是简化格式，\Verb[breaklines]|RslRlVecEnvWrapper| 负责适配。其中最关键的一步是对两种「回合结束」的区分处理（\cref{tab:rlmc-mgr-wrapper}）。
+
+\begin{table}[ht]
+\centering
+\caption{RslRlVecEnvWrapper 的 terminated/truncated 适配}
+\label{tab:rlmc-mgr-wrapper}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\verb|env.step()| 输出 & RSL-RL 需要 & Wrapper 处理 \\
+\midrule
+\verb|obs["actor"]|（mjlab）/ \verb|obs["policy"]|（Isaac Lab） & actor 网络输入 & 按 \verb|obs_groups| 映射 \\
+\verb|obs["critic"]| & critic 网络输入 & 存在则映射给 critic \\
+\verb|reward| & \verb|rewards| & 直接传递 \\
+\verb|terminated| \verb!|! \verb|truncated| & \verb|dones| & 合并为单个 bool 张量 \\
+\Verb[breaklines]|extras["time_outs"]| & \Verb[breaklines]|infos["time_outs"]| & 用于价值自举（bootstrap） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[terminated 与 truncated 必须分开传，否则 GAE 算错]\label{ins:rlmc-mgr-term}
+\Verb[breaklines]|terminated=True| 表示「任务真正失败」（如机器人摔倒），其终止状态的价值应取 0（没有未来回报可期）。\Verb[breaklines]|truncated=True| 表示「超时截断」（回合达到最大步数），其状态价值应做\emph{自举} $V(s_{\text{end}})$（任务并未真正结束，只是人为截断）。若 Wrapper 不区分二者、把所有结束都按 terminated 处理，策略会学到「越接近 episode 末尾价值越低」，从而在末尾做不自然的「最后冲刺」，而非持续稳定运动。\textbf{这是腿足训练里一个高发且隐蔽的正确性陷阱}——它不报错，只是让策略行为变怪。这条数学依据见理论部 GAE 的自举推导（\cref{ch:rl-ac}）。
+\end{insight}
+
+\subsection{运行验证：看哪些日志}
+
+启动训练后，按 \cref{tab:rlmc-mgr-ppolog} 看 WandB（或 TensorBoard）的关键曲线判断 PPO 是否健康。这些曲线在后续每一节排错时都会反复用到。
+
+\begin{table}[ht]
+\centering
+\caption{PPO 训练健康度的关键日志}
+\label{tab:rlmc-mgr-ppolog}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+日志项 & 正常表现 & 异常信号 \\
+\midrule
+\Verb[breaklines]|Episode_Reward/<term>| & 至少 tracking 项在涨 & 全部为零 $\Rightarrow$ sensor 接线问题 \\
+KL divergence & 约 $0.005\!\sim\!0.03$ & $>0.1$ $\Rightarrow$ lr 太大 \\
+entropy & 缓慢下降 & 骤降 $\Rightarrow$ 策略过早坍缩 \\
+value loss & 逐步下降 & 突增 $\Rightarrow$ critic 不准 \\
+episode length & 逐步增加 & 不增 $\Rightarrow$ termination 太严 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{pitfall}[把 num\_steps\_per\_env 设得过大]
+\textbf{错误描述}：为「让 GAE 更准」把 \Verb[breaklines]|num_steps_per_env| 设到 256 甚至更大。\textbf{现象后果}：GPU 显存被 rollout storage 占满——$4096\times256$ 条 obs/action/reward 需要数 GB 显存，留给物理仿真的显存骤减，甚至 OOM。\textbf{根本原因}：rollout storage 大小正比于 $\text{num\_envs}\times\text{num\_steps\_per\_env}\times\text{obs\_dim}$。\textbf{正确做法}：从 24 起步；要增大「有效 batch」优先加 \verb|num_envs| 而非 steps。
+\end{pitfall}
+
+\begin{pitfall}[在 env.step 内部假设「当前在 rollout 阶段」]
+\textbf{错误描述}：在某个 Manager 的回调里写「如果当前是 rollout 就 \dots」。\textbf{现象后果}：行为依赖外部训练阶段，难以复现、迁移即崩。\textbf{根本原因}：Manager 的设计契约是\emph{无状态纯函数}（给定输入产生确定输出），它根本不该知道外部处于哪个阶段。\textbf{正确做法}：让所有 term 只依赖 \verb|env| 的当前物理状态。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[动手]} 在你能访问的任一框架日志里，找出 \verb|num_envs|、\Verb[breaklines]|num_steps_per_env|、\Verb[breaklines]|num_mini_batches|，验证 $\text{num\_envs}\times\text{num\_steps\_per\_env}$ 能被 \Verb[breaklines]|num_mini_batches| 整除。\emph{验收}：写出三个数与商。
+  \item \textbf{[推理]} 若 \verb|num_envs=4096|、\Verb[breaklines]|num_steps_per_env=24|、\Verb[breaklines]|num_mini_batches=4|，每个 mini-batch 多少条 transition？\emph{验收}：给出 $4096\times24/4=24576$ 并解释。
+  \item \textbf{[设计]} 设计一个实验，验证「不区分 terminated/truncated 会让策略在 episode 末尾行为变怪」。\emph{验收}：写出你会观察哪条曲线、预期差异是什么。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{env.step 内部时序精读}
+\label{sec:rlmc-mgr-step}
+
+\subsection{模块功能与在管线中的位置}
+
+\cref{sec:rlmc-mgr-ppo} 告诉我们「\verb|env.step()| 每步被调一次」。本节放大这一行：它内部是一段精确排序的执行序列，每一步都有明确工程理由。\textbf{这段时序是理解所有 Manager 交互的关键}——它决定了你的 obs/reward/event 函数究竟读到「哪一帧」的数据。
+
+\subsection{配置详解：mjlab 的内部时序（18 步）}
+\label{sec:rlmc-mgr-step18}
+
+\cref{tab:rlmc-mgr-step18} 是 mjlab \Verb[breaklines]|ManagerBasedRlEnv.step()| 的执行序列。\rebuilt{这是据 mjlab 1.4.0 \texttt{manager\_based\_rl\_env.\allowbreak py} 整理的「18 步」教学划分；具体步数与拆分粒度随版本变，请以你机器上的源码为准——本表的价值在相对顺序，而非「恰好 18」这个数字。}
+
+\begin{table}[ht]
+\centering
+\caption{mjlab env.step() 内部时序（相对顺序为重点；步号为教学划分）}
+\label{tab:rlmc-mgr-step18}
+\footnotesize
+\begin{tabular}{@{}clll@{}}
+\toprule
+步 & 操作 & 代码入口（示意） & 说明 \\
+\midrule
+1 & 清空 extras 日志 & \Verb[breaklines]|extras["log"] = {}| & 每步重收日志 \\
+2 & 处理 action & \Verb[breaklines]|action_manager.process_action| & raw $\to$ scaled/clipped \\
+3--7 & \textbf{decimation 子循环} & \Verb[breaklines]|for _ in range(decimation)| & 物理子步 \\
+3 & \quad 应用 action & \Verb[breaklines]|action_manager.apply_action| & 经 actuator 算力矩 \\
+4 & \quad 写入仿真 & \Verb[breaklines]|scene.write_data_to_sim| & 控制信号 $\to$ \verb|MjData.ctrl| \\
+5 & \quad 物理步进 & \verb|sim.step()| & MuJoCo Warp 推进一个 \verb|physics_dt| \\
+6 & \quad 更新场景 & \verb|scene.update| & 同步 GPU buffer \\
+7 & \quad 子步指标 & \Verb[breaklines]|metrics_manager.compute_substep| & 记子步级指标 \\
+8 & episode 计数 & \Verb[breaklines]|episode_length_buf += 1| & 增回合步数 \\
+9 & 计算 termination & \Verb[breaklines]|termination_manager.compute| & 判是否终止 \\
+10 & 计算 reward & \Verb[breaklines]|reward_manager.compute(dt)| & 加权 reward \\
+11 & 计算 step 指标 & \Verb[breaklines]|metrics_manager.compute| & 记 step 级指标 \\
+12 & reset 终止的环境 & \Verb[breaklines]|_reset_idx(env_ids)| & auto-reset \\
+12a & \quad curriculum 更新 & \Verb[breaklines]|curriculum_manager.compute| & 调难度 \\
+12b & \quad reset 级 event & \Verb[breaklines]|event_manager.apply("reset")| & reset DR \\
+13 & 刷新派生量 & \verb|sim.forward()| & 更新接触力等 \\
+14 & 更新 command & \Verb[breaklines]|command_manager.compute(dt)| & 重采样/更新命令 \\
+15 & step/interval event & \Verb[breaklines]|event_manager.apply("step/interval")| & 周期事件（如推力） \\
+16 & 刷新传感器 & \verb|sim.sense()| & 更新 sensor data \\
+17 & 计算 observation & \Verb[breaklines]|observation_manager.compute| & 算并返回 obs dict \\
+18 & 记录 & \Verb[breaklines]|recorder_manager.record_post_step| & 录制 rollout \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{代码走读：decimation 子循环}
+
+步骤 3--7 是 decimation 子循环——它在\emph{一个} policy step 内执行多次物理步进，这是「策略频率」与「物理频率」解耦的核心机制。
+
+\begin{codebox}[Python]{decimation 子循环（伪代码，对应表中步骤 2--7）}
+processed_action = action_manager.process_action(raw_action)  # 步骤2:一次性处理
+
+for substep in range(decimation):          # 步骤3-7:循环 N 次
+    action_manager.apply_action()          # 步骤3:每个 substep 应用同一个 processed_action
+    scene.write_data_to_sim()              # 步骤4:力矩写入 MuJoCo
+    sim.step(render=False)                  # 步骤5:物理引擎推进一个 physics_dt
+    scene.update(dt=physics_dt)            # 步骤6:同步 GPU buffer
+    metrics_manager.compute_substep()      # 步骤7:记录子步级指标
+\end{codebox}
+
+\paragraph{为什么不在每个 substep 都查询策略？}因为策略前向（MLP 推理）比单步物理慢得多。若每个 substep 都查询策略，训练吞吐会下降约 \verb|decimation| 倍。工程解法：用较慢的策略频率（如 50\,Hz）+ 较快的物理频率（如 200\,Hz），让物理引擎在两次策略查询间做更精确的模拟。因此策略的「有效控制频率」是 $1/(\text{physics\_dt}\times\text{decimation})$。
+
+\begin{insight}[decimation 类比数字音频的过采样]\label{ins:rlmc-mgr-oversample}
+decimation 子循环类似数字音频里的「过采样」：你的 DAC（策略）输出 50\,Hz 的控制信号，但物理世界需要 200\,Hz 的力矩输入。过采样让力矩曲线更平滑、减少高频混叠（在物理上表现为关节抖动）。这条类比的边界：音频过采样是为重建连续波形，而 decimation 是为在固定动作目标下让 PD/积分器更稳定地逼近——内建 PD actuator 在每个 substep 重算力矩（因为关节位置在变），而显式力矩 actuator 在每个 substep 应用\emph{完全相同}的力矩值。
+\end{insight}
+
+\subsection{时序设计的六个关键洞察}
+
+时序不是随意排列——每个相对顺序都有理由。逐条理解，你才能正确编写 obs/reward/event。
+
+\begin{enumerate}
+  \item \textbf{action 在 physics 前处理}（步 2 $\to$ 3--7）：策略输出必须先 scaling/clipping/offset，再经 actuator 转为力矩，才能写入仿真。
+  \item \textbf{termination 在 reward 之前}（步 9 $\to$ 10）：被终止环境的\emph{最后一步} reward 仍会被计算。机器人摔倒时，reward 在摔倒状态下算出一个很低的值——这是正确的。若反过来，摔倒前的最后一步可能拿到正常 reward，导致策略低估摔倒代价。
+  \item \textbf{observation 在 reset 之后}（步 12 $\to$ 17）：确保 reset 后返回的是\emph{新 episode 的初始 obs}，而非旧 episode 的最后一帧。PPO 每次 \verb|env.step()| 返回的 obs 都是\emph{下一步}策略的输入；返回旧 obs 会让策略在错误状态上决策。
+  \item \textbf{reward 在 \texttt{sim.\allowbreak forward()} 之前}（步 10 vs 13）：reward 函数读到的派生量（接触力、传感器）有\emph{一个 substep 的滞后}。这不是 bug，而是性能权衡——若 reward 前也调一次 \verb|sim.forward()|，每步多一次 forward，在数千环境下显著降吞吐。
+  \item \textbf{command 在 observation 之前更新}（步 14 $\to$ 17）：因为 observation 可能\emph{包含} command（如速度命令 $(v_x,v_y,\omega_z)$）。若 command 在 obs 之后更新，策略本步看到旧命令、reward 下一步用新命令——obs 与 reward 不对齐。
+  \item \textbf{event 有四种执行模式}（mjlab）：见 \cref{tab:rlmc-mgr-eventmode}。
+\end{enumerate}
+
+\begin{table}[ht]
+\centering
+\caption{mjlab EventManager 的四种模式与执行时机（Isaac Lab 无 \texttt{step} 模式，另有 USD 级 \texttt{prestartup}）}
+\label{tab:rlmc-mgr-eventmode}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+mode & 执行时机 & 典型用途 & 在 step() 中的位置 \\
+\midrule
+\verb|startup| & 环境初始化（仅一次） & 初始质量/摩擦随机化 & \verb|__init__()|，不在 step \\
+\verb|reset| & episode reset 时 & 位姿/速度随机化 & 步 12b \\
+\verb|step| & 每步 & 观测噪声注入 & 步 15 \\
+\verb|interval| & 每 $N$ 秒 & 周期推力扰动 & 步 15 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[reward 滞后一个 substep 的双重解读]\label{ins:rlmc-mgr-dual}
+洞察 4 这个取舍可从两个角度看。\textbf{性能视角}：省去每步一次 \verb|sim.forward()|，吞吐有可观提升。\textbf{精度视角}：reward 读到的派生量滞后一个 substep（约 $0.005$\,s），对绝大多数 reward 函数影响可忽略。\rebuilt{源稿给出「吞吐提升 5--10\%」「滞后 0.005s」等具体数字，依硬件/任务/decimation 而变，应理解为量级而非定值。}只有当你的 reward 对\emph{瞬时}冲击力极敏感（如软着陆惩罚要抓着地峰值）时，才需用 ContactSensor 的 \Verb[breaklines]|history_length| 记录 decimation 期间的所有 substep 力，在 reward 里取其极值。
+\end{insight}
+
+\subsection{三框架对比：Isaac Lab 与 UniLab 的对应时序}
+
+\paragraph{Isaac Lab。}其 \Verb[breaklines]|ManagerBasedRLEnv.step()| 在\emph{高层 MDP 阶段}上与 mjlab 相似（action$\to$physics$\to$termination/reward$\to$reset$\to$command/event$\to$obs），但源码时序\textbf{并非逐行一致}。主要差异见 \cref{tab:rlmc-mgr-stepdiff}。
+
+\begin{table}[ht]
+\centering
+\caption{mjlab 与 Isaac Lab 的 step() 差异（MDP 对齐，非源码逐行映射）}
+\label{tab:rlmc-mgr-stepdiff}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+差异点 & mjlab & Isaac Lab \\
+\midrule
+MetricsManager & 有（步 7/11） & 无（指标由各 Manager 内部处理） \\
+\verb|sim.sense()| & 独立调用（步 16） & 部分集成进 \Verb[breaklines]|scene.update()| \\
+\verb|step| 模式 event & step() 内处理 & step() 内只自动处理 \verb|interval|；\verb|startup|/\allowbreak\verb|reset| 在初始化/重置路径 \\
+RecorderManager & 有（步 18） & 有（带 pre/post hooks 与 render interval） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{codebox}[Python]{Isaac Lab ManagerBasedRLEnv.step() 高层骨架（简化示意）}
+def step(self, action):
+    self.action_manager.process_action(action)          # 1-2
+    for _ in range(self.cfg.decimation):                # 3-6 decimation
+        self.scene.write_data_to_sim()
+        self.sim.step(render=False)
+        self.scene.update(self.physics_dt)
+    reset_buf = self.termination_manager.compute()      # termination（reset 前状态算）
+    self.reward_manager.compute(dt=self.step_dt)        # reward（reset 前状态算）
+    # Isaac Lab 永远 auto-reset（无 mjlab 那种 auto_reset 开关）:
+    reset_ids = reset_buf.nonzero().squeeze(-1)         # = (terminated | time_outs)
+    if reset_ids.numel() > 0:
+        self._reset_idx(reset_ids)
+    self.scene.update(self.physics_dt)                   # forward
+    self.command_manager.compute(self.step_dt)
+    self.event_manager.apply(mode="interval")           # 只 interval 在此
+    obs = self.observation_manager.compute()            # reset 后取 → reset env 拿新 obs
+    return obs, self.reward_manager.reward_buf, \
+        self.termination_manager.terminated, self.termination_manager.time_outs, extras
+\end{codebox}
+
+上段为高层 MDP 对齐的简化示意，其中的关键语义\textbf{已据源码核实}：Isaac Lab \emph{永远} auto-reset（无 \texttt{auto\_reset} 开关，那是 mjlab 才有的）、奖惩在 reset 前算、obs 在 reset 后取、返回 5 元组 \texttt{(obs, reward, terminated, time\_outs, extras)} 且 \texttt{terminated} 与 \texttt{time\_outs} 分开返回；属性名为 \texttt{time\_outs}（复数）/\texttt{reward\_buf}。\pz{唯精确\emph{行序}仍以你所用 Isaac Lab 版本源码为准；另注意 3.0 起 \texttt{data.*} 返回类型由 torch 张量改为 Warp 数组（见后文陷阱），相关运算需 \texttt{wp.\allowbreak to\_torch()}。}
+
+\begin{insight}[高层对齐 $\ne$ 源码逐行一致]\label{ins:rlmc-mgr-align}
+对比两框架的 step()，你会发现\emph{高层 MDP 阶段}相似，但传感器/派生量刷新机制不同（MuJoCo Warp 的 \verb|sim.forward()|/\allowbreak\verb|sim.sense()| vs PhysX 的集成式更新）。掌握一个框架后迁移到另一个相对快——但\textbf{不能}把两者的 step() 源码当成逐行可互换。这正是「学方法、而非背某版数字」的具体体现。
+\end{insight}
+
+\paragraph{UniLab：第三种「非 Manager-Based」的 env.step。}这里出现本章最重要的一处三框架\emph{结构性}差异：UniLab \textbf{不是} Manager-Based——它没有 \Verb[breaklines]|ObservationManager|/\allowbreak\verb|RewardManager|/\allowbreak\Verb[breaklines]|TerminationManager| 这些类，obs/reward/terminated \textbf{在一个方法 \texttt{update\_state} 里一处算完}。其 \verb|NpEnv.step()|（UniLab commit \texttt{99936e08}，\texttt{base/\allowbreak np\_env.\allowbreak py} 的 \verb|NpEnv.step|）时序如下，可与 \cref{tab:rlmc-mgr-step18} 的 18 步逐项对照：
+
+\begin{codebox}[Python]{UniLab NpEnv.step() 时序（一处算 obs/reward/done，对照 mjlab 18 步）}
+def step(self, actions):
+    # 1) 动作 -> ctrl（位置式 PD:ctrl = act*action_scale + default_angles）
+    state = self.apply_action(actions, state)
+    # 2) interval 域随机化（等价 EventMode.interval，由 DR manager 自计时分发）
+    self._dr_manager.apply_interval_randomization_if_due(self._step_count)
+    # 3) CPU 批量物理步（sim_substeps = round(ctrl_dt / sim_dt)，等价 decimation 子循环）
+    self._backend.step(ctrl, nsteps=self.sim_substeps)
+    # 4) 一处算 obs + reward + terminated（替代 Obs/Reward/Term 三个 Manager）
+    state = self.update_state(state)
+    # 5) 超时截断（max_episode_steps），对应 truncated
+    state = self._compute_truncated(state)
+    # 6) autoreset 已 done 的 env（含 final_observation 打补丁，供 bootstrap 用真终止 obs）
+    state = self._reset_done_envs(state)
+    # 7) NaN 守卫 check + 兜底 np.nan_to_num(reward)
+    self._nan_guard.check(state.obs, state.reward, self._step_count)
+    return state.obs, state.reward, state.terminated, state.truncated, state.info
+\end{codebox}
+
+逐项映射到 mjlab 的 18 步：UniLab 的 \emph{decimation 子循环} 被压进后端一次 \Verb[breaklines]|backend.step(ctrl, nsteps)| 调用（CPU 多线程批量步进 \verb|sim_substeps| 个物理子步）；mjlab 的 termination(步 9)+reward(步 10)+observation(步 17) 三步在 UniLab 里\textbf{合并为 \texttt{update\_state} 一处}；mjlab 独有的 \Verb[breaklines]|MetricsManager|（步 7/11）UniLab \textbf{无对应}（指标经 \verb|info["log"]| 直接累加）；mjlab 的 \verb|sim.sense()|（步 16）在 UniLab 里由后端 \Verb[breaklines]|get_sensor_data()| 按需读取，而非独立刷新阶段。事件（DR）的分发：UniLab 经 \Verb[breaklines]|DomainRandomizationManager| 在三个时机触发——\verb|init|（$\approx$startup）、\verb|reset|（per-episode）、\verb|interval|（步 2，自计时），\textbf{无} mjlab 的 \verb|step| 模式（每步无条件 DR）。
+
+\begin{insight}[同一条 MDP 数据流，可以「分散到九个 Manager」也可以「收进一个 update\_state」]\label{ins:rlmc-mgr-unilab}
+mjlab/Isaac Lab 把 obs/reward/termination 拆成独立 Manager（显式依赖、纯函数、可配置消融），UniLab 反其道而行——\verb|update_state| 一处算完三者。\textbf{这不是「谁更对」，而是不同约束下的取舍}：Manager-Based 的拆分换来「加一条 reward 只改一行 config」的迭代速度（\cref{ins:rlmc-mgr-value}），代价是九个 Manager 的加载顺序与运行时序必须对齐（本章前两节的全部内容）；UniLab 的合并换来「一个文件读懂整条 MDP 数据流」的可读性与 CPU-sim 异构所需的灵活控制，代价是消融一个奖励项要回到 \texttt{update\_state} 改代码（而非纯配置）。\textbf{看清这点，你就不会把「Manager」当成 RL 框架的必需品}——它只是一种把 MDP 组件正交化的工程手段。
+\end{insight}
+
+\subsection{运行验证与时序在调试中的应用}
+
+理解时序不是「学完就忘」的理论——它是日常调试最常用的诊断工具。三个真实场景：
+
+\paragraph{场景 A：reward 读到的接触力「滞后」一步。}症状：你写了惩罚足端冲击力的 reward，但策略仍猛烈着地；打印 reward 里读到的冲击力，比可视化峰值小得多。诊断：reward 在步 10 算，而 \verb|sim.forward()| 在步 13 才执行——reward 读到的是\emph{上一个 substep} 的接触力，可能错过了着地瞬间的峰值。解法：用 ContactSensor 的 \Verb[breaklines]|history_length| 记录 decimation 期间所有 substep 力，reward 取 history 的最大值；或在 \Verb[breaklines]|metrics_manager.compute_substep()| 里记每个 substep 的峰值。
+
+\paragraph{场景 B：obs 与 reward 里的 command 看似不匹配。}诊断：command 在步 14 更新、obs 在步 17 算、reward 在步 10 算——同一次 step 里 reward 用旧 command、obs 用新 command。但这\emph{不是} bug：command 只在重采样时刻（如每 10 秒）变化，绝大多数 step 里 command 不变，所谓「不匹配」只在重采样那一步存在。结论：若策略真的不跟命令，更可能是 actor obs 里漏了 command 项，或命令范围太窄。
+
+\paragraph{场景 C：reset 后第一步 obs 维度异常。}诊断：检查你的自定义 obs term 是否含 \verb|if| 分支、按环境状态返回不同 shape 的张量。\textbf{所有 obs term 必须返回相同 shape}，不能有条件分支。
+
+\begin{pitfall}[在 reward term 里调 sim.forward()]
+\textbf{错误描述}：为读最新派生量，在 reward 函数里手动调一次 \verb|sim.forward()|。\textbf{现象后果}：每步多一次 forward 调用，吞吐下降，且可能破坏 CUDA Graph 捕获。\textbf{根本原因}：reward 的设计位置就在 forward 之前，强行 forward 违反时序契约。\textbf{正确做法}：接受一步延迟，或用 sensor 的 history 机制取峰值。
+\end{pitfall}
+
+\begin{pitfall}[把 step event 与 interval event 混淆]
+\textbf{错误描述}：把推力扰动写成 \verb|step| 模式、把观测噪声写成 \verb|interval| 模式。\textbf{现象后果}：推力\emph{每步}都加（机器人被持续推着走，学不出鲁棒步态）；噪声\emph{偶尔}才加（actor 见不到足够噪声，sim-to-real 变差）。\textbf{根本原因}：两种模式频率语义相反。\textbf{正确做法}：间歇性扰动用 \verb|interval|，每步都要的腐蚀用 \verb|step|。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[源码]} 打开你能访问框架的 \Verb[breaklines]|manager_based_rl_env.py|（或等价文件），定位 \verb|step()|，对照 \cref{tab:rlmc-mgr-step18} 确认每一步的代码位置与相对顺序。\emph{验收}：列出你的版本里 termination/reward/reset/observation 的实际先后。
+  \item \textbf{[推理]} 若把 observation 计算（步 17）移到 reward（步 10）之前，会产生什么后果？\emph{验收}：从「obs 与 reward 的数据对齐」角度说明。
+  \item \textbf{[推理]} decimation 从 4 改成 8 后，policy frequency 变成多少？若 reward 用了 dt 缩放，reward 权重的\emph{实际效果}是否改变？为什么这很重要？\emph{验收}：给出新频率并解释 dt 缩放的作用（见 \cref{sec:rlmc-mgr-reward}）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Manager 模式的设计动机}
+\label{sec:rlmc-mgr-why}
+
+\subsection{模块功能与在管线中的位置}
+
+为什么要有 Manager？它不是「更优雅」的审美问题，而是有明确工程收益的设计决策。本节用 legged\_gym\,\cite{rudin2021minutes,leggedrobotics2021} 的单体架构作反面教材，说清 Manager-Based 解决了什么。
+
+\subsection{反面：legged\_gym 的单体架构}
+
+legged\_gym（Isaac Gym 时代的标准框架，源自 CoRL 2021 的「分钟级学步」工作\,\cite{rudin2021minutes}）的核心是一个两千余行的 \verb|LeggedRobot| 类，把所有逻辑塞在一起：
+
+\begin{codebox}[Python]{legged\_gym 单体结构（简化，体现「全部耦合」）}
+class LeggedRobot(BaseTask):
+    def _compute_observations(self):
+        self.obs_buf = torch.cat([                 # 30+ 行手动拼接
+            self.base_lin_vel * self.obs_scales.lin_vel,
+            self.projected_gravity,
+            self.commands[:, :3] * self.commands_scale,
+            (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
+            self.dof_vel * self.obs_scales.dof_vel,
+            self.actions,
+        ], dim=-1)
+    def _compute_reward(self):                      # 50+ 行手动计算每项
+        rew_lin = torch.exp(-torch.sum(torch.square(
+            self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1) / 0.25)
+        rew_act = -torch.sum(torch.square(self.actions - self.last_actions), dim=1)
+        self.rew_buf = rew_lin * 1.0 + rew_act * (-0.01)  # ... 更多项
+    def step(self, actions):                        # 手动编排所有执行顺序
+        self._compute_torques(actions); self.gym.simulate(self.sim)
+        self._compute_observations(); self._compute_reward()
+        self._check_termination(); self._reset_envs()
+        return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
+\end{codebox}
+
+\paragraph{隐式依赖：最危险的工程债。}在单体类里，\Verb[breaklines]|_compute_reward()| 可能依赖 \Verb[breaklines]|_compute_observations()| 算出的中间量（经 \Verb[breaklines]|self.projected_gravity| 传递）。这种\emph{隐式}依赖没被代码结构表达，只有读完整个两千行才能发现。若你改了 obs 计算顺序而没意识到 reward 依赖它，reward 会用到错误值——\textbf{却不报任何错}。
+
+\begin{codebox}[Python]{legged\_gym 的隐式依赖（危险示例）}
+def _compute_observations(self):
+    self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
+def _compute_reward(self):
+    # 隐式依赖 self.projected_gravity:若 obs 没先执行，这里用的是旧值（无报错）
+    rew_upright = -torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
+\end{codebox}
+
+\subsection{Manager-Based 如何解决：显式依赖 + 纯函数}
+
+Manager-Based 把 MDP 的每个组件拆到独立 Manager，每个 term 是一个\textbf{纯函数}——接收 \verb|env|，直接从 \Verb[breaklines]|env.scene["robot"].data| 读最新数据，不依赖任何中间量。
+
+\begin{codebox}[Python]{Manager-Based 的显式依赖（同一逻辑，解耦写法）}
+def projected_gravity(env) -> torch.Tensor:           # obs term:纯函数
+    return env.scene["robot"].data.projected_gravity_b
+def flat_orientation_reward(env) -> torch.Tensor:     # reward term:同样直接读
+    g = env.scene["robot"].data.projected_gravity_b
+    return -torch.sum(g[:, :2] ** 2, dim=1)
+\end{codebox}
+
+\begin{codebox}[Python]{Manager-Based 配置（term 名用短别名 ObsTerm/RewTerm/EventTerm;mjlab 须写全名或自行 as 重命名）}
+class VelocityEnvCfg(ManagerBasedRlEnvCfg):
+    observations = ObservationsCfg(
+        actor=ObservationGroupCfg(                    # mjlab 组名:actor
+            base_lin_vel=ObsTerm(func=mdp.base_lin_vel),
+            commands=ObsTerm(func=mdp.generated_commands,
+                             params={"command_name": "twist"}),
+            joint_pos=ObsTerm(func=mdp.joint_pos_rel),
+            last_action=ObsTerm(func=mdp.last_action),
+        ),
+    )
+    rewards = RewardsCfg(
+        track_lin_vel=RewTerm(func=mdp.track_lin_vel_xy_exp, weight=1.5,
+                              params={"std": 0.25}),
+        action_rate=RewTerm(func=mdp.action_rate_l2, weight=-0.01),
+    )
+    events = EventCfg(
+        push_robot=EventTerm(func=mdp.push_by_setting_velocity,
+                             mode="interval", interval_range_s=(10.0, 15.0)),
+    )
+\end{codebox}
+
+\begin{insight}[Manager-Based 的核心价值是「迭代速度」，不是「代码优雅」]\label{ins:rlmc-mgr-value}
+其真正价值是把实验迭代速度提升约一个数量级（\cref{tab:rlmc-mgr-speedup}）。在机器人 RL 研究里，能快速迭代 reward/obs/DR 配置的研究者，比能写更快代码的研究者更有竞争力。\rebuilt{下表「工时/加速倍数」为源稿经验值，因人/项目而异，应理解为量级对比而非测得基准。}
+\end{insight}
+
+\begin{table}[ht]
+\centering
+\caption{单体 vs Manager-Based 的工程开销对比（量级，非实测基准）}
+\label{tab:rlmc-mgr-speedup}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+操作 & legged\_gym & Manager-Based \\
+\midrule
+加一条 reward 项 & 改函数 + 测试 & 加一行 config \\
+对比 3 种 reward 配置 & 复制 3 份文件 & 3 次 CLI 覆盖 \\
+换一台新机器人 & 改数十处硬编码索引 & 改 EntityCfg \\
+定位「reward 为零」 & 逐行排查 & 打印各 term \\
+2 人并行开发 & 频繁 merge 冲突 & 改不同 config 段，无冲突 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{「改一行 config」不是口号——一行 CLI 即可消融任一 reward 项（mjlab 实测）。}上表「对比 N 种 reward 配置 = N 次 CLI 覆盖」在 mjlab 是\emph{字面可执行}的：mjlab 用 tyro 暴露了\textbf{任意深度}的配置覆盖，于是「把某条 reward 关掉/调权重」无需改任何文件、无需复制 config，一行命令就够（已实测 \Verb[breaklines]|--env.rewards.<name>.weight| 这一层覆盖确实生效）：
+
+\begin{codebox}[bash]{单项 reward 消融:一行 CLI 覆盖权重，不碰任何源文件（mjlab，已实测命中）}
+# 基线:默认权重训练
+WANDB_MODE=disabled mjlab train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 64 --agent.max-iterations 2
+# 消融 A:把足端打滑惩罚权重清零（等价「移除这一项」），其余不变
+WANDB_MODE=disabled mjlab train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 64 --agent.max-iterations 2 \
+    --env.rewards.feet-slip.weight 0.0
+# 消融 B:把角速度跟踪奖励加倍，看 Episode_Reward/track_angular_velocity 是否抬升
+WANDB_MODE=disabled mjlab train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 64 --agent.max-iterations 2 \
+    --env.rewards.track-angular-velocity.weight 1.5
+\end{codebox}
+\noindent 注意 CLI 里点分路径用\textbf{连字符}（\Verb[breaklines]|track-angular-velocity|）对应 Python 的下划线字段名（\Verb[breaklines]|track_angular_velocity|），这是 tyro 的命名约定；覆盖只作用于本次 run、不污染注册的原始 cfg（\cref{sec:rlmc-mgr-loadorder} 讲的 \verb|deepcopy| 机制）。\textbf{这就是 \cref{ins:rlmc-mgr-value} 「迭代速度」的实证}——在 legged\_gym 里这三次对比要复制三份文件、改三处硬编码，在这里是三行命令。
+
+\begin{insight}[微服务类比及其边界]\label{ins:rlmc-mgr-micro}
+单体架构像早期「巨型 main 函数」，Manager-Based 像「微服务」——每个 Manager 独立部署扩展。类比的边界：微服务之间经网络通信（有延迟、可能失败），而 Manager 之间经共享 GPU 张量通信（零延迟、不丢包）。所以 Manager-Based 享受了关注点分离的好处，却没有分布式系统的通信代价。
+\end{insight}
+
+\subsection{Manager 加载顺序}
+\label{sec:rlmc-mgr-loadorder}
+
+Manager 的\emph{创建}顺序很重要——后创建的可能依赖先创建的输出。mjlab 的 \Verb[breaklines]|load_managers()| 按 \cref{tab:rlmc-mgr-loadorder} 创建。
+
+\begin{table}[ht]
+\centering
+\caption{mjlab 的 Manager 加载（创建）顺序及理由}
+\label{tab:rlmc-mgr-loadorder}
+\small
+\begin{tabular}{@{}cll@{}}
+\toprule
+序 & Manager & 为什么这个顺序 \\
+\midrule
+1 & EventManager & DR 可能改写模型字段，影响后续所有 Manager 的数据访问 \\
+2 & CommandManager & observation 可能读取 command \\
+3 & ActionManager & observation 可能含 last\_action \\
+4 & ObservationManager & 定义 observation space（PPO 需知输入维度） \\
+5 & TerminationManager & step 后判 done \\
+6 & RewardManager & step 后算 reward \\
+7 & CurriculumManager & reset 时调难度 \\
+8 & MetricsManager & step/substep 记指标 \\
+9 & RecorderManager & 记 post-reset / post-step \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[加载顺序 $\ne$ 运行时执行顺序]\label{ins:rlmc-mgr-order}
+两张表别混为一谈。\cref{tab:rlmc-mgr-loadorder} 表达的是\emph{初始化依赖}（谁先创建、谁依赖谁的产物）；\cref{tab:rlmc-mgr-step18} 表达的是\emph{运行时 MDP 数据对齐}。例如加载顺序里 Observation 排第 4、Termination 第 5，但运行时 termination 在 reward 之后、observation 在最后——因为初始化关心「依赖就绪」，运行关心「数据对齐」。\textbf{反事实}：若 ObservationManager 在 CommandManager 之前加载，obs 里的 \Verb[breaklines]|generated_commands| 项会找不到 command manager（可能不报错、只返回空张量），策略遂学不会跟踪命令。
+\end{insight}
+
+\subsection{三框架对比：任务注册机制}
+
+「能跑」的第一步是任务被\emph{注册}——把 task ID 映射到 env/RL 配置。三框架机制不同：
+
+\begin{itemize}
+  \item \textbf{mjlab}：用自有的 \Verb[breaklines]|register_mjlab_task()|，把\emph{已实例化}的 cfg 对象存进私有 dict \verb|_REGISTRY|（\texttt{tasks/\allowbreak registry.\allowbreak py}），每次 \Verb[breaklines]|load_env_cfg()| 返回一个 \verb|deepcopy|（而非「调函数」），从而避免训练运行间共享状态——这也是 CLI 覆盖（如 \Verb[breaklines]|--env.rewards.X.weight 0.5|，经 tyro 解析）不污染原始配置的原因。任务发现靠 Python entry\_points（group \verb|mjlab.tasks|）而非 gym registry，故 \verb|list-envs| 读的是 \verb|_REGISTRY|\,\cite{mjlab2026}。
+  \item \textbf{Isaac Lab}：用 \Verb[breaklines]|gymnasium.register()|，以 \Verb[breaklines]|env_cfg_entry_point| 指向配置类，CLI 用 argparse 预定义参数\,\cite{isaaclab2024}。
+  \item \textbf{UniLab}：用\textbf{双装饰器}注册（\texttt{base/\allowbreak registry.\allowbreak py}，UniLab commit \texttt{99936e08}）——\Verb[breaklines]|@registry.envcfg("Go2JoystickFlat")| 注册\emph{配置类}，\Verb[breaklines]|@registry.env("Go2JoystickFlat", sim_backend="mujoco")| 注册\emph{env 类 + 后端}（同名可叠多个后端，如再加一行 \Verb[breaklines]|sim_backend="motrix"|）。运行时 \Verb[breaklines]|make(name, sim_backend, env_cfg_override, num_envs)| 建实例，CLI 覆盖经 Hydra 的 \Verb[breaklines]|apply_cfg_overrides|（\textbf{深合并}嵌套键，如 \Verb[breaklines]|env.scene.terrain.generator.num_rows=4| 只改这一项、保其余默认）——与 mjlab 的 tyro「任意深度覆盖」同思想。注意 UniLab 有\textbf{两套命名}：注册名是 CamelCase（\Verb[breaklines]|Go2JoystickFlat|，实测共 26 个任务），CLI 的 \verb|--task| 是小写 slug（\Verb[breaklines]|go2_joystick_flat|），二者经 owner YAML 的 \Verb[breaklines]|training.task_name| 字段绑定。
+\end{itemize}
+
+\begin{codebox}[Python]{mjlab vs Isaac Lab 任务注册（API 不同、原理相似）}
+# mjlab:存「已实例化的 cfg 对象」到私有 _REGISTRY，load 时返回 deepcopy
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Flat-Unitree-Go1",   # mjlab 真实任务名（有 G1/Go1，无 Go2）
+    env_cfg=unitree_go1_flat_env_cfg(),          # 注意带 ():存的是实例不是函数
+    play_env_cfg=unitree_go1_flat_env_cfg(play=True),
+    rl_cfg=unitree_go1_rl_cfg(),                 # RSL-RL 配置（实例）
+    runner_cls=VelocityOnPolicyRunner,           # mjlab 注册需指定 runner 类
+)
+
+# Isaac Lab:gymnasium 注册，entry_point 指向 env 类
+import gymnasium
+gymnasium.register(
+    id="Isaac-Velocity-Flat-Anymal-C-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={"env_cfg_entry_point": AnymalCFlatEnvCfg},
+)
+
+# UniLab:双装饰器，配置类与 env 类分别注册，同名可叠多后端
+@registry.envcfg("Go2JoystickFlat")            # 注册配置类（CamelCase = training.task_name）
+@dataclass
+class Go2JoystickCfg(Go2BaseCfg): ...
+
+@registry.env("Go2JoystickFlat", sim_backend="mujoco")   # 注册 env 类 + 后端
+@registry.env("Go2JoystickFlat", sim_backend="motrix")   # 同名再叠一个后端
+class Go2WalkTask(Go2BaseEnv): ...
+\end{codebox}
+
+\begin{pitfall}[认为 Manager 顺序不重要]
+\textbf{错误描述}：自定义一个新 Manager，随手插在加载序列任意位置。\textbf{现象后果}：依赖缺失——你的 Manager 想读的另一 Manager 还没创建，得到空数据或 \verb|None|。\textbf{根本原因}：加载顺序编码了创建期依赖。\textbf{正确做法}：按「谁依赖谁的产物」定位插入点——如一个「安全检查」Manager 要在 action 应用前校验，应排在 ActionManager 附近且在其使用前就绪。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[迁移]} 在 legged\_gym 里对比「有/无 foot\_slip 惩罚」的训练，你要怎么做？在 Manager-Based 里呢？\emph{验收}：写出两套操作步骤，对比改动量。
+  \item \textbf{[推理]} 给一个具体例子，说明「EventManager 不最先加载」会导致什么问题。\emph{验收}：指出哪个后续 Manager 会读到错误数据。
+  \item \textbf{[设计]} 要为 mjlab 加第 10 个 Manager（如负责 action 执行前安全约束检查的 \verb|SafetyManager|），它在加载序列哪个位置？为什么？\emph{验收}：给出位置 + 依赖理由。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{各 Manager 对比实战}
+\label{sec:rlmc-mgr-managers}
+
+本节是全章的对比实战主体：每个 Manager 先立\emph{它管什么 MDP 组件}（算法主线），再走读其 \verb|compute()|/\allowbreak\verb|apply()| 核心逻辑，最后给出 mjlab / Isaac Lab / UniLab 三框架的 API 对照。先看总览（\cref{tab:rlmc-mgr-naming}），这是两框架间切换的「翻译表」。
+
+\begin{table}[ht]
+\centering
+\caption{mjlab 与 Isaac Lab 的核心命名对照（含已联网核对的差异）}
+\label{tab:rlmc-mgr-naming}
+\small
+\begin{tabularx}{\linewidth}{@{}llLL@{}}
+\toprule
+概念 & mjlab（导出名） & Isaac Lab（含常用别名） & 说明 \\
+\midrule
+环境基类 & \Verb[breaklines]|ManagerBasedRlEnvCfg| & \Verb[breaklines]|ManagerBasedRLEnvCfg| & 注意 \verb|Rl| vs \verb|RL| \\
+机器人配置 & \verb|EntityCfg| & \Verb[breaklines]|ArticulationCfg| & mjlab 更通用 \\
+场景配置 & \verb|SceneCfg| & \Verb[breaklines]|InteractiveSceneCfg| & Isaac Lab 有 Interactive 前缀 \\
+obs 组名 & \verb|"actor"| / \verb|"critic"| & \verb|"policy"|(默认) / \verb|"critic"| & 见 \cref{ins:rlmc-mgr-asym} \\
+obs 项 & \Verb[breaklines]|ObservationTermCfg| & \Verb[breaklines]|ObservationTermCfg|（常 import 为 \verb|ObsTerm|） & 全名同；短别名仅 Isaac Lab 侧习惯 \\
+reward 项 & \verb|RewardTermCfg| & \verb|RewardTermCfg|（常作 \verb|RewTerm|） & 同上 \\
+event 项 & \verb|EventTermCfg| & \verb|EventTermCfg|（常作 \verb|EventTerm|） & 同上 \\
+termination 项 & \Verb[breaklines]|TerminationTermCfg| & \Verb[breaklines]|TerminationTermCfg|（常作 \verb|DoneTerm|） & 全名同；\textbf{短别名} \verb|TermTerm|\textbf{/}\verb|DoneTerm| \textbf{均不存在于库，是 import 重命名} \\
+任务注册 & \Verb[breaklines]|register_mjlab_task()| & \Verb[breaklines]|gymnasium.register()| & 机制不同 \\
+CLI 覆盖 & tyro（任意深度） & argparse（预定义） & mjlab 覆盖更灵活 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{insight}[mjlab 不提供 \texttt{ObsTerm/\allowbreak RewTerm/\allowbreak DoneTerm} 短别名]\label{ins:rlmc-mgr-alias}
+一个跨框架抄代码时最易踩的坑：\verb|ObsTerm|/\allowbreak\verb|RewTerm|/\allowbreak\verb|EventTerm|/\allowbreak\verb|DoneTerm|/\allowbreak\verb|ObsGroup|/\allowbreak\verb|CurrTerm| 这些短名是 \emph{Isaac Lab 用户在 import 处自行重命名}的习惯（\Verb[breaklines]|from ... import ObservationTermCfg as ObsTerm|），\textbf{并非库本身导出的符号}。mjlab 的 \Verb[breaklines]|from mjlab.managers import ...| 只导出全名（\Verb[breaklines]|ObservationTermCfg|/\allowbreak\verb|RewardTermCfg|/\allowbreak\verb|EventTermCfg|/\allowbreak\Verb[breaklines]|TerminationTermCfg|/\allowbreak\Verb[breaklines]|CurriculumTermCfg|/\allowbreak\Verb[breaklines]|ObservationGroupCfg| 等），\textbf{没有任何短别名}。因此本节后续 codebox 为对照紧凑用了 \verb|ObsTerm| 等写法，但你在 mjlab 里要么写全名、要么自己在文件顶 \verb|as| 重命名——直接 \Verb[breaklines]|from mjlab.managers import ObsTerm| 会 \verb|ImportError|。mjlab 唯一的 term 基类是 \Verb[breaklines]|ManagerTermBase|（\emph{不是} \verb|ObsTermBase|/\allowbreak\Verb[breaklines]|RewardTermBase|，后两者不存在）。
+\end{insight}
+
+\cref{tab:rlmc-mgr-naming} 只列 mjlab 与 Isaac Lab，是因为它们\emph{共享} Manager-Based 抽象、翻译表才有意义。\textbf{UniLab 不在这张表里，因为它根本没有这些 Manager 类}——它是本章的「第三种架构」（\cref{ins:rlmc-mgr-unilab}）。\cref{tab:rlmc-mgr-unilabmap} 给出 UniLab 对每个 MDP 组件的\emph{真实}对应（不是类名映射，而是「这个职责在 UniLab 里由谁承担」），各组件的细节在本节随后各小节随 mjlab/Isaac Lab 并排展开。
+
+\begin{table}[ht]
+\centering
+\caption{UniLab 对各 MDP 组件的承担者（非 Manager-Based，commit \texttt{99936e08}）}
+\label{tab:rlmc-mgr-unilabmap}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+MDP 组件 & mjlab/Isaac 的 Manager & UniLab 的承担者 \\
+\midrule
+observation & ObservationManager & \verb|update_state|$\to$\verb|_compute_obs|（手拼，组名固定 obs/critic） \\
+reward & RewardManager & \verb|reward.scales| 标量字典 + \verb|_reward_fns| 派发表 \\
+termination & TerminationManager & \verb|update_state| 直接算 + 基类 \Verb[breaklines]|_compute_truncated| \\
+event (DR) & EventManager & \Verb[breaklines]|DomainRandomizationManager|（init/reset/interval 三模式） \\
+command & CommandManager & \verb|Commands|（commands.py） \\
+curriculum & CurriculumManager & \Verb[breaklines]|PenaltyCurriculum| + \Verb[breaklines]|TerrainCurriculumCfg| \\
+action & ActionManager & \verb|apply_action|（位置目标残差，后端 PD 增益） \\
+数据源 & Entity / Articulation & \verb|NpEnvState| + 后端 getter（\Verb[breaklines]|get_local_linvel| 等） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[obs 组名是高发的「翻译陷阱」，且需分清两层]\label{ins:rlmc-mgr-asym}
+这一点经联网核对后必须讲清，因为它最易踩坑。\textbf{第一层（环境侧 group 名）}：mjlab velocity 任务的两个观测组源码里就叫 \verb|actor| 与 \verb|critic|\,\cite{mjlab2026}；而 Isaac Lab 的 locomotion \emph{velocity 基类}默认\textbf{只}定义一个 \verb|policy| 组，\verb|critic|（非对称特权组）只在启用非对称演员-评论家的具体机器人配置里才追加——所以「默认就有 policy 和 critic 两组」对 locomotion \emph{不准确}：\verb|policy| 才是唯一保证的默认\,\cite{isaaclab2024}。\textbf{第二层（RSL-RL runner 侧）}：runner 的 \verb|obs_groups| 是 \Verb[breaklines]|dict[str,list[str]]|，其\emph{键}是算法角色 \verb|"actor"|/\allowbreak\verb|"critic"|，\emph{值}是环境 group 名的列表\,\cite{schwarke2025rslrl,isaaclab2024}。两层别混：环境侧叫什么、与 runner 侧映射到哪个角色，是两件事。
+\end{insight}
+
+% -------------------------------------------
+\subsection{ObservationManager：策略的眼睛}
+\label{sec:rlmc-mgr-obs}
+
+\paragraph{算法主线。}ObservationManager 实现 POMDP 的观测函数 $o_t=h(s_t)+\boldsymbol\epsilon_t$（\cref{ch:rlmc-obsact} 的 \cref{eq:rlmc-obs-fn}）。它遍历每个 obs group、对每个 term 调函数取张量，再施加 clip/noise/history，最后拼成一个扁平张量。\cref{ch:rlmc-obsact} 已深入观测\emph{设计}，这里只看 Manager 的\emph{编排}。
+
+\begin{codebox}[Python]{ObservationManager.compute() 内部流程（简化）}
+def compute(self, update_history=True):
+    obs_dict = {}
+    for group_name, group_cfg in self.cfg.items():
+        obs_list = []
+        for term_name, term_cfg in group_cfg.items():
+            raw = term_cfg.func(self.env, **term_cfg.params)        # 调 obs 函数
+            if group_cfg.enable_corruption and term_cfg.noise:     # 仅 actor 加噪
+                raw = raw + term_cfg.noise.sample(raw.shape)
+            if term_cfg.clip:
+                raw = torch.clamp(raw, term_cfg.clip[0], term_cfg.clip[1])
+            obs_list.append(raw)
+        obs_dict[group_name] = torch.cat(obs_list, dim=-1)         # 拼扁平张量
+    return obs_dict
+\end{codebox}
+
+\paragraph{配置项耦合（关键）。}\Verb[breaklines]|enable_corruption| 是组级开关：actor 组设 \verb|True|（加噪以逼近真机传感器），critic 组设 \verb|False|（特权信息不该被噪声污染）。这与非对称演员-评论家的部署逻辑一致——actor 须可部署、critic 只在训练中输出价值（数学依据见 \cref{ch:rlmc-obsact} 与理论部 GAE 推导）。
+
+\paragraph{三框架对比。}
+\begin{itemize}
+  \item \textbf{mjlab}：obs 项以 \Verb[breaklines]|terms={"name": cfg}| 字典组织，组名 \verb|actor|/\allowbreak\verb|critic|\,\cite{mjlab2026}。
+  \item \textbf{Isaac Lab}：用 \Verb[breaklines]|ObservationsCfg| 的嵌套 \verb|@configclass|，每个 group 是继承 \Verb[breaklines]|ObservationGroupCfg|（别名 \verb|ObsGroup|）的内部类；基类默认只有 \verb|policy| 组\,\cite{isaaclab2024}。
+  \item \textbf{UniLab}：\textbf{无 ObservationManager}——env 实现一个属性 \Verb[breaklines]|obs_groups_spec -> dict[str,int]|（组名$\to$维度，UniLab commit \texttt{99936e08}，如 Go2 joystick 返回 \Verb[breaklines]|{"obs": 49, "critic": 52}|），并在 \verb|update_state| 调用的 \verb|_compute_obs| 里\emph{手动}拼各组张量。env 侧组名\textbf{固定为 \texttt{obs} 与 \texttt{critic}}：\Verb[breaklines]|base/observations.py| 的 \Verb[breaklines]|split_obs_dict| 把 \verb|obs["obs"]| 喂 actor、\verb|obs["critic"]| 喂 critic（无 critic 组则复用 obs）。两层映射与 mjlab 同思想（Hydra \Verb[breaklines]|algo.obs_groups={actor:[actor],critic:[critic]}| 把 RL runner 角色路由到 env 组），但 env 侧固定只有 \texttt{obs}/\allowbreak\texttt{critic} 两组、且加噪/clip 是 \verb|_compute_obs| 里手写而非 term 级配置。
+\end{itemize}
+
+% -------------------------------------------
+\subsection{RewardManager：优化目标的装配线}
+\label{sec:rlmc-mgr-reward}
+
+\paragraph{算法主线。}RewardManager 把 MDP 的标量奖励 $r_t$ 装配出来：每个 RewTerm 是一个返回 $[\text{num\_envs}]$ 张量的纯函数，乘权重、（可选）乘 \verb|dt|、做 NaN 保护后累加。
+
+\begin{codebox}[Python]{RewardManager.compute(dt) 内部流程（简化）}
+def compute(self, dt):
+    self._reward_buf.zero_()
+    for term_name, term_cfg in self.cfg.items():
+        raw = term_cfg.func(self.env, **term_cfg.params)   # [num_envs]
+        weighted = raw * term_cfg.weight
+        if self.scale_by_dt:                               # dt 缩放（关键）
+            weighted = weighted * dt
+        weighted = torch.nan_to_num(weighted, nan=0.0, posinf=0.0, neginf=0.0)
+        self._reward_buf += weighted
+        self._episode_sums[term_name] += weighted          # 供日志分项
+    return self._reward_buf
+\end{codebox}
+
+\begin{insight}[dt 缩放让 reward 权重与仿真频率解耦]\label{ins:rlmc-mgr-dtscale}
+RewardManager 默认把 reward 乘 \verb|dt|（$\text{step\_dt}=\text{physics\_dt}\times\text{decimation}$）。于是改 timestep 或 decimation 后，reward 权重的\emph{实际效果}不变——权重表达的是「单位时间的 reward 密度」，而非「单步绝对值」。\textbf{反事实}：若不做 dt 缩放，把 decimation 从 4 改成 8（policy 频率 50\,Hz$\to$25\,Hz）时每步 reward 翻倍，你得重调所有权重。这条洞察直接回答了 \cref{sec:rlmc-mgr-step} 练习 3。
+\end{insight}
+
+\paragraph{velocity 任务的典型奖励族（算法视角）。}腿足速度跟踪的奖励大体分四类：\textbf{跟踪}（正激励，如 \Verb[breaklines]|track_lin_vel_xy_exp|、\Verb[breaklines]|track_ang_vel_z_exp|，用指数核 $\exp(-e^2/\sigma^2)$）、\textbf{正则}（负惩罚，如 \Verb[breaklines]|action_rate_l2|、关节加速度）、\textbf{风格}（如躯干水平 \Verb[breaklines]|flat_orientation_l2|）、\textbf{接触}（如足端打滑 \verb|foot_slip|）。\cref{tab:rlmc-mgr-rewexample} 给出权重符号约定。\textbf{命名提醒（两库已逐字核实）}：本节用的函数名（\texttt{track\_lin\_vel\_xy\_exp}/\allowbreak\texttt{track\_ang\_vel\_z\_exp}/\allowbreak\texttt{foot\_slip}）取自 Isaac Lab 的 \texttt{mdp} 库，便于与理论部呼应；mjlab 的同功能函数\emph{命名不同}——其 \texttt{tasks/\allowbreak velocity/\allowbreak mdp} 里跟踪奖励叫 \texttt{track\_linear\_velocity}/\allowbreak\texttt{track\_angular\_velocity}、足端打滑叫 \texttt{feet\_slip}（而 \texttt{action\_rate\_l2}/\allowbreak\texttt{flat\_orientation\_l2} 等通用项两库同名）。故落地时务必按「功能」而非「照搬名字」查你所用框架的 \texttt{mdp} 模块。
+
+\begin{table}[H]
+\centering
+\caption{velocity 任务奖励项的符号约定（数值随机器人调）}
+\label{tab:rlmc-mgr-rewexample}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+类别 & 示例项 & 权重符号 \\
+\midrule
+跟踪 & \Verb[breaklines]|track_lin_vel_xy_exp| & $+$（如 1.5） \\
+跟踪 & \Verb[breaklines]|track_ang_vel_z_exp| & $+$（如 0.75） \\
+正则 & \Verb[breaklines]|action_rate_l2| & $-$（如 $-0.01$） \\
+风格 & \Verb[breaklines]|flat_orientation_l2| & $-$ \\
+接触 & \verb|foot_slip| & $-$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{三框架对比。}reward 项配置类全名 \verb|RewardTermCfg| 在 mjlab 与 Isaac Lab 中一致（Isaac Lab 教程常 import 重命名为 \verb|RewTerm|，mjlab 无此短别名、须写全名，见 \cref{ins:rlmc-mgr-alias}）；dt 缩放逻辑两者一致。\textbf{UniLab 在这里范式截然不同}：它\textbf{没有 RewardTermCfg 类}，reward 是一个 Hydra \emph{标量字典} \Verb[breaklines]|reward.scales={tracking_lin_vel: 1.0, lin_vel_z: -5.0, ...}| 加 env 内一张\emph{派发表} \Verb[breaklines]|_reward_fns: dict[str, Callable]|（UniLab commit \texttt{99936e08}，共享函数在 \texttt{envs/\allowbreak locomotion/\allowbreak common/\allowbreak rewards.\allowbreak py}，约 40 个）。每步 \Verb[breaklines]|run_reward_dispatch()| 算 $r=\sum_{\text{name}}\text{scales[name]}\cdot\text{fns[name]}(\text{ctx})$，跳过 \verb|scale==0| 的项，\textbf{返回 \texttt{reward * ctrl\_dt}}——即 UniLab \emph{也}做 dt 缩放（等价 mjlab/Isaac 的 \verb|scale_by_dt|），但乘的是 \verb|ctrl_dt|（控制周期本身），而非 \Verb[breaklines]|physics_dt*decimation|。下面把同一条 tracking 奖励在三框架并排：
+
+\begin{codebox}[Python]{同一条 track\_lin\_vel 奖励:mjlab/Isaac 类式 term vs UniLab 标量字典+派发表}
+# mjlab / Isaac Lab:RewTerm 类，func 指向纯函数，weight 在 cfg 里
+track_lin_vel = RewTerm(func=mdp.track_lin_vel_xy_exp, weight=1.5, params={"std": 0.25})
+
+# UniLab:函数进派发表 _reward_fns，权重进 reward.scales 标量字典（无 RewTerm 类）
+def tracking_lin_vel(ctx):                       # common/rewards.py，返回 [num_envs]
+    e = np.sum(np.square(ctx.info["commands"][:, :2] - ctx.linvel[:, :2]), axis=1)
+    return np.exp(-e / ctx.tracking_sigma)       # 指数核，sigma 经 reward.tracking_sigma 配
+# env._reward_fns = {"tracking_lin_vel": tracking_lin_vel, ...}
+# Hydra: reward.scales.tracking_lin_vel = 1.5
+reward = run_reward_dispatch(scales=cfg.scales, fns=self._reward_fns, ctx=ctx,
+                             info=info, ctrl_dt=self._cfg.ctrl_dt)  # 返回 Σ scale*fn(ctx) * ctrl_dt
+\end{codebox}
+
+\begin{pitfall}[reward 函数返回负值、weight 又取负 —— 负负得正]
+\textbf{错误描述}：写惩罚项时让函数直接返回负值，同时 weight 也设负。\textbf{现象后果}：负 $\times$ 负 $=$ 正，你以为在惩罚，实际在\emph{奖励}该行为——策略越发做你想禁止的动作。\textbf{根本原因}：符号约定不统一。\textbf{正确做法}：始终让 reward 函数返回\emph{非负}值，用 weight 的正负控制奖励/惩罚方向。
+\end{pitfall}
+
+% -------------------------------------------
+\subsection{ActionManager：策略的手脚}
+\label{sec:rlmc-mgr-action}
+
+\paragraph{算法主线。}ActionManager 把策略输出的 raw action 变成物理引擎可执行的控制信号，分两阶段：\Verb[breaklines]|process_action()|（步 2，一次性 scaling/clipping/offset）与 \Verb[breaklines]|apply_action()|（步 3，每个 substep 经 actuator 算力矩）。\cref{ch:rlmc-obsact} 已讲四种动作抽象（关节位置/速度/力矩/微分逆运动学）与缩放原理，这里只看 Manager 的两阶段编排。
+
+\begin{codebox}[Python]{ActionManager 两阶段处理（简化）}
+class ActionManager:
+    def process_action(self, action):                 # 步骤2:一次性
+        self.processed_action = action * self.scale + self.offset   # raw -> target
+        if self.clip:
+            self.processed_action = torch.clamp(
+                self.processed_action, self.clip_min, self.clip_max)
+    def apply_action(self):                           # 步骤3:每个 substep
+        # builtin: 写关节位置目标，MuJoCo 内部 PD 算力矩;explicit: 自算 torque=kp*(target-pos)-kd*vel
+        # mjlab 1.4.0 真实 API:set_joint_position_target(...)（位置目标）
+        #   / write_joint_position_to_sim(...)（直写 qpos），无 write_joint_targets 这个名
+        self.entity.set_joint_position_target(self.processed_action)
+\end{codebox}
+
+\paragraph{velocity 任务默认用关节位置动作。}\Verb[breaklines]|JointPositionAction| 配 \verb|scale=0.25|、\Verb[breaklines]|use_default_offset=True|，意味着策略输出 $a\in[-1,1]$ 时实际关节目标是 $\text{default\_pos}+a\times0.25$（rad）。\verb|scale=0.25| 限制探索范围在默认姿态 $\pm 0.25$ rad 内，对训练稳定性至关重要：若 scale 太大（如 1.0），训练初期随机策略可能产生极端关节位置，导致物理不稳定（NaN）。
+
+\paragraph{三框架对比。}动作类名（如 \Verb[breaklines]|JointPositionActionCfg|）在 mjlab 与 Isaac Lab 中语义对应、命名近似；actuator 模型实现不同（mjlab 经 MuJoCo builtin/explicit，Isaac Lab 经 PhysX/显式 PD）。\textbf{UniLab 无 \texttt{JointPositionActionCfg} 类}：动作固定是\emph{关节位置目标对默认姿态的残差}，在 \verb|apply_action| 里算 \Verb[breaklines]|ctrl = act * action_scale + default_angles|（UniLab commit \texttt{99936e08}，\texttt{envs/\allowbreak locomotion/\allowbreak common/\allowbreak base.\allowbreak py}；\verb|action_scale| 默认 0.25、\Verb[breaklines]|default_angles| 取自 keyframe \verb|home| 的 qpos 尾段，与 mjlab velocity 任务的 \Verb[breaklines]|scale=0.25, use_default_offset=True| 数值意图一致）。两阶段（process/apply）由 \verb|NpEnv| 模板隐式承担（\cref{ins:rlmc-mgr-unilab} 的时序里 \verb|apply_action| 后即进 \Verb[breaklines]|backend.step(ctrl, nsteps)|）。actuator 模型 = \textbf{后端位置执行器 + PD 增益}（Ideal PD 层级）：\verb|kp/kd| 经 \Verb[breaklines]|create_backend(..., position_actuator_gains={"kp": Kp, "kd": Kd})| 传入（\Verb[breaklines]|PdControlConfig| 默认 \Verb[breaklines]|Kp=35.0, Kd=0.5|），力矩/速度饱和由 MJCF/Motrix 模型自身的 actuator 定义（\verb|ctrlrange|/\allowbreak\verb|forcerange|/\allowbreak\verb|gear|）承担，\textbf{不}在 Python 配 \verb|DCMotorCfg| 等价类。UniLab 也无 learned-actuator 网络等价物（其执行器停在 Ideal PD 层级），sim2real 的执行器误差主要靠 kp/kd 域随机化覆盖（见 \cref{sec:rlmc-mgr-event} 的 UniLab DR）。
+
+% -------------------------------------------
+\subsection{TerminationManager：回合何时结束}
+\label{sec:rlmc-mgr-term}
+
+\paragraph{算法主线。}TerminationManager 决定 episode 边界，并\emph{区分}两类结束——这直接喂给 \cref{ins:rlmc-mgr-term} 所述的 GAE 自举逻辑。它维护两个 bool 张量：\verb|terminated|（真正失败）与 \verb|time_out|（超时，对应 \verb|truncated|）。
+
+\begin{codebox}[Python]{TerminationManager.compute() 区分两类结束（简化）}
+def compute(self):
+    self.terminated.zero_(); self.time_out.zero_()
+    for term_name, term_cfg in self.cfg.items():
+        result = term_cfg.func(self.env, **term_cfg.params)
+        if term_cfg.time_out:
+            self.time_out |= result        # 超时:需 bootstrap
+        else:
+            self.terminated |= result      # 真失败:value=0
+\end{codebox}
+
+\begin{codebox}[Python]{velocity 任务 termination 配置（mjlab:term 类全名 TerminationTermCfg，无 TermTerm 别名）}
+terminations = TerminationsCfg(
+    time_out=TerminationTermCfg(func=mdp.time_out, time_out=True),   # truncated
+    fell_over=TerminationTermCfg(func=mdp.bad_orientation,
+                                 params={"limit_angle": 0.5}),       # terminated, ~28.6 deg
+)
+\end{codebox}
+
+\begin{pitfall}[忘记给超时项设 time\_out=True]
+\textbf{错误描述}：超时条件 \verb|time_out| 没标 \verb|time_out=True|。\textbf{现象后果}：所有超时回合被当作 terminated、价值被设 0；策略学到「越接近回合末价值越低」，在末尾做不自然的加速或怪动作（典型表现：前 800 步走得好、最后 200 步突然抽风）。\textbf{根本原因}：truncated 被误当 terminated，GAE 自举缺失。\textbf{正确做法}：所有「超时类」终止项必须 \verb|time_out=True|。
+\end{pitfall}
+
+\paragraph{flat 与 rough 的 termination 差异（一个高发坑）。}见 \cref{tab:rlmc-mgr-flatrough}。在 rough 地形上若保留 \verb|fell_over|（姿态角检查），上坡时的合理前倾会被误判为摔倒，导致频繁 reset、训练效率极低；正确做法是改用 \Verb[breaklines]|illegal_contact|（检测特定 body 是否触地）。
+
+\begin{table}[H]
+\centering
+\caption{flat vs rough 的 termination 配置差异}
+\label{tab:rlmc-mgr-flatrough}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+termination & flat & rough & 原因 \\
+\midrule
+\verb|time_out| & 有 & 有 & 两者都有最大 episode 长度 \\
+\verb|fell_over| & 有 & 无 & rough 上合理倾斜会被误判摔倒 \\
+\Verb[breaklines]|illegal_contact| & 无 & 有 & rough 用接触传感器检测非法触地 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{三框架对比。}\textbf{这是命名陷阱最典型处}：两库的终止项配置类全名都是 \Verb[breaklines]|TerminationTermCfg|，但 \emph{短别名习惯不同}——Isaac Lab 教程常 \Verb[breaklines]|import ... as DoneTerm|，而 mjlab \textbf{不提供任何短别名}（须写全名 \Verb[breaklines]|TerminationTermCfg| 或自行 \verb|as| 重命名）。换言之 \verb|DoneTerm| 与本节为紧凑所用的 \verb|TermTerm| \textbf{都不是库导出符号}（见 \cref{ins:rlmc-mgr-alias}）——直接 \Verb[breaklines]|from mjlab.managers import DoneTerm|（或 \verb|TermTerm|）会 \verb|ImportError|；跨框架抄代码忘了改 import 即报错。\textbf{UniLab 把这个陷阱直接消除了——因为它\emph{没有}终止项类}：\verb|terminated| 在 \verb|update_state| 里直接算（UniLab commit \texttt{99936e08}，如 Go2 用 \Verb[breaklines]|gravity[:, 2] <= 0.5| 判摔倒），超时 \verb|truncated| 由基类 \Verb[breaklines]|_compute_truncated| 按 \Verb[breaklines]|max_episode_steps| 自动算，二者经 \verb@done = terminated | truncated@ 合并。值得注意的是 \cref{ins:rlmc-mgr-term} 的 terminated/truncated 区分在 UniLab 里被\textbf{固化成一个显式契约类} \Verb[breaklines]|TransitionBootstrapContract|（\texttt{base/\allowbreak final\_observation.\allowbreak py}，区分 \Verb[breaklines]|timeout_terminal_mask| 与失败终止，并用 \Verb[breaklines]|terminal_next_obs| 给终止帧的 \verb|next_obs| 打补丁，保证 bootstrap 用真终止观测而非 autoreset 后的新 obs）——这与 mjlab/Isaac 的 \verb|time_out| 标记同语义，但 UniLab 做成了数据结构而非 term 上的一个 bool 字段。
+
+% -------------------------------------------
+\subsection{EventManager：域随机化的引擎}
+\label{sec:rlmc-mgr-event}
+
+\paragraph{算法主线。}EventManager 是域随机化（domain randomization, DR）的工程实现，通过在不同时机（\cref{tab:rlmc-mgr-eventmode} 的四模式）扰动物理参数/状态，让策略对 sim-to-real 间隙更鲁棒。其原理细节属于域随机化章，这里只看模式分发。
+
+\begin{codebox}[Python]{velocity 任务 event 配置（结构示意;mdp 函数名为 Isaac-Lab 风格，mjlab DR 名不同见下）}
+# 注意:func 这一栏的名字两库不同.reset_root_state_uniform / push_by_setting_velocity
+# 在 mjlab 与 Isaac Lab 都叫这名（mjlab/envs/mdp/events.py）;但质量 DR 不同——
+# Isaac Lab 叫 randomize_rigid_body_mass，mjlab 在 mdp/dr/ 包里叫 dr.body_mass.
+events = EventCfg(
+    randomize_mass=EventTermCfg(func=mdp.randomize_rigid_body_mass,  # mjlab: func=dr.body_mass
+        mode="startup", params={"mass_distribution_params": (-0.5, 0.5)}),
+    randomize_base_pose=EventTermCfg(func=mdp.reset_root_state_uniform,
+        mode="reset", params={"pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}}),
+    push_robot=EventTermCfg(func=mdp.push_by_setting_velocity,
+        mode="interval", interval_range_s=(10.0, 15.0),
+        params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}}),
+)
+\end{codebox}
+
+\begin{insight}[startup 与 reset 的关键区别带来一次性图重建代价]\label{ins:rlmc-mgr-startup}
+\verb|startup| 的随机化在整个训练只执行一次——每个并行 world 的质量/摩擦在训练开始时确定、之后不变。若想\emph{每次 reset} 都重随机化质量，要把 mode 改成 \verb|reset|。mjlab 的实现机制（已据源码核实）：被随机化的 DR 函数上挂装饰器 \Verb[breaklines]|@requires_model_fields("body_mass", recompute=RecomputeLevel.set_const)|（\texttt{managers/\allowbreak event\_manager.\allowbreak py}），env 构造时 \Verb[breaklines]|sim.expand_model_fields(event_manager.domain_randomization_fields)|（\texttt{manager\_based\_rl\_env.\allowbreak py}）为这些字段一次性分配 per-world 内存——而 \Verb[breaklines]|expand_model_fields| 用 \verb|setattr| 换了 GPU 数组地址，故其末尾\textbf{必须 \texttt{create\_graph()} 重捕 CUDA Graph}（否则旧 graph 静默读旧数组、忽略新 per-world 值）。这是「改 reset 期 DR 字段集」带来的一次性图重建代价。所以\textbf{绝不要}在 \verb|step| 模式 event 里做会触发图重建的操作——每步重建图是性能灾难。（重算等级用枚举 \Verb[breaklines]|RecomputeLevel|，非字符串；用户不手动置 \Verb[breaklines]|_graph_captured|，捕获由 \Verb[breaklines]|wp.is_mempool_enabled| 门控自动进行。）
+\end{insight}
+
+\paragraph{三框架对比。}event 项配置类全名 \verb|EventTermCfg|（Isaac Lab 常作 \verb|EventTerm|，mjlab 无短别名）在 mjlab 与 Isaac Lab 中一致；但两库\emph{支持的模式集合}并不相同——mjlab 有四种模式（含 \verb|step|），\textbf{Isaac Lab 基础 \texttt{EventManager} 不含 \texttt{step} 模式}（其模式为 \verb|startup|/\allowbreak\verb|reset|/\allowbreak\verb|interval|，另有 USD 级 \verb|prestartup|），且 step() 内对模式的\emph{自动调度}也不同（\cref{tab:rlmc-mgr-stepdiff}：Isaac Lab step 内只自动跑 \verb|interval|）。\textbf{UniLab 无 EventManager / EventTerm}——域随机化由专门的 \Verb[breaklines]|DomainRandomizationManager| 承担（UniLab commit \texttt{99936e08}，\texttt{dr/\allowbreak manager.\allowbreak py}），模式集合是\textbf{三种}：\verb|init|（$\approx$mjlab/Isaac 的 \verb|startup|，\Verb[breaklines]|apply_init_randomization|，整训一次）、\verb|reset|（per-episode，\Verb[breaklines]|build_reset_plan| 经后端 \Verb[breaklines]|set_state(randomization=)| 写入）、\verb|interval|（步 2 自计时，\Verb[breaklines]|apply_interval_randomization_if_due(step)|）。\textbf{UniLab 无 \texttt{step} 模式}（每步无条件扰动）——逐步腐蚀（如观测噪声）在 UniLab 里由 \verb|_compute_obs| 内的 \verb|_obs_noise| 手写承担，而非一个 step-mode event。一个 UniLab 特有的工程点：每个后端经 \Verb[breaklines]|get_dr_capabilities()| 声明它支持哪些 reset 项（MuJoCo 后端静态 11 项、Motrix 后端动态门控基线 4 项），\Verb[breaklines]|filter_reset_payload| 自动剔除后端不支持的项（打 warning 跳过、不报错）——这是「同一份 DR 配置在两个后端上优雅降级」的设计，是 mjlab/Isaac 单后端时不存在的关切。
+
+% -------------------------------------------
+\subsection{CommandManager 与 CurriculumManager}
+\label{sec:rlmc-mgr-cmd}
+
+\paragraph{CommandManager（算法主线）。}它生成任务条件变量（如速度命令 $(v_x,v_y,\omega_z)$），并经 \Verb[breaklines]|generated_commands| obs term 进入 actor 观测——策略必须\emph{看到}命令才能做条件性行为。关键属性：\Verb[breaklines]|resampling_time_range|（每 $N$ 秒重采样一次命令）、\Verb[breaklines]|rel_standing_envs|（一部分环境给零命令，逼策略学会「站立」而非乱动）。
+
+\begin{codebox}[Python]{velocity 任务 command 配置（mjlab 风格）}
+commands = CommandsCfg(
+    twist=UniformVelocityCommandCfg(
+        asset_name="robot", resampling_time_range=(10.0, 10.0),
+        ranges={"lin_vel_x": (-1.0, 1.0), "lin_vel_y": (-0.5, 0.5),
+                "ang_vel_z": (-1.0, 1.0)},
+        rel_standing_envs=0.1,   # 10% 环境命令为零（站立）
+    ),
+)
+\end{codebox}
+
+\paragraph{CurriculumManager（算法主线）。}它在 reset 时调训练难度（如 rough 地形等级、命令范围）。\textbf{反事实}：若不用 curriculum 直接在最难地形训练，初期（还不会走）会频繁摔倒，大量「失败」样本让优势估计噪声极大、学习信号被淹没。curriculum 让策略先在简单地形学会基本步态，再逐步过渡——如同人学走路先平地、再台阶、再草地。
+
+\paragraph{三框架对比。}command/curriculum 概念两框架一致，配置类名近似。\textbf{UniLab 同样无 CommandManager / CurriculumManager 类}，但两个职责都有专门承担者（UniLab commit \texttt{99936e08}）：命令由 \verb|Commands|（\texttt{envs/\allowbreak locomotion/\allowbreak common/\allowbreak commands.\allowbreak py}，速度命令采样 + heading 反馈）生成，经 \Verb[breaklines]|info["commands"]| 进入 \verb|_compute_obs| 拼进 actor 观测（与「策略必须看到命令」的逻辑一致）；课程则\textbf{拆成两个独立机制}——\Verb[breaklines]|PenaltyCurriculum|（\texttt{base/\allowbreak curriculum.\allowbreak py}，按滑窗 episode 长度自适应缩放\emph{负权重} reward，识别 \verb|scales| 里 \verb|<0| 的项在 \Verb[breaklines]|[min_scale, max_scale]| 间调，原地改 \Verb[breaklines]|cfg.reward_config.scales|）与 \Verb[breaklines]|TerrainCurriculumCfg|/\allowbreak\Verb[breaklines]|TerrainSpawnManager|（地形等级）。注意 UniLab 的 \Verb[breaklines]|PenaltyCurriculum| 是「按表现\emph{放松/收紧惩罚}」，与 mjlab/Isaac 课程常做的「放宽命令范围/升地形难度」是\emph{互补}的两类课程信号。
+
+% -------------------------------------------
+\subsection{自定义 Term：三步流程}
+\label{sec:rlmc-mgr-customterm}
+
+把前面所有 Manager 的知识落到一个可操作技能上：加一个新 obs/reward term 只需三步。这也是本章\emph{可检验}目标 5 的内容。
+
+\begin{codebox}[Python]{步骤1:写纯函数（obs 返回 [N,dim]，reward 返回 [N]）}
+def maintain_base_height(env, target_height: float = 0.34) -> torch.Tensor:
+    """惩罚基座高度偏离目标，用指数核（返回非负，符号靠 weight 控制）."""
+    height = env.scene["robot"].data.root_link_pos_w[:, 2]
+    return torch.exp(-torch.square(height - target_height) / 0.01)
+\end{codebox}
+
+\begin{codebox}[Python]{步骤2:在 config 中引用}
+rewards = RewardsCfg(
+    maintain_height=RewTerm(func=maintain_base_height, weight=0.3),
+)
+\end{codebox}
+
+\begin{codebox}[bash]{步骤3:验证（zero agent 查 shape，small train 查非 NaN）}
+# zero agent:确认 obs 维度/物理姿态正确
+uv run play <TASK> --agent zero --num-envs 4
+# small train:确认 reward 非 NaN，且日志出现 Episode_Reward/maintain_height
+uv run train <TASK> --env.scene.num-envs 64 --agent.max-iterations 5
+\end{codebox}
+
+\rebuilt{上面的 \texttt{uv run play/\allowbreak train} 与 \texttt{--agent zero} 等 CLI 为 mjlab 约定；Isaac Lab 对应 \texttt{python scripts/\allowbreak .../\allowbreak train.\allowbreak py --task ...}；UniLab 对应 \texttt{uv run train --algo ppo --task <slug> --sim mujoco}（env 数/迭代数走 Hydra 覆盖，如 \texttt{algo.\allowbreak num\_envs=64 algo.\allowbreak max\_iterations=5}），但 UniLab 新增 obs/reward 是改 \texttt{update\_state}/\allowbreak\texttt{\_reward\_fns} 代码而非纯配置，故其「三步流程」第 1--2 步与 mjlab/Isaac 的「写函数+config 引用」不同。}
+
+\begin{note}[\texttt{uv run train/\allowbreak play} 还是直接 \texttt{train/play}？看你怎么装的]
+本章多处写 \Verb[breaklines]|uv run train| / \Verb[breaklines]|uv run play|，那是「克隆源码 + \texttt{uv} 管虚拟环境」的开发者形态——\Verb[breaklines]|uv run| 的作用只是「在该项目虚拟环境里执行」。但 mjlab 把 \verb|train|/\allowbreak\verb|play| 注册成了\textbf{控制台脚本（console\_scripts 入口）}：只要装进了当前已激活的环境（\Verb[breaklines]|pip install| 或在 \verb|uv| 环境内），就可\textbf{直接敲 \texttt{mjlab train ...} / \texttt{mjlab play ...}}（或视安装方式直接 \verb|train|/\allowbreak\verb|play|），\textbf{不必前缀 \texttt{uv run}}。本服务器即直接用入口脚本跑通。所以你照抄命令若提示 \Verb[breaklines]|uv: command not found| 或不在 uv 项目里，把 \Verb[breaklines]|uv run | 去掉再试——二者只是「在哪个环境执行」的差别，命令本身与所有 \verb|--env.*|/\allowbreak\verb|--agent.*| 覆盖项完全一致。\pz{究竟是 \texttt{mjlab train} 还是裸 \texttt{train} 取决于打包配置，以你那版 \texttt{--help} 实际可用的为准。}
+\end{note}
+
+\begin{pitfall}[Isaac Lab 里把 obs 组名写成 actor]
+\textbf{错误描述}：从 mjlab 迁来代码，在 Isaac Lab 里仍用 \verb|"actor"| 作 obs 组名 / runner 的 group 映射。\textbf{现象后果}：RSL-RL 的 \verb|obs_groups| 找不到对应环境 group，actor 拿不到观测。\textbf{根本原因}：Isaac Lab 环境侧默认组名是 \verb|policy|（见 \cref{ins:rlmc-mgr-asym}）。\textbf{正确做法}：环境侧用 \verb|policy|，并让 runner 的 \verb|obs_groups| 把算法角色 \verb|"actor"| 映射到环境 group \verb|"policy"|。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[动手]} 写一个自定义 obs term，返回机器人基座相对世界原点的水平距离（$[\text{num\_envs},1]$）。加入 velocity 任务并用 zero agent 验证维度。\emph{验收}：贴出函数 + 打印的 obs shape。
+  \item \textbf{[动手]} 实现 \Verb[breaklines]|maintain_base_height| reward，训练约 100 iteration，观察 WandB 的 \Verb[breaklines]|Episode_Reward/maintain_height| 曲线。\emph{验收}：曲线非零且随训练变化。
+  \item \textbf{[对比]} 把同一 obs/reward term 分别在 mjlab 与 Isaac Lab 实现，列出你遇到的所有 API 差异。\emph{验收}：至少列出 3 处（提示：组名、import 路径、终止项类名）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{Entity 与 Articulation：Manager 的数据源}
+\label{sec:rlmc-mgr-entity}
+
+\subsection{模块功能与在管线中的位置}
+
+所有 Manager 都要从某处读机器人状态（关节角、基座速度、接触力）。mjlab 的数据源是 \verb|Entity|，Isaac Lab 的是 \verb|Articulation|。理解它们的 API 差异，是写自定义 term 的前提。
+
+\subsection{配置详解与数据访问}
+
+mjlab 的 \verb|EntityCfg| 遵循「先 compile 再 run」：\verb|spec_fn| 返回一个 \verb|MjSpec|，多个 Entity 经 \verb|attach| 组合后 \verb|compile| 为 \verb|MjModel|（回顾 \cref{ch:rlmc-obsact} 提及的物理建模流程）。运行时经 \verb|EntityData| 提供状态访问，常用属性见 \cref{tab:rlmc-mgr-entitydata}。
+
+\begin{table}[ht]
+\centering
+\caption{mjlab EntityData 常用属性（$N$=num\_envs, $J$=num\_joints, $B$=num\_bodies）}
+\label{tab:rlmc-mgr-entitydata}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+属性 & 形状 & 含义 & 坐标系 \\
+\midrule
+\Verb[breaklines]|root_link_pos_w| & $[N,3]$ & 基座位置 & 世界 \\
+\Verb[breaklines]|root_link_quat_w| & $[N,4]$ & 基座四元数 (w,x,y,z) & 世界 \\
+\Verb[breaklines]|root_link_lin_vel_b| & $[N,3]$ & 基座线速度 & 机体 \\
+\Verb[breaklines]|root_link_ang_vel_b| & $[N,3]$ & 基座角速度 & 机体 \\
+\verb|joint_pos| & $[N,J]$ & 关节位置 & 关节空间 \\
+\verb|joint_vel| & $[N,J]$ & 关节速度 & 关节空间 \\
+\Verb[breaklines]|default_joint_pos| & $[N,J]$ & 默认关节位置 & 关节空间 \\
+\Verb[breaklines]|body_link_pos_w| & $[N,B,3]$ & 所有 body 的\emph{连杆原点}位置 & 世界 \\
+\Verb[breaklines]|body_com_pos_w| & $[N,B,3]$ & 所有 body 的\emph{质心}位置 & 世界 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{\texttt{\_link\_} 与 \texttt{\_com\_}：mjlab 1.4.0 把每个位姿/速度都拆成了两套。}注意上表没有笼统的 \verb|body_pos_w|——mjlab 1.4.0 把 body 与 root 的位置/姿态/速度都\textbf{显式拆成「连杆系（\texttt{\_link\_}）」与「质心系（\texttt{\_com\_}）」两套属性}（\Verb[breaklines]|body_link_pos_w|/\allowbreak\Verb[breaklines]|body_com_pos_w|、\Verb[breaklines]|root_link_pos_w|/\allowbreak\Verb[breaklines]|root_com_pos_w| 等）。原因是 MuJoCo 里一个 body 的\emph{连杆坐标原点}（你在 MJCF 里定义关节、几何挂载点的那个点）与它的\emph{质心}（动力学积分点）一般不重合；动力学（动量、力）关心 \texttt{\_com\_}，而运动学约束、足端落点、可视化关心 \texttt{\_link\_}。这比 Isaac Lab 的单一 \verb|body_pos_w| 更细——\textbf{随手写 \texttt{body\_pos\_w} 会 \texttt{AttributeError}}，得先想清你要的是连杆原点还是质心。足端高度这类几何量用 \Verb[breaklines]|body_link_pos_w|。
+
+\paragraph{机体系 vs 世界系。}locomotion 策略通常用\emph{机体系}速度（\Verb[breaklines]|root_link_lin_vel_b|）——策略应学「向前走」而非「向北走」。obs term \verb|base_lin_vel| 默认返回的就是机体系速度。
+
+\begin{insight}[别照抄属性名——学会一行列出\emph{你这版}的全部字段]\label{ins:rlmc-mgr-introspect}
+本章这张 \cref{tab:rlmc-mgr-entitydata} 是全章\textbf{最易随版本漂移}的表（\verb|body_pos_w| 在某些旧文档里有、mjlab 1.4.0 已拆成 \texttt{\_link\_}/\allowbreak\texttt{\_com\_} 两套就是活例）。与其把这张表当字典背，不如记住：\textbf{任何一版的真实属性，都能用一行 Python 当场列出}，不必猜、不必翻文档：
+\begin{codebox}[Python]{当场列出某 Entity 数据对象的全部公开属性（不靠记忆、不翻文档）}
+# 构造好 env 后（mjlab:from mjlab.tasks.registry import load_env_cfg 起步）:
+robot = env.scene["robot"]
+print([a for a in dir(robot.data) if not a.startswith("_")])
+# 你会看到 body_link_pos_w / body_com_pos_w 等真实名;找不到 body_pos_w 正说明它在本版不存在
+# 等价地，直接读源码的 dataclass 定义:src/mjlab/entity/data.py 里 EntityData 的字段列表
+\end{codebox}
+\noindent 这正是本章反复强调的「学查法、不背数字」落到\emph{这张最该自查的表}上——下次换版本属性名变了，你用这一行 5 秒自查，而非被书里的旧名带沟里。
+\end{insight}
+
+\subsection{三框架对比：完整 API 对照}
+
+\cref{tab:rlmc-mgr-entityapi} 是 mjlab Entity 与 Isaac Lab Articulation 的对照表。\pz{具体属性名仍以各框架你所装版本为准；另需注意 Isaac Lab 3.0 起的两处官方 Breaking Change：\texttt{data.*} 返回类型由 \texttt{torch.\allowbreak Tensor} 改为 Warp 数组、四元数由 wxyz 改为 xyzw（见下方两个陷阱）。}
+
+\begin{table}[ht]
+\centering
+\caption{mjlab Entity 与 Isaac Lab Articulation 的 API 对照}
+\label{tab:rlmc-mgr-entityapi}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+操作 & mjlab Entity & Isaac Lab Articulation \\
+\midrule
+基座位置 & \Verb[breaklines]|data.root_link_pos_w| & \Verb[breaklines]|data.root_pos_w| \\
+基座四元数 & \Verb[breaklines]|data.root_link_quat_w| & \Verb[breaklines]|data.root_quat_w| \\
+基座线速度(世界) & \Verb[breaklines]|data.root_link_lin_vel_w| & \Verb[breaklines]|data.root_vel_w[:, :3]| \\
+基座线速度(机体) & \Verb[breaklines]|data.root_link_lin_vel_b| & 需手动转换 \\
+关节位置 & \Verb[breaklines]|data.joint_pos| & \Verb[breaklines]|data.joint_pos| \\
+默认关节角 & \Verb[breaklines]|data.default_joint_pos| & \Verb[breaklines]|data.default_joint_pos| \\
+设置关节位置目标 & \Verb[breaklines]|set_joint_position_target(...)| & \Verb[breaklines]|set_joint_position_target(...)| \\
+重置基座位姿 & \Verb[breaklines]|write_root_link_pose_to_sim| & \Verb[breaklines]|write_root_pose_to_sim| \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{insight}[mjlab 直接给机体系速度，是面向 locomotion 的贴心优化]\label{ins:rlmc-mgr-bodyframe}
+mjlab 的 Entity 直接暴露机体系速度 \Verb[breaklines]|root_link_lin_vel_b|，而 Isaac Lab 的 Articulation 只给世界系速度，需在 obs term 里用基座四元数手动转到机体系。对 locomotion 这是个小但高频的便利——因为几乎每个本体感知观测都要机体系量。\textbf{UniLab 数据源}：UniLab 没有 Entity/Articulation 这种「资产对象」，状态来自 \verb|NpEnvState|（\Verb[breaklines]|obs/reward/terminated/truncated/info/final_observation| 的不可变快照，UniLab commit \texttt{99936e08}）加一组\emph{后端 getter}——\Verb[breaklines]|get_local_linvel()|、\verb|get_gyro()|、\verb|get_dof_pos()|/\allowbreak\verb|get_dof_vel()|、\Verb[breaklines]|get_base_pos()|、\Verb[breaklines]|get_sensor_data(name)|。关键对照：UniLab \textbf{也}直接给机体系速度（后端 \verb|SimBackend| 的 \Verb[breaklines]|get_body_lin_vel_b()| / 便利方法 \Verb[breaklines]|get_local_linvel()| 走机体系传感器），与 mjlab 的便利一致、优于 Isaac Lab 2.x 需手动转换——三框架在「机体系速度可得性」上是 mjlab 与 UniLab 同档、Isaac Lab 需自己转。
+\end{insight}
+
+\begin{pitfall}[假设两框架四元数格式相同]
+\textbf{错误描述}：把 mjlab 的四元数直接喂给按另一约定写的旋转函数。\textbf{现象后果}：旋转计算结果错乱、姿态相关 obs/reward 全错，但不报错。\textbf{根本原因}：mjlab 与 Isaac Lab 2.x 用 wxyz（MuJoCo 约定），而 Isaac Lab 3.0 起改为 xyzw——其 v3.0.0-beta 发布说明在「Breaking Changes」里明确「所有四元数统一改用 XYZW 顺序，以对齐 Warp / PhysX / Newton 约定」。\textbf{正确做法}：先确认你所用 Isaac Lab 主版本（2.x=wxyz / 3.x=xyzw），跨约定时显式重排分量（3.0 另附 quaternion-finder 工具帮你定位硬编码的四元数）。
+\end{pitfall}
+
+\begin{pitfall}[Isaac Lab 3.0 忘记把数据转 torch 张量]
+\textbf{错误描述}：在 3.0 上像 2.x 那样直接对 \verb|data.*| 做 torch 运算。\textbf{现象后果}：tensor 类型错误。\textbf{根本原因}：Isaac Lab 3.0 的数据管线返回类型有变——据其 v3.0.0-beta 发布说明，所有 \texttt{.data.*} 属性改为返回 \texttt{wp.array}（NVIDIA Warp 数组）而非 \texttt{torch.\allowbreak Tensor}（内部状态缓冲改用 \texttt{wp.vec3f}/\allowbreak\texttt{wp.quatf} 等结构化 Warp 类型）。\textbf{正确做法}：在 3.0 上需要 torch 运算时，先用 \texttt{wp.\allowbreak to\_torch()} 把 \texttt{data.*} 转成张量再算（2.x 仍直接是 torch 张量，不需此步）。
+\end{pitfall}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[动手]} 分别在 mjlab 与 Isaac Lab 中获取机器人基座高度，写出含「如何从 env 取 robot 对象」的完整片段。\emph{验收}：两段代码 + 指出 \Verb[breaklines]|root_link_pos_w| vs \verb|root_pos_w| 的差异。
+  \item \textbf{[动手]} 写一个 obs term，返回四个足端的世界系高度（$[\text{num\_envs},4]$）。\emph{验收}：说明如何由 \Verb[breaklines]|body_link_pos_w| 与 body 名索引取到四个足端的 $z$ 分量（提示：\Verb[breaklines]|entity.body_names| 给名字、\Verb[breaklines]|body_link_pos_w| 取连杆原点；想清为何用 \verb|_link_| 而非 \verb|_com_|）。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{接线诊断：能跑但不学习}
+\label{sec:rlmc-mgr-debug}
+
+\subsection{模块功能与在管线中的位置}
+
+「看似能跑但不学习」最常见的根因是\textbf{接线（wiring）错误}——数据流链路上某个连接点接错了，但\emph{不报错}。本节给一套系统诊断法，把前面所有时序/Manager 知识用于实战排错。
+
+\subsection{从 Sensor 到 Manager 的数据流}
+
+Sensor 是 Manager 的「数据源扩展」——它提供 Entity 不直接暴露的物理信息（接触力、地形高度、射线检测）。\textbf{一个 sensor 可服务多个 Manager 的多个 term}：例如足端接触传感器同时供 critic obs 的 \verb|foot_contact|、reward 的 \verb|air_time|/\allowbreak\verb|foot_slip|/\allowbreak\verb|soft_landing| 等多项。
+
+\begin{insight}[一个拼错的 regex 让一串 term 同时静默失效]\label{ins:rlmc-mgr-wiring}
+若接触传感器的 geom 名正则拼错（如 \verb|"FL_foot"| 写成 \verb|"fl_foot"|），\emph{上述所有} term 同时失效——但\textbf{不报错}：regex 匹配到空集，sensor 返回全零数据，依赖它的 reward 恒为零、obs 恒为零列。这就是为什么「reward 为零」要先查 sensor 接线，而非先调权重。Sensor 在 \verb|env.step()| 时序里位于步 16（\verb|sim.sense()|，在 forward 之后、obs 之前），所以 obs 拿到最新 sensor 数据，而 reward（步 10）拿到的是上一步更新值——又一次印证 \cref{sec:rlmc-mgr-step} 的时序。
+\end{insight}
+
+\subsection{运行验证：系统诊断流程}
+
+按 \cref{tab:rlmc-mgr-diag} 顺序排查，从「物理层」到「配置层」逐级收敛——类似调试网络问题的分层思想（先查物理层网线，再查应用层协议）。
+
+\begin{table}[ht]
+\centering
+\caption{接线错误的系统诊断流程}
+\label{tab:rlmc-mgr-diag}
+\small
+\begin{tabular}{@{}cll@{}}
+\toprule
+步 & 操作 & 检查什么 \\
+\midrule
+1 & zero agent 可视化 & 初始姿态是否正确？有无穿地/浮空/扭曲？ \\
+2 & 打印 obs 张量 shape & 维度是否符合预期？有无意外的全零列？ \\
+3 & 打印每个 reward term & 哪些 term 恒为零？（多半 sensor 接线问题） \\
+4 & 打印 sensor 原始数据 & sensor 是否真检测到接触/地形？ \\
+5 & 检查 regex 匹配 & sensor 的 geom regex 是否匹配到正确 geom？ \\
+6 & 对比 play vs train cfg & 两者 obs/reward 配置是否一致？ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\cref{tab:rlmc-mgr-wiringbugs} 列出五种最隐蔽的接线错误及其诊断方法。
+
+\begin{table}[ht]
+\centering
+\caption{五种最隐蔽的接线错误}
+\label{tab:rlmc-mgr-wiringbugs}
+\footnotesize
+\begin{tabular}{@{}lllp{0.2\linewidth}@{}}
+\toprule
+错误 & 表现 & 根因 & 诊断 \\
+\midrule
+sensor geom 名拼错 & contact reward 恒零 & regex 匹配空集 & 打印 sensor 命中状态 \\
+actor obs 缺 command & 策略走但不跟命令 & 漏 \Verb[breaklines]|generated_commands| & 打印 obs 维度 \\
+flat 保留 terrain scan & 变慢但不报错 & 引用了不需要的 sensor & 查 flat cfg 的 sensor 列表 \\
+rough 保留 \verb|fell_over| & 合理斜坡姿态被判摔倒 & 姿态限制不适合地形 & 查 termination 计数 \\
+obs 组名不匹配 & RSL-RL 拿不到 obs & \verb|actor| vs \verb|policy| & 查 runner 的 \verb|obs_groups| \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{一次真实排错：从「reward 不涨」到定位失效 term（可复制命令序列）}
+\label{sec:rlmc-mgr-debugwalk}
+
+\cref{tab:rlmc-mgr-diag} 给的是\emph{诊断思路}，但读者最需要的是「我到底敲哪几条命令、看哪一行」。下面用 mjlab 把上表的步 1--3 走成一条\textbf{可照抄的命令序列}——这正是「sensor geom 名拼错 $\to$ contact reward 恒零」这个最高发坑的真实排查路径。
+
+\paragraph{第 0 步：先确认「跑通」长什么样——首跑必盯的三行输出。}任何一次训练\emph{刚启动}时，终端会滚动打印 RSL-RL 的迭代摘要。你只需盯死\textbf{三行信号}，缺一即出问题（\cref{tab:rlmc-mgr-firstrun}）：
+
+\begin{table}[ht]
+\centering
+\caption{首跑必盯的三行终端输出（mjlab / Isaac Lab 的 RSL-RL 摘要）}
+\label{tab:rlmc-mgr-firstrun}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+盯哪一行 & 健康样子 & 不对劲说明 \\
+\midrule
+\Verb[breaklines]|Steps per second| & 稳定的正数（本机 Go1\,@64env $\approx$2000） & 0 或持续掉 $\Rightarrow$ 物理/渲染卡住 \\
+\Verb[breaklines]|Value function loss| & 有限、随迭代下降 & \verb|nan|/暴涨 $\Rightarrow$ obs 含 NaN 或 lr 太大 \\
+\Verb[breaklines]|Episode_Reward/<term>| & 至少 tracking 项非零 & 某项恒 0 $\Rightarrow$ 该 term 接线失效 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{codebox}[bash]{第 1--2 步:极短训练，把每个 reward 分项打出来（mjlab，已实测此输出形态）}
+# 关掉 wandb 上传、只跑 2 迭代 64 环境，让 RSL-RL 把分项 reward 刷到终端
+WANDB_MODE=disabled mjlab train Mjlab-Velocity-Flat-Unitree-Go1 \
+    --env.scene.num-envs 64 --agent.max-iterations 2
+# 在滚动输出里找 Episode_Reward/ 开头的行（每个 RewTerm 一行），形如:
+#   Episode_Reward/track_linear_velocity   0.0142     <- 非零，正常
+#   Episode_Reward/track_angular_velocity  0.0091     <- 非零，正常
+#   Episode_Reward/feet_slip               0.0000     <- 恒零！这一项接线失效
+\end{codebox}
+
+\paragraph{第 3 步：读出结论并收敛。}哪个 \Verb[breaklines]|Episode_Reward/<term>| 恒为 \verb|0.0000|，失效的就是\emph{那一项}——\textbf{不必逐行看代码}。上例 \verb|feet_slip| 恒零，按 \cref{ins:rlmc-mgr-wiring} 的逻辑：它依赖足端接触传感器，最可能是 sensor 的 geom 正则匹配到了空集（如把 \verb|FL_foot| 误写成小写）。于是排查从「整个奖励系统」一步收敛到「这一个 sensor 的 geom 名」，再去查该 sensor 的 regex 是否命中（\cref{tab:rlmc-mgr-diag} 步 4--5）。\textbf{这就是「打印各 term」相对「逐行排查」的真实威力}——它把 \cref{tab:rlmc-mgr-speedup} 里「定位 reward 为零」那一行的「打印各 term」从一句口号变成了你刚敲过的命令。
+
+\begin{note}[三框架的 reward 日志前缀不同，跨框架查曲线别找错命名空间]
+同一个「分项 reward」在三框架的日志键\textbf{前缀不一样}，跨框架排错时极易在 TensorBoard/WandB 里找不到曲线：mjlab 与 Isaac Lab（走 RSL-RL）都是 \Verb[breaklines]|Episode_Reward/<term>|（如 \Verb[breaklines]|Episode_Reward/feet_slip|）；而\textbf{UniLab 实测是 \texttt{reward/\allowbreak <term>}}（如 \Verb[breaklines]|reward/tracking_lin_vel|，无 \texttt{Episode\_} 前缀）。所以本节的「找 \Verb[breaklines]|Episode_Reward/<term>=0|」在 UniLab 上要改成找 \Verb[breaklines]|reward/<term>=0|。记住这条前缀差异，省得你对着 UniLab 日志搜 \Verb[breaklines]|Episode_Reward| 一无所获、误以为「没打分项」。
+\end{note}
+
+\subsection{三框架对比：诊断入口}
+
+\begin{itemize}
+  \item \textbf{mjlab}：\Verb[breaklines]|uv run play <TASK> --agent zero|（零动作看纯物理）、\Verb[breaklines]|--agent.max-iterations 2| 小训查日志；mjlab 另有针对腿足训练「NaN 爆炸」的 NaN Guard 工具（\texttt{NanGuard}/\allowbreak\texttt{NanGuardCfg}，经 \texttt{sim.\allowbreak nan\_guard.\allowbreak watch(data)} 挂载），可在检测到 NaN 时暂停、记录首次出现的环境与物理变量并支持回放\,\cite{mjlab2026}；命令行用 \texttt{--enable-nan-guard True} 开启（已据 mjlab 1.4.0 实测确认，回放命令名仍以你所装版本 \texttt{--help} 为准）。
+  \item \textbf{Isaac Lab}：经脚本参数（如 \verb|--num_envs|）控制小规模调试；默认 NaN 行为不如 mjlab 友好（NaN 常直接 crash），需自行加 NaN 检测。
+  \item \textbf{UniLab}：可视化用 \textbf{Viser}（web 3D，\Verb[breaklines]|--render-mode interactive| 浏览器远程看，跨境/无 X 都行）+ 直接读 \verb|NpEnvState|；NaN 处理是其工程亮点——\verb|NpEnv| 内建 \verb|NanGuard|（UniLab commit \texttt{99936e08}，\texttt{utils/\allowbreak nan\_guard.\allowbreak py}）：\verb|check_ctrl| 查动作 NaN、\verb|check| 查 obs/reward NaN、\verb|capture| 存物理快照（环缓存最近 \verb|buffer_size| 帧），命中即 \verb|dump| 写 \Verb[breaklines]|nan_dump_*.npz|（含状态环缓冲 + 复制模型文件），事后 \Verb[breaklines]|unilab-viz-nan <dump>| 用 \verb|mujoco.viewer| 离线回放出事前那几帧（默认 \verb|enabled=true|，且 \verb|step()| 末尾还有兜底 \Verb[breaklines]|np.nan_to_num(reward)|）——这与 mjlab 的 NaN Guard 是\emph{同级}的成熟工具，二者都\textbf{优于} Isaac Lab（NaN 常直接 crash）。另有 \verb|--profile| 产 chrome-trace 时间片，可视化 collector/learner/H2D 重叠（异构架构特供的诊断视角）。
+\end{itemize}
+
+\begin{practice}[本节练习]
+\begin{enumerate}
+  \item \textbf{[动手]} 给一个能跑的 velocity 任务，故意把某接触传感器的 geom regex 拼错，训练 2 iteration，观察哪些 \Verb[breaklines]|Episode_Reward/<term>| 变为零。\emph{验收}：列出受影响的 term，并说明为何不报错。
+  \item \textbf{[诊断]} 训练 reward 不涨。按 \cref{tab:rlmc-mgr-diag} 写出你的前三步排查动作与各自的预期观察。\emph{验收}：每步给出「看什么 + 正常/异常如何区分」。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section*{常见误解汇总}
+\label{sec:rlmc-mgr-misconceptions}
+\addcontentsline{toc}{section}{常见误解汇总}
+
+\begin{table}[H]
+\centering
+\caption{本章常见误解与正确理解}
+\label{tab:rlmc-mgr-misc}
+\small
+\begin{tabular}{@{}p{0.42\linewidth}p{0.5\linewidth}@{}}
+\toprule
+误解 & 正确理解 \\
+\midrule
+Manager-Based 只是代码更整洁 & 它有明确工程收益——消融从「复制文件」变「改一行配置」 \\
+env.step() 的顺序无所谓 & 顺序决定 obs/reward/termination 的数据对齐，改错可致训练失败 \\
+obs 与 reward 看到同一帧数据 & obs 在 \verb|sim.forward()| 之后、reward 在之前，差一个 substep \\
+PPO 每步都更新网络 & 先 rollout 收 $N$ 步，再 update 做 $M$ 次梯度更新，交替进行 \\
+两框架 Manager API 完全相同 & 命名有差异（actor vs policy、EntityCfg vs ArticulationCfg；终止项全名同为 \texttt{TerminationTermCfg}，但 Isaac Lab 常别名 \texttt{DoneTerm}、mjlab 无短别名） \\
+terminated 与 truncated 一样 & terminated 真失败、truncated 超时——PPO 自举处理不同 \\
+Manager 加载顺序随意 & 顺序编码依赖——EventManager 须最先加载 \\
+自定义 term 可修改 env 状态 & obs/reward term 应只读；改状态用 event term \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+\label{sec:rlmc-mgr-summary}
+\addcontentsline{toc}{section}{本章小结}
+
+本章从 PPO 训练循环出发，放大 \verb|env.step()| 这一行：先确立「env.step 是数据生产者、PPO 是消费者」的分工（\cref{ins:rlmc-mgr-producer}），再逐步解析其内部时序（\cref{tab:rlmc-mgr-step18}）与六个设计洞察，对比单体架构与 Manager-Based 的工程差异（\cref{ins:rlmc-mgr-value}），最后在每个 MDP 组件下排布 mjlab / Isaac Lab / UniLab 的对比实战。\textbf{算法主线（PPO 的数据需求）决定了每个 Manager 的职责与时序位置}——这是本章一以贯之的逻辑。
+
+\paragraph{术语速查。}\cref{tab:rlmc-mgr-glossary} 汇总本章核心术语。
+
+\begin{table}[H]
+\centering
+\caption{本章术语速查}
+\label{tab:rlmc-mgr-glossary}
+\footnotesize
+\begin{tabular}{@{}lll@{}}
+\toprule
+术语 & 含义 & 首次出现 \\
+\midrule
+rollout & PPO 数据收集阶段，调 env.step() 收 transition & \cref{sec:rlmc-mgr-ppo} \\
+update & PPO 梯度更新阶段，不调 env.step() & \cref{sec:rlmc-mgr-ppo} \\
+decimation & 一个 policy step 内调 sim.step() 的次数 & \cref{sec:rlmc-mgr-step} \\
+\verb|step_dt| & policy 时间步 $=\text{physics\_dt}\times\text{decimation}$ & \cref{sec:rlmc-mgr-step} \\
+terminated & 任务真失败，价值取 0 & \cref{sec:rlmc-mgr-wrapper} \\
+truncated & 超时，价值需自举 & \cref{sec:rlmc-mgr-wrapper} \\
+Manager-Based & 把 MDP 组件拆到独立 Manager 的架构 & \cref{sec:rlmc-mgr-why} \\
+Term & Manager 的基本配置单元（ObsTerm/RewTerm/...） & \cref{sec:rlmc-mgr-why} \\
+wiring & sensor $\to$ obs/reward 的数据流连接 & \cref{sec:rlmc-mgr-debug} \\
+\Verb[breaklines]|enable_corruption| & 是否给 obs 加噪（actor True, critic False） & \cref{sec:rlmc-mgr-obs} \\
+\verb|scale_by_dt| & RewardManager 是否用 dt 缩放 reward & \cref{sec:rlmc-mgr-reward} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{知识点总表。}\cref{tab:rlmc-mgr-knowledge} 列出本章知识点（难度以星级在表内标注，不进标题）。
+
+\begin{table}[H]
+\centering
+\caption{本章知识点总表}
+\label{tab:rlmc-mgr-knowledge}
+\footnotesize
+\begin{tabular}{@{}clll@{}}
+\toprule
+编号 & 知识点 & 对应节 & 难度 \\
+\midrule
+1 & PPO rollout/update 两阶段，env.step 是生产者 & \cref{sec:rlmc-mgr-ppo} & $\star\star$ \\
+2 & terminated/truncated 区分与 GAE 自举 & \cref{sec:rlmc-mgr-wrapper} & $\star\star$ \\
+3 & env.step() 内部时序（相对顺序） & \cref{sec:rlmc-mgr-step} & $\star\star\star$ \\
+4 & reward 在 forward 前算（滞后一 substep） & \cref{sec:rlmc-mgr-step} & $\star\star\star$ \\
+5 & obs 在 reset 后算（返回新 episode 初始 obs） & \cref{sec:rlmc-mgr-step} & $\star\star\star$ \\
+6 & EventManager 四模式 & \cref{sec:rlmc-mgr-step} & $\star\star$ \\
+7 & 单体 vs Manager-Based 的工程差异 & \cref{sec:rlmc-mgr-why} & $\star\star\star$ \\
+8 & Manager 加载顺序 $\ne$ 运行顺序 & \cref{sec:rlmc-mgr-why} & $\star\star\star$ \\
+9 & 两框架命名差异（actor/policy；全名 \texttt{TerminationTermCfg} vs Isaac 别名 \texttt{DoneTerm}） & \cref{sec:rlmc-mgr-managers} & $\star\star\star$ \\
+10 & RewardManager 的 dt 缩放 & \cref{sec:rlmc-mgr-reward} & $\star\star$ \\
+11 & 自定义 Term 三步流程 & \cref{sec:rlmc-mgr-customterm} & $\star\star$ \\
+12 & Entity vs Articulation 数据源 & \cref{sec:rlmc-mgr-entity} & $\star\star$ \\
+13 & 接线错误的系统诊断 & \cref{sec:rlmc-mgr-debug} & $\star\star\star$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\label{sec:rlmc-mgr-further}
+\addcontentsline{toc}{section}{延伸阅读}
+
+\begin{itemize}
+  \item \textbf{mjlab（arXiv:2601.22074，``mjlab: A Lightweight Framework for GPU-Accelerated Robot Learning''）}\,\cite{mjlab2026}——教 MuJoCo Warp 后端如何复刻 Isaac Lab 的 Manager-Based API，并暴露原生 \verb|MjModel|/\allowbreak\verb|MjData|；其源码用 \verb|WarpBridge| 把 warp 数组零拷贝暴露成 torch 张量（\verb|TorchArray|）。对照本章的 env.step 时序与 Manager 设计阅读。
+  \item \textbf{Isaac Lab / Orbit（arXiv:2301.04195）}\,\cite{isaaclab2024}——教 Manager-Based 架构的原型设计与模块化环境构建；其官方「创建 Manager-Based RL 环境」教程是入门 ObsTerm/RewTerm/DoneTerm 的最短路径。
+  \item \textbf{UniLab（arXiv:2605.30313）}\,\cite{unilab2026}——教「GPU 仿真主导」之外的第三条路：异构 CPU 物理 + GPU 策略、经共享内存 IPC（\Verb[breaklines]|SharedWeightSync|/\allowbreak\verb|ReplayBuffer|）解耦 collector 与 learner。对照本章看「同一条 MDP 数据流为何\emph{不必}拆成 Manager」（\cref{ins:rlmc-mgr-unilab}），以及 APPO/SAC 等异步 off-policy 为何天然契合这套架构。
+  \item \textbf{RSL-RL（arXiv:2509.10771）}\,\cite{schwarke2025rslrl}——教面向机器人的紧凑 PPO 实现、actor/critic 分离与 VecEnv Wrapper（terminated/truncated$\to$dones 的处理）。
+  \item \textbf{PPO 原始论文（arXiv:1707.06347）}\,\cite{schulman2017ppo}——教 clip 目标与多 epoch mini-batch 更新的由来；本章假定你已掌握，列此备查。
+  \item \textbf{「分钟级学步」（CoRL 2021, arXiv:2109.11978）}\,\cite{rudin2021minutes}——教大规模并行 + 课程学习的腿足 RL 范式，也是 legged\_gym 单体架构的来源，对照理解本章的「Manager-Based 解决了什么」。
+  \item \textbf{《PPO 的 37 个实现细节》（ICLR Blog Track, 2022）}\,\cite{huang202237ppo}——教 PPO 工程化的隐性细节（含 advantage 归一化、value clipping 等），是排查「reward 涨但行为怪」的权威参考。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{故障排查手册}
+\label{sec:rlmc-mgr-troubleshoot}
+\addcontentsline{toc}{section}{故障排查手册}
+
+\begin{table}[H]
+\centering
+\caption{Manager 配置与跨框架问题排查}
+\label{tab:rlmc-mgr-faq}
+\footnotesize
+\begin{tabular}{@{}p{0.22\linewidth}p{0.24\linewidth}p{0.28\linewidth}l@{}}
+\toprule
+症状 & 可能原因 & 排查步骤 & 相关节 \\
+\midrule
+obs 维度不符 & ObsTerm 返回错误 shape & 打印每个 term 输出 shape & \cref{sec:rlmc-mgr-obs} \\
+reward 恒为零 & reward 读到空数据（如 sensor 名拼错） & 打印 raw reward + sensor 命中 & \cref{sec:rlmc-mgr-debug} \\
+策略不跟命令 & actor obs 缺 command 项 & 查 obs 是否含 \Verb[breaklines]|generated_commands| & \cref{sec:rlmc-mgr-cmd} \\
+价值自举不对 & terminated/truncated 未区分 & 查 Wrapper 的 dones/time\_outs & \cref{sec:rlmc-mgr-wrapper} \\
+末尾行为变怪 & 超时项漏 \verb|time_out=True| & 查 TerminationManager 配置 & \cref{sec:rlmc-mgr-term} \\
+迁移后 obs 组找不到 & actor vs policy 命名差异 & 查 runner 的 \verb|obs_groups| & \cref{sec:rlmc-mgr-managers} \\
+四元数计算错 & wxyz vs xyzw 约定差异 & 确认框架版本与约定 & \cref{sec:rlmc-mgr-entity} \\
+rough 频繁 reset & 保留了 \verb|fell_over| & 改用 \Verb[breaklines]|illegal_contact| & \cref{sec:rlmc-mgr-term} \\
+decimation 改后 reward 变 & dt 缩放使密度改变 & 确认 \verb|scale_by_dt| & \cref{sec:rlmc-mgr-reward} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{版本信息速查}
+\label{sec:rlmc-mgr-versioninfo}
+\addcontentsline{toc}{section}{版本信息速查}
+
+本章 API/时序/默认值锚定：mjlab 1.4.0、Isaac Lab 2.x（3.0 差异以批注标注）、\verb|rsl_rl| $\ge 4.0$、UniLab commit \texttt{99936e08}（后端 \texttt{mujoco-uni}\,3.8.0 / \texttt{motrixsim-core}\,0.8.2）。\textbf{所有具体版本号、类名、默认数值均应以你机器上实测为准}（见 \cref{tab:rlmc-mgr-versions}）——Manager-Based 架构在两框架中持续演进，本章价值在「读源码、对时序、查默认值」的方法，而非记住某版数字。UniLab 相关内容（安装、注册、env.step 时序、各 MDP 组件对应实现、数据源、调试入口）已据实跑+读源补全；其根本特征是\textbf{非 Manager-Based 的异构 CPU-sim + GPU-policy 架构}（\cref{ins:rlmc-mgr-unilab}），故其槽位写的是「第三种架构的真实对应」而非 Manager 类名映射。

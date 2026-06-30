@@ -1,0 +1,1220 @@
+\chapter{足式状态估计}
+\label{ch:quad_est}
+
+% \cnum（字体无关带圈数字）已上提到 common/preamble.tex，全书统一，勿在此重定义。
+
+% ════════════════════════════════════════════════════════════════
+%  四足机器人运动控制部 —— 足式状态估计。
+%  组织主线：旋转直读 + 平动滤波二分；触地检测是混合控制开关。
+%  通用 KF/ESKF/InEKF 一律 \cref 不重推（ch:eskf / ch:invariant-filter / ch:imu / ch:leg）。
+% ════════════════════════════════════════════════════════════════
+
+\begin{practice}[前置自测]
+开始之前，先试答下列问题。若已能流畅作答，可只速读本章表格与速查卡；若卡住，正是本章要为你解决的。
+\begin{enumerate}
+  \item 四足机器人的关节角可由编码器直接读出，机身姿态可由 IMU 直接读出。那么为什么机身在世界系下的\emph{位置}与\emph{速度}\,\emph{无法}被任何单一传感器直接测量？要估计它们，最少需要哪两类信息？
+  \item 把 IMU 加速度计的读数直接做两次时间积分得到位置，理论上没错。可为什么真机上这样做几秒钟内就会漂移到“飞出房间”？而纯靠腿部运动学（足端不动、反推机身移动）又会在什么情况下突然崩掉？
+  \item 一条腿“已经触地却没被检测到”，与“还在空中却被误判成触地”，分别会让支撑相力控/摆动相位控这套\emph{混合控制}发生什么灾难？哪一类后果更危险？
+  \item 直觉上,测“足端接触力”只要在脚底贴一片力传感器即可。为什么四足工程上几乎\emph{不}这么做，而宁愿用关节电机的扭矩去\emph{反推}接触力？
+  \item 想用“模型预期扭矩 vs.\ 实际扭矩”之差判断是否受到外部接触力。这个朴素思路需要关节加速度 $\ddot{\boldsymbol q}$。$\ddot{\boldsymbol q}$ 从哪来、为什么用它会出大问题？有没有办法\emph{绕过}它？
+  \item 足式里程计的状态里塞进了 $4$ 个足端的世界系位置。为什么对支撑足可以写出“它在世界系里\emph{不动}”这条强约束？这条约束如何变成卡尔曼滤波能用的\emph{观测}？一旦这条腿抬起来摆动，这条观测还能信吗？
+\end{enumerate}
+\end{practice}
+
+\section*{本章目标}
+学完本章，你应当能够：
+\begin{enumerate}
+  \item \textbf{说清}状态估计为何是“控制的根”——无准确状态则无稳定反馈，并据此把四足估计任务拆成\emph{姿态（易，直读）}与\emph{位置/速度（难，须融合）}两条线（\cref{sec:qe-why}）；
+  \item \textbf{论证}纯 IMU 积分与纯运动学里程计各自为何不够，以及触地误判的两类灾难后果\emph{如何逼出}触地检测、力传感器的四条短板\emph{如何逼出}本体感知路线（\cref{sec:qe-naive}）；
+  \item \textbf{推导}IMU 的质量-弹簧物理模型，得到“读数 $=$ 真实加速度 $-$ 旋转后的重力”这一耦合关系，并把 IMU 安装偏置标定链 $\to$ 躯干姿态合成走全（\cref{sec:qe-imu}）；
+  \item \textbf{掌握}足端触地检测三法：力阈值法及其缺陷、广义动量接触力观测器（GM，逐步消去 $\ddot{\boldsymbol q}$）、概率融合触地（相位先验 $\times$ 多路测量似然）（\cref{sec:qe-contact}）；
+  \item \textbf{建立}$18$ 维足式里程计的连续状态方程（足端静止假设）并前向欧拉离散为 $\mathbf{A}_k,\mathbf{B}_k$，理解“输入取重力”与“输入取机身净加速度”两种等价写法（\cref{sec:qe-state}）；
+  \item \textbf{推导}$28$ 维观测方程——正向运动学得本体系足端位置、雅可比得足端速度、不打滑约束得质心速度观测、零高度假设得足高观测——并用摆动足协方差膨胀把触地状态缝进滤波器（\cref{sec:qe-obs}）；
+  \item \textbf{落地}离散卡尔曼滤波的预测/更新两步（Joseph 形协方差），走通一个单步数值例，并把通用 KF/ESKF/InEKF 的处理指向 \cref{ch:eskf,ch:invariant-filter}（\cref{sec:qe-kf}）；
+  \item \textbf{规避}高度漂移、简化协方差更新失对称、符号冲突等陷阱，完成 $\mathbf{Q}/\mathbf{R}$ 整定与部署（\cref{sec:qe-pitfall,sec:qe-practice}）。
+\end{enumerate}
+
+\subsection*{本章知识导航}
+本章是一条“\emph{机器人怎么知道自己在哪儿、跑多快}”的主线。一条核心二分贯穿全章：\textbf{姿态由 IMU 直读 $+$ 坐标变换即可；位置与速度难测，须用卡尔曼滤波把 IMU 与足底运动学融合成‘足式里程计’}。结构如下：
+
+\begin{center}
+\begin{forest} navtreeLR
+[{足式状态估计\\（四足运动控制）}
+  [{为何要估计\\状态=控制的根}
+    [{姿态易 / 平动难}] ]
+  [{反面与触地\\两类误判灾难}
+    [{为何不用力传感器}] ]
+  [{IMU 模型\\读数$=a-Rg$}
+    [{安装偏置标定链}] ]
+  [{触地检测\\力阈值/GM/概率融合}
+    [{GM 消去 $\ddot q$}] ]
+  [{里程计 KF\\18 维状态+28 维观测}
+    [{不打滑约束\\协方差膨胀}] ]
+]
+\end{forest}
+\end{center}
+
+\noindent\textbf{推荐路径}：\cref{sec:qe-why,sec:qe-naive} 建立“为什么要估计、朴素方案为何崩”的两大立论，是任何读者的主干；\cref{sec:qe-imu} 是姿态线（短，因姿态本就易），\cref{sec:qe-contact} 是本章相对两本教材的\emph{增量}（触地检测，写控制器前必须吃透）；\cref{sec:qe-state,sec:qe-obs} 是平动线的核心机械步骤（状态方程 $+$ 观测方程），是“足式里程计”之所以为里程计的地方；\cref{sec:qe-kf} 把它们装进卡尔曼滤波（通用部分引用 \cref{ch:eskf}，本章只给四足实例）；\cref{sec:qe-pitfall,sec:qe-practice} 是陷阱与工程落地。
+
+\subsection*{前置知识桥接}
+本章把前几部的几何、惯性与滤波工具直接用作地基，且\emph{不重复推导}通用滤波理论：
+\begin{itemize}
+  \item \cref{ch:lie}（李群与李代数）给出 $\dot{\mathbf{R}}=\mathbf{R}\,\boldsymbol{\omega}_b^{\wedge}$（机体角速度，本书右扰动主线）与反对称算子 $(\cdot)^\wedge$、$(\cdot)^\vee$；本章足端速度微分与 IMU 重力耦合都建在这条微分方程上；
+  \item \cref{ch:rigid_body}（刚体运动）给出旋转矩阵、ZYX 欧拉角与基本旋转 $\mathbf{R}_x,\mathbf{R}_y,\mathbf{R}_z$，本章 IMU 标定链与姿态合成直接复用；
+  \item \cref{ch:imu}（IMU 模型）给出加速度计/陀螺仪的\emph{通用}噪声与零偏（bias）模型；本章只补四足专属的“质量-弹簧物理直觉”与“安装偏置标定”，通用噪声项一律 \cref{ch:imu}；
+  \item \cref{ch:eskf}（卡尔曼滤波与误差状态滤波）给出 KF/ESKF 的一般推导——加权最小二乘 $\to$ 递推最小二乘 $\to$ 离散 KF、预测/更新、协方差递推。本章是这套理论在“四足足式里程计”上的\emph{具体落地}，只给四足实例的两步递归式，通用推导 \cref{ch:eskf}；
+  \item \cref{ch:invariant-filter}（不变卡尔曼滤波）给出在 $\SO(3)$/$\SE(3)$ 上保持一致性的现代滤波（RIEKF）。本章的线性 KF 是工程主力与教学起点，把\emph{流形一致性}的现代演进指向该章；
+  \item \cref{ch:leg}（足式里程计）给出腿式里程计的\emph{通用}观测框架；本章是其四足落地，侧重串联腿运动学闭式与触地耦合。
+\end{itemize}
+本章是 \cref{ch:quad_mpc}（单刚体 MPC）与 \cref{ch:quad_wbc}（WBC）的\emph{反馈来源}：MPC/WBC 都假定当前状态 $(\boldsymbol{p}_b,\boldsymbol{v}_b,\mathbf{R},\boldsymbol{\omega})$ 已由本章估计器给出。触地相位与 \cref{ch:quad_gait}（步态生成）的调度互为表里。
+
+\subsection*{如果跳过本章会怎样}
+\begin{itemize}
+  \item 你会把 MPC/WBC 的“当前状态 $\boldsymbol{x}(0)$”当成天上掉下来的真值，而\emph{无法}解释为什么仿真完美的控制器一上真机就漂移、抖振——根子常在状态估计而非控制律；
+  \item 读 MIT Cheetah、宇树 \texttt{unitree\_guide} 等开源代码时，你会看到一个反复出现的 $18$ 维状态、$28$ 维观测、足端不动作约束的线性卡尔曼滤波器，以及一个“摆动腿就把协方差设成大数”的奇怪技巧，却不知它每一块从哪条物理/运动学方程来——只能照抄而不会调参、不会排错。
+\end{itemize}
+
+\begin{table}[H]\centering\small
+\caption{本章阅读方式建议}
+\begin{tabular}{lll}
+\toprule
+阅读方式 & 时间 & 适合谁 \\
+\midrule
+精读（含全部推导与练习） & 5--6 小时 & 首次系统学习、要做四足状态估计 \\
+速读（跳过 KF 通用部分与协方差递推） & 2 小时 & 有 KF 基础、想对齐足式里程计建模与记号 \\
+速查（只看小结的符号表 + 公式速查表） & 15 分钟 & 写估计器代码时回来查公式/维度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{本章记号与约定.}\;
+旋转矩阵记 $\mathbf{R}\in\SO(3)$；世界（惯性）系记 $\mathcal{O}$（亦读 world 系 $\mathcal{W}$），机体（躯干）系记 $\mathcal{B}$，IMU 本体系记 $\mathcal{B}_{imu}$。统一取 $\mathbf{R}\equiv{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}=\mathbf{R}_{sb}$（世界 $\leftarrow$ 机体）。
+重力向量取世界系常量 ${}^{\mathcal{O}}\boldsymbol{g}=[0,0,-g_0]^\top$（$g_0\approx9.81\,\mathrm{m/s^2}$）。
+\textbf{观测矩阵记 $\mathbf{H}$、观测量记 $\boldsymbol{z}$}（与 \cref{ch:eskf} 一致）。
+\textbf{先验/后验用上标减号/加号} $\hat{\boldsymbol{x}}_k^-$/$\hat{\boldsymbol{x}}_k^+$、$\mathbf{P}_k^-$/$\mathbf{P}_k^+$。
+关节角记 ${}_iq^j$（第 $i$ 腿第 $j$ 关节，三关节 abad/hip/knee），其速度 ${}_i\dot q^j$；与广义坐标 $\boldsymbol q$ 的腿关节分量为同一量。接触布尔量 $s_i\in\{0,1\}$（$1$ 支撑/$0$ 摆动）。
+\textbf{角速度反对称记 $(\cdot)^\wedge$}（亦写 $[\cdot]_\times$，\cref{ch:lie}）。
+IMU 原始读数记 $\boldsymbol{a}_{out}$（加速度计）、$\boldsymbol{\omega}_{out}$（陀螺仪）；符号 $\boldsymbol{\omega}$ 全章专表角速度，状态估计误差另记 $\tilde{\boldsymbol{x}}_k$，二者不复用。
+\end{note}
+
+% ════════════════════════════════════════════════════════════════
+\section{为什么需要状态估计：控制的根与“在哪儿”}
+\label{sec:qe-why}
+
+\paragraph{动机：状态估计是反馈控制的根。}
+四足机器人控制系统要回答三个问题——\emph{在哪儿、去哪儿、怎么去}，分别对应\emph{状态估计器、轨迹规划器、控制器}\cite{dicarlo2018cheetah}。\cref{ch:quad_mpc} 的单刚体 MPC、\cref{ch:quad_wbc} 的 WBC 都是“怎么去”，且都默认“在哪儿”已知。本章补上这块地基：只有先把状态估准，反馈才有意义。
+
+\begin{insight}[状态估计 $=$ 控制的根（全章动机句）]\label{ins:qe-root}
+全章立论可一句概括：\textbf{只有估计出一个准确的状态，机器人才能获得准确的反馈信息从而进行更准确的控制，否则无法进行稳定的运动}。这把状态估计从“附属模块”提到“控制根基”的高度——一切反馈控制（PID、LQR、MPC、WBC）的输入都是\emph{估计出来}的状态，估计错了，控制律再优也是在错误的世界里做最优。\cref{ch:quad_mpc} 的 $\boldsymbol{x}(0)$ 正来自本章。这是本章存在的理由，也是阅读时始终要带着的问题：\emph{这一步是在让状态更准吗？}
+\end{insight}
+
+\paragraph{什么能直接测、什么不能。}
+先盘点四足机身上的传感器能直接给出什么：
+\begin{itemize}
+  \item \textbf{关节编码器}：直接给出每条腿每个关节的角度 ${}_iq^j$ 与角速度 ${}_i\dot q^j$。这是\emph{本体感知}（proprioception）的核心——机器人对自己身体构型的感知是完整且廉价的。
+  \item \textbf{IMU（惯性测量单元）}：直接给出机身的\emph{角速度}（陀螺仪）与\emph{比力}（加速度计，含重力耦合）。经积分/融合可得机身\emph{姿态} $\mathbf{R}$。
+  \item \textbf{无法直接测的}：机身在世界系下的\emph{位置} ${}^{\mathcal{O}}\boldsymbol{p}_{com}$ 与\emph{线速度} ${}^{\mathcal{O}}\boldsymbol{v}_{com}$。室内四足通常\emph{没有} GPS、没有外部动捕；位置/速度只能靠“把可测量的东西积分/融合出来”\cite{yu2021quadruped}。
+\end{itemize}
+
+\begin{insight}[旋转直读、平动滤波的二分主线（本章组织骨架）]\label{ins:qe-split}
+全章最重要的组织原则是一条\emph{分治}主线：\textbf{对躯干旋转的估计由 IMU 实现，只需对 IMU 原始数据稍作旋转坐标变换；对躯干平动，用卡尔曼滤波器设计一个足底里程计}。具体地：
+\begin{itemize}
+  \item \textbf{姿态（旋转）易}：IMU 直接测角速度、且重力方向给出绝对俯仰/横滚参考，姿态估计本质上是“读数 $+$ 坐标变换”，本章 \cref{sec:qe-imu} 一节即可交代；
+  \item \textbf{位置/速度（平动）难}：没有直接测量、加速度二次积分必漂移，必须把 IMU（高频、会漂）与足底运动学（低频、靠支撑足不动提供绝对参考）\emph{融合}，这就是“足式里程计 $+$ 卡尔曼滤波”，占本章 \cref{sec:qe-state,sec:qe-obs,sec:qe-kf} 的主体。
+\end{itemize}
+把这两条线分开看，全章结构立刻清晰：短的姿态线 $+$ 长的平动滤波线。记住“旋转直读、平动滤波”，就抓住了本章的骨架。
+\end{insight}
+
+\paragraph{与控制层的接口。}
+本章估计器的输出 $(\,{}^{\mathcal{O}}\boldsymbol{p}_{com},\,{}^{\mathcal{O}}\boldsymbol{v}_{com},\,\mathbf{R},\,{}^{\mathcal{B}}\boldsymbol{\omega}\,)$ 正是 \cref{ch:quad_mpc} 单刚体 MPC 的状态反馈 $\boldsymbol{x}(0)$，以及 \cref{ch:quad_wbc} WBC 浮动基逆动力学的当前位姿/速度。频率上，状态估计通常跑在高频环（如 $500\,\mathrm{Hz}$，与 IMU 同步），为 $100\,\mathrm{Hz}$ 的 MPC 与 $500\,\mathrm{Hz}$ 的 WBC 供数。本章只讲“怎么估”，不重复控制层（\cref{ch:quad_mpc,ch:quad_wbc}）。
+
+\begin{practice}
+\begin{enumerate}
+  \item 列出你能想到的“能让四足直接测出世界系位置”的外部手段（GPS/UWB/动捕/视觉里程计），并说明为什么室内动态步态场景里它们都难以单独承担反馈任务，从而\emph{逼出}本体感知的足式里程计。
+  \item 用 \cref{ins:qe-split} 的语言解释：为什么“估姿态”可以不依赖足底，而“估位置/速度”必须依赖足底？（提示：重力给姿态绝对参考，但不给位置参考。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{反面：朴素方案为何不够，触地与力传感器之困}
+\label{sec:qe-naive}
+
+\paragraph{反面一：纯 IMU 积分必漂移。}
+最朴素的想法：IMU 既然给加速度，把世界系加速度做两次时间积分不就得速度和位置了吗？问题在于加速度计读数含\emph{零偏 bias} 与\emph{噪声}（\cref{ch:imu}）。设加速度真值 $\boldsymbol{a}$、零偏 $\boldsymbol{b}_a$（缓变常量级），则一次积分得速度误差随时间\emph{线性}增长 $\sim\!\boldsymbol{b}_a t$，二次积分得位置误差随时间\emph{二次}增长 $\sim\!\tfrac12\boldsymbol{b}_a t^2$。哪怕 $\|\boldsymbol{b}_a\|$ 只有 $0.05\,\mathrm{m/s^2}$，$10\,\mathrm{s}$ 后位置误差就达 $\tfrac12\times0.05\times10^2=2.5\,\mathrm{m}$——“几秒飞出房间”绝非夸张。\textbf{IMU 只能提供高频、短时可信的增量，绝不能单独定位。}
+
+\paragraph{反面二：纯运动学里程计依赖“支撑足不打滑”。}
+另一条朴素路线：既然关节编码器完整、姿态已知，就用正向运动学算出“足端相对机身的位置”，再假设\emph{支撑足在世界系里不动}，反过来解出“机身相对足端移动了多少”——这就是足式里程计的核心思想（\cref{sec:qe-obs} 全推）。它的命门是那条假设：\textbf{支撑足不打滑}。一旦支撑足打滑、或——更隐蔽地——\emph{触地状态被误判}，这条“足端不动”约束就失效，里程计瞬间崩坏。于是触地检测成了里程计可信度的开关。
+
+\begin{insight}[触地检测是混合控制的开关]\label{ins:qe-contact-switch}
+触地状态的双重角色远不止“里程计要不要信这条腿”：四足是\emph{混合控制系统}——\textbf{支撑相}用力控/阻抗控制（把 MPC 算出的足端力施加到地面），\textbf{摆动相}用位置/速度控制（让足端跟踪规划的摆动轨迹）。两种控制律\emph{完全不同}，靠触地状态 $s_i$ 切换。因此触地状态既决定\emph{估计器}信哪条腿（\cref{sec:qe-obs} 的协方差膨胀），又决定\emph{控制器}对哪条腿用哪套律。触地误判 $=$ 控制逻辑与估计逻辑\emph{同时}走错——这就是为什么本章要专门、独立地讲触地检测（\cref{sec:qe-contact}），它是把估计与控制缝在一起的关键开关。
+\end{insight}
+
+\paragraph{触地误判的两类灾难后果。}
+误判的物理后果（\cref{fig:qe-misdetect}）有两类，性质不同：
+\begin{itemize}
+  \item \textbf{已触地却未检出}（漏检，仍当摆动腿做位置控制）：足端已撞上地面，位置控制器却还在命令它“继续下探到规划落点”，于是腿被地面顶住、控制器加大力矩硬怼——\emph{巨大关节力矩可能损坏电机}；或反过来把机身\emph{撑起、失衡}；轻则\emph{额外能耗}。
+  \item \textbf{空中却误判触地}（虚检，把摆动腿当支撑腿做力控）：足端其实悬空，力控却命令它“蹬地发力”，结果\emph{无法到达规划落足点}（提前“以为”到地了）；更危险的是，若把它计入支撑腿，\emph{实际支撑腿数减少}，剩余支撑多边形不足以支撑体重 $\Rightarrow$ \emph{摔倒}。
+\end{itemize}
+两类相比，\textbf{虚检（空中误判触地）通常更危险}：它直接削减支撑、可能立即摔倒；漏检多表现为电机过载/能耗，有缓冲余地。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=1.0,>=Stealth]
+  % ground
+  \draw[gray] (-4.4,0)--(4.4,0);
+  \foreach \x in {-4.2,-3.8,...,4.2} \draw[gray] (\x,0)--(\x-0.15,-0.18);
+  % ---- left: missed detection (touched but not detected) ----
+  \begin{scope}[shift={(-2.4,0)}]
+    \draw[rounded corners=2pt, fill=main!8, draw=main!60!black] (-0.9,1.5) rectangle (0.9,1.95);
+    \node[main!60!black,font=\scriptsize] at (0,1.72) {躯干};
+    % leg pressed into ground
+    \draw[gray!60!black, very thick] (0.5,1.5)--(0.55,0.0);
+    \fill (0.55,0.0) circle (2.5pt);
+    % big force arrow downward command, ground reaction up
+    \draw[red!70!black,-{Stealth[length=2.5mm]},very thick] (0.55,0.0)--(0.55,0.9) node[right,font=\scriptsize]{巨大反力};
+    \draw[third,-{Stealth[length=2.5mm]},thick] (0.9,1.7)--(0.9,1.1) node[right,font=\scriptsize]{命令下探};
+    \node[align=center,font=\scriptsize] at (0,-0.55) {\textbf{漏检}\\已触地未检出\\$\Rightarrow$ 电机过载/撑起失衡};
+  \end{scope}
+  % ---- right: false detection (in air but judged contact) ----
+  \begin{scope}[shift={(2.4,0)}]
+    \draw[rounded corners=2pt, fill=main!8, draw=main!60!black] (-0.9,1.5) rectangle (0.9,1.95);
+    \node[main!60!black,font=\scriptsize] at (0,1.72) {躯干};
+    \draw[gray!60!black, very thick] (-0.5,1.5)--(-0.55,0.55);
+    \draw (-0.55,0.55) circle (2.5pt); % foot in air
+    \draw[gray,dashed] (-0.55,0.55)--(-0.55,0.0);
+    \draw[red!70!black,-{Stealth[length=2.5mm]},very thick] (-0.55,0.55)--(-0.55,1.25) node[left,font=\scriptsize]{以为在蹬地};
+    \node[align=center,font=\scriptsize] at (0,-0.55) {\textbf{虚检}\\空中误判触地\\$\Rightarrow$ 支撑腿减少摔倒};
+  \end{scope}
+\end{tikzpicture}
+\caption{触地误判的两类灾难后果。左：腿已触地却未检出（漏检），位置控制仍命令足端下探，被地面顶住产生巨大关节力矩、损坏电机或撑起失衡。右：腿仍在空中却被误判触地（虚检），按支撑腿做力控、无法到达落足点，且实际支撑腿数减少导致摔倒。虚检通常更危险。}
+\label{fig:qe-misdetect}
+\end{figure}
+
+\begin{pitfall}[误区：“触地检测就是力传感器读个数”]
+触地不是一个能廉价直接测的物理量。漏检与虚检的后果（\cref{fig:qe-misdetect}）都是\emph{灾难性}的，且发生在\emph{相位切换瞬间}——恰恰是控制律切换、最脆弱的时刻。把触地当成“读个数”会低估它：它是估计器（信哪条腿）与控制器（用哪套律）共同依赖的\emph{开关信号}（\cref{ins:qe-contact-switch}），必须用专门的检测器（\cref{sec:qe-contact}）并对其鲁棒性负责。
+\end{pitfall}
+
+\paragraph{反面三：为何不直接用足端力传感器。}
+既然触地这么重要，最直接的办法不是在脚底装力传感器吗？四足工程上\emph{不}这么做，有四条理由：
+
+\begin{insight}[为何不用足端力传感器——逼出本体感知路线]\label{ins:qe-no-force-sensor}
+四条短板，每条都指向同一结论：
+\begin{enumerate}
+  \item \textbf{贴合难}：四足足底多为\emph{球状}（点接触、利于全向地形），薄片式力/压力传感器难以贴合球面，安装即失真；
+  \item \textbf{精度噪声}：能贴合的薄片传感器精度有限、噪声大，单点读数不足以可靠判触地；
+  \item \textbf{成本剧增}：要做到高精度、耐冲击（足端承受落地冲击），成本急剧上升，与四足“低成本本体感知”的设计哲学相悖；
+  \item \textbf{额外线路}：足端在腿的最远端、运动剧烈，额外的传感器线路易磨损、增加故障点。
+\end{enumerate}
+四条合起来，\emph{逼出}了本体感知路线：\textbf{不测力，而用已有的关节扭矩/位置/速度去\emph{反推}接触力}。这条路线还有一个额外红利——它\emph{复用}了控制本就需要的动力学模型，效率高。这正是 \cref{sec:qe-contact} 广义动量观测器（GM）的根本动机：用电机已知的扭矩和编码器已知的运动学，反推地面给了多大力。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 用 $\tfrac12 b_a t^2$ 估算：若加速度计零偏 $b_a=0.1\,\mathrm{m/s^2}$，多久后纯 IMU 位置误差达 $1\,\mathrm{m}$？这与 \cref{ins:qe-split} “平动必须融合”如何对应？
+  \item 设计一个反例步态/地形，使纯运动学里程计因“支撑足打滑”而崩溃；说明此时触地检测能否救它（提示：检测不到打滑，但能限制错误累积的腿）。
+  \item 把 \cref{ins:qe-no-force-sensor} 的四条短板按“能否被软件/标定缓解”分类，论证为什么“反推”比“直测”在四足上是更系统的选择。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{IMU 测量模型：质量-弹簧物理与安装偏置标定}
+\label{sec:qe-imu}
+
+本节是“旋转直读”这条短线的主体（\cref{ins:qe-split}）。先用质量-弹簧物理模型把加速度计读数“到底测的是什么”讲透（结论：读数 $=$ 真加速度 $-$ 旋转后的重力），再用安装偏置标定链把“IMU 装在机身任意位置”这件工程事实处理干净。
+
+\subsection{加速度计读数的物理：从一维质量-弹簧到三维}
+\label{subsec:qe-imu-physics}
+
+\paragraph{一维质量-弹簧模型。}
+把加速度计抽象为一个\emph{质量块 $+$ 弹簧}：质量块 $m$ 受弹簧约束，外界加速度 $a$ 使弹簧产生形变 $s$，传感器通过测形变反推加速度\cite{unitree2023quadruped}。在\emph{失重}（无重力）理想情形，牛顿第二定律给出弹力等于质量乘加速度，弹力与形变成正比（劲度系数 $k$）、方向相反：
+\begin{equation}
+  m a = -k s.
+  \label{eq:qe-massspring-1d}
+\end{equation}
+于是由形变反推“读数”（传感器实际输出的加速度估计）：
+\begin{equation}
+  a_{out} = -\frac{k}{m}s.
+  \label{eq:qe-aout-1d}
+\end{equation}
+
+\paragraph{含重力的一维。}
+真实地球惯性系中必须计入重力。设竖直方向重力分量 $g$（取 $g=-9.81\,\mathrm{m/s^2}$，向下为负），则受力平衡变为
+\begin{equation}
+  m a = -k s + m g
+  \quad\Longrightarrow\quad
+  s = \frac{m}{k}(g - a).
+  \label{eq:qe-massspring-1d-g}
+\end{equation}
+代回 \cref{eq:qe-aout-1d} 得读数与真加速度的关系\cite{unitree2023quadruped}：
+\begin{equation}
+  a_{out} = -\frac{k}{m}s = -\frac{k}{m}\cdot\frac{m}{k}(g-a) = a - g.
+  \label{eq:qe-aout-1d-g}
+\end{equation}
+这就解释了一个人人见过却常困惑的现象：\textbf{静止}（$a=0$）时加速度计输出 $a_{out}=-g=+9.81\,\mathrm{m/s^2}$，而非 $0$。读数测的是\emph{比力}（specific force），含重力的反作用。
+
+\paragraph{三维：重力须旋到 IMU 本体系。}
+推广到三维。IMU 测量发生在其\emph{本体系} $\{b\}$（暂记，下一小节再细分 IMU 系与机身系），而重力 $\boldsymbol{g}$ 是\emph{世界系常量}，须左乘 $\mathbf{R}_{bs}={}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}^\top=\mathbf{R}^\top$ 转入本体系\cite{unitree2023quadruped}：
+\begin{equation}
+  m\boldsymbol{a} = -k\boldsymbol{s} + m\,\mathbf{R}_{bs}\boldsymbol{g}
+  \quad\Longrightarrow\quad
+  \boldsymbol{s} = \frac{m}{k}\big(\mathbf{R}_{bs}\boldsymbol{g} - \boldsymbol{a}\big).
+  \label{eq:qe-massspring-3d}
+\end{equation}
+代回得三维读数模型\cite{unitree2023quadruped}：
+\begin{equation}
+  \boxed{\;\boldsymbol{a}_{out} = -\frac{k}{m}\boldsymbol{s} = \boldsymbol{a} - \mathbf{R}_{bs}\boldsymbol{g} = \boldsymbol{a} - \mathbf{R}^\top\boldsymbol{g},\qquad \boldsymbol{g}=[0,0,-g_0]^\top.\;}
+  \label{eq:qe-aout-3d}
+\end{equation}
+
+\paragraph{反解世界系净加速度（状态方程的输入来源）。}
+控制与里程计要的是\emph{世界系}里机身的真实加速度 ${}^{\mathcal{O}}\boldsymbol{a}={}^{\mathcal{O}}\boldsymbol{a}_s$。由 \cref{eq:qe-aout-3d} 解出本体系真加速度 $\boldsymbol{a}=\boldsymbol{a}_{out}+\mathbf{R}^\top\boldsymbol{g}$，再左乘 $\mathbf{R}=\mathbf{R}_{sb}$ 旋回世界系：
+\begin{equation}
+  {}^{\mathcal{O}}\boldsymbol{a}_s = \mathbf{R}\,\boldsymbol{a}
+  = \mathbf{R}\big(\boldsymbol{a}_{out}+\mathbf{R}^\top\boldsymbol{g}\big)
+  = \mathbf{R}\,\boldsymbol{a}_{out} + \underbrace{\mathbf{R}\mathbf{R}^\top}_{\mathbf{I}}\boldsymbol{g}
+  = \mathbf{R}\,\boldsymbol{a}_{out} + \boldsymbol{g}.
+  \label{eq:qe-world-acc}
+\end{equation}
+
+\begin{insight}[\cref{eq:qe-world-acc} 是平动状态方程的物理来源]\label{ins:qe-world-acc}
+\cref{eq:qe-world-acc} 看似平凡，却是 \cref{sec:qe-state} 状态方程里 $\dot{\boldsymbol{v}}_b=\mathbf{R}\boldsymbol{a}_{out}+\boldsymbol{g}$ 的\emph{物理出处}：把 IMU 原始读数 $\boldsymbol{a}_{out}$ 旋回世界系，\emph{再补回重力} $\boldsymbol{g}$，得到的才是机身在世界系里的净加速度。换句话说——“读数旋回世界系 $+$ 重力补偿”——这正是把惯性信息喂进足式里程计的接口。理解了这一步，状态方程里那个看似突兀的 $+\boldsymbol{g}$ 就不再神秘：它是把 \cref{eq:qe-aout-3d} 中被减掉的重力\emph{加回来}。
+\end{insight}
+
+\begin{note}[与 \cref{ch:imu} 通用 IMU 模型的接口]\label{note:qe-imu-bridge}
+本小节的质量-弹簧模型只刻画了\emph{重力耦合}这一确定性部分（读数 $=$ 真加速度 $-$ 旋转重力），目的是讲清那个 $+\boldsymbol{g}$ 从哪来。真实 IMU 还有\emph{零偏} $\boldsymbol{b}_a,\boldsymbol{b}_g$ 与\emph{白噪声} $\boldsymbol{n}_a,\boldsymbol{n}_g$——完整模型 $\boldsymbol{a}_{out}=\mathbf{R}^\top({}^{\mathcal{O}}\boldsymbol{a}-\boldsymbol{g})+\boldsymbol{b}_a+\boldsymbol{n}_a$ 见 \cref{ch:imu}，那里也给出零偏随机游走的演化与可观测性分析。本章的线性 KF（\cref{sec:qe-kf}）为简洁起见把零偏并入过程噪声 $\mathbf{Q}$ 处理；若要显式估计零偏，应转 \cref{ch:eskf} 的误差状态滤波或 \cref{ch:invariant-filter} 的不变滤波，将 $\boldsymbol{b}_a,\boldsymbol{b}_g$ 扩进状态。
+\end{note}
+
+\subsection{IMU 安装偏置标定链：从原始读数到躯干姿态}
+\label{subsec:qe-imu-calib}
+
+\paragraph{为什么需要标定链。}
+若默认“IMU 即机身系”，可直接给出 $\mathbf{R}_{sb}$。但真机上 IMU 可装在机身\emph{任意位置、任意朝向}，其原始读数 $\boldsymbol{a}_{out},\boldsymbol{\omega}_{out}$ 是在\emph{IMU 本体系}里、\emph{不}等于躯干状态\cite{yu2021quadruped}。需要一条\emph{常值旋转链}把 IMU 读数对齐到机身系、再合成到世界系。
+
+\paragraph{标定链四步。}
+设 IMU 本体系 $\mathcal{B}_{imu}$、IMU 零系 $\mathcal{B}_{imu0}$（启动时刻的 IMU 系），机身系 $\mathcal{B}$，世界系 $\mathcal{O}$。
+\begin{enumerate}
+  \item \textbf{IMU 本体系 $\to$ 机身系的常值旋转}（由安装方式定，对本平台 IMU 倒装，绕 $x$ 转 $\pi$）\cite{yu2021quadruped}：
+  \begin{equation}
+    {}^{\mathcal{B}_{imu}}\mathbf{R}_{\mathcal{B}} = \mathbf{R}_x(\pi).
+    \label{eq:qe-imu-mount}
+  \end{equation}
+  \item \textbf{世界系 $\to$ IMU 零系}（启动时机身水平，但\emph{偏航朝向}未知，记为待标定的 $\psi_{init}$）\cite{yu2021quadruped}：
+  \begin{equation}
+    {}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}_{imu0}} = \mathbf{R}_z(\psi_{init})\,\mathbf{R}_x(\pi).
+    \label{eq:qe-imu-init}
+  \end{equation}
+  \item \textbf{标定启动偏航角}：首个周期读到 IMU 给出的 ${}^{\mathcal{B}_{imu0}}\mathbf{R}_{\mathcal{B}_{imu}}^{t=0}$，从中反解偏航\cite{yu2021quadruped}：
+  \begin{equation}
+    \psi_{init} = -\,\mathrm{yaw}\!\left({}^{\mathcal{B}_{imu0}}\mathbf{R}_{\mathcal{B}_{imu}}^{t=0}\right).
+    \label{eq:qe-psi-init}
+  \end{equation}
+  这里 $\mathrm{yaw}(\cdot)$ 是“从一个绕 $z$ 的旋转矩阵\emph{反解出偏航角}”的算子，并非矩阵求逆。
+  \item \textbf{躯干姿态合成}（组合旋转，把三段串起来）\cite{yu2021quadruped}：
+  \begin{equation}
+    \boxed{\;{}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}} = {}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}_{imu0}}\;{}^{\mathcal{B}_{imu0}}\mathbf{R}_{\mathcal{B}_{imu}}\;{}^{\mathcal{B}_{imu}}\mathbf{R}_{\mathcal{B}}.\;}
+    \label{eq:qe-att-compose}
+  \end{equation}
+\end{enumerate}
+其中中间项 ${}^{\mathcal{B}_{imu0}}\mathbf{R}_{\mathcal{B}_{imu}}$ 是 IMU 每周期\emph{实时}给出的姿态增量，首末两项是\emph{常值}标定结果。
+
+\paragraph{角速度与加速度只需对齐到机身系。}
+姿态合成（\cref{eq:qe-att-compose}）涉及世界系，但\emph{角速度、加速度}作为机体量，只需经 IMU $\to$ 机身的常值旋转 ${}^{\mathcal{B}}\mathbf{R}_{\mathcal{B}_{imu}}$ 对齐即可\cite{yu2021quadruped}：
+\begin{equation}
+  {}^{\mathcal{B}}\boldsymbol{\omega}_{\mathcal{OB}} = {}^{\mathcal{B}}\mathbf{R}_{\mathcal{B}_{imu}}\,\boldsymbol{\omega}_{out},
+  \qquad
+  {}^{\mathcal{B}}\boldsymbol{a}_{com} = {}^{\mathcal{B}}\mathbf{R}_{\mathcal{B}_{imu}}\,\boldsymbol{a}_{out}.
+  \label{eq:qe-imu-align}
+\end{equation}
+再用 \cref{eq:qe-world-acc} 把 ${}^{\mathcal{B}}\boldsymbol{a}_{com}$ 旋到世界系并补重力，即得里程计要的 ${}^{\mathcal{O}}\boldsymbol{a}_{com}$。至此“旋转直读”这条线闭合：姿态由 \cref{eq:qe-att-compose} 直接给出，角速度/加速度由 \cref{eq:qe-imu-align} 对齐——这正是 \cref{ins:qe-split} 所说“稍作旋转坐标变换”的全部内容。
+
+\begin{example}[标定链一步数值核对]\label{exam:qe-calib}
+设启动时 IMU 给 ${}^{\mathcal{B}_{imu0}}\mathbf{R}_{\mathcal{B}_{imu}}^{t=0}=\mathbf{R}_z(30^\circ)$，则 \cref{eq:qe-psi-init} 给 $\psi_{init}=-30^\circ$。某周期 IMU 输出 ${}^{\mathcal{B}_{imu0}}\mathbf{R}_{\mathcal{B}_{imu}}=\mathbf{R}_z(35^\circ)$（机身在零系基础上又转了 $5^\circ$ 偏航）。则由 \cref{eq:qe-imu-init,eq:qe-att-compose}：
+\[
+  {}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}
+  = \mathbf{R}_z(-30^\circ)\mathbf{R}_x(\pi)\cdot\mathbf{R}_z(35^\circ)\cdot\mathbf{R}_x(\pi)^{-1}.
+\]
+注意 $\mathbf{R}_x(\pi)$ 把绕 $z$ 的正转翻成负转（因 $\mathbf{R}_x(\pi)\mathbf{R}_z(\alpha)\mathbf{R}_x(\pi)^{-1}=\mathbf{R}_z(-\alpha)$），代入得 ${}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}=\mathbf{R}_z(-30^\circ)\mathbf{R}_z(-35^\circ)=\mathbf{R}_z(-65^\circ)$。\emph{校验}：扣掉 $\psi_{init}=-30^\circ$ 偏置后机身世界系偏航应为 $35^\circ-30^\circ=5^\circ$。这里得 $-65^\circ$ 是因为 $\mathbf{R}_x(\pi)$ 倒装使偏航测量符号翻转——提醒读者标定链中\emph{每一段的方向与符号}都必须与硬件安装一致，否则偏航整体反号（实践中以静止朝向已知的标定动作核对）。
+\end{example}
+
+% ════════════════════════════════════════════════════════════════
+\section{足端触地检测}
+\label{sec:qe-contact}
+
+触地检测在足式状态估计中常被简化处理：或仅用协方差膨胀间接区分支撑/摆动、或直接假设四足全触地。本节给出一条完整的检测路线，按“朴素 $\to$ 物理观测器 $\to$ 概率融合”三级递进：力阈值法（\cref{subsec:qe-thresh}）、广义动量接触力观测器（\cref{subsec:qe-gm}，本节核心推导）、概率融合触地（\cref{subsec:qe-prob}）。
+
+\subsection{力阈值法及其缺陷}
+\label{subsec:qe-thresh}
+
+最朴素的检测：估出足端法向接触力 $\hat f_i^z$，与阈值 $f_{th}$ 比较——超过即判触地，$s_i=\mathbb{1}[\hat f_i^z>f_{th}]$。在\emph{平地、固定步态}下，这甚至可退化为更省事的方案：
+
+\begin{insight}[概率融合触地的适用边界——平地够用、复杂地形必须]\label{ins:qe-prob-boundary}
+这里有一条重要的工程边界：在\textbf{平整地面 $+$ 固定运动模式}下，根本\emph{不需要}检测器——一个\emph{固定时间调度器}就够了：步态周期已知、相位时刻已知，“时间到了就当它触地”。因为地面平、落足时刻可预测，调度的触地时刻与真实触地时刻几乎重合。但一旦进入\textbf{非结构化地形}，二者必然\emph{偏移}：踩到\emph{高地}（凸起）会\emph{早}触地（腿还没伸到规划落点就先碰到），踩到\emph{凹坑}会\emph{晚}触地（伸到规划落点仍悬空）。这种时间偏移让固定调度失效——\textbf{此时才必须上检测器}。这条边界解释了“为什么很多平地 demo 不做触地检测也能跑，而野外四足必须做”，也界定了 \cref{subsec:qe-gm,subsec:qe-prob} 的用武之地。
+\end{insight}
+
+力阈值法的缺陷在于“怎么估 $\hat f_i^z$”。直接测力的路线已被 \cref{ins:qe-no-force-sensor} 否掉；那就要\emph{反推}。最朴素的反推是比较“模型预期的关节扭矩”与“电机实际扭矩”，差值经雅可比转置反推接触力。但这条路有个致命依赖——它需要关节加速度 $\ddot{\boldsymbol q}$。
+
+\begin{insight}[GM 绕过加速度的核心动机（本节最关键）]\label{ins:qe-gm-motivation}
+朴素反推法的命门在于：要算“模型预期扭矩”，须代入完整动力学 $\mathbf{M}(\boldsymbol q)\ddot{\boldsymbol q}+\mathbf{C}\dot{\boldsymbol q}+\boldsymbol g$，其中\emph{需要关节加速度} $\ddot{\boldsymbol q}$。可 $\ddot{\boldsymbol q}$ 从哪来？编码器只给位置 ${}_iq^j$、（差分得）速度 ${}_i\dot q^j$；$\ddot{\boldsymbol q}$ 只能对速度\emph{再做一次数值微分}——而数值微分会\textbf{放大高频噪声并引入延迟}。结果：任何依赖 $\ddot{\boldsymbol q}$ 的力观测器信号都嘈杂、滞后，无法可靠判触地。\textbf{广义动量法（GM）的全部精妙就在于：通过对广义动量求导、并利用 $\dot{\mathbf{M}}-2\mathbf{C}$ 的斜对称性质，把 $\ddot{\boldsymbol q}$ 整项\emph{消掉}}，让接触力估计只依赖扭矩、位置、速度（都是干净可测的）。这是本节最值得记住的一招：\emph{用恒等式换掉数值微分}。
+\end{insight}
+
+\subsection{广义动量接触力观测器（GM）}
+\label{subsec:qe-gm}
+
+下面把 GM 的消元过程逐步走全。它源自 De Luca 等的碰撞检测残差动量观测器\cite{deluca2006collision}，在四足上由 MIT 组用于事件式触地\cite{bledt2018contact}。
+
+\paragraph{第 1 步：广义动量定义。}
+关节空间广义动量
+\begin{equation}
+  \boldsymbol p = \mathbf{M}(\boldsymbol q)\dot{\boldsymbol q},
+  \label{eq:qe-gm-momentum}
+\end{equation}
+其中 $\mathbf{M}(\boldsymbol q)$ 是构型相关的质量矩阵。
+
+\paragraph{第 2 步：含外部接触的拉格朗日动力学。}
+机器人完整动力学（含未知外部接触扭矩 $\boldsymbol\tau_K$）：
+\begin{equation}
+  \mathbf{M}(\boldsymbol q)\ddot{\boldsymbol q} + \mathbf{C}(\boldsymbol q,\dot{\boldsymbol q})\dot{\boldsymbol q} + \boldsymbol g(\boldsymbol q) = \boldsymbol\tau + \boldsymbol\tau_K,
+  \label{eq:qe-gm-dyn}
+\end{equation}
+$\boldsymbol\tau$ 为电机扭矩（已知）、$\boldsymbol g(\boldsymbol q)$ 为重力扭矩、$\mathbf{C}\dot{\boldsymbol q}$ 为科氏/离心项、$\boldsymbol\tau_K$ 为待估的外部接触扭矩（足端接触力经雅可比映射到关节空间）。
+
+\paragraph{第 3 步：朴素解法仍含 $\ddot{\boldsymbol q}$（要消去的对象）。}
+直接从 \cref{eq:qe-gm-dyn} 解出外部扭矩：
+\begin{equation}
+  \boldsymbol\tau_K = \big[\mathbf{M}(\boldsymbol q)\ddot{\boldsymbol q} + \mathbf{C}(\boldsymbol q,\dot{\boldsymbol q})\dot{\boldsymbol q} + \boldsymbol g(\boldsymbol q)\big] - \boldsymbol\tau.
+  \label{eq:qe-gm-naive}
+\end{equation}
+右端含 $\ddot{\boldsymbol q}$——这正是 \cref{ins:qe-gm-motivation} 要绕过的。
+
+\paragraph{第 4 步：对广义动量求导（仍含 $\ddot{\boldsymbol q}$）。}
+对 \cref{eq:qe-gm-momentum} 关于时间求导，用乘积法则：
+\begin{equation}
+  \dot{\boldsymbol p} = \frac{\mathrm{d}}{\mathrm{d}t}\big(\mathbf{M}(\boldsymbol q)\dot{\boldsymbol q}\big)
+  = \dot{\mathbf{M}}(\boldsymbol q)\dot{\boldsymbol q} + \mathbf{M}(\boldsymbol q)\ddot{\boldsymbol q}.
+  \label{eq:qe-gm-pdot}
+\end{equation}
+
+\paragraph{第 5 步：联立消去加速度项。}
+由 \cref{eq:qe-gm-dyn} 解出 $\mathbf{M}\ddot{\boldsymbol q}=\boldsymbol\tau+\boldsymbol\tau_K-\mathbf{C}\dot{\boldsymbol q}-\boldsymbol g$，代入 \cref{eq:qe-gm-pdot} 的 $\mathbf{M}\ddot{\boldsymbol q}$：
+\begin{equation}
+  \dot{\boldsymbol p} = \dot{\mathbf{M}}(\boldsymbol q)\dot{\boldsymbol q} + \big[\boldsymbol\tau + \boldsymbol\tau_K - \mathbf{C}(\boldsymbol q,\dot{\boldsymbol q})\dot{\boldsymbol q} - \boldsymbol g(\boldsymbol q)\big].
+  \label{eq:qe-gm-sub}
+\end{equation}
+$\ddot{\boldsymbol q}$ 已不显式出现，但 $\dot{\mathbf{M}}$ 仍隐含它（$\dot{\mathbf{M}}=\sum_j\frac{\partial\mathbf{M}}{\partial q_j}\dot q_j$ 不含 $\ddot{\boldsymbol q}$，故其实 $\dot{\mathbf{M}}$ 只依赖位置和速度——这点关键）。下一步用一条结构性质把 $\dot{\mathbf{M}}$ 与 $\mathbf{C}$ 合并。
+
+\paragraph{第 6 步：用 $\dot{\mathbf{M}}-2\mathbf{C}$ 的斜对称性。}
+拉格朗日动力学有一条经典性质：在合适的 $\mathbf{C}$ 取法下，$\dot{\mathbf{M}}(\boldsymbol q)-2\mathbf{C}(\boldsymbol q,\dot{\boldsymbol q})$ 是\emph{斜对称}矩阵。斜对称 $\Leftrightarrow(\dot{\mathbf{M}}-2\mathbf{C})^\top=-(\dot{\mathbf{M}}-2\mathbf{C})$，结合 $\mathbf{M}$ 对称（$\dot{\mathbf{M}}$ 对称）可推出
+\begin{equation}
+  \dot{\mathbf{M}}(\boldsymbol q) = \mathbf{C}(\boldsymbol q,\dot{\boldsymbol q}) + \mathbf{C}^\top(\boldsymbol q,\dot{\boldsymbol q}).
+  \label{eq:qe-skew}
+\end{equation}
+把 \cref{eq:qe-skew} 代入 \cref{eq:qe-gm-sub}，$\dot{\mathbf{M}}\dot{\boldsymbol q}=(\mathbf{C}+\mathbf{C}^\top)\dot{\boldsymbol q}$，与 $-\mathbf{C}\dot{\boldsymbol q}$ 相消一项：
+\begin{equation}
+  \boxed{\;\dot{\boldsymbol p} = \boldsymbol\tau + \boldsymbol\tau_K + \mathbf{C}^\top(\boldsymbol q,\dot{\boldsymbol q})\dot{\boldsymbol q} - \boldsymbol g(\boldsymbol q).\;}
+  \label{eq:qe-gm-final}
+\end{equation}
+
+\begin{derivation}[\cref{eq:qe-gm-final} 右端为何不含 $\ddot{\boldsymbol q}$ 的逐项核对]\label{deriv:qe-gm}
+逐项检查 \cref{eq:qe-gm-final} 右端四项对 $\ddot{\boldsymbol q}$ 的依赖：
+\begin{itemize}
+  \item $\boldsymbol\tau$：电机扭矩，编码器/电流环可测，\emph{不含} $\ddot{\boldsymbol q}$；
+  \item $\boldsymbol\tau_K$：待估量，是观测器的\emph{输出}，不算输入；
+  \item $\mathbf{C}^\top(\boldsymbol q,\dot{\boldsymbol q})\dot{\boldsymbol q}$：$\mathbf{C}$ 只依赖 $\boldsymbol q$（位置）与 $\dot{\boldsymbol q}$（速度），二者编码器直接给（速度由位置一次差分，噪声尚可接受），\emph{不含} $\ddot{\boldsymbol q}$；
+  \item $\boldsymbol g(\boldsymbol q)$：只依赖位置，\emph{不含} $\ddot{\boldsymbol q}$。
+\end{itemize}
+故右端整体只依赖 $(\boldsymbol\tau,\boldsymbol q,\dot{\boldsymbol q})$——\emph{无需对速度再做一次数值微分}。对比朴素式 \cref{eq:qe-gm-naive} 显含 $\mathbf{M}\ddot{\boldsymbol q}$，可见 GM 的全部收益正来自第 5、6 两步：先用动力学把 $\mathbf{M}\ddot{\boldsymbol q}$ 换成 $(\boldsymbol\tau+\boldsymbol\tau_K-\mathbf{C}\dot{\boldsymbol q}-\boldsymbol g)$，再用斜对称性把 $\dot{\mathbf{M}}\dot{\boldsymbol q}$ 中多出的 $\mathbf{C}\dot{\boldsymbol q}$ 抵消。这印证 \cref{ins:qe-gm-motivation}：用恒等式换掉数值微分。
+\end{derivation}
+
+\paragraph{残差动量观测器形式。}
+\cref{eq:qe-gm-final} 仍是隐式的（$\dot{\boldsymbol p}$ 含待估 $\boldsymbol\tau_K$）。De Luca 把它整理成一个\emph{一阶低通残差观测器}\cite{deluca2006collision}：定义残差 $\hat{\boldsymbol\tau}_K$ 为观测器输出，令其追踪“动量变化里无法用已知量解释的部分”，
+\begin{equation}
+  \hat{\boldsymbol\tau}_K = \mathbf{K}_I\!\left(\boldsymbol p - \int_0^t\!\big[\boldsymbol\tau + \mathbf{C}^\top\dot{\boldsymbol q} - \boldsymbol g + \hat{\boldsymbol\tau}_K\big]\mathrm{d}\sigma\right),
+  \label{eq:qe-gm-observer}
+\end{equation}
+$\mathbf{K}_I\succ0$ 为对角增益。该式是一个稳定的一阶系统：$\dot{\hat{\boldsymbol\tau}}_K=\mathbf{K}_I(\boldsymbol\tau_K-\hat{\boldsymbol\tau}_K)$，即 $\hat{\boldsymbol\tau}_K$ 以带宽 $\mathbf{K}_I$ 低通地跟踪真值 $\boldsymbol\tau_K$——增益越大跟踪越快但越易受噪声影响，是带宽与噪声的折中。
+
+\paragraph{由关节外扭矩反推足端接触力。}
+最后把关节空间外扭矩 $\hat{\boldsymbol\tau}_K$ 经第 $i$ 腿足端雅可比 $\mathbf{J}_i$ 的转置映射反推为足端接触力。由 $\boldsymbol\tau_{K,i}=\mathbf{J}_i^\top\boldsymbol f_i$，用伪逆反解：
+\begin{equation}
+  \hat{\boldsymbol f}_i = \big(\mathbf{J}_i^\top\big)^{+}\hat{\boldsymbol\tau}_{K,i},
+  \label{eq:qe-grf-from-tau}
+\end{equation}
+取其法向分量 $\hat f_i^z=[0,0,1]\hat{\boldsymbol f}_i$ 作触地依据。至此，仅用电机扭矩与编码器即\emph{反推}出接触力，绕开了力传感器（\cref{ins:qe-no-force-sensor}）与加速度（\cref{ins:qe-gm-motivation}）。
+
+\subsection{概率融合触地}
+\label{subsec:qe-prob}
+
+GM 给出的 $\hat f_i^z$ 仍是单路、含噪测量。Bledt 等在 MIT Cheetah 3 上提出\emph{概率融合}：把\emph{步态相位先验}与\emph{多路测量似然}用贝叶斯融合，得到接触概率\cite{bledt2018contact}。
+
+\paragraph{先验：步态相位。}
+步态调度器（\cref{ch:quad_gait}）给出每条腿当前相位 $\phi_i\in[0,1)$，据此给\emph{接触先验} $P(s_i=1\mid\phi_i)$——按计划该支撑时先验高、该摆动时先验低，相位切换附近用平滑过渡（如 sigmoid）。
+
+\paragraph{似然：三路测量。}
+对每条腿取三路独立测量构造似然：
+\begin{enumerate}
+  \item \textbf{法向力} $\hat f_i^z$（来自 GM，\cref{eq:qe-grf-from-tau}）：力大 $\Rightarrow$ 触地似然高；
+  \item \textbf{足端高度} $\hat p_i^z$（来自运动学，\cref{sec:qe-obs}）：足低（接近地面）$\Rightarrow$ 触地似然高；
+  \item \textbf{足端纵向速度} $\hat{\dot p}_i^z$（来自运动学微分）：足端竖直速度近零（不再下落）$\Rightarrow$ 触地似然高。
+\end{enumerate}
+
+\paragraph{贝叶斯融合。}
+设三路测量 $\boldsymbol z_i=(\hat f_i^z,\hat p_i^z,\hat{\dot p}_i^z)$ 给定接触状态条件独立，则后验接触概率
+\begin{equation}
+  P(s_i=1\mid\boldsymbol z_i,\phi_i)
+  = \frac{P(\hat f_i^z\mid s_i{=}1)\,P(\hat p_i^z\mid s_i{=}1)\,P(\hat{\dot p}_i^z\mid s_i{=}1)\,P(s_i{=}1\mid\phi_i)}{\sum_{s\in\{0,1\}}\big[\textstyle\prod\text{似然}\big]P(s_i{=}s\mid\phi_i)},
+  \label{eq:qe-bayes-contact}
+\end{equation}
+判据 $s_i=\mathbb{1}[P(s_i{=}1\mid\boldsymbol z_i,\phi_i)>0.5]$。Bledt 等报告该融合在非结构化地形上达约 $99.3\%$ 的接触判别准确率、毫秒级延时\cite{bledt2018contact}。
+
+\begin{insight}[相位先验 $\times$ 测量似然 $=$ 计划与现实的折中]\label{ins:qe-prob-fusion}
+概率融合的妙处在于\emph{同时}用上了“计划”（相位先验：按步态本该触地了吗）与“现实”（三路测量：力/高度/速度真的像触地吗）。这正好弥合 \cref{ins:qe-prob-boundary} 的边界——平地上现实与计划一致，先验主导（退化为调度器）；复杂地形上现实偏离计划，似然主导（检测器纠正先验）。一个估计器在两种地形上\emph{平滑切换}信任来源，无需手动调模式。这是“概率方法吸收先验”思想在触地检测上的优雅落地。
+\end{insight}
+
+\begin{algo}[四足触地检测整体流程]\label{algo:qe-contact}
+每个控制周期、对每条腿 $i\in\{1,2,3,4\}$：
+\begin{enumerate}
+  \item 读编码器得 $\boldsymbol q_i,\dot{\boldsymbol q}_i$、电机扭矩 $\boldsymbol\tau_i$；
+  \item 由广义动量观测器 \cref{eq:qe-gm-observer} 更新残差 $\hat{\boldsymbol\tau}_{K,i}$，经 \cref{eq:qe-grf-from-tau} 得法向力 $\hat f_i^z$；
+  \item 由正向运动学（\cref{sec:qe-obs}）得足端高度 $\hat p_i^z$、纵向速度 $\hat{\dot p}_i^z$；
+  \item 从步态调度器取相位 $\phi_i$、查接触先验 $P(s_i{=}1\mid\phi_i)$；
+  \item 由 \cref{eq:qe-bayes-contact} 贝叶斯融合得接触概率，阈值 $0.5$ 判 $s_i$；
+  \item 输出 $s_i$：供\emph{控制器}切换支撑/摆动律（\cref{ins:qe-contact-switch}），供\emph{估计器}决定该腿观测协方差是否膨胀（\cref{sec:qe-obs}）。
+\end{enumerate}
+平地固定步态下可整体退化为“按相位固定调度”，跳过 1--3 步（\cref{ins:qe-prob-boundary}）。
+\end{algo}
+
+\begin{practice}
+\begin{enumerate}
+  \item 推 \cref{eq:qe-skew}：由 $\dot{\mathbf{M}}-2\mathbf{C}$ 斜对称与 $\mathbf{M}=\mathbf{M}^\top$，证明 $\dot{\mathbf{M}}=\mathbf{C}+\mathbf{C}^\top$。（提示：$\dot{\mathbf{M}}$ 对称，取 $(\dot{\mathbf{M}}-2\mathbf{C})+(\dot{\mathbf{M}}-2\mathbf{C})^\top=0$。）
+  \item 验证 \cref{eq:qe-gm-observer} 满足 $\dot{\hat{\boldsymbol\tau}}_K=\mathbf{K}_I(\boldsymbol\tau_K-\hat{\boldsymbol\tau}_K)$（对 \cref{eq:qe-gm-observer} 求导并代入 \cref{eq:qe-gm-final}）。这说明 $\mathbf{K}_I$ 的物理意义是什么？
+  \item 在 \cref{eq:qe-bayes-contact} 中，若三路似然里只有“高度”可信、其余两路噪声极大（似然近似均匀），后验会塌缩成什么？这对应 \cref{ins:qe-prob-fusion} 的哪种地形情形？
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{足式里程计的状态方程}
+\label{sec:qe-state}
+
+从本节起进入“平动滤波”主线（\cref{ins:qe-split}）。足式里程计是一个线性卡尔曼滤波器：本节建状态方程（系统怎么演化），\cref{sec:qe-obs} 建观测方程（怎么从腿测量），\cref{sec:qe-kf} 把二者装进 KF。
+
+\subsection{连续状态方程：足端静止假设}
+\label{subsec:qe-cont-state}
+
+\paragraph{状态向量（$18$ 维）。}
+取状态为机身位置、机身速度、四个足端世界系位置：
+\begin{equation}
+  \boldsymbol x = \big[\,{}^{\mathcal{O}}\boldsymbol p_{com};\ {}^{\mathcal{O}}\boldsymbol v_{com};\ {}^{\mathcal{O}}\boldsymbol p_{1};\ {}^{\mathcal{O}}\boldsymbol p_{2};\ {}^{\mathcal{O}}\boldsymbol p_{3};\ {}^{\mathcal{O}}\boldsymbol p_{4}\,\big]\in\mathbb{R}^{18}.
+  \label{eq:qe-state-vec}
+\end{equation}
+机身位置/速度各 $3$ 维，四足端各 $3$ 维，共 $6+12=18$ 维\cite{yu2021quadruped,unitree2023quadruped}。
+
+\paragraph{连续动力学。}
+机身平动是双积分器：位置导数等于速度，速度导数等于世界系净加速度（来自 IMU，\cref{eq:qe-world-acc}）。\textbf{关键的足端静止假设}：支撑足在世界系里\emph{不动}，故其位置导数为零\cite{yu2021quadruped,unitree2023quadruped}：
+\begin{equation}
+  {}^{\mathcal{O}}\dot{\boldsymbol p}_{com} = {}^{\mathcal{O}}\boldsymbol v_{com},
+  \qquad
+  {}^{\mathcal{O}}\dot{\boldsymbol v}_{com} = {}^{\mathcal{O}}\boldsymbol a_{com} + {}^{\mathcal{O}}\boldsymbol g,
+  \qquad
+  {}^{\mathcal{O}}\dot{\boldsymbol p}_{i} = \boldsymbol 0,\ \ i=1,\dots,4.
+  \label{eq:qe-cont-dyn}
+\end{equation}
+
+\begin{insight}[足端静止假设是足式里程计的“锚”]\label{ins:qe-foot-anchor}
+为什么把会动的足端塞进状态、还说它“不动”？因为支撑足在世界系里的\emph{绝对位置}恰是里程计唯一的\emph{绝对参考}（“锚点”）。机身位置无法直接测、IMU 积分会漂；但支撑足一旦落地、只要不打滑，它在世界系里就是\emph{固定}的一个点。把它当状态、用 $\dot{\boldsymbol p}_i=\boldsymbol 0$ 钉住，再通过“足端相对机身位置”（运动学可测，\cref{sec:qe-obs}）把机身\emph{挂}在这个锚上，就把漂移的机身位置约束住了。这就是“里程计”二字的本质：用不动的接触点反推动的机身——与轮式里程计用“轮子不打滑”如出一辙，只是这里的“轮子”是间歇切换的四只脚。摆动时锚失效，故需 \cref{sec:qe-obs} 的协方差膨胀“换锚”。
+\end{insight}
+
+\paragraph{写成矩阵形（输入取世界系净加速度）。}
+把 \cref{eq:qe-cont-dyn} 写成 $\dot{\boldsymbol x}=\mathbf{A}_c\boldsymbol x+\mathbf{B}_c\boldsymbol u$，取输入为世界系净加速度 $\boldsymbol u=\mathbf{R}\boldsymbol a_{out}+\boldsymbol g={}^{\mathcal{O}}\boldsymbol a_s$（\cref{eq:qe-world-acc}）\cite{unitree2023quadruped}：
+\begin{equation}
+  \dot{\boldsymbol x}
+  = \underbrace{\begin{bmatrix} \mathbf{0}_{3\times3} & \mathbf{I}_3 & \mathbf{0}_{3\times12}\\ \mathbf{0}_{3\times18} \\ \mathbf{0}_{12\times18} \end{bmatrix}}_{\mathbf{A}_c}\boldsymbol x
+  + \underbrace{\begin{bmatrix} \mathbf{0}_{3\times3}\\ \mathbf{I}_3 \\ \mathbf{0}_{12\times3} \end{bmatrix}}_{\mathbf{B}_c}\,\big(\mathbf{R}\boldsymbol a_{out}+\boldsymbol g\big).
+  \label{eq:qe-cont-AB}
+\end{equation}
+
+\begin{note}[$\mathbf{A}_c$ 的非零块结构]\label{note:qe-ocr-Ac}
+由 \cref{eq:qe-cont-dyn} 的物理含义，$\mathbf{A}_c$ 中\emph{仅}第一块行 $[\mathbf{0}_3,\ \mathbf{I}_3,\ \mathbf{0}_{3\times12}]$ 非零（对应 $\dot{\boldsymbol p}_{com}={\boldsymbol v}_{com}$），其余行全零——速度导数 $\dot{\boldsymbol v}_{com}$ 的贡献进了 $\mathbf{B}_c$（由输入加速度驱动），足端 $\dot{\boldsymbol p}_i=\boldsymbol 0$ 故对应行全零，即 \cref{eq:qe-cont-AB} 之形式。
+\end{note}
+
+\begin{note}[两种等价写法：输入取重力 vs.\ 取净加速度]\label{note:qe-two-input}
+\cref{eq:qe-cont-AB} 的 $18$ 维线性系统有两种等价的输入写法，区别仅在\emph{输入 $\boldsymbol u$ 怎么取}：
+\begin{itemize}
+  \item \textbf{取净加速度}（本书主用，\cref{eq:qe-cont-AB}）：$\boldsymbol u=\mathbf{R}\boldsymbol a_{out}+\boldsymbol g$（世界系净加速度），$\mathbf{B}_c$ 把它整体送进 $\dot{\boldsymbol v}_{com}$；
+  \item \textbf{取重力}：把 ${}^{\mathcal{O}}\boldsymbol a_{com}=\mathbf{R}\,{}^{\mathcal{B}}\boldsymbol a_{com}$ 并入状态方程的常驻项、只把\emph{重力} $\boldsymbol u={}^{\mathcal{O}}\boldsymbol g$ 设为输入，$\mathbf{B}=[\mathbf{0};\Delta t\,\mathbf{I}_3;\mathbf{0}]$。
+\end{itemize}
+两者数学等价（重力是常量，放输入还是放常驻项不影响解）。本书统一取前者（输入 $=$ 世界系净加速度），因为它把“IMU 提供的所有惯性信息”集中在一个输入向量里，与 \cref{eq:qe-world-acc} 的物理直觉一致。
+\end{note}
+
+\subsection{前向欧拉离散化}
+\label{subsec:qe-disc}
+
+\paragraph{离散化。}
+KF 在离散时刻递推，须把 \cref{eq:qe-cont-AB} 离散。用前向欧拉（一阶、与 IMU 采样周期 $\mathrm{d}t$ 匹配，实时友好）\cite{unitree2023quadruped}：
+\begin{equation}
+  \boldsymbol x_k = \boldsymbol x_{k-1} + \mathrm{d}t\,\dot{\boldsymbol x}_{k-1}
+  = (\mathbf{I}+\mathrm{d}t\,\mathbf{A}_c)\boldsymbol x_{k-1} + \mathrm{d}t\,\mathbf{B}_c\,\boldsymbol u_{k-1},
+  \label{eq:qe-disc-step}
+\end{equation}
+即离散系统矩阵
+\begin{equation}
+  \boxed{\;\mathbf{A} = \mathbf{I}_{18} + \mathrm{d}t\,\mathbf{A}_c,\qquad \mathbf{B} = \mathrm{d}t\,\mathbf{B}_c,\qquad \mathbf{H} = \mathbf{H}_c.\;}
+  \label{eq:qe-disc-AB}
+\end{equation}
+代入 \cref{eq:qe-cont-AB} 的结构，离散状态转移显式为
+\begin{equation}
+  \boldsymbol x_{k} =
+  \begin{bmatrix} \mathbf{I}_3 & \mathrm{d}t\,\mathbf{I}_3 & \mathbf{0}_{3\times12}\\ \mathbf{0}_{3\times3} & \mathbf{I}_3 & \mathbf{0}_{3\times12}\\ \mathbf{0}_{12\times3} & \mathbf{0}_{12\times3} & \mathbf{I}_{12} \end{bmatrix}\boldsymbol x_{k-1}
+  + \begin{bmatrix} \mathbf{0}_{3\times3}\\ \mathrm{d}t\,\mathbf{I}_3 \\ \mathbf{0}_{12\times3} \end{bmatrix}\big(\mathbf{R}\boldsymbol a_{out}+\boldsymbol g\big)_{k-1}.
+  \label{eq:qe-disc-explicit}
+\end{equation}
+读法：机身位置 $=$ 上一步位置 $+\,\mathrm{d}t\times$ 速度（含 $\mathbf{I}_3$ 与 $\mathrm{d}t\,\mathbf{I}_3$ 两块）；机身速度 $=$ 上一步速度 $+\,\mathrm{d}t\times$ 净加速度（来自 $\mathbf{B}$）；足端位置保持（$\mathbf{I}_{12}$，对应 $\dot{\boldsymbol p}_i=\boldsymbol 0$）。两种输入写法（\cref{note:qe-two-input}）给出的离散转移结构相同。
+
+\begin{practice}
+\begin{enumerate}
+  \item 写出 \cref{eq:qe-disc-explicit} 的“位置块”展开式 ${}^{\mathcal{O}}\boldsymbol p_{com,k}={}^{\mathcal{O}}\boldsymbol p_{com,k-1}+\mathrm{d}t\,{}^{\mathcal{O}}\boldsymbol v_{com,k-1}$，并说明它为何\emph{不}含加速度项（提示：前向欧拉只把当前导数线性外推一步）。
+  \item 验证 \cref{eq:qe-disc-AB} 的 $\mathbf{A}=\mathbf{I}+\mathrm{d}t\,\mathbf{A}_c$ 代入 \cref{eq:qe-cont-AB} 的 $\mathbf{A}_c$ 后，位置-速度块恰为 $\begin{bsmallmatrix}\mathbf{I}_3&\mathrm{d}t\,\mathbf{I}_3\\\mathbf{0}&\mathbf{I}_3\end{bsmallmatrix}$。
+  \item （概念）若把前向欧拉换成精确离散 $\mathbf{A}=e^{\mathrm{d}t\,\mathbf{A}_c}$，对本系统结果会差多少？（提示：$\mathbf{A}_c$ 幂零，$\mathbf{A}_c^2=\mathbf{0}$，故 $e^{\mathrm{d}t\mathbf{A}_c}=\mathbf{I}+\mathrm{d}t\mathbf{A}_c$ 精确——前向欧拉在此\emph{无}离散误差。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{足式里程计的观测方程}
+\label{sec:qe-obs}
+
+观测方程把“腿能测到什么”写成 $\boldsymbol z=\mathbf{H}\boldsymbol x$。本节按微分推导走全：正向运动学得本体系足端位置（\cref{subsec:qe-fk}）、雅可比得足端速度、不打滑约束得质心速度观测、零高度假设得足高观测（\cref{subsec:qe-noslip}），最后整合 $28$ 维观测（\cref{subsec:qe-obs-assemble}）并用协方差膨胀缝入触地状态（\cref{subsec:qe-cov-inflate}）。
+
+\subsection{正向运动学：本体系足端位置与速度}
+\label{subsec:qe-fk}
+
+\paragraph{串联腿足端位置闭式。}
+对串联三关节腿，正向运动学给出第 $i$ 腿足端在\emph{机身系}下的位置闭式\cite{yu2021quadruped}：
+\begin{equation}
+  {}^{\mathcal{B}}_{i}\boldsymbol p =
+  \begin{bmatrix}
+    -l_2 s_2 - l_3 s_{23} + \delta\,h_x \\[2pt]
+    \zeta\,l_1 c_1 + l_3 s_1 c_{23} + l_2 c_2 s_1 + \zeta\,h_y \\[2pt]
+    \zeta\,l_1 s_1 - l_3 c_1 c_{23} - l_2 c_1 c_2
+  \end{bmatrix},
+  \label{eq:qe-fk}
+\end{equation}
+其中 $c_j=\cos({}_iq^j)$、$s_j=\sin({}_iq^j)$、$c_{jk}=\cos({}_iq^j+{}_iq^k)$、$s_{jk}=\sin({}_iq^j+{}_iq^k)$；$l_1,l_2,l_3$ 为髋/大腿/小腿连杆长，$h_x,h_y$ 为髋关节相对机身中心的偏置。\emph{符号变量}\cite{yu2021quadruped}：
+\begin{equation}
+  \zeta = \begin{cases}+1,&\text{左腿}\\-1,&\text{右腿}\end{cases},
+  \qquad
+  \delta = \begin{cases}+1,&\text{前腿}\\-1,&\text{后腿}\end{cases},
+  \label{eq:qe-fk-sign}
+\end{equation}
+用一组带符号常量统一四条腿的运动学（左右镜像由 $\zeta$、前后由 $\delta$ 翻转）。
+
+\paragraph{足端雅可比与本体系足端速度。}
+对 \cref{eq:qe-fk} 关于关节角求偏导得 $3\times3$ 足端雅可比 $\mathbf{J}_i=\partial({}^{\mathcal{B}}_{i}\boldsymbol p)/\partial\boldsymbol q_i$，则本体系足端速度\cite{yu2021quadruped}：
+\begin{equation}
+  {}^{\mathcal{B}}_{i}\dot{\boldsymbol p} = \mathbf{J}_i\,\dot{\boldsymbol q}_i,
+  \qquad
+  \mathbf{J}_i=\frac{\partial\,{}^{\mathcal{B}}_{i}\boldsymbol p}{\partial\boldsymbol q_i}
+  =\begin{bmatrix}
+    \dfrac{\partial p^x}{\partial q^1}&\dfrac{\partial p^x}{\partial q^2}&\dfrac{\partial p^x}{\partial q^3}\\[6pt]
+    \dfrac{\partial p^y}{\partial q^1}&\dfrac{\partial p^y}{\partial q^2}&\dfrac{\partial p^y}{\partial q^3}\\[6pt]
+    \dfrac{\partial p^z}{\partial q^1}&\dfrac{\partial p^z}{\partial q^2}&\dfrac{\partial p^z}{\partial q^3}
+  \end{bmatrix}.
+  \label{eq:qe-foot-vel-body}
+\end{equation}
+下面把这 $9$ 个偏导逐一求全（与 \cref{sec:qk-jacobian} 的“一阶微分把非线性变线性”同法），不留“其余同理”。
+
+\begin{example}[足端雅可比 $\mathbf{J}_i$ 的全 $9$ 元逐式推导]\label{exam:qe-jacobian}
+记 $c_j=\cos({}_iq^j)$、$s_j=\sin({}_iq^j)$、$c_{23}=\cos({}_iq^2+{}_iq^3)$、$s_{23}=\sin({}_iq^2+{}_iq^3)$，对 \cref{eq:qe-fk} 三个分量分别关于 ${}_iq^1,{}_iq^2,{}_iq^3$ 求偏导。求导时反复用到链式法则 $\partial c_{23}/\partial q^2=\partial c_{23}/\partial q^3=-s_{23}$、$\partial s_{23}/\partial q^2=\partial s_{23}/\partial q^3=c_{23}$（因 $c_{23},s_{23}$ 同时含 $q^2,q^3$，故对二者偏导相等），以及常量 $\delta h_x,\zeta h_y$ 求导为零。
+
+\textbf{第一行}（$p^x=-l_2 s_2-l_3 s_{23}+\delta h_x$，\emph{不含} $q^1$）：
+\begin{align*}
+  \frac{\partial p^x}{\partial q^1}&=0,\\
+  \frac{\partial p^x}{\partial q^2}&=-l_2 c_2-l_3 c_{23},\qquad(\text{$-l_2 s_2$ 导得 $-l_2c_2$，$-l_3 s_{23}$ 导得 $-l_3c_{23}$})\\
+  \frac{\partial p^x}{\partial q^3}&=-l_3 c_{23}.\qquad(\text{仅 $-l_3 s_{23}$ 含 $q^3$})
+\end{align*}
+
+\textbf{第二行}（$p^y=\zeta l_1 c_1+l_3 s_1 c_{23}+l_2 c_2 s_1+\zeta h_y$）：
+\begin{align*}
+  \frac{\partial p^y}{\partial q^1}&=-\zeta l_1 s_1+l_3 c_1 c_{23}+l_2 c_2 c_1,
+   \quad(\text{$\partial c_1=-s_1$、$\partial s_1=c_1$，$c_{23},c_2$ 视常量})\\
+  \frac{\partial p^y}{\partial q^2}&=-l_3 s_1 s_{23}-l_2 s_2 s_1,
+   \quad(\text{$\partial c_{23}=-s_{23}$、$\partial c_2=-s_2$，$s_1$ 视常量})\\
+  \frac{\partial p^y}{\partial q^3}&=-l_3 s_1 s_{23}.\qquad(\text{仅 $l_3 s_1 c_{23}$ 含 $q^3$，$\partial c_{23}=-s_{23}$})
+\end{align*}
+
+\textbf{第三行}（$p^z=\zeta l_1 s_1-l_3 c_1 c_{23}-l_2 c_1 c_2$）：
+\begin{align*}
+  \frac{\partial p^z}{\partial q^1}&=\zeta l_1 c_1+l_3 s_1 c_{23}+l_2 s_1 c_2,
+   \quad(\text{$\partial s_1=c_1$、$\partial(-c_1)=s_1$，$c_{23},c_2$ 视常量})\\
+  \frac{\partial p^z}{\partial q^2}&=l_3 c_1 s_{23}+l_2 c_1 s_2,
+   \quad(\text{$\partial(-c_{23})=s_{23}$、$\partial(-c_2)=s_2$，$c_1$ 视常量})\\
+  \frac{\partial p^z}{\partial q^3}&=l_3 c_1 s_{23}.\qquad(\text{仅 $-l_3 c_1 c_{23}$ 含 $q^3$，$\partial(-c_{23})=s_{23}$})
+\end{align*}
+把九式按行列归位，即得完整的足端雅可比\cite{yu2021quadruped}：
+\begin{equation}
+  \mathbf{J}_i=
+  \begin{bmatrix}
+    0 & -l_2 c_2-l_3 c_{23} & -l_3 c_{23}\\[2pt]
+    -\zeta l_1 s_1+l_3 c_1 c_{23}+l_2 c_2 c_1 & -l_3 s_1 s_{23}-l_2 s_2 s_1 & -l_3 s_1 s_{23}\\[2pt]
+    \zeta l_1 c_1+l_3 s_1 c_{23}+l_2 s_1 c_2 & l_3 c_1 s_{23}+l_2 c_1 s_2 & l_3 c_1 s_{23}
+  \end{bmatrix}.
+  \label{eq:qe-jacobian-full}
+\end{equation}
+\emph{结构校核}：首行首列为 $0$，因 $p^x$ 不含 $q^1$（abad 关节绕机身 $x$ 轴转、只搬动 $y$/$z$ 不动 $x$，与 \cref{ch:quad_kin} 的单腿关节轴约定一致）；第三列（对膝关节 $q^3$）三元 $-l_3 c_{23},-l_3 s_1 s_{23},l_3 c_1 s_{23}$ 只含 $l_3$，因小腿末端足端只受 $l_3$ 段几何调制。\cref{eq:qe-foot-vel-body} 的 ${}^{\mathcal{B}}_{i}\dot{\boldsymbol p}=\mathbf{J}_i\dot{\boldsymbol q}_i$ 即把这九元作用到关节速度上——这正是 \cref{ins:qe-split} 平动线所需的“足端相对机身速度”，下游经 \cref{eq:qe-vel-obs} 反推机身速度。
+\end{example}
+
+\subsection{不打滑约束与零高度假设}
+\label{subsec:qe-noslip}
+
+\paragraph{足端世界系位置。}
+把本体系足端位置 \cref{eq:qe-fk} 旋到世界系并平移到机身位置\cite{yu2021quadruped}：
+\begin{equation}
+  {}^{\mathcal{O}}_{i}\boldsymbol p = {}^{\mathcal{O}}\boldsymbol p_{com} + \mathbf{R}\,{}^{\mathcal{B}}_{i}\boldsymbol p.
+  \label{eq:qe-foot-world-pos}
+\end{equation}
+
+\paragraph{足端世界系速度（微分）。}
+对 \cref{eq:qe-foot-world-pos} 关于时间求导，用 $\dot{\mathbf{R}}=\mathbf{R}\,({}^{\mathcal{B}}\boldsymbol\omega_{\mathcal{OB}})^\wedge$（机体角速度，\cref{ch:lie} 右扰动主线）：
+\begin{equation}
+  {}^{\mathcal{O}}_{i}\dot{\boldsymbol p}
+  = {}^{\mathcal{O}}\boldsymbol v_{com}
+  + \dot{\mathbf{R}}\,{}^{\mathcal{B}}_{i}\boldsymbol p + \mathbf{R}\,{}^{\mathcal{B}}_{i}\dot{\boldsymbol p}
+  = {}^{\mathcal{O}}\boldsymbol v_{com}
+  + \mathbf{R}\Big(({}^{\mathcal{B}}\boldsymbol\omega_{\mathcal{OB}})^\wedge\,{}^{\mathcal{B}}_{i}\boldsymbol p + {}^{\mathcal{B}}_{i}\dot{\boldsymbol p}\Big).
+  \label{eq:qe-foot-world-vel}
+\end{equation}
+
+\paragraph{不打滑约束 $\to$ 质心速度观测。}
+\textbf{核心一步}：支撑足在世界系里不动（不打滑），即 ${}^{\mathcal{O}}_{i}\dot{\boldsymbol p}=\boldsymbol 0$。代入 \cref{eq:qe-foot-world-vel} 反解出机身速度\cite{yu2021quadruped}：
+\begin{equation}
+  \boxed{\;{}^{\mathcal{O}}\boldsymbol v_{com}
+  = -\,\mathbf{R}\Big(({}^{\mathcal{B}}\boldsymbol\omega_{\mathcal{OB}})^\wedge\,{}^{\mathcal{B}}_{i}\boldsymbol p + {}^{\mathcal{B}}_{i}\dot{\boldsymbol p}\Big).\;}
+  \label{eq:qe-vel-obs}
+\end{equation}
+这是足式里程计\emph{最关键}的观测：右端全是可测量——$\mathbf{R}$（姿态）、${}^{\mathcal{B}}\boldsymbol\omega_{\mathcal{OB}}$（IMU 角速度）、${}^{\mathcal{B}}_{i}\boldsymbol p$（运动学，\cref{eq:qe-fk}）、${}^{\mathcal{B}}_{i}\dot{\boldsymbol p}=\mathbf{J}_i\dot{\boldsymbol q}_i$（雅可比，\cref{eq:qe-foot-vel-body}）。于是\textbf{支撑足的运动学给出了机身速度的一个直接观测}——这正是修正 IMU 速度漂移的绝对参考。
+
+\begin{insight}[不打滑约束把“腿的几何”变成“机身的速度计”]\label{ins:qe-noslip}
+\cref{eq:qe-vel-obs} 是全章平动线的灵魂：它把“足端在世界系不动”这条物理约束，翻译成对机身速度 ${}^{\mathcal{O}}\boldsymbol v_{com}$ 的\emph{直接测量}。没有任何传感器直接测机身速度（\cref{ins:qe-split}），但支撑足的不动 $+$ 腿的几何（运动学 $+$ 雅可比）$+$ 姿态/角速度，合起来\emph{算}出了机身速度。这就是“腿式里程计”——腿当成一根会变形的“量尺”，量出机身相对不动接触点的运动。它与 IMU 积分形成互补：IMU 高频但漂，运动学速度观测低频但锚定。卡尔曼滤波（\cref{sec:qe-kf}）的全部工作就是把这两者按各自可信度融合。约束失效（打滑/摆动）时，这把“速度计”读数不可信，须降权（\cref{subsec:qe-cov-inflate}）。
+\end{insight}
+
+\paragraph{零高度假设 $\to$ 足高观测。}
+足端高度观测取世界系 $z$ 分量 ${}^{\mathcal{O}}_{i}p^z=[0,0,1]\,{}^{\mathcal{O}}_{i}\boldsymbol p$。支撑足落在地面，名义\emph{零高度}假设\cite{yu2021quadruped}：
+\begin{equation}
+  {}^{\mathcal{O}}_{i}p^z = 0.
+  \label{eq:qe-zero-height}
+\end{equation}
+
+\begin{insight}[高度漂移的特殊危害与零高度假设]\label{ins:qe-height}
+高度方向有其\emph{特殊性}。水平 $x/y$ 方向的累积漂移其实\emph{不直接影响}动态步态控制——MPC/WBC 主要跟踪\emph{速度}与\emph{相对位置}，机身在世界系里整体平移多远无伤大雅（\cref{ch:quad_mpc} 跟速度比跟绝对位置鲁棒）。但 $z$ 方向\emph{不同}：机身高度直接体现在\emph{质心高度}（站多高）与\emph{抬腿高度}控制里，$z$ 漂移会让机器人“以为自己站得比实际高/低”，直接污染控制。于是采取\emph{零高度假设}（\cref{eq:qe-zero-height}）：假设支撑足踩在名义零高度地面，反过来\emph{反求机身高度}。代价是——\textbf{机器人无法感知所踩平台的绝对高度}（踩上 $10\,\mathrm{cm}$ 台阶时它仍以为脚在零高度），但这\emph{不显著影响}动态步态（控制要的是机身\emph{相对支撑面}的高度，零高度假设恰好给的就是这个）。这是一个典型的“放弃不需要的绝对量、换取需要的相对量稳定”的工程权衡。
+\end{insight}
+
+\begin{pitfall}[误区：零高度假设让机器人能测台阶高度]
+零高度假设（\cref{eq:qe-zero-height}）\emph{恰恰相反}：它把支撑足\emph{钉在}名义零高度，因此机器人\emph{无法}感知所踩平台的绝对高度变化——上台阶时它“看不见”那 $10\,\mathrm{cm}$。这是有意为之的代价（\cref{ins:qe-height}）：换来 $z$ 方向不漂移、机身相对支撑面高度稳定。若任务\emph{需要}绝对地形高度（如建图、跨越已知障碍），须引入外部传感（视觉/激光）或地形估计，而非指望足式里程计——后者天生只给相对量。
+\end{pitfall}
+
+\subsection{整合 \texorpdfstring{$28$}{28} 维观测方程}
+\label{subsec:qe-obs-assemble}
+
+把三类观测对每条腿堆叠：足端相对机身位置（$4\times3=12$）、足端相对机身速度（$4\times3=12$）、足端高度（$4\times1=4$），共 $28$ 维\cite{yu2021quadruped,unitree2023quadruped}：
+\begin{equation}
+  \boldsymbol z =
+  \begin{bmatrix}
+    \mathbf{R}\,{}^{\mathcal{B}}_{i}\boldsymbol p &\!\!(i{=}1\!\dots\!4)\\[3pt]
+    \mathbf{R}\big(({}^{\mathcal{B}}\boldsymbol\omega_{\mathcal{OB}})^\wedge\,{}^{\mathcal{B}}_{i}\boldsymbol p + \mathbf{J}_i\dot{\boldsymbol q}_i\big)&\!\!(i{=}1\!\dots\!4)\\[3pt]
+    {}^{\mathcal{O}}_{i}p^z &\!\!(i{=}1\!\dots\!4)
+  \end{bmatrix}
+  = \mathbf{H}\,\boldsymbol x.
+  \label{eq:qe-obs-z}
+\end{equation}
+观测矩阵 $\mathbf{H}\in\mathbb{R}^{28\times18}$ 的结构由三段语义决定：
+\begin{itemize}
+  \item \textbf{位置段}（$12$ 行）：测“足端相对机身位置” ${}^{\mathcal{O}}_{i}\boldsymbol p-{}^{\mathcal{O}}\boldsymbol p_{com}=\mathbf{R}\,{}^{\mathcal{B}}_{i}\boldsymbol p$，对应 $\mathbf{H}$ 把 ${}^{\mathcal{O}}_{i}\boldsymbol p$（状态）减 ${}^{\mathcal{O}}\boldsymbol p_{com}$（状态），故该段为 $[-\mathbf{I}_3\,(\text{机身位置块}),\,\mathbf{0},\,\mathbf{I}_3\,(\text{第 }i\text{ 足端块})]$；
+  \item \textbf{速度段}（$12$ 行）：由不打滑约束 \cref{eq:qe-vel-obs}，测的等价于 $-{}^{\mathcal{O}}\boldsymbol v_{com}$，对应 $\mathbf{H}$ 在机身速度块取 $-\mathbf{I}_3$；
+  \item \textbf{高度段}（$4$ 行）：测足端世界系 $z$，对应第 $i$ 足端块取 $[0,0,1]$。
+\end{itemize}
+
+\begin{note}[$\mathbf{H}$ 矩阵的三段语义与 $0$-index 提醒]\label{note:qe-ocr-H}
+$28\times18$ 的观测矩阵 $\mathbf{H}$ 由上述三段语义（位置/速度/高度）完全确定，块结构如上所列。这套观测方程不依赖足端运动学的具体写法——无论用串联腿闭式 \cref{eq:qe-fk} 还是通用雅可比，所得 $28$ 维、三段结构\emph{同构}，可互为独立佐证。另一处实现细节：程序中“$\boldsymbol p_i(2)$”按 $0$-index 约定代表\emph{第三个}元素（$(2)=z$ 轴），\emph{非}第二元素，实现时勿误。
+\end{note}
+
+\subsection{摆动足协方差膨胀：把触地状态缝进滤波器}
+\label{subsec:qe-cov-inflate}
+
+\paragraph{为什么需要膨胀。}
+不打滑约束（\cref{eq:qe-vel-obs}）与足端静止（\cref{eq:qe-cont-dyn}）只对\emph{支撑足}成立。摆动足在空中、运动学“速度观测”毫无意义（足端正高速摆动，不动假设彻底失效）。但 KF 的 $\mathbf{H}$ 是固定结构的——不能每步改维度。解决办法：保持 $\mathbf{H}$ 不变，只把摆动腿对应的\emph{过程/观测协方差}设成大数，让 KF \emph{自动}降权（“软关闭”）该腿的信息\cite{yu2021quadruped}。
+
+\paragraph{膨胀规则。}
+若第 $i$ 腿摆动（$s_i=0$），在过程噪声 $\mathbf{Q}$ 与观测噪声 $\mathbf{R}$ 中把对应块设为大数 $n_{big}=100$\cite{yu2021quadruped}：
+\begin{equation}
+  \mathbf{Q}\big[\text{足端 }i\text{ 块}\big]=n_{big}\,\mathbf{I}_3,
+  \quad
+  \mathbf{R}\big[\text{位置}_i,\,\text{速度}_i\text{ 块}\big]=n_{big}\,\mathbf{I}_3,
+  \quad
+  \mathbf{R}\big[\text{高度}_i\big]=n_{big}.
+  \label{eq:qe-cov-inflate}
+\end{equation}
+$\mathbf{Q}$ 中足端块膨胀允许摆动足端位置“自由漂移”（不再钉死 $\dot{\boldsymbol p}_i=\boldsymbol 0$）；$\mathbf{R}$ 中三段膨胀让该腿的三类观测几乎不参与更新（卡尔曼增益 $\to0$）。落地（$s_i=1$）后恢复正常小协方差，该足端“重新落锚”（\cref{ins:qe-foot-anchor}）。
+
+\paragraph{支撑腿内部也该可变：窗口函数渐变协方差。}
+上面的二值膨胀只把腿分成“摆动（大协方差）/ 支撑（小协方差）”两档，对支撑相\emph{一视同仁}。但更精细地看，\emph{支撑相内部}也并非处处一样可信：足端\emph{刚开始触地}与\emph{即将结束触地、准备腾空}的瞬间，足端位置都会有明显抖动（落地冲击、卸载回弹），此时即便已判触地也仍需\emph{较大}协方差；唯有支撑相\emph{中段}稳定踩实时，足端位置抖动才小、协方差才该小。于是应给支撑腿一个\emph{随触地进度连续变化}的协方差\cite{unitree2023quadruped}。
+
+为此引入\emph{窗口函数}（window function）$\sigma(x)$ 作“可信度”，其中 $x\in[0,1]$ 是触地相位（$0$ 刚触地、$1$ 即将离地，由步态调度器或触地检测给出）。$\sigma$ 在定义域\emph{两端小、中间大}，恰好编码“信任触地中段、不信任始末”。用分段（梯形）函数表示\cite{unitree2023quadruped}：
+\begin{equation}
+  \sigma(x)=\begin{cases}
+    \dfrac{x}{w_r}, & 0\le x< w_r,\\[6pt]
+    1, & w_r\le x\le 1-w_r,\\[4pt]
+    \dfrac{1-x}{w_r}, & 1-w_r< x\le 1,
+  \end{cases}
+  \label{eq:qe-window}
+\end{equation}
+其中 $w_r\in(0,\tfrac12)$ 是斜升/斜降段的相位宽度（爬坡半宽）。设足端\emph{稳定触地}时的噪声协方差为 $\mathbf{C}_{\mathrm{init}}$，则整个触地周期内该足端的协方差取\cite{unitree2023quadruped}：
+\begin{equation}
+  \mathbf{C}_{\mathrm{stance}}=\big[\,1+(1-\sigma)\,L\,\big]\,\mathbf{C}_{\mathrm{init}},
+  \label{eq:qe-cstance}
+\end{equation}
+$L$ 为代替 $+\infty$ 的极大数（与 \cref{eq:qe-cov-inflate} 的 $n_{big}$ 同类）。读两端：$\sigma=1$（中段，最信任）$\Rightarrow\mathbf{C}_{\mathrm{stance}}=\mathbf{C}_{\mathrm{init}}$；$\sigma=0$（触地始末，不信任）$\Rightarrow\mathbf{C}_{\mathrm{stance}}=(1+L)\mathbf{C}_{\mathrm{init}}$ 极大——即支撑腿的协方差在触地周期内\emph{由大到小再到大}地连续变化（\cref{fig:qe-window}），而非二值跳变。
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth,scale=1.0]
+  \draw[->] (0,0)--(5.8,0) node[right,font=\scriptsize]{触地相位 $x$};
+  \draw[->] (0,0)--(0,2.35) node[above,font=\scriptsize]{可信度 $\sigma(x)$};
+  \draw (0,0.05)--(0,-0.05) node[below,font=\scriptsize]{$0$};
+  \draw (5,0.05)--(5,-0.05) node[below,font=\scriptsize]{$1$};
+  \draw[dashed,gray!55] (0,1.8)--(5,1.8); \node[font=\scriptsize] at (-0.25,1.8){$1$};
+  % trapezoid window: w_r=0.25 -> ramp 0..1.25, plateau 1.25..3.75, ramp 3.75..5
+  \draw[main,very thick] (0,0)--(1.25,1.8)--(3.75,1.8)--(5,0);
+  \draw[dashed,gray!55] (1.25,0)--(1.25,1.8); \node[font=\scriptsize] at (1.25,-0.32){$w_r$};
+  \draw[dashed,gray!55] (3.75,0)--(3.75,1.8); \node[font=\scriptsize] at (3.75,-0.32){$1-w_r$};
+  \node[main,font=\scriptsize] at (2.5,2.08){平台：稳定支撑，$\mathbf{C}_{\mathrm{stance}}=\mathbf{C}_{\mathrm{init}}$};
+  \node[third,font=\scriptsize,align=center] at (0.62,0.95){刚触地\\抖动大};
+  \node[third,font=\scriptsize,align=center] at (4.4,0.95){将离地\\抖动大};
+\end{tikzpicture}
+\caption{支撑腿协方差的渐变窗口函数 $\sigma(x)$（\cref{eq:qe-window}）。触地中段 $\sigma=1$、协方差取最小 $\mathbf{C}_{\mathrm{init}}$（最信任）；触地始末 $\sigma\to0$、协方差经 \cref{eq:qe-cstance} 膨胀到 $(1+L)\mathbf{C}_{\mathrm{init}}$（不信任落地冲击/卸载回弹的抖动）。这把“摆动 / 支撑”二值开关细化为“摆动 / 触地始末 / 稳定支撑”三档连续。}
+\label{fig:qe-window}
+\end{figure}
+
+\begin{insight}[二值膨胀 $\subset$ 渐变窗口：合并 OCS2 与宇树两源所长]\label{ins:qe-cov-graded}
+\cref{eq:qe-cov-inflate} 的二值膨胀与 \cref{eq:qe-cstance} 的渐变窗口\emph{不是两套对立方案，而是同一思想的粗细两档}，正可合并：把可信度 $\sigma$ 看作连续旋钮，则\textbf{二值膨胀是 $\sigma$ 只取 $\{0,1\}$ 两端的硬量化}——摆动腿对应 $\sigma\to0$（$\mathbf{C}_{\mathrm{stance}}\to(1+L)\mathbf{C}_{\mathrm{init}}$，正是 $n_{big}$ 膨胀），稳定支撑对应 $\sigma=1$（$\mathbf{C}_{\mathrm{init}}$）；而\textbf{渐变窗口把这个开关在触地始末用 $0<\sigma<1$ 平滑过渡}，于是“摆动/支撑”二档被细化成“摆动 / 触地始末 / 稳定支撑”三档连续。两源的取舍因此清晰：\textbf{OCS2/论文的二值膨胀}实现最简、在\emph{平地 $+$ 固定步态}下足够（落足时刻可预测、相位切换抖动可忽略，呼应 \cref{ins:qe-prob-boundary}）；\textbf{宇树的渐变窗口}在\emph{快步态 / 非结构化地形}下额外平滑了相位切换处的估计跳变（落地冲击不被当作可信观测猛拉机身速度），代价是要多标定爬坡半宽 $w_r$ 与触地相位 $x$。工程上可\emph{先用二值膨胀跑通、再在相位切换抖动明显时升级为渐变窗口}——二者共享同一个 $\mathbf{C}_{\mathrm{init}}$ 与 $L$，升级只是把 $\sigma$ 从两级量化放开为连续。
+\end{insight}
+
+\begin{insight}[协方差膨胀 $=$ 触地检测在滤波器里的落地点（耦合 §触地 $\leftrightarrow$ §里程计）]\label{ins:qe-cov-couple}
+\cref{eq:qe-cov-inflate} 是本章两条主线的\emph{缝合处}：触地检测（\cref{sec:qe-contact}）输出的 $s_i$，正是通过协方差膨胀\emph{进入}估计器的。$s_i=0$（摆动）$\Rightarrow$ 膨胀 $\Rightarrow$ KF 不信该腿；$s_i=1$（支撑）$\Rightarrow$ 恢复 $\Rightarrow$ KF 用该腿的不打滑约束（\cref{ins:qe-noslip}）锚定机身速度。即使不做显式触地检测，单凭协方差膨胀也能\emph{间接}区分支撑/摆动；而显式触地检测（\cref{sec:qe-contact}）给出更可靠的 $s_i$——二者在这里汇合于同一个膨胀开关。这解释了 \cref{ins:qe-contact-switch}“触地是开关”在估计侧的确切含义：开关 $=$ 协方差是否膨胀。理解这一点，触地检测与里程计就不再是两个孤立模块，而是一个由 $s_i$ 串起来的闭环。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 对 \cref{eq:qe-foot-world-pos} 求时间导数，逐步导出 \cref{eq:qe-foot-world-vel}（注意 $\dot{\mathbf{R}}=\mathbf{R}\,\boldsymbol\omega^\wedge$ 与乘积法则两项）。
+  \item 由 \cref{eq:qe-foot-world-vel} 令 ${}^{\mathcal{O}}_{i}\dot{\boldsymbol p}=\boldsymbol 0$ 推出 \cref{eq:qe-vel-obs}；解释为何四条支撑腿各给一个 ${}^{\mathcal{O}}\boldsymbol v_{com}$ 观测、KF 如何融合这些冗余观测。
+  \item 设第 $2$ 腿摆动，写出 $\mathbf{R}$ 中被膨胀的具体行块（位置段第 $4$--$6$ 行、速度段第 $16$--$18$ 行、高度段第 $26$ 行），核对 \cref{eq:qe-cov-inflate} 的索引。
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{卡尔曼滤波融合}
+\label{sec:qe-kf}
+
+至此状态方程（\cref{eq:qe-disc-explicit}）与观测方程（\cref{eq:qe-obs-z}）齐备，二者都\emph{线性}，故用标准\emph{线性卡尔曼滤波}融合即可。本节只给四足实例的两步递归式与一个数值例；通用 KF 推导（加权最小二乘 $\to$ 递推最小二乘 $\to$ KF）一律引用 \cref{ch:eskf}。
+
+\subsection{通用 KF 推导一律外引}
+\label{subsec:qe-kf-cite}
+
+\begin{derivation}[通用 KF 推导的来龙去脉（凝练，详见 \cref{ch:eskf}）]\label{deriv:qe-kf-lineage}
+离散 KF 可由一条完整链条推出，本章\emph{不重推}，只点其骨架供索引 \cref{ch:eskf}：
+\begin{enumerate}
+  \item \textbf{加权最小二乘（WLS）}：最小化 $J=(\boldsymbol z-\mathbf{H}\hat{\boldsymbol x})^\top\mathbf{R}^{-1}(\boldsymbol z-\mathbf{H}\hat{\boldsymbol x})$，对 $\hat{\boldsymbol x}$ 求导置零得 $\hat{\boldsymbol x}=(\mathbf{H}^\top\mathbf{R}^{-1}\mathbf{H})^{-1}\mathbf{H}^\top\mathbf{R}^{-1}\boldsymbol z$；
+  \item \textbf{递推最小二乘（RLS）}：把 WLS 写成“上一估计 $+$ 增益 $\times$ 新息”的递推 $\hat{\boldsymbol x}_k=\hat{\boldsymbol x}_{k-1}+\mathbf{K}_k(\boldsymbol z_k-\mathbf{H}\hat{\boldsymbol x}_{k-1})$，对增益求迹偏导置零得最优 $\mathbf{K}_k=\mathbf{P}_{k-1}\mathbf{H}^\top(\mathbf{R}+\mathbf{H}\mathbf{P}_{k-1}\mathbf{H}^\top)^{-1}$；
+  \item \textbf{加上过程模型}：含过程噪声 $\boldsymbol w\sim(0,\mathbf{Q})$ 的状态递推 $\bar{\boldsymbol x}_k=\mathbf{A}\bar{\boldsymbol x}_{k-1}+\mathbf{B}\boldsymbol u_{k-1}$、协方差递推 $\mathbf{P}_k=\mathbf{A}\mathbf{P}_{k-1}\mathbf{A}^\top+\mathbf{Q}$，与 RLS 合并即得预测-更新两步的离散 KF。
+\end{enumerate}
+所需数学工具（二次型/迹偏导 $\partial(\boldsymbol x^\top\mathbf{A}\boldsymbol x)/\partial\boldsymbol x$、$\partial\,\mathrm{Tr}(\mathbf{A}\mathbf{B}\mathbf{A}^\top)/\partial\mathbf{A}$、期望/方差/协方差/白噪声）见 \cref{ch:matderiv,ch:eskf}。本章默认读者已掌握，直接用结论。
+\end{derivation}
+
+\begin{note}[符号约定：角速度与状态估计误差不复用 $\boldsymbol\omega$]\label{note:qe-ocr-symbol}
+部分文献在 KF 推导中用同一个 $\boldsymbol\omega_k$ 既表“IMU 角速度”又表“状态估计误差”，二义易混。本书全章保留 $\boldsymbol\omega$ \emph{专表}角速度，状态估计误差统一记 $\tilde{\boldsymbol x}_k$（亦可记 $\boldsymbol e_k$）；先验/后验一律用上标减号/加号 $\hat{\boldsymbol x}_k^-,\mathbf{P}_k^-$（见本章记号约定）。
+\end{note}
+
+\subsection{四足实例的预测-更新两步}
+\label{subsec:qe-kf-steps}
+
+\paragraph{系统-观测组合。}
+\begin{equation}
+  \boldsymbol x_k = \mathbf{A}\boldsymbol x_{k-1} + \mathbf{B}\boldsymbol u_{k-1} + \boldsymbol w_{k-1},
+  \qquad
+  \boldsymbol z_k = \mathbf{H}\boldsymbol x_k + \boldsymbol v_k,
+  \label{eq:qe-kf-system}
+\end{equation}
+$\boldsymbol w\sim(0,\mathbf{Q})$ 过程噪声、$\boldsymbol v\sim(0,\mathbf{R})$ 观测噪声，$\mathbf{A},\mathbf{B}$ 来自 \cref{eq:qe-disc-AB}、$\mathbf{H}$ 来自 \cref{eq:qe-obs-z}、$\mathbf{Q},\mathbf{R}$ 按触地状态膨胀（\cref{eq:qe-cov-inflate}）。
+
+\paragraph{时间更新（预测）。}
+\begin{equation}
+  \hat{\boldsymbol x}_k^- = \mathbf{A}\hat{\boldsymbol x}_{k-1}^+ + \mathbf{B}\boldsymbol u_{k-1},
+  \qquad
+  \mathbf{P}_k^- = \mathbf{A}\mathbf{P}_{k-1}^+\mathbf{A}^\top + \mathbf{Q}.
+  \label{eq:qe-kf-predict}
+\end{equation}
+
+\paragraph{测量更新（校正）。}
+\begin{align}
+  \mathbf{K}_k &= \mathbf{P}_k^-\mathbf{H}^\top\big(\mathbf{R} + \mathbf{H}\mathbf{P}_k^-\mathbf{H}^\top\big)^{-1},
+  \label{eq:qe-kf-gain}\\
+  \hat{\boldsymbol x}_k^+ &= \hat{\boldsymbol x}_k^- + \mathbf{K}_k\big(\boldsymbol z_k - \mathbf{H}\hat{\boldsymbol x}_k^-\big),
+  \label{eq:qe-kf-update}\\
+  \mathbf{P}_k^+ &= (\mathbf{I} - \mathbf{K}_k\mathbf{H})\mathbf{P}_k^-(\mathbf{I} - \mathbf{K}_k\mathbf{H})^\top + \mathbf{K}_k\mathbf{R}\mathbf{K}_k^\top.
+  \label{eq:qe-kf-cov}
+\end{align}
+\cref{eq:qe-kf-cov} 用\emph{Joseph 形}协方差更新（而非简化形 $(\mathbf{I}-\mathbf{K}_k\mathbf{H})\mathbf{P}_k^-$）。
+
+\begin{note}[简化形与 Joseph 形等价，但 Joseph 形优先]\label{note:qe-joseph}
+协方差更新有两种写法：\emph{简化形} $\mathbf{P}_k^+=(\mathbf{I}-\mathbf{K}_k\mathbf{H})\mathbf{P}_k^-$ 与 \emph{Joseph 形}（\cref{eq:qe-kf-cov}）。二者在\emph{最优增益}（\cref{eq:qe-kf-gain}）下数学等价，但 Joseph 形对\emph{任意}增益都保持 $\mathbf{P}_k^+$ 的\emph{对称半正定}，且对舍入误差更稳健——故本书推荐 Joseph 形。简化形虽省一次乘法，但浮点累积可能使 $\mathbf{P}$ 失对称/出现负特征值，长时运行后滤波器发散（见 \cref{sec:qe-pitfall}）。
+\end{note}
+
+\begin{example}[单步预测-更新走一遍（一维退化直觉）]\label{exam:qe-kf-step}
+为看清两步机理，取最简一维退化：估机身高度 $x$（标量），过程 $x_k=x_{k-1}+w$（$\mathbf{A}=1,\mathbf{B}=0$），观测 $z_k=x_k+v$（$\mathbf{H}=1$），$\mathbf{Q}=0.01$、$\mathbf{R}=0.04$。设上一后验 $\hat x_{k-1}^+=0.30\,\mathrm{m}$、$\mathbf{P}_{k-1}^+=0.02$。
+\begin{itemize}
+  \item \textbf{预测}（\cref{eq:qe-kf-predict}）：$\hat x_k^-=0.30$，$\mathbf{P}_k^-=1\cdot0.02\cdot1+0.01=0.03$。
+  \item \textbf{增益}（\cref{eq:qe-kf-gain}）：$\mathbf{K}_k=\dfrac{0.03}{0.04+0.03}=\dfrac{0.03}{0.07}\approx0.4286$。
+  \item \textbf{更新}（\cref{eq:qe-kf-update}）：设观测 $z_k=0.36$，新息 $0.36-0.30=0.06$，$\hat x_k^+=0.30+0.4286\times0.06\approx0.3257\,\mathrm{m}$。
+  \item \textbf{协方差}（\cref{eq:qe-kf-cov} Joseph）：$\mathbf{P}_k^+=(1-0.4286)^2\cdot0.03+0.4286^2\cdot0.04\approx0.0098+0.0073=0.0172$。
+\end{itemize}
+观察：协方差从预测的 $0.03$ 降到更新后的 $0.0172$（观测带来信息、降低不确定度）；增益 $0.43$ 介于 $0,1$ 之间，意味“信观测 $43\%$、信预测 $57\%$”——因 $\mathbf{R}>\mathbf{P}^-$（观测比预测更不确定）。$18$ 维实际系统逐块同理，只是矩阵运算；摆动腿膨胀时（\cref{eq:qe-cov-inflate}）对应 $\mathbf{R}$ 块巨大 $\Rightarrow\mathbf{K}\to0\Rightarrow$ 几乎不更新该腿。
+\end{example}
+
+\begin{insight}[现代演进指针：流形一致性与 InEKF]\label{ins:qe-inekf}
+本章用的是\emph{线性} KF——把姿态当成外部直读量、状态只装位置/速度/足端（都在 $\mathbb{R}^n$ 上）。这是工程主力与教学起点，简单可靠。但它有一个理论瑕疵：姿态 $\mathbf{R}\in\SO(3)$ 是流形，线性 KF 把它\emph{排除在被滤状态外}（仅作直读），错失了姿态与速度/位置的耦合不确定性。现代演进有两条：（i）\cref{ch:eskf} 的\emph{误差状态卡尔曼滤波}（ESKF）——在 $\SO(3)$ 切空间（右扰动，本书主线）线性化误差、把姿态/零偏一并扩进状态；（ii）\cref{ch:invariant-filter} 的\emph{不变卡尔曼滤波}（RIEKF/InEKF）——利用群对称性使误差动力学\emph{状态无关}，收敛域更大、对初值更鲁棒，已成为腿式状态估计（如 Hartley/Bloesch 路线\cite{bloesch2013state}）的现代标准。本章线性 KF 是它们的“退化基线”：理解了这里的两步递归，再去读 \cref{ch:invariant-filter} 就只是把 $\mathbb{R}^n$ 换成流形、把加法换成 $\exp/\log$。
+\end{insight}
+
+\begin{practice}
+\begin{enumerate}
+  \item 验证 \cref{exam:qe-kf-step} 中若改用\emph{简化形} $\mathbf{P}_k^+=(1-\mathbf{K}_k)\mathbf{P}_k^-$，结果 $0.0172$ 与 Joseph 形一致（因用了最优增益）；再取一个\emph{非}最优增益 $\mathbf{K}=0.6$，比较两形 $\mathbf{P}_k^+$，验证 Joseph 形仍非负而简化形可能为负（\cref{note:qe-joseph}）。
+  \item 在 \cref{eq:qe-kf-gain} 中令某腿 $\mathbf{R}$ 块 $\to\infty$（膨胀），证明对应 $\mathbf{K}_k$ 块 $\to0$，从而该腿观测不参与更新（\cref{ins:qe-cov-couple}）。
+  \item （概念）为什么本章能用线性 KF 而非 EKF？（提示：状态方程 \cref{eq:qe-disc-explicit} 与观测方程 \cref{eq:qe-obs-z} 对\emph{状态} $\boldsymbol x$ 都线性，非线性的 $\mathbf{R}$、运动学已作为\emph{已知系数}进入 $\mathbf{H}$、$\boldsymbol u$。）
+\end{enumerate}
+\end{practice}
+
+% ════════════════════════════════════════════════════════════════
+\section{陷阱速查}
+\label{sec:qe-pitfall}
+
+\begin{pitfall}[纯 IMU 积分定位]
+把加速度计两次积分当定位用——零偏使位置误差 $\sim\tfrac12 b_a t^2$ 二次发散（\cref{sec:qe-naive}）。IMU 只供高频短时增量，必须由足底运动学观测（\cref{eq:qe-vel-obs}）锚定。
+\end{pitfall}
+
+\begin{pitfall}[简化形协方差更新长时发散]
+用 $\mathbf{P}_k^+=(\mathbf{I}-\mathbf{K}\mathbf{H})\mathbf{P}_k^-$ 而非 Joseph 形：浮点累积使 $\mathbf{P}$ 失对称、出现负特征值，长时运行滤波器发散。务必用 Joseph 形 \cref{eq:qe-kf-cov}（\cref{note:qe-joseph}）。
+\end{pitfall}
+
+\begin{pitfall}[忘记给摆动腿膨胀协方差]
+摆动腿足端高速运动，不打滑约束（\cref{eq:qe-vel-obs}）与足端静止（\cref{eq:qe-cont-dyn}）都失效。若不膨胀其协方差（\cref{eq:qe-cov-inflate}），KF 会把摆动腿的荒谬“速度观测”当真，污染机身速度估计。
+\end{pitfall}
+
+\begin{pitfall}[$0$-index 与第三元素混淆]
+代码中 $\boldsymbol p_i(2)$ 是\emph{第三个}元素（$z$ 轴，$0$-index 程序约定），非第二元素（\cref{note:qe-ocr-H}）。实现高度观测（\cref{eq:qe-zero-height}）时取错分量将整套高度估计错位。
+\end{pitfall}
+
+\begin{pitfall}[期望零高度假设能测台阶]
+零高度假设把支撑足钉在名义零高度，机器人\emph{无法}感知台阶绝对高度（\cref{ins:qe-height}）。要绝对地形高度须外部传感，别指望足式里程计。
+\end{pitfall}
+
+\begin{pitfall}[GM 观测器里偷用加速度]
+图省事在 GM 观测器里代入 $\ddot{\boldsymbol q}$（数值微分得）——这恰是 GM 要消去的（\cref{ins:qe-gm-motivation}），会重新引入噪声/延迟。必须用 \cref{eq:qe-gm-observer} 的残差形式，右端只含 $(\boldsymbol\tau,\boldsymbol q,\dot{\boldsymbol q})$（\cref{deriv:qe-gm}）。
+\end{pitfall}
+
+\begin{pitfall}[IMU 安装偏置不标定]
+直接拿 IMU 原始读数当躯干姿态/角速度，忽略安装旋转链（\cref{eq:qe-att-compose,eq:qe-imu-align}）——若 IMU 倒装或斜装，姿态整体偏转，污染世界系加速度（\cref{eq:qe-world-acc}）与整个里程计。务必走完标定链（\cref{exam:qe-calib}）。
+\end{pitfall}
+
+% ════════════════════════════════════════════════════════════════
+\section{实践与部署}
+\label{sec:qe-practice}
+
+本节遵“跳过纯工程”原则，凝练落地要点，不展开代码。
+
+\begin{practice}[$\mathbf{Q}/\mathbf{R}$ 整定]
+\begin{itemize}
+  \item \textbf{$\mathbf{Q}$（过程噪声）}：机身位置/速度块按 IMU 积分可信度设小值；足端位置块支撑时设小（钉死不动）、摆动时膨胀为 $n_{big}=100$（\cref{eq:qe-cov-inflate}）。把未显式建模的 IMU 零偏并入 $\mathbf{Q}$（\cref{note:qe-imu-bridge}）。
+  \item \textbf{$\mathbf{R}$（观测噪声）}：位置/速度/高度三段按运动学测量精度设；摆动腿三段膨胀。打滑频发地形可整体调大速度段 $\mathbf{R}$（降低对不打滑假设的信任）。
+  \item \textbf{触地状态 $s_i$ 来源}：平地固定步态用相位调度器即可；非结构化地形用概率融合（\cref{algo:qe-contact}），$s_i$ 驱动 \cref{eq:qe-cov-inflate} 的膨胀开关。
+\end{itemize}
+\end{practice}
+
+\begin{derivation}[$\mathbf{R}$ 从哪来：四足传感器协方差的在线递推测量]\label{deriv:qe-cov-meas}
+上面只说“按测量精度设 $\mathbf{R}$”，但\emph{精度的数值从哪来}？观测噪声协方差 $\mathbf{R}=E(\boldsymbol v\boldsymbol v^\top)$ 的物理意义最直白——它就是\emph{传感器读数本身的协方差}，故可\emph{直接量}：让机器人保持已知状态（如静止站立，真值已知），把每周期的测量残差 $\boldsymbol v_k=\boldsymbol z_k-\mathbf{H}\boldsymbol x_{\text{真}}$ 当作样本，统计其样本协方差即得 $\mathbf{R}$。本章观测来自 IMU（加速度/角速度）与编码器（关节角/角速度经雅可比，\cref{eq:qe-obs-z}），故 $\mathbf{R}$ 即这两类本体感知量噪声的协方差；它们\emph{未必对角}——同一条腿三关节的足端位置噪声经雅可比 \cref{eq:qe-jacobian-full} 耦合，故 $\mathbf{R}$ 的腿内 $3\times3$ 块一般\emph{满}（不可简化为对角）。
+
+直接保存全部样本再统一算协方差会爆内存，需\emph{递推}（在线、定存）。设 $\bar{\boldsymbol z}_n$ 为前 $n$ 个样本的均值、$\mathbf{C}_n$ 为其样本协方差。均值递推由“新样本对旧均值的偏离按 $1/n$ 加权”给出：
+\begin{equation}
+  \bar{\boldsymbol z}_n = \bar{\boldsymbol z}_{n-1} + \frac{\boldsymbol z_n-\bar{\boldsymbol z}_{n-1}}{n}.
+  \label{eq:qe-mean-recur}
+\end{equation}
+协方差递推（Welford 型，推导见 \cref{ch:eskf,ch:matderiv}，本章只引结论）：把 $\mathbf{C}_n$ 的求和中 $i{=}n$ 项单独提出、其余项凑成 $\mathbf{C}_{n-1}$，并用 $\sum_{i=1}^{n-1}(\boldsymbol z_i-\bar{\boldsymbol z}_{n-1})=\boldsymbol 0$ 消去交叉项，得
+\begin{equation}
+  \boxed{\;\mathbf{C}_n = \frac{n-1}{n^2}\big(\boldsymbol z_n-\bar{\boldsymbol z}_{n-1}\big)\big(\boldsymbol z_n-\bar{\boldsymbol z}_{n-1}\big)^\top + \frac{n-1}{n}\,\mathbf{C}_{n-1}.\;}
+  \label{eq:qe-cov-recur}
+\end{equation}
+\cref{eq:qe-cov-recur} 只需保存 $(\bar{\boldsymbol z}_{n-1},\mathbf{C}_{n-1},n)$ 即可逐样本更新，内存恒定、适合上机标定。物理读法：第一项是新样本对当前均值的“离群度”外积（带 $1/n^2$ 量级衰减，样本越多单次扰动越弱），第二项是旧协方差的继承（带 $\tfrac{n-1}{n}\!\to\!1$ 的遗忘因子）。过程噪声 $\mathbf{Q}$ 则\emph{部分可测、部分只能整定}。可测的那部分来自\textbf{输入量噪声的传播}：离散 KF（\cref{eq:qe-kf-system}）把一切过程噪声并入 $\boldsymbol w\sim(0,\mathbf{Q})$，而输入 $\boldsymbol u$（由 IMU 读数算出，\cref{eq:qe-world-acc}）本身带噪声 $\boldsymbol o$。把它显式写进状态递推：
+\begin{equation}
+  \boldsymbol x_k=\mathbf{A}\boldsymbol x_{k-1}+\mathbf{B}(\boldsymbol u_{k-1}+\boldsymbol o_{k-1})
+  =\mathbf{A}\boldsymbol x_{k-1}+\mathbf{B}\boldsymbol u_{k-1}+\underbrace{\mathbf{B}\,\boldsymbol o_{k-1}}_{\boldsymbol w_u},
+  \label{eq:qe-Qu-input}
+\end{equation}
+可见过程噪声中由输入产生的分量为 $\boldsymbol w_u=\mathbf{B}\boldsymbol o_{k-1}$。$\boldsymbol o$ 的协方差 $\mathbf{C}_u$ 与 $\mathbf{R}$ 一样可经 \cref{eq:qe-cov-recur} 直接递推测量（因 $\boldsymbol u$ 由 IMU 给出），再经输入矩阵 $\mathbf{B}$ 传播为 $\boldsymbol w_u$ 的协方差：
+\begin{equation}
+  \boxed{\;\mathbf{Q}_u=\frac1n\sum_{i=1}^{n}\mathbf{B}(\boldsymbol o_i-\bar{\boldsymbol o}_n)(\boldsymbol o_i-\bar{\boldsymbol o}_n)^\top\mathbf{B}^\top=\mathbf{B}\,\mathbf{C}_u\,\mathbf{B}^\top.\;}
+  \label{eq:qe-Qu}
+\end{equation}
+故 $\mathbf{Q}$ 的输入噪声分量 $\mathbf{Q}_u=\mathbf{B}\mathbf{C}_u\mathbf{B}^\top$ \emph{可直测}；剩下的（单刚体建模简化、前向欧拉离散化误差等）才\emph{无}真值残差可采、只能按模型可信度\emph{整定}（\cref{note:qe-imu-bridge} 把 IMU 零偏并入 $\mathbf{Q}$）。这就把笼统的“$\mathbf{R}$ 易测、$\mathbf{Q}$ 难定”精确化为：$\mathbf{R}$ 与 $\mathbf{Q}$ 的输入分量 $\mathbf{Q}_u$ 皆可直测，唯 $\mathbf{Q}$ 的建模/离散化分量才是真正只能调的部分。
+\end{derivation}
+
+\begin{theorem}[协方差等比例缩放不变性]\label{thm:qe-cov-scale}
+若把过程噪声 $\mathbf{Q}$、观测噪声 $\mathbf{R}$ 与初始后验协方差 $\mathbf{P}_0^+$ \emph{同乘}一个正系数 $a>0$（即 $\mathbf{Q}'=a\mathbf{Q}$、$\mathbf{R}'=a\mathbf{R}$、$\mathbf{P}_0^{+\prime}=a\mathbf{P}_0^+$），则离散卡尔曼滤波在任意时刻 $k$ 给出的最优状态估计 $\hat{\boldsymbol x}_k^+$ \emph{完全不变}。因此协方差矩阵可\emph{任意等比例缩放}到便于计算的量级，KF 的输出只取决于 $\mathbf{Q}$ 与 $\mathbf{R}$ 的\emph{比值}。
+\end{theorem}
+\begin{proof}
+归纳。$k=1$ 的先验估计 $\hat{\boldsymbol x}_1^-=\mathbf{A}\hat{\boldsymbol x}_0^++\mathbf{B}\boldsymbol u_0$ 不含协方差，故不变。先验协方差（\cref{eq:qe-kf-predict}）随 $a$ 整体放大：
+\begin{equation}
+  \mathbf{P}_1^{-\prime}=\mathbf{A}(a\mathbf{P}_0^+)\mathbf{A}^\top+a\mathbf{Q}=a\big(\mathbf{A}\mathbf{P}_0^+\mathbf{A}^\top+\mathbf{Q}\big)=a\,\mathbf{P}_1^-.
+  \label{eq:qe-scale-P}
+\end{equation}
+代入增益（\cref{eq:qe-kf-gain}），分子的 $a$ 与分母括号内整体提出的 $a$ 相消：
+\begin{equation}
+  \mathbf{K}_1'=a\mathbf{P}_1^-\mathbf{H}^\top\big(a\mathbf{R}+\mathbf{H}\,a\mathbf{P}_1^-\mathbf{H}^\top\big)^{-1}
+  =a\mathbf{P}_1^-\mathbf{H}^\top\cdot\tfrac1a\big(\mathbf{R}+\mathbf{H}\mathbf{P}_1^-\mathbf{H}^\top\big)^{-1}=\mathbf{K}_1.
+  \label{eq:qe-scale-K}
+\end{equation}
+增益不变 $\Rightarrow$ 后验估计 $\hat{\boldsymbol x}_1^+=\hat{\boldsymbol x}_1^-+\mathbf{K}_1(\boldsymbol z_1-\mathbf{H}\hat{\boldsymbol x}_1^-)$ 不变；而后验协方差（\cref{eq:qe-kf-cov}）因 $\mathbf{K}_1$ 不变、$\mathbf{P}_1^-,\mathbf{R}$ 各带因子 $a$，亦满足 $\mathbf{P}_1^{+\prime}=a\mathbf{P}_1^+$。于是 $k=2$ 的初始条件 $(\hat{\boldsymbol x}_1^+,a\mathbf{P}_1^+)$ 与 $k=1$ 同构，归纳得任意 $k$ 的 $\hat{\boldsymbol x}_k^+$ 不变、$\mathbf{P}_k^{+\prime}=a\mathbf{P}_k^+$。\qed
+\end{proof}
+
+\begin{note}[只整定比值：过大 $\mathbf{Q}$ $\equiv$ 缩小 $\mathbf{R}$]\label{note:qe-cov-ratio}
+\cref{thm:qe-cov-scale} 有两条直接用处。其一，整定时\emph{只需关心 $\mathbf{Q}/\mathbf{R}$ 的相对大小}，可把它们缩放到数值最舒服的量级而不改变估计——这也解释了 \cref{eq:qe-cov-inflate} 的膨胀本质上是一次\emph{相对}缩放（把摆动腿块相对其余块放大 $n_{big}$ 倍），其绝对量级无所谓、唯比值要紧。其二，由不变性，\textbf{把 $\mathbf{Q}$ 调得过大，等价于变相缩小 $\mathbf{R}$}：滤波器会过度信任测量值，若测量本身噪声大，最优估计便继承大噪声，表现为状态向量的\emph{高频抖振}。故 $\mathbf{Q}$ 的常用调法是\emph{先给大、再逐步减小}：过大则模型几乎不被信任（抖振），过小则过度信任可能不准的模型（发散），在二者间找平衡（\cref{sec:qe-pitfall} 的发散/抖振两类陷阱正是这两端）。
+\end{note}
+
+\begin{practice}[高度漂移与零高度假设的部署代价]
+\begin{itemize}
+  \item $x/y$ 水平漂移不直接影响动态步态控制（控制跟速度/相对位置），可容忍（\cref{ins:qe-height}）；$z$ 方向用零高度假设（\cref{eq:qe-zero-height}）抑制漂移。
+  \item 代价：上下台阶/斜坡时机器人感知的是机身\emph{相对支撑面}高度（恰是控制所需），但\emph{看不见}台阶绝对高度。建图/跨障须另配视觉/激光。
+  \item 部署陷阱：状态估计漂移会\emph{毒化} MPC 的 $\boldsymbol x(0)$（\cref{ch:quad_mpc}）。对策——控制层跟踪\emph{速度}而非绝对位置、降低位置/偏航在 MPC 权重 $\mathbf{Q}$ 中的比重。
+\end{itemize}
+\end{practice}
+
+\begin{practice}[工程接口凝练（unitree\_guide 等）]
+开源实现（如 \texttt{unitree\_guide}）中状态估计器的典型接口：\texttt{getRotMat()} 直读姿态 $\mathbf{R}$（对应 \cref{eq:qe-att-compose}）、关节编码器读 $\boldsymbol q,\dot{\boldsymbol q}$、足端雅可比由腿运动学库给（\cref{eq:qe-fk,eq:qe-foot-vel-body}）、$18$ 维 KF 每 IMU 周期跑一次预测-更新（\cref{eq:qe-kf-predict,eq:qe-kf-update}）。代码细节（类名、线程、消息）属纯工程，本书不展开——理解了本章每块公式的物理来历，读任何实现都只是“对号入座”。
+\end{practice}
+
+\subsection{cheater \texorpdfstring{$\to$}{->} KF：bring-up 的真门槛}
+\label{subsec:qe-cheater-gate}
+
+前面把 $18$ 维 KF（\cref{sec:qe-kf}）从公式推到部署整定，似乎只要把它接上就完事了。但一个真实工业级开源四足栈（OCS2/\texttt{legged\_control}\cite{flayols2017experimental}）的实践告诉我们：\textbf{把估计器从“仿真地真透传”切到“真·卡尔曼滤波”，本身就是 bring-up 的一道独立门槛}，且这道门槛常被新手当成“控制器变烂了”而误诊。
+
+\paragraph{两种估计源：cheater 与生产 KF。}
+这类栈通常同时提供两套状态估计实现，由配置切换：
+\begin{itemize}
+  \item \textbf{仿真 cheater}（如 \texttt{FromTopicStateEstimate}）：直接订阅仿真器发布的\emph{地面真值}（Gazebo \texttt{p3d} 插件挂在 \texttt{base} 上给出的 \texttt{/\allowbreak ground\_truth/\allowbreak state}），\emph{透传不滤波}——位姿、速度都是仿真内核的精确值。对应一个 \texttt{legged\_cheater\_controller}。它\emph{不是}本章任何一条估计线，而是“假装估计已经完美”的占位。
+  \item \textbf{生产 KF}（如 \texttt{LinearKalmanFilter}）：正是本章的 $18$ 维线性卡尔曼滤波——\textbf{IMU 加速度做预测}（\cref{eq:qe-kf-predict}，输入由 \cref{eq:qe-world-acc} 给出）、\textbf{足端正运动学做更新}（\cref{eq:qe-obs-z}），\textbf{按接触相调噪声}（支撑足信任运动学、摆动足协方差 $\times n_{big}$，\cref{eq:qe-cov-inflate}）。可选再融合 \texttt{/\allowbreak tracking\_camera/\allowbreak odom} 等外部里程计。
+\end{itemize}
+
+\begin{insight}[cheater $\to$ KF 切换是 bring-up 的真门槛，cheater 指标是乐观下界]\label{ins:qe-cheater-gate}
+这两套估计源之间藏着一条最容易踩空的 bring-up 逻辑：\textbf{cheater 用的是零噪声地真，因此在 cheater 上跑通的控制器，其稳定性/跟踪指标是一个\emph{乐观下界}——它\emph{排除了}一切估计误差}。一旦切到真 KF，本章反复强调的真实漂移就回来了：IMU 零偏使预测漂移（\cref{note:qe-imu-bridge}）、摆动腿误判使协方差膨胀开关抖动（\cref{ins:qe-cov-couple}）、不打滑约束在打滑时失真（\cref{ins:qe-noslip}）。于是一个\emph{在 cheater 下完美}的控制器，切 KF 后可能立刻漂移/抖振——\textbf{这往往不是控制律退化，而是估计误差头一次进入闭环}。
+
+这条门槛给出一条极有用的\emph{分而治之}调试纪律：\textbf{bring-up 时先用 cheater 跑通控制器}（把估计误差从故障空间里\emph{摘掉}，先确认 MPC/WBC、步态、力分配本身没问题），\emph{再切 KF} 单独面对估计误差。若 cheater 稳、KF 不稳，故障域被干净地锁定在\emph{状态估计}这一侧（呼应 \cref{ins:qe-root}“状态是控制的根”：此时根烂在估计而非控制）。反过来，若连 cheater 都不稳，则问题在控制层，与本章无关——这正是 cheater 作为“乐观下界”的诊断价值。
+\end{insight}
+
+\paragraph{切 KF 必看：噪声配置散落三处。}
+把 cheater 换成真 KF 时，决定估计质量的噪声参数\emph{并不在一个文件里}，而是散落在三个语义不同的地方，漏配任一处都会让 KF 行为与预期不符：
+\begin{enumerate}
+  \item \textbf{IMU 传感器噪声}：在仿真模型（如 \texttt{imu.xacro}/\allowbreak\texttt{gazebo.\allowbreak xacro}）的 \texttt{gaussianNoise} 项——这是\emph{注入到读数里}的噪声，决定 $\boldsymbol a_{out},\boldsymbol\omega_{out}$ 有多脏（\cref{eq:qe-aout-3d}）；
+  \item \textbf{KF 协方差}：在 \texttt{task.info} 的 \texttt{kalmanFilter} 块——即本章的 $\mathbf{Q},\mathbf{R}$（\cref{eq:qe-cov-inflate} 整定对象），典型量级 \texttt{imuProcessNoise\{Pos,Vel\}}$\approx0.02$、\texttt{footProcessNoisePosition}$\approx0.002$、\texttt{footSensorNoise\{Pos,Vel\}}$\approx0.005/0.1$、\texttt{footHeightSensorNoise}$\approx0.01$，正对应 \cref{deriv:qe-cov-meas} 里“$\mathbf{R}$ 直接量、$\mathbf{Q}$ 只能整定”的分工；
+  \item \textbf{地真噪声}（\emph{仅} cheater）：\texttt{p3d} 的 \texttt{gaussianNoise}——只在 cheater 路径生效，与真 KF 无关。
+\end{enumerate}
+关键提醒：第(1)类（传感器噪声）与第(2)类（滤波器协方差）是\emph{两件事}——前者是世界注入的真实噪声，后者是滤波器\emph{以为}有多少噪声；二者不匹配（如传感器无噪却把 $\mathbf{R}$ 设很大）会让 KF 过度不信观测、估计滞后。
+
+\begin{pitfall}[误区：“仿真里跑了 KF 就等于验过了带噪估计”]\label{pit:qe-clean-kf}
+一个真实且诚实的 caveat（来自对该栈的独立审计）：\textbf{仿真里“跑着 KF”不等于“验过了真实噪声下的 KF”}。该栈的仿真接口曾把 IMU 加噪标了 \texttt{TODO} 而\emph{未实际加噪}（只把协方差播出去），于是 KF 实际是在\emph{近乎干净}的读数上滤波，估计仅滞后真值约 $13\%$——这种情况下宣称“已验证带噪 IMU 下的估计鲁棒性”就是\emph{过度声明}。教训有二：其一，\cref{ins:qe-cheater-gate} 的“乐观下界”不止 cheater 有，\emph{噪声没真正打开}的 KF 同样是乐观下界；其二，这正是 \cref{ch:quad_advanced} 强调的“独立审计防自我说服”在估计侧的实例——\emph{核对噪声是否真的注入了}（查 \texttt{gaussianNoise} 是否非零、加噪代码是否真生效），别把“代码里有 KF”当成“估计已经过真实噪声考验”。真要逼近真机，须把 \cref{ch:imu} 的零偏随机游走与传感器白噪声\emph{显式打开}，并优先转 \cref{ch:eskf} 的 ESKF 或 \cref{ch:invariant-filter} 的不变滤波把零偏扩进状态（\cref{ins:qe-inekf}）。
+\end{pitfall}
+
+\subsection{左右不对称：先在状态估计/标定里现形的系统症状}
+\label{subsec:qe-lr-asymmetry}
+
+切到真 KF 之后，四足上有一类\emph{几何不对称}故障，它的第一现场恰恰在状态估计/标定环节——值得在本章钉一笔，因为它极易被误诊为“KF 没调好”或“控制器偏”。
+
+\begin{insight}[左右不对称会先在状态估计/标定里现形]\label{ins:qe-lr-asymmetry}
+来自一台自定义四足的移植经验：当机器人\emph{每条腿的连杆参数都逐个独立硬编码}（而非由一个带镜像乘子的参数化腿宏统一生成）时，左右两侧\textbf{永远不可能 bit-exact 镜像}——总残留微小的左右不对称（实测最大项是右膝 \texttt{KFE} 关节 origin 的 $z$ 比左侧低约 $3\,\mathrm{mm}$，其余还有髋 origin 的 $y$、大腿惯量积、整机质心 $y$ 等更小残差）。这种不对称在动态行走里表现为\emph{每个步态周期注入微小左右力/力矩差}，无绝对航向锁时自由积分成弧线甚至自旋——但它\textbf{最先暴露的地方不是步态，而是站姿的正运动学核对}。
+
+具体地，一套“左右对称性检查 $+$ 站姿 FK 核对”脚本（\texttt{check\_lr\_symmetry.\allowbreak py} $+$ \texttt{verify\_pose}）会在机器人\emph{静止站立}时，最先从\textbf{左右足端世界系 $z$ 的劈叉量}（z-spread $\approx3\,\mathrm{mm}$）里揪出这个头号不对称——远早于你在行走轨迹里看到左偏。这把左右不对称从“行走故障”重定位成\textbf{站立标定阶段的可观测症状}：\emph{站立时若左右髋劈叉方向相反/不对称、或左右足高对不齐，第一怀疑点不是 KF 协方差，而是几何不对称（连杆参数左右不镜像）或关节序映射错配}。
+\end{insight}
+
+\begin{note}[关节序映射：易误判、但通常不是漂移源]\label{note:qe-jointorder}
+紧挨着上面那条，有一个\emph{看起来}像左右不对称、实则不是漂移源的陷阱，需澄清以免误诊：某些框架（如 OCS2）内部默认的 \texttt{jointNames} 顺序（\texttt{LF,RF,LH,RH}）可能\emph{不同于} URDF 的声明顺序（\texttt{LF,LH,RF,RH}）。但只要建模是\emph{按关节名}（而非按位置下标）建立映射的（\texttt{createPinocchioInterface} 即如此），且 URDF 含全部 $12$ 个关节名，\textbf{顺序差异不会造成估计错误}——它不是漂移源。真正的提醒是：\emph{若站立时左右髋劈叉方向反}，在排除几何不对称（\cref{ins:qe-lr-asymmetry}）之后，第二怀疑点才是这个序映射（回看 \texttt{defaultJointState} 里左右髋外展角 $\mp$ 号是否与实际腿一一对应）。简言之：左右不对称\emph{先}查几何镜像、\emph{再}查关节序，二者都属“估计/标定先现形”的范畴。
+\end{note}
+
+\begin{insight}[结构性对称 vs.\ 一次性脚本镜像：为何“单点修正”会翻车]\label{ins:qe-lr-structural}
+\cref{ins:qe-lr-asymmetry} 还隐含一条比“估计先现形”更深的工程哲学，值得在此点出（治本的完整侦探故事见 \cref{ch:quad_advanced}）。诱人的做法是\emph{单点修正}那个最大残差（把右膝 $z$ 抬回 $3\,\mathrm{mm}$）——但实践中这样做\emph{反而让漂移方向翻转}（从左偏变右偏加螺旋）：因为左右不对称是\emph{多项残差叠加}的结果，磨平最大一项只是改变了合力方向，\emph{并未}消除不对称。真正的治本是\textbf{结构性对称}：仿照成熟实现，把四条腿用\emph{一个}带镜像乘子（$\pm1$）的参数化腿宏实例化生成，使左右\emph{构造上}就 bit-exact（验证：展开后左右最大残差 $=0.000\mathrm{e}{+}00$）。这条对照——“一次性脚本镜像/单点修正”治标、“结构性对称”治本——的判别准则极简：\textbf{左右不对称是真 bug（须消除残差），前后站姿不对称是非 bug（是构造，腿宏的 \texttt{front\_hind} 乘子使然）}。把这条记牢，就能在站立标定时一眼区分“该修的不对称”与“正常的前后差异”。整机运动学的左右/前后对称结构见 \cref{ch:quad_kin}。
+\end{insight}
+
+% ════════════════════════════════════════════════════════════════
+\section{延伸与前沿}
+\label{sec:qe-frontier}
+
+\begin{paper}[Bledt et al., 非结构化地形的事件式触地（ICRA 2018）]\label{paper:qe-bledt}
+\textbf{问题.}\;平地固定步态调度在非结构化地形上失效（高地早触、凹地晚触，\cref{ins:qe-prob-boundary}），如何\emph{实时}可靠判触地？\\
+\textbf{核心思想.}\;贝叶斯融合\emph{步态相位先验}与\emph{多路本体感知测量似然}（GM 估计的法向力、足高、足端纵向速度），得接触概率（\cref{eq:qe-bayes-contact}）。\\
+\textbf{关键结果.}\;在 MIT Cheetah 3\cite{bledt2018cheetah3} 上达约 $99.3\%$ 接触判别准确率、毫秒级延时，使四足能在碎石/台阶等非结构化地形动态行走。\\
+\textbf{与本书关系.}\;本章 \cref{subsec:qe-prob} 即此范式展开；GM 观测器（\cref{subsec:qe-gm}）源自 De Luca\cite{deluca2006collision} 的残差动量碰撞观测器。\\
+\textbf{局限.}\;似然模型需按平台标定；强冲击/极端打滑下单步判别仍可能错，须与里程计协方差膨胀（\cref{eq:qe-cov-inflate}）协同。
+\end{paper}
+
+\noindent 足式状态估计的脉络与前沿：
+\begin{itemize}
+  \item \textbf{腿式 KF 里程计奠基}：Bloesch 等\cite{bloesch2013state}——把足端位置纳入状态、用不打滑约束作观测的腿式卡尔曼滤波经典，本章 $18$ 维状态/$28$ 维观测的思想源头之一。
+  \item \textbf{事件式触地}：Bledt 等\cite{bledt2018contact}（\cref{paper:qe-bledt}）——概率融合触地，把估计与控制经 $s_i$ 缝合（\cref{ins:qe-cov-couple}）。
+  \item \textbf{广义动量观测器}：De Luca 等\cite{deluca2006collision}——残差动量碰撞检测，本章 GM 法（\cref{subsec:qe-gm}）的原始出处，绕过加速度（\cref{ins:qe-gm-motivation}）。
+  \item \textbf{不变卡尔曼滤波（现代演进）}：见 \cref{ch:invariant-filter}——在 $\SO(3)/\SE(3)$ 上保一致性的 RIEKF，腿式估计的现代标准，修本章线性 KF “姿态仅直读”的瑕疵（\cref{ins:qe-inekf}）。
+  \item \textbf{工程落地范式}：宇树《四足机器人控制算法》\cite{unitree2023quadruped} 的 $18$ 维线性 KF 与 \texttt{unitree\_guide}，是把本章理论跑上真机的标准实现。
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章常见误解汇总}
+\begin{table}[H]\centering\small
+\begin{tabular}{p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{常见误解} & \textbf{正确理解} \\
+\midrule
+机身位置/速度能直接测 & 无 GPS/动捕，平动须 IMU $+$ 足底运动学融合（\cref{ins:qe-split}）\\
+IMU 两次积分即可定位 & 零偏使位置 $\sim\tfrac12 b_a t^2$ 二次漂移，必须锚定（\cref{sec:qe-naive}）\\
+触地检测 $=$ 读个力传感器 & 球状足底难贴合/噪声/成本/线路，逼出本体感知反推（\cref{ins:qe-no-force-sensor}）\\
+反推接触力须算 $\ddot{\boldsymbol q}$ & GM 用动量求导 $+$ 斜对称性消去 $\ddot{\boldsymbol q}$（\cref{ins:qe-gm-motivation}）\\
+平地也必须概率融合触地 & 平地固定调度即可，非结构化地形才必须检测器（\cref{ins:qe-prob-boundary}）\\
+加速度计静止读数应为 $0$ & 测比力，静止读 $-g=+9.81$（\cref{eq:qe-aout-1d-g}）\\
+状态方程的 $+\boldsymbol g$ 是凑的 & 把 \cref{eq:qe-aout-3d} 减掉的重力加回（\cref{ins:qe-world-acc}）\\
+足端在状态里却说“不动”矛盾 & 支撑足是世界系绝对锚，$\dot{\boldsymbol p}_i=\boldsymbol 0$ 钉住（\cref{ins:qe-foot-anchor}）\\
+任何腿都给可信速度观测 & 仅支撑足不打滑约束成立，摆动腿须膨胀协方差（\cref{ins:qe-cov-couple}）\\
+零高度假设能测台阶高度 & 恰相反，钉死零高度故看不见台阶（\cref{ins:qe-height}）\\
+简化形协方差更新够用 & 长时浮点累积发散，用 Joseph 形（\cref{note:qe-joseph}）\\
+$\boldsymbol p_i(2)$ 是第二个元素 & $0$-index，是第三元素（$z$ 轴）（\cref{note:qe-ocr-H}）\\
+本章须用 EKF & 状态方程/观测方程对 $\boldsymbol x$ 都线性，线性 KF 足矣（\cref{ins:qe-inekf}）\\
+姿态进不进被滤状态无所谓 & 线性 KF 仅直读姿态，错失耦合，InEKF 修之（\cref{ins:qe-inekf}）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{本章小结}
+
+\begin{table}[H]\centering\small
+\caption{符号表}
+\begin{tabular}{lll}
+\toprule
+符号 & 含义 & 首次出现 \\
+\midrule
+$\mathbf{R}\in\SO(3)$ & 机身姿态（$={}^{\mathcal{O}}\mathbf{R}_{\mathcal{B}}=\mathbf{R}_{sb}$） & \cref{eq:qe-aout-3d} \\
+$\boldsymbol a_{out},\boldsymbol\omega_{out}$ & IMU 加速度计/陀螺仪原始读数 & \cref{eq:qe-aout-3d} \\
+${}^{\mathcal{O}}\boldsymbol g$ & 世界系重力 $[0,0,-g_0]^\top$ & \cref{eq:qe-aout-3d} \\
+${}^{\mathcal{O}}\boldsymbol p_{com},{}^{\mathcal{O}}\boldsymbol v_{com}$ & 机身位置/速度（世界系） & \cref{eq:qe-state-vec} \\
+${}^{\mathcal{O}}_{i}\boldsymbol p$ & 第 $i$ 足端世界系位置 & \cref{eq:qe-foot-world-pos} \\
+${}^{\mathcal{B}}_{i}\boldsymbol p$ & 第 $i$ 足端机身系位置（运动学） & \cref{eq:qe-fk} \\
+${}_iq^j,{}_i\dot q^j$ & 第 $i$ 腿第 $j$ 关节角/角速度 & \cref{eq:qe-fk} \\
+$\zeta,\delta$ & 左右($\pm1$)/前后($\pm1$)符号变量 & \cref{eq:qe-fk-sign} \\
+$\mathbf{J}_i$ & 第 $i$ 腿足端雅可比 & \cref{eq:qe-foot-vel-body} \\
+$\boldsymbol p,\boldsymbol\tau_K$ & 广义动量/外部接触扭矩 & \cref{eq:qe-gm-momentum,eq:qe-gm-dyn} \\
+$\mathbf{M},\mathbf{C},\boldsymbol g(\boldsymbol q)$ & 质量阵/科氏阵/重力扭矩 & \cref{eq:qe-gm-dyn} \\
+$s_i\in\{0,1\}$ & 第 $i$ 腿接触布尔量 & \cref{ins:qe-contact-switch} \\
+$\boldsymbol x\in\mathbb{R}^{18}$ & 状态 $[\boldsymbol p_{com};\boldsymbol v_{com};\boldsymbol p_{1:4}]$ & \cref{eq:qe-state-vec} \\
+$\boldsymbol z\in\mathbb{R}^{28}$ & 观测 [位置12;速度12;高度4] & \cref{eq:qe-obs-z} \\
+$\mathbf{A},\mathbf{B},\mathbf{H}$ & 离散系统/输入/观测矩阵 & \cref{eq:qe-disc-AB,eq:qe-obs-z} \\
+$\mathbf{Q},\mathbf{R}$ & 过程/观测噪声协方差 & \cref{eq:qe-cov-inflate} \\
+$\mathbf{P}_k^-,\mathbf{P}_k^+$ & 先验/后验状态协方差 & \cref{eq:qe-kf-predict} \\
+$\mathbf{K}_k$ & 卡尔曼增益 & \cref{eq:qe-kf-gain} \\
+$n_{big}$ & 膨胀大数($=100$) & \cref{eq:qe-cov-inflate} \\
+$\mathrm{d}t$ & 离散周期（IMU 同步） & \cref{eq:qe-disc-step} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{公式速查表}
+\begin{tabular}{lll}
+\toprule
+公式 / 结论 & 一句话说明 & 对应 \\
+\midrule
+IMU 读数 \cref{eq:qe-aout-3d} & $\boldsymbol a_{out}=\boldsymbol a-\mathbf{R}^\top\boldsymbol g$ & \cref{ins:qe-world-acc} \\
+世界系净加速度 \cref{eq:qe-world-acc} & $\mathbf{R}\boldsymbol a_{out}+\boldsymbol g$ & 状态方程输入 \\
+姿态合成 \cref{eq:qe-att-compose} & IMU 标定链三段串联 & \cref{exam:qe-calib} \\
+GM 消加速度 \cref{eq:qe-gm-final} & $\dot{\boldsymbol p}=\boldsymbol\tau+\boldsymbol\tau_K+\mathbf{C}^\top\dot{\boldsymbol q}-\boldsymbol g$ & \cref{deriv:qe-gm} \\
+GM 观测器 \cref{eq:qe-gm-observer} & 一阶低通残差动量 & \cref{ins:qe-gm-motivation} \\
+概率融合 \cref{eq:qe-bayes-contact} & 相位先验 $\times$ 三路似然 & \cref{ins:qe-prob-fusion} \\
+连续状态方程 \cref{eq:qe-cont-AB} & 双积分器 $+$ 足端不动 & \cref{ins:qe-foot-anchor} \\
+离散化 \cref{eq:qe-disc-AB} & $\mathbf{A}=\mathbf{I}+\mathrm{d}t\,\mathbf{A}_c$ & \cref{eq:qe-disc-explicit} \\
+足端正运动学 \cref{eq:qe-fk} & 串联腿闭式（$\zeta,\delta$ 符号） & \cref{exam:qe-jacobian} \\
+不打滑速度观测 \cref{eq:qe-vel-obs} & ${}^{\mathcal{O}}\boldsymbol v_{com}=-\mathbf{R}(\boldsymbol\omega^\wedge{}^{\mathcal{B}}_{i}\boldsymbol p+{}^{\mathcal{B}}_{i}\dot{\boldsymbol p})$ & \cref{ins:qe-noslip} \\
+零高度观测 \cref{eq:qe-zero-height} & ${}^{\mathcal{O}}_{i}p^z=0$ & \cref{ins:qe-height} \\
+协方差膨胀 \cref{eq:qe-cov-inflate} & 摆动腿块设 $n_{big}$ & \cref{ins:qe-cov-couple} \\
+渐变窗口协方差 \cref{eq:qe-cstance} & $\mathbf{C}_{\mathrm{stance}}=[1+(1-\sigma)L]\mathbf{C}_{\mathrm{init}}$ & \cref{ins:qe-cov-graded} \\
+KF 预测 \cref{eq:qe-kf-predict} & $\mathbf{P}_k^-=\mathbf{A}\mathbf{P}\mathbf{A}^\top+\mathbf{Q}$ & \cref{exam:qe-kf-step} \\
+KF 增益/更新 \cref{eq:qe-kf-gain,eq:qe-kf-update} & 新息加权 & \cref{ch:eskf} \\
+Joseph 协方差 \cref{eq:qe-kf-cov} & 保对称半正定 & \cref{note:qe-joseph} \\
+协方差递推测量 \cref{eq:qe-cov-recur} & 在线统计 $\mathbf{R}$（Welford 型） & \cref{deriv:qe-cov-meas} \\
+输入噪声传播 \cref{eq:qe-Qu} & $\mathbf{Q}_u=\mathbf{B}\mathbf{C}_u\mathbf{B}^\top$ & \cref{deriv:qe-cov-meas} \\
+协方差缩放不变 \cref{thm:qe-cov-scale} & 同乘 $a$ 不改估计，只整定比值 & \cref{note:qe-cov-ratio} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]\centering\small
+\caption{知识点总表}
+\begin{tabular}{clll}
+\toprule
+\# & 知识点 & 核心要点 & 难度 \\
+\midrule
+1 & 状态估计 $=$ 控制的根 & 无准状态无稳定反馈；姿态易/平动难二分 & \(\bigstar\) \\
+2 & 朴素方案的反面 & IMU 漂移、运动学依赖不打滑 & \(\bigstar\bigstar\) \\
+3 & 触地误判两类后果 & 漏检过载/虚检摔倒；混合控制开关 & \(\bigstar\bigstar\) \\
+4 & 为何不用力传感器 & 球底/噪声/成本/线路 $\Rightarrow$ 本体感知 & \(\bigstar\bigstar\) \\
+5 & IMU 质量-弹簧模型 & 读数 $=a-\mathbf{R}^\top g$；净加速度 $\mathbf{R}a_{out}+g$ & \(\bigstar\bigstar\) \\
+6 & IMU 安装偏置标定链 & 常值旋转链合成躯干姿态 & \(\bigstar\bigstar\bigstar\) \\
+7 & 广义动量观测器 GM & 求导 $+$ 斜对称消 $\ddot{\boldsymbol q}$ & \(\bigstar\bigstar\bigstar\bigstar\) \\
+8 & 概率融合触地 & 相位先验 $\times$ 多路似然 & \(\bigstar\bigstar\bigstar\) \\
+9 & 18 维状态方程 & 双积分器 $+$ 足端静止锚 & \(\bigstar\bigstar\bigstar\) \\
+10 & 前向欧拉离散 & $\mathbf{A}=\mathbf{I}+\mathrm{d}t\mathbf{A}_c$（此处精确） & \(\bigstar\bigstar\) \\
+11 & 不打滑速度观测 & 腿几何 $\to$ 机身速度计 & \(\bigstar\bigstar\bigstar\bigstar\) \\
+12 & 零高度假设 & 抑 $z$ 漂移、弃台阶绝对高 & \(\bigstar\bigstar\bigstar\) \\
+13 & 协方差膨胀 & 触地状态缝入滤波器 & \(\bigstar\bigstar\bigstar\) \\
+14 & 线性 KF 两步 & 预测-更新；Joseph 形 & \(\bigstar\bigstar\bigstar\) \\
+15 & InEKF 现代演进 & 流形一致性，修线性 KF 瑕疵 & \(\bigstar\bigstar\bigstar\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ════════════════════════════════════════════════════════════════
+\section*{延伸阅读}
+\begin{itemize}
+  \item \textbf{一手详尽推导}：于宪元《基于稳定性的仿生四足机器人控制系统设计》\cite{yu2021quadruped}（北航硕论）——§2.4 状态估计器含 IMU 标定链、$18$ 维状态/$28$ 维观测、不打滑约束、协方差膨胀的逐步推导，本章平动线主源。
+  \item \textbf{物理与 KF 全推}：宇树《四足机器人控制算法》\cite{unitree2023quadruped}——IMU 质量-弹簧模型、WLS$\to$RLS$\to$KF 全链条、Joseph 形，配套 \texttt{unitree\_guide} 开源代码。
+  \item \textbf{触地与腿式估计经典}：Bledt 等\cite{bledt2018contact}（事件式概率触地）、Bloesch 等\cite{bloesch2013state}（腿式 KF 里程计奠基）、De Luca 等\cite{deluca2006collision}（残差动量碰撞观测器，GM 源头）。
+  \item \textbf{控制接口}：Di Carlo 等\cite{dicarlo2018cheetah}——本章估计器是其单刚体 MPC 的反馈来源（\cref{ch:quad_mpc}）。
+  \item \textbf{通用滤波理论}：\cref{ch:eskf}（KF/ESKF）、\cref{ch:invariant-filter}（InEKF/RIEKF）、\cref{ch:imu}（IMU 噪声/零偏模型）、\cref{ch:leg}（腿式里程计通用框架）。
+\end{itemize}
+
+\section*{本章与其它章节的关系}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+相关章节 & 关系 & 本章接口 \\
+\midrule
+\cref{ch:lie} 李群与李代数 & 提供 $\dot{\mathbf{R}}=\mathbf{R}\boldsymbol\omega^\wedge$、$(\cdot)^\wedge$ & \cref{eq:qe-foot-world-vel} \\
+\cref{ch:imu} IMU 模型 & 提供噪声/零偏通用模型 & \cref{note:qe-imu-bridge} \\
+\cref{ch:eskf} KF/ESKF & 提供通用 KF 推导、误差状态 & \cref{deriv:qe-kf-lineage} \\
+\cref{ch:invariant-filter} 不变滤波 & 提供流形一致 RIEKF & \cref{ins:qe-inekf} \\
+\cref{ch:leg} 足式里程计 & 提供腿式里程计通用框架 & \cref{sec:qe-obs} \\
+\cref{ch:quad_gait} 步态生成 & 提供相位 $\to$ 触地先验 & \cref{eq:qe-bayes-contact} \\
+\cref{ch:quad_mpc} 单刚体 MPC & 消费本章状态作反馈 $\boldsymbol x(0)$ & \cref{ins:qe-root} \\
+\cref{ch:quad_wbc} WBC & 消费本章位姿/速度 & \cref{sec:qe-why} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{故障排查手册}
+\begin{enumerate}
+  \item \textbf{症状}：机身位置\emph{快速漂移飞走}。\textbf{排查}：是否退化成纯 IMU 积分（足底观测未生效）；检查触地状态 $s_i$ 是否恒为 $0$（全腿被误判摆动 $\Rightarrow$ 全膨胀 $\Rightarrow$ 无锚，\cref{ins:qe-foot-anchor}）；检查不打滑速度观测 \cref{eq:qe-vel-obs} 是否接入。
+  \item \textbf{症状}：\emph{速度估计抖振}。\textbf{原因}：摆动腿协方差未膨胀（\cref{eq:qe-cov-inflate}），荒谬观测污染。\textbf{对策}：确认 $s_i$ 正确驱动膨胀；打滑地形调大速度段 $\mathbf{R}$。
+  \item \textbf{症状}：长时运行后\emph{滤波器发散 / $\mathbf{P}$ 出现负值}。\textbf{原因}：用了简化形协方差更新。\textbf{对策}：改 Joseph 形 \cref{eq:qe-kf-cov}（\cref{note:qe-joseph}）。
+  \item \textbf{症状}：\emph{机身高度估计偏移}（站高站低）。\textbf{原因}：零高度假设被破坏（持续打滑/斜坡），或取错 $z$ 分量（$0$-index 误）。\textbf{对策}：核对 \cref{eq:qe-zero-height} 与 \cref{note:qe-ocr-H} 的索引。
+  \item \textbf{症状}：\emph{姿态整体偏转 / 偏航反号}。\textbf{原因}：IMU 安装偏置未标定或标定链方向错（\cref{exam:qe-calib}）。\textbf{对策}：走完标定链 \cref{eq:qe-att-compose}，以静止已知朝向核对 $\psi_{init}$。
+  \item \textbf{症状}：\emph{触地判别频繁误报}（平地也乱跳）。\textbf{原因}：GM 增益 $\mathbf{K}_I$ 过大（噪声敏感）或似然模型未标定。\textbf{对策}：平地直接退化为相位调度（\cref{ins:qe-prob-boundary}）；调小 $\mathbf{K}_I$（\cref{eq:qe-gm-observer}）。
+  \item \textbf{症状}：\emph{仿真好、真机偏移}。\textbf{原因}：IMU 零偏未建模（\cref{note:qe-imu-bridge}）或安装标定漂移。\textbf{对策}：把零偏扩进状态用 ESKF（\cref{ch:eskf}）或 InEKF（\cref{ch:invariant-filter}）。
+\end{enumerate}
